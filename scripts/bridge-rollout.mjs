@@ -12,6 +12,8 @@ function usage() {
   console.log("Usage:");
   console.log("  node scripts/bridge-rollout.mjs --target <bridge-id>");
   console.log("  node scripts/bridge-rollout.mjs --target <bridge-id> --stage --apply");
+  console.log("  node scripts/bridge-rollout.mjs --target <bridge-id> --enroll --apply");
+  console.log("  node scripts/bridge-rollout.mjs --target <bridge-id> --restore-baseline --enrollment-id <64-hex> --apply");
   console.log("  node scripts/bridge-rollout.mjs --target <bridge-id> --activate --sha <40-hex> --checksum <64-hex> --stage-id <64-hex> --apply");
   console.log("  node scripts/bridge-rollout.mjs --target <bridge-id> --rollback --activation-id <64-hex> --apply");
 }
@@ -40,6 +42,26 @@ async function main() {
     const stageId = parseKeyValues(staged.stdout).stage_id;
     if (!/^[0-9a-f]{64}$/.test(stageId ?? "")) throw new Error("remote stage did not return an immutable stage id");
     console.log(`activate_command=npm run bridge:rollout -- --target ${target.bridgeId} --activate --sha ${artifact.sha} --checksum ${artifact.checksum} --stage-id ${stageId} --apply`);
+    return;
+  }
+  if (options.action === "enroll") {
+    // Enrollment records a baseline for the host as it is. It deliberately does
+    // NOT require rollout readiness: an unmanaged host that is not yet
+    // receipt-capable is exactly the host that needs a recorded baseline. It
+    // also changes nothing about what runs — no signal, no entrypoint switch —
+    // so activation stays a separate, later, explicitly invoked phase.
+    const enrollmentId = nonce(); const operationId = nonce();
+    const result = await commandRunner(makeSshCommand(target, ["enroll", enrollmentId, operationId], remoteScript));
+    process.stdout.write(result.stdout);
+    const report = parseKeyValues(result.stdout);
+    if (report.process_signaled !== "no" || report.artifact_changed !== "no") throw new Error("enrollment reported a mutation it must never perform");
+    console.log(`restore_command=npm run bridge:rollout -- --target ${target.bridgeId} --restore-baseline --enrollment-id ${report.enrollment_id} --apply`);
+    return;
+  }
+  if (options.action === "restore-baseline") {
+    const operationId = nonce();
+    const result = await commandRunner(makeSshCommand(target, ["restore-baseline", options.enrollmentId, operationId], remoteScript));
+    process.stdout.write(result.stdout);
     return;
   }
   if (preflight.report.rollout_ready !== "yes") throw new Error("active bridge lacks the verified drain/protocol/catalog capabilities required for activation or rollback");

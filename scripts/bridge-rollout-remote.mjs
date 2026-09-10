@@ -173,6 +173,7 @@ async function readLiveIdentity() {
   if (env.exec_interpreter !== nodePath) fail("pm2_interpreter_mismatch");
   safePhase = "identity_pm2_args";
   validatePm2Args(env.args);
+  const pm2Identity = { name: env.name, cwd: env.pm_cwd, execPath: env.pm_exec_path, interpreter: env.exec_interpreter, args: (Array.isArray(env.args) ? env.args : []).map(String) };
   safePhase = "identity_entrypoint";
   const entryStat = await fsp.lstat(entrypointPath).catch(() => fail("entrypoint_missing")); assertUid(entryStat, expectedUid, "entrypoint_wrong_owner");
   if (!entryStat.isFile() && !entryStat.isSymbolicLink()) fail("entrypoint_wrong_type");
@@ -181,7 +182,7 @@ async function readLiveIdentity() {
   if (!legacy && !entryReal.startsWith(`${releaseRoot}/releases/`)) fail("entrypoint_escape");
   if (entryReal !== entrypointPath && !entryReal.endsWith("/packages/bridge/dist/index.js")) fail("entrypoint_unexpected_target");
   assertUid(await fsp.stat(entryReal), expectedUid, "entrypoint_target_wrong_owner");
-  return { pid, cwd, entryReal, legacy };
+  return { pid, cwd, entryReal, legacy, pm2: pm2Identity };
 }
 
 function tarString(block, start, length) {
@@ -410,7 +411,7 @@ async function prepareManagedRoot() {
   if (parentReal !== parent) fail("release_parent_symlink"); assertUid(await fsp.lstat(parent), expectedUid, "release_parent_wrong_owner");
   await fsp.mkdir(releaseRoot, { mode: 0o700 }).catch((error) => { if (error?.code !== "EEXIST") throw error; });
   await requireManagedDirectory(releaseRoot); await fsp.chmod(releaseRoot,0o700);
-  for (const part of ["incoming","releases","activations","rollbacks","locks","stale-locks","failed-staging"]) {
+  for (const part of ["incoming","releases","activations","rollbacks","baselines","locks","stale-locks","failed-staging"]) {
     const directory = `${releaseRoot}/${part}`; await fsp.mkdir(directory,{mode:0o700}).catch((error)=>{if(error?.code!=="EEXIST")throw error;}); await requireManagedDirectory(directory); await fsp.chmod(directory,0o700);
   }
 }
@@ -489,6 +490,222 @@ async function readCapabilityFile(root, relative, code) {
   return fsp.readFile(file);
 }
 
+/**
+ * The exact deployed files whose CONTENT decides what a bridge can do. Read from
+ * whichever tree is actually active, never inferred from a version string: the
+ * package version stayed 0.1.0 and protocol stayed 1 across the change that
+ * added the catalog RPCs, so bytes are the only honest discriminator.
+ */
+const CAPABILITY_FILES = [
+  ["packages/bridge/dist/index.js", "deployed_entrypoint_invalid"],
+  ["packages/bridge/package.json", "deployed_bridge_package_invalid"],
+  ["packages/adapters/dist/command-bus.js", "deployed_protocol_invalid"],
+  ["packages/bridge/dist/rpc.js", "deployed_rpc_invalid"],
+];
+
+async function readDeployedCapabilities(root) {
+  const bytes = [];
+  for (const [relative, code] of CAPABILITY_FILES) bytes.push(await readCapabilityFile(root, relative, code));
+  const [entryBytes, bridgePackageBytes, commandBusBytes, rpcBytes] = bytes;
+  const bridgePackage = parseJson(bridgePackageBytes, "deployed_bridge_package_invalid");
+  if (bridgePackage.name !== "@seam/bridge" || !/^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?$/.test(bridgePackage.version ?? "")) fail("deployed_bridge_package_invalid");
+  const entrySource = entryBytes.toString("utf8"); const commandBusSource = commandBusBytes.toString("utf8"); const rpcSource = rpcBytes.toString("utf8");
+  const protocolVersion = /\bPROTOCOL_VERSION\s*=\s*(\d+)\b/.exec(commandBusSource)?.[1] ?? "unknown";
+  const drainSupport = /process\.on\(\s*["']SIGUSR2["']/.test(entrySource) ? "yes" : "no";
+  const rpcDispatch = rpcSource.includes("isAllowedRpcMethod") && rpcSource.includes("dispatchAdapter");
+  const describeSupport = rpcDispatch && commandBusSource.includes('"describeModelCatalog"') ? "yes" : "no";
+  const fetchSupport = rpcDispatch && commandBusSource.includes('"fetchModelCatalog"') ? "yes" : "no";
+  const rolloutReady = protocolVersion === "1" && drainSupport === "yes" && describeSupport === "yes" && fetchSupport === "yes" ? "yes" : "no";
+  const files = CAPABILITY_FILES.map(([relative], index) => ({ path: relative, size: bytes[index].length, sha256: hash(bytes[index]) }));
+  return { bytes, files, bridgePackage, protocolVersion, drainSupport, describeSupport, fetchSupport, rolloutReady };
+}
+
+const baselineRoot = `${releaseRoot}/baselines`;
+const currentBaselinePath = `${baselineRoot}/current.json`;
+
+/**
+ * Capture, from LIVE state, everything a restore would need to put this host
+ * back exactly as it is now: the revision, the content of every file whose bytes
+ * decide behaviour, the entrypoint's own bytes and mode, the process-manager
+ * identity, and the runtime. Anything unreadable fails closed here rather than
+ * being recorded as a blank — a baseline that cannot be restored to is worse
+ * than no baseline, because it looks like one.
+ */
+async function captureBaseline(identity) {
+  if (!identity.legacy) fail("enroll_requires_legacy_checkout");
+  const checkoutSourceSha = await readCheckoutSourceSha();
+  const capabilities = await readDeployedCapabilities(checkoutPath);
+  const entryStat = await fsp.lstat(entrypointPath).catch(() => fail("baseline_entrypoint_unreadable"));
+  if (!entryStat.isFile() || entryStat.isSymbolicLink()) fail("baseline_entrypoint_wrong_type");
+  const runtimeEnv = { PATH: `${path.dirname(nodePath)}:/usr/bin:/bin`, HOME: process.env.HOME ?? checkoutPath };
+  let nodeVersion;
+  try { nodeVersion = (await runBounded(nodePath, ["--version"], { timeoutMs: 10_000, stdoutLimit: 1024, stderrLimit: 1024, env: runtimeEnv })).stdout.trim(); }
+  catch { fail("baseline_node_version_unavailable"); }
+  if (!/^v\d+\.\d+\.\d+/.test(nodeVersion)) fail("baseline_node_version_unavailable");
+  // Fixed key order: this object is hashed, so its serialization is its identity.
+  const baseline = {
+    artifactMode: "legacy-checkout",
+    checkoutPath,
+    checkoutSourceSha,
+    entrypointPath,
+    entrypointSha256: capabilities.files[0].sha256,
+    entrypointSize: capabilities.files[0].size,
+    entrypointMode: entryStat.mode & 0o7777,
+    files: capabilities.files,
+    bridgeVersion: capabilities.bridgePackage.version,
+    protocolVersion: capabilities.protocolVersion,
+    drainSigusr2: capabilities.drainSupport,
+    describeModelCatalog: capabilities.describeSupport,
+    fetchModelCatalog: capabilities.fetchSupport,
+    // The honest verdict, from the captured bytes: can THIS baseline emit the
+    // nonce/PID/instance/two-RPC receipt a rollback onto it would have to prove?
+    receiptCapable: capabilities.rolloutReady === "yes" ? "yes" : "no",
+    processManager: { manager: "pm2", app: pm2App, cwd: identity.pm2.cwd, execPath: identity.pm2.execPath, interpreter: identity.pm2.interpreter, args: identity.pm2.args },
+    runtime: { nodePath, nodeVersion, platform: `${process.platform}-${process.arch}`, uid: expectedUid },
+  };
+  return { baseline, digest: hash(Buffer.from(JSON.stringify(baseline), "utf8")), entryBytes: capabilities.bytes[0], pid: identity.pid };
+}
+
+/** Read the published enrollment and say plainly whether live state still matches it. */
+async function enrollmentState() {
+  if (!fs.existsSync(currentBaselinePath)) return { status: "none" };
+  const pointerStat = await fsp.lstat(currentBaselinePath);
+  if (!pointerStat.isFile() || pointerStat.isSymbolicLink()) fail("enrollment_pointer_wrong_type");
+  assertUid(pointerStat, expectedUid, "enrollment_pointer_wrong_owner");
+  const pointer = parseJson(await fsp.readFile(currentBaselinePath), "enrollment_pointer_invalid");
+  if (pointer.formatVersion !== 1 || pointer.bridgeId !== bridgeId || !HASH.test(pointer.enrollmentId ?? "") || !HASH.test(pointer.baselineDigest ?? "")) fail("enrollment_pointer_invalid");
+  const recordPath = `${baselineRoot}/${pointer.enrollmentId}.baseline.json`;
+  // A pointer with no record behind it is a partially enrolled host: refuse
+  // rather than treat the pointer alone as evidence.
+  const recordStat = await fsp.lstat(recordPath).catch(() => fail("enrollment_record_missing"));
+  if (!recordStat.isFile() || recordStat.isSymbolicLink()) fail("enrollment_record_wrong_type");
+  assertUid(recordStat, expectedUid, "enrollment_record_wrong_owner");
+  const record = parseJson(await fsp.readFile(recordPath), "enrollment_record_invalid");
+  if (record.formatVersion !== 1 || record.kind !== "enrolled-baseline" || record.enrollmentId !== pointer.enrollmentId || record.bridgeId !== bridgeId || record.pm2App !== pm2App || record.baselineDigest !== pointer.baselineDigest) fail("enrollment_record_invalid");
+  assertObject(record.baseline, "enrollment_record_invalid");
+  if (hash(Buffer.from(JSON.stringify(record.baseline), "utf8")) !== record.baselineDigest) fail("enrollment_record_digest_mismatch");
+  const preserved = `${baselineRoot}/${pointer.enrollmentId}/entrypoint/index.js`;
+  if (record.preservedEntrypoint !== preserved) fail("enrollment_record_invalid");
+  const preservedStat = await fsp.lstat(preserved).catch(() => fail("baseline_entrypoint_copy_missing"));
+  if (!preservedStat.isFile() || preservedStat.isSymbolicLink()) fail("baseline_entrypoint_copy_wrong_type");
+  assertUid(preservedStat, expectedUid, "baseline_entrypoint_copy_wrong_owner");
+  const preservedBytes = await fsp.readFile(preserved);
+  if (hash(preservedBytes) !== record.baseline.entrypointSha256) fail("baseline_entrypoint_copy_mismatch");
+  return { status: "recorded", pointer, record, preservedBytes };
+}
+
+/** Enrollment state PLUS whether the host still looks like what was recorded. */
+async function enrollmentStatus(identity) {
+  const state = await enrollmentState();
+  if (state.status === "none") return { status: "none" };
+  let live;
+  try { live = await captureBaseline(identity); }
+  catch { return { ...state, status: "drifted" }; }
+  if (live.digest !== state.record.baselineDigest) return { ...state, status: "drifted" };
+  return { ...state, status: "enrolled", live };
+}
+
+async function enroll() {
+  safePhase = "enroll_arguments";
+  if (actionArgs.length !== 2) fail("enroll_argument_count");
+  const [enrollmentId, operationId] = actionArgs;
+  if (!HASH.test(enrollmentId) || !HASH.test(operationId)) fail("enroll_identity_invalid");
+  safePhase = "enroll_identity";
+  await readLiveIdentity();
+  await prepareManagedRoot();
+  await withLock(operationId, async () => {
+    safePhase = "enroll_capture";
+    const before = await readLiveIdentity();
+    const captured = await captureBaseline(before);
+    // Capture is only worth as much as its agreement with the host a moment
+    // later. Re-read everything and refuse if any of it moved while we looked.
+    safePhase = "enroll_reprove";
+    const after = await readLiveIdentity();
+    const recaptured = await captureBaseline(after);
+    if (after.pid !== before.pid || recaptured.digest !== captured.digest) fail("enrollment_live_state_drift");
+    safePhase = "enroll_existing";
+    const existing = await enrollmentState();
+    if (existing.status === "recorded") {
+      // Idempotent: an unchanged host re-reports its baseline and mutates
+      // nothing. A changed host refuses — the recorded baseline is no longer a
+      // restore target, and silently re-recording would destroy that evidence.
+      if (existing.record.baselineDigest !== captured.digest) fail("enrollment_baseline_drift");
+      if (existing.record.livePid !== after.pid) fail("enrollment_process_changed");
+      console.log("enrollment=unchanged"); console.log(`enrollment_id=${existing.record.enrollmentId}`);
+      console.log(`baseline_digest=${existing.record.baselineDigest}`); console.log(`baseline_source_sha=${existing.record.baseline.checkoutSourceSha}`);
+      console.log(`baseline_receipt_capable=${existing.record.baseline.receiptCapable}`); console.log(`live_pid=${after.pid}`);
+      console.log("process_signaled=no"); console.log("artifact_changed=no");
+      return;
+    }
+    safePhase = "enroll_preserve";
+    const directory = `${baselineRoot}/${enrollmentId}`;
+    await fsp.mkdir(directory, { mode: 0o700 }).catch(() => fail("enrollment_directory_exists"));
+    await requireManagedDirectory(directory);
+    const entrypointDirectory = `${directory}/entrypoint`;
+    await fsp.mkdir(entrypointDirectory, { mode: 0o700 }); await requireManagedDirectory(entrypointDirectory);
+    const preserved = `${entrypointDirectory}/index.js`;
+    await fsp.writeFile(preserved, captured.entryBytes, { flag: "wx", mode: 0o600 });
+    if (hash(await fsp.readFile(preserved)) !== captured.baseline.entrypointSha256) fail("baseline_entrypoint_copy_mismatch");
+    safePhase = "enroll_record";
+    const record = { formatVersion: 1, kind: "enrolled-baseline", enrollmentId, bridgeId, pm2App, baseline: captured.baseline, baselineDigest: captured.digest, preservedEntrypoint: preserved, livePid: after.pid, enrolledAt: nowIso() };
+    await fsp.writeFile(`${baselineRoot}/${enrollmentId}.baseline.json`, safeJson(record), { flag: "wx", mode: 0o600 });
+    const pointer = { formatVersion: 1, bridgeId, enrollmentId, baselineDigest: captured.digest, publishedAt: nowIso() };
+    const temp = `${currentBaselinePath}.next-${enrollmentId}`;
+    await fsp.writeFile(temp, safeJson(pointer), { flag: "wx", mode: 0o600 });
+    await fsp.rename(temp, currentBaselinePath);
+    safePhase = "enroll_verify";
+    // Final proof that recording changed nothing about the host: same process,
+    // same bytes at the same path, entrypoint still the checkout's own file.
+    const final = await readLiveIdentity();
+    if (final.pid !== after.pid || !final.legacy || final.entryReal !== entrypointPath) fail("enrollment_process_changed");
+    const published = await enrollmentStatus(final);
+    if (published.status !== "enrolled") fail("enrollment_verification_failed");
+    console.log("enrollment=recorded"); console.log(`enrollment_id=${enrollmentId}`);
+    console.log(`baseline_digest=${captured.digest}`); console.log(`baseline_source_sha=${captured.baseline.checkoutSourceSha}`);
+    console.log(`baseline_entrypoint_sha256=${captured.baseline.entrypointSha256}`); console.log(`baseline_receipt_capable=${captured.baseline.receiptCapable}`);
+    console.log(`live_pid=${after.pid}`); console.log("process_signaled=no"); console.log("artifact_changed=no");
+    // Enrollment establishes a baseline and nothing else. Activation stays a
+    // separate, later, explicitly invoked phase with its own proof obligations.
+    console.log(`next_preflight=npm run bridge:rollout -- --target ${bridgeId}`);
+  });
+}
+
+async function restoreBaseline() {
+  safePhase = "restore_arguments";
+  if (actionArgs.length !== 2) fail("restore_argument_count");
+  const [enrollmentId, operationId] = actionArgs;
+  if (!HASH.test(enrollmentId) || !HASH.test(operationId)) fail("restore_identity_invalid");
+  safePhase = "restore_identity";
+  await readLiveIdentity(); await requireManagedDirectory(releaseRoot); await requireManagedDirectory(baselineRoot); await requireManagedDirectory(`${releaseRoot}/locks`); await requireManagedDirectory(`${releaseRoot}/stale-locks`);
+  await withLock(operationId, async () => {
+    safePhase = "restore_record";
+    const state = await enrollmentState();
+    if (state.status !== "recorded") fail("enrollment_not_recorded");
+    if (state.record.enrollmentId !== enrollmentId) fail("enrollment_id_mismatch");
+    const identity = await readLiveIdentity();
+    if (identity.pm2.cwd !== state.record.baseline.processManager.cwd || identity.pm2.execPath !== state.record.baseline.processManager.execPath || identity.pm2.interpreter !== state.record.baseline.processManager.interpreter) fail("restore_process_manager_mismatch");
+    safePhase = "restore_entrypoint";
+    // Put the recorded bytes back at the exact recorded path and mode. This is
+    // the whole point of the baseline: the pre-enrollment artifact is restorable
+    // byte for byte, not merely described.
+    const temp = `${entrypointPath}.seam-restore-${process.pid}`;
+    await fsp.writeFile(temp, state.preservedBytes, { flag: "wx", mode: state.record.baseline.entrypointMode });
+    await fsp.chmod(temp, state.record.baseline.entrypointMode);
+    await fsp.rename(temp, entrypointPath);
+    const restored = await readLiveIdentity();
+    if (!restored.legacy || restored.entryReal !== entrypointPath) fail("restore_entrypoint_mismatch");
+    if (hash(await fsp.readFile(entrypointPath)) !== state.record.baseline.entrypointSha256) fail("restore_entrypoint_mismatch");
+    safePhase = "restore_publish";
+    // The immutable record and its preserved copy stay for audit; only the
+    // published pointer is withdrawn, so the host is unenrolled but not amnesic.
+    await fsp.unlink(currentBaselinePath).catch(() => fail("enrollment_pointer_missing"));
+    await fsp.writeFile(`${baselineRoot}/${enrollmentId}.restored.json`, safeJson({ formatVersion: 1, kind: "baseline-restore", enrollmentId, bridgeId, pm2App, baselineDigest: state.record.baselineDigest, entrypointSha256: state.record.baseline.entrypointSha256, livePid: restored.pid, restoredAt: nowIso() }), { flag: "wx", mode: 0o600 });
+    console.log("baseline=restored"); console.log(`enrollment_id=${enrollmentId}`);
+    console.log(`baseline_digest=${state.record.baselineDigest}`); console.log(`entrypoint_sha256=${state.record.baseline.entrypointSha256}`);
+    console.log(`live_pid=${restored.pid}`); console.log("process_signaled=no");
+  });
+}
+
 async function preflight() {
   if (actionArgs.length) fail("preflight_argument_count");
   const identity = await readLiveIdentity();
@@ -500,22 +717,9 @@ async function preflight() {
     const match = /^([0-9a-f]{40})-([0-9a-f]{64})$/.exec(path.basename(activeRoot)); if (!match) fail("active_release_name_invalid");
     const receipt = await validateRelease(activeRoot,match[1],match[2]); artifactSourceSha = receipt.sourceSha; artifactChecksum = receipt.artifactChecksum;
   }
-  const [entryBytes, bridgePackageBytes, commandBusBytes, rpcBytes] = await Promise.all([
-    readCapabilityFile(activeRoot,"packages/bridge/dist/index.js","deployed_entrypoint_invalid"),
-    readCapabilityFile(activeRoot,"packages/bridge/package.json","deployed_bridge_package_invalid"),
-    readCapabilityFile(activeRoot,"packages/adapters/dist/command-bus.js","deployed_protocol_invalid"),
-    readCapabilityFile(activeRoot,"packages/bridge/dist/rpc.js","deployed_rpc_invalid"),
-  ]);
-  const bridgePackage = parseJson(bridgePackageBytes,"deployed_bridge_package_invalid");
-  if (bridgePackage.name !== "@seam/bridge" || !/^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?$/.test(bridgePackage.version ?? "")) fail("deployed_bridge_package_invalid");
-  const protocolMatch = /\bPROTOCOL_VERSION\s*=\s*(\d+)\b/.exec(commandBusBytes.toString("utf8"));
-  const entrySource = entryBytes.toString("utf8"); const commandBusSource = commandBusBytes.toString("utf8"); const rpcSource = rpcBytes.toString("utf8");
-  const protocolVersion = protocolMatch?.[1] ?? "unknown";
-  const drainSupport = /process\.on\(\s*["']SIGUSR2["']/.test(entrySource) ? "yes" : "no";
-  const rpcDispatch = rpcSource.includes("isAllowedRpcMethod") && rpcSource.includes("dispatchAdapter");
-  const describeSupport = rpcDispatch && commandBusSource.includes('"describeModelCatalog"') ? "yes" : "no";
-  const fetchSupport = rpcDispatch && commandBusSource.includes('"fetchModelCatalog"') ? "yes" : "no";
-  const rolloutReady = protocolVersion === "1" && drainSupport === "yes" && describeSupport === "yes" && fetchSupport === "yes" ? "yes" : "no";
+  const capabilities = await readDeployedCapabilities(activeRoot);
+  const { bridgePackage, protocolVersion, drainSupport, describeSupport, fetchSupport, rolloutReady } = capabilities;
+  const entryBytes = capabilities.bytes[0];
   const npmPath = `${path.dirname(nodePath)}/npm`; const npmReal = await fsp.realpath(npmPath).catch(()=>fail("configured_npm_missing"));
   const npmStat = await fsp.stat(npmReal); if (!npmStat.isFile()) fail("configured_npm_wrong_type"); assertUid(npmStat,expectedUid,"configured_npm_wrong_owner"); await fsp.access(npmReal,fs.constants.X_OK).catch(()=>fail("configured_npm_not_executable"));
   const runtimeEnv = { PATH: `${path.dirname(nodePath)}:/usr/bin:/bin`, HOME: process.env.HOME ?? checkoutPath };
@@ -531,7 +735,15 @@ async function preflight() {
   const entrypointSha256 = hash(entryBytes); const artifactIdentity = artifactMode === "managed" ? `${artifactSourceSha}:${artifactChecksum}` : `entrypoint-sha256:${entrypointSha256}`;
   console.log(`artifact_mode=${artifactMode}`); console.log(`artifact_identity=${artifactIdentity}`); console.log(`artifact_source_sha=${artifactSourceSha}`); console.log(`checkout_source_sha=${checkoutSourceSha}`); console.log(`artifact_checksum=${artifactChecksum}`); console.log(`entrypoint_sha256=${entrypointSha256}`);
   console.log(`bridge_version=${bridgePackage.version}`); console.log(`protocol_version=${protocolVersion}`); console.log(`drain_SIGUSR2=${drainSupport}`); console.log(`describeModelCatalog=${describeSupport}`); console.log(`fetchModelCatalog=${fetchSupport}`); console.log(`rollout_ready=${rolloutReady}`);
-  console.log(`node_path=${nodePath}`); console.log(`node_version=${nodeVersion}`); console.log(`npm_version=${npmVersion}`); console.log(`disk_path=${checkoutPath}`); console.log(`disk_bytes_available=${diskBytesAvailable}`); console.log("identity_bound=yes"); console.log("remote_mutation=no");
+  console.log(`node_path=${nodePath}`); console.log(`node_version=${nodeVersion}`); console.log(`npm_version=${npmVersion}`); console.log(`disk_path=${checkoutPath}`); console.log(`disk_bytes_available=${diskBytesAvailable}`);
+  // Enrollment state is re-derived from live state, never trusted from the file:
+  // a recorded baseline whose host has since moved reports `drifted`, not `yes`.
+  const enrollment = await enrollmentStatus(identity);
+  console.log(`enrolled=${enrollment.status === "enrolled" ? "yes" : enrollment.status === "drifted" ? "drifted" : "no"}`);
+  console.log(`enrollment_id=${enrollment.record?.enrollmentId ?? "none"}`);
+  console.log(`baseline_digest=${enrollment.record?.baselineDigest ?? "none"}`);
+  console.log(`baseline_receipt_capable=${enrollment.record?.baseline?.receiptCapable ?? "none"}`);
+  console.log("identity_bound=yes"); console.log("remote_mutation=no");
 }
 
 async function prepareUpload() {
@@ -606,7 +818,19 @@ async function activate() {
   await readLiveIdentity(); await requireManagedDirectory(releaseRoot); await requireManagedDirectory(`${releaseRoot}/activations`); await requireManagedDirectory(`${releaseRoot}/releases`); await requireManagedDirectory(`${releaseRoot}/locks`); await requireManagedDirectory(`${releaseRoot}/stale-locks`);
   await withLock(operationId, async () => {
     const before = await readLiveIdentity();
-    if (before.legacy) fail("legacy_previous_release_not_receipt_capable");
+    if (before.legacy) {
+      // The refusal is preserved in every legacy case; enrollment only makes it
+      // specific. A rollback onto a baseline that cannot emit the nonce/PID/
+      // instance/two-RPC receipt still cannot be proven, so recording one does
+      // not buy permission to activate — and consuming even a receipt-capable
+      // baseline as an activation's previous release is a separate reviewed
+      // change, not something enrollment grants itself.
+      const enrollment = await enrollmentStatus(before);
+      if (enrollment.status === "none") fail("legacy_previous_release_not_receipt_capable");
+      if (enrollment.status === "drifted") fail("enrolled_baseline_state_drift");
+      if (enrollment.record.baseline.receiptCapable !== "yes") fail("enrolled_baseline_not_receipt_capable");
+      fail("enrolled_baseline_activation_not_enabled");
+    }
     const previousDir = path.resolve(before.entryReal, "../../../..");
     const previousName = path.basename(previousDir); const match = /^([0-9a-f]{40})-([0-9a-f]{64})$/.exec(previousName); if (!match) fail("previous_release_name_invalid");
     const previousReceipt = await validateRelease(previousDir, match[1], match[2]);
@@ -674,6 +898,8 @@ try {
   if (mode === "preflight") await preflight();
   else if (mode === "prepare-upload") await prepareUpload();
   else if (mode === "stage") await stage();
+  else if (mode === "enroll") await enroll();
+  else if (mode === "restore-baseline") await restoreBaseline();
   else if (mode === "activate") await activate();
   else if (mode === "rollback") await rollback();
   else fail("unknown_mode");

@@ -29,6 +29,10 @@ function preflightReport(target: ReturnType<typeof resolveTarget>, overrides: Re
     describeModelCatalog: "yes",
     fetchModelCatalog: "yes",
     rollout_ready: "yes",
+    enrolled: "no",
+    enrollment_id: "none",
+    baseline_digest: "none",
+    baseline_receipt_capable: "none",
     node_path: target.nodePath,
     node_version: "v24.15.0",
     npm_version: "11.6.2",
@@ -101,6 +105,10 @@ describe("bridge rollout gating and verification (#241)", () => {
     expect((await runPreflight(target, "fixed-script", fake)).report.pid).toBe("123");
     const mismatch = vi.fn(async () => ({ stdout: "bridge_id=other\npm2_app=seam-bridge\nidentity_bound=yes\n", stderr: "" }));
     await expect(runPreflight(target, "fixed-script", mismatch)).rejects.toThrow(/identity/);
+    // #281: enrollment evidence is part of the bound identity response, and a
+    // half-reported baseline is refused rather than read as "not enrolled".
+    const halfEnrolled = vi.fn(async () => ({ stdout: preflightReport(target, { enrolled: "yes" }), stderr: "" }));
+    await expect(runPreflight(target, "fixed-script", halfEnrolled)).rejects.toThrow(/enrollment evidence/);
   });
 
   it("refuses a mapped SSH host whose reported bridge id differs from the target before mutation (#282)", async () => {

@@ -71,6 +71,62 @@ managed release is fully revalidated before its receipt is reported. Run the
 preflight separately for each host. The canary remains `media-server`; observe
 and obtain separate authorization before doing anything to `macbook-air`.
 
+### 1a. ENROLL (legacy → managed baseline)
+
+```bash
+npm run bridge:rollout -- --target media-server --enroll --apply
+```
+
+Every remote bridge is an unmanaged legacy checkout, and ACTIVATE refuses from
+that state because it cannot prove a version-bound rollback. Enrollment is the
+entrance to the safe path: it records a baseline, and nothing else.
+
+It proves the same deployment identity every other phase does, then captures —
+from live state — the checkout revision (read from Git metadata, never by
+invoking remote Git), the size and SHA-256 of every file whose bytes decide
+behaviour, the entrypoint's own bytes and mode, the PM2 identity (app, cwd,
+exec path, interpreter, argv), and the runtime (Node path and version, platform,
+UID). Anything unreadable fails closed: a baseline that cannot be restored to is
+worse than none, because it looks like one. The capture is then re-taken and
+compared, and enrollment refuses `enrollment_live_state_drift` if the host moved
+while it was being read.
+
+Enrollment preserves the one artifact a later activation would replace — the
+stable entrypoint file — inside the baseline directory, verified against its
+recorded hash. That is what makes the baseline a restore target rather than a
+description of one. `--restore-baseline --enrollment-id <64-hex>` puts those
+exact bytes back at the exact path and mode and withdraws the enrollment; the
+immutable record and preserved copy remain for audit.
+
+Enrollment **sends no signal, switches no pointer, and installs nothing**. The
+running process and the bytes it would run after any restart are untouched, so
+enrollment can never silently upgrade a host. Activation stays a separate,
+later, explicitly invoked phase.
+
+Re-running is idempotent: an unchanged host re-reports its existing baseline and
+mutates nothing. A host whose deployed bytes changed since enrollment refuses
+with `enrollment_baseline_drift` rather than overwriting the evidence, and a
+pointer with no record behind it refuses with `enrollment_record_missing`.
+
+PREFLIGHT reports `enrolled` (`yes`, `no`, or `drifted`), the enrollment ID, the
+baseline digest, and `baseline_receipt_capable`. `drifted` is re-derived from
+live state, never trusted from the file.
+
+**Enrollment is not permission to activate.** A rollback onto bytes that cannot
+emit the nonce/PID/instance/two-RPC receipt still cannot be proven, so ACTIVATE
+continues to refuse for every legacy host — now naming the actual situation:
+`legacy_previous_release_not_receipt_capable` when nothing is enrolled,
+`enrolled_baseline_state_drift` when the recorded baseline no longer matches the
+host, `enrolled_baseline_not_receipt_capable` when the recorded baseline could
+not emit that receipt, and `enrolled_baseline_activation_not_enabled` when it
+could — consuming an enrolled baseline as an activation's previous release is a
+separate reviewed change, not something enrollment grants itself.
+
+Enrollment changes nothing about drain semantics and makes no claim about
+mid-turn safety. `SIGUSR2` still exits after ten seconds without output or a
+five-minute hard limit, and silence is still not proof that a provider turn
+reached a terminal event, so a host must not be activated mid-turn.
+
 ### 2. PREPARE + UPLOAD + STAGE
 
 ```bash
@@ -196,9 +252,11 @@ racing lock state refuses. Never delete a lock by hand while its owner is live.
   replacement PID. If the pointer never switched, drifted elsewhere, or any
   identity is ambiguous, rollback refuses. No record permits guessing.
 - Legacy code cannot emit a nonce/PID/instance/two-RPC rollback receipt. Therefore
-  ACTIVATE fails closed with `legacy_previous_release_not_receipt_capable` until
-  the host has been explicitly enrolled with a reviewed receipt-capable managed
-  baseline. This tool does not weaken rollback proof or perform that bootstrap.
+  ACTIVATE fails closed until the host has been explicitly enrolled with a
+  reviewed receipt-capable managed baseline, and still refuses when the enrolled
+  baseline is not itself receipt-capable. Enrollment (§1a) establishes and
+  preserves that baseline; it does not weaken rollback proof, and it does not
+  authorize activation.
 - Never replace a refusal with `pm2 restart`, `pm2 reload`, a provider login, or
   an environment/PM2 dump. Emergency/manual recovery is outside this automated
   transaction and requires a separate operator plan.

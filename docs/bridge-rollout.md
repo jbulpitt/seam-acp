@@ -118,8 +118,19 @@ apply to the whole traversal. A link pointing at the stable entrypoint (the
 `.bin` launcher shims do) is recorded as such rather than followed, so the
 digest does not change merely because the host is currently activated. Special
 files are refused outright; a hardlink is an ordinary file and its content is
-hashed. Measured on this checkout: 14,426 files / 247 MB with links followed,
-against the 120,000-file / 1-GiB bounds.
+hashed.
+
+The traversal ceiling charges **every entry** — regular file, directory,
+symlink, duplicate/cycle reference, and absent scope root — because each costs
+an `lstat`, a sort position and a digest line. Charging regular files alone left
+a symlink- or reference-heavy tree free to walk past the advertised limit. The
+byte bound is separate and bounds content, so work that carries no bytes (an
+empty file, a directory, a reference) is bounded by the entry ceiling instead of
+escaping both. Measured on this checkout with links followed: 16,421 entries
+(14,396 files, 1,969 directories, 28 symlinks, 28 references) and 247.06 MiB,
+against the 120,000-entry / 1-GiB bounds. A declared scope root that does not
+exist — a host whose bridge has not been built yet — is recorded as absent
+rather than skipped, so its later appearance is drift.
 
 Enrollment preserves the one artifact a later activation would replace — the
 stable entrypoint file — inside the baseline directory, verified against its

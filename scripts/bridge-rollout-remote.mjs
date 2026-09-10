@@ -539,7 +539,16 @@ const RUNTIME_SCOPE = {
   directories: ["packages/adapters/dist", "packages/bridge/dist", "node_modules"],
   files: ["package.json", "package-lock.json", "packages/adapters/package.json", "packages/bridge/package.json"],
 };
-const MAX_BASELINE_FILES = 120_000;
+/**
+ * The traversal ceiling charges EVERY entry — regular file, directory, symlink,
+ * duplicate/cycle reference, and absent scope root — because every one of them
+ * costs an lstat, a sort position and a digest line. Charging regular files
+ * alone left a symlink- or reference-heavy tree free to walk past the advertised
+ * limit: 120,001 links at one target consumed four file charges and enrolled.
+ * The byte bound is separate and bounds CONTENT; work that carries no bytes (an
+ * empty file, a directory, a reference) is bounded here instead.
+ */
+const MAX_BASELINE_ENTRIES = 120_000;
 const MAX_BASELINE_BYTES = 1024 * 1024 * 1024;
 
 /**
@@ -567,14 +576,19 @@ const MAX_BASELINE_BYTES = 1024 * 1024 * 1024;
  * does not change merely because the host is currently activated.
  */
 async function runtimeTreeSnapshot() {
-  const lines = []; let fileCount = 0; let bytes = 0; let linkCount = 0;
+  const lines = []; let entryCount = 0; let fileCount = 0; let bytes = 0; let linkCount = 0;
   /** canonical path -> the label its content was hashed under. */
   const hashed = new Map();
   const externalRoots = [];
 
-  const account = (size) => {
-    fileCount += 1; bytes += size;
-    if (fileCount > MAX_BASELINE_FILES || bytes > MAX_BASELINE_BYTES) fail("baseline_runtime_tree_too_large");
+  /**
+   * The single charging point. Every digest line goes through here, so nothing
+   * can be traversed or serialized without being counted.
+   */
+  const push = (line, size = 0) => {
+    entryCount += 1; bytes += size;
+    if (entryCount > MAX_BASELINE_ENTRIES || bytes > MAX_BASELINE_BYTES) fail("baseline_runtime_tree_too_large");
+    lines.push(line);
   };
   const labelFor = (canonical) => {
     if (canonical === checkoutPath) return ".";
@@ -585,19 +599,19 @@ async function runtimeTreeSnapshot() {
   const emit = async (label, canonical) => {
     const already = hashed.get(canonical);
     // Duplicate suppression AND cycle termination: reached again, referenced once.
-    if (already !== undefined) { lines.push(`= ${label} -> ${already}`); return; }
+    if (already !== undefined) { push(`= ${label} -> ${already}`); return; }
     hashed.set(canonical, label);
     const stat = await fsp.lstat(canonical);
     if (stat.isDirectory()) {
-      lines.push(`d ${label}`);
+      push(`d ${label}`);
       const entries = await fsp.readdir(canonical, { withFileTypes: true });
       entries.sort((a, b) => a.name.localeCompare(b.name));
       for (const entry of entries) await visit(`${label}/${entry.name}`, path.join(canonical, entry.name));
       return;
     }
     if (!stat.isFile()) fail("baseline_runtime_special_file");
-    account(stat.size);
-    lines.push(`f ${label} ${stat.size} ${hash(await fsp.readFile(canonical))}`);
+    fileCount += 1;
+    push(`f ${label} ${stat.size} ${hash(await fsp.readFile(canonical))}`, stat.size);
   };
 
   const visit = async (label, full) => {
@@ -606,27 +620,27 @@ async function runtimeTreeSnapshot() {
     if (!stat.isSymbolicLink()) { await emit(label, full); return; }
     linkCount += 1;
     const raw = path.resolve(path.dirname(full), await fsp.readlink(full));
-    if (raw === entrypointPath) { lines.push(`l ${label} -> <entrypoint>`); return; }
+    if (raw === entrypointPath) { push(`l ${label} -> <entrypoint>`); return; }
     let target;
     try { target = await fsp.realpath(full); } catch { fail("baseline_runtime_link_unresolvable"); }
     const targetLabel = labelFor(target);
-    lines.push(`l ${label} -> ${targetLabel}`);
+    push(`l ${label} -> ${targetLabel}`);
     if (targetLabel.startsWith("external:") && !hashed.has(target)) externalRoots.push(target);
     await emit(targetLabel, target);
   };
 
   for (const relative of RUNTIME_SCOPE.directories) {
     const full = path.join(checkoutPath, ...relative.split("/"));
-    if (!fs.existsSync(full)) { lines.push(`- ${relative}`); continue; }
+    if (!fs.existsSync(full)) { push(`- ${relative}`); continue; }
     await visit(relative, full);
   }
   for (const relative of RUNTIME_SCOPE.files) {
     const full = path.join(checkoutPath, ...relative.split("/"));
-    if (!fs.existsSync(full)) { lines.push(`- ${relative}`); continue; }
+    if (!fs.existsSync(full)) { push(`- ${relative}`); continue; }
     await visit(relative, full);
   }
   externalRoots.sort();
-  return { digest: hash(Buffer.from(`${lines.join("\n")}\n`, "utf8")), fileCount, bytes, linkCount, externalRoots };
+  return { digest: hash(Buffer.from(`${lines.join("\n")}\n`, "utf8")), entryCount, fileCount, bytes, linkCount, externalRoots };
 }
 
 /**
@@ -682,6 +696,8 @@ async function captureBaseline(identity) {
     // few. A dormant dependency that drifts changes this digest.
     runtimeScope: [...RUNTIME_SCOPE.directories, ...RUNTIME_SCOPE.files],
     runtimeTreeDigest: measured.tree.digest,
+    // What the ceiling actually charges; the rest are diagnostics.
+    runtimeEntryCount: measured.tree.entryCount,
     runtimeFileCount: measured.tree.fileCount,
     runtimeBytes: measured.tree.bytes,
     // Symlinks are followed and their targets hashed; these two fields make the

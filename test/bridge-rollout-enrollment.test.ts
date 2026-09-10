@@ -100,8 +100,24 @@ async function makeFixture(options: { capable?: boolean; withGit?: boolean } = {
   return value;
 }
 
+/** Mirrors MAX_BASELINE_ENTRIES in scripts/bridge-rollout-remote.mjs. */
+const MAX_BASELINE_ENTRIES = 120_000;
+
 const baselineDir = (f: Fixture) => path.join(f.releaseRoot, "baselines");
-const enroll = async (f: Fixture, id = H("1"), operation = H("2")) => f.run(["enroll", id, operation]);
+const enroll = async (f: Fixture, id = H("1"), operation = H("2"), timeoutMs?: number) =>
+  f.run(["enroll", id, operation], timeoutMs);
+
+/**
+ * Create many filesystem entries without serializing 120k awaits. The ceiling
+ * tests need real inodes — the point is that the traversal charges them — so
+ * this bounds wall time rather than the entry count.
+ */
+async function createMany(count: number, make: (index: number) => Promise<unknown>): Promise<void> {
+  const batch = 512;
+  for (let start = 0; start < count; start += batch) {
+    await Promise.all(Array.from({ length: Math.min(batch, count - start) }, (_, offset) => make(start + offset)));
+  }
+}
 
 afterEach(async () => {
   while (fixtures.length) {
@@ -401,6 +417,49 @@ describe.sequential("#281 restoring the recorded baseline", () => {
     // A hardlink is indistinguishable from a regular file, so its bytes are in
     // the digest: changing them through EITHER name is caught.
     await fs.writeFile(path.join(f.checkout, "node_modules/hardlinked.js"), "// drifted through the hardlink\n");
+    await expect(f.run(["restore-baseline", H("1"), H("5")])).rejects.toThrow(/baseline_runtime_tree_mismatch/);
+  }, 60_000);
+
+  it("charges symlinks and references against the ceiling, not just regular files", async () => {
+    // QA round 3. The ceiling was enforced only for regular files, so a
+    // symlink-only fan-out walked past the advertised 120,000 limit: 120,001
+    // links at one target cost four file charges and enrolled successfully.
+    const f = await makeFixture();
+    const fan = path.join(f.checkout, "node_modules/fan");
+    await fs.mkdir(fan, { recursive: true });
+    await createMany(MAX_BASELINE_ENTRIES + 1, (index) => fs.symlink(f.entry, path.join(fan, `l${index}`)));
+
+    // Generous subprocess budget: this walks 120k real inodes, and the suite
+    // runs alongside others. A timeout here would be a load artefact, not a
+    // refusal, and the assertion below distinguishes them.
+    await expect(enroll(f, H("1"), H("2"), 300_000)).rejects.toThrow(/baseline_runtime_tree_too_large/);
+    // Fails closed: nothing recorded, nothing published.
+    await expect(fs.stat(path.join(baselineDir(f), `${H("1")}.baseline.json`))).rejects.toThrow();
+    await expect(fs.stat(path.join(baselineDir(f), "current.json"))).rejects.toThrow();
+  }, 600_000);
+
+  it("charges empty files and directories, which carry no bytes at all", async () => {
+    // The byte bound cannot see zero-byte work, so the entry ceiling is what
+    // bounds it. Directories nest rather than fan out, so empty files make the
+    // same point with far fewer inodes.
+    const f = await makeFixture();
+    const empties = path.join(f.checkout, "node_modules/empties");
+    await fs.mkdir(empties, { recursive: true });
+    await createMany(MAX_BASELINE_ENTRIES + 1, (index) => fs.writeFile(path.join(empties, `e${index}`), ""));
+
+    await expect(enroll(f, H("1"), H("2"), 300_000)).rejects.toThrow(/baseline_runtime_tree_too_large/);
+    await expect(fs.stat(path.join(baselineDir(f), "current.json"))).rejects.toThrow();
+  }, 600_000);
+
+  it("records an absent declared-scope root as absent rather than ignoring it", async () => {
+    // "Not built" and "missing" are the same observation to the traversal, and
+    // both must be recorded: a scope root that later appears is drift.
+    const f = await makeFixture();
+    await fs.rm(path.join(f.checkout, "package-lock.json"), { force: true });
+    const report = parseKeyValues((await enroll(f)).stdout);
+    expect(report.enrollment).toBe("recorded");
+
+    await fs.writeFile(path.join(f.checkout, "package-lock.json"), JSON.stringify({ lockfileVersion: 3 }));
     await expect(f.run(["restore-baseline", H("1"), H("5")])).rejects.toThrow(/baseline_runtime_tree_mismatch/);
   }, 60_000);
 

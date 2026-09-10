@@ -23,6 +23,7 @@ import { access, mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs
 import { renameSync, rmSync } from "node:fs";
 import * as path from "node:path";
 import { SerialQueue } from "../serial-queue.js";
+import { DispatchSuspendedError } from "./attempt-store.js";
 import type { Logger } from "../../lib/logger.js";
 import type { DispatchResult, DispatchSpec } from "./types.js";
 import {
@@ -55,6 +56,8 @@ export interface DispatchWatcherOpts {
   resumeEnabled?: boolean;
   /** Durable ledger gate: false means recovery must terminalize, never replay. */
   mayRecover?: (id: string) => boolean;
+  /** Modern SQL-owned attempts must never use legacy original-input replay. */
+  retainForRecovery?: (id: string) => boolean;
   /**
    * Directory-listing seam. Defaults to `fs.readdir`.
    *
@@ -105,6 +108,7 @@ export class DispatchWatcher {
   private readonly pollMs: number;
   private readonly resumeEnabled: boolean;
   private readonly mayRecover: (id: string) => boolean;
+  private readonly retainForRecovery: (id: string) => boolean;
   private readonly readDir: (dir: string) => Promise<string[]>;
   private readonly beforeOwnedDoneCommit?: (id: string) => Promise<void>;
   private readonly beforeRecoveryPublish?: (id: string) => Promise<void>;
@@ -160,6 +164,7 @@ export class DispatchWatcher {
     this.pollMs = opts.pollMs ?? 1000;
     this.resumeEnabled = opts.resumeEnabled === true;
     this.mayRecover = opts.mayRecover ?? (() => true);
+    this.retainForRecovery = opts.retainForRecovery ?? (() => false);
     this.readDir = opts.readDir ?? readdir;
     this.beforeOwnedDoneCommit = opts.beforeOwnedDoneCommit;
     this.beforeRecoveryPublish = opts.beforeRecoveryPublish;
@@ -354,6 +359,7 @@ export class DispatchWatcher {
         this.logger.warn({ id }, "dispatch: terminalized stale spec blocked by ledger");
         continue;
       }
+      if (this.retainForRecovery(id)) continue;
       if (await this.requeueStale(id)) requeued++;
     }
     if (requeued > 0) {
@@ -884,6 +890,11 @@ export class DispatchWatcher {
         }
       } catch (err) {
         if (!this.owns(owner)) return;
+        if (err instanceof DispatchSuspendedError) {
+          // SQL owns suspension. Keep the running spec; no failed done/report.
+          this.logger.info({ id, target: spec.target }, "dispatch: attempt retained");
+          return;
+        }
         const message = (err as Error)?.message ?? String(err);
         const partial = err instanceof DispatchTurnError ? err.output : undefined;
         const stopReason = err instanceof DispatchTurnError ? err.stopReason : undefined;

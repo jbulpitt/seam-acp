@@ -79,8 +79,8 @@ export function fixtureModelCatalog(profiles: ReadonlyArray<AgentProfile>): Mode
   return {
     models: rows,
     model,
-    effortChoices: (binding, id) => model(binding, id)?.effort.choices.map((choice) => choice.id) ?? [],
-    lookup: (binding) => {
+    effortChoices: (binding: CatalogBinding, id: string) => model(binding, id)?.effort.choices.map((choice) => choice.id) ?? [],
+    lookup: (binding: CatalogBinding) => {
       const all = rows(binding);
       return {
         state: all.length ? "ready" : "warming",
@@ -101,7 +101,7 @@ export function fixtureModelCatalog(profiles: ReadonlyArray<AgentProfile>): Mode
         observation: null,
       };
     },
-    resolve: (binding, selection) => {
+    resolve: (binding: CatalogBinding, selection: { model: string; effort?: string }) => {
       const found = model(binding, selection.model);
       if (!found) throw new Error(`fixture model unavailable: ${selection.model}`);
       const effort = selection.effort ?? found.effort.selectionDefault;

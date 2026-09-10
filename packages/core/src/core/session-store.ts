@@ -1,4 +1,5 @@
 import Database from "better-sqlite3";
+import { TurnAttemptStore } from "./dispatch/attempt-store.js";
 import fs from "node:fs";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
@@ -383,11 +384,13 @@ export function isPlannedChainChildId(id: string | null | undefined): id is stri
 
 export class SessionStore {
   private readonly db: Database.Database;
+  readonly turnAttempts: TurnAttemptStore;
 
   constructor(dbPath: string) {
     fs.mkdirSync(path.dirname(dbPath), { recursive: true });
     this.db = new Database(dbPath);
     this.db.pragma("journal_mode = WAL");
+    this.turnAttempts = new TurnAttemptStore(this.db);
     this.db.exec(SCHEMA);
     this.db.exec(DELEGATION_SCHEMA);
     this.migrateReportBackDedupIndex();
@@ -1976,7 +1979,9 @@ export class SessionStore {
       .prepare(
         `UPDATE delegation_log
             SET status = 'interrupted', updated_utc = ?
-          WHERE status IN (${placeholders})`
+          WHERE status IN (${placeholders})
+            AND NOT EXISTS (SELECT 1 FROM turn_attempts WHERE turn_attempts.id=delegation_log.id
+              AND turn_attempts.state IN ('active','completed'))`
       )
       .run(nowUtc, ...DELEGATION_ACTIVE_STATUSES);
     return info.changes;
@@ -1996,7 +2001,8 @@ export class SessionStore {
       .prepare(
         `UPDATE delegation_log
             SET status = 'abandoned', updated_utc = ?
-          WHERE status = 'running' AND updated_utc < ?`
+          WHERE status = 'running' AND updated_utc < ?
+            AND NOT EXISTS (SELECT 1 FROM turn_attempts WHERE turn_attempts.id=delegation_log.id)`
       )
       .run(nowUtc, cutoffUtc);
     return info.changes;

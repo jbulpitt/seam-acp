@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { artifactName, buildArtifact, commandRunner, makeScpCommand, makeSshCommand, parseArgs, resolveTarget, rollbackPlan, runPreflight, validateReadyReceipt, validateTargetMap, verifyChecksum } from "../scripts/lib/bridge-rollout.mjs";
+import { activationRefusal, artifactName, buildArtifact, commandRunner, makeScpCommand, makeSshCommand, parseArgs, parseKeyValues, resolveTarget, rollbackPlan, runPreflight, validateReadyReceipt, validateTargetMap, verifyChecksum } from "../scripts/lib/bridge-rollout.mjs";
 
 const root = path.resolve(import.meta.dirname, "..");
 const configured = JSON.parse(fs.readFileSync(path.join(root, "ops/bridge/targets.json"), "utf8"));
@@ -29,6 +29,10 @@ function preflightReport(target: ReturnType<typeof resolveTarget>, overrides: Re
     describeModelCatalog: "yes",
     fetchModelCatalog: "yes",
     rollout_ready: "yes",
+    enrolled: "no",
+    enrollment_id: "none",
+    baseline_digest: "none",
+    baseline_receipt_capable: "none",
     node_path: target.nodePath,
     node_version: "v24.15.0",
     npm_version: "11.6.2",
@@ -61,7 +65,38 @@ describe("bridge rollout target safety (#241)", () => {
       expect(() => resolveTarget(targets, parsed.target)).toThrow(/explicitly unmanaged.*home-hub is a distinct bridge/);
     }
     expect(() => makeSshCommand(target, ["preflight"], "fixed-script")).toThrow(/explicitly unmanaged/);
+    // #281: enrollment must refuse the same state. Recording a baseline for a
+    // host with no verified management path would produce a rollback target
+    // nobody could ever restore to — the inversion of the primitive's purpose.
+    for (const argv of [
+      ["--target", "macbook-pro", "--enroll", "--apply"],
+      ["--target", "macbook-pro", "--restore-baseline", "--enrollment-id", token, "--apply"],
+    ]) {
+      const parsed = parseArgs(argv);
+      expect(() => resolveTarget(targets, parsed.target)).toThrow(/explicitly unmanaged/);
+    }
+    expect(() => makeSshCommand(target, ["enroll", token, token], "fixed-script")).toThrow(/explicitly unmanaged/);
     expect(() => makeScpCommand(target, "/tmp/release.tgz", `${artifactName("a".repeat(40), "b".repeat(64))}.upload-${token}`)).toThrow(/explicitly unmanaged/);
+  });
+
+  it("surfaces the enrollment-specific reason behind the activation capability gate (#281)", () => {
+    const target = resolveTarget(targets, "media-server");
+    // The gate itself is unchanged — it still refuses — but a legacy host no
+    // longer gets a generic capability message that hides which of the four
+    // legacy states it is actually in.
+    const legacy = (overrides: Record<string, string>) =>
+      parseKeyValues(preflightReport(target, { artifact_mode: "legacy-checkout", rollout_ready: "no", ...overrides }));
+    expect(activationRefusal(legacy({ enrolled: "no" }))).toMatch(/nothing is enrolled.*legacy_previous_release_not_receipt_capable.*--enroll/s);
+    expect(activationRefusal(legacy({ enrolled: "drifted", enrollment_id: "a".repeat(64), baseline_digest: "b".repeat(64), baseline_receipt_capable: "no" })))
+      .toMatch(/enrolled_baseline_state_drift/);
+    expect(activationRefusal(legacy({ enrolled: "yes", enrollment_id: "a".repeat(64), baseline_digest: "b".repeat(64), baseline_receipt_capable: "no" })))
+      .toMatch(/enrolled_baseline_not_receipt_capable/);
+    expect(activationRefusal(legacy({ enrolled: "yes", enrollment_id: "a".repeat(64), baseline_digest: "b".repeat(64), baseline_receipt_capable: "yes" })))
+      .toMatch(/enrolled_baseline_activation_not_enabled/);
+    // A managed host keeps the original message; enrollment says nothing there.
+    expect(activationRefusal(parseKeyValues(preflightReport(target, { rollout_ready: "no" })))).toBe(
+      "active bridge lacks the verified drain/protocol/catalog capabilities required for activation or rollback"
+    );
   });
 
   it("rejects unknown fields, shell characters, path ambiguity, and incomplete identities", () => {
@@ -101,6 +136,10 @@ describe("bridge rollout gating and verification (#241)", () => {
     expect((await runPreflight(target, "fixed-script", fake)).report.pid).toBe("123");
     const mismatch = vi.fn(async () => ({ stdout: "bridge_id=other\npm2_app=seam-bridge\nidentity_bound=yes\n", stderr: "" }));
     await expect(runPreflight(target, "fixed-script", mismatch)).rejects.toThrow(/identity/);
+    // #281: enrollment evidence is part of the bound identity response, and a
+    // half-reported baseline is refused rather than read as "not enrolled".
+    const halfEnrolled = vi.fn(async () => ({ stdout: preflightReport(target, { enrolled: "yes" }), stderr: "" }));
+    await expect(runPreflight(target, "fixed-script", halfEnrolled)).rejects.toThrow(/enrollment evidence/);
   });
 
   it("refuses a mapped SSH host whose reported bridge id differs from the target before mutation (#282)", async () => {

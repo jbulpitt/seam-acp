@@ -2,7 +2,7 @@
 import { randomBytes } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { buildArtifact, commandRunner, loadTargetMap, makeScpCommand, makeSshCommand, parseArgs, parseKeyValues, renderRemoteScript, resolveTarget, rollbackPlan, runPreflight } from "./lib/bridge-rollout.mjs";
+import { activationRefusal, buildArtifact, commandRunner, loadTargetMap, makeScpCommand, makeSshCommand, parseArgs, parseKeyValues, renderRemoteScript, resolveTarget, rollbackPlan, runPreflight } from "./lib/bridge-rollout.mjs";
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(scriptDir, "..");
@@ -12,6 +12,8 @@ function usage() {
   console.log("Usage:");
   console.log("  node scripts/bridge-rollout.mjs --target <bridge-id>");
   console.log("  node scripts/bridge-rollout.mjs --target <bridge-id> --stage --apply");
+  console.log("  node scripts/bridge-rollout.mjs --target <bridge-id> --enroll --apply");
+  console.log("  node scripts/bridge-rollout.mjs --target <bridge-id> --restore-baseline --enrollment-id <64-hex> --apply");
   console.log("  node scripts/bridge-rollout.mjs --target <bridge-id> --activate --sha <40-hex> --checksum <64-hex> --stage-id <64-hex> --apply");
   console.log("  node scripts/bridge-rollout.mjs --target <bridge-id> --rollback --activation-id <64-hex> --apply");
 }
@@ -42,7 +44,29 @@ async function main() {
     console.log(`activate_command=npm run bridge:rollout -- --target ${target.bridgeId} --activate --sha ${artifact.sha} --checksum ${artifact.checksum} --stage-id ${stageId} --apply`);
     return;
   }
-  if (preflight.report.rollout_ready !== "yes") throw new Error("active bridge lacks the verified drain/protocol/catalog capabilities required for activation or rollback");
+  if (options.action === "enroll") {
+    // Enrollment records a baseline for the host as it is. It deliberately does
+    // NOT require rollout readiness: an unmanaged host that is not yet
+    // receipt-capable is exactly the host that needs a recorded baseline. It
+    // does not alter or signal the RUNNABLE deployment — no entrypoint switch,
+    // no install, no signal beyond a liveness probe — though it does write
+    // rollout metadata and take the target lock, so activation stays a
+    // separate, later, explicitly invoked phase.
+    const enrollmentId = nonce(); const operationId = nonce();
+    const result = await commandRunner(makeSshCommand(target, ["enroll", enrollmentId, operationId], remoteScript));
+    process.stdout.write(result.stdout);
+    const report = parseKeyValues(result.stdout);
+    if (report.process_signaled !== "no" || report.artifact_changed !== "no") throw new Error("enrollment reported a mutation it must never perform");
+    console.log(`restore_command=npm run bridge:rollout -- --target ${target.bridgeId} --restore-baseline --enrollment-id ${report.enrollment_id} --apply`);
+    return;
+  }
+  if (options.action === "restore-baseline") {
+    const operationId = nonce();
+    const result = await commandRunner(makeSshCommand(target, ["restore-baseline", options.enrollmentId, operationId], remoteScript));
+    process.stdout.write(result.stdout);
+    return;
+  }
+  if (preflight.report.rollout_ready !== "yes") throw new Error(activationRefusal(preflight.report));
   if (options.action === "activate") {
     const activationId = nonce(); const operationId = nonce();
     console.log(`activation_id=${activationId}`);

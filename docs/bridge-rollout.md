@@ -71,6 +71,141 @@ managed release is fully revalidated before its receipt is reported. Run the
 preflight separately for each host. The canary remains `media-server`; observe
 and obtain separate authorization before doing anything to `macbook-air`.
 
+### 1a. ENROLL (legacy → managed baseline)
+
+```bash
+npm run bridge:rollout -- --target media-server --enroll --apply
+```
+
+Every remote bridge is an unmanaged legacy checkout, and ACTIVATE refuses from
+that state because it cannot prove a version-bound rollback. Enrollment is the
+entrance to the safe path: it records a baseline, and nothing else.
+
+It proves the same deployment identity every other phase does, then captures —
+from live state — the checkout revision (read from Git metadata, never by
+invoking remote Git), a digest of the **whole declared runtime scope**, the
+entrypoint's own bytes and mode, the PM2 identity (app, cwd, exec path,
+interpreter, argv), and the runtime (Node path and version, platform, UID).
+Anything unreadable fails closed: a baseline that cannot be restored to is worse
+than none, because it looks like one. The capture is then re-taken and compared,
+and enrollment refuses `enrollment_live_state_drift` if the host moved while it
+was being read.
+
+The runtime scope is `packages/adapters/dist`, `packages/bridge/dist`,
+`node_modules`, and the package manifests, recorded in the baseline itself. It
+is deliberately a whole-tree digest rather than a walk of the entrypoint's
+import graph: closure tracking is more precise, but its failure mode is silent —
+a dynamic `import()`, a bare specifier resolved through conditional exports, a
+`require` inside a dependency or a native addon the walker does not model is
+simply absent, and an absent file is exactly the defect this guards against.
+Hashing everything in scope can only over-capture, which fails loudly. The
+stable entrypoint is excluded from that digest because during managed operation
+it is a symlink into a release; its bytes are held and verified separately as
+the preserved baseline copy.
+
+Symlinks are followed and their targets hashed, not recorded as link text. A
+reference recorded only by name is a hole: the bytes it resolves to are what the
+process loads, so a dependency linked out of `node_modules` could drift while
+the link text stayed identical. Refusing escaping links instead is not an
+option — a real checkout's `node_modules` contains workspace links
+(`@seam/adapters`, `@seam/bridge`, `@seam/core` resolve into `packages/`) and
+`.bin` shims that link across packages, so that rule would refuse every real
+host. Following is bounded rather than trusted: targets are canonicalized
+first, a target already hashed is referenced instead of re-hashed (which also
+terminates cycles), targets outside the checkout are recorded in the baseline as
+`runtimeExternalRoots` so the inclusion is explicit, and the file/byte limits
+apply to the whole traversal. A link pointing at the stable entrypoint (the
+`.bin` launcher shims do) is recorded as such rather than followed, so the
+digest does not change merely because the host is currently activated. Special
+files are refused outright; a hardlink is an ordinary file and its content is
+hashed.
+
+The traversal ceiling charges **every entry** — regular file, directory,
+symlink, duplicate/cycle reference, and absent scope root — because each costs
+an `lstat`, a sort position and a digest line. Charging regular files alone left
+a symlink- or reference-heavy tree free to walk past the advertised limit. The
+byte bound is separate and bounds content, so work that carries no bytes (an
+empty file, a directory, a reference) is bounded by the entry ceiling instead of
+escaping both.
+
+Both ceilings are tested **before** the work they bound. An entry is charged and
+checked before its content is opened, so an over-limit file is refused without
+ever being read — charging inside the expression that read the file meant a
+multi-gigabyte file could exhaust memory before the controlled refusal ran.
+File hashing is incremental, so resident memory is one chunk regardless of file
+size and a file that grew past its charged size is caught during the read.
+Directory enumeration is bounded the same way: a listing must be materialized to
+be sorted (the digest is stable only because the order is fixed), so enumeration
+stops as soon as that directory alone cannot fit the remaining budget, leaving at
+most `remaining + 1` names resident. So the entry ceiling bounds enumeration and
+serialization, not merely the accepted digest. Measured on this checkout with links followed: 16,421 entries
+(14,396 files, 1,969 directories, 28 symlinks, 28 references) and 247.06 MiB,
+against the 120,000-entry / 1-GiB bounds. A declared scope root that does not
+exist — a host whose bridge has not been built yet — is recorded as absent
+rather than skipped, so its later appearance is drift.
+
+Enrollment preserves the one artifact a later activation would replace — the
+stable entrypoint file — inside the baseline directory, verified against its
+recorded hash. That is what makes the baseline a restore target rather than a
+description of one.
+
+`--restore-baseline --enrollment-id <64-hex>` **verifies before it changes
+anything**: the recorded revision and every recorded non-entrypoint runtime file
+must still match. Only then does it put the preserved bytes back at the exact
+path and mode, re-prove the result, and withdraw the enrollment pointer; the
+immutable record and preserved copy remain for audit. If the surrounding tree
+drifted, restore refuses and leaves both the current entrypoint and the
+enrollment pointer exactly as it found them. Restoring only the entrypoint onto
+a drifted checkout would report success while leaving the host to start a
+combination that never existed, so it is not treated as a restore at all.
+
+Enrollment **does not alter or signal the runnable deployment**: no entrypoint
+switch, no install, no signal other than `kill(pid, 0)` for liveness. It is not
+a filesystem no-op — it creates and chmods rollout metadata under the release
+root and takes and releases the target lock — but the running process and the
+bytes it would run after any restart are untouched, so enrollment can never
+silently upgrade a host. Activation stays a separate, later, explicitly invoked
+phase.
+
+Re-running is idempotent in durable state: an unchanged host re-reports its
+existing baseline and every recorded artifact stays byte-identical. The rerun
+does still take and release the target lock and re-apply 0700 to the metadata
+directories. A host whose runtime tree changed since enrollment refuses with
+`enrollment_baseline_drift` rather than overwriting the evidence, and a pointer
+with no record behind it refuses with `enrollment_record_missing`.
+
+PREFLIGHT reports `enrolled` (`yes`, `no`, or `drifted`), the enrollment ID, the
+baseline digest, and `baseline_receipt_capable`. `drifted` is re-derived from
+live state, never trusted from the file.
+
+A target that is explicitly unmanaged (`sshAlias: null` with an
+`unmanagedReason`, #282) is refused before any command is constructed, for
+enrollment exactly as for every other phase: recording a baseline for a host
+with no verified management path would produce a rollback target nobody could
+restore to.
+
+**Enrollment is not permission to activate.** A rollback onto bytes that cannot
+emit the nonce/PID/instance/two-RPC receipt still cannot be proven, so ACTIVATE
+continues to refuse for every legacy host — now naming the actual situation,
+both in the remote program and in the local capability gate that runs first:
+`legacy_previous_release_not_receipt_capable` when nothing is enrolled,
+`enrolled_baseline_state_drift` when the recorded baseline no longer matches the
+host, `enrolled_baseline_not_receipt_capable` when the recorded baseline could
+not emit that receipt, and `enrolled_baseline_activation_not_enabled` when it
+could — consuming an enrolled baseline as an activation's previous release is a
+separate reviewed change, not something enrollment grants itself.
+
+The baseline record is `formatVersion: 1`, `kind: "enrolled-baseline"`. Version 1
+hardwires PM2, a Node runtime, a JavaScript checkout entrypoint and this exact
+runtime scope. A host that does not fit that shape — native artifacts, a
+different process manager — needs a genuinely separate version-2 capture and
+restore path, not extra fields bolted onto version 1.
+
+Enrollment changes nothing about drain semantics and makes no claim about
+mid-turn safety. `SIGUSR2` still exits after ten seconds without output or a
+five-minute hard limit, and silence is still not proof that a provider turn
+reached a terminal event, so a host must not be activated mid-turn.
+
 ### 2. PREPARE + UPLOAD + STAGE
 
 ```bash
@@ -196,9 +331,11 @@ racing lock state refuses. Never delete a lock by hand while its owner is live.
   replacement PID. If the pointer never switched, drifted elsewhere, or any
   identity is ambiguous, rollback refuses. No record permits guessing.
 - Legacy code cannot emit a nonce/PID/instance/two-RPC rollback receipt. Therefore
-  ACTIVATE fails closed with `legacy_previous_release_not_receipt_capable` until
-  the host has been explicitly enrolled with a reviewed receipt-capable managed
-  baseline. This tool does not weaken rollback proof or perform that bootstrap.
+  ACTIVATE fails closed until the host has been explicitly enrolled with a
+  reviewed receipt-capable managed baseline, and still refuses when the enrolled
+  baseline is not itself receipt-capable. Enrollment (§1a) establishes and
+  preserves that baseline; it does not weaken rollback proof, and it does not
+  authorize activation.
 - Never replace a refusal with `pm2 restart`, `pm2 reload`, a provider login, or
   an environment/PM2 dump. Emergency/manual recovery is outside this automated
   transaction and requires a separate operator plan.

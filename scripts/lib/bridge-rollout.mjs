@@ -87,8 +87,8 @@ function requireManagedTarget(target) {
 export function parseArgs(argv) {
   const values = new Map();
   const booleans = new Set();
-  const valueFlags = new Set(["--target", "--sha", "--checksum", "--stage-id", "--activation-id", "--timeout-seconds"]);
-  const boolFlags = new Set(["--apply", "--stage", "--activate", "--rollback", "--help"]);
+  const valueFlags = new Set(["--target", "--sha", "--checksum", "--stage-id", "--activation-id", "--enrollment-id", "--timeout-seconds"]);
+  const boolFlags = new Set(["--apply", "--stage", "--enroll", "--restore-baseline", "--activate", "--rollback", "--help"]);
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (valueFlags.has(arg)) {
@@ -104,12 +104,12 @@ export function parseArgs(argv) {
   if (booleans.has("--help")) return { help: true };
   const target = values.get("--target");
   if (!target) throw new Error("--target is required (exactly one host; fan-out is unsupported)");
-  const actions = ["--stage", "--activate", "--rollback"].filter((flag) => booleans.has(flag));
-  if (actions.length > 1) throw new Error("choose only one of --stage, --activate, or --rollback");
+  const actions = ["--stage", "--enroll", "--restore-baseline", "--activate", "--rollback"].filter((flag) => booleans.has(flag));
+  if (actions.length > 1) throw new Error("choose only one of --stage, --enroll, --restore-baseline, --activate, or --rollback");
   const action = actions[0]?.slice(2) ?? "preflight";
   const apply = booleans.has("--apply");
   if (action !== "preflight" && !apply) throw new Error(`${actions[0]} mutates a remote host and requires --apply`);
-  if (action === "preflight" && apply) throw new Error("--apply requires --stage, --activate, or --rollback");
+  if (action === "preflight" && apply) throw new Error("--apply requires one of --stage, --enroll, --restore-baseline, --activate, or --rollback");
   const sha = values.get("--sha");
   const checksum = values.get("--checksum");
   const stageId = values.get("--stage-id");
@@ -122,9 +122,15 @@ export function parseArgs(argv) {
   if (action === "rollback") {
     if (!TOKEN.test(activationId ?? "")) throw new Error("--rollback requires an exact immutable --activation-id");
   } else if (activationId) throw new Error("--activation-id is valid only with --rollback");
+  const enrollmentId = values.get("--enrollment-id");
+  // Enrollment mints its own immutable id; a restore must name the exact one it
+  // is putting back, so there is no "restore whatever was last recorded".
+  if (action === "restore-baseline") {
+    if (!TOKEN.test(enrollmentId ?? "")) throw new Error("--restore-baseline requires the exact immutable --enrollment-id printed by enrollment");
+  } else if (enrollmentId) throw new Error("--enrollment-id is valid only with --restore-baseline");
   const timeoutSeconds = Number(values.get("--timeout-seconds") ?? "420");
   if (!Number.isInteger(timeoutSeconds) || timeoutSeconds < 10 || timeoutSeconds > 900) throw new Error("--timeout-seconds must be an integer from 10 through 900");
-  return { help: false, target, action, apply, sha, checksum, stageId, activationId, timeoutSeconds };
+  return { help: false, target, action, apply, sha, checksum, stageId, activationId, enrollmentId, timeoutSeconds };
 }
 
 function targetArgs(target) {
@@ -284,8 +290,28 @@ export async function runPreflight(target, remoteScript, run = commandRunner) {
   if (!/^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?$/.test(report.bridge_version ?? "") || !/^(?:\d+|unknown)$/.test(report.protocol_version ?? "") || ![report.drain_SIGUSR2,report.describeModelCatalog,report.fetchModelCatalog,report.rollout_ready].every((value)=>value === "yes" || value === "no")) throw new Error("remote bridge capability evidence is incomplete");
   const expectedReadiness = report.protocol_version === "1" && report.drain_SIGUSR2 === "yes" && report.describeModelCatalog === "yes" && report.fetchModelCatalog === "yes" ? "yes" : "no";
   if (report.rollout_ready !== expectedReadiness) throw new Error("remote bridge readiness evidence is inconsistent");
+  if (!/^(yes|no|drifted)$/.test(report.enrolled ?? "")) throw new Error("remote enrollment evidence is incomplete");
+  if (report.enrolled === "no") {
+    if (report.enrollment_id !== "none" || report.baseline_digest !== "none" || report.baseline_receipt_capable !== "none") throw new Error("remote enrollment evidence is inconsistent");
+  } else if (!TOKEN.test(report.enrollment_id ?? "") || !CHECKSUM.test(report.baseline_digest ?? "") || !/^(yes|no)$/.test(report.baseline_receipt_capable ?? "")) throw new Error("remote enrollment evidence is incomplete");
   if (report.node_path !== target.nodePath || !/^v(?:2[2-9]|[3-9]\d)\.\d+\.\d+/.test(report.node_version ?? "") || !/^\d+\.\d+\.\d+/.test(report.npm_version ?? "") || report.disk_path !== target.checkoutPath || !/^\d+$/.test(report.disk_bytes_available ?? "") || BigInt(report.disk_bytes_available) <= 0n) throw new Error("remote runtime capacity evidence is incomplete");
   return { command, report, stdout: result.stdout };
 }
 
 export function newOperationId() { return randomBytes(32).toString("hex"); }
+
+/**
+ * The capability gate is unchanged — it still refuses — but the operator sees
+ * WHY, from the enrollment evidence already in the preflight report. Before
+ * this the local gate short-circuited first and every legacy host got the same
+ * generic capability message, so the remote program's specific refusals were
+ * unreachable in normal operation (#281 QA).
+ */
+export function activationRefusal(report) {
+  const generic = "active bridge lacks the verified drain/protocol/catalog capabilities required for activation or rollback";
+  if (report.artifact_mode !== "legacy-checkout") return generic;
+  if (report.enrolled === "no") return `${generic}; nothing is enrolled on this host, so no rollback target exists yet (legacy_previous_release_not_receipt_capable) — run --enroll --apply first`;
+  if (report.enrolled === "drifted") return `${generic}; the recorded baseline no longer matches this host (enrolled_baseline_state_drift)`;
+  if (report.baseline_receipt_capable !== "yes") return `${generic}; the enrolled baseline cannot emit a rollback receipt (enrolled_baseline_not_receipt_capable)`;
+  return `${generic}; activating from an enrolled baseline is a separate reviewed change (enrolled_baseline_activation_not_enabled)`;
+}

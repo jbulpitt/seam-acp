@@ -892,6 +892,7 @@ async function main(): Promise<void> {
       // global newest-N cap still surfaces), the DERIVED busy read + config
       // precedence from the router, and the platform's thread-name/live-state
       // lookups. Self-scoped: the channel is record.parentRef, never an arg.
+      getScheduledWork: (record) => orchestrator.scheduledWorkForCaller(record),
       listThreads: async (record) => {
         if (!record.parentRef) return [];
         const siblings = store.listSessionsByParent(record.platform, record.parentRef);
@@ -1039,7 +1040,7 @@ async function main(): Promise<void> {
   const scheduledManager = new ScheduledPromptManager({
     store,
     logger: logger.child({ mod: "scheduled" }),
-    onFire: (id) => orchestrator.runScheduledPrompt(id),
+    onFire: (id, occurrence) => orchestrator.runScheduledPrompt(id, occurrence),
   });
   orchestrator.setScheduledManager(scheduledManager);
 
@@ -1480,6 +1481,7 @@ async function main(): Promise<void> {
           memoryRssBytes: mem.rss,
           memoryHeapUsedBytes: mem.heapUsed,
           activeTurns: orchestrator.activeTurnCount(),
+          activeScheduledOccurrences: orchestrator.activeScheduledOccurrenceCount(),
           liveRuntimes: router.liveRuntimeCount(),
           sessions: store.countSessions(),
           pendingWakes: store.countPendingWakes(),

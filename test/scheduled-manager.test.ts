@@ -106,7 +106,7 @@ describe("ScheduledPromptManager overlap guard (D3)", () => {
     const row = makeRow();
     const { store } = makeStore(row);
     const onFire = vi
-      .fn<[string], Promise<void>>()
+      .fn<(id: string) => Promise<void>>()
       .mockRejectedValueOnce(new Error("boom"))
       .mockResolvedValueOnce(undefined);
 
@@ -120,6 +120,24 @@ describe("ScheduledPromptManager overlap guard (D3)", () => {
 });
 
 describe("ScheduledPromptManager.runNow", () => {
+  it("keys cron callbacks by the armed slot while manual fires remain distinct", async () => {
+    vi.useFakeTimers(); vi.setSystemTime(new Date("2026-09-09T00:00:00.000Z"));
+    const row = makeRow({ timezone: "UTC" });
+    const { store } = makeStore(row);
+    const onFire = vi.fn(async (_id: string, _occurrence: unknown) => {});
+    const manager = new ScheduledPromptManager({ store, onFire, logger: silentLogger });
+    try {
+      manager.start(); await manager.runNow(row.id);
+      await vi.advanceTimersByTimeAsync(60000);
+      await vi.advanceTimersByTimeAsync(60000);
+      expect(onFire.mock.calls.map(c => c[1])).toEqual([
+        { id: expect.stringMatching(/^scheduled-/), scheduledFor: null },
+        { id: expect.stringMatching(/^scheduled-/), scheduledFor: "2026-09-09T00:01:00.000Z" },
+        { id: expect.stringMatching(/^scheduled-/), scheduledFor: "2026-09-09T00:02:00.000Z" },
+      ]);
+      expect(new Set(onFire.mock.calls.map(c => (c[1] as { id: string }).id)).size).toBe(3);
+    } finally { manager.stop(); vi.useRealTimers(); }
+  });
   it("invokes onFire and does not require the row to be enabled", async () => {
     const row = makeRow({ enabled: false, cron: "0 9 * * *" });
     const { store } = makeStore(row);
@@ -127,7 +145,7 @@ describe("ScheduledPromptManager.runNow", () => {
     const manager = new ScheduledPromptManager({ store, onFire, logger: silentLogger });
     await manager.runNow(row.id);
     expect(onFire).toHaveBeenCalledTimes(1);
-    expect(onFire).toHaveBeenCalledWith(row.id);
+    expect(onFire).toHaveBeenCalledWith(row.id, { id: expect.stringMatching(/^scheduled-/), scheduledFor: null });
     manager.stop();
   });
 });

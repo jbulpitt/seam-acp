@@ -38,6 +38,7 @@ import type { InjectTurnOptions } from "../packages/core/src/core/inject-turn.js
 import type { SessionRecord } from "../packages/core/src/core/types.js";
 import type { ChannelRef, MessageRef } from "../packages/core/src/platforms/chat-adapter.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
+import { simulateRetiredOwnerProcess } from "./restart-process-fixture.js";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
 const THREAD = "1516907849349857421";
@@ -213,6 +214,7 @@ afterEach(() => {
   store.close();
   fs.rmSync(dataDir, { recursive: true, force: true });
   fs.rmSync(dbDir, { recursive: true, force: true });
+  vi.restoreAllMocks();
 });
 
 /** Specs the runtime enqueued for itself (a report-back would land here). */
@@ -528,7 +530,7 @@ describe("#246 isolated ingest owns every terminal transition", () => {
     const spec = planEndpointDispatch({ endpoint: row, payload: "synthetic pre-prompt input" });
     const results = new ChoiceResultHub({ store, logger: silent });
     expectJob(results, spec.id, row.resultSchema);
-    vi.spyOn(store.turnAttempts, "registerOwner").mockImplementation(() => {});
+    simulateRetiredOwnerProcess();
     const first = makeOrch(dataDir, store, {
       profile: { id: "codex", defaultModel: "default" },
     }).orch;
@@ -604,7 +606,7 @@ describe("#246 isolated ingest owns every terminal transition", () => {
     // Model a process boundary without pretending the still-running test PID
     // is dead. PID/boot ownership is exercised by #250's store tests; this
     // fixture follows the production isolated-ingest lifecycle around it.
-    const ownerSpy = vi.spyOn(store.turnAttempts, "registerOwner").mockImplementation(() => {});
+    simulateRetiredOwnerProcess();
     const first = makeOrch(dataDir, store, {
       profile: { id: "codex", defaultModel: "default" },
     }).orch;
@@ -672,7 +674,6 @@ describe("#246 isolated ingest owns every terminal transition", () => {
     expect(store.getChoiceResult(spec.id)).toMatchObject({ status: "ok", body: { answer: 9 } });
     expect(store.getDelegation(spec.id)?.status).toBe("completed");
     expect(store.turnAttempts.get(spec.id)).toMatchObject({ state: "completed", generation: 2 });
-    ownerSpy.mockRestore();
   });
 
   it("retains a submitted non-Codex HTTP job for explicit recovery without a fresh execution", async () => {
@@ -681,7 +682,7 @@ describe("#246 isolated ingest owns every terminal transition", () => {
     const spec = planEndpointDispatch({ endpoint: row, payload: "synthetic original input" });
     const results = new ChoiceResultHub({ store, logger: silent });
     expectJob(results, spec.id, row.resultSchema);
-    vi.spyOn(store.turnAttempts, "registerOwner").mockImplementation(() => {});
+    simulateRetiredOwnerProcess();
     const first = makeOrch(dataDir, store, {
       profile: { id: "claude", defaultModel: "default" },
     }).orch;

@@ -15,6 +15,7 @@ export async function projectAttemptCompletions(
   await mkdir(dirs.done, { recursive: true });
   let n = 0;
   for (const a of [...attempts.list("completed"), ...attempts.list("cancelled")]) {
+    if (a.source !== "dispatch") continue;
     if (!needsProjection(a.id)) continue;
     if (!a.outcome) throw new Error("completed attempt has no durable outcome");
     if (!a.id || a.id === "." || a.id === ".." || path.basename(a.id) !== a.id || /[\\\0]/.test(a.id)) {

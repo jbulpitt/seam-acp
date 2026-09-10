@@ -85,6 +85,20 @@ afterEach(() => {
 });
 
 describe("injectTurn isolated resumeSessionId", () => {
+  it("an optional cleanup attribution failure cannot prevent isolated disposal/history cleanup (#253)", async () => {
+    const deleteSession = vi.fn(async () => {});
+    const profile = { id: "codex", defaultModel: "m", sessionManager: { deleteSession } } as any;
+    const orch = new Orchestrator({ logger: silent, store, config: { REPOS_ROOT: dir, DATA_DIR: dir } as any,
+      adapter: {} as any, renderer: {} as any, modelCatalog: fixtureModelCatalog([profile]),
+      router: { listProfiles: () => [], describeConfig: () => ({ location: { value: "local" } }) } as any });
+    let completed = false;
+    await orch.injectTurn(record(), "disposable", { session: "isolated", profile, cwd: dir,
+      lifecycle: { isCurrent: () => true, beforePrompt: () => {}, onOutcome: () => { completed = true; },
+        mayDeleteSession: () => completed, onCleanup: () => { throw new Error("synthetic observability failure"); } } });
+    expect(completed).toBe(true);
+    expect(deleteSession).toHaveBeenCalledExactlyOnceWith(dir, "acp-NEW");
+  });
+
   it("suspension retains isolated provider material; completion deletes it only after winning", async () => {
     const deleteSession = vi.fn(async () => {});
     const profile = { id: "codex", defaultModel: "m", sessionManager: { deleteSession } } as any;

@@ -1,5 +1,6 @@
 import Database from "better-sqlite3";
-import { TurnAttemptStore } from "./dispatch/attempt-store.js";
+import { TurnAttemptStore, inboundAttemptId } from "./dispatch/attempt-store.js";
+import { ScheduledOccurrenceStore } from "./scheduled-prompts/occurrence-store.js";
 import fs from "node:fs";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
@@ -385,12 +386,14 @@ export function isPlannedChainChildId(id: string | null | undefined): id is stri
 export class SessionStore {
   private readonly db: Database.Database;
   readonly turnAttempts: TurnAttemptStore;
+  readonly scheduledOccurrences: ScheduledOccurrenceStore;
 
   constructor(dbPath: string) {
     fs.mkdirSync(path.dirname(dbPath), { recursive: true });
     this.db = new Database(dbPath);
     this.db.pragma("journal_mode = WAL");
     this.turnAttempts = new TurnAttemptStore(this.db);
+    this.scheduledOccurrences = new ScheduledOccurrenceStore(this.db);
     this.db.exec(SCHEMA);
     this.db.exec(DELEGATION_SCHEMA);
     this.migrateReportBackDedupIndex();
@@ -2621,6 +2624,11 @@ export class SessionStore {
       // A normal Discord message is a priority replacement, not FIFO. Make
       // that intent durable in the same commit as the new admission so boot
       // recovery cannot resurrect the turn it superseded.
+      for (const old of this.db.prepare(`SELECT message_id FROM inbound_admissions
+        WHERE channel_ref=? AND message_id<>? AND state IN ('pending','running')`)
+        .all(input.channelRef, input.messageId) as { message_id: string }[]) {
+        this.turnAttempts.cancel(inboundAttemptId(old.message_id));
+      }
       this.db
         .prepare(
           `UPDATE inbound_admissions SET state = 'completed', updated_utc = ?
@@ -2672,6 +2680,17 @@ export class SessionStore {
     return result.changes === 1;
   }
 
+  /** The current queue invocation observed setup fail before execution was
+   * claimed. Retain that never-submitted input; never reset a legacy running
+   * row at boot or an admission with any recorded attempt. */
+  releaseUnstartedInbound(messageId: string, queueEpoch: number, updatedUtc: string): boolean {
+    return this.db.prepare(`UPDATE inbound_admissions
+      SET state='pending', queue_epoch=NULL, updated_utc=?
+      WHERE message_id=? AND state='running' AND queue_epoch=?
+      AND NOT EXISTS (SELECT 1 FROM turn_attempts WHERE id=?)`)
+      .run(updatedUtc, messageId, queueEpoch, inboundAttemptId(messageId)).changes === 1;
+  }
+
   /** Epoch is part of the ownership claim. A late promise from an invalidated
    * queue cannot terminalize the row after recovery has re-claimed it. */
   completeInbound(messageId: string, queueEpoch: number, updatedUtc: string): boolean {
@@ -2683,6 +2702,14 @@ export class SessionStore {
       )
       .run(updatedUtc, messageId, queueEpoch);
     return result.changes === 1;
+  }
+
+  /** Boot settlement requires the durable execution winner, not a stale queue epoch. */
+  settleInboundExecution(messageId: string): void {
+    const a = this.turnAttempts.get(inboundAttemptId(messageId));
+    if (!a || (a.state !== "completed" && a.state !== "cancelled")) return;
+    this.db.prepare("UPDATE inbound_admissions SET state='completed', updated_utc=? WHERE message_id=?")
+      .run(new Date().toISOString(), messageId);
   }
 
   /**
@@ -2701,6 +2728,9 @@ export class SessionStore {
         .all(channelRef);
       const newest = rows.at(-1);
       if (!newest) return null;
+      for (const old of rows) {
+        if (old.message_id !== newest.message_id) this.turnAttempts.cancel(inboundAttemptId(old.message_id));
+      }
       this.db
         .prepare(
           `UPDATE inbound_admissions SET state = 'completed', updated_utc = ?

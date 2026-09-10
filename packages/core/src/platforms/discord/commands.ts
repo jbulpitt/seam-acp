@@ -881,6 +881,7 @@ export function buildSeamAdminCommand(): SlashCommandBuilder {
     g
       .setName("debug")
       .setDescription("Admin-only: tail, exec, status a paired bridge, or live-help voice spike")
+      .addSubcommand((sub) => sub.setName("work").setDescription("Identify active scheduled work and restart blockers"))
       .addSubcommand((sub) =>
         sub
           .setName("tail")

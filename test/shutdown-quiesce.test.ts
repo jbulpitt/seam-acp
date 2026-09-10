@@ -31,8 +31,8 @@ import {
   dispatchDirs,
   type DispatchSpec,
 } from "../packages/core/src/core/dispatch/types.js";
-import { DELEGATION_TERMINAL_STATUSES } from "../packages/core/src/core/types.js";
-import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
+import { DELEGATION_TERMINAL_STATUSES, type DelegationStatus, type DelegationKind } from "../packages/core/src/core/types.js";
+import { Orchestrator, type QuiesceOutcome } from "../packages/core/src/platforms/discord/orchestrator.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import { startHealthServer } from "../packages/core/src/lib/health.js";
 import {
@@ -334,8 +334,8 @@ function makeQuiesceHost(over: Record<string, unknown> = {}) {
     ...over,
   });
   return self as unknown as {
-    quiesce(o?: { timeoutMs?: number }): Promise<{ timedOut: boolean; continuations: number }>;
-    drainAfterDispose(o?: { timeoutMs?: number }): Promise<{ timedOut: boolean }>;
+    quiesce(o?: { timeoutMs?: number }): Promise<QuiesceOutcome>;
+    drainAfterDispose(o?: { timeoutMs?: number }): Promise<QuiesceOutcome>;
     trackContinuation(p: Promise<void>): void;
     settleTrackedContinuations(): Promise<void>;
     beginTurn(): () => void;
@@ -541,8 +541,8 @@ describe("#174 bounded quiesce", () => {
 function makeLedger() {
   const rows = new Map<string, {
     id: string;
-    kind: string;
-    status: string;
+    kind: DelegationKind;
+    status: DelegationStatus;
     correlationId?: string;
     targetRef?: string | null;
     worker?: string | null;
@@ -551,7 +551,7 @@ function makeLedger() {
   return {
     rows,
     getDelegation: (id: string) => rows.get(id) ?? null,
-    updateDelegationStatus(id: string, status: string) {
+    updateDelegationStatus(id: string, status: DelegationStatus) {
       const r = rows.get(id);
       if (r) r.status = status;
     },
@@ -566,13 +566,13 @@ function makeLedger() {
       correlationId?: string;
       targetRef?: string | null;
       worker?: string | null;
-      status?: string;
+      status?: DelegationStatus;
     }) {
       // Atomic claim: first writer for a correlation wins, as in SQLite.
       if (entry.correlationId && this.getReportBackByCorrelation(entry.correlationId)) return null;
       const row = {
         id: entry.id,
-        kind: "report_back",
+        kind: "report_back" as const,
         status: entry.status ?? "dispatched",
         correlationId: entry.correlationId,
         targetRef: entry.targetRef ?? null,
@@ -645,7 +645,7 @@ describe("#174 replay ordering is crash-safe", () => {
       store: new Proxy(ledger, {
         get(t, k) {
           if (k === "updateDelegationStatus") {
-            return (id: string, s: string) => {
+            return (id: string, s: DelegationStatus) => {
               order.push("terminalize");
               ledger.updateDelegationStatus(id, s);
             };
@@ -696,7 +696,7 @@ describe("#174 replay ordering is crash-safe", () => {
       store: new Proxy(ledger, {
         get(t, k) {
           if (k === "updateDelegationStatus") {
-            return (id: string, s: string) => {
+            return (id: string, s: DelegationStatus) => {
               if (crash) throw new Error("process died before terminalize");
               ledger.updateDelegationStatus(id, s);
             };
@@ -783,7 +783,7 @@ describe("#174 replay ordering is crash-safe", () => {
       store: new Proxy(ledger, {
         get(t, k) {
           if (k === "updateDelegationStatus") {
-            return (id: string, s: string) => {
+            return (id: string, s: DelegationStatus) => {
               order.push("terminalize");
               ledger.updateDelegationStatus(id, s);
             };
@@ -859,7 +859,7 @@ describe("#174 boot done-file reconciliation", () => {
 
   it("replays a done-file whose ledger row is non-terminal, without rerunning the worker", async () => {
     await writeDone("d1", { id: "d1", ...base });
-    const replay = vi.fn(async () => {});
+    const replay = vi.fn(async (..._args: any[]) => {});
     const onDispatch = vi.fn(async () => ({ output: "RERUN", stopReason: "end_turn" }));
     const summary = await reconcileDoneFilesForTest({
       dataDir,
@@ -914,7 +914,7 @@ describe("#174 boot done-file reconciliation", () => {
     // offered a paid rerun of finished work. The kind is what makes it safe:
     // a wake owes no onward delivery, so terminalizing loses nothing.
     await writeDone("d2", { id: "d2", target: "t", status: "completed", finishedUtc: "x" });
-    const getDelegation = vi.fn(() => ({ status: "interrupted", kind: "wake" }));
+    const getDelegation = vi.fn(() => ({ status: "interrupted", kind: "wake" } as const));
     const summary = await reconcileDoneFilesForTest({
       dataDir, logger: silent, getDelegation, replay: async () => {},
     });
@@ -937,7 +937,7 @@ describe("#174 boot done-file reconciliation", () => {
 
   it("is idempotent across reboots once the row goes terminal", async () => {
     await writeDone("d4", { id: "d4", ...base });
-    let status = "interrupted";
+    let status: DelegationStatus = "interrupted";
     const replay = vi.fn(async () => {
       status = "completed";
     });
@@ -989,7 +989,7 @@ function makeIngressHost<T>(over: Record<string, unknown>): T {
 
 describe("#174 admission gates", () => {
   it("refuses a message that arrives after the phase-1 snapshot, without touching the store", async () => {
-    const sendMessage = vi.fn(async () => {});
+    const sendMessage = vi.fn(async (..._args: any[]) => {});
     const store = new Proxy(
       {},
       {
@@ -1027,7 +1027,7 @@ describe("#174 admission gates", () => {
 
   it("retains a parked prompt instead of firing or deleting it once intake is closed", async () => {
     const deleteParked = vi.fn();
-    const fireParked = vi.fn(async () => {});
+    const fireParked = vi.fn(async (..._args: any[]) => {});
     const self = {
       logger: silent,
       intakeStopped: true,
@@ -1051,7 +1051,7 @@ describe("#174 admission gates", () => {
    * reach `queueOnChannel` directly and would be counted after the snapshot.
    */
   it("skips a preset's opening turn once intake is closed", () => {
-    const queueOnChannel = vi.fn(async () => {});
+    const queueOnChannel = vi.fn(async (..._args: any[]) => {});
     const make = (intakeStopped: boolean) =>
       ({
         logger: silent,
@@ -1075,7 +1075,7 @@ describe("#174 admission gates", () => {
   it("refuses a preemptive steer once intake is closed, without cancelling", async () => {
     const abortTurn = vi.fn(async () => "cancelled");
     const queueOnChannel = vi.fn(async () => ({ text: "ok" }));
-    const editReply = vi.fn(async () => {});
+    const editReply = vi.fn(async (..._args: any[]) => {});
     const make = (intakeStopped: boolean) =>
       ({
         logger: silent,
@@ -1121,7 +1121,7 @@ describe("#174 admission gates", () => {
    * still be mid-await when `store.close()` lands.
    */
   it("refuses a slash command before it can touch the store", async () => {
-    const reply = vi.fn(async () => {});
+    const reply = vi.fn(async (..._args: any[]) => {});
     const self = makeIngressHost<{ handleSlashInteraction(i: unknown): Promise<void> }>({
       store: new Proxy({}, { get() { throw new Error("store touched by a refused slash"); } }),
     });
@@ -1144,7 +1144,7 @@ describe("#174 admission gates", () => {
   });
 
   it("answers autocomplete with an empty list instead of reading the store", async () => {
-    const respond = vi.fn(async () => {});
+    const respond = vi.fn(async (..._args: any[]) => {});
     const lookup = vi.fn(() => undefined);
     // NOT a throwing stub: `safeAutocompleteRespond` catches and answers []
     // anyway, so a throw here would pass with or without the gate. The real
@@ -1166,7 +1166,7 @@ describe("#174 admission gates", () => {
   });
 
   it("refuses a component click without dispatching to any handler", async () => {
-    const replyEphemeral = vi.fn(async () => {});
+    const replyEphemeral = vi.fn(async (..._args: any[]) => {});
     const onComponent = vi.fn();
     const self = makeIngressHost<{ install(): void }>({
       adapter: { onMessage: () => {}, onComponent, setActiveChannelCheck: () => {} },
@@ -1190,7 +1190,7 @@ describe("#174 admission gates", () => {
   });
 
   it("refuses a choice-card click without recording it", async () => {
-    const replyEphemeral = vi.fn(async () => {});
+    const replyEphemeral = vi.fn(async (..._args: any[]) => {});
     const onChoiceInteraction = vi.fn();
     const self = makeIngressHost<{ install(): void }>({
       adapter: {
@@ -1318,7 +1318,7 @@ describe("#174 admission gates", () => {
     vi.useFakeTimers();
     try {
       await writeFile(path.join(dataDir, ".restart-pending"), "", "utf8"); // graceful
-      const fireParked = vi.fn(async () => {});
+      const fireParked = vi.fn(async (..._args: any[]) => {});
       const self = makeQuiesceHost({
         config: { DATA_DIR: dataDir, RESTART_DRAIN_TIMEOUT_MS: 60_000 },
         restartPending: false,
@@ -1342,8 +1342,8 @@ describe("#174 admission gates", () => {
       // …but the transport is NOT, so a slash command still reaches its handler
       // rather than being answered "Restarting — that command was not run".
       expect(self.admissionClosed).toBe(false);
-      const cancelRan = vi.fn(async () => {});
-      const refused = vi.fn(async () => {});
+      const cancelRan = vi.fn(async (..._args: any[]) => {});
+      const refused = vi.fn(async (..._args: any[]) => {});
       await self.runInbound("slash", cancelRan, refused);
       expect(cancelRan).toHaveBeenCalledOnce();
       expect(refused).not.toHaveBeenCalled();
@@ -1635,7 +1635,7 @@ describe("#174 tick pre-claim race", () => {
 // ---------------------------------------------------------------------------
 
 describe("#174 an unrouted completion is judged by its KIND", () => {
-  it.each(["wake", "watch", "report_back", "scheduled", "peek", "parked", "choice"])(
+  it.each(["wake", "watch", "report_back", "scheduled", "peek", "parked", "choice"] as const)(
     "terminalizes a completed %s done-file that owes nothing onward",
     async (kind) => {
       await writeDone(`u-${kind}`, {
@@ -1647,7 +1647,7 @@ describe("#174 an unrouted completion is judged by its KIND", () => {
         kind,
         // deliberately no returnTo / chainId
       });
-      const replay = vi.fn(async () => {});
+      const replay = vi.fn(async (..._args: any[]) => {});
       const summary = await reconcileDoneFilesForTest({
         dataDir,
         logger: silent,
@@ -1662,7 +1662,7 @@ describe("#174 an unrouted completion is judged by its KIND", () => {
   it("an unrouted replay terminalizes directly and reruns nothing", async () => {
     const ledger = makeLedger();
     ledger.rows.set("u1", { id: "u1", kind: "wake", status: "running" });
-    const advanceChain = vi.fn(async () => {});
+    const advanceChain = vi.fn(async (..._args: any[]) => {});
     const host = makeReplayHost(ledger, { advanceChain });
     await replayVia(
       host,
@@ -1875,7 +1875,7 @@ describe("#174 replay matches the LIVE dispatch contract, not just the fields", 
       finishedUtc: "x",
       // no kind, no returnTo, no chainId — a pre-#174 file
     });
-    const replay = vi.fn(async () => {});
+    const replay = vi.fn(async (..._args: any[]) => {});
     const summary = await reconcileDoneFilesForTest({
       dataDir,
       logger: silent,
@@ -1923,7 +1923,7 @@ describe("#174 recovery contract is bounded and honest", () => {
       correlationId: "c-rec",
       finishedUtc: "2026-09-03T00:00:00.000Z",
     });
-    const replay = vi.fn(async () => {});
+    const replay = vi.fn(async (..._args: any[]) => {});
     const summary = await reconcileDoneFilesForTest({
       dataDir, logger: silent, getDelegation: () => ({ status: "interrupted" }), replay,
     });
@@ -1981,7 +1981,7 @@ function makeClosableStore() {
       scheduled.set(id, { ...scheduled.get(id), ...patch });
     },
     getDelegation: (id: string) => (guard("getDelegation"), ledger.getDelegation(id)),
-    updateDelegationStatus: (id: string, s: string) => (
+    updateDelegationStatus: (id: string, s: DelegationStatus) => (
       guard("updateDelegationStatus"), ledger.updateDelegationStatus(id, s)
     ),
     getReportBackByCorrelation: (c: string) => (
@@ -2338,7 +2338,7 @@ describe("#174 an in-flight isolated scheduled fire holds both phases", () => {
     const host = makeQuiesceHost({
       store,
       scheduledManager: { stop: () => {} },
-      runScheduledPromptInner: async () => {
+      runDurableScheduledPrompt: async () => {
         await fire.promise;
         store.patchScheduled("s-1", { lastStatus: "ok" }); // the tail
         patched = true;
@@ -2376,7 +2376,7 @@ describe("#174 an in-flight isolated scheduled fire holds both phases", () => {
     const fire = deferred();
     const host = makeQuiesceHost({
       store,
-      runScheduledPromptInner: async () => {
+      runDurableScheduledPrompt: async () => {
         expect(host.activeTurns).toBe(1);
         await fire.promise;
       },
@@ -2556,7 +2556,7 @@ describe("#174 seam-mcp shares one gate across both entry points", () => {
       inFlight: new Set<Promise<void>>(),
       ...over,
     });
-    return self as unknown as SeamMcpServer & {
+    return self as unknown as Pick<SeamMcpServer, keyof SeamMcpServer> & {
       handle(req: unknown, res: unknown): Promise<void>;
       inFlight: Set<Promise<void>>;
     };
@@ -2700,8 +2700,8 @@ describe("#174 an admitted gateway handler is part of quiescence", () => {
 
   it("refuses the NEXT handler without tracking or touching anything", async () => {
     const host = makeQuiesceHost();
-    const refuse = vi.fn(async () => {});
-    const run = vi.fn(async () => {});
+    const refuse = vi.fn(async (..._args: any[]) => {});
+    const run = vi.fn(async (..._args: any[]) => {});
 
     await host.quiesce({ timeoutMs: 1000 }); // closes admission
     await host.runInbound("slash", run, refuse);
@@ -3249,7 +3249,7 @@ describe("#174 runInbound tracks without swallowing", () => {
 
   it("a refusal that throws SYNCHRONOUSLY is still silent", async () => {
     const host = makeQuiesceHost({ gatewayClosed: true });
-    const run = vi.fn(async () => {});
+    const run = vi.fn(async (..._args: any[]) => {});
 
     // `Promise.resolve(refuse())` would have let this escape the `.catch`,
     // turning a deliberately silent refusal into a rejected inbound.
@@ -3379,7 +3379,7 @@ describe("#174 the component aggregate reports every handler's failure", () => {
   });
 
   it("a recovery that SUCCEEDS is not reported as a handler failure", async () => {
-    const replyEphemeral = vi.fn(async () => {});
+    const replyEphemeral = vi.fn(async (..._args: any[]) => {});
     const { log, wrapper } = componentHost({
       handleVoiceConsoleComponent: async () => {
         throw new Error("voice boom");

@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { simulateRetiredOwnerProcess } from "./restart-process-fixture.js";
 import { mkdtempSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -12,7 +13,7 @@ import { projectAttemptCompletions } from "../packages/core/src/core/dispatch/at
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 
 const cleanups: (() => void)[] = [];
-afterEach(() => { for (const f of cleanups.splice(0).reverse()) f(); });
+afterEach(() => { for (const f of cleanups.splice(0).reverse()) f(); vi.restoreAllMocks(); });
 function setup() {
   const dataDir = mkdtempSync(path.join(tmpdir(), "seam-250-dispatch-"));
   cleanups.push(() => rmSync(dataDir, { force: true, recursive: true }));
@@ -89,7 +90,7 @@ describe("#250 production dispatch lifecycle (synthetic transport, no providers)
     const h = setup(); h.spec.kind = kind;
     // Isolate process death from dispatch lifecycle in this in-process test.
     // Process/PID-reuse guards are tested separately; this is NOT a live provider canary.
-    vi.spyOn(h.store.turnAttempts, "registerOwner").mockImplementation(() => {});
+    simulateRetiredOwnerProcess();
     const first = h.orch.dispatchInjectTurn(h.spec);
     await h.started; h.orch.suspendForRestart(); h.release();
     await expect(first).rejects.toMatchObject({ name: "DispatchSuspendedError" });

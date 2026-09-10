@@ -41,6 +41,8 @@ export interface ServerStatusSnapshot {
   memoryRssBytes: number;
   memoryHeapUsedBytes: number;
   activeTurns: number;
+  /** Logical scheduled occurrences; live schedules may hold multiple turn tokens. */
+  activeScheduledOccurrences?: number;
   liveRuntimes: number;
   sessions: number;
   pendingWakes: number;
@@ -216,7 +218,10 @@ function metricsLines(snap: ServerStatusSnapshot): string[] {
     snap.discordPingMs != null ? `${snap.discordPingMs}ms` : "n/a";
   return [
     `**Uptime** ${uptime}`,
-    `**Load** ${formatCount(snap.activeTurns, "turn")} · ${formatCount(snap.liveRuntimes, "runtime")} · ${formatCount(snap.sessions, "session")}`,
+    `**Load** ${formatCount(snap.activeTurns, snap.activeScheduledOccurrences === undefined ? "turn" : "turn token")} · ${formatCount(snap.liveRuntimes, "runtime")} · ${formatCount(snap.sessions, "session")}`,
+    ...(snap.activeScheduledOccurrences === undefined ? [] : [
+      `**Scheduled work** ${formatCount(snap.activeScheduledOccurrences, "occurrence")} (included above; details: admin debug work)`,
+    ]),
     `**Memory** ${formatBytes(snap.memoryRssBytes)} RSS · ${formatBytes(snap.memoryHeapUsedBytes)} heap`,
     `**Jobs** ${formatCount(snap.pendingWakes, "wake")} · ${formatCount(snap.pendingWatches, "watch", "watches")} · ${formatCount(snap.scheduledJobs, "schedule")}`,
     `**Gateway** ${ping} · **PID** \`${snap.pid}\``,
@@ -275,7 +280,7 @@ export function renderServerStatusPanel(snap: ServerStatusSnapshot): StructuredP
     {
       name: "Load",
       value: [
-        formatCount(snap.activeTurns, "turn"),
+        formatCount(snap.activeTurns, snap.activeScheduledOccurrences === undefined ? "turn" : "turn token"),
         formatCount(snap.liveRuntimes, "runtime"),
         formatCount(snap.sessions, "session"),
       ].join("\n"),
@@ -306,6 +311,9 @@ export function renderServerStatusPanel(snap: ServerStatusSnapshot): StructuredP
       inline: true,
     },
   ];
+
+  if (snap.activeScheduledOccurrences !== undefined) metricFields.push({ name: "Scheduled work",
+    value: `${formatCount(snap.activeScheduledOccurrences, "occurrence")} (included in tokens); details: admin debug work`, inline: true });
 
   const bridgeFields: StructuredPanel["fields"] =
     paired === 0

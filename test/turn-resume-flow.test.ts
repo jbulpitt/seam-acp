@@ -4,6 +4,7 @@
  * live-turn re-fire, flag-off inventory, max-age / deleted-thread abandon.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { simulateRetiredOwnerProcess } from "./restart-process-fixture.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -147,7 +148,7 @@ function handoffSpec(over: Partial<DispatchSpec> = {}): DispatchSpec {
 async function seedInterrupted(spec: DispatchSpec = handoffSpec()): Promise<void> {
   // Synthetic process boundary; separate ownership tests verify actual PID
   // liveness. The production dispatcher captures the exact spec/identity.
-  vi.spyOn(store.turnAttempts, "registerOwner").mockImplementation(() => {});
+  simulateRetiredOwnerProcess();
   const { orch } = makeOrch({ enabled: true });
   (orch as any).injectTurn = async (_t: unknown, _p: string, opts: InjectTurnOptions) => {
     await opts.onSession?.("acp-recorded");
@@ -169,6 +170,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.restoreAllMocks();
   store.close();
   fs.rmSync(dir, { recursive: true, force: true });
 });

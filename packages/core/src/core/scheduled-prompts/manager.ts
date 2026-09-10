@@ -11,18 +11,21 @@
 import { Cron } from "croner";
 import type { SessionStore } from "../session-store.js";
 import type { ScheduledPrompt } from "./types.js";
+import { scheduledOccurrenceKey, type ScheduledOccurrenceKey } from "./occurrence-store.js";
 import { legacyAttachmentQuarantine, legacyAttachmentStatus } from "./quarantine.js";
 import type { Logger } from "../../lib/logger.js";
 
 export interface ScheduledPromptManagerOpts {
   store: SessionStore;
   /** Run the schedule now. Updates last_run/last_status; must NOT touch next_run. */
-  onFire: (id: string) => Promise<void>;
+  onFire: (id: string, occurrence: ScheduledOccurrenceKey) => Promise<void>;
   logger: Logger;
 }
 
 export class ScheduledPromptManager {
   private readonly jobs = new Map<string, Cron>();
+  /** Armed slot identity, independent of manual-fire completion timestamps. */
+  private readonly nextDue = new Map<string, string>();
   /** Schedule ids whose `onFire` is currently running. Guards same-schedule
    *  overlap (D3): a fire that lands while a prior fire of the same id is still
    *  in flight is skipped (status-stamped) rather than stacked. Covers both the
@@ -31,7 +34,7 @@ export class ScheduledPromptManager {
   private readonly activeFires = new Set<Promise<void>>();
   private stopped = false;
   private readonly store: SessionStore;
-  private readonly onFire: (id: string) => Promise<void>;
+  private readonly onFire: ScheduledPromptManagerOpts["onFire"];
   private readonly logger: Logger;
 
   constructor(opts: ScheduledPromptManagerOpts) {
@@ -45,6 +48,13 @@ export class ScheduledPromptManager {
    *  left disarmed — it is neither caught up nor armed. */
   start(): void {
     if (this.stopped) return;
+    // Recover admitted occurrences before catch-up can publish the same tick.
+    // onFire applies #250 ownership/capability guards; completed output never
+    // re-enters a provider. Disabled/deleted schedules retain already-admitted
+    // work: disable/delete affects future ticks, not cancellation intent.
+    for (const occurrence of this.store.scheduledOccurrences?.pending() ?? []) {
+      void this.fire(occurrence.scheduleId, occurrence);
+    }
     const rows = this.store.listScheduledEnabled();
     const quarantined: string[] = [];
     for (const row of rows) {
@@ -95,7 +105,9 @@ export class ScheduledPromptManager {
       return;
     }
     this.jobs.set(row.id, job);
-    this.patchRow(row.id, { nextRunUtc: job.nextRun()?.toISOString() ?? null });
+    const due = job.nextRun()?.toISOString() ?? null;
+    if (due) this.nextDue.set(row.id, due);
+    this.patchRow(row.id, { nextRunUtc: due });
   }
 
   /** Re-read a schedule from the store and (re)arm or disarm accordingly. */
@@ -106,6 +118,7 @@ export class ScheduledPromptManager {
   }
 
   disarm(id: string): void {
+    this.nextDue.delete(id);
     const job = this.jobs.get(id);
     if (job) {
       job.stop();
@@ -122,12 +135,23 @@ export class ScheduledPromptManager {
     this.stopped = true;
     for (const job of this.jobs.values()) job.stop();
     this.jobs.clear();
+    this.nextDue.clear();
   }
 
   /** Cron entry: a tick queued before stop is a no-op once admission is closed. */
   private onCronTick(id: string): void {
     if (this.stopped) return;
-    void this.fire(id);
+    const due = this.nextDue.get(id);
+    if (!due) return; // no stable scheduled-for identity: do not guess Date.now
+    void this.fire(id, scheduledOccurrenceKey(id, due));
+    // onFire synchronously admits the occurrence before its first await. Keep
+    // the next scheduled slot distinct even while this occurrence is running.
+    const job = this.jobs.get(id);
+    if (job) {
+      const next = job.nextRun()?.toISOString() ?? null;
+      if (next) this.nextDue.set(id, next); else this.nextDue.delete(id);
+      this.patchRow(id, { nextRunUtc: next });
+    }
   }
 
   async drain(): Promise<void> {
@@ -153,22 +177,22 @@ export class ScheduledPromptManager {
     if (isNaN(due) || due > Date.now()) return; // not missed
     const missedBySec = Math.round((Date.now() - due) / 1000);
     this.logger.info({ id: row.id, missedBySec }, "scheduled prompt: catch-up firing");
-    void this.fire(row.id);
+    void this.fire(row.id, scheduledOccurrenceKey(row.id, row.nextRunUtc));
   }
 
   /** Execute one fire: run the job, then refresh next_run from the armed timer. */
-  private fire(id: string): Promise<void> {
-    const running = this.fireInner(id);
+  private fire(id: string, occurrence = scheduledOccurrenceKey(id)): Promise<void> {
+    const running = this.fireInner(id, occurrence);
     const tracked = running.finally(() => this.activeFires.delete(tracked));
     this.activeFires.add(tracked);
     return tracked;
   }
 
-  private async fireInner(id: string): Promise<void> {
+  private async fireInner(id: string, occurrence: ScheduledOccurrenceKey): Promise<void> {
     // #158: last line of defence. `armFromRow` never arms a quarantined row, but
     // catch-up and manual "Run now" reach `fire` directly — refuse there too so
     // there is exactly one answer for a legacy attachment-bearing schedule.
-    const current = this.store.getScheduled(id);
+    const current = this.store.scheduledOccurrences?.get(occurrence.id)?.row ?? this.store.getScheduled(id);
     if (current) {
       const quarantine = legacyAttachmentQuarantine(current);
       if (quarantine) {
@@ -187,13 +211,13 @@ export class ScheduledPromptManager {
     }
     this.inFlight.add(id);
     try {
-      await this.onFire(id);
+      await this.onFire(id, occurrence);
     } catch (err) {
       this.logger.error({ id, err }, "scheduled fire failed");
     } finally {
       this.inFlight.delete(id);
       const job = this.jobs.get(id);
-      if (job) this.patchRow(id, { nextRunUtc: job.nextRun()?.toISOString() ?? null });
+      if (job) this.patchRow(id, { nextRunUtc: this.nextDue.get(id) ?? job.nextRun()?.toISOString() ?? null });
     }
   }
 

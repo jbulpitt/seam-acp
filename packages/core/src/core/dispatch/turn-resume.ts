@@ -70,6 +70,10 @@ export interface LiveTurnMarker {
   startedUtc: string;
   /** Host this turn was running on (D10 / #85). Omit ⇒ `local`. */
   location?: string;
+  /** Human input linkage; absent on legacy markers and synthetic turns. */
+  inboundMessageId?: string;
+  scheduleOccurrenceId?: string;
+  promptStarted?: boolean;
 }
 
 export type LiveTurnTerminalStatus = "completed" | "failed" | "cancelled" | "abandoned";
@@ -161,7 +165,7 @@ export async function writeLiveMarker(
 export async function patchLiveMarker(
   dataDir: string,
   id: string,
-  patch: Partial<Pick<LiveTurnMarker, "acpSessionId">>
+  patch: Partial<Pick<LiveTurnMarker, "acpSessionId" | "promptStarted">>
 ): Promise<void> {
   const dirs = turnDirs(dataDir);
   const runningPath = path.join(dirs.running, `${id}.json`);
@@ -293,6 +297,9 @@ export function parseLiveMarker(id: string, raw: string): LiveTurnMarker {
     ...(json.authorId ? { authorId: json.authorId } : {}),
     startedUtc: json.startedUtc,
     ...(json.location ? { location: json.location } : {}),
+    ...(typeof json.inboundMessageId === "string" ? { inboundMessageId: json.inboundMessageId } : {}),
+    ...(typeof json.scheduleOccurrenceId === "string" ? { scheduleOccurrenceId: json.scheduleOccurrenceId } : {}),
+    ...(typeof json.promptStarted === "boolean" ? { promptStarted: json.promptStarted } : {}),
   };
 }
 

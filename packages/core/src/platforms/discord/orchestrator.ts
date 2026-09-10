@@ -8467,6 +8467,9 @@ export class Orchestrator {
         cwd: effectiveSession === "live" ? described?.cwd?.value ?? record.repoPath : preset?.repoPath ?? spec.cwd ?? described?.cwd?.value ?? record.repoPath,
         config: record.configJson, preset: preset ?? null,
         runtime: selectedProfile?.runtime,
+        // Adapter-declared scope includes profile-specific backend/account
+        // overrides that need not appear in the daemon's process environment.
+        providerScope: selectedProfile?.catalog?.scope?.(),
       });
       this.store.turnAttempts?.registerOwner(this.attemptBoot);
       const attempt = this.store.turnAttempts?.claim(spec, identity, this.attemptBoot);

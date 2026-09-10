@@ -5,6 +5,7 @@ import {
   isMessageCardOrNoise,
   parseSince,
   timestampToSnowflake,
+  type MessagePage,
   type MessagePageItem,
   type MessagePageRequest,
   type MessagePageSource,
@@ -31,6 +32,22 @@ function message(
   };
 }
 
+/**
+ * A transport page whose raw facts match its rows exactly — the ordinary case
+ * where nothing was filtered. Pages that DO filter (and the pagination that
+ * depends on it) are covered end-to-end in test/message-page-pagination.ts.
+ */
+function pageOf(rows: readonly MessagePageItem[], over: Partial<MessagePage> = {}): MessagePage {
+  const oldest = [...rows].sort((a, b) => a.timestampMs - b.timestampMs)[0];
+  return {
+    messages: [...rows],
+    rawCount: rows.length,
+    oldestRawId: oldest?.messageId ?? null,
+    oldestRawTimestampMs: oldest?.timestampMs ?? null,
+    ...over,
+  };
+}
+
 describe("MessageReader", () => {
   it("uses cursor pagination and returns chronological messages", async () => {
     const all = Array.from({ length: 205 }, (_, index) => message(index + 1, `message ${index + 1}`));
@@ -39,10 +56,12 @@ describe("MessageReader", () => {
       fetchMessagePage: async (_threadId, request) => {
         requests.push(request);
         const before = request.before ? BigInt(request.before) : undefined;
-        return all
-          .filter((item) => before === undefined || BigInt(item.messageId) < before)
-          .slice(-request.limit)
-          .reverse();
+        return pageOf(
+          all
+            .filter((item) => before === undefined || BigInt(item.messageId) < before)
+            .slice(-request.limit)
+            .reverse()
+        );
       },
     };
     const reader = new MessageReader(source, { interPageDelayMs: 0, maxSearchPages: 5 });
@@ -60,16 +79,18 @@ describe("MessageReader", () => {
   });
 
   it("passes around/before/after anchors to the same page source and preserves cards", async () => {
-    const fetchMessagePage = vi.fn(async (_threadId: string, request: MessagePageRequest) => [
-      message(3, "Status panel", {
-        authorId: "bot-1",
-        authorName: "seam-acp",
-        authorType: "bot",
-        hasEmbeds: true,
-      }),
-      message(2, "answer", { authorId: "bot-1", authorName: "seam-acp", authorType: "bot" }),
-      message(1, "question"),
-    ].slice(0, request.limit));
+    const fetchMessagePage = vi.fn(async (_threadId: string, request: MessagePageRequest) =>
+      pageOf([
+        message(3, "Status panel", {
+          authorId: "bot-1",
+          authorName: "seam-acp",
+          authorType: "bot",
+          hasEmbeds: true,
+        }),
+        message(2, "answer", { authorId: "bot-1", authorName: "seam-acp", authorType: "bot" }),
+        message(1, "question"),
+      ].slice(0, request.limit))
+    );
     const reader = new MessageReader({ fetchMessagePage }, { interPageDelayMs: 0 });
     const result = await reader.readMessages("thread-1", { around: "hit-1", limit: 3 });
 
@@ -81,9 +102,9 @@ describe("MessageReader", () => {
   it("honors Discord retry-after without advancing the cursor", async () => {
     const sleep = vi.fn(async () => {});
     const fetchMessagePage = vi
-      .fn<(_: string, __: MessagePageRequest) => Promise<MessagePageItem[]>>()
+      .fn<(_: string, __: MessagePageRequest) => Promise<MessagePage>>()
       .mockRejectedValueOnce({ status: 429, data: { retry_after: 0.25 } })
-      .mockResolvedValueOnce([message(1, "ok")]);
+      .mockResolvedValueOnce(pageOf([message(1, "ok")]));
     const reader = new MessageReader(
       { fetchMessagePage },
       { sleep, interPageDelayMs: 0, maxRateLimitRetries: 2 }
@@ -108,10 +129,12 @@ describe("MessageReader", () => {
       fetchMessagePage: async (_threadId, request) => {
         requests.push(request);
         const before = request.before ? BigInt(request.before) : undefined;
-        return all
-          .filter((item) => before === undefined || BigInt(item.messageId) < before)
-          .slice(-request.limit)
-          .reverse();
+        return pageOf(
+          all
+            .filter((item) => before === undefined || BigInt(item.messageId) < before)
+            .slice(-request.limit)
+            .reverse()
+        );
       },
     };
     const sinceMs = BASE + 105_000;
@@ -147,7 +170,7 @@ describe("LiveMessageSearch", () => {
       }),
     ];
     const reader = new MessageReader(
-      { fetchMessagePage: async () => [...rows].reverse() },
+      { fetchMessagePage: async () => pageOf([...rows].reverse()) },
       { interPageDelayMs: 0 }
     );
     const search = new LiveMessageSearch(reader);
@@ -170,7 +193,7 @@ describe("LiveMessageSearch", () => {
       message(3, "needle bot", { authorId: "bot", authorName: "Seam", authorType: "bot" }),
     ];
     const reader = new MessageReader(
-      { fetchMessagePage: async () => [...rows].reverse() },
+      { fetchMessagePage: async () => pageOf([...rows].reverse()) },
       { interPageDelayMs: 0 }
     );
     const search = new LiveMessageSearch(reader);
@@ -193,9 +216,19 @@ describe("LiveMessageSearch", () => {
   });
 
   it("surfaces page-cap and hit-limit truncation", async () => {
-    const fullPage = Array.from({ length: 100 }, (_, index) => message(index + 1, "needle"));
+    let pageIndex = 0;
     const reader = new MessageReader(
-      { fetchMessagePage: async () => fullPage },
+      {
+        // Each page advances to genuinely older ids, so the page CAP is what
+        // stops this walk — not a stalled cursor (#278).
+        fetchMessagePage: async () => {
+          const first = 100_000 - pageIndex * 100;
+          pageIndex += 1;
+          return pageOf(
+            Array.from({ length: 100 }, (_, index) => message(first - index, "needle"))
+          );
+        },
+      },
       { interPageDelayMs: 0, maxSearchPages: 1 }
     );
     const result = await new LiveMessageSearch(reader).search({

@@ -28,8 +28,32 @@ export interface MessagePageRequest {
   after?: string;
 }
 
+/**
+ * One transport page: the content-eligible messages PLUS the raw facts about
+ * the page they came from (#278).
+ *
+ * Transport pagination and content filtering are different concerns and must
+ * not be inferred from one another. A source drops ineligible rows (Discord
+ * join/pin/thread-started system messages), so the eligible array says nothing
+ * about whether the platform has more history or where the next cursor is: a
+ * full raw page of 100 containing one system post yields 99 eligible rows, and
+ * a raw page consisting entirely of system posts yields none at all. Both are
+ * mid-history pages. The raw fields below are the only exhaustion and cursor
+ * authority; `messages` is only what the caller is allowed to read.
+ */
+export interface MessagePage {
+  /** Eligible, normalized messages. May be empty on a full raw page. */
+  messages: MessagePageItem[];
+  /** Rows the platform returned before any content filtering. */
+  rawCount: number;
+  /** Oldest RAW row's id — the next `before` cursor. Null iff `rawCount` is 0. */
+  oldestRawId: string | null;
+  /** Oldest RAW row's timestamp, for since-boundary decisions. Null iff empty. */
+  oldestRawTimestampMs: number | null;
+}
+
 export interface MessagePageSource {
-  fetchMessagePage(threadId: string, request: MessagePageRequest): Promise<MessagePageItem[]>;
+  fetchMessagePage(threadId: string, request: MessagePageRequest): Promise<MessagePage>;
 }
 
 export interface ReadMessagesInput {
@@ -243,7 +267,10 @@ export class MessageReader {
       ...(input.before ? { before: input.before } : {}),
       ...(input.after ? { after: input.after } : {}),
     });
-    const messages = ordered(page).map((message): ReadMessage => ({
+    // A bounded anchored read returns exactly this page's eligible rows; it has
+    // never promised the whole thread, so raw-page metadata is not consulted
+    // here and around/before/after semantics are unchanged.
+    const messages = ordered(page.messages).map((message): ReadMessage => ({
       messageId: message.messageId,
       timestamp: new Date(message.timestampMs).toISOString(),
       author: message.authorName,
@@ -256,15 +283,30 @@ export class MessageReader {
     return { threadId, messages, truncated: false };
   }
 
-  /** Walk one thread for live search. Page budget is supplied by the caller. */
+  /**
+   * Walk one thread to exhaustion (or to the caller's page budget).
+   *
+   * `truncated` means the walk did NOT establish that it reached the start of
+   * the thread — a caller that needs complete history must fail closed rather
+   * than treat the result as the whole conversation. `truncatedReason` says
+   * which bound stopped it, so operator-facing messages stay accurate.
+   */
   async walkThread(
     threadId: string,
     input: { sinceMs?: number; maxPages: number }
-  ): Promise<{ messages: MessagePageItem[]; pagesFetched: number; truncated: boolean }> {
+  ): Promise<{
+    messages: MessagePageItem[];
+    pagesFetched: number;
+    truncated: boolean;
+    truncatedReason?: "page-cap" | "cursor-stalled";
+  }> {
     const seen = new Set<string>();
+    /** Every cursor already requested, so a repeating source cannot loop. */
+    const cursors = new Set<string>();
     const messages: MessagePageItem[] = [];
     let pagesFetched = 0;
     let truncated = false;
+    let truncatedReason: "page-cap" | "cursor-stalled" | undefined;
     let exhausted = false;
     let before: string | undefined;
     const sinceSnowflake = input.sinceMs === undefined
@@ -277,55 +319,82 @@ export class MessageReader {
         ...(before ? { before } : {}),
       });
       pagesFetched += 1;
-      const fresh = page.filter((message) => !seen.has(message.messageId));
-      for (const message of fresh) {
+      for (const message of page.messages) {
+        if (seen.has(message.messageId)) continue;
         seen.add(message.messageId);
         if (input.sinceMs === undefined || message.timestampMs >= input.sinceMs) messages.push(message);
       }
-      if (page.length < PAGE_SIZE) {
+
+      // Exhaustion is a RAW fact. Judging it by the eligible rows made one
+      // filtered system post in a full page look like the end of the thread
+      // and silently stopped Rebuild at 99 posts (#278). A page that is
+      // ENTIRELY filtered is likewise mid-history, not the end — so this must
+      // not be relaxed to `rawCount === 0` either; only the platform returning
+      // fewer raw rows than requested ends the walk.
+      if (page.rawCount < PAGE_SIZE) {
         exhausted = true;
         break;
       }
 
-      const sorted = ordered(page);
-      const oldest = sorted[0]!;
       // Discord returns every page newest→oldest, including `after` pages, and
       // cursor parameters are mutually exclusive. Walking forward with `after`
       // can therefore return the newest 100 and skip the middle. Page backward
-      // and stop once the oldest row crosses the synthesized since snowflake.
+      // and stop once the oldest RAW row crosses the synthesized since
+      // snowflake — the oldest ELIGIBLE row can sit arbitrarily far newer than
+      // the page it came from.
       if (
         sinceSnowflake &&
-        ((/^\d+$/.test(oldest.messageId) && BigInt(oldest.messageId) <= BigInt(sinceSnowflake)) ||
-          (input.sinceMs !== undefined && oldest.timestampMs <= input.sinceMs))
+        ((page.oldestRawId !== null &&
+          /^\d+$/.test(page.oldestRawId) &&
+          BigInt(page.oldestRawId) <= BigInt(sinceSnowflake)) ||
+          (input.sinceMs !== undefined &&
+            page.oldestRawTimestampMs !== null &&
+            page.oldestRawTimestampMs <= input.sinceMs))
       ) {
         exhausted = true;
         break;
       }
-      const nextBefore = oldest.messageId;
-      if (nextBefore === before) {
+
+      // The next cursor comes from the raw page too, so an all-filtered page
+      // still advances. No cursor, or one already walked, means the source is
+      // not making progress: stop and say so rather than spinning to the cap.
+      const nextBefore = page.oldestRawId;
+      if (nextBefore === null || nextBefore === before || cursors.has(nextBefore)) {
         truncated = true;
+        truncatedReason = "cursor-stalled";
+        this.logger?.warn(
+          { threadId, pagesFetched, cursor: nextBefore },
+          "message walk cursor did not advance; results truncated"
+        );
         break;
       }
+      cursors.add(nextBefore);
       before = nextBefore;
       if (pagesFetched < input.maxPages && this.interPageDelayMs > 0) {
         await this.sleep(this.interPageDelayMs);
       }
     }
 
-    if (!exhausted && pagesFetched >= input.maxPages) {
+    if (!exhausted && !truncated && pagesFetched >= input.maxPages) {
       truncated = true;
+      truncatedReason = "page-cap";
       this.logger?.warn(
         { threadId, pagesFetched, maxPages: input.maxPages },
         "message search page cap reached; results truncated"
       );
     }
-    return { messages: ordered(messages), pagesFetched, truncated };
+    return {
+      messages: ordered(messages),
+      pagesFetched,
+      truncated,
+      ...(truncatedReason ? { truncatedReason } : {}),
+    };
   }
 
   private async fetchWithBackoff(
     threadId: string,
     request: MessagePageRequest
-  ): Promise<MessagePageItem[]> {
+  ): Promise<MessagePage> {
     let retries = 0;
     while (true) {
       try {

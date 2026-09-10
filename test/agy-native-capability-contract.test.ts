@@ -11,7 +11,10 @@ import {
   type AgentEvent,
 } from "../packages/core/src/agents/agent-runtime.js";
 import { DispatchStatusPanel } from "../packages/core/src/core/dispatch-status-panel.js";
-import { TurnStatus } from "../packages/core/src/core/status-panel.js";
+import {
+  TurnStatus,
+  formatContextUsage,
+} from "../packages/core/src/core/status-panel.js";
 import type { StructuredPanel } from "../packages/core/src/core/types.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import type { MessageAttachment } from "../packages/core/src/platforms/chat-adapter.js";
@@ -140,6 +143,24 @@ function nativeThought(events: readonly AgentEvent[]): string {
       event.kind === "agent-thought")
     .map((event) => event.text)
     .join("");
+}
+
+function usageSequence(events: readonly AgentEvent[]): Array<{ used: number; size: number }> {
+  return events
+    .filter((event): event is Extract<AgentEvent, { kind: "usage-update" }> =>
+      event.kind === "usage-update")
+    .map(({ used, size }) => ({ used, size }));
+}
+
+async function renderEvents(
+  events: readonly AgentEvent[],
+  style: "full" | "simple",
+): Promise<string> {
+  const captured = capturePanels(style);
+  await captured.panel.start();
+  for (const event of events) captured.panel.handleEvent(event);
+  await captured.panel.finalize("Done", "Completed");
+  return captured.rendered.map(serializePanelText).join("\n");
 }
 
 async function runNegativeTrace(
@@ -287,19 +308,38 @@ describe.sequential("native AGY R1 capability contract", () => {
       expect.objectContaining({ toolCallId: "agy-step-3", status: "completed" }),
       expect.objectContaining({ toolCallId: "agy-step-4", status: "failed" }),
     ]));
-    expect(events.filter((event) => event.kind === "usage-update").at(-1)).toEqual({
-      kind: "usage-update",
-      used: 200,
-      size: 4096,
-    });
+    expect(usageSequence(events)).toEqual([
+      { used: 128, size: 4096 },
+      { used: 160, size: 4096 },
+      { used: 200, size: 4096 },
+    ]);
+    for (const captured of [full, simple]) {
+      expect(captured.panel.status.contextUsedHighWater).toBe(200);
+      expect(captured.panel.status.contextWindowSize).toBe(4096);
+    }
+    const compactionInput = {
+      used: full.panel.status.contextUsedHighWater,
+      size: full.panel.status.contextWindowSize,
+    };
+    expect(compactionInput).toEqual({ used: 200, size: 4096 });
+    expect(compactionInput.used / compactionInput.size).toBeGreaterThan(0.04);
     expect(JSON.stringify(events)).not.toMatch(/SANITIZED PRIVATE (READ|EDIT|COMMAND)/);
 
     await full.panel.finalize("Done", "Completed");
     await simple.panel.finalize("Done", "Completed");
     const fullCard = serializePanelText(full.rendered.at(-1)!);
     const simpleCard = serializePanelText(simple.rendered.at(-1)!);
+    const fullRenderHistory = full.rendered.map(serializePanelText).join("\n");
+    const simpleRenderHistory = simple.rendered.map(serializePanelText).join("\n");
+    for (const cardHistory of [fullRenderHistory, simpleRenderHistory]) {
+      expect(cardHistory).toContain("💡 Inspect fixture 🧭");
+      expect(cardHistory).toContain("💡 Plan safely");
+    }
+    expect(fullCard).toContain("💡 Inspect fixture 🧭");
+    expect(fullCard).toContain("💡 Plan safely");
+    expect(fullCard).toContain(formatContextUsage(200, 4096));
+    expect(simpleCard).toContain("🪟 5%");
     for (const card of [fullCard, simpleCard]) {
-      expect(card).toContain("💡 Plan safely");
       expect(card).not.toMatch(/SANITIZED PRIVATE (READ|EDIT|COMMAND)/);
     }
 
@@ -428,6 +468,11 @@ describe.sequential("native AGY R1 capability contract", () => {
     });
     expect(nativeThought(events)).not.toBe(expectedThinking);
     expect(nativeThought(events)).toBe("");
+    for (const style of ["full", "simple"] as const) {
+      const cardHistory = await renderEvents(events, style);
+      expect(cardHistory).not.toContain("Inspect fixture 🧭");
+      expect(cardHistory).not.toContain("Plan safely");
+    }
   }, 20_000);
 
   it("negative control: removing mainTrajectoryUpdate.stepsUpdate breaks all output assertions", async () => {

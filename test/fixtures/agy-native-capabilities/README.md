@@ -10,6 +10,10 @@ the observed native `StreamAgentStateUpdates` subset documented in
 `packages/adapters/src/agy-stream.ts`; every identifier, path, token count,
 message, tool payload, and binary byte in this directory is synthetic.
 
+The turn-one usage trace deliberately includes a repeated reading and a lower
+reading after its high-water mark. They are observed-shape negative inputs used
+to freeze monotonic ACP usage emission; they are not claims about token billing.
+
 The fake CLI exposes the same local health, model, and Connect streaming routes
 the production native adapter calls. Tests therefore execute the production
 native profile, in-process ACP facade, `AgentRuntime`, attachment mapper,

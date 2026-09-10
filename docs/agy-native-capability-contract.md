@@ -76,7 +76,7 @@ an artifact-verification claim or alter that optional adapter. Runtime tuple,
 digest, and provenance enforcement belongs to R2
 ([#258](https://github.com/jbulpitt/seam-acp/issues/258)); lifecycle/redaction
 enforcement belongs to R5
-([#262](https://github.com/jbulpitt/seam-acp/issues/262)).
+([#261](https://github.com/jbulpitt/seam-acp/issues/261)).
 
 Restart attempt ownership and continuation remain governed by
 [#250](https://github.com/jbulpitt/seam-acp/issues/250), durable scheduled

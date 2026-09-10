@@ -26,7 +26,7 @@
             "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
             "status": "CORTEX_STEP_STATUS_GENERATING",
             "plannerResponse": {
-              "thinking": "Inspect ",
+              "thinking": "Inspect fixture 🧭",
               "modifiedResponse": "Res",
               "messageId": "fixture-message-one"
             },
@@ -61,6 +61,54 @@
               "modelUsage": {
                 "model": "fixture-native-model",
                 "inputTokens": "140",
+                "outputTokens": "20"
+              }
+            }
+          }]
+        }
+      }
+    },
+    {
+      "mainTrajectoryUpdate": {
+        "stepsUpdate": {
+          "indices": [1],
+          "steps": [{
+            "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+            "status": "CORTEX_STEP_STATUS_GENERATING",
+            "plannerResponse": {
+              "thinking": "Inspect fixture 🧭\nPlan",
+              "modifiedResponse": "Result ",
+              "messageId": "fixture-message-one"
+            },
+            "metadata": {
+              "generatorModel": "fixture-native-model",
+              "modelUsage": {
+                "model": "fixture-native-model",
+                "inputTokens": "140",
+                "outputTokens": "20"
+              }
+            }
+          }]
+        }
+      }
+    },
+    {
+      "mainTrajectoryUpdate": {
+        "stepsUpdate": {
+          "indices": [1],
+          "steps": [{
+            "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+            "status": "CORTEX_STEP_STATUS_GENERATING",
+            "plannerResponse": {
+              "thinking": "Inspect fixture 🧭\nPlan",
+              "modifiedResponse": "Result ",
+              "messageId": "fixture-message-one"
+            },
+            "metadata": {
+              "generatorModel": "fixture-native-model",
+              "modelUsage": {
+                "model": "fixture-native-model",
+                "inputTokens": "80",
                 "outputTokens": "20"
               }
             }

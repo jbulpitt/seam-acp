@@ -82,7 +82,7 @@ export interface ModelValueSnapshotRow {
   catalogDefault?: boolean;
   effortDefault?: string;
   effortMechanism?: string;
-  sourceStatus?: Record<string, "fresh" | "stale">;
+  sourceStatus?: Record<string, "fresh" | "stale" | "unavailable">;
   generationDiagnostics?: string[];
 }
 
@@ -114,7 +114,7 @@ export interface ModelValueRanking {
   pricing_tier?: "default" | "long-context" | null;
   source_snapshots?: Record<string, string | null>;
   source_fetched_at?: Record<string, string | null>;
-  source_status?: Record<string, "fresh" | "stale">;
+  source_status?: Record<string, "fresh" | "stale" | "unavailable">;
   generation_diagnostics?: string[];
   catalog_default?: boolean;
   effort_default?: string;

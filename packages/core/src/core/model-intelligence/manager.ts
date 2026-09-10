@@ -13,7 +13,7 @@ import { ModelIntelligenceStore, type IntelligenceSourceName, type IntelligenceS
 
 export const MODEL_INTELLIGENCE_REFRESH_CRON = "0 */12 * * *";
 export const MODEL_INTELLIGENCE_PARSER_VERSION = "249.1";
-export const MODEL_INTELLIGENCE_MATCHING_POLICY_VERSION = "249.1";
+export const MODEL_INTELLIGENCE_MATCHING_POLICY_VERSION = "249.2";
 
 export interface ModelIntelligenceRefreshResult {
   ok: boolean;
@@ -129,14 +129,11 @@ export class ModelIntelligenceManager {
         this.options.getCatalog(),
       ]);
       if (this.stopped) return this.result("stopped", ["manager stopped before publication"]);
-      if (!aa || !pricing) {
-        return this.complete("retained", ["one or more enrichment sources have no last-known-good snapshot"], attemptedAt, forceSources);
-      }
       const built = buildGeneration(fleet, aa, pricing, this.options.scenario, attemptedAt);
-      const aaStale = this.options.store.latestSourceAttempt("artificial-analysis")?.status === "failure";
-      const pricingStale = this.options.store.latestSourceAttempt("github-copilot-pricing")?.status === "failure";
-      if (aaStale) built.diagnostics.push(`Artificial Analysis source stale; retained snapshot ${aa.id}`);
-      if (pricingStale) built.diagnostics.push(`GitHub pricing source stale; retained snapshot ${pricing.id}`);
+      const aaStale = Boolean(aa) && this.options.store.latestSourceAttempt("artificial-analysis")?.status === "failure";
+      const pricingStale = Boolean(pricing) && this.options.store.latestSourceAttempt("github-copilot-pricing")?.status === "failure";
+      if (aa && aaStale) built.diagnostics.push(`Artificial Analysis source stale; retained snapshot ${aa.id}`);
+      if (pricing && pricingStale) built.diagnostics.push(`GitHub pricing source stale; retained snapshot ${pricing.id}`);
       for (const row of built.metadata) {
         if (row.matching) {
           row.matching.artificial_analysis.stale = aaStale;
@@ -145,8 +142,8 @@ export class ModelIntelligenceManager {
       }
       for (const row of built.values) {
         row.sourceStatus = {
-          "artificial-analysis": aaStale ? "stale" : "fresh",
-          "github-copilot-pricing": pricingStale ? "stale" : "fresh",
+          "artificial-analysis": !aa ? "unavailable" : aaStale ? "stale" : "fresh",
+          "github-copilot-pricing": !pricing ? "unavailable" : pricingStale ? "stale" : "fresh",
         };
       }
       if (built.metadata.length === 0) {
@@ -177,15 +174,16 @@ export class ModelIntelligenceManager {
         return this.complete("retained", [...built.diagnostics, collapse], attemptedAt, forceSources);
       }
       if (active && active.catalogSignature === built.catalogSignature &&
-        active.sourceSnapshots["artificial-analysis"] === aa.id &&
-        active.sourceSnapshots["github-copilot-pricing"] === pricing.id &&
+        active.matchingPolicyVersion === MODEL_INTELLIGENCE_MATCHING_POLICY_VERSION &&
+        active.sourceSnapshots["artificial-analysis"] === (aa?.id ?? null) &&
+        active.sourceSnapshots["github-copilot-pricing"] === (pricing?.id ?? null) &&
         JSON.stringify(active.scenario) === JSON.stringify(this.options.scenario)) {
         return this.complete("unchanged", built.diagnostics, attemptedAt, forceSources);
       }
       const generation = this.options.store.publish({
         publishedAt: attemptedAt, catalogSignature: built.catalogSignature,
         matchingPolicyVersion: MODEL_INTELLIGENCE_MATCHING_POLICY_VERSION,
-        sourceSnapshots: { "artificial-analysis": aa.id, "github-copilot-pricing": pricing.id },
+        sourceSnapshots: { "artificial-analysis": aa?.id ?? null, "github-copilot-pricing": pricing?.id ?? null },
         scenario: this.options.scenario, diagnostics: built.diagnostics,
         metadata: built.metadata, values: built.values,
       });
@@ -274,10 +272,12 @@ export class ModelIntelligenceManager {
 }
 
 function buildGeneration(
-  fleet: CatalogFleetBinding[], aa: IntelligenceSourceSnapshot<MetadataSourceModel>,
-  pricing: IntelligenceSourceSnapshot<CopilotPricing>, scenario: ModelValueScenario, fetchedAt: string
+  fleet: CatalogFleetBinding[], aa: IntelligenceSourceSnapshot<MetadataSourceModel> | null,
+  pricing: IntelligenceSourceSnapshot<CopilotPricing> | null, scenario: ModelValueScenario, fetchedAt: string
 ): { metadata: ModelMetadata[]; values: ModelValueSnapshotRow[]; diagnostics: string[]; catalogSignature: string } {
   const diagnostics: string[] = [];
+  if (!aa) diagnostics.push("Artificial Analysis source unavailable; no validated snapshot");
+  if (!pricing) diagnostics.push("GitHub pricing source unavailable; no validated snapshot");
   const availability: AgentModelAvailability[] = [];
   for (const binding of fleet) {
     if (binding.state === "warming" || binding.state === "drift" || !binding.snapshot) {
@@ -289,12 +289,12 @@ function buildGeneration(
       availability.push(toAvailability(binding, model));
     }
   }
-  const metadataResult = buildModelMetadataSnapshot({ catalog: availability, sourceModels: aa.records,
-    source: "artificial-analysis", fetchedAt });
-  diagnostics.push(...metadataResult.unmatchedModels.map((id) => `${id}: no Artificial Analysis match`));
+  const metadataResult = buildModelMetadataSnapshot({ catalog: availability, sourceModels: aa?.records ?? [],
+    source: "artificial-analysis", fetchedAt: aa?.fetchedAt ?? fetchedAt });
+  if (aa) diagnostics.push(...metadataResult.unmatchedModels.map((id) => `${id}: no Artificial Analysis match`));
   const baseMetadata = metadataResult.rows.map((row) => ({ ...row,
-    source_snapshots: { "artificial-analysis": String(aa.id), "github-copilot-pricing": String(pricing.id) },
-    source_fetched_at: { "artificial-analysis": aa.fetchedAt, "github-copilot-pricing": pricing.fetchedAt },
+    source_snapshots: { "artificial-analysis": aa ? String(aa.id) : null, "github-copilot-pricing": pricing ? String(pricing.id) : null },
+    source_fetched_at: { "artificial-analysis": aa?.fetchedAt ?? null, "github-copilot-pricing": pricing?.fetchedAt ?? null },
   }));
   const copilot = [...new Map(availability.filter((row) => row.catalogProvider === "github-copilot")
     .map((row) => [`${row.catalogScope ?? row.agentId}\u0000${row.modelId}`, row] as const)).values()];
@@ -303,13 +303,13 @@ function buildGeneration(
       validEffortTiers: row.effortChoices ?? [], priceCategory: row.priceCategory ?? null,
       runtimeId: row.runtimeId, aliases: row.aliases, effortDefault: row.effortDefault, effortMechanism: row.effortMechanism,
       variantId: `${row.catalogScope ?? row.agentId}::${row.modelId}` })),
-    aaModels: aa.records, pricing: pricing.records, inputTokens: scenario.uncached_input_tokens,
+    aaModels: aa?.records ?? [], pricing: pricing?.records ?? [], inputTokens: scenario.uncached_input_tokens,
     cachedInputTokens: scenario.cached_input_tokens, cacheWriteTokens: scenario.cache_write_tokens,
     outputTokens: scenario.output_tokens, longContextThresholdTokens: scenario.long_context_threshold_tokens,
     fetchedAt,
   });
-  diagnostics.push(...valuesResult.unmatchedAaModels.map((id) => `${id}: benchmark unresolved`));
-  diagnostics.push(...valuesResult.unmatchedPricingModels.map((id) => `${id}: pricing unresolved`));
+  if (aa) diagnostics.push(...valuesResult.unmatchedAaModels.map((id) => `${id}: benchmark unresolved`));
+  if (pricing) diagnostics.push(...valuesResult.unmatchedPricingModels.map((id) => `${id}: pricing unresolved`));
   const catalogSignature = stableHash(fleet.map((entry) => ({ binding: entry.binding, state: entry.state,
     generation: entry.snapshot?.generation ?? null, scope: entry.snapshot?.scopeKey ?? null,
     checksum: entry.snapshot?.checksum ?? null }))
@@ -336,8 +336,10 @@ function buildGeneration(
     return { ...row, bindings, catalogGeneration: entry?.catalogGeneration,
       catalogDefault: entry?.modelDefault, effortDefault: entry?.effortDefault,
       effortMechanism: entry?.effortMechanism,
-      sourceSnapshots: { "artificial-analysis": String(aa.id), "github-copilot-pricing": String(pricing.id) },
-      sourceFetchedAt: { "artificial-analysis": aa.fetchedAt, "github-copilot-pricing": pricing.fetchedAt },
+      benchmarkMatchStatus: aa ? row.benchmarkMatchStatus : "source-unavailable",
+      pricingMatchStatus: pricing ? row.pricingMatchStatus : "source-unavailable",
+      sourceSnapshots: { "artificial-analysis": aa ? String(aa.id) : null, "github-copilot-pricing": pricing ? String(pricing.id) : null },
+      sourceFetchedAt: { "artificial-analysis": aa?.fetchedAt ?? null, "github-copilot-pricing": pricing?.fetchedAt ?? null },
       scenario,
     };
   });
@@ -349,15 +351,17 @@ function buildGeneration(
       matching: {
         artificial_analysis: {
           ...row.matching!.artificial_analysis,
-          snapshot_id: String(aa.id),
+          status: aa ? row.matching!.artificial_analysis.status : "source-unavailable",
+          snapshot_id: aa ? String(aa.id) : null,
+          detail: aa ? row.matching!.artificial_analysis.detail : "no validated source snapshot",
         },
         github_copilot_pricing: value ? {
-          status: value.pricingMatchStatus ?? "no-source-record",
-          source: "github-copilot-pricing", snapshot_id: String(pricing.id), record_id: null,
+          status: pricing ? value.pricingMatchStatus ?? "no-source-record" : "source-unavailable",
+          source: "github-copilot-pricing", snapshot_id: pricing ? String(pricing.id) : null, record_id: null,
           record_name: value.pricingMatchRecordName ?? null,
           selected_effort: null, policy: "automatic-exact-normalized-scenario-tier",
           candidates: value.pricingMatchCandidates ?? [], stale: false,
-          detail: value.pricingTier ? `tier ${value.pricingTier}` : null,
+          detail: pricing ? value.pricingTier ? `tier ${value.pricingTier}` : null : "no validated source snapshot",
         } : null,
       },
     };
@@ -388,7 +392,8 @@ function stableHash(value: unknown): string {
 function matchingCollapsed(
   active: NonNullable<ReturnType<ModelIntelligenceStore["active"]>>,
   metadata: ModelMetadata[], values: ModelValueSnapshotRow[], store: ModelIntelligenceStore,
-  aa: IntelligenceSourceSnapshot<MetadataSourceModel>, pricing: IntelligenceSourceSnapshot<CopilotPricing>
+  aa: IntelligenceSourceSnapshot<MetadataSourceModel> | null,
+  pricing: IntelligenceSourceSnapshot<CopilotPricing> | null
 ): string | null {
   const priorAaId = active.sourceSnapshots["artificial-analysis"];
   const priorPriceId = active.sourceSnapshots["github-copilot-pricing"];
@@ -397,13 +402,13 @@ function matchingCollapsed(
   const currentByVariant = new Map(metadata.map((row) => [row.variant_id ?? row.id, row]));
   const comparable = active.metadata.filter((row) => row.slug && currentByVariant.has(row.variant_id ?? row.id));
   const retained = comparable.filter((row) => currentByVariant.get(row.variant_id ?? row.id)?.slug).length;
-  if (priorAa && aa.records.length >= priorAa.records.length && comparable.length > 0 && retained < Math.ceil(comparable.length / 2)) {
+  if (priorAa && aa && aa.records.length >= priorAa.records.length && comparable.length > 0 && retained < Math.ceil(comparable.length / 2)) {
     return `Artificial Analysis matching collapsed (${retained}/${comparable.length} comparable rows)`;
   }
   const currentValues = new Map(values.map((row) => [row.variantId ?? row.copilotModel, row]));
   const priorPriced = active.values.filter((row) => row.inputRate !== null && currentValues.has(row.variantId ?? row.copilotModel));
   const retainedPriced = priorPriced.filter((row) => currentValues.get(row.variantId ?? row.copilotModel)?.inputRate !== null).length;
-  if (priorPricing && pricing.records.length >= priorPricing.records.length && priorPriced.length > 0 && retainedPriced < Math.ceil(priorPriced.length / 2)) {
+  if (priorPricing && pricing && pricing.records.length >= priorPricing.records.length && priorPriced.length > 0 && retainedPriced < Math.ceil(priorPriced.length / 2)) {
     return `GitHub pricing matching collapsed (${retainedPriced}/${priorPriced.length} comparable rows)`;
   }
   return null;

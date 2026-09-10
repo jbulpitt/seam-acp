@@ -105,10 +105,23 @@ describe("automatic model-intelligence matching (#249)", () => {
     expect(unknown.status).toBe("unresolved-effort");
     expect(unknown.row).toBeNull();
     const futureOnly = matchArtificialAnalysis(
-      { modelId: "nebula-7", displayName: "Nebula 7", effortChoices: ["extreme"] },
+      { modelId: "nebula-7", displayName: "Nebula 7", effortChoices: ["low", "high"] },
       [rows[2]!],
     );
-    expect(futureOnly).toMatchObject({ status: "unresolved-effort", row: null });
+    expect(futureOnly).toEqual({
+      status: "unresolved-effort",
+      row: null,
+      selectedEffort: null,
+      candidates: ["nebula-7-extreme"],
+      ignored: ["nebula-7-extreme"],
+    });
+    expect(matchArtificialAnalysis(model, [{
+      id: "different-version", name: "Nebula 70 (extreme)", slug: "nebula-70-extreme",
+      creator: null, releaseDate: null, intelligenceIndex: 9, benchmarks: {}, pricing: null,
+    }, {
+      id: "mini", name: "Nebula 7 Mini (extreme)", slug: "nebula-7-mini-extreme",
+      creator: null, releaseDate: null, intelligenceIndex: 9, benchmarks: {}, pricing: null,
+    }])).toEqual({ status: "no-source-record", row: null, selectedEffort: null, candidates: [], ignored: [] });
   });
 
   it("selects explicit long-context pricing and never substitutes a missing cache rate", () => {
@@ -380,6 +393,157 @@ describe("coordinated model-intelligence generations (#249)", () => {
       ]) }),
       "model intelligence matching coverage recovered",
     );
+    manager.stop();
+    store.close();
+  });
+
+  it.each(["artificial-analysis", "github-copilot-pricing"] as const)(
+    "publishes cold partial enrichment and later retains the recovered %s LKG",
+    async (outage) => {
+      const dir = mkdtempSync(path.join(tmpdir(), `seam-intelligence-cold-${outage}-`));
+      dirs.push(dir);
+      const store = new ModelIntelligenceStore(path.join(dir, "seam.db"));
+      const aaRows = parseAaModels({ data: [{
+        id: "aa-astra", name: "GPT-6 Astra (max)", slug: "gpt-6-astra-max",
+        evaluations: { artificial_analysis_intelligence_index: 54 },
+      }] });
+      const pricingRows = parseCopilotPricingMarkdown(`
+| Model | Input | Output |
+| --- | ---: | ---: |
+| GPT 6 Astra | $10 | $50 |
+`);
+      let failAa = outage === "artificial-analysis";
+      let failPricing = outage === "github-copilot-pricing";
+      const manager = new ModelIntelligenceManager({
+        store, logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } as never,
+        source: { name: "artificial-analysis", fetch: vi.fn(async () => {
+          if (failAa) throw new Error("AA offline");
+          return aaRows;
+        }) },
+        fetchPricing: vi.fn(async () => {
+          if (failPricing) throw new Error("GitHub pricing offline");
+          return pricingRows;
+        }),
+        getCatalog: () => fleet([catalogModel("gpt-6-astra")]),
+        scenario: { uncached_input_tokens: 8_000, cached_input_tokens: 0, cache_write_tokens: 0,
+          output_tokens: 2_000, long_context_threshold_tokens: 200_000 },
+      });
+
+      const cold = await manager.refresh({ forceSources: true });
+      expect(cold).toMatchObject({
+        ok: true,
+        result: "published",
+        generation: 1,
+        sources: { [outage]: { snapshot: null, status: "missing" } },
+      });
+      const coldActive = store.active()!;
+      expect(coldActive.sourceSnapshots[outage]).toBeNull();
+      expect(coldActive.metadata.map((row) => row.id)).toEqual(["gpt-6-astra"]);
+      expect(coldActive.values.map((row) => row.copilotModel)).toEqual(["gpt-6-astra"]);
+      expect(coldActive.diagnostics).toContain(outage === "artificial-analysis"
+        ? "Artificial Analysis source unavailable; no validated snapshot"
+        : "GitHub pricing source unavailable; no validated snapshot");
+      expect(coldActive.metadata[0]?.matching?.artificial_analysis.status).toBe(
+        outage === "artificial-analysis" ? "source-unavailable" : "matched",
+      );
+      expect(coldActive.metadata[0]?.matching?.github_copilot_pricing?.status).toBe(
+        outage === "github-copilot-pricing" ? "source-unavailable" : "matched",
+      );
+      expect(coldActive.values[0]).toMatchObject(outage === "artificial-analysis"
+        ? {
+            intelligenceIndex: null,
+            inputRate: 10,
+            benchmarkMatchStatus: "source-unavailable",
+            pricingMatchStatus: "matched",
+            sourceStatus: { "artificial-analysis": "unavailable", "github-copilot-pricing": "fresh" },
+          }
+        : {
+            intelligenceIndex: 54,
+            inputRate: null,
+            benchmarkMatchStatus: "matched",
+            pricingMatchStatus: "source-unavailable",
+            sourceStatus: { "artificial-analysis": "fresh", "github-copilot-pricing": "unavailable" },
+          });
+      expect(JSON.stringify(renderModelValueRankingsLayout(coldActive.values))).toContain("degraded");
+
+      failAa = false;
+      failPricing = false;
+      expect(await manager.refresh({ forceSources: true })).toMatchObject({ result: "published", generation: 2 });
+      const recovered = store.active()!;
+      const recoveredSnapshot = recovered.sourceSnapshots[outage];
+      expect(recoveredSnapshot).toEqual(expect.any(Number));
+      const recoveredFetchedAt = store.sourceSnapshot(recoveredSnapshot!)?.fetchedAt;
+      expect(recovered.metadata[0]?.matching?.artificial_analysis.status).toBe("matched");
+      expect(recovered.metadata[0]?.matching?.github_copilot_pricing?.status).toBe("matched");
+
+      failAa = outage === "artificial-analysis";
+      failPricing = outage === "github-copilot-pricing";
+      const warm = await manager.refresh({ forceSources: true });
+      expect(warm).toMatchObject({
+        result: "published",
+        generation: 3,
+        sources: { [outage]: { snapshot: recoveredSnapshot, status: "stale", lastSuccessAt: recoveredFetchedAt } },
+      });
+      const warmActive = store.active()!;
+      expect(warmActive.sourceSnapshots[outage]).toBe(recoveredSnapshot);
+      expect(warmActive.values[0]?.sourceStatus?.[outage]).toBe("stale");
+      expect(outage === "artificial-analysis"
+        ? warmActive.metadata[0]?.source_fetched_at?.[outage]
+        : warmActive.values[0]?.sourceFetchedAt?.[outage]).toBe(recoveredFetchedAt);
+      manager.stop();
+      store.close();
+    },
+  );
+
+  it("publishes exact unknown-effort evidence without borrowing a nearby identity", async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "seam-intelligence-future-effort-"));
+    dirs.push(dir);
+    const store = new ModelIntelligenceStore(path.join(dir, "seam.db"));
+    const manager = new ModelIntelligenceManager({
+      store, logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } as never,
+      source: { name: "artificial-analysis", fetch: vi.fn(async () => parseAaModels({ data: [{
+        id: "nebula-extreme", name: "Nebula 7 (extreme)", slug: "nebula-7-extreme",
+        evaluations: { artificial_analysis_intelligence_index: 70 },
+      }, {
+        id: "nebula-mini", name: "Nebula 7 Mini (extreme)", slug: "nebula-7-mini-extreme",
+        evaluations: { artificial_analysis_intelligence_index: 80 },
+      }, {
+        id: "nebula-70", name: "Nebula 70 (extreme)", slug: "nebula-70-extreme",
+        evaluations: { artificial_analysis_intelligence_index: 90 },
+      }] })) },
+      fetchPricing: vi.fn(async () => parseCopilotPricingMarkdown(`
+| Model | Input | Output |
+| --- | ---: | ---: |
+| Nebula 7 | $1 | $5 |
+`)),
+      getCatalog: () => fleet([catalogModel("nebula-7", ["low", "high"])]),
+      scenario: { uncached_input_tokens: 8_000, cached_input_tokens: 0, cache_write_tokens: 0,
+        output_tokens: 2_000, long_context_threshold_tokens: 200_000 },
+    });
+
+    expect(await manager.refresh({ forceSources: true })).toMatchObject({
+      result: "published",
+      matchingPolicyVersion: "249.2",
+    });
+    expect(store.active()?.metadata[0]).toMatchObject({
+      id: "nebula-7",
+      intelligence_index: null,
+      matching: {
+        artificial_analysis: {
+          status: "unresolved-effort",
+          selected_effort: null,
+          candidates: ["nebula-7-extreme"],
+        },
+      },
+      benchmark_variants: [{ slug: "nebula-7-extreme", effort: null, intelligence_index: 70 }],
+    });
+    expect(store.active()?.values[0]).toMatchObject({
+      copilotModel: "nebula-7",
+      aaSlug: null,
+      intelligenceIndex: null,
+      benchmarkMatchStatus: "unresolved-effort",
+      inputRate: 1,
+    });
     manager.stop();
     store.close();
   });

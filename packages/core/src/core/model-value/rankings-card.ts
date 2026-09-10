@@ -134,7 +134,7 @@ function snapshotDescription(rows: readonly ModelValueSnapshotRow[]): string {
       ? [`${source === "artificial-analysis" ? "AA" : "GitHub"} <t:${Math.floor(timestamp / 1_000)}:R>`]
       : [];
   });
-  const degraded = Object.values(row.sourceStatus ?? {}).some((status) => status === "stale") ||
+  const degraded = Object.values(row.sourceStatus ?? {}).some((status) => status !== "fresh") ||
     (row.generationDiagnostics?.length ?? 0) > 0;
   return `Published <t:${unix}:R> · <t:${unix}:f> · ${generation} · ${scenario} · ${sourceCount} source snapshots` +
     `${sourceAges.length ? ` (${sourceAges.join(", ")})` : ""}` +

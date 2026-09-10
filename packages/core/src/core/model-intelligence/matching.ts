@@ -68,16 +68,17 @@ function splitEffort(value: string): { base: string; effort: string | null } {
   return { base: parts.slice(0, -1).join("-"), effort: suffix };
 }
 
-function splitSourceEffort(
-  value: string,
-  declaredEfforts: ReadonlySet<string>,
-): { base: string; effort: string | null; unknownEffort: string | null } {
+function splitSourceEffort(value: string): { base: string; effort: string | null; unknownEffort: string | null } {
   const match = value.match(/\(([^)]+)\)\s*$/);
   if (match) {
     const token = normalizeExternalModelName(match[1]!);
     const base = normalizeExternalModelName(value.slice(0, match.index));
     if (EFFORT_RANK.has(token)) return { base, effort: token, unknownEffort: null };
-    if (declaredEfforts.has(token)) return { base, effort: null, unknownEffort: token || "unknown" };
+    // AA effort variants are expressed as a trailing parenthesized qualifier.
+    // Preserve a future vocabulary item as evidence even when the operational
+    // catalog does not yet declare it: it may identify the exact model, but it
+    // must never be guessed into a supported runtime effort.
+    if (token) return { base, effort: null, unknownEffort: token };
   }
   return { ...splitEffort(value), unknownEffort: null };
 }
@@ -92,8 +93,8 @@ export function matchArtificialAnalysis(
   const bakedEffort = model.effortMechanism === "modelBaked" || supported.size === 0
     ? splitEffort(model.modelId).effort : null;
   const syntactic = rows.flatMap((row) => {
-    const slug = splitSourceEffort(row.slug, supported);
-    const name = splitSourceEffort(row.name, supported);
+    const slug = splitSourceEffort(row.slug);
+    const name = splitSourceEffort(row.name);
     const baseMatches = keys.has(slug.base) || keys.has(name.base) ||
       keys.has(normalizeExternalModelName(row.slug)) || keys.has(normalizeExternalModelName(row.name));
     return baseMatches ? [{

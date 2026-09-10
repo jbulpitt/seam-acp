@@ -5,21 +5,21 @@ import { fileURLToPath } from "node:url";
 import type { McpServer } from "@agentclientprotocol/sdk";
 import { makeAgyProfile } from "@seam/adapters";
 import { pino } from "pino";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   AgentRuntime,
   type AgentEvent,
 } from "../packages/core/src/agents/agent-runtime.js";
 import { DispatchStatusPanel } from "../packages/core/src/core/dispatch-status-panel.js";
-import {
-  TurnStatus,
-  formatContextUsage,
-} from "../packages/core/src/core/status-panel.js";
+import { SessionStore } from "../packages/core/src/core/session-store.js";
+import { TurnStatus } from "../packages/core/src/core/status-panel.js";
 import type { StructuredPanel } from "../packages/core/src/core/types.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import type { MessageAttachment } from "../packages/core/src/platforms/chat-adapter.js";
+import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
 import { discordRenderer } from "../packages/core/src/platforms/discord/renderer.js";
 import { serializePanelText } from "../packages/core/src/platforms/renderer.js";
+import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const fixtureDir = path.join(here, "fixtures", "agy-native-capabilities");
@@ -150,6 +150,19 @@ function usageSequence(events: readonly AgentEvent[]): Array<{ used: number; siz
     .filter((event): event is Extract<AgentEvent, { kind: "usage-update" }> =>
       event.kind === "usage-update")
     .map(({ used, size }) => ({ used, size }));
+}
+
+function fullCardThoughtLines(panel: StructuredPanel): string[] {
+  return (panel.footer ?? "")
+    .split("\n")
+    .filter((line) => line.startsWith("💡 "));
+}
+
+function simpleCardThoughtObservations(panels: readonly StructuredPanel[]): string[] {
+  const observations = panels
+    .map((panel) => /💡 ([^•]+)/u.exec(panel.footer ?? "")?.[1]?.trim())
+    .filter((value): value is string => value !== undefined);
+  return observations.filter((value, index) => value !== observations[index - 1]);
 }
 
 async function renderEvents(
@@ -317,27 +330,22 @@ describe.sequential("native AGY R1 capability contract", () => {
       expect(captured.panel.status.contextUsedHighWater).toBe(200);
       expect(captured.panel.status.contextWindowSize).toBe(4096);
     }
-    const compactionInput = {
-      used: full.panel.status.contextUsedHighWater,
-      size: full.panel.status.contextWindowSize,
-    };
-    expect(compactionInput).toEqual({ used: 200, size: 4096 });
-    expect(compactionInput.used / compactionInput.size).toBeGreaterThan(0.04);
     expect(JSON.stringify(events)).not.toMatch(/SANITIZED PRIVATE (READ|EDIT|COMMAND)/);
 
     await full.panel.finalize("Done", "Completed");
     await simple.panel.finalize("Done", "Completed");
     const fullCard = serializePanelText(full.rendered.at(-1)!);
     const simpleCard = serializePanelText(simple.rendered.at(-1)!);
-    const fullRenderHistory = full.rendered.map(serializePanelText).join("\n");
-    const simpleRenderHistory = simple.rendered.map(serializePanelText).join("\n");
-    for (const cardHistory of [fullRenderHistory, simpleRenderHistory]) {
-      expect(cardHistory).toContain("💡 Inspect fixture 🧭");
-      expect(cardHistory).toContain("💡 Plan safely");
-    }
-    expect(fullCard).toContain("💡 Inspect fixture 🧭");
-    expect(fullCard).toContain("💡 Plan safely");
-    expect(fullCard).toContain(formatContextUsage(200, 4096));
+    expect(fullCardThoughtLines(full.rendered.at(-1)!)).toEqual([
+      "💡 Inspect fixture 🧭",
+      "💡 Plan safely",
+    ]);
+    expect(simpleCardThoughtObservations(simple.rendered)).toEqual([
+      "Inspect fixture 🧭",
+      "Plan",
+      "Plan safely",
+    ]);
+    expect(fullCard).toContain("🪟 0k / 4k (5%)");
     expect(simpleCard).toContain("🪟 5%");
     for (const card of [fullCard, simpleCard]) {
       expect(card).not.toMatch(/SANITIZED PRIVATE (READ|EDIT|COMMAND)/);
@@ -452,6 +460,110 @@ describe.sequential("native AGY R1 capability contract", () => {
       maxStepIndex: 6,
     });
     await resumed.dispose();
+  }, 30_000);
+
+  it("feeds native usage through the real AGY auto-compaction predicate and consumer", async () => {
+    const dataDir = fs.mkdtempSync(path.join(root, "orchestrator-data-"));
+    const turnMappingDir = fs.mkdtempSync(path.join(root, "orchestrator-mapping-"));
+    const store = new SessionStore(path.join(dataDir, "seam.db"));
+    const profile = makeAgyProfile({
+      cliPath: fakeCli,
+      dataDir: turnMappingDir,
+      defaultModel: "Fixture Native Model",
+      persistModelSelection: false,
+      exposeGlobalStaging: false,
+    });
+    const runtime = new AgentRuntime({ profile, logger, mcpServers: [seamMcp] });
+    await runtime.start();
+    const session = await runtime.newSession({
+      cwd: root,
+      model: "fixture-native-model",
+      strictModel: true,
+    });
+    const record = {
+      id: "discord:agy-r1-compaction",
+      platform: "discord",
+      channelRef: "agy-r1-compaction",
+      parentRef: null,
+      agentId: "agy",
+      acpSessionId: session.sessionId,
+      repoPath: root,
+      configJson: JSON.stringify({ model: "fixture-native-model" }),
+      createdUtc: "2026-09-10T00:00:00.000Z",
+      updatedUtc: "2026-09-10T00:00:00.000Z",
+    } as const;
+    store.upsert(record);
+
+    const described = {
+      agent: { value: "agy" },
+      location: { value: "local" },
+      model: { value: "fixture-native-model" },
+      effort: { value: "default" },
+      cwd: { value: root },
+      statusCardStyle: { value: "full" },
+      simpleCardGif: { value: false },
+      fastMode: { value: false },
+    };
+    const profileWithoutCompactionManager = { ...profile, sessionManager: undefined };
+    const router = {
+      ensureSessionRecord: () => record,
+      describeConfig: () => described,
+      getProfile: () => profileWithoutCompactionManager,
+      getOrStartRuntime: async () => runtime,
+      hasRuntime: () => true,
+      invalidate: async () => {},
+      listProfiles: () => [profileWithoutCompactionManager],
+    };
+    const channel = { platform: "discord", id: record.channelRef } as const;
+    const adapter = {
+      sendPanel: async () => ({ channel, id: "status" }),
+      editPanel: async () => {},
+      sendMessage: async () => ({ channel, id: "message" }),
+      editMessage: async () => {},
+      sendTyping: async () => {},
+    };
+    const catalog = fixtureModelCatalog([profileWithoutCompactionManager]);
+    const orchestrator = new Orchestrator({
+      logger,
+      config: {
+        DATA_DIR: dataDir,
+        REPOS_ROOT: root,
+        TURN_TIMEOUT_SECONDS: 10,
+        DEFAULT_AGENT: "agy",
+        DEFAULT_MODEL: "fixture-native-model",
+        AGY_AUTO_COMPACT_THRESHOLD: 0.04,
+        CHANNEL_PRESETS_FILE: undefined,
+        SEAM_CONFIG_MUTATION_TIER_C_ENABLED: false,
+        channelPresets: new Map(),
+        threadPresets: new Map(),
+        bridgePresets: new Map(),
+      } as any,
+      adapter: adapter as any,
+      router: router as any,
+      store,
+      renderer: discordRenderer,
+      modelCatalog: catalog,
+    });
+    const compact = vi.spyOn(orchestrator as any, "runAgyAutoCompact");
+
+    try {
+      await (orchestrator as any).executeIncomingMessage({
+        channel,
+        authorId: "fixture-user",
+        authorIsBot: false,
+        text: "capability-turn-one",
+      });
+      expect(compact).toHaveBeenCalledTimes(1);
+      expect(compact.mock.calls[0]?.[4]).toBe(200);
+      expect(compact.mock.calls[0]?.[2]).toMatchObject({
+        contextUsedHighWater: 200,
+        contextWindowSize: 4096,
+      });
+    } finally {
+      compact.mockRestore();
+      await runtime.dispose();
+      store.close();
+    }
   }, 30_000);
 
   it("negative control: removing plannerResponse.thinking breaks the thinking assertion", async () => {

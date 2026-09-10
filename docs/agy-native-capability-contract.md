@@ -25,7 +25,9 @@ model self-report or a claim of live correctness.
 
 - Native `plannerResponse.thinking` cumulative updates become only incremental
   ACP `agent_thought_chunk` updates, then core `agent-thought` events. Both full
-  and simple status cards render those thoughts. Tool labels and opaque tool
+  and simple status cards render those thoughts in their observed order. The
+  full terminal card retains the exact ordered thought lines, and the simple
+  card history observes them chronologically. Tool labels and opaque tool
   payloads cannot satisfy the thinking assertion.
 - Native `plannerResponse.modifiedResponse` cumulative updates finalize to the
   exact visible message once. Connect envelopes split inside multibyte Unicode,
@@ -33,9 +35,12 @@ model self-report or a claim of live correctness.
 - Observed read, edit, and execute step types become stable tool start/update
   events. Failed native tool status remains failed. Opaque command output,
   patches, and errors are not promoted to assistant text or thinking.
-- `metadata.modelUsage` supplies monotonically increasing ACP usage updates;
-  `AgentRuntime` supplies the core context inputs used by status and compaction
-  callers.
+- `metadata.modelUsage` supplies monotonically increasing ACP usage updates.
+  `AgentRuntime` supplies the core context inputs used by status and the live
+  Discord turn crosses the production AGY auto-compaction predicate; the real
+  `runAgyAutoCompact` consumer receives the retained usage as `tokensBefore`.
+  Card expectations are fixture-owned literals, not values recomputed by the
+  production formatter under test.
 - A persisted native conversation ID and step high-water mark survive runtime
   disposal/load. Replayed old indices are suppressed and only the resumed
   turn's new indices are emitted.
@@ -64,9 +69,13 @@ model self-report or a claim of live correctness.
 The fixture shapes are source-confirmed from the native structural snapshot
 documented in `packages/adapters/src/agy-stream.ts` and offline-reproduced
 through the real native profile, ACP facade, core runtime, attachment mapping,
-and renderers. Unknown native fields remain opaque. A later compatibility gate
-may add separately approved disposable live observations; R1 does not infer
-provider or model correctness from fixture output.
+renderers, and the orchestrator's AGY threshold/consumer call. The R1
+auto-compaction check stops after the real consumer receives the retained usage;
+it does not claim that summary generation, session reseeding, or the separately
+tested compaction workflow is reproduced by this fixture. Unknown native fields
+remain opaque. A later compatibility gate may add separately approved
+disposable live observations; R1 does not infer provider or model correctness
+from fixture output.
 
 The observed production warning that `AGY_BIN` does not match the configured
 immutable artifact concerns `agy-package` launch identity and artifact

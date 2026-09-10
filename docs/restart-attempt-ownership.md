@@ -45,6 +45,15 @@ gone before replacement. Unknown host/process identity fails closed; Linux
 metadata is read without signals. Other operating systems need a separate
 ownership implementation.
 
+Suspended recovery requires a present, structurally valid prior owner row, even
+for same-boot operator recovery. Missing/null/malformed proof yields the typed
+suspension signal without advancing the generation or entering completion.
+Cross-boot recovery additionally proves the prior owner dead. Same-boot recovery
+still checks any recorded runtime process. Startup retirement skips malformed
+owner rows, retaining their work for operator investigation. Tests model an
+explicit synthetic PID-reuse boundary while preserving real owner registration;
+they do not establish actual provider reload or supervisor stop ordering.
+
 The execution fingerprint covers host/agent/mode/model/effort/cwd, thread/preset
 configuration, declared runtime provenance and conservative account/store/config
 fingerprints. Provider initialize identity is retained and checked. Credential

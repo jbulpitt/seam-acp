@@ -1,6 +1,13 @@
 import type Database from "better-sqlite3";
 import type { DispatchResult, DispatchSpec } from "./types.js";
-import { processOwner, provenDead, type ProcessOwner } from "./process-owner.js";
+import { isProcessOwner, processOwner, provenDead, type ProcessOwner } from "./process-owner.js";
+
+function recordedOwner(raw: string | undefined): ProcessOwner | null {
+  try {
+    const value: unknown = raw ? JSON.parse(raw) : null;
+    return isProcessOwner(value) ? value : null;
+  } catch { return null; }
+}
 
 export const inboundAttemptId = (messageId: string): string => `inbound-${messageId}`;
 
@@ -61,7 +68,7 @@ export class TurnAttemptStore {
     const owners = this.db.prepare("SELECT id,process_json FROM turn_attempt_owners").all() as { id: string; process_json: string }[];
     let n = 0;
     for (const owner of owners) {
-      const p = JSON.parse(owner.process_json) as ProcessOwner | null;
+      const p = recordedOwner(owner.process_json);
       if (p && provenDead(p)) n += this.suspendBoot(owner.id);
     }
     return n;
@@ -93,10 +100,10 @@ export class TurnAttemptStore {
         }
         const owner = this.db.prepare("SELECT process_json FROM turn_attempt_owners WHERE id=?")
           .get(old.ownerBoot) as { process_json: string } | undefined;
-        if (owner && old.ownerBoot !== ownerBoot) {
-          const p = JSON.parse(owner.process_json) as ProcessOwner | null;
-          if (!p || !provenDead(p)) throw new DispatchSuspendedError(spec.id);
-        }
+        // Suspension alone is not proof of death. Missing/corrupt registration
+        // must retain ownership, including same-boot operator recovery.
+        const p = recordedOwner(owner?.process_json);
+        if (!p || (old.ownerBoot !== ownerBoot && !provenDead(p))) throw new DispatchSuspendedError(spec.id);
         if (old.runtimeOwner && !provenDead(old.runtimeOwner)) throw new DispatchSuspendedError(spec.id);
         this.db.prepare(`UPDATE turn_attempts SET generation=generation+1,
           owner_boot=?, state='active', updated_utc=? WHERE id=? AND state='suspended'`)

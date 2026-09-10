@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { simulateRetiredOwnerProcess } from "./restart-process-fixture.js";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -26,7 +27,7 @@ vi.mock("../packages/core/src/agents/agent-runtime.js", async importOriginal => 
   } };
 });
 const cleanups: (() => void)[] = [];
-afterEach(() => { for (const f of cleanups.splice(0).reverse()) f(); vi.clearAllMocks(); });
+afterEach(() => { for (const f of cleanups.splice(0).reverse()) f(); vi.clearAllMocks(); vi.restoreAllMocks(); });
 function setup(mode: "live" | "isolated" = "isolated") {
   transport.prompt.mockReset();
   transport.delete.mockResolvedValue(undefined);
@@ -83,7 +84,7 @@ describe("#252 actual isolated scheduler + injectTurn, synthetic transport", () 
 
   it.each(["live", "isolated"] as const)("continues the same %s occurrence/session after repeated cutoff without the original task", async mode => {
     const h = setup(mode);
-    vi.spyOn(h.store.turnAttempts, "registerOwner").mockImplementation(() => {});
+    simulateRetiredOwnerProcess();
     const key = scheduledOccurrenceKey(h.row.id, "2026-09-09T00:00:00.000Z");
     for (let i = 0; i < 2; i++) {
       const orch = h.make();
@@ -130,7 +131,7 @@ describe("#252 actual isolated scheduler + injectTurn, synthetic transport", () 
   });
 
   it("a durable cancellation never resumes, while disable/delete only stops future ticks", async () => {
-    const h = setup(); vi.spyOn(h.store.turnAttempts, "registerOwner").mockImplementation(() => {});
+    const h = setup(); simulateRetiredOwnerProcess();
     const orch = h.make(); const key = scheduledOccurrenceKey(h.row.id);
     transport.prompt.mockImplementationOnce(async () => { orch.suspendForRestart(); throw new Error("cutoff"); });
     await orch.runScheduledPrompt(h.row.id, key);
@@ -151,7 +152,7 @@ describe("#252 actual isolated scheduler + injectTurn, synthetic transport", () 
   });
 
   it("boot recovery owns a due slot before catch-up and does not run it twice", async () => {
-    const h = setup(); vi.spyOn(h.store.turnAttempts, "registerOwner").mockImplementation(() => {});
+    const h = setup(); simulateRetiredOwnerProcess();
     const due = new Date(Date.now() - 120000).toISOString();
     const orch = h.make(); const key = scheduledOccurrenceKey(h.row.id, due);
     transport.prompt.mockImplementationOnce(async () => { orch.suspendForRestart(); throw new Error("cutoff"); });
@@ -168,7 +169,7 @@ describe("#252 actual isolated scheduler + injectTurn, synthetic transport", () 
   });
 
   it("a cutoff during target preconditions retains an unstarted occurrence for its first prompt", async () => {
-    const h = setup(); vi.spyOn(h.store.turnAttempts, "registerOwner").mockImplementation(() => {});
+    const h = setup(); simulateRetiredOwnerProcess();
     let release!: () => void;
     const gate = new Promise<void>(r => { release = r; });
     Object.assign(h.adapter, { getThreadLiveState: async () => { await gate; return { locked: false, archived: false }; } });
@@ -184,7 +185,7 @@ describe("#252 actual isolated scheduler + injectTurn, synthetic transport", () 
   });
 
   it("does not allow a later slot to overlap a suspended occurrence, or inherit its updated configuration", async () => {
-    const h = setup(); vi.spyOn(h.store.turnAttempts, "registerOwner").mockImplementation(() => {});
+    const h = setup(); simulateRetiredOwnerProcess();
     const orch = h.make(); const key = scheduledOccurrenceKey(h.row.id);
     transport.prompt.mockImplementationOnce(async () => { orch.suspendForRestart(); throw new Error("cutoff"); });
     await orch.runScheduledPrompt(h.row.id, key);
@@ -199,7 +200,7 @@ describe("#252 actual isolated scheduler + injectTurn, synthetic transport", () 
   });
 
   it("strict session-load refusal retains provider material and never falls back to a new original turn", async () => {
-    const h = setup(); vi.spyOn(h.store.turnAttempts, "registerOwner").mockImplementation(() => {});
+    const h = setup(); simulateRetiredOwnerProcess();
     const orch = h.make(); const key = scheduledOccurrenceKey(h.row.id);
     transport.prompt.mockImplementationOnce(async () => { orch.suspendForRestart(); throw new Error("cutoff"); });
     await orch.runScheduledPrompt(h.row.id, key);

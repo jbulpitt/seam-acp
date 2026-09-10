@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { simulateRetiredOwnerProcess } from "./restart-process-fixture.js";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -10,7 +11,7 @@ import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 import { listLiveMarkers } from "../packages/core/src/core/dispatch/turn-resume.js";
 
 const cleanups: (() => void)[] = [];
-afterEach(() => { for (const f of cleanups.splice(0).reverse()) f(); });
+afterEach(() => { for (const f of cleanups.splice(0).reverse()) f(); vi.restoreAllMocks(); });
 function setup() {
   const dir = mkdtempSync(path.join(tmpdir(), "seam-250-inbound-"));
   cleanups.push(() => rmSync(dir, { force: true, recursive: true }));
@@ -69,7 +70,7 @@ describe("#250 human turn production pipeline, synthetic transport only", () => 
   it("retains the inbound execution and marker on cutoff, then submits only continue to the same ACP", async () => {
     const h = setup();
     // In-process boot simulation; real PID retirement has separate offline tests.
-    vi.spyOn(h.store.turnAttempts, "registerOwner").mockImplementation(() => {});
+    simulateRetiredOwnerProcess();
     const first = h.run(); await h.started;
     h.orch.suspendForRestart(); h.release(); await first;
     expect(h.store.turnAttempts.get("inbound-1")).toMatchObject({ state: "suspended", promptStarted: true, acpSessionId: "recorded-acp" });
@@ -130,7 +131,7 @@ describe("#250 human turn production pipeline, synthetic transport only", () => 
 
   it("retains a suspended turn when its current thread ACP differs, without a prompt or load", async () => {
     const h = setup();
-    vi.spyOn(h.store.turnAttempts, "registerOwner").mockImplementation(() => {});
+    simulateRetiredOwnerProcess();
     const first = h.run(); await h.started; h.orch.suspendForRestart(); h.release(); await first;
     const current = h.router.ensureSessionRecord();
     h.router.ensureSessionRecord = () => ({ ...current, acpSessionId: "different-session" });

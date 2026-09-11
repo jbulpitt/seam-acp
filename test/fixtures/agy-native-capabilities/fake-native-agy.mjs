@@ -210,7 +210,20 @@ server.listen(0, "127.0.0.1", () => {
   );
 });
 
+let terminating = false;
 process.on("SIGTERM", () => {
+  if (terminating) return;
+  terminating = true;
+  const delayMs = Number(process.env.SEAM_AGY_CAPABILITY_SIGTERM_DELAY_MS ?? 0);
+  if (Number.isFinite(delayMs) && delayMs > 0) {
+    setTimeout(() => {
+      appendInvocation({ scenario: trace?.scenario ?? "catalog", signal: "SIGTERM" });
+      server.close();
+      server.closeAllConnections?.();
+      process.exit(0);
+    }, delayMs);
+    return;
+  }
   appendInvocation({ scenario: trace?.scenario ?? "catalog", signal: "SIGTERM" });
   if (prompt === "r5-term" || prompt === "r5-tree") return;
   if (prompt === "r5-closing") { setTimeout(() => process.exit(0), 300); return; }

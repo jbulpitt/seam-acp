@@ -102,7 +102,11 @@ async function waitForInvocation(
 
 function makeRuntime(
   dataDir = mappingDir,
-  options: { defaultModel?: string; initialSettingsFile?: string } = {},
+  options: {
+    defaultModel?: string;
+    initialSettingsFile?: string;
+    approvedEnvironment?: Readonly<Record<string, string>>;
+  } = {},
 ): AgentRuntime {
   const profile = makeAgyProfile({
     runtime: makeAgyNativeRuntime({
@@ -116,6 +120,7 @@ function makeRuntime(
       approvedEnvironment: {
         SEAM_AGY_CAPABILITY_FIXTURE_DIR: process.env.SEAM_AGY_CAPABILITY_FIXTURE_DIR!,
         SEAM_AGY_CAPABILITY_INVOCATIONS: invocationLog,
+        ...options.approvedEnvironment,
       },
     }),
     dataDir,
@@ -126,6 +131,15 @@ function makeRuntime(
     exposeGlobalStaging: false,
   });
   return new AgentRuntime({ profile, logger, mcpServers: [seamMcp] });
+}
+
+function processExists(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== "ESRCH";
+  }
 }
 
 function capturePanels(style: "full" | "simple") {
@@ -890,6 +904,45 @@ describe.sequential("native AGY R1 capability contract", () => {
       store.close();
     }
   }, 30_000);
+
+  it("reaps the native prompt child before releasing its test-owned temp state", async () => {
+    const runtime = makeRuntime(
+      fs.mkdtempSync(path.join(root, "mapping-owned-child-")),
+      {
+        approvedEnvironment: {
+          SEAM_AGY_CAPABILITY_SIGTERM_DELAY_MS: "750",
+        },
+      },
+    );
+    let pid: number | undefined;
+    try {
+      await runtime.start();
+      await runtime.newSession({
+        cwd: root,
+        model: "fixture-native-model",
+        strictModel: true,
+      });
+      await runtime.prompt("capability-turn-one");
+      pid = readInvocations()
+        .filter((entry) => entry.scenario === "turn-one" && entry.pid !== undefined)
+        .at(-1)?.pid;
+      expect(pid).toBeTypeOf("number");
+
+      await runtime.dispose();
+
+      expect(processExists(pid!)).toBe(false);
+      expect(readInvocations()).toContainEqual({
+        scenario: "turn-one",
+        signal: "SIGTERM",
+      });
+    } finally {
+      await runtime.dispose();
+      if (pid !== undefined && processExists(pid)) {
+        try { process.kill(pid, "SIGKILL"); } catch { /* already exited */ }
+        await vi.waitFor(() => expect(processExists(pid!)).toBe(false));
+      }
+    }
+  }, 20_000);
 
   it("negative control: removing plannerResponse.thinking breaks the thinking assertion", async () => {
     const events = await runNegativeTrace((trace) => {

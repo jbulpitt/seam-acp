@@ -1250,6 +1250,8 @@ class AgyAgent implements Agent {
     }
     catch (error) {
       if (run.userCancelled && !(error instanceof ProbeError && error.code === "not_reaped")) return { stopReason: "cancelled" };
+      // Keep local ACP parameter refusals (including R3 model validation) intact.
+      if (error instanceof RequestError) throw error;
       // Upstream errors can embed private LS responses, argv or host paths.
       const failure = error instanceof ProbeError ? error : run.abort.signal.reason ?? agyFailure("protocol_error");
       throw RequestError.internalError({ code: failure.code }, `native AGY ${failure.code}`);

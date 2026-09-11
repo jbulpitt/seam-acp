@@ -32,6 +32,7 @@ const expectedConversation = "11111111-1111-4111-8111-111111111111";
 const expectedThinking = "Inspect fixture 🧭\nPlan safely\n";
 
 interface Invocation {
+  pid?: number;
   scenario: string;
   prompt?: string;
   conversationId?: string;
@@ -418,6 +419,9 @@ describe.sequential("native AGY R1 capability contract", () => {
 
     const firstInvocation = readInvocations().find((entry) => entry.scenario === "turn-one");
     expect(firstInvocation).toBeDefined();
+    // R5: the production ACP response must wait for native process cleanup.
+    expect(firstInvocation?.pid).toBeTypeOf("number");
+    expect(() => process.kill(firstInvocation!.pid!, 0)).toThrow();
     expect(firstInvocation?.cwd).toBe(root);
     expect(firstInvocation?.cwd).not.toBe(os.tmpdir());
     expect(firstInvocation?.prompt).toContain("[Attached file: notes.txt]\nembedded fixture text");

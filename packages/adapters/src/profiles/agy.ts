@@ -19,9 +19,10 @@
  * agent picks up where it left off.
  */
 
-import { type ChildProcess, type ChildProcessByStdio } from "node:child_process";
+import { type ChildProcess, type ChildProcessByStdio, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
+import { setTimeout as delay } from "node:timers/promises";
 import fsSync from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -56,6 +57,8 @@ import {
 } from "@agentclientprotocol/sdk";
 import { AGENT_ADAPTER_VERSION, asLocalAdapter, type AgentProfile } from "../agent-profile.js";
 import { AgyNativeRuntime } from "../agy-native-runtime.js";
+import { AgyTurnLifecycle, agyFailure, agyWait } from "../agy-lifecycle.js";
+import { runBoundedProbe, type ProbeHandle, ProbeError } from "../probe-process.js";
 import {
   manifestCatalogScope,
   manifestCatalogSource,
@@ -65,6 +68,7 @@ import {
   discoverAgyLs,
   subscribeToAgyStream,
   waitForAgyConversationId,
+  readAgyJsonResponse,
   type AgyStep,
 } from "../agy-stream.js";
 import { STAGING_ROOT } from "../attachment-staging.js";
@@ -146,12 +150,16 @@ export function scrubStaleGlobalSeamStdio(configPath = REAL_MCP_CONFIG): boolean
  * conversations stay on the real tree via symlink of `antigravity-cli`.
  */
 export async function prepareAgyMcpHome(
-  sessionId: string,
+  _sessionId: string,
   servers: McpServer[],
   realGemini = REAL_GEMINI
 ): Promise<string | undefined> {
-  if (servers.length === 0) return undefined;
-  const home = path.join(os.tmpdir(), "seam-agy-homes", sessionId);
+  // Empty means NO MCP, not inherit the host's tools. Unique homes also prevent
+  // a resumed runtime's config being deleted by its predecessor's disposal.
+  const base = path.join(os.tmpdir(), "seam-agy-homes");
+  await fs.mkdir(base, { recursive: true, mode: 0o700 });
+  const home = await fs.mkdtemp(path.join(base, "session-"));
+  try {
   const gemini = path.join(home, ".gemini");
   const cfgDir = path.join(gemini, "config");
   await fs.mkdir(cfgDir, { recursive: true, mode: 0o700 });
@@ -179,6 +187,11 @@ export async function prepareAgyMcpHome(
   }
   await fs.writeFile(path.join(cfgDir, "mcp_config.json"), `${buildAgyMcpConfigJson(servers)}\n`, { mode: 0o600 });
   return home;
+  } catch {
+    // A failed MCP config write must not leave a credential-bearing temp HOME.
+    await fs.rm(home, { recursive: true, force: true });
+    throw agyFailure("spawn_failed");
+  }
 }
 /**
  * Where we point each spawned `agy`'s `--log-file`. Every turn (and every
@@ -191,8 +204,11 @@ const AGY_SPAWN_LOG_DIR = path.join(os.tmpdir(), "seam-agy-logs");
 
 /** Allocate a fresh private `--log-file` path and ensure its dir exists. */
 async function newSpawnLogPath(): Promise<string> {
-  await fs.mkdir(AGY_SPAWN_LOG_DIR, { recursive: true }).catch(() => {});
-  return path.join(AGY_SPAWN_LOG_DIR, `agy-${randomUUID()}.log`);
+  await fs.mkdir(AGY_SPAWN_LOG_DIR, { recursive: true, mode: 0o700 });
+  const file = path.join(AGY_SPAWN_LOG_DIR, `agy-${randomUUID()}.log`);
+  // CLI logs can include prompt/auth data; do not rely on the host umask.
+  await fs.writeFile(file, "", { mode: 0o600, flag: "wx" });
+  return file;
 }
 /** Legacy mapping file from before we moved this state out of agy's home dir. */
 const LEGACY_MAPPING_FILE = path.join(AGY_HOME, "seam_sessions.json");
@@ -321,7 +337,7 @@ async function savePersistedSession(
   } catch (err) {
     if (process.env.AGY_PROFILE_DEBUG) {
       // eslint-disable-next-line no-console
-      console.error("[agy] failed to save session mapping:", err);
+      console.error("[agy] failed to save session mapping");
     }
   }
 }
@@ -354,7 +370,7 @@ async function clearPersistedSession(
   } catch (err) {
     if (process.env.AGY_PROFILE_DEBUG) {
       // eslint-disable-next-line no-console
-      console.error("[agy] failed to clear session mapping:", err);
+      console.error("[agy] failed to clear session mapping");
     }
   }
 }
@@ -446,7 +462,7 @@ export function makeAgyProfile(opts: {
         let models: ReadonlyArray<{ modelId: string; name: string; contextLimit?: number }>;
         if (opts.staticModels && opts.staticModels.length > 0) {
           const rows = opts.staticModels.some((model) => !model.contextLimit)
-            ? await getCatalog(runtime).catch(() => [])
+            ? await getCatalog(runtime).catch(catalogFallback)
             : [];
           const limits = new Map(
             rows.filter((row) => row.maxTokens).map((row) => [row.modelId, row.maxTokens])
@@ -844,11 +860,18 @@ function makeFakeAgyProcess(
     kill(): boolean {
       if (killed) return false;
       killed = true;
-      agent.shutdown();
-      fakeStdin.destroy();
-      fakeStdout.push(null);
-      fakeStderr.push(null);
-      emitter.emit("exit", 0, null);
+      // Do not report virtual process exit while a native child is still owned.
+      void agent.shutdown().then(() => {
+        fakeStdin.destroy();
+        fakeStdout.push(null);
+        fakeStderr.push(null);
+        emitter.emit("exit", 0, null);
+      }, () => {
+        fakeStdin.destroy();
+        fakeStdout.push(null);
+        fakeStderr.push(null);
+        emitter.emit("exit", 1, null);
+      });
       return true;
     },
     pid: undefined,
@@ -890,14 +913,6 @@ function persistedSession(session: AgySession, modelId = session.modelId): Persi
     ...(modelId ? { modelId } : {}),
   };
 }
-
-interface ActiveRun {
-  proc: ChildProcess;
-  abort: AbortController;
-  sessionId: string;
-  userCancelled?: boolean;
-}
-
 export interface AgyExecutionPolicy {
   sandbox: boolean;
   exposeGlobalStaging: boolean;
@@ -1055,7 +1070,9 @@ export function parseAgyPrintJsonEnvelope(stdout: string): {
 class AgyAgent implements Agent {
   private conn?: AgentSideConnection;
   private readonly sessions = new Map<string, AgySession>();
-  private active?: ActiveRun;
+  private active?: AgyTurnLifecycle;
+  private shutdownPromise?: Promise<void>;
+  private promptTail: Promise<unknown> = Promise.resolve();
 
   constructor(
     private readonly runtime: AgyNativeRuntime,
@@ -1094,9 +1111,9 @@ class AgyAgent implements Agent {
 
   async newSession(params: NewSessionRequest): Promise<NewSessionResponse> {
     const id = randomUUID();
-    const mcpServers = params.mcpServers?.length ? params.mcpServers : this.defaultMcpServers;
+    const mcpServers = this.execution.sandbox ? [] : params.mcpServers?.length ? params.mcpServers : this.defaultMcpServers;
     const mcpHome = await prepareAgyMcpHome(id, mcpServers);
-    const catalog = await getCatalog(this.runtime).catch(() => [] as AgyCatalogEntry[]);
+    const catalog = await getCatalog(this.runtime).catch(catalogFallback);
     // An empty catalog cannot supply the exact canonical id required by --model;
     // deleting this guard would silently fall back to AGY's process-global default.
     if (catalog.length === 0) {
@@ -1123,9 +1140,9 @@ class AgyAgent implements Agent {
 
   async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
     const persisted = await loadPersistedSession(this.mappingFile, params.sessionId);
-    const mcpServers = params.mcpServers?.length ? params.mcpServers : this.defaultMcpServers;
+    const mcpServers = this.execution.sandbox ? [] : params.mcpServers?.length ? params.mcpServers : this.defaultMcpServers;
     const mcpHome = await prepareAgyMcpHome(params.sessionId, mcpServers);
-    const catalog = await getCatalog(this.runtime).catch(() => [] as AgyCatalogEntry[]);
+    const catalog = await getCatalog(this.runtime).catch(catalogFallback);
     // Resume cannot validate or invoke a canonical session model without a catalog;
     // deleting this guard would reintroduce implicit global/list-order selection.
     if (catalog.length === 0) throw new Error("AGY model catalog is unavailable");
@@ -1176,7 +1193,7 @@ class AgyAgent implements Agent {
     if (!sess) {
       throw RequestError.invalidParams({ details: `unknown session ${params.sessionId}` });
     }
-    const catalog = await getCatalog(this.runtime).catch(() => [] as AgyCatalogEntry[]);
+    const catalog = await getCatalog(this.runtime).catch(catalogFallback);
     // An unavailable catalog cannot validate an exact model binding; deleting
     // this guard would turn a transient catalog failure into an arbitrary choice.
     if (catalog.length === 0) throw new Error("AGY model catalog is unavailable");
@@ -1206,6 +1223,42 @@ class AgyAgent implements Agent {
   }
 
   async prompt(params: PromptRequest): Promise<PromptResponse> {
+    // Concurrent ACP requests must not both replace the same finished owner.
+    this.active?.cancel();
+    const next = this.promptTail.then(() => this.executePrompt(params)).catch((error) => {
+      if (error instanceof RequestError) throw error;
+      const code = error instanceof ProbeError ? error.code : "protocol_error";
+      throw RequestError.internalError({ code }, `native AGY ${code}`);
+    });
+    this.promptTail = next.catch(() => {});
+    return next;
+  }
+
+  private async executePrompt(params: PromptRequest): Promise<PromptResponse> {
+    if (this.shutdownPromise) throw agyFailure("cancelled");
+    // A replacement may not spawn while its predecessor still owns children.
+    const previous = this.active;
+    if (previous) { previous.cancel(); await previous.done; await previous.close(); }
+    const run = new AgyTurnLifecycle(params.sessionId, (this.printTimeoutSeconds ?? 600) * 1000);
+    this.active = run;
+    try {
+      try { return await this.runPrompt(params, run); }
+      finally {
+        await run.close();
+        if (this.active === run) this.active = undefined;
+      }
+    }
+    catch (error) {
+      if (run.userCancelled && !(error instanceof ProbeError && error.code === "not_reaped")) return { stopReason: "cancelled" };
+      // Keep local ACP parameter refusals (including R3 model validation) intact.
+      if (error instanceof RequestError) throw error;
+      // Upstream errors can embed private LS responses, argv or host paths.
+      const failure = error instanceof ProbeError ? error : run.abort.signal.reason ?? agyFailure("protocol_error");
+      throw RequestError.internalError({ code: failure.code }, `native AGY ${failure.code}`);
+    }
+  }
+
+  private async runPrompt(params: PromptRequest, runRef: AgyTurnLifecycle): Promise<PromptResponse> {
     if (!this.conn) throw new Error("ACP connection not bound");
     const sess = this.sessions.get(params.sessionId);
     if (!sess) {
@@ -1220,21 +1273,13 @@ class AgyAgent implements Agent {
     }
     const jsonSchema = readAgyJsonSchemaMeta(params._meta);
 
-    // Cancel any prior run for this session before starting a new one.
-    if (this.active?.sessionId === params.sessionId) {
-      this.active.userCancelled = true;
-      try { this.active.proc.kill(); } catch {}
-      this.active.abort.abort();
-      this.active = undefined;
-    }
-
     // Private per-turn log: agy writes its language-server port and the
     // conversation id it binds to here, so we read them back deterministically
     // instead of racing other concurrent turns over agy's shared global dirs.
     const agyLogPath = await newSpawnLogPath();
-    const agyStart = Date.now();
+    runRef.temporaryFiles.push(agyLogPath);
 
-    const catalog = await getCatalog(this.runtime).catch(() => [] as AgyCatalogEntry[]);
+    const catalog = await agyWait(getCatalog(this.runtime).catch(catalogFallback), runRef.abort.signal);
     const selected = selectAgyTurnModel({
       catalog,
       sessionModelId: sess.modelId,
@@ -1262,7 +1307,8 @@ class AgyAgent implements Agent {
         os.tmpdir(),
         `agy-json-schema-${params.sessionId}-${Date.now()}.json`
       );
-      await fs.writeFile(schemaFile, JSON.stringify(jsonSchema), "utf8");
+      runRef.temporaryFiles.push(schemaFile);
+      await fs.writeFile(schemaFile, JSON.stringify(jsonSchema), { encoding: "utf8", mode: 0o600, flag: "wx" });
     }
 
     const args = buildAgyPromptArgs({
@@ -1281,55 +1327,22 @@ class AgyAgent implements Agent {
       // eslint-disable-next-line no-console
       console.error(`[agy] spawning verified native runtime useStdin=${useStdin} argvCount=${args.length}`);
     }
-    const proc = await this.runtime.spawn(args, sess.cwd, {
+    runRef.abort.signal.throwIfAborted();
+    const proc = this.runtime.prepare(args, sess.cwd, {
       mcpHome: sess.mcpHome,
+      detached: true,
       stdio: [useStdin ? "pipe" : "ignore", "pipe", "pipe"],
-    });
+    }).spawn();
+    runRef.attach(proc, !!jsonSchema, useStdin);
 
     if (useStdin && proc.stdin) {
       proc.stdin.write(promptText);
       proc.stdin.end();
     }
 
-    const stderrChunks: Buffer[] = [];
-    const stdoutChunks: Buffer[] = [];
-    // Prose turns: drain stdout — the visible answer arrives via the LS stream
-    // as plannerResponse.modifiedResponse. Structured turns: stdout IS the
-    // canonical JSON envelope (`structured_output`); the LS stream is progress.
-    if (jsonSchema) {
-      proc.stdout?.on("data", (c: Buffer) => stdoutChunks.push(c));
-    } else {
-      proc.stdout?.on("data", () => {});
-    }
-    proc.stderr?.on("data", (c: Buffer) => stderrChunks.push(c));
-    const procExitPromise = new Promise<void>((resolve) => {
-      proc.once("exit", () => resolve());
-    });
-    // Two independent signals:
-    //   `cancelAbort` — external cancel from the ACP client (session/cancel).
-    //   `procExited` — agy itself finished; the LS will close the stream
-    //     naturally afterward, so we don't need to abort fetch on its own.
-    const cancelAbort = new AbortController();
-    let procExited = false;
-    let exitCode: number | null = null;
-    this.active = { proc, abort: cancelAbort, sessionId: params.sessionId };
-    const runRef = this.active;
-    proc.once("exit", (code, signal) => {
-      // Always log — essential for diagnosing empty-turn bugs where the
-      // process exits before producing any output.
-      // eslint-disable-next-line no-console
-      console.error(`[agy] child exit code=${code} signal=${signal} elapsed=${Date.now() - agyStart}ms`);
-      procExited = true;
-      exitCode = code;
-      cancelAbort.abort();
-      if (this.active === runRef) this.active = undefined;
-    });
-    proc.once("error", (e) => {
-      // eslint-disable-next-line no-console
-      console.error(`[agy] child spawn/process error code=${(e as NodeJS.ErrnoException).code ?? "unknown"}`);
-      cancelAbort.abort();
-      if (this.active === runRef) this.active = undefined;
-    });
+    // Clean post-discovery exit lets the LS flush its final frames. Abnormal
+    // exit, timeout and external cancellation abort all turn-owned IO.
+    const cancelAbort = runRef.abort;
 
     try {
       const ls = await discoverAgyLs({
@@ -1352,6 +1365,7 @@ class AgyAgent implements Agent {
           modelId: sess.modelId,
         });
       }
+      runRef.streaming = true;
 
       const lastText = new Map<number, string>();
       const lastThinking = new Map<number, string>();
@@ -1456,10 +1470,7 @@ class AgyAgent implements Agent {
                 if (process.env.AGY_PROFILE_DEBUG) {
                   // eslint-disable-next-line no-console
                   console.error(
-                    `[agy] main trajectory idle but NOT fullyIdle — continuing to wait`,
-                    { status: update.status, fullyIdle: update.fullyIdle,
-                      executableStatus: update.executableStatus,
-                      executorLoopStatus: update.executorLoopStatus },
+                    "[agy] main trajectory idle but NOT fullyIdle — continuing to wait",
                   );
                 }
                 continue;
@@ -1480,13 +1491,8 @@ class AgyAgent implements Agent {
           if (cancelAbort.signal.aborted && runRef.userCancelled) {
             return { stopReason: "cancelled" };
           }
-          if (process.env.AGY_PROFILE_DEBUG) {
-            // eslint-disable-next-line no-console
-            console.error(
-              `[agy] stream ended:`,
-              streamErr instanceof Error ? streamErr.message : streamErr,
-            );
-          }
+          if (cancelAbort.signal.aborted) throw cancelAbort.signal.reason;
+          if (streamErr instanceof Error && streamErr.name === "ProbeError") throw streamErr;
           // Fall through — check whether we need to retry below.
         }
 
@@ -1497,7 +1503,7 @@ class AgyAgent implements Agent {
         // This is a race: we subscribed while the cascade was idle between
         // the prior turn ending and AGY picking up our new prompt. Retry.
         if (cancelAbort.signal.aborted) break;
-        if (procExited) break; // agy itself exited — no point retrying
+        if (proc.exitCode !== null || proc.signalCode !== null) break;
         const remaining = staleIdleDeadline - Date.now();
         if (remaining <= 0) {
           if (process.env.AGY_PROFILE_DEBUG) {
@@ -1515,12 +1521,12 @@ class AgyAgent implements Agent {
             `[agy] stream ended with no activity (stale idle) — retry #${staleIdleRetryCount} in ${STALE_IDLE_RETRY_DELAY_MS}ms`,
           );
         }
-        await new Promise<void>((r) => setTimeout(r, STALE_IDLE_RETRY_DELAY_MS));
+        await delay(STALE_IDLE_RETRY_DELAY_MS, undefined, { signal: cancelAbort.signal });
       }
 
+      cancelAbort.signal.throwIfAborted();
       if (jsonSchema) {
-        await procExitPromise;
-        const stdout = Buffer.concat(stdoutChunks).toString("utf8");
+        const stdout = await runRef.structuredOutput();
         const { structuredOutput } = parseAgyPrintJsonEnvelope(stdout);
         if (this.conn) {
           await this.conn.sessionUpdate({
@@ -1548,89 +1554,26 @@ class AgyAgent implements Agent {
       }
     } catch (err) {
       if (cancelAbort.signal.aborted && runRef.userCancelled) return { stopReason: "cancelled" };
-      if (cancelAbort.signal.aborted && !runRef.userCancelled) {
-        // The child process exited (normally or abnormally) and we aborted the
-        // stream/discovery deliberately. Always log so empty-turn bugs are
-        // diagnosable without AGY_PROFILE_DEBUG (previously silent).
-        const stderr = Buffer.concat(stderrChunks).toString("utf8").trim();
-        // eslint-disable-next-line no-console
-        console.error(
-          `[agy] process exited during prompt (code=${exitCode}, signal=${proc.signalCode ?? "none"})` +
-            (stderr ? `\nstderr: ${stderr.slice(0, 2000)}` : "") +
-            `\nerr: ${err instanceof Error ? err.message : String(err)}`,
-        );
-        // Surface the error to the user so a 0-char turn shows *something*
-        // instead of complete silence (the "empty results" bug). Structured
-        // turns must not mix stderr into the JSON payload injectTurn captures.
-        if (stderr && this.conn && !jsonSchema) {
-          await this.conn.sessionUpdate({
-            sessionId: params.sessionId,
-            update: {
-              sessionUpdate: "agent_message_chunk",
-              content: { type: "text", text: `\n[agy exit ${exitCode ?? "?"}]\n${stderr.slice(0, 2000)}` },
-            },
-          }).catch(() => {});
-        }
-      } else {
-        const stderr = Buffer.concat(stderrChunks).toString("utf8").trim();
-        if (stderr && !jsonSchema) {
-          await this.conn.sessionUpdate({
-            sessionId: params.sessionId,
-            update: {
-              sessionUpdate: "agent_message_chunk",
-              content: { type: "text", text: `\n[agy error]\n${stderr.slice(0, 2000)}` },
-            },
-          }).catch(() => {});
-        }
-        throw err;
-      }
+      throw err;
     } finally {
-      if (!procExited) {
-        if (process.env.AGY_PROFILE_DEBUG) {
-          // eslint-disable-next-line no-console
-          console.error(`[agy] killing active child process on prompt completion`);
-        }
-        try {
-          proc.kill();
-        } catch {
-          // ignore
-        }
-      }
-      if (this.active === runRef) this.active = undefined;
+      await runRef.close();
       if (schemaFile) {
         await fs.unlink(schemaFile).catch(() => {});
       }
-      // Drop our private per-turn log so /tmp doesn't grow unbounded. Keep it
-      // when debugging — it's the richest post-mortem for an empty/wedged turn.
-      if (process.env.AGY_PROFILE_DEBUG) {
-        // eslint-disable-next-line no-console
-        console.error(`[agy] retained turn log: ${agyLogPath}`);
-      } else {
-        fs.unlink(agyLogPath).catch(() => {});
-      }
+      await fs.unlink(agyLogPath).catch(() => {});
     }
 
-    if (exitCode !== null && exitCode !== 0 && !jsonSchema) {
-      const stderr = Buffer.concat(stderrChunks).toString("utf8").trim();
-      if (stderr) {
-        await this.conn.sessionUpdate({
-          sessionId: params.sessionId,
-          update: {
-            sessionUpdate: "agent_message_chunk",
-            content: { type: "text", text: `\n[agy exit ${exitCode}]\n${stderr.slice(0, 2000)}` },
-          },
-        }).catch(() => {});
-      }
-    }
+    if (proc.exitCode !== null && proc.exitCode !== 0) throw agyFailure("exited_early");
     return { stopReason: "end_turn" };
   }
 
   async cancel(params: CancelNotification): Promise<void> {
     const wasActive = this.active?.sessionId === params.sessionId;
     if (wasActive && this.active) {
-      this.active.userCancelled = true;
-      this.active.abort.abort();
-      try { this.active.proc.kill(); } catch {}
+      const run = this.active;
+      run.cancel();
+      await run.done;
+      await run.close();
     }
     // IMPORTANT: do NOT wipe the cascadeId or clear the persisted mapping on
     // cancel. Doing so destroyed the entire conversation on every interrupt /
@@ -1645,13 +1588,17 @@ class AgyAgent implements Agent {
     // resending recovers it and no context is lost.
   }
 
-  shutdown(): void {
-    if (this.active) {
-      this.active.userCancelled = true;
-      try { this.active.proc.kill(); } catch {}
-      this.active.abort.abort();
-      this.active = undefined;
-    }
+  shutdown(): Promise<void> {
+    return this.shutdownPromise ??= (async () => {
+      const run = this.active;
+      if (run) { run.cancel(); await run.done; await run.close(); }
+      // Only this runtime's generated HOME is disposable; symlinked provider
+      // auth/conversations and the ACP restoration mapping are never removed.
+      for (const session of this.sessions.values()) {
+        if (session.mcpHome) await fs.rm(session.mcpHome, { recursive: true, force: true });
+      }
+      this.sessions.clear();
+    })();
   }
 
   // -----------------------------------------------------------------------
@@ -1794,7 +1741,7 @@ class AgyAgent implements Agent {
     } catch (err) {
       if (process.env.AGY_PROFILE_DEBUG) {
         // eslint-disable-next-line no-console
-        console.error("[agy] failed to read generated image:", imagePath, err);
+        console.error("[agy] failed to read generated image");
       }
       return;
     }
@@ -2142,45 +2089,55 @@ export async function fetchAgyAcceptedModels(runtime: AgyNativeRuntime): Promise
       "15s",
       "--dangerously-skip-permissions",
     ];
-  return new Promise((resolve) => {
-    void runtime.spawn(args, "/tmp", { stdio: ["ignore", "pipe", "pipe"] })
-      .then((proc) => {
+  let output = "";
+  try {
+    return await runAgyProbe(runtime, args, 15_000, async (handle) => {
+      for await (const chunk of handle.stdout) output += chunk.toString();
+      await handle.completed;
+      return parseAgyAcceptedModels(output);
+    }, (proc) => {
+      // Validator diagnostics are protocol input here, never diagnostic output.
+      // The shared helper enforces its stderr bound before this listener runs.
+      let bytes = 0;
+      const capture = (chunk: Buffer): void => {
+        bytes += chunk.length;
+        if (bytes <= 256_000) output += chunk.toString();
+      };
+      proc.stderr.on("data", capture);
+      return () => { proc.stderr.removeListener("data", capture); };
+    }, true);
+  } catch (error) {
+    if (error instanceof ProbeError && error.code === "not_reaped") throw error;
+    return new Set();
+  }
+}
 
-        let output = "";
-        let settled = false;
-        const finish = (models: Set<string>): void => {
-          if (settled) return;
-          settled = true;
-          clearTimeout(timeout);
-          resolve(models);
-        };
-        const timeout = setTimeout(() => {
-          try {
-            proc.kill("SIGKILL");
-          } catch {
-            /* already gone */
-          }
-          finish(new Set());
-        }, 15_000);
-        timeout.unref?.();
-        const capture = (chunk: Buffer | string): void => {
-          output += chunk.toString();
-          if (Buffer.byteLength(output) > 1_000_000) {
-            try {
-              proc.kill("SIGKILL");
-            } catch {
-              /* already gone */
-            }
-            finish(new Set());
-          }
-        };
-        proc.stdout?.on("data", capture);
-        proc.stderr?.on("data", capture);
-        proc.once("error", () => finish(new Set()));
-        proc.once("close", () => finish(parseAgyAcceptedModels(output)));
-      })
-      .catch(() => resolve(new Set()));
-  });
+/** Finite discovery uses the shared lifecycle, retaining R4's current protocol. */
+async function runAgyProbe<T>(
+  runtime: AgyNativeRuntime, args: string[], timeoutMs: number,
+  run: (handle: ProbeHandle) => Promise<T>,
+  observe?: (proc: ChildProcessWithoutNullStreams) => (() => void),
+  acceptNonzeroExit = false,
+): Promise<T> {
+  let proc: ChildProcessWithoutNullStreams;
+  let stopObserving: (() => void) | undefined;
+  try {
+    return await runBoundedProbe({
+      executable: "native-agy", label: "native AGY", timeoutMs, killGraceMs: 500,
+      processGroup: true, allowCleanExit: true, acceptNonzeroExit,
+      spawnOverride: () => {
+        proc = runtime.prepare(args, "/tmp", { detached: true, stdio: ["pipe", "pipe", "pipe"] }).spawn() as ChildProcessWithoutNullStreams;
+        return proc;
+      },
+      run: async (handle) => { stopObserving = observe?.(proc); return run(handle); },
+    });
+  } catch (error) {
+    // Even the shared redactor cannot know secrets loaded from native auth files.
+    throw agyFailure(error instanceof ProbeError ? error.code : "protocol_error");
+  } finally {
+    // Do not keep the validator parser/output alive after finite finalization.
+    stopObserving?.();
+  }
 }
 
 const acceptedModelsPromises = new Map<string, Promise<Set<string>>>();
@@ -2200,7 +2157,8 @@ function getAcceptedModels(runtime: AgyNativeRuntime): Promise<Set<string>> {
     })
     .catch((err) => {
       acceptedModelsPromises.delete(runtime.identityKey);
-      console.warn("[agy] accepted-model probe failed:", err);
+      console.warn("[agy] accepted-model probe failed");
+      if (err instanceof ProbeError && err.code === "not_reaped") throw err;
       return new Set<string>();
     });
   acceptedModelsPromises.set(runtime.identityKey, p);
@@ -2267,6 +2225,12 @@ export function selectAgyTurnModel(opts: {
 
 const catalogRowsPromises = new Map<string, Promise<AgyCatalogEntry[]>>();
 
+function catalogFallback(error: unknown): AgyCatalogEntry[] {
+  // Missing metadata may fall back as before; a live leaked child may not.
+  if (error instanceof ProbeError && error.code === "not_reaped") throw error;
+  return [];
+}
+
 function getCatalogRows(runtime: AgyNativeRuntime): Promise<AgyCatalogEntry[]> {
   const cached = catalogRowsPromises.get(runtime.identityKey);
   if (cached) return cached;
@@ -2286,8 +2250,9 @@ function getCatalogRows(runtime: AgyNativeRuntime): Promise<AgyCatalogEntry[]> {
     .catch((err) => {
       // Don't pin the cache to an error — let the next caller retry.
       catalogRowsPromises.delete(runtime.identityKey);
-      console.error("[agy] catalog fetch failed:", err);
-      return [];
+      console.error("[agy] catalog fetch failed");
+      // A failed lifecycle is not an empty catalog; retain its classified error.
+      throw err;
     });
   catalogRowsPromises.set(runtime.identityKey, p);
   return p;
@@ -2388,15 +2353,13 @@ export async function fetchAgyUserStatus(runtime: AgyNativeRuntime): Promise<Agy
     return cached.data;
   }
   const logFile = await newSpawnLogPath();
-  const proc = await runtime.spawn(["-p", "ok", AGY_NO_SLASH_EXPANSION, "--log-file", logFile, "--print-timeout", "30s", "--dangerously-skip-permissions"], "/tmp", {
-    stdio: ["ignore", "ignore", "ignore"],
-  });
-  // Missing binary would otherwise emit unhandled 'error' and crash the process.
-  proc.on("error", () => {});
   try {
+    return await runAgyProbe(runtime, ["-p", "ok", AGY_NO_SLASH_EXPANSION, "--log-file", logFile, "--print-timeout", "30s", "--dangerously-skip-permissions"], 30_000, async (handle) => {
+    handle.stdout.resume();
     const ls = await discoverAgyLs({
       logFile,
       timeoutMs: 15_000,
+      signal: handle.signal,
     });
     // /healthz comes up before the LS finishes silent-auth, so quota retrieval
     // can initially 500. Retry briefly until auth lands (usually 1–2s).
@@ -2408,21 +2371,23 @@ export async function fetchAgyUserStatus(runtime: AgyNativeRuntime): Promise<Agy
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({}),
+        signal: handle.signal,
       });
       if (res.ok) {
-        const json = (await res.json()) as UserQuotaSummaryResponse;
+        const json = (await readAgyJsonResponse(res)) as UserQuotaSummaryResponse;
         const data = parseAgyQuotaSummary(json);
         usageCache.set(runtime.identityKey, { at: Date.now(), data });
         return data;
       }
       lastStatus = res.status;
+      await res.body?.cancel();
       if (res.status !== 500) break;
-      await new Promise((r) => setTimeout(r, 400));
+      await delay(400, undefined, { signal: handle.signal });
     }
     throw new Error(`RetrieveUserQuotaSummary HTTP ${lastStatus}`);
+    });
   } finally {
-    try { proc.kill(); } catch { /* already gone */ }
-    fs.unlink(logFile).catch(() => {});
+    await fs.unlink(logFile).catch(() => {});
   }
 }
 
@@ -2431,15 +2396,13 @@ async function fetchAgyCatalog(runtime: AgyNativeRuntime): Promise<AgyCatalogEnt
   // a few tokens of throwaway output; the cost is acceptable given the result
   // is cached for the process lifetime.
   const logFile = await newSpawnLogPath();
-  const proc = await runtime.spawn(["-p", "ok", AGY_NO_SLASH_EXPANSION, "--log-file", logFile, "--print-timeout", "30s", "--dangerously-skip-permissions"], "/tmp", {
-    stdio: ["ignore", "ignore", "ignore"],
-  });
-  // Missing binary would otherwise emit unhandled 'error' and crash the process.
-  proc.on("error", () => {});
   try {
+    return await runAgyProbe(runtime, ["-p", "ok", AGY_NO_SLASH_EXPANSION, "--log-file", logFile, "--print-timeout", "30s", "--dangerously-skip-permissions"], 30_000, async (handle) => {
+    handle.stdout.resume();
     const ls = await discoverAgyLs({
       logFile,
       timeoutMs: 15_000,
+      signal: handle.signal,
     });
     const url = `http://localhost:${ls.port}/exa.language_server_pb.LanguageServerService/GetAvailableModels`;
     // The LS answers as soon as it's discovered, but its model catalog finishes
@@ -2455,18 +2418,19 @@ async function fetchAgyCatalog(runtime: AgyNativeRuntime): Promise<AgyCatalogEnt
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: "{}",
+        signal: handle.signal,
       });
       if (res.ok) {
-        const json = (await res.json()) as { response?: { models?: Record<string, AgyRawModel> } };
+        const json = (await readAgyJsonResponse(res)) as { response?: { models?: Record<string, AgyRawModel> } };
         last = parseAgyCatalog(json);
         if (last.length > 0) return last;
-      }
+      } else await res.body?.cancel();
       if (Date.now() >= deadline) return last;
-      await new Promise((r) => setTimeout(r, 400));
+      await delay(400, undefined, { signal: handle.signal });
     }
+    });
   } finally {
-    try { proc.kill(); } catch { /* already gone */ }
-    fs.unlink(logFile).catch(() => {});
+    await fs.unlink(logFile).catch(() => {});
   }
 }
 

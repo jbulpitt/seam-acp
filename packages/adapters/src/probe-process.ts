@@ -46,6 +46,7 @@
  */
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { PassThrough, type Readable, type Writable } from "node:stream";
+import { setTimeout as delay } from "node:timers/promises";
 
 /** Trailing bytes of stderr retained for (redacted) diagnostics. */
 export const PROBE_STDERR_CAPTURE_BYTES = 4_000;
@@ -129,7 +130,7 @@ export interface ProbeHandle {
    * collectors await this together with their bounded stdout consumption.
    * Every failure rejects it so their run callback also settles during cleanup.
    */
-  readonly completed: Promise<{ code: 0; signal: null }>;
+  readonly completed: Promise<{ code: number; signal: null }>;
   /** Redacted trailing stderr, for tests and structured diagnostics. */
   stderrTail(): string;
 }
@@ -162,6 +163,10 @@ export interface BoundedProbeOptions<T> {
   maxStderrBytes?: number;
   /** Permit exit code 0 for bounded one-shot collectors. Default is false. */
   allowCleanExit?: boolean;
+  /** A validator's protocol can be its output on any normal (non-signal) exit. */
+  acceptNonzeroExit?: boolean;
+  /** Child was spawned detached: reap its LS/tool group, not only its leader. */
+  processGroup?: boolean;
   /** Label used in error detail. Must not carry secrets. */
   label?: string;
   /**
@@ -240,6 +245,20 @@ export async function runBoundedProbe<T>(options: BoundedProbeOptions<T>): Promi
     throw new ProbeError("spawn_failed", `${label}: ${redact(errorText(err))}`);
   }
 
+  // Partial spawn can own a real process without usable transport. Reap it
+  // before refusing startup; accessing missing streams used to skip cleanup.
+  if (!child.stdin || !child.stdout || !child.stderr) {
+    const ignore = (): void => {};
+    child.on("error", ignore);
+    try {
+      const reaped = options.processGroup
+        ? await terminateProcessGroup(child, killGraceMs)
+        : await terminate(child, killGraceMs);
+      if (!reaped) throw new ProbeError("not_reaped", `${label} partial startup child did not exit`);
+      throw new ProbeError("spawn_failed", `${label} missing stdio`);
+    } finally { child.removeListener("error", ignore); }
+  }
+
   const controller = new AbortController();
   const closeSteps: CloseStep[] = [];
   // Phase order is a property of the CONTRACT, not of registration order.
@@ -263,9 +282,9 @@ export async function runBoundedProbe<T>(options: BoundedProbeOptions<T>): Promi
    *  to observe the abort and finish registering its closes. */
   let runPromise: Promise<T> | undefined;
   let exitReject: ((err: Error) => void) | undefined;
-  let completionResolve: ((result: { code: 0; signal: null }) => void) | undefined;
+  let completionResolve: ((result: { code: number; signal: null }) => void) | undefined;
   let completionReject: ((err: Error) => void) | undefined;
-  const completed = new Promise<{ code: 0; signal: null }>((resolve, reject) => {
+  const completed = new Promise<{ code: number; signal: null }>((resolve, reject) => {
     completionResolve = resolve;
     completionReject = reject;
   });
@@ -339,9 +358,9 @@ export async function runBoundedProbe<T>(options: BoundedProbeOptions<T>): Promi
     // Treating it as `exited_early` failed probes that had already succeeded,
     // purely on whether the exit event beat the run's resolution to the race.
     // Only an ABNORMAL exit is a failure worth unblocking racers for.
-    if (code === 0 && signalCode === null) {
+    if (signalCode === null && code !== null && (code === 0 || options.acceptNonzeroExit)) {
       cleanExit = true;
-      if (options.allowCleanExit) completionResolve?.({ code: 0, signal: null });
+      if (options.allowCleanExit) completionResolve?.({ code, signal: null });
       return;
     }
     // Raw child stderr is NEVER attached; only its redacted tail.
@@ -494,7 +513,9 @@ export async function runBoundedProbe<T>(options: BoundedProbeOptions<T>): Promi
     child.stdout.removeListener("end", onStdoutEnd);
     child.stderr.removeListener("data", onStderr);
     if (!stdout.destroyed) stdout.end();
-    const reaped = cleanExit || (await terminate(child, killGraceMs));
+    const reaped = options.processGroup
+      ? await terminateProcessGroup(child, killGraceMs)
+      : cleanExit || (await terminate(child, killGraceMs));
     // The protective error listener is the LAST thing removed, so a stray
     // `error` emitted during termination cannot become an uncaught exception.
     child.removeListener("error", swallowLateError);
@@ -575,14 +596,37 @@ export async function terminate(
     child.once("exit", onExit);
   });
   try {
-    child.kill("SIGTERM");
+    try { child.kill("SIGTERM"); } catch { /* Escalate even after synchronous kill failure. */ }
     if (await settledWithin(exit, graceMs)) return true;
-    child.kill("SIGKILL");
+    try { child.kill("SIGKILL"); } catch { /* Only observed exit counts as reaped. */ }
     return await settledWithin(exit, PROBE_DEFAULT_REAP_MS);
   } finally {
     // Whether or not it fired, this listener is ours to remove.
     if (onExit) child.removeListener("exit", onExit);
   }
+}
+
+/** Own detached process groups only. A leader's exit does not reap its tools. */
+export async function terminateProcessGroup(
+  child: import("node:child_process").ChildProcess,
+  graceMs = PROBE_DEFAULT_KILL_GRACE_MS,
+): Promise<boolean> {
+  const pid = child.pid;
+  if (pid === undefined) return true;
+  const alive = (): boolean => {
+    try { process.kill(-pid, 0); return true; }
+    catch (error) { return (error as NodeJS.ErrnoException).code !== "ESRCH"; }
+  };
+  const wait = async (ms: number): Promise<boolean> => {
+    const until = Date.now() + ms;
+    while (alive() && Date.now() < until) await delay(20);
+    return !alive() && (child.exitCode !== null || child.signalCode !== null);
+  };
+  for (const [signal, ms] of [["SIGTERM", graceMs], ["SIGKILL", PROBE_DEFAULT_REAP_MS]] as const) {
+    try { process.kill(-pid, signal); } catch { /* Verify absence even if signalling failed. */ }
+    if (await wait(ms)) return true;
+  }
+  return false;
 }
 
 function settledWithin(promise: Promise<void>, ms: number): Promise<boolean> {

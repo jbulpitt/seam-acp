@@ -63,8 +63,10 @@ model self-report or a claim of live correctness.
   after the temp write leaves the prior complete mapping parseable with every
   conversation id and model intact, and removes the abandoned temp file.
 - ACP cancellation interrupts the active native turn, settles it as cancelled,
-  and leaves the persisted conversation mapping intact. This is behavioral
-  evidence only; bounded process-tree cleanup belongs to R5.
+  and leaves the persisted conversation mapping intact. R5 additionally requires
+  the production prompt response to follow observed native-child cleanup; its
+  hostile lifecycle matrix covers deadlines, failure, cancellation and reaping.
+  See [native lifecycle](agy-native-lifecycle.md) for bounds and evidence limits.
 - Native initialization advertises embedded context. Text attachments are
   included as text resources; unknown binary resources are represented as
   binary and flattened only to a non-text placeholder, never decoded as text.

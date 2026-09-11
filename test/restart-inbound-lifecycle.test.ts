@@ -9,6 +9,7 @@ import { SessionStore } from "../packages/core/src/core/session-store.js";
 import { discordRenderer } from "../packages/core/src/platforms/discord/renderer.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 import { listLiveMarkers } from "../packages/core/src/core/dispatch/turn-resume.js";
+import type { DeliveryNonceLookup } from "../packages/core/src/platforms/chat-adapter.js";
 
 const cleanups: (() => void)[] = [];
 afterEach(() => { for (const f of cleanups.splice(0).reverse()) f(); vi.restoreAllMocks(); });
@@ -46,9 +47,9 @@ function setup() {
     getOrStartRuntime: vi.fn(async (_record: unknown, _recovery?: unknown) => runtime),
   };
   const adapter = { sendPanel: vi.fn(async (channel: any) => ({ channel, id: "panel" })),
-    sendMessage: vi.fn(async (channel: any, _text: string) => ({ channel, id: "message" })),
+    sendMessage: vi.fn(async (channel: any, _text: string, _delivery?: unknown) => ({ channel, id: "message" })),
     sendFile: vi.fn(async () => {}),
-    findMessageByNonce: vi.fn(async () => ({ status: "absent" as const })),
+    findMessageByNonce: vi.fn(async (): Promise<DeliveryNonceLookup> => ({ status: "absent" })),
     editPanel: vi.fn(async () => {}), editMessage: vi.fn(async () => {}) };
   const config = { DATA_DIR: dir, REPOS_ROOT: "/synthetic", TURN_TIMEOUT_SECONDS: 60,
     DEFAULT_MODEL: "test", REPO_EMOJIS: new Map(), SEAM_TURN_RESUME_ENABLED: true,

@@ -44,8 +44,11 @@ publishing a key before the first durable insert was not durable admission.
 - Cutoff fences callbacks and prevents failed/completed schedule output. Isolated
   provider material is deleted only after a terminal winner, never suspension.
   Captured outcomes are delivered from SQLite after boot without provider work.
-  External delivery is at-least-once across the send/ack crash gap, not an
-  exactly-once Discord/external-tool guarantee.
+  Discord terminal-result creates carry a persisted, enforced nonce. Recovery
+  first asks Discord for that nonce, then either records the observed message or
+  replays the exact payload with the same nonce; an incomplete history search is
+  explicitly abandoned with a durable reason instead of guessed or retried
+  forever. This does not claim exactly-once semantics for non-Discord tools.
 - Disable/delete prevents future cron admission. It **does not cancel an already
   admitted occurrence**, including its frozen snapshot or captured output.
   Intentional cancellation is a durable attempt terminal state and cannot resume.

@@ -382,6 +382,8 @@ export interface LedgerEntry {
    */
   acpSessionId: string | null;
   status: DelegationStatus;
+  /** Durable operator-facing explanation for an explicit terminal refusal. */
+  terminalReason: string | null;
   createdUtc: string;
   updatedUtc: string;
 }
@@ -403,6 +405,7 @@ export interface LedgerEntryInput {
   acpSessionId?: string | null;
   /** Defaults to "dispatched". */
   status?: DelegationStatus;
+  terminalReason?: string | null;
   /** Defaults to now (ISO 8601). */
   createdUtc?: string;
   /** Defaults to `createdUtc`. */
@@ -422,6 +425,7 @@ export type LedgerPatch = Partial<
     | "promptPreview"
     | "correlationId"
     | "acpSessionId"
+    | "terminalReason"
   >
 >;
 

@@ -93,11 +93,13 @@ async function writeDone(id: string, body: Record<string, unknown>): Promise<voi
 /** Legacy #174 cases deliberately exercise arbitrary files. Production boot
  * uses SessionStore's non-terminal index and never enumerates this directory. */
 async function reconcileDoneFilesForTest(
-  deps: Omit<DoneReconcileDeps, "listRecoveryCandidates">
+  deps: Omit<DoneReconcileDeps, "listRecoveryCandidates" | "abandonUnprovable"> &
+    Partial<Pick<DoneReconcileDeps, "abandonUnprovable">>
 ) {
   const names = await readdir(dispatchDirs(deps.dataDir).done).catch(() => []);
   return reconcileCompletedDoneFiles({
     ...deps,
+    abandonUnprovable: deps.abandonUnprovable ?? (() => false),
     listRecoveryCandidates: () =>
       names
         .filter((name) => name.endsWith(".json"))
@@ -1865,7 +1867,7 @@ describe("#174 replay matches the LIVE dispatch contract, not just the fields", 
     }
   );
 
-  it("a LEGACY forward with no routing is left alone, not silently terminalized", async () => {
+  it("a LEGACY forward with no routing is explicitly abandoned once", async () => {
     // Written before #174 carried routing: it cannot prove its report-back was
     // ever enqueued. Terminalizing would strand the answer permanently and
     // silently; leaving it non-terminal is merely a rerun offer, which is the
@@ -1879,15 +1881,31 @@ describe("#174 replay matches the LIVE dispatch contract, not just the fields", 
       // no kind, no returnTo, no chainId — a pre-#174 file
     });
     const replay = vi.fn(async (..._args: any[]) => {});
-    const summary = await reconcileDoneFilesForTest({
+    let status: DelegationStatus = "interrupted";
+    let reason: string | null = null;
+    const abandon = vi.fn((_id: string, why: string) => {
+      status = "abandoned";
+      reason = why;
+      return true;
+    });
+    const deps = {
       dataDir,
       logger: silent,
-      getDelegation: () => ({ status: "interrupted", kind: "forward", correlationId: "legacy-h" }),
+      getDelegation: () => ({ status, kind: "forward", correlationId: "legacy-h" }),
       replay,
-    });
+      abandonUnprovable: abandon,
+    };
+    const summary = await reconcileDoneFilesForTest(deps);
     expect(replay).not.toHaveBeenCalled();
     expect(summary.reconciled).toBe(0);
-    expect(summary.skippedUnprovable).toBe(1);
+    expect(summary.abandonedUnprovable).toBe(1);
+    expect(reason).toContain("no recorded nonce or route");
+
+    const second = await reconcileDoneFilesForTest(deps);
+    // Protects the one-time terminal transition; deleting it recreates the
+    // same legacy warning and examination on every boot.
+    expect(abandon).toHaveBeenCalledTimes(1);
+    expect(second.skippedTerminal).toBe(1);
   });
 
   it("a forward's correlationId does not prove whether it is a chain hop", () => {

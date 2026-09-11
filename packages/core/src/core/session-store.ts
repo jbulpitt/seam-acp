@@ -398,6 +398,7 @@ export class SessionStore {
     this.db.exec(DELEGATION_SCHEMA);
     this.migrateReportBackDedupIndex();
     this.migrateDelegationAcpSessionId();
+    this.migrateDelegationTerminalReason();
     this.db.exec(CONFIG_AUDIT_SCHEMA);
     this.db.exec(ACTIVE_PROJECTS_SCHEMA);
     this.db.exec(CHAINS_SCHEMA);
@@ -451,6 +452,14 @@ export class SessionStore {
     this.db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_elicitation_codex_async
       ON elicitations(session_record_id, request_correlation)
       WHERE source_kind = 'codex_async'`);
+  }
+
+  private migrateDelegationTerminalReason(): void {
+    try {
+      this.db.exec("ALTER TABLE delegation_log ADD COLUMN terminal_reason TEXT");
+    } catch {
+      /* column already exists */
+    }
   }
 
   /** Additive V2 migration over the shipped V1 compatibility tables. */
@@ -1919,6 +1928,7 @@ export class SessionStore {
       correlationId: entry.correlationId ?? null,
       acpSessionId: entry.acpSessionId ?? null,
       status: entry.status ?? "dispatched",
+      terminalReason: entry.terminalReason ?? null,
       createdUtc,
       updatedUtc: entry.updatedUtc ?? createdUtc,
     };
@@ -1926,10 +1936,10 @@ export class SessionStore {
       .prepare(
         `INSERT INTO delegation_log
            (id, source_ref, target_ref, worker, kind, prompt_preview,
-            correlation_id, acp_session_id, status, created_utc, updated_utc)
+            correlation_id, acp_session_id, status, terminal_reason, created_utc, updated_utc)
          VALUES
            (@id, @sourceRef, @targetRef, @worker, @kind, @promptPreview,
-            @correlationId, @acpSessionId, @status, @createdUtc, @updatedUtc)`
+            @correlationId, @acpSessionId, @status, @terminalReason, @createdUtc, @updatedUtc)`
       )
       .run(row);
     return row;
@@ -2004,6 +2014,15 @@ export class SessionStore {
     this.db
       .prepare(`UPDATE delegation_log SET ${sets.join(", ")} WHERE id = @id`)
       .run(params);
+  }
+
+  /** Explicitly terminalize an unrouteable legacy completion with evidence. */
+  abandonUnprovableDelivery(id: string, reason: string): boolean {
+    const now = new Date().toISOString();
+    const placeholders = DELEGATION_TERMINAL_STATUSES.map(() => "?").join(", ");
+    return this.db.prepare(`UPDATE delegation_log SET status='abandoned', terminal_reason=?, updated_utc=?
+      WHERE id=? AND status NOT IN (${placeholders})`)
+      .run(reason, now, id, ...DELEGATION_TERMINAL_STATUSES).changes === 1;
   }
 
   /** One ledger row by primary key, or null if absent. */
@@ -2116,6 +2135,7 @@ export class SessionStore {
       correlationId: entry.correlationId ?? null,
       acpSessionId: entry.acpSessionId ?? null,
       status: entry.status ?? "dispatched",
+      terminalReason: entry.terminalReason ?? null,
       createdUtc,
       updatedUtc: entry.updatedUtc ?? createdUtc,
     };
@@ -2124,10 +2144,10 @@ export class SessionStore {
         .prepare(
           `INSERT INTO delegation_log
              (id, source_ref, target_ref, worker, kind, prompt_preview,
-              correlation_id, acp_session_id, status, created_utc, updated_utc)
+              correlation_id, acp_session_id, status, terminal_reason, created_utc, updated_utc)
            SELECT
              @id, @sourceRef, @targetRef, @worker, @kind, @promptPreview,
-             @correlationId, @acpSessionId, @status, @createdUtc, @updatedUtc
+             @correlationId, @acpSessionId, @status, @terminalReason, @createdUtc, @updatedUtc
            WHERE @correlationId IS NULL OR NOT EXISTS (
              SELECT 1 FROM delegation_log
               WHERE kind = 'report_back' AND correlation_id = @correlationId
@@ -6075,6 +6095,7 @@ CREATE TABLE IF NOT EXISTS delegation_log (
   correlation_id  TEXT,
   acp_session_id  TEXT,
   status          TEXT NOT NULL,
+  terminal_reason TEXT,
   created_utc     TEXT NOT NULL,
   updated_utc     TEXT NOT NULL
 );
@@ -6096,6 +6117,7 @@ interface LedgerRow {
   correlation_id: string | null;
   acp_session_id: string | null;
   status: string;
+  terminal_reason: string | null;
   created_utc: string;
   updated_utc: string;
 }
@@ -6110,6 +6132,7 @@ const mapLedger = (r: LedgerRow): LedgerEntry => ({
   correlationId: r.correlation_id,
   acpSessionId: r.acp_session_id ?? null,
   status: r.status as DelegationStatus,
+  terminalReason: r.terminal_reason ?? null,
   createdUtc: r.created_utc,
   updatedUtc: r.updated_utc,
 });
@@ -7469,6 +7492,7 @@ const LEDGER_PATCH_COLUMNS: Record<keyof LedgerPatch, string> = {
   promptPreview: "prompt_preview",
   correlationId: "correlation_id",
   acpSessionId: "acp_session_id",
+  terminalReason: "terminal_reason",
 };
 
 function truncatePreview(text: string | null): string | null {

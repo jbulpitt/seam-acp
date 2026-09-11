@@ -60,9 +60,17 @@ export interface DispatchWatcherOpts {
    * reject ⇒ `status: "failed"` with the error message.
    */
   onDispatch: (spec: DispatchSpec) => Promise<{ output: string; stopReason: string }>;
-  /** Observe a retained callback while intake is still open. Shutdown-time
-   * retention is deliberately excluded: boot recovery owns that handoff. */
-  onRetained?: (spec: DispatchSpec) => Promise<void>;
+  /**
+   * Observe a retained callback that no other actor will finish — i.e. a
+   * `defect` refusal. Shutdown and superseded retentions never reach here:
+   * the next boot or the current owner respectively already have that work.
+   *
+   * #333: this used to be gated on intake still being open, which made the
+   * SAME shutdown event either a quarantine or a clean handoff depending on
+   * who won a race with `stop()`. It receives the refusal now so the
+   * quarantine can name its cause instead of guessing one.
+   */
+  onRetained?: (spec: DispatchSpec, err: DispatchSuspendedError) => Promise<void>;
   /** Poll interval in ms. Default 1000. */
   pollMs?: number;
   /**
@@ -124,7 +132,7 @@ export function createRuntimeDispatchWatcher(
   opts: Omit<DispatchWatcherOpts, "onDispatch" | "onRetained" | "beforeAdmission"> & {
     runtime: {
       dispatchInjectTurn(spec: DispatchSpec): Promise<{ output: string; stopReason: string }>;
-      observeRetainedDispatch(spec: DispatchSpec): Promise<void>;
+      observeRetainedDispatch(spec: DispatchSpec, err?: DispatchSuspendedError): Promise<void>;
       recoverInterruptedTurns(): Promise<void>;
     };
   }
@@ -133,7 +141,7 @@ export function createRuntimeDispatchWatcher(
   return new DispatchWatcher({
     ...watcherOpts,
     onDispatch: (spec) => runtime.dispatchInjectTurn(spec),
-    onRetained: (spec) => runtime.observeRetainedDispatch(spec),
+    onRetained: (spec, err) => runtime.observeRetainedDispatch(spec, err),
     // #307: protects the production recovery barrier; deleting this wire lets
     // the runtime watcher admit pending work before interrupted turns requeue.
     beforeAdmission: () => runtime.recoverInterruptedTurns(),
@@ -1041,14 +1049,33 @@ export class DispatchWatcher {
         if (!this.owns(owner)) return;
         if (err instanceof DispatchSuspendedError) {
           // SQL owns suspension. Keep the running spec; no failed done/report.
-          this.logger.info({ id, target: spec.target }, "dispatch: attempt retained");
-          // stop() runs before restart teardown. A retention observed after
-          // that cutoff is the healthy #250 handoff to the next boot, not a
-          // stall. While intake remains open, however, this callback has left
-          // the artifact in running/ and no poller will ever revisit it.
-          if (this.ready && this.onRetained) {
+          this.logger.info(
+            { id, target: spec.target, suspension: err.suspension, reason: err.reason },
+            "dispatch: attempt retained"
+          );
+          // #333: the CLASS decides, not the clock.
+          //
+          // This used to read `if (this.ready && ...)`, which made the outcome
+          // depend on whether `stop()` had already closed intake. The identical
+          // shutdown handoff became a durable quarantine plus an operator notice
+          // on the losing side of that race, and a genuine defect became silence
+          // on the winning side. Both halves were wrong, and neither was
+          // reproducible, because the deciding input was timing.
+          //
+          // A shutdown is the next boot's work and a superseded attempt is
+          // somebody else's work; neither is owed a human. Only a defect is.
+          // Deleting this branch restores the race and re-buries the 92% of
+          // refusals that are not failures.
+          if (err.suspension !== "defect") {
+            this.logger.debug(
+              { id, target: spec.target, suspension: err.suspension, reason: err.reason },
+              "dispatch: retained attempt needs no operator action"
+            );
+            return;
+          }
+          if (this.onRetained) {
             try {
-              await this.onRetained(spec);
+              await this.onRetained(spec, err);
             } catch (observeErr) {
               this.logger.error(
                 { err: observeErr, id, target: spec.target },

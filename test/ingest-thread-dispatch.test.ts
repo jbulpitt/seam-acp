@@ -724,7 +724,7 @@ describe("#246 isolated ingest owns every terminal transition", () => {
       await opts.onSession?.("acp-claude-recorded");
       opts.lifecycle?.beforePrompt();
       first.suspendForRestart();
-      throw new DispatchSuspendedError(spec.id);
+      throw DispatchSuspendedError.shutdown(spec.id, "fixture restart");
     };
     await expect(first.dispatchInjectTurn(spec)).rejects.toBeInstanceOf(DispatchSuspendedError);
 

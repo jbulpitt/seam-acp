@@ -115,7 +115,7 @@ describe("injectTurn isolated resumeSessionId", () => {
     const lifecycle = {
       isCurrent: () => active,
       beforePrompt: () => {},
-      onOutcome: () => { if (!active) throw new DispatchSuspendedError("job"); completed = true; },
+      onOutcome: () => { if (!active) throw DispatchSuspendedError.superseded("job", "fixture replaced"); completed = true; },
       mayDeleteSession: () => completed,
     };
     await expect(orch.injectTurn(record(), "continue", { session: "isolated", profile, cwd: dir,
@@ -141,7 +141,7 @@ describe("injectTurn isolated resumeSessionId", () => {
     });
     await expect(orch.injectTurn(record(), "original", {
       session: "isolated", profile, cwd: dir,
-      onSession: () => { throw new DispatchSuspendedError("db-write-failed"); },
+      onSession: () => { throw DispatchSuspendedError.defect("db-write-failed", "fixture write failure"); },
       lifecycle: { isCurrent: () => true, beforePrompt: () => {}, onOutcome: () => {}, mayDeleteSession: () => false },
     })).rejects.toBeInstanceOf(DispatchSuspendedError);
     expect(calls.prompts).toEqual([]);

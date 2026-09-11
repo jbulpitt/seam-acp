@@ -163,23 +163,27 @@ describe("real injection recording, offline runtime only", () => {
   // Without the ordinary receipt-time writer, interrupted turns lose observations and side-channel estimates can inflate them.
   it("ordinary turns retain the same observation despite a larger inferred side-channel limit", async () => {
     const { record, runtime, profile, setEvents } = injectionFixture();
+    const logs: string[] = [];
+    const prompts = vi.spyOn(runtime, "prompt");
     const panels: unknown[] = [];
     Object.assign(profile, { sessionManager: {
       getUsage: async () => ({ model: identity.model, totalUsed: 31_000, contextLimit: 400_000 }),
     } });
     Object.assign(runtime, {
+      idle: async () => {},
       getFastModeOutcome: () => undefined, getPromptCapabilities: () => ({}),
       getProcessId: () => undefined, getProviderIdentity: () => "synthetic",
     });
     setEvents([{ kind: "usage-update", used: 30_000, size: 272_000 },
       { kind: "usage-update", used: 0, size: 200_000 }]);
     const orch = new Orchestrator({
-      logger: pino({ level: "silent" }) as never, store, modelCatalog: fixtureModelCatalog([profile as never]),
+      logger: pino({ level: "debug" }, { write: (line: string) => { logs.push(line); } }) as never,
+      store, modelCatalog: fixtureModelCatalog([profile as never]),
       renderer: discordRenderer,
       config: { DATA_DIR: dir, REPOS_ROOT: dir, TURN_TIMEOUT_SECONDS: 60, REPO_EMOJIS: new Map(),
         DEFAULT_MODEL: identity.model, channelPresets: new Map(), threadPresets: new Map() } as never,
       router: {
-        listProfiles: () => [profile], ensureSessionRecord: () => record, getProfile: () => profile,
+        listProfiles: () => [profile], ensureSessionRecord: () => store.get(record.id)!, getProfile: () => profile,
         getOrStartRuntime: async () => runtime,
         describeConfig: () => ({
           agent: { value: identity.agentId }, location: { value: "local" }, model: { value: identity.model },
@@ -201,6 +205,33 @@ describe("real injection recording, offline runtime only", () => {
       .toMatchObject({ ...identity, promptBudget: 200_000, used: 0, previousPromptBudget: 272_000 });
     expect(JSON.stringify(panels.at(-1))).toContain("200k");
     expect(JSON.stringify(panels.at(-1))).not.toContain("400k");
+    // Unlike an inferred limit, a fresh measured side-channel limit may replace the preceding turn's budget.
+    Object.assign(profile, { sessionManager: {
+      getUsage: async () => ({ model: identity.model, totalUsed: 17, contextLimit: 180_000, contextLimitSource: "observed" }),
+    } });
+    setEvents([]);
+    await (orch as any).handleIncomingMessageInner({
+      messageId: "synthetic-measured-message", channel: { platform: "discord", id: record.channelRef },
+      authorId: "synthetic-user", authorIsBot: false, text: "offline measured turn",
+    });
+    // Assert actual turn execution; otherwise an early setup/transport failure can make cached-value checks pass vacuously.
+    expect(prompts, logs.join("\n")).toHaveBeenCalledTimes(2);
+    expect(store.readConfig(store.get(record.id)!).lastContextUsage?.budget, logs.join("\n"))
+      .toMatchObject({ promptBudget: 180_000, source: "session-usage", previousPromptBudget: 200_000 });
+    // A quiet subsequent turn must not replace a matching cached observation with a larger inference.
+    Object.assign(profile, { sessionManager: {
+      getUsage: async () => ({ model: identity.model, totalUsed: 31_000, contextLimit: 400_000 }),
+    } });
+    setEvents([]);
+    await (orch as any).handleIncomingMessageInner({
+      messageId: "synthetic-next-message", channel: { platform: "discord", id: record.channelRef },
+      authorId: "synthetic-user", authorIsBot: false, text: "offline next turn",
+    });
+    expect(JSON.stringify(panels.at(-1))).toContain("180k");
+    expect(JSON.stringify(panels.at(-1))).not.toContain("400k");
+    // All three runs must reach normal completion, including the inferred and measured side-channel reads.
+    expect(prompts, logs.join("\n")).toHaveBeenCalledTimes(3);
+    expect(logs.filter(line => line.includes('"level":50'))).toEqual([]);
   });
 
   // Removing the inject handler write loses dispatch telemetry whenever the UI is off or fails to post (#292).

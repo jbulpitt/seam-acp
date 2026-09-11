@@ -3237,6 +3237,7 @@ export class Orchestrator {
     const cachedUsage = cfg.lastContextUsage;
     let contextIdentity = this.contextBudgetIdentity(record);
     let observedContextBudget: ContextBudgetObservation | undefined;
+    let acpUsageReceived = false;
     const activeModel = described.model.value;
     // Catalog capacity is a display estimate only until telemetry arrives.
     const modelContextFloor = this.modelCatalog.model(
@@ -3250,6 +3251,7 @@ export class Orchestrator {
       cachedUsage.used >= 0
     ) {
       status.contextUsedHighWater = cachedUsage.used;
+      observedContextBudget = cachedUsage.budget;
       status.contextWindowSize = cachedUsage.size;
       status.context = formatContextUsage(cachedUsage.used, cachedUsage.size);
     }
@@ -3548,6 +3550,7 @@ export class Orchestrator {
         ? await this.router.getOrStartRuntime(record, { resumeSessionId: priorHuman.acpSessionId })
         : await this.router.getOrStartRuntime(record);
       contextIdentity = this.contextBudgetIdentity(record, activeRuntime.getSessionInfo()?.sessionId);
+      if (!contextIdentity || !matchesContextBudget(observedContextBudget, contextIdentity)) observedContextBudget = undefined;
       this.assertQueueFence(queueFence);
       if (humanAttempt) {
         if (!humanCurrent()) throw new DispatchSuspendedError(humanAttempt.id);
@@ -3829,6 +3832,7 @@ export class Orchestrator {
             return;
           case "usage-update": {
             if (!validContextUsage(event.used, event.size)) return;
+            acpUsageReceived = true;
             if (contextIdentity) {
               observedContextBudget = this.recordContextBudget(contextIdentity, event.used, event.size, record);
             }
@@ -4078,6 +4082,7 @@ export class Orchestrator {
           activeRuntime = await this.router.getOrStartRuntime(record);
           contextIdentity = this.contextBudgetIdentity(record, activeRuntime.getSessionInfo()?.sessionId);
           observedContextBudget = undefined;
+          acpUsageReceived = false;
           activeRuntime.onEvent(eventHandler);
           result = await raceWithTimeout(activeRuntime.prompt(promptText, promptAttachments), timeoutMs);
         } else if (isConnectionClosedError(promptErr)) {
@@ -4087,6 +4092,7 @@ export class Orchestrator {
           activeRuntime = await this.router.getOrStartRuntime(record);
           contextIdentity = this.contextBudgetIdentity(record, activeRuntime.getSessionInfo()?.sessionId);
           observedContextBudget = undefined;
+          acpUsageReceived = false;
           activeRuntime.onEvent(eventHandler);
           result = await raceWithTimeout(activeRuntime.prompt(promptText, promptAttachments), timeoutMs);
         } else if (isRateLimitError(promptErr) && !textSent && !textBuffer) {
@@ -4277,15 +4283,14 @@ export class Orchestrator {
             const computedSize = modelEntry?.context.effective ?? usage?.contextLimit ?? 0;
             // Inferred transcript limits cannot override live ACP observations.
             // Only an explicitly measured side-channel limit is persisted.
-            const size = observedContextBudget?.promptBudget ??
-              (usage?.contextLimitSource === "observed" ? usage.contextLimit : computedSize);
-            if (!observedContextBudget && usage?.contextLimitSource === "observed" && contextIdentity &&
+            if (!acpUsageReceived && usage?.contextLimitSource === "observed" && contextIdentity &&
                 validContextUsage(usage.totalUsed, usage.contextLimit)) {
               observedContextBudget = this.recordContextBudget(
                 this.contextIdentityForModel(contextIdentity, usage.model ?? contextIdentity.model),
                 usage.totalUsed, usage.contextLimit, record, "session-usage"
               );
             }
+            const size = observedContextBudget?.promptBudget ?? computedSize;
             if (usage && usage.totalUsed > 0 && size > 0) {
               status.contextUsedHighWater = usage.totalUsed;
               status.contextWindowSize = size;

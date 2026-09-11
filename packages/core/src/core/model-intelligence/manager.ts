@@ -280,7 +280,7 @@ function buildGeneration(
   if (!pricing) diagnostics.push("GitHub pricing source unavailable; no validated snapshot");
   const availability: AgentModelAvailability[] = [];
   for (const binding of fleet) {
-    if (binding.state === "warming" || binding.state === "drift" || !binding.snapshot) {
+    if (binding.state === "warming" || !binding.snapshot) {
       diagnostics.push(`${binding.binding.agentId}@${binding.binding.location}: catalog ${binding.state}`);
       continue;
     }

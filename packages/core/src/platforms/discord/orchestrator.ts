@@ -5310,7 +5310,7 @@ export class Orchestrator {
           profile,
           logger,
           mcpServers: opts.mcpServers ?? [],
-          effortDescriptor: selection.model.effort,
+          ...(selection.model ? { effortDescriptor: selection.model.effort } : {}),
           spawnFn: opts.spawnFn ?? (() => profile.spawn(
             selection.raw.model,
             selection.raw.effort,
@@ -5354,7 +5354,7 @@ export class Orchestrator {
         }
         // Registered after newSession: the session-creation handshake emits no
         // events we want, and this matches the order the callers used.
-        budgetIdentity = { ...binding, acpSessionId: sessionId, model: selection.model.id,
+        budgetIdentity = { ...binding, acpSessionId: sessionId, model: selection.normalized.model,
           requestedTier: profile.requestedContextTier ?? null };
         rt.onEvent(handler);
         const outcome = await runPrompt(rt);
@@ -6296,11 +6296,11 @@ export class Orchestrator {
     // An omitted model is deliberately resolved against the binding's current
     // published default at fire time. AgentProfile.defaultModel is bootstrap
     // input to adapter discovery, not a second runtime selection authority.
+    // #339 rule 15: a cold catalog must not refuse the dispatch. `default` is
+    // resolvable with no catalog at all, and the provider applies its own.
     const requestedModel = opts.model
-      ?? this.modelCatalog.model(binding, "default")?.id;
-    if (!requestedModel) {
-      throw new Error(`dispatch ${opts.spec.id}: catalog has no default model for ${agentId}@${opts.workerLocation}`);
-    }
+      ?? this.modelCatalog.model(binding, "default")?.id
+      ?? "default";
     const selection = this.modelCatalog.resolve(binding, {
       model: requestedModel,
       effort: opts.effort,
@@ -18541,7 +18541,7 @@ export class Orchestrator {
                 profile,
                 logger: this.logger.child({ session: `temp-summary-${session.sessionId}` }),
                 mcpServers: [],
-                effortDescriptor: summarySelection.model.effort,
+                ...(summarySelection.model ? { effortDescriptor: summarySelection.model.effort } : {}),
                 spawnFn: () => profile.spawn(
                   summarySelection.raw.model,
                   summarySelection.raw.effort,

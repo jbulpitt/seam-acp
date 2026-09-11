@@ -55,6 +55,28 @@ export interface CatalogReductionReport {
   confirmationRequired: boolean;
 }
 
+/**
+ * A peer disagreement, reported rather than enforced (#339 rules 7-8, 13-14).
+ *
+ * Both sides are named because "they disagree" is not actionable: an operator
+ * needs to know which generation, which wrapper versions, and which models
+ * actually differ before they can decide whether anything is wrong at all.
+ * Usually nothing is — two hosts on different wrapper versions genuinely have
+ * different capabilities, and both descriptions are true.
+ */
+export interface CatalogConflictReport {
+  /** The shared scope this binding stopped using. */
+  peerScope: string;
+  peerGeneration: number;
+  peerChecksum: string;
+  peerCliVersion: string | null;
+  peerSourceVersion: string | null;
+  cliVersion: string | null;
+  sourceVersion: string | null;
+  /** Model ids only this binding has, only the peer has, and that differ. */
+  differs: { onlyHere: string[]; onlyPeer: string[]; changed: string[] };
+}
+
 export interface CatalogRefreshResult {
   binding: CatalogBinding;
   ok: boolean;
@@ -76,10 +98,26 @@ export interface CatalogRefreshResult {
   acceptedReduction?: true;
   /** Who accepted it, for the audit trail. */
   acceptedBy?: string;
+  /**
+   * Rule 13: which mode this binding is in. `shared` names the scope it shares;
+   * `binding-local` is the default and is a correct description of one host.
+   */
+  mode?: "shared" | "binding-local";
+  /** Rule 8: present when a peer disagreed. Never a failure; both keep serving. */
+  conflict?: CatalogConflictReport;
 }
 
 export interface CatalogLookup {
-  state: "ready" | "stale" | "warming" | "drift";
+  /**
+   * #339 rule 6: a binding holding a valid catalog is never unavailable.
+   *
+   * There used to be a `drift` state here, entered when a PEER disagreed, and
+   * it made `models()` return [] — so a healthy host lost every model,
+   * including `default`, because a different host described itself
+   * differently. Peer disagreement is now a report on the refresh result; it
+   * has no state of its own because it is not a state of this binding.
+   */
+  state: "ready" | "stale" | "warming";
   snapshot: StoredCatalogSnapshot | null;
   observation: CatalogObservationRow | null;
 }
@@ -87,8 +125,18 @@ export interface CatalogLookup {
 export interface ResolvedCatalogSelection {
   normalized: NormalizedCatalogSelection;
   raw: RawCatalogSelection;
-  model: CatalogModel;
-  generation: number;
+  /** Null when no catalog entry backed this resolution (#339 rules 15-17). */
+  model: CatalogModel | null;
+  /** Null when no catalog generation backed this resolution. */
+  generation: number | null;
+  /**
+   * How much was actually verified, so a display can be truthful about it:
+   * `binding` — this binding's own catalog listed the model;
+   * `borrowed` — another binding's catalog did, and is named in `borrowedFrom`;
+   * `unverified` — no catalog anywhere; the id is passed through as typed.
+   */
+  verification: "binding" | "borrowed" | "unverified";
+  borrowedFrom?: CatalogBinding;
 }
 
 export interface CatalogPublication {
@@ -181,11 +229,12 @@ export class ModelCatalogService {
     return [...this.observations.values()].map(({ agentId, location }) => ({ agentId, location }));
   }
 
-  /** Cache-only fleet view used by enrichment; drifted bindings contribute nothing. */
+  /** Cache-only fleet view used by enrichment. */
   availableModels(): AvailableCatalogModel[] {
     const rows: AvailableCatalogModel[] = [];
     for (const observation of this.observations.values()) {
-      if (observation.drift) continue;
+      // #339 rule 5: no binding's availability depends on another's state, so a
+      // historical peer-conflict marker no longer removes this binding's models.
       const snapshot = this.snapshots.get(observation.scopeKey);
       if (!snapshot) continue;
       for (const model of snapshot.candidate.models) {
@@ -221,14 +270,36 @@ export class ModelCatalogService {
     const observation = this.observations.get(key) ?? null;
     const snapshot = observation ? this.snapshots.get(observation.scopeKey) ?? null : null;
     if (!snapshot) return { state: "warming", snapshot: null, observation };
-    if (observation?.drift) return { state: "drift", snapshot, observation };
     const online = this.options.isOnline?.(binding) ?? true;
     return { state: online ? "ready" : "stale", snapshot, observation };
   }
 
   models(binding: CatalogBinding): ReadonlyArray<CatalogModel> {
-    const lookup = this.lookup(binding);
-    return lookup.state === "drift" ? [] : lookup.snapshot?.candidate.models ?? [];
+    return this.lookup(binding).snapshot?.candidate.models ?? [];
+  }
+
+  /**
+   * Rule 16: another binding's catalog for the same agent, as a labeled HINT.
+   *
+   * Only consulted when this binding has none of its own, and never presented
+   * as this binding's catalog — the caller gets `verification: "borrowed"` and
+   * the lending binding's name so the display can say "not verified on this
+   * host". Rule 18 makes it temporary: the first real session publishes this
+   * binding's own catalog and the borrowing stops.
+   */
+  hint(binding: CatalogBinding): { from: CatalogBinding; models: ReadonlyArray<CatalogModel> } | null {
+    if (this.lookup(binding).snapshot) return null;
+    for (const observation of this.observations.values()) {
+      if (observation.agentId !== binding.agentId) continue;
+      if (observation.location === binding.location) continue;
+      const snapshot = this.snapshots.get(observation.scopeKey);
+      if (!snapshot?.candidate.models.length) continue;
+      return {
+        from: { agentId: observation.agentId, location: observation.location },
+        models: snapshot.candidate.models,
+      };
+    }
+    return null;
   }
 
   model(binding: CatalogBinding, idOrAlias: string): CatalogModel | null {
@@ -246,7 +317,21 @@ export class ModelCatalogService {
 
   resolve(binding: CatalogBinding, selection: { model: string; effort?: string | null }): ResolvedCatalogSelection {
     const lookup = this.lookup(binding);
-    if (!lookup.snapshot) throw new Error(`model catalog for ${bindingKey(binding)} is warming/unavailable`);
+    // #339 rule 15 (and the fix for #326). This used to throw
+    // "model catalog is warming/unavailable", which is a bootstrap deadlock: a
+    // binding can only obtain a catalog by running a session, and could only
+    // run a session once it had one. A whole host became unable to accept work
+    // because a cache was cold — the worst available outcome when starting on
+    // `default` was right there.
+    //
+    // So a missing catalog no longer blocks a turn. What is refused shrinks to
+    // the thing actually in doubt: we cannot say the model is listed, so we say
+    // exactly that in `verification` and let the provider answer. Rule 17: our
+    // gate is the binding constraint and it is ours to relax; downstream a
+    // model id is a string we pass through, and `profiles/claude.ts`
+    // substitutes nothing, so an unknown id fails cleanly rather than silently
+    // running something else.
+    if (!lookup.snapshot) return this.resolveWithoutOwnCatalog(binding, selection);
     const model = this.model(binding, selection.model);
     if (!model || model.availability !== "available" || model.lifecycle === "retired") {
       throw new Error(`model ${JSON.stringify(selection.model)} is unavailable in catalog generation ${lookup.snapshot.generation}`);
@@ -258,7 +343,73 @@ export class ModelCatalogService {
       );
     }
     const normalized = { model: model.id, effort };
-    return { normalized, raw: encodeCatalogSelection(model, normalized), model, generation: lookup.snapshot.generation };
+    return {
+      normalized,
+      raw: encodeCatalogSelection(model, normalized),
+      model,
+      generation: lookup.snapshot.generation,
+      verification: "binding",
+    };
+  }
+
+  /**
+   * Resolve for a binding that has no catalog of its own (#339 rules 15-18).
+   *
+   * Order of preference, best available outcome first: a peer's entry for the
+   * same agent (rules 16-17 — real evidence the id exists for this provider,
+   * labeled as borrowed), then a bare pass-through (rule 15 — `default` must
+   * always start, and a typed id is a string the provider will judge).
+   *
+   * Nothing here is permanent: rule 18 says the first real session publishes
+   * this binding's own catalog, after which `lookup().snapshot` exists and this
+   * path stops being reached. One turn, no operator action.
+   */
+  private resolveWithoutOwnCatalog(
+    binding: CatalogBinding,
+    selection: { model: string; effort?: string | null }
+  ): ResolvedCatalogSelection {
+    const wanted = selection.model.trim();
+    const hint = this.hint(binding);
+    if (hint) {
+      const lowered = wanted.toLowerCase();
+      const model = lowered === "default" || !lowered
+        ? hint.models.find((entry) => entry.default)
+        : hint.models.find((entry) =>
+            entry.id.toLowerCase() === lowered ||
+            entry.aliases.some((alias) => alias.toLowerCase() === lowered));
+      if (model && model.availability === "available" && model.lifecycle !== "retired") {
+        const effort = selection.effort ?? model.effort.selectionDefault;
+        // An effort the borrowed entry does not list is not proof this host
+        // rejects it, but we have nothing better to offer, so fall back to the
+        // borrowed default rather than refusing the turn.
+        const usable = model.effort.choices.some((choice) => choice.id === effort)
+          ? effort
+          : model.effort.selectionDefault;
+        const normalized = { model: model.id, effort: usable };
+        return {
+          normalized,
+          raw: encodeCatalogSelection(model, normalized),
+          model,
+          generation: null,
+          verification: "borrowed",
+          borrowedFrom: hint.from,
+        };
+      }
+    }
+    // Rule 15: `default` is always startable. The provider picks its own.
+    // Empty effort means "the caller named none and we have no catalog to take
+    // a default from" — the provider applies its own, exactly as it does for a
+    // bare `default`. Inventing an effort id here would be a silent wrong
+    // answer rather than an honest absence.
+    const normalized = { model: wanted || "default", effort: selection.effort ?? "" };
+    return {
+      normalized,
+      raw: { model: normalized.model, ...(normalized.effort ? { effort: normalized.effort } : {}) },
+      model: null,
+      generation: null,
+      verification: "unverified",
+      ...(hint ? { borrowedFrom: hint.from } : {}),
+    };
   }
 
   decode(binding: CatalogBinding, raw: RawCatalogSelection): NormalizedCatalogSelection | null {
@@ -367,46 +518,55 @@ export class ModelCatalogService {
         sourceObservation.checksum === activeForScope.checksum &&
         !sourceObservation.drift
       ) || migrationProof;
-      const drift = activeForScope && checksum !== activeForScope.checksum && !fetchedFromActive
-        ? `catalog conflicts with active generation ${activeForScope.generation}; binding quarantined`
+      // #339 rules 7-10. Disagreeing with a peer used to quarantine THIS
+      // binding: `models()` returned [] and even `default` stopped resolving,
+      // so a host that was working perfectly lost its models because a
+      // different host described itself differently. That is the blast-radius
+      // defect in AGENTS.md — the doubt was about the shared generation, and
+      // the thing refused was the whole binding.
+      //
+      // Disagreement is an observation, not a fault. macbook-air advertising
+      // 0.70.0 while local advertises 0.75.1 is TRUE information. So the
+      // disagreeing binding stops sharing, publishes what its own adapter
+      // actually reported under its own key, and both sides keep serving. It
+      // is also how recovery becomes unilateral (rule 10): the next valid
+      // refresh publishes, with no peer change and no operator action.
+      const conflict = activeForScope && checksum !== activeForScope.checksum && !fetchedFromActive
+        ? {
+            peerScope: desiredScope,
+            peerGeneration: activeForScope.generation,
+            peerChecksum: activeForScope.checksum,
+            peerCliVersion: activeForScope.candidate.cliVersion ?? null,
+            peerSourceVersion: activeForScope.candidate.sourceVersion ?? null,
+            cliVersion: candidate.cliVersion ?? null,
+            sourceVersion: candidate.sourceVersion ?? null,
+            differs: describeCatalogDifference(activeForScope.candidate.models, candidate.models),
+          }
         : null;
-      const scopeKey = desiredScope;
+      // Rule 8: the binding demotes ITSELF to binding-local rather than losing
+      // its catalog. Deleting this line restores quarantine-on-disagreement and
+      // with it the outage; nothing else re-establishes availability here.
+      const scopeKey = conflict ? `binding:${key}` : desiredScope;
+      const drift: string | null = null;
       const priorForScope = this.snapshots.get(scopeKey) ?? prior;
       const diff = diffModels(priorForScope?.candidate.models ?? [], candidate.models);
-      if (drift) {
-        const observation: CatalogObservationRow = {
-          bindingKey: key, agentId: binding.agentId, location: binding.location,
-          scopeKey, checksum, adapterVersion: candidate.adapterVersion,
-          schemaVersion: candidate.schemaVersion,
-          cliVersion: candidate.cliVersion ?? null,
-          sourceVersion: candidate.sourceVersion ?? null,
-          source: candidate.source, fetchedAt: candidate.fetchedAt, drift,
-        };
-        // Only the binding whose adapter actually produced a conflicting
-        // shared candidate is a drift observation. Waiters retain their last
-        // known-good observation; otherwise one stale source could poison
-        // every healthy binding that happened to join its in-flight fetch.
-        if (fetchedBy === key) {
-          this.options.store.recordObservation(observation);
-          this.observations.set(key, observation);
-        }
-        // A drift quarantine is not an independent confirming observation of a
-        // reduction either.
-        this.clearReductionConfirmation(key);
-        this.options.store.recordAttempt({ bindingKey: key, attemptedAt, result: "quarantined", error: drift, source: candidate.source, candidateChecksum: checksum });
-        return {
-          ...base,
-          ...diff,
-          ok: false,
-          result: "quarantined",
-          scope: scopeKey,
-          generation: priorForScope?.generation ?? null,
-          source: candidate.source,
-          fetchedAt: candidate.fetchedAt,
-          cliVersion: candidate.cliVersion,
-          sourceVersion: candidate.sourceVersion,
-          error: drift,
-        };
+      if (conflict) {
+        // Rule 14: "they disagree" is not actionable. Name both catalogs, both
+        // wrapper versions, and what actually differs.
+        this.options.logger.warn(
+          {
+            binding: key,
+            mode: "binding-local",
+            demotedFrom: conflict.peerScope,
+            peerGeneration: conflict.peerGeneration,
+            thisCliVersion: conflict.cliVersion,
+            peerCliVersion: conflict.peerCliVersion,
+            thisSourceVersion: conflict.sourceVersion,
+            peerSourceVersion: conflict.peerSourceVersion,
+            differs: conflict.differs,
+          },
+          "model catalog disagrees with a peer; serving this binding's own catalog"
+        );
       }
       // Reduction quarantine (#236). A candidate that DROPS a published model
       // is held until a second, independent, identical refresh confirms it —
@@ -558,18 +718,17 @@ export class ModelCatalogService {
   }
 
   private async fetchCandidate(binding: CatalogBinding): Promise<FetchedCatalogCandidate> {
-    // Scope discovery is adapter-owned and provider-work-free, so equivalent
-    // cold bindings share the very first provider/CLI fetch as well as all
-    // later refreshes. Old embedders without the scope hook conservatively use
-    // a prior observation or isolate by binding.
-    const observedScope = this.observations.get(bindingKey(binding))?.scopeKey;
+    // #339 rules 11-12: dedupe concurrent refreshes of the SAME binding, and
+    // never across a binding boundary.
+    //
+    // This used to key the in-flight map by scope, so two bindings that merely
+    // looked equivalent shared one provider fetch — and then one host's answer
+    // was published as the other's. Saving a probe is not worth asserting an
+    // equivalence we cannot prove. Bindings that genuinely do share a scope
+    // still share the published generation; they just each ask for it.
     const declared = this.options.scope ? await this.options.scope(binding) : null;
-    // An explicit binding-local declaration overrides a historic shared scope:
-    // otherwise concurrent recovery refreshes still borrow the wrong host's fetch.
-    const scopeKey = declared
-      ? shareableScope(declared) ? `scope:${declared.fingerprint}` : `binding:${bindingKey(binding)}`
-      : observedScope ?? `binding:${bindingKey(binding)}`;
-    const existing = this.fetchInFlight.get(scopeKey);
+    const fetchKey = bindingKey(binding);
+    const existing = this.fetchInFlight.get(fetchKey);
     if (existing) return existing;
     const promise = this.options.fetch(binding).then((candidate) => {
       if (
@@ -582,9 +741,9 @@ export class ModelCatalogService {
           `adapter catalog scope changed during fetch (${declared.fingerprint} → ${candidate.scope.fingerprint})`
         );
       }
-      return { candidate, fetchedBy: bindingKey(binding) };
-    }).finally(() => this.fetchInFlight.delete(scopeKey));
-    this.fetchInFlight.set(scopeKey, promise);
+      return { candidate, fetchedBy: fetchKey };
+    }).finally(() => this.fetchInFlight.delete(fetchKey));
+    this.fetchInFlight.set(fetchKey, promise);
     return promise;
   }
 }
@@ -725,13 +884,39 @@ function validStringList(value: unknown, requireNonEmpty: boolean): value is str
 }
 
 function trustworthyFingerprint(value: string): boolean { return /^[a-f0-9]{64}$/.test(value); }
+/**
+ * #339 rules 1-3: a catalog is binding-local unless the adapter PROVES sharing.
+ *
+ * This was `scope.sharing !== "binding"`, which treated silence as proof and
+ * made label equality — provider name, config-directory name — stand in for
+ * runtime equivalence. It does not: two hosts carrying the same label ran
+ * `claude-agent-acp` 0.70.0 and 0.75.1 and advertised different capabilities.
+ *
+ * Refusing to share costs a duplicate probe. Sharing wrongly costs a host its
+ * models. Binding-local is a correct description of one host, not a degraded
+ * mode, so it is the default and the burden is on the claim to share.
+ */
 function shareableScope(scope: CatalogScope): boolean {
-  return scope.sharing !== "binding" && trustworthyFingerprint(scope.fingerprint);
+  return scope.sharing === "shared" && trustworthyFingerprint(scope.fingerprint);
 }
 /** Canonical, key-order-independent content identity (#236). */
 function candidateChecksum(candidate: AdapterCatalogCandidate): string {
   return catalogContentChecksum(candidate);
 }
+/** Rule 14: what actually differs, in model ids an operator can look up. */
+function describeCatalogDifference(
+  peer: ReadonlyArray<CatalogModel>,
+  here: ReadonlyArray<CatalogModel>
+): { onlyHere: string[]; onlyPeer: string[]; changed: string[] } {
+  const a = new Map(peer.map((model) => [model.id, catalogModelFingerprint(model)]));
+  const b = new Map(here.map((model) => [model.id, catalogModelFingerprint(model)]));
+  return {
+    onlyHere: [...b.keys()].filter((id) => !a.has(id)).sort(),
+    onlyPeer: [...a.keys()].filter((id) => !b.has(id)).sort(),
+    changed: [...b].filter(([id, row]) => a.has(id) && a.get(id) !== row).map(([id]) => id).sort(),
+  };
+}
+
 function diffModels(before: ReadonlyArray<CatalogModel>, after: ReadonlyArray<CatalogModel>): { added: number; removed: number; changed: number } {
   // Canonical per-model identity: a property reordering is not a change.
   const a = new Map(before.map((model) => [model.id, catalogModelFingerprint(model)]));

@@ -27,7 +27,7 @@ import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { Logger } from "../../lib/logger.js";
 import { DELEGATION_TERMINAL_STATUSES } from "../types.js";
-import type { LedgerEntry } from "../types.js";
+import type { DoneArtifactExpirationAuthorization, LedgerEntry } from "../types.js";
 import { dispatchDirs } from "./types.js";
 import type { DispatchResult } from "./types.js";
 
@@ -95,6 +95,8 @@ export interface DoneReconcileDeps {
   recoveryBatchSize?: number;
   /** Replay the completion side effects for one finished dispatch. */
   replay: (result: DispatchResult, route: CompletionRoute) => Promise<void>;
+  /** Terminalize an unrouteable legacy result with an operator-facing reason. */
+  abandonUnprovable: (id: string, reason: string) => boolean;
   /** Optional retention surface. Omitted by narrow callers that only repair. */
   retention?: {
     listCandidates: (
@@ -103,6 +105,10 @@ export interface DoneReconcileDeps {
       limit: number
     ) => DoneLedgerRow[];
     getReportBackByCorrelation: (correlationId: string) => DoneLedgerRow | null;
+    isAttemptDeliveryProven: (id: string) => boolean;
+    getExpirationAuthorization: (
+      id: string
+    ) => DoneArtifactExpirationAuthorization | null;
     now?: () => Date;
     maxAgeMs?: number;
     batchSize?: number;
@@ -112,10 +118,10 @@ export interface DoneReconcileDeps {
 export type DoneLedgerRow = Pick<
   LedgerEntry,
   "id" | "status" | "updatedUtc"
-> & Partial<Pick<LedgerEntry, "kind" | "correlationId" | "targetRef">>;
+> & Partial<Pick<LedgerEntry, "kind" | "correlationId" | "targetRef" | "terminalReason">>;
 
 export type DoneLedgerState = Pick<LedgerEntry, "status"> &
-  Partial<Pick<LedgerEntry, "id" | "updatedUtc" | "kind" | "correlationId" | "targetRef">>;
+  Partial<Pick<LedgerEntry, "id" | "updatedUtc" | "kind" | "correlationId" | "targetRef" | "terminalReason">>;
 
 export interface DoneRetentionCursor {
   updatedUtc: string;
@@ -129,6 +135,9 @@ export const DONE_RETENTION_BATCH_SIZE = 256;
 /** Recovery also has a hard ceiling; its cursor makes overflow resumable. */
 export const DONE_RECOVERY_BATCH_SIZE = 256;
 
+export const LEGACY_DELIVERY_ABANDON_REASON =
+  "legacy completion has no recorded nonce or route; Discord delivery cannot be proven or replayed safely";
+
 export interface DoneReconcileSummary {
   /** Existing files opened across recovery and retention. */
   scanned: number;
@@ -140,16 +149,18 @@ export interface DoneReconcileSummary {
   retainedPending: number;
   skippedTerminal: number;
   skippedUnknown: number;
-  /** Legacy done-files whose delivery cannot be proven — deliberately left. */
+  /** Compatibility counter: production must not intentionally leave rows here. */
   skippedUnprovable: number;
+  /** Legacy done-files terminalized with an explicit delivery refusal. */
+  abandonedUnprovable: number;
   failed: number;
 }
 
-const SETTLED_ONWARD_STATUSES: ReadonlySet<string> = new Set([
-  "completed",
-  "failed",
-  "timed_out",
-]);
+function isCompletedOnward(row: DoneLedgerState | null): boolean {
+  // Protects proof-of-failure from becoming proof-of-delivery; deleting the
+  // exact completed check lets failed/timed-out/abandoned children prune output.
+  return row?.status === "completed";
+}
 
 const RECOVERY_CURSOR_FILE = ".done-recovery-cursor.json";
 const RETENTION_CURSOR_FILE = ".done-retention-cursor.json";
@@ -291,31 +302,76 @@ async function writeMaintenanceCursor(
   await rename(tmp, file);
 }
 
-function onwardIsSettled(
+export interface DoneDeliveryProofLookup {
+  getDelegation: (id: string) => DoneLedgerState | null;
+  getReportBackByCorrelation: (correlationId: string) => DoneLedgerRow | null;
+  isAttemptDeliveryProven: (id: string) => boolean;
+  getExpirationAuthorization: (
+    id: string
+  ) => DoneArtifactExpirationAuthorization | null;
+}
+
+/**
+ * Positive delivery evidence only. Lifecycle terminality and automatic refusal
+ * deliberately do not satisfy this predicate.
+ */
+export function isDoneDeliveryProven(
   result: DispatchResult,
   row: DoneLedgerState,
-  deps: DoneReconcileDeps
+  lookup: DoneDeliveryProofLookup
 ): boolean {
+  // Protects active work from deletion even if a corrupt receipt/child exists;
+  // deleting this check lets evidence attach to a non-terminal source.
+  if (!TERMINAL_STATUSES.has(row.status)) return false;
+  // Protects direct Discord deliveries proven by nonce/send acknowledgement;
+  // deleting it retains every modern no-onward result forever.
+  if (lookup.isAttemptDeliveryProven(result.id)) return true;
   // Reclassify with a non-terminal status: the live route is still required
-  // to prove whether a terminal source had an onward obligation.
+  // to identify an onward child without terminal-source short-circuiting.
   const route = completionRoute(result, { ...row, status: "interrupted" });
-  if (route.action === "terminalize") return true;
+  // Terminal/no-onward is disposition, not proof: without a receipt or child,
+  // deleting here would erase the only full local result copy.
+  if (route.action === "terminalize") return false;
   if (route.action === "skip") return false;
 
-  const lookup = deps.retention!.getReportBackByCorrelation;
   if (route.action === "report_back") {
     const correlation = result.correlationId ?? result.id;
-    const delivery = lookup(correlation);
-    return Boolean(delivery && SETTLED_ONWARD_STATUSES.has(delivery.status));
+    const delivery = lookup.getReportBackByCorrelation(correlation);
+    return isCompletedOnward(delivery);
   }
 
   // A chain plan is a terminal synthetic row; its targetRef names the actual
   // next hop/origin-delivery. Only that target becoming settled proves the
   // parent's output is no longer needed to reconstruct the onward spec.
-  const plan = lookup(result.id);
+  const plan = lookup.getReportBackByCorrelation(result.id);
   if (!plan?.targetRef) return false;
-  const child = deps.getDelegation(plan.targetRef);
-  return Boolean(child && SETTLED_ONWARD_STATUSES.has(child.status));
+  const child = lookup.getDelegation(plan.targetRef);
+  return isCompletedOnward(child);
+}
+
+/**
+ * Sole done-artifact deletion authority. Positive delivery proof is preferred;
+ * otherwise only a separate immutable human expiration authorization suffices.
+ */
+export function isDoneArtifactDeletable(
+  result: DispatchResult,
+  row: DoneLedgerState,
+  lookup: DoneDeliveryProofLookup
+): boolean {
+  // Protects operator policy from attaching to active work; deleting this
+  // check lets a premature authorization erase a still-recoverable artifact.
+  if (!TERMINAL_STATUSES.has(row.status)) return false;
+  if (isDoneDeliveryProven(result, row, lookup)) return true;
+  const authorization = lookup.getExpirationAuthorization(result.id);
+  // Protects lifecycle reasons from impersonating operator retention consent;
+  // deleting the exact binding lets malformed/shared authorization prune output.
+  return Boolean(
+    authorization &&
+      authorization.dispatchId === result.id &&
+      authorization.operatorId.trim() &&
+      authorization.reason.trim() &&
+      Number.isFinite(Date.parse(authorization.authorizedUtc))
+  );
 }
 
 /**
@@ -352,8 +408,9 @@ export function needsCompletionReplay(
  * delivery-bearing kind was written before #174 carried routing. It cannot
  * prove its report-back was ever
  * enqueued, and terminalizing it would strand the answer permanently and
- * silently. So it is left non-terminal: `/seam workflows` may offer a rerun,
- * which is the pre-existing behaviour and recoverable, unlike deletion.
+ * silently. The pure classifier reports `delivery-unprovable`; the boot loop
+ * then records an explicit `abandoned` terminal reason instead of guessing a
+ * route or repeating the same warning forever.
  */
 export function completionRoute(
   result: Pick<DispatchResult, "returnTo" | "chainId" | "kind" | "suppressedOnward" | "inlinedReportBack">,
@@ -414,6 +471,7 @@ export async function reconcileCompletedDoneFiles(
     skippedTerminal: 0,
     skippedUnknown: 0,
     skippedUnprovable: 0,
+    abandonedUnprovable: 0,
     failed: 0,
   };
 
@@ -454,11 +512,32 @@ export async function reconcileCompletedDoneFiles(
       if (route.reason === "unknown-row") summary.skippedUnknown++;
       else if (route.reason === "terminal") summary.skippedTerminal++;
       else {
-        summary.skippedUnprovable++;
-        deps.logger.warn(
-          { id: result.id, kind: result.kind ?? row?.kind, status: row?.status },
-          "done-reconcile: cannot prove onward delivery; leaving row non-terminal"
-        );
+        // Protects against the permanent boot-warning loop for pre-nonce rows;
+        // deleting this transition leaves the same unprovable result forever.
+        let abandoned = false;
+        try {
+          abandoned = deps.abandonUnprovable(result.id, LEGACY_DELIVERY_ABANDON_REASON);
+        } catch (err) {
+          // Protects one corrupt/busy ledger write from starving later legacy
+          // rows; deleting this boundary aborts the whole bounded recovery page.
+          summary.failed++;
+          deps.logger.warn({ err, id: result.id }, "done-reconcile: legacy abandonment failed");
+          continue;
+        }
+        if (abandoned) {
+          summary.abandonedUnprovable++;
+          deps.logger.warn(
+            { id: result.id, kind: result.kind ?? row?.kind, reason: LEGACY_DELIVERY_ABANDON_REASON },
+            "done-reconcile: explicitly abandoned legacy delivery without proof"
+          );
+        } else {
+          summary.skippedUnprovable++;
+          summary.failed++;
+          deps.logger.warn(
+            { id: result.id, kind: result.kind ?? row?.kind },
+            "done-reconcile: legacy delivery abandonment was not recorded"
+          );
+        }
       }
       continue;
     }
@@ -537,7 +616,12 @@ export async function reconcileCompletedDoneFiles(
           summary.retainedPending++;
           continue;
         }
-        if (!onwardIsSettled(result, current, deps)) {
+        if (!isDoneArtifactDeletable(result, current, {
+          getDelegation: deps.getDelegation,
+          getReportBackByCorrelation: deps.retention.getReportBackByCorrelation,
+          isAttemptDeliveryProven: deps.retention.isAttemptDeliveryProven,
+          getExpirationAuthorization: deps.retention.getExpirationAuthorization,
+        })) {
           summary.retainedPending++;
           continue;
         }

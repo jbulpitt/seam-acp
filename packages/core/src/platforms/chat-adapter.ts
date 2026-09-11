@@ -21,6 +21,18 @@ export interface MessageRef {
   id: string;
 }
 
+/** Idempotency key forwarded to a platform create-message operation. */
+export interface DeliveryNonceOptions {
+  nonce: string;
+  enforceNonce: true;
+}
+
+/** Result of asking the platform whether this bot already created a nonce. */
+export type DeliveryNonceLookup =
+  | { status: "found"; message: MessageRef }
+  | { status: "absent" }
+  | { status: "indeterminate"; reason: string };
+
 /** A file attached to an incoming message, normalized across platforms. */
 export interface MessageAttachment {
   /** Stable URL the bot can fetch (Discord CDN URL). */
@@ -68,7 +80,11 @@ export interface ChatAdapter {
   start(): Promise<void>;
   stop(): Promise<void>;
 
-  sendMessage(channel: ChannelRef, text: string): Promise<MessageRef>;
+  sendMessage(
+    channel: ChannelRef,
+    text: string,
+    delivery?: DeliveryNonceOptions
+  ): Promise<MessageRef>;
   editMessage(message: MessageRef, text: string): Promise<void>;
 
   /**
@@ -88,8 +104,16 @@ export interface ChatAdapter {
         /** Base64-encoded sampled amplitude bytes. */
         waveform: string;
       };
-    }
+    },
+    delivery?: DeliveryNonceOptions
   ): Promise<MessageRef>;
+
+  /** Ask the platform source of truth whether this bot already created the nonce. */
+  findMessageByNonce?(
+    channel: ChannelRef,
+    nonce: string,
+    sinceMs: number
+  ): Promise<DeliveryNonceLookup>;
 
   /** Optional: platforms that support threads should implement this. */
   createThread?(parent: ChannelRef, name: string): Promise<ChannelRef>;
@@ -155,7 +179,11 @@ export interface ChatAdapter {
   ): Promise<Array<{ ts: number; authorIsBot: boolean; text: string; authorName?: string }>>;
 
   /** Optional: send a rich structured panel (embed on Discord). */
-  sendPanel?(channel: ChannelRef, panel: StructuredPanel): Promise<MessageRef>;
+  sendPanel?(
+    channel: ChannelRef,
+    panel: StructuredPanel,
+    delivery?: DeliveryNonceOptions
+  ): Promise<MessageRef>;
 
   /** Optional: edit a previously-sent panel. */
   editPanel?(message: MessageRef, panel: StructuredPanel): Promise<void>;

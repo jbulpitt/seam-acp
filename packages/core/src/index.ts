@@ -1226,11 +1226,15 @@ async function main(): Promise<void> {
       listRecoveryCandidates: (after, limit) =>
         store.listNonTerminalDelegations(after, limit),
       replay: (result, route) => orchestrator.replayCompletedDispatch(result, route),
+      abandonUnprovable: (id, reason) => store.abandonUnprovableDelivery(id, reason),
       retention: {
         listCandidates: (cutoffUtc, after, limit) =>
           store.listTerminalDelegationsForDoneRetention(cutoffUtc, after, limit),
         getReportBackByCorrelation: (correlationId) =>
           store.getReportBackByCorrelation(correlationId),
+        isAttemptDeliveryProven: (id) => store.turnAttempts.isDeliveryProven(id),
+        getExpirationAuthorization: (id) =>
+          store.getDoneArtifactExpirationAuthorization(id),
       },
     });
     if (
@@ -1238,6 +1242,7 @@ async function main(): Promise<void> {
       repaired.pruned > 0 ||
       repaired.quarantined > 0 ||
       repaired.failed > 0 ||
+      repaired.abandonedUnprovable > 0 ||
       repaired.skippedUnprovable > 0
     ) {
       logger.warn(repaired, "dispatch done-file boot maintenance reported work or failures");

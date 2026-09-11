@@ -1024,6 +1024,7 @@ describe("#246 isolated ingest owns every terminal transition", () => {
       logger: silent,
       getDelegation: (id) => store.getDelegation(id),
       listRecoveryCandidates: (after, limit) => store.listNonTerminalDelegations(after, limit),
+      abandonUnprovable: (id, reason) => store.abandonUnprovableDelivery(id, reason),
       replay: (done, route) => orch.replayCompletedDispatch(done, route),
     });
     expect(repaired.reconciled).toBe(1);
@@ -1080,6 +1081,7 @@ describe("#246 isolated ingest owns every terminal transition", () => {
       logger: silent,
       getDelegation: (id) => store.getDelegation(id),
       listRecoveryCandidates: (after, limit) => store.listNonTerminalDelegations(after, limit),
+      abandonUnprovable: (id, reason) => store.abandonUnprovableDelivery(id, reason),
       replay: async (done, route) => {
         replayCalls++;
         await orch.replayCompletedDispatch(done, route);
@@ -1102,6 +1104,7 @@ describe("#246 isolated ingest owns every terminal transition", () => {
       logger: silent,
       getDelegation: (id) => store.getDelegation(id),
       listRecoveryCandidates: (after, limit) => store.listNonTerminalDelegations(after, limit),
+      abandonUnprovable: (id, reason) => store.abandonUnprovableDelivery(id, reason),
       replay: async (done, route) => {
         replayCalls++;
         await orch.replayCompletedDispatch(done, route);
@@ -1139,6 +1142,7 @@ describe("#246 isolated ingest owns every terminal transition", () => {
       logger: silent,
       getDelegation: (id) => store.getDelegation(id),
       listRecoveryCandidates: (after, limit) => store.listNonTerminalDelegations(after, limit),
+      abandonUnprovable: (id, reason) => store.abandonUnprovableDelivery(id, reason),
       replay: async () => {
         throw new Error("artifact-free work must not replay");
       },

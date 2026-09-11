@@ -20,6 +20,7 @@ import {
   PROMPT_PREVIEW_MAX,
   type DelegationKind,
   type DelegationStatus,
+  type DoneArtifactExpirationAuthorization,
   type LedgerEntry,
   type LedgerEntryInput,
   type LedgerPatch,
@@ -408,8 +409,10 @@ export class SessionStore {
     this.scheduledOccurrences = new ScheduledOccurrenceStore(this.db);
     this.db.exec(SCHEMA);
     this.db.exec(DELEGATION_SCHEMA);
+    this.db.exec(DONE_ARTIFACT_EXPIRATION_SCHEMA);
     this.migrateReportBackDedupIndex();
     this.migrateDelegationAcpSessionId();
+    this.migrateDelegationTerminalReason();
     this.db.exec(CONFIG_AUDIT_SCHEMA);
     this.db.exec(ACTIVE_PROJECTS_SCHEMA);
     this.db.exec(CHAINS_SCHEMA);
@@ -463,6 +466,14 @@ export class SessionStore {
     this.db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_elicitation_codex_async
       ON elicitations(session_record_id, request_correlation)
       WHERE source_kind = 'codex_async'`);
+  }
+
+  private migrateDelegationTerminalReason(): void {
+    try {
+      this.db.exec("ALTER TABLE delegation_log ADD COLUMN terminal_reason TEXT");
+    } catch {
+      /* column already exists */
+    }
   }
 
   /** Additive V2 migration over the shipped V1 compatibility tables. */
@@ -1934,6 +1945,7 @@ export class SessionStore {
       correlationId: entry.correlationId ?? null,
       acpSessionId: entry.acpSessionId ?? null,
       status: entry.status ?? "dispatched",
+      terminalReason: entry.terminalReason ?? null,
       createdUtc,
       updatedUtc: entry.updatedUtc ?? createdUtc,
     };
@@ -1941,10 +1953,10 @@ export class SessionStore {
       .prepare(
         `INSERT INTO delegation_log
            (id, source_ref, target_ref, worker, kind, prompt_preview,
-            correlation_id, acp_session_id, status, created_utc, updated_utc)
+            correlation_id, acp_session_id, status, terminal_reason, created_utc, updated_utc)
          VALUES
            (@id, @sourceRef, @targetRef, @worker, @kind, @promptPreview,
-            @correlationId, @acpSessionId, @status, @createdUtc, @updatedUtc)`
+            @correlationId, @acpSessionId, @status, @terminalReason, @createdUtc, @updatedUtc)`
       )
       .run(row);
     return row;
@@ -2070,6 +2082,73 @@ export class SessionStore {
       .run(params);
   }
 
+  /** Explicitly terminalize an unrouteable legacy completion with evidence. */
+  abandonUnprovableDelivery(id: string, reason: string): boolean {
+    const now = new Date().toISOString();
+    const placeholders = DELEGATION_TERMINAL_STATUSES.map(() => "?").join(", ");
+    return this.db.prepare(`UPDATE delegation_log SET status='abandoned', terminal_reason=?, updated_utc=?
+      WHERE id=? AND status NOT IN (${placeholders})`)
+      .run(reason, now, id, ...DELEGATION_TERMINAL_STATUSES).changes === 1;
+  }
+
+  /**
+   * Record one immutable operator decision to expire unproven output.
+   * Recovery must never call this: terminal disposition is not authorization.
+   */
+  authorizeDoneArtifactExpiration(
+    id: string,
+    operatorId: string,
+    reason: string,
+    authorizedUtc = new Date().toISOString()
+  ): DoneArtifactExpirationAuthorization {
+    const actor = operatorId.trim();
+    const explanation = reason.trim();
+    // Protects the audit row from anonymous/empty authorization; deleting this
+    // check turns an automatic or malformed call into apparent human consent.
+    if (!actor || !explanation) {
+      throw new Error("done artifact expiration requires operator id and reason");
+    }
+    return this.db.transaction(() => {
+      const existing = this.getDoneArtifactExpirationAuthorization(id);
+      if (existing) {
+        // Protects the human decision from later rewriting; deleting this
+        // check lets a second caller erase who authorized destructive expiry.
+        if (
+          existing.operatorId !== actor ||
+          existing.reason !== explanation
+        ) {
+          throw new Error(`done artifact expiration already authorized for ${id}`);
+        }
+        return existing;
+      }
+      const placeholders = DELEGATION_TERMINAL_STATUSES.map(() => "?").join(", ");
+      const written = this.db.prepare(`INSERT INTO done_artifact_expirations
+          (dispatch_id, operator_id, reason, authorized_utc)
+        SELECT id, ?, ?, ? FROM delegation_log
+        WHERE id=? AND status IN (${placeholders})`)
+        .run(actor, explanation, authorizedUtc, id, ...DELEGATION_TERMINAL_STATUSES).changes;
+      // Protects active/unknown work from operator-expiry authorization;
+      // deleting this check can make a recoverable result deletable.
+      if (written !== 1) throw new Error(`cannot authorize done artifact expiration for ${id}`);
+      return { dispatchId: id, operatorId: actor, reason: explanation, authorizedUtc };
+    }).immediate();
+  }
+
+  getDoneArtifactExpirationAuthorization(
+    id: string
+  ): DoneArtifactExpirationAuthorization | null {
+    const row = this.db.prepare(`SELECT dispatch_id,operator_id,reason,authorized_utc
+      FROM done_artifact_expirations WHERE dispatch_id=?`).get(id) as
+      | { dispatch_id: string; operator_id: string; reason: string; authorized_utc: string }
+      | undefined;
+    return row ? {
+      dispatchId: row.dispatch_id,
+      operatorId: row.operator_id,
+      reason: row.reason,
+      authorizedUtc: row.authorized_utc,
+    } : null;
+  }
+
   /** One ledger row by primary key, or null if absent. */
   getDelegation(id: string): LedgerEntry | null {
     const row = this.db
@@ -2180,6 +2259,7 @@ export class SessionStore {
       correlationId: entry.correlationId ?? null,
       acpSessionId: entry.acpSessionId ?? null,
       status: entry.status ?? "dispatched",
+      terminalReason: entry.terminalReason ?? null,
       createdUtc,
       updatedUtc: entry.updatedUtc ?? createdUtc,
     };
@@ -2188,10 +2268,10 @@ export class SessionStore {
         .prepare(
           `INSERT INTO delegation_log
              (id, source_ref, target_ref, worker, kind, prompt_preview,
-              correlation_id, acp_session_id, status, created_utc, updated_utc)
+              correlation_id, acp_session_id, status, terminal_reason, created_utc, updated_utc)
            SELECT
              @id, @sourceRef, @targetRef, @worker, @kind, @promptPreview,
-             @correlationId, @acpSessionId, @status, @createdUtc, @updatedUtc
+             @correlationId, @acpSessionId, @status, @terminalReason, @createdUtc, @updatedUtc
            WHERE @correlationId IS NULL OR NOT EXISTS (
              SELECT 1 FROM delegation_log
               WHERE kind = 'report_back' AND correlation_id = @correlationId
@@ -6139,6 +6219,7 @@ CREATE TABLE IF NOT EXISTS delegation_log (
   correlation_id  TEXT,
   acp_session_id  TEXT,
   status          TEXT NOT NULL,
+  terminal_reason TEXT,
   created_utc     TEXT NOT NULL,
   updated_utc     TEXT NOT NULL
 );
@@ -6148,6 +6229,17 @@ CREATE INDEX IF NOT EXISTS idx_delegation_source
   ON delegation_log(source_ref);
 CREATE INDEX IF NOT EXISTS idx_delegation_done_retention
   ON delegation_log(updated_utc, id, status);
+`;
+
+/** Separate from the lifecycle ledger by design: a terminal status records
+ * what Seam did; this append-only row records a human retention decision. */
+const DONE_ARTIFACT_EXPIRATION_SCHEMA = `
+CREATE TABLE IF NOT EXISTS done_artifact_expirations (
+  dispatch_id   TEXT PRIMARY KEY,
+  operator_id   TEXT NOT NULL,
+  reason        TEXT NOT NULL,
+  authorized_utc TEXT NOT NULL
+);
 `;
 
 interface LedgerRow {
@@ -6160,6 +6252,7 @@ interface LedgerRow {
   correlation_id: string | null;
   acp_session_id: string | null;
   status: string;
+  terminal_reason: string | null;
   created_utc: string;
   updated_utc: string;
 }
@@ -6174,6 +6267,7 @@ const mapLedger = (r: LedgerRow): LedgerEntry => ({
   correlationId: r.correlation_id,
   acpSessionId: r.acp_session_id ?? null,
   status: r.status as DelegationStatus,
+  terminalReason: r.terminal_reason ?? null,
   createdUtc: r.created_utc,
   updatedUtc: r.updated_utc,
 });
@@ -7563,6 +7657,7 @@ const LEDGER_PATCH_COLUMNS: Record<keyof LedgerPatch, string> = {
   promptPreview: "prompt_preview",
   correlationId: "correlation_id",
   acpSessionId: "acp_session_id",
+  terminalReason: "terminal_reason",
 };
 
 function truncatePreview(text: string | null): string | null {

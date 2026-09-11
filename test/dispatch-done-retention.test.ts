@@ -56,12 +56,16 @@ function deps(
     logger: silent,
     getDelegation: (id) => store.getDelegation(id),
     listRecoveryCandidates: (after, limit) => store.listNonTerminalDelegations(after, limit),
+    abandonUnprovable: (id, reason) => store.abandonUnprovableDelivery(id, reason),
     replay,
     retention: {
       listCandidates: (cutoffUtc, after, limit) =>
         store.listTerminalDelegationsForDoneRetention(cutoffUtc, after, limit),
       getReportBackByCorrelation: (correlationId) =>
         store.getReportBackByCorrelation(correlationId),
+      isAttemptDeliveryProven: (id) => store.turnAttempts.isDeliveryProven(id),
+      getExpirationAuthorization: (id) =>
+        store.getDoneArtifactExpirationAuthorization(id),
       now: () => NOW,
       maxAgeMs: 24 * 60 * 60 * 1000,
       batchSize: 32,
@@ -84,6 +88,27 @@ function record(
   });
 }
 
+function completedAttempt(id: string) {
+  store.turnAttempts.registerOwner("retention-test-boot");
+  const attempt = store.turnAttempts.claim({
+    id,
+    target: "worker",
+    prompt: "fixture",
+    session: "live",
+    createdUtc: OLD,
+    kind: "wake",
+  }, "fixture-identity", "retention-test-boot");
+  store.turnAttempts.complete(attempt, {
+    id,
+    target: "worker",
+    status: "completed",
+    output: `result-${id}`,
+    kind: "wake",
+    finishedUtc: OLD,
+  });
+  return store.turnAttempts.get(id)!;
+}
+
 describe("#193 bounded done-file recovery and retention", () => {
   it("opens only indexed recovery ids plus one hard-capped terminal page", async () => {
     for (let i = 0; i < 80; i++) {
@@ -91,6 +116,12 @@ describe("#193 bounded done-file recovery and retention", () => {
     }
     for (let i = 0; i < 5; i++) {
       record(`terminal-${i}`, "completed");
+      store.authorizeDoneArtifactExpiration(
+        `terminal-${i}`,
+        "operator-305",
+        "bounded retention fixture",
+        "2026-09-03T00:00:00.000Z"
+      );
       await writeDone(`terminal-${i}`);
     }
     for (let i = 0; i < 5; i++) {
@@ -147,7 +178,7 @@ describe("#193 bounded done-file recovery and retention", () => {
     await expect(access(path.join(dispatchDirs(dataDir).done, "finished-worker.json"))).resolves.toBeUndefined();
   });
 
-  it("retains a terminal parent through the report-back crash window, then prunes after ack", async () => {
+  it("retains failed, timed-out and abandoned onward children, then prunes after completion", async () => {
     record("parent", "completed", { kind: "handoff", correlationId: "job-2" });
     record("delivery", "dispatched", { kind: "report_back", correlationId: "job-2" });
     await writeDone("parent", {
@@ -160,12 +191,26 @@ describe("#193 bounded done-file recovery and retention", () => {
     expect(pending.retainedPending).toBe(1);
     await expect(access(path.join(dispatchDirs(dataDir).done, "parent.json"))).resolves.toBeUndefined();
 
-    store.updateDelegationStatus("delivery", "abandoned");
+    for (const status of ["failed", "timed_out"] as const) {
+      store.updateDelegationStatus("delivery", status);
+      const refused = await reconcileCompletedDoneFiles(deps());
+      // Protects proof-of-failure from authorizing deletion; deleting the
+      // exact-completed child check prunes on failed or timed-out report-back.
+      expect(refused).toMatchObject({ pruned: 0, retainedPending: 1 });
+      await expect(access(path.join(dispatchDirs(dataDir).done, "parent.json"))).resolves.toBeUndefined();
+    }
+    store.updateDelegationStatus("delivery", "abandoned", {
+      terminalReason: "automatic recovery refusal",
+    });
     const abandoned = await reconcileCompletedDoneFiles(deps());
-    expect(abandoned.retainedPending).toBe(1);
+    // Protects automatic abandonment from impersonating delivery evidence;
+    // deleting it makes a reasoned refusal destructive.
+    expect(abandoned).toMatchObject({ pruned: 0, retainedPending: 1 });
 
     store.updateDelegationStatus("delivery", "completed");
     const settled = await reconcileCompletedDoneFiles(deps());
+    // Protects positive completed-child evidence; deleting it retains every
+    // successfully delivered report-back forever.
     expect(settled.pruned).toBe(1);
     await expect(access(path.join(dispatchDirs(dataDir).done, "parent.json"))).rejects.toMatchObject({ code: "ENOENT" });
   });
@@ -185,6 +230,80 @@ describe("#193 bounded done-file recovery and retention", () => {
     store.updateDelegationStatus("chain-child", "completed");
     const settled = await reconcileCompletedDoneFiles(deps());
     expect(settled.pruned).toBe(1);
+  });
+
+  it("retains an automatically abandoned attempt but prunes a nonce-confirmed attempt", async () => {
+    for (const id of ["automatic-abandonment", "nonce-confirmed"]) {
+      record(id, "completed", { kind: "wake" });
+      completedAttempt(id);
+      await writeDone(id);
+    }
+    store.turnAttempts.abandonDelivery(
+      "automatic-abandonment",
+      "automatic recovery could not prove delivery"
+    );
+    const receipt = store.turnAttempts.prepareDelivery(
+      "nonce-confirmed",
+      "worker",
+      { kind: "message", text: "result-nonce-confirmed" },
+      "2026-09-03T00:00:00.000Z"
+    );
+    expect(receipt.nonce).toHaveLength(25);
+    store.turnAttempts.markDeliveryDone("nonce-confirmed");
+
+    const summary = await reconcileCompletedDoneFiles(deps());
+
+    // Protects terminal refusal/proof separation; deleting it lets automatic
+    // abandonment remove the only retained output.
+    expect(summary).toMatchObject({ pruned: 1, retainedPending: 1 });
+    await expect(access(path.join(dispatchDirs(dataDir).done, "automatic-abandonment.json"))).resolves.toBeUndefined();
+    // Protects nonce-confirmed pruning; deleting attempt-proof lookup leaks
+    // every successfully acknowledged direct result forever.
+    await expect(access(path.join(dispatchDirs(dataDir).done, "nonce-confirmed.json"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("requires an immutable operator authorization to expire unproven legacy output", async () => {
+    record("legacy-no-onward", "abandoned", {
+      kind: "wake",
+      terminalReason: "automatic legacy delivery refusal",
+    });
+    await writeDone("legacy-no-onward");
+
+    const automatic = await reconcileCompletedDoneFiles(deps());
+    expect(automatic).toMatchObject({ pruned: 0, retainedPending: 1 });
+    const authorization = store.authorizeDoneArtifactExpiration(
+      "legacy-no-onward",
+      "discord-user-42",
+      "owner approved expiration after reviewing retained output",
+      "2026-09-03T01:02:03.000Z"
+    );
+    expect(authorization).toEqual({
+      dispatchId: "legacy-no-onward",
+      operatorId: "discord-user-42",
+      reason: "owner approved expiration after reviewing retained output",
+      authorizedUtc: "2026-09-03T01:02:03.000Z",
+    });
+    // Protects an operator retry from creating or rewriting authorization;
+    // deleting idempotency makes a harmless repeated command fail or drift.
+    expect(store.authorizeDoneArtifactExpiration(
+      "legacy-no-onward",
+      "discord-user-42",
+      "owner approved expiration after reviewing retained output"
+    )).toEqual(authorization);
+    // Protects the authorization audit from mutation; deleting write-once
+    // enforcement lets a later caller rewrite destructive consent.
+    expect(() => store.authorizeDoneArtifactExpiration(
+      "legacy-no-onward",
+      "different-operator",
+      "replacement reason",
+      "2026-09-03T02:00:00.000Z"
+    )).toThrow(/already authorized/);
+
+    const authorized = await reconcileCompletedDoneFiles(deps());
+    // Protects the sole policy escape hatch for legacy output; deleting the
+    // explicit authorization lookup makes deliberate expiry impossible.
+    expect(authorized).toMatchObject({ pruned: 1, retainedPending: 0 });
+    await expect(access(path.join(dispatchDirs(dataDir).done, "legacy-no-onward.json"))).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("quarantines malformed and unreadable terminal artifacts without replaying them", async () => {
@@ -216,6 +335,12 @@ describe("#193 bounded done-file recovery and retention", () => {
   it("repeats an already-pruned page safely after a crash before cursor commit", async () => {
     for (const id of ["a", "b", "c"]) {
       record(id, "completed");
+      store.authorizeDoneArtifactExpiration(
+        id,
+        "operator-305",
+        "cursor crash fixture",
+        "2026-09-03T00:00:00.000Z"
+      );
       await writeDone(id);
     }
     const configured = deps();

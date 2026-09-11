@@ -11,6 +11,7 @@ import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 import type { ScheduledPrompt } from "../packages/core/src/core/scheduled-prompts/types.js";
 import { scheduledOccurrenceKey } from "../packages/core/src/core/scheduled-prompts/occurrence-store.js";
 import { ScheduledPromptManager } from "../packages/core/src/core/scheduled-prompts/manager.js";
+import type { DeliveryNonceLookup } from "../packages/core/src/platforms/chat-adapter.js";
 
 const transport = vi.hoisted(() => ({ prompt: vi.fn(), load: vi.fn(), fresh: vi.fn(), delete: vi.fn(), dispose: vi.fn() }));
 vi.mock("../packages/core/src/agents/agent-runtime.js", async importOriginal => {
@@ -59,8 +60,9 @@ function setup(mode: "live" | "isolated" = "isolated") {
     })),
     reuseMcpServers: () => [], describeConfig: () => ({ agent: { value: "codex" }, model: { value: "test" },
       cwd: { value: "/synthetic" }, effort: { value: null }, location: { value: "local" }, fastMode: { value: false } }) };
-  const adapter = { sendPanel: vi.fn(async (channel: any) => ({ channel, id: "panel" })),
-    sendMessage: vi.fn(async (channel: any, _text: string) => ({ channel, id: "message" })),
+  const adapter = { sendPanel: vi.fn(async (channel: any, _panel?: unknown, _delivery?: unknown) => ({ channel, id: "panel" })),
+    sendMessage: vi.fn(async (channel: any, _text: string, _delivery?: unknown) => ({ channel, id: "message" })),
+    findMessageByNonce: vi.fn(async (): Promise<DeliveryNonceLookup> => ({ status: "absent" })),
     editPanel: vi.fn(async () => {}), editMessage: vi.fn(async () => {}) };
   const make = () => new Orchestrator({ logger: pino({ level: "silent" }) as any, store, router: router as any,
     adapter: adapter as any, renderer: discordRenderer as any, modelCatalog: fixtureModelCatalog([profile]),
@@ -264,6 +266,13 @@ describe("#252 actual isolated scheduler + injectTurn, synthetic transport", () 
     await h.make().runScheduledPrompt(h.row.id, key);
     expect(transport.prompt).toHaveBeenCalledTimes(1);
     expect(h.store.scheduledOccurrences.get(key.id)?.settled).toBe(true);
+    const deliveryCalls = h.adapter.sendPanel.mock.calls.filter(call => call[2]);
+    const firstDelivery = deliveryCalls[0]?.[2];
+    const replayDelivery = deliveryCalls.at(-1)?.[2];
+    // Protects scheduled-result dedup after an accepted/rejected ambiguity;
+    // deleting it lets boot replay create a second result card.
+    expect(replayDelivery).toEqual(firstDelivery);
+    expect(replayDelivery).toMatchObject({ enforceNonce: true });
   });
 
   it("a durable cancellation never resumes, while disable/delete only stops future ticks", async () => {

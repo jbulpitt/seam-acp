@@ -401,6 +401,7 @@ import {
   rollingLineWindow,
 } from "../../core/rolling-line-window.js";
 import { completionRoute, type CompletionRoute } from "../../core/dispatch/done-reconcile.js";
+import type { DurableDeliveryPayload } from "../../core/dispatch/delivery-proof.js";
 import { promptExcerpt } from "../../core/prompt-excerpt.js";
 import { buildSeamHelpPages } from "./help-text.js";
 import { frameSteerPrompt, frameInterruptPrompt } from "../../core/steer.js";
@@ -3397,7 +3398,11 @@ export class Orchestrator {
     // would be its own message).
     const HARD_MAX = 1800;
     const SOFT_MIN = 800;
-    const drainBufferInner = async (force: boolean, allowUnsafeCut = false) => {
+    const drainBufferInner = async (
+      force: boolean,
+      allowUnsafeCut = false,
+      terminalProof = false
+    ) => {
       this.assertQueueFence(queueFence);
       while (textBuffer) {
         if (!humanOutcomeOwned && !humanCurrent()) return;
@@ -3411,7 +3416,14 @@ export class Orchestrator {
         textBuffer = split.keep;
         if (split.send) {
           this.assertQueueFence(queueFence);
-          await this.adapter.sendMessage(channel, split.send);
+          if (terminalProof && textBuffer.length === 0 && humanAttempt && humanOutcomeOwned) {
+            await this.sendTerminalAttemptDelivery(humanAttempt.id, channel, {
+              kind: "message",
+              text: split.send,
+            });
+          } else {
+            await this.adapter.sendMessage(channel, split.send);
+          }
           this.assertQueueFence(queueFence);
           spokenProse += split.send;
           spokenAfterLastTool += split.send;
@@ -3428,12 +3440,15 @@ export class Orchestrator {
     // Enqueueing is synchronous, so drains (and their sends) run strictly in
     // call order.
     const flushQueue = new SerialQueue();
-    const drainBuffer = (force: boolean, allowUnsafeCut = false): Promise<void> =>
-      flushQueue.run(() => drainBufferInner(force, allowUnsafeCut));
-    const flushChunks = async () => {
+    const drainBuffer = (
+      force: boolean,
+      allowUnsafeCut = false,
+      terminalProof = false
+    ): Promise<void> => flushQueue.run(() => drainBufferInner(force, allowUnsafeCut, terminalProof));
+    const flushChunks = async (terminalProof = false) => {
       // End-of-turn: must drain everything. An open link will never be
       // closed, so allow unsafe cuts here.
-      await drainBuffer(true, true);
+      await drainBuffer(true, true, terminalProof);
     };
     /**
      * Idle-flush timer: if text has been buffered for IDLE_FLUSH_MS
@@ -4195,7 +4210,7 @@ export class Orchestrator {
         });
         textSent = true;
       }
-      await flushChunks();
+      await flushChunks(true);
 
       const turnOk =
         result !== "timeout" && !(result as { cancelled?: boolean }).cancelled;
@@ -4242,7 +4257,15 @@ export class Orchestrator {
         // Turn completed but the agent produced no visible text (e.g. tools ran
         // but emitted no assistant message). Make it visible so the user isn't
         // left wondering if their message was received.
-        await this.adapter.sendMessage(channel, "_Agent completed with no text response._");
+        const empty = "_Agent completed with no text response._";
+        if (humanAttempt && humanOutcomeOwned) {
+          await this.sendTerminalAttemptDelivery(humanAttempt.id, channel, {
+            kind: "message",
+            text: empty,
+          });
+        } else {
+          await this.adapter.sendMessage(channel, empty);
+        }
       }
       humanDelivered = result !== "timeout";
 
@@ -11198,9 +11221,83 @@ export class Orchestrator {
       const target: ChannelRef = { platform: PLATFORM,
         id: row.sessionMode === "live" ? row.channelRef : row.targetChannel || row.channelRef };
       if (await this.checkResumePreconditions(target) !== "ok") return;
+      const settleDelivery = async (
+        resolution: "delivered" | "abandoned" | "uncertain",
+        reason?: string
+      ): Promise<void> => {
+        this.patchScheduledStatus(
+          row.id,
+          resolution === "delivered"
+            ? "ok"
+            : `${resolution === "uncertain" ? "retained" : "abandoned"}: ${reason ?? "delivery unresolved"}`
+        );
+        this.store.scheduledOccurrences.settle(occurrence.id);
+        if (row.sessionMode === "live") {
+          await finishLiveTurn(this.config.DATA_DIR, {
+            id: occurrence.id,
+            status: resolution === "delivered"
+              ? "completed"
+              : resolution === "uncertain" ? "failed" : "abandoned",
+            channelRef: row.channelRef,
+            finishedUtc: new Date().toISOString(),
+            ...(reason ? { reason } : {}),
+          });
+        }
+      };
+      if (attempt.deliveryAbandonedReason) {
+        await settleDelivery("abandoned", attempt.deliveryAbandonedReason);
+        return;
+      }
+      if (attempt.deliveryUncertainReason) {
+        await settleDelivery("uncertain", attempt.deliveryUncertainReason);
+        return;
+      }
+      if (attempt.deliveryNonce) {
+        const resolution = await this.recoverRecordedDelivery(attempt, target);
+        if (resolution === "deferred") return;
+        const recovered = this.store.turnAttempts.get(attempt.id);
+        await settleDelivery(
+          resolution,
+          recovered?.deliveryAbandonedReason ?? recovered?.deliveryUncertainReason ?? undefined
+        );
+        return;
+      }
+      // Protects live scheduled streams whose final nonce was never planned;
+      // deleting it can replay a full answer after some chunks were visible.
+      if (row.sessionMode === "live") {
+        this.store.turnAttempts.abandonDelivery(
+          attempt.id,
+          "completed live schedule has no terminal nonce receipt; partial delivery cannot be excluded"
+        );
+        await settleDelivery(
+          "abandoned",
+          "completed live schedule has no terminal nonce receipt; partial delivery cannot be excluded"
+        );
+        return;
+      }
+      // Protects old send-without-receipt attempts from unsafe replay; deleting
+      // this check can duplicate a pre-upgrade scheduled result.
+      if (!attempt.deliveryProtocol) {
+        this.store.turnAttempts.abandonDelivery(
+          attempt.id,
+          "completed scheduled output predates nonce-backed delivery receipts"
+        );
+        await settleDelivery(
+          "abandoned",
+          "completed scheduled output predates nonce-backed delivery receipts"
+        );
+        return;
+      }
       const result = attempt.outcome;
       if (result.status === "failed") {
-        await this.sendResultCard(target, `⏰ ${row.name} — failed`, "Scheduled execution failed.", 0xe74c3c);
+        await this.sendResultCard(
+          target,
+          `⏰ ${row.name} — failed`,
+          "Scheduled execution failed.",
+          0xe74c3c,
+          [],
+          attempt.id
+        );
       } else await this.postScheduledVisibleResult(target, row.id, row.name, result.output ?? "", row.outputType,
         row.sessionMode === "isolated" ? this.isolatedScheduleIdentityFields(occurrence.execution) : [], occurrence.id);
       this.store.turnAttempts.markDeliveryDone(attempt.id);
@@ -11397,7 +11494,8 @@ export class Orchestrator {
         `⏰ ${row.name} — failed`,
         `❌ ${result.error.slice(0, 1500)}`,
         0xe74c3c,
-        identityFields
+        identityFields,
+        owned?.attempt.id
       );
     } else {
       this.patchScheduledStatus(id, "ok");
@@ -11422,7 +11520,7 @@ export class Orchestrator {
       : null;
     if (speech) this.voiceConsole?.acceptVisibleAgentText(speech, 1, text);
     try {
-      await this.postScheduledResult(target, name, text, outputType, identityFields);
+      await this.postScheduledResult(target, name, text, outputType, identityFields, occurrenceId);
     } finally {
       if (occurrenceId) this.scheduledActivity?.phase(occurrenceId, "cleanup");
       if (speech) {
@@ -11520,11 +11618,80 @@ export class Orchestrator {
     name: string,
     text: string,
     outputType: "card" | "messages",
-    identityFields: StructuredPanel["fields"] = []
+    identityFields: StructuredPanel["fields"] = [],
+    deliveryAttemptId?: string
   ): Promise<void> {
     const body = text.trim();
+    if (deliveryAttemptId) {
+      let terminalPayload: DurableDeliveryPayload;
+      if (!body) {
+        terminalPayload = {
+          kind: "panel",
+          panel: {
+            color: SCHEDULED_COLOR,
+            title: `⏰ ${name}`,
+            description: "✅ Done — no output.",
+            fields: identityFields,
+          },
+        };
+      } else if (outputType === "messages") {
+        const chunks = this.chunkString(body, 1900);
+        if (chunks.length <= 8) {
+          terminalPayload = { kind: "message", text: chunks.at(-1)! };
+        } else if (this.adapter.sendFile) {
+          const filename = `scheduled-${name.replace(/[^\w.-]+/g, "_") || "output"}.md`;
+          terminalPayload = {
+            kind: "file",
+            file: {
+              dataBase64: Buffer.from(body, "utf8").toString("base64"),
+              filename,
+              mimeType: "text/markdown",
+            },
+          };
+        } else {
+          terminalPayload = { kind: "message", text: chunks.at(-1)! };
+        }
+      } else {
+        const chunks = this.chunkString(body, 3900);
+        if (chunks.length <= 3) {
+          const index = chunks.length - 1;
+          const suffix = chunks.length > 1 ? ` (${index + 1}/${chunks.length})` : "";
+          terminalPayload = {
+            kind: "panel",
+            panel: {
+              color: SCHEDULED_COLOR,
+              title: `⏰ ${name}${suffix}`,
+              description: chunks[index]!,
+              fields: identityFields,
+            },
+          };
+        } else if (this.adapter.sendFile) {
+          const filename = `scheduled-${name.replace(/[^\w.-]+/g, "_") || "output"}.md`;
+          terminalPayload = {
+            kind: "file",
+            file: {
+              dataBase64: Buffer.from(body, "utf8").toString("base64"),
+              filename,
+              mimeType: "text/markdown",
+            },
+          };
+        } else {
+          terminalPayload = { kind: "message", text: this.chunkString(body, 1900).at(-1)! };
+        }
+      }
+      // Protects the interval before a multi-message result reaches its last
+      // create call; deleting this pre-plan can leave a partial send ambiguous.
+      this.store.turnAttempts.prepareDelivery(deliveryAttemptId, channel.id, terminalPayload);
+    }
     if (!body) {
-      await this.sendResultCard(channel, `⏰ ${name}`, "✅ Done — no output.", SCHEDULED_COLOR, identityFields);
+      await this.sendResultCard(
+        channel,
+        `⏰ ${name}`,
+        "✅ Done — no output.",
+        SCHEDULED_COLOR,
+        identityFields,
+        deliveryAttemptId
+      );
       return;
     }
 
@@ -11534,7 +11701,8 @@ export class Orchestrator {
         body,
         name,
         "scheduled",
-        `⏰ **${name}** — output attached (${body.length} chars).`
+        `⏰ **${name}** — output attached (${body.length} chars).`,
+        deliveryAttemptId
       );
       return;
     }
@@ -11544,11 +11712,18 @@ export class Orchestrator {
     if (chunks.length <= 3) {
       for (let j = 0; j < chunks.length; j++) {
         const suffix = chunks.length > 1 ? ` (${j + 1}/${chunks.length})` : "";
-        await this.sendResultCard(channel, `⏰ ${name}${suffix}`, chunks[j]!, SCHEDULED_COLOR, identityFields);
+        await this.sendResultCard(
+          channel,
+          `⏰ ${name}${suffix}`,
+          chunks[j]!,
+          SCHEDULED_COLOR,
+          identityFields,
+          j === chunks.length - 1 ? deliveryAttemptId : undefined
+        );
       }
     } else {
       await this.sendResultCard(channel, `⏰ ${name}`, `✅ Done — full output attached (${body.length} chars).`, SCHEDULED_COLOR, identityFields);
-      await this.sendResultFile(channel, name, body);
+      await this.sendResultFile(channel, name, body, "scheduled", deliveryAttemptId);
     }
   }
 
@@ -11569,14 +11744,25 @@ export class Orchestrator {
     body: string,
     fileName: string,
     filePrefix: string,
-    overflowNote: string
+    overflowNote: string,
+    deliveryAttemptId?: string
   ): Promise<void> {
     const chunks = this.chunkString(body, 1900);
     if (chunks.length <= 8) {
-      for (const c of chunks) await this.adapter.sendMessage(channel, c);
+      for (let index = 0; index < chunks.length; index += 1) {
+        const text = chunks[index]!;
+        if (index === chunks.length - 1 && deliveryAttemptId) {
+          await this.sendTerminalAttemptDelivery(deliveryAttemptId, channel, {
+            kind: "message",
+            text,
+          });
+        } else {
+          await this.adapter.sendMessage(channel, text);
+        }
+      }
     } else {
       await this.adapter.sendMessage(channel, overflowNote);
-      await this.sendResultFile(channel, fileName, body, filePrefix);
+      await this.sendResultFile(channel, fileName, body, filePrefix, deliveryAttemptId);
     }
   }
 
@@ -11661,10 +11847,16 @@ export class Orchestrator {
     title: string,
     description: string,
     color: number,
-    fields: StructuredPanel["fields"] = []
+    fields: StructuredPanel["fields"] = [],
+    deliveryAttemptId?: string
   ): Promise<void> {
     const p: StructuredPanel = { color, title, description, fields };
-    if (this.adapter.sendPanel) await this.adapter.sendPanel(channel, p);
+    if (deliveryAttemptId) {
+      await this.sendTerminalAttemptDelivery(deliveryAttemptId, channel, {
+        kind: "panel",
+        panel: p,
+      });
+    } else if (this.adapter.sendPanel) await this.adapter.sendPanel(channel, p);
     else {
       const rows = fields.map((f) => `${f.name}: ${f.value}`).join("\n");
       await this.adapter.sendMessage(
@@ -11678,13 +11870,33 @@ export class Orchestrator {
     channel: ChannelRef,
     name: string,
     body: string,
-    prefix = "scheduled"
+    prefix = "scheduled",
+    deliveryAttemptId?: string
   ): Promise<void> {
     const filename = `${prefix}-${name.replace(/[^\w.-]+/g, "_") || "output"}.md`;
     if (this.adapter.sendFile) {
-      await this.adapter.sendFile(channel, { data: Buffer.from(body, "utf8"), filename, mimeType: "text/markdown" });
+      const data = Buffer.from(body, "utf8");
+      if (deliveryAttemptId) {
+        await this.sendTerminalAttemptDelivery(deliveryAttemptId, channel, {
+          kind: "file",
+          file: { dataBase64: data.toString("base64"), filename, mimeType: "text/markdown" },
+        });
+      } else {
+        await this.adapter.sendFile(channel, { data, filename, mimeType: "text/markdown" });
+      }
     } else {
-      for (const c of this.chunkString(body, 1900)) await this.adapter.sendMessage(channel, c);
+      const chunks = this.chunkString(body, 1900);
+      for (let index = 0; index < chunks.length; index += 1) {
+        const text = chunks[index]!;
+        if (index === chunks.length - 1 && deliveryAttemptId) {
+          await this.sendTerminalAttemptDelivery(deliveryAttemptId, channel, {
+            kind: "message",
+            text,
+          });
+        } else {
+          await this.adapter.sendMessage(channel, text);
+        }
+      }
     }
   }
 
@@ -14241,8 +14453,127 @@ export class Orchestrator {
     await Promise.all(liveJobs);
   }
 
-  /** Deliver the captured winner, never re-enter a provider. Discord has no
-   * transactional ack with SQLite: the send/ack crash gap is at-least-once. */
+  private async sendDeliveryPayload(
+    channel: ChannelRef,
+    payload: DurableDeliveryPayload,
+    nonce: string
+  ): Promise<MessageRef> {
+    const delivery = { nonce, enforceNonce: true as const };
+    if (payload.kind === "message") {
+      return this.adapter.sendMessage(channel, payload.text, delivery);
+    }
+    if (payload.kind === "panel") {
+      if (this.adapter.sendPanel) return this.adapter.sendPanel(channel, payload.panel, delivery);
+      return this.adapter.sendMessage(channel, serializePanelText(payload.panel), delivery);
+    }
+    if (!this.adapter.sendFile) throw new Error("platform cannot replay the recorded delivery file");
+    return this.adapter.sendFile(
+      channel,
+      {
+        data: Buffer.from(payload.file.dataBase64, "base64"),
+        filename: payload.file.filename,
+        mimeType: payload.file.mimeType,
+        ...(payload.file.caption ? { caption: payload.file.caption } : {}),
+      },
+      delivery
+    );
+  }
+
+  /** Persist-before-send terminal delivery used by normal and recovery paths. */
+  private async sendTerminalAttemptDelivery(
+    attemptId: string,
+    channel: ChannelRef,
+    payload: DurableDeliveryPayload
+  ): Promise<MessageRef> {
+    const receipt = this.store.turnAttempts.prepareDelivery(attemptId, channel.id, payload);
+    return this.sendDeliveryPayload(channel, payload, receipt.nonce);
+  }
+
+  private async recoverRecordedDelivery(
+    attempt: TurnAttempt,
+    channel: ChannelRef
+  ): Promise<"delivered" | "abandoned" | "uncertain" | "deferred"> {
+    // Protects bounded uncertainty from being re-queried on every boot;
+    // deleting this check recreates noisy retries without creating proof.
+    if (attempt.deliveryUncertainReason) return "uncertain";
+    // Protects against replaying pre-nonce output that may already be visible;
+    // deleting this check converts legacy uncertainty into duplicate messages.
+    if (
+      !attempt.deliveryNonce ||
+      !attempt.deliveryPayload ||
+      !attempt.deliveryChannel ||
+      !attempt.deliveryStartedUtc
+    ) {
+      this.store.turnAttempts.abandonDelivery(
+        attempt.id,
+        "completed output predates nonce-backed delivery receipts; safe replay is impossible"
+      );
+      return "abandoned";
+    }
+    // Protects against sending a receipt into a replacement/different thread;
+    // deleting this check lets stale state redirect captured output.
+    if (attempt.deliveryChannel !== channel.id) {
+      this.store.turnAttempts.abandonDelivery(
+        attempt.id,
+        "recorded delivery channel does not match the originating conversation"
+      );
+      return "abandoned";
+    }
+    const sinceMs = Date.parse(attempt.deliveryStartedUtc) - 5 * 60_000;
+    // Protects against treating corrupt receipt time as a complete history scan;
+    // deleting this check can turn an indeterminate lookup into unsafe replay.
+    if (!Number.isFinite(sinceMs)) {
+      this.store.turnAttempts.abandonDelivery(attempt.id, "recorded delivery timestamp is invalid");
+      return "abandoned";
+    }
+    // The production Discord adapter implements this evidence lookup. A test or
+    // future adapter without it must fail closed instead of claiming dedup.
+    if (!this.adapter.findMessageByNonce) {
+      this.store.turnAttempts.abandonDelivery(
+        attempt.id,
+        "platform cannot query nonce-backed delivery evidence"
+      );
+      return "abandoned";
+    }
+
+    let observed;
+    try {
+      observed = await this.adapter.findMessageByNonce(
+        channel,
+        attempt.deliveryNonce,
+        sinceMs
+      );
+    } catch (err) {
+      this.logger.warn({ err, id: attempt.id }, "Discord nonce lookup deferred");
+      return "deferred";
+    }
+    if (observed.status === "found") {
+      this.store.turnAttempts.markDeliveryDone(attempt.id);
+      return "delivered";
+    }
+    if (observed.status === "indeterminate") {
+      // Protects incomplete history scans from becoming destructive proof;
+      // deleting this distinction lets automatic abandonment authorize pruning.
+      this.store.turnAttempts.markDeliveryUncertain(attempt.id, observed.reason);
+      return "uncertain";
+    }
+    try {
+      // The same enforced nonce closes the lookup/send race at Discord: if a
+      // concurrent create won, Discord returns it rather than creating another.
+      await this.sendDeliveryPayload(
+        channel,
+        attempt.deliveryPayload,
+        attempt.deliveryNonce
+      );
+      this.store.turnAttempts.markDeliveryDone(attempt.id);
+      return "delivered";
+    } catch (err) {
+      this.logger.warn({ err, id: attempt.id }, "nonce-backed delivery replay deferred");
+      return "deferred";
+    }
+  }
+
+  /** Deliver the captured winner, never re-enter a provider. */
   private async recoverInboundOutput(): Promise<void> {
     for (const a of this.store.turnAttempts?.list("cancelled") ?? []) {
       if (a.source !== "inbound") continue;
@@ -14257,19 +14588,21 @@ export class Orchestrator {
       const channel = this.inboundMessage(row).channel;
       if (await this.checkResumePreconditions(channel) !== "ok") continue;
       try {
-        const output = a.outcome.output || (a.outcome.status === "failed"
-          ? "The turn failed before its response was delivered."
-          : "_Agent completed with no text response._");
-        // Literal text only. Never re-execute embedded action/attachment fences.
-        if (output.length > 1800) {
-          if (!this.adapter.sendFile) continue;
-          await this.adapter.sendFile(channel, { data: Buffer.from(output),
-            filename: "recovered-response.md", mimeType: "text/markdown" });
-        } else await this.adapter.sendMessage(channel, output);
-        this.store.turnAttempts.markDeliveryDone(a.id);
+        const resolution = await this.recoverRecordedDelivery(a, channel);
+        if (resolution === "deferred") continue;
         this.store.settleInboundExecution(row.messageId);
-        await finishLiveTurn(this.config.DATA_DIR, { id: a.id, status: "completed",
-          channelRef: channel.id, finishedUtc: new Date().toISOString() });
+        const recovered = this.store.turnAttempts.get(a.id);
+        await finishLiveTurn(this.config.DATA_DIR, {
+          id: a.id,
+          status: resolution === "delivered"
+            ? "completed"
+            : resolution === "uncertain" ? "failed" : "abandoned",
+          channelRef: channel.id,
+          finishedUtc: new Date().toISOString(),
+          ...(resolution !== "delivered"
+            ? { reason: recovered?.deliveryAbandonedReason ?? recovered?.deliveryUncertainReason ?? "delivery unresolved" }
+            : {}),
+        });
       } catch (err) {
         this.logger.warn({ id: a.id, err }, "captured inbound output delivery deferred");
       }
@@ -14290,10 +14623,27 @@ export class Orchestrator {
         status: e.status === "abandoned" ? "abandoned" : "interrupted",
         startedUtc: e.updatedUtc || e.createdUtc,
         acpSessionId: e.acpSessionId,
+        reason: e.terminalReason,
         // Resume re-enqueues into the ledger's own target, which `channelRef`
         // conflates with sourceRef — carry it verbatim so the Resume button is
         // only offered when the resume can actually run (#159).
         targetRef: e.targetRef,
+      });
+    }
+    for (const attempt of this.store.turnAttempts.list("completed")) {
+      const deliveryReason = attempt.deliveryAbandonedReason ?? attempt.deliveryUncertainReason;
+      if (!deliveryReason || seen.has(attempt.id)) continue;
+      seen.add(attempt.id);
+      rows.push({
+        id: attempt.id,
+        source: attempt.source === "dispatch" ? "dispatch" : "live",
+        channelRef: attempt.deliveryChannel ?? attempt.spec.target,
+        correlationId: attempt.spec.correlationId ?? null,
+        status: attempt.deliveryUncertainReason ? "interrupted" : "abandoned",
+        startedUtc: attempt.updatedUtc,
+        acpSessionId: attempt.acpSessionId,
+        targetRef: attempt.spec.target,
+        reason: deliveryReason,
       });
     }
     const live = await listLiveMarkers(this.config.DATA_DIR).catch(() => [] as LiveTurnMarker[]);
@@ -14323,6 +14673,7 @@ export class Orchestrator {
         status: "abandoned",
         startedUtc: r.finishedUtc,
         acpSessionId: null,
+        reason: r.reason ?? null,
         targetRef: r.channelRef,
       });
     }

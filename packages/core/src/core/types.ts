@@ -382,8 +382,21 @@ export interface LedgerEntry {
    */
   acpSessionId: string | null;
   status: DelegationStatus;
+  /** Durable operator-facing explanation for an explicit terminal refusal. */
+  terminalReason: string | null;
   createdUtc: string;
   updatedUtc: string;
+}
+
+/**
+ * Immutable human authorization to expire a done artifact whose onward
+ * delivery cannot be proven. This is retention policy, never delivery proof.
+ */
+export interface DoneArtifactExpirationAuthorization {
+  dispatchId: string;
+  operatorId: string;
+  reason: string;
+  authorizedUtc: string;
 }
 
 /**
@@ -403,6 +416,7 @@ export interface LedgerEntryInput {
   acpSessionId?: string | null;
   /** Defaults to "dispatched". */
   status?: DelegationStatus;
+  terminalReason?: string | null;
   /** Defaults to now (ISO 8601). */
   createdUtc?: string;
   /** Defaults to `createdUtc`. */
@@ -422,6 +436,7 @@ export type LedgerPatch = Partial<
     | "promptPreview"
     | "correlationId"
     | "acpSessionId"
+    | "terminalReason"
   >
 >;
 

@@ -473,6 +473,14 @@ export interface ConfigAuditInput {
   appliedUtc?: string;
 }
 
+/** Runtime-only routing rule persisted as the latest audited mutation for an
+ * agent. A missing rule deliberately means unrestricted, preserving all
+ * existing routing behaviour. */
+export interface AgentChannelRestriction {
+  agentId: string;
+  allowedChannelIds: string[];
+}
+
 // --- durable multi-hop chains (#25) ----------------------------------------
 
 /** Lifecycle of a chain. Terminal states: completed | failed. */

@@ -427,6 +427,36 @@ export class SessionRouter {
     return profile;
   }
 
+  /** #308: resolves only after enforcing the runtime channel allowlist; deleting
+   * this check lets any caller resolve a barred agent outside its audit rule. */
+  resolveProfileForChannel(
+    agentId: string,
+    channelId: string | null | undefined,
+    location = "local"
+  ): AgentProfile | undefined {
+    this.assertAgentAllowedForChannel(agentId, channelId);
+    return this.getProfile(agentId, location);
+  }
+
+  /** #308: protects every agent resolution from a prohibited channel; deleting
+   * it lets a restricted agent run outside its audited allowlist. */
+  assertAgentAllowedForChannel(agentId: string, channelId: string | null | undefined): void {
+    const rule = this.store.getAgentChannelRestriction(agentId);
+    if (!rule) return;
+    const actual = channelId?.trim() || "(no channel)";
+    if (rule.allowedChannelIds.includes(actual)) return;
+    throw new Error(
+      `Refused: agent "${agentId}" cannot run in channel "${actual}". ` +
+        `Rule: "${agentId}" is allowed only in channel(s): ${rule.allowedChannelIds.join(", ")}.`
+    );
+  }
+
+  /** Record-bound variant so thread turns consistently use their parent
+   * channel (or the channel itself when not threaded). */
+  assertAgentAllowedForRecord(record: SessionRecord, agentId: string): void {
+    this.assertAgentAllowedForChannel(agentId, record.parentRef ?? record.channelRef);
+  }
+
   /** Parked-select copy when ollama-cloud is disabled, else null. */
   parkedSelectMessage(agentId: string): string | null {
     return parkedAgentMessage(agentId, this.ollamaCloudEnabled, "select");
@@ -748,6 +778,9 @@ export class SessionRouter {
     if (recovery && record.acpSessionId && record.acpSessionId !== recovery.resumeSessionId) {
       throw new Error("Strict resume refused: thread now belongs to a different ACP session");
     }
+    // #308: plan before the warm-cache return so a rule added at runtime blocks
+    // the next turn; deleting this lets cached restricted agents bypass policy.
+    this.planRuntimeSpawn(record);
     const retiring = this.retirements.get(record.id);
     if (retiring) {
       await retiring;
@@ -1010,7 +1043,9 @@ export class SessionRouter {
     );
 
     const agentId = preset.agent?.value ?? record.agentId;
-    const profile = this.getProfile(agentId, location);
+    // #308: protects normal live turns, queued prompts, wakes, and interrupt
+    // redirects; deleting it lets those shared runtime paths bypass the rule.
+    const profile = this.resolveProfileForChannel(agentId, record.parentRef ?? record.channelRef, location);
     if (!profile) {
       // #220 / #12: a parked or retired agent gets a message that names the
       // state and the fix. We deliberately do NOT substitute the default

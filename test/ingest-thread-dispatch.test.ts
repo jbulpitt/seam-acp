@@ -135,16 +135,19 @@ function makeOrch(
     profile?: { id: string; defaultModel: string };
     catalogProfile?: { id: string; defaultModel: string };
     profileLocation?: string;
+    restrictionError?: string;
   } = {}
 ): {
   orch: Orchestrator;
   ensured: string[];
   runtimeFor: string[];
   profileLookups: Array<{ id: string; location?: string }>;
+  restrictionChecks: Array<{ id: string; channelId?: string; location?: string }>;
 } {
   const ensured: string[] = [];
   const runtimeFor: string[] = [];
   const profileLookups: Array<{ id: string; location?: string }> = [];
+  const restrictionChecks: Array<{ id: string; channelId?: string; location?: string }> = [];
   const rt = fakeRuntime(opts.answer ?? "answered in-thread", opts.mode ?? "ok");
   const router = {
     listProfiles: () => (opts.profile ? [opts.profile] : []),
@@ -160,6 +163,11 @@ function makeOrch(
       return opts.profile?.id === id && (!opts.profileLocation || opts.profileLocation === location)
         ? opts.profile
         : undefined;
+    },
+    resolveProfileForChannel: (id: string, channelId?: string, location?: string) => {
+      restrictionChecks.push({ id, channelId, location });
+      if (opts.restrictionError) throw new Error(opts.restrictionError);
+      return router.getProfile(id, location);
     },
     getOrStartRuntime: async (rec: SessionRecord | string) => {
       runtimeFor.push(typeof rec === "string" ? rec : rec.id);
@@ -198,7 +206,7 @@ function makeOrch(
           : []
     ),
   });
-  return { orch, ensured, runtimeFor, profileLookups };
+  return { orch, ensured, runtimeFor, profileLookups, restrictionChecks };
 }
 
 let dataDir: string;
@@ -461,6 +469,26 @@ describe("#224 turnEnded releases channel/session aliases on every path", () => 
 });
 
 describe("#224 isolated ingest routing", () => {
+  it("refuses an isolated HTTP ingest before it reaches synthetic injection (#308)", async () => {
+    const row = endpoint({ thread: null, agentId: "claude" });
+    store.insertIngestEndpoint(row);
+    const spec = planEndpointDispatch({ endpoint: row, payload: "untrusted POST" });
+    const refusal =
+      'Refused: agent "claude" cannot run in channel "chan-1". Rule: "claude" is allowed only in channel(s): allowed.';
+    const { orch, restrictionChecks, profileLookups } = makeOrch(dataDir, store, {
+      profile: { id: "claude", defaultModel: "default" },
+      restrictionError: refusal,
+    });
+    const inject = (orch as any).injectTurn = vi.fn();
+
+    await expect(orch.dispatchInjectTurn(spec)).rejects.toThrow(refusal);
+    expect(restrictionChecks).toEqual([{ id: "claude", channelId: "chan-1", location: "local" }]);
+    expect(profileLookups).toEqual([]);
+    expect(inject).not.toHaveBeenCalled();
+    // Deleting the HTTP resolver lets this exact public ingest path start a
+    // synthetic turn, bypassing the endpoint's authoring-channel rule.
+  });
+
   it("an isolated ingest spec still takes the synthetic path (no regression)", async () => {
     const spec: DispatchSpec = planEndpointDispatch({
       endpoint: endpoint({ thread: null, agentId: "claude" }),

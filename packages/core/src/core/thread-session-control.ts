@@ -148,6 +148,7 @@ export interface ThreadSessionControlDeps {
   router: {
     describeConfig(record: SessionRecord): ConfigDescription;
     getProfile(agentId: string, location?: string): AgentProfile | undefined;
+    assertAgentAllowedForRecord(record: SessionRecord, agentId: string): void;
     parkedSelectMessage?(agentId: string): string | null;
     unregisteredAgentMessage?(agentId: string, fallback: string): string;
     getOrStartRuntime(record: SessionRecord): Promise<SessionControlRuntime>;
@@ -207,6 +208,13 @@ export class ThreadSessionControlService {
       return { ok: false, error: "`agent` must be a non-empty string." };
     }
     const nextAgent = requestedAgent ?? before.agent.value;
+    // #308: protects migration staging from selecting an agent barred from this
+    // channel; deleting it lets a later post-turn migration bypass the rule.
+    try {
+      this.deps.router.assertAgentAllowedForRecord(target, nextAgent);
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
     const parked = isLocalLocation(location)
       ? this.deps.router.parkedSelectMessage?.(nextAgent)
       : null;
@@ -385,6 +393,13 @@ export class ThreadSessionControlService {
       return { ok: false, error: "`agent` must be a non-empty string." };
     }
     const nextAgentId = requestedAgent ?? previousAgentId;
+    // #308: protects configure_thread before it persists a barred agent; deleting
+    // it makes reconfiguration an immediate bypass of the channel allowlist.
+    try {
+      this.deps.router.assertAgentAllowedForRecord(target, nextAgentId);
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
     const parked = isLocalLocation(location)
       ? this.deps.router.parkedSelectMessage?.(nextAgentId)
       : null;

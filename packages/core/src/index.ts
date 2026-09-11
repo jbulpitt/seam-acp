@@ -830,6 +830,9 @@ async function main(): Promise<void> {
           throw new Error("inspect_image is only available to tool-vision sessions");
         }
         if (!agyImageInspector) throw new Error("inspect_image requires configured agy-package");
+        // #308: protects the tool-vision sidecar's direct AgentRuntime start;
+        // deleting it lets agy-package run outside its channel allowlist.
+        router.assertAgentAllowedForRecord(record, "agy-package");
         return agyImageInspector({ ...req, ownerId: record.id });
       },
       // Agent-scheduled wake events (#59): arm/cancel a one-shot self-resumption

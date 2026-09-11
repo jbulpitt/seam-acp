@@ -145,6 +145,40 @@ afterEach(() => {
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
+describe("agent channel restriction mutation (#308)", () => {
+  it("uses the existing audited mutation ledger as the live set/list/clear store", () => {
+    const svc = makeService();
+    const set = svc.setAgentChannelRestriction({
+      agentId: "copilot",
+      allowedChannelIds: ["222", "111", "222"],
+      actor: { id: "user-jesse", name: "Jesse" },
+    });
+    expect(set).toMatchObject({ ok: true, rule: { agentId: "copilot", allowedChannelIds: ["222", "111"] } });
+    expect(svc.listAgentChannelRestrictions()).toEqual([
+      { agentId: "copilot", allowedChannelIds: ["222", "111"] },
+    ]);
+    const audit = store.listConfigMutations(1)[0]!;
+    expect(audit).toMatchObject({
+      tier: "agent-channel-restriction",
+      scope: "agent-channel-restriction:copilot",
+      actorId: "user-jesse",
+      actorName: "Jesse",
+    });
+    expect(JSON.parse(audit.afterJson)).toEqual({
+      restriction: { agentId: "copilot", allowedChannelIds: ["222", "111"] },
+    });
+
+    const clear = svc.clearAgentChannelRestriction({
+      agentId: "copilot",
+      actor: { id: "user-jesse", name: "Jesse" },
+    });
+    expect(clear).toMatchObject({ ok: true, cleared: true });
+    expect(svc.listAgentChannelRestrictions()).toEqual([]);
+    expect(store.listConfigMutations(1)[0]).toMatchObject({ tier: "agent-channel-restriction" });
+    expect(JSON.parse(store.listConfigMutations(1)[0]!.afterJson)).toEqual({ restriction: null });
+  });
+});
+
 // -------------------------------------------------------------------------
 // Tier A — session config: propose is side-effect free; apply mutates + audits
 // -------------------------------------------------------------------------

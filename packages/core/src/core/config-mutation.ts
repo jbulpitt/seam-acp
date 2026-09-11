@@ -46,6 +46,7 @@ import {
   parseStatusCardStyle,
   type ConfigAuditEntry,
   type ConfigAuditInput,
+  type AgentChannelRestriction,
   type PermissionPolicyMode,
   type Preset,
   type SessionConfigState,
@@ -61,7 +62,8 @@ export type ConfigMutationTier =
   | "thread-preset"
   | "schedule"
   | "bridge"
-  | "runtime-provenance";
+  | "runtime-provenance"
+  | "agent-channel-restriction";
 
 /** Tier A — the calling thread's own session config. */
 export interface SessionConfigChanges {
@@ -316,6 +318,8 @@ export interface ConfigMutationStore {
   upsertPreset(p: Preset): void;
   deletePreset(id: string): void;
   recordConfigMutation(entry: ConfigAuditInput): ConfigAuditEntry;
+  getAgentChannelRestriction(agentId: string): AgentChannelRestriction | null;
+  listAgentChannelRestrictions(): AgentChannelRestriction[];
   // Scheduled prompts (#69) — the Tier-D surface.
   getScheduled(id: string): ScheduledPrompt | null;
   listScheduledByChannel(platform: string, channelRef: string): ScheduledPrompt[];
@@ -773,6 +777,58 @@ export class ConfigMutationService {
       before: {},
       after: { agentId: opts.agentId, location: opts.location, runtime: safeRuntime },
     });
+  }
+
+  /** Set the complete allowlist for one agent. The audit row is deliberately
+   * also the live rule, so this takes effect without a restart (#308). */
+  setAgentChannelRestriction(opts: {
+    agentId: string;
+    allowedChannelIds: ReadonlyArray<string>;
+    actor: MutationActor;
+  }): { ok: true; auditId: string; rule: AgentChannelRestriction } | { ok: false; error: string } {
+    const agentId = opts.agentId.trim();
+    const allowedChannelIds = [...new Set(opts.allowedChannelIds.map((id) => id.trim()).filter(Boolean))];
+    if (!agentId) return { ok: false, error: "Agent id must be non-empty." };
+    if (allowedChannelIds.length === 0) {
+      return { ok: false, error: "Provide at least one allowed channel id." };
+    }
+    const rule: AgentChannelRestriction = { agentId, allowedChannelIds };
+    const before = this.deps.store.getAgentChannelRestriction(agentId);
+    const audit = this.writeAudit({
+      tier: "agent-channel-restriction",
+      scope: `agent-channel-restriction:${agentId}`,
+      correlationId: randomUUID(),
+      actor: opts.actor,
+      summary: `agent ${agentId} channel allowlist set (${allowedChannelIds.join(", ")})`,
+      before: { restriction: before },
+      after: { restriction: rule },
+    });
+    return { ok: true, auditId: audit.id, rule };
+  }
+
+  /** Clear one rule by appending an audited null state; history is retained. */
+  clearAgentChannelRestriction(opts: {
+    agentId: string;
+    actor: MutationActor;
+  }): { ok: true; auditId: string; cleared: boolean } | { ok: false; error: string } {
+    const agentId = opts.agentId.trim();
+    if (!agentId) return { ok: false, error: "Agent id must be non-empty." };
+    const before = this.deps.store.getAgentChannelRestriction(agentId);
+    if (!before) return { ok: true, auditId: "", cleared: false };
+    const audit = this.writeAudit({
+      tier: "agent-channel-restriction",
+      scope: `agent-channel-restriction:${agentId}`,
+      correlationId: randomUUID(),
+      actor: opts.actor,
+      summary: `agent ${agentId} channel allowlist cleared`,
+      before: { restriction: before },
+      after: { restriction: null },
+    });
+    return { ok: true, auditId: audit.id, cleared: true };
+  }
+
+  listAgentChannelRestrictions(): AgentChannelRestriction[] {
+    return this.deps.store.listAgentChannelRestrictions();
   }
 
   private readPresetsDoc():

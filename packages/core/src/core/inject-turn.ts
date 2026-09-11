@@ -74,6 +74,9 @@ export interface InjectTurnOptions {
   /** Agent profile to run. Required when `target` is `null`; otherwise
    *  resolved from the target's session record. */
   profile?: AgentProfile;
+  /** Owning Discord channel for a target-less isolated run. Required to enforce
+   * an agent/channel restriction when the turn has no SessionRecord target. */
+  restrictionChannelId?: string;
   /** Session manager used to delete the throwaway session on teardown.
    *  Defaults to `profile.sessionManager`. */
   sessionManager?: ISessionManager;

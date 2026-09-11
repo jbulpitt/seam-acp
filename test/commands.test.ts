@@ -320,9 +320,9 @@ describe("/seamadmin — operator surface (#151)", () => {
     expect(() => buildSeamAdminCommand().toJSON()).not.toThrow();
   });
 
-  it("registers exactly 11 top-level slots (3 subcommands + 8 groups)", () => {
+  it("registers exactly 12 top-level slots (3 subcommands + 9 groups)", () => {
     const json = admin();
-    expect(json.options?.length ?? 0).toBe(11);
+    expect(json.options?.length ?? 0).toBe(12);
     expect(json.options?.length ?? 0).toBeLessThanOrEqual(25);
   });
 
@@ -342,6 +342,7 @@ describe("/seamadmin — operator surface (#151)", () => {
       "debug",
       "voice",
       "catalog",
+      "restrictions",
       "naming",
     ]);
   });
@@ -356,6 +357,18 @@ describe("/seamadmin — operator surface (#151)", () => {
     expect(refresh?.options?.[0]).toMatchObject({ required: true, autocomplete: true });
     expect(refresh?.options?.[1]).toMatchObject({ required: false });
     expect(refresh?.options?.[2]).toMatchObject({ required: false });
+  });
+
+  it("registers immediate set/list/clear agent channel restrictions", () => {
+    const restrictions = slot(admin(), "restrictions");
+    expect(restrictions?.type).toBe(SUB_COMMAND_GROUP);
+    expect(leafNames(admin(), "restrictions")).toEqual(["set", "list", "clear"]);
+    const set = restrictions?.options?.find((o) => o.name === "set");
+    expect(set?.options?.map((o) => o.name)).toEqual(["agent", "channels"]);
+    expect(set?.options?.every((o) => o.required)).toBe(true);
+    const clear = restrictions?.options?.find((o) => o.name === "clear");
+    expect(clear?.options?.map((o) => o.name)).toEqual(["agent"]);
+    expect(clear?.options?.[0]?.required).toBe(true);
   });
 
   it("declares the exact ManageGuild permission and Guild-only context", () => {

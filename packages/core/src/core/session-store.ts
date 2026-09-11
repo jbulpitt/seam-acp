@@ -25,6 +25,7 @@ import {
   type LedgerPatch,
   type ConfigAuditEntry,
   type ConfigAuditInput,
+  type AgentChannelRestriction,
   type SessionConfigState,
   type SessionRecord,
 } from "./types.js";
@@ -1980,6 +1981,39 @@ export class SessionStore {
       )
       .all(limit)
       .map(mapConfigAudit);
+  }
+
+  /** The latest audited rule is the runtime source of truth; no second
+   * configuration store exists for agent/channel restrictions (#308). */
+  getAgentChannelRestriction(agentId: string): AgentChannelRestriction | null {
+    const row = this.db
+      .prepare<[string, string], ConfigAuditRow>(
+        `SELECT * FROM config_audit
+         WHERE tier = ? AND scope = ?
+         ORDER BY applied_utc DESC, rowid DESC LIMIT 1`
+      )
+      .get("agent-channel-restriction", `agent-channel-restriction:${agentId}`);
+    return row ? parseAgentChannelRestriction(row.after_json) : null;
+  }
+
+  /** Current rules only: cleared rules remain in the immutable audit history. */
+  listAgentChannelRestrictions(): AgentChannelRestriction[] {
+    return this.db
+      .prepare<[string], ConfigAuditRow>(
+        `SELECT current.* FROM config_audit AS current
+         WHERE current.tier = ?
+           AND NOT EXISTS (
+             SELECT 1 FROM config_audit AS newer
+             WHERE newer.tier = current.tier
+               AND newer.scope = current.scope
+               AND (newer.applied_utc > current.applied_utc
+                 OR (newer.applied_utc = current.applied_utc AND newer.rowid > current.rowid))
+           )
+         ORDER BY current.scope ASC`
+      )
+      .all("agent-channel-restriction")
+      .map((row) => parseAgentChannelRestriction(row.after_json))
+      .filter((rule): rule is AgentChannelRestriction => rule !== null);
   }
 
   /**
@@ -6166,6 +6200,27 @@ const mapConfigAudit = (r: ConfigAuditRow): ConfigAuditEntry => ({
   correlationId: r.correlation_id,
   appliedUtc: r.applied_utc,
 });
+
+function parseAgentChannelRestriction(raw: string): AgentChannelRestriction | null {
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") return null;
+    const value = (parsed as { restriction?: unknown }).restriction;
+    if (!value || typeof value !== "object") return null;
+    const rule = value as { agentId?: unknown; allowedChannelIds?: unknown };
+    if (
+      typeof rule.agentId !== "string" ||
+      !Array.isArray(rule.allowedChannelIds) ||
+      rule.allowedChannelIds.length === 0 ||
+      !rule.allowedChannelIds.every((id): id is string => typeof id === "string" && id.length > 0)
+    ) {
+      return null;
+    }
+    return { agentId: rule.agentId, allowedChannelIds: [...rule.allowedChannelIds] };
+  } catch {
+    return null;
+  }
+}
 
 // --- chains schema + row mapping (#25) --------------------------------------
 

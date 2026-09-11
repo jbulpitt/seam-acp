@@ -47,8 +47,8 @@ async function writePm2(overrides: Record<string, unknown> = {}) {
   await fs.writeFile(path.join(fixture,"pm2.json"), JSON.stringify(config));
 }
 
-function baseArgs(overrides: Partial<{ bridgeId:string; app:string; uid:string; checkout:string; entrypoint:string; pidFile:string }> = {}) {
-  return [overrides.bridgeId ?? "fixture", overrides.app ?? "fixture-app", "grok", overrides.uid ?? String(process.getuid!()), overrides.checkout ?? checkout, overrides.entrypoint ?? entrypoint, overrides.pidFile ?? pidFile, process.execPath, pm2Module, "-", "no", releaseRoot];
+function baseArgs(overrides: Partial<{ bridgeId:string; app:string; uid:string; checkout:string; entrypoint:string; pidFile:string; releaseRoot:string }> = {}) {
+  return [overrides.bridgeId ?? "fixture", overrides.app ?? "fixture-app", "grok", overrides.uid ?? String(process.getuid!()), overrides.checkout ?? checkout, overrides.entrypoint ?? entrypoint, overrides.pidFile ?? pidFile, process.execPath, pm2Module, "-", "no", overrides.releaseRoot ?? releaseRoot];
 }
 
 async function runRemote(action: string[], overrides = {}) {
@@ -122,6 +122,7 @@ describe.sequential("production remote shell deployment identity defenses (#241)
     expect(preflight.stdout).toContain("protocol_version=1"); expect(preflight.stdout).toContain("drain_SIGUSR2=yes");
     expect(preflight.stdout).toContain("describeModelCatalog=yes"); expect(preflight.stdout).toContain("fetchModelCatalog=yes");
     expect(preflight.stdout).toMatch(/node_version=v(?:2[2-9]|[3-9]\d)\./); expect(preflight.stdout).toMatch(/npm_version=\d+\.\d+\.\d+/); expect(preflight.stdout).toMatch(/disk_bytes_available=\d+/);
+    expect(preflight.stdout).toContain("native_dependency=better-sqlite3@11.10.0"); expect(preflight.stdout).toContain("native_install_strategy=locked-prebuild"); expect(preflight.stdout).toContain("native_install_ready=yes");
     await expect(runRemote(["preflight"],{app:"wrong-app"})).rejects.toThrow(/pm2_app_pid_mismatch/);
     await expect(runRemote(["preflight"],{uid:String(process.getuid!()+1)})).rejects.toThrow(/wrong_owner/);
     const otherPid = path.join(fixture,"other.pid"); await fs.writeFile(otherPid,String(process.pid)); await expect(runRemote(["preflight"],{pidFile:otherPid})).rejects.toThrow(/process_cwd_mismatch/);
@@ -133,5 +134,27 @@ describe.sequential("production remote shell deployment identity defenses (#241)
     const commandBus=path.join(checkout,"packages/adapters/dist/command-bus.js"); await fs.writeFile(commandBus,'export const PROTOCOL_VERSION = 1;\nconst methods = ["describeModelCatalog"];\n');
     const result=await runRemote(["preflight"]); expect(result.stdout).toContain("fetchModelCatalog=no"); expect(result.stdout).toContain("rollout_ready=no");
     await fs.writeFile(commandBus,'export const PROTOCOL_VERSION = 1;\nconst methods = ["describeModelCatalog", "fetchModelCatalog"];\n');
+  });
+
+  it("reports a missing rollout parent read-only, then bootstraps exactly one owned 0700 component", async () => {
+    const home = path.join(fixture, "fresh-home"); const freshRoot = path.join(home, ".seam", "bridge-rollouts");
+    await fs.mkdir(home, { mode: 0o700 });
+    const before = await runRemote(["preflight"], { releaseRoot: freshRoot });
+    expect(before.stdout).toContain("release_parent=bootstrap-required");
+    await expect(fs.stat(path.join(home, ".seam"))).rejects.toThrow();
+    await runRemote(["prepare-upload", H("d")], { releaseRoot: freshRoot });
+    const parent = await fs.lstat(path.join(home, ".seam"));
+    expect(parent.isDirectory()).toBe(true); expect(parent.isSymbolicLink()).toBe(false);
+    expect(parent.mode & 0o777).toBe(0o700); expect(parent.uid).toBe(process.getuid!());
+  });
+
+  it("refuses rollout-parent aliases and more than one missing bootstrap component", async () => {
+    const home = path.join(fixture, "bootstrap-guards"); const realParent = path.join(home, "real-parent");
+    await fs.mkdir(realParent, { recursive: true, mode: 0o700 });
+    await fs.symlink(realParent, path.join(home, ".seam"));
+    await expect(runRemote(["preflight"], { releaseRoot: path.join(home, ".seam", "bridge-rollouts") })).rejects.toThrow(/release_parent_symlink/);
+    const nestedRoot = path.join(home, "missing-anchor", ".seam", "bridge-rollouts");
+    await expect(runRemote(["preflight"], { releaseRoot: nestedRoot })).rejects.toThrow(/release_parent_anchor_missing/);
+    await expect(fs.stat(path.join(home, "missing-anchor"))).rejects.toThrow();
   });
 });

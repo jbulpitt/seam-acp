@@ -18,6 +18,16 @@ const MAX_EXPANDED = 128 * 1024 * 1024;
 const MAX_MEMBER = 16 * 1024 * 1024;
 const MAX_MEMBERS = 2_000;
 const LOCK_STALE_MS = 15 * 60 * 1_000;
+// This is an explicit release input, not a guess made by npm on the host.
+// v11.10.0 publishes these Node-ABI prebuilds for both Darwin architectures
+// used by the managed bridge fleet. Linux entries keep the shipped harness and
+// future Linux bridge targets honest; unsupported tuples refuse in PREFLIGHT.
+const NATIVE_DEPENDENCY = "better-sqlite3@11.10.0";
+const NATIVE_PREBUILD_ABIS = new Set(["108", "115", "127", "131"]);
+const NATIVE_PREBUILD_TARGETS = new Set([
+  "darwin-arm64", "darwin-x64",
+  "linux-arm", "linux-arm64", "linux-x64",
+]);
 
 function fail(code) { const error = new Error(code); error.code = code; throw error; }
 function exactPath(value, code) { if (!SAFE_PATH.test(value ?? "") || path.posix.normalize(value) !== value || value.includes("//") || value.endsWith("/")) fail(code); return value; }
@@ -58,8 +68,22 @@ async function runBounded(file, args, options = {}) {
     const onStderr = (chunk) => { errSize += chunk.length; if (errSize > stderrLimit) stop("subprocess_stderr_limit"); else stderr.push(chunk); };
     const onError = () => { reason ??= "subprocess_spawn_failed"; };
     child.stdout.on("data",onStdout); child.stderr.on("data",onStderr); child.on("error",onError);
-    child.on("close", (code) => { clearTimeout(timer); child.stdout.off("data",onStdout); child.stderr.off("data",onStderr); child.off("error",onError); if (reason) reject(new Error(reason)); else if (code !== 0) reject(new Error("subprocess_failed")); else resolve({ stdout: Buffer.concat(stdout).toString("utf8"), stderr: Buffer.concat(stderr).toString("utf8") }); });
+    child.on("close", (code) => {
+      clearTimeout(timer); child.stdout.off("data",onStdout); child.stderr.off("data",onStderr); child.off("error",onError);
+      const stdoutText = Buffer.concat(stdout).toString("utf8"); const stderrText = Buffer.concat(stderr).toString("utf8");
+      if (reason) reject(new Error(reason));
+      else if (code !== 0 && stderrText.includes("seam_native_prebuild_unavailable")) reject(new Error("native_prebuild_unavailable"));
+      else if (code !== 0) reject(new Error("subprocess_failed"));
+      else resolve({ stdout: stdoutText, stderr: stderrText });
+    });
   });
+}
+
+function nativeInstallPlan() {
+  const abi = process.versions.modules ?? "unknown";
+  const target = `${process.platform}-${process.arch}`;
+  const prebuild = `${NATIVE_DEPENDENCY}-node-v${abi}-${target}`;
+  return { abi, target, prebuild, ready: NATIVE_PREBUILD_ABIS.has(abi) && NATIVE_PREBUILD_TARGETS.has(target) };
 }
 
 async function pm2Describe() {
@@ -267,6 +291,7 @@ function validateManifest(members, sourceSha) {
   const lock = parseJson(byName.get("package-lock.json").bytes, "lockfile_invalid");
   if (rootPackage.name !== "seam-acp" || adaptersPackage.name !== "@seam/adapters" || bridgePackage.name !== "@seam/bridge" || corePackage.name !== "@seam/core") fail("package_identity_mismatch");
   if (lock.name !== "seam-acp" || !lock.packages?.[""] || lock.packages["packages/adapters"]?.name !== "@seam/adapters" || lock.packages["packages/bridge"]?.name !== "@seam/bridge" || lock.packages["packages/core"]?.name !== "@seam/core") fail("lockfile_identity_mismatch");
+  if (adaptersPackage.dependencies?.["better-sqlite3"] !== "^11.7.0" || lock.packages["node_modules/better-sqlite3"]?.version !== "11.10.0" || lock.packages["node_modules/prebuild-install"]?.version !== "7.1.3") fail("native_dependency_contract_mismatch");
   return manifest;
 }
 
@@ -406,9 +431,40 @@ async function requireManagedDirectory(directory) {
   const stat = await fsp.lstat(directory); if (!stat.isDirectory() || stat.isSymbolicLink()) fail("managed_directory_wrong_type"); assertUid(stat, expectedUid, "managed_directory_wrong_owner");
 }
 
+async function releaseParentState() {
+  const parent = path.dirname(releaseRoot);
+  try {
+    const parentReal = await fsp.realpath(parent);
+    if (parentReal !== parent) fail("release_parent_symlink");
+    const stat = await fsp.lstat(parent);
+    if (!stat.isDirectory() || stat.isSymbolicLink()) fail("release_parent_wrong_type");
+    assertUid(stat, expectedUid, "release_parent_wrong_owner");
+    return "ready";
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  // Bootstrap exactly one missing component. Its existing anchor must already
+  // be canonical, owned by the configured uid, and a real directory.
+  const anchor = path.dirname(parent);
+  const anchorReal = await fsp.realpath(anchor).catch(() => fail("release_parent_anchor_missing"));
+  if (anchorReal !== anchor) fail("release_parent_anchor_symlink");
+  const anchorStat = await fsp.lstat(anchor);
+  if (!anchorStat.isDirectory() || anchorStat.isSymbolicLink()) fail("release_parent_anchor_wrong_type");
+  assertUid(anchorStat, expectedUid, "release_parent_anchor_wrong_owner");
+  return "bootstrap-required";
+}
+
 async function prepareManagedRoot() {
-  const parent = path.dirname(releaseRoot); const parentReal = await fsp.realpath(parent).catch(() => fail("release_parent_missing"));
-  if (parentReal !== parent) fail("release_parent_symlink"); assertUid(await fsp.lstat(parent), expectedUid, "release_parent_wrong_owner");
+  const parent = path.dirname(releaseRoot);
+  if (await releaseParentState() === "bootstrap-required") {
+    await fsp.mkdir(parent, { mode: 0o700 }).catch((error) => { if (error?.code !== "EEXIST") throw error; });
+    const parentReal = await fsp.realpath(parent).catch(() => fail("release_parent_bootstrap_failed"));
+    if (parentReal !== parent) fail("release_parent_symlink");
+    const parentStat = await fsp.lstat(parent);
+    if (!parentStat.isDirectory() || parentStat.isSymbolicLink()) fail("release_parent_wrong_type");
+    assertUid(parentStat, expectedUid, "release_parent_wrong_owner");
+    await fsp.chmod(parent, 0o700);
+  }
   await fsp.mkdir(releaseRoot, { mode: 0o700 }).catch((error) => { if (error?.code !== "EEXIST") throw error; });
   await requireManagedDirectory(releaseRoot); await fsp.chmod(releaseRoot,0o700);
   for (const part of ["incoming","releases","activations","rollbacks","baselines","locks","stale-locks","failed-staging"]) {
@@ -973,6 +1029,8 @@ async function preflight() {
   if (!/^\d+\.\d+\.\d+/.test(npmVersion)) fail("configured_npm_version_invalid");
   const disk = await fsp.statfs(checkoutPath).catch(()=>fail("release_disk_unavailable")); const diskBytesAvailable = BigInt(disk.bavail) * BigInt(disk.bsize);
   if (diskBytesAvailable <= 0n) fail("release_disk_unavailable");
+  const nativeInstall = nativeInstallPlan();
+  const parentState = await releaseParentState();
   console.log("reachable=yes"); console.log(`bridge_id=${bridgeId}`); console.log(`pm2_app=${pm2App}`); console.log(`pid=${identity.pid}`);
   console.log(`cwd=${identity.cwd}`); console.log(`entrypoint=${entrypointPath}`); console.log(`entrypoint_target=${identity.entryReal}`);
   console.log(`expected_uid=${expectedUid}`); console.log(`release_root=${releaseRoot}`); console.log(`platform=${process.platform}-${process.arch}`);
@@ -980,6 +1038,8 @@ async function preflight() {
   console.log(`artifact_mode=${artifactMode}`); console.log(`artifact_identity=${artifactIdentity}`); console.log(`artifact_source_sha=${artifactSourceSha}`); console.log(`checkout_source_sha=${checkoutSourceSha}`); console.log(`artifact_checksum=${artifactChecksum}`); console.log(`entrypoint_sha256=${entrypointSha256}`);
   console.log(`bridge_version=${bridgePackage.version}`); console.log(`protocol_version=${protocolVersion}`); console.log(`drain_SIGUSR2=${drainSupport}`); console.log(`describeModelCatalog=${describeSupport}`); console.log(`fetchModelCatalog=${fetchSupport}`); console.log(`rollout_ready=${rolloutReady}`);
   console.log(`node_path=${nodePath}`); console.log(`node_version=${nodeVersion}`); console.log(`npm_version=${npmVersion}`); console.log(`disk_path=${checkoutPath}`); console.log(`disk_bytes_available=${diskBytesAvailable}`);
+  console.log(`release_parent=${parentState}`); console.log(`native_dependency=${NATIVE_DEPENDENCY}`); console.log("native_install_strategy=locked-prebuild");
+  console.log(`native_prebuild=${nativeInstall.prebuild}`); console.log(`native_install_ready=${nativeInstall.ready ? "yes" : "no"}`);
   // Enrollment state is re-derived from live state, never trusted from the file:
   // a recorded baseline whose host has since moved reports `drifted`, not `yes`.
   const enrollment = await enrollmentStatus(identity);
@@ -1030,7 +1090,17 @@ async function stage() {
       stageStep = "install";
       safePhase = "stage_install";
       const npmPath = `${path.dirname(nodePath)}/npm`; const npmStat = await fsp.lstat(npmPath).catch(() => fail("configured_npm_missing")); if (!npmStat.isFile() && !npmStat.isSymbolicLink()) fail("configured_npm_wrong_type");
-      await runBounded(npmPath, ["ci","--omit=dev","--bin-links=false","--install-links=true","--workspace=@seam/adapters","--workspace=@seam/bridge","--no-audit","--no-fund"], { cwd: partial, timeoutMs: 600_000, stdoutLimit: 512*1024, stderrLimit: 256*1024, env: { PATH: `${path.dirname(nodePath)}:/usr/bin:/bin`, HOME: process.env.HOME ?? releaseRoot, TMPDIR: process.env.TMPDIR ?? "/tmp", npm_config_userconfig: "/dev/null" } });
+      if (!nativeInstallPlan().ready) fail("native_prebuild_unsupported");
+      // --bin-links=false deliberately prevents every dependency-declared bin
+      // from becoming executable during install. Add only the two reviewed
+      // names needed for this lock-bound lifecycle: prebuild-install runs via
+      // the configured Node, while node-gyp refuses an undeclared compiler.
+      const installBin = `${partial}/.seam-install-bin`;
+      await fsp.mkdir(installBin, { mode: 0o700 });
+      await fsp.writeFile(`${installBin}/prebuild-install`, `#!/bin/sh\nexec ${nodePath} ${partial}/node_modules/prebuild-install/bin.js \"$@\"\n`, { flag: "wx", mode: 0o700 });
+      await fsp.writeFile(`${installBin}/node-gyp`, "#!/bin/sh\nprintf 'seam_native_prebuild_unavailable\\n' >&2\nexit 78\n", { flag: "wx", mode: 0o700 });
+      await runBounded(npmPath, ["ci","--omit=dev","--bin-links=false","--install-links=true","--workspace=@seam/adapters","--workspace=@seam/bridge","--no-audit","--no-fund"], { cwd: partial, timeoutMs: 600_000, stdoutLimit: 512*1024, stderrLimit: 256*1024, env: { PATH: `${installBin}:${path.dirname(nodePath)}:/usr/bin:/bin`, HOME: process.env.HOME ?? releaseRoot, TMPDIR: process.env.TMPDIR ?? "/tmp", npm_config_userconfig: "/dev/null" } });
+      await fsp.rm(installBin, { recursive: true });
       stageStep = "link_materialization";
       safePhase = "stage_link_materialization";
       await materializeLinks(partial);

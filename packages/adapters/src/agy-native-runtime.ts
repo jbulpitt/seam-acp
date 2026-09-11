@@ -31,6 +31,8 @@ export interface AgyNativeRuntimeOptions {
 }
 
 export interface AgyNativeSpawnOptions {
+  /** R5: own the LS/tool descendants as well as the CLI during teardown. */
+  detached?: boolean;
   mcpHome?: string;
   stdio: readonly [
     "pipe" | "ignore" | "inherit",
@@ -479,6 +481,7 @@ export class AgyNativeRuntime {
             proc = spawn(snapshot.executable, [...snapshot.argvPrefix, ...argv], {
               cwd: normalizedCwd,
               env,
+              detached: options.detached,
               stdio: [...options.stdio, snapshot.fd],
             });
           } catch (error) {

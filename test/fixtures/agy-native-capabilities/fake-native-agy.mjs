@@ -2,6 +2,7 @@
 import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
+import { spawn } from "node:child_process";
 
 const args = process.argv.slice(2);
 const fixtureDir = process.env.SEAM_AGY_CAPABILITY_FIXTURE_DIR;
@@ -46,13 +47,13 @@ const scenarioFile = prompt === "ok"
     ? "turn-two-resume.json"
     : prompt.includes("capability-model-")
       ? "turn-one.json"
-  : prompt.includes("capability-turn-one")
+  : prompt.includes("capability-turn-one") || prompt === "r5-closing"
     ? "turn-one.json"
     : prompt.includes("capability-turn-two")
       ? "turn-two-resume.json"
       : prompt.includes("capability-structured")
         ? "structured-turn.json"
-        : prompt.includes("capability-interrupt")
+        : prompt.includes("capability-interrupt") || prompt.startsWith("r5-")
           ? "interrupted-turn.json"
           : undefined;
 
@@ -76,6 +77,7 @@ if (schemaFile) {
   try { jsonSchema = readJson(schemaFile); } catch { /* asserted by the caller */ }
 }
 appendInvocation({
+  pid: process.pid,
   scenario: trace?.scenario ?? "catalog",
   prompt,
   conversationId,
@@ -86,6 +88,22 @@ appendInvocation({
   args,
   cwd: process.cwd(),
 });
+
+if (prompt === "r5-exit" || (prompt === "ok" && process.env.SEAM_AGY_R5_CATALOG_MODE === "fail")) {
+  process.stderr.write(`private diagnostic synthetic-password ${process.env.HOME}\n`);
+  process.exit(3);
+}
+if (prompt === "r5-stderr") process.stderr.write(Buffer.alloc(300_000, "x"));
+if (prompt === "r5-stdout") process.stdout.write(Buffer.alloc(1_100_000, "x"));
+if (prompt === "r5-tree") {
+  const descendant = spawn(process.execPath, ["-e", 'process.on("SIGTERM", () => {}); setInterval(() => {}, 1000)'], { stdio: "ignore" });
+  appendInvocation({ scenario: "descendant", pid: descendant.pid });
+}
+if (prompt === "r5-no-ls") {
+  process.on("SIGTERM", () => appendInvocation({ scenario: "no-ls", signal: "SIGTERM" }));
+  setInterval(() => {}, 1000);
+  await new Promise(() => {});
+}
 
 const envelope = (flag, value) => {
   const payload = Buffer.from(JSON.stringify(value), "utf8");
@@ -161,6 +179,8 @@ const server = http.createServer(async (request, response) => {
   if (request.url?.endsWith("/StreamAgentStateUpdates") && trace) {
     response.statusCode = 200;
     response.setHeader("content-type", "application/connect+json");
+    if (prompt === "r5-malformed") { response.end(Buffer.from([0, 0, 0, 0, 1, 123])); return; }
+    if (prompt === "r5-oversized-frame") { response.write(Buffer.from([0, 127, 255, 255, 255])); return; }
     for (const update of trace.updates) {
       await writeFragmented(response, envelope(0, { update }));
     }
@@ -192,6 +212,8 @@ server.listen(0, "127.0.0.1", () => {
 
 process.on("SIGTERM", () => {
   appendInvocation({ scenario: trace?.scenario ?? "catalog", signal: "SIGTERM" });
+  if (prompt === "r5-term" || prompt === "r5-tree") return;
+  if (prompt === "r5-closing") { setTimeout(() => process.exit(0), 300); return; }
   server.close();
   server.closeAllConnections?.();
   process.exit(0);

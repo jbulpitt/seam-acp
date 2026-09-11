@@ -20,6 +20,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+import { agyFailure } from "./agy-lifecycle.js";
 
 /** Default location of the agy CLI's per-run log files. */
 const DEFAULT_LOG_DIR = path.join(
@@ -74,10 +75,13 @@ export async function discoverAgyLs(opts: {
       ? await readHttpPortFromFile(opts.logFile)
       : await readLatestHttpPort(logDir, newerThan);
     if (port !== undefined) {
-      const id = await probeHealthz(port);
+      const id = await probeHealthz(port, AbortSignal.any([
+        ...(opts.signal ? [opts.signal] : []),
+        AbortSignal.timeout(Math.max(1, deadline - Date.now())),
+      ]));
       if (id) return { port, instanceId: id };
     }
-    await delay(300);
+    await delay(Math.min(300, Math.max(1, deadline - Date.now())), undefined, { signal: opts.signal });
   }
   throw new Error(`agy language server did not appear within ${timeoutMs}ms`);
 }
@@ -109,13 +113,14 @@ export async function waitForAgyConversationId(opts: {
   while (Date.now() < deadline) {
     if (opts.signal?.aborted) throw new Error("aborted waiting for conversation id");
     try {
-      const raw = await fs.readFile(opts.logFile, "utf8");
+      const raw = await readAgyLog(opts.logFile);
       const m = re.exec(raw);
       if (m?.[1]) return m[1];
-    } catch {
+    } catch (error) {
+      if (error instanceof Error && error.name === "ProbeError") throw error;
       /* log file not written yet — retry */
     }
-    await delay(250);
+    await delay(Math.min(250, Math.max(1, deadline - Date.now())), undefined, { signal: opts.signal });
   }
   throw new Error(
     `agy did not report a conversation id within ${timeoutMs}ms ` +
@@ -236,9 +241,8 @@ export async function* subscribeToAgyStream(opts: {
     signal: opts.signal,
   });
   if (!resp.ok || !resp.body) {
-    throw new Error(
-      `agy stream subscribe failed: HTTP ${resp.status} ${resp.statusText}`,
-    );
+    await resp.body?.cancel();
+    throw agyFailure("protocol_error");
   }
 
   for await (const env of readConnectEnvelopes(resp.body)) {
@@ -247,19 +251,14 @@ export async function* subscribeToAgyStream(opts: {
     try {
       parsed = JSON.parse(text);
     } catch {
-      // Malformed JSON: skip rather than poison the whole stream. The
-      // wire format is well-defined enough that this should never happen
-      // in practice, but defensive parsing keeps a flaky server from
-      // taking the bridge down.
-      continue;
+      // Skipping corrupt frames silently drops native thoughts/results.
+      throw agyFailure("protocol_error");
     }
     if (env.flag === 2) {
       // End-of-stream envelope. May carry an error payload.
       const obj = parsed as { error?: { code?: string; message?: string } };
       if (obj?.error?.message) {
-        throw new Error(
-          `agy stream ended with error (${obj.error.code ?? "unknown"}): ${obj.error.message}`,
-        );
+        throw agyFailure("protocol_error");
       }
       return;
     }
@@ -283,9 +282,13 @@ async function* readConnectEnvelopes(
 ): AsyncGenerator<{ flag: number; payload: Uint8Array }, void, void> {
   const reader = body.getReader();
   let buf = new Uint8Array(0);
+  // A bogus length prefix must not retain an unbounded stream awaiting a frame.
+  const maxFrameBytes = 8 * 1024 * 1024;
+  try {
   while (true) {
     const { value, done } = await reader.read();
     if (value && value.length > 0) {
+      if (buf.length + value.length > maxFrameBytes + 5) throw agyFailure("output_overflow");
       const next = new Uint8Array(buf.length + value.length);
       next.set(buf, 0);
       next.set(value, buf.length);
@@ -295,12 +298,22 @@ async function* readConnectEnvelopes(
       const flag = buf[0]!;
       const len =
         ((buf[1]! << 24) | (buf[2]! << 16) | (buf[3]! << 8) | buf[4]!) >>> 0;
+      if (len > maxFrameBytes) throw agyFailure("output_overflow");
+      if (flag !== 0 && flag !== 2) throw agyFailure("protocol_error");
       if (buf.length < 5 + len) break;
       const payload = buf.subarray(5, 5 + len);
       yield { flag, payload };
       buf = buf.subarray(5 + len);
     }
-    if (done) return;
+    if (done) {
+      if (buf.length) throw agyFailure("protocol_error");
+      return;
+    }
+  }
+  } finally {
+    // Breaking after IDLE must close the HTTP body before the LS is killed.
+    await reader.cancel().catch(() => {});
+    reader.releaseLock();
   }
 }
 
@@ -344,8 +357,9 @@ async function readLatestHttpPort(
     if (e.mtimeMs < newerThanMs) break;
     let raw: string;
     try {
-      raw = await fs.readFile(path.join(logDir, e.name), "utf8");
-    } catch {
+      raw = await readAgyLog(path.join(logDir, e.name));
+    } catch (error) {
+      if (error instanceof Error && error.name === "ProbeError") throw error;
       continue;
     }
     const m = /port at (\d+) for HTTP$/m.exec(raw);
@@ -364,8 +378,9 @@ async function readLatestHttpPort(
 async function readHttpPortFromFile(file: string): Promise<number | undefined> {
   let raw: string;
   try {
-    raw = await fs.readFile(file, "utf8");
-  } catch {
+    raw = await readAgyLog(file);
+  } catch (error) {
+    if (error instanceof Error && error.name === "ProbeError") throw error;
     return undefined;
   }
   const m = /port at (\d+) for HTTP$/m.exec(raw);
@@ -373,16 +388,49 @@ async function readHttpPortFromFile(file: string): Promise<number | undefined> {
 }
 
 /** Hit `/healthz` on the candidate port; return `instanceId` if OK. */
-async function probeHealthz(port: number): Promise<string | undefined> {
+async function probeHealthz(port: number, signal: AbortSignal): Promise<string | undefined> {
   try {
     const resp = await fetch(`http://127.0.0.1:${port}/healthz`, {
-      signal: AbortSignal.timeout(1000),
+      signal: AbortSignal.any([signal, AbortSignal.timeout(1000)]),
     });
-    if (!resp.ok) return undefined;
-    const j = (await resp.json()) as { status?: string; instanceId?: string };
+    if (!resp.ok) { await resp.body?.cancel(); return undefined; }
+    const j = (await readAgyJsonResponse(resp)) as { status?: string; instanceId?: string };
     if (j.status !== "ok" || !j.instanceId) return undefined;
     return j.instanceId;
   } catch {
     return undefined;
+  }
+}
+
+/** Bound untrusted log/HTTP input before materializing strings or JSON. */
+const AGY_METADATA_BYTES = 8 * 1024 * 1024;
+async function readAgyLog(file: string): Promise<string> {
+  const handle = await fs.open(file, "r");
+  try {
+    const buffer = Buffer.alloc(AGY_METADATA_BYTES + 1);
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+    if (bytesRead > AGY_METADATA_BYTES) throw agyFailure("output_overflow");
+    return buffer.subarray(0, bytesRead).toString("utf8");
+  } finally { await handle.close(); }
+}
+
+export async function readAgyJsonResponse(response: Response): Promise<unknown> {
+  if (!response.body) throw agyFailure("protocol_error");
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let bytes = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      bytes += value.length;
+      if (bytes > AGY_METADATA_BYTES) throw agyFailure("output_overflow");
+      chunks.push(value);
+    }
+    try { return JSON.parse(Buffer.concat(chunks).toString("utf8")); }
+    catch { throw agyFailure("protocol_error"); }
+  } finally {
+    await reader.cancel().catch(() => {});
+    reader.releaseLock();
   }
 }

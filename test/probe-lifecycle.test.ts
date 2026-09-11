@@ -120,6 +120,34 @@ function cooperativeSleep(ms: number, signal: AbortSignal): Promise<void> {
 }
 
 describe("#236 bounded probe lifecycle", () => {
+  it("reaps a partial startup with missing stdout before refusing it", async () => {
+    const { child } = fakeChild({ diesOnKill: true });
+    Object.assign(child, { stdout: null });
+    await expect(runBoundedProbe({
+      executable: "fixture", spawnOverride: () => child,
+      run: async () => { throw new Error("must not enter protocol"); },
+    })).rejects.toMatchObject({ code: "spawn_failed" });
+    expect(child.exitCode).toBe(0);
+    expect(child.listenerCount("error")).toBe(0);
+  });
+
+  it("still escalates and observes exit after synchronous TERM failure", async () => {
+    const { child, exit } = fakeChild();
+    const signals: unknown[] = [];
+    child.kill = (signal) => {
+      signals.push(signal);
+      if (signal === "SIGTERM") throw new Error("synthetic signal failure");
+      queueMicrotask(() => exit(0));
+      return true;
+    };
+    await expect(runBoundedProbe({
+      executable: "fixture", spawnOverride: () => child, killGraceMs: 10,
+      run: async () => "value",
+    })).resolves.toBe("value");
+    expect(signals).toEqual(["SIGTERM", "SIGKILL"]);
+    expect(child.exitCode).toBe(0);
+  });
+
   it("returns the caller's value and reaps the child", async () => {
     let pid: number | undefined;
     const closed: string[] = [];

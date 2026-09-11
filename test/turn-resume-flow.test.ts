@@ -23,7 +23,8 @@ import {
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import type { SessionRecord } from "../packages/core/src/core/types.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
-import { DispatchSuspendedError } from "../packages/core/src/core/dispatch/attempt-store.js";
+import { DispatchSuspendedError, inboundAttemptId } from "../packages/core/src/core/dispatch/attempt-store.js";
+import { executionIdentity } from "../packages/core/src/core/dispatch/execution-identity.js";
 import type { InjectTurnOptions } from "../packages/core/src/core/inject-turn.js";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
@@ -124,7 +125,10 @@ function makeOrch(opts?: {
     modelCatalog: fixtureModelCatalog([catalogProfile]),
     router: router as any,
     store,
-    renderer: {} as any,
+    renderer: {
+      statusPanel: () => ({ title: "", fields: [] }),
+      panel: () => ({ title: "", fields: [] }),
+    } as any,
   });
   (orch as any).postDispatchStartIndicator = async () => undefined;
   (orch as any).postDispatchOutput = async () => {};
@@ -880,5 +884,83 @@ describe("finishLiveTurn is not invoked by dispose helpers", () => {
       finishedUtc: new Date().toISOString(),
     });
     expect(await listLiveMarkers(dir)).toHaveLength(0);
+  });
+});
+
+describe("#302 continuation is a capability question, not a vendor name", () => {
+  /**
+   * The deleted guard read `d.agent.value !== "codex" || !isLocalLocation(...)
+   * || !priorHuman?.acpSessionId`. A Claude thread whose turn was interrupted
+   * after its prompt was sent hit the first clause and was suspended forever,
+   * even though claude-agent-acp advertises loadSession and resumes with
+   * `--resume=<uuid>`. Restoring any of those clauses fails this test.
+   */
+  it("reattaches an interrupted Claude turn to its recorded session", async () => {
+    simulateRetiredOwnerProcess();
+    const { orch, loadSession, newSession } = makeOrch({
+      enabled: true,
+      getProfile: () => ({ id: "claude", sessionManager: { deleteSession: async () => {} } }),
+    });
+    (orch as any).router.describeConfig = () => ({
+      agent: { value: "claude" },
+      location: { value: "local" },
+      model: { value: "claude-opus-5" },
+      effort: { value: "high" },
+      cwd: { value: "/repo" },
+    });
+
+    store.admitInbound({
+      messageId: "302-claude",
+      platform: "discord",
+      channelRef: "thread-worker",
+      parentRef: "channel-1",
+      sessionRecordId: "discord:thread-worker",
+      authorId: "human-1",
+      authorName: "Jesse",
+      text: "keep going",
+      attachmentsJson: "[]",
+      createdUtc: new Date().toISOString(),
+      expectedAcpSessionId: null,
+      preemptive: false,
+    } as never);
+
+    // An attempt that was interrupted AFTER its prompt was sent: it must be
+    // continued on its recorded session, never replayed.
+    const id = inboundAttemptId("302-claude");
+    store.turnAttempts.registerOwner("boot-prior");
+    const claimed = store.turnAttempts.claim(
+      { id, target: "thread-worker", prompt: "keep going", createdUtc: new Date().toISOString() } as never,
+      // Computed exactly as executeIncomingMessage does, so the comparison is
+      // exercised on real inputs rather than trivially matching.
+      (() => {
+        const { lastContextUsage: _u, ...identityConfig } =
+          store.readConfig(record({ id: "discord:thread-worker", channelRef: "thread-worker" })) as Record<string, unknown>;
+        return executionIdentity({ agent: "claude", location: "local", model: "claude-opus-5",
+          effort: "high", cwd: "/repo", config: identityConfig });
+      })(),
+      "boot-prior",
+      "inbound"
+    );
+    store.turnAttempts.bind(claimed, "acp-recorded");
+    store.turnAttempts.startPrompt(claimed);
+    store.turnAttempts.suspendBoot("boot-prior");
+    vi.restoreAllMocks();
+
+    await (orch as any).executeIncomingMessage({
+      messageId: "302-claude",
+      text: "keep going",
+      authorId: "human-1",
+      authorName: "Jesse",
+      channel: { platform: "discord", id: "thread-worker", parentId: "channel-1" },
+      attachments: [],
+    });
+
+    // It continued: the turn ran on the already-attached recorded session and
+    // no replacement session was created. Before this change the vendor clause
+    // threw DispatchSuspendedError here and the turn never came back.
+    expect(newSession).not.toHaveBeenCalled();
+    expect(store.turnAttempts.get(id)?.acpSessionId).toBe("acp-recorded");
+    expect(store.turnAttempts.get(id)?.state).not.toBe("suspended");
+    void loadSession;
   });
 });

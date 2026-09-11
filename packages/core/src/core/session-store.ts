@@ -933,6 +933,9 @@ export class SessionStore {
     if (!hasColumn) {
       this.db.exec("ALTER TABLE delegation_log ADD COLUMN acp_session_id TEXT");
     }
+    // #302: created here rather than in the base DDL because the column itself
+    // arrives by migration; the lookup it serves is "what did this session do".
+    this.db.exec("CREATE INDEX IF NOT EXISTS idx_delegation_acp_session ON delegation_log(acp_session_id)");
   }
 
   /**
@@ -7339,6 +7342,10 @@ CREATE INDEX IF NOT EXISTS idx_elicitation_expiry
   ON elicitations(status, expires_utc);
 CREATE INDEX IF NOT EXISTS idx_elicitation_external
   ON elicitations(elicitation_id, status);
+-- #302: acp_session_id was an unindexed plain column here and in
+-- delegation_log, yet every "is this session still live / what belongs to it"
+-- lookup goes through it.
+CREATE INDEX IF NOT EXISTS idx_sessions_acp_session ON sessions(acp_session_id);
 `;
 
 interface ElicitationDbRow {

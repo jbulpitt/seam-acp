@@ -99,6 +99,52 @@ hand-editing runtime state.
 
 `poll_inbox` at the start of a turn (and at checkpoints). Empty is normal.
 
+## ⚠️ CRITICAL: Blast radius must equal the scope of the uncertainty
+
+When a check cannot be satisfied, **refuse the smallest thing that is actually
+in doubt.** If you cannot verify one model, refuse one model. One adapter,
+refuse one adapter. One binding, refuse one binding. A check may narrow what is
+possible; it may never remove the capability.
+
+Rank outcomes worst to best and pick the best one available:
+
+1. Works correctly.
+2. Works with a labeled caveat.
+3. One narrow operation fails with a clear, named reason — **recoverable**.
+4. The whole capability fails — **a non-starter for real work**.
+5. Silently does the wrong thing — **worse than 4**.
+
+**Never choose 4 when 3 exists. Never choose 5.**
+
+Being told "that model was rejected" is a pesky annoyance you route around.
+Being told the tool is unusable stops the work entirely. Those are not two
+points on one scale; they are different categories, and a safety check that
+produces the second when the first was available is a design defect, not
+caution.
+
+This is the single most common defect in this codebase, because each check is
+written by someone reasoning locally — *"I cannot prove this, so I must
+refuse"* — which is correct about the check and wrong about the scope. The
+missing question is always **"refuse what, exactly?"**
+
+Real examples, all found in production on 2026-09-11:
+
+- A catalog that could not be read made the **entire host** unable to accept
+  work, when `default` would have started fine (#326).
+- Unverifiable agy provenance **removed the agent**; on agy-only hosts that
+  meant zero agents, when refusing agy and keeping the host was available
+  (#329).
+- One adapter's verification failure **killed the whole bridge**, when refusing
+  that adapter and serving the rest was available (#330).
+- Two catalogs disagreeing made **even `default` unavailable** on a healthy
+  binding, when each using its own was available (#337).
+- A delivery predicate treated *failed* delivery as proof of delivery and would
+  have permanently deleted 2,976 artifacts — an instance of 5 (#305/#306).
+
+When you write a guard, state in the comment **what you refuse and what keeps
+working.** If you cannot name something that keeps working, you have probably
+chosen 4, and should look again for the narrower refusal.
+
 ## ⚠️ CRITICAL: Applying code changes or restarting the app
 
 Production now runs Seam and the shared Pronoa Playwright MCP as separate

@@ -1267,7 +1267,10 @@ export class SessionRouter {
             return runtime;
           } catch (err) {
             const lastAttempt = attempt === RESUME_ATTEMPTS;
-            if (lastAttempt && recovery) throw err;
+            if (lastAttempt && recovery) {
+              const detail = err instanceof Error ? err.message : String(err);
+              throw new Error(`Strict resume refused: session/load failed after retries: ${detail}`, { cause: err });
+            }
             this.logger.warn(
               { err, sessionId: record.id, attempt, lastAttempt },
               lastAttempt

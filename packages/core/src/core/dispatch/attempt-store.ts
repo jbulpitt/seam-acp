@@ -123,7 +123,10 @@ export class TurnAttemptStore {
         // the field. The previous opaque digest also folded in rotating
         // credentials and provider env values, so an unrelated token refresh
         // stranded the attempt permanently (#302).
-        const drift = compareExecutionIdentity(old.identity, identity);
+        const drift = compareExecutionIdentity(old.identity, identity, {
+          promptStarted: old.promptStarted,
+          acpSessionId: old.acpSessionId,
+        });
         if (!drift.match) throw new DispatchSuspendedError(spec.id, drift.reason);
         // `startPrompt` only sets prompt_started when a session id is already
         // recorded, so this pairing cannot occur. If it ever does we recorded

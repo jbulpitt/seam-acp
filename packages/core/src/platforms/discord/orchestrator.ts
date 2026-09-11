@@ -5,7 +5,7 @@ import path from "node:path";
 import os from "node:os";
 import { randomUUID } from "node:crypto";
 import { DispatchSuspendedError, inboundAttemptId, type TurnAttempt } from "../../core/dispatch/attempt-store.js";
-import { executionIdentity } from "../../core/dispatch/execution-identity.js";
+import { compareExecutionIdentity, executionIdentity } from "../../core/dispatch/execution-identity.js";
 import { MessageFlags, EmbedBuilder, ButtonBuilder, ActionRowBuilder, ButtonStyle, StringSelectMenuBuilder, ModalBuilder, TextInputBuilder, TextInputStyle, AttachmentBuilder, type ChatInputCommandInteraction, type AutocompleteInteraction, type MessageComponentInteraction, type Message, type InteractionEditReplyOptions } from "discord.js";
 import type { Logger } from "../../lib/logger.js";
 import type { Config } from "../../config.js";
@@ -3128,7 +3128,11 @@ export class Orchestrator {
         location: d.location.value, model: d.model.value, effort: d.effort.value,
         cwd: d.cwd.value, config: identityConfig });
       if (scheduledAttempt) {
-        if (identity !== scheduledAttempt.identity) throw new DispatchSuspendedError(scheduledAttempt.id);
+        const drift = compareExecutionIdentity(scheduledAttempt.identity, identity, {
+          promptStarted: scheduledAttempt.promptStarted,
+          acpSessionId: scheduledAttempt.acpSessionId,
+        });
+        if (!drift.match) throw new DispatchSuspendedError(scheduledAttempt.id, drift.reason);
       } else if (admission) {
         this.store.turnAttempts.registerOwner(this.attemptBoot);
         humanAttempt = this.store.turnAttempts.claim({
@@ -3148,7 +3152,12 @@ export class Orchestrator {
     const humanCurrent = () => !humanAttempt || (!this.restartCutoff && this.store.turnAttempts.isCurrent(humanAttempt));
     const completeHuman = (error?: string, cancelled = false, stopReason?: string): void => {
       if (!humanAttempt || humanOutcomeOwned) return;
-      if (!humanCurrent() || (humanResume && !humanPromptSubmitted)) throw new DispatchSuspendedError(humanAttempt.id);
+      if (!humanCurrent()) throw new DispatchSuspendedError(humanAttempt.id);
+      if (humanResume && !humanPromptSubmitted) {
+        const reason = error ?? "strict resume stopped before the continuation prompt was submitted";
+        this.store.turnAttempts.markStalled(humanAttempt.id, reason);
+        throw new DispatchSuspendedError(humanAttempt.id, reason);
+      }
       if (cancelled) {
         this.store.turnAttempts.cancel(humanAttempt.id);
         throw new DispatchSuspendedError(humanAttempt.id);
@@ -8792,7 +8801,11 @@ export class Orchestrator {
         config: record.configJson,
         // #302: `preset` is upstream of the agent/model/effort/cwd already
         // compared above, so it adds refusals for edits that changed no
-        // effective selection. `runtime` and `providerScope` fold in a
+        // effective selection. Its instructions are deliberately not frozen:
+        // work interrupted before its first prompt should use the current
+        // instructions, because no prior model work exists to preserve and
+        // applying an edit is preferable to stranding the queued job.
+        // `runtime` and `providerScope` fold in a
         // credential-scope digest and an environment fingerprint, which drift
         // on token refresh and strand in-flight work — the defect this fixes.
       });
@@ -11057,7 +11070,16 @@ export class Orchestrator {
     if (prior?.state === "completed") { await this.deliverScheduledCompletion(occurrence, prior); return; }
     if (prior?.state === "cancelled") { await this.settleScheduleCancellation(occurrence); return; }
     const execution = this.scheduleExecution(occurrence.row);
-    if (execution.fingerprint !== occurrence.execution.fingerprint || this.restartCutoff) return;
+    const drift = compareExecutionIdentity(occurrence.execution.fingerprint, execution.fingerprint, prior ? {
+      promptStarted: prior.promptStarted,
+      acpSessionId: prior.acpSessionId,
+    } : undefined);
+    if (!drift.match) {
+      if (prior) this.store.turnAttempts.markStalled(prior.id, drift.reason);
+      this.patchScheduledStatus(row.id, `retained: ${drift.reason}`);
+      return;
+    }
+    if (this.restartCutoff) return;
     if (prior?.promptStarted && ((!manualResume && !this.config.SEAM_TURN_RESUME_ENABLED) || execution.agentId !== "codex" ||
       !isLocalLocation(execution.location) || !prior.acpSessionId)) return;
     try {
@@ -11066,12 +11088,15 @@ export class Orchestrator {
         prompt: row.promptText, session: row.sessionMode, kind: "scheduled", createdUtc: new Date().toISOString(),
         agentId: execution.agentId, location: execution.location, model: execution.model,
         cwd: execution.cwd, ...(execution.effort ? { effort: execution.effort } : {}),
-      }, occurrence.execution.fingerprint, this.attemptBoot, "schedule");
+      }, execution.fingerprint, this.attemptBoot, "schedule");
       try {
         await this.runScheduledPromptInner(occurrence.row, { occurrence, attempt });
       } catch (err) {
         if (err instanceof DispatchSuspendedError) {
-          this.store.turnAttempts.suspend(attempt.id, this.attemptBoot);
+          if (err.reason) {
+            this.store.turnAttempts.markStalled(attempt.id, err.reason);
+            this.patchScheduledStatus(row.id, `retained: ${err.reason}`);
+          } else this.store.turnAttempts.suspend(attempt.id, this.attemptBoot);
           return;
         }
         if (!this.store.turnAttempts.isCurrent(attempt) || this.restartCutoff) return;
@@ -11124,10 +11149,16 @@ export class Orchestrator {
 
   private async runScheduledPromptInner(row: ScheduledPrompt, owned?: { occurrence: PreparedScheduledOccurrence; attempt: TurnAttempt }): Promise<void> {
     const assertOwned = (): void => {
-      if (owned && (this.restartCutoff || !this.store.turnAttempts.isCurrent(owned.attempt) ||
-        this.scheduleExecution(row).fingerprint !== owned.occurrence.execution.fingerprint)) {
+      if (!owned) return;
+      if (this.restartCutoff || !this.store.turnAttempts.isCurrent(owned.attempt)) {
         throw new DispatchSuspendedError(owned.attempt.id);
       }
+      const drift = compareExecutionIdentity(owned.occurrence.execution.fingerprint,
+        this.scheduleExecution(row).fingerprint, {
+          promptStarted: owned.attempt.promptStarted,
+          acpSessionId: owned.attempt.acpSessionId,
+        });
+      if (!drift.match) throw new DispatchSuspendedError(owned.attempt.id, drift.reason);
     };
     assertOwned();
     const id = row.id;

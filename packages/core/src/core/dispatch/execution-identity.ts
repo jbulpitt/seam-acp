@@ -85,6 +85,11 @@ export type IdentityComparison =
   | { match: true; legacy: boolean }
   | { match: false; field: keyof ExecutionIdentity; reason: string };
 
+export interface LegacyIdentityContext {
+  promptStarted: boolean;
+  acpSessionId: string | null | undefined;
+}
+
 function parse(raw: string): ExecutionIdentity | null {
   try {
     const value = JSON.parse(raw) as Partial<ExecutionIdentity>;
@@ -109,17 +114,33 @@ const LABEL: Record<Exclude<keyof ExecutionIdentity, "version">, (a: string, b: 
  * Compare a stored identity with the current one and name the first field that
  * differs, in terms an operator can act on.
  *
- * A stored value that is not a version-2 record is reported as `legacy`. Those
- * are the pre-#302 digests, which cannot say which field differs and whose
- * inputs drifted on their own; refusing on one would permanently strand exactly
- * the work this change exists to recover. The recorded ACP session id and the
- * provider's answer to a reattach still bound what such a resume can do.
+ * A stored value that is not a version-2 record is a pre-#302 digest, which
+ * cannot say which field differs and whose inputs drifted on their own. It is
+ * safe to tolerate only for a prompted attempt carrying a recorded ACP session
+ * id: strict session/load either reattaches to that conversation or refuses.
+ * A never-prompted legacy attempt has no session id and therefore no equivalent
+ * bound; accepting it would replay the original brief under today's selection.
  */
-export function compareExecutionIdentity(stored: string, current: string): IdentityComparison {
-  if (stored === current) return { match: true, legacy: false };
+export function compareExecutionIdentity(
+  stored: string,
+  current: string,
+  legacyContext?: LegacyIdentityContext,
+): IdentityComparison {
   const before = parse(stored);
   const after = parse(current);
-  if (!before || !after) return { match: true, legacy: true };
+  if (!before) {
+    if (legacyContext?.promptStarted && legacyContext.acpSessionId) {
+      return { match: true, legacy: true };
+    }
+    const reason = legacyContext?.promptStarted
+      ? "prompted legacy attempt has no recorded ACP session id; it cannot be reattached safely"
+      : "never-prompted legacy attempt has no recorded ACP session id; abandon it and resend under the current configuration";
+    return { match: false, field: "version", reason };
+  }
+  if (!after) {
+    return { match: false, field: "version", reason: "current execution identity is not a version-2 record" };
+  }
+  if (stored === current) return { match: true, legacy: false };
   for (const field of Object.keys(LABEL) as Array<Exclude<keyof ExecutionIdentity, "version">>) {
     if (before[field] !== after[field]) {
       return { match: false, field, reason: LABEL[field](before[field], after[field]) };

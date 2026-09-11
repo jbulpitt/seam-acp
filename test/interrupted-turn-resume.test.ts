@@ -104,11 +104,21 @@ describe("#302 execution identity", () => {
     }
   });
 
-  it("does not strand an attempt that stored a pre-#302 digest", () => {
-    // Those rows are exactly the orphaned work this change exists to recover,
-    // and a digest cannot say which field differs.
+  it("accepts a prompted pre-#302 digest only when a recorded session bounds reattachment", () => {
     const legacy = "a".repeat(64);
-    expect(compareExecutionIdentity(legacy, selection())).toEqual({ match: true, legacy: true });
+    expect(compareExecutionIdentity(legacy, selection(), {
+      promptStarted: true,
+      acpSessionId: "acp-session-624a55a4",
+    })).toEqual({ match: true, legacy: true });
+  });
+
+  it("refuses a never-prompted pre-#302 digest by name", () => {
+    const result = compareExecutionIdentity("a".repeat(64), selection(), {
+      promptStarted: false,
+      acpSessionId: null,
+    });
+    expect(result.match).toBe(false);
+    if (!result.match) expect(result.reason).toMatch(/never-prompted legacy attempt.*abandon.*resend/i);
   });
 });
 
@@ -160,6 +170,33 @@ describe("#302 claim()", () => {
     // Nothing reached the model, so the original spec is safe to re-send.
     expect(resumed.promptStarted).toBe(false);
     expect(JSON.parse(JSON.stringify(resumed.spec))).toMatchObject({ id: s.id, prompt: "keep going" });
+  });
+
+  it("refuses a never-prompted legacy row instead of replaying it under today's selection", () => {
+    const s = spec();
+    attempts.claim(s, "a".repeat(64), "boot-1");
+    suspend(s.id);
+    try {
+      attempts.claim(s, selection(), "boot-2");
+      throw new Error("expected a refusal");
+    } catch (err) {
+      expect(err).toBeInstanceOf(DispatchSuspendedError);
+      expect((err as DispatchSuspendedError).reason).toMatch(/never-prompted legacy attempt/i);
+    }
+    expect(attempts.get(s.id)).toMatchObject({ state: "suspended", promptStarted: false, acpSessionId: null });
+  });
+
+  it("reclaims a prompted legacy row because strict session/load still bounds it", () => {
+    const s = spec();
+    const claimed = attempts.claim(s, "a".repeat(64), "boot-1");
+    attempts.bind(claimed, "acp-session-624a55a4");
+    attempts.startPrompt(claimed);
+    suspend(s.id);
+    expect(attempts.claim(s, selection(), "boot-2")).toMatchObject({
+      state: "active",
+      promptStarted: true,
+      acpSessionId: "acp-session-624a55a4",
+    });
   });
 
   it("refuses loudly if a started prompt has no session id", () => {

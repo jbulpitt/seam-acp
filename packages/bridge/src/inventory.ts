@@ -9,6 +9,7 @@ import { accessSync, constants } from "node:fs";
 import {
   AGENT_ADAPTER_VERSION,
   makeAgyNativeRuntime,
+  describeProvenanceMode,
   makeAgyPackageProfile,
   makeAgyProfile,
   makeClaudeProfile,
@@ -45,6 +46,8 @@ export interface HostAdapterRuntimeOptions {
   env?: NodeJS.ProcessEnv;
   exists?: (bin: string) => boolean;
   copilotCatalogProbe?: (launch: CopilotCatalogLaunch) => Promise<CopilotCatalogProbe>;
+  /** #330: observe a strict adapter refusing to load instead of it killing the bridge. */
+  onAdapterRefused?: (agentId: string, reason: string) => void;
 }
 
 export function resolveCopilotHostLaunch(
@@ -233,9 +236,29 @@ export function loadHostAdapters(
     if (!exists(f.bin)) continue;
     try {
       out.set(f.id, f.make());
+      if (f.strict) {
+        // Mode is null until a snapshot is actually opened (prepare()), so say
+        // "pending" rather than assert a platform default — the two disagree
+        // for a Node fixture on darwin. #330 review.
+        console.error(`[bridge] adapter ${f.id} loaded; provenance mode: ${describeProvenanceMode() ?? "pending first launch"}`);
+      }
     } catch (error) {
       // Factory threw (missing optional deps) — skip.
-      if (f.strict) throw error;
+      //
+      // #330: a strict adapter must NOT be able to take the bridge down with
+      // it. Rethrowing here escaped loadHostAdapters and killed the process,
+      // so one agent failing verification became a HOST outage — and on a
+      // single-agent host those are the same event with very different blast
+      // radii. An agy provenance failure on macOS took an entire laptop
+      // offline this way. Refuse the agent loudly and keep serving the rest.
+      const reason = error instanceof Error ? error.message : String(error);
+      if (f.strict) {
+        // Refusal is the case you most want the mode for, so report it here too.
+        console.error(
+          `[bridge] adapter ${f.id} refused to load (provenance mode: ${describeProvenanceMode() ?? "not reached"}): ${reason}`
+        );
+        options.onAdapterRefused?.(f.id, reason);
+      }
     }
   }
   return out;

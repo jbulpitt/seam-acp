@@ -54,10 +54,14 @@ interface VerificationEntry {
 
 const verificationCache = new Map<string, VerificationEntry>();
 
+/** Which mechanism bound the verified bytes to the executed bytes (#330). */
+export type AgyProvenanceMode = "descriptor" | "immutable-path";
+
 interface VerifiedSnapshot extends VerificationEntry {
   fd: number;
   executable: string;
   argvPrefix: string[];
+  provenance: AgyProvenanceMode;
   close(): void;
 }
 
@@ -65,6 +69,7 @@ interface CachedSnapshot {
   fd: number;
   executable: string;
   argvPrefix: string[];
+  provenance: AgyProvenanceMode;
 }
 
 const snapshotCache = new Map<string, CachedSnapshot>();
@@ -180,22 +185,63 @@ export function verifyAgyManagedRuntimeArtifact(
 
 function fdExecutable(fd: number): string {
   if (process.platform === "linux") return `/proc/self/fd/${fd}`;
-  if (process.platform === "darwin") return `/dev/fd/${fd}`;
+  // NOT darwin: macOS refuses to EXEC a code-signed Mach-O through /dev/fd/N
+  // (EACCES) because signature validation resolves a real path. See the
+  // immutable-path branch in openVerifiedSnapshot (#330).
   throw new Error("native AGY requires descriptor-bound executable launch support");
 }
+
+/**
+ * Re-open an existing descriptor for READING. This is a different capability
+ * from {@link fdExecutable} and macOS supports it: `/dev/fd/N` opens fine, it
+ * only refuses `exec`. Conflating the two made the darwin branch throw on its
+ * own return path via duplicateCachedSnapshot, so it never reached the version
+ * probe at all (#330 review).
+ */
+function fdReadPath(fd: number): string {
+  if (process.platform === "linux") return `/proc/self/fd/${fd}`;
+  if (process.platform === "darwin") return `/dev/fd/${fd}`;
+  throw new Error("native AGY requires descriptor reopen support");
+}
+
+/**
+ * Which mechanism bound the verified bytes to the executed bytes for the most
+ * recent snapshot, or `null` if none has been opened yet.
+ *
+ * `descriptor` — the artifact was copied, re-verified through an open fd, then
+ * unlinked, so the executed inode is unreachable by name and cannot be swapped.
+ * This is structural: the verified inode IS the executed inode.
+ *
+ * `immutable-path` — the artifact is executed from AGY_RUNTIME_ROOT by name,
+ * and the binding rests on the PRECONDITION that the path is canonical and not
+ * writable by the service user. Weaker than the descriptor route: `exec`
+ * resolves the name a second time, so a swap inside that window is not
+ * excluded structurally. See #332 for the remaining ancestor-rename gap.
+ *
+ * Deliberately reports the observed snapshot rather than a platform default —
+ * on darwin a Node fixture still takes the descriptor route, so the platform
+ * alone would report the wrong answer in exactly the case where they differ.
+ */
+export function describeProvenanceMode(): AgyProvenanceMode | null {
+  return lastProvenanceMode;
+}
+
+let lastProvenanceMode: AgyProvenanceMode | null = null;
 
 function duplicateCachedSnapshot(
   verified: VerificationEntry,
   cached: CachedSnapshot,
 ): VerifiedSnapshot {
-  const fd = fs.openSync(fdExecutable(cached.fd), fs.constants.O_RDONLY);
+  const fd = fs.openSync(fdReadPath(cached.fd), fs.constants.O_RDONLY);
   let closed = false;
+  lastProvenanceMode = cached.provenance;
   return {
     ...verified,
     digest: verified.digest,
     fd,
     executable: cached.executable,
     argvPrefix: [...cached.argvPrefix],
+    provenance: cached.provenance,
     close() {
       if (closed) return;
       closed = true;
@@ -259,6 +305,49 @@ function openVerifiedSnapshot(
     throw new Error("AGY executable sha256 does not match the configured immutable artifact");
   }
 
+  // macOS cannot EXEC a code-signed Mach-O through `/dev/fd/N` — the kernel
+  // resolves a real path to validate the signature — so the descriptor-bound
+  // launch below fails with EACCES for every production AGY binary. The darwin
+  // branch of `fdExecutable` existed but had never worked, so a Mac either lost
+  // native agy entirely or crashed its bridge (#330). Note macOS DOES permit
+  // opening `/dev/fd/N` for reading; only exec is refused, which is why
+  // `fdReadPath` still has a darwin branch.
+  //
+  // What the descriptor route buys is that the VERIFIED bytes and the EXECUTED
+  // bytes cannot differ: the copy is re-hashed through the fd and then unlinked,
+  // so the verified inode IS the executed inode, structurally.
+  //
+  // This branch pursues the same intent by a PRECONDITION rather than by
+  // construction, and it is honestly weaker. `verifyAgyManagedRuntimeArtifact`
+  // has proven the path canonical and not writable by the service user, but
+  // `spawn` resolves the name a second time, so the fd we hold pins the inode we
+  // READ, not the inode we EXEC. A swap landing inside that window is not
+  // excluded. `assertNotWritable` also checks only the root, release dir and
+  // executable — not their ancestors — and renaming a directory requires write
+  // on its PARENT, so a 0555 tree under a writable parent is still replaceable.
+  //
+  // That matters here specifically because agents execute code as the service
+  // user: such an attacker cannot change the running bridge's env, but can win
+  // that race. What they gain is not privilege — they already have same-user
+  // execution — it is ATTESTATION: the bridge would advertise a
+  // provenance-verified agy while running other bytes. Closing it means walking
+  // every ancestor and restaging outside $HOME; tracked in #332.
+  //
+  // The Node fixture loader stays on the descriptor route on every platform: it
+  // READS fd 3 rather than exec'ing it, which macOS permits.
+  const nodeFixtureSource = bytes.subarray(0, 64).toString("utf8").startsWith("#!/usr/bin/env node\n");
+  if (process.platform === "darwin" && !nodeFixtureSource) {
+    // retainSnapshot takes ownership of this fd and closes it if it throws;
+    // closing it here as well replaced the real cause with EBADF.
+    const realFd = fs.openSync(executable, fs.constants.O_RDONLY);
+    return retainSnapshot(sourceDigest, {
+      fd: realFd,
+      executable,
+      argvPrefix: [],
+      provenance: "immutable-path",
+    }, verified);
+  }
+
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "seam-agy-exec-"));
   fs.chmodSync(dir, 0o700);
   const snapshotPath = path.join(dir, "agy");
@@ -281,7 +370,7 @@ function openVerifiedSnapshot(
     // Validate descriptor execution support even for the Node-only fixture
     // loader branch. Production AGY is an ELF binary and executes fd 3 itself.
     fdExecutable(fd);
-    const nodeFixture = bytes.subarray(0, 64).toString("utf8").startsWith("#!/usr/bin/env node\n");
+    const nodeFixture = nodeFixtureSource;
     const executableFd = nodeFixture ? process.execPath : fdExecutable(3);
     const argvPrefix = nodeFixture
       ? ["--input-type=module", "--eval", NODE_FD_MODULE_LOADER, "agy"]
@@ -294,6 +383,7 @@ function openVerifiedSnapshot(
       fd: ownedFd,
       executable: executableFd,
       argvPrefix,
+      provenance: "descriptor",
     }, verified);
   } catch (error) {
     if (fd !== undefined) fs.closeSync(fd);

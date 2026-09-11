@@ -1,9 +1,10 @@
-import { lstatSync, unlinkSync } from "node:fs";
+import { lstatSync, readFileSync, unlinkSync } from "node:fs";
 import { opendir } from "node:fs/promises";
 import path from "node:path";
 import { setImmediate } from "node:timers/promises";
 import type { Logger } from "../../lib/logger.js";
-import { dispatchDirs } from "./types.js";
+import { dispatchDirs, type DispatchResult } from "./types.js";
+import type { DoneLedgerRow, DoneLedgerState } from "./done-reconcile.js";
 
 export interface DoneRetentionDeps {
   dataDir: string;
@@ -11,6 +12,39 @@ export interface DoneRetentionDeps {
   /** The delivery resolver's durable decision, never inferred from file age,
    * worker success, or a completed parent with an unresolved onward result. */
   isDeliveryResolved: (id: string) => boolean;
+}
+
+/** Bind the canonical #305 route-aware resolver without putting any delivery
+ * interpretation in the retention mechanism or the maintenance CLI. */
+export function bindDoneDeliveryResolver(opts: {
+  dataDir: string;
+  logger: Logger;
+  getDelegation: (id: string) => DoneLedgerState | null;
+  getReportBackByCorrelation: (correlationId: string) => DoneLedgerRow | null;
+  resolveDelivery: (
+    result: DispatchResult,
+    row: DoneLedgerState | null,
+    lookups: Pick<typeof opts, "getDelegation" | "getReportBackByCorrelation">
+  ) => boolean;
+}): DoneRetentionDeps {
+  return { dataDir: opts.dataDir, logger: opts.logger, isDeliveryResolved: (id) => {
+    const raw = readFileSync(path.join(dispatchDirs(opts.dataDir).done, `${id}.json`), "utf8");
+    let result: DispatchResult;
+    try {
+      const parsed = JSON.parse(raw);
+      // Malformed legacy output is unresolved evidence. Without validation a
+      // missing route can be mistaken for a no-onward obligation.
+      if (!parsed || typeof parsed !== "object" || typeof parsed.target !== "string" ||
+        !["completed", "failed"].includes(parsed.status) || typeof parsed.finishedUtc !== "string") {
+        throw new Error("invalid result");
+      }
+      result = { ...parsed, id };
+    } catch {
+      // JSON parser errors can contain private prompt/output fragments.
+      throw new Error("invalid done artifact; retained for operator repair");
+    }
+    return opts.resolveDelivery(result, opts.getDelegation(id), opts);
+  } };
 }
 
 export interface DonePruneSummary {
@@ -49,8 +83,9 @@ export function pruneDoneArtifact(
   }
 }
 
-/** Stream existing filenames, not prompt/output bodies or the lifetime SQL
- * ledger. Repeated sweeps are idempotent, so no maintenance cursor is needed.
+/** Stream existing filenames, not the lifetime SQL ledger. The canonical
+ * resolver reads one result at a time for routing, never logging its body.
+ * Repeated sweeps are idempotent, so no maintenance cursor is needed.
  * Yield between small batches to keep backlog cleanup off the boot critical
  * path. Unknown/undelivered files remain in their recovery location. */
 export async function pruneDoneArtifacts(

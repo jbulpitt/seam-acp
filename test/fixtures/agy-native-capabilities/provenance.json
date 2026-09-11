@@ -33,6 +33,7 @@
     { "id": "resume-high-water", "evidence": ["source-confirmed", "offline-reproduced"], "liveVerified": false },
     { "id": "embedded-text-binary-attachments", "evidence": ["source-confirmed", "offline-reproduced"], "liveVerified": false },
     { "id": "session-scoped-mcp", "evidence": ["source-confirmed", "offline-reproduced"], "liveVerified": false },
-    { "id": "structured-result", "evidence": ["source-confirmed", "offline-reproduced"], "liveVerified": false }
+    { "id": "structured-result", "evidence": ["source-confirmed", "offline-reproduced"], "liveVerified": false },
+    { "id": "session-model-isolation", "evidence": ["source-confirmed", "offline-reproduced"], "liveVerified": false }
   ]
 }

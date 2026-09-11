@@ -12,7 +12,6 @@ const STAGING_ROOT = path.join(os.tmpdir(), "seam-attachments");
 const CHAT_POLICY: AgyExecutionPolicy = {
   sandbox: false,
   exposeGlobalStaging: true,
-  persistModelSelection: true,
 };
 
 const base = {
@@ -105,12 +104,6 @@ describe("buildAgyPromptArgs — no other behavior changed", () => {
     ]);
   });
 
-  it("omits --model when the catalog yielded no model", () => {
-    const args = buildAgyPromptArgs({ ...base, modelDisplayName: undefined });
-    expect(args).not.toContain("--model");
-    expect(args).toContain(AGY_NO_SLASH_EXPANSION);
-  });
-
   it("omits --conversation on the first turn of a session", () => {
     expect(buildAgyPromptArgs(base)).not.toContain("--conversation");
   });
@@ -119,7 +112,7 @@ describe("buildAgyPromptArgs — no other behavior changed", () => {
     const args = buildAgyPromptArgs({
       ...base,
       cwd: "/private/image",
-      execution: { sandbox: true, exposeGlobalStaging: false, persistModelSelection: false },
+      execution: { sandbox: true, exposeGlobalStaging: false },
     });
     expect(args).toContain("--sandbox");
     expect(args.filter((a) => a === "--add-dir")).toHaveLength(1);

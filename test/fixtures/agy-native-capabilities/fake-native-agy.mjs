@@ -32,12 +32,20 @@ if (args.includes("--version")) {
 }
 
 if (argValue("--model") === "__seam_probe_invalid__") {
-  process.stderr.write("Unknown model\nAvailable models:\n  Fixture Native Model\n\n");
+  process.stderr.write(
+    "Unknown model\nAvailable models:\n" +
+    "  Fixture Native Model\n" +
+    "  Fixture Native Model (Low)\n\n",
+  );
   process.exit(1);
 }
 
 const scenarioFile = prompt === "ok"
   ? undefined
+  : prompt.includes("capability-model-") && prompt.includes("-resume")
+    ? "turn-two-resume.json"
+    : prompt.includes("capability-model-")
+      ? "turn-one.json"
   : prompt.includes("capability-turn-one")
     ? "turn-one.json"
     : prompt.includes("capability-turn-two")
@@ -113,6 +121,14 @@ const server = http.createServer(async (request, response) => {
             displayName: "Fixture Native Model",
             maxTokens: 4096,
             recommended: true,
+            supportsThinking: true,
+            supportsImages: false,
+            isInternal: false
+          },
+          "fixture-native-model-low": {
+            displayName: "Fixture Native Model (Low)",
+            maxTokens: 4096,
+            recommended: false,
             supportsThinking: true,
             supportsImages: false,
             isInternal: false

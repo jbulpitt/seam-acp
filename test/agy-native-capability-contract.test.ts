@@ -1,4 +1,6 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs";
+import fsPromises from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -97,7 +99,10 @@ async function waitForInvocation(
   return undefined;
 }
 
-function makeRuntime(dataDir = mappingDir): AgentRuntime {
+function makeRuntime(
+  dataDir = mappingDir,
+  options: { defaultModel?: string; initialSettingsFile?: string } = {},
+): AgentRuntime {
   const profile = makeAgyProfile({
     runtime: makeAgyNativeRuntime({
       executable: managedCli.executable,
@@ -113,8 +118,10 @@ function makeRuntime(dataDir = mappingDir): AgentRuntime {
       },
     }),
     dataDir,
-    defaultModel: "Fixture Native Model",
-    persistModelSelection: false,
+    defaultModel: options.defaultModel ?? "Fixture Native Model",
+    ...(options.initialSettingsFile
+      ? { initialSettingsFile: options.initialSettingsFile }
+      : {}),
     exposeGlobalStaging: false,
   });
   return new AgentRuntime({ profile, logger, mcpServers: [seamMcp] });
@@ -281,6 +288,7 @@ describe.sequential("native AGY R1 capability contract", () => {
       "embedded-text-binary-attachments",
       "session-scoped-mcp",
       "structured-result",
+      "session-model-isolation",
     ]);
     for (const entry of provenance.capabilities) {
       expect(entry.evidence).toContain("source-confirmed");
@@ -525,6 +533,245 @@ describe.sequential("native AGY R1 capability contract", () => {
     await resumed.dispose();
   }, 30_000);
 
+  it("keeps exact native model choices session-owned across concurrency, failure, and resume", async () => {
+    const r3Root = fs.mkdtempSync(path.join(root, "model-isolation-"));
+    const r3Mapping = path.join(r3Root, "mapping");
+    const settingsFile = path.join(r3Root, "settings.json");
+    fs.mkdirSync(r3Mapping);
+    fs.writeFileSync(
+      settingsFile,
+      `${JSON.stringify({ model: "Fixture Native Model (Low)", retained: "unchanged" }, null, 2)}\n`,
+    );
+    // Test-owned hashing observes the external file bytes; production never
+    // computes its own oracle for the unchanged-settings assertion.
+    const settingsHash = () => createHash("sha256")
+      .update(fs.readFileSync(settingsFile))
+      .digest("hex");
+    const initialSettingsHash = settingsHash();
+    const first = makeRuntime(r3Mapping, { defaultModel: "", initialSettingsFile: settingsFile });
+    const second = makeRuntime(r3Mapping, { defaultModel: "", initialSettingsFile: settingsFile });
+    let firstSessionId = "";
+    let secondSessionId = "";
+
+    try {
+      await Promise.all([first.start(), second.start()]);
+      const [firstSession, secondSession] = await Promise.all([
+        first.newSession({
+          cwd: r3Root,
+          model: "fixture-native-model",
+          strictModel: true,
+        }),
+        second.newSession({
+          cwd: r3Root,
+          model: "fixture-native-model-low",
+          strictModel: true,
+        }),
+      ]);
+      firstSessionId = firstSession.sessionId;
+      secondSessionId = secondSession.sessionId;
+
+      await Promise.all([
+        first.prompt("capability-model-a"),
+        second.prompt("capability-model-b"),
+      ]);
+      await Promise.all([first.idle(), second.idle()]);
+
+      const firstInvocation = readInvocations().find(
+        (entry) => entry.prompt === "capability-model-a",
+      );
+      const secondInvocation = readInvocations().find(
+        (entry) => entry.prompt === "capability-model-b",
+      );
+      const firstModelAt = firstInvocation?.args?.indexOf("--model") ?? -1;
+      const secondModelAt = secondInvocation?.args?.indexOf("--model") ?? -1;
+      expect(firstInvocation?.args?.slice(firstModelAt, firstModelAt + 2)).toEqual([
+        "--model",
+        "Fixture Native Model",
+      ]);
+      expect(secondInvocation?.args?.slice(secondModelAt, secondModelAt + 2)).toEqual([
+        "--model",
+        "Fixture Native Model (Low)",
+      ]);
+
+      const mappingFile = path.join(r3Mapping, "agy-sessions.json");
+      const persisted = JSON.parse(fs.readFileSync(mappingFile, "utf8")) as Record<
+        string,
+        { modelId?: string }
+      >;
+      expect(persisted[firstSessionId]?.modelId).toBe("fixture-native-model");
+      expect(persisted[secondSessionId]?.modelId).toBe("fixture-native-model-low");
+      expect(settingsHash()).toBe(initialSettingsHash);
+
+      const mappingBeforeInvalid = fs.readFileSync(mappingFile, "utf8");
+      await expect(first.setModel("fixture-model-does-not-exist")).rejects.toThrow(
+        "Invalid params",
+      );
+      expect(first.getSessionInfo()?.currentModelId).toBe("fixture-native-model");
+      expect(fs.readFileSync(mappingFile, "utf8")).toBe(mappingBeforeInvalid);
+      expect(settingsHash()).toBe(initialSettingsHash);
+
+      const mappingDirMode = fs.statSync(r3Mapping).mode & 0o777;
+      fs.chmodSync(r3Mapping, 0o500);
+      try {
+        await expect(first.setModel("fixture-native-model-low")).rejects.toThrow();
+      } finally {
+        fs.chmodSync(r3Mapping, mappingDirMode);
+      }
+      expect(first.getSessionInfo()?.currentModelId).toBe("fixture-native-model");
+      expect(fs.readFileSync(mappingFile, "utf8")).toBe(mappingBeforeInvalid);
+      expect(settingsHash()).toBe(initialSettingsHash);
+
+      const mappingBeforeInterruptedRename = fs.readFileSync(mappingFile, "utf8");
+      const rename = vi.spyOn(fsPromises, "rename").mockRejectedValueOnce(
+        new Error("fixture interruption before atomic mapping rename"),
+      );
+      try {
+        await expect(first.setModel("fixture-native-model-low")).rejects.toThrow(
+          "Internal error",
+        );
+      } finally {
+        rename.mockRestore();
+      }
+      const mappingAfterInterruptedRename = fs.readFileSync(mappingFile, "utf8");
+      expect(mappingAfterInterruptedRename).toBe(mappingBeforeInterruptedRename);
+      const intact = JSON.parse(mappingAfterInterruptedRename) as Record<
+        string,
+        { cascadeId?: string; modelId?: string }
+      >;
+      expect(intact[firstSessionId]).toMatchObject({
+        cascadeId: expectedConversation,
+        modelId: "fixture-native-model",
+      });
+      expect(intact[secondSessionId]).toMatchObject({
+        cascadeId: expectedConversation,
+        modelId: "fixture-native-model-low",
+      });
+      expect(first.getSessionInfo()?.currentModelId).toBe("fixture-native-model");
+      expect(fs.readdirSync(r3Mapping).filter((name) => name.endsWith(".tmp"))).toEqual([]);
+      expect(settingsHash()).toBe(initialSettingsHash);
+    } finally {
+      await Promise.all([first.dispose(), second.dispose()]);
+    }
+
+    // Simulate an operator changing AGY's global default between processes.
+    // Persisted sessions must continue to win, and resume must not rewrite it.
+    fs.writeFileSync(
+      settingsFile,
+      `${JSON.stringify({ model: "Fixture Native Model", retained: "changed-default" }, null, 2)}\n`,
+    );
+    const changedSettingsHash = settingsHash();
+    const resumedFirst = makeRuntime(r3Mapping, {
+      defaultModel: "",
+      initialSettingsFile: settingsFile,
+    });
+    const resumedSecond = makeRuntime(r3Mapping, {
+      defaultModel: "",
+      initialSettingsFile: settingsFile,
+    });
+    try {
+      await Promise.all([resumedFirst.start(), resumedSecond.start()]);
+      const [firstInfo, secondInfo] = await Promise.all([
+        resumedFirst.loadSession({ sessionId: firstSessionId, cwd: r3Root }),
+        resumedSecond.loadSession({ sessionId: secondSessionId, cwd: r3Root }),
+      ]);
+      expect(firstInfo.currentModelId).toBe("fixture-native-model");
+      expect(secondInfo.currentModelId).toBe("fixture-native-model-low");
+      await Promise.all([
+        resumedFirst.prompt("capability-model-a-resume"),
+        resumedSecond.prompt("capability-model-b-resume"),
+      ]);
+      await Promise.all([resumedFirst.idle(), resumedSecond.idle()]);
+
+      const resumedA = readInvocations().find(
+        (entry) => entry.prompt === "capability-model-a-resume",
+      );
+      const resumedB = readInvocations().find(
+        (entry) => entry.prompt === "capability-model-b-resume",
+      );
+      const resumedAAt = resumedA?.args?.indexOf("--model") ?? -1;
+      const resumedBAt = resumedB?.args?.indexOf("--model") ?? -1;
+      expect(resumedA?.args?.slice(resumedAAt, resumedAAt + 2)).toEqual([
+        "--model",
+        "Fixture Native Model",
+      ]);
+      expect(resumedB?.args?.slice(resumedBAt, resumedBAt + 2)).toEqual([
+        "--model",
+        "Fixture Native Model (Low)",
+      ]);
+      expect(settingsHash()).toBe(changedSettingsHash);
+    } finally {
+      await Promise.all([resumedFirst.dispose(), resumedSecond.dispose()]);
+    }
+
+    const staleSessionId = "44444444-4444-4444-8444-444444444444";
+    const mappingFile = path.join(r3Mapping, "agy-sessions.json");
+    const staleMapping = JSON.parse(fs.readFileSync(mappingFile, "utf8")) as Record<
+      string,
+      unknown
+    >;
+    staleMapping[staleSessionId] = {
+      cascadeId: expectedConversation,
+      maxStepIndex: 5,
+      cwd: r3Root,
+      modelId: "fixture-model-no-longer-in-catalog",
+    };
+    fs.writeFileSync(mappingFile, `${JSON.stringify(staleMapping, null, 2)}\n`);
+    const mappingBeforeStaleLoad = fs.readFileSync(mappingFile, "utf8");
+    const staleRuntime = makeRuntime(r3Mapping, {
+      defaultModel: "",
+      initialSettingsFile: settingsFile,
+    });
+    try {
+      await staleRuntime.start();
+      await expect(staleRuntime.loadSession({
+        sessionId: staleSessionId,
+        cwd: r3Root,
+      })).rejects.toThrow("Invalid params");
+      expect(fs.readFileSync(mappingFile, "utf8")).toBe(mappingBeforeStaleLoad);
+      expect(settingsHash()).toBe(changedSettingsHash);
+    } finally {
+      await staleRuntime.dispose();
+    }
+
+    fs.writeFileSync(
+      settingsFile,
+      `${JSON.stringify({ model: "Fixture Native Model (Low)", retained: "legacy-default" }, null, 2)}\n`,
+    );
+    const legacySettingsHash = settingsHash();
+    const legacySessionId = "33333333-3333-4333-8333-333333333333";
+    const legacyMapping = JSON.parse(fs.readFileSync(mappingFile, "utf8")) as Record<
+      string,
+      unknown
+    >;
+    legacyMapping[legacySessionId] = expectedConversation;
+    fs.writeFileSync(mappingFile, `${JSON.stringify(legacyMapping, null, 2)}\n`);
+    const legacyRuntime = makeRuntime(r3Mapping, {
+      defaultModel: "",
+      initialSettingsFile: settingsFile,
+    });
+    try {
+      await legacyRuntime.start();
+      const legacyInfo = await legacyRuntime.loadSession({
+        sessionId: legacySessionId,
+        cwd: r3Root,
+      });
+      expect(legacyInfo.currentModelId).toBe("fixture-native-model-low");
+      const normalized = JSON.parse(fs.readFileSync(mappingFile, "utf8")) as Record<
+        string,
+        { cascadeId?: string; maxStepIndex?: number; modelId?: string }
+      >;
+      expect(normalized[legacySessionId]).toEqual({
+        cascadeId: expectedConversation,
+        maxStepIndex: -1,
+        cwd: r3Root,
+        modelId: "fixture-native-model-low",
+      });
+      expect(settingsHash()).toBe(legacySettingsHash);
+    } finally {
+      await legacyRuntime.dispose();
+    }
+  }, 30_000);
+
   it("feeds native usage through the real AGY auto-compaction predicate and consumer", async () => {
     const dataDir = fs.mkdtempSync(path.join(root, "orchestrator-data-"));
     const turnMappingDir = fs.mkdtempSync(path.join(root, "orchestrator-mapping-"));
@@ -545,7 +792,6 @@ describe.sequential("native AGY R1 capability contract", () => {
       }),
       dataDir: turnMappingDir,
       defaultModel: "Fixture Native Model",
-      persistModelSelection: false,
       exposeGlobalStaging: false,
     });
     const runtime = new AgentRuntime({ profile, logger, mcpServers: [seamMcp] });

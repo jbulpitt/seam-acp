@@ -2,7 +2,7 @@
 import { randomBytes } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { activationRefusal, buildArtifact, commandRunner, loadTargetMap, makeScpCommand, makeSshCommand, parseArgs, parseKeyValues, renderRemoteScript, resolveTarget, rollbackPlan, runPreflight } from "./lib/bridge-rollout.mjs";
+import { activationRefusal, buildArtifact, firstActivationFromBaselineAllowed, commandRunner, loadTargetMap, makeScpCommand, makeSshCommand, parseArgs, parseKeyValues, renderRemoteScript, resolveTarget, rollbackPlan, runPreflight } from "./lib/bridge-rollout.mjs";
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(scriptDir, "..");
@@ -66,7 +66,17 @@ async function main() {
     process.stdout.write(result.stdout);
     return;
   }
-  if (preflight.report.rollout_ready !== "yes") throw new Error(activationRefusal(preflight.report));
+  // A first managed activation from a verified enrolled baseline is the one
+  // exception, and only for ACTIVATE: rollback and every managed-to-managed
+  // transition keep the full capability requirement unchanged.
+  const firstFromBaseline = options.action === "activate" && firstActivationFromBaselineAllowed(preflight.report);
+  if (preflight.report.rollout_ready !== "yes" && !firstFromBaseline) {
+    throw new Error(activationRefusal(preflight.report));
+  }
+  if (firstFromBaseline) {
+    console.log("first_activation_from=enrolled-baseline");
+    console.log(`baseline_rollback_proof=${preflight.report.baseline_rollback_proof}`);
+  }
   if (options.action === "activate") {
     const activationId = nonce(); const operationId = nonce();
     console.log(`activation_id=${activationId}`);

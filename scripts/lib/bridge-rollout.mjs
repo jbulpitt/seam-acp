@@ -292,8 +292,8 @@ export async function runPreflight(target, remoteScript, run = commandRunner) {
   if (report.rollout_ready !== expectedReadiness) throw new Error("remote bridge readiness evidence is inconsistent");
   if (!/^(yes|no|drifted)$/.test(report.enrolled ?? "")) throw new Error("remote enrollment evidence is incomplete");
   if (report.enrolled === "no") {
-    if (report.enrollment_id !== "none" || report.baseline_digest !== "none" || report.baseline_receipt_capable !== "none") throw new Error("remote enrollment evidence is inconsistent");
-  } else if (!TOKEN.test(report.enrollment_id ?? "") || !CHECKSUM.test(report.baseline_digest ?? "") || !/^(yes|no)$/.test(report.baseline_receipt_capable ?? "")) throw new Error("remote enrollment evidence is incomplete");
+    if (report.enrollment_id !== "none" || report.baseline_digest !== "none" || report.baseline_rollback_proof !== "none") throw new Error("remote enrollment evidence is inconsistent");
+  } else if (!TOKEN.test(report.enrollment_id ?? "") || !CHECKSUM.test(report.baseline_digest ?? "") || !/^(receipt|reduced-baseline)$/.test(report.baseline_rollback_proof ?? "")) throw new Error("remote enrollment evidence is incomplete");
   if (report.node_path !== target.nodePath || !/^v(?:2[2-9]|[3-9]\d)\.\d+\.\d+/.test(report.node_version ?? "") || !/^\d+\.\d+\.\d+/.test(report.npm_version ?? "") || report.disk_path !== target.checkoutPath || !/^\d+$/.test(report.disk_bytes_available ?? "") || BigInt(report.disk_bytes_available) <= 0n) throw new Error("remote runtime capacity evidence is incomplete");
   return { command, report, stdout: result.stdout };
 }
@@ -307,11 +307,30 @@ export function newOperationId() { return randomBytes(32).toString("hex"); }
  * generic capability message, so the remote program's specific refusals were
  * unreachable in normal operation (#281 QA).
  */
+/**
+ * A legacy host may take the FIRST managed activation from a verified enrolled
+ * baseline (#288). The capability gate is decomposed rather than relaxed: the
+ * OLD process must be drainable and speak protocol 1, because that is what the
+ * transition itself depends on. The two catalog RPCs are NOT required of it —
+ * they are served by the NEW release and proven on the new connection by the
+ * ordinary receipt, which this path still demands.
+ *
+ * This is self-retiring: once the entrypoint resolves into a managed release
+ * `artifact_mode` is `managed`, so the exception can never apply again.
+ */
+export function firstActivationFromBaselineAllowed(report) {
+  return report.artifact_mode === "legacy-checkout"
+    && report.enrolled === "yes"
+    && report.protocol_version === "1"
+    && report.drain_SIGUSR2 === "yes";
+}
+
 export function activationRefusal(report) {
   const generic = "active bridge lacks the verified drain/protocol/catalog capabilities required for activation or rollback";
   if (report.artifact_mode !== "legacy-checkout") return generic;
   if (report.enrolled === "no") return `${generic}; nothing is enrolled on this host, so no rollback target exists yet (legacy_previous_release_not_receipt_capable) — run --enroll --apply first`;
   if (report.enrolled === "drifted") return `${generic}; the recorded baseline no longer matches this host (enrolled_baseline_state_drift)`;
-  if (report.baseline_receipt_capable !== "yes") return `${generic}; the enrolled baseline cannot emit a rollback receipt (enrolled_baseline_not_receipt_capable)`;
-  return `${generic}; activating from an enrolled baseline is a separate reviewed change (enrolled_baseline_activation_not_enabled)`;
+  if (report.drain_SIGUSR2 !== "yes") return `${generic}; the enrolled baseline cannot be drained with SIGUSR2, so no transition onto it can be proven (enrolled_baseline_not_drainable)`;
+  if (report.protocol_version !== "1") return `${generic}; the enrolled baseline does not speak protocol 1 (enrolled_baseline_protocol_unsupported)`;
+  return generic;
 }

@@ -752,9 +752,15 @@ async function captureBaseline(identity) {
     drainSigusr2: capabilities.drainSupport,
     describeModelCatalog: capabilities.describeSupport,
     fetchModelCatalog: capabilities.fetchSupport,
-    // The honest verdict, from the captured bytes: can THIS baseline emit the
-    // nonce/PID/instance/two-RPC receipt a rollback onto it would have to prove?
-    receiptCapable: capabilities.rolloutReady === "yes" ? "yes" : "no",
+    // WHICH proof a rollback onto this baseline can actually produce, from the
+    // captured bytes. A yes/no said only whether the baseline cleared a gate; a
+    // pre-catalog bridge can still prove a great deal about itself, just not the
+    // nonce/PID/instance/two-RPC receipt, and the record should describe that
+    // rather than collapse it. `receipt` means the standard proof is available;
+    // `reduced-baseline` means a restore onto it is provable by digest-exact
+    // content plus live process/PM2/protocol/drain evidence, with no
+    // controller-observed catalog RPCs.
+    rollbackProof: capabilities.rolloutReady === "yes" ? "receipt" : "reduced-baseline",
     processManager: { manager: "pm2", app: pm2App, cwd: identity.pm2.cwd, execPath: identity.pm2.execPath, interpreter: identity.pm2.interpreter, args: identity.pm2.args },
     runtime: { nodePath, nodeVersion, platform: `${process.platform}-${process.arch}`, uid: expectedUid },
   };
@@ -776,7 +782,7 @@ async function enrollmentState() {
   if (!recordStat.isFile() || recordStat.isSymbolicLink()) fail("enrollment_record_wrong_type");
   assertUid(recordStat, expectedUid, "enrollment_record_wrong_owner");
   const record = parseJson(await fsp.readFile(recordPath), "enrollment_record_invalid");
-  if (record.formatVersion !== 1 || record.kind !== "enrolled-baseline" || record.enrollmentId !== pointer.enrollmentId || record.bridgeId !== bridgeId || record.pm2App !== pm2App || record.baselineDigest !== pointer.baselineDigest) fail("enrollment_record_invalid");
+  if (record.formatVersion !== 2 || record.kind !== "enrolled-baseline" || record.enrollmentId !== pointer.enrollmentId || record.bridgeId !== bridgeId || record.pm2App !== pm2App || record.baselineDigest !== pointer.baselineDigest) fail("enrollment_record_invalid");
   assertObject(record.baseline, "enrollment_record_invalid");
   if (hash(Buffer.from(JSON.stringify(record.baseline), "utf8")) !== record.baselineDigest) fail("enrollment_record_digest_mismatch");
   const preserved = `${baselineRoot}/${pointer.enrollmentId}/entrypoint/index.js`;
@@ -854,7 +860,7 @@ async function enroll() {
       if (existing.record.livePid !== after.pid) fail("enrollment_process_changed");
       console.log("enrollment=unchanged"); console.log(`enrollment_id=${existing.record.enrollmentId}`);
       console.log(`baseline_digest=${existing.record.baselineDigest}`); console.log(`baseline_source_sha=${existing.record.baseline.checkoutSourceSha}`);
-      console.log(`baseline_receipt_capable=${existing.record.baseline.receiptCapable}`); console.log(`live_pid=${after.pid}`);
+      console.log(`baseline_rollback_proof=${existing.record.baseline.rollbackProof}`); console.log(`live_pid=${after.pid}`);
       console.log("process_signaled=no"); console.log("artifact_changed=no");
       return;
     }
@@ -868,7 +874,7 @@ async function enroll() {
     await fsp.writeFile(preserved, captured.entryBytes, { flag: "wx", mode: 0o600 });
     if (hash(await fsp.readFile(preserved)) !== captured.baseline.entrypointSha256) fail("baseline_entrypoint_copy_mismatch");
     safePhase = "enroll_record";
-    const record = { formatVersion: 1, kind: "enrolled-baseline", enrollmentId, bridgeId, pm2App, baseline: captured.baseline, baselineDigest: captured.digest, preservedEntrypoint: preserved, livePid: after.pid, enrolledAt: nowIso() };
+    const record = { formatVersion: 2, kind: "enrolled-baseline", enrollmentId, bridgeId, pm2App, baseline: captured.baseline, baselineDigest: captured.digest, preservedEntrypoint: preserved, livePid: after.pid, enrolledAt: nowIso() };
     await fsp.writeFile(`${baselineRoot}/${enrollmentId}.baseline.json`, safeJson(record), { flag: "wx", mode: 0o600 });
     const pointer = { formatVersion: 1, bridgeId, enrollmentId, baselineDigest: captured.digest, publishedAt: nowIso() };
     const temp = `${currentBaselinePath}.next-${enrollmentId}`;
@@ -885,7 +891,7 @@ async function enroll() {
     if (published.status !== "enrolled") fail("enrollment_verification_failed");
     console.log("enrollment=recorded"); console.log(`enrollment_id=${enrollmentId}`);
     console.log(`baseline_digest=${captured.digest}`); console.log(`baseline_source_sha=${captured.baseline.checkoutSourceSha}`);
-    console.log(`baseline_entrypoint_sha256=${captured.baseline.entrypointSha256}`); console.log(`baseline_receipt_capable=${captured.baseline.receiptCapable}`);
+    console.log(`baseline_entrypoint_sha256=${captured.baseline.entrypointSha256}`); console.log(`baseline_rollback_proof=${captured.baseline.rollbackProof}`);
     console.log(`live_pid=${after.pid}`); console.log("process_signaled=no"); console.log("artifact_changed=no");
     // Enrollment establishes a baseline and nothing else. Activation stays a
     // separate, later, explicitly invoked phase with its own proof obligations.
@@ -974,7 +980,7 @@ async function preflight() {
   console.log(`enrolled=${enrollment.status === "enrolled" ? "yes" : enrollment.status === "drifted" ? "drifted" : "no"}`);
   console.log(`enrollment_id=${enrollment.record?.enrollmentId ?? "none"}`);
   console.log(`baseline_digest=${enrollment.record?.baselineDigest ?? "none"}`);
-  console.log(`baseline_receipt_capable=${enrollment.record?.baseline?.receiptCapable ?? "none"}`);
+  console.log(`baseline_rollback_proof=${enrollment.record?.baseline?.rollbackProof ?? "none"}`);
   console.log("identity_bound=yes"); console.log("remote_mutation=no");
 }
 
@@ -1042,6 +1048,70 @@ async function stage() {
   });
 }
 
+/**
+ * The first managed activation on a host whose previous state is an enrolled
+ * baseline rather than a managed release (#288).
+ *
+ * The FORWARD proof is not weakened: the new release must itself be
+ * receipt-capable, and the replacement must present the ordinary
+ * nonce/PID/instance/two-RPC receipt. What is different is the ROLLBACK target —
+ * a pre-receipt baseline can never emit that receipt, so the intent records
+ * which proof a rollback onto it would get, and the rollback path produces
+ * exactly that proof rather than pretending to produce the usual one.
+ */
+async function activateFromEnrolledBaseline(input) {
+  const { enrollment, before, sourceSha, checksum, stageId, activationId, timeout } = input;
+  safePhase = "first_activation_release";
+  const release = `${releaseRoot}/releases/${sourceSha}-${checksum}`;
+  const staged = await validateRelease(release, sourceSha, checksum, stageId);
+  // Activating a baseline onto a release that also cannot emit a receipt would
+  // leave the host with no provable state in either direction. Refuse early.
+  const forward = await readDeployedCapabilities(release);
+  if (forward.rolloutReady !== "yes") fail("first_activation_release_not_receipt_capable");
+
+  const baseline = enrollment.record.baseline;
+  const started = Date.now(); const deadline = started + timeout * 1000;
+  const intent = {
+    formatVersion: 2, kind: "activate", activationId, bridgeId, pm2App,
+    sourceSha, artifactChecksum: checksum, stageId,
+    previous: {
+      kind: "enrolled-baseline",
+      enrollmentId: enrollment.record.enrollmentId,
+      baselineDigest: enrollment.record.baselineDigest,
+      sourceSha: baseline.checkoutSourceSha,
+      entrypoint: entrypointPath,
+      entrypointSha256: baseline.entrypointSha256,
+      // Stated at intent time so the weaker rollback is visible before the
+      // switch, not discovered afterwards.
+      rollbackProof: baseline.rollbackProof,
+    },
+    verification: { forward: "receipt", catalogRpcsVerified: true },
+    activatedEntrypoint: `${release}/packages/bridge/dist/index.js`,
+    oldPid: before.pid,
+    startedAt: new Date(started).toISOString(), deadlineAt: new Date(deadline).toISOString(),
+  };
+  await fsp.writeFile(`${releaseRoot}/activations/${activationId}.intent.json`, safeJson(intent), { flag: "wx", mode: 0o600 });
+  await writeActivationEnvelope(release, { formatVersion: 2, activationId, bridgeId, sourceSha, artifactChecksum: checksum, verificationAgent: verifyAgent, stageId: staged.stageId, oldPid: before.pid, startedAt: intent.startedAt, deadlineAt: intent.deadlineAt });
+  safePhase = "first_activation_switch";
+  await switchEntrypoint(intent.activatedEntrypoint);
+  process.kill(before.pid, "SIGUSR2");
+  const newPid = await waitForReplacement(before.pid, timeout);
+  const after = await readLiveIdentity();
+  if (after.pid !== newPid || after.entryReal !== intent.activatedEntrypoint || after.legacy) fail("replacement_identity_mismatch");
+  const observed = { ...intent, newPid, observedAt: nowIso() };
+  await fsp.writeFile(`${releaseRoot}/activations/${activationId}.observed.json`, safeJson(observed), { flag: "wx", mode: 0o600 });
+  safePhase = "first_activation_receipt";
+  const ready = await verifyActivationReceipt(release, { activationId, sourceSha, artifactChecksum: checksum, stageId, oldPid: before.pid, newPid, started, deadline });
+  const readyReceiptSha256 = hash(await fsp.readFile(`${release}/release-receipt.json`));
+  const outcome = { ...observed, instanceId: ready.instanceId, readyReceipt: `${release}/release-receipt.json`, readyReceiptSha256, verifiedAt: nowIso() };
+  await fsp.writeFile(`${releaseRoot}/activations/${activationId}.verified.json`, safeJson(outcome), { flag: "wx", mode: 0o600 });
+  console.log("activation=verified"); console.log("activation_from=enrolled-baseline");
+  console.log(`activation_id=${activationId}`); console.log(`old_pid=${before.pid}`); console.log(`new_pid=${newPid}`); console.log(`instance_id=${ready.instanceId}`);
+  console.log(`enrollment_id=${enrollment.record.enrollmentId}`);
+  console.log(`rollback_proof=${baseline.rollbackProof}`);
+  console.log(`rollback_command=npm run bridge:rollout -- --target ${bridgeId} --rollback --activation-id ${activationId} --apply`);
+}
+
 async function activate() {
   if (actionArgs.length !== 6) fail("activate_argument_count");
   const [sourceSha, checksum, stageId, activationId, timeoutText, operationId] = actionArgs;
@@ -1051,17 +1121,22 @@ async function activate() {
   await withLock(operationId, async () => {
     const before = await readLiveIdentity();
     if (before.legacy) {
-      // The refusal is preserved in every legacy case; enrollment only makes it
-      // specific. A rollback onto a baseline that cannot emit the nonce/PID/
-      // instance/two-RPC receipt still cannot be proven, so recording one does
-      // not buy permission to activate — and consuming even a receipt-capable
-      // baseline as an activation's previous release is a separate reviewed
-      // change, not something enrollment grants itself.
+      // The FIRST managed activation on this host (#288), and the only one that
+      // can take this path. It SELF-RETIRES: afterwards the stable entrypoint
+      // resolves into `releases/`, so `before.legacy` is false and this branch
+      // is unreachable forever. Nothing is persisted to enable it and nothing
+      // has to be remembered and unset to retire it.
+      //
+      // A baseline that is merely present is not enough: it is re-verified here
+      // through the same `verifyBaseline` that restore and preflight share, and
+      // both prior refusals are unchanged.
       const enrollment = await enrollmentStatus(before);
       if (enrollment.status === "none") fail("legacy_previous_release_not_receipt_capable");
       if (enrollment.status === "drifted") fail("enrolled_baseline_state_drift");
-      if (enrollment.record.baseline.receiptCapable !== "yes") fail("enrolled_baseline_not_receipt_capable");
-      fail("enrolled_baseline_activation_not_enabled");
+      await activateFromEnrolledBaseline({
+        enrollment, before, sourceSha, checksum, stageId, activationId, timeout,
+      });
+      return;
     }
     const previousDir = path.resolve(before.entryReal, "../../../..");
     const previousName = path.basename(previousDir); const match = /^([0-9a-f]{40})-([0-9a-f]{64})$/.exec(previousName); if (!match) fail("previous_release_name_invalid");
@@ -1084,6 +1159,102 @@ async function activate() {
     await fsp.writeFile(`${releaseRoot}/activations/${activationId}.verified.json`, safeJson(outcome), { flag: "wx", mode: 0o600 });
     console.log("activation=verified"); console.log(`activation_id=${activationId}`); console.log(`old_pid=${before.pid}`); console.log(`new_pid=${newPid}`); console.log(`instance_id=${ready.instanceId}`); console.log(`rollback_command=npm run bridge:rollout -- --target ${bridgeId} --rollback --activation-id ${activationId} --apply`);
   });
+}
+
+/**
+ * Roll a first managed activation back onto its enrolled baseline (#288).
+ *
+ * The baseline's bytes predate the receipt mechanism, so the standard
+ * nonce/PID/instance/two-RPC proof is unobtainable here no matter how exactly
+ * the restore is performed. Rather than pretend otherwise, this produces the
+ * strongest proof that baseline can actually emit and records precisely which
+ * proofs were and were NOT part of it, so a later reader can tell which
+ * verification this transition received.
+ *
+ * What is proven: the recorded checkout revision and every runtime-scope file
+ * still hash to the baseline; the entrypoint bytes and mode are restored
+ * exactly and re-verified afterwards; the old PID exited; a distinct owned
+ * replacement PID appeared; PM2 still maps it to the exact app, interpreter,
+ * cwd and bridge id; and the restored bytes carry protocol 1 and the SIGUSR2
+ * drain handler.
+ *
+ * What is NOT proven, and is recorded as not proven: the two catalog RPCs, and
+ * anything the controller observed. No controller-side evidence exists for a
+ * pre-catalog bridge.
+ */
+async function rollbackToEnrolledBaseline(input) {
+  const { record, previous, current, failedActivationId, rollbackId, recordKind, timeout } = input;
+  safePhase = "baseline_rollback_record";
+  if (!HASH.test(previous.enrollmentId ?? "") || !HASH.test(previous.baselineDigest ?? "") ||
+      previous.entrypoint !== entrypointPath || !HASH.test(previous.entrypointSha256 ?? "")) {
+    fail("rollback_previous_invalid");
+  }
+  const state = await enrollmentState();
+  if (state.status !== "recorded") fail("enrollment_not_recorded");
+  if (state.record.enrollmentId !== previous.enrollmentId || state.record.baselineDigest !== previous.baselineDigest) {
+    fail("rollback_baseline_identity_mismatch");
+  }
+  // Before anything is changed: the surrounding tree must still be the one the
+  // baseline describes, or this is not a restore.
+  const verified = await verifyBaseline(state.record, null);
+  if (!verified.ok) fail(verified.reason);
+
+  const started = Date.now(); const deadline = started + timeout * 1000;
+  const intent = {
+    formatVersion: 2, kind: "rollback", rollbackId, failedActivationId,
+    failedActivationRecordKind: recordKind, bridgeId, pm2App,
+    from: { sourceSha: record.sourceSha, artifactChecksum: record.artifactChecksum, stageId: record.stageId, entrypoint: record.activatedEntrypoint, pid: current.pid, readyReceiptSha256: record.readyReceiptSha256 ?? null },
+    to: previous,
+    verification: {
+      proof: "reduced-baseline",
+      // Stated plainly and in the record itself, not merely implied by the
+      // absence of a receipt field.
+      catalogRpcsVerified: false,
+      controllerObserved: false,
+      note: "pre-receipt baseline: restored by digest-exact content plus live process, PM2, protocol and drain evidence",
+    },
+    oldPid: current.pid,
+    startedAt: new Date(started).toISOString(), deadlineAt: new Date(deadline).toISOString(),
+  };
+  await fsp.writeFile(`${releaseRoot}/rollbacks/${failedActivationId}-${rollbackId}.intent.json`, safeJson(intent), { flag: "wx", mode: 0o600 });
+  safePhase = "baseline_rollback_restore";
+  // The baseline entrypoint is the checkout's own regular file, so it is written
+  // back rather than repointed.
+  const temp = `${entrypointPath}.seam-rollback-${process.pid}`;
+  await fsp.writeFile(temp, state.preservedBytes, { flag: "wx", mode: state.record.baseline.entrypointMode });
+  await fsp.chmod(temp, state.record.baseline.entrypointMode);
+  await fsp.rename(temp, entrypointPath);
+  if (hash(await fsp.readFile(entrypointPath)) !== previous.entrypointSha256) fail("rollback_entrypoint_mismatch");
+  process.kill(current.pid, "SIGUSR2");
+  const newPid = await waitForReplacement(current.pid, timeout);
+  safePhase = "baseline_rollback_prove";
+  const after = await readLiveIdentity();
+  if (after.pid !== newPid || !after.legacy || after.entryReal !== entrypointPath) fail("rollback_replacement_identity_mismatch");
+  if (after.pm2.name !== pm2App || after.pm2.cwd !== checkoutPath || after.pm2.interpreter !== nodePath) fail("rollback_replacement_identity_mismatch");
+  // `readLiveIdentity` already proved the PM2 argv carries this exact bridge id.
+  const reproved = await verifyBaseline(state.record, after);
+  if (!reproved.ok) fail(reproved.reason);
+  const restoredCapabilities = await readDeployedCapabilities(checkoutPath);
+  if (restoredCapabilities.protocolVersion !== "1") fail("rollback_baseline_protocol_unproven");
+  if (restoredCapabilities.drainSupport !== "yes") fail("rollback_baseline_drain_unproven");
+  const outcome = {
+    ...intent, newPid,
+    proved: {
+      baselineDigest: state.record.baselineDigest,
+      entrypointSha256: previous.entrypointSha256,
+      oldPidExited: true,
+      replacementPid: newPid,
+      pm2App, bridgeId,
+      protocolVersion: restoredCapabilities.protocolVersion,
+      drainSigusr2: restoredCapabilities.drainSupport,
+    },
+    verifiedAt: nowIso(),
+  };
+  await fsp.writeFile(`${releaseRoot}/rollbacks/${failedActivationId}-${rollbackId}.verified.json`, safeJson(outcome), { flag: "wx", mode: 0o600 });
+  console.log("rollback=verified"); console.log("rollback_to=enrolled-baseline");
+  console.log(`rollback_id=${rollbackId}`); console.log(`old_pid=${current.pid}`); console.log(`new_pid=${newPid}`);
+  console.log(`restored_sha=${previous.sourceSha}`); console.log(`restored_entrypoint_sha256=${previous.entrypointSha256}`);
+  console.log("rollback_proof=reduced-baseline"); console.log("catalog_rpcs_verified=no");
 }
 
 async function rollback() {
@@ -1109,6 +1280,10 @@ async function rollback() {
     }
     if (recordKind === "verified" && (!HASH.test(record.readyReceiptSha256 ?? "") || hash(await fsp.readFile(record.readyReceipt)) !== record.readyReceiptSha256)) fail("activation_ready_receipt_changed");
     const previous = record.previous; assertObject(previous,"rollback_previous_invalid");
+    if (previous.kind === "enrolled-baseline") {
+      await rollbackToEnrolledBaseline({ record, previous, current, failedActivationId, rollbackId, recordKind, timeout });
+      return;
+    }
     const expectedPreviousEntrypoint = `${releaseRoot}/releases/${previous.sourceSha}-${previous.artifactChecksum}/packages/bridge/dist/index.js`;
     if (!SHA.test(previous.sourceSha ?? "") || !HASH.test(previous.artifactChecksum ?? "") || !HASH.test(previous.stageId ?? "") || previous.entrypoint !== expectedPreviousEntrypoint) fail("rollback_previous_invalid");
     const previousDir = path.resolve(previous.entrypoint,"../../../.."); const previousReceipt = await validateRelease(previousDir, previous.sourceSha, previous.artifactChecksum, previous.stageId);

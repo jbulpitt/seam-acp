@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { activationRefusal, artifactName, buildArtifact, commandRunner, makeScpCommand, makeSshCommand, parseArgs, parseKeyValues, resolveTarget, rollbackPlan, runPreflight, validateReadyReceipt, validateTargetMap, verifyChecksum } from "../scripts/lib/bridge-rollout.mjs";
+import { activationRefusal, artifactName, firstActivationFromBaselineAllowed, buildArtifact, commandRunner, makeScpCommand, makeSshCommand, parseArgs, parseKeyValues, resolveTarget, rollbackPlan, runPreflight, validateReadyReceipt, validateTargetMap, verifyChecksum } from "../scripts/lib/bridge-rollout.mjs";
 
 const root = path.resolve(import.meta.dirname, "..");
 const configured = JSON.parse(fs.readFileSync(path.join(root, "ops/bridge/targets.json"), "utf8"));
@@ -32,7 +32,7 @@ function preflightReport(target: ReturnType<typeof resolveTarget>, overrides: Re
     enrolled: "no",
     enrollment_id: "none",
     baseline_digest: "none",
-    baseline_receipt_capable: "none",
+    baseline_rollback_proof: "none",
     node_path: target.nodePath,
     node_version: "v24.15.0",
     npm_version: "11.6.2",
@@ -87,12 +87,29 @@ describe("bridge rollout target safety (#241)", () => {
     const legacy = (overrides: Record<string, string>) =>
       parseKeyValues(preflightReport(target, { artifact_mode: "legacy-checkout", rollout_ready: "no", ...overrides }));
     expect(activationRefusal(legacy({ enrolled: "no" }))).toMatch(/nothing is enrolled.*legacy_previous_release_not_receipt_capable.*--enroll/s);
-    expect(activationRefusal(legacy({ enrolled: "drifted", enrollment_id: "a".repeat(64), baseline_digest: "b".repeat(64), baseline_receipt_capable: "no" })))
+    expect(activationRefusal(legacy({ enrolled: "drifted", enrollment_id: "a".repeat(64), baseline_digest: "b".repeat(64), baseline_rollback_proof: "reduced-baseline" })))
       .toMatch(/enrolled_baseline_state_drift/);
-    expect(activationRefusal(legacy({ enrolled: "yes", enrollment_id: "a".repeat(64), baseline_digest: "b".repeat(64), baseline_receipt_capable: "no" })))
-      .toMatch(/enrolled_baseline_not_receipt_capable/);
-    expect(activationRefusal(legacy({ enrolled: "yes", enrollment_id: "a".repeat(64), baseline_digest: "b".repeat(64), baseline_receipt_capable: "yes" })))
-      .toMatch(/enrolled_baseline_activation_not_enabled/);
+    // #288: a baseline that cannot be drained still cannot host a transition,
+    // and the operator is told which rung failed.
+    expect(activationRefusal(legacy({ enrolled: "yes", enrollment_id: "a".repeat(64), baseline_digest: "b".repeat(64), baseline_rollback_proof: "reduced-baseline", drain_SIGUSR2: "no" })))
+      .toMatch(/enrolled_baseline_not_drainable/);
+    expect(activationRefusal(legacy({ enrolled: "yes", enrollment_id: "a".repeat(64), baseline_digest: "b".repeat(64), baseline_rollback_proof: "reduced-baseline", protocol_version: "2" })))
+      .toMatch(/enrolled_baseline_protocol_unsupported/);
+    // #288: a drainable, protocol-1 enrolled host is no longer refused at all —
+    // the capability gate is decomposed, not relaxed, and the two catalog RPCs
+    // are demanded of the NEW release on the new connection instead.
+    const eligible = legacy({ enrolled: "yes", enrollment_id: "a".repeat(64), baseline_digest: "b".repeat(64), baseline_rollback_proof: "reduced-baseline" });
+    expect(firstActivationFromBaselineAllowed(eligible)).toBe(true);
+    // …and the exception is scoped to legacy hosts only, so it self-retires the
+    // moment the entrypoint resolves into a managed release.
+    expect(firstActivationFromBaselineAllowed(parseKeyValues(preflightReport(target, { rollout_ready: "no", enrolled: "yes", enrollment_id: "a".repeat(64), baseline_digest: "b".repeat(64), baseline_rollback_proof: "receipt" })))).toBe(false);
+    expect(firstActivationFromBaselineAllowed(legacy({ enrolled: "no" }))).toBe(false);
+    // The exception is a DECOMPOSITION of the gate, not a hole in it: the old
+    // process must still be drainable and speak protocol 1, because the
+    // transition itself depends on both.
+    expect(firstActivationFromBaselineAllowed(legacy({ enrolled: "yes", enrollment_id: "a".repeat(64), baseline_digest: "b".repeat(64), baseline_rollback_proof: "reduced-baseline", drain_SIGUSR2: "no" }))).toBe(false);
+    expect(firstActivationFromBaselineAllowed(legacy({ enrolled: "yes", enrollment_id: "a".repeat(64), baseline_digest: "b".repeat(64), baseline_rollback_proof: "reduced-baseline", protocol_version: "2" }))).toBe(false);
+    expect(firstActivationFromBaselineAllowed(legacy({ enrolled: "drifted", enrollment_id: "a".repeat(64), baseline_digest: "b".repeat(64), baseline_rollback_proof: "reduced-baseline" }))).toBe(false);
     // A managed host keeps the original message; enrollment says nothing there.
     expect(activationRefusal(parseKeyValues(preflightReport(target, { rollout_ready: "no" })))).toBe(
       "active bridge lacks the verified drain/protocol/catalog capabilities required for activation or rollback"

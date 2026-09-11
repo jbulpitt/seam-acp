@@ -1895,7 +1895,7 @@ describe("#174 replay matches the LIVE dispatch contract, not just the fields", 
     const deps = {
       dataDir,
       logger: silent,
-      getDelegation: () => ({ status, kind: "forward", correlationId: "legacy-h" }),
+      getDelegation: () => ({ status, kind: "forward" as const, correlationId: "legacy-h" }),
       replay,
       abandonUnprovable: abandon,
     };

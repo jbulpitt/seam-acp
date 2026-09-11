@@ -8,6 +8,7 @@ import { DispatchWatcher } from "../packages/core/src/core/dispatch/watcher.js";
 import { bindDoneDeliveryResolver, DoneRetention, pruneDoneArtifact, pruneDoneArtifacts } from "../packages/core/src/core/dispatch/done-retention.js";
 import { dispatchDirs, type DispatchSpec } from "../packages/core/src/core/dispatch/types.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
+import { isDoneDeliveryResolved } from "../packages/core/src/core/dispatch/done-reconcile.js";
 
 let dataDir: string;
 let store: SessionStore;
@@ -35,8 +36,50 @@ function complete(id: string, delivered: boolean): void {
 // worker status, report-back, or Discord nonce constitutes delivery proof.
 const deps = () => ({ dataDir, logger, isDeliveryResolved: (id: string) => store.turnAttempts.get(id)?.deliveryDone === true });
 const artifact = (id: string) => path.join(dispatchDirs(dataDir).done, `${id}.json`);
+const canonicalDeps = () => bindDoneDeliveryResolver({ dataDir, logger,
+  getDelegation: (id) => store.getDelegation(id),
+  getReportBackByCorrelation: (id) => store.getReportBackByCorrelation(id),
+  resolveDelivery: isDoneDeliveryResolved,
+});
+async function routedFile(id: string, fields: Record<string, unknown> = {}): Promise<void> {
+  await writeFile(artifact(id), JSON.stringify({ id, target: "worker", kind: "wake", status: "completed",
+    finishedUtc: new Date().toISOString(), output: "synthetic captured output", ...fields }));
+}
 
 describe("proof-only done retention (#306)", () => {
+  it("retains terminal handoff/chain parents until the #305 resolver settles their actual onward child", async () => {
+    store.recordDelegation({ id: "handoff", kind: "handoff", status: "completed", correlationId: "correlation" });
+    store.recordDelegation({ id: "report", kind: "report_back", status: "dispatched", correlationId: "correlation" });
+    await routedFile("handoff", { kind: "handoff", returnTo: "origin", correlationId: "correlation" });
+    // Removing the route-aware resolver deletes a parent's only recoverable result while report-back is still pending.
+    expect(pruneDoneArtifact(canonicalDeps(), "handoff").state).toBe("retained");
+    store.updateDelegationStatus("report", "completed");
+    expect(pruneDoneArtifact(canonicalDeps(), "handoff").state).toBe("pruned");
+
+    store.recordDelegation({ id: "chain", kind: "forward", status: "completed" });
+    store.recordDelegation({ id: "plan", kind: "report_back", status: "completed", correlationId: "chain", targetRef: "next" });
+    store.recordDelegation({ id: "next", kind: "forward", status: "abandoned" });
+    await routedFile("chain", { kind: "forward", chainId: "synthetic-chain" });
+    // A completed plan is not delivery; unexplained abandonment is not an explicit disposition either.
+    expect(pruneDoneArtifact(canonicalDeps(), "chain").state).toBe("retained");
+    store.updateDelegationStatus("next", "abandoned", { terminalReason: "operator explicitly declined this synthetic delivery" });
+    expect(pruneDoneArtifact(canonicalDeps(), "chain").state).toBe("pruned");
+  });
+
+  it("retains unknown/nonterminal sources and expires explicitly resolved legacy abandonment", async () => {
+    await routedFile("unknown");
+    store.recordDelegation({ id: "running", kind: "wake", status: "running" });
+    await routedFile("running");
+    // Removing the canonical source-state gate mistakes captured but unsettled output for completed delivery.
+    expect(pruneDoneArtifact(canonicalDeps(), "unknown").state).toBe("retained");
+    expect(pruneDoneArtifact(canonicalDeps(), "running").state).toBe("retained");
+    store.recordDelegation({ id: "legacy", kind: "handoff", status: "abandoned" });
+    await routedFile("legacy", { kind: "handoff" });
+    expect(pruneDoneArtifact(canonicalDeps(), "legacy").state).toBe("retained");
+    store.updateDelegationStatus("legacy", "abandoned", { terminalReason: "legacy delivery cannot be reconstructed; explicitly abandoned" });
+    expect(pruneDoneArtifact(canonicalDeps(), "legacy").state).toBe("pruned");
+  });
+
   it("uses the canonical resolver decision and does not log invalid private bodies", async () => {
     complete("routed", true);
     const row = store.getDelegation("routed");
@@ -109,7 +152,7 @@ describe("proof-only done retention (#306)", () => {
   });
 
   it("removes the file even when delivery was proved before the watcher publishes it", async () => {
-    const manager = new DoneRetention(deps());
+    const manager = new DoneRetention(canonicalDeps());
     managers.push(manager);
     const dirs = dispatchDirs(dataDir);
     await mkdir(dirs.pending, { recursive: true });

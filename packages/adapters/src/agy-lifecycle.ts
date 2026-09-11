@@ -22,7 +22,8 @@ export async function agyWait<T>(work: Promise<T>, signal: AbortSignal): Promise
 /** Only use with a child launched in its own process group (detached:true). */
 export async function reapAgyTree(child: ChildProcess): Promise<void> {
   // A failed kill must not permit a replacement turn beside the old process.
-  if (!await terminateProcessGroup(child, 500)) throw agyFailure("not_reaped");
+  // Native AGY can need more than 500 ms to flush and acknowledge SIGTERM.
+  if (!await terminateProcessGroup(child, 1_000)) throw agyFailure("not_reaped");
 }
 
 /** One interactive turn; no finite-probe byte ceiling on streamed answers. */

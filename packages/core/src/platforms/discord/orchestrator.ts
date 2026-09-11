@@ -11111,6 +11111,17 @@ export class Orchestrator {
         this.store.scheduledOccurrences.settle(occurrence.id);
         return;
       }
+      // Protects live scheduled streams whose final nonce was never planned;
+      // deleting it can replay a full answer after some chunks were visible.
+      if (row.sessionMode === "live") {
+        this.store.turnAttempts.abandonDelivery(
+          attempt.id,
+          "completed live schedule has no terminal nonce receipt; partial delivery cannot be excluded"
+        );
+        this.patchScheduledStatus(row.id, "abandoned: delivery proof unavailable");
+        this.store.scheduledOccurrences.settle(occurrence.id);
+        return;
+      }
       // Protects old send-without-receipt attempts from unsafe replay; deleting
       // this check can duplicate a pre-upgrade scheduled result.
       if (!attempt.deliveryProtocol) {
@@ -14255,7 +14266,7 @@ export class Orchestrator {
       );
       return "abandoned";
     }
-    const sinceMs = Date.parse(attempt.deliveryStartedUtc) - 5_000;
+    const sinceMs = Date.parse(attempt.deliveryStartedUtc) - 5 * 60_000;
     // Protects against treating corrupt receipt time as a complete history scan;
     // deleting this check can turn an indeterminate lookup into unsafe replay.
     if (!Number.isFinite(sinceMs)) {

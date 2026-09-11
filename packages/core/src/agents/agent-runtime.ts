@@ -42,8 +42,20 @@ import type {
 } from "../core/elicitation/types.js";
 
 /** Events surfaced from the ACP `session/update` stream. */
+export interface AsyncUserInputQuestion {
+  title: string;
+  options: string[] | null;
+}
+
 export type AgentEvent =
   | { kind: "agent-text"; text: string; messageId?: string }
+  | {
+      kind: "async-user-input";
+      itemId: string;
+      threadId: string;
+      turnId: string;
+      questions: AsyncUserInputQuestion[];
+    }
   | { kind: "agent-thought"; text: string }
   | {
       kind: "tool-start";
@@ -173,6 +185,74 @@ export const ACP_CLIENT_CAPABILITIES = Object.freeze({
   fs: Object.freeze({ readTextFile: false, writeTextFile: false }),
   elicitation: Object.freeze({ form: Object.freeze({}), url: Object.freeze({}) }),
 }) satisfies ClientCapabilities;
+
+const ASYNC_INPUT_MAX_QUESTIONS = 20;
+const ASYNC_INPUT_MAX_TITLE = 100;
+const ASYNC_INPUT_MAX_OPTIONS = 25;
+const ASYNC_INPUT_MAX_ID = 256;
+const CONTROL_CHARACTER = /[\u0000-\u001f\u007f]/u;
+
+function objectRecord(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function exactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+  const actual = Object.keys(value).sort();
+  const expected = [...keys].sort();
+  return actual.length === expected.length && actual.every((key, index) => key === expected[index]);
+}
+
+/** Decode the reviewed codex-acp async-question extension. Fail closed on any
+ * extra/sensitive field or malformed correlation so opaque provider metadata
+ * can never become a Discord form accidentally. */
+export function codexAsyncUserInputFromUpdate(update: SessionUpdate): {
+  itemId: string;
+  threadId: string;
+  turnId: string;
+  questions: AsyncUserInputQuestion[];
+} | null {
+  if (update.sessionUpdate !== "agent_message_chunk") return null;
+  const root = objectRecord((update as unknown as { _meta?: unknown })._meta);
+  const codex = objectRecord(root?.codex);
+  const input = objectRecord(codex?.asyncUserInput);
+  if (!input) return null;
+  if (!exactKeys(input, ["delivery", "threadId", "turnId", "itemId", "questions"]) ||
+      input.delivery !== "async") return null;
+  const printableId = (value: unknown): value is string =>
+    typeof value === "string" && value.length > 0 && value.length <= ASYNC_INPUT_MAX_ID &&
+    !CONTROL_CHARACTER.test(value);
+  if (!printableId(input.threadId) || !printableId(input.turnId) || !printableId(input.itemId) ||
+      update.messageId !== input.itemId || !Array.isArray(input.questions) ||
+      input.questions.length < 1 || input.questions.length > ASYNC_INPUT_MAX_QUESTIONS) return null;
+  const questions: AsyncUserInputQuestion[] = [];
+  for (const raw of input.questions) {
+    const question = objectRecord(raw);
+    if (!question || !exactKeys(question, ["title", "options"]) ||
+        typeof question.title !== "string" || !question.title.trim() ||
+        question.title.length > ASYNC_INPUT_MAX_TITLE || CONTROL_CHARACTER.test(question.title)) return null;
+    if (question.options === null) {
+      questions.push({ title: question.title, options: null });
+      continue;
+    }
+    if (!Array.isArray(question.options) || question.options.length < 2 ||
+        question.options.length > ASYNC_INPUT_MAX_OPTIONS) return null;
+    const options: string[] = [];
+    for (const option of question.options) {
+      if (typeof option !== "string" || !option.trim() || option.length > 100 ||
+          CONTROL_CHARACTER.test(option) || options.includes(option)) return null;
+      options.push(option);
+    }
+    questions.push({ title: question.title, options });
+  }
+  return {
+    itemId: input.itemId,
+    threadId: input.threadId,
+    turnId: input.turnId,
+    questions,
+  };
+}
 
 function withTimeout<T = never>(ms: number, message: string): Promise<T> {
   return new Promise((_resolve, reject) => {
@@ -1350,6 +1430,11 @@ export class AgentRuntime {
   private async dispatchSessionUpdate(update: SessionUpdate): Promise<void> {
     switch (update.sessionUpdate) {
       case "agent_message_chunk": {
+        const asyncInput = codexAsyncUserInputFromUpdate(update);
+        if (asyncInput) {
+          await this.emit({ kind: "async-user-input", ...asyncInput });
+          return;
+        }
         await this.handleContentBlock(update.content, "message", {
           messageId: update.messageId ?? undefined,
         });

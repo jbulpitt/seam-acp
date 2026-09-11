@@ -402,12 +402,56 @@ interface Waiter {
   resolve: (response: CreateElicitationResponse) => void;
 }
 
+export interface CodexAsyncUserInputRequest {
+  itemId: string;
+  threadId: string;
+  turnId: string;
+  questions: Array<{ title: string; options: string[] | null }>;
+}
+
+export interface CodexAsyncAnswerDelivery {
+  row: ElicitationRow;
+  interactionId: string;
+  authorName?: string;
+  prompt: string;
+}
+
+function codexAsyncForm(input: CodexAsyncUserInputRequest): FormRequest {
+  const keys = input.questions.map((_, index) => `question_${index + 1}`);
+  return {
+    mode: "form",
+    sessionId: input.threadId,
+    toolCallId: input.itemId,
+    message: input.questions.length === 1
+      ? input.questions[0]!.title
+      : "Codex asked several questions. Answer every field to continue the same conversation.",
+    requestedSchema: {
+      type: "object",
+      title: input.questions.length === 1 ? "Codex question" : "Codex questions",
+      properties: Object.fromEntries(input.questions.map((question, index) => [
+        keys[index]!,
+        question.options === null
+          ? { type: "string", title: question.title, minLength: 1, maxLength: ELICITATION_MAX_TEXT }
+          : {
+              type: "string",
+              title: question.title,
+              oneOf: question.options.map((option) => ({ title: option, const: option })),
+            },
+      ])),
+      required: keys,
+    },
+  } as FormRequest;
+}
+
 export class ElicitationManager {
   private readonly store: SessionStore;
   private readonly adapter: ChatAdapter;
   private readonly logger: Logger;
   private readonly currentUserId: (channelRef: string) => string | undefined;
   private readonly now: () => number;
+  private readonly onCodexAsyncAnswer?: (
+    delivery: CodexAsyncAnswerDelivery
+  ) => Promise<boolean>;
   private readonly waiters = new Map<string, Waiter>();
   private readonly timers = new Map<string, ReturnType<typeof setTimeout>>();
 
@@ -416,18 +460,25 @@ export class ElicitationManager {
     adapter: ChatAdapter;
     logger: Logger;
     currentUserId: (channelRef: string) => string | undefined;
+    onCodexAsyncAnswer?: (delivery: CodexAsyncAnswerDelivery) => Promise<boolean>;
     now?: () => number;
   }) {
     this.store = opts.store;
     this.adapter = opts.adapter;
     this.logger = opts.logger.child({ comp: "elicitation" });
     this.currentUserId = opts.currentUserId;
+    this.onCodexAsyncAnswer = opts.onCodexAsyncAnswer;
     this.now = opts.now ?? Date.now;
   }
 
   async recoverOpen(): Promise<number> {
     const rows = this.store.listOpenElicitations();
     for (const row of rows) {
+      if (row.source === "codex_async") {
+        if (row.answerMessageId) await this.deliverClaimedCodexAsyncAnswer(row);
+        else this.armExpiry(row.id, row.expiresUtc);
+        continue;
+      }
       const settled = this.store.settleElicitation(
         row.id, "interrupted", "Seam restarted before this request completed.", this.nowUtc()
       );
@@ -435,6 +486,84 @@ export class ElicitationManager {
     }
     this.store.clearExpiredElicitationLeases(this.nowUtc());
     return rows.length;
+  }
+
+  async createCodexAsync(
+    record: SessionRecord,
+    input: CodexAsyncUserInputRequest
+  ): Promise<boolean> {
+    const userId = this.currentUserId(record.channelRef);
+    if (!userId || !record.acpSessionId || !this.adapter.sendElicitationCard ||
+        !this.adapter.editElicitationCard || input.threadId !== record.acpSessionId) return false;
+    const correlation = JSON.stringify({
+      threadId: input.threadId,
+      turnId: input.turnId,
+      itemId: input.itemId,
+    });
+    if (this.store.getCodexAsyncElicitation(record.id, correlation)) return true;
+    const request = codexAsyncForm(input);
+    const checked = validateFormRequest(request);
+    if (!checked.ok) {
+      await this.postRefusal(record, request.message, checked.error);
+      return false;
+    }
+    const now = this.now();
+    const row: ElicitationRow & { status: "open" } = {
+      id: randomUUID(),
+      sessionRecordId: record.id,
+      platform: record.platform,
+      channelRef: record.channelRef,
+      parentRef: record.parentRef,
+      authorizedUserId: userId,
+      acpSessionId: record.acpSessionId,
+      requestCorrelation: correlation,
+      source: "codex_async",
+      answerMessageId: null,
+      mode: "form",
+      elicitationId: null,
+      requestJson: durableRequest(request),
+      valuesJson: "{}",
+      completedPagesJson: "[]",
+      currentPage: 0,
+      status: "open",
+      messageId: null,
+      leaseToken: null,
+      leaseExpiresUtc: null,
+      terminalDetail: null,
+      createdUtc: new Date(now).toISOString(),
+      updatedUtc: new Date(now).toISOString(),
+      expiresUtc: new Date(now + ELICITATION_TTL_MS).toISOString(),
+    };
+    const superseded = this.store.replaceOpenElicitation(row);
+    for (const old of superseded) {
+      this.finish(old, responseForTerminal(old.status as ElicitationTerminalStatus));
+      await this.refresh(old);
+    }
+    try {
+      const sent = await this.adapter.sendElicitationCard(
+        {
+          platform: row.platform,
+          id: row.channelRef,
+          ...(row.parentRef ? { parentId: row.parentRef } : {}),
+        },
+        this.render(row, checked.value)
+      );
+      if (!this.store.attachElicitationMessage(row.id, sent.id, this.nowUtc())) {
+        const latest = this.store.getElicitation(row.id);
+        if (latest) await this.adapter.editElicitationCard(sent, this.render(latest));
+      } else {
+        row.messageId = sent.id;
+      }
+      this.armExpiry(row.id, row.expiresUtc);
+      return true;
+    } catch (error) {
+      this.logger.warn({ error, id: row.id }, "async elicitation card post failed");
+      const failed = this.store.settleElicitation(
+        row.id, "declined", "The Discord card could not be posted.", this.nowUtc()
+      );
+      if (failed) await this.refresh(failed);
+      return false;
+    }
   }
 
   async create(
@@ -481,6 +610,8 @@ export class ElicitationManager {
       authorizedUserId: userId,
       acpSessionId: record.acpSessionId || null,
       requestCorrelation: correlation.value,
+      source: "request",
+      answerMessageId: null,
       mode: request.mode,
       elicitationId: request.mode === "url" ? (request as UrlRequest).elicitationId : null,
       requestJson: durableRequest(request),
@@ -558,6 +689,10 @@ export class ElicitationManager {
       await event.replyEphemeral("That input request has already been settled.").catch(() => {});
       return;
     }
+    if (row.answerMessageId) {
+      await event.replyEphemeral("That answer is already queued for the originating conversation.").catch(() => {});
+      return;
+    }
     const request = parseStored<CreateElicitationRequest | null>(row.requestJson, null);
     if (!request) {
       await this.cancelOne(row.id, "declined", "Stored request state was unreadable.");
@@ -601,7 +736,7 @@ export class ElicitationManager {
         return;
       }
       await event.deferUpdate().catch(() => {});
-      await this.accept(row.id, {}, "The optional decision was skipped.");
+      await this.accept(row.id, {}, "The optional decision was skipped.", event);
       return;
     }
     if (action.kind === "boolean") {
@@ -610,7 +745,7 @@ export class ElicitationManager {
         return;
       }
       await event.deferUpdate().catch(() => {});
-      await this.accept(row.id, { [form.fields[0].key]: action.value }, "Answered on the card.");
+      await this.accept(row.id, { [form.fields[0].key]: action.value }, "Answered on the card.", event);
       return;
     }
     if (action.kind === "choice") {
@@ -623,7 +758,8 @@ export class ElicitationManager {
       await this.accept(
         row.id,
         { [direct.field.key]: direct.options[action.index]!.value },
-        "Answered on the card."
+        "Answered on the card.",
+        event
       );
       return;
     }
@@ -645,7 +781,8 @@ export class ElicitationManager {
       await this.accept(
         row.id,
         { [direct.field.key]: direct.kind === "single" ? selected[0]! : selected },
-        "Answered on the card."
+        "Answered on the card.",
+        event
       );
       return;
     }
@@ -726,14 +863,15 @@ export class ElicitationManager {
       const allRequired = form.fields.every((field) => !field.required || values[field.key] !== undefined);
       const finalPage = latest.currentPage === form.pages.length - 1;
       if (finalPage && allRequired) {
-        const accepted = this.store.acceptElicitation(
-          row.id, "All form pages were saved.", this.nowUtc(), action.lease
-        );
         await event.replyEphemeral("Saved. The request is complete.").catch(() => {});
-        if (accepted) {
-          this.finish(accepted, { action: "accept", content: values });
-          await this.refresh(accepted, form);
-        }
+        await this.accept(
+          row.id,
+          values,
+          "All form pages were saved.",
+          event,
+          action.lease,
+          form
+        );
         return;
       }
       const nextPage = Math.min(form.pages.length - 1, latest.currentPage + 1);
@@ -1000,12 +1138,93 @@ export class ElicitationManager {
     return Array.isArray(value) ? value.join(", ") : String(value);
   }
 
-  private async accept(id: string, values: ElicitationValues, detail: string): Promise<boolean> {
-    const row = this.store.acceptElicitation(id, detail, this.nowUtc());
+  private async accept(
+    id: string,
+    values: ElicitationValues,
+    detail: string,
+    event?: ComponentEvent,
+    leaseToken?: string,
+    known?: ValidatedForm
+  ): Promise<boolean> {
+    const current = this.store.getElicitation(id);
+    if (current?.source === "codex_async") {
+      if (!event) return false;
+      const claimed = this.store.claimCodexAsyncElicitationAnswer(
+        id,
+        event.interactionId,
+        JSON.stringify(values),
+        this.nowUtc(),
+        leaseToken
+      );
+      if (!claimed) return false;
+      const delivered = await this.deliverClaimedCodexAsyncAnswer(claimed, event.userName);
+      if (!delivered) {
+        await event.followUpEphemeral(
+          "The originating Codex conversation is no longer available; the answer was not sent."
+        ).catch(() => {});
+      }
+      return delivered;
+    }
+    const row = this.store.acceptElicitation(id, detail, this.nowUtc(), leaseToken);
     if (!row) return false;
     this.finish(row, { action: "accept", content: values });
-    await this.refresh(row);
+    await this.refresh(row, known);
     return true;
+  }
+
+  private async deliverClaimedCodexAsyncAnswer(
+    row: ElicitationRow,
+    authorName?: string
+  ): Promise<boolean> {
+    if (row.source !== "codex_async" || !row.answerMessageId || !this.onCodexAsyncAnswer) {
+      return false;
+    }
+    const request = parseStored<CreateElicitationRequest | null>(row.requestJson, null);
+    if (!request || request.mode !== "form") {
+      const failed = this.store.settleElicitation(
+        row.id, "declined", "Stored async question state was unreadable.", this.nowUtc()
+      );
+      if (failed) await this.refresh(failed);
+      return false;
+    }
+    const checked = validateFormRequest(request as FormRequest);
+    const values = parseStored<ElicitationValues>(row.valuesJson, {});
+    if (!checked.ok || checked.value.fields.some((field) => values[field.key] === undefined)) {
+      const failed = this.store.settleElicitation(
+        row.id, "declined", "Stored async answer state was invalid.", this.nowUtc()
+      );
+      if (failed) await this.refresh(failed);
+      return false;
+    }
+    const answerLines = checked.value.fields.map((field) =>
+      `${field.title}: ${this.displayValue(values[field.key]!)}`
+    );
+    const prompt = answerLines.length === 1
+      ? this.displayValue(values[checked.value.fields[0]!.key]!)
+      : `Answers to your questions:\n${answerLines.map((line) => `- ${line}`).join("\n")}`;
+    let admitted = false;
+    try {
+      admitted = await this.onCodexAsyncAnswer({
+        row,
+        interactionId: row.answerMessageId,
+        ...(authorName ? { authorName } : {}),
+        prompt,
+      });
+    } catch (error) {
+      this.logger.warn({ error, id: row.id }, "async elicitation answer admission failed");
+    }
+    if (!admitted) {
+      const failed = this.store.settleElicitation(
+        row.id, "interrupted", "The originating conversation changed; no answer was sent.", this.nowUtc()
+      );
+      if (failed) await this.refresh(failed, checked.value);
+      return false;
+    }
+    const accepted = this.store.acceptElicitation(
+      row.id, "Answer queued for the originating Codex conversation.", this.nowUtc()
+    );
+    if (accepted) await this.refresh(accepted, checked.value);
+    return accepted !== null;
   }
 
   private async cancelOne(

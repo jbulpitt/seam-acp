@@ -22,6 +22,7 @@ export type ElicitationTerminalStatus =
   | "interrupted"
   | "declined";
 export type ElicitationStatus = "open" | ElicitationTerminalStatus;
+export type ElicitationSource = "request" | "codex_async";
 
 export interface ElicitationRow {
   id: string;
@@ -32,6 +33,9 @@ export interface ElicitationRow {
   authorizedUserId: string;
   acpSessionId: string | null;
   requestCorrelation: string;
+  source: ElicitationSource;
+  /** Discord interaction snowflake after an async answer is durably claimed. */
+  answerMessageId: string | null;
   mode: "form" | "url";
   elicitationId: string | null;
   requestJson: string;

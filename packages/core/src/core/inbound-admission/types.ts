@@ -21,6 +21,10 @@ export interface InboundAdmission {
   queueEpoch: number | null;
   createdUtc: string;
   updatedUtc: string;
+  /** Exact ACP conversation this synthetic admission is allowed to enter. */
+  expectedAcpSessionId: string | null;
+  /** Real platform messages pre-empt; card-routed async answers wait FIFO. */
+  preemptive: boolean;
 }
 
 export interface NewInboundAdmission {
@@ -34,4 +38,6 @@ export interface NewInboundAdmission {
   text: string;
   attachments?: MessageAttachment[];
   createdUtc: string;
+  expectedAcpSessionId?: string | null;
+  preemptive?: boolean;
 }

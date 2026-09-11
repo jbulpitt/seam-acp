@@ -1926,6 +1926,37 @@ describe("SeamMcpServer", () => {
     expect(text).toContain("💻");
   });
 
+  it("threads renders retained dispatch quarantine instead of calling the target idle (#290)", async () => {
+    h = await makeHarness({
+      listThreads: async () => [{
+        id: "111111111111111111",
+        name: "recovery worker",
+        isSelf: false,
+        agent: "codex",
+        model: "gpt",
+        effort: null,
+        cwd: "/repo",
+        busy: false,
+        queueState: "stalled",
+        stalledDispatchCount: 1,
+        stalledDispatchIds: ["dispatch-stalled-1"],
+        status: "active",
+        lastActivityUtc: "2026-09-10T08:31:13.000Z",
+      }],
+    });
+    const { body } = await h.call(
+      "tools/call",
+      { name: "threads", arguments: {} },
+      { "X-Seam-Session": "good-token" }
+    );
+    expect(body.result.isError).toBeFalsy();
+    const text = body.result.content[0].text as string;
+    expect(text).toContain("[stalled]");
+    expect(text).toContain("dispatch-stalled-1");
+    expect(text).toContain("/seam workflows");
+    expect(text).not.toContain("[idle]");
+  });
+
   it("threads refuses a scope that names another channel (self-scope, #73)", async () => {
     h = await makeHarness({ listThreads: async () => [] });
     const { body } = await h.call(

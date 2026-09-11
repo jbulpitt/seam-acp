@@ -49,7 +49,7 @@ import {
 } from "./platforms/discord/voice-console-components.js";
 import { VoiceLeaseManager } from "./core/voice-lease.js";
 import { evaluateWatch } from "./core/watch/evaluate.js";
-import { DispatchWatcher } from "./core/dispatch/watcher.js";
+import { createRuntimeDispatchWatcher } from "./core/dispatch/watcher.js";
 import { reconcileCompletedDoneFiles } from "./core/dispatch/done-reconcile.js";
 import { dispatchDirs, enqueueDispatchSpec, type DispatchSpec } from "./core/dispatch/types.js";
 import { SeamTokenRegistry } from "./core/mcp/token-registry.js";
@@ -922,10 +922,12 @@ async function main(): Promise<void> {
               effort: cfg.effort.value,
               fastMode: cfg.fastMode?.value === true,
               cwd: cfg.cwd.value,
-              busy: router.isBusy(s.id) || queue.state !== "idle",
+              busy: router.isBusy(s.id) || (queue.state !== "idle" && queue.state !== "stalled"),
               queueState: queue.state,
               queueAgeMs: queue.ageMs,
               queueEpoch: queue.epoch,
+              stalledDispatchCount: queue.stalledDispatchCount,
+              stalledDispatchIds: queue.stalledDispatchIds,
               status,
               lastActivityUtc: s.updatedUtc,
               location,
@@ -1086,10 +1088,10 @@ async function main(): Promise<void> {
   // <DATA_DIR>/dispatch/pending/ and the watcher runs it as a turn in the
   // target thread, writing the captured output to done/. Started after the
   // adapter so a dispatch never fires before Discord can receive its output.
-  const dispatchWatcher = new DispatchWatcher({
+  const dispatchWatcher = createRuntimeDispatchWatcher({
     dataDir: config.DATA_DIR,
     logger: logger.child({ mod: "dispatch" }),
-    onDispatch: (spec) => orchestrator.dispatchInjectTurn(spec),
+    runtime: orchestrator,
     // Flag-on: mark stale running specs in place (orchestrator stagger-
     // requeues after preconditions). Flag-off: today's recoverStale replay.
     resumeEnabled: config.SEAM_TURN_RESUME_ENABLED,

@@ -25,7 +25,7 @@ async function fixture(sandbox = false, timeoutSeconds = 10) {
   });
   const runtime = new AgentRuntime({ logger, profile: makeAgyProfile({
     runtime: managed.runtime, dataDir: root, defaultModel: "Fixture Native Model",
-    printTimeoutSeconds: timeoutSeconds, persistModelSelection: false, exposeGlobalStaging: false, sandbox,
+    printTimeoutSeconds: timeoutSeconds, exposeGlobalStaging: false, sandbox,
     mcpServers: [{ type: "http", name: "must-not-inherit", url: "http://127.0.0.1:9", headers: [] }],
   }) });
   const events: AgentEvent[] = [];

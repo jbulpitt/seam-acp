@@ -320,6 +320,8 @@ describe("Codex Session Manager", () => {
     const usage = await manager.getUsage("/workspace/repo", ID_A);
     expect(usage.totalUsed).toBe(90);
     expect(usage.contextLimit).toBe(258400);
+    // Without this provenance, real Codex rollout limits cannot be persisted separately from inferred limits.
+    expect(usage.contextLimitSource).toBe("observed");
     expect(usage.model).toBe("gpt-5.4");
   });
 

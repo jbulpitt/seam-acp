@@ -195,6 +195,7 @@ export class CodexSessionManager implements ISessionManager {
         model: usage.model,
         totalUsed: usage.totalTokens,
         contextLimit: usage.contextLimit,
+        contextLimitSource: "observed",
       };
     } catch {
       return emptyUsage();

@@ -53,9 +53,6 @@ export interface DispatchStatusPanelOptions {
   /** Heartbeat interval that ticks the elapsed clock while otherwise idle.
    *  Defaults to 5000ms, matching the user-turn panel's `STATUS_HEARTBEAT_MS`. */
   heartbeatMs?: number;
-  /** Authoritative per-model context window floor (from static models), used so
-   *  an agent's generic 200K default never masks the true window. 0 = unknown. */
-  modelContextFloor?: number;
 }
 
 export class DispatchStatusPanel<TRef = unknown> {
@@ -125,7 +122,7 @@ export class DispatchStatusPanel<TRef = unknown> {
    *   - model-changed            → model
    *   - agent-thought            → thinking window
    *   - agent-state              → action
-   *   - usage-update             → context-window health (high-water + floor)
+   *   - usage-update             → context-window health (raw served limit)
    * agent-text / agent-file / mode-changed / config-options / error do not
    * alter the panel (agent-text drives the *separate* plain-output stream).
    */
@@ -159,16 +156,13 @@ export class DispatchStatusPanel<TRef = unknown> {
         s.setAction(event.state);
         break;
       case "usage-update": {
-        // Ignore size:0 and mid-turn used:0 blips (compact boundaries / proxy
-        // chunks with missing usage), exactly as the user-turn path does.
-        if (event.size <= 0 || event.used === 0) return;
+        // Reject invalid telemetry, but zero used can be a valid fresh/compacted session.
+        if (!Number.isFinite(event.size) || event.size <= 0 ||
+            !Number.isFinite(event.used) || event.used < 0) return;
         const used = Math.max(event.used, s.contextUsedHighWater);
         s.contextUsedHighWater = used;
-        const size = Math.max(
-          event.size,
-          this.opts.modelContextFloor ?? 0,
-          s.contextWindowSize
-        );
+        // A smaller served budget is authoritative; catalog/high-water floors over-admit input.
+        const size = event.size;
         s.contextWindowSize = size;
         s.context = formatContextUsage(used, size);
         break;

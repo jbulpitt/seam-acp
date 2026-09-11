@@ -400,6 +400,18 @@ export async function probeCopilotCatalog(options: {
   }
 }
 
+/** Read the actual launch selection without claiming ACP acknowledged it (#4275). */
+export function copilotRequestedContextTier(args: readonly string[]): string | undefined {
+  let tier: string | undefined;
+  for (let i = 0; i < args.length; i++) {
+    const value = args[i] === "--context" ? args[++i]
+      : args[i]?.startsWith("--context=") ? args[i]!.slice(10) : undefined;
+    // Only the CLI's public enum is attributable; malformed flags must not become observed tiers.
+    if (value === "default" || value === "long_context") tier = value;
+  }
+  return tier;
+}
+
 /**
  * GitHub Copilot CLI as an ACP server (`copilot --acp`).
  *
@@ -465,6 +477,7 @@ export function makeCopilotProfile(opts: {
     id: opts.id ?? "copilot",
     displayName: opts.displayName ?? "GitHub Copilot",
     defaultModel: opts.defaultModel,
+    requestedContextTier: copilotRequestedContextTier(acpArgs),
     catalog: {
       scope: () => manifestCatalogScope({
         provider: "github-copilot",

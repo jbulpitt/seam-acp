@@ -70,12 +70,25 @@ describe("DispatchStatusPanel: drives TurnStatus from onEvent", () => {
     await panel.finalize("Done", "Completed");
   });
 
-  it("ignores size:0 / used:0 usage blips (no context set from noise)", async () => {
+  // Protects real empty/compacted telemetry; dropping zero-used updates hides a newly smaller budget.
+  it("accepts a zero-used measurement but ignores a zero budget", async () => {
     const { panel, status } = makeUnitPanel();
     await panel.start();
     panel.handleEvent({ kind: "usage-update", used: 0, size: 200_000 });
     panel.handleEvent({ kind: "usage-update", used: 12_345, size: 0 });
-    expect(status.context).toBeUndefined();
+    expect(status.contextWindowSize).toBe(200_000);
+    await panel.finalize("Done");
+  });
+
+  // Without this assertion a catalog/previous-size floor can silently display too much served input capacity.
+  it("replaces a catalog-sized estimate and accepts a smaller served budget", async () => {
+    const { panel, status } = makeUnitPanel();
+    status.contextWindowSize = 1_000_000;
+    await panel.start();
+    panel.handleEvent({ kind: "usage-update", used: 30_000, size: 272_000 });
+    expect(status.contextWindowSize).toBe(272_000);
+    panel.handleEvent({ kind: "usage-update", used: 0, size: 200_000 });
+    expect(status.contextWindowSize).toBe(200_000);
     await panel.finalize("Done");
   });
 

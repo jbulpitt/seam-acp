@@ -1,4 +1,13 @@
 import { describe, expect, it } from "vitest";
+import type { ContextBudgetIdentity, ContextBudgetObservation } from "../packages/core/src/core/context-budget.js";
+
+const identity = (agentId: string, model: string): ContextBudgetIdentity =>
+  ({ agentId, model, location: "local", acpSessionId: "session", requestedTier: null });
+const observed = (agentId: string, model: string, size: number) => ({
+  model, size, budget: { ...identity(agentId, model), used: 30_000, promptBudget: size,
+    totalWindow: null, outputAllocation: null, observedTier: null, source: "acp-usage",
+    atUtc: "2026-09-11T00:00:00Z", previousPromptBudget: null } satisfies ContextBudgetObservation,
+});
 import { lookupClaudeNativeContextWindow } from "@seam/adapters";
 import {
   GROK_STATIC_MODELS,
@@ -79,14 +88,16 @@ describe("resolveContextWindow matrix", () => {
       source: "operational-catalog",
     },
     {
-      name: "Copilot exact cached metadata when no live usage or static list",
+      // Protects input vs total capacity: removing this distinction would admit 400K into a 272K prompt.
+      name: "Copilot binding-qualified prompt metadata when no live usage or static list",
       input: {
         agentId: "copilot",
         model: "gpt-5.5",
         catalogModels: [{ modelId: "gpt-5.5", name: "GPT-5.5" }],
-        metadataWindow: 400_000,
+        identity: identity("copilot", "gpt-5.5"),
+        metadataBudget: { ...identity("copilot", "gpt-5.5"), promptBudget: 272_000 },
       },
-      window: 400_000,
+      window: 272_000,
       source: "model-metadata",
     },
     {
@@ -94,9 +105,10 @@ describe("resolveContextWindow matrix", () => {
       input: {
         agentId: "codex",
         model: "gpt-5.4",
-        metadataWindow: 272_000,
+        identity: identity("codex", "gpt-5.4"),
+        metadataBudget: { ...identity("codex", "gpt-5.4"), promptBudget: 258_400 },
       },
-      window: 272_000,
+      window: 258_400,
       source: "model-metadata",
     },
     {
@@ -144,7 +156,8 @@ describe("resolveContextWindow matrix", () => {
       input: {
         agentId: "claude",
         model: "claude-opus-4.8",
-        lastContextUsage: { model: "claude-opus-4.8", size: 800_000 },
+        identity: identity("claude", "claude-opus-4.8"),
+        lastContextUsage: observed("claude", "claude-opus-4.8", 800_000),
         catalogModels: [{ modelId: "claude-opus-4.8", name: "Opus", contextLimit: 1_000_000 }],
       },
       window: 800_000,
@@ -179,7 +192,6 @@ describe("resolveContextWindow matrix", () => {
         agentId: "copilot",
         model: "mystery-999",
         catalogModels: [{ modelId: "gpt-5.5", name: "GPT-5.5", contextLimit: 400_000 }],
-        metadataWindow: null,
       })
     ).toThrow(/agent `copilot` model `mystery-999`[\s\S]*Checked: live-usage, operational-catalog, model-metadata/);
   });

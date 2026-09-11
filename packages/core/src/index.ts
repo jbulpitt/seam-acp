@@ -585,7 +585,6 @@ async function main(): Promise<void> {
     modelCatalog,
     agyRuntime,
     refreshModelIntelligence: (forceSources) => modelIntelligenceManager.refresh({ forceSources }),
-    getModelMetadata: (idOrSlug) => modelMetadataStore.get(idOrSlug).model,
   });
 
   publishLocalAgyRuntimeProvenance(orchestrator, agyRuntime);

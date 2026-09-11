@@ -43,6 +43,8 @@ export interface AdapterModel {
  * always present so callers can round-trip values like grok's `spawnArgs`.
  */
 export interface AdapterDescribe {
+  /** Optional launch request; NOT confirmation of the served context tier. */
+  requestedContextTier?: string;
   version: number;
   models: ReadonlyArray<AdapterModel>;
   effort: EffortDescriptor;
@@ -141,6 +143,7 @@ export interface AgentAdapter {
 
   /** Default model id this agent should use unless the session overrides it. */
   readonly defaultModel: string;
+  readonly requestedContextTier?: string;
 
   /** Required operational model/capability source and portable selection codec. */
   readonly catalog: AdapterCatalogSource;
@@ -346,6 +349,7 @@ export function asLocalAdapter(core: AgentProfileCore): AgentAdapter {
         : { mechanism: "none", levels: [] };
       return {
         version: AGENT_ADAPTER_VERSION,
+        ...(adapter.requestedContextTier ? { requestedContextTier: adapter.requestedContextTier } : {}),
         models,
         effort,
         ...(adapter.runtime ? { runtime: adapter.runtime } : {}),

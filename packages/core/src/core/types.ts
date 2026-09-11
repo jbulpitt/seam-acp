@@ -52,12 +52,12 @@ export interface SessionConfigState {
    */
   autoApprovePermissions?: boolean;
   /**
-   * Last-known context-window usage at end of the previous turn. Used to
-   * seed the status panel at turn start so the user sees continuity. Cleared
-   * on model change. May go stale after out-of-band session edits — corrected
-   * by the post-turn side-channel `getUsage` read in normal operation.
+   * Latest qualified observation, written on receipt by ordinary and live
+   * dispatch turns. Used to seed a matching execution's status panel.
    */
   lastContextUsage?: {
+    /** Legacy rows without provenance are display/budget-ineligible. */
+    budget?: import("./context-budget.js").ContextBudgetObservation;
     used: number;
     size: number;
     /** The model id this measurement was taken under. Used to invalidate

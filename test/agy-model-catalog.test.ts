@@ -13,7 +13,6 @@ describe("agyExecutionPolicyArgs", () => {
     const args = agyExecutionPolicyArgs("/workspace", {
       sandbox: false,
       exposeGlobalStaging: true,
-      persistModelSelection: true,
     });
     expect(args).toContain("--dangerously-skip-permissions");
     expect(args).not.toContain("--sandbox");
@@ -26,7 +25,6 @@ describe("agyExecutionPolicyArgs", () => {
       agyExecutionPolicyArgs("/private/image", {
         sandbox: true,
         exposeGlobalStaging: false,
-        persistModelSelection: false,
       })
     ).toEqual([
       "--sandbox",
@@ -190,7 +188,6 @@ describe("selectAgyTurnModel", () => {
       selectAgyTurnModel({
         catalog: [flash, opus],
         sessionModelId: "gemini-3.8-flash-high",
-        defaultModel: "Claude Opus 4.6 (Thinking)",
       })
     ).toEqual({ entry: flash });
   });
@@ -200,18 +197,15 @@ describe("selectAgyTurnModel", () => {
       selectAgyTurnModel({
         catalog: [flash, opus],
         sessionModelId: "gemini-3.1-flash-lite",
-        defaultModel: "Claude Opus 4.6 (Thinking)",
       })
     ).toEqual({ error: "unknown AGY model gemini-3.1-flash-lite" });
   });
 
-  it("still auto-heals the settings.json / default path when no session model is set", () => {
+  it("rejects a missing session model instead of consulting a shared default", () => {
     expect(
       selectAgyTurnModel({
         catalog: [flash, opus],
-        settingsModelId: "stale-settings-id",
-        defaultModel: "Claude Opus 4.6 (Thinking)",
       })
-    ).toEqual({ entry: opus, healedFrom: "stale-settings-id" });
+    ).toEqual({ error: "AGY session has no model selection" });
   });
 });

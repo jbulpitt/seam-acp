@@ -116,7 +116,6 @@ describe("native AGY R2 runtime identity", () => {
       runtime: fixture.runtime,
       dataDir: root,
       defaultModel: "Fixture Native Model",
-      persistModelSelection: false,
       exposeGlobalStaging: false,
     });
     const agent = new AgentRuntime({ profile, logger });

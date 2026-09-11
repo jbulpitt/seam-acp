@@ -12,9 +12,10 @@ conversation SQLite are not thinking sources for this contract.
 
 R1 freezes observed behavior so later AGY stories have a regression gate. R2
 now extends that gate with the launch/provenance rules in
-`docs/agy-native-runtime.md`; it does not change model selection, catalog,
-lifecycle, persistence, helper routing, deployment, or production state. R0's
-restoration ledger and next-turn rebuild gates remain untouched.
+`docs/agy-native-runtime.md`. R3 extends the same native behavior gate with
+session-owned model selection; it does not modernize the catalog, lifecycle,
+redaction, helper/MCP parity, deployment, or production state. R0's restoration
+ledger and next-turn rebuild gates remain untouched.
 
 The executable fixture and sanitized traces live in
 `test/fixtures/agy-native-capabilities/`. `provenance.json` records the CLI,
@@ -45,6 +46,18 @@ model self-report or a claim of live correctness.
 - A persisted native conversation ID and step high-water mark survive runtime
   disposal/load. Replayed old indices are suppressed and only the resumed
   turn's new indices are emitted.
+- Each native ACP session persists its own exact canonical model id beside its
+  conversation mapping. Every real native turn resolves that id against the
+  exact current catalog and passes the matching fixture-owned runtime display
+  name via `--model`; baked high/low variants remain distinct. Concurrent
+  sessions, process disposal/load, and a later global-default change cannot
+  cross-wire those values. The global settings file is a one-time initial
+  default only for a mapping with no model and its bytes are never mutated.
+- Model selection commits the mapping before changing in-memory state. An
+  unknown exact id or a failed mapping write leaves both the prior in-memory
+  model and persisted bytes intact. The contract derives expected argv values
+  from fixture literals and observes the real native invocation log rather
+  than asking the production resolver to predict itself.
 - ACP cancellation interrupts the active native turn, settles it as cancelled,
   and leaves the persisted conversation mapping intact. This is behavioral
   evidence only; bounded process-tree cleanup belongs to R5.
@@ -99,6 +112,31 @@ profiles' production configuration to use a non-writable content-addressed AGY
 artifact and binds native launches to its version, digest, account scope, and
 approved environment. Lifecycle/redaction enforcement still belongs to R5
 ([#261](https://github.com/jbulpitt/seam-acp/issues/261)).
+
+R3 deliberately leaves catalog/LKG modernization to R4
+([#260](https://github.com/jbulpitt/seam-acp/issues/260)), lifecycle and
+redaction to R5 ([#261](https://github.com/jbulpitt/seam-acp/issues/261)),
+native MCP/helper parity to R8 ([#264](https://github.com/jbulpitt/seam-acp/issues/264)),
+and deployment/canaries to R9 ([#265](https://github.com/jbulpitt/seam-acp/issues/265)).
+
+## R3 deletion-safety rationale
+
+- The per-file mutation queue prevents concurrent session selections from
+  overwriting each other's mapping rows; remove it and the last writer wins.
+- Empty-catalog checks prevent native turns from falling back to shared AGY
+  state; remove them and exact model ownership is no longer enforceable.
+- Missing/unknown session-model checks prevent silent substitution, including
+  between baked-effort variants; remove them and a requested tier can change.
+- Persist-before-memory ordering keeps a failed selection atomic; reverse or
+  remove it and the live process diverges from what restart will restore.
+- Including `modelId` in every mapping snapshot prevents conversation/high-water
+  updates from erasing the choice; remove it and resume changes model.
+- The no-conversation guards permit model-only pre-prompt rows to be listed,
+  read, or deleted safely; remove them and those ordinary operations build
+  invalid conversation paths.
+- Reading global settings only while creating or normalizing a model-less row
+  gives legacy sessions one initial default; read it per turn and sessions
+  cross-contaminate again.
 
 Restart attempt ownership and continuation remain governed by
 [#250](https://github.com/jbulpitt/seam-acp/issues/250), durable scheduled

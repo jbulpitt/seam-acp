@@ -203,12 +203,45 @@ const LEGACY_MAPPING_FILE = path.join(AGY_HOME, "seam_sessions.json");
  * subscribe. Anything ≤ this we've already shown the user.
  */
 interface PersistedSession {
-  cascadeId: string;
+  cascadeId?: string;
   maxStepIndex: number;
   cwd?: string;
+  /** Canonical id from the exact native catalog used for every resumed turn. */
+  modelId?: string;
 }
 
 type SessionMapping = Record<string, PersistedSession | string>;
+
+const mappingWriteTails = new Map<string, Promise<void>>();
+
+/**
+ * Serialize read-modify-write operations for one mapping file in this process.
+ * Without this queue, two native ACP sessions selecting models concurrently can
+ * each read the old file and the last writer silently deletes the other row.
+ */
+async function mutateSessionMapping(
+  file: string,
+  mutate: (mapping: SessionMapping) => void,
+): Promise<void> {
+  const previous = mappingWriteTails.get(file) ?? Promise.resolve();
+  const current = previous.catch(() => {}).then(async () => {
+    let mapping: SessionMapping = {};
+    try {
+      mapping = JSON.parse(await fs.readFile(file, "utf8")) as SessionMapping;
+    } catch { /* fresh file */ }
+    mutate(mapping);
+    await fs.mkdir(path.dirname(file), { recursive: true });
+    await fs.writeFile(file, JSON.stringify(mapping, null, 2) + "\n");
+  });
+  mappingWriteTails.set(file, current);
+  try {
+    await current;
+  } finally {
+    // Keep a newer queued mutation registered; deleting it here would allow a
+    // third write to bypass the still-running second write and lose its row.
+    if (mappingWriteTails.get(file) === current) mappingWriteTails.delete(file);
+  }
+}
 
 /**
  * Highest step index recorded in a cascade's conversation DB, or -1 if it can't
@@ -265,13 +298,7 @@ async function savePersistedSession(
   entry: PersistedSession,
 ): Promise<void> {
   try {
-    let mapping: SessionMapping = {};
-    try {
-      mapping = JSON.parse(await fs.readFile(file, "utf8")) as SessionMapping;
-    } catch { /* fresh file */ }
-    mapping[sessionId] = entry;
-    await fs.mkdir(path.dirname(file), { recursive: true });
-    await fs.writeFile(file, JSON.stringify(mapping, null, 2) + "\n");
+    await savePersistedSessionStrict(file, sessionId, entry);
   } catch (err) {
     if (process.env.AGY_PROFILE_DEBUG) {
       // eslint-disable-next-line no-console
@@ -280,18 +307,31 @@ async function savePersistedSession(
   }
 }
 
+/**
+ * Selection commits must report mapping write failures to the ACP caller.
+ * If this throws, the in-memory session is left unchanged; otherwise a failed
+ * disk write could make the current process use a model that resume forgets.
+ */
+async function savePersistedSessionStrict(
+  file: string,
+  sessionId: string,
+  entry: PersistedSession,
+): Promise<void> {
+  await mutateSessionMapping(file, (mapping) => {
+    mapping[sessionId] = entry;
+  });
+}
+
 async function clearPersistedSession(
   file: string,
   sessionId: string,
 ): Promise<void> {
   try {
-    let mapping: SessionMapping;
-    try {
-      mapping = JSON.parse(await fs.readFile(file, "utf8")) as SessionMapping;
-    } catch { return; /* nothing on disk */ }
-    if (!(sessionId in mapping)) return;
-    delete mapping[sessionId];
-    await fs.writeFile(file, JSON.stringify(mapping, null, 2) + "\n");
+    const exists = await fs.access(file).then(() => true).catch(() => false);
+    if (!exists) return;
+    await mutateSessionMapping(file, (mapping) => {
+      delete mapping[sessionId];
+    });
   } catch (err) {
     if (process.env.AGY_PROFILE_DEBUG) {
       // eslint-disable-next-line no-console
@@ -363,9 +403,9 @@ export function makeAgyProfile(opts: {
   /** Expose Seam's shared attachment staging root. Defaults true for normal
    *  chat sessions; isolated helpers should copy inputs into their own cwd. */
   exposeGlobalStaging?: boolean;
-  /** Persist model picks into agy's process-global settings file. Defaults
-   *  true for normal interactive sessions; isolated helpers must disable it. */
-  persistModelSelection?: boolean;
+  /** Override only the file read once when a session has no persisted model.
+   *  Production uses AGY's normal global settings; fixtures use an isolated file. */
+  initialSettingsFile?: string;
 }): AgentProfile {
   const runtime = opts.runtime;
   const defaultModel = opts.defaultModel ?? "antigravity";
@@ -435,8 +475,8 @@ export function makeAgyProfile(opts: {
         {
           sandbox: opts.sandbox ?? false,
           exposeGlobalStaging: opts.exposeGlobalStaging ?? true,
-          persistModelSelection: opts.persistModelSelection ?? true,
-        }
+        },
+        opts.initialSettingsFile ?? SETTINGS_FILE,
       );
     },
     sessionManager: {
@@ -585,14 +625,20 @@ export function makeAgyProfile(opts: {
         const oldEntry = mapping[oldSessionId];
         if (!oldEntry) throw new Error(`Old session ${oldSessionId} not found in mapping`);
 
-        let oldCascadeId: string;
+        let oldCascadeId: string | undefined;
         let oldMaxStepIndex = -1;
+        let oldModelId: string | undefined;
         if (typeof oldEntry === "string") {
           oldCascadeId = oldEntry;
         } else {
           oldCascadeId = oldEntry.cascadeId;
           oldMaxStepIndex = oldEntry.maxStepIndex;
+          oldModelId = oldEntry.modelId;
         }
+
+        // A model-only row exists before the first prompt but has no native
+        // conversation to clone; deleting this guard would invent file paths.
+        if (!oldCascadeId) throw new Error(`Session ${oldSessionId} has no conversation to clone`);
 
         const newCascadeId = randomUUID();
 
@@ -620,12 +666,12 @@ export function makeAgyProfile(opts: {
         }
 
         // 3. Update mapping
-        mapping[newSessionId] = {
+        await savePersistedSessionStrict(mappingFile, newSessionId, {
           cascadeId: newCascadeId,
           maxStepIndex: oldMaxStepIndex,
           cwd,
-        };
-        await fs.writeFile(mappingFile, JSON.stringify(mapping, null, 2) + "\n");
+          ...(oldModelId ? { modelId: oldModelId } : {}),
+        });
       },
 
       async deleteSession(cwd: string, sessionId: string): Promise<void> {
@@ -637,7 +683,7 @@ export function makeAgyProfile(opts: {
         const entry = mapping[sessionId];
         if (!entry) return;
 
-        let cascadeId: string;
+        let cascadeId: string | undefined;
         if (typeof entry === "string") {
           cascadeId = entry;
         } else {
@@ -645,25 +691,26 @@ export function makeAgyProfile(opts: {
         }
 
         // 1. Delete the conversation file(s) (.db current, .pb legacy).
-        for (const ext of [".db", ".pb"]) {
+        if (cascadeId) {
+          for (const ext of [".db", ".pb"]) {
+            try {
+              await fs.unlink(path.join(CONVERSATION_DIR, `${cascadeId}${ext}`));
+            } catch {
+              // ignore
+            }
+          }
+
+          // 2. Delete brain folder
+          const brainFolder = path.join(AGY_HOME, "brain", cascadeId);
           try {
-            await fs.unlink(path.join(CONVERSATION_DIR, `${cascadeId}${ext}`));
+            await fs.rm(brainFolder, { recursive: true, force: true });
           } catch {
             // ignore
           }
         }
 
-        // 2. Delete brain folder
-        const brainFolder = path.join(AGY_HOME, "brain", cascadeId);
-        try {
-          await fs.rm(brainFolder, { recursive: true, force: true });
-        } catch {
-          // ignore
-        }
-
         // 3. Delete from mapping
-        delete mapping[sessionId];
-        await fs.writeFile(mappingFile, JSON.stringify(mapping, null, 2) + "\n");
+        await clearPersistedSession(mappingFile, sessionId);
       },
 
       async getTranscript(cwd: string, sessionId: string): Promise<string> {
@@ -675,12 +722,15 @@ export function makeAgyProfile(opts: {
         const entry = mapping[sessionId];
         if (!entry) return "";
 
-        let cascadeId: string;
+        let cascadeId: string | undefined;
         if (typeof entry === "string") {
           cascadeId = entry;
         } else {
           cascadeId = entry.cascadeId;
         }
+        // A newly persisted model-only session has no transcript yet; deleting
+        // this guard would turn an ordinary pre-prompt lookup into a bad path.
+        if (!cascadeId) return "";
 
         const transcriptFile = path.join(
           AGY_HOME,
@@ -736,7 +786,8 @@ function makeFakeAgyProcess(
   defaultModel: string,
   printTimeoutSeconds?: number,
   mcpServers: McpServer[] = [],
-  execution: AgyExecutionPolicy = DEFAULT_AGY_EXECUTION_POLICY
+  execution: AgyExecutionPolicy = DEFAULT_AGY_EXECUTION_POLICY,
+  initialSettingsFile: string = SETTINGS_FILE,
 ): FakeProc {
   const fakeStdin = new PassThrough(); // client writes here; we read from it
   const fakeStdout = new PassThrough(); // we write here; client reads from it
@@ -750,7 +801,8 @@ function makeFakeAgyProcess(
     defaultModel,
     printTimeoutSeconds,
     mcpServers,
-    execution
+    execution,
+    initialSettingsFile,
   );
 
   const stream = ndJsonStream(
@@ -800,10 +852,24 @@ interface AgySession {
    * to skip everything we've shown before. -1 = nothing yet.
    */
   maxStepIndex: number;
-  modelId?: string;
+  modelId: string;
   mcpServers: McpServer[];
   /** Isolated HOME for this session's mcp_config.json (undefined = inherit). */
   mcpHome?: string;
+}
+
+/**
+ * One canonical snapshot is used by selection and turn-progress writes.
+ * If modelId is omitted here, a later high-water update erases the session's
+ * model and the next process restart falls back to a shared default.
+ */
+function persistedSession(session: AgySession, modelId = session.modelId): PersistedSession {
+  return {
+    ...(session.cascadeId ? { cascadeId: session.cascadeId } : {}),
+    maxStepIndex: session.maxStepIndex,
+    cwd: session.cwd,
+    ...(modelId ? { modelId } : {}),
+  };
 }
 
 interface ActiveRun {
@@ -816,13 +882,11 @@ interface ActiveRun {
 export interface AgyExecutionPolicy {
   sandbox: boolean;
   exposeGlobalStaging: boolean;
-  persistModelSelection: boolean;
 }
 
 const DEFAULT_AGY_EXECUTION_POLICY: AgyExecutionPolicy = {
   sandbox: false,
   exposeGlobalStaging: true,
-  persistModelSelection: true,
 };
 
 /** Pure argv fragment so isolation policy remains directly regression-testable. */
@@ -876,7 +940,7 @@ export const SEAM_AGY_JSON_SCHEMA_META = "seam/agyJsonSchema";
 export function buildAgyPromptArgs(opts: {
   promptText: string;
   useStdin: boolean;
-  modelDisplayName?: string;
+  modelDisplayName: string;
   logFile: string;
   printTimeoutSeconds: number;
   cwd: string;
@@ -892,7 +956,8 @@ export function buildAgyPromptArgs(opts: {
   return [
     ...(opts.useStdin ? [] : ["-p", opts.promptText]),
     AGY_NO_SLASH_EXPANSION,
-    ...(opts.modelDisplayName ? ["--model", opts.modelDisplayName] : []),
+    "--model",
+    opts.modelDisplayName,
     // Redirect this spawn's log to a private path we own and read back for
     // its port + conversation id. Exclusive: agy writes nothing to its shared
     // ~/.gemini/antigravity-cli/log dir when this is set (verified).
@@ -980,6 +1045,7 @@ class AgyAgent implements Agent {
     private readonly printTimeoutSeconds?: number,
     private readonly defaultMcpServers: McpServer[] = [],
     private readonly execution: AgyExecutionPolicy = DEFAULT_AGY_EXECUTION_POLICY,
+    private readonly initialSettingsFile: string = SETTINGS_FILE,
   ) {}
 
   bind(conn: AgentSideConnection): void {
@@ -1011,14 +1077,28 @@ class AgyAgent implements Agent {
     const id = randomUUID();
     const mcpServers = params.mcpServers?.length ? params.mcpServers : this.defaultMcpServers;
     const mcpHome = await prepareAgyMcpHome(id, mcpServers);
-    this.sessions.set(id, { cwd: params.cwd, maxStepIndex: -1, mcpServers, mcpHome });
     const catalog = await getCatalog(this.runtime).catch(() => [] as AgyCatalogEntry[]);
+    // An empty catalog cannot supply the exact canonical id required by --model;
+    // deleting this guard would silently fall back to AGY's process-global default.
     if (catalog.length === 0) {
-      return { sessionId: id };
+      throw new Error("AGY model catalog is unavailable");
     }
+    const modelId = readInitialModelId(catalog, this.initialSettingsFile, this.defaultModel);
+    // Every admitted session must own a catalog-valid model before its first turn;
+    // deleting this guard would permit an invocation without an isolated model.
+    if (!modelId) throw new Error("AGY model catalog has no selectable model");
+    const session: AgySession = {
+      cwd: params.cwd,
+      maxStepIndex: -1,
+      modelId,
+      mcpServers,
+      mcpHome,
+    };
+    await savePersistedSessionStrict(this.mappingFile, id, persistedSession(session));
+    this.sessions.set(id, session);
     return {
       sessionId: id,
-      configOptions: buildAgyConfigOptions(catalog),
+      configOptions: buildAgyConfigOptions(catalog, modelId),
     };
   }
 
@@ -1026,19 +1106,39 @@ class AgyAgent implements Agent {
     const persisted = await loadPersistedSession(this.mappingFile, params.sessionId);
     const mcpServers = params.mcpServers?.length ? params.mcpServers : this.defaultMcpServers;
     const mcpHome = await prepareAgyMcpHome(params.sessionId, mcpServers);
-    this.sessions.set(params.sessionId, {
+    const catalog = await getCatalog(this.runtime).catch(() => [] as AgyCatalogEntry[]);
+    // Resume cannot validate or invoke a canonical session model without a catalog;
+    // deleting this guard would reintroduce implicit global/list-order selection.
+    if (catalog.length === 0) throw new Error("AGY model catalog is unavailable");
+    const modelId = persisted?.modelId ??
+      readInitialModelId(catalog, this.initialSettingsFile, this.defaultModel);
+    // A persisted id must still exist in the exact current catalog; deleting this
+    // check would pass a stale/unknown id to AGY or silently substitute a model.
+    if (!modelId || !catalog.some((entry) => entry.modelId === modelId)) {
+      throw RequestError.invalidParams({
+        details: modelId ? `unknown AGY model ${modelId}` : "AGY session has no model selection",
+      });
+    }
+    const session: AgySession = {
       cwd: params.cwd,
       cascadeId: persisted?.cascadeId,
       maxStepIndex: persisted?.maxStepIndex ?? -1,
+      modelId,
       mcpServers,
       mcpHome,
-    });
-    const catalog = await getCatalog(this.runtime).catch(() => [] as AgyCatalogEntry[]);
-    if (catalog.length === 0) {
-      return {};
+    };
+    // Legacy mapping rows have no model; persisting the one-time initial default
+    // here prevents later global-default changes from rewriting that session.
+    if (!persisted?.modelId) {
+      await savePersistedSessionStrict(
+        this.mappingFile,
+        params.sessionId,
+        persistedSession(session),
+      );
     }
+    this.sessions.set(params.sessionId, session);
     return {
-      configOptions: buildAgyConfigOptions(catalog),
+      configOptions: buildAgyConfigOptions(catalog, modelId),
     };
   }
 
@@ -1051,11 +1151,20 @@ class AgyAgent implements Agent {
   async setSessionConfigOption(
     params: SetSessionConfigOptionRequest,
   ): Promise<SetSessionConfigOptionResponse> {
+    const sess = this.sessions.get(params.sessionId);
+    // Config changes for an unknown session cannot be persisted or invoked;
+    // deleting this guard would acknowledge a model choice that no session owns.
+    if (!sess) {
+      throw RequestError.invalidParams({ details: `unknown session ${params.sessionId}` });
+    }
     const catalog = await getCatalog(this.runtime).catch(() => [] as AgyCatalogEntry[]);
+    // An unavailable catalog cannot validate an exact model binding; deleting
+    // this guard would turn a transient catalog failure into an arbitrary choice.
+    if (catalog.length === 0) throw new Error("AGY model catalog is unavailable");
     // Only the "model" selector is advertised; anything else is a no-op that
     // still echoes the current option set back per the ACP contract.
     if (params.configId !== "model" || typeof params.value !== "string") {
-      return { configOptions: buildAgyConfigOptions(catalog) };
+      return { configOptions: buildAgyConfigOptions(catalog, sess.modelId) };
     }
     const modelId = params.value;
     const entry = catalog.find((e) => e.modelId === modelId);
@@ -1064,27 +1173,15 @@ class AgyAgent implements Agent {
         details: `unknown AGY model ${modelId}`,
       });
     }
-    const sess = this.sessions.get(params.sessionId);
-    if (sess) {
+    if (sess.modelId !== modelId) {
+      // Persist before changing memory; deleting this order makes a failed write
+      // partially commit until restart and then resume under the previous model.
+      await savePersistedSessionStrict(
+        this.mappingFile,
+        params.sessionId,
+        persistedSession(sess, modelId),
+      );
       sess.modelId = modelId;
-    }
-    // agy reads its active model from ~/.gemini/antigravity-cli/settings.json
-    // at every CLI invocation. Since we spawn a fresh `agy -p` per prompt,
-    // editing that file takes effect on the next turn.
-    if (this.execution.persistModelSelection) {
-      try {
-        let json: Record<string, unknown> = {};
-        try {
-          json = JSON.parse(fsSync.readFileSync(SETTINGS_FILE, "utf8")) as Record<string, unknown>;
-        } catch { /* fresh settings */ }
-        json["model"] = entry.rawDisplayName;
-        fsSync.writeFileSync(SETTINGS_FILE, JSON.stringify(json, null, 2) + "\n");
-      } catch (err) {
-        if (process.env.AGY_PROFILE_DEBUG) {
-          // eslint-disable-next-line no-console
-          console.error("[agy] setSessionConfigOption failed:", err);
-        }
-      }
     }
     return { configOptions: buildAgyConfigOptions(catalog, modelId) };
   }
@@ -1122,20 +1219,14 @@ class AgyAgent implements Agent {
     const selected = selectAgyTurnModel({
       catalog,
       sessionModelId: sess.modelId,
-      settingsModelId: sess.modelId ? undefined : readCurrentModelId(catalog),
-      defaultModel: this.defaultModel,
     });
     if (selected.error) {
       throw RequestError.invalidParams({ details: selected.error });
     }
     const currentModel = selected.entry;
-    if (selected.healedFrom && currentModel) {
-      // eslint-disable-next-line no-console
-      console.info(
-        `[agy] auto-healing invalid model ${selected.healedFrom} -> ${currentModel.modelId} (${currentModel.rawDisplayName})`
-      );
-      sess.modelId = currentModel.modelId;
-    }
+    // A turn without an exact model would let the native CLI consult global
+    // settings; deleting this guard breaks isolation even if selection failed.
+    if (!currentModel) throw new Error("AGY session has no model selection");
     const maxTokens = currentModel?.maxTokens ?? 1_000_000;
 
     // Linux limits each individual argv/envp string to MAX_ARG_STRLEN
@@ -1158,7 +1249,7 @@ class AgyAgent implements Agent {
     const args = buildAgyPromptArgs({
       promptText,
       useStdin,
-      ...(currentModel ? { modelDisplayName: currentModel.rawDisplayName } : {}),
+      modelDisplayName: currentModel.rawDisplayName,
       logFile: agyLogPath,
       printTimeoutSeconds: this.printTimeoutSeconds ?? 600,
       cwd: sess.cwd,
@@ -1239,6 +1330,7 @@ class AgyAgent implements Agent {
           cascadeId: cid,
           maxStepIndex: sess.maxStepIndex,
           cwd: sess.cwd,
+          modelId: sess.modelId,
         });
       }
 
@@ -1432,6 +1524,7 @@ class AgyAgent implements Agent {
           cascadeId: sess.cascadeId,
           maxStepIndex: sess.maxStepIndex,
           cwd: sess.cwd,
+          modelId: sess.modelId,
         });
       }
     } catch (err) {
@@ -1979,16 +2072,16 @@ function transformAgyText(text: string, cwd: string): string {
 // agy's local language server exposes the live model list via the Connect
 // endpoint /exa.language_server_pb.LanguageServerService/GetAvailableModels.
 // We spawn a transient `agy -p` once at profile creation, scrape the catalog,
-// and cache it for the life of the process. The selected model lives in
-// ~/.gemini/antigravity-cli/settings.json under the `model` key (a display
-// name like "Gemini 3.5 Flash (High)"), which agy reads on every CLI call.
+// and cache it for the life of the process. AGY's global settings model is read
+// only to initialize a session that has no persisted choice. Every turn then
+// receives that session's exact runtime display name through `--model`.
 
 export interface AgyCatalogEntry {
   /** API id (e.g. "gemini-3-flash-agent") — what we put in ACP `modelId`. */
   modelId: string;
   /** Cleaned-up name for the Discord picker (tier word → icon, no "(Thinking)"). */
   displayName: string;
-  /** Original Antigravity display name — what we write to settings.json. */
+  /** Original Antigravity display name — the canonical native `--model` value. */
   rawDisplayName: string;
   /** Human-readable context window (e.g. "1M", "250K"). */
   ctx: string;
@@ -2131,34 +2224,26 @@ export function resolveAgyModel(
 /**
  * Choose the model for one AGY turn.
  *
- * An explicitly requested session model is exact-match only — never substituted
- * for another catalog entry. Auto-heal remains for the non-explicit path
- * (settings.json / profile default) so ordinary chat stays compatible.
+ * A session-owned model is exact-match only and is never substituted. Initial
+ * default resolution happens once in new/load, outside the per-turn path.
  */
 export function selectAgyTurnModel(opts: {
   catalog: ReadonlyArray<AgyCatalogEntry>;
   sessionModelId?: string;
-  settingsModelId?: string;
-  defaultModel?: string;
-}): { entry?: AgyCatalogEntry; healedFrom?: string; error?: string } {
-  if (opts.sessionModelId) {
-    const exact = resolveAgyModel(
-      opts.catalog,
-      opts.sessionModelId,
-      opts.defaultModel,
-      { allowAutoHeal: false }
-    );
-    if (!exact) {
-      return { error: `unknown AGY model ${opts.sessionModelId}` };
-    }
-    return { entry: exact };
-  }
-  const requested = opts.settingsModelId;
-  const entry = resolveAgyModel(opts.catalog, requested, opts.defaultModel);
-  if (requested && entry && entry.modelId !== requested) {
-    return { entry, healedFrom: requested };
-  }
-  return { entry };
+}): { entry?: AgyCatalogEntry; error?: string } {
+  // A missing session choice must not fall through to AGY's global settings;
+  // deleting this guard makes concurrent sessions share process-wide state.
+  if (!opts.sessionModelId) return { error: "AGY session has no model selection" };
+  const exact = resolveAgyModel(
+    opts.catalog,
+    opts.sessionModelId,
+    undefined,
+    { allowAutoHeal: false },
+  );
+  // A catalog miss must fail instead of healing to another model; deleting this
+  // guard turns a removed baked-effort variant into an unrequested runtime.
+  if (!exact) return { error: `unknown AGY model ${opts.sessionModelId}` };
+  return { entry: exact };
 }
 
 const catalogRowsPromises = new Map<string, Promise<AgyCatalogEntry[]>>();
@@ -2441,7 +2526,7 @@ function pickerLabel(e: AgyCatalogEntry): string {
  *  selector is a `configOption` with category/id "model". */
 function buildAgyConfigOptions(
   catalog: ReadonlyArray<AgyCatalogEntry>,
-  currentModelId?: string,
+  currentModelId: string,
 ): SessionConfigOption[] {
   return [
     {
@@ -2450,7 +2535,7 @@ function buildAgyConfigOptions(
       description: "Antigravity model to use",
       category: "model",
       type: "select",
-      currentValue: currentModelId ?? readCurrentModelId(catalog),
+      currentValue: currentModelId,
       options: catalog.map((e) => ({
         value: e.modelId,
         name: pickerLabel(e),
@@ -2459,14 +2544,18 @@ function buildAgyConfigOptions(
   ];
 }
 
-function readCurrentModelId(catalog: ReadonlyArray<AgyCatalogEntry>): string {
+function readInitialModelId(
+  catalog: ReadonlyArray<AgyCatalogEntry>,
+  settingsFile: string,
+  defaultModel?: string,
+): string {
   try {
-    const raw = fsSync.readFileSync(SETTINGS_FILE, "utf8");
+    const raw = fsSync.readFileSync(settingsFile, "utf8");
     const dn = (JSON.parse(raw) as { model?: unknown }).model;
     if (typeof dn === "string") {
       const match = catalog.find((e) => e.rawDisplayName === dn);
       if (match) return match.modelId;
     }
-  } catch { /* fall through to default */ }
-  return catalog.find((e) => e.recommended)?.modelId ?? catalog[0]?.modelId ?? "";
+  } catch { /* one-time fallback below */ }
+  return resolveAgyModel(catalog, defaultModel, defaultModel)?.modelId ?? "";
 }

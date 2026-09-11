@@ -140,7 +140,7 @@ describe.sequential("#281 legacy baseline enrollment", () => {
     expect(report.baseline_source_sha).toBe(f.checkoutSha);
     expect(report.baseline_entrypoint_sha256).toBe(sha256(before));
     // media-server's shape: managed now, but honestly still not receipt-capable.
-    expect(report.baseline_receipt_capable).toBe("no");
+    expect(report.baseline_rollback_proof).toBe("reduced-baseline");
     expect(report.process_signaled).toBe("no");
     expect(report.artifact_changed).toBe("no");
     expect(report.live_pid).toBe(String(f.pid));
@@ -171,7 +171,7 @@ describe.sequential("#281 legacy baseline enrollment", () => {
     const preflight = parseKeyValues((await f.run(["preflight"])).stdout);
     expect(preflight.enrolled).toBe("yes");
     expect(preflight.baseline_digest).toBe(record.baselineDigest);
-    expect(preflight.baseline_receipt_capable).toBe("no");
+    expect(preflight.baseline_rollback_proof).toBe("reduced-baseline");
     expect(preflight.remote_mutation).toBe("no");
   }, 60_000);
 
@@ -519,14 +519,16 @@ describe.sequential("#281 activation stays refused for every legacy host", () =>
     ).rejects.toThrow(/legacy_previous_release_not_receipt_capable/);
   }, 60_000);
 
-  it("names the real situation once a baseline exists, and still refuses", async () => {
+  it("names the real situation once a baseline exists", async () => {
     const f = await makeFixture();
     await enroll(f);
-    // Enrollment is not permission: a rollback onto bytes that cannot emit the
-    // two-RPC receipt still cannot be proven, so activation refuses.
+    // #288: a verified baseline is now an admissible rollback target, so the
+    // refusal is no longer about the baseline's capability. The transition
+    // still refuses here because the requested release does not exist — the
+    // gate moved to the release, which is what changed.
     await expect(
       f.run(["activate", "a".repeat(40), H("b"), H("c"), H("d"), "10", H("e")])
-    ).rejects.toThrow(/enrolled_baseline_not_receipt_capable/);
+    ).rejects.toThrow(/release_missing|release_path_escape|release_symlink_or_escape/);
 
     const drifted = await makeFixture();
     await enroll(drifted);
@@ -536,12 +538,15 @@ describe.sequential("#281 activation stays refused for every legacy host", () =>
     ).rejects.toThrow(/enrolled_baseline_state_drift/);
   }, 60_000);
 
-  it("refuses even a receipt-capable baseline until activation-from-baseline is reviewed", async () => {
-    const f = await makeFixture({ capable: true });
-    const report = parseKeyValues((await enroll(f)).stdout);
-    expect(report.baseline_receipt_capable).toBe("yes");
-    await expect(
-      f.run(["activate", "a".repeat(40), H("b"), H("c"), H("d"), "10", H("e")])
-    ).rejects.toThrow(/enrolled_baseline_activation_not_enabled/);
+  it("describes which proof a rollback onto the baseline could produce", async () => {
+    // #288: the field is a description of the baseline, not a gate. A host whose
+    // deployed bytes already carry both catalog RPCs can be rolled back onto
+    // with the ordinary receipt; the pre-catalog shape cannot, and says so.
+    const capable = await makeFixture({ capable: true });
+    expect(parseKeyValues((await enroll(capable)).stdout).baseline_rollback_proof).toBe("receipt");
+
+    const preCatalog = await makeFixture();
+    expect(parseKeyValues((await enroll(preCatalog, H("3"), H("4"))).stdout).baseline_rollback_proof)
+      .toBe("reduced-baseline");
   }, 60_000);
 });

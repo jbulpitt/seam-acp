@@ -175,7 +175,7 @@ directories. A host whose runtime tree changed since enrollment refuses with
 with no record behind it refuses with `enrollment_record_missing`.
 
 PREFLIGHT reports `enrolled` (`yes`, `no`, or `drifted`), the enrollment ID, the
-baseline digest, and `baseline_receipt_capable`. `drifted` is re-derived from
+baseline digest, and `baseline_rollback_proof`. `drifted` is re-derived from
 live state, never trusted from the file.
 
 A target that is explicitly unmanaged (`sshAlias: null` with an
@@ -184,22 +184,107 @@ enrollment exactly as for every other phase: recording a baseline for a host
 with no verified management path would produce a rollback target nobody could
 restore to.
 
-**Enrollment is not permission to activate.** A rollback onto bytes that cannot
-emit the nonce/PID/instance/two-RPC receipt still cannot be proven, so ACTIVATE
-continues to refuse for every legacy host — now naming the actual situation,
-both in the remote program and in the local capability gate that runs first:
-`legacy_previous_release_not_receipt_capable` when nothing is enrolled,
-`enrolled_baseline_state_drift` when the recorded baseline no longer matches the
-host, `enrolled_baseline_not_receipt_capable` when the recorded baseline could
-not emit that receipt, and `enrolled_baseline_activation_not_enabled` when it
-could — consuming an enrolled baseline as an activation's previous release is a
-separate reviewed change, not something enrollment grants itself.
+Enrollment records `rollbackProof` on the baseline: which proof a rollback onto
+it could actually produce. `receipt` means the ordinary
+nonce/PID/instance/two-RPC proof is available. `reduced-baseline` means the
+deployed bytes predate the receipt mechanism, so no restore of them — however
+exact — can ever emit one. It is a description of the baseline, not a gate.
 
-The baseline record is `formatVersion: 1`, `kind: "enrolled-baseline"`. Version 1
+A legacy host with nothing enrolled, or whose recorded baseline no longer
+matches it, is still refused: `legacy_previous_release_not_receipt_capable` and
+`enrolled_baseline_state_drift`, in both the remote program and the local
+capability gate that runs first.
+
+The baseline record is `formatVersion: 2`, `kind: "enrolled-baseline"`. A
+version-1 record is refused rather than reinterpreted, across preflight,
+enrollment, restore and activation; re-running `--enroll` does not migrate one,
+it refuses it, so a host holding a v1 record must have it removed deliberately. It
 hardwires PM2, a Node runtime, a JavaScript checkout entrypoint and this exact
 runtime scope. A host that does not fit that shape — native artifacts, a
-different process manager — needs a genuinely separate version-2 capture and
-restore path, not extra fields bolted onto version 1.
+different process manager — needs a genuinely separate version-3 capture and
+restore path, not extra fields bolted onto version 2.
+
+### 1b. The FIRST managed activation, from an enrolled baseline
+
+A host whose live entrypoint is a legacy checkout has no managed release to roll
+back to, so its activation cannot offer the usual rollback target. Such a
+transition may instead use the verified enrolled baseline as its rollback
+target.
+
+**The guarantee is a precondition, not a count, and not a list of routes.** The
+gate checks exactly two things, and they are the whole condition:
+
+1. the live entrypoint is the checkout's own regular file rather than a symlink
+   into `releases/` (`before.legacy`); and
+2. the host has a recorded baseline that **still verifies** right now — recorded
+   revision, every non-entrypoint runtime-scope file, the whole runtime-tree
+   digest, and the entrypoint's bytes and mode.
+
+So the path is reachable whenever the host is in that state, and never while a
+managed release is active. It is **not** "once per host", and it is not limited
+to any particular way of arriving there. Any operation that leaves the host on a
+verified legacy baseline reopens it: never having activated at all; rolling back
+a baseline-backed activation; or `--restore-baseline` followed by re-enrollment,
+which is precisely what restore is *for*. Do not read the list as exhaustive —
+check the precondition, which `preflight` reports directly as
+`artifact_mode=legacy-checkout` with `enrolled=yes`.
+
+A host in that state genuinely *is* legacy again and faces the original problem,
+so refusing it there would strand it with no way forward at the moment it most
+needs one. What re-entry costs varies by route and should not be assumed: a
+rollback of a baseline-backed activation carries that rollback's full proof
+obligations, while restore-then-re-enroll carries restore's and enrollment's
+instead. Rolling back a *managed-to-managed* activation returns the host to the
+previous **release**, not to the baseline, so ordinary rollout activity does not
+reopen the path.
+
+Each use is separately auditable: every activation writes an immutable record
+under `activations/`, and exactly those whose `previous.kind` is
+`enrolled-baseline` took the reduced path.
+
+**What it proves.** The forward direction is not weakened at all. The new release
+must itself be receipt-capable, and the replacement must present the ordinary
+receipt on its own controller connection: nonce, PID, instance, bridge id, and
+both catalog RPCs, within the window. A first activation onto a release that
+could not emit that receipt is refused (`first_activation_release_not_receipt_capable`),
+because it would leave the host with no provable state in either direction.
+
+**What it does not prove, and says so.** If that activation has to be rolled
+back, the bridge restored from the baseline cannot emit a receipt — its bytes
+predate the mechanism. The rollback therefore produces the strongest proof that
+baseline can emit: the recorded checkout revision and every runtime-scope file
+still hash to the baseline; the entrypoint bytes **and mode** are restored
+exactly and both re-verified after the switch — applying a mode during restore
+is not the same as proving it afterwards, and a mode that changed between the
+rename and the proof is refused as `baseline_entrypoint_mode_mismatch`; the old PID exited; a distinct owned replacement PID
+appeared; PM2 still maps it to the exact app, interpreter, cwd and bridge id; and
+the restored bytes carry protocol 1 and the SIGUSR2 drain handler. The record
+states `proof: "reduced-baseline"`, `catalogRpcsVerified: false` and
+`controllerObserved: false` explicitly, so a later reader can tell which
+verification a given transition received rather than inferring it from a missing
+field. **This is a weaker guarantee than every other transition in this runbook,
+accepted deliberately, and only while the precondition above holds.**
+
+**It retires itself while the host stays managed.** After the activation the
+stable entrypoint resolves into `releases/`, so the host is no longer legacy and
+this path is unreachable for as long as that remains true — which is every
+ordinary activation thereafter. It becomes reachable again whenever the host
+returns to a verified legacy baseline, by any route, exactly as the precondition
+above describes. There is no flag, environment variable or persisted "first
+activation allowed" state, and nothing has to be remembered and unset; the live
+entrypoint plus a verifying baseline is the whole condition.
+
+**The capability gate is decomposed, not relaxed.** The local gate still requires
+the old process to be drainable with `SIGUSR2` and to speak protocol 1, because
+the transition itself depends on both; it refuses with
+`enrolled_baseline_not_drainable` or `enrolled_baseline_protocol_unsupported`
+otherwise. The two catalog RPCs are no longer demanded of the OLD process,
+because they are served by the NEW release and proven on the new connection.
+Managed-to-managed activations are unchanged and keep the full requirement.
+
+Before using this, the baseline must have been proven restorable end to end on
+that host: `--restore-baseline` exercises the same verification the rollback
+would, without signalling anything.
 
 Enrollment changes nothing about drain semantics and makes no claim about
 mid-turn safety. `SIGUSR2` still exits after ten seconds without output or a
@@ -330,12 +415,14 @@ racing lock state refuses. Never delete a lock by hand while its owner is live.
   release trees, and either the unchanged recorded old PID or a receipt-bound
   replacement PID. If the pointer never switched, drifted elsewhere, or any
   identity is ambiguous, rollback refuses. No record permits guessing.
-- Legacy code cannot emit a nonce/PID/instance/two-RPC rollback receipt. Therefore
-  ACTIVATE fails closed until the host has been explicitly enrolled with a
-  reviewed receipt-capable managed baseline, and still refuses when the enrolled
-  baseline is not itself receipt-capable. Enrollment (§1a) establishes and
-  preserves that baseline; it does not weaken rollback proof, and it does not
-  authorize activation.
+- Legacy code cannot emit a nonce/PID/instance/two-RPC rollback receipt. ACTIVATE
+  therefore fails closed until the host has been explicitly enrolled (§1a) with a
+  baseline that still verifies. An activation from that baseline (§1b) has a
+  reduced ROLLBACK proof, and both the activation and the rollback record say so
+  explicitly. That applies to any activation taken while the host is on a
+  verified legacy baseline — see §1b for the precondition — and not to a fixed
+  number of transitions. Every activation taken while a managed release is
+  active requires the full receipt in both directions.
 - Never replace a refusal with `pm2 restart`, `pm2 reload`, a provider login, or
   an environment/PM2 dump. Emergency/manual recovery is outside this automated
   transaction and requires a separate operator plan.

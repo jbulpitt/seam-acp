@@ -23,6 +23,17 @@ afterEach(async () => {
 });
 
 /** Drop a pending spec, returning its id. */
+/** Capture what the watcher reports without silencing the rest of the logger. */
+function capturingLogger(): { logger: Logger; errors: string[] } {
+  const errors: string[] = [];
+  const logger = {
+    child: () => logger,
+    error: (obj: unknown, msg?: string) => { errors.push(`${msg ?? ""} ${JSON.stringify(obj)}`); },
+    warn: () => {}, info: () => {}, debug: () => {}, trace: () => {}, fatal: () => {},
+  } as unknown as Logger;
+  return { logger, errors };
+}
+
 async function dropSpec(spec: Partial<DispatchSpec> & { id: string }): Promise<string> {
   await mkdir(dirs.pending, { recursive: true });
   const body = {
@@ -197,6 +208,104 @@ describe("DispatchWatcher", () => {
     expect(await readDone("boot-backlog")).toMatchObject({
       status: "completed",
       output: "eventually durable",
+    });
+  });
+
+  /**
+   * #315 review: boot recovery must not be able to disable dispatch. A
+   * rejection used to skip `ready = true` and the timer entirely, so the
+   * watcher admitted nothing for the life of the process behind one warn.
+   */
+  it("opens admission and reports the forfeit when boot recovery rejects (#303)", async () => {
+    const { logger, errors } = capturingLogger();
+    const seen: string[] = [];
+    const watcher = new DispatchWatcher({
+      dataDir,
+      logger,
+      beforeAdmission: async () => { throw new Error("discord rate limit during boot"); },
+      onDispatch: async (spec) => {
+        seen.push(spec.id);
+        return { output: spec.id, stopReason: "end_turn" };
+      },
+    });
+    await dropSpec({ id: "still-flows" });
+
+    await watcher.start();
+    await watcher.initialDispatchesSettled();
+
+    // #307: protects the queue against a failed recovery; deleting this lets a
+    // single boot-time network blip take dispatch dark until the next restart.
+    expect({ accepting: watcher.isAcceptingDispatches, seen }).toEqual({
+      accepting: true,
+      seen: ["still-flows"],
+    });
+    // …and says what was given up, at error, rather than failing silently.
+    expect(errors.join(" ")).toMatch(/boot recovery failed.*opening dispatch admission anyway.*createdUtc order/);
+  });
+
+  /**
+   * The second door to the same outage: an unbounded barrier. A recovery that
+   * HANGS held admission closed forever and logged nothing at all — strictly
+   * worse than the throw. #314: `loadSession` has no timeout.
+   */
+  it("opens admission and reports the forfeit when boot recovery hangs past the bound (#303)", async () => {
+    const { logger, errors } = capturingLogger();
+    const seen: string[] = [];
+    const watcher = new DispatchWatcher({
+      dataDir,
+      logger,
+      // Never resolves, the way an unbounded loadSession would not.
+      beforeAdmission: () => new Promise<void>(() => {}),
+      admissionBarrierTimeoutMs: 25,
+      onDispatch: async (spec) => {
+        seen.push(spec.id);
+        return { output: spec.id, stopReason: "end_turn" };
+      },
+    });
+    await dropSpec({ id: "flows-after-timeout" });
+
+    await watcher.start();
+    await watcher.initialDispatchesSettled();
+
+    // #307: protects the queue against a hung recovery; deleting the bound
+    // restores a dark spool with no diagnostic at all.
+    expect({ accepting: watcher.isAcceptingDispatches, seen }).toEqual({
+      accepting: true,
+      seen: ["flows-after-timeout"],
+    });
+    expect(errors.join(" ")).toMatch(/did not finish within 25ms.*opening dispatch admission anyway/);
+    watcher.stop();
+  });
+
+  /**
+   * The epoch fence has to hold on the DEGRADED path too: stop() may win while
+   * the barrier is hung, and the timeout must not then reopen intake.
+   */
+  it("does not reopen admission when stop wins a hung boot recovery (#303)", async () => {
+    const seen: string[] = [];
+    const watcher = new DispatchWatcher({
+      dataDir,
+      logger: silent,
+      beforeAdmission: () => new Promise<void>(() => {}),
+      admissionBarrierTimeoutMs: 25,
+      onDispatch: async (spec) => {
+        seen.push(spec.id);
+        return { output: spec.id, stopReason: "end_turn" };
+      },
+    });
+    await dropSpec({ id: "must-stay-pending-after-timeout" });
+
+    await watcher.start({ waitForInitialDispatches: false });
+    watcher.stop();
+    await watcher.initialDispatchesSettled();
+    await new Promise((resolve) => setTimeout(resolve, 60));
+
+    // #307: protects shutdown's win over the TIMEOUT opener specifically;
+    // deleting the epoch re-check lets an expired barrier reopen intake and
+    // run work after stop() returned.
+    expect({ accepting: watcher.isAcceptingDispatches, seen }).toEqual({
+      accepting: false,
+      seen: [],
     });
   });
 

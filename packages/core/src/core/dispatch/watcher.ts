@@ -33,6 +33,21 @@ import {
   shouldInlineCardReportBack,
 } from "./types.js";
 
+/**
+ * Longest admission may stay closed waiting for boot reconciliation.
+ *
+ * 60s. The observed boot-recovery window in #290 was ~25s from process start
+ * (resume activity and bridge reconciliation landed in the same window), so
+ * this leaves roughly 2.4x headroom: an ordinary boot — a few Discord channel
+ * fetches and session loads, even through a rate-limit backoff — finishes well
+ * inside it and keeps the #303 ordering guarantee. Past that, something is
+ * hung rather than slow: #314 records that `loadSession` has no timeout and
+ * `checkResumePreconditions` makes network calls with none, so an unbounded
+ * wait here costs the entire dispatch spool for the life of the process. One
+ * minute of closed admission is a bounded cost; forever is an outage.
+ */
+export const ADMISSION_BARRIER_TIMEOUT_MS = 60_000;
+
 /** Clamp on the originating prompt copied into a done-file (#174). */
 export const DONE_ORIGIN_PROMPT_MAX = 4000;
 
@@ -63,6 +78,12 @@ export interface DispatchWatcherOpts {
   retainForRecovery?: (id: string) => boolean;
   /** Boot reconciliation that must finish before pending specs may be claimed. */
   beforeAdmission?: () => Promise<void>;
+  /**
+   * How long admission may stay closed waiting for `beforeAdmission`. Default
+   * {@link ADMISSION_BARRIER_TIMEOUT_MS}. Overridable here rather than through a
+   * config key so the bound travels with the watcher that enforces it.
+   */
+  admissionBarrierTimeoutMs?: number;
   /**
    * Directory-listing seam. Defaults to `fs.readdir`.
    *
@@ -140,6 +161,7 @@ export class DispatchWatcher {
   private readonly mayRecover: (id: string) => boolean;
   private readonly retainForRecovery: (id: string) => boolean;
   private readonly beforeAdmission?: () => Promise<void>;
+  private readonly admissionBarrierTimeoutMs: number;
   private readonly readDir: (dir: string) => Promise<string[]>;
   private readonly beforeOwnedDoneCommit?: (id: string) => Promise<void>;
   private readonly beforeRecoveryPublish?: (id: string) => Promise<void>;
@@ -201,9 +223,46 @@ export class DispatchWatcher {
     this.mayRecover = opts.mayRecover ?? (() => true);
     this.retainForRecovery = opts.retainForRecovery ?? (() => false);
     this.beforeAdmission = opts.beforeAdmission;
+    this.admissionBarrierTimeoutMs = opts.admissionBarrierTimeoutMs ?? ADMISSION_BARRIER_TIMEOUT_MS;
     this.readDir = opts.readDir ?? readdir;
     this.beforeOwnedDoneCommit = opts.beforeOwnedDoneCommit;
     this.beforeRecoveryPublish = opts.beforeRecoveryPublish;
+  }
+
+  /**
+   * Wait for boot reconciliation, bounded. Always resolves: a rejected or hung
+   * barrier must not be able to hold dispatch admission closed, because that
+   * turns one failed recovery into a dark queue for the life of the process.
+   * Both degraded outcomes are reported at error with what was forfeited.
+   */
+  private async awaitAdmissionBarrier(): Promise<void> {
+    if (!this.beforeAdmission) return;
+    const forfeited = (what: string, err?: unknown): void => {
+      this.logger.error(
+        { ...(err === undefined ? {} : { err }), timeoutMs: this.admissionBarrierTimeoutMs },
+        `boot recovery ${what}; opening dispatch admission anyway — interrupted turns may be ` +
+          "admitted out of createdUtc order, or not at all, this boot"
+      );
+    };
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([
+        // A rejection is caught HERE, before the epoch check, so the caller
+        // still proceeds to open admission and run the first tick.
+        this.beforeAdmission().catch((err) => forfeited("failed", err)),
+        new Promise<void>((resolve) => {
+          timer = setTimeout(() => {
+            // The hung barrier keeps running detached; it cannot be cancelled,
+            // but it no longer gates admission.
+            forfeited(`did not finish within ${this.admissionBarrierTimeoutMs}ms`);
+            resolve();
+          }, this.admissionBarrierTimeoutMs);
+          timer.unref?.();
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
   /** Create the queue dirs, recover anything a crash left in `running/`, then
@@ -225,7 +284,16 @@ export class DispatchWatcher {
       // #303: keep pending admission closed until interrupted running turns have
       // joined the same first tick; deleting this await lets newer pending turns
       // bypass the existing createdUtc ordering while recovery is still running.
-      await this.beforeAdmission?.();
+      //
+      // That ordering rule governs how running and pending work INTERLEAVE WHEN
+      // RECOVERY SUCCEEDS. It is not a licence to halt the queue when recovery
+      // fails or hangs: ordering is a correctness property of a working system,
+      // admission IS the system. So a rejection and a timeout both degrade to
+      // "pending work still flows, the ordering guarantee is forfeited, and we
+      // say so loudly" — never to silence. `awaitAdmissionBarrier` therefore
+      // always resolves, and the epoch check below still runs on those degraded
+      // paths, because stop() can win during either wait.
+      await this.awaitAdmissionBarrier();
       if (this.lifecycleEpoch !== lifecycleEpoch) return;
       this.ready = true;
       this.timer = setInterval(() => void this.tick(), this.pollMs);

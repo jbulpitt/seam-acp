@@ -313,12 +313,19 @@ export interface DoneDeliveryResolutionLookup {
   getReportBackByCorrelation: (correlationId: string) => DoneLedgerRow | null;
 }
 
-/** Canonical read-only proof gate shared with done-artifact retention (#306). */
+/**
+ * Canonical read-only proof gate shared with done-artifact retention (#306).
+ * It proves both halves: the source row is terminal and its route-specific
+ * onward delivery is settled. Callers need not add a separate status guard.
+ */
 export function isDoneDeliveryResolved(
   result: DispatchResult,
   row: DoneLedgerState,
   lookup: DoneDeliveryResolutionLookup
 ): boolean {
+  // Protects callers from deleting output for work that is still recoverable;
+  // deleting this check makes a no-onward but non-terminal row read resolved.
+  if (!TERMINAL_STATUSES.has(row.status)) return false;
   if (row.status === "abandoned" && row.terminalReason) return true;
   // Reclassify with a non-terminal status: the live route is still required
   // to prove whether a terminal source had an onward obligation.

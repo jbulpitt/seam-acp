@@ -237,7 +237,10 @@ export function loadHostAdapters(
     try {
       out.set(f.id, f.make());
       if (f.strict) {
-        console.error(`[bridge] adapter ${f.id} loaded; provenance mode: ${describeProvenanceMode()}`);
+        // Mode is null until a snapshot is actually opened (prepare()), so say
+        // "pending" rather than assert a platform default — the two disagree
+        // for a Node fixture on darwin. #330 review.
+        console.error(`[bridge] adapter ${f.id} loaded; provenance mode: ${describeProvenanceMode() ?? "pending first launch"}`);
       }
     } catch (error) {
       // Factory threw (missing optional deps) — skip.
@@ -250,7 +253,10 @@ export function loadHostAdapters(
       // offline this way. Refuse the agent loudly and keep serving the rest.
       const reason = error instanceof Error ? error.message : String(error);
       if (f.strict) {
-        console.error(`[bridge] adapter ${f.id} refused to load: ${reason}`);
+        // Refusal is the case you most want the mode for, so report it here too.
+        console.error(
+          `[bridge] adapter ${f.id} refused to load (provenance mode: ${describeProvenanceMode() ?? "not reached"}): ${reason}`
+        );
         options.onAdapterRefused?.(f.id, reason);
       }
     }

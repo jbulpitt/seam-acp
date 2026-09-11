@@ -11,8 +11,8 @@ const load = (file) => import(pathToFileURL(path.join(repo, "packages/core", var
 const { SessionStore } = await load("core/session-store");
 const { DispatchWatcher } = await load("core/dispatch/watcher");
 const { projectAttemptCompletions } = await load("core/dispatch/attempt-recovery");
-const { reconcileCompletedDoneFiles } = await load("core/dispatch/done-reconcile");
-const { pruneDoneArtifacts } = await load("core/dispatch/done-retention");
+const { isDoneDeliveryResolved, reconcileCompletedDoneFiles } = await load("core/dispatch/done-reconcile");
+const { bindDoneDeliveryResolver, pruneDoneArtifacts } = await load("core/dispatch/done-retention");
 const { dispatchDirs } = await load("core/dispatch/types");
 const logger = pino({ level: "silent" });
 const store = new SessionStore(path.join(dataDir, "seam.db"));
@@ -52,9 +52,11 @@ if (phase === "produce") {
       store.updateDelegationStatus(saved.id, "completed");
     },
   });
-  const pruned = await pruneDoneArtifacts({ dataDir, logger,
-    isDeliveryResolved: (key) => store.turnAttempts.get(key)?.deliveryDone === true,
-  });
+  const pruned = await pruneDoneArtifacts(bindDoneDeliveryResolver({ dataDir, logger,
+    getDelegation: key => store.getDelegation(key),
+    getReportBackByCorrelation: key => store.getReportBackByCorrelation(key),
+    resolveDelivery: isDoneDeliveryResolved,
+  }));
   store.close();
   process.send?.({ event: "recovered", reconciled: result.reconciled, pruned: pruned.pruned,
     executionCount: await readFile(path.join(dataDir, "execution-count"), "utf8") });

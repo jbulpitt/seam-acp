@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { fork, spawn, type ChildProcess } from "node:child_process";
+import { execFile, fork, spawn, type ChildProcess } from "node:child_process";
 import { once } from "node:events";
-import { access, mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { promisify } from "node:util";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -44,6 +45,30 @@ async function message(proc: ChildProcess): Promise<Record<string, unknown>> {
 }
 
 describe("result retention across real process death (#306)", () => {
+  it.skipIf(process.env.SEAM_306_COMPILED !== "1")("compiled maintenance CLI defaults to dry-run and applies only canonical proof", async () => {
+    const dataDir = await temporary();
+    const store = new SessionStore(path.join(dataDir, "seam.db"));
+    const done = path.join(dataDir, "dispatch/done");
+    try {
+      await mkdir(done, { recursive: true });
+      store.recordDelegation({ id: "resolved", kind: "wake", status: "completed" });
+      store.recordDelegation({ id: "unresolved", kind: "wake", status: "running" });
+      for (const id of ["resolved", "unresolved", "unknown"]) {
+        await writeFile(path.join(done, `${id}.json`), JSON.stringify({ id, kind: "wake", target: "worker",
+          status: "completed", finishedUtc: new Date().toISOString(), output: "synthetic result" }));
+      }
+      const run = async (args: string[]) => JSON.parse((await promisify(execFile)(process.execPath,
+        [path.join(repo, "scripts/prune-dispatch-done.mjs"), "--data-dir", dataDir, ...args],
+        { cwd: repo, env: { PATH: process.env.PATH, HOME: dataDir }, timeout: 5000 })).stdout);
+      // Without default dry-run the operator's inspection destroys artifacts; without canonical gating apply loses unresolved output.
+      expect(await run([])).toMatchObject({ scanned: 3, pruned: 1, retained: 2, dryRun: true, failed: 0 });
+      expect(await readdir(done)).toHaveLength(3);
+      expect(await run(["--apply"])).toMatchObject({ scanned: 3, pruned: 1, retained: 2, dryRun: false, failed: 0 });
+      expect((await readdir(done)).sort()).toEqual(["unknown.json", "unresolved.json"]);
+      expect(store.getDelegation("resolved")?.status).toBe("completed");
+    } finally { store.close(); }
+  }, 15_000);
+
   it("recovers an undelivered output after SIGKILL without executing the original task again", async () => {
     const dataDir = await temporary();
     const producer = child(dataDir, "produce");

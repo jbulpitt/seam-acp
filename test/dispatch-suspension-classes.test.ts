@@ -196,24 +196,29 @@ describe("#333 suspension classes", () => {
   });
 
   it("has no silent construction site left in the dispatch or orchestrator source", async () => {
-    // Structural, not behavioural: `private constructor` already makes this a
-    // type error, but the assertion states the invariant in one place so a
-    // future relaxation of the constructor is a failing test rather than a
-    // quiet return to 60 anonymous refusals.
-    const sources = [
+    // Structural, not behavioural. `private constructor` is the real guard —
+    // it makes a silent site a type error — so this asserts the guard itself
+    // is still in place, plus that nobody has routed around it with a cast.
+    // Written as two assertions because the second one is what a regression
+    // actually looks like: `as any` compiles fine and greps differently.
+    const store = readFileSync(
+      path.join(repo, "packages/core/src/core/dispatch/attempt-store.ts"), "utf8");
+    expect(store).toMatch(/private constructor\(\s*\n\s*readonly dispatchId: string,/);
+
+    const offenders: string[] = [];
+    for (const relative of [
       "packages/core/src/core/dispatch/attempt-store.ts",
       "packages/core/src/core/dispatch/watcher.ts",
       "packages/core/src/platforms/discord/orchestrator.ts",
-    ];
-    const offenders: string[] = [];
-    for (const relative of sources) {
+    ]) {
       const text = readFileSync(path.join(repo, relative), "utf8");
       text.split("\n").forEach((line, index) => {
-        if (!line.includes("new DispatchSuspendedError(")) return;
-        // The three factories are the only legitimate constructions, and they
-        // live inside the class itself.
+        // Any spelling: `new DispatchSuspendedError(`, `new (X as any)(`, or a
+        // parenthesised/asserted form. The three factories are the only
+        // legitimate constructions and they live inside the class itself.
+        if (!/new\s*\(?\s*DispatchSuspendedError\b/.test(line)) return;
         if (/return new DispatchSuspendedError\(dispatchId, reason, "/.test(line)) return;
-        offenders.push(`${relative}:${index + 1}`);
+        offenders.push(`${relative}:${index + 1} ${line.trim()}`);
       });
     }
     expect(offenders).toEqual([]);

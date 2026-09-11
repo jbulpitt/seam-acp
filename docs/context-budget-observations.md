@@ -76,3 +76,47 @@ Each new parameterized check has its protection/deletion consequence beside it:
 
 The offline suite must exclude `test/acp.int.test.ts` (billable).
 No tests here contact providers; runtime transport is synthetic.
+
+## Verification record (2026-09-11)
+
+Branched from `origin/main` at `f3086f4`, using sanctioned `wt` worktrees
+with bind-mounted dependencies and Node 22.22.2. No build, deployment, merge,
+live model prompt or production configuration change.
+
+- Final implementation `44cd391`: `tsc --noEmit` passed; seven focused files,
+  **168 tests passed**. This includes ordinary completion through three real
+  orchestration turns using a synthetic transport, not just early persistence.
+- Broad non-live run at `ecb02c8`, before the quiet-turn follow-up:
+  **3778 passed, 1 failed, 5 todo**, across 236 files. The failing
+  `grok-model-catalog` TERM-ignoring subprocess test also produced one unhandled
+  timeout. This was not a fully green run. Grok and AGY timing tests subsequently
+  passed in a one-worker targeted run (75 tests across three files).
+- The final quiet-turn change was covered by the final 168-test focused run,
+  not another full-suite run. All test commands excluded `test/acp.int.test.ts`.
+- A separate disposable `wt` copy exercised **18 distinct deliberate mutations**.
+  Each failed the corresponding assertions, and each mutation was reversed.
+  The restored relevant suite passed **57 tests**. The expanded ordinary fixture
+  initially missed `idle()`; it was corrected, normal-completion assertions
+  were added, and affected mutations were rerun against a passing baseline.
+
+Mutation names describe the deliberately broken mechanism; counts are failed
+tests, not assertion counts:
+
+- `dispatch-write`: 4 expected test failure(s).
+- `identity-fence`: 6 expected test failure(s).
+- `panel-floor`: 1 expected test failure(s).
+- `total-as-prompt`: 5 expected test failure(s).
+- `drop-dimensions`: 5 expected test failure(s).
+- `tier-key`: 3 expected test failure(s).
+- `launch-tier`: 1 expected test failure(s).
+- `owner-fence`: 1 expected test failure(s).
+- `stale-cache`: 1 expected test failure(s).
+- `codex-source`: 1 expected test failure(s).
+- `ordinary-write`: 1 expected test failure(s).
+- `invalid-telemetry`: 4 expected test failure(s).
+- `unknown-dimensions`: 4 expected test failure(s).
+- `observed-tier-assumption`: 1 expected test failure(s).
+- `model-change`: 1 expected test failure(s).
+- `quiet-cache`: 1 expected test failure(s).
+- `shrink-clamp`: 2 expected test failure(s).
+- `metadata-provider`: 1 expected test failure(s).

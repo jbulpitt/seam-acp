@@ -180,7 +180,7 @@ const server = http.createServer(async (request, response) => {
     response.statusCode = 200;
     response.setHeader("content-type", "application/connect+json");
     if (prompt === "r5-malformed") { response.end(Buffer.from([0, 0, 0, 0, 1, 123])); return; }
-    if (prompt === "r5-oversized-frame") { response.write(Buffer.from([0, 127, 255, 255, 255])); return; }
+    if (prompt === "r5-oversized-frame") { response.write(Buffer.from([0, 0, 128, 0, 1])); return; }
     for (const update of trace.updates) {
       await writeFragmented(response, envelope(0, { update }));
     }

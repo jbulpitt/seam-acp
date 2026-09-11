@@ -25,7 +25,7 @@ it("releases the production subscription reader when its consumer breaks", async
 
 it.each([
   [0, 0, 0, 0, 4, 123], // truncated payload
-  [1, 0, 0, 0, 0], // unsupported compression
+  [1, 0, 0, 0, 2, 123, 125], // unsupported compression, otherwise VALID JSON
 ])("rejects incomplete/unsupported frames instead of silently completing (%j)", async (...bytes) => {
   vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(new Uint8Array(bytes)));
   await expect((async () => {
@@ -42,6 +42,15 @@ it("caps HTTP metadata before parsing and closes the response", async () => {
   await expect(readAgyJsonResponse(new Response(body))).rejects.toMatchObject({ code: "output_overflow" });
   expect(cancelled).toBe(true);
   expect(body.locked).toBe(false);
+});
+
+it("accepts coalesced valid frames whose total chunk exceeds the per-frame limit", async () => {
+  const payload = Buffer.from(JSON.stringify({ update: { status: "RUNNING", text: "x".repeat(5 * 1024 * 1024) } }));
+  const header = Buffer.alloc(5); header.writeUInt32BE(payload.length, 1);
+  vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(Buffer.concat([header, payload, header, payload])));
+  const statuses: unknown[] = [];
+  for await (const update of subscribeToAgyStream({ port: 1, conversationId: "fixture" })) statuses.push(update.status);
+  expect(statuses).toEqual(["RUNNING", "RUNNING"]);
 });
 
 it("caps the private startup log for both discovery readers", async () => {

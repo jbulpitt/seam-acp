@@ -281,35 +281,48 @@ async function* readConnectEnvelopes(
   body: ReadableStream<Uint8Array>,
 ): AsyncGenerator<{ flag: number; payload: Uint8Array }, void, void> {
   const reader = body.getReader();
-  let buf = new Uint8Array(0);
+  const header = new Uint8Array(5);
+  let headerBytes = 0;
+  let payload: Uint8Array | undefined;
+  let payloadBytes = 0;
+  let flag = 0;
   // A bogus length prefix must not retain an unbounded stream awaiting a frame.
   const maxFrameBytes = 8 * 1024 * 1024;
   try {
-  while (true) {
-    const { value, done } = await reader.read();
-    if (value && value.length > 0) {
-      if (buf.length + value.length > maxFrameBytes + 5) throw agyFailure("output_overflow");
-      const next = new Uint8Array(buf.length + value.length);
-      next.set(buf, 0);
-      next.set(value, buf.length);
-      buf = next;
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) {
+        if (headerBytes) throw agyFailure("protocol_error");
+        return;
+      }
+      // One transport chunk can contain MANY valid frames. Bound the declared
+      // frame before allocating it, not the sum of arbitrarily batched frames.
+      let offset = 0;
+      while (offset < value.length) {
+        if (!payload) {
+          const take = Math.min(5 - headerBytes, value.length - offset);
+          header.set(value.subarray(offset, offset + take), headerBytes);
+          headerBytes += take;
+          offset += take;
+          if (headerBytes < 5) continue;
+          flag = header[0]!;
+          const len = new DataView(header.buffer).getUint32(1);
+          if (len > maxFrameBytes) throw agyFailure("output_overflow");
+          if (flag !== 0 && flag !== 2) throw agyFailure("protocol_error");
+          payload = new Uint8Array(len);
+          payloadBytes = 0;
+        }
+        const take = Math.min(payload.length - payloadBytes, value.length - offset);
+        payload.set(value.subarray(offset, offset + take), payloadBytes);
+        payloadBytes += take;
+        offset += take;
+        if (payloadBytes === payload.length) {
+          yield { flag, payload };
+          payload = undefined;
+          headerBytes = 0;
+        }
+      }
     }
-    while (buf.length >= 5) {
-      const flag = buf[0]!;
-      const len =
-        ((buf[1]! << 24) | (buf[2]! << 16) | (buf[3]! << 8) | buf[4]!) >>> 0;
-      if (len > maxFrameBytes) throw agyFailure("output_overflow");
-      if (flag !== 0 && flag !== 2) throw agyFailure("protocol_error");
-      if (buf.length < 5 + len) break;
-      const payload = buf.subarray(5, 5 + len);
-      yield { flag, payload };
-      buf = buf.subarray(5 + len);
-    }
-    if (done) {
-      if (buf.length) throw agyFailure("protocol_error");
-      return;
-    }
-  }
   } finally {
     // Breaking after IDLE must close the HTTP body before the LS is killed.
     await reader.cancel().catch(() => {});

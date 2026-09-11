@@ -2097,10 +2097,12 @@ export async function fetchAgyAcceptedModels(runtime: AgyNativeRuntime): Promise
       // Validator diagnostics are protocol input here, never diagnostic output.
       // The shared helper enforces its stderr bound before this listener runs.
       let bytes = 0;
-      proc.stderr.on("data", (chunk: Buffer) => {
+      const capture = (chunk: Buffer): void => {
         bytes += chunk.length;
         if (bytes <= 256_000) output += chunk.toString();
-      });
+      };
+      proc.stderr.on("data", capture);
+      return () => { proc.stderr.removeListener("data", capture); };
     }, [1]);
   } catch (error) {
     if (error instanceof ProbeError && error.code === "not_reaped") throw error;
@@ -2112,10 +2114,11 @@ export async function fetchAgyAcceptedModels(runtime: AgyNativeRuntime): Promise
 async function runAgyProbe<T>(
   runtime: AgyNativeRuntime, args: string[], timeoutMs: number,
   run: (handle: ProbeHandle) => Promise<T>,
-  observe?: (proc: ChildProcessWithoutNullStreams) => void,
+  observe?: (proc: ChildProcessWithoutNullStreams) => (() => void),
   acceptedExitCodes?: readonly number[],
 ): Promise<T> {
   let proc: ChildProcessWithoutNullStreams;
+  let stopObserving: (() => void) | undefined;
   try {
     return await runBoundedProbe({
       executable: "native-agy", label: "native AGY", timeoutMs, killGraceMs: 500,
@@ -2124,11 +2127,14 @@ async function runAgyProbe<T>(
         proc = runtime.prepare(args, "/tmp", { detached: true, stdio: ["pipe", "pipe", "pipe"] }).spawn() as ChildProcessWithoutNullStreams;
         return proc;
       },
-      run: async (handle) => { observe?.(proc); return run(handle); },
+      run: async (handle) => { stopObserving = observe?.(proc); return run(handle); },
     });
   } catch (error) {
     // Even the shared redactor cannot know secrets loaded from native auth files.
     throw agyFailure(error instanceof ProbeError ? error.code : "protocol_error");
+  } finally {
+    // Do not keep the validator parser/output alive after finite finalization.
+    stopObserving?.();
   }
 }
 

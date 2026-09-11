@@ -1142,7 +1142,7 @@ class AgyAgent implements Agent {
     const persisted = await loadPersistedSession(this.mappingFile, params.sessionId);
     const mcpServers = this.execution.sandbox ? [] : params.mcpServers?.length ? params.mcpServers : this.defaultMcpServers;
     const mcpHome = await prepareAgyMcpHome(params.sessionId, mcpServers);
-    const catalog = await getCatalog(this.runtime).catch(() => [] as AgyCatalogEntry[]);
+    const catalog = await getCatalog(this.runtime).catch(catalogFallback);
     // Resume cannot validate or invoke a canonical session model without a catalog;
     // deleting this guard would reintroduce implicit global/list-order selection.
     if (catalog.length === 0) throw new Error("AGY model catalog is unavailable");

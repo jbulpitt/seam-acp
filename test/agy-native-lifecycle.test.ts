@@ -50,7 +50,7 @@ describe.sequential("R5 native production lifecycle", () => {
       source: path.join(fixtures, "fake-native-agy.mjs"), version: "agy fixture 1.1.28",
       approvedEnvironment: { SEAM_AGY_CAPABILITY_FIXTURE_DIR: fixtures, SEAM_AGY_VALIDATOR_EXIT: String(code) },
     });
-    try { expect([...await fetchAgyAcceptedModels(managed.runtime)]).toEqual(["Fixture Native Model"]); }
+    try { expect([...await fetchAgyAcceptedModels(managed.runtime)]).toEqual(["Fixture Native Model", "Fixture Native Model (Low)"]); }
     finally { managed.cleanup(); }
   });
   it("persists only the safe native failure through the real catalog service", async () => {

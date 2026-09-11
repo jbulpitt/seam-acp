@@ -97,8 +97,8 @@ global staging absent, and no supplied/default MCP server inherited. This is
 Seam launch-policy evidence, **not proof that the installed CLI blocks filesystem
 or terminal operations**. A prompt saying “read only” is not a sandbox.
 
-Installed-CLI enforcement remains an explicit live acceptance gate pending
-separate owner approval. It must use a named model/host, fresh disposable
+Installed-CLI enforcement is tracked separately in #324 and remains gated on
+explicit owner approval. It must use a named model/host, fresh disposable
 sessions, bounded prompt budget, synthetic inside/outside sentinel files and a
 local synthetic MCP endpoint. Assert actual allowed/denied operations and
 unchanged outside sentinels; stop on any unexpected access. Do not use existing

@@ -59,7 +59,7 @@ function makeArchive(sourceSha: string, indexSource: string) {
   return gzipSync(Buffer.concat([tarMember("bridge-release.json", manifest), ...files.map((f) => tarMember(f.path, f.bytes)), Buffer.alloc(1024)]));
 }
 
-async function makeFixture() {
+async function makeFixture(options: { receipt?: "good" | "wrong-nonce" } = {}) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "bridge-first-activation-"));
   const checkout = path.join(root, "checkout");
   const releaseRoot = path.join(root, "rollouts");
@@ -87,6 +87,9 @@ async function makeFixture() {
     `const release=path.resolve(new URL('.',import.meta.url).pathname,'../../..');` +
     `const ep=path.join(release,'activation-envelope.json'),rp=path.join(release,'release-receipt.json');` +
     `if(fs.existsSync(ep)){const e=JSON.parse(fs.readFileSync(ep)),s=JSON.parse(fs.readFileSync(rp)),t=new Date().toISOString(),instance='instance-'+e.activationId.slice(0,12);` +
+    // A receipt that does not bind THIS activation: the forward proof must
+    // reject it rather than accept any well-formed-looking receipt file.
+    (options.receipt === "wrong-nonce" ? `e.activationId='f'.repeat(64);` : "") +
     `fs.writeFileSync(rp,JSON.stringify({...s,...e,pid:process.pid,instanceId:instance,protocolVersion:1,startedAt:e.startedAt,helloAcceptedAt:t,catalogRpcs:{grok:{describeModelCatalogAt:t,fetchModelCatalogAt:t}},controllerAck:{activationId:e.activationId,bridgeId:e.bridgeId,instanceId:instance,pid:process.pid,sourceSha:e.sourceSha,artifactChecksum:e.artifactChecksum},controllerVerifiedAt:t,completedAt:t})+'\\n');}` +
     `process.on('SIGUSR2',()=>{const c=spawn(node,[entry],{cwd,detached:true,stdio:'ignore'});c.unref();update(c.pid);setTimeout(()=>process.exit(0),100);});setInterval(()=>{},1000);\n`;
 
@@ -280,4 +283,127 @@ describe.sequential("#288 first managed activation from an enrolled baseline", (
     ).rejects.toThrow(/release_manifest_file_changed|release_tree_digest_mismatch|first_activation_release_not_receipt_capable/);
     expect(await fs.realpath(f.entry)).toBe(f.entry);
   }, 180_000);
+
+  /**
+   * QA blocker A: the recorded MODE must be re-proven after the switch, not
+   * merely applied during it. The fake PM2 describe callback runs inside
+   * post-switch verification, so weakening the mode there lands exactly in the
+   * window between rename and proof.
+   */
+  it("refuses a rollback whose restored entrypoint mode was weakened after the switch", async () => {
+    const f = await makeFixture();
+    await fs.chmod(f.entry, 0o640);
+    await enroll(f);
+    const release = await f.stage("1".repeat(40), H("3"));
+    const activation = H("4");
+    await f.run(["activate", release.sourceSha, release.checksum, release.stageId, activation, "20", H("5")]);
+
+    const pm2Module = path.join(f.root, "pm2.cjs");
+    const original = await fs.readFile(pm2Module, "utf8");
+    await fs.writeFile(pm2Module, original.replace(
+      "describe(_n,cb){",
+      `describe(_n,cb){try{const st=fs.lstatSync(${JSON.stringify(f.entry)});if(st.isFile()&&!st.isSymbolicLink())fs.chmodSync(${JSON.stringify(f.entry)},0o600);}catch{}`
+    ));
+
+    await expect(
+      f.run(["rollback", activation, H("9"), "20", H("a")])
+    ).rejects.toThrow(/baseline_entrypoint_mode_mismatch/);
+    // No verified record may claim a transition that was not proven.
+    await expect(fs.stat(path.join(f.releaseRoot, "rollbacks", `${activation}-${H("9")}.verified.json`))).rejects.toThrow();
+  }, 180_000);
+
+  /**
+   * QA coverage gap 1: replacing the forward `verifyActivationReceipt` with a
+   * bare read of the receipt file left all six original tests green, because
+   * they only assert the happy path's record fields. A malformed receipt must
+   * be what fails.
+   */
+  it("refuses a first activation whose forward receipt does not bind this activation", async () => {
+    const f = await makeFixture({ receipt: "wrong-nonce" });
+    await enroll(f);
+    const release = await f.stage("1".repeat(40), H("3"));
+    const activation = H("4");
+    await expect(
+      f.run(["activate", release.sourceSha, release.checksum, release.stageId, activation, "12", H("5")])
+    ).rejects.toThrow(/activation_receipt_timeout/);
+    // Observed but never verified: rollback remains available by activation id.
+    await expect(fs.stat(path.join(f.releaseRoot, "activations", `${activation}.verified.json`))).rejects.toThrow();
+    await expect(fs.stat(path.join(f.releaseRoot, "activations", `${activation}.observed.json`))).resolves.toBeTruthy();
+  }, 180_000);
+
+  /**
+   * QA coverage gap 2: removing only the POST-switch baseline re-proof left all
+   * six original tests green — the existing drift test kills the pre-switch
+   * check. Drift introduced after the rename must be caught by the later proof.
+   */
+  it("refuses a rollback when runtime content drifts after the switch", async () => {
+    const f = await makeFixture();
+    await enroll(f);
+    const release = await f.stage("1".repeat(40), H("3"));
+    const activation = H("4");
+    await f.run(["activate", release.sourceSha, release.checksum, release.stageId, activation, "20", H("5")]);
+
+    // Drift a dormant dependency from inside post-switch verification, so the
+    // pre-switch proof has already passed when it happens.
+    const pm2Module = path.join(f.root, "pm2.cjs");
+    const original = await fs.readFile(pm2Module, "utf8");
+    const dep = path.join(f.checkout, "node_modules/ws/index.js");
+    await fs.writeFile(pm2Module, original.replace(
+      "describe(_n,cb){",
+      `describe(_n,cb){try{const st=fs.lstatSync(${JSON.stringify(f.entry)});if(st.isFile()&&!st.isSymbolicLink())fs.writeFileSync(${JSON.stringify(dep)},"module.exports={drifted:true};\\n");}catch{}`
+    ));
+
+    await expect(
+      f.run(["rollback", activation, H("9"), "20", H("a")])
+    ).rejects.toThrow(/baseline_runtime_tree_mismatch|baseline_runtime_file_mismatch/);
+    await expect(fs.stat(path.join(f.releaseRoot, "rollbacks", `${activation}-${H("9")}.verified.json`))).rejects.toThrow();
+  }, 180_000);
+
+  /**
+   * QA blocker B, resolved as a PRECONDITION rather than a count. A host that
+   * rolled back to its legacy baseline genuinely is legacy again and faces the
+   * original problem, so the reduced path is reachable again — deliberately.
+   * What must stay true is that it is unreachable while a managed release is
+   * active, and that re-entry costs an explicit, verified rollback.
+   */
+  it("is reachable again only after an explicit verified rollback to legacy", async () => {
+    const f = await makeFixture();
+    await enroll(f);
+
+    // 1. First activation takes the reduced path.
+    const first = await f.stage("1".repeat(40), H("3"));
+    const one = parseKeyValues((await f.run(["activate", first.sourceSha, first.checksum, first.stageId, H("4"), "20", H("5")])).stdout);
+    expect(one.activation_from).toBe("enrolled-baseline");
+
+    // 2. An explicit, verified rollback is the ONLY way back to legacy. Note a
+    //    managed-to-managed rollback returns to a release, not to the baseline,
+    //    so re-entry costs rolling back the baseline-backed activation itself.
+    const rolled = parseKeyValues((await f.run(["rollback", H("4"), H("9"), "20", H("a")])).stdout);
+    expect(rolled.rollback_to).toBe("enrolled-baseline");
+    const pre = parseKeyValues((await f.run(["preflight"])).stdout);
+    expect(pre.artifact_mode).toBe("legacy-checkout");
+    expect(pre.enrolled).toBe("yes");
+
+    // 3. The host genuinely IS legacy again and faces the original problem, so
+    //    the reduced path applies once more. This is the guarantee: a
+    //    precondition on the live entrypoint, not a count of uses.
+    const second = await f.stage("2".repeat(40), H("6"));
+    const two = parseKeyValues((await f.run(["activate", second.sourceSha, second.checksum, second.stageId, H("7"), "20", H("8")])).stdout);
+    expect(two.activation_from).toBe("enrolled-baseline");
+    expect(two.rollback_proof).toBe("reduced-baseline");
+
+    // 4. While a managed release is active it stays unreachable: the ordinary
+    //    receipt path is taken and the record names no baseline previous.
+    const third = await f.stage("3".repeat(40), H("b"));
+    const three = parseKeyValues((await f.run(["activate", third.sourceSha, third.checksum, third.stageId, H("c"), "20", H("d")])).stdout);
+    expect(three.activation_from).toBeUndefined();
+
+    // Every use is separately auditable from the immutable activation records.
+    const records = await Promise.all(
+      [H("4"), H("7"), H("c")].map(async (id) =>
+        JSON.parse(await fs.readFile(path.join(f.releaseRoot, "activations", `${id}.verified.json`), "utf8")))
+    );
+    expect(records.map((r) => r.previous.kind)).toEqual(["enrolled-baseline", "enrolled-baseline", undefined]);
+    expect(records.filter((r) => r.previous.kind === "enrolled-baseline")).toHaveLength(2);
+  }, 240_000);
 });

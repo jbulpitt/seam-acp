@@ -819,6 +819,12 @@ async function verifyBaseline(record, identity) {
     const entryStat = await fsp.lstat(entrypointPath).catch(() => null);
     if (!entryStat?.isFile() || entryStat.isSymbolicLink()) return { ok: false, reason: "baseline_entrypoint_wrong_type" };
     if (hash(await fsp.readFile(entrypointPath)) !== baseline.entrypointSha256) return { ok: false, reason: "baseline_entrypoint_mismatch" };
+    // The MODE is part of the restored artifact, not a detail of how it was
+    // written. Applying a chmod during restore is not the same as proving the
+    // mode afterwards: anything that changed it between the rename and this
+    // check would otherwise pass verification while the deployment ran with
+    // permissions the baseline never recorded.
+    if ((entryStat.mode & 0o7777) !== baseline.entrypointMode) return { ok: false, reason: "baseline_entrypoint_mode_mismatch" };
   }
   return { ok: true };
 }

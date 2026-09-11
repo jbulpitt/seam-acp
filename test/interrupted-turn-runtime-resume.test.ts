@@ -42,7 +42,7 @@ function modelOptions() {
     options: [{ value: MODEL, name: "Opus" }] }];
 }
 
-function syntheticAcp(calls: AcpCalls, mode: "ok" | "no-load" | "reject-load") {
+function syntheticAcp(calls: AcpCalls, mode: "ok" | "no-load" | "reject-load" | "hang-load") {
   return () => {
     const stdin = new PassThrough();
     const stdout = new PassThrough();
@@ -72,6 +72,7 @@ function syntheticAcp(calls: AcpCalls, mode: "ok" | "no-load" | "reject-load") {
       .onRequest(methods.agent.session.load, ({ params }) => {
         calls.loads.push(params.sessionId);
         if (mode === "reject-load") throw new Error("synthetic remote session/load refusal");
+        if (mode === "hang-load") return new Promise(() => {});
         return { sessionId: params.sessionId, configOptions: modelOptions() };
       })
       .onRequest(methods.agent.session.prompt, ({ params }) => {
@@ -104,7 +105,7 @@ afterEach(async () => {
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
 });
 
-function harness(location: "local" | "bridge-a", mode: "ok" | "no-load" | "reject-load"): Harness {
+function harness(location: "local" | "bridge-a", mode: "ok" | "no-load" | "reject-load" | "hang-load"): Harness {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "seam-302-runtime-"));
   const store = new SessionStore(path.join(dir, "seam.db"));
   const calls: AcpCalls = { initialized: 0, loads: [], news: 0, prompts: [], children: [] };
@@ -126,7 +127,8 @@ function harness(location: "local" | "bridge-a", mode: "ok" | "no-load" | "rejec
     createdUtc: now, updatedUtc: now });
   const router = new SessionRouter({ logger: silent, store, profiles: [profile], modelCatalog: catalog,
     defaultAgentId: "claude", defaultModel: MODEL, defaultPermissionMode: "deny",
-    threadPresets, defaultCwd: dir });
+    threadPresets, defaultCwd: dir,
+    ...(mode === "hang-load" ? { sessionLoadTimeoutMs: 25 } : {}) });
   if (location !== "local") {
     const localPlan = router.planRuntimeSpawn.bind(router);
     vi.spyOn(router, "planRuntimeSpawn").mockImplementation((record) => ({
@@ -186,7 +188,9 @@ async function resume(h: Harness): Promise<void> {
 describe("#302 real ACP handshake and strict session/load recovery", () => {
   it("loads the recorded Claude session and sends one continuation without replaying the brief", async () => {
     const h = harness("local", "ok"); const id = seedPromptedAttempt(h);
+    const startedAt = performance.now();
     await resume(h);
+    expect(performance.now() - startedAt).toBeLessThan(5_000);
     expect(h.calls.initialized).toBe(1);
     expect(h.calls.loads).toEqual([RECORDED]);
     expect(h.calls.news).toBe(0);
@@ -235,4 +239,22 @@ describe("#302 real ACP handshake and strict session/load recovery", () => {
       if (mode === "reject-load") expect(h.calls.loads).toEqual([RECORDED, RECORDED, RECORDED]);
     },
   );
+
+  it("bounds a silent session/load and records the named refusal as recoverably suspended", async () => {
+    const h = harness("local", "hang-load"); const id = seedPromptedAttempt(h);
+    const startedAt = performance.now();
+    await resume(h);
+    const elapsedMs = performance.now() - startedAt;
+    expect(elapsedMs).toBeGreaterThanOrEqual(15);
+    expect(elapsedMs).toBeLessThan(500);
+    expect(h.calls.loads).toEqual([RECORDED]);
+    expect(h.calls.news).toBe(0);
+    expect(h.calls.prompts).toEqual([]);
+    expect(h.calls.children[0]?.killed).toBe(true);
+    expect(h.store.turnAttempts.get(id)).toMatchObject({
+      state: "suspended",
+      generation: 2,
+      stalledReason: "Strict resume refused: ACP session/load timed out after 0.025s for agent 'claude'; the session was not resumed and can be retried",
+    });
+  }, 1_000);
 });

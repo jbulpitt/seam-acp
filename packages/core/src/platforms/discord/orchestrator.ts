@@ -7424,11 +7424,32 @@ export class Orchestrator {
   private async handleQuotaCardComponent(evt: ComponentEvent): Promise<void> {
     if (!evt.customId.startsWith("seam-quota:")) return;
     await evt.deferUpdate().catch(() => {});
-    if (!this.quotaPoller) return;
+    if (!this.quotaPoller) {
+      await evt.followUpEphemeral("Usage refresh is unavailable during startup or shutdown.");
+      return;
+    }
     const now = Date.now();
-    if (now - this.lastQuotaRefreshClickAt < 10_000) return;
+    if (now - this.lastQuotaRefreshClickAt < 10_000) {
+      await evt.followUpEphemeral("Usage was refreshed recently; try again in a few seconds.");
+      return;
+    }
     this.lastQuotaRefreshClickAt = now;
-    await this.quotaPoller.refreshAll(true);
+    const result = await this.quotaPoller.refreshAll(true);
+    const timedOut = result.sources.filter((source) => source.outcome === "timed_out");
+    const unavailable = result.sources.filter((source) => source.outcome === "unavailable");
+    if (timedOut.length > 0) {
+      await evt.followUpEphemeral(
+        `Usage refresh timed out after 30s for ${timedOut.map((source) => source.displayName).join(", ")}. ` +
+        "Other agents refreshed normally; any last-known-good values were retained."
+      );
+    } else if (unavailable.length > 0) {
+      await evt.followUpEphemeral(
+        `Usage refreshed with ${unavailable.length} unavailable source${unavailable.length === 1 ? "" : "s"}; ` +
+        "other agents and retained values remain available."
+      );
+    } else {
+      await evt.followUpEphemeral(`Usage refreshed (${result.sources.length} agents).`);
+    }
   }
 
   /** Manual refresh on the pinned upstream-status card. */

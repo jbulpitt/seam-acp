@@ -28,6 +28,7 @@ import {
   QUOTA_FAILURE_RETRY_CAP,
   QUOTA_FAILURE_RETRY_MS,
   QUOTA_MIN_REFRESH_MS,
+  QUOTA_SOURCE_TIMEOUT_MS,
   QUOTA_STALE_RETENTION_MS,
   QuotaRegistry,
   quotaPollIntervalMs,
@@ -40,8 +41,26 @@ export type QuotaConnectionRequest = (
 
 export interface AgentQuotaSource extends QuotaAgentIdentity {
   eventDriven: boolean;
-  fetch: () => Promise<AgentQuota>;
-  fetchFromConnection?: (request: QuotaConnectionRequest) => Promise<AgentQuota>;
+  fetch: (signal: AbortSignal) => Promise<AgentQuota>;
+  fetchFromConnection?: (
+    request: QuotaConnectionRequest,
+    signal: AbortSignal
+  ) => Promise<AgentQuota>;
+}
+
+export interface AgentQuotaRefreshResult {
+  agentId: string;
+  displayName: string;
+  outcome: "refreshed" | "retained" | "unavailable" | "timed_out";
+  durationMs: number;
+  quota: AgentQuota;
+  error: string | null;
+}
+
+export interface AgentQuotaRefreshSummary {
+  outcome: "succeeded" | "mixed" | "failed";
+  durationMs: number;
+  sources: AgentQuotaRefreshResult[];
 }
 
 export function createAgentQuotaSources(
@@ -106,8 +125,8 @@ export function createAgentQuotaSources(
       return {
         ...identity,
         eventDriven: false,
-        fetch: async () =>
-          mapCopilotQuota(identity, await fetchCopilotUsage(profile.configDir)),
+        fetch: async (signal) =>
+          mapCopilotQuota(identity, await fetchCopilotUsage(profile.configDir, signal)),
       };
     }
     if (
@@ -138,13 +157,14 @@ export class AgentQuotaPoller {
   /** Absolute ms each pending timer is scheduled to fire, so activity can only
    *  pull a refresh sooner — never push it out (which would starve the timer). */
   private readonly timerFireAt = new Map<string, number>();
-  private readonly inFlight = new Map<string, Promise<AgentQuota | undefined>>();
+  private readonly inFlight = new Map<string, Promise<AgentQuotaRefreshResult>>();
   private readonly lastRefreshAt = new Map<string, number>();
   /** When each agent last produced an `ok` snapshot (for stale retention). */
   private readonly lastGoodAt = new Map<string, number>();
   /** Consecutive surfaced-unavailable results per agent (for fast retry). */
   private readonly consecutiveFailures = new Map<string, number>();
   private readonly staleRetentionMs: number;
+  private readonly sourceTimeoutMs: number;
   private onUpdate?: (quota: AgentQuota) => void;
   private started = false;
 
@@ -155,11 +175,14 @@ export class AgentQuotaPoller {
     onUpdate?: (quota: AgentQuota) => void;
     /** Keep last-known-good this long when reads return unavailable. */
     staleRetentionMs?: number;
+    /** Test/embedding override. Production uses QUOTA_SOURCE_TIMEOUT_MS. */
+    sourceTimeoutMs?: number;
   }) {
     this.logger = opts.logger.child({ comp: "agent-quota" });
     this.registry = opts.registry;
     this.onUpdate = opts.onUpdate;
     this.staleRetentionMs = opts.staleRetentionMs ?? QUOTA_STALE_RETENTION_MS;
+    this.sourceTimeoutMs = opts.sourceTimeoutMs ?? QUOTA_SOURCE_TIMEOUT_MS;
     for (const source of opts.sources) this.sources.set(source.agentId, source);
   }
 
@@ -219,10 +242,19 @@ export class AgentQuotaPoller {
    * still dedupes an already-in-flight fetch per agent, and each fresh `ok`
    * snapshot fires onUpdate so the card re-renders with new timestamps.
    */
-  async refreshAll(force = false): Promise<void> {
-    await Promise.all(
-      [...this.sources.keys()].map((agentId) => this.refresh(agentId, undefined, force))
+  async refreshAll(force = false): Promise<AgentQuotaRefreshSummary> {
+    const startedAt = Date.now();
+    const sources = await Promise.all(
+      [...this.sources.keys()].map((agentId) => this.refreshResult(agentId, undefined, force))
     );
+    const failures = sources.filter((source) =>
+      source.outcome === "unavailable" || source.outcome === "timed_out"
+    ).length;
+    return {
+      outcome: failures === 0 ? "succeeded" : failures === sources.length ? "failed" : "mixed",
+      durationMs: Date.now() - startedAt,
+      sources,
+    };
   }
 
   async refresh(
@@ -230,36 +262,114 @@ export class AgentQuotaPoller {
     request?: QuotaConnectionRequest,
     force = false
   ): Promise<AgentQuota | undefined> {
+    return (await this.refreshResult(agentId, request, force))?.quota;
+  }
+
+  private async refreshResult(
+    agentId: string,
+    request?: QuotaConnectionRequest,
+    force = false
+  ): Promise<AgentQuotaRefreshResult> {
     const source = this.sources.get(agentId);
-    if (!source) return undefined;
+    if (!source) throw new Error(`Unknown quota source '${agentId}'`);
     const pending = this.inFlight.get(agentId);
     if (pending) return pending;
     const now = Date.now();
     const previousAt = this.lastRefreshAt.get(agentId) ?? 0;
     if (!force && now - previousAt < QUOTA_MIN_REFRESH_MS) {
-      return this.registry.get(agentId);
+      const quota = this.registry.get(agentId) ?? mapUnavailableQuota(source, "Quota has not been fetched yet");
+      return {
+        ...source,
+        outcome: quota.ok ? "retained" : "unavailable",
+        durationMs: 0,
+        quota,
+        error: quota.error ?? null,
+      };
     }
     this.lastRefreshAt.set(agentId, now);
-    const task = (async (): Promise<AgentQuota> => {
+    const controller = new AbortController();
+    const startedAt = Date.now();
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    let sourceWorkSettled = false;
+    const sourceWork = (async (): Promise<AgentQuota> => {
+      return request && source.fetchFromConnection
+        ? await source.fetchFromConnection(request, controller.signal)
+        : await source.fetch(controller.signal);
+    })().then(
+      (quota) => {
+        sourceWorkSettled = true;
+        return quota;
+      },
+      (err: unknown) => {
+        sourceWorkSettled = true;
+        throw err;
+      }
+    );
+    const task = (async (): Promise<AgentQuotaRefreshResult> => {
       let quota: AgentQuota;
+      let timedOut = false;
       try {
-        quota = request && source.fetchFromConnection
-          ? await source.fetchFromConnection(request)
-          : await source.fetch();
+        quota = await Promise.race([
+          sourceWork,
+          new Promise<never>((_resolve, reject) => {
+            timeout = setTimeout(() => {
+              // #307: this deadline refuses only the stuck quota source;
+              // deleting it restores the permanent usage-card spinner.
+              timedOut = true;
+              const error = new Error(
+                `Quota refresh for '${source.displayName}' timed out after ${this.sourceTimeoutMs / 1000}s`
+              );
+              controller.abort(error);
+              reject(error);
+            }, this.sourceTimeoutMs);
+            timeout.unref?.();
+          }),
+        ]);
       } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
+        // Stable text only: endpoint responses, credentials and paths must not
+        // enter the card, registry or durable logs through a thrown error.
+        const message = timedOut
+          ? `Quota refresh timed out after ${this.sourceTimeoutMs / 1000}s`
+          : "Quota refresh failed";
         quota = mapUnavailableQuota(source, message);
-        this.logger.warn({ err, agentId }, "agent quota refresh failed");
+        this.logger.warn(
+          { agentId, timeoutMs: timedOut ? this.sourceTimeoutMs : undefined },
+          timedOut ? "agent quota refresh timed out" : "agent quota refresh failed"
+        );
+      } finally {
+        if (timeout) clearTimeout(timeout);
       }
       const { quota: effective, changed } = this.applyResult(quota);
       if (changed) this.onUpdate?.(effective);
-      return effective;
+      const retained = !quota.ok && effective.ok;
+      return {
+        ...source,
+        outcome: timedOut ? "timed_out" : retained ? "retained" : effective.ok ? "refreshed" : "unavailable",
+        durationMs: Date.now() - startedAt,
+        quota: effective,
+        error: timedOut
+          ? `Quota refresh timed out after ${this.sourceTimeoutMs / 1000}s`
+          : quota.error ?? null,
+      };
     })();
     this.inFlight.set(agentId, task);
     try {
       return await task;
     } finally {
-      this.inFlight.delete(agentId);
+      const release = () => {
+        if (this.inFlight.get(agentId) === task) this.inFlight.delete(agentId);
+      };
+      if (sourceWorkSettled) {
+        release();
+      } else {
+        // #307: retaining ownership prevents overlap; deleting this lets a
+        // second click start IO while the timed-out source is still alive.
+        // Promise.race bounds what the caller waits for, but the ownership
+        // record stays until the aborted source itself settles. This prevents
+        // a second click from overlapping owned IO. The source can no longer
+        // publish (only `task` calls applyResult), so a late completion is inert.
+        void sourceWork.then(release, release);
+      }
     }
   }
 

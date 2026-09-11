@@ -1,5 +1,5 @@
 import path from "node:path";
-import { AgentRuntime } from "../agents/agent-runtime.js";
+import { AgentRuntime, SessionLoadTimeoutError } from "../agents/agent-runtime.js";
 import { asRemoteCatalogAdapter, type AgentProfile, type CatalogModelEvidence } from "@seam/adapters";
 import type { Logger } from "../lib/logger.js";
 import type { SessionStore } from "./session-store.js";
@@ -315,6 +315,7 @@ export class SessionRouter {
   private readonly retirements = new Map<string, Promise<void>>();
   private readonly runtimeIdleTtlMs: number;
   private readonly runtimeIdleSweepMs: number;
+  private readonly sessionLoadTimeoutMs: number | undefined;
   private idleReaperTimer?: ReturnType<typeof setInterval>;
   private idleSweepInFlight = false;
 
@@ -341,6 +342,8 @@ export class SessionRouter {
      * TTL; tests and embedders remain opt-in. */
     runtimeIdleTtlMs?: number;
     runtimeIdleSweepMs?: number;
+    /** Test/embedding override forwarded to AgentRuntime. */
+    sessionLoadTimeoutMs?: number;
     /**
      * Production passes `OLLAMA_CLOUD_ENABLED`. When false, a leftover
      * ollama-cloud session fails with the parked message rather than
@@ -366,6 +369,7 @@ export class SessionRouter {
       1_000,
       opts.runtimeIdleSweepMs ?? Math.min(300_000, Math.max(30_000, Math.floor(this.runtimeIdleTtlMs / 4)))
     );
+    this.sessionLoadTimeoutMs = opts.sessionLoadTimeoutMs;
   }
 
   /** Start the unref'd warm-runtime reaper. Durable session rows and ACP ids
@@ -1268,6 +1272,9 @@ export class SessionRouter {
           "The running turn was cancelled before this request completed."
         );
       },
+      ...(this.sessionLoadTimeoutMs !== undefined
+        ? { loadSessionTimeoutMs: this.sessionLoadTimeoutMs }
+        : {}),
     });
 
     // For non-Anthropic backends (Ollama Cloud, Z.ai), setModel() is rejected
@@ -1323,6 +1330,17 @@ export class SessionRouter {
             );
             return runtime;
           } catch (err) {
+            // #307: this check keeps the 60s deadline global to one resume;
+            // deleting it silently multiplies the outage across three retries.
+            // A deadline is not a transient adapter-start race. Retrying it
+            // would multiply the configured bound and keep this worker silent;
+            // refuse only this resume and let the caller expose/retry it.
+            if (err instanceof SessionLoadTimeoutError) {
+              if (recovery) {
+                throw new Error(`Strict resume refused: ${err.message}`, { cause: err });
+              }
+              throw err;
+            }
             const lastAttempt = attempt === RESUME_ATTEMPTS;
             if (lastAttempt && recovery) {
               const detail = err instanceof Error ? err.message : String(err);

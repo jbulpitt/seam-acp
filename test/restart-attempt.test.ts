@@ -5,6 +5,7 @@ import path from "node:path";
 import Database from "better-sqlite3";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
 import { processOwner, provenDead } from "../packages/core/src/core/dispatch/process-owner.js";
+import { executionIdentity } from "../packages/core/src/core/dispatch/execution-identity.js";
 import { simulateRetiredOwnerProcess } from "./restart-process-fixture.js";
 
 const dirs: string[] = [];
@@ -24,7 +25,8 @@ afterEach(() => {
 const spec = { id: "job", target: "worker", session: "live" as const,
   kind: "handoff" as const, prompt: "original task", returnTo: "origin",
   correlationId: "logical", createdUtc: "2026-09-09T00:00:00Z" };
-const identity = "synthetic-provider/store/cwd/account-v1";
+const identity = executionIdentity({ agent: "synthetic-provider", location: "local", session: "live",
+  model: "synthetic-model", effort: "", cwd: "/synthetic", config: {} });
 
 describe("#250 durable attempt winner", () => {
   it.each(["missing", "null", "{}", "invalid-json", "invalid-pid", "missing-start"])(

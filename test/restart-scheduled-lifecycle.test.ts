@@ -66,6 +66,15 @@ function setup(mode: "live" | "isolated" = "isolated") {
   return { dir, store, make, adapter, row, router };
 }
 
+function rewriteAsLegacy(store: SessionStore, id: string, legacy = "a".repeat(64)): void {
+  const db = (store as unknown as { db: import("better-sqlite3").Database }).db;
+  const occurrence = store.scheduledOccurrences.get(id);
+  if (!occurrence?.execution) throw new Error("expected prepared scheduled occurrence");
+  db.prepare("UPDATE turn_attempts SET identity=? WHERE id=?").run(legacy, id);
+  db.prepare("UPDATE scheduled_occurrences SET execution_json=? WHERE id=?")
+    .run(JSON.stringify({ ...occurrence.execution, fingerprint: legacy }), id);
+}
+
 describe("#252 actual isolated scheduler + injectTurn, synthetic transport", () => {
   it.each((['live', 'isolated'] as const).flatMap(mode => (['manual', 'cron'] as const)
     .flatMap(trigger => (['record', 'config', 'read-config'] as const).map(stage => ({ mode, trigger, stage })))))
@@ -185,6 +194,49 @@ describe("#252 actual isolated scheduler + injectTurn, synthetic transport", () 
       expect(transport.load).toHaveBeenCalledTimes(2);
       expect(transport.delete).toHaveBeenCalledTimes(1);
     } else expect(h.router.getOrStartRuntime.mock.calls.at(-1)?.[1]).toEqual({ resumeSessionId: "live-session" });
+  });
+
+  it("reclaims a prompted scheduled attempt carrying a legacy digest", async () => {
+    const h = setup("isolated"); simulateRetiredOwnerProcess();
+    const first = h.make(); const key = scheduledOccurrenceKey(h.row.id);
+    transport.prompt.mockImplementationOnce(async () => { first.suspendForRestart(); throw new Error("cutoff"); });
+    await first.runScheduledPrompt(h.row.id, key);
+    const recorded = h.store.turnAttempts.get(key.id)?.acpSessionId;
+    expect(recorded).toBe("new-disposable-session");
+    rewriteAsLegacy(h.store, key.id);
+
+    transport.prompt.mockResolvedValueOnce({ stopReason: "end_turn" });
+    await h.make().runScheduledPrompt(h.row.id, key);
+
+    expect(transport.load).toHaveBeenLastCalledWith(recorded);
+    expect(transport.prompt.mock.calls.map((call) => call[0])).toEqual([
+      expect.stringContaining(h.row.promptText),
+      "continue",
+    ]);
+    expect(h.store.turnAttempts.get(key.id)).toMatchObject({ state: "completed", generation: 2 });
+  });
+
+  it("refuses a never-prompted scheduled legacy row by name and leaves it recoverably suspended", async () => {
+    const h = setup("isolated"); simulateRetiredOwnerProcess();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    Object.assign(h.adapter, { getThreadLiveState: async () => { await gate; return { locked: false, archived: false }; } });
+    const first = h.make(); const key = scheduledOccurrenceKey(h.row.id);
+    const run = first.runScheduledPrompt(h.row.id, key);
+    expect(h.store.turnAttempts.get(key.id)).toMatchObject({ promptStarted: false, acpSessionId: null });
+    first.suspendForRestart(); release(); await run;
+    rewriteAsLegacy(h.store, key.id);
+    Object.assign(h.adapter, { getThreadLiveState: async () => ({ locked: false, archived: false }) });
+
+    await h.make().runScheduledPrompt(h.row.id, key);
+
+    expect(transport.prompt).not.toHaveBeenCalled();
+    expect(h.store.turnAttempts.get(key.id)).toMatchObject({
+      state: "suspended",
+      promptStarted: false,
+      stalledReason: expect.stringMatching(/never-prompted legacy attempt/i),
+    });
+    expect(h.store.getScheduled(h.row.id)?.lastStatus).toMatch(/retained: never-prompted legacy attempt/i);
   });
 
   it("deduplicates the same cron slot but admits a later slot and distinct manual runs", async () => {

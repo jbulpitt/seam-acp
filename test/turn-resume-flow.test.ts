@@ -124,7 +124,10 @@ function makeOrch(opts?: {
     modelCatalog: fixtureModelCatalog([catalogProfile]),
     router: router as any,
     store,
-    renderer: {} as any,
+    renderer: {
+      statusPanel: () => ({ title: "", fields: [] }),
+      panel: () => ({ title: "", fields: [] }),
+    } as any,
   });
   (orch as any).postDispatchStartIndicator = async () => undefined;
   (orch as any).postDispatchOutput = async () => {};

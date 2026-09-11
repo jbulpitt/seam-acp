@@ -1,5 +1,6 @@
 import type Database from "better-sqlite3";
 import type { DispatchResult, DispatchSpec } from "./types.js";
+import { compareExecutionIdentity } from "./execution-identity.js";
 import { isProcessOwner, processOwner, provenDead, type ProcessOwner } from "./process-owner.js";
 
 function recordedOwner(raw: string | undefined): ProcessOwner | null {
@@ -41,7 +42,10 @@ export interface TurnAttempt {
 /** Not a worker failure. Callers must retain the logical job and emit nothing
  * onward. Also fences obsolete callbacks after a replacement/cancel winner. */
 export class DispatchSuspendedError extends Error {
-  constructor(readonly dispatchId: string) {
+  /** `reason` names WHY in operator terms — e.g. "thread switched from codex to
+   * claude". Without it a refusal is two opaque digests and hours of debugging
+   * (#302); the message stays stable for existing callers that match on it. */
+  constructor(readonly dispatchId: string, readonly reason?: string) {
     super("dispatch attempt no longer owns execution");
     this.name = "DispatchSuspendedError";
   }
@@ -55,6 +59,10 @@ export class TurnAttemptStore {
       acp_session_id TEXT, prompt_started INTEGER NOT NULL DEFAULT 0,
       outcome_json TEXT, runtime_json TEXT, provider_identity TEXT, updated_utc TEXT NOT NULL
     ); CREATE INDEX IF NOT EXISTS idx_turn_attempt_owner ON turn_attempts(owner_boot, state);
+    -- #302: attempts are many-to-one with sessions (two of the five stalls on
+    -- 2026-09-10 shared 624a55a4), so "which work belongs to this session" was
+    -- a table scan.
+    CREATE INDEX IF NOT EXISTS idx_turn_attempt_acp_session ON turn_attempts(acp_session_id);
     CREATE TABLE IF NOT EXISTS turn_attempt_owners (id TEXT PRIMARY KEY, process_json TEXT NOT NULL);`);
     for (const ddl of [
       "ALTER TABLE turn_attempts ADD COLUMN source TEXT NOT NULL DEFAULT 'dispatch'",
@@ -110,8 +118,22 @@ export class TurnAttemptStore {
     return this.db.transaction(() => {
       const old = this.get(spec.id);
       if (old) {
-        if (old.state !== "suspended" || old.identity !== identity || old.source !== source) {
-          throw new DispatchSuspendedError(spec.id);
+        if (old.state !== "suspended" || old.source !== source) throw new DispatchSuspendedError(spec.id);
+        // Compare the recorded selection field by field so a refusal can name
+        // the field. The previous opaque digest also folded in rotating
+        // credentials and provider env values, so an unrelated token refresh
+        // stranded the attempt permanently (#302).
+        const drift = compareExecutionIdentity(old.identity, identity, {
+          promptStarted: old.promptStarted,
+          acpSessionId: old.acpSessionId,
+        });
+        if (!drift.match) throw new DispatchSuspendedError(spec.id, drift.reason);
+        // `startPrompt` only sets prompt_started when a session id is already
+        // recorded, so this pairing cannot occur. If it ever does we recorded
+        // that we prompted without recording where the work went, and replaying
+        // could duplicate work the model already did — refuse loudly instead.
+        if (old.promptStarted && !old.acpSessionId) {
+          throw new DispatchSuspendedError(spec.id, "attempt recorded a started prompt with no session id");
         }
         const owner = this.db.prepare("SELECT process_json FROM turn_attempt_owners WHERE id=?")
           .get(old.ownerBoot) as { process_json: string } | undefined;

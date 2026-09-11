@@ -294,6 +294,7 @@ function makeHarness(opts: HarnessOpts = {}) {
       return profile;
     },
     ensureSessionRecord: () => record,
+    assertAgentAllowedForRecord: () => {},
     invalidate: async (id: string, o: unknown) => void invalidated.push({ id, opts: o }),
   };
 

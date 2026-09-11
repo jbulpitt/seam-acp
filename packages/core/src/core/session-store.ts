@@ -98,6 +98,14 @@ import type {
   NewElicitationRow,
 } from "./elicitation/types.js";
 
+/** The latest audit row's readable state. `unreadable` is deliberately distinct
+ * from a missing or cleared rule so runtime enforcement can fail closed. */
+export type AgentChannelRestrictionLookup =
+  | { state: "absent" }
+  | { state: "cleared" }
+  | { state: "active"; rule: AgentChannelRestriction }
+  | { state: "unreadable" };
+
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS agy_identity_restore (
   id TEXT PRIMARY KEY,
@@ -1986,6 +1994,13 @@ export class SessionStore {
   /** The latest audited rule is the runtime source of truth; no second
    * configuration store exists for agent/channel restrictions (#308). */
   getAgentChannelRestriction(agentId: string): AgentChannelRestriction | null {
+    const lookup = this.lookupAgentChannelRestriction(agentId);
+    return lookup.state === "active" ? lookup.rule : null;
+  }
+
+  /** One-row state lookup for runtime enforcement: an unreadable latest row
+   * remains distinguishable from a rule that was never set or was cleared. */
+  lookupAgentChannelRestriction(agentId: string): AgentChannelRestrictionLookup {
     const row = this.db
       .prepare<[string, string], ConfigAuditRow>(
         `SELECT * FROM config_audit
@@ -1993,7 +2008,12 @@ export class SessionStore {
          ORDER BY applied_utc DESC, rowid DESC LIMIT 1`
       )
       .get("agent-channel-restriction", `agent-channel-restriction:${agentId}`);
-    return row ? parseAgentChannelRestriction(row.after_json) : null;
+    if (!row) return { state: "absent" };
+    const parsed = parseAgentChannelRestriction(row.after_json);
+    if (parsed.state === "active" && parsed.rule.agentId !== agentId) {
+      return { state: "unreadable" };
+    }
+    return parsed;
   }
 
   /** Current rules only: cleared rules remain in the immutable audit history. */
@@ -2012,8 +2032,12 @@ export class SessionStore {
          ORDER BY current.scope ASC`
       )
       .all("agent-channel-restriction")
-      .map((row) => parseAgentChannelRestriction(row.after_json))
-      .filter((rule): rule is AgentChannelRestriction => rule !== null);
+      .flatMap((row) => {
+        const parsed = parseAgentChannelRestriction(row.after_json);
+        return parsed.state === "active" && row.scope === `agent-channel-restriction:${parsed.rule.agentId}`
+          ? [parsed.rule]
+          : [];
+      });
   }
 
   /**
@@ -6201,12 +6225,14 @@ const mapConfigAudit = (r: ConfigAuditRow): ConfigAuditEntry => ({
   appliedUtc: r.applied_utc,
 });
 
-function parseAgentChannelRestriction(raw: string): AgentChannelRestriction | null {
+function parseAgentChannelRestriction(raw: string): Exclude<AgentChannelRestrictionLookup, { state: "absent" }> {
   try {
     const parsed: unknown = JSON.parse(raw);
-    if (!parsed || typeof parsed !== "object") return null;
+    if (!parsed || typeof parsed !== "object") return { state: "unreadable" };
+    if (!Object.hasOwn(parsed, "restriction")) return { state: "unreadable" };
     const value = (parsed as { restriction?: unknown }).restriction;
-    if (!value || typeof value !== "object") return null;
+    if (value === null) return { state: "cleared" };
+    if (!value || typeof value !== "object") return { state: "unreadable" };
     const rule = value as { agentId?: unknown; allowedChannelIds?: unknown };
     if (
       typeof rule.agentId !== "string" ||
@@ -6214,11 +6240,14 @@ function parseAgentChannelRestriction(raw: string): AgentChannelRestriction | nu
       rule.allowedChannelIds.length === 0 ||
       !rule.allowedChannelIds.every((id): id is string => typeof id === "string" && id.length > 0)
     ) {
-      return null;
+      return { state: "unreadable" };
     }
-    return { agentId: rule.agentId, allowedChannelIds: [...rule.allowedChannelIds] };
+    return {
+      state: "active",
+      rule: { agentId: rule.agentId, allowedChannelIds: [...rule.allowedChannelIds] },
+    };
   } catch {
-    return null;
+    return { state: "unreadable" };
   }
 }
 

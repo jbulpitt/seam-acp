@@ -86,6 +86,26 @@ describe("agent channel restriction resolution (#308)", () => {
     );
   });
 
+  it("refuses fail-closed when the latest audited rule is unreadable", () => {
+    const rec = record();
+    store.upsert(rec);
+    store.recordConfigMutation({
+      id: "audit-corrupt-rule",
+      tier: "agent-channel-restriction",
+      scope: "agent-channel-restriction:copilot",
+      summary: "corrupt restriction fixture",
+      beforeJson: JSON.stringify({ restriction: null }),
+      afterJson: "{not-json",
+    });
+
+    expect(() => router().planRuntimeSpawn(rec)).toThrow(
+      'Refused: agent "copilot" cannot run in channel "111111111111111111" because its channel rule is unreadable.'
+    );
+    expect(store.listAgentChannelRestrictions()).toEqual([]);
+    // Removing the unreadable-state branch turns this exact corrupt ledger row
+    // into an allow, which would make enforcement fail open.
+  });
+
   it("rechecks a warm cached runtime before every turn", async () => {
     const rec = record();
     store.upsert(rec);

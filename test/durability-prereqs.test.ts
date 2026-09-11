@@ -111,6 +111,8 @@ function makeOrch(store: SessionStore, dataDir: string): Orchestrator {
         },
       },
     }),
+    resolveProfileForChannel: () => router.getProfile(),
+    assertAgentAllowedForChannel: () => {},
     getOrStartRuntime: async () => {
       throw new Error("isolated dispatch must not use the live runtime");
     },

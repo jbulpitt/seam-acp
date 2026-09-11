@@ -76,6 +76,9 @@ function makeOrch(opts?: {
       id: "codex",
       sessionManager: { deleteSession: async () => {} },
     })),
+    resolveProfileForChannel: (id?: string, _channel?: string, location?: string) => router.getProfile(id, location),
+    assertAgentAllowedForChannel: () => {},
+    assertAgentAllowedForRecord: () => {},
     getOrStartRuntime: async () => ({
       onEvent() {},
       async prompt(p: string) {

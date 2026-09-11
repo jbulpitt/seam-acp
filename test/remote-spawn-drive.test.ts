@@ -62,6 +62,7 @@ function stubProfile(id: string, spawnCalls: unknown[]): AgentProfile {
 function stubStore(): SessionStore {
   return {
     needsAgyIdentityRebuild: () => false,
+    lookupAgentChannelRestriction: () => ({ state: "absent" as const }),
     readConfig: (record: SessionRecord): SessionConfigState => {
       if (!record.configJson) return {};
       try {

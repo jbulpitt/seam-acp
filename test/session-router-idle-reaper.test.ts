@@ -92,6 +92,7 @@ function makeStore(record: SessionRecord): SessionStore {
       row = { ...next };
     },
     needsAgyIdentityRebuild: () => false,
+    lookupAgentChannelRestriction: () => ({ state: "absent" as const }),
     readConfig: (input: SessionRecord) => JSON.parse(input.configJson) as SessionConfigState,
   } as unknown as SessionStore;
 }

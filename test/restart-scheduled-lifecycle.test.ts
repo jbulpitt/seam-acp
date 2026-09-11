@@ -47,6 +47,9 @@ function setup(mode: "live" | "isolated" = "isolated") {
   store.upsertScheduled(row);
   const profile = { id: "codex", defaultModel: "test", displayName: "Codex", sessionManager: { deleteSession: transport.delete } } as any;
   const router = { ensureSessionRecord: () => ({ ...record }), listProfiles: () => [profile], getProfile: () => profile,
+    resolveProfileForChannel: () => profile,
+    assertAgentAllowedForChannel: () => {},
+    assertAgentAllowedForRecord: () => {},
     isBusy: () => false,
     getOrStartRuntime: vi.fn(async (_record: unknown, _resume?: unknown) => ({
       getSessionInfo: () => ({ sessionId: record.acpSessionId }), getProcessId: () => undefined,

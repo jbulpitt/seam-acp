@@ -153,6 +153,7 @@ function injectionFixture() {
         model: { value: identity.model },
       }),
       getProfile: () => profile,
+      assertAgentAllowedForChannel: () => {},
       getOrStartRuntime: async () => runtime,
     },
   });
@@ -184,6 +185,7 @@ describe("real injection recording, offline runtime only", () => {
         DEFAULT_MODEL: identity.model, channelPresets: new Map(), threadPresets: new Map() } as never,
       router: {
         listProfiles: () => [profile], ensureSessionRecord: () => store.get(record.id)!, getProfile: () => profile,
+        assertAgentAllowedForRecord: () => {},
         getOrStartRuntime: async () => runtime,
         describeConfig: () => ({
           agent: { value: identity.agentId }, location: { value: "local" }, model: { value: identity.model },

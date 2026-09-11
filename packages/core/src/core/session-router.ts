@@ -441,9 +441,17 @@ export class SessionRouter {
   /** #308: protects every agent resolution from a prohibited channel; deleting
    * it lets a restricted agent run outside its audited allowlist. */
   assertAgentAllowedForChannel(agentId: string, channelId: string | null | undefined): void {
-    const rule = this.store.getAgentChannelRestriction(agentId);
-    if (!rule) return;
+    const lookup = this.store.lookupAgentChannelRestriction(agentId);
+    if (lookup.state === "absent" || lookup.state === "cleared") return;
     const actual = channelId?.trim() || "(no channel)";
+    // #308: protects a corrupted current rule from failing open; deleting it
+    // lets an unreadable restriction silently permit the agent to run.
+    if (lookup.state === "unreadable") {
+      throw new Error(
+        `Refused: agent "${agentId}" cannot run in channel "${actual}" because its channel rule is unreadable.`
+      );
+    }
+    const { rule } = lookup;
     if (rule.allowedChannelIds.includes(actual)) return;
     throw new Error(
       `Refused: agent "${agentId}" cannot run in channel "${actual}". ` +
@@ -1030,6 +1038,13 @@ export class SessionRouter {
    * Resolve spawn inputs for a runtime start without actually starting the
    * agent. Tests (and later PR4) use this to inspect MCP injection + the
    * remote spawn path. `startRuntime` is the only production caller.
+   *
+   * #308: this is the runtime gate for SessionRouter-managed turns:
+   * getOrStartRuntime calls it before the warm-cache return, and startRuntime
+   * calls it again before a process is spawned. Resolver calls in orchestrator
+   * are courtesy refusals that surface a blocked dispatch early; they are not
+   * sufficient on their own. Throwaway AgentRuntime constructions cannot use a
+   * session spawn plan and instead call assertAgentAllowedForChannel directly.
    */
   planRuntimeSpawn(record: SessionRecord): RuntimeSpawnPlan {
     if (this.store.needsAgyIdentityRebuild(record.id)) {

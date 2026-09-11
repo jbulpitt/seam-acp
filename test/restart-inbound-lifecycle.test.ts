@@ -155,6 +155,25 @@ describe("#250 human turn production pipeline, synthetic transport only", () => 
     expect(h.store.turnAttempts.get("inbound-1")).toMatchObject({ state: "completed", outcome: { status: "failed" } });
   });
 
+  it("records a visible terminal outcome when a #308 rule refuses after claim", async () => {
+    const h = setup();
+    const refusal =
+      'Refused: agent "codex" cannot run in channel "worker" because its channel rule is unreadable.';
+    h.router.getOrStartRuntime.mockRejectedValueOnce(new Error(refusal));
+
+    await h.run();
+
+    expect(h.runtime.prompt).not.toHaveBeenCalled();
+    expect(h.store.turnAttempts.get("inbound-1")).toMatchObject({
+      state: "completed",
+      promptStarted: false,
+      outcome: { status: "failed", error: refusal },
+    });
+    expect(h.adapter.sendMessage).toHaveBeenCalledWith(expect.anything(), "The turn failed before its response was delivered.");
+    // Removing executeIncomingMessage's owned-error completion leaves this
+    // claimed turn active with no visible refusal until a future restart.
+  });
+
   it("captured output beats cutoff while delivery is held and never pays for a second turn", async () => {
     const h = setup();
     let release!: () => void; let entered!: () => void;

@@ -37,6 +37,7 @@ export interface TurnAttempt {
   deliveryPayload: DurableDeliveryPayload | null;
   deliveryStartedUtc: string | null;
   deliveryAbandonedReason: string | null;
+  deliveryUncertainReason: string | null;
   updatedUtc: string;
   /** Durable quarantine metadata for a recovery attempt that was retained
    * after startup readiness. The execution remains suspended and can only be
@@ -80,6 +81,7 @@ export class TurnAttemptStore {
       "ALTER TABLE turn_attempts ADD COLUMN delivery_payload_json TEXT",
       "ALTER TABLE turn_attempts ADD COLUMN delivery_started_utc TEXT",
       "ALTER TABLE turn_attempts ADD COLUMN delivery_abandoned_reason TEXT",
+      "ALTER TABLE turn_attempts ADD COLUMN delivery_uncertain_reason TEXT",
       "ALTER TABLE turn_attempts ADD COLUMN stalled_utc TEXT",
       "ALTER TABLE turn_attempts ADD COLUMN stalled_reason TEXT",
       "ALTER TABLE turn_attempts ADD COLUMN stall_notice_utc TEXT",
@@ -114,6 +116,7 @@ export class TurnAttemptStore {
         delivery_nonce: string | null; delivery_channel: string | null;
         delivery_payload_json: string | null; delivery_started_utc: string | null;
         delivery_abandoned_reason: string | null;
+        delivery_uncertain_reason: string | null;
         stalled_utc: string | null; stalled_reason: string | null; stall_notice_utc: string | null } | undefined;
     return row ? {
       id: row.id, generation: row.generation, ownerBoot: row.owner_boot,
@@ -129,6 +132,7 @@ export class TurnAttemptStore {
       deliveryPayload: row.delivery_payload_json ? JSON.parse(row.delivery_payload_json) : null,
       deliveryStartedUtc: row.delivery_started_utc,
       deliveryAbandonedReason: row.delivery_abandoned_reason,
+      deliveryUncertainReason: row.delivery_uncertain_reason,
       updatedUtc: row.updated_utc,
       stalledUtc: row.stalled_utc,
       stalledReason: row.stalled_reason,
@@ -248,6 +252,7 @@ export class TurnAttemptStore {
     const startedUtc = current.deliveryStartedUtc ?? now;
     this.db.prepare(`UPDATE turn_attempts SET delivery_nonce=?, delivery_channel=?,
       delivery_payload_json=?, delivery_started_utc=?, delivery_abandoned_reason=NULL,
+      delivery_uncertain_reason=NULL,
       updated_utc=? WHERE id=? AND state='completed' AND delivery_done=0`)
       .run(nonce, channel, serialized, startedUtc, now, id);
     return { nonce, startedUtc };
@@ -256,25 +261,43 @@ export class TurnAttemptStore {
   /** Acknowledges captured output after Discord evidence or enforced replay. */
   markDeliveryDone(id: string): void {
     this.db.prepare(`UPDATE turn_attempts SET delivery_done=1,
-      delivery_abandoned_reason=NULL, updated_utc=? WHERE id=? AND state='completed'`)
+      delivery_abandoned_reason=NULL, delivery_uncertain_reason=NULL,
+      updated_utc=? WHERE id=? AND state='completed'`)
       .run(new Date().toISOString(), id);
   }
 
   /** Terminal refusal for a completed payload whose delivery cannot be proven safely. */
   abandonDelivery(id: string, reason: string, now = new Date().toISOString()): boolean {
-    return this.db.prepare(`UPDATE turn_attempts SET delivery_abandoned_reason=?, updated_utc=?
+    return this.db.prepare(`UPDATE turn_attempts SET delivery_abandoned_reason=?,
+      delivery_uncertain_reason=NULL, updated_utc=?
       WHERE id=? AND state='completed' AND delivery_done=0 AND delivery_abandoned_reason IS NULL`)
       .run(reason, now, id).changes === 1;
   }
 
-  isDeliveryResolved(id: string): boolean {
-    const row = this.db.prepare(`SELECT state,delivery_done,delivery_abandoned_reason
+  /** Retain bounded/ambiguous output without calling uncertainty delivery. */
+  markDeliveryUncertain(id: string, reason: string, now = new Date().toISOString()): boolean {
+    return this.db.prepare(`UPDATE turn_attempts SET delivery_uncertain_reason=?, updated_utc=?
+      WHERE id=? AND state='completed' AND delivery_done=0
+        AND delivery_abandoned_reason IS NULL AND delivery_uncertain_reason IS NULL`)
+      .run(reason, now, id).changes === 1;
+  }
+
+  /** Positive transport evidence only; terminal refusal is deliberately false. */
+  isDeliveryProven(id: string): boolean {
+    const row = this.db.prepare(`SELECT state,delivery_done
       FROM turn_attempts WHERE id=?`).get(id) as
-      { state: TurnAttempt["state"]; delivery_done: number; delivery_abandoned_reason: string | null } | undefined;
+      { state: TurnAttempt["state"]; delivery_done: number } | undefined;
+    return Boolean(row?.state === "completed" && row.delivery_done === 1);
+  }
+
+  /** Lifecycle disposition only. Never use this as done-artifact deletion proof. */
+  isDeliveryDispositionTerminal(id: string): boolean {
+    const row = this.get(id);
     return Boolean(
       row &&
       (row.state === "cancelled" ||
-        (row.state === "completed" && (row.delivery_done === 1 || row.delivery_abandoned_reason !== null)))
+        (row.state === "completed" &&
+          (row.deliveryDone || row.deliveryAbandonedReason || row.deliveryUncertainReason)))
     );
   }
 

@@ -285,7 +285,7 @@ describe("#250 human turn production pipeline, synthetic transport only", () => 
     expect(h.adapter.sendMessage).not.toHaveBeenCalled();
   });
 
-  it("makes an indeterminate Discord history search terminal and actionable", async () => {
+  it("retains an indeterminate Discord history search as visible uncertainty", async () => {
     const h = setup();
     h.runtime.prompt.mockImplementationOnce(async () => {
       await h.emit("accepted but too old to scan");
@@ -304,16 +304,22 @@ describe("#250 human turn production pipeline, synthetic transport only", () => 
     const recovered = h.make();
     await recovered.recoverInterruptedTurns();
     const attempt = h.store.turnAttempts.get("inbound-1")!;
-    expect(h.store.turnAttempts.isDeliveryResolved(attempt.id)).toBe(true);
-    expect(attempt.deliveryAbandonedReason).toBe("Discord nonce search exceeded 5000 messages");
+    expect(h.store.turnAttempts.isDeliveryProven(attempt.id)).toBe(false);
+    expect(h.store.turnAttempts.isDeliveryDispositionTerminal(attempt.id)).toBe(true);
+    expect(attempt.deliveryAbandonedReason).toBeNull();
+    expect(attempt.deliveryUncertainReason).toBe("Discord nonce search exceeded 5000 messages");
     const inventory = await (recovered as any).collectInterruptedRows();
     // Protects operator visibility for bounded-search exhaustion; deleting it
-    // turns a safe refusal back into an invisible recurring warning.
+    // turns a retained uncertainty into an invisible recurring warning.
     expect(inventory).toContainEqual(expect.objectContaining({
       id: "inbound-1",
-      status: "abandoned",
+      status: "interrupted",
       reason: "Discord nonce search exceeded 5000 messages",
     }));
+    await h.make().recoverInterruptedTurns();
+    // Protects the bounded refusal from repeated 5,000-message scans; deleting
+    // the durable uncertain state re-runs the same inconclusive query each boot.
+    expect(h.adapter.findMessageByNonce).toHaveBeenCalledTimes(1);
     expect(h.adapter.sendMessage).toHaveBeenCalledTimes(1);
   });
 

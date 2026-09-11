@@ -46,9 +46,10 @@ publishing a key before the first durable insert was not durable admission.
   Captured outcomes are delivered from SQLite after boot without provider work.
   Discord terminal-result creates carry a persisted, enforced nonce. Recovery
   first asks Discord for that nonce, then either records the observed message or
-  replays the exact payload with the same nonce; an incomplete history search is
-  explicitly abandoned with a durable reason instead of guessed or retried
-  forever. This does not claim exactly-once semantics for non-Discord tools.
+  replays the exact payload with the same nonce. An incomplete bounded history
+  search is recorded as retained uncertainty: it is surfaced to the operator,
+  is not automatically searched again on each boot, and never counts as delivery
+  proof. This does not claim exactly-once semantics for non-Discord tools.
 - Disable/delete prevents future cron admission. It **does not cancel an already
   admitted occurrence**, including its frozen snapshot or captured output.
   Intentional cancellation is a durable attempt terminal state and cannot resume.

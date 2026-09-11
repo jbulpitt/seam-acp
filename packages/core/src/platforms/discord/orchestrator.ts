@@ -11222,18 +11222,22 @@ export class Orchestrator {
         id: row.sessionMode === "live" ? row.channelRef : row.targetChannel || row.channelRef };
       if (await this.checkResumePreconditions(target) !== "ok") return;
       const settleDelivery = async (
-        resolution: "delivered" | "abandoned",
+        resolution: "delivered" | "abandoned" | "uncertain",
         reason?: string
       ): Promise<void> => {
         this.patchScheduledStatus(
           row.id,
-          resolution === "delivered" ? "ok" : `abandoned: ${reason ?? "delivery unresolved"}`
+          resolution === "delivered"
+            ? "ok"
+            : `${resolution === "uncertain" ? "retained" : "abandoned"}: ${reason ?? "delivery unresolved"}`
         );
         this.store.scheduledOccurrences.settle(occurrence.id);
         if (row.sessionMode === "live") {
           await finishLiveTurn(this.config.DATA_DIR, {
             id: occurrence.id,
-            status: resolution === "delivered" ? "completed" : "abandoned",
+            status: resolution === "delivered"
+              ? "completed"
+              : resolution === "uncertain" ? "failed" : "abandoned",
             channelRef: row.channelRef,
             finishedUtc: new Date().toISOString(),
             ...(reason ? { reason } : {}),
@@ -11244,12 +11248,17 @@ export class Orchestrator {
         await settleDelivery("abandoned", attempt.deliveryAbandonedReason);
         return;
       }
+      if (attempt.deliveryUncertainReason) {
+        await settleDelivery("uncertain", attempt.deliveryUncertainReason);
+        return;
+      }
       if (attempt.deliveryNonce) {
         const resolution = await this.recoverRecordedDelivery(attempt, target);
         if (resolution === "deferred") return;
+        const recovered = this.store.turnAttempts.get(attempt.id);
         await settleDelivery(
           resolution,
-          this.store.turnAttempts.get(attempt.id)?.deliveryAbandonedReason ?? undefined
+          recovered?.deliveryAbandonedReason ?? recovered?.deliveryUncertainReason ?? undefined
         );
         return;
       }
@@ -14483,7 +14492,10 @@ export class Orchestrator {
   private async recoverRecordedDelivery(
     attempt: TurnAttempt,
     channel: ChannelRef
-  ): Promise<"delivered" | "abandoned" | "deferred"> {
+  ): Promise<"delivered" | "abandoned" | "uncertain" | "deferred"> {
+    // Protects bounded uncertainty from being re-queried on every boot;
+    // deleting this check recreates noisy retries without creating proof.
+    if (attempt.deliveryUncertainReason) return "uncertain";
     // Protects against replaying pre-nonce output that may already be visible;
     // deleting this check converts legacy uncertainty into duplicate messages.
     if (
@@ -14540,8 +14552,10 @@ export class Orchestrator {
       return "delivered";
     }
     if (observed.status === "indeterminate") {
-      this.store.turnAttempts.abandonDelivery(attempt.id, observed.reason);
-      return "abandoned";
+      // Protects incomplete history scans from becoming destructive proof;
+      // deleting this distinction lets automatic abandonment authorize pruning.
+      this.store.turnAttempts.markDeliveryUncertain(attempt.id, observed.reason);
+      return "uncertain";
     }
     try {
       // The same enforced nonce closes the lookup/send race at Discord: if a
@@ -14577,13 +14591,16 @@ export class Orchestrator {
         const resolution = await this.recoverRecordedDelivery(a, channel);
         if (resolution === "deferred") continue;
         this.store.settleInboundExecution(row.messageId);
+        const recovered = this.store.turnAttempts.get(a.id);
         await finishLiveTurn(this.config.DATA_DIR, {
           id: a.id,
-          status: resolution === "delivered" ? "completed" : "abandoned",
+          status: resolution === "delivered"
+            ? "completed"
+            : resolution === "uncertain" ? "failed" : "abandoned",
           channelRef: channel.id,
           finishedUtc: new Date().toISOString(),
-          ...(resolution === "abandoned"
-            ? { reason: this.store.turnAttempts.get(a.id)?.deliveryAbandonedReason ?? "delivery unresolved" }
+          ...(resolution !== "delivered"
+            ? { reason: recovered?.deliveryAbandonedReason ?? recovered?.deliveryUncertainReason ?? "delivery unresolved" }
             : {}),
         });
       } catch (err) {
@@ -14614,18 +14631,19 @@ export class Orchestrator {
       });
     }
     for (const attempt of this.store.turnAttempts.list("completed")) {
-      if (!attempt.deliveryAbandonedReason || seen.has(attempt.id)) continue;
+      const deliveryReason = attempt.deliveryAbandonedReason ?? attempt.deliveryUncertainReason;
+      if (!deliveryReason || seen.has(attempt.id)) continue;
       seen.add(attempt.id);
       rows.push({
         id: attempt.id,
         source: attempt.source === "dispatch" ? "dispatch" : "live",
         channelRef: attempt.deliveryChannel ?? attempt.spec.target,
         correlationId: attempt.spec.correlationId ?? null,
-        status: "abandoned",
+        status: attempt.deliveryUncertainReason ? "interrupted" : "abandoned",
         startedUtc: attempt.updatedUtc,
         acpSessionId: attempt.acpSessionId,
         targetRef: attempt.spec.target,
-        reason: attempt.deliveryAbandonedReason,
+        reason: deliveryReason,
       });
     }
     const live = await listLiveMarkers(this.config.DATA_DIR).catch(() => [] as LiveTurnMarker[]);

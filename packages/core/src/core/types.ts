@@ -389,6 +389,17 @@ export interface LedgerEntry {
 }
 
 /**
+ * Immutable human authorization to expire a done artifact whose onward
+ * delivery cannot be proven. This is retention policy, never delivery proof.
+ */
+export interface DoneArtifactExpirationAuthorization {
+  dispatchId: string;
+  operatorId: string;
+  reason: string;
+  authorizedUtc: string;
+}
+
+/**
  * Caller-supplied shape for `recordDelegation`. Only `id` and `kind` are
  * required; `status` defaults to "dispatched" and the timestamps default to
  * now, so a dispatch site writes one line and gets a complete row back.

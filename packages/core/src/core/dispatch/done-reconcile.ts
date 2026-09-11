@@ -27,7 +27,7 @@ import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { Logger } from "../../lib/logger.js";
 import { DELEGATION_TERMINAL_STATUSES } from "../types.js";
-import type { LedgerEntry } from "../types.js";
+import type { DoneArtifactExpirationAuthorization, LedgerEntry } from "../types.js";
 import { dispatchDirs } from "./types.js";
 import type { DispatchResult } from "./types.js";
 
@@ -105,6 +105,10 @@ export interface DoneReconcileDeps {
       limit: number
     ) => DoneLedgerRow[];
     getReportBackByCorrelation: (correlationId: string) => DoneLedgerRow | null;
+    isAttemptDeliveryProven: (id: string) => boolean;
+    getExpirationAuthorization: (
+      id: string
+    ) => DoneArtifactExpirationAuthorization | null;
     now?: () => Date;
     maxAgeMs?: number;
     batchSize?: number;
@@ -152,20 +156,10 @@ export interface DoneReconcileSummary {
   failed: number;
 }
 
-const SETTLED_ONWARD_STATUSES: ReadonlySet<string> = new Set([
-  "completed",
-  "failed",
-  "timed_out",
-]);
-
-function isSettledOnward(row: DoneLedgerState | null): boolean {
-  // Protects unexplained legacy `abandoned` rows from becoming deletion proof;
-  // deleting the reason requirement can discard the only recoverable result.
-  return Boolean(
-    row &&
-      (SETTLED_ONWARD_STATUSES.has(row.status) ||
-        (row.status === "abandoned" && row.terminalReason))
-  );
+function isCompletedOnward(row: DoneLedgerState | null): boolean {
+  // Protects proof-of-failure from becoming proof-of-delivery; deleting the
+  // exact completed check lets failed/timed-out/abandoned children prune output.
+  return row?.status === "completed";
 }
 
 const RECOVERY_CURSOR_FILE = ".done-recovery-cursor.json";
@@ -311,32 +305,39 @@ async function writeMaintenanceCursor(
 export interface DoneDeliveryResolutionLookup {
   getDelegation: (id: string) => DoneLedgerState | null;
   getReportBackByCorrelation: (correlationId: string) => DoneLedgerRow | null;
+  isAttemptDeliveryProven: (id: string) => boolean;
+  getExpirationAuthorization: (
+    id: string
+  ) => DoneArtifactExpirationAuthorization | null;
 }
 
 /**
- * Canonical read-only proof gate shared with done-artifact retention (#306).
- * It proves both halves: the source row is terminal and its route-specific
- * onward delivery is settled. Callers need not add a separate status guard.
+ * Positive delivery evidence only. Lifecycle terminality and automatic refusal
+ * deliberately do not satisfy this predicate.
  */
-export function isDoneDeliveryResolved(
+export function isDoneDeliveryProven(
   result: DispatchResult,
   row: DoneLedgerState,
   lookup: DoneDeliveryResolutionLookup
 ): boolean {
-  // Protects callers from deleting output for work that is still recoverable;
-  // deleting this check makes a no-onward but non-terminal row read resolved.
+  // Protects active work from deletion even if a corrupt receipt/child exists;
+  // deleting this check lets evidence attach to a non-terminal source.
   if (!TERMINAL_STATUSES.has(row.status)) return false;
-  if (row.status === "abandoned" && row.terminalReason) return true;
+  // Protects direct Discord deliveries proven by nonce/send acknowledgement;
+  // deleting it retains every modern no-onward result forever.
+  if (lookup.isAttemptDeliveryProven(result.id)) return true;
   // Reclassify with a non-terminal status: the live route is still required
-  // to prove whether a terminal source had an onward obligation.
+  // to identify an onward child without terminal-source short-circuiting.
   const route = completionRoute(result, { ...row, status: "interrupted" });
-  if (route.action === "terminalize") return true;
+  // Terminal/no-onward is disposition, not proof: without a receipt or child,
+  // deleting here would erase the only full local result copy.
+  if (route.action === "terminalize") return false;
   if (route.action === "skip") return false;
 
   if (route.action === "report_back") {
     const correlation = result.correlationId ?? result.id;
     const delivery = lookup.getReportBackByCorrelation(correlation);
-    return isSettledOnward(delivery);
+    return isCompletedOnward(delivery);
   }
 
   // A chain plan is a terminal synthetic row; its targetRef names the actual
@@ -345,7 +346,30 @@ export function isDoneDeliveryResolved(
   const plan = lookup.getReportBackByCorrelation(result.id);
   if (!plan?.targetRef) return false;
   const child = lookup.getDelegation(plan.targetRef);
-  return isSettledOnward(child);
+  return isCompletedOnward(child);
+}
+
+/**
+ * Sole done-artifact deletion authority. Positive delivery proof is preferred;
+ * otherwise only a separate immutable human expiration authorization suffices.
+ */
+export function isDoneArtifactDeletable(
+  result: DispatchResult,
+  row: DoneLedgerState,
+  lookup: DoneDeliveryResolutionLookup
+): boolean {
+  if (!TERMINAL_STATUSES.has(row.status)) return false;
+  if (isDoneDeliveryProven(result, row, lookup)) return true;
+  const authorization = lookup.getExpirationAuthorization(result.id);
+  // Protects lifecycle reasons from impersonating operator retention consent;
+  // deleting the exact binding lets malformed/shared authorization prune output.
+  return Boolean(
+    authorization &&
+      authorization.dispatchId === result.id &&
+      authorization.operatorId.trim() &&
+      authorization.reason.trim() &&
+      Number.isFinite(Date.parse(authorization.authorizedUtc))
+  );
 }
 
 /**
@@ -590,9 +614,11 @@ export async function reconcileCompletedDoneFiles(
           summary.retainedPending++;
           continue;
         }
-        if (!isDoneDeliveryResolved(result, current, {
+        if (!isDoneArtifactDeletable(result, current, {
           getDelegation: deps.getDelegation,
           getReportBackByCorrelation: deps.retention.getReportBackByCorrelation,
+          isAttemptDeliveryProven: deps.retention.isAttemptDeliveryProven,
+          getExpirationAuthorization: deps.retention.getExpirationAuthorization,
         })) {
           summary.retainedPending++;
           continue;

@@ -1232,6 +1232,9 @@ async function main(): Promise<void> {
           store.listTerminalDelegationsForDoneRetention(cutoffUtc, after, limit),
         getReportBackByCorrelation: (correlationId) =>
           store.getReportBackByCorrelation(correlationId),
+        isAttemptDeliveryProven: (id) => store.turnAttempts.isDeliveryProven(id),
+        getExpirationAuthorization: (id) =>
+          store.getDoneArtifactExpirationAuthorization(id),
       },
     });
     if (

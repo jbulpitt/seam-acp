@@ -20,6 +20,7 @@ import {
   PROMPT_PREVIEW_MAX,
   type DelegationKind,
   type DelegationStatus,
+  type DoneArtifactExpirationAuthorization,
   type LedgerEntry,
   type LedgerEntryInput,
   type LedgerPatch,
@@ -408,6 +409,7 @@ export class SessionStore {
     this.scheduledOccurrences = new ScheduledOccurrenceStore(this.db);
     this.db.exec(SCHEMA);
     this.db.exec(DELEGATION_SCHEMA);
+    this.db.exec(DONE_ARTIFACT_EXPIRATION_SCHEMA);
     this.migrateReportBackDedupIndex();
     this.migrateDelegationAcpSessionId();
     this.migrateDelegationTerminalReason();
@@ -2087,6 +2089,65 @@ export class SessionStore {
     return this.db.prepare(`UPDATE delegation_log SET status='abandoned', terminal_reason=?, updated_utc=?
       WHERE id=? AND status NOT IN (${placeholders})`)
       .run(reason, now, id, ...DELEGATION_TERMINAL_STATUSES).changes === 1;
+  }
+
+  /**
+   * Record one immutable operator decision to expire unproven output.
+   * Recovery must never call this: terminal disposition is not authorization.
+   */
+  authorizeDoneArtifactExpiration(
+    id: string,
+    operatorId: string,
+    reason: string,
+    authorizedUtc = new Date().toISOString()
+  ): DoneArtifactExpirationAuthorization {
+    const actor = operatorId.trim();
+    const explanation = reason.trim();
+    // Protects the audit row from anonymous/empty authorization; deleting this
+    // check turns an automatic or malformed call into apparent human consent.
+    if (!actor || !explanation) {
+      throw new Error("done artifact expiration requires operator id and reason");
+    }
+    return this.db.transaction(() => {
+      const existing = this.getDoneArtifactExpirationAuthorization(id);
+      if (existing) {
+        // Protects the human decision from later rewriting; deleting this
+        // check lets a second caller erase who authorized destructive expiry.
+        if (
+          existing.operatorId !== actor ||
+          existing.reason !== explanation ||
+          existing.authorizedUtc !== authorizedUtc
+        ) {
+          throw new Error(`done artifact expiration already authorized for ${id}`);
+        }
+        return existing;
+      }
+      const placeholders = DELEGATION_TERMINAL_STATUSES.map(() => "?").join(", ");
+      const written = this.db.prepare(`INSERT INTO done_artifact_expirations
+          (dispatch_id, operator_id, reason, authorized_utc)
+        SELECT id, ?, ?, ? FROM delegation_log
+        WHERE id=? AND status IN (${placeholders})`)
+        .run(actor, explanation, authorizedUtc, id, ...DELEGATION_TERMINAL_STATUSES).changes;
+      // Protects active/unknown work from operator-expiry authorization;
+      // deleting this check can make a recoverable result deletable.
+      if (written !== 1) throw new Error(`cannot authorize done artifact expiration for ${id}`);
+      return { dispatchId: id, operatorId: actor, reason: explanation, authorizedUtc };
+    }).immediate();
+  }
+
+  getDoneArtifactExpirationAuthorization(
+    id: string
+  ): DoneArtifactExpirationAuthorization | null {
+    const row = this.db.prepare(`SELECT dispatch_id,operator_id,reason,authorized_utc
+      FROM done_artifact_expirations WHERE dispatch_id=?`).get(id) as
+      | { dispatch_id: string; operator_id: string; reason: string; authorized_utc: string }
+      | undefined;
+    return row ? {
+      dispatchId: row.dispatch_id,
+      operatorId: row.operator_id,
+      reason: row.reason,
+      authorizedUtc: row.authorized_utc,
+    } : null;
   }
 
   /** One ledger row by primary key, or null if absent. */
@@ -6169,6 +6230,17 @@ CREATE INDEX IF NOT EXISTS idx_delegation_source
   ON delegation_log(source_ref);
 CREATE INDEX IF NOT EXISTS idx_delegation_done_retention
   ON delegation_log(updated_utc, id, status);
+`;
+
+/** Separate from the lifecycle ledger by design: a terminal status records
+ * what Seam did; this append-only row records a human retention decision. */
+const DONE_ARTIFACT_EXPIRATION_SCHEMA = `
+CREATE TABLE IF NOT EXISTS done_artifact_expirations (
+  dispatch_id   TEXT PRIMARY KEY,
+  operator_id   TEXT NOT NULL,
+  reason        TEXT NOT NULL,
+  authorized_utc TEXT NOT NULL
+);
 `;
 
 interface LedgerRow {

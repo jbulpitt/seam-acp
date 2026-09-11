@@ -12,7 +12,8 @@ import {
 import { SessionStore } from "../packages/core/src/core/session-store.js";
 import { pino } from "pino";
 import {
-  isDoneDeliveryResolved,
+  isDoneArtifactDeletable,
+  isDoneDeliveryProven,
   reconcileCompletedDoneFiles,
 } from "../packages/core/src/core/dispatch/done-reconcile.js";
 import { dispatchDirs } from "../packages/core/src/core/dispatch/types.js";
@@ -217,19 +218,41 @@ describe("#305 Discord nonce delivery proof", () => {
     expect(second).toMatchObject({ recoveryCandidates: 0, abandonedUnprovable: 0 });
   });
 
-  it("does not mistake a no-onward but non-terminal source for resolved delivery", () => {
+  it("does not mistake source terminality or no-onward disposition for delivery proof", () => {
     const lookup = {
       getDelegation: () => null,
       getReportBackByCorrelation: () => null,
+      isAttemptDeliveryProven: () => false,
+      getExpirationAuthorization: () => null,
     };
     // Protects consumers such as #306 from omitting their own status precheck;
     // deleting it allows a running wake result to be pruned as if completed.
-    expect(isDoneDeliveryResolved({
+    const result = {
       id: "running-wake",
       target: "thread",
       status: "completed",
       kind: "wake",
       finishedUtc: "2026-09-11T00:00:00.000Z",
-    }, { status: "running", kind: "wake" }, lookup)).toBe(false);
+    } as const;
+    expect(isDoneDeliveryProven(result, { status: "running", kind: "wake" }, lookup)).toBe(false);
+    expect(isDoneArtifactDeletable(result, { status: "running", kind: "wake" }, lookup)).toBe(false);
+    // Protects the last local result copy for terminal no-onward work; deleting
+    // this assertion permits lifecycle completion alone to authorize deletion.
+    expect(isDoneDeliveryProven(result, { status: "completed", kind: "wake" }, lookup)).toBe(false);
+    expect(isDoneArtifactDeletable(result, { status: "completed", kind: "wake" }, lookup)).toBe(false);
+
+    const operatorAuthorized = {
+      ...lookup,
+      getExpirationAuthorization: () => ({
+        dispatchId: result.id,
+        operatorId: "discord-user-42",
+        reason: "reviewed and approved",
+        authorizedUtc: "2026-09-11T00:01:00.000Z",
+      }),
+    };
+    // Protects proof/disposition/policy separation; deleting it can either call
+    // operator expiry proof or make deliberate legacy expiration impossible.
+    expect(isDoneDeliveryProven(result, { status: "completed", kind: "wake" }, operatorAuthorized)).toBe(false);
+    expect(isDoneArtifactDeletable(result, { status: "completed", kind: "wake" }, operatorAuthorized)).toBe(true);
   });
 });

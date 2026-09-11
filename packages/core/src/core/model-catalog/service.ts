@@ -568,6 +568,12 @@ export class ModelCatalogService {
           "model catalog disagrees with a peer; serving this binding's own catalog"
         );
       }
+      // Rule 13: every refresh says which mode it is in, so "binding-local" is
+      // visible as a state of the system rather than inferred from silence.
+      const report = {
+        mode: scopeKey.startsWith("scope:") ? ("shared" as const) : ("binding-local" as const),
+        ...(conflict ? { conflict } : {}),
+      };
       // Reduction quarantine (#236). A candidate that DROPS a published model
       // is held until a second, independent, identical refresh confirms it —
       // or until an operator explicitly accepts it. Additions and
@@ -631,7 +637,7 @@ export class ModelCatalogService {
         this.options.store.recordObservation(observation, bindingMigrationProof);
         this.options.store.recordAttempt({ bindingKey: key, attemptedAt, result: "unchanged", error: drift, source: candidate.source, candidateChecksum: checksum });
         this.observations.set(key, observation);
-        return { ...base, ok: !drift, result: "unchanged", source: candidate.source, scope: scopeKey, generation: priorForScope.generation, fetchedAt: candidate.fetchedAt, cliVersion: candidate.cliVersion, sourceVersion: candidate.sourceVersion, ...(drift ? { error: drift } : {}) };
+        return { ...base, ...report, ok: !drift, result: "unchanged", source: candidate.source, scope: scopeKey, generation: priorForScope.generation, fetchedAt: candidate.fetchedAt, cliVersion: candidate.cliVersion, sourceVersion: candidate.sourceVersion, ...(drift ? { error: drift } : {}) };
       }
       const snapshot = this.options.store.publish({
         scopeKey,
@@ -662,7 +668,7 @@ export class ModelCatalogService {
       }
       this.options.logger.info({ binding: key, scopeKey, generation: snapshot.generation, ...diff, drift }, "model catalog published");
       return {
-        ...base, ...diff, ok: !drift, result: "published", source: candidate.source, scope: scopeKey,
+        ...base, ...diff, ...report, ok: !drift, result: "published", source: candidate.source, scope: scopeKey,
         generation: snapshot.generation, fetchedAt: candidate.fetchedAt,
         cliVersion: candidate.cliVersion, sourceVersion: candidate.sourceVersion,
         ...(acceptedReduction

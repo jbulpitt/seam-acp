@@ -86,6 +86,12 @@ function candidate(ids = ["nebula"], provider = "architectural-outlier"): Adapte
   };
 }
 
+/** #339 rule 2: sharing is only shared when the adapter asserts it. */
+function shared(ids = ["nebula"], provider = "architectural-outlier"): AdapterCatalogCandidate {
+  const base = candidate(ids, provider);
+  return { ...base, scope: { ...base.scope, sharing: "shared" as const } };
+}
+
 function service(opts: {
   store: ModelCatalogStore;
   fetch: (binding: { agentId: string; location: string }) => Promise<AdapterCatalogCandidate>;
@@ -128,8 +134,12 @@ describe("ModelCatalogService", () => {
     const before = service({ store: opened.store, bindings: [local, remote],
       fetch: async (b) => b.location === "local" ? oldLocal : oldRemote });
     expect((await before.refresh(remote)).result).toBe("published");
-    expect((await before.refresh(local)).result).toBe("quarantined");
-    expect(() => before.resolve(local, { model: "default", effort: "xhigh" })).toThrow("unavailable");
+    // #339 rules 1-3: the pre-fix declaration omitted `sharing`, and silence is
+    // no longer read as a proof of equivalence, so these two never share a
+    // scope and the disagreement that used to quarantine `local` cannot arise.
+    expect((await before.refresh(local)).result).toBe("published");
+    expect(before.resolve(local, { model: "default", effort: "xhigh" }).normalized)
+      .toEqual({ model: "default", effort: "xhigh" });
     const retainedGeneration = before.lookup(remote).snapshot!.generation;
 
     let calls = 0;
@@ -344,18 +354,20 @@ describe("ModelCatalogService", () => {
     opened.store.close();
   });
 
-  it("single-flights refresh by observed semantic scope", async () => {
+  it("never coalesces two bindings' refreshes, even on an identical scope", async () => {
     const opened = db();
     const bindings = [
       { agentId: "fake", location: "local" },
       { agentId: "fake", location: "remote-a" },
     ];
     let calls = 0;
-    let release: (() => void) | undefined;
+    // Two bindings now mean two in-flight fetches, so every waiter has to be
+    // released rather than only the most recent one.
+    const releases: Array<() => void> = [];
     let blocked = false;
     const fetch = vi.fn(async () => {
       calls += 1;
-      if (blocked) await new Promise<void>((resolve) => { release = resolve; });
+      if (blocked) await new Promise<void>((resolve) => { releases.push(resolve); });
       return candidate();
     });
     const catalog = service({ store: opened.store, fetch, bindings });
@@ -365,35 +377,41 @@ describe("ModelCatalogService", () => {
     blocked = true;
     const first = catalog.refresh(bindings[0]!);
     const second = catalog.refresh(bindings[1]!);
-    await vi.waitFor(() => expect(calls).toBe(1));
-    release?.();
+    // #339 rule 12. This used to assert 1: one binding's provider answer was
+    // published as the other's, which is how a host on a different wrapper
+    // version came to carry a catalog it had never produced. Saving a probe is
+    // not worth asserting an equivalence we cannot prove.
+    await vi.waitFor(() => expect(calls).toBe(2));
+    for (const release of releases) release();
     await Promise.all([first, second]);
-    expect(calls).toBe(1);
+    expect(calls).toBe(2);
     opened.store.close();
   });
 
-  it("single-flights equivalent bindings on their first cold fetch", async () => {
+  it("asks each binding's own adapter on a cold fetch, even with one declared scope", async () => {
     const opened = db();
     const bindings = [
       { agentId: "fake-a", location: "local" },
       { agentId: "fake-b", location: "remote-a" },
     ];
-    let release: (() => void) | undefined;
+    const releases: Array<() => void> = [];
     const fetch = vi.fn(() => new Promise<AdapterCatalogCandidate>((resolve) => {
-      release = () => resolve(candidate());
+      releases.push(() => resolve(shared()));
     }));
     const catalog = service({
       store: opened.store,
       fetch,
       bindings,
-      scope: () => candidate().scope,
+      scope: () => shared().scope,
     });
     const both = bindings.map((binding) => catalog.refresh(binding));
-    await vi.waitFor(() => expect(fetch).toHaveBeenCalledOnce());
-    release?.();
+    // Rule 11: dedupe is per binding. Both still land on the one shared
+    // generation — they simply each ask for it.
+    await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
+    for (const release of releases) release();
     const results = await Promise.all(both);
     expect(results.map((result) => result.result).sort()).toEqual(["published", "unchanged"]);
-    expect(fetch).toHaveBeenCalledOnce();
+    expect(fetch).toHaveBeenCalledTimes(2);
     opened.store.close();
   });
 
@@ -419,23 +437,35 @@ describe("ModelCatalogService", () => {
     opened.store.close();
   });
 
-  it("isolates equivalent-scope disagreement and refuses the drifted binding", async () => {
+  it("reports a shared-scope disagreement and keeps both bindings serving", async () => {
+    // #339 rules 7-10. This used to assert the opposite — `state: "drift"`,
+    // `models(): []`, `resolve()` throwing — so a host that was working
+    // perfectly lost every model, including `default`, because a DIFFERENT
+    // host described itself differently.
     const opened = db();
     const local = { agentId: "fake", location: "local" };
     const remote = { agentId: "fake", location: "remote-a" };
     const catalog = service({
       store: opened.store,
       fetch: async (binding) => binding.location === "local"
-        ? candidate(["nebula"])
-        : candidate(["nebula", "remote-only"]),
+        ? shared(["nebula"])
+        : shared(["nebula", "remote-only"]),
     });
     await catalog.refresh(local);
     const result = await catalog.refresh(remote);
-    expect(result.error).toContain("conflicts with active generation");
-    expect(catalog.lookup(remote).state).toBe("drift");
-    expect(catalog.models(remote)).toEqual([]);
-    expect(() => catalog.resolve(remote, { model: "nebula" })).toThrow(/unavailable/);
+
+    // It is an observation, not a failure, and it names both sides (rule 14).
+    expect(result.ok).toBe(true);
+    expect(result.result).toBe("published");
+    expect(result.conflict?.differs.onlyHere).toEqual(["remote-only"]);
+    expect(result.conflict?.peerGeneration).toBe(1);
+    expect(result.mode).toBe("binding-local");
+
+    // Neither side loses anything (rules 5, 6, 8).
+    expect(catalog.models(remote).map((entry) => entry.id)).toEqual(["nebula", "remote-only"]);
     expect(catalog.models(local).map((entry) => entry.id)).toEqual(["nebula"]);
+    expect(catalog.resolve(remote, { model: "nebula" }).normalized.model).toBe("nebula");
+    expect(catalog.resolve(local, { model: "nebula" }).normalized.model).toBe("nebula");
     opened.store.close();
   });
 
@@ -446,7 +476,7 @@ describe("ModelCatalogService", () => {
     const catalog = service({
       store: opened.store,
       fetch: async (binding) => ({
-        ...candidate(["nebula"]),
+        ...shared(["nebula"]),
         cliVersion: binding.location === "local" ? "fake-cli 1" : "fake-cli 2",
         sourceVersion: binding.location === "local" ? "feed-1" : "feed-2",
       }),
@@ -459,7 +489,7 @@ describe("ModelCatalogService", () => {
     // One binding may observe a legitimate next generation before its peer;
     // the peer's observation of the current active generation is merely stale,
     // not conflicting drift.
-    const nextCatalog = candidate(["nebula", "second"]);
+    const nextCatalog = shared(["nebula", "second"]);
     const evolving = service({
       store: opened.store,
       fetch: async () => nextCatalog,
@@ -476,8 +506,8 @@ describe("ModelCatalogService", () => {
     let localIds = ["nebula", "keep1", "keep2", "a"];
     const catalog = service({
       store: opened.store,
-      fetch: async (binding) => candidate(binding.location === "local" ? localIds : ["nebula", "keep1", "keep2", "a"]),
-      scope: () => candidate().scope,
+      fetch: async (binding) => shared(binding.location === "local" ? localIds : ["nebula", "keep1", "keep2", "a"]),
+      scope: () => shared().scope,
     });
     expect(await catalog.refresh(local)).toMatchObject({ generation: 1, result: "published" });
     expect(await catalog.refresh(remote)).toMatchObject({ generation: 1, result: "unchanged" });
@@ -490,21 +520,21 @@ describe("ModelCatalogService", () => {
     opened.store.close();
   });
 
-  it("does not let a stale peer's shared in-flight candidate roll back the active owner", async () => {
+  it("does not let a stale peer roll back the active owner, and does not punish it either", async () => {
     const opened = db();
     const local = { agentId: "fake", location: "local" };
     const remote = { agentId: "fake", location: "remote-a" };
     let localIds = ["nebula", "keep1", "keep2", "a"];
     let holdRace = false;
-    let release: (() => void) | undefined;
+    const releases: Array<() => void> = [];
     const fetch = vi.fn(async (binding: typeof local) => {
-      if (holdRace) await new Promise<void>((resolve) => { release = resolve; });
-      return candidate(binding.location === "local" ? localIds : ["nebula", "keep1", "keep2", "a"]);
+      if (holdRace) await new Promise<void>((resolve) => { releases.push(resolve); });
+      return shared(binding.location === "local" ? localIds : ["nebula", "keep1", "keep2", "a"]);
     });
     const catalog = service({
       store: opened.store,
       fetch,
-      scope: () => candidate().scope,
+      scope: () => shared().scope,
     });
     await catalog.refresh(local);
     await catalog.refresh(remote);
@@ -515,13 +545,17 @@ describe("ModelCatalogService", () => {
     holdRace = true;
     const staleFirst = catalog.refresh(remote);
     const ownerWaiter = catalog.refresh(local);
-    await vi.waitFor(() => expect(release).toBeTypeOf("function"));
-    release?.();
-    expect(await staleFirst).toMatchObject({ result: "quarantined", generation: 2 });
-    expect(await ownerWaiter).toMatchObject({ result: "quarantined", generation: 2 });
-    expect(catalog.lookup(remote).state).toBe("drift");
+    await vi.waitFor(() => expect(releases.length).toBe(2));
+    for (const release of releases) release();
+    await Promise.all([staleFirst, ownerWaiter]);
+    // The owner is untouched: the lagging peer cannot move the shared
+    // generation backwards (the original protection, still enforced).
     expect(catalog.lookup(local)).toMatchObject({ state: "ready", snapshot: { generation: 2 } });
     expect(catalog.models(local).map((entry) => entry.id)).toEqual(["nebula", "keep1", "keep2", "b"]);
+    // And #339 rule 8: being behind is not a fault. The peer keeps serving the
+    // catalog its own adapter actually reported instead of being emptied.
+    expect(catalog.lookup(remote).state).toBe("ready");
+    expect(catalog.models(remote).map((entry) => entry.id)).toEqual(["nebula", "keep1", "keep2", "a"]);
     opened.store.close();
   });
 

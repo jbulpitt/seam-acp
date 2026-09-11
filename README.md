@@ -361,12 +361,16 @@ AgentProfile         (Copilot today, Claude Code tomorrow — adds via `src/agen
 ## Testing
 
 ```sh
-npm test         # unit tests + 1 integration test against `copilot --acp`
+npm test          # bounded non-live suite; excludes **/*.int.test.ts
+npm run test:int  # explicit live ACP opt-in; may incur provider charges
 npm run typecheck
 npm run build
 ```
 
-The ACP integration test is automatically skipped if `copilot` is not on `PATH`.
+`npm test` never invokes a live provider, even when its CLI is installed. It
+prints the non-live boundary before Vitest starts so reported file/test counts
+are comparable across hosts. `npm run test:int` is a separate, deliberately
+named opt-in and reports that its provider requests may be billable.
 
 ## License
 

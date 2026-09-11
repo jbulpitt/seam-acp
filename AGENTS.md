@@ -170,6 +170,14 @@ inspection instead.
 - `data/` — SQLite database (runtime, not committed)
 - `.env` — local environment config (not committed)
 
+## Testing safety
+
+`npm test` is the bounded non-live suite. It excludes every
+`**/*.int.test.ts` file even when provider CLIs are installed. Run
+`npm run test:int` only with explicit authorization for potentially billable
+live provider requests, and report live results separately from non-live
+file/test counts.
+
 ## Git worktrees
 
 Use this host's `wt` CLI only (`~/.local/bin/wt`). Do **not** call `git worktree add` / `git worktree remove --force`, symlink `node_modules`, `npm install` a second copy to satisfy a bundler, park trees under `/tmp` or as visible `~/Projects/<name>` siblings, or invent a project-local worktree helper. This repo has no provisioner — call `wt` directly.

@@ -57,6 +57,13 @@ normalizes models and model-specific effort capabilities, declares how a model
 change applies (`live`, `reload`, or `freshSession`), and supplies exhaustive
 normalized-to-raw bindings. Core knows no provider naming convention.
 
+`scope.sharing: "binding"` explicitly keeps discovery and publication local to
+one `agent@location`, even when an older observation shared a generation.
+Native Claude live discovery uses this policy: the same config-directory label
+(`default`, in particular) does not establish identical credentials or wrapper
+capabilities on different hosts. A fresh validated observation migrates the
+binding without changing session/model selections or disabling reduction guards.
+
 The portable `encodeCatalogSelection` and `decodeCatalogSelection` helpers are
 the reverse-binding seam reserved for #228. This base change preserves Agy's
 current segmented, model-baked choices; it does not normalize Agy families or

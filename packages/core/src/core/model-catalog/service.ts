@@ -342,7 +342,7 @@ export class ModelCatalogService {
       const candidate = normalizeCatalogCandidate(fetched);
       validateCandidate(candidate);
       const checksum = candidateChecksum(candidate);
-      const desiredScope = trustworthyFingerprint(candidate.scope.fingerprint)
+      const desiredScope = shareableScope(candidate.scope)
         ? `scope:${candidate.scope.fingerprint}` : `binding:${key}`;
       const activeForScope = this.snapshots.get(desiredScope);
       const sourceObservation = this.observations.get(fetchedBy);
@@ -564,15 +564,19 @@ export class ModelCatalogService {
     // a prior observation or isolate by binding.
     const observedScope = this.observations.get(bindingKey(binding))?.scopeKey;
     const declared = this.options.scope ? await this.options.scope(binding) : null;
-    const scopeKey = declared && trustworthyFingerprint(declared.fingerprint)
-      ? `scope:${declared.fingerprint}`
+    // An explicit binding-local declaration overrides a historic shared scope:
+    // otherwise concurrent recovery refreshes still borrow the wrong host's fetch.
+    const scopeKey = declared
+      ? shareableScope(declared) ? `scope:${declared.fingerprint}` : `binding:${bindingKey(binding)}`
       : observedScope ?? `binding:${bindingKey(binding)}`;
     const existing = this.fetchInFlight.get(scopeKey);
     if (existing) return existing;
     const promise = this.options.fetch(binding).then((candidate) => {
       if (
-        declared && trustworthyFingerprint(declared.fingerprint) &&
-        candidate.scope.fingerprint !== declared.fingerprint
+        declared && (
+          candidate.scope.sharing !== declared.sharing ||
+          (trustworthyFingerprint(declared.fingerprint) && candidate.scope.fingerprint !== declared.fingerprint)
+        )
       ) {
         throw new Error(
           `adapter catalog scope changed during fetch (${declared.fingerprint} → ${candidate.scope.fingerprint})`
@@ -721,6 +725,9 @@ function validStringList(value: unknown, requireNonEmpty: boolean): value is str
 }
 
 function trustworthyFingerprint(value: string): boolean { return /^[a-f0-9]{64}$/.test(value); }
+function shareableScope(scope: CatalogScope): boolean {
+  return scope.sharing !== "binding" && trustworthyFingerprint(scope.fingerprint);
+}
 /** Canonical, key-order-independent content identity (#236). */
 function candidateChecksum(candidate: AdapterCatalogCandidate): string {
   return catalogContentChecksum(candidate);

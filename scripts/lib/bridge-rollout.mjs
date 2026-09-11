@@ -295,6 +295,8 @@ export async function runPreflight(target, remoteScript, run = commandRunner) {
     if (report.enrollment_id !== "none" || report.baseline_digest !== "none" || report.baseline_rollback_proof !== "none") throw new Error("remote enrollment evidence is inconsistent");
   } else if (!TOKEN.test(report.enrollment_id ?? "") || !CHECKSUM.test(report.baseline_digest ?? "") || !/^(receipt|reduced-baseline)$/.test(report.baseline_rollback_proof ?? "")) throw new Error("remote enrollment evidence is incomplete");
   if (report.node_path !== target.nodePath || !/^v(?:2[2-9]|[3-9]\d)\.\d+\.\d+/.test(report.node_version ?? "") || !/^\d+\.\d+\.\d+/.test(report.npm_version ?? "") || report.disk_path !== target.checkoutPath || !/^\d+$/.test(report.disk_bytes_available ?? "") || BigInt(report.disk_bytes_available) <= 0n) throw new Error("remote runtime capacity evidence is incomplete");
+  if (!/^(ready|bootstrap-required)$/.test(report.release_parent ?? "") || report.native_dependency !== "better-sqlite3@11.10.0" || report.native_install_strategy !== "locked-prebuild" || !/^better-sqlite3@11\.10\.0-node-v\d+-(?:darwin|linux)-(?:arm|arm64|x64)$/.test(report.native_prebuild ?? "") || !/^(yes|no)$/.test(report.native_install_ready ?? "")) throw new Error("remote native install preflight evidence is incomplete");
+  if (report.native_install_ready !== "yes") throw new Error(`remote native install preflight refused: ${report.native_prebuild} has no reviewed prebuild; staging will not fall back to an undeclared Python/compiler toolchain`);
   return { command, report, stdout: result.stdout };
 }
 

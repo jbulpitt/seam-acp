@@ -38,6 +38,11 @@ function preflightReport(target: ReturnType<typeof resolveTarget>, overrides: Re
     npm_version: "11.6.2",
     disk_path: target.checkoutPath,
     disk_bytes_available: "1024",
+    release_parent: "ready",
+    native_dependency: "better-sqlite3@11.10.0",
+    native_install_strategy: "locked-prebuild",
+    native_prebuild: "better-sqlite3@11.10.0-node-v127-darwin-arm64",
+    native_install_ready: "yes",
     ...overrides,
   }).map(([key, value]) => `${key}=${value}`).join("\n") + "\n";
 }
@@ -158,6 +163,15 @@ describe("bridge rollout gating and verification (#241)", () => {
     // half-reported baseline is refused rather than read as "not enrolled".
     const halfEnrolled = vi.fn(async () => ({ stdout: preflightReport(target, { enrolled: "yes" }), stderr: "" }));
     await expect(runPreflight(target, "fixed-script", halfEnrolled)).rejects.toThrow(/enrollment evidence/);
+  });
+
+  it("refuses an unsupported native runtime in preflight before staging", async () => {
+    const target = resolveTarget(targets, "media-server");
+    const fake = vi.fn(async (command: { mutates: boolean }) => {
+      expect(command.mutates).toBe(false);
+      return { stdout: preflightReport(target, { native_prebuild: "better-sqlite3@11.10.0-node-v137-darwin-x64", native_install_ready: "no" }), stderr: "" };
+    });
+    await expect(runPreflight(target, "fixed-script", fake)).rejects.toThrow(/no reviewed prebuild.*undeclared Python\/compiler toolchain/);
   });
 
   it("refuses a mapped SSH host whose reported bridge id differs from the target before mutation (#282)", async () => {

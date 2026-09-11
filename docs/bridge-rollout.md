@@ -71,6 +71,16 @@ managed release is fully revalidated before its receipt is reported. Run the
 preflight separately for each host. The canary remains `media-server`; observe
 and obtain separate authorization before doing anything to `macbook-air`.
 
+PREFLIGHT also proves that the configured Node ABI, platform, architecture and
+the lock-pinned `better-sqlite3@11.10.0` have a reviewed upstream prebuild. It
+reports `native_install_strategy=locked-prebuild` and refuses an unsupported
+tuple before PREPARE, upload or `npm ci`; staging is never allowed to discover a
+missing compiler/Python toolchain after mutation has begun. The bridge package
+does not use SQLite for every agent, but the shared adapters runtime genuinely
+uses it for AGY and Copilot session/catalog state. Keeping one fleet artifact is
+safer than producing target-specific dependency graphs, so the dependency is
+not pruned for Grok-only hosts.
+
 ### 1a. ENROLL (legacy → managed baseline)
 
 ```bash
@@ -90,6 +100,15 @@ Anything unreadable fails closed: a baseline that cannot be restored to is worse
 than none, because it looks like one. The capture is then re-taken and compared,
 and enrollment refuses `enrollment_live_state_drift` if the host moved while it
 was being read.
+
+On a genuinely fresh host the rollout root's immediate parent may not exist yet
+(for the current macOS layout, `~/.seam`). PREFLIGHT reports
+`release_parent=bootstrap-required` without creating it. The first mutating
+phase may create exactly that one component at mode 0700 only after proving its
+existing parent is a canonical, real directory owned by the configured UID;
+symlinks, the wrong owner, a missing anchor or multiple missing components still
+refuse. This makes the reviewed path itself the bootstrap instead of requiring
+an operator to improvise `mkdir`.
 
 The runtime scope is `packages/adapters/dist`, `packages/bridge/dist`,
 `node_modules`, and the package manifests, recorded in the baseline itself. It
@@ -313,10 +332,28 @@ special members are refused.
 Extraction writes regular files one by one with exclusive create into a fresh
 private `.stage-*` directory. The manifest, all file hashes, package names, and
 lockfile workspace identities are checked again. `npm ci` receives a minimal
-secret-free environment and the committed lockfile. Links produced by npm are
-materialized only when their canonical targets remain inside the stage; links
-and special files are forbidden in the final release. A full-tree digest and
-random stage ID are placed in `release-receipt.json`, after which the directory
+secret-free environment and the committed lockfile. Its restricted `PATH`
+prevents user shell configuration, Homebrew/MacPorts tools and unrelated global
+binaries from silently changing the install. `--bin-links=false` prevents the
+arbitrary `bin` entries declared by dependencies (and workspace links) from
+becoming executable symlinks during staging. Relaxing either would make the
+release depend on unrecorded host state and expand the code npm lifecycle
+scripts can execute.
+
+The one native lifecycle needed by the validated lockfile is handled narrowly:
+a private per-stage directory exposes only `prebuild-install`, pinned to the
+configured Node and the freshly installed lock-declared module, plus a
+`node-gyp` refusal shim. The directory is removed before the release digest is
+created. This retains `--bin-links=false`'s boundary without making the entire
+dependency bin set executable, and it prevents a failed prebuild from falling
+through to an undeclared compiler/Python environment. Shipping binaries in the
+Seam artifact was rejected because it would make this repository responsible
+for building and attesting every native fleet tuple; a per-target compiler
+toolchain was rejected because the supported fleet tuples already have upstream
+prebuilds and compilers would add mutable host prerequisites. Links produced by
+npm are materialized only when their canonical targets remain inside the stage;
+links and special files are forbidden in the final release. A full-tree digest
+and random stage ID are placed in `release-receipt.json`, after which the directory
 is atomically published as `releases/<sha>-<archive-checksum>`.
 
 An existing release is never trusted by pathname or one state file. Reuse walks

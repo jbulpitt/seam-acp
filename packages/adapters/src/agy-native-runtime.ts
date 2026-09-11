@@ -180,8 +180,25 @@ export function verifyAgyManagedRuntimeArtifact(
 
 function fdExecutable(fd: number): string {
   if (process.platform === "linux") return `/proc/self/fd/${fd}`;
-  if (process.platform === "darwin") return `/dev/fd/${fd}`;
+  // NOT darwin: macOS refuses to exec a code-signed Mach-O through /dev/fd/N
+  // (EACCES), because signature validation resolves a real path. See the
+  // immutable-path branch in openVerifiedSnapshot (#330).
   throw new Error("native AGY requires descriptor-bound executable launch support");
+}
+
+/**
+ * Which mechanism guarantees that the verified bytes are the executed bytes.
+ *
+ * `descriptor` — the artifact is copied, re-verified through an open fd, then
+ * unlinked, so the executed inode is unreachable by name and cannot be swapped.
+ * `immutable-path` — the artifact is executed from AGY_RUNTIME_ROOT, which has
+ * been proven canonical and not writable by the service user, so it cannot be
+ * swapped either. Used where descriptor execution is unavailable (macOS).
+ *
+ * Reported at startup so the weaker-looking option is never silently assumed.
+ */
+export function describeProvenanceMode(): "descriptor" | "immutable-path" {
+  return process.platform === "linux" ? "descriptor" : "immutable-path";
 }
 
 function duplicateCachedSnapshot(
@@ -259,6 +276,39 @@ function openVerifiedSnapshot(
     throw new Error("AGY executable sha256 does not match the configured immutable artifact");
   }
 
+  // macOS cannot execute a code-signed Mach-O through `/dev/fd/N` — the kernel
+  // resolves a real path to validate the signature, so the descriptor-bound
+  // launch below fails with EACCES for every production AGY binary. The darwin
+  // branch of `fdExecutable` existed but had never worked; a Mac therefore
+  // either lost native agy entirely or crashed its bridge (#330).
+  //
+  // The property the descriptor route buys is that the VERIFIED bytes and the
+  // EXECUTED bytes cannot differ — nothing may be swapped in between. That is
+  // not the only way to obtain it. `verifyAgyManagedRuntimeArtifact` above has
+  // already required AGY_RUNTIME_ROOT to be canonical and immutable to the
+  // service user, and the digest of this exact path was just checked. A user
+  // who cannot write the artifact cannot swap it, so executing the verified
+  // real path carries the same guarantee by a different mechanism, not a
+  // weaker one. `describeProvenanceMode` reports which is in force so the
+  // distinction is never invisible.
+  //
+  // The Node fixture loader is exempt: it READS fd 3 rather than exec'ing it,
+  // which macOS permits, so tests keep exercising the descriptor path.
+  const nodeFixtureSource = bytes.subarray(0, 64).toString("utf8").startsWith("#!/usr/bin/env node\n");
+  if (process.platform === "darwin" && !nodeFixtureSource) {
+    const realFd = fs.openSync(executable, fs.constants.O_RDONLY);
+    try {
+      return retainSnapshot(sourceDigest, {
+        fd: realFd,
+        executable,
+        argvPrefix: [],
+      }, verified);
+    } catch (error) {
+      fs.closeSync(realFd);
+      throw error;
+    }
+  }
+
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "seam-agy-exec-"));
   fs.chmodSync(dir, 0o700);
   const snapshotPath = path.join(dir, "agy");
@@ -281,7 +331,7 @@ function openVerifiedSnapshot(
     // Validate descriptor execution support even for the Node-only fixture
     // loader branch. Production AGY is an ELF binary and executes fd 3 itself.
     fdExecutable(fd);
-    const nodeFixture = bytes.subarray(0, 64).toString("utf8").startsWith("#!/usr/bin/env node\n");
+    const nodeFixture = nodeFixtureSource;
     const executableFd = nodeFixture ? process.execPath : fdExecutable(3);
     const argvPrefix = nodeFixture
       ? ["--input-type=module", "--eval", NODE_FD_MODULE_LOADER, "agy"]

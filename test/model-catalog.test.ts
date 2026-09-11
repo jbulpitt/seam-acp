@@ -6,6 +6,7 @@ import Database from "better-sqlite3";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   catalogScopeFingerprint,
+  makeClaudeProfile,
   type AdapterCatalogCandidate,
   type CatalogModel,
 } from "@seam/adapters";
@@ -104,6 +105,56 @@ function service(opts: {
 }
 
 describe("ModelCatalogService", () => {
+  it("recovers quarantined Claude bindings independently without replacing default or effort", async () => {
+    const opened = db();
+    const local = { agentId: "claude", location: "local" };
+    const remote = { agentId: "claude", location: "remote" };
+    const profile = makeClaudeProfile({
+      directAnthropic: true, defaultModel: "default", cliPath: "false",
+      catalogProbe: async () => ({
+        wrapperCurrentValue: "default",
+        models: [{ advertisedId: "default", advertisedName: "Default", resolvedValue: "default",
+          effortChoices: ["default", "high", "xhigh"], effortCurrent: "default", configIds: ["model", "effort"] }],
+      }),
+    });
+    const live = await profile.catalog.fetch();
+    const oldRemote = structuredClone(live);
+    delete oldRemote.scope.sharing; // the deployed pre-fix declaration
+    oldRemote.cliVersion = "0.70.0";
+    oldRemote.models[0]!.displayName = "Remote wrapper default";
+    const oldLocal = structuredClone(live);
+    delete oldLocal.scope.sharing;
+    oldLocal.cliVersion = "0.75.1";
+    const before = service({ store: opened.store, bindings: [local, remote],
+      fetch: async (b) => b.location === "local" ? oldLocal : oldRemote });
+    expect((await before.refresh(remote)).result).toBe("published");
+    expect((await before.refresh(local)).result).toBe("quarantined");
+    expect(() => before.resolve(local, { model: "default", effort: "xhigh" })).toThrow("unavailable");
+    const retainedGeneration = before.lookup(remote).snapshot!.generation;
+
+    let calls = 0;
+    const after = service({ store: opened.store, bindings: [local, remote],
+      scope: () => profile.catalog.scope(),
+      fetch: async (b) => {
+        calls++;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        const c = structuredClone(live);
+        c.models[0]!.displayName = b.location === "local" ? "Local wrapper default" : "Remote wrapper default";
+        return c;
+      } });
+    const results = await Promise.all([after.refresh(local), after.refresh(remote)]);
+    expect(calls).toBe(2); // recovery must not coalesce using the historic shared scope
+    expect(results.map((r) => r.result)).toEqual(["published", "published"]);
+    expect(results.map((r) => r.scope)).toEqual(["binding:claude@local", "binding:claude@remote"]);
+    expect(after.model(local, "default")?.displayName).toBe("Local wrapper default");
+    expect(after.model(remote, "default")?.displayName).toBe("Remote wrapper default");
+    expect(after.resolve(local, { model: "default", effort: "xhigh" }).normalized).toEqual({ model: "default", effort: "xhigh" });
+    expect(before.lookup(remote).snapshot!.generation).toBe(retainedGeneration);
+    const rebooted = service({ store: opened.store, fetch: async () => live });
+    expect(rebooted.resolve(local, { model: "default", effort: "xhigh" }).normalized).toEqual({ model: "default", effort: "xhigh" });
+    opened.store.close();
+  });
+
   it("renders adapter-defined effort names without a core allowlist", () => {
     expect(catalogEffortChoices(["astronomical", "low", "default"])).toEqual([
       expect.objectContaining({ value: "low", label: "Low" }),

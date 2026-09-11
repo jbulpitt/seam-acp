@@ -57,6 +57,8 @@ export type CatalogEffortEvidence = NonNullable<CatalogModelEvidence["effort"]>;
 export interface CatalogScope {
   /** Stable, non-secret semantic identity. Equal fingerprints may share a generation. */
   fingerprint: string;
+  /** Host-local credentials/runtime have not proved cross-binding equivalence. */
+  sharing?: "binding";
   provider: string;
   credentialProfile?: string;
   backend?: string;

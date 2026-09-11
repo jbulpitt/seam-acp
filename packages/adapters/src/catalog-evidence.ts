@@ -416,7 +416,7 @@ const CANDIDATE_KEYS = [
   "adapterVersion", "cliVersion", "fetchedAt",
 ] as const;
 const SCOPE_KEYS = [
-  "fingerprint", "provider", "credentialProfile", "backend", "project", "region", "policy",
+  "fingerprint", "sharing", "provider", "credentialProfile", "backend", "project", "region", "policy",
 ] as const;
 const MODEL_KEYS = [
   "id", "runtimeId", "displayName", "description", "evidence", "aliases", "default",
@@ -669,6 +669,9 @@ export function assertCatalogValues(candidate: unknown): void {
     assertLabelValue("candidate.scope.fingerprint", scope.fingerprint, CATALOG_EVIDENCE_TEXT_MAX);
   }
   requireLabel("candidate.scope.provider", scope.provider);
+  if (scope.sharing !== undefined && scope.sharing !== "binding") {
+    fail("candidate.scope.sharing", "must be binding when specified");
+  }
   for (const field of SCOPE_IDENTITY_FIELDS) {
     const value = scope[field];
     if (value === undefined) continue;

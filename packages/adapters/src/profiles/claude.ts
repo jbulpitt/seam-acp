@@ -216,13 +216,13 @@ export function makeClaudeProfile(opts: {
     ...(opts.brand ? { brand: opts.brand } : {}),
     defaultModel: opts.defaultModel,
     catalog: {
-      scope: () => manifestCatalogScope({
+      scope: () => ({ ...manifestCatalogScope({
         provider: opts.directAnthropic ? "anthropic" : (opts.brand ?? "claude-compatible"),
         backend: opts.extraEnv?.CLAUDE_CODE_USE_VERTEX === "1" ? "vertex" : opts.extraEnv?.ANTHROPIC_BASE_URL,
         credentialProfile: configDir ?? "default",
         project: opts.extraEnv?.ANTHROPIC_VERTEX_PROJECT_ID,
         region: opts.extraEnv?.CLOUD_ML_REGION,
-      }),
+      }), ...(liveCatalog ? { sharing: "binding" as const } : {}) }),
       async fetch() {
         const common = {
           provider: opts.directAnthropic ? "anthropic" : (opts.brand ?? "claude-compatible"),
@@ -266,6 +266,10 @@ export function makeClaudeProfile(opts: {
             models: () => models,
             source: "claude-acp-live+verified-overlay",
           }).fetch();
+          // A config-directory label (especially "default") does not prove
+          // that two hosts have the same account, wrapper, or advertised list.
+          // Sharing it lets one host quarantine every model on the other.
+          candidate.scope.sharing = "binding";
           candidate.cliVersion = await readCliVersion(cli);
           candidate.sourceVersion = `overlay-v${CLAUDE_VERIFIED_OVERLAY_VERSION}`;
           return candidate;

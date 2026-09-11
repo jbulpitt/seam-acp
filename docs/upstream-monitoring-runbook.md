@@ -4,7 +4,7 @@
 >
 > **Cadence**: Weekly sweep (recommended: Monday), with ad-hoc checks when a major release is announced.
 >
-> **Last updated**: 2026-09-07 (weekly sweep)
+> **Last updated**: 2026-09-11 (daily sweep)
 >
 > **⚠️ AGENT CONSTRAINT — READ-ONLY / REPORTING MODE**: Agents executing this runbook must **never** modify seam-acp source files, run `npm run redeploy`, apply patches, or make any code changes during a monitoring sweep. All code work is tracked via GitHub issues and implemented in **separate, explicitly tasked sessions**. Your job during a sweep is to **find, classify, and file or update GitHub issues** — not to implement fixes.
 
@@ -424,17 +424,17 @@ Use this checklist for each monitoring sweep. Copy it into your report and check
 ### Gather Checklist
 
 #### Google / Antigravity CLI (agy)
-- [ ] Check [Antigravity CLI releases](https://github.com/google-antigravity/antigravity-cli/releases) — last checked version: **1.1.27** (2026-09-07 sweep; installed = latest; 1.1.27: `/model <name> <prompt>` one-shot model consultation without disturbing default, conversation_title in status/title scripts, agents list in Markdown frontmatter, typed [model] hint, MCP server undeclared argument validation, headless -p tool action refusal reporting via denied_actions, print mode -p trailing conversation history shutdown flush fix, artifact cross-conversation approval fix)
+- [ ] Check [Antigravity CLI releases](https://github.com/google-antigravity/antigravity-cli/releases) — last checked version: **1.2.1** (2026-09-11 sweep; installed 1.2.0, latest 1.2.1; 1.2.1: excludeDefaultComponents frontmatter, in-process transient API error retry, open MCP schema validation fix, status line sandbox report fix relevant to #324, memory/responsiveness improvements, --continue fallback fix)
 - [ ] Check [Antigravity CLI CHANGELOG](https://github.com/google-antigravity/antigravity-cli/blob/main/CHANGELOG.md)
 - [ ] Check [Gemini API release notes](https://ai.google.dev/gemini-api/docs/changelog) (models shared with agy; Lyria 3.5 preview Sep 3, Gemini 3.8 Flash GA Sep 2, agentic video understanding GA Sep 1)
 - [ ] Scan [Google AI Blog](https://blog.google/technology/ai/) for announcements
 - [ ] Check [Google AI pricing](https://ai.google.dev/gemini-api/docs/pricing) for changes
 
 #### Anthropic / Claude Code
-- [ ] Check [Claude Code releases](https://github.com/anthropics/claude-code/releases) — last checked version: **2.1.263** (2026-09-07 sweep; installed 2.1.258, latest 2.1.263; 2.1.263: bug fixes and reliability improvements; 2.1.261: bashOutputMaxChars/taskOutputMaxChars up to 128K inline output, --append-subagent-system-prompt-file, /skill-doctor context pruning, org policy diagnostics, keystroke order fix, automount dir fix, Bedrock timeout fix, resume parallel tool hook context fix, Remote Control sync fixes, tight-loop background agent CPU fix; host updates tracked in #223)
+- [ ] Check [Claude Code releases](https://github.com/anthropics/claude-code/releases) — last checked version: **2.1.268** (2026-09-11 sweep; installed 2.1.266, latest 2.1.268; 2.1.268: task tracking tools policy, CLAUDE_CONFIG_DIR session fixes, Bedrock/Vertex/Foundry byte-stable tools; 2.1.267: maxEffortLevel setting, --system-prompt-snapshot off, prompt cache deduplication across /model switches; host updates following #223 closure)
 - [ ] Check [Claude Code CHANGELOG](https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md)
 - [ ] Check [Claude Code docs changelog](https://docs.anthropic.com/en/docs/claude-code/changelog)
-- [ ] Check [claude-agent-acp releases](https://github.com/agentclientprotocol/claude-agent-acp/releases) — last checked version: **0.75.1** (2026-09-07 sweep; installed 0.73.0, latest 0.75.1; 0.75.1: restore session forks and speed up loading #1089; 0.75.0: agent auth identity reporting over ACP authStatus extension #1080, Markdown usage stats #1085, ACP tool lifecycle for context compaction #991; 0.74.0: refuse claude.ai subscriptions under --hide-claude-auth #1079, @anthropic-ai/claude-agent-sdk 0.3.257, process leak fix, fresh query restart; host updates tracked in #223)
+- [ ] Check [claude-agent-acp releases](https://github.com/agentclientprotocol/claude-agent-acp/releases) — last checked version: **0.76.0** (2026-09-11 sweep; installed 0.75.1, latest 0.76.0 GA / 0.76.1-preview.2; 0.76.0: advertise recommended config values #1111; 0.76.1-preview: remove main-thread agent config picker #1112; host updates following #223 closure)
 - [ ] Check [claude-agent-acp CHANGELOG](https://github.com/agentclientprotocol/claude-agent-acp/blob/main/CHANGELOG.md)
 - [ ] Scan [Anthropic News](https://www.anthropic.com/news) for announcements (Claude Fable 5.1 GA)
 - [ ] Check [Anthropic platform release notes](https://docs.anthropic.com/en/release-notes)
@@ -443,7 +443,7 @@ Use this checklist for each monitoring sweep. Copy it into your report and check
 - [ ] Check [Anthropic status](https://status.anthropic.com/) for ongoing incidents
 
 #### GitHub / Copilot
-- [ ] Check [Copilot CLI releases](https://github.com/github/copilot-cli/releases) — last checked version: **1.0.83 GA / 1.0.84-1 pre-release** (2026-09-07 sweep; installed 1.0.81; GPT-6 Astra GA in Copilot with 1.05M context and reasoning effort; 1.0.84-1 pre-release adds gpt-6-astra support; 1.0.83 GA: claude-fable-5.1 support, custom agent fallback model lists, CIMD for MCP OAuth, Windows 11 taskbar hover cards, sandbox localhost restrictions; upcoming deprecation on Oct 2 of Gemini 3.5/3.6 Flash, Claude Opus 4.7, Kimi K2.7 Code — tracked in #222; GitHub CLI Linux package signing key expired Sep 5)
+- [ ] Check [Copilot CLI releases](https://github.com/github/copilot-cli/releases) — last checked version: **1.0.83 GA / 1.0.84-4 pre-release** (2026-09-11 sweep; installed 1.0.34; 1.0.84-4: command restructure for skill/mcp/plugin, plugins list flat json array, sandbox status display fix; MAI-Code-1-Flash deprecated Sep 10; dynamic catalog discovery via PR #284; #291 context window resolved)
 - [ ] Check [Copilot CLI CHANGELOG](https://github.com/github/copilot-cli/blob/main/CHANGELOG.md)
 - [ ] Scan [GitHub Changelog](https://github.blog/changelog/) for Copilot entries (Claude Fable 5.1 GA in Copilot, Copilot code review PR approvals)
 - [ ] Scan [GitHub Blog](https://github.blog/) for Copilot announcements

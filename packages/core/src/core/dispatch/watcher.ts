@@ -84,6 +84,10 @@ export interface DispatchWatcherOpts {
    * config key so the bound travels with the watcher that enforces it.
    */
   admissionBarrierTimeoutMs?: number;
+  /** SQL completion authority survives removal of a delivered result file. */
+  isCompleted?: (id: string) => boolean;
+  /** Retention runs after publication, including when delivery preceded the file. */
+  onResultPublished?: (id: string) => Promise<void>;
   /**
    * Directory-listing seam. Defaults to `fs.readdir`.
    *
@@ -161,7 +165,10 @@ export class DispatchWatcher {
   private readonly mayRecover: (id: string) => boolean;
   private readonly retainForRecovery: (id: string) => boolean;
   private readonly beforeAdmission?: () => Promise<void>;
+  private admissionRelease: Promise<void> = Promise.resolve();
   private readonly admissionBarrierTimeoutMs: number;
+  private readonly isCompleted: (id: string) => boolean;
+  private readonly onResultPublished?: (id: string) => Promise<void>;
   private readonly readDir: (dir: string) => Promise<string[]>;
   private readonly beforeOwnedDoneCommit?: (id: string) => Promise<void>;
   private readonly beforeRecoveryPublish?: (id: string) => Promise<void>;
@@ -224,6 +231,8 @@ export class DispatchWatcher {
     this.retainForRecovery = opts.retainForRecovery ?? (() => false);
     this.beforeAdmission = opts.beforeAdmission;
     this.admissionBarrierTimeoutMs = opts.admissionBarrierTimeoutMs ?? ADMISSION_BARRIER_TIMEOUT_MS;
+    this.isCompleted = opts.isCompleted ?? (() => false);
+    this.onResultPublished = opts.onResultPublished;
     this.readDir = opts.readDir ?? readdir;
     this.beforeOwnedDoneCommit = opts.beforeOwnedDoneCommit;
     this.beforeRecoveryPublish = opts.beforeRecoveryPublish;
@@ -280,7 +289,7 @@ export class DispatchWatcher {
     } else {
       await this.recoverStale();
     }
-    const initialPass = (async () => {
+    this.admissionRelease = (async () => {
       // #303: keep pending admission closed until interrupted running turns have
       // joined the same first tick; deleting this await lets newer pending turns
       // bypass the existing createdUtc ordering while recovery is still running.
@@ -299,8 +308,10 @@ export class DispatchWatcher {
       this.timer = setInterval(() => void this.tick(), this.pollMs);
       // Don't hold the event loop open just for the poller.
       this.timer.unref?.();
-      await this.tick();
     })();
+    const initialPass = this.admissionRelease.then(async () => {
+      if (this.lifecycleEpoch === lifecycleEpoch && this.ready) await this.tick();
+    });
     this.initialDispatchPass = initialPass.catch((err) => {
       this.logger.warn({ err }, "initial dispatch pass failed");
     });
@@ -312,6 +323,12 @@ export class DispatchWatcher {
    * application readiness notification behind paid agent turns. */
   initialDispatchesSettled(): Promise<void> {
     return this.initialDispatchPass;
+  }
+
+  /** Recovery barrier only, not the paid work admitted by the initial tick.
+   * Call after start(); false-wait startup intentionally returns before this. */
+  admissionReleased(): Promise<void> {
+    return this.admissionRelease;
   }
 
   /** False after shutdown closes watcher intake. */
@@ -445,6 +462,12 @@ export class DispatchWatcher {
 
   // --- internals ------------------------------------------------------------
 
+  /** SQL wins after pruning. Legacy outputs without a SQL completion remain
+   * recovery authority until their completion/delivery has been resolved. */
+  async hasCompleted(id: string): Promise<boolean> {
+    return this.isCompleted(id) || await exists(path.join(this.dirs.done, `${id}.json`));
+  }
+
   /**
    * Re-enqueue crash leftovers. A spec that already has a done-file finished its
    * turn — the process just died before deleting the running-file — so it is
@@ -462,7 +485,7 @@ export class DispatchWatcher {
       if (!name.endsWith(".json")) continue;
       const id = name.slice(0, -".json".length);
       const runningPath = path.join(this.dirs.running, name);
-      if (await exists(path.join(this.dirs.done, name))) {
+      if (await this.hasCompleted(id)) {
         await rm(runningPath, { force: true }).catch(() => {});
         this.logger.info({ id }, "dispatch: dropped stale running spec (already done)");
         continue;
@@ -498,7 +521,7 @@ export class DispatchWatcher {
       if (!name.endsWith(".json")) continue;
       const id = name.slice(0, -".json".length);
       const runningPath = path.join(this.dirs.running, name);
-      if (await exists(path.join(this.dirs.done, name))) {
+      if (await this.hasCompleted(id)) {
         await rm(runningPath, { force: true }).catch(() => {});
         this.logger.info({ id }, "dispatch: dropped stale running spec (already done)");
         continue;
@@ -540,7 +563,7 @@ export class DispatchWatcher {
       if (!name.endsWith(".json")) continue;
       const id = name.slice(0, -".json".length);
       if (this.inFlight.has(id)) continue;
-      if (await exists(path.join(this.dirs.done, name))) continue;
+      if (await this.hasCompleted(id)) continue;
       try {
         out.push(parseDispatchSpec(id, await readFile(path.join(this.dirs.running, name), "utf8")));
       } catch {
@@ -557,7 +580,7 @@ export class DispatchWatcher {
       const name = `${id}.json`;
       const runningPath = path.join(this.dirs.running, name);
       const pendingPath = path.join(this.dirs.pending, name);
-      if (await exists(path.join(this.dirs.done, name))) {
+      if (await this.hasCompleted(id)) {
         await rm(runningPath, { force: true }).catch(() => {});
         return false;
       }
@@ -646,8 +669,7 @@ export class DispatchWatcher {
         const name = `${spec.id}.json`;
         const runningPath = path.join(this.dirs.running, name);
         const pendingPath = path.join(this.dirs.pending, name);
-        const donePath = path.join(this.dirs.done, name);
-        if (await exists(donePath)) {
+        if (await this.hasCompleted(spec.id)) {
           await rm(runningPath, { force: true }).catch(() => {});
           await rm(pendingPath, { force: true }).catch(() => {});
           return false;
@@ -806,10 +828,9 @@ export class DispatchWatcher {
     try {
       return await this.withArtifact(id, async () => {
         const name = `${id}.json`;
-        const donePath = path.join(this.dirs.done, name);
         const runningPath = path.join(this.dirs.running, name);
         const pendingPath = path.join(this.dirs.pending, name);
-        if (await exists(donePath)) {
+        if (await this.hasCompleted(id)) {
           await rm(runningPath, { force: true }).catch(() => {});
           await rm(pendingPath, { force: true }).catch(() => {});
           return { state: "done" as const, inFlight };
@@ -838,7 +859,7 @@ export class DispatchWatcher {
           ...(spec?.correlationId ? { correlationId: spec.correlationId } : {}),
           finishedUtc: new Date().toISOString(),
         });
-        if (!(await exists(donePath))) {
+        if (!(await this.hasCompleted(id))) {
           throw new Error(`dispatch ${id}: quarantine result was not durable`);
         }
         return { state: "terminalized" as const, inFlight };
@@ -889,6 +910,12 @@ export class DispatchWatcher {
       const name = `${id}.json`;
       const pendingPath = path.join(this.dirs.pending, name);
       const runningPath = path.join(this.dirs.running, name);
+      // A duplicate queue marker can outlive its delivered/pruned result;
+      // without this check it would execute the original prompt again.
+      if (await this.hasCompleted(id)) {
+        await rm(pendingPath, { force: true });
+        return null;
+      }
       let spec: DispatchSpec;
       try {
         // Parse before rename so target fencing can publish its ownership
@@ -957,6 +984,15 @@ export class DispatchWatcher {
 
     await this.queueFor(spec.target).run(async () => {
       if (!this.owns(owner)) return;
+      // Another queued callback may have completed this id since claim time.
+      // Keep the winning SQL outcome instead of writing a replacement failure.
+      if (this.isCompleted(id)) {
+        await this.withArtifact(id, async () => {
+          await rm(path.join(this.dirs.running, `${id}.json`), { force: true });
+          await rm(path.join(this.dirs.pending, `${id}.json`), { force: true });
+        });
+        return;
+      }
       if (!this.mayRecover(id)) {
         this.revokeArtifact(id);
         await this.withArtifact(id, () =>
@@ -1086,6 +1122,7 @@ export class DispatchWatcher {
         // authoritative and startup recovery drops the leftover marker.
         return published && (await exists(finalPath));
       }
+      await this.applyRetention(id);
       return true;
     });
   }
@@ -1106,6 +1143,16 @@ export class DispatchWatcher {
     // Command-layer cancel may finalize a spec still sitting in pending/
     // (a staggered resume that has not been claimed yet).
     await rm(path.join(this.dirs.pending, name), { force: true }).catch(() => {});
+    await this.applyRetention(id);
+  }
+
+  private async applyRetention(id: string): Promise<void> {
+    try { await this.onResultPublished?.(id); }
+    catch (err) {
+      // A cleanup failure must not replace a winning output with a failure;
+      // the periodic sweep retries the retained artifact.
+      this.logger.warn({ err, id }, "dispatch: delivered artifact retention failed");
+    }
   }
 
   private owns(owner: ClaimOwnership): boolean {
@@ -1168,7 +1215,7 @@ export class DispatchWatcher {
 
   private async restorePendingLocked(spec: DispatchSpec): Promise<void> {
     const name = `${spec.id}.json`;
-    if (await exists(path.join(this.dirs.done, name))) return;
+    if (await this.hasCompleted(spec.id)) return;
     const runningPath = path.join(this.dirs.running, name);
     const pendingPath = path.join(this.dirs.pending, name);
     if (await exists(runningPath)) {

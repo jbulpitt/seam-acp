@@ -1,4 +1,4 @@
-import { Collection, MessagePayload } from "discord.js";
+import { Collection, MessagePayload, type MessageCreateOptions } from "discord.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
@@ -44,7 +44,7 @@ describe("#305 Discord nonce delivery proof", () => {
   });
 
   it("forwards nonce enforcement through the actual discord.js send path", async () => {
-    const send = vi.fn(async () => ({ id: "discord-message" }));
+    const send = vi.fn(async (_payload: MessageCreateOptions) => ({ id: "discord-message" }));
     const adapter = bareAdapter(send);
     await adapter.sendMessage(
       { platform: "discord", id: "thread" },

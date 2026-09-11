@@ -5,6 +5,8 @@
     "packages/core/src/**/*.ts",
     "packages/bridge/src/**/*.ts",
     "test/restart-attempt.test.ts",
+    "test/delivery-proof.test.ts",
+    "test/dispatch-done-retention.test.ts",
     "test/restart-dispatch-lifecycle.test.ts",
     "test/restart-inbound-lifecycle.test.ts",
     "test/restart-scheduled-lifecycle.test.ts",

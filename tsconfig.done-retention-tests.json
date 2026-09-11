@@ -1,0 +1,15 @@
+{
+  "extends": "./tsconfig.json",
+  "include": [
+    "packages/adapters/src/**/*.ts",
+    "packages/core/src/**/*.ts",
+    "packages/bridge/src/**/*.ts",
+    "test/dispatch-pruned-completion.test.ts",
+    "test/dispatch-done-retention.test.ts",
+    "test/shutdown-quiesce.test.ts",
+    "test/dispatch-proof-retention.test.ts",
+    "test/dispatch-retention-proof-contract.test.ts",
+    "test/delivery-proof.test.ts",
+    "test/dispatch-retention-crash.test.ts"
+  ]
+}

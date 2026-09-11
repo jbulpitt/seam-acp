@@ -556,6 +556,10 @@ function makeLedger() {
   return {
     rows,
     getDelegation: (id: string) => rows.get(id) ?? null,
+    isDispatchCompleted: (id: string) => {
+      const row = rows.get(id);
+      return Boolean(row && DELEGATION_TERMINAL_STATUSES.includes(row.status));
+    },
     updateDelegationStatus(id: string, status: DelegationStatus) {
       const r = rows.get(id);
       if (r) r.status = status;
@@ -2011,6 +2015,7 @@ function makeClosableStore() {
       scheduled.set(id, { ...scheduled.get(id), ...patch });
     },
     getDelegation: (id: string) => (guard("getDelegation"), ledger.getDelegation(id)),
+    isDispatchCompleted: (id: string) => (guard("isDispatchCompleted"), ledger.isDispatchCompleted(id)),
     updateDelegationStatus: (id: string, s: DelegationStatus) => (
       guard("updateDelegationStatus"), ledger.updateDelegationStatus(id, s)
     ),

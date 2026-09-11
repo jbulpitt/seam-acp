@@ -10152,7 +10152,8 @@ export class Orchestrator {
   ): Promise<boolean> {
     const existingClaim = this.store.getReportBackByCorrelation(correlationId);
     if (existingClaim) {
-      const artifact = await dispatchArtifactState(this.config.DATA_DIR, existingClaim.id);
+      const artifact = await dispatchArtifactState(this.config.DATA_DIR, existingClaim.id,
+        (id) => this.store.isDispatchCompleted(id));
       if (artifact) {
         this.logger.info(
           { correlationId, spec: existingClaim.id, artifact },
@@ -10371,7 +10372,8 @@ export class Orchestrator {
         prompt: output,
         originRef: plan.originRef,
       });
-      const artifact = await dispatchArtifactState(this.config.DATA_DIR, plan.dispatchId);
+      const artifact = await dispatchArtifactState(this.config.DATA_DIR, plan.dispatchId,
+        (id) => this.store.isDispatchCompleted(id));
       if (!artifact) await enqueueDispatchSpec(this.config.DATA_DIR, next);
       this.logger.info(
         { chainId, dispatch: next.id, worker: plan.nextHop, repaired: !plan.created },

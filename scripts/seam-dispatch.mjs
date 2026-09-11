@@ -5,7 +5,7 @@
  * Writes a dispatch spec into <DATA_DIR>/dispatch/pending/<uuid>.json; the
  * running seam-acp process picks it up, runs the prompt as a turn in the target
  * Discord thread, and writes <DATA_DIR>/dispatch/done/<uuid>.json. With --wait
- * this polls for that result and prints it.
+ * this polls for that result (or its SQL outcome after pruning) and prints it.
  *
  * Auth is the filesystem — if you can write to the dispatch dir you are the
  * operator. Don't expose this path to anything you don't trust.
@@ -34,6 +34,7 @@ import { mkdir, readFile, writeFile, rename } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import * as path from "node:path";
 import * as url from "node:url";
+import Database from "better-sqlite3";
 
 const FLAGS_WITH_VALUES = new Set([
   "target",
@@ -76,6 +77,25 @@ function fail(msg) {
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** Delivered files may already be pruned before the next 500ms poll. SQL is
+ * the durable outcome owner; read-only access must never create/migrate a DB. */
+function readCompletedOutcome(dataDir, id) {
+  let db;
+  try {
+    db = new Database(path.join(dataDir, "seam.db"), { readonly: true, fileMustExist: true });
+    const hasAttempts = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='turn_attempts'").get();
+    if (!hasAttempts) return null; // pre-attempt installations still use the file
+    const row = db.prepare(`SELECT a.outcome_json FROM turn_attempts a
+      JOIN delegation_log d ON d.id=a.id
+      WHERE a.id=? AND a.state IN ('completed','cancelled')
+        AND d.status IN ('completed','failed','timed_out','abandoned')`).get(id);
+    return row?.outcome_json ?? null;
+  } catch (err) {
+    if (err?.code === "SQLITE_CANTOPEN" || err?.code === "ENOENT") return null;
+    throw err;
+  } finally { db?.close(); }
+}
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
@@ -152,7 +172,11 @@ async function main() {
     let raw;
     try {
       raw = await readFile(donePath, "utf8");
-    } catch {
+    } catch (err) {
+      if (err?.code !== "ENOENT") throw err;
+      raw = readCompletedOutcome(dataDir, id);
+    }
+    if (!raw) {
       await sleep(500);
       continue;
     }
@@ -167,7 +191,7 @@ async function main() {
 
   process.stderr.write(
     `seam-dispatch: timed out after ${timeoutSecs}s waiting for ${donePath}\n` +
-      `The dispatch may still be running — check that file later.\n`
+      `The dispatch may still be running — inspect its durable workflow status.\n`
   );
   process.exit(1);
 }

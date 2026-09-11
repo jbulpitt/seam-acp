@@ -10,6 +10,7 @@ data/
 # Explicit exceptions keep new canonical agent entry points visible to Git.
 docs/*
 !docs/model-catalog.md
+!docs/dispatch-result-retention.md
 !docs/agent-guides/
 docs/agent-guides/*
 !docs/agent-guides/README.md

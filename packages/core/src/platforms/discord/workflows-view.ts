@@ -157,6 +157,8 @@ export interface InterruptedTurnRow {
    * this ref, so a row without one cannot be resumed at all (#159).
    */
   targetRef: string | null;
+  /** Durable explanation for an explicit abandonment, when available. */
+  reason?: string | null;
 }
 
 /** One inventory line: thread, age, correlation — what the operator needs
@@ -164,7 +166,8 @@ export interface InterruptedTurnRow {
 export function formatInterruptedLine(row: InterruptedTurnRow, now: Date): string {
   const icon = row.status === "abandoned" ? "🚫" : "⚠️";
   const corr = row.correlationId ? ` · corr \`${shortId(row.correlationId)}\`` : "";
-  return `${icon} \`${shortId(row.id)}\` ${row.source} · ${shortRef(row.channelRef, "?")} · ${row.status} · ${formatAge(row.startedUtc, now)}${corr}`;
+  const reason = row.reason ? ` · ${row.reason.slice(0, 160)}` : "";
+  return `${icon} \`${shortId(row.id)}\` ${row.source} · ${shortRef(row.channelRef, "?")} · ${row.status} · ${formatAge(row.startedUtc, now)}${corr}${reason}`;
 }
 
 export function formatInterruptedLines(rows: InterruptedTurnRow[], now: Date): string[] {

@@ -56,6 +56,7 @@ function deps(
     logger: silent,
     getDelegation: (id) => store.getDelegation(id),
     listRecoveryCandidates: (after, limit) => store.listNonTerminalDelegations(after, limit),
+    abandonUnprovable: (id, reason) => store.abandonUnprovableDelivery(id, reason),
     replay,
     retention: {
       listCandidates: (cutoffUtc, after, limit) =>
@@ -164,8 +165,12 @@ describe("#193 bounded done-file recovery and retention", () => {
     const abandoned = await reconcileCompletedDoneFiles(deps());
     expect(abandoned.retainedPending).toBe(1);
 
-    store.updateDelegationStatus("delivery", "completed");
+    store.updateDelegationStatus("delivery", "abandoned", {
+      terminalReason: "operator recorded an explicit delivery refusal",
+    });
     const settled = await reconcileCompletedDoneFiles(deps());
+    // Protects explicit abandonment as a terminal delivery resolution while
+    // keeping unexplained legacy `abandoned` rows fail-closed.
     expect(settled.pruned).toBe(1);
     await expect(access(path.join(dispatchDirs(dataDir).done, "parent.json"))).rejects.toMatchObject({ code: "ENOENT" });
   });

@@ -61,6 +61,7 @@ function setup(mode: "live" | "isolated" = "isolated") {
       cwd: { value: "/synthetic" }, effort: { value: null }, location: { value: "local" }, fastMode: { value: false } }) };
   const adapter = { sendPanel: vi.fn(async (channel: any) => ({ channel, id: "panel" })),
     sendMessage: vi.fn(async (channel: any, _text: string) => ({ channel, id: "message" })),
+    findMessageByNonce: vi.fn(async () => ({ status: "absent" as const })),
     editPanel: vi.fn(async () => {}), editMessage: vi.fn(async () => {}) };
   const make = () => new Orchestrator({ logger: pino({ level: "silent" }) as any, store, router: router as any,
     adapter: adapter as any, renderer: discordRenderer as any, modelCatalog: fixtureModelCatalog([profile]),
@@ -264,6 +265,13 @@ describe("#252 actual isolated scheduler + injectTurn, synthetic transport", () 
     await h.make().runScheduledPrompt(h.row.id, key);
     expect(transport.prompt).toHaveBeenCalledTimes(1);
     expect(h.store.scheduledOccurrences.get(key.id)?.settled).toBe(true);
+    const deliveryCalls = h.adapter.sendPanel.mock.calls.filter(call => call[2]);
+    const firstDelivery = deliveryCalls[0]?.[2];
+    const replayDelivery = deliveryCalls.at(-1)?.[2];
+    // Protects scheduled-result dedup after an accepted/rejected ambiguity;
+    // deleting it lets boot replay create a second result card.
+    expect(replayDelivery).toEqual(firstDelivery);
+    expect(replayDelivery).toMatchObject({ enforceNonce: true });
   });
 
   it("a durable cancellation never resumes, while disable/delete only stops future ticks", async () => {

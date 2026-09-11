@@ -65,6 +65,8 @@ import type {
   ComponentEvent,
   ChoiceCardPost,
   ChoiceInteraction,
+  DeliveryNonceLookup,
+  DeliveryNonceOptions,
   ElicitationCardPost,
   ConfirmationCard,
   ConfirmationDecision,
@@ -971,7 +973,11 @@ export class DiscordAdapter implements ChatAdapter {
     }
   }
 
-  async sendMessage(channel: ChannelRef, text: string): Promise<MessageRef> {
+  async sendMessage(
+    channel: ChannelRef,
+    text: string,
+    delivery?: DeliveryNonceOptions
+  ): Promise<MessageRef> {
     const ch = await this.fetchSendableChannel(channel.id);
     const sent = await ch.send({
       content: text,
@@ -979,6 +985,7 @@ export class DiscordAdapter implements ChatAdapter {
       // M0 (#57): never turn a model-emitted <@id> into a real ping. Mentions
       // still render as a highlighted name; they just don't notify.
       allowedMentions: { parse: [] },
+      ...(delivery ?? {}),
     });
     return { channel, id: sent.id };
   }
@@ -995,11 +1002,50 @@ export class DiscordAdapter implements ChatAdapter {
 
   async sendFile(
     channel: ChannelRef,
-    file: DiscordFileSend
+    file: DiscordFileSend,
+    delivery?: DeliveryNonceOptions
   ): Promise<MessageRef> {
     const ch = await this.fetchSendableChannel(channel.id);
-    const sent = await ch.send(buildDiscordFileSendPayload(file));
+    const sent = await ch.send({
+      ...buildDiscordFileSendPayload(file),
+      ...(delivery ?? {}),
+    });
     return { channel, id: sent.id };
+  }
+
+  async findMessageByNonce(
+    channel: ChannelRef,
+    nonce: string,
+    sinceMs: number
+  ): Promise<DeliveryNonceLookup> {
+    const ch = await this.fetchSendableChannel(channel.id);
+    const botId = this.client.user?.id;
+    // Protects against treating another author's coincident nonce as proof;
+    // deleting this check can falsely acknowledge an undelivered Seam result.
+    if (!botId) return { status: "indeterminate", reason: "Discord bot identity unavailable" };
+
+    let before: string | undefined;
+    const maxPages = 50;
+    for (let page = 0; page < maxPages; page += 1) {
+      const messages = await ch.messages.fetch({ limit: 100, ...(before ? { before } : {}) });
+      if (messages.size === 0) return { status: "absent" };
+      let oldestMs = Number.POSITIVE_INFINITY;
+      for (const message of messages.values()) {
+        oldestMs = Math.min(oldestMs, message.createdTimestamp);
+        if (message.author.id === botId && String(message.nonce ?? "") === nonce) {
+          return { status: "found", message: { channel, id: message.id } };
+        }
+      }
+      if (oldestMs <= sinceMs || messages.size < 100) return { status: "absent" };
+      before = messages.last()?.id;
+      // Protects against a cursor stall becoming an unbounded boot loop; if
+      // deleted, a malformed/cached page can prevent startup from settling.
+      if (!before) return { status: "indeterminate", reason: "Discord history cursor did not advance" };
+    }
+    return {
+      status: "indeterminate",
+      reason: `Discord nonce search exceeded ${maxPages * 100} messages`,
+    };
   }
 
   async sendTyping(channel: ChannelRef): Promise<void> {
@@ -1659,7 +1705,8 @@ export class DiscordAdapter implements ChatAdapter {
 
   async sendPanel(
     channel: ChannelRef,
-    panel: StructuredPanel
+    panel: StructuredPanel,
+    delivery?: DeliveryNonceOptions
   ): Promise<MessageRef> {
     const ch = await this.fetchSendableChannel(channel.id);
     const embed = DiscordAdapter.buildEmbed(panel);
@@ -1671,6 +1718,7 @@ export class DiscordAdapter implements ChatAdapter {
       embeds: [embed],
       ...(components.length > 0 ? { components } : {}),
       ...(files.length > 0 ? { files } : {}),
+      ...(delivery ?? {}),
     });
     return { channel, id: sent.id };
   }

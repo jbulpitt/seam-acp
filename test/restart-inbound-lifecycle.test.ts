@@ -47,7 +47,9 @@ function setup() {
   };
   const adapter = { sendPanel: vi.fn(async (channel: any) => ({ channel, id: "panel" })),
     sendMessage: vi.fn(async (channel: any, _text: string) => ({ channel, id: "message" })),
-    sendFile: vi.fn(async () => {}), editPanel: vi.fn(async () => {}), editMessage: vi.fn(async () => {}) };
+    sendFile: vi.fn(async () => {}),
+    findMessageByNonce: vi.fn(async () => ({ status: "absent" as const })),
+    editPanel: vi.fn(async () => {}), editMessage: vi.fn(async () => {}) };
   const config = { DATA_DIR: dir, REPOS_ROOT: "/synthetic", TURN_TIMEOUT_SECONDS: 60,
     DEFAULT_MODEL: "test", REPO_EMOJIS: new Map(), SEAM_TURN_RESUME_ENABLED: true,
     channelPresets: new Map(), threadPresets: new Map() };
@@ -184,9 +186,16 @@ describe("#250 human turn production pipeline, synthetic transport only", () => 
     const first = h.run(); await started;
     expect(h.store.turnAttempts.get("inbound-1")).toMatchObject({ state: "completed", deliveryDone: false });
     h.orch.suspendForRestart(); release(); await first;
+    h.adapter.findMessageByNonce.mockResolvedValueOnce({
+      status: "found",
+      message: { channel: { platform: "discord", id: "worker" }, id: "sent" },
+    });
     await h.run(h.make());
     expect(h.runtime.prompt).toHaveBeenCalledTimes(1);
     expect(h.store.turnAttempts.get("inbound-1")?.deliveryDone).toBe(true);
+    // Protects the send/SQLite-ack crash window; deleting nonce lookup causes a
+    // second visible result despite Discord already accepting the first.
+    expect(h.adapter.sendMessage).toHaveBeenCalledTimes(1);
   });
 
   it("recovers captured output after a delivery failure without provider reentry", async () => {
@@ -201,6 +210,110 @@ describe("#250 human turn production pipeline, synthetic transport only", () => 
     expect(h.adapter.sendMessage.mock.calls.at(-1)?.[1]).toBe("saved answer");
     expect(h.store.getInbound("1")?.state).toBe("completed");
     expect(h.store.turnAttempts.get("inbound-1")?.deliveryDone).toBe(true);
+    const firstDelivery = h.adapter.sendMessage.mock.calls[0]?.[2];
+    const replayDelivery = h.adapter.sendMessage.mock.calls.at(-1)?.[2];
+    // Protects server-side dedup on the lookup/replay race; deleting this
+    // equality reintroduces at-least-once duplicate delivery.
+    expect(replayDelivery).toEqual(firstDelivery);
+    expect(replayDelivery).toMatchObject({ enforceNonce: true });
+  });
+
+  it("confirms a Discord-accepted nonce after crashing before delivery_done", async () => {
+    const h = setup();
+    h.runtime.prompt.mockImplementationOnce(async () => {
+      await h.emit("accepted exactly once");
+      return { stopReason: "end_turn" };
+    });
+    const realMark = h.store.turnAttempts.markDeliveryDone.bind(h.store.turnAttempts);
+    vi.spyOn(h.store.turnAttempts, "markDeliveryDone")
+      .mockImplementationOnce(() => { throw new Error("synthetic crash after Discord accept"); })
+      .mockImplementation(realMark);
+
+    await expect(h.run()).rejects.toThrow("synthetic crash after Discord accept");
+    const receipt = h.store.turnAttempts.get("inbound-1")!;
+    expect(receipt).toMatchObject({
+      state: "completed",
+      deliveryDone: false,
+      deliveryPayload: { kind: "message", text: "accepted exactly once" },
+    });
+    h.adapter.findMessageByNonce.mockResolvedValueOnce({
+      status: "found",
+      message: { channel: { platform: "discord", id: "worker" }, id: "accepted" },
+    });
+
+    await h.make().recoverInterruptedTurns();
+
+    expect(h.runtime.prompt).toHaveBeenCalledTimes(1);
+    expect(h.adapter.findMessageByNonce).toHaveBeenCalledWith(
+      { platform: "discord", id: "worker" },
+      receipt.deliveryNonce,
+      expect.any(Number)
+    );
+    // Protects against replay after Discord accepted but SQLite did not; if
+    // deleted, this exact crash produces the duplicate described in #305.
+    expect(h.adapter.sendMessage).toHaveBeenCalledTimes(1);
+    expect(h.store.turnAttempts.get("inbound-1")?.deliveryDone).toBe(true);
+    expect(h.store.getInbound("1")?.state).toBe("completed");
+  });
+
+  it("explicitly abandons a legacy captured result that has no nonce receipt", async () => {
+    const h = setup();
+    const attempt = h.store.turnAttempts.get("inbound-1");
+    expect(attempt).toBeNull();
+    h.store.turnAttempts.registerOwner("legacy-boot");
+    const legacy = h.store.turnAttempts.claim({
+      id: "inbound-1", target: "worker", prompt: "legacy", session: "live",
+      kind: "parked", createdUtc: new Date().toISOString(),
+    }, "legacy-identity", "legacy-boot", "inbound");
+    h.store.turnAttempts.complete(legacy, {
+      id: legacy.id, target: "worker", status: "completed", output: "maybe sent",
+      finishedUtc: new Date().toISOString(),
+    });
+    // Simulate a pre-#305 row: the migration defaults existing attempts to 0.
+    (h.store as any).db.prepare("UPDATE turn_attempts SET delivery_protocol=0 WHERE id=?").run(legacy.id);
+
+    await h.make().recoverInterruptedTurns();
+
+    expect(h.store.turnAttempts.get(legacy.id)).toMatchObject({
+      deliveryDone: false,
+      deliveryAbandonedReason: expect.stringContaining("predates nonce-backed"),
+    });
+    expect(h.store.getInbound("1")?.state).toBe("completed");
+    // Protects legacy users from an unprovable duplicate; deleting this check
+    // turns old ambiguity into an unsolicited replay.
+    expect(h.adapter.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("makes an indeterminate Discord history search terminal and actionable", async () => {
+    const h = setup();
+    h.runtime.prompt.mockImplementationOnce(async () => {
+      await h.emit("accepted but too old to scan");
+      return { stopReason: "end_turn" };
+    });
+    const realMark = h.store.turnAttempts.markDeliveryDone.bind(h.store.turnAttempts);
+    vi.spyOn(h.store.turnAttempts, "markDeliveryDone")
+      .mockImplementationOnce(() => { throw new Error("synthetic post-send crash"); })
+      .mockImplementation(realMark);
+    await h.run().catch(() => {});
+    h.adapter.findMessageByNonce.mockResolvedValueOnce({
+      status: "indeterminate",
+      reason: "Discord nonce search exceeded 5000 messages",
+    });
+
+    const recovered = h.make();
+    await recovered.recoverInterruptedTurns();
+    const attempt = h.store.turnAttempts.get("inbound-1")!;
+    expect(h.store.turnAttempts.isDeliveryResolved(attempt.id)).toBe(true);
+    expect(attempt.deliveryAbandonedReason).toBe("Discord nonce search exceeded 5000 messages");
+    const inventory = await (recovered as any).collectInterruptedRows();
+    // Protects operator visibility for bounded-search exhaustion; deleting it
+    // turns a safe refusal back into an invisible recurring warning.
+    expect(inventory).toContainEqual(expect.objectContaining({
+      id: "inbound-1",
+      status: "abandoned",
+      reason: "Discord nonce search exceeded 5000 messages",
+    }));
+    expect(h.adapter.sendMessage).toHaveBeenCalledTimes(1);
   });
 
   it("new user input durably cancels the old execution before its late outcome", async () => {

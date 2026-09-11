@@ -1,6 +1,7 @@
 import type Database from "better-sqlite3";
 import type { DispatchResult, DispatchSpec } from "./types.js";
 import { compareExecutionIdentity } from "./execution-identity.js";
+import { deliveryNonce, type DurableDeliveryPayload } from "./delivery-proof.js";
 import { isProcessOwner, processOwner, provenDead, type ProcessOwner } from "./process-owner.js";
 
 function recordedOwner(raw: string | undefined): ProcessOwner | null {
@@ -30,6 +31,12 @@ export interface TurnAttempt {
   providerIdentity: string | null;
   source: "dispatch" | "inbound" | "schedule";
   deliveryDone: boolean;
+  deliveryProtocol: boolean;
+  deliveryNonce: string | null;
+  deliveryChannel: string | null;
+  deliveryPayload: DurableDeliveryPayload | null;
+  deliveryStartedUtc: string | null;
+  deliveryAbandonedReason: string | null;
   updatedUtc: string;
   /** Durable quarantine metadata for a recovery attempt that was retained
    * after startup readiness. The execution remains suspended and can only be
@@ -67,6 +74,12 @@ export class TurnAttemptStore {
     for (const ddl of [
       "ALTER TABLE turn_attempts ADD COLUMN source TEXT NOT NULL DEFAULT 'dispatch'",
       "ALTER TABLE turn_attempts ADD COLUMN delivery_done INTEGER NOT NULL DEFAULT 0",
+      "ALTER TABLE turn_attempts ADD COLUMN delivery_protocol INTEGER NOT NULL DEFAULT 0",
+      "ALTER TABLE turn_attempts ADD COLUMN delivery_nonce TEXT",
+      "ALTER TABLE turn_attempts ADD COLUMN delivery_channel TEXT",
+      "ALTER TABLE turn_attempts ADD COLUMN delivery_payload_json TEXT",
+      "ALTER TABLE turn_attempts ADD COLUMN delivery_started_utc TEXT",
+      "ALTER TABLE turn_attempts ADD COLUMN delivery_abandoned_reason TEXT",
       "ALTER TABLE turn_attempts ADD COLUMN stalled_utc TEXT",
       "ALTER TABLE turn_attempts ADD COLUMN stalled_reason TEXT",
       "ALTER TABLE turn_attempts ADD COLUMN stall_notice_utc TEXT",
@@ -97,7 +110,10 @@ export class TurnAttemptStore {
       { id: string; generation: number; owner_boot: string; state: TurnAttempt["state"];
         identity: string; spec_json: string; acp_session_id: string | null;
         prompt_started: number; outcome_json: string | null; runtime_json: string | null; provider_identity: string | null;
-        source: TurnAttempt["source"]; delivery_done: number; updated_utc: string;
+        source: TurnAttempt["source"]; delivery_done: number; delivery_protocol: number; updated_utc: string;
+        delivery_nonce: string | null; delivery_channel: string | null;
+        delivery_payload_json: string | null; delivery_started_utc: string | null;
+        delivery_abandoned_reason: string | null;
         stalled_utc: string | null; stalled_reason: string | null; stall_notice_utc: string | null } | undefined;
     return row ? {
       id: row.id, generation: row.generation, ownerBoot: row.owner_boot,
@@ -107,6 +123,12 @@ export class TurnAttemptStore {
       runtimeOwner: row.runtime_json ? JSON.parse(row.runtime_json) : null,
       providerIdentity: row.provider_identity,
       source: row.source, deliveryDone: row.delivery_done === 1,
+      deliveryProtocol: row.delivery_protocol === 1,
+      deliveryNonce: row.delivery_nonce,
+      deliveryChannel: row.delivery_channel,
+      deliveryPayload: row.delivery_payload_json ? JSON.parse(row.delivery_payload_json) : null,
+      deliveryStartedUtc: row.delivery_started_utc,
+      deliveryAbandonedReason: row.delivery_abandoned_reason,
       updatedUtc: row.updated_utc,
       stalledUtc: row.stalled_utc,
       stalledReason: row.stalled_reason,
@@ -148,8 +170,8 @@ export class TurnAttemptStore {
           .run(ownerBoot, new Date().toISOString(), spec.id);
       } else {
         this.db.prepare(`INSERT INTO turn_attempts
-          (id,generation,owner_boot,state,identity,spec_json,updated_utc,source)
-          VALUES (?,1,?,'active',?,?,?,?)`)
+          (id,generation,owner_boot,state,identity,spec_json,updated_utc,source,delivery_protocol)
+          VALUES (?,1,?,'active',?,?,?,?,1)`)
           .run(spec.id, ownerBoot, identity, JSON.stringify(spec), new Date().toISOString(), source);
       }
       return this.get(spec.id)!;
@@ -200,10 +222,60 @@ export class TurnAttemptStore {
       .run(JSON.stringify(outcome), new Date().toISOString(), a.id, a.generation, a.ownerBoot).changes === 1;
   }
 
-  /** Acknowledges captured human output, never reopens provider execution.
-   * Send-before-ack is at-least-once across an external delivery crash gap. */
+  /** Record the exact terminal create-message before it can reach Discord. */
+  prepareDelivery(
+    id: string,
+    channel: string,
+    payload: DurableDeliveryPayload,
+    now = new Date().toISOString()
+  ): { nonce: string; startedUtc: string } {
+    const current = this.get(id);
+    // Protects against attaching delivery proof to unfinished/replaced work;
+    // deleting this check lets an obsolete attempt acknowledge a winner.
+    if (!current || current.state !== "completed") {
+      throw new DispatchSuspendedError(id);
+    }
+    const nonce = current.deliveryNonce ?? deliveryNonce(id);
+    const serialized = JSON.stringify(payload);
+    // Protects against replaying a different body under an already-used nonce;
+    // deleting this check lets Discord dedup hide payload substitution.
+    if (
+      current.deliveryNonce &&
+      (current.deliveryChannel !== channel || JSON.stringify(current.deliveryPayload) !== serialized)
+    ) {
+      throw new Error(`delivery receipt mismatch for ${id}`);
+    }
+    const startedUtc = current.deliveryStartedUtc ?? now;
+    this.db.prepare(`UPDATE turn_attempts SET delivery_nonce=?, delivery_channel=?,
+      delivery_payload_json=?, delivery_started_utc=?, delivery_abandoned_reason=NULL,
+      updated_utc=? WHERE id=? AND state='completed' AND delivery_done=0`)
+      .run(nonce, channel, serialized, startedUtc, now, id);
+    return { nonce, startedUtc };
+  }
+
+  /** Acknowledges captured output after Discord evidence or enforced replay. */
   markDeliveryDone(id: string): void {
-    this.db.prepare("UPDATE turn_attempts SET delivery_done=1 WHERE id=? AND state='completed'").run(id);
+    this.db.prepare(`UPDATE turn_attempts SET delivery_done=1,
+      delivery_abandoned_reason=NULL, updated_utc=? WHERE id=? AND state='completed'`)
+      .run(new Date().toISOString(), id);
+  }
+
+  /** Terminal refusal for a completed payload whose delivery cannot be proven safely. */
+  abandonDelivery(id: string, reason: string, now = new Date().toISOString()): boolean {
+    return this.db.prepare(`UPDATE turn_attempts SET delivery_abandoned_reason=?, updated_utc=?
+      WHERE id=? AND state='completed' AND delivery_done=0 AND delivery_abandoned_reason IS NULL`)
+      .run(reason, now, id).changes === 1;
+  }
+
+  isDeliveryResolved(id: string): boolean {
+    const row = this.db.prepare(`SELECT state,delivery_done,delivery_abandoned_reason
+      FROM turn_attempts WHERE id=?`).get(id) as
+      { state: TurnAttempt["state"]; delivery_done: number; delivery_abandoned_reason: string | null } | undefined;
+    return Boolean(
+      row &&
+      (row.state === "cancelled" ||
+        (row.state === "completed" && (row.delivery_done === 1 || row.delivery_abandoned_reason !== null)))
+    );
   }
 
   /** Quarantine a retained recovery without terminalizing or replaying it.

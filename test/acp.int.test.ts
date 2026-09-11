@@ -3,11 +3,14 @@ import { spawnSync } from "node:child_process";
 import { AgentRuntime } from "../packages/core/src/agents/agent-runtime.js";
 import { makeCopilotProfile } from "@seam/adapters";
 import { logger } from "../packages/core/src/lib/logger.js";
+import { shouldRunLiveAcpTest } from "./test-suite-boundary.js";
 
-const copilotInstalled =
-  spawnSync("which", ["copilot"], { encoding: "utf8" }).status === 0;
+const liveAcpEnabled = shouldRunLiveAcpTest(
+  process.env.SEAM_LIVE_ACP,
+  () => spawnSync("which", ["copilot"], { encoding: "utf8" }).status === 0
+);
 
-const maybe = copilotInstalled ? describe : describe.skip;
+const maybe = liveAcpEnabled ? describe : describe.skip;
 
 maybe("AgentRuntime against `copilot --acp` (integration)", () => {
   it(

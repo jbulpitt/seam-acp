@@ -11221,18 +11221,36 @@ export class Orchestrator {
       const target: ChannelRef = { platform: PLATFORM,
         id: row.sessionMode === "live" ? row.channelRef : row.targetChannel || row.channelRef };
       if (await this.checkResumePreconditions(target) !== "ok") return;
-      if (attempt.deliveryAbandonedReason) {
+      const settleDelivery = async (
+        resolution: "delivered" | "abandoned",
+        reason?: string
+      ): Promise<void> => {
+        this.patchScheduledStatus(
+          row.id,
+          resolution === "delivered" ? "ok" : `abandoned: ${reason ?? "delivery unresolved"}`
+        );
         this.store.scheduledOccurrences.settle(occurrence.id);
+        if (row.sessionMode === "live") {
+          await finishLiveTurn(this.config.DATA_DIR, {
+            id: occurrence.id,
+            status: resolution === "delivered" ? "completed" : "abandoned",
+            channelRef: row.channelRef,
+            finishedUtc: new Date().toISOString(),
+            ...(reason ? { reason } : {}),
+          });
+        }
+      };
+      if (attempt.deliveryAbandonedReason) {
+        await settleDelivery("abandoned", attempt.deliveryAbandonedReason);
         return;
       }
       if (attempt.deliveryNonce) {
         const resolution = await this.recoverRecordedDelivery(attempt, target);
         if (resolution === "deferred") return;
-        this.patchScheduledStatus(
-          row.id,
-          resolution === "delivered" ? "ok" : `abandoned: ${this.store.turnAttempts.get(attempt.id)?.deliveryAbandonedReason ?? "delivery unresolved"}`
+        await settleDelivery(
+          resolution,
+          this.store.turnAttempts.get(attempt.id)?.deliveryAbandonedReason ?? undefined
         );
-        this.store.scheduledOccurrences.settle(occurrence.id);
         return;
       }
       // Protects live scheduled streams whose final nonce was never planned;
@@ -11242,8 +11260,10 @@ export class Orchestrator {
           attempt.id,
           "completed live schedule has no terminal nonce receipt; partial delivery cannot be excluded"
         );
-        this.patchScheduledStatus(row.id, "abandoned: delivery proof unavailable");
-        this.store.scheduledOccurrences.settle(occurrence.id);
+        await settleDelivery(
+          "abandoned",
+          "completed live schedule has no terminal nonce receipt; partial delivery cannot be excluded"
+        );
         return;
       }
       // Protects old send-without-receipt attempts from unsafe replay; deleting
@@ -11253,8 +11273,10 @@ export class Orchestrator {
           attempt.id,
           "completed scheduled output predates nonce-backed delivery receipts"
         );
-        this.patchScheduledStatus(row.id, "abandoned: delivery proof unavailable");
-        this.store.scheduledOccurrences.settle(occurrence.id);
+        await settleDelivery(
+          "abandoned",
+          "completed scheduled output predates nonce-backed delivery receipts"
+        );
         return;
       }
       const result = attempt.outcome;

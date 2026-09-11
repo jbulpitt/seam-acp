@@ -407,6 +407,7 @@ export class SessionStore {
     this.db.exec(PARKED_PROMPTS_SCHEMA);
     this.db.exec(INBOUND_ADMISSIONS_SCHEMA);
     this.db.exec(ELICITATIONS_SCHEMA);
+    this.migrateAsyncElicitationState();
     this.migrateParkedKind();
     this.db.exec(CHOICE_CARDS_SCHEMA);
     this.migrateChoiceIngest();
@@ -436,6 +437,20 @@ export class SessionStore {
     this.migratePresetsScope();
     this.migratePresetRole();
     try { this.db.exec("ALTER TABLE sessions ADD COLUMN name_prefix TEXT"); } catch { /* exists */ }
+  }
+
+  private migrateAsyncElicitationState(): void {
+    for (const ddl of [
+      "ALTER TABLE elicitations ADD COLUMN source_kind TEXT NOT NULL DEFAULT 'request'",
+      "ALTER TABLE elicitations ADD COLUMN answer_message_id TEXT",
+      "ALTER TABLE inbound_admissions ADD COLUMN expected_acp_session_id TEXT",
+      "ALTER TABLE inbound_admissions ADD COLUMN preemptive INTEGER NOT NULL DEFAULT 1",
+    ]) {
+      try { this.db.exec(ddl); } catch { /* column already exists */ }
+    }
+    this.db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_elicitation_codex_async
+      ON elicitations(session_record_id, request_correlation)
+      WHERE source_kind = 'codex_async'`);
   }
 
   /** Additive V2 migration over the shipped V1 compatibility tables. */
@@ -1229,13 +1244,15 @@ export class SessionStore {
         .prepare(
           `INSERT INTO elicitations (
              id, session_record_id, platform, channel_ref, parent_ref,
-             authorized_user_id, acp_session_id, request_correlation, mode,
+             authorized_user_id, acp_session_id, request_correlation, source_kind,
+             answer_message_id, mode,
              elicitation_id, request_json, values_json, completed_pages_json,
              current_page, status, message_id, lease_token, lease_expires_utc,
              terminal_detail, created_utc, updated_utc, expires_utc
            ) VALUES (
              @id, @sessionRecordId, @platform, @channelRef, @parentRef,
-             @authorizedUserId, @acpSessionId, @requestCorrelation, @mode,
+             @authorizedUserId, @acpSessionId, @requestCorrelation, @source,
+             @answerMessageId, @mode,
              @elicitationId, @requestJson, @valuesJson, @completedPagesJson,
              @currentPage, @status, @messageId, @leaseToken, @leaseExpiresUtc,
              @terminalDetail, @createdUtc, @updatedUtc, @expiresUtc
@@ -1261,6 +1278,37 @@ export class SessionStore {
       .prepare<[string], ElicitationDbRow>("SELECT * FROM elicitations WHERE id = ?")
       .get(id);
     return row ? mapElicitation(row) : null;
+  }
+
+  getCodexAsyncElicitation(sessionRecordId: string, correlation: string): ElicitationRow | null {
+    const row = this.db
+      .prepare<[string, string], ElicitationDbRow>(
+        `SELECT * FROM elicitations
+          WHERE session_record_id = ? AND source_kind = 'codex_async'
+            AND request_correlation = ? LIMIT 1`
+      )
+      .get(sessionRecordId, correlation);
+    return row ? mapElicitation(row) : null;
+  }
+
+  /** Claim one async card answer exactly once while retaining its values until
+   * the synthetic inbound admission is durable. */
+  claimCodexAsyncElicitationAnswer(
+    id: string,
+    answerMessageId: string,
+    valuesJson: string,
+    nowUtc: string,
+    leaseToken?: string
+  ): ElicitationRow | null {
+    const changed = this.db.prepare(
+      `UPDATE elicitations
+          SET answer_message_id = ?, values_json = ?, updated_utc = ?,
+              lease_token = NULL, lease_expires_utc = NULL
+        WHERE id = ? AND status = 'open' AND source_kind = 'codex_async'
+          AND answer_message_id IS NULL
+          AND (? IS NULL OR lease_token = ?)`
+    ).run(answerMessageId, valuesJson, nowUtc, id, leaseToken ?? null, leaseToken ?? null).changes;
+    return changed === 1 ? this.getElicitation(id) : null;
   }
 
   listOpenElicitations(): ElicitationRow[] {
@@ -2608,34 +2656,38 @@ export class SessionStore {
           `INSERT OR IGNORE INTO inbound_admissions
              (message_id, platform, channel_ref, parent_ref, session_record_id,
               author_id, author_name, prompt, attachments_json, state,
-              queue_epoch, created_utc, updated_utc)
+              queue_epoch, created_utc, updated_utc, expected_acp_session_id, preemptive)
            VALUES
              (@messageId, @platform, @channelRef, @parentRef, @sessionRecordId,
               @authorId, @authorName, @text, @attachmentsJson, 'pending',
-              NULL, @createdUtc, @createdUtc)`
+              NULL, @createdUtc, @createdUtc, @expectedAcpSessionId, @preemptive)`
         )
         .run({
           ...input,
           parentRef: input.parentRef ?? null,
           authorName: input.authorName ?? null,
           attachmentsJson: JSON.stringify(input.attachments ?? []),
+          expectedAcpSessionId: input.expectedAcpSessionId ?? null,
+          preemptive: input.preemptive === false ? 0 : 1,
         });
-      if (result.changes !== 1) return false;
+        if (result.changes !== 1) return false;
       // A normal Discord message is a priority replacement, not FIFO. Make
       // that intent durable in the same commit as the new admission so boot
       // recovery cannot resurrect the turn it superseded.
-      for (const old of this.db.prepare(`SELECT message_id FROM inbound_admissions
-        WHERE channel_ref=? AND message_id<>? AND state IN ('pending','running')`)
-        .all(input.channelRef, input.messageId) as { message_id: string }[]) {
-        this.turnAttempts.cancel(inboundAttemptId(old.message_id));
+      if (input.preemptive !== false) {
+        for (const old of this.db.prepare(`SELECT message_id FROM inbound_admissions
+          WHERE channel_ref=? AND message_id<>? AND state IN ('pending','running')`)
+          .all(input.channelRef, input.messageId) as { message_id: string }[]) {
+          this.turnAttempts.cancel(inboundAttemptId(old.message_id));
+        }
+        this.db
+          .prepare(
+            `UPDATE inbound_admissions SET state = 'completed', updated_utc = ?
+             WHERE channel_ref = ? AND message_id <> ?
+               AND state IN ('pending','running')`
+          )
+          .run(input.createdUtc, input.channelRef, input.messageId);
       }
-      this.db
-        .prepare(
-          `UPDATE inbound_admissions SET state = 'completed', updated_utc = ?
-           WHERE channel_ref = ? AND message_id <> ?
-             AND state IN ('pending','running')`
-        )
-        .run(input.createdUtc, input.channelRef, input.messageId);
       return true;
     });
     return admit();
@@ -7238,6 +7290,8 @@ CREATE TABLE IF NOT EXISTS inbound_admissions (
   attachments_json  TEXT NOT NULL DEFAULT '[]',
   state             TEXT NOT NULL CHECK (state IN ('pending','running','completed')),
   queue_epoch       INTEGER,
+  expected_acp_session_id TEXT,
+  preemptive        INTEGER NOT NULL DEFAULT 1,
   created_utc       TEXT NOT NULL,
   updated_utc       TEXT NOT NULL
 );
@@ -7257,6 +7311,8 @@ CREATE TABLE IF NOT EXISTS elicitations (
   authorized_user_id       TEXT NOT NULL,
   acp_session_id           TEXT,
   request_correlation      TEXT NOT NULL,
+  source_kind              TEXT NOT NULL DEFAULT 'request',
+  answer_message_id        TEXT,
   mode                     TEXT NOT NULL CHECK (mode IN ('form','url')),
   elicitation_id           TEXT,
   request_json             TEXT NOT NULL,
@@ -7291,6 +7347,8 @@ interface ElicitationDbRow {
   authorized_user_id: string;
   acp_session_id: string | null;
   request_correlation: string;
+  source_kind: "request" | "codex_async";
+  answer_message_id: string | null;
   mode: "form" | "url";
   elicitation_id: string | null;
   request_json: string;
@@ -7316,6 +7374,8 @@ const mapElicitation = (row: ElicitationDbRow): ElicitationRow => ({
   authorizedUserId: row.authorized_user_id,
   acpSessionId: row.acp_session_id,
   requestCorrelation: row.request_correlation,
+  source: row.source_kind,
+  answerMessageId: row.answer_message_id,
   mode: row.mode,
   elicitationId: row.elicitation_id,
   requestJson: row.request_json,
@@ -7344,6 +7404,8 @@ interface InboundAdmissionRow {
   attachments_json: string;
   state: "pending" | "running" | "completed";
   queue_epoch: number | null;
+  expected_acp_session_id: string | null;
+  preemptive: number;
   created_utc: string;
   updated_utc: string;
 }
@@ -7383,6 +7445,8 @@ const mapInboundAdmission = (r: InboundAdmissionRow): InboundAdmission => ({
   queueEpoch: r.queue_epoch,
   createdUtc: r.created_utc,
   updatedUtc: r.updated_utc,
+  expectedAcpSessionId: r.expected_acp_session_id,
+  preemptive: r.preemptive !== 0,
 });
 
 /** Defensive parse of the stored hops array — a corrupt row degrades to an

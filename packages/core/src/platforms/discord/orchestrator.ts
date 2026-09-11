@@ -336,7 +336,10 @@ const VOICE_CONSOLE_DURABLE_ACTIONS: ReadonlySet<string> = new Set([
 ]);
 import type { SessionStore } from "../../core/session-store.js";
 import { makeSessionId } from "../../core/session-store.js";
-import { ElicitationManager } from "../../core/elicitation/manager.js";
+import {
+  ElicitationManager,
+  type CodexAsyncAnswerDelivery,
+} from "../../core/elicitation/manager.js";
 import type { InboundAdmission } from "../../core/inbound-admission/types.js";
 import { SessionRouter, resolveSessionCwd, simpleCardGifForRender, statusCardStyleForRender } from "../../core/session-router.js";
 import {
@@ -1019,6 +1022,7 @@ export class Orchestrator {
       adapter: this.adapter,
       logger: this.logger,
       currentUserId: (channelRef) => this.currentAuthorIds.get(channelRef),
+      onCodexAsyncAnswer: (delivery) => this.admitCodexAsyncAnswer(delivery),
     });
     this.router.setElicitationHandlers?.({
       create: (record, request, context) => this.elicitations.create(record, request, context),
@@ -2467,13 +2471,25 @@ export class Orchestrator {
   /** Enqueue an already-durable row without passing back through duplicate
    * admission. Used at boot and by localized recovery. */
   private startRecoveredInbound(row: InboundAdmission): void {
-    const myGen = (this.channelGenerations.get(row.channelRef) ?? 0) + 1;
-    this.channelGenerations.set(row.channelRef, myGen);
+    const myGen = row.preemptive
+      ? (this.channelGenerations.get(row.channelRef) ?? 0) + 1
+      : this.channelGenerations.get(row.channelRef) ?? 0;
+    if (row.preemptive) this.channelGenerations.set(row.channelRef, myGen);
     const msg = this.inboundMessage(row);
     void this.queueOnChannel(row.channelRef, async (fence) => {
-      if ((this.channelGenerations.get(row.channelRef) ?? 0) > myGen) return;
+      if (row.preemptive && (this.channelGenerations.get(row.channelRef) ?? 0) > myGen) return;
       if (!this.store.claimInbound(row.messageId, fence.epoch, new Date().toISOString())) return;
       try {
+        const current = this.store.get(row.sessionRecordId);
+        if (row.expectedAcpSessionId &&
+            (!current || current.acpSessionId !== row.expectedAcpSessionId)) {
+          this.logger.info(
+            { sessionId: row.sessionRecordId, messageId: row.messageId },
+            "async answer refused because the originating ACP session changed"
+          );
+          this.store.completeInbound(row.messageId, fence.epoch, new Date().toISOString());
+          return;
+        }
         await this.handleIncomingMessageInner(msg, fence);
       } finally {
         if (this.queueFenceCurrent(fence) && this.inboundExecutionTerminal(row.messageId)) {
@@ -2488,6 +2504,37 @@ export class Orchestrator {
         );
       }
     });
+  }
+
+  private async admitCodexAsyncAnswer(delivery: CodexAsyncAnswerDelivery): Promise<boolean> {
+    const { row } = delivery;
+    if (!/^\d+$/.test(delivery.interactionId) || !row.acpSessionId) return false;
+    const current = this.store.get(row.sessionRecordId);
+    if (!current || current.platform !== row.platform || current.channelRef !== row.channelRef ||
+        current.acpSessionId !== row.acpSessionId) return false;
+    const input = {
+      messageId: delivery.interactionId,
+      platform: row.platform,
+      channelRef: row.channelRef,
+      parentRef: row.parentRef,
+      sessionRecordId: row.sessionRecordId,
+      authorId: row.authorizedUserId,
+      authorName: delivery.authorName ?? null,
+      text: delivery.prompt,
+      attachments: [],
+      expectedAcpSessionId: row.acpSessionId,
+      preemptive: false,
+      createdUtc: new Date().toISOString(),
+    };
+    const inserted = this.store.admitInbound(input);
+    const admission = this.store.getInbound(delivery.interactionId);
+    if (!admission || admission.platform !== input.platform ||
+        admission.channelRef !== input.channelRef ||
+        admission.sessionRecordId !== input.sessionRecordId ||
+        admission.authorId !== input.authorId || admission.text !== input.text ||
+        admission.expectedAcpSessionId !== input.expectedAcpSessionId || admission.preemptive) return false;
+    if (inserted || admission.state === "pending") this.startRecoveredInbound(admission);
+    return true;
   }
 
   /**
@@ -3571,6 +3618,10 @@ export class Orchestrator {
           );
         }
         switch (event.kind) {
+          case "async-user-input": {
+            await this.elicitations.createCodexAsync(record, event);
+            return;
+          }
           case "agent-text": {
             refreshTyping();
             // Detect Copilot CLI retry: either the agent emits a "Retrying"

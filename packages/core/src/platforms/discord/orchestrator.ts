@@ -4754,6 +4754,9 @@ export class Orchestrator {
     if (slashGroup === "catalog") {
       return this.cmdCatalogRefresh(interaction);
     }
+    if (slashGroup === "restrictions") {
+      return this.cmdAgentChannelRestrictions(interaction);
+    }
     if (interaction.options.getSubcommandGroup(false) === "preset") {
       return this.cmdPreset(interaction);
     }
@@ -5001,6 +5004,9 @@ export class Orchestrator {
       this.logger.debug({ agent: record.agentId }, "auto-compact skipped: missing manager methods");
       return;
     }
+    // #308: protects unattended auto-compaction from reusing a barred agent;
+    // deleting it lets an internal follow-up run outside the channel rule.
+    this.router.assertAgentAllowedForRecord(record, profile.id);
 
     status.setState("Working");
     status.setAction("Auto-compacting context…");
@@ -5043,6 +5049,7 @@ export class Orchestrator {
         location,
         cwd,
         sessionId: record.acpSessionId,
+        restrictionChannelId: record.parentRef ?? record.channelRef,
       });
     } catch (err) {
       this.logger.warn({ err, session: record.id }, "auto-compact: seed build failed");
@@ -5057,7 +5064,7 @@ export class Orchestrator {
     // (the original session is preserved on disk).
     const acCfg = this.store.readConfig(record);
     const acNewId = await this.seedNewSession({
-      profile, cwd,
+      profile, restrictionChannelId: record.parentRef ?? record.channelRef, cwd,
       ...(acCfg.model ? { model: acCfg.model } : {}),
       ...(acCfg.reasoningEffort ? { effort: acCfg.reasoningEffort } : {}),
       summary: built.seed,
@@ -5177,6 +5184,23 @@ export class Orchestrator {
       const profile = opts.profile ?? this.profileForTarget(target);
       if (!profile) {
         return { text, error: "injectTurn: no agent profile for target", ...correlation };
+      }
+      const restrictionChannelId = target
+        ? isSessionRecord(target)
+          ? target.parentRef ?? target.channelRef
+          : target.parentId ?? target.id
+        : opts.restrictionChannelId;
+      // #308: protects target-less isolated runs (ingest/compaction) as well as
+      // session targets; deleting it lets an explicit profile bypass the router.
+      try {
+        this.router.assertAgentAllowedForChannel(profile.id, restrictionChannelId);
+      } catch (err) {
+        return settle({
+          text,
+          error: err instanceof Error ? err.message : String(err),
+          cause: err,
+          ...correlation,
+        });
       }
       const cwd =
         opts.cwd ??
@@ -5406,8 +5430,11 @@ export class Orchestrator {
       : this.store.get(makeSessionId(target.platform, target.id));
     if (!record) return undefined;
     const described = this.router.describeConfig(record);
-    return this.router.getProfile(
+    // #308: protects injectTurn's target profile resolution; deleting it lets
+    // an explicit isolated target bypass the channel allowlist.
+    return this.router.resolveProfileForChannel(
       described.agent?.value ?? record.agentId,
+      record.parentRef ?? record.channelRef,
       described.location?.value ?? resolveThreadLocation(this.config, record.channelRef)
     );
   }
@@ -5428,6 +5455,7 @@ export class Orchestrator {
       effort?: string;
       strictModel?: boolean;
       location?: string;
+      restrictionChannelId?: string;
     }
   ): RunAgent {
     const model = opts?.model ?? "default";
@@ -5463,6 +5491,7 @@ export class Orchestrator {
         const result = await this.injectTurn(null, actualPrompt, {
           session: "isolated",
           profile,
+          ...(opts?.restrictionChannelId ? { restrictionChannelId: opts.restrictionChannelId } : {}),
           sessionManager: manager,
           cwd,
           model,
@@ -5548,6 +5577,7 @@ export class Orchestrator {
     sessionId: string;
     cwd: string;
     channel?: ChannelRef;
+    restrictionChannelId?: string;
     onProgress?: (msg: string) => void;
   }): Promise<PremiumCompactionResult> {
     const { profile, manager, sessionId, cwd, channel, onProgress } = args;
@@ -5587,6 +5617,7 @@ export class Orchestrator {
     // whole point of this tier.
     const runAgent = this.makeCompactionRunAgent(profile, manager, {
       effort: this.compactionEffortFor(profile, "default", "premium"),
+      ...(args.restrictionChannelId ? { restrictionChannelId: args.restrictionChannelId } : {}),
     });
     return runPremiumCompaction({
       richHistory,
@@ -5611,6 +5642,7 @@ export class Orchestrator {
     sessionId: string;
     cwd: string;
     channel?: ChannelRef;
+    restrictionChannelId?: string;
     onProgress?: (msg: string) => void;
   }): Promise<PremiumCompactionResult> {
     const { sessionId, channel, onProgress } = args;
@@ -5695,6 +5727,7 @@ export class Orchestrator {
       model: DISCORD_COMPACTION_MODEL,
       strictModel: true,
       effort: this.compactionEffortFor(analysisProfile, DISCORD_COMPACTION_MODEL, "premium"),
+      ...(args.restrictionChannelId ? { restrictionChannelId: args.restrictionChannelId } : {}),
     });
     return runPremiumCompaction({
       richHistory,
@@ -5728,6 +5761,7 @@ export class Orchestrator {
     location: string;
     cwd: string;
     sessionId: string;
+    restrictionChannelId?: string;
     recentWindowTokens?: number;
     log?: (msg: string) => void;
   }): Promise<{ seed: string; keptTurns: number; summarizedTurns: number; pinnedCount: number } | null> {
@@ -5762,6 +5796,7 @@ export class Orchestrator {
       cwd,
       effort: this.compactionEffortFor(profile, compactionModel, "cheap", location),
       location,
+      ...(args.restrictionChannelId ? { restrictionChannelId: args.restrictionChannelId } : {}),
     });
 
     // Summary of the older prefix via the existing single-pass template.
@@ -5832,6 +5867,7 @@ export class Orchestrator {
    *  it and the original session is left intact (recoverable / deletable). */
   private async seedNewSession(args: {
     profile: AgentProfile;
+    restrictionChannelId: string;
     cwd: string;
     model?: string;
     effort?: string;
@@ -5839,7 +5875,10 @@ export class Orchestrator {
     /** `null` = seed text is already complete (Rebuild). Omit for compaction lead-in. */
     leadIn?: string | null;
   }): Promise<string> {
-    const { profile, cwd, model, effort, summary } = args;
+    const { profile, restrictionChannelId, cwd, model, effort, summary } = args;
+    // #308: protects compaction/rebuild seed turns; deleting it lets a direct
+    // AgentRuntime construction evade the same channel allowlist as dispatch.
+    this.router.assertAgentAllowedForChannel(profile.id, restrictionChannelId);
     let rt: AgentRuntime | undefined;
     try {
       rt = new AgentRuntime({ profile, logger: this.logger.child({ compaction: "seed" }), mcpServers: [] });
@@ -5964,6 +6003,7 @@ export class Orchestrator {
             sessionId,
             cwd,
             channel,
+            restrictionChannelId: record.parentRef ?? record.channelRef,
             ...(onProgress ? { onProgress } : {}),
           })
         : await this.runPremiumCompactionForSession({
@@ -5972,6 +6012,7 @@ export class Orchestrator {
             sessionId,
             cwd,
             channel,
+            restrictionChannelId: record.parentRef ?? record.channelRef,
             ...(onProgress ? { onProgress } : {}),
           });
 
@@ -5983,6 +6024,7 @@ export class Orchestrator {
     const cfg = this.store.readConfig(record);
     const newSessionId = await this.seedNewSession({
       profile,
+      restrictionChannelId: record.parentRef ?? record.channelRef,
       cwd,
       ...(cfg.model ? { model: cfg.model } : {}),
       ...(cfg.reasoningEffort ? { effort: cfg.reasoningEffort } : {}),
@@ -8634,9 +8676,16 @@ export class Orchestrator {
     const threadLocation = this.router.describeConfig?.(record).location?.value
       ?? resolveThreadLocation(this.config, spec.target);
     const requestedWorkerLocation = spec.location ?? threadLocation;
+    const restrictionChannelId = record.parentRef ?? record.channelRef;
+    // #308: protects handoff, forward, steer, parked, wake, and chain dispatch
+    // identities; deleting it lets that durable dispatch source run a barred agent.
     const agentOverride =
       spec.agentId ??
-      (!preset && spec.preset && this.router.getProfile(spec.preset, requestedWorkerLocation)
+      (!preset && spec.preset && this.router.resolveProfileForChannel(
+        spec.preset,
+        restrictionChannelId,
+        requestedWorkerLocation
+      )
         ? spec.preset
         : undefined);
     if (spec.preset && !preset && !agentOverride) {
@@ -8646,7 +8695,7 @@ export class Orchestrator {
     const workerLocation = effectiveSession === "live" ? threadLocation : spec.location ?? threadLocation;
     const requestedAgentId = preset?.agentId ?? agentOverride;
     const presetProfile = requestedAgentId
-      ? this.router.getProfile(requestedAgentId, workerLocation)
+      ? this.router.resolveProfileForChannel(requestedAgentId, restrictionChannelId, workerLocation)
       : undefined;
     if (requestedAgentId && !presetProfile) {
       throw new Error(`dispatch: unknown agent "${requestedAgentId}" at ${workerLocation}`);
@@ -9584,7 +9633,10 @@ export class Orchestrator {
       }
       const location = spec.location ?? endpoint?.location ?? LOCAL_LOCATION;
       agentId = preset?.agentId ?? spec.agentId ?? this.config.DEFAULT_AGENT;
-      const profile = this.router.getProfile(agentId, location);
+      const restrictionChannelId = endpoint?.authoringParentRef ?? notifyId;
+      // #308: protects public HTTP ingest before its synthetic turn starts;
+      // deleting it lets an endpoint run outside its authoring-channel rule.
+      const profile = this.router.resolveProfileForChannel(agentId, restrictionChannelId, location);
       if (!profile) {
         throw new Error(
           `dispatch ${spec.id}: ${this.refuseUnregisteredAgent(agentId, `unknown agent "${agentId}" at "${location}"`)}`
@@ -9726,6 +9778,7 @@ export class Orchestrator {
       result = await this.injectTurn(null, isResume ? CONTINUE_PROMPT : prompt, {
         session: "isolated",
         profile,
+        ...(restrictionChannelId ? { restrictionChannelId } : {}),
         cwd,
         ...isolatedSpawn,
         strictModel: true,
@@ -10984,7 +11037,18 @@ export class Orchestrator {
     | { ok: false; agentId: string; error: string } {
     const described = this.router.describeConfig(record);
     const agentId = described.agent.value;
-    const profile = this.router.getProfile(agentId, described.location.value);
+    // #308: protects scheduled fires before their isolated job is announced;
+    // deleting it lets a scheduled prompt bypass the shared agent resolver.
+    let profile: AgentProfile | undefined;
+    try {
+      profile = this.router.resolveProfileForChannel(
+        agentId,
+        record.parentRef ?? record.channelRef,
+        described.location.value
+      );
+    } catch (err) {
+      return { ok: false, agentId, error: err instanceof Error ? err.message : String(err) };
+    }
     if (!profile) {
       return {
         ok: false,
@@ -12083,6 +12147,95 @@ export class Orchestrator {
     }
     await i.editReply({
       content: `🗂️ Model catalog refresh finished.\n\n${lines.join("\n\n").slice(0, 1950)}`,
+    });
+  }
+
+  /** `/seamadmin restrictions` — immediate, audited runtime channel allowlists.
+   * This keeps the operator-only surface on the same stamped config-admin gate
+   * as catalog/rebuild rather than introducing a second authorization path. */
+  private async cmdAgentChannelRestrictions(i: ChatInputCommandInteraction): Promise<void> {
+    const admins = this.config.SEAM_CONFIG_ADMIN_USER_IDS;
+    if (admins && admins.size > 0 && !admins.has(i.user.id)) {
+      await i.reply({
+        content: "🔒 `/seamadmin restrictions` is config-admin-only.",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    const sub = i.options.getSubcommand(true);
+    if (sub === "list") {
+      const rules = this.configMutation.listAgentChannelRestrictions();
+      await i.reply({
+        content: rules.length === 0
+          ? "No agent channel restrictions are active."
+          : [
+              "Active agent channel restrictions:",
+              ...rules.map(
+                (rule) =>
+                  `• Agent \`${rule.agentId}\` — allowed only in ${rule.allowedChannelIds.map((id) => `<#${id}>`).join(", ")}`
+              ),
+            ].join("\n"),
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
+    const agentId = i.options.getString("agent", true).trim();
+    if (!agentId || /\s|@/.test(agentId)) {
+      await i.reply({
+        content: "Provide one configured agent id (without a host suffix).",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    const actor = { id: i.user.id, name: i.user.username };
+    if (sub === "clear") {
+      const cleared = this.configMutation.clearAgentChannelRestriction({ agentId, actor });
+      if (!cleared.ok) {
+        await i.reply({ content: `Restriction was not cleared: ${cleared.error}`, flags: MessageFlags.Ephemeral });
+        return;
+      }
+      await i.reply({
+        content: cleared.cleared
+          ? `Cleared the channel rule for agent \`${agentId}\` (audit \`${cleared.auditId}\`).`
+          : `Agent \`${agentId}\` has no active channel rule.`,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
+    if (sub !== "set") {
+      await i.reply({ content: `Unknown restrictions subcommand: ${sub}`, flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const rawChannels = i.options.getString("channels", true);
+    const allowedChannelIds = [...new Set(rawChannels.split(",").map((value) => {
+      const trimmed = value.trim();
+      const mention = /^<#(\d+)>$/.exec(trimmed);
+      return mention?.[1] ?? trimmed;
+    }).filter(isDiscordSnowflake))];
+    if (allowedChannelIds.length === 0) {
+      await i.reply({
+        content: "Provide at least one Discord channel id (or a comma-separated #channel mention).",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    const written = this.configMutation.setAgentChannelRestriction({
+      agentId,
+      allowedChannelIds,
+      actor,
+    });
+    if (!written.ok) {
+      await i.reply({ content: `Restriction was not saved: ${written.error}`, flags: MessageFlags.Ephemeral });
+      return;
+    }
+    await i.reply({
+      content:
+        `Agent \`${written.rule.agentId}\` is now allowed only in ` +
+        `${written.rule.allowedChannelIds.map((id) => `<#${id}>`).join(", ")} ` +
+        `(audit \`${written.auditId}\`).`,
+      flags: MessageFlags.Ephemeral,
     });
   }
 
@@ -16399,6 +16552,9 @@ export class Orchestrator {
     const compactLocation = compactBinding.location.value;
     const profile = this.router.getProfile(compactAgentId, compactLocation);
     if (!profile) throw new Error(`Agent profile "${record.agentId}" not found.`);
+    // #308: protects the direct Discord-history compactor; deleting it makes
+    // this temporary AgentRuntime a bypass around normal turn resolution.
+    this.router.assertAgentAllowedForRecord(record, profile.id);
     const manager = profile.sessionManager;
     if (!manager) {
       throw new Error(
@@ -16499,6 +16655,7 @@ export class Orchestrator {
       const rbCfg = this.store.readConfig(record);
       const newSessionId = await this.seedNewSession({
         profile,
+        restrictionChannelId: record.parentRef ?? record.channelRef,
         cwd,
         ...(rbCfg.model ? { model: rbCfg.model } : {}),
         ...(rbCfg.reasoningEffort ? { effort: rbCfg.reasoningEffort } : {}),
@@ -16755,6 +16912,7 @@ export class Orchestrator {
       const cwd = described.cwd.value;
       const newSessionId = await this.seedNewSession({
         profile,
+        restrictionChannelId: record.parentRef ?? record.channelRef,
         cwd,
         ...(destinationModel ? { model: destinationModel } : {}),
         ...(described.effort?.value ? { effort: described.effort.value } : {}),
@@ -17856,6 +18014,9 @@ export class Orchestrator {
                   sanitizedTranscript.substring(sanitizedTranscript.length - keepTail);
               }
 
+              // #308: protects the session-summary helper; deleting it allows
+              // its direct temporary runtime to bypass the channel rule.
+              this.router.assertAgentAllowedForRecord(record, profile.id);
               tempRuntime = new AgentRuntime({
                 profile,
                 logger: this.logger.child({ session: `temp-summary-${session.sessionId}` }),
@@ -18002,6 +18163,7 @@ export class Orchestrator {
                   location: sessionBinding.location,
                   cwd,
                   sessionId: session.sessionId,
+                  restrictionChannelId: record.parentRef ?? record.channelRef,
                 });
                 if (!built) throw new Error("Nothing to compact (empty transcript or no summarizer model).");
 
@@ -18009,7 +18171,7 @@ export class Orchestrator {
                 // (resumable) and leave the original intact.
                 const cfg = this.store.readConfig(record);
                 const newId = await this.seedNewSession({
-                  profile, cwd,
+                  profile, restrictionChannelId: record.parentRef ?? record.channelRef, cwd,
                   ...(cfg.model ? { model: cfg.model } : {}),
                   ...(cfg.reasoningEffort ? { effort: cfg.reasoningEffort } : {}),
                   summary: built.seed,
@@ -18191,6 +18353,9 @@ export class Orchestrator {
             );
             const compactionPrompt = `${promptTemplate}\n\nConversation Transcript:\n${sanitizedTranscript}`;
 
+            // #308: protects the import summarizer; deleting it allows this
+            // direct temporary runtime to bypass the channel rule.
+            this.router.assertAgentAllowedForRecord(record, profile.id);
             tempRuntime = new AgentRuntime({
               profile,
               logger: this.logger.child({ session: `temp-import-${session.sessionId}` }),
@@ -18218,7 +18383,7 @@ export class Orchestrator {
             // Seed a NEW resumable session (in the target cwd) with the summary.
             const imCfg = this.store.readConfig(record);
             const newSessionId = await this.seedNewSession({
-              profile, cwd: targetCwd,
+              profile, restrictionChannelId: record.parentRef ?? record.channelRef, cwd: targetCwd,
               ...(imCfg.model ? { model: imCfg.model } : {}),
               ...(imCfg.reasoningEffort ? { effort: imCfg.reasoningEffort } : {}),
               summary: summaryText,
@@ -18391,6 +18556,9 @@ export class Orchestrator {
               );
               const compactionPrompt = `${promptTemplate}\n\nConversation Transcript:\n${sanitizedTranscript}`;
 
+              // #308: protects the migration summarizer; deleting it allows
+              // this direct temporary runtime to bypass the channel rule.
+              this.router.assertAgentAllowedForRecord(record, profile.id);
               tempRuntime = new AgentRuntime({
                 profile,
                 logger: this.logger.child({ session: `temp-migrate-${session.sessionId}` }),
@@ -18422,6 +18590,7 @@ export class Orchestrator {
               // default model/effort) with the summary.
               const newSessionId = await this.seedNewSession({
                 profile: targetProfile,
+                restrictionChannelId: record.parentRef ?? record.channelRef,
                 cwd,
                 summary: summaryText,
               });

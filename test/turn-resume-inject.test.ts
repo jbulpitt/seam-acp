@@ -90,7 +90,8 @@ describe("injectTurn isolated resumeSessionId", () => {
     const profile = { id: "codex", defaultModel: "m", sessionManager: { deleteSession } } as any;
     const orch = new Orchestrator({ logger: silent, store, config: { REPOS_ROOT: dir, DATA_DIR: dir } as any,
       adapter: {} as any, renderer: {} as any, modelCatalog: fixtureModelCatalog([profile]),
-      router: { listProfiles: () => [], describeConfig: () => ({ location: { value: "local" } }) } as any });
+      router: { listProfiles: () => [], describeConfig: () => ({ location: { value: "local" } }),
+        assertAgentAllowedForChannel: () => {} } as any });
     let completed = false;
     await orch.injectTurn(record(), "disposable", { session: "isolated", profile, cwd: dir,
       lifecycle: { isCurrent: () => true, beforePrompt: () => {}, onOutcome: () => { completed = true; },
@@ -106,7 +107,8 @@ describe("injectTurn isolated resumeSessionId", () => {
       logger: silent, store, config: { REPOS_ROOT: dir, DATA_DIR: dir } as any,
       adapter: {} as any, renderer: {} as any,
       modelCatalog: fixtureModelCatalog([profile]),
-      router: { listProfiles: () => [], describeConfig: () => ({ location: { value: "local" } }) } as any,
+      router: { listProfiles: () => [], describeConfig: () => ({ location: { value: "local" } }),
+        assertAgentAllowedForChannel: () => {} } as any,
     });
     let active = true, completed = false;
     beforeOutcome = () => { active = false; };
@@ -134,7 +136,8 @@ describe("injectTurn isolated resumeSessionId", () => {
     const orch = new Orchestrator({
       logger: silent, store, config: { REPOS_ROOT: dir, DATA_DIR: dir } as any,
       adapter: {} as any, renderer: {} as any, modelCatalog: fixtureModelCatalog([profile]),
-      router: { listProfiles: () => [], describeConfig: () => ({ location: { value: "local" } }) } as any,
+      router: { listProfiles: () => [], describeConfig: () => ({ location: { value: "local" } }),
+        assertAgentAllowedForChannel: () => {} } as any,
     });
     await expect(orch.injectTurn(record(), "original", {
       session: "isolated", profile, cwd: dir,
@@ -163,6 +166,7 @@ describe("injectTurn isolated resumeSessionId", () => {
         describeConfig: () => ({ location: { value: "local" } }),
         ensureSessionRecord: () => record(),
         getProfile: () => ({ id: "claude", sessionManager: { deleteSession: async () => {} } }),
+        assertAgentAllowedForChannel: () => {},
         getOrStartRuntime: async () => {
           throw new Error("isolated must not use live runtime");
         },

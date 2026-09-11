@@ -301,6 +301,7 @@ async function fireSchedule(
   row: ScheduledPrompt,
   over: {
     describeConfig?: SessionRouter["describeConfig"];
+    resolveProfileForChannel?: (agentId: string, channelId: string, location?: string) => AgentProfile | undefined;
   } = {}
 ): Promise<FireCapture> {
   const jobs: FireCapture["jobs"] = [];
@@ -337,6 +338,8 @@ async function fireSchedule(
         harness.router.ensureSessionRecord(opts),
       describeConfig,
       getProfile,
+      resolveProfileForChannel: (agentId: string, _channelId: string, location?: string) =>
+        over.resolveProfileForChannel?.(agentId, _channelId, location) ?? getProfile(agentId, location),
       reuseMcpServers: () => [],
     },
     runIsolatedScheduledJob: vi.fn(async (args: FireCapture["jobs"][number]) => {
@@ -410,6 +413,18 @@ describe("#208 schedule builder inherits effective thread config", () => {
 });
 
 describe("#208 isolated fire re-resolves effective config", () => {
+  it("refuses a restricted scheduled fire before runIsolatedScheduledJob (#308)", async () => {
+    const refusal =
+      'Refused: agent "grok" cannot run in channel "111111111111111111". Rule: "grok" is allowed only in channel(s): allowed.';
+    const capture = await fireSchedule(harness, schedule(), {
+      resolveProfileForChannel: () => { throw new Error(refusal); },
+    });
+    expect(capture.jobs).toEqual([]);
+    expect(capture.statuses.join("\n")).toContain(refusal);
+    // Removing the scheduled identity resolver makes this exact fire reach
+    // runIsolatedScheduledJob, despite the restriction.
+  });
+
   it("invokes the effective agent/model/cwd, not stale session columns", async () => {
     harness.store.close();
     fs.rmSync(harness.dir, { recursive: true, force: true });

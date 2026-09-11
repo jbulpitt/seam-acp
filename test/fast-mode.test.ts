@@ -888,6 +888,7 @@ function ctrlHarness(opts: {
     router: {
       describeConfig,
       getProfile: (id) => byId.get(id),
+      assertAgentAllowedForRecord: () => {},
       invalidate: async (id) => {
         invalidated.push(id);
         if (opts.failRetire && invalidated.length > 1) {

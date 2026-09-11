@@ -25,6 +25,7 @@ import {
   type LedgerPatch,
   type ConfigAuditEntry,
   type ConfigAuditInput,
+  type AgentChannelRestriction,
   type SessionConfigState,
   type SessionRecord,
 } from "./types.js";
@@ -96,6 +97,14 @@ import type {
   ElicitationTerminalStatus,
   NewElicitationRow,
 } from "./elicitation/types.js";
+
+/** The latest audit row's readable state. `unreadable` is deliberately distinct
+ * from a missing or cleared rule so runtime enforcement can fail closed. */
+export type AgentChannelRestrictionLookup =
+  | { state: "absent" }
+  | { state: "cleared" }
+  | { state: "active"; rule: AgentChannelRestriction }
+  | { state: "unreadable" };
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS agy_identity_restore (
@@ -1980,6 +1989,55 @@ export class SessionStore {
       )
       .all(limit)
       .map(mapConfigAudit);
+  }
+
+  /** The latest audited rule is the runtime source of truth; no second
+   * configuration store exists for agent/channel restrictions (#308). */
+  getAgentChannelRestriction(agentId: string): AgentChannelRestriction | null {
+    const lookup = this.lookupAgentChannelRestriction(agentId);
+    return lookup.state === "active" ? lookup.rule : null;
+  }
+
+  /** One-row state lookup for runtime enforcement: an unreadable latest row
+   * remains distinguishable from a rule that was never set or was cleared. */
+  lookupAgentChannelRestriction(agentId: string): AgentChannelRestrictionLookup {
+    const row = this.db
+      .prepare<[string, string], ConfigAuditRow>(
+        `SELECT * FROM config_audit
+         WHERE tier = ? AND scope = ?
+         ORDER BY applied_utc DESC, rowid DESC LIMIT 1`
+      )
+      .get("agent-channel-restriction", `agent-channel-restriction:${agentId}`);
+    if (!row) return { state: "absent" };
+    const parsed = parseAgentChannelRestriction(row.after_json);
+    if (parsed.state === "active" && parsed.rule.agentId !== agentId) {
+      return { state: "unreadable" };
+    }
+    return parsed;
+  }
+
+  /** Current rules only: cleared rules remain in the immutable audit history. */
+  listAgentChannelRestrictions(): AgentChannelRestriction[] {
+    return this.db
+      .prepare<[string], ConfigAuditRow>(
+        `SELECT current.* FROM config_audit AS current
+         WHERE current.tier = ?
+           AND NOT EXISTS (
+             SELECT 1 FROM config_audit AS newer
+             WHERE newer.tier = current.tier
+               AND newer.scope = current.scope
+               AND (newer.applied_utc > current.applied_utc
+                 OR (newer.applied_utc = current.applied_utc AND newer.rowid > current.rowid))
+           )
+         ORDER BY current.scope ASC`
+      )
+      .all("agent-channel-restriction")
+      .flatMap((row) => {
+        const parsed = parseAgentChannelRestriction(row.after_json);
+        return parsed.state === "active" && row.scope === `agent-channel-restriction:${parsed.rule.agentId}`
+          ? [parsed.rule]
+          : [];
+      });
   }
 
   /**
@@ -6166,6 +6224,32 @@ const mapConfigAudit = (r: ConfigAuditRow): ConfigAuditEntry => ({
   correlationId: r.correlation_id,
   appliedUtc: r.applied_utc,
 });
+
+function parseAgentChannelRestriction(raw: string): Exclude<AgentChannelRestrictionLookup, { state: "absent" }> {
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") return { state: "unreadable" };
+    if (!Object.hasOwn(parsed, "restriction")) return { state: "unreadable" };
+    const value = (parsed as { restriction?: unknown }).restriction;
+    if (value === null) return { state: "cleared" };
+    if (!value || typeof value !== "object") return { state: "unreadable" };
+    const rule = value as { agentId?: unknown; allowedChannelIds?: unknown };
+    if (
+      typeof rule.agentId !== "string" ||
+      !Array.isArray(rule.allowedChannelIds) ||
+      rule.allowedChannelIds.length === 0 ||
+      !rule.allowedChannelIds.every((id): id is string => typeof id === "string" && id.length > 0)
+    ) {
+      return { state: "unreadable" };
+    }
+    return {
+      state: "active",
+      rule: { agentId: rule.agentId, allowedChannelIds: [...rule.allowedChannelIds] },
+    };
+  } catch {
+    return { state: "unreadable" };
+  }
+}
 
 // --- chains schema + row mapping (#25) --------------------------------------
 

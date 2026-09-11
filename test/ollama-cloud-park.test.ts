@@ -80,6 +80,7 @@ function stubProfile(id: string): AgentProfile {
 function stubStore(): SessionStore {
   return {
     needsAgyIdentityRebuild: () => false,
+    lookupAgentChannelRestriction: () => ({ state: "absent" as const }),
     readConfig: (record: SessionRecord): SessionConfigState => {
       try {
         return record.configJson ? (JSON.parse(record.configJson) as SessionConfigState) : {};
@@ -332,6 +333,7 @@ describe("#220 picker / configure refuse parked ollama-cloud", () => {
         getProfile: (id) => profiles.get(id),
         parkedSelectMessage: (id) => router.parkedSelectMessage(id),
         unregisteredAgentMessage: (id, fallback) => router.unregisteredAgentMessage(id, fallback),
+        assertAgentAllowedForRecord: () => {},
         getOrStartRuntime: async () => {
           throw new Error("should not start");
         },

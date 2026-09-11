@@ -89,6 +89,7 @@ function harness(opts: {
   efforts?: string[];
   profiles?: AgentProfile[];
   failFreshStart?: boolean;
+  restrictionError?: string;
 } = {}) {
   const target = opts.target ?? record();
   const caller = record({ id: "discord:caller", channelRef: "caller", acpSessionId: "caller-acp" });
@@ -124,6 +125,9 @@ function harness(opts: {
     router: {
       describeConfig: (value) => description(records.get(value.id) ?? value, defaults),
       getProfile: (id) => byProfile.get(id),
+      assertAgentAllowedForRecord: (_value, agentId) => {
+        if (opts.restrictionError && agentId === "copilot") throw new Error(opts.restrictionError);
+      },
       invalidate: async (id, invalidateOpts) => {
         invalidated.push(id);
         invalidationOptions.push(invalidateOpts);
@@ -231,6 +235,27 @@ describe("detectSessionReset", () => {
 });
 
 describe("ThreadSessionControlService", () => {
+  it("refuses configure_thread before it persists an agent barred from the target channel (#308)", async () => {
+    const h = harness({
+      profiles: [
+        profile("claude", "claude-old", ["claude-old", "claude-new"]),
+        profile("copilot", "gpt", ["gpt"]),
+      ],
+      restrictionError:
+        'Refused: agent "copilot" cannot run in channel "channel". Rule: "copilot" is allowed only in channel(s): allowed.',
+    });
+    const result = await h.service.configure(h.caller, h.target, { agent: "copilot" });
+    expect(result).toEqual({
+      ok: false,
+      error:
+        'Refused: agent "copilot" cannot run in channel "channel". Rule: "copilot" is allowed only in channel(s): allowed.',
+    });
+    // This is deliberately before the mutation: deleting the configure guard
+    // makes this production path persist/restart a restricted agent.
+    expect(h.mutations).toEqual([]);
+    expect(h.overlays).toEqual([]);
+  });
+
   it("changes a Claude model and reloads the runtime so meta effort takes effect", async () => {
     const h = harness();
     const result = await h.service.configure(h.caller, h.target, {

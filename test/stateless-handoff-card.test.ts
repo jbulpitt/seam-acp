@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -108,6 +108,8 @@ function makeOrch(opts: {
     ensureSessionRecord: ({ channelRef }: { channelRef: string }) =>
       record({ id: `discord:${channelRef}`, channelRef }),
     getProfile: () => ({ id: "claude" }),
+    resolveProfileForChannel: (id: string, _channel: string, location?: string) =>
+      router.getProfile(id, location),
     getOrStartRuntime: async () => {
       throw new Error("live runtime must not be used; injectTurn is stubbed");
     },
@@ -292,6 +294,27 @@ describe("isStatelessHandoffWorker / shouldInlineCardReportBack", () => {
 });
 
 describe("stateless/preset handoff embed card", () => {
+  it.each([
+    ["handoff", presetSpec({ kind: "handoff" })],
+    ["forward", presetSpec({ kind: "forward", returnTo: undefined })],
+    ["MCP steer", presetSpec({ kind: "handoff", prompt: "<seam-steer>pivot</seam-steer>" })],
+    ["wake", presetSpec({ kind: "wake" })],
+    ["parked prompt", presetSpec({ kind: "parked" })],
+    ["chain hop", presetSpec({ kind: "handoff", chainId: "chain-308" })],
+  ])("refuses the %s dispatch before its injection path can run (#308)", async (_label, spec) => {
+    const { adapter } = spyAdapter();
+    const orch = makeOrch({ dataDir, adapter });
+    const refusal =
+      'Refused: agent "claude" cannot run in channel "thread-caller". Rule: "claude" is allowed only in channel(s): allowed.';
+    (orch as any).router.resolveProfileForChannel = () => { throw new Error(refusal); };
+    const inject = (orch as any).injectTurn = vi.fn();
+
+    await expect(orch.dispatchInjectTurn(spec)).rejects.toThrow(refusal);
+    // This is intentionally before injectTurn: deleting the dispatch resolver
+    // lets this exact durable source reach the provider-facing path.
+    expect(inject).not.toHaveBeenCalled();
+  });
+
   it("resolves a preset worker on the target host and plans a remote spawn", async () => {
     const { adapter } = spyAdapter();
     const orch = makeOrch({ dataDir, adapter });

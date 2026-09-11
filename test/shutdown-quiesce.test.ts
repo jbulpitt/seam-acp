@@ -2421,6 +2421,7 @@ describe("#174 an ingest job stays registered through its durable tail", () => {
       ingestJobs: new Map(),
       router: {
         getProfile: () => ({ id: "a" }),
+        resolveProfileForChannel: () => ({ id: "a" }),
         mintMcpServersForSession: () => ({}),
         revokeMcpSession: () => {},
       },

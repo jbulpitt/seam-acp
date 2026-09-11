@@ -207,7 +207,7 @@ Discord has no aliases; old invocations simply disappear.
 - `info` (6): `whoami` `usage` `avatar` `help` `sessions` `repos`
 - `preset` (7): `list` `create` `apply` `delete` `show` `edit` `thread`
 
-### `/seamadmin` — operator surface (11 slots)
+### `/seamadmin` — operator surface (12 slots)
 
 Registered with `default_member_permissions = ManageGuild` and
 `contexts = [Guild]` (via `setContexts`, not the deprecated `setDMPermission`),
@@ -223,10 +223,12 @@ the command to anyone, so every runtime refusal stays exactly where it was:
 
 `/seamadmin rebuild` is deterministic Discord reconstruction (no summarizer; one destination seed turn that may consume up to 60% of the destination context window). `/seamadmin compact-thread` is the former model-assisted rebuild. `Premium Compact (Discord)` remains the AGY fan-out pipeline. `/seam config reset` starts a blank session with no history.
 
-**Groups (8):**
+**Groups (9):**
 - `catalog` (1): `refresh` — refresh one `agent@location` catalog or all
   catalogs. Reads remain cache-only; the durable response reports generation,
   source/provenance, diff, scope, and any retained/quarantined failure.
+- `restrictions` (3): `set` `list` `clear` — immediate, audited per-agent
+  Discord-channel allowlists. An absent rule allows existing routing unchanged.
 - `schedule` (5): `add` `list` `remove` `toggle` `edit` — **no attachments**
   (#158). A scheduled prompt carries no files on any surface; when a job needs
   substantial instructions, commit a runbook and make the prompt a short request

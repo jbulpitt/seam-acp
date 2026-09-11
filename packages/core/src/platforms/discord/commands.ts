@@ -31,7 +31,7 @@ export const SEAM_ADMIN_COMMAND_NAME = "seamadmin";
  *     config (18) model effort agent role mode repo tools card gif approve
  *                 reset init detach tts show edit set audit
  *
- *   /seamadmin  (11 slots)  operator surface — ManageGuild + guild-only
+ *   /seamadmin  (12 slots)  operator surface — ManageGuild + guild-only
  *     rebuild · compact-thread · recover
  *     project  (3)  new list remove
  *     upload   (3)  pull push secret
@@ -697,7 +697,7 @@ export function buildSeamAdminCommand(): SlashCommandBuilder {
       )
   );
 
-  // --- groups (7) -----------------------------------------------------------
+  // --- groups (9) -----------------------------------------------------------
 
   cmd.addSubcommandGroup((g) =>
     g
@@ -1043,6 +1043,39 @@ export function buildSeamAdminCommand(): SlashCommandBuilder {
             o
               .setName("refresh-sources")
               .setDescription("Also force intelligence sources and publish")
+          )
+      )
+  );
+
+  // Runtime-only agent routing guard (#308). Rules are audited in the existing
+  // config-mutation ledger, never written to an env/config file.
+  cmd.addSubcommandGroup((g) =>
+    g
+      .setName("restrictions")
+      .setDescription("Admin-only: restrict an agent to named Discord channels")
+      .addSubcommand((sub) =>
+        sub
+          .setName("set")
+          .setDescription("Set one agent's complete comma-separated channel allowlist")
+          .addStringOption((o) =>
+            o.setName("agent").setDescription("Agent id to restrict").setRequired(true)
+          )
+          .addStringOption((o) =>
+            o
+              .setName("channels")
+              .setDescription("Comma-separated channel ids or #channel mentions")
+              .setRequired(true)
+          )
+      )
+      .addSubcommand((sub) =>
+        sub.setName("list").setDescription("List active agent channel allowlists")
+      )
+      .addSubcommand((sub) =>
+        sub
+          .setName("clear")
+          .setDescription("Clear one agent's channel allowlist")
+          .addStringOption((o) =>
+            o.setName("agent").setDescription("Agent id to unrestrict").setRequired(true)
           )
       )
   );

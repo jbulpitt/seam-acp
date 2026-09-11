@@ -200,6 +200,34 @@ describe("DispatchWatcher", () => {
     });
   });
 
+  it("does not reopen admission after stop wins a slow boot-recovery race (#303)", async () => {
+    let releaseRecovery!: () => void;
+    const slowRecovery = new Promise<void>((resolve) => { releaseRecovery = resolve; });
+    const seen: string[] = [];
+    const watcher = new DispatchWatcher({
+      dataDir,
+      logger: silent,
+      beforeAdmission: () => slowRecovery,
+      onDispatch: async (spec) => {
+        seen.push(spec.id);
+        return { output: spec.id, stopReason: "end_turn" };
+      },
+    });
+    await dropSpec({ id: "must-stay-pending" });
+
+    await watcher.start({ waitForInitialDispatches: false });
+    watcher.stop();
+    releaseRecovery();
+    await watcher.initialDispatchesSettled();
+
+    // #307: protects shutdown's win over a delayed boot opener; deleting this
+    // assertion lets recovery reopen intake and run work after stop returned.
+    expect({ accepting: watcher.isAcceptingDispatches, seen }).toEqual({
+      accepting: false,
+      seen: [],
+    });
+  });
+
   it("does not classify the healthy shutdown retention handoff as a stall (#250/#290)", async () => {
     let entered!: () => void;
     const started = new Promise<void>((resolve) => { entered = resolve; });

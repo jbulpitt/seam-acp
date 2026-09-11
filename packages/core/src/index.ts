@@ -1263,10 +1263,10 @@ async function main(): Promise<void> {
   delegationReconciler.start();
   // Only now may durable specs run: Thread Voice verification, settlement,
   // lease reconciliation, and recovery bookkeeping are all installed first.
-  // Arm the initial pass, but do not hold application readiness behind the
-  // paid agent turns it finds. The pass remains visible to watcher.drain(),
-  // and #76 marker recovery below still waits for it to preserve the original
-  // no-double-resume ordering.
+  // #303: reconcile interrupted turns while watcher admission is still closed,
+  // so stale running specs are requeued into the same createdUtc-sorted first
+  // pass as the existing backlog. The runtime watcher factory owns that barrier
+  // so production and tests cannot silently diverge.
   await dispatchWatcher.start({ waitForInitialDispatches: false });
   // Boot-time sweepers can emit visible turns/specs immediately. Start them
   // only after Voice Console recovery and the shared visible-speech hook are
@@ -1296,22 +1296,6 @@ async function main(): Promise<void> {
   });
   orchestrator.setCardGifs(cardGifs);
   cardGifs.start();
-
-  // #76: reconcile live-turn markers (always) and auto-resume if the flag
-  // is on. SIGTERM/disposeAll above leave markers intact — this is the
-  // path that acts on them. Preserve the historical ordering after the
-  // watcher's boot backlog: a newly-running dispatch may create a live marker,
-  // and inspecting markers before that first pass settles could mistake live
-  // work for a crash leftover. Neither wait blocks the rest of startup.
-  void dispatchWatcher
-    .initialDispatchesSettled()
-    .then(async () => {
-      // A shutdown may have closed intake while the boot backlog was running.
-      // Do not start a new recovery pass on the far side of that barrier.
-      if (!dispatchWatcher.isAcceptingDispatches) return;
-      await orchestrator.recoverInterruptedTurns();
-    })
-    .catch((err) => logger.warn({ err }, "turn-resume recovery failed"));
 
   // P0 (#58): hot-reload data/channel-presets.json. The watcher mutates the
   // SAME map objects the router and orchestrator hold (config.channelPresets /

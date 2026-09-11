@@ -432,6 +432,70 @@ describe("command-layer cancel vs dispose / onDead", () => {
 });
 
 describe("watcher recoverStale vs resumeEnabled", () => {
+  it("keeps boot admission closed until a slow resume pass restores thread FIFO (#303)", async () => {
+    const dirs = dispatchDirs(dir);
+    await mkdir(dirs.running, { recursive: true });
+    await mkdir(dirs.pending, { recursive: true });
+    await mkdir(dirs.done, { recursive: true });
+    const created = Date.now();
+    const p1 = handoffSpec({ id: "p1", createdUtc: new Date(created).toISOString() });
+    const p2 = handoffSpec({ id: "p2", createdUtc: new Date(created + 1_000).toISOString() });
+    const p3 = handoffSpec({ id: "p3", createdUtc: new Date(created + 2_000).toISOString() });
+    await writeFile(path.join(dirs.running, "p1.json"), JSON.stringify(p1), "utf8");
+    await writeFile(path.join(dirs.pending, "p2.json"), JSON.stringify(p2), "utf8");
+    await writeFile(path.join(dirs.pending, "p3.json"), JSON.stringify(p3), "utf8");
+    store.recordDelegation({
+      id: "p1",
+      kind: "handoff",
+      targetRef: "thread-worker",
+      correlationId: "corr-x",
+      acpSessionId: "acp-recorded",
+      status: "interrupted",
+    });
+
+    let resumePassEntered!: () => void;
+    const resumePassStarted = new Promise<void>((resolve) => { resumePassEntered = resolve; });
+    let releaseResumePass!: () => void;
+    const slowResumePass = new Promise<void>((resolve) => { releaseResumePass = resolve; });
+    const { orch } = makeOrch({
+      enabled: true,
+      getThreadLiveState: async () => {
+        resumePassEntered();
+        await slowResumePass;
+        return { locked: false, archived: false };
+      },
+    });
+    const seen: string[] = [];
+    const watcher = createRuntimeDispatchWatcher({
+      dataDir: dir,
+      logger: silent,
+      resumeEnabled: true,
+      pollMs: 60_000,
+      runtime: {
+        dispatchInjectTurn: async (spec) => {
+          seen.push(spec.id);
+          return { output: spec.id, stopReason: "end_turn" };
+        },
+        observeRetainedDispatch: (spec) => orch.observeRetainedDispatch(spec),
+        recoverInterruptedTurns: () => orch.recoverInterruptedTurns(),
+      },
+    });
+    orch.setDispatchWatcher(watcher);
+
+    await watcher.start({ waitForInitialDispatches: false });
+    await resumePassStarted;
+    // #307: protects the closed boot gate; deleting this assertion lets queued
+    // work begin while interrupted-turn preconditions are still unresolved.
+    expect(seen).toEqual([]);
+    releaseResumePass();
+    await watcher.initialDispatchesSettled();
+    watcher.stop();
+
+    // #307: protects restart FIFO and original pending order; deleting this
+    // assertion lets the interrupted turn land behind either queued successor.
+    expect(seen).toEqual(["p1", "p2", "p3"]);
+  });
+
   it("flag off: re-enqueues unmarked (today's replay); flag on: marks in place", async () => {
     const dirs = dispatchDirs(dir);
     await mkdir(dirs.running, { recursive: true });
@@ -565,11 +629,11 @@ describe("watcher recoverStale vs resumeEnabled", () => {
       retainForRecovery: (id) => store.turnAttempts.get(id) !== null,
       runtime: orch,
     });
-    await watcher.start();
     orch.setDispatchWatcher(watcher);
+    await watcher.start({ waitForInitialDispatches: false });
 
     let settled = false;
-    const recovery = orch.recoverInterruptedTurns().then(() => { settled = true; });
+    const recovery = watcher.initialDispatchesSettled().then(() => { settled = true; });
     await vi.waitFor(() => {
       expect(Boolean(readyListener) || settled).toBe(true);
     });
@@ -581,9 +645,7 @@ describe("watcher recoverStale vs resumeEnabled", () => {
     ready = true;
     readyListener?.("remote-a");
     await recovery;
-    expect(await readdir(dirs.pending)).toEqual([`${spec.id}.json`]);
     expect(markSessionBridge).toHaveBeenCalledWith("discord:thread-worker", "remote-a");
-    await watcher.tick();
     watcher.stop();
     const retained = store.turnAttempts.get(spec.id)!;
     // #250 deliberately forbids prompt-started remote replay. Readiness gates

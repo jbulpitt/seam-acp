@@ -61,6 +61,8 @@ export interface DispatchWatcherOpts {
   mayRecover?: (id: string) => boolean;
   /** Modern SQL-owned attempts must never use legacy original-input replay. */
   retainForRecovery?: (id: string) => boolean;
+  /** Boot reconciliation that must finish before pending specs may be claimed. */
+  beforeAdmission?: () => Promise<void>;
   /**
    * Directory-listing seam. Defaults to `fs.readdir`.
    *
@@ -82,21 +84,23 @@ export interface DispatchWatcherOpts {
 export interface DispatchWatcherStartOpts {
   /**
    * Preserve the historical test/utility behavior by default: `start()` does
-   * not resolve until every spec found by its first pending-directory scan has
-   * settled. Production startup disables this so paid agent work cannot delay
-   * the rest of application readiness.
+   * not resolve until boot reconciliation and every spec found by its first
+   * pending-directory scan have settled. Production startup disables this so
+   * slow recovery or paid agent work cannot delay the rest of readiness; the
+   * watcher still keeps admission closed until reconciliation finishes.
    */
   waitForInitialDispatches?: boolean;
 }
 
-/** Single production composition point for dispatch execution + retained
- * observability. Tests use this same factory so deleting either wire is a
+/** Single production composition point for execution, retained observability,
+ * and boot recovery. Tests use this same factory so deleting any wire is a
  * behavioral regression, not an untested index.ts assembly detail. */
 export function createRuntimeDispatchWatcher(
-  opts: Omit<DispatchWatcherOpts, "onDispatch" | "onRetained"> & {
+  opts: Omit<DispatchWatcherOpts, "onDispatch" | "onRetained" | "beforeAdmission"> & {
     runtime: {
       dispatchInjectTurn(spec: DispatchSpec): Promise<{ output: string; stopReason: string }>;
       observeRetainedDispatch(spec: DispatchSpec): Promise<void>;
+      recoverInterruptedTurns(): Promise<void>;
     };
   }
 ): DispatchWatcher {
@@ -105,6 +109,9 @@ export function createRuntimeDispatchWatcher(
     ...watcherOpts,
     onDispatch: (spec) => runtime.dispatchInjectTurn(spec),
     onRetained: (spec) => runtime.observeRetainedDispatch(spec),
+    // #307: protects the production recovery barrier; deleting this wire lets
+    // the runtime watcher admit pending work before interrupted turns requeue.
+    beforeAdmission: () => runtime.recoverInterruptedTurns(),
   });
 }
 
@@ -132,6 +139,7 @@ export class DispatchWatcher {
   private readonly resumeEnabled: boolean;
   private readonly mayRecover: (id: string) => boolean;
   private readonly retainForRecovery: (id: string) => boolean;
+  private readonly beforeAdmission?: () => Promise<void>;
   private readonly readDir: (dir: string) => Promise<string[]>;
   private readonly beforeOwnedDoneCommit?: (id: string) => Promise<void>;
   private readonly beforeRecoveryPublish?: (id: string) => Promise<void>;
@@ -169,6 +177,9 @@ export class DispatchWatcher {
   private readonly artifactTails = new Map<string, Promise<void>>();
   private timer?: NodeJS.Timeout;
   private ready = false;
+  /** #303: invalidates a delayed boot opener; deleting this fence lets stop()
+   * race a slow admission barrier and accidentally reopen intake afterward. */
+  private lifecycleEpoch = 0;
   /** Settles after the first pending-directory pass, including every dispatch
    * it claimed. The handled promise is safe to observe from boot sequencing. */
   private initialDispatchPass: Promise<void> = Promise.resolve();
@@ -189,15 +200,17 @@ export class DispatchWatcher {
     this.resumeEnabled = opts.resumeEnabled === true;
     this.mayRecover = opts.mayRecover ?? (() => true);
     this.retainForRecovery = opts.retainForRecovery ?? (() => false);
+    this.beforeAdmission = opts.beforeAdmission;
     this.readDir = opts.readDir ?? readdir;
     this.beforeOwnedDoneCommit = opts.beforeOwnedDoneCommit;
     this.beforeRecoveryPublish = opts.beforeRecoveryPublish;
   }
 
   /** Create the queue dirs, recover anything a crash left in `running/`, then
-   * start polling. Callers may arm the first dispatch pass in the background;
-   * crash reconciliation itself is always complete before this resolves. */
+   * start polling. Callers may arm boot reconciliation plus the first dispatch
+   * pass in the background; admission stays closed until reconciliation ends. */
   async start(opts: DispatchWatcherStartOpts = {}): Promise<void> {
+    const lifecycleEpoch = ++this.lifecycleEpoch;
     await mkdir(this.dirs.pending, { recursive: true });
     await mkdir(this.dirs.running, { recursive: true });
     await mkdir(this.dirs.done, { recursive: true });
@@ -208,11 +221,18 @@ export class DispatchWatcher {
     } else {
       await this.recoverStale();
     }
-    this.ready = true;
-    this.timer = setInterval(() => void this.tick(), this.pollMs);
-    // Don't hold the event loop open just for the poller.
-    this.timer.unref?.();
-    const initialPass = this.tick();
+    const initialPass = (async () => {
+      // #303: keep pending admission closed until interrupted running turns have
+      // joined the same first tick; deleting this await lets newer pending turns
+      // bypass the existing createdUtc ordering while recovery is still running.
+      await this.beforeAdmission?.();
+      if (this.lifecycleEpoch !== lifecycleEpoch) return;
+      this.ready = true;
+      this.timer = setInterval(() => void this.tick(), this.pollMs);
+      // Don't hold the event loop open just for the poller.
+      this.timer.unref?.();
+      await this.tick();
+    })();
     this.initialDispatchPass = initialPass.catch((err) => {
       this.logger.warn({ err }, "initial dispatch pass failed");
     });
@@ -241,6 +261,7 @@ export class DispatchWatcher {
    * boot, so stopping intake early is lossless.
    */
   stop(): void {
+    this.lifecycleEpoch++;
     if (this.timer) clearInterval(this.timer);
     this.timer = undefined;
     this.ready = false;

@@ -1028,20 +1028,28 @@ export class DiscordAdapter implements ChatAdapter {
     const maxPages = 50;
     for (let page = 0; page < maxPages; page += 1) {
       const messages = await ch.messages.fetch({ limit: 100, ...(before ? { before } : {}) });
+      // Protects end-of-history as authoritative absence; deleting it turns an
+      // empty channel into an indeterminate boot-time retry.
       if (messages.size === 0) return { status: "absent" };
       let oldestMs = Number.POSITIVE_INFINITY;
       for (const message of messages.values()) {
         oldestMs = Math.min(oldestMs, message.createdTimestamp);
+        // Protects accepted-but-unacknowledged creates from replay; deleting it
+        // ignores the Discord evidence this repair exists to consume.
         if (message.author.id === botId && String(message.nonce ?? "") === nonce) {
           return { status: "found", message: { channel, id: message.id } };
         }
       }
+      // Protects absence from being inferred before the full relevant interval
+      // was inspected; deleting the boundary can duplicate an older result.
       if (oldestMs <= sinceMs || messages.size < 100) return { status: "absent" };
       before = messages.last()?.id;
       // Protects against a cursor stall becoming an unbounded boot loop; if
       // deleted, a malformed/cached page can prevent startup from settling.
       if (!before) return { status: "indeterminate", reason: "Discord history cursor did not advance" };
     }
+    // Protects boot from lifetime-sized Discord history; deleting this bound
+    // can turn delivery reconciliation into unbounded startup work.
     return {
       status: "indeterminate",
       reason: `Discord nonce search exceeded ${maxPages * 100} messages`,

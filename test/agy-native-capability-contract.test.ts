@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import fs from "node:fs";
+import fsPromises from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -609,14 +610,44 @@ describe.sequential("native AGY R1 capability contract", () => {
       expect(fs.readFileSync(mappingFile, "utf8")).toBe(mappingBeforeInvalid);
       expect(settingsHash()).toBe(initialSettingsHash);
 
-      fs.chmodSync(mappingFile, 0o400);
+      const mappingDirMode = fs.statSync(r3Mapping).mode & 0o777;
+      fs.chmodSync(r3Mapping, 0o500);
       try {
         await expect(first.setModel("fixture-native-model-low")).rejects.toThrow();
       } finally {
-        fs.chmodSync(mappingFile, 0o600);
+        fs.chmodSync(r3Mapping, mappingDirMode);
       }
       expect(first.getSessionInfo()?.currentModelId).toBe("fixture-native-model");
       expect(fs.readFileSync(mappingFile, "utf8")).toBe(mappingBeforeInvalid);
+      expect(settingsHash()).toBe(initialSettingsHash);
+
+      const mappingBeforeInterruptedRename = fs.readFileSync(mappingFile, "utf8");
+      const rename = vi.spyOn(fsPromises, "rename").mockRejectedValueOnce(
+        new Error("fixture interruption before atomic mapping rename"),
+      );
+      try {
+        await expect(first.setModel("fixture-native-model-low")).rejects.toThrow(
+          "Internal error",
+        );
+      } finally {
+        rename.mockRestore();
+      }
+      const mappingAfterInterruptedRename = fs.readFileSync(mappingFile, "utf8");
+      expect(mappingAfterInterruptedRename).toBe(mappingBeforeInterruptedRename);
+      const intact = JSON.parse(mappingAfterInterruptedRename) as Record<
+        string,
+        { cascadeId?: string; modelId?: string }
+      >;
+      expect(intact[firstSessionId]).toMatchObject({
+        cascadeId: expectedConversation,
+        modelId: "fixture-native-model",
+      });
+      expect(intact[secondSessionId]).toMatchObject({
+        cascadeId: expectedConversation,
+        modelId: "fixture-native-model-low",
+      });
+      expect(first.getSessionInfo()?.currentModelId).toBe("fixture-native-model");
+      expect(fs.readdirSync(r3Mapping).filter((name) => name.endsWith(".tmp"))).toEqual([]);
       expect(settingsHash()).toBe(initialSettingsHash);
     } finally {
       await Promise.all([first.dispose(), second.dispose()]);

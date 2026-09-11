@@ -58,6 +58,10 @@ model self-report or a claim of live correctness.
   model and persisted bytes intact. The contract derives expected argv values
   from fixture literals and observes the real native invocation log rather
   than asking the production resolver to predict itself.
+- Mapping updates write a uniquely named temporary file in the target directory
+  and atomically rename it over `agy-sessions.json`. An injected interruption
+  after the temp write leaves the prior complete mapping parseable with every
+  conversation id and model intact, and removes the abandoned temp file.
 - ACP cancellation interrupts the active native turn, settles it as cancelled,
   and leaves the persisted conversation mapping intact. This is behavioral
   evidence only; bounded process-tree cleanup belongs to R5.
@@ -123,6 +127,9 @@ and deployment/canaries to R9 ([#265](https://github.com/jbulpitt/seam-acp/issue
 
 - The per-file mutation queue prevents concurrent session selections from
   overwriting each other's mapping rows; remove it and the last writer wins.
+- Same-directory temp-and-rename prevents readers or a crash from observing a
+  truncated mapping; replace it with a bare write and every session can lose
+  both its conversation id and model in one torn commit.
 - Empty-catalog checks prevent native turns from falling back to shared AGY
   state; remove them and exact model ownership is no longer enforceable.
 - Missing/unknown session-model checks prevent silent substitution, including

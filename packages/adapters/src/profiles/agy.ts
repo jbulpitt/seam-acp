@@ -230,8 +230,27 @@ async function mutateSessionMapping(
       mapping = JSON.parse(await fs.readFile(file, "utf8")) as SessionMapping;
     } catch { /* fresh file */ }
     mutate(mapping);
-    await fs.mkdir(path.dirname(file), { recursive: true });
-    await fs.writeFile(file, JSON.stringify(mapping, null, 2) + "\n");
+    const dir = path.dirname(file);
+    await fs.mkdir(dir, { recursive: true });
+    // The temporary file must share the target directory: a cross-filesystem
+    // rename is not atomic, so a crash could expose a truncated mapping.
+    const temp = path.join(
+      dir,
+      `.${path.basename(file)}.${process.pid}.${randomUUID()}.tmp`,
+    );
+    try {
+      await fs.writeFile(temp, JSON.stringify(mapping, null, 2) + "\n", {
+        encoding: "utf8",
+        flag: "wx",
+        mode: 0o600,
+      });
+      await fs.rename(temp, file);
+    } catch (err) {
+      // A failed write/rename must not leave abandoned session mappings that
+      // a later recovery or operator could mistake for durable state.
+      await fs.rm(temp, { force: true }).catch(() => {});
+      throw err;
+    }
   });
   mappingWriteTails.set(file, current);
   try {

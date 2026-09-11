@@ -5,7 +5,7 @@
  * Writes a dispatch spec into <DATA_DIR>/dispatch/pending/<uuid>.json; the
  * running seam-acp process picks it up, runs the prompt as a turn in the target
  * Discord thread, and writes <DATA_DIR>/dispatch/done/<uuid>.json. With --wait
- * this polls for that result and prints it.
+ * this polls for that result (or its SQL outcome after pruning) and prints it.
  *
  * Auth is the filesystem — if you can write to the dispatch dir you are the
  * operator. Don't expose this path to anything you don't trust.

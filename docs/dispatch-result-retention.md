@@ -71,6 +71,12 @@ in `done/` mean unresolved delivery (or a logged unlink/lookup failure awaiting
 retry), not an operator evidence archive. There is no time-based expiry for
 unresolved output: that would silently lose work.
 
+A read-only dry run on 2026-09-11 using #305's canonical resolver scanned
+5,069 artifacts: 3,618 eligible for expiration (12,840,589 logical bytes),
+1,451 retained, zero errors. **No production files were removed.** These are
+point-in-time counts, not a promise that the retained subset is deliverable;
+unresolved historical routes require #305's recovery or explicit disposition.
+
 ## Necessity and non-live checks (#307)
 
 - SQL completion lookup: removing it makes completed queue leftovers runnable
@@ -83,6 +89,8 @@ unresolved output: that would silently lose work.
 - Periodic sweep: removing it strands backlog and parents acknowledged after
   their own result writer has returned; the regression changes proof later.
 - Dry-run mode: removing its write separation makes an audit delete records.
+  The compiled maintenance CLI regression also checks its default dry-run and
+  explicit apply against private SQL/files, retaining unresolved and unknown rows.
 - Exact basename and regular-file checks: removing them lets malformed ids
   unlink outside the buffer or silently discard non-file operator evidence.
 - Stop flag and single-flight sweep: removing them lets overlapping intervals

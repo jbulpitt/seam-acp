@@ -51,6 +51,7 @@ import { VoiceLeaseManager } from "./core/voice-lease.js";
 import { evaluateWatch } from "./core/watch/evaluate.js";
 import { createRuntimeDispatchWatcher } from "./core/dispatch/watcher.js";
 import { reconcileCompletedDoneFiles } from "./core/dispatch/done-reconcile.js";
+import { bindDoneDeliveryResolver, DoneRetention } from "./core/dispatch/done-retention.js";
 import { dispatchDirs, enqueueDispatchSpec, type DispatchSpec } from "./core/dispatch/types.js";
 import { SeamTokenRegistry } from "./core/mcp/token-registry.js";
 import { SeamMcpServer } from "./core/mcp/seam-mcp-server.js";
@@ -1090,6 +1091,14 @@ async function main(): Promise<void> {
   // <DATA_DIR>/dispatch/pending/ and the watcher runs it as a turn in the
   // target thread, writing the captured output to done/. Started after the
   // adapter so a dispatch never fires before Discord can receive its output.
+  const doneRetention = new DoneRetention(bindDoneDeliveryResolver({
+    dataDir: config.DATA_DIR,
+    logger: logger.child({ mod: "done-retention" }),
+    getDelegation: (id) => store.getDelegation(id),
+    getReportBackByCorrelation: (id) => store.getReportBackByCorrelation(id),
+    isAttemptDeliveryProven: (id) => store.turnAttempts.isDeliveryProven(id),
+    getExpirationAuthorization: (id) => store.getDoneArtifactExpirationAuthorization(id),
+  }));
   const dispatchWatcher = createRuntimeDispatchWatcher({
     dataDir: config.DATA_DIR,
     logger: logger.child({ mod: "dispatch" }),
@@ -1099,6 +1108,7 @@ async function main(): Promise<void> {
     resumeEnabled: config.SEAM_TURN_RESUME_ENABLED,
     retainForRecovery: (id) => store.turnAttempts.get(id) !== null,
     isCompleted: (id) => store.isDispatchCompleted(id),
+    onResultPublished: (id) => doneRetention.resultPublished(id),
     // A stale ledger row terminalized by #137 must never be resurrected by the
     // filesystem at-least-once recovery path, regardless of resume flag.
     mayRecover: (id) => {
@@ -1265,6 +1275,10 @@ async function main(): Promise<void> {
   // pass as the existing backlog. The runtime watcher factory owns that barrier
   // so production and tests cannot silently diverge.
   await dispatchWatcher.start({ waitForInitialDispatches: false });
+  // #303: false-wait start returns before recovery. Await admission separately,
+  // without waiting for paid turns in initialDispatchesSettled().
+  await dispatchWatcher.admissionReleased();
+  doneRetention.start();
   // Boot-time sweepers can emit visible turns/specs immediately. Start them
   // only after Voice Console recovery and the shared visible-speech hook are
   // installed, so a due schedule/wake/watch cannot bypass binding speech.
@@ -1534,6 +1548,7 @@ async function main(): Promise<void> {
     stopStatusCard?.();
     stopServiceStatus?.();
     scheduledManager.stop();
+    doneRetention.stop();
     wakeManager.stop();
     parkedManager.stop();
     cardGifs.stop();
@@ -1606,6 +1621,10 @@ async function main(): Promise<void> {
       drained: await bounded("model catalog drain", config.SHUTDOWN_QUIESCE_TIMEOUT_MS, () =>
         modelCatalog.drain()
       ),
+    });
+    verdicts.push({
+      stage: "done-retention",
+      drained: await bounded("done retention drain", config.SHUTDOWN_QUIESCE_TIMEOUT_MS, () => doneRetention.drain()),
     });
     // #174 phase 1: quiesce BEFORE anything is torn down. `dispatchWatcher.stop()`
     // only closes intake; `quiesce()` is the barrier that waits for claimed

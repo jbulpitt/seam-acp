@@ -4,30 +4,25 @@ import path from "node:path";
 import { setImmediate } from "node:timers/promises";
 import type { Logger } from "../../lib/logger.js";
 import { dispatchDirs, type DispatchResult } from "./types.js";
-import type { DoneLedgerRow, DoneLedgerState } from "./done-reconcile.js";
+import { isDoneArtifactDeletable, type DoneDeliveryProofLookup } from "./done-reconcile.js";
 
 export interface DoneRetentionDeps {
   dataDir: string;
   logger: Logger;
   /** The delivery resolver's durable decision, never inferred from file age,
    * worker success, or a completed parent with an unresolved onward result. */
-  isDeliveryResolved: (id: string) => boolean;
+  isArtifactDeletable: (id: string) => boolean;
 }
 
 /** Bind the canonical #305 route-aware resolver without putting any delivery
  * interpretation in the retention mechanism or the maintenance CLI. */
-export function bindDoneDeliveryResolver(opts: {
+export function bindDoneDeliveryResolver(opts: DoneDeliveryProofLookup & {
   dataDir: string;
   logger: Logger;
-  getDelegation: (id: string) => DoneLedgerState | null;
-  getReportBackByCorrelation: (correlationId: string) => DoneLedgerRow | null;
-  resolveDelivery: (
-    result: DispatchResult,
-    row: DoneLedgerState | null,
-    lookups: Pick<typeof opts, "getDelegation" | "getReportBackByCorrelation">
-  ) => boolean;
 }): DoneRetentionDeps {
-  return { dataDir: opts.dataDir, logger: opts.logger, isDeliveryResolved: (id) => {
+  return { dataDir: opts.dataDir, logger: opts.logger, isArtifactDeletable: (id) => {
+    const row = opts.getDelegation(id);
+    if (!row) return false; // Unknown ownership cannot supply the canonical proof input.
     const raw = readFileSync(path.join(dispatchDirs(opts.dataDir).done, `${id}.json`), "utf8");
     let result: DispatchResult;
     try {
@@ -43,7 +38,7 @@ export function bindDoneDeliveryResolver(opts: {
       // JSON parser errors can contain private prompt/output fragments.
       throw new Error("invalid done artifact; retained for operator repair");
     }
-    return opts.resolveDelivery(result, opts.getDelegation(id), opts);
+    return isDoneArtifactDeletable(result, row, opts);
   } };
 }
 
@@ -54,7 +49,12 @@ export interface DonePruneSummary {
   failed: number;
   bytes: number;
   dryRun: boolean;
+  limitReached: boolean;
 }
+
+/** Bound destructive work per pass, including bulk operator-authorized expiry.
+ * Dry-run audits the whole buffer; retained prefixes must not starve later ids. */
+export const DONE_PRUNE_MAX_PER_SWEEP = 1000;
 
 /** Delete only the redundant artifact, not the durable outcome or delivery
  * evidence. Synchronous proof + unlink leaves no in-process await gap in which
@@ -74,7 +74,7 @@ export function pruneDoneArtifact(
     const stat = lstatSync(file);
     // Non-files are unresolved operator evidence; never recurse or follow a
     // symlink. Without this check a malformed artifact silently disappears.
-    if (!stat.isFile() || !deps.isDeliveryResolved(id)) return { state: "retained", bytes: 0 };
+    if (!stat.isFile() || !deps.isArtifactDeletable(id)) return { state: "retained", bytes: 0 };
     if (!dryRun) unlinkSync(file);
     return { state: "pruned", bytes: stat.size };
   } catch (err) {
@@ -90,9 +90,14 @@ export function pruneDoneArtifact(
  * path. Unknown/undelivered files remain in their recovery location. */
 export async function pruneDoneArtifacts(
   deps: DoneRetentionDeps,
-  opts: { dryRun?: boolean; shouldStop?: () => boolean } = {}
+  opts: { dryRun?: boolean; shouldStop?: () => boolean; maxPruned?: number } = {}
 ): Promise<DonePruneSummary> {
-  const summary: DonePruneSummary = { scanned: 0, pruned: 0, retained: 0, failed: 0, bytes: 0, dryRun: opts.dryRun === true };
+  const maxPruned = opts.maxPruned ?? DONE_PRUNE_MAX_PER_SWEEP;
+  // Invalid or unbounded budgets must fail before the first destructive operation.
+  if (!Number.isInteger(maxPruned) || maxPruned < 1 || maxPruned > DONE_PRUNE_MAX_PER_SWEEP) {
+    throw new Error(`maxPruned must be an integer from 1 to ${DONE_PRUNE_MAX_PER_SWEEP}`);
+  }
+  const summary: DonePruneSummary = { scanned: 0, pruned: 0, retained: 0, failed: 0, bytes: 0, dryRun: opts.dryRun === true, limitReached: false };
   try {
     const dir = await opendir(dispatchDirs(deps.dataDir).done);
     for await (const entry of dir) {
@@ -108,6 +113,10 @@ export async function pruneDoneArtifacts(
       } catch (err) {
         summary.failed++;
         deps.logger.warn({ id, err }, "done-retention: artifact retained after prune failure");
+      }
+      if (!summary.dryRun && summary.pruned >= maxPruned) {
+        summary.limitReached = true;
+        break;
       }
       if (summary.scanned % 64 === 0) await setImmediate();
     }

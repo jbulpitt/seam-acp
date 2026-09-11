@@ -11,7 +11,7 @@ const load = (file) => import(pathToFileURL(path.join(repo, "packages/core", var
 const { SessionStore } = await load("core/session-store");
 const { DispatchWatcher } = await load("core/dispatch/watcher");
 const { projectAttemptCompletions } = await load("core/dispatch/attempt-recovery");
-const { isDoneDeliveryResolved, reconcileCompletedDoneFiles } = await load("core/dispatch/done-reconcile");
+const { reconcileCompletedDoneFiles } = await load("core/dispatch/done-reconcile");
 const { bindDoneDeliveryResolver, pruneDoneArtifacts } = await load("core/dispatch/done-retention");
 const { dispatchDirs } = await load("core/dispatch/types");
 const logger = pino({ level: "silent" });
@@ -55,7 +55,8 @@ if (phase === "produce") {
   const pruned = await pruneDoneArtifacts(bindDoneDeliveryResolver({ dataDir, logger,
     getDelegation: key => store.getDelegation(key),
     getReportBackByCorrelation: key => store.getReportBackByCorrelation(key),
-    resolveDelivery: isDoneDeliveryResolved,
+    isAttemptDeliveryProven: id => store.turnAttempts.isDeliveryProven(id),
+    getExpirationAuthorization: id => store.getDoneArtifactExpirationAuthorization(id),
   }));
   store.close();
   process.send?.({ event: "recovered", reconciled: result.reconciled, pruned: pruned.pruned,

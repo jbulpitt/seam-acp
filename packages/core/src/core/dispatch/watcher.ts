@@ -165,6 +165,7 @@ export class DispatchWatcher {
   private readonly mayRecover: (id: string) => boolean;
   private readonly retainForRecovery: (id: string) => boolean;
   private readonly beforeAdmission?: () => Promise<void>;
+  private admissionRelease: Promise<void> = Promise.resolve();
   private readonly admissionBarrierTimeoutMs: number;
   private readonly isCompleted: (id: string) => boolean;
   private readonly onResultPublished?: (id: string) => Promise<void>;
@@ -288,7 +289,7 @@ export class DispatchWatcher {
     } else {
       await this.recoverStale();
     }
-    const initialPass = (async () => {
+    this.admissionRelease = (async () => {
       // #303: keep pending admission closed until interrupted running turns have
       // joined the same first tick; deleting this await lets newer pending turns
       // bypass the existing createdUtc ordering while recovery is still running.
@@ -307,8 +308,10 @@ export class DispatchWatcher {
       this.timer = setInterval(() => void this.tick(), this.pollMs);
       // Don't hold the event loop open just for the poller.
       this.timer.unref?.();
-      await this.tick();
     })();
+    const initialPass = this.admissionRelease.then(async () => {
+      if (this.lifecycleEpoch === lifecycleEpoch && this.ready) await this.tick();
+    });
     this.initialDispatchPass = initialPass.catch((err) => {
       this.logger.warn({ err }, "initial dispatch pass failed");
     });
@@ -320,6 +323,12 @@ export class DispatchWatcher {
    * application readiness notification behind paid agent turns. */
   initialDispatchesSettled(): Promise<void> {
     return this.initialDispatchPass;
+  }
+
+  /** Recovery barrier only, not the paid work admitted by the initial tick.
+   * Call after start(); false-wait startup intentionally returns before this. */
+  admissionReleased(): Promise<void> {
+    return this.admissionRelease;
   }
 
   /** False after shutdown closes watcher intake. */

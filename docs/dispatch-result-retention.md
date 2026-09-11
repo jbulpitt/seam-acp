@@ -1,118 +1,131 @@
 # Dispatch result retention (#306)
 
-## Policy
+## Deletion authority
 
-`dispatch/done/` is a delivery-recovery buffer, not an archive or a completion
-index. There is **no age-based grace period** for delivery-resolved results:
-their redundant JSON artifacts are removed after publication or by the next
-background sweep. The sweep runs on startup in the background, then every
-minute. It streams filenames and yields every 64 entries. Resolution reads one
-artifact at a time for routing; prompt/output bodies are never logged, and the
-lifetime directory scan does not hold startup readiness.
+`dispatch/done/` is a delivery-recovery buffer, not a completion index. A
+regular, valid artifact expires only when the corrected #305 canonical
+`isDoneArtifactDeletable` predicate authorizes it. Retention binds that function
+directly; it does not reinterpret ledger status or maintain another delivery
+definition.
 
-Deletion consumes the delivery resolver's canonical durable decision (#305).
-Worker success, a terminal parent ledger row, file age, and an enqueued but
-unfinished report-back are not substitute proof. Explicit disposition belongs
-to that resolver; retention never invents abandonment or a second delivery
-status. Unknown, undelivered, and unresolved legacy artifacts stay in `done/`,
-including malformed files. Retention neither executes a provider nor replays
-an original prompt. Non-regular entries are retained for operator inspection.
+Positive delivery evidence is a recorded successful transport receipt or an
+exactly completed onward child. Failed, timed-out, automatically abandoned,
+search-indeterminate, and terminal/no-onward work **remain retained** unless
+positive evidence subsequently arrives. A terminal reason is not proof.
+Unknown ownership, malformed artifacts, and non-regular entries also remain.
 
-Completed work remains completed after unlink: SQL (`delegation_log` and
-terminal dispatch `turn_attempts`) supplies the boolean used by the watcher
-and Voice Console. Legacy files without SQL completion remain recovery
-authority. Queue leftovers cannot turn a pruned result into a new turn.
+The sole exception for unproven legacy output is #305's separate immutable
+`done_artifact_expirations` authorization: exact dispatch id, operator id,
+reason, and timestamp. Identical repeat authorization is idempotent; conflicting
+authorization is refused. Neither retention, recovery, nor the maintenance CLI
+creates authorization rows. This PR adds no bulk authorization or unauthenticated
+operator endpoint. Having a backup is not authorization and does not weaken proof.
 
-Modern durable outcomes remain in `turn_attempts.outcome_json`; delegation and
-delivery records remain in SQLite. `seam-dispatch --wait` falls back to that
-SQL outcome when its file has already disappeared. **Legacy exception:** a
-read-only metadata audit on 2026-09-11 found 5,060 result files but only 182
-matching SQL outcomes. The other 4,878 are not promised an SQL output archive.
-Pruning a delivery-resolved legacy file can remove its last full local result
-copy; that is intentional expiration, not lossless migration. Confirm this
-legacy disposition at rollout. Unknown/unresolved files are retained.
+There is no age threshold for proven or explicitly authorized output, and no
+age-based expiration of unresolved output. Deletion preserves SQLite outcomes,
+ledger entries, and authorization evidence. Many legacy files have no SQL
+outcome; expiring one without proof intentionally destroys a last local full
+copy and therefore requires the separate explicit operator decision.
 
-This policy does **not remove all copies of prompts/outputs**. SQLite,
-provider session storage, logs, backups, and pre-existing `done-quarantine/`
-have separate lifetimes and are not silently deleted by this change.
+## Runtime and bulk bounds
+
+The post-publication fast path handles an individual already-proven result.
+The background sweep starts only after `dispatchWatcher.start()` plus awaited
+`admissionReleased()` releases #303's recovery barrier. The existing
+`waitForInitialDispatches: false` option returns before that barrier, so an
+await on `start()` alone is insufficient. The separate promise avoids waiting
+for paid work in `initialDispatchesSettled()`. Later sweeps run once per
+minute, single-flight, stream filenames, and yield every 64 entries. Shutdown
+stops and drains retention before closing SQLite.
+
+**Bulk expiration needs a destructive-work bound.** Each mutating sweep
+unlinks at most **1,000 artifacts**, including operator-authorized legacy
+expirations, then returns `limitReached: true`. Later sweeps continue from
+remaining files; unresolved prefixes do not consume the unlink budget and
+cannot permanently starve later eligible files. This replaces an unbounded
+bulk delete with incremental passes. The single-result publication path is
+unchanged. A narrow test may lower the cap; zero, non-integer, or values above
+1,000 are rejected before any deletion.
+
+This is an **item bound on unlinks**, not a whole-sweep wall-clock or read-count
+bound. Scanning an unresolved backlog still requires cooperative enumeration.
+A whole-sweep deadline without a resumable cursor would repeatedly stop at the
+same retained prefix. No such deadline is claimed. Dry runs count the entire
+buffer, without the destructive cap, so the reported eligible count is not a
+truncated page. A 5,040-eligible-file synthetic backlog drains in six passes.
+
+SQL completion checks keep pruned work completed across queue recovery and
+admission. Legacy files without SQL completion remain recovery authority.
+`seam-dispatch --wait` reads the durable SQL outcome if the file disappears
+before its next poll. None of these paths re-executes the original task.
 
 ## Existing backlog and rollout
 
-The same resolver-gated sweep handles the measured 5,040-file backlog; it does
-not require 30 days of age or repeated service restarts. Unknown or unresolved
-rows stay put until #305 establishes delivery or records an explicit terminal
-disposition. Repeating cleanup after a crash is harmless: missing files are
-already pruned, while surviving files are checked against current proof again.
+Deploy compatible SQL-aware readers and the corrected proof foundation before
+enabling retention. Automatic cleanup begins after the admission barrier on
+the first compatible boot; no extra operator action is required for **proven**
+artifacts. This PR does not authorize deployment or production deletion.
 
-Deploy the SQL-aware consumers, SQL-capable operator CLI, and #305 delivery
-resolver **before** applying cleanup to production. Do not run the new pruner
-against an older running watcher: old filesystem-only readers can interpret a
-removed file as permission to replay. The implementation PR does not itself
-authorize a merge or restart. Production deletion is a rollout step, not an
-implicit side effect of tests or a dry run.
-
-After building the integrated #305/#306 head, inspect without writes:
+Read-only audit invocation, after building this worktree:
 
 ```sh
 node scripts/prune-dispatch-done.mjs --data-dir <DATA_DIR> --dry-run
 ```
 
-After compatible consumers are deployed, the automatic sweep handles the
-backlog. An operator may instead explicitly run the same command with `--apply`.
-The command opens SQLite read-only and never migrates schema; `--apply` only
-unlinks resolver-approved regular files under that data directory's `dispatch/done/`.
-It reports counts/bytes, not bodies. `dryRun: true` means `pruned`/`bytes` are
-eligible counts, **not files actually removed**. A missing #305 resolver refuses
-the operation. No production cleanup is performed by the PR's test commands.
+The CLI defaults to dry-run and opens SQLite read-only, without migration or
+environment loading. Missing legacy proof/authorization tables cannot grant
+permission. Its explicit apply mode is only for an independently authorized
+operator after compatible deployment; it has the same 1,000-unlink cap.
+No apply command is part of this PR's validation.
 
-The automatic sweep emits counts (`scanned`, `pruned`, `retained`, `failed`,
-`bytes`) without result bodies. In steady state, regular JSON files remaining
-in `done/` mean unresolved delivery (or a logged unlink/lookup failure awaiting
-retry), not an operator evidence archive. There is no time-based expiry for
-unresolved output: that would silently lose work.
+Summary fields are `scanned`, `pruned`, `retained`, `failed`, `bytes`,
+`dryRun`, and `limitReached`. In dry-run, `pruned` and `bytes` mean eligible,
+not removed. Bodies and parser snippets are not logged. SQLite, provider
+sessions, logs, backups, and pre-existing quarantine have separate retention.
 
-A read-only dry run on 2026-09-11 using #305's canonical resolver scanned
-5,069 artifacts: 3,618 eligible for expiration (12,840,589 logical bytes),
-1,451 retained, zero errors. **No production files were removed.** These are
-point-in-time counts, not a promise that the retained subset is deliverable;
-unresolved historical routes require #305's recovery or explicit disposition.
+The superseded a578fc6 dry run reported 3,618 eligible / 1,451 retained from
+5,069 artifacts. Independent QA later reported 3,634 eligible, only about 666
+with positive evidence. Those unsafe counts included lifecycle-only inference
+and failed onward children; they are **not** valid cleanup targets. The corrected
+PR report records a new command and count, with same-input comparison when
+available. A growing spool means historical snapshots must not be conflated.
 
-## Necessity and non-live checks (#307)
+## Necessity and validation (#307)
 
-- SQL completion lookup: removing it makes completed queue leftovers runnable
-  after pruning; the regression exercises both resume modes.
-- Canonical delivery predicate: removing it deletes captured output before its
-  destination is established; the regression retains a completed but unacked
-  result, then deletes only after the resolver changes its decision.
-- Post-publication hook: removing it recreates already-delivered artifacts
-  because delivery commonly finishes before the watcher writes `done/`.
-- Periodic sweep: removing it strands backlog and parents acknowledged after
-  their own result writer has returned; the regression changes proof later.
-- Dry-run mode: removing its write separation makes an audit delete records.
-  The compiled maintenance CLI regression also checks its default dry-run and
-  explicit apply against private SQL/files, retaining unresolved and unknown rows.
-- Exact basename and regular-file checks: removing them lets malformed ids
-  unlink outside the buffer or silently discard non-file operator evidence.
-- Stop flag and single-flight sweep: removing them lets overlapping intervals
-  duplicate scans or continue reaching SQLite after shutdown.
-- CLI SQL fallback: removing it makes a successful dispatch's `--wait` time out
-  if the next poll happens after its artifact was pruned.
-- Actual process-death test: a disposable child imports the real watcher,
-  attempt store/projection, and done reconciler. SIGKILL lands after durable
-  result publication and before delivery. A fresh process recovers output to a
-  recording sink, proves one execution, and prunes only after acknowledgement.
-  No Discord or provider calls are made; this is not a live delivery certificate.
+- Canonical positive proof: removing it deletes output after failed, timed-out,
+  uncertain, or automatic-abandoned delivery; each has a retention regression.
+- Completed-child/nonce proof: removing either strands positively delivered
+  output; regressions use real SQLite and the shipped no-network nonce lookup.
+- Separate immutable authorization: removing it confuses disposition with
+  destructive operator consent; idempotence/conflict tests preserve the audit.
+- Admission barrier: removing the await lets cleanup race recovery; the test
+  holds the real watcher barrier and checks production composition ordering.
+- Bulk unlink cap: removing it lets one bulk authorization erase the whole
+  backlog in one pass; lower-budget and 5,040-file regressions discriminate.
+- SQL completion: removing it permits stale queue markers to replay pruned
+  work; both resume modes are covered.
+- Post-publication pruning: removing it recreates already-delivered files.
+- Periodic sweep: removing it strands later receipts and old eligible files.
+- Dry-run separation: removing it makes an audit destructive.
+- Exact basename/regular-file checks: removing them permits out-of-buffer
+  unlink or loss of malformed evidence.
+- Stop/single-flight/drain: removing them overlaps scans or uses a closed DB.
+- CLI SQL fallback: removing it turns successful work into a waiting timeout.
+- SIGKILL recovery: a real disposable process dies after publication, then a
+  fresh process delivers captured output to a recording sink without task replay.
+  This tests shipped components, not live Discord/provider delivery.
 
-Focused checks:
+Explicit gates:
 
 ```sh
-npm run build
-SEAM_306_COMPILED=1 ./node_modules/.bin/vitest run \
-  test/dispatch-retention-crash.test.ts --exclude test/acp.int.test.ts
+npm test -- --maxWorkers=2
+./node_modules/.bin/tsc --noEmit -p tsconfig.restart-tests.json
 ./node_modules/.bin/tsc --noEmit -p tsconfig.done-retention-tests.json
-./node_modules/.bin/vitest run --exclude test/acp.int.test.ts --maxWorkers=2
+./node_modules/.bin/tsc --noEmit -p tsconfig.agy-tests.json
+npm run typecheck
+npm run build
+SEAM_306_COMPILED=1 npm test -- test/dispatch-retention-crash.test.ts --maxWorkers=1
 ```
 
-Without `SEAM_306_COMPILED=1`, the child-process regression imports the same
-source components through `tsx`, so the ordinary non-live suite needs no
-pre-existing build. Compiled validation must use the freshly built PR head.
+#289 makes `npm test` non-live by default and prints its selected file scope.
+The live test requires a separate command and opt-in; it is not run here.

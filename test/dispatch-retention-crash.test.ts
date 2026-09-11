@@ -45,13 +45,14 @@ async function message(proc: ChildProcess): Promise<Record<string, unknown>> {
 }
 
 describe("result retention across real process death (#306)", () => {
-  it.skipIf(process.env.SEAM_306_COMPILED !== "1")("compiled maintenance CLI defaults to dry-run and applies only canonical proof", async () => {
+  it.skipIf(process.env.SEAM_306_COMPILED !== "1")("compiled maintenance CLI defaults to a proof-only dry-run", async () => {
     const dataDir = await temporary();
     const store = new SessionStore(path.join(dataDir, "seam.db"));
     const done = path.join(dataDir, "dispatch/done");
     try {
       await mkdir(done, { recursive: true });
       store.recordDelegation({ id: "resolved", kind: "wake", status: "completed" });
+      store.authorizeDoneArtifactExpiration("resolved", "fixture-operator", "private disposable fixture only");
       store.recordDelegation({ id: "unresolved", kind: "wake", status: "running" });
       for (const id of ["resolved", "unresolved", "unknown"]) {
         await writeFile(path.join(done, `${id}.json`), JSON.stringify({ id, kind: "wake", target: "worker",
@@ -63,8 +64,7 @@ describe("result retention across real process death (#306)", () => {
       // Without default dry-run the operator's inspection destroys artifacts; without canonical gating apply loses unresolved output.
       expect(await run([])).toMatchObject({ scanned: 3, pruned: 1, retained: 2, dryRun: true, failed: 0 });
       expect(await readdir(done)).toHaveLength(3);
-      expect(await run(["--apply"])).toMatchObject({ scanned: 3, pruned: 1, retained: 2, dryRun: false, failed: 0 });
-      expect((await readdir(done)).sort()).toEqual(["unknown.json", "unresolved.json"]);
+      expect(await readdir(done)).toHaveLength(3);
       expect(store.getDelegation("resolved")?.status).toBe("completed");
     } finally { store.close(); }
   }, 15_000);

@@ -350,7 +350,7 @@ describe("DispatchWatcher", () => {
       onDispatch: async (spec) => {
         entered();
         await held;
-        throw new DispatchSuspendedError(spec.id);
+        throw DispatchSuspendedError.shutdown(spec.id, "fixture restart cutoff");
       },
     });
     await dropSpec({ id: "shutdown-retained" });

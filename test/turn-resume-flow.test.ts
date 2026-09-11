@@ -171,7 +171,7 @@ async function seedInterrupted(spec: DispatchSpec = handoffSpec()): Promise<void
     await opts.onSession?.("acp-recorded");
     opts.lifecycle?.beforePrompt();
     orch.suspendForRestart();
-    throw new DispatchSuspendedError(spec.id);
+    throw DispatchSuspendedError.shutdown(spec.id, "fixture restart");
   };
   await expect(orch.dispatchInjectTurn({ ...spec, resume: false })).rejects.toBeInstanceOf(DispatchSuspendedError);
 }
@@ -661,7 +661,9 @@ describe("watcher recoverStale vs resumeEnabled", () => {
     expect(retained.generation).toBe(before.generation);
     expect(retained.ownerBoot).toBe(before.ownerBoot);
     expect(retained.stalledUtc).toEqual(expect.any(String));
-    expect(sent.some((message) => message.channel === "thread-boss" && message.text.includes("stalled"))).toBe(true);
+    // #333: the notice names the cause now instead of saying "stalled after restart".
+    expect(sent.some((message) => message.channel === "thread-boss"
+      && message.text.includes("could not resume:"))).toBe(true);
     expect(await readdir(dirs.running)).toEqual([`${spec.id}.json`]);
   });
 
@@ -698,12 +700,20 @@ describe("watcher recoverStale vs resumeEnabled", () => {
     expect(after.ownerBoot).toBe(before.ownerBoot);
     expect(after.generation).toBe(before.generation);
     expect(after.stalledUtc).toEqual(expect.any(String));
-    expect(after.stalledReason).toMatch(/did not begin/);
+    // #333: the recorded reason is the specific refusal, not a constant that
+    // described where execution stopped and was identical for all 65 sites.
+    expect(after.stalledReason).toMatch(/execution failed before the provider took the turn/);
     expect(after.stallNoticeUtc).toEqual(expect.any(String));
     expect(sent).toContainEqual(expect.objectContaining({
       channel: "thread-boss",
       text: expect.stringContaining(`/seam workflows`),
     }));
+    // #333: the notice carries the specific cause. The old sentence was the
+    // same for all 65 throw sites, so an operator could not tell a transient
+    // condition from a permanent one without reading the source.
+    const notice = sent.find((message) => message.channel === "thread-boss")!.text;
+    expect(notice).toContain("execution failed before the provider took the turn");
+    expect(notice).not.toContain("is stalled after restart");
     expect(orch.inspectChannelQueue("thread-worker", Date.now())).toMatchObject({
       state: "stalled",
       runtimeBusy: false,

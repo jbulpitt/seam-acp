@@ -566,6 +566,17 @@ const STATUS_EDIT_DEBOUNCE_MS = 2500;
 const STATUS_HEARTBEAT_MS = 5000;
 const PLATFORM = "discord";
 
+/**
+ * Last resort when a quarantine has no recorded cause (#333).
+ *
+ * Reachable only from the boot re-notice path, for rows quarantined by a build
+ * that predates classified refusals. A live refusal always carries a reason —
+ * the constructor refuses an empty one — so seeing this in `stalled_reason`
+ * means the row is old, not that a new site forgot to explain itself.
+ */
+const RETAINED_WITHOUT_REASON =
+  "resume was retained after startup readiness; execution did not begin";
+
 /** Stable bounded HTTP-facing failure text; never retain an Error/cause chain. */
 function ingestFailureText(err: unknown): string {
   const raw = err instanceof Error ? err.message : String(err);
@@ -2020,23 +2031,34 @@ export class Orchestrator {
     };
   }
 
-  /** Production observer wired into DispatchWatcher. A retained recovery is
-   * not a terminal failure, but it is now an explicit durable quarantine with
-   * a requester-facing notice and operator-owned resume/abandon controls. */
-  async observeRetainedDispatch(spec: DispatchSpec): Promise<void> {
-    const reason = "resume was retained after startup readiness; execution did not begin";
+  /**
+   * Production observer wired into DispatchWatcher. A retained recovery is not
+   * a terminal failure, but it is an explicit durable quarantine with a
+   * requester-facing notice and operator-owned resume/abandon controls.
+   *
+   * #333: only `defect` refusals arrive here now, and the refusal carries the
+   * reason. The old text — "is stalled after restart" — described WHERE
+   * execution stopped, which was the same sentence for all 65 throw sites and
+   * told the operator nothing they could act on. `stalled_reason` now records
+   * the specific cause, which is also what makes the Phase 4 distribution
+   * measurable at all.
+   */
+  async observeRetainedDispatch(spec: DispatchSpec, err?: DispatchSuspendedError): Promise<void> {
+    const reason = err?.reason
+      ?? this.store.turnAttempts.get(spec.id)?.stalledReason
+      ?? RETAINED_WITHOUT_REASON;
     this.store.turnAttempts.markStalled(spec.id, reason);
     const stalled = this.store.turnAttempts.get(spec.id);
     if (!stalled?.stalledUtc || stalled.stallNoticeUtc) return;
     const requester = spec.returnTo ?? spec.originThreadRef ?? spec.target;
     await this.adapter.sendMessage(
       { platform: PLATFORM, id: requester },
-      `⚠️ Dispatch \`${spec.id}\` to <#${spec.target}> is stalled after restart. ` +
+      `⚠️ Dispatch \`${spec.id}\` to <#${spec.target}> could not resume: ${reason}. ` +
         "It remains suspended and was not replayed. Use `/seam workflows` to resume or abandon it."
     );
     this.store.turnAttempts.markStallNoticeDelivered(spec.id);
     this.logger.warn(
-      { id: spec.id, target: spec.target, requester },
+      { id: spec.id, target: spec.target, requester, reason },
       "dispatch: retained attempt quarantined as stalled"
     );
   }
@@ -3084,8 +3106,15 @@ export class Orchestrator {
     scheduledAttempt?: TurnAttempt
   ): Promise<void> {
     this.assertQueueFence(queueFence);
-    if (scheduledAttempt && (this.restartCutoff || !this.store.turnAttempts.isCurrent(scheduledAttempt))) {
-      throw new DispatchSuspendedError(scheduledAttempt.id);
+    if (scheduledAttempt) {
+      if (this.restartCutoff) {
+        throw DispatchSuspendedError.shutdown(scheduledAttempt.id,
+          "restart cutoff reached before the scheduled turn started");
+      }
+      if (!this.store.turnAttempts.isCurrent(scheduledAttempt)) {
+        throw DispatchSuspendedError.superseded(scheduledAttempt.id,
+          "a newer attempt generation owns this scheduled occurrence");
+      }
     }
     // #80 v1: detach is a handleMessage gate only. Schedules / wakes / watches
     // / handoffs / steer synthesize an IncomingMessage and enter HERE, so they
@@ -3108,7 +3137,8 @@ export class Orchestrator {
     if (admission || scheduledAttempt) {
       if (priorHuman?.state === "completed" || priorHuman?.state === "cancelled") return;
       if (priorHuman?.acpSessionId && record.acpSessionId && priorHuman.acpSessionId !== record.acpSessionId) {
-        throw new DispatchSuspendedError(priorHuman.id);
+        throw DispatchSuspendedError.defect(priorHuman.id,
+          "the thread moved to a different ACP session since this turn was recorded");
       }
       const d = this.router.describeConfig(record);
       const p = this.router.getProfile(d.agent.value, d.location.value);
@@ -3133,7 +3163,7 @@ export class Orchestrator {
           promptStarted: scheduledAttempt.promptStarted,
           acpSessionId: scheduledAttempt.acpSessionId,
         });
-        if (!drift.match) throw new DispatchSuspendedError(scheduledAttempt.id, drift.reason);
+        if (!drift.match) throw DispatchSuspendedError.defect(scheduledAttempt.id, drift.reason);
       } else if (admission) {
         this.store.turnAttempts.registerOwner(this.attemptBoot);
         humanAttempt = this.store.turnAttempts.claim({
@@ -3144,30 +3174,56 @@ export class Orchestrator {
       }
       if (this.restartCutoff) {
         this.store.turnAttempts.suspendBoot(this.attemptBoot);
-        throw new DispatchSuspendedError(humanAttempt!.id);
+        throw DispatchSuspendedError.shutdown(humanAttempt!.id,
+          "restart cutoff reached before the prompt was submitted");
       }
       // Never restage old attachments, re-transcribe voice or rebuild the
       // original brief while resuming a submitted human turn.
       if (humanResume) msg = { ...msg, text: CONTINUE_PROMPT, attachments: undefined };
     }
     const humanCurrent = () => !humanAttempt || (!this.restartCutoff && this.store.turnAttempts.isCurrent(humanAttempt));
+    /**
+     * `humanCurrent` as a REASON rather than a boolean (#333).
+     *
+     * The predicate is false for two unrelated events — this process is going
+     * down, or a newer generation took the turn — and collapsing them into one
+     * silent throw is what made an ordinary restart look like it stranded
+     * work. Neither is operator-actionable, but they are not the same event
+     * and the log has to be able to tell them apart.
+     */
+    const humanRefusal = (): DispatchSuspendedError | null => {
+      if (!humanAttempt) return null;
+      if (this.restartCutoff) {
+        return DispatchSuspendedError.shutdown(humanAttempt.id,
+          "restart cutoff reached before this turn finished");
+      }
+      if (!this.store.turnAttempts.isCurrent(humanAttempt)) {
+        return DispatchSuspendedError.superseded(humanAttempt.id,
+          "a newer attempt generation owns this turn");
+      }
+      return null;
+    };
     const completeHuman = (error?: string, cancelled = false, stopReason?: string): void => {
       if (!humanAttempt || humanOutcomeOwned) return;
-      if (!humanCurrent()) throw new DispatchSuspendedError(humanAttempt.id);
+      const refusal = humanRefusal();
+      if (refusal) throw refusal;
       if (humanResume && !humanPromptSubmitted) {
         const reason = error ?? "strict resume stopped before the continuation prompt was submitted";
         this.store.turnAttempts.markStalled(humanAttempt.id, reason);
-        throw new DispatchSuspendedError(humanAttempt.id, reason);
+        throw DispatchSuspendedError.defect(humanAttempt.id, reason);
       }
       if (cancelled) {
         this.store.turnAttempts.cancel(humanAttempt.id);
-        throw new DispatchSuspendedError(humanAttempt.id);
+        throw DispatchSuspendedError.superseded(humanAttempt.id, "the turn was cancelled");
       }
       humanOutcomeOwned = this.store.turnAttempts.complete(humanAttempt, {
         id: humanAttempt.id, target: channel.id, status: error ? "failed" : "completed",
         output: humanOutput, error, stopReason, finishedUtc: new Date().toISOString(),
       });
-      if (!humanOutcomeOwned) throw new DispatchSuspendedError(humanAttempt.id);
+      if (!humanOutcomeOwned) {
+        throw DispatchSuspendedError.superseded(humanAttempt.id,
+          "another attempt generation already recorded this turn's outcome");
+      }
       if (scheduledAttempt) this.scheduledActivity?.phase(scheduledAttempt.id, "output");
     };
     this.quotaPoller?.recordTurnStart(record.agentId);
@@ -3586,7 +3642,8 @@ export class Orchestrator {
       if (!contextIdentity || !matchesContextBudget(observedContextBudget, contextIdentity)) observedContextBudget = undefined;
       this.assertQueueFence(queueFence);
       if (humanAttempt) {
-        if (!humanCurrent()) throw new DispatchSuspendedError(humanAttempt.id);
+        const refusal = humanRefusal();
+        if (refusal) throw refusal;
         this.store.turnAttempts.bindRuntime(humanAttempt, activeRuntime.getProcessId(), activeRuntime.getProviderIdentity());
         this.store.turnAttempts.bind(humanAttempt, activeRuntime.getSessionInfo()?.sessionId ?? record.acpSessionId);
       }
@@ -4093,13 +4150,15 @@ export class Orchestrator {
       try {
         this.assertQueueFence(queueFence);
         if (humanAttempt) {
-          if (!humanCurrent()) throw new DispatchSuspendedError(humanAttempt.id);
+          const beforePromptRefusal = humanRefusal();
+          if (beforePromptRefusal) throw beforePromptRefusal;
           this.store.turnAttempts.startPrompt(humanAttempt);
           if (scheduledAttempt) this.scheduledActivity?.phase(scheduledAttempt.id, "provider");
           humanPromptSubmitted = true;
           // SQL owns this phase. The file is a recoverable inventory projection.
           await patchLiveMarker(this.config.DATA_DIR, liveMarkerId, { promptStarted: true });
-          if (!humanCurrent()) throw new DispatchSuspendedError(humanAttempt.id);
+          const afterPromptRefusal = humanRefusal();
+          if (afterPromptRefusal) throw afterPromptRefusal;
         }
         result = await raceWithTimeout(activeRuntime.prompt(promptText, promptAttachments), timeoutMs);
         this.assertQueueFence(queueFence);
@@ -4374,7 +4433,8 @@ export class Orchestrator {
         return;
       }
       if (humanAttempt) {
-        if (!humanCurrent() && !humanOutcomeOwned) throw new DispatchSuspendedError(humanAttempt.id);
+        const refusal = humanOutcomeOwned ? null : humanRefusal();
+        if (refusal) throw refusal;
         if (err instanceof DispatchSuspendedError) throw err;
         completeHuman(err instanceof Error ? err.message : String(err));
       }
@@ -5261,7 +5321,8 @@ export class Orchestrator {
         opts.lifecycle?.onRuntime?.(rt.getProcessId?.(), rt.getProviderIdentity?.());
         if (opts.resumeSessionId) {
           if (opts.lifecycle && !rt.supportsSessionLoad?.()) {
-            throw new DispatchSuspendedError(opts.logContext?.dispatch as string ?? "unknown");
+            throw DispatchSuspendedError.defect(opts.logContext?.dispatch as string ?? "unknown",
+              "the provider does not support session/load, so this turn cannot be reattached");
           }
           // #76: resume against the recorded session, never newSession().
           await rt.loadSession({
@@ -8620,19 +8681,27 @@ export class Orchestrator {
       // Completed-output ownership never re-enters a provider. Boot projection
       // normally settles this before queue intake; this is the last race gate.
       this.logger.debug({ dispatch: spec.id }, "dispatch: already ledgered (durable output); skipping execution");
-      if (!prior.outcome) throw new DispatchSuspendedError(spec.id);
+      if (!prior.outcome) {
+        throw DispatchSuspendedError.defect(spec.id,
+          "attempt is marked completed but carries no recorded outcome");
+      }
       if (prior.outcome.error) throw new DispatchTurnError(prior.outcome.error,
         prior.outcome.output ?? "", prior.outcome.stopReason, prior.outcome.workerStatus,
         prior.outcome.workerError, true, prior.outcome.suppressedOnward);
       return { output: prior.outcome.output ?? "", stopReason: prior.outcome.stopReason ?? "" };
     }
-    if (prior?.state === "cancelled" || this.restartCutoff) throw new DispatchSuspendedError(spec.id);
+    if (prior?.state === "cancelled") {
+      throw DispatchSuspendedError.superseded(spec.id, "the dispatch was cancelled");
+    }
+    if (this.restartCutoff) {
+      throw DispatchSuspendedError.shutdown(spec.id, "restart cutoff reached before execution began");
+    }
     try {
       return await this.dispatchInjectTurnOwned(prior ? { ...prior.spec, resume: prior.promptStarted } : spec);
     } catch (err) {
       let current;
       try { current = this.store.turnAttempts?.get(spec.id); }
-      catch { throw new DispatchSuspendedError(spec.id); }
+      catch (readErr) { throw DispatchSuspendedError.from(readErr, spec.id, "reading the attempt row failed"); }
       if (current?.state === "cancelled") {
         this.interruptedDispatches.delete(spec.id);
         let completionPending = false;
@@ -8654,8 +8723,11 @@ export class Orchestrator {
         };
         let won = false;
         try { won = this.store.turnAttempts.complete(current, outcome); }
-        catch { throw new DispatchSuspendedError(spec.id); }
-        if (!won) throw new DispatchSuspendedError(spec.id);
+        catch (completeErr) { throw DispatchSuspendedError.from(completeErr, spec.id, "recording the failure outcome failed"); }
+        if (!won) {
+          throw DispatchSuspendedError.superseded(spec.id,
+            "another attempt generation already recorded this dispatch's outcome");
+        }
         try {
           await this.replayCompletedDispatch(outcome, completionRoute(outcome, this.store.getDelegation(spec.id)));
         } catch {
@@ -8666,7 +8738,8 @@ export class Orchestrator {
       if (current && current.state !== "completed") {
         // Includes pre-provider acquisition failure on recovery. Retain its
         // identity/history for inspection; never turn load failure into replay.
-        throw new DispatchSuspendedError(spec.id);
+        throw DispatchSuspendedError.defect(spec.id,
+          `execution failed before the provider took the turn and the attempt is ${current.state}`);
       }
       throw err;
     }
@@ -8734,20 +8807,25 @@ export class Orchestrator {
     if (isResume && !previousAttempt) {
       // Legacy ACP pointers have no frozen provider/account/host identity.
       // Retain for explicit reconciliation; do not certify a guessed identity.
-      throw new DispatchSuspendedError(spec.id);
+      throw DispatchSuspendedError.defect(spec.id,
+        "resume requested but no recorded attempt exists to resume from");
     }
     const resumeSessionId = previousAttempt?.acpSessionId ??
       (ledger?.acpSessionId && ledger.acpSessionId.length > 0
         ? ledger.acpSessionId
         : undefined) ??
       (record.acpSessionId && record.acpSessionId.length > 0 ? record.acpSessionId : undefined);
-    if (isResume && !resumeSessionId) throw new DispatchSuspendedError(spec.id);
+    if (isResume && !resumeSessionId) {
+      throw DispatchSuspendedError.defect(spec.id,
+        "resume requested but no ACP session id was ever recorded for this dispatch");
+    }
     if (previousAttempt && previousAttempt.promptStarted &&
       (!resumeSessionId || !isLocalLocation(workerLocation) || (presetProfile?.id ?? record.agentId) !== "codex")) {
       // Initial auto-recovery scope is local Codex (live acceptance is a
       // separate gate). Other providers/remote slots
       // remain visible and retained, not silently replayed or fallback-local.
-      throw new DispatchSuspendedError(spec.id);
+      throw DispatchSuspendedError.defect(spec.id,
+        `automatic continuation covers local codex with a recorded session only; this is ${presetProfile?.id ?? record.agentId} at ${workerLocation}`);
     }
     // Handoff feedback channel (#62): when the dispatch opts into watchFeedback,
     // append the standing poll_inbox instruction AFTER any preset-identity
@@ -8861,7 +8939,9 @@ export class Orchestrator {
 
     const run = async (queueFence?: ChannelQueueFence): Promise<{ output: string; stopReason: string }> => {
       this.assertQueueFence(queueFence);
-      if (this.restartCutoff) throw new DispatchSuspendedError(spec.id);
+      if (this.restartCutoff) {
+        throw DispatchSuspendedError.shutdown(spec.id, "restart cutoff reached before the turn started");
+      }
       const described = this.router.describeConfig?.(record);
       const selectedProfile = presetProfile ?? this.router.getProfile?.(described?.agent?.value ?? record.agentId, workerLocation);
       const identity = executionIdentity({
@@ -8889,19 +8969,26 @@ export class Orchestrator {
         isCurrent: () => !this.restartCutoff && this.store.turnAttempts.isCurrent(attempt),
         onRuntime: (pid, providerIdentity) => {
           try { this.store.turnAttempts.bindRuntime(attempt, pid, providerIdentity); }
-          catch { throw new DispatchSuspendedError(spec.id); }
+          catch (bindErr) { throw DispatchSuspendedError.from(bindErr, spec.id, "binding the runtime to the attempt failed"); }
         },
         beforePrompt: () => {
           try {
-            if (this.restartCutoff) throw new DispatchSuspendedError(spec.id);
+            if (this.restartCutoff) {
+              throw DispatchSuspendedError.shutdown(spec.id, "restart cutoff reached before prompt submission");
+            }
             this.assertQueueFence(queueFence);
             this.store.turnAttempts.startPrompt(attempt);
             submittedThisAttempt = true;
-          } catch { throw new DispatchSuspendedError(spec.id); }
+          } catch (promptErr) { throw DispatchSuspendedError.from(promptErr, spec.id, "recording prompt submission failed"); }
         },
         onOutcome: (outcome) => {
-          if (this.restartCutoff) throw new DispatchSuspendedError(spec.id);
-          if (isResume && !submittedThisAttempt) throw new DispatchSuspendedError(spec.id);
+          if (this.restartCutoff) {
+            throw DispatchSuspendedError.shutdown(spec.id, "restart cutoff reached before the outcome was recorded");
+          }
+          if (isResume && !submittedThisAttempt) {
+            throw DispatchSuspendedError.defect(spec.id,
+              "a resumed turn produced an outcome without this attempt submitting a prompt");
+          }
           const suppressed = Boolean(outcome.cancelled || this.interruptedDispatches.has(spec.id) || !this.queueFenceCurrent(queueFence));
           const workerStatus = outcome.timedOut ? "timed_out" : outcome.error ? "failed" : "completed";
           // Winner and full onward plan captured BEFORE finally/result callbacks,
@@ -8915,8 +9002,11 @@ export class Orchestrator {
               inlinedReportBack: shouldInlineCardReportBack(spec), suppressedOnward: suppressed,
               finishedUtc: new Date().toISOString(),
             });
-          } catch { throw new DispatchSuspendedError(spec.id); }
-          if (!outcomeOwned) throw new DispatchSuspendedError(spec.id);
+          } catch (completeErr) { throw DispatchSuspendedError.from(completeErr, spec.id, "recording the outcome failed"); }
+          if (!outcomeOwned) {
+            throw DispatchSuspendedError.superseded(spec.id,
+              "another attempt generation already recorded this dispatch's outcome");
+          }
         },
         mayDeleteSession: () => outcomeOwned || this.store.turnAttempts.get(spec.id)?.state === "cancelled",
       } : undefined;
@@ -9182,10 +9272,13 @@ export class Orchestrator {
           // transition. Write the session id now, before prompt(), so a
           // SIGKILL still leaves a pointer on the ledger (#75).
           onSession: (sessionId) => {
-            if (!this.queueFenceCurrent(queueFence)) throw new DispatchSuspendedError(spec.id);
+            if (!this.queueFenceCurrent(queueFence)) {
+              throw DispatchSuspendedError.superseded(spec.id,
+                "the channel queue was fenced to a newer epoch");
+            }
             if (attempt) {
               try { this.store.turnAttempts.bind(attempt, sessionId); }
-              catch { throw new DispatchSuspendedError(spec.id); }
+              catch (sessionErr) { throw DispatchSuspendedError.from(sessionErr, spec.id, "recording the ACP session id failed"); }
             }
             try {
               this.store.updateDelegationStatus(spec.id, "running", {
@@ -9624,7 +9717,9 @@ export class Orchestrator {
     const isResume = spec.resume === true;
     try {
       previousAttempt = attemptStore?.get(spec.id);
-      if (this.restartCutoff) throw new DispatchSuspendedError(spec.id);
+      if (this.restartCutoff) {
+        throw DispatchSuspendedError.shutdown(spec.id, "restart cutoff reached before the ingest turn started");
+      }
       const notifyId = isDiscordSnowflake(spec.target) ? spec.target : undefined;
       const endpoint = spec.correlationId ? this.store.getIngestEndpoint(spec.correlationId) : null;
       const presetName = endpoint?.preset ?? spec.preset;
@@ -9706,7 +9801,10 @@ export class Orchestrator {
         ...(mcpServers ? { mcpServers } : {}),
       });
       const resumeSessionId = previousAttempt?.acpSessionId ?? undefined;
-      if (isResume && !resumeSessionId) throw new DispatchSuspendedError(spec.id);
+      if (isResume && !resumeSessionId) {
+        throw DispatchSuspendedError.defect(spec.id,
+          "resume requested but no ACP session id was ever recorded for this dispatch");
+      }
       if (
         previousAttempt?.promptStarted &&
         (!isResume || !resumeSessionId || !isLocalLocation(location) || profile.id !== "codex")
@@ -9714,7 +9812,8 @@ export class Orchestrator {
         // Initial automatic continuation scope is the same as generic #250:
         // exact local Codex with a durable ACP handle. Other provider/host
         // attempts remain suspended for explicit operator reconciliation.
-        throw new DispatchSuspendedError(spec.id);
+        throw DispatchSuspendedError.defect(spec.id,
+          `automatic continuation covers local codex with a recorded session only; this is ${profile.id} at ${location}`);
       }
       const identity = executionIdentity({
         agentId,
@@ -9736,24 +9835,39 @@ export class Orchestrator {
             !this.restartCutoff && Boolean(attempt && attemptStore.isCurrent(attempt)),
           onRuntime: (pid, providerIdentity) => {
             try {
-              if (!attempt) throw new DispatchSuspendedError(spec.id);
+              if (!attempt) {
+                throw DispatchSuspendedError.defect(spec.id, "no attempt was claimed for this ingest turn");
+              }
               attemptStore.bindRuntime(attempt, pid, providerIdentity);
-            } catch {
-              throw new DispatchSuspendedError(spec.id);
+            } catch (bindErr) {
+              throw DispatchSuspendedError.from(bindErr, spec.id, "binding the runtime to the attempt failed");
             }
           },
           beforePrompt: () => {
             try {
-              if (this.restartCutoff || !attempt) throw new DispatchSuspendedError(spec.id);
+              if (this.restartCutoff) {
+                throw DispatchSuspendedError.shutdown(spec.id, "restart cutoff reached before prompt submission");
+              }
+              if (!attempt) {
+                throw DispatchSuspendedError.defect(spec.id, "no attempt was claimed for this ingest turn");
+              }
               attemptStore.startPrompt(attempt);
               submittedThisAttempt = true;
-            } catch {
-              throw new DispatchSuspendedError(spec.id);
+            } catch (promptErr) {
+              throw DispatchSuspendedError.from(promptErr, spec.id, "recording prompt submission failed");
             }
           },
           onOutcome: (outcome) => {
-            if (this.restartCutoff || !attempt) throw new DispatchSuspendedError(spec.id);
-            if (isResume && !submittedThisAttempt) throw new DispatchSuspendedError(spec.id);
+            if (this.restartCutoff) {
+              throw DispatchSuspendedError.shutdown(spec.id, "restart cutoff reached before the outcome was recorded");
+            }
+            if (!attempt) {
+              throw DispatchSuspendedError.defect(spec.id, "no attempt was claimed for this ingest turn");
+            }
+            if (isResume && !submittedThisAttempt) {
+              throw DispatchSuspendedError.defect(spec.id,
+                "a resumed turn produced an outcome without this attempt submitting a prompt");
+            }
             const workerStatus = outcome.timedOut
               ? "timed_out"
               : outcome.error || outcome.cancelled
@@ -9774,10 +9888,13 @@ export class Orchestrator {
                 correlationId: spec.correlationId,
                 finishedUtc: new Date().toISOString(),
               });
-            } catch {
-              throw new DispatchSuspendedError(spec.id);
+            } catch (completeErr) {
+              throw DispatchSuspendedError.from(completeErr, spec.id, "recording the outcome failed");
             }
-            if (!outcomeOwned) throw new DispatchSuspendedError(spec.id);
+            if (!outcomeOwned) {
+              throw DispatchSuspendedError.superseded(spec.id,
+                "another attempt generation already recorded this dispatch's outcome");
+            }
           },
           mayDeleteSession: () =>
             outcomeOwned || attemptStore.get(spec.id)?.state === "cancelled",
@@ -9786,7 +9903,9 @@ export class Orchestrator {
       let outputTo: ChannelRef | undefined;
       if (notifyId) {
         const live = await this.threadLiveState(notifyId);
-        if (this.restartCutoff) throw new DispatchSuspendedError(spec.id);
+        if (this.restartCutoff) {
+          throw DispatchSuspendedError.shutdown(spec.id, "restart cutoff reached while resolving the output thread");
+        }
         if (live === "ok") {
           outputTo = { platform: PLATFORM, id: notifyId };
         }
@@ -9812,11 +9931,13 @@ export class Orchestrator {
         timeoutMs: this.config.TURN_TIMEOUT_SECONDS * 1000,
         onSession: (sessionId) => {
           if (attemptStore) {
-            if (!attempt) throw new DispatchSuspendedError(spec.id);
+            if (!attempt) {
+              throw DispatchSuspendedError.defect(spec.id, "no attempt was claimed for this ingest turn");
+            }
             try {
               attemptStore.bind(attempt, sessionId);
-            } catch {
-              throw new DispatchSuspendedError(spec.id);
+            } catch (sessionErr) {
+              throw DispatchSuspendedError.from(sessionErr, spec.id, "recording the ACP session id failed");
             }
           }
           try {
@@ -9856,8 +9977,8 @@ export class Orchestrator {
       let attemptState: TurnAttempt["state"] | undefined;
       try {
         attemptState = attemptStore?.get(spec.id)?.state;
-      } catch {
-        if (attempt) failure = new DispatchSuspendedError(spec.id);
+      } catch (stateErr) {
+        if (attempt) failure = DispatchSuspendedError.from(stateErr, spec.id, "reading the final attempt state failed");
       }
       const cancelled = attemptState === "cancelled";
       const suspended = failure instanceof DispatchSuspendedError && !cancelled;
@@ -11182,10 +11303,20 @@ export class Orchestrator {
         await this.runScheduledPromptInner(occurrence.row, { occurrence, attempt });
       } catch (err) {
         if (err instanceof DispatchSuspendedError) {
-          if (err.reason) {
+          // #333: this used to branch on whether a reason happened to be
+          // present, which quarantined exactly the five sites that had one and
+          // silently suspended the other sixty. Every refusal carries a reason
+          // now, so presence says nothing — the CLASS decides. A shutdown or a
+          // superseded occurrence is somebody else's work and must stay
+          // suspended without a quarantine record.
+          if (err.suspension === "defect") {
             this.store.turnAttempts.markStalled(attempt.id, err.reason);
             this.patchScheduledStatus(row.id, `retained: ${err.reason}`);
-          } else this.store.turnAttempts.suspend(attempt.id, this.attemptBoot);
+          } else {
+            this.store.turnAttempts.suspend(attempt.id, this.attemptBoot);
+            this.logger.debug({ id: attempt.id, suspension: err.suspension, reason: err.reason },
+              "scheduled: occurrence handed off without operator action");
+          }
           return;
         }
         if (!this.store.turnAttempts.isCurrent(attempt) || this.restartCutoff) return;
@@ -11313,15 +11444,20 @@ export class Orchestrator {
   private async runScheduledPromptInner(row: ScheduledPrompt, owned?: { occurrence: PreparedScheduledOccurrence; attempt: TurnAttempt }): Promise<void> {
     const assertOwned = (): void => {
       if (!owned) return;
-      if (this.restartCutoff || !this.store.turnAttempts.isCurrent(owned.attempt)) {
-        throw new DispatchSuspendedError(owned.attempt.id);
+      if (this.restartCutoff) {
+        throw DispatchSuspendedError.shutdown(owned.attempt.id,
+          "restart cutoff reached before the scheduled turn finished");
+      }
+      if (!this.store.turnAttempts.isCurrent(owned.attempt)) {
+        throw DispatchSuspendedError.superseded(owned.attempt.id,
+          "a newer attempt generation owns this scheduled occurrence");
       }
       const drift = compareExecutionIdentity(owned.occurrence.execution.fingerprint,
         this.scheduleExecution(row).fingerprint, {
           promptStarted: owned.attempt.promptStarted,
           acpSessionId: owned.attempt.acpSessionId,
         });
-      if (!drift.match) throw new DispatchSuspendedError(owned.attempt.id, drift.reason);
+      if (!drift.match) throw DispatchSuspendedError.defect(owned.attempt.id, drift.reason);
     };
     assertOwned();
     const id = row.id;
@@ -11337,9 +11473,15 @@ export class Orchestrator {
     const skip = (): void => {
       if (!owned) return;
       const a = owned.attempt;
-      if (a.promptStarted) throw new DispatchSuspendedError(a.id);
+      if (a.promptStarted) {
+        throw DispatchSuspendedError.defect(a.id,
+          "the occurrence was skipped after its prompt had already been submitted");
+      }
       if (!this.store.turnAttempts.complete(a, { id: a.id, target: row.channelRef,
-        status: "completed", output: "", finishedUtc: new Date().toISOString() })) throw new DispatchSuspendedError(a.id);
+        status: "completed", output: "", finishedUtc: new Date().toISOString() })) {
+        throw DispatchSuspendedError.superseded(a.id,
+          "another attempt generation already recorded this occurrence's outcome");
+      }
       this.store.turnAttempts.markDeliveryDone(a.id);
     };
 
@@ -11414,7 +11556,14 @@ export class Orchestrator {
         // turn-level error reporting and does not surface it here.
         if (owned) {
           const done = this.store.turnAttempts.get(owned.attempt.id)!;
-          if (done.state === "active" || done.state === "suspended") throw new DispatchSuspendedError(done.id);
+          if (done.state === "active") {
+            throw DispatchSuspendedError.superseded(done.id,
+              "the scheduled occurrence is still active under another owner");
+          }
+          if (done.state === "suspended") {
+            throw DispatchSuspendedError.defect(done.id,
+              "the scheduled turn returned without settling its attempt");
+          }
           this.patchScheduledStatus(id, done.state === "cancelled" ? "aborted: user turn"
             : done.outcome?.status === "failed" ? "error: live turn failed" : "ok");
         } else this.patchScheduledStatus(id, aborted ? "aborted: user turn" : "ok");
@@ -11577,19 +11726,37 @@ export class Orchestrator {
           isCurrent: () => !this.restartCutoff && this.store.turnAttempts.isCurrent(attempt!),
           onRuntime: (pid: number | undefined, providerIdentity?: string) => this.store.turnAttempts.bindRuntime(attempt!, pid, providerIdentity),
           beforePrompt: () => {
-            if (this.restartCutoff) throw new DispatchSuspendedError(attempt!.id);
+            if (this.restartCutoff) {
+              throw DispatchSuspendedError.shutdown(attempt!.id,
+                "restart cutoff reached before prompt submission");
+            }
             this.store.turnAttempts.startPrompt(attempt!); submitted = true;
             this.scheduledActivity?.phase(attempt!.id, "provider");
           },
           onOutcome: (outcome: InjectTurnResult) => {
-            if (this.restartCutoff || !this.store.turnAttempts.isCurrent(attempt!) || resume && !submitted) {
-              throw new DispatchSuspendedError(attempt!.id);
+            if (this.restartCutoff) {
+              throw DispatchSuspendedError.shutdown(attempt!.id,
+                "restart cutoff reached before the outcome was recorded");
             }
-            if (outcome.cancelled) { this.store.turnAttempts.cancel(attempt!.id); throw new DispatchSuspendedError(attempt!.id); }
+            if (!this.store.turnAttempts.isCurrent(attempt!)) {
+              throw DispatchSuspendedError.superseded(attempt!.id,
+                "a newer attempt generation owns this scheduled occurrence");
+            }
+            if (resume && !submitted) {
+              throw DispatchSuspendedError.defect(attempt!.id,
+                "a resumed turn produced an outcome without this attempt submitting a prompt");
+            }
+            if (outcome.cancelled) {
+              this.store.turnAttempts.cancel(attempt!.id);
+              throw DispatchSuspendedError.superseded(attempt!.id, "the scheduled turn was cancelled");
+            }
             completed = this.store.turnAttempts.complete(attempt!, { id: attempt!.id, target: record.channelRef,
               status: outcome.error ? "failed" : "completed", output: outcome.text, error: outcome.error,
               stopReason: outcome.stopReason, finishedUtc: new Date().toISOString() });
-            if (!completed) throw new DispatchSuspendedError(attempt!.id);
+            if (!completed) {
+              throw DispatchSuspendedError.superseded(attempt!.id,
+                "another attempt generation already recorded this occurrence's outcome");
+            }
           },
           mayDeleteSession: () => completed || this.store.turnAttempts.get(attempt!.id)?.state === "cancelled",
           onCleanup: () => this.scheduledActivity?.phase(attempt!.id, "cleanup"),

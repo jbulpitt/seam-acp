@@ -2014,6 +2014,17 @@ export class SessionStore {
     return row ? mapLedger(row) : null;
   }
 
+  /** Completion, not delivery: prevents re-executing work after its redundant
+   * done artifact is pruned. Reads indexed metadata only, never prompt/output. */
+  isDispatchCompleted(id: string): boolean {
+    const terminal = DELEGATION_TERMINAL_STATUSES.map(() => "?").join(",");
+    return Boolean(this.db.prepare(`SELECT 1 FROM delegation_log
+      WHERE id=? AND status IN (${terminal})
+      UNION ALL SELECT 1 FROM turn_attempts
+      WHERE id=? AND state IN ('completed','cancelled') LIMIT 1`)
+      .get(id, ...DELEGATION_TERMINAL_STATUSES, id));
+  }
+
   /**
    * Mark every still-in-flight ledger row as `interrupted` and stamp
    * `updated_utc`. Called once at boot so a crash cannot leave phantom
@@ -2218,36 +2229,6 @@ export class SessionStore {
       .map(mapLedger);
   }
 
-  /**
-   * One keyset-paginated window of old terminal rows. The `(updated_utc,id)`
-   * cursor is non-authoritative maintenance state: repeating a page after a
-   * crash is safe, while the hard limit bounds filesystem probes per boot.
-   */
-  listTerminalDelegationsForDoneRetention(
-    cutoffUtc: string,
-    after: { updatedUtc: string; id: string } | null,
-    limit: number
-  ): LedgerEntry[] {
-    const boundedLimit = Math.max(1, Math.floor(limit));
-    const placeholders = DELEGATION_TERMINAL_STATUSES.map(() => "?").join(", ");
-    const cursorSql = after
-      ? "AND (updated_utc > ? OR (updated_utc = ? AND id > ?))"
-      : "";
-    const params: Array<string | number> = [
-      ...DELEGATION_TERMINAL_STATUSES,
-      cutoffUtc,
-      ...(after ? [after.updatedUtc, after.updatedUtc, after.id] : []),
-      boundedLimit,
-    ];
-    return this.db
-      .prepare<Array<string | number>, LedgerRow>(
-        `SELECT * FROM delegation_log
-         WHERE status IN (${placeholders}) AND updated_utc < ? ${cursorSql}
-         ORDER BY updated_utc ASC, id ASC LIMIT ?`
-      )
-      .all(...params)
-      .map(mapLedger);
-  }
 
   // --- durable multi-hop chains (#25) ---------------------------------------
 

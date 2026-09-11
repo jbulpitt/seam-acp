@@ -1096,6 +1096,7 @@ async function main(): Promise<void> {
     // requeues after preconditions). Flag-off: today's recoverStale replay.
     resumeEnabled: config.SEAM_TURN_RESUME_ENABLED,
     retainForRecovery: (id) => store.turnAttempts.get(id) !== null,
+    isCompleted: (id) => store.isDispatchCompleted(id),
     // A stale ledger row terminalized by #137 must never be resurrected by the
     // filesystem at-least-once recovery path, regardless of resume flag.
     mayRecover: (id) => {
@@ -1142,7 +1143,7 @@ async function main(): Promise<void> {
       isBindingBusy: (binding) => orchestrator.isChannelBusy(binding.channelRef),
       inspectArtifact: async (id) => {
         const dirs = dispatchDirs(config.DATA_DIR);
-        if (fs.existsSync(path.join(dirs.done, `${id}.json`))) return "done";
+        if (await dispatchWatcher.hasCompleted(id)) return "done";
         if (fs.existsSync(path.join(dirs.running, `${id}.json`))) return "running";
         if (fs.existsSync(path.join(dirs.pending, `${id}.json`))) return "pending";
         return "missing";
@@ -1202,7 +1203,7 @@ async function main(): Promise<void> {
   });
   // #174/#193: repair completions whose output reached `done/` but whose
   // DB-first side effects (ledger status, report-back, chain advance) were lost
-  // to a shutdown race, then prune one bounded page of proven-settled results.
+  // to a shutdown race. #306 retention runs separately after delivery resolves.
   // Runs BEFORE the watcher starts, so a report-back this enqueues is picked up
   // by the first tick. The worker is never re-executed; output comes from disk.
   //
@@ -1224,17 +1225,9 @@ async function main(): Promise<void> {
       listRecoveryCandidates: (after, limit) =>
         store.listNonTerminalDelegations(after, limit),
       replay: (result, route) => orchestrator.replayCompletedDispatch(result, route),
-      retention: {
-        listCandidates: (cutoffUtc, after, limit) =>
-          store.listTerminalDelegationsForDoneRetention(cutoffUtc, after, limit),
-        getReportBackByCorrelation: (correlationId) =>
-          store.getReportBackByCorrelation(correlationId),
-      },
     });
     if (
       repaired.reconciled > 0 ||
-      repaired.pruned > 0 ||
-      repaired.quarantined > 0 ||
       repaired.failed > 0 ||
       repaired.skippedUnprovable > 0
     ) {

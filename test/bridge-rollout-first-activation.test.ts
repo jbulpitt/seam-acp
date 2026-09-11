@@ -142,7 +142,7 @@ afterEach(async () => {
 });
 
 describe.sequential("#288 first managed activation from an enrolled baseline", () => {
-  it("activates a pre-catalog host, records the reduced rollback, and self-retires", async () => {
+  it("activates a pre-catalog host, records the reduced rollback, and retires while managed", async () => {
     const f = await makeFixture();
     const enrolled = parseKeyValues((await enroll(f)).stdout);
     // The media-server shape: drain and protocol 1, no catalog RPCs.
@@ -360,13 +360,15 @@ describe.sequential("#288 first managed activation from an enrolled baseline", (
   }, 180_000);
 
   /**
-   * QA blocker B, resolved as a PRECONDITION rather than a count. A host that
-   * rolled back to its legacy baseline genuinely is legacy again and faces the
-   * original problem, so the reduced path is reachable again — deliberately.
-   * What must stay true is that it is unreachable while a managed release is
-   * active, and that re-entry costs an explicit, verified rollback.
+   * QA blocker B, resolved as a PRECONDITION rather than a count. A host back on
+   * a verified legacy baseline genuinely is legacy again and faces the original
+   * problem, so the reduced path applies again — deliberately. What must stay
+   * true is that it is unreachable while a managed release is active. Rollback
+   * is one route back; `--restore-baseline` plus re-enrollment is another and
+   * costs no rollback at all, so this asserts the precondition rather than any
+   * particular way of satisfying it.
    */
-  it("is reachable again only after an explicit verified rollback to legacy", async () => {
+  it("applies whenever the host is on a verified legacy baseline, not once per host", async () => {
     const f = await makeFixture();
     await enroll(f);
 
@@ -375,9 +377,10 @@ describe.sequential("#288 first managed activation from an enrolled baseline", (
     const one = parseKeyValues((await f.run(["activate", first.sourceSha, first.checksum, first.stageId, H("4"), "20", H("5")])).stdout);
     expect(one.activation_from).toBe("enrolled-baseline");
 
-    // 2. An explicit, verified rollback is the ONLY way back to legacy. Note a
-    //    managed-to-managed rollback returns to a release, not to the baseline,
-    //    so re-entry costs rolling back the baseline-backed activation itself.
+    // 2. Rollback is ONE route back to legacy, used here because it is the one
+    //    inside this transaction. Note a managed-to-managed rollback returns to
+    //    a release, not to the baseline, so ordinary rollout activity does not
+    //    reopen the path — that bound is real and is what this step pins.
     const rolled = parseKeyValues((await f.run(["rollback", H("4"), H("9"), "20", H("a")])).stdout);
     expect(rolled.rollback_to).toBe("enrolled-baseline");
     const pre = parseKeyValues((await f.run(["preflight"])).stdout);

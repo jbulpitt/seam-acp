@@ -315,8 +315,10 @@ export function newOperationId() { return randomBytes(32).toString("hex"); }
  * they are served by the NEW release and proven on the new connection by the
  * ordinary receipt, which this path still demands.
  *
- * This is self-retiring: once the entrypoint resolves into a managed release
- * `artifact_mode` is `managed`, so the exception can never apply again.
+ * This retires itself while the host stays managed: once the entrypoint
+ * resolves into a managed release `artifact_mode` is `managed` and this returns
+ * false. It applies again whenever the host returns to a verified legacy
+ * baseline, by any route — see docs/bridge-rollout.md §1b for the precondition.
  */
 export function firstActivationFromBaselineAllowed(report) {
   return report.artifact_mode === "legacy-checkout"

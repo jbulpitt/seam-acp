@@ -100,8 +100,9 @@ describe("bridge rollout target safety (#241)", () => {
     // are demanded of the NEW release on the new connection instead.
     const eligible = legacy({ enrolled: "yes", enrollment_id: "a".repeat(64), baseline_digest: "b".repeat(64), baseline_rollback_proof: "reduced-baseline" });
     expect(firstActivationFromBaselineAllowed(eligible)).toBe(true);
-    // …and the exception is scoped to legacy hosts only, so it self-retires the
-    // moment the entrypoint resolves into a managed release.
+    // …and the exception is scoped to legacy hosts, so it stops applying the
+    // moment the entrypoint resolves into a managed release — and applies again
+    // if the host later returns to a verified legacy baseline.
     expect(firstActivationFromBaselineAllowed(parseKeyValues(preflightReport(target, { rollout_ready: "no", enrolled: "yes", enrollment_id: "a".repeat(64), baseline_digest: "b".repeat(64), baseline_rollback_proof: "receipt" })))).toBe(false);
     expect(firstActivationFromBaselineAllowed(legacy({ enrolled: "no" }))).toBe(false);
     // The exception is a DECOMPOSITION of the gate, not a hole in it: the old

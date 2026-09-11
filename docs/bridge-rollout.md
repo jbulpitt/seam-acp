@@ -268,10 +268,11 @@ accepted deliberately, and only while the precondition above holds.**
 **It retires itself while the host stays managed.** After the activation the
 stable entrypoint resolves into `releases/`, so the host is no longer legacy and
 this path is unreachable for as long as that remains true — which is every
-ordinary activation thereafter. It becomes reachable again only if a verified
-rollback restores the legacy checkout, as described above. There is no flag,
-environment variable or persisted "first activation allowed" state, and nothing
-has to be remembered and unset; the live entrypoint is the whole condition.
+ordinary activation thereafter. It becomes reachable again whenever the host
+returns to a verified legacy baseline, by any route, exactly as the precondition
+above describes. There is no flag, environment variable or persisted "first
+activation allowed" state, and nothing has to be remembered and unset; the live
+entrypoint plus a verifying baseline is the whole condition.
 
 **The capability gate is decomposed, not relaxed.** The local gate still requires
 the old process to be drainable with `SIGUSR2` and to speak protocol 1, because

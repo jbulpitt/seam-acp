@@ -211,17 +211,32 @@ back to, so its activation cannot offer the usual rollback target. Such a
 transition may instead use the verified enrolled baseline as its rollback
 target.
 
-**The guarantee is a precondition, not a count.** This path is reachable exactly
-when the live entrypoint is a legacy checkout and its recorded baseline still
-verifies — initially, and again after a verified rollback has restored that
-checkout — and it is never reachable while a managed release is active. It is
-not "once per host". A host that has rolled back to its baseline genuinely *is*
-legacy again and faces the original problem, so refusing it there would strand
-it with no way forward at the moment it most needs one. Re-entry is not free: it
-costs an explicit, verified rollback of the baseline-backed activation itself,
-with all of that rollback's proof obligations. Note that rolling back a
-managed-to-managed activation returns the host to the previous *release*, not to
-the baseline, so ordinary rollout activity does not re-open this path.
+**The guarantee is a precondition, not a count, and not a list of routes.** The
+gate checks exactly two things, and they are the whole condition:
+
+1. the live entrypoint is the checkout's own regular file rather than a symlink
+   into `releases/` (`before.legacy`); and
+2. the host has a recorded baseline that **still verifies** right now — recorded
+   revision, every non-entrypoint runtime-scope file, the whole runtime-tree
+   digest, and the entrypoint's bytes and mode.
+
+So the path is reachable whenever the host is in that state, and never while a
+managed release is active. It is **not** "once per host", and it is not limited
+to any particular way of arriving there. Any operation that leaves the host on a
+verified legacy baseline reopens it: never having activated at all; rolling back
+a baseline-backed activation; or `--restore-baseline` followed by re-enrollment,
+which is precisely what restore is *for*. Do not read the list as exhaustive —
+check the precondition, which `preflight` reports directly as
+`artifact_mode=legacy-checkout` with `enrolled=yes`.
+
+A host in that state genuinely *is* legacy again and faces the original problem,
+so refusing it there would strand it with no way forward at the moment it most
+needs one. What re-entry costs varies by route and should not be assumed: a
+rollback of a baseline-backed activation carries that rollback's full proof
+obligations, while restore-then-re-enroll carries restore's and enrollment's
+instead. Rolling back a *managed-to-managed* activation returns the host to the
+previous **release**, not to the baseline, so ordinary rollout activity does not
+reopen the path.
 
 Each use is separately auditable: every activation writes an immutable record
 under `activations/`, and exactly those whose `previous.kind` is
@@ -401,10 +416,12 @@ racing lock state refuses. Never delete a lock by hand while its owner is live.
   identity is ambiguous, rollback refuses. No record permits guessing.
 - Legacy code cannot emit a nonce/PID/instance/two-RPC rollback receipt. ACTIVATE
   therefore fails closed until the host has been explicitly enrolled (§1a) with a
-  baseline that still verifies. The first activation from that baseline (§1b) is
-  the single transition per host whose ROLLBACK proof is reduced, and both the
-  activation and the rollback record say so explicitly. Every later activation
-  requires the full receipt in both directions.
+  baseline that still verifies. An activation from that baseline (§1b) has a
+  reduced ROLLBACK proof, and both the activation and the rollback record say so
+  explicitly. That applies to any activation taken while the host is on a
+  verified legacy baseline — see §1b for the precondition — and not to a fixed
+  number of transitions. Every activation taken while a managed release is
+  active requires the full receipt in both directions.
 - Never replace a refusal with `pm2 restart`, `pm2 reload`, a provider login, or
   an environment/PM2 dump. Emergency/manual recovery is outside this automated
   transaction and requires a separate operator plan.

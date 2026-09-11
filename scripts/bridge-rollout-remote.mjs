@@ -1127,11 +1127,15 @@ async function activate() {
   await withLock(operationId, async () => {
     const before = await readLiveIdentity();
     if (before.legacy) {
-      // The FIRST managed activation on this host (#288), and the only one that
-      // can take this path. It SELF-RETIRES: afterwards the stable entrypoint
-      // resolves into `releases/`, so `before.legacy` is false and this branch
-      // is unreachable forever. Nothing is persisted to enable it and nothing
-      // has to be remembered and unset to retire it.
+      // A managed activation whose previous state is an enrolled baseline
+      // rather than a managed release (#288). The condition is exactly the two
+      // checks below plus `before.legacy`: the live entrypoint is the
+      // checkout's own file, and the recorded baseline still verifies. Nothing
+      // is persisted to enable this and nothing has to be unset to retire it —
+      // once the entrypoint resolves into `releases/` the branch is not taken,
+      // and it applies again if the host is later returned to a verified legacy
+      // baseline (rollback of such an activation, or restore-baseline plus
+      // re-enrollment). It is NOT once-per-host; see docs/bridge-rollout.md §1b.
       //
       // A baseline that is merely present is not enough: it is re-verified here
       // through the same `verifyBaseline` that restore and preflight share, and

@@ -22,7 +22,6 @@
  * would re-deliver. The ledger row is the only thing that distinguishes
  * "never enqueued" from "enqueued and finished".
  */
-import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { Logger } from "../../lib/logger.js";
@@ -97,22 +96,6 @@ export interface DoneReconcileDeps {
   replay: (result: DispatchResult, route: CompletionRoute) => Promise<void>;
   /** Terminalize an unrouteable legacy result with an operator-facing reason. */
   abandonUnprovable: (id: string, reason: string) => boolean;
-  /** Optional retention surface. Omitted by narrow callers that only repair. */
-  retention?: {
-    listCandidates: (
-      cutoffUtc: string,
-      after: DoneRetentionCursor | null,
-      limit: number
-    ) => DoneLedgerRow[];
-    getReportBackByCorrelation: (correlationId: string) => DoneLedgerRow | null;
-    isAttemptDeliveryProven: (id: string) => boolean;
-    getExpirationAuthorization: (
-      id: string
-    ) => DoneArtifactExpirationAuthorization | null;
-    now?: () => Date;
-    maxAgeMs?: number;
-    batchSize?: number;
-  };
 }
 
 export type DoneLedgerRow = Pick<
@@ -128,10 +111,6 @@ export interface DoneRetentionCursor {
   id: string;
 }
 
-/** Thirty days keeps operator evidence while placing a finite ceiling on it. */
-export const DONE_RETENTION_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
-/** At most this many old terminal artifacts are opened during one boot. */
-export const DONE_RETENTION_BATCH_SIZE = 256;
 /** Recovery also has a hard ceiling; its cursor makes overflow resumable. */
 export const DONE_RECOVERY_BATCH_SIZE = 256;
 
@@ -139,14 +118,10 @@ export const LEGACY_DELIVERY_ABANDON_REASON =
   "legacy completion has no recorded nonce or route; Discord delivery cannot be proven or replayed safely";
 
 export interface DoneReconcileSummary {
-  /** Existing files opened across recovery and retention. */
+  /** Existing recovery files opened. */
   scanned: number;
   recoveryCandidates: number;
-  retentionCandidates: number;
   reconciled: number;
-  pruned: number;
-  quarantined: number;
-  retainedPending: number;
   skippedTerminal: number;
   skippedUnknown: number;
   /** Compatibility counter: production must not intentionally leave rows here. */
@@ -161,9 +136,7 @@ function isCompletedOnward(row: DoneLedgerState | null): boolean {
   // exact completed check lets failed/timed-out/abandoned children prune output.
   return row?.status === "completed";
 }
-
 const RECOVERY_CURSOR_FILE = ".done-recovery-cursor.json";
-const RETENTION_CURSOR_FILE = ".done-retention-cursor.json";
 
 function safeDonePath(doneDir: string, id: string): string | null {
   if (!id || id.includes("/") || id.includes("\\") || id.includes("\0")) return null;
@@ -171,54 +144,16 @@ function safeDonePath(doneDir: string, id: string): string | null {
   return path.dirname(candidate) === path.resolve(doneDir) ? candidate : null;
 }
 
-async function quarantineDoneFile(
-  source: string,
-  id: string,
-  dirs: ReturnType<typeof dispatchDirs>,
-  logger: Logger,
-  reason: string
-): Promise<boolean> {
-  const quarantineDir = path.join(dirs.root, "done-quarantine");
-  const digest = createHash("sha256").update(id).digest("hex").slice(0, 24);
-  const destination = path.join(quarantineDir, `${digest}-${randomUUID()}.json`);
-  try {
-    await mkdir(quarantineDir, { recursive: true });
-    await rename(source, destination);
-    logger.warn({ id, destination, reason }, "done-reconcile: quarantined unreadable artifact");
-    return true;
-  } catch (err) {
-    const code = (err as NodeJS.ErrnoException).code;
-    if (code === "ENOENT") return false;
-    logger.warn({ err, id, reason }, "done-reconcile: artifact quarantine failed");
-    return false;
-  }
-}
-
-async function handleInvalidDoneFile(
-  source: string,
+function handleInvalidDoneFile(
   row: DoneLedgerRow,
-  dirs: ReturnType<typeof dispatchDirs>,
   logger: Logger,
   summary: DoneReconcileSummary,
   reason: string
-): Promise<void> {
-  // A non-terminal file is recovery authority even when it is malformed. Do
-  // not move it out of the canonical location; make the failure visible and
-  // leave it for operator repair. Terminal files may be moved losslessly into
-  // quarantine because the ledger already prevents a paid rerun.
-  if (!TERMINAL_STATUSES.has(row.status)) {
-    summary.failed++;
-    logger.warn(
-      { id: row.id, reason },
-      "done-reconcile: invalid non-terminal artifact retained for operator repair"
-    );
-    return;
-  }
-  if (await quarantineDoneFile(source, row.id, dirs, logger, reason)) {
-    summary.quarantined++;
-  } else {
-    summary.failed++;
-  }
+): void {
+  // Malformed output is unresolved evidence, not permission to discard it.
+  // Retention owns deletion and requires the canonical delivery resolver.
+  summary.failed++;
+  logger.warn({ id: row.id, reason }, "done-reconcile: invalid artifact retained for operator repair");
 }
 
 async function readDone(
@@ -239,7 +174,7 @@ async function readDone(
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
     summary.scanned++;
-    await handleInvalidDoneFile(file, row, dirs, logger, summary, "read failed");
+    handleInvalidDoneFile(row, logger, summary, "read failed");
     return null;
   }
   summary.scanned++;
@@ -258,7 +193,7 @@ async function readDone(
     return { ...result, id: row.id } as DispatchResult;
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err);
-    await handleInvalidDoneFile(file, row, dirs, logger, summary, reason);
+    handleInvalidDoneFile(row, logger, summary, reason);
     return null;
   }
 }
@@ -373,7 +308,6 @@ export function isDoneArtifactDeletable(
       Number.isFinite(Date.parse(authorization.authorizedUtc))
   );
 }
-
 /**
  * True when `result` still has completion work owed to it.
  *
@@ -448,9 +382,9 @@ export function completionRoute(
 }
 
 /**
- * Replay completion from exact non-terminal ledger ids, then inspect one
- * keyset-paginated retention window of old terminal ids. At no point does boot
- * enumerate `done/`, so lifetime completion volume cannot inflate startup.
+ * Replay completion from exact non-terminal ledger ids. Retention is a
+ * separate proof-only background sweep; this recovery pass never deletes an
+ * output or enumerates the lifetime done directory.
  *
  * Best-effort by contract — a failure to replay one dispatch is logged and the
  * pass continues, because blocking boot on a stale done-file would be worse
@@ -463,11 +397,7 @@ export async function reconcileCompletedDoneFiles(
   const summary: DoneReconcileSummary = {
     scanned: 0,
     recoveryCandidates: 0,
-    retentionCandidates: 0,
     reconciled: 0,
-    pruned: 0,
-    quarantined: 0,
-    retainedPending: 0,
     skippedTerminal: 0,
     skippedUnknown: 0,
     skippedUnprovable: 0,
@@ -564,96 +494,6 @@ export async function reconcileCompletedDoneFiles(
   } catch (err) {
     summary.failed++;
     deps.logger.warn({ err }, "done-reconcile: recovery cursor update failed");
-  }
-
-  if (deps.retention) {
-    const now = deps.retention.now?.() ?? new Date();
-    const maxAgeMs = deps.retention.maxAgeMs ?? DONE_RETENTION_MAX_AGE_MS;
-    const batchSize = Math.max(
-      1,
-      Math.floor(deps.retention.batchSize ?? DONE_RETENTION_BATCH_SIZE)
-    );
-    const cutoffMs = now.getTime() - maxAgeMs;
-    const cutoffUtc = new Date(cutoffMs).toISOString();
-    const after = await readMaintenanceCursor(dirs.root, RETENTION_CURSOR_FILE, deps.logger);
-    let retentionRows: DoneLedgerRow[] = [];
-    try {
-      retentionRows = deps.retention.listCandidates(cutoffUtc, after, batchSize);
-    } catch (err) {
-      summary.failed++;
-      deps.logger.warn({ err }, "done-reconcile: retention index lookup failed");
-    }
-    summary.retentionCandidates = retentionRows.length;
-
-    for (const indexedRow of retentionRows) {
-      const result = await readDone(indexedRow, dirs, deps.logger, summary);
-      if (!result) continue;
-      const finishedMs = Date.parse(result.finishedUtc);
-      if (!Number.isFinite(finishedMs)) {
-        const file = safeDonePath(dirs.done, result.id);
-        if (file) {
-          await handleInvalidDoneFile(
-            file,
-            indexedRow,
-            dirs,
-            deps.logger,
-            summary,
-            "finishedUtc is invalid"
-          );
-        } else {
-          summary.failed++;
-        }
-        continue;
-      }
-      if (finishedMs >= cutoffMs) {
-        continue;
-      }
-      try {
-        // Re-read the source and onward rows immediately before deletion. The
-        // paginated candidate snapshot is never deletion authority.
-        const current = deps.getDelegation(result.id);
-        if (!current || !TERMINAL_STATUSES.has(current.status)) {
-          summary.retainedPending++;
-          continue;
-        }
-        if (!isDoneArtifactDeletable(result, current, {
-          getDelegation: deps.getDelegation,
-          getReportBackByCorrelation: deps.retention.getReportBackByCorrelation,
-          isAttemptDeliveryProven: deps.retention.isAttemptDeliveryProven,
-          getExpirationAuthorization: deps.retention.getExpirationAuthorization,
-        })) {
-          summary.retainedPending++;
-          continue;
-        }
-        const file = safeDonePath(dirs.done, result.id);
-        if (!file) {
-          summary.failed++;
-          continue;
-        }
-        await unlink(file);
-        summary.pruned++;
-      } catch (err) {
-        if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
-          summary.failed++;
-          deps.logger.warn({ err, id: result.id }, "done-reconcile: terminal prune failed");
-        }
-      }
-    }
-
-    try {
-      const last = retentionRows.at(-1);
-      // A short page reached the end. Clearing wraps the next boot to the
-      // oldest retained item; full pages advance monotonically without any
-      // artifact being able to starve later ids.
-      const next =
-        last && retentionRows.length >= batchSize
-          ? { updatedUtc: last.updatedUtc, id: last.id }
-          : null;
-      await writeMaintenanceCursor(dirs.root, RETENTION_CURSOR_FILE, next);
-    } catch (err) {
-      summary.failed++;
-      deps.logger.warn({ err }, "done-reconcile: retention cursor update failed");
-    }
   }
 
   deps.logger.info(summary, "done-reconcile: boot maintenance summary");

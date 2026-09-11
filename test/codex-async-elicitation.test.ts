@@ -319,9 +319,11 @@ describe("Codex async user-input bridge", () => {
       duplicateUpdate: true,
     });
     harnesses.push(harness);
+    const persist = vi.spyOn(harness.store, "replaceOpenElicitation");
     await harness.adapter.message();
     expect(promptBodies(harness)).toEqual(["start"]);
     expect(harness.adapter.cards).toHaveLength(1);
+    expect(persist).toHaveBeenCalledTimes(1);
     expect(harness.adapter.cards[0]!.card.buttons?.map((button) => button.label))
       .toEqual(["Yes", "No", "Cancel"]);
     const elicitationId = harness.store.listOpenElicitations()[0]!.id;
@@ -365,6 +367,7 @@ describe("Codex async user-input bridge", () => {
       interactionId: "810000000000000003",
     });
     expect(duplicate.replies.join(" ")).toMatch(/already been settled/);
+    expect(harness.store.getInbound("810000000000000003")).toBeNull();
     expect(promptBodies(harness)).toEqual(["start", "Yes"]);
   });
 
@@ -439,6 +442,7 @@ describe("Codex async user-input bridge", () => {
       interactionId: "830000000000000001",
     });
     expect(promptBodies(cancelHarness)).toEqual(["start"]);
+    expect(cancelHarness.store.listOpenElicitations()).toEqual([]);
 
     const otherDir = path.join(dir, "replacement");
     fs.mkdirSync(otherDir);

@@ -163,8 +163,8 @@ export interface BoundedProbeOptions<T> {
   maxStderrBytes?: number;
   /** Permit exit code 0 for bounded one-shot collectors. Default is false. */
   allowCleanExit?: boolean;
-  /** Validator commands may document a nonzero result; other codes still fail. */
-  acceptedExitCodes?: readonly number[];
+  /** A validator's protocol can be its output on any normal (non-signal) exit. */
+  acceptNonzeroExit?: boolean;
   /** Child was spawned detached: reap its LS/tool group, not only its leader. */
   processGroup?: boolean;
   /** Label used in error detail. Must not carry secrets. */
@@ -358,7 +358,7 @@ export async function runBoundedProbe<T>(options: BoundedProbeOptions<T>): Promi
     // Treating it as `exited_early` failed probes that had already succeeded,
     // purely on whether the exit event beat the run's resolution to the race.
     // Only an ABNORMAL exit is a failure worth unblocking racers for.
-    if (signalCode === null && code !== null && (code === 0 || options.acceptedExitCodes?.includes(code))) {
+    if (signalCode === null && code !== null && (code === 0 || options.acceptNonzeroExit)) {
       cleanExit = true;
       if (options.allowCleanExit) completionResolve?.({ code, signal: null });
       return;

@@ -2103,7 +2103,7 @@ export async function fetchAgyAcceptedModels(runtime: AgyNativeRuntime): Promise
       };
       proc.stderr.on("data", capture);
       return () => { proc.stderr.removeListener("data", capture); };
-    }, [1]);
+    }, true);
   } catch (error) {
     if (error instanceof ProbeError && error.code === "not_reaped") throw error;
     return new Set();
@@ -2115,14 +2115,14 @@ async function runAgyProbe<T>(
   runtime: AgyNativeRuntime, args: string[], timeoutMs: number,
   run: (handle: ProbeHandle) => Promise<T>,
   observe?: (proc: ChildProcessWithoutNullStreams) => (() => void),
-  acceptedExitCodes?: readonly number[],
+  acceptNonzeroExit = false,
 ): Promise<T> {
   let proc: ChildProcessWithoutNullStreams;
   let stopObserving: (() => void) | undefined;
   try {
     return await runBoundedProbe({
       executable: "native-agy", label: "native AGY", timeoutMs, killGraceMs: 500,
-      processGroup: true, allowCleanExit: true, acceptedExitCodes,
+      processGroup: true, allowCleanExit: true, acceptNonzeroExit,
       spawnOverride: () => {
         proc = runtime.prepare(args, "/tmp", { detached: true, stdio: ["pipe", "pipe", "pipe"] }).spawn() as ChildProcessWithoutNullStreams;
         return proc;

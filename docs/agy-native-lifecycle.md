@@ -74,8 +74,9 @@ Each added bound/check has an observable failure it prevents:
   locked and its connection open during process teardown.
 - Abortable discovery/retry waits: a caller cancellation must interrupt a
   hanging health request, not wait for an unrelated discovery timeout.
-- Explicit validator exit code 1: the existing native validator intentionally
-  reports model names on a nonzero exit; other errors still fail the probe.
+- Opt-in validator nonzero completion: its existing protocol parses output on
+  any non-signal exit; guessing a single allowed code would drop valid lists.
+  Spawn, signal, timeout and overflow failures still fail the probe.
 - Unique private HOME even with zero MCP servers: returning `undefined` inherits
   global tools; reusing a HOME lets an old runtime delete its replacement's config.
 - Empty helper MCP config: supplied/default servers otherwise leak into a

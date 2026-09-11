@@ -38,7 +38,7 @@ if (argValue("--model") === "__seam_probe_invalid__") {
     "  Fixture Native Model\n" +
     "  Fixture Native Model (Low)\n\n",
   );
-  process.exit(1);
+  process.exit(Number(process.env.SEAM_AGY_VALIDATOR_EXIT ?? 1));
 }
 
 const scenarioFile = prompt === "ok"

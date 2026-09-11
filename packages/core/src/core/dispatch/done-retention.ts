@@ -4,7 +4,7 @@ import path from "node:path";
 import { setImmediate } from "node:timers/promises";
 import type { Logger } from "../../lib/logger.js";
 import { dispatchDirs, type DispatchResult } from "./types.js";
-import type { DoneLedgerRow, DoneLedgerState } from "./done-reconcile.js";
+import type { DoneDeliveryResolutionLookup, DoneLedgerRow, DoneLedgerState } from "./done-reconcile.js";
 
 export interface DoneRetentionDeps {
   dataDir: string;
@@ -23,11 +23,15 @@ export function bindDoneDeliveryResolver(opts: {
   getReportBackByCorrelation: (correlationId: string) => DoneLedgerRow | null;
   resolveDelivery: (
     result: DispatchResult,
-    row: DoneLedgerState | null,
-    lookups: Pick<typeof opts, "getDelegation" | "getReportBackByCorrelation">
+    row: DoneLedgerState,
+    lookups: DoneDeliveryResolutionLookup
   ) => boolean;
 }): DoneRetentionDeps {
   return { dataDir: opts.dataDir, logger: opts.logger, isDeliveryResolved: (id) => {
+    const row = opts.getDelegation(id);
+    // Unknown rows cannot prove delivery; the canonical resolver owns every
+    // status/route decision for known rows, including the terminal-source gate.
+    if (!row) return false;
     const raw = readFileSync(path.join(dispatchDirs(opts.dataDir).done, `${id}.json`), "utf8");
     let result: DispatchResult;
     try {
@@ -43,7 +47,7 @@ export function bindDoneDeliveryResolver(opts: {
       // JSON parser errors can contain private prompt/output fragments.
       throw new Error("invalid done artifact; retained for operator repair");
     }
-    return opts.resolveDelivery(result, opts.getDelegation(id), opts);
+    return opts.resolveDelivery(result, row, opts);
   } };
 }
 

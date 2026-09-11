@@ -14,8 +14,10 @@ Deletion consumes the delivery resolver's canonical durable decision (#305).
 Worker success, a terminal parent ledger row, file age, and an enqueued but
 unfinished report-back are not substitute proof. Explicit disposition belongs
 to that resolver; retention never invents abandonment or a second delivery
-status. Unknown, undelivered, and unresolved legacy artifacts stay in `done/`,
-including malformed files. Retention neither executes a provider nor replays
+status. Unknown and unresolved undelivered artifacts stay in `done/`, including
+malformed files. A #305 explicit abandonment with a recorded terminal reason
+resolves the obligation and permits expiry; retention never makes that decision.
+Retention neither executes a provider nor replays
 an original prompt. Non-regular entries are retained for operator inspection.
 
 Completed work remains completed after unlink: SQL (`delegation_log` and
@@ -78,6 +80,8 @@ unresolved output: that would silently lose work.
 - Canonical delivery predicate: removing it deletes captured output before its
   destination is established; the regression retains a completed but unacked
   result, then deletes only after the resolver changes its decision.
+- Terminal source precondition: removing it lets a no-onward result disappear
+  before the recovery pass commits its completion bookkeeping.
 - Post-publication hook: removing it recreates already-delivered artifacts
   because delivery commonly finishes before the watcher writes `done/`.
 - Periodic sweep: removing it strands backlog and parents acknowledged after

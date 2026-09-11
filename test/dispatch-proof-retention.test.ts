@@ -52,6 +52,7 @@ describe("proof-only done retention (#306)", () => {
     expect(resolveDelivery).toHaveBeenCalledWith(result, row, expect.any(Object));
     resolveDelivery.mockReturnValue(true);
     expect(pruneDoneArtifact(configured, "routed").state).toBe("pruned");
+    store.recordDelegation({ id: "malformed", kind: "wake", status: "completed" });
     await writeFile(artifact("malformed"), "PRIVATE-PROMPT-CONTENT");
     expect((await pruneDoneArtifacts(configured))).toMatchObject({ failed: 1, pruned: 0 });
     // Without error redaction JSON.parse includes the private input in the logger's Error message.

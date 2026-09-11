@@ -44,6 +44,7 @@ if (phase === "produce") {
 } else {
   await projectAttemptCompletions(dataDir, store.turnAttempts);
   const result = await reconcileCompletedDoneFiles({ dataDir, logger,
+    abandonUnprovable: (key, reason) => store.abandonUnprovableDelivery(key, reason),
     getDelegation: (key) => store.getDelegation(key),
     listRecoveryCandidates: (after, limit) => store.listNonTerminalDelegations(after, limit),
     replay: async (saved) => {

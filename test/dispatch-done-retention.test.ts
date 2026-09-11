@@ -25,6 +25,7 @@ async function writeDone(id: string, fields: Partial<DispatchResult> = {}): Prom
 }
 function deps(replay: DoneReconcileDeps["replay"] = async () => {}): DoneReconcileDeps {
   return { dataDir, logger: silent, getDelegation: (id) => store.getDelegation(id),
+    abandonUnprovable: (id, reason) => store.abandonUnprovableDelivery(id, reason),
     listRecoveryCandidates: (after, limit) => store.listNonTerminalDelegations(after, limit), replay };
 }
 

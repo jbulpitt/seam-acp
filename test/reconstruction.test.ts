@@ -64,10 +64,17 @@ function conversation(humanCount: number, assistant = true): LogicalReconstructi
 
 describe("resolveDestinationContextWindow", () => {
   it("uses matching live usage when size is positive", () => {
+    // Without qualified identity this test would endorse cross-provider cache reuse.
+    const identity = { agentId: "claude", location: "local", acpSessionId: "test",
+      model: "claude-opus-4.8", requestedTier: null };
     expect(
       resolveDestinationContextWindow({
         destinationModel: "claude-opus-4.8",
-        lastContextUsage: { model: "claude-opus-4.8", size: 1_000_000 },
+        identity,
+        lastContextUsage: { model: "claude-opus-4.8", size: 1_000_000, budget: {
+          ...identity, promptBudget: 1_000_000, used: 30_000, totalWindow: null, outputAllocation: null,
+          observedTier: null, source: "acp-usage", atUtc: "2026-09-11T00:00:00Z", previousPromptBudget: null,
+        } },
         staticContextLimit: 200_000,
       })
     ).toBe(1_000_000);

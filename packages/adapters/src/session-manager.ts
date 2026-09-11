@@ -24,6 +24,8 @@ export interface ContextUsage {
   totalUsed: number;
   /** Context window size for the active model. */
   contextLimit: number;
+  /** Omitted for inferred/catalog limits; only telemetry is eligible for persistence. */
+  contextLimitSource?: "observed";
 }
 
 export interface ISessionManager {

@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { matchesContextBudget, validContextUsage, type ContextBudgetIdentity, type ContextBudgetObservation } from "../../core/context-budget.js";
 import { promises as fsp } from "node:fs";
 import path from "node:path";
 import os from "node:os";
@@ -832,7 +833,6 @@ export class Orchestrator {
   private readonly quotaPoller?: AgentQuotaPoller;
   private readonly modelCatalog: ModelCatalogService;
   private readonly refreshModelIntelligence?: (forceSources: boolean) => Promise<ModelIntelligenceRefreshResult>;
-  private readonly getModelMetadata?: (idOrSlug: string) => { context_window: number | null } | null;
   /** Installed by index.ts only while the upstream-status subsystem is active. */
   private serviceStatusRefresh?: () => Promise<RefreshResult>;
   /** Injected only by deterministic restart tests; production uses detached PM2. */
@@ -998,7 +998,6 @@ export class Orchestrator {
     agyRuntime?: AgyNativeRuntime;
     refreshModelIntelligence?: (forceSources: boolean) => Promise<ModelIntelligenceRefreshResult>;
     restartProcess?: () => Promise<void>;
-    getModelMetadata?: (idOrSlug: string) => { context_window: number | null } | null;
   }) {
     this.logger = opts.logger.child({ comp: "orchestrator" });
     this.config = opts.config;
@@ -1011,7 +1010,6 @@ export class Orchestrator {
     this.agyRuntime = opts.agyRuntime;
     this.refreshModelIntelligence = opts.refreshModelIntelligence;
     this.restartProcess = opts.restartProcess ?? restartSeamAcpProcess;
-    this.getModelMetadata = opts.getModelMetadata;
     this.threadNamerConfig = new ThreadNamerConfigStore(
       path.join(this.config.DATA_DIR, "thread-namer.json"),
       this.logger
@@ -3235,36 +3233,29 @@ export class Orchestrator {
       authorName: turnProfile?.displayName ?? brand,
     });
 
-    // Seed the status panel with the last-known usage from the previous turn,
-    // so the user sees continuity before any usage_update events fire. The
-    // saved value is invalidated when the model changes (size belongs to a
-    // different model). Any staleness is corrected by the post-turn
-    // side-channel read.
+    // Seed only a matching execution's observation, not legacy bare-model usage.
     const cachedUsage = cfg.lastContextUsage;
+    let contextIdentity = this.contextBudgetIdentity(record);
+    let observedContextBudget: ContextBudgetObservation | undefined;
+    let acpUsageReceived = false;
     const activeModel = described.model.value;
-    // Authoritative per-model window from the operational catalog. Some
-    // agents report a generic default (~200K) in usage_update regardless of the
-    // real window; use this as a FLOOR so the panel shows the true size.
-    // Look up the authoritative context window from the cached catalog. When
-    // claude-agent-acp is pointed at a non-Anthropic backend (Ollama Cloud,
-    // Z.ai) it reports its *internal* Claude model name, not the real model.
-    // Fallback: if the activeModel doesn't match any static entry, try the
-    // profile's defaultModel — that's what the backend is actually running.
+    // Catalog capacity is a display estimate only until telemetry arrives.
     const modelContextFloor = this.modelCatalog.model(
       { agentId: described.agent.value, location: described.location.value },
       activeModel
     )?.context.effective ?? 0;
     if (
       cachedUsage &&
-      cachedUsage.model === activeModel &&
+      contextIdentity && matchesContextBudget(cachedUsage.budget, contextIdentity) &&
       cachedUsage.size > 0 &&
-      cachedUsage.used > 0
+      cachedUsage.used >= 0
     ) {
       status.contextUsedHighWater = cachedUsage.used;
+      observedContextBudget = cachedUsage.budget;
       status.contextWindowSize = cachedUsage.size;
       status.context = formatContextUsage(cachedUsage.used, cachedUsage.size);
     }
-    if (modelContextFloor > status.contextWindowSize) {
+    if (!status.contextWindowSize && modelContextFloor > 0) {
       status.contextWindowSize = modelContextFloor;
       status.context = formatContextUsage(status.contextUsedHighWater, modelContextFloor);
     }
@@ -3558,6 +3549,8 @@ export class Orchestrator {
       let activeRuntime = priorHuman?.acpSessionId
         ? await this.router.getOrStartRuntime(record, { resumeSessionId: priorHuman.acpSessionId })
         : await this.router.getOrStartRuntime(record);
+      contextIdentity = this.contextBudgetIdentity(record, activeRuntime.getSessionInfo()?.sessionId);
+      if (!contextIdentity || !matchesContextBudget(observedContextBudget, contextIdentity)) observedContextBudget = undefined;
       this.assertQueueFence(queueFence);
       if (humanAttempt) {
         if (!humanCurrent()) throw new DispatchSuspendedError(humanAttempt.id);
@@ -3803,6 +3796,7 @@ export class Orchestrator {
             await refresh();
             return;
           case "model-changed":
+            if (contextIdentity) contextIdentity = this.contextIdentityForModel(contextIdentity, event.modelId);
             status.setModel(event.modelId);
             await refresh();
             return;
@@ -3837,26 +3831,16 @@ export class Orchestrator {
             void refresh();
             return;
           case "usage-update": {
-            if (event.size <= 0) return;
-            // Ignore mid-turn used:0 events. claude-agent-acp emits them on
-            // compact_boundary, but the remote-claude→copilot-api proxy path
-            // also surfaces spurious 0s when intermediate response chunks
-            // arrive with missing usage fields — making the display flicker.
-            // We can't tell the two apart, so hold steady. The end-of-turn
-            // side-channel (getUsage / JSONL read) lands the authoritative
-            // post-compaction value if a compaction really did happen.
-            if (event.used === 0) return;
+            if (!validContextUsage(event.used, event.size)) return;
+            acpUsageReceived = true;
+            if (contextIdentity) {
+              observedContextBudget = this.recordContextBudget(contextIdentity, event.used, event.size, record);
+            }
+            // Display usage may hold its high-water mark; persistence keeps the raw sample.
             const used = Math.max(event.used, status.contextUsedHighWater);
             status.contextUsedHighWater = used;
-            // Monotonic ceiling on the window too. claude-agent-acp starts each
-            // session at its 200K default and the authoritative window (e.g. 1M)
-            // arrives a beat later — without this, the card blips 200K→1M on the
-            // first event. The window only ever grows within a turn (default →
-            // authoritative); it never legitimately shrinks (compaction changes
-            // `used`, not `size`; model switches clear the cache between turns).
-            // `modelContextFloor` overrides an agent's generic default (e.g.
-            // an agent reporting 200K for a model with a 256K window).
-            const size = Math.max(event.size, modelContextFloor, status.contextWindowSize);
+            // Served prompt limits can shrink; neither catalog nor earlier telemetry is a floor.
+            const size = event.size;
             status.contextWindowSize = size;
             status.context = formatContextUsage(used, size);
             // agy has no built-in auto-compaction. Mark the turn for an
@@ -4096,6 +4080,9 @@ export class Orchestrator {
           await this.router.invalidate(record.id, { clearAcpSession: true });
           this.assertQueueFence(queueFence);
           activeRuntime = await this.router.getOrStartRuntime(record);
+          contextIdentity = this.contextBudgetIdentity(record, activeRuntime.getSessionInfo()?.sessionId);
+          observedContextBudget = undefined;
+          acpUsageReceived = false;
           activeRuntime.onEvent(eventHandler);
           result = await raceWithTimeout(activeRuntime.prompt(promptText, promptAttachments), timeoutMs);
         } else if (isConnectionClosedError(promptErr)) {
@@ -4103,6 +4090,9 @@ export class Orchestrator {
           await this.router.invalidate(record.id, { clearAcpSession: false });
           this.assertQueueFence(queueFence);
           activeRuntime = await this.router.getOrStartRuntime(record);
+          contextIdentity = this.contextBudgetIdentity(record, activeRuntime.getSessionInfo()?.sessionId);
+          observedContextBudget = undefined;
+          acpUsageReceived = false;
           activeRuntime.onEvent(eventHandler);
           result = await raceWithTimeout(activeRuntime.prompt(promptText, promptAttachments), timeoutMs);
         } else if (isRateLimitError(promptErr) && !textSent && !textBuffer) {
@@ -4270,7 +4260,7 @@ export class Orchestrator {
       //   2. Copilot CLI fallback — probe its `/context` slash command, which
       //      the CLI handles client-side (no LLM call).
       if (result !== "timeout" && !result.cancelled) {
-        const profile = this.router.getProfile(record.agentId);
+        const profile = this.router.getProfile(record.agentId, described.location.value);
         const usageReader = profile?.sessionManager?.getUsage;
         let sideChannelEmitted = false;
         if (usageReader) {
@@ -4291,13 +4281,16 @@ export class Orchestrator {
               selectedModel
             );
             const computedSize = modelEntry?.context.effective ?? usage?.contextLimit ?? 0;
-            // `used` may legitimately drop (post-compaction), so we bypass its
-            // ceiling. But the window must never shrink: getUsage can return a
-            // stale 200K default when the bridge has not yet reported the
-            // selected model's real window.
-            // Trust the larger of the computed value and what the live stream /
-            // cache already established for this turn.
-            const size = Math.max(status.contextWindowSize, computedSize);
+            // Inferred transcript limits cannot override live ACP observations.
+            // Only an explicitly measured side-channel limit is persisted.
+            if (!acpUsageReceived && usage?.contextLimitSource === "observed" && contextIdentity &&
+                validContextUsage(usage.totalUsed, usage.contextLimit)) {
+              observedContextBudget = this.recordContextBudget(
+                this.contextIdentityForModel(contextIdentity, usage.model ?? contextIdentity.model),
+                usage.totalUsed, usage.contextLimit, record, "session-usage"
+              );
+            }
+            const size = observedContextBudget?.promptBudget ?? computedSize;
             if (usage && usage.totalUsed > 0 && size > 0) {
               status.contextUsedHighWater = usage.totalUsed;
               status.contextWindowSize = size;
@@ -4318,22 +4311,8 @@ export class Orchestrator {
           await this.probeCopilotContext(activeRuntime, eventHandler, refresh);
         }
 
-        // Persist final usage to the session record so the next turn can
-        // seed its status panel without waiting for the first usage_update.
-        if (status.contextUsedHighWater > 0 && status.contextWindowSize > 0) {
-          try {
-            const persistedCfg = this.store.readConfig(record);
-            persistedCfg.lastContextUsage = {
-              used: status.contextUsedHighWater,
-              size: status.contextWindowSize,
-              model: this.router.describeConfig(record).model.value,
-              atUtc: new Date().toISOString(),
-            };
-            this.persistConfig(record, persistedCfg);
-          } catch (err) {
-            this.logger.debug({ err }, "failed to persist lastContextUsage");
-          }
-        }
+        // Observations are persisted on receipt, including interrupted turns.
+        // Never persist a catalog estimate merely because it was rendered.
       }
 
       // agy has no native auto-compaction. If usage crossed the threshold
@@ -5129,8 +5108,16 @@ export class Orchestrator {
       opts.outputTo ?? (target && !isSessionRecord(target) ? target : undefined);
 
     let text = "";
+    let budgetIdentity: ContextBudgetIdentity | undefined;
+    let budgetRecord: SessionRecord | undefined;
     const handler: AgentEventHandler = async (event) => {
       if (opts.lifecycle && !opts.lifecycle.isCurrent()) return;
+      if (event.kind === "model-changed" && budgetIdentity) {
+        budgetIdentity = this.contextIdentityForModel(budgetIdentity, event.modelId);
+      }
+      if (event.kind === "usage-update" && budgetIdentity && validContextUsage(event.used, event.size)) {
+        this.recordContextBudget(budgetIdentity, event.used, event.size, budgetRecord);
+      }
       if (event.kind === "agent-text") {
         text += event.text;
       } else if (event.kind === "agent-file") {
@@ -5241,6 +5228,8 @@ export class Orchestrator {
         }
         // Registered after newSession: the session-creation handshake emits no
         // events we want, and this matches the order the callers used.
+        budgetIdentity = { ...binding, acpSessionId: sessionId, model: selection.model.id,
+          requestedTier: profile.requestedContextTier ?? null };
         rt.onEvent(handler);
         const outcome = await runPrompt(rt);
         if (outcome === "timeout") {
@@ -5302,6 +5291,8 @@ export class Orchestrator {
         : await this.router.getOrStartRuntime(record);
       opts.lifecycle?.onRuntime?.(rt.getProcessId?.(), rt.getProviderIdentity?.());
       const liveSessionId = record.acpSessionId || rt.getSessionInfo()?.sessionId;
+      budgetRecord = record;
+      budgetIdentity = this.contextBudgetIdentity(record, rt.getSessionInfo()?.sessionId ?? liveSessionId);
       if (liveSessionId) {
         try {
           await opts.onSession?.(liveSessionId);
@@ -5338,6 +5329,54 @@ export class Orchestrator {
         sessionId: record.acpSessionId,
         ...correlation,
       });
+    }
+  }
+
+  private contextBudgetIdentity(record: SessionRecord, sessionId = record.acpSessionId): ContextBudgetIdentity | undefined {
+    const described = this.router.describeConfig(record);
+    const agentId = described.agent?.value;
+    const location = described.location?.value;
+    const model = described.model?.value;
+    // Missing execution attribution must fail closed, never fall back to a bare model.
+    if (!agentId || !location || !model || !sessionId) return undefined;
+    return this.contextIdentityForModel({ agentId, location, model, acpSessionId: sessionId,
+      requestedTier: this.router.getProfile(agentId, location)?.requestedContextTier ?? null }, model);
+  }
+
+  private contextIdentityForModel(identity: ContextBudgetIdentity, model: string): ContextBudgetIdentity {
+    // Alias resolution is scoped to this operational binding, never the cross-provider metadata reader.
+    return { ...identity, model: this.modelCatalog.model(identity, model)?.id ?? model };
+  }
+
+  private recordContextBudget(
+    identity: ContextBudgetIdentity, used: number, promptBudget: number,
+    record?: SessionRecord, source: ContextBudgetObservation["source"] = "acp-usage"
+  ): ContextBudgetObservation {
+    let observation: ContextBudgetObservation = {
+      ...identity, used, promptBudget, source, atUtc: new Date().toISOString(),
+      totalWindow: null, outputAllocation: null, observedTier: null, previousPromptBudget: null,
+    };
+    try {
+      observation = this.store.contextBudgets.record(observation);
+      if (observation.previousPromptBudget !== null && promptBudget < observation.previousPromptBudget) {
+        this.logger.warn({ agentId: identity.agentId, model: identity.model,
+          previousPromptBudget: observation.previousPromptBudget, promptBudget }, "served context budget decreased");
+      }
+      // Isolated runs retain their own observation, never overwrite their authoring thread.
+      // A reset/reconfiguration must not receive a late old-session cache write.
+      const current = record && this.store.get(record.id);
+      const currentIdentity = current && this.contextBudgetIdentity(current);
+      if (current && currentIdentity && matchesContextBudget(identity, currentIdentity)) {
+        const cfg = this.store.readConfig(current);
+        cfg.lastContextUsage = { used, size: promptBudget, model: identity.model,
+          atUtc: observation.atUtc, budget: observation };
+        this.persistConfig(current, cfg);
+      }
+      return observation;
+    } catch (err) {
+      this.logger.warn({ err }, "context budget persistence failed");
+      // Storage failure is not permission to inflate this turn's observed display limit.
+      return observation;
     }
   }
 
@@ -8892,11 +8931,7 @@ export class Orchestrator {
               isolated,
               ...(cfg.lastContextUsage
                 ? {
-                    cachedUsage: {
-                      used: cfg.lastContextUsage.used,
-                      size: cfg.lastContextUsage.size,
-                      model: cfg.lastContextUsage.model,
-                    },
+                    cachedUsage: cfg.lastContextUsage,
                   }
                 : {}),
             }, queueFence);
@@ -9864,11 +9899,7 @@ export class Orchestrator {
             isolated: false,
             ...(cfg.lastContextUsage
               ? {
-                  cachedUsage: {
-                    used: cfg.lastContextUsage.used,
-                    size: cfg.lastContextUsage.size,
-                    model: cfg.lastContextUsage.model,
-                  },
+                  cachedUsage: cfg.lastContextUsage,
                 }
               : {}),
           });
@@ -10567,10 +10598,8 @@ export class Orchestrator {
    * Context-window health is seeded here so the panel isn't blank before the
    * first `usage-update`: a LIVE dispatch reuses the target thread's cached
    * session usage; an ISOLATED dispatch starts blank and fills from the fresh
-   * runtime's `usage-update` events during the turn. The authoritative per-model
-   * window floor (static models) applies to both so an agent's generic 200K
-   * default never masks the true window. Usage genuinely unavailable ⇒ the
-   * context line is simply omitted (never crashes).
+   * runtime's `usage-update` events during the turn. A catalog estimate never
+   * raises an observed budget. Unknown usage is omitted.
    */
   private async startDispatchStatusPanel(
     target: ChannelRef,
@@ -10581,7 +10610,7 @@ export class Orchestrator {
       cwd: string;
       profile?: AgentProfile;
       isolated: boolean;
-      cachedUsage?: { used: number; size: number; model: string };
+      cachedUsage?: SessionConfigState["lastContextUsage"];
     },
     queueFence?: ChannelQueueFence
   ): Promise<DispatchStatusPanel<MessageRef> | undefined> {
@@ -10628,13 +10657,15 @@ export class Orchestrator {
     // user-turn seed.
     if (!resolved.isolated && resolved.cachedUsage) {
       const u = resolved.cachedUsage;
-      if (u.model === resolved.model && u.size > 0 && u.used > 0) {
+      const identity = destRecord && this.contextBudgetIdentity(destRecord);
+      if (identity && matchesContextBudget(u.budget, this.contextIdentityForModel(identity, resolved.model)) &&
+          u.size > 0 && u.used >= 0) {
         status.contextUsedHighWater = u.used;
         status.contextWindowSize = u.size;
         status.context = formatContextUsage(u.used, u.size);
       }
     }
-    if (modelContextFloor > status.contextWindowSize) {
+    if (!status.contextWindowSize && modelContextFloor > 0) {
       status.contextWindowSize = modelContextFloor;
       if (status.contextUsedHighWater > 0) {
         status.context = formatContextUsage(status.contextUsedHighWater, modelContextFloor);
@@ -10678,7 +10709,6 @@ export class Orchestrator {
       {
         debounceMs: STATUS_EDIT_DEBOUNCE_MS,
         heartbeatMs: STATUS_HEARTBEAT_MS,
-        modelContextFloor,
       }
     );
     await panel.start();
@@ -16609,17 +16639,18 @@ export class Orchestrator {
         { agentId, location: described.location.value },
         "default"
       );
-      const metadata = this.getModelMetadata?.(catalogEntry.id) ?? null;
       const resolved = resolveContextWindow({
         agentId,
         model: catalogEntry.id,
+        identity: this.contextBudgetIdentity(record),
         defaultModel: catalogDefault?.id,
         lastContextUsage: cfg.lastContextUsage,
         catalogModels: catalogModels.map((model) => ({
           modelId: model.id,
           contextLimit: model.context.effective ?? undefined,
         })),
-        metadataWindow: metadata?.context_window ?? null,
+        // Model intelligence exposes a total/ambiguous context_window, not
+        // a binding-qualified prompt budget. It is not an input-limit fallback.
       });
       const contextWindow = resolved.window;
       const budgetTokens = resolved.budgetTokens;

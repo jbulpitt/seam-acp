@@ -1,4 +1,5 @@
 import Database from "better-sqlite3";
+import { ContextBudgetStore } from "./context-budget-store.js";
 import { TurnAttemptStore, inboundAttemptId } from "./dispatch/attempt-store.js";
 import { ScheduledOccurrenceStore } from "./scheduled-prompts/occurrence-store.js";
 import fs from "node:fs";
@@ -386,12 +387,14 @@ export function isPlannedChainChildId(id: string | null | undefined): id is stri
 export class SessionStore {
   private readonly db: Database.Database;
   readonly turnAttempts: TurnAttemptStore;
+  readonly contextBudgets: ContextBudgetStore;
   readonly scheduledOccurrences: ScheduledOccurrenceStore;
 
   constructor(dbPath: string) {
     fs.mkdirSync(path.dirname(dbPath), { recursive: true });
     this.db = new Database(dbPath);
     this.db.pragma("journal_mode = WAL");
+    this.contextBudgets = new ContextBudgetStore(this.db);
     this.turnAttempts = new TurnAttemptStore(this.db);
     this.scheduledOccurrences = new ScheduledOccurrenceStore(this.db);
     this.db.exec(SCHEMA);

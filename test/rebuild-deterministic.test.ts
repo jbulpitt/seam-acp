@@ -51,7 +51,9 @@ function page(rows: readonly MessagePageItem[], over: Partial<MessagePage> = {})
 
 function makeOrch(over?: {
   posts?: MessagePageItem[];
-  cfg?: { model?: string; reasoningEffort?: string; lastContextUsage?: { model: string; size: number } };
+  cfg?: { model?: string; reasoningEffort?: string; lastContextUsage?: {
+    model: string; size: number; budget?: import("../packages/core/src/core/context-budget.js").ContextBudgetObservation;
+  } };
   staticContextLimit?: number;
   staticModels?: Array<{ modelId: string; name: string; contextLimit?: number }> | null;
   botId?: string | undefined;
@@ -65,7 +67,6 @@ function makeOrch(over?: {
   recordOver?: Partial<SessionRecord>;
   profiles?: Record<string, any>;
   describeConfig?: (record: SessionRecord) => any;
-  getModelMetadata?: (id: string) => { context_window: number | null } | null;
   listPickerModels?: () => Promise<Array<{ modelId: string; name: string; contextLimit?: number }>>;
 }) {
   const rec = record(over?.recordOver);
@@ -148,7 +149,6 @@ function makeOrch(over?: {
       invalidate: async () => {},
     } as any,
     modelCatalog,
-    ...(over?.getModelMetadata ? { getModelMetadata: over.getModelMetadata } : {}),
     store: {
       readConfig: () => over?.cfg ?? { model: "claude-opus-4.8", reasoningEffort: "high" },
       get: () => ({ ...rec, acpSessionId: bound.value }),
@@ -316,10 +316,16 @@ describe("reconstructSessionFromDiscord", () => {
   });
 
   it("uses matching live usage for the 60% budget", async () => {
+    // A real rebuild must consume the matching observed prompt limit, not a catalog floor or total window.
     const t = makeOrch({
       cfg: {
         model: "claude-opus-4.8",
-        lastContextUsage: { model: "claude-opus-4.8", size: 500_000 },
+        lastContextUsage: { model: "claude-opus-4.8", size: 500_000, budget: {
+          agentId: "claude", location: "local", acpSessionId: "acp-active", model: "claude-opus-4.8",
+          requestedTier: null, observedTier: null, used: 30_000, promptBudget: 500_000,
+          totalWindow: null, outputAllocation: null, source: "acp-usage",
+          atUtc: "2026-09-11T00:00:00Z", previousPromptBudget: null,
+        } },
       },
     });
     const res = await (t.orch as any).reconstructSessionFromDiscord({
@@ -752,7 +758,8 @@ describe("reconstructSessionFromDiscord", () => {
     expect(res.seed.budgetTokens).toBe(Math.floor(1_048_576 * 0.6));
   });
 
-  it("uses cached copilot metadata when the static picker has no window", async () => {
+  // A bare metadata total is not a prompt budget; restoring that fallback would overfill Copilot input.
+  it("fails closed when Copilot has neither qualified usage nor a catalog prompt limit", async () => {
     const t = makeOrch({
       recordOver: { agentId: "copilot" },
       cfg: { model: "gpt-5.5" },
@@ -764,16 +771,14 @@ describe("reconstructSessionFromDiscord", () => {
           sessionManager: { name: "mgr" },
         },
       },
-      getModelMetadata: (id) => (id === "gpt-5.5" ? { context_window: 400_000 } : null),
     });
-    const res = await (t.orch as any).reconstructSessionFromDiscord({
+    await expect((t.orch as any).reconstructSessionFromDiscord({
       record: t.rec,
       channel: { platform: "discord", id: "thread-r" },
       observedAtStart: "acp-active",
       attachIntent: "attach",
-    });
-    expect(res.destination).toEqual({ agentId: "copilot", model: "gpt-5.5", contextWindow: 400_000 });
-    expect(res.seed.budgetTokens).toBe(240_000);
+    })).rejects.toThrow(/cannot resolve a context window/);
+    expect(t.seedCalls).toHaveLength(0);
   });
 
   it("does not parse a display label for a token count", async () => {

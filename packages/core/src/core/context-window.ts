@@ -10,6 +10,7 @@ import {
   ReconstructionUnavailableError,
   reconstructionBudgetTokens,
 } from "./reconstruction/types.js";
+import { matchesContextBudget, type ContextBudgetIdentity, type ContextBudgetObservation } from "./context-budget.js";
 
 export type ContextWindowSourceId =
   | "live-usage"
@@ -42,10 +43,11 @@ export interface ContextWindowResolveInput {
   model: string;
   /** Profile default, used only to look up catalogs when `model` is `"default"`. */
   defaultModel?: string;
-  lastContextUsage?: { model: string; size: number };
+  identity?: ContextBudgetIdentity;
+  lastContextUsage?: { model: string; size: number; budget?: ContextBudgetObservation };
   catalogModels?: ReadonlyArray<ContextWindowModel>;
-  /** Exact-id window from the durable model-metadata catalog. */
-  metadataWindow?: number | null;
+  /** Explicit prompt budget from a binding-qualified source, never a total window. */
+  metadataBudget?: Omit<ContextBudgetIdentity, "acpSessionId"> & { promptBudget: number };
 }
 
 export function enrichModelListWithKnownLimits<T extends ContextWindowModel>(
@@ -113,11 +115,9 @@ export function resolveContextWindow(input: ContextWindowResolveInput): ContextW
 
   const usage = input.lastContextUsage;
   const live =
-    usage &&
-    usage.model === model &&
-    Number.isFinite(usage.size) &&
-    usage.size > 0
-      ? Math.floor(usage.size)
+    input.identity && matchesContextBudget(usage?.budget, { ...input.identity, agentId, model }) &&
+    usage?.budget && Number.isFinite(usage.budget.promptBudget) && usage.budget.promptBudget > 0
+      ? Math.floor(usage.budget.promptBudget)
       : undefined;
   const fromLive = take("live-usage", live);
   if (fromLive) return fromLive;
@@ -137,9 +137,15 @@ export function resolveContextWindow(input: ContextWindowResolveInput): ContextW
   const fromCatalog = firstHit("operational-catalog", (id) => exactLimit(id, input.catalogModels));
   if (fromCatalog) return fromCatalog;
 
+  const metadata = input.metadataBudget;
+  // Metadata must name this binding and tier and explicitly describe input capacity.
+  // Removing this gate reintroduces bare-model cross-provider and total-window leakage.
   const meta =
-    input.metadataWindow && Number.isFinite(input.metadataWindow) && input.metadataWindow > 0
-      ? Math.floor(input.metadataWindow)
+    input.identity && metadata &&
+    metadata.agentId === agentId && metadata.location === input.identity.location &&
+    metadata.model === model && metadata.requestedTier === input.identity.requestedTier &&
+    Number.isFinite(metadata.promptBudget) && metadata.promptBudget > 0
+      ? Math.floor(metadata.promptBudget)
       : undefined;
   const fromMeta = take("model-metadata", meta);
   if (fromMeta) return fromMeta;
@@ -150,15 +156,17 @@ export function resolveContextWindow(input: ContextWindowResolveInput): ContextW
   );
 }
 
-/** Compatibility wrapper used by older reconstruction unit tests. */
+/** Compatibility wrapper for destination-only callers; observations still require full attribution. */
 export function resolveDestinationContextWindow(opts: {
   destinationModel: string;
-  lastContextUsage?: { model: string; size: number };
+  identity?: ContextBudgetIdentity;
+  lastContextUsage?: ContextWindowResolveInput["lastContextUsage"];
   staticContextLimit?: number;
 }): number {
   return resolveContextWindow({
-    agentId: "unknown",
+    agentId: opts.identity?.agentId ?? "unknown",
     model: opts.destinationModel,
+    identity: opts.identity,
     lastContextUsage: opts.lastContextUsage,
     catalogModels: opts.staticContextLimit
       ? [{ modelId: opts.destinationModel, contextLimit: opts.staticContextLimit }]

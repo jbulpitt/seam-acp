@@ -363,7 +363,8 @@ export async function reconcileInterruptedChoiceAdmissions(opts: {
   const rows = opts.store.listAdmittingChoiceResults(limit + 1);
   const truncated = rows.length > limit;
   const inspect = rows.slice(0, limit);
-  const stateFor = opts.artifactState ?? dispatchArtifactState;
+  const stateFor = opts.artifactState ?? ((dataDir: string, id: string) =>
+    dispatchArtifactState(dataDir, id, (key) => opts.store.isDispatchCompleted(key)));
   const result: InterruptedAdmissionReconcileResult = {
     inspected: 0,
     published: 0,

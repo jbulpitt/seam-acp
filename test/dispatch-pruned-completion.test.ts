@@ -5,7 +5,7 @@ import path from "node:path";
 import { pino } from "pino";
 import { DispatchWatcher } from "../packages/core/src/core/dispatch/watcher.js";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
-import { dispatchDirs } from "../packages/core/src/core/dispatch/types.js";
+import { dispatchArtifactState, dispatchDirs } from "../packages/core/src/core/dispatch/types.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 
 let dataDir: string;
@@ -24,6 +24,12 @@ afterEach(async () => {
 });
 
 describe("completion survives done artifact removal (#306)", () => {
+  it("uses SQL completion for artifact inspection after pruning", async () => {
+    store.recordDelegation({ id: "pruned-child", kind: "forward", status: "completed" });
+    // Without this production helper's SQL path, chain/admission repair mistakes pruning for missing publication.
+    expect(await dispatchArtifactState(dataDir, "pruned-child", (id) => store.isDispatchCompleted(id))).toBe("done");
+    expect(await dispatchArtifactState(dataDir, "unknown", (id) => store.isDispatchCompleted(id))).toBeNull();
+  });
   for (const resumeEnabled of [false, true]) {
     it(`drops completed queue leftovers without replay or replacement output (resume=${resumeEnabled})`, async () => {
       const dirs = dispatchDirs(dataDir);

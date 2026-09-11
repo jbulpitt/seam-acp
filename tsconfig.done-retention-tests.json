@@ -6,6 +6,7 @@
     "packages/bridge/src/**/*.ts",
     "test/dispatch-pruned-completion.test.ts",
     "test/dispatch-done-retention.test.ts",
+    "test/shutdown-quiesce.test.ts",
     "test/dispatch-proof-retention.test.ts",
     "test/dispatch-retention-crash.test.ts"
   ]

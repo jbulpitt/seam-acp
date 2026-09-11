@@ -5,7 +5,7 @@ import path from "node:path";
 import { pino } from "pino";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
 import { DispatchWatcher } from "../packages/core/src/core/dispatch/watcher.js";
-import { DoneRetention, pruneDoneArtifact, pruneDoneArtifacts } from "../packages/core/src/core/dispatch/done-retention.js";
+import { bindDoneDeliveryResolver, DoneRetention, pruneDoneArtifact, pruneDoneArtifacts } from "../packages/core/src/core/dispatch/done-retention.js";
 import { dispatchDirs, type DispatchSpec } from "../packages/core/src/core/dispatch/types.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 
@@ -37,6 +37,27 @@ const deps = () => ({ dataDir, logger, isDeliveryResolved: (id: string) => store
 const artifact = (id: string) => path.join(dispatchDirs(dataDir).done, `${id}.json`);
 
 describe("proof-only done retention (#306)", () => {
+  it("uses the canonical resolver decision and does not log invalid private bodies", async () => {
+    complete("routed", true);
+    const row = store.getDelegation("routed");
+    const result = { id: "routed", target: "worker", status: "completed", kind: "handoff", returnTo: "origin",
+      finishedUtc: new Date().toISOString(), output: "private output" };
+    await writeFile(artifact("routed"), JSON.stringify(result));
+    const resolveDelivery = vi.fn(() => false);
+    const warn = vi.fn();
+    const configured = bindDoneDeliveryResolver({ dataDir, logger: { warn } as unknown as Logger,
+      getDelegation: (id) => store.getDelegation(id), getReportBackByCorrelation: (id) => store.getReportBackByCorrelation(id), resolveDelivery });
+    // Without this binding, retention could substitute terminal/local-ack for the canonical onward-delivery decision.
+    expect(pruneDoneArtifact(configured, "routed").state).toBe("retained");
+    expect(resolveDelivery).toHaveBeenCalledWith(result, row, expect.any(Object));
+    resolveDelivery.mockReturnValue(true);
+    expect(pruneDoneArtifact(configured, "routed").state).toBe("pruned");
+    await writeFile(artifact("malformed"), "PRIVATE-PROMPT-CONTENT");
+    expect((await pruneDoneArtifacts(configured))).toMatchObject({ failed: 1, pruned: 0 });
+    // Without error redaction JSON.parse includes the private input in the logger's Error message.
+    expect(String(warn.mock.calls[0]?.[0].err)).not.toContain("PRIVATE-PROMPT-CONTENT");
+  });
+
   it("prunes all delivered backlog pages without an age cutoff and retains unknown/undelivered files", async () => {
     complete("resolved", true);
     complete("pending", false);

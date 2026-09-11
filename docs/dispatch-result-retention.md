@@ -6,8 +6,9 @@
 index. There is **no age-based grace period** for delivery-resolved results:
 their redundant JSON artifacts are removed after publication or by the next
 background sweep. The sweep runs on startup in the background, then every
-minute. It streams filenames and yields every 64 entries; it does not load
-prompt/output bodies or hold startup behind a lifetime directory scan.
+minute. It streams filenames and yields every 64 entries. Resolution reads one
+artifact at a time for routing; prompt/output bodies are never logged, and the
+lifetime directory scan does not hold startup readiness.
 
 Deletion consumes the delivery resolver's canonical durable decision (#305).
 Worker success, a terminal parent ledger row, file age, and an enqueued but
@@ -22,10 +23,16 @@ terminal dispatch `turn_attempts`) supplies the boolean used by the watcher
 and Voice Console. Legacy files without SQL completion remain recovery
 authority. Queue leftovers cannot turn a pruned result into a new turn.
 
-The durable outcome remains in `turn_attempts.outcome_json`; delegation and
+Modern durable outcomes remain in `turn_attempts.outcome_json`; delegation and
 delivery records remain in SQLite. `seam-dispatch --wait` falls back to that
-SQL outcome when its file has already disappeared. This policy removes the
-duplicate cleartext JSON copy, **not all copies of prompts/outputs**. SQLite,
+SQL outcome when its file has already disappeared. **Legacy exception:** a
+read-only metadata audit on 2026-09-11 found 5,060 result files but only 182
+matching SQL outcomes. The other 4,878 are not promised an SQL output archive.
+Pruning a delivery-resolved legacy file can remove its last full local result
+copy; that is intentional expiration, not lossless migration. Confirm this
+legacy disposition at rollout. Unknown/unresolved files are retained.
+
+This policy does **not remove all copies of prompts/outputs**. SQLite,
 provider session storage, logs, backups, and pre-existing `done-quarantine/`
 have separate lifetimes and are not silently deleted by this change.
 
@@ -43,6 +50,20 @@ against an older running watcher: old filesystem-only readers can interpret a
 removed file as permission to replay. The implementation PR does not itself
 authorize a merge or restart. Production deletion is a rollout step, not an
 implicit side effect of tests or a dry run.
+
+After building the integrated #305/#306 head, inspect without writes:
+
+```sh
+node scripts/prune-dispatch-done.mjs --data-dir <DATA_DIR> --dry-run
+```
+
+After compatible consumers are deployed, the automatic sweep handles the
+backlog. An operator may instead explicitly run the same command with `--apply`.
+The command opens SQLite read-only and never migrates schema; `--apply` only
+unlinks resolver-approved regular files under that data directory's `dispatch/done/`.
+It reports counts/bytes, not bodies. `dryRun: true` means `pruned`/`bytes` are
+eligible counts, **not files actually removed**. A missing #305 resolver refuses
+the operation. No production cleanup is performed by the PR's test commands.
 
 The automatic sweep emits counts (`scanned`, `pruned`, `retained`, `failed`,
 `bytes`) without result bodies. In steady state, regular JSON files remaining

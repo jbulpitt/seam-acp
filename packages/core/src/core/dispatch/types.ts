@@ -636,8 +636,12 @@ export async function enqueueDispatchSpec(
 /** Locate the durable artifact for one exact dispatch id. */
 export async function dispatchArtifactState(
   dataDir: string,
-  id: string
+  id: string,
+  isCompleted?: (id: string) => boolean
 ): Promise<"pending" | "running" | "done" | null> {
+  // Completion survives delivery-retention unlink. Without SQL precedence,
+  // chain repair republishes a completed child's original prompt.
+  if (isCompleted?.(id)) return "done";
   const dirs = dispatchDirs(dataDir);
   for (const [state, dir] of [
     ["pending", dirs.pending],

@@ -252,12 +252,19 @@ export interface DoneDeliveryResolutionLookup {
   getReportBackByCorrelation: (correlationId: string) => DoneLedgerRow | null;
 }
 
-/** Canonical read-only proof gate shared with done-artifact retention (#306). */
+/**
+ * Canonical read-only proof gate shared with done-artifact retention (#306).
+ * It proves both halves: the source row is terminal and its route-specific
+ * onward delivery is settled. Callers need not add a separate status guard.
+ */
 export function isDoneDeliveryResolved(
   result: DispatchResult,
   row: DoneLedgerState,
   lookup: DoneDeliveryResolutionLookup
 ): boolean {
+  // Protects callers from deleting output for work that is still recoverable;
+  // deleting this check makes a no-onward but non-terminal row read resolved.
+  if (!TERMINAL_STATUSES.has(row.status)) return false;
   if (row.status === "abandoned" && row.terminalReason) return true;
   // Reclassify with a non-terminal status: the live route is still required
   // to prove whether a terminal source had an onward obligation.
@@ -415,7 +422,17 @@ export async function reconcileCompletedDoneFiles(
       else {
         // Protects against the permanent boot-warning loop for pre-nonce rows;
         // deleting this transition leaves the same unprovable result forever.
-        if (deps.abandonUnprovable(result.id, LEGACY_DELIVERY_ABANDON_REASON)) {
+        let abandoned = false;
+        try {
+          abandoned = deps.abandonUnprovable(result.id, LEGACY_DELIVERY_ABANDON_REASON);
+        } catch (err) {
+          // Protects one corrupt/busy ledger write from starving later legacy
+          // rows; deleting this boundary aborts the whole bounded recovery page.
+          summary.failed++;
+          deps.logger.warn({ err, id: result.id }, "done-reconcile: legacy abandonment failed");
+          continue;
+        }
+        if (abandoned) {
           summary.abandonedUnprovable++;
           deps.logger.warn(
             { id: result.id, kind: result.kind ?? row?.kind, reason: LEGACY_DELIVERY_ABANDON_REASON },

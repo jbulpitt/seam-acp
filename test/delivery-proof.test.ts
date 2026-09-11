@@ -11,7 +11,10 @@ import {
 } from "../packages/core/src/core/dispatch/delivery-proof.js";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
 import { pino } from "pino";
-import { reconcileCompletedDoneFiles } from "../packages/core/src/core/dispatch/done-reconcile.js";
+import {
+  isDoneDeliveryResolved,
+  reconcileCompletedDoneFiles,
+} from "../packages/core/src/core/dispatch/done-reconcile.js";
 import { dispatchDirs } from "../packages/core/src/core/dispatch/types.js";
 
 const cleanups: Array<() => void> = [];
@@ -212,5 +215,21 @@ describe("#305 Discord nonce delivery proof", () => {
     // Protects the production backlog from permanent boot churn; deleting the
     // terminal reason/transition makes these same ids candidates indefinitely.
     expect(second).toMatchObject({ recoveryCandidates: 0, abandonedUnprovable: 0 });
+  });
+
+  it("does not mistake a no-onward but non-terminal source for resolved delivery", () => {
+    const lookup = {
+      getDelegation: () => null,
+      getReportBackByCorrelation: () => null,
+    };
+    // Protects consumers such as #306 from omitting their own status precheck;
+    // deleting it allows a running wake result to be pruned as if completed.
+    expect(isDoneDeliveryResolved({
+      id: "running-wake",
+      target: "thread",
+      status: "completed",
+      kind: "wake",
+      finishedUtc: "2026-09-11T00:00:00.000Z",
+    }, { status: "running", kind: "wake" }, lookup)).toBe(false);
   });
 });

@@ -287,6 +287,8 @@ export class TurnAttemptStore {
     const row = this.db.prepare(`SELECT state,delivery_done
       FROM turn_attempts WHERE id=?`).get(id) as
       { state: TurnAttempt["state"]; delivery_done: number } | undefined;
+    // Protects terminal refusal/uncertainty from reading as transport proof;
+    // deleting the exact receipt check makes retained output deletable.
     return Boolean(row?.state === "completed" && row.delivery_done === 1);
   }
 

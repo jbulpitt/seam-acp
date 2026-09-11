@@ -2115,8 +2115,7 @@ export class SessionStore {
         // check lets a second caller erase who authorized destructive expiry.
         if (
           existing.operatorId !== actor ||
-          existing.reason !== explanation ||
-          existing.authorizedUtc !== authorizedUtc
+          existing.reason !== explanation
         ) {
           throw new Error(`done artifact expiration already authorized for ${id}`);
         }

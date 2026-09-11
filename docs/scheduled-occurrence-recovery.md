@@ -50,6 +50,12 @@ publishing a key before the first durable insert was not durable admission.
   search is recorded as retained uncertainty: it is surfaced to the operator,
   is not automatically searched again on each boot, and never counts as delivery
   proof. This does not claim exactly-once semantics for non-Discord tools.
+- Done-artifact retention asks a narrower question than lifecycle recovery.
+  `completed`, `failed`, `timed_out`, `abandoned`, and retained uncertainty are
+  dispositions, not evidence that output exists elsewhere. Deletion requires a
+  recorded successful Discord receipt, an exactly completed onward child, or a
+  separate immutable operator expiration authorization containing dispatch id,
+  operator id, reason, and timestamp. No recovery path writes that authorization.
 - Disable/delete prevents future cron admission. It **does not cancel an already
   admitted occurrence**, including its frozen snapshot or captured output.
   Intentional cancellation is a durable attempt terminal state and cannot resume.

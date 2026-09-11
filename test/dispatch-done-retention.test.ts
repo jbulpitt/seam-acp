@@ -283,6 +283,13 @@ describe("#193 bounded done-file recovery and retention", () => {
       reason: "owner approved expiration after reviewing retained output",
       authorizedUtc: "2026-09-03T01:02:03.000Z",
     });
+    // Protects an operator retry from creating or rewriting authorization;
+    // deleting idempotency makes a harmless repeated command fail or drift.
+    expect(store.authorizeDoneArtifactExpiration(
+      "legacy-no-onward",
+      "discord-user-42",
+      "owner approved expiration after reviewing retained output"
+    )).toEqual(authorization);
     // Protects the authorization audit from mutation; deleting write-once
     // enforcement lets a later caller rewrite destructive consent.
     expect(() => store.authorizeDoneArtifactExpiration(

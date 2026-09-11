@@ -302,7 +302,7 @@ async function writeMaintenanceCursor(
   await rename(tmp, file);
 }
 
-export interface DoneDeliveryResolutionLookup {
+export interface DoneDeliveryProofLookup {
   getDelegation: (id: string) => DoneLedgerState | null;
   getReportBackByCorrelation: (correlationId: string) => DoneLedgerRow | null;
   isAttemptDeliveryProven: (id: string) => boolean;
@@ -318,7 +318,7 @@ export interface DoneDeliveryResolutionLookup {
 export function isDoneDeliveryProven(
   result: DispatchResult,
   row: DoneLedgerState,
-  lookup: DoneDeliveryResolutionLookup
+  lookup: DoneDeliveryProofLookup
 ): boolean {
   // Protects active work from deletion even if a corrupt receipt/child exists;
   // deleting this check lets evidence attach to a non-terminal source.
@@ -356,8 +356,10 @@ export function isDoneDeliveryProven(
 export function isDoneArtifactDeletable(
   result: DispatchResult,
   row: DoneLedgerState,
-  lookup: DoneDeliveryResolutionLookup
+  lookup: DoneDeliveryProofLookup
 ): boolean {
+  // Protects operator policy from attaching to active work; deleting this
+  // check lets a premature authorization erase a still-recoverable artifact.
   if (!TERMINAL_STATUSES.has(row.status)) return false;
   if (isDoneDeliveryProven(result, row, lookup)) return true;
   const authorization = lookup.getExpirationAuthorization(result.id);

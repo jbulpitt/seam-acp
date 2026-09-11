@@ -12,7 +12,7 @@ import { mkdir, writeFile, readdir, readFile } from "node:fs/promises";
 import { pino } from "pino";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
-import { DispatchWatcher } from "../packages/core/src/core/dispatch/watcher.js";
+import { DispatchWatcher, createRuntimeDispatchWatcher } from "../packages/core/src/core/dispatch/watcher.js";
 import { dispatchDirs, type DispatchSpec } from "../packages/core/src/core/dispatch/types.js";
 import {
   CONTINUE_PROMPT,
@@ -51,16 +51,19 @@ function makeOrch(opts?: {
   loadSession?: ReturnType<typeof vi.fn<(opts: { sessionId: string }) => Promise<{ sessionId: string }>>>;
   newSession?: ReturnType<typeof vi.fn<() => Promise<{ sessionId: string }>>>;
   handleInner?: ReturnType<typeof vi.fn>;
+  getProfile?: (id?: string, location?: string) => unknown;
 }): {
   orch: Orchestrator;
   prompts: string[];
   announced: string[];
+  sent: Array<{ channel: string; text: string }>;
   loadSession: ReturnType<typeof vi.fn>;
   newSession: ReturnType<typeof vi.fn>;
 } {
   const catalogProfile = { id: "codex", defaultModel: "default" } as any;
   const prompts: string[] = [];
   const announced: string[] = [];
+  const sent: Array<{ channel: string; text: string }> = [];
   const loadSession = opts?.loadSession ?? vi.fn(async () => ({ sessionId: "acp-recorded" }));
   const newSession = opts?.newSession ?? vi.fn(async () => ({ sessionId: "acp-NEW" }));
   const router = {
@@ -69,10 +72,10 @@ function makeOrch(opts?: {
     reuseMcpServers: () => [],
     ensureSessionRecord: (o: { channelRef: string }) =>
       record({ id: `discord:${o.channelRef}`, channelRef: o.channelRef }),
-    getProfile: () => ({
+    getProfile: opts?.getProfile ?? (() => ({
       id: "codex",
       sessionManager: { deleteSession: async () => {} },
-    }),
+    })),
     getOrStartRuntime: async () => ({
       onEvent() {},
       async prompt(p: string) {
@@ -110,8 +113,9 @@ function makeOrch(opts?: {
       SEAM_TURN_RESUME_MAX_AGE_SECONDS: 7200,
     } as any,
     adapter: {
-      async sendMessage(_ch: unknown, text: string) {
+      async sendMessage(ch: { id?: string }, text: string) {
         announced.push(text);
+        sent.push({ channel: ch.id ?? "", text });
         return { channel: { platform: "discord", id: "x" }, id: "m" };
       },
       async editMessage() {},
@@ -127,7 +131,7 @@ function makeOrch(opts?: {
   if (opts?.handleInner) {
     (orch as any).handleIncomingMessageInner = opts.handleInner;
   }
-  return { orch, prompts, announced, loadSession, newSession };
+  return { orch, prompts, announced, sent, loadSession, newSession };
 }
 
 function handoffSpec(over: Partial<DispatchSpec> = {}): DispatchSpec {
@@ -150,6 +154,13 @@ async function seedInterrupted(spec: DispatchSpec = handoffSpec()): Promise<void
   // liveness. The production dispatcher captures the exact spec/identity.
   simulateRetiredOwnerProcess();
   const { orch } = makeOrch({ enabled: true });
+  if (spec.location && spec.location !== "local") {
+    orch.setBridgeHub({
+      markSessionBridge: () => {},
+      get: () => ({ mux: {} }),
+      mcpServersForRemoteSpawn: () => undefined,
+    } as any);
+  }
   (orch as any).injectTurn = async (_t: unknown, _p: string, opts: InjectTurnOptions) => {
     await opts.onSession?.("acp-recorded");
     opts.lifecycle?.beforePrompt();
@@ -511,6 +522,144 @@ describe("watcher recoverStale vs resumeEnabled", () => {
     const body = JSON.parse(await readFile(path.join(dirs.pending, "disp-1.json"), "utf8"));
     expect(body.resume).toBe(true);
     expect(body.prompt).toBe("do the overnight git push");
+  });
+
+  it("does not publish an owned remote resume until bridge reconciliation is ready (#290)", async () => {
+    const spec = handoffSpec({
+      location: "remote-a",
+      agentId: "codex",
+      createdUtc: new Date().toISOString(),
+    });
+    await seedInterrupted(spec);
+    const before = store.turnAttempts.get(spec.id)!;
+    const dirs = dispatchDirs(dir);
+    await mkdir(dirs.running, { recursive: true });
+    await mkdir(dirs.pending, { recursive: true });
+    await mkdir(dirs.done, { recursive: true });
+    await writeFile(path.join(dirs.running, `${spec.id}.json`), JSON.stringify(spec), "utf8");
+
+    const { orch, sent } = makeOrch({ enabled: true });
+    (orch as any).injectTurn = async (_t: unknown, prompt: string, opts: InjectTurnOptions) => {
+      expect(prompt).toBe(CONTINUE_PROMPT);
+      await syntheticStart(opts);
+      return { text: "continued after reconciliation", error: undefined, stopReason: "end_turn" };
+    };
+    let ready = false;
+    let readyListener: ((id: string) => void) | undefined;
+    const markSessionBridge = vi.fn();
+    orch.setBridgeHub({
+      isBridgeReady: () => ready,
+      onBridgeReady: (listener: (id: string) => void) => {
+        readyListener = listener;
+        return () => { readyListener = undefined; };
+      },
+      markSessionBridge,
+      get: () => ({ mux: {} }),
+      mcpServersForRemoteSpawn: () => undefined,
+    } as any);
+    const watcher = createRuntimeDispatchWatcher({
+      dataDir: dir,
+      logger: silent,
+      pollMs: 60_000,
+      resumeEnabled: true,
+      retainForRecovery: (id) => store.turnAttempts.get(id) !== null,
+      runtime: orch,
+    });
+    await watcher.start();
+    orch.setDispatchWatcher(watcher);
+
+    let settled = false;
+    const recovery = orch.recoverInterruptedTurns().then(() => { settled = true; });
+    await vi.waitFor(() => {
+      expect(Boolean(readyListener) || settled).toBe(true);
+    });
+    expect(readyListener).toBeTypeOf("function");
+    expect(settled).toBe(false);
+    expect(await readdir(dirs.pending)).toEqual([]);
+    expect(await readdir(dirs.running)).toEqual([`${spec.id}.json`]);
+
+    ready = true;
+    readyListener?.("remote-a");
+    await recovery;
+    expect(await readdir(dirs.pending)).toEqual([`${spec.id}.json`]);
+    expect(markSessionBridge).toHaveBeenCalledWith("discord:thread-worker", "remote-a");
+    await watcher.tick();
+    watcher.stop();
+    const retained = store.turnAttempts.get(spec.id)!;
+    // #250 deliberately forbids prompt-started remote replay. Readiness gates
+    // the attempt, then the unsupported continuation is made loud instead of
+    // being retried as a new prompt.
+    expect(retained.state).toBe("suspended");
+    expect(retained.generation).toBe(before.generation);
+    expect(retained.ownerBoot).toBe(before.ownerBoot);
+    expect(retained.stalledUtc).toEqual(expect.any(String));
+    expect(sent.some((message) => message.channel === "thread-boss" && message.text.includes("stalled"))).toBe(true);
+    expect(await readdir(dirs.running)).toEqual([`${spec.id}.json`]);
+  });
+
+  it("durably quarantines and reports a post-readiness retain through the production watcher path (#290)", async () => {
+    const spec = handoffSpec({ agentId: "codex", createdUtc: new Date().toISOString() });
+    await seedInterrupted(spec);
+    const before = store.turnAttempts.get(spec.id)!;
+    const dirs = dispatchDirs(dir);
+    await mkdir(dirs.pending, { recursive: true });
+    await writeFile(
+      path.join(dirs.pending, `${spec.id}.json`),
+      JSON.stringify({ ...spec, resume: true }),
+      "utf8"
+    );
+
+    // Reproduce the incident's pre-claim availability loss after boot: the
+    // configured provider is absent, so ownership cannot advance and the
+    // orchestrator retains rather than replaying/terminalizing.
+    const { orch, sent } = makeOrch({ enabled: true, getProfile: () => undefined });
+    const watcher = createRuntimeDispatchWatcher({
+      dataDir: dir,
+      logger: silent,
+      pollMs: 60_000,
+      resumeEnabled: true,
+      retainForRecovery: (id) => store.turnAttempts.get(id) !== null,
+      runtime: orch,
+    });
+    orch.setDispatchWatcher(watcher);
+    await watcher.start();
+    watcher.stop();
+
+    const after = store.turnAttempts.get(spec.id)!;
+    expect(after.state).toBe("suspended");
+    expect(after.ownerBoot).toBe(before.ownerBoot);
+    expect(after.generation).toBe(before.generation);
+    expect(after.stalledUtc).toEqual(expect.any(String));
+    expect(after.stalledReason).toMatch(/did not begin/);
+    expect(after.stallNoticeUtc).toEqual(expect.any(String));
+    expect(sent).toContainEqual(expect.objectContaining({
+      channel: "thread-boss",
+      text: expect.stringContaining(`/seam workflows`),
+    }));
+    expect(orch.inspectChannelQueue("thread-worker", Date.now())).toMatchObject({
+      state: "stalled",
+      runtimeBusy: false,
+      stalledDispatchCount: 1,
+      stalledDispatchIds: [spec.id],
+    });
+    expect(await readdir(dirs.running)).toEqual([`${spec.id}.json`]);
+    await expect(readFile(path.join(dirs.done, `${spec.id}.json`), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+
+    // Another boot must keep the quarantine and must not silently retry it.
+    const secondWatcher = new DispatchWatcher({
+      dataDir: dir,
+      logger: silent,
+      pollMs: 60_000,
+      resumeEnabled: true,
+      retainForRecovery: (id) => store.turnAttempts.get(id) !== null,
+      onDispatch: vi.fn(async () => ({ output: "must not run", stopReason: "end_turn" })),
+    });
+    await secondWatcher.start();
+    orch.setDispatchWatcher(secondWatcher);
+    await orch.recoverInterruptedTurns();
+    secondWatcher.stop();
+    expect(await readdir(dirs.pending)).toEqual([]);
+    expect(await readdir(dirs.running)).toEqual([`${spec.id}.json`]);
   });
 });
 

@@ -29,6 +29,13 @@ export interface TurnAttempt {
   providerIdentity: string | null;
   source: "dispatch" | "inbound" | "schedule";
   deliveryDone: boolean;
+  updatedUtc: string;
+  /** Durable quarantine metadata for a recovery attempt that was retained
+   * after startup readiness. The execution remains suspended and can only be
+   * resumed/abandoned through the guarded operator workflow. */
+  stalledUtc: string | null;
+  stalledReason: string | null;
+  stallNoticeUtc: string | null;
 }
 
 /** Not a worker failure. Callers must retain the logical job and emit nothing
@@ -52,6 +59,9 @@ export class TurnAttemptStore {
     for (const ddl of [
       "ALTER TABLE turn_attempts ADD COLUMN source TEXT NOT NULL DEFAULT 'dispatch'",
       "ALTER TABLE turn_attempts ADD COLUMN delivery_done INTEGER NOT NULL DEFAULT 0",
+      "ALTER TABLE turn_attempts ADD COLUMN stalled_utc TEXT",
+      "ALTER TABLE turn_attempts ADD COLUMN stalled_reason TEXT",
+      "ALTER TABLE turn_attempts ADD COLUMN stall_notice_utc TEXT",
     ]) {
       try { db.exec(ddl); } catch (err) {
         if (!(err instanceof Error) || !err.message.includes("duplicate column name")) throw err;
@@ -79,7 +89,8 @@ export class TurnAttemptStore {
       { id: string; generation: number; owner_boot: string; state: TurnAttempt["state"];
         identity: string; spec_json: string; acp_session_id: string | null;
         prompt_started: number; outcome_json: string | null; runtime_json: string | null; provider_identity: string | null;
-        source: TurnAttempt["source"]; delivery_done: number } | undefined;
+        source: TurnAttempt["source"]; delivery_done: number; updated_utc: string;
+        stalled_utc: string | null; stalled_reason: string | null; stall_notice_utc: string | null } | undefined;
     return row ? {
       id: row.id, generation: row.generation, ownerBoot: row.owner_boot,
       state: row.state, identity: row.identity, spec: JSON.parse(row.spec_json),
@@ -88,6 +99,10 @@ export class TurnAttemptStore {
       runtimeOwner: row.runtime_json ? JSON.parse(row.runtime_json) : null,
       providerIdentity: row.provider_identity,
       source: row.source, deliveryDone: row.delivery_done === 1,
+      updatedUtc: row.updated_utc,
+      stalledUtc: row.stalled_utc,
+      stalledReason: row.stalled_reason,
+      stallNoticeUtc: row.stall_notice_utc,
     } : null;
   }
 
@@ -106,7 +121,8 @@ export class TurnAttemptStore {
         if (!p || (old.ownerBoot !== ownerBoot && !provenDead(p))) throw new DispatchSuspendedError(spec.id);
         if (old.runtimeOwner && !provenDead(old.runtimeOwner)) throw new DispatchSuspendedError(spec.id);
         this.db.prepare(`UPDATE turn_attempts SET generation=generation+1,
-          owner_boot=?, state='active', updated_utc=? WHERE id=? AND state='suspended'`)
+          owner_boot=?, state='active', stalled_utc=NULL, stalled_reason=NULL,
+          stall_notice_utc=NULL, updated_utc=? WHERE id=? AND state='suspended'`)
           .run(ownerBoot, new Date().toISOString(), spec.id);
       } else {
         this.db.prepare(`INSERT INTO turn_attempts
@@ -166,6 +182,32 @@ export class TurnAttemptStore {
    * Send-before-ack is at-least-once across an external delivery crash gap. */
   markDeliveryDone(id: string): void {
     this.db.prepare("UPDATE turn_attempts SET delivery_done=1 WHERE id=? AND state='completed'").run(id);
+  }
+
+  /** Quarantine a retained recovery without terminalizing or replaying it.
+   * Returns true only for the first durable transition, so the requester gets
+   * one notice even if the observer is invoked more than once. */
+  markStalled(id: string, reason: string, now = new Date().toISOString()): boolean {
+    return this.db.prepare(`UPDATE turn_attempts
+      SET state='suspended', stalled_utc=?, stalled_reason=?, updated_utc=?
+      WHERE id=? AND state IN ('active','suspended') AND stalled_utc IS NULL`)
+      .run(now, reason, now, id).changes === 1;
+  }
+
+  markStallNoticeDelivered(id: string, now = new Date().toISOString()): boolean {
+    return this.db.prepare(`UPDATE turn_attempts SET stall_notice_utc=?, updated_utc=?
+      WHERE id=? AND state='suspended' AND stalled_utc IS NOT NULL AND stall_notice_utc IS NULL`)
+      .run(now, now, id).changes === 1;
+  }
+
+  listStalled(target?: string): TurnAttempt[] {
+    const rows = target
+      ? this.db.prepare(`SELECT id FROM turn_attempts
+          WHERE state='suspended' AND stalled_utc IS NOT NULL
+          AND json_extract(spec_json, '$.target')=? ORDER BY stalled_utc,id`).all(target)
+      : this.db.prepare(`SELECT id FROM turn_attempts
+          WHERE state='suspended' AND stalled_utc IS NOT NULL ORDER BY stalled_utc,id`).all();
+    return (rows as { id: string }[]).map(({ id }) => this.get(id)!);
   }
 
   /** Synchronous cutoff, before any transport/runtime teardown can reject. */

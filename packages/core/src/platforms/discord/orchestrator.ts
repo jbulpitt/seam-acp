@@ -567,7 +567,7 @@ function ingestFailureText(err: unknown): string {
   return (raw.trim() || "unknown failure").replace(/\s+/g, " ").slice(0, 1_000);
 }
 
-export type ChannelQueueState = "idle" | "runtime_busy" | "queued" | "wedged";
+export type ChannelQueueState = "idle" | "runtime_busy" | "queued" | "wedged" | "stalled";
 
 export interface ChannelQueueHealth {
   state: ChannelQueueState;
@@ -575,6 +575,8 @@ export interface ChannelQueueHealth {
   queued: number;
   ageMs: number;
   runtimeBusy: boolean;
+  stalledDispatchCount: number;
+  stalledDispatchIds: string[];
 }
 
 interface ChannelQueueFence {
@@ -1972,16 +1974,20 @@ export class Orchestrator {
     const meta = this.channelQueueMeta.get(channelRef);
     const listInbound = (this.store as Partial<SessionStore>).listInboundNonterminal;
     const durable = listInbound ? listInbound.call(this.store, channelRef) : [];
-    if (!meta && !runtimeBusy && durable.length === 0) {
+    const stalled = this.store.turnAttempts.listStalled(channelRef);
+    if (!meta && !runtimeBusy && durable.length === 0 && stalled.length === 0) {
       return {
         state: "idle",
         epoch: this.queueEpoch(channelRef),
         queued: 0,
         ageMs: 0,
         runtimeBusy: false,
+        stalledDispatchCount: 0,
+        stalledDispatchIds: [],
       };
     }
     const durableSince = durable.length > 0 ? Date.parse(durable[0]!.updatedUtc) : Number.NaN;
+    const stalledSince = stalled.length > 0 ? Date.parse(stalled[0]!.stalledUtc!) : Number.NaN;
     const idleSince = meta?.runtimeIdleSinceMs ?? meta?.lastProgressAtMs;
     const ageMs = runtimeBusy
       ? 0
@@ -1989,20 +1995,47 @@ export class Orchestrator {
         ? Math.max(0, nowMs - idleSince)
         : Number.isFinite(durableSince)
           ? Math.max(0, nowMs - durableSince)
-          : 0;
+          : Number.isFinite(stalledSince)
+            ? Math.max(0, nowMs - stalledSince)
+            : 0;
     const graceMs = (this.config.CHANNEL_QUEUE_WEDGE_GRACE_SECONDS ?? 30) * 1000;
     const state: ChannelQueueState = runtimeBusy
       ? "runtime_busy"
       : (meta || durable.length > 0) && ageMs >= graceMs
         ? "wedged"
-        : "queued";
+        : meta || durable.length > 0
+          ? "queued"
+          : "stalled";
     return {
       state,
       epoch: meta?.epoch ?? this.queueEpoch(channelRef),
       queued: Math.max(meta?.queued ?? 0, durable.length),
       ageMs,
       runtimeBusy,
+      stalledDispatchCount: stalled.length,
+      stalledDispatchIds: stalled.map((attempt) => attempt.id),
     };
+  }
+
+  /** Production observer wired into DispatchWatcher. A retained recovery is
+   * not a terminal failure, but it is now an explicit durable quarantine with
+   * a requester-facing notice and operator-owned resume/abandon controls. */
+  async observeRetainedDispatch(spec: DispatchSpec): Promise<void> {
+    const reason = "resume was retained after startup readiness; execution did not begin";
+    this.store.turnAttempts.markStalled(spec.id, reason);
+    const stalled = this.store.turnAttempts.get(spec.id);
+    if (!stalled?.stalledUtc || stalled.stallNoticeUtc) return;
+    const requester = spec.returnTo ?? spec.originThreadRef ?? spec.target;
+    await this.adapter.sendMessage(
+      { platform: PLATFORM, id: requester },
+      `⚠️ Dispatch \`${spec.id}\` to <#${spec.target}> is stalled after restart. ` +
+        "It remains suspended and was not replayed. Use `/seam workflows` to resume or abandon it."
+    );
+    this.store.turnAttempts.markStallNoticeDelivered(spec.id);
+    this.logger.warn(
+      { id: spec.id, target: spec.target, requester },
+      "dispatch: retained attempt quarantined as stalled"
+    );
   }
 
   /** Detach the abandoned tail immediately. Old promises remain tracked by
@@ -13871,8 +13904,28 @@ export class Orchestrator {
           // SQL owns modern attempts. Keep exceptional identities and disabled
           // recovery visible; age/transport failure is not cancellation intent.
           if (owned.state !== "suspended" || pre !== "ok") continue;
+          if (owned.stalledUtc) {
+            // A post-readiness retain is a durable quarantine. Do not turn a
+            // later reboot into an implicit retry; only the guarded operator
+            // workflow may resume it. Retry an unacknowledged notice, though.
+            if (!owned.stallNoticeUtc) await this.observeRetainedDispatch(spec);
+            continue;
+          }
           if (owned.promptStarted && !owned.acpSessionId) continue;
-          await this.dispatchWatcher.requeueStale(spec.id);
+          liveJobs.push(
+            this.resumeScheduler.run(async () => {
+              const loc = spec.location ?? resolveThreadLocation(this.config, spec.target);
+              const waited = await this.waitForResumeHost(loc, spec.createdUtc, maxAge, now);
+              if (waited === "abandon") {
+                await this.abandonDispatchSpec(spec, "bridge not ready (past max-age)");
+                return;
+              }
+              if (!isLocalLocation(loc)) {
+                bindSessionLocation(this.bridgeHub, `discord:${spec.target}`, loc);
+              }
+              await this.dispatchWatcher!.requeueStale(spec.id);
+            })
+          );
           continue;
         }
         const decided = decideResume({

@@ -45,6 +45,9 @@ export interface DispatchWatcherOpts {
    * reject ⇒ `status: "failed"` with the error message.
    */
   onDispatch: (spec: DispatchSpec) => Promise<{ output: string; stopReason: string }>;
+  /** Observe a retained callback while intake is still open. Shutdown-time
+   * retention is deliberately excluded: boot recovery owns that handoff. */
+  onRetained?: (spec: DispatchSpec) => Promise<void>;
   /** Poll interval in ms. Default 1000. */
   pollMs?: number;
   /**
@@ -86,6 +89,25 @@ export interface DispatchWatcherStartOpts {
   waitForInitialDispatches?: boolean;
 }
 
+/** Single production composition point for dispatch execution + retained
+ * observability. Tests use this same factory so deleting either wire is a
+ * behavioral regression, not an untested index.ts assembly detail. */
+export function createRuntimeDispatchWatcher(
+  opts: Omit<DispatchWatcherOpts, "onDispatch" | "onRetained"> & {
+    runtime: {
+      dispatchInjectTurn(spec: DispatchSpec): Promise<{ output: string; stopReason: string }>;
+      observeRetainedDispatch(spec: DispatchSpec): Promise<void>;
+    };
+  }
+): DispatchWatcher {
+  const { runtime, ...watcherOpts } = opts;
+  return new DispatchWatcher({
+    ...watcherOpts,
+    onDispatch: (spec) => runtime.dispatchInjectTurn(spec),
+    onRetained: (spec) => runtime.observeRetainedDispatch(spec),
+  });
+}
+
 interface ClaimOwnership {
   readonly token: symbol;
   readonly spec: DispatchSpec;
@@ -105,6 +127,7 @@ export class DispatchWatcher {
   private readonly dirs: ReturnType<typeof dispatchDirs>;
   private readonly logger: Logger;
   private readonly onDispatch: DispatchWatcherOpts["onDispatch"];
+  private readonly onRetained?: DispatchWatcherOpts["onRetained"];
   private readonly pollMs: number;
   private readonly resumeEnabled: boolean;
   private readonly mayRecover: (id: string) => boolean;
@@ -161,6 +184,7 @@ export class DispatchWatcher {
     this.dirs = dispatchDirs(opts.dataDir);
     this.logger = opts.logger.child({ comp: "dispatch-watcher" });
     this.onDispatch = opts.onDispatch;
+    this.onRetained = opts.onRetained;
     this.pollMs = opts.pollMs ?? 1000;
     this.resumeEnabled = opts.resumeEnabled === true;
     this.mayRecover = opts.mayRecover ?? (() => true);
@@ -893,6 +917,20 @@ export class DispatchWatcher {
         if (err instanceof DispatchSuspendedError) {
           // SQL owns suspension. Keep the running spec; no failed done/report.
           this.logger.info({ id, target: spec.target }, "dispatch: attempt retained");
+          // stop() runs before restart teardown. A retention observed after
+          // that cutoff is the healthy #250 handoff to the next boot, not a
+          // stall. While intake remains open, however, this callback has left
+          // the artifact in running/ and no poller will ever revisit it.
+          if (this.ready && this.onRetained) {
+            try {
+              await this.onRetained(spec);
+            } catch (observeErr) {
+              this.logger.error(
+                { err: observeErr, id, target: spec.target },
+                "dispatch: retained attempt observability failed"
+              );
+            }
+          }
           return;
         }
         const message = (err as Error)?.message ?? String(err);

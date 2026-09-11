@@ -1,9 +1,10 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdtemp, mkdir, rm, readFile, writeFile, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { pino } from "pino";
 import { DispatchWatcher } from "../packages/core/src/core/dispatch/watcher.js";
+import { DispatchSuspendedError } from "../packages/core/src/core/dispatch/attempt-store.js";
 import { dispatchDirs, type DispatchSpec } from "../packages/core/src/core/dispatch/types.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 
@@ -197,6 +198,36 @@ describe("DispatchWatcher", () => {
       status: "completed",
       output: "eventually durable",
     });
+  });
+
+  it("does not classify the healthy shutdown retention handoff as a stall (#250/#290)", async () => {
+    let entered!: () => void;
+    const started = new Promise<void>((resolve) => { entered = resolve; });
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const onRetained = vi.fn(async () => {});
+    const watcher = new DispatchWatcher({
+      dataDir,
+      logger: silent,
+      onRetained,
+      onDispatch: async (spec) => {
+        entered();
+        await held;
+        throw new DispatchSuspendedError(spec.id);
+      },
+    });
+    await dropSpec({ id: "shutdown-retained" });
+
+    await watcher.start({ waitForInitialDispatches: false });
+    await started;
+    watcher.stop();
+    release();
+    await watcher.initialDispatchesSettled();
+
+    expect(onRetained).not.toHaveBeenCalled();
+    expect(await readdir(dirs.running)).toEqual(["shutdown-retained.json"]);
+    await expect(readFile(path.join(dirs.done, "shutdown-retained.json"), "utf8"))
+      .rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("records status failed with the error when the callback rejects", async () => {

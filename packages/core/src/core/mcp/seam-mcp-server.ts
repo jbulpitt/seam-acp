@@ -164,9 +164,13 @@ export interface ThreadEntry {
   busy: boolean;
   /** Channel-tail truth. `wedged` means runtime-idle but an admitted queue tail
    * exceeded its bounded progress grace. */
-  queueState?: "idle" | "runtime_busy" | "queued" | "wedged";
+  queueState?: "idle" | "runtime_busy" | "queued" | "wedged" | "stalled";
   queueAgeMs?: number;
   queueEpoch?: number;
+  /** Durable retained dispatches that are not currently executing. Required
+   * on the production projection so index.ts cannot silently omit the state. */
+  stalledDispatchCount: number;
+  stalledDispatchIds: string[];
   /** Host binding (D10). Omit ⇒ `local`. Rendered as `agentId@location`. */
   location?: string;
   /** Host emoji prefix (local 🏠 + each paired bridge). */
@@ -683,7 +687,8 @@ const TOOLS = [
       "teammate), `isSelf` (true for YOUR OWN thread — never hand off to yourself), the teammate's " +
       "`agent`/`model`/`cwd` (agent is `agentId@location` with host emoji), `status` (active | archived | gone), `lastActivityUtc`, and `busy`. " +
       "`busy` IS LOAD-BEARING for choosing HOW to reach a teammate: it includes admitted channel work even " +
-      "when the ACP runtime is idle. `queueState` distinguishes runtime_busy, queued, and wedged. When busy:true a live turn " +
+      "when the ACP runtime is idle. `queueState` distinguishes runtime_busy, queued, wedged, and stalled. `stalled` means " +
+      "a retained dispatch is durably quarantined and needs `/seam workflows` resume/abandon action; its ids are included. When busy:true a live turn " +
       "is running, so prefer `send` (PULL-ONLY — it waits in the inbox and never interrupts) unless you " +
       "truly need to preempt, in which case use `steer` or `send(interrupt:true)`; when busy:false the " +
       "teammate is idle, so `handoff`/`forward` (which START a turn) land cleanly. Read-only and " +
@@ -2736,7 +2741,7 @@ export class SeamMcpServer {
       const name = t.name ?? "(unnamed)";
       const flags = [
         t.isSelf ? "YOU" : null,
-        t.busy ? "busy" : "idle",
+        t.busy ? "busy" : t.queueState === "stalled" ? "stalled" : "idle",
         t.status !== "active" ? t.status : null,
         addressable ? null : "not addressable",
       ].filter(Boolean);
@@ -2752,6 +2757,9 @@ export class SeamMcpServer {
       lines.push(
         `• ${name} — id ${t.id} [${flags.join(", ")}]` +
           (cfg ? `\n    identity: ${cfg}${t.cwd ? ` @ ${t.cwd}` : ""}` : "") +
+          (t.queueState === "stalled"
+            ? `\n    retained dispatches: ${(t.stalledDispatchIds ?? []).join(", ") || t.stalledDispatchCount || "unknown"}; use /seam workflows to resume or abandon`
+            : "") +
           `\n    last active ${formatLocalTime(t.lastActivityUtc)}`
       );
     }
@@ -2767,7 +2775,8 @@ export class SeamMcpServer {
     lines.push(
       "",
       "To reach a teammate: use its `id` above. If it is busy, prefer send (pull-only, won't interrupt); " +
-        "if idle, handoff/forward start a turn directly. Never hand off to the entry marked YOU."
+        "if idle, handoff/forward start a turn directly. A stalled entry needs /seam workflows recovery. " +
+        "Never hand off to the entry marked YOU."
     );
     return textResult(lines.join("\n"));
   }

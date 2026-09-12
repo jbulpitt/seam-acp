@@ -12,6 +12,7 @@ import {
 import type { ConfigDescription } from "../packages/core/src/core/session-router.js";
 import type { SessionConfigState, SessionRecord } from "../packages/core/src/core/types.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
+import { passthroughCases, passthroughCatalog } from "./catalog-passthrough-fixture.js";
 
 function record(over: Partial<SessionRecord> = {}): SessionRecord {
   return {
@@ -85,6 +86,8 @@ function makeRuntime(
 }
 
 function harness(opts: {
+  catalog?: ThreadSessionControlDeps["modelCatalog"];
+  location?: string;
   target?: SessionRecord;
   efforts?: string[];
   profiles?: AgentProfile[];
@@ -123,7 +126,8 @@ function harness(opts: {
       upsert: (value) => { records.set(value.id, value); },
     },
     router: {
-      describeConfig: (value) => description(records.get(value.id) ?? value, defaults),
+      describeConfig: (value) => ({ ...description(records.get(value.id) ?? value, defaults),
+        location: { value: opts.location ?? "local", source: "default" } }),
       getProfile: (id) => byProfile.get(id),
       assertAgentAllowedForRecord: (_value, agentId) => {
         if (opts.restrictionError && agentId === "copilot") throw new Error(opts.restrictionError);
@@ -192,7 +196,7 @@ function harness(opts: {
         };
       },
     },
-    modelCatalog: fixtureModelCatalog(profiles),
+    modelCatalog: opts.catalog ?? fixtureModelCatalog(profiles),
     applyThreadName,
   };
 
@@ -209,6 +213,39 @@ function harness(opts: {
     service: new ThreadSessionControlService(deps),
   };
 }
+
+describe("#366 existing claude@macbook-pro thread configuration", () => {
+  it("agent-only switch to a cold binding uses provider default", async () => {
+    const cache = await passthroughCatalog(false);
+    try {
+      const h = harness({ catalog: cache.catalog, location: "macbook-pro",
+        target: record({ agentId: "codex", configJson: JSON.stringify({ model: "gpt-old" }) }) });
+      expect(await h.service.configure(h.caller, h.target, { agent: "claude" })).toMatchObject({
+        ok: true, verification: "unverified", applied: { agent: "claude", model: "default" },
+      });
+    } finally { cache.close(); }
+  });
+  it.each(passthroughCases)("$name", async fixture => {
+    const cache = await passthroughCatalog(fixture.warm);
+    try {
+      if (!fixture.warm) expect(cache.generationRows()).toBe(0);
+      const h = harness({ catalog: cache.catalog, location: "macbook-pro" });
+      const result = await h.service.configure(h.caller, h.target, { model: fixture.typed });
+      expect(result.ok).toBe(fixture.allowed);
+      if (!result.ok) {
+        expect(result.error).toContain("unavailable");
+        expect(h.mutations).toHaveLength(0);
+        expect(h.runtimes).toHaveLength(0);
+        return;
+      }
+      const expected = fixture.name === "available-alias" ? "known" : fixture.typed;
+      expect(result.verification).toBe(fixture.name === "available-alias" ? "binding" : "unverified");
+      expect(result.applied.model).toBe(expected);
+      expect(JSON.parse(h.records.get(h.target.id)!.configJson).model).toBe(expected);
+      expect(h.overlays.at(-1)?.model).toBe(expected);
+    } finally { cache.close(); }
+  });
+});
 
 describe("detectSessionReset", () => {
   it.each([
@@ -346,6 +383,7 @@ describe("ThreadSessionControlService", () => {
 
     expect(result).toEqual({
       ok: true,
+      verification: "binding",
       applied: {
         agent: "claude",
         model: "claude-old",

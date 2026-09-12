@@ -1120,6 +1120,7 @@ export class Orchestrator {
       store: this.store,
       describeConfig: (record) => this.router.describeConfig(record),
       modelCatalog: this.modelCatalog,
+      isAgentAvailable: (agentId, location) => Boolean(this.router.getProfile(agentId, location)),
       ollamaCloudEnabled: this.config.OLLAMA_CLOUD_ENABLED,
       presetsFile: this.config.CHANNEL_PRESETS_FILE,
       tierCEnabled: this.config.SEAM_CONFIG_MUTATION_TIER_C_ENABLED,

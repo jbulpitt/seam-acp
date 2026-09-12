@@ -33,6 +33,22 @@ import {
 } from "./store.js";
 
 export interface CatalogBinding { agentId: string; location: string }
+export type ModelVerification = "binding" | "unverified";
+
+/** One rule for configuration and execution (#366): refuse only a model with
+ * positive evidence of retirement/unavailability. Missing evidence leaves this
+ * typed choice usable and unverified; the rest of the binding keeps working. */
+export function assessModelSelection(
+  catalog: Pick<ModelCatalogService, "model">, binding: CatalogBinding, requested: string
+): { allowed: boolean; id: string; model: CatalogModel | null; verification: ModelVerification } {
+  const model = catalog.model(binding, requested);
+  return {
+    allowed: !model || (model.lifecycle !== "retired" && model.availability === "available"),
+    id: model?.id ?? requested,
+    model,
+    verification: model ? "binding" : "unverified",
+  };
+}
 export type CatalogRefreshReason = "startup" | "scheduled" | "manual" | "session";
 
 export interface CatalogRefreshOptions {
@@ -133,7 +149,7 @@ export interface ResolvedCatalogSelection {
    * How much was actually verified, so a display can be truthful about it:
    * `binding` — this binding's own catalog listed the model;
    * `borrowed` — another binding's catalog did, and is named in `borrowedFrom`;
-   * `unverified` — no catalog anywhere; the id is passed through as typed.
+   * `unverified` — this binding did not list it; the id passes through as typed.
    */
   verification: "binding" | "borrowed" | "unverified";
   borrowedFrom?: CatalogBinding;
@@ -282,10 +298,10 @@ export class ModelCatalogService {
    * Rule 16: another binding's catalog for the same agent, as a labeled HINT.
    *
    * Only consulted when this binding has none of its own, and never presented
-   * as this binding's catalog — the caller gets `verification: "borrowed"` and
-   * the lending binding's name so the display can say "not verified on this
-   * host". Rule 18 makes it temporary: the first real session publishes this
-   * binding's own catalog and the borrowing stops.
+   * as this binding's catalog. The lending binding's name lets displays say
+   * "not verified on this host". Typed selections do not borrow normalization
+   * or effort defaults from these hints (#366). The first real session may
+   * publish this binding's own catalog and end the need for display hints.
    */
   hint(binding: CatalogBinding): { from: CatalogBinding; models: ReadonlyArray<CatalogModel> } | null {
     if (this.lookup(binding).snapshot) return null;
@@ -331,15 +347,22 @@ export class ModelCatalogService {
     // model id is a string we pass through, and `profiles/claude.ts`
     // substitutes nothing, so an unknown id fails cleanly rather than silently
     // running something else.
-    if (!lookup.snapshot) return this.resolveWithoutOwnCatalog(binding, selection);
-    const model = this.model(binding, selection.model);
-    if (!model || model.availability !== "available" || model.lifecycle === "retired") {
-      throw new Error(`model ${JSON.stringify(selection.model)} is unavailable in catalog generation ${lookup.snapshot.generation}`);
+    const evidence = assessModelSelection(this, binding, selection.model);
+    if (!evidence.allowed) {
+      throw new Error(`model ${JSON.stringify(selection.model)} is unavailable in catalog generation ${lookup.snapshot?.generation}`);
     }
+    const model = evidence.model;
+    // Unknown typed choices pass unchanged, even with a warm snapshot. Peer
+    // hints remain display evidence, not permission to substitute another id.
+    if (!model) return {
+      normalized: { model: selection.model, effort: selection.effort ?? "" },
+      raw: { model: selection.model, ...(selection.effort ? { effort: selection.effort } : {}) },
+      model: null, generation: null, verification: "unverified",
+    };
     const effort = selection.effort ?? model.effort.selectionDefault;
     if (!model.effort.choices.some((choice) => choice.id === effort)) {
       throw new Error(
-        `effort ${JSON.stringify(effort)} is unsupported for model ${JSON.stringify(model.id)} in catalog generation ${lookup.snapshot.generation}; refusing catalog/runtime drift`
+        `effort ${JSON.stringify(effort)} is unsupported for model ${JSON.stringify(model.id)} in catalog generation ${lookup.snapshot?.generation}; refusing catalog/runtime drift`
       );
     }
     const normalized = { model: model.id, effort };
@@ -347,70 +370,11 @@ export class ModelCatalogService {
       normalized,
       raw: encodeCatalogSelection(model, normalized),
       model,
-      generation: lookup.snapshot.generation,
+      generation: lookup.snapshot?.generation ?? null,
       verification: "binding",
     };
   }
 
-  /**
-   * Resolve for a binding that has no catalog of its own (#339 rules 15-18).
-   *
-   * Order of preference, best available outcome first: a peer's entry for the
-   * same agent (rules 16-17 — real evidence the id exists for this provider,
-   * labeled as borrowed), then a bare pass-through (rule 15 — `default` must
-   * always start, and a typed id is a string the provider will judge).
-   *
-   * Nothing here is permanent: rule 18 says the first real session publishes
-   * this binding's own catalog, after which `lookup().snapshot` exists and this
-   * path stops being reached. One turn, no operator action.
-   */
-  private resolveWithoutOwnCatalog(
-    binding: CatalogBinding,
-    selection: { model: string; effort?: string | null }
-  ): ResolvedCatalogSelection {
-    const wanted = selection.model.trim();
-    const hint = this.hint(binding);
-    if (hint) {
-      const lowered = wanted.toLowerCase();
-      const model = lowered === "default" || !lowered
-        ? hint.models.find((entry) => entry.default)
-        : hint.models.find((entry) =>
-            entry.id.toLowerCase() === lowered ||
-            entry.aliases.some((alias) => alias.toLowerCase() === lowered));
-      if (model && model.availability === "available" && model.lifecycle !== "retired") {
-        const effort = selection.effort ?? model.effort.selectionDefault;
-        // An effort the borrowed entry does not list is not proof this host
-        // rejects it, but we have nothing better to offer, so fall back to the
-        // borrowed default rather than refusing the turn.
-        const usable = model.effort.choices.some((choice) => choice.id === effort)
-          ? effort
-          : model.effort.selectionDefault;
-        const normalized = { model: model.id, effort: usable };
-        return {
-          normalized,
-          raw: encodeCatalogSelection(model, normalized),
-          model,
-          generation: null,
-          verification: "borrowed",
-          borrowedFrom: hint.from,
-        };
-      }
-    }
-    // Rule 15: `default` is always startable. The provider picks its own.
-    // Empty effort means "the caller named none and we have no catalog to take
-    // a default from" — the provider applies its own, exactly as it does for a
-    // bare `default`. Inventing an effort id here would be a silent wrong
-    // answer rather than an honest absence.
-    const normalized = { model: wanted || "default", effort: selection.effort ?? "" };
-    return {
-      normalized,
-      raw: { model: normalized.model, ...(normalized.effort ? { effort: normalized.effort } : {}) },
-      model: null,
-      generation: null,
-      verification: "unverified",
-      ...(hint ? { borrowedFrom: hint.from } : {}),
-    };
-  }
 
   decode(binding: CatalogBinding, raw: RawCatalogSelection): NormalizedCatalogSelection | null {
     return decodeCatalogSelection(this.models(binding), raw);

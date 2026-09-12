@@ -122,8 +122,7 @@ describe.sequential("#346 real-session catalog enrichment", () => {
       // never as authoritative metadata for that host.
       expect(catalog.models(peerBinding)).toEqual([]);
       expect(catalog.resolve(peerBinding, { model: "fixture-native-model" })).toMatchObject({
-        verification: "borrowed",
-        borrowedFrom: localBinding,
+        verification: "unverified",
       });
       expect(await catalog.refresh(peerBinding)).toMatchObject({ result: "published", generation: 3 });
       expect(catalog.model(peerBinding, "fixture-native-model")?.context.maximum).toBeNull();

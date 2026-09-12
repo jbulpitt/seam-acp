@@ -15,6 +15,7 @@ import type { ScheduledPrompt } from "../packages/core/src/core/scheduled-prompt
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 import type { ModelCatalogService } from "../packages/core/src/core/model-catalog/service.js";
+import { passthroughCases, passthroughCatalog } from "./catalog-passthrough-fixture.js";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
 
@@ -125,6 +126,7 @@ function makeService(over: {
     store,
     describeConfig: over.describe ?? describeConfig,
     modelCatalog: over.catalog ?? modelCatalog,
+    isAgentAvailable: id => ["claude", "copilot", "codex", "remote-zai"].includes(id),
     defaultModel: "gpt-5.4",
     presetsFile: over.presetsFile,
     tierCEnabled: over.tierCEnabled ?? false,
@@ -182,6 +184,47 @@ describe("agent channel restriction mutation (#308)", () => {
 // -------------------------------------------------------------------------
 // Tier A — session config: propose is side-effect free; apply mutates + audits
 // -------------------------------------------------------------------------
+
+describe("#366 all four configuration proposal doors", () => {
+  for (const site of ["session", "preset", "channelPreset", "threadPreset"] as const) {
+    it.each(passthroughCases)(`${site}: $name`, async fixture => {
+      // Channel overlays have no host dimension; the other three use the real
+      // failing binding, including an existing raw-string thread location.
+      const location = site === "channelPreset" ? "local" : "macbook-pro";
+      const cache = await passthroughCatalog(fixture.warm, location);
+      try {
+        if (!fixture.warm) expect(cache.generationRows()).toBe(0);
+        const record = makeRecord({ channelRef: "333333333333333333", parentRef: "111111111111111111" });
+        store.upsert(record);
+        const file = path.join(dir, "presets.json");
+        fs.writeFileSync(file, JSON.stringify({ channels: { [record.parentRef!]: { agent: { value: "claude" } } },
+          threads: { [record.channelRef]: { agent: { value: "claude" }, location: "macbook-pro" } } }));
+        const svc = makeService({ catalog: cache.catalog, presetsFile: file, tierCEnabled: true,
+          describe: row => ({ ...describeConfig(row), location: { value: location, source: "thread preset" } }),
+        });
+        const input = site === "preset"
+          ? { preset: { name: "cold-host", agent: "claude", model: fixture.typed } }
+          : { [site]: { agent: "claude", model: fixture.typed } };
+        const built = svc.buildProposal(record, input);
+        expect(built.ok).toBe(fixture.allowed);
+        if (!built.ok) { expect(built.error).toContain("unavailable"); return; }
+        const expected = fixture.name === "available-alias" ? "known" : fixture.typed;
+        const verification = fixture.name === "available-alias" ? "binding" : "unverified";
+        expect(built.proposal.verification).toBe(verification);
+        expect(built.proposal.fields).toContainEqual(expect.objectContaining({ label: "model", after: expected }));
+        expect(built.proposal.apply({ id: "owner", name: "Owner" })).toMatchObject({ ok: true, verification });
+        expect(JSON.parse(store.listConfigMutations(1)[0]!.afterJson).verification).toBe(verification);
+        if (site === "session") expect(store.readConfig(store.get(record.id)!).model).toBe(expected);
+        if (site === "preset") expect(store.getPresetByNameScoped("cold-host", null)?.model
+          ?? store.getPresetByNameScoped("cold-host", record.parentRef)?.model).toBe(expected);
+        if (site === "threadPreset" || site === "channelPreset") {
+          const saved = JSON.parse(fs.readFileSync(file, "utf8"));
+          expect((site === "threadPreset" ? saved.threads[record.channelRef] : saved.channels[record.parentRef!]).model.value).toBe(expected);
+        }
+      } finally { cache.close(); }
+    });
+  }
+});
 
 describe("session config mutation (Tier A)", () => {
   it("preserves explicit effort when the normalized model is reselected as a no-op", () => {

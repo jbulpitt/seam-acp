@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { activationRefusal, artifactName, firstActivationFromBaselineAllowed, buildArtifact, commandRunner, makeScpCommand, makeSshCommand, parseArgs, parseKeyValues, resolveTarget, rollbackPlan, runPreflight, validateReadyReceipt, validateTargetMap, verifyChecksum } from "../scripts/lib/bridge-rollout.mjs";
+import { activationRefusal, artifactName, firstActivationFromBaselineAllowed, buildArtifact, commandRunner, makeScpCommand, makeSshCommand, parseArgs, parseKeyValues, resolveTarget, rollbackPlan, runActivation, runPreflight, validateReadyReceipt, validateTargetMap, verifyChecksum } from "../scripts/lib/bridge-rollout.mjs";
 
 const root = path.resolve(import.meta.dirname, "..");
 const configured = JSON.parse(fs.readFileSync(path.join(root, "ops/bridge/targets.json"), "utf8"));
@@ -258,7 +258,8 @@ describe("bridge rollout gating and verification (#241)", () => {
   it("separates an incomplete activation from deployed-but-unconfirmed verification output (#328)", () => {
     const local = fs.readFileSync(path.join(root, "scripts/bridge-rollout.mjs"), "utf8");
     const remote = fs.readFileSync(path.join(root, "scripts/bridge-rollout-remote.mjs"), "utf8");
-    expect(local).toContain("activation=failed_or_incomplete");
+    expect(local).toContain("await runActivation(");
+    expect(local).not.toContain('console.error("activation=failed_or_incomplete")');
     expect(local).not.toContain("activation=deployed_verification_unconfirmed");
     expect(remote).toContain("activation=deployed_verification_unconfirmed");
     expect(remote.indexOf('console.log("verification_reason=activation_receipt_timeout")'))
@@ -271,5 +272,85 @@ describe("bridge rollout gating and verification (#241)", () => {
     expect(source).not.toMatch(/SIGTERM|SIGKILL.*oldPid/);
     expect(source).toContain('process.kill(before.pid, "SIGUSR2")');
     expect(source).toContain('preflight.report.rollout_ready !== "yes"');
+  });
+});
+
+describe("activation outcome reporting (#370)", () => {
+  // All execution is injected; this target never comes from the live fleet.
+  const target = resolveTarget(validateTargetMap({ schemaVersion: 3, targets: {
+    "fixture-host": {
+      rolloutEnabled: true, sshAlias: "fixture-host", pm2App: "fixture-bridge", verifyAgent: "grok", expectedUid: 501,
+      checkoutPath: "/fixture/checkout", entrypointPath: "/fixture/checkout/packages/bridge/dist/index.js",
+      pidFilePath: "/fixture/bridge.pid", nodePath: "/fixture/node", pm2ModulePath: "/fixture/pm2",
+      releaseRoot: "/fixture/releases", workspaceArg: null, devMode: false,
+    },
+  } }), "fixture-host");
+  const options = { sha: "d".repeat(40), checksum: "e".repeat(64), stageId: token, timeoutSeconds: 10 };
+  const before = parseKeyValues(preflightReport(target));
+  const activeReport = (overrides: Record<string, string> = {}) => preflightReport(target, {
+    artifact_source_sha: options.sha, artifact_checksum: options.checksum,
+    artifact_identity: `${options.sha}:${options.checksum}`, pid: "456", ...overrides,
+  });
+  async function failedAttempt(reason: string, observed: string | Error, initial = before) {
+    const run = vi.fn().mockRejectedValueOnce(new Error(`ssh failed (1): error=${reason}`));
+    if (observed instanceof Error) run.mockRejectedValueOnce(observed);
+    else run.mockResolvedValueOnce({ stdout: observed, stderr: "" });
+    const result = await runActivation({ target, options, activationId: token, operationId: "f".repeat(64), remoteScript: "fixture-script", before: initial }, run);
+    expect(run).toHaveBeenCalledTimes(2);
+    expect(run.mock.calls[0]![0]).toMatchObject({ mutates: true });
+    expect(run.mock.calls[1]![0]).toMatchObject({ mutates: false });
+    expect(run.mock.calls[1]![0].args.at(-1)).toBe("preflight");
+    return { ...result, report: parseKeyValues(result.stdout) };
+  }
+
+  it.each(["receipt_verification_failed", "target_lock_busy"])("reports ACTIVE after a post-swap %s, without a rollback remedy", async (reason) => {
+    const result = await failedAttempt(reason, activeReport());
+    expect(result.report).toMatchObject({ activation: "active_post_step_failed", release_active: "yes", recommended_action: "inspect_failed_post_step_do_not_retry_activation" });
+    expect(result.report.failed_step).toContain(reason);
+    expect(result.stdout).not.toContain("rollback_command=");
+    expect(result.exitCode).toBe(1); // automation still sees the failed post-step
+  });
+
+  it("retains failure and optional rollback for a genuine pre-swap failure, recommending retry", async () => {
+    const result = await failedAttempt("activation_envelope_failed", preflightReport(target));
+    expect(result.report).toMatchObject({ activation: "not_activated", release_active: "no", recommended_action: "fix_failed_step_then_retry", rollback_applicability: "not_needed_before_swap" });
+    expect(result.report.rollback_command).toBe(rollbackPlan(target, token).command);
+    expect(result.exitCode).toBe(1);
+  });
+
+  it("reports a stale-lock retry separately when the prior interrupted run already activated", async () => {
+    const observed = activeReport();
+    const result = await failedAttempt("target_lock_busy", observed, parseKeyValues(observed));
+    expect(result.report).toMatchObject({ activation: "active_post_step_failed", release_active: "yes", coordination: "lock_blocked", lock_note: "concurrency_refusal_not_activation_evidence" });
+    expect(result.stdout).not.toContain("rollback_command=");
+  });
+
+  it("does not treat a lock refusal itself as proof of activation", async () => {
+    const result = await failedAttempt("target_lock_busy", preflightReport(target));
+    expect(result.report).toMatchObject({ activation: "not_activated", release_active: "no", coordination: "lock_blocked", recommended_action: "resolve_concurrency_then_retry" });
+  });
+
+  it("requires the exact checksum, not merely the requested source SHA", async () => {
+    const checksum = "9".repeat(64);
+    const result = await failedAttempt("target_lock_busy", activeReport({ artifact_checksum: checksum, artifact_identity: `${options.sha}:${checksum}` }));
+    expect(result.report.release_active).toBe("no");
+    expect(result.report.activation).toBe("not_activated");
+  });
+
+  it.each(["123", "", "invalid"])("does not claim a serving release from the swapped link alone (pid=%s)", async (pid) => {
+    const result = await failedAttempt("replacement_timeout", activeReport({ pid }));
+    expect(result.report).toMatchObject({ activation: "failed_or_incomplete", release_active: "unknown" });
+    expect(result.report.rollback_command).toBe(rollbackPlan(target, token).command);
+  });
+
+  it("reports uncertainty rather than inventing activation state when the re-read fails", async () => {
+    const result = await failedAttempt("target_lock_busy", new Error("identity_process_unavailable"));
+    expect(result.report).toMatchObject({ activation: "failed_or_incomplete", release_active: "unknown", coordination: "lock_blocked", observation_error: "identity_process_unavailable" });
+  });
+
+  it("keeps successful activation output unchanged without any extra command", async () => {
+    const run = vi.fn().mockResolvedValue({ stdout: "activation=verified\n", stderr: "" });
+    await expect(runActivation({ target, options, activationId: token, operationId: "f".repeat(64), remoteScript: "fixture-script", before }, run)).resolves.toEqual({ stdout: "activation=verified\n", exitCode: 0 });
+    expect(run).toHaveBeenCalledTimes(1);
   });
 });

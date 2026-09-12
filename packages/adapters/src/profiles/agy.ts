@@ -2075,8 +2075,15 @@ export function parseAgyModelsList(output: string): Array<{ modelId: string; raw
   const rows: Array<{ modelId: string; rawDisplayName: string }> = [];
   const seen = new Set<string>();
   for (const line of output.split(/\r?\n/)) {
-    // "Fetching available models..." and any other prose has no separator.
-    const match = /^(\S+)[\t ]+(\S.*)$/.exec(line.trim());
+    const trimmed = line.trim();
+    const tabbed = /^([^\t]+)\t+(\S.*)$/.exec(trimmed);
+    // A tab is the observed separator and is unambiguous. A space is accepted
+    // only when the first token still LOOKS like a model id, so progress and
+    // error prose ("Fetching available models...", "CLI error: not signed in")
+    // cannot be mistaken for a model — a wrong id here would be published as a
+    // selectable model and then fail at turn time.
+    const spaced = tabbed ? null : /^([a-z0-9][a-z0-9._-]*) +(\S.*)$/.exec(trimmed);
+    const match = tabbed ?? spaced;
     if (!match) continue;
     const modelId = match[1]!.trim();
     const rawDisplayName = match[2]!.trim();

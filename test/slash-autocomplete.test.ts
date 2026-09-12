@@ -177,7 +177,7 @@ function makeOrch(over?: {
       REPO_EMOJIS: new Map(),
       channelPresets: new Map(),
       threadPresets: new Map(),
-      bridgePresets: new Map(),
+      bridgePresets: new Map([["mac", { id: "mac", shortName: "mac", emoji: "💻" }]]),
       SEAM_CONFIG_ADMIN_USER_IDS: new Set(["admin"]),
     } as any,
     adapter: {} as any,
@@ -239,6 +239,14 @@ describe("slash autocomplete responders", () => {
     expect(inventory.map((entry) => entry.key)).toEqual(registeredAutocompleteKeys());
 
     const expected = new Map<string, AutocompleteRoundTripPolicy>([
+      ["/new/agent", "canonical"],
+      ["/new/card", "canonical"],
+      ["/new/effort", "canonical"],
+      ["/new/gif", "canonical"],
+      ["/new/model", "canonical"],
+      ["/new/permissions", "canonical"],
+      ["/new/repo", "canonical"],
+      ["/new/role", "canonical"],
       ["/recover/thread", "opaque"],
       ["/steer/thread", "opaque"],
       ["/workflows/cancel-choice", "opaque"],
@@ -364,6 +372,58 @@ describe("slash autocomplete responders", () => {
     });
     await orch.handleAutocompleteInteraction(effort as any);
     expect(effortResponded[0]).toEqual([{ name: "default", value: "default" }]);
+  });
+
+  it("new model and effort follow the not-yet-persisted agent selection", async () => {
+    store.upsert(session({ agentId: "grok" }));
+    const { orch } = makeOrch();
+    const data = [
+      {
+        name: "new",
+        options: [
+          { name: "agent", value: "copilot@mac" },
+          { name: "model", value: "", focused: true },
+        ],
+      },
+    ];
+    const { i, responded } = autocompleteI({
+      group: null,
+      sub: "new",
+      option: "model",
+      value: "",
+      data,
+    });
+    await orch.handleAutocompleteInteraction(i as any);
+    expect(responded[0]).toEqual([{ name: "gpt-5", value: "gpt-5" }]);
+
+    const effortData = JSON.parse(JSON.stringify(data));
+    effortData[0].options[1] = { name: "effort", value: "", focused: true };
+    const { i: effort, responded: effortResponded } = autocompleteI({
+      group: null,
+      sub: "new",
+      option: "effort",
+      value: "",
+      data: effortData,
+    });
+    await orch.handleAutocompleteInteraction(effort as any);
+    expect(effortResponded[0]).toEqual([{ name: "default", value: "default" }]);
+  });
+
+  it("new autocomplete ignores the invoking thread's active agent", async () => {
+    store.upsert(session({ agentId: "copilot" }));
+    const { orch } = makeOrch();
+    const { i, responded } = autocompleteI({
+      group: null,
+      sub: "new",
+      option: "model",
+      value: "",
+      data: [{ name: "new", options: [{ name: "model", value: "", focused: true }] }],
+    });
+    await orch.handleAutocompleteInteraction(i as any);
+    expect(responded[0]).toEqual([
+      { name: "grok-4.6", value: "grok-4.6" },
+      { name: "grok-4", value: "grok-4" },
+    ]);
   });
 
   it("config set repo uses the same workspace cache-backed responder", async () => {

@@ -4,12 +4,48 @@ import {
   SlashCommandBuilder,
   type ChatInputCommandInteraction,
   type RESTPostAPIApplicationCommandsJSONBody,
+  type SlashCommandSubcommandBuilder,
 } from "discord.js";
 
 /** The everyday user + agent surface. */
 export const SEAM_COMMAND_NAME = "seam";
 /** The operator surface — ManageGuild-gated, guild-only (#151). */
 export const SEAM_ADMIN_COMMAND_NAME = "seamadmin";
+
+/** Keep `/seam new` and `/seam config set` on one registered option contract. */
+function addConfigSetOptions(sub: SlashCommandSubcommandBuilder): SlashCommandSubcommandBuilder {
+  return sub
+    .addStringOption((o) =>
+      o.setName("json").setDescription("Full config JSON; cannot mix with fields").setRequired(false)
+    )
+    .addStringOption((o) =>
+      o.setName("agent").setDescription("Agent id or agent@host").setRequired(false).setAutocomplete(true)
+    )
+    .addStringOption((o) =>
+      o.setName("model").setDescription("Model id").setRequired(false).setAutocomplete(true)
+    )
+    .addStringOption((o) =>
+      o.setName("effort").setDescription("Reasoning effort; default clears").setRequired(false).setAutocomplete(true)
+    )
+    .addStringOption((o) =>
+      o.setName("repo").setDescription("Working repo path").setRequired(false).setAutocomplete(true)
+    )
+    .addStringOption((o) =>
+      o.setName("role").setDescription("Naming role; auto clears").setRequired(false).setAutocomplete(true)
+    )
+    .addStringOption((o) =>
+      o.setName("permissions").setDescription("always, ask, or deny").setRequired(false).setAutocomplete(true)
+    )
+    .addStringOption((o) =>
+      o.setName("card").setDescription("full, simple, or default").setRequired(false).setAutocomplete(true)
+    )
+    .addStringOption((o) =>
+      o.setName("gif").setDescription("on, off, or default").setRequired(false).setAutocomplete(true)
+    )
+    .addBooleanOption((o) =>
+      o.setName("rebuild").setDescription("Rebuild session from Discord after applying").setRequired(false)
+    );
+}
 
 /**
  * The two slash-command trees (#78, split in #151).
@@ -107,15 +143,17 @@ export function buildSeamCommand(): SlashCommandBuilder {
   );
 
   cmd.addSubcommand((sub) =>
-    sub
-      .setName("new")
-      .setDescription("Create a new agent thread + config card")
-      .addStringOption((o) =>
+    addConfigSetOptions(
+      sub
+        .setName("new")
+        .setDescription("Create and optionally configure an agent thread")
+        .addStringOption((o) =>
         o
           .setName("name")
           .setDescription("Thread name (optional)")
           .setRequired(false)
       )
+    )
   );
 
   cmd.addSubcommand((sub) =>
@@ -446,42 +484,11 @@ export function buildSeamCommand(): SlashCommandBuilder {
           .setDescription("Open the visual thread config editor (draft, then Save/Cancel)")
       )
       .addSubcommand((sub) =>
-        sub
-          .setName("set")
-          .setDescription("Patch named config fields together, or replace session JSON")
-          .addStringOption((o) =>
-            o.setName("json").setDescription("Full config JSON (cannot mix with named fields)").setRequired(false)
-          )
-          .addStringOption((o) =>
-            o.setName("agent").setDescription("Agent id or agent@host").setRequired(false).setAutocomplete(true)
-          )
-          .addStringOption((o) =>
-            o.setName("model").setDescription("Model id").setRequired(false).setAutocomplete(true)
-          )
-          .addStringOption((o) =>
-            o.setName("effort").setDescription("Reasoning effort; default clears").setRequired(false).setAutocomplete(true)
-          )
-          .addStringOption((o) =>
-            o.setName("repo").setDescription("Working repo path").setRequired(false).setAutocomplete(true)
-          )
-          .addStringOption((o) =>
-            o.setName("role").setDescription("Naming role; auto clears").setRequired(false).setAutocomplete(true)
-          )
-          .addStringOption((o) =>
-            o.setName("permissions").setDescription("always, ask, or deny").setRequired(false).setAutocomplete(true)
-          )
-          .addStringOption((o) =>
-            o.setName("card").setDescription("full, simple, or default").setRequired(false).setAutocomplete(true)
-          )
-          .addStringOption((o) =>
-            o.setName("gif").setDescription("on, off, or default").setRequired(false).setAutocomplete(true)
-          )
-          .addBooleanOption((o) =>
-            o
-              .setName("rebuild")
-              .setDescription("Rebuild session from Discord after applying")
-              .setRequired(false)
-          )
+        addConfigSetOptions(
+          sub
+            .setName("set")
+            .setDescription("Patch config fields together, or replace session JSON")
+        )
       )
       .addSubcommand((sub) =>
         sub

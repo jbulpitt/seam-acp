@@ -725,17 +725,14 @@ export class SessionRouter {
     return this.describeConfig(record).cwd.value;
   }
 
-  /** Look up or create the SessionRecord for a given chat channel. */
-  ensureSessionRecord(opts: {
+  /** Resolve creation defaults without writing a session row. */
+  previewSessionRecord(opts: {
     platform: string;
     channelRef: string;
     parentRef?: string;
     cwd: string;
   }): SessionRecord {
     const id = makeSessionId(opts.platform, opts.channelRef);
-    const existing = this.store.get(id);
-    if (existing) return existing;
-
     // Stamp the channel/thread preset agent/model into the record at creation
     // so capability lookups (`getProfile(record.agentId)`) match what will run.
     // Do NOT stamp cwd into `repoPath`: that column is a session-scope overlay,
@@ -772,6 +769,20 @@ export class SessionRouter {
       createdUtc: now,
       updatedUtc: now,
     };
+    return record;
+  }
+
+  /** Look up or create the SessionRecord for a given chat channel. */
+  ensureSessionRecord(opts: {
+    platform: string;
+    channelRef: string;
+    parentRef?: string;
+    cwd: string;
+  }): SessionRecord {
+    const id = makeSessionId(opts.platform, opts.channelRef);
+    const existing = this.store.get(id);
+    if (existing) return existing;
+    const record = this.previewSessionRecord(opts);
     this.store.upsert(record);
     return record;
   }

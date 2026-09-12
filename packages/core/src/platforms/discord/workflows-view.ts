@@ -351,12 +351,22 @@ export function clampFieldValue(lines: string[], max = 1024): string {
   for (let idx = 0; idx < lines.length; idx++) {
     const line = lines[idx]!;
     const added = (out.length ? 1 : 0) + line.length;
-    if (len + added > max) {
-      out.push(`…and ${lines.length - idx} more`);
+    // The truncation marker must fit INSIDE the budget. Appending it after the
+    // cap check overflowed the field whenever `len` landed within a couple of
+    // characters of `max` — 1035 for a 1024 limit — and Discord rejects the
+    // whole embed, so `/seam workflows` failed outright exactly when the list
+    // was long enough to need truncating. That is the one command the stall
+    // notice tells an operator to run to recover interrupted work.
+    const marker = `…and ${lines.length - idx} more`;
+    if (len + added > max - ((out.length ? 1 : 0) + marker.length)) {
+      out.push(marker);
       break;
     }
     out.push(line);
     len += added;
   }
-  return out.join("\n");
+  const rendered = out.join("\n");
+  // Belt and braces: never hand Discord an over-length value, whatever the
+  // arithmetic above does on an input nobody anticipated.
+  return rendered.length > max ? `${rendered.slice(0, max - 1)}…` : rendered;
 }

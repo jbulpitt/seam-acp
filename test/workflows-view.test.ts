@@ -465,3 +465,34 @@ describe("fitEmbedFields — Discord's 6000-char aggregate cap", () => {
     expect(fitted.dropped).toBe(0);
   });
 });
+
+describe("clampFieldValue never exceeds Discord's field limit (#356)", () => {
+  it("counts the truncation marker against the budget", () => {
+    // The marker was appended AFTER the cap check, so a list that filled to
+    // within a character or two of the limit rendered 1035+ chars. Discord
+    // rejects the embed, and `/seam workflows` — the one command the stall
+    // notice tells an operator to run — failed outright, exactly when the
+    // list was long enough to need truncating.
+    for (const fill of [1018, 1020, 1021, 1022, 1023, 1024, 1025]) {
+      const lines: string[] = [];
+      let total = 0;
+      while (total < fill) {
+        const line = "x".repeat(Math.min(20, fill - total));
+        lines.push(line);
+        total += line.length + (lines.length > 1 ? 1 : 0);
+      }
+      for (let i = 0; i < 7; i++) lines.push("y".repeat(60));
+      const rendered = clampFieldValue(lines);
+      expect(rendered.length, `fill=${fill}`).toBeLessThanOrEqual(1024);
+      expect(rendered).toContain("more");
+    }
+  });
+
+  it("still returns a non-empty value for an empty list", () => {
+    expect(clampFieldValue([])).toBe("_none_");
+  });
+
+  it("clamps a single oversized line rather than emitting it whole", () => {
+    expect(clampFieldValue(["z".repeat(5000)]).length).toBeLessThanOrEqual(1024);
+  });
+});

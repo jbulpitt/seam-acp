@@ -35,6 +35,10 @@ export interface DispatchSpec {
   target: string;
   prompt: string;
   session: DispatchSessionMode;
+  /** Sole human allowed to answer native async questions. Server-stamped from
+   * the requesting turn (or explicitly supplied by the trusted spool operator),
+   * never a model tool argument. Frozen with the attempt across restart. */
+  responderUserId?: string;
   /** Isolated runs only — a live run inherits the thread's own model/effort. */
   model?: string;
   effort?: string;
@@ -233,6 +237,7 @@ export interface DispatchResult {
  * if the body's `id` field disagrees or is missing.
  */
 export const DispatchSpecSchema = z.object({
+  responderUserId: z.string().optional(),
   id: z.string().optional(),
   target: z.string().min(1, "target (a Discord thread/channel id) is required"),
   prompt: z.string().min(1, "prompt is required"),
@@ -385,6 +390,7 @@ export function parseDispatchSpec(id: string, raw: string): DispatchSpec {
     ...(d.rebuild === true ? { rebuild: true } : {}),
     ...(d.migration ? { migration: d.migration } : {}),
     ...(d.authorId ? { authorId: d.authorId } : {}),
+    ...(d.responderUserId ? { responderUserId: d.responderUserId } : {}),
     ...(d.authorName ? { authorName: d.authorName } : {}),
     ...(d.voiceConsoleId ? { voiceConsoleId: d.voiceConsoleId } : {}),
     ...(d.voiceConsoleBindingId ? { voiceConsoleBindingId: d.voiceConsoleBindingId } : {}),

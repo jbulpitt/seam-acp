@@ -773,6 +773,7 @@ async function main(): Promise<void> {
         return store.get(sid) ?? orchestrator.resolveIngestJob(sid);
       },
       enqueueDispatch: (spec) => enqueueDispatchSpec(config.DATA_DIR, spec),
+      dispatchResponderUserId: (caller) => orchestrator.dispatchResponderUserId(caller),
       resolveThread: (threadId) => store.getByChannel("discord", threadId),
       getThreadLiveState: (threadId) =>
         adapter.getThreadLiveState({ platform: "discord", id: threadId }),

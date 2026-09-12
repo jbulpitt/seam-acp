@@ -190,6 +190,8 @@ export interface SeamMcpServerDeps {
   resolveSession: (token: string | undefined) => SessionRecord | undefined;
   /** Persist a dispatch spec into the pending queue (the DispatchWatcher runs it). */
   enqueueDispatch: (spec: DispatchSpec) => Promise<void>;
+  /** Trusted active-turn ownership, not caller-supplied tool arguments. */
+  dispatchResponderUserId?: (caller: SessionRecord) => string | undefined;
   /**
    * Create a durable chain row and pop its first hop (#25). Returns the new
    * chain id and the worker string of hop 1 (the caller then enqueues it).
@@ -2422,6 +2424,7 @@ export class SeamMcpServer {
       ...(parsed.kind === "named" && parsed.location ? { location: parsed.location } : {}),
       returnTo,
       kind: "handoff",
+      responderUserId: this.deps.dispatchResponderUserId?.(caller),
       correlationId: dispatchId,
       ...(stream !== undefined ? { stream } : {}),
       ...(watchFeedback ? { watchFeedback: true } : {}),
@@ -2457,6 +2460,7 @@ export class SeamMcpServer {
       returnTo: caller.channelRef,
       kind: "forward",
       correlationId: dispatchId,
+      responderUserId: this.deps.dispatchResponderUserId?.(caller),
       ...(stream !== undefined ? { stream } : {}),
       createdUtc: new Date().toISOString(),
     };
@@ -2487,6 +2491,7 @@ export class SeamMcpServer {
       id: dispatchId,
       target: thread,
       prompt: frameSteerPrompt(prompt),
+      responderUserId: this.deps.dispatchResponderUserId?.(caller),
       session: "live",
       returnTo: caller.channelRef,
       kind: "handoff",

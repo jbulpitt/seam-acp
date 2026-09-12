@@ -1035,6 +1035,7 @@ export class Orchestrator {
       adapter: this.adapter,
       logger: this.logger,
       currentUserId: (channelRef) => this.currentAuthorIds.get(channelRef),
+      isTurnActive: (channelRef) => this.channelQueues.has(channelRef),
       onCodexAsyncAnswer: (delivery) => this.admitCodexAsyncAnswer(delivery),
     });
     this.router.setElicitationHandlers?.({
@@ -9347,25 +9348,30 @@ export class Orchestrator {
           // injectTurn still accumulates the FULL text into `result.text` in
           // parallel, so streaming stays lossless — report-back / done-file get
           // the whole answer regardless.
-          ...(msgRenderer || streamPanel || statusPanel || dispatchSpeech
-            ? {
-                onEvent: async (event) => {
-                  if (!this.queueFenceCurrent(queueFence)) return;
-                  if (event.kind === "agent-text") {
-                    if (dispatchSpeech) {
-                      this.voiceConsole?.acceptVisibleAgentText(
-                        dispatchSpeech,
-                        ++dispatchSpeechOrdinal,
-                        event.text
-                      );
-                    }
-                    if (msgRenderer) msgRenderer.feed(event.text);
-                    else if (streamPanel) streamPanel.append(event.text);
-                  }
-                  statusPanel?.handleEvent(event);
-                },
+          onEvent: async (event) => {
+            if (!this.queueFenceCurrent(queueFence)) return;
+            // Questions are interactive control events, not optional status
+            // output. Refuse only an unanswerable question; keep work running.
+            if (event.kind === "async-user-input") {
+              await this.elicitations.createCodexAsync(record, event, {
+                session: isLiveDispatch ? "live" : "isolated",
+                responderUserId: spec.responderUserId,
+              });
+              return;
+            }
+            if (event.kind === "agent-text") {
+              if (dispatchSpeech) {
+                this.voiceConsole?.acceptVisibleAgentText(
+                  dispatchSpeech,
+                  ++dispatchSpeechOrdinal,
+                  event.text
+                );
               }
-            : {}),
+              if (msgRenderer) msgRenderer.feed(event.text);
+              else if (streamPanel) streamPanel.append(event.text);
+            }
+            statusPanel?.handleEvent(event);
+          },
           // Drain trailing text that lands after the prompt RPC resolves, so the
           // done-file holds the whole answer rather than a truncated one.
           awaitIdle: true,
@@ -21099,6 +21105,21 @@ export class Orchestrator {
    */
   currentAuthorId(channelRef: string): string | undefined {
     return this.currentAuthorIds.get(channelRef);
+  }
+
+  /** Snapshot only the requesting conversation's trusted human. No inference
+   * from target membership, thread creator, returnTo, or model-authored text. */
+  dispatchResponderUserId(caller: SessionRecord): string | undefined {
+    const current = this.store.get(caller.id);
+    // Refuse responder inheritance from a replaced session; dispatch still works.
+    if (!current || current.acpSessionId !== caller.acpSessionId) return undefined;
+    const active = this.activeLiveDispatch.get(caller.channelRef);
+    if (active) {
+      const attempt = this.store.turnAttempts.get(active);
+      return attempt?.state === "active" && attempt.acpSessionId === caller.acpSessionId
+        ? attempt.spec.responderUserId : undefined;
+    }
+    return this.currentAuthorIds.get(caller.channelRef);
   }
 
   /**

@@ -31,6 +31,9 @@ import type {
   MessageRef,
 } from "../packages/core/src/platforms/chat-adapter.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
+import { ElicitationManager, type CodexAsyncRefusalReason } from "../packages/core/src/core/elicitation/manager.js";
+import { parseDispatchSpec } from "../packages/core/src/core/dispatch/types.js";
+import ts from "typescript";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
 const THREAD = "700000000000000001";
@@ -124,6 +127,9 @@ interface Harness {
   router: SessionRouter;
   store: SessionStore;
   prompts: string[];
+  promptSessionIds: string[];
+  newSessionIds: string[];
+  loadedSessionIds: string[];
   releaseQuestionTurn(): void;
   close(): Promise<void>;
 }
@@ -157,9 +163,13 @@ function makeHarness(
     duplicateUpdate?: boolean;
     emitQuestion?: boolean;
     holdQuestionTurn?: boolean;
+    dispatchQuestion?: boolean;
   } = {}
 ): Harness {
   const prompts: string[] = [];
+  const promptSessionIds: string[] = [];
+  const newSessionIds: string[] = [];
+  const loadedSessionIds: string[] = [];
   const connections: Array<{ close(): void }> = [];
   let emitted = false;
   let releaseQuestionTurn = () => {};
@@ -168,7 +178,8 @@ function makeHarness(
     const stdin = new PassThrough();
     const stdout = new PassThrough();
     const stderr = new PassThrough();
-    const child = Object.assign(new EventEmitter(), {
+    const emitter = new EventEmitter();
+    const child = Object.assign(emitter, {
       stdin,
       stdout,
       stderr,
@@ -176,7 +187,7 @@ function makeHarness(
       killed: false,
       kill() {
         this.killed = true;
-        this.emit("exit", 0, null);
+        emitter.emit("exit", 0, null);
         return true;
       },
     });
@@ -185,12 +196,17 @@ function makeHarness(
         protocolVersion: PROTOCOL_VERSION,
         agentCapabilities: { loadSession: true },
       }))
-      .onRequest(methods.agent.session.new, () => ({ sessionId: ACP_SESSION }))
-      .onRequest(methods.agent.session.load, ({ params }) => ({ sessionId: params.sessionId }))
+      .onRequest(methods.agent.session.new, () => {
+        const sessionId = newSessionIds.length ? `unexpected-fresh-${newSessionIds.length}` : ACP_SESSION;
+        newSessionIds.push(sessionId);
+        return { sessionId };
+      })
+      .onRequest(methods.agent.session.load, ({ params }) => { loadedSessionIds.push(params.sessionId); return {}; })
       .onRequest(methods.agent.session.prompt, async ({ params, client }) => {
         const text = params.prompt.map((block) => "text" in block ? block.text : "").join("");
         prompts.push(text);
-        if ((opts.emitQuestion ?? true) && !emitted && text.trimEnd().endsWith("\n\nstart")) {
+        promptSessionIds.push(params.sessionId);
+        if ((opts.emitQuestion ?? true) && !emitted && (opts.dispatchQuestion || text.trimEnd().endsWith("\n\nstart"))) {
           emitted = true;
           await client.notify(methods.client.session.update, {
             sessionId: ACP_SESSION,
@@ -242,6 +258,7 @@ function makeHarness(
       TURN_TIMEOUT_SECONDS: 15,
       DEFAULT_MODEL: "gpt-fixture",
       DEFAULT_AGENT: "codex",
+      SEAM_DISPATCH_STATUS_PANEL: false,
       CHANNEL_PRESETS_FILE: path.join(dir, "channel-presets.json"),
       SEAM_CONFIG_MUTATION_TIER_C_ENABLED: false,
       channelPresets: new Map(),
@@ -263,6 +280,9 @@ function makeHarness(
     router,
     store,
     prompts,
+    promptSessionIds,
+    newSessionIds,
+    loadedSessionIds,
     releaseQuestionTurn,
     async close() {
       await router.disposeAll();
@@ -292,6 +312,118 @@ afterEach(async () => {
 });
 
 describe("Codex async user-input bridge", () => {
+  // Protects the real dispatch event route, frozen owner, and conversation/queue
+  // identity; removing any of these either loses the card or redirects an answer.
+  it.each([false, true])("dispatch question and answer preserve original ACP identity (held=%s)", async (held) => {
+    const h = makeHarness(dir, [{ title: "Proceed?", options: ["Yes", "No"] }], {
+      dispatchQuestion: true, holdQuestionTurn: held, duplicateUpdate: true,
+    });
+    harnesses.push(h);
+    const spec = parseDispatchSpec("dispatch-question", JSON.stringify({ target: THREAD, session: "live", kind: "handoff",
+      responderUserId: USER, prompt: "start", stream: false, createdUtc: new Date().toISOString() }));
+    const running = h.orchestrator.dispatchInjectTurn(spec);
+    try {
+      await vi.waitFor(() => expect(h.adapter.cards).toHaveLength(1));
+      if (!held) await running;
+      const row = h.store.listOpenElicitations()[0]!;
+      expect(row.authorizedUserId).toBe(USER);
+      expect(row.acpSessionId).toBe(ACP_SESSION);
+      expect(h.store.turnAttempts.get(spec.id)?.spec.responderUserId).toBe(USER);
+      const record = h.store.get(`discord:${THREAD}`)!;
+      expect(h.orchestrator.dispatchResponderUserId(record)).toBe(held ? USER : undefined);
+      expect(h.orchestrator.dispatchResponderUserId({ ...record, acpSessionId: "replaced-caller" })).toBeUndefined();
+      const yes = h.adapter.cards[0]!.card.buttons!.find(button => button.label === "Yes")!;
+      const denied = await h.adapter.component({ customId: yes.customId!, interactionId: "850000000000000001", userId: "someone-else" });
+      expect(denied.replies.join(" ")).toMatch(/Only the person/);
+      await h.adapter.component({ customId: yes.customId!, interactionId: "850000000000000002" });
+      expect(h.store.getInbound("850000000000000002")).toMatchObject({
+        expectedAcpSessionId: ACP_SESSION, authorId: USER, preemptive: false,
+      });
+      expect(h.store.getElicitation(row.id)?.terminalDetail).toContain(held ? "behind the running turn" : "queued for delivery");
+      if (held) {
+        expect(h.prompts).toHaveLength(1);
+        expect(h.store.getInbound("850000000000000002")?.state).toBe("pending");
+      }
+    } finally { h.releaseQuestionTurn(); await running; }
+    await vi.waitFor(() => expect(h.prompts).toHaveLength(2));
+    expect(h.promptSessionIds).toEqual([ACP_SESSION, ACP_SESSION]);
+    expect(h.newSessionIds).toEqual([ACP_SESSION]);
+    expect(h.prompts[1]).toMatch(/\n\nYes$/);
+  });
+
+  // Protects ownerless legacy turns from silent loss without blocking their work.
+  it("ownerless dispatch names its refusal and still completes", async () => {
+    const h = makeHarness(dir, [{ title: "Proceed?", options: ["Yes", "No"] }], { dispatchQuestion: true });
+    harnesses.push(h);
+    await expect(h.orchestrator.dispatchInjectTurn({ id: "ownerless", target: THREAD, session: "live", kind: "handoff",
+      prompt: "start", stream: false, createdUtc: new Date().toISOString() })).resolves.toMatchObject({ stopReason: "end_turn" });
+    expect(h.adapter.cards).toHaveLength(0);
+    expect(h.adapter.messages.join(" ")).toContain("[missing_responder]");
+  });
+
+  // Protects against delivering an old dispatch's answer to a replacement
+  // conversation; losing this assertion can silently continue the wrong work.
+  it("dispatch answer refuses a replacement conversation without prompting it", async () => {
+    const h = makeHarness(dir, [{ title: "Proceed?", options: ["Yes", "No"] }], { dispatchQuestion: true });
+    harnesses.push(h);
+    await h.orchestrator.dispatchInjectTurn({ id: "replace-dispatch", target: THREAD, session: "live", kind: "handoff",
+      responderUserId: USER, prompt: "start", createdUtc: new Date().toISOString() });
+    expect(h.store.compareAndSwapAcpSession(`discord:${THREAD}`, ACP_SESSION, "replacement")).toBe(true);
+    const yes = h.adapter.cards[0]!.card.buttons!.find(button => button.label === "Yes")!;
+    const refused = await h.adapter.component({ customId: yes.customId!, interactionId: "850000000000000003" });
+    expect(refused.replies.join(" ")).toMatch(/originating Codex conversation is no longer available/);
+    expect(h.promptSessionIds).toEqual([ACP_SESSION]);
+    expect(h.store.getInbound("850000000000000003")).toBeNull();
+  });
+
+  // Each guard refuses just the question, with a typed reason plus a visible
+  // notice and redacted log; deleting a guard/diagnostic loses that explanation.
+  it.each<CodexAsyncRefusalReason>(["missing_responder", "invalid_responder", "missing_acp_session", "card_send_unsupported", "card_edit_unsupported",
+    "session_mismatch", "isolated_session", "invalid_form", "card_post_failed"])("names async refusal %s", async reason => {
+    const h = makeHarness(dir, [{ title: "unused", options: null }]);
+    harnesses.push(h);
+    const record = h.router.ensureSessionRecord({ platform: "discord", channelRef: THREAD, cwd: dir });
+    record.acpSessionId = reason === "missing_acp_session" ? "" : ACP_SESSION;
+    h.store.upsert(record);
+    const logs: unknown[] = [];
+    const logger = pino({ level: "warn" }, { write: line => { logs.push(JSON.parse(line)); } }) as unknown as Logger;
+    const adapter = h.adapter as unknown as Partial<ChatAdapter>;
+    if (reason === "card_send_unsupported") adapter.sendElicitationCard = undefined;
+    if (reason === "card_edit_unsupported") adapter.editElicitationCard = undefined;
+    if (reason === "card_post_failed") adapter.sendElicitationCard = async () => { throw Error("private-provider-body"); };
+    const manager = new ElicitationManager({ store: h.store, adapter: adapter as ChatAdapter, logger,
+      currentUserId: () => "ambient-user-must-not-authorize-dispatch" });
+    const result = await manager.createCodexAsync(record, { itemId: "item", turnId: "turn",
+      threadId: reason === "session_mismatch" ? "replacement" : ACP_SESSION,
+      questions: [{ title: reason === "invalid_form" ? "API key" : "Proceed?", options: null }] }, {
+      responderUserId: reason === "missing_responder" ? undefined : reason === "invalid_responder" ? "not-a-user" : USER,
+      session: reason === "isolated_session" ? "isolated" : "live",
+    });
+    expect(result).toEqual({ ok: false, reason });
+    expect(h.adapter.messages.join(" ")).toContain(`[${reason}]`);
+    expect(logs).toContainEqual(expect.objectContaining({ reason, msg: "async elicitation refused" }));
+    expect(JSON.stringify(logs)).not.toMatch(/API key|private-provider-body|Proceed\?/);
+  });
+
+  // Structural backstop: adding any bare boolean refusal bypasses the named
+  // result contract, even if a fixture does not yet reach that new branch.
+  it("async admission has no bare boolean return", () => {
+    const source = ts.createSourceFile("manager.ts", fs.readFileSync(new URL("../packages/core/src/core/elicitation/manager.ts", import.meta.url), "utf8"), ts.ScriptTarget.Latest, true);
+    let found = false;
+    function visit(node: ts.Node): void {
+      if (ts.isMethodDeclaration(node) && node.name.getText(source) === "createCodexAsync") {
+        found = true;
+        const check = (child: ts.Node): void => {
+          if (ts.isReturnStatement(child)) expect(child.expression?.kind).not.toBe(ts.SyntaxKind.FalseKeyword);
+          ts.forEachChild(child, check);
+        };
+        check(node);
+      }
+      ts.forEachChild(node, visit);
+    }
+    visit(source); expect(found).toBe(true);
+  });
+
   it("strictly accepts the reviewed metadata shape and rejects sensitive/ambiguous additions", () => {
     expect(codexAsyncUserInputFromUpdate(asyncUpdate([
       { title: "Proceed?", options: ["Yes", "No"] },
@@ -407,6 +539,8 @@ describe("Codex async user-input bridge", () => {
     harnesses.push(harness);
     const running = harness.adapter.message();
     await vi.waitFor(() => expect(harness.adapter.cards).toHaveLength(1));
+    // Human-originated dispatches inherit that authenticated human, not an ambient target user.
+    expect(harness.orchestrator.dispatchResponderUserId(harness.store.get(`discord:${THREAD}`)!)).toBe(USER);
     const yes = harness.adapter.cards[0]!.card.buttons!.find((button) => button.label === "Yes")!;
     await harness.adapter.component({
       customId: yes.customId!,
@@ -427,9 +561,9 @@ describe("Codex async user-input bridge", () => {
     harnesses.push(harness);
     await harness.adapter.message();
     expect(harness.store.listOpenElicitations()).toEqual([]);
-    expect(harness.adapter.cards).toHaveLength(1);
-    expect(harness.adapter.cards[0]!.card.panel.title).toBe("Input request unavailable");
-    expect(harness.adapter.cards[0]!.card.panel.fields[0]!.value).toMatch(/Sensitive/);
+    expect(harness.adapter.cards).toHaveLength(0);
+    expect(harness.adapter.messages.join(" ")).toContain("[invalid_form]");
+    expect(harness.adapter.messages.join(" ")).not.toContain("API key");
   });
 
   it("cancels without a provider turn and refuses a replacement session", async () => {
@@ -482,6 +616,8 @@ describe("Codex async user-input bridge", () => {
       interactionId: "840000000000000001",
     });
     await vi.waitFor(() => expect(promptBodies(restarted)).toEqual(["Yes"]));
+    expect(restarted.newSessionIds).toEqual([]);
+    expect(restarted.loadedSessionIds).toEqual([ACP_SESSION]);
     expect(first.store.getElicitation(row.id)?.status).toBe("accepted");
   });
 });

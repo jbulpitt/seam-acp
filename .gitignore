@@ -15,6 +15,7 @@ docs/*
 docs/agent-guides/*
 !docs/agent-guides/README.md
 !docs/agent-guides/interactive-ingest.md
+!docs/agent-guides/native-async-questions.md
 !docs/industry-watch/
 !docs/industry-watch/**
 .DS_Store

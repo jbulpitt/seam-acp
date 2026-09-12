@@ -70,6 +70,7 @@ import { CATALOG_MAX_CONTEXT_TOKENS } from "../catalog-evidence.js";
 import {
   discoverAgyLs,
   subscribeToAgyStream,
+  AgyStreamUnavailableError,
   waitForAgyConversationId,
   readAgyJsonResponse,
   type AgyStep,
@@ -1278,6 +1279,12 @@ class AgyAgent implements Agent {
       if (run.userCancelled && !(error instanceof ProbeError && error.code === "not_reaped")) return { stopReason: "cancelled" };
       // Keep local ACP parameter refusals (including R3 model validation) intact.
       if (error instanceof RequestError) throw error;
+      if (error instanceof AgyStreamUnavailableError) {
+        // Refuse this interrupted stream only; preserve its named cause for
+        // bridge operators while other turns/bindings remain usable.
+        console.error(`[agy] ${error.message}`);
+        throw RequestError.internalError({ code: error.code, streamCode: error.streamCode, streamMessage: error.streamMessage }, error.message);
+      }
       // Upstream errors can embed private LS responses, argv or host paths.
       const failure = error instanceof ProbeError ? error : run.abort.signal.reason ?? agyFailure("protocol_error");
       throw RequestError.internalError({ code: failure.code }, `native AGY ${failure.code}`);
@@ -1447,6 +1454,8 @@ class AgyAgent implements Agent {
       const staleIdleDeadline = Date.now() + STALE_IDLE_RETRY_TIMEOUT_MS;
       let hasBeenActive = false;
       let staleIdleRetryCount = 0;
+      let streamCommitted = false;
+      let stdoutFallback = false;
       outer: while (true) {
         hasBeenActive = false;
         try {
@@ -1456,6 +1465,8 @@ class AgyAgent implements Agent {
             signal: cancelAbort.signal,
           })) {
             if (cancelAbort.signal.aborted) break outer;
+            streamCommitted = true;
+            runRef.commitStream();
 
             const isRunning = update.status === "CASCADE_RUN_STATUS_RUNNING";
             const sup = update.mainTrajectoryUpdate?.stepsUpdate;
@@ -1541,6 +1552,22 @@ class AgyAgent implements Agent {
             return { stopReason: "cancelled" };
           }
           if (cancelAbort.signal.aborted) throw cancelAbort.signal.reason;
+          if (streamErr instanceof AgyStreamUnavailableError && streamErr.permitsStdoutFallback && !streamCommitted) {
+            // Refuse only rich streaming when the subscription is rejected.
+            // Print stdout still completes this same child/turn; never replay
+            // stdout after any update (including tools/permission activity).
+            console.error(`[agy] ${streamErr.message}; using stdout fallback`);
+            stdoutFallback = true;
+            await this.conn.sessionUpdate({
+              sessionId: params.sessionId,
+              update: {
+                // Keep the caveat visible without corrupting schema-only JSON.
+                sessionUpdate: jsonSchema ? "agent_thought_chunk" : "agent_message_chunk",
+                content: { type: "text", text: `[AGY stream unavailable (${streamErr.streamCode}: ${streamErr.streamMessage}). Using stdout only; streamed thoughts, tool updates and permission prompts are unavailable. Existing permission policy is unchanged.]\n\n` },
+              },
+            });
+            break outer;
+          }
           if (streamErr instanceof Error && streamErr.name === "ProbeError") throw streamErr;
           // Fall through — check whether we need to retry below.
         }
@@ -1574,15 +1601,15 @@ class AgyAgent implements Agent {
       }
 
       cancelAbort.signal.throwIfAborted();
-      if (jsonSchema) {
+      if (jsonSchema || stdoutFallback) {
         const stdout = await runRef.structuredOutput();
-        const { structuredOutput } = parseAgyPrintJsonEnvelope(stdout);
+        const text = jsonSchema ? JSON.stringify(parseAgyPrintJsonEnvelope(stdout).structuredOutput) : stdout;
         if (this.conn) {
           await this.conn.sessionUpdate({
             sessionId: params.sessionId,
             update: {
               sessionUpdate: "agent_message_chunk",
-              content: { type: "text", text: JSON.stringify(structuredOutput) },
+              content: { type: "text", text },
             },
           });
         }

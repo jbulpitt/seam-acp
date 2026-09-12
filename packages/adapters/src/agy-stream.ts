@@ -21,6 +21,26 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { agyFailure } from "./agy-lifecycle.js";
+import { ProbeError, redactProbeText } from "./probe-process.js";
+
+/** Explicit subscription rejection, not corrupt frames or a broken active stream. */
+export class AgyStreamUnavailableError extends ProbeError {
+  readonly streamCode: string;
+  readonly streamMessage: string;
+  get permitsStdoutFallback(): boolean {
+    // Refuse provider/application failures (quota, cancellation, etc.) as
+    // failures of this turn; only subscription auth/protocol loses streaming.
+    return ["unauthenticated", "permission_denied", "unimplemented", "protocol_error"].includes(this.streamCode)
+      || /^http_(?:4\d\d|5\d\d|200)$/.test(this.streamCode);
+  }
+  constructor(code: string, message: string) {
+    const safeCode = redactProbeText(code, process.env).slice(0, 100);
+    const safeMessage = redactProbeText(message, process.env).slice(0, 2000);
+    super("protocol_error", `AGY stream ${safeCode}: ${safeMessage}`);
+    this.streamCode = safeCode;
+    this.streamMessage = safeMessage;
+  }
+}
 
 /** Default location of the agy CLI's per-run log files. */
 const DEFAULT_LOG_DIR = path.join(
@@ -242,7 +262,7 @@ export async function* subscribeToAgyStream(opts: {
   });
   if (!resp.ok || !resp.body) {
     await resp.body?.cancel();
-    throw agyFailure("protocol_error");
+    throw new AgyStreamUnavailableError(`http_${resp.status}`, resp.statusText || "subscription has no response body");
   }
 
   for await (const env of readConnectEnvelopes(resp.body)) {
@@ -256,9 +276,13 @@ export async function* subscribeToAgyStream(opts: {
     }
     if (env.flag === 2) {
       // End-of-stream envelope. May carry an error payload.
-      const obj = parsed as { error?: { code?: string; message?: string } };
-      if (obj?.error?.message) {
-        throw agyFailure("protocol_error");
+      const obj = parsed as { error?: { code?: string; message?: string }; code?: string; message?: string };
+      const error = obj?.error ?? obj;
+      if (typeof error?.code === "string" || typeof error?.message === "string") {
+        throw new AgyStreamUnavailableError(
+          typeof error.code === "string" ? error.code : "unknown",
+          typeof error.message === "string" ? error.message : "subscription rejected",
+        );
       }
       return;
     }

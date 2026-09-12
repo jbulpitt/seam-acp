@@ -1033,10 +1033,13 @@ export async function fetchGrokUsage(
     });
   });
 
-  // Racing this alongside `exit` is what turns an abort into a real
-  // cancellation: it rejects whichever call is outstanding, which unwinds to
-  // the `finally` below and kills the child. Rejecting the pending map too
-  // means nothing is left waiting on a process that is about to disappear.
+  // Two overlapping jobs, deliberately. Rejecting the `pending` map frees
+  // whichever call is outstanding, which is what unwinds to the `finally`
+  // below and kills the child — that is the one a mutation test discriminates.
+  // Racing `aborted` covers the gap the map cannot: the moment between
+  // `initialize` resolving and the billing call being issued, when `pending`
+  // is empty and there is nothing to reject. Deleting either leaves a window
+  // where an abort stops the caller without stopping the process.
   let onAbort: (() => void) | undefined;
   const aborted = new Promise<never>((_, reject) => {
     if (!signal) return;

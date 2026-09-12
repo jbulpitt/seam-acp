@@ -31,6 +31,8 @@ const resumedConversation = argValue("--conversation");
 const schemaFile = argValue("--json-schema");
 
 const readJson = (file) => JSON.parse(fs.readFileSync(file, "utf8"));
+// #361: how many 500s to emit before the quota RPC starts answering.
+let quotaFiveHundredsLeft = Number(process.env.SEAM_AGY_QUOTA_500S ?? 1);
 const appendInvocation = (record) => {
   if (invocationLog) fs.appendFileSync(invocationLog, `${JSON.stringify(record)}\n`);
 };
@@ -171,6 +173,14 @@ const server = http.createServer(async (request, response) => {
   }
 
   if (request.url?.endsWith("/RetrieveUserQuotaSummary")) {
+    // #361, observed on agy 1.1.27: the LS answers 500 while silent-auth is
+    // still landing, then 200. The retry loop exists for exactly this.
+    if (quotaFiveHundredsLeft > 0) {
+      quotaFiveHundredsLeft -= 1;
+      response.statusCode = 500;
+      response.end("{}");
+      return;
+    }
     response.setHeader("content-type", "application/json");
     response.end(JSON.stringify({
       response: {
@@ -222,17 +232,25 @@ server.listen(0, "127.0.0.1", () => {
       `Created conversation ${conversationId}\n`,
   );
   if (!isModelsCommand) return;
-  // Matches the observed CLI: print the rows, exit. The language server this
-  // started dies with the process and never answers GetAvailableModels in that
-  // window, which is why #260 takes ids and names only.
+  // Observed on agy 1.1.27: `models` prints its rows and exits after ~1.7-2.8s,
+  // and its language server is answerable for part of that window — 500 during
+  // silent-auth, then 200. #260 takes ids and names only because
+  // GetAvailableModels stayed 400 throughout; #361 reads quota, which does
+  // answer. SEAM_AGY_MODELS_NO_LS=1 models the cold-auth miss: exit at once,
+  // so the window never opens.
   process.stdout.write(
     "Fetching available models...\n" +
     "fixture-native-model\tFixture Native Model\n" +
     "fixture-native-model-low\tFixture Native Model (Low)\n"
   );
-  server.close();
-  server.closeAllConnections?.();
-  process.exit(0);
+  const holdMs = process.env.SEAM_AGY_MODELS_NO_LS === "1"
+    ? 0
+    : Number(process.env.SEAM_AGY_MODELS_HOLD_MS ?? 2000);
+  setTimeout(() => {
+    server.close();
+    server.closeAllConnections?.();
+    process.exit(0);
+  }, holdMs).unref?.();
 });
 
 let terminating = false;

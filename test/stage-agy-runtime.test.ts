@@ -320,7 +320,15 @@ describe("#342 a failed gate leaves the host exactly as it was", () => {
       const entry = staged.ancestors.find((e) => e.path === fixture.runtimeParent)!;
       expect(entry.passesRuntimeCheck).toBe(true);  // the bridge would accept it
       expect(entry.rootOwned).toBe(false);          // but it is not durable
-      expect(() => assertAncestryIsRootOwned(staged)).toThrow(/must be root-owned/);
+      // Named specifically: a tmpdir chain is writable anyway, so asserting
+      // only that SOMETHING was refused would pass even if the gate had been
+      // relaxed to the runtime check and let this directory through.
+      let message = "";
+      try { assertAncestryIsRootOwned(staged); } catch (error) {
+        message = error instanceof Error ? error.message : String(error);
+      }
+      expect(message).toMatch(/must be root-owned/);
+      expect(message).toContain(fixture.runtimeParent);
       expect(fixture.pins().AGY_CLI_PATH).toBe(fixture.source);
     } finally {
       fs.chmodSync(fixture.runtimeParent, 0o755);

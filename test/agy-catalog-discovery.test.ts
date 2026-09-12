@@ -27,6 +27,8 @@ import {
   AGY_ASSUMED_CONTEXT_WINDOW,
   agyContextWindow,
   makeAgyProfile,
+  mergeAgyCatalogMetadata,
+  parseAgySessionCatalog,
   type AgyCatalogEntry,
 } from "@seam/adapters";
 import { AgentRuntime } from "../packages/core/src/agents/agent-runtime.js";
@@ -145,6 +147,41 @@ describe("#260 native catalog discovery is prompt-free", () => {
       fs.rmSync(root, { recursive: true, force: true });
     }
   });
+
+  it("learns the real context window from the language server of a real turn", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "seam-agy-r4b-repro-"));
+    const managed = createManagedAgyFixture({
+      source: path.join(fixtures, "fake-native-agy.mjs"),
+      version: "agy fixture 1.1.28",
+      cwd: root,
+      approvedEnvironment: {
+        SEAM_AGY_CAPABILITY_FIXTURE_DIR: fixtures,
+      },
+    });
+    const profile = makeAgyProfile({
+      runtime: managed.runtime,
+      dataDir: root,
+      defaultModel: "fixture-native-model",
+      exposeGlobalStaging: false,
+    });
+    const runtime = new AgentRuntime({ profile, logger });
+    try {
+      const cold = await profile.catalog.fetch();
+      expect(cold.models[0]?.context.maximum).toBeNull();
+
+      await runtime.start();
+      await runtime.newSession({ cwd: root, model: "fixture-native-model" });
+      await runtime.prompt("capability-turn-one");
+      await runtime.idle();
+
+      const learned = await profile.catalog.fetch();
+      expect(learned.models[0]?.context.maximum).toBe(4_096);
+    } finally {
+      await runtime.dispose().catch(() => {});
+      managed.cleanup();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("#260 unknown context windows assume a floor, never a ceiling", () => {
@@ -179,5 +216,61 @@ describe("#260 unknown context windows assume a floor, never a ceiling", () => {
     // a 200k Claude window, and undetectable until the turn broke.
     expect(AGY_ASSUMED_CONTEXT_WINDOW).toBeLessThanOrEqual(200_000);
     expect(AGY_ASSUMED_CONTEXT_WINDOW).toBeLessThan(1_000_000);
+  });
+});
+
+describe("#346 session metadata keeps prompt-free identity authoritative", () => {
+  const entry = (modelId: string, rawDisplayName = modelId): AgyCatalogEntry => ({
+    modelId,
+    rawDisplayName,
+    displayName: rawDisplayName,
+    ctx: "",
+    recommended: false,
+    supportsThinking: false,
+    supportsImages: false,
+    maxTokens: 0,
+  });
+
+  it("merges only an exact selectable id and never admits an LS-only model", () => {
+    const selectable = [entry("selectable-id", "Same Name")];
+    const observed = parseAgySessionCatalog({
+      response: {
+        models: {
+          "different-id": {
+            displayName: "Same Name",
+            maxTokens: 65_536,
+            supportsImages: true,
+          },
+          "ls-only-id": {
+            displayName: "Language Server Only",
+            maxTokens: 1_000_000,
+            recommended: true,
+          },
+        },
+      },
+    });
+
+    // Neither a fuzzy display-name match nor an LS-only identity can expand
+    // what `agy models` proved selectable. If exact-id matching is weakened,
+    // this assertion changes or gains a second row.
+    expect(mergeAgyCatalogMetadata(selectable, observed)).toEqual(selectable);
+  });
+
+  it("does not publish an invalid or guessed context window", () => {
+    const [observed] = parseAgySessionCatalog({
+      response: {
+        models: {
+          "selectable-id": {
+            displayName: "Selectable",
+            maxTokens: Number.MAX_SAFE_INTEGER,
+            supportsThinking: true,
+          },
+        },
+      },
+    });
+    const [merged] = mergeAgyCatalogMetadata([entry("selectable-id")], observed ? [observed] : []);
+
+    expect(merged?.maxTokens).toBe(0);
+    expect(merged?.supportsThinking).toBe(true);
   });
 });

@@ -18,6 +18,7 @@ import {
 } from "@agentclientprotocol/sdk";
 import {
   SEAM_AGY_JSON_SCHEMA_META,
+  SEAM_AGY_CATALOG_REFRESH_META,
   type AgentProfile,
   type CatalogEffort,
 } from "@seam/adapters";
@@ -285,6 +286,7 @@ export class AgentRuntime {
   private readonly permissionPolicy: PermissionPolicy;
   private readonly mcpServers: McpServer[];
   private readonly onDead?: () => void;
+  private readonly onCatalogRefresh?: () => void | Promise<void>;
   private readonly elicitationHandler?: ElicitationHandler;
   private readonly completeElicitationHandler?: (
     notification: CompleteElicitationNotification
@@ -424,6 +426,8 @@ export class AgentRuntime {
     cancelElicitations?: () => Promise<void>;
     /** Called when the agent process exits after a successful initialize. */
     onDead?: () => void;
+    /** Refresh this runtime's exact host binding after adapter-owned metadata changes. */
+    onCatalogRefresh?: () => void | Promise<void>;
     /**
      * Override process spawn. When set, `start()` uses this instead of
      * `profile.spawn(model?, effort?)`. Local agents leave it unset.
@@ -441,6 +445,7 @@ export class AgentRuntime {
     this.catalogEffort = opts.effortDescriptor;
     this.loadSessionTimeoutMs = opts.loadSessionTimeoutMs ?? SESSION_LOAD_TIMEOUT_MS;
     this.onDead = opts.onDead;
+    this.onCatalogRefresh = opts.onCatalogRefresh;
     this.spawnFn = opts.spawnFn;
     this.elicitationHandler = opts.elicitationHandler;
     this.completeElicitationHandler = opts.completeElicitationHandler;
@@ -1527,6 +1532,16 @@ export class AgentRuntime {
           await this.emit({ kind: "model-changed", modelId: currentModel });
         }
         await this.emit({ kind: "config-options", options: opts });
+        const meta = (update as unknown as { _meta?: Record<string, unknown> | null })._meta;
+        if (meta?.[SEAM_AGY_CATALOG_REFRESH_META] === true && this.onCatalogRefresh) {
+          try {
+            await this.onCatalogRefresh();
+          } catch (err) {
+            // Blast radius: refuse only this catalog publication. The live AGY
+            // session and its conservative in-session sizing keep working.
+            this.logger.warn({ err }, "adapter catalog refresh signal failed");
+          }
+        }
         return;
       }
       case "usage_update": {

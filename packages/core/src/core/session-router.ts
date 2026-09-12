@@ -66,6 +66,8 @@ export interface SeamMcpWiring {
 /** Inputs `startRuntime` uses to construct and spawn an AgentRuntime. */
 export interface RuntimeSpawnPlan {
   agentId: string;
+  /** Exact catalog binding host; never inferred again after planning. */
+  location: string;
   profile: AgentProfile;
   model: string;
   effort?: string;
@@ -1181,6 +1183,7 @@ export class SessionRouter {
 
     return {
       agentId,
+      location,
       profile,
       model,
       effort,
@@ -1219,7 +1222,7 @@ export class SessionRouter {
     // whatever's in CHANNEL_PRESETS_FILE wins, regardless of what's in the
     // DB. See resolveChannelPreset in config.ts.
     const plan = this.planRuntimeSpawn(record);
-    const { profile, model, effort, effortDescriptor, fastMode, cwd, mcpServers } = plan;
+    const { agentId, location, profile, model, effort, effortDescriptor, fastMode, cwd, mcpServers } = plan;
 
     const runtime = new AgentRuntime({
       profile,
@@ -1236,6 +1239,12 @@ export class SessionRouter {
         // header; rotating here is `-32001 unauthorized`.
         this.logger.info({ sessionId: record.id }, "agent process died; evicting runtime for auto-resume");
         this.runtimes.delete(record.id);
+      },
+      onCatalogRefresh: async () => {
+        // The adapter signal proves only that THIS runtime learned metadata.
+        // Refresh exactly its host binding; other hosts keep their independent
+        // binding/borrowed/unverified truth until their own real session runs.
+        await this.modelCatalog.refresh({ agentId, location }, "session");
       },
       permissionPolicy: async (req) => {
         // Always re-read from the live session row: the captured `record`

@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { McpServer } from "@agentclientprotocol/sdk";
-import { AGY_ASSUMED_CONTEXT_WINDOW, makeAgyNativeRuntime, makeAgyProfile } from "@seam/adapters";
+import { makeAgyNativeRuntime, makeAgyProfile } from "@seam/adapters";
 import { pino } from "pino";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
@@ -30,6 +30,7 @@ const fakeCli = path.join(fixtureDir, "fake-native-agy.mjs");
 const logger = pino({ level: "silent" }) as unknown as Logger;
 const expectedConversation = "11111111-1111-4111-8111-111111111111";
 const expectedThinking = "Inspect fixture 🧭\nPlan safely\n";
+const expectedContextWindow = 4_096;
 
 interface Invocation {
   pid?: number;
@@ -402,17 +403,16 @@ describe.sequential("native AGY R1 capability contract", () => {
       expect.objectContaining({ toolCallId: "agy-step-4", status: "failed" }),
     ]));
     expect(usageSequence(events)).toEqual([
-      { used: 128, size: AGY_ASSUMED_CONTEXT_WINDOW },
-      { used: 160, size: AGY_ASSUMED_CONTEXT_WINDOW },
-      { used: 200, size: AGY_ASSUMED_CONTEXT_WINDOW },
+      { used: 128, size: expectedContextWindow },
+      { used: 160, size: expectedContextWindow },
+      { used: 200, size: expectedContextWindow },
     ]);
     for (const captured of [full, simple]) {
       expect(captured.panel.status.contextUsedHighWater).toBe(200);
-      // #260: the status card reports what the turn was actually sized
-      // against. With prompt-free discovery that is the conservative
-      // assumption, not a language-server window — and the card showing the
-      // number we really used is the point.
-      expect(captured.panel.status.contextWindowSize).toBe(AGY_ASSUMED_CONTEXT_WINDOW);
+      // #346: the real turn learns this from its own already-running language
+      // server. The card must report the observed window actually used, not
+      // the R4a fallback that only applies while metadata is unavailable.
+      expect(captured.panel.status.contextWindowSize).toBe(expectedContextWindow);
     }
     expect(JSON.stringify(events)).not.toMatch(/SANITIZED PRIVATE (READ|EDIT|COMMAND)/);
 
@@ -429,8 +429,8 @@ describe.sequential("native AGY R1 capability contract", () => {
       "Plan",
       "Plan safely",
     ]);
-    expect(fullCard).toContain("🪟 0k / 128k (0%)");
-    expect(simpleCard).toContain("🪟 0%");
+    expect(fullCard).toContain("🪟 0k / 4k (5%)");
+    expect(simpleCard).toContain("🪟 5%");
     for (const card of [fullCard, simpleCard]) {
       expect(card).not.toMatch(/SANITIZED PRIVATE (READ|EDIT|COMMAND)/);
     }
@@ -905,11 +905,10 @@ describe.sequential("native AGY R1 capability contract", () => {
       expect(compact.mock.calls[0]?.[4]).toBe(200);
       expect(compact.mock.calls[0]?.[2]).toMatchObject({
         contextUsedHighWater: 200,
-        // Not 4096: that came from a language-server row the removed `-p ok`
-        // probe fetched. Prompt-free discovery knows ids, not windows, so the
-        // turn is sized by the conservative assumption — under every window
-        // AGY ships rather than over one of them.
-        contextWindowSize: AGY_ASSUMED_CONTEXT_WINDOW,
+        // R4b observes this on the SAME real turn whose usage drives the
+        // production compaction consumer; no metadata-only process or prompt
+        // is involved.
+        contextWindowSize: expectedContextWindow,
       });
     } finally {
       compact.mockRestore();

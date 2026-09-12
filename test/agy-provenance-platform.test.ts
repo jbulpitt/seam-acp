@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -28,7 +28,7 @@ function forcePlatform(value: string): void {
 afterEach(() => forcePlatform(realPlatform));
 
 /** A staged content-addressed artifact, root `0555`, exactly as production. */
-function stageArtifact(body: Buffer): { root: string; executable: string; sha256: string } {
+function stageArtifact(body: Buffer): { base: string; root: string; executable: string; sha256: string } {
   const sha256 = createHash("sha256").update(body).digest("hex");
   const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "seam-agy-prov-")));
   const root = path.join(base, "agy-runtime");
@@ -39,7 +39,42 @@ function stageArtifact(body: Buffer): { root: string; executable: string; sha256
   fs.chmodSync(executable, 0o555);
   fs.chmodSync(release, 0o555);
   fs.chmodSync(root, 0o555);
-  return { root, executable, sha256 };
+  return { base, root, executable, sha256 };
+}
+
+function stageReplacement(root: string, sha256: string, body: Buffer): string {
+  const release = path.join(root, sha256);
+  fs.mkdirSync(release, { recursive: true });
+  const executable = path.join(release, "agy");
+  fs.writeFileSync(executable, body, { mode: 0o555 });
+  fs.chmodSync(executable, 0o555);
+  fs.chmodSync(release, 0o555);
+  fs.chmodSync(root, 0o555);
+  return executable;
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function withImmutableAncestors<T>(runtimeRoot: string, run: () => T): T {
+  const ancestors = new Set<string>();
+  let ancestor = path.dirname(runtimeRoot);
+  while (true) {
+    ancestors.add(ancestor);
+    const parent = path.dirname(ancestor);
+    if (parent === ancestor) break;
+    ancestor = parent;
+  }
+  const realAccess = fs.accessSync.bind(fs);
+  const access = vi.spyOn(fs, "accessSync").mockImplementation((target, mode) => {
+    if (mode === fs.constants.W_OK && ancestors.has(path.resolve(String(target)))) {
+      throw Object.assign(new Error("synthetic immutable ancestor"), { code: "EACCES" });
+    }
+    return realAccess(target, mode);
+  });
+  try { return run(); }
+  finally { access.mockRestore(); }
 }
 
 describe("AGY provenance is platform-correct and cannot take down the host (#330)", () => {
@@ -76,29 +111,31 @@ describe("AGY provenance is platform-correct and cannot take down the host (#330
     // return path, because duplicateCachedSnapshot re-opened the descriptor
     // through fdExecutable (exec-only) rather than fdReadPath (read, which
     // macOS permits). Verification must reach a real verdict.
-    expect(() => verifyAgyManagedRuntimeArtifact(executable, root, sha256)).not.toThrow();
+    withImmutableAncestors(root, () => {
+      expect(() => verifyAgyManagedRuntimeArtifact(executable, root, sha256)).not.toThrow();
 
-    // The load-bearing part: drive the real snapshot path. Before the fix this
-    // threw `EBADF: bad file descriptor, close` from its own return path and
-    // never reached the version probe. It must now get all the way to the
-    // probe, which fails for a fake binary — a DIFFERENT and correct verdict.
-    let reached: string | undefined;
-    try {
-      verifyAgyManagedRuntimeIdentity({
-        executable,
-        runtimeRoot: root,
-        version: "fixture-version",
-        sha256,
-        cwd: os.tmpdir(),
-        env: { PATH: process.env.PATH ?? "", HOME: os.homedir() },
-      });
-    } catch (error) {
-      reached = error instanceof Error ? error.message : String(error);
-    }
-    expect(reached).toBeDefined();
-    expect(reached).not.toMatch(/EBADF|bad file descriptor/);
-    expect(reached).toMatch(/bounded probe|does not match AGY_VERSION/);
-    expect(describeProvenanceMode()).toBe("immutable-path");
+      // The load-bearing part: drive the real snapshot path. Before the fix this
+      // threw `EBADF: bad file descriptor, close` from its own return path and
+      // never reached the version probe. It must now get all the way to the
+      // probe, which fails for a fake binary — a DIFFERENT and correct verdict.
+      let reached: string | undefined;
+      try {
+        verifyAgyManagedRuntimeIdentity({
+          executable,
+          runtimeRoot: root,
+          version: "fixture-version",
+          sha256,
+          cwd: os.tmpdir(),
+          env: { PATH: process.env.PATH ?? "", HOME: os.homedir() },
+        });
+      } catch (error) {
+        reached = error instanceof Error ? error.message : String(error);
+      }
+      expect(reached).toBeDefined();
+      expect(reached).not.toMatch(/EBADF|bad file descriptor/);
+      expect(reached).toMatch(/bounded probe|does not match AGY_VERSION/);
+      expect(describeProvenanceMode()).toBe("immutable-path");
+    });
   });
 
   it("refuses a runtime root the service user can write, which IS the darwin guarantee", () => {
@@ -130,6 +167,48 @@ describe("AGY provenance is platform-correct and cannot take down the host (#330
         .toThrow(/AGY executable must be immutable/);
     } finally {
       fs.chmodSync(executable, 0o555);
+    }
+  });
+
+  it("refuses a replaceable runtime tree by naming its writable ancestor", () => {
+    const trusted = Buffer.from([0xcf, 0xfa, 0xed, 0xfe, 0x0a, 0x00]);
+    const malicious = Buffer.from([0xcf, 0xfa, 0xed, 0xfe, 0x66, 0x00]);
+    const { base, root, executable, sha256 } = stageArtifact(trusted);
+    const original = `${root}.original`;
+    const replacement = `${root}.replacement`;
+    stageReplacement(replacement, sha256, malicious);
+
+    // This is the real attack, not a permission-bit proxy: despite every
+    // checked path being 0555, the writable parent lets the service user swap
+    // the complete content-addressed tree by name.
+    fs.renameSync(root, original);
+    fs.renameSync(replacement, root);
+    expect(fs.readFileSync(executable)).toEqual(malicious);
+
+    forcePlatform("darwin");
+    expect(() => verifyAgyManagedRuntimeArtifact(executable, root, sha256))
+      .toThrow(new RegExp(`AGY_RUNTIME_ROOT ancestor ${escapeRegExp(base)} must be immutable`));
+  });
+
+  it("checks the immutable-path ancestor chain through the filesystem root", () => {
+    const { root, executable, sha256 } = stageArtifact(
+      Buffer.from([0xcf, 0xfa, 0xed, 0xfe, 0x0b, 0x00]),
+    );
+    const realAccess = fs.accessSync.bind(fs);
+    const access = vi.spyOn(fs, "accessSync").mockImplementation((target, mode) => {
+      const resolved = path.resolve(String(target));
+      if (mode === fs.constants.W_OK && resolved === path.parse(resolved).root) return;
+      if (mode === fs.constants.W_OK && root.startsWith(`${resolved}${path.sep}`)) {
+        throw Object.assign(new Error("synthetic immutable ancestor"), { code: "EACCES" });
+      }
+      return realAccess(target, mode);
+    });
+    forcePlatform("darwin");
+    try {
+      expect(() => verifyAgyManagedRuntimeArtifact(executable, root, sha256))
+        .toThrow(/AGY_RUNTIME_ROOT ancestor \/ must be immutable/);
+    } finally {
+      access.mockRestore();
     }
   });
 

@@ -12,6 +12,7 @@
     "test/agy-image-inspector.test.ts",
     "test/agy-native-capability-contract.test.ts",
     "test/agy-native-lifecycle.test.ts",
+    "test/agy-provenance-platform.test.ts",
     "test/agy-stream-lifecycle.test.ts",
     "test/bridge-inventory.test.ts"
   ]

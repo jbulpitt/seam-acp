@@ -6,11 +6,12 @@ import path from "node:path";
 import { pino } from "pino";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
-import { DispatchWatcher } from "../packages/core/src/core/dispatch/watcher.js";
+import { DispatchWatcher, createRuntimeDispatchWatcher } from "../packages/core/src/core/dispatch/watcher.js";
 import { enqueueDispatchSpec, dispatchDirs, type DispatchSpec } from "../packages/core/src/core/dispatch/types.js";
 import { discordRenderer } from "../packages/core/src/platforms/discord/renderer.js";
 import { projectAttemptCompletions } from "../packages/core/src/core/dispatch/attempt-recovery.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
+import { DispatchSuspendedError } from "../packages/core/src/core/dispatch/attempt-store.js";
 
 const cleanups: (() => void)[] = [];
 afterEach(() => { for (const f of cleanups.splice(0).reverse()) f(); vi.restoreAllMocks(); });
@@ -35,12 +36,13 @@ function setup() {
   const router = {
     listProfiles: () => [], describeConfig: () => ({}),
     ensureSessionRecord: () => ({ ...record }), getProfile: () => undefined,
-    getOrStartRuntime: async () => runtime,
+    getOrStartRuntime: vi.fn(async (_record: unknown, _opts?: { resumeSessionId: string }) => runtime),
   };
   const adapter = { sendPanel: async (channel: any) => ({ channel, id: "panel" }),
     sendMessage: async (channel: any) => ({ channel, id: "message" }),
     editPanel: async () => {}, editMessage: async () => {} };
   const config = { DATA_DIR: dataDir, REPOS_ROOT: "/synthetic", TURN_TIMEOUT_SECONDS: 60,
+    SEAM_TURN_RESUME_ENABLED: true,
     DEFAULT_MODEL: "default", SEAM_DISPATCH_STATUS_PANEL: false,
     SEAM_DISPATCH_OUTPUT_STYLE: "messages", REPO_EMOJIS: new Map(),
     channelPresets: {}, threadPresets: {} };
@@ -50,17 +52,125 @@ function setup() {
     config: config as any });
   const orch = makeOrch();
   const reports = vi.spyOn(orch as any, "enqueueReportBack").mockResolvedValue(undefined);
+  const notices = vi.fn((s: DispatchSpec, err: DispatchSuspendedError) => orch.observeRetainedDispatch(s, err));
+  const refusals: DispatchSuspendedError[] = [];
   const watcher = new DispatchWatcher({ dataDir, logger: pino({ level: "silent" }) as any,
-    resumeEnabled: true, onDispatch: s => orch.dispatchInjectTurn(s), pollMs: 1000000 });
+    resumeEnabled: true, onRetained: notices, onDispatch: async s => {
+      try { return await orch.dispatchInjectTurn(s); }
+      catch (err) { if (err instanceof DispatchSuspendedError) refusals.push(err); throw err; }
+    }, pollMs: 1000000 });
   orch.setDispatchWatcher(watcher);
   cleanups.push(() => watcher.stop());
   const spec: DispatchSpec = { id: "held", target: "worker", prompt: "original work", session: "live",
     returnTo: "origin", correlationId: "logical", kind: "handoff", stream: false,
     createdUtc: new Date().toISOString() };
-  return { orch, store, watcher, dataDir, spec, reports, runtime, started, release, makeOrch };
+  return { orch, store, watcher, dataDir, spec, reports, runtime, router, notices, refusals, started, release, makeOrch };
 }
 
 describe("#250 production dispatch lifecycle (synthetic transport, no providers)", () => {
+  it("#336 shutdown during acquisition retains without notice and the next boot completes", async () => {
+    const h = setup();
+    h.spec.id = "11ac5c69-7785-4e84-bee5-110a86e8af76";
+    simulateRetiredOwnerProcess();
+    let entered!: () => void;
+    const acquiring = new Promise<void>(resolve => { entered = resolve; });
+    let fail!: (err: Error) => void;
+    h.router.getOrStartRuntime.mockImplementationOnce(() => {
+      entered();
+      return new Promise((_resolve, reject) => { fail = reject; });
+    });
+    await h.watcher.start();
+    await enqueueDispatchSpec(h.dataDir, h.spec);
+    const tick = h.watcher.tick();
+    await acquiring;
+    h.orch.suspendForRestart();
+    // The event has already attributed cancellation; ambient state must not
+    // decide the eventual refusal after the transport finishes unwinding.
+    (h.orch as any).restartCutoff = false;
+    fail(new Error("ACP connection closed"));
+    await tick; await h.watcher.drain(); h.watcher.stop();
+    expect(h.refusals).toMatchObject([{ suspension: "shutdown", reason: expect.stringContaining("shutdown interrupted provider acquisition") }]);
+    expect(h.notices).not.toHaveBeenCalled();
+    expect(h.store.turnAttempts.get(h.spec.id)).toMatchObject({ state: "suspended", stalledUtc: null, promptStarted: false });
+    expect(existsSync(path.join(dispatchDirs(h.dataDir).running, `${h.spec.id}.json`))).toBe(true);
+    h.runtime.prompt.mockResolvedValue({ stopReason: "end_turn" });
+    const next = h.makeOrch();
+    vi.spyOn(next as any, "enqueueReportBack").mockResolvedValue(undefined);
+    const nextWatcher = createRuntimeDispatchWatcher({ dataDir: h.dataDir, logger: pino({ level: "silent" }) as any,
+      resumeEnabled: true, retainForRecovery: id => h.store.turnAttempts.get(id) !== null, runtime: next });
+    next.setDispatchWatcher(nextWatcher);
+    cleanups.push(() => nextWatcher.stop());
+    await nextWatcher.start(); await nextWatcher.initialDispatchesSettled();
+    expect(h.store.turnAttempts.get(h.spec.id)).toMatchObject({ state: "completed", generation: 2, stalledUtc: null });
+    expect(h.notices).not.toHaveBeenCalled();
+    expect(h.runtime.prompt).toHaveBeenCalledTimes(1);
+  });
+
+  it("#336 boot-recovery acquisition failure hands off, then resumes the same session on a later boot", async () => {
+    const h = setup();
+    simulateRetiredOwnerProcess();
+    const first = h.orch.dispatchInjectTurn(h.spec);
+    await h.started; h.orch.suspendForRestart(); h.release();
+    await expect(first).rejects.toMatchObject({ suspension: "shutdown" });
+    const recovering = h.makeOrch();
+    h.router.getOrStartRuntime.mockRejectedValueOnce(new Error("ACP connection closed"));
+    await enqueueDispatchSpec(h.dataDir, h.spec);
+    const refusals: DispatchSuspendedError[] = [];
+    const watcher = new DispatchWatcher({ dataDir: h.dataDir, logger: pino({ level: "silent" }) as any,
+      resumeEnabled: true, onRetained: h.notices, onDispatch: async s => {
+        try { return await recovering.dispatchInjectTurn(s); }
+        catch (err) { refusals.push(err as DispatchSuspendedError); throw err; }
+      } });
+    cleanups.push(() => watcher.stop());
+    await watcher.start(); watcher.stop();
+    expect(refusals).toMatchObject([{ suspension: "shutdown", reason: "provider acquisition failed during boot-recovery: ACP connection closed" }]);
+    expect(h.notices).not.toHaveBeenCalled();
+    expect(h.store.turnAttempts.get(h.spec.id)).toMatchObject({ state: "suspended", generation: 2,
+      acpSessionId: "recorded-acp", promptStarted: true, stalledUtc: null });
+    h.runtime.prompt.mockResolvedValueOnce({ stopReason: "end_turn" });
+    const next = h.makeOrch();
+    vi.spyOn(next as any, "enqueueReportBack").mockResolvedValue(undefined);
+    const nextWatcher = createRuntimeDispatchWatcher({ dataDir: h.dataDir, logger: pino({ level: "silent" }) as any,
+      resumeEnabled: true, retainForRecovery: id => h.store.turnAttempts.get(id) !== null, runtime: next });
+    next.setDispatchWatcher(nextWatcher);
+    cleanups.push(() => nextWatcher.stop());
+    await nextWatcher.start();
+    expect(h.runtime.prompt.mock.calls.at(-1)?.[0]).toBe("continue");
+    expect(h.router.getOrStartRuntime.mock.calls.at(-1)).toMatchObject([{}, { resumeSessionId: "recorded-acp" }]);
+    expect(h.store.turnAttempts.get(h.spec.id)).toMatchObject({ state: "completed", generation: 3, stalledUtc: null });
+    expect(h.notices).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])("#336 ordinary acquisition failure remains defect with ambient cutoff=%s", async ambientCutoff => {
+    const h = setup();
+    h.router.getOrStartRuntime.mockImplementationOnce(async () => {
+      // No shutdown event cancelled this acquisition. A window flag alone
+      // must never turn its independent failure into a shutdown handoff.
+      (h.orch as any).restartCutoff = ambientCutoff;
+      throw new Error("ACP connection closed");
+    });
+    await h.watcher.start(); await enqueueDispatchSpec(h.dataDir, h.spec);
+    await h.watcher.tick(); await h.watcher.drain();
+    expect(h.refusals).toMatchObject([{ suspension: "defect", reason: "provider acquisition failed during execution: ACP connection closed" }]);
+    expect(h.notices).toHaveBeenCalledTimes(1);
+    expect(h.store.turnAttempts.get(h.spec.id)).toMatchObject({ state: "suspended",
+      stalledReason: "provider acquisition failed during execution: ACP connection closed",
+      stallNoticeUtc: expect.any(String) });
+  });
+
+  it("#336 a classified defect survives a real shutdown during non-acquisition setup", async () => {
+    const h = setup();
+    vi.spyOn(h.orch as any, "postDispatchStartIndicator").mockImplementation(async () => {
+      h.orch.suspendForRestart();
+      throw DispatchSuspendedError.defect(h.spec.id, "recorded provider identity is corrupt");
+    });
+    await h.watcher.start(); await enqueueDispatchSpec(h.dataDir, h.spec);
+    await h.watcher.tick(); await h.watcher.drain();
+    expect(h.refusals).toMatchObject([{ suspension: "defect", reason: "recorded provider identity is corrupt" }]);
+    expect(h.notices).toHaveBeenCalledTimes(1);
+    expect(h.store.turnAttempts.get(h.spec.id)?.stalledReason).toBe("recorded provider identity is corrupt");
+  });
+
   it("restart cutoff keeps running artifact and ACP binding without an early report", async () => {
     const h = setup();
     await h.watcher.start();

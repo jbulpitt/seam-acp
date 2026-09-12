@@ -13,6 +13,7 @@ import type { Logger } from "../packages/core/src/lib/logger.js";
 import type { SessionRecord } from "../packages/core/src/core/types.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 import { DispatchSuspendedError } from "../packages/core/src/core/dispatch/attempt-store.js";
+import { DispatchAcquisitionPhase } from "../packages/core/src/core/dispatch/acquisition-phase.js";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
 
@@ -22,20 +23,23 @@ const calls: { load: string[]; neu: number; prompts: string[] } = {
   prompts: [],
 };
 let beforeOutcome: (() => void) | undefined;
+let acquisitionFailure: "start" | "load" | "new" | undefined;
 
 vi.mock("../packages/core/src/agents/agent-runtime.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../packages/core/src/agents/agent-runtime.js")>();
   return {
     ...actual,
     AgentRuntime: class {
-      async start(): Promise<void> {}
+      async start(): Promise<void> { if (acquisitionFailure === "start") throw new Error("transport unavailable"); }
       supportsSessionLoad(): boolean { return true; }
       async newSession(): Promise<{ sessionId: string }> {
         calls.neu++;
+        if (acquisitionFailure === "new") throw new Error("transport unavailable");
         return { sessionId: "acp-NEW" };
       }
       async loadSession(opts: { sessionId: string }): Promise<{ sessionId: string }> {
         calls.load.push(opts.sessionId);
+        if (acquisitionFailure === "load") throw new Error("transport unavailable");
         return { sessionId: opts.sessionId };
       }
       onEvent(): void {}
@@ -77,6 +81,7 @@ beforeEach(() => {
   calls.neu = 0;
   calls.prompts = [];
   beforeOutcome = undefined;
+  acquisitionFailure = undefined;
 });
 
 afterEach(() => {
@@ -85,6 +90,41 @@ afterEach(() => {
 });
 
 describe("injectTurn isolated resumeSessionId", () => {
+  it.each(["start", "load", "new"] as const)("#336 attributes isolated %s failures without settling or deleting history", async stage => {
+    const deleteSession = vi.fn(async () => {});
+    const profile = { id: "codex", defaultModel: "m", sessionManager: { deleteSession } } as any;
+    const orch = new Orchestrator({ logger: silent, store, config: { REPOS_ROOT: dir, DATA_DIR: dir } as any,
+      adapter: {} as any, renderer: {} as any, modelCatalog: fixtureModelCatalog([profile]),
+      router: { listProfiles: () => [], describeConfig: () => ({ location: { value: "local" } }),
+        assertAgentAllowedForChannel: () => {} } as any });
+    acquisitionFailure = stage;
+    for (const phase of ["execution", "boot-recovery"] as const) {
+      const acquisition = new DispatchAcquisitionPhase("job", phase);
+      const onOutcome = vi.fn();
+      await expect(orch.injectTurn(record(), "continue", { session: "isolated", profile, cwd: dir,
+        ...(stage === "new" ? {} : { resumeSessionId: "same-acp" }),
+        lifecycle: { isCurrent: () => true, acquire: operation => acquisition.acquire(operation),
+          beforePrompt: () => {}, onOutcome, mayDeleteSession: () => false } })).rejects.toMatchObject({
+        suspension: phase === "boot-recovery" ? "shutdown" : "defect",
+        reason: `provider acquisition failed during ${phase}: transport unavailable`,
+      });
+      expect(onOutcome).not.toHaveBeenCalled();
+    }
+    expect(deleteSession).not.toHaveBeenCalled();
+    expect(calls.prompts).toEqual([]);
+  });
+
+  it("#336 a specific acquisition defect survives shutdown cancellation", async () => {
+    const phase = new DispatchAcquisitionPhase("job", "boot-recovery");
+    let fail!: (err: Error) => void;
+    const work = phase.acquire(() => new Promise((_resolve, reject) => { fail = reject; }));
+    await Promise.resolve();
+    phase.shutdown();
+    const defect = DispatchSuspendedError.defect("job", "provider identity mismatch");
+    fail(defect);
+    await expect(work).rejects.toBe(defect);
+  });
+
   it("an optional cleanup attribution failure cannot prevent isolated disposal/history cleanup (#253)", async () => {
     const deleteSession = vi.fn(async () => {});
     const profile = { id: "codex", defaultModel: "m", sessionManager: { deleteSession } } as any;

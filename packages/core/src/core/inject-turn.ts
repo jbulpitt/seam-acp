@@ -112,6 +112,8 @@ export interface InjectTurnOptions {
    * An obsolete/suspended owner may neither forward files nor delete history. */
   lifecycle?: {
     isCurrent(): boolean;
+    /** Attribute only runtime/session acquisition to this dispatch's phase. */
+    acquire?<T>(operation: () => Promise<T>): Promise<T>;
     onRuntime?(pid: number | undefined, providerIdentity?: string): void;
     beforePrompt(): void;
     onOutcome(result: InjectTurnResult): void;

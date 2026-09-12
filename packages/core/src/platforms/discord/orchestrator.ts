@@ -5,6 +5,7 @@ import path from "node:path";
 import os from "node:os";
 import { randomUUID } from "node:crypto";
 import { DispatchSuspendedError, inboundAttemptId, type TurnAttempt } from "../../core/dispatch/attempt-store.js";
+import { DispatchAcquisitionPhase } from "../../core/dispatch/acquisition-phase.js";
 import { compareExecutionIdentity, executionIdentity } from "../../core/dispatch/execution-identity.js";
 import { MessageFlags, EmbedBuilder, ButtonBuilder, ActionRowBuilder, ButtonStyle, StringSelectMenuBuilder, ModalBuilder, TextInputBuilder, TextInputStyle, AttachmentBuilder, type ChatInputCommandInteraction, type AutocompleteInteraction, type MessageComponentInteraction, type Message, type InteractionEditReplyOptions } from "discord.js";
 import type { Logger } from "../../lib/logger.js";
@@ -834,12 +835,14 @@ export class Orchestrator {
   private readonly store: SessionStore;
   private readonly attemptBoot = randomUUID();
   private restartCutoff = false;
+  private readonly dispatchAcquisitions = new Set<DispatchAcquisitionPhase>();
 
   /** Final restart cutoff, NOT ordinary drain/admission or intentional cancel.
    * Synchronous durable winner before teardown is allowed to reject prompts. */
   suspendForRestart(): void {
     this.restartCutoff = true;
     this.store.turnAttempts.suspendBoot(this.attemptBoot);
+    for (const phase of this.dispatchAcquisitions) phase.shutdown();
   }
   private readonly renderer: Renderer;
   private readonly quotaPoller?: AgentQuotaPoller;
@@ -5253,6 +5256,8 @@ export class Orchestrator {
       opts.lifecycle?.onOutcome(result);
       return result;
     };
+    const acquire = <T>(operation: () => Promise<T>): Promise<T> =>
+      opts.lifecycle?.acquire ? opts.lifecycle.acquire(operation) : operation();
     const runPrompt = async (rt: AgentRuntime): Promise<PromptOutcome | "timeout"> => {
       opts.lifecycle?.beforePrompt();
       return opts.timeoutMs === undefined
@@ -5317,29 +5322,30 @@ export class Orchestrator {
             opts.mcpServers ?? []
           )),
         });
-        await rt.start();
+        await acquire(() => rt!.start());
         opts.lifecycle?.onRuntime?.(rt.getProcessId?.(), rt.getProviderIdentity?.());
         if (opts.resumeSessionId) {
+          const recordedSessionId = opts.resumeSessionId;
           if (opts.lifecycle && !rt.supportsSessionLoad?.()) {
             throw DispatchSuspendedError.defect(opts.logContext?.dispatch as string ?? "unknown",
               "the provider does not support session/load, so this turn cannot be reattached");
           }
           // #76: resume against the recorded session, never newSession().
-          await rt.loadSession({
-            sessionId: opts.resumeSessionId,
+          await acquire(() => rt!.loadSession({
+            sessionId: recordedSessionId,
             cwd,
             model: selection.raw.model,
             ...(selection.raw.effort ? { effort: selection.raw.effort } : {}),
             ...((opts.strictModel || opts.lifecycle) ? { strictModel: true } : {}),
-          });
+          }));
           sessionId = opts.resumeSessionId;
         } else {
-          const info = await rt.newSession({
+          const info = await acquire(() => rt!.newSession({
             cwd,
             model: selection.raw.model,
             ...(selection.raw.effort ? { effort: selection.raw.effort } : {}),
             ...(opts.strictModel ? { strictModel: true } : {}),
-          });
+          }));
           sessionId = info.sessionId;
         }
         // Persist the id BEFORE prompt() so a crash mid-turn is still
@@ -5412,9 +5418,9 @@ export class Orchestrator {
           cwd: opts.cwd ?? this.config.REPOS_ROOT,
         });
     try {
-      const rt = opts.resumeSessionId
-        ? await this.router.getOrStartRuntime(record, { resumeSessionId: opts.resumeSessionId })
-        : await this.router.getOrStartRuntime(record);
+      const rt = await acquire(() => opts.resumeSessionId
+        ? this.router.getOrStartRuntime(record, { resumeSessionId: opts.resumeSessionId })
+        : this.router.getOrStartRuntime(record));
       opts.lifecycle?.onRuntime?.(rt.getProcessId?.(), rt.getProviderIdentity?.());
       const liveSessionId = record.acpSessionId || rt.getSessionInfo()?.sessionId;
       budgetRecord = record;
@@ -8696,8 +8702,11 @@ export class Orchestrator {
     if (this.restartCutoff) {
       throw DispatchSuspendedError.shutdown(spec.id, "restart cutoff reached before execution began");
     }
+    const phase = new DispatchAcquisitionPhase(spec.id,
+      prior?.state === "suspended" && prior.ownerBoot !== this.attemptBoot ? "boot-recovery" : "execution");
+    this.dispatchAcquisitions.add(phase);
     try {
-      return await this.dispatchInjectTurnOwned(prior ? { ...prior.spec, resume: prior.promptStarted } : spec);
+      return await this.dispatchInjectTurnOwned(prior ? { ...prior.spec, resume: prior.promptStarted } : spec, phase);
     } catch (err) {
       let current;
       try { current = this.store.turnAttempts?.get(spec.id); }
@@ -8709,6 +8718,11 @@ export class Orchestrator {
         catch { completionPending = true; }
         throw new DispatchTurnError("cancelled by operator", "", "cancelled", "failed",
           "cancelled by operator", completionPending, true);
+      }
+      if (err instanceof DispatchSuspendedError) {
+        // Refuse only the operation named by the inner error. Its shutdown
+        // handoff or superseding owner keeps working; defects stay actionable.
+        throw err;
       }
       if (current?.state === "active" && current.ownerBoot === this.attemptBoot &&
           !this.restartCutoff && !(err instanceof DispatchSuspendedError)) {
@@ -8736,16 +8750,18 @@ export class Orchestrator {
         throw new DispatchTurnError(workerError, "", "", "failed", workerError);
       }
       if (current && current.state !== "completed") {
-        // Includes pre-provider acquisition failure on recovery. Retain its
-        // identity/history for inspection; never turn load failure into replay.
+        // Unclassified setup failures refuse only this dispatch. Acquisition
+        // handoffs carry their explicit phase above; other jobs keep running.
         throw DispatchSuspendedError.defect(spec.id,
           `execution failed before the provider took the turn and the attempt is ${current.state}`);
       }
       throw err;
+    } finally {
+      this.dispatchAcquisitions.delete(phase);
     }
   }
 
-  private async dispatchInjectTurnOwned(spec: DispatchSpec): Promise<{ output: string; stopReason: string }> {
+  private async dispatchInjectTurnOwned(spec: DispatchSpec, phase: DispatchAcquisitionPhase): Promise<{ output: string; stopReason: string }> {
     // Compact dispatches don't inject a turn — they run the compaction pipeline
     // on the target thread and post a result card there. Same start-indicator +
     // ledger + done-file plumbing, different body (see dispatchCompact).
@@ -8967,6 +8983,19 @@ export class Orchestrator {
       let submittedThisAttempt = false;
       const lifecycle: InjectTurnOptions["lifecycle"] = attempt ? {
         isCurrent: () => !this.restartCutoff && this.store.turnAttempts.isCurrent(attempt),
+        acquire: async operation => {
+          try { return await phase.acquire(operation); }
+          catch (err) {
+            // Refuse only this acquisition's generation; a replacement keeps
+            // running. Recovery load failure leaves this attempt for next boot.
+            if (err instanceof DispatchSuspendedError && err.suspension === "shutdown" &&
+                this.store.turnAttempts.isCurrent(attempt)) {
+              try { this.store.turnAttempts.suspend(spec.id, this.attemptBoot); }
+              catch (suspendErr) { throw DispatchSuspendedError.from(suspendErr, spec.id, "retaining the acquisition for next boot failed"); }
+            }
+            throw err;
+          }
+        },
         onRuntime: (pid, providerIdentity) => {
           try { this.store.turnAttempts.bindRuntime(attempt, pid, providerIdentity); }
           catch (bindErr) { throw DispatchSuspendedError.from(bindErr, spec.id, "binding the runtime to the attempt failed"); }

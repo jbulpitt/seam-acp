@@ -125,6 +125,18 @@ function assertNotWritable(target: string, name: string): void {
   throw new Error(`${name} must be immutable to the Seam service user`);
 }
 
+function assertImmutablePathAncestorsNotWritable(runtimeRoot: string): void {
+  let ancestor = path.dirname(runtimeRoot);
+  while (true) {
+    // Refuse only this AGY binding and name the component an operator must
+    // migrate; #330 keeps the host and its other adapters serving.
+    assertNotWritable(ancestor, `AGY_RUNTIME_ROOT ancestor ${ancestor}`);
+    const parent = path.dirname(ancestor);
+    if (parent === ancestor) return;
+    ancestor = parent;
+  }
+}
+
 export function verifyAgyManagedRuntimeArtifact(
   executable: string,
   runtimeRoot: string,
@@ -158,6 +170,12 @@ export function verifyAgyManagedRuntimeArtifact(
   if (!stat.isFile()) throw new Error("AGY executable is not a regular file");
   fs.accessSync(executableReal, fs.constants.X_OK);
   assertNotWritable(rootReal, "AGY_RUNTIME_ROOT");
+  // macOS executes by name, so every parent component is part of the binding
+  // between verified and executed bytes. Linux executes the verified inode
+  // through /proc/self/fd and does not delegate that authority to the path.
+  if (process.platform === "darwin") {
+    assertImmutablePathAncestorsNotWritable(rootReal);
+  }
   assertNotWritable(releaseDir, "AGY release directory");
   assertNotWritable(executableReal, "AGY executable");
 
@@ -319,19 +337,10 @@ function openVerifiedSnapshot(
   //
   // This branch pursues the same intent by a PRECONDITION rather than by
   // construction, and it is honestly weaker. `verifyAgyManagedRuntimeArtifact`
-  // has proven the path canonical and not writable by the service user, but
-  // `spawn` resolves the name a second time, so the fd we hold pins the inode we
-  // READ, not the inode we EXEC. A swap landing inside that window is not
-  // excluded. `assertNotWritable` also checks only the root, release dir and
-  // executable — not their ancestors — and renaming a directory requires write
-  // on its PARENT, so a 0555 tree under a writable parent is still replaceable.
-  //
-  // That matters here specifically because agents execute code as the service
-  // user: such an attacker cannot change the running bridge's env, but can win
-  // that race. What they gain is not privilege — they already have same-user
-  // execution — it is ATTESTATION: the bridge would advertise a
-  // provenance-verified agy while running other bytes. Closing it means walking
-  // every ancestor and restaging outside $HOME; tracked in #332.
+  // has proven the entire path canonical and non-writable by the service user,
+  // including every ancestor through `/`. That prevents a same-user agent from
+  // replacing any named component between verification and `spawn`, which
+  // would otherwise let different bytes inherit the verified attestation.
   //
   // The Node fixture loader stays on the descriptor route on every platform: it
   // READS fd 3 rather than exec'ing it, which macOS permits.

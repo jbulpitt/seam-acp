@@ -15,9 +15,11 @@ location managed by Google's background updater. The configured executable is:
 ```
 
 (`agy.exe` on Windows.) The root, digest directory, and executable must not be
-writable by the Seam service user. The executable must be a regular,
-non-symlink file. These layout checks are policy and operator-error defenses;
-they are not the native check-to-use guarantee.
+writable by the Seam service user. On macOS, every ancestor of the runtime root
+through `/` must also be non-writable by that user because the native binary is
+executed by name. The refusal names the first writable component so an operator
+can migrate that one AGY binding without taking the host's other adapters down.
+The executable must be a regular, non-symlink file.
 
 For the first use of an artifact digest in a process, Seam reads the candidate
 into a fresh mode-0700 private directory, writes a mode-0500 snapshot, opens it
@@ -29,10 +31,40 @@ obtain an independent file description. Concurrent children therefore cannot
 share or advance one another's offset.
 
 The bounded `--version` probe and real child both receive the launch duplicate
-as fd 3; Linux executes `/proc/self/fd/3` and macOS uses `/dev/fd/3`. The
-configured pathname is never executed after verification. Renaming or replacing
-the configured root after preparation therefore cannot substitute different
-bytes. Unsupported descriptor-launch platforms fail closed.
+as fd 3. Linux executes `/proc/self/fd/3`, so the verified inode is the executed
+inode and pathname ancestry is defense in depth. macOS cannot execute its
+code-signed native binary through `/dev/fd/3`; it uses the verified immutable
+path instead, after proving the complete ancestor chain cannot be renamed by
+the service user. Unsupported launch platforms fail closed.
+
+## macOS ancestor-immutability rollout (#332)
+
+Do not deploy the ancestor check hot onto the existing `$HOME/.seam` staging.
+`$HOME` and `$HOME/.seam` are service-user writable, so the check correctly
+refuses those AGY bindings. Removing three recently restored Mac bindings at
+once would turn a precise provenance refusal into a fleet capability outage.
+
+Stage the migration before enforcement:
+
+1. Inventory each Mac's active five-value runtime tuple and retain its audited
+   rollback record.
+2. As an operator, create `/opt/seam/agy-runtime` with `/`, `/opt`, `/opt/seam`,
+   and the runtime root owned by `root` and not writable by the service user.
+3. Copy the already-verified executable to
+   `/opt/seam/agy-runtime/<AGY_SHA256>/agy`; make the digest directory and
+   executable root-owned and non-writable by the service user.
+4. Recompute the digest and exact version from the staged file, then update
+   `AGY_RUNTIME_ROOT`, `AGY_CLI_PATH`, `AGY_BIN`, `AGY_VERSION`, and
+   `AGY_SHA256` together through the audited host rollout path.
+5. Validate one host at a time. Only after every Mac is compliant should the
+   enforcement commit deploy fleet-wide.
+
+A bypass flag is not recommended: while disabled it would advertise verified
+provenance for a path that remains replaceable. The safe staging boundary is
+operational sequencing, not a weaker attestation. If a host is missed, #330's
+adapter-isolated admission refuses AGY with the named writable ancestor while
+the host's other adapters keep serving; operators must ensure an AGY-only host
+has a working alternative before rollout.
 
 The descriptor cache holds at most four digests and closes an evicted master;
 prepared launches keep independent duplicates and are unaffected by eviction.

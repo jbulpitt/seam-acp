@@ -52,8 +52,6 @@ Copy `.env.example` to `.env` and fill it in.
 | `MODEL_VALUE_LONG_CONTEXT_THRESHOLD_TOKENS` | no | Total input threshold selecting explicit long-context pricing. Default `200000`. Missing required tier rates remain unranked. |
 | `COPILOT_PROFILES` | no | Register additional Copilot profiles, each with its own auth / config dir. Format: `id1:/abs/dir1,id2:/abs/dir2`. Each becomes an agent profile named `copilot-<id>` in `/seam config agent`. Lets one bot serve multiple GitHub accounts; see "Multiple Copilot accounts" below. |
 | `AGY_ENABLED` / `AGY_CLI_PATH` | no | Enables native Seam `agy` with an exact managed CLI path, release pins, and explicit default model. Default `false`. |
-| `AGY_PACKAGE_ENABLED` | no | Separately enables `agy-package` with exact wrapper/runtime pins and permission-risk acknowledgement. Default `false`. |
-| `AGY_ACP_BIN` / `AGY_ACP_SHA256` | with AGY | Exact compiled `antigravity-acp` v1.1.0 asset and reviewed platform digest. Seam never downloads it. |
 | `AGY_BIN` / `AGY_VERSION` / `AGY_SHA256` / `AGY_RUNTIME_ROOT` | with AGY | Exact authenticated `agy` executable, coupled version/digest, and non-writable content-addressed root outside the auto-updater. See `docs/agy-native-runtime.md`. |
 | `CLAUDE_CLI_PATH` | no | If `claude-agent-acp` is not on `PATH` |
 | `CLAUDE_DEFAULT_MODEL` | no | Default Claude model — applied even when `DEFAULT_AGENT` is `copilot`. Default `claude-sonnet-4.5`. |
@@ -76,15 +74,11 @@ claude /login
 ```
 
 The **Google Antigravity (`agy`)** profile is Seam's native adapter, with its
-existing thinking, MCP, and structured-output integration. The separate optional
-**`agy-package`** profile uses the pinned compiled
-`antigravity-acp` wrapper and an exact host-local `agy` binary. It is deliberately
-disabled until its artifact digest, directories, semantic credential scope, and
-permission-bypass acknowledgement are configured. Seam forces
-`AGY_SKIP_DOWNLOAD=1`; neither startup nor catalog refresh downloads or replaces
-either executable. Authentication is a separate operator action performed on
-the runtime host, never by Seam. Read the security and account-risk requirements
-in [the AGY integration runbook](docs/agy-package-integration.md) before enabling it.
+existing thinking, MCP, and structured-output integration. It launches with
+`--dangerously-skip-permissions` on every turn and no sandbox; no configuration
+changes that, and none ever has. See
+[the native lifecycle notes](docs/agy-native-lifecycle.md) for the full posture
+and why there is deliberately no acknowledgement flag (#324, #380).
 
 ## Run (local dev)
 
@@ -355,7 +349,7 @@ AgentProfile         (Copilot today, Claude Code tomorrow — adds via `src/agen
 - **`src/platforms/chat-adapter.ts`** — generic chat platform interface.
 - **`src/platforms/discord/`** — discord.js v14 implementation + slash commands + repo picker.
 - **`src/agents/agent-runtime.ts`** — wraps `@agentclientprotocol/sdk` + a child process running an ACP server. Handles `initialize`, `session/new`, `session/load`, `session/prompt`, `session/cancel`, model / mode / config option setters, and emits typed events.
-- **`packages/adapters/src/profiles/copilot.ts`** — spawns `copilot --acp`. Sibling profiles include `agy.ts` (native Seam Antigravity), `agy-package.ts` (optional pinned package-backed ACP), `claude.ts`, `codex.ts`, and `grok.ts`.
+- **`packages/adapters/src/profiles/copilot.ts`** — spawns `copilot --acp`. Sibling profiles include `agy.ts` (native Seam Antigravity), `claude.ts`, `codex.ts`, and `grok.ts`.
 - **`src/core/`** — pure utilities: text chunker, path safety, sqlite store, session router, status panel.
 
 ## Testing

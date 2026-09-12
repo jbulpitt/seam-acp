@@ -164,9 +164,10 @@ A sandbox was never a requirement for this work.
 `DEFAULT_AGY_EXECUTION_POLICY` sets it to `false`, and neither production
 construction site overrides it — not `packages/bridge/src/inventory.ts` (remote
 host inventory) nor `packages/core/src/index.ts` (server startup).
-`sandbox: true` appears only in `test/agy-prompt-args.test.ts` and
-`test/agy-model-catalog.test.ts`, covering the argv shape of a helper path that
-is not wired up. `--dangerously-skip-permissions` is added **unconditionally**,
+`sandbox: true` appears only in `test/agy-prompt-args.test.ts`,
+`test/agy-model-catalog.test.ts` and `test/agy-sandbox-posture.test.ts` —
+covering the argv shape of a helper path that is not wired up, plus the guard
+that keeps this section true. `--dangerously-skip-permissions` is added **unconditionally**,
 independent of the policy.
 
 So every agy session launches with:
@@ -176,6 +177,16 @@ So every agy session launches with:
   auto-approved without prompting;
 - **`--add-dir <cwd>`** plus the shared staging root — `--add-dir` is the only
   thing bounding the workspace.
+
+**No configuration controls any of this, and none ever has.** If you are
+looking for a switch, there isn't one — that is the posture, not an
+oversight. A key called `AGY_DANGEROUS_PERMISSIONS_ACKNOWLEDGED` used to
+exist and defaulted to `false`; it was only ever read by the agy-package
+config block, which #377 removed, and native agy never consulted it. So the
+single place an operator would check said the bypass was off while it was on
+every turn. #380 removed the key rather than make it a gate: requiring it
+before native agy starts would take agy off any host that had not set it,
+and four of the five agy hosts run no other agent.
 
 This is written down because the flag list invites the opposite conclusion:
 "we pass `--sandbox`" and "we auto-approve every tool request" pull in

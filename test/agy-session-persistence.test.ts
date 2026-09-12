@@ -311,6 +311,12 @@ describe.sequential("AGY R7 session persistence", () => {
   it("fails one session loudly when its conversation binding cannot be committed (#263)", async () => {
     const harness = makeHarness();
     const failing = await newRuntime(harness);
+    const exposed: string[] = [];
+    failing.onEvent((event) => {
+      if (event.kind === "agent-text" || event.kind === "agent-thought" || event.kind === "tool-start") {
+        exposed.push(event.kind);
+      }
+    });
     await failing.newSession({
       cwd: harness.root,
       model: "fixture-native-model",
@@ -325,6 +331,10 @@ describe.sequential("AGY R7 session persistence", () => {
 
     await expect(failing.prompt("capability-turn-one"))
       .rejects.toThrow("AGY session persistence failed");
+    // The provider conversation id is committed before stream subscription;
+    // if that commit fails, this one session is refused before any output can
+    // be exposed while independent sessions remain available below.
+    expect(exposed).toEqual([]);
     rename.mockImplementation(realRename);
     expect(fs.readFileSync(mappingFile, "utf8")).toBe(prior);
 

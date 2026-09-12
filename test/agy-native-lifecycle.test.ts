@@ -80,6 +80,35 @@ describe.sequential("R5 native production lifecycle", () => {
     } finally { await f.close(); }
   }, 15_000);
 
+  it("labels a cumulative planner correction instead of appending from a stale snapshot (#262)", async () => {
+    const f = await fixture();
+    try {
+      await expect(f.runtime.prompt("capability-correction")).resolves.toMatchObject({ stopReason: "end_turn" });
+      const text = f.events.flatMap(event => event.kind === "agent-text" ? [event.text] : []).join("");
+      const thought = f.events.flatMap(event => event.kind === "agent-thought" ? [event.text] : []).join("");
+      expect(text).toBe("Choose red\n\n[AGY corrected the preceding message]\nChoose new!");
+      expect(thought).toBe("Check red path\n\n[AGY corrected the preceding thought]\nCheck new path safely");
+    } finally { await f.close(); }
+  }, 15_000);
+
+  it("keeps generated-image IO in the ACP application layer after translation (#262)", async () => {
+    const f = await fixture();
+    try {
+      await expect(f.runtime.prompt("capability-generated-image")).resolves.toMatchObject({ stopReason: "end_turn" });
+      expect(f.events.filter((event) => event.kind === "agent-file")).toEqual([
+        expect.objectContaining({
+          kind: "agent-file",
+          source: "message",
+          filename: "generated.png",
+          mimeType: "image/png",
+          data: "iVBORw0KGgo=",
+          base64: true,
+        }),
+      ]);
+      expect(f.events.some((event) => event.kind === "tool-start" && event.title === "generate image")).toBe(false);
+    } finally { await f.close(); }
+  }, 15_000);
+
   it("#371 preserves a mid-stream rejection cause and never duplicates partial output from stdout", async () => {
     const f = await fixture();
     const log = vi.spyOn(console, "error").mockImplementation(() => {});

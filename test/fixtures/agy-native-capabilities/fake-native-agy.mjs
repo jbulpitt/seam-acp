@@ -57,6 +57,10 @@ const scenarioFile = prompt === "ok" || isModelsCommand
     ? "turn-two-resume.json"
     : prompt.includes("capability-model-")
       ? "turn-one.json"
+  : prompt.includes("capability-generated-image")
+    ? "turn-generated-image.json"
+  : prompt.includes("capability-correction")
+    ? "turn-correction.json"
   : prompt.includes("capability-turn-one") || prompt === "r5-closing"
     ? "turn-one.json"
     : prompt.includes("capability-turn-two")
@@ -73,6 +77,12 @@ if (prompt !== "ok" && !isModelsCommand && !scenarioFile) {
 }
 
 const trace = scenarioFile ? readJson(path.join(fixtureDir, scenarioFile)) : undefined;
+if (trace?.scenario === "turn-generated-image") {
+  const imagePath = path.join(process.cwd(), "generated.png");
+  fs.writeFileSync(imagePath, Buffer.from("89504e470d0a1a0a", "hex"));
+  trace.updates[1].mainTrajectoryUpdate.stepsUpdate.steps[0].content =
+    `Generated image is saved at ${imagePath}.`;
+}
 const conversationId = resumedConversation ?? trace?.conversationId ??
   "22222222-2222-4222-8222-222222222222";
 const mcpFile = process.env.HOME
@@ -147,10 +157,13 @@ const server = http.createServer(async (request, response) => {
       return;
     }
     response.setHeader("content-type", "application/json");
+    const primaryModelId = process.env.SEAM_AGY_R4B_METADATA_MODE === "mismatch"
+      ? "fixture-native-model-alias"
+      : "fixture-native-model";
     response.end(JSON.stringify({
       response: {
         models: {
-          "fixture-native-model": {
+          [primaryModelId]: {
             displayName: "Fixture Native Model",
             maxTokens: 4096,
             recommended: true,

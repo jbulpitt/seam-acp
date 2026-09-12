@@ -81,8 +81,11 @@ import {
   AgyStreamUnavailableError,
   waitForAgyConversationId,
   readAgyJsonResponse,
-  type AgyStep,
 } from "../agy-stream.js";
+import {
+  AgyNativeTranslator,
+  type AgyNativeEvent,
+} from "../agy-native-translation.js";
 import { STAGING_ROOT } from "../attachment-staging.js";
 import {
   AGY_SESSION_BACKEND,
@@ -1391,11 +1394,8 @@ class AgyAgent implements Agent {
       }
       runRef.streaming = true;
 
-      const lastText = new Map<number, string>();
-      const lastThinking = new Map<number, string>();
       const heldText = new Map<number, string>();
       const heldThinking = new Map<number, string>();
-      const toolCallIds = new Map<number, string>();
       // High-water mark from prior turns. The LS replays every step at or
       // below this on subscribe — skip them so the user doesn't see the entire
       // previous conversation repeated. Anything strictly above is new.
@@ -1411,7 +1411,12 @@ class AgyAgent implements Agent {
         }
       }
 
-      const usageTracker = { maxUsed: 0 };
+      const translator = new AgyNativeTranslator({
+        sessionId: params.sessionId,
+        replayThrough: skipUpTo,
+        maxTokens,
+        omitPlannerMessage: Boolean(jsonSchema),
+      });
 
       // Outer retry loop: if the stream closes without any activity (hasBeenActive
       // stays false), it means we subscribed during the idle window between the LS
@@ -1464,21 +1469,14 @@ class AgyAgent implements Agent {
                 const idx = sup.indices[i];
                 const step = sup.steps[i];
                 if (idx === undefined || step === undefined) continue;
-                if (idx <= skipUpTo) continue;
-                await this.emitStep(
-                  params.sessionId,
-                  idx,
-                  step,
-                  lastText,
-                  lastThinking,
-                  toolCallIds,
-                  heldText,
-                  heldThinking,
-                  sess.cwd,
-                  maxTokens,
-                  usageTracker,
-                  Boolean(jsonSchema),
-                );
+                const translated = translator.translate(idx, step);
+                // The translator retains deterministic historical events for
+                // replay consumers, but this live ACP path must never make an
+                // old trajectory step look like a response to the new prompt.
+                if (translated.delivery === "historical") continue;
+                for (const event of translated.events) {
+                  await this.emitTranslatedEvent(event, heldText, heldThinking, sess.cwd);
+                }
                 if (idx > sess.maxStepIndex) sess.maxStepIndex = idx;
               }
             }
@@ -1657,115 +1655,66 @@ class AgyAgent implements Agent {
   }
 
   // -----------------------------------------------------------------------
-  // Step → ACP translation
+  // Pure native translation → ACP application
   // -----------------------------------------------------------------------
 
-  private async emitStep(
-    sessionId: string,
-    idx: number,
-    step: AgyStep,
-    lastText: Map<number, string>,
-    lastThinking: Map<number, string>,
-    toolCallIds: Map<number, string>,
+  private async emitTranslatedEvent(
+    event: AgyNativeEvent,
     heldText: Map<number, string>,
     heldThinking: Map<number, string>,
     cwd: string,
-    maxTokens: number,
-    usageTracker: { maxUsed: number },
-    omitPlannerMessage = false,
   ): Promise<void> {
     if (!this.conn) return;
-
-    if (step.metadata?.modelUsage) {
-      const u = step.metadata.modelUsage;
-      const input = parseInt(u.inputTokens ?? "0", 10) || 0;
-      const output = parseInt(u.outputTokens ?? "0", 10) || 0;
-      const used = input + output;
-      if (used > usageTracker.maxUsed) {
-        usageTracker.maxUsed = used;
-        if (maxTokens > 0) {
-          await this.conn.sessionUpdate({
-            sessionId,
-            update: {
-              sessionUpdate: "usage_update",
-              used,
-              size: maxTokens,
-            } as any
-          }).catch(() => {});
-        }
-      }
-    }
-
-    const type = step.type ?? "";
-
-    if (type === "CORTEX_STEP_TYPE_PLANNER_RESPONSE") {
-      // Stream thinking deltas before visible text — agy fills them in that
-      // order, so consumers see "thinking…" before the answer arrives.
-      const thinking = step.plannerResponse?.thinking ?? "";
-      const prevTh = lastThinking.get(idx) ?? "";
-      if (thinking.length > prevTh.length) {
-        const delta = thinking.slice(prevTh.length);
-        lastThinking.set(idx, thinking);
-        await this.emitTextChunk(sessionId, idx, delta, heldThinking, "agent_thought_chunk", cwd);
-      }
-      const text = step.plannerResponse?.modifiedResponse ?? "";
-      const prevTx = lastText.get(idx) ?? "";
-      if (text.length > prevTx.length) {
-        const delta = text.slice(prevTx.length);
-        lastText.set(idx, text);
-        if (!omitPlannerMessage) {
-          await this.emitTextChunk(sessionId, idx, delta, heldText, "agent_message_chunk", cwd);
-        }
-      }
-      return;
-    }
-
-    // Skip internal trajectory steps — they're noise to a chat consumer.
-    if (
-      type === "CORTEX_STEP_TYPE_USER_INPUT" ||
-      type === "CORTEX_STEP_TYPE_CONVERSATION_HISTORY" ||
-      type === "CORTEX_STEP_TYPE_CHECKPOINT"
-    ) {
-      return;
-    }
-
-    // Generated images: agy writes the file to its brain dir and assumes the
-    // host UI (the Antigravity IDE) can read it from there. Our chat pipeline
-    // can't — we need to read the file and surface it as an ACP `image`
-    // content block so agent-runtime can route it through to Discord.
-    if (type === "CORTEX_STEP_TYPE_GENERATE_IMAGE") {
-      await this.emitGeneratedImageBlock(sessionId, step);
-      return;
-    }
-
-    // Anything else (VIEW_FILE, RUN_COMMAND, …) becomes a tool call.
-    const status = mapToolStatus(step.status);
-    const title = toolTitle(step);
-    let toolCallId = toolCallIds.get(idx);
-    if (!toolCallId) {
-      toolCallId = `agy-step-${idx}`;
-      toolCallIds.set(idx, toolCallId);
+    if (event.kind === "usage") {
       await this.conn.sessionUpdate({
-        sessionId,
+        sessionId: event.sessionId,
+        update: { sessionUpdate: "usage_update", used: event.used, size: event.size } as any,
+      }).catch(() => {});
+      return;
+    }
+    if (event.kind === "content") {
+      const held = event.role === "thought" ? heldThinking : heldText;
+      const updateType = event.role === "thought" ? "agent_thought_chunk" : "agent_message_chunk";
+      let text = event.text;
+      if (event.operation === "replace") {
+        // ACP chunks cannot retract already-rendered bytes. Flush only this
+        // role's held tail and label the corrected snapshot rather than
+        // silently displaying a false concatenation; the turn keeps running.
+        await this.flushHeld(event.sessionId, held, updateType, cwd);
+        text = `\n\n[AGY corrected the preceding ${event.role}]\n${text || "[empty]"}`;
+      }
+      await this.emitTextChunk(event.sessionId, event.stepIndex, text, held, updateType, cwd);
+      return;
+    }
+    if (event.kind === "generated-image") {
+      await this.emitGeneratedImageBlock(event.sessionId, event.content);
+      return;
+    }
+    const nativeMeta = { agy: event.metadata };
+    if (event.kind === "tool-start") {
+      await this.conn.sessionUpdate({
+        sessionId: event.sessionId,
         update: {
           sessionUpdate: "tool_call",
-          toolCallId,
-          title,
-          status,
-          kind: "other",
+          toolCallId: event.toolCallId,
+          title: event.title,
+          status: event.status,
+          kind: event.toolKind,
+          _meta: nativeMeta,
         },
       });
-    } else {
-      await this.conn.sessionUpdate({
-        sessionId,
-        update: {
-          sessionUpdate: "tool_call_update",
-          toolCallId,
-          ...(title ? { title } : {}),
-          status,
-        },
-      });
+      return;
     }
+    await this.conn.sessionUpdate({
+      sessionId: event.sessionId,
+      update: {
+        sessionUpdate: "tool_call_update",
+        toolCallId: event.toolCallId,
+        title: event.title,
+        status: event.status,
+        _meta: nativeMeta,
+      },
+    });
   }
 
   /**
@@ -1776,10 +1725,9 @@ class AgyAgent implements Agent {
    */
   private async emitGeneratedImageBlock(
     sessionId: string,
-    step: AgyStep,
+    content: string,
   ): Promise<void> {
     if (!this.conn) return;
-    const content = typeof step.content === "string" ? step.content : "";
     const m = content.match(/saved at\s+(\S+\.(?:png|jpe?g|gif|webp|svg))/i);
     const imagePath = m?.[1];
     if (!imagePath) {
@@ -1933,27 +1881,6 @@ function flattenPrompt(blocks: ReadonlyArray<ContentBlock>): string {
     // image/audio: agy CLI is text-only (no vision) — skip.
   }
   return parts.join("\n");
-}
-
-function mapToolStatus(
-  s: string | undefined,
-): "pending" | "in_progress" | "completed" | "failed" {
-  switch (s) {
-    case "CORTEX_STEP_STATUS_DONE":
-      return "completed";
-    case "CORTEX_STEP_STATUS_WAITING":
-      return "pending";
-    case "CORTEX_STEP_STATUS_FAILED":
-    case "CORTEX_STEP_STATUS_ERROR":
-      return "failed";
-    default:
-      return "in_progress";
-  }
-}
-
-function toolTitle(step: AgyStep): string {
-  const t = step.type ?? "";
-  return t.replace(/^CORTEX_STEP_TYPE_/, "").replace(/_/g, " ").toLowerCase();
 }
 
 /**

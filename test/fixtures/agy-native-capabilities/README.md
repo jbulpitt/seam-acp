@@ -14,6 +14,14 @@ The turn-one usage trace deliberately includes a repeated reading and a lower
 reading after its high-water mark. They are observed-shape negative inputs used
 to freeze monotonic ACP usage emission; they are not claims about token billing.
 
+`turn-correction.json` uses that same observed cumulative planner-step shape to
+model a same-length replacement followed by growth. Its text is synthetic; the
+fixture freezes the required truthful handling of a snapshot that is not an
+append, rather than claiming that exact prose came from a provider session.
+`turn-generated-image.json` freezes the existing native GENERATE_IMAGE union
+shape; the fake substitutes a private disposable path and writes synthetic PNG
+signature bytes so the real application layer, not the pure translator, owns IO.
+
 The fake CLI exposes the same local health, model, and Connect streaming routes
 the production native adapter calls. Tests therefore execute the production
 native profile, in-process ACP facade, `AgentRuntime`, attachment mapper,

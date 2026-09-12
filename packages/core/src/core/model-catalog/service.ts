@@ -33,7 +33,7 @@ import {
 } from "./store.js";
 
 export interface CatalogBinding { agentId: string; location: string }
-export type CatalogRefreshReason = "startup" | "scheduled" | "manual";
+export type CatalogRefreshReason = "startup" | "scheduled" | "manual" | "session";
 
 export interface CatalogRefreshOptions {
   /**

@@ -139,6 +139,11 @@ const server = http.createServer(async (request, response) => {
   }
 
   if (request.url?.endsWith("/GetAvailableModels")) {
+    if (process.env.SEAM_AGY_R4B_METADATA_MODE === "unavailable") {
+      response.statusCode = 403;
+      response.end();
+      return;
+    }
     response.setHeader("content-type", "application/json");
     response.end(JSON.stringify({
       response: {

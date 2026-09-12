@@ -62,8 +62,11 @@ import { runBoundedProbe, type ProbeHandle, ProbeError } from "../probe-process.
 import {
   manifestCatalogScope,
   manifestCatalogSource,
+  type CatalogModelEvidence,
   type CatalogScope,
+  type ManifestCatalogModel,
 } from "../model-catalog.js";
+import { CATALOG_MAX_CONTEXT_TOKENS } from "../catalog-evidence.js";
 import {
   discoverAgyLs,
   subscribeToAgyStream,
@@ -459,27 +462,31 @@ export function makeAgyProfile(opts: {
     catalog: {
       scope: () => catalogScope,
       async fetch() {
-        let models: ReadonlyArray<{ modelId: string; name: string; contextLimit?: number }>;
+        let models: ReadonlyArray<ManifestCatalogModel>;
         if (opts.staticModels && opts.staticModels.length > 0) {
-          const rows = opts.staticModels.some((model) => !model.contextLimit)
-            ? await getCatalog(runtime).catch(catalogFallback)
-            : [];
-          const limits = new Map(
-            rows.filter((row) => row.maxTokens).map((row) => [row.modelId, row.maxTokens])
-          );
+          const rows = await getCatalog(runtime).catch(catalogFallback);
+          const byId = new Map(rows.map((row) => [row.modelId, row]));
           models = opts.staticModels.map((model) => {
-            const contextLimit = model.contextLimit ?? limits.get(model.modelId);
-            return contextLimit ? { ...model, contextLimit } : model;
+            const row = byId.get(model.modelId);
+            return agyManifestModel(
+              model,
+              row,
+              runtime.descriptor.provenance.version,
+              catalogScope.fingerprint,
+            );
           });
         } else {
           const rows = await getCatalog(runtime);
           models = [...rows.filter((row) => row.recommended), ...rows.filter((row) => !row.recommended)]
-            .map((row) => ({
-              modelId: row.modelId,
-              name: row.displayName,
-              ...(row.maxTokens ? { contextLimit: row.maxTokens } : {}),
-            }));
+            .map((row) => agyManifestModel(
+              { modelId: row.modelId, name: row.displayName },
+              row,
+              runtime.descriptor.provenance.version,
+              catalogScope.fingerprint,
+            ));
         }
+        const enriched = models.some((model) => model.evidence?.some((entry) =>
+          entry.kind === "live-observation" && entry.source === "agy language server"));
         const candidate = await manifestCatalogSource({
           provider: "google-antigravity",
           backend: catalogScope.backend,
@@ -489,7 +496,9 @@ export function makeAgyProfile(opts: {
           models: () => models,
           effort: { mechanism: "modelBaked", choices: ["default"] },
           adapterVersion: AGENT_ADAPTER_VERSION,
-          source: opts.staticModels?.length ? "validated-manifest+agy-catalog" : "agy-language-server",
+          source: opts.staticModels?.length
+            ? enriched ? "validated-manifest+agy-session-language-server" : "validated-manifest+agy-models"
+            : enriched ? "agy-models+session-language-server" : "agy-models",
         }).fetch();
         runtime.verify(process.cwd());
         candidate.cliVersion = runtime.descriptor.provenance.version;
@@ -971,6 +980,14 @@ export const AGY_NO_SLASH_EXPANSION = "--disable-slash-commands";
 export const SEAM_AGY_JSON_SCHEMA_META = "seam/agyJsonSchema";
 
 /**
+ * ACP extension carried on a normal config-option update after a real AGY
+ * session has learned richer catalog metadata from its own language server.
+ * The controller responds by refreshing this exact binding through the normal
+ * catalog service; no catalog candidate crosses this private notification.
+ */
+export const SEAM_AGY_CATALOG_REFRESH_META = "seam/agyCatalogRefresh";
+
+/**
  * Pure argv for one print-mode turn, so the flag set stays directly
  * regression-testable (same rationale as {@link agyExecutionPolicyArgs}).
  *
@@ -1081,6 +1098,7 @@ class AgyAgent implements Agent {
   private active?: AgyTurnLifecycle;
   private shutdownPromise?: Promise<void>;
   private promptTail: Promise<unknown> = Promise.resolve();
+  private catalogRefreshSignalled = false;
 
   constructor(
     private readonly runtime: AgyNativeRuntime,
@@ -1299,7 +1317,7 @@ class AgyAgent implements Agent {
     // A turn without an exact model would let the native CLI consult global
     // settings; deleting this guard breaks isolation even if selection failed.
     if (!currentModel) throw new Error("AGY session has no model selection");
-    const maxTokens = agyContextWindow(catalog, currentModel);
+    let maxTokens = agyContextWindow(catalog, currentModel);
 
     // Linux limits each individual argv/envp string to MAX_ARG_STRLEN
     // (PAGE_SIZE * 32 = 131,072 bytes on x86-64), independent of the overall
@@ -1357,6 +1375,29 @@ class AgyAgent implements Agent {
         logFile: agyLogPath,
         timeoutMs: 90_000,
         signal: cancelAbort.signal,
+      });
+      const metadataLearning = learnAgyCatalogFromSession(
+        this.runtime,
+        ls.port,
+        cancelAbort.signal,
+      ).then(async (available) => {
+        if (!available) return;
+        const enriched = await getCatalog(this.runtime);
+        const enrichedCurrent = enriched.find((entry) => entry.modelId === currentModel.modelId);
+        maxTokens = agyContextWindow(enriched, enrichedCurrent ?? currentModel);
+        if (this.catalogRefreshSignalled || !this.conn) return;
+        await this.conn.sessionUpdate({
+          sessionId: params.sessionId,
+          update: {
+            sessionUpdate: "config_option_update",
+            configOptions: buildAgyConfigOptions(enriched, sess.modelId),
+            _meta: { [SEAM_AGY_CATALOG_REFRESH_META]: true },
+          },
+        });
+        this.catalogRefreshSignalled = true;
+      }).catch(() => {
+        // Blast radius: refuse only this metadata observation. The real turn,
+        // prompt-free selectable ids, and R4a's conservative window keep working.
       });
       const cid =
         sess.cascadeId ??
@@ -1560,6 +1601,7 @@ class AgyAgent implements Agent {
           modelId: sess.modelId,
         });
       }
+      await metadataLearning;
     } catch (err) {
       if (cancelAbort.signal.aborted && runRef.userCancelled) return { stopReason: "cancelled" };
       throw err;
@@ -2043,12 +2085,12 @@ function transformAgyText(text: string, cwd: string): string {
 // Model catalog
 // ---------------------------------------------------------------------------
 //
-// agy's local language server exposes the live model list via the Connect
-// endpoint /exa.language_server_pb.LanguageServerService/GetAvailableModels.
-// We spawn a transient `agy -p` once at profile creation, scrape the catalog,
-// and cache it for the life of the process. AGY's global settings model is read
-// only to initialize a session that has no persisted choice. Every turn then
-// receives that session's exact runtime display name through `--model`.
+// `agy models` supplies the prompt-free selectable ids. A real turn's already
+// running language server can later enrich those exact ids through
+// GetAvailableModels; enrichment never starts a process of its own. AGY's
+// global settings model is read only to initialize a session that has no
+// persisted choice. Every turn then receives that session's exact runtime
+// display name through `--model`.
 
 /**
  * What we are willing to assume a context window is when nothing is known.
@@ -2111,6 +2153,47 @@ export interface AgyCatalogEntry {
   supportsImages: boolean;
   /** Maximum context window size in tokens. */
   maxTokens: number;
+  /** Present only when rich fields came from this runtime's real-session LS. */
+  metadataObservedAt?: string;
+}
+
+function agyManifestModel(
+  configured: { modelId: string; name: string; contextLimit?: number },
+  row: AgyCatalogEntry | undefined,
+  runtimeVersion: string,
+  scopeRef: string,
+): ManifestCatalogModel {
+  const contextLimit = configured.contextLimit ?? (row?.maxTokens || undefined);
+  const evidence: CatalogModelEvidence[] = row?.metadataObservedAt ? [{
+    kind: "live-observation",
+    source: "agy language server",
+    observedAt: row.metadataObservedAt,
+    runtimeVersion,
+    adapterVersion: AGENT_ADAPTER_VERSION,
+    scopeRef,
+    resolvedModel: configured.modelId,
+    ...(row.maxTokens ? {
+      context: {
+        native: row.maxTokens,
+        maximum: row.maxTokens,
+        effective: row.maxTokens,
+        method: "GetAvailableModels",
+      },
+    } : {}),
+    note: `thinking ${row.supportsThinking ? "yes" : "no"}; images ${row.supportsImages ? "yes" : "no"}; recommended ${row.recommended ? "yes" : "no"}`,
+  }] : [];
+  return {
+    ...configured,
+    ...(contextLimit ? { contextLimit } : {}),
+    ...(evidence.length ? { evidence } : {}),
+    ...(row ? {
+      modalities: {
+        input: row.supportsImages ? ["text", "image"] : ["text"],
+        output: ["text"],
+      },
+      visionMode: row.supportsImages ? "tool" : "none",
+    } : {}),
+  };
 }
 
 /**
@@ -2220,6 +2303,11 @@ export function selectAgyTurnModel(opts: {
 }
 
 const catalogRowsPromises = new Map<string, Promise<AgyCatalogEntry[]>>();
+const sessionCatalogMetadata = new Map<string, {
+  rows: AgyCatalogEntry[];
+  observedAt: string;
+  fingerprint: string;
+}>();
 
 function catalogFallback(error: unknown): AgyCatalogEntry[] {
   // Missing metadata may fall back as before; a live leaked child may not.
@@ -2227,10 +2315,9 @@ function catalogFallback(error: unknown): AgyCatalogEntry[] {
   return [];
 }
 
-function getCatalogRows(runtime: AgyNativeRuntime): Promise<AgyCatalogEntry[]> {
+async function getCatalogRows(runtime: AgyNativeRuntime): Promise<AgyCatalogEntry[]> {
   const cached = catalogRowsPromises.get(runtime.identityKey);
-  if (cached) return cached;
-  const p = fetchAgyModelCatalog(runtime)
+  const base = cached ?? fetchAgyModelCatalog(runtime)
     .then((rows) => {
       // Don't PIN an empty result. A cold-start LS (or any transient empty
       // response) would otherwise poison this module-level cache for the whole
@@ -2250,8 +2337,10 @@ function getCatalogRows(runtime: AgyNativeRuntime): Promise<AgyCatalogEntry[]> {
       // A failed lifecycle is not an empty catalog; retain its classified error.
       throw err;
     });
-  catalogRowsPromises.set(runtime.identityKey, p);
-  return p;
+  if (!cached) catalogRowsPromises.set(runtime.identityKey, base);
+  const rows = await base;
+  const observed = sessionCatalogMetadata.get(runtime.identityKey);
+  return observed ? mergeAgyCatalogMetadata(rows, observed.rows, observed.observedAt) : rows;
 }
 
 /**
@@ -2263,8 +2352,9 @@ function getCatalogRows(runtime: AgyNativeRuntime): Promise<AgyCatalogEntry[]> {
  * model turns to learn a list of models, invisible at this call site.
  *
  * `agy models` answers both questions without a prompt, so the intersection is
- * gone: the ids it prints ARE the selectable ids. Rich metadata is enriched
- * opportunistically from the same prompt-free process and is never required.
+ * gone: the ids it prints ARE the selectable ids. A later real session may
+ * enrich those exact ids from its already-running language server; enrichment
+ * never starts a process or prompt of its own and is never required.
  */
 async function getCatalog(runtime: AgyNativeRuntime): Promise<AgyCatalogEntry[]> {
   return getCatalogRows(runtime);
@@ -2458,6 +2548,113 @@ interface AgyRawModel {
   supportsThinking?: boolean;
   supportsImages?: boolean;
   isInternal?: boolean;
+}
+
+/** Parse the rich catalog shape observed from a live AGY language server. */
+export function parseAgySessionCatalog(
+  json: { response?: { models?: Record<string, AgyRawModel> } },
+): AgyCatalogEntry[] {
+  const rows: AgyCatalogEntry[] = [];
+  for (const [modelId, raw] of Object.entries(json.response?.models ?? {})) {
+    if (raw.isInternal || !raw.displayName) continue;
+    const maxTokens = typeof raw.maxTokens === "number" &&
+      Number.isSafeInteger(raw.maxTokens) && raw.maxTokens > 0 &&
+      raw.maxTokens <= CATALOG_MAX_CONTEXT_TOKENS
+      ? raw.maxTokens
+      : 0;
+    rows.push({
+      modelId,
+      rawDisplayName: raw.displayName,
+      displayName: cleanAgyDisplayName(raw.displayName),
+      ctx: formatTokens(maxTokens),
+      recommended: raw.recommended === true,
+      supportsThinking: raw.supportsThinking === true,
+      supportsImages: raw.supportsImages === true,
+      maxTokens,
+    });
+  }
+  return rows;
+}
+
+/**
+ * Apply metadata only to exact ids already advertised by `agy models`.
+ * A language-server-only row is refused; the prompt-free selectable catalog
+ * and every unmatched row keep working with R4a's conservative assumptions.
+ */
+export function mergeAgyCatalogMetadata(
+  selectable: ReadonlyArray<AgyCatalogEntry>,
+  observed: ReadonlyArray<AgyCatalogEntry>,
+  observedAt?: string,
+): AgyCatalogEntry[] {
+  const byId = new Map(observed.map((row) => [row.modelId, row]));
+  return selectable.map((row) => {
+    const rich = byId.get(row.modelId);
+    if (!rich) return { ...row };
+    return {
+      ...row,
+      ctx: rich.ctx,
+      recommended: rich.recommended,
+      supportsThinking: rich.supportsThinking,
+      supportsImages: rich.supportsImages,
+      maxTokens: rich.maxTokens,
+      ...(observedAt ? { metadataObservedAt: observedAt } : {}),
+    };
+  });
+}
+
+const AGY_SESSION_CATALOG_DEADLINE_MS = 10_000;
+
+/**
+ * Learn rich metadata from the language server of an ALREADY REAL turn.
+ * This starts no process and sends no prompt. Failure refuses only enrichment;
+ * the active turn and the conservative prompt-free catalog keep working.
+ */
+async function learnAgyCatalogFromSession(
+  runtime: AgyNativeRuntime,
+  port: number,
+  signal: AbortSignal,
+): Promise<boolean> {
+  if (sessionCatalogMetadata.has(runtime.identityKey)) return true;
+  const selectable = await getCatalogRows(runtime);
+  const selectableIds = new Set(selectable.map((row) => row.modelId));
+  const url = `http://localhost:${port}/exa.language_server_pb.LanguageServerService/GetAvailableModels`;
+  const deadline = Date.now() + AGY_SESSION_CATALOG_DEADLINE_MS;
+  for (;;) {
+    signal.throwIfAborted();
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+      signal,
+    });
+    if (response.ok) {
+      const parsed = parseAgySessionCatalog(
+        (await readAgyJsonResponse(response)) as { response?: { models?: Record<string, AgyRawModel> } },
+      ).filter((row) => selectableIds.has(row.modelId));
+      if (parsed.length > 0) {
+        const fingerprint = JSON.stringify(parsed.map((row) => ({
+          modelId: row.modelId,
+          maxTokens: row.maxTokens,
+          recommended: row.recommended,
+          supportsThinking: row.supportsThinking,
+          supportsImages: row.supportsImages,
+        })).sort((a, b) => a.modelId.localeCompare(b.modelId)));
+        const prior = sessionCatalogMetadata.get(runtime.identityKey);
+        sessionCatalogMetadata.set(runtime.identityKey, prior?.fingerprint === fingerprint
+          ? prior
+          : { rows: parsed, observedAt: new Date().toISOString(), fingerprint });
+        return true;
+      }
+    } else {
+      const retryable = response.status === 400 || response.status === 500;
+      await response.body?.cancel();
+      // A definitive refusal cannot become metadata by polling. Refuse only
+      // enrichment; the real turn and conservative catalog keep working.
+      if (!retryable) return false;
+    }
+    if (Date.now() >= deadline) return false;
+    await delay(400, undefined, { signal });
+  }
 }
 
 /**

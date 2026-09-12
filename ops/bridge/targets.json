@@ -43,7 +43,7 @@
       "verifyAgent": "grok",
       "checkoutPath": "/Users/jessebulpitt/.seam/seam-acp",
       "entrypointPath": "/Users/jessebulpitt/.seam/seam-acp/packages/bridge/dist/index.js",
-      "pidFilePath": "/Users/jessebulpitt/.pm2/pids/seam-bridge-2.pid",
+      "pidFilePath": "/Users/jessebulpitt/.pm2/pids/seam-bridge-3.pid",
       "expectedUid": 501,
       "nodePath": "/Users/jessebulpitt/.seam/node/bin/node",
       "pm2ModulePath": "/Users/jessebulpitt/.seam/lib/node_modules/pm2",

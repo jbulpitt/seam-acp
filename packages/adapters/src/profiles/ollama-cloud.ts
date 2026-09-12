@@ -79,10 +79,32 @@ export function parseOllamaCloudUsage(raw: unknown): OllamaCloudUsageData {
  * Read Ollama Cloud quota from `ollama-usage --json`. Never throws: spawn,
  * timeout, exit, output-size, and JSON failures are returned as `ok: false`.
  */
+/**
+ * Read the Ollama Cloud allowance by spawning `ollama-usage --json`.
+ *
+ * #361: `signal` cancels the WORK, not merely the wait. This path bounds
+ * itself at {@link OLLAMA_USAGE_TIMEOUT_MS} (15s), comfortably inside the
+ * quota poller's 30s per-source deadline, so unlike Grok's it could not
+ * outlive the deadline on its own — but an aborted refresh still left the
+ * child running to its own timer, doing work whose answer nobody would read.
+ * The signal was handed to this source and dropped, and an
+ * accepted-but-unconsumed signal is worse than no bound, because the caller
+ * believes it has one.
+ *
+ * What an abort refuses: this one Ollama Cloud quota reading, which degrades
+ * to "we cannot currently tell you Ollama Cloud's quota" and leaves the
+ * registry's last-known-good value in place. What keeps working: every other
+ * agent's quota source, each with its own controller; and Ollama Cloud itself
+ * as an agent, because the only process killed here is this throwaway
+ * `ollama-usage` reader, never a model runtime.
+ */
 export async function fetchOllamaCloudUsage(
-  cliPath?: string
+  cliPath?: string,
+  signal?: AbortSignal
 ): Promise<OllamaCloudUsageData> {
   const cli = cliPath?.trim() || "ollama-usage";
+  // The cheapest cancellation is the one that never starts a process.
+  if (signal?.aborted) return failure("ollama-usage aborted before it started");
   return new Promise((resolve) => {
     let child: ReturnType<typeof spawn>;
     try {
@@ -103,8 +125,19 @@ export async function fetchOllamaCloudUsage(
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      if (onAbort) signal?.removeEventListener("abort", onAbort);
       resolve(data);
     };
+    // SIGKILL rather than SIGTERM, matching this path's own timeout below:
+    // `ollama-usage` is a throwaway reader with nothing to flush, and the
+    // point of consuming the signal is that the process actually stops.
+    const onAbort = signal
+      ? (): void => {
+          try { child.kill("SIGKILL"); } catch { /* already gone */ }
+          finish(failure("ollama-usage aborted"));
+        }
+      : undefined;
+    if (onAbort) signal?.addEventListener("abort", onAbort, { once: true });
     const timer = setTimeout(() => {
       try {
         child.kill("SIGKILL");

@@ -99,10 +99,13 @@ export function createAgentQuotaSources(
       return {
         ...identity,
         eventDriven: false,
-        fetch: async () =>
+        // #361: the signal has to reach the spawn. Dropping it here left an
+        // `ollama-usage` child running to its own 15s timer after this poller
+        // had already reported the refusal.
+        fetch: async (signal) =>
           mapOllamaCloudQuota(
             identity,
-            await fetchOllamaCloudUsage(opts.ollamaUsageCliPath)
+            await fetchOllamaCloudUsage(opts.ollamaUsageCliPath, signal)
           ),
       };
     }

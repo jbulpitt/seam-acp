@@ -60,6 +60,10 @@ input.on("line", (line) => {
   const request = JSON.parse(line);
   appendLog(request.method);
   if (mode === "hang") return;
+  // #361: answer `initialize` normally, then never answer billing. Holds the
+  // process alive across the initialize -> billing transition so an abort can
+  // be swept across that whole window.
+  if (mode === "initialize-then-hang" && request.method !== "initialize") return;
   if (mode === "malformed-protocol") {
     process.stdout.write(JSON.stringify({
       jsonrpc: "2.0",

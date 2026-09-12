@@ -285,6 +285,48 @@ describe("#342 a failed gate leaves the host exactly as it was", () => {
     expect(fs.existsSync(staged.executable)).toBe(false);
   });
 
+  it("has not written the pins yet at the moment verification runs", async () => {
+    // The ordering IS the safety property, and rollback hides it: reordering
+    // the pin write before the verify leaves the same end state, so only an
+    // observation made DURING the run can tell them apart. It matters because
+    // rollback does not run if the machine dies in that window — pins pointing
+    // at an unverified tree is the one genuinely bad state this can create.
+    const fixture = host();
+    const before = fs.readFileSync(fixture.envFile, "utf8");
+    let pinsAtVerifyTime = "";
+
+    await expect(applyAgyStaging(plan(fixture), {
+      io: noChown,
+      verify: async () => {
+        pinsAtVerifyTime = fs.readFileSync(fixture.envFile, "utf8");
+        throw new Error("ancestor is writable");
+      },
+    })).rejects.toThrow(/writable/);
+
+    expect(pinsAtVerifyTime).toBe(before);
+  });
+
+  it("refuses a service-user-owned 0555 ancestor, which the runtime check accepts", () => {
+    // The macbook-air hole, and the reason the gate is ownership rather than
+    // the runtime check. 0555 owned by the service user passes
+    // `accessSync(W_OK)` — the owner is simply one `chmod` away from
+    // undoing it, and staging into it would advertise provenance on a tree the
+    // host can swap back.
+    const fixture = host();
+    fs.mkdirSync(fixture.runtimeParent, { recursive: true });
+    fs.chmodSync(fixture.runtimeParent, 0o555);
+    try {
+      const staged = plan(fixture);
+      const entry = staged.ancestors.find((e) => e.path === fixture.runtimeParent)!;
+      expect(entry.passesRuntimeCheck).toBe(true);  // the bridge would accept it
+      expect(entry.rootOwned).toBe(false);          // but it is not durable
+      expect(() => assertAncestryIsRootOwned(staged)).toThrow(/must be root-owned/);
+      expect(fixture.pins().AGY_CLI_PATH).toBe(fixture.source);
+    } finally {
+      fs.chmodSync(fixture.runtimeParent, 0o755);
+    }
+  });
+
   it("refuses rather than guessing when there is no default model to carry", () => {
     const fixture = host({ AGY_DEFAULT_MODEL: "" });
     fs.writeFileSync(

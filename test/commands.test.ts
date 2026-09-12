@@ -134,6 +134,28 @@ describe("/seam — everyday surface", () => {
     expect(json.default_member_permissions ?? null).toBeNull();
   });
 
+  it("new exposes the config-set surface after its optional name", () => {
+    const json = seam();
+    const created = slot(json, "new");
+    expect((created?.options ?? []).map((o) => o.name)).toEqual([
+      "name",
+      "json",
+      "agent",
+      "model",
+      "effort",
+      "repo",
+      "role",
+      "permissions",
+      "card",
+      "gif",
+      "rebuild",
+    ]);
+    for (const name of ["agent", "model", "effort", "repo", "role", "permissions", "card", "gif"]) {
+      expect(created?.options?.find((o) => o.name === name)?.autocomplete, name).toBe(true);
+    }
+    expect(created?.options?.find((o) => o.name === "rebuild")?.type).toBe(BOOLEAN);
+  });
+
   it("config group has 18 leaves — rename and namer moved to /seamadmin naming", () => {
     const json = seam();
     const config = slot(json, "config");

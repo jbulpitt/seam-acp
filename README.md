@@ -161,7 +161,7 @@ All commands are restricted to users listed in `DISCORD_ALLOWED_USER_IDS` and (w
 
 | Command | What it does |
 |---|---|
-| `/seam new [name]` | Create a new public thread, add you to it, bind a session, and post the `/seam config edit` card — all in one step |
+| `/seam new [name] [json or config fields]` | Create a public thread already configured with the same fields as `/seam config set` (for example `agent:codex model:<id> effort:high repo:<repo> role:worker`). With no config fields, preserve the visual `/seam config edit` card flow. `rebuild:true` is refused because a new thread has no history. |
 | `/seam cancel` | Gracefully cancel this thread's in-flight turn |
 | `/seam cancel force:true` | Escalate: cancel, then force-kill this thread's turn if it's hung (old `/seam abort`) |
 | `/seam cancel scope:all` | Force-kill every active session bot-wide (old `/seam kill`). Privileged — not lock-exempt, not participant-allowed. |

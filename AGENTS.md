@@ -252,8 +252,10 @@ Discord has no aliases; old invocations simply disappear.
   `gif` `approve` `reset` `init` `detach` `tts` `show` `edit` `set` `audit`
   - `role` sets a thread's naming role. `rename` / `namer` are **no longer
     here** — they live under `/seamadmin naming`.
-  - `edit` is the **one** configuration surface (#157): `/seam new` and
-    `/seam config init` both post this card instead of running a setup wizard.
+  - `edit` is the visual configuration surface (#157): `/seam new` with no
+    config arguments and `/seam config init` both post this card instead of
+    running a setup wizard. `/seam new` may instead take the same JSON or named
+    fields as `config set` and creates the thread already configured (#294).
     There is no host selector on it — an agent id is `agentId@location`, so
     the **Agent** picker binds the host too and Host is shown read-only (#156).
     To pre-bind a host that is currently offline (it lists no agents), use

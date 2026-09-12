@@ -567,6 +567,40 @@ const STATUS_EDIT_DEBOUNCE_MS = 2500;
 const STATUS_HEARTBEAT_MS = 5000;
 const PLATFORM = "discord";
 
+const CONFIG_SET_FIELD_NAMES = [
+  "agent",
+  "model",
+  "effort",
+  "repo",
+  "role",
+  "permissions",
+  "card",
+  "gif",
+] as const;
+type ConfigSetFieldName = (typeof CONFIG_SET_FIELD_NAMES)[number];
+type ConfigSetRequest = {
+  json: string | null;
+  rebuild: boolean;
+  values: Record<ConfigSetFieldName, string | null>;
+  supplied: ConfigSetFieldName[];
+};
+type PreparedConfigSet =
+  | { kind: "json"; cfg: SessionConfigState }
+  | {
+      kind: "named";
+      parsedAgent?: ReturnType<typeof parseAgentAtLocation>;
+      nextAgentId: string;
+      nextLocation: string;
+      model: string;
+      pinnedEffort?: string;
+      requestedRole?: string;
+      permission?: string;
+      card?: string;
+      gif?: string;
+      resolvedRepo?: string;
+      restartRequested: boolean;
+    };
+
 /**
  * Last resort when a quarantine has no recorded cause (#333).
  *
@@ -1152,12 +1186,20 @@ export class Orchestrator {
    * `handleAutocompleteInteraction` (never a one-off branch there).
    */
   private catalogBinding(ctx: AutocompleteContext, selectedAgent?: string): CatalogBinding | null {
-    const raw = selectedAgent?.trim() || ctx.agentId;
+    const isNewThread = ctx.group === null && ctx.subcommand === "new";
+    const newParent = isNewThread ? (ctx.parentId ?? ctx.channelId) : undefined;
+    const inheritedNewAgent = isNewThread
+      ? resolveChannelPreset(this.config, newParent, undefined).agent?.value
+      : undefined;
+    const raw = selectedAgent?.trim() || inheritedNewAgent ||
+      (isNewThread ? this.config.DEFAULT_AGENT : ctx.agentId);
     if (!raw) return null;
     const parsed = parseAgentAtLocation(raw);
     const location = parsed.explicit
       ? parsed.location
-      : resolveThreadLocation(this.config, ctx.channelId);
+      : isNewThread
+        ? LOCAL_LOCATION
+        : resolveThreadLocation(this.config, ctx.channelId);
     return { agentId: parsed.agentId, location };
   }
 
@@ -1202,6 +1244,14 @@ export class Orchestrator {
   }
 
   private wireSlashAutocomplete(): void {
+    const registerConfigSurface = (
+      option: ConfigSetFieldName,
+      mode: "canonical" | "opaque",
+      responder: AutocompleteResponder
+    ) => {
+      this.autocomplete.register("config", "set", option, mode, responder);
+      this.autocomplete.register(null, "new", option, mode, responder);
+    };
     this.autocomplete.register("catalog", "refresh", "agent", "canonical", (ctx) =>
       labeledAutocompleteChoices(
         [
@@ -1232,7 +1282,7 @@ export class Orchestrator {
     };
     this.autocomplete.register("config", "agent", "id", "canonical", agentAtLocationResponder);
 
-    this.autocomplete.register("config", "set", "agent", "canonical", agentAtLocationResponder);
+    registerConfigSurface("agent", "canonical", agentAtLocationResponder);
 
     const repoResponder: AutocompleteResponder = async (ctx) => {
       try {
@@ -1247,11 +1297,15 @@ export class Orchestrator {
       }
     };
     this.autocomplete.register("config", "repo", "path", "canonical", repoResponder);
-    this.autocomplete.register("config", "set", "repo", "canonical", async (ctx) => {
+    const configSurfaceRepoResponder: AutocompleteResponder = async (ctx) => {
       try {
         const selected = ctx.optionValues?.agent?.trim();
         const parsed = selected ? parseAgentAtLocation(selected) : undefined;
-        const location = parsed?.explicit ? parsed.location : undefined;
+        const location = parsed?.explicit
+          ? parsed.location
+          : ctx.group === null && ctx.subcommand === "new"
+            ? LOCAL_LOCATION
+            : undefined;
         const dirs = await this.listHostWorkspacePaths(ctx.channelId, location);
         if (!dirs) return [];
         return labeledAutocompleteChoices(
@@ -1261,7 +1315,8 @@ export class Orchestrator {
       } catch {
         return [];
       }
-    });
+    };
+    registerConfigSurface("repo", "canonical", configSurfaceRepoResponder);
 
     this.autocomplete.register("config", "model", "id", "canonical", async (ctx) => {
       try {
@@ -1280,9 +1335,10 @@ export class Orchestrator {
       }
     });
 
-    this.autocomplete.register("config", "set", "model", "canonical", async (ctx) => {
+    const configSurfaceModelResponder: AutocompleteResponder = async (ctx) => {
       try {
-        const selectedAgent = ctx.optionValues?.agent?.trim() || ctx.agentId;
+        const selectedAgent = ctx.optionValues?.agent?.trim() ||
+          (ctx.group === null && ctx.subcommand === "new" ? undefined : ctx.agentId);
         const binding = this.catalogBinding(ctx, selectedAgent);
         if (!binding) return [];
         const models = this.modelCatalog.models(binding);
@@ -1296,11 +1352,13 @@ export class Orchestrator {
       } catch {
         return [];
       }
-    });
+    };
+    registerConfigSurface("model", "canonical", configSurfaceModelResponder);
 
-    this.autocomplete.register("config", "set", "effort", "canonical", (ctx) => {
+    const configSurfaceEffortResponder: AutocompleteResponder = (ctx) => {
       try {
-        const selectedAgent = ctx.optionValues?.agent?.trim() || ctx.agentId;
+        const selectedAgent = ctx.optionValues?.agent?.trim() ||
+          (ctx.group === null && ctx.subcommand === "new" ? undefined : ctx.agentId);
         const binding = this.catalogBinding(ctx, selectedAgent);
         const model = binding ? this.catalogModelForAutocomplete(ctx, binding) : null;
         const levels = binding && model ? this.modelCatalog.effortChoices(binding, model) : [];
@@ -1317,7 +1375,8 @@ export class Orchestrator {
       } catch {
         return [];
       }
-    });
+    };
+    registerConfigSurface("effort", "canonical", configSurfaceEffortResponder);
 
     this.autocomplete.register("config", "effort", "level", "canonical", (ctx) => {
       try {
@@ -1333,7 +1392,7 @@ export class Orchestrator {
       }
     });
 
-    this.autocomplete.register("config", "set", "role", "canonical", (ctx) =>
+    const configSurfaceRoleResponder: AutocompleteResponder = (ctx) =>
       labeledAutocompleteChoices(
         [
           { name: "Auto / none", value: "auto" },
@@ -1344,8 +1403,8 @@ export class Orchestrator {
           { name: "Planner", value: "planner" },
         ],
         ctx.focusedValue
-      )
-    );
+      );
+    registerConfigSurface("role", "canonical", configSurfaceRoleResponder);
     const fixedSetChoices: ReadonlyArray<{
       option: "permissions" | "card" | "gif";
       choices: ReadonlyArray<{ name: string; value: string }>;
@@ -1376,7 +1435,7 @@ export class Orchestrator {
       },
     ];
     for (const { option, choices } of fixedSetChoices) {
-      this.autocomplete.register("config", "set", option, "canonical", (ctx) =>
+      registerConfigSurface(option, "canonical", (ctx) =>
         labeledAutocompleteChoices(choices, ctx.focusedValue)
       );
     }
@@ -13344,18 +13403,98 @@ export class Orchestrator {
       await i.reply({ content: "No channel.", flags: MessageFlags.Ephemeral });
       return;
     }
+    const request = this.configSetRequest(i);
+    const configured = request.json !== null || request.supplied.length > 0;
+    if (request.rebuild) {
+      await i.reply({
+        content: "`rebuild:true` requires an existing thread with Discord history; `/seam new` does not clone history.",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
     await i.deferReply({ flags: MessageFlags.Ephemeral });
-    // createChildThread adds the invoking user to the new thread (mention
-    // fallback on failure) — that is the main reason people run this command,
-    // so it happens before anything that can fail.
-    const thread = await this.createChildThread(i.channelId, name, i.user.id);
 
-    // Auto-init: bind a session to the new thread and post the same config
-    // card `/seam config edit` uses (#157), so the user doesn't have to run
-    // `/seam config init` themselves. Reply BEFORE the card — Discord
-    // interaction tokens last 15 min and the draft outlives that.
+    let validated: { ok: true; prepared: PreparedConfigSet } | undefined;
+    if (configured) {
+      const invokingChannel = i.channel as
+        | { isThread?: () => boolean; parentId?: string | null }
+        | null
+        | undefined;
+      const intendedParentId = invokingChannel?.isThread?.()
+        ? (invokingChannel.parentId ?? i.channelId)
+        : i.channelId;
+      const previewChannel: ChannelRef = {
+        platform: PLATFORM,
+        id: `__seam-new-preview__:${randomUUID()}`,
+        parentId: intendedParentId,
+      };
+      const preview = this.router.previewSessionRecord({
+        platform: PLATFORM,
+        channelRef: previewChannel.id,
+        parentRef: intendedParentId,
+        cwd: this.config.REPOS_ROOT,
+      });
+      const result = await this.prepareConfigSet(preview, previewChannel, request);
+      if (!result.ok) {
+        await i.editReply(result.message);
+        return;
+      }
+      validated = result;
+    }
+
+    // All deterministic configuration checks have passed. From here on a
+    // Discord creation or persistence failure is reported with the thread link
+    // when one exists; a user-visible thread is never silently deleted.
+    let thread: ChannelRef;
+    try {
+      thread = await this.createChildThread(i.channelId, name, i.user.id);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.logger.warn({ err }, "/seam new thread creation failed");
+      await i.editReply(`Could not create thread: ${message}`);
+      return;
+    }
+
     try {
       const record = this.bindSessionToThread(thread);
+      if (validated) {
+        const applied = await this.applyPreparedConfigSet(
+          record,
+          thread,
+          request,
+          validated.prepared,
+          { id: i.user.id, name: i.user.displayName ?? i.user.username },
+          // A new row has no ACP runtime/session to retire. Applying once here
+          // prevents the create-then-config double-forge this command replaces.
+          { retireRuntime: false, applyName: false }
+        );
+        if (!applied.ok) {
+          const actual = this.store.get(record.id) ?? record;
+          let actualSummary = "session state unavailable";
+          try {
+            actualSummary = this.configSetSummary(this.router.describeConfig(actual));
+          } catch {
+            /* keep the narrower initialization error */
+          }
+          this.logger.warn(
+            { threadId: thread.id, error: applied.message },
+            "configured /seam new persistence failed"
+          );
+          await i.editReply(
+            `Created thread <#${thread.id}>, but configuration was not applied: ` +
+              `${applied.message}${applied.rollbackError} Actual: ${actualSummary}.`
+          );
+          return;
+        }
+        await this.applyThreadName(applied.record, { fresh: true });
+        await i.editReply(
+          `Created and configured thread <#${thread.id}>. Effective: ` +
+            `${this.configSetSummary(applied.effective)}.`
+        );
+        return;
+      }
+
+      // No config arguments preserves #157's visual editor workflow.
       await this.applyThreadName(record, { fresh: true });
       await i.editReply(`Created thread <#${thread.id}> and initialized it.`);
       const opened = await this.openConfigEditorCard(thread, i.user.id);
@@ -13370,8 +13509,11 @@ export class Orchestrator {
     } catch (err) {
       this.logger.warn({ err, threadId: thread.id }, "auto-init after /seam new failed");
       try {
-        await i.editReply(
-          `Created thread <#${thread.id}>. Run \`/seam config init\` there to begin.`
+        const detail = err instanceof Error ? err.message : String(err);
+        await i.editReply(configured
+          ? `Created thread <#${thread.id}>, but its session could not be initialized, so the ` +
+            `requested configuration was not confirmed: ${detail}. Run \`/seam config init\` there to recover.`
+          : `Created thread <#${thread.id}>. Run \`/seam config init\` there to begin.`
         );
       } catch {
         /* already replied */
@@ -15596,9 +15738,9 @@ export class Orchestrator {
 
   /**
    * Bind `channel` as a session and post the config-editor hub card into it,
-   * owned by `userId`. The single configuration surface (#90): `/seam config
-   * edit`, `/seam new`, and `/seam config init` (#157) all land here instead of
-   * running their own picker sequences.
+   * owned by `userId`. The visual configuration surface (#90): `/seam config
+   * edit`, no-argument `/seam new`, and `/seam config init` (#157) all land
+   * here instead of running their own picker sequences.
    *
    * Returns the drafted card, or `null` when the platform cannot render panels.
    */
@@ -19277,53 +19419,84 @@ export class Orchestrator {
     await i.editReply(note.trim() || "🏗️ Rebuild complete.");
   }
 
-  private async cmdConfigSet(
-    i: ChatInputCommandInteraction
-  ): Promise<void> {
-    const record = this.recordFromInteraction(i);
-    const channel = this.channelRefFromInteraction(i);
-    if (!record || !channel) {
-      await i.reply({ content: "Use inside a thread.", flags: MessageFlags.Ephemeral });
-      return;
-    }
-    const names = [
-      "agent",
-      "model",
-      "effort",
-      "repo",
-      "role",
-      "permissions",
-      "card",
-      "gif",
-    ] as const;
-    const json = i.options.getString("json");
-    const rebuild = i.options.getBoolean("rebuild") === true;
-    const values = Object.fromEntries(names.map((name) => [name, i.options.getString(name)])) as
-      Record<(typeof names)[number], string | null>;
-    const supplied = names.filter((name) => values[name] !== null);
-    if (json !== null && supplied.length > 0) {
-      await i.reply({
-        content: "Use either `json:` or named fields, not both.",
-        flags: MessageFlags.Ephemeral,
-      });
-      return;
-    }
-    if (json === null && supplied.length === 0 && !rebuild) {
-      await i.reply({
-        content: "Provide `json:` or at least one named field.",
-        flags: MessageFlags.Ephemeral,
-      });
-      return;
-    }
+  private configSetRequest(i: ChatInputCommandInteraction): ConfigSetRequest {
+    const values = Object.fromEntries(
+      CONFIG_SET_FIELD_NAMES.map((name) => [name, i.options.getString(name)])
+    ) as Record<ConfigSetFieldName, string | null>;
+    return {
+      json: i.options.getString("json"),
+      rebuild: i.options.getBoolean("rebuild") === true,
+      values,
+      supplied: CONFIG_SET_FIELD_NAMES.filter((name) => values[name] !== null),
+    };
+  }
 
-    // A repo lookup or runtime retirement can exceed Discord's three-second
-    // interaction deadline. Acknowledge before either one starts.
-    await i.deferReply({ flags: MessageFlags.Ephemeral });
-
-    if (json === null && supplied.length === 0 && rebuild) {
-      await this.replyConfigSetRebuild(i, record, channel);
-      return;
+  private configSetRequestError(request: ConfigSetRequest): string | null {
+    if (request.json !== null && request.supplied.length > 0) {
+      return "Use either `json:` or named fields, not both.";
     }
+    if (request.json === null && request.supplied.length === 0) {
+      return "Provide `json:` or at least one named field.";
+    }
+    return null;
+  }
+
+  private validateSessionConfigJson(cfg: SessionConfigState): string | null {
+    if (cfg.model !== undefined && (typeof cfg.model !== "string" || !cfg.model.trim())) {
+      return "`model` must be a non-empty id.";
+    }
+    if (
+      cfg.reasoningEffort !== undefined &&
+      (typeof cfg.reasoningEffort !== "string" || !cfg.reasoningEffort.trim())
+    ) {
+      return "`reasoningEffort` must be a non-empty level.";
+    }
+    if (cfg.role !== undefined && (typeof cfg.role !== "string" || cfg.role.trim().length > 64)) {
+      return "`role` must be a string of at most 64 characters.";
+    }
+    if (
+      cfg.permissionPolicy !== undefined &&
+      cfg.permissionPolicy !== "always" &&
+      cfg.permissionPolicy !== "ask" &&
+      cfg.permissionPolicy !== "deny"
+    ) {
+      return "`permissionPolicy` must be `always`, `ask`, or `deny`.";
+    }
+    if (cfg.statusCardStyle !== undefined && !parseStatusCardStyle(cfg.statusCardStyle)) {
+      return "`statusCardStyle` must be `full` or `simple`.";
+    }
+    if (cfg.simpleCardGif !== undefined && typeof cfg.simpleCardGif !== "boolean") {
+      return "`simpleCardGif` must be a boolean.";
+    }
+    if (cfg.disableThreadPrefix !== undefined && typeof cfg.disableThreadPrefix !== "boolean") {
+      return "`disableThreadPrefix` must be a boolean.";
+    }
+    if (cfg.sessionCwdExplicit !== undefined && typeof cfg.sessionCwdExplicit !== "boolean") {
+      return "`sessionCwdExplicit` must be a boolean.";
+    }
+    for (const key of ["availableTools", "excludedTools"] as const) {
+      const value = cfg[key];
+      if (value !== undefined && (!Array.isArray(value) || value.some((item) => typeof item !== "string"))) {
+        return `\`${key}\` must be an array of strings.`;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Side-effect-free validation shared by `/seam config set` and configured
+   * `/seam new`. The latter passes a preview record rooted at the destination
+   * parent, so an invalid request refuses only that requested creation; existing
+   * threads and every other agent capability remain available.
+   */
+  private async prepareConfigSet(
+    record: SessionRecord,
+    channel: ChannelRef,
+    request: ConfigSetRequest
+  ): Promise<{ ok: true; prepared: PreparedConfigSet } | { ok: false; message: string }> {
+    const { json, values, supplied } = request;
+    const requestError = this.configSetRequestError(request);
+    if (requestError) return { ok: false, message: requestError };
 
     if (json !== null) {
       let cfg: SessionConfigState;
@@ -19332,110 +19505,81 @@ export class Orchestrator {
         if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
           throw new Error("not an object");
         }
-        cfg = parsed as SessionConfigState;
+        cfg = { ...(parsed as SessionConfigState) };
       } catch (err) {
-        await i.editReply(`Invalid JSON: ${(err as Error).message}`);
-        return;
+        return { ok: false, message: `Invalid JSON: ${(err as Error).message}` };
       }
-      const jsonDescription = this.router.describeConfig(record);
-      if (!cfg.model) cfg.model = jsonDescription.model.value;
-      const jsonBinding = {
-        agentId: jsonDescription.agent.value,
-        location: jsonDescription.location.value,
-      };
+      const shapeError = this.validateSessionConfigJson(cfg);
+      if (shapeError) return { ok: false, message: `Invalid JSON: ${shapeError}` };
+      const description = this.router.describeConfig(record);
+      if (!cfg.model) cfg.model = description.model.value;
       try {
-        const selected = this.modelCatalog.resolve(jsonBinding, {
-          model: cfg.model,
-          effort: cfg.reasoningEffort,
-        });
+        const selected = this.modelCatalog.resolve(
+          { agentId: description.agent.value, location: description.location.value },
+          { model: cfg.model, effort: cfg.reasoningEffort }
+        );
         cfg.model = selected.normalized.model;
         cfg.reasoningEffort = selected.normalized.effort;
       } catch (err) {
-        await i.editReply(`Invalid catalog selection: ${err instanceof Error ? err.message : String(err)}`);
-        return;
+        return {
+          ok: false,
+          message: `Invalid catalog selection: ${err instanceof Error ? err.message : String(err)}`,
+        };
       }
-      try {
-        await this.router.invalidate(record.id);
-        this.persistConfig(this.store.get(record.id) ?? record, cfg);
-        await this.applyThreadName(this.store.get(record.id) ?? record);
-        const replaced = this.store.get(record.id) ?? record;
-        const rebuildNote = rebuild ? await this.configSetRebuildNote(replaced, channel) : "";
-        await i.editReply("Config replaced; next turn starts a fresh runtime." + rebuildNote);
-      } catch (err) {
-        this.logger.warn({ err, sessionId: record.id }, "JSON config replacement failed");
-        await i.editReply(
-          `Could not replace config: ${err instanceof Error ? err.message : String(err)}`
-        );
-      }
-      return;
+      return { ok: true, prepared: { kind: "json", cfg } };
     }
 
     const requestedAgent = values.agent?.trim();
     if (values.agent !== null && !requestedAgent) {
-      await i.editReply("`agent` must be a non-empty profile id.");
-      return;
+      return { ok: false, message: "`agent` must be a non-empty profile id." };
     }
     const parsedAgent = requestedAgent ? parseAgentAtLocation(requestedAgent) : undefined;
-    const before = this.store.get(record.id) ?? record;
-    const describedBefore = this.router.describeConfig(before);
+    const describedBefore = this.router.describeConfig(record);
     const nextAgentId = parsedAgent?.agentId ?? describedBefore.agent.value;
     const currentLocation = resolveThreadLocation(this.config, channel.id);
     const nextLocation = parsedAgent?.explicit ? parsedAgent.location : currentLocation;
     const parkedSelect = nextLocation === LOCAL_LOCATION
       ? this.parkedSelectRefusal(nextAgentId)
       : null;
-    if (parkedSelect) {
-      await i.editReply(parkedSelect);
-      return;
-    }
-    const profile = this.router.getProfile(nextAgentId, nextLocation);
-    if (!profile) {
-      await i.editReply(
-        this.refuseUnregisteredAgent(nextAgentId, `Unknown agent \`${nextAgentId}\`.`)
-      );
-      return;
+    if (parkedSelect) return { ok: false, message: parkedSelect };
+    if (!this.router.getProfile(nextAgentId, nextLocation)) {
+      return {
+        ok: false,
+        message: this.refuseUnregisteredAgent(nextAgentId, `Unknown agent \`${nextAgentId}\`.`),
+      };
     }
 
     const requestedModel = values.model?.trim();
     if (values.model !== null && !requestedModel) {
-      await i.editReply("`model` must be a non-empty id.");
-      return;
+      return { ok: false, message: "`model` must be a non-empty id." };
     }
     const requestedEffort = values.effort?.trim().toLowerCase();
     const clearEffort = requestedEffort === "default" || requestedEffort === "auto";
     if (values.effort !== null && !requestedEffort) {
-      await i.editReply("`effort` must be a level or `default`.");
-      return;
+      return { ok: false, message: "`effort` must be a level or `default`." };
     }
     const requestedRole = values.role?.trim();
     if (requestedRole && requestedRole.length > 64) {
-      await i.editReply("`role` must be at most 64 characters.");
-      return;
+      return { ok: false, message: "`role` must be at most 64 characters." };
     }
     const permission = values.permissions?.trim().toLowerCase();
     if (
       values.permissions !== null &&
       (!permission || (permission !== "always" && permission !== "ask" && permission !== "deny"))
     ) {
-      await i.editReply("`permissions` must be `always`, `ask`, or `deny`.");
-      return;
+      return { ok: false, message: "`permissions` must be `always`, `ask`, or `deny`." };
     }
     const card = values.card?.trim().toLowerCase();
     if (values.card !== null && (!card || (card !== "default" && !parseStatusCardStyle(card)))) {
-      await i.editReply("`card` must be `full`, `simple`, or `default`.");
-      return;
+      return { ok: false, message: "`card` must be `full`, `simple`, or `default`." };
     }
     const gif = values.gif?.trim().toLowerCase();
-    if (
-      values.gif !== null &&
-      (!gif || (gif !== "default" && parseSimpleCardGif(gif) === undefined))
-    ) {
-      await i.editReply("`gif` must be `on`, `off`, or `default`.");
-      return;
+    if (values.gif !== null && (!gif || (gif !== "default" && parseSimpleCardGif(gif) === undefined))) {
+      return { ok: false, message: "`gif` must be `on`, `off`, or `default`." };
     }
 
-    const candidateModel = requestedModel
-      ?? (nextAgentId !== describedBefore.agent.value
+    const candidateModel = requestedModel ??
+      (nextAgentId !== describedBefore.agent.value
         ? this.modelCatalog.model({ agentId: nextAgentId, location: nextLocation }, "default")?.id ?? "default"
         : describedBefore.model.value);
     const catalogModel = this.modelCatalog.model(
@@ -19443,11 +19587,12 @@ export class Orchestrator {
       candidateModel
     );
     if (!catalogModel) {
-      await i.editReply(
-        `Model \`${candidateModel}\` is unavailable in the cached catalog for ` +
-          `\`${nextAgentId}@${nextLocation}\`; refresh the catalog and retry.`
-      );
-      return;
+      return {
+        ok: false,
+        message:
+          `Model \`${candidateModel}\` is unavailable in the cached catalog for ` +
+          `\`${nextAgentId}@${nextLocation}\`; refresh the catalog and retry.`,
+      };
     }
     const effortChoices = catalogModel.effort.choices.map((choice) => choice.id);
     const pinnedEffort = values.effort !== null
@@ -19456,38 +19601,75 @@ export class Orchestrator {
           ? catalogModel.effort.selectionDefault
           : undefined);
     if (pinnedEffort && !effortChoices.includes(pinnedEffort)) {
-      await i.editReply(
-        `Effort \`${pinnedEffort}\` is not supported by \`${nextAgentId}/${catalogModel.id}\`. ` +
-          `Choose ${effortChoices.map((value) => `\`${value}\``).join(", ")}.`
-      );
-      return;
+      return {
+        ok: false,
+        message:
+          `Effort \`${pinnedEffort}\` is not supported by \`${nextAgentId}/${catalogModel.id}\`. ` +
+          `Choose ${effortChoices.map((value) => `\`${value}\``).join(", ")}.`,
+      };
     }
     let resolvedRepo: string | undefined;
     if (values.repo !== null) {
       const requestedRepo = values.repo?.trim();
-      if (!requestedRepo) {
-        await i.editReply("`repo` must be a non-empty path.");
-        return;
-      }
+      if (!requestedRepo) return { ok: false, message: "`repo` must be a non-empty path." };
       try {
         resolvedRepo = await this.resolveRequestedRepoPath(channel, requestedRepo, nextLocation);
       } catch (err) {
-        await i.editReply(`Invalid repo: ${err instanceof Error ? err.message : String(err)}`);
-        return;
+        return {
+          ok: false,
+          message: `Invalid repo: ${err instanceof Error ? err.message : String(err)}`,
+        };
       }
       if (isLocalLocation(nextLocation) && !isWithinRoot(resolvedRepo, this.config.REPOS_ROOT)) {
-        await i.editReply(
-          `Repo \`${resolvedRepo}\` is outside REPOS_ROOT (\`${this.config.REPOS_ROOT}\`).`
-        );
-        return;
+        return {
+          ok: false,
+          message: `Repo \`${resolvedRepo}\` is outside REPOS_ROOT (\`${this.config.REPOS_ROOT}\`).`,
+        };
       }
     }
+    return {
+      ok: true,
+      prepared: {
+        kind: "named",
+        parsedAgent,
+        nextAgentId,
+        nextLocation,
+        model: catalogModel.id,
+        ...(pinnedEffort !== undefined ? { pinnedEffort } : {}),
+        ...(requestedRole !== undefined ? { requestedRole } : {}),
+        ...(permission !== undefined ? { permission } : {}),
+        ...(card !== undefined ? { card } : {}),
+        ...(gif !== undefined ? { gif } : {}),
+        ...(resolvedRepo !== undefined ? { resolvedRepo } : {}),
+        restartRequested: supplied.some((name) =>
+          name === "agent" || name === "model" || name === "effort" || name === "repo"
+        ),
+      },
+    };
+  }
 
-    const restartRequested =
-      values.agent !== null ||
-      values.model !== null ||
-      values.effort !== null ||
-      values.repo !== null;
+  private configSetSummary(effective: ReturnType<SessionRouter["describeConfig"]>): string {
+    return (
+      `agent \`${effective.agent.value}\`, model \`${effective.model.value}\`, ` +
+      `effort \`${effective.effort.value ?? "default"}\`, repo ` +
+      `\`${this.repoDisplay(effective.cwd.value)}\`, role \`${effective.role.value ?? "auto"}\`, ` +
+      `permissions \`${effective.permission.value}\`, card \`${effective.statusCardStyle.value}\`, ` +
+      `gif \`${effective.simpleCardGif.value ? "on" : "off"}\``
+    );
+  }
+
+  /** Apply a previously validated request. New threads skip retirement: no ACP runtime exists yet. */
+  private async applyPreparedConfigSet(
+    record: SessionRecord,
+    channel: ChannelRef,
+    request: ConfigSetRequest,
+    prepared: PreparedConfigSet,
+    actor: { id: string; name: string },
+    opts: { retireRuntime: boolean; applyName: boolean }
+  ): Promise<
+    | { ok: true; record: SessionRecord; effective: ReturnType<SessionRouter["describeConfig"]>; restartRequested: boolean }
+    | { ok: false; message: string; rollbackError: string }
+  > {
     let sessionBefore: SessionRecord | undefined;
     let overlayBefore: unknown | undefined;
     let mutationStarted = false;
@@ -19498,121 +19680,101 @@ export class Orchestrator {
       return restored.ok ? "" : ` Overlay rollback also failed: ${restored.error}`;
     };
     try {
-      if (restartRequested) {
-        // Retire first, then take the authoritative row. Nothing awaits between
-        // this read and the single SQLite upsert, so a concurrent config write
-        // cannot be lost across the retirement window.
-        await this.router.invalidate(record.id, { clearAcpSession: false });
+      const restartRequested = prepared.kind === "json" || prepared.restartRequested;
+      if (opts.retireRuntime && restartRequested) {
+        if (prepared.kind === "named") {
+          await this.router.invalidate(record.id, { clearAcpSession: false });
+        } else {
+          await this.router.invalidate(record.id);
+        }
       }
       const live = this.store.get(record.id) ?? record;
-      const liveDescription = this.router.describeConfig(live);
-      const appliedAgentId = parsedAgent?.agentId ?? liveDescription.agent.value;
-      const storedAgentId = parsedAgent?.agentId ?? live.agentId;
-      const appliedProfile = this.router.getProfile(appliedAgentId, nextLocation);
-      if (!appliedProfile) {
-        await i.editReply(
-          this.refuseUnregisteredAgent(
-            appliedAgentId,
-            `Unknown agent \`${appliedAgentId}\`.`
-          )
-        );
-        return;
-      }
       sessionBefore = { ...live };
       overlayBefore = this.configMutation.readThreadPresetEntry(channel.id);
-      const cfg = this.store.readConfig(live);
-      const agentChanged = appliedAgentId !== liveDescription.agent.value;
-      const locationChanged = nextLocation !== liveDescription.location.value;
-      const model = catalogModel.id;
-      if (model !== undefined) cfg.model = model;
-      if (values.model !== null || agentChanged) delete cfg.lastContextUsage;
-      if (pinnedEffort !== undefined) cfg.reasoningEffort = pinnedEffort;
-      if (values.role !== null) {
-        if (!requestedRole || requestedRole.toLowerCase() === "auto") delete cfg.role;
-        else cfg.role = requestedRole;
-      }
-      if (values.permissions !== null) {
-        cfg.permissionPolicy = permission as PermissionPolicyMode;
-        delete cfg.autoApprovePermissions;
-      }
-      if (values.card !== null) {
-        if (!card || card === "default") delete cfg.statusCardStyle;
-        else cfg.statusCardStyle = card as StatusCardStyle;
-      }
-      if (values.gif !== null) {
-        if (!gif || gif === "default") delete cfg.simpleCardGif;
-        else cfg.simpleCardGif = parseSimpleCardGif(gif);
-      }
-      if (resolvedRepo !== undefined) cfg.sessionCwdExplicit = true;
-      const updated = {
-        ...live,
-        agentId: storedAgentId,
-        ...(resolvedRepo !== undefined ? { repoPath: resolvedRepo } : {}),
-        ...(agentChanged || locationChanged ? { acpSessionId: "" } : {}),
-        configJson: this.store.writeConfig(cfg),
-        updatedUtc: new Date().toISOString(),
-      };
-      mutationStarted = true;
-      this.store.upsert(updated);
 
-      const overlayChanges: {
-        agent?: string;
-        model?: string;
-        effort?: string | null;
-        location?: string;
-      } = {};
-      if (values.agent !== null) {
-        overlayChanges.agent = appliedAgentId;
-        if (model !== undefined) overlayChanges.model = model;
-        if (parsedAgent?.explicit) overlayChanges.location = nextLocation;
-      } else if (values.model !== null && model !== undefined) {
-        overlayChanges.model = model;
-      }
-      if (pinnedEffort !== undefined) overlayChanges.effort = pinnedEffort;
-      if (Object.keys(overlayChanges).length > 0) {
-        const overlaid = this.configMutation.applyThreadOverlay({
-          threadId: channel.id,
-          ...(channel.parentId ? { parentRef: channel.parentId } : {}),
-          changes: overlayChanges,
-          actor: {
-            id: i.user.id,
-            name: i.user.displayName ?? i.user.username,
-          },
-        });
-        if (!overlaid.ok) throw new Error(overlaid.error);
+      if (prepared.kind === "json") {
+        mutationStarted = true;
+        this.persistConfig(live, prepared.cfg);
+      } else {
+        const liveDescription = this.router.describeConfig(live);
+        const appliedAgentId = prepared.parsedAgent?.agentId ?? liveDescription.agent.value;
+        const storedAgentId = prepared.parsedAgent?.agentId ?? live.agentId;
+        if (!this.router.getProfile(appliedAgentId, prepared.nextLocation)) {
+          throw new Error(this.refuseUnregisteredAgent(appliedAgentId, `Unknown agent \`${appliedAgentId}\`.`));
+        }
+        const cfg = this.store.readConfig(live);
+        const agentChanged = appliedAgentId !== liveDescription.agent.value;
+        const locationChanged = prepared.nextLocation !== liveDescription.location.value;
+        cfg.model = prepared.model;
+        if (request.values.model !== null || agentChanged) delete cfg.lastContextUsage;
+        if (prepared.pinnedEffort !== undefined) cfg.reasoningEffort = prepared.pinnedEffort;
+        if (request.values.role !== null) {
+          if (!prepared.requestedRole || prepared.requestedRole.toLowerCase() === "auto") delete cfg.role;
+          else cfg.role = prepared.requestedRole;
+        }
+        if (request.values.permissions !== null) {
+          cfg.permissionPolicy = prepared.permission as PermissionPolicyMode;
+          delete cfg.autoApprovePermissions;
+        }
+        if (request.values.card !== null) {
+          if (!prepared.card || prepared.card === "default") delete cfg.statusCardStyle;
+          else cfg.statusCardStyle = prepared.card as StatusCardStyle;
+        }
+        if (request.values.gif !== null) {
+          if (!prepared.gif || prepared.gif === "default") delete cfg.simpleCardGif;
+          else cfg.simpleCardGif = parseSimpleCardGif(prepared.gif);
+        }
+        if (prepared.resolvedRepo !== undefined) cfg.sessionCwdExplicit = true;
+        const updated: SessionRecord = {
+          ...live,
+          agentId: storedAgentId,
+          ...(prepared.resolvedRepo !== undefined ? { repoPath: prepared.resolvedRepo } : {}),
+          ...(agentChanged || locationChanged ? { acpSessionId: "" } : {}),
+          configJson: this.store.writeConfig(cfg),
+          updatedUtc: new Date().toISOString(),
+        };
+        mutationStarted = true;
+        this.store.upsert(updated);
+
+        const overlayChanges: { agent?: string; model?: string; effort?: string | null; location?: string } = {};
+        if (request.values.agent !== null) {
+          overlayChanges.agent = appliedAgentId;
+          overlayChanges.model = prepared.model;
+          if (prepared.parsedAgent?.explicit) overlayChanges.location = prepared.nextLocation;
+        } else if (request.values.model !== null) {
+          overlayChanges.model = prepared.model;
+        }
+        if (prepared.pinnedEffort !== undefined) overlayChanges.effort = prepared.pinnedEffort;
+        if (Object.keys(overlayChanges).length > 0) {
+          const overlaid = this.configMutation.applyThreadOverlay({
+            threadId: channel.id,
+            ...(channel.parentId ? { parentRef: channel.parentId } : {}),
+            changes: overlayChanges,
+            actor,
+          });
+          if (!overlaid.ok) throw new Error(overlaid.error);
+        }
       }
 
-      const committed = this.store.get(record.id) ?? updated;
+      const committed = this.store.get(record.id) ?? record;
       const effective = this.router.describeConfig(committed);
-      const mismatch =
-        (values.agent !== null && effective.agent.value !== appliedAgentId) ||
-        ((values.model !== null || agentChanged) &&
-          model !== undefined &&
-          effective.model.value !== model) ||
-        (pinnedEffort !== undefined && effective.effort.value !== pinnedEffort) ||
-        (parsedAgent?.explicit === true && effective.location.value !== nextLocation);
-      if (mismatch) {
-        throw new Error("the effective agent/model/effort/location did not match the requested values");
+      if (prepared.kind === "named") {
+        const mismatch =
+          (request.values.agent !== null && effective.agent.value !== prepared.nextAgentId) ||
+          ((request.values.model !== null || prepared.nextAgentId !== this.router.describeConfig(sessionBefore).agent.value) &&
+            effective.model.value !== prepared.model) ||
+          (prepared.pinnedEffort !== undefined && effective.effort.value !== prepared.pinnedEffort) ||
+          (prepared.parsedAgent?.explicit === true && effective.location.value !== prepared.nextLocation);
+        if (mismatch) {
+          throw new Error("the effective agent/model/effort/location did not match the requested values");
+        }
+        if (prepared.parsedAgent?.explicit) {
+          bindSessionLocation(this.bridgeHub, committed.id, prepared.nextLocation);
+        }
       }
-      if (parsedAgent?.explicit) bindSessionLocation(this.bridgeHub, committed.id, nextLocation);
-      // The durable session + overlay commit is complete. Presentation failures
-      // after this point must never roll a successfully applied config back.
       mutationStarted = false;
-      await this.applyThreadName(this.store.get(record.id) ?? updated);
-
-      const changed = supplied.map((name) => `\`${name}\``).join(", ");
-      const liveAfter = this.store.get(record.id) ?? updated;
-      const rebuildNote = rebuild ? await this.configSetRebuildNote(liveAfter, channel) : "";
-      await i.editReply(
-        `Updated ${changed}. Effective: agent \`${effective.agent.value}\`, model ` +
-          `\`${effective.model.value}\`, effort \`${effective.effort.value ?? "default"}\`, ` +
-          `repo \`${this.repoDisplay(effective.cwd.value)}\`, role ` +
-          `\`${effective.role.value ?? "auto"}\`, permissions \`${effective.permission.value}\`, ` +
-          `card \`${effective.statusCardStyle.value}\`, gif ` +
-          `\`${effective.simpleCardGif.value ? "on" : "off"}\`.` +
-          (restartRequested ? " Next turn uses the new runtime configuration." : "") +
-          rebuildNote
-      );
+      if (opts.applyName) await this.applyThreadName(committed);
+      return { ok: true, record: committed, effective, restartRequested };
     } catch (err) {
       let rollbackError = "";
       try {
@@ -19622,11 +19784,75 @@ export class Orchestrator {
           rollbackFailure instanceof Error ? rollbackFailure.message : String(rollbackFailure)
         }`;
       }
-      this.logger.warn({ err, sessionId: record.id }, "bulk config set failed");
-      await i.editReply(
-        `Could not update config: ${err instanceof Error ? err.message : String(err)}${rollbackError}`
-      );
+      return {
+        ok: false,
+        message: err instanceof Error ? err.message : String(err),
+        rollbackError,
+      };
     }
+  }
+
+  private async cmdConfigSet(
+    i: ChatInputCommandInteraction
+  ): Promise<void> {
+    const record = this.recordFromInteraction(i);
+    const channel = this.channelRefFromInteraction(i);
+    if (!record || !channel) {
+      await i.reply({ content: "Use inside a thread.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const request = this.configSetRequest(i);
+    const requestError = this.configSetRequestError(request);
+    if (requestError && !request.rebuild) {
+      await i.reply({
+        content: requestError,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
+    // A repo lookup or runtime retirement can exceed Discord's three-second
+    // interaction deadline. Acknowledge before either one starts.
+    await i.deferReply({ flags: MessageFlags.Ephemeral });
+
+    if (request.json === null && request.supplied.length === 0 && request.rebuild) {
+      await this.replyConfigSetRebuild(i, record, channel);
+      return;
+    }
+    const validated = await this.prepareConfigSet(record, channel, request);
+    if (!validated.ok) {
+      await i.editReply(validated.message);
+      return;
+    }
+    const applied = await this.applyPreparedConfigSet(
+      record,
+      channel,
+      request,
+      validated.prepared,
+      { id: i.user.id, name: i.user.displayName ?? i.user.username },
+      { retireRuntime: true, applyName: true }
+    );
+    if (!applied.ok) {
+      this.logger.warn({ sessionId: record.id, error: applied.message }, "bulk config set failed");
+      await i.editReply(
+        `${validated.prepared.kind === "json" ? "Could not replace config" : "Could not update config"}: ` +
+          `${applied.message}${applied.rollbackError}`
+      );
+      return;
+    }
+    const rebuildNote = request.rebuild
+      ? await this.configSetRebuildNote(applied.record, channel)
+      : "";
+    if (validated.prepared.kind === "json") {
+      await i.editReply("Config replaced; next turn starts a fresh runtime." + rebuildNote);
+      return;
+    }
+    const changed = request.supplied.map((name) => `\`${name}\``).join(", ");
+    await i.editReply(
+      `Updated ${changed}. Effective: ${this.configSetSummary(applied.effective)}.` +
+        (applied.restartRequested ? " Next turn uses the new runtime configuration." : "") +
+        rebuildNote
+    );
   }
 
   private async cmdRepos(i: ChatInputCommandInteraction): Promise<void> {

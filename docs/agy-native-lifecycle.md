@@ -1,4 +1,4 @@
-# Native AGY lifecycle (R5)
+# Native AGY lifecycle and persistence (R5/R7)
 
 Native `agy` remains primary; optional `agy-package` is unchanged. R2's reduced
 provenance and descriptor-bound launch are retained, not replaced by a second
@@ -42,6 +42,45 @@ data and ACP mappings are not deleted by cancellation or disposal.
 All timers/listeners/readers created by the turn are released at completion.
 Local filesystem work and ACP notification delivery remain cooperative IO; this
 does not claim JavaScript can forcibly cancel an arbitrary uncooperative promise.
+
+## Durable session ownership (R7)
+
+`agy-sessions.json` is the native adapter's ownership record for ACP session
+ids. It is a versioned document whose rows bind one ACP id to the native
+backend, cascade id (once a first prompt creates one), replay high-water mark,
+cwd, canonical model id and update timestamp. It contains no credentials. The
+pre-R7 plain map and string rows remain readable and are normalized by the
+first successful load; an unknown schema/backend or malformed row is never
+guessed.
+
+- A new ACP session id is returned only after its initial model/cwd row is
+  durable. Core can therefore record an orphaned native row if its later
+  `seam.db` transaction fails, but it cannot record an id that the adapter never
+  owned. Conversely, loading a `seam.db` id absent from this map fails loudly;
+  it never allocates a replacement conversation under the old id.
+- Mutations serialize through one process-wide queue and one same-host lock.
+  Each commit writes a mode-0600 file in the destination directory, fsyncs it,
+  atomically renames it over the prior generation, and fsyncs the directory.
+  A crash exposes either the complete old generation or the complete new one,
+  never a truncated merge. A dead lock owner may be recovered; a live owner is
+  not bypassed.
+- Invalid input is copied once to a hash-named quarantine file while the sole
+  original remains untouched. The affected persistence operation is refused;
+  loaded sessions and other adapters/bindings keep working.
+- Conversation binding and replay progress are committed before that state is
+  exposed as resumable. If a commit fails, only that ACP session is retired
+  from this adapter instance and the named persistence error is returned.
+  Other sessions remain usable.
+- ACP `list`, `resume`, `close` and `delete` are advertised because this adapter
+  now honors them. Resume reattaches the saved cascade without replaying a
+  prompt. Close/cancel release local execution resources but retain the durable
+  conversation; both are idempotent. Delete first removes the exact owned map
+  row, then cleans only a UUID-named provider conversation/brain path. An
+  unknown or malformed identity is refused rather than interpreted as a path.
+
+These boundaries preserve #250 continuation: cancellation and close do not
+delete or replay a conversation, while deletion is a separate explicit owner
+operation.
 
 ## Necessity audit (#307)
 
@@ -134,7 +173,8 @@ if this posture changes without that decision being revisited.
 - R3 (#259): session-local model selection/global settings.
 - R4 (#260): native catalog authority, discovery redesign and removal of
   throwaway inference probes. No such live probe was run for R5 testing.
-- R6/R7: translation/replay refactoring and restart orchestration.
+- R6 (#262): translation/replay refactoring. R7 (#263) persistence and explicit
+  lifecycle operations are documented above.
 - R8 (#264): MCP/helper factory parity; package-backed helpers are not silently
   moved to native here.
 - R9 (#265): deployment/canary rollout. Nothing is deployed by this change.

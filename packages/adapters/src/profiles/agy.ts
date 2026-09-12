@@ -39,16 +39,24 @@ import {
   type AuthenticateRequest,
   type AuthenticateResponse,
   type CancelNotification,
+  type CloseSessionRequest,
+  type CloseSessionResponse,
   type ContentBlock,
+  type DeleteSessionRequest,
+  type DeleteSessionResponse,
   type InitializeRequest,
   type InitializeResponse,
   type LoadSessionRequest,
   type LoadSessionResponse,
+  type ListSessionsRequest,
+  type ListSessionsResponse,
   type McpServer,
   type NewSessionRequest,
   type NewSessionResponse,
   type PromptRequest,
   type PromptResponse,
+  type ResumeSessionRequest,
+  type ResumeSessionResponse,
   type SessionConfigOption,
   type SetSessionConfigOptionRequest,
   type SetSessionConfigOptionResponse,
@@ -76,6 +84,12 @@ import {
   type AgyStep,
 } from "../agy-stream.js";
 import { STAGING_ROOT } from "../attachment-staging.js";
+import {
+  AGY_SESSION_BACKEND,
+  AgySessionStore,
+  AgySessionStoreError,
+  type AgyPersistedSession,
+} from "../agy-session-store.js";
 
 const AGY_HOME = path.join(process.env.HOME ?? "/root", ".gemini/antigravity-cli");
 const CONVERSATION_DIR = path.join(AGY_HOME, "conversations");
@@ -218,71 +232,6 @@ async function newSpawnLogPath(): Promise<string> {
 const LEGACY_MAPPING_FILE = path.join(AGY_HOME, "seam_sessions.json");
 
 /**
- * On-disk session record. `maxStepIndex` is the highest cascade step idx we've
- * already emitted to the ACP client — used to skip the LS's history replay on
- * subscribe. Anything ≤ this we've already shown the user.
- */
-interface PersistedSession {
-  cascadeId?: string;
-  maxStepIndex: number;
-  cwd?: string;
-  /** Canonical id from the exact native catalog used for every resumed turn. */
-  modelId?: string;
-}
-
-type SessionMapping = Record<string, PersistedSession | string>;
-
-const mappingWriteTails = new Map<string, Promise<void>>();
-
-/**
- * Serialize read-modify-write operations for one mapping file in this process.
- * Without this queue, two native ACP sessions selecting models concurrently can
- * each read the old file and the last writer silently deletes the other row.
- */
-async function mutateSessionMapping(
-  file: string,
-  mutate: (mapping: SessionMapping) => void,
-): Promise<void> {
-  const previous = mappingWriteTails.get(file) ?? Promise.resolve();
-  const current = previous.catch(() => {}).then(async () => {
-    let mapping: SessionMapping = {};
-    try {
-      mapping = JSON.parse(await fs.readFile(file, "utf8")) as SessionMapping;
-    } catch { /* fresh file */ }
-    mutate(mapping);
-    const dir = path.dirname(file);
-    await fs.mkdir(dir, { recursive: true });
-    // The temporary file must share the target directory: a cross-filesystem
-    // rename is not atomic, so a crash could expose a truncated mapping.
-    const temp = path.join(
-      dir,
-      `.${path.basename(file)}.${process.pid}.${randomUUID()}.tmp`,
-    );
-    try {
-      await fs.writeFile(temp, JSON.stringify(mapping, null, 2) + "\n", {
-        encoding: "utf8",
-        flag: "wx",
-        mode: 0o600,
-      });
-      await fs.rename(temp, file);
-    } catch (err) {
-      // A failed write/rename must not leave abandoned session mappings that
-      // a later recovery or operator could mistake for durable state.
-      await fs.rm(temp, { force: true }).catch(() => {});
-      throw err;
-    }
-  });
-  mappingWriteTails.set(file, current);
-  try {
-    await current;
-  } finally {
-    // Keep a newer queued mutation registered; deleting it here would allow a
-    // third write to bypass the still-running second write and lose its row.
-    if (mappingWriteTails.get(file) === current) mappingWriteTails.delete(file);
-  }
-}
-
-/**
  * Highest step index recorded in a cascade's conversation DB, or -1 if it can't
  * be read. Used to seed the replay high-water mark for legacy mapping entries
  * that pre-date step-index tracking: skip the already-recorded history but
@@ -306,78 +255,32 @@ function conversationMaxStepIndex(cascadeId: string): number {
   }
 }
 
-async function loadPersistedSession(
-  file: string,
-  sessionId: string,
-): Promise<PersistedSession | undefined> {
-  for (const candidate of [file, LEGACY_MAPPING_FILE]) {
-    try {
-      const data = await fs.readFile(candidate, "utf8");
-      const mapping = JSON.parse(data) as SessionMapping;
-      const entry = mapping[sessionId];
-      if (!entry) continue;
-      // Old format stored just the cascadeId as a string, pre-dating step-index
-      // tracking. Seed the high-water mark from the conversation DB's current
-      // max idx: skip the LS's replay of already-recorded history, but still
-      // deliver new steps. (The previous Number.MAX_SAFE_INTEGER pin skipped
-      // EVERYTHING forever, so replies were never delivered — a silent
-      // empty-response trap if a legacy entry was ever loaded.)
-      if (typeof entry === "string") {
-        return { cascadeId: entry, maxStepIndex: conversationMaxStepIndex(entry) };
-      }
-      return entry;
-    } catch { /* try next */ }
+function ownedCascadeIdForDeletion(value: string | undefined): string | undefined {
+  if (value === undefined) return undefined;
+  // Provider conversation ids observed in native logs are UUIDs. Refuse only
+  // deletion of a malformed/unowned id; the mapping, other sessions and the
+  // adapter remain intact instead of interpreting persisted text as a path.
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value)) {
+    throw new AgySessionStoreError(
+      "invalid",
+      "AGY session conversation id is not an owned UUID",
+    );
   }
-  return undefined;
+  return value;
 }
 
-async function savePersistedSession(
-  file: string,
-  sessionId: string,
-  entry: PersistedSession,
-): Promise<void> {
-  try {
-    await savePersistedSessionStrict(file, sessionId, entry);
-  } catch (err) {
-    if (process.env.AGY_PROFILE_DEBUG) {
-      // eslint-disable-next-line no-console
-      console.error("[agy] failed to save session mapping");
-    }
+async function deleteNativeSessionArtifacts(cascadeId: string | undefined): Promise<void> {
+  const ownedId = ownedCascadeIdForDeletion(cascadeId);
+  if (!ownedId) return;
+  for (const ext of [".db", ".pb"]) {
+    await fs.unlink(path.join(CONVERSATION_DIR, `${ownedId}${ext}`)).catch(() => {});
   }
+  await fs.rm(path.join(AGY_HOME, "brain", ownedId), {
+    recursive: true,
+    force: true,
+  }).catch(() => {});
 }
 
-/**
- * Selection commits must report mapping write failures to the ACP caller.
- * If this throws, the in-memory session is left unchanged; otherwise a failed
- * disk write could make the current process use a model that resume forgets.
- */
-async function savePersistedSessionStrict(
-  file: string,
-  sessionId: string,
-  entry: PersistedSession,
-): Promise<void> {
-  await mutateSessionMapping(file, (mapping) => {
-    mapping[sessionId] = entry;
-  });
-}
-
-async function clearPersistedSession(
-  file: string,
-  sessionId: string,
-): Promise<void> {
-  try {
-    const exists = await fs.access(file).then(() => true).catch(() => false);
-    if (!exists) return;
-    await mutateSessionMapping(file, (mapping) => {
-      delete mapping[sessionId];
-    });
-  } catch (err) {
-    if (process.env.AGY_PROFILE_DEBUG) {
-      // eslint-disable-next-line no-console
-      console.error("[agy] failed to clear session mapping");
-    }
-  }
-}
 
 export interface AgyNativeCatalogScopeOptions {
   credentialScope?: string;
@@ -456,6 +359,10 @@ export function makeAgyProfile(opts: {
   const mappingFile = opts.dataDir
     ? path.join(opts.dataDir, "agy-sessions.json")
     : LEGACY_MAPPING_FILE;
+  const sessionStore = new AgySessionStore(
+    mappingFile,
+    mappingFile === LEGACY_MAPPING_FILE ? undefined : LEGACY_MAPPING_FILE,
+  );
   return asLocalAdapter({
     id: "agy",
     displayName: "Antigravity",
@@ -513,7 +420,7 @@ export function makeAgyProfile(opts: {
     spawn() {
       return makeFakeAgyProcess(
         runtime,
-        mappingFile,
+        sessionStore,
         defaultModel,
         opts.printTimeoutSeconds,
         opts.mcpServers ?? [],
@@ -527,10 +434,7 @@ export function makeAgyProfile(opts: {
     sessionManager: {
       async listSessions(cwd: string): Promise<SessionSummary[]> {
         try {
-          const fileExists = await fs.access(mappingFile).then(() => true).catch(() => false);
-          if (!fileExists) return [];
-          const data = await fs.readFile(mappingFile, "utf8");
-          const mapping = JSON.parse(data) as SessionMapping;
+          const mapping = await sessionStore.list();
           const summaries: SessionSummary[] = [];
 
           // Query seam.db as a fallback/source of truth for session directories
@@ -553,17 +457,12 @@ export function makeAgyProfile(opts: {
             // ignore database lookup errors
           }
 
-          for (const sessionId of Object.keys(mapping)) {
-            const entry = mapping[sessionId];
+          for (const [sessionId, entry] of Object.entries(mapping)) {
             let cascadeId: string | undefined;
             let entryCwd: string | undefined;
 
-            if (typeof entry === "string") {
-              cascadeId = entry;
-            } else if (entry && typeof entry === "object") {
-              cascadeId = entry.cascadeId;
-              entryCwd = entry.cwd;
-            }
+            cascadeId = entry.cascadeId;
+            entryCwd = entry.cwd;
 
             if (!cascadeId) continue;
 
@@ -656,34 +555,27 @@ export function makeAgyProfile(opts: {
           }
 
           return summaries.sort((a, b) => (b.lastActivityAt ?? 0) - (a.lastActivityAt ?? 0));
-        } catch {
+        } catch (error) {
+          // An unreadable persistence map is an ownership failure, not an
+          // empty history. Refuse only this AGY listing and keep the adapter's
+          // already-loaded sessions plus every other binding available.
+          if (error instanceof AgySessionStoreError) throw error;
           return [];
         }
       },
 
       async cloneSession(cwd: string, oldSessionId: string, newSessionId: string): Promise<void> {
-        const fileExists = await fs.access(mappingFile).then(() => true).catch(() => false);
-        if (!fileExists) throw new Error("No sessions found to clone");
-        const data = await fs.readFile(mappingFile, "utf8");
-        const mapping = JSON.parse(data) as SessionMapping;
-
-        const oldEntry = mapping[oldSessionId];
+        const oldEntry = await sessionStore.get(oldSessionId);
         if (!oldEntry) throw new Error(`Old session ${oldSessionId} not found in mapping`);
 
-        let oldCascadeId: string | undefined;
-        let oldMaxStepIndex = -1;
-        let oldModelId: string | undefined;
-        if (typeof oldEntry === "string") {
-          oldCascadeId = oldEntry;
-        } else {
-          oldCascadeId = oldEntry.cascadeId;
-          oldMaxStepIndex = oldEntry.maxStepIndex;
-          oldModelId = oldEntry.modelId;
-        }
+        const oldCascadeId = oldEntry.cascadeId;
+        const oldMaxStepIndex = oldEntry.maxStepIndex;
+        const oldModelId = oldEntry.modelId;
 
         // A model-only row exists before the first prompt but has no native
         // conversation to clone; deleting this guard would invent file paths.
         if (!oldCascadeId) throw new Error(`Session ${oldSessionId} has no conversation to clone`);
+        if (!oldModelId) throw new Error(`Session ${oldSessionId} has no model to clone`);
 
         const newCascadeId = randomUUID();
 
@@ -711,68 +603,31 @@ export function makeAgyProfile(opts: {
         }
 
         // 3. Update mapping
-        await savePersistedSessionStrict(mappingFile, newSessionId, {
+        await sessionStore.put(newSessionId, {
           cascadeId: newCascadeId,
           maxStepIndex: oldMaxStepIndex,
           cwd,
-          ...(oldModelId ? { modelId: oldModelId } : {}),
+          modelId: oldModelId,
         });
       },
 
       async deleteSession(cwd: string, sessionId: string): Promise<void> {
-        const fileExists = await fs.access(mappingFile).then(() => true).catch(() => false);
-        if (!fileExists) return;
-        const data = await fs.readFile(mappingFile, "utf8");
-        const mapping = JSON.parse(data) as SessionMapping;
-
-        const entry = mapping[sessionId];
+        // Validate path ownership inside the atomic delete, then remove durable
+        // ownership before artifacts. Cleanup failure can leave an orphan but
+        // cannot leave a mapping aimed at missing bytes.
+        const entry = await sessionStore.delete(
+          sessionId,
+          (record) => { ownedCascadeIdForDeletion(record.cascadeId); },
+        );
         if (!entry) return;
-
-        let cascadeId: string | undefined;
-        if (typeof entry === "string") {
-          cascadeId = entry;
-        } else {
-          cascadeId = entry.cascadeId;
-        }
-
-        // 1. Delete the conversation file(s) (.db current, .pb legacy).
-        if (cascadeId) {
-          for (const ext of [".db", ".pb"]) {
-            try {
-              await fs.unlink(path.join(CONVERSATION_DIR, `${cascadeId}${ext}`));
-            } catch {
-              // ignore
-            }
-          }
-
-          // 2. Delete brain folder
-          const brainFolder = path.join(AGY_HOME, "brain", cascadeId);
-          try {
-            await fs.rm(brainFolder, { recursive: true, force: true });
-          } catch {
-            // ignore
-          }
-        }
-
-        // 3. Delete from mapping
-        await clearPersistedSession(mappingFile, sessionId);
+        await deleteNativeSessionArtifacts(entry.cascadeId);
       },
 
       async getTranscript(cwd: string, sessionId: string): Promise<string> {
-        const fileExists = await fs.access(mappingFile).then(() => true).catch(() => false);
-        if (!fileExists) return "";
-        const data = await fs.readFile(mappingFile, "utf8");
-        const mapping = JSON.parse(data) as SessionMapping;
-
-        const entry = mapping[sessionId];
+        const entry = await sessionStore.get(sessionId);
         if (!entry) return "";
 
-        let cascadeId: string | undefined;
-        if (typeof entry === "string") {
-          cascadeId = entry;
-        } else {
-          cascadeId = entry.cascadeId;
-        }
+        const cascadeId = entry.cascadeId;
         // A newly persisted model-only session has no transcript yet; deleting
         // this guard would turn an ordinary pre-prompt lookup into a bad path.
         if (!cascadeId) return "";
@@ -827,7 +682,7 @@ type FakeProc = ChildProcessByStdio<Writable, Readable, Readable>;
 
 function makeFakeAgyProcess(
   runtime: AgyNativeRuntime,
-  mappingFile: string,
+  sessionStore: AgySessionStore,
   defaultModel: string,
   printTimeoutSeconds?: number,
   mcpServers: McpServer[] = [],
@@ -842,7 +697,7 @@ function makeFakeAgyProcess(
 
   const agent = new AgyAgent(
     runtime,
-    mappingFile,
+    sessionStore,
     defaultModel,
     printTimeoutSeconds,
     mcpServers,
@@ -915,7 +770,10 @@ interface AgySession {
  * If modelId is omitted here, a later high-water update erases the session's
  * model and the next process restart falls back to a shared default.
  */
-function persistedSession(session: AgySession, modelId = session.modelId): PersistedSession {
+function persistedSession(
+  session: AgySession,
+  modelId = session.modelId,
+): Omit<AgyPersistedSession, "backend" | "updatedAt"> {
   return {
     ...(session.cascadeId ? { cascadeId: session.cascadeId } : {}),
     maxStepIndex: session.maxStepIndex,
@@ -1103,7 +961,7 @@ class AgyAgent implements Agent {
 
   constructor(
     private readonly runtime: AgyNativeRuntime,
-    private readonly mappingFile: string,
+    private readonly sessionStore: AgySessionStore,
     private readonly defaultModel: string,
     private readonly printTimeoutSeconds?: number,
     private readonly defaultMcpServers: McpServer[] = [],
@@ -1127,6 +985,12 @@ class AgyAgent implements Agent {
         // the staging --add-dir below. No image capability (agy CLI is text-in).
         promptCapabilities: { embeddedContext: true },
         loadSession: true,
+        sessionCapabilities: {
+          list: {},
+          delete: {},
+          resume: {},
+          close: {},
+        },
       },
       authMethods: [],
     };
@@ -1140,69 +1004,166 @@ class AgyAgent implements Agent {
     const id = randomUUID();
     const mcpServers = this.execution.sandbox ? [] : params.mcpServers?.length ? params.mcpServers : this.defaultMcpServers;
     const mcpHome = await prepareAgyMcpHome(id, mcpServers);
-    const catalog = await getCatalog(this.runtime).catch(catalogFallback);
-    // An empty catalog cannot supply the exact canonical id required by --model;
-    // deleting this guard would silently fall back to AGY's process-global default.
-    if (catalog.length === 0) {
-      throw new Error("AGY model catalog is unavailable");
+    try {
+      const catalog = await getCatalog(this.runtime).catch(catalogFallback);
+      // An empty catalog cannot supply the exact canonical id required by --model;
+      // deleting this guard would silently fall back to AGY's process-global default.
+      if (catalog.length === 0) throw new Error("AGY model catalog is unavailable");
+      const modelId = readInitialModelId(catalog, this.initialSettingsFile, this.defaultModel);
+      // Every admitted session must own a catalog-valid model before its first turn;
+      // deleting this guard would permit an invocation without an isolated model.
+      if (!modelId) throw new Error("AGY model catalog has no selectable model");
+      const session: AgySession = {
+        cwd: params.cwd,
+        maxStepIndex: -1,
+        modelId,
+        mcpServers,
+        mcpHome,
+      };
+      // Persistence is the admission boundary: ACP must not return an id for
+      // seam.db to record until the native map owns the exact same id.
+      await this.sessionStore.put(id, persistedSession(session));
+      this.sessions.set(id, session);
+      return {
+        sessionId: id,
+        configOptions: buildAgyConfigOptions(catalog, modelId),
+      };
+    } catch (error) {
+      if (mcpHome) await fs.rm(mcpHome, { recursive: true, force: true }).catch(() => {});
+      throw error;
     }
-    const modelId = readInitialModelId(catalog, this.initialSettingsFile, this.defaultModel);
-    // Every admitted session must own a catalog-valid model before its first turn;
-    // deleting this guard would permit an invocation without an isolated model.
-    if (!modelId) throw new Error("AGY model catalog has no selectable model");
-    const session: AgySession = {
-      cwd: params.cwd,
-      maxStepIndex: -1,
-      modelId,
-      mcpServers,
-      mcpHome,
-    };
-    await savePersistedSessionStrict(this.mappingFile, id, persistedSession(session));
-    this.sessions.set(id, session);
-    return {
-      sessionId: id,
-      configOptions: buildAgyConfigOptions(catalog, modelId),
-    };
   }
 
   async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
-    const persisted = await loadPersistedSession(this.mappingFile, params.sessionId);
+    const persisted = await this.sessionStore.get(params.sessionId);
+    // seam.db can outlive or be repaired independently from the native map.
+    // Refuse only this unowned session instead of inventing a new conversation;
+    // known sessions and the rest of the adapter remain usable.
+    if (!persisted) {
+      const detail = `unknown AGY session ${params.sessionId}`;
+      throw RequestError.invalidParams({
+        details: detail,
+      }, detail);
+    }
+    if (persisted.backend !== AGY_SESSION_BACKEND) {
+      const detail = `AGY session ${params.sessionId} belongs to another backend`;
+      throw RequestError.invalidParams({
+        details: detail,
+      }, detail);
+    }
+    if (persisted.cwd && persisted.cwd !== params.cwd) {
+      const detail = `AGY session ${params.sessionId} belongs to cwd ${persisted.cwd}`;
+      throw RequestError.invalidParams({
+        details: detail,
+      }, detail);
+    }
     const mcpServers = this.execution.sandbox ? [] : params.mcpServers?.length ? params.mcpServers : this.defaultMcpServers;
     const mcpHome = await prepareAgyMcpHome(params.sessionId, mcpServers);
-    const catalog = await getCatalog(this.runtime).catch(catalogFallback);
-    // Resume cannot validate or invoke a canonical session model without a catalog;
-    // deleting this guard would reintroduce implicit global/list-order selection.
-    if (catalog.length === 0) throw new Error("AGY model catalog is unavailable");
-    const modelId = persisted?.modelId ??
-      readInitialModelId(catalog, this.initialSettingsFile, this.defaultModel);
-    // A persisted id must still exist in the exact current catalog; deleting this
-    // check would pass a stale/unknown id to AGY or silently substitute a model.
-    if (!modelId || !catalog.some((entry) => entry.modelId === modelId)) {
-      throw RequestError.invalidParams({
-        details: modelId ? `unknown AGY model ${modelId}` : "AGY session has no model selection",
-      });
+    try {
+      const catalog = await getCatalog(this.runtime).catch(catalogFallback);
+      // Resume cannot validate or invoke a canonical session model without a catalog;
+      // deleting this guard would reintroduce implicit global/list-order selection.
+      if (catalog.length === 0) throw new Error("AGY model catalog is unavailable");
+      const modelId = persisted.modelId ??
+        readInitialModelId(catalog, this.initialSettingsFile, this.defaultModel);
+      // A persisted id must still exist in the exact current catalog; deleting this
+      // check would pass a stale/unknown id to AGY or silently substitute a model.
+      if (!modelId || !catalog.some((entry) => entry.modelId === modelId)) {
+        throw RequestError.invalidParams({
+          details: modelId ? `unknown AGY model ${modelId}` : "AGY session has no model selection",
+        });
+      }
+      const legacyProgress = persisted.cascadeId && !persisted.cwd && !persisted.modelId
+        ? conversationMaxStepIndex(persisted.cascadeId)
+        : persisted.maxStepIndex;
+      const session: AgySession = {
+        cwd: params.cwd,
+        cascadeId: persisted.cascadeId,
+        maxStepIndex: legacyProgress,
+        modelId,
+        mcpServers,
+        mcpHome,
+      };
+      // Normalize legacy rows before exposing the session in memory. A failed
+      // migration refuses only this resume and cannot diverge from disk.
+      if (!persisted.modelId || !persisted.cwd) {
+        await this.sessionStore.put(params.sessionId, persistedSession(session));
+      }
+      this.sessions.set(params.sessionId, session);
+      return { configOptions: buildAgyConfigOptions(catalog, modelId) };
+    } catch (error) {
+      if (mcpHome) await fs.rm(mcpHome, { recursive: true, force: true }).catch(() => {});
+      throw error;
     }
-    const session: AgySession = {
-      cwd: params.cwd,
-      cascadeId: persisted?.cascadeId,
-      maxStepIndex: persisted?.maxStepIndex ?? -1,
-      modelId,
-      mcpServers,
-      mcpHome,
-    };
-    // Legacy mapping rows have no model; persisting the one-time initial default
-    // here prevents later global-default changes from rewriting that session.
-    if (!persisted?.modelId) {
-      await savePersistedSessionStrict(
-        this.mappingFile,
-        params.sessionId,
-        persistedSession(session),
-      );
+  }
+
+  async listSessions(params: ListSessionsRequest): Promise<ListSessionsResponse> {
+    if (params.cursor) {
+      throw RequestError.invalidParams({ details: "AGY session list has no additional page" });
     }
-    this.sessions.set(params.sessionId, session);
+    const records = await this.sessionStore.list();
     return {
-      configOptions: buildAgyConfigOptions(catalog, modelId),
+      sessions: Object.entries(records)
+        // A legacy row with no cwd is retained for load-time migration, but it
+        // cannot truthfully satisfy an ACP cwd filter, so do not guess.
+        .filter(([, record]) => record.cwd && (!params.cwd || record.cwd === params.cwd))
+        .map(([sessionId, record]) => ({
+          sessionId,
+          cwd: record.cwd!,
+          ...(record.updatedAt ? { updatedAt: record.updatedAt } : {}),
+        }))
+        .sort((a, b) => (b.updatedAt ?? "").localeCompare(a.updatedAt ?? "")),
     };
+  }
+
+  async resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse> {
+    // Native AGY load emits no replay; it only restores the durable cascade id,
+    // so the stable resume operation is the same owned attach without history.
+    return this.loadSession({ ...params, mcpServers: params.mcpServers ?? [] });
+  }
+
+  async closeSession(params: CloseSessionRequest): Promise<CloseSessionResponse> {
+    const active = this.active?.sessionId === params.sessionId ? this.active : undefined;
+    if (active) {
+      active.cancel();
+      await active.done;
+      await active.close();
+    }
+    const session = this.sessions.get(params.sessionId);
+    if (session?.mcpHome) {
+      await fs.rm(session.mcpHome, { recursive: true, force: true });
+    }
+    // Close frees only process-local resources. The durable conversation is
+    // intentionally retained for resume, and duplicate close is a safe no-op.
+    this.sessions.delete(params.sessionId);
+    return {};
+  }
+
+  async deleteSession(params: DeleteSessionRequest): Promise<DeleteSessionResponse> {
+    await this.closeSession({ sessionId: params.sessionId });
+    let record: AgyPersistedSession | undefined;
+    try {
+      record = await this.sessionStore.delete(
+        params.sessionId,
+        (entry) => { ownedCascadeIdForDeletion(entry.cascadeId); },
+      );
+    } catch (error) {
+      if (error instanceof AgySessionStoreError) {
+        throw RequestError.internalError(
+          { code: `session_store_${error.code}` },
+          error.message,
+        );
+      }
+      throw error;
+    }
+    if (!record) {
+      const detail = `unknown AGY session ${params.sessionId}`;
+      throw RequestError.invalidParams({
+        details: detail,
+      }, detail);
+    }
+    await deleteNativeSessionArtifacts(record.cascadeId);
+    return {};
   }
 
   async setSessionMode(
@@ -1239,11 +1200,7 @@ class AgyAgent implements Agent {
     if (sess.modelId !== modelId) {
       // Persist before changing memory; deleting this order makes a failed write
       // partially commit until restart and then resume under the previous model.
-      await savePersistedSessionStrict(
-        this.mappingFile,
-        params.sessionId,
-        persistedSession(sess, modelId),
-      );
+      await this.sessionStore.put(params.sessionId, persistedSession(sess, modelId));
       sess.modelId = modelId;
     }
     return { configOptions: buildAgyConfigOptions(catalog, modelId) };
@@ -1254,6 +1211,12 @@ class AgyAgent implements Agent {
     this.active?.cancel();
     const next = this.promptTail.then(() => this.executePrompt(params)).catch((error) => {
       if (error instanceof RequestError) throw error;
+      if (error instanceof AgySessionStoreError) {
+        throw RequestError.internalError(
+          { code: `session_store_${error.code}` },
+          error.message,
+        );
+      }
       const code = error instanceof ProbeError ? error.code : "protocol_error";
       throw RequestError.internalError({ code }, `native AGY ${code}`);
     });
@@ -1279,6 +1242,12 @@ class AgyAgent implements Agent {
       if (run.userCancelled && !(error instanceof ProbeError && error.code === "not_reaped")) return { stopReason: "cancelled" };
       // Keep local ACP parameter refusals (including R3 model validation) intact.
       if (error instanceof RequestError) throw error;
+      if (error instanceof AgySessionStoreError) {
+        throw RequestError.internalError(
+          { code: `session_store_${error.code}` },
+          error.message,
+        );
+      }
       if (error instanceof AgyStreamUnavailableError) {
         // Refuse this interrupted stream only; preserve its named cause for
         // bridge operators while other turns/bindings remain usable.
@@ -1413,13 +1382,12 @@ class AgyAgent implements Agent {
           signal: cancelAbort.signal,
         }));
       if (!sess.cascadeId) {
+        const bound = { ...sess, cascadeId: cid };
+        // The native conversation already exists, so a failed commit retires
+        // only this ACP session. It must never continue in memory with an id
+        // that restart cannot recover from the store.
+        await this.persistTurnState(params.sessionId, bound);
         sess.cascadeId = cid;
-        await savePersistedSession(this.mappingFile, params.sessionId, {
-          cascadeId: cid,
-          maxStepIndex: sess.maxStepIndex,
-          cwd: sess.cwd,
-          modelId: sess.modelId,
-        });
       }
       runRef.streaming = true;
 
@@ -1621,12 +1589,7 @@ class AgyAgent implements Agent {
       // Persist the new high-water mark so the next turn (or a restart) can
       // skip everything we've already emitted.
       if (sess.cascadeId && sess.maxStepIndex > skipUpTo) {
-        await savePersistedSession(this.mappingFile, params.sessionId, {
-          cascadeId: sess.cascadeId,
-          maxStepIndex: sess.maxStepIndex,
-          cwd: sess.cwd,
-          modelId: sess.modelId,
-        });
+        await this.persistTurnState(params.sessionId, sess);
       }
       await metadataLearning;
     } catch (err) {
@@ -1642,6 +1605,21 @@ class AgyAgent implements Agent {
 
     if (proc.exitCode !== null && proc.exitCode !== 0) throw agyFailure("exited_early");
     return { stopReason: "end_turn" };
+  }
+
+  private async persistTurnState(sessionId: string, session: AgySession): Promise<void> {
+    try {
+      await this.sessionStore.put(sessionId, persistedSession(session));
+    } catch (error) {
+      // Refuse only the session whose provider/store identities may differ.
+      // Other sessions and the adapter stay available; future use of this id
+      // fails loudly until a fresh runtime reloads its last complete snapshot.
+      this.sessions.delete(sessionId);
+      if (session.mcpHome) {
+        await fs.rm(session.mcpHome, { recursive: true, force: true }).catch(() => {});
+      }
+      throw error;
+    }
   }
 
   async cancel(params: CancelNotification): Promise<void> {

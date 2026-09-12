@@ -10,6 +10,8 @@ export * from "./session-manager.js";
 export * from "./attachment-staging.js";
 export * from "./agy-stream.js";
 export * from "./agy-native-runtime.js";
+export * from "./agy-session-store.js";
+export * from "./agy-session-store.js";
 export * from "./command-bus.js";
 export * from "./read-attachment.js";
 export * from "./workspace-scan.js";

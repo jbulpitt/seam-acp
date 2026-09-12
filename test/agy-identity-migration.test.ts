@@ -94,7 +94,19 @@ describe("owner-approved local AGY restoration", () => {
   it("validates native maps including legacy location; malformed maps cannot clear handles", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "agy-migrate-")); dirs.push(root);
     fs.mkdirSync(path.join(root, ".gemini/antigravity-cli"), { recursive: true });
-    fs.writeFileSync(path.join(root, "agy-sessions.json"), JSON.stringify({ native: { cascadeId: "cascade", cwd: "/repo" } }));
+    fs.writeFileSync(path.join(root, "agy-sessions.json"), JSON.stringify({
+      schemaVersion: 1,
+      backend: "agy-native-language-server-v1",
+      sessions: {
+        native: {
+          backend: "agy-native-language-server-v1",
+          cascadeId: "cascade",
+          maxStepIndex: 2,
+          cwd: "/repo",
+          modelId: "fixture-model",
+        },
+      },
+    }));
     fs.writeFileSync(path.join(root, ".gemini/antigravity-cli/seam_sessions.json"), JSON.stringify({ legacy: "cascade2" }));
     fs.writeFileSync(path.join(root, "sessions.json"), JSON.stringify({ sessions: { package: { conversationId: "pkg" } } }));
     const result = readAgyHandleOwnership(root, root, root);

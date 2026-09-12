@@ -547,8 +547,8 @@ describe.sequential("native AGY R1 capability contract", () => {
       .toMatchObject({ scenario: "interrupted-turn", signal: "SIGTERM" });
     const persisted = JSON.parse(
       fs.readFileSync(path.join(mappingDir, "agy-sessions.json"), "utf8"),
-    ) as Record<string, { cascadeId: string; maxStepIndex: number }>;
-    expect(persisted[sessionId]).toMatchObject({
+    ) as { sessions: Record<string, { cascadeId: string; maxStepIndex: number }> };
+    expect(persisted.sessions[sessionId]).toMatchObject({
       cascadeId: expectedConversation,
       maxStepIndex: 6,
     });
@@ -616,12 +616,11 @@ describe.sequential("native AGY R1 capability contract", () => {
       ]);
 
       const mappingFile = path.join(r3Mapping, "agy-sessions.json");
-      const persisted = JSON.parse(fs.readFileSync(mappingFile, "utf8")) as Record<
-        string,
-        { modelId?: string }
-      >;
-      expect(persisted[firstSessionId]?.modelId).toBe("fixture-native-model");
-      expect(persisted[secondSessionId]?.modelId).toBe("fixture-native-model-low");
+      const persisted = JSON.parse(fs.readFileSync(mappingFile, "utf8")) as {
+        sessions: Record<string, { modelId?: string }>;
+      };
+      expect(persisted.sessions[firstSessionId]?.modelId).toBe("fixture-native-model");
+      expect(persisted.sessions[secondSessionId]?.modelId).toBe("fixture-native-model-low");
       expect(settingsHash()).toBe(initialSettingsHash);
 
       const mappingBeforeInvalid = fs.readFileSync(mappingFile, "utf8");
@@ -656,15 +655,14 @@ describe.sequential("native AGY R1 capability contract", () => {
       }
       const mappingAfterInterruptedRename = fs.readFileSync(mappingFile, "utf8");
       expect(mappingAfterInterruptedRename).toBe(mappingBeforeInterruptedRename);
-      const intact = JSON.parse(mappingAfterInterruptedRename) as Record<
-        string,
-        { cascadeId?: string; modelId?: string }
-      >;
-      expect(intact[firstSessionId]).toMatchObject({
+      const intact = JSON.parse(mappingAfterInterruptedRename) as {
+        sessions: Record<string, { cascadeId?: string; modelId?: string }>;
+      };
+      expect(intact.sessions[firstSessionId]).toMatchObject({
         cascadeId: expectedConversation,
         modelId: "fixture-native-model",
       });
-      expect(intact[secondSessionId]).toMatchObject({
+      expect(intact.sessions[secondSessionId]).toMatchObject({
         cascadeId: expectedConversation,
         modelId: "fixture-native-model-low",
       });
@@ -727,15 +725,16 @@ describe.sequential("native AGY R1 capability contract", () => {
 
     const staleSessionId = "44444444-4444-4444-8444-444444444444";
     const mappingFile = path.join(r3Mapping, "agy-sessions.json");
-    const staleMapping = JSON.parse(fs.readFileSync(mappingFile, "utf8")) as Record<
-      string,
-      unknown
-    >;
-    staleMapping[staleSessionId] = {
+    const staleMapping = JSON.parse(fs.readFileSync(mappingFile, "utf8")) as {
+      sessions: Record<string, unknown>;
+    };
+    staleMapping.sessions[staleSessionId] = {
+      backend: "agy-native-language-server-v1",
       cascadeId: expectedConversation,
       maxStepIndex: 5,
       cwd: r3Root,
       modelId: "fixture-model-no-longer-in-catalog",
+      updatedAt: new Date(0).toISOString(),
     };
     fs.writeFileSync(mappingFile, `${JSON.stringify(staleMapping, null, 2)}\n`);
     const mappingBeforeStaleLoad = fs.readFileSync(mappingFile, "utf8");
@@ -761,10 +760,10 @@ describe.sequential("native AGY R1 capability contract", () => {
     );
     const legacySettingsHash = settingsHash();
     const legacySessionId = "33333333-3333-4333-8333-333333333333";
-    const legacyMapping = JSON.parse(fs.readFileSync(mappingFile, "utf8")) as Record<
-      string,
-      unknown
-    >;
+    const currentDocument = JSON.parse(fs.readFileSync(mappingFile, "utf8")) as {
+      sessions: Record<string, unknown>;
+    };
+    const legacyMapping = { ...currentDocument.sessions };
     legacyMapping[legacySessionId] = expectedConversation;
     fs.writeFileSync(mappingFile, `${JSON.stringify(legacyMapping, null, 2)}\n`);
     const legacyRuntime = makeRuntime(r3Mapping, {
@@ -778,11 +777,18 @@ describe.sequential("native AGY R1 capability contract", () => {
         cwd: r3Root,
       });
       expect(legacyInfo.currentModelId).toBe("fixture-native-model-low");
-      const normalized = JSON.parse(fs.readFileSync(mappingFile, "utf8")) as Record<
-        string,
-        { cascadeId?: string; maxStepIndex?: number; modelId?: string }
-      >;
-      expect(normalized[legacySessionId]).toEqual({
+      const normalized = JSON.parse(fs.readFileSync(mappingFile, "utf8")) as {
+        sessions: Record<string, {
+          backend?: string;
+          cascadeId?: string;
+          maxStepIndex?: number;
+          cwd?: string;
+          modelId?: string;
+          updatedAt?: string;
+        }>;
+      };
+      expect(normalized.sessions[legacySessionId]).toMatchObject({
+        backend: "agy-native-language-server-v1",
         cascadeId: expectedConversation,
         maxStepIndex: -1,
         cwd: r3Root,

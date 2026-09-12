@@ -145,6 +145,122 @@ When you write a guard, state in the comment **what you refuse and what keeps
 working.** If you cannot name something that keeps working, you have probably
 chosen 4, and should look again for the narrower refusal.
 
+## ⚠️ CRITICAL: Ask whether a mechanism should exist, not only whether it works
+
+Review reliably asks *is this implemented correctly?* It almost never asks *why
+is this here at all?* Both questions have to be asked, and only the first one
+has an obvious answer, so the second has to be forced.
+
+The incentive is structural rather than anyone's fault: a worker who adds a
+guard and proves it discriminates has something to show. A worker who deletes
+one has nothing to demonstrate. **Thoroughness is measurable; necessity is not,
+unless someone asks.**
+
+### The four questions, in order
+
+Apply these to every new guard, gate, derived identifier, reconciliation layer,
+retention rule or quarantine — anything that can refuse, transform or persist.
+Each one is answerable with evidence, and **"I cannot answer this" is itself a
+finding**, not a pass.
+
+**1. Delete it on paper. Which test fails, and what does that failure prove
+about production?**
+If nothing fails, the mechanism is dead — delete it. If something fails but the
+failing assertion only describes the mechanism's own shape, the test is
+circular: it proves the mechanism exists, not that anything needed it.
+
+**2. Is the failure it prevents actually reachable?**
+Name the state it refuses and say how the system gets there. If an earlier
+layer already makes that state impossible — a SQL constraint, a type, a guard
+upstream — the check is decoration, and decoration costs refusals.
+
+**3. Is the mechanism reached in production?**
+Find the production call site that supplies the value which turns it on. If the
+only places that enable it are tests, the tests are proving the behaviour of a
+path nobody runs.
+
+**4. Does it report what actually happened?**
+A mechanism can be present, reached, and still report the wrong outcome. Assert
+the *content* of a refusal, not merely that one occurred — a test that checks
+"it refused" passes whether or not the refusal says anything useful.
+
+### Real examples, all from this codebase
+
+- **We verified for weeks that `--sandbox` was passed correctly. Nobody asked
+  whether it was passed at all** (#324). It is not:
+  `DEFAULT_AGY_EXECUTION_POLICY` sets `sandbox: false`, neither production
+  construction site overrides it, and `sandbox: true` existed only in two test
+  files covering an unwired helper path. The tests proved the argv shape of a
+  path nobody runs. That is question 3. The resolution is also the model
+  answer: the mechanism was not fixed, the docs were corrected to describe the
+  real posture, and `test/agy-sandbox-posture.test.ts` now fails if the
+  default changes — so the recorded answer cannot go stale (#360).
+- **`agy-stream.ts` held the language server's real error message and threw a
+  bare `protocol_error`** (#371). Every test asserted that the refusal
+  happened; none asked whether it should carry its cause. Diagnosing a live
+  outage meant patching a running production bridge to recover a string the
+  code already had in hand. That is question 4.
+- **Activation reported failure after succeeding**, and offered to roll back a
+  working host (#370). The mechanism worked; the reported outcome was wrong.
+  Also question 4.
+- **`executionIdentity` hashed the operator's credential files and provider
+  environment**, passed review, and permanently stranded any suspended turn
+  whose token happened to rotate (#302). Reviewed for correctness, never for
+  necessity: nothing about which session work belongs to changes when a
+  credential refreshes. That is question 2.
+- **The continuation guard shipped with a hardcoded vendor name and an
+  `!acpSessionId` clause that SQL already makes unreachable** (#302). Reviewed,
+  passed, deleted later. Question 2.
+- **`done/` grew to 31 MB of cleartext prompts** because nothing deleted and no
+  review asked what the retention policy was (#305/#306).
+
+### Record the answer, in the code
+
+When you add one of these, **state in the comment the failure it prevents, in
+terms of something that has happened or demonstrably can.** Not a hypothetical.
+The `!acpSessionId` clause is the worked example of the failure mode: it read
+as prudent and guarded a state the schema forbids.
+
+This is also what stops the rule becoming a licence to relitigate. **A recorded
+answer closes the question.** A reviewer who disagrees with a recorded
+justification must bring new evidence — a case the comment does not cover — not
+a fresh opinion. If there is no recorded answer, the question is open and
+asking it is in scope.
+
+### What this costs, and where it does not apply
+
+It will sometimes slow a review down, and occasionally reopen something that
+felt settled. That is the intended trade: six review rounds went into the
+wording of a mechanism in #296 without anyone asking whether the mechanism was
+needed, which is a worse use of the same time.
+
+It does **not** apply to:
+
+- a mechanism whose justification is already recorded — see above;
+- pure refactors and renames, which change no behaviour to justify;
+- bug fixes to an existing mechanism whose necessity is recorded, where the
+  question is whether the fix is right;
+- anything where the answer is "it is load-bearing and here is the incident" —
+  that is a pass, and a short one.
+
+### Review briefs must ask it
+
+Every QA or review brief includes: **what breaks if this mechanism is removed
+entirely?** A reviewer who cannot answer concretely should say so in the report
+rather than passing the change; an unanswerable necessity question is a
+finding, and reporting it is the correct outcome.
+
+Two supporting habits, both of which have already paid for themselves here:
+
+- **Prefer plain comparisons to derived values** wherever a human reads the
+  refusal. Two mismatched hex digests cost three exchanges of debugging that a
+  field name answered instantly; `executionIdentity` v2 now compares named
+  fields and says "thread switched from codex to claude" (#302).
+- **Report surviving mutations rather than dropping them.** A mutation that
+  does not fail any test is telling you the mechanism is unprotected, dead, or
+  redundant with something else — all three are question-1 answers. Several
+  deletions in #362 and #364 started as a survived mutation nobody hid.
+
 ## ⚠️ CRITICAL: Applying code changes or restarting the app
 
 Production now runs Seam and the shared Pronoa Playwright MCP as separate

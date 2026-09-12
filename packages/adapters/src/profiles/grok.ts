@@ -1033,16 +1033,23 @@ export async function fetchGrokUsage(
     });
   });
 
-  // Two overlapping jobs, deliberately. Rejecting the `pending` map frees
-  // whichever call is outstanding, which is what unwinds to the `finally`
-  // below and kills the child — that is the one a mutation test discriminates.
-  // Racing `aborted` covers the gap the map cannot: the moment between
-  // `initialize` resolving and the billing call being issued, when `pending`
-  // is empty and there is nothing to reject. Deleting either leaves a window
-  // where an abort stops the caller without stopping the process.
+  // Rejecting the `pending` map is the whole mechanism: it frees whichever
+  // call is outstanding, which unwinds to the `finally` below and kills the
+  // child.
+  //
+  // #359 also raced a separate `aborted` promise here, to cover the moment
+  // between `initialize` resolving and the billing call being issued, when
+  // `pending` would be empty. #361 removed it: that window does not exist.
+  // The billing `call()` runs in the same synchronous continuation as the
+  // resolved initialize race, so it registers its `pending` entry before
+  // control returns to the event loop, and an `abort` event is delivered as a
+  // task — `pending` is never empty when this handler runs. Two mutation
+  // passes agreed, surviving deletion both times, including against a sweep
+  // that aborts at six points across the request lifetime. Keeping an
+  // unreachable branch as "defence in depth" is just code that cannot be
+  // trusted to do anything.
   let onAbort: (() => void) | undefined;
-  const aborted = new Promise<never>((_, reject) => {
-    if (!signal) return;
+  if (signal) {
     onAbort = () => {
       const error = signal.reason instanceof Error
         ? signal.reason
@@ -1051,10 +1058,9 @@ export async function fetchGrokUsage(
         pending.delete(id);
         waiter.reject(error);
       }
-      reject(error);
     };
     signal.addEventListener("abort", onAbort, { once: true });
-  });
+  }
 
   try {
     await Promise.race([
@@ -1068,12 +1074,10 @@ export async function fetchGrokUsage(
         30_000
       ),
       exit,
-      aborted,
     ]);
     const raw = await Promise.race([
       call(GROK_BILLING_METHOD, {}, 20_000),
       exit,
-      aborted,
     ]);
     return parseGrokBilling(raw);
   } finally {

@@ -189,6 +189,61 @@ export function rollbackPlan(target, activationId) {
   return { target: target.bridgeId, command: `npm run bridge:rollout -- --target ${target.bridgeId} --rollback --activation-id ${activationId} --apply`, automatic: false };
 }
 
+/** Same managed-release identity used by requested_release_already_active. */
+export function requestedReleaseMatches(report, requested) {
+  return report?.artifact_mode === "managed"
+    && report.artifact_source_sha === requested.sha
+    && report.artifact_checksum === requested.checksum;
+}
+
+export function activationFailureReport({ target, requested, activationId, before, after, error, observationError }) {
+  const reason = safeDiagnostic(error instanceof Error ? error.message : error);
+  const lockBlocked = /(?:target_lock_busy|stale_lock_race|target_lock_race|lock_owner_invalid|lock_lost|lock_ownership_changed)/.test(reason);
+  const matched = requestedReleaseMatches(after, requested);
+  // #370, like #305/#308/#366: an operation error is not a deployment state.
+  // Refuse only post-step confirmation when the requested release is active;
+  // the serving bridge keeps working and must not be sent back to its baseline.
+  // A changed link alone is insufficient: the bound process must have changed,
+  // or the initial observation must already identify this release (lock retry).
+  const boundPid = /^[1-9][0-9]*$/.test(after?.pid ?? "") && Number.isSafeInteger(Number(after.pid)) && Number(after.pid) > 1;
+  const active = matched && boundPid && (after.pid !== before.pid || requestedReleaseMatches(before, requested));
+  const state = active ? "active_post_step_failed" : after && !matched ? "not_activated" : "failed_or_incomplete";
+  const lines = [`activation=${state}`, `activation_id=${activationId}`, `failed_step=${reason}`];
+  if (lockBlocked) lines.push("coordination=lock_blocked", "lock_note=concurrency_refusal_not_activation_evidence");
+  if (after) lines.push(`observed_source_sha=${after.artifact_source_sha}`, `observed_artifact_checksum=${after.artifact_checksum}`, `observed_pid=${after.pid}`);
+  if (active) {
+    lines.push("release_active=yes", "receipt_verification=not_confirmed_by_this_report", "recommended_action=inspect_failed_post_step_do_not_retry_activation");
+  } else {
+    // Refuse only an unproven activation claim, not the existing deployment.
+    // Keep explicit recovery available, but a pre-swap refusal needs retry,
+    // not rollback; no report here performs either action automatically.
+    lines.push(`release_active=${after && !matched ? "no" : "unknown"}`);
+    lines.push(`recommended_action=${state === "not_activated" ? (lockBlocked ? "resolve_concurrency_then_retry" : "fix_failed_step_then_retry") : "inspect_current_state_before_recovery"}`);
+    if (observationError) lines.push(`observation_error=${safeDiagnostic(observationError instanceof Error ? observationError.message : observationError)}`);
+    lines.push(`rollback_applicability=${state === "not_activated" ? "not_needed_before_swap" : "only_after_confirming_partial_activation"}`);
+    lines.push(`rollback_command=${rollbackPlan(target, activationId).command}`);
+  }
+  return lines.join("\n") + "\n";
+}
+
+/** One mutation attempt, followed on error by an existing, lock-free read only. */
+export async function runActivation({ target, options, activationId, operationId, remoteScript, before }, run = commandRunner) {
+  try {
+    const result = await run(makeSshCommand(target, ["activate", options.sha, options.checksum, options.stageId, activationId, String(options.timeoutSeconds), operationId], remoteScript));
+    return { stdout: result.stdout, exitCode: 0 };
+  } catch (error) {
+    let after; let observationError;
+    try { after = (await runPreflight(target, remoteScript, run)).report; }
+    catch (failedObservation) { observationError = failedObservation; }
+    return {
+      stdout: activationFailureReport({ target, requested: options, activationId, before, after, error, observationError }),
+      // The post-step still failed; don't conceal that from automation merely
+      // because serving the new release remains available.
+      exitCode: 1,
+    };
+  }
+}
+
 export function artifactName(sha, checksum) {
   if (!SHA.test(sha) || !CHECKSUM.test(checksum)) throw new Error("invalid artifact identity");
   return `bridge-${sha}-${checksum}.tgz`;

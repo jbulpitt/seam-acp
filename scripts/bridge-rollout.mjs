@@ -2,7 +2,7 @@
 import { randomBytes } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { activationRefusal, buildArtifact, firstActivationFromBaselineAllowed, commandRunner, loadTargetMap, makeScpCommand, makeSshCommand, parseArgs, parseKeyValues, renderRemoteScript, resolveTarget, rollbackPlan, runPreflight } from "./lib/bridge-rollout.mjs";
+import { activationRefusal, buildArtifact, firstActivationFromBaselineAllowed, commandRunner, loadTargetMap, makeScpCommand, makeSshCommand, parseArgs, parseKeyValues, renderRemoteScript, resolveTarget, runActivation, runPreflight } from "./lib/bridge-rollout.mjs";
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(scriptDir, "..");
@@ -79,15 +79,9 @@ async function main() {
   }
   if (options.action === "activate") {
     const activationId = nonce(); const operationId = nonce();
-    try {
-      const result = await commandRunner(makeSshCommand(target, ["activate", options.sha, options.checksum, options.stageId, activationId, String(options.timeoutSeconds), operationId], remoteScript));
-      process.stdout.write(result.stdout);
-    } catch (error) {
-      console.error("activation=failed_or_incomplete");
-      console.error(`activation_id=${activationId}`);
-      console.error(`rollback_command=${rollbackPlan(target, activationId).command}`);
-      throw error;
-    }
+    const result = await runActivation({ target, options, activationId, operationId, remoteScript, before: preflight.report });
+    process.stdout.write(result.stdout);
+    process.exitCode = result.exitCode;
     return;
   }
   const rollbackId = nonce(); const operationId = nonce();

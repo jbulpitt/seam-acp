@@ -2394,10 +2394,13 @@ export async function fetchAgyUserStatus(
   if (cached && Date.now() - cached.at < USAGE_CACHE_TTL_MS) {
     return cached.data;
   }
-  // The cheapest cancellation is the one that never starts a process.
-  signal?.throwIfAborted();
   const logFile = await newSpawnLogPath();
   try {
+    // An already-aborted refresh never spawns: `runBoundedProbe` refuses
+    // before spawn when `options.signal` is set and aborted. #361 briefly had
+    // a second `throwIfAborted` here; it was redundant with that one and
+    // survived mutation, so it is gone rather than kept as decoration.
+    //
     // NO PROMPT FLAG BELOW. `models` is a subcommand that lists models and
     // exits 0; adding `-p`/`--print`/`--prompt` here would restore a billable
     // turn on every cold quota refresh. `test/agy-quota-no-prompt.test.ts`

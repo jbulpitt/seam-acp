@@ -22,11 +22,12 @@ import pino from "pino";
 import { fetchAgyUserStatus } from "@seam/adapters";
 import {
   AgentQuotaPoller,
+  createAgentQuotaSources,
   type AgentQuotaSource,
 } from "../packages/core/src/core/quota/quota-poller.js";
 import { QuotaRegistry } from "../packages/core/src/core/quota/quota-registry.js";
-import { mapAgyQuota } from "../packages/core/src/core/quota/agent-quota.js";
 import type { AgentQuota } from "../packages/core/src/core/quota/agent-quota.js";
+import type { AgentProfile } from "@seam/adapters";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import { createManagedAgyFixture } from "./helpers/agy-runtime-fixture.js";
 
@@ -73,13 +74,18 @@ function agyFixture(extraEnv: Record<string, string> = {}): {
   };
 }
 
+/**
+ * The production source, built by the production factory. An earlier draft
+ * hand-rolled this and a mutation dropping the poller's signal wiring survived,
+ * because the hand-rolled source did its own wiring.
+ */
 function agySource(runtime: Parameters<typeof fetchAgyUserStatus>[0]): AgentQuotaSource {
-  const identity = { agentId: "agy", displayName: "Antigravity" };
-  return {
-    ...identity,
-    eventDriven: false,
-    fetch: async (signal) => mapAgyQuota(identity, await fetchAgyUserStatus(runtime, signal)),
-  };
+  const [source] = createAgentQuotaSources(
+    [{ id: "agy", displayName: "Antigravity" } as AgentProfile],
+    { agyRuntime: runtime as never }
+  );
+  if (!source) throw new Error("createAgentQuotaSources did not build an agy source");
+  return source;
 }
 
 function quota(agentId: string, displayName: string): AgentQuota {

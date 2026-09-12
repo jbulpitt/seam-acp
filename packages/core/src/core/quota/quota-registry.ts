@@ -4,6 +4,15 @@ export const QUOTA_ACTIVITY_WINDOW_MS = 10 * 60_000;
 export const QUOTA_MIN_REFRESH_MS = 15_000;
 
 /**
+ * Absolute deadline for one quota source, including response headers and body.
+ * Thirty seconds covers the slowest existing healthy source (Claude can make
+ * three bounded 8s attempts plus short backoffs) without letting one provider
+ * hold the manual Discord refresh open indefinitely. A timeout refuses only
+ * that source; sibling sources and its last-known-good value remain usable.
+ */
+export const QUOTA_SOURCE_TIMEOUT_MS = 30_000;
+
+/**
  * Default window over which the poller keeps serving the last-known-good quota
  * when an upstream read returns "unavailable", instead of flapping the card to
  * ⚠️. A sustained outage longer than this still surfaces honestly. Tunable via

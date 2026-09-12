@@ -829,7 +829,8 @@ export interface CopilotUsageData {
  * Uses the OAuth token stored in config.json. Returns what it can on failure.
  */
 export async function fetchCopilotUsage(
-  configDir?: string
+  configDir?: string,
+  signal?: AbortSignal
 ): Promise<CopilotUsageData> {
   const dir = configDir?.trim() || path.join(process.env.HOME ?? "", ".copilot");
   const result: CopilotUsageData = {
@@ -848,6 +849,7 @@ export async function fetchCopilotUsage(
   try {
     const res = await fetch("https://api.github.com/copilot_internal/user", {
       headers: { Authorization: `token ${token}`, Accept: "application/json" },
+      ...(signal ? { signal } : {}),
     });
     if (res.ok) {
       const body = (await res.json()) as Record<string, unknown>;
@@ -863,7 +865,10 @@ export async function fetchCopilotUsage(
         result.premiumInteractions = parseQuota(snaps.premium_interactions);
       }
     }
-  } catch {
+  } catch (err) {
+    // #307: this check releases the timed-out fetch owner; deleting it makes a
+    // later refresh rejoin or overlap a body read that ignored its deadline.
+    if (signal?.aborted) throw signal.reason instanceof Error ? signal.reason : err;
     /* return what we have */
   }
   return result;

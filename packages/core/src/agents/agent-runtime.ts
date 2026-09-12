@@ -180,6 +180,24 @@ function flattenConfigSelectOptions(
  */
 const START_TIMEOUT_MS = 45_000;
 const NEW_SESSION_TIMEOUT_MS = 45_000;
+/**
+ * A healthy load may replay a large history, so it gets more room than startup.
+ * Sixty seconds is roughly 2.4x the observed 25s recovery window, while still
+ * making silence a named refusal of this resume only. Other sessions and new
+ * session creation remain available.
+ */
+export const SESSION_LOAD_TIMEOUT_MS = 60_000;
+
+export class SessionLoadTimeoutError extends Error {
+  readonly code = "session_load_timeout";
+  constructor(readonly timeoutMs: number, readonly agentId: string) {
+    super(
+      `ACP session/load timed out after ${timeoutMs / 1000}s for agent '${agentId}'; ` +
+      "the session was not resumed and can be retried"
+    );
+    this.name = "SessionLoadTimeoutError";
+  }
+}
 
 export const ACP_CLIENT_CAPABILITIES = Object.freeze({
   fs: Object.freeze({ readTextFile: false, writeTextFile: false }),
@@ -282,6 +300,7 @@ export class AgentRuntime {
     effort?: string
   ) => ReturnType<AgentProfile["spawn"]> | Promise<ReturnType<AgentProfile["spawn"]>>;
   private readonly catalogEffort?: CatalogEffort;
+  private readonly loadSessionTimeoutMs: number;
 
   private child?: ReturnType<AgentProfile["spawn"]>;
   private connection?: ClientSideConnection;
@@ -413,11 +432,14 @@ export class AgentRuntime {
       model?: string,
       effort?: string
     ) => ReturnType<AgentProfile["spawn"]> | Promise<ReturnType<AgentProfile["spawn"]>>;
+    /** Test/embedding override. Production uses SESSION_LOAD_TIMEOUT_MS. */
+    loadSessionTimeoutMs?: number;
   }) {
     this.profile = opts.profile;
     this.logger = opts.logger.child({ agent: opts.profile.id });
     this.mcpServers = opts.mcpServers ?? [];
     this.catalogEffort = opts.effortDescriptor;
+    this.loadSessionTimeoutMs = opts.loadSessionTimeoutMs ?? SESSION_LOAD_TIMEOUT_MS;
     this.onDead = opts.onDead;
     this.spawnFn = opts.spawnFn;
     this.elicitationHandler = opts.elicitationHandler;
@@ -699,12 +721,28 @@ export class AgentRuntime {
     this.replayLoadedDuringLoad = false;
     let result: import("@agentclientprotocol/sdk").LoadSessionResponse;
     try {
-      result = await conn.loadSession({
-        sessionId: opts.sessionId,
-        cwd: opts.cwd,
-        mcpServers: this.profile.mcpServersAtSpawn ? [] : this.mcpServers,
-        ...(Object.keys(meta).length > 0 ? { _meta: meta } : {}),
-      });
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        result = await Promise.race([
+          conn.loadSession({
+            sessionId: opts.sessionId,
+            cwd: opts.cwd,
+            mcpServers: this.profile.mcpServersAtSpawn ? [] : this.mcpServers,
+            ...(Object.keys(meta).length > 0 ? { _meta: meta } : {}),
+          }),
+          new Promise<never>((_resolve, reject) => {
+            // #307: this deadline refuses only the current session resume;
+            // deleting it lets paginated history hold a worker slot forever.
+            timer = setTimeout(
+              () => reject(new SessionLoadTimeoutError(this.loadSessionTimeoutMs, this.profile.id)),
+              this.loadSessionTimeoutMs
+            );
+            timer.unref?.();
+          }),
+        ]);
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
     } finally {
       this.loadReplayInProgress = false;
     }

@@ -39,9 +39,9 @@ export interface TurnAttempt {
   deliveryAbandonedReason: string | null;
   deliveryUncertainReason: string | null;
   updatedUtc: string;
-  /** Durable quarantine metadata for a recovery attempt that was retained
-   * after startup readiness. The execution remains suspended and can only be
-   * resumed/abandoned through the guarded operator workflow. */
+  /** Durable evidence of a retained attempt. Safe recorded-session continuation
+   * may reclaim it automatically; only a successful fenced claim clears this
+   * evidence. Unresolved safety failures remain quarantined. */
   stalledUtc: string | null;
   stalledReason: string | null;
   stallNoticeUtc: string | null;
@@ -462,14 +462,16 @@ export class TurnAttemptStore {
     );
   }
 
-  /** Quarantine a retained recovery without terminalizing or replaying it.
-   * Returns true only for the first durable transition, so the requester gets
-   * one notice even if the observer is invoked more than once. */
+  /** Preserve quarantine until successful reclaim. A newly determined cause
+   * replaces stale diagnostics and earns a new notice; repeated identical
+   * observations do not repeatedly notify. */
   markStalled(id: string, reason: string, now = new Date().toISOString()): boolean {
     return this.db.prepare(`UPDATE turn_attempts
-      SET state='suspended', stalled_utc=?, stalled_reason=?, updated_utc=?
-      WHERE id=? AND state IN ('pending','active','suspended') AND stalled_utc IS NULL`)
-      .run(now, reason, now, id).changes === 1;
+      SET state='suspended', stalled_utc=COALESCE(stalled_utc,?), stalled_reason=?,
+          stall_notice_utc=NULL, updated_utc=?
+      WHERE id=? AND state IN ('pending','active','suspended')
+        AND (stalled_utc IS NULL OR stalled_reason IS NOT ?)`)
+      .run(now, reason, now, id, reason).changes === 1;
   }
 
   markStallNoticeDelivered(id: string, now = new Date().toISOString()): boolean {

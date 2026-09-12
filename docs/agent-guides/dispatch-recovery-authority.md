@@ -40,6 +40,21 @@ recomputes that permission. A retained error is deferred for the remainder of
 the boot, preventing a hot retry loop; shutdown and superseded remain silent,
 while a defect retains its specific reason and operator workflow.
 
+Stall evidence is not itself a refusal to continue (#355). Boot and operator
+dispatch continuation share admission checks. A stalled, prompted attempt with
+a recorded ACP session proceeds automatically through the normal execution
+identity, ownership, and strict session/load checks, without a confirmation
+notice. A stalled never-prompted attempt or a prompted attempt with no session
+remains quarantined; continuation cannot safely be inferred from that evidence.
+Real identity/integrity failures still refuse before any prompt, and notices
+name the unresolved cause rather than presenting a blind Resume confirmation.
+An explicit auto-resume opt-out remains respected at boot.
+
+Only successful fenced reclaim clears `stalledUtc` and its reason/notice fields,
+atomically with the new generation. Merely considering recovery does not erase
+diagnostic evidence. A changed refusal updates the reason and permits a fresh
+notice; repeating the same refusal does not repeatedly notify.
+
 ## Disagreement and loss
 
 If ingress or a completion projection disagrees with a nonterminal SQL attempt,

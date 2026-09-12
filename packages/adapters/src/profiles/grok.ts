@@ -896,10 +896,20 @@ export function parseGrokBilling(raw: unknown): GrokUsageData {
 /**
  * Ask a live grok ACP connection for the SuperGrok weekly allowance.
  * `request` is `AgentRuntime.request` / `ClientSideConnection.request`.
+ *
+ * The signal is checked BEFORE the request and not after (#349). This path
+ * borrows a connection that belongs to a live Grok session, so there is
+ * nothing here we may cancel: the only lever would be tearing down that
+ * connection, which would refuse Grok as an agent to answer a question about
+ * Grok's quota. Refusing to START a request we have already been told to
+ * abandon is the whole of what is available, and it is honest — unlike the
+ * cold path below, no process is left running by declining to do more.
  */
 export async function fetchGrokUsageFromConnection(
-  request: (method: string, params?: unknown) => Promise<unknown>
+  request: (method: string, params?: unknown) => Promise<unknown>,
+  signal?: AbortSignal
 ): Promise<GrokUsageData> {
+  signal?.throwIfAborted();
   const raw = await request(GROK_BILLING_METHOD, {});
   return parseGrokBilling(raw);
 }
@@ -907,8 +917,32 @@ export async function fetchGrokUsageFromConnection(
 /**
  * Spawn a throwaway `grok agent stdio`, initialize (no session/new), call
  * `_x.ai/billing`, and kill the process. Use when no grok runtime is warm.
+ *
+ * #349: `signal` cancels the WORK, not merely the wait.
+ *
+ * This path's own bounds are 30s to initialize plus 20s to bill — up to 50s,
+ * against the quota poller's 30s per-source deadline (#344). Without the
+ * signal the poller's refusal stopped the caller and left a spawned `grok
+ * agent stdio` running for up to another 20s, still holding stdio and still
+ * about to answer a question nobody would read. An accepted-but-unconsumed
+ * signal is worse than no timeout: the caller believes it has a bound it does
+ * not have.
+ *
+ * What an abort refuses: this one Grok quota reading, which degrades to "we
+ * cannot currently tell you Grok's quota" and leaves the registry's
+ * last-known-good value in place. What keeps working: every other agent's
+ * quota source, each of which has its own controller and is unaffected; and
+ * Grok itself as an agent, because the only process torn down here is this
+ * throwaway probe — live Grok sessions have their own runtimes and are never
+ * touched by this path.
  */
-export async function fetchGrokUsage(cliPath?: string): Promise<GrokUsageData> {
+export async function fetchGrokUsage(
+  cliPath?: string,
+  signal?: AbortSignal
+): Promise<GrokUsageData> {
+  // Do not spawn at all for a refresh that has already been abandoned; the
+  // cheapest cancellation is the one that never starts a process.
+  signal?.throwIfAborted();
   const cli = cliPath?.trim() || "grok";
   const child = spawn(cli, ["agent", "stdio"], {
     stdio: ["pipe", "pipe", "pipe"],
@@ -994,9 +1028,32 @@ export async function fetchGrokUsage(cliPath?: string): Promise<GrokUsageData> {
 
   const exit = new Promise<never>((_, reject) => {
     child.once("error", (err) => reject(new Error(`grok spawn failed: ${err.message}`)));
-    child.once("exit", (code, signal) => {
-      reject(new Error(`grok exited before billing (code=${code}, signal=${signal})`));
+    child.once("exit", (code, childSignal) => {
+      reject(new Error(`grok exited before billing (code=${code}, signal=${childSignal})`));
     });
+  });
+
+  // Two overlapping jobs, deliberately. Rejecting the `pending` map frees
+  // whichever call is outstanding, which is what unwinds to the `finally`
+  // below and kills the child — that is the one a mutation test discriminates.
+  // Racing `aborted` covers the gap the map cannot: the moment between
+  // `initialize` resolving and the billing call being issued, when `pending`
+  // is empty and there is nothing to reject. Deleting either leaves a window
+  // where an abort stops the caller without stopping the process.
+  let onAbort: (() => void) | undefined;
+  const aborted = new Promise<never>((_, reject) => {
+    if (!signal) return;
+    onAbort = () => {
+      const error = signal.reason instanceof Error
+        ? signal.reason
+        : new Error("grok quota request aborted");
+      for (const [id, waiter] of [...pending]) {
+        pending.delete(id);
+        waiter.reject(error);
+      }
+      reject(error);
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
   });
 
   try {
@@ -1011,13 +1068,16 @@ export async function fetchGrokUsage(cliPath?: string): Promise<GrokUsageData> {
         30_000
       ),
       exit,
+      aborted,
     ]);
     const raw = await Promise.race([
       call(GROK_BILLING_METHOD, {}, 20_000),
       exit,
+      aborted,
     ]);
     return parseGrokBilling(raw);
   } finally {
+    if (onAbort) signal?.removeEventListener("abort", onAbort);
     child.stdout.off("data", onData);
     try {
       child.kill("SIGTERM");

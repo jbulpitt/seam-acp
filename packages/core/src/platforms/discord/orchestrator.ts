@@ -2117,7 +2117,9 @@ export class Orchestrator {
     await this.adapter.sendMessage(
       { platform: PLATFORM, id: requester },
       `⚠️ Dispatch \`${spec.id}\` to <#${spec.target}> could not resume: ${reason}. ` +
-        "It remains suspended and was not replayed. Use `/seam workflows` to resume or abandon it."
+        "It remains suspended and was not replayed. " +
+        "Resolve this cause before requesting continuation in `/seam workflows`, or abandon the work there. " +
+        "A resume command cannot bypass the failed safety checks."
     );
     this.store.turnAttempts.markStallNoticeDelivered(spec.id);
     this.logger.warn(
@@ -14749,12 +14751,14 @@ export class Orchestrator {
         // Defer only opted-out prompted work. Never-started dispatches and
         // unrelated targets remain available, without original-input replay.
         if (owned.promptStarted && !enabled) continue;
-        if (owned.stalledUtc) {
-          if (!owned.stallNoticeUtc) await this.observeRetainedDispatch(spec);
+        // Quarantine only work we cannot safely continue, not a timestamp.
+        // Prompted, session-bound work uses the same path as operator Resume;
+        // identity/ownership/provider guards still run before any prompt.
+        const refusal = await this.dispatchContinuationRefusal(spec);
+        if (refusal) {
+          await this.observeRetainedDispatch(spec, DispatchSuspendedError.defect(spec.id, refusal));
           continue;
         }
-        const pre = await this.checkResumePreconditions({ platform: PLATFORM, id: spec.target });
-        if (pre !== "ok") continue;
         liveJobs.push(this.resumeScheduler.run(async () => {
           const loc = spec.location ?? resolveThreadLocation(this.config, spec.target);
           const waited = await this.waitForResumeHost(loc, spec.createdUtc, maxAge, now);
@@ -14763,7 +14767,8 @@ export class Orchestrator {
             return;
           }
           if (!isLocalLocation(loc)) bindSessionLocation(this.bridgeHub, `discord:${spec.target}`, loc);
-          await this.dispatchWatcher!.requeueStale(spec.id);
+          const refusal = await this.requestDispatchContinuation(spec);
+          if (refusal) await this.observeRetainedDispatch(spec, DispatchSuspendedError.defect(spec.id, refusal));
         }));
       }
     }
@@ -15020,6 +15025,33 @@ export class Orchestrator {
     return legacy;
   }
 
+  /** One admission decision for boot and operator dispatch continuation.
+   * Refuse only the unsafe attempt; other suspended conversations continue.
+   * Success authorizes the existing executor, never bypasses its identity,
+   * owner-generation, or strict session/load guards. */
+  private async dispatchContinuationRefusal(spec: DispatchSpec): Promise<string | null> {
+    const attempt = this.store.turnAttempts.get(spec.id);
+    if (!attempt || attempt.state !== "suspended") return "no suspended SQL execution is recorded";
+    if (attempt.stalledUtc && !attempt.promptStarted) {
+      return "the stalled attempt never started a prompt; continuation cannot be distinguished from replaying its original brief";
+    }
+    if (attempt.promptStarted && !attempt.acpSessionId) {
+      return "the attempt recorded a started prompt but no ACP session id; the conversation to continue cannot be determined";
+    }
+    const pre = await this.checkResumePreconditions({ platform: PLATFORM, id: spec.target });
+    if (pre !== "ok") return `target thread is ${pre}; continuation cannot currently be admitted`;
+    return null;
+  }
+
+  private async requestDispatchContinuation(spec: DispatchSpec): Promise<string | null> {
+    // Recheck after any boot host-readiness wait, just as operator admission
+    // does. A change during that wait cannot authorize an unsafe continuation.
+    const refusal = await this.dispatchContinuationRefusal(spec);
+    if (refusal) return refusal;
+    return await this.dispatchWatcher?.requeueStale(spec.id)
+      ? null : "the suspended execution could not be authorized for continuation";
+  }
+
   /** Operator-initiated resume from `/seam workflows` — bypasses max-age
    *  and the auto-resume flag (the operator clicked Resume). */
   async resumeTurnManually(id: string): Promise<string> {
@@ -15052,10 +15084,10 @@ export class Orchestrator {
     const stale = (await this.dispatchWatcher?.listStaleRunning()) ?? [];
     const spec = stale.find((s) => s.id === id);
     if (spec) {
-      const ok = await this.dispatchWatcher!.requeueStale(spec.id);
-      return ok
-        ? `▶️ Re-queued dispatch \`${id}\` as a resume (continue + loadSession).`
-        : `Could not re-queue \`${id}\`.`;
+      const refusal = await this.requestDispatchContinuation(spec);
+      return refusal
+        ? `Cannot resume \`${id}\` — ${refusal}.`
+        : `▶️ Continuation requested for dispatch \`${id}\`; identity, ownership and session/load checks still apply.`;
     }
     const ledger = this.store.getDelegation(id);
     if (ledger && (ledger.status === "interrupted" || ledger.status === "abandoned")) {

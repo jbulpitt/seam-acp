@@ -39,7 +39,7 @@ function setup() {
     getOrStartRuntime: vi.fn(async (_record: unknown, _opts?: { resumeSessionId: string }) => runtime),
   };
   const adapter = { sendPanel: async (channel: any) => ({ channel, id: "panel" }),
-    sendMessage: async (channel: any) => ({ channel, id: "message" }),
+    sendMessage: vi.fn(async (channel: any, _text?: string) => ({ channel, id: "message" })),
     editPanel: async () => {}, editMessage: async () => {} };
   const config = { DATA_DIR: dataDir, REPOS_ROOT: "/synthetic", TURN_TIMEOUT_SECONDS: 60,
     SEAM_TURN_RESUME_ENABLED: true,
@@ -64,10 +64,87 @@ function setup() {
   const spec: DispatchSpec = { id: "held", target: "worker", prompt: "original work", session: "live",
     returnTo: "origin", correlationId: "logical", kind: "handoff", stream: false,
     createdUtc: new Date().toISOString() };
-  return { orch, store, watcher, dataDir, spec, reports, runtime, router, notices, refusals, started, release, makeOrch };
+  return { orch, store, watcher, dataDir, spec, reports, runtime, router, adapter, notices, refusals, started, release, makeOrch };
 }
 
 describe("#250 production dispatch lifecycle (synthetic transport, no providers)", () => {
+  it.each([false, true])("#355 stalled recorded conversation auto-continues without a notice (old notice delivered=%s)", async delivered => {
+    const h = setup();
+    h.spec.id = delivered ? "11ac5c69-7785-4e84-bee5-110a86e8af76" : "0a98091b-00e8-44f7-8515-8b3c2c6d71d0";
+    simulateRetiredOwnerProcess();
+    const first = h.orch.dispatchInjectTurn(h.spec);
+    await h.started; h.orch.suspendForRestart(); h.release();
+    await expect(first).rejects.toMatchObject({ suspension: "shutdown" });
+    h.store.turnAttempts.markStalled(h.spec.id, "execution failed before the provider took the turn and the attempt is suspended");
+    if (delivered) h.store.turnAttempts.markStallNoticeDelivered(h.spec.id);
+    h.adapter.sendMessage.mockClear();
+    h.runtime.prompt.mockImplementationOnce(async text => {
+      expect(text).toBe("continue");
+      expect(h.store.turnAttempts.get(h.spec.id)).toMatchObject({ generation: 2,
+        stalledUtc: null, stalledReason: null, stallNoticeUtc: null });
+      return { stopReason: "end_turn" };
+    });
+    const next = h.makeOrch();
+    vi.spyOn(next as any, "enqueueReportBack").mockResolvedValue(undefined);
+    const notice = vi.spyOn(next, "observeRetainedDispatch");
+    const watcher = createRuntimeDispatchWatcher({ attempts: h.store.turnAttempts,
+      dataDir: h.dataDir, logger: pino({ level: "silent" }) as any, runtime: next });
+    next.setDispatchWatcher(watcher); cleanups.push(() => watcher.stop());
+    await watcher.start();
+    expect(h.runtime.prompt).toHaveBeenCalledTimes(2);
+    expect(h.runtime.prompt.mock.calls.at(-1)?.[0]).toBe("continue");
+    expect(h.router.getOrStartRuntime.mock.calls.at(-1)).toMatchObject([
+      { channelRef: "worker" }, { resumeSessionId: "recorded-acp" },
+    ]);
+    expect(h.store.turnAttempts.get(h.spec.id)?.state).toBe("completed");
+    expect(notice).not.toHaveBeenCalled();
+    expect(h.adapter.sendMessage.mock.calls.some(([, text]) => text?.includes("could not resume"))).toBe(false);
+  });
+
+  it.each(["never-prompted", "missing-session", "identity-drift", "unreadable-owner"] as const)(
+    "#355 unresolved %s stays quarantined and names the uncertainty", async fault => {
+      const h = setup();
+      simulateRetiredOwnerProcess();
+      if (fault === "never-prompted") {
+        // Unsafe evidence must stay quarantined even when its host is absent;
+        // the host wait/expiry path must not silently abandon it first.
+        h.spec.location = "unavailable-bridge";
+        h.store.turnAttempts.admit(h.spec);
+      }
+      else {
+        const first = h.orch.dispatchInjectTurn(h.spec);
+        await h.started; h.orch.suspendForRestart(); h.release();
+        await expect(first).rejects.toMatchObject({ suspension: "shutdown" });
+      }
+      h.store.turnAttempts.markStalled(h.spec.id, "old undifferentiated retention");
+      h.store.turnAttempts.markStallNoticeDelivered(h.spec.id);
+      const before = h.store.turnAttempts.get(h.spec.id)!;
+      if (fault === "missing-session") (h.store as any).db.prepare(
+        "UPDATE turn_attempts SET acp_session_id=NULL WHERE id=?").run(h.spec.id);
+      if (fault === "identity-drift") vi.spyOn(h.router, "describeConfig").mockReturnValue({ agent: { value: "claude" } });
+      if (fault === "unreadable-owner") (h.store as any).db.prepare(
+        "UPDATE turn_attempt_owners SET process_json='{}' WHERE id=?").run(before.ownerBoot);
+      h.adapter.sendMessage.mockClear(); h.runtime.prompt.mockClear();
+      const next = h.makeOrch();
+      const watcher = createRuntimeDispatchWatcher({ attempts: h.store.turnAttempts,
+        dataDir: h.dataDir, logger: pino({ level: "silent" }) as any, runtime: next });
+      next.setDispatchWatcher(watcher); cleanups.push(() => watcher.stop());
+      await watcher.start();
+      expect(h.runtime.prompt).not.toHaveBeenCalled();
+      expect(h.store.turnAttempts.get(h.spec.id)).toMatchObject({ state: "suspended",
+        generation: before.generation, stalledUtc: before.stalledUtc, stallNoticeUtc: expect.any(String) });
+      const reason = { "never-prompted": "never started a prompt", "missing-session": "no ACP session id",
+        "identity-drift": "thread switched from codex to claude", "unreadable-owner": "owner registration is missing or unreadable" }[fault];
+      expect(h.store.turnAttempts.get(h.spec.id)?.stalledReason).toContain(reason);
+      const notices = h.adapter.sendMessage.mock.calls.filter(([, text]) => text?.includes("could not resume"));
+      expect(notices).toHaveLength(1);
+      expect(notices[0]?.[1]).toContain(reason);
+      expect(notices[0]?.[1]).not.toContain("Use `/seam workflows` to resume or abandon");
+      if (fault === "never-prompted" || fault === "missing-session") {
+        expect(await next.resumeTurnManually(h.spec.id)).toContain(reason);
+      }
+    });
+
   it("#304 admitting to SQL does not turn an ordinary setup failure into a stall", async () => {
     const h = setup();
     vi.spyOn(h.router, "ensureSessionRecord").mockImplementationOnce(() => { throw new Error("target unavailable"); });

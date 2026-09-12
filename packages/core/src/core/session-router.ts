@@ -888,10 +888,10 @@ export class SessionRouter {
         // Clearing it here would orphan that preserved mapping: the next turn
         // sees an empty acp, calls newSession → a brand-new cascade, and the
         // reply is dropped / the thread goes amnesiac (the 2026-06-23 empty-
-        // response bug). `agy-package` has an incompatible
-        // session store, so its failed legacy handle is cleared while the
-        // Discord configuration/history remain available for a fresh session
-        // or deterministic rebuild. Preserve only native `agy` handles.
+        // response bug). Preserve only native `agy` handles; every other
+        // agent's failed legacy handle is cleared, leaving its Discord
+        // configuration and history available for a fresh session or a
+        // deterministic rebuild.
         if (record.agentId === "agy") {
           this.logger.info(
             { sessionId },

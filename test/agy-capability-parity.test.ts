@@ -162,57 +162,68 @@ describe("#264 structured output: the degradation notice stays out of the payloa
   });
 });
 
-describe("#264 helpers: audited, and deliberately not moved", () => {
+describe("#377 helpers: the agy-package vision sidecar is gone", () => {
   const coreIndex = fs.readFileSync(
     path.join(import.meta.dirname, "..", "packages", "core", "src", "index.ts"),
     "utf8"
   );
 
-  it("is a vision sidecar for ollama-cloud sessions, not an agy-session capability", () => {
-    // R8 asks whether each helper is still hardwired to the package factory
-    // now that the chat adapter is native. For this one the answer turned out
-    // to matter less than the question underneath it: agy sessions never call
-    // `inspect_image` at all. The production gate admits only ollama-cloud
-    // tool-vision sessions, and merely USES agy-package as the engine.
-    //
-    // So "move the helper back to the native factory" restores no agy parity:
-    // there is no agy caller to restore it for. That is question 3 of the
-    // review rule doing its job before any code was written.
-    const gate = coreIndex.slice(
-      coreIndex.indexOf("inspect_image is only available to tool-vision sessions") - 600,
-      coreIndex.indexOf("agyImageInspector({ ...req, ownerId: record.id })")
-    );
-    expect(gate).toContain('effective.agent.value !== "ollama-cloud"');
-    expect(gate).toContain("config.OLLAMA_CLOUD_ENABLED");
-    expect(gate).toContain('visionMode !== "tool"');
+  it("no longer wires an inspect_image backend, and says why", () => {
+    // R8 (#264) audited this helper and deliberately left it in place. The
+    // measurement that followed settled it: agy-package had 0 sessions and 0
+    // turn attempts ever, ollama-cloud — its only permitted caller — had 0 of
+    // both, and OLLAMA_CLOUD_ENABLED=false meant the gate refused before the
+    // sidecar was reached. Unreachable by construction, so removed (#377).
+    expect(coreIndex).not.toContain("agyImageInspector");
+    expect(coreIndex).not.toContain("createAgyImageInspector");
+    // The answer is recorded where the wiring used to be, per AGENTS.md.
+    expect(coreIndex).toContain("NO inspect_image BACKEND (#377)");
   });
 
-  it("refuses by name when its engine is absent, and refuses only itself", () => {
-    // The NEGATIVE assertion R8 asks for. On a host without agy-package —
-    // every agy-only Mac — this capability is unavailable. It says so, names
-    // what to configure, and throws from inside one tool handler: the session
-    // continues, the other tools continue, the host continues. That is
-    // outcome 3 in the blast-radius ordering, and it is already correct, which
-    // is why this PR does not change it.
-    expect(coreIndex).toContain(
-      'if (!agyImageInspector) throw new Error("inspect_image requires configured agy-package");'
-    );
-    // Constructed only when the engine exists — no half-built helper that
-    // fails later at a point the operator cannot connect to a missing config.
-    expect(coreIndex).toContain("const agyImageInspector = agyPackage");
-  });
-
-  it("still defaults to the package factory, which is the audited state", () => {
-    // Recorded rather than changed. R8 permits moving a helper "only with its
-    // sandbox/tool-scope contract verified" — and #324 deliberately deferred
-    // that verification, so the precondition is unmet by design, not by
-    // oversight. Moving it would make an unproven boundary look available.
-    const inspector = fs.readFileSync(
-      path.join(import.meta.dirname, "..", "packages", "core", "src", "core", "vision", "agy-image-inspector.ts"),
+  it("keeps the tool interface and its clean absent-backend answer", () => {
+    // Blast radius: what was removed is one unverifiable backend, not the
+    // interface. `visionMode: "tool"` is a catalog property any future model
+    // may carry, and `inspectImage` is an optional dep, so a replacement can
+    // be wired without re-adding a tool. The absent case already answers
+    // cleanly rather than crashing.
+    const mcp = fs.readFileSync(
+      path.join(import.meta.dirname, "..", "packages", "core", "src", "core", "mcp", "seam-mcp-server.ts"),
       "utf8"
     );
-    expect(inspector).toContain("opts.profileFactory ?? makeAgyPackageProfile");
-    // And the file states the real posture rather than implying a sandbox.
-    expect(inspector).toContain("A private cwd is not a sandbox");
+    expect(mcp).toContain("inspect_image is not configured on this deployment.");
+    expect(mcp).toContain("inspectImage?:");
+  });
+
+  it("leaves staged-image authorization completely untouched", () => {
+    // The NEGATIVE assertion. `ollama-image-inspector.ts` is misleadingly
+    // named: it holds the staging authorization the orchestrator uses directly
+    // and independently of any vision backend. Removing the sidecar must not
+    // touch it.
+    const staging = fs.readFileSync(
+      path.join(import.meta.dirname, "..", "packages", "core", "src", "core", "vision", "ollama-image-inspector.ts"),
+      "utf8"
+    );
+    expect(staging).toContain("export function stagedAttachmentOwnerKey");
+    expect(staging).toContain("export async function authorizeStagedImage");
+    expect(staging).toContain("export async function readAuthorizedStagedImage");
+    const orchestrator = fs.readFileSync(
+      path.join(import.meta.dirname, "..", "packages", "core", "src", "platforms", "discord", "orchestrator.ts"),
+      "utf8"
+    );
+    expect(orchestrator).toContain("vision/ollama-image-inspector.js");
+  });
+
+  it("removes the agent without disturbing any other adapter", () => {
+    // The other half of the negative assertion: this is one entry out of a
+    // factory list, and every sibling still builds.
+    const inventory = fs.readFileSync(
+      path.join(import.meta.dirname, "..", "packages", "bridge", "src", "inventory.ts"),
+      "utf8"
+    );
+    expect(inventory).not.toContain("agy-package");
+    expect(inventory).not.toContain("makeAgyPackageProfile");
+    for (const id of ['id: "copilot"', 'id: "claude"', 'id: "agy"', 'id: "codex"', 'id: "grok"']) {
+      expect(inventory).toContain(id);
+    }
   });
 });

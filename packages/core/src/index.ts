@@ -26,7 +26,7 @@ import {
 } from "./core/parked-agents.js";
 import { makeCopilotProfile } from "@seam/adapters";
 import { makeClaudeProfile } from "@seam/adapters";
-import { makeAgyNativeRuntime, makeAgyPackageProfile, makeAgyProfile, scrubStaleGlobalSeamStdio } from "@seam/adapters";
+import { makeAgyNativeRuntime, makeAgyProfile, scrubStaleGlobalSeamStdio } from "@seam/adapters";
 import { makeCodexProfile } from "@seam/adapters";
 import { buildOllamaCodexCatalog } from "./agents/ollama-codex-catalog.js";
 import { makeGrokProfile, fetchXaiModels } from "@seam/adapters";
@@ -56,7 +56,6 @@ import { dispatchDirs, enqueueDispatchSpec, type DispatchSpec } from "./core/dis
 import { SeamTokenRegistry } from "./core/mcp/token-registry.js";
 import { SeamMcpServer } from "./core/mcp/seam-mcp-server.js";
 import { ThreadSessionControlService } from "./core/thread-session-control.js";
-import { createAgyImageInspector } from "./core/vision/agy-image-inspector.js";
 import { watchChannelPresets } from "./core/config-reload.js";
 import { BridgeHub } from "./core/bridge-hub.js";
 import { ServerStatusCard } from "./core/server-status-card.js";
@@ -97,7 +96,6 @@ import {
 } from "./core/service-status/index.js";
 import { ServiceStatusCard } from "./core/service-status-card.js";
 import { planAgyIdentityMigration, readAgyHandleOwnership } from "./core/agy-identity-migration.js";
-import { migrateAgyCatalogIdentity } from "./core/agy-catalog-migration.js";
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -242,24 +240,6 @@ async function main(): Promise<void> {
       })
     : undefined;
 
-  const agyPackage = config.AGY_PACKAGE_ENABLED
-    ? makeAgyPackageProfile({
-        acpPath: config.AGY_ACP_BIN!,
-        agyBin: config.AGY_BIN!,
-        agyVersion: config.AGY_VERSION,
-        agySha256: config.AGY_SHA256,
-        runtimeRoot: config.AGY_RUNTIME_ROOT!,
-        defaultModel: config.AGY_DEFAULT_MODEL,
-        stateDir: config.AGY_ACP_STATE_DIR!,
-        conversationsDir: config.AGY_CONVERSATIONS_DIR!,
-        cwd: config.AGY_ACP_CWD!,
-        credentialScope: config.AGY_CREDENTIAL_SCOPE,
-        wrapperVersion: config.AGY_ACP_VERSION,
-        wrapperSha256: config.AGY_ACP_SHA256,
-        permissionRiskAcknowledged: config.AGY_DANGEROUS_PERMISSIONS_ACKNOWLEDGED,
-        timeoutMs: Math.min(config.TURN_TIMEOUT_SECONDS * 1_000, 120_000),
-      })
-    : undefined;
   const agyRuntime = config.AGY_ENABLED || config.AGY_OLD_ROLLBACK_ENABLED
     ? makeAgyNativeRuntime({
         executable: config.AGY_CLI_PATH!,
@@ -428,11 +408,7 @@ async function main(): Promise<void> {
   let stopCatalogEnrichmentRefresh: (() => void) | undefined;
   let serviceStatusSources: ReturnType<typeof createDefaultServiceStatusSources> | undefined;
 
-  const profiles: AgentProfile[] = [copilot, ...extraCopilots, claude, ...extraClaudes, ...(claudeVertex ? [claudeVertex] : []), ...(agy ? [agy] : []), ...(agyPackage ? [agyPackage] : []), ...(codex ? [codex] : []), ...(grok ? [grok] : []), ...(zai ? [zai] : []), ...(ollamaCloud ? [ollamaCloud] : [])];
-  if (agyPackage && store.agyIdentityRestored()) {
-    const migration = migrateAgyCatalogIdentity(modelCatalogStore, await agyPackage.catalog.scope());
-    logger.info({ migration }, "local AGY catalog identity migration checked");
-  }
+  const profiles: AgentProfile[] = [copilot, ...extraCopilots, claude, ...extraClaudes, ...(claudeVertex ? [claudeVertex] : []), ...(agy ? [agy] : []), ...(codex ? [codex] : []), ...(grok ? [grok] : []), ...(zai ? [zai] : []), ...(ollamaCloud ? [ollamaCloud] : [])];
   const profilesById = new Map(profiles.map((profile) => [profile.id, profile]));
   const modelCatalog = new ModelCatalogService({
     store: modelCatalogStore,
@@ -735,26 +711,6 @@ async function main(): Promise<void> {
         )
       : undefined;
     const messageSearch = messageReader ? new LiveMessageSearch(messageReader) : undefined;
-    const agyImageInspector = agyPackage
-      ? createAgyImageInspector({
-          model: config.AGY_VISION_MODEL,
-          logger,
-          isModelAvailable: (model) => Boolean(modelCatalog.model({ agentId: "agy-package", location: "local" }, model)),
-          profileOptions: {
-            acpPath: config.AGY_ACP_BIN!,
-            agyBin: config.AGY_BIN!,
-            agyVersion: config.AGY_VERSION,
-            agySha256: config.AGY_SHA256,
-            runtimeRoot: config.AGY_RUNTIME_ROOT!,
-            stateDir: config.AGY_ACP_STATE_DIR!,
-            conversationsDir: config.AGY_CONVERSATIONS_DIR!,
-            credentialScope: config.AGY_CREDENTIAL_SCOPE,
-            wrapperVersion: config.AGY_ACP_VERSION,
-            wrapperSha256: config.AGY_ACP_SHA256,
-            permissionRiskAcknowledged: config.AGY_DANGEROUS_PERMISSIONS_ACKNOWLEDGED,
-          },
-        })
-      : undefined;
     const threadSessionControl = new ThreadSessionControlService({
       store,
       router,
@@ -818,25 +774,18 @@ async function main(): Promise<void> {
       getModelValueRankings: (options) => modelValueStore.getRankings(options),
       getModelMetadata: (idOrSlug) => modelMetadataStore.get(idOrSlug),
       queryModelMetadata: (options) => modelMetadataStore.query(options),
-      inspectImage: (record, req) => {
-        const effective = router.describeConfig(record);
-        const visionMode = modelCatalog.model(
-          { agentId: effective.agent.value, location: effective.location.value },
-          effective.model.value
-        )?.visionMode;
-        if (
-          !config.OLLAMA_CLOUD_ENABLED ||
-          effective.agent.value !== "ollama-cloud" ||
-          visionMode !== "tool"
-        ) {
-          throw new Error("inspect_image is only available to tool-vision sessions");
-        }
-        if (!agyImageInspector) throw new Error("inspect_image requires configured agy-package");
-        // #308: protects the tool-vision sidecar's direct AgentRuntime start;
-        // deleting it lets agy-package run outside its channel allowlist.
-        router.assertAgentAllowedForRecord(record, "agy-package");
-        return agyImageInspector({ ...req, ownerId: record.id });
-      },
+      // NO inspect_image BACKEND (#377). The only one was an agy-package
+      // sidecar, removed with that agent: 0 sessions and 0 turn attempts for
+      // agy-package, 0 for ollama-cloud (its only permitted caller), and
+      // OLLAMA_CLOUD_ENABLED=false, so the gate here refused before the
+      // sidecar was ever reached. Structurally unreachable, not merely idle.
+      //
+      // The `inspectImage` dep is left OPTIONAL rather than removed: it is an
+      // extension point, and `toolInspectImage` already answers an absent
+      // backend with "inspect_image is not configured on this deployment".
+      // `visionMode: "tool"` is a catalog property any future model may
+      // carry, so the routing that leads here stays live and generic — what
+      // was removed is one unverifiable backend, not the interface.
       // Agent-scheduled wake events (#59): arm/cancel a one-shot self-resumption
       // for the calling thread. The orchestrator owns the loop-safety guards and
       // the DB row; the WakeManager sweeper fires it via the dispatch queue.

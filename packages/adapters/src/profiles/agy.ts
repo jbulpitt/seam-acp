@@ -2349,6 +2349,19 @@ export function parseAgyQuotaSummary(json: UserQuotaSummaryResponse): AgyUsage {
 // Cache the usage snapshot briefly so repeated `/seam usage` calls don't pay
 // the ~5s LS spawn cost. 60s strikes a balance between freshness and snappiness.
 const USAGE_CACHE_TTL_MS = 60_000;
+
+/**
+ * Upper bound on the whole prompt-free quota probe (#361).
+ *
+ * Must stay UNDER the quota poller's per-source deadline
+ * (`QUOTA_SOURCE_TIMEOUT_MS`, 30s), or this path can outlive the refusal that
+ * is supposed to contain it — which was half of what #361 reported. The old
+ * probe's bounds were 30s + 15s + 10s sequentially and did exactly that.
+ * `agy models` exits on its own in ~1.7-2.8s, so 15s is roughly five times the
+ * observed need and still half the deadline. `test/agy-quota-no-prompt.test.ts`
+ * asserts the inequality, because it is arithmetic no timing test can see.
+ */
+export const AGY_QUOTA_PROBE_TIMEOUT_MS = 15_000;
 const usageCache = new Map<string, { at: number; data: AgyUsage }>();
 
 /**
@@ -2405,7 +2418,7 @@ export async function fetchAgyUserStatus(
     // exits 0; adding `-p`/`--print`/`--prompt` here would restore a billable
     // turn on every cold quota refresh. `test/agy-quota-no-prompt.test.ts`
     // fails if one reappears.
-    return await runAgyProbe(runtime, ["--log-file", logFile, "models"], 15_000, async (handle) => {
+    return await runAgyProbe(runtime, ["--log-file", logFile, "models"], AGY_QUOTA_PROBE_TIMEOUT_MS, async (handle) => {
     handle.stdout.resume();
     const ls = await discoverAgyLs({
       logFile,

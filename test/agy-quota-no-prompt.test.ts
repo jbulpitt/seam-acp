@@ -19,13 +19,16 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import pino from "pino";
-import { fetchAgyUserStatus } from "@seam/adapters";
+import { AGY_QUOTA_PROBE_TIMEOUT_MS, fetchAgyUserStatus } from "@seam/adapters";
 import {
   AgentQuotaPoller,
   createAgentQuotaSources,
   type AgentQuotaSource,
 } from "../packages/core/src/core/quota/quota-poller.js";
-import { QuotaRegistry } from "../packages/core/src/core/quota/quota-registry.js";
+import {
+  QuotaRegistry,
+  QUOTA_SOURCE_TIMEOUT_MS,
+} from "../packages/core/src/core/quota/quota-registry.js";
 import type { AgentQuota } from "../packages/core/src/core/quota/agent-quota.js";
 import type { AgentProfile } from "@seam/adapters";
 import type { Logger } from "../packages/core/src/lib/logger.js";
@@ -182,6 +185,14 @@ describe("#361 missing the window refuses one reading and nothing else", () => {
     expect(byAgent.get("claude")).toMatchObject({ outcome: "refreshed" });
     expect(registry.get("claude")?.ok).toBe(true);
   }, 60_000);
+
+  it("bounds the probe under the poller's own per-source deadline", () => {
+    // Arithmetic, not timing: #361's other half was that the old path's nested
+    // bounds (30s + 15s + 10s, sequential) could outlive the 30s refusal meant
+    // to contain it. No behavioural test sees that without burning 30 real
+    // seconds, so the inequality is asserted directly.
+    expect(AGY_QUOTA_PROBE_TIMEOUT_MS).toBeLessThan(QUOTA_SOURCE_TIMEOUT_MS);
+  });
 
   it("does not spawn at all for a refresh that was already abandoned", async () => {
     const { runtime, invocations } = agyFixture();

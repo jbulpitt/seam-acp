@@ -82,6 +82,20 @@ describe("fetchCodexUsage bounded traversal", () => {
       },
     }) as unknown as Awaited<ReturnType<typeof fsp.opendir>>);
 
+    const result = await fetchCodexUsage({
+      sessionsRoot: "/fixture/infinite",
+      maxTraversalEntries: 5,
+    });
+    expect(result).toMatchObject({
+      ok: false,
+      error: "Codex usage traversal exceeded the 5-entry ceiling",
+    });
+    expect(generated).toBe(6);
+  }, 500);
+
+  it("keeps a healthy sibling reporting when Codex exceeds its ceiling", async () => {
+    const root = tempRoot();
+    for (let i = 0; i < 6; i++) fs.writeFileSync(path.join(root, `${i}.jsonl`), "{}\n");
     const identity = { agentId: "codex", displayName: "Codex" };
     const healthy: AgentQuota = {
       agentId: "healthy", displayName: "Healthy", ok: true, plan: "fixture",
@@ -100,7 +114,7 @@ describe("fetchCodexUsage bounded traversal", () => {
           ...identity,
           eventDriven: true,
           fetch: async (signal) => mapCodexQuota(identity, await fetchCodexUsage({
-            sessionsRoot: "/fixture/infinite",
+            sessionsRoot: root,
             signal,
             maxTraversalEntries: 5,
           })),
@@ -124,8 +138,7 @@ describe("fetchCodexUsage bounded traversal", () => {
       expect.objectContaining({ agentId: "healthy", outcome: "refreshed" }),
     ]));
     expect(registry.get("healthy")?.ok).toBe(true);
-    expect(generated).toBe(6);
-  }, 500);
+  });
 
   it("keeps a normal 100-rollout scan far below the production ceiling", async () => {
     const root = tempRoot();

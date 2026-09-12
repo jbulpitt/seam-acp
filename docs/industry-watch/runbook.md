@@ -161,6 +161,7 @@ try (add new ones to this list when they clear the bar — that is self-update):
 - Hugging Face trending / new orgs with large or sudden models
 - AA newly added creators not on `storylines.md`
 - `from:ArtificialAnlys` plus AA’s own articles (Seam cache can lag a public first score by days)
+- AA’s articles index and current Intelligence Index page; record a methodology version change before calling a model-score move
 - LM Arena: a model appearing then vanishing; also Code Arena WebDev for non-US API snapshots
 - Epoch AI (free) if a claimed pretrain needs a compute sanity check
 

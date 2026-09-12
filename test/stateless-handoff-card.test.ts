@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { SessionStore } from "../packages/core/src/core/session-store.js";
 import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { pino } from "pino";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
@@ -472,7 +473,9 @@ describe("completion replay does not invent a live report-back for the card path
   });
 
   it("stamps inlinedReportBack on the done-file for a same-thread preset handoff", async () => {
+    const queueStore = new SessionStore(path.join(dataDir, "queue.db"));
     const watcher = new DispatchWatcher({
+      attempts: queueStore.turnAttempts,
       dataDir,
       logger: silent,
       onDispatch: async () => ({ output: "card result", stopReason: "end_turn" }),
@@ -483,6 +486,7 @@ describe("completion replay does not invent a live report-back for the card path
     await writeFile(path.join(dirs.pending, `${spec.id}.json`), `${JSON.stringify(spec, null, 2)}\n`);
     await watcher.start();
     watcher.stop();
+    queueStore.close();
     const done = JSON.parse(await readFile(path.join(dirs.done, `${spec.id}.json`), "utf8"));
     expect(done.inlinedReportBack).toBe(true);
     expect(done.returnTo).toBe("thread-caller");

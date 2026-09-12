@@ -351,7 +351,7 @@ describe("#180 channel queue fencing", () => {
       lastProgressAtMs: 0,
     });
 
-    const watcher = new DispatchWatcher({
+    const watcher = new DispatchWatcher({ attempts: store.turnAttempts,
       dataDir: dir,
       logger: silent,
       pollMs: 60_000,
@@ -399,14 +399,15 @@ describe("#180 channel queue fencing", () => {
     });
     await starting;
     await watcher.drain();
-    expect(await readdir(dispatchDirs(dir).pending)).toContain("d1.json");
+    expect(store.turnAttempts.get("d1")?.state).toBe("pending");
+    expect(await readdir(dispatchDirs(dir).pending)).toEqual([]);
     expect(await readdir(dispatchDirs(dir).done)).not.toContain("d1.json");
   }, 15_000);
 
   it("revokes an old writer paused at the done commit point before recovery publishes", async () => {
     const finalizing = deferred();
     const releaseFinalization = deferred();
-    const watcher = new DispatchWatcher({
+    const watcher = new DispatchWatcher({ attempts: store.turnAttempts,
       dataDir: dir,
       logger: silent,
       pollMs: 60_000,
@@ -432,10 +433,11 @@ describe("#180 channel queue fencing", () => {
     const recovering = watcher.recoverTarget(fence);
     releaseFinalization.resolve();
 
-    await expect(recovering).resolves.toEqual(["commit-race"]);
+    await expect(recovering).resolves.toEqual([]);
     await starting;
-    expect(await readdir(dispatchDirs(dir).done)).not.toContain("commit-race.json");
-    expect(await readdir(dispatchDirs(dir).pending)).toContain("commit-race.json");
+    expect(store.turnAttempts.get("commit-race")).toMatchObject({ state: "completed", outcome: { output: "stale" } });
+    expect(await readdir(dispatchDirs(dir).done)).toContain("commit-race.json");
+    expect(await readdir(dispatchDirs(dir).pending)).toEqual([]);
     expect(await readdir(dispatchDirs(dir).running)).not.toContain("commit-race.json");
     watcher.releaseTargetFence(fence);
     await watcher.drain();
@@ -494,7 +496,7 @@ describe("#180 dispatch and restart recovery", () => {
     const isolatedFinalizing = deferred();
     const releaseFinalization = deferred();
     const calls: string[] = [];
-    const watcher = new DispatchWatcher({
+    const watcher = new DispatchWatcher({ attempts: store.turnAttempts,
       dataDir: dir,
       logger: silent,
       pollMs: 60_000,
@@ -568,7 +570,10 @@ describe("#180 dispatch and restart recovery", () => {
     await watcher.drain();
 
     expect(calls).toEqual(["isolated"]);
-    for (const id of ["isolated", "queued"]) {
+    // The first callback's outcome reached SQL before cancellation. Preserve
+    // that winner; only the still-queued callback can be cancelled.
+    expect(store.turnAttempts.get("isolated")?.state).toBe("completed");
+    for (const id of ["queued"]) {
       const done = JSON.parse(
         await readFile(path.join(dispatchDirs(dir).done, `${id}.json`), "utf8")
       );
@@ -589,7 +594,7 @@ describe("#180 dispatch and restart recovery", () => {
       correlationId: "paid",
       status: "running",
     });
-    const watcher = new DispatchWatcher({
+    const watcher = new DispatchWatcher({ attempts: store.turnAttempts,
       dataDir: dir,
       logger: silent,
       pollMs: 60_000,
@@ -615,6 +620,8 @@ describe("#180 dispatch and restart recovery", () => {
     await paidWorkEntered.promise;
     watcher.stop();
     store.updateDelegationStatus("paid", "completed");
+    store.turnAttempts.completePending("paid", { id: "paid", target: "100", status: "completed",
+      output: "paid result", finishedUtc: new Date().toISOString() });
 
     const fence = watcher.fenceTarget("100");
     expect(await watcher.recoverTarget(fence)).toEqual([]);
@@ -624,8 +631,8 @@ describe("#180 dispatch and restart recovery", () => {
     );
     expect(abandoned).toMatchObject({
       id: "paid",
-      status: "failed",
-      error: "abandoned: durable delegation ledger is terminal",
+      status: "completed",
+      output: "paid result",
     });
     expect(await readdir(dispatchDirs(dir).pending)).toEqual([]);
     expect(await readdir(dispatchDirs(dir).running)).toEqual([]);
@@ -650,7 +657,7 @@ describe("#180 dispatch and restart recovery", () => {
       status: "running",
     });
     const dirs = dispatchDirs(dir);
-    const watcher = new DispatchWatcher({
+    const watcher = new DispatchWatcher({ attempts: store.turnAttempts,
       dataDir: dir,
       logger: silent,
       pollMs: 60_000,
@@ -668,6 +675,8 @@ describe("#180 dispatch and restart recovery", () => {
         oldRunEntered.resolve();
         await releaseOldRun.promise;
         store.updateDelegationStatus("ledger-race", "completed");
+        store.turnAttempts.completePending("ledger-race", { id: "ledger-race", target: "100", status: "completed",
+          output: "already paid", finishedUtc: new Date().toISOString() });
         return { output: "already paid", stopReason: "end_turn" };
       },
     });
@@ -703,8 +712,8 @@ describe("#180 dispatch and restart recovery", () => {
       JSON.parse(await readFile(path.join(dirs.done, "ledger-race.json"), "utf8"))
     ).toMatchObject({
       id: "ledger-race",
-      status: "failed",
-      error: "abandoned: durable delegation ledger is terminal",
+      status: "completed",
+      output: "already paid",
     });
   });
 
@@ -732,7 +741,8 @@ describe("#180 dispatch and restart recovery", () => {
       }),
       "utf8"
     );
-    const watcher = new DispatchWatcher({
+    store.turnAttempts.admit(JSON.parse(await readFile(path.join(dirs.running, "execution-gate.json"), "utf8")));
+    const watcher = new DispatchWatcher({ attempts: store.turnAttempts,
       dataDir: dir,
       logger: silent,
       pollMs: 60_000,
@@ -749,19 +759,18 @@ describe("#180 dispatch and restart recovery", () => {
     const fence = watcher.fenceTarget("100");
     await expect(watcher.recoverTarget(fence)).resolves.toEqual(["execution-gate"]);
     store.updateDelegationStatus("execution-gate", "completed");
+    store.turnAttempts.completePending("execution-gate", { id: "execution-gate", target: "100", status: "completed",
+      output: "already completed", finishedUtc: new Date().toISOString() });
     watcher.releaseTargetFence(fence);
     await watcher.start();
     watcher.stop();
 
     expect(calls).toBe(0);
     expect(await readdir(dirs.pending)).toEqual([]);
-    expect(await readdir(dirs.running)).toEqual([]);
-    expect(
-      JSON.parse(await readFile(path.join(dirs.done, "execution-gate.json"), "utf8"))
-    ).toMatchObject({
+    expect(store.turnAttempts.get("execution-gate")?.outcome).toMatchObject({
       id: "execution-gate",
-      status: "failed",
-      error: "abandoned: durable delegation ledger is terminal",
+      status: "completed",
+      output: "already completed",
     });
   });
 
@@ -771,7 +780,7 @@ describe("#180 dispatch and restart recovery", () => {
     const recoveredEntered = deferred();
     const recoveredRelease = deferred();
     let calls = 0;
-    const watcher = new DispatchWatcher({
+    const watcher = new DispatchWatcher({ attempts: store.turnAttempts,
       dataDir: dir,
       logger: silent,
       pollMs: 60_000,

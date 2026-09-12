@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { simulateRetiredOwnerProcess } from "./restart-process-fixture.js";
-import { mkdtempSync, rmSync, existsSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { pino } from "pino";
@@ -54,7 +54,7 @@ function setup() {
   const reports = vi.spyOn(orch as any, "enqueueReportBack").mockResolvedValue(undefined);
   const notices = vi.fn((s: DispatchSpec, err: DispatchSuspendedError) => orch.observeRetainedDispatch(s, err));
   const refusals: DispatchSuspendedError[] = [];
-  const watcher = new DispatchWatcher({ dataDir, logger: pino({ level: "silent" }) as any,
+  const watcher = new DispatchWatcher({ attempts: store.turnAttempts, dataDir, logger: pino({ level: "silent" }) as any,
     resumeEnabled: true, onRetained: notices, onDispatch: async s => {
       try { return await orch.dispatchInjectTurn(s); }
       catch (err) { if (err instanceof DispatchSuspendedError) refusals.push(err); throw err; }
@@ -68,6 +68,53 @@ function setup() {
 }
 
 describe("#250 production dispatch lifecycle (synthetic transport, no providers)", () => {
+  it("#304 admitting to SQL does not turn an ordinary setup failure into a stall", async () => {
+    const h = setup();
+    vi.spyOn(h.router, "ensureSessionRecord").mockImplementationOnce(() => { throw new Error("target unavailable"); });
+    await enqueueDispatchSpec(h.dataDir, h.spec);
+    await h.watcher.start();
+    expect(h.store.turnAttempts.get(h.spec.id)).toMatchObject({ state: "completed", stalledUtc: null,
+      outcome: { status: "failed", error: "target unavailable" } });
+    expect(h.notices).not.toHaveBeenCalled();
+    expect(h.runtime.prompt).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])("#304 SQL alone resumes prompted work; conflicting projections=%s", async conflict => {
+    const h = setup();
+    simulateRetiredOwnerProcess();
+    const first = h.orch.dispatchInjectTurn(h.spec);
+    await h.started; h.orch.suspendForRestart(); h.release();
+    await expect(first).rejects.toMatchObject({ suspension: "shutdown" });
+    const dirs = dispatchDirs(h.dataDir);
+    rmSync(dirs.running, { recursive: true, force: true });
+    const logs: Array<{ msg?: string; authority?: string }> = [];
+    const logger = pino({ level: "warn" }, { write: (line: string) => logs.push(JSON.parse(line)) } as any);
+    if (conflict) {
+      mkdirSync(dirs.pending, { recursive: true });
+      mkdirSync(dirs.done, { recursive: true });
+      writeFileSync(path.join(dirs.pending, `${h.spec.id}.json`), JSON.stringify({
+        ...h.spec, target: "wrong-thread", prompt: "WRONG ORIGINAL INPUT", resume: false,
+      }));
+      writeFileSync(path.join(dirs.done, `${h.spec.id}.json`), JSON.stringify({ id: h.spec.id,
+        target: "wrong-thread", status: "completed", output: "stale projection" }));
+    }
+    const next = h.makeOrch();
+    vi.spyOn(next as any, "enqueueReportBack").mockResolvedValue(undefined);
+    h.runtime.prompt.mockResolvedValueOnce({ stopReason: "end_turn" });
+    const watcher = createRuntimeDispatchWatcher({ attempts: h.store.turnAttempts,
+      dataDir: h.dataDir, logger: logger as any, runtime: next, resumeEnabled: true });
+    next.setDispatchWatcher(watcher); cleanups.push(() => watcher.stop());
+    await watcher.start();
+    expect(h.runtime.prompt.mock.calls.at(-1)?.[0]).toBe("continue");
+    expect(h.runtime.prompt).toHaveBeenCalledTimes(2);
+    expect(h.router.getOrStartRuntime.mock.calls.at(-1)).toMatchObject([
+      { channelRef: "worker" }, { resumeSessionId: "recorded-acp" },
+    ]);
+    expect(h.store.turnAttempts.get(h.spec.id)).toMatchObject({ state: "completed", generation: 2,
+      acpSessionId: "recorded-acp", stalledUtc: null });
+    if (conflict) expect(logs.some(l => l.authority === "turn_attempts" && l.msg?.includes("conflicts"))).toBe(true);
+  });
+
   it("#336 shutdown during acquisition retains without notice and the next boot completes", async () => {
     const h = setup();
     h.spec.id = "11ac5c69-7785-4e84-bee5-110a86e8af76";
@@ -96,8 +143,8 @@ describe("#250 production dispatch lifecycle (synthetic transport, no providers)
     h.runtime.prompt.mockResolvedValue({ stopReason: "end_turn" });
     const next = h.makeOrch();
     vi.spyOn(next as any, "enqueueReportBack").mockResolvedValue(undefined);
-    const nextWatcher = createRuntimeDispatchWatcher({ dataDir: h.dataDir, logger: pino({ level: "silent" }) as any,
-      resumeEnabled: true, retainForRecovery: id => h.store.turnAttempts.get(id) !== null, runtime: next });
+    const nextWatcher = createRuntimeDispatchWatcher({ attempts: h.store.turnAttempts, dataDir: h.dataDir, logger: pino({ level: "silent" }) as any,
+      resumeEnabled: true, runtime: next });
     next.setDispatchWatcher(nextWatcher);
     cleanups.push(() => nextWatcher.stop());
     await nextWatcher.start(); await nextWatcher.initialDispatchesSettled();
@@ -116,7 +163,7 @@ describe("#250 production dispatch lifecycle (synthetic transport, no providers)
     h.router.getOrStartRuntime.mockRejectedValueOnce(new Error("ACP connection closed"));
     await enqueueDispatchSpec(h.dataDir, h.spec);
     const refusals: DispatchSuspendedError[] = [];
-    const watcher = new DispatchWatcher({ dataDir: h.dataDir, logger: pino({ level: "silent" }) as any,
+    const watcher = new DispatchWatcher({ attempts: h.store.turnAttempts, dataDir: h.dataDir, logger: pino({ level: "silent" }) as any,
       resumeEnabled: true, onRetained: h.notices, onDispatch: async s => {
         try { return await recovering.dispatchInjectTurn(s); }
         catch (err) { refusals.push(err as DispatchSuspendedError); throw err; }
@@ -130,8 +177,8 @@ describe("#250 production dispatch lifecycle (synthetic transport, no providers)
     h.runtime.prompt.mockResolvedValueOnce({ stopReason: "end_turn" });
     const next = h.makeOrch();
     vi.spyOn(next as any, "enqueueReportBack").mockResolvedValue(undefined);
-    const nextWatcher = createRuntimeDispatchWatcher({ dataDir: h.dataDir, logger: pino({ level: "silent" }) as any,
-      resumeEnabled: true, retainForRecovery: id => h.store.turnAttempts.get(id) !== null, runtime: next });
+    const nextWatcher = createRuntimeDispatchWatcher({ attempts: h.store.turnAttempts, dataDir: h.dataDir, logger: pino({ level: "silent" }) as any,
+      resumeEnabled: true, runtime: next });
     next.setDispatchWatcher(nextWatcher);
     cleanups.push(() => nextWatcher.stop());
     await nextWatcher.start();

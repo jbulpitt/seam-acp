@@ -341,10 +341,11 @@ describe("command-layer cancel vs dispose / onDead", () => {
     await mkdir(dirs.pending, { recursive: true });
     await mkdir(dirs.done, { recursive: true });
     const spec = handoffSpec();
+    store.turnAttempts.admit(spec);
     await writeFile(path.join(dirs.running, "disp-1.json"), JSON.stringify(spec), "utf8");
 
     const seen: string[] = [];
-    const watcher = new DispatchWatcher({
+    const watcher = new DispatchWatcher({ attempts: store.turnAttempts,
       dataDir: dir,
       logger: silent,
       onDispatch: async (s) => {
@@ -459,6 +460,7 @@ describe("watcher recoverStale vs resumeEnabled", () => {
       status: "interrupted",
     });
 
+    await seedInterrupted(p1);
     let resumePassEntered!: () => void;
     const resumePassStarted = new Promise<void>((resolve) => { resumePassEntered = resolve; });
     let releaseResumePass!: () => void;
@@ -472,7 +474,7 @@ describe("watcher recoverStale vs resumeEnabled", () => {
       },
     });
     const seen: string[] = [];
-    const watcher = createRuntimeDispatchWatcher({
+    const watcher = createRuntimeDispatchWatcher({ attempts: store.turnAttempts,
       dataDir: dir,
       logger: silent,
       resumeEnabled: true,
@@ -502,63 +504,24 @@ describe("watcher recoverStale vs resumeEnabled", () => {
     expect(seen).toEqual(["p1", "p2", "p3"]);
   });
 
-  it("flag off: re-enqueues unmarked (today's replay); flag on: marks in place", async () => {
-    const dirs = dispatchDirs(dir);
-    await mkdir(dirs.running, { recursive: true });
-    await mkdir(dirs.pending, { recursive: true });
-    await mkdir(dirs.done, { recursive: true });
-    await writeFile(
-      path.join(dirs.running, "job-c.json"),
-      JSON.stringify({ target: "thread-9", prompt: "resume me", session: "isolated" }),
-      "utf8"
-    );
-
-    const offSeen: DispatchSpec[] = [];
-    const off = new DispatchWatcher({
-      dataDir: dir,
-      logger: silent,
-      resumeEnabled: false,
-      onDispatch: async (spec) => {
-        offSeen.push(spec);
-        return { output: "replayed", stopReason: "end_turn" };
-      },
-    });
-    await off.start();
-    off.stop();
-    expect(offSeen).toHaveLength(1);
-    expect(offSeen[0]!.resume).toBeUndefined();
-    expect(offSeen[0]!.prompt).toBe("resume me");
-
-    // Reset a leftover in running/ for the flag-on path.
-    const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), "seam-resume-on-"));
-    const dirs2 = dispatchDirs(dir2);
-    await mkdir(dirs2.running, { recursive: true });
-    await mkdir(dirs2.pending, { recursive: true });
-    await mkdir(dirs2.done, { recursive: true });
-    await writeFile(
-      path.join(dirs2.running, "job-c.json"),
-      JSON.stringify({ target: "thread-9", prompt: "resume me", session: "isolated" }),
-      "utf8"
-    );
-    const onSeen: DispatchSpec[] = [];
-    const on = new DispatchWatcher({
-      dataDir: dir2,
-      logger: silent,
-      resumeEnabled: true,
-      onDispatch: async (spec) => {
-        onSeen.push(spec);
-        return { output: "should not auto-fire from start()", stopReason: "end_turn" };
-      },
-    });
-    await on.start();
-    on.stop();
-    expect(onSeen).toEqual([]);
-    const marked = JSON.parse(await readFile(path.join(dirs2.running, "job-c.json"), "utf8"));
-    expect(marked.resume).toBe(true);
-    expect(marked.prompt).toBe("resume me");
-    const listed = await on.listStaleRunning();
-    expect(listed[0]?.resume).toBe(true);
-    fs.rmSync(dir2, { recursive: true, force: true });
+  it("resume opt-out never replays prompted SQL work; opt-in continues without files", async () => {
+    const spec = handoffSpec();
+    await seedInterrupted(spec);
+    const seen: DispatchSpec[] = [];
+    for (const enabled of [false, true]) {
+      const { orch } = makeOrch({ enabled });
+      const watcher = createRuntimeDispatchWatcher({ attempts: store.turnAttempts,
+        dataDir: dir, logger: silent, resumeEnabled: enabled, runtime: {
+          dispatchInjectTurn: async s => { seen.push(s); throw DispatchSuspendedError.shutdown(s.id, "fixture handoff"); },
+          observeRetainedDispatch: (s, err) => orch.observeRetainedDispatch(s, err),
+          recoverInterruptedTurns: () => orch.recoverInterruptedTurns(),
+        } });
+      orch.setDispatchWatcher(watcher);
+      await watcher.start(); watcher.stop();
+      expect(seen).toHaveLength(enabled ? 1 : 0);
+    }
+    expect(seen[0]).toMatchObject({ id: spec.id, resume: true, prompt: spec.prompt });
+    expect(store.turnAttempts.get(spec.id)).toMatchObject({ promptStarted: true, acpSessionId: "acp-recorded" });
   });
 
   it("recoverInterruptedTurns requeues a marked dispatch spec when the flag is on", async () => {
@@ -577,19 +540,20 @@ describe("watcher recoverStale vs resumeEnabled", () => {
       status: "interrupted",
     });
     const { orch } = makeOrch({ enabled: true });
-    const watcher = new DispatchWatcher({
+    const watcher = new DispatchWatcher({ attempts: store.turnAttempts,
       dataDir: dir,
       logger: silent,
       resumeEnabled: true,
       onDispatch: async () => ({ output: "ok", stopReason: "end_turn" }),
     });
+    await seedInterrupted(spec);
     await watcher.start();
     orch.setDispatchWatcher(watcher);
     await orch.recoverInterruptedTurns();
     watcher.stop();
     const pending = await readdir(dirs.pending);
-    expect(pending).toContain("disp-1.json");
-    const body = JSON.parse(await readFile(path.join(dirs.pending, "disp-1.json"), "utf8"));
+    expect(pending).toEqual([]);
+    const body = (await watcher.listStaleRunning())[0]!;
     expect(body.resume).toBe(true);
     expect(body.prompt).toBe("do the overnight git push");
   });
@@ -627,12 +591,11 @@ describe("watcher recoverStale vs resumeEnabled", () => {
       get: () => ({ mux: {} }),
       mcpServersForRemoteSpawn: () => undefined,
     } as any);
-    const watcher = createRuntimeDispatchWatcher({
+    const watcher = createRuntimeDispatchWatcher({ attempts: store.turnAttempts,
       dataDir: dir,
       logger: silent,
       pollMs: 60_000,
       resumeEnabled: true,
-      retainForRecovery: (id) => store.turnAttempts.get(id) !== null,
       runtime: orch,
     });
     orch.setDispatchWatcher(watcher);
@@ -683,12 +646,11 @@ describe("watcher recoverStale vs resumeEnabled", () => {
     // configured provider is absent, so ownership cannot advance and the
     // orchestrator retains rather than replaying/terminalizing.
     const { orch, sent } = makeOrch({ enabled: true, getProfile: () => undefined });
-    const watcher = createRuntimeDispatchWatcher({
+    const watcher = createRuntimeDispatchWatcher({ attempts: store.turnAttempts,
       dataDir: dir,
       logger: silent,
       pollMs: 60_000,
       resumeEnabled: true,
-      retainForRecovery: (id) => store.turnAttempts.get(id) !== null,
       runtime: orch,
     });
     orch.setDispatchWatcher(watcher);
@@ -724,12 +686,11 @@ describe("watcher recoverStale vs resumeEnabled", () => {
     await expect(readFile(path.join(dirs.done, `${spec.id}.json`), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
 
     // Another boot must keep the quarantine and must not silently retry it.
-    const secondWatcher = new DispatchWatcher({
+    const secondWatcher = new DispatchWatcher({ attempts: store.turnAttempts,
       dataDir: dir,
       logger: silent,
       pollMs: 60_000,
       resumeEnabled: true,
-      retainForRecovery: (id) => store.turnAttempts.get(id) !== null,
       onDispatch: vi.fn(async () => ({ output: "must not run", stopReason: "end_turn" })),
     });
     await secondWatcher.start();

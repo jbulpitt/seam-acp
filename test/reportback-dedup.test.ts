@@ -7,6 +7,7 @@ import { pino } from "pino";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
 import { DispatchWatcher } from "../packages/core/src/core/dispatch/watcher.js";
+import { projectAttemptCompletions } from "../packages/core/src/core/dispatch/attempt-recovery.js";
 import {
   dispatchDirs,
   findQueuedReportBackSpec,
@@ -165,6 +166,9 @@ describe("report-back enqueue is idempotent on correlationId (#77)", () => {
   it("killing between report-back enqueue and done-file, then restarting, delivers exactly once", async () => {
     const orch = makeOrch();
     const original = handoffSpec({ session: "isolated" });
+    store.turnAttempts.admit(original);
+    store.turnAttempts.completePending(original.id, { id: original.id, target: original.target,
+      status: "completed", output: "the result", finishedUtc: new Date().toISOString() });
 
     // (1) First run completed the turn and enqueued the report-back.
     await (orch as any).enqueueReportBack(original, "the result");
@@ -183,11 +187,12 @@ describe("report-back enqueue is idempotent on correlationId (#77)", () => {
     expect(specsIn("done")).toEqual([]);
     expect(specsIn("running")).toEqual([`${original.id}.json`]);
 
-    // (3) Restart: recoverStale re-enqueues the original; the existing
-    // report-back is already in pending/. Both are dispatched this tick.
+    // (3) Restart: SQL repairs the captured output. Only the report-back is
+    // runnable; the finished original is never re-executed.
+    await projectAttemptCompletions(dir, store.turnAttempts);
     let originalReruns = 0;
     let reportBackDeliveries = 0;
-    const watcher = new DispatchWatcher({
+    const watcher = new DispatchWatcher({ attempts: store.turnAttempts,
       dataDir: dir,
       logger: silent,
       onDispatch: async (spec) => {
@@ -204,7 +209,7 @@ describe("report-back enqueue is idempotent on correlationId (#77)", () => {
     await watcher.start();
     watcher.stop();
 
-    expect(originalReruns).toBe(1);
+    expect(originalReruns).toBe(0);
     expect(reportBackDeliveries).toBe(1);
     expect(reportBackRows("corr-x")).toHaveLength(1);
 

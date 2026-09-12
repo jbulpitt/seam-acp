@@ -132,7 +132,7 @@ async function exerciseFastCompletion(opts: {
 }): Promise<void> {
   const results = new ChoiceResultHub({ store, logger: silent });
   let workerSubmissions = 0;
-  const watcher = new DispatchWatcher({
+  const watcher = new DispatchWatcher({ attempts: store.turnAttempts,
     dataDir,
     logger: silent,
     onDispatch: async (spec) => {

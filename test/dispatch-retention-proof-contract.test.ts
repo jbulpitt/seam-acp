@@ -109,7 +109,7 @@ describe("#316 corrected deletion contract", () => {
     let release!: () => void;
     const barrier = new Promise<void>(resolve => { release = resolve; });
     const recovered = vi.fn(() => barrier);
-    const watcher = createRuntimeDispatchWatcher({ dataDir: dir, logger, runtime: {
+    const watcher = createRuntimeDispatchWatcher({ attempts: store.turnAttempts, dataDir: dir, logger, runtime: {
       dispatchInjectTurn: async () => { throw new Error("no task allowed"); },
       observeRetainedDispatch: async () => {}, recoverInterruptedTurns: recovered,
     } });

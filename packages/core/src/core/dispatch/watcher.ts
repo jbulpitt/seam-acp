@@ -1,29 +1,20 @@
 /**
- * DispatchWatcher — the filesystem half of the operator-dispatch bridge.
+ * SQL-backed dispatch admission and recovery with filesystem ingress/results.
  *
- * Polls `<DATA_DIR>/dispatch/pending/` for spec files, claims each one by
- * renaming it into `running/`, hands it to an injected `onDispatch` callback,
- * and records the outcome in `done/`. It knows nothing about Discord or ACP:
- * the callback is the seam (see `Orchestrator.dispatchInjectTurn`), which keeps
- * this testable with a stub and keeps the queue mechanics out of the 6.5k-line
- * orchestrator.
+ * pending/ is acknowledged only after turn_attempts.admit commits. SQL pending
+ * rows survive queue/file loss; suspended rows are authorized by the runtime's
+ * boot/operator preconditions and continue their recorded session. running/
+ * is a best-effort compatibility projection, never read for execution.
  *
- * Delivery is **at-least-once**. `start()` re-enqueues anything left in
- * `running/` by a crash, so an interrupted dispatch runs again; the done-file
- * is written before the running-file is removed, and recovery skips specs that
- * already have one, which keeps the duplicate window to "crashed after the
- * turn finished but before the result was durable".
- *
- * Concurrency: specs for *different* targets run concurrently — one slow thread
- * must not block dispatches to every other worker. Specs for the *same* target
- * are serialized through a `SerialQueue`, so the on-disk arrival order is the
- * order they reach the thread.
+ * Per-target SerialQueues preserve createdUtc/id ordering; other targets run
+ * concurrently. Provider ownership, generations and completion remain in the
+ * same turn_attempts row, so there is no second durable recovery queue.
  */
 import { access, mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { renameSync, rmSync } from "node:fs";
 import * as path from "node:path";
 import { SerialQueue } from "../serial-queue.js";
-import { DispatchSuspendedError } from "./attempt-store.js";
+import { DispatchSuspendedError, type TurnAttemptStore } from "./attempt-store.js";
 import type { Logger } from "../../lib/logger.js";
 import type { DispatchResult, DispatchSpec } from "./types.js";
 import {
@@ -55,6 +46,8 @@ export interface DispatchWatcherOpts {
   /** `config.DATA_DIR` — the queue lives at `<dataDir>/dispatch/`. */
   dataDir: string;
   logger: Logger;
+  /** Sole authority for admitted work, execution phase, and recovery. */
+  attempts: TurnAttemptStore;
   /**
    * Run one dispatched turn. Resolve ⇒ `done/` gets `status: "completed"`;
    * reject ⇒ `status: "failed"` with the error message.
@@ -74,16 +67,13 @@ export interface DispatchWatcherOpts {
   /** Poll interval in ms. Default 1000. */
   pollMs?: number;
   /**
-   * When true, crash leftovers in `running/` are marked `resume: true` and
-   * LEFT in place for the orchestrator to precondition-check + stagger-
-   * requeue. When false (default), today's recoverStale re-enqueues them
-   * unmarked — original-prompt replay, unconfigured == today's behavior.
+   * Compatibility option for callers. The runtime's beforeAdmission callback
+   * owns resume policy; this watcher never infers replay from a flag or file.
    */
   resumeEnabled?: boolean;
-  /** Durable ledger gate: false means recovery must terminalize, never replay. */
+  /** Legacy delegation observation. Conflicts with SQL attempts are reported,
+   * not used to veto their recorded execution. */
   mayRecover?: (id: string) => boolean;
-  /** Modern SQL-owned attempts must never use legacy original-input replay. */
-  retainForRecovery?: (id: string) => boolean;
   /** Boot reconciliation that must finish before pending specs may be claimed. */
   beforeAdmission?: () => Promise<void>;
   /**
@@ -109,8 +99,8 @@ export interface DispatchWatcherOpts {
   /** Deterministic test seam: pauses an owned writer after its temp file is
    * durable but before the atomic done-file rename. */
   beforeOwnedDoneCommit?: (id: string) => Promise<void>;
-  /** Deterministic test seam: pauses recovery after its first ledger check but
-   * before publishing the recovered pending artifact. */
+  /** Deterministic test seam: pauses recovery before its final SQL state check
+   * and transient authorization. No recovery artifact is published. */
   beforeRecoveryPublish?: (id: string) => Promise<void>;
 }
 
@@ -169,9 +159,12 @@ export class DispatchWatcher {
   private readonly onDispatch: DispatchWatcherOpts["onDispatch"];
   private readonly onRetained?: DispatchWatcherOpts["onRetained"];
   private readonly pollMs: number;
-  private readonly resumeEnabled: boolean;
   private readonly mayRecover: (id: string) => boolean;
-  private readonly retainForRecovery: (id: string) => boolean;
+  private readonly attempts: TurnAttemptStore;
+  /** Boot/operator preconditions authorize an existing suspended row, not a
+   * second durable queue. A new boot recomputes this transient permission. */
+  private readonly recoveryReady = new Set<string>();
+  private readonly deferred = new Set<string>();
   private readonly beforeAdmission?: () => Promise<void>;
   private admissionRelease: Promise<void> = Promise.resolve();
   private readonly admissionBarrierTimeoutMs: number;
@@ -234,9 +227,8 @@ export class DispatchWatcher {
     this.onDispatch = opts.onDispatch;
     this.onRetained = opts.onRetained;
     this.pollMs = opts.pollMs ?? 1000;
-    this.resumeEnabled = opts.resumeEnabled === true;
     this.mayRecover = opts.mayRecover ?? (() => true);
-    this.retainForRecovery = opts.retainForRecovery ?? (() => false);
+    this.attempts = opts.attempts;
     this.beforeAdmission = opts.beforeAdmission;
     this.admissionBarrierTimeoutMs = opts.admissionBarrierTimeoutMs ?? ADMISSION_BARRIER_TIMEOUT_MS;
     this.isCompleted = opts.isCompleted ?? (() => false);
@@ -282,21 +274,18 @@ export class DispatchWatcher {
     }
   }
 
-  /** Create the queue dirs, recover anything a crash left in `running/`, then
+  /** Create the projection dirs, retire proven-dead SQL owners, then
    * start polling. Callers may arm boot reconciliation plus the first dispatch
    * pass in the background; admission stays closed until reconciliation ends. */
   async start(opts: DispatchWatcherStartOpts = {}): Promise<void> {
     const lifecycleEpoch = ++this.lifecycleEpoch;
-    await mkdir(this.dirs.pending, { recursive: true });
-    await mkdir(this.dirs.running, { recursive: true });
-    await mkdir(this.dirs.done, { recursive: true });
+    for (const dir of [this.dirs.pending, this.dirs.running, this.dirs.done]) {
+      await mkdir(dir, { recursive: true }).catch(err =>
+        this.logger.warn({ dir, err }, "dispatch: filesystem contract unavailable; admitted SQL work remains available"));
+    }
     // SINGLE-INSTANCE ASSUMPTION: recovery assumes no other seam-acp process
     // owns these specs. Two processes on one DATA_DIR would double-resume.
-    if (this.resumeEnabled) {
-      await this.markStaleInPlace();
-    } else {
-      await this.recoverStale();
-    }
+    this.attempts.retireDeadOwners();
     this.admissionRelease = (async () => {
       // #303: keep pending admission closed until interrupted running turns have
       // joined the same first tick; deleting this await lets newer pending turns
@@ -417,23 +406,25 @@ export class DispatchWatcher {
       names = await this.readDir(this.dirs.pending);
     } catch (err) {
       this.logger.warn({ err }, "cannot read pending dir");
-      return;
+      names = []; // Only ingress is unavailable; admitted SQL work still runs.
     }
     // #174: re-check admission AFTER the await. Intake may have closed while
     // this tick was reading the directory; claiming now would start work the
     // shutdown barrier has already decided it is not waiting for. The specs
     // stay in `pending/` and are delivered on the next boot.
     if (!this.ready) return;
-    const ids = names
+    const ids = [...new Set([...names
       .filter((name) => name.endsWith(".json"))
-      .map((name) => name.slice(0, -".json".length))
-      .filter((id) => !this.inFlight.has(id) && !this.claiming.has(id));
+      .map((name) => name.slice(0, -".json".length)),
+      ...this.attempts.list("pending").filter(a => a.source === "dispatch").map(a => a.id),
+      ...this.recoveryReady])]
+      .filter((id) => !this.inFlight.has(id) && !this.claiming.has(id) && !this.deferred.has(id));
     const claimFenceSequence = this.fenceSequence;
     const claimGlobalEpoch = this.globalEpoch;
     const claims = ids.map((id) => ({ id, token: Symbol(id) }));
     for (const { id } of claims) this.claiming.add(id);
 
-    // Claim (rename + parse) concurrently — a race here is harmless — but collect
+    // Admit (SQL commit + ingress acknowledgement) concurrently, but collect
     // the winners and ENQUEUE their runs in a deterministic arrival order
     // (createdUtc, then id). Otherwise two same-target specs claimed in one tick
     // would reach their SerialQueue in whatever order the async claim races
@@ -473,153 +464,35 @@ export class DispatchWatcher {
   /** SQL wins after pruning. Legacy outputs without a SQL completion remain
    * recovery authority until their completion/delivery has been resolved. */
   async hasCompleted(id: string): Promise<boolean> {
+    const attempt = this.attempts.get(id);
+    if (attempt) {
+      if (attempt.state === "completed" || attempt.state === "cancelled") return true;
+      if (this.isCompleted(id) || !this.mayRecover(id) || await exists(path.join(this.dirs.done, `${id}.json`))) {
+        this.logger.warn({ id, authority: "turn_attempts" },
+          "dispatch: completion projection conflicts with nonterminal SQL; continuing recorded execution");
+      }
+      return false;
+    }
     return this.isCompleted(id) || await exists(path.join(this.dirs.done, `${id}.json`));
   }
 
-  /**
-   * Re-enqueue crash leftovers. A spec that already has a done-file finished its
-   * turn — the process just died before deleting the running-file — so it is
-   * dropped rather than re-run.
-   */
-  private async recoverStale(): Promise<void> {
-    let names: string[];
-    try {
-      names = await this.readDir(this.dirs.running);
-    } catch {
-      return;
-    }
-    let requeued = 0;
-    for (const name of names) {
-      if (!name.endsWith(".json")) continue;
-      const id = name.slice(0, -".json".length);
-      const runningPath = path.join(this.dirs.running, name);
-      if (await this.hasCompleted(id)) {
-        await rm(runningPath, { force: true }).catch(() => {});
-        this.logger.info({ id }, "dispatch: dropped stale running spec (already done)");
-        continue;
-      }
-      if (!this.mayRecover(id)) {
-        await this.abandonRunning(id, "durable delegation ledger is terminal");
-        this.logger.warn({ id }, "dispatch: terminalized stale spec blocked by ledger");
-        continue;
-      }
-      if (this.retainForRecovery(id)) continue;
-      if (await this.requeueStale(id)) requeued++;
-    }
-    if (requeued > 0) {
-      this.logger.info({ requeued }, "dispatch: re-enqueued stale running specs");
-    }
-  }
-
-  /**
-   * Flag-on boot path: stamp `resume: true` onto crash leftovers in `running/`
-   * but do NOT move them to pending. The orchestrator lists them, applies
-   * max-age / preconditions, then {@link requeueStale}s the ones that should
-   * fire. Specs that already have a done-file are dropped (same as recoverStale).
-   */
-  private async markStaleInPlace(): Promise<void> {
-    let names: string[];
-    try {
-      names = await this.readDir(this.dirs.running);
-    } catch {
-      return;
-    }
-    let marked = 0;
-    for (const name of names) {
-      if (!name.endsWith(".json")) continue;
-      const id = name.slice(0, -".json".length);
-      const runningPath = path.join(this.dirs.running, name);
-      if (await this.hasCompleted(id)) {
-        await rm(runningPath, { force: true }).catch(() => {});
-        this.logger.info({ id }, "dispatch: dropped stale running spec (already done)");
-        continue;
-      }
-      if (!this.mayRecover(id)) {
-        await this.abandonRunning(id, "durable delegation ledger is terminal");
-        this.logger.warn({ id }, "dispatch: terminalized stale resume blocked by ledger");
-        continue;
-      }
-      try {
-        const spec = parseDispatchSpec(id, await readFile(runningPath, "utf8"));
-        if (spec.resume) {
-          marked++;
-          continue;
-        }
-        const tmpPath = `${runningPath}.tmp`;
-        await writeFile(tmpPath, `${JSON.stringify({ ...spec, resume: true }, null, 2)}\n`, "utf8");
-        await rename(tmpPath, runningPath);
-        marked++;
-      } catch (err) {
-        this.logger.warn({ err, id }, "dispatch: could not mark stale spec as resume");
-      }
-    }
-    if (marked > 0) {
-      this.logger.info({ marked }, "dispatch: marked stale running specs for resume");
-    }
-  }
-
-  /** Crash leftovers still sitting in `running/` with no done-file. */
+  /** Interrupted inventory comes only from SQL, even if every projection is lost. */
   async listStaleRunning(): Promise<DispatchSpec[]> {
-    let names: string[];
-    try {
-      names = await this.readDir(this.dirs.running);
-    } catch {
-      return [];
-    }
-    const out: DispatchSpec[] = [];
-    for (const name of names) {
-      if (!name.endsWith(".json")) continue;
-      const id = name.slice(0, -".json".length);
-      if (this.inFlight.has(id)) continue;
-      if (await this.hasCompleted(id)) continue;
-      try {
-        out.push(parseDispatchSpec(id, await readFile(path.join(this.dirs.running, name), "utf8")));
-      } catch {
-        // unparseable
-      }
-    }
-    return out;
+    return this.attempts.list("suspended")
+      .filter(a => a.source === "dispatch" && !this.inFlight.has(a.id))
+      .map(a => ({ ...a.spec, resume: a.promptStarted }));
   }
 
-  /** Move a marked stale spec from `running/` to `pending/` so the next tick
-   *  claims it through the normal dispatch path. */
+  /** Authorize an existing SQL attempt after boot/operator preconditions. */
   async requeueStale(id: string): Promise<boolean> {
     return this.withArtifact(id, async () => {
-      const name = `${id}.json`;
-      const runningPath = path.join(this.dirs.running, name);
-      const pendingPath = path.join(this.dirs.pending, name);
-      if (await this.hasCompleted(id)) {
-        await rm(runningPath, { force: true }).catch(() => {});
-        return false;
-      }
-      let spec: DispatchSpec;
-      try {
-        spec = parseDispatchSpec(id, await readFile(runningPath, "utf8"));
-      } catch (err) {
-        this.logger.warn({ err, id }, "dispatch: could not read resume spec");
-        return false;
-      }
-      if (!this.mayRecover(id)) {
-        await this.terminalizeLocked(spec, "abandoned: durable delegation ledger is terminal");
-        return false;
-      }
       if (this.beforeRecoveryPublish) await this.beforeRecoveryPublish(id);
-      if (!this.mayRecover(id)) {
-        await this.terminalizeLocked(spec, "abandoned: durable delegation ledger is terminal");
-        return false;
-      }
-      try {
-        // The final ledger check and publication are one non-yielding commit
-        // section, so a terminal transition cannot land between them.
-        renameSync(runningPath, pendingPath);
-      } catch (err) {
-        this.logger.warn({ err, id }, "dispatch: could not requeue resume spec");
-        return false;
-      }
-      if (!this.mayRecover(id)) {
-        await this.terminalizeLocked(spec, "abandoned: durable delegation ledger is terminal");
-        return false;
-      }
+      const a = this.attempts.get(id);
+      if (!a || a.source !== "dispatch" || a.state !== "suspended") return false;
+      // Refuse only a terminal execution. A stale delegation projection cannot
+      // strand nonterminal SQL-owned work; the owning dispatcher repairs it.
+      this.recoveryReady.add(id);
+      this.deferred.delete(id);
       return true;
     });
   }
@@ -658,91 +531,29 @@ export class DispatchWatcher {
 
   /**
    * Async half of localized repair. Worker finalization, recovery publication,
-   * and cleanup all take the same id-scoped serializer. The durable ledger is
-   * checked immediately before and immediately after the atomic publication,
-   * closing the check/rename window in both directions.
+   * and cleanup all take the same id-scoped serializer. Re-read SQL after the
+   * final fence check; terminal SQL wins and nonterminal SQL remains eligible
+   * without reconstructing original input from a filesystem projection.
    */
   async recoverTarget(fence: DispatchTargetFence): Promise<string[]> {
-    if (this.targetFences.get(fence.target) !== fence.token) return [];
-    const listed = await this.listQueueSpecs(["running", "pending"]);
-    const byId = new Map<string, DispatchSpec>();
-    for (const spec of [...listed, ...fence.claims]) {
-      if (spec.target === fence.target) byId.set(spec.id, spec);
-    }
-
+    if (!this.fenceCurrent(fence)) return [];
+    const specs = [...new Map([...fence.claims, ...await this.listQueueSpecs()]
+      .map(spec => [spec.id, spec])).values()];
     const recovered: string[] = [];
-    for (const spec of byId.values()) {
-      const didRecover = await this.withArtifact(spec.id, async () => {
-        if (!this.fenceCurrent(fence)) return false;
-        const name = `${spec.id}.json`;
-        const runningPath = path.join(this.dirs.running, name);
-        const pendingPath = path.join(this.dirs.pending, name);
-        if (await this.hasCompleted(spec.id)) {
-          await rm(runningPath, { force: true }).catch(() => {});
-          await rm(pendingPath, { force: true }).catch(() => {});
-          return false;
-        }
-        if (!this.mayRecover(spec.id)) {
-          await this.terminalizeLocked(spec, "abandoned: durable delegation ledger is terminal");
-          this.logger.warn(
-            { id: spec.id, target: fence.target },
-            "dispatch: local recovery terminalized artifact blocked by ledger"
-          );
-          return false;
-        }
-
+    for (const spec of specs) {
+      if (spec.target !== fence.target) continue;
+      await this.withArtifact(spec.id, async () => {
         if (this.beforeRecoveryPublish) await this.beforeRecoveryPublish(spec.id);
-        if (!this.fenceCurrent(fence)) return false;
-        if (!this.mayRecover(spec.id)) {
-          await this.terminalizeLocked(spec, "abandoned: durable delegation ledger is terminal");
-          return false;
+        if (!this.fenceCurrent(fence)) return;
+        const a = this.attempts.get(spec.id) ?? this.attempts.admit(spec);
+        if (a.state === "completed" || a.state === "cancelled") {
+          if (a.outcome) await this.finishLocked(a.id, a.outcome);
+          return;
         }
-
-        if (await exists(runningPath)) {
-          if (!this.fenceCurrent(fence)) return false;
-          if (!this.mayRecover(spec.id)) {
-            await this.terminalizeLocked(spec, "abandoned: durable delegation ledger is terminal");
-            return false;
-          }
-          try {
-            // Same non-yielding ledger-check/publication commit as manual and
-            // boot recovery.
-            renameSync(runningPath, pendingPath);
-          } catch (err) {
-            if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
-              this.logger.warn(
-                { err, id: spec.id, target: fence.target },
-                "dispatch: local recovery requeue failed"
-              );
-              return false;
-            }
-          }
-        } else if (!(await exists(pendingPath))) {
-          const published = await this.publishPendingLocked(
-            spec,
-            () => this.fenceCurrent(fence) && this.mayRecover(spec.id)
-          );
-          if (!published) {
-            if (this.fenceCurrent(fence) && !this.mayRecover(spec.id)) {
-              await this.terminalizeLocked(
-                spec,
-                "abandoned: durable delegation ledger is terminal"
-              );
-            }
-            return false;
-          }
-        }
-
-        // A ledger transition can occur during any preceding staging/existence
-        // await. Reconcile it before exposing this artifact for execution.
-        if (!this.fenceCurrent(fence)) return false;
-        if (!this.mayRecover(spec.id)) {
-          await this.terminalizeLocked(spec, "abandoned: durable delegation ledger is terminal");
-          return false;
-        }
-        return exists(pendingPath);
+        if (a.state === "suspended") this.recoveryReady.add(a.id);
+        this.deferred.delete(a.id);
+        recovered.push(a.id);
       });
-      if (didRecover) recovered.push(spec.id);
     }
     return recovered;
   }
@@ -760,7 +571,7 @@ export class DispatchWatcher {
       this.revokeArtifact(filter.id);
     }
     try {
-      const listed = await this.listQueueSpecs(["running", "pending"]);
+      const listed = await this.listQueueSpecs();
       const claims = targetFence?.claims ?? globalFence?.claims ?? [];
       const byId = new Map<string, DispatchSpec>();
       for (const spec of [...listed, ...claims]) {
@@ -791,7 +602,13 @@ export class DispatchWatcher {
     this.revokeArtifact(id);
     let target = "";
     let correlationId: string | undefined;
-    for (const dir of [this.dirs.running, this.dirs.pending]) {
+    const recorded = this.attempts.get(id);
+    if (recorded) {
+      target = recorded.spec.target;
+      correlationId = recorded.spec.correlationId;
+      this.attempts.cancel(id, `abandoned: ${reason}`);
+    }
+    for (const dir of recorded ? [] : [this.dirs.pending]) {
       try {
         const spec = parseDispatchSpec(id, await readFile(path.join(dir, `${id}.json`), "utf8"));
         target = spec.target;
@@ -844,10 +661,10 @@ export class DispatchWatcher {
           return { state: "done" as const, inFlight };
         }
 
-        let spec = owner?.spec;
+        let spec = this.attempts.get(id)?.spec ?? owner?.spec;
         let found = spec !== undefined;
         if (!spec) {
-          for (const artifactPath of [runningPath, pendingPath]) {
+          for (const artifactPath of [pendingPath]) {
             try {
               spec = parseDispatchSpec(id, await readFile(artifactPath, "utf8"));
               found = true;
@@ -858,6 +675,9 @@ export class DispatchWatcher {
           }
         }
         if (!found) return { state: "missing" as const, inFlight: false };
+
+        if (spec) this.attempts.admit(spec);
+        this.attempts.cancel(id, `quarantined: ${reason}`);
 
         await this.finishLocked(id, {
           id,
@@ -877,35 +697,29 @@ export class DispatchWatcher {
     }
   }
 
-  private async listQueueSpecs(subdirs: Array<"running" | "pending">): Promise<DispatchSpec[]> {
-    const out: DispatchSpec[] = [];
-    for (const sub of subdirs) {
-      const dir = this.dirs[sub];
-      let names: string[];
-      try {
-        names = await this.readDir(dir);
-      } catch {
-        continue;
-      }
-      for (const name of names) {
+  private async listQueueSpecs(): Promise<DispatchSpec[]> {
+    const out = new Map<string, DispatchSpec>();
+    {
+      for (const name of await this.readDir(this.dirs.pending).catch(() => [])) {
         if (!name.endsWith(".json")) continue;
-        const id = name.slice(0, -".json".length);
-        try {
-          out.push(parseDispatchSpec(id, await readFile(path.join(dir, name), "utf8")));
-        } catch {
-          // ignore
-        }
+        const id = name.slice(0, -5);
+        try { out.set(id, parseDispatchSpec(id, await readFile(path.join(this.dirs.pending, name), "utf8"))); }
+        catch (err) { this.logger.warn({ id, err }, "dispatch: unreadable ingress spec"); }
       }
     }
-    return out;
+    // SQL overwrites producer projections, never the reverse.
+    for (const state of ["pending", "active", "suspended"] as const) {
+      for (const a of this.attempts.list(state)) {
+        if (a.source === "dispatch") out.set(a.id, { ...a.spec, resume: a.promptStarted });
+      }
+    }
+    return [...out.values()];
   }
 
   /**
-   * Parse a pending spec, publish immutable ownership, then claim it by atomic
-   * rename into `running/`.
-   * Returns the spec on success; `null` when the claim was lost (ENOENT — a
-   * racing tick/process won it) or the spec was unparseable (already finalized
-   * as `failed` here, since retrying could never succeed). Kept separate from
+   * Admit ingress to SQL and publish immutable local queue ownership.
+   * Returns null when fenced, terminal, owned elsewhere, or unparseable.
+   * A missing producer file is normal after SQL admission. Kept separate from
    * {@link runSpec} so `tick` can order the runs after all claims land.
    */
   private async claimSpec(
@@ -915,68 +729,59 @@ export class DispatchWatcher {
     startedGlobalEpoch: number
   ): Promise<{ spec: DispatchSpec; owner: ClaimOwnership } | null> {
     return this.withArtifact(id, async () => {
-      const name = `${id}.json`;
-      const pendingPath = path.join(this.dirs.pending, name);
-      const runningPath = path.join(this.dirs.running, name);
-      // A duplicate queue marker can outlive its delivered/pruned result;
-      // without this check it would execute the original prompt again.
-      if (await this.hasCompleted(id)) {
-        await rm(pendingPath, { force: true });
-        return null;
-      }
-      let spec: DispatchSpec;
-      try {
-        // Parse before rename so target fencing can publish its ownership
-        // barrier before this claim crosses the pending→running commit point.
-        spec = parseDispatchSpec(id, await readFile(pendingPath, "utf8"));
-      } catch (err) {
-        if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
-        try {
-          await rename(pendingPath, runningPath);
-        } catch (renameErr) {
-          if ((renameErr as NodeJS.ErrnoException).code === "ENOENT") return null;
-          throw renameErr;
+      const pendingPath = path.join(this.dirs.pending, `${id}.json`);
+      let recorded = this.attempts.get(id);
+      let incoming: DispatchSpec | undefined;
+      try { incoming = parseDispatchSpec(id, await readFile(pendingPath, "utf8")); }
+      catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+          this.logger.error({ id, err }, "dispatch: unusable ingress; retaining SQL execution if present");
+          if (!recorded) {
+            await this.finishLocked(id, { id, status: "failed", target: "",
+              error: (err as Error).message, finishedUtc: new Date().toISOString() });
+            return null;
+          }
         }
-        const message = (err as Error).message;
-        this.logger.error({ id, err }, "dispatch: unusable spec");
-        await this.finishLocked(id, {
-          id,
-          status: "failed",
-          target: "",
-          error: message,
-          finishedUtc: new Date().toISOString(),
-        });
+      }
+      if (recorded && incoming && JSON.stringify(recorded.spec) !== JSON.stringify(incoming)) {
+        this.logger.warn({ id, authority: "turn_attempts" },
+          "dispatch: ingress conflicts with SQL; continuing recorded execution");
+      }
+      if (await this.hasCompleted(id)) {
+        this.recoveryReady.delete(id);
+        await rm(pendingPath, { force: true }).catch(() => {});
         return null;
       }
-
+      // Only an unowned legacy ingress uses the old terminal ledger check.
+      // Existing SQL execution keeps running despite a stale ledger projection.
+      if (!recorded && incoming && !this.mayRecover(id)) {
+        await this.terminalizeLocked(incoming, "abandoned: durable delegation ledger is terminal");
+        return null;
+      }
+      let spec = recorded ? { ...recorded.spec, resume: recorded.promptStarted } : incoming;
+      if (!spec) return null;
+      if ((this.targetFenceSequences.get(spec.target) ?? 0) > startedFenceSequence ||
+          this.globalEpoch !== startedGlobalEpoch || this.targetFences.has(spec.target) || this.globalFence) return null;
+      // SQL commit precedes ingress acknowledgement. A crash anywhere after
+      // this commit is recoverable with SQL alone.
+      recorded = this.attempts.admit(spec);
+      spec = { ...recorded.spec, resume: recorded.promptStarted };
+      if (incoming && recorded.state === "suspended" && !recorded.stalledUtc) this.recoveryReady.add(id);
+      await rm(pendingPath, { force: true }).catch(err =>
+        this.logger.warn({ id, err }, "dispatch: admitted ingress cleanup failed; SQL owns the duplicate"));
+      if (recorded.state !== "pending" && !this.recoveryReady.has(id)) return null;
       const owner: ClaimOwnership = Object.freeze({
-        token,
-        spec,
-        targetEpoch: this.targetEpoch(spec.target),
-        globalEpoch: this.globalEpoch,
+        token, spec, targetEpoch: this.targetEpoch(spec.target), globalEpoch: this.globalEpoch,
       });
-      const targetWasFenced =
-        (this.targetFenceSequences.get(spec.target) ?? 0) > startedFenceSequence;
-      if (
-        targetWasFenced ||
-        this.globalEpoch !== startedGlobalEpoch ||
-        this.targetFences.has(spec.target) ||
-        this.globalFence
-      ) {
-        return null;
-      }
+      // Intake/fencing may change during best-effort ingress cleanup.
+      if (!this.ready || this.globalEpoch !== startedGlobalEpoch ||
+          (this.targetFenceSequences.get(spec.target) ?? 0) > startedFenceSequence ||
+          this.targetFences.has(spec.target) || this.globalFence) return null;
       this.inFlight.set(id, owner);
-
-      // Claim by rename: atomic within a filesystem, so if two processes race,
-      // exactly one wins. It is synchronous so a target fence cannot interleave
-      // between the ownership check above and this commit point.
-      try {
-        renameSync(pendingPath, runningPath);
-      } catch (err) {
-        if (this.inFlight.get(id) === owner) this.inFlight.delete(id);
-        if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
-        throw err;
-      }
+      this.recoveryReady.delete(id);
+      // Compatibility inventory only. Failure or loss cannot change execution.
+      await writeFile(path.join(this.dirs.running, `${id}.json`), JSON.stringify(spec), "utf8")
+        .catch(err => this.logger.warn({ id, err }, "dispatch: running projection unavailable; SQL execution continues"));
       return { spec, owner };
     });
   }
@@ -994,14 +799,14 @@ export class DispatchWatcher {
       if (!this.owns(owner)) return;
       // Another queued callback may have completed this id since claim time.
       // Keep the winning SQL outcome instead of writing a replacement failure.
-      if (this.isCompleted(id)) {
+      if (await this.hasCompleted(id)) {
         await this.withArtifact(id, async () => {
           await rm(path.join(this.dirs.running, `${id}.json`), { force: true });
           await rm(path.join(this.dirs.pending, `${id}.json`), { force: true });
         });
         return;
       }
-      if (!this.mayRecover(id)) {
+      if (!this.mayRecover(id) && !this.attempts.get(id)) {
         this.revokeArtifact(id);
         await this.withArtifact(id, () =>
           this.terminalizeLocked(spec, "abandoned: durable delegation ledger is terminal")
@@ -1016,6 +821,7 @@ export class DispatchWatcher {
         this.logger.warn({ id, target: spec.target }, "dispatch: quarantined before execution");
         return;
       }
+      if (!this.owns(owner)) return;
       const base = {
         id,
         target: spec.target,
@@ -1048,6 +854,7 @@ export class DispatchWatcher {
       } catch (err) {
         if (!this.owns(owner)) return;
         if (err instanceof DispatchSuspendedError) {
+          this.deferred.add(id);
           // SQL owns suspension. Keep the running spec; no failed done/report.
           this.logger.info(
             { id, target: spec.target, suspension: err.suspension, reason: err.reason },
@@ -1118,10 +925,10 @@ export class DispatchWatcher {
   private async finishOwned(owner: ClaimOwnership, result: DispatchResult): Promise<boolean> {
     return this.withArtifact(owner.spec.id, async () => {
       if (!this.owns(owner)) {
-        await this.restoreRevokedOwnerLocked(owner);
         return false;
       }
       const id = owner.spec.id;
+      this.attempts.completePending(id, result);
       const name = `${id}.json`;
       const finalPath = path.join(this.dirs.done, name);
       const tmpPath = `${finalPath}.tmp`;
@@ -1131,7 +938,6 @@ export class DispatchWatcher {
         if (this.beforeOwnedDoneCommit) await this.beforeOwnedDoneCommit(id);
         if (!this.owns(owner)) {
           await rm(tmpPath, { force: true }).catch(() => {});
-          await this.restoreRevokedOwnerLocked(owner);
           return false;
         }
         // These tiny metadata operations intentionally do not yield. Ownership
@@ -1145,8 +951,8 @@ export class DispatchWatcher {
       } catch (err) {
         this.logger.error({ err, id }, "dispatch: could not write result file");
         await rm(tmpPath, { force: true }).catch(() => {});
-        // If publication succeeded but cleanup failed, the done-file remains
-        // authoritative and startup recovery drops the leftover marker.
+        // Cleanup failure cannot undo captured SQL completion. The published
+        // result remains available and startup projection repairs leftovers.
         return published && (await exists(finalPath));
       }
       await this.applyRetention(id);
@@ -1155,6 +961,8 @@ export class DispatchWatcher {
   }
 
   private async finishLocked(id: string, result: DispatchResult): Promise<void> {
+    this.attempts.completePending(id, result);
+    result = this.attempts.get(id)?.outcome ?? result;
     const name = `${id}.json`;
     const finalPath = path.join(this.dirs.done, name);
     const tmpPath = `${finalPath}.tmp`;
@@ -1164,7 +972,7 @@ export class DispatchWatcher {
     } catch (err) {
       this.logger.error({ err, id }, "dispatch: could not write result file");
       await rm(tmpPath, { force: true }).catch(() => {});
-      return; // leave the running-file so start() re-enqueues it
+      return; // SQL completion remains terminal; boot retries its projection.
     }
     await rm(path.join(this.dirs.running, name), { force: true }).catch(() => {});
     // Command-layer cancel may finalize a spec still sitting in pending/
@@ -1223,6 +1031,13 @@ export class DispatchWatcher {
   }
 
   private async terminalizeLocked(spec: DispatchSpec, error: string): Promise<void> {
+    const recorded = this.attempts.get(spec.id);
+    if (recorded?.state === "completed" || recorded?.state === "cancelled") {
+      if (recorded.outcome) await this.finishLocked(spec.id, recorded.outcome);
+      return;
+    }
+    this.attempts.admit(spec);
+    this.attempts.cancel(spec.id, error);
     await this.finishLocked(spec.id, {
       id: spec.id,
       status: "failed",
@@ -1231,44 +1046,6 @@ export class DispatchWatcher {
       ...(spec.correlationId ? { correlationId: spec.correlationId } : {}),
       finishedUtc: new Date().toISOString(),
     });
-  }
-
-  /** Recreate the claimed spec only when no later terminal owner exists. */
-  private async restoreRevokedOwnerLocked(owner: ClaimOwnership): Promise<void> {
-    const current = this.inFlight.get(owner.spec.id);
-    if (current && current.token !== owner.token) return;
-    await this.restorePendingLocked(owner.spec);
-  }
-
-  private async restorePendingLocked(spec: DispatchSpec): Promise<void> {
-    const name = `${spec.id}.json`;
-    if (await this.hasCompleted(spec.id)) return;
-    const runningPath = path.join(this.dirs.running, name);
-    const pendingPath = path.join(this.dirs.pending, name);
-    if (await exists(runningPath)) {
-      try {
-        await rename(runningPath, pendingPath);
-        return;
-      } catch (err) {
-        if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
-      }
-    }
-    if (!(await exists(pendingPath))) await this.publishPendingLocked(spec);
-  }
-
-  private async publishPendingLocked(
-    spec: DispatchSpec,
-    mayCommit?: () => boolean
-  ): Promise<boolean> {
-    const pendingPath = path.join(this.dirs.pending, `${spec.id}.json`);
-    const tmpPath = `${pendingPath}.recovery.tmp`;
-    await writeFile(tmpPath, `${JSON.stringify(spec, null, 2)}\n`, "utf8");
-    if (mayCommit && !mayCommit()) {
-      await rm(tmpPath, { force: true }).catch(() => {});
-      return false;
-    }
-    renameSync(tmpPath, pendingPath);
-    return true;
   }
 
   private async withArtifact<T>(id: string, task: () => Promise<T>): Promise<T> {

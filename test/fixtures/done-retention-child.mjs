@@ -24,11 +24,11 @@ const outcome = { id, kind: "wake", target: spec.target, status: "completed", ou
 if (phase === "produce") {
   store.recordDelegation({ id, kind: "wake", status: "running" });
   store.turnAttempts.registerOwner("disposable-producer");
-  const a = store.turnAttempts.claim(spec, "fixture", "disposable-producer");
   await mkdir(dirs.pending, { recursive: true });
   await writeFile(path.join(dirs.pending, `${id}.json`), JSON.stringify(spec));
-  const watcher = new DispatchWatcher({ dataDir, logger,
+  const watcher = new DispatchWatcher({ attempts: store.turnAttempts, dataDir, logger,
     onDispatch: async () => {
+      const a = store.turnAttempts.claim(spec, "fixture", "disposable-producer");
       await writeFile(path.join(dataDir, "execution-count"), "1");
       store.turnAttempts.complete(a, outcome);
       return { output: outcome.output, stopReason: "end_turn" };

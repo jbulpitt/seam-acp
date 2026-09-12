@@ -21,7 +21,7 @@ export interface TurnAttempt {
   id: string;
   generation: number;
   ownerBoot: string;
-  state: "active" | "suspended" | "completed" | "cancelled";
+  state: "pending" | "active" | "suspended" | "completed" | "cancelled";
   identity: string;
   spec: DispatchSpec;
   acpSessionId: string | null;
@@ -161,6 +161,24 @@ export class TurnAttemptStore {
       .run(id, JSON.stringify(processOwner()));
   }
 
+  /** Commit ingress before acknowledging its file. Existing execution always
+   * wins over a duplicate producer's spec; no identity is invented at ingress. */
+  admit(spec: DispatchSpec): TurnAttempt {
+    this.db.prepare(`INSERT OR IGNORE INTO turn_attempts
+      (id,generation,owner_boot,state,identity,spec_json,updated_utc,source,delivery_protocol)
+      VALUES (?,0,'','pending','',?,?,'dispatch',1)`)
+      .run(spec.id, JSON.stringify(spec), new Date().toISOString());
+    return this.get(spec.id)!;
+  }
+
+  /** A non-provider callback/setup failure can settle an admitted job before
+   * execution claims it. Never overwrite a provider-owned generation. */
+  completePending(id: string, outcome: DispatchResult): boolean {
+    return this.db.prepare(`UPDATE turn_attempts SET state='completed', outcome_json=?, updated_utc=?
+      WHERE id=? AND state='pending'`)
+      .run(JSON.stringify(outcome), new Date().toISOString(), id).changes === 1;
+  }
+
   retireDeadOwners(): number {
     const owners = this.db.prepare("SELECT id,process_json FROM turn_attempt_owners").all() as { id: string; process_json: string }[];
     let n = 0;
@@ -207,7 +225,12 @@ export class TurnAttemptStore {
   claim(spec: DispatchSpec, identity: string, ownerBoot: string, source: TurnAttempt["source"] = "dispatch"): TurnAttempt {
     return this.db.transaction(() => {
       const old = this.get(spec.id);
-      if (old) {
+      if (old && old.generation === 0 && (old.state === "pending" || old.state === "suspended") && old.source === source) {
+        this.db.prepare(`UPDATE turn_attempts SET generation=1, owner_boot=?, state='active',
+          identity=?, stalled_utc=NULL, stalled_reason=NULL, stall_notice_utc=NULL,
+          updated_utc=? WHERE id=? AND generation=0 AND state IN ('pending','suspended')`)
+          .run(ownerBoot, identity, new Date().toISOString(), spec.id);
+      } else if (old) {
         // Two different events wore one throw: a live attempt somebody else is
         // still running, and an id whose recorded origin disagrees with the
         // caller's. The first resolves itself; the second never will.
@@ -445,7 +468,7 @@ export class TurnAttemptStore {
   markStalled(id: string, reason: string, now = new Date().toISOString()): boolean {
     return this.db.prepare(`UPDATE turn_attempts
       SET state='suspended', stalled_utc=?, stalled_reason=?, updated_utc=?
-      WHERE id=? AND state IN ('active','suspended') AND stalled_utc IS NULL`)
+      WHERE id=? AND state IN ('pending','active','suspended') AND stalled_utc IS NULL`)
       .run(now, reason, now, id).changes === 1;
   }
 
@@ -478,23 +501,31 @@ export class TurnAttemptStore {
   }
 
   /** Explicit cancellation may win against suspension, never against captured completion. */
-  cancel(id: string): boolean {
+  cancel(id: string, reason = "cancelled by operator"): boolean {
     return this.db.transaction(() => {
       const a = this.get(id);
-      if (!a || (a.state !== "active" && a.state !== "suspended")) return false;
+      if (!a || (a.state !== "pending" && a.state !== "active" && a.state !== "suspended")) return false;
       const outcome: DispatchResult = {
         id, target: a.spec.target, status: "failed", workerStatus: "failed",
-        error: "cancelled by operator", suppressedOnward: true,
-        kind: a.spec.kind, finishedUtc: new Date().toISOString(),
+        error: reason, suppressedOnward: true,
+        kind: a.spec.kind, correlationId: a.spec.correlationId,
+        returnTo: a.spec.returnTo, chainId: a.spec.chainId, finishedUtc: new Date().toISOString(),
       };
       return this.db.prepare(`UPDATE turn_attempts SET state='cancelled', outcome_json=?, updated_utc=?
-        WHERE id=? AND state IN ('active','suspended')`)
+        WHERE id=? AND state IN ('pending','active','suspended')`)
         .run(JSON.stringify(outcome), outcome.finishedUtc, id).changes === 1;
     }).immediate();
   }
 
-  list(state: TurnAttempt["state"]): TurnAttempt[] {
-    return (this.db.prepare("SELECT id FROM turn_attempts WHERE state=? ORDER BY id").all(state) as { id: string }[])
-      .map(({ id }) => this.get(id)!);
+  list(state: TurnAttempt["state"], onUnreadable: (id: string, err: unknown) => void =
+    (id, err) => console.error("dispatch: unreadable SQL attempt; other attempts remain available", id, err)): TurnAttempt[] {
+    const attempts: TurnAttempt[] = [];
+    for (const { id } of this.db.prepare("SELECT id FROM turn_attempts WHERE state=? ORDER BY id").all(state) as { id: string }[]) {
+      // Refuse only the unreadable row, never the entire recovery inventory.
+      // Its SQL record remains available for inspection; other rows proceed.
+      try { const a = this.get(id); if (a) attempts.push(a); }
+      catch (err) { onUnreadable(id, err); }
+    }
+    return attempts;
   }
 }

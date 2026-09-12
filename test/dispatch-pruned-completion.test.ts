@@ -41,7 +41,7 @@ describe("completion survives done artifact removal (#306)", () => {
         }));
       }
       const onDispatch = vi.fn(async () => ({ output: "duplicate", stopReason: "end_turn" }));
-      const watcher = new DispatchWatcher({
+      const watcher = new DispatchWatcher({ attempts: store.turnAttempts,
         dataDir, logger, resumeEnabled, onDispatch,
         isCompleted: (id: string) => store.isDispatchCompleted(id),
       });
@@ -49,7 +49,8 @@ describe("completion survives done artifact removal (#306)", () => {
       await watcher.start();
       // Without SQL completion authority, a pruned result becomes a paid rerun or a replacement failure.
       expect(onDispatch).not.toHaveBeenCalled();
-      expect(await readdir(dirs.running)).toEqual([]);
+      // Obsolete projections are neither enumerated nor replayed.
+      expect(await readdir(dirs.running)).toEqual(["running.json"]);
       expect(await readdir(dirs.pending)).toEqual([]);
       expect(await readdir(dirs.done)).toEqual([]);
       expect(await watcher.listStaleRunning()).toEqual([]);

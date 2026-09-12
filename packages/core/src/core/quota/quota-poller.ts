@@ -110,7 +110,7 @@ export function createAgentQuotaSources(
       return {
         ...identity,
         eventDriven: true,
-        fetch: async () => mapCodexQuota(identity, await fetchCodexUsage()),
+        fetch: async (signal) => mapCodexQuota(identity, await fetchCodexUsage({ signal })),
       };
     }
     if (profile.id === "grok" || profile.id.startsWith("grok-")) {

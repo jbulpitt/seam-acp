@@ -453,6 +453,32 @@ export interface CodexUsageData {
   error?: string;
 }
 
+/**
+ * Maximum directory entries inspected while locating Codex rollout files.
+ * The production tree measured 366 entries / 347 rollouts on 2026-09-11, so
+ * 10,000 leaves more than 27x current structural headroom while placing a firm
+ * ceiling below a pathological or accidentally misconfigured tree.
+ */
+export const CODEX_USAGE_MAX_TRAVERSAL_ENTRIES = 10_000;
+
+const CODEX_USAGE_RECENT_FILE_LIMIT = 25;
+
+class CodexUsageTraversalLimitError extends Error {
+  constructor(readonly limit: number) {
+    super(`Codex usage traversal exceeded the ${limit}-entry ceiling`);
+    this.name = "CodexUsageTraversalLimitError";
+  }
+}
+
+function throwIfCodexUsageAborted(signal?: AbortSignal): void {
+  // #307: this guard stops only the current Codex usage scan; deleting it lets
+  // filesystem work continue after the quota source has already timed out.
+  if (!signal?.aborted) return;
+  throw signal.reason instanceof Error
+    ? signal.reason
+    : new Error("Codex usage traversal was cancelled");
+}
+
 function mapCodexRateLimits(raw: unknown): CodexUsageData | null {
   if (!raw || typeof raw !== "object") return null;
   const r = raw as Record<string, unknown>;
@@ -484,12 +510,21 @@ function mapCodexRateLimits(raw: unknown): CodexUsageData | null {
 }
 
 /** Scan one rollout for the LAST token_count carrying a `rate_limits` block. */
-async function readLastCodexRateLimits(filePath: string): Promise<CodexUsageData | null> {
+async function readLastCodexRateLimits(
+  filePath: string,
+  signal?: AbortSignal
+): Promise<CodexUsageData | null> {
+  throwIfCodexUsageAborted(signal);
   const stream = createReadStream(filePath, { encoding: "utf8" });
+  const abort = () => stream.destroy(
+    signal?.reason instanceof Error ? signal.reason : new Error("Codex usage traversal was cancelled")
+  );
+  signal?.addEventListener("abort", abort, { once: true });
   let found: CodexUsageData | null = null;
   try {
     const rl = createInterface({ input: stream, crlfDelay: Infinity });
     for await (const line of rl) {
+      throwIfCodexUsageAborted(signal);
       // Cheap pre-filter so we only JSON.parse the relevant lines.
       if (!line.includes("token_count") || !line.includes("rate_limits")) continue;
       let entry: RolloutEntry;
@@ -506,12 +541,59 @@ async function readLastCodexRateLimits(filePath: string): Promise<CodexUsageData
       if (mapped) found = mapped; // keep the LAST one in the file
     }
     rl.close();
-  } catch {
+  } catch (err) {
+    if (signal?.aborted) throwIfCodexUsageAborted(signal);
     /* fall through with whatever we found */
   } finally {
+    signal?.removeEventListener("abort", abort);
     stream.destroy();
   }
   return found;
+}
+
+async function collectCodexUsageFiles(
+  root: string,
+  signal: AbortSignal | undefined,
+  maxEntries: number
+): Promise<string[]> {
+  const files: string[] = [];
+  const pending = [root];
+  let visited = 0;
+  while (pending.length > 0) {
+    throwIfCodexUsageAborted(signal);
+    const dir = pending.pop()!;
+    let entries;
+    try {
+      entries = await fsp.opendir(dir);
+      throwIfCodexUsageAborted(signal);
+    } catch (err) {
+      if (signal?.aborted) throwIfCodexUsageAborted(signal);
+      continue;
+    }
+    try {
+      throwIfCodexUsageAborted(signal);
+      for await (const entry of entries) {
+        throwIfCodexUsageAborted(signal);
+        visited++;
+        // #307: this ceiling refuses only the Codex usage source; deleting it
+        // makes traversal termination depend entirely on the directory data.
+        if (visited > maxEntries) throw new CodexUsageTraversalLimitError(maxEntries);
+        const candidate = path.join(dir, entry.name);
+        if (entry.isDirectory()) pending.push(candidate);
+        else if (entry.isFile() && entry.name.endsWith(".jsonl")) files.push(candidate);
+      }
+    } catch (err) {
+      if (signal?.aborted) throwIfCodexUsageAborted(signal);
+      throw err;
+    } finally {
+      // Async iteration normally closes the handle itself. Explicit close is
+      // needed when cancellation lands after opendir() but before iteration.
+      await entries.close().catch((err: NodeJS.ErrnoException) => {
+        if (err.code !== "ERR_DIR_CLOSED") throw err;
+      });
+    }
+  }
+  return files;
 }
 
 /**
@@ -523,8 +605,12 @@ async function readLastCodexRateLimits(filePath: string): Promise<CodexUsageData
  */
 export async function fetchCodexUsage(opts?: {
   sessionsRoot?: string;
+  signal?: AbortSignal;
+  /** Test/embedding override. Production uses CODEX_USAGE_MAX_TRAVERSAL_ENTRIES. */
+  maxTraversalEntries?: number;
 }): Promise<CodexUsageData> {
   const root = opts?.sessionsRoot ?? defaultCodexSessionsRoot();
+  const maxEntries = opts?.maxTraversalEntries ?? CODEX_USAGE_MAX_TRAVERSAL_ENTRIES;
   const empty = (error?: string): CodexUsageData => ({
     ok: false,
     plan: null,
@@ -534,39 +620,35 @@ export async function fetchCodexUsage(opts?: {
     ...(error ? { error } : {}),
   });
   try {
-    const files: string[] = [];
-    const walk = async (dir: string): Promise<void> => {
-      let entries;
-      try {
-        entries = await fsp.readdir(dir, { withFileTypes: true });
-      } catch {
-        return;
-      }
-      for (const e of entries) {
-        const p = path.join(dir, e.name);
-        if (e.isDirectory()) await walk(p);
-        else if (e.isFile() && e.name.endsWith(".jsonl")) files.push(p);
-      }
-    };
-    await walk(root);
+    if (!Number.isSafeInteger(maxEntries) || maxEntries < 1) {
+      return empty("Codex usage traversal requires a positive entry ceiling");
+    }
+    throwIfCodexUsageAborted(opts?.signal);
+    const files = await collectCodexUsageFiles(root, opts?.signal, maxEntries);
 
     const withMtime: Array<{ f: string; m: number }> = [];
     for (const f of files) {
+      throwIfCodexUsageAborted(opts?.signal);
       try {
         withMtime.push({ f, m: (await fsp.stat(f)).mtimeMs });
+        throwIfCodexUsageAborted(opts?.signal);
       } catch {
+        if (opts?.signal?.aborted) throwIfCodexUsageAborted(opts.signal);
         /* skip unreadable */
       }
     }
     withMtime.sort((a, b) => b.m - a.m);
 
     // Bound the scan: the newest handful almost always has fresh limits.
-    for (const { f } of withMtime.slice(0, 25)) {
-      const usage = await readLastCodexRateLimits(f);
+    for (const { f } of withMtime.slice(0, CODEX_USAGE_RECENT_FILE_LIMIT)) {
+      throwIfCodexUsageAborted(opts?.signal);
+      const usage = await readLastCodexRateLimits(f, opts?.signal);
       if (usage) return usage;
     }
     return empty("no rate-limit data in recent codex sessions");
   } catch (err) {
-    return empty(err instanceof Error ? err.message : "codex usage read failed");
+    if (opts?.signal?.aborted) throwIfCodexUsageAborted(opts.signal);
+    if (err instanceof CodexUsageTraversalLimitError) return empty(err.message);
+    return empty("Codex usage read failed");
   }
 }

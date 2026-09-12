@@ -2,9 +2,29 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
-import { discoverAgyLs, readAgyJsonResponse, subscribeToAgyStream, waitForAgyConversationId } from "../packages/adapters/src/agy-stream.js";
+import { AgyStreamUnavailableError, discoverAgyLs, readAgyJsonResponse, subscribeToAgyStream, waitForAgyConversationId } from "../packages/adapters/src/agy-stream.js";
 
 afterEach(() => vi.restoreAllMocks());
+
+it("#371 limits fallback to subscription auth/protocol failures and redacts credentials", () => {
+  expect(new AgyStreamUnavailableError("unauthenticated", "missing CSRF token").permitsStdoutFallback).toBe(true);
+  expect(new AgyStreamUnavailableError("resource_exhausted", "quota exceeded").permitsStdoutFallback).toBe(false);
+  expect(new AgyStreamUnavailableError("cancelled", "cancelled").permitsStdoutFallback).toBe(false);
+  const error = new AgyStreamUnavailableError("unauthenticated", "Authorization: Bearer synthetic-secret-token");
+  expect(error.message).not.toContain("synthetic-secret-token");
+});
+
+it.each([
+  { error: { code: "unauthenticated", message: "missing CSRF token" } },
+  { code: "unauthenticated", message: "missing CSRF token" },
+])("#371 retains the language server code and message from HTTP 200 EOS (%j)", async (error) => {
+  const payload = Buffer.from(JSON.stringify(error));
+  const header = Buffer.alloc(5); header[0] = 2; header.writeUInt32BE(payload.length, 1);
+  vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(Buffer.concat([header, payload])));
+  await expect((async () => {
+    for await (const _ of subscribeToAgyStream({ port: 1, conversationId: "fixture" })) { /* drain */ }
+  })()).rejects.toMatchObject({ streamCode: "unauthenticated", streamMessage: "missing CSRF token", message: expect.stringContaining("missing CSRF token") });
+});
 
 it("releases the production subscription reader when its consumer breaks", async () => {
   let cancelled = false;

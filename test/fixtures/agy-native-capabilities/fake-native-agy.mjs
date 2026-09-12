@@ -202,6 +202,30 @@ const server = http.createServer(async (request, response) => {
   if (request.url?.endsWith("/StreamAgentStateUpdates") && trace) {
     response.statusCode = 200;
     response.setHeader("content-type", "application/connect+json");
+    if (prompt.startsWith("r5-stream-")) {
+      if (!schemaFile) process.stdout.write("STDOUT ONLY ");
+      if (prompt === "r5-stream-partial") {
+        await writeFragmented(response, envelope(0, { update: {
+          status: "CASCADE_RUN_STATUS_RUNNING",
+          mainTrajectoryUpdate: { stepsUpdate: { indices: [1], steps: [{
+            type: "CORTEX_STEP_TYPE_PLANNER_RESPONSE", status: "CORTEX_STEP_STATUS_DONE",
+            plannerResponse: { modifiedResponse: "PARTIAL STREAM" },
+          }] } },
+        } }));
+      }
+      response.end(envelope(2, { error: { code: "unauthenticated", message: "missing CSRF token" } }));
+      if (prompt === "r5-stream-hang") return;
+      setTimeout(() => {
+        process.stdout.write(schemaFile ? JSON.stringify({ status: "SUCCESS", structured_output: { answer: "OK" } })
+          : prompt === "r5-stream-overflow" ? "x".repeat(1_100_000) : "OK🧭\n");
+        server.close();
+        server.closeAllConnections?.();
+        process.exitCode = prompt === "r5-stream-exit" ? 3 : 0;
+      }, 50);
+      return;
+    }
+    // A working stream must never substitute this deliberately different stdout.
+    if (!schemaFile) process.stdout.write("DO NOT USE STDOUT\n");
     if (prompt === "r5-malformed") { response.end(Buffer.from([0, 0, 0, 0, 1, 123])); return; }
     if (prompt === "r5-oversized-frame") { response.write(Buffer.from([0, 0, 128, 0, 1])); return; }
     for (const update of trace.updates) {

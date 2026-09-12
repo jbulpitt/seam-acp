@@ -40,9 +40,12 @@ export class AgyTurnLifecycle {
   private stderrBytes = 0;
   private stdoutBytes = 0;
   private structured = false;
+  private captureStdout = true;
+  private stdoutOverflow = false;
   private readonly stdout: Buffer[] = [];
   private exit!: Promise<void>;
   private onExit?: (code: number | null) => void;
+  private onClose?: () => void;
   private onError = (): void => this.fail("spawn_failed");
   private onStderr = (chunk: Buffer): void => {
     // A noisy child must not exhaust host memory/IO before cancellation runs.
@@ -50,10 +53,15 @@ export class AgyTurnLifecycle {
     if (this.stderrBytes > 256_000) this.fail("output_overflow");
   };
   private onStdout = (chunk: Buffer): void => {
-    if (!this.structured) return;
-    // Structured stdout is retained whole; refuse overflow BEFORE retaining.
+    if (!this.captureStdout) return;
+    // Refuse only oversized buffered output, not a healthy streaming turn.
+    // Pending fallback capture is bounded without imposing a streaming limit.
     this.stdoutBytes += chunk.length;
-    if (this.stdoutBytes > 1_000_000) { this.fail("output_overflow"); return; }
+    if (this.stdoutBytes > 1_000_000) {
+      this.stdoutOverflow = true;
+      if (this.structured) this.fail("output_overflow");
+      return;
+    }
     this.stdout.push(chunk);
   };
   constructor(readonly sessionId: string, timeoutMs: number) {
@@ -67,11 +75,11 @@ export class AgyTurnLifecycle {
     this.proc = proc;
     this.structured = structured;
     proc.on("error", this.onError);
-    this.exit = new Promise(resolve => {
-      // A clean CLI exit before LS discovery still cannot fulfill this turn.
-      this.onExit = (code) => { if (code !== 0 || !this.streaming) this.fail("exited_early"); resolve(); };
-      proc.once("exit", this.onExit);
-    });
+    // A clean CLI exit before LS discovery still cannot fulfill this turn.
+    this.onExit = (code) => { if (code !== 0 || !this.streaming) this.fail("exited_early"); };
+    proc.once("exit", this.onExit);
+    // close, unlike exit, guarantees the final stdout bytes have been drained.
+    this.exit = new Promise(resolve => { this.onClose = resolve; proc.once("close", resolve); });
     // Partial startup still enters cleanup, rather than leaking a real child.
     if (!proc.stdout || !proc.stderr || (needsStdin && !proc.stdin)) {
       this.fail("spawn_failed");
@@ -83,7 +91,13 @@ export class AgyTurnLifecycle {
   }
   async structuredOutput(): Promise<string> {
     await agyWait(this.exit, this.abort.signal);
+    if (this.stdoutOverflow) throw agyFailure("output_overflow");
     return Buffer.concat(this.stdout).toString("utf8");
+  }
+  commitStream(): void {
+    if (this.structured) return;
+    this.captureStdout = false;
+    this.stdout.length = 0;
   }
   close(): Promise<void> {
     return this.cleanup ??= (async () => {
@@ -99,6 +113,7 @@ export class AgyTurnLifecycle {
         this.proc?.stdin?.removeListener("error", this.onError);
         this.proc?.removeListener("error", this.onError);
         if (this.onExit) this.proc?.removeListener("exit", this.onExit);
+        if (this.onClose) this.proc?.removeListener("close", this.onClose);
         this.stdout.length = 0;
         await Promise.all(this.temporaryFiles.map(file => fs.unlink(file).catch(() => {})));
         this.finish();

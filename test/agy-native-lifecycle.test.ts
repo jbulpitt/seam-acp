@@ -45,6 +45,61 @@ async function fixture(sandbox = false, timeoutSeconds = 10) {
 }
 
 describe.sequential("R5 native production lifecycle", () => {
+  it("#371 completes from stdout after an unauthenticated subscription and labels degradation", async () => {
+    const f = await fixture();
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await expect(f.runtime.prompt("r5-stream-auth")).resolves.toMatchObject({ stopReason: "end_turn" });
+      const emitted = JSON.stringify(f.events);
+      expect(emitted).toContain("STDOUT ONLY OK🧭");
+      expect(emitted).toContain("streamed thoughts, tool updates and permission prompts are unavailable");
+      expect(emitted).toContain("unauthenticated: missing CSRF token");
+      expect(log).toHaveBeenCalledWith(expect.stringContaining("unauthenticated: missing CSRF token; using stdout fallback"));
+      expect(f.rows().filter(row => row.prompt === "r5-stream-auth")).toHaveLength(1);
+    } finally { log.mockRestore(); await f.close(); }
+  }, 15_000);
+
+  it("#371 keeps the fallback caveat separate from structured JSON", async () => {
+    const f = await fixture();
+    try {
+      await expect(f.runtime.prompt("r5-stream-auth", undefined, { jsonSchema: { type: "object" } })).resolves.toMatchObject({ stopReason: "end_turn" });
+      const text = f.events.flatMap(event => event.kind === "agent-text" ? [event.text] : []).join("");
+      expect(JSON.parse(text)).toEqual({ answer: "OK" });
+      expect(f.events.some(event => event.kind === "agent-thought" && event.text.includes("Using stdout only"))).toBe(true);
+    } finally { await f.close(); }
+  }, 15_000);
+
+  it("#371 keeps a working stream authoritative without fallback", async () => {
+    const f = await fixture();
+    try {
+      await expect(f.runtime.prompt("capability-turn-one")).resolves.toMatchObject({ stopReason: "end_turn" });
+      const emitted = JSON.stringify(f.events);
+      expect(f.events.some(event => event.kind === "agent-thought")).toBe(true);
+      expect(emitted).not.toContain("DO NOT USE STDOUT");
+      expect(emitted).not.toContain("Using stdout only");
+    } finally { await f.close(); }
+  }, 15_000);
+
+  it("#371 preserves a mid-stream rejection cause and never duplicates partial output from stdout", async () => {
+    const f = await fixture();
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await expect(f.runtime.prompt("r5-stream-partial")).rejects.toThrow("unauthenticated: missing CSRF token");
+      const emitted = JSON.stringify(f.events);
+      expect(emitted).toContain("PARTIAL STREAM");
+      expect(emitted).not.toContain("STDOUT ONLY");
+      expect(emitted).not.toContain("Using stdout only");
+      expect(log).toHaveBeenCalledWith(expect.stringContaining("unauthenticated: missing CSRF token"));
+    } finally { log.mockRestore(); await f.close(); }
+  }, 15_000);
+
+  it.each([["r5-stream-exit", "exited_early"], ["r5-stream-overflow", "output_overflow"], ["r5-stream-hang", "timeout"]])(
+    "#371 fallback retains lifecycle bounds for %s", async (prompt, code) => {
+      const f = await fixture(false, 3);
+      try { await expect(f.runtime.prompt(prompt)).rejects.toThrow(code); }
+      finally { await f.close(); }
+    }, 15_000,
+  );
   it("persists only the safe native failure through the real catalog service", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "seam-agy-r5-durable-"));
     const managed = createManagedAgyFixture({

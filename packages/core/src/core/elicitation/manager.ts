@@ -443,11 +443,28 @@ function codexAsyncForm(input: CodexAsyncUserInputRequest): FormRequest {
   } as FormRequest;
 }
 
+export const CODEX_ASYNC_REFUSALS = {
+  missing_responder: "No trusted human responder was recorded.",
+  invalid_responder: "The recorded responder is not a Discord user identifier.",
+  missing_acp_session: "The originating ACP session is not bound.",
+  card_send_unsupported: "The chat adapter cannot post question cards.",
+  card_edit_unsupported: "The chat adapter cannot update question cards.",
+  session_mismatch: "The question does not belong to the currently bound ACP conversation.",
+  isolated_session: "An isolated worker cannot receive a later answer in a persistent conversation.",
+  invalid_form: "The question cannot be represented as a safe supported form.",
+  card_post_failed: "The question card could not be posted.",
+} as const;
+export type CodexAsyncRefusalReason = keyof typeof CODEX_ASYNC_REFUSALS;
+export type CodexAsyncAdmission =
+  | { ok: true; status: "created" | "duplicate" }
+  | { ok: false; reason: CodexAsyncRefusalReason };
+
 export class ElicitationManager {
   private readonly store: SessionStore;
   private readonly adapter: ChatAdapter;
   private readonly logger: Logger;
   private readonly currentUserId: (channelRef: string) => string | undefined;
+  private readonly isTurnActive: (channelRef: string) => boolean;
   private readonly now: () => number;
   private readonly onCodexAsyncAnswer?: (
     delivery: CodexAsyncAnswerDelivery
@@ -460,6 +477,7 @@ export class ElicitationManager {
     adapter: ChatAdapter;
     logger: Logger;
     currentUserId: (channelRef: string) => string | undefined;
+    isTurnActive?: (channelRef: string) => boolean;
     onCodexAsyncAnswer?: (delivery: CodexAsyncAnswerDelivery) => Promise<boolean>;
     now?: () => number;
   }) {
@@ -467,6 +485,7 @@ export class ElicitationManager {
     this.adapter = opts.adapter;
     this.logger = opts.logger.child({ comp: "elicitation" });
     this.currentUserId = opts.currentUserId;
+    this.isTurnActive = opts.isTurnActive ?? (() => false);
     this.onCodexAsyncAnswer = opts.onCodexAsyncAnswer;
     this.now = opts.now ?? Date.now;
   }
@@ -490,22 +509,29 @@ export class ElicitationManager {
 
   async createCodexAsync(
     record: SessionRecord,
-    input: CodexAsyncUserInputRequest
-  ): Promise<boolean> {
-    const userId = this.currentUserId(record.channelRef);
-    if (!userId || !record.acpSessionId || !this.adapter.sendElicitationCard ||
-        !this.adapter.editElicitationCard || input.threadId !== record.acpSessionId) return false;
+    input: CodexAsyncUserInputRequest,
+    dispatch?: { responderUserId?: string; session: "live" | "isolated" }
+  ): Promise<CodexAsyncAdmission> {
+    // Refuse only this question; the turn keeps running. Dispatch authority is
+    // explicit: never fall back to a different human active in the target channel.
+    const userId = dispatch ? dispatch.responderUserId : this.currentUserId(record.channelRef);
+    if (dispatch?.session === "isolated") return this.refuseCodexAsync(record, "isolated_session");
+    if (!userId) return this.refuseCodexAsync(record, "missing_responder");
+    if (dispatch && !/^\d{17,20}$/.test(userId)) return this.refuseCodexAsync(record, "invalid_responder");
+    if (!record.acpSessionId) return this.refuseCodexAsync(record, "missing_acp_session");
+    if (!this.adapter.sendElicitationCard) return this.refuseCodexAsync(record, "card_send_unsupported");
+    if (!this.adapter.editElicitationCard) return this.refuseCodexAsync(record, "card_edit_unsupported");
+    if (input.threadId !== record.acpSessionId) return this.refuseCodexAsync(record, "session_mismatch");
     const correlation = JSON.stringify({
       threadId: input.threadId,
       turnId: input.turnId,
       itemId: input.itemId,
     });
-    if (this.store.getCodexAsyncElicitation(record.id, correlation)) return true;
+    if (this.store.getCodexAsyncElicitation(record.id, correlation)) return { ok: true, status: "duplicate" };
     const request = codexAsyncForm(input);
     const checked = validateFormRequest(request);
     if (!checked.ok) {
-      await this.postRefusal(record, request.message, checked.error);
-      return false;
+      return this.refuseCodexAsync(record, "invalid_form", { message: request.message, error: checked.error });
     }
     const now = this.now();
     const row: ElicitationRow & { status: "open" } = {
@@ -555,15 +581,38 @@ export class ElicitationManager {
         row.messageId = sent.id;
       }
       this.armExpiry(row.id, row.expiresUtc);
-      return true;
-    } catch (error) {
-      this.logger.warn({ error, id: row.id }, "async elicitation card post failed");
+      return { ok: true, status: "created" };
+    } catch {
       const failed = this.store.settleElicitation(
         row.id, "declined", "The Discord card could not be posted.", this.nowUtc()
       );
       if (failed) await this.refresh(failed);
-      return false;
+      return this.refuseCodexAsync(record, "card_post_failed");
     }
+  }
+
+  private async refuseCodexAsync(
+    record: SessionRecord, reason: CodexAsyncRefusalReason,
+    form?: { message: string; error: string }
+  ): Promise<Extract<CodexAsyncAdmission, { ok: false }>> {
+    // No question, answer, or transport error bodies: they may contain secrets.
+    this.logger.warn({ reason, sessionRecordId: record.id }, "async elicitation refused");
+    try {
+      if (form) {
+        // Preserve the existing human invalid-form card, adding the named reason.
+        if (!await this.postRefusal(record, form.message, `[${reason}] ${form.error}`)) {
+          throw new Error("refusal_notice_failed");
+        }
+      } else {
+        await this.adapter.sendMessage(
+          { platform: record.platform, id: record.channelRef, ...(record.parentRef ? { parentId: record.parentRef } : {}) },
+          `⚠️ Async question unavailable [${reason}]. ${CODEX_ASYNC_REFUSALS[reason]} The turn can continue.`
+        );
+      }
+    } catch {
+      this.logger.warn({ reason, sessionRecordId: record.id }, "async elicitation refusal notice failed");
+    }
+    return { ok: false, reason };
   }
 
   async create(
@@ -954,7 +1003,7 @@ export class ElicitationManager {
     return { ok: true, value: JSON.stringify({ requestId: request.requestId }) };
   }
 
-  private async postRefusal(record: SessionRecord, message: string, error: string): Promise<void> {
+  private async postRefusal(record: SessionRecord, message: string, error: string): Promise<boolean> {
     const channel = {
       platform: record.platform,
       id: record.channelRef,
@@ -968,10 +1017,11 @@ export class ElicitationManager {
       footer: "No answer was collected. Sensitive information must use a secure URL request.",
     };
     if (this.adapter.sendElicitationCard) {
-      await this.adapter.sendElicitationCard(channel, { panel }).catch(() => {});
-    } else {
-      await this.adapter.sendPanel?.(channel, panel).catch(() => {});
+      return this.adapter.sendElicitationCard(channel, { panel }).then(() => true, () => false);
     }
+    return this.adapter.sendPanel
+      ? this.adapter.sendPanel(channel, panel).then(() => true, () => false)
+      : false;
   }
 
   private render(row: ElicitationRow, known?: ValidatedForm | URL): ElicitationCardPost {
@@ -1202,6 +1252,7 @@ export class ElicitationManager {
     const prompt = answerLines.length === 1
       ? this.displayValue(values[checked.value.fields[0]!.key]!)
       : `Answers to your questions:\n${answerLines.map((line) => `- ${line}`).join("\n")}`;
+    const behindTurn = this.isTurnActive(row.channelRef);
     let admitted = false;
     try {
       admitted = await this.onCodexAsyncAnswer({
@@ -1221,7 +1272,9 @@ export class ElicitationManager {
       return false;
     }
     const accepted = this.store.acceptElicitation(
-      row.id, "Answer queued for the originating Codex conversation.", this.nowUtc()
+      row.id, behindTurn
+        ? "Answer queued behind the running turn in the originating Codex conversation; it will not interrupt it."
+        : "Answer queued for delivery to the originating Codex conversation.", this.nowUtc()
     );
     if (accepted) await this.refresh(accepted, checked.value);
     return accepted !== null;

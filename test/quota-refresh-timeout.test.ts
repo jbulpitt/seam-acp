@@ -117,7 +117,44 @@ describe("bounded quota refresh", () => {
     expect(elapsedMs).toBeLessThan(100);
   });
 
-  it("aborts the real Copilot source while its response body is stalled", async () => {
+  it("prevents overlap and late publication when an aborted source has not settled", async () => {
+    let calls = 0;
+    let releaseFirst!: (value: AgentQuota) => void;
+    const timedOutQuota = quota("slow", "Slow");
+    const registry = new QuotaRegistry();
+    const poller = new AgentQuotaPoller({
+      logger: silent,
+      registry,
+      sources: [{
+        agentId: "slow",
+        displayName: "Slow",
+        eventDriven: false,
+        fetch: async () => {
+          calls++;
+          if (calls === 1) return await new Promise<AgentQuota>((resolve) => { releaseFirst = resolve; });
+          return quota("slow", "Slow");
+        },
+      }],
+      sourceTimeoutMs: 25,
+      staleRetentionMs: 0,
+    });
+    const first = await poller.refreshAll(true);
+    expect(first.sources[0]?.outcome).toBe("timed_out");
+    const joined = await poller.refreshAll(true);
+    expect(joined.sources[0]?.outcome).toBe("timed_out");
+    expect(calls).toBe(1);
+
+    releaseFirst(timedOutQuota);
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(registry.get("slow")?.error).toBe("Quota refresh timed out after 0.025s");
+    const recovered = await poller.refreshAll(true);
+    expect(recovered.sources[0]?.outcome).toBe("refreshed");
+    expect(calls).toBe(2);
+  }, 500);
+
+  it.each(["headers", "body"] as const)(
+    "aborts the real Copilot source while response %s are stalled",
+    async (stallAt) => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "seam-quota-copilot-"));
     try {
       fs.writeFileSync(path.join(dir, "config.json"), JSON.stringify({
@@ -125,14 +162,13 @@ describe("bounded quota refresh", () => {
         copilotTokens: { "github.com:fixture": "credential-must-not-surface" },
       }));
       let fetchSignal: AbortSignal | undefined;
-      vi.stubGlobal("fetch", vi.fn(async (_url: string, init?: RequestInit) => {
+      vi.stubGlobal("fetch", vi.fn((_url: string, init?: RequestInit) => {
         fetchSignal = init?.signal ?? undefined;
-        return {
-          ok: true,
-          json: async () => await new Promise((_resolve, reject) => {
+        const stalled = async () => await new Promise<never>((_resolve, reject) => {
             fetchSignal?.addEventListener("abort", () => reject(fetchSignal?.reason), { once: true });
-          }),
-        } as Response;
+        });
+        if (stallAt === "headers") return stalled();
+        return Promise.resolve({ ok: true, json: stalled } as Response);
       }));
       const profile = { id: "copilot", displayName: "Copilot", configDir: dir } as AgentProfile;
       const [source] = createAgentQuotaSources([profile], {});
@@ -155,7 +191,9 @@ describe("bounded quota refresh", () => {
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
-  }, 500);
+    },
+    500,
+  );
 });
 
 describe("usage-card production interaction", () => {

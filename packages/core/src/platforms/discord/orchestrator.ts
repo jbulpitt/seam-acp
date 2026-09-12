@@ -6345,6 +6345,32 @@ export class Orchestrator {
     return result === "timeout" ? "abandon" : "ok";
   }
 
+  /**
+   * Resolve one isolated dispatch cwd without leaking the caller's filesystem
+   * layout onto another host (#367).
+   *
+   * An explicit preset/spec cwd remains authoritative and is still validated
+   * by the executing adapter. Local workers retain the caller/thread default.
+   * A remote implicit cwd must come from that host; if the bridge cannot name
+   * one, refuse only this dispatch with a recoverable reason. Local work,
+   * explicit remote paths, and other bridges keep working.
+   */
+  private isolatedDispatchCwd(opts: {
+    spec: DispatchSpec;
+    preset: Preset | null;
+    record: SessionRecord;
+    workerLocation: string;
+  }): string {
+    const explicit = opts.preset?.repoPath ?? opts.spec.cwd;
+    if (explicit !== undefined && explicit !== null) return explicit;
+    if (isLocalLocation(opts.workerLocation)) return this.effectiveCwd(opts.record);
+    const remoteDefault = this.bridgeHub?.defaultCwdForLocation?.(opts.workerLocation);
+    if (remoteDefault) return remoteDefault;
+    throw new Error(
+      `dispatch ${opts.spec.id}: remote location "${opts.workerLocation}" did not report a workspace root or HOME; specify cwd explicitly`
+    );
+  }
+
   /** Isolated workers on a bridge: bind + remote spawn. Live runs bind in SessionRouter. */
   private remoteDispatchSpawnOpts(opts: {
     spec: DispatchSpec;
@@ -8898,6 +8924,9 @@ export class Orchestrator {
     if (requestedAgentId && !presetProfile) {
       throw new Error(`dispatch: unknown agent "${requestedAgentId}" at ${workerLocation}`);
     }
+    const isolatedWorkerCwd = effectiveSession === "isolated"
+      ? this.isolatedDispatchCwd({ spec, preset, record, workerLocation })
+      : undefined;
     let quotaAgentId = presetProfile?.id ?? record.agentId;
     // #76: a resume is the SAME spec with two substitutions — prompt →
     // "continue", session acquisition → loadSession(recorded id). Everything
@@ -8945,7 +8974,7 @@ export class Orchestrator {
             effectiveSession,
             workerLocation,
             profile: presetProfile,
-            cwd: preset?.repoPath ?? spec.cwd ?? this.effectiveCwd(record),
+            cwd: isolatedWorkerCwd!,
             model: preset?.model ?? spec.model,
             effort: preset?.effort ?? spec.effort,
           })
@@ -9051,7 +9080,9 @@ export class Orchestrator {
         location: workerLocation, session: effectiveSession,
         model: preset?.model ?? (effectiveSession === "isolated" ? spec.model : described?.model?.value),
         effort: preset?.effort ?? (effectiveSession === "isolated" ? spec.effort : described?.effort?.value),
-        cwd: effectiveSession === "live" ? described?.cwd?.value ?? record.repoPath : preset?.repoPath ?? spec.cwd ?? described?.cwd?.value ?? record.repoPath,
+        cwd: effectiveSession === "live"
+          ? described?.cwd?.value ?? record.repoPath
+          : isolatedWorkerCwd!,
         config: record.configJson,
         // #302: `preset` is upstream of the agent/model/effort/cwd already
         // compared above, so it adds refusals for edits that changed no
@@ -9221,7 +9252,7 @@ export class Orchestrator {
             const panelEffort = isolated
               ? (preset?.effort ?? spec.effort ?? cfg.reasoningEffort)
               : cfg.reasoningEffort;
-            const panelCwd = preset?.repoPath ?? spec.cwd ?? this.effectiveCwd(record);
+            const panelCwd = isolated ? isolatedWorkerCwd! : this.effectiveCwd(record);
             const panelProfile = presetProfile ?? this.router.getProfile(record.agentId);
             return this.startDispatchStatusPanel(target, spec, {
               model: panelModel,
@@ -9373,7 +9404,7 @@ export class Orchestrator {
           session: effectiveSession,
           ...(preset?.model ? { model: preset.model } : spec.model ? { model: spec.model } : {}),
           ...(preset?.effort ? { effort: preset.effort } : spec.effort ? { effort: spec.effort } : {}),
-          ...(preset?.repoPath ? { cwd: preset.repoPath } : spec.cwd ? { cwd: spec.cwd } : {}),
+          ...(effectiveSession === "isolated" ? { cwd: isolatedWorkerCwd! } : {}),
           ...(presetProfile ? { profile: presetProfile } : {}),
           ...((isResume || previousAttempt?.acpSessionId) && resumeSessionId
             ? { resumeSessionId }

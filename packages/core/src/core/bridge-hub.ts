@@ -77,7 +77,12 @@ export async function verifyStagedReleaseCatalogRpcs(
 export interface ConnectedBridge {
   bridgeId: string;
   instanceId: string;
-  host: { os: string; arch: string };
+  host: {
+    os: string;
+    arch: string;
+    workspaceRoot?: string;
+    home?: string;
+  };
   devMode: boolean;
   agents: Map<string, {
     version: number;
@@ -124,6 +129,17 @@ function readTunnelUrl(dataDir: string): string | null {
   } catch {
     return null;
   }
+}
+
+/** Select a remote host path without interpreting it on the controller OS. */
+function resolveBridgeDefaultCwd(opts: {
+  reportedWorkspaceRoot?: string;
+  configuredWorkspaceRoot?: string;
+  reportedHome?: string;
+}): string | undefined {
+  return nonEmptyHostPath(opts.reportedWorkspaceRoot)
+    ?? nonEmptyHostPath(opts.configuredWorkspaceRoot)
+    ?? nonEmptyHostPath(opts.reportedHome);
 }
 
 export class BridgeHub {
@@ -225,6 +241,28 @@ export class BridgeHub {
 
   pairedBridges(): BridgeHostConfig[] {
     return [...this.config.bridgePresets.values()];
+  }
+
+  /**
+   * Host-owned default cwd for an implicit remote dispatch (#367).
+   *
+   * The connected bridge's actual `--cwd` wins over the controller's paired
+   * copy, because it describes the process that will execute this turn. Older
+   * bridges do not advertise it, so retain the paired workspace as a
+   * compatibility fallback, then use the connected host's HOME. Returning
+   * undefined refuses only an implicit-cwd dispatch; explicit cwd dispatches,
+   * local work, and every other bridge remain available.
+   */
+  defaultCwdForLocation(bridgeId: string): string | undefined {
+    const id = normalizeLocation(bridgeId);
+    if (isLocalLocation(id)) return undefined;
+    const connected = this.connections.get(id)?.host;
+    const paired = this.config.bridgePresets.get(id);
+    return resolveBridgeDefaultCwd({
+      reportedWorkspaceRoot: connected?.workspaceRoot,
+      configuredWorkspaceRoot: paired?.workspaceRoot,
+      reportedHome: connected?.home,
+    });
   }
 
   publicWsUrl(): string {
@@ -479,4 +517,9 @@ export class BridgeHub {
     );
     this.readyEvents.emit("ready", expectedId);
   }
+}
+
+function nonEmptyHostPath(value: string | undefined): string | undefined {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed : undefined;
 }

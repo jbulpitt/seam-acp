@@ -162,6 +162,7 @@ async function seedInterrupted(spec: DispatchSpec = handoffSpec()): Promise<void
   const { orch } = makeOrch({ enabled: true });
   if (spec.location && spec.location !== "local") {
     orch.setBridgeHub({
+      defaultCwdForLocation: () => "/remote/workspace",
       markSessionBridge: () => {},
       get: () => ({ mux: {} }),
       mcpServersForRemoteSpawn: () => undefined,
@@ -582,6 +583,7 @@ describe("watcher recoverStale vs resumeEnabled", () => {
     let readyListener: ((id: string) => void) | undefined;
     const markSessionBridge = vi.fn();
     orch.setBridgeHub({
+      defaultCwdForLocation: () => "/remote/workspace",
       isBridgeReady: () => ready,
       onBridgeReady: (listener: (id: string) => void) => {
         readyListener = listener;

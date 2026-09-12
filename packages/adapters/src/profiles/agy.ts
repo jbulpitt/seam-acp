@@ -918,7 +918,15 @@ export interface AgyExecutionPolicy {
   exposeGlobalStaging: boolean;
 }
 
-const DEFAULT_AGY_EXECUTION_POLICY: AgyExecutionPolicy = {
+/**
+ * The policy every production agy session actually launches with. Exported so
+ * the documented posture in `docs/agy-native-lifecycle.md` is asserted rather
+ * than described: no `--sandbox`, and permissions auto-approved. Changing
+ * `sandbox` here means depending on a CLI boundary nobody has demonstrated,
+ * which is the decision #324 records — so it should fail a test, not pass
+ * quietly.
+ */
+export const DEFAULT_AGY_EXECUTION_POLICY: AgyExecutionPolicy = {
   sandbox: false,
   exposeGlobalStaging: true,
 };

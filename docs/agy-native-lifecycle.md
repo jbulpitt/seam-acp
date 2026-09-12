@@ -84,25 +84,50 @@ Each added bound/check has an observable failure it prevents:
 - Mode-0600 schema/log files and cleanup on failure: umask defaults and partial
   startup otherwise leave readable private request material behind.
 
-## Sandbox evidence and limits
+## Sandbox posture
 
-The installed native CLI's read-only `--help` describes `--sandbox` as enabling
-terminal restrictions and `--dangerously-skip-permissions` as auto-approval of
-tool permission requests. **Both profiles still bypass permission prompts by
-default.** R5 does not add/remove advertised permission capabilities.
+**Production does not run agy in a sandbox, and nothing here depends on one.**
+A sandbox was never a requirement for this work.
 
-The production native-profile fixture checks the actual launched argv, private
-HOME and parsed MCP file: sandbox flag present, only the private cwd added,
-global staging absent, and no supplied/default MCP server inherited. This is
-Seam launch-policy evidence, **not proof that the installed CLI blocks filesystem
-or terminal operations**. A prompt saying “read only” is not a sandbox.
+`agyExecutionPolicyArgs` accepts a `sandbox` flag, but
+`DEFAULT_AGY_EXECUTION_POLICY` sets it to `false`, and neither production
+construction site overrides it — not `packages/bridge/src/inventory.ts` (remote
+host inventory) nor `packages/core/src/index.ts` (server startup).
+`sandbox: true` appears only in `test/agy-prompt-args.test.ts` and
+`test/agy-model-catalog.test.ts`, covering the argv shape of a helper path that
+is not wired up. `--dangerously-skip-permissions` is added **unconditionally**,
+independent of the policy.
 
-Installed-CLI enforcement is tracked separately in #324 and remains gated on
-explicit owner approval. It must use a named model/host, fresh disposable
-sessions, bounded prompt budget, synthetic inside/outside sentinel files and a
-local synthetic MCP endpoint. Assert actual allowed/denied operations and
-unchanged outside sentinels; stop on any unexpected access. Do not use existing
-conversations, real credentials as test payloads, or production worktrees.
+So every agy session launches with:
+
+- **no `--sandbox`** — terminal operations are unrestricted;
+- **`--dangerously-skip-permissions`** — every tool permission request is
+  auto-approved without prompting;
+- **`--add-dir <cwd>`** plus the shared staging root — `--add-dir` is the only
+  thing bounding the workspace.
+
+This is written down because the flag list invites the opposite conclusion:
+"we pass `--sandbox`" and "we auto-approve every tool request" pull in
+different directions, and a reader skimming the profile could reasonably
+believe the first is load-bearing. It is not passed at all.
+
+What the fixtures prove is **launch policy** for the argv we build: a private
+HOME, only the intended directories added, and no supplied or default MCP
+server inherited by a helper. They prove nothing about whether the installed
+CLI restricts anything, and could not. A prompt saying “read only” is not a
+sandbox — and neither is a flag whose enforcement nobody has demonstrated.
+
+Upstream treats the flag as live surface rather than a settled guarantee: agy
+1.2.1 fixed the status line reporting the terminal sandbox as *disabled* when
+the session was launched with `--sandbox`, and 1.2.2 began warning on
+deprecated `unsandboxed` permission rules. Testing enforcement today would
+describe a version we will not be running when it matters.
+
+If a future helper path (R8, #264) ever needs the CLI's own boundary to be
+real, that claim must be proven **before** anything depends on it; the canary
+design is recorded in #324. Until then nothing relies on it, so there is no
+exposure from it being unproven — and `test/agy-sandbox-posture.test.ts` fails
+if this posture changes without that decision being revisited.
 
 ## Scope left to other stories
 

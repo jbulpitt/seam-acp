@@ -8745,7 +8745,7 @@ export class Orchestrator {
         // handoff or superseding owner keeps working; defects stay actionable.
         throw err;
       }
-      if (current?.state === "active" && current.ownerBoot === this.attemptBoot &&
+      if ((current?.state === "pending" || (current?.state === "active" && current.ownerBoot === this.attemptBoot)) &&
           !this.restartCutoff && !(err instanceof DispatchSuspendedError)) {
         // A genuine setup/visibility exception from the living owner is not a
         // restart. Capture its terminal outcome; reuse existing onward claims.
@@ -8757,7 +8757,9 @@ export class Orchestrator {
           output: "", finishedUtc: new Date().toISOString(),
         };
         let won = false;
-        try { won = this.store.turnAttempts.complete(current, outcome); }
+        try { won = current.state === "pending"
+          ? this.store.turnAttempts.completePending(spec.id, outcome)
+          : this.store.turnAttempts.complete(current, outcome); }
         catch (completeErr) { throw DispatchSuspendedError.from(completeErr, spec.id, "recording the failure outcome failed"); }
         if (!won) {
           throw DispatchSuspendedError.superseded(spec.id,
@@ -14373,7 +14375,7 @@ export class Orchestrator {
     const now = new Date().toISOString();
     const liveId = this.liveTurnByChannel.get(channelRef);
     if (liveId) this.liveTurnByChannel.delete(channelRef);
-    const markers = await listLiveMarkers(this.config.DATA_DIR).catch(() => [] as LiveTurnMarker[]);
+    const markers = await this.liveTurnInventory();
     for (const m of markers) {
       if (m.channelRef !== channelRef && m.id !== liveId) continue;
       if (opts?.preserveDispatch && m.inboundMessageId && this.store.turnAttempts.get(m.id)) continue;
@@ -14403,7 +14405,7 @@ export class Orchestrator {
     }
     const now = new Date().toISOString();
     this.liveTurnByChannel.clear();
-    const markers = await listLiveMarkers(this.config.DATA_DIR).catch(() => [] as LiveTurnMarker[]);
+    const markers = await this.liveTurnInventory();
     for (const m of markers) {
       await finishLiveTurn(this.config.DATA_DIR, {
         id: m.id,
@@ -14538,7 +14540,7 @@ export class Orchestrator {
       this.config.SEAM_TURN_RESUME_MAX_AGE_SECONDS ?? TURN_RESUME_MAX_AGE_SECONDS;
     const now = new Date();
 
-    const live = await listLiveMarkers(this.config.DATA_DIR).catch(() => [] as LiveTurnMarker[]);
+    const live = await this.liveTurnInventory();
     // Inspect the original admission phase BEFORE recovery resets running to
     // pending. An old marker/running row is not proof the prompt was unstarted.
     const inbound = this.store.listInboundNonterminal?.() ?? [];
@@ -14592,80 +14594,29 @@ export class Orchestrator {
       );
     }
 
-    if (enabled && this.dispatchWatcher) {
-      const stale = await this.dispatchWatcher.listStaleRunning();
-      for (const spec of stale) {
-        const pre = await this.checkResumePreconditions({
-          platform: PLATFORM,
-          id: spec.target,
-        });
-        const ledger = this.store.getDelegation(spec.id);
-        const owned = this.store.turnAttempts?.get(spec.id);
-        if (owned) {
-          // SQL owns modern attempts. Keep exceptional identities and disabled
-          // recovery visible; age/transport failure is not cancellation intent.
-          if (owned.state !== "suspended" || pre !== "ok") continue;
-          if (owned.stalledUtc) {
-            // A post-readiness retain is a durable quarantine. Do not turn a
-            // later reboot into an implicit retry; only the guarded operator
-            // workflow may resume it. Retry an unacknowledged notice, though.
-            if (!owned.stallNoticeUtc) await this.observeRetainedDispatch(spec);
-            continue;
+    if (this.dispatchWatcher) {
+      for (const spec of await this.dispatchWatcher.listStaleRunning()) {
+        const owned = this.store.turnAttempts.get(spec.id);
+        if (!owned || owned.state !== "suspended") continue;
+        // Defer only opted-out prompted work. Never-started dispatches and
+        // unrelated targets remain available, without original-input replay.
+        if (owned.promptStarted && !enabled) continue;
+        if (owned.stalledUtc) {
+          if (!owned.stallNoticeUtc) await this.observeRetainedDispatch(spec);
+          continue;
+        }
+        const pre = await this.checkResumePreconditions({ platform: PLATFORM, id: spec.target });
+        if (pre !== "ok") continue;
+        liveJobs.push(this.resumeScheduler.run(async () => {
+          const loc = spec.location ?? resolveThreadLocation(this.config, spec.target);
+          const waited = await this.waitForResumeHost(loc, spec.createdUtc, maxAge, now);
+          if (waited === "abandon") {
+            await this.abandonDispatchSpec(spec, "bridge not ready (past max-age)");
+            return;
           }
-          if (owned.promptStarted && !owned.acpSessionId) continue;
-          liveJobs.push(
-            this.resumeScheduler.run(async () => {
-              const loc = spec.location ?? resolveThreadLocation(this.config, spec.target);
-              const waited = await this.waitForResumeHost(loc, spec.createdUtc, maxAge, now);
-              if (waited === "abandon") {
-                await this.abandonDispatchSpec(spec, "bridge not ready (past max-age)");
-                return;
-              }
-              if (!isLocalLocation(loc)) {
-                bindSessionLocation(this.bridgeHub, `discord:${spec.target}`, loc);
-              }
-              await this.dispatchWatcher!.requeueStale(spec.id);
-            })
-          );
-          continue;
-        }
-        const decided = decideResume({
-          startedUtc: spec.createdUtc,
-          maxAgeSeconds: maxAge,
-          now,
-          precondition: pre,
-          acpSessionId: ledger?.acpSessionId,
-        });
-        if (decided.action === "abandon") {
-          await this.abandonDispatchSpec(spec, decided.reason);
-          continue;
-        }
-        if (decided.action === "skip") {
-          this.logger.info(
-            { id: spec.id, reason: decided.reason, target: spec.target },
-            "dispatch resume skipped"
-          );
-          continue;
-        }
-        liveJobs.push(
-          this.resumeScheduler.run(async () => {
-            const loc =
-              spec.location ?? resolveThreadLocation(this.config, spec.target);
-            const waited = await this.waitForResumeHost(loc, spec.createdUtc, maxAge, now);
-            if (waited === "abandon") {
-              await this.abandonDispatchSpec(spec, "bridge not ready (past max-age)");
-              return;
-            }
-            if (!isLocalLocation(loc)) {
-              bindSessionLocation(
-                this.bridgeHub,
-                `discord:${spec.target}`,
-                loc
-              );
-            }
-            await this.dispatchWatcher!.requeueStale(spec.id);
-          })
-        );
+          if (!isLocalLocation(loc)) bindSessionLocation(this.bridgeHub, `discord:${spec.target}`, loc);
+          await this.dispatchWatcher!.requeueStale(spec.id);
+        }));
       }
     }
 
@@ -14865,7 +14816,7 @@ export class Orchestrator {
         reason: deliveryReason,
       });
     }
-    const live = await listLiveMarkers(this.config.DATA_DIR).catch(() => [] as LiveTurnMarker[]);
+    const live = await this.liveTurnInventory();
     for (const m of live) {
       if (seen.has(m.id)) continue;
       rows.push({
@@ -14899,10 +14850,32 @@ export class Orchestrator {
     return rows;
   }
 
+  /** Modern live inventory is derived from SQL. Only genuinely legacy,
+   * unlinked markers retain their old recovery contract; a lost modern SQL
+   * row must never be guessed from a marker or replayed as a legacy turn. */
+  private async liveTurnInventory(): Promise<LiveTurnMarker[]> {
+    const legacy = (await listLiveMarkers(this.config.DATA_DIR).catch(() => [] as LiveTurnMarker[]))
+      .filter(m => !m.inboundMessageId && !m.scheduleOccurrenceId && !this.store.turnAttempts?.get(m.id));
+    for (const state of ["active", "suspended"] as const) {
+      for (const a of this.store.turnAttempts?.list(state) ?? []) {
+        if (a.source === "dispatch") continue;
+        legacy.push({ id: a.id, kind: "live", channelRef: a.spec.target,
+          sessionRecordId: makeSessionId(PLATFORM, a.spec.target),
+          startedUtc: a.spec.createdUtc ?? a.updatedUtc,
+          ...(a.acpSessionId ? { acpSessionId: a.acpSessionId } : {}),
+          promptStarted: a.promptStarted,
+          ...(a.source === "inbound" ? { inboundMessageId: a.id.slice("inbound-".length) }
+            : { scheduleOccurrenceId: a.id }),
+        });
+      }
+    }
+    return legacy;
+  }
+
   /** Operator-initiated resume from `/seam workflows` — bypasses max-age
    *  and the auto-resume flag (the operator clicked Resume). */
   async resumeTurnManually(id: string): Promise<string> {
-    const live = await listLiveMarkers(this.config.DATA_DIR).catch(() => [] as LiveTurnMarker[]);
+    const live = await this.liveTurnInventory();
     const marker = live.find((m) => m.id === id);
     if (marker) {
       if (marker.scheduleOccurrenceId) {
@@ -14975,7 +14948,7 @@ export class Orchestrator {
   }
 
   async abandonTurnManually(id: string): Promise<string> {
-    const live = await listLiveMarkers(this.config.DATA_DIR).catch(() => [] as LiveTurnMarker[]);
+    const live = await this.liveTurnInventory();
     const marker = live.find((m) => m.id === id);
     if (marker) {
       await this.abandonLiveMarker(marker, "abandoned by operator");

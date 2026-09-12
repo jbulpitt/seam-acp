@@ -3,6 +3,8 @@ import { mkdtemp, mkdir, rm, readFile, writeFile, readdir } from "node:fs/promis
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { pino } from "pino";
+import { SessionStore } from "../packages/core/src/core/session-store.js";
+import { projectAttemptCompletions } from "../packages/core/src/core/dispatch/attempt-recovery.js";
 import { DispatchWatcher } from "../packages/core/src/core/dispatch/watcher.js";
 import { DispatchSuspendedError } from "../packages/core/src/core/dispatch/attempt-store.js";
 import { dispatchDirs, type DispatchSpec } from "../packages/core/src/core/dispatch/types.js";
@@ -11,14 +13,17 @@ import type { Logger } from "../packages/core/src/lib/logger.js";
 const silent = pino({ level: "silent" }) as unknown as Logger;
 
 let dataDir: string;
+let queueStore: SessionStore;
 let dirs: ReturnType<typeof dispatchDirs>;
 
 beforeEach(async () => {
   dataDir = await mkdtemp(path.join(tmpdir(), "seam-dispatch-test-"));
   dirs = dispatchDirs(dataDir);
+  queueStore = new SessionStore(path.join(dataDir, "watcher-test.db"));
 });
 
 afterEach(async () => {
+  queueStore.close();
   await rm(dataDir, { recursive: true, force: true });
 });
 
@@ -52,8 +57,40 @@ async function readDone(id: string): Promise<Record<string, unknown>> {
 }
 
 describe("DispatchWatcher", () => {
+  it("#304 unavailable filesystem ingress cannot block admitted SQL work", async () => {
+    queueStore.turnAttempts.admit({ id: "sql-only", target: "thread-1", prompt: "already admitted", session: "live" });
+    await mkdir(dirs.root, { recursive: true });
+    await writeFile(dirs.pending, "not a directory");
+    const onDispatch = vi.fn(async () => ({ output: "completed from SQL", stopReason: "end_turn" }));
+    const watcher = new DispatchWatcher({ attempts: queueStore.turnAttempts, dataDir, logger: silent, onDispatch });
+    await watcher.start(); watcher.stop();
+    expect(onDispatch).toHaveBeenCalledTimes(1);
+    expect(queueStore.turnAttempts.get("sql-only")).toMatchObject({ state: "completed", outcome: { output: "completed from SQL" } });
+  });
+
+  it("#304 one broken result projection cannot stop other results or new work", async () => {
+    for (const id of ["broken", "healthy", "unreadable"]) {
+      queueStore.turnAttempts.admit({ id, target: "thread-1", prompt: "already finished", session: "live" });
+      queueStore.turnAttempts.completePending(id, { id, target: "thread-1", status: "completed",
+        output: id, finishedUtc: new Date().toISOString() });
+    }
+    (queueStore as any).db.prepare("UPDATE turn_attempts SET outcome_json=? WHERE id=?").run("{", "unreadable");
+    await mkdir(path.join(dirs.done, "broken.json"), { recursive: true });
+    const error = vi.fn();
+    expect(await projectAttemptCompletions(dataDir, queueStore.turnAttempts, () => true, { error } as any)).toBe(1);
+    expect(error).toHaveBeenCalledWith(expect.objectContaining({ id: "broken" }), expect.stringContaining("other work continues"));
+    expect(error).toHaveBeenCalledWith(expect.objectContaining({ id: "unreadable" }), expect.stringContaining("other work continues"));
+    expect(await readDone("healthy")).toMatchObject({ output: "healthy" });
+    expect(queueStore.turnAttempts.get("broken")?.state).toBe("completed");
+    await dropSpec({ id: "new-work" });
+    const onDispatch = vi.fn(async () => ({ output: "new", stopReason: "end_turn" }));
+    const watcher = new DispatchWatcher({ attempts: queueStore.turnAttempts, dataDir, logger: silent, onDispatch });
+    await watcher.start(); watcher.stop();
+    expect(onDispatch).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ id: "new-work" }));
+  });
+
   it("terminalizes exactly one quarantined artifact and preserves an existing done result", async () => {
-    const watcher = new DispatchWatcher({
+    const watcher = new DispatchWatcher({ attempts: queueStore.turnAttempts,
       dataDir,
       logger: silent,
       onDispatch: async () => ({ output: "must not run", stopReason: "end_turn" }),
@@ -89,7 +126,7 @@ describe("DispatchWatcher", () => {
     let callbackCalls = 0;
     let releaseFirst!: () => void;
     const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
-    const watcher = new DispatchWatcher({
+    const watcher = new DispatchWatcher({ attempts: queueStore.turnAttempts,
       dataDir,
       logger: silent,
       onDispatch: async (spec) => {
@@ -131,7 +168,7 @@ describe("DispatchWatcher", () => {
 
   it("moves a pending spec through running to done with the callback's output", async () => {
     const seen: DispatchSpec[] = [];
-    const watcher = new DispatchWatcher({
+    const watcher = new DispatchWatcher({ attempts: queueStore.turnAttempts,
       dataDir,
       logger: silent,
       onDispatch: async (spec) => {
@@ -173,7 +210,7 @@ describe("DispatchWatcher", () => {
     let entered = false;
     let release!: () => void;
     const held = new Promise<void>((resolve) => { release = resolve; });
-    const watcher = new DispatchWatcher({
+    const watcher = new DispatchWatcher({ attempts: queueStore.turnAttempts,
       dataDir,
       logger: silent,
       onDispatch: async () => {
@@ -219,7 +256,7 @@ describe("DispatchWatcher", () => {
   it("opens admission and reports the forfeit when boot recovery rejects (#303)", async () => {
     const { logger, errors } = capturingLogger();
     const seen: string[] = [];
-    const watcher = new DispatchWatcher({
+    const watcher = new DispatchWatcher({ attempts: queueStore.turnAttempts,
       dataDir,
       logger,
       beforeAdmission: async () => { throw new Error("discord rate limit during boot"); },
@@ -251,7 +288,7 @@ describe("DispatchWatcher", () => {
   it("opens admission and reports the forfeit when boot recovery hangs past the bound (#303)", async () => {
     const { logger, errors } = capturingLogger();
     const seen: string[] = [];
-    const watcher = new DispatchWatcher({
+    const watcher = new DispatchWatcher({ attempts: queueStore.turnAttempts,
       dataDir,
       logger,
       // Never resolves, the way an unbounded loadSession would not.
@@ -283,7 +320,7 @@ describe("DispatchWatcher", () => {
    */
   it("does not reopen admission when stop wins a hung boot recovery (#303)", async () => {
     const seen: string[] = [];
-    const watcher = new DispatchWatcher({
+    const watcher = new DispatchWatcher({ attempts: queueStore.turnAttempts,
       dataDir,
       logger: silent,
       beforeAdmission: () => new Promise<void>(() => {}),
@@ -313,7 +350,7 @@ describe("DispatchWatcher", () => {
     let releaseRecovery!: () => void;
     const slowRecovery = new Promise<void>((resolve) => { releaseRecovery = resolve; });
     const seen: string[] = [];
-    const watcher = new DispatchWatcher({
+    const watcher = new DispatchWatcher({ attempts: queueStore.turnAttempts,
       dataDir,
       logger: silent,
       beforeAdmission: () => slowRecovery,
@@ -343,7 +380,7 @@ describe("DispatchWatcher", () => {
     let release!: () => void;
     const held = new Promise<void>((resolve) => { release = resolve; });
     const onRetained = vi.fn(async () => {});
-    const watcher = new DispatchWatcher({
+    const watcher = new DispatchWatcher({ attempts: queueStore.turnAttempts,
       dataDir,
       logger: silent,
       onRetained,
@@ -368,7 +405,7 @@ describe("DispatchWatcher", () => {
   });
 
   it("records status failed with the error when the callback rejects", async () => {
-    const watcher = new DispatchWatcher({
+    const watcher = new DispatchWatcher({ attempts: queueStore.turnAttempts,
       dataDir,
       logger: silent,
       onDispatch: async () => {
@@ -391,7 +428,7 @@ describe("DispatchWatcher", () => {
     expect(await readdir(dirs.running)).toEqual([]);
   });
 
-  it("re-enqueues a spec a crash left in running/ (at-least-once)", async () => {
+  it("recovers admitted SQL work even when its running projection is absent", async () => {
     // Simulate the crash: a claimed spec sitting in running/ with no result.
     await mkdir(dirs.running, { recursive: true });
     await mkdir(dirs.pending, { recursive: true });
@@ -401,8 +438,10 @@ describe("DispatchWatcher", () => {
       "utf8"
     );
 
+    queueStore.turnAttempts.admit({ id: "job-c", target: "thread-9", prompt: "resume me", session: "isolated" });
+    await rm(dirs.running, { recursive: true });
     const seen: string[] = [];
-    const watcher = new DispatchWatcher({
+    const watcher = new DispatchWatcher({ attempts: queueStore.turnAttempts,
       dataDir,
       logger: silent,
       onDispatch: async (spec) => {
@@ -423,7 +462,7 @@ describe("DispatchWatcher", () => {
     });
   });
 
-  it("drops a stale running spec that already has a result instead of re-running it", async () => {
+  it("ignores a legacy running projection and preserves its existing result", async () => {
     await mkdir(dirs.running, { recursive: true });
     await mkdir(dirs.done, { recursive: true });
     await writeFile(
@@ -438,7 +477,7 @@ describe("DispatchWatcher", () => {
     );
 
     let calls = 0;
-    const watcher = new DispatchWatcher({
+    const watcher = new DispatchWatcher({ attempts: queueStore.turnAttempts,
       dataDir,
       logger: silent,
       onDispatch: async () => {
@@ -452,11 +491,11 @@ describe("DispatchWatcher", () => {
 
     expect(calls).toBe(0);
     expect(await readDone("job-d")).toMatchObject({ output: "first run" });
-    expect(await readdir(dirs.running)).toEqual([]);
+    expect(await readdir(dirs.running)).toEqual(["job-d.json"]);
   });
 
   it.each([false, true])(
-    "terminalizes a stale artifact whose durable ledger forbids recovery (resume=%s)",
+    "never executes unowned legacy running artifacts (resume=%s)",
     async (resumeEnabled) => {
       await mkdir(dirs.running, { recursive: true });
       await mkdir(dirs.pending, { recursive: true });
@@ -470,7 +509,7 @@ describe("DispatchWatcher", () => {
         "utf8"
       );
       let calls = 0;
-      const watcher = new DispatchWatcher({
+      const watcher = new DispatchWatcher({ attempts: queueStore.turnAttempts,
         dataDir,
         logger: silent,
         resumeEnabled,
@@ -485,12 +524,8 @@ describe("DispatchWatcher", () => {
       watcher.stop();
 
       expect(calls).toBe(0);
-      expect(await readDone("job-abandoned")).toMatchObject({
-        id: "job-abandoned",
-        status: "failed",
-        error: "abandoned: durable delegation ledger is terminal",
-      });
-      expect(await readdir(dirs.running)).toEqual([]);
+      await expect(readDone("job-abandoned")).rejects.toMatchObject({ code: "ENOENT" });
+      expect(await readdir(dirs.running)).toEqual(["job-abandoned.json"]);
       expect(await readdir(dirs.pending)).toEqual([]);
     }
   );
@@ -503,7 +538,7 @@ describe("DispatchWatcher", () => {
     const gate = (id: string) =>
       new Promise<void>((resolve) => release.set(id, resolve));
 
-    const watcher = new DispatchWatcher({
+    const watcher = new DispatchWatcher({ attempts: queueStore.turnAttempts,
       dataDir,
       logger: silent,
       onDispatch: async (spec) => {
@@ -553,7 +588,7 @@ describe("DispatchWatcher", () => {
     // the later id ("aaa") was created FIRST — sorting by id/readdir would run it
     // first; only sorting by createdUtc gives the correct ["zzz", "aaa"].
     const order: string[] = [];
-    const watcher = new DispatchWatcher({
+    const watcher = new DispatchWatcher({ attempts: queueStore.turnAttempts,
       dataDir,
       logger: silent,
       onDispatch: async (spec) => {
@@ -578,7 +613,7 @@ describe("DispatchWatcher", () => {
     await writeFile(path.join(dirs.pending, "job-e.json"), "{ not json", "utf8");
 
     let calls = 0;
-    const watcher = new DispatchWatcher({
+    const watcher = new DispatchWatcher({ attempts: queueStore.turnAttempts,
       dataDir,
       logger: silent,
       onDispatch: async () => {
@@ -603,7 +638,7 @@ describe("DispatchWatcher", () => {
     await mkdir(dirs.pending, { recursive: true });
     await writeFile(path.join(dirs.pending, "job-f.json"), JSON.stringify({ prompt: "hi" }), "utf8");
 
-    const watcher = new DispatchWatcher({
+    const watcher = new DispatchWatcher({ attempts: queueStore.turnAttempts,
       dataDir,
       logger: silent,
       onDispatch: async () => ({ output: "", stopReason: "end_turn" }),

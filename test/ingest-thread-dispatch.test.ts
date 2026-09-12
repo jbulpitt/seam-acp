@@ -789,7 +789,7 @@ describe("#246 isolated ingest owns every terminal transition", () => {
       recordTurnStart: () => { preflightQuotaStarts++; },
       turnCompleted: async () => { preflightQuotaCompletions++; },
     };
-    const failedWatcher = new DispatchWatcher({
+    const failedWatcher = new DispatchWatcher({ attempts: store.turnAttempts,
       dataDir,
       logger: silent,
       onDispatch: (spec) => broken.orch.dispatchInjectTurn(spec),
@@ -868,7 +868,7 @@ describe("#246 isolated ingest owns every terminal transition", () => {
         text: 'fixture transcript\n```seam-result\n{"answer":42}\n```',
         stopReason: "end_turn",
       });
-      const healthyWatcher = new DispatchWatcher({
+      const healthyWatcher = new DispatchWatcher({ attempts: store.turnAttempts,
         dataDir,
         logger: silent,
         onDispatch: (spec) => healthy.orch.dispatchInjectTurn(spec),
@@ -1010,7 +1010,7 @@ describe("#246 isolated ingest owns every terminal transition", () => {
       throw new Error("result store unavailable");
     };
     let executions = 0;
-    const watcher = new DispatchWatcher({
+    const watcher = new DispatchWatcher({ attempts: store.turnAttempts,
       dataDir,
       logger: silent,
       onDispatch: async (queued) => {

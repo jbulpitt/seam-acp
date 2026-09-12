@@ -163,7 +163,7 @@ describe("proof-only done retention (#306)", () => {
     const dirs = dispatchDirs(dataDir);
     await mkdir(dirs.pending, { recursive: true });
     await writeFile(path.join(dirs.pending, "early-proof.json"), JSON.stringify(spec("early-proof")));
-    const watcher = new DispatchWatcher({ dataDir, logger,
+    const watcher = new DispatchWatcher({ attempts: store.turnAttempts, dataDir, logger,
       onDispatch: async () => { complete("early-proof", true); return { output: "delivered", stopReason: "end_turn" }; },
       onResultPublished: (id) => manager.resultPublished(id),
     });

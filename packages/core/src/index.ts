@@ -1100,17 +1100,17 @@ async function main(): Promise<void> {
     getExpirationAuthorization: (id) => store.getDoneArtifactExpirationAuthorization(id),
   }));
   const dispatchWatcher = createRuntimeDispatchWatcher({
+    attempts: store.turnAttempts,
     dataDir: config.DATA_DIR,
     logger: logger.child({ mod: "dispatch" }),
     runtime: orchestrator,
-    // Flag-on: mark stale running specs in place (orchestrator stagger-
-    // requeues after preconditions). Flag-off: today's recoverStale replay.
+    // The orchestrator authorizes SQL recovery after its boot preconditions.
+    // The flag controls prompted continuation, never original-input replay.
     resumeEnabled: config.SEAM_TURN_RESUME_ENABLED,
-    retainForRecovery: (id) => store.turnAttempts.get(id) !== null,
     isCompleted: (id) => store.isDispatchCompleted(id),
     onResultPublished: (id) => doneRetention.resultPublished(id),
-    // A stale ledger row terminalized by #137 must never be resurrected by the
-    // filesystem at-least-once recovery path, regardless of resume flag.
+    // Legacy ingress without an attempt still respects terminal ledger proof.
+    // Once admitted, SQL execution state takes precedence over this projection.
     mayRecover: (id) => {
       const row = store.getDelegation(id);
       return !row || !DELEGATION_TERMINAL_STATUSES.includes(row.status);
@@ -1222,13 +1222,13 @@ async function main(): Promise<void> {
   // This deliberately runs BEFORE the #137 stale and #75 orphan passes below.
   // A done-backed row is a completed turn awaiting side effects, not stale
   // work to abandon or interrupted work to resume.
-  // #250 ownership repair is deliberately outside the best-effort legacy
-  // scan: a broken winning output must stop intake, never allow provider replay.
+  // SQL completion fences replay even when its output projection is broken.
+  // Repair/report each artifact independently; unrelated intake stays available.
   store.turnAttempts.retireDeadOwners();
   await projectAttemptCompletions(config.DATA_DIR, store.turnAttempts, (id) => {
     const row = store.getDelegation(id);
     return !row || !DELEGATION_TERMINAL_STATUSES.includes(row.status);
-  });
+  }, logger);
   try {
     const repaired = await reconcileCompletedDoneFiles({
       dataDir: config.DATA_DIR,

@@ -21,6 +21,7 @@ import { readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { pino } from "pino";
+import { SessionStore } from "../packages/core/src/core/session-store.js";
 import { DispatchWatcher } from "../packages/core/src/core/dispatch/watcher.js";
 import {
   DispatchSuspendedError,
@@ -49,6 +50,7 @@ async function runRefusal(opts: {
   // attribute its notice to this one.
   const runDir = await mkdtemp(path.join(tmpdir(), "seam-suspension-run-"));
   const runDirs = dispatchDirs(runDir);
+  const store = new SessionStore(path.join(runDir, "queue.db"));
   const notices: Array<{ spec: DispatchSpec; err: DispatchSuspendedError }> = [];
   let entered!: () => void;
   const started = new Promise<void>((resolve) => { entered = resolve; });
@@ -56,6 +58,7 @@ async function runRefusal(opts: {
   const held = new Promise<void>((resolve) => { release = resolve; });
 
   const watcher = new DispatchWatcher({
+    attempts: store.turnAttempts,
     dataDir: runDir,
     logger: silent,
     onRetained: async (spec, err) => { notices.push({ spec, err }); },
@@ -86,6 +89,7 @@ async function runRefusal(opts: {
   if (!opts.stopDuringRun) watcher.stop();
 
   const running = await readdir(runDirs.running);
+  store.close();
   await rm(runDir, { recursive: true, force: true });
   return { notices, running };
 }

@@ -60,16 +60,27 @@ import net from "node:net";
 const silent = pino({ level: "silent" }) as unknown as Logger;
 
 let dataDir: string;
+let queueStore: SessionStore;
+const queueWatchers = new Set<DispatchWatcher>();
+function makeWatcher(opts: DispatchWatcherOpts): DispatchWatcher {
+  const watcher = new DispatchWatcher(opts);
+  queueWatchers.add(watcher);
+  return watcher;
+}
 let dirs: ReturnType<typeof dispatchDirs>;
 
 beforeEach(async () => {
   dataDir = await mkdtemp(path.join(tmpdir(), "seam-174-"));
   dirs = dispatchDirs(dataDir);
+  queueStore = new SessionStore(path.join(dataDir, "watcher-test.db"));
   await mkdir(dirs.pending, { recursive: true });
   await mkdir(dirs.running, { recursive: true });
   await mkdir(dirs.done, { recursive: true });
 });
 afterEach(async () => {
+  for (const watcher of queueWatchers) watcher.stop();
+  queueWatchers.clear();
+  queueStore.close();
   await rm(dataDir, { recursive: true, force: true });
 });
 
@@ -133,7 +144,7 @@ const deferred = () => {
 
 describe("#174 DispatchWatcher.drain", () => {
   it("writes partial worker output into a failed done-file", async () => {
-    const watcher = new DispatchWatcher({
+    const watcher = makeWatcher({ attempts: queueStore.turnAttempts,
       dataDir,
       logger: silent,
       onDispatch: async () => {
@@ -164,7 +175,7 @@ describe("#174 DispatchWatcher.drain", () => {
 
   it("stop() closes intake but does NOT mean drained", async () => {
     const gate = deferred();
-    const watcher = new DispatchWatcher({
+    const watcher = makeWatcher({ attempts: queueStore.turnAttempts,
       dataDir,
       logger: silent,
       onDispatch: async () => {
@@ -192,7 +203,7 @@ describe("#174 DispatchWatcher.drain", () => {
   });
 
   it("stops claiming new specs once intake is closed", async () => {
-    const watcher = new DispatchWatcher({
+    const watcher = makeWatcher({ attempts: queueStore.turnAttempts,
       dataDir,
       logger: silent,
       onDispatch: async () => ({ output: "x", stopReason: "end_turn" }),
@@ -210,7 +221,7 @@ describe("#174 DispatchWatcher.drain", () => {
   it("reaches a fixpoint when a completing task enqueues onto another target", async () => {
     // The fixed-pass version could return with work still in flight.
     let follow: Promise<unknown> | null = null;
-    const watcher = new DispatchWatcher({
+    const watcher = makeWatcher({ attempts: queueStore.turnAttempts,
       dataDir,
       logger: silent,
       onDispatch: async (spec) => {
@@ -232,7 +243,7 @@ describe("#174 DispatchWatcher.drain", () => {
   });
 
   it("carries #174 replay routing into the done-file", async () => {
-    const watcher = new DispatchWatcher({
+    const watcher = makeWatcher({ attempts: queueStore.turnAttempts,
       dataDir,
       logger: silent,
       onDispatch: async () => ({ output: "the answer", stopReason: "end_turn" }),
@@ -260,7 +271,7 @@ describe("#174 DispatchWatcher.drain", () => {
   });
 
   it("carries the KIND of a self-delivering spec, so replay can refuse it", async () => {
-    const watcher = new DispatchWatcher({
+    const watcher = makeWatcher({ attempts: queueStore.turnAttempts,
       dataDir,
       logger: silent,
       onDispatch: async () => ({ output: "compacted", stopReason: "end_turn" }),
@@ -1543,7 +1554,7 @@ describe("#174 tick pre-claim race", () => {
   function makeParkableWatcher(onDispatch: DispatchWatcherOpts["onDispatch"]) {
     let gate: { at: ReturnType<typeof deferred>; release: ReturnType<typeof deferred> } | null =
       null;
-    const watcher = new DispatchWatcher({
+    const watcher = makeWatcher({ attempts: queueStore.turnAttempts,
       dataDir,
       logger: silent,
       onDispatch,
@@ -1711,7 +1722,7 @@ describe("#174 a completion the interrupt suppressed is never re-delivered", () 
   };
 
   it("carries the suppression from the dispatch error into the done-file", async () => {
-    const watcher = new DispatchWatcher({
+    const watcher = makeWatcher({ attempts: queueStore.turnAttempts,
       dataDir,
       logger: silent,
       onDispatch: suppressingDispatch(true),
@@ -1733,7 +1744,7 @@ describe("#174 a completion the interrupt suppressed is never re-delivered", () 
   });
 
   it("omits the flag when nothing was suppressed (negative control)", async () => {
-    const watcher = new DispatchWatcher({
+    const watcher = makeWatcher({ attempts: queueStore.turnAttempts,
       dataDir,
       logger: silent,
       onDispatch: suppressingDispatch(false),
@@ -2063,7 +2074,7 @@ describe("#174 real shutdown sequence keeps adapter and store live", () => {
     const host = makeQuiesceHost();
     const replayHost = makeReplayHost(store as never);
 
-    const watcher = new DispatchWatcher({
+    const watcher = makeWatcher({ attempts: queueStore.turnAttempts,
       dataDir,
       logger: silent,
       onDispatch: async () => {
@@ -2170,7 +2181,7 @@ describe("#174 post-dispose drain covers an ISOLATED dispatch", () => {
     const host = makeQuiesceHost();
     const replayHost = makeReplayHost(store as never);
 
-    const watcher = new DispatchWatcher({
+    const watcher = makeWatcher({ attempts: queueStore.turnAttempts,
       dataDir,
       logger: silent,
       onDispatch: async () => {
@@ -2259,7 +2270,7 @@ describe("#174 post-dispose drain covers an ISOLATED dispatch", () => {
     const host = makeQuiesceHost();
     const replayHost = makeReplayHost(store as never);
 
-    const watcher = new DispatchWatcher({
+    const watcher = makeWatcher({ attempts: queueStore.turnAttempts,
       dataDir,
       logger: silent,
       onDispatch: async () => {

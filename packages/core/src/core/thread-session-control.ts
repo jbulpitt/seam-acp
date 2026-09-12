@@ -16,7 +16,7 @@ import {
   type FastModeOutcome,
 } from "./fast-mode.js";
 import type { SessionConfigState, SessionRecord } from "./types.js";
-import type { CatalogBinding, ModelCatalogService } from "./model-catalog/service.js";
+import { assessModelSelection, type CatalogBinding, type ModelCatalogService, type ModelVerification } from "./model-catalog/service.js";
 import { isLocalLocation } from "./location.js";
 
 export interface ConfigureThreadInput {
@@ -66,6 +66,7 @@ export type ExecuteSelfMigrationOutcome =
   | { ok: false; error: string };
 
 export interface ConfigureThreadSuccess {
+  verification?: ModelVerification;
   ok: true;
   /** Exact effective identity after the operation. Never a partial/vague diff. */
   applied: ThreadConfigurationIdentity;
@@ -422,7 +423,7 @@ export class ThreadSessionControlService {
       agentId: nextAgentId,
       location,
     }).find((model) => model.default);
-    const requestedTargetModel = requestedModel ?? (agentChanged ? catalogDefault?.id : before.model.value);
+    const requestedTargetModel = requestedModel ?? (agentChanged ? catalogDefault?.id ?? "default" : before.model.value);
     if (!requestedTargetModel) {
       return {
         ok: false,
@@ -430,50 +431,29 @@ export class ThreadSessionControlService {
       };
     }
 
-    if (requestedModel) {
-      const models = await this.advertisedModels(
-        profile,
-        target,
-        agentChanged,
-        { agentId: nextAgentId, location }
-      );
-      if (models.length === 0) {
-        return {
-          ok: false,
-          error: `Agent "${nextAgentId}" did not advertise a model catalog; refusing an unvalidated model.`,
-        };
-      }
-      if (!this.deps.modelCatalog.model(
-        { agentId: nextAgentId, location },
-        requestedModel
-      )) {
-        return {
-          ok: false,
-          error: `Model "${requestedModel}" is not advertised by "${nextAgentId}". Valid models: ${models.join(", ")}.`,
-        };
-      }
-    }
-
     const requestedEffort = normalizeEffort(input.effort);
     if (input.effort !== undefined && !requestedEffort) {
       return { ok: false, error: "`effort` must be a non-empty string or `auto`." };
     }
-    const catalogModel = this.deps.modelCatalog.model(
+    const selection = assessModelSelection(this.deps.modelCatalog,
       { agentId: nextAgentId, location },
       requestedTargetModel
     );
-    if (!catalogModel) {
+    // Refuse only a positively retired/unavailable model. Unlisted typed ids
+    // keep this registered agent usable and are passed to its provider unchanged.
+    if (!selection.allowed) {
       return {
         ok: false,
         error: `Model "${requestedTargetModel}" is unavailable in the cached catalog for ${nextAgentId}@${location}.`,
       };
     }
-    const nextModel = catalogModel.id;
+    const catalogModel = selection.model;
+    const nextModel = selection.id;
     const modelChanged = nextModel !== before.model.value;
-    const effortMechanism = catalogModel.effort.mechanism;
-    const staticEffortValues = catalogModel.effort.choices.map((choice) => choice.id);
+    const effortMechanism = catalogModel?.effort.mechanism;
+    const staticEffortValues = catalogModel?.effort.choices.map((choice) => choice.id) ?? [];
     let desiredEffort = requestedEffort === "auto"
-      ? catalogModel.effort.selectionDefault
+      ? catalogModel?.effort.selectionDefault
       : requestedEffort ??
         ((modelChanged || agentChanged)
           ? catalogModel?.effort.selectionDefault
@@ -491,7 +471,8 @@ export class ThreadSessionControlService {
     // #37 Fast mode. Eligibility (agent declares it, environment permits it) is
     // a HARD refusal, not a warning: confirming a Fast change that can never
     // apply is exactly the false confirmation this feature must not produce.
-    const warnings: string[] = [];
+    const warnings: string[] = selection.verification === "unverified"
+      ? [`Model ${JSON.stringify(nextModel)} is unverified for ${nextAgentId}@${location}; the provider will validate the typed id.`] : [];
     const eligible = checkFastModeEligibility({
       requested: input.fastMode === true,
       agentId: nextAgentId,
@@ -516,7 +497,7 @@ export class ThreadSessionControlService {
       previousAgentId,
       nextAgentId,
       modelChanged,
-      modelApplicationMode: catalogModel.applicationMode,
+      modelApplicationMode: catalogModel?.applicationMode ?? "reload",
       fastModeChanged: fastModeNeedsFreshSession({
         nextFastMode,
         fastModeChanged,
@@ -526,7 +507,7 @@ export class ThreadSessionControlService {
     });
     const effortTouched = input.effort !== undefined || modelChanged || agentChanged;
     if (
-      desiredEffort &&
+      catalogModel && desiredEffort &&
       (((effortMechanism === "none" || effortMechanism === "modelBaked") &&
         desiredEffort !== catalogModel.effort.selectionDefault) ||
         !staticEffortValues.includes(desiredEffort))
@@ -563,6 +544,7 @@ export class ThreadSessionControlService {
       const threadIdentityUpdated = await this.applyNaming(target);
       return {
         ok: true,
+        verification: selection.verification,
         applied: beforeIdentity,
         changes: plannedChanges,
         sessionReset: false,
@@ -601,6 +583,7 @@ export class ThreadSessionControlService {
       const effectiveIdentity = identityFromDescription(this.deps.router.describeConfig(current));
       return {
         ok: true,
+        verification: selection.verification,
         applied: effectiveIdentity,
         changes: diffIdentity(beforeIdentity, effectiveIdentity),
         sessionReset: false,
@@ -622,7 +605,7 @@ export class ThreadSessionControlService {
       runtime = forged.runtime;
       newSessionId = runtime.getSessionInfo()?.sessionId;
     } else if (
-      modelChanged && catalogModel.applicationMode === "reload"
+      modelChanged && (catalogModel?.applicationMode ?? "reload") === "reload"
     ) {
       await this.deps.router.invalidate(target.id, { clearAcpSession: false });
       const current = this.deps.store.get(target.id);
@@ -631,7 +614,7 @@ export class ThreadSessionControlService {
       runtimeReloaded = true;
     } else if (
       plannedChanges.effort.changed &&
-      (effortMechanism === "meta" ||
+      (!catalogModel || effortMechanism === "meta" ||
         effortMechanism === "spawnArgs" ||
         desiredEffort === undefined)
     ) {
@@ -658,7 +641,7 @@ export class ThreadSessionControlService {
     // Config-option agents may advertise a model-dependent subset. Validate
     // against the live session before claiming success. Claude never enters
     // this branch: its effort is `_meta` and was applied by the reload above.
-    if (effortTouched && desiredEffort && effortMechanism === "configOption") {
+    if (catalogModel && effortTouched && desiredEffort && effortMechanism === "configOption") {
       const configId = catalogModel.effort.configId;
       if (!configId) {
         return { ok: false, error: `Catalog is missing the config id for ${nextAgentId}/${nextModel}.` };
@@ -740,6 +723,7 @@ export class ThreadSessionControlService {
     const changes = diffIdentity(beforeIdentity, effectiveIdentity);
     return {
       ok: true,
+      verification: selection.verification,
       applied: effectiveIdentity,
       changes,
       sessionReset: reset.sessionReset,

@@ -243,11 +243,9 @@ describe("#339 catalogs are binding-local and disagreement never costs availabil
     expect(warm.generation).toBe(1);
   });
 
-  it("borrows a peer's entry as a labeled hint, never as its own", async () => {
-    // Rules 16-17. `local` has a catalog; `macbook-air` has none yet. The
-    // borrowed entry authorises an ATTEMPT and says so — Seam's gate is the
-    // binding constraint and it is ours to relax, and `profiles/claude.ts`
-    // substitutes nothing, so a wrong id fails cleanly downstream.
+  it("keeps peer entries as display hints, not typed-selection normalization", async () => {
+    // Rules 16-17 still provide display hints. #366 keeps typed selection
+    // independent: a peer cannot normalize a model for this account/host.
     const store = newStore();
     const catalog = service({
       store,
@@ -257,8 +255,8 @@ describe("#339 catalogs are binding-local and disagreement never costs availabil
     await catalog.refresh(local);
 
     const borrowed = catalog.resolve(air, { model: "opus" });
-    expect(borrowed.verification).toBe("borrowed");
-    expect(borrowed.borrowedFrom).toEqual(local);
+    expect(borrowed.verification).toBe("unverified");
+    expect(borrowed.borrowedFrom).toBeUndefined();
     expect(borrowed.normalized.model).toBe("opus");
     // Not presented as this binding's catalog: it has none.
     expect(catalog.models(air)).toEqual([]);

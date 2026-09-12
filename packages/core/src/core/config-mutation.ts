@@ -36,7 +36,7 @@ import { uniqueBridgeId } from "./bridge-pairing.js";
 import type { Logger } from "../lib/logger.js";
 import { parkedAgentMessage } from "./parked-agents.js";
 import type { ConfigDescription } from "./session-router.js";
-import type { ModelCatalogService } from "./model-catalog/service.js";
+import { assessModelSelection, type ModelCatalogService, type ModelVerification } from "./model-catalog/service.js";
 import { validateCron, describeCron } from "./scheduled-prompts/cron.js";
 import { legacyAttachmentQuarantine } from "./scheduled-prompts/quarantine.js";
 import { FAST_MODE_COST_WARNING, FAST_MODE_RESET_NOTICE } from "./fast-mode.js";
@@ -250,6 +250,7 @@ function fmtOverlay(v: unknown): string {
 }
 
 export interface ConfigApplyResult {
+  verification?: ModelVerification;
   ok: boolean;
   /** Effective outcome, Trap-1 aware (reports which layer actually won). */
   message: string;
@@ -292,6 +293,7 @@ export function detectSessionReset(input: {
 /** A validated, human-readable proposal. Nothing has been written yet — calling
  *  `apply` is the only thing that mutates state (D5). */
 export interface ConfigProposal {
+  verification?: ModelVerification;
   id: string;
   tier: ConfigMutationTier;
   /** The thread/channel the change is scoped to (never caller-supplied; D3). */
@@ -333,6 +335,8 @@ export interface ConfigMutationDeps {
   describeConfig: (record: SessionRecord) => ConfigDescription;
   /** Sole cache-only authority for operational model capabilities. */
   modelCatalog: Pick<ModelCatalogService, "model">;
+  /** Agent registration is independent of whether its model cache is warm. */
+  isAgentAvailable?: (agentId: string, location: string) => boolean;
   /**
    * #220: when false, refuse ollama-cloud as parked even if a stale profile
    * is still in `profiles`. Undefined keeps historical unknown-agent wording.
@@ -995,6 +999,7 @@ export class ConfigMutationService {
     changes: SessionConfigChanges,
     opts: { effortValues?: ReadonlyArray<string> } = {}
   ): BuildProposalResult {
+    let verification: ModelVerification | undefined;
     const before = this.deps.describeConfig(record);
     const fields: ProposedField[] = [];
     const warnings: string[] = [];
@@ -1008,10 +1013,12 @@ export class ConfigMutationService {
       if (parked) {
         return { ok: false, error: parked };
       }
-      if (!this.catalogModel(changes.agent, "default", before.location.value)) {
+      // Refuse only a known-unregistered agent; registered agents keep working
+      // with a cold model cache. A model snapshot is not agent registration.
+      if (this.deps.isAgentAvailable?.(changes.agent, before.location.value) === false) {
         return {
           ok: false,
-          error: `Unknown agent "${changes.agent}" at ${before.location.value}. Refresh its catalog first.`,
+          error: `Unknown agent "${changes.agent}" at ${before.location.value}.`,
         };
       }
       nextAgentId = changes.agent;
@@ -1033,19 +1040,20 @@ export class ConfigMutationService {
     if (changes.model !== undefined) {
       const requested = changes.model.trim();
       if (!requested) return { ok: false, error: "`model` must be a non-empty string." };
-      const discovered = this.catalogModel(
-        nextAgentId,
-        requested,
-        before.location.value
-      );
-      if (!discovered) {
+      const selection = assessModelSelection(this.deps.modelCatalog,
+        { agentId: nextAgentId, location: before.location.value }, requested);
+      // Refuse only explicitly retired/unavailable choices; unlisted typed ids
+      // remain usable on this binding and are recorded as unverified.
+      if (!selection.allowed) {
         return {
           ok: false,
           error: `Model "${requested}" is unavailable in the cached catalog for ` +
             `${nextAgentId}@${before.location.value}.`,
         };
       }
-      const m = discovered.id;
+      const discovered = selection.model;
+      verification = selection.verification;
+      const m = selection.id;
       nextCfg.model = m;
       if (m !== before.model.value) {
         fields.push({ label: "model", before: before.model.value, after: m });
@@ -1110,7 +1118,7 @@ export class ConfigMutationService {
         )?.effort.choices.map((choice) => choice.id);
         const usable = opts.effortValues
           ? opts.effortValues.includes(level)
-          : Boolean(catalogChoices?.includes(level));
+          : catalogChoices === undefined || catalogChoices.includes(level);
         if (!usable) {
           return {
             ok: false,
@@ -1262,12 +1270,14 @@ export class ConfigMutationService {
 
     const id = randomUUID();
     const proposal: ConfigProposal = {
+      verification,
       id,
       tier: "session",
       scope: record.channelRef,
       title: `Session config for this thread`,
       fields,
-      warnings,
+      warnings: verification === "unverified"
+        ? [...warnings, "Model verification: unverified; the typed id is passed unchanged to the provider."] : warnings,
       restartsSession,
       apply: (actor) => {
         const updated: SessionRecord = {
@@ -1294,6 +1304,7 @@ export class ConfigMutationService {
           },
           after: {
             ...this.effectiveSnapshot(effective),
+            verification,
             mode: nextCfg.mode ?? null,
             availableTools: nextCfg.availableTools ?? null,
             excludedTools: nextCfg.excludedTools ?? null,
@@ -1304,7 +1315,7 @@ export class ConfigMutationService {
           `agent ${effective.agent.value} (from ${effective.agent.source}), ` +
           `effort ${effective.effort.value ?? "none"} (from ${effective.effort.source}), ` +
           `role ${effective.role.value ?? "none"} (from ${effective.role.source}).`;
-        return { ok: true, message: eff, auditId: audit.id };
+        return { ok: true, verification, message: eff, auditId: audit.id };
       },
     };
     return { ok: true, proposal };
@@ -1316,6 +1327,7 @@ export class ConfigMutationService {
     record: SessionRecord,
     changes: PresetChanges
   ): BuildProposalResult {
+    let verification: ModelVerification | undefined;
     const name = changes.name?.trim();
     if (!name) return { ok: false, error: "`preset.name` is required." };
     const before = this.deps.describeConfig(record);
@@ -1333,7 +1345,8 @@ export class ConfigMutationService {
         ? parkedAgentMessage(changes.agent, this.deps.ollamaCloudEnabled, "select")
         : null;
       if (parked) return { ok: false, error: parked };
-      if (!this.catalogModel(changes.agent, "default", before.location.value)) {
+      // Refuse only an unregistered agent; a cold catalog leaves it usable.
+      if (this.deps.isAgentAvailable?.(changes.agent, before.location.value) === false) {
         return { ok: false, error: `Unknown agent "${changes.agent}" at ${before.location.value}.` };
       }
     }
@@ -1348,11 +1361,15 @@ export class ConfigMutationService {
     const nextAgentId = changes.agent ?? existing?.agentId ?? null;
     let nextModel = changes.model?.trim() || existing?.model || null;
     if (nextAgentId && nextModel && (changes.model !== undefined || changes.agent !== undefined)) {
-      const discovered = this.catalogModel(nextAgentId, nextModel, before.location.value);
-      if (!discovered) {
+      const selection = assessModelSelection(this.deps.modelCatalog,
+        { agentId: nextAgentId, location: before.location.value }, nextModel);
+      // Refuse only positive retirement/unavailability evidence; unlisted
+      // choices remain usable without normalization against another binding.
+      if (!selection.allowed) {
         return { ok: false, error: `Model "${nextModel}" is unavailable in the cached catalog for ${nextAgentId}@${before.location.value}.` };
       }
-      if (discovered) nextModel = discovered.id;
+      verification = selection.verification;
+      nextModel = selection.id;
     }
     let nextEffort =
       changes.effort === null
@@ -1439,7 +1456,7 @@ export class ConfigMutationService {
       const catalogChoices = nextAgentId && nextModel
         ? this.catalogModel(nextAgentId, nextModel, before.location.value)?.effort.choices.map((choice) => choice.id)
         : undefined;
-      const usable = Boolean(catalogChoices?.includes(nextEffort));
+      const usable = catalogChoices === undefined || catalogChoices.includes(nextEffort);
       if (nextAgentId && !usable) {
         return {
           ok: false,
@@ -1488,12 +1505,14 @@ export class ConfigMutationService {
     const id = randomUUID();
     const scopeLabel = projectRef ? `project ${projectRef}` : "global";
     const proposal: ConfigProposal = {
+      verification,
       id,
       tier: "preset",
       scope: record.channelRef,
       title: `${existing ? "Update" : "Create"} preset "${name}" (${scopeLabel})`,
       fields,
-      warnings,
+      warnings: verification === "unverified"
+        ? [...warnings, "Model verification: unverified; the typed id is passed unchanged to the provider."] : warnings,
       restartsSession: false,
       apply: (actor) => {
         const now = new Date().toISOString();
@@ -1525,7 +1544,7 @@ export class ConfigMutationService {
           actor,
           summary: `${existing ? "update" : "create"} preset "${name}" (${scopeLabel})`,
           before: existing ? this.presetSnapshot(existing) : { preset: null },
-          after: this.presetSnapshot(row),
+          after: { ...this.presetSnapshot(row), verification },
         });
         return {
           ok: true,
@@ -1533,6 +1552,7 @@ export class ConfigMutationService {
             `Preset "${name}" ${existing ? "updated" : "created"} in ${scopeLabel}. ` +
             `It is now usable as a handoff target in this thread.`,
           auditId: audit.id,
+          verification,
         };
       },
     };
@@ -1620,6 +1640,7 @@ export class ConfigMutationService {
     changes: ChannelPresetChanges,
     opts: { requireTierC?: boolean } = {}
   ): BuildProposalResult {
+    let verification: ModelVerification | undefined;
     const requireTierC = opts.requireTierC ?? true;
     if (requireTierC && !this.deps.tierCEnabled) {
       return {
@@ -1668,10 +1689,15 @@ export class ConfigMutationService {
     if (changes.model) {
       const agentId = changes.agent ?? ((current.agent as { value?: string } | undefined)?.value);
       if (agentId) {
-        const discovered = this.catalogModel(agentId, changes.model, "local");
-        if (!discovered) {
+        const selection = assessModelSelection(this.deps.modelCatalog,
+          { agentId, location: "local" }, changes.model);
+        // Refuse only retired/unavailable choices; a missing entry leaves
+        // manually typed models available to this channel.
+        if (!selection.allowed) {
           return { ok: false, error: `Model "${changes.model}" is unavailable in the cached catalog for ${agentId}@local.` };
         }
+        verification = selection.verification;
+        const discovered = selection.model;
         if (discovered) {
           effectiveChanges.model = discovered.id;
           const currentModel = (current.model as { value?: string } | undefined)?.value;
@@ -1750,6 +1776,7 @@ export class ConfigMutationService {
 
     const id = randomUUID();
     const proposal: ConfigProposal = {
+      verification,
       id,
       tier: "channel-preset",
       scope: channelId,
@@ -1757,6 +1784,7 @@ export class ConfigMutationService {
       fields,
       warnings: [
         "This is a channel-wide preset — it applies to every thread under this channel, not just this one.",
+        ...(verification === "unverified" ? ["Model verification: unverified; the typed id is passed unchanged to the provider."] : []),
       ],
       restartsSession: true,
       apply: (actor) => {
@@ -1775,7 +1803,7 @@ export class ConfigMutationService {
           actor,
           summary: `channel ${channelId} preset: ${fields.map((f) => f.label).join(", ")}`,
           before: { channel: current },
-          after: { channel: next },
+          after: { channel: next, verification },
         });
         return {
           ok: true,
@@ -1783,6 +1811,7 @@ export class ConfigMutationService {
             `Channel preset for ${channelId} updated and hot-reloaded — it takes effect on the ` +
             `next turn in every thread under this channel. The lock was left unchanged.`,
           auditId: audit.id,
+          verification,
         };
       },
     };
@@ -1829,6 +1858,7 @@ export class ConfigMutationService {
     changes: ThreadPresetChanges,
     opts: { requireTierC?: boolean } = {}
   ): BuildProposalResult {
+    let verification: ModelVerification | undefined;
     const requireTierC = opts.requireTierC ?? true;
     if (requireTierC && !this.deps.tierCEnabled) {
       return {
@@ -1891,12 +1921,16 @@ export class ConfigMutationService {
       const location = requestedLocation === null || requestedLocation === ""
         ? "local"
         : requestedLocation ??
-          ((current.location as { value?: string } | undefined)?.value ?? "local");
+          (typeof current.location === "string" ? current.location : "local");
       if (agentId) {
-        const discovered = this.catalogModel(agentId, changes.model, location);
-        if (!discovered) {
+        const selection = assessModelSelection(this.deps.modelCatalog, { agentId, location }, changes.model);
+        // Refuse only retired/unavailable choices on this binding; unknown
+        // typed ids keep this thread configurable even before its first run.
+        if (!selection.allowed) {
           return { ok: false, error: `Model "${changes.model}" is unavailable in the cached catalog for ${agentId}@${location}.` };
         }
+        verification = selection.verification;
+        const discovered = selection.model;
         if (discovered) {
           effectiveChanges.model = discovered.id;
           const currentModel =
@@ -2112,12 +2146,14 @@ export class ConfigMutationService {
 
     const id = randomUUID();
     const proposal: ConfigProposal = {
+      verification,
       id,
       tier: "thread-preset",
       scope: threadId,
       title: `Thread preset for this thread (${threadId})`,
       fields,
-      warnings,
+      warnings: verification === "unverified"
+        ? [...warnings, "Model verification: unverified; the typed id is passed unchanged to the provider."] : warnings,
       // Detach is a message-gate, not a session-config change. A detached-only
       // write must not restart/invalidate; slash abort-on-detach handles an
       // in-flight turn separately. Mixed with rider/effort/etc. still restarts.
@@ -2141,7 +2177,7 @@ export class ConfigMutationService {
           actor,
           summary: `thread ${threadId} preset: ${fields.map((f) => f.label).join(", ")}`,
           before: { thread: current },
-          after: { thread: next },
+          after: { thread: next, verification },
         });
         return {
           ok: true,
@@ -2149,6 +2185,7 @@ export class ConfigMutationService {
             `Thread preset for ${threadId} updated and hot-reloaded — it takes effect on the ` +
             `next turn in THIS thread only. Sibling threads and the channel preset are unchanged.`,
           auditId: audit.id,
+          verification,
         };
       },
     };

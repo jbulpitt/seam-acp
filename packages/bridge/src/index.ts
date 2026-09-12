@@ -277,7 +277,12 @@ function makeSlotManager(opts: {
             bridgeId,
             instanceId: BRIDGE_INSTANCE_ID,
             protocolVersion: PROTOCOL_VERSION,
-            host: { os: process.platform, arch: process.arch },
+            host: {
+              os: process.platform,
+              arch: process.arch,
+              workspaceRoot,
+              home: homedir(),
+            },
             agents,
             devMode,
             ...(releaseReceipt ? { release: releaseReceipt.helloMetadata() } : {}),

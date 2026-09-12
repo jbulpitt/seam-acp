@@ -65,6 +65,10 @@ export interface HelloAgentInventory {
 export interface HelloHostInfo {
   os: string;
   arch: string;
+  /** Exact non-secret workspace configured by the bridge's `--cwd`. */
+  workspaceRoot?: string;
+  /** Exact non-secret home directory; fallback when no workspace was declared. */
+  home?: string;
 }
 
 export interface HelloFrame {

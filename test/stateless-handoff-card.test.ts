@@ -1,7 +1,9 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { EventEmitter } from "node:events";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { PassThrough } from "node:stream";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
 import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { pino } from "pino";
@@ -22,6 +24,7 @@ import type { Logger } from "../packages/core/src/lib/logger.js";
 import type { Preset, SessionRecord, StructuredPanel } from "../packages/core/src/core/types.js";
 import type { ChannelRef, MessageRef } from "../packages/core/src/platforms/chat-adapter.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
+import { BridgeHub } from "../packages/core/src/core/bridge-hub.js";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
 
@@ -179,6 +182,39 @@ function presetSpec(over: Partial<DispatchSpec> = {}): DispatchSpec {
   };
 }
 
+function fakeRemoteHub(opts: {
+  defaultCwd?: string;
+  rpc?: (method: string, params: unknown) => Promise<unknown>;
+}) {
+  const rpcCalls: Array<{ method: string; params: unknown }> = [];
+  let slot = 0;
+  const mux = {
+    spawn: () => Object.assign(new EventEmitter(), {
+      slot: ++slot,
+      stdin: new PassThrough(),
+      stdout: new PassThrough(),
+      stderr: new PassThrough(),
+      kill: vi.fn(),
+    }),
+    rpc: async (method: string, params: unknown) => {
+      rpcCalls.push({ method, params });
+      return opts.rpc ? opts.rpc(method, params) : { ok: true };
+    },
+    releaseStdin: vi.fn(),
+  };
+  const defaultCwdForLocation = vi.fn(() => opts.defaultCwd);
+  return {
+    rpcCalls,
+    defaultCwdForLocation,
+    hub: {
+      defaultCwdForLocation,
+      markSessionBridge: vi.fn(),
+      get: () => ({ mux }),
+      mcpServersForRemoteSpawn: () => undefined,
+    },
+  };
+}
+
 function threadSpec(over: Partial<DispatchSpec> = {}): DispatchSpec {
   return {
     id: "disp-thread",
@@ -327,6 +363,7 @@ describe("stateless/preset handoff embed card", () => {
     };
     const marked: Array<{ sessionId: string; location: string }> = [];
     orch.setBridgeHub({
+      defaultCwdForLocation: () => "/Users/fixture/Projects",
       markSessionBridge: (sessionId: string, location: string) => {
         marked.push({ sessionId, location });
       },
@@ -347,6 +384,144 @@ describe("stateless/preset handoff embed card", () => {
     ]);
     expect(injected.location).toBe("studio");
     expect(typeof injected.spawnFn).toBe("function");
+  });
+
+  it("uses the executing bridge workspace for an implicit agentId@location cwd (#367)", async () => {
+    const { adapter } = spyAdapter();
+    const orch = makeOrch({ dataDir, adapter });
+    // `claude@studio` is an agent address, not a stored DB preset.
+    (orch as any).store.getPresetByName = () => null;
+    const remote = fakeRemoteHub({ defaultCwd: "/Users/fixture/Projects" });
+    orch.setBridgeHub(remote.hub as any);
+    let injected: any;
+    (orch as any).injectTurn = async (_record: unknown, _prompt: string, opts: unknown) => {
+      injected = opts;
+      return { text: "remote result", stopReason: "end_turn" };
+    };
+
+    await orch.dispatchInjectTurn(presetSpec({ preset: "claude", location: "studio" }));
+    await injected.spawnFn();
+
+    // The fixture intentionally uses mutually impossible Linux/Mac layouts.
+    // Restoring the old inherited-cwd expression changes both assertions to
+    // `/repo`, so this test fails on the production call site rather than a
+    // helper that dispatch never invokes.
+    expect(injected.cwd).toBe("/Users/fixture/Projects");
+    expect(injected.cwd).not.toBe("/repo");
+    expect(remote.rpcCalls).toEqual([
+      expect.objectContaining({
+        method: "spawn",
+        params: expect.objectContaining({ cwd: "/Users/fixture/Projects" }),
+      }),
+    ]);
+  });
+
+  it("still sends an explicit nonexistent cwd to the host and preserves its refusal (#367)", async () => {
+    const explicit = "/Users/fixture/does-not-exist";
+    const refusal = `Invalid params: \`cwd\` does not exist on the machine running the agent: ${explicit}`;
+    const { adapter } = spyAdapter();
+    const orch = makeOrch({ dataDir, adapter });
+    (orch as any).store.getPresetByName = () => null;
+    const remote = fakeRemoteHub({
+      defaultCwd: "/Users/fixture/Projects",
+      rpc: async (_method, params) => {
+        const cwd = (params as { cwd?: string }).cwd;
+        if (cwd === explicit) throw new Error(refusal);
+        return { ok: true };
+      },
+    });
+    orch.setBridgeHub(remote.hub as any);
+    (orch as any).injectTurn = async (_record: unknown, _prompt: string, opts: any) => {
+      try {
+        await opts.spawnFn();
+        return { text: "wrong cwd accepted", stopReason: "end_turn" };
+      } catch (cause) {
+        return { text: "", error: (cause as Error).message, cause };
+      }
+    };
+
+    await expect(orch.dispatchInjectTurn(presetSpec({
+      preset: "claude",
+      location: "studio",
+      cwd: explicit,
+    }))).rejects.toThrow(refusal);
+    expect(remote.defaultCwdForLocation).not.toHaveBeenCalled();
+    expect(remote.rpcCalls).toEqual([
+      expect.objectContaining({
+        method: "spawn",
+        params: expect.objectContaining({ cwd: explicit }),
+      }),
+    ]);
+  });
+
+  it("keeps implicit @local workers on the caller thread cwd (#367)", async () => {
+    const { adapter } = spyAdapter();
+    const orch = makeOrch({ dataDir, adapter });
+    (orch as any).store.getPresetByName = () => null;
+    let injected: any;
+    (orch as any).injectTurn = async (_record: unknown, _prompt: string, opts: unknown) => {
+      injected = opts;
+      return { text: "local result", stopReason: "end_turn" };
+    };
+
+    await orch.dispatchInjectTurn(presetSpec({ preset: "claude", location: "local" }));
+
+    expect(injected.cwd).toBe("/repo");
+    expect(injected.location).toBe("local");
+    expect(injected.spawnFn).toBeUndefined();
+  });
+
+  it("refuses only an implicit remote dispatch when the host reports no safe default (#367)", async () => {
+    const { adapter } = spyAdapter();
+    const orch = makeOrch({ dataDir, adapter });
+    (orch as any).store.getPresetByName = () => null;
+    const remote = fakeRemoteHub({});
+    orch.setBridgeHub(remote.hub as any);
+    const inject = (orch as any).injectTurn = vi.fn(async () => ({
+      text: "",
+      stopReason: "end_turn",
+    }));
+
+    await expect(orch.dispatchInjectTurn(
+      presetSpec({ preset: "claude", location: "legacy-mac" })
+    )).rejects.toThrow(
+      'remote location "legacy-mac" did not report a workspace root or HOME; specify cwd explicitly'
+    );
+    expect(inject).not.toHaveBeenCalled();
+    // An explicit cwd remains a recovery route even for an older bridge.
+    await expect(orch.dispatchInjectTurn(
+      presetSpec({ preset: "claude", location: "legacy-mac", cwd: "/Users/legacy" })
+    )).resolves.toMatchObject({ output: "" });
+    expect(inject).toHaveBeenCalledTimes(1);
+  });
+
+  it("reads the actual workspace, configured workspace, then HOME from BridgeHub (#367)", () => {
+    const subject = (host: Record<string, string>, configuredWorkspaceRoot?: string) => {
+      const hub = Object.create(BridgeHub.prototype) as any;
+      hub.connections = new Map([["studio", { host }]]);
+      hub.config = {
+        bridgePresets: new Map([["studio", {
+          id: "studio",
+          tokenHash: "a".repeat(64),
+          ...(configuredWorkspaceRoot ? { workspaceRoot: configuredWorkspaceRoot } : {}),
+        }]]),
+      };
+      return hub as BridgeHub;
+    };
+
+    expect(subject({
+      os: "darwin",
+      arch: "arm64",
+      workspaceRoot: "/Users/live/Projects",
+      home: "/Users/live",
+    }, "/Users/stale/Projects").defaultCwdForLocation("studio"))
+      .toBe("/Users/live/Projects");
+    expect(subject({ os: "darwin", arch: "arm64", home: "/Users/live" },
+      "/Users/configured/Projects").defaultCwdForLocation("studio"))
+      .toBe("/Users/configured/Projects");
+    expect(subject({ os: "darwin", arch: "arm64", home: "/Users/live" })
+      .defaultCwdForLocation("studio"))
+      .toBe("/Users/live");
   });
 
   it("posts a card (not messages) for a preset handoff", async () => {

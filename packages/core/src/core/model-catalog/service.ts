@@ -503,12 +503,13 @@ export class ModelCatalogService {
       // binding-local key by construction, so without honouring that proof the
       // rename would silently abandon the published generation it exists to
       // carry forward. Labels still prove nothing; this is not a label.
-      const desiredScope =
-        bindingMigration &&
-        bindingMigration.targetBindingKey === key &&
+      const migrationScope =
+        bindingMigration?.targetBindingKey === key &&
+        bindingMigration.scopeKey &&
         this.snapshots.has(bindingMigration.scopeKey)
           ? bindingMigration.scopeKey
-          : declaredScope;
+          : null;
+      const desiredScope = migrationScope ?? declaredScope;
       const activeForScope = this.snapshots.get(desiredScope);
       const sourceObservation = this.observations.get(fetchedBy);
       const migrationProof = Boolean(

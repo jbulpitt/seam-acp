@@ -2155,6 +2155,10 @@ async function runAgyProbe<T>(
   run: (handle: ProbeHandle) => Promise<T>,
   observe?: (proc: ChildProcessWithoutNullStreams) => (() => void),
   acceptNonzeroExit = false,
+  /** #361: a caller's cancellation. `runBoundedProbe` refuses to spawn when it
+   * is already aborted and tears the child down if it fires mid-probe, so the
+   * work stops rather than the wait. */
+  signal?: AbortSignal,
 ): Promise<T> {
   let proc: ChildProcessWithoutNullStreams;
   let stopObserving: (() => void) | undefined;
@@ -2162,6 +2166,7 @@ async function runAgyProbe<T>(
     return await runBoundedProbe({
       executable: "native-agy", label: "native AGY", timeoutMs, killGraceMs: 500,
       processGroup: true, allowCleanExit: true, acceptNonzeroExit,
+      ...(signal ? { signal } : {}),
       spawnOverride: () => {
         proc = runtime.prepare(args, "/tmp", { detached: true, stdio: ["pipe", "pipe", "pipe"] }).spawn() as ChildProcessWithoutNullStreams;
         return proc;
@@ -2347,38 +2352,69 @@ const USAGE_CACHE_TTL_MS = 60_000;
 const usageCache = new Map<string, { at: number; data: AgyUsage }>();
 
 /**
- * Fetch the current user's Antigravity usage snapshot. Spawns a transient
- * `agy -p` to bring the local LS up, hits `RetrieveUserQuotaSummary`, and
- * parses the response. Cached for {@link USAGE_CACHE_TTL_MS} after a successful
- * call.
+ * Fetch the current user's Antigravity usage snapshot, WITHOUT paying for a
+ * model turn (#361).
+ *
+ * This used to run `agy -p ok …`. `-p` is agy's `--print` — "run a single
+ * prompt non-interactively and print the response" — so every cold quota
+ * refresh billed a real turn, purely as a side effect of needing a language
+ * server up. Threading a cancellation signal into that would only have made
+ * the charge shorter; cancelling a billable probe still bills.
+ *
+ * `agy models` starts the same language server and takes no prompt. Measured
+ * on agy 1.1.27, four runs: the LS port appears ~0.6s in, the quota RPC
+ * answers `500` during silent-auth and then `200` at +1.4s to +2.2s, with the
+ * process exiting at +1.7s to +2.8s. This is the difference from R4a (#260),
+ * where `GetAvailableModels` returned `400` for the entire window and the
+ * catalog had to give up on enrichment — quota does not have that problem.
+ *
+ * The retry loop is therefore bounded by the CHILD'S LIFETIME rather than a
+ * 10s wall clock: `agy models` exits on its own, `handle.signal` aborts with
+ * it, and there is nothing to wait for afterwards. That also fixes the second
+ * half of #361 — the old nested bounds were 30s + 15s + 10s sequentially,
+ * which could outlive the quota poller's own 30s per-source deadline. The
+ * worst case here is the 15s probe bound, comfortably inside it.
+ *
+ * The honest cost: the usable window is roughly 0.5–1.5s wide, so a cold or
+ * slow silent-auth can miss it. What that refuses is ONE agy quota reading,
+ * which degrades to "we cannot currently tell you agy's quota" with the
+ * registry's last-known-good left in place. What keeps working: every other
+ * agent's quota source, each with its own controller; and agy itself as an
+ * agent, because the only process involved is this throwaway `models` reader
+ * and no model runtime is on this path. Missing a reading is an annoyance;
+ * paying for a turn to avoid missing it was the wrong trade.
+ *
+ * Cached for {@link USAGE_CACHE_TTL_MS} after a successful call.
  */
-export async function fetchAgyUserStatus(runtime: AgyNativeRuntime): Promise<AgyUsage> {
+export async function fetchAgyUserStatus(
+  runtime: AgyNativeRuntime,
+  signal?: AbortSignal
+): Promise<AgyUsage> {
   const cached = usageCache.get(runtime.identityKey);
   if (cached && Date.now() - cached.at < USAGE_CACHE_TTL_MS) {
     return cached.data;
   }
+  // The cheapest cancellation is the one that never starts a process.
+  signal?.throwIfAborted();
   const logFile = await newSpawnLogPath();
   try {
-    // KNOWN REMAINING PROMPT PROBE (#260). Quota lives behind the same
-    // language server as the catalog did, and this still pays a model turn to
-    // start one. The catalog no longer does — `agy models` starts an LS
-    // without prompting — so the same technique should work here, but quota
-    // semantics belong to #345 and changing them is not this story's scope.
-    // Left named rather than silently inherited: a probe nobody can see is how
-    // this one survived two rounds of catalog work.
-    return await runAgyProbe(runtime, ["-p", "ok", AGY_NO_SLASH_EXPANSION, "--log-file", logFile, "--print-timeout", "30s", "--dangerously-skip-permissions"], 30_000, async (handle) => {
+    // NO PROMPT FLAG BELOW. `models` is a subcommand that lists models and
+    // exits 0; adding `-p`/`--print`/`--prompt` here would restore a billable
+    // turn on every cold quota refresh. `test/agy-quota-no-prompt.test.ts`
+    // fails if one reappears.
+    return await runAgyProbe(runtime, ["--log-file", logFile, "models"], 15_000, async (handle) => {
     handle.stdout.resume();
     const ls = await discoverAgyLs({
       logFile,
-      timeoutMs: 15_000,
+      timeoutMs: 8_000,
       signal: handle.signal,
     });
     // /healthz comes up before the LS finishes silent-auth, so quota retrieval
-    // can initially 500. Retry briefly until auth lands (usually 1–2s).
+    // can initially 500. Retry until auth lands (usually 1–2s) or the child
+    // goes away, whichever comes first.
     const url = `http://localhost:${ls.port}/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary`;
-    const deadline = Date.now() + 10_000;
     let lastStatus = 0;
-    while (Date.now() < deadline) {
+    while (!handle.signal.aborted) {
       const res = await fetch(url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -2394,10 +2430,10 @@ export async function fetchAgyUserStatus(runtime: AgyNativeRuntime): Promise<Agy
       lastStatus = res.status;
       await res.body?.cancel();
       if (res.status !== 500) break;
-      await delay(400, undefined, { signal: handle.signal });
+      await delay(250, undefined, { signal: handle.signal });
     }
     throw new Error(`RetrieveUserQuotaSummary HTTP ${lastStatus}`);
-    });
+    }, undefined, false, signal);
   } finally {
     await fs.unlink(logFile).catch(() => {});
   }

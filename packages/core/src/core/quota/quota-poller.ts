@@ -92,7 +92,11 @@ export function createAgentQuotaSources(
       return {
         ...identity,
         eventDriven: false,
-        fetch: async () => mapAgyQuota(identity, await fetchAgyUserStatus(opts.agyRuntime!)),
+        // #361: the signal reaches the spawn now. The probe itself no longer
+        // issues a prompt, so an abandoned refresh costs nothing either way —
+        // but the child still stops with the refusal rather than outliving it.
+        fetch: async (signal) =>
+          mapAgyQuota(identity, await fetchAgyUserStatus(opts.agyRuntime!, signal)),
       };
     }
     if (profile.id === "ollama-cloud") {

@@ -52,6 +52,42 @@ function text(value: unknown): string {
   return canonicalJson(value);
 }
 
+/**
+ * Configuration that has not changed must compare equal no matter which call
+ * site recorded it. Admission passes the session's raw `configJson` (pretty
+ * printed, and carrying `lastContextUsage`), while the resume check passes the
+ * parsed object with that key already removed. `text` returned a string
+ * verbatim, so those two spellings of an IDENTICAL configuration never matched
+ * and every such resume was refused as "thread configuration changed".
+ *
+ * `lastContextUsage` is a usage statistic that is rewritten after every turn,
+ * so leaving it inside the record would make an untouched thread drift out of
+ * its own identity. Both concerns are settled here, once, rather than at each
+ * caller — the asymmetry is exactly what a per-caller convention produced.
+ */
+const VOLATILE_CONFIG_KEYS = new Set(["lastContextUsage"]);
+
+function configIdentity(value: unknown): string {
+  if (value === null || value === undefined) return "";
+  let parsed: unknown = value;
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) return "";
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch {
+      // Not JSON: it is some other opaque marker, so compare it verbatim
+      // rather than inventing a shape for it.
+      return value;
+    }
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return canonicalJson(parsed);
+  const stable = Object.fromEntries(
+    Object.entries(parsed as Record<string, unknown>).filter(([key]) => !VOLATILE_CONFIG_KEYS.has(key))
+  );
+  return canonicalJson(stable);
+}
+
 /** Key-sorted JSON so an equal configuration always compares equal. */
 function canonicalJson(value: unknown): string {
   if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "";
@@ -76,7 +112,7 @@ export function executionIdentity(input: ExecutionIdentityInput): string {
     model: text(input.model),
     effort: text(input.effort),
     cwd: text(input.cwd),
-    config: text(input.config),
+    config: configIdentity(input.config),
   };
   return canonicalJson(identity);
 }
@@ -142,9 +178,14 @@ export function compareExecutionIdentity(
   }
   if (stored === current) return { match: true, legacy: false };
   for (const field of Object.keys(LABEL) as Array<Exclude<keyof ExecutionIdentity, "version">>) {
-    if (before[field] !== after[field]) {
-      return { match: false, field, reason: LABEL[field](before[field], after[field]) };
-    }
+    // Rows written before the spelling was settled hold the raw pretty-printed
+    // configJson. Normalising BOTH sides here means those attempts resume on
+    // their own rather than needing a migration to rewrite history, and a
+    // configuration that genuinely differs still differs after normalising.
+    const [a, b] = field === "config"
+      ? [configIdentity(before[field]), configIdentity(after[field])]
+      : [before[field], after[field]];
+    if (a !== b) return { match: false, field, reason: LABEL[field](a, b) };
   }
   return { match: true, legacy: false };
 }

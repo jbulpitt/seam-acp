@@ -117,9 +117,14 @@ export function createAgentQuotaSources(
       return {
         ...identity,
         eventDriven: true,
-        fetch: async () => mapGrokQuota(identity, await fetchGrokUsage(opts.grokCliPath)),
-        fetchFromConnection: async (request) =>
-          mapGrokQuota(identity, await fetchGrokUsageFromConnection(request)),
+        // #349: the signal has to reach the cold path, which spawns a process
+        // and can run 50s against this poller's 30s deadline. Dropping it here
+        // is what let an aborted refresh leave a `grok agent stdio` running —
+        // the caller stopped waiting, the work did not stop.
+        fetch: async (signal) =>
+          mapGrokQuota(identity, await fetchGrokUsage(opts.grokCliPath, signal)),
+        fetchFromConnection: async (request, signal) =>
+          mapGrokQuota(identity, await fetchGrokUsageFromConnection(request, signal)),
       };
     }
     if (profile.id === "copilot" || profile.id.startsWith("copilot-")) {

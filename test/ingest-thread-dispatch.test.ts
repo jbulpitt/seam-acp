@@ -169,6 +169,9 @@ function makeOrch(
       if (opts.restrictionError) throw new Error(opts.restrictionError);
       return router.getProfile(id, location);
     },
+    // Fixture completeness: reaching this at all is new, because the preflight
+    // refusal under test now happens later than "the binding has no catalog".
+    assertAgentAllowedForChannel: () => {},
     getOrStartRuntime: async (rec: SessionRecord | string) => {
       runtimeFor.push(typeof rec === "string" ? rec : rec.id);
       return rt;
@@ -750,7 +753,7 @@ describe("#246 isolated ingest owns every terminal transition", () => {
     });
   });
 
-  it("terminalizes catalog preflight failure and permits the next HTTP job and ordinary turn", async () => {
+  it("terminalizes a preflight refusal and permits the next HTTP job and ordinary turn", async () => {
     const token = mintBridgeToken();
     const row = endpoint({
       tokenHash: hashBridgeToken(token),
@@ -765,11 +768,18 @@ describe("#246 isolated ingest owns every terminal transition", () => {
     });
     store.insertIngestEndpoint(row);
     const results = new ChoiceResultHub({ store, logger: silent });
+    // This used to make the preflight fail by leaving `claude@local` without a
+    // catalog at all, which #339 rule 15 deliberately no longer refuses: a
+    // missing catalog is the #326 bootstrap deadlock, not a reason to fail a
+    // turn. The terminalization machinery is still worth testing, so the
+    // refusal is now the narrow one #339 keeps — the binding HAS a catalog and
+    // the requested model is genuinely not in it.
     const broken = makeOrch(dataDir, store, {
       profile: { id: "claude", defaultModel: "default" },
-      // A different catalog binding leaves claude@local genuinely unavailable.
-      catalogProfile: { id: "other", defaultModel: "other-default" },
     });
+    (broken.orch as unknown as { injectTurn: () => Promise<never> }).injectTurn = async () => {
+      throw new Error("provider refused: quota exhausted for claude@local");
+    };
     broken.orch.setChoiceResults(results);
     let preflightRevocations = 0;
     let preflightQuotaStarts = 0;
@@ -819,7 +829,7 @@ describe("#246 isolated ingest owns every terminal transition", () => {
       ) as { status: string; error?: string };
       expect(failedDone).toMatchObject({
         status: "failed",
-        error: expect.stringMatching(/catalog has no default model/),
+        error: expect.stringContaining("quota exhausted"),
       });
 
       const failedPoll = await fetch(`http://127.0.0.1:${port}/ingest/jobs/${first.jobId}`, {
@@ -829,7 +839,7 @@ describe("#246 isolated ingest owns every terminal transition", () => {
       expect(await failedPoll.json()).toMatchObject({
         jobId: first.jobId,
         status: "missing",
-        error: expect.stringMatching(/catalog has no default model/),
+        error: expect.stringContaining("quota exhausted"),
       });
       expect(store.getDelegation(first.jobId)).toMatchObject({
         kind: "ingest",

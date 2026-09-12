@@ -493,11 +493,24 @@ export class ModelCatalogService {
       const candidate = normalizeCatalogCandidate(fetched);
       validateCandidate(candidate);
       const checksum = candidateChecksum(candidate);
-      const desiredScope = shareableScope(candidate.scope)
+      const declaredScope = shareableScope(candidate.scope)
         ? `scope:${candidate.scope.fingerprint}` : `binding:${key}`;
+      const bindingMigration = this.options.store.pendingBindingMigration(key);
+      // #339 rule 2 says sharing must be PROVEN, and a recorded binding
+      // migration is the strongest proof in the system: single-use, bound to a
+      // named source binding, an exact active generation and checksum, and a
+      // content continuity fingerprint. A binding RENAME changes the
+      // binding-local key by construction, so without honouring that proof the
+      // rename would silently abandon the published generation it exists to
+      // carry forward. Labels still prove nothing; this is not a label.
+      const desiredScope =
+        bindingMigration &&
+        bindingMigration.targetBindingKey === key &&
+        this.snapshots.has(bindingMigration.scopeKey)
+          ? bindingMigration.scopeKey
+          : declaredScope;
       const activeForScope = this.snapshots.get(desiredScope);
       const sourceObservation = this.observations.get(fetchedBy);
-      const bindingMigration = this.options.store.pendingBindingMigration(key);
       const migrationProof = Boolean(
         fetchedBy === key && activeForScope && bindingMigration &&
         bindingMigration.targetBindingKey === key &&

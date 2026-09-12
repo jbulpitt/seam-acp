@@ -9,6 +9,7 @@ export * from "./fast-mode.js";
 export * from "./session-manager.js";
 export * from "./attachment-staging.js";
 export * from "./agy-stream.js";
+export * from "./agy-native-translation.js";
 export * from "./agy-native-runtime.js";
 export * from "./agy-session-store.js";
 export * from "./agy-session-store.js";

@@ -1,0 +1,58 @@
+{
+  "scenario": "turn-correction",
+  "conversationId": "33333333-3333-4333-8333-333333333333",
+  "updates": [
+    {
+      "status": "CASCADE_RUN_STATUS_RUNNING"
+    },
+    {
+      "mainTrajectoryUpdate": {
+        "stepsUpdate": {
+          "indices": [1],
+          "steps": [{
+            "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+            "status": "CORTEX_STEP_STATUS_GENERATING",
+            "plannerResponse": {
+              "thinking": "Check red path",
+              "modifiedResponse": "Choose red"
+            }
+          }]
+        }
+      }
+    },
+    {
+      "mainTrajectoryUpdate": {
+        "stepsUpdate": {
+          "indices": [1],
+          "steps": [{
+            "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+            "status": "CORTEX_STEP_STATUS_GENERATING",
+            "plannerResponse": {
+              "thinking": "Check new path",
+              "modifiedResponse": "Choose new"
+            }
+          }]
+        }
+      }
+    },
+    {
+      "mainTrajectoryUpdate": {
+        "stepsUpdate": {
+          "indices": [1],
+          "steps": [{
+            "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+            "status": "CORTEX_STEP_STATUS_DONE",
+            "plannerResponse": {
+              "thinking": "Check new path safely",
+              "modifiedResponse": "Choose new!"
+            }
+          }]
+        }
+      }
+    },
+    {
+      "status": "CASCADE_RUN_STATUS_IDLE",
+      "fullyIdle": true
+    }
+  ]
+}

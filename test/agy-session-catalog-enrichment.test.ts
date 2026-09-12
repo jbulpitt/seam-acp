@@ -23,7 +23,7 @@ const logger = pino({ level: "silent" }) as unknown as Logger;
 function managedProfile(
   root: string,
   credentialScope: string,
-  metadataUnavailable = false,
+  metadataMode: "available" | "unavailable" | "mismatch" = "available",
   invocationLog?: string,
 ) {
   const managed = createManagedAgyFixture({
@@ -33,7 +33,7 @@ function managedProfile(
     cwd: root,
     approvedEnvironment: {
       SEAM_AGY_CAPABILITY_FIXTURE_DIR: fixtureDir,
-      ...(metadataUnavailable ? { SEAM_AGY_R4B_METADATA_MODE: "unavailable" } : {}),
+      ...(metadataMode === "available" ? {} : { SEAM_AGY_R4B_METADATA_MODE: metadataMode }),
       ...(invocationLog ? { SEAM_AGY_CAPABILITY_INVOCATIONS: invocationLog } : {}),
     },
   });
@@ -50,7 +50,7 @@ describe.sequential("#346 real-session catalog enrichment", () => {
   it("publishes rich LS metadata for the exact binding and never lends it as host evidence", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "seam-agy-r4b-publish-"));
     const invocationLog = path.join(root, "invocations.ndjson");
-    const local = managedProfile(root, "antigravity-oauth:local", false, invocationLog);
+    const local = managedProfile(root, "antigravity-oauth:local", "available", invocationLog);
     const peerRoot = fs.mkdtempSync(path.join(os.tmpdir(), "seam-agy-r4b-peer-"));
     const peer = managedProfile(peerRoot, "antigravity-oauth:peer");
     const db = path.join(root, "seam.db");
@@ -141,7 +141,7 @@ describe.sequential("#346 real-session catalog enrichment", () => {
 
   it("keeps AGY usable with the conservative window when its LS cannot provide metadata", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "seam-agy-r4b-unavailable-"));
-    const subject = managedProfile(root, "antigravity-oauth:unavailable", true);
+    const subject = managedProfile(root, "antigravity-oauth:unavailable", "unavailable");
     const db = path.join(root, "seam.db");
     const catalogStore = new ModelCatalogStore(db);
     const sessionStore = new SessionStore(db);
@@ -189,6 +189,51 @@ describe.sequential("#346 real-session catalog enrichment", () => {
       ]);
       expect(usage.length).toBeGreaterThan(0);
       expect(usage.every((event) => event.size === AGY_ASSUMED_CONTEXT_WINDOW)).toBe(true);
+    } finally {
+      await router.disposeAll().catch(() => {});
+      sessionStore.close();
+      catalogStore.close();
+      subject.managed.cleanup();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("ignores rich metadata whose model id is not an exact catalog id", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "seam-agy-r4b-mismatch-"));
+    const subject = managedProfile(root, "antigravity-oauth:mismatch", "mismatch");
+    const db = path.join(root, "seam.db");
+    const catalogStore = new ModelCatalogStore(db);
+    const sessionStore = new SessionStore(db);
+    const binding = { agentId: "agy", location: "local" };
+    const catalog = new ModelCatalogService({
+      store: catalogStore,
+      logger,
+      bindings: () => [binding],
+      scope: () => subject.profile.catalog.scope(),
+      fetch: () => subject.profile.catalog.fetch(),
+    });
+    const router = new SessionRouter({
+      logger,
+      store: sessionStore,
+      profiles: [subject.profile],
+      modelCatalog: catalog,
+      defaultAgentId: "agy",
+      defaultModel: "fixture-native-model",
+      defaultCwd: root,
+    });
+    try {
+      expect(await catalog.refresh(binding)).toMatchObject({ result: "published", generation: 1 });
+      const record = router.ensureSessionRecord({ platform: "discord", channelRef: "agy-r4b-mismatch", cwd: root });
+      const runtime = await router.getOrStartRuntime(record);
+      await runtime.prompt("capability-turn-one");
+      await runtime.idle();
+
+      expect(catalog.model(binding, "fixture-native-model")?.context.maximum).toBeNull();
+      expect(catalog.model(binding, "fixture-native-model-alias")).toBeNull();
+      expect(catalog.models(binding).map((model) => model.id)).toEqual([
+        "fixture-native-model",
+        "fixture-native-model-low",
+      ]);
     } finally {
       await router.disposeAll().catch(() => {});
       sessionStore.close();

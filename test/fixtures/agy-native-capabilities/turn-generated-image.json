@@ -1,0 +1,25 @@
+{
+  "scenario": "turn-generated-image",
+  "conversationId": "44444444-4444-4444-8444-444444444444",
+  "updates": [
+    {
+      "status": "CASCADE_RUN_STATUS_RUNNING"
+    },
+    {
+      "mainTrajectoryUpdate": {
+        "stepsUpdate": {
+          "indices": [1],
+          "steps": [{
+            "type": "CORTEX_STEP_TYPE_GENERATE_IMAGE",
+            "status": "CORTEX_STEP_STATUS_DONE",
+            "content": "Generated image is saved at __GENERATED_IMAGE__."
+          }]
+        }
+      }
+    },
+    {
+      "status": "CASCADE_RUN_STATUS_IDLE",
+      "fullyIdle": true
+    }
+  ]
+}

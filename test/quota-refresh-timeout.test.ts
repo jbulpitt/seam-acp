@@ -202,6 +202,7 @@ describe("usage-card production interaction", () => {
     const result: AgentQuotaRefreshSummary = {
       outcome: "mixed",
       durationMs: 30_000,
+      timeoutMs: 30_000,
       sources: [
         { agentId: "copilot", displayName: "Copilot", outcome: "timed_out", durationMs: 30_000,
           quota: quota("copilot", "Copilot"), error: "Quota refresh timed out after 30s" },

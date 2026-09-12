@@ -60,6 +60,7 @@ export interface AgentQuotaRefreshResult {
 export interface AgentQuotaRefreshSummary {
   outcome: "succeeded" | "mixed" | "failed";
   durationMs: number;
+  timeoutMs: number;
   sources: AgentQuotaRefreshResult[];
 }
 
@@ -253,6 +254,7 @@ export class AgentQuotaPoller {
     return {
       outcome: failures === 0 ? "succeeded" : failures === sources.length ? "failed" : "mixed",
       durationMs: Date.now() - startedAt,
+      timeoutMs: this.sourceTimeoutMs,
       sources,
     };
   }
@@ -279,7 +281,8 @@ export class AgentQuotaPoller {
     if (!force && now - previousAt < QUOTA_MIN_REFRESH_MS) {
       const quota = this.registry.get(agentId) ?? mapUnavailableQuota(source, "Quota has not been fetched yet");
       return {
-        ...source,
+        agentId: source.agentId,
+        displayName: source.displayName,
         outcome: quota.ok ? "retained" : "unavailable",
         durationMs: 0,
         quota,
@@ -343,7 +346,8 @@ export class AgentQuotaPoller {
       if (changed) this.onUpdate?.(effective);
       const retained = !quota.ok && effective.ok;
       return {
-        ...source,
+        agentId: source.agentId,
+        displayName: source.displayName,
         outcome: timedOut ? "timed_out" : retained ? "retained" : effective.ok ? "refreshed" : "unavailable",
         durationMs: Date.now() - startedAt,
         quota: effective,

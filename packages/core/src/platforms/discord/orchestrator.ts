@@ -7439,7 +7439,7 @@ export class Orchestrator {
     const unavailable = result.sources.filter((source) => source.outcome === "unavailable");
     if (timedOut.length > 0) {
       await evt.followUpEphemeral(
-        `Usage refresh timed out after 30s for ${timedOut.map((source) => source.displayName).join(", ")}. ` +
+        `Usage refresh timed out after ${result.timeoutMs / 1000}s for ${timedOut.map((source) => source.displayName).join(", ")}. ` +
         "Other agents refreshed normally; any last-known-good values were retained."
       );
     } else if (unavailable.length > 0) {

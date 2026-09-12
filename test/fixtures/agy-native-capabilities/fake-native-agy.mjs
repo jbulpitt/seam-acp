@@ -217,21 +217,17 @@ server.listen(0, "127.0.0.1", () => {
       `Created conversation ${conversationId}\n`,
   );
   if (!isModelsCommand) return;
-  // The real `agy models` prints its rows and exits; the language server dies
-  // with it, so enrichment is a race the catalog is built without. Hold briefly
-  // so the enriched path is exercised, and set SEAM_AGY_MODELS_NO_LS=1 to
-  // exercise the unenriched one.
+  // Matches the observed CLI: print the rows, exit. The language server this
+  // started dies with the process and never answers GetAvailableModels in that
+  // window, which is why #260 takes ids and names only.
   process.stdout.write(
     "Fetching available models...\n" +
     "fixture-native-model\tFixture Native Model\n" +
     "fixture-native-model-low\tFixture Native Model (Low)\n"
   );
-  const holdMs = process.env.SEAM_AGY_MODELS_NO_LS === "1" ? 0 : 250;
-  setTimeout(() => {
-    server.close();
-    server.closeAllConnections?.();
-    process.exit(0);
-  }, holdMs).unref?.();
+  server.close();
+  server.closeAllConnections?.();
+  process.exit(0);
 });
 
 let terminating = false;

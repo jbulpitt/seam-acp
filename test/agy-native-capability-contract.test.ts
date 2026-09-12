@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { McpServer } from "@agentclientprotocol/sdk";
-import { makeAgyNativeRuntime, makeAgyProfile } from "@seam/adapters";
+import { AGY_ASSUMED_CONTEXT_WINDOW, makeAgyNativeRuntime, makeAgyProfile } from "@seam/adapters";
 import { pino } from "pino";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
@@ -402,13 +402,17 @@ describe.sequential("native AGY R1 capability contract", () => {
       expect.objectContaining({ toolCallId: "agy-step-4", status: "failed" }),
     ]));
     expect(usageSequence(events)).toEqual([
-      { used: 128, size: 4096 },
-      { used: 160, size: 4096 },
-      { used: 200, size: 4096 },
+      { used: 128, size: AGY_ASSUMED_CONTEXT_WINDOW },
+      { used: 160, size: AGY_ASSUMED_CONTEXT_WINDOW },
+      { used: 200, size: AGY_ASSUMED_CONTEXT_WINDOW },
     ]);
     for (const captured of [full, simple]) {
       expect(captured.panel.status.contextUsedHighWater).toBe(200);
-      expect(captured.panel.status.contextWindowSize).toBe(4096);
+      // #260: the status card reports what the turn was actually sized
+      // against. With prompt-free discovery that is the conservative
+      // assumption, not a language-server window — and the card showing the
+      // number we really used is the point.
+      expect(captured.panel.status.contextWindowSize).toBe(AGY_ASSUMED_CONTEXT_WINDOW);
     }
     expect(JSON.stringify(events)).not.toMatch(/SANITIZED PRIVATE (READ|EDIT|COMMAND)/);
 
@@ -425,8 +429,8 @@ describe.sequential("native AGY R1 capability contract", () => {
       "Plan",
       "Plan safely",
     ]);
-    expect(fullCard).toContain("🪟 0k / 4k (5%)");
-    expect(simpleCard).toContain("🪟 5%");
+    expect(fullCard).toContain("🪟 0k / 128k (0%)");
+    expect(simpleCard).toContain("🪟 0%");
     for (const card of [fullCard, simpleCard]) {
       expect(card).not.toMatch(/SANITIZED PRIVATE (READ|EDIT|COMMAND)/);
     }
@@ -870,7 +874,12 @@ describe.sequential("native AGY R1 capability contract", () => {
         TURN_TIMEOUT_SECONDS: 10,
         DEFAULT_AGENT: "agy",
         DEFAULT_MODEL: "fixture-native-model",
-        AGY_AUTO_COMPACT_THRESHOLD: 0.04,
+        // #260: AGY has no observed context windows until #346 lands, so the
+        // turn is sized by the conservative assumption rather than a real
+        // number. The threshold is scaled to it so this still exercises the
+        // same wiring — usage in, real predicate, real consumer — instead of
+        // silently never compacting.
+        AGY_AUTO_COMPACT_THRESHOLD: 0.001,
         CHANNEL_PRESETS_FILE: undefined,
         SEAM_CONFIG_MUTATION_TIER_C_ENABLED: false,
         channelPresets: new Map(),
@@ -896,7 +905,11 @@ describe.sequential("native AGY R1 capability contract", () => {
       expect(compact.mock.calls[0]?.[4]).toBe(200);
       expect(compact.mock.calls[0]?.[2]).toMatchObject({
         contextUsedHighWater: 200,
-        contextWindowSize: 4096,
+        // Not 4096: that came from a language-server row the removed `-p ok`
+        // probe fetched. Prompt-free discovery knows ids, not windows, so the
+        // turn is sized by the conservative assumption — under every window
+        // AGY ships rather than over one of them.
+        contextWindowSize: AGY_ASSUMED_CONTEXT_WINDOW,
       });
     } finally {
       compact.mockRestore();

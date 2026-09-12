@@ -1291,7 +1291,7 @@ class AgyAgent implements Agent {
     // A turn without an exact model would let the native CLI consult global
     // settings; deleting this guard breaks isolation even if selection failed.
     if (!currentModel) throw new Error("AGY session has no model selection");
-    const maxTokens = currentModel?.maxTokens ?? 1_000_000;
+    const maxTokens = agyContextWindow(catalog, currentModel);
 
     // Linux limits each individual argv/envp string to MAX_ARG_STRLEN
     // (PAGE_SIZE * 32 = 131,072 bytes on x86-64), independent of the overall
@@ -2042,6 +2042,53 @@ function transformAgyText(text: string, cwd: string): string {
 // only to initialize a session that has no persisted choice. Every turn then
 // receives that session's exact runtime display name through `--model`.
 
+/**
+ * What we are willing to assume a context window is when nothing is known.
+ *
+ * 128,000 tokens. This is NOT a claim about any model — an unknown window is
+ * still published as `null` in the catalog (`catalog.fetch` omits
+ * `contextLimit` for an unenriched row). It is the largest window we are
+ * willing to ASSUME while sizing a live turn, which is a different question
+ * with a different failure mode.
+ *
+ * The asymmetry is the whole argument. This number becomes the `size` in
+ * `usage_update`, which is what the auto-compaction consumer reads as
+ * remaining headroom. Assume too much and a 200k-window model is driven past
+ * its limit and fails mid-turn, far from the cause — the silent-wrong-answer
+ * outcome `AGENTS.md` ranks worst. Assume too little and we compact earlier
+ * than strictly needed, costing some headroom and nothing else.
+ *
+ * 128,000 because it sits at or below the smallest window among the model
+ * families AGY advertises (Gemini, Claude, GPT-OSS), so a turn sized to it
+ * fits all of them, while still being large enough that ordinary turns never
+ * compact spuriously. Raising it trades a bounded, recoverable cost for an
+ * unbounded, silent one.
+ */
+export const AGY_ASSUMED_CONTEXT_WINDOW = 128_000;
+
+/**
+ * The window to size this turn against (#260).
+ *
+ * Evidence first: the model's own observed window, then the smallest window
+ * observed anywhere in THIS binding's catalog — a real number from a real
+ * sibling model beats a constant, and staying inside the smallest known window
+ * cannot overrun any of them. Only a catalog with no observed windows at all
+ * falls back to {@link AGY_ASSUMED_CONTEXT_WINDOW}.
+ *
+ * This replaced `?? 1_000_000`, which assumed the CEILING: correct for Gemini,
+ * five times over the limit for a 200k Claude window, and undetectable until
+ * the turn failed. #346 removes the guessing entirely by learning real windows
+ * from a real session's language server.
+ */
+export function agyContextWindow(
+  catalog: ReadonlyArray<AgyCatalogEntry>,
+  entry?: Pick<AgyCatalogEntry, "maxTokens">,
+): number {
+  if (entry?.maxTokens) return entry.maxTokens;
+  const known = catalog.map((row) => row.maxTokens).filter((value) => value > 0);
+  return known.length ? Math.min(...known) : AGY_ASSUMED_CONTEXT_WINDOW;
+}
+
 export interface AgyCatalogEntry {
   /** API id (e.g. "gemini-3-flash-agent") — what we put in ACP `modelId`. */
   modelId: string;
@@ -2353,88 +2400,47 @@ export async function fetchAgyUserStatus(runtime: AgyNativeRuntime): Promise<Agy
  *
  * What this replaces: `agy -p ok … --print-timeout 30s`, spawned purely to
  * bring the local language server up so `GetAvailableModels` could be queried
- * over HTTP. The prompt was a side effect — nobody wanted the answer to "ok" —
- * but it was a real turn against a real model, it was invisible at the call
- * site, and the catalog path ran it on every cold start.
+ * over HTTP, plus a second `agy -p ok --model __seam_probe_invalid__` whose
+ * accepted-name list was intersected with the first. Two model turns to learn
+ * a list of models, neither visible at the call site.
  *
- * `agy models` asks for the model list directly. It exits 0, prints
- * `<modelId>\t<displayName>` per row, and spends nothing. It ALSO brings a
- * language server up as a side effect of its own, and writes that server's
- * port into the private `--log-file` we pass — so the rich metadata the LS
- * knows (context window, thinking, images, recommended) can be read from the
- * same prompt-free process, with no second spawn.
+ * `agy models` asks for the list directly: exit 0, one
+ * `<modelId>\t<displayName>` row per model, no prompt, nothing billed. The
+ * intersection is gone rather than reimplemented — the ids it prints ARE the
+ * selectable ids, which is what the validator probe was there to confirm.
  *
- * Enrichment is strictly opportunistic. `agy models` exits as soon as it has
- * printed, which can be before the LS finishes answering, so the race is
- * expected and losing it is not an error: the name list still stands on its
- * own and every unobserved field stays UNKNOWN. Per #260 a CLI name list is
- * not proof of a context size, thinking support or a default, so an
- * unenriched row reports `maxTokens: 0`, which `catalog.fetch` already omits
- * rather than publishing as a guessed `contextLimit`.
+ * What it deliberately does NOT do is fetch context windows, thinking support
+ * or a recommended flag. Those live in the language server, and the server
+ * this subcommand starts is not answerable prompt-free: measured on agy
+ * 1.1.27, the port appears ~124ms in and `GetAvailableModels` returns HTTP 400
+ * for the whole ~2s the process lives, because the catalog RPC needs a warmup
+ * the old probe bought with `--print-timeout 30s`. Trying anyway produced a
+ * catalog whose metadata depended on who won a race. So every such field stays
+ * UNKNOWN here — `maxTokens: 0`, which `catalog.fetch` omits rather than
+ * publishing as a guessed `contextLimit` — and #346 learns the real values
+ * from a session's own long-lived server.
  */
 async function fetchAgyModelCatalog(runtime: AgyNativeRuntime): Promise<AgyCatalogEntry[]> {
   const logFile = await newSpawnLogPath();
   try {
     return await runAgyProbe(runtime, ["--log-file", logFile, "models"], 30_000, async (handle) => {
       let output = "";
-      const collect = (async () => {
-        for await (const chunk of handle.stdout) output += chunk.toString();
-      })();
-      // Best effort, in parallel with the list we actually rely on. Every
-      // failure here — no server, no answer in time, a malformed body, or the
-      // process simply finishing first — leaves the catalog intact and the
-      // metadata unknown, which is the honest outcome.
-      const enrichment = enrichFromLanguageServer(logFile, handle.signal)
-        .catch(() => new Map<string, AgyRawModel>());
-      const [, enriched] = await Promise.all([collect, enrichment]);
+      for await (const chunk of handle.stdout) output += chunk.toString();
       await handle.completed;
-      const rows = parseAgyModelsList(output).map((row) => {
-        const meta = enriched.get(row.modelId);
-        return {
-          modelId: row.modelId,
-          rawDisplayName: meta?.displayName ?? row.rawDisplayName,
-          displayName: cleanAgyDisplayName(meta?.displayName ?? row.rawDisplayName),
-          ctx: formatTokens(meta?.maxTokens ?? 0),
-          recommended: Boolean(meta?.recommended),
-          supportsThinking: Boolean(meta?.supportsThinking),
-          supportsImages: Boolean(meta?.supportsImages),
-          maxTokens: meta?.maxTokens ?? 0,
-        };
-      });
-      return dedupeAgyDisplayNames(rows);
+      return dedupeAgyDisplayNames(parseAgyModelsList(output).map((row) => ({
+        modelId: row.modelId,
+        rawDisplayName: row.rawDisplayName,
+        displayName: cleanAgyDisplayName(row.rawDisplayName),
+        ctx: formatTokens(0),
+        recommended: false,
+        supportsThinking: false,
+        supportsImages: false,
+        maxTokens: 0,
+      })));
     });
   } finally {
     await fs.unlink(logFile).catch(() => {});
   }
-}
-
-/**
- * Read `GetAvailableModels` from the language server this probe's own process
- * started. Bounded and best-effort by construction; see the caller.
- */
-async function enrichFromLanguageServer(
-  logFile: string,
-  signal: AbortSignal,
-): Promise<Map<string, AgyRawModel>> {
-  const ls = await discoverAgyLs({ logFile, timeoutMs: 8_000, signal });
-  const url = `http://localhost:${ls.port}/exa.language_server_pb.LanguageServerService/GetAvailableModels`;
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: "{}",
-    signal,
-  });
-  if (!res.ok) {
-    await res.body?.cancel();
-    return new Map();
-  }
-  const json = (await readAgyJsonResponse(res)) as { response?: { models?: Record<string, AgyRawModel> } };
-  const out = new Map<string, AgyRawModel>();
-  for (const [id, model] of Object.entries(json.response?.models ?? {})) {
-    if (model.isInternal) continue;
-    out.set(id, model);
-  }
-  return out;
 }
 
 interface AgyRawModel {

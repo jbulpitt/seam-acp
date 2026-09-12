@@ -71,6 +71,18 @@ managed release is fully revalidated before its receipt is reported. Run the
 preflight separately for each host. The canary remains `media-server`; observe
 and obtain separate authorization before doing anything to `macbook-air`.
 
+PREFLIGHT also reports the inventory-bound `verification_agent` and the PM2
+`process_started_at` time (or `unknown` if PM2 does not expose one). Before
+ACTIVATE, the orchestrator must query `agent_quota` for that exact agent and
+refuse to start when the relevant quota window is exhausted. The standalone
+rollout process cannot query this safely: quota is authenticated, in-memory
+controller state exposed through the orchestrator's MCP session, not a host
+file or unauthenticated local endpoint. Surfacing the exact identity makes the
+external precondition explicit without weakening the rollout's restricted
+environment or duplicating provider collectors. If quota cannot be checked,
+defer activation rather than discovering that verification is unavailable
+after the pointer changes.
+
 PREFLIGHT also proves that the configured Node ABI, platform, architecture and
 the lock-pinned `better-sqlite3@11.10.0` have a reviewed upstream prebuild. It
 reports `native_install_strategy=locked-prebuild` and refuses an unsupported
@@ -395,15 +407,38 @@ connection. The bridge rejects an acknowledgement whose artifact identity does
 not exactly equal its activation envelope. It writes the ordered, in-window
 receipt. Only then is an
 immutable `.verified.json` activation record written. The activation ID and its
-exact rollback command are printed before signaling so they remain available if
-verification later fails. Once the replacement PID and entrypoint are proven, an
+exact rollback command are recorded before signaling so they remain recoverable
+if activation itself fails. Once the replacement PID and entrypoint are proven, an
 immutable `.observed.json` is also written; it permits an explicit rollback of a
 replacement whose catalog/receipt verification timed out without guessing a PID.
+The intent and observation mark receipt verification as pending; only a valid
+receipt changes `catalogRpcsVerified` to true in `.verified.json`.
 
-A stale/shared receipt, different process, different connection, missing RPC,
-old PID still alive, or timeout cannot satisfy the gate. The runner also bounds
+A receipt timeout after those deployment facts are proven is not reported as a
+failed activation. The remote checker re-proves the active symlink target, old
+PID exit, replacement PID/PM2 identity and process start time; re-runs the
+deployed release's protocol, drain and both catalog capability checks once; and
+then re-reads the receipt once to close the deadline race. If the receipt is
+still unavailable, it writes an immutable `.unconfirmed.json` record and
+reports `activation=deployed_verification_unconfirmed`. Operator output leads
+with the deployed SHA/checksum, live target, process evidence, verification
+agent, and post-activation capability flags. It then names the missing proof
+and offers the explicit rollback command last. This refuses only confirmation:
+it does not claim the deployment failed or steer an operator toward stale code.
+If the pointer, PID or PM2 identity changed during the re-check, the command
+still fails because the deployment outcome is genuinely ambiguous.
+
+A stale/shared receipt, different process, different connection, or missing RPC
+cannot satisfy the receipt gate; a live old PID or changed replacement identity
+remains an activation failure. The runner also bounds
 wall time and stdout/stderr bytes, kills and awaits an over-limit subprocess,
 cleans listeners/timers, and returns symbolic/redacted diagnostics.
+
+After a managed activation, PREFLIGHT may report `enrolled=drifted` because the
+live entrypoint deliberately moved away from the enrolled legacy baseline. That
+is expected and is not an instruction to overwrite the baseline: enrollment is
+only for a live legacy checkout. The activation record retains the verified
+baseline as that transition's rollback target.
 
 ### 4. ROLLBACK (explicit, never fleet-wide)
 

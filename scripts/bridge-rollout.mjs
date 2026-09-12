@@ -79,10 +79,15 @@ async function main() {
   }
   if (options.action === "activate") {
     const activationId = nonce(); const operationId = nonce();
-    console.log(`activation_id=${activationId}`);
-    console.log(`rollback_command=${rollbackPlan(target, activationId).command}`);
-    const result = await commandRunner(makeSshCommand(target, ["activate", options.sha, options.checksum, options.stageId, activationId, String(options.timeoutSeconds), operationId], remoteScript));
-    process.stdout.write(result.stdout);
+    try {
+      const result = await commandRunner(makeSshCommand(target, ["activate", options.sha, options.checksum, options.stageId, activationId, String(options.timeoutSeconds), operationId], remoteScript));
+      process.stdout.write(result.stdout);
+    } catch (error) {
+      console.error("activation=failed_or_incomplete");
+      console.error(`activation_id=${activationId}`);
+      console.error(`rollback_command=${rollbackPlan(target, activationId).command}`);
+      throw error;
+    }
     return;
   }
   const rollbackId = nonce(); const operationId = nonce();

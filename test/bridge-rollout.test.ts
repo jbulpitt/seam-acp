@@ -29,6 +29,8 @@ function preflightReport(target: ReturnType<typeof resolveTarget>, overrides: Re
     describeModelCatalog: "yes",
     fetchModelCatalog: "yes",
     rollout_ready: "yes",
+    verification_agent: target.verifyAgent,
+    process_started_at: "2026-09-11T14:00:00.000Z",
     enrolled: "no",
     enrollment_id: "none",
     baseline_digest: "none",
@@ -163,6 +165,10 @@ describe("bridge rollout gating and verification (#241)", () => {
     // half-reported baseline is refused rather than read as "not enrolled".
     const halfEnrolled = vi.fn(async () => ({ stdout: preflightReport(target, { enrolled: "yes" }), stderr: "" }));
     await expect(runPreflight(target, "fixed-script", halfEnrolled)).rejects.toThrow(/enrollment evidence/);
+    const wrongVerifier = vi.fn(async () => ({ stdout: preflightReport(target, { verification_agent: "other-agent" }), stderr: "" }));
+    await expect(runPreflight(target, "fixed-script", wrongVerifier)).rejects.toThrow(/verification identity evidence/);
+    const badStartTime = vi.fn(async () => ({ stdout: preflightReport(target, { process_started_at: "not-a-time" }), stderr: "" }));
+    await expect(runPreflight(target, "fixed-script", badStartTime)).rejects.toThrow(/verification identity evidence/);
   });
 
   it("refuses an unsupported native runtime in preflight before staging", async () => {
@@ -216,6 +222,16 @@ describe("bridge rollout gating and verification (#241)", () => {
 
   it("generates only an explicit version-bound rollback", () => {
     expect(rollbackPlan(resolveTarget(targets, "media-server"), token)).toEqual({ target: "media-server", command: `npm run bridge:rollout -- --target media-server --rollback --activation-id ${token} --apply`, automatic: false });
+  });
+
+  it("separates an incomplete activation from deployed-but-unconfirmed verification output (#328)", () => {
+    const local = fs.readFileSync(path.join(root, "scripts/bridge-rollout.mjs"), "utf8");
+    const remote = fs.readFileSync(path.join(root, "scripts/bridge-rollout-remote.mjs"), "utf8");
+    expect(local).toContain("activation=failed_or_incomplete");
+    expect(local).not.toContain("activation=deployed_verification_unconfirmed");
+    expect(remote).toContain("activation=deployed_verification_unconfirmed");
+    expect(remote.indexOf('console.log("verification_reason=activation_receipt_timeout")'))
+      .toBeLessThan(remote.indexOf("console.log(`rollback_command="));
   });
 
   it("contains SIGUSR2 only and no secret-bearing or immediate PM2 command", () => {

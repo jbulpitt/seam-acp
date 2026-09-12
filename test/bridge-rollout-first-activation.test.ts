@@ -83,7 +83,7 @@ async function makeFixture(options: { receipt?: "good" | "wrong-nonce" } = {}) {
   // and writes the activation receipt when it finds an envelope beside itself.
   const bridgeSource = `import fs from 'node:fs';import path from 'node:path';import{spawn}from'node:child_process';` +
     `const entry=${JSON.stringify(entry)},pidFile=${JSON.stringify(pidFile)},pm2File=${JSON.stringify(pm2File)},node=${JSON.stringify(node)},cwd=${JSON.stringify(checkout)};` +
-    `function update(pid){const j=JSON.parse(fs.readFileSync(pm2File));j.pid=pid;fs.writeFileSync(pm2File,JSON.stringify(j));fs.writeFileSync(pidFile,String(pid));}` +
+    `function update(pid){const j=JSON.parse(fs.readFileSync(pm2File));j.pid=pid;j.pm_uptime=Date.now();fs.writeFileSync(pm2File,JSON.stringify(j));fs.writeFileSync(pidFile,String(pid));}` +
     `const release=path.resolve(new URL('.',import.meta.url).pathname,'../../..');` +
     `const ep=path.join(release,'activation-envelope.json'),rp=path.join(release,'release-receipt.json');` +
     `if(fs.existsSync(ep)){const e=JSON.parse(fs.readFileSync(ep)),s=JSON.parse(fs.readFileSync(rp)),t=new Date().toISOString(),instance='instance-'+e.activationId.slice(0,12);` +
@@ -101,12 +101,12 @@ async function makeFixture(options: { receipt?: "good" | "wrong-nonce" } = {}) {
   await fs.writeFile(path.join(checkout, "package.json"), JSON.stringify({ name: "seam-acp", version: "0.1.0" }));
   await fs.mkdir(path.join(checkout, ".git"));
   await fs.writeFile(path.join(checkout, ".git/HEAD"), `${checkoutSha}\n`);
-  await fs.writeFile(pm2Module, `const fs=require('fs'),p=${JSON.stringify(pm2File)};module.exports={connect(cb){setImmediate(()=>cb(null))},describe(_n,cb){const j=JSON.parse(fs.readFileSync(p,'utf8'));setImmediate(()=>cb(null,[{pid:j.pid,pm2_env:{name:j.name,pm_cwd:j.cwd,pm_exec_path:j.entry,exec_interpreter:j.node,args:['connect','--server','wss://controller.invalid','--token','fixture-token','--id','fixture']}}]))},disconnect(){}}`);
+  await fs.writeFile(pm2Module, `const fs=require('fs'),p=${JSON.stringify(pm2File)};module.exports={connect(cb){setImmediate(()=>cb(null))},describe(_n,cb){const j=JSON.parse(fs.readFileSync(p,'utf8'));setImmediate(()=>cb(null,[{pid:j.pid,pm2_env:{name:j.name,pm_cwd:j.cwd,pm_exec_path:j.entry,exec_interpreter:j.node,pm_uptime:j.pm_uptime,args:['connect','--server','wss://controller.invalid','--token','fixture-token','--id','fixture']}}]))},disconnect(){}}`);
 
   const child = spawn(node, [entry], { cwd: checkout, detached: true, stdio: "ignore" });
   child.unref();
   await fs.writeFile(pidFile, String(child.pid));
-  await fs.writeFile(pm2File, JSON.stringify({ pid: child.pid, name: "fixture-app", cwd: checkout, entry, node }));
+  await fs.writeFile(pm2File, JSON.stringify({ pid: child.pid, name: "fixture-app", cwd: checkout, entry, node, pm_uptime: Date.now() }));
 
   const shell = await renderRemoteScript(path.join(repo, "scripts/bridge-rollout-remote.sh"), path.join(repo, "scripts/bridge-rollout-remote.mjs"));
   const base = ["fixture", "fixture-app", "grok", String(process.getuid!()), checkout, entry, pidFile, node, pm2Module, "-", "no", releaseRoot];
@@ -318,17 +318,27 @@ describe.sequential("#288 first managed activation from an enrolled baseline", (
    * they only assert the happy path's record fields. A malformed receipt must
    * be what fails.
    */
-  it("refuses a first activation whose forward receipt does not bind this activation", async () => {
+  it("records a first activation with a non-binding receipt as deployed but unconfirmed", async () => {
     const f = await makeFixture({ receipt: "wrong-nonce" });
     await enroll(f);
     const release = await f.stage("1".repeat(40), H("3"));
     const activation = H("4");
-    await expect(
-      f.run(["activate", release.sourceSha, release.checksum, release.stageId, activation, "12", H("5")])
-    ).rejects.toThrow(/activation_receipt_timeout/);
-    // Observed but never verified: rollback remains available by activation id.
+    const result = parseKeyValues((await f.run(
+      ["activate", release.sourceSha, release.checksum, release.stageId, activation, "12", H("5")]
+    )).stdout);
+    expect(result.activation).toBe("deployed_verification_unconfirmed");
+    expect(result.verification_reason).toBe("activation_receipt_timeout");
+    expect(result.activation_from).toBe("enrolled-baseline");
+    expect(result.rollback_proof).toBe("reduced-baseline");
+    // Observed and explicitly unconfirmed, never verified: rollback remains
+    // available by activation id without misreporting the deployment as failed.
     await expect(fs.stat(path.join(f.releaseRoot, "activations", `${activation}.verified.json`))).rejects.toThrow();
     await expect(fs.stat(path.join(f.releaseRoot, "activations", `${activation}.observed.json`))).resolves.toBeTruthy();
+    const unconfirmed = JSON.parse(await fs.readFile(path.join(f.releaseRoot, "activations", `${activation}.unconfirmed.json`), "utf8"));
+    expect(unconfirmed.verification).toEqual({ forward: "receipt", catalogRpcsVerified: false });
+    expect(unconfirmed.previous.rollbackProof).toBe("reduced-baseline");
+    const observed = JSON.parse(await fs.readFile(path.join(f.releaseRoot, "activations", `${activation}.observed.json`), "utf8"));
+    expect(observed.verification).toEqual({ forward: "receipt", catalogRpcsVerified: false, state: "pending" });
   }, 180_000);
 
   /**

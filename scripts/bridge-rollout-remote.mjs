@@ -197,6 +197,10 @@ async function readLiveIdentity() {
   if (env.exec_interpreter !== nodePath) fail("pm2_interpreter_mismatch");
   safePhase = "identity_pm2_args";
   validatePm2Args(env.args);
+  const pmUptime = Number(env.pm_uptime);
+  const processStartedAt = Number.isFinite(pmUptime) && pmUptime > 0 && pmUptime <= Date.now() + 60_000
+    ? new Date(pmUptime).toISOString()
+    : "unknown";
   const pm2Identity = { name: env.name, cwd: env.pm_cwd, execPath: env.pm_exec_path, interpreter: env.exec_interpreter, args: (Array.isArray(env.args) ? env.args : []).map(String) };
   safePhase = "identity_entrypoint";
   const entryStat = await fsp.lstat(entrypointPath).catch(() => fail("entrypoint_missing")); assertUid(entryStat, expectedUid, "entrypoint_wrong_owner");
@@ -206,7 +210,7 @@ async function readLiveIdentity() {
   if (!legacy && !entryReal.startsWith(`${releaseRoot}/releases/`)) fail("entrypoint_escape");
   if (entryReal !== entrypointPath && !entryReal.endsWith("/packages/bridge/dist/index.js")) fail("entrypoint_unexpected_target");
   assertUid(await fsp.stat(entryReal), expectedUid, "entrypoint_target_wrong_owner");
-  return { pid, cwd, entryReal, legacy, pm2: pm2Identity };
+  return { pid, cwd, entryReal, legacy, processStartedAt, pm2: pm2Identity };
 }
 
 function tarString(block, start, length) {
@@ -491,17 +495,93 @@ async function writeActivationEnvelope(release, envelope) {
   await fsp.writeFile(temp, safeJson(envelope), { flag: "wx", mode: 0o600 }); await fsp.rename(temp, file);
 }
 
+async function readActivationReceipt(release, expected) {
+  const receiptPath = `${release}/release-receipt.json`;
+  try {
+    const value = parseJson(await fsp.readFile(receiptPath), "activation_receipt_invalid");
+    const sequence = [value.startedAt,value.helloAcceptedAt,value.catalogRpcs?.[verifyAgent]?.describeModelCatalogAt,value.catalogRpcs?.[verifyAgent]?.fetchModelCatalogAt,value.controllerVerifiedAt,value.completedAt].map(Date.parse);
+    if (value.formatVersion === 2 && value.activationId === expected.activationId && value.bridgeId === bridgeId && value.sourceSha === expected.sourceSha && value.artifactChecksum === expected.artifactChecksum && value.stageId === expected.stageId && value.oldPid === expected.oldPid && value.pid === expected.newPid && INSTANCE.test(value.instanceId ?? "") && value.protocolVersion === 1 && sequence.every(Number.isFinite) && sequence.every((time,index) => !index || time >= sequence[index-1]) && sequence[0] >= expected.started && sequence.at(-1) <= expected.deadline && value.controllerAck?.activationId === expected.activationId && value.controllerAck?.bridgeId === bridgeId && value.controllerAck?.instanceId === value.instanceId && value.controllerAck?.pid === expected.newPid && value.controllerAck?.sourceSha === expected.sourceSha && value.controllerAck?.artifactChecksum === expected.artifactChecksum) return value;
+  } catch {}
+  return null;
+}
+
 async function verifyActivationReceipt(release, expected) {
-  const receiptPath = `${release}/release-receipt.json`; const deadline = expected.deadline;
+  const deadline = expected.deadline;
   while (Date.now() <= deadline) {
-    try {
-      const value = parseJson(await fsp.readFile(receiptPath), "activation_receipt_invalid");
-      const sequence = [value.startedAt,value.helloAcceptedAt,value.catalogRpcs?.[verifyAgent]?.describeModelCatalogAt,value.catalogRpcs?.[verifyAgent]?.fetchModelCatalogAt,value.controllerVerifiedAt,value.completedAt].map(Date.parse);
-      if (value.formatVersion === 2 && value.activationId === expected.activationId && value.bridgeId === bridgeId && value.sourceSha === expected.sourceSha && value.artifactChecksum === expected.artifactChecksum && value.stageId === expected.stageId && value.oldPid === expected.oldPid && value.pid === expected.newPid && INSTANCE.test(value.instanceId ?? "") && value.protocolVersion === 1 && sequence.every(Number.isFinite) && sequence.every((time,index) => !index || time >= sequence[index-1]) && sequence[0] >= expected.started && sequence.at(-1) <= expected.deadline && value.controllerAck?.activationId === expected.activationId && value.controllerAck?.bridgeId === bridgeId && value.controllerAck?.instanceId === value.instanceId && value.controllerAck?.pid === expected.newPid && value.controllerAck?.sourceSha === expected.sourceSha && value.controllerAck?.artifactChecksum === expected.artifactChecksum) return value;
-    } catch {}
+    const value = await readActivationReceipt(release, expected);
+    if (value) return value;
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
-  fail("activation_receipt_timeout");
+  return null;
+}
+
+async function requireActivationReceipt(release, expected) {
+  const receipt = await verifyActivationReceipt(release, expected);
+  if (!receipt) fail("activation_receipt_timeout");
+  return receipt;
+}
+
+/**
+ * A missing controller receipt refuses only confirmation, not a deployment
+ * whose pointer, old-PID exit and replacement identity are already proved.
+ * Re-check those facts and the active release's static capability contract
+ * once, then persist an explicit unconfirmed outcome. Rollback remains
+ * available, but comes after the evidence so a false alarm does not steer the
+ * operator back to stale code (#328).
+ */
+async function receiptOrUnconfirmed(release, expected, observed, extraLines = []) {
+  let ready = await verifyActivationReceipt(release, expected);
+  if (ready) return ready;
+
+  const after = await readLiveIdentity();
+  if (after.pid !== expected.newPid || after.entryReal !== observed.activatedEntrypoint || after.legacy || live(expected.oldPid)) {
+    fail("post_activation_identity_changed");
+  }
+  const capabilities = await readDeployedCapabilities(release);
+  // One bounded, immediate re-read after the capability probe closes the race
+  // where controller acknowledgement lands at the original deadline.
+  ready = await readActivationReceipt(release, expected);
+  if (ready) return ready;
+
+  const unconfirmed = {
+    ...observed,
+    verification: { forward: "receipt", catalogRpcsVerified: false },
+    verificationAgent: verifyAgent,
+    confirmationError: "activation_receipt_timeout",
+    recheck: {
+      currentEntrypointTarget: after.entryReal,
+      processStartedAt: after.processStartedAt,
+      oldPidExited: true,
+      protocolVersion: capabilities.protocolVersion,
+      drainSigusr2: capabilities.drainSupport,
+      describeModelCatalog: capabilities.describeSupport,
+      fetchModelCatalog: capabilities.fetchSupport,
+      rolloutReady: capabilities.rolloutReady,
+      checkedAt: nowIso(),
+    },
+  };
+  await fsp.writeFile(`${releaseRoot}/activations/${expected.activationId}.unconfirmed.json`, safeJson(unconfirmed), { flag: "wx", mode: 0o600 });
+  console.log("activation=deployed_verification_unconfirmed");
+  console.log(`activation_id=${expected.activationId}`);
+  console.log(`deployed_source_sha=${expected.sourceSha}`);
+  console.log(`deployed_artifact_checksum=${expected.artifactChecksum}`);
+  console.log(`current_entrypoint_target=${after.entryReal}`);
+  console.log(`old_pid=${expected.oldPid}`); console.log("old_pid_exited=yes");
+  console.log(`new_pid=${expected.newPid}`); console.log(`process_started_at=${after.processStartedAt}`);
+  console.log(`verification_agent=${verifyAgent}`);
+  console.log(`post_protocol_version=${capabilities.protocolVersion}`);
+  console.log(`post_drain_SIGUSR2=${capabilities.drainSupport}`);
+  console.log(`post_describeModelCatalog=${capabilities.describeSupport}`);
+  console.log(`post_fetchModelCatalog=${capabilities.fetchSupport}`);
+  console.log(`post_rollout_ready=${capabilities.rolloutReady}`);
+  console.log("receipt_verification=unconfirmed");
+  console.log("verification_reason=activation_receipt_timeout");
+  console.log("capability_recheck=completed");
+  for (const line of extraLines) console.log(line);
+  console.log(`next_preflight=npm run bridge:rollout -- --target ${bridgeId}`);
+  console.log("rollback_available=yes");
+  console.log(`rollback_command=npm run bridge:rollout -- --target ${bridgeId} --rollback --activation-id ${expected.activationId} --apply`);
+  return null;
 }
 
 async function switchEntrypoint(target) {
@@ -1037,6 +1117,7 @@ async function preflight() {
   const entrypointSha256 = hash(entryBytes); const artifactIdentity = artifactMode === "managed" ? `${artifactSourceSha}:${artifactChecksum}` : `entrypoint-sha256:${entrypointSha256}`;
   console.log(`artifact_mode=${artifactMode}`); console.log(`artifact_identity=${artifactIdentity}`); console.log(`artifact_source_sha=${artifactSourceSha}`); console.log(`checkout_source_sha=${checkoutSourceSha}`); console.log(`artifact_checksum=${artifactChecksum}`); console.log(`entrypoint_sha256=${entrypointSha256}`);
   console.log(`bridge_version=${bridgePackage.version}`); console.log(`protocol_version=${protocolVersion}`); console.log(`drain_SIGUSR2=${drainSupport}`); console.log(`describeModelCatalog=${describeSupport}`); console.log(`fetchModelCatalog=${fetchSupport}`); console.log(`rollout_ready=${rolloutReady}`);
+  console.log(`verification_agent=${verifyAgent}`); console.log(`process_started_at=${identity.processStartedAt}`);
   console.log(`node_path=${nodePath}`); console.log(`node_version=${nodeVersion}`); console.log(`npm_version=${npmVersion}`); console.log(`disk_path=${checkoutPath}`); console.log(`disk_bytes_available=${diskBytesAvailable}`);
   console.log(`release_parent=${parentState}`); console.log(`native_dependency=${NATIVE_DEPENDENCY}`); console.log("native_install_strategy=locked-prebuild");
   console.log(`native_prebuild=${nativeInstall.prebuild}`); console.log(`native_install_ready=${nativeInstall.ready ? "yes" : "no"}`);
@@ -1161,7 +1242,7 @@ async function activateFromEnrolledBaseline(input) {
       // switch, not discovered afterwards.
       rollbackProof: baseline.rollbackProof,
     },
-    verification: { forward: "receipt", catalogRpcsVerified: true },
+    verification: { forward: "receipt", catalogRpcsVerified: false, state: "pending" },
     activatedEntrypoint: `${release}/packages/bridge/dist/index.js`,
     oldPid: before.pid,
     startedAt: new Date(started).toISOString(), deadlineAt: new Date(deadline).toISOString(),
@@ -1177,9 +1258,19 @@ async function activateFromEnrolledBaseline(input) {
   const observed = { ...intent, newPid, observedAt: nowIso() };
   await fsp.writeFile(`${releaseRoot}/activations/${activationId}.observed.json`, safeJson(observed), { flag: "wx", mode: 0o600 });
   safePhase = "first_activation_receipt";
-  const ready = await verifyActivationReceipt(release, { activationId, sourceSha, artifactChecksum: checksum, stageId, oldPid: before.pid, newPid, started, deadline });
+  const ready = await receiptOrUnconfirmed(
+    release,
+    { activationId, sourceSha, artifactChecksum: checksum, stageId, oldPid: before.pid, newPid, started, deadline },
+    observed,
+    [
+      "activation_from=enrolled-baseline",
+      `enrollment_id=${enrollment.record.enrollmentId}`,
+      `rollback_proof=${baseline.rollbackProof}`,
+    ],
+  );
+  if (!ready) return;
   const readyReceiptSha256 = hash(await fsp.readFile(`${release}/release-receipt.json`));
-  const outcome = { ...observed, instanceId: ready.instanceId, readyReceipt: `${release}/release-receipt.json`, readyReceiptSha256, verifiedAt: nowIso() };
+  const outcome = { ...observed, verification: { forward: "receipt", catalogRpcsVerified: true }, instanceId: ready.instanceId, readyReceipt: `${release}/release-receipt.json`, readyReceiptSha256, verifiedAt: nowIso() };
   await fsp.writeFile(`${releaseRoot}/activations/${activationId}.verified.json`, safeJson(outcome), { flag: "wx", mode: 0o600 });
   console.log("activation=verified"); console.log("activation_from=enrolled-baseline");
   console.log(`activation_id=${activationId}`); console.log(`old_pid=${before.pid}`); console.log(`new_pid=${newPid}`); console.log(`instance_id=${ready.instanceId}`);
@@ -1224,7 +1315,7 @@ async function activate() {
     const release = `${releaseRoot}/releases/${sourceSha}-${checksum}`; const staged = await validateRelease(release, sourceSha, checksum, stageId);
     if (release === previousDir) fail("requested_release_already_active");
     const started = Date.now(); const deadline = started + timeout * 1000;
-    const intent = { formatVersion: 2, kind: "activate", activationId, bridgeId, pm2App, sourceSha, artifactChecksum: checksum, stageId, previous: { sourceSha: previousReceipt.sourceSha, artifactChecksum: previousReceipt.artifactChecksum, stageId: previousReceipt.stageId, entrypoint: before.entryReal }, activatedEntrypoint: `${release}/packages/bridge/dist/index.js`, oldPid: before.pid, startedAt: new Date(started).toISOString(), deadlineAt: new Date(deadline).toISOString() };
+    const intent = { formatVersion: 2, kind: "activate", activationId, bridgeId, pm2App, sourceSha, artifactChecksum: checksum, stageId, previous: { sourceSha: previousReceipt.sourceSha, artifactChecksum: previousReceipt.artifactChecksum, stageId: previousReceipt.stageId, entrypoint: before.entryReal }, verification: { forward: "receipt", catalogRpcsVerified: false, state: "pending" }, activatedEntrypoint: `${release}/packages/bridge/dist/index.js`, oldPid: before.pid, startedAt: new Date(started).toISOString(), deadlineAt: new Date(deadline).toISOString() };
     await fsp.writeFile(`${releaseRoot}/activations/${activationId}.intent.json`, safeJson(intent), { flag: "wx", mode: 0o600 });
     await writeActivationEnvelope(release, { formatVersion: 2, activationId, bridgeId, sourceSha, artifactChecksum: checksum, verificationAgent: verifyAgent, stageId: staged.stageId, oldPid: before.pid, startedAt: intent.startedAt, deadlineAt: intent.deadlineAt });
     await switchEntrypoint(intent.activatedEntrypoint);
@@ -1233,9 +1324,10 @@ async function activate() {
     const after = await readLiveIdentity(); if (after.pid !== newPid || after.entryReal !== intent.activatedEntrypoint || after.legacy) fail("replacement_identity_mismatch");
     const observed = { ...intent, newPid, observedAt: nowIso() };
     await fsp.writeFile(`${releaseRoot}/activations/${activationId}.observed.json`, safeJson(observed), { flag: "wx", mode: 0o600 });
-    const ready = await verifyActivationReceipt(release, { activationId, sourceSha, artifactChecksum: checksum, stageId, oldPid: before.pid, newPid, started, deadline });
+    const ready = await receiptOrUnconfirmed(release, { activationId, sourceSha, artifactChecksum: checksum, stageId, oldPid: before.pid, newPid, started, deadline }, observed);
+    if (!ready) return;
     const readyReceiptSha256 = hash(await fsp.readFile(`${release}/release-receipt.json`));
-    const outcome = { ...observed, instanceId: ready.instanceId, readyReceipt: `${release}/release-receipt.json`, readyReceiptSha256, verifiedAt: nowIso() };
+    const outcome = { ...observed, verification: { forward: "receipt", catalogRpcsVerified: true }, instanceId: ready.instanceId, readyReceipt: `${release}/release-receipt.json`, readyReceiptSha256, verifiedAt: nowIso() };
     await fsp.writeFile(`${releaseRoot}/activations/${activationId}.verified.json`, safeJson(outcome), { flag: "wx", mode: 0o600 });
     console.log("activation=verified"); console.log(`activation_id=${activationId}`); console.log(`old_pid=${before.pid}`); console.log(`new_pid=${newPid}`); console.log(`instance_id=${ready.instanceId}`); console.log(`rollback_command=npm run bridge:rollout -- --target ${bridgeId} --rollback --activation-id ${activationId} --apply`);
   });
@@ -1374,7 +1466,7 @@ async function rollback() {
     await switchEntrypoint(previous.entrypoint); process.kill(current.pid,"SIGUSR2");
     const newPid = await waitForReplacement(current.pid, timeout); const after = await readLiveIdentity();
     if (after.pid !== newPid || after.entryReal !== previous.entrypoint) fail("rollback_replacement_identity_mismatch");
-    const ready = await verifyActivationReceipt(previousDir, { activationId: rollbackId, sourceSha: previous.sourceSha, artifactChecksum: previous.artifactChecksum, stageId: previous.stageId, oldPid: current.pid, newPid, started, deadline });
+    const ready = await requireActivationReceipt(previousDir, { activationId: rollbackId, sourceSha: previous.sourceSha, artifactChecksum: previous.artifactChecksum, stageId: previous.stageId, oldPid: current.pid, newPid, started, deadline });
     const rollbackReadyReceiptSha256 = hash(await fsp.readFile(`${previousDir}/release-receipt.json`));
     await fsp.writeFile(`${releaseRoot}/rollbacks/${failedActivationId}-${rollbackId}.verified.json`, safeJson({ ...intent, newPid, instanceId: ready.instanceId, readyReceipt: `${previousDir}/release-receipt.json`, readyReceiptSha256: rollbackReadyReceiptSha256, verifiedAt: nowIso() }), { flag: "wx", mode: 0o600 });
     console.log("rollback=verified"); console.log(`rollback_id=${rollbackId}`); console.log(`old_pid=${current.pid}`); console.log(`new_pid=${newPid}`); console.log(`restored_sha=${previous.sourceSha}`); console.log(`restored_checksum=${previous.artifactChecksum}`);

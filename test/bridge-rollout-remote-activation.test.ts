@@ -18,7 +18,12 @@ function tarMember(name:string,bytes:Buffer){const h=Buffer.alloc(512);put(h,0,1
 function makeArchive(sourceSha:string,indexSource:string){
   const names=["package.json","package-lock.json","packages/adapters/package.json","packages/bridge/package.json","packages/core/package.json"];
   const files=names.map((name)=>({path:name,bytes:Buffer.from(readFileSync(path.join(repo,name)))}));
-  files.push({path:"packages/adapters/dist/index.js",bytes:Buffer.from("export {};\n")},{path:"packages/bridge/dist/index.js",bytes:Buffer.from(indexSource)},{path:"packages/bridge/dist/rpc.js",bytes:Buffer.from("// describeModelCatalog fetchModelCatalog\n")});
+  files.push(
+    {path:"packages/adapters/dist/index.js",bytes:Buffer.from("export {};\n")},
+    {path:"packages/adapters/dist/command-bus.js",bytes:Buffer.from('export const PROTOCOL_VERSION = 1;\nconst methods = ["describeModelCatalog", "fetchModelCatalog"];\n')},
+    {path:"packages/bridge/dist/index.js",bytes:Buffer.from(indexSource)},
+    {path:"packages/bridge/dist/rpc.js",bytes:Buffer.from("export function isAllowedRpcMethod(){}\nexport function dispatchAdapter(){}\n")},
+  );
   const manifest=Buffer.from(`${JSON.stringify({formatVersion:2,sourceSha,files:files.map((f)=>({path:f.path,size:f.bytes.length,sha256:createHash("sha256").update(f.bytes).digest("hex")}))})}\n`);
   return gzipSync(Buffer.concat([tarMember("bridge-release.json",manifest),...files.map((f)=>tarMember(f.path,f.bytes)),Buffer.alloc(1024)]));
 }
@@ -34,10 +39,10 @@ printf '%s\\n' "import fs from 'node:fs'; fs.writeFileSync(new URL('../better-sq
 if [ -f ${failPrebuild} ]; then node-gyp; fi
 prebuild-install
 `,{mode:0o755});
-  const bridgeSource=(mode:string)=>`import fs from 'node:fs';import path from 'node:path';import{spawn}from'node:child_process';const entry=${JSON.stringify(entry)},pidFile=${JSON.stringify(pidFile)},pm2File=${JSON.stringify(pm2File)},node=${JSON.stringify(node)},cwd=${JSON.stringify(checkout)},mode=${JSON.stringify(mode)};let signalCount=0;function update(pid){const j=JSON.parse(fs.readFileSync(pm2File));j.pid=pid;fs.writeFileSync(pm2File,JSON.stringify(j));fs.writeFileSync(pidFile,String(pid));}const release=path.resolve(new URL('.',import.meta.url).pathname,'../../..');const ep=path.join(release,'activation-envelope.json'),rp=path.join(release,'release-receipt.json');if(fs.existsSync(ep)){const e=JSON.parse(fs.readFileSync(ep)),s=JSON.parse(fs.readFileSync(rp)),t=new Date().toISOString(),started=mode==='stale'?'2000-01-01T00:00:00.000Z':e.startedAt,instance='instance-'+e.activationId.slice(0,12),ackChecksum=mode==='wrong-ack'?'f'.repeat(64):e.artifactChecksum;fs.writeFileSync(rp,JSON.stringify({...s,...e,pid:process.pid,instanceId:instance,protocolVersion:1,startedAt:started,helloAcceptedAt:t,catalogRpcs:{grok:{describeModelCatalogAt:t,fetchModelCatalogAt:t}},controllerAck:{activationId:e.activationId,bridgeId:e.bridgeId,instanceId:instance,pid:process.pid,sourceSha:e.sourceSha,artifactChecksum:ackChecksum},controllerVerifiedAt:t,completedAt:t})+'\\n');}process.on('SIGUSR2',()=>{signalCount+=1;if(mode==='interrupt'&&signalCount===1)return;const c=spawn(node,[entry],{cwd,detached:true,stdio:'ignore'});c.unref();update(c.pid);setTimeout(()=>process.exit(0),100);});setInterval(()=>{},1000);\n`;
+  const bridgeSource=(mode:string)=>`import fs from 'node:fs';import path from 'node:path';import{spawn}from'node:child_process';const entry=${JSON.stringify(entry)},pidFile=${JSON.stringify(pidFile)},pm2File=${JSON.stringify(pm2File)},node=${JSON.stringify(node)},cwd=${JSON.stringify(checkout)},mode=${JSON.stringify(mode)};let signalCount=0;function update(pid){const j=JSON.parse(fs.readFileSync(pm2File));j.pid=pid;j.pm_uptime=Date.now();fs.writeFileSync(pm2File,JSON.stringify(j));fs.writeFileSync(pidFile,String(pid));}const release=path.resolve(new URL('.',import.meta.url).pathname,'../../..');const ep=path.join(release,'activation-envelope.json'),rp=path.join(release,'release-receipt.json');if(fs.existsSync(ep)){const e=JSON.parse(fs.readFileSync(ep)),s=JSON.parse(fs.readFileSync(rp)),t=new Date().toISOString(),started=mode==='stale'?'2000-01-01T00:00:00.000Z':e.startedAt,instance='instance-'+e.activationId.slice(0,12),ackChecksum=mode==='wrong-ack'?'f'.repeat(64):e.artifactChecksum;fs.writeFileSync(rp,JSON.stringify({...s,...e,pid:process.pid,instanceId:instance,protocolVersion:1,startedAt:started,helloAcceptedAt:t,catalogRpcs:{grok:{describeModelCatalogAt:t,fetchModelCatalogAt:t}},controllerAck:{activationId:e.activationId,bridgeId:e.bridgeId,instanceId:instance,pid:process.pid,sourceSha:e.sourceSha,artifactChecksum:ackChecksum},controllerVerifiedAt:t,completedAt:t})+'\\n');}process.on('SIGUSR2',()=>{signalCount+=1;if(mode==='interrupt'&&signalCount===1)return;const c=spawn(node,[entry],{cwd,detached:true,stdio:'ignore'});c.unref();update(c.pid);setTimeout(()=>process.exit(0),100);});setInterval(()=>{},1000);\n`;
   await fs.writeFile(entry,bridgeSource("legacy"));
-  await fs.writeFile(pm2Module,`const fs=require('fs'),p=${JSON.stringify(pm2File)};module.exports={connect(cb){setImmediate(()=>cb(null))},describe(_n,cb){const j=JSON.parse(fs.readFileSync(p,'utf8'));setImmediate(()=>cb(null,[{pid:j.pid,pm2_env:{name:j.name,pm_cwd:j.cwd,pm_exec_path:j.entry,exec_interpreter:j.node,args:['connect','--server','wss://controller.invalid','--token','fixture-token','--id','fixture']}}]))},disconnect(){}}`);
-  const start=spawn(node,[entry],{cwd:checkout,detached:true,stdio:"ignore"});start.unref(); await fs.writeFile(pidFile,String(start.pid)); await fs.writeFile(pm2File,JSON.stringify({pid:start.pid,name:"fixture-app",cwd:checkout,entry,node}));
+  await fs.writeFile(pm2Module,`const fs=require('fs'),p=${JSON.stringify(pm2File)};module.exports={connect(cb){setImmediate(()=>cb(null))},describe(_n,cb){const j=JSON.parse(fs.readFileSync(p,'utf8'));setImmediate(()=>cb(null,[{pid:j.pid,pm2_env:{name:j.name,pm_cwd:j.cwd,pm_exec_path:j.entry,exec_interpreter:j.node,pm_uptime:j.pm_uptime,args:['connect','--server','wss://controller.invalid','--token','fixture-token','--id','fixture']}}]))},disconnect(){}}`);
+  const start=spawn(node,[entry],{cwd:checkout,detached:true,stdio:"ignore"});start.unref(); await fs.writeFile(pidFile,String(start.pid)); await fs.writeFile(pm2File,JSON.stringify({pid:start.pid,name:"fixture-app",cwd:checkout,entry,node,pm_uptime:Date.now()}));
   const shell=await renderRemoteScript(path.join(repo,"scripts/bridge-rollout-remote.sh"),path.join(repo,"scripts/bridge-rollout-remote.mjs"));
   const base=["fixture","fixture-app","grok",String(process.getuid!()),checkout,entry,pidFile,node,pm2Module,"-","no",releaseRoot];
   const run=(action:string[],timeoutMs=30_000)=>commandRunner({file:"/bin/sh",args:["-s","--",node,...base,...action],input:shell,timeoutMs});
@@ -45,7 +50,7 @@ prebuild-install
   const stage=async(sourceSha:string,source:string,operation:string)=>{const bytes=makeArchive(sourceSha,source),checksum=createHash("sha256").update(bytes).digest("hex"),upload=`bridge-${sourceSha}-${checksum}.tgz.upload-${operation}`;await fs.mkdir(path.join(releaseRoot,"incoming"),{recursive:true});await fs.writeFile(path.join(releaseRoot,"incoming",upload),bytes);const result=await run(["stage",sourceSha,checksum,upload,operation],60_000);return{sourceSha,checksum,stageId:operation,release:path.join(releaseRoot,"releases",`${sourceSha}-${checksum}`),result};};
   const old=await stage("1".repeat(40),bridgeSource(oldBehavior),H("1"));
   process.kill(start.pid!,"SIGKILL"); await new Promise((resolve)=>setTimeout(resolve,100)); await fs.unlink(entry); await fs.symlink(path.join(old.release,"packages/bridge/dist/index.js"),entry);
-  const managed=spawn(node,[entry],{cwd:checkout,detached:true,stdio:"ignore"});managed.unref();await fs.writeFile(pidFile,String(managed.pid));await fs.writeFile(pm2File,JSON.stringify({pid:managed.pid,name:"fixture-app",cwd:checkout,entry,node}));await new Promise((resolve)=>setTimeout(resolve,100));
+  const managed=spawn(node,[entry],{cwd:checkout,detached:true,stdio:"ignore"});managed.unref();await fs.writeFile(pidFile,String(managed.pid));await fs.writeFile(pm2File,JSON.stringify({pid:managed.pid,name:"fixture-app",cwd:checkout,entry,node,pm_uptime:Date.now()}));await new Promise((resolve)=>setTimeout(resolve,100));
   const next=await stage("2".repeat(40),bridgeSource(behavior),H("2"));
   const value={root,checkout,releaseRoot,entry,pidFile,run,stage,failPrebuild,old,next}; fixtures.push(value); return value;
 }
@@ -59,6 +64,8 @@ describe.sequential("production remote shell activation and rollback gates (#241
     await expect(fs.stat(path.join(f.next.release,".seam-install-bin"))).rejects.toThrow();
     const activated=await f.run(["activate",f.next.sourceSha,f.next.checksum,f.next.stageId,activation,"10",operation],20_000);
     expect(activated.stdout).toContain(`activation_id=${activation}`); expect(activated.stdout).toContain("activation=verified");
+    const verified=JSON.parse(await fs.readFile(path.join(f.releaseRoot,"activations",`${activation}.verified.json`),"utf8"));
+    expect(verified.verification).toEqual({forward:"receipt",catalogRpcsVerified:true});
     const newTarget=path.join(f.next.release,"packages/bridge/dist/index.js"),oldTarget=path.join(f.old.release,"packages/bridge/dist/index.js");
     await fs.unlink(f.entry);await fs.symlink(oldTarget,f.entry);
     await expect(f.run(["rollback",activation,H("5"),"10",H("6")],20_000)).rejects.toThrow(/rollback_current_activation_mismatch/);
@@ -75,20 +82,40 @@ describe.sequential("production remote shell activation and rollback gates (#241
     expect(releases.some((name)=>name.startsWith(`${sourceSha}-`))).toBe(false);
   },60_000);
 
-  it("rejects a stale shared receipt and rolls an observed interrupted activation back explicitly",async()=>{
+  it("reports a stale shared receipt as deployed but unconfirmed, with evidence before rollback",async()=>{
     const f=await makeFixture("stale"),activation=H("9");
-    await expect(f.run(["activate",f.next.sourceSha,f.next.checksum,f.next.stageId,activation,"10",H("a")],20_000)).rejects.toThrow(/activation_receipt_timeout/);
+    const result=await f.run(["activate",f.next.sourceSha,f.next.checksum,f.next.stageId,activation,"10",H("a")],20_000);
+    expect(result.stdout).toContain("activation=deployed_verification_unconfirmed");
+    expect(result.stdout).toContain("verification_reason=activation_receipt_timeout");
+    expect(result.stdout).toContain("old_pid_exited=yes");
+    expect(result.stdout).toContain("post_describeModelCatalog=yes");
+    expect(result.stdout).toContain("post_fetchModelCatalog=yes");
+    expect(result.stdout).toContain("post_rollout_ready=yes");
+    expect(result.stdout.indexOf("verification_reason=")).toBeLessThan(result.stdout.indexOf("rollback_command="));
+    expect(result.stdout.indexOf("current_entrypoint_target=")).toBeLessThan(result.stdout.indexOf("rollback_command="));
+    expect(result.stdout.indexOf("process_started_at=")).toBeLessThan(result.stdout.indexOf("rollback_command="));
     await expect(fs.stat(path.join(f.releaseRoot,"activations",`${activation}.intent.json`))).resolves.toBeTruthy();
     await expect(fs.stat(path.join(f.releaseRoot,"activations",`${activation}.observed.json`))).resolves.toBeTruthy();
+    const unconfirmed=JSON.parse(await fs.readFile(path.join(f.releaseRoot,"activations",`${activation}.unconfirmed.json`),"utf8"));
+    expect(unconfirmed.verification).toEqual({forward:"receipt",catalogRpcsVerified:false});
+    expect(unconfirmed.confirmationError).toBe("activation_receipt_timeout");
+    expect(unconfirmed.recheck).toMatchObject({oldPidExited:true,describeModelCatalog:"yes",fetchModelCatalog:"yes",rolloutReady:"yes"});
+    expect(Date.parse(unconfirmed.recheck.processStartedAt)).not.toBeNaN();
+    const observed=JSON.parse(await fs.readFile(path.join(f.releaseRoot,"activations",`${activation}.observed.json`),"utf8"));
+    expect(observed.verification).toEqual({forward:"receipt",catalogRpcsVerified:false,state:"pending"});
     await expect(fs.stat(path.join(f.releaseRoot,"activations",`${activation}.verified.json`))).rejects.toThrow();
     await expect(fs.stat(path.join(f.releaseRoot,"locks/fixture"))).rejects.toThrow();
     const rolled=await f.run(["rollback",activation,H("b"),"10",H("c")],20_000); expect(rolled.stdout).toContain("rollback=verified");
   },60_000);
 
-  it("rejects a controller acknowledgement for a different artifact",async()=>{
+  it("keeps a wrong controller acknowledgement unconfirmed rather than claiming activation failure",async()=>{
     const f=await makeFixture("wrong-ack"),activation=H("d");
-    await expect(f.run(["activate",f.next.sourceSha,f.next.checksum,f.next.stageId,activation,"10",H("e")],20_000)).rejects.toThrow(/activation_receipt_timeout/);
+    const result=await f.run(["activate",f.next.sourceSha,f.next.checksum,f.next.stageId,activation,"10",H("e")],20_000);
+    expect(result.stdout).toContain("activation=deployed_verification_unconfirmed");
+    expect(result.stdout).toContain("receipt_verification=unconfirmed");
     await expect(fs.stat(path.join(f.releaseRoot,"activations",`${activation}.observed.json`))).resolves.toBeTruthy();
+    await expect(fs.stat(path.join(f.releaseRoot,"activations",`${activation}.unconfirmed.json`))).resolves.toBeTruthy();
+    await expect(fs.stat(path.join(f.releaseRoot,"activations",`${activation}.verified.json`))).rejects.toThrow();
   },60_000);
 
   it("uses the immutable pre-switch intent to roll back a switched pointer when the old PID never exited",async()=>{

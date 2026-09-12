@@ -282,7 +282,19 @@ describe("vendor dir remap", () => {
     const mapping = path.join(tmp, "agy-sessions.json");
     fs.writeFileSync(
       mapping,
-      JSON.stringify({ "sid-1": { cascadeId: "c1", maxStepIndex: 1, cwd: from } })
+      JSON.stringify({
+        schemaVersion: 1,
+        backend: "agy-native-language-server-v1",
+        sessions: {
+          "sid-1": {
+            backend: "agy-native-language-server-v1",
+            cascadeId: "11111111-1111-4111-8111-111111111111",
+            maxStepIndex: 1,
+            cwd: from,
+            modelId: "fixture-native-model",
+          },
+        },
+      })
     );
     fs.mkdirSync(agyHome, { recursive: true });
     fs.writeFileSync(
@@ -343,7 +355,7 @@ describe("vendor dir remap", () => {
       JSON.parse(fs.readFileSync(path.join(grokTo, "prompt_context.json"), "utf8")).working_directory
     ).toBe(to);
 
-    expect(JSON.parse(fs.readFileSync(mapping, "utf8"))["sid-1"].cwd).toBe(to);
+    expect(JSON.parse(fs.readFileSync(mapping, "utf8")).sessions["sid-1"].cwd).toBe(to);
     expect(JSON.parse(fs.readFileSync(path.join(agyHome, "settings.json"), "utf8")).trustedWorkspaces).toEqual(
       [to, "/tmp"]
     );

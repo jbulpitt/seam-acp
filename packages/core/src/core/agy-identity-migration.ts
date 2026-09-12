@@ -24,12 +24,27 @@ function readMap(file: string): Record<string, unknown> {
   }
 }
 
+function readNativeMap(file: string): Record<string, unknown> {
+  const root = readMap(file);
+  if (!Object.prototype.hasOwnProperty.call(root, "schemaVersion")) return root;
+  if (
+    root.schemaVersion !== 1 ||
+    root.backend !== "agy-native-language-server-v1" ||
+    !root.sessions ||
+    typeof root.sessions !== "object" ||
+    Array.isArray(root.sessions)
+  ) {
+    throw new Error("Cannot safely classify AGY session map");
+  }
+  return root.sessions as Record<string, unknown>;
+}
+
 export function readAgyHandleOwnership(dataDir: string, home: string, packageStateDir: string): {
   native: Set<string>; packaged: Set<string>;
 } {
   const native = new Set<string>();
   for (const file of [path.join(dataDir, "agy-sessions.json"), path.join(home, ".gemini/antigravity-cli/seam_sessions.json")]) {
-    for (const [id, entry] of Object.entries(readMap(file))) {
+    for (const [id, entry] of Object.entries(readNativeMap(file))) {
       const cascade = typeof entry === "string" ? entry : (entry as { cascadeId?: unknown } | null)?.cascadeId;
       if (typeof cascade !== "string" || !cascade.trim()) throw new Error("Invalid native AGY mapping entry");
       native.add(id);

@@ -50,7 +50,12 @@ describe("Agy image inspector", () => {
     await fsp.rm(root, { recursive: true, force: true });
   });
 
-  it("runs the exact Gemini model in a private sandbox without shared tools", async () => {
+  // #264: "private cwd", not "private sandbox". The implementation says so in
+    // as many words — "A private cwd is not a sandbox: upstream still bypasses
+    // CLI permissions" — and #324 is the cost of a name that claims a boundary
+    // nobody verified. The isolation here is real but narrower than "sandbox":
+    // a fresh cwd, no MCP servers, no shared staging, no global model mutation.
+    it("runs the exact Gemini model in a private cwd without shared tools", async () => {
     let eventHandler: Parameters<AgyVisionRuntime["onEvent"]>[0] | undefined;
     let privateCwd = "";
     let promptText = "";

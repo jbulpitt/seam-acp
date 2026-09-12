@@ -14,6 +14,12 @@ const silent = pino({ level: "silent" }) as unknown as Logger;
 
 let dataDir: string;
 let queueStore: SessionStore;
+const queueWatchers = new Set<DispatchWatcher>();
+function makeWatcher(opts: ConstructorParameters<typeof DispatchWatcher>[0]): DispatchWatcher {
+  const watcher = new DispatchWatcher(opts);
+  queueWatchers.add(watcher);
+  return watcher;
+}
 let dirs: ReturnType<typeof dispatchDirs>;
 
 beforeEach(async () => {
@@ -23,6 +29,9 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  for (const watcher of queueWatchers) watcher.stop();
+  await Promise.all([...queueWatchers].map(watcher => watcher.drain()));
+  queueWatchers.clear();
   queueStore.close();
   await rm(dataDir, { recursive: true, force: true });
 });
@@ -62,7 +71,7 @@ describe("DispatchWatcher", () => {
     await mkdir(dirs.root, { recursive: true });
     await writeFile(dirs.pending, "not a directory");
     const onDispatch = vi.fn(async () => ({ output: "completed from SQL", stopReason: "end_turn" }));
-    const watcher = new DispatchWatcher({ attempts: queueStore.turnAttempts, dataDir, logger: silent, onDispatch });
+    const watcher = makeWatcher({ attempts: queueStore.turnAttempts, dataDir, logger: silent, onDispatch });
     await watcher.start(); watcher.stop();
     expect(onDispatch).toHaveBeenCalledTimes(1);
     expect(queueStore.turnAttempts.get("sql-only")).toMatchObject({ state: "completed", outcome: { output: "completed from SQL" } });
@@ -84,13 +93,13 @@ describe("DispatchWatcher", () => {
     expect(queueStore.turnAttempts.get("broken")?.state).toBe("completed");
     await dropSpec({ id: "new-work" });
     const onDispatch = vi.fn(async () => ({ output: "new", stopReason: "end_turn" }));
-    const watcher = new DispatchWatcher({ attempts: queueStore.turnAttempts, dataDir, logger: silent, onDispatch });
+    const watcher = makeWatcher({ attempts: queueStore.turnAttempts, dataDir, logger: silent, onDispatch });
     await watcher.start(); watcher.stop();
     expect(onDispatch).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ id: "new-work" }));
   });
 
   it("terminalizes exactly one quarantined artifact and preserves an existing done result", async () => {
-    const watcher = new DispatchWatcher({ attempts: queueStore.turnAttempts,
+    const watcher = makeWatcher({ attempts: queueStore.turnAttempts,
       dataDir,
       logger: silent,
       onDispatch: async () => ({ output: "must not run", stopReason: "end_turn" }),
@@ -126,7 +135,7 @@ describe("DispatchWatcher", () => {
     let callbackCalls = 0;
     let releaseFirst!: () => void;
     const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
-    const watcher = new DispatchWatcher({ attempts: queueStore.turnAttempts,
+    const watcher = makeWatcher({ attempts: queueStore.turnAttempts,
       dataDir,
       logger: silent,
       onDispatch: async (spec) => {
@@ -168,7 +177,7 @@ describe("DispatchWatcher", () => {
 
   it("moves a pending spec through running to done with the callback's output", async () => {
     const seen: DispatchSpec[] = [];
-    const watcher = new DispatchWatcher({ attempts: queueStore.turnAttempts,
+    const watcher = makeWatcher({ attempts: queueStore.turnAttempts,
       dataDir,
       logger: silent,
       onDispatch: async (spec) => {
@@ -210,7 +219,7 @@ describe("DispatchWatcher", () => {
     let entered = false;
     let release!: () => void;
     const held = new Promise<void>((resolve) => { release = resolve; });
-    const watcher = new DispatchWatcher({ attempts: queueStore.turnAttempts,
+    const watcher = makeWatcher({ attempts: queueStore.turnAttempts,
       dataDir,
       logger: silent,
       onDispatch: async () => {
@@ -256,7 +265,7 @@ describe("DispatchWatcher", () => {
   it("opens admission and reports the forfeit when boot recovery rejects (#303)", async () => {
     const { logger, errors } = capturingLogger();
     const seen: string[] = [];
-    const watcher = new DispatchWatcher({ attempts: queueStore.turnAttempts,
+    const watcher = makeWatcher({ attempts: queueStore.turnAttempts,
       dataDir,
       logger,
       beforeAdmission: async () => { throw new Error("discord rate limit during boot"); },
@@ -288,7 +297,7 @@ describe("DispatchWatcher", () => {
   it("opens admission and reports the forfeit when boot recovery hangs past the bound (#303)", async () => {
     const { logger, errors } = capturingLogger();
     const seen: string[] = [];
-    const watcher = new DispatchWatcher({ attempts: queueStore.turnAttempts,
+    const watcher = makeWatcher({ attempts: queueStore.turnAttempts,
       dataDir,
       logger,
       // Never resolves, the way an unbounded loadSession would not.
@@ -320,7 +329,7 @@ describe("DispatchWatcher", () => {
    */
   it("does not reopen admission when stop wins a hung boot recovery (#303)", async () => {
     const seen: string[] = [];
-    const watcher = new DispatchWatcher({ attempts: queueStore.turnAttempts,
+    const watcher = makeWatcher({ attempts: queueStore.turnAttempts,
       dataDir,
       logger: silent,
       beforeAdmission: () => new Promise<void>(() => {}),
@@ -350,7 +359,7 @@ describe("DispatchWatcher", () => {
     let releaseRecovery!: () => void;
     const slowRecovery = new Promise<void>((resolve) => { releaseRecovery = resolve; });
     const seen: string[] = [];
-    const watcher = new DispatchWatcher({ attempts: queueStore.turnAttempts,
+    const watcher = makeWatcher({ attempts: queueStore.turnAttempts,
       dataDir,
       logger: silent,
       beforeAdmission: () => slowRecovery,
@@ -380,7 +389,7 @@ describe("DispatchWatcher", () => {
     let release!: () => void;
     const held = new Promise<void>((resolve) => { release = resolve; });
     const onRetained = vi.fn(async () => {});
-    const watcher = new DispatchWatcher({ attempts: queueStore.turnAttempts,
+    const watcher = makeWatcher({ attempts: queueStore.turnAttempts,
       dataDir,
       logger: silent,
       onRetained,
@@ -405,7 +414,7 @@ describe("DispatchWatcher", () => {
   });
 
   it("records status failed with the error when the callback rejects", async () => {
-    const watcher = new DispatchWatcher({ attempts: queueStore.turnAttempts,
+    const watcher = makeWatcher({ attempts: queueStore.turnAttempts,
       dataDir,
       logger: silent,
       onDispatch: async () => {
@@ -441,7 +450,7 @@ describe("DispatchWatcher", () => {
     queueStore.turnAttempts.admit({ id: "job-c", target: "thread-9", prompt: "resume me", session: "isolated" });
     await rm(dirs.running, { recursive: true });
     const seen: string[] = [];
-    const watcher = new DispatchWatcher({ attempts: queueStore.turnAttempts,
+    const watcher = makeWatcher({ attempts: queueStore.turnAttempts,
       dataDir,
       logger: silent,
       onDispatch: async (spec) => {
@@ -477,7 +486,7 @@ describe("DispatchWatcher", () => {
     );
 
     let calls = 0;
-    const watcher = new DispatchWatcher({ attempts: queueStore.turnAttempts,
+    const watcher = makeWatcher({ attempts: queueStore.turnAttempts,
       dataDir,
       logger: silent,
       onDispatch: async () => {
@@ -509,7 +518,7 @@ describe("DispatchWatcher", () => {
         "utf8"
       );
       let calls = 0;
-      const watcher = new DispatchWatcher({ attempts: queueStore.turnAttempts,
+      const watcher = makeWatcher({ attempts: queueStore.turnAttempts,
         dataDir,
         logger: silent,
         resumeEnabled,
@@ -538,7 +547,7 @@ describe("DispatchWatcher", () => {
     const gate = (id: string) =>
       new Promise<void>((resolve) => release.set(id, resolve));
 
-    const watcher = new DispatchWatcher({ attempts: queueStore.turnAttempts,
+    const watcher = makeWatcher({ attempts: queueStore.turnAttempts,
       dataDir,
       logger: silent,
       onDispatch: async (spec) => {
@@ -588,7 +597,7 @@ describe("DispatchWatcher", () => {
     // the later id ("aaa") was created FIRST — sorting by id/readdir would run it
     // first; only sorting by createdUtc gives the correct ["zzz", "aaa"].
     const order: string[] = [];
-    const watcher = new DispatchWatcher({ attempts: queueStore.turnAttempts,
+    const watcher = makeWatcher({ attempts: queueStore.turnAttempts,
       dataDir,
       logger: silent,
       onDispatch: async (spec) => {
@@ -613,7 +622,7 @@ describe("DispatchWatcher", () => {
     await writeFile(path.join(dirs.pending, "job-e.json"), "{ not json", "utf8");
 
     let calls = 0;
-    const watcher = new DispatchWatcher({ attempts: queueStore.turnAttempts,
+    const watcher = makeWatcher({ attempts: queueStore.turnAttempts,
       dataDir,
       logger: silent,
       onDispatch: async () => {
@@ -638,7 +647,7 @@ describe("DispatchWatcher", () => {
     await mkdir(dirs.pending, { recursive: true });
     await writeFile(path.join(dirs.pending, "job-f.json"), JSON.stringify({ prompt: "hi" }), "utf8");
 
-    const watcher = new DispatchWatcher({ attempts: queueStore.turnAttempts,
+    const watcher = makeWatcher({ attempts: queueStore.turnAttempts,
       dataDir,
       logger: silent,
       onDispatch: async () => ({ output: "", stopReason: "end_turn" }),

@@ -57,8 +57,21 @@ export type CatalogEffortEvidence = NonNullable<CatalogModelEvidence["effort"]>;
 export interface CatalogScope {
   /** Stable, non-secret semantic identity. Equal fingerprints may share a generation. */
   fingerprint: string;
-  /** Host-local credentials/runtime have not proved cross-binding equivalence. */
-  sharing?: "binding";
+  /**
+   * Whether this catalog may be shared across bindings (#339 rules 1-3).
+   *
+   * A catalog belongs to ONE binding by default. Sharing has to be PROVEN by
+   * the adapter — `"shared"` is an assertion that these credentials, this
+   * runtime and these advertised capabilities are genuinely the same object on
+   * every binding carrying the fingerprint. Absence is not a proof, so an
+   * omitted value and `"binding"` both mean binding-local.
+   *
+   * This used to read `sharing !== "binding"`, i.e. sharing was inferred from
+   * silence, which is how `macbook-air` on `claude-agent-acp` 0.70.0 came to
+   * share a scope with hosts on 0.75.1 and then get quarantined for describing
+   * itself accurately.
+   */
+  sharing?: "binding" | "shared";
   provider: string;
   credentialProfile?: string;
   backend?: string;

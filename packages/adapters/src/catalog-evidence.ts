@@ -669,8 +669,12 @@ export function assertCatalogValues(candidate: unknown): void {
     assertLabelValue("candidate.scope.fingerprint", scope.fingerprint, CATALOG_EVIDENCE_TEXT_MAX);
   }
   requireLabel("candidate.scope.provider", scope.provider);
-  if (scope.sharing !== undefined && scope.sharing !== "binding") {
-    fail("candidate.scope.sharing", "must be binding when specified");
+  // #339 rule 2: `shared` is an adapter's explicit assertion that these
+  // credentials, this runtime and these capabilities are the same object on
+  // every binding carrying the fingerprint. Absence means binding-local, so an
+  // adapter that cannot prove equivalence simply says nothing.
+  if (scope.sharing !== undefined && scope.sharing !== "binding" && scope.sharing !== "shared") {
+    fail("candidate.scope.sharing", "must be binding or shared when specified");
   }
   for (const field of SCOPE_IDENTITY_FIELDS) {
     const value = scope[field];

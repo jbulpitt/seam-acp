@@ -356,7 +356,13 @@ describe("AGY catalog identity migration", () => {
       "gemini-3.8-flash-high",
       [...rightfulChange.models.map((row) => row.id), "peer-only"],
     )).refresh({ agentId: "agy-package", location: "remote-peer" });
-    expect(stalePeer.result).toBe("quarantined");
+    // #339 rules 1-8. This used to be `quarantined`: a second host publishing
+    // a slightly different catalog lost its own. Binding-local keying means the
+    // two never collide in the first place, so the peer simply publishes what
+    // its adapter reported and the local binding's generation is untouched.
+    expect(stalePeer.result).toBe("published");
+    expect(stalePeer.mode).toBe("binding-local");
+    expect(stalePeer.scope).toBe("binding:agy-package@remote-peer");
 
     store.close();
     const restarted = new ModelCatalogStore(file);
@@ -451,7 +457,14 @@ describe("AGY catalog identity migration", () => {
       change(altered);
       const result = await service(store, async () => altered)
         .refresh({ agentId: "agy-package", location: "local" });
-      expect(result.result).toBe("quarantined");
+      // #339: the narrow thing in doubt is whether this candidate may TAKE
+      // OVER the legacy generation, and the answer stays no — the proof is
+      // still pending, asserted below and again after the loop. What used to
+      // ALSO happen, and no longer does, is the binding losing its catalog
+      // over it. It keeps serving what its own adapter actually fetched.
+      expect(result.result).not.toBe("quarantined");
+      expect(result.ok).toBe(true);
+      expect(result.mode).toBe("binding-local");
       expect(store.bindingMigration(AGY_CATALOG_IDENTITY_MIGRATION)?.status).toBe("pending-proof");
     }
     const wrongScope = candidate(

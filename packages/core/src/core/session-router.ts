@@ -418,7 +418,11 @@ export class SessionRouter {
     if (local || isLocalLocation(location)) return local;
     const binding = { agentId: id, location };
     const lookup = this.modelCatalog.lookup(binding);
-    if (!lookup.snapshot || lookup.state === "drift") return undefined;
+    // A remote-only profile is synthesized FROM a candidate, so without one
+    // there is nothing to build. That is narrower than it looks: only remote
+    // agents with no local profile are affected, and #339 rule 15 keeps the
+    // turn itself startable.
+    if (!lookup.snapshot) return undefined;
     const key = bindingKey(binding);
     const cached = this.remoteProfiles.get(key);
     if (cached?.generation === lookup.snapshot.generation) return cached.profile;
@@ -1100,7 +1104,10 @@ export class SessionRouter {
     );
     const model = catalogSelection.raw.model;
     const effort = catalogSelection.raw.effort;
-    const effortDescriptor = catalogSelection.model.effort;
+    // Null when the binding has no catalog yet (#339 rule 15). The runtime
+    // treats an absent descriptor as "this agent advertises no effort control",
+    // which is the same thing we would say about an agent that has none.
+    const effortDescriptor = catalogSelection.model?.effort;
     const described = this.describeConfig(record);
     const cwd = described.cwd.value;
     // #37: never request Fast from an agent that has no such concept — that

@@ -1,8 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import os from "node:os";
 import {
-  makeAgyPackageProfile,
-  agyAcpReleaseArtifact,
   makeClaudeProfile,
   makeCodexProfile,
   makeCopilotProfile,
@@ -165,7 +162,7 @@ describe("production adapter catalog sources", () => {
     expect(catalogs[3]?.source).toBe("validated-manifest");
   });
 
-  it("covers Codex, parked Ollama Cloud, segmented Agy, and deferred Grok discovery", async () => {
+  it("covers Codex, parked Ollama Cloud, and deferred Grok discovery", async () => {
     const codex = makeCodexProfile({
       cliPath: "false",
       defaultModel: "gpt-5",
@@ -193,26 +190,6 @@ describe("production adapter catalog sources", () => {
       staticModels: [{ modelId: "qwen:cloud", name: "Qwen", contextLimit: 200_000 }],
       effort: { mechanism: "configOption", configId: "reasoning_effort", levels: ["low", "high"] },
     });
-    const agy = makeAgyPackageProfile({
-      acpPath: "/bin/false",
-      agyBin: "/bin/false",
-      agyVersion: "false 1.0",
-      agySha256: "a".repeat(64),
-      defaultModel: "gemini-high",
-      stateDir: `${os.homedir()}/.agy-acp`,
-      conversationsDir: "/tmp/conversations",
-      cwd: "/tmp",
-      credentialScope: "test",
-      wrapperVersion: "1.1.0",
-      wrapperSha256: agyAcpReleaseArtifact().sha256,
-      permissionRiskAcknowledged: true,
-      verifyWrapper: () => {},
-      verifyRuntime: () => {},
-      catalogProbe: async () => ({
-        agyVersion: "false 1.0",
-        models: [{ modelId: "gemini-high", displayName: "Gemini High" }],
-      }),
-    });
     const discover = vi.fn(async () => [
       { modelId: "grok-future", name: "Grok Future", contextLimit: 654_321 },
     ]);
@@ -226,14 +203,13 @@ describe("production adapter catalog sources", () => {
       cliVersionProbe: async () => "grok test",
     });
     expect(discover).not.toHaveBeenCalled();
-    const catalogs = (await Promise.all([codex, ollama, agy, grok].map((profile) => profile.catalog.fetch())))
+    const catalogs = (await Promise.all([codex, ollama, grok].map((profile) => profile.catalog.fetch())))
       .map(normalizeCatalogCandidate);
     catalogs.forEach(validateCandidate);
     expect(catalogs.map((catalog) => catalog.scope.provider)).toEqual([
-      "openai", "ollama-cloud", "google-antigravity", "xai",
+      "openai", "ollama-cloud", "xai",
     ]);
     expect(discover).toHaveBeenCalledOnce();
-    expect(catalogs[2]?.models[0]?.effort.mechanism).toBe("modelBaked");
-    expect(catalogs[3]?.models[0]?.id).toBe("grok-future");
+    expect(catalogs[2]?.models[0]?.id).toBe("grok-future");
   });
 });

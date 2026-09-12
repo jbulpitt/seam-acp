@@ -10,7 +10,6 @@ import {
   AGENT_ADAPTER_VERSION,
   makeAgyNativeRuntime,
   describeProvenanceMode,
-  makeAgyPackageProfile,
   makeAgyProfile,
   makeClaudeProfile,
   makeCodexProfile,
@@ -123,7 +122,6 @@ export function loadHostAdapters(
   const out = new Map<string, AgentAdapter>();
   // Resolved once so the existence probe and the profile use the SAME path.
   const claudeCli = env.CLAUDE_CLI_PATH?.trim() || "claude-agent-acp";
-  const agyAcpPath = env.AGY_ACP_BIN?.trim();
   const agyBin = env.AGY_BIN?.trim();
   const agyVersion = env.AGY_VERSION?.trim();
   const agySha256 = env.AGY_SHA256?.trim();
@@ -131,8 +129,6 @@ export function loadHostAdapters(
   const agyDefaultModel = env.AGY_DEFAULT_MODEL?.trim();
   const agyModels = parseConfiguredModels(env.AGY_MODELS);
   const agyNativeBin = env.AGY_CLI_PATH?.trim() || env.AGY_OLD_CLI_PATH?.trim() || agyBin;
-  const agyEnabled = env.AGY_PACKAGE_ENABLED === "true";
-  const agyRiskAcknowledged = env.AGY_DANGEROUS_PERMISSIONS_ACKNOWLEDGED === "true";
   const factories: Array<{ id: string; bin: string; make: () => AgentAdapter; strict?: boolean }> = [
     {
       id: "copilot",
@@ -168,25 +164,6 @@ export function loadHostAdapters(
           : {}),
       }),
     },
-    ...(agyEnabled && agyAcpPath && agyBin && agyVersion && agySha256 && agyRuntimeRoot && path.isAbsolute(agyRuntimeRoot) && agyDefaultModel && agyRiskAcknowledged ? [{
-      id: "agy-package",
-      bin: agyAcpPath,
-      make: () => makeAgyPackageProfile({
-        acpPath: agyAcpPath,
-        agyBin,
-        agyVersion,
-        agySha256,
-        runtimeRoot: agyRuntimeRoot,
-        defaultModel: agyDefaultModel,
-        stateDir: env.AGY_ACP_STATE_DIR ?? path.join(env.HOME ?? os.homedir(), ".agy-acp"),
-        conversationsDir: env.AGY_CONVERSATIONS_DIR ?? path.join(env.HOME ?? os.homedir(), ".gemini", "antigravity-cli", "conversations"),
-        cwd: env.AGY_ACP_CWD ?? options.cwd ?? process.cwd(),
-        credentialScope: env.AGY_CREDENTIAL_SCOPE ?? "antigravity-oauth:default",
-        wrapperVersion: env.AGY_ACP_VERSION ?? "",
-        wrapperSha256: env.AGY_ACP_SHA256 ?? "",
-        permissionRiskAcknowledged: true,
-      }),
-    }] : []),
     ...((env.AGY_ENABLED === "true" || env.AGY_OLD_ROLLBACK_ENABLED === "true") && agyNativeBin && path.isAbsolute(agyNativeBin) && agyDefaultModel && agyVersion && agySha256 && agyRuntimeRoot && path.isAbsolute(agyRuntimeRoot) ? [{
       id: "agy",
       bin: agyNativeBin,
@@ -272,7 +249,6 @@ export function inventoryFromAdapters(
   const bins: Record<string, string> = {
     copilot: copilotCmd,
     claude: env.CLAUDE_CLI_PATH ?? "claude-agent-acp",
-    "agy-package": env.AGY_ACP_BIN ?? "antigravity-acp",
     agy: env.AGY_CLI_PATH?.trim() || env.AGY_OLD_CLI_PATH?.trim() || env.AGY_BIN?.trim() || "agy",
     codex: "codex-acp",
     grok: env.GROK_CLI_PATH?.trim() || "grok",

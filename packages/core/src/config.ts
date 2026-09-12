@@ -3,7 +3,6 @@ dotenv.config({ override: true });
 import fs from "node:fs";
 import path from "node:path";
 import { z } from "zod";
-import { agyAcpReleaseArtifact } from "@seam/adapters";
 import { parkedAgentMessage } from "./core/parked-agents.js";
 import { retiredAgentConfigMessage } from "./core/retired-agents.js";
 
@@ -290,12 +289,9 @@ const Schema = z.object({
 
   /** Native Seam Antigravity adapter (public agy identity). */
   AGY_ENABLED: z.enum(["true", "false"]).default("false").transform((v) => v === "true"),
-  /** Optional package-backed implementation; never enabled by AGY_ENABLED. */
-  AGY_PACKAGE_ENABLED: z.enum(["true", "false"]).default("false").transform((v) => v === "true"),
   /** Owner-approved one-time local native restoration, applied before work admission. */
   AGY_NATIVE_RESTORE: z.enum(["true", "false"]).default("false").transform((v) => v === "true"),
   /** Exact compiled antigravity-acp v1.1.0 executable for this host. */
-  AGY_ACP_BIN: z.string().optional(),
   /** Exact authenticated agy executable; forwarded to the wrapper as AGY_BIN. */
   AGY_BIN: z.string().optional(),
   /** Exact first line returned by AGY_BIN --version. */
@@ -304,16 +300,27 @@ const Schema = z.object({
   AGY_SHA256: z.string().default(""),
   /** Non-writable content-addressed root managed outside agy's auto-updater. */
   AGY_RUNTIME_ROOT: z.string().optional(),
-  AGY_ACP_VERSION: z.string().default(""),
-  /** Host/platform-specific SHA-256 of AGY_ACP_BIN. */
-  AGY_ACP_SHA256: z.string().default(""),
-  /** v1.1.0 stores sessions here; must describe the effective host-local directory. */
+  /**
+   * Where the removed agy-package wrapper kept its session map (#377).
+   * Retained because the one-shot #254 native identity restoration still reads
+   * it to decide which sessions were package-owned, and `agy_identity_restore`
+   * has rows with `rebuild_required` still pending. Nothing else uses it.
+   */
   AGY_ACP_STATE_DIR: z.string().optional(),
   AGY_CONVERSATIONS_DIR: z.string().optional(),
-  AGY_ACP_CWD: z.string().optional(),
   /** Non-secret semantic auth scope, never an account name, email, token, or path. */
   AGY_CREDENTIAL_SCOPE: z.string().default("antigravity-oauth:default"),
-  /** Security acceptance: v1.1.0 unconditionally runs agy with its bypass flag. */
+  /**
+   * GATES NOTHING TODAY (#377). It was required only by the removed
+   * agy-package config block and by that agent's factory.
+   *
+   * Native agy passes `--dangerously-skip-permissions` unconditionally
+   * (#324) and has NEVER required this acknowledgement, so the risk it
+   * names is live while the acknowledgement is not. Kept rather than
+   * deleted because moving the gate onto the native path is a new boot-time
+   * requirement — a host that has not set it would lose agy entirely, which
+   * is the wrong thing to do inside a removal. Tracked separately.
+   */
   AGY_DANGEROUS_PERMISSIONS_ACKNOWLEDGED: z.enum(["true", "false"]).default("false").transform((v) => v === "true"),
   /** Deprecated native-adapter enable alias, retained for existing host config. */
   AGY_OLD_ROLLBACK_ENABLED: z.enum(["true", "false"]).default("false").transform((v) => v === "true"),
@@ -1176,70 +1183,6 @@ export function loadConfig(): Config {
   }
   cfg.REPOS_ROOT = reposRoot;
 
-  if (cfg.AGY_PACKAGE_ENABLED) {
-    const missing = [
-      ["AGY_ACP_BIN", cfg.AGY_ACP_BIN],
-      ["AGY_BIN", cfg.AGY_BIN],
-      ["AGY_VERSION", cfg.AGY_VERSION],
-      ["AGY_SHA256", cfg.AGY_SHA256],
-      ["AGY_RUNTIME_ROOT", cfg.AGY_RUNTIME_ROOT],
-      ["AGY_ACP_SHA256", cfg.AGY_ACP_SHA256],
-      ["AGY_CONVERSATIONS_DIR", cfg.AGY_CONVERSATIONS_DIR],
-      ["AGY_DEFAULT_MODEL", cfg.AGY_DEFAULT_MODEL],
-    ].filter(([, value]) => !value).map(([name]) => name);
-    if (missing.length) {
-      throw new Error(`Invalid configuration: AGY_PACKAGE_ENABLED requires ${missing.join(", ")}`);
-    }
-    for (const [name, value] of [
-      ["AGY_ACP_BIN", cfg.AGY_ACP_BIN!],
-      ["AGY_BIN", cfg.AGY_BIN!],
-      ["AGY_CONVERSATIONS_DIR", cfg.AGY_CONVERSATIONS_DIR!],
-      ["AGY_ACP_CWD", cfg.AGY_ACP_CWD ?? cfg.REPOS_ROOT],
-      ["AGY_RUNTIME_ROOT", cfg.AGY_RUNTIME_ROOT!],
-    ] as const) {
-      if (!path.isAbsolute(value)) throw new Error(`Invalid configuration: ${name} must be an absolute path`);
-    }
-    if (cfg.AGY_ACP_VERSION !== "1.1.0") {
-      throw new Error("Invalid configuration: AGY_ACP_VERSION must be the reviewed immutable version 1.1.0");
-    }
-    if (cfg.AGY_VERSION.length > 256 || /[\r\n\0]/.test(cfg.AGY_VERSION)) {
-      throw new Error("Invalid configuration: AGY_VERSION must be the exact bounded first line from AGY_BIN --version");
-    }
-    if (!/^[a-f0-9]{64}$/.test(cfg.AGY_SHA256)) {
-      throw new Error("Invalid configuration: AGY_SHA256 must be 64 lowercase hex characters");
-    }
-    if (!/^[a-f0-9]{64}$/.test(cfg.AGY_ACP_SHA256)) {
-      throw new Error("Invalid configuration: AGY_ACP_SHA256 must be 64 lowercase hex characters");
-    }
-    const reviewedArtifact = agyAcpReleaseArtifact();
-    if (cfg.AGY_ACP_SHA256 !== reviewedArtifact.sha256) {
-      throw new Error(
-        `Invalid configuration: AGY_ACP_SHA256 must match reviewed v1.1.0 ${reviewedArtifact.name}`
-      );
-    }
-    if (!/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,63}$/.test(cfg.AGY_CREDENTIAL_SCOPE)) {
-      throw new Error("Invalid configuration: AGY_CREDENTIAL_SCOPE must be a non-secret semantic identifier");
-    }
-    if (!cfg.AGY_DANGEROUS_PERMISSIONS_ACKNOWLEDGED) {
-      throw new Error(
-        "Invalid configuration: antigravity-acp v1.1.0 unconditionally passes " +
-          "--dangerously-skip-permissions; set AGY_DANGEROUS_PERMISSIONS_ACKNOWLEDGED=true only after explicit operator acceptance"
-      );
-    }
-    const effectiveStateDir = cfg.AGY_ACP_STATE_DIR ?? path.join(process.env.HOME ?? "", ".agy-acp");
-    if (!path.isAbsolute(effectiveStateDir)) {
-      throw new Error("Invalid configuration: AGY_ACP_STATE_DIR must resolve to an absolute path");
-    }
-    const wrapperStateDir = path.join(process.env.HOME ?? "", ".agy-acp");
-    if (path.normalize(effectiveStateDir) !== path.normalize(wrapperStateDir)) {
-      throw new Error(
-        `Invalid configuration: antigravity-acp v1.1.0 fixes state at ${wrapperStateDir}; ` +
-          "AGY_ACP_STATE_DIR may describe but cannot relocate it"
-      );
-    }
-    cfg.AGY_ACP_STATE_DIR = effectiveStateDir;
-    cfg.AGY_ACP_CWD = cfg.AGY_ACP_CWD ?? cfg.REPOS_ROOT;
-  }
   if (cfg.AGY_ENABLED || cfg.AGY_OLD_ROLLBACK_ENABLED) {
     cfg.AGY_CLI_PATH = cfg.AGY_CLI_PATH?.trim() || cfg.AGY_OLD_CLI_PATH?.trim() || cfg.AGY_BIN?.trim();
     if (!cfg.AGY_CLI_PATH || !path.isAbsolute(cfg.AGY_CLI_PATH)) {

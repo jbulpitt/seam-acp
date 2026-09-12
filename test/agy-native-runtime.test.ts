@@ -9,11 +9,9 @@ import { pino } from "pino";
 import {
   AGENT_ADAPTER_VERSION,
   PROTOCOL_VERSION,
-  agyAcpReleaseArtifact,
   fetchAgyUserStatus,
   makeAgyNativeRuntime,
   makeAgyProfile,
-  makeAgyPackageProfile,
 } from "@seam/adapters";
 import { fileURLToPath } from "node:url";
 import { AgentRuntime } from "../packages/core/src/agents/agent-runtime.js";
@@ -58,7 +56,6 @@ describe("native AGY R2 runtime identity", () => {
         HOME: os.homedir(),
         PATH: process.env.PATH,
         AGY_ENABLED: "true",
-        AGY_PACKAGE_ENABLED: "false",
         AGY_CLI_PATH: fixture.executable,
         AGY_BIN: fixture.executable,
         AGY_RUNTIME_ROOT: fixture.runtimeRoot,
@@ -276,44 +273,6 @@ describe("native AGY R2 runtime identity", () => {
     }
   });
 
-  it("also blocks agy-package before its catalog consumer can use a replaced managed CLI", async () => {
-    const fixture = createManagedAgyFixture();
-    const probe = vi.fn(async () => ({
-      agyVersion: "agy-test 1.0",
-      models: [{ modelId: "fixture-model", displayName: "Fixture Model" }],
-    }));
-    try {
-      const profile = makeAgyPackageProfile({
-        acpPath: "/bin/false",
-        agyBin: fixture.executable,
-        agyVersion: "agy-test 1.0",
-        agySha256: fixture.sha256,
-        runtimeRoot: fixture.runtimeRoot,
-        defaultModel: "fixture-model",
-        stateDir: path.join(os.homedir(), ".agy-acp"),
-        conversationsDir: "/tmp/agy-conversations",
-        cwd: "/tmp",
-        credentialScope: "antigravity-oauth:test",
-        wrapperVersion: "1.1.0",
-        wrapperSha256: agyAcpReleaseArtifact().sha256,
-        permissionRiskAcknowledged: true,
-        verifyWrapper: () => {},
-        catalogProbe: probe,
-      });
-      const releaseDir = path.dirname(fixture.executable);
-      fs.chmodSync(fixture.runtimeRoot, 0o700);
-      fs.chmodSync(releaseDir, 0o700);
-      fs.chmodSync(fixture.executable, 0o700);
-      fs.appendFileSync(fixture.executable, "\n# replaced\n");
-      fs.chmodSync(fixture.executable, 0o500);
-      fs.chmodSync(releaseDir, 0o500);
-      fs.chmodSync(fixture.runtimeRoot, 0o500);
-      await expect(profile.catalog.fetch()).rejects.toThrow(/sha256 does not match/);
-      expect(probe).not.toHaveBeenCalled();
-    } finally {
-      fixture.cleanup();
-    }
-  });
 
   it("requires version and digest to move together for a deliberate upgrade", async () => {
     const fixture = createManagedAgyFixture({ version: "actual-version" });

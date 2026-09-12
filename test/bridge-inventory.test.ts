@@ -7,7 +7,6 @@ import {
   loadHostAdapters,
   resolveCopilotHostLaunch,
 } from "../packages/bridge/src/inventory.js";
-import { agyAcpReleaseArtifact } from "@seam/adapters";
 import { createManagedAgyFixture } from "./helpers/agy-runtime-fixture.js";
 
 describe("loadHostAdapters", () => {
@@ -120,65 +119,6 @@ fs.writeFileSync(process.env.GROK_BRIDGE_LOG, JSON.stringify({
     }
   });
 
-  it("advertises the package runtime under agy-package only when explicitly acknowledged", () => {
-    const managed = createManagedAgyFixture({ version: "1.1.28" });
-    const env: NodeJS.ProcessEnv = {
-      ...process.env,
-      AGY_ENABLED: "false",
-      AGY_PACKAGE_ENABLED: "true",
-      AGY_ACP_BIN: "/opt/agy/antigravity-acp",
-      AGY_BIN: "/opt/agy/agy",
-      AGY_VERSION: "1.1.28",
-      AGY_SHA256: "a".repeat(64),
-      AGY_RUNTIME_ROOT: "/opt/agy/runtime",
-      AGY_DEFAULT_MODEL: "gemini-high",
-      AGY_ACP_VERSION: "1.1.0",
-      AGY_ACP_SHA256: agyAcpReleaseArtifact().sha256,
-      AGY_CONVERSATIONS_DIR: "/srv/agy/conversations",
-      AGY_ACP_CWD: "/srv/workspaces",
-      AGY_CREDENTIAL_SCOPE: "antigravity-oauth:test",
-      AGY_DANGEROUS_PERMISSIONS_ACKNOWLEDGED: "true",
-      AGY_OLD_ROLLBACK_ENABLED: "false",
-    };
-    const adapters = loadHostAdapters("copilot", { env, exists: () => true });
-    expect(adapters.has("agy-package")).toBe(true);
-    expect(adapters.has("agy")).toBe(false);
-    expect(adapters.has("agy-old")).toBe(false);
-    const row = inventoryFromAdapters(adapters, "copilot", env)
-      .find((item) => item.agentId === "agy-package");
-    expect(row?.runtime).toMatchObject({
-      executable: "/opt/agy/antigravity-acp",
-      cwd: "/srv/workspaces",
-      environment: {
-        AGY_BIN: "/opt/agy/agy",
-        AGY_SKIP_DOWNLOAD: "1",
-        AGY_CONVERSATIONS_DIR: "/srv/agy/conversations",
-      },
-      credentialScope: "antigravity-oauth:test",
-    });
-
-    const both = loadHostAdapters("copilot", {
-      env: {
-        ...env,
-        AGY_ENABLED: "true",
-        AGY_CLI_PATH: managed.executable,
-        AGY_VERSION: "1.1.28",
-        AGY_SHA256: managed.sha256,
-        AGY_RUNTIME_ROOT: managed.runtimeRoot,
-      },
-      exists: () => true,
-    });
-    expect(both.get("agy")?.id).toBe("agy");
-    expect(both.get("agy-package")?.id).toBe("agy-package");
-    expect(both.has("agy-old")).toBe(false);
-
-    const neither = loadHostAdapters("copilot", {
-      env: { ...env, AGY_PACKAGE_ENABLED: "false" }, exists: () => true,
-    });
-    expect(neither.has("agy")).toBe(false);
-    expect(neither.has("agy-package")).toBe(false);
-    managed.cleanup();
-  });
 
   it("the deprecated rollback flag registers native agy, never agy-old", () => {
     const managed = createManagedAgyFixture({ version: "1.1.28" });

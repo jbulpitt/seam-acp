@@ -61,7 +61,7 @@ describe("model catalog architecture", () => {
     expect(contract).toContain("readonly catalog: AdapterCatalogSource");
     expect(source("packages/adapters/src/model-catalog.ts")).toContain("scope(): CatalogScope");
     expect(contract).not.toContain("readonly staticModels");
-    for (const profile of ["copilot", "claude", "codex", "agy", "agy-package", "grok"]) {
+    for (const profile of ["copilot", "claude", "codex", "agy", "grok"]) {
       expect(source(`packages/adapters/src/profiles/${profile}.ts`)).toMatch(/catalog:\s*(?:\{|manifestCatalogSource)/);
     }
   });

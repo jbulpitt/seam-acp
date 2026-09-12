@@ -194,7 +194,14 @@ describe("#361 missing the window refuses one reading and nothing else", () => {
   it("stops the probe process when the refresh is aborted mid-flight", async () => {
     // #361's other half: the old nested bounds were 30s + 15s + 10s and could
     // outlive the poller's own 30s deadline. The signal now reaches the spawn.
-    const { runtime, invocations } = agyFixture({ SEAM_AGY_MODELS_HOLD_MS: "30000" });
+    // The quota RPC must NEVER answer, or the probe finishes before the
+    // deadline can fire and the child is torn down by ordinary cleanup — which
+    // would make this test pass with or without the signal. An earlier draft
+    // did exactly that and a mutation dropping the poller's wiring survived it.
+    const { runtime, invocations } = agyFixture({
+      SEAM_AGY_MODELS_HOLD_MS: "30000",
+      SEAM_AGY_QUOTA_500S: "9999",
+    });
     const registry = new QuotaRegistry();
     const poller = new AgentQuotaPoller({
       logger: silent,
@@ -218,10 +225,13 @@ describe("#361 missing the window refuses one reading and nothing else", () => {
     });
 
     const result = await refresh;
-    expect(result.sources[0]?.agentId).toBe("agy");
+    // The deadline really fired — otherwise the rest proves nothing.
+    expect(result.sources[0]).toMatchObject({ agentId: "agy", outcome: "timed_out" });
     const alive = (value: number): boolean => {
       try { process.kill(value, 0); return true; } catch { return false; }
     };
-    await expect.poll(() => alive(pid), { timeout: 8_000, interval: 25 }).toBe(false);
+    // Without the signal the child lives to runBoundedProbe's own 15s bound,
+    // far past this window.
+    await expect.poll(() => alive(pid), { timeout: 6_000, interval: 25 }).toBe(false);
   }, 40_000);
 });

@@ -60,30 +60,61 @@ describe("bridge rollout target safety (#241)", () => {
     expect(() => resolveTarget(targets, "jennifer-laptop")).toThrow(/AGY-only/);
   });
 
-  it("keeps macbook-pro explicitly unmanaged and refuses every mutating phase before command construction (#282)", () => {
-    const target = targets.get("macbook-pro")!;
+  it("refuses every mutating phase for an explicitly unmanaged host, before command construction (#281, #282)", () => {
+    // Deliberately synthetic. This guard used to read `macbook-pro` out of the
+    // live target map, so enrolling that host once it HAD a verified SSH path
+    // (#342) invalidated the guard rather than the rule — the assertion broke
+    // while the behaviour it protects was untouched. The rule is about the
+    // unmanaged STATE, so assert it against an entry no rollout decision can
+    // reclassify.
+    const map = validateTargetMap({
+      schemaVersion: configured.schemaVersion,
+      targets: {
+        "unmanaged-host": {
+          sshAlias: null,
+          pm2App: null,
+          verifyAgent: null,
+          rolloutEnabled: false,
+          unmanagedReason: "no verified SSH management path",
+        },
+      },
+    });
+    const target = map.get("unmanaged-host")!;
     expect(target.sshAlias).toBeNull();
     expect(target.unmanagedReason).toMatch(/no verified SSH management path/);
     for (const argv of [
-      ["--target", "macbook-pro", "--stage", "--apply"],
-      ["--target", "macbook-pro", "--activate", "--sha", "a".repeat(40), "--checksum", "b".repeat(64), "--stage-id", token, "--apply"],
+      ["--target", "unmanaged-host", "--stage", "--apply"],
+      ["--target", "unmanaged-host", "--activate", "--sha", "a".repeat(40), "--checksum", "b".repeat(64), "--stage-id", token, "--apply"],
     ]) {
       const parsed = parseArgs(argv);
-      expect(() => resolveTarget(targets, parsed.target)).toThrow(/explicitly unmanaged.*home-hub is a distinct bridge/);
+      expect(() => resolveTarget(map, parsed.target)).toThrow(/explicitly unmanaged.*no verified SSH management path/);
     }
     expect(() => makeSshCommand(target, ["preflight"], "fixed-script")).toThrow(/explicitly unmanaged/);
     // #281: enrollment must refuse the same state. Recording a baseline for a
     // host with no verified management path would produce a rollback target
     // nobody could ever restore to — the inversion of the primitive's purpose.
     for (const argv of [
-      ["--target", "macbook-pro", "--enroll", "--apply"],
-      ["--target", "macbook-pro", "--restore-baseline", "--enrollment-id", token, "--apply"],
+      ["--target", "unmanaged-host", "--enroll", "--apply"],
+      ["--target", "unmanaged-host", "--restore-baseline", "--enrollment-id", token, "--apply"],
     ]) {
       const parsed = parseArgs(argv);
-      expect(() => resolveTarget(targets, parsed.target)).toThrow(/explicitly unmanaged/);
+      expect(() => resolveTarget(map, parsed.target)).toThrow(/explicitly unmanaged/);
     }
     expect(() => makeSshCommand(target, ["enroll", token, token], "fixed-script")).toThrow(/explicitly unmanaged/);
     expect(() => makeScpCommand(target, "/tmp/release.tgz", `${artifactName("a".repeat(40), "b".repeat(64))}.upload-${token}`)).toThrow(/explicitly unmanaged/);
+  });
+
+  it("records macbook-pro as managed now that it has a verified SSH path (#342)", () => {
+    // The state change the guard above deliberately no longer encodes.
+    // Enrolling was only legitimate BECAUSE the path now exists: a chisel
+    // reverse tunnel on port 2228 under pm2, with key auth from the server.
+    // #281's invariant — never record a baseline for a host nobody could
+    // restore to — is preserved by that fact, not by the host staying marked
+    // unmanaged.
+    const target = resolveTarget(targets, "macbook-pro");
+    expect(target.sshAlias).toBe("macbook-pro");
+    expect(target.rolloutEnabled).toBe(true);
+    expect(target.unmanagedReason ?? null).toBeNull();
   });
 
   it("surfaces the enrollment-specific reason behind the activation capability gate (#281)", () => {

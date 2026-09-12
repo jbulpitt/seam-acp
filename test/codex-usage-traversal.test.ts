@@ -147,7 +147,7 @@ describe("fetchCodexUsage bounded traversal", () => {
     for (let i = 0; i < 100; i++) {
       fs.writeFileSync(
         path.join(dir, `rollout-${String(i).padStart(3, "0")}.jsonl`),
-        `${i === 99 ? rateLimitLine("normal-fixture") : "{}"}\n`
+        `${rateLimitLine("normal-fixture")}\n`
       );
     }
     const startedAt = performance.now();

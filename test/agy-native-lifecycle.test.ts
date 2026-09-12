@@ -4,7 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { pino } from "pino";
 import { describe, it, expect, vi } from "vitest";
-import { makeAgyProfile, fetchAgyAcceptedModels } from "@seam/adapters";
+import { makeAgyProfile } from "@seam/adapters";
 import { AgentRuntime, type AgentEvent } from "../packages/core/src/agents/agent-runtime.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import { createManagedAgyFixture } from "./helpers/agy-runtime-fixture.js";
@@ -45,14 +45,6 @@ async function fixture(sandbox = false, timeoutSeconds = 10) {
 }
 
 describe.sequential("R5 native production lifecycle", () => {
-  it.each([1, 2])("preserves validator protocol output on ordinary nonzero exit %s", async (code) => {
-    const managed = createManagedAgyFixture({
-      source: path.join(fixtures, "fake-native-agy.mjs"), version: "agy fixture 1.1.28",
-      approvedEnvironment: { SEAM_AGY_CAPABILITY_FIXTURE_DIR: fixtures, SEAM_AGY_VALIDATOR_EXIT: String(code) },
-    });
-    try { expect([...await fetchAgyAcceptedModels(managed.runtime)]).toEqual(["Fixture Native Model", "Fixture Native Model (Low)"]); }
-    finally { managed.cleanup(); }
-  });
   it("persists only the safe native failure through the real catalog service", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "seam-agy-r5-durable-"));
     const managed = createManagedAgyFixture({

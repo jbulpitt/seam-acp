@@ -1291,7 +1291,7 @@ class AgyAgent implements Agent {
     // A turn without an exact model would let the native CLI consult global
     // settings; deleting this guard breaks isolation even if selection failed.
     if (!currentModel) throw new Error("AGY session has no model selection");
-    const maxTokens = currentModel?.maxTokens ?? 1_000_000;
+    const maxTokens = agyContextWindow(catalog, currentModel);
 
     // Linux limits each individual argv/envp string to MAX_ARG_STRLEN
     // (PAGE_SIZE * 32 = 131,072 bytes on x86-64), independent of the overall
@@ -2042,6 +2042,53 @@ function transformAgyText(text: string, cwd: string): string {
 // only to initialize a session that has no persisted choice. Every turn then
 // receives that session's exact runtime display name through `--model`.
 
+/**
+ * What we are willing to assume a context window is when nothing is known.
+ *
+ * 128,000 tokens. This is NOT a claim about any model — an unknown window is
+ * still published as `null` in the catalog (`catalog.fetch` omits
+ * `contextLimit` for an unenriched row). It is the largest window we are
+ * willing to ASSUME while sizing a live turn, which is a different question
+ * with a different failure mode.
+ *
+ * The asymmetry is the whole argument. This number becomes the `size` in
+ * `usage_update`, which is what the auto-compaction consumer reads as
+ * remaining headroom. Assume too much and a 200k-window model is driven past
+ * its limit and fails mid-turn, far from the cause — the silent-wrong-answer
+ * outcome `AGENTS.md` ranks worst. Assume too little and we compact earlier
+ * than strictly needed, costing some headroom and nothing else.
+ *
+ * 128,000 because it sits at or below the smallest window among the model
+ * families AGY advertises (Gemini, Claude, GPT-OSS), so a turn sized to it
+ * fits all of them, while still being large enough that ordinary turns never
+ * compact spuriously. Raising it trades a bounded, recoverable cost for an
+ * unbounded, silent one.
+ */
+export const AGY_ASSUMED_CONTEXT_WINDOW = 128_000;
+
+/**
+ * The window to size this turn against (#260).
+ *
+ * Evidence first: the model's own observed window, then the smallest window
+ * observed anywhere in THIS binding's catalog — a real number from a real
+ * sibling model beats a constant, and staying inside the smallest known window
+ * cannot overrun any of them. Only a catalog with no observed windows at all
+ * falls back to {@link AGY_ASSUMED_CONTEXT_WINDOW}.
+ *
+ * This replaced `?? 1_000_000`, which assumed the CEILING: correct for Gemini,
+ * five times over the limit for a 200k Claude window, and undetectable until
+ * the turn failed. #346 removes the guessing entirely by learning real windows
+ * from a real session's language server.
+ */
+export function agyContextWindow(
+  catalog: ReadonlyArray<AgyCatalogEntry>,
+  entry?: Pick<AgyCatalogEntry, "maxTokens">,
+): number {
+  if (entry?.maxTokens) return entry.maxTokens;
+  const known = catalog.map((row) => row.maxTokens).filter((value) => value > 0);
+  return known.length ? Math.min(...known) : AGY_ASSUMED_CONTEXT_WINDOW;
+}
+
 export interface AgyCatalogEntry {
   /** API id (e.g. "gemini-3-flash-agent") — what we put in ACP `modelId`. */
   modelId: string;
@@ -2058,58 +2105,40 @@ export interface AgyCatalogEntry {
   maxTokens: number;
 }
 
-/** Parse the authoritative model list printed after an invalid `--model`. */
-export function parseAgyAcceptedModels(output: string): Set<string> {
-  const lines = output.split(/\r?\n/);
-  const marker = lines.findIndex((line) => /Available models:/.test(line));
-  if (marker < 0) return new Set();
-
-  const accepted = new Set<string>();
-  for (const line of lines.slice(marker + 1)) {
-    if (line.trim() === "") break;
-    if (!/^\s/.test(line)) break;
-    accepted.add(line.trim());
-  }
-  return accepted;
-}
-
 /**
- * Ask agy's own `--model` validator for its accepted display names. The
- * deliberately invalid model exits non-zero; that exit is expected. Spawn,
- * timeout, and oversized-output failures return an empty set and never throw.
+ * Parse `agy models` stdout — one `<modelId>\t<displayName>` row per line.
+ *
+ * #260: this replaces a parser that read the list agy prints when `--model`
+ * is INVALID. That list was only reachable by running `agy -p ok --model
+ * __seam_probe_invalid__`, i.e. by starting a model turn and relying on an
+ * error path to abort it before the turn billed. `agy models` asks the same
+ * question directly, exits 0, and spends nothing.
+ *
+ * Tolerant of a space separator as well as a tab: the separator is a display
+ * detail of a CLI we do not control, and a name list is too valuable to lose
+ * to it. Rows without both fields are skipped rather than guessed at.
  */
-export async function fetchAgyAcceptedModels(runtime: AgyNativeRuntime): Promise<Set<string>> {
-  const args = [
-      "-p",
-      "ok",
-      AGY_NO_SLASH_EXPANSION,
-      "--model",
-      "__seam_probe_invalid__",
-      "--print-timeout",
-      "15s",
-      "--dangerously-skip-permissions",
-    ];
-  let output = "";
-  try {
-    return await runAgyProbe(runtime, args, 15_000, async (handle) => {
-      for await (const chunk of handle.stdout) output += chunk.toString();
-      await handle.completed;
-      return parseAgyAcceptedModels(output);
-    }, (proc) => {
-      // Validator diagnostics are protocol input here, never diagnostic output.
-      // The shared helper enforces its stderr bound before this listener runs.
-      let bytes = 0;
-      const capture = (chunk: Buffer): void => {
-        bytes += chunk.length;
-        if (bytes <= 256_000) output += chunk.toString();
-      };
-      proc.stderr.on("data", capture);
-      return () => { proc.stderr.removeListener("data", capture); };
-    }, true);
-  } catch (error) {
-    if (error instanceof ProbeError && error.code === "not_reaped") throw error;
-    return new Set();
+export function parseAgyModelsList(output: string): Array<{ modelId: string; rawDisplayName: string }> {
+  const rows: Array<{ modelId: string; rawDisplayName: string }> = [];
+  const seen = new Set<string>();
+  for (const line of output.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    const tabbed = /^([^\t]+)\t+(\S.*)$/.exec(trimmed);
+    // A tab is the observed separator and is unambiguous. A space is accepted
+    // only when the first token still LOOKS like a model id, so progress and
+    // error prose ("Fetching available models...", "CLI error: not signed in")
+    // cannot be mistaken for a model — a wrong id here would be published as a
+    // selectable model and then fail at turn time.
+    const spaced = tabbed ? null : /^([a-z0-9][a-z0-9._-]*) +(\S.*)$/.exec(trimmed);
+    const match = tabbed ?? spaced;
+    if (!match) continue;
+    const modelId = match[1]!.trim();
+    const rawDisplayName = match[2]!.trim();
+    if (!modelId || !rawDisplayName || seen.has(modelId)) continue;
+    seen.add(modelId);
+    rows.push({ modelId, rawDisplayName });
   }
+  return rows;
 }
 
 /** Finite discovery uses the shared lifecycle, retaining R4's current protocol. */
@@ -2138,47 +2167,6 @@ async function runAgyProbe<T>(
     // Do not keep the validator parser/output alive after finite finalization.
     stopObserving?.();
   }
-}
-
-const acceptedModelsPromises = new Map<string, Promise<Set<string>>>();
-
-function getAcceptedModels(runtime: AgyNativeRuntime): Promise<Set<string>> {
-  const cached = acceptedModelsPromises.get(runtime.identityKey);
-  if (cached) return cached;
-  const p = fetchAgyAcceptedModels(runtime)
-    .then((models) => {
-      if (models.size === 0) {
-        acceptedModelsPromises.delete(runtime.identityKey);
-        console.warn(
-          "[agy] accepted-model probe returned no models — not caching; will retry"
-        );
-      }
-      return models;
-    })
-    .catch((err) => {
-      acceptedModelsPromises.delete(runtime.identityKey);
-      console.warn("[agy] accepted-model probe failed");
-      if (err instanceof ProbeError && err.code === "not_reaped") throw err;
-      return new Set<string>();
-    });
-  acceptedModelsPromises.set(runtime.identityKey, p);
-  return p;
-}
-
-/** Keep only LS rows the CLI validator accepts, with fail-open guards. */
-export function filterAgyCatalogByAcceptedModels(
-  rows: ReadonlyArray<AgyCatalogEntry>,
-  accepted: ReadonlySet<string>
-): AgyCatalogEntry[] {
-  if (accepted.size === 0) return [...rows];
-  const filtered = rows.filter((row) => accepted.has(row.rawDisplayName));
-  if (rows.length > 0 && filtered.length === 0) {
-    console.warn(
-      `[agy] accepted-model probe matched none of ${rows.length} catalog rows — using unfiltered catalog`
-    );
-    return [...rows];
-  }
-  return filtered;
 }
 
 /** Resolve a requested model, falling back only to entries in the live catalog. */
@@ -2234,7 +2222,7 @@ function catalogFallback(error: unknown): AgyCatalogEntry[] {
 function getCatalogRows(runtime: AgyNativeRuntime): Promise<AgyCatalogEntry[]> {
   const cached = catalogRowsPromises.get(runtime.identityKey);
   if (cached) return cached;
-  const p = fetchAgyCatalog(runtime)
+  const p = fetchAgyModelCatalog(runtime)
     .then((rows) => {
       // Don't PIN an empty result. A cold-start LS (or any transient empty
       // response) would otherwise poison this module-level cache for the whole
@@ -2258,11 +2246,20 @@ function getCatalogRows(runtime: AgyNativeRuntime): Promise<AgyCatalogEntry[]> {
   return p;
 }
 
+/**
+ * The binding's catalog.
+ *
+ * #260: this used to intersect two hidden prompt probes — a language-server
+ * model list obtained by running `agy -p ok`, filtered by an accepted-name
+ * list obtained by running `agy -p ok --model __seam_probe_invalid__`. Two
+ * model turns to learn a list of models, invisible at this call site.
+ *
+ * `agy models` answers both questions without a prompt, so the intersection is
+ * gone: the ids it prints ARE the selectable ids. Rich metadata is enriched
+ * opportunistically from the same prompt-free process and is never required.
+ */
 async function getCatalog(runtime: AgyNativeRuntime): Promise<AgyCatalogEntry[]> {
-  const rows = await getCatalogRows(runtime);
-  if (rows.length === 0) return rows;
-  const accepted = await getAcceptedModels(runtime);
-  return filterAgyCatalogByAcceptedModels(rows, accepted);
+  return getCatalogRows(runtime);
 }
 
 /** Snapshot of the agy CLI's "Models & Quota" data. */
@@ -2354,6 +2351,13 @@ export async function fetchAgyUserStatus(runtime: AgyNativeRuntime): Promise<Agy
   }
   const logFile = await newSpawnLogPath();
   try {
+    // KNOWN REMAINING PROMPT PROBE (#260). Quota lives behind the same
+    // language server as the catalog did, and this still pays a model turn to
+    // start one. The catalog no longer does — `agy models` starts an LS
+    // without prompting — so the same technique should work here, but quota
+    // semantics belong to #345 and changing them is not this story's scope.
+    // Left named rather than silently inherited: a probe nobody can see is how
+    // this one survived two rounds of catalog work.
     return await runAgyProbe(runtime, ["-p", "ok", AGY_NO_SLASH_EXPANSION, "--log-file", logFile, "--print-timeout", "30s", "--dangerously-skip-permissions"], 30_000, async (handle) => {
     handle.stdout.resume();
     const ls = await discoverAgyLs({
@@ -2391,43 +2395,48 @@ export async function fetchAgyUserStatus(runtime: AgyNativeRuntime): Promise<Agy
   }
 }
 
-async function fetchAgyCatalog(runtime: AgyNativeRuntime): Promise<AgyCatalogEntry[]> {
-  // Spawn a tiny agy turn just to bring the LS up. The "ok" prompt produces
-  // a few tokens of throwaway output; the cost is acceptable given the result
-  // is cached for the process lifetime.
+/**
+ * Build the native catalog WITHOUT starting a model turn (#260).
+ *
+ * What this replaces: `agy -p ok … --print-timeout 30s`, spawned purely to
+ * bring the local language server up so `GetAvailableModels` could be queried
+ * over HTTP, plus a second `agy -p ok --model __seam_probe_invalid__` whose
+ * accepted-name list was intersected with the first. Two model turns to learn
+ * a list of models, neither visible at the call site.
+ *
+ * `agy models` asks for the list directly: exit 0, one
+ * `<modelId>\t<displayName>` row per model, no prompt, nothing billed. The
+ * intersection is gone rather than reimplemented — the ids it prints ARE the
+ * selectable ids, which is what the validator probe was there to confirm.
+ *
+ * What it deliberately does NOT do is fetch context windows, thinking support
+ * or a recommended flag. Those live in the language server, and the server
+ * this subcommand starts is not answerable prompt-free: measured on agy
+ * 1.1.27, the port appears ~124ms in and `GetAvailableModels` returns HTTP 400
+ * for the whole ~2s the process lives, because the catalog RPC needs a warmup
+ * the old probe bought with `--print-timeout 30s`. Trying anyway produced a
+ * catalog whose metadata depended on who won a race. So every such field stays
+ * UNKNOWN here — `maxTokens: 0`, which `catalog.fetch` omits rather than
+ * publishing as a guessed `contextLimit` — and #346 learns the real values
+ * from a session's own long-lived server.
+ */
+async function fetchAgyModelCatalog(runtime: AgyNativeRuntime): Promise<AgyCatalogEntry[]> {
   const logFile = await newSpawnLogPath();
   try {
-    return await runAgyProbe(runtime, ["-p", "ok", AGY_NO_SLASH_EXPANSION, "--log-file", logFile, "--print-timeout", "30s", "--dangerously-skip-permissions"], 30_000, async (handle) => {
-    handle.stdout.resume();
-    const ls = await discoverAgyLs({
-      logFile,
-      timeoutMs: 15_000,
-      signal: handle.signal,
-    });
-    const url = `http://localhost:${ls.port}/exa.language_server_pb.LanguageServerService/GetAvailableModels`;
-    // The LS answers as soon as it's discovered, but its model catalog finishes
-    // loading a beat later (~1-2s): query too early and `response.models` is
-    // empty/internal-only, so parseAgyCatalog yields nothing — which the caller
-    // then refuses to cache, leaving the picker permanently empty. Poll until
-    // the catalog has usable models. Returns whatever we last parsed if warmup
-    // never completes within the deadline (caller treats [] as "retry later").
-    const deadline = Date.now() + 12_000;
-    let last: AgyCatalogEntry[] = [];
-    for (;;) {
-      const res = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: "{}",
-        signal: handle.signal,
-      });
-      if (res.ok) {
-        const json = (await readAgyJsonResponse(res)) as { response?: { models?: Record<string, AgyRawModel> } };
-        last = parseAgyCatalog(json);
-        if (last.length > 0) return last;
-      } else await res.body?.cancel();
-      if (Date.now() >= deadline) return last;
-      await delay(400, undefined, { signal: handle.signal });
-    }
+    return await runAgyProbe(runtime, ["--log-file", logFile, "models"], 30_000, async (handle) => {
+      let output = "";
+      for await (const chunk of handle.stdout) output += chunk.toString();
+      await handle.completed;
+      return dedupeAgyDisplayNames(parseAgyModelsList(output).map((row) => ({
+        modelId: row.modelId,
+        rawDisplayName: row.rawDisplayName,
+        displayName: cleanAgyDisplayName(row.rawDisplayName),
+        ctx: formatTokens(0),
+        recommended: false,
+        supportsThinking: false,
+        supportsImages: false,
+        maxTokens: 0,
+      })));
     });
   } finally {
     await fs.unlink(logFile).catch(() => {});
@@ -2443,37 +2452,26 @@ interface AgyRawModel {
   isInternal?: boolean;
 }
 
-function parseAgyCatalog(json: { response?: { models?: Record<string, AgyRawModel> } }): AgyCatalogEntry[] {
-  const models = json.response?.models ?? {};
-  const rows: AgyCatalogEntry[] = [];
-  for (const [id, m] of Object.entries(models)) {
-    if (m.isInternal || !m.displayName) continue;
-    rows.push({
-      modelId: id,
-      rawDisplayName: m.displayName,
-      displayName: cleanAgyDisplayName(m.displayName),
-      ctx: formatTokens(m.maxTokens ?? 0),
-      recommended: !!m.recommended,
-      supportsThinking: !!m.supportsThinking,
-      supportsImages: !!m.supportsImages,
-      maxTokens: m.maxTokens ?? 0,
-    });
-  }
-  // Antigravity ships multiple ids with the same displayName (rebrand aliases
-  // and stale labels). Pick the id whose slug best matches the displayName so
-  // the picker doesn't show literal duplicates.
+/**
+ * Antigravity ships several ids under one display name (rebrand aliases and
+ * stale labels), and the picker shows names. Keep the id whose slug best
+ * matches its own display name, and order recommended first. Carried over from
+ * the language-server parser #260 removed — the duplicates are a property of
+ * the provider's naming, not of how the list was obtained.
+ */
+function dedupeAgyDisplayNames(rows: ReadonlyArray<AgyCatalogEntry>): AgyCatalogEntry[] {
   const byName = new Map<string, AgyCatalogEntry>();
-  const slug = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, "");
-  const score = (r: AgyCatalogEntry) => {
-    const a = slug(r.rawDisplayName);
-    const b = slug(r.modelId);
-    let s = 0;
-    for (let i = 0; i < Math.min(a.length, b.length); i++) if (a[i] === b[i]) s++;
-    return s;
+  const slug = (value: string) => value.toLowerCase().replace(/[^a-z0-9]/g, "");
+  const score = (row: AgyCatalogEntry) => {
+    const a = slug(row.rawDisplayName);
+    const b = slug(row.modelId);
+    let matched = 0;
+    for (let i = 0; i < Math.min(a.length, b.length); i++) if (a[i] === b[i]) matched++;
+    return matched;
   };
-  for (const r of rows) {
-    const prev = byName.get(r.rawDisplayName);
-    if (!prev || score(r) > score(prev)) byName.set(r.rawDisplayName, r);
+  for (const row of rows) {
+    const prev = byName.get(row.rawDisplayName);
+    if (!prev || score(row) > score(prev)) byName.set(row.rawDisplayName, row);
   }
   return [...byName.values()].sort(
     (a, b) => Number(b.recommended) - Number(a.recommended) || a.displayName.localeCompare(b.displayName),

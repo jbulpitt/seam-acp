@@ -18,6 +18,14 @@ const argValue = (flag) => {
   return index >= 0 ? args[index + 1] : undefined;
 };
 const prompt = argValue("-p") ?? "";
+/**
+ * #260: the catalog is now discovered with `agy models`, which takes no prompt.
+ * Row shape is the observed one from agy 1.1.27 — `<modelId>\t<displayName>`,
+ * one per line, after a "Fetching available models..." progress line — and the
+ * subcommand also brings a language server up, which is how the rich metadata
+ * is still reachable without paying for a turn.
+ */
+const isModelsCommand = args.includes("models");
 const logFile = argValue("--log-file");
 const resumedConversation = argValue("--conversation");
 const schemaFile = argValue("--json-schema");
@@ -41,7 +49,7 @@ if (argValue("--model") === "__seam_probe_invalid__") {
   process.exit(Number(process.env.SEAM_AGY_VALIDATOR_EXIT ?? 1));
 }
 
-const scenarioFile = prompt === "ok"
+const scenarioFile = prompt === "ok" || isModelsCommand
   ? undefined
   : prompt.includes("capability-model-") && prompt.includes("-resume")
     ? "turn-two-resume.json"
@@ -57,7 +65,7 @@ const scenarioFile = prompt === "ok"
           ? "interrupted-turn.json"
           : undefined;
 
-if (prompt !== "ok" && !scenarioFile) {
+if (prompt !== "ok" && !isModelsCommand && !scenarioFile) {
   process.stderr.write("unknown sanitized fixture prompt\n");
   process.exit(2);
 }
@@ -89,7 +97,7 @@ appendInvocation({
   cwd: process.cwd(),
 });
 
-if (prompt === "r5-exit" || (prompt === "ok" && process.env.SEAM_AGY_R5_CATALOG_MODE === "fail")) {
+if (prompt === "r5-exit" || ((prompt === "ok" || isModelsCommand) && process.env.SEAM_AGY_R5_CATALOG_MODE === "fail")) {
   process.stderr.write(`private diagnostic synthetic-password ${process.env.HOME}\n`);
   process.exit(3);
 }
@@ -208,6 +216,18 @@ server.listen(0, "127.0.0.1", () => {
     `Language server listening on random port at ${address.port} for HTTP\n` +
       `Created conversation ${conversationId}\n`,
   );
+  if (!isModelsCommand) return;
+  // Matches the observed CLI: print the rows, exit. The language server this
+  // started dies with the process and never answers GetAvailableModels in that
+  // window, which is why #260 takes ids and names only.
+  process.stdout.write(
+    "Fetching available models...\n" +
+    "fixture-native-model\tFixture Native Model\n" +
+    "fixture-native-model-low\tFixture Native Model (Low)\n"
+  );
+  server.close();
+  server.closeAllConnections?.();
+  process.exit(0);
 });
 
 let terminating = false;

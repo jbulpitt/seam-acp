@@ -1,8 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   agyExecutionPolicyArgs,
-  filterAgyCatalogByAcceptedModels,
-  parseAgyAcceptedModels,
+  parseAgyModelsList,
   resolveAgyModel,
   selectAgyTurnModel,
   type AgyCatalogEntry,
@@ -69,72 +68,40 @@ function catalogEntry(
   };
 }
 
-describe("parseAgyAcceptedModels", () => {
-  it("parses the 14 exact display names from agy's validator output", () => {
-    const output = [
-      "invalid model selection: __seam_probe_invalid__ is not recognized",
-      "Available models:",
-      ...ACCEPTED_MODELS.map((model) => `  ${model}`),
-      "",
-    ].join("\n");
-    expect(parseAgyAcceptedModels(output)).toEqual(new Set(ACCEPTED_MODELS));
-  });
+describe("parseAgyModelsList", () => {
+  // Observed shape, agy 1.1.27 on Linux: a progress line, then one
+  // `<modelId>\t<displayName>` row per model, exit 0, no prompt.
+  const observed = [
+    "Fetching available models...",
+    "gemini-3.8-flash-high\tGemini 3.8 Flash (High)",
+    "gemini-3.1-pro-high\tGemini 3.1 Pro (High)",
+    "claude-opus-4-6-thinking\tClaude Opus 4.6 (Thinking)",
+  ].join("\n");
 
-  it("returns an empty set when the marker is absent", () => {
-    expect(parseAgyAcceptedModels("invalid model, but no catalog followed")).toEqual(
-      new Set()
-    );
-  });
-
-  it("ignores trailing junk after the accepted-model block", () => {
-    const output = [
-      "Available models:",
-      "  Gemini 3.7 Flash (High)",
-      "  Claude Opus 4.6 (Thinking)",
-      "",
-      "traceback: unrelated trailing diagnostics",
-      "  Gemini 2.5 Pro",
-    ].join("\n");
-    expect(parseAgyAcceptedModels(output)).toEqual(
-      new Set(["Gemini 3.7 Flash (High)", "Claude Opus 4.6 (Thinking)"])
-    );
-  });
-});
-
-describe("filterAgyCatalogByAcceptedModels", () => {
-  const rows = [
-    catalogEntry("gemini-3.7-flash-high", "Gemini 3.7 Flash (High)", true),
-    catalogEntry("claude-opus-4.6-thinking", "Claude Opus 4.6 (Thinking)"),
-    catalogEntry("gemini-3.1-flash-lite", "Gemini 3.1 Flash Lite"),
-    catalogEntry("gemini-2.5-pro", "Gemini 2.5 Pro"),
-    catalogEntry("unknown", "?"),
-  ];
-
-  it("intersects polluted LS rows with exact CLI-accepted display names", () => {
-    const filtered = filterAgyCatalogByAcceptedModels(
-      rows,
-      new Set(["Gemini 3.7 Flash (High)", "Claude Opus 4.6 (Thinking)"])
-    );
-    expect(filtered.map((row) => row.rawDisplayName)).toEqual([
-      "Gemini 3.7 Flash (High)",
-      "Claude Opus 4.6 (Thinking)",
+  it("reads ids and display names and ignores the progress line", () => {
+    expect(parseAgyModelsList(observed)).toEqual([
+      { modelId: "gemini-3.8-flash-high", rawDisplayName: "Gemini 3.8 Flash (High)" },
+      { modelId: "gemini-3.1-pro-high", rawDisplayName: "Gemini 3.1 Pro (High)" },
+      { modelId: "claude-opus-4-6-thinking", rawDisplayName: "Claude Opus 4.6 (Thinking)" },
     ]);
   });
 
-  it("fails open when the accepted-model probe returns empty", () => {
-    expect(filterAgyCatalogByAcceptedModels(rows, new Set())).toEqual(rows);
+  it("tolerates a space separator and skips rows missing either field", () => {
+    // The separator is a display detail of a CLI we do not control; losing the
+    // whole list to it would be a much worse outcome than accepting both.
+    expect(parseAgyModelsList("model-a Model A\nnoseparator\n\n  \n")).toEqual([
+      { modelId: "model-a", rawDisplayName: "Model A" },
+    ]);
   });
 
-  it("warns and fails open when no accepted name matches the catalog", () => {
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    const filtered = filterAgyCatalogByAcceptedModels(
-      rows,
-      new Set(["Future Model With An Unexpected Name"])
-    );
-    expect(filtered).toEqual(rows);
-    expect(filtered).not.toHaveLength(0);
-    expect(warn).toHaveBeenCalledWith(expect.stringMatching(/matched none/));
-    warn.mockRestore();
+  it("keeps the first row for a duplicated id", () => {
+    expect(parseAgyModelsList("a\tFirst\na\tSecond")).toEqual([
+      { modelId: "a", rawDisplayName: "First" },
+    ]);
+  });
+
+  it("returns nothing rather than guessing when the output is prose", () => {
+    expect(parseAgyModelsList("CLI error: not signed in")).toEqual([]);
   });
 });
 

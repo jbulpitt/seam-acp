@@ -400,7 +400,7 @@ describe("Codex async user-input bridge", () => {
       session: reason === "isolated_session" ? "isolated" : "live",
     });
     expect(result).toEqual({ ok: false, reason });
-    expect(h.adapter.messages.join(" ")).toContain(`[${reason}]`);
+    expect(JSON.stringify([h.adapter.messages, h.adapter.cards])).toContain(`[${reason}]`);
     expect(logs).toContainEqual(expect.objectContaining({ reason, msg: "async elicitation refused" }));
     expect(JSON.stringify(logs)).not.toMatch(/API key|private-provider-body|Proceed\?/);
   });
@@ -422,6 +422,28 @@ describe("Codex async user-input bridge", () => {
       ts.forEachChild(node, visit);
     }
     visit(source); expect(found).toBe(true);
+  });
+
+  // Protects diagnostics when Discord itself refuses the notice: the named
+  // cause must survive in logs and the question must not abort the turn.
+  it.each([false, true])("logs a named failed refusal notice (form=%s)", async form => {
+    const h = makeHarness(dir, [{ title: "unused", options: null }]);
+    harnesses.push(h);
+    const record = h.router.ensureSessionRecord({ platform: "discord", channelRef: THREAD, cwd: dir });
+    record.acpSessionId = ACP_SESSION;
+    h.store.upsert(record);
+    const logs: unknown[] = [];
+    const logger = pino({ level: "warn" }, { write: line => { logs.push(JSON.parse(line)); } }) as unknown as Logger;
+    h.adapter.sendMessage = async () => { throw Error("private transport payload"); };
+    h.adapter.sendElicitationCard = async () => { throw Error("private transport payload"); };
+    const manager = new ElicitationManager({ store: h.store, adapter: h.adapter, logger, currentUserId: () => undefined });
+    const reason = form ? "invalid_form" : "missing_responder";
+    await expect(manager.createCodexAsync(record, { itemId: "item", turnId: "turn", threadId: ACP_SESSION,
+      questions: [{ title: form ? "API key" : "Proceed?", options: null }] }, {
+      responderUserId: form ? USER : undefined, session: "live",
+    })).resolves.toEqual({ ok: false, reason });
+    expect(logs).toContainEqual(expect.objectContaining({ reason, msg: "async elicitation refusal notice failed" }));
+    expect(JSON.stringify(logs)).not.toContain("private transport payload");
   });
 
   it("strictly accepts the reviewed metadata shape and rejects sensitive/ambiguous additions", () => {
@@ -561,8 +583,10 @@ describe("Codex async user-input bridge", () => {
     harnesses.push(harness);
     await harness.adapter.message();
     expect(harness.store.listOpenElicitations()).toEqual([]);
-    expect(harness.adapter.cards).toHaveLength(0);
-    expect(harness.adapter.messages.join(" ")).toContain("[invalid_form]");
+    expect(harness.adapter.cards).toHaveLength(1);
+    expect(harness.adapter.cards[0]!.card.panel.title).toBe("Input request unavailable");
+    expect(harness.adapter.cards[0]!.card.panel.fields[0]!.value).toMatch(/Sensitive/);
+    expect(harness.adapter.cards[0]!.card.panel.fields[0]!.value).toContain("[invalid_form]");
     expect(harness.adapter.messages.join(" ")).not.toContain("API key");
   });
 

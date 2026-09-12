@@ -531,7 +531,7 @@ export class ElicitationManager {
     const request = codexAsyncForm(input);
     const checked = validateFormRequest(request);
     if (!checked.ok) {
-      return this.refuseCodexAsync(record, "invalid_form");
+      return this.refuseCodexAsync(record, "invalid_form", { message: request.message, error: checked.error });
     }
     const now = this.now();
     const row: ElicitationRow & { status: "open" } = {
@@ -592,15 +592,23 @@ export class ElicitationManager {
   }
 
   private async refuseCodexAsync(
-    record: SessionRecord, reason: CodexAsyncRefusalReason
+    record: SessionRecord, reason: CodexAsyncRefusalReason,
+    form?: { message: string; error: string }
   ): Promise<Extract<CodexAsyncAdmission, { ok: false }>> {
     // No question, answer, or transport error bodies: they may contain secrets.
     this.logger.warn({ reason, sessionRecordId: record.id }, "async elicitation refused");
     try {
-      await this.adapter.sendMessage(
-        { platform: record.platform, id: record.channelRef, ...(record.parentRef ? { parentId: record.parentRef } : {}) },
-        `⚠️ Async question unavailable [${reason}]. ${CODEX_ASYNC_REFUSALS[reason]} The turn can continue.`
-      );
+      if (form) {
+        // Preserve the existing human invalid-form card, adding the named reason.
+        if (!await this.postRefusal(record, form.message, `[${reason}] ${form.error}`)) {
+          throw new Error("refusal_notice_failed");
+        }
+      } else {
+        await this.adapter.sendMessage(
+          { platform: record.platform, id: record.channelRef, ...(record.parentRef ? { parentId: record.parentRef } : {}) },
+          `⚠️ Async question unavailable [${reason}]. ${CODEX_ASYNC_REFUSALS[reason]} The turn can continue.`
+        );
+      }
     } catch {
       this.logger.warn({ reason, sessionRecordId: record.id }, "async elicitation refusal notice failed");
     }
@@ -995,7 +1003,7 @@ export class ElicitationManager {
     return { ok: true, value: JSON.stringify({ requestId: request.requestId }) };
   }
 
-  private async postRefusal(record: SessionRecord, message: string, error: string): Promise<void> {
+  private async postRefusal(record: SessionRecord, message: string, error: string): Promise<boolean> {
     const channel = {
       platform: record.platform,
       id: record.channelRef,
@@ -1009,10 +1017,11 @@ export class ElicitationManager {
       footer: "No answer was collected. Sensitive information must use a secure URL request.",
     };
     if (this.adapter.sendElicitationCard) {
-      await this.adapter.sendElicitationCard(channel, { panel }).catch(() => {});
-    } else {
-      await this.adapter.sendPanel?.(channel, panel).catch(() => {});
+      return this.adapter.sendElicitationCard(channel, { panel }).then(() => true, () => false);
     }
+    return this.adapter.sendPanel
+      ? this.adapter.sendPanel(channel, panel).then(() => true, () => false)
+      : false;
   }
 
   private render(row: ElicitationRow, known?: ValidatedForm | URL): ElicitationCardPost {

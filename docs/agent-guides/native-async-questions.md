@@ -34,7 +34,8 @@ new work; do not replay completed work to supply an owner.
 `createCodexAsync` returns a discriminated result, never a bare boolean:
 `{ok:true,status:"created"|"duplicate"}` or `{ok:false,reason}`. Each refusal
 logs `async elicitation refused` with the reason and session-record id, and sends
-a text notice to the question's target thread. Question/answer bodies and raw
+a text notice to the question's target thread (preserving the existing refusal
+card for invalid forms, with the named reason added). Question/answer bodies and raw
 transport errors are not logged. If the notice itself fails, the named reason
 remains in `async elicitation refusal notice failed`.
 

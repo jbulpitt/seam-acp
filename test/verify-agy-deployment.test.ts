@@ -29,6 +29,7 @@ import path from "node:path";
 import {
   AGY_DEPLOYMENT_PINS,
   canonicalExecutable,
+  formatDeploymentReport,
   readOnlyIo,
   resolvePinSources,
   verifyAgyDeployment,
@@ -38,6 +39,15 @@ const roots: string[] = [];
 
 afterEach(() => {
   for (const root of roots.splice(0)) {
+    // Only two tests harden directories to 0555, so try the cheap removal first
+    // and walk chmod'ing only if that fails. The unconditional recursive walk
+    // this replaced was enough extra filesystem churn to tip already-marginal
+    // timing tests elsewhere in the suite over their budgets when scheduled
+    // alongside this file — see the PR for the run-by-run evidence.
+    try {
+      fs.rmSync(root, { recursive: true, force: true });
+      continue;
+    } catch { /* a 0555 directory is in the way; relax and retry */ }
     const relax = (dir: string): void => {
       let entries: fs.Dirent[] = [];
       try {
@@ -83,6 +93,8 @@ function host(opts: {
   mode?: number;
   body?: Buffer;
   omitPins?: string[];
+  /** Stage in `<parent>-backup`: a sibling that shares the parent's prefix. */
+  siblingOfParent?: boolean;
 } = {}): Host {
   const {
     underHome = false, pinsInFile = true, version = "1.1.28",
@@ -93,7 +105,9 @@ function host(opts: {
 
   const runtimeParent = path.join(root, "opt", "seam", "agy-runtime");
   const homeParent = path.join(root, "home", "seam", ".seam", "agy-runtime");
-  const runtimeRoot = underHome ? homeParent : runtimeParent;
+  const runtimeRoot = opts.siblingOfParent
+    ? `${runtimeParent}-backup`
+    : underHome ? homeParent : runtimeParent;
 
   const digest = createHash("sha256").update(body).digest("hex");
   const release = path.join(runtimeRoot, digest);
@@ -387,6 +401,36 @@ describe("#265 no version policy", () => {
     expect(report.observed.version).toBe("1.2.2");
     expect(report.verdict).toBe("pass");
     expect(JSON.stringify(report.checks)).not.toContain("1.2.2");
+  });
+});
+
+describe("#265 mutation survivors, closed", () => {
+  it("requires these six pins by name, not whatever the constant happens to list", () => {
+    // Asserting against AGY_DEPLOYMENT_PINS made the earlier check circular:
+    // dropping AGY_ENABLED from the constant changed the expectation with it.
+    expect([...AGY_DEPLOYMENT_PINS]).toEqual([
+      "AGY_RUNTIME_ROOT", "AGY_SHA256", "AGY_CLI_PATH",
+      "AGY_VERSION", "AGY_DEFAULT_MODEL", "AGY_ENABLED",
+    ]);
+  });
+
+  it("refuses a sibling of the managed parent, not merely a string that starts like it", () => {
+    // The runtime root is `<parent>-backup`, which a string prefix test accepts
+    // as being inside `<parent>` and a component test does not. The direction
+    // matters: the root has to be the sibling, not the parent.
+    const h = host({ siblingOfParent: true });
+    expect(h.runtimeRoot).toBe(`${h.runtimeParent}-backup`);
+    const report = verdictFor(h);
+    expect(byId(report, "runtime-root-managed").reasonCode)
+      .toBe("runtime_root_outside_managed_parent");
+  });
+
+  it("says in the text report how many checks it did not cover", () => {
+    // The skipped count is the honesty property of the default run: without it
+    // a reader sees only passes and concludes the host is fully verified.
+    const text = formatDeploymentReport(verdictFor(host()));
+    expect(text).toContain("1 check(s) skipped");
+    expect(text).toContain("host was not modified");
   });
 });
 

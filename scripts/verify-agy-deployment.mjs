@@ -174,8 +174,12 @@ export function verifyAgyDeployment(options, io = readOnlyIo()) {
         `AGY_CLI_PATH is ${cliPath}, expected ${expected}`, "cli_path_not_canonical"));
 
     const managed = path.resolve(runtimeParent);
-    const withinManaged = path.resolve(runtimeRoot) === managed
-      || path.resolve(runtimeRoot).startsWith(`${managed}${path.sep}`);
+    // Containment by path components, not by string prefix: a bare
+    // `startsWith` admits `/opt/seam/agy-runtime-backup`, which is a sibling of
+    // the managed parent rather than a child of it. Found by mutation.
+    const relative = path.relative(managed, path.resolve(runtimeRoot));
+    const withinManaged = relative === ""
+      || (!relative.startsWith("..") && !path.isAbsolute(relative));
     checks.push(withinManaged
       ? check("runtime-root-managed", "pass", `AGY_RUNTIME_ROOT is under ${managed}`)
       : check("runtime-root-managed", "fail",

@@ -790,9 +790,17 @@ export class DispatchWatcher {
    *  outcome. Invoked by `tick` in arrival order, so the synchronous
    *  `queueFor(target).run(...)` enqueue below preserves same-target order. */
   private async runSpec(id: string, spec: DispatchSpec, owner: ClaimOwnership): Promise<void> {
+    // #409: this is SELECTION, not execution. The turn is about to be enqueued
+    // on its target's SerialQueue and may sit there for minutes behind another
+    // turn — `294ba576` waited 13.5 of them. `turn_attempts` reports it
+    // `state=pending` for that whole wait, which is correct, and this line used
+    // to say "running", which was not. The schema already draws the
+    // distinction; the log now uses the schema's word for it. `attempts.admit()`
+    // is what just happened a few lines above, and it leaves the row `pending`.
+    const admittedAt = Date.now();
     this.logger.info(
       { id, target: spec.target, session: spec.session, correlationId: spec.correlationId },
-      "dispatch: running"
+      "dispatch: admitted"
     );
 
     await this.queueFor(spec.target).run(async () => {
@@ -839,6 +847,24 @@ export class DispatchWatcher {
           ? { originPrompt: spec.prompt.slice(0, DONE_ORIGIN_PROMPT_MAX) }
           : {}),
       };
+      // #409: execution actually begins here, and this is the last point the
+      // watcher controls before it. `onDispatch` calls `turnAttempts.claim()`,
+      // which is the write that flips the row `pending` -> `active`, so this
+      // line and that state change are the same moment to within the call.
+      //
+      // `queuedMs` is the quantity the whole issue is about: it turns "admitted
+      // at 12:28:00, running at 12:41:32" into one readable number, so a reader
+      // asking "is this turn stuck?" does not have to diff two timestamps
+      // across a busy journal. A turn that is admitted and has no `running`
+      // line yet is queued, and now says so by its absence.
+      this.logger.info(
+        {
+          id, target: spec.target, session: spec.session,
+          ...(spec.correlationId ? { correlationId: spec.correlationId } : {}),
+          queuedMs: Date.now() - admittedAt,
+        },
+        "dispatch: running"
+      );
       try {
         const { output, stopReason } = await this.onDispatch(spec);
         const committed = await this.finishOwned(owner, {

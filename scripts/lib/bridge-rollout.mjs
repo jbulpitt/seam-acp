@@ -11,7 +11,7 @@ const CHECKSUM = /^[0-9a-f]{64}$/;
 const TOKEN = /^[0-9a-f]{64}$/;
 const TARGET_KEYS = new Set([
   "sshAlias", "pm2App", "verifyAgent", "checkoutPath", "entrypointPath",
-  "pidFilePath", "expectedUid", "nodePath", "pm2ModulePath", "workspaceArg",
+  "expectedUid", "nodePath", "pm2ModulePath", "workspaceArg",
   "devMode", "releaseRoot", "rolloutEnabled", "unmanagedReason",
 ]);
 const SAFE_REASON = /^[A-Za-z0-9][A-Za-z0-9 .,:;#/_()-]{0,255}$/;
@@ -53,7 +53,7 @@ export function validateTargetMap(input) {
     if (!SAFE_NAME.test(value.verifyAgent ?? "")) throw new Error(`unsafe verification agent for ${bridgeId}`);
     if (!Number.isInteger(value.expectedUid) || value.expectedUid < 1 || value.expectedUid > 0x7fffffff) throw new Error(`unsafe expected UID for ${bridgeId}`);
     if (typeof value.devMode !== "boolean") throw new Error(`missing devMode identity for ${bridgeId}`);
-    for (const key of ["checkoutPath", "entrypointPath", "pidFilePath", "nodePath", "pm2ModulePath", "releaseRoot"]) exactAbsolute(value[key], `${key} for ${bridgeId}`);
+    for (const key of ["checkoutPath", "entrypointPath", "nodePath", "pm2ModulePath", "releaseRoot"]) exactAbsolute(value[key], `${key} for ${bridgeId}`);
     if (value.workspaceArg !== null) exactAbsolute(value.workspaceArg, `workspaceArg for ${bridgeId}`);
     if (value.entrypointPath !== `${value.checkoutPath}/packages/bridge/dist/index.js`) throw new Error(`entrypoint is not the managed stable launcher for ${bridgeId}`);
     if (value.releaseRoot === value.checkoutPath || value.releaseRoot.startsWith(`${value.checkoutPath}/`) || value.checkoutPath.startsWith(`${value.releaseRoot}/`)) {
@@ -136,7 +136,7 @@ export function parseArgs(argv) {
 function targetArgs(target) {
   return [
     target.bridgeId, target.pm2App, target.verifyAgent, String(target.expectedUid),
-    target.checkoutPath, target.entrypointPath, target.pidFilePath, target.nodePath,
+    target.checkoutPath, target.entrypointPath, target.nodePath,
     target.pm2ModulePath, target.workspaceArg ?? "-", target.devMode ? "yes" : "no", target.releaseRoot,
   ];
 }

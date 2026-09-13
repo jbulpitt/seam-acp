@@ -30,6 +30,8 @@ import {
   AGY_DEPLOYMENT_PINS,
   canonicalExecutable,
   formatDeploymentReport,
+  main,
+  parsePm2EcosystemPins,
   readOnlyIo,
   resolvePinSources,
   verifyAgyDeployment,
@@ -95,6 +97,8 @@ function host(opts: {
   omitPins?: string[];
   /** Stage in `<parent>-backup`: a sibling that shares the parent's prefix. */
   siblingOfParent?: boolean;
+  /** "pm2" writes the ecosystem module the fleet actually uses (#395). */
+  pinsFormat?: "env" | "pm2";
 } = {}): Host {
   const {
     underHome = false, pinsInFile = true, version = "1.1.28",
@@ -126,16 +130,35 @@ function host(opts: {
   };
   for (const key of omitPins) delete pins[key];
 
-  const envFile = path.join(root, "bridge.env");
   const fileEntries: Record<string, string> = {
     SEAM_BRIDGE_ID: "fixture-host",
     GROK_CLI_PATH: "/usr/local/bin/grok",
     ...(pinsInFile ? pins : {}),
   };
-  fs.writeFileSync(
-    envFile,
-    `${Object.entries(fileEntries).map(([k, v]) => `${k}=${v}`).join("\n")}\n`
-  );
+
+  // The fleet keeps pins in a pm2 ecosystem module, not a KEY=VALUE file. This
+  // shape is copied from macbook-pro/macbook-air/home-hub as observed on
+  // 2026-09-13 — indentation, quoting and trailing commas included — because
+  // the previous fixtures took the pins-file shape from the documentation and
+  // that is the single assumption #395 turned on.
+  const envFile = path.join(root, opts.pinsFormat === "pm2" ? "ecosystem.config.cjs" : "bridge.env");
+  fs.writeFileSync(envFile, opts.pinsFormat === "pm2"
+    ? [
+      "module.exports = {",
+      "  apps: [",
+      "    {",
+      `      name: "seam-bridge",`,
+      `      cwd: "${root}",`,
+      `      script: "packages/bridge/dist/index.js",`,
+      "      env: {",
+      ...Object.entries(fileEntries).map(([k, v]) => `        ${k}: "${v}",`),
+      "      },",
+      "    },",
+      "  ],",
+      "};",
+      "",
+    ].join("\n")
+    : `${Object.entries(fileEntries).map(([k, v]) => `${k}=${v}`).join("\n")}\n`);
 
   return {
     root, envFile, runtimeParent, runtimeRoot, cliPath,
@@ -434,11 +457,171 @@ describe("#265 mutation survivors, closed", () => {
   });
 });
 
+/** The fleet's real file, reduced to the parts that matter. No token. */
+function ecosystem(envLines: string[], opts: { apps?: string[] } = {}): string {
+  const apps = opts.apps ?? ["seam-bridge"];
+  return [
+    "module.exports = {",
+    "  apps: [",
+    ...apps.flatMap((name) => [
+      "    {",
+      `      name: "${name}",`,
+      "      env: {",
+      ...envLines.map((l) => `        ${l}`),
+      "      },",
+      "    },",
+    ]),
+    "  ],",
+    "};",
+    "",
+  ].join("\n");
+}
+
+describe("#395 pins where the fleet actually keeps them", () => {
+  it("reads a pm2 ecosystem module without executing it", () => {
+    const report = verdictFor(host({ pinsFormat: "pm2" }));
+    expect(report.verdict).toBe("pass");
+    expect(report.observed.pinsFileFormat).toBe("pm2-ecosystem");
+    expect(report.observed.pm2App).toBe("seam-bridge");
+    for (const key of AGY_DEPLOYMENT_PINS) {
+      expect(report.observed.pinSources[key]).toBe("pm2-ecosystem");
+    }
+    // The substantive checks must actually run — the #395 symptom was eight
+    // skips behind one false FAIL.
+    for (const id of ["layout-canonical", "runtime-root-managed", "artifact-present",
+      "artifact-digest", "artifact-mode", "path-not-symlinked", "ancestors-durable"]) {
+      expect(byId(report, id).status).toBe("pass");
+    }
+  });
+
+  it("names the pm2 lifecycle consequence an operator has to act on", () => {
+    const detail = byId(verdictFor(host({ pinsFormat: "pm2" })), "pins-in-file").detail;
+    expect(detail).toContain("pm2 restart");
+    expect(detail).toContain("pm2 save");
+    expect(detail).toContain("dump.pm2");
+  });
+
+  it("never executes the module: the io has no require, import or spawn to reach for", () => {
+    // If the implementation ever switched to require()ing the config, the
+    // frozen five-call io would be bypassed and this contract would be a lie.
+    const io = readOnlyIo();
+    expect(Object.keys(io).sort())
+      .toEqual(["accessSync", "lstatSync", "readFileSync", "realpathSync", "statSync"]);
+  });
+
+  it("reads a pm2 value containing // without treating it as a comment", () => {
+    const { pins } = parsePm2EcosystemPins(ecosystem([
+      `AGY_CLI_PATH: "https://example.invalid//opt/agy",`,
+    ]));
+    expect(pins.get("AGY_CLI_PATH")).toBe("https://example.invalid//opt/agy");
+  });
+});
+
+describe("#395 the matcher refuses rather than guessing", () => {
+  it("ignores a commented-out pin", () => {
+    const { pins } = parsePm2EcosystemPins(ecosystem([
+      `// AGY_ENABLED: "true",`,
+      `AGY_VERSION: "1.1.27",`,
+    ]));
+    expect(pins.has("AGY_ENABLED")).toBe(false);
+    expect(pins.get("AGY_VERSION")).toBe("1.1.27");
+  });
+
+  it("ignores a pin inside a block comment", () => {
+    const { pins } = parsePm2EcosystemPins(ecosystem([
+      `/* AGY_ENABLED: "true", */`,
+      `AGY_VERSION: "1.1.27",`,
+    ]));
+    expect(pins.has("AGY_ENABLED")).toBe(false);
+  });
+
+  it("ignores a value that is not a complete single-line string literal", () => {
+    for (const line of [
+      "AGY_VERSION: process.env.AGY_VERSION,",
+      "AGY_VERSION: `1.1.27`,",
+      `AGY_VERSION: "1.1." +`,
+      `AGY_VERSION: "1.1.27" + suffix,`,
+    ]) {
+      expect(parsePm2EcosystemPins(ecosystem([line])).pins.has("AGY_VERSION")).toBe(false);
+    }
+  });
+
+  it("ignores a pin nested inside a deeper object within env", () => {
+    const { pins } = parsePm2EcosystemPins(ecosystem([
+      "nested: {",
+      `  AGY_VERSION: "9.9.9",`,
+      "},",
+      `AGY_ENABLED: "true",`,
+    ]));
+    expect(pins.has("AGY_VERSION")).toBe(false);
+    expect(pins.get("AGY_ENABLED")).toBe("true");
+  });
+
+  it("refuses when two apps both carry AGY pins instead of picking one", () => {
+    const text = ecosystem([`AGY_VERSION: "1.1.27",`], { apps: ["seam-bridge", "other-agent"] });
+    const parsed = parsePm2EcosystemPins(text);
+    expect(parsed.ambiguous).toBe(true);
+    expect(parsed.pins.size).toBe(0);
+    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "seam-265-")));
+    roots.push(root);
+    const file = path.join(root, "ecosystem.config.cjs");
+    fs.writeFileSync(file, text);
+    const report = verifyAgyDeployment({ envFile: file, platform: "darwin" }, readOnlyIo());
+    expect(byId(report, "pins-in-file").reasonCode).toBe("pins_in_multiple_apps");
+    expect(byId(report, "pins-in-file").detail).toContain("other-agent");
+  });
+
+  it("does not mistake an AGY key outside any env block for a pin", () => {
+    const text = [
+      "module.exports = {",
+      "  apps: [",
+      "    {",
+      `      name: "seam-bridge",`,
+      `      AGY_VERSION: "9.9.9",`,
+      "      env: {",
+      `        AGY_ENABLED: "true",`,
+      "      },",
+      "    },",
+      "  ],",
+      "};",
+    ].join("\n");
+    const { pins } = parsePm2EcosystemPins(text);
+    expect(pins.has("AGY_VERSION")).toBe(false);
+    expect(pins.get("AGY_ENABLED")).toBe("true");
+  });
+});
+
+describe("#395 a host where agy is simply not deployed", () => {
+  it("reports 'not deployed' rather than a failure, with its own exit status", async () => {
+    // media-server runs a bridge and no agy, and has no ecosystem file at all.
+    // Calling that "fail" would describe a correct host as broken.
+    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "seam-265-")));
+    roots.push(root);
+    const report = verifyAgyDeployment(
+      { envFile: path.join(root, "ecosystem.config.cjs"), platform: "darwin" }, readOnlyIo());
+    expect(report.verdict).toBe("not-deployed");
+    expect(byId(report, "pins-in-file").reasonCode).toBe("agy_not_deployed");
+    const lines: string[] = [];
+    const code = await main(["--pins-file", path.join(root, "ecosystem.config.cjs")],
+      { log: (s: string) => lines.push(s) });
+    expect(code).toBe(3);
+    expect(lines.join("\n")).toContain("NOT-DEPLOYED");
+  });
+
+  it("still fails a host that has a pins file carrying only some of the pins", () => {
+    // Partial pins are a misdeployment, not an absence, and must not be
+    // swallowed by the not-deployed path.
+    const report = verdictFor(host({ pinsFormat: "pm2", omitPins: ["AGY_SHA256"] }));
+    expect(report.verdict).toBe("fail");
+    expect(byId(report, "pins-in-file").reasonCode).toBe("pins_missing");
+  });
+});
+
 describe("#265 pin resolution", () => {
   it("prefers the file over the process environment when both have a key", () => {
     // pm2 keeps a stale copy of everything; the file is the source of truth and
     // the process env is only a cache of it (#390).
-    const sources = resolvePinSources("AGY_SHA256=from-file\n", { AGY_SHA256: "from-process" });
+    const { sources } = resolvePinSources("AGY_SHA256=from-file\n", { AGY_SHA256: "from-process" });
     expect(sources.AGY_SHA256).toEqual({ value: "from-file", source: "file" });
   });
 

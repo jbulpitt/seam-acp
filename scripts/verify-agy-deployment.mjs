@@ -554,11 +554,48 @@ export function formatDeploymentReport(report) {
   return lines.join("\n");
 }
 
+/**
+ * Every flag this tool accepts. None of them may be a name `node` itself parses
+ * (#397): node scans the whole argv for its own options even after the script
+ * path, so a collision is resolved by the runtime before the script starts and
+ * the script cannot report, catch or work around it.
+ */
+export const AGY_DEPLOYMENT_FLAGS = Object.freeze([
+  "--pins-file", "--format", "--runtime-parent", "--process-env", "--probe", "--json",
+]);
+
+/**
+ * The exit-code contract a rollout script reads. Separate from `main` because
+ * exit 0 needs a root-owned tree that an unprivileged test cannot build, so
+ * without this the mapping could only be checked on a real host — and a
+ * mutation swapping pass and fail survived the whole suite because of it.
+ *
+ *   0  correct
+ *   1  deployed, but not to the reference layout
+ *   3  agy is not deployed here at all — an observation, not a failure
+ */
+export function exitCodeFor(verdict) {
+  if (verdict === "pass") return 0;
+  if (verdict === "not-deployed") return 3;
+  return 1;
+}
+
 function parseArgs(argv) {
   const opts = { probe: null, json: false, processEnv: {} };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
-    if (arg === "--pins-file" || arg === "--env-file") opts.envFile = argv[++i];
+    if (arg === "--pins-file") opts.envFile = argv[++i];
+    else if (arg === "--env-file") {
+      // Removed rather than documented (#397). `--env-file` is a node option:
+      // pointed at a MISSING file node aborts with exit 9 before this script
+      // runs, so the one host the not-deployed verdict was written for could
+      // never report it. A flag whose name the runtime owns cannot be made to
+      // work, and this synonym only ever existed for a documented path
+      // (~/.seam/bridge.env) that has never existed on any host (#395).
+      throw new Error(
+        "--env-file is a node option and cannot be used here: pointed at a " +
+        "missing file, node exits 9 before this script starts. Use --pins-file.");
+    }
     else if (arg === "--format") opts.format = argv[++i];
     else if (arg === "--runtime-parent") opts.runtimeParent = argv[++i];
     else if (arg === "--process-env") opts.processEnvFile = argv[++i];
@@ -577,10 +614,7 @@ export async function main(argv, out = console) {
   }
   const report = verifyAgyDeployment(opts);
   out.log(opts.json ? JSON.stringify(report, null, 2) : formatDeploymentReport(report));
-  // 0 correct, 1 misdeployed, 3 agy is not deployed here at all. A rollout
-  // script must be able to tell the third from the second.
-  if (report.verdict === "pass") return 0;
-  return report.verdict === "not-deployed" ? 3 : 1;
+  return exitCodeFor(report.verdict);
 }
 
 /**

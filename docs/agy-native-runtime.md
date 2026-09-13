@@ -152,8 +152,17 @@ literal inside the `env:` block of the `seam-bridge` app, **not** as
 `KEY=VALUE`. The first version of this document specified `~/.seam/bridge.env`,
 a path that exists on no host, and the verifier could only read `KEY=VALUE`, so
 it returned one false FAIL and eight skips on every correctly-pinned host
-(#395). Both formats are read now, detected by content; `--env-file` is still
-accepted as a synonym.
+(#395). Both formats are read now, detected by content.
+
+The flag is `--pins-file`, and **`--env-file` is not accepted** (#397).
+`--env-file` is a *node* option, and node scans the whole argv for its own
+options even after the script path — so pointed at a file that does not exist,
+node aborts with exit 9 before this script starts. That made the not-deployed
+verdict below unreachable on the one host it was written for. A flag whose name
+the runtime owns cannot be made to work, so it was removed rather than
+documented; passing it now gets an error naming `--pins-file`. Any future flag
+added here must not collide with a node option, and there is a test that spawns
+a real process per flag to enforce it.
 
 Exit status is **0** for a host matching the reference layout, **1** for one
 that does not, and **3** for a host where agy is not deployed at all — no pins

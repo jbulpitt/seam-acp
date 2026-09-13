@@ -564,6 +564,22 @@ export const AGY_DEPLOYMENT_FLAGS = Object.freeze([
   "--pins-file", "--format", "--runtime-parent", "--process-env", "--probe", "--json",
 ]);
 
+/**
+ * The exit-code contract a rollout script reads. Separate from `main` because
+ * exit 0 needs a root-owned tree that an unprivileged test cannot build, so
+ * without this the mapping could only be checked on a real host — and a
+ * mutation swapping pass and fail survived the whole suite because of it.
+ *
+ *   0  correct
+ *   1  deployed, but not to the reference layout
+ *   3  agy is not deployed here at all — an observation, not a failure
+ */
+export function exitCodeFor(verdict) {
+  if (verdict === "pass") return 0;
+  if (verdict === "not-deployed") return 3;
+  return 1;
+}
+
 function parseArgs(argv) {
   const opts = { probe: null, json: false, processEnv: {} };
   for (let i = 0; i < argv.length; i += 1) {
@@ -598,10 +614,7 @@ export async function main(argv, out = console) {
   }
   const report = verifyAgyDeployment(opts);
   out.log(opts.json ? JSON.stringify(report, null, 2) : formatDeploymentReport(report));
-  // 0 correct, 1 misdeployed, 3 agy is not deployed here at all. A rollout
-  // script must be able to tell the third from the second.
-  if (report.verdict === "pass") return 0;
-  return report.verdict === "not-deployed" ? 3 : 1;
+  return exitCodeFor(report.verdict);
 }
 
 /**

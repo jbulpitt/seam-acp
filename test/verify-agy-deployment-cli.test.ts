@@ -25,7 +25,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { AGY_DEPLOYMENT_FLAGS } from "../scripts/verify-agy-deployment.mjs";
+import { AGY_DEPLOYMENT_FLAGS, exitCodeFor } from "../scripts/verify-agy-deployment.mjs";
 
 const SCRIPT = path.join(import.meta.dirname, "..", "scripts", "verify-agy-deployment.mjs");
 const roots: string[] = [];
@@ -160,7 +160,52 @@ describe("#397 the exit-code contract, from a real node process", () => {
   });
 });
 
+describe("#397 the exit-code mapping itself", () => {
+  it.each([
+    ["pass", 0],
+    ["fail", 1],
+    ["not-deployed", 3],
+  ])("maps %s to exit %i", (verdict, code) => {
+    // Pinned here rather than through a spawn because exit 0 needs a root-owned
+    // tree. A mutation swapping pass and fail survived every other test in the
+    // suite until this existed.
+    expect(exitCodeFor(verdict as string)).toBe(code);
+  });
+
+  it("treats an unrecognised verdict as a failure rather than a pass", () => {
+    expect(exitCodeFor("something-new")).toBe(1);
+  });
+
+  it("rejects an unknown argument instead of ignoring it", () => {
+    // Silently skipping an unknown flag means a mistyped --pins-file reports on
+    // whatever the default is, which is a confident answer about the wrong host.
+    const result = run(["--pins-file", "/nonexistent", "--bogus"]);
+    expect(result.code).toBe(2);
+    expect(result.stderr).toContain("unknown argument: --bogus");
+  });
+});
+
 describe("#397 no flag this tool accepts may be one node also parses", () => {
+  it("lists exactly the flags the parser accepts, by name", () => {
+    // Asserting against the constant alone was circular: dropping a flag from
+    // it dropped the collision test for that flag with it. This pins the names,
+    // and the source cross-check below catches the constant drifting from the
+    // parser — which is the direction that silently removes coverage.
+    expect([...AGY_DEPLOYMENT_FLAGS]).toEqual([
+      "--pins-file", "--format", "--runtime-parent", "--process-env", "--probe", "--json",
+    ]);
+    const source = fs.readFileSync(SCRIPT, "utf8");
+    const accepted = [...source.matchAll(/arg === "(--[a-z-]+)"/g)].map((m) => m[1]);
+    const guarded = new Set(AGY_DEPLOYMENT_FLAGS);
+    // `--env-file` is accepted only to be refused by name, so it is expected
+    // here and must NOT be in the guarded list.
+    for (const flag of accepted) {
+      if (flag === "--env-file") continue;
+      expect(guarded.has(flag)).toBe(true);
+    }
+    expect(guarded.has("--env-file")).toBe(false);
+  });
+
   it.each(AGY_DEPLOYMENT_FLAGS)(
     "reaches the script when %s is given a path that does not exist", (flag) => {
       // The generalising guard. A future flag colliding with a node option

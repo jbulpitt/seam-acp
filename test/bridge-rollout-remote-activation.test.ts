@@ -28,7 +28,7 @@ function makeArchive(sourceSha:string,indexSource:string){
   return gzipSync(Buffer.concat([tarMember("bridge-release.json",manifest),...files.map((f)=>tarMember(f.path,f.bytes)),Buffer.alloc(1024)]));
 }
 
-async function makeFixture(behavior:"good"|"stale"|"wrong-ack"="good", oldBehavior:"good"|"interrupt"="good") {
+async function makeFixture(behavior:"good"|"stale"|"wrong-ack"|"adapter-loss"="good", oldBehavior:"good"|"interrupt"="good") {
   const root=await fs.mkdtemp(path.join(os.tmpdir(),"bridge-activation-e2e-")); const checkout=path.join(root,"checkout"); const releaseRoot=path.join(root,"rollouts"); const entry=path.join(checkout,"packages/bridge/dist/index.js"); const pidFile=path.join(root,"bridge.pid"); const pm2File=path.join(root,"pm2.json"); const pm2Module=path.join(root,"pm2.cjs"); const runtime=path.join(root,"runtime"); const node=path.join(runtime,"node"); const failPrebuild=path.join(root,"fail-prebuild");
   await fs.mkdir(path.dirname(entry),{recursive:true}); await fs.mkdir(runtime); await fs.link(process.execPath,node); await fs.writeFile(path.join(runtime,"npm"),`#!/bin/sh
 set -eu
@@ -39,7 +39,7 @@ printf '%s\\n' "import fs from 'node:fs'; fs.writeFileSync(new URL('../better-sq
 if [ -f ${failPrebuild} ]; then node-gyp; fi
 prebuild-install
 `,{mode:0o755});
-  const bridgeSource=(mode:string)=>`import fs from 'node:fs';import path from 'node:path';import{spawn}from'node:child_process';const entry=${JSON.stringify(entry)},pidFile=${JSON.stringify(pidFile)},pm2File=${JSON.stringify(pm2File)},node=${JSON.stringify(node)},cwd=${JSON.stringify(checkout)},mode=${JSON.stringify(mode)};let signalCount=0;function update(pid){const j=JSON.parse(fs.readFileSync(pm2File));j.pid=pid;j.pm_uptime=Date.now();fs.writeFileSync(pm2File,JSON.stringify(j));fs.writeFileSync(pidFile,String(pid));}const release=path.resolve(new URL('.',import.meta.url).pathname,'../../..');const ep=path.join(release,'activation-envelope.json'),rp=path.join(release,'release-receipt.json');if(fs.existsSync(ep)){const e=JSON.parse(fs.readFileSync(ep)),s=JSON.parse(fs.readFileSync(rp)),t=new Date().toISOString(),started=mode==='stale'?'2000-01-01T00:00:00.000Z':e.startedAt,instance='instance-'+e.activationId.slice(0,12),ackChecksum=mode==='wrong-ack'?'f'.repeat(64):e.artifactChecksum;fs.writeFileSync(rp,JSON.stringify({...s,...e,pid:process.pid,instanceId:instance,protocolVersion:1,startedAt:started,helloAcceptedAt:t,catalogRpcs:{grok:{describeModelCatalogAt:t,fetchModelCatalogAt:t}},controllerAck:{activationId:e.activationId,bridgeId:e.bridgeId,instanceId:instance,pid:process.pid,sourceSha:e.sourceSha,artifactChecksum:ackChecksum},controllerVerifiedAt:t,completedAt:t})+'\\n');}process.on('SIGUSR2',()=>{signalCount+=1;if(mode==='interrupt'&&signalCount===1)return;const c=spawn(node,[entry],{cwd,detached:true,stdio:'ignore'});c.unref();update(c.pid);setTimeout(()=>process.exit(0),100);});setInterval(()=>{},1000);\n`;
+  const bridgeSource=(mode:string)=>`import fs from 'node:fs';import path from 'node:path';import{spawn}from'node:child_process';const entry=${JSON.stringify(entry)},pidFile=${JSON.stringify(pidFile)},pm2File=${JSON.stringify(pm2File)},node=${JSON.stringify(node)},cwd=${JSON.stringify(checkout)},mode=${JSON.stringify(mode)};let signalCount=0;function update(pid){const j=JSON.parse(fs.readFileSync(pm2File));j.pid=pid;j.pm_uptime=Date.now();fs.writeFileSync(pm2File,JSON.stringify(j));fs.writeFileSync(pidFile,String(pid));}const release=path.resolve(new URL('.',import.meta.url).pathname,'../../..');const ep=path.join(release,'activation-envelope.json'),rp=path.join(release,'release-receipt.json');if(fs.existsSync(ep)){const e=JSON.parse(fs.readFileSync(ep)),s=JSON.parse(fs.readFileSync(rp)),t=new Date().toISOString(),started=mode==='stale'?'2000-01-01T00:00:00.000Z':e.startedAt,instance='instance-'+e.activationId.slice(0,12),ackChecksum=mode==='wrong-ack'?'f'.repeat(64):e.artifactChecksum,adapterRefusals=mode==='adapter-loss'?[{agentId:'agy',code:'configuration_incomplete',missing:['AGY_ENABLED=true','AGY_SHA256']}]:[];fs.writeFileSync(rp,JSON.stringify({...s,...e,pid:process.pid,instanceId:instance,protocolVersion:1,startedAt:started,helloAcceptedAt:t,adapterRefusals,catalogRpcs:{grok:{describeModelCatalogAt:t,fetchModelCatalogAt:t}},controllerAck:{activationId:e.activationId,bridgeId:e.bridgeId,instanceId:instance,pid:process.pid,sourceSha:e.sourceSha,artifactChecksum:ackChecksum},controllerVerifiedAt:t,completedAt:t})+'\\n');}process.on('SIGUSR2',()=>{signalCount+=1;if(mode==='interrupt'&&signalCount===1)return;const c=spawn(node,[entry],{cwd,detached:true,stdio:'ignore'});c.unref();update(c.pid);setTimeout(()=>process.exit(0),100);});setInterval(()=>{},1000);\n`;
   await fs.writeFile(entry,bridgeSource("legacy"));
   await fs.writeFile(pm2Module,`const fs=require('fs'),p=${JSON.stringify(pm2File)};module.exports={connect(cb){setImmediate(()=>cb(null))},describe(_n,cb){const j=JSON.parse(fs.readFileSync(p,'utf8'));setImmediate(()=>cb(null,[{pid:j.pid,pm2_env:{name:j.name,pm_cwd:j.cwd,pm_exec_path:j.entry,exec_interpreter:j.node,pm_uptime:j.pm_uptime,args:['connect','--server','wss://controller.invalid','--token','fixture-token','--id','fixture']}}]))},disconnect(){}}`);
   const start=spawn(node,[entry],{cwd:checkout,detached:true,stdio:"ignore"});start.unref(); await fs.writeFile(pidFile,String(start.pid)); await fs.writeFile(pm2File,JSON.stringify({pid:start.pid,name:"fixture-app",cwd:checkout,entry,node,pm_uptime:Date.now()}));
@@ -58,6 +58,33 @@ prebuild-install
 afterEach(async()=>{while(fixtures.length){const fixture=fixtures.pop()!;try{const pid=Number(await fs.readFile(fixture.pidFile,"utf8"));process.kill(pid,"SIGKILL");}catch{}await fs.rm(fixture.root,{recursive:true,force:true});}});
 
 describe.sequential("production remote shell activation and rollback gates (#241)",()=>{
+  it("surfaces an adapter lost by the new build without refusing the verified upgrade", async () => {
+    const f = await makeFixture("adapter-loss");
+    const activation = H("0");
+    const result = await f.run(["activate", f.next.sourceSha, f.next.checksum, f.next.stageId, activation, "10", H("1")], 20_000);
+
+    expect(result.stdout).toContain("activation=verified");
+    expect(result.stdout).toContain("adapter_inventory=degraded");
+    expect(result.stdout).toContain("adapter_refusal=agy:configuration_incomplete");
+    expect(result.stdout).toContain("adapter_refusal_missing_agy=AGY_ENABLED=true,AGY_SHA256");
+    expect(result.stdout).toContain("upgrade_status=verified_with_adapter_refusal");
+    const receipt = JSON.parse(await fs.readFile(path.join(f.next.release, "release-receipt.json"), "utf8"));
+    expect(receipt.adapterRefusals).toEqual([{
+      agentId: "agy",
+      code: "configuration_incomplete",
+      missing: ["AGY_ENABLED=true", "AGY_SHA256"],
+    }]);
+  }, 60_000);
+
+  it("reports no refusal when the successor deliberately advertises no agy", async () => {
+    const f = await makeFixture("good");
+    const result = await f.run(["activate", f.next.sourceSha, f.next.checksum, f.next.stageId, H("0"), "10", H("1")], 20_000);
+
+    expect(result.stdout).toContain("activation=verified");
+    expect(result.stdout).toContain("adapter_refusals=none");
+    expect(result.stdout).not.toContain("adapter_inventory=degraded");
+  }, 60_000);
+
   it("proves a nonce-bound new instance, refuses current-release mismatch, then proves exact rollback",async()=>{
     const f=await makeFixture(); const activation=H("3"),operation=H("4");
     expect(await fs.readFile(path.join(f.next.release,"node_modules/better-sqlite3/build/Release/better_sqlite3.node"),"utf8")).toBe("prebuilt");

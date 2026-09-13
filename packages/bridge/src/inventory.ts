@@ -47,6 +47,48 @@ export interface HostAdapterRuntimeOptions {
   copilotCatalogProbe?: (launch: CopilotCatalogLaunch) => Promise<CopilotCatalogProbe>;
   /** #330: observe a strict adapter refusing to load instead of it killing the bridge. */
   onAdapterRefused?: (agentId: string, reason: string) => void;
+  /**
+   * #329: structured, secret-free evidence that an installed/configured
+   * adapter was omitted. The bridge keeps serving every adapter that did load.
+   */
+  onAdapterUnavailable?: (refusal: HostAdapterRefusal) => void;
+}
+
+export interface HostAdapterRefusal {
+  agentId: string;
+  code: "configuration_incomplete" | "executable_unavailable" | "runtime_refused";
+  missing?: string[];
+}
+
+export interface HostAdapterInventory {
+  adapters: Map<string, AgentAdapter>;
+  adapterRefusals: HostAdapterRefusal[];
+}
+
+const AGY_NATIVE_REQUIREMENTS = [
+  "AGY_ENABLED=true",
+  "AGY_CLI_PATH (absolute)",
+  "AGY_DEFAULT_MODEL",
+  "AGY_VERSION",
+  "AGY_SHA256",
+  "AGY_RUNTIME_ROOT (absolute)",
+] as const;
+
+function reportUnavailable(
+  options: HostAdapterRuntimeOptions,
+  refusal: HostAdapterRefusal,
+): void {
+  const missing = refusal.missing?.length
+    ? `; missing or invalid: ${refusal.missing.join(", ")}`
+    : "";
+  // Refuse only this adapter. The bridge and every independently loadable
+  // adapter keep serving; this names the code-upgrade loss that was silent on
+  // macbook-pro and home-hub (#329).
+  console.error(
+    `[bridge] adapter ${refusal.agentId} unavailable (${refusal.code})${missing}; ` +
+    "adapter will not be advertised, but the bridge and other adapters remain available",
+  );
+  options.onAdapterUnavailable?.(refusal);
 }
 
 export function resolveCopilotHostLaunch(
@@ -129,6 +171,30 @@ export function loadHostAdapters(
   const agyDefaultModel = env.AGY_DEFAULT_MODEL?.trim();
   const agyModels = parseConfiguredModels(env.AGY_MODELS);
   const agyNativeBin = env.AGY_CLI_PATH?.trim() || env.AGY_OLD_CLI_PATH?.trim() || agyBin;
+  const agyEnabled = env.AGY_ENABLED === "true" || env.AGY_OLD_ROLLBACK_ENABLED === "true";
+  const agyExplicitlyDisabled = env.AGY_ENABLED === "false" && env.AGY_OLD_ROLLBACK_ENABLED !== "true";
+  const agyCandidate = agyNativeBin || "agy";
+  const agyExecutableAvailable = !agyExplicitlyDisabled && exists(agyCandidate);
+  const agyMissing = [
+    ...(!agyEnabled ? [AGY_NATIVE_REQUIREMENTS[0]] : []),
+    ...(!agyNativeBin || !path.isAbsolute(agyNativeBin) ? [AGY_NATIVE_REQUIREMENTS[1]] : []),
+    ...(!agyDefaultModel ? [AGY_NATIVE_REQUIREMENTS[2]] : []),
+    ...(!agyVersion ? [AGY_NATIVE_REQUIREMENTS[3]] : []),
+    ...(!agySha256 ? [AGY_NATIVE_REQUIREMENTS[4]] : []),
+    ...(!agyRuntimeRoot || !path.isAbsolute(agyRuntimeRoot) ? [AGY_NATIVE_REQUIREMENTS[5]] : []),
+  ];
+  if (!agyExplicitlyDisabled && (agyEnabled || agyExecutableAvailable)) {
+    if (agyMissing.length > 0) {
+      reportUnavailable(options, {
+        agentId: "agy",
+        code: "configuration_incomplete",
+        missing: agyMissing,
+      });
+    } else if (!agyExecutableAvailable) {
+      reportUnavailable(options, { agentId: "agy", code: "executable_unavailable" });
+    }
+  }
+  const agyLoadable = agyEnabled && agyMissing.length === 0 && agyExecutableAvailable;
   const factories: Array<{ id: string; bin: string; make: () => AgentAdapter; strict?: boolean }> = [
     {
       id: "copilot",
@@ -164,21 +230,21 @@ export function loadHostAdapters(
           : {}),
       }),
     },
-    ...((env.AGY_ENABLED === "true" || env.AGY_OLD_ROLLBACK_ENABLED === "true") && agyNativeBin && path.isAbsolute(agyNativeBin) && agyDefaultModel && agyVersion && agySha256 && agyRuntimeRoot && path.isAbsolute(agyRuntimeRoot) ? [{
+    ...(agyLoadable ? [{
       id: "agy",
-      bin: agyNativeBin,
+      bin: agyNativeBin!,
       strict: true,
       make: () => makeAgyProfile({
         runtime: makeAgyNativeRuntime({
-          executable: agyNativeBin,
-          runtimeRoot: agyRuntimeRoot,
-          version: agyVersion,
-          sha256: agySha256,
+          executable: agyNativeBin!,
+          runtimeRoot: agyRuntimeRoot!,
+          version: agyVersion!,
+          sha256: agySha256!,
           credentialScope: env.AGY_CREDENTIAL_SCOPE ?? "antigravity-oauth:default",
           cwd: options.cwd ?? process.cwd(),
           baseEnv: env,
         }),
-        defaultModel: agyDefaultModel,
+        defaultModel: agyDefaultModel!,
         staticModels: agyModels,
       }),
     }] : []),
@@ -235,10 +301,32 @@ export function loadHostAdapters(
           `[bridge] adapter ${f.id} refused to load (provenance mode: ${describeProvenanceMode() ?? "not reached"}): ${reason}`
         );
         options.onAdapterRefused?.(f.id, reason);
+        options.onAdapterUnavailable?.({ agentId: f.id, code: "runtime_refused" });
       }
     }
   }
   return out;
+}
+
+/**
+ * The production bridge startup boundary: keep the usable adapter map and the
+ * reasons omitted adapters were refused as one result so rollout evidence
+ * cannot accidentally discard the diagnostic half (#329).
+ */
+export function loadHostAdapterInventory(
+  copilotCmd: string,
+  options: HostAdapterRuntimeOptions = {},
+): HostAdapterInventory {
+  const adapterRefusals: HostAdapterRefusal[] = [];
+  const onAdapterUnavailable = options.onAdapterUnavailable;
+  const adapters = loadHostAdapters(copilotCmd, {
+    ...options,
+    onAdapterUnavailable: (refusal) => {
+      adapterRefusals.push(refusal);
+      onAdapterUnavailable?.(refusal);
+    },
+  });
+  return { adapters, adapterRefusals };
 }
 
 export function inventoryFromAdapters(

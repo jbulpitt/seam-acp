@@ -4,12 +4,50 @@ import path from "node:path";
 import { describe, it, expect } from "vitest";
 import {
   inventoryFromAdapters,
+  loadHostAdapterInventory,
   loadHostAdapters,
   resolveCopilotHostLaunch,
 } from "../packages/bridge/src/inventory.js";
 import { createManagedAgyFixture } from "./helpers/agy-runtime-fixture.js";
 
 describe("loadHostAdapters", () => {
+  it("surfaces the legacy agy-on-PATH upgrade loss while keeping other adapters", () => {
+    const legacyAdvertised = ["copilot", "agy"].filter((bin) => bin === "copilot" || bin === "agy");
+    const { adapters, adapterRefusals: refusals } = loadHostAdapterInventory("copilot", {
+      env: { PATH: process.env.PATH },
+      exists: (bin) => bin === "copilot" || bin === "agy",
+    });
+
+    // The predecessor auto-detected the installed binary. Current code must
+    // not silently collapse that state into an ordinary disabled adapter.
+    expect(legacyAdvertised).toContain("agy");
+    expect([...adapters.keys()]).toEqual(["copilot"]);
+    expect(refusals).toEqual([{
+      agentId: "agy",
+      code: "configuration_incomplete",
+      missing: [
+        "AGY_ENABLED=true",
+        "AGY_CLI_PATH (absolute)",
+        "AGY_DEFAULT_MODEL",
+        "AGY_VERSION",
+        "AGY_SHA256",
+        "AGY_RUNTIME_ROOT (absolute)",
+      ],
+    }]);
+  });
+
+  it("treats explicit AGY_ENABLED=false as a deliberate clean removal", () => {
+    const refusals: unknown[] = [];
+    const adapters = loadHostAdapters("copilot", {
+      env: { PATH: process.env.PATH, AGY_ENABLED: "false" },
+      exists: (bin) => bin === "copilot" || bin === "agy",
+      onAdapterUnavailable: (refusal) => refusals.push(refusal),
+    });
+
+    expect([...adapters.keys()]).toEqual(["copilot"]);
+    expect(refusals).toEqual([]);
+  });
+
   it("skips adapters whose CLI is not on PATH (agy must not spawn ENOENT)", () => {
     const adapters = loadHostAdapters("copilot", { exists: (bin) => bin === "copilot" });
     expect([...adapters.keys()]).toEqual(["copilot"]);

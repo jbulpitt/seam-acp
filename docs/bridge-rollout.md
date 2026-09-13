@@ -434,6 +434,18 @@ remains an activation failure. The runner also bounds
 wall time and stdout/stderr bytes, kills and awaits an over-limit subprocess,
 cleans listeners/timers, and returns symbolic/redacted diagnostics.
 
+The ready receipt also carries secret-free adapter refusals from the replacement
+bridge. A verified activation with one or more refusals remains active and prints
+`adapter_inventory=degraded`, one `adapter_refusal=<agent>:<reason>` line per
+omitted adapter, the names of any missing configuration fields, and
+`upgrade_status=verified_with_adapter_refusal`. This deliberately does not block
+the code upgrade: only the adapter whose configuration or runtime cannot be
+verified is refused, while the host and its other adapters keep serving (#329).
+An operator who intentionally removes native agy must set `AGY_ENABLED=false`;
+that explicit state produces `adapter_refusals=none`. An absent enable flag while
+an `agy` executable is still installed is not treated as intent, because that
+was the exact macbook-pro/home-hub upgrade state that silently removed agy.
+
 After a managed activation, PREFLIGHT may report `enrolled=drifted` because the
 live entrypoint deliberately moved away from the enrolled legacy baseline. That
 is expected and is not an instruction to overwrite the baseline: enrollment is

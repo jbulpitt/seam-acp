@@ -23,6 +23,14 @@ const LOCK_STALE_MS = 15 * 60 * 1_000;
 // used by the managed bridge fleet. Linux entries keep the shipped harness and
 // future Linux bridge targets honest; unsupported tuples refuse in PREFLIGHT.
 const NATIVE_DEPENDENCY = "better-sqlite3@11.10.0";
+const ADAPTER_REQUIREMENTS = new Set([
+  "AGY_ENABLED=true",
+  "AGY_CLI_PATH (absolute)",
+  "AGY_DEFAULT_MODEL",
+  "AGY_VERSION",
+  "AGY_SHA256",
+  "AGY_RUNTIME_ROOT (absolute)",
+]);
 const NATIVE_PREBUILD_ABIS = new Set(["108", "115", "127", "131"]);
 const NATIVE_PREBUILD_TARGETS = new Set([
   "darwin-arm64", "darwin-x64",
@@ -500,9 +508,34 @@ async function readActivationReceipt(release, expected) {
   try {
     const value = parseJson(await fsp.readFile(receiptPath), "activation_receipt_invalid");
     const sequence = [value.startedAt,value.helloAcceptedAt,value.catalogRpcs?.[verifyAgent]?.describeModelCatalogAt,value.catalogRpcs?.[verifyAgent]?.fetchModelCatalogAt,value.controllerVerifiedAt,value.completedAt].map(Date.parse);
-    if (value.formatVersion === 2 && value.activationId === expected.activationId && value.bridgeId === bridgeId && value.sourceSha === expected.sourceSha && value.artifactChecksum === expected.artifactChecksum && value.stageId === expected.stageId && value.oldPid === expected.oldPid && value.pid === expected.newPid && INSTANCE.test(value.instanceId ?? "") && value.protocolVersion === 1 && sequence.every(Number.isFinite) && sequence.every((time,index) => !index || time >= sequence[index-1]) && sequence[0] >= expected.started && sequence.at(-1) <= expected.deadline && value.controllerAck?.activationId === expected.activationId && value.controllerAck?.bridgeId === bridgeId && value.controllerAck?.instanceId === value.instanceId && value.controllerAck?.pid === expected.newPid && value.controllerAck?.sourceSha === expected.sourceSha && value.controllerAck?.artifactChecksum === expected.artifactChecksum) return value;
+    // Receipts from a previous release predate #329 and therefore omit the
+    // field; treating that as an empty list keeps exact rollback available.
+    const adapterRefusals = value.adapterRefusals ?? [];
+    const adapterRefusalsValid = Array.isArray(adapterRefusals) && adapterRefusals.every((item) =>
+      item && typeof item === "object" && NAME.test(item.agentId ?? "") &&
+      ["configuration_incomplete", "executable_unavailable", "runtime_refused"].includes(item.code) &&
+      (item.missing === undefined || (Array.isArray(item.missing) && item.missing.length <= ADAPTER_REQUIREMENTS.size && item.missing.every((name) => ADAPTER_REQUIREMENTS.has(name))))
+    );
+    if (value.formatVersion === 2 && value.activationId === expected.activationId && value.bridgeId === bridgeId && value.sourceSha === expected.sourceSha && value.artifactChecksum === expected.artifactChecksum && value.stageId === expected.stageId && value.oldPid === expected.oldPid && value.pid === expected.newPid && INSTANCE.test(value.instanceId ?? "") && value.protocolVersion === 1 && adapterRefusalsValid && sequence.every(Number.isFinite) && sequence.every((time,index) => !index || time >= sequence[index-1]) && sequence[0] >= expected.started && sequence.at(-1) <= expected.deadline && value.controllerAck?.activationId === expected.activationId && value.controllerAck?.bridgeId === bridgeId && value.controllerAck?.instanceId === value.instanceId && value.controllerAck?.pid === expected.newPid && value.controllerAck?.sourceSha === expected.sourceSha && value.controllerAck?.artifactChecksum === expected.artifactChecksum) return { ...value, adapterRefusals };
   } catch {}
   return null;
+}
+
+function reportAdapterRefusals(ready) {
+  const refusals = ready.adapterRefusals ?? [];
+  if (!refusals.length) {
+    console.log("adapter_refusals=none");
+    return;
+  }
+  // A verified code upgrade remains active: refuse only the adapter whose
+  // configuration/runtime is in doubt. The activation output names the loss
+  // so a healthy bridge cannot silently advertise fewer agents (#329).
+  console.log("adapter_inventory=degraded");
+  for (const refusal of refusals) {
+    console.log(`adapter_refusal=${refusal.agentId}:${refusal.code}`);
+    if (refusal.missing?.length) console.log(`adapter_refusal_missing_${refusal.agentId}=${refusal.missing.join(",")}`);
+  }
+  console.log("upgrade_status=verified_with_adapter_refusal");
 }
 
 async function verifyActivationReceipt(release, expected) {
@@ -1276,6 +1309,7 @@ async function activateFromEnrolledBaseline(input) {
   console.log(`activation_id=${activationId}`); console.log(`old_pid=${before.pid}`); console.log(`new_pid=${newPid}`); console.log(`instance_id=${ready.instanceId}`);
   console.log(`enrollment_id=${enrollment.record.enrollmentId}`);
   console.log(`rollback_proof=${baseline.rollbackProof}`);
+  reportAdapterRefusals(ready);
   console.log(`rollback_command=npm run bridge:rollout -- --target ${bridgeId} --rollback --activation-id ${activationId} --apply`);
 }
 
@@ -1329,7 +1363,7 @@ async function activate() {
     const readyReceiptSha256 = hash(await fsp.readFile(`${release}/release-receipt.json`));
     const outcome = { ...observed, verification: { forward: "receipt", catalogRpcsVerified: true }, instanceId: ready.instanceId, readyReceipt: `${release}/release-receipt.json`, readyReceiptSha256, verifiedAt: nowIso() };
     await fsp.writeFile(`${releaseRoot}/activations/${activationId}.verified.json`, safeJson(outcome), { flag: "wx", mode: 0o600 });
-    console.log("activation=verified"); console.log(`activation_id=${activationId}`); console.log(`old_pid=${before.pid}`); console.log(`new_pid=${newPid}`); console.log(`instance_id=${ready.instanceId}`); console.log(`rollback_command=npm run bridge:rollout -- --target ${bridgeId} --rollback --activation-id ${activationId} --apply`);
+    console.log("activation=verified"); console.log(`activation_id=${activationId}`); console.log(`old_pid=${before.pid}`); console.log(`new_pid=${newPid}`); console.log(`instance_id=${ready.instanceId}`); reportAdapterRefusals(ready); console.log(`rollback_command=npm run bridge:rollout -- --target ${bridgeId} --rollback --activation-id ${activationId} --apply`);
   });
 }
 

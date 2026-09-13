@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import { fileURLToPath } from "node:url";
+import type { HostAdapterRefusal } from "./inventory.js";
 
 interface StageReceipt {
   formatVersion: 2;
@@ -34,6 +35,7 @@ interface ReadyReceipt extends StageReceipt, ActivationEnvelope {
   completedAt?: string;
   controllerAck?: { activationId: string; bridgeId: string; instanceId: string; pid: number; sourceSha: string; artifactChecksum: string };
   catalogRpcs: Record<string, { describeModelCatalogAt?: string; fetchModelCatalogAt?: string }>;
+  adapterRefusals: HostAdapterRefusal[];
 }
 
 const SHA = /^[0-9a-f]{40}$/;
@@ -56,8 +58,8 @@ export class ReleaseReceiptWriter {
   private receipt: ReadyReceipt;
   private pending: Promise<void> = Promise.resolve();
 
-  constructor(stage: StageReceipt, activation: ActivationEnvelope, instance: { instanceId: string; protocolVersion: number }, private readonly receiptPath: string) {
-    this.receipt = { ...stage, ...activation, pid: process.pid, instanceId: instance.instanceId, protocolVersion: instance.protocolVersion, catalogRpcs: {} };
+  constructor(stage: StageReceipt, activation: ActivationEnvelope, instance: { instanceId: string; protocolVersion: number; adapterRefusals: HostAdapterRefusal[] }, private readonly receiptPath: string) {
+    this.receipt = { ...stage, ...activation, pid: process.pid, instanceId: instance.instanceId, protocolVersion: instance.protocolVersion, catalogRpcs: {}, adapterRefusals: instance.adapterRefusals };
   }
 
   recordHelloAccepted(): Promise<void> {
@@ -100,7 +102,7 @@ export class ReleaseReceiptWriter {
   }
 }
 
-export async function createReleaseReceiptWriter(options: { bridgeId: string; instanceId: string; protocolVersion: number; releaseStatePath?: string; activationEnvelopePath?: string; receiptPath?: string }): Promise<ReleaseReceiptWriter | null> {
+export async function createReleaseReceiptWriter(options: { bridgeId: string; instanceId: string; protocolVersion: number; adapterRefusals: HostAdapterRefusal[]; releaseStatePath?: string; activationEnvelopePath?: string; receiptPath?: string }): Promise<ReleaseReceiptWriter | null> {
   if (!SAFE_NAME.test(options.bridgeId) || !INSTANCE.test(options.instanceId) || options.protocolVersion !== 1) return null;
   const receiptPath = options.receiptPath ?? fileURLToPath(new URL("../../../release-receipt.json", import.meta.url));
   const activationPath = options.activationEnvelopePath ?? options.releaseStatePath ?? fileURLToPath(new URL("../../../activation-envelope.json", import.meta.url));
@@ -108,5 +110,5 @@ export async function createReleaseReceiptWriter(options: { bridgeId: string; in
   try { stage = JSON.parse(await fs.readFile(receiptPath, "utf8")); activation = JSON.parse(await fs.readFile(activationPath, "utf8")); } catch { return null; }
   if (!isStageReceipt(stage) || !isActivationEnvelope(activation)) return null;
   if (stage.bridgeId !== options.bridgeId || activation.bridgeId !== options.bridgeId || stage.sourceSha !== activation.sourceSha || stage.artifactChecksum !== activation.artifactChecksum || stage.verificationAgent !== activation.verificationAgent || stage.stageId !== activation.stageId) return null;
-  return new ReleaseReceiptWriter(stage, activation, { instanceId: options.instanceId, protocolVersion: options.protocolVersion }, receiptPath);
+  return new ReleaseReceiptWriter(stage, activation, { instanceId: options.instanceId, protocolVersion: options.protocolVersion, adapterRefusals: options.adapterRefusals }, receiptPath);
 }

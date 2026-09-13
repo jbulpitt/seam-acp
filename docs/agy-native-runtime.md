@@ -219,6 +219,58 @@ outcome worse than a refusal here.
    link anywhere in the chain means the ancestor walk inspects one directory
    chain while exec follows another.
 8. **`ancestors-durable`** — every component up to `/` is root-owned.
+9. **`pm2-state-consistent`** — the three sources of truth agree (#390). See
+   below; this is the one check that asks whether the configuration will still
+   be there after a restart or a reboot, rather than describing the artifact.
+
+### The three sources of truth (#390)
+
+A pm2 host has three, and until now nothing compared them:
+
+- **file** — `~/.seam/bridge/ecosystem.config.cjs`, what an operator edits.
+  `pm2 restart` does **not** re-read it; only `pm2 delete <app>` followed by
+  `pm2 start <file>` applies a change.
+- **dump** — `~/.pm2/dump.pm2`, what a **reboot** restores. `pm2 save` writes it
+  from the *running* list, so it can lag the file or drop an app entirely.
+- **live** — the running process environment, what is serving turns right now.
+
+macbook-air had its pins in **live only**: absent from the file, absent from a
+dump stale since Aug 30. It worked, reported `immutable-path`, and no file on
+the host explained how — one reboot from silently losing agy on an agy-only
+laptop.
+
+The dump is read as JSON through the same frozen read calls, never by shelling
+out to `pm2`: that binary is not on a non-interactive `PATH` on any Mac in this
+fleet, which is #390's sixth failure and bit twice while this was being built.
+Override the path with `--pm2-dump <file>`; it defaults to `$PM2_HOME/dump.pm2`
+or `~/.pm2/dump.pm2`. Supply the running environment with
+`--process-env <file.json>` to compare all three — without it only two are
+compared, and the report says so rather than implying a clean bill.
+
+**A source that could not be read is a third state, never "the pin is absent".**
+Fewer than two readable sources is `SKIP`, naming which were missing. Treating
+unreadable as absent would make the check cry wolf; treating it as agreement
+would make it useless.
+
+### `drift` is its own verdict, exit 4
+
+A host whose dump is stale is **not misdeployed** — it is serving turns
+correctly and will not survive a restart. The remediation is `pm2 save`, or
+`delete` + `start`, not re-staging the artifact, and a caller that cannot tell
+those apart will do the wrong one. So drift gets its own exit status alongside
+0 correct / 1 misdeployed / 3 not deployed, and the detail line names the
+specific consequence and the exact command.
+
+A real check failure outranks drift: a wrong digest and a stale dump together
+report `fail`, because the artifact is the more serious of the two.
+
+**Not yet wired into rollout preflight.** `scripts/bridge-rollout-remote.mjs` is
+delivered to the host as a self-contained string over stdin, so it cannot import
+this comparison — surfacing drift there today would mean a second copy of the
+ecosystem and dump parsers. Two copies of a *drift detector* is the wrong shape.
+The design for the follow-up is to have the remote side emit the three sources'
+`AGY_` values as preflight evidence and have the controller call
+`compareAgyPinSources`, keeping one copy of the comparison.
 
 ### Why `ancestors-durable` is stricter than the runtime check
 

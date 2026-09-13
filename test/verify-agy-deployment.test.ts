@@ -453,7 +453,9 @@ describe("#265 mutation survivors, closed", () => {
     // a reader sees only passes and concludes the host is fully verified.
     const h = host();
     const text = formatDeploymentReport(verdictFor(h));
-    expect(text).toContain("1 check(s) skipped");
+    // Two now: capability, and the three-source comparison when neither the
+    // pm2 dump nor a live environment was supplied (#390).
+    expect(text).toContain("2 check(s) skipped");
     expect(text).toContain("host was not modified");
     // The header must name the file it read and how it read it. A stale key
     // here printed `undefined` on three live hosts before anyone noticed.

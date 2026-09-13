@@ -208,6 +208,118 @@ export function looksLikePm2Ecosystem(text) {
  * re-reads that file on `delete` + `start <file>`, so it is its own state with
  * its own consequence and is labelled separately (#395).
  */
+/**
+ * Read AGY pins out of `~/.pm2/dump.pm2` — what a REBOOT actually restores.
+ *
+ * Observed on macbook-pro/macbook-air/home-hub on 2026-09-13: the dump is a
+ * JSON **array** of app objects, each with `name` and `env`. Some pm2 versions
+ * write `{ apps: [...] }`, so both are accepted — but the array form is the one
+ * this fleet has, and it is the one the fixtures are built from.
+ *
+ * Parsed as JSON through the frozen read calls, never by shelling out to `pm2`:
+ * the binary is not on a non-interactive PATH on any Mac in this fleet (#390's
+ * sixth failure, which bit twice while building this), and spawning a process
+ * manager from a read-only verifier would discard the property that makes a
+ * misdiagnosis unable to change anything.
+ */
+export function parsePm2DumpPins(text) {
+  let raw;
+  try {
+    raw = JSON.parse(text);
+  } catch {
+    return { apps: [], malformed: true };
+  }
+  const list = Array.isArray(raw) ? raw : Array.isArray(raw?.apps) ? raw.apps : null;
+  if (!list) return { apps: [], malformed: true };
+  const apps = [];
+  for (const app of list) {
+    const env = app?.env;
+    if (!env || typeof env !== "object") continue;
+    const pins = new Map();
+    for (const key of AGY_DEPLOYMENT_PINS) {
+      if (Object.prototype.hasOwnProperty.call(env, key)) pins.set(key, String(env[key]));
+    }
+    apps.push({ name: typeof app?.name === "string" ? app.name : null, pins });
+  }
+  return { apps, malformed: false };
+}
+
+/** A source is unavailable (not checked) rather than empty (checked, nothing there). */
+const UNAVAILABLE = Symbol("unavailable");
+
+/**
+ * Compare the three sources of truth on a pm2 host (#390).
+ *
+ * There are three, and until now nothing compared them:
+ *
+ *   file  — `ecosystem.config.cjs`, what an operator edits. `pm2 restart` does
+ *           NOT re-read it; only `delete` + `start <file>` applies a change.
+ *   dump  — `~/.pm2/dump.pm2`, what a reboot restores. `pm2 save` writes it from
+ *           the RUNNING list, so it can lag the file or drop apps entirely.
+ *   live  — the running process environment, what is serving turns right now.
+ *
+ * macbook-air had pins in `live` only: the file lacked them and the dump was
+ * stale since Aug 30. It worked, reported `immutable-path`, and no file on the
+ * host explained why — one reboot from silently losing agy.
+ *
+ * A source that could not be READ is `UNAVAILABLE`, which is a third state and
+ * never folded into "the pin is absent". Reporting "cannot tell" as "drifted"
+ * would make the check cry wolf; reporting it as "consistent" would make it
+ * useless. Both are the question-4 failure.
+ */
+export function compareAgyPinSources({ file, dump, live }) {
+  const available = Object.entries({ file, dump, live })
+    .filter(([, v]) => v !== UNAVAILABLE && v != null)
+    .map(([name, v]) => [name, v instanceof Map ? v : new Map(Object.entries(v))]);
+  const unavailable = ["file", "dump", "live"]
+    .filter((n) => !available.some(([name]) => name === n));
+  if (available.length < 2) {
+    return { status: "unknown", differences: [], unavailable, compared: available.map(([n]) => n) };
+  }
+  const differences = [];
+  for (const key of AGY_DEPLOYMENT_PINS) {
+    const present = available.filter(([, pins]) => pins.has(key));
+    if (!present.length) continue;
+    const missing = available.filter(([, pins]) => !pins.has(key)).map(([name]) => name);
+    if (missing.length) {
+      differences.push({ key, kind: "missing", in: missing, from: present.map(([n]) => n) });
+      continue;
+    }
+    const values = new Set(present.map(([, pins]) => pins.get(key)));
+    if (values.size > 1) {
+      differences.push({
+        key,
+        kind: "value",
+        sources: Object.fromEntries(present.map(([n, pins]) => [n, pins.get(key)])),
+      });
+    }
+  }
+  return {
+    status: differences.length ? "drifted" : "consistent",
+    differences,
+    unavailable,
+    compared: available.map(([n]) => n),
+  };
+}
+
+/** The consequence and the command, per drift shape. Generic advice is useless here. */
+function driftConsequence(difference, pinsFile) {
+  if (difference.kind === "value") {
+    return `${difference.key} differs between ` +
+      `${Object.entries(difference.sources).map(([s, v]) => `${s}=${v}`).join(" and ")}`;
+  }
+  const missingIn = difference.in.join(", ");
+  if (difference.in.includes("dump")) {
+    return `${difference.key} is absent from ${missingIn} — a reboot restores from ` +
+      `~/.pm2/dump.pm2 and would start without it`;
+  }
+  if (difference.in.includes("file")) {
+    return `${difference.key} is absent from ${missingIn} (${pinsFile}) — applying any ` +
+      `config change means \`pm2 delete\` + \`pm2 start\`, which would drop it`;
+  }
+  return `${difference.key} is absent from ${missingIn}`;
+}
+
 export function resolvePinSources(pinsFileText, processEnv = {}, format = null) {
   const fromFile = new Map();
   // "absent" rather than "file" when there is nothing to read, so the header
@@ -264,6 +376,7 @@ export function verifyAgyDeployment(options, io = readOnlyIo()) {
     platform = process.platform,
     probe = null,
     format = null,
+    pm2Dump = null,
   } = options;
 
   let envFileText = null;
@@ -338,6 +451,83 @@ export function verifyAgyDeployment(options, io = readOnlyIo()) {
   } else {
     checks.push(check("pins-in-file", "pass",
       `all ${AGY_DEPLOYMENT_PINS.length} pins read from ${envFile}`));
+  }
+
+  // 1b. The three sources of truth, compared (#390).
+  //
+  // This is the check that would have caught macbook-air. Everything else in
+  // this file describes the artifact; this one asks whether the configuration
+  // pointing at it will still be there after a restart or a reboot.
+  let dumpPins = UNAVAILABLE;
+  let dumpNote = null;
+  if (pm2Dump) {
+    let dumpText = null;
+    try {
+      dumpText = io.readFileSync(pm2Dump, "utf8");
+    } catch (error) {
+      dumpNote = `cannot read ${pm2Dump} (${error?.code ?? "EUNKNOWN"})`;
+    }
+    if (dumpText !== null) {
+      const parsed = parsePm2DumpPins(dumpText);
+      if (parsed.malformed) dumpNote = `${pm2Dump} is not a pm2 dump this can read`;
+      else {
+        // Match the app the ecosystem file names. Falling back to "the only app
+        // carrying AGY pins" covers a KEY=VALUE host; more than one is ambiguous
+        // and is reported as unknown rather than resolved by guessing.
+        const named = ecosystem?.app
+          ? parsed.apps.filter((a) => a.name === ecosystem.app)
+          : parsed.apps.filter((a) => a.pins.size);
+        if (named.length === 1) dumpPins = named[0].pins;
+        else if (!named.length) {
+          dumpNote = ecosystem?.app
+            ? `${pm2Dump} has no app named "${ecosystem.app}", so a reboot would not start it`
+            : `${pm2Dump} carries no AGY pins for any app`;
+          dumpPins = new Map();
+        } else dumpNote = `${pm2Dump} has ${named.length} apps carrying AGY pins`;
+      }
+    }
+  }
+
+  const livePins = Object.keys(processEnv).length
+    ? new Map(AGY_DEPLOYMENT_PINS
+      .filter((k) => Object.prototype.hasOwnProperty.call(processEnv, k))
+      .map((k) => [k, String(processEnv[k])]))
+    : UNAVAILABLE;
+
+  const filePins = envFileError || ecosystem?.ambiguous
+    ? UNAVAILABLE
+    : new Map(AGY_DEPLOYMENT_PINS
+      .filter((k) => pins[k].source === fileSource && pins[k].value !== null)
+      .map((k) => [k, pins[k].value]));
+
+  const comparison = compareAgyPinSources({ file: filePins, dump: dumpPins, live: livePins });
+  if (notDeployed) {
+    checks.push(check("pm2-state-consistent", "skipped",
+      "agy is not deployed here, so there is no configuration to compare", "agy_not_deployed"));
+  } else if (comparison.status === "unknown") {
+    checks.push(check("pm2-state-consistent", "skipped",
+      `fewer than two sources could be read (had: ${comparison.compared.join(", ") || "none"}; ` +
+      `missing: ${comparison.unavailable.join(", ")})` + (dumpNote ? `. ${dumpNote}` : "") +
+      ". Supply the running environment with --process-env <file.json> to compare all three.",
+      "sources_unavailable"));
+  } else if (comparison.status === "drifted") {
+    checks.push(check("pm2-state-consistent", "drift",
+      // The note explains WHY a source came back empty — "the dump has no app
+      // by that name" is a different fault from "the dump lacks these keys",
+      // and an operator needs the distinction to know what to run.
+      (dumpNote ? `${dumpNote}. ` : "") +
+      `${comparison.compared.join(", ")} disagree: ` +
+      comparison.differences.map((d) => driftConsequence(d, envFile)).join("; ") +
+      `. \`pm2 restart\` does not re-read ${envFile}; apply a change with ` +
+      `\`pm2 delete ${ecosystem?.app ?? "<app>"} && pm2 start ${envFile}\`, then \`pm2 save\` ` +
+      "so the next reboot restores what is actually running" +
+      (comparison.unavailable.length ? `. Not compared: ${comparison.unavailable.join(", ")}` : ""),
+      "pm2_state_drift"));
+  } else {
+    checks.push(check("pm2-state-consistent", "pass",
+      `${comparison.compared.join(", ")} agree on all ${AGY_DEPLOYMENT_PINS.length} pins` +
+      (comparison.unavailable.length
+        ? `. Not compared: ${comparison.unavailable.join(", ")}` : "")));
   }
 
   const runtimeRoot = value("AGY_RUNTIME_ROOT");
@@ -510,9 +700,11 @@ export function verifyAgyDeployment(options, io = readOnlyIo()) {
   return {
     schemaVersion: AGY_DEPLOYMENT_SCHEMA_VERSION,
     kind: "agy-deployment-verification",
-    verdict: notDeployed
-      ? "not-deployed"
-      : checks.some((c) => c.status === "fail") ? "fail" : "pass",
+    // Precedence: a wrong artifact outranks fragile configuration, which
+    // outranks "agy is not here". Each is a different remediation.
+    verdict: checks.some((c) => c.status === "fail") ? "fail"
+      : notDeployed ? "not-deployed"
+        : checks.some((c) => c.status === "drift") ? "drift" : "pass",
     // Always false, and asserted by the tests against a byte-level snapshot of
     // the host tree. A verifier that could repair would be a deployment tool
     // that half-applies, which is the outcome this whole story exists under.
@@ -520,6 +712,8 @@ export function verifyAgyDeployment(options, io = readOnlyIo()) {
     observed: {
       pinsFile: envFile,
       pinsFileFormat: fileSource,
+      pm2Dump,
+      pinSourcesCompared: comparison.compared,
       pm2App: ecosystem?.app ?? null,
       runtimeParent: path.resolve(runtimeParent),
       pinSources: Object.fromEntries(
@@ -535,7 +729,7 @@ export function verifyAgyDeployment(options, io = readOnlyIo()) {
 }
 
 export function formatDeploymentReport(report) {
-  const glyph = { pass: "PASS", fail: "FAIL", skipped: "SKIP" };
+  const glyph = { pass: "PASS", fail: "FAIL", skipped: "SKIP", drift: "DRIFT" };
   const lines = [
     `agy deployment: ${report.verdict.toUpperCase()}  (host was not modified)`,
     `  pins file      ${report.observed.pinsFile} (${report.observed.pinsFileFormat})`,
@@ -561,7 +755,7 @@ export function formatDeploymentReport(report) {
  * the script cannot report, catch or work around it.
  */
 export const AGY_DEPLOYMENT_FLAGS = Object.freeze([
-  "--pins-file", "--format", "--runtime-parent", "--process-env", "--probe", "--json",
+  "--pins-file", "--format", "--runtime-parent", "--process-env", "--pm2-dump", "--probe", "--json",
 ]);
 
 /**
@@ -577,11 +771,27 @@ export const AGY_DEPLOYMENT_FLAGS = Object.freeze([
 export function exitCodeFor(verdict) {
   if (verdict === "pass") return 0;
   if (verdict === "not-deployed") return 3;
+  // 4 is its own code because drift is not "misdeployed": the host is serving
+  // turns correctly and will not survive a restart. The remediation is
+  // `pm2 save` / `delete` + `start`, not re-staging the artifact, and a
+  // caller that cannot tell those apart will do the wrong one.
+  if (verdict === "drift") return 4;
   return 1;
 }
 
+/**
+ * Where pm2 keeps the dump on every host in this fleet. Not derived from `pm2`
+ * itself: the binary is absent from a non-interactive PATH on all three Macs
+ * (#390's sixth failure), so asking it would fail in the exact situation this
+ * check exists to examine.
+ */
+function defaultPm2Dump() {
+  const home = process.env.PM2_HOME ?? (process.env.HOME ? path.join(process.env.HOME, ".pm2") : null);
+  return home ? path.join(home, "dump.pm2") : null;
+}
+
 function parseArgs(argv) {
-  const opts = { probe: null, json: false, processEnv: {} };
+  const opts = { probe: null, json: false, processEnv: {}, pm2Dump: defaultPm2Dump() };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === "--pins-file") opts.envFile = argv[++i];
@@ -599,6 +809,7 @@ function parseArgs(argv) {
     else if (arg === "--format") opts.format = argv[++i];
     else if (arg === "--runtime-parent") opts.runtimeParent = argv[++i];
     else if (arg === "--process-env") opts.processEnvFile = argv[++i];
+    else if (arg === "--pm2-dump") opts.pm2Dump = argv[++i];
     else if (arg === "--probe") opts.probe = true;
     else if (arg === "--json") opts.json = true;
     else throw new Error(`unknown argument: ${arg}`);

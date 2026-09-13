@@ -143,15 +143,35 @@ pm2 process environment and in no file anywhere (#390). Each was repaired in
 isolation because there was no way to ask a host whether it was correct.
 
 ```
-node scripts/verify-agy-deployment.mjs --env-file ~/.seam/bridge.env
-node scripts/verify-agy-deployment.mjs --env-file ~/.seam/bridge.env --probe --json
+node scripts/verify-agy-deployment.mjs --pins-file ~/.seam/bridge/ecosystem.config.cjs
+node scripts/verify-agy-deployment.mjs --pins-file ~/.seam/bridge/ecosystem.config.cjs --probe --json
 ```
 
-Exit status is 0 for a host matching the reference layout and 1 for one that
-does not. **It cannot repair anything.** Its entire filesystem surface is five
-read calls — `stat`, `lstat`, `readFile`, `access`, `realpath` — so a
-misdiagnosis cannot take an agy-only laptop to zero agents; repair is always a
-deliberate `stage-agy-runtime.mjs` run by an operator who has read the output.
+That is where every agy host in the fleet keeps its pins — as a JS object
+literal inside the `env:` block of the `seam-bridge` app, **not** as
+`KEY=VALUE`. The first version of this document specified `~/.seam/bridge.env`,
+a path that exists on no host, and the verifier could only read `KEY=VALUE`, so
+it returned one false FAIL and eight skips on every correctly-pinned host
+(#395). Both formats are read now, detected by content; `--env-file` is still
+accepted as a synonym.
+
+Exit status is **0** for a host matching the reference layout, **1** for one
+that does not, and **3** for a host where agy is not deployed at all — no pins
+file and no AGY pins anywhere. `media-server` is the third case, and it is an
+accurate observation rather than a failure, so a rollout script has to be able
+to tell it from the second.
+
+**It cannot repair anything.** Its entire filesystem surface is five read
+calls — `stat`, `lstat`, `readFile`, `access`, `realpath` — so a misdiagnosis
+cannot take an agy-only laptop to zero agents; repair is always a deliberate
+`stage-agy-runtime.mjs` run by an operator who has read the output. The
+ecosystem file is read as **text and never executed**: `require()`ing host
+config would hand it this process and discard that guarantee to save a regex.
+The matcher is correspondingly strict — a commented-out pin, a value spanning
+lines or built by concatenation, a pin nested deeper inside `env`, and a pin in
+a second app's `env` block are all refused rather than guessed at, because a
+lenient match over JS syntax yields a quiet false PASS, which is the one
+outcome worse than a refusal here.
 
 ### The reference layout, as checked
 
@@ -163,6 +183,19 @@ deliberate `stage-agy-runtime.mjs` run by an operator who has read the output.
    August, and one reboot would have brought it back with no pins and no trail
    back to a cause. Pass `--process-env <file.json>` to supply the live
    environment and have the difference named.
+
+   There are **three** pin sources, not two, and the report labels which one
+   each pin came from. `file` is a `KEY=VALUE` file. `process-env` is the
+   failure above. `pm2-ecosystem` is the fleet's actual arrangement and
+   **passes**: the pins are recorded on disk, which is what this check asks.
+   The pm2 lifecycle hazard is real but belongs to pm2 rather than to the
+   host's deployment being wrong (#390), so it is reported as a consequence in
+   the detail line instead of as the verdict — `pm2 restart` does **not**
+   re-read the ecosystem file (only `pm2 delete <app> && pm2 start <file>`
+   does), and a reboot restores from `~/.pm2/dump.pm2` rather than from the
+   file, so `pm2 save` after any change is what makes the pins survive. Failing
+   this state instead would mean no host in the fleet could reach the passing
+   state, which is a gate nobody can satisfy.
 2. **`layout-canonical`** — `AGY_CLI_PATH` is exactly
    `<AGY_RUNTIME_ROOT>/<AGY_SHA256>/agy`.
 3. **`runtime-root-managed`** — `AGY_RUNTIME_ROOT` is under

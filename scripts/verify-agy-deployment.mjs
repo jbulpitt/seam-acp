@@ -32,6 +32,7 @@
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   AGY_PINS,
   DEFAULT_RUNTIME_PARENT,
@@ -74,31 +75,172 @@ function check(id, status, detail, reasonCode) {
 }
 
 /**
+ * Blank out `//` and block comments while preserving every newline, so line
+ * positions survive. String-aware, because a `//` inside a path value is not a
+ * comment — and `AGY_CLI_PATH` is full of slashes.
+ */
+export function stripJsComments(src) {
+  let out = "";
+  let i = 0;
+  let inString = null;
+  while (i < src.length) {
+    const c = src[i];
+    const next = src[i + 1];
+    if (inString) {
+      out += c;
+      if (c === "\\") { out += next ?? ""; i += 2; continue; }
+      if (c === inString) inString = null;
+      i += 1;
+      continue;
+    }
+    if (c === '"' || c === "'" || c === "`") { inString = c; out += c; i += 1; continue; }
+    if (c === "/" && next === "/") {
+      while (i < src.length && src[i] !== "\n") { out += " "; i += 1; }
+      continue;
+    }
+    if (c === "/" && next === "*") {
+      out += "  "; i += 2;
+      while (i < src.length && !(src[i] === "*" && src[i + 1] === "/")) {
+        out += src[i] === "\n" ? "\n" : " ";
+        i += 1;
+      }
+      out += "  "; i += 2;
+      continue;
+    }
+    out += c;
+    i += 1;
+  }
+  return out;
+}
+
+/** Index of the `}` matching the `{` at `open`, or -1. String-aware. */
+function matchBrace(src, open) {
+  let depth = 0;
+  let inString = null;
+  for (let i = open; i < src.length; i += 1) {
+    const c = src[i];
+    if (inString) {
+      if (c === "\\") { i += 1; continue; }
+      if (c === inString) inString = null;
+      continue;
+    }
+    if (c === '"' || c === "'" || c === "`") { inString = c; continue; }
+    if (c === "{") depth += 1;
+    else if (c === "}") { depth -= 1; if (depth === 0) return i; }
+  }
+  return -1;
+}
+
+/** Only a complete single-line string literal counts as a pin value. */
+const PM2_PIN_LINE =
+  /^\s*(?:(AGY_[A-Za-z0-9_]+)|"(AGY_[A-Za-z0-9_]+)"|'(AGY_[A-Za-z0-9_]+)')\s*:\s*(?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)')\s*,?\s*$/;
+
+/**
+ * Read AGY pins out of a pm2 ecosystem file WITHOUT executing it (#395).
+ *
+ * `require()`ing host config here would hand arbitrary host code the verifier's
+ * process, which is precisely the property `readOnlyIo()` exists to guarantee
+ * away — a misdiagnosis must not be able to take an agy-only laptop to zero
+ * agents, and running the file makes that guarantee unprovable. So this is a
+ * text scan, and it is deliberately strict rather than lenient: a lenient match
+ * over JS syntax produces a quiet FALSE PASS, which is worse here than a
+ * refusal, because the whole tool exists to tell an operator the truth about a
+ * host that looks fine.
+ *
+ * What it will not accept, each for a reason:
+ *   - a commented-out pin — comments are blanked first;
+ *   - a pin whose value spans lines, or is a concatenation, template or
+ *     variable reference — the line must be a whole string literal;
+ *   - a pin nested inside some deeper object within `env` — depth is tracked;
+ *   - pins spread across more than one app's env block, which is ambiguous
+ *     rather than wrong, and is reported as such instead of guessed at.
+ */
+export function parsePm2EcosystemPins(text) {
+  const src = stripJsComments(text);
+  const blocks = [];
+  for (const match of src.matchAll(/\benv(?:_[A-Za-z0-9_]+)?\s*:\s*\{/g)) {
+    const open = match.index + match[0].length - 1;
+    const end = matchBrace(src, open);
+    if (end < 0) continue;
+    const before = src.slice(0, match.index);
+    const names = [...before.matchAll(/\bname\s*:\s*(?:"([^"]*)"|'([^']*)')/g)];
+    const last = names[names.length - 1];
+    const pins = new Map();
+    let depth = 0;
+    for (const rawLine of src.slice(open + 1, end).split("\n")) {
+      if (depth === 0) {
+        const pin = PM2_PIN_LINE.exec(rawLine);
+        if (pin) {
+          const key = pin[1] ?? pin[2] ?? pin[3];
+          const value = pin[4] ?? pin[5] ?? "";
+          pins.set(key, value.replace(/\\(.)/g, "$1"));
+        }
+      }
+      for (const c of rawLine.replace(/"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'/g, "")) {
+        if (c === "{" || c === "[") depth += 1;
+        else if (c === "}" || c === "]") depth -= 1;
+      }
+    }
+    if (pins.size) blocks.push({ app: last?.[1] ?? last?.[2] ?? null, pins });
+  }
+  return {
+    blocks,
+    ambiguous: blocks.length > 1,
+    pins: blocks.length === 1 ? blocks[0].pins : new Map(),
+    app: blocks.length === 1 ? blocks[0].app : null,
+  };
+}
+
+/** Does this text look like a pm2 ecosystem module rather than a KEY=VALUE file? */
+export function looksLikePm2Ecosystem(text) {
+  return /\bmodule\s*\.\s*exports\s*=/.test(stripJsComments(text ?? ""));
+}
+
+/**
  * Where each pin actually resolves from.
  *
- * The distinction is the point. A pin present in the live process environment
- * and absent from every file is not "configured" — macbook-air reported
- * `provenance mode: immutable-path` from exactly that state, with a `dump.pm2`
- * stale since August, and a reboot would have resurrected it without pins and
- * dropped agy with no trail back to a cause.
+ * The distinction is the point, and there are THREE sources rather than two.
+ * A pin present in the live process environment and absent from every file is
+ * not "configured" — macbook-air reported `provenance mode: immutable-path`
+ * from exactly that state, with a `dump.pm2` stale since August, and a reboot
+ * would have resurrected it without pins and dropped agy with no trail back to
+ * a cause. A pin in the pm2 ecosystem file IS recorded on disk, but pm2 only
+ * re-reads that file on `delete` + `start <file>`, so it is its own state with
+ * its own consequence and is labelled separately (#395).
  */
-export function resolvePinSources(envFileText, processEnv = {}) {
+export function resolvePinSources(pinsFileText, processEnv = {}, format = null) {
   const fromFile = new Map();
-  if (typeof envFileText === "string") {
-    const { index } = parseEnvFile(envFileText);
-    for (const key of AGY_DEPLOYMENT_PINS) {
-      const found = index.get(key);
-      if (found !== undefined) fromFile.set(key, found.value);
+  // "absent" rather than "file" when there is nothing to read, so the header
+  // does not label a missing file with the format it would have had.
+  let fileSource = typeof pinsFileText === "string" ? "file" : "absent";
+  let ecosystem = null;
+  if (typeof pinsFileText === "string") {
+    const isEcosystem = format === "pm2-ecosystem"
+      || (format === null && looksLikePm2Ecosystem(pinsFileText));
+    if (isEcosystem) {
+      fileSource = "pm2-ecosystem";
+      ecosystem = parsePm2EcosystemPins(pinsFileText);
+      if (!ecosystem.ambiguous) {
+        for (const key of AGY_DEPLOYMENT_PINS) {
+          if (ecosystem.pins.has(key)) fromFile.set(key, ecosystem.pins.get(key));
+        }
+      }
+    } else {
+      const { index } = parseEnvFile(pinsFileText);
+      for (const key of AGY_DEPLOYMENT_PINS) {
+        const found = index.get(key);
+        if (found !== undefined) fromFile.set(key, found.value);
+      }
     }
   }
   const sources = {};
   for (const key of AGY_DEPLOYMENT_PINS) {
-    if (fromFile.has(key)) sources[key] = { value: fromFile.get(key), source: "file" };
+    if (fromFile.has(key)) sources[key] = { value: fromFile.get(key), source: fileSource };
     else if (Object.prototype.hasOwnProperty.call(processEnv, key)) {
       sources[key] = { value: processEnv[key], source: "process-env" };
     } else sources[key] = { value: null, source: "absent" };
   }
-  return sources;
+  return { sources, fileSource, ecosystem };
 }
 
 /** The canonical executable for a root and digest, per docs/agy-native-runtime.md. */
@@ -121,6 +263,7 @@ export function verifyAgyDeployment(options, io = readOnlyIo()) {
     runtimeParent = DEFAULT_RUNTIME_PARENT,
     platform = process.platform,
     probe = null,
+    format = null,
   } = options;
 
   let envFileText = null;
@@ -131,29 +274,70 @@ export function verifyAgyDeployment(options, io = readOnlyIo()) {
     envFileError = error?.code ?? "EUNKNOWN";
   }
 
-  const pins = resolvePinSources(envFileText, processEnv);
+  const { sources: pins, fileSource, ecosystem } =
+    resolvePinSources(envFileText, processEnv, format);
   const value = (key) => pins[key]?.value ?? null;
   const checks = [];
 
-  // 1. Pins must live in a file the bridge re-reads, not in process state.
-  if (envFileError) {
+  const absent = AGY_DEPLOYMENT_PINS.filter((k) => pins[k].source === "absent");
+  const processOnly = AGY_DEPLOYMENT_PINS.filter((k) => pins[k].source === "process-env");
+
+  // A host with no pins file and no AGY pins anywhere is NOT DEPLOYED, which is
+  // a different fact from being deployed wrongly. media-server is exactly this:
+  // it runs a bridge and no agy. Reporting that as a failure would be the
+  // question-4 error this tool exists to avoid — it would describe a correct
+  // host as broken — so it gets its own verdict and its own exit status.
+  // "Ambiguous" is emphatically not "absent": a file with AGY pins in two apps
+  // has agy deployed and cannot say which app owns it. Letting that fall into
+  // the not-deployed path would report a configuration conflict as a host that
+  // simply does not run agy.
+  const notDeployed = absent.length === AGY_DEPLOYMENT_PINS.length
+    && !processOnly.length
+    && !ecosystem?.ambiguous;
+
+  // 1. Pins must live in a file, not only in volatile process state.
+  if (notDeployed) {
+    checks.push(check("pins-in-file", "skipped",
+      envFileError
+        ? `no pins file at ${envFile} (${envFileError}) and no AGY pins in the process environment`
+        : `${envFile} carries no AGY pins, and neither does the process environment`,
+      "agy_not_deployed"));
+  } else if (envFileError) {
     checks.push(check("pins-in-file", "fail",
       `cannot read pins file ${envFile} (${envFileError})`, "pins_file_unreadable"));
+  } else if (ecosystem?.ambiguous) {
+    checks.push(check("pins-in-file", "fail",
+      `AGY pins appear in ${ecosystem.blocks.length} separate env blocks ` +
+      `(${ecosystem.blocks.map((b) => b.app ?? "unnamed").join(", ")}); ` +
+      `which app serves agy cannot be determined from the file alone`,
+      "pins_in_multiple_apps"));
+  } else if (processOnly.length) {
+    checks.push(check("pins-in-file", "fail",
+      `present only in the live process environment, absent from ${envFile}: ` +
+      `${processOnly.join(", ")} — a restart resurrects this host without them`,
+      "pins_only_in_process_env"));
+  } else if (absent.length) {
+    checks.push(check("pins-in-file", "fail",
+      `absent from ${envFile} and from the process environment: ${absent.join(", ")}`,
+      "pins_missing"));
+  } else if (fileSource === "pm2-ecosystem") {
+    // PASS, deliberately. The question this check asks is whether the pins are
+    // recorded on disk rather than existing only in volatile process state, and
+    // here they are — in the file the whole fleet actually uses. Failing it
+    // would mean no host in the fleet can reach the passing state, which is a
+    // gate nobody can satisfy. The pm2 lifecycle hazard below is real but it is
+    // a property of pm2, not of this host being misdeployed (#390), so it is
+    // reported as the consequence rather than as the verdict.
+    checks.push(check("pins-in-file", "pass",
+      `all ${AGY_DEPLOYMENT_PINS.length} pins read from the pm2 ecosystem file ` +
+      `${envFile}${ecosystem?.app ? ` (app "${ecosystem.app}")` : ""}. ` +
+      `pm2 re-reads this file only on \`pm2 delete <app> && pm2 start ${envFile}\` — ` +
+      `\`pm2 restart\` does not — and a reboot restores from ~/.pm2/dump.pm2, not ` +
+      `from here, so run \`pm2 save\` after any change or the next boot uses the ` +
+      `last saved process list instead`));
   } else {
-    const absent = AGY_DEPLOYMENT_PINS.filter((k) => pins[k].source === "absent");
-    const processOnly = AGY_DEPLOYMENT_PINS.filter((k) => pins[k].source === "process-env");
-    if (processOnly.length) {
-      checks.push(check("pins-in-file", "fail",
-        `present only in the live process environment, absent from ${envFile}: ` +
-        `${processOnly.join(", ")} — a restart resurrects this host without them`,
-        "pins_only_in_process_env"));
-    } else if (absent.length) {
-      checks.push(check("pins-in-file", "fail",
-        `absent from ${envFile} and from the process environment: ${absent.join(", ")}`,
-        "pins_missing"));
-    } else {
-      checks.push(check("pins-in-file", "pass", `all ${AGY_DEPLOYMENT_PINS.length} pins read from ${envFile}`));
-    }
+    checks.push(check("pins-in-file", "pass",
+      `all ${AGY_DEPLOYMENT_PINS.length} pins read from ${envFile}`));
   }
 
   const runtimeRoot = value("AGY_RUNTIME_ROOT");
@@ -326,13 +510,17 @@ export function verifyAgyDeployment(options, io = readOnlyIo()) {
   return {
     schemaVersion: AGY_DEPLOYMENT_SCHEMA_VERSION,
     kind: "agy-deployment-verification",
-    verdict: checks.some((c) => c.status === "fail") ? "fail" : "pass",
+    verdict: notDeployed
+      ? "not-deployed"
+      : checks.some((c) => c.status === "fail") ? "fail" : "pass",
     // Always false, and asserted by the tests against a byte-level snapshot of
     // the host tree. A verifier that could repair would be a deployment tool
     // that half-applies, which is the outcome this whole story exists under.
     mutated: false,
     observed: {
-      envFile,
+      pinsFile: envFile,
+      pinsFileFormat: fileSource,
+      pm2App: ecosystem?.app ?? null,
       runtimeParent: path.resolve(runtimeParent),
       pinSources: Object.fromEntries(
         AGY_DEPLOYMENT_PINS.map((k) => [k, pins[k].source])),
@@ -350,7 +538,7 @@ export function formatDeploymentReport(report) {
   const glyph = { pass: "PASS", fail: "FAIL", skipped: "SKIP" };
   const lines = [
     `agy deployment: ${report.verdict.toUpperCase()}  (host was not modified)`,
-    `  pins file      ${report.observed.envFile}`,
+    `  pins file      ${report.observed.pinsFile} (${report.observed.pinsFileFormat})`,
     `  runtime root   ${report.observed.runtimeRoot ?? "(unset)"}`,
     `  version        ${report.observed.version ?? "(unset)"}`,
     "",
@@ -370,14 +558,15 @@ function parseArgs(argv) {
   const opts = { probe: null, json: false, processEnv: {} };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
-    if (arg === "--env-file") opts.envFile = argv[++i];
+    if (arg === "--pins-file" || arg === "--env-file") opts.envFile = argv[++i];
+    else if (arg === "--format") opts.format = argv[++i];
     else if (arg === "--runtime-parent") opts.runtimeParent = argv[++i];
     else if (arg === "--process-env") opts.processEnvFile = argv[++i];
     else if (arg === "--probe") opts.probe = true;
     else if (arg === "--json") opts.json = true;
     else throw new Error(`unknown argument: ${arg}`);
   }
-  if (!opts.envFile) throw new Error("--env-file is required");
+  if (!opts.envFile) throw new Error("--pins-file is required");
   return opts;
 }
 
@@ -388,10 +577,27 @@ export async function main(argv, out = console) {
   }
   const report = verifyAgyDeployment(opts);
   out.log(opts.json ? JSON.stringify(report, null, 2) : formatDeploymentReport(report));
-  return report.verdict === "pass" ? 0 : 1;
+  // 0 correct, 1 misdeployed, 3 agy is not deployed here at all. A rollout
+  // script must be able to tell the third from the second.
+  if (report.verdict === "pass") return 0;
+  return report.verdict === "not-deployed" ? 3 : 1;
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+/**
+ * Run only when invoked directly. Compared through `realpath` because on macOS
+ * `/tmp` is a symlink to `/private/tmp`: `import.meta.url` resolves the link and
+ * `process.argv[1]` does not, so the naive string comparison silently does
+ * nothing and exits 0 — which is exactly how this was found, running the
+ * verifier from `/tmp` on three Macs and getting no output at all.
+ */
+const invokedDirectly = (() => {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  const real = (p) => { try { return fs.realpathSync(p); } catch { return p; } };
+  return real(fileURLToPath(import.meta.url)) === real(entry);
+})();
+
+if (invokedDirectly) {
   main(process.argv.slice(2))
     .then((code) => { process.exitCode = code; })
     .catch((error) => {

@@ -280,7 +280,10 @@ function buildGeneration(
   if (!pricing) diagnostics.push("GitHub pricing source unavailable; no validated snapshot");
   const availability: AgentModelAvailability[] = [];
   for (const binding of fleet) {
-    if (binding.state === "warming" || !binding.snapshot) {
+    // `retired` is positive evidence about this one removed local adapter.
+    // Refuse only its stale models; every configured/offline-remote binding
+    // continues through the same enrichment path (#381).
+    if (binding.state === "warming" || binding.state === "retired" || !binding.snapshot) {
       diagnostics.push(`${binding.binding.agentId}@${binding.binding.location}: catalog ${binding.state}`);
       continue;
     }
@@ -379,7 +382,7 @@ function toAvailability(binding: CatalogFleetBinding, model: CatalogModel): Agen
     effortMechanism: model.effort.mechanism, priceCategory: model.pricingCategory,
     modelDefault: model.default,
     catalogProvider: snapshot.candidate.scope.provider, catalogGeneration: snapshot.generation,
-    catalogScope: snapshot.scopeKey, catalogState: binding.state,
+    catalogScope: snapshot.scopeKey, catalogState: binding.state === "stale" ? "stale" : "ready",
     catalogFetchedAt: snapshot.candidate.fetchedAt, description: model.description, evidence: model.evidence,
     applicationMode: model.applicationMode, executionBindings: model.bindings,
   };

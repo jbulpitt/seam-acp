@@ -413,12 +413,13 @@ async function main(): Promise<void> {
   const modelCatalog = new ModelCatalogService({
     store: modelCatalogStore,
     logger: logger.child({ mod: "model-catalog" }),
+    configuredLocalAgentIds: () => profiles.map((profile) => profile.id),
     bindings: () => {
       const bindings = profiles.map((profile) => ({ agentId: profile.id, location: "local" }));
       // Re-read durable observations on each orchestration pass so a
       // remote-only adapter first seen during this process remains part of
       // manual/scheduled refresh-all after its bridge disconnects.
-      bindings.push(...modelCatalogStore.loadObservations()
+      bindings.push(...modelCatalogStore.loadCurrentObservations()
         .map(({ agentId, location }) => ({ agentId, location })));
       for (const bridge of bridgeHub?.listConnected() ?? []) {
         for (const [agentId, info] of bridge.agents) {

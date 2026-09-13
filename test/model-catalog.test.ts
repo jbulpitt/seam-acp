@@ -185,7 +185,7 @@ describe("ModelCatalogService", () => {
     const columns = check.prepare("PRAGMA table_info(model_catalog_observations)").all() as Array<{ name: string }>;
     check.close();
     expect(columns.map((column) => column.name)).toEqual(expect.arrayContaining([
-      "schema_version", "source_version",
+      "schema_version", "source_version", "retired_at", "retirement_reason",
     ]));
   });
 
@@ -590,6 +590,81 @@ describe("ModelCatalogService", () => {
     expect(catalog.models(binding)).toHaveLength(1);
     expect(await catalog.refresh(binding)).toMatchObject({ result: "unavailable", ok: true });
     expect(catalog.models(binding)).toHaveLength(1);
+    opened.store.close();
+  });
+
+  it("retires only a positively removed local adapter and preserves an offline remote observation", async () => {
+    const opened = db();
+    const removedLocal = { agentId: "agy-package", location: "local" };
+    const offlineRemote = { agentId: "agy", location: "jennifer-laptop" };
+    const seeded = service({
+      store: opened.store,
+      bindings: [removedLocal, offlineRemote],
+      fetch: async (binding) => candidate([binding.location === "local" ? "legacy" : "remote-live"]),
+    });
+    expect((await seeded.refresh(removedLocal)).result).toBe("published");
+    expect((await seeded.refresh(offlineRemote)).result).toBe("published");
+    const remoteGeneration = seeded.lookup(offlineRemote).snapshot!.generation;
+
+    const currentBindings = () => opened.store.loadCurrentObservations()
+      .map(({ agentId, location }) => ({ agentId, location }));
+    const afterRemoval = new ModelCatalogService({
+      store: opened.store,
+      logger,
+      configuredLocalAgentIds: () => [],
+      bindings: currentBindings,
+      fetch: async () => { throw new Error("offline fixtures must remain cache-only"); },
+      isOnline: () => false,
+      now: () => new Date("2026-09-12T12:34:56.000Z"),
+      refreshCron: "0 0 1 1 *",
+    });
+    const observations = new Map(opened.store.loadObservations()
+      .map((row) => [row.bindingKey, row]));
+
+    // The removed local adapter is the only uncertain capability. Its row is
+    // retained for audit, but it no longer participates in the live fleet.
+    expect(observations.get("agy-package@local")).toMatchObject({
+      retiredAt: "2026-09-12T12:34:56.000Z",
+      retirementReason: "local adapter no longer configured",
+    });
+    expect(afterRemoval.knownBindings()).not.toContainEqual(removedLocal);
+    expect(afterRemoval.fleetSnapshot()).toContainEqual({
+      binding: removedLocal,
+      state: "retired",
+      snapshot: null,
+    });
+    expect(afterRemoval.availableModels().some(({ binding }) =>
+      binding.agentId === "agy-package" && binding.location === "local"
+    )).toBe(false);
+
+    // A remote host's absence from this server's local profiles proves
+    // nothing. Even after arbitrary downtime its durable fleet evidence stays
+    // current and serves as a stale last-known-good snapshot.
+    expect(observations.get("agy@jennifer-laptop")).toMatchObject({
+      retiredAt: null,
+      retirementReason: null,
+    });
+    expect(afterRemoval.knownBindings()).toContainEqual(offlineRemote);
+    expect(afterRemoval.lookup(offlineRemote)).toMatchObject({
+      state: "stale",
+      snapshot: { generation: remoteGeneration },
+    });
+    expect(afterRemoval.models(offlineRemote).map((entry) => entry.id)).toEqual(["remote-live"]);
+
+    // Marking is reversible: a later explicit local configuration is positive
+    // evidence that this binding is current again; no catalog bytes were lost.
+    const restored = new ModelCatalogService({
+      store: opened.store,
+      logger,
+      configuredLocalAgentIds: () => ["agy-package"],
+      bindings: currentBindings,
+      fetch: async () => { throw new Error("restore must remain cache-only"); },
+      refreshCron: "0 0 1 1 *",
+    });
+    expect(opened.store.loadObservations().find((row) => row.bindingKey === "agy-package@local"))
+      .toMatchObject({ retiredAt: null, retirementReason: null });
+    expect(restored.knownBindings()).toContainEqual(removedLocal);
+    expect(restored.models(removedLocal).map((entry) => entry.id)).toEqual(["legacy"]);
     opened.store.close();
   });
 

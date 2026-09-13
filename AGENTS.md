@@ -261,6 +261,34 @@ Two supporting habits, both of which have already paid for themselves here:
   redundant with something else — all three are question-1 answers. Several
   deletions in #362 and #364 started as a survived mutation nobody hid.
 
+### A review that returns no verdict is not a pass
+
+This is question 4 turned on the review process itself. A review turn can come
+back empty for reasons that have nothing to do with the code: a vendor input
+filter, a crashed adapter, a zero-character turn from a lost session, a worker
+that ran out of context. **What arrives is an absence of findings, which on a
+screen is indistinguishable from a review that found nothing wrong.**
+
+So: an empty or refused review is neither PASS nor FAIL. Re-issue it, and
+record in the PR that the first attempt returned no verdict — the record is the
+point, because the failure mode is silent by construction. If a second attempt
+also returns nothing, move the review to a different agent family rather than
+retrying, and say that you did: reviewer independence is what you just spent to
+keep, and a later reader needs to know which reviewer actually looked.
+
+Four QA turns were lost to this in one day in September 2026 (#313), each
+returning no work at all. The vendor filter that caused those specific losses
+did not reproduce when it was re-tested on 2026-09-12, so do not write briefs
+around it. The way the loss was *read* is the durable hazard, and that part is
+not vendor-specific.
+
+One related habit, for a different reason: **in this repo, "break the
+production path" is not a metaphor.** Workers here hold host access and deploy
+authority. Keep review briefs as adversarial as they need to be — that framing
+is why reviews here catch vacuous tests and real bypasses — but aim the verbs
+at a named artifact rather than at the running system, for the same reason the
+blast-radius rule above exists.
+
 ## ⚠️ CRITICAL: Applying code changes or restarting the app
 
 Production now runs Seam and the shared Pronoa Playwright MCP as separate

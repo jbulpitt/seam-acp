@@ -131,8 +131,83 @@ fingerprint, or environment value. Bridge hello validates that reduced shape
 before accepting or persisting it.
 
 This gives pin changes a durable before/after chronology without treating bare
-environment edits as sanctioned conversational mutations. Artifact staging,
-promotion, and rollback remain R9 work.
+environment edits as sanctioned conversational mutations.
+
+## Verifying an already-deployed host (#265)
+
+`scripts/stage-agy-runtime.mjs` migrates a host and #266's gate guards an
+upgrade. Neither describes a host that is already running, and on 2026-09-12
+all five hosts turned out to be shaped differently — two staged under
+`/opt/seam`, two under `$HOME`, and one with its pins present only in a live
+pm2 process environment and in no file anywhere (#390). Each was repaired in
+isolation because there was no way to ask a host whether it was correct.
+
+```
+node scripts/verify-agy-deployment.mjs --env-file ~/.seam/bridge.env
+node scripts/verify-agy-deployment.mjs --env-file ~/.seam/bridge.env --probe --json
+```
+
+Exit status is 0 for a host matching the reference layout and 1 for one that
+does not. **It cannot repair anything.** Its entire filesystem surface is five
+read calls — `stat`, `lstat`, `readFile`, `access`, `realpath` — so a
+misdiagnosis cannot take an agy-only laptop to zero agents; repair is always a
+deliberate `stage-agy-runtime.mjs` run by an operator who has read the output.
+
+### The reference layout, as checked
+
+1. **`pins-in-file`** — all six of `AGY_RUNTIME_ROOT`, `AGY_SHA256`,
+   `AGY_CLI_PATH`, `AGY_VERSION`, `AGY_DEFAULT_MODEL` and `AGY_ENABLED`
+   resolve from a *file*. A pin that resolves only from the running process is
+   a failure, not a pass: macbook-air reported `provenance mode:
+   immutable-path` from exactly that state with a `dump.pm2` stale since
+   August, and one reboot would have brought it back with no pins and no trail
+   back to a cause. Pass `--process-env <file.json>` to supply the live
+   environment and have the difference named.
+2. **`layout-canonical`** — `AGY_CLI_PATH` is exactly
+   `<AGY_RUNTIME_ROOT>/<AGY_SHA256>/agy`.
+3. **`runtime-root-managed`** — `AGY_RUNTIME_ROOT` is under
+   `/opt/seam/agy-runtime` (override with `--runtime-parent`).
+4. **`artifact-present`** — a regular, non-symlink file is actually there. It
+   is a first-class check because agy 1.1.27 vanished from two of the three
+   hosts that had it during #342; a verified copy is archived precisely because
+   reproducibility failed in practice.
+5. **`artifact-digest`** — the bytes hash to `AGY_SHA256`.
+6. **`artifact-mode`** — `0555`.
+7. **`path-not-symlinked`** — `AGY_CLI_PATH` is already its own real path. A
+   link anywhere in the chain means the ancestor walk inspects one directory
+   chain while exec follows another.
+8. **`ancestors-durable`** — every component up to `/` is root-owned.
+
+### Why `ancestors-durable` is stricter than the runtime check
+
+The runtime asks *can the service user write this right now*. A `0555`
+directory the service user **owns** answers no — and the owner can `chmod` it
+back at any moment. So a host in that state reports `immutable-path` while
+remaining replaceable, which is why this failure has survived every previous
+audit. The report names the components the running bridge accepts today, so an
+operator does not read a true refusal as a false positive on a host where agy
+is visibly working.
+
+This check fails on every platform, not only darwin. The runtime enforces the
+ancestor walk on darwin (#332) because there the path is the only binding
+between verified and executed bytes; the question here is a different one —
+whether the host matches the reference layout — and a Linux host under `$HOME`
+does not, even while it works.
+
+### What this does not tell you
+
+`capability` is **skipped** unless `--probe` is passed, and a skipped check is
+reported as skipped rather than omitted. Identity is not capability: agy 1.2.2
+had a valid digest, immutable provenance and a working `--version` on
+macbook-pro while its language server rejected every subscription (#371).
+`--probe` runs the same prompt-free `agy --log-file <temp> models` check
+staging uses — no `-p`, no prompt, nothing billable (#361).
+
+There is deliberately **no version allowlist or blocklist**, matching the
+upgrade gate: evidence binds to an exact version and digest, and `1.2.2` is an
+incident label rather than a runtime policy. A correctly staged 1.2.2 host
+passes identity here and is caught by `--probe` or by #266, not by its version
+string.
 
 ## Pre-deployment migration for the current 1.2.0 host
 

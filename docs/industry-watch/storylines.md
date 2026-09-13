@@ -13,8 +13,8 @@ Promote only if §4's inclusion bar hits. After 14 quiet daily sweeps, set
 - **status:** shipping
 - **confidence:** confirmed
 - **last_movement:** 2026-09-11
-- **last_checked:** 2026-09-12
-- **quiet_sweeps:** 1
+- **last_checked:** 2026-09-13
+- **quiet_sweeps:** 2
 - **expected_window:** Altman 2026-09-01: “we are also going to be launching our next model soon.” Official 2026-09-03: “rolling out today to a limited set of organizations and over the coming days will become available to all ChatGPT Plus, Pro, Business, and Enterprise users.” OpenAI 2026-09-04: Plus and Business “might take a few days.” The Decoder 2026-09-05 still has Plus pending. Do not invent a free-tier date.
 - **why_it_matters:** Phased frontier access plus a unilateral RL pause is the GPT-6 pattern, not a single “the model is out” headline.
 - **latest:**
@@ -46,8 +46,8 @@ Promote only if §4's inclusion bar hits. After 14 quiet daily sweeps, set
 - **status:** delayed
 - **confidence:** credible
 - **last_movement:** 2026-09-11
-- **last_checked:** 2026-09-12
-- **quiet_sweeps:** 1
+- **last_checked:** 2026-09-13
+- **quiet_sweeps:** 2
 - **expected_window:** Hassabis 2026-05-19 on 3.5 Flash: “And Pro to come…” Pichai at I/O: Pro “next month” (June). SemiAnalysis/OfficeChai (2026-08-10) say 3.5 Pro was silently cancelled. Official now points at Gemini 4 pretrain, not a Pro GA date. Do not invent one.
 - **why_it_matters:** Same-week (Aug 5) leadership change + talent exit + rank drop + Flash-only shipping is one lab-in-crisis story, not a happy startup plus three Flash upgrades.
 - **latest:**
@@ -72,8 +72,8 @@ Promote only if §4's inclusion bar hits. After 14 quiet daily sweeps, set
 - **status:** shipping
 - **confidence:** confirmed
 - **last_movement:** 2026-09-07
-- **last_checked:** 2026-09-12
-- **quiet_sweeps:** 0
+- **last_checked:** 2026-09-13
+- **quiet_sweeps:** 1
 - **expected_window:** Mythos still “US organizations only for now”; biology LSVP “we expect to open enrollment for scientists soon.” EFS “beginning later this fall.”
 - **why_it_matters:** Government constraint on a lab’s best model is now a standing product shape (GA twin + defender/life-science twin), not a one-off June outage.
 - **latest:**
@@ -97,8 +97,8 @@ Promote only if §4's inclusion bar hits. After 14 quiet daily sweeps, set
 - **status:** shipping
 - **confidence:** confirmed
 - **last_movement:** 2026-09-04
-- **last_checked:** 2026-09-12
-- **quiet_sweeps:** 3
+- **last_checked:** 2026-09-13
+- **quiet_sweeps:** 4
 - **expected_window:** Wang 2026-09-04: max is out after “completing our safety testing.” EU still reported on 1.1 in some recaps. Open-weight Spark still on the “looking forward” list, unspecified.
 - **why_it_matters:** Meta is back on the closed frontier with a non-Llama line; journalist/AA website numbers are not in the Seam cache, so the rank claim is still unverified here.
 - **latest:**
@@ -121,8 +121,8 @@ Promote only if §4's inclusion bar hits. After 14 quiet daily sweeps, set
 - **status:** GA
 - **confidence:** confirmed
 - **last_movement:** 2026-07-16
-- **last_checked:** 2026-09-12
-- **quiet_sweeps:** 3
+- **last_checked:** 2026-09-13
+- **quiet_sweeps:** 4
 - **expected_window:** unspecified (no K4 timing found this sweep)
 - **why_it_matters:** First non-US open-weight to sit in AA’s closed pack (50.2, #5, −6.6 vs Fable 5.1). License is not MIT: >$20M/yr needs a commercial deal.
 - **latest:**
@@ -141,14 +141,14 @@ Promote only if §4's inclusion bar hits. After 14 quiet daily sweeps, set
 - **status:** GA
 - **confidence:** confirmed
 - **last_movement:** 2026-08-28
-- **last_checked:** 2026-09-12
-- **quiet_sweeps:** 3
+- **last_checked:** 2026-09-13
+- **quiet_sweeps:** 4
 - **expected_window:** unspecified
-- **why_it_matters:** Non-flagship lab via HF/AA: public AA ~49 II; weights dropped in-window; Flash previously ran as anonymous Ox Alpha on Chinese chips. Seam cache dropped the row this sweep — coverage, not a public fall.
+- **why_it_matters:** Non-flagship lab via HF/AA: AA put GLM-5.3 at 49 before v4.3’s methodology reset and 45 under v4.3; weights dropped in-window; Flash previously ran as anonymous Ox Alpha on Chinese chips. Seam cache dropped the row this sweep — coverage, not a public fall.
 - **latest:**
-  - AA v4.3 (2026-09-07) keeps GLM-5.3 among the open-weight leaders and puts GLM-5.3 Flash at **42**. This reflects a changed index, not a new GLM SKU or a score comparison with v4.2.
+  - AA v4.3 (2026-09-07) keeps GLM-5.3 as the top open-weight model at **45**, ahead of Kimi K3 at 44, and puts GLM-5.3 Flash at **42**. This reflects a changed index, not a new GLM SKU or a score comparison with v4.2.
   - No new Z.ai SKU. `from:Zai_org` silent. `zai-org/GLM-5.3` and GLM-5.3-Flash still on HF trending.
-  - Public AA GLM-5.3 (max) **49** / Flash **46**. Seam cache: 0 rows (were 48.6 / 46.2 yesterday).
+  - Before the v4.3 methodology reset, public AA listed GLM-5.3 (max) **49** / Flash **46**. Seam cache: 0 rows (were 48.6 / 46.2 yesterday).
   - OpenCode “Omen Alpha” (2026-09-04) has a similar failure fingerprint to Ox Alpha / GLM-5.3-Flash in one private bench — speculative, not a named 5.4.
 - **search:** from:Zai_org; GLM-5.3; Ox Alpha; Omen Alpha; site:huggingface.co/zai-org/GLM-5.3
 - **sources:**
@@ -164,8 +164,8 @@ Promote only if §4's inclusion bar hits. After 14 quiet daily sweeps, set
 - **status:** shipping
 - **confidence:** confirmed
 - **last_movement:** 2026-09-02
-- **last_checked:** 2026-09-12
-- **quiet_sweeps:** 3
+- **last_checked:** 2026-09-13
+- **quiet_sweeps:** 4
 - **expected_window:** Official: “This is an early version of Hy4.” Do not invent a non-preview GA date.
 - **why_it_matters:** Same Appendix A class as Kimi/GLM: a non-US lab appearing via HF trending and Arena, not a Western blog. Morning 2026-09-05 sweep missed it.
 - **latest:**
@@ -185,8 +185,8 @@ Promote only if §4's inclusion bar hits. After 14 quiet daily sweeps, set
 - **status:** shipping
 - **confidence:** confirmed
 - **last_movement:** 2026-09-02
-- **last_checked:** 2026-09-12
-- **quiet_sweeps:** 3
+- **last_checked:** 2026-09-13
+- **quiet_sweeps:** 4
 - **expected_window:** unspecified next snapshot
 - **why_it_matters:** Non-flagship lab via Arena: a date-suffix post-train, not a new generation, took Code Arena WebDev’s point estimate. Not open-weight. Seam AA still has 0 Qwen rows.
 - **latest:**
@@ -205,8 +205,8 @@ Promote only if §4's inclusion bar hits. After 14 quiet daily sweeps, set
 - **status:** rumored
 - **confidence:** speculative
 - **last_movement:** 2026-09-02
-- **last_checked:** 2026-09-12
-- **quiet_sweeps:** 3
+- **last_checked:** 2026-09-13
+- **quiet_sweeps:** 4
 - **expected_window:** Musk on 2026-09-02: “Grok 4.7 comes out in 10 days.” That implies September 12, not a separately stated calendar date. xAI has not published a 4.7 model page, API identifier, price, or card.
 - **why_it_matters:** Exec speech about an unreleased model. 4.6 is already #6 on AA (49.3, 2026-08-12).
 - **latest:**
@@ -226,8 +226,8 @@ Promote only if §4's inclusion bar hits. After 14 quiet daily sweeps, set
 - **status:** shipping
 - **confidence:** confirmed
 - **last_movement:** 2026-09-10
-- **last_checked:** 2026-09-12
-- **quiet_sweeps:** 1
+- **last_checked:** 2026-09-13
+- **quiet_sweeps:** 2
 - **expected_window:** DeepSeek: V4 Pro requests route to V4.1 Flash from 2026-09-14 04:00 UTC “until V4.1-Pro launches.” V4.1 Pro is otherwise unspecified.
 - **why_it_matters:** A newly open-weight, 1M-context, native-multimodal Flash replaces two earlier endpoints and becomes the temporary Pro path—an architecture and release-shape change, not a small modality add.
 - **latest:**
@@ -245,8 +245,8 @@ Promote only if §4's inclusion bar hits. After 14 quiet daily sweeps, set
 - **status:** training
 - **confidence:** confirmed
 - **last_movement:** 2026-09-08
-- **last_checked:** 2026-09-12
-- **quiet_sweeps:** 1
+- **last_checked:** 2026-09-13
+- **quiet_sweeps:** 2
 - **expected_window:** Mistral says it will make sovereign, open-weight AI “the technology frontier.” No model or training completion date is stated.
 - **why_it_matters:** €3B of confirmed capital for a named open-weight frontier ambition clears the capital/compute inclusion bar and puts a European lab back on the attempt board.
 - **latest:**
@@ -263,8 +263,8 @@ Promote only if §4's inclusion bar hits. After 14 quiet daily sweeps, set
 - **status:** training
 - **confidence:** credible
 - **last_movement:** 2026-09-11
-- **last_checked:** 2026-09-12
-- **quiet_sweeps:** 0
+- **last_checked:** 2026-09-13
+- **quiet_sweeps:** 1
 - **expected_window:** unspecified; China says it will respond if the allegations are used to suppress its AI companies.
 - **why_it_matters:** One clustered policy/training signal touches DeepSeek, Moonshot/Kimi, Alibaba/Qwen, Z.ai/GLM, MiniMax, and StepFun; it is not six independent model-release stories.
 - **latest:**
@@ -277,6 +277,45 @@ Promote only if §4's inclusion bar hits. After 14 quiet daily sweeps, set
   - 2026-09-10 · official · https://www.anthropic.com/threat-intelligence-report-september-2026
   - 2026-09-10 · journalist · https://www.scmp.com/economy/article/3367001/china-rejects-us-claims-industrial-scale-ai-model-distillation-warns-retaliation
 - **open_questions:** Will the advisory create restrictions or joint mitigations? Do named labs respond directly? Is there independent evidence connecting any specific released model to the alleged campaigns?
+
+### `openai-next-internal-training`
+- **title:** OpenAI’s unnamed post-Astra internal model is still training
+- **status:** training
+- **confidence:** confirmed
+- **last_movement:** 2026-09-08
+- **last_checked:** 2026-09-13
+- **quiet_sweeps:** 0
+- **expected_window:** unspecified; OpenAI gives neither a model name nor release plan.
+- **why_it_matters:** A primary disclosure of an actively trained, unreleased model beyond the current public flagship clears the training-run bar without implying a product schedule.
+- **latest:**
+  - OpenAI’s September 8 research post says that since **August 28** it has been training a new internal model with “unprecedented performance” in its benchmarks, including mathematics; training remains ongoing and performance continues to improve.
+  - OpenAI says the model used in its Navier–Stokes effort is “significantly more capable than GPT-6 Astra.” Its coordinating-agent group had about 10,000 concurrent agents; that is OpenAI’s capability disclosure, not an independent validation of the mathematics result.
+  - The post says the system is a large-scale-RL continuation of a previously pretrained model. No public identifier, price, model card, access tier, external benchmark, or AA row exists.
+- **search:** site:openai.com/index/navier-stokes-solution; from:OpenAI internal model Astra; “Since August 28” OpenAI model; from:ArtificialAnlys Astra
+- **sources:**
+  - 2026-09-08 · official · https://openai.com/index/navier-stokes-solution/
+- **open_questions:** What is the model’s name and release path? Which claims survive independent review and external benchmarking? Does its training continue through a safety gate?
+
+### `frontier-pacing-and-safety-exits`
+- **title:** Public safety exits push the frontier race toward external oversight
+- **status:** training
+- **confidence:** credible
+- **last_movement:** 2026-09-12
+- **last_checked:** 2026-09-13
+- **quiet_sweeps:** 0
+- **expected_window:** Amodei says Anthropic intends to invite embedded external reviewers “in the near future”; no shared industry pacing timetable is stated.
+- **why_it_matters:** Named departures and a concrete external-evaluator commitment are evidence about how the leading labs govern active frontier training, not a generic AI-safety debate.
+- **latest:**
+  - Former OpenAI/Anthropic pretraining researcher Jacob Coxon publicly resigned, saying the labs are “racing straight to self-improving superintelligence and gambling with our lives.” AP reports two current Anthropic employees responded in agreement; the exit is a personal diagnosis, not proof of a specific safety failure.
+  - Joe Benton says he left Anthropic’s safety team for independent evaluator METR. This joins Coxon’s exit to Amodei’s proposed embedded-reviewer model; it does not establish that METR will be Anthropic’s evaluator.
+  - Dario Amodei’s primary September essay commits Anthropic to embedded third-party evaluators with employee-like access, while proposing domestic and global coordination to pace unchecked capability gains. AP reports Sam Altman said OpenAI would commit to one of the proposals; no agreed speed limit or cross-lab pact has been published.
+- **search:** “Jacob Coxon” Anthropic resignation; “Joe Benton” METR; site:darioamodei.com “We Must Pace the Frontier”; from:EvanHub; from:saprmarks; “embedded evaluators” frontier AI
+- **sources:**
+  - 2026-09-09 · journalist · https://apnews.com/article/anthropic-ai-safety-jacob-coxon-2ed549e07f2f941600a135070487d83d
+  - 2026-09-11 · official · https://jbenton1.substack.com/p/why-i-left-anthropics-safety-team
+  - 2026-09-12 · official · https://darioamodei.com/post/we-must-pace-the-frontier
+  - 2026-09-12 · journalist · https://apnews.com/article/anthropic-ai-dario-amodei-d59552edcb27892d8ee4d98a48397706
+- **open_questions:** Which outside reviewer will Anthropic use, with what access and publication rights? Does OpenAI publish the proposal it will adopt? Do further named researchers leave or do the labs announce enforceable pacing gates?
 
 ## Resolved
 

@@ -143,6 +143,7 @@ try (add new ones to this list when they clear the bar — that is self-update):
 - xAI / Grok: `elonmusk`, `xai`, `grok`
 - OpenAI: `sama`, `OpenAI`
 - Anthropic: `AnthropicAI`, `darioamodei`
+- Safety / pacing: Jacob Coxon (`hilbertspaess`), Joe Benton (`JoeJBenton`), Evan Hubinger (`EvanHub`), Samuel Marks (`saprmarks`)
 - Google / DeepMind: `JeffDean`, `demishassabis`, `GoogleDeepMind`, `sundarpichai`
 - Meta: `ylecun`, `AIatMeta`, `alexandr_wang` (Muse max shipped on Wang’s account, not AIatMeta)
 - Open-weight / non-flagship: `Kimi_Moonshot`, `Zai_org` / Zhipu, DeepSeek,
@@ -171,8 +172,11 @@ Wired when unpaywalled, OfficeChai-style recaps of SemiAnalysis. Use them to
 catch The Information / SemiAnalysis facts 1–3 days late. **No paid
 subscriptions are required.**
 
-**Official blogs** last, and only as the thing to distrust and cluster
-against (blog.google, OpenAI, Anthropic news).
+**Official blogs** last, and normally only as the thing to distrust and cluster
+against (blog.google, OpenAI, Anthropic news). Exception: check each frontier
+lab’s research index for a direct disclosure of an unreleased internal model or
+active training run. That is primary evidence for §4, but never by itself a
+claim that a product has shipped.
 
 ### Phase E — Rewrite the notebook
 

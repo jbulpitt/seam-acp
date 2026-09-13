@@ -37,6 +37,17 @@ afterEach(async () => {
 });
 
 describe("shared stdio MCP tool broker", () => {
+  /**
+   * #384 — same reasoning as the AGY enrichment test: the cost is the subject.
+   * This spawns a real backend process, stands up a real loopback listener, and
+   * drives two independent MCP sessions through a full handshake before the
+   * concurrent calls that prove both landed on ONE backend pid. Nothing here
+   * can be stubbed without deleting what is being asserted.
+   *
+   * Measured 4.38s on a quiet host on 2026-09-12 against vitest's 5s default —
+   * a 12% margin, close enough that a busy host reports it as a regression.
+   * 15s is ~3.4x the measured cost.
+   */
   it("multiplexes independent HTTP sessions onto one backend process", async () => {
     const broker = await startStdioToolBroker({
       command: process.execPath,
@@ -69,7 +80,7 @@ describe("shared stdio MCP tool broker", () => {
     await first.close();
     clients.splice(clients.indexOf(first), 1);
     expect((await echo(second, "still-alive")).value).toBe("still-alive");
-  });
+  }, 15_000);
 
   it("exposes health without authentication only on the loopback listener", async () => {
     const broker = await startStdioToolBroker({

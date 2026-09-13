@@ -1,4 +1,12 @@
+import nodeFs from "node:fs";
 import { Readable, Writable } from "node:stream";
+import {
+  CLAUDE_REFRESH_RETRY_ATTEMPTS,
+  claudeCredentialsPath,
+  claudeRefreshRetryDelayMs,
+  classifyClaudeAuthFailure,
+  readClaudeCredentialFacts,
+} from "../core/claude-oauth-contention.js";
 import {
   client,
   methods,
@@ -320,6 +328,8 @@ export class AgentRuntime {
   /** True while a `session/prompt` is awaiting a response — lets the abort path
    *  tell whether a graceful cancel actually ended the turn before escalating. */
   private promptInFlight = false;
+  /** #404: has the in-flight turn produced any session update yet? */
+  private sawUpdateThisTurn = false;
   /** Last meaningful runtime activity. The session router uses this only to
    * retire warm, idle processes; it is not durable conversation state. */
   private lastActivityMs = Date.now();
@@ -872,6 +882,7 @@ export class AgentRuntime {
 
     this.touchActivity();
     this.promptInFlight = true;
+    this.sawUpdateThisTurn = false;
     // Captured so the teardown fail-safe below can tell a CLEAN completion
     // (end_turn) from an abnormal one (cancel/abort/error). Stays undefined if
     // the RPC rejects (dispose/child-death) — which is itself an abnormal end.
@@ -881,16 +892,61 @@ export class AgentRuntime {
       // reject lets the child-exit handler (and dispose) force this await to
       // settle instead of hanging when the connection dies without a clean
       // close. On normal completion the RPC resolves first.
-      const res = await new Promise<{ stopReason: string }>((resolve, reject) => {
-        this.rejectInFlightPrompt = reject;
-        conn.prompt({
-          sessionId: sid,
-          prompt,
-          ...(opts?.jsonSchema
-            ? { _meta: { [SEAM_AGY_JSON_SCHEMA_META]: opts.jsonSchema } }
-            : {}),
-        }).then(resolve, reject);
-      });
+      const sendPrompt = (): Promise<{ stopReason: string }> =>
+        new Promise<{ stopReason: string }>((resolve, reject) => {
+          this.rejectInFlightPrompt = reject;
+          conn.prompt({
+            sessionId: sid,
+            prompt,
+            ...(opts?.jsonSchema
+              ? { _meta: { [SEAM_AGY_JSON_SCHEMA_META]: opts.jsonSchema } }
+              : {}),
+          }).then(resolve, reject);
+        });
+
+      // #404: every Claude agent on this host shares one credential store, and
+      // when its 8-hour token expires they all race to refresh it. The losers
+      // get a hard error and the turn never runs — in every channel at once.
+      //
+      // Retrying is only safe while the turn has produced NOTHING. Once any
+      // session update has arrived the model is running, and re-sending would
+      // duplicate the work and the billing; that case falls through and throws
+      // exactly as before.
+      let res: { stopReason: string };
+      for (let attempt = 0; ; attempt += 1) {
+        try {
+          res = await sendPrompt();
+          break;
+        } catch (err) {
+          const verdict = classifyClaudeAuthFailure(
+            err instanceof Error ? err.message : String(err),
+            readClaudeCredentialFacts(
+              (p, enc) => nodeFs.readFileSync(p, enc),
+              claudeCredentialsPath()
+            )
+          );
+          const canRetry = verdict.retryable
+            && !this.sawUpdateThisTurn
+            && attempt < CLAUDE_REFRESH_RETRY_ATTEMPTS;
+          if (!canRetry) {
+            if (verdict.kind === "refresh-contention") {
+              this.logger.error(
+                { sessionId: sid, attempt, reason: verdict.reason, sawOutput: this.sawUpdateThisTurn },
+                this.sawUpdateThisTurn
+                  ? "credential refresh race after the turn had started; not retrying a turn that produced output"
+                  : "credential refresh race persisted across every retry"
+              );
+            }
+            throw err;
+          }
+          const delay = claudeRefreshRetryDelayMs(attempt + 1);
+          this.logger.warn(
+            { sessionId: sid, attempt: attempt + 1, delayMs: delay, reason: verdict.reason },
+            "lost the shared Claude credential refresh race; retrying after jittered backoff"
+          );
+          await new Promise((r) => setTimeout(r, delay));
+        }
+      }
       outcomeStopReason = res.stopReason;
       return {
         stopReason: res.stopReason,
@@ -1404,6 +1460,11 @@ export class AgentRuntime {
   }
 
   private handleSessionUpdate(update: SessionUpdate): Promise<void> {
+    // #404: the retry below is only safe while a turn has produced nothing.
+    // Set here rather than in the handler body so a suppressed or filtered
+    // update still counts as "the model has started" — the question is whether
+    // the turn ran, not whether we chose to show it.
+    this.sawUpdateThisTurn = true;
     // Process updates one at a time, in arrival order. See `sessionUpdates`.
     return this.sessionUpdates.run(() => this.handleSessionUpdateInner(update));
   }

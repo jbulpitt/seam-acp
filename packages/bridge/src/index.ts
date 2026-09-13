@@ -53,7 +53,7 @@ import { PROTOCOL_VERSION, type AgentAdapter } from "@seam/adapters";
 import { dispatchBridgeRpc, type SlotSpawnConfig } from "./rpc.js";
 import {
   inventoryFromAdapters,
-  loadHostAdapters,
+  loadHostAdapterInventory,
   resolveCopilotHostLaunch,
 } from "./inventory.js";
 import { createReleaseReceiptWriter, type ReleaseReceiptWriter } from "./release-receipt.js";
@@ -657,8 +657,8 @@ async function runClientMode(
   bridgeOpts: { bridgeId: string; devMode: boolean; workspaceRoot: string }
 ) {
   const { WebSocket } = await loadWs();
-  const adapters = loadHostAdapters(copilotCmd, { cwd: localCwd });
-  const releaseReceipt = await createReleaseReceiptWriter({ bridgeId: bridgeOpts.bridgeId, instanceId: BRIDGE_INSTANCE_ID, protocolVersion: PROTOCOL_VERSION });
+  const { adapters, adapterRefusals } = loadHostAdapterInventory(copilotCmd, { cwd: localCwd });
+  const releaseReceipt = await createReleaseReceiptWriter({ bridgeId: bridgeOpts.bridgeId, instanceId: BRIDGE_INSTANCE_ID, protocolVersion: PROTOCOL_VERSION, adapterRefusals });
   const mgr = makeSlotManager({
     copilotCmd,
     localCwd,
@@ -717,8 +717,8 @@ async function runServerMode(
   bridgeOpts: { bridgeId: string; devMode: boolean; workspaceRoot: string }
 ) {
   const { WebSocket, WebSocketServer } = await loadWs();
-  const adapters = loadHostAdapters(copilotCmd, { cwd: localCwd });
-  const releaseReceipt = await createReleaseReceiptWriter({ bridgeId: bridgeOpts.bridgeId, instanceId: BRIDGE_INSTANCE_ID, protocolVersion: PROTOCOL_VERSION });
+  const { adapters, adapterRefusals } = loadHostAdapterInventory(copilotCmd, { cwd: localCwd });
+  const releaseReceipt = await createReleaseReceiptWriter({ bridgeId: bridgeOpts.bridgeId, instanceId: BRIDGE_INSTANCE_ID, protocolVersion: PROTOCOL_VERSION, adapterRefusals });
   const mgr = makeSlotManager({
     copilotCmd,
     localCwd,

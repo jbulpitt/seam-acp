@@ -150,33 +150,32 @@ Each added bound/check has an observable failure it prevents:
   Spawn, signal, timeout and overflow failures still fail the probe.
 - Unique private HOME even with zero MCP servers: returning `undefined` inherits
   global tools; reusing a HOME lets an old runtime delete its replacement's config.
-- Empty helper MCP config: supplied/default servers otherwise leak into a
-  sandbox-intended helper. Helper factory routing itself remains R8.
+- Explicit empty MCP config: writing no private config would inherit the host's
+  global tools. Each session still gets its own HOME even when it has no tools.
 - Mode-0600 schema/log files and cleanup on failure: umask defaults and partial
   startup otherwise leave readable private request material behind.
 
-## Sandbox posture
+## Execution and permission posture
 
-**Production does not run agy in a sandbox, and nothing here depends on one.**
-A sandbox was never a requirement for this work.
+**Production does not claim to run agy in an OS sandbox, and nothing here
+depends on one.** A sandbox was never a requirement for this work.
 
-`agyExecutionPolicyArgs` accepts a `sandbox` flag, but
-`DEFAULT_AGY_EXECUTION_POLICY` sets it to `false`, and neither production
-construction site overrides it — not `packages/bridge/src/inventory.ts` (remote
-host inventory) nor `packages/core/src/index.ts` (server startup).
-`sandbox: true` appears only in `test/agy-prompt-args.test.ts`,
-`test/agy-model-catalog.test.ts` and `test/agy-sandbox-posture.test.ts` —
-covering the argv shape of a helper path that is not wired up, plus the guard
-that keeps this section true. `--dangerously-skip-permissions` is added **unconditionally**,
-independent of the policy.
+The old native profile exposed a `sandbox: true` option that neither production
+construction site used — not `packages/bridge/src/inventory.ts` (remote host
+inventory) nor `packages/core/src/index.ts` (server startup). Its only callers
+were tests of its own argv shape, after the vision sidecar that once motivated
+it had already been removed. #391 deletes that option, its `--sandbox` argv
+branch, and the associated MCP suppression instead of leaving a dormant
+security-looking mechanism in the public adapter surface.
 
 So every agy session launches with:
 
-- **no `--sandbox`** — terminal operations are unrestricted;
 - **`--dangerously-skip-permissions`** — every tool permission request is
   auto-approved without prompting;
-- **`--add-dir <cwd>`** plus the shared staging root — `--add-dir` is the only
-  thing bounding the workspace.
+- **`--add-dir <cwd>`** plus the shared staging root — these tell AGY which
+  roots the session needs, but do not establish an OS access boundary;
+- a private per-session HOME and MCP configuration, so sessions do not inherit
+  or overwrite one another's tools.
 
 **No configuration controls any of this, and none ever has.** If you are
 looking for a switch, there isn't one — that is the posture, not an
@@ -188,28 +187,11 @@ every turn. #380 removed the key rather than make it a gate: requiring it
 before native agy starts would take agy off any host that had not set it,
 and four of the five agy hosts run no other agent.
 
-This is written down because the flag list invites the opposite conclusion:
-"we pass `--sandbox`" and "we auto-approve every tool request" pull in
-different directions, and a reader skimming the profile could reasonably
-believe the first is load-bearing. It is not passed at all.
-
-What the fixtures prove is **launch policy** for the argv we build: a private
-HOME, only the intended directories added, and no supplied or default MCP
-server inherited by a helper. They prove nothing about whether the installed
-CLI restricts anything, and could not. A prompt saying “read only” is not a
-sandbox — and neither is a flag whose enforcement nobody has demonstrated.
-
-Upstream treats the flag as live surface rather than a settled guarantee: agy
-1.2.1 fixed the status line reporting the terminal sandbox as *disabled* when
-the session was launched with `--sandbox`, and 1.2.2 began warning on
-deprecated `unsandboxed` permission rules. Testing enforcement today would
-describe a version we will not be running when it matters.
-
-If a future helper path (R8, #264) ever needs the CLI's own boundary to be
-real, that claim must be proven **before** anything depends on it; the canary
-design is recorded in #324. Until then nothing relies on it, so there is no
-exposure from it being unproven — and `test/agy-sandbox-posture.test.ts` fails
-if this posture changes without that decision being revisited.
+What the fixtures prove is **launch policy** for the argv and private config we
+build. They prove nothing about what the installed CLI or operating system
+prevents, and are not described as confinement tests. If a future production
+path needs an OS boundary, that must be introduced as a production-reachable,
+independently demonstrated mechanism rather than reviving this deleted option.
 
 ## Scope left to other stories
 

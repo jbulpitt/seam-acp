@@ -10,7 +10,6 @@ import {
 const STAGING_ROOT = path.join(os.tmpdir(), "seam-attachments");
 
 const CHAT_POLICY: AgyExecutionPolicy = {
-  sandbox: false,
   exposeGlobalStaging: true,
 };
 
@@ -108,13 +107,13 @@ describe("buildAgyPromptArgs — no other behavior changed", () => {
     expect(buildAgyPromptArgs(base)).not.toContain("--conversation");
   });
 
-  it("threads the sandboxed one-shot policy through unchanged", () => {
+  it("can omit shared staging without claiming filesystem confinement", () => {
     const args = buildAgyPromptArgs({
       ...base,
       cwd: "/private/image",
-      execution: { sandbox: true, exposeGlobalStaging: false },
+      execution: { exposeGlobalStaging: false },
     });
-    expect(args).toContain("--sandbox");
+    expect(args).not.toContain("--sandbox");
     expect(args.filter((a) => a === "--add-dir")).toHaveLength(1);
     expect(args).not.toContain(STAGING_ROOT);
     expect(args).toContain(AGY_NO_SLASH_EXPANSION);

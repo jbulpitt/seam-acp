@@ -487,6 +487,15 @@ describe.sequential("native AGY R1 capability contract", () => {
     expect(resumeInvocation).toMatchObject({
       conversationId: expectedConversation,
       resumedConversation: expectedConversation,
+      mcpConfig: {
+        mcpServers: {
+          "seam-mcp": {
+            disabled: false,
+            serverUrl: "http://127.0.0.1:3000/mcp",
+            headers: { "X-Seam-Session": "synthetic-session-token" },
+          },
+        },
+      },
     });
 
     const structuredStart = resumedEvents.length;

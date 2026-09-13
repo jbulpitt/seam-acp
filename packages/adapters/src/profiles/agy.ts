@@ -342,9 +342,6 @@ export function makeAgyProfile(opts: {
   dataDir?: string;
   staticModels?: ReadonlyArray<{ modelId: string; name: string; contextLimit?: number }>;
   printTimeoutSeconds?: number;
-  /** Run terminal tools inside agy's sandbox. Intended for tightly scoped
-   *  one-shot helpers that consume untrusted content. */
-  sandbox?: boolean;
   /** Expose Seam's shared attachment staging root. Defaults true for normal
    *  chat sessions; isolated helpers should copy inputs into their own cwd. */
   exposeGlobalStaging?: boolean;
@@ -428,7 +425,6 @@ export function makeAgyProfile(opts: {
         opts.printTimeoutSeconds,
         opts.mcpServers ?? [],
         {
-          sandbox: opts.sandbox ?? false,
           exposeGlobalStaging: opts.exposeGlobalStaging ?? true,
         },
         opts.initialSettingsFile ?? SETTINGS_FILE,
@@ -785,20 +781,17 @@ function persistedSession(
   };
 }
 export interface AgyExecutionPolicy {
-  sandbox: boolean;
   exposeGlobalStaging: boolean;
 }
 
 /**
  * The policy every production agy session actually launches with. Exported so
  * the documented posture in `docs/agy-native-lifecycle.md` is asserted rather
- * than described: no `--sandbox`, and permissions auto-approved. Changing
- * `sandbox` here means depending on a CLI boundary nobody has demonstrated,
- * which is the decision #324 records — so it should fail a test, not pass
- * quietly.
+ * than described: the session workspace and shared attachment staging are
+ * exposed to the CLI, and permissions are auto-approved. This is launch policy,
+ * not evidence of OS confinement (#324/#391).
  */
 export const DEFAULT_AGY_EXECUTION_POLICY: AgyExecutionPolicy = {
-  sandbox: false,
   exposeGlobalStaging: true,
 };
 
@@ -808,19 +801,18 @@ export function agyExecutionPolicyArgs(
   policy: AgyExecutionPolicy
 ): string[] {
   return [
-    ...(policy.sandbox ? ["--sandbox"] : []),
     // UNCONDITIONAL, and nothing anywhere makes it conditional (#380).
     //
-    // Sitting one line under an optional `--sandbox` is what made this
-    // misread twice. #324: we verified for weeks that `--sandbox` was
-    // passed correctly without anyone asking whether it was passed at all
-    // — it never is. #380: a config key named
+    // #324: we verified for weeks that an unwired `--sandbox` option was
+    // passed correctly without asking whether production called it. #391
+    // removes that dead option rather than preserving a misleading security
+    // mechanism. #380: a config key named
     // `AGY_DANGEROUS_PERMISSIONS_ACKNOWLEDGED`, defaulting to false, sat in
     // the schema gating nothing, so the one place an operator would look
     // for this said the opposite of the truth.
     //
-    // Every agy turn auto-approves every tool permission request. The only
-    // thing bounding it is `--add-dir` below.
+    // Every agy turn auto-approves every tool permission request. `--add-dir`
+    // supplies accessible roots to the CLI; it is not an OS confinement claim.
     "--dangerously-skip-permissions",
     "--add-dir",
     cwd,
@@ -902,8 +894,7 @@ export function buildAgyPromptArgs(opts: {
       ? ["--output-format", "json", "--json-schema", opts.structuredOutput.jsonSchema]
       : []),
     // agy ignores the process cwd for its "workspace" — execution policy
-    // supplies --add-dir and optionally the shared staging root. Sandboxed
-    // one-shot helpers deliberately expose only their private cwd.
+    // supplies --add-dir and optionally the shared staging root.
     ...agyExecutionPolicyArgs(opts.cwd, opts.execution),
     ...(opts.cascadeId ? ["--conversation", opts.cascadeId] : []),
   ];
@@ -1017,7 +1008,7 @@ class AgyAgent implements Agent {
 
   async newSession(params: NewSessionRequest): Promise<NewSessionResponse> {
     const id = randomUUID();
-    const mcpServers = this.execution.sandbox ? [] : params.mcpServers?.length ? params.mcpServers : this.defaultMcpServers;
+    const mcpServers = params.mcpServers?.length ? params.mcpServers : this.defaultMcpServers;
     const mcpHome = await prepareAgyMcpHome(id, mcpServers);
     try {
       const catalog = await getCatalog(this.runtime).catch(catalogFallback);
@@ -1072,7 +1063,7 @@ class AgyAgent implements Agent {
         details: detail,
       }, detail);
     }
-    const mcpServers = this.execution.sandbox ? [] : params.mcpServers?.length ? params.mcpServers : this.defaultMcpServers;
+    const mcpServers = params.mcpServers?.length ? params.mcpServers : this.defaultMcpServers;
     const mcpHome = await prepareAgyMcpHome(params.sessionId, mcpServers);
     try {
       const catalog = await getCatalog(this.runtime).catch(catalogFallback);

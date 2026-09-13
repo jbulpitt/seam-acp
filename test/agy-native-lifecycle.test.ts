@@ -16,7 +16,7 @@ const logger = pino({ level: "silent" }) as unknown as Logger;
 type Row = { scenario?: string; pid?: number; prompt?: string; args?: string[]; home?: string; signal?: string; mcpConfig?: unknown };
 const alive = (pid: number): boolean => { try { process.kill(pid, 0); return true; } catch { return false; } };
 
-async function fixture(sandbox = false, timeoutSeconds = 10) {
+async function fixture(timeoutSeconds = 10) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "seam-agy-r5-"));
   const log = path.join(root, "invocations");
   const managed = createManagedAgyFixture({
@@ -25,7 +25,7 @@ async function fixture(sandbox = false, timeoutSeconds = 10) {
   });
   const runtime = new AgentRuntime({ logger, profile: makeAgyProfile({
     runtime: managed.runtime, dataDir: root, defaultModel: "Fixture Native Model",
-    printTimeoutSeconds: timeoutSeconds, exposeGlobalStaging: false, sandbox,
+    printTimeoutSeconds: timeoutSeconds, exposeGlobalStaging: false,
     mcpServers: [{ type: "http", name: "must-not-inherit", url: "http://127.0.0.1:9", headers: [] }],
   }) });
   const events: AgentEvent[] = [];
@@ -124,7 +124,7 @@ describe.sequential("R5 native production lifecycle", () => {
 
   it.each([["r5-stream-exit", "exited_early"], ["r5-stream-overflow", "output_overflow"], ["r5-stream-hang", "timeout"]])(
     "#371 fallback retains lifecycle bounds for %s", async (prompt, code) => {
-      const f = await fixture(false, 3);
+      const f = await fixture(3);
       try { await expect(f.runtime.prompt(prompt)).rejects.toThrow(code); }
       finally { await f.close(); }
     }, 15_000,
@@ -162,7 +162,7 @@ describe.sequential("R5 native production lifecycle", () => {
     ["r5-oversized-frame", "output_overflow"],
     ["r5-no-ls", "timeout"],
   ])("bounds %s and keeps diagnostics out of the ACP consumer", async (prompt, code) => {
-    const f = await fixture(false, prompt === "r5-no-ls" ? 2 : 10);
+    const f = await fixture(prompt === "r5-no-ls" ? 2 : 10);
     try {
       const start = Date.now();
       const error = await f.runtime.prompt(prompt).then(() => "unexpected success", error => String(error));
@@ -199,16 +199,26 @@ describe.sequential("R5 native production lifecycle", () => {
     } finally { await f.close(); }
   }, 15_000);
 
-  it("sandbox launch supplies only its cwd, an empty private MCP config, and leaves permissions unchanged", async () => {
-    const f = await fixture(true);
+  it("the production factory keeps default MCP servers in a private HOME", async () => {
+    const f = await fixture();
     try {
       await f.runtime.prompt("capability-turn-one");
       const row = f.rows().find(row => row.prompt === "capability-turn-one")!;
-      expect(row.args).toContain("--sandbox");
+      // Launch flags describe what we pass to AGY; they do not prove OS
+      // confinement. Removing the dead sandbox path must not remove active MCP
+      // isolation or the existing permission posture (#391).
+      expect(row.args).not.toContain("--sandbox");
       expect(row.args).toContain("--dangerously-skip-permissions");
       const dirs = row.args!.flatMap((arg, i) => arg === "--add-dir" ? [row.args![i + 1]] : []);
       expect(dirs).toEqual([f.root]);
-      expect(row.mcpConfig).toEqual({ mcpServers: {} });
+      expect(row.mcpConfig).toEqual({
+        mcpServers: {
+          "must-not-inherit": {
+            disabled: false,
+            serverUrl: "http://127.0.0.1:9",
+          },
+        },
+      });
       expect(fs.statSync(row.home!).mode & 0o777).toBe(0o700);
     } finally { await f.close(); }
   }, 15_000);

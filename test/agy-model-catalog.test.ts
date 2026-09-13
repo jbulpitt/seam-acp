@@ -10,7 +10,6 @@ import {
 describe("agyExecutionPolicyArgs", () => {
   it("keeps normal chat compatibility with the shared staging directory", () => {
     const args = agyExecutionPolicyArgs("/workspace", {
-      sandbox: false,
       exposeGlobalStaging: true,
     });
     expect(args).toContain("--dangerously-skip-permissions");
@@ -19,19 +18,6 @@ describe("agyExecutionPolicyArgs", () => {
     expect(args.filter((arg) => arg === "--add-dir")).toHaveLength(2);
   });
 
-  it("confines the vision sidecar to its private sandbox cwd", () => {
-    expect(
-      agyExecutionPolicyArgs("/private/image", {
-        sandbox: true,
-        exposeGlobalStaging: false,
-      })
-    ).toEqual([
-      "--sandbox",
-      "--dangerously-skip-permissions",
-      "--add-dir",
-      "/private/image",
-    ]);
-  });
 });
 
 const ACCEPTED_MODELS = [

@@ -6,6 +6,7 @@
   "main": "./dist/index.js",
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "postbuild": "node ../../scripts/prune-orphan-dist.mjs --package .",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "start": "node dist/index.js"
   },

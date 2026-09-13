@@ -1,14 +1,15 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import type { AgentProfile } from "@seam/adapters";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
 import { planAgyIdentityMigration, readAgyHandleOwnership, rebuildMigratedAgySession } from "../packages/core/src/core/agy-identity-migration.js";
 import type { SessionRecord } from "../packages/core/src/core/types.js";
 import { SessionRouter } from "../packages/core/src/core/session-router.js";
 import { pino } from "pino";
 import type { Logger } from "../packages/core/src/lib/logger.js";
-import type { ModelCatalogService } from "../packages/core/src/core/model-catalog/service.js";
+import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 
 const stores: SessionStore[] = [];
 const dirs: string[] = [];
@@ -37,9 +38,18 @@ describe("owner-approved local AGY restoration", () => {
   it("refuses runtime creation while the durable migration rebuild is pending", () => {
     const store = setup(); store.upsert(row("package"));
     store.applyAgyIdentityMigration(planAgyIdentityMigration(store.list(), ownership, binding));
+    // #307: an empty profile list made gate removal fail for an unrelated
+    // unknown-agent reason. Use a viable non-live plan and prove recovery opens
+    // it: the refusal protects a pending context rebuild, not missing config.
+    const spawn = vi.fn(() => { throw new Error("audit fixture must never spawn"); });
+    const profile = { id: "agy", displayName: "AGY fixture", defaultModel: "exact-high", spawn } as unknown as AgentProfile;
     const router = new SessionRouter({ logger: pino({ level: "silent" }) as unknown as Logger,
-      store, profiles: [], modelCatalog: {} as ModelCatalogService, defaultAgentId: "agy", defaultModel: "exact-high", threadPresets: new Map() });
+      store, profiles: [profile], modelCatalog: fixtureModelCatalog([profile]), defaultAgentId: "agy", defaultModel: "exact-high", threadPresets: new Map() });
     expect(() => router.planRuntimeSpawn(store.get("package")!)).toThrow(/requires Discord reconstruction/);
+    store.compareAndSwapAcpSession("package", "", "rebuilt-native");
+    expect(store.completeAgyIdentityRebuild("package", "rebuilt-native")).toBe(true);
+    expect(router.planRuntimeSpawn(store.get("package")!)).toMatchObject({ agentId: "agy", model: "exact-high" });
+    expect(spawn).not.toHaveBeenCalled();
   });
   it("preserves all columns except exact identity/handle, excludes remote and other agents, and is one-shot", () => {
     const store = setup();

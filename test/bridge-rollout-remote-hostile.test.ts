@@ -43,12 +43,12 @@ function validArchive(extra: { path: string; bytes: Buffer }[] = []) {
 }
 
 async function writePm2(overrides: Record<string, unknown> = {}) {
-  const config = { pid: bridge.pid, name: "fixture-app", pm_cwd: checkout, pm_exec_path: entrypoint, exec_interpreter: process.execPath, args: ["connect","--server","wss://controller.invalid","--token","fixture-token","--id","fixture"], ...overrides };
+  const config = { pid: bridge.pid, pm_id: 0, pidFile, name: "fixture-app", pm_cwd: checkout, pm_exec_path: entrypoint, exec_interpreter: process.execPath, args: ["connect","--server","wss://controller.invalid","--token","fixture-token","--id","fixture"], ...overrides };
   await fs.writeFile(path.join(fixture,"pm2.json"), JSON.stringify(config));
 }
 
-function baseArgs(overrides: Partial<{ bridgeId:string; app:string; uid:string; checkout:string; entrypoint:string; pidFile:string; releaseRoot:string }> = {}) {
-  return [overrides.bridgeId ?? "fixture", overrides.app ?? "fixture-app", "grok", overrides.uid ?? String(process.getuid!()), overrides.checkout ?? checkout, overrides.entrypoint ?? entrypoint, overrides.pidFile ?? pidFile, process.execPath, pm2Module, "-", "no", overrides.releaseRoot ?? releaseRoot];
+function baseArgs(overrides: Partial<{ bridgeId:string; app:string; uid:string; checkout:string; entrypoint:string; releaseRoot:string }> = {}) {
+  return [overrides.bridgeId ?? "fixture", overrides.app ?? "fixture-app", "grok", overrides.uid ?? String(process.getuid!()), overrides.checkout ?? checkout, overrides.entrypoint ?? entrypoint, process.execPath, pm2Module, "-", "no", overrides.releaseRoot ?? releaseRoot];
 }
 
 async function runRemote(action: string[], overrides = {}) {
@@ -62,7 +62,7 @@ async function stageBytes(bytes: Buffer, operationId = H("1")) {
 }
 
 beforeAll(async () => {
-  fixture = await fs.mkdtemp(path.join(os.tmpdir(),"bridge-rollout-hostile-")); checkout = path.join(fixture,"checkout"); releaseRoot = path.join(fixture,"rollouts"); entrypoint = path.join(checkout,"packages/bridge/dist/index.js"); pidFile = path.join(fixture,"fixture.pid"); pm2Module = path.join(fixture,"pm2-module");
+  fixture = await fs.mkdtemp(path.join(os.tmpdir(),"bridge-rollout-hostile-")); checkout = path.join(fixture,"checkout"); releaseRoot = path.join(fixture,"rollouts"); entrypoint = path.join(checkout,"packages/bridge/dist/index.js"); pidFile = path.join(fixture,"fixture-app-0.pid"); pm2Module = path.join(fixture,"pm2-module");
   await fs.mkdir(path.dirname(entrypoint), { recursive: true }); await fs.mkdir(path.join(checkout,"packages/adapters/dist"),{recursive:true}); await fs.mkdir(path.join(checkout,".git")); await fs.mkdir(pm2Module);
   await fs.writeFile(entrypoint, "process.title='fixture-bridge';process.on('SIGUSR2',()=>{});setInterval(()=>{},1000);\n");
   await fs.writeFile(path.join(checkout,"packages/bridge/package.json"),requireBytes("packages/bridge/package.json"));
@@ -71,7 +71,7 @@ beforeAll(async () => {
   await fs.writeFile(path.join(checkout,".git/HEAD"),`${sha}\n`);
   bridge = spawn(process.execPath, [entrypoint], { cwd: checkout, stdio: "ignore" }); await new Promise((resolve) => setTimeout(resolve,100));
   await fs.writeFile(pidFile, String(bridge.pid)); await fs.writeFile(path.join(pm2Module,"package.json"), JSON.stringify({ type:"commonjs", main:"index.cjs" }));
-  await fs.writeFile(path.join(pm2Module,"index.cjs"), `const fs=require('fs');const p=${JSON.stringify(path.join(fixture,"pm2.json"))};module.exports={connect(cb){cb(null)},describe(_n,cb){const j=JSON.parse(fs.readFileSync(p));cb(null,[{pid:j.pid,pm2_env:{name:j.name,pm_cwd:j.pm_cwd,pm_exec_path:j.pm_exec_path,exec_interpreter:j.exec_interpreter,args:j.args}}])},disconnect(){}};`);
+  await fs.writeFile(path.join(pm2Module,"index.cjs"), `const fs=require('fs');const p=${JSON.stringify(path.join(fixture,"pm2.json"))};module.exports={connect(cb){cb(null)},describe(_n,cb){const j=JSON.parse(fs.readFileSync(p));cb(null,[{pid:j.pid,pm_id:j.pm_id,pm2_env:{name:j.name,pm_id:j.pm_id,pm_pid_path:j.pidFile,pm_cwd:j.pm_cwd,pm_exec_path:j.pm_exec_path,exec_interpreter:j.exec_interpreter,args:j.args}}])},disconnect(){}};`);
   await writePm2(); remoteScript = await renderRemoteScript(path.join(repo,"scripts/bridge-rollout-remote.sh"),path.join(repo,"scripts/bridge-rollout-remote.mjs")); await runRemote(["prepare-upload",H("f")]);
 });
 
@@ -125,9 +125,23 @@ describe.sequential("production remote shell deployment identity defenses (#241)
     expect(preflight.stdout).toContain("native_dependency=better-sqlite3@11.10.0"); expect(preflight.stdout).toContain("native_install_strategy=locked-prebuild"); expect(preflight.stdout).toContain("native_install_ready=yes");
     await expect(runRemote(["preflight"],{app:"wrong-app"})).rejects.toThrow(/pm2_app_pid_mismatch/);
     await expect(runRemote(["preflight"],{uid:String(process.getuid!()+1)})).rejects.toThrow(/wrong_owner/);
-    const otherPid = path.join(fixture,"other.pid"); await fs.writeFile(otherPid,String(process.pid)); await expect(runRemote(["preflight"],{pidFile:otherPid})).rejects.toThrow(/process_cwd_mismatch/);
+    await fs.writeFile(pidFile,String(process.pid)); await writePm2({pid:process.pid}); await expect(runRemote(["preflight"])).rejects.toThrow(/process_cwd_mismatch/); await fs.writeFile(pidFile,String(bridge.pid)); await writePm2();
     await writePm2({pm_exec_path:path.join(checkout,"other.js")}); await expect(runRemote(["preflight"])).rejects.toThrow(/pm2_launcher_mismatch/); await writePm2();
     await writePm2({args:["connect","--server","wss://controller.invalid","--token","fixture-token","--id","fixture","--dev"]}); await expect(runRemote(["preflight"])).rejects.toThrow(/pm2_dev_mode_mismatch/); await writePm2();
+  });
+
+  it("follows the current PM2 id resolved by app name and still refuses a missing PID file (#390)", async () => {
+    const rotated = path.join(fixture, "fixture-app-7.pid");
+    await fs.writeFile(rotated, String(bridge.pid));
+    await fs.rm(pidFile);
+    await writePm2({ pm_id: 7, pidFile: rotated });
+    expect((await runRemote(["preflight"])).stdout).toContain("identity_bound=yes");
+
+    await fs.rm(rotated);
+    await expect(runRemote(["preflight"])).rejects.toThrow(/pid_file_missing/);
+
+    await fs.writeFile(pidFile, String(bridge.pid));
+    await writePm2();
   });
 
   it("reports a non-ready preflight when the deployed bridge cannot prove both catalog RPCs",async()=>{

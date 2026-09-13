@@ -50,13 +50,14 @@ function live(pid) { try { process.kill(pid, 0); return true; } catch { return f
 function assertUid(stat, uid, code) { if (stat.uid !== uid) fail(code); }
 
 const argv = process.argv.slice(2);
-if (argv.length < 13) fail("argument_count");
-const [bridgeId, pm2App, verifyAgent, uidText, checkoutPath, entrypointPath, pidFilePath, nodePath, pm2ModulePath, workspaceText, devModeText, releaseRoot, mode, ...actionArgs] = argv;
+if (argv.length < 12) fail("argument_count");
+const [bridgeId, pm2App, verifyAgent, uidText, checkoutPath, entrypointPath, nodePath, pm2ModulePath, workspaceText, devModeText, releaseRoot, mode, ...actionArgs] = argv;
 let safePhase = "arguments";
+let pidFilePath = "";
 if (![bridgeId, pm2App, verifyAgent].every((v) => NAME.test(v))) fail("unsafe_identity_name");
 const expectedUid = Number(uidText);
 if (!Number.isSafeInteger(expectedUid) || expectedUid < 1) fail("unsafe_expected_uid");
-for (const [value, code] of [[checkoutPath,"unsafe_checkout"],[entrypointPath,"unsafe_entrypoint"],[pidFilePath,"unsafe_pid_file"],[nodePath,"unsafe_node"],[pm2ModulePath,"unsafe_pm2_module"],[releaseRoot,"unsafe_release_root"]]) exactPath(value, code);
+for (const [value, code] of [[checkoutPath,"unsafe_checkout"],[entrypointPath,"unsafe_entrypoint"],[nodePath,"unsafe_node"],[pm2ModulePath,"unsafe_pm2_module"],[releaseRoot,"unsafe_release_root"]]) exactPath(value, code);
 const workspaceArg = workspaceText === "-" ? null : exactPath(workspaceText, "unsafe_workspace");
 if (devModeText !== "yes" && devModeText !== "no") fail("unsafe_dev_mode");
 const expectedDevMode = devModeText === "yes";
@@ -173,6 +174,23 @@ function validatePm2Args(raw) {
 }
 
 async function readLiveIdentity() {
+  safePhase = "identity_pm2";
+  const rows = await pm2Describe();
+  safePhase = "identity_pm2_rows";
+  if (!Array.isArray(rows) || rows.length !== 1) fail("pm2_app_ambiguous");
+  const row = rows[0]; const env = row?.pm2_env;
+  safePhase = "identity_pm2_fields";
+  if (!env || env.name !== pm2App) fail("pm2_app_pid_mismatch");
+  const pmId = Number(row.pm_id);
+  if (!Number.isSafeInteger(pmId) || pmId < 0 || Number(env.pm_id) !== pmId) fail("pm2_app_id_invalid");
+  const reportedPidPath = exactPath(env.pm_pid_path, "pm2_pid_path_invalid");
+  // #390: PM2 assigns a new numeric id whenever an app is legitimately
+  // recreated to apply config. Resolve the app by its stable name and derive
+  // the ephemeral filename from the CURRENT id; pinning yesterday's id made a
+  // healthy bridge un-upgradeable. A missing/malformed file still refuses only
+  // this host's rollout below; the bridge and every other host keep serving.
+  pidFilePath = path.posix.join(path.posix.dirname(reportedPidPath), `${pm2App}-${pmId}.pid`);
+  if (reportedPidPath !== pidFilePath) fail("pm2_pid_path_mismatch");
   safePhase = `${safePhase}_pid_file`;
   const pidStat = await fsp.lstat(pidFilePath).catch(() => fail("pid_file_missing")); assertUid(pidStat, expectedUid, "pid_file_wrong_owner");
   if (!pidStat.isFile() || pidStat.isSymbolicLink()) fail("pid_file_wrong_type");
@@ -194,12 +212,6 @@ async function readLiveIdentity() {
   const pm2Real = await fsp.realpath(pm2ModulePath).catch(() => fail("configured_pm2_module_unavailable"));
   if (pm2Real !== pm2ModulePath) fail("configured_pm2_module_symlink");
   assertUid(await fsp.lstat(pm2ModulePath), expectedUid, "configured_pm2_module_wrong_owner");
-  safePhase = "identity_pm2";
-  const rows = await pm2Describe();
-  safePhase = "identity_pm2_rows";
-  if (!Array.isArray(rows) || rows.length !== 1) fail("pm2_app_ambiguous");
-  const row = rows[0]; const env = row?.pm2_env;
-  safePhase = "identity_pm2_fields";
   if (!env || env.name !== pm2App || parsePid(row.pid, "pm2_pid_invalid") !== pid) fail("pm2_app_pid_mismatch");
   if (env.pm_cwd !== checkoutPath || env.pm_exec_path !== entrypointPath) fail("pm2_launcher_mismatch");
   if (env.exec_interpreter !== nodePath) fail("pm2_interpreter_mismatch");

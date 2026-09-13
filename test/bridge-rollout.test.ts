@@ -51,7 +51,8 @@ function preflightReport(target: ReturnType<typeof resolveTarget>, overrides: Re
 
 describe("bridge rollout target safety (#241)", () => {
   it("pins the full operator-owned deployment identity", () => {
-    expect(resolveTarget(targets, "media-server")).toMatchObject({ bridgeId: "media-server", sshAlias: "media-server", pm2App: "remote-agent-bridge", expectedUid: 501, checkoutPath: "/Users/jesse/seam-acp", entrypointPath: "/Users/jesse/seam-acp/packages/bridge/dist/index.js", pidFilePath: "/Users/jesse/.pm2/pids/remote-agent-bridge-0.pid", releaseRoot: "/Users/jesse/.seam/bridge-rollouts" });
+    expect(resolveTarget(targets, "media-server")).toMatchObject({ bridgeId: "media-server", sshAlias: "media-server", pm2App: "remote-agent-bridge", expectedUid: 501, checkoutPath: "/Users/jesse/seam-acp", entrypointPath: "/Users/jesse/seam-acp/packages/bridge/dist/index.js", releaseRoot: "/Users/jesse/.seam/bridge-rollouts" });
+    expect(configured.targets["media-server"]).not.toHaveProperty("pidFilePath");
     expect(resolveTarget(targets, "macbook-air")).toMatchObject({ bridgeId: "macbook-air", sshAlias: "macbook-air", pm2App: "seam-bridge", expectedUid: 501, workspaceArg: "/Users/jessebulpitt" });
   });
 
@@ -162,6 +163,7 @@ describe("bridge rollout target safety (#241)", () => {
     expect(() => validateTargetMap({ schemaVersion: 3, targets: { ok: { ...base, sshAlias: "host;id" } } })).toThrow(/unsafe SSH/);
     expect(() => validateTargetMap({ schemaVersion: 3, targets: { ok: { ...base, checkoutPath: "/safe/../escape", entrypointPath: "/safe/../escape/packages/bridge/dist/index.js" } } })).toThrow(/unsafe checkout/);
     expect(() => validateTargetMap({ schemaVersion: 3, targets: { ok: { ...base, surprise: "x" } } })).toThrow(/unknown target property/);
+    expect(() => validateTargetMap({ schemaVersion: 3, targets: { ok: { ...base, pidFilePath: "/stale/app-0.pid" } } })).toThrow(/unknown target property.*pidFilePath/);
     expect(() => validateTargetMap({ schemaVersion: 3, targets: { ok: { sshAlias: null, pm2App: null, verifyAgent: null, rolloutEnabled: false } } })).toThrow(/requires a safe reason/);
     expect(() => validateTargetMap({ schemaVersion: 3, targets: { ok: { sshAlias: "known-host", pm2App: null, verifyAgent: null, rolloutEnabled: false, unmanagedReason: "wrong state" } } })).toThrow(/must not declare an unmanaged reason/);
   });
@@ -170,7 +172,7 @@ describe("bridge rollout target safety (#241)", () => {
     const target = resolveTarget(targets, "media-server");
     const ssh = makeSshCommand(target, ["preflight"], "fixed-script");
     expect(ssh.file).toBe("ssh"); expect(ssh.input).toBe("fixed-script"); expect(ssh.mutates).toBe(false);
-    expect(ssh.args).toContain(target.nodePath); expect(ssh.args).toContain(target.entrypointPath); expect(ssh.args).toContain(target.pidFilePath); expect(ssh.args.at(-1)).toBe("preflight");
+    expect(ssh.args).toContain(target.nodePath); expect(ssh.args).toContain(target.entrypointPath); expect(ssh.args).not.toContain("/Users/jesse/.pm2/pids/remote-agent-bridge-0.pid"); expect(ssh.args.at(-1)).toBe("preflight");
     const name = `${artifactName("a".repeat(40), "b".repeat(64))}.upload-${token}`;
     expect(makeScpCommand(target, "/tmp/release.tgz", name).args.at(-1)).toBe(`media-server:${target.releaseRoot}/incoming/${name}`);
   });
@@ -281,7 +283,7 @@ describe("activation outcome reporting (#370)", () => {
     "fixture-host": {
       rolloutEnabled: true, sshAlias: "fixture-host", pm2App: "fixture-bridge", verifyAgent: "grok", expectedUid: 501,
       checkoutPath: "/fixture/checkout", entrypointPath: "/fixture/checkout/packages/bridge/dist/index.js",
-      pidFilePath: "/fixture/bridge.pid", nodePath: "/fixture/node", pm2ModulePath: "/fixture/pm2",
+      nodePath: "/fixture/node", pm2ModulePath: "/fixture/pm2",
       releaseRoot: "/fixture/releases", workspaceArg: null, devMode: false,
     },
   } }), "fixture-host");

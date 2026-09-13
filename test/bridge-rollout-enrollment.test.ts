@@ -45,7 +45,7 @@ async function makeFixture(options: { capable?: boolean; withGit?: boolean } = {
   const checkout = path.join(root, "checkout");
   const releaseRoot = path.join(root, "rollouts");
   const entry = path.join(checkout, "packages/bridge/dist/index.js");
-  const pidFile = path.join(root, "bridge.pid");
+  const pidFile = path.join(root, "fixture-app-0.pid");
   const pm2File = path.join(root, "pm2.json");
   const pm2Module = path.join(root, "pm2.cjs");
   const runtime = path.join(root, "runtime");
@@ -83,15 +83,15 @@ async function makeFixture(options: { capable?: boolean; withGit?: boolean } = {
   }
   await fs.writeFile(
     pm2Module,
-    `const fs=require('fs'),p=${JSON.stringify(pm2File)};module.exports={connect(cb){setImmediate(()=>cb(null))},describe(_n,cb){const j=JSON.parse(fs.readFileSync(p,'utf8'));setImmediate(()=>cb(null,[{pid:j.pid,pm2_env:{name:j.name,pm_cwd:j.cwd,pm_exec_path:j.entry,exec_interpreter:j.node,args:['connect','--server','wss://controller.invalid','--token','fixture-token','--id','fixture']}}]))},disconnect(){}}`
+    `const fs=require('fs'),p=${JSON.stringify(pm2File)};module.exports={connect(cb){setImmediate(()=>cb(null))},describe(_n,cb){const j=JSON.parse(fs.readFileSync(p,'utf8'));setImmediate(()=>cb(null,[{pid:j.pid,pm_id:j.pm_id,pm2_env:{name:j.name,pm_id:j.pm_id,pm_pid_path:j.pidFile,pm_cwd:j.cwd,pm_exec_path:j.entry,exec_interpreter:j.node,args:['connect','--server','wss://controller.invalid','--token','fixture-token','--id','fixture']}}]))},disconnect(){}}`
   );
   const child = spawn(node, [entry], { cwd: checkout, detached: true, stdio: "ignore" });
   child.unref();
   await fs.writeFile(pidFile, String(child.pid));
-  await fs.writeFile(pm2File, JSON.stringify({ pid: child.pid, name: "fixture-app", cwd: checkout, entry, node }));
+  await fs.writeFile(pm2File, JSON.stringify({ pid: child.pid, pm_id: 0, pidFile, name: "fixture-app", cwd: checkout, entry, node }));
 
   const shell = await renderRemoteScript(path.join(repo, "scripts/bridge-rollout-remote.sh"), path.join(repo, "scripts/bridge-rollout-remote.mjs"));
-  const base = ["fixture", "fixture-app", "grok", String(process.getuid!()), checkout, entry, pidFile, node, pm2Module, "-", "no", releaseRoot];
+  const base = ["fixture", "fixture-app", "grok", String(process.getuid!()), checkout, entry, node, pm2Module, "-", "no", releaseRoot];
   const run = (action: string[], timeoutMs = 30_000) =>
     commandRunner({ file: "/bin/sh", args: ["-s", "--", node, ...base, ...action], input: shell, timeoutMs });
 

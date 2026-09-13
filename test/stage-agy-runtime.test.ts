@@ -23,6 +23,7 @@ import path from "node:path";
 import { verifyAgyManagedRuntimeArtifact } from "../packages/adapters/src/agy-native-runtime.js";
 import {
   AGY_PINS,
+  AGY_CAPABILITY_TIMEOUT_MS,
   MANAGED_DIR_MODE,
   MANAGED_FILE_MODE,
   applyAgyStaging,
@@ -31,6 +32,7 @@ import {
   parseEnvFile,
   planAgyStaging,
   renderEnvFile,
+  verifyAgyCapability,
 } from "../scripts/stage-agy-runtime.mjs";
 
 const realPlatform = process.platform;
@@ -59,8 +61,21 @@ afterEach(() => {
   }
 });
 
-const BODY = Buffer.from([0xcf, 0xfa, 0xed, 0xfe, 0x41, 0x47, 0x59]);
+const BODY = Buffer.from(`#!/bin/sh
+if [ "$1" = "--log-file" ] && [ "$3" = "models" ]; then
+  printf 'fixture-model\\tFixture Model\\n'
+  exit 0
+fi
+exit 2
+`);
 const DIGEST = createHash("sha256").update(BODY).digest("hex");
+const BROKEN_BODY = Buffer.from(`#!/bin/sh
+if [ "$1" = "--log-file" ] && [ "$3" = "models" ]; then
+  printf 'missing CSRF token\\n' >&2
+  exit 23
+fi
+exit 2
+`);
 
 /**
  * A host: a source `agy`, a pins file holding its CURRENT `$HOME` staging, and
@@ -239,6 +254,29 @@ describe("#342 a failed gate leaves the host exactly as it was", () => {
     expect(fs.readFileSync(fixture.source)).toEqual(BODY);
   });
 
+  it("refuses a provenance-valid binary that cannot list models and leaves the working pins untouched", async () => {
+    // macbook-pro's agy 1.2.2 passed version, digest, ownership, ancestry, and
+    // provenance checks but failed every real turn with `missing CSRF token`.
+    // This protects against making that unusable artifact authoritative; if
+    // the capability call is removed, this test observes the pins move to it.
+    const fixture = host();
+    const before = fs.readFileSync(fixture.envFile, "utf8");
+    const brokenSource = path.join(fixture.root, "candidate-agy");
+    fs.writeFileSync(brokenSource, BROKEN_BODY, { mode: 0o555 });
+    const staged = plan(fixture, { source: brokenSource, version: "1.2.2" });
+
+    await expect(applyAgyStaging(staged, {
+      io: noChown,
+      verify: stagedVerify,
+    })).rejects.toThrow(/prompt-free capability check \(agy models, exit 23\)/);
+
+    expect(fs.readFileSync(fixture.envFile, "utf8")).toBe(before);
+    expect(fixture.pins().AGY_CLI_PATH).toBe(fixture.source);
+    expect(fs.existsSync(staged.executable)).toBe(false);
+    expect(fs.existsSync(fixture.runtimeParent)).toBe(false);
+    expect(fs.readFileSync(fixture.source)).toEqual(BODY);
+  });
+
   it("restores the pins when the post-restart confirmation fails", async () => {
     // The only window where the host is genuinely in a bad state: pins moved,
     // bridge not confirming. Rollback has to put the bytes back AND restart
@@ -306,6 +344,28 @@ describe("#342 a failed gate leaves the host exactly as it was", () => {
     expect(pinsAtVerifyTime).toBe(before);
   });
 
+  it("has not written the pins yet when the capability gate runs", async () => {
+    // Rollback would hide a pin write made before this gate, just as it hides
+    // one made before provenance verification. A crash in that interval would
+    // leave the host pinned to an artifact that never proved it could serve,
+    // so observe the production call site while the check is running.
+    const fixture = host();
+    const before = fs.readFileSync(fixture.envFile, "utf8");
+    let pinsAtCapabilityTime = "";
+
+    await expect(applyAgyStaging(plan(fixture), {
+      io: noChown,
+      verify: stagedVerify,
+      verifyCapability: async () => {
+        pinsAtCapabilityTime = fs.readFileSync(fixture.envFile, "utf8");
+        throw new Error("capability unavailable");
+      },
+    })).rejects.toThrow(/capability unavailable/);
+
+    expect(pinsAtCapabilityTime).toBe(before);
+    expect(fs.readFileSync(fixture.envFile, "utf8")).toBe(before);
+  });
+
   it("refuses a service-user-owned 0555 ancestor, which the runtime check accepts", () => {
     // The macbook-air hole, and the reason the gate is ownership rather than
     // the runtime check. 0555 owned by the service user passes
@@ -346,6 +406,38 @@ describe("#342 a failed gate leaves the host exactly as it was", () => {
 });
 
 describe("#342 a successful migration", () => {
+  it("uses the bounded prompt-free models command and removes its temporary log directory", () => {
+    const fixture = host();
+    const tmp = path.join(fixture.root, "capability-tmp");
+    fs.mkdirSync(tmp);
+    let invocation: { file: string; args: string[]; timeout?: number; logExisted: boolean } | undefined;
+
+    const result = verifyAgyCapability(fixture.source, {
+      tmpdir: () => tmp,
+      run: (file: string, args: string[], options: { timeout?: number }) => {
+        invocation = {
+          file,
+          args,
+          timeout: options.timeout,
+          logExisted: fs.existsSync(path.dirname(args[1]!)),
+        };
+        return "fixture-model\tFixture Model\n";
+      },
+    });
+
+    expect(result).toEqual({ modelsObserved: 1 });
+    expect(invocation).toMatchObject({
+      file: fixture.source,
+      args: ["--log-file", expect.stringMatching(/\/agy\.log$/), "models"],
+      timeout: AGY_CAPABILITY_TIMEOUT_MS,
+      logExisted: true,
+    });
+    for (const flag of ["-p", "--print", "--prompt", "--prompt-interactive"]) {
+      expect(invocation!.args).not.toContain(flag);
+    }
+    expect(fs.readdirSync(tmp)).toEqual([]);
+  });
+
   it("computes the digest from the file it stages and moves all five pins", async () => {
     const fixture = host();
     const staged = plan(fixture);

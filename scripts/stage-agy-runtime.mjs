@@ -31,12 +31,14 @@
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 
 /** Directories in the reference layout are 0755; only the binary is 0555. */
 export const MANAGED_DIR_MODE = 0o755;
 export const MANAGED_FILE_MODE = 0o555;
 export const DEFAULT_RUNTIME_PARENT = "/opt/seam/agy-runtime";
+export const AGY_CAPABILITY_TIMEOUT_MS = 30_000;
 
 /** The five pins #342 moves together. Order is stable for deterministic diffs. */
 export const AGY_PINS = [
@@ -142,6 +144,50 @@ function readAgyVersion(binary, run) {
   const first = String(out).trim().split(/\r?\n/, 1)[0]?.trim() ?? "";
   if (!first) throw new StagingRefusal("`agy --version` produced no version line");
   return first;
+}
+
+/**
+ * Prove the staged artifact can start its language server and list models.
+ *
+ * `agy --version` is deliberately insufficient: agy 1.2.2 reported its
+ * version and passed every digest/provenance check on macbook-pro while its
+ * language server rejected every adapter subscription with `missing CSRF
+ * token` (#371). `models` exercises that capability without `-p`, `--prompt`,
+ * or any billable turn (#361).
+ *
+ * This guard refuses only this attempted migration. The existing pins and
+ * staging keep serving because the caller runs it before writing any pin.
+ */
+export function verifyAgyCapability(binary, options = {}) {
+  const mkdtempSync = options.mkdtempSync ?? fs.mkdtempSync;
+  const rmSync = options.rmSync ?? fs.rmSync;
+  const run = options.run ?? execFileSync;
+  const tmpRoot = options.tmpdir?.() ?? os.tmpdir();
+  const tempDir = mkdtempSync(path.join(tmpRoot, "seam-agy-stage-capability-"));
+  const logFile = path.join(tempDir, "agy.log");
+  try {
+    let output;
+    try {
+      output = run(binary, ["--log-file", logFile, "models"], {
+        encoding: "utf8",
+        timeout: AGY_CAPABILITY_TIMEOUT_MS,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+    } catch (error) {
+      const status = Number.isInteger(error?.status) ? `, exit ${error.status}` : "";
+      const signal = typeof error?.signal === "string" ? `, signal ${error.signal}` : "";
+      throw new StagingRefusal(
+        `staged agy failed prompt-free capability check (agy models${status}${signal})`
+      );
+    }
+    const rows = String(output).split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+    if (!rows.length) {
+      throw new StagingRefusal("staged agy capability check returned no models");
+    }
+    return { modelsObserved: rows.length };
+  } finally {
+    rmSync(tempDir, { recursive: true, force: true });
+  }
 }
 
 /**
@@ -379,6 +425,12 @@ export async function applyAgyStaging(plan, options = {}) {
       runtimeRoot: plan.runtimeRoot,
       sha256: plan.sha256,
     });
+
+    // Identity and immutability do not imply usability. macbook-pro proved
+    // that distinction with a fully verified agy 1.2.2 that could not serve a
+    // turn. Keep this inside the same pre-pin transaction boundary so failure
+    // refuses only the new artifact and leaves the working host unchanged.
+    await (options.verifyCapability ?? verifyAgyCapability)(plan.executable);
 
     // Only now is the tree known good, so only now do the pins point at it.
     writeFileSync(plan.envFile, renderEnvFile(envBefore, plan.updates));

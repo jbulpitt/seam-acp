@@ -321,6 +321,10 @@ requires an explicit one-host apply for activation or rollback.
 
 ### MCP servers
 
+Project-scoped `.mcp.json` servers also support environment references such as
+`${EXAMPLE_TOKEN}`. See [project MCP configuration](docs/agent-guides/project-mcp.md)
+for expansion, missing-variable handling, and session reload behavior.
+
 The bot can attach Model Context Protocol servers globally to every
 session. Configure them via env vars:
 

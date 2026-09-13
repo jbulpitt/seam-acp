@@ -408,6 +408,23 @@ export function safeNativeAgyRuntimeProvenance(runtime: AdapterRuntimeDescriptor
   };
 }
 
+function validateBridgeWorkspaceRoot(
+  value: string | null | undefined
+): { ok: true; value: string | undefined } | { ok: false; error: string } {
+  if (value === null || value === undefined) return { ok: true, value: undefined };
+  const trimmed = value.trim();
+  // A relative bridge path would be resolved on the controller and could send
+  // remote work into the wrong directory. Refuse only this config write; the
+  // bridge, its existing configuration, and explicit-cwd dispatches keep working.
+  if (!trimmed || !path.posix.isAbsolute(trimmed)) {
+    return {
+      ok: false,
+      error: "Bridge workspace root must be an absolute POSIX path on the bridge host.",
+    };
+  }
+  return { ok: true, value: trimmed };
+}
+
 export class ConfigMutationService {
   private readonly deps: ConfigMutationDeps;
   private readonly logger: Logger;
@@ -631,6 +648,8 @@ export class ConfigMutationService {
     url?: string;
     actor: MutationActor;
   }): { ok: true; bridgeId: string; auditId: string } | { ok: false; error: string } {
+    const workspaceRoot = validateBridgeWorkspaceRoot(opts.workspaceRoot);
+    if (!workspaceRoot.ok) return workspaceRoot;
     const loaded = this.readPresetsDoc();
     if (!loaded.ok) return loaded;
     const { file, doc } = loaded;
@@ -644,7 +663,7 @@ export class ConfigMutationService {
     if (opts.emoji) entry.emoji = opts.emoji;
     if (opts.shortName) entry.shortName = opts.shortName;
     else entry.shortName = opts.name;
-    if (opts.workspaceRoot) entry.workspaceRoot = path.resolve(opts.workspaceRoot);
+    if (workspaceRoot.value) entry.workspaceRoot = workspaceRoot.value;
     if (opts.url) entry.url = opts.url;
     bridges[bridgeId] = entry;
     const written = this.writeBridgesDoc({
@@ -720,6 +739,8 @@ export class ConfigMutationService {
     workspaceRoot?: string | null;
     actor: MutationActor;
   }): { ok: true; auditId: string } | { ok: false; error: string } {
+    const workspaceRoot = validateBridgeWorkspaceRoot(opts.workspaceRoot);
+    if (!workspaceRoot.ok) return workspaceRoot;
     const loaded = this.readPresetsDoc();
     if (!loaded.ok) return loaded;
     const { file, doc } = loaded;
@@ -732,7 +753,7 @@ export class ConfigMutationService {
     if (opts.shortName === null) delete next.shortName;
     else if (opts.shortName !== undefined) next.shortName = opts.shortName;
     if (opts.workspaceRoot === null) delete next.workspaceRoot;
-    else if (opts.workspaceRoot !== undefined) next.workspaceRoot = path.resolve(opts.workspaceRoot);
+    else if (workspaceRoot.value !== undefined) next.workspaceRoot = workspaceRoot.value;
     bridges[opts.bridgeId] = next;
     const written = this.writeBridgesDoc({
       file,

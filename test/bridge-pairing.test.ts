@@ -8,6 +8,7 @@ import { ConfigMutationService } from "../packages/core/src/core/config-mutation
 import { reloadChannelPresets } from "../packages/core/src/core/config-reload.js";
 import { PresetsFileSchema } from "../packages/core/src/config.js";
 import { hashBridgeToken, mintBridgeToken, tokenMatchesHash } from "../packages/core/src/core/bridge-pairing.js";
+import { handleBridgeSlash } from "../packages/core/src/platforms/discord/bridge.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import type { AgentProfile } from "@seam/adapters";
 import type { SessionRecord } from "../packages/core/src/core/types.js";
@@ -134,5 +135,66 @@ describe("bridge pairing (#83 audit, #86 presets)", () => {
     if (!parsed.success) return;
     expect(parsed.data.bridges.mac).not.toHaveProperty("location");
     expect(JSON.stringify(parsed.data)).not.toMatch(/agentId@/);
+  });
+
+  it("updates an existing bridge workspace through the audited slash-command path (#403)", async () => {
+    const svc = makeService();
+    const tokenHash = hashBridgeToken(mintBridgeToken());
+    const paired = svc.applyBridgePair({ name: "legacy-mac", tokenHash, actor });
+    expect(paired.ok).toBe(true);
+
+    const replies: Array<{ content?: string }> = [];
+    const interaction = {
+      user: { id: actor.id, displayName: actor.name, username: actor.name },
+      options: {
+        getSubcommand: () => "configure",
+        getString: (name: string) => ({
+          name: "legacy-mac",
+          "workspace-root": "/Users/legacy/Projects",
+        })[name] ?? null,
+      },
+      reply: async (payload: { content?: string }) => { replies.push(payload); },
+    };
+    await handleBridgeSlash(interaction as any, {
+      config: {
+        bridgePresets: new Map([["legacy-mac", {
+          id: "legacy-mac",
+          tokenHash,
+          shortName: "legacy-mac",
+          transport: "server",
+        }]]),
+      } as any,
+      mutation: svc,
+      logger: silent,
+      publicWsUrl: "wss://example.invalid/bridge",
+    });
+
+    const raw = JSON.parse(fs.readFileSync(file, "utf8"));
+    expect(raw.bridges["legacy-mac"].workspaceRoot).toBe("/Users/legacy/Projects");
+    expect(replies.at(-1)?.content).toContain("/Users/legacy/Projects");
+    const audit = store.listConfigMutations(10).find((row) => row.summary.includes("host-config"));
+    expect(audit).toMatchObject({ tier: "bridge", scope: "bridge:legacy-mac" });
+    expect(JSON.parse(audit!.afterJson)).toMatchObject({
+      bridge: { id: "legacy-mac", workspaceRoot: "/Users/legacy/Projects" },
+    });
+  });
+
+  it("refuses a controller-relative bridge workspace without changing the host record (#403)", async () => {
+    const svc = makeService();
+    const tokenHash = hashBridgeToken(mintBridgeToken());
+    svc.applyBridgePair({ name: "legacy-mac", tokenHash, actor });
+    const before = fs.readFileSync(file, "utf8");
+
+    const result = svc.applyBridgeHostConfig({
+      bridgeId: "legacy-mac",
+      workspaceRoot: "../wrong-host-path",
+      actor,
+    });
+
+    expect(result).toEqual({
+      ok: false,
+      error: "Bridge workspace root must be an absolute POSIX path on the bridge host.",
+    });
+    expect(fs.readFileSync(file, "utf8")).toBe(before);
   });
 });

@@ -485,7 +485,7 @@ describe("stateless/preset handoff embed card", () => {
     await expect(orch.dispatchInjectTurn(
       presetSpec({ preset: "claude", location: "legacy-mac" })
     )).rejects.toThrow(
-      'remote location "legacy-mac" did not report a workspace root or HOME; specify cwd explicitly'
+      'remote location "legacy-mac" has no default cwd: reported workspace root, configured workspace root, and reported HOME are all empty; specify cwd explicitly or configure the bridge workspace root'
     );
     expect(inject).not.toHaveBeenCalled();
     // An explicit cwd remains a recovery route even for an older bridge.
@@ -493,6 +493,44 @@ describe("stateless/preset handoff embed card", () => {
       presetSpec({ preset: "claude", location: "legacy-mac", cwd: "/Users/legacy" })
     )).resolves.toMatchObject({ output: "" });
     expect(inject).toHaveBeenCalledTimes(1);
+  });
+
+  it("dispatches through a configured workspace when a legacy hello reports neither root nor HOME (#403)", async () => {
+    const { adapter } = spyAdapter();
+    const orch = makeOrch({ dataDir, adapter });
+    (orch as any).store.getPresetByName = () => null;
+    const remote = fakeRemoteHub({});
+    const hub = Object.create(BridgeHub.prototype) as any;
+    hub.connections = new Map([["legacy-mac", {
+      host: { os: "darwin", arch: "arm64" },
+      mux: remote.hub.get().mux,
+    }]]);
+    hub.config = {
+      bridgePresets: new Map([["legacy-mac", {
+        id: "legacy-mac",
+        tokenHash: "a".repeat(64),
+        workspaceRoot: "/Users/legacy/Projects",
+      }]]),
+    };
+    hub.markSessionBridge = vi.fn();
+    hub.mcpServersForRemoteSpawn = () => undefined;
+    orch.setBridgeHub(hub);
+    let injected: any;
+    (orch as any).injectTurn = async (_record: unknown, _prompt: string, opts: any) => {
+      injected = opts;
+      await opts.spawnFn();
+      return { text: "remote result", stopReason: "end_turn" };
+    };
+
+    await orch.dispatchInjectTurn(presetSpec({ preset: "claude", location: "legacy-mac" }));
+
+    expect(injected.cwd).toBe("/Users/legacy/Projects");
+    expect(remote.rpcCalls).toEqual([
+      expect.objectContaining({
+        method: "spawn",
+        params: expect.objectContaining({ cwd: "/Users/legacy/Projects" }),
+      }),
+    ]);
   });
 
   it("reads the actual workspace, configured workspace, then HOME from BridgeHub (#367)", () => {

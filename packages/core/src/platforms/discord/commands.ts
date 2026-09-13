@@ -71,7 +71,7 @@ function addConfigSetOptions(sub: SlashCommandSubcommandBuilder): SlashCommandSu
  *     rebuild · compact-thread · recover
  *     project  (3)  new list remove
  *     upload   (3)  pull push secret
- *     bridge   (5)  add rotate list remove restart
+ *     bridge   (6)  add rotate configure list remove restart
  *     schedule (5)  add list remove toggle edit — no attachments (#158)
  *     debug    (6)  tail exec status voice-ping voice-capture voice-live
  *     voice    (7)  start add remove configure console status stop
@@ -815,7 +815,7 @@ export function buildSeamAdminCommand(): SlashCommandBuilder {
   cmd.addSubcommandGroup((g) =>
     g
       .setName("bridge")
-      .setDescription("Admin-only: pair, rotate, list, or remove remote bridges")
+      .setDescription("Admin-only: pair and configure remote bridges")
       .addSubcommand((sub) =>
         sub
           .setName("add")
@@ -848,6 +848,20 @@ export function buildSeamAdminCommand(): SlashCommandBuilder {
           .setDescription("Issue a new token for a paired bridge")
           .addStringOption((o) =>
             o.setName("name").setDescription("Bridge id or name").setRequired(true)
+          )
+      )
+      .addSubcommand((sub) =>
+        sub
+          .setName("configure")
+          .setDescription("Set a bridge workspace fallback for legacy hellos")
+          .addStringOption((o) =>
+            o.setName("name").setDescription("Bridge id or name").setRequired(true)
+          )
+          .addStringOption((o) =>
+            o
+              .setName("workspace-root")
+              .setDescription("Absolute POSIX workspace path on the bridge host")
+              .setRequired(true)
           )
       )
       .addSubcommand((sub) =>

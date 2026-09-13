@@ -44,6 +44,8 @@ export async function handleBridgeSlash(
       return cmdAdd(interaction, deps);
     case "rotate":
       return cmdRotate(interaction, deps);
+    case "configure":
+      return cmdConfigure(interaction, deps);
     case "list":
       return cmdList(interaction, deps);
     case "remove":
@@ -119,6 +121,34 @@ async function cmdRotate(
       `Rotated token for **${bridgeId}**. Re-bootstrap the host. Mac (skip clone/build, paste this when asked):\n` +
       `\`\`\`\ncurl -fsSL https://raw.githubusercontent.com/jbulpitt/seam-acp/main/scripts/install-macos-bridge.sh | bash -s -- --skip-deps\n\`\`\`\n` +
       `Connect line:\n\`\`\`\n${line}\n\`\`\``,
+    flags: MessageFlags.Ephemeral,
+  });
+}
+
+async function cmdConfigure(
+  i: ChatInputCommandInteraction,
+  deps: BridgeSlashDeps
+): Promise<void> {
+  const name = i.options.getString("name", true);
+  const bridgeId = resolveBridgeId(deps, name);
+  if (!bridgeId) {
+    await i.reply({ content: `No paired bridge named "${name}".`, flags: MessageFlags.Ephemeral });
+    return;
+  }
+  const workspaceRoot = i.options.getString("workspace-root", true).trim();
+  const result = deps.mutation.applyBridgeHostConfig({
+    bridgeId,
+    workspaceRoot,
+    actor: actorOf(i),
+  });
+  if (!result.ok) {
+    await i.reply({ content: result.error, flags: MessageFlags.Ephemeral });
+    return;
+  }
+  await i.reply({
+    content:
+      `Configured **${bridgeId}** workspace fallback to \`${workspaceRoot}\`. ` +
+      "A connected bridge's reported workspace still takes precedence.",
     flags: MessageFlags.Ephemeral,
   });
 }

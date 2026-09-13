@@ -6367,7 +6367,9 @@ export class Orchestrator {
     const remoteDefault = this.bridgeHub?.defaultCwdForLocation?.(opts.workerLocation);
     if (remoteDefault) return remoteDefault;
     throw new Error(
-      `dispatch ${opts.spec.id}: remote location "${opts.workerLocation}" did not report a workspace root or HOME; specify cwd explicitly`
+      `dispatch ${opts.spec.id}: remote location "${opts.workerLocation}" has no default cwd: ` +
+      "reported workspace root, configured workspace root, and reported HOME are all empty; " +
+      "specify cwd explicitly or configure the bridge workspace root"
     );
   }
 

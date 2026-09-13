@@ -451,9 +451,13 @@ describe("#265 mutation survivors, closed", () => {
   it("says in the text report how many checks it did not cover", () => {
     // The skipped count is the honesty property of the default run: without it
     // a reader sees only passes and concludes the host is fully verified.
-    const text = formatDeploymentReport(verdictFor(host()));
+    const h = host();
+    const text = formatDeploymentReport(verdictFor(h));
     expect(text).toContain("1 check(s) skipped");
     expect(text).toContain("host was not modified");
+    // The header must name the file it read and how it read it. A stale key
+    // here printed `undefined` on three live hosts before anyone noticed.
+    expect(text).toContain(`${h.envFile} (file)`);
   });
 });
 
@@ -535,6 +539,40 @@ describe("#395 the matcher refuses rather than guessing", () => {
     expect(pins.has("AGY_ENABLED")).toBe(false);
   });
 
+  it("keeps a real pin that has a comment after it on the same line", () => {
+    // Mutation found that comment-stripping and the `^` anchor were each
+    // covering for the other in every test. They differ here: without
+    // stripping, the trailing comment defeats the end anchor and a CORRECT pin
+    // is silently missed — a false FAIL on a good host, which is #395 again.
+    const { pins } = parsePm2EcosystemPins(ecosystem([
+      `AGY_VERSION: "1.1.27", // pinned by #342`,
+    ]));
+    expect(pins.get("AGY_VERSION")).toBe("1.1.27");
+  });
+
+  it("ignores a pin on an interior line of a block comment", () => {
+    // And they differ the other way here: the interior line begins with the
+    // key, so the anchor alone accepts it. Only stripping refuses it, and
+    // accepting it would be a false PASS carrying a fabricated version.
+    const { pins } = parsePm2EcosystemPins(ecosystem([
+      "/*",
+      `AGY_VERSION: "9.9.9",`,
+      "*/",
+      `AGY_ENABLED: "true",`,
+    ]));
+    expect(pins.has("AGY_VERSION")).toBe(false);
+    expect(pins.get("AGY_ENABLED")).toBe("true");
+  });
+
+  it("ignores a pin that is not the first thing on its line", () => {
+    // `^` is what refuses this; a second assignment sharing a line is not a
+    // shape the fleet writes, and guessing at it is how a false PASS starts.
+    const { pins } = parsePm2EcosystemPins(ecosystem([
+      `SOME_OTHER: "x", AGY_VERSION: "9.9.9",`,
+    ]));
+    expect(pins.has("AGY_VERSION")).toBe(false);
+  });
+
   it("ignores a value that is not a complete single-line string literal", () => {
     for (const line of [
       "AGY_VERSION: process.env.AGY_VERSION,",
@@ -601,6 +639,11 @@ describe("#395 a host where agy is simply not deployed", () => {
       { envFile: path.join(root, "ecosystem.config.cjs"), platform: "darwin" }, readOnlyIo());
     expect(report.verdict).toBe("not-deployed");
     expect(byId(report, "pins-in-file").reasonCode).toBe("agy_not_deployed");
+    // Not "file": there is no file, and labelling it with a format it never
+    // had is the kind of small lie this tool exists to avoid.
+    expect(report.observed.pinsFileFormat).toBe("absent");
+    // Every substantive check must say it was skipped, not silently pass.
+    for (const c of report.checks) expect(c.status).toBe("skipped");
     const lines: string[] = [];
     const code = await main(["--pins-file", path.join(root, "ecosystem.config.cjs")],
       { log: (s: string) => lines.push(s) });

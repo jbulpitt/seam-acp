@@ -32,6 +32,7 @@
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   AGY_PINS,
   DEFAULT_RUNTIME_PARENT,
@@ -209,7 +210,9 @@ export function looksLikePm2Ecosystem(text) {
  */
 export function resolvePinSources(pinsFileText, processEnv = {}, format = null) {
   const fromFile = new Map();
-  let fileSource = "file";
+  // "absent" rather than "file" when there is nothing to read, so the header
+  // does not label a missing file with the format it would have had.
+  let fileSource = typeof pinsFileText === "string" ? "file" : "absent";
   let ecosystem = null;
   if (typeof pinsFileText === "string") {
     const isEcosystem = format === "pm2-ecosystem"
@@ -535,7 +538,7 @@ export function formatDeploymentReport(report) {
   const glyph = { pass: "PASS", fail: "FAIL", skipped: "SKIP" };
   const lines = [
     `agy deployment: ${report.verdict.toUpperCase()}  (host was not modified)`,
-    `  pins file      ${report.observed.envFile}`,
+    `  pins file      ${report.observed.pinsFile} (${report.observed.pinsFileFormat})`,
     `  runtime root   ${report.observed.runtimeRoot ?? "(unset)"}`,
     `  version        ${report.observed.version ?? "(unset)"}`,
     "",
@@ -580,7 +583,21 @@ export async function main(argv, out = console) {
   return report.verdict === "not-deployed" ? 3 : 1;
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+/**
+ * Run only when invoked directly. Compared through `realpath` because on macOS
+ * `/tmp` is a symlink to `/private/tmp`: `import.meta.url` resolves the link and
+ * `process.argv[1]` does not, so the naive string comparison silently does
+ * nothing and exits 0 — which is exactly how this was found, running the
+ * verifier from `/tmp` on three Macs and getting no output at all.
+ */
+const invokedDirectly = (() => {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  const real = (p) => { try { return fs.realpathSync(p); } catch { return p; } };
+  return real(fileURLToPath(import.meta.url)) === real(entry);
+})();
+
+if (invokedDirectly) {
   main(process.argv.slice(2))
     .then((code) => { process.exitCode = code; })
     .catch((error) => {

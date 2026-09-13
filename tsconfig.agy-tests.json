@@ -15,6 +15,7 @@
     "test/agy-native-lifecycle.test.ts",
     "test/agy-provenance-platform.test.ts",
     "test/agy-stream-lifecycle.test.ts",
+    "test/agy-upgrade-gate.test.ts",
     "test/bridge-inventory.test.ts"
   ]
 }

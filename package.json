@@ -36,6 +36,7 @@
     "test:int": "vitest run --config vitest.int.config.ts",
     "test:watch": "vitest",
     "bridge:rollout": "node scripts/bridge-rollout.mjs",
+    "agy:upgrade:gate": "node scripts/agy-upgrade-gate.mjs",
     "relocate-repo": "tsx scripts/relocate-repo.ts"
   },
   "devDependencies": {

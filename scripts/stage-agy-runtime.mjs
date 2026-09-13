@@ -33,6 +33,10 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import {
+  evaluateAgyUpgradeEvidence,
+  readAgyUpgradeEvidence,
+} from "./agy-upgrade-gate.mjs";
 
 /** Directories in the reference layout are 0755; only the binary is 0555. */
 export const MANAGED_DIR_MODE = 0o755;
@@ -277,6 +281,8 @@ export function planAgyStaging(options) {
     /** Already staged at exactly this path with this digest: nothing to do. */
     alreadyStaged:
       existsSync(executable) && sha256File(executable, readFileSync) === sha256,
+    /** A changed artifact is an upgrade; moving identical bytes is migration. */
+    isUpgrade: Boolean(current.AGY_SHA256 && current.AGY_SHA256 !== sha256),
   };
 }
 
@@ -432,6 +438,25 @@ export async function applyAgyStaging(plan, options = {}) {
     // refuses only the new artifact and leaves the working host unchanged.
     await (options.verifyCapability ?? verifyAgyCapability)(plan.executable);
 
+    if (plan.isUpgrade) {
+      // Catalog success is not promotion evidence. AGY 1.2.2 could identify
+      // itself and satisfy provenance while rejecting the stream every Seam
+      // turn consumes. Refuse only this candidate upgrade; the existing pins,
+      // runtime and adapter keep serving after rollback.
+      if (!options.upgradeEvidence) {
+        throw new StagingRefusal(
+          "changed AGY artifact requires --upgrade-evidence from a separately approved canary"
+        );
+      }
+      const evidence = typeof options.upgradeEvidence === "string"
+        ? readAgyUpgradeEvidence(options.upgradeEvidence)
+        : options.upgradeEvidence;
+      await (options.verifyUpgradeEvidence ?? evaluateAgyUpgradeEvidence)(evidence, {
+        version: plan.version,
+        sha256: plan.sha256,
+      });
+    }
+
     // Only now is the tree known good, so only now do the pins point at it.
     writeFileSync(plan.envFile, renderEnvFile(envBefore, plan.updates));
     pinsWritten = true;
@@ -475,6 +500,7 @@ function parseArgs(argv) {
     else if (arg === "--env-file") opts.envFile = argv[++i];
     else if (arg === "--runtime-parent") opts.runtimeParent = argv[++i];
     else if (arg === "--default-model") opts.defaultModel = argv[++i];
+    else if (arg === "--upgrade-evidence") opts.upgradeEvidence = argv[++i];
     else if (arg === "--help" || arg === "-h") opts.help = true;
     else throw new StagingRefusal(`unknown argument ${arg}`);
   }
@@ -489,6 +515,7 @@ const USAGE = `stage-agy-runtime — migrate an agy binary into a root-owned man
   --env-file        the file holding the five AGY_* pins
   --runtime-parent  default ${DEFAULT_RUNTIME_PARENT}
   --default-model   only needed when there is no AGY_DEFAULT_MODEL to carry
+  --upgrade-evidence sanitized live-canary evidence required when the digest changes
   --apply           actually perform the migration (default is a dry run)
 
 Dry run is the default. There is no bypass flag: staging that cannot be
@@ -522,12 +549,18 @@ export async function main(argv, out = console) {
     out.log("dry run — nothing written. Re-run with --apply to perform this migration.");
     return 0;
   }
+  if (plan.isUpgrade && !opts.upgradeEvidence) {
+    out.error(
+      "REFUSED: changed AGY artifact requires --upgrade-evidence; existing runtime remains pinned."
+    );
+    return 1;
+  }
   if ((process.getuid?.() ?? -1) !== 0) {
     out.error("REFUSED: --apply needs root to create a root-owned runtime; re-run under sudo.");
     return 1;
   }
   try {
-    await applyAgyStaging(plan);
+    await applyAgyStaging(plan, { upgradeEvidence: opts.upgradeEvidence });
     out.log(`staged ${plan.executable} and updated ${AGY_PINS.length} pins.`);
     out.log("restart the bridge and confirm: provenance mode: immutable-path, agy version 4, executable managed-artifact.");
     return 0;

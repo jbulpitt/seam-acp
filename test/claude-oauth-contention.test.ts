@@ -69,6 +69,20 @@ describe("#404 the contention signature, and only it", () => {
     expect(classifyClaudeAuthFailure(message, VALID, NOW).retryable).toBe(false);
   });
 
+  it.each([
+    // Found by mutation: a matcher keyed on "mid-refresh" alone passed every
+    // other test here, and "mid-refresh" is not a Claude-specific token.
+    ["mid-refresh in an unrelated message", "Upload failed: the writer exited mid-refresh of its buffer"],
+    ["mid-refresh from a different subsystem", "Catalog refresh aborted; source exited mid-refresh"],
+    // Also found by mutation: dropping "Claude Code" from the phrase still
+    // passed. Another agent's identically-shaped error must not be retried
+    // against Claude's credential store, whose expiry says nothing about it.
+    ["another agent's refresh race", "another codex process is refreshing it or exited mid-refresh"],
+    ["an agy refresh race", "another agy process is refreshing it"],
+  ])("refuses %s, which is not this failure", (_label, message) => {
+    expect(classifyClaudeAuthFailure(message, VALID, NOW).retryable).toBe(false);
+  });
+
   it("does not match on the word refresh, OAuth, or the advice clause alone", () => {
     // "sign in again" and "close other Claude Code processes" both appear in the
     // real message, so a matcher keyed on the ADVICE rather than the CAUSE would

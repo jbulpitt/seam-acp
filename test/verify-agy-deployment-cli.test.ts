@@ -192,7 +192,8 @@ describe("#397 no flag this tool accepts may be one node also parses", () => {
     // and the source cross-check below catches the constant drifting from the
     // parser — which is the direction that silently removes coverage.
     expect([...AGY_DEPLOYMENT_FLAGS]).toEqual([
-      "--pins-file", "--format", "--runtime-parent", "--process-env", "--probe", "--json",
+      "--pins-file", "--format", "--runtime-parent", "--process-env", "--pm2-dump",
+      "--probe", "--json",
     ]);
     const source = fs.readFileSync(SCRIPT, "utf8");
     const accepted = [...source.matchAll(/arg === "(--[a-z-]+)"/g)].map((m) => m[1]);

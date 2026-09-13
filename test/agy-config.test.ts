@@ -33,7 +33,6 @@ describe("package-backed agy configuration gates", () => {
       AGY_CONVERSATIONS_DIR: "/srv/agy/conversations",
       AGY_DEFAULT_MODEL: "gemini-3.7-pro-high",
       AGY_CREDENTIAL_SCOPE: "antigravity-oauth:primary",
-      AGY_DANGEROUS_PERMISSIONS_ACKNOWLEDGED: "true",
       ...extra,
     });
   }

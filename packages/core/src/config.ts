@@ -311,17 +311,23 @@ const Schema = z.object({
   /** Non-secret semantic auth scope, never an account name, email, token, or path. */
   AGY_CREDENTIAL_SCOPE: z.string().default("antigravity-oauth:default"),
   /**
-   * GATES NOTHING TODAY (#377). It was required only by the removed
-   * agy-package config block and by that agent's factory.
+   * THERE IS DELIBERATELY NO PERMISSION-BYPASS ACKNOWLEDGEMENT KEY (#380).
    *
-   * Native agy passes `--dangerously-skip-permissions` unconditionally
-   * (#324) and has NEVER required this acknowledgement, so the risk it
-   * names is live while the acknowledgement is not. Kept rather than
-   * deleted because moving the gate onto the native path is a new boot-time
-   * requirement — a host that has not set it would lose agy entirely, which
-   * is the wrong thing to do inside a removal. Tracked separately.
+   * `AGY_DANGEROUS_PERMISSIONS_ACKNOWLEDGED` used to live here, defaulting
+   * to `"false"`. Its only consumer was the agy-package config block, which
+   * #377 removed, and native agy never consulted it. So it read to an
+   * operator as evidence the bypass was OFF while
+   * `--dangerously-skip-permissions` was passed on every single turn —
+   * the #324 shape, a name describing a boundary nobody verified.
+   *
+   * Do not re-add it as a gate. Native agy would then refuse to start
+   * without it, and four of the five agy hosts are agy-ONLY, so any host
+   * missing the key would advertise no agents at all — outcome 4 in the
+   * blast-radius ordering, introduced by a change meant to improve safety.
+   * The posture is stated in `docs/agy-native-lifecycle.md` and pinned by
+   * `test/agy-sandbox-posture.test.ts`, which is where it belongs: a
+   * description, not a control.
    */
-  AGY_DANGEROUS_PERMISSIONS_ACKNOWLEDGED: z.enum(["true", "false"]).default("false").transform((v) => v === "true"),
   /** Deprecated native-adapter enable alias, retained for existing host config. */
   AGY_OLD_ROLLBACK_ENABLED: z.enum(["true", "false"]).default("false").transform((v) => v === "true"),
   AGY_OLD_CLI_PATH: z.string().optional(),

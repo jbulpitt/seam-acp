@@ -809,6 +809,18 @@ export function agyExecutionPolicyArgs(
 ): string[] {
   return [
     ...(policy.sandbox ? ["--sandbox"] : []),
+    // UNCONDITIONAL, and nothing anywhere makes it conditional (#380).
+    //
+    // Sitting one line under an optional `--sandbox` is what made this
+    // misread twice. #324: we verified for weeks that `--sandbox` was
+    // passed correctly without anyone asking whether it was passed at all
+    // — it never is. #380: a config key named
+    // `AGY_DANGEROUS_PERMISSIONS_ACKNOWLEDGED`, defaulting to false, sat in
+    // the schema gating nothing, so the one place an operator would look
+    // for this said the opposite of the truth.
+    //
+    // Every agy turn auto-approves every tool permission request. The only
+    // thing bounding it is `--add-dir` below.
     "--dangerously-skip-permissions",
     "--add-dir",
     cwd,

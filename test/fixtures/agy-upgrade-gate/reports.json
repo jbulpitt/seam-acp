@@ -1,0 +1,95 @@
+{
+  "fixtureSchemaVersion": 1,
+  "origin": {
+    "incident": "#371: agy 1.2.2 StreamAgentStateUpdates rejected with unauthenticated/missing CSRF token",
+    "privacy": "All identities, timings, counts, task names and digests are synthetic. Only the rejection shape and known-good/known-bad version labels come from the incident record."
+  },
+  "reports": [
+    {
+      "schemaVersion": 1,
+      "kind": "agy-upgrade-evidence",
+      "sanitized": true,
+      "evidenceLevel": "synthetic-fixture",
+      "capturedAt": "2026-09-12T12:00:00Z",
+      "candidate": { "version": "1.1.27", "sha256": "1111111111111111111111111111111111111111111111111111111111111111" },
+      "baseline": { "version": "1.1.27", "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+      "comparison": { "adapterCommit": "abcdef0", "scenarioVersion": "agy-r10-v1", "hostClass": "synthetic-darwin-arm64", "declaredHostLoad": "synthetic-load-1", "modelId": "fixture-model" },
+      "capabilities": [
+        { "id": "stream-subscription", "verdict": "pass", "observations": 3 },
+        { "id": "thinking", "verdict": "pass", "observations": 3 },
+        { "id": "mcp", "verdict": "pass", "observations": 3 },
+        { "id": "usage", "verdict": "pass", "observations": 3 },
+        { "id": "structured-output", "verdict": "pass", "observations": 3 },
+        { "id": "session-continuity", "verdict": "pass", "observations": 3 },
+        { "id": "cleanup", "verdict": "pass", "observations": 3 }
+      ],
+      "schemaDrift": {
+        "updates": [
+          {
+            "status": "CASCADE_RUN_STATUS_RUNNING",
+            "mainTrajectoryUpdate": {
+              "stepsUpdate": {
+                "indices": [1],
+                "steps": [
+                  {
+                    "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+                    "status": "CORTEX_STEP_STATUS_DONE",
+                    "plannerResponse": { "thinking": "synthetic", "modifiedResponse": "synthetic" },
+                    "metadata": { "modelUsage": { "inputTokens": "1", "outputTokens": "1" } }
+                  }
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "performance": {
+        "baseline": [
+          { "taskId": "a", "startupToFirstEventMs": 10, "firstTextMs": 20, "completionToIdleMs": 30, "cleanupMs": 5, "peakRssBytes": 1000, "peakChildCount": 2 },
+          { "taskId": "b", "startupToFirstEventMs": 12, "firstTextMs": 22, "completionToIdleMs": 32, "cleanupMs": 7, "peakRssBytes": 1100, "peakChildCount": 2 },
+          { "taskId": "c", "startupToFirstEventMs": 14, "firstTextMs": 24, "completionToIdleMs": 34, "cleanupMs": 9, "peakRssBytes": 1200, "peakChildCount": 3 }
+        ],
+        "candidate": [
+          { "taskId": "a", "startupToFirstEventMs": 11, "firstTextMs": 21, "completionToIdleMs": 31, "cleanupMs": 6, "peakRssBytes": 1050, "peakChildCount": 2 },
+          { "taskId": "b", "startupToFirstEventMs": 13, "firstTextMs": 23, "completionToIdleMs": 33, "cleanupMs": 8, "peakRssBytes": 1150, "peakChildCount": 2 },
+          { "taskId": "c", "startupToFirstEventMs": 15, "firstTextMs": 25, "completionToIdleMs": 35, "cleanupMs": 10, "peakRssBytes": 1250, "peakChildCount": 3 }
+        ]
+      }
+    },
+    {
+      "$copy": "1.1.27",
+      "candidate": { "version": "1.1.28", "sha256": "2222222222222222222222222222222222222222222222222222222222222222" }
+    },
+    {
+      "$copy": "1.1.27",
+      "candidate": { "version": "1.2.0", "sha256": "3333333333333333333333333333333333333333333333333333333333333333" },
+      "schemaDrift": {
+        "updates": [
+          {
+            "status": "CASCADE_RUN_STATUS_RUNNING",
+            "futureTopLevelField": "synthetic",
+            "mainTrajectoryUpdate": {
+              "stepsUpdate": {
+                "indices": [1],
+                "steps": [
+                  {
+                    "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+                    "status": "CORTEX_STEP_STATUS_DONE",
+                    "futureStepField": "synthetic",
+                    "plannerResponse": { "thinking": "synthetic", "modifiedResponse": "synthetic" },
+                    "metadata": { "modelUsage": { "inputTokens": "1", "outputTokens": "1" } }
+                  }
+                ]
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "$copy": "1.1.27",
+      "candidate": { "version": "1.2.2", "sha256": "4444444444444444444444444444444444444444444444444444444444444444" },
+      "capabilityOverride": { "id": "stream-subscription", "verdict": "fail", "observations": 1, "reasonCode": "unauthenticated" }
+    }
+  ]
+}

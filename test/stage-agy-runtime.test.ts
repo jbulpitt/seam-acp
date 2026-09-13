@@ -34,6 +34,7 @@ import {
   renderEnvFile,
   verifyAgyCapability,
 } from "../scripts/stage-agy-runtime.mjs";
+import { evaluateAgyUpgradeEvidence } from "../scripts/agy-upgrade-gate.mjs";
 
 const realPlatform = process.platform;
 const roots: string[] = [];
@@ -76,6 +77,46 @@ if [ "$1" = "--log-file" ] && [ "$3" = "models" ]; then
 fi
 exit 2
 `);
+const UPGRADE_BODY = Buffer.from(`${BODY.toString()}\n# changed candidate bytes\n`);
+
+function upgradeReport(version: string, sha256: string, streamVerdict: "pass" | "fail") {
+  const sample = (taskId: string, offset: number) => ({
+    taskId,
+    startupToFirstEventMs: 10 + offset,
+    firstTextMs: 20 + offset,
+    completionToIdleMs: 30 + offset,
+    cleanupMs: 5 + offset,
+    peakRssBytes: 1000 + offset,
+    peakChildCount: 2,
+  });
+  return {
+    schemaVersion: 1,
+    kind: "agy-upgrade-evidence",
+    sanitized: true,
+    evidenceLevel: "live-verified",
+    capturedAt: "2026-09-12T12:00:00Z",
+    candidate: { version, sha256 },
+    baseline: { version: "1.1.27", sha256: "a".repeat(64) },
+    comparison: {
+      adapterCommit: "abcdef0",
+      scenarioVersion: "agy-r10-v1",
+      hostClass: "synthetic-darwin-arm64",
+      declaredHostLoad: "synthetic-load-1",
+      modelId: "fixture-model",
+    },
+    capabilities: [
+      { id: "stream-subscription", verdict: streamVerdict, observations: 1,
+        ...(streamVerdict === "fail" ? { reasonCode: "unauthenticated" } : {}) },
+      ...["thinking", "mcp", "usage", "structured-output", "session-continuity", "cleanup"]
+        .map((id) => ({ id, verdict: "pass", observations: 3 })),
+    ],
+    schemaDrift: { updates: [{ status: "CASCADE_RUN_STATUS_RUNNING" }] },
+    performance: {
+      baseline: [sample("a", 0), sample("b", 1), sample("c", 2)],
+      candidate: [sample("a", 1), sample("b", 2), sample("c", 3)],
+    },
+  };
+}
 
 /**
  * A host: a source `agy`, a pins file holding its CURRENT `$HOME` staging, and
@@ -275,6 +316,33 @@ describe("#342 a failed gate leaves the host exactly as it was", () => {
     expect(fs.existsSync(staged.executable)).toBe(false);
     expect(fs.existsSync(fixture.runtimeParent)).toBe(false);
     expect(fs.readFileSync(fixture.source)).toEqual(BODY);
+  });
+
+  it("refuses an upgrade whose catalog works but stream subscription regressed, leaving the working runtime pinned", async () => {
+    // #371's destructive distinction: a candidate can report a version, pass
+    // provenance and list models while the subscription every Seam turn uses
+    // is rejected. This checks the real staging call site, not only the pure
+    // evidence parser. Removing the R10 call moves the pins and fails here.
+    const fixture = host();
+    const before = fs.readFileSync(fixture.envFile, "utf8");
+    const candidate = path.join(fixture.root, "candidate-agy-r10");
+    fs.writeFileSync(candidate, UPGRADE_BODY, { mode: 0o555 });
+    const staged = plan(fixture, { source: candidate, version: "1.2.2" });
+    expect(staged.isUpgrade).toBe(true);
+
+    await expect(applyAgyStaging(staged, {
+      io: noChown,
+      verify: stagedVerify,
+      upgradeEvidence: upgradeReport("1.2.2", staged.sha256, "fail"),
+      verifyUpgradeEvidence: evaluateAgyUpgradeEvidence,
+    })).rejects.toThrow(
+      /stream-subscription failed \(unauthenticated\).*existing runtime remains pinned/,
+    );
+
+    expect(fs.readFileSync(fixture.envFile, "utf8")).toBe(before);
+    expect(fixture.pins().AGY_CLI_PATH).toBe(fixture.source);
+    expect(fs.readFileSync(fixture.source)).toEqual(BODY);
+    expect(fs.existsSync(staged.executable)).toBe(false);
   });
 
   it("restores the pins when the post-restart confirmation fails", async () => {

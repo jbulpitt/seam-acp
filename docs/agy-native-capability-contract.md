@@ -124,6 +124,10 @@ R3 deliberately leaves catalog/LKG modernization to R4
 redaction to R5 ([#261](https://github.com/jbulpitt/seam-acp/issues/261)),
 native MCP/helper parity to R8 ([#264](https://github.com/jbulpitt/seam-acp/issues/264)),
 and deployment/canaries to R9 ([#265](https://github.com/jbulpitt/seam-acp/issues/265)).
+R10 ([#266](https://github.com/jbulpitt/seam-acp/issues/266)) consumes this
+matrix as the offline regression baseline and separately requires exact-artifact
+live-canary evidence before an upgrade can move staging pins; see
+[the upgrade gate](agy-upgrade-gate.md).
 
 ## R3 deletion-safety rationale
 

@@ -662,8 +662,15 @@ When writing a new issue, always include:
 3. Check for conversation file format changes (previously `.pb` → `.db`).
 4. Check for new CLI flags or changes to `-p`, `--conversation`, `--add-dir`, `--dangerously-skip-permissions`.
 5. Check for new step types or metadata fields in streaming events.
-6. Update agy binary (it's a Go binary, not npm — check install instructions).
-7. Test an agy session via Discord, verify model catalog loads and streaming works.
+6. Do not promote from `--version` or model-list success. Prepare the sanitized,
+   separately approved baseline/candidate canary evidence described in
+   [`agy-upgrade-gate.md`](agy-upgrade-gate.md): stream subscription, thinking,
+   MCP, usage, structured output, continuity, cleanup, and paired performance
+   observations under declared load must each be explicit.
+7. Run `npm run agy:upgrade:gate -- --evidence <report.json> --version <version>
+   --sha256 <digest>`, then pass that same report to the dry-run-first staging
+   command as `--upgrade-evidence`. A refusal leaves the current binary pinned;
+   there is no version blocklist or force switch.
 
 ### 5.5 Gemini CLI deprecation & removal
 
@@ -929,6 +936,7 @@ https://registry.npmjs.org/@github/copilot
 ## Appendix C: Related seam-acp Documentation
 
 - [`model-management-runbook.md`](model-management-runbook.md) — Authoritative Claude model management process
+- [`agy-upgrade-gate.md`](agy-upgrade-gate.md) — Native AGY candidate capability and performance evidence gate
 - [`remote-agent.md`](remote-agent.md) — Remote agent setup via WebSocket bridge
 - [`premium-compaction-design.md`](premium-compaction-design.md) — Compaction system design
 - [`durable-jobs-plan.md`](durable-jobs-plan.md) — Durable jobs feature plan

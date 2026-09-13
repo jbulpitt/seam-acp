@@ -47,6 +47,23 @@ function managedProfile(
 }
 
 describe.sequential("#346 real-session catalog enrichment", () => {
+  /**
+   * #384 — budget, not a nudge. This test stages TWO managed fixtures and makes
+   * two real child-process round trips through them: a prompt-free `agy models`
+   * and a full turn. That cost is load-bearing, not incidental. The assertion
+   * below on `processes` pins the exact set of spawns — one `models`, one
+   * prompt, nothing else — which is the no-hidden-probe property #260 and #361
+   * exist to defend. Stub the subprocess out to make this cheap and the set is
+   * empty and the assertion passes vacuously, which is the one way this test
+   * could fail silently.
+   *
+   * Measured 2026-09-12: 4.86s at load 1.40, 4.92s on an idle host. Against
+   * vitest's 5s default that is a ~2% margin, so it reported "regression"
+   * whenever the host was merely busy. 15s is ~3x the measured cost, matching
+   * the budget the sibling AGY lifecycle tests already carry. If this ever
+   * approaches 15s the work itself has changed by 3x, and that is worth
+   * reading as a change rather than absorbing with another raise.
+   */
   it("publishes rich LS metadata for the exact binding and never lends it as host evidence", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "seam-agy-r4b-publish-"));
     const invocationLog = path.join(root, "invocations.ndjson");
@@ -137,7 +154,7 @@ describe.sequential("#346 real-session catalog enrichment", () => {
       fs.rmSync(root, { recursive: true, force: true });
       fs.rmSync(peerRoot, { recursive: true, force: true });
     }
-  });
+  }, 15_000);
 
   it("keeps AGY usable with the conservative window when its LS cannot provide metadata", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "seam-agy-r4b-unavailable-"));

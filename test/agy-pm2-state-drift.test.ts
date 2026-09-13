@@ -241,6 +241,24 @@ describe("#390 the drift verdict and what it tells an operator", () => {
     expect(detail).toContain("a reboot would not start it");
   });
 
+  it("picks the dump app the ecosystem file names, not just the one with pins", () => {
+    // Found by mutation: with one pinned app in the dump, matching by name and
+    // "take the only app with AGY pins" are indistinguishable. They differ the
+    // moment a second app carries AGY_* — a stale second bridge, or an agy
+    // sidecar — and then guessing reports the wrong host's configuration.
+    const h = host({
+      dump: [
+        { name: "some-other-agent", env: pins({ AGY_VERSION: "9.9.9", AGY_SHA256: "f".repeat(64) }) },
+        { name: "seam-bridge", env: pins() },
+      ],
+    });
+    const check = byId(verify(h), "pm2-state-consistent");
+    // seam-bridge's dump entry agrees with the file on version and digest, so
+    // the only differences are the fixture-root paths — never 9.9.9.
+    expect(check.detail).not.toContain("9.9.9");
+    expect(check.detail).not.toContain("apps carrying AGY pins");
+  });
+
   it("lets a real failure outrank drift, because the remediations differ", () => {
     const h = host({ dump: [{ name: "seam-bridge", env: pins({ AGY_SHA256: null }) }] });
     fs.chmodSync(path.join(h.runtimeParent, DIGEST, "agy"), 0o755);

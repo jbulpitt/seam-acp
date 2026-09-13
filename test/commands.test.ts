@@ -393,6 +393,20 @@ describe("/seamadmin — operator surface (#151)", () => {
     expect(clear?.options?.[0]?.required).toBe(true);
   });
 
+  it("registers an audited bridge workspace configuration path (#403)", () => {
+    expect(leafNames(admin(), "bridge")).toEqual([
+      "add",
+      "rotate",
+      "configure",
+      "list",
+      "remove",
+      "restart",
+    ]);
+    const configure = slot(admin(), "bridge")?.options?.find((o) => o.name === "configure");
+    expect(configure?.options?.map((o) => o.name)).toEqual(["name", "workspace-root"]);
+    expect(configure?.options?.every((o) => o.required)).toBe(true);
+  });
+
   it("declares the exact ManageGuild permission and Guild-only context", () => {
     const json = admin();
     // Serialized as a decimal STRING bitfield, not a number — assert the exact
@@ -445,7 +459,9 @@ describe("/seamadmin — operator surface (#151)", () => {
     const json = admin();
     expect(leafNames(json, "project")).toEqual(["new", "list", "remove"]);
     expect(leafNames(json, "upload")).toEqual(["pull", "push", "secret"]);
-    expect(leafNames(json, "bridge")).toEqual(["add", "rotate", "list", "remove", "restart"]);
+    expect(leafNames(json, "bridge")).toEqual([
+      "add", "rotate", "configure", "list", "remove", "restart",
+    ]);
     expect(leafNames(json, "debug")).toEqual([
       "work",
       "tail",

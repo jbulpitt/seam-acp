@@ -437,7 +437,7 @@ the command to anyone, so every runtime refusal stays exactly where it was:
   Stored bytes under `data/scheduled-attachments/` are never deleted by Seam.
 - `project` (3): `new` `list` `remove`
 - `upload` (3): `pull` `push` `secret`
-- `bridge` (4), `debug` (6) — pairing / host debug (`voice-ping` /
+- `bridge` (6), `debug` (6) — pairing / host config / safe restart / debug (`voice-ping` /
   `voice-capture` / `voice-live` are the live-help spike)
 - `voice` (7): `start` `add` `remove` `configure` `console` `status` `stop` —
   Shared Voice Console V2

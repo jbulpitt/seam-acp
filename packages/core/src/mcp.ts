@@ -108,7 +108,9 @@ export function buildProjectMcpServers(
     const expand = (value: string): string => value.replace(
       /\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^{}]*))?\}/g,
       (reference, variable: string, fallback: string | undefined) => {
-        const resolved = process.env[variable] ?? fallback;
+        // process.env inherits e.g. `toString`; those are not environment
+        // variables and must use the fallback/missing-server path, not be sent.
+        const resolved = (Object.hasOwn(process.env, variable) ? process.env[variable] : undefined) ?? fallback;
         if (resolved !== undefined) return resolved;
         missingVariables.add(variable);
         return reference;

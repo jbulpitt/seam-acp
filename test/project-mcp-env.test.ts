@@ -94,6 +94,18 @@ describe("project MCP environment references", () => {
     expect(logs.warn.mock.calls[0]![1]).toContain("reserved");
   });
 
+  it("does not mistake inherited object methods for environment values", () => {
+    const key: string = "toString";
+    const previous = Object.hasOwn(process.env, key) ? process.env[key] : undefined;
+    delete process.env[key];
+    try {
+      write({ web: { url: "https://example.invalid", headers: { "X-Test": "${toString:-fallback}" } } });
+      expect(read()[0]).toMatchObject({ headers: [{ name: "X-Test", value: "fallback" }] });
+    } finally {
+      if (previous !== undefined) process.env[key] = previous;
+    }
+  });
+
   it("does not expose config content through JSON parse diagnostics", () => {
     fs.writeFileSync(path.join(dir, ".mcp.json"), "mcp-key");
     expect(read()).toEqual([]);

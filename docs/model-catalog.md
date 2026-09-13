@@ -465,7 +465,8 @@ writes to the child, so a catalog probe cannot spend model tokens.
 - `model_catalog_generations`: immutable, checksummed snapshot generations.
 - `model_catalog_scopes`: the active-generation pointer per semantic scope.
 - `model_catalog_observations`: agent/host observations, source and schema /
-  adapter / CLI provenance, and drift diagnostics.
+  adapter / CLI provenance, drift diagnostics, and explicit local-configuration
+  retirement markers.
 - `model_catalog_refresh_status`: the last attempt, including quarantined and
   failed candidates.
 
@@ -483,6 +484,12 @@ agent ids remain selectable and use a catalog-backed controller descriptor while
 the actual process is spawned by the bridge. Preset application, stateless
 workers, and isolated ingest carry the selected/authoring host through catalog
 validation and dispatch; they never fall back to a same-named local profile.
+A local observation is marked retired only when the server's authoritative
+configured-profile list no longer contains that adapter. It is excluded from
+refresh and fleet selection, retained for audit, and reported to the cache-only
+fleet view as `retired`. Remote observations are never retired from local
+absence or age: an offline laptop may legitimately be gone for days, and its
+durable fleet evidence remains available when it returns.
 A binding
 with no valid generation reports `warming`; selection fails closed. Runtime ACP
 configuration is execution evidence only: if a live config option contradicts

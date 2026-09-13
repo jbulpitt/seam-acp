@@ -168,7 +168,7 @@ export interface AvailableCatalogModel {
 
 export interface CatalogFleetBinding {
   binding: CatalogBinding;
-  state: CatalogLookup["state"];
+  state: CatalogLookup["state"] | "retired";
   snapshot: StoredCatalogSnapshot | null;
 }
 
@@ -195,6 +195,8 @@ export class ModelCatalogService {
     store: ModelCatalogStore;
     logger: Logger;
     bindings: () => ReadonlyArray<CatalogBinding>;
+    /** Exact locally configured profiles; never inferred from remote presence. */
+    configuredLocalAgentIds?: () => ReadonlyArray<string>;
     /** Adapter-owned semantic scope; no provider work is allowed here. */
     scope?: (binding: CatalogBinding) => CatalogScope | Promise<CatalogScope>;
     fetch: (binding: CatalogBinding) => Promise<AdapterCatalogCandidate>;
@@ -206,6 +208,15 @@ export class ModelCatalogService {
     reductionPolicy?: CatalogReductionPolicy;
   }) {
     this.reductionPolicy = options.reductionPolicy ?? DEFAULT_CATALOG_REDUCTION_POLICY;
+    if (options.configuredLocalAgentIds) {
+      const reconciliation = options.store.reconcileConfiguredLocalAgents(
+        new Set(options.configuredLocalAgentIds()),
+        (options.now?.() ?? new Date()).toISOString(),
+      );
+      if (reconciliation.retired.length || reconciliation.restored.length) {
+        options.logger.info(reconciliation, "model catalog local observation lifecycle reconciled");
+      }
+    }
     for (const snapshot of options.store.loadActive()) {
       try {
         // Normalize forward before validating so a snapshot written by an older
@@ -242,13 +253,23 @@ export class ModelCatalogService {
   }
 
   knownBindings(): CatalogBinding[] {
-    return [...this.observations.values()].map(({ agentId, location }) => ({ agentId, location }));
+    return [...this.observations.values()]
+      .filter((observation) => observation.retiredAt == null)
+      .map(({ agentId, location }) => ({ agentId, location }));
+  }
+
+  /** Explicitly retired local bindings remain visible for fleet diagnostics. */
+  retiredBindings(): CatalogBinding[] {
+    return [...this.observations.values()]
+      .filter((observation) => observation.retiredAt != null)
+      .map(({ agentId, location }) => ({ agentId, location }));
   }
 
   /** Cache-only fleet view used by enrichment. */
   availableModels(): AvailableCatalogModel[] {
     const rows: AvailableCatalogModel[] = [];
     for (const observation of this.observations.values()) {
+      if (observation.retiredAt != null) continue;
       // #339 rule 5: no binding's availability depends on another's state, so a
       // historical peer-conflict marker no longer removes this binding's models.
       const snapshot = this.snapshots.get(observation.scopeKey);
@@ -269,8 +290,13 @@ export class ModelCatalogService {
     const configured = uniqueBindings([
       ...this.options.bindings(),
       ...this.knownBindings(),
+      ...this.retiredBindings(),
     ]);
     return configured.map((binding) => {
+      const observation = this.observations.get(bindingKey(binding));
+      if (observation?.retiredAt != null) {
+        return { binding, state: "retired" as const, snapshot: null };
+      }
       const lookup = this.lookup(binding);
       return { binding, state: lookup.state, snapshot: lookup.snapshot };
     }).sort((a, b) => bindingKey(a.binding).localeCompare(bindingKey(b.binding)));
@@ -284,6 +310,9 @@ export class ModelCatalogService {
   lookup(binding: CatalogBinding): CatalogLookup {
     const key = bindingKey(binding);
     const observation = this.observations.get(key) ?? null;
+    if (observation?.retiredAt != null) {
+      return { state: "warming", snapshot: null, observation };
+    }
     const snapshot = observation ? this.snapshots.get(observation.scopeKey) ?? null : null;
     if (!snapshot) return { state: "warming", snapshot: null, observation };
     const online = this.options.isOnline?.(binding) ?? true;
@@ -306,6 +335,7 @@ export class ModelCatalogService {
   hint(binding: CatalogBinding): { from: CatalogBinding; models: ReadonlyArray<CatalogModel> } | null {
     if (this.lookup(binding).snapshot) return null;
     for (const observation of this.observations.values()) {
+      if (observation.retiredAt != null) continue;
       if (observation.agentId !== binding.agentId) continue;
       if (observation.location === binding.location) continue;
       const snapshot = this.snapshots.get(observation.scopeKey);

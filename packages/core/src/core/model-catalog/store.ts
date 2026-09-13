@@ -30,6 +30,14 @@ export interface CatalogObservationRow {
   source: string;
   fetchedAt: string;
   drift: string | null;
+  /** Set only when this server positively observes removal from local config. */
+  retiredAt?: string | null;
+  retirementReason?: string | null;
+}
+
+export interface CatalogObservationReconciliation {
+  retired: string[];
+  restored: string[];
 }
 
 export interface CatalogRefreshStatusRow {
@@ -123,7 +131,9 @@ export class ModelCatalogStore {
         source_version TEXT,
         source TEXT NOT NULL,
         fetched_at TEXT NOT NULL,
-        drift TEXT
+        drift TEXT,
+        retired_at TEXT,
+        retirement_reason TEXT
       );
       CREATE TABLE IF NOT EXISTS model_catalog_refresh_status (
         binding_key TEXT PRIMARY KEY,
@@ -176,6 +186,8 @@ export class ModelCatalogStore {
     `);
     this.ensureColumn("model_catalog_observations", "schema_version", "INTEGER NOT NULL DEFAULT 1");
     this.ensureColumn("model_catalog_observations", "source_version", "TEXT");
+    this.ensureColumn("model_catalog_observations", "retired_at", "TEXT");
+    this.ensureColumn("model_catalog_observations", "retirement_reason", "TEXT");
   }
 
   loadActive(): StoredCatalogSnapshot[] {
@@ -215,7 +227,59 @@ export class ModelCatalogStore {
       source: String(row.source),
       fetchedAt: String(row.fetched_at),
       drift: row.drift == null ? null : String(row.drift),
+      retiredAt: row.retired_at == null ? null : String(row.retired_at),
+      retirementReason: row.retirement_reason == null ? null : String(row.retirement_reason),
     }));
+  }
+
+  /** Observations that still describe a configured binding or a remote host. */
+  loadCurrentObservations(): CatalogObservationRow[] {
+    return this.loadObservations().filter((row) => row.retiredAt == null);
+  }
+
+  /**
+   * Reconcile only the local configuration boundary we can prove.
+   *
+   * A missing `@local` profile means that one local adapter was removed, as
+   * happened to `agy-package` in #377. We mark that observation so it stops
+   * participating in refresh and fleet selection while its audit evidence
+   * remains intact. Every non-local observation keeps working regardless of
+   * age or connectivity: absence from this server's profile list says nothing
+   * about an offline bridge, and deleting or retiring it would silently blind
+   * the fleet view (#381).
+   */
+  reconcileConfiguredLocalAgents(
+    configuredAgentIds: ReadonlySet<string>,
+    now = new Date().toISOString(),
+  ): CatalogObservationReconciliation {
+    return this.db.transaction(() => {
+      const rows = this.db.prepare(`
+        SELECT binding_key, agent_id, retired_at
+        FROM model_catalog_observations
+        WHERE location = 'local'
+        ORDER BY binding_key
+      `).all() as Array<{ binding_key: string; agent_id: string; retired_at: string | null }>;
+      const retired: string[] = [];
+      const restored: string[] = [];
+      const retire = this.db.prepare(`
+        UPDATE model_catalog_observations
+        SET retired_at = ?, retirement_reason = 'local adapter no longer configured'
+        WHERE binding_key = ? AND retired_at IS NULL
+      `);
+      const restore = this.db.prepare(`
+        UPDATE model_catalog_observations
+        SET retired_at = NULL, retirement_reason = NULL
+        WHERE binding_key = ? AND retired_at IS NOT NULL
+      `);
+      for (const row of rows) {
+        if (configuredAgentIds.has(row.agent_id)) {
+          if (restore.run(row.binding_key).changes === 1) restored.push(row.binding_key);
+        } else if (retire.run(now, row.binding_key).changes === 1) {
+          retired.push(row.binding_key);
+        }
+      }
+      return { retired, restored };
+    })();
   }
 
   getRefreshStatus(bindingKey: string): CatalogRefreshStatusRow | null {
@@ -437,16 +501,19 @@ export class ModelCatalogStore {
     this.db.prepare(`
       INSERT INTO model_catalog_observations(
         binding_key, agent_id, location, scope_key, checksum, adapter_version,
-        schema_version, cli_version, source_version, source, fetched_at, drift
+        schema_version, cli_version, source_version, source, fetched_at, drift,
+        retired_at, retirement_reason
       ) VALUES (@bindingKey, @agentId, @location, @scopeKey, @checksum, @adapterVersion,
-        @schemaVersion, @cliVersion, @sourceVersion, @source, @fetchedAt, @drift)
+        @schemaVersion, @cliVersion, @sourceVersion, @source, @fetchedAt, @drift,
+        @retiredAt, @retirementReason)
       ON CONFLICT(binding_key) DO UPDATE SET
         agent_id=excluded.agent_id, location=excluded.location, scope_key=excluded.scope_key,
         checksum=excluded.checksum, adapter_version=excluded.adapter_version,
         schema_version=excluded.schema_version, cli_version=excluded.cli_version,
         source_version=excluded.source_version, source=excluded.source,
-        fetched_at=excluded.fetched_at, drift=excluded.drift
-    `).run(row);
+        fetched_at=excluded.fetched_at, drift=excluded.drift,
+        retired_at=NULL, retirement_reason=NULL
+    `).run({ ...row, retiredAt: row.retiredAt ?? null, retirementReason: row.retirementReason ?? null });
   }
 
   /** The reduction quarantine a confirmation must match, if any. */

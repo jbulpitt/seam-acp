@@ -143,7 +143,7 @@ try (add new ones to this list when they clear the bar — that is self-update):
 - xAI / Grok: `elonmusk`, `xai`, `grok`
 - OpenAI: `sama`, `OpenAI`
 - Anthropic: `AnthropicAI`, `darioamodei`
-- Safety / pacing: Jacob Coxon (`hilbertspaess`), Joe Benton (`JoeJBenton`), Evan Hubinger (`EvanHub`), Samuel Marks (`saprmarks`)
+- Safety / pacing: Jacob Coxon (`hilbertspaess`), Joe Benton (`JoeJBenton`), Josh Engels (`JoshAEngels`; formerly Google DeepMind, now METR), Evan Hubinger (`EvanHub`), Samuel Marks (`saprmarks`)
 - Google / DeepMind: `JeffDean`, `demishassabis`, `GoogleDeepMind`, `sundarpichai`
 - Meta: `ylecun`, `AIatMeta`, `alexandr_wang` (Muse max shipped on Wang’s account, not AIatMeta)
 - Open-weight / non-flagship: `Kimi_Moonshot`, `Zai_org` / Zhipu, DeepSeek,

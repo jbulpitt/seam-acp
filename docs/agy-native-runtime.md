@@ -147,6 +147,15 @@ node scripts/verify-agy-deployment.mjs --pins-file ~/.seam/bridge/ecosystem.conf
 node scripts/verify-agy-deployment.mjs --pins-file ~/.seam/bridge/ecosystem.config.cjs --probe --json
 ```
 
+Those commands verify one host and now say so in both text and JSON output;
+they are not evidence for a fleet-wide claim. An aggregator making such a claim
+must also pass `--host`, `--fleet-targets`, and `--bridge-registry` together.
+The last input is a controller-side key-only copy of the `bridges` object, not
+the full channel-presets file with its credentials. The verifier then reports
+the selected host as one of the registered denominator and names every host
+excluded from the rollout inventory. Partial fleet context is refused rather
+than silently falling back to a confidently incomplete count (#413).
+
 That is where every agy host in the fleet keeps its pins — as a JS object
 literal inside the `env:` block of the `seam-bridge` app, **not** as
 `KEY=VALUE`. The first version of this document specified `~/.seam/bridge.env`,

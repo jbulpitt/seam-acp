@@ -138,6 +138,36 @@ describe("#397 the exit-code contract, from a real node process", () => {
     expect(result.code).toBe(3);
     expect(result.stdout).toContain("agy deployment: NOT-DEPLOYED");
     expect(result.stdout).toContain("(absent)");
+    expect(result.stdout).toContain("verification_scope=1 host; fleet denominator not supplied; this is not a fleet-wide result");
+  });
+
+  it("states the fleet denominator when given both reconciled registries", () => {
+    const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "seam-413-")));
+    roots.push(dir);
+    const targets = path.join(import.meta.dirname, "..", "ops", "bridge", "targets.json");
+    const targetShape = JSON.parse(fs.readFileSync(targets, "utf8"));
+    const registry = path.join(dir, "channel-presets.json");
+    fs.writeFileSync(registry, JSON.stringify({
+      bridges: Object.fromEntries(Object.keys(targetShape.targets).map((id) => [id, {}])),
+    }));
+    const result = run([
+      "--pins-file", path.join(dir, "missing.cjs"),
+      "--host", "plex-server",
+      "--fleet-targets", targets,
+      "--bridge-registry", registry,
+    ]);
+    expect(result.code).toBe(3);
+    expect(result.stdout).toContain("fleet_registered=9");
+    expect(result.stdout).toContain("fleet_rollout_managed=4 of 9");
+    expect(result.stdout).toContain("operation_scope=1 of 9 registered hosts: plex-server");
+    expect(result.stdout).toContain("fleet_excluded=rhc-server: Linux aarch64 PM2 host needs a verified rollout identity and enrollment");
+  });
+
+  it("refuses a partial fleet scope instead of implying completeness", () => {
+    const result = run(["--pins-file", "/nonexistent", "--host", "plex-server"]);
+    expect(result.code).toBe(2);
+    expect(result.stderr).toContain("requires --host, --fleet-targets, and --bridge-registry together");
+    expect(result.stdout).not.toContain("agy deployment:");
   });
 
   it("exits 2 when invoked wrongly, without pretending to have checked anything", () => {
@@ -193,7 +223,7 @@ describe("#397 no flag this tool accepts may be one node also parses", () => {
     // parser — which is the direction that silently removes coverage.
     expect([...AGY_DEPLOYMENT_FLAGS]).toEqual([
       "--pins-file", "--format", "--runtime-parent", "--process-env", "--pm2-dump",
-      "--probe", "--json",
+      "--host", "--fleet-targets", "--bridge-registry", "--probe", "--json",
     ]);
     const source = fs.readFileSync(SCRIPT, "utf8");
     const accepted = [...source.matchAll(/arg === "(--[a-z-]+)"/g)].map((m) => m[1]);

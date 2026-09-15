@@ -58,7 +58,7 @@ describe("bridge rollout target safety (#241)", () => {
 
   it("keeps AGY-only hosts mapped but outside this rollout", () => {
     expect(configured.targets["jennifer-laptop"].sshAlias).toBe("macbook-air-j");
-    expect(() => resolveTarget(targets, "jennifer-laptop")).toThrow(/AGY-only/);
+    expect(() => resolveTarget(targets, "jennifer-laptop")).toThrow(/explicitly excluded.*AGY-only/);
   });
 
   it("refuses every mutating phase for an explicitly unmanaged host, before command construction (#281, #282)", () => {
@@ -88,9 +88,9 @@ describe("bridge rollout target safety (#241)", () => {
       ["--target", "unmanaged-host", "--activate", "--sha", "a".repeat(40), "--checksum", "b".repeat(64), "--stage-id", token, "--apply"],
     ]) {
       const parsed = parseArgs(argv);
-      expect(() => resolveTarget(map, parsed.target)).toThrow(/explicitly unmanaged.*no verified SSH management path/);
+      expect(() => resolveTarget(map, parsed.target)).toThrow(/explicitly excluded.*no verified SSH management path/);
     }
-    expect(() => makeSshCommand(target, ["preflight"], "fixed-script")).toThrow(/explicitly unmanaged/);
+    expect(() => makeSshCommand(target, ["preflight"], "fixed-script")).toThrow(/explicitly excluded/);
     // #281: enrollment must refuse the same state. Recording a baseline for a
     // host with no verified management path would produce a rollback target
     // nobody could ever restore to — the inversion of the primitive's purpose.
@@ -99,10 +99,10 @@ describe("bridge rollout target safety (#241)", () => {
       ["--target", "unmanaged-host", "--restore-baseline", "--enrollment-id", token, "--apply"],
     ]) {
       const parsed = parseArgs(argv);
-      expect(() => resolveTarget(map, parsed.target)).toThrow(/explicitly unmanaged/);
+      expect(() => resolveTarget(map, parsed.target)).toThrow(/explicitly excluded/);
     }
-    expect(() => makeSshCommand(target, ["enroll", token, token], "fixed-script")).toThrow(/explicitly unmanaged/);
-    expect(() => makeScpCommand(target, "/tmp/release.tgz", `${artifactName("a".repeat(40), "b".repeat(64))}.upload-${token}`)).toThrow(/explicitly unmanaged/);
+    expect(() => makeSshCommand(target, ["enroll", token, token], "fixed-script")).toThrow(/explicitly excluded/);
+    expect(() => makeScpCommand(target, "/tmp/release.tgz", `${artifactName("a".repeat(40), "b".repeat(64))}.upload-${token}`)).toThrow(/explicitly excluded/);
   });
 
   it("records macbook-pro as managed now that it has a verified SSH path (#342)", () => {
@@ -165,7 +165,7 @@ describe("bridge rollout target safety (#241)", () => {
     expect(() => validateTargetMap({ schemaVersion: 3, targets: { ok: { ...base, surprise: "x" } } })).toThrow(/unknown target property/);
     expect(() => validateTargetMap({ schemaVersion: 3, targets: { ok: { ...base, pidFilePath: "/stale/app-0.pid" } } })).toThrow(/unknown target property.*pidFilePath/);
     expect(() => validateTargetMap({ schemaVersion: 3, targets: { ok: { sshAlias: null, pm2App: null, verifyAgent: null, rolloutEnabled: false } } })).toThrow(/requires a safe reason/);
-    expect(() => validateTargetMap({ schemaVersion: 3, targets: { ok: { sshAlias: "known-host", pm2App: null, verifyAgent: null, rolloutEnabled: false, unmanagedReason: "wrong state" } } })).toThrow(/must not declare an unmanaged reason/);
+    expect(() => validateTargetMap({ schemaVersion: 3, targets: { ok: { sshAlias: "known-host", pm2App: null, verifyAgent: null, rolloutEnabled: false } } })).toThrow(/requires a safe reason/);
   });
 
   it("constructs argv directly with every pinned identity field", () => {

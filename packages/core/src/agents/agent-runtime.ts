@@ -191,11 +191,23 @@ const START_TIMEOUT_MS = 45_000;
 const NEW_SESSION_TIMEOUT_MS = 45_000;
 /**
  * A healthy load may replay a large history, so it gets more room than startup.
- * Sixty seconds is roughly 2.4x the observed 25s recovery window, while still
- * making silence a named refusal of this resume only. Other sessions and new
- * session creation remain available.
+ *
+ * This was 60s, sized at 2.4x an observed 25s recovery window (#325/#314,
+ * 2026-09-11). That window was measured on small sessions and the bound does
+ * not scale with history, so it silently became a ceiling on session SIZE: a
+ * codex thread at 202,534/258,400 tokens and another at 138,895 both exceeded
+ * it and could no longer be resumed at all. Before the bound existed the load
+ * was an unbounded `await` and simply took as long as it took, so this turned
+ * "slow" into "permanently unreachable" for exactly the long-lived threads that
+ * hold the most work.
+ *
+ * 180s is a deliberate stopgap, not a derivation: it is wide enough for the
+ * largest sessions observed failing, and the honest fix is a bound that scales
+ * with replayed history rather than a constant anyone has to keep raising.
+ * Silence past this is still a named refusal of this one resume; other sessions
+ * and new session creation remain available.
  */
-export const SESSION_LOAD_TIMEOUT_MS = 60_000;
+export const SESSION_LOAD_TIMEOUT_MS = 180_000;
 
 export class SessionLoadTimeoutError extends Error {
   readonly code = "session_load_timeout";

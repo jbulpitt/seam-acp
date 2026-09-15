@@ -3,6 +3,7 @@ import { randomBytes } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { activationRefusal, buildArtifact, firstActivationFromBaselineAllowed, commandRunner, loadTargetMap, makeScpCommand, makeSshCommand, parseArgs, parseKeyValues, renderRemoteScript, resolveTarget, runActivation, runPreflight } from "./lib/bridge-rollout.mjs";
+import { describeTargetFleet, formatFleetCoverage, loadBridgeRegistry } from "./lib/bridge-fleet.mjs";
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(scriptDir, "..");
@@ -22,6 +23,12 @@ async function main() {
   const options = parseArgs(process.argv.slice(2));
   if (options.help) return usage();
   const targets = await loadTargetMap(path.join(repoRoot, "ops/bridge/targets.json"));
+  const configuredRegistry = process.env.CHANNEL_PRESETS_FILE ??
+    path.join(process.env.DATA_DIR ?? "data", "channel-presets.json");
+  const registryFile = path.resolve(repoRoot, configuredRegistry);
+  const registered = await loadBridgeRegistry(registryFile);
+  const fleet = describeTargetFleet(targets, registered);
+  console.log(formatFleetCoverage(fleet, options.target));
   const target = resolveTarget(targets, options.target);
   const remoteScript = await renderRemoteScript(path.join(scriptDir, "bridge-rollout-remote.sh"), path.join(scriptDir, "bridge-rollout-remote.mjs"));
   const preflight = await runPreflight(target, remoteScript);

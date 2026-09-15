@@ -33,7 +33,8 @@
       "sshAlias": "macbook-air-j",
       "pm2App": null,
       "verifyAgent": null,
-      "rolloutEnabled": false
+      "rolloutEnabled": false,
+      "unmanagedReason": "AGY-only host is outside the PM2 bridge rollout contract"
     },
     "macbook-pro": {
       "sshAlias": "macbook-pro",
@@ -53,13 +54,15 @@
       "sshAlias": "laptop-alaina",
       "pm2App": null,
       "verifyAgent": null,
-      "rolloutEnabled": false
+      "rolloutEnabled": false,
+      "unmanagedReason": "AGY-only host is outside the PM2 bridge rollout contract"
     },
     "allie-laptop": {
       "sshAlias": "laptop-allie",
       "pm2App": null,
       "verifyAgent": null,
-      "rolloutEnabled": false
+      "rolloutEnabled": false,
+      "unmanagedReason": "AGY-only host is outside the PM2 bridge rollout contract"
     },
     "home-hub": {
       "sshAlias": "home-hub",
@@ -74,6 +77,20 @@
       "devMode": false,
       "releaseRoot": "/Users/jessebulpitt/.seam/bridge-rollouts",
       "rolloutEnabled": true
+    },
+    "plex-server": {
+      "sshAlias": "plex-server",
+      "pm2App": null,
+      "verifyAgent": null,
+      "rolloutEnabled": false,
+      "unmanagedReason": "systemd launcher needs a dedicated activation and rollback contract"
+    },
+    "rhc-server": {
+      "sshAlias": "rhc-server",
+      "pm2App": null,
+      "verifyAgent": null,
+      "rolloutEnabled": false,
+      "unmanagedReason": "Linux aarch64 PM2 host needs a verified rollout identity and enrollment"
     }
   }
 }

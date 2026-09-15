@@ -42,6 +42,8 @@ import {
   pathChain,
   verifyAgyCapability,
 } from "./stage-agy-runtime.mjs";
+import { loadTargetMap } from "./lib/bridge-rollout.mjs";
+import { describeTargetFleet, formatFleetCoverage, loadBridgeRegistry } from "./lib/bridge-fleet.mjs";
 
 export const AGY_DEPLOYMENT_SCHEMA_VERSION = 1;
 
@@ -745,6 +747,9 @@ export function formatDeploymentReport(report) {
   if (skipped.length) {
     lines.push("", `  ${skipped.length} check(s) skipped — this report does not cover them.`);
   }
+  lines.push("");
+  if (report.fleet) lines.push(formatFleetCoverage(report.fleet, report.host));
+  else lines.push("verification_scope=1 host; fleet denominator not supplied; this is not a fleet-wide result");
   return lines.join("\n");
 }
 
@@ -755,7 +760,8 @@ export function formatDeploymentReport(report) {
  * the script cannot report, catch or work around it.
  */
 export const AGY_DEPLOYMENT_FLAGS = Object.freeze([
-  "--pins-file", "--format", "--runtime-parent", "--process-env", "--pm2-dump", "--probe", "--json",
+  "--pins-file", "--format", "--runtime-parent", "--process-env", "--pm2-dump",
+  "--host", "--fleet-targets", "--bridge-registry", "--probe", "--json",
 ]);
 
 /**
@@ -810,11 +816,18 @@ function parseArgs(argv) {
     else if (arg === "--runtime-parent") opts.runtimeParent = argv[++i];
     else if (arg === "--process-env") opts.processEnvFile = argv[++i];
     else if (arg === "--pm2-dump") opts.pm2Dump = argv[++i];
+    else if (arg === "--host") opts.host = argv[++i];
+    else if (arg === "--fleet-targets") opts.fleetTargets = argv[++i];
+    else if (arg === "--bridge-registry") opts.bridgeRegistry = argv[++i];
     else if (arg === "--probe") opts.probe = true;
     else if (arg === "--json") opts.json = true;
     else throw new Error(`unknown argument: ${arg}`);
   }
   if (!opts.envFile) throw new Error("--pins-file is required");
+  const fleetArgs = [opts.host, opts.fleetTargets, opts.bridgeRegistry].filter(Boolean).length;
+  if (fleetArgs !== 0 && fleetArgs !== 3) {
+    throw new Error("fleet accounting requires --host, --fleet-targets, and --bridge-registry together");
+  }
   return opts;
 }
 
@@ -823,7 +836,22 @@ export async function main(argv, out = console) {
   if (opts.processEnvFile) {
     opts.processEnv = JSON.parse(fs.readFileSync(opts.processEnvFile, "utf8"));
   }
-  const report = verifyAgyDeployment(opts);
+  let fleet;
+  if (opts.fleetTargets) {
+    const targets = await loadTargetMap(opts.fleetTargets);
+    const registered = await loadBridgeRegistry(opts.bridgeRegistry);
+    fleet = describeTargetFleet(targets, registered);
+    if (!registered.has(opts.host)) throw new Error(`--host ${JSON.stringify(opts.host)} is not in the bridge registry`);
+  }
+  const report = {
+    ...verifyAgyDeployment(opts),
+    host: opts.host ?? null,
+    fleet,
+    fleetScope: fleet ? "accounted" : "single-host-only",
+    fleetScopeDetail: fleet
+      ? `1 of ${fleet.registered.length} registered hosts`
+      : "fleet denominator not supplied; this is not a fleet-wide result",
+  };
   out.log(opts.json ? JSON.stringify(report, null, 2) : formatDeploymentReport(report));
   return exitCodeFor(report.verdict);
 }

@@ -12,9 +12,22 @@ parsing.
 
 ## Fixed deployment identities
 
-[`ops/bridge/targets.json`](../ops/bridge/targets.json) is the only target map.
-For each enabled bridge it pins the bridge ID, SSH alias, PM2 app, verification
-agent, UID, checkout/cwd, stable PM2 entrypoint, exact PID file, Node executable,
+[`ops/bridge/targets.json`](../ops/bridge/targets.json) is the rollout inventory.
+It names every bridge registered in `data/channel-presets.json`, including hosts
+that are deliberately excluded from this PM2 rollout. Before constructing any
+SSH command, the controller compares those two key sets and refuses a fleet
+claim if either has an unrecorded host. This guard refuses only the rollout
+operation; connected bridges, adapters, dispatches, and other hosts keep
+serving. Set `CHANNEL_PRESETS_FILE` when the live registry is not at
+`data/channel-presets.json` relative to the checkout.
+
+Every preflight prints the denominator: nine registered hosts, four managed by
+this rollout, and five excluded with a reason, plus the one selected host. A
+successful selected-host preflight is therefore never presented as verification
+of an unnamed whole fleet.
+
+For each enabled bridge the target map pins the bridge ID, SSH alias, PM2 app,
+verification agent, UID, checkout/cwd, stable PM2 entrypoint, Node executable,
 PM2 module, optional workspace argument, and rollout root. None is overridable
 on the command line.
 
@@ -24,13 +37,18 @@ on the command line.
 - `macbook-air` maps to SSH `macbook-air`, PM2 `seam-bridge`, UID 501, checkout
   `/Users/jessebulpitt/.seam/seam-acp`, and rollout root
   `/Users/jessebulpitt/.seam/bridge-rollouts`.
-- Three AGY-only hosts retain SSH aliases but deliberately have no rollout
-  identity and remain disabled. `macbook-pro` is explicitly unmanaged: the
-  previously recorded `home-hub` alias reaches a simultaneously connected,
-  distinct `home-hub` bridge, and no verified SSH management path for
-  `macbook-pro` is known. Every rollout phase therefore refuses that target.
-  Do not restore an alias until a read-only preflight proves that the remote
-  process reports `bridge_id=macbook-pro`.
+- `macbook-pro` and `home-hub` are enabled PM2 targets alongside the two above.
+- Three AGY-only laptops retain SSH aliases but deliberately have no rollout
+  identity and remain disabled.
+- `plex-server` is explicitly excluded: it is Linux x86_64 under systemd and a
+  launch wrapper, so the PM2 capture/activation/rollback protocol does not apply.
+- `rhc-server` is explicitly excluded pending a verified rollout identity and
+  enrollment. It is Linux aarch64 under PM2 with Node ABI 127, a tuple the
+  rollout supports, but architecture alone is not enough evidence to guess its
+  launcher, arguments, ownership, or rollback identity.
+
+An excluded host remains in the fleet denominator and every attempted phase
+refuses with its recorded reason. Absence is not used to mean exclusion.
 
 Before any mutation, the remote program requires one PM2 record and proves that
 its PID equals the exact owned PID file; the process is alive, owned by the

@@ -36,13 +36,9 @@ export function validateTargetMap(input) {
       if (Object.keys(value).some((key) => !["sshAlias", "pm2App", "verifyAgent", "rolloutEnabled", "unmanagedReason"].includes(key)) || value.pm2App !== null || value.verifyAgent !== null) {
         throw new Error(`disabled target ${bridgeId} must not guess deployment identity`);
       }
-      if (value.sshAlias === null) {
-        if (typeof value.unmanagedReason !== "string" || !SAFE_REASON.test(value.unmanagedReason)) {
-          throw new Error(`explicitly unmanaged target ${bridgeId} requires a safe reason`);
-        }
-      } else {
-        if (!SAFE_NAME.test(value.sshAlias ?? "")) throw new Error(`unsafe SSH alias for ${bridgeId}`);
-        if (value.unmanagedReason !== undefined) throw new Error(`mapped disabled target ${bridgeId} must not declare an unmanaged reason`);
+      if (value.sshAlias !== null && !SAFE_NAME.test(value.sshAlias ?? "")) throw new Error(`unsafe SSH alias for ${bridgeId}`);
+      if (typeof value.unmanagedReason !== "string" || !SAFE_REASON.test(value.unmanagedReason)) {
+        throw new Error(`rollout-excluded target ${bridgeId} requires a safe reason`);
       }
       targets.set(bridgeId, { bridgeId, ...value });
       continue;
@@ -76,10 +72,7 @@ export function resolveTarget(targets, bridgeId) {
 
 function requireManagedTarget(target) {
   if (!target?.rolloutEnabled) {
-    if (target?.sshAlias === null) {
-      throw new Error(`${target.bridgeId} is explicitly unmanaged: ${target.unmanagedReason}`);
-    }
-    throw new Error(`${target?.bridgeId ?? "target"} is mapped but rollout is disabled (AGY-only hosts are outside #241)`);
+    throw new Error(`${target?.bridgeId ?? "target"} is explicitly excluded from bridge rollout: ${target?.unmanagedReason ?? "reason not recorded"}`);
   }
   if (!SAFE_NAME.test(target.sshAlias ?? "")) throw new Error(`target ${target.bridgeId ?? "unknown"} has no verified SSH management path`);
 }

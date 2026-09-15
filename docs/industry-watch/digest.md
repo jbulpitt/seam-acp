@@ -1,11 +1,11 @@
 # LLM Industry Watch
 
-- **last_sweep:** 2026-09-14
-- **one_line:** DeepSeek’s old Pro endpoint now routes to V4.1 Flash, while the AA-backed cache reports a sharp Gemini 3.5 Flash score drop; the public frontier’s new pacing rhetoric still has no shared implementation.
+- **last_sweep:** 2026-09-15
+- **one_line:** The AA cache advanced without a score shock or new creator; DeepSeek’s Pro-to-Flash routing, Google’s missing-Pro pattern, and the labs’ nonbinding pacing rhetoric remain the current frontier picture.
 
 ## Frontier snapshot
 
-Seam’s AA-backed catalog advanced from source snapshot **60** to **70**. The returned leader set is otherwise unchanged—Astra **52.8 / 76.9 Coding**, Sol 47.1, Grok 4.6 44.3, Kimi K3 43.8, Terra 42.3, and Gemini 3.8 Flash **41.2 / 76.3 Coding**—but **Gemini 3.5 Flash (high) moved 39.7 → 33.0 II** (−6.7; Coding 70.1). That clears the numeric mover bar, but AA’s public index remains **v4.3**; treat it as a cached-score event, not a demonstrated model regression or a methodology release.
+Seam’s AA-backed catalog advanced from source snapshot **70** to **74**. The selected leader set is unchanged—Astra **52.8 / 76.9 Coding**, Sol 47.1, Grok 4.6 44.3, Kimi K3 43.8, Terra 42.3, and Gemini 3.8 Flash **41.2 / 76.3 Coding**. Gemini 3.5 Flash (high) remains **33.0 II / 70.1 Coding** after yesterday’s −6.7 cache move; there is no new ≥1.0 score movement today.
 
 Public AA v4.3 still has Fable 5.1 and Astra tied at 53, with GLM-5.3 (45) and Kimi K3 (44) leading open weights. Its September 7 benchmark reset (Terminal-Bench v4 plus AutomationBench-AA) is unchanged. The cache still lacks Fable/Opus/GLM/DeepSeek rows; absence is coverage, not a model verdict.
 
@@ -13,11 +13,11 @@ Public AA v4.3 still has Fable 5.1 and Astra tied at 53, with GLM-5.3 (45) and K
 
 ### DeepSeek V4.1 Flash — shipping, confirmed
 
-At **2026-09-14 04:00 UTC**, `deepseek-v4-pro` began routing to V4.1 Flash at Flash rates, joining the old Flash routes. V4.1 Pro has no announced timing or AA score.
+At **2026-09-14 04:00 UTC**, `deepseek-v4-pro` began routing to V4.1 Flash at Flash rates, joining the old Flash routes. V4.1 Pro has no announced timing or AA score; no subsequent change surfaced.
 
 ### Google Flash cadence / missing Pro — delayed, credible
 
-The −6.7 cached Gemini 3.5 Flash move is the day’s AA shock, while Gemini 3.8 Flash remains visible and no 3.5/3.8/4 Pro artifact stayed public. The cache-only movement does not resolve the missing-Pro storyline.
+Yesterday’s −6.7 cached Gemini 3.5 Flash move remains unchanged, while Gemini 3.8 Flash remains visible and no 3.5/3.8/4 Pro artifact stayed public. The cache-only movement does not resolve the missing-Pro storyline.
 
 ### Frontier pacing and safety exits — training, confirmed
 
@@ -46,11 +46,13 @@ No new storyline cleared the inclusion bar.
 - **gpt-6-astra:** no confirmed Plus/Business completion or new access slice.
 - **anthropic-fable-mythos-gates:** no trusted-access expansion or Commerce change.
 - **meta-muse-spark:** no 1.3 follow-up, open-weight successor, or Seam cache row.
-- **kimi-k3:** no K4 artifact or training signal.
+- **google-gemini-flagship-gap:** no Pro artifact or access announcement; cached scores unchanged.
+- **kimi-k3:** no post-sweep K4 artifact or training signal. A July 28 Blackwell/K4 report was rediscovered and filtered as historical, not revived as a daily event.
 - **glm-5-3:** no named successor, AA restoration, or confirmation for Omen Alpha.
 - **tencent-hy4:** no non-preview Hy4 or AA row.
 - **qwen-3-8-max:** no independent Arena-CI separation or AA row.
 - **grok-next:** no 4.7 release artifact.
+- **deepseek-v4-1-flash:** no V4.1 Pro timing or first AA score after the routing transition.
 - **mistral-frontier-bid:** no flagship-run or compute-commitment proof beyond the raise.
 - **china-distillation-policy-cluster:** no direct lab response, restriction, or independent lineage evidence.
 - **openai-next-internal-training:** no identifier, external score, or release window.

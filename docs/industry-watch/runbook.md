@@ -148,6 +148,7 @@ try (add new ones to this list when they clear the bar — that is self-update):
 - Meta: `ylecun`, `AIatMeta`, `alexandr_wang` (Muse max shipped on Wang’s account, not AIatMeta)
 - Open-weight / non-flagship: `Kimi_Moonshot`, `Zai_org` / Zhipu, DeepSeek,
   Qwen / `Alibaba_Qwen`, Mistral, Tencent Hunyuan (`Hy4`, `tencent/Hy4-preview`)
+  and Nex AGI (`nex-agi`, `Nex-N2.5`)
 - Analysts who unspin labs: `SemiAnalysis_`, `natolambert`
 - Benchmarks: `ArtificialAnlys` (first scores often land here before the Seam AA cache)
 

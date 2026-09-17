@@ -101,7 +101,7 @@ export function planSeamMcpInjection(opts: {
 }
 
 export interface RemoteSlotSpawnParams {
-  mcpServers: unknown;
+  mcpServers: McpServer[];
   agentId: string;
   model?: string;
   effort?: string;
@@ -127,7 +127,18 @@ export async function spawnRemoteSlot(
   if (params.effort !== undefined) rpcParams.effort = params.effort;
   if (params.cwd !== undefined) rpcParams.cwd = params.cwd;
   try {
-    await mux.rpc("spawn", rpcParams, { agentId: params.agentId });
+    const result = await mux.rpc("spawn", rpcParams, { agentId: params.agentId });
+    const projectMcpInjection = result && typeof result === "object"
+      ? (result as { projectMcpInjection?: unknown }).projectMcpInjection
+      : undefined;
+    if (projectMcpInjection !== true) {
+      // Old bridges cannot load remote project MCP. Keep the agent available
+      // and make the compatibility gap loud until that host is rolled out.
+      console.warn(
+        `[remote-spawn] bridge for ${params.agentId} predates host-owned project MCP; ` +
+        "continuing without remote project .mcp.json"
+      );
+    }
   } catch (err) {
     try {
       child.kill();

@@ -15,6 +15,7 @@ export * from "./agy-session-store.js";
 export * from "./agy-session-store.js";
 export * from "./command-bus.js";
 export * from "./read-attachment.js";
+export * from "./project-mcp.js";
 export * from "./workspace-scan.js";
 export * from "./adapter-rpc.js";
 export * from "./profiles/claude.js";

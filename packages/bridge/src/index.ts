@@ -49,8 +49,13 @@ import fsp from "node:fs/promises";
 import path from "node:path";
 import type { IncomingMessage } from "node:http";
 import type { RawData, WebSocket as WsSocket } from "ws";
-import { PROTOCOL_VERSION, type AgentAdapter } from "@seam/adapters";
+import {
+  PROTOCOL_VERSION,
+  buildCopilotMcpConfigJson,
+  type AgentAdapter,
+} from "@seam/adapters";
 import { dispatchBridgeRpc, type SlotSpawnConfig } from "./rpc.js";
+import { BridgeMcpInputRewriter } from "./mcp-injection.js";
 import {
   inventoryFromAdapters,
   loadHostAdapterInventory,
@@ -154,30 +159,6 @@ async function loadWs(): Promise<{ WebSocket: WsCtor; WebSocketServer: WssCtor }
   }
 }
 
-function additionalMcpConfigJson(mcpServers: unknown): string | undefined {
-  if (!Array.isArray(mcpServers) || mcpServers.length === 0) return undefined;
-  const mapped: Record<string, { url: string; headers?: Record<string, string> }> = {};
-  for (const s of mcpServers) {
-    if (!s || typeof s !== "object") continue;
-    const rec = s as {
-      name?: string;
-      url?: string;
-      headers?: Array<{ name: string; value: string }>;
-    };
-    if (!rec.url || !rec.name) continue;
-    const headers: Record<string, string> = {};
-    for (const h of rec.headers ?? []) {
-      if (h?.name && typeof h.value === "string") headers[h.name] = h.value;
-    }
-    mapped[rec.name] = {
-      url: rec.url,
-      ...(Object.keys(headers).length > 0 ? { headers } : {}),
-    };
-  }
-  if (Object.keys(mapped).length === 0) return undefined;
-  return JSON.stringify({ mcpServers: mapped });
-}
-
 function resolveSlotAdapter(
   adapters: Map<string, AgentAdapter>,
   slotCfg?: SlotSpawnConfig
@@ -207,7 +188,9 @@ function spawnAgent(
   const cwd = slotCfg?.cwd || localCwd;
   const launch = resolveCopilotHostLaunch(copilotCmd, cwd, slotCfg?.env);
   const cmdArgs = [...launch.args];
-  const mcpJson = additionalMcpConfigJson(slotCfg?.mcpServers);
+  const mcpJson = buildCopilotMcpConfigJson(
+    Array.isArray(slotCfg?.mcpServers) ? slotCfg.mcpServers : []
+  );
   if (mcpJson) {
     cmdArgs.push("--additional-mcp-config", mcpJson);
   }
@@ -259,6 +242,7 @@ function makeSlotManager(opts: {
   const slotConfigs = new Map<number, SlotSpawnConfig>();
   let draining = false;
   const lastStdoutAt = new Map<number, number>();
+  const slotInputRewriters = new Map<number, BridgeMcpInputRewriter>();
 
   function setWs(ws: WsSocket | null) {
     currentWs = ws;
@@ -302,6 +286,10 @@ function makeSlotManager(opts: {
     console.error(`[bridge] Slot ${slot}: spawning agent`);
     const agent = spawnAgent(adapters, copilotCmd, localCwd, slotConfigs.get(slot));
     slots.set(slot, agent);
+    slotInputRewriters.set(
+      slot,
+      new BridgeMcpInputRewriter(slotConfigs.get(slot)?.mcpServers ?? [])
+    );
 
     agent.stdout?.on("data", (chunk: Buffer) => {
       lastStdoutAt.set(slot, Date.now());
@@ -311,6 +299,7 @@ function makeSlotManager(opts: {
     agent.on("error", (err) => {
       console.error(`[bridge] Slot ${slot} agent error: ${err.message}`);
       slots.delete(slot);
+      slotInputRewriters.delete(slot);
       muxSend(currentWs, WebSocket, slot, "exit", { code: 1 });
     });
 
@@ -318,6 +307,7 @@ function makeSlotManager(opts: {
       console.error(`[bridge] Slot ${slot} agent exited (code=${code}, signal=${signal})`);
       slots.delete(slot);
       lastStdoutAt.delete(slot);
+      slotInputRewriters.delete(slot);
       muxSend(currentWs, WebSocket, slot, "exit", { code: code ?? 1 });
     });
 
@@ -582,7 +572,8 @@ function makeSlotManager(opts: {
     if (msg.type === "data" && msg.data !== undefined) {
       const agent = getOrSpawnSlot(msg.slot);
       if (agent && !agent.killed) {
-        agent.stdin?.write(msg.data);
+        const rewritten = slotInputRewriters.get(msg.slot)?.push(msg.data) ?? msg.data;
+        if (rewritten) agent.stdin?.write(rewritten);
       }
     } else if (msg.type === "kill") {
       const agent = slots.get(msg.slot);
@@ -591,6 +582,7 @@ function makeSlotManager(opts: {
         agent.kill();
         slots.delete(msg.slot);
         slotConfigs.delete(msg.slot);
+        slotInputRewriters.delete(msg.slot);
       }
     } else if (msg.type === "cmd") {
       handleCmd(msg);

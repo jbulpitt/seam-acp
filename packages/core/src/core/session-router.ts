@@ -1148,17 +1148,20 @@ export class SessionRouter {
       // send a header the new process no longer knows.
       reuseToken: true,
     });
-    // Bridge the session cwd's project .mcp.json into the per-session list so
-    // non-claude agents (codex/grok/agy/copilot) see the same project MCP
-    // servers claude-agent-acp auto-reads from cwd. Scoped to cwd, so a server
-    // in one repo's .mcp.json never leaks to another.
+    // Local sessions read local project config here. Remote cwd belongs to the
+    // bridge host, so the spawn RPC loads it there and the bridge enriches
+    // session/new|load without returning resolved credentials to this process.
+    // Reading a remote path on the controller can select an unrelated local
+    // repo with the same pathname.
     const mcpServers = [
       ...injectedMcpServers,
-      ...buildProjectMcpServers(
-        cwd,
-        this.logger,
-        new Set(injectedMcpServers.map((s) => s.name))
-      ),
+      ...(remote
+        ? []
+        : buildProjectMcpServers(
+            cwd,
+            this.logger,
+            new Set(injectedMcpServers.map((s) => s.name))
+          )),
     ];
 
     let spawnChild: RuntimeSpawnPlan["spawnChild"] = (modelOverride, effortOverride) =>

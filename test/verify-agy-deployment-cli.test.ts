@@ -158,9 +158,9 @@ describe("#397 the exit-code contract, from a real node process", () => {
     ]);
     expect(result.code).toBe(3);
     expect(result.stdout).toContain("fleet_registered=9");
-    expect(result.stdout).toContain("fleet_rollout_managed=4 of 9");
+    expect(result.stdout).toContain("fleet_rollout_managed=5 of 9");
     expect(result.stdout).toContain("operation_scope=1 of 9 registered hosts: plex-server");
-    expect(result.stdout).toContain("fleet_excluded=rhc-server: Linux aarch64 PM2 host needs a verified rollout identity and enrollment");
+    expect(result.stdout).toContain("fleet_excluded=plex-server: systemd launcher needs a dedicated activation and rollback contract");
   });
 
   it("refuses a partial fleet scope instead of implying completeness", () => {

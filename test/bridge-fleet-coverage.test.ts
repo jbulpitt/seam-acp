@@ -31,13 +31,12 @@ describe("#413 bridge fleet accounting", () => {
     const registered = validateBridgeRegistry(registeredShape);
     const fleet = describeTargetFleet(targetMap, registered);
     expect(fleet.registered).toHaveLength(9);
-    expect(fleet.rolloutManaged).toEqual(["home-hub", "macbook-air", "macbook-pro", "media-server"]);
+    expect(fleet.rolloutManaged).toEqual(["home-hub", "macbook-air", "macbook-pro", "media-server", "rhc-server"]);
     expect(fleet.rolloutExcluded.map((row) => row.id)).toEqual([
-      "alaina-laptop", "allie-laptop", "jennifer-laptop", "plex-server", "rhc-server",
+      "alaina-laptop", "allie-laptop", "jennifer-laptop", "plex-server",
     ]);
     expect(fleet.rolloutExcluded.find((row) => row.id === "plex-server")?.reason).toMatch(/systemd.*dedicated/i);
-    expect(fleet.rolloutExcluded.find((row) => row.id === "rhc-server")?.reason).toMatch(/aarch64.*verified.*enrollment/i);
-    expect(formatFleetCoverage(fleet, "media-server")).toContain("fleet_rollout_managed=4 of 9");
+    expect(formatFleetCoverage(fleet, "media-server")).toContain("fleet_rollout_managed=5 of 9");
     expect(formatFleetCoverage(fleet, "media-server")).toContain("operation_scope=1 of 9 registered hosts: media-server");
   });
 
@@ -111,7 +110,7 @@ describe("#413 bridge fleet accounting", () => {
       stderr = e.stderr ?? "";
     }
     expect(stdout).toContain("fleet_registered=9");
-    expect(stdout).toContain("fleet_rollout_managed=4 of 9");
+    expect(stdout).toContain("fleet_rollout_managed=5 of 9");
     expect(stdout).toContain("fleet_excluded=plex-server: systemd launcher needs a dedicated activation and rollback contract");
     expect(stderr).toMatch(/plex-server is explicitly excluded.*systemd launcher/);
   });

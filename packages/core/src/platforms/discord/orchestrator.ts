@@ -131,6 +131,7 @@ import {
   clampFieldValue,
   formatAnomalyLines,
   buildInterruptedInventory,
+  interruptedRowForCompletedAttempt,
   fitEmbedFields,
   interruptedRowActions,
   type InterruptedTurnRow,
@@ -15002,20 +15003,15 @@ export class Orchestrator {
       });
     }
     for (const attempt of this.store.turnAttempts.list("completed")) {
-      const deliveryReason = attempt.deliveryAbandonedReason ?? attempt.deliveryUncertainReason;
-      if (!deliveryReason || seen.has(attempt.id)) continue;
+      if (seen.has(attempt.id)) continue;
+      // #419: the mapping lives in workflows-view so it can be tested without
+      // building an orchestrator. Its inline predecessor skipped every attempt
+      // with no delivery reason, which is why `b27578fe` was invisible to the
+      // only control that could have cleared it.
+      const row = interruptedRowForCompletedAttempt(attempt);
+      if (!row) continue;
       seen.add(attempt.id);
-      rows.push({
-        id: attempt.id,
-        source: attempt.source === "dispatch" ? "dispatch" : "live",
-        channelRef: attempt.deliveryChannel ?? attempt.spec.target,
-        correlationId: attempt.spec.correlationId ?? null,
-        status: attempt.deliveryUncertainReason ? "interrupted" : "abandoned",
-        startedUtc: attempt.updatedUtc,
-        acpSessionId: attempt.acpSessionId,
-        targetRef: attempt.spec.target,
-        reason: deliveryReason,
-      });
+      rows.push(row);
     }
     const live = await this.liveTurnInventory();
     for (const m of live) {

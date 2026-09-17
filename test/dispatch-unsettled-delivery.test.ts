@@ -208,6 +208,68 @@ describe("#419 the trap: unsettled completions are reachable by an operator", ()
     expect(store.listUnsettledCompletions(TARGET).map((a) => a.id)).toEqual(["mine"]);
   });
 
+  it("maps a real unsettled attempt into an actionable workflows row", async () => {
+    // Drives the ACTUAL mapping the orchestrator uses, from a real store row —
+    // the previous version of this test built the row by hand and so never
+    // exercised the code under change. Mutation testing caught that.
+    const { interruptedRowForCompletedAttempt, interruptedRowActions } = await import(
+      "../packages/core/src/platforms/discord/workflows-view.js");
+    forceUnsettled("b27578fe");
+    const attempt = store.get("b27578fe")!;
+    const row = interruptedRowForCompletedAttempt(attempt)!;
+    expect(row).not.toBeNull();
+    expect(row.id).toBe("b27578fe");
+    expect(row.status).toBe("interrupted");
+    expect(row.targetRef).toBeNull();
+    expect(row.reason).toMatch(/holds thread admission until abandoned/);
+    expect(interruptedRowActions(row)).toEqual(["abandon"]);
+  });
+
+  it("maps a settled attempt the way it always did, and a delivered one not at all", async () => {
+    const { interruptedRowForCompletedAttempt } = await import(
+      "../packages/core/src/platforms/discord/workflows-view.js");
+    completeWith("abandoned", { returnTo: "c" });
+    store.abandonDelivery("abandoned", "refused");
+    const abandonedRow = interruptedRowForCompletedAttempt(store.get("abandoned")!)!;
+    expect(abandonedRow.status).toBe("abandoned");
+    expect(abandonedRow.targetRef).toBe(TARGET);
+
+    completeWith("done", { returnTo: "c" });
+    store.prepareDelivery("done", "chan", { kind: "text", body: "x" } as never);
+    store.markDeliveryDone("done");
+    expect(interruptedRowForCompletedAttempt(store.get("done")!)).toBeNull();
+  });
+
+  it("an unsettled row is offered Abandon and NOT Resume", async () => {
+    // The `/seam workflows` inventory decides controls from `status` and
+    // `targetRef` (#159). An unsettled completion must be "interrupted"
+    // (actionable) with a null targetRef (no Resume) — marking it "abandoned"
+    // would list the trap and still offer no way out, and offering Resume
+    // would re-run a turn that already ran.
+    const { buildInterruptedInventory, interruptedRowActions } = await import(
+      "../packages/core/src/platforms/discord/workflows-view.js");
+    const row = {
+      id: "b27578fe", source: "dispatch" as const, channelRef: TARGET,
+      correlationId: null, status: "interrupted" as const,
+      startedUtc: "2026-09-17T22:36:57.301Z", acpSessionId: "01a078e3",
+      targetRef: null,
+      reason: "completed but never settled its delivery disposition; it holds thread admission until abandoned",
+    };
+    // Abandon offered, Resume withheld — the precise control set.
+    expect(interruptedRowActions(row)).toEqual(["abandon"]);
+
+    // And it lands in the ACTIONABLE section, not the inert one. Listing it as
+    // inert would show the trap and still give no way out.
+    const slice = buildInterruptedInventory([row], 0, new Date());
+    expect(slice.actionable).not.toBeNull();
+    expect(slice.inert).toBeNull();
+    expect(slice.actionable!.value).toContain("b27578fe");
+
+    // The pre-fix shape, for contrast: had it been listed "abandoned", #159
+    // would correctly give it no controls at all.
+    expect(interruptedRowActions({ ...row, status: "abandoned" })).toEqual([]);
+  });
+
   it("is reachable by the same abandon the operator already has", () => {
     // End to end: the state that trapped b27578fe is now visible AND clearable,
     // with the truthful terminal reason rather than a delivery claim.

@@ -87,10 +87,17 @@
     },
     "rhc-server": {
       "sshAlias": "rhc-server",
-      "pm2App": null,
-      "verifyAgent": null,
-      "rolloutEnabled": false,
-      "unmanagedReason": "Linux aarch64 PM2 host needs a verified rollout identity and enrollment"
+      "pm2App": "seam-bridge",
+      "verifyAgent": "agy",
+      "checkoutPath": "/home/ubuntu/.seam/seam-acp",
+      "entrypointPath": "/home/ubuntu/.seam/seam-acp/packages/bridge/dist/index.js",
+      "expectedUid": 1001,
+      "nodePath": "/home/ubuntu/.nvm/versions/node/v22.22.2/bin/node",
+      "pm2ModulePath": "/home/ubuntu/.nvm/versions/node/v22.22.2/lib/node_modules/pm2",
+      "workspaceArg": "/home/ubuntu/Projects",
+      "devMode": true,
+      "releaseRoot": "/home/ubuntu/.seam/bridge-rollouts",
+      "rolloutEnabled": true
     }
   }
 }

@@ -209,6 +209,52 @@ export function interruptedRowActions(
 }
 
 /** True when the row still has at least one action a click could perform. */
+/**
+ * The `/seam workflows` row for a COMPLETED attempt, or null when it owes
+ * nothing (#419).
+ *
+ * Extracted from the orchestrator so the decision is testable without building
+ * one. It was previously inline, and the inline version silently dropped every
+ * attempt with no delivery reason — the exact reason `b27578fe` was invisible
+ * to the only operator control that could have cleared it.
+ */
+export function interruptedRowForCompletedAttempt(attempt: {
+  id: string;
+  source: string;
+  acpSessionId: string | null;
+  updatedUtc: string;
+  deliveryDone: boolean;
+  deliveryChannel: string | null;
+  deliveryAbandonedReason: string | null;
+  deliveryUncertainReason: string | null;
+  spec: { target: string; correlationId?: string | null };
+}): InterruptedTurnRow | null {
+  const unsettled = !attempt.deliveryDone
+    && !attempt.deliveryAbandonedReason
+    && !attempt.deliveryUncertainReason;
+  const reason = attempt.deliveryAbandonedReason ?? attempt.deliveryUncertainReason
+    ?? (unsettled
+      ? "completed but never settled its delivery disposition; it holds thread admission until abandoned"
+      : null);
+  if (!reason) return null;
+  return {
+    id: attempt.id,
+    source: attempt.source === "dispatch" ? "dispatch" : "live",
+    channelRef: attempt.deliveryChannel ?? attempt.spec.target,
+    correlationId: attempt.spec.correlationId ?? null,
+    // An unsettled row must be ACTIONABLE. "abandoned" is the already-consumed
+    // state and #159 gives it no button, so marking one that way would list the
+    // trap and still offer no way out.
+    status: (unsettled || attempt.deliveryUncertainReason) ? "interrupted" : "abandoned",
+    startedUtc: attempt.updatedUtc,
+    acpSessionId: attempt.acpSessionId,
+    // Withheld when unsettled: #159 offers Resume only when a target exists,
+    // and this turn has already run. Abandon is the only correct remedy.
+    targetRef: unsettled ? null : attempt.spec.target,
+    reason,
+  };
+}
+
 export function isActionableInterruptedRow(row: InterruptedTurnRow): boolean {
   return interruptedRowActions(row).length > 0;
 }

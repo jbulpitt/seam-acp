@@ -131,6 +131,7 @@ import {
   clampFieldValue,
   formatAnomalyLines,
   buildInterruptedInventory,
+  interruptedRowForCompletedAttempt,
   fitEmbedFields,
   interruptedRowActions,
   type InterruptedTurnRow,
@@ -628,6 +629,14 @@ export interface ChannelQueueHealth {
   runtimeBusy: boolean;
   stalledDispatchCount: number;
   stalledDispatchIds: string[];
+  /** #419: completed attempts with NO delivery disposition. They hold thread
+   *  admission exactly like a stalled one, but carry no `stalled_utc`, so the
+   *  recovery path could not see them and no operator control could clear
+   *  them. Reported separately rather than folded into the stalled count,
+   *  because the remedy differs: these are already finished and must be
+   *  abandoned, never resumed. */
+  unsettledDispatchCount: number;
+  unsettledDispatchIds: string[];
 }
 
 interface ChannelQueueFence {
@@ -2053,7 +2062,9 @@ export class Orchestrator {
     const listInbound = (this.store as Partial<SessionStore>).listInboundNonterminal;
     const durable = listInbound ? listInbound.call(this.store, channelRef) : [];
     const stalled = this.store.turnAttempts.listStalled(channelRef);
-    if (!meta && !runtimeBusy && durable.length === 0 && stalled.length === 0) {
+    const listUnsettled = this.store.turnAttempts.listUnsettledCompletions?.bind(this.store.turnAttempts);
+    const unsettled = listUnsettled ? listUnsettled(channelRef) : [];
+    if (!meta && !runtimeBusy && durable.length === 0 && stalled.length === 0 && unsettled.length === 0) {
       return {
         state: "idle",
         epoch: this.queueEpoch(channelRef),
@@ -2062,6 +2073,8 @@ export class Orchestrator {
         runtimeBusy: false,
         stalledDispatchCount: 0,
         stalledDispatchIds: [],
+        unsettledDispatchCount: 0,
+        unsettledDispatchIds: [],
       };
     }
     const durableSince = durable.length > 0 ? Date.parse(durable[0]!.updatedUtc) : Number.NaN;
@@ -2090,6 +2103,8 @@ export class Orchestrator {
       queued: Math.max(meta?.queued ?? 0, durable.length),
       ageMs,
       runtimeBusy,
+      unsettledDispatchCount: unsettled.length,
+      unsettledDispatchIds: unsettled.map((a) => a.id),
       stalledDispatchCount: stalled.length,
       stalledDispatchIds: stalled.map((attempt) => attempt.id),
     };
@@ -14988,20 +15003,15 @@ export class Orchestrator {
       });
     }
     for (const attempt of this.store.turnAttempts.list("completed")) {
-      const deliveryReason = attempt.deliveryAbandonedReason ?? attempt.deliveryUncertainReason;
-      if (!deliveryReason || seen.has(attempt.id)) continue;
+      if (seen.has(attempt.id)) continue;
+      // #419: the mapping lives in workflows-view so it can be tested without
+      // building an orchestrator. Its inline predecessor skipped every attempt
+      // with no delivery reason, which is why `b27578fe` was invisible to the
+      // only control that could have cleared it.
+      const row = interruptedRowForCompletedAttempt(attempt);
+      if (!row) continue;
       seen.add(attempt.id);
-      rows.push({
-        id: attempt.id,
-        source: attempt.source === "dispatch" ? "dispatch" : "live",
-        channelRef: attempt.deliveryChannel ?? attempt.spec.target,
-        correlationId: attempt.spec.correlationId ?? null,
-        status: attempt.deliveryUncertainReason ? "interrupted" : "abandoned",
-        startedUtc: attempt.updatedUtc,
-        acpSessionId: attempt.acpSessionId,
-        targetRef: attempt.spec.target,
-        reason: deliveryReason,
-      });
+      rows.push(row);
     }
     const live = await this.liveTurnInventory();
     for (const m of live) {

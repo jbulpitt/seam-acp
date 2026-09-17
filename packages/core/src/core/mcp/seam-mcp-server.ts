@@ -171,6 +171,8 @@ export interface ThreadEntry {
    * on the production projection so index.ts cannot silently omit the state. */
   stalledDispatchCount: number;
   stalledDispatchIds: string[];
+  unsettledDispatchCount?: number;
+  unsettledDispatchIds?: string[];
   /** Host binding (D10). Omit ⇒ `local`. Rendered as `agentId@location`. */
   location?: string;
   /** Host emoji prefix (local 🏠 + each paired bridge). */
@@ -2764,6 +2766,13 @@ export class SeamMcpServer {
           (cfg ? `\n    identity: ${cfg}${t.cwd ? ` @ ${t.cwd}` : ""}` : "") +
           (t.queueState === "stalled"
             ? `\n    retained dispatches: ${(t.stalledDispatchIds ?? []).join(", ") || t.stalledDispatchCount || "unknown"}; use /seam workflows to resume or abandon`
+            : "") +
+          // #419: reported whatever the queue state says. An unsettled
+          // completion holds admission while the thread still looks merely
+          // "busy", so gating this on `stalled` would hide the one case that
+          // has no other way of being seen.
+          ((t.unsettledDispatchCount ?? 0) > 0
+            ? `\n    ⚠️ completed but unsettled (holding admission): ${(t.unsettledDispatchIds ?? []).join(", ")}; abandon via /seam workflows — do NOT resume, these already ran`
             : "") +
           `\n    last active ${formatLocalTime(t.lastActivityUtc)}`
       );

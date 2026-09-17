@@ -4,6 +4,32 @@ import { compareExecutionIdentity } from "./execution-identity.js";
 import { deliveryNonce, type DurableDeliveryPayload } from "./delivery-proof.js";
 import { isProcessOwner, processOwner, provenDead, type ProcessOwner } from "./process-owner.js";
 
+/**
+ * The truthful terminal reason for a completion whose onward delivery was
+ * INTENTIONALLY skipped, or `null` when delivery is still owed (#419).
+ *
+ * Deliberately narrow. It fires only on the two flags that mean "the live path
+ * already decided this owes nothing onward" — the same two `completionRoute`
+ * terminalizes on. Anything broader would settle an attempt whose report-back
+ * is genuinely still in flight, which silently drops the answer: the opposite
+ * failure, and a worse one than a blocked thread, because a blocked thread is
+ * at least visible.
+ *
+ * The reason text names transport explicitly, because an operator reading this
+ * row later has to be able to tell "we chose not to send it" from "we sent it".
+ */
+export function suppressedOnwardDeliveryReason(
+  outcome: Pick<DispatchResult, "suppressedOnward" | "inlinedReportBack">
+): string | null {
+  if (outcome.inlinedReportBack) {
+    return "onward delivery suppressed: report-back was inlined onto the card; transport never started";
+  }
+  if (outcome.suppressedOnward) {
+    return "onward delivery suppressed: completion superseded before transport started";
+  }
+  return null;
+}
+
 function recordedOwner(raw: string | undefined): ProcessOwner | null {
   try {
     const value: unknown = raw ? JSON.parse(raw) : null;
@@ -376,9 +402,58 @@ export class TurnAttemptStore {
   }
 
   complete(a: TurnAttempt, outcome: DispatchResult): boolean {
-    return this.db.prepare(`UPDATE turn_attempts SET state='completed', outcome_json=?, updated_utc=?
+    // #419: settle the delivery disposition in the SAME write that records the
+    // completion. Suppressing onward delivery and settling its disposition used
+    // to be unconnected, so a card-click whose report-back was inlined landed as
+    // `completed` with `delivery_done=0` and no reason — which
+    // `isDeliveryDispositionTerminal` treats as outstanding forever, holding
+    // thread admission. `b27578fe` blocked a thread for 25 minutes that way.
+    //
+    // It is one statement rather than a follow-up call on purpose: any gap
+    // between "completed" and "settled" is the same hole, just narrower, and a
+    // crash inside it leaves exactly the row this fixes.
+    //
+    // `COALESCE` so an existing reason is never overwritten, and note what is
+    // NOT set: `delivery_done` stays 0. This is a terminal DISPOSITION, not
+    // transport proof — `isDeliveryProven` must keep reading false, or retained
+    // output becomes deletable on the strength of a delivery that never ran.
+    return this.db.prepare(`UPDATE turn_attempts SET state='completed', outcome_json=?,
+      delivery_abandoned_reason=COALESCE(delivery_abandoned_reason, ?), updated_utc=?
       WHERE id=? AND generation=? AND owner_boot=? AND state='active'`)
-      .run(JSON.stringify(outcome), new Date().toISOString(), a.id, a.generation, a.ownerBoot).changes === 1;
+      .run(
+        JSON.stringify(outcome),
+        suppressedOnwardDeliveryReason(outcome),
+        new Date().toISOString(),
+        a.id, a.generation, a.ownerBoot
+      ).changes === 1;
+  }
+
+  /**
+   * Completed attempts with no delivery disposition at all (#419).
+   *
+   * These are invisible to every operator control: `/seam workflows` keys on
+   * `stalled_utc`, cancel targets a running turn, and nothing times an
+   * unsettled delivery out. `markStalled` cannot reach them either — it is
+   * gated on `state IN ('pending','active','suspended')`, and widening it would
+   * rewrite a finished attempt's state to `suspended`, destroying the record
+   * that the turn ran and inviting a resume of work already done.
+   *
+   * So they are surfaced as what they are rather than disguised as stalled.
+   * With the settlement above this should stay empty; it exists because the
+   * trigger fix only closes the causes we know about, and the next unsettled
+   * completion should be recoverable without database access.
+   */
+  listUnsettledCompletions(target?: string): TurnAttempt[] {
+    const rows = target
+      ? this.db.prepare(`SELECT id FROM turn_attempts
+          WHERE state='completed' AND delivery_done=0
+            AND delivery_abandoned_reason IS NULL AND delivery_uncertain_reason IS NULL
+            AND json_extract(spec_json, '$.target')=? ORDER BY updated_utc,id`).all(target)
+      : this.db.prepare(`SELECT id FROM turn_attempts
+          WHERE state='completed' AND delivery_done=0
+            AND delivery_abandoned_reason IS NULL AND delivery_uncertain_reason IS NULL
+          ORDER BY updated_utc,id`).all();
+    return (rows as { id: string }[]).map(({ id }) => this.get(id)!);
   }
 
   /** Record the exact terminal create-message before it can reach Discord. */

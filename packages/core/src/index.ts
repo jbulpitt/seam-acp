@@ -882,6 +882,8 @@ async function main(): Promise<void> {
               queueEpoch: queue.epoch,
               stalledDispatchCount: queue.stalledDispatchCount,
               stalledDispatchIds: queue.stalledDispatchIds,
+              unsettledDispatchCount: queue.unsettledDispatchCount,
+              unsettledDispatchIds: queue.unsettledDispatchIds,
               status,
               lastActivityUtc: s.updatedUtc,
               location,

@@ -628,6 +628,14 @@ export interface ChannelQueueHealth {
   runtimeBusy: boolean;
   stalledDispatchCount: number;
   stalledDispatchIds: string[];
+  /** #419: completed attempts with NO delivery disposition. They hold thread
+   *  admission exactly like a stalled one, but carry no `stalled_utc`, so the
+   *  recovery path could not see them and no operator control could clear
+   *  them. Reported separately rather than folded into the stalled count,
+   *  because the remedy differs: these are already finished and must be
+   *  abandoned, never resumed. */
+  unsettledDispatchCount: number;
+  unsettledDispatchIds: string[];
 }
 
 interface ChannelQueueFence {
@@ -2053,7 +2061,9 @@ export class Orchestrator {
     const listInbound = (this.store as Partial<SessionStore>).listInboundNonterminal;
     const durable = listInbound ? listInbound.call(this.store, channelRef) : [];
     const stalled = this.store.turnAttempts.listStalled(channelRef);
-    if (!meta && !runtimeBusy && durable.length === 0 && stalled.length === 0) {
+    const listUnsettled = this.store.turnAttempts.listUnsettledCompletions?.bind(this.store.turnAttempts);
+    const unsettled = listUnsettled ? listUnsettled(channelRef) : [];
+    if (!meta && !runtimeBusy && durable.length === 0 && stalled.length === 0 && unsettled.length === 0) {
       return {
         state: "idle",
         epoch: this.queueEpoch(channelRef),
@@ -2062,6 +2072,8 @@ export class Orchestrator {
         runtimeBusy: false,
         stalledDispatchCount: 0,
         stalledDispatchIds: [],
+        unsettledDispatchCount: 0,
+        unsettledDispatchIds: [],
       };
     }
     const durableSince = durable.length > 0 ? Date.parse(durable[0]!.updatedUtc) : Number.NaN;
@@ -2090,6 +2102,8 @@ export class Orchestrator {
       queued: Math.max(meta?.queued ?? 0, durable.length),
       ageMs,
       runtimeBusy,
+      unsettledDispatchCount: unsettled.length,
+      unsettledDispatchIds: unsettled.map((a) => a.id),
       stalledDispatchCount: stalled.length,
       stalledDispatchIds: stalled.map((attempt) => attempt.id),
     };

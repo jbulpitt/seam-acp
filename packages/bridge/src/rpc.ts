@@ -7,6 +7,7 @@ import { execFile, exec } from "node:child_process";
 import { promisify } from "node:util";
 import { promises as fsp } from "node:fs";
 import path from "node:path";
+import type { McpServer } from "@agentclientprotocol/sdk";
 import type { AgentAdapter } from "@seam/adapters";
 import {
   isAllowedRpcMethod,
@@ -14,6 +15,7 @@ import {
   invokeAdapterRpc,
   isPathWithinRoot,
   ATTACH_MAX_BYTES,
+  readProjectMcpServers,
 } from "@seam/adapters";
 
 const execFileAsync = promisify(execFile);
@@ -23,7 +25,7 @@ export interface SlotSpawnConfig {
   agentId?: string;
   cwd?: string;
   env?: Record<string, string>;
-  mcpServers?: unknown;
+  mcpServers?: McpServer[];
   model?: string;
   effort?: string;
 }
@@ -52,6 +54,45 @@ function requireAgent(ctx: RpcContext, agentId: string | undefined): AgentAdapte
   const adapter = ctx.adapters.get(id);
   if (!adapter) throw new Error(`unknown agentId: ${id}`);
   return adapter;
+}
+
+const projectMcpLogger = {
+  info(fields: Record<string, unknown>, message: string) {
+    console.error(`[bridge] ${message}`, fields);
+  },
+  warn(fields: Record<string, unknown>, message: string) {
+    console.error(`[bridge] ${message}`, fields);
+  },
+};
+
+/**
+ * The controller may transport network MCP endpoints, but never stdio command
+ * or environment payloads. Project stdio configuration belongs to the host
+ * that owns the cwd and is loaded below from that host's `.mcp.json`.
+ * Refusing one remote spawn keeps every other adapter and bridge usable.
+ */
+export function assertTransportableRemoteMcpServers(raw: unknown): McpServer[] {
+  if (raw === undefined) return [];
+  if (!Array.isArray(raw)) {
+    throw new Error("remote spawn MCP configuration must be an array");
+  }
+  return raw.map((value, index) => {
+    if (!value || typeof value !== "object") {
+      throw new Error(`remote spawn MCP server at index ${index} is invalid`);
+    }
+    const server = value as Record<string, unknown>;
+    const name = typeof server.name === "string" ? server.name : `index ${index}`;
+    if (typeof server.command === "string" || !(server.type === "http" || server.type === "sse")) {
+      throw new Error(
+        `remote spawn refuses transported stdio MCP server "${name}"; ` +
+        "configure it in the bridge host project's .mcp.json instead"
+      );
+    }
+    if (typeof server.name !== "string" || typeof server.url !== "string") {
+      throw new Error(`remote spawn MCP server "${name}" requires name and url`);
+    }
+    return value as McpServer;
+  });
 }
 
 function assertWithinRoot(target: string, root: string, label: string): string {
@@ -96,15 +137,28 @@ async function dispatchAdapter(
             )
           )
         : undefined;
+    const transportedMcpServers = assertTransportableRemoteMcpServers(params.mcpServers);
+    const projectMcpServers = readProjectMcpServers({
+      cwd,
+      logger: projectMcpLogger,
+      reservedNames: new Set(transportedMcpServers.map((server) => server.name)),
+      environment: process.env,
+    });
+    const mcpServers = [...transportedMcpServers, ...projectMcpServers];
     ctx.configureSlot?.(slot, {
       agentId: str(params.agentId) ?? agentId,
       cwd,
       env,
-      mcpServers: params.mcpServers,
+      mcpServers,
       model: str(params.model),
       effort: str(params.effort),
     });
-    return { ok: true, slot };
+    return {
+      ok: true,
+      slot,
+      projectMcpInjection: true,
+      projectMcpServers: projectMcpServers.map((server) => server.name),
+    };
   }
 
   const adapter = method === "listWorkspaces" ? undefined : requireAgent(ctx, agentId);

@@ -7,9 +7,8 @@
  * keeps each client's browser context isolated.
  */
 
-import fs from "node:fs";
-import path from "node:path";
 import type { McpServer } from "@agentclientprotocol/sdk";
+import { readProjectMcpServers } from "@seam/adapters";
 import type { Logger } from "./lib/logger.js";
 
 export interface McpServersResult {
@@ -72,86 +71,12 @@ export function buildProjectMcpServers(
   logger: Logger,
   reservedNames: ReadonlySet<string>
 ): McpServer[] {
-  let raw: string;
-  const file = path.join(cwd, ".mcp.json");
-  try {
-    raw = fs.readFileSync(file, "utf8");
-  } catch {
-    return []; // no project .mcp.json — nothing to bridge
-  }
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    // JSON.parse errors can quote credential-bearing config text. Refuse this
-    // malformed file without logging its contents; global MCP remains usable.
-    logger.warn({ file }, "project .mcp.json: parse failed; ignoring");
-    return [];
-  }
-  const servers = (parsed as { mcpServers?: unknown } | null)?.mcpServers;
-  if (!servers || typeof servers !== "object") return [];
-
-  const out: McpServer[] = [];
-  for (const [name, defRaw] of Object.entries(servers as Record<string, unknown>)) {
-    if (!defRaw || typeof defRaw !== "object") continue;
-    if (reservedNames.has(name)) {
-      logger.warn({ name, file }, "project .mcp.json: name collides with a reserved MCP server; skipping");
-      continue;
-    }
-    const def = defRaw as Record<string, unknown>;
-    const url = typeof def.url === "string" ? def.url : undefined;
-    const command = typeof def.command === "string" ? def.command : undefined;
-    const missingVariables = new Set<string>();
-    // Codex treats ACP HTTP headers as static strings: forwarding ${TOKEN}
-    // literally caused Sentry authentication failures. Resolve only the original
-    // config string, never recursively interpret credential bytes (or run shell).
-    const expand = (value: string): string => value.replace(
-      /\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^{}]*))?\}/g,
-      (reference, variable: string, fallback: string | undefined) => {
-        // process.env inherits e.g. `toString`; those are not environment
-        // variables and must use the fallback/missing-server path, not be sent.
-        const resolved = (Object.hasOwn(process.env, variable) ? process.env[variable] : undefined) ?? fallback;
-        if (resolved !== undefined) return resolved;
-        missingVariables.add(variable);
-        return reference;
-      },
-    );
-    let server: McpServer;
-    if (url) {
-      server = { name, type: "http", url: expand(url), headers: pairs(def.headers, expand) };
-    } else if (command) {
-      server = {
-        name,
-        command: expand(command),
-        args: Array.isArray(def.args) ? def.args.filter((a): a is string => typeof a === "string").map(expand) : [],
-        env: pairs(def.env, expand),
-      };
-    } else {
-      logger.warn({ name, file }, "project .mcp.json: entry has neither url nor command; skipping");
-      continue;
-    }
-    // An unset reference otherwise becomes a literal invalid credential/command.
-    // Refuse only this server, keeping the agent and other MCP servers usable.
-    // Log variable names, never resolved values or credential-bearing URLs.
-    if (missingVariables.size > 0) {
-      logger.warn({ name, file, missingVariables: [...missingVariables].sort() },
-        "project .mcp.json: unresolved environment variables; skipping this server");
-      continue;
-    }
-    out.push(server);
-  }
-  if (out.length > 0) {
-    logger.info({ cwd, servers: out.map((s) => s.name) }, "bridged project .mcp.json servers");
-  }
-  return out;
-}
-
-/** Convert a `.mcp.json` `{ key: value }` map (headers/env) to ACP `{ name, value }[]`. */
-function pairs(v: unknown, expand: (value: string) => string): Array<{ name: string; value: string }> {
-  if (!v || typeof v !== "object") return [];
-  return Object.entries(v as Record<string, unknown>)
-    .filter(([, val]) => typeof val === "string")
-    .map(([name, val]) => ({ name, value: expand(val as string) }));
+  return readProjectMcpServers({
+    cwd,
+    logger,
+    reservedNames,
+    environment: process.env,
+  });
 }
 
 function parseBool(v: string | undefined): boolean {

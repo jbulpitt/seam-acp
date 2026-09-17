@@ -109,7 +109,11 @@ function fakeMux(rpcCalls: RpcCall[]): MuxHandle {
     },
     async rpc(method: string, params: unknown, opts?: { agentId?: string }) {
       rpcCalls.push({ method, params, opts });
-      return { ok: true, slot: (params as { slot: number }).slot };
+      return {
+        ok: true,
+        slot: (params as { slot: number }).slot,
+        projectMcpInjection: true,
+      };
     },
     releaseStdin() {},
   };
@@ -182,9 +186,19 @@ describe("remote spawn drives token + reachable MCP URL (#84)", () => {
       },
     });
 
-    const remoteRecord = makeRecord();
+    const remoteCwd = path.join(tmp, "same-looking-remote-cwd");
+    fs.mkdirSync(remoteCwd);
+    fs.writeFileSync(path.join(remoteCwd, ".mcp.json"), JSON.stringify({
+      mcpServers: {
+        controllerOnly: { command: "false", args: [] },
+      },
+    }));
+    const remoteRecord = makeRecord({ repoPath: remoteCwd });
     const plan = router.planRuntimeSpawn(remoteRecord);
     expect(plan.remote).toBe(true);
+    // The pathname belongs to the bridge host. Even if an unrelated local
+    // directory has the same spelling, the controller must not read it.
+    expect(plan.mcpServers.map((server) => server.name)).not.toContain("controllerOnly");
 
     const remoteSeam = seamEntry(plan.mcpServers);
     expect(remoteSeam.url).toBe("https://reach.example/mcp");

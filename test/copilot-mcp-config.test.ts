@@ -30,7 +30,14 @@ describe("Copilot per-runtime MCP configuration", () => {
     const json = JSON.parse(buildCopilotMcpConfigJson(merged)!) as {
       mcpServers: Record<
         string,
-        { headers?: Record<string, string>; deferTools?: string }
+        {
+          type?: string;
+          command?: string;
+          args?: string[];
+          env?: Record<string, string>;
+          headers?: Record<string, string>;
+          deferTools?: string;
+        }
       >;
     };
     expect(json.mcpServers["seam-mcp"]?.headers).toEqual({
@@ -38,5 +45,23 @@ describe("Copilot per-runtime MCP configuration", () => {
     });
     expect(json.mcpServers["seam-mcp"]?.deferTools).toBe("never");
     expect(json.mcpServers.playwright?.deferTools).toBeUndefined();
+    expect(json.mcpServers.playwright).toMatchObject({
+      type: "stdio",
+      command: "npx",
+      args: ["-y", "@playwright/mcp"],
+    });
+  });
+
+  it("preserves stdio environment values for a host-owned project server", () => {
+    const json = JSON.parse(buildCopilotMcpConfigJson([{
+      name: "langfuse",
+      command: "node",
+      args: ["langfuse-mcp.mjs"],
+      env: [{ name: "LANGFUSE_MCP_AUTH", value: "synthetic-secret" }],
+    }])!) as { mcpServers: Record<string, { env?: Record<string, string> }> };
+
+    expect(json.mcpServers.langfuse?.env).toEqual({
+      LANGFUSE_MCP_AUTH: "synthetic-secret",
+    });
   });
 });

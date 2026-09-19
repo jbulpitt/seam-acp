@@ -42,7 +42,7 @@ function modelOptions() {
     options: [{ value: MODEL, name: "Opus" }] }];
 }
 
-function syntheticAcp(calls: AcpCalls, mode: "ok" | "no-load" | "reject-load" | "hang-load") {
+function syntheticAcp(calls: AcpCalls, mode: "ok" | "no-load" | "reject-load" | "hang-load" | "hang-load-once") {
   return () => {
     const stdin = new PassThrough();
     const stdout = new PassThrough();
@@ -72,7 +72,7 @@ function syntheticAcp(calls: AcpCalls, mode: "ok" | "no-load" | "reject-load" | 
       .onRequest(methods.agent.session.load, ({ params }) => {
         calls.loads.push(params.sessionId);
         if (mode === "reject-load") throw new Error("synthetic remote session/load refusal");
-        if (mode === "hang-load") return new Promise(() => {});
+        if (mode === "hang-load" || (mode === "hang-load-once" && calls.loads.length === 1)) return new Promise(() => {});
         return { sessionId: params.sessionId, configOptions: modelOptions() };
       })
       .onRequest(methods.agent.session.prompt, ({ params }) => {
@@ -105,7 +105,7 @@ afterEach(async () => {
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
 });
 
-function harness(location: "local" | "bridge-a", mode: "ok" | "no-load" | "reject-load" | "hang-load"): Harness {
+function harness(location: "local" | "bridge-a", mode: "ok" | "no-load" | "reject-load" | "hang-load" | "hang-load-once"): Harness {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "seam-302-runtime-"));
   const store = new SessionStore(path.join(dir, "seam.db"));
   const calls: AcpCalls = { initialized: 0, loads: [], news: 0, prompts: [], children: [] };
@@ -128,7 +128,8 @@ function harness(location: "local" | "bridge-a", mode: "ok" | "no-load" | "rejec
   const router = new SessionRouter({ logger: silent, store, profiles: [profile], modelCatalog: catalog,
     defaultAgentId: "claude", defaultModel: MODEL, defaultPermissionMode: "deny",
     threadPresets, defaultCwd: dir,
-    ...(mode === "hang-load" ? { sessionLoadTimeoutMs: 25 } : {}) });
+    ...(mode === "hang-load" || mode === "hang-load-once" ? { sessionLoadTimeoutMs: 25 } : {}) });
+  (router as any).startFailureCooldownMs = 0;
   if (location !== "local") {
     const localPlan = router.planRuntimeSpawn.bind(router);
     vi.spyOn(router, "planRuntimeSpawn").mockImplementation((record) => ({
@@ -145,6 +146,7 @@ function harness(location: "local" | "bridge-a", mode: "ok" | "no-load" | "rejec
   };
   const orch = new Orchestrator({ logger: silent, store, router, adapter: adapter as any,
     renderer: discordRenderer, modelCatalog: catalog,
+    recoverySleep: async () => {},
     config: { DATA_DIR: dir, REPOS_ROOT: dir, TURN_TIMEOUT_SECONDS: 15,
       DEFAULT_AGENT: "claude", DEFAULT_MODEL: MODEL, SEAM_TURN_RESUME_ENABLED: true,
       SEAM_DISPATCH_STATUS_PANEL: false, channelPresets: new Map(), threadPresets,
@@ -247,14 +249,24 @@ describe("#302 real ACP handshake and strict session/load recovery", () => {
     const elapsedMs = performance.now() - startedAt;
     expect(elapsedMs).toBeGreaterThanOrEqual(15);
     expect(elapsedMs).toBeLessThan(500);
-    expect(h.calls.loads).toEqual([RECORDED]);
+    expect(h.calls.loads).toEqual([RECORDED, RECORDED, RECORDED]);
     expect(h.calls.news).toBe(0);
     expect(h.calls.prompts).toEqual([]);
-    expect(h.calls.children[0]?.killed).toBe(true);
+    expect(h.calls.children.every((child) => child.killed)).toBe(true);
     expect(h.store.turnAttempts.get(id)).toMatchObject({
       state: "suspended",
       generation: 2,
-      stalledReason: "Strict resume refused: ACP session/load timed out after 0.025s for agent 'claude'; the session was not resumed and can be retried",
+      stalledReason: expect.stringContaining("boot recovery exhausted 3 pre-prompt acquisition attempts"),
     });
   }, 1_000);
+
+  it("retries a timed-out session/load in a fresh runtime and then continues once", async () => {
+    const h = harness("bridge-a", "hang-load-once"); const id = seedPromptedAttempt(h);
+    await resume(h);
+    expect(h.calls.loads).toEqual([RECORDED, RECORDED]);
+    expect(h.calls.news).toBe(0);
+    expect(h.calls.prompts).toEqual(["continue"]);
+    expect(h.calls.children[0]?.killed).toBe(true);
+    expect(h.store.turnAttempts.get(id)).toMatchObject({ state: "completed", generation: 2 });
+  }, 10_000);
 });

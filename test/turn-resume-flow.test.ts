@@ -60,7 +60,7 @@ function makeOrch(opts?: {
   loadSession: ReturnType<typeof vi.fn>;
   newSession: ReturnType<typeof vi.fn>;
 } {
-  const catalogProfile = { id: "codex", defaultModel: "default" } as any;
+  const catalogProfiles = ["codex", "grok", "claude"].map((id) => ({ id, defaultModel: "default" } as any));
   const prompts: string[] = [];
   const announced: string[] = [];
   const sent: Array<{ channel: string; text: string }> = [];
@@ -72,8 +72,8 @@ function makeOrch(opts?: {
     reuseMcpServers: () => [],
     ensureSessionRecord: (o: { channelRef: string }) =>
       record({ id: `discord:${o.channelRef}`, channelRef: o.channelRef }),
-    getProfile: opts?.getProfile ?? (() => ({
-      id: "codex",
+    getProfile: opts?.getProfile ?? ((id = "codex") => ({
+      id,
       sessionManager: { deleteSession: async () => {} },
     })),
     resolveProfileForChannel: (id?: string, _channel?: string, location?: string) => router.getProfile(id, location),
@@ -124,7 +124,7 @@ function makeOrch(opts?: {
       async editMessage() {},
       getThreadLiveState: opts?.getThreadLiveState ?? (async () => ({ locked: false, archived: false })),
     } as any,
-    modelCatalog: fixtureModelCatalog([catalogProfile]),
+    modelCatalog: fixtureModelCatalog(catalogProfiles),
     router: router as any,
     store,
     renderer: {
@@ -559,10 +559,12 @@ describe("watcher recoverStale vs resumeEnabled", () => {
     expect(body.prompt).toBe("do the overnight git push");
   });
 
-  it("does not publish an owned remote resume until bridge reconciliation is ready (#290)", async () => {
+  it.each(["codex", "grok"])(
+    "waits for bridge readiness, then resumes recorded remote %s capability-first (#421)",
+    async (agentId) => {
     const spec = handoffSpec({
       location: "remote-a",
-      agentId: "codex",
+      agentId,
       createdUtc: new Date().toISOString(),
     });
     await seedInterrupted(spec);
@@ -619,17 +621,14 @@ describe("watcher recoverStale vs resumeEnabled", () => {
     expect(markSessionBridge).toHaveBeenCalledWith("discord:thread-worker", "remote-a");
     watcher.stop();
     const retained = store.turnAttempts.get(spec.id)!;
-    // #250 deliberately forbids prompt-started remote replay. Readiness gates
-    // the attempt, then the unsupported continuation is made loud instead of
-    // being retried as a new prompt.
-    expect(retained.state).toBe("suspended");
-    expect(retained.generation).toBe(before.generation);
-    expect(retained.ownerBoot).toBe(before.ownerBoot);
-    expect(retained.stalledUtc).toEqual(expect.any(String));
-    // #333: the notice names the cause now instead of saying "stalled after restart".
+    // #421: provider/host identity is not a capability check. A runtime that
+    // loads the exact recorded session continues; the original brief is never
+    // submitted again.
+    expect(retained).toMatchObject({ state: "completed", generation: before.generation + 1,
+      stalledUtc: null, acpSessionId: "acp-recorded" });
     expect(sent.some((message) => message.channel === "thread-boss"
-      && message.text.includes("could not resume:"))).toBe(true);
-    expect(await readdir(dirs.running)).toEqual([`${spec.id}.json`]);
+      && message.text.includes("could not resume:"))).toBe(false);
+    expect(await readdir(dirs.running)).toEqual([]);
   });
 
   it("durably quarantines and reports a post-readiness retain through the production watcher path (#290)", async () => {

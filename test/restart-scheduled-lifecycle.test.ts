@@ -29,7 +29,7 @@ vi.mock("../packages/core/src/agents/agent-runtime.js", async importOriginal => 
 });
 const cleanups: (() => void)[] = [];
 afterEach(() => { for (const f of cleanups.splice(0).reverse()) f(); vi.clearAllMocks(); vi.restoreAllMocks(); });
-function setup(mode: "live" | "isolated" = "isolated") {
+function setup(mode: "live" | "isolated" = "isolated", agentId = "codex") {
   transport.prompt.mockReset();
   transport.delete.mockResolvedValue(undefined);
   transport.dispose.mockResolvedValue(undefined);
@@ -38,7 +38,7 @@ function setup(mode: "live" | "isolated" = "isolated") {
   const store = new SessionStore(path.join(dir, "test.db")); cleanups.push(() => store.close());
   const now = new Date().toISOString();
   const record = { id: "discord:worker", platform: "discord", channelRef: "worker", parentRef: "parent",
-    agentId: "codex", acpSessionId: "live-session", repoPath: "/synthetic", configJson: "{}", createdUtc: now, updatedUtc: now };
+    agentId, acpSessionId: "live-session", repoPath: "/synthetic", configJson: "{}", createdUtc: now, updatedUtc: now };
   store.upsert(record);
   const row: ScheduledPrompt = { id: "schedule-1", platform: "discord", channelRef: "worker", parentRef: "parent",
     name: "Disposable schedule", promptText: "ORIGINAL DISPOSABLE SCHEDULE", cron: "* * * * *", timezone: "UTC",
@@ -46,7 +46,7 @@ function setup(mode: "live" | "isolated" = "isolated") {
     catchupSeconds: 0, enabled: true, legacyAttachmentCount: 0, createdBy: "user", createdUtc: now, updatedUtc: now,
     lastRunUtc: null, lastStatus: null, nextRunUtc: null, pinnedSessionId: null };
   store.upsertScheduled(row);
-  const profile = { id: "codex", defaultModel: "test", displayName: "Codex", sessionManager: { deleteSession: transport.delete } } as any;
+  const profile = { id: agentId, defaultModel: "test", displayName: agentId, sessionManager: { deleteSession: transport.delete } } as any;
   const router = { ensureSessionRecord: () => ({ ...record }), listProfiles: () => [profile], getProfile: () => profile,
     resolveProfileForChannel: () => profile,
     assertAgentAllowedForChannel: () => {},
@@ -58,7 +58,7 @@ function setup(mode: "live" | "isolated" = "isolated") {
       getPromptCapabilities: () => ({}), onEvent() {}, idle: async () => {},
       prompt: (text: string) => transport.prompt(text),
     })),
-    reuseMcpServers: () => [], describeConfig: () => ({ agent: { value: "codex" }, model: { value: "test" },
+    reuseMcpServers: () => [], describeConfig: () => ({ agent: { value: agentId }, model: { value: "test" },
       cwd: { value: "/synthetic" }, effort: { value: null }, location: { value: "local" }, fastMode: { value: false } }) };
   const adapter = { sendPanel: vi.fn(async (channel: any, _panel?: unknown, _delivery?: unknown) => ({ channel, id: "panel" })),
     sendMessage: vi.fn(async (channel: any, _text: string, _delivery?: unknown) => ({ channel, id: "message" })),
@@ -199,6 +199,21 @@ describe("#252 actual isolated scheduler + injectTurn, synthetic transport", () 
       expect(transport.load).toHaveBeenCalledTimes(2);
       expect(transport.delete).toHaveBeenCalledTimes(1);
     } else expect(h.router.getOrStartRuntime.mock.calls.at(-1)?.[1]).toEqual({ resumeSessionId: "live-session" });
+  });
+
+  it("#421 automatically continues a submitted non-Codex scheduled occurrence", async () => {
+    const h = setup("isolated", "grok"); simulateRetiredOwnerProcess();
+    const first = h.make(); const key = scheduledOccurrenceKey(h.row.id);
+    transport.prompt.mockImplementationOnce(async () => { first.suspendForRestart(); throw new Error("cutoff"); });
+    await first.runScheduledPrompt(h.row.id, key);
+    transport.prompt.mockResolvedValueOnce({ stopReason: "end_turn" });
+    await h.make().runScheduledPrompt(h.row.id, key);
+    expect(transport.load).toHaveBeenCalledWith("new-disposable-session");
+    expect(transport.prompt.mock.calls.map((call) => call[0])).toEqual([
+      expect.stringContaining(h.row.promptText),
+      "continue",
+    ]);
+    expect(h.store.turnAttempts.get(key.id)).toMatchObject({ state: "completed", generation: 2 });
   });
 
   it("reclaims a prompted scheduled attempt carrying a legacy digest", async () => {

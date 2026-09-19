@@ -86,11 +86,14 @@ export interface TurnAttempt {
  *                  winning writer of the outcome row, a live previous owner, or
  *                  a fenced channel queue. The work is still being done, just
  *                  not here. Also nothing is owed to an operator.
+ * - `retryable`  — boot recovery failed before prompt submission in a way that
+ *                  may clear without operator action. The watcher retries this
+ *                  exact recorded session with a bounded backoff.
  * - `defect`     — a resume cannot safely proceed and no other actor is going
  *                  to finish it. This is the ONLY class that deserves a durable
  *                  quarantine and a human-facing notice.
  */
-export type SuspensionClass = "shutdown" | "superseded" | "defect";
+export type SuspensionClass = "shutdown" | "superseded" | "retryable" | "defect";
 
 /** Not a worker failure. Callers must retain the logical job and emit nothing
  * onward. Also fences obsolete callbacks after a replacement/cancel winner. */
@@ -101,7 +104,7 @@ export class DispatchSuspendedError extends Error {
    * Before this, 60 of 65 throw sites passed no reason, every one of them
    * surfaced as the same "stalled after restart" notice, and the distribution
    * of what actually fires was unmeasurable. `reason` and `suspension` are
-   * therefore mandatory, and the only way in is one of the three factories
+   * therefore mandatory, and the only way in is one of the factories
    * below — which forces the author to name the class at the throw site, where
    * the condition is still in view. Deleting the `private` here re-opens the
    * silent path and nothing else would catch it.
@@ -125,6 +128,11 @@ export class DispatchSuspendedError extends Error {
   /** Another owner/generation/fence has the work. It is not lost. */
   static superseded(dispatchId: string, reason: string): DispatchSuspendedError {
     return new DispatchSuspendedError(dispatchId, reason, "superseded");
+  }
+
+  /** Boot recovery failed before any prompt, and may be tried again safely. */
+  static retryable(dispatchId: string, reason: string): DispatchSuspendedError {
+    return new DispatchSuspendedError(dispatchId, reason, "retryable");
   }
 
   /** A resume cannot safely proceed and nobody else will finish it. */

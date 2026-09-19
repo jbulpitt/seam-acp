@@ -230,7 +230,7 @@ describe("#250 production dispatch lifecycle (synthetic transport, no providers)
     expect(h.runtime.prompt).toHaveBeenCalledTimes(1);
   });
 
-  it("#336 boot-recovery acquisition failure hands off, then resumes the same session on a later boot", async () => {
+  it("#421 retries a transient boot acquisition and resumes the same session in the same boot", async () => {
     const h = setup();
     simulateRetiredOwnerProcess();
     const first = h.orch.dispatchInjectTurn(h.spec);
@@ -238,31 +238,54 @@ describe("#250 production dispatch lifecycle (synthetic transport, no providers)
     await expect(first).rejects.toMatchObject({ suspension: "shutdown" });
     const recovering = h.makeOrch();
     h.router.getOrStartRuntime.mockRejectedValueOnce(new Error("ACP connection closed"));
+    h.runtime.prompt.mockResolvedValueOnce({ stopReason: "end_turn" });
     await enqueueDispatchSpec(h.dataDir, h.spec);
     const refusals: DispatchSuspendedError[] = [];
     const watcher = new DispatchWatcher({ attempts: h.store.turnAttempts, dataDir: h.dataDir, logger: pino({ level: "silent" }) as any,
       resumeEnabled: true, onRetained: h.notices, onDispatch: async s => {
         try { return await recovering.dispatchInjectTurn(s); }
         catch (err) { refusals.push(err as DispatchSuspendedError); throw err; }
-      } });
+      }, recoverySleep: vi.fn(async () => {}) });
     cleanups.push(() => watcher.stop());
     await watcher.start(); watcher.stop();
-    expect(refusals).toMatchObject([{ suspension: "shutdown", reason: "provider acquisition failed during boot-recovery: ACP connection closed" }]);
+    expect(refusals).toMatchObject([{ suspension: "retryable", reason: "provider acquisition failed during boot-recovery: ACP connection closed" }]);
     expect(h.notices).not.toHaveBeenCalled();
-    expect(h.store.turnAttempts.get(h.spec.id)).toMatchObject({ state: "suspended", generation: 2,
+    expect(h.store.turnAttempts.get(h.spec.id)).toMatchObject({ state: "completed", generation: 3,
       acpSessionId: "recorded-acp", promptStarted: true, stalledUtc: null });
-    h.runtime.prompt.mockResolvedValueOnce({ stopReason: "end_turn" });
-    const next = h.makeOrch();
-    vi.spyOn(next as any, "enqueueReportBack").mockResolvedValue(undefined);
-    const nextWatcher = createRuntimeDispatchWatcher({ attempts: h.store.turnAttempts, dataDir: h.dataDir, logger: pino({ level: "silent" }) as any,
-      resumeEnabled: true, runtime: next });
-    next.setDispatchWatcher(nextWatcher);
-    cleanups.push(() => nextWatcher.stop());
-    await nextWatcher.start();
     expect(h.runtime.prompt.mock.calls.at(-1)?.[0]).toBe("continue");
     expect(h.router.getOrStartRuntime.mock.calls.at(-1)).toMatchObject([{}, { resumeSessionId: "recorded-acp" }]);
-    expect(h.store.turnAttempts.get(h.spec.id)).toMatchObject({ state: "completed", generation: 3, stalledUtc: null });
     expect(h.notices).not.toHaveBeenCalled();
+  });
+
+  it("#421 bounds repeated boot acquisition timeouts and visibly quarantines exhaustion", async () => {
+    const h = setup();
+    simulateRetiredOwnerProcess();
+    const first = h.orch.dispatchInjectTurn(h.spec);
+    await h.started; h.orch.suspendForRestart(); h.release();
+    await expect(first).rejects.toMatchObject({ suspension: "shutdown" });
+    h.runtime.prompt.mockClear();
+    h.router.getOrStartRuntime.mockClear();
+    const recovering = h.makeOrch();
+    (recovering as any).resumeScheduler = { run: (fn: () => Promise<unknown>) => fn() };
+    h.router.getOrStartRuntime.mockRejectedValue(new Error("rpc 'spawn' timed out after 30s"));
+    await enqueueDispatchSpec(h.dataDir, h.spec);
+    const retrySleep = vi.fn(async () => {});
+    const watcher = new DispatchWatcher({ attempts: h.store.turnAttempts, dataDir: h.dataDir,
+      logger: pino({ level: "silent" }) as any, resumeEnabled: true,
+      onRetained: h.notices, recoverySleep: retrySleep,
+      onDispatch: s => recovering.dispatchInjectTurn(s) });
+    cleanups.push(() => watcher.stop());
+    await watcher.start(); watcher.stop();
+    expect(h.router.getOrStartRuntime).toHaveBeenCalledTimes(3);
+    expect(retrySleep).toHaveBeenCalledTimes(2);
+    expect(h.runtime.prompt).not.toHaveBeenCalled();
+    expect(h.notices).toHaveBeenCalledTimes(1);
+    expect(h.store.turnAttempts.get(h.spec.id)).toMatchObject({
+      state: "suspended",
+      generation: 4,
+      stalledReason: expect.stringContaining("exhausted 3 pre-prompt acquisition attempts"),
+      stallNoticeUtc: expect.any(String),
+    });
   });
 
   it.each([false, true])("#336 ordinary acquisition failure remains defect with ambient cutoff=%s", async ambientCutoff => {

@@ -105,7 +105,7 @@ describe("injectTurn isolated resumeSessionId", () => {
         ...(stage === "new" ? {} : { resumeSessionId: "same-acp" }),
         lifecycle: { isCurrent: () => true, acquire: operation => acquisition.acquire(operation),
           beforePrompt: () => {}, onOutcome, mayDeleteSession: () => false } })).rejects.toMatchObject({
-        suspension: phase === "boot-recovery" ? "shutdown" : "defect",
+        suspension: phase === "boot-recovery" ? "retryable" : "defect",
         reason: `provider acquisition failed during ${phase}: transport unavailable`,
       });
       expect(onOutcome).not.toHaveBeenCalled();

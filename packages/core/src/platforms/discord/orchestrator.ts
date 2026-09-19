@@ -5,7 +5,7 @@ import path from "node:path";
 import os from "node:os";
 import { randomUUID } from "node:crypto";
 import { DispatchSuspendedError, inboundAttemptId, type TurnAttempt } from "../../core/dispatch/attempt-store.js";
-import { DispatchAcquisitionPhase } from "../../core/dispatch/acquisition-phase.js";
+import { DispatchAcquisitionPhase, isRetryableBootAcquisitionError } from "../../core/dispatch/acquisition-phase.js";
 import { compareExecutionIdentity, executionIdentity } from "../../core/dispatch/execution-identity.js";
 import { MessageFlags, EmbedBuilder, ButtonBuilder, ActionRowBuilder, ButtonStyle, StringSelectMenuBuilder, ModalBuilder, TextInputBuilder, TextInputStyle, AttachmentBuilder, type ChatInputCommandInteraction, type AutocompleteInteraction, type MessageComponentInteraction, type Message, type InteractionEditReplyOptions } from "discord.js";
 import type { Logger } from "../../lib/logger.js";
@@ -152,7 +152,11 @@ import {
   type AttachOutcome,
 } from "../../core/session-attach.js";
 import { renderCatalogEvidenceLines } from "../../core/catalog-evidence-render.js";
-import { DispatchWatcher } from "../../core/dispatch/watcher.js";
+import {
+  BOOT_RECOVERY_ATTEMPTS,
+  BOOT_RECOVERY_BACKOFF_MS,
+  DispatchWatcher,
+} from "../../core/dispatch/watcher.js";
 import {
   CONTINUE_PROMPT,
   RESUME_ANNOUNCE,
@@ -1042,6 +1046,7 @@ export class Orchestrator {
     concurrency: TURN_RESUME_CONCURRENCY,
     staggerMs: TURN_RESUME_STAGGER_MS,
   });
+  private readonly recoverySleep: (ms: number) => Promise<void>;
   private readonly agyRuntime?: AgyNativeRuntime;
 
   constructor(opts: {
@@ -1056,6 +1061,8 @@ export class Orchestrator {
     agyRuntime?: AgyNativeRuntime;
     refreshModelIntelligence?: (forceSources: boolean) => Promise<ModelIntelligenceRefreshResult>;
     restartProcess?: () => Promise<void>;
+    /** Test seam for bounded boot-recovery backoff. */
+    recoverySleep?: (ms: number) => Promise<void>;
   }) {
     this.logger = opts.logger.child({ comp: "orchestrator" });
     this.config = opts.config;
@@ -1063,6 +1070,7 @@ export class Orchestrator {
     this.router = opts.router;
     this.store = opts.store;
     this.renderer = opts.renderer;
+    this.recoverySleep = opts.recoverySleep ?? ((ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
     this.quotaPoller = opts.quotaPoller;
     this.modelCatalog = opts.modelCatalog;
     this.agyRuntime = opts.agyRuntime;
@@ -2572,13 +2580,13 @@ export class Orchestrator {
 
   /** Enqueue an already-durable row without passing back through duplicate
    * admission. Used at boot and by localized recovery. */
-  private startRecoveredInbound(row: InboundAdmission): void {
+  private startRecoveredInbound(row: InboundAdmission): Promise<void> {
     const myGen = row.preemptive
       ? (this.channelGenerations.get(row.channelRef) ?? 0) + 1
       : this.channelGenerations.get(row.channelRef) ?? 0;
     if (row.preemptive) this.channelGenerations.set(row.channelRef, myGen);
     const msg = this.inboundMessage(row);
-    void this.queueOnChannel(row.channelRef, async (fence) => {
+    return this.queueOnChannel(row.channelRef, async (fence) => {
       if (row.preemptive && (this.channelGenerations.get(row.channelRef) ?? 0) > myGen) return;
       if (!this.store.claimInbound(row.messageId, fence.epoch, new Date().toISOString())) return;
       try {
@@ -3716,9 +3724,11 @@ export class Orchestrator {
         this.assertQueueFence(queueFence);
         Object.assign(record, this.store.get(record.id));
       }
-      let activeRuntime = priorHuman?.acpSessionId
-        ? await this.router.getOrStartRuntime(record, { resumeSessionId: priorHuman.acpSessionId })
-        : await this.router.getOrStartRuntime(record);
+      let activeRuntime = humanResume && priorHuman?.acpSessionId
+        ? await this.acquireRecordedRuntime(record, priorHuman.id, priorHuman.acpSessionId)
+        : priorHuman?.acpSessionId
+          ? await this.router.getOrStartRuntime(record, { resumeSessionId: priorHuman.acpSessionId })
+          : await this.router.getOrStartRuntime(record);
       contextIdentity = this.contextBudgetIdentity(record, activeRuntime.getSessionInfo()?.sessionId);
       if (!contextIdentity || !matchesContextBudget(observedContextBudget, contextIdentity)) observedContextBudget = undefined;
       this.assertQueueFence(queueFence);
@@ -6361,6 +6371,50 @@ export class Orchestrator {
   }
 
   /**
+   * Reacquire one recorded live session during recovery. Each failure happens
+   * before `continue` is submitted, so a fresh runtime retry cannot replay the
+   * original prompt. Permanent capability/identity refusals stop immediately;
+   * transient start/load failures get the same bounded budget as dispatches.
+   */
+  private async acquireRecordedRuntime(
+    record: SessionRecord,
+    attemptId: string,
+    resumeSessionId: string,
+  ): Promise<AgentRuntime> {
+    for (let attempt = 1; attempt <= BOOT_RECOVERY_ATTEMPTS; attempt++) {
+      try {
+        return await this.router.getOrStartRuntime(record, { resumeSessionId });
+      } catch (err) {
+        const detail = err instanceof Error ? err.message : String(err);
+        if (!isRetryableBootAcquisitionError(err)) {
+          throw err;
+        }
+        if (attempt === BOOT_RECOVERY_ATTEMPTS) {
+          // Refuse only this exhausted resume. The binding, provider, and other
+          // sessions remain available, while workflows exposes the named cause.
+          throw new Error(
+            `boot recovery exhausted ${BOOT_RECOVERY_ATTEMPTS} pre-prompt acquisition attempts: ${detail}`,
+            { cause: err },
+          );
+        }
+        const backoffMs = BOOT_RECOVERY_BACKOFF_MS[attempt - 1]!;
+        this.logger.warn(
+          { attemptId, attempt, backoffMs, err },
+          "live turn: transient boot recovery acquisition failed; retrying recorded session",
+        );
+        await this.recoverySleep(backoffMs);
+        if (this.restartCutoff) {
+          throw DispatchSuspendedError.shutdown(
+            attemptId,
+            "shutdown interrupted boot-recovery backoff; the next boot owns the turn",
+          );
+        }
+      }
+    }
+    throw new Error("unreachable live recovery retry state");
+  }
+
+  /**
    * Resolve one isolated dispatch cwd without leaking the caller's filesystem
    * layout onto another host (#367).
    *
@@ -8830,10 +8884,19 @@ export class Orchestrator {
       throw DispatchSuspendedError.shutdown(spec.id, "restart cutoff reached before execution began");
     }
     const phase = new DispatchAcquisitionPhase(spec.id,
-      prior?.state === "suspended" && prior.ownerBoot !== this.attemptBoot ? "boot-recovery" : "execution");
+      prior?.state === "suspended" && prior.promptStarted ? "boot-recovery" : "execution");
     this.dispatchAcquisitions.add(phase);
     try {
-      return await this.dispatchInjectTurnOwned(prior ? { ...prior.spec, resume: prior.promptStarted } : spec, phase);
+      const run = () => this.dispatchInjectTurnOwned(
+        prior ? { ...prior.spec, resume: prior.promptStarted } : spec,
+        phase,
+      );
+      // #421: stagger the provider acquisition itself, after target FIFO and
+      // readiness checks. Staggering only the earlier SQL requeue looked safe
+      // but the watcher admitted every recovered target together once the boot
+      // barrier opened. This refuses no capability: ordinary dispatches still
+      // run immediately, while recorded continuations start two at a time.
+      return await (phase.phase === "boot-recovery" ? this.resumeScheduler.run(run) : run());
     } catch (err) {
       let current;
       try { current = this.store.turnAttempts?.get(spec.id); }
@@ -8967,14 +9030,11 @@ export class Orchestrator {
       throw DispatchSuspendedError.defect(spec.id,
         "resume requested but no ACP session id was ever recorded for this dispatch");
     }
-    if (previousAttempt && previousAttempt.promptStarted &&
-      (!resumeSessionId || !isLocalLocation(workerLocation) || (presetProfile?.id ?? record.agentId) !== "codex")) {
-      // Initial auto-recovery scope is local Codex (live acceptance is a
-      // separate gate). Other providers/remote slots
-      // remain visible and retained, not silently replayed or fallback-local.
-      throw DispatchSuspendedError.defect(spec.id,
-        `automatic continuation covers local codex with a recorded session only; this is ${presetProfile?.id ?? record.agentId} at ${workerLocation}`);
-    }
+    // #302/#421: no vendor or host allowlist here. `startPrompt` cannot persist
+    // promptStarted without an ACP session id, and a recorded attempt is always
+    // reloaded above with `resume: promptStarted`. The initialized runtime's
+    // session/load capability is the authority; injectTurn refuses unsupported
+    // reattachment before `continue`, while unrelated agents keep working.
     // Handoff feedback channel (#62): when the dispatch opts into watchFeedback,
     // append the standing poll_inbox instruction AFTER any preset-identity
     // prepend so it is the last thing the worker reads. Opt-in — without the flag
@@ -9121,8 +9181,10 @@ export class Orchestrator {
           try { return await phase.acquire(operation); }
           catch (err) {
             // Refuse only this acquisition's generation; a replacement keeps
-            // running. Recovery load failure leaves this attempt for next boot.
-            if (err instanceof DispatchSuspendedError && err.suspension === "shutdown" &&
+            // running. A transient pre-prompt recovery failure is retried by
+            // the boot-recovery owner; shutdown still leaves it for next boot.
+            if (err instanceof DispatchSuspendedError &&
+                (err.suspension === "shutdown" || err.suspension === "retryable") &&
                 this.store.turnAttempts.isCurrent(attempt)) {
               try { this.store.turnAttempts.suspend(spec.id, this.attemptBoot); }
               catch (suspendErr) { throw DispatchSuspendedError.from(suspendErr, spec.id, "retaining the acquisition for next boot failed"); }
@@ -9973,16 +10035,9 @@ export class Orchestrator {
         throw DispatchSuspendedError.defect(spec.id,
           "resume requested but no ACP session id was ever recorded for this dispatch");
       }
-      if (
-        previousAttempt?.promptStarted &&
-        (!isResume || !resumeSessionId || !isLocalLocation(location) || profile.id !== "codex")
-      ) {
-        // Initial automatic continuation scope is the same as generic #250:
-        // exact local Codex with a durable ACP handle. Other provider/host
-        // attempts remain suspended for explicit operator reconciliation.
-        throw DispatchSuspendedError.defect(spec.id,
-          `automatic continuation covers local codex with a recorded session only; this is ${profile.id} at ${location}`);
-      }
+      // #302/#421: prompted attempts are session-bound by the store. Ask the
+      // initialized runtime whether it can load that exact id; provider and
+      // location names are not capability signals.
       const identity = executionIdentity({
         agentId,
         location,
@@ -11458,8 +11513,10 @@ export class Orchestrator {
       return;
     }
     if (this.restartCutoff) return;
-    if (prior?.promptStarted && ((!manualResume && !this.config.SEAM_TURN_RESUME_ENABLED) || execution.agentId !== "codex" ||
-      !isLocalLocation(execution.location) || !prior.acpSessionId)) return;
+    // `startPrompt` requires a recorded ACP id, so the feature flag is the only
+    // pre-runtime gate. session/load capability is verified by the same strict
+    // reattachment path used for human turns (#302).
+    if (prior?.promptStarted && !manualResume && !this.config.SEAM_TURN_RESUME_ENABLED) return;
     try {
       this.store.turnAttempts.registerOwner(this.attemptBoot);
       const attempt = this.store.turnAttempts.claim({ id: key.id, target: row.channelRef,
@@ -11468,7 +11525,10 @@ export class Orchestrator {
         cwd: execution.cwd, ...(execution.effort ? { effort: execution.effort } : {}),
       }, execution.fingerprint, this.attemptBoot, "schedule");
       try {
-        await this.runScheduledPromptInner(occurrence.row, { occurrence, attempt });
+        const execute = () => this.runScheduledPromptInner(occurrence.row, { occurrence, attempt });
+        // Scheduled recovery is a separate boot producer from DispatchWatcher;
+        // use the same start gate so it cannot recreate the boot-time stampede.
+        await (prior?.promptStarted && !manualResume ? this.resumeScheduler.run(execute) : execute());
       } catch (err) {
         if (err instanceof DispatchSuspendedError) {
           // #333: this used to branch on whether a reason happened to be
@@ -14740,6 +14800,7 @@ export class Orchestrator {
     const now = new Date();
 
     const live = await this.liveTurnInventory();
+    const liveJobs: Array<Promise<void>> = [];
     // Inspect the original admission phase BEFORE recovery resets running to
     // pending. An old marker/running row is not proof the prompt was unstarted.
     const inbound = this.store.listInboundNonterminal?.() ?? [];
@@ -14758,10 +14819,9 @@ export class Orchestrator {
         continue;
       }
       const pending = this.store.recoverInboundChannel(row.channelRef, now.toISOString());
-      if (pending) this.startRecoveredInbound(pending);
+      if (pending) liveJobs.push(this.resumeScheduler.run(() => this.startRecoveredInbound(pending)));
     }
     await this.recoverInboundOutput();
-    const liveJobs: Array<Promise<void>> = [];
     for (const marker of live) {
       if (marker.inboundMessageId || marker.scheduleOccurrenceId || inboundChannels.has(marker.channelRef)) continue;
       const pre = await this.checkResumePreconditions({
@@ -14808,7 +14868,7 @@ export class Orchestrator {
           await this.observeRetainedDispatch(spec, DispatchSuspendedError.defect(spec.id, refusal));
           continue;
         }
-        liveJobs.push(this.resumeScheduler.run(async () => {
+        liveJobs.push((async () => {
           const loc = spec.location ?? resolveThreadLocation(this.config, spec.target);
           const waited = await this.waitForResumeHost(loc, spec.createdUtc, maxAge, now);
           if (waited === "abandon") {
@@ -14818,7 +14878,7 @@ export class Orchestrator {
           if (!isLocalLocation(loc)) bindSessionLocation(this.bridgeHub, `discord:${spec.target}`, loc);
           const refusal = await this.requestDispatchContinuation(spec);
           if (refusal) await this.observeRetainedDispatch(spec, DispatchSuspendedError.defect(spec.id, refusal));
-        }));
+        })());
       }
     }
 

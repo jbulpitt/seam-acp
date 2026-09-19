@@ -707,7 +707,7 @@ describe("#246 isolated ingest owns every terminal transition", () => {
     expect(store.turnAttempts.get(spec.id)).toMatchObject({ state: "completed", generation: 2 });
   });
 
-  it("retains a submitted non-Codex HTTP job for explicit recovery without a fresh execution", async () => {
+  it("#421 resumes a submitted non-Codex HTTP job through its recorded session", async () => {
     const row = endpoint({ thread: null, agentId: "claude", model: null });
     store.insertIngestEndpoint(row);
     const spec = planEndpointDispatch({ endpoint: row, payload: "synthetic original input" });
@@ -735,21 +735,27 @@ describe("#246 isolated ingest owns every terminal transition", () => {
       profile: { id: "claude", defaultModel: "default" },
     }).orch;
     restarted.setChoiceResults(results);
-    let executions = 0;
-    (restarted as any).injectTurn = async () => {
-      executions++;
-      return { text: "must not execute" };
+    const seen: Array<{ prompt: string; resumeSessionId?: string }> = [];
+    (restarted as any).injectTurn = async (
+      _target: unknown,
+      prompt: string,
+      opts: InjectTurnOptions,
+    ) => {
+      seen.push({ prompt, resumeSessionId: opts.resumeSessionId });
+      opts.lifecycle?.onRuntime?.(undefined, "fixture-local-claude");
+      await opts.onSession?.("acp-claude-recorded");
+      opts.lifecycle?.beforePrompt();
+      return { text: "continued Claude work", stopReason: "end_turn" };
     };
     await expect(restarted.dispatchInjectTurn({ ...spec, resume: true }))
-      .rejects.toBeInstanceOf(DispatchSuspendedError);
-    expect(executions).toBe(0);
-    expect(store.getChoiceResult(spec.id)?.status).toBe("pending");
-    expect(store.getDelegation(spec.id)?.status).toBe("running");
+      .resolves.toMatchObject({ stopReason: "end_turn" });
+    expect(seen).toEqual([{ prompt: "continue", resumeSessionId: "acp-claude-recorded" }]);
+    expect(store.getDelegation(spec.id)?.status).toBe("completed");
     expect(store.turnAttempts.get(spec.id)).toMatchObject({
-      state: "suspended",
+      state: "completed",
+      generation: 2,
       acpSessionId: "acp-claude-recorded",
       promptStarted: true,
-      outcome: null,
     });
   });
 

@@ -39,6 +39,13 @@ import {
  */
 export const ADMISSION_BARRIER_TIMEOUT_MS = 60_000;
 
+/** Boot recovery gets two retries after its first pre-prompt acquisition.
+ * Exhaustion is quarantined visibly rather than spinning until another boot. */
+export const BOOT_RECOVERY_ATTEMPTS = 3;
+// SessionRouter deliberately cools a failed runtime for 30s. Shorter retry
+// delays would only hit that guard and consume the bounded attempt budget.
+export const BOOT_RECOVERY_BACKOFF_MS = [30_000, 30_000] as const;
+
 /** Clamp on the originating prompt copied into a done-file (#174). */
 export const DONE_ORIGIN_PROMPT_MAX = 4000;
 
@@ -86,6 +93,8 @@ export interface DispatchWatcherOpts {
   isCompleted?: (id: string) => boolean;
   /** Retention runs after publication, including when delivery preceded the file. */
   onResultPublished?: (id: string) => Promise<void>;
+  /** Test seam for bounded boot-recovery backoff. Production uses timers. */
+  recoverySleep?: (ms: number) => Promise<void>;
   /**
    * Directory-listing seam. Defaults to `fs.readdir`.
    *
@@ -207,6 +216,7 @@ export class DispatchWatcher {
   private readonly artifactTails = new Map<string, Promise<void>>();
   private timer?: NodeJS.Timeout;
   private ready = false;
+  private readonly recoverySleep: (ms: number) => Promise<void>;
   /** #303: invalidates a delayed boot opener; deleting this fence lets stop()
    * race a slow admission barrier and accidentally reopen intake afterward. */
   private lifecycleEpoch = 0;
@@ -233,6 +243,7 @@ export class DispatchWatcher {
     this.admissionBarrierTimeoutMs = opts.admissionBarrierTimeoutMs ?? ADMISSION_BARRIER_TIMEOUT_MS;
     this.isCompleted = opts.isCompleted ?? (() => false);
     this.onResultPublished = opts.onResultPublished;
+    this.recoverySleep = opts.recoverySleep ?? ((ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
     this.readDir = opts.readDir ?? readdir;
     this.beforeOwnedDoneCommit = opts.beforeOwnedDoneCommit;
     this.beforeRecoveryPublish = opts.beforeRecoveryPublish;
@@ -789,6 +800,41 @@ export class DispatchWatcher {
   /** Run one claimed spec through its target's SerialQueue and record the
    *  outcome. Invoked by `tick` in arrival order, so the synchronous
    *  `queueFor(target).run(...)` enqueue below preserves same-target order. */
+  private async dispatchWithBootRecoveryRetries(
+    spec: DispatchSpec,
+    owner: ClaimOwnership,
+  ): Promise<{ output: string; stopReason: string }> {
+    for (let attempt = 1; attempt <= BOOT_RECOVERY_ATTEMPTS; attempt++) {
+      try {
+        return await this.onDispatch(spec);
+      } catch (err) {
+        if (!(err instanceof DispatchSuspendedError) || err.suspension !== "retryable") throw err;
+        if (attempt === BOOT_RECOVERY_ATTEMPTS) {
+          // #421: refuse only this exhausted continuation. Other targets keep
+          // running, and this one becomes a named `/seam workflows` quarantine
+          // instead of spinning forever or silently waiting for another boot.
+          throw DispatchSuspendedError.defect(
+            spec.id,
+            `boot recovery exhausted ${BOOT_RECOVERY_ATTEMPTS} pre-prompt acquisition attempts: ${err.reason}`,
+          );
+        }
+        const backoffMs = BOOT_RECOVERY_BACKOFF_MS[attempt - 1]!;
+        this.logger.warn(
+          { id: spec.id, target: spec.target, attempt, backoffMs, reason: err.reason },
+          "dispatch: transient boot recovery acquisition failed; retrying recorded session",
+        );
+        await this.recoverySleep(backoffMs);
+        if (!this.ready || !this.owns(owner)) {
+          throw DispatchSuspendedError.shutdown(
+            spec.id,
+            "shutdown interrupted boot-recovery backoff; the next boot owns the dispatch",
+          );
+        }
+      }
+    }
+    throw new Error("unreachable boot recovery retry state");
+  }
+
   private async runSpec(id: string, spec: DispatchSpec, owner: ClaimOwnership): Promise<void> {
     // #409: this is SELECTION, not execution. The turn is about to be enqueued
     // on its target's SerialQueue and may sit there for minutes behind another
@@ -866,7 +912,7 @@ export class DispatchWatcher {
         "dispatch: running"
       );
       try {
-        const { output, stopReason } = await this.onDispatch(spec);
+        const { output, stopReason } = await this.dispatchWithBootRecoveryRetries(spec, owner);
         const committed = await this.finishOwned(owner, {
           ...base,
           status: "completed",

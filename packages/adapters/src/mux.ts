@@ -19,39 +19,8 @@ import { PROTOCOL_VERSION } from "./command-bus.js";
  */
 const CONNECT_TIMEOUT_MS = 10_000;
 
-/**
- * Bridge liveness (#427).
- *
- * A half-open socket — TCP gone with no FIN or RST, the ordinary outcome
- * through a proxy or tunnel — leaves `readyState === OPEN` on both ends
- * forever. `rpc()`'s offline guard passes, the frame goes into the void, and
- * the caller waits out the generic 30s timeout. Nothing ever closes the socket,
- * so the client's (correct) reconnect-on-close never fires and the thread is
- * dead permanently.
- *
- * Liveness is inferred from traffic the bridge ALREADY sends before any probe
- * is issued. The client pings every 25s, and `ws` answers an inbound ping at
- * protocol level, so on a healthy connection the server hears something at
- * least that often and these timers cost nothing.
- *
- * The active probe exists only for the case inference cannot cover: a client
- * that is quiet and does not ping. Terminating on silence alone would kill such
- * a connection even though it is healthy — the exact failure mode that would be
- * worse than the bug. Asking first turns "no evidence" into "we asked and got
- * nothing", which is a different and much safer claim.
- */
-const LIVENESS_SILENCE_MS = 35_000;
-/**
- * Grace for the probe to be answered. Sized against the client's 25s ping
- * rather than chosen: 35s tolerates one entirely missed ping plus jitter, and
- * the extra 10s tolerates a slow round trip on a path that is merely
- * congested. Two consecutive missed pings AND an unanswered probe is the bar
- * for calling a socket dead — worst case ~50s, after which the client's
- * existing 5s reconnect makes the thread usable again inside a minute.
- */
-const LIVENESS_PROBE_GRACE_MS = 10_000;
-/** Sweep granularity. Cheap: one timer per attached bridge socket. */
-const LIVENESS_TICK_MS = 5_000;
+/** How often to ping the bridge WS to keep tunnels/proxies alive. */
+const ACTIVE_PING_INTERVAL_MS = 25_000;
 
 /**
  * A bridge RPC that failed because the peer is gone, as distinct from an
@@ -189,14 +158,6 @@ export function makeMux(opts: {
   onHello?: (hello: HelloFrame) => void;
   onEvent?: (event: EventFrame) => void;
   onDisconnect?: () => void;
-  /** #427: fired when liveness terminates a socket, before `close`. */
-  onLivenessTimeout?: () => void;
-  /**
-   * #427: liveness timings, overridable so a test can drive the REAL monitor
-   * on real timers in milliseconds instead of waiting out the production
-   * window. Production never sets this.
-   */
-  liveness?: { silenceMs?: number; graceMs?: number; tickMs?: number };
 }) {
   let bridgeWs: WebSocket | null = null;
   let lastBridgeInstanceId: string | undefined;
@@ -286,68 +247,7 @@ export function makeMux(opts: {
     // Send any stdin that arrived while the bridge was offline.
     flushQueues();
 
-    // #427: per-SOCKET liveness. Scoped to this connection on purpose — there
-    // is one mux per bridge id, so what this refuses is exactly one bridge's
-    // websocket. The hub, every other bridge, and all local agents keep
-    // working; the only consequence is that THIS bridge is forced to notice it
-    // is gone and reconnect, which is what it would already do if the socket
-    // had closed honestly.
-    const silenceMs = opts.liveness?.silenceMs ?? LIVENESS_SILENCE_MS;
-    const graceMs = opts.liveness?.graceMs ?? LIVENESS_PROBE_GRACE_MS;
-    const tickMs = opts.liveness?.tickMs ?? LIVENESS_TICK_MS;
-    let lastSeenAt = Date.now();
-    let probeSentAt: number | null = null;
-    const sawTraffic = (): void => {
-      lastSeenAt = Date.now();
-      probeSentAt = null;
-    };
-    // Any inbound frame is liveness evidence, and `ws` emits `ping`/`pong`
-    // separately from `message` — the client's existing 25s ping arrives here
-    // and is answered by the library, so a healthy connection never reaches the
-    // probe below.
-    newWs.on("ping", sawTraffic);
-    newWs.on("pong", sawTraffic);
-
-    // Liveness needs a socket that can be PROBED. `attach()` also accepts
-    // minimal stand-ins (tests, and any future non-ws transport), and a monitor
-    // that assumed the full API turned one missing method into a throw inside
-    // attach — taking down the connection it was meant to protect. What is
-    // refused when these are absent is liveness detection for that one socket;
-    // message routing, RPC, spawn and the close/error settlement all continue.
-    const canProbe = typeof (newWs as { ping?: unknown }).ping === "function"
-      && typeof (newWs as { terminate?: unknown }).terminate === "function";
-    const liveness = canProbe ? setInterval(() => {
-      try {
-        if (newWs.readyState !== WebSocket.OPEN) return;
-        const now = Date.now();
-        if (probeSentAt !== null) {
-          if (now - probeSentAt >= graceMs) {
-            opts.onLivenessTimeout?.();
-            // terminate(), not close(): close() writes a frame and waits for a
-            // reply that a half-open peer will never send, which is the same
-            // hang one level down. terminate() destroys the socket locally and
-            // fires `close`, which is the event the client's reconnect needs.
-            newWs.terminate();
-          }
-          return;
-        }
-        if (now - lastSeenAt >= silenceMs) {
-          probeSentAt = now;
-          newWs.ping();
-        }
-      } catch {
-        // A throwing timer would take down the process for one bad socket.
-      }
-    }, tickMs) : null;
-    if (liveness && typeof liveness.unref === "function") liveness.unref();
-    const stopLiveness = (): void => { if (liveness) clearInterval(liveness); };
-    // `on`, not `once`: the stand-ins above implement only `on`, and
-    // clearInterval is idempotent so a repeat call costs nothing.
-    newWs.on("close", stopLiveness);
-    newWs.on("error", stopLiveness);
-
     newWs.on("message", (raw) => {
-      sawTraffic();
       let msg: MuxMsg;
       try {
         msg = JSON.parse(raw.toString()) as MuxMsg;
@@ -457,11 +357,10 @@ export function makeMux(opts: {
       }
     });
 
-    // #427: a dead socket must fail its in-flight RPCs NOW, with a reason that
+    // #429: a dead socket must fail its in-flight RPCs NOW, with a reason that
     // says the peer is gone. Leaving them to expire at the generic 30s default
     // is what made a dead connection look like a slow operation.
     newWs.on("close", () => {
-      stopLiveness();
       if (bridgeWs === newWs) {
         bridgeWs = null;
         settleInFlight("Remote bridge connection closed before the reply arrived.");
@@ -470,7 +369,6 @@ export function makeMux(opts: {
     });
 
     newWs.on("error", () => {
-      stopLiveness();
       if (bridgeWs === newWs) {
         bridgeWs = null;
         settleInFlight("Remote bridge connection failed before the reply arrived.");

@@ -1,24 +1,26 @@
 /**
- * #427 — two ways a bridge RPC dies at the generic 30s timeout, neither of
- * which is slowness.
+ * #429 — every bridge reconnect strands the calls that were in flight.
  *
- * **The deterministic one, and the higher-volume one.** `pendingRpcs` and
- * `pendingCmds` were each settled in exactly two places: a matching reply
- * frame, or their own 30s timer. `close`, `error` and `attach()`'s replacement
- * of the incumbent socket all left them untouched. So every call in flight
- * across an ORDINARY reconnect was orphaned — its reply can never arrive,
- * because the bridge answers on the socket it was asked on — and burned the
- * full 30s before failing with `rpc 'spawn' timed out after 30s`. With a 5s
- * reconnect delay, Mac sleep, wifi blips and cloudflared restarts, that is
- * routine. The transport is known dead at close time and we waited anyway.
+ * `pendingRpcs` and `pendingCmds` were each settled in exactly two places: a
+ * matching reply frame, or their own 30s timer. `close`, `error` and
+ * `attach()`'s replacement of the incumbent socket all left them untouched. So
+ * every call in flight when a socket went away was orphaned — its reply can
+ * never arrive, because the bridge answers on the socket it was asked on — and
+ * burned the full 30s before failing with `rpc 'spawn' timed out after 30s`.
  *
- * **The half-open one.** TCP gone with no FIN or RST leaves `readyState ===
- * OPEN` on both ends forever, so nothing closes and the client's correct
- * reconnect-on-close never fires. That needs a liveness probe.
+ * With `RECONNECT_DELAY_MS = 5s`, Mac sleep, wifi blips and cloudflared
+ * restarts, that is routine rather than exotic. The transport is known dead at
+ * close time and the caller waited half a minute anyway.
  *
- * The outcome distinction is load-bearing throughout: a call that was on the
- * wire may have been APPLIED by the bridge before the socket died, so these
- * failures are "outcome unknown", not "the bridge said no".
+ * The outcome distinction is load-bearing. The bridge's `spawn` handler
+ * configures the slot and returns (`bridge/src/rpc.ts:129`), so a call that
+ * was on the wire may have been fully APPLIED even though its reply could
+ * never come back. These failures are "transport died, outcome unknown", not
+ * "the bridge said no" — a caller must not infer the slot is unconfigured.
+ *
+ * Half-open sockets, where nothing ever closes, are #427 and are not covered
+ * here. This lands first: once a dead socket actually settles its callers,
+ * #427's failure mode becomes observable instead of indistinguishable from it.
  */
 import { createServer, type Server } from "node:http";
 import { afterEach, describe, expect, it } from "vitest";
@@ -39,9 +41,7 @@ afterEach(async () => {
 });
 
 /** A real ws pair: an actual server socket handed to the mux, and its client. */
-async function connectedPair(liveness?: {
-  silenceMs?: number; graceMs?: number; tickMs?: number;
-}): Promise<{
+async function connectedPair(): Promise<{
   mux: ReturnType<typeof makeMux>;
   serverWs: WebSocket;
   clientWs: WebSocket;
@@ -57,8 +57,6 @@ async function connectedPair(liveness?: {
   const mux = makeMux({
     id: "test-bridge",
     onDisconnect: () => events.push("disconnect"),
-    onLivenessTimeout: () => events.push("liveness-timeout"),
-    ...(liveness ? { liveness } : {}),
   } as never);
 
   const serverWs = await new Promise<WebSocket>((resolve) => {
@@ -78,7 +76,7 @@ async function connectedPair(liveness?: {
 const settled = async <T>(p: Promise<T>): Promise<unknown> =>
   p.then((v) => ({ ok: v }), (e) => e);
 
-describe("#427 an ordinary reconnect must not orphan in-flight calls", () => {
+describe("#429 an ordinary reconnect must not orphan in-flight calls", () => {
   it("settles a pending RPC on close instead of letting it burn 30s", async () => {
     const { mux, serverWs } = await connectedPair();
     // No reply will ever come; before this fix the only thing that settled it
@@ -158,52 +156,4 @@ describe("#427 an ordinary reconnect must not orphan in-flight calls", () => {
     expect(err.message).toMatch(/bridge/i);
     expect(err.message).not.toMatch(/timed out after/);
   }, 10_000);
-});
-
-describe("#427 a half-open socket is detected and terminated", () => {
-  // Real monitor, real timers, production logic — only the window is shortened
-  // so the test does not wait out the ~50s production budget.
-  const FAST = { silenceMs: 60, graceMs: 40, tickMs: 15 };
-
-  it("terminates a silent peer and fires close, so the client can reconnect", async () => {
-    // The half-open simulation: the peer is dropped with NO close frame, so
-    // `readyState` stays OPEN and nothing would ever close it. Pausing the
-    // underlying socket stops the library's automatic pong without sending
-    // anything, which is exactly what a vanished TCP path looks like.
-    const { serverWs, clientWs, events } = await connectedPair(FAST);
-    expect(serverWs.readyState).toBe(WebSocket.OPEN);
-    const closed = new Promise<void>((r) => serverWs.once("close", () => r()));
-
-    (clientWs as never as { _socket: { pause(): void } })._socket.pause();
-
-    await closed;
-    expect(events).toContain("liveness-timeout");
-    expect(serverWs.readyState).not.toBe(WebSocket.OPEN);
-    // `close` fired, which is the event the client's existing reconnect waits
-    // for — the whole reason terminate() is used rather than close().
-    expect(events).toContain("disconnect");
-  }, 15_000);
-
-  it("fails an RPC issued on a dying socket as unreachable, not as a timeout", async () => {
-    const { mux, clientWs } = await connectedPair(FAST);
-    const inFlight = mux.rpc("spawn", { slot: 1 });
-    (clientWs as never as { _socket: { pause(): void } })._socket.pause();
-
-    const err = await settled(inFlight);
-    expect(err).toBeInstanceOf(BridgeUnreachableError);
-    expect((err as Error).message).not.toMatch(/timed out after/);
-    expect((err as BridgeUnreachableError).outcomeUnknown).toBe(true);
-  }, 15_000);
-
-  it("does NOT terminate a healthy idle connection", async () => {
-    // The failure mode that would be worse than the bug. This peer sends
-    // nothing at all for many full windows; it is alive only in the sense that
-    // it answers the probe at protocol level, which is precisely the case the
-    // active probe exists to protect.
-    const { serverWs, events } = await connectedPair(FAST);
-    await new Promise((r) => setTimeout(r, 60 * 8));
-    expect(serverWs.readyState).toBe(WebSocket.OPEN);
-    expect(events).not.toContain("liveness-timeout");
-    expect(events).not.toContain("disconnect");
-  }, 15_000);
 });

@@ -175,6 +175,10 @@ const Schema = z.object({
 
   DEFAULT_AGENT: z.string().default("copilot"),
   DEFAULT_MODEL: z.string().default("gpt-5.4"),
+  /** Copilot is licensed per-seat and may be entitled to one project only.
+   * Set false to refuse it on this host regardless of whether the binary is
+   * installed — a licence boundary belongs in config, not in PATH. */
+  COPILOT_ENABLED: z.coerce.boolean().default(true),
   COPILOT_CLI_PATH: z.string().optional(),
   /**
    * Comma-separated list of additional Copilot profiles, each of the form

@@ -195,10 +195,22 @@ export function loadHostAdapters(
     }
   }
   const agyLoadable = agyEnabled && agyMissing.length === 0 && agyExecutableAvailable;
-  const factories: Array<{ id: string; bin: string; make: () => AgentAdapter; strict?: boolean }> = [
+  // Copilot is licensed per-seat and may be entitled to one project only. Unlike
+  // every other adapter here, "is the binary on PATH" is the wrong question for
+  // it — a reinstall must not silently re-enable a seat this host is not
+  // licensed to use. Mirrors AGY_ENABLED: explicit opt-out, refused loudly.
+  const copilotExplicitlyDisabled = env.COPILOT_ENABLED === "false";
+  const factories: Array<{
+    id: string;
+    bin: string;
+    make: () => AgentAdapter;
+    strict?: boolean;
+    disabled?: boolean;
+  }> = [
     {
       id: "copilot",
       bin: copilotCmd,
+      disabled: copilotExplicitlyDisabled,
       make: () => copilotProfileForHost(
         copilotCmd,
         options.cwd ?? process.cwd(),
@@ -275,6 +287,12 @@ export function loadHostAdapters(
     },
   ];
   for (const f of factories) {
+    // Explicit opt-out outranks discovery: refuse before probing the binary, so
+    // the reason recorded is the licence decision rather than "not installed".
+    if (f.disabled) {
+      options.onAdapterUnavailable?.({ agentId: f.id, code: "configuration_incomplete" });
+      continue;
+    }
     // Skip before construct so inventory never starts or refreshes an adapter.
     if (!exists(f.bin)) continue;
     try {

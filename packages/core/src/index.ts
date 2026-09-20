@@ -171,6 +171,11 @@ async function main(): Promise<void> {
     dataDir: config.DATA_DIR,
   });
 
+  // #439: a disabled licence must not register a profile at all. A
+  // registered-but-unusable agent still appears in pickers and still invites
+  // dispatch to a seat this host is not entitled to use.
+  const copilotEnabled = config.COPILOT_ENABLED !== false;
+
   const copilot = makeCopilotProfile({
     ...(config.COPILOT_CLI_PATH ? { cliPath: config.COPILOT_CLI_PATH } : {}),
     defaultModel: config.DEFAULT_MODEL,
@@ -408,7 +413,7 @@ async function main(): Promise<void> {
   let stopCatalogEnrichmentRefresh: (() => void) | undefined;
   let serviceStatusSources: ReturnType<typeof createDefaultServiceStatusSources> | undefined;
 
-  const profiles: AgentProfile[] = [copilot, ...extraCopilots, claude, ...extraClaudes, ...(claudeVertex ? [claudeVertex] : []), ...(agy ? [agy] : []), ...(codex ? [codex] : []), ...(grok ? [grok] : []), ...(zai ? [zai] : []), ...(ollamaCloud ? [ollamaCloud] : [])];
+  const profiles: AgentProfile[] = [...(copilotEnabled ? [copilot, ...extraCopilots] : []), claude, ...extraClaudes, ...(claudeVertex ? [claudeVertex] : []), ...(agy ? [agy] : []), ...(codex ? [codex] : []), ...(grok ? [grok] : []), ...(zai ? [zai] : []), ...(ollamaCloud ? [ollamaCloud] : [])];
   const profilesById = new Map(profiles.map((profile) => [profile.id, profile]));
   const modelCatalog = new ModelCatalogService({
     store: modelCatalogStore,

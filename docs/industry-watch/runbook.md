@@ -148,8 +148,9 @@ try (add new ones to this list when they clear the bar — that is self-update):
 - Meta: `ylecun`, `AIatMeta`, `alexandr_wang` (Muse max shipped on Wang’s account, not AIatMeta)
 - Open-weight / non-flagship: `Kimi_Moonshot`, `Zai_org` / Zhipu, DeepSeek,
   Qwen / `Alibaba_Qwen`, Mistral, Tencent Hunyuan (`Hy4`, `tencent/Hy4-preview`),
-  Nex AGI (`nex-agi`, `Nex-N2.5`), and Xiaomi MiMo (`_LuoFuli`, `XiaomiMiMo`;
-  livestream `mimo.xiaomi.com/rl`)
+  Nex AGI (`nex-agi`, `Nex-N2.5`), Xiaomi MiMo (`_LuoFuli`, `XiaomiMiMo`;
+  livestream `mimo.xiaomi.com/rl`), and StepFun (`StepFun_ai`; 阶跃星辰;
+  `stepfun.com/step-5-preview`)
 - Analysts who unspin labs: `SemiAnalysis_`, `natolambert`
 - Benchmarks: `ArtificialAnlys` (first scores often land here before the Seam AA cache)
 
@@ -164,6 +165,7 @@ try (add new ones to this list when they clear the bar — that is self-update):
 - Hugging Face trending / new orgs with large or sudden models
 - AA newly added creators not on `storylines.md`
 - `from:ArtificialAnlys` plus AA’s own articles (Seam cache can lag a public first score by days)
+- AA’s **changelog** and homepage “New language model evaluation” rows — first scores often land here **without** an article (DeepSeek V4.1 Flash eval dated 10 Sep was missed while the articles index still topped out at Ling-3.0-flash-Fin)
 - AA’s articles index and current Intelligence Index page; record a methodology version change before calling a model-score move
 - LM Arena: a model appearing then vanishing; also Code Arena WebDev for non-US API snapshots
 - Epoch AI (free) if a claimed pretrain needs a compute sanity check

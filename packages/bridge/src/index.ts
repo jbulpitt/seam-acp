@@ -148,6 +148,18 @@ const BRIDGE_INSTANCE_ID = randomUUID();
 
 /** Interval for sending WS ping frames to keep the tunnel/proxy alive. */
 const KEEPALIVE_PING_MS = 25_000;
+/**
+ * #427: how long a ping may go unanswered before this side gives up.
+ *
+ * The ping was blind — no `pong` listener, no timeout — so the client happily
+ * pinged a dead path forever while `readyState` read OPEN. Two intervals plus
+ * margin: one missed pong is a hiccup, two in a row through a tunnel that is
+ * still forwarding nothing is not. Deliberately longer than the server's own
+ * window so the server, which can see every bridge, is normally the one that
+ * decides; this is the backstop for the case where the server is the peer that
+ * vanished.
+ */
+const KEEPALIVE_PONG_TIMEOUT_MS = 60_000;
 
 async function loadWs(): Promise<{ WebSocket: WsCtor; WebSocketServer: WssCtor }> {
   try {
@@ -669,17 +681,42 @@ async function runClientMode(
       headers: { Authorization: `Bearer ${token}` },
     });
 
+    // #427: the ping is no longer blind. Any inbound traffic counts as an
+    // answer, not just a pong — a busy connection proves itself by carrying
+    // messages, and demanding a pong specifically would terminate a socket that
+    // is plainly working. Declared out here so the `message` handler below can
+    // feed it too.
+    let lastPeerAt = Date.now();
+    const sawPeer = (): void => { lastPeerAt = Date.now(); };
+    ws.on("pong", sawPeer);
+    ws.on("ping", sawPeer);
+
     ws.on("open", () => {
       console.error("[bridge] Connected.");
       mgr.setWs(ws);
+      sawPeer();
 
       const keepalive = setInterval(() => {
-        if (ws.readyState === WebSocket.OPEN) ws.ping();
+        if (ws.readyState !== WebSocket.OPEN) return;
+        if (Date.now() - lastPeerAt >= KEEPALIVE_PONG_TIMEOUT_MS) {
+          console.error(
+            `[bridge] No response for ${KEEPALIVE_PONG_TIMEOUT_MS / 1000}s; terminating dead socket.`
+          );
+          // terminate(), not close(): a half-open peer never answers a close
+          // handshake. This forces the local `close` event that the reconnect
+          // below is already waiting for.
+          ws.terminate();
+          return;
+        }
+        ws.ping();
       }, KEEPALIVE_PING_MS);
       ws.once("close", () => clearInterval(keepalive));
     });
 
-    ws.on("message", (raw) => mgr.handleMessage(raw));
+    ws.on("message", (raw) => {
+      sawPeer();
+      mgr.handleMessage(raw);
+    });
 
     ws.on("close", (code, reason) => {
       mgr.setWs(null);

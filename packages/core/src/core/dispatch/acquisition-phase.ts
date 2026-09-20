@@ -12,6 +12,14 @@ export function isRetryableBootAcquisitionError(err: unknown): boolean {
     seen.add(current);
     const typed = current as { code?: unknown; name?: unknown; message?: unknown; cause?: unknown };
     if (typed.code === "session_load_timeout" || typed.name === "SessionLoadTimeoutError") return true;
+    // #427: recognise the transport's own verdict structurally rather than by
+    // its wording. This is NOT a new retry policy — it is the existing one
+    // seeing a failure it already intends to cover: the regex below matches
+    // "Remote bridge is offline" and "rpc 'spawn' timed out", which were the
+    // only shapes a dead transport used to produce. A socket that closes
+    // mid-call now says so directly, and would otherwise fall through to the
+    // catch-all instead of being classified on purpose.
+    if ((current as { bridgeUnreachable?: unknown }).bridgeUnreachable === true) return true;
     const message = typeof typed.message === "string" ? typed.message : "";
     if (/rpc 'spawn' timed out|ACP connection closed|Remote bridge is offline/i.test(message)) return true;
     current = typed.cause;

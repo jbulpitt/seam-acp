@@ -19,8 +19,74 @@ import { PROTOCOL_VERSION } from "./command-bus.js";
  */
 const CONNECT_TIMEOUT_MS = 10_000;
 
-/** How often to ping the bridge WS to keep tunnels/proxies alive. */
-const ACTIVE_PING_INTERVAL_MS = 25_000;
+/**
+ * Bridge liveness (#427).
+ *
+ * A half-open socket — TCP gone with no FIN or RST, the ordinary outcome
+ * through a proxy or tunnel — leaves `readyState === OPEN` on both ends
+ * forever. `rpc()`'s offline guard passes, the frame goes into the void, and
+ * the caller waits out the generic 30s timeout. Nothing ever closes the socket,
+ * so the client's (correct) reconnect-on-close never fires and the thread is
+ * dead permanently.
+ *
+ * Liveness is inferred from traffic the bridge ALREADY sends before any probe
+ * is issued. The client pings every 25s, and `ws` answers an inbound ping at
+ * protocol level, so on a healthy connection the server hears something at
+ * least that often and these timers cost nothing.
+ *
+ * The active probe exists only for the case inference cannot cover: a client
+ * that is quiet and does not ping. Terminating on silence alone would kill such
+ * a connection even though it is healthy — the exact failure mode that would be
+ * worse than the bug. Asking first turns "no evidence" into "we asked and got
+ * nothing", which is a different and much safer claim.
+ */
+const LIVENESS_SILENCE_MS = 35_000;
+/**
+ * Grace for the probe to be answered. Sized against the client's 25s ping
+ * rather than chosen: 35s tolerates one entirely missed ping plus jitter, and
+ * the extra 10s tolerates a slow round trip on a path that is merely
+ * congested. Two consecutive missed pings AND an unanswered probe is the bar
+ * for calling a socket dead — worst case ~50s, after which the client's
+ * existing 5s reconnect makes the thread usable again inside a minute.
+ */
+const LIVENESS_PROBE_GRACE_MS = 10_000;
+/** Sweep granularity. Cheap: one timer per attached bridge socket. */
+const LIVENESS_TICK_MS = 5_000;
+
+/**
+ * A bridge RPC that failed because the peer is gone, as distinct from an
+ * operation that is merely slow (#427).
+ *
+ * The two used to be indistinguishable — both surfaced as
+ * `rpc 'spawn' timed out after 30s` — which sent every investigation towards
+ * "why is spawn slow" when the answer was "the connection died 30 seconds ago".
+ * The bridge's spawn handler does pure config work and launches nothing, so a
+ * 30s wait there was never measuring slowness.
+ */
+export class BridgeUnreachableError extends Error {
+  readonly bridgeUnreachable = true;
+  /**
+   * Was the call already on the wire when the transport died?
+   *
+   * This is the distinction a caller must not get wrong. The bridge's `spawn`
+   * handler configures the slot and returns, so a request that reached it may
+   * have been fully APPLIED even though the reply could never come back — the
+   * bridge answers on the socket it was asked on, and that socket is gone.
+   *
+   *   false — never sent. The outcome is known: nothing happened.
+   *   true  — sent, fate unknown. Safe to retry only if the operation is
+   *           idempotent; callers must not infer the slot is unconfigured.
+   *
+   * No retry policy is imposed here. #421/#424 own how callers degrade, and a
+   * third policy buried in the transport would be invisible to both.
+   */
+  readonly outcomeUnknown: boolean;
+  constructor(message: string, outcomeUnknown: boolean) {
+    super(message);
+    this.name = "BridgeUnreachableError";
+    this.outcomeUnknown = outcomeUnknown;
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Multiplexed message protocol
@@ -123,6 +189,14 @@ export function makeMux(opts: {
   onHello?: (hello: HelloFrame) => void;
   onEvent?: (event: EventFrame) => void;
   onDisconnect?: () => void;
+  /** #427: fired when liveness terminates a socket, before `close`. */
+  onLivenessTimeout?: () => void;
+  /**
+   * #427: liveness timings, overridable so a test can drive the REAL monitor
+   * on real timers in milliseconds instead of waiting out the production
+   * window. Production never sets this.
+   */
+  liveness?: { silenceMs?: number; graceMs?: number; tickMs?: number };
 }) {
   let bridgeWs: WebSocket | null = null;
   let lastBridgeInstanceId: string | undefined;
@@ -161,10 +235,43 @@ export function makeMux(opts: {
     }
   }
 
+  /**
+   * Settle everything waiting on a socket that can no longer answer (#427).
+   *
+   * `pendingRpcs` and `pendingCmds` were each settled in exactly two places:
+   * a matching reply frame, or their own 30s timer. Neither `close` nor
+   * `error` nor `attach()`'s replacement of the incumbent touched them — so
+   * every call in flight across an ORDINARY reconnect was orphaned and burned
+   * the full 30s before failing with `rpc '<m>' timed out after 30s`. With a
+   * 5s reconnect delay and Mac sleep, wifi blips and cloudflared restarts,
+   * that is routine rather than exotic: the transport is known dead at close
+   * time and we waited half a minute anyway.
+   *
+   * Everything settled here is `outcomeUnknown: true` — it was on the wire.
+   */
+  function settleInFlight(why: string): void {
+    for (const [id, { reject }] of [...pendingRpcs]) {
+      pendingRpcs.delete(id);
+      reject(new BridgeUnreachableError(why, true));
+    }
+    for (const [id, { reject }] of [...pendingCmds]) {
+      pendingCmds.delete(id);
+      reject(new BridgeUnreachableError(why, true));
+    }
+  }
+
   function attach(newWs: WebSocket) {
     // Replace the old bridge connection.
-    if (bridgeWs && bridgeWs !== newWs && bridgeWs.readyState === WebSocket.OPEN) {
-      bridgeWs.close(1001, "replaced by new bridge connection");
+    if (bridgeWs && bridgeWs !== newWs) {
+      // #427: the incumbent's replies can never arrive once it is replaced —
+      // the bridge answers on the socket it was asked on. Settled HERE rather
+      // than in the old socket's `close` handler, because by the time that
+      // fires `bridgeWs` already points at the new socket and the handler's
+      // `bridgeWs === newWs` identity guard (correctly) skips it.
+      settleInFlight("Remote bridge reconnected before the reply arrived.");
+      if (bridgeWs.readyState === WebSocket.OPEN) {
+        bridgeWs.close(1001, "replaced by new bridge connection");
+      }
     }
     bridgeWs = newWs;
 
@@ -179,7 +286,58 @@ export function makeMux(opts: {
     // Send any stdin that arrived while the bridge was offline.
     flushQueues();
 
+    // #427: per-SOCKET liveness. Scoped to this connection on purpose — there
+    // is one mux per bridge id, so what this refuses is exactly one bridge's
+    // websocket. The hub, every other bridge, and all local agents keep
+    // working; the only consequence is that THIS bridge is forced to notice it
+    // is gone and reconnect, which is what it would already do if the socket
+    // had closed honestly.
+    const silenceMs = opts.liveness?.silenceMs ?? LIVENESS_SILENCE_MS;
+    const graceMs = opts.liveness?.graceMs ?? LIVENESS_PROBE_GRACE_MS;
+    const tickMs = opts.liveness?.tickMs ?? LIVENESS_TICK_MS;
+    let lastSeenAt = Date.now();
+    let probeSentAt: number | null = null;
+    const sawTraffic = (): void => {
+      lastSeenAt = Date.now();
+      probeSentAt = null;
+    };
+    // Any inbound frame is liveness evidence, and `ws` emits `ping`/`pong`
+    // separately from `message` — the client's existing 25s ping arrives here
+    // and is answered by the library, so a healthy connection never reaches the
+    // probe below.
+    newWs.on("ping", sawTraffic);
+    newWs.on("pong", sawTraffic);
+
+    const liveness = setInterval(() => {
+      try {
+        if (newWs.readyState !== WebSocket.OPEN) return;
+        const now = Date.now();
+        if (probeSentAt !== null) {
+          if (now - probeSentAt >= graceMs) {
+            opts.onLivenessTimeout?.();
+            // terminate(), not close(): close() writes a frame and waits for a
+            // reply that a half-open peer will never send, which is the same
+            // hang one level down. terminate() destroys the socket locally and
+            // fires `close`, which is the event the client's reconnect needs.
+            newWs.terminate();
+          }
+          return;
+        }
+        if (now - lastSeenAt >= silenceMs) {
+          probeSentAt = now;
+          newWs.ping();
+        }
+      } catch {
+        // A throwing timer would take down the process for one bad socket.
+      }
+    }, tickMs);
+    if (typeof liveness.unref === "function") liveness.unref();
+    const stopLiveness = (): void => clearInterval(liveness);
+    newWs.once("close", stopLiveness);
+    newWs.once("error", stopLiveness);
+
     newWs.on("message", (raw) => {
+      sawTraffic();
       let msg: MuxMsg;
       try {
         msg = JSON.parse(raw.toString()) as MuxMsg;
@@ -289,16 +447,23 @@ export function makeMux(opts: {
       }
     });
 
+    // #427: a dead socket must fail its in-flight RPCs NOW, with a reason that
+    // says the peer is gone. Leaving them to expire at the generic 30s default
+    // is what made a dead connection look like a slow operation.
     newWs.on("close", () => {
+      stopLiveness();
       if (bridgeWs === newWs) {
         bridgeWs = null;
+        settleInFlight("Remote bridge connection closed before the reply arrived.");
         opts.onDisconnect?.();
       }
     });
 
     newWs.on("error", () => {
+      stopLiveness();
       if (bridgeWs === newWs) {
         bridgeWs = null;
+        settleInFlight("Remote bridge connection failed before the reply arrived.");
         opts.onDisconnect?.();
       }
     });
@@ -380,7 +545,12 @@ export function makeMux(opts: {
 
   async function sendCmd(action: string, payload: any): Promise<any> {
     if (!bridgeWs || bridgeWs.readyState !== WebSocket.OPEN) {
-      throw new Error(`Remote bridge is offline. Make sure the bridge is running.`);
+      // Same type as a mid-flight death, so callers classify one thing.
+      throw new BridgeUnreachableError(
+        "Remote bridge is offline. Make sure the bridge is running.",
+        // Nothing left this process, so the outcome is not in doubt.
+        false
+      );
     }
     const cmdId = Math.random().toString(36).substring(2, 15);
     return new Promise((resolve, reject) => {
@@ -407,7 +577,12 @@ export function makeMux(opts: {
     optsRpc: { agentId?: string; timeoutMs?: number } = {}
   ): Promise<unknown> {
     if (!bridgeWs || bridgeWs.readyState !== WebSocket.OPEN) {
-      throw new Error(`Remote bridge is offline. Make sure the bridge is running.`);
+      // Same type as a mid-flight death, so callers classify one thing.
+      // Nothing left this process, so the outcome is not in doubt.
+      throw new BridgeUnreachableError(
+        "Remote bridge is offline. Make sure the bridge is running.",
+        false
+      );
     }
     const id = Math.random().toString(36).substring(2, 15);
     const timeoutMs = optsRpc.timeoutMs ?? 30_000;

@@ -64,6 +64,13 @@
       "rolloutEnabled": false,
       "unmanagedReason": "AGY-only host is outside the PM2 bridge rollout contract"
     },
+    "fhr-server": {
+      "sshAlias": "fhr-server",
+      "pm2App": null,
+      "verifyAgent": null,
+      "rolloutEnabled": false,
+      "unmanagedReason": "systemd launcher needs a dedicated activation and rollback contract"
+    },
     "home-hub": {
       "sshAlias": "home-hub",
       "pm2App": "seam-bridge",

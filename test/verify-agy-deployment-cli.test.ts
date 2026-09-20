@@ -157,9 +157,9 @@ describe("#397 the exit-code contract, from a real node process", () => {
       "--bridge-registry", registry,
     ]);
     expect(result.code).toBe(3);
-    expect(result.stdout).toContain("fleet_registered=9");
-    expect(result.stdout).toContain("fleet_rollout_managed=5 of 9");
-    expect(result.stdout).toContain("operation_scope=1 of 9 registered hosts: plex-server");
+    expect(result.stdout).toContain("fleet_registered=10");
+    expect(result.stdout).toContain("fleet_rollout_managed=5 of 10");
+    expect(result.stdout).toContain("operation_scope=1 of 10 registered hosts: plex-server");
     expect(result.stdout).toContain("fleet_excluded=plex-server: systemd launcher needs a dedicated activation and rollback contract");
   });
 

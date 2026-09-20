@@ -21,7 +21,7 @@ operation; connected bridges, adapters, dispatches, and other hosts keep
 serving. Set `CHANNEL_PRESETS_FILE` when the live registry is not at
 `data/channel-presets.json` relative to the checkout.
 
-Every preflight prints the denominator: nine registered hosts, four managed by
+Every preflight prints the denominator: ten registered hosts, five managed by
 this rollout, and five excluded with a reason, plus the one selected host. A
 successful selected-host preflight is therefore never presented as verification
 of an unnamed whole fleet.
@@ -40,12 +40,11 @@ on the command line.
 - `macbook-pro` and `home-hub` are enabled PM2 targets alongside the two above.
 - Three AGY-only laptops retain SSH aliases but deliberately have no rollout
   identity and remain disabled.
-- `plex-server` is explicitly excluded: it is Linux x86_64 under systemd and a
-  launch wrapper, so the PM2 capture/activation/rollback protocol does not apply.
-- `rhc-server` is explicitly excluded pending a verified rollout identity and
-  enrollment. It is Linux aarch64 under PM2 with Node ABI 127, a tuple the
-  rollout supports, but architecture alone is not enough evidence to guess its
-  launcher, arguments, ownership, or rollback identity.
+- `plex-server` and `fhr-server` are explicitly excluded: they are Linux x86_64
+  under systemd and launch wrappers, so the PM2 capture/activation/rollback
+  protocol does not apply.
+- `rhc-server` is an enabled Linux aarch64 PM2 target with a verified rollout
+  identity alongside the macOS PM2 targets.
 
 An excluded host remains in the fleet denominator and every attempted phase
 refuses with its recorded reason. Absence is not used to mean exclusion.

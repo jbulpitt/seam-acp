@@ -27,17 +27,17 @@ function tempRegistry(shape = registeredShape): string {
 }
 
 describe("#413 bridge fleet accounting", () => {
-  it("reconciles all nine registered hosts and names every rollout exclusion", () => {
+  it("reconciles all ten registered hosts and names every rollout exclusion", () => {
     const registered = validateBridgeRegistry(registeredShape);
     const fleet = describeTargetFleet(targetMap, registered);
-    expect(fleet.registered).toHaveLength(9);
+    expect(fleet.registered).toHaveLength(10);
     expect(fleet.rolloutManaged).toEqual(["home-hub", "macbook-air", "macbook-pro", "media-server", "rhc-server"]);
     expect(fleet.rolloutExcluded.map((row) => row.id)).toEqual([
-      "alaina-laptop", "allie-laptop", "jennifer-laptop", "plex-server",
+      "alaina-laptop", "allie-laptop", "fhr-server", "jennifer-laptop", "plex-server",
     ]);
     expect(fleet.rolloutExcluded.find((row) => row.id === "plex-server")?.reason).toMatch(/systemd.*dedicated/i);
-    expect(formatFleetCoverage(fleet, "media-server")).toContain("fleet_rollout_managed=5 of 9");
-    expect(formatFleetCoverage(fleet, "media-server")).toContain("operation_scope=1 of 9 registered hosts: media-server");
+    expect(formatFleetCoverage(fleet, "media-server")).toContain("fleet_rollout_managed=5 of 10");
+    expect(formatFleetCoverage(fleet, "media-server")).toContain("operation_scope=1 of 10 registered hosts: media-server");
   });
 
   it("refuses a fleet claim when a live registered bridge has no rollout record", () => {
@@ -109,8 +109,8 @@ describe("#413 bridge fleet accounting", () => {
       stdout = e.stdout ?? "";
       stderr = e.stderr ?? "";
     }
-    expect(stdout).toContain("fleet_registered=9");
-    expect(stdout).toContain("fleet_rollout_managed=5 of 9");
+    expect(stdout).toContain("fleet_registered=10");
+    expect(stdout).toContain("fleet_rollout_managed=5 of 10");
     expect(stdout).toContain("fleet_excluded=plex-server: systemd launcher needs a dedicated activation and rollback contract");
     expect(stderr).toMatch(/plex-server is explicitly excluded.*systemd launcher/);
   });

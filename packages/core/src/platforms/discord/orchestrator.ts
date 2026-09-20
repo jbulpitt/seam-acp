@@ -625,6 +625,48 @@ function ingestFailureText(err: unknown): string {
 
 export type ChannelQueueState = "idle" | "runtime_busy" | "queued" | "wedged" | "stalled";
 
+/**
+ * The system identity an automatic queue recovery is recorded under (#423).
+ *
+ * A bumped queue epoch with no actor reads as a mystery in the audit log, so
+ * the automatic path uses this in place of the operator's Discord identity and
+ * is otherwise recorded identically.
+ */
+export const AUTO_RECOVERY_ACTOR = Object.freeze({
+  id: "system:channel-queue-sweep",
+  name: "Seam auto-recovery",
+});
+
+/**
+ * May the sweep repair this channel without asking a human? (#423)
+ *
+ * Exactly one state qualifies: `wedged`, which `inspectChannelQueue` only
+ * reports when the runtime is IDLE and the queue tail is older than
+ * `CHANNEL_QUEUE_WEDGE_GRACE_SECONDS`. That is the mechanically decidable case
+ * `mode:auto` was built for, and `recoverChannel` independently refuses auto
+ * on anything else — this predicate decides whether to *ask*, not whether it is
+ * safe, so the two are deliberately not the same check.
+ *
+ * What stays manual, and why:
+ *   - `runtime_busy` — a live turn is running. Fencing it would discard work
+ *     that is making progress, and "stuck" is a judgement a human makes.
+ *   - `queued` — still inside the grace period. Recovering here would fight
+ *     normal queueing.
+ *   - `idle` / `stalled` — nothing to fence, or already quarantined and
+ *     surfaced through `/seam workflows`.
+ *
+ * A wedge whose durable items cannot be re-queued is also left to a human, but
+ * that is decided inside `recoverChannel` (a legacy running admission with no
+ * frozen execution identity refuses there) rather than here, because it needs
+ * the store.
+ */
+export function shouldAutoRecoverQueue(
+  health: Pick<ChannelQueueHealth, "state">,
+  enabled: boolean
+): boolean {
+  return enabled && health.state === "wedged";
+}
+
 export interface ChannelQueueHealth {
   state: ChannelQueueState;
   epoch: number;
@@ -1906,6 +1948,7 @@ export class Orchestrator {
     // an enabled active_projects row as allowed, additive to the env allowlist.
     this.adapter.setActiveChannelCheck?.((ref) => this.store.isChannelActive(ref));
     this.watchSentinel();
+    this.watchQueueWedges();
   }
 
   /** Freeze any card whose ACP request disappeared with the prior process. */
@@ -2176,6 +2219,10 @@ export class Orchestrator {
 
   /** Stop the sentinel file watcher (call on shutdown). */
   stopSentinelWatcher(): void {
+    if (this.queueSweepTimer) {
+      clearInterval(this.queueSweepTimer);
+      this.queueSweepTimer = null;
+    }
     if (this.sentinelPoller) {
       clearInterval(this.sentinelPoller);
       this.sentinelPoller = null;
@@ -2192,6 +2239,112 @@ export class Orchestrator {
     } catch {
       return false;
     }
+  }
+
+  private queueSweepTimer: ReturnType<typeof setInterval> | null = null;
+
+  /**
+   * Every channel worth inspecting for a wedge (#423).
+   *
+   * Three sources, and the two durable ones are what matter. `channelQueueMeta`
+   * is in-memory, so it only knows about channels this process has queued for
+   * since boot. The threads Jesse lost were blocked for 7 and 13 HOURS across
+   * restarts, and were invisible to the hot set by then.
+   *
+   * The durable sources are the queued message itself
+   * (`listInboundNonterminal`, which is the "card stuck at Working…" row) and
+   * any non-terminal attempt's target. Both come from SQL and survive a
+   * restart. An early version of this used only the hot set and the attempts,
+   * and found nothing at all for a thread whose only trace was a pending
+   * admission — which is the commonest shape of this bug.
+   */
+  private wedgeSweepCandidates(): string[] {
+    const refs = new Set<string>(this.channelQueueMeta?.keys() ?? []);
+    const listInbound = (this.store as Partial<SessionStore>).listInboundNonterminal;
+    if (listInbound) {
+      for (const row of listInbound.call(this.store)) {
+        if (row.channelRef) refs.add(row.channelRef);
+      }
+    }
+    for (const state of ["pending", "suspended"] as const) {
+      for (const attempt of this.store.turnAttempts.list(state, () => {})) {
+        if (attempt.spec?.target) refs.add(attempt.spec.target);
+      }
+    }
+    return [...refs];
+  }
+
+  /**
+   * One pass of the wedge sweep (#423).
+   *
+   * The detector and the repair both already existed; nothing ran them. The
+   * detector fired only when a human typed `/seam cancel`, and the repair only
+   * when an admin typed back the command Seam had just printed for them — so a
+   * thread stayed dead for as long as nobody happened to look.
+   *
+   * Separate from the timer so a test can drive exactly one pass.
+   */
+  async sweepWedgedQueues(): Promise<string[]> {
+    const enabled = this.config?.CHANNEL_QUEUE_AUTO_RECOVER !== false;
+    const recovered: string[] = [];
+    for (const channelRef of this.wedgeSweepCandidates()) {
+      let health: ChannelQueueHealth;
+      try {
+        health = this.inspectChannelQueue(channelRef);
+      } catch (err) {
+        // One unreadable channel must never stop the sweep: the whole point is
+        // that nobody is watching, so a throw here restores the silence.
+        this.logger.warn({ err, channelRef }, "queue sweep: inspection failed");
+        continue;
+      }
+      if (health.state !== "wedged") continue;
+      if (!shouldAutoRecoverQueue(health, enabled)) {
+        // Detected but not repaired. Logged either way, so turning auto-repair
+        // off degrades to visibility rather than back to silence.
+        this.logger.warn(
+          { channelRef, queued: health.queued, ageMs: health.ageMs, epoch: health.epoch },
+          "queue sweep: wedged channel detected; automatic recovery is disabled"
+        );
+        continue;
+      }
+      try {
+        const result = await this.recoverChannel(channelRef, "auto", AUTO_RECOVERY_ACTOR);
+        if (result.ok) {
+          recovered.push(channelRef);
+          this.logger.warn(
+            { channelRef, queued: health.queued, ageMs: health.ageMs,
+              oldEpoch: health.epoch, newEpoch: result.epoch },
+            "queue sweep: recovered a wedged channel automatically"
+          );
+        } else {
+          // `recoverChannel` refused — e.g. a legacy running admission whose
+          // durable work cannot be safely replayed. That is the boundary where
+          // a human is still required, and it is stated rather than retried.
+          this.logger.warn(
+            { channelRef, reason: result.message },
+            "queue sweep: wedged channel needs an operator"
+          );
+        }
+      } catch (err) {
+        this.logger.error({ err, channelRef }, "queue sweep: recovery threw");
+      }
+    }
+    return recovered;
+  }
+
+  private watchQueueWedges(): void {
+    // Optional-chained deliberately: `install()` runs in harnesses that build
+    // an Orchestrator without a config, and an eager dereference here threw
+    // during install rather than at the first sweep — turning a background
+    // timer into a startup crash.
+    const seconds = this.config?.CHANNEL_QUEUE_SWEEP_SECONDS ?? 60;
+    if (seconds <= 0) return;
+    this.queueSweepTimer = setInterval(() => {
+      void this.sweepWedgedQueues().catch((err) =>
+        this.logger.error({ err }, "queue sweep failed")
+      );
+    }, seconds * 1000);
+    this.queueSweepTimer.unref?.();
   }
 
   private watchSentinel(): void {

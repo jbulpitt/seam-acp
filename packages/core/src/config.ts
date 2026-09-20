@@ -178,7 +178,7 @@ const Schema = z.object({
   /** Copilot is licensed per-seat and may be entitled to one project only.
    * Set false to refuse it on this host regardless of whether the binary is
    * installed — a licence boundary belongs in config, not in PATH. */
-  COPILOT_ENABLED: z.coerce.boolean().default(true),
+  COPILOT_ENABLED: z.enum(["true", "false"]).default("true").transform((v) => v === "true"),
   COPILOT_CLI_PATH: z.string().optional(),
   /**
    * Comma-separated list of additional Copilot profiles, each of the form
@@ -554,7 +554,10 @@ const Schema = z.object({
   /** #423: auto-apply `mode:auto` recovery to an unambiguous wedge. Off means
    * the wedge is still detected and logged, but waits for a human — which is
    * the behaviour that silently held threads for 7-13 hours. */
-  CHANNEL_QUEUE_AUTO_RECOVER: z.coerce.boolean().default(true),
+  CHANNEL_QUEUE_AUTO_RECOVER: z
+    .enum(["true", "false"])
+    .default("true")
+    .transform((v) => v === "true"),
   /** Maximum graceful restart drain. On expiry the existing force-restart path
    * takes over so a leaked turn counter can never wedge redeploy indefinitely. */
   RESTART_DRAIN_TIMEOUT_MS: z.coerce

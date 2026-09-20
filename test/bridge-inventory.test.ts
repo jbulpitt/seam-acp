@@ -49,7 +49,12 @@ describe("loadHostAdapters", () => {
   });
 
   it("skips adapters whose CLI is not on PATH (agy must not spawn ENOENT)", () => {
-    const adapters = loadHostAdapters("copilot", { exists: (bin) => bin === "copilot" });
+    // Pin the env: this asserts copilot loads, so it must not inherit a host
+    // config where the operator has disabled it (COPILOT_ENABLED=false).
+    const adapters = loadHostAdapters("copilot", {
+      env: { PATH: process.env.PATH, AGY_ENABLED: "false" },
+      exists: (bin) => bin === "copilot",
+    });
     expect([...adapters.keys()]).toEqual(["copilot"]);
     expect(adapters.has("agy")).toBe(false);
   });
@@ -57,8 +62,13 @@ describe("loadHostAdapters", () => {
   it("binds remote catalog fetches to the configured Copilot launch tuple", async () => {
     const priorArgs = process.env.COPILOT_ARGS;
     const priorToken = process.env.GH_TOKEN;
+    // The assertion below compares against resolveCopilotHostLaunch, which reads
+    // process.env directly — so the adapter must see the SAME env, and a host
+    // that has disabled copilot would otherwise remove the adapter under test.
+    const priorEnabled = process.env.COPILOT_ENABLED;
     process.env.COPILOT_ARGS = "--acp --remote-mode";
     process.env.GH_TOKEN = "remote-credential-token";
+    process.env.COPILOT_ENABLED = "true";
     let launch: {
       cliPath: string;
       args: string[];
@@ -109,6 +119,8 @@ describe("loadHostAdapters", () => {
       else process.env.COPILOT_ARGS = priorArgs;
       if (priorToken === undefined) delete process.env.GH_TOKEN;
       else process.env.GH_TOKEN = priorToken;
+      if (priorEnabled === undefined) delete process.env.COPILOT_ENABLED;
+      else process.env.COPILOT_ENABLED = priorEnabled;
     }
   });
 

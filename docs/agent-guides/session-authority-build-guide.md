@@ -89,25 +89,39 @@ the contradictions between layers live, and why four separate derivations of
 - **#447** inbound queue
 - **#450** tiered presentation — wide integration surface
 
-### Sol — `gpt-5.6-sol`, xhigh — agentic and iterative
+### Grok 4.6 high — the curatable bulk
 
-Coding 78.3, and the **only** model in this pool with measured agentic benchmarks:
-`tau2` 0.848, `terminalbench_hard` 0.659, `ifbench` 0.73. Its intelligence index of 44
-badly undersells it for tool-heavy work. $8 blended.
+The volume workhorse, and the default for any story whose brief already names its files.
 
-- **#440** adapter normalization — eight profiles, heavily iterative, test-driven
-- **#455** metadata ingestion — debugging a pipeline
-- **#449** fallback chain
+Intelligence 44.3 — marginally *ahead* of Sol xhigh's 44.0 — coding 76.8, **500k context**
+(nearly double Sol), at **$3 blended** against Sol's $8. It concedes 1.5 points of coding
+index and wins on every other axis that matters here.
+
+Owner's direct comparison: *Grok 4.6 high has produced equal or better results than Sol
+where the context was well curated.* That qualifier is the assignment rule. Most stories
+in this epic already name their files and symbols, which is curation — so Grok is the
+default, not the fallback.
+
+- **#440** adapter normalization — seven profiles, one known pattern to follow in `agy.ts`
+- **#449** fallback chain — filters and ranking fully specified in the story
 - **#445** snapshot and the `messages.edit` optimization
-- **#454** re-auth via elicitations
-
-### Grok 4.6 — small, well-scoped, cheap
-
-Coding 76.8 at $3 blended, 500k context. Plenty for single-file work.
-
 - **#446** durable binding
 - **#451** recovery context
 - **#453** copilot collapse
+
+### Sol — `gpt-5.6-sol`, xhigh — reserved for autonomous exploration
+
+The **only** model in this pool with measured agentic benchmarks: `tau2` 0.848,
+`terminalbench_hard` 0.659, `ifbench` 0.73. Grok's equivalents are *unpublished*, not
+zero — absence of measurement, not measured weakness — so this is a narrow, specific
+advantage rather than a general one.
+
+Use Sol only where the work requires finding an unknown target rather than editing a
+named one, which is the case its agentic scores actually describe. At $8 and 258k context
+it is not the right default.
+
+- **#455** metadata ingestion — locating an unknown failure point in a pipeline
+- **#454** re-auth — integrating a device flow against the elicitation path
 
 ## Dispatch protocol
 

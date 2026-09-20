@@ -22,6 +22,41 @@ const CONNECT_TIMEOUT_MS = 10_000;
 /** How often to ping the bridge WS to keep tunnels/proxies alive. */
 const ACTIVE_PING_INTERVAL_MS = 25_000;
 
+/**
+ * A bridge RPC that failed because the peer is gone, as distinct from an
+ * operation that is merely slow (#427).
+ *
+ * The two used to be indistinguishable — both surfaced as
+ * `rpc 'spawn' timed out after 30s` — which sent every investigation towards
+ * "why is spawn slow" when the answer was "the connection died 30 seconds ago".
+ * The bridge's spawn handler does pure config work and launches nothing, so a
+ * 30s wait there was never measuring slowness.
+ */
+export class BridgeUnreachableError extends Error {
+  readonly bridgeUnreachable = true;
+  /**
+   * Was the call already on the wire when the transport died?
+   *
+   * This is the distinction a caller must not get wrong. The bridge's `spawn`
+   * handler configures the slot and returns, so a request that reached it may
+   * have been fully APPLIED even though the reply could never come back — the
+   * bridge answers on the socket it was asked on, and that socket is gone.
+   *
+   *   false — never sent. The outcome is known: nothing happened.
+   *   true  — sent, fate unknown. Safe to retry only if the operation is
+   *           idempotent; callers must not infer the slot is unconfigured.
+   *
+   * No retry policy is imposed here. #421/#424 own how callers degrade, and a
+   * third policy buried in the transport would be invisible to both.
+   */
+  readonly outcomeUnknown: boolean;
+  constructor(message: string, outcomeUnknown: boolean) {
+    super(message);
+    this.name = "BridgeUnreachableError";
+    this.outcomeUnknown = outcomeUnknown;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Multiplexed message protocol
 // ---------------------------------------------------------------------------
@@ -161,10 +196,43 @@ export function makeMux(opts: {
     }
   }
 
+  /**
+   * Settle everything waiting on a socket that can no longer answer (#427).
+   *
+   * `pendingRpcs` and `pendingCmds` were each settled in exactly two places:
+   * a matching reply frame, or their own 30s timer. Neither `close` nor
+   * `error` nor `attach()`'s replacement of the incumbent touched them — so
+   * every call in flight across an ORDINARY reconnect was orphaned and burned
+   * the full 30s before failing with `rpc '<m>' timed out after 30s`. With a
+   * 5s reconnect delay and Mac sleep, wifi blips and cloudflared restarts,
+   * that is routine rather than exotic: the transport is known dead at close
+   * time and we waited half a minute anyway.
+   *
+   * Everything settled here is `outcomeUnknown: true` — it was on the wire.
+   */
+  function settleInFlight(why: string): void {
+    for (const [id, { reject }] of [...pendingRpcs]) {
+      pendingRpcs.delete(id);
+      reject(new BridgeUnreachableError(why, true));
+    }
+    for (const [id, { reject }] of [...pendingCmds]) {
+      pendingCmds.delete(id);
+      reject(new BridgeUnreachableError(why, true));
+    }
+  }
+
   function attach(newWs: WebSocket) {
     // Replace the old bridge connection.
-    if (bridgeWs && bridgeWs !== newWs && bridgeWs.readyState === WebSocket.OPEN) {
-      bridgeWs.close(1001, "replaced by new bridge connection");
+    if (bridgeWs && bridgeWs !== newWs) {
+      // #427: the incumbent's replies can never arrive once it is replaced —
+      // the bridge answers on the socket it was asked on. Settled HERE rather
+      // than in the old socket's `close` handler, because by the time that
+      // fires `bridgeWs` already points at the new socket and the handler's
+      // `bridgeWs === newWs` identity guard (correctly) skips it.
+      settleInFlight("Remote bridge reconnected before the reply arrived.");
+      if (bridgeWs.readyState === WebSocket.OPEN) {
+        bridgeWs.close(1001, "replaced by new bridge connection");
+      }
     }
     bridgeWs = newWs;
 
@@ -289,9 +357,13 @@ export function makeMux(opts: {
       }
     });
 
+    // #429: a dead socket must fail its in-flight RPCs NOW, with a reason that
+    // says the peer is gone. Leaving them to expire at the generic 30s default
+    // is what made a dead connection look like a slow operation.
     newWs.on("close", () => {
       if (bridgeWs === newWs) {
         bridgeWs = null;
+        settleInFlight("Remote bridge connection closed before the reply arrived.");
         opts.onDisconnect?.();
       }
     });
@@ -299,6 +371,7 @@ export function makeMux(opts: {
     newWs.on("error", () => {
       if (bridgeWs === newWs) {
         bridgeWs = null;
+        settleInFlight("Remote bridge connection failed before the reply arrived.");
         opts.onDisconnect?.();
       }
     });
@@ -380,7 +453,12 @@ export function makeMux(opts: {
 
   async function sendCmd(action: string, payload: any): Promise<any> {
     if (!bridgeWs || bridgeWs.readyState !== WebSocket.OPEN) {
-      throw new Error(`Remote bridge is offline. Make sure the bridge is running.`);
+      // Same type as a mid-flight death, so callers classify one thing.
+      throw new BridgeUnreachableError(
+        "Remote bridge is offline. Make sure the bridge is running.",
+        // Nothing left this process, so the outcome is not in doubt.
+        false
+      );
     }
     const cmdId = Math.random().toString(36).substring(2, 15);
     return new Promise((resolve, reject) => {
@@ -407,7 +485,12 @@ export function makeMux(opts: {
     optsRpc: { agentId?: string; timeoutMs?: number } = {}
   ): Promise<unknown> {
     if (!bridgeWs || bridgeWs.readyState !== WebSocket.OPEN) {
-      throw new Error(`Remote bridge is offline. Make sure the bridge is running.`);
+      // Same type as a mid-flight death, so callers classify one thing.
+      // Nothing left this process, so the outcome is not in doubt.
+      throw new BridgeUnreachableError(
+        "Remote bridge is offline. Make sure the bridge is running.",
+        false
+      );
     }
     const id = Math.random().toString(36).substring(2, 15);
     const timeoutMs = optsRpc.timeoutMs ?? 30_000;

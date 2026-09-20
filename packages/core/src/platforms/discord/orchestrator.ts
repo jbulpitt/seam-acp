@@ -2285,7 +2285,7 @@ export class Orchestrator {
    * Separate from the timer so a test can drive exactly one pass.
    */
   async sweepWedgedQueues(): Promise<string[]> {
-    const enabled = this.config.CHANNEL_QUEUE_AUTO_RECOVER !== false;
+    const enabled = this.config?.CHANNEL_QUEUE_AUTO_RECOVER !== false;
     const recovered: string[] = [];
     for (const channelRef of this.wedgeSweepCandidates()) {
       let health: ChannelQueueHealth;
@@ -2333,7 +2333,11 @@ export class Orchestrator {
   }
 
   private watchQueueWedges(): void {
-    const seconds = this.config.CHANNEL_QUEUE_SWEEP_SECONDS ?? 60;
+    // Optional-chained deliberately: `install()` runs in harnesses that build
+    // an Orchestrator without a config, and an eager dereference here threw
+    // during install rather than at the first sweep — turning a background
+    // timer into a startup crash.
+    const seconds = this.config?.CHANNEL_QUEUE_SWEEP_SECONDS ?? 60;
     if (seconds <= 0) return;
     this.queueSweepTimer = setInterval(() => {
       void this.sweepWedgedQueues().catch((err) =>

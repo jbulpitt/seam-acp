@@ -29,7 +29,12 @@ const servers: Server[] = [];
 const sockets: WebSocket[] = [];
 
 afterEach(async () => {
-  for (const s of sockets.splice(0)) { try { s.terminate(); } catch { /* gone */ } }
+  for (const s of sockets.splice(0)) {
+    try { s.removeAllListeners(); s.on("error", () => {}); s.terminate(); } catch { /* gone */ }
+  }
+  // Let in-flight handshakes settle before the servers go, so nothing rejects
+  // into an empty listener set.
+  await new Promise((r) => setTimeout(r, 20));
   for (const s of servers.splice(0)) await new Promise<void>((r) => s.close(() => r()));
 });
 
@@ -59,6 +64,10 @@ async function connectedPair(liveness?: {
   const serverWs = await new Promise<WebSocket>((resolve) => {
     wss.on("connection", (ws) => resolve(ws as never));
     const c = new WebSocket(`ws://127.0.0.1:${port}`);
+    // Teardown terminates these; a socket still mid-handshake then emits
+    // "closed before the connection was established", which vitest counts as
+    // an unhandled error even though every test passed. Own it here.
+    c.on("error", () => {});
     sockets.push(c as never);
   });
   const clientWs = [...wss.clients][0] as never as WebSocket;

@@ -59,6 +59,43 @@ with one spare for review and verification.
 **Critical path:** #440 → #441 → #448 → #450 → #454. Start #440 and #455 immediately;
 everything else queues behind one of them.
 
+## Cost here is quota burn, not dollars
+
+Compute is prepaid on subsidised plans, so the scarce resource is **per-provider quota**,
+and the buckets are independent. Spreading the epic across providers is therefore a
+capacity strategy in itself — four independent weekly allowances beat one.
+
+**Check `agent_quota` before dispatching a wave.** Percentages move; the mapping below
+does not.
+
+Which bucket each model draws from:
+
+- **Fable 5.1, Opus 5** → `claude` (and `claude-vertex`, a second Anthropic bucket that
+  reports no quota and is available as an overflow valve)
+- **Astra, Sol** → `codex` or `copilot`
+- **Grok 4.6** → `grok`, or `copilot`
+- **Gemini 3.8 Flash High** → `agy`
+
+Two consequences that are easy to get backwards:
+
+**Astra is not the quota-cheap top tier.** It draws on `codex` and `copilot`, which at the
+time of writing were the two most-burned buckets (35% with zero credits, and 53%
+respectively) while `claude` sat at 19%. Steering premium work to Astra to protect
+Anthropic quota pushes it onto tighter allowances. Astra earns its three stories on
+capability, not on headroom — dispatch it deliberately, not as a default.
+
+**Grok is close to free capacity.** Its own `grok` bucket was at 5%, uncontended by
+anything else in the pool. That reinforces its role as the default far more than price
+does.
+
+**`agy` is almost entirely untapped** — under 1% weekly. Nothing in this epic is assigned
+to it, but it is the obvious home for any low-stakes or parallel-verification work that
+appears, and for absorbing overflow when another bucket tightens.
+
+When a bucket crosses roughly 70% weekly, move its work rather than finishing the wave —
+`copilot` in particular is shared by three of the four models here, so it tightens fastest
+and takes the most options down with it.
+
 ## Model assignment
 
 Grounded in measured coding index and agentic benchmarks, not general intelligence rank.

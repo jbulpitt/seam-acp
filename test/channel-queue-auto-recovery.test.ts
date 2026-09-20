@@ -162,6 +162,27 @@ describe("#423 a wedged thread self-heals without an operator", () => {
     expect(store.listConfigMutations()).toHaveLength(0);
   });
 
+  it("leaves a wedge it cannot safely replay to a human, and does not claim success", async () => {
+    // The boundary #423 asks to be stated explicitly. `recoverChannel` refuses
+    // a legacy `running` admission that has no frozen execution identity,
+    // because replaying it is not provably safe. The sweep must report that as
+    // NOT recovered — counting a refusal as a fix would restore the original
+    // failure with a reassuring log line on top, which is worse than silence.
+    const { host } = makeHost();
+    admitStale("306");
+    // Exactly the shape recoverChannel refuses: state=running, no attempt row.
+    (store as never as { db: { prepare(q: string): { run(...a: unknown[]): unknown } } })
+      .db.prepare("UPDATE inbound_admissions SET state='running' WHERE message_id=?")
+      .run("306");
+    expect(host.inspectChannelQueue(CHANNEL).state).toBe("wedged");
+
+    expect(await host.sweepWedgedQueues()).toEqual([]);
+    // Nothing was fenced and no epoch moved, so a human still has a thread to
+    // look at rather than a silently-altered one.
+    expect(store.listConfigMutations()).toHaveLength(0);
+    expect(store.getInbound("306")?.state).toBe("running");
+  });
+
   it("detects but does not repair when auto-recovery is switched off", async () => {
     // Degrading to visibility, not back to silence.
     const { host } = makeHost({ CHANNEL_QUEUE_AUTO_RECOVER: false });

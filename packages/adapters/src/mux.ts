@@ -308,7 +308,15 @@ export function makeMux(opts: {
     newWs.on("ping", sawTraffic);
     newWs.on("pong", sawTraffic);
 
-    const liveness = setInterval(() => {
+    // Liveness needs a socket that can be PROBED. `attach()` also accepts
+    // minimal stand-ins (tests, and any future non-ws transport), and a monitor
+    // that assumed the full API turned one missing method into a throw inside
+    // attach — taking down the connection it was meant to protect. What is
+    // refused when these are absent is liveness detection for that one socket;
+    // message routing, RPC, spawn and the close/error settlement all continue.
+    const canProbe = typeof (newWs as { ping?: unknown }).ping === "function"
+      && typeof (newWs as { terminate?: unknown }).terminate === "function";
+    const liveness = canProbe ? setInterval(() => {
       try {
         if (newWs.readyState !== WebSocket.OPEN) return;
         const now = Date.now();
@@ -330,11 +338,13 @@ export function makeMux(opts: {
       } catch {
         // A throwing timer would take down the process for one bad socket.
       }
-    }, tickMs);
-    if (typeof liveness.unref === "function") liveness.unref();
-    const stopLiveness = (): void => clearInterval(liveness);
-    newWs.once("close", stopLiveness);
-    newWs.once("error", stopLiveness);
+    }, tickMs) : null;
+    if (liveness && typeof liveness.unref === "function") liveness.unref();
+    const stopLiveness = (): void => { if (liveness) clearInterval(liveness); };
+    // `on`, not `once`: the stand-ins above implement only `on`, and
+    // clearInterval is idempotent so a repeat call costs nothing.
+    newWs.on("close", stopLiveness);
+    newWs.on("error", stopLiveness);
 
     newWs.on("message", (raw) => {
       sawTraffic();

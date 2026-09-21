@@ -207,6 +207,14 @@ describe("#440 journal corpus — Copilot and capability absence", () => {
 });
 
 describe("#440 journal corpus — agy", () => {
+  it("keeps an unrecognised AGY diagnostic visible as unclassified", () => {
+    expectKind(
+      classifyAgyError(new Error("future AGY failure shape 481")),
+      "unclassified",
+      "agy",
+    );
+  });
+
   it("maps native AGY protocol_error data.code, not the Internal error prefix", () => {
     const err = requestError("Internal error: native AGY protocol_error", { code: "protocol_error" });
     expectKind(classifyAgyError(err), "protocol_error", "agy");

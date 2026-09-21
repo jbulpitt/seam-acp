@@ -19,7 +19,11 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import pino from "pino";
-import { AGY_QUOTA_PROBE_TIMEOUT_MS, fetchAgyUserStatus } from "@seam/adapters";
+import {
+  AGY_QUOTA_PROBE_TIMEOUT_MS,
+  fetchAgyUserStatus,
+  readErrorClassification,
+} from "@seam/adapters";
 import {
   AgentQuotaPoller,
   createAgentQuotaSources,
@@ -127,6 +131,26 @@ describe("#361 the agy quota refresh issues no model turn", () => {
     const { runtime } = agyFixture({ SEAM_AGY_QUOTA_500S: "3" });
     const usage = await fetchAgyUserStatus(runtime);
     expect(usage.groups[0]?.buckets[0]?.window).toBe("weekly");
+  }, 30_000);
+
+  it("#481 reports an unknown prompt-free probe failure as unclassified", async () => {
+    // A closed connection becomes an otherwise-unrecognised callback failure
+    // on the real quota path. Removing the classification-before-discard step
+    // changes this to `protocol_error`; retaining the callback text leaks the
+    // transport diagnostic through a credential-adjacent boundary.
+    const { runtime } = agyFixture({ SEAM_AGY_QUOTA_DROP_CONNECTION: "1" });
+    const caught = await fetchAgyUserStatus(runtime).then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+
+    expect(caught).toBeInstanceOf(Error);
+    expect(readErrorClassification(caught)).toMatchObject({
+      agentId: "agy",
+      errorKind: "unclassified",
+    });
+    expect(String(caught)).toContain("native AGY lifecycle failed");
+    expect(String(caught)).not.toContain("fetch failed");
   }, 30_000);
 });
 

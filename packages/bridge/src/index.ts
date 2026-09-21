@@ -326,8 +326,9 @@ function makeSlotManager(opts: {
     );
 
     // #456: fd 2 was piped and nothing ever read it, so the kernel pipe buffer
-    // filled at 64 KiB and the child blocked on its next write to stderr —
-    // a live process that has stopped producing output, which is exactly what
+    // filled — 64 KiB on Linux, smaller to start on Darwin — and the child
+    // blocked on its next write to stderr. That is a live process which has
+    // stopped producing output, which is exactly what
     // a hung agent looks like from seam-acp. Attaching this handler is what
     // keeps the pipe flowing; the ring is what turns the bytes into a cause we
     // can report instead of infer.

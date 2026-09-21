@@ -113,7 +113,8 @@ describe.sequential("R5 native production lifecycle", () => {
     const f = await fixture();
     const log = vi.spyOn(console, "error").mockImplementation(() => {});
     try {
-      await expect(f.runtime.prompt("r5-stream-partial")).rejects.toThrow("unauthenticated: missing CSRF token");
+      // Assert the adapter attempt, not #448's surrounding recovery budget.
+      await expect(f.runtime.prompt("r5-stream-partial", undefined, { recoveryScope: "ephemeral" })).rejects.toThrow("unauthenticated: missing CSRF token");
       const emitted = JSON.stringify(f.events);
       expect(emitted).toContain("PARTIAL STREAM");
       expect(emitted).not.toContain("STDOUT ONLY");
@@ -125,7 +126,7 @@ describe.sequential("R5 native production lifecycle", () => {
   it.each([["r5-stream-exit", "exited_early"], ["r5-stream-overflow", "output_overflow"], ["r5-stream-hang", "timeout"]])(
     "#371 fallback retains lifecycle bounds for %s", async (prompt, code) => {
       const f = await fixture(3);
-      try { await expect(f.runtime.prompt(prompt)).rejects.toThrow(code); }
+      try { await expect(f.runtime.prompt(prompt, undefined, { recoveryScope: "ephemeral" })).rejects.toThrow(code); }
       finally { await f.close(); }
     }, 15_000,
   );
@@ -165,7 +166,9 @@ describe.sequential("R5 native production lifecycle", () => {
     const f = await fixture(prompt === "r5-no-ls" ? 2 : 10);
     try {
       const start = Date.now();
-      const error = await f.runtime.prompt(prompt).then(() => "unexpected success", error => String(error));
+      // Per-attempt lifecycle bounds also protect isolated dispatches. A live
+      // conversation may now recover; its total budget is tested in #448.
+      const error = await f.runtime.prompt(prompt, undefined, { recoveryScope: "ephemeral" }).then(() => "unexpected success", error => String(error));
       expect(error).toContain(code);
       expect(Date.now() - start).toBeLessThan(5000);
       const row = f.rows().find(row => row.prompt === prompt)!;
@@ -280,7 +283,7 @@ describe.sequential("R5 native production lifecycle", () => {
   it("bounds structured stdout before retaining it as a result", async () => {
     const f = await fixture();
     try {
-      await expect(f.runtime.prompt("r5-stdout", undefined, { jsonSchema: { type: "object" } })).rejects.toThrow("output_overflow");
+      await expect(f.runtime.prompt("r5-stdout", undefined, { jsonSchema: { type: "object" }, recoveryScope: "ephemeral" })).rejects.toThrow("output_overflow");
       const row = f.rows().find(row => row.prompt === "r5-stdout")!;
       expect(alive(row.pid!)).toBe(false);
       expect(f.events.some(event => event.kind === "agent-text")).toBe(false);

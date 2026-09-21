@@ -17,10 +17,11 @@ import { DispatchAcquisitionPhase } from "../packages/core/src/core/dispatch/acq
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
 
-const calls: { load: string[]; neu: number; prompts: string[] } = {
+const calls: { load: string[]; neu: number; prompts: string[]; scopes: unknown[] } = {
   load: [],
   neu: 0,
   prompts: [],
+  scopes: [],
 };
 let beforeOutcome: (() => void) | undefined;
 let acquisitionFailure: "start" | "load" | "new" | undefined;
@@ -43,8 +44,9 @@ vi.mock("../packages/core/src/agents/agent-runtime.js", async (importOriginal) =
         return { sessionId: opts.sessionId };
       }
       onEvent(): void {}
-      async prompt(p: string): Promise<{ stopReason: string }> {
+      async prompt(p: string, _attachments?: unknown, opts?: { recoveryScope?: string }): Promise<{ stopReason: string }> {
         calls.prompts.push(p);
+        calls.scopes.push(opts?.recoveryScope);
         beforeOutcome?.();
         return { stopReason: "end_turn" };
       }
@@ -80,6 +82,7 @@ beforeEach(() => {
   calls.load = [];
   calls.neu = 0;
   calls.prompts = [];
+  calls.scopes = [];
   beforeOutcome = undefined;
   acquisitionFailure = undefined;
 });
@@ -138,6 +141,7 @@ describe("injectTurn isolated resumeSessionId", () => {
         mayDeleteSession: () => completed, onCleanup: () => { throw new Error("synthetic observability failure"); } } });
     expect(completed).toBe(true);
     expect(deleteSession).toHaveBeenCalledExactlyOnceWith(dir, "acp-NEW");
+    expect(calls.scopes).toEqual(["ephemeral"]); // #448: production inject path, not just runtime unit options.
   });
 
   it("suspension retains isolated provider material; completion deletes it only after winning", async () => {

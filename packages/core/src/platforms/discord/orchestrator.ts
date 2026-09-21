@@ -3937,6 +3937,10 @@ export class Orchestrator {
           );
         }
         switch (event.kind) {
+          case "recovery": {
+            await this.adapter.sendMessage(msg.channel, event.message);
+            return;
+          }
           case "async-user-input": {
             await this.elicitations.createCodexAsync(record, event);
             return;
@@ -4402,8 +4406,9 @@ export class Orchestrator {
         const resolution = resolveError(
           readErrorClassification(promptErr) ?? unclassified(record.agentId), DEFAULT_ERROR_RULES);
         this.logger.warn({ session: record.id, resolution }, "turn recovery resolved");
-        // No-output is not proof that no tools ran. Owned human input is never
-        // transparently replayed, including a rate limit after submission.
+        // Same-session recovery has already run inside AgentRuntime. No output
+        // is not proof that no tools ran: owned input must not now be replayed
+        // on a replacement session. Report this outcome, without another owner.
         if (humanAttempt) throw promptErr;
         this.assertQueueFence(queueFence);
         if (isSessionGoneError(promptErr)) {
@@ -4426,30 +4431,11 @@ export class Orchestrator {
           acpUsageReceived = false;
           activeRuntime.onEvent(eventHandler);
           result = await raceWithTimeout(activeRuntime.prompt(promptText, promptAttachments), timeoutMs);
-        } else if (resolution.action === "recover" && resolution.errorKind === "rate_limit" && resolution.transience === "transient"
-          && resolution.startRung === 1 && !textSent && !textBuffer) {
-          // Transient server-side throttle with nothing emitted yet: the session
-          // is intact, so back off and retry the SAME prompt on the SAME runtime
-          // (no invalidate). Guarded on no-output-yet so a mid-stream limit can't
-          // double-emit — if output already started we fall through and surface
-          // it. Schedule clears typical brief throttles invisibly.
-          let rlResult: PromptOutcome | "timeout" | undefined;
-          for (const backoffMs of [2_000, 5_000, 10_000]) {
-            this.logger.warn({ session: record.id, backoffMs }, "rate limited before output; backing off and retrying");
-            await new Promise((r) => setTimeout(r, backoffMs));
-            try {
-              rlResult = await raceWithTimeout(activeRuntime.prompt(promptText, promptAttachments), timeoutMs);
-              break;
-            } catch (rlErr) {
-              const retryResolution = resolveError(
-                readErrorClassification(rlErr) ?? unclassified(record.agentId), DEFAULT_ERROR_RULES);
-              if (retryResolution.action !== "recover" || retryResolution.errorKind !== "rate_limit" || retryResolution.transience !== "transient"
-                || retryResolution.startRung !== 1) throw rlErr; // a different failure — surface it
-            }
-          }
-          if (rlResult === undefined) throw promptErr; // still throttled after backoff
-          result = rlResult;
         } else {
+          // #448: AgentRuntime owns the bounded prompt budget, including turns
+          // with output. Refuse only an exhausted operation and report it here;
+          // the thread/session stay usable. Starting another loop would multiply
+          // that budget (#421/#424's failure mode), not improve recovery.
           throw promptErr;
         }
       }
@@ -5500,10 +5486,15 @@ export class Orchestrator {
       opts.lifecycle?.acquire ? opts.lifecycle.acquire(operation) : operation();
     const runPrompt = async (rt: AgentRuntime): Promise<PromptOutcome | "timeout"> => {
       opts.lifecycle?.beforePrompt();
+      // ACP ids for isolated runtimes are provider-generated, not necessarily
+      // `dispatch:` prefixed. Carry isolation explicitly: refuse automatic
+      // outward-effect replay while live transcript continuations keep working.
+      const promptOptions = { ...(opts.jsonSchema ? { jsonSchema: opts.jsonSchema } : {}),
+        recoveryScope: opts.session === "isolated" ? "ephemeral" as const : "conversation" as const };
       return opts.timeoutMs === undefined
-        ? await rt.prompt(prompt, attachments, opts.jsonSchema ? { jsonSchema: opts.jsonSchema } : undefined)
+        ? await rt.prompt(prompt, attachments, promptOptions)
         : await raceWithTimeout(
-            rt.prompt(prompt, attachments, opts.jsonSchema ? { jsonSchema: opts.jsonSchema } : undefined),
+            rt.prompt(prompt, attachments, promptOptions),
             opts.timeoutMs
           );
     };
@@ -9676,6 +9667,10 @@ export class Orchestrator {
           // the whole answer regardless.
           onEvent: async (event) => {
             if (!this.queueFenceCurrent(queueFence)) return;
+            if (event.kind === "recovery") {
+              await this.adapter.sendMessage(target, event.message);
+              return;
+            }
             // Questions are interactive control events, not optional status
             // output. Refuse only an unanswerable question; keep work running.
             if (event.kind === "async-user-input") {

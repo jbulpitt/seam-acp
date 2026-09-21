@@ -258,7 +258,8 @@ describe("AgentRuntime resume-replay suppression", () => {
     await h.rt.loadSession({ sessionId: "s9", cwd: "/tmp" });
     h.conn.promptShouldReject = true;
     h.conn.promptUpdates = [agentChunk("STALE held content before the crash.")];
-    await expect(h.rt.prompt(PROMPT)).rejects.toBeTruthy();
+    // Exercise abnormal teardown of one attempt, not the #448 retry budget.
+    await expect(h.rt.prompt(PROMPT, undefined, { recoveryScope: "ephemeral" })).rejects.toBeTruthy();
     // No stopReason ever resolved ⇒ treated as abnormal ⇒ buffer dropped.
     expect(h.agentText()).toEqual([]);
   });

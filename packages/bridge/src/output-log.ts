@@ -177,9 +177,17 @@ export function createOutputLog(options: OutputLogOptions = {}): OutputLog {
       while (log.frames.length && log.frames[0]!.seq <= throughSeq) {
         const frame = log.frames.shift()!;
         totalBytes -= frame.bytes;
-        // Acked frames are NOT a gap — the consumer has them. Advancing
-        // `droppedThrough` here would report a gap on the next reconnect for
-        // output that was delivered successfully.
+        // These frames really are gone, so record it. Mutation testing caught
+        // the earlier version, which deliberately did NOT — on the theory that
+        // an acked frame can never be missed. That is only true for the
+        // consumer that acked: a cursor RESET back before `throughSeq` would
+        // have been handed the later frames with no indication that anything
+        // preceded them, which is the silent discontinuity this whole design
+        // exists to prevent.
+        //
+        // It costs nothing in the normal case, because that consumer's cursor
+        // is at or beyond `throughSeq` and `since()` compares against it.
+        log.droppedThrough = Math.max(log.droppedThrough, frame.seq);
       }
     },
 

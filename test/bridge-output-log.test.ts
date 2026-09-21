@@ -22,6 +22,7 @@
  */
 import { describe, expect, it } from "vitest";
 import { createOutputLog, createLineFramer } from "../packages/bridge/src/output-log.js";
+import { muxSend, forwardAgentStdout } from "../packages/bridge/src/frame-out.js";
 
 const frame = (n: number) => ({ data: `line-${n}\n` });
 
@@ -159,5 +160,68 @@ describe("#444 line framing", () => {
     const framer = createLineFramer(16);
     expect(framer.push("x".repeat(20))).toEqual(["x".repeat(20)]);
     expect(framer.pending()).toBe(0);
+  });
+});
+
+describe("#444 an acked-then-trimmed range is still a gap to a reset cursor", () => {
+  it("does not hand a rewound consumer later frames as if nothing preceded them", () => {
+    // Found by mutation. The first version treated acked frames as "can never
+    // be missed", which holds only for the consumer that acked. A cursor that
+    // resets to 0 has genuinely not seen 1-3, and they are gone.
+    const log = createOutputLog();
+    for (let i = 1; i <= 5; i += 1) log.append(1, "data", frame(i));
+    log.ack(1, 3);
+    const rewound = log.since(1, 0);
+    expect(rewound.gap).toMatchObject({ afterSeq: 0, firstAvailableSeq: 4 });
+    expect(rewound.frames.map((f) => f.seq)).toEqual([4, 5]);
+  });
+
+  it("still reports no gap to the consumer that did the acking", () => {
+    const log = createOutputLog();
+    for (let i = 1; i <= 5; i += 1) log.append(1, "data", frame(i));
+    log.ack(1, 3);
+    expect(log.since(1, 3).gap).toBeUndefined();
+  });
+});
+
+describe("#444 the wiring, which had no test until mutation said so", () => {
+  // Three mutations survived a full suite while this was inline in `index.ts`:
+  // not logging when the socket was closed, dropping `seq` from the wire, and
+  // forwarding raw chunks. Each is exactly the bug this story fixes.
+  const openWs = () => {
+    const sent: string[] = [];
+    return { sent, ws: { readyState: 1, send: (raw: string) => sent.push(raw) } };
+  };
+  const CTOR = { OPEN: 1 } as never;
+
+  it("records output even when the socket is CLOSED — the whole point", () => {
+    const log = createOutputLog();
+    const closed = { readyState: 3, send: () => { throw new Error("must not send"); } };
+    muxSend(closed as never, CTOR, 1, "data", { data: "while-down\n" }, log);
+    expect(log.since(1, 0).frames.map((f) => f.payload.data)).toEqual(["while-down\n"]);
+  });
+
+  it("records nothing when no log is supplied, so other callers are unchanged", () => {
+    const { ws, sent } = openWs();
+    muxSend(ws as never, CTOR, 1, "kill", {});
+    expect(JSON.parse(sent[0]!)).toEqual({ slot: 1, type: "kill" });
+    expect(JSON.parse(sent[0]!)).not.toHaveProperty("seq");
+  });
+
+  it("puts the sequence on the wire so the consumer can cursor on it", () => {
+    const { ws, sent } = openWs();
+    const log = createOutputLog();
+    muxSend(ws as never, CTOR, 2, "data", { data: "a\n" }, log);
+    muxSend(ws as never, CTOR, 2, "data", { data: "b\n" }, log);
+    expect(sent.map((raw) => JSON.parse(raw).seq)).toEqual([1, 2]);
+  });
+
+  it("forwards whole lines, never a partial one", () => {
+    const framer = createLineFramer();
+    const out: string[] = [];
+    forwardAgentStdout(Buffer.from('{"a":1}\n{"b":'), framer, (l) => out.push(l));
+    expect(out).toEqual(['{"a":1}\n']);
+    forwardAgentStdout(Buffer.from('2}\n'), framer, (l) => out.push(l));
+    expect(out).toEqual(['{"a":1}\n', '{"b":2}\n']);
   });
 });

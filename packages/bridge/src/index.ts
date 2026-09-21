@@ -57,6 +57,7 @@ import {
 import { dispatchBridgeRpc, type SlotSpawnConfig } from "./rpc.js";
 import { slotHealthSnapshot } from "./slot-health.js";
 import { createOutputLog, createLineFramer } from "./output-log.js";
+import { muxSend, forwardAgentStdout } from "./frame-out.js";
 import { BridgeMcpInputRewriter } from "./mcp-injection.js";
 import {
   inventoryFromAdapters,
@@ -224,27 +225,6 @@ function spawnAgent(
  *   "kill"  — seam-acp → bridge: terminate agent for this slot
  *   "exit"  — bridge → seam-acp: agent exited
  */
-function muxSend(
-  ws: WsSocket | null,
-  WebSocket: WsCtor,
-  slot: number,
-  type: string,
-  payload: Record<string, unknown>,
-  /**
-   * #444: when given, the frame is recorded BEFORE the socket is consulted and
-   * carries its `seq` on the wire. The early return below used to discard
-   * output whenever the socket was not OPEN, while stdin in the other
-   * direction was queued and replayed — the asymmetry this story removes.
-   *
-   * An older seam-acp ignores the extra `seq` field, so tagging is safe on a
-   * mixed-version fleet.
-   */
-  log?: { append(slot: number, type: string, payload: Record<string, unknown>): number },
-) {
-  const seq = log?.append(slot, type, payload);
-  if (!ws || ws.readyState !== WebSocket.OPEN) return;
-  ws.send(JSON.stringify({ slot, type, ...payload, ...(seq === undefined ? {} : { seq }) }));
-}
 
 /**
  * Create a slot manager that multiplexes multiple agent processes over one WS.
@@ -351,9 +331,9 @@ function makeSlotManager(opts: {
       lastStdoutAt.set(slot, Date.now());
       // One frame per complete line. A partial tail is held until its newline
       // arrives, so a frame is always a whole JSON-RPC message.
-      for (const line of framer.push(chunk.toString("utf8"))) {
-        muxSend(currentWs, WebSocket, slot, "data", { data: line }, outputLog);
-      }
+      forwardAgentStdout(chunk, framer, (line) =>
+        muxSend(currentWs, WebSocket, slot, "data", { data: line }, outputLog)
+      );
     });
 
     agent.on("error", (err) => {

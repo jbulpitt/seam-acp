@@ -13,6 +13,7 @@ const TARGET_KEYS = new Set([
   "sshAlias", "pm2App", "verifyAgent", "checkoutPath", "entrypointPath",
   "expectedUid", "nodePath", "pm2ModulePath", "workspaceArg",
   "devMode", "releaseRoot", "rolloutEnabled", "unmanagedReason",
+  "launcher", "launcherPath",
 ]);
 const SAFE_REASON = /^[A-Za-z0-9][A-Za-z0-9 .,:;#/_()-]{0,255}$/;
 
@@ -45,17 +46,29 @@ export function validateTargetMap(input) {
     }
     if (!SAFE_NAME.test(value.sshAlias ?? "")) throw new Error(`unsafe SSH alias for ${bridgeId}`);
     if (value.unmanagedReason !== undefined) throw new Error(`enabled target ${bridgeId} must not declare an unmanaged reason`);
-    if (!SAFE_NAME.test(value.pm2App ?? "")) throw new Error(`unsafe PM2 app for ${bridgeId}`);
+    const launcher = value.launcher ?? "pm2";
+    if (launcher !== "pm2" && launcher !== "systemd") throw new Error(`unsafe launcher for ${bridgeId}`);
+    if (!SAFE_NAME.test(value.pm2App ?? "")) {
+      throw new Error(launcher === "systemd" ? `unsafe systemd unit for ${bridgeId}` : `unsafe PM2 app for ${bridgeId}`);
+    }
     if (!SAFE_NAME.test(value.verifyAgent ?? "")) throw new Error(`unsafe verification agent for ${bridgeId}`);
     if (!Number.isInteger(value.expectedUid) || value.expectedUid < 1 || value.expectedUid > 0x7fffffff) throw new Error(`unsafe expected UID for ${bridgeId}`);
     if (typeof value.devMode !== "boolean") throw new Error(`missing devMode identity for ${bridgeId}`);
-    for (const key of ["checkoutPath", "entrypointPath", "nodePath", "pm2ModulePath", "releaseRoot"]) exactAbsolute(value[key], `${key} for ${bridgeId}`);
+    const pathKeys = launcher === "systemd"
+      ? ["checkoutPath", "entrypointPath", "nodePath", "releaseRoot", "launcherPath"]
+      : ["checkoutPath", "entrypointPath", "nodePath", "pm2ModulePath", "releaseRoot"];
+    for (const key of pathKeys) exactAbsolute(value[key], `${key} for ${bridgeId}`);
+    if (launcher === "pm2") {
+      if (value.launcherPath !== undefined) throw new Error(`PM2 target ${bridgeId} must not declare a systemd launcher path`);
+    } else if (value.pm2ModulePath !== undefined) {
+      throw new Error(`systemd target ${bridgeId} must not declare a PM2 module`);
+    }
     if (value.workspaceArg !== null) exactAbsolute(value.workspaceArg, `workspaceArg for ${bridgeId}`);
     if (value.entrypointPath !== `${value.checkoutPath}/packages/bridge/dist/index.js`) throw new Error(`entrypoint is not the managed stable launcher for ${bridgeId}`);
     if (value.releaseRoot === value.checkoutPath || value.releaseRoot.startsWith(`${value.checkoutPath}/`) || value.checkoutPath.startsWith(`${value.releaseRoot}/`)) {
       throw new Error(`checkout and release roots overlap for ${bridgeId}`);
     }
-    targets.set(bridgeId, { bridgeId, ...value });
+    targets.set(bridgeId, { bridgeId, launcher, ...value });
   }
   return targets;
 }
@@ -145,7 +158,8 @@ function targetArgs(target) {
   return [
     target.bridgeId, target.pm2App, target.verifyAgent, String(target.expectedUid),
     target.checkoutPath, target.entrypointPath, target.nodePath,
-    target.pm2ModulePath, target.workspaceArg ?? "-", target.devMode ? "yes" : "no", target.releaseRoot,
+    target.pm2ModulePath ?? "-", target.workspaceArg ?? "-", target.devMode ? "yes" : "no", target.releaseRoot,
+    target.launcher ?? "pm2", target.launcherPath ?? "-",
   ];
 }
 
@@ -358,6 +372,8 @@ export async function runPreflight(target, remoteScript, run = commandRunner) {
   const result = await run(command);
   const report = parseKeyValues(result.stdout);
   if (report.bridge_id !== target.bridgeId || report.pm2_app !== target.pm2App || report.identity_bound !== "yes" || report.remote_mutation !== "no") throw new Error("remote deployment identity did not match the operator mapping");
+  if (report.launcher !== (target.launcher ?? "pm2")) throw new Error("remote launcher identity did not match the operator mapping");
+  if ((target.launcher ?? "pm2") === "systemd" && report.launcher_path !== target.launcherPath) throw new Error("remote systemd launcher path did not match the operator mapping");
   if (!/^[a-z0-9._-]+$/.test(report.platform ?? "") || !/^(managed|legacy-checkout)$/.test(report.artifact_mode ?? "") || !CHECKSUM.test(report.entrypoint_sha256 ?? "")) throw new Error("remote artifact identity evidence is incomplete");
   if (report.artifact_mode === "managed" && (!SHA.test(report.artifact_source_sha ?? "") || !CHECKSUM.test(report.artifact_checksum ?? "") || report.checkout_source_sha !== "not-applicable" || report.artifact_identity !== `${report.artifact_source_sha}:${report.artifact_checksum}`)) throw new Error("managed artifact checksum evidence is incomplete");
   if (report.artifact_mode === "legacy-checkout" && (report.artifact_source_sha !== "unmanaged" || report.artifact_checksum !== "unmanaged" || !SHA.test(report.checkout_source_sha ?? "") || report.artifact_identity !== `entrypoint-sha256:${report.entrypoint_sha256}`)) throw new Error("legacy checkout artifact evidence is incomplete");

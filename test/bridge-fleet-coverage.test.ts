@@ -31,12 +31,11 @@ describe("#413 bridge fleet accounting", () => {
     const registered = validateBridgeRegistry(registeredShape);
     const fleet = describeTargetFleet(targetMap, registered);
     expect(fleet.registered).toHaveLength(10);
-    expect(fleet.rolloutManaged).toEqual(["home-hub", "macbook-air", "macbook-pro", "media-server", "rhc-server"]);
+    expect(fleet.rolloutManaged).toEqual(["fhr-server", "home-hub", "macbook-air", "macbook-pro", "media-server", "plex-server", "rhc-server"]);
     expect(fleet.rolloutExcluded.map((row) => row.id)).toEqual([
-      "alaina-laptop", "allie-laptop", "fhr-server", "jennifer-laptop", "plex-server",
+      "alaina-laptop", "allie-laptop", "jennifer-laptop",
     ]);
-    expect(fleet.rolloutExcluded.find((row) => row.id === "plex-server")?.reason).toMatch(/systemd.*dedicated/i);
-    expect(formatFleetCoverage(fleet, "media-server")).toContain("fleet_rollout_managed=5 of 10");
+    expect(formatFleetCoverage(fleet, "media-server")).toContain("fleet_rollout_managed=7 of 10");
     expect(formatFleetCoverage(fleet, "media-server")).toContain("operation_scope=1 of 10 registered hosts: media-server");
   });
 
@@ -78,7 +77,7 @@ describe("#413 bridge fleet accounting", () => {
       // Select an excluded target so even a mutation removing reconciliation
       // cannot cross the test boundary into SSH; it will stop at the ordinary
       // target refusal instead.
-      execFileSync(process.execPath, [path.join(root, "scripts/bridge-rollout.mjs"), "--target", "plex-server"], {
+      execFileSync(process.execPath, [path.join(root, "scripts/bridge-rollout.mjs"), "--target", "jennifer-laptop"], {
         cwd: root,
         env: { ...process.env, CHANNEL_PRESETS_FILE: registry },
         encoding: "utf8",
@@ -97,7 +96,7 @@ describe("#413 bridge fleet accounting", () => {
     let stdout = "";
     let stderr = "";
     try {
-      execFileSync(process.execPath, [path.join(root, "scripts/bridge-rollout.mjs"), "--target", "plex-server"], {
+      execFileSync(process.execPath, [path.join(root, "scripts/bridge-rollout.mjs"), "--target", "jennifer-laptop"], {
         cwd: root,
         env: { ...process.env, CHANNEL_PRESETS_FILE: registry },
         encoding: "utf8",
@@ -110,8 +109,8 @@ describe("#413 bridge fleet accounting", () => {
       stderr = e.stderr ?? "";
     }
     expect(stdout).toContain("fleet_registered=10");
-    expect(stdout).toContain("fleet_rollout_managed=5 of 10");
-    expect(stdout).toContain("fleet_excluded=plex-server: systemd launcher needs a dedicated activation and rollback contract");
-    expect(stderr).toMatch(/plex-server is explicitly excluded.*systemd launcher/);
+    expect(stdout).toContain("fleet_rollout_managed=7 of 10");
+    expect(stdout).toContain("fleet_excluded=jennifer-laptop: AGY-only host is outside the PM2 bridge rollout contract");
+    expect(stderr).toMatch(/jennifer-laptop is explicitly excluded.*AGY-only/);
   });
 });

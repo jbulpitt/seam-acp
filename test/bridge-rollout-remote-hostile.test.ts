@@ -48,7 +48,7 @@ async function writePm2(overrides: Record<string, unknown> = {}) {
 }
 
 function baseArgs(overrides: Partial<{ bridgeId:string; app:string; uid:string; checkout:string; entrypoint:string; releaseRoot:string }> = {}) {
-  return [overrides.bridgeId ?? "fixture", overrides.app ?? "fixture-app", "grok", overrides.uid ?? String(process.getuid!()), overrides.checkout ?? checkout, overrides.entrypoint ?? entrypoint, process.execPath, pm2Module, "-", "no", overrides.releaseRoot ?? releaseRoot];
+  return [overrides.bridgeId ?? "fixture", overrides.app ?? "fixture-app", "grok", overrides.uid ?? String(process.getuid!()), overrides.checkout ?? checkout, overrides.entrypoint ?? entrypoint, process.execPath, pm2Module, "-", "no", overrides.releaseRoot ?? releaseRoot, "pm2", "-"];
 }
 
 async function runRemote(action: string[], overrides = {}) {

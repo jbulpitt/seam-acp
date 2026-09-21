@@ -1,9 +1,10 @@
 # Remote bridge rollout runbook
 
-This is the reviewed update mechanism for receipt-capable, PM2-managed Seam
-bridges. It ships an exact committed artifact without remote Git, drains only
-with `SIGUSR2`, proves the replacement on its exact controller connection, and
-keeps rollback explicit and version-bound. It never restarts the controller.
+This is the reviewed update mechanism for receipt-capable Seam bridges, whether
+they run under PM2 or systemd. It ships an exact committed artifact without
+remote Git, drains only with `SIGUSR2`, proves the replacement on its exact
+controller connection, and keeps rollback explicit and version-bound. It never
+restarts the controller.
 
 A bare invocation is read-only. Every mutation requires `--apply`, one exact
 target, and one phase. There is no host loop, implicit rollback, PM2 restart or
@@ -21,15 +22,17 @@ operation; connected bridges, adapters, dispatches, and other hosts keep
 serving. Set `CHANNEL_PRESETS_FILE` when the live registry is not at
 `data/channel-presets.json` relative to the checkout.
 
-Every preflight prints the denominator: ten registered hosts, five managed by
-this rollout, and five excluded with a reason, plus the one selected host. A
+Every preflight prints the denominator: ten registered hosts, seven managed by
+this rollout, and three excluded with a reason, plus the one selected host. A
 successful selected-host preflight is therefore never presented as verification
 of an unnamed whole fleet.
 
-For each enabled bridge the target map pins the bridge ID, SSH alias, PM2 app,
-verification agent, UID, checkout/cwd, stable PM2 entrypoint, Node executable,
-PM2 module, optional workspace argument, and rollout root. None is overridable
-on the command line.
+For each enabled bridge the target map pins the bridge ID, SSH alias, supervisor
+name (`pm2App`: the PM2 app or the systemd unit), verification agent, UID,
+checkout/cwd, stable entrypoint, Node executable, optional workspace argument,
+and rollout root. PM2 hosts also pin the PM2 module. systemd hosts pin
+`launcher=systemd` and the `seam-bridge-launch.mjs` path instead. None is
+overridable on the command line.
 
 - `media-server` maps to SSH `media-server`, PM2 `remote-agent-bridge`, UID 501,
   checkout `/Users/jesse/seam-acp`, and rollout root
@@ -40,21 +43,26 @@ on the command line.
 - `macbook-pro` and `home-hub` are enabled PM2 targets alongside the two above.
 - Three AGY-only laptops retain SSH aliases but deliberately have no rollout
   identity and remain disabled.
-- `plex-server` and `fhr-server` are explicitly excluded: they are Linux x86_64
-  under systemd and launch wrappers, so the PM2 capture/activation/rollback
-  protocol does not apply.
+- `plex-server` and `fhr-server` are enabled systemd targets. They run
+  `~/.local/libexec/seam-bridge-launch.mjs`, which `import()`s the stable
+  checkout entrypoint; activation swaps that path for a stub into
+  `~/.seam/bridge-rollouts/releases/<sha>-<checksum>/` and signals `MainPID`
+  with `SIGUSR2`. The units already use `KillSignal=SIGUSR2` and
+  `Restart=always`, so the process restarts without sudo and without converting
+  the unit to a user session.
 - `rhc-server` is an enabled Linux aarch64 PM2 target with a verified rollout
   identity alongside the macOS PM2 targets.
 
 An excluded host remains in the fleet denominator and every attempted phase
 refuses with its recorded reason. Absence is not used to mean exclusion.
 
-Before any mutation, the remote program requires one PM2 record and proves that
-its PID equals the exact owned PID file; the process is alive, owned by the
-configured UID, running the exact Node executable, and has the exact checkout
-cwd; PM2 names the exact stable entrypoint, interpreter, bridge ID, and expected
-workspace argument; and all configured paths and owners are canonical. PM2
-arguments must match a supported bridge grammar. Secret argument values are
+Before any mutation, the remote program proves the live process identity. On
+PM2 hosts that is one PM2 record whose PID equals the owned PID file, with
+entrypoint/interpreter/argv matching the target map. On systemd hosts that is
+`systemctl show` of `MainPID` for the pinned unit, the process owned by the
+configured UID running the exact Node executable at the checkout cwd, and
+`/proc/<pid>/cmdline` naming the pinned launcher — not `systemctl restart`.
+All configured paths and owners are canonical. Secret argument values are
 compared in memory and never printed. Ambiguity, symlink escape, wrong owner,
 unexpected flags, or any mismatch refuses the phase.
 
@@ -247,10 +255,11 @@ The baseline record is `formatVersion: 2`, `kind: "enrolled-baseline"`. A
 version-1 record is refused rather than reinterpreted, across preflight,
 enrollment, restore and activation; re-running `--enroll` does not migrate one,
 it refuses it, so a host holding a v1 record must have it removed deliberately. It
-hardwires PM2, a Node runtime, a JavaScript checkout entrypoint and this exact
-runtime scope. A host that does not fit that shape — native artifacts, a
-different process manager — needs a genuinely separate version-3 capture and
-restore path, not extra fields bolted onto version 2.
+records a Node runtime, a JavaScript checkout entrypoint, this exact runtime
+scope, and a `processManager` snapshot whose `manager` is `pm2` or `systemd`.
+A host that does not fit that shape — native artifacts, a third supervisor —
+needs a genuinely separate version-3 capture and restore path, not extra
+fields bolted onto version 2.
 
 ### 1b. The FIRST managed activation, from an enrolled baseline
 

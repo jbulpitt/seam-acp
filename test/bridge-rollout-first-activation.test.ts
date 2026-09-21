@@ -109,7 +109,7 @@ async function makeFixture(options: { receipt?: "good" | "wrong-nonce" } = {}) {
   await fs.writeFile(pm2File, JSON.stringify({ pid: child.pid, pm_id: 0, pidFile, name: "fixture-app", cwd: checkout, entry, node, pm_uptime: Date.now() }));
 
   const shell = await renderRemoteScript(path.join(repo, "scripts/bridge-rollout-remote.sh"), path.join(repo, "scripts/bridge-rollout-remote.mjs"));
-  const base = ["fixture", "fixture-app", "grok", String(process.getuid!()), checkout, entry, node, pm2Module, "-", "no", releaseRoot];
+  const base = ["fixture", "fixture-app", "grok", String(process.getuid!()), checkout, entry, node, pm2Module, "-", "no", releaseRoot, "pm2", "-"];
   const run = (action: string[], timeoutMs = 60_000) =>
     commandRunner({ file: "/bin/sh", args: ["-s", "--", node, ...base, ...action], input: shell, timeoutMs });
 
@@ -182,6 +182,21 @@ describe.sequential("#288 first managed activation from an enrolled baseline", (
     const secondVerified = JSON.parse(await fs.readFile(path.join(f.releaseRoot, "activations", `${secondActivation}.verified.json`), "utf8"));
     expect(secondVerified.previous.kind).toBeUndefined();
     expect(secondVerified.previous).toMatchObject({ sourceSha: first.sourceSha, artifactChecksum: first.checksum });
+  }, 180_000);
+
+  it("rolls back when a workspace link realpaths onto the stubbed entrypoint", async () => {
+    const f = await makeFixture();
+    await fs.mkdir(path.join(f.checkout, "node_modules/@seam"), { recursive: true });
+    await fs.symlink(path.join(f.checkout, "packages/bridge"), path.join(f.checkout, "node_modules/@seam/bridge"));
+    await enroll(f);
+    const release = await f.stage("1".repeat(40), H("3"));
+    const activation = H("4");
+    await f.run(["activate", release.sourceSha, release.checksum, release.stageId, activation, "20", H("5")]);
+    const rolled = parseKeyValues((await f.run(["rollback", activation, H("9"), "20", H("a")])).stdout);
+    expect(rolled.rollback).toBe("verified");
+    expect(rolled.rollback_to).toBe("enrolled-baseline");
+    expect(await fs.realpath(f.entry)).toBe(f.entry);
+    expect((await fs.lstat(f.entry)).isSymbolicLink()).toBe(false);
   }, 180_000);
 
   it("rolls back onto the baseline with the strongest proof it can emit, recorded as reduced", async () => {

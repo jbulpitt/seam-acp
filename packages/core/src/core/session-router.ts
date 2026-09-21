@@ -1,5 +1,5 @@
 import path from "node:path";
-import { AgentRuntime, SessionLoadTimeoutError } from "../agents/agent-runtime.js";
+import { AgentRuntime, SessionLoadTimeoutError, type BridgeHealthSource } from "../agents/agent-runtime.js";
 import { asRemoteCatalogAdapter, type AgentProfile, type CatalogModelEvidence } from "@seam/adapters";
 import type { Logger } from "../lib/logger.js";
 import type { SessionStore } from "./session-store.js";
@@ -55,7 +55,7 @@ export interface SeamMcpWiring {
    */
   mcpServersForRemoteSpawn?: (sessionId: string) => McpServer | undefined;
   /** Mux of the connected bridge this session is bound to, if any. */
-  muxForSession?: (sessionId: string) => MuxHandle | undefined;
+  muxForSession?: (sessionId: string) => (MuxHandle & Partial<BridgeHealthSource>) | undefined;
   /**
    * Bind `sessionId` to a remote bridge id. Called on runtime start when the
    * thread preset's `location` is not `local`. Local stays unbound.
@@ -78,6 +78,7 @@ export interface RuntimeSpawnPlan {
   cwd: string;
   mcpServers: McpServer[];
   remote: boolean;
+  bridgeHealth?: Partial<BridgeHealthSource>;
   spawnChild: (
     model?: string,
     effort?: string
@@ -1247,6 +1248,7 @@ export class SessionRouter {
 
     let spawnChild: RuntimeSpawnPlan["spawnChild"] = (modelOverride, effortOverride) =>
       profile.spawn(modelOverride, effortOverride, mcpServers);
+    let bridgeHealth: RuntimeSpawnPlan["bridgeHealth"];
 
     if (remote) {
       const mux = this.seamMcp?.muxForSession?.(record.id);
@@ -1255,6 +1257,7 @@ export class SessionRouter {
           `Session ${record.id} is bound to a remote bridge that is not connected`
         );
       }
+      bridgeHealth = mux;
       spawnChild = (modelOverride, effortOverride) =>
         spawnRemoteSlot(mux, {
           mcpServers,
@@ -1276,6 +1279,7 @@ export class SessionRouter {
       cwd,
       mcpServers,
       remote,
+      bridgeHealth,
       spawnChild,
     };
   }
@@ -1313,6 +1317,7 @@ export class SessionRouter {
       logger: this.logger.child({ session: record.id }),
       mcpServers,
       spawnFn: plan.spawnChild,
+      bridgeHealth: plan.bridgeHealth,
       ...(effortDescriptor ? { effortDescriptor } : {}),
       onDead: () => {
         // Involuntary death — #76: leave turn markers intact. This is an

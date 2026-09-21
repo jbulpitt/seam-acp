@@ -1492,10 +1492,6 @@ async function rollbackToEnrolledBaseline(input) {
   if (state.record.enrollmentId !== previous.enrollmentId || state.record.baselineDigest !== previous.baselineDigest) {
     fail("rollback_baseline_identity_mismatch");
   }
-  // Before anything is changed: the surrounding tree must still be the one the
-  // baseline describes, or this is not a restore.
-  const verified = await verifyBaseline(state.record, null);
-  if (!verified.ok) fail(verified.reason);
 
   const started = Date.now(); const deadline = started + timeout * 1000;
   const intent = {
@@ -1516,13 +1512,27 @@ async function rollbackToEnrolledBaseline(input) {
   };
   await fsp.writeFile(`${releaseRoot}/rollbacks/${failedActivationId}-${rollbackId}.intent.json`, safeJson(intent), { flag: "wx", mode: 0o600 });
   safePhase = "baseline_rollback_restore";
-  // The baseline entrypoint is the checkout's own regular file, so it is written
-  // back rather than repointed.
+  // The tree digest follows realpath. A workspace or .bin link onto the
+  // stable entrypoint therefore hashes the live stub target during managed
+  // operation, which looks like drift even when only the entrypoint changed.
+  // Put the preserved bytes back first so the digest is comparable; if the
+  // surrounding tree still does not match, restore the stub and refuse
+  // without signalling.
+  const managedTarget = current.entryReal;
+  const restoreStub = async () => { await switchEntrypoint(managedTarget); };
   const temp = `${entrypointPath}.seam-rollback-${process.pid}`;
   await fsp.writeFile(temp, state.preservedBytes, { flag: "wx", mode: state.record.baseline.entrypointMode });
   await fsp.chmod(temp, state.record.baseline.entrypointMode);
   await fsp.rename(temp, entrypointPath);
-  if (hash(await fsp.readFile(entrypointPath)) !== previous.entrypointSha256) fail("rollback_entrypoint_mismatch");
+  if (hash(await fsp.readFile(entrypointPath)) !== previous.entrypointSha256) {
+    await restoreStub().catch(() => {});
+    fail("rollback_entrypoint_mismatch");
+  }
+  const verified = await verifyBaseline(state.record, { legacy: true });
+  if (!verified.ok) {
+    await restoreStub();
+    fail(verified.reason);
+  }
   process.kill(current.pid, "SIGUSR2");
   const newPid = await waitForReplacement(current.pid, timeout);
   safePhase = "baseline_rollback_prove";

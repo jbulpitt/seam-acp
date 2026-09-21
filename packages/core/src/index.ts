@@ -2,7 +2,15 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { loadConfig, isChannelLocked, resolveThreadLocation, resolveThreadTtsVoice, resolveThreadTtsPace, resolveThreadTtsStyle, adminParticipantOverlapIds, GROK_STATIC_MODELS, ZAI_STATIC_MODELS, OLLAMA_CLOUD_STATIC_MODELS } from "./config.js";
 import { enrichModelListWithKnownLimits } from "./core/context-window.js";
-import { hostEmoji, isLocalLocation } from "./core/location.js";
+import {
+  guardLocalProfileSpawn,
+  hostEmoji,
+  installAgentLocationDeny,
+  isAgentLocationDenied,
+  isLocalLocation,
+  LOCAL_LOCATION,
+  setAgentLocationDeny,
+} from "./core/location.js";
 import { LoopbackHost } from "./core/loopback-host.js";
 import { logger } from "./lib/logger.js";
 import { startHealthServer } from "./lib/health.js";
@@ -100,6 +108,7 @@ import { planAgyIdentityMigration, readAgyHandleOwnership } from "./core/agy-ide
 
 async function main(): Promise<void> {
   const config = loadConfig();
+  setAgentLocationDeny(config.AGENT_LOCATION_DENY);
   console.log(`[BOOT] Loaded REPO_EMOJIS with ${config.REPO_EMOJIS.size} entries.`);
   logger.info(
     {
@@ -172,9 +181,9 @@ async function main(): Promise<void> {
     dataDir: config.DATA_DIR,
   });
 
-  // #439: a disabled licence must not register a profile at all. A
-  // registered-but-unusable agent still appears in pickers and still invites
-  // dispatch to a seat this host is not entitled to use.
+  // #439 / #474: COPILOT_ENABLED=false is the global "not entitled at all"
+  // switch — it drops the profile, so copilot@fhr-server dies with it.
+  // Host-scoped withholding is AGENT_LOCATION_DENY (profile stays registered).
   const copilotEnabled = config.COPILOT_ENABLED !== false;
 
   const copilot = makeCopilotProfile({
@@ -414,14 +423,19 @@ async function main(): Promise<void> {
   let stopCatalogEnrichmentRefresh: (() => void) | undefined;
   let serviceStatusSources: ReturnType<typeof createDefaultServiceStatusSources> | undefined;
 
-  const profiles: AgentProfile[] = [...(copilotEnabled ? [copilot, ...extraCopilots] : []), claude, ...extraClaudes, ...(claudeVertex ? [claudeVertex] : []), ...(agy ? [agy] : []), ...(codex ? [codex] : []), ...(grok ? [grok] : []), ...(zai ? [zai] : []), ...(ollamaCloud ? [ollamaCloud] : [])];
+  const registered: AgentProfile[] = [...(copilotEnabled ? [copilot, ...extraCopilots] : []), claude, ...extraClaudes, ...(claudeVertex ? [claudeVertex] : []), ...(agy ? [agy] : []), ...(codex ? [codex] : []), ...(grok ? [grok] : []), ...(zai ? [zai] : []), ...(ollamaCloud ? [ollamaCloud] : [])];
+  const profiles: AgentProfile[] = registered.map((profile) =>
+    guardLocalProfileSpawn(profile, config.AGENT_LOCATION_DENY)
+  );
   const profilesById = new Map(profiles.map((profile) => [profile.id, profile]));
+  const localCatalogProfiles = () =>
+    profiles.filter((profile) => !isAgentLocationDenied(profile.id, LOCAL_LOCATION, config.AGENT_LOCATION_DENY));
   const modelCatalog = new ModelCatalogService({
     store: modelCatalogStore,
     logger: logger.child({ mod: "model-catalog" }),
-    configuredLocalAgentIds: () => profiles.map((profile) => profile.id),
+    configuredLocalAgentIds: () => localCatalogProfiles().map((profile) => profile.id),
     bindings: () => {
-      const bindings = profiles.map((profile) => ({ agentId: profile.id, location: "local" }));
+      const bindings = localCatalogProfiles().map((profile) => ({ agentId: profile.id, location: "local" }));
       // Re-read durable observations on each orchestration pass so a
       // remote-only adapter first seen during this process remains part of
       // manual/scheduled refresh-all after its bridge disconnects.
@@ -511,6 +525,7 @@ async function main(): Promise<void> {
     // than the deadline that should already have fired.
     turnStalenessBoundMs: config.TURN_TIMEOUT_SECONDS * 1000,
   });
+  installAgentLocationDeny(router, config.AGENT_LOCATION_DENY);
   router.startIdleReaper();
 
   // #249: one coordinator captures the operational catalog plus independent

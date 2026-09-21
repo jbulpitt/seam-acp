@@ -4,6 +4,7 @@ import type { McpServer } from "@agentclientprotocol/sdk";
 import type { ContextUsage, ISessionManager, SessionSummary } from "./session-manager.js";
 import type { FastModeDescriptor } from "./fast-mode.js";
 import type { AdapterCatalogCandidate, AdapterCatalogSource } from "./model-catalog.js";
+import type { AdapterErrorClassification } from "./error-classification.js";
 
 /**
  * Adapter contract version advertised by in-process local agents via
@@ -298,6 +299,16 @@ export interface AgentAdapter {
     filename: string,
     bytes: string | Uint8Array
   ): Promise<{ path: string } | null>;
+
+  /**
+   * Parse this agent's known error shapes and attach `{ errorKind, agentId }`
+   * to `error.data`. Downstream reads that field.
+   *
+   * Ownership: if the resolver cannot decide, this adapter under-reported.
+   * Unclassified-error rate is a per-agent metric. Do not "fix" an unclassified
+   * result by regexing English in the orchestrator — extend the matcher here.
+   */
+  classifyError?(error: unknown): AdapterErrorClassification;
 }
 
 /**

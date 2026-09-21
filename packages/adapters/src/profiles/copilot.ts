@@ -19,6 +19,41 @@ import { AGENT_ADAPTER_VERSION } from "../agent-profile.js";
 import { manifestCatalogScope, manifestCatalogSource, readCliVersion } from "../model-catalog.js";
 import { ProbeError, redactProbeText, runBoundedProbe } from "../probe-process.js";
 import type { SessionSummary, SessionSummaryLine } from "../session-manager.js";
+import {
+  classifyAndAttach,
+  classifyWith,
+  classified,
+  type AdapterErrorClassification,
+  type AdapterErrorKind,
+  type ClassifyContext,
+} from "../error-classification.js";
+
+export function classifyCopilotError(error: unknown, agentId = "copilot"): AdapterErrorClassification {
+  return classifyWith(agentId, error, matchCopilotError);
+}
+
+function matchCopilotError(ctx: ClassifyContext): AdapterErrorClassification | AdapterErrorKind | null {
+  const { haystack, agentId, message } = ctx;
+  if (/\bcopilot acp advertised no model config options\b/.test(haystack)) {
+    return classified(agentId, "capability_absent", { details: message });
+  }
+  if (/\bcopilot acp advertised duplicate model config options\b/.test(haystack) ||
+      /\bcopilot acp default model\b/.test(haystack)) {
+    return classified(agentId, "invalid_request", { details: message });
+  }
+  if (/\bcopilot acp (?:initialize|catalog probe) timed out\b/.test(haystack)) {
+    return classified(agentId, "timeout", { details: message });
+  }
+  return null;
+}
+
+export function copilotNoModelConfigError(agentId = "copilot"): Error & { data: Record<string, unknown> } {
+  const err = new Error("copilot ACP advertised no model config options") as Error & {
+    data: Record<string, unknown>;
+  };
+  classifyAndAttach(err, classified(agentId, "capability_absent", { details: err.message }));
+  return err;
+}
 
 interface SeamAcpSessionIdRow {
   acp_session_id?: string | null;
@@ -284,7 +319,7 @@ export async function probeCopilotCatalog(options: {
       },
     });
     const models = discovery.models;
-    if (!models.length) throw new Error("copilot ACP advertised no model config options");
+    if (!models.length) throw copilotNoModelConfigError();
     if (new Set(models.map((model) => model.value)).size !== models.length) {
       throw new Error("copilot ACP advertised duplicate model config options");
     }
@@ -473,8 +508,9 @@ export function makeCopilotProfile(opts: {
     return env;
   };
 
+  const profileId = opts.id ?? "copilot";
   return asLocalAdapter({
-    id: opts.id ?? "copilot",
+    id: profileId,
     displayName: opts.displayName ?? "GitHub Copilot",
     defaultModel: opts.defaultModel,
     requestedContextTier: copilotRequestedContextTier(acpArgs),
@@ -527,6 +563,9 @@ export function makeCopilotProfile(opts: {
       mechanism: "configOption",
       configId: "reasoning_effort",
       levels: ["low", "medium", "high", "xhigh", "max"],
+    },
+    classifyError(error: unknown) {
+      return classifyAndAttach(error, classifyCopilotError(error, profileId));
     },
     spawn(_modelOverride?: string, _effortOverride?: string, sessionMcpServers?: McpServer[]) {
       const launch = copilotAcpLaunchSpec(cli, acpArgs, runtimeCwd, probeEnvironment());

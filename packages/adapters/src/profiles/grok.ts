@@ -19,6 +19,74 @@ import {
 } from "../model-catalog.js";
 import { ProbeError, runBoundedProbe } from "../probe-process.js";
 import type { ContextUsage, ISessionManager, SessionSummary } from "../session-manager.js";
+import {
+  classifyAndAttach,
+  classifyWith,
+  classified,
+  parseExitCause,
+  type AdapterErrorClassification,
+  type AdapterErrorKind,
+  type ClassifyContext,
+} from "../error-classification.js";
+
+export function classifyGrokError(error: unknown, agentId = "grok"): AdapterErrorClassification {
+  return classifyWith(agentId, error, matchGrokError);
+}
+
+function matchGrokError(ctx: ClassifyContext): AdapterErrorClassification | AdapterErrorKind | null {
+  const { haystack, agentId, message, exit } = ctx;
+  if (/\bgrok exited before billing\b/.test(haystack) ||
+      /\bgrok acp initialize exited\b/.test(haystack)) {
+    return classified(agentId, "agent_exit", {
+      exitCode: exit?.exitCode ?? null,
+      signal: exit?.signal ?? null,
+      details: message,
+    });
+  }
+  if (/\bgrok acp initialize cancelled\b/.test(haystack)) {
+    return classified(agentId, "cancelled", { details: message });
+  }
+  if (/\bgrok spawn failed\b/.test(haystack) || /\bgrok stdin closed\b/.test(haystack)) {
+    return classified(agentId, "agent_exit", {
+      exitCode: exit?.exitCode ?? null,
+      signal: exit?.signal ?? null,
+      details: message,
+    });
+  }
+  if (/\bgrok \S+ timed out\b/.test(haystack)) {
+    return classified(agentId, "timeout", { details: message });
+  }
+  if (errorIsProbe(ctx) && /\bacp connection closed\b/.test(haystack)) {
+    return classified(agentId, "connection_closed", { details: message });
+  }
+  return null;
+}
+
+function errorIsProbe(ctx: ClassifyContext): boolean {
+  return ctx.errorCode === "protocol_error" || ctx.errorCode === "exited_early" ||
+    /^protocol_error:/.test(ctx.message) || /^exited_early:/.test(ctx.message);
+}
+
+/**
+ * Journal 2026-09: 16 times, `code=null, signal=SIGILL`. Structured fields on
+ * the error are what classification keys on; interpolating them only into the
+ * message is how SIGILL and a clean exit became indistinguishable.
+ */
+export function grokExitBeforeBillingError(
+  code: number | null,
+  signal: NodeJS.Signals | string | null,
+): Error & { data: Record<string, unknown> } {
+  const err = new Error(`grok exited before billing (code=${code}, signal=${signal})`) as Error & {
+    data: Record<string, unknown>;
+  };
+  const parsed = parseExitCause(err);
+  classifyAndAttach(err, classified("grok", "agent_exit", {
+    exitCode: parsed?.exitCode ?? code,
+    signal: parsed?.signal ?? (signal == null ? null : String(signal)),
+    details: err.message,
+  }));
+  return err;
+}
 
 /**
  * Known context windows for xAI text models (from docs.x.ai/developers/models).
@@ -830,6 +898,9 @@ export function makeGrokProfile(opts: {
     // mechanism "spawnArgs", SessionRouter treats grok as having no effort
     // and silently ignores channel/thread preset pins.
     effort: catalogEffort,
+    classifyError(error: unknown) {
+      return classifyAndAttach(error, classifyGrokError(error, opts.id ?? "grok"));
+    },
     spawn(modelOverride?: string, effortOverride?: string) {
       const model = modelOverride ?? opts.defaultModel;
       return spawn(cli, grokAgentArgs(baseArgs, model, effortOverride), {
@@ -1029,7 +1100,7 @@ export async function fetchGrokUsage(
   const exit = new Promise<never>((_, reject) => {
     child.once("error", (err) => reject(new Error(`grok spawn failed: ${err.message}`)));
     child.once("exit", (code, childSignal) => {
-      reject(new Error(`grok exited before billing (code=${code}, signal=${childSignal})`));
+      reject(grokExitBeforeBillingError(code, childSignal));
     });
   });
 

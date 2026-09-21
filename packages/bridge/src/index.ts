@@ -51,19 +51,19 @@ import type { IncomingMessage } from "node:http";
 import type { RawData, WebSocket as WsSocket } from "ws";
 import {
   PROTOCOL_VERSION,
-  buildCopilotMcpConfigJson,
   type AgentAdapter,
 } from "@seam/adapters";
 import { dispatchBridgeRpc, type SlotSpawnConfig } from "./rpc.js";
 import { slotHealthSnapshot } from "./slot-health.js";
 import { createOutputLog, createLineFramer } from "./output-log.js";
 import { createStderrRegistry } from "./stderr-ring.js";
+import { spawnRefusalFrame } from "./resolve-adapter.js";
+import { spawnAgent } from "./spawn-agent.js";
 import { muxSend, forwardAgentStdout } from "./frame-out.js";
 import { BridgeMcpInputRewriter } from "./mcp-injection.js";
 import {
   inventoryFromAdapters,
   loadHostAdapterInventory,
-  resolveCopilotHostLaunch,
 } from "./inventory.js";
 import { createReleaseReceiptWriter, type ReleaseReceiptWriter } from "./release-receipt.js";
 
@@ -175,50 +175,6 @@ async function loadWs(): Promise<{ WebSocket: WsCtor; WebSocketServer: WssCtor }
   }
 }
 
-function resolveSlotAdapter(
-  adapters: Map<string, AgentAdapter>,
-  slotCfg?: SlotSpawnConfig
-): AgentAdapter | undefined {
-  const id = slotCfg?.agentId;
-  if (id && adapters.has(id)) return adapters.get(id);
-  if (adapters.size === 1) return [...adapters.values()][0];
-  return undefined;
-}
-
-function spawnAgent(
-  adapters: Map<string, AgentAdapter>,
-  copilotCmd: string,
-  localCwd: string,
-  slotCfg?: SlotSpawnConfig
-): ChildProcess {
-  const adapter = resolveSlotAdapter(adapters, slotCfg);
-  if (adapter && adapter.id !== "copilot") {
-    console.error(
-      `[bridge] Spawning adapter ${adapter.id}` +
-        (slotCfg?.model ? ` model=${slotCfg.model}` : "") +
-        (slotCfg?.effort ? ` effort=${slotCfg.effort}` : "")
-    );
-    return adapter.spawn(slotCfg?.model, slotCfg?.effort);
-  }
-
-  const cwd = slotCfg?.cwd || localCwd;
-  const launch = resolveCopilotHostLaunch(copilotCmd, cwd, slotCfg?.env);
-  const cmdArgs = [...launch.args];
-  const mcpJson = buildCopilotMcpConfigJson(
-    Array.isArray(slotCfg?.mcpServers) ? slotCfg.mcpServers : []
-  );
-  if (mcpJson) {
-    cmdArgs.push("--additional-mcp-config", mcpJson);
-  }
-  const tokenLabel = launch.env.GH_TOKEN ? "present" : "missing";
-  console.error(`[bridge] Spawning agent: ${launch.cliPath} ${cmdArgs.filter((a) => a !== mcpJson).join(" ")} (GH_TOKEN: ${tokenLabel})`);
-  return spawn(launch.cliPath, cmdArgs, {
-    cwd: launch.cwd,
-    stdio: ["pipe", "pipe", "inherit"],
-    env: launch.env,
-  });
-}
-
 /**
  * Create a slot manager that multiplexes multiple agent processes over one WS.
  * Each slot gets its own agent process, spawned lazily on first message.
@@ -318,7 +274,19 @@ function makeSlotManager(opts: {
     }
 
     console.error(`[bridge] Slot ${slot}: spawning agent`);
-    const agent = spawnAgent(adapters, copilotCmd, localCwd, slotConfigs.get(slot));
+    let agent: ChildProcess;
+    try {
+      agent = spawnAgent(adapters, copilotCmd, localCwd, slotConfigs.get(slot));
+    } catch (err) {
+      // #468: end the slot honestly rather than leaving seam-acp waiting on a
+      // stream that will never produce anything. One `exit` frame is enough —
+      // the mux marks the slot killed on receipt and stops forwarding stdin,
+      // so this cannot turn into a frame-per-write loop.
+      const frame = spawnRefusalFrame(err);
+      console.error(`[bridge] Slot ${slot}: refusing to spawn — ${frame.spawnError}`);
+      muxSend(currentWs, WebSocket, slot, "exit", frame, outputLog);
+      return null;
+    }
     slots.set(slot, agent);
     slotInputRewriters.set(
       slot,

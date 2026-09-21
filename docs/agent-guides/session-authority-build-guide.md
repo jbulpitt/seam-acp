@@ -33,10 +33,20 @@ with one spare for review and verification.
 
 ### Lane B — `mux.ts` and `bridge/src/index.ts`
 
-1. **#453** copilot collapse — smallest, clears the deck before the big ones
-2. **#442** bridge reports per-slot health
-3. **#444** output log with cursors, plus line framing
+1. **#442** bridge reports per-slot health
+2. **#444** output log with cursors, plus line framing
+3. **#456** drain bridge-spawned stderr — before #443, which would otherwise detect hangs
+   this causes
 4. **#443** hang detection
+5. **#453** copilot collapse — **after #440**, not first
+
+#453 was attempted 2026-09-20 and came back blocked. It looked like the smallest story and
+is not: the branch it deletes is the only thing giving copilot `inherit` stderr, and the
+adapter path cannot carry per-slot `cwd`/`env`. Two of the three fixes live in
+`profiles/copilot.ts`, which is #440's file. See the issue comment for the full finding.
+
+**A story's size is a hypothesis until a worker tests it.** "Smallest, clears the deck" was
+wrong here, and ordering a lane around it cost a slot.
 
 ### Lane C — no hot-file contact, freely parallel
 
@@ -52,7 +62,8 @@ with one spare for review and verification.
 - #441 (A) waits on #440 (C)
 - #448 (A) waits on #441 (A) and #442 (B)
 - #450 (A) waits on #441, #448, #449
-- #443 (B) waits on #442 (B)
+- #443 (B) waits on #442 (B), and should follow #456 (B)
+- #453 (B) waits on #440 (C)
 - #452 (C) waits on #446 (C) and #442 (B)
 - #454 (C) waits on #450 (A)
 

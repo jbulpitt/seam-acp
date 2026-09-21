@@ -108,6 +108,14 @@ describe("#12 opencode surface removed", () => {
       DISCORD_ALLOWED_USER_IDS: "123",
       REPOS_ROOT: repoRoot,
       CHANNEL_PRESETS_FILE: undefined,
+      // #474: `config.ts` runs `dotenv.config({ override: true })` at import,
+      // so the operator's real .env is already in `saved` and cannot be
+      // displaced from the test command line. A host that denies an agent at
+      // local (e.g. `copilot@local`) makes DEFAULT_AGENT=copilot legitimately
+      // refusable — true of the host, irrelevant to retirement semantics,
+      // which is what these cases assert. Clear it so the fixture states its
+      // own world instead of inheriting the operator's.
+      AGENT_LOCATION_DENY: undefined,
       ...extra,
     } as NodeJS.ProcessEnv;
   }

@@ -1098,6 +1098,18 @@ export class SessionRouter {
   }
 
   /**
+   * Warm-set (#452) resume: load an existing ACP session and never create a
+   * new one. Falling through to session/new would start a conversation nobody
+   * asked for. A missing or failed session is the caller's to mark cold.
+   */
+  async resumeExistingSession(record: SessionRecord): Promise<AgentRuntime> {
+    if (!record.acpSessionId) {
+      throw new Error("warm-set refused: no ACP session to resume");
+    }
+    return this.getOrStartRuntime(record, { resumeSessionId: record.acpSessionId });
+  }
+
+  /**
    * seam-MCP servers for a throwaway isolated run, reusing the session's
    * existing token so a concurrent live turn is not rotated off MCP.
    */

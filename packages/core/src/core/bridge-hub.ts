@@ -13,6 +13,7 @@ import {
   type HelloFrame,
   type WorkspaceInfo,
 } from "@seam/adapters";
+import type { SlotHealthFact } from "./warm-set/manager.js";
 import { buildSeamMcpServerEntry } from "./mcp/seam-mcp-server.js";
 import {
   publicBaseFromBridgeWsUrl,
@@ -157,6 +158,8 @@ export class BridgeHub {
    *  makeMux() per connection left the old turn writing to a dead mux while
    *  hello landed on a different one — VPS stopped sending, cancel no-op. */
   private readonly muxes = new Map<string, ReturnType<typeof makeMux>>();
+  /** Last per-slot health the bridge reported (#442). Facts only. */
+  private readonly slotHealth = new Map<string, readonly SlotHealthFact[]>();
   /** In-memory session → bridge mapping. Persistence is the thread-preset `location`. */
   private readonly sessionBridge = new Map<string, string>();
   private readonly readyEvents = new EventEmitter();
@@ -237,6 +240,11 @@ export class BridgeHub {
   /** Mux for this bridge, including the gap after WS drop before hello. */
   muxFor(bridgeId: string): ReturnType<typeof makeMux> | undefined {
     return this.muxes.get(normalizeLocation(bridgeId));
+  }
+
+  /** Last slot-health snapshot from this bridge; empty if none yet / disconnected. */
+  slotHealthFor(location: string): readonly SlotHealthFact[] {
+    return this.slotHealth.get(normalizeLocation(location)) ?? [];
   }
 
   pairedBridges(): BridgeHostConfig[] {
@@ -387,9 +395,13 @@ export class BridgeHub {
         const cur = this.connections.get(bridgeId);
         if (cur?.mux === mux) {
           this.connections.delete(bridgeId);
+          this.slotHealth.delete(bridgeId);
           this.logger.info({ bridgeId }, "bridge disconnected; agents unavailable");
           this.readyEvents.emit("disconnect", bridgeId);
         }
+      },
+      onSlotHealth: (health) => {
+        this.slotHealth.set(bridgeId, health);
       },
     });
     this.muxes.set(bridgeId, mux);

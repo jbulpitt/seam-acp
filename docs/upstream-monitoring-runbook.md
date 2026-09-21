@@ -4,7 +4,7 @@
 >
 > **Cadence**: Weekly sweep (recommended: Monday), with ad-hoc checks when a major release is announced.
 >
-> **Last updated**: 2026-09-20 (daily sweep)
+> **Last updated**: 2026-09-21 (daily sweep)
 >
 > **⚠️ AGENT CONSTRAINT — READ-ONLY / REPORTING MODE**: Agents executing this runbook must **never** modify seam-acp source files, run `npm run redeploy`, apply patches, or make any code changes during a monitoring sweep. All code work is tracked via GitHub issues and implemented in **separate, explicitly tasked sessions**. Your job during a sweep is to **find, classify, and file or update GitHub issues** — not to implement fixes.
 
@@ -454,7 +454,7 @@ Use this checklist for each monitoring sweep. Copy it into your report and check
 - [ ] Check [GitHub Community Announcements](https://github.com/orgs/community/discussions/categories/announcements) for billing/policy updates
 
 #### ACP Protocol
-- [ ] Check [ACP SDK npm](https://registry.npmjs.org/@agentclientprotocol/sdk) — current pinned: `^1.4.0`, installed: 1.4.0, latest: **1.4.0** (installed in workspace; #28 closed)
+- [ ] Check [ACP SDK npm](https://registry.npmjs.org/@agentclientprotocol/sdk) — current pinned: `^1.4.0`, installed: 1.4.0, latest: **1.5.0** (released 2026-09-21; schema-v1.23.0 & schema-v2.0.0-alpha.5; v1 session-notices, strict v2 prompt response messageId)
 - [ ] Check [ACP monorepo releases](https://github.com/agentclientprotocol/agent-client-protocol/releases) for spec/schema changes (`schema-v*` tags; Rust Crate v1.9.1 released 2026-09-18; Schema v1.23.0 & Schema v2.0.0-alpha.5 released 2026-09-18; Schema v1.22.0 & Schema v2.0.0-alpha.4 released 2026-09-17)
 - [ ] Check [ACP updates page](https://agentclientprotocol.com/updates)
 - [ ] Check [ACP v2 Draft status](https://agentclientprotocol.com/protocol/v2/overview) — **v2.0.0-alpha.5 schema shipped in monorepo (2026-09-18); SDK 1.4.0 enforces v2 lifecycle; tracked in #41; monitor for RC; no seam-acp implementation until stable** | ACP v1 Elicitation stabilized in SDK 1.4.0 — tracked in #45

@@ -652,63 +652,88 @@ function reportAdapterRefusals(ready) {
   console.log("upgrade_status=verified_with_adapter_refusal");
 }
 
-async function verifyActivationReceipt(release, expected) {
-  const deadline = expected.deadline;
-  while (Date.now() <= deadline) {
-    const value = await readActivationReceipt(release, expected);
-    if (value) return value;
-    await new Promise((resolve) => setTimeout(resolve, 250));
-  }
+// Long enough for the controller's on-hello catalog RPCs (prepare, then
+// describe + fetch on this binding). Not the fleet refresh interval.
+const CATALOG_OBSERVATION_MS = 20_000;
+
+function receiptBindsActivation(value, expected) {
+  return value?.formatVersion === 2 && value.activationId === expected.activationId && value.bridgeId === bridgeId && value.sourceSha === expected.sourceSha && value.artifactChecksum === expected.artifactChecksum && value.stageId === expected.stageId && value.oldPid === expected.oldPid && value.pid === expected.newPid && INSTANCE.test(value.instanceId ?? "") && value.protocolVersion === 1;
+}
+
+function contradictoryControllerAck(value, expected) {
+  const ack = value.controllerAck;
+  if (!ack) return false;
+  return ack.activationId !== expected.activationId || ack.bridgeId !== bridgeId || ack.instanceId !== value.instanceId || ack.pid !== expected.newPid || ack.sourceSha !== expected.sourceSha || ack.artifactChecksum !== expected.artifactChecksum;
+}
+
+async function loadReceipt(release) {
+  try { return parseJson(await fsp.readFile(`${release}/release-receipt.json`), "activation_receipt_invalid"); }
+  catch { return null; }
+}
+
+function receiptProblem(value, expected) {
+  if (!value || (value.activationId == null && value.helloAcceptedAt == null)) return null;
+  if (!receiptBindsActivation(value, expected)) return "activation_receipt_identity_mismatch";
+  const started = parseReceiptTime(value.startedAt);
+  if (started != null && started < expected.started - RECEIPT_NTP_SKEW_MS) return "receipt_outside_window";
+  if (contradictoryControllerAck(value, expected)) return "controller_ack_mismatch";
+  const describe = parseReceiptTime(value.catalogRpcs?.[verifyAgent]?.describeModelCatalogAt);
+  const fetchAt = parseReceiptTime(value.catalogRpcs?.[verifyAgent]?.fetchModelCatalogAt);
+  if (describe != null && fetchAt != null && fetchAt < describe) return "catalog_timestamp_order";
+  const hello = parseReceiptTime(value.helloAcceptedAt);
+  if (hello != null && started != null && hello + RECEIPT_NTP_SKEW_MS < started) return "catalog_timestamp_order";
   return null;
 }
 
-async function requireActivationReceipt(release, expected) {
-  const receipt = await verifyActivationReceipt(release, expected);
-  if (!receipt) fail("activation_receipt_timeout");
-  return receipt;
+async function readHelloReceipt(release, expected) {
+  const value = await loadReceipt(release);
+  if (!value || receiptProblem(value, expected)) return null;
+  const hello = parseReceiptTime(value.helloAcceptedAt);
+  const started = parseReceiptTime(value.startedAt);
+  if (hello == null || started == null) return null;
+  if (hello > expected.deadline + RECEIPT_NTP_SKEW_MS) return null;
+  return value;
 }
 
 /**
- * A missing controller receipt refuses only confirmation, not a deployment
- * whose pointer, old-PID exit and replacement identity are already proved.
- * Re-check those facts and the active release's static capability contract
- * once, then persist an explicit unconfirmed outcome. Rollback remains
- * available, but comes after the evidence so a false alarm does not steer the
- * operator back to stale code (#328).
+ * Catalog RPCs are stamped when the controller calls this bridge. Source
+ * already does that for one binding on hello (`verifyStagedReleaseCatalogRpcs`);
+ * the periodic fleet refresh is a different job and must not be the wait.
+ * Observe only long enough for the on-hello call. Hello alone proves the
+ * replacement reconnected. A missing catalog stamp is not a failed deploy.
  */
-async function receiptOrUnconfirmed(release, expected, observed, extraLines = []) {
-  let ready = await verifyActivationReceipt(release, expected);
-  if (ready) return ready;
-
-  const after = await readLiveIdentity();
-  if (after.pid !== expected.newPid || after.entryReal !== observed.activatedEntrypoint || after.legacy || live(expected.oldPid)) {
-    fail("post_activation_identity_changed");
+async function observeActivationProof(release, expected) {
+  const observeUntil = Math.min(expected.deadline, Date.now() + CATALOG_OBSERVATION_MS);
+  while (Date.now() <= observeUntil) {
+    const value = await loadReceipt(release);
+    const problem = receiptProblem(value, expected);
+    if (problem) return { kind: "failed", reason: problem };
+    const full = await readActivationReceipt(release, expected);
+    if (full) return { kind: "full", receipt: full };
+    await new Promise((resolve) => setTimeout(resolve, 250));
   }
-  const capabilities = await readDeployedCapabilities(release);
-  // One bounded, immediate re-read after the capability probe closes the race
-  // where controller acknowledgement lands at the original deadline.
-  ready = await readActivationReceipt(release, expected);
-  if (ready) return ready;
+  const lateProblem = receiptProblem(await loadReceipt(release), expected);
+  if (lateProblem) return { kind: "failed", reason: lateProblem };
+  const full = await readActivationReceipt(release, expected);
+  if (full) return { kind: "full", receipt: full };
+  const hello = await readHelloReceipt(release, expected);
+  if (hello) return { kind: "hello", receipt: hello };
+  return { kind: "failed", reason: "activation_hello_timeout" };
+}
 
-  const unconfirmed = {
-    ...observed,
-    verification: { forward: "receipt", catalogRpcsVerified: false },
-    verificationAgent: verifyAgent,
-    confirmationError: "activation_receipt_timeout",
-    recheck: {
-      currentEntrypointTarget: after.entryReal,
-      processStartedAt: after.processStartedAt,
-      oldPidExited: true,
-      protocolVersion: capabilities.protocolVersion,
-      drainSigusr2: capabilities.drainSupport,
-      describeModelCatalog: capabilities.describeSupport,
-      fetchModelCatalog: capabilities.fetchSupport,
-      rolloutReady: capabilities.rolloutReady,
-      checkedAt: nowIso(),
-    },
-  };
-  await fsp.writeFile(`${releaseRoot}/activations/${expected.activationId}.unconfirmed.json`, safeJson(unconfirmed), { flag: "wx", mode: 0o600 });
-  console.log("activation=deployed_verification_unconfirmed");
+async function requireActivationReceipt(release, expected) {
+  const observed = await observeActivationProof(release, expected);
+  if (observed.kind === "failed") fail(observed.reason);
+  return observed;
+}
+
+/**
+ * Hello plus the replacement identity is the deployment proof (#492). Catalog
+ * RPCs are recorded when they arrive inside the short on-hello window; their
+ * absence is not a failed deploy. A contradictory receipt or a replacement
+ * that never reconnects is verification_failed, named, and still rollbackable.
+ */
+function reportDeploymentEvidence(expected, after, capabilities, extraLines) {
   console.log(`activation_id=${expected.activationId}`);
   console.log(`deployed_source_sha=${expected.sourceSha}`);
   console.log(`deployed_artifact_checksum=${expected.artifactChecksum}`);
@@ -721,10 +746,48 @@ async function receiptOrUnconfirmed(release, expected, observed, extraLines = []
   console.log(`post_describeModelCatalog=${capabilities.describeSupport}`);
   console.log(`post_fetchModelCatalog=${capabilities.fetchSupport}`);
   console.log(`post_rollout_ready=${capabilities.rolloutReady}`);
-  console.log("receipt_verification=unconfirmed");
-  console.log("verification_reason=activation_receipt_timeout");
-  console.log("capability_recheck=completed");
   for (const line of extraLines) console.log(line);
+}
+
+async function receiptOrUnconfirmed(release, expected, observed, extraLines = []) {
+  const proof = await observeActivationProof(release, expected);
+  const after = await readLiveIdentity();
+  if (after.pid !== expected.newPid || after.entryReal !== observed.activatedEntrypoint || after.legacy || live(expected.oldPid)) {
+    fail("post_activation_identity_changed");
+  }
+  const capabilities = await readDeployedCapabilities(release);
+  if (proof.kind === "full" || proof.kind === "hello") {
+    if (capabilities.protocolVersion !== "1" || capabilities.drainSupport !== "yes" || capabilities.rolloutReady !== "yes") {
+      console.log("activation=verification_failed");
+      reportDeploymentEvidence(expected, after, capabilities, extraLines);
+      console.log("verification_reason=deployed_not_receipt_capable");
+      console.log(`rollback_command=npm run bridge:rollout -- --target ${bridgeId} --rollback --activation-id ${expected.activationId} --apply`);
+      return null;
+    }
+    return { ...proof.receipt, catalogVerified: proof.kind === "full" };
+  }
+  const failed = {
+    ...observed,
+    verification: { forward: "failed", catalogRpcsVerified: false, state: "failed" },
+    verificationAgent: verifyAgent,
+    confirmationError: proof.reason,
+    recheck: {
+      currentEntrypointTarget: after.entryReal,
+      processStartedAt: after.processStartedAt,
+      oldPidExited: true,
+      protocolVersion: capabilities.protocolVersion,
+      drainSigusr2: capabilities.drainSupport,
+      describeModelCatalog: capabilities.describeSupport,
+      fetchModelCatalog: capabilities.fetchSupport,
+      rolloutReady: capabilities.rolloutReady,
+      checkedAt: nowIso(),
+    },
+  };
+  await fsp.writeFile(`${releaseRoot}/activations/${expected.activationId}.failed.json`, safeJson(failed), { flag: "wx", mode: 0o600 });
+  console.log("activation=verification_failed");
+  reportDeploymentEvidence(expected, after, capabilities, extraLines);
+  console.log(`verification_reason=${proof.reason}`);
+  console.log("capability_recheck=completed");
   console.log(`next_preflight=npm run bridge:rollout -- --target ${bridgeId}`);
   console.log("rollback_available=yes");
   console.log(`rollback_command=npm run bridge:rollout -- --target ${bridgeId} --rollback --activation-id ${expected.activationId} --apply`);
@@ -1547,10 +1610,13 @@ async function activateFromEnrolledBaseline(input) {
     ],
   );
   if (!ready) return;
+  const catalogVerified = ready.catalogVerified === true;
   const readyReceiptSha256 = hash(await fsp.readFile(`${release}/release-receipt.json`));
-  const outcome = { ...observed, verification: { forward: "receipt", catalogRpcsVerified: true }, instanceId: ready.instanceId, readyReceipt: `${release}/release-receipt.json`, readyReceiptSha256, verifiedAt: nowIso() };
+  const outcome = { ...observed, verification: { forward: catalogVerified ? "receipt" : "hello", catalogRpcsVerified: catalogVerified }, instanceId: ready.instanceId, readyReceipt: `${release}/release-receipt.json`, ...(catalogVerified ? { readyReceiptSha256 } : {}), verifiedAt: nowIso() };
   await fsp.writeFile(`${releaseRoot}/activations/${activationId}.verified.json`, safeJson(outcome), { flag: "wx", mode: 0o600 });
   console.log("activation=verified"); console.log("activation_from=enrolled-baseline");
+  console.log(`catalog_rpcs_verified=${catalogVerified ? "yes" : "no"}`);
+  if (!catalogVerified) console.log("verification_reason=catalog_rpc_not_observed");
   console.log(`activation_id=${activationId}`); console.log(`old_pid=${before.pid}`); console.log(`new_pid=${newPid}`); console.log(`instance_id=${ready.instanceId}`);
   console.log(`enrollment_id=${enrollment.record.enrollmentId}`);
   console.log(`rollback_proof=${baseline.rollbackProof}`);
@@ -1605,10 +1671,13 @@ async function activate() {
     await fsp.writeFile(`${releaseRoot}/activations/${activationId}.observed.json`, safeJson(observed), { flag: "wx", mode: 0o600 });
     const ready = await receiptOrUnconfirmed(release, { activationId, sourceSha, artifactChecksum: checksum, stageId, oldPid: before.pid, newPid, started, deadline }, observed);
     if (!ready) return;
+    const catalogVerified = ready.catalogVerified === true;
     const readyReceiptSha256 = hash(await fsp.readFile(`${release}/release-receipt.json`));
-    const outcome = { ...observed, verification: { forward: "receipt", catalogRpcsVerified: true }, instanceId: ready.instanceId, readyReceipt: `${release}/release-receipt.json`, readyReceiptSha256, verifiedAt: nowIso() };
+    const outcome = { ...observed, verification: { forward: catalogVerified ? "receipt" : "hello", catalogRpcsVerified: catalogVerified }, instanceId: ready.instanceId, readyReceipt: `${release}/release-receipt.json`, ...(catalogVerified ? { readyReceiptSha256 } : {}), verifiedAt: nowIso() };
     await fsp.writeFile(`${releaseRoot}/activations/${activationId}.verified.json`, safeJson(outcome), { flag: "wx", mode: 0o600 });
-    console.log("activation=verified"); console.log(`activation_id=${activationId}`); console.log(`old_pid=${before.pid}`); console.log(`new_pid=${newPid}`); console.log(`instance_id=${ready.instanceId}`); reportAdapterRefusals(ready); console.log(`rollback_command=npm run bridge:rollout -- --target ${bridgeId} --rollback --activation-id ${activationId} --apply`);
+    console.log("activation=verified"); console.log(`catalog_rpcs_verified=${catalogVerified ? "yes" : "no"}`);
+    if (!catalogVerified) console.log("verification_reason=catalog_rpc_not_observed");
+    console.log(`activation_id=${activationId}`); console.log(`old_pid=${before.pid}`); console.log(`new_pid=${newPid}`); console.log(`instance_id=${ready.instanceId}`); reportAdapterRefusals(ready); console.log(`rollback_command=npm run bridge:rollout -- --target ${bridgeId} --rollback --activation-id ${activationId} --apply`);
   });
 }
 
@@ -1742,7 +1811,7 @@ async function rollback() {
       const unobserved = parseJson(await fsp.readFile(`${currentDir}/release-receipt.json`),"unobserved_activation_receipt_invalid");
       if (unobserved.activationId !== failedActivationId || unobserved.sourceSha !== record.sourceSha || unobserved.artifactChecksum !== record.artifactChecksum || unobserved.stageId !== record.stageId || unobserved.oldPid !== record.oldPid || unobserved.pid !== current.pid || !INSTANCE.test(unobserved.instanceId ?? "")) fail("rollback_unobserved_pid_mismatch");
     }
-    if (recordKind === "verified" && (!HASH.test(record.readyReceiptSha256 ?? "") || hash(await fsp.readFile(record.readyReceipt)) !== record.readyReceiptSha256)) fail("activation_ready_receipt_changed");
+    if (recordKind === "verified" && record.verification?.catalogRpcsVerified !== false && (!HASH.test(record.readyReceiptSha256 ?? "") || hash(await fsp.readFile(record.readyReceipt)) !== record.readyReceiptSha256)) fail("activation_ready_receipt_changed");
     const previous = record.previous; assertObject(previous,"rollback_previous_invalid");
     if (previous.kind === "enrolled-baseline") {
       await rollbackToEnrolledBaseline({ record, previous, current, failedActivationId, rollbackId, recordKind, timeout });
@@ -1759,9 +1828,12 @@ async function rollback() {
     const newPid = await waitForReplacement(current.pid, timeout); const after = await readLiveIdentity();
     if (after.pid !== newPid || after.entryReal !== previous.entrypoint) fail("rollback_replacement_identity_mismatch");
     const ready = await requireActivationReceipt(previousDir, { activationId: rollbackId, sourceSha: previous.sourceSha, artifactChecksum: previous.artifactChecksum, stageId: previous.stageId, oldPid: current.pid, newPid, started, deadline });
+    const catalogVerified = ready.kind === "full";
     const rollbackReadyReceiptSha256 = hash(await fsp.readFile(`${previousDir}/release-receipt.json`));
-    await fsp.writeFile(`${releaseRoot}/rollbacks/${failedActivationId}-${rollbackId}.verified.json`, safeJson({ ...intent, newPid, instanceId: ready.instanceId, readyReceipt: `${previousDir}/release-receipt.json`, readyReceiptSha256: rollbackReadyReceiptSha256, verifiedAt: nowIso() }), { flag: "wx", mode: 0o600 });
-    console.log("rollback=verified"); console.log(`rollback_id=${rollbackId}`); console.log(`old_pid=${current.pid}`); console.log(`new_pid=${newPid}`); console.log(`restored_sha=${previous.sourceSha}`); console.log(`restored_checksum=${previous.artifactChecksum}`);
+    await fsp.writeFile(`${releaseRoot}/rollbacks/${failedActivationId}-${rollbackId}.verified.json`, safeJson({ ...intent, newPid, instanceId: ready.receipt.instanceId, readyReceipt: `${previousDir}/release-receipt.json`, ...(catalogVerified ? { readyReceiptSha256: rollbackReadyReceiptSha256 } : {}), verification: { forward: catalogVerified ? "receipt" : "hello", catalogRpcsVerified: catalogVerified }, verifiedAt: nowIso() }), { flag: "wx", mode: 0o600 });
+    console.log("rollback=verified"); console.log(`catalog_rpcs_verified=${catalogVerified ? "yes" : "no"}`);
+    if (!catalogVerified) console.log("verification_reason=catalog_rpc_not_observed");
+    console.log(`rollback_id=${rollbackId}`); console.log(`old_pid=${current.pid}`); console.log(`new_pid=${newPid}`); console.log(`restored_sha=${previous.sourceSha}`); console.log(`restored_checksum=${previous.artifactChecksum}`);
   });
 }
 

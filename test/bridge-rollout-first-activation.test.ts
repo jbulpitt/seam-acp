@@ -341,17 +341,18 @@ describe.sequential("#288 first managed activation from an enrolled baseline", (
     const result = parseKeyValues((await f.run(
       ["activate", release.sourceSha, release.checksum, release.stageId, activation, "12", H("5")]
     )).stdout);
-    expect(result.activation).toBe("deployed_verification_unconfirmed");
-    expect(result.verification_reason).toBe("activation_receipt_timeout");
+    expect(result.activation).toBe("verification_failed");
+    expect(result.verification_reason).toBe("activation_receipt_identity_mismatch");
     expect(result.activation_from).toBe("enrolled-baseline");
     expect(result.rollback_proof).toBe("reduced-baseline");
     // Observed and explicitly unconfirmed, never verified: rollback remains
     // available by activation id without misreporting the deployment as failed.
     await expect(fs.stat(path.join(f.releaseRoot, "activations", `${activation}.verified.json`))).rejects.toThrow();
     await expect(fs.stat(path.join(f.releaseRoot, "activations", `${activation}.observed.json`))).resolves.toBeTruthy();
-    const unconfirmed = JSON.parse(await fs.readFile(path.join(f.releaseRoot, "activations", `${activation}.unconfirmed.json`), "utf8"));
-    expect(unconfirmed.verification).toEqual({ forward: "receipt", catalogRpcsVerified: false });
-    expect(unconfirmed.previous.rollbackProof).toBe("reduced-baseline");
+    const failed = JSON.parse(await fs.readFile(path.join(f.releaseRoot, "activations", `${activation}.failed.json`), "utf8"));
+    expect(failed.verification).toEqual({ forward: "failed", catalogRpcsVerified: false, state: "failed" });
+    expect(failed.confirmationError).toBe("activation_receipt_identity_mismatch");
+    expect(failed.previous.rollbackProof).toBe("reduced-baseline");
     const observed = JSON.parse(await fs.readFile(path.join(f.releaseRoot, "activations", `${activation}.observed.json`), "utf8"));
     expect(observed.verification).toEqual({ forward: "receipt", catalogRpcsVerified: false, state: "pending" });
   }, 180_000);

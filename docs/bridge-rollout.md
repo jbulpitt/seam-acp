@@ -458,29 +458,35 @@ and PID, plus the exact source SHA and artifact checksum it received from that
 connection. The bridge rejects an acknowledgement whose artifact identity does
 not exactly equal its activation envelope. It writes the in-window receipt.
 Catalog RPC timestamps and the controller-ack stamp are concurrent event
-streams: the controller may ack identity before catalog RPCs finish recording.
-Order is enforced within each stream; a total order across them produced a
-false `unconfirmed` on plex-server (#483, 3ms). Membership in the activation
-window allows 2s of NTP skew across streams. Only then is an
+streams. Order is enforced within each stream; the activation window allows
+2s of NTP skew across streams.
+
+Those live RPC stamps are not required to call the deployment verified.
+The controller source can refresh one binding on hello
+(`verifyStagedReleaseCatalogRpcs`); the periodic fleet refresh is a different
+job. Activation observes for 20s after the replacement is up — long enough
+for that on-hello call, not for a sweep. Hello plus the replacement identity
+and the deployed tree's static capability contract is `activation=verified`
+with `catalog_rpcs_verified=no` and `verification_reason=catalog_rpc_not_observed`.
+A receipt that contradicts the activation (wrong id, stale window, bad
+controller ack) or a replacement that never reconnects is
+`activation=verification_failed` with a named reason. Only a binding catalog
+receipt sets `catalog_rpcs_verified=yes`. Only then, for that stronger proof, is an
 immutable `.verified.json` activation record written. The activation ID and its
 exact rollback command are recorded before signaling so they remain recoverable
 if activation itself fails. Once the replacement PID and entrypoint are proven, an
 immutable `.observed.json` is also written; it permits an explicit rollback of a
-replacement whose catalog/receipt verification timed out without guessing a PID.
-The intent and observation mark receipt verification as pending; only a valid
-receipt changes `catalogRpcsVerified` to true in `.verified.json`.
+replacement without guessing a PID. A hello-only verification records
+`catalogRpcsVerified: false`. A binding catalog receipt records `true`.
 
-A receipt timeout after those deployment facts are proven is not reported as a
-failed activation. The remote checker re-proves the active symlink target, old
-PID exit, replacement PID/PM2 identity and process start time; re-runs the
-deployed release's protocol, drain and both catalog capability checks once; and
-then re-reads the receipt once to close the deadline race. If the receipt is
-still unavailable, it writes an immutable `.unconfirmed.json` record and
-reports `activation=deployed_verification_unconfirmed`. Operator output leads
+A replacement that is up but never accepts hello, or a receipt that contradicts
+the activation, is `activation=verification_failed` with a named reason and an
+immutable `.failed.json`. That is not the same as a deploy that reconnected
+without a catalog stamp. Operator output leads
 with the deployed SHA/checksum, live target, process evidence, verification
 agent, and post-activation capability flags. It then names the missing proof
-and offers the explicit rollback command last. This refuses only confirmation:
-it does not claim the deployment failed or steer an operator toward stale code.
+and offers the explicit rollback command last. A hello-only success is not
+reported as a failure, and a failed verification is not reported as a success.
 If the pointer, PID or PM2 identity changed during the re-check, the command
 still fails because the deployment outcome is genuinely ambiguous.
 

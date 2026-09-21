@@ -122,6 +122,15 @@ describe("#456 truncation is stated, never implied", () => {
     expect(ring.tail()).toBe("only line");
   });
 
+  it("still reports the drop when nothing at all survived it", () => {
+    // A pathological bound can evict everything. "We dropped 40 KB and kept
+    // none of it" is a fact; returning empty would be the silent
+    // discontinuity the marker exists to prevent.
+    const ring = createStderrRing({ maxBytes: 1, maxLines: 1 });
+    ring.push("a".repeat(40_000) + "\n");
+    expect(ring.tail()).toMatch(/^\[stderr truncated: \d+ earlier bytes dropped\]$/);
+  });
+
   it("retains a line the agent never finished, since it still wrote those bytes", () => {
     const ring = createStderrRing();
     ring.push("complete\npartial-at-death");

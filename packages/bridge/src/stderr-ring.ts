@@ -124,10 +124,15 @@ export function createStderrRing(options: StderrRingOptions = {}): StderrRing {
 
     tail() {
       const body = [...lines, ...(partial ? [partial] : [])].join("\n");
-      if (!body) return "";
-      // Stated, never implied — the same rule #444's gap marker follows.
+      // Nothing written and nothing dropped: genuinely no diagnostic, and the
+      // caller omits the field rather than sending an empty claim.
+      if (!body && droppedBytes === 0) return "";
+      // Stated, never implied — the same rule #444's gap marker follows. This
+      // holds even when the body is empty: "we dropped 40 KB and kept none of
+      // it" is a fact worth having, and reporting nothing would be the silent
+      // discontinuity the marker exists to prevent.
       return droppedBytes > 0
-        ? `[stderr truncated: ${droppedBytes} earlier bytes dropped]\n${body}`
+        ? `[stderr truncated: ${droppedBytes} earlier bytes dropped]${body ? `\n${body}` : ""}`
         : body;
     },
 

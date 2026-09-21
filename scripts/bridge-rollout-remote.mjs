@@ -50,14 +50,21 @@ function live(pid) { try { process.kill(pid, 0); return true; } catch { return f
 function assertUid(stat, uid, code) { if (stat.uid !== uid) fail(code); }
 
 const argv = process.argv.slice(2);
-if (argv.length < 12) fail("argument_count");
-const [bridgeId, pm2App, verifyAgent, uidText, checkoutPath, entrypointPath, nodePath, pm2ModulePath, workspaceText, devModeText, releaseRoot, mode, ...actionArgs] = argv;
+if (argv.length < 14) fail("argument_count");
+const [bridgeId, pm2App, verifyAgent, uidText, checkoutPath, entrypointPath, nodePath, pm2ModulePath, workspaceText, devModeText, releaseRoot, launcherKind, launcherPathText, mode, ...actionArgs] = argv;
 let safePhase = "arguments";
 let pidFilePath = "";
 if (![bridgeId, pm2App, verifyAgent].every((v) => NAME.test(v))) fail("unsafe_identity_name");
 const expectedUid = Number(uidText);
 if (!Number.isSafeInteger(expectedUid) || expectedUid < 1) fail("unsafe_expected_uid");
-for (const [value, code] of [[checkoutPath,"unsafe_checkout"],[entrypointPath,"unsafe_entrypoint"],[nodePath,"unsafe_node"],[pm2ModulePath,"unsafe_pm2_module"],[releaseRoot,"unsafe_release_root"]]) exactPath(value, code);
+if (launcherKind !== "pm2" && launcherKind !== "systemd") fail("unsafe_launcher");
+const launcherPath = launcherPathText === "-" ? null : exactPath(launcherPathText, "unsafe_launcher_path");
+if (launcherKind === "systemd") {
+  if (!launcherPath) fail("systemd_launcher_path_missing");
+  if (pm2ModulePath !== "-") fail("systemd_pm2_module_forbidden");
+} else if (launcherPath) fail("pm2_launcher_path_forbidden");
+for (const [value, code] of [[checkoutPath,"unsafe_checkout"],[entrypointPath,"unsafe_entrypoint"],[nodePath,"unsafe_node"],[releaseRoot,"unsafe_release_root"]]) exactPath(value, code);
+if (launcherKind === "pm2") exactPath(pm2ModulePath, "unsafe_pm2_module");
 const workspaceArg = workspaceText === "-" ? null : exactPath(workspaceText, "unsafe_workspace");
 if (devModeText !== "yes" && devModeText !== "no") fail("unsafe_dev_mode");
 const expectedDevMode = devModeText === "yes";
@@ -149,6 +156,25 @@ async function processExecutable(pid) {
   } catch (error) { if (error?.code) throw error; fail("process_executable_unavailable"); }
 }
 
+async function processArgv(pid) {
+  if (process.platform !== "linux") fail("process_argv_unavailable");
+  try {
+    const raw = await fsp.readFile(`/proc/${pid}/cmdline`);
+    const args = raw.toString("utf8").split("\0").filter(Boolean);
+    if (args.length < 2) fail("process_argv_short");
+    return args;
+  } catch (error) { if (error?.code) throw error; fail("process_argv_unavailable"); }
+}
+
+async function systemctlShow(property) {
+  const result = await runBounded("/usr/bin/systemctl", ["show", pm2App, "-p", property, "--value"], { timeoutMs: 10_000, stdoutLimit: 4096, stderrLimit: 4096 });
+  return result.stdout.trim();
+}
+
+async function systemdMainPid() {
+  return parsePid(await systemctlShow("MainPID"), "systemd_mainpid_invalid");
+}
+
 function validatePm2Args(raw) {
   const args = Array.isArray(raw) ? raw.map(String) : [];
   if (!args.length || args.some((value) => !value || /[\x00-\x1f\x7f]/.test(value))) fail("pm2_argv_invalid");
@@ -173,7 +199,36 @@ function validatePm2Args(raw) {
   } else if (positional !== 2 || flags.has("--server") || flags.has("--token")) fail("pm2_legacy_argv_mismatch");
 }
 
-async function readLiveIdentity() {
+async function proveSharedProcess(pid) {
+  safePhase = "identity_process";
+  if (!live(pid)) fail("configured_pid_not_live");
+  if (await processUid(pid) !== expectedUid) fail("process_wrong_owner");
+  if (await processExecutable(pid) !== nodePath) fail("process_executable_mismatch");
+  safePhase = "identity_checkout";
+  const checkoutReal = await fsp.realpath(checkoutPath).catch(() => fail("checkout_missing"));
+  if (checkoutReal !== checkoutPath) fail("checkout_symlink_or_escape");
+  assertUid(await fsp.lstat(checkoutPath), expectedUid, "checkout_wrong_owner");
+  const cwd = await pidCwd(pid);
+  if (cwd !== checkoutPath) fail("process_cwd_mismatch");
+  const nodeReal = await fsp.realpath(nodePath).catch(() => fail("configured_node_missing"));
+  if (nodeReal !== nodePath) fail("configured_node_symlink");
+  assertUid(await fsp.lstat(nodePath), expectedUid, "configured_node_wrong_owner");
+  return cwd;
+}
+
+async function proveEntrypoint() {
+  safePhase = "identity_entrypoint";
+  const entryStat = await fsp.lstat(entrypointPath).catch(() => fail("entrypoint_missing")); assertUid(entryStat, expectedUid, "entrypoint_wrong_owner");
+  if (!entryStat.isFile() && !entryStat.isSymbolicLink()) fail("entrypoint_wrong_type");
+  const entryReal = await fsp.realpath(entrypointPath).catch(() => fail("entrypoint_broken"));
+  const legacy = entryReal === entrypointPath;
+  if (!legacy && !entryReal.startsWith(`${releaseRoot}/releases/`)) fail("entrypoint_escape");
+  if (entryReal !== entrypointPath && !entryReal.endsWith("/packages/bridge/dist/index.js")) fail("entrypoint_unexpected_target");
+  assertUid(await fsp.stat(entryReal), expectedUid, "entrypoint_target_wrong_owner");
+  return { entryReal, legacy };
+}
+
+async function readPm2Identity() {
   safePhase = "identity_pm2";
   const rows = await pm2Describe();
   safePhase = "identity_pm2_rows";
@@ -196,19 +251,7 @@ async function readLiveIdentity() {
   if (!pidStat.isFile() || pidStat.isSymbolicLink()) fail("pid_file_wrong_type");
   if (await fsp.realpath(pidFilePath) !== pidFilePath) fail("pid_file_symlink_escape");
   const pid = parsePid(await fsp.readFile(pidFilePath, "utf8"), "pid_file_invalid");
-  safePhase = "identity_process";
-  if (!live(pid)) fail("configured_pid_not_live");
-  if (await processUid(pid) !== expectedUid) fail("process_wrong_owner");
-  if (await processExecutable(pid) !== nodePath) fail("process_executable_mismatch");
-  safePhase = "identity_checkout";
-  const checkoutReal = await fsp.realpath(checkoutPath).catch(() => fail("checkout_missing"));
-  if (checkoutReal !== checkoutPath) fail("checkout_symlink_or_escape");
-  assertUid(await fsp.lstat(checkoutPath), expectedUid, "checkout_wrong_owner");
-  const cwd = await pidCwd(pid);
-  if (cwd !== checkoutPath) fail("process_cwd_mismatch");
-  const nodeReal = await fsp.realpath(nodePath).catch(() => fail("configured_node_missing"));
-  if (nodeReal !== nodePath) fail("configured_node_symlink");
-  assertUid(await fsp.lstat(nodePath), expectedUid, "configured_node_wrong_owner");
+  const cwd = await proveSharedProcess(pid);
   const pm2Real = await fsp.realpath(pm2ModulePath).catch(() => fail("configured_pm2_module_unavailable"));
   if (pm2Real !== pm2ModulePath) fail("configured_pm2_module_symlink");
   assertUid(await fsp.lstat(pm2ModulePath), expectedUid, "configured_pm2_module_wrong_owner");
@@ -221,16 +264,44 @@ async function readLiveIdentity() {
   const processStartedAt = Number.isFinite(pmUptime) && pmUptime > 0 && pmUptime <= Date.now() + 60_000
     ? new Date(pmUptime).toISOString()
     : "unknown";
+  const { entryReal, legacy } = await proveEntrypoint();
   const pm2Identity = { name: env.name, cwd: env.pm_cwd, execPath: env.pm_exec_path, interpreter: env.exec_interpreter, args: (Array.isArray(env.args) ? env.args : []).map(String) };
-  safePhase = "identity_entrypoint";
-  const entryStat = await fsp.lstat(entrypointPath).catch(() => fail("entrypoint_missing")); assertUid(entryStat, expectedUid, "entrypoint_wrong_owner");
-  if (!entryStat.isFile() && !entryStat.isSymbolicLink()) fail("entrypoint_wrong_type");
-  const entryReal = await fsp.realpath(entrypointPath).catch(() => fail("entrypoint_broken"));
-  const legacy = entryReal === entrypointPath;
-  if (!legacy && !entryReal.startsWith(`${releaseRoot}/releases/`)) fail("entrypoint_escape");
-  if (entryReal !== entrypointPath && !entryReal.endsWith("/packages/bridge/dist/index.js")) fail("entrypoint_unexpected_target");
-  assertUid(await fsp.stat(entryReal), expectedUid, "entrypoint_target_wrong_owner");
   return { pid, cwd, entryReal, legacy, processStartedAt, pm2: pm2Identity };
+}
+
+async function readSystemdIdentity() {
+  if (process.platform !== "linux") fail("systemd_not_linux");
+  safePhase = "identity_systemd";
+  const active = await systemctlShow("ActiveState");
+  if (active !== "active") fail("systemd_unit_not_active");
+  const pid = await systemdMainPid();
+  const cwd = await proveSharedProcess(pid);
+  safePhase = "identity_systemd_launcher";
+  const launchStat = await fsp.lstat(launcherPath).catch(() => fail("systemd_launcher_missing"));
+  assertUid(launchStat, expectedUid, "systemd_launcher_wrong_owner");
+  if (!launchStat.isFile() || launchStat.isSymbolicLink()) fail("systemd_launcher_wrong_type");
+  if (await fsp.realpath(launcherPath) !== launcherPath) fail("systemd_launcher_symlink");
+  const argv = await processArgv(pid);
+  if (argv[1] !== launcherPath) fail("systemd_launcher_mismatch");
+  const startedRaw = await systemctlShow("ActiveEnterTimestamp");
+  const startedMs = Date.parse(startedRaw);
+  const processStartedAt = Number.isFinite(startedMs) ? new Date(startedMs).toISOString() : "unknown";
+  const { entryReal, legacy } = await proveEntrypoint();
+  return {
+    pid, cwd, entryReal, legacy, processStartedAt,
+    systemd: { unit: pm2App, launcher: launcherPath, interpreter: nodePath, args: argv },
+  };
+}
+
+async function readLiveIdentity() {
+  return launcherKind === "systemd" ? readSystemdIdentity() : readPm2Identity();
+}
+
+function processManagerSnapshot(identity) {
+  if (identity.pm2) {
+    return { manager: "pm2", app: pm2App, cwd: identity.pm2.cwd, execPath: identity.pm2.execPath, interpreter: identity.pm2.interpreter, args: identity.pm2.args };
+  }
+  return { manager: "systemd", app: pm2App, cwd: identity.cwd, execPath: identity.systemd.launcher, interpreter: identity.systemd.interpreter, args: identity.systemd.args };
 }
 
 function tarString(block, start, length) {
@@ -498,12 +569,17 @@ async function prepareManagedRoot() {
 
 async function withLock(operationId, fn) { const release = await acquireLock(operationId); try { return await fn(); } finally { await release(); } }
 
+async function supervisorPid() {
+  if (launcherKind === "systemd") return systemdMainPid();
+  return parsePid(await fsp.readFile(pidFilePath, "utf8"), "pid_file_invalid");
+}
+
 async function waitForReplacement(oldPid, seconds) {
   const deadline = Date.now() + seconds * 1000; let oldExited = false;
   while (Date.now() <= deadline) {
     if (!live(oldPid)) oldExited = true;
     let candidate;
-    try { candidate = parsePid(await fsp.readFile(pidFilePath,"utf8"), "pid_file_invalid"); } catch {}
+    try { candidate = await supervisorPid(); } catch {}
     if (oldExited && candidate && candidate !== oldPid && live(candidate)) return candidate;
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
@@ -942,7 +1018,7 @@ async function captureBaseline(identity) {
     // content plus live process/PM2/protocol/drain evidence, with no
     // controller-observed catalog RPCs.
     rollbackProof: capabilities.rolloutReady === "yes" ? "receipt" : "reduced-baseline",
-    processManager: { manager: "pm2", app: pm2App, cwd: identity.pm2.cwd, execPath: identity.pm2.execPath, interpreter: identity.pm2.interpreter, args: identity.pm2.args },
+    processManager: processManagerSnapshot(identity),
     runtime: { nodePath, nodeVersion, platform: `${process.platform}-${process.arch}`, uid: expectedUid },
   };
   return { baseline, digest: hash(Buffer.from(JSON.stringify(baseline), "utf8")), entryBytes: capabilities.bytes[0], pid: identity.pid };
@@ -1099,7 +1175,9 @@ async function restoreBaseline() {
     if (state.status !== "recorded") fail("enrollment_not_recorded");
     if (state.record.enrollmentId !== enrollmentId) fail("enrollment_id_mismatch");
     const identity = await readLiveIdentity();
-    if (identity.pm2.cwd !== state.record.baseline.processManager.cwd || identity.pm2.execPath !== state.record.baseline.processManager.execPath || identity.pm2.interpreter !== state.record.baseline.processManager.interpreter) fail("restore_process_manager_mismatch");
+    const liveManager = processManagerSnapshot(identity);
+    const recordedManager = state.record.baseline.processManager;
+    if (liveManager.manager !== recordedManager.manager || liveManager.app !== recordedManager.app || liveManager.cwd !== recordedManager.cwd || liveManager.execPath !== recordedManager.execPath || liveManager.interpreter !== recordedManager.interpreter) fail("restore_process_manager_mismatch");
     safePhase = "restore_verify";
     // BEFORE anything is changed. Restoring only the entrypoint onto a checkout
     // whose other runtime files have drifted would report success while leaving
@@ -1156,7 +1234,9 @@ async function preflight() {
   if (diskBytesAvailable <= 0n) fail("release_disk_unavailable");
   const nativeInstall = nativeInstallPlan();
   const parentState = await releaseParentState();
-  console.log("reachable=yes"); console.log(`bridge_id=${bridgeId}`); console.log(`pm2_app=${pm2App}`); console.log(`pid=${identity.pid}`);
+  console.log("reachable=yes"); console.log(`bridge_id=${bridgeId}`); console.log(`pm2_app=${pm2App}`); console.log(`launcher=${launcherKind}`);
+  if (launcherKind === "systemd") console.log(`launcher_path=${launcherPath}`);
+  console.log(`pid=${identity.pid}`);
   console.log(`cwd=${identity.cwd}`); console.log(`entrypoint=${entrypointPath}`); console.log(`entrypoint_target=${identity.entryReal}`);
   console.log(`expected_uid=${expectedUid}`); console.log(`release_root=${releaseRoot}`); console.log(`platform=${process.platform}-${process.arch}`);
   const entrypointSha256 = hash(entryBytes); const artifactIdentity = artifactMode === "managed" ? `${artifactSourceSha}:${artifactChecksum}` : `entrypoint-sha256:${entrypointSha256}`;
@@ -1429,7 +1509,7 @@ async function rollbackToEnrolledBaseline(input) {
       // absence of a receipt field.
       catalogRpcsVerified: false,
       controllerObserved: false,
-      note: "pre-receipt baseline: restored by digest-exact content plus live process, PM2, protocol and drain evidence",
+      note: "pre-receipt baseline: restored by digest-exact content plus live process, supervisor, protocol and drain evidence",
     },
     oldPid: current.pid,
     startedAt: new Date(started).toISOString(), deadlineAt: new Date(deadline).toISOString(),
@@ -1448,8 +1528,11 @@ async function rollbackToEnrolledBaseline(input) {
   safePhase = "baseline_rollback_prove";
   const after = await readLiveIdentity();
   if (after.pid !== newPid || !after.legacy || after.entryReal !== entrypointPath) fail("rollback_replacement_identity_mismatch");
-  if (after.pm2.name !== pm2App || after.pm2.cwd !== checkoutPath || after.pm2.interpreter !== nodePath) fail("rollback_replacement_identity_mismatch");
-  // `readLiveIdentity` already proved the PM2 argv carries this exact bridge id.
+  const afterManager = processManagerSnapshot(after);
+  const expectedExec = launcherKind === "systemd" ? launcherPath : entrypointPath;
+  if (afterManager.manager !== launcherKind || afterManager.app !== pm2App || afterManager.cwd !== checkoutPath || afterManager.interpreter !== nodePath || afterManager.execPath !== expectedExec) {
+    fail("rollback_replacement_identity_mismatch");
+  }
   const reproved = await verifyBaseline(state.record, after);
   if (!reproved.ok) fail(reproved.reason);
   const restoredCapabilities = await readDeployedCapabilities(checkoutPath);
@@ -1531,5 +1614,9 @@ try {
 } catch (error) {
   const safeCode = typeof error?.code === "string" && /^[a-z0-9_]+$/i.test(error.code) ? error.code : typeof error?.message === "string" && /^[a-z0-9_]+$/i.test(error.message) ? error.message : `unexpected_${safePhase}`;
   console.error(`error=${safeCode}`);
+  if (String(safeCode).startsWith("unexpected_")) {
+    const detail = error instanceof Error ? error.message.replace(/[^A-Za-z0-9 ._:-]/g, " ").slice(0, 200) : "unknown";
+    console.error(`unexpected_detail=${detail}`);
+  }
   process.exitCode = 1;
 }

@@ -13,6 +13,7 @@ function preflightReport(target: ReturnType<typeof resolveTarget>, overrides: Re
     reachable: "yes",
     bridge_id: target.bridgeId,
     pm2_app: target.pm2App,
+    launcher: target.launcher ?? "pm2",
     identity_bound: "yes",
     remote_mutation: "no",
     pid: "123",
@@ -325,8 +326,10 @@ describe("bridge rollout gating and verification (#241)", () => {
   it("contains SIGUSR2 only and no secret-bearing or immediate PM2 command", () => {
     const source = ["scripts/bridge-rollout-remote.sh", "scripts/bridge-rollout-remote.mjs", "scripts/bridge-rollout.mjs", "scripts/lib/bridge-rollout.mjs"].map((file) => fs.readFileSync(path.join(root, file), "utf8")).join("\n");
     expect(source).not.toMatch(/pm2\s+(?:restart|reload|jlist|prettylist|env)\b/i);
+    expect(source).not.toMatch(/systemctl\s+(?:restart|stop|kill|reload)\b/i);
     expect(source).not.toMatch(/SIGTERM|SIGKILL.*oldPid/);
     expect(source).toContain('process.kill(before.pid, "SIGUSR2")');
+    expect(source).toContain("systemdMainPid");
     // #484 re-aimed this, and tightened it. The gate is spelled
     // `report.rollout_ready !== "yes"` since the preflight result is
     // destructured, and it now guards BOTH the single-host path and the

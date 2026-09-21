@@ -91,7 +91,7 @@ async function makeFixture(options: { capable?: boolean; withGit?: boolean } = {
   await fs.writeFile(pm2File, JSON.stringify({ pid: child.pid, pm_id: 0, pidFile, name: "fixture-app", cwd: checkout, entry, node }));
 
   const shell = await renderRemoteScript(path.join(repo, "scripts/bridge-rollout-remote.sh"), path.join(repo, "scripts/bridge-rollout-remote.mjs"));
-  const base = ["fixture", "fixture-app", "grok", String(process.getuid!()), checkout, entry, node, pm2Module, "-", "no", releaseRoot];
+  const base = ["fixture", "fixture-app", "grok", String(process.getuid!()), checkout, entry, node, pm2Module, "-", "no", releaseRoot, "pm2", "-"];
   const run = (action: string[], timeoutMs = 30_000) =>
     commandRunner({ file: "/bin/sh", args: ["-s", "--", node, ...base, ...action], input: shell, timeoutMs });
 

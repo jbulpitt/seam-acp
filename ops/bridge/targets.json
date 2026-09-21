@@ -66,10 +66,18 @@
     },
     "fhr-server": {
       "sshAlias": "fhr-server",
-      "pm2App": null,
-      "verifyAgent": null,
-      "rolloutEnabled": false,
-      "unmanagedReason": "systemd launcher needs a dedicated activation and rollback contract"
+      "launcher": "systemd",
+      "pm2App": "seam-bridge",
+      "launcherPath": "/home/jessebulpitt/.local/libexec/seam-bridge-launch.mjs",
+      "verifyAgent": "agy",
+      "checkoutPath": "/home/jessebulpitt/.seam/seam-acp",
+      "entrypointPath": "/home/jessebulpitt/.seam/seam-acp/packages/bridge/dist/index.js",
+      "expectedUid": 1000,
+      "nodePath": "/home/jessebulpitt/.nvm/versions/node/v22.22.2/bin/node",
+      "workspaceArg": "/home/jessebulpitt/Projects",
+      "devMode": true,
+      "releaseRoot": "/home/jessebulpitt/.seam/bridge-rollouts",
+      "rolloutEnabled": true
     },
     "home-hub": {
       "sshAlias": "home-hub",
@@ -87,10 +95,18 @@
     },
     "plex-server": {
       "sshAlias": "plex-server",
-      "pm2App": null,
-      "verifyAgent": null,
-      "rolloutEnabled": false,
-      "unmanagedReason": "systemd launcher needs a dedicated activation and rollback contract"
+      "launcher": "systemd",
+      "pm2App": "seam-bridge",
+      "launcherPath": "/home/mediaserver/.local/libexec/seam-bridge-launch.mjs",
+      "verifyAgent": "grok",
+      "checkoutPath": "/home/mediaserver/.seam/seam-acp",
+      "entrypointPath": "/home/mediaserver/.seam/seam-acp/packages/bridge/dist/index.js",
+      "expectedUid": 1000,
+      "nodePath": "/home/mediaserver/.seam/node-v22.22.2/bin/node",
+      "workspaceArg": "/home/mediaserver/Projects",
+      "devMode": false,
+      "releaseRoot": "/home/mediaserver/.seam/bridge-rollouts",
+      "rolloutEnabled": true
     },
     "rhc-server": {
       "sshAlias": "rhc-server",

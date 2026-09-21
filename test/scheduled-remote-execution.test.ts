@@ -5,11 +5,13 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { EventEmitter } from "node:events";
 import { PassThrough, Readable, Writable } from "node:stream";
-import { agent, methods, ndJsonStream, PROTOCOL_VERSION } from "@agentclientprotocol/sdk";
-import type { AgentProfile } from "@seam/adapters";
+import { agent, methods, ndJsonStream, PROTOCOL_VERSION, RequestError } from "@agentclientprotocol/sdk";
+import { classifyAgyError, readErrorClassification, type AgentProfile } from "@seam/adapters";
 import { pino } from "pino";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
+import { SessionRouter } from "../packages/core/src/core/session-router.js";
+import { SeamTokenRegistry } from "../packages/core/src/core/mcp/token-registry.js";
 import { discordRenderer } from "../packages/core/src/platforms/discord/renderer.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 import type { ScheduledPrompt } from "../packages/core/src/core/scheduled-prompts/types.js";
@@ -36,6 +38,9 @@ function setup(location = REMOTE) {
   cleanups.push(() => store.close());
   const calls = { news: [] as any[], loads: [] as any[], prompts: [] as any[], configs: [] as any[], children: [] as any[] };
   const onPrompt = vi.fn(async () => {});
+  const afterText = vi.fn(async () => {});
+  const logs: any[] = [];
+  const logger = pino({ level: "warn" }, { write(line) { logs.push(JSON.parse(line)); } }) as any;
   function spawn() {
     const stdin = new PassThrough(), stdout = new PassThrough(), stderr = new PassThrough();
     const child = Object.assign(new EventEmitter(), { stdin, stdout, stderr, slot: calls.children.length,
@@ -55,6 +60,7 @@ function setup(location = REMOTE) {
         calls.prompts.push(params); await onPrompt();
         await client.notify(methods.client.session.update, { sessionId: params.sessionId,
           update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "synthetic result" } } });
+        await afterText();
         return { stopReason: "end_turn" };
       })
       .onNotification(methods.agent.session.cancel, () => {})
@@ -63,6 +69,7 @@ function setup(location = REMOTE) {
   }
   const localSpawn = vi.fn(spawn), remoteSpawn = vi.fn(spawn), localDelete = vi.fn(async () => {});
   const profile = { id: "agy", displayName: "Synthetic", defaultModel: MODEL,
+    classifyError: classifyAgyError,
     effort: { mechanism: "spawnArgs", levels: ["high"] }, spawn: localSpawn,
     sessionManager: { deleteSession: localDelete } } as unknown as AgentProfile;
   const now = new Date().toISOString();
@@ -83,7 +90,8 @@ function setup(location = REMOTE) {
     reuseMcpServers: vi.fn(() => [globalMcp, seam]), isBusy: () => false,
     describeConfig: () => ({ agent: { value: profile.id }, model: { value: MODEL }, effort: { value: "high" },
       cwd: { value: cwd }, location: { value: location }, fastMode: { value: false } }) };
-  const mux = { spawn: remoteSpawn, rpc: vi.fn(async (_method: string, _params: unknown, _opts?: unknown) => ({ projectMcpInjection: true })), releaseStdin: vi.fn() };
+  const mux = { spawn: remoteSpawn, rpc: vi.fn(async (_method: string, _params: unknown, _opts?: unknown) => ({ projectMcpInjection: true })), releaseStdin: vi.fn(),
+    sendCmd: vi.fn(async (_action: string, _payload: unknown) => ({ health: calls.children.map(child => ({ slot: child.slot, alive: !child.killed })) })) };
   const hub = { markSessionBridge: vi.fn(), get: vi.fn(() => ({ mux })),
     mcpServersForRemoteSpawn: vi.fn(() => remoteSeam), rpc: vi.fn(async (_location: string, _method: string, _params: unknown, _agent: string) => ({})) };
   const adapter = { sendPanel: vi.fn(async (channel: any, _panel?: unknown) => ({ channel, id: "panel" })),
@@ -91,15 +99,52 @@ function setup(location = REMOTE) {
     editPanel: vi.fn(async () => {}), editMessage: vi.fn(async () => {}),
     findMessageByNonce: vi.fn(async () => ({ status: "absent" })) };
   const make = () => {
-    const orch = new Orchestrator({ logger: silent, store, router: router as any, adapter: adapter as any,
+    const orch = new Orchestrator({ logger, store, router: router as any, adapter: adapter as any,
       renderer: discordRenderer, modelCatalog: fixtureModelCatalog([profile]),
       config: { DATA_DIR: cwd, REPOS_ROOT: cwd, TURN_TIMEOUT_SECONDS: 15, SEAM_TURN_RESUME_ENABLED: true,
         REPO_EMOJIS: new Map(), channelPresets: new Map(), threadPresets: new Map() } as any });
     orch.setBridgeHub(hub as any);
     return orch;
   };
-  return { cwd, store, calls, onPrompt, localSpawn, remoteSpawn, localDelete, profile, record, row, router, mux, hub, adapter, make, globalMcp, remoteSeam };
+  return { cwd, store, calls, onPrompt, afterText, logs, logger, localSpawn, remoteSpawn, localDelete, profile, record, row, router, mux, hub, adapter, make, globalMcp, remoteSeam };
 }
+
+describe("#487 production remote construction paths", () => {
+  const failAfterText = () => { throw new RequestError(-32603, "Internal error: native AGY exited_early", { code: "exited_early" }); };
+
+  it("consults the live bridge before scheduled occurrence recovery and only then cleans up", async () => {
+    const h = setup(); h.afterText.mockImplementation(failAfterText);
+    await h.make().runScheduledPrompt(h.row.id);
+    expect(h.calls.prompts).toHaveLength(1); // The ladder's ephemeral exception is unchanged.
+    expect(h.mux.sendCmd).toHaveBeenCalledExactlyOnceWith("listSlots", {});
+    expect(h.logs).toContainEqual(expect.objectContaining({ msg: "bridge slot health consulted before exit classification", slot: 0, alive: true }));
+    expect(h.logs).toContainEqual(expect.objectContaining({ msg: "adapter error classified", errorKind: "protocol_error" }));
+    expect(h.logs).not.toContainEqual(expect.objectContaining({ msg: "adapter error classified", errorKind: "agent_exit" }));
+    expect(h.store.getScheduled(h.row.id)?.lastStatus).toContain("native AGY exited_early");
+    expect(h.calls.children[0].killed).toBe(true); // Cleanup is a consequence, not evidence of death.
+    expect(h.localSpawn).not.toHaveBeenCalled();
+  });
+
+  it("pins the real router runtime's health query to its spawning mux", async () => {
+    const h = setup(); h.afterText.mockImplementation(failAfterText);
+    const muxForSession = vi.fn(() => h.mux);
+    const router = new SessionRouter({ logger: h.logger, store: h.store, profiles: [h.profile],
+      modelCatalog: fixtureModelCatalog([h.profile]), defaultAgentId: "agy", defaultModel: MODEL,
+      threadPresets: new Map([["author", { location: REMOTE }]]), defaultCwd: h.cwd,
+      seamMcp: { registry: new SeamTokenRegistry(), getPort: () => undefined, isRemoteSession: () => true, muxForSession } });
+    try {
+      const runtime = await router.getOrStartRuntime(h.record);
+      // A later binding change must not ask a different host about this slot.
+      const other = { ...h.mux, sendCmd: vi.fn(async () => ({ health: [{ slot: 0, alive: false }] })) };
+      muxForSession.mockReturnValue(other);
+      const error = await runtime.prompt("fixture", undefined, { recoveryScope: "ephemeral" }).catch(error => error);
+      expect(readErrorClassification(error)?.errorKind).toBe("protocol_error");
+      expect(h.mux.sendCmd).toHaveBeenCalledExactlyOnceWith("listSlots", {});
+      expect(other.sendCmd).not.toHaveBeenCalled();
+      expect(h.calls.children[0].killed).toBe(false);
+    } finally { await router.disposeAll(); }
+  });
+});
 
 describe("#466 scheduled execution boundary", () => {
   it("runs the issue reproduction through the real isolated job and injectTurn", async () => {

@@ -5546,6 +5546,9 @@ export class Orchestrator {
           profile,
           logger,
           mcpServers: opts.mcpServers ?? [],
+          // #487: isolated schedules/dispatches bypass SessionRouter's runtime
+          // construction, but must consult the same child-owning bridge too.
+          bridgeHealth: isLocalLocation(location) ? undefined : this.bridgeHub?.get(location)?.mux,
           ...(selection.model ? { effortDescriptor: selection.model.effort } : {}),
           spawnFn: opts.spawnFn ?? (() => profile.spawn(
             selection.raw.model,

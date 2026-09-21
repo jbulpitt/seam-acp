@@ -27,7 +27,9 @@ import {
   resolveError,
   unclassified,
   type AgentProfile,
+  type AdapterErrorClassification,
   type CatalogEffort,
+  type makeMux,
 } from "@seam/adapters";
 import type { Logger } from "../lib/logger.js";
 import type { MessageAttachment } from "../platforms/chat-adapter.js";
@@ -48,6 +50,9 @@ import type {
   ElicitationHandler,
   ElicitationRequestContext,
 } from "../core/elicitation/types.js";
+
+/** The existing bridge control command, pinned to the mux that owns this child. */
+export type BridgeHealthSource = Pick<ReturnType<typeof makeMux>, "sendCmd">;
 
 /** Events surfaced from the ACP `session/update` stream. */
 export interface AsyncUserInputQuestion {
@@ -322,6 +327,7 @@ export class AgentRuntime {
     effort?: string
   ) => ReturnType<AgentProfile["spawn"]> | Promise<ReturnType<AgentProfile["spawn"]>>;
   private readonly catalogEffort?: CatalogEffort;
+  private readonly bridgeHealth?: Partial<BridgeHealthSource>;
   private readonly loadSessionTimeoutMs: number;
 
   private child?: ReturnType<AgentProfile["spawn"]>;
@@ -442,6 +448,8 @@ export class AgentRuntime {
     mcpServers?: McpServer[];
     /** Model-specific transport declaration from the pinned catalog generation. */
     effortDescriptor?: CatalogEffort;
+    /** Remote child owner; absent on local runtimes / older embedding shims. */
+    bridgeHealth?: Partial<BridgeHealthSource>;
     elicitationHandler?: ElicitationHandler;
     completeElicitationHandler?: (
       notification: CompleteElicitationNotification
@@ -466,6 +474,7 @@ export class AgentRuntime {
     this.logger = opts.logger.child({ agent: opts.profile.id });
     this.mcpServers = opts.mcpServers ?? [];
     this.catalogEffort = opts.effortDescriptor;
+    this.bridgeHealth = opts.bridgeHealth;
     this.loadSessionTimeoutMs = opts.loadSessionTimeoutMs ?? SESSION_LOAD_TIMEOUT_MS;
     this.onDead = opts.onDead;
     this.onCatalogRefresh = opts.onCatalogRefresh;
@@ -883,7 +892,7 @@ export class AgentRuntime {
         ? original : Object.assign(new Error(
           original instanceof Error ? original.message : String(original), { cause: original }),
           original && typeof original === "object" ? original : {});
-      let classification;
+      let classification: AdapterErrorClassification;
       try {
         classification = this.profile.classifyError?.(error) ?? unclassified(this.profile.id);
       } catch {
@@ -892,6 +901,34 @@ export class AgentRuntime {
         classification = unclassified(this.profile.id, "adapter classifier threw");
       }
       classification = { ...classification, agentId: this.profile.id };
+      const slot = this.getSlot();
+      if (classification.errorKind === "agent_exit" && slot !== undefined && this.bridgeHealth?.sendCmd) {
+        // #487: native AGY exited_early arrived as an ACP error while its
+        // bridge-owned adapter was alive. Refuse only the false process-death
+        // diagnosis: the failed turn still surfaces and recovery keeps working.
+        // Query the owner before resolution, not a cached reconnect snapshot.
+        // sendCmd is bounded (15s); old bridges / failed probes have no opinion.
+        try {
+          const reply: unknown = await this.bridgeHealth.sendCmd("listSlots", {});
+          const health = reply && typeof reply === "object" && "health" in reply && Array.isArray(reply.health)
+            ? reply.health.find((entry: unknown) => entry && typeof entry === "object"
+              && "slot" in entry && entry.slot === slot && "alive" in entry && typeof entry.alive === "boolean")
+            : undefined;
+          this.logger.warn({ slot, operation, alive: health?.alive ?? null, reportedErrorKind: classification.errorKind },
+            "bridge slot health consulted before exit classification");
+          if (health?.alive === true) {
+            // An ACP error / broken stream is not an adapter-process exit.
+            // The nested provider turn may still have failed: retain its error
+            // message, code and evidence rather than reporting a successful turn.
+            classification = { ...classification, errorKind: "protocol_error",
+              sourceKind: classification.sourceKind ?? "agent_exit",
+              details: [classification.details, `bridge slot ${slot} is alive; agent_exit is not adapter-process death`]
+                .filter(Boolean).join("; ") };
+          }
+        } catch (err) {
+          this.logger.warn({ err, slot, operation }, "bridge slot health unavailable; no process-liveness opinion");
+        }
+      }
       try {
         attachErrorClassification(error, classification);
       } catch {

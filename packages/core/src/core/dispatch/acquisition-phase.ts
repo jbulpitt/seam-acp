@@ -1,5 +1,17 @@
 import { DispatchSuspendedError } from "./attempt-store.js";
 
+/** Outcome of the sole start/load owner, not another retryable transport error.
+ * Keep the cause for inspection without letting an outer watcher replenish the
+ * spent budget. Only this acquisition stops; its transcript and other work live. */
+export class BootAcquisitionExhaustedError extends Error {
+  readonly acquisitionRecoveryExhausted = true;
+
+  constructor(readonly attempts: number, cause: unknown) {
+    super(`boot recovery exhausted ${attempts} pre-prompt acquisition attempts: ${cause instanceof Error ? cause.message : String(cause)}`, { cause });
+    this.name = "BootAcquisitionExhaustedError";
+  }
+}
+
 /**
  * Boot acquisition happens before a continuation prompt, so an unknown
  * transport/start failure is safe to retry with a bound. Named integrity and
@@ -10,6 +22,9 @@ export function isRetryableBootAcquisitionError(err: unknown): boolean {
   const seen = new Set<unknown>();
   while (current && typeof current === "object" && !seen.has(current)) {
     seen.add(current);
+    // #448: a timeout/transport cause may remain inside an exhausted outcome.
+    // Refuse a second budget, not a later explicit recovery or another target.
+    if ((current as { acquisitionRecoveryExhausted?: unknown }).acquisitionRecoveryExhausted === true) return false;
     const typed = current as { code?: unknown; name?: unknown; message?: unknown; cause?: unknown };
     if (typed.code === "session_load_timeout" || typed.name === "SessionLoadTimeoutError") return true;
     // #427: recognise the transport's own verdict structurally rather than by
@@ -62,9 +77,10 @@ export class DispatchAcquisitionPhase {
       // #421: a boot-time spawn/load failure happens before prompt submission,
       // so retrying this recorded session cannot replay the original brief. It
       // refuses only this acquisition while other dispatches keep running. The
-      // watcher owns the bounded retry/backoff and turns exhaustion into a
-      // visible quarantine; a real shutdown still arrives through the explicit
-      // DispatchSuspendedError above and is left for the next boot.
+      // watcher owns isolated acquisition retry/backoff. Live continuations
+      // arrive from their acquisition owner with exhaustion already marked, so
+      // they cannot start a second budget here (#448). A real shutdown arrives
+      // through DispatchSuspendedError above and is left for the next boot.
       throw this.phase === "boot-recovery" && isRetryableBootAcquisitionError(err)
         ? DispatchSuspendedError.retryable(this.dispatchId, reason)
         : DispatchSuspendedError.defect(this.dispatchId, reason);

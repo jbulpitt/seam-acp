@@ -5,7 +5,7 @@ import path from "node:path";
 import os from "node:os";
 import { randomUUID } from "node:crypto";
 import { DispatchSuspendedError, inboundAttemptId, type TurnAttempt } from "../../core/dispatch/attempt-store.js";
-import { DispatchAcquisitionPhase, isRetryableBootAcquisitionError } from "../../core/dispatch/acquisition-phase.js";
+import { BootAcquisitionExhaustedError, DispatchAcquisitionPhase, isRetryableBootAcquisitionError } from "../../core/dispatch/acquisition-phase.js";
 import { compareExecutionIdentity, executionIdentity } from "../../core/dispatch/execution-identity.js";
 import { MessageFlags, EmbedBuilder, ButtonBuilder, ActionRowBuilder, ButtonStyle, StringSelectMenuBuilder, ModalBuilder, TextInputBuilder, TextInputStyle, AttachmentBuilder, type ChatInputCommandInteraction, type AutocompleteInteraction, type MessageComponentInteraction, type Message, type InteractionEditReplyOptions } from "discord.js";
 import type { Logger } from "../../lib/logger.js";
@@ -5650,7 +5650,9 @@ export class Orchestrator {
         });
     try {
       const rt = await acquire(() => opts.resumeSessionId
-        ? this.router.getOrStartRuntime(record, { resumeSessionId: opts.resumeSessionId })
+        // The same owner serves human and live-dispatch continuations. The
+        // enclosing phase sees its exhausted outcome, never a fresh budget.
+        ? this.acquireRecordedRuntime(record, opts.logContext?.dispatch as string ?? record.id, opts.resumeSessionId)
         : this.router.getOrStartRuntime(record));
       opts.lifecycle?.onRuntime?.(rt.getProcessId?.(), rt.getProviderIdentity?.());
       const liveSessionId = record.acpSessionId || rt.getSessionInfo()?.sessionId;
@@ -6528,17 +6530,13 @@ export class Orchestrator {
       try {
         return await this.router.getOrStartRuntime(record, { resumeSessionId });
       } catch (err) {
-        const detail = err instanceof Error ? err.message : String(err);
         if (!isRetryableBootAcquisitionError(err)) {
           throw err;
         }
         if (attempt === BOOT_RECOVERY_ATTEMPTS) {
           // Refuse only this exhausted resume. The binding, provider, and other
           // sessions remain available, while workflows exposes the named cause.
-          throw new Error(
-            `boot recovery exhausted ${BOOT_RECOVERY_ATTEMPTS} pre-prompt acquisition attempts: ${detail}`,
-            { cause: err },
-          );
+          throw new BootAcquisitionExhaustedError(BOOT_RECOVERY_ATTEMPTS, err);
         }
         const backoffMs = BOOT_RECOVERY_BACKOFF_MS[attempt - 1]!;
         this.logger.warn(

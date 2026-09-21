@@ -81,7 +81,7 @@ export function parseArgs(argv) {
   const values = new Map();
   const booleans = new Set();
   const valueFlags = new Set(["--target", "--sha", "--checksum", "--stage-id", "--activation-id", "--enrollment-id", "--timeout-seconds"]);
-  const boolFlags = new Set(["--apply", "--stage", "--enroll", "--restore-baseline", "--activate", "--rollback", "--help"]);
+  const boolFlags = new Set(["--apply", "--stage", "--enroll", "--restore-baseline", "--activate", "--rollback", "--rollout", "--all", "--auto-enroll", "--help"]);
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (valueFlags.has(arg)) {
@@ -96,13 +96,28 @@ export function parseArgs(argv) {
   }
   if (booleans.has("--help")) return { help: true };
   const target = values.get("--target");
-  if (!target) throw new Error("--target is required (exactly one host; fan-out is unsupported)");
-  const actions = ["--stage", "--enroll", "--restore-baseline", "--activate", "--rollback"].filter((flag) => booleans.has(flag));
-  if (actions.length > 1) throw new Error("choose only one of --stage, --enroll, --restore-baseline, --activate, or --rollback");
+  // #484: fan-out is now supported, but only as an explicit opt-in. Naming
+  // neither a host nor the fleet is still an error rather than a default.
+  const all = booleans.has("--all");
+  if (!target && !all) throw new Error("--target is required (exactly one host), or --all for every rollout-managed host");
+  if (target && all) throw new Error("choose either --target <host> or --all, not both");
+  const actions = ["--stage", "--enroll", "--restore-baseline", "--activate", "--rollback", "--rollout"].filter((flag) => booleans.has(flag));
+  if (actions.length > 1) throw new Error("choose only one of --stage, --enroll, --restore-baseline, --activate, --rollback, or --rollout");
   const action = actions[0]?.slice(2) ?? "preflight";
   const apply = booleans.has("--apply");
   if (action !== "preflight" && !apply) throw new Error(`${actions[0]} mutates a remote host and requires --apply`);
-  if (action === "preflight" && apply) throw new Error("--apply requires one of --stage, --enroll, --restore-baseline, --activate, or --rollback");
+  if (action === "preflight" && apply) throw new Error("--apply requires one of --stage, --enroll, --restore-baseline, --activate, --rollback, or --rollout");
+  // #484: fleet mode is deliberately narrow. `restore-baseline`, `activate` and
+  // `rollback` each carry an id minted for ONE host, so "the same one for all
+  // of them" is meaningless rather than merely unwise; `enroll` across a whole
+  // fleet is a decision an operator should make per host. Preflight and the
+  // combined rollout are the two that genuinely generalise.
+  const fleetActions = new Set(["preflight", "rollout"]);
+  if (all && !fleetActions.has(action)) {
+    throw new Error(`--all supports only preflight and --rollout; ${actions[0]} carries per-host identity and must name its --target`);
+  }
+  const autoEnroll = booleans.has("--auto-enroll");
+  if (autoEnroll && action !== "rollout") throw new Error("--auto-enroll applies only to --rollout");
   const sha = values.get("--sha");
   const checksum = values.get("--checksum");
   const stageId = values.get("--stage-id");
@@ -123,7 +138,7 @@ export function parseArgs(argv) {
   } else if (enrollmentId) throw new Error("--enrollment-id is valid only with --restore-baseline");
   const timeoutSeconds = Number(values.get("--timeout-seconds") ?? "420");
   if (!Number.isInteger(timeoutSeconds) || timeoutSeconds < 10 || timeoutSeconds > 900) throw new Error("--timeout-seconds must be an integer from 10 through 900");
-  return { help: false, target, action, apply, sha, checksum, stageId, activationId, enrollmentId, timeoutSeconds };
+  return { help: false, target, all, autoEnroll, action, apply, sha, checksum, stageId, activationId, enrollmentId, timeoutSeconds };
 }
 
 function targetArgs(target) {
@@ -296,13 +311,24 @@ async function collectArtifactFiles(repoRoot) {
 }
 
 export async function buildArtifact(repoRoot, run = commandRunner) {
-  const status = await run({ file: "git", args: ["status", "--porcelain", "--untracked-files=all"], cwd: repoRoot });
-  if (status.stdout.trim()) throw new Error("source worktree is dirty; commit every source change before staging");
+  // #484 item 7: an untracked scratch file under scripts/ blocked staging
+  // twice. Nothing untracked can reach the artifact — `collectArtifactFiles`
+  // takes a fixed list of package manifests plus the two dist trees — so the
+  // guard that matters is on MODIFIED TRACKED source, and that is unchanged
+  // and still refuses.
+  const tracked = await run({ file: "git", args: ["status", "--porcelain", "--untracked-files=no"], cwd: repoRoot });
+  if (tracked.stdout.trim()) throw new Error("source worktree has modified tracked files; commit every source change before staging");
   const sha = (await run({ file: "git", args: ["rev-parse", "HEAD"], cwd: repoRoot })).stdout.trim();
   if (!SHA.test(sha)) throw new Error("could not resolve an exact committed source SHA");
+  // Snapshot INCLUDING untracked, so the post-build comparison below still
+  // catches a build that writes anything at all — it is now compared against
+  // what was there beforehand rather than against empty, which is what let a
+  // pre-existing scratch file masquerade as a build side effect.
+  const before = (await run({ file: "git", args: ["status", "--porcelain", "--untracked-files=all"], cwd: repoRoot })).stdout;
   await run({ file: "npm", args: ["run", "build", "-w", "@seam/adapters"], cwd: repoRoot, timeoutMs: 300_000 });
   await run({ file: "npm", args: ["run", "build", "-w", "@seam/bridge"], cwd: repoRoot, timeoutMs: 300_000 });
-  if ((await run({ file: "git", args: ["status", "--porcelain", "--untracked-files=all"], cwd: repoRoot })).stdout.trim()) throw new Error("build changed tracked or untracked source; refusing artifact");
+  const after = (await run({ file: "git", args: ["status", "--porcelain", "--untracked-files=all"], cwd: repoRoot })).stdout;
+  if (after !== before) throw new Error("build changed tracked or untracked source; refusing artifact");
   const temp = await fs.mkdtemp(path.join(os.tmpdir(), "seam-bridge-release-"));
   const payload = path.join(temp, "payload"); await fs.mkdir(payload, { mode: 0o700 });
   const files = await collectArtifactFiles(repoRoot);

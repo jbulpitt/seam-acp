@@ -228,11 +228,65 @@ describe("bridge rollout gating and verification (#241)", () => {
     expect(fake).toHaveBeenCalledOnce();
   });
 
-  it("refuses checksum mismatch and dirty artifact sources", async () => {
+  it("refuses checksum mismatch and MODIFIED TRACKED artifact sources", async () => {
     expect(verifyChecksum("a".repeat(64), "a".repeat(64))).toBe(true);
     expect(() => verifyChecksum("a".repeat(64), "b".repeat(64))).toThrow(/checksum mismatch/);
-    const fake = vi.fn(async () => ({ stdout: "?? investigation.txt\n", stderr: "" }));
-    await expect(buildArtifact("/unused", fake)).rejects.toThrow(/dirty/);
+    // The guard that matters is unchanged: tracked source edits still refuse.
+    const fake = vi.fn(async () => ({ stdout: " M packages/bridge/src/index.ts\n", stderr: "" }));
+    await expect(buildArtifact("/unused", fake)).rejects.toThrow(/modified tracked/);
+  });
+
+  it("#484: an untracked scratch file no longer blocks staging", async () => {
+    // It blocked twice on 2026-09-21, both times on a scratch script written
+    // into scripts/. Nothing untracked can reach the artifact —
+    // `collectArtifactFiles` takes fixed manifests plus the two dist trees —
+    // so this is ergonomics, not a weakened guard.
+    const calls: string[][] = [];
+    const fake = vi.fn(async (cmd: { file: string; args: string[] }) => {
+      calls.push([cmd.file, ...cmd.args]);
+      if (cmd.args.includes("--untracked-files=no")) return { stdout: "", stderr: "" };
+      if (cmd.args.includes("--untracked-files=all")) return { stdout: "?? scripts/scratch.mjs\n", stderr: "" };
+      if (cmd.args.includes("rev-parse")) return { stdout: "not-a-sha\n", stderr: "" };
+      return { stdout: "", stderr: "" };
+    });
+    // It gets PAST the worktree gate and fails later, on the SHA — which is
+    // the proof that the untracked file no longer refuses.
+    await expect(buildArtifact("/unused", fake as never)).rejects.toThrow(/committed source SHA/);
+    expect(calls.some((c) => c.includes("--untracked-files=no"))).toBe(true);
+  });
+
+  it("#484: still refuses when the BUILD changes the worktree", async () => {
+    // The post-build check used to compare against empty. It now compares
+    // against a pre-build snapshot, so a pre-existing untracked file cannot
+    // masquerade as a build side effect — but a real one must still refuse.
+    // Mutation found this guard had no coverage at all after the rewrite.
+    let builds = 0;
+    const fake = vi.fn(async (cmd: { file: string; args: string[] }) => {
+      if (cmd.file === "npm") { builds += 1; return { stdout: "", stderr: "" }; }
+      if (cmd.args?.includes("--untracked-files=no")) return { stdout: "", stderr: "" };
+      if (cmd.args?.includes("--untracked-files=all")) {
+        // Clean before the build; the build then wrote something.
+        return { stdout: builds ? "?? packages/bridge/generated.js\n" : "", stderr: "" };
+      }
+      if (cmd.args?.includes("rev-parse")) return { stdout: `${"a".repeat(40)}\n`, stderr: "" };
+      return { stdout: "", stderr: "" };
+    });
+    await expect(buildArtifact("/unused", fake as never)).rejects.toThrow(/build changed tracked or untracked source/);
+  });
+
+  it("#484: a pre-existing untracked file is not mistaken for a build side effect", async () => {
+    let builds = 0;
+    const fake = vi.fn(async (cmd: { file: string; args: string[] }) => {
+      if (cmd.file === "npm") { builds += 1; return { stdout: "", stderr: "" }; }
+      if (cmd.args?.includes("--untracked-files=no")) return { stdout: "", stderr: "" };
+      // The same scratch file before and after — unchanged by the build.
+      if (cmd.args?.includes("--untracked-files=all")) return { stdout: "?? scripts/scratch.mjs\n", stderr: "" };
+      if (cmd.args?.includes("rev-parse")) return { stdout: `${"a".repeat(40)}\n`, stderr: "" };
+      return { stdout: "", stderr: "" };
+    });
+    // Gets past both worktree gates and fails later, in artifact assembly.
+    await expect(buildArtifact("/unused", fake as never)).rejects.not.toThrow(/worktree|build changed/);
+    expect(builds).toBe(2);
   });
 
   it("requires nonce, target, PIDs, instance, ordered fresh window, controller ack and both RPCs", () => {
@@ -273,7 +327,12 @@ describe("bridge rollout gating and verification (#241)", () => {
     expect(source).not.toMatch(/pm2\s+(?:restart|reload|jlist|prettylist|env)\b/i);
     expect(source).not.toMatch(/SIGTERM|SIGKILL.*oldPid/);
     expect(source).toContain('process.kill(before.pid, "SIGUSR2")');
-    expect(source).toContain('preflight.report.rollout_ready !== "yes"');
+    // #484 re-aimed this, and tightened it. The gate is spelled
+    // `report.rollout_ready !== "yes"` since the preflight result is
+    // destructured, and it now guards BOTH the single-host path and the
+    // combined stage+activate path — so require it in both rather than once.
+    expect(source.match(/report\.rollout_ready !== "yes"/g)?.length ?? 0).toBeGreaterThanOrEqual(2);
+    expect(source).toContain("activationRefusal(report)");
   });
 });
 

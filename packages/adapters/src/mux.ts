@@ -63,6 +63,28 @@ const LIVENESS_TICK_MS = 5_000;
  * The bridge's spawn handler does pure config work and launches nothing, so a
  * 30s wait there was never measuring slowness.
  */
+/**
+ * What the bridge directly observes about one slot (#442).
+ *
+ * Deliberately has no `midTurn`. The bridge is a byte mux: it forwards frames
+ * and never parses ACP, so it cannot see a `session/prompt` begin or end. It
+ * would have to INFER mid-turn from "stdin arrived and stdout has not", which
+ * is the mistake the manifesto names — when the authoritative fact exists
+ * somewhere, do not re-derive it somewhere else. seam-acp holds that fact.
+ *
+ * So the bridge reports what it can see, and `lastStdinMsAgo` is the piece
+ * that makes the seam-acp-side judgement possible: silence since input is
+ * suspicious, silence with no input is just idle.
+ */
+export interface BridgeSlotHealth {
+  slot: number;
+  alive: boolean;
+  pid: number | null;
+  /** Null when the bridge has never observed the event, never 0. */
+  lastStdoutMsAgo: number | null;
+  lastStdinMsAgo: number | null;
+}
+
 export class BridgeUnreachableError extends Error {
   readonly bridgeUnreachable = true;
   /**
@@ -189,6 +211,13 @@ export function makeMux(opts: {
   onHello?: (hello: HelloFrame) => void;
   onEvent?: (event: EventFrame) => void;
   onDisconnect?: () => void;
+  /**
+   * #442: per-slot health as the BRIDGE observed it, delivered on every
+   * same-instance reconnect probe. Facts only — liveness and silence — with
+   * no verdict attached, because whether silence means a stuck turn depends
+   * on whether a prompt is outstanding, and that fact lives in seam-acp.
+   */
+  onSlotHealth?: (health: readonly BridgeSlotHealth[]) => void;
   /** #427: fired when liveness terminates a socket, before `close`. */
   onLivenessTimeout?: () => void;
   /**
@@ -384,8 +413,25 @@ export function makeMux(opts: {
         // evict it immediately so the turn fails fast rather than waiting for the
         // turn timeout.
         if (!isNewInstance && slots.size > 0) {
-          void sendCmd("listSlots", {}).then((reply: { slots: number[] }) => {
-            const liveOnBridge = new Set<number>(reply.slots);
+          void sendCmd("listSlots", {}).then((reply: {
+            slots: number[];
+            health?: BridgeSlotHealth[];
+          }) => {
+            // #442: an older bridge sends no `health`, which means "no
+            // opinion" — never "unhealthy". Eviction still keys on the slot
+            // list exactly as before, so a mixed-version fleet behaves today's
+            // way rather than a new way nobody has tested.
+            const health = Array.isArray(reply.health) ? reply.health : [];
+            // A slot the bridge lists but reports dead is evicted too: the
+            // list says "I have an entry", `alive` says "the process is
+            // gone", and the second is the stronger statement.
+            const deadOnBridge = new Set<number>(
+              health.filter((h) => h && h.alive === false).map((h) => h.slot)
+            );
+            const liveOnBridge = new Set<number>(
+              reply.slots.filter((slot) => !deadOnBridge.has(slot))
+            );
+            if (health.length) opts.onSlotHealth?.(health);
             for (const [slot, entry] of [...slots]) {
               if (!entry.killed && !liveOnBridge.has(slot)) {
                 send({ slot, type: "kill" });

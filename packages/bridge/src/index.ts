@@ -254,6 +254,14 @@ function makeSlotManager(opts: {
   const slotConfigs = new Map<number, SlotSpawnConfig>();
   let draining = false;
   const lastStdoutAt = new Map<number, number>();
+  /**
+   * #442: when seam-acp last wrote INTO this slot. Directly observed by the
+   * bridge, and the half that makes silence interpretable: stdout silence
+   * alone cannot distinguish "working on a prompt" from "idle, nobody asked
+   * it anything". Paired with `lastStdoutMsAgo` it lets the OWNER of the
+   * turn fact — seam-acp — decide, without the bridge guessing.
+   */
+  const lastStdinAt = new Map<number, number>();
   const slotInputRewriters = new Map<number, BridgeMcpInputRewriter>();
 
   function setWs(ws: WsSocket | null) {
@@ -319,6 +327,7 @@ function makeSlotManager(opts: {
       console.error(`[bridge] Slot ${slot} agent exited (code=${code}, signal=${signal})`);
       slots.delete(slot);
       lastStdoutAt.delete(slot);
+      lastStdinAt.delete(slot);
       slotInputRewriters.delete(slot);
       muxSend(currentWs, WebSocket, slot, "exit", { code: code ?? 1 });
     });
@@ -508,9 +517,31 @@ function makeSlotManager(opts: {
         );
         result = null;
       } else if (action === "listSlots") {
-        // Returns the slot IDs of currently-active agent processes so the
-        // seam-acp side can detect and evict stale slots on reconnect.
-        result = { slots: [...slots.keys()] };
+        // #442: the bridge holds the process. It is the only participant that
+        // can answer "is it alive" and "when did it last speak" by OBSERVING
+        // rather than inferring, so it answers exactly those and no more.
+        //
+        // `slots` stays first and unchanged: a new bridge must keep answering
+        // an old seam-acp, and an old bridge answering a new seam-acp simply
+        // omits `health` — which the caller treats as "no opinion" rather
+        // than as "unhealthy". The frame is an array of objects so #456 can
+        // hang a stderr tail off the same shape without another protocol turn.
+        const now = Date.now();
+        result = {
+          slots: [...slots.keys()],
+          health: [...slots.entries()].map(([slot, child]) => ({
+            slot,
+            // Liveness, not an opinion about the turn: `exitCode === null`
+            // and no signal means the OS still has this process.
+            alive: child.exitCode === null && child.signalCode === null && !child.killed,
+            pid: child.pid ?? null,
+            // `null`, never 0, when the bridge has never seen the event —
+            // "not observed" and "observed just now" are different facts and
+            // collapsing them is how a fresh slot reads as 0ms-silent.
+            lastStdoutMsAgo: lastStdoutAt.has(slot) ? now - lastStdoutAt.get(slot)! : null,
+            lastStdinMsAgo: lastStdinAt.has(slot) ? now - lastStdinAt.get(slot)! : null,
+          })),
+        };
       } else if (action === "writeAttachment") {
         result = await writeAttachment(payload.cwd, payload.filename, payload.base64);
       } else {
@@ -585,7 +616,10 @@ function makeSlotManager(opts: {
       const agent = getOrSpawnSlot(msg.slot);
       if (agent && !agent.killed) {
         const rewritten = slotInputRewriters.get(msg.slot)?.push(msg.data) ?? msg.data;
-        if (rewritten) agent.stdin?.write(rewritten);
+        if (rewritten) {
+          lastStdinAt.set(msg.slot, Date.now());
+          agent.stdin?.write(rewritten);
+        }
       }
     } else if (msg.type === "kill") {
       const agent = slots.get(msg.slot);

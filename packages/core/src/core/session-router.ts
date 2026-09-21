@@ -316,6 +316,7 @@ export class SessionRouter {
    * turns wait on this barrier before respawning the same durable session. */
   private readonly retirements = new Map<string, Promise<void>>();
   private readonly runtimeIdleTtlMs: number;
+  private readonly turnStalenessBoundMs: number;
   private readonly runtimeIdleSweepMs: number;
   private readonly sessionLoadTimeoutMs: number | undefined;
   private idleReaperTimer?: ReturnType<typeof setInterval>;
@@ -346,6 +347,9 @@ export class SessionRouter {
     runtimeIdleSweepMs?: number;
     /** Test/embedding override forwarded to AgentRuntime. */
     sessionLoadTimeoutMs?: number;
+    /** #442: silence past this means a `busy` belief is stale. Derived from
+     *  TURN_TIMEOUT_SECONDS by the caller; 0 disables the staleness verdict. */
+    turnStalenessBoundMs?: number;
     /**
      * Production passes `OLLAMA_CLOUD_ENABLED`. When false, a leftover
      * ollama-cloud session fails with the parked message rather than
@@ -367,6 +371,7 @@ export class SessionRouter {
     this.defaultCwd = opts.defaultCwd ?? process.cwd();
     this.ollamaCloudEnabled = opts.ollamaCloudEnabled;
     this.runtimeIdleTtlMs = Math.max(0, opts.runtimeIdleTtlMs ?? 0);
+    this.turnStalenessBoundMs = Math.max(0, opts.turnStalenessBoundMs ?? 0);
     this.runtimeIdleSweepMs = Math.max(
       1_000,
       opts.runtimeIdleSweepMs ?? Math.min(300_000, Math.max(30_000, Math.floor(this.runtimeIdleTtlMs / 4)))
@@ -795,6 +800,15 @@ export class SessionRouter {
    */
   async getOrStartRuntime(record: SessionRecord, recovery?: { resumeSessionId: string }): Promise<AgentRuntime> {
     const verify = (rt: AgentRuntime): AgentRuntime => {
+      // #442: this checked IDENTITY only — is this the right ACP session —
+      // and never whether the runtime could still answer. A cached runtime
+      // whose in-flight reply was lost passes every identity check and then
+      // hands the caller a session that is mid-turn forever. Health comes
+      // from the one owner rather than being re-derived from `busy` here.
+      const health = this.turnHealth(record.id);
+      if (health.stalled) {
+        throw new Error(`Cached runtime is believed mid-turn but has been silent for ${Math.round(health.silentMs / 1000)}s; refusing to reuse it`);
+      }
       const current = recovery ? this.store.get(record.id) : undefined;
       if (recovery && current?.acpSessionId && current.acpSessionId !== recovery.resumeSessionId) {
         throw new Error("Strict resume refused: thread session changed during acquisition");
@@ -818,8 +832,13 @@ export class SessionRouter {
 
     const cached = this.runtimes.get(record.id);
     if (cached) {
-      cached.markActivity();
-      return verify(cached);
+      // #442: verify BEFORE touching. `markActivity()` moves
+      // `lastActivityAtMs` to now, which is precisely the evidence the
+      // staleness verdict reads — touching first erased the proof that the
+      // runtime was stuck and made the check unreachable. Observe, then touch.
+      const verified = verify(cached);
+      verified.markActivity();
+      return verified;
     }
 
     const inflight = this.creationLocks.get(record.id);
@@ -975,7 +994,13 @@ export class SessionRouter {
       const candidates: Array<[string, AgentRuntime]> = [];
       for (const [sessionId, rt] of this.runtimes) {
         if (candidates.length >= 8) break;
-        if (rt.busy) continue;
+        // #442: was `if (rt.busy) continue`, which a stale `promptInFlight`
+        // turned into a permanent exemption — the runtime nobody could reap
+        // was exactly the one that would never finish. Asking the one owner
+        // means a runtime believed busy but silent past any legal turn is
+        // reapable, while one genuinely working is still protected.
+        const health = this.turnHealth(sessionId, nowMs);
+        if (health.busy && !health.stalled) continue;
         if (nowMs - rt.lastActivityAtMs < this.runtimeIdleTtlMs) continue;
         candidates.push([sessionId, rt]);
       }
@@ -985,7 +1010,9 @@ export class SessionRouter {
         candidates.map(async ([sessionId, rt]) => {
           // Recheck immediately before the synchronous cache removal. No await
           // occurs between this guard and retireRuntime's ownership claim.
-          if (this.runtimes.get(sessionId) !== rt || rt.busy) return;
+          // Re-checked against the same owner immediately before removal.
+          const recheck = this.turnHealth(sessionId, nowMs);
+          if (this.runtimes.get(sessionId) !== rt || (recheck.busy && !recheck.stalled)) return;
           if (nowMs - rt.lastActivityAtMs < this.runtimeIdleTtlMs) return;
           await this.retireRuntime(sessionId, rt, "idle_ttl");
         })
@@ -1024,8 +1051,50 @@ export class SessionRouter {
    *  `hasRuntime`, which answers the weaker "runtime alive" question; this is the
    *  load-bearing signal `threads()` uses to steer send (pull-only) vs
    *  steer/handoff (interrupting). */
+  /**
+   * The one place that answers "is this session mid-turn?" (#442).
+   *
+   * Four call sites used to answer it independently, and all four read the
+   * same boolean — `promptInFlight` — which goes stale the moment the
+   * transport hiccups. A lost in-flight reply leaves it `true` forever: the
+   * runtime is kept, the queue reads busy, the reaper skips it, and resume
+   * hands the caller a runtime that will never answer.
+   *
+   * `busy` alone is a BELIEF. `lastActivityAtMs` is an OBSERVATION — it
+   * advances on real agent output. Where they disagree past the point any
+   * legal turn could still be running, the observation wins.
+   *
+   * The staleness bound is derived, not chosen: a turn cannot legitimately
+   * outlive `TURN_TIMEOUT_SECONDS`, so silence beyond it means the belief is
+   * wrong rather than the turn being slow. That makes `stalled` strictly
+   * later than the deadline that should already have fired — it fires only
+   * when that deadline did NOT, which is precisely the bug.
+   */
+  turnHealth(sessionId: string, nowMs = Date.now()): {
+    busy: boolean;
+    silentMs: number;
+    stalled: boolean;
+  } {
+    const rt = this.runtimes.get(sessionId);
+    if (!rt) return { busy: false, silentMs: 0, stalled: false };
+    const silentMs = Math.max(0, nowMs - rt.lastActivityAtMs);
+    const bound = this.turnStalenessBoundMs;
+    return {
+      busy: rt.busy,
+      silentMs,
+      // Only a runtime we BELIEVE is working can be stalled. An idle runtime
+      // that has been silent for an hour is just idle.
+      stalled: rt.busy && bound > 0 && silentMs > bound,
+    };
+  }
+
+  /**
+   * True when the session is mid-turn AND we still have reason to believe it.
+   * This is what every consumer should ask instead of reading `busy`.
+   */
   isBusy(sessionId: string): boolean {
-    return this.runtimes.get(sessionId)?.busy ?? false;
+    const health = this.turnHealth(sessionId);
+    return health.busy && !health.stalled;
   }
 
   /**

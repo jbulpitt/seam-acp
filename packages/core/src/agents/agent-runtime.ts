@@ -27,6 +27,8 @@ import {
 import {
   SEAM_AGY_JSON_SCHEMA_META,
   SEAM_AGY_CATALOG_REFRESH_META,
+  attachErrorClassification,
+  unclassified,
   type AgentProfile,
   type CatalogEffort,
 } from "@seam/adapters";
@@ -496,6 +498,10 @@ export class AgentRuntime {
 
   /** Start the agent process and complete ACP `initialize`. */
   async start(): Promise<void> {
+    return this.withClassifiedErrors("start", () => this.startUnclassified());
+  }
+
+  private async startUnclassified(): Promise<void> {
     if (this.connection) return;
     const child = this.spawnFn
       ? await this.spawnFn(this.modelOverride, this.effortOverride)
@@ -657,6 +663,10 @@ export class AgentRuntime {
 
   /** Create a new ACP session in `cwd`. */
   async newSession(opts: NewSessionOptions): Promise<SessionInfo> {
+    return this.withClassifiedErrors("session/new", () => this.newSessionUnclassified(opts));
+  }
+
+  private async newSessionUnclassified(opts: NewSessionOptions): Promise<SessionInfo> {
     // Fresh session: no history to replay, so never gate. (A prior failed
     // loadSession may have toggled the load flags without setting justResumed;
     // reset defensively so a fresh session can't inherit stale resume state.)
@@ -736,6 +746,10 @@ export class AgentRuntime {
     /** Isolated ingest: fail the load instead of warning on setModel. */
     strictModel?: boolean;
   }): Promise<SessionInfo> {
+    return this.withClassifiedErrors("session/load", () => this.loadSessionUnclassified(opts));
+  }
+
+  private async loadSessionUnclassified(opts: Parameters<AgentRuntime["loadSession"]>[0]): Promise<SessionInfo> {
     const conn = this.requireConnection();
     const meta: Record<string, unknown> = {
       ...(this.profile.newSessionMeta?.(opts.model, opts.effort) ?? {}),
@@ -841,6 +855,50 @@ export class AgentRuntime {
   }
 
   async prompt(
+    text: string,
+    attachments?: ReadonlyArray<MessageAttachment>,
+    opts?: { jsonSchema?: Record<string, unknown> }
+  ): Promise<PromptOutcome> {
+    return this.withClassifiedErrors("session/prompt", () => this.promptUnclassified(text, attachments, opts));
+  }
+
+  /** #440/#441: one adapter report for each failure escaping the runtime.
+   * Missing/broken classifiers refuse only certainty, not the original error or
+   * recovery. Include every agent in the unclassified-rate denominator. Existing
+   * bounded retries stay owned here until #448; this adds no retry layer. */
+  private async withClassifiedErrors<T>(operation: string, run: () => Promise<T>): Promise<T> {
+    try {
+      return await run();
+    } catch (original) {
+      // ACP normally throws mutable RequestError. Primitive/frozen rejections
+      // must also carry data without masking their cause with an assignment error.
+      let error: object = original && typeof original === "object" && Object.isExtensible(original)
+        ? original : Object.assign(new Error(
+          original instanceof Error ? original.message : String(original), { cause: original }),
+          original && typeof original === "object" ? original : {});
+      let classification;
+      try {
+        classification = this.profile.classifyError?.(error) ?? unclassified(this.profile.id);
+      } catch {
+        // Adapter failure must remain attributable without replacing the provider
+        // error with a classifier bug. No downstream English parsing fallback.
+        classification = unclassified(this.profile.id, "adapter classifier threw");
+      }
+      classification = { ...classification, agentId: this.profile.id };
+      try {
+        attachErrorClassification(error, classification);
+      } catch {
+        error = Object.assign(new Error(
+          original instanceof Error ? original.message : String(original), { cause: original }), error);
+        attachErrorClassification(error, classification);
+      }
+      this.logger.warn({ agentId: this.profile.id, errorKind: classification.errorKind, operation },
+        "adapter error classified");
+      throw error;
+    }
+  }
+
+  private async promptUnclassified(
     text: string,
     attachments?: ReadonlyArray<MessageAttachment>,
     opts?: { jsonSchema?: Record<string, unknown> }

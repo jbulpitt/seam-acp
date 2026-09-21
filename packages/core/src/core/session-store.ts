@@ -1129,6 +1129,22 @@ export class SessionStore {
     return rows.map(mapRow);
   }
 
+  /**
+   * Every session row, newest activity first. Uncapped.
+   *
+   * `list(100)` is the operator listing cap. Feeding it to warm-set
+   * enumeration (#446) would silently drop every thread past the global 100 —
+   * the same failure `listSessionsByParent` exists to prevent. Quiet threads
+   * are exactly the ones recency would otherwise starve, and they are the
+   * ones a host still owns.
+   */
+  listSessionsUncapped(): SessionRecord[] {
+    return this.db
+      .prepare<[], Row>("SELECT * FROM sessions ORDER BY updated_utc DESC, id ASC")
+      .all()
+      .map(mapRow);
+  }
+
   agyIdentityRestored(): boolean {
     return !!this.db.prepare("SELECT 1 FROM agy_identity_restore WHERE id = '@complete'").get();
   }

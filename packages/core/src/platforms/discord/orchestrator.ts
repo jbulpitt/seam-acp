@@ -48,6 +48,8 @@ import type {
   SessionRecord,
 } from "../chat-adapter.js";
 import { AgentRuntime, type AgentEventHandler, type PromptOutcome } from "../../agents/agent-runtime.js";
+import { readErrorClassification, resolveError, unclassified } from "@seam/adapters";
+import { DEFAULT_ERROR_RULES } from "../../core/error-resolution-rules.js";
 import { cleanTextForPreview, scanWorkspaces, type SessionSummary, type SessionSummaryLine, type ISessionManager } from "@seam/adapters";
 import type { ModelCatalogService, CatalogBinding } from "../../core/model-catalog/service.js";
 import type { ModelIntelligenceRefreshResult } from "../../core/model-intelligence/manager.js";
@@ -3852,16 +3854,6 @@ export class Orchestrator {
       const msg = e instanceof Error ? e.message : String(e);
       return msg.includes("ACP connection closed");
     };
-    // Transient server-side throttle — "Server is temporarily limiting requests
-    // (not your usage limit) · Rate limited". NOT a quota/usage error; it clears
-    // on its own, so a short backoff-and-retry recovers it invisibly.
-    const isRateLimitError = (e: unknown): boolean => {
-      const err = e as { data?: { errorKind?: string }; message?: string } | undefined;
-      if (err?.data?.errorKind === "rate_limit") return true;
-      const msg = e instanceof Error ? e.message : String(e);
-      return /temporarily limiting requests|rate limited/i.test(msg);
-    };
-
     let quotaRequest: QuotaConnectionRequest | undefined;
 
     // Available during session/new as well as session/prompt so request-scoped
@@ -4407,6 +4399,9 @@ export class Orchestrator {
         result = await raceWithTimeout(activeRuntime.prompt(promptText, promptAttachments), timeoutMs);
         this.assertQueueFence(queueFence);
       } catch (promptErr) {
+        const resolution = resolveError(
+          readErrorClassification(promptErr) ?? unclassified(record.agentId), DEFAULT_ERROR_RULES);
+        this.logger.warn({ session: record.id, resolution }, "turn recovery resolved");
         // No-output is not proof that no tools ran. Owned human input is never
         // transparently replayed, including a rate limit after submission.
         if (humanAttempt) throw promptErr;
@@ -4431,7 +4426,8 @@ export class Orchestrator {
           acpUsageReceived = false;
           activeRuntime.onEvent(eventHandler);
           result = await raceWithTimeout(activeRuntime.prompt(promptText, promptAttachments), timeoutMs);
-        } else if (isRateLimitError(promptErr) && !textSent && !textBuffer) {
+        } else if (resolution.action === "recover" && resolution.errorKind === "rate_limit" && resolution.transience === "transient"
+          && resolution.startRung === 1 && !textSent && !textBuffer) {
           // Transient server-side throttle with nothing emitted yet: the session
           // is intact, so back off and retry the SAME prompt on the SAME runtime
           // (no invalidate). Guarded on no-output-yet so a mid-stream limit can't
@@ -4445,7 +4441,10 @@ export class Orchestrator {
               rlResult = await raceWithTimeout(activeRuntime.prompt(promptText, promptAttachments), timeoutMs);
               break;
             } catch (rlErr) {
-              if (!isRateLimitError(rlErr)) throw rlErr; // a different failure — surface it
+              const retryResolution = resolveError(
+                readErrorClassification(rlErr) ?? unclassified(record.agentId), DEFAULT_ERROR_RULES);
+              if (retryResolution.action !== "recover" || retryResolution.errorKind !== "rate_limit" || retryResolution.transience !== "transient"
+                || retryResolution.startRung !== 1) throw rlErr; // a different failure — surface it
             }
           }
           if (rlResult === undefined) throw promptErr; // still throttled after backoff

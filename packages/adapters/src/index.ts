@@ -3,6 +3,7 @@ export { makeMux, BridgeUnreachableError } from "./mux.js";
 export type { MuxSpawnOpts, MuxChild } from "./mux.js";
 export * from "./agent-profile.js";
 export * from "./error-classification.js";
+export * from "./error-resolver.js";
 export * from "./catalog-evidence.js";
 export * from "./model-catalog.js";
 export * from "./probe-process.js";

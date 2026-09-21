@@ -183,8 +183,67 @@ export class ModelIntelligenceStore {
         INSERT INTO model_intelligence_active(singleton, generation) VALUES (1, ?)
         ON CONFLICT(singleton) DO UPDATE SET generation = excluded.generation
       `).run(generation);
+      if (input.catalogSignature !== "legacy-unknown") {
+        this.replaceMetadataCompatibilityProjection(metadata);
+      }
       this.pruneHistory();
       return { generation, schemaVersion: MODEL_INTELLIGENCE_SCHEMA_VERSION, ...input, metadata, values };
+    })();
+  }
+
+  /**
+   * Keep the pre-#249 table truthful for rollback code and for #449's
+   * precomputed fallback reader. #455 reached this production path: the
+   * coordinated generation contained Astra's AA record while `model_metadata`
+   * remained frozen at its 2026-09-10 null benchmark. Removing this projection
+   * recreates that split brain; coordinated JSON readers keep working, but the
+   * compatibility reader silently loses published benchmark evidence.
+   *
+   * The old schema has one row per model, so scope variants are collapsed only
+   * when their external enrichment agrees exactly. Catalog-owned availability
+   * is merged conservatively: an unknown window in any scope leaves the
+   * projection's window unknown, and otherwise the smallest window is used.
+   * The coordinated generation remains authoritative and retains every
+   * per-effort benchmark variant and binding.
+   */
+  replaceMetadataCompatibilityProjection(rows: readonly ModelMetadata[]): void {
+    const table = this.db.prepare(
+      "SELECT 1 FROM sqlite_master WHERE type='table' AND name='model_metadata'"
+    ).get();
+    if (!table) return;
+    const columns = new Set(
+      (this.db.prepare("PRAGMA table_info(model_metadata)").all() as Array<{ name: string }>)
+        .map((entry) => entry.name)
+    );
+    const required = [
+      "model_id", "name", "aliases_json", "aa_slug", "source_id", "source_name", "provider",
+      "creator_json", "agents_json", "agent_models_json", "context_window", "intelligence_index",
+      "benchmarks_json", "pricing_json", "released_at", "description", "evidence_json", "source",
+      "fetched_at",
+    ];
+    const missing = required.filter((column) => !columns.has(column));
+    if (missing.length > 0) {
+      throw new Error(`model_metadata compatibility projection schema is missing: ${missing.join(", ")}`);
+    }
+
+    const projection = projectCompatibilityMetadata(rows);
+    if (projection.length === 0) return;
+    const insert = this.db.prepare(`
+      INSERT INTO model_metadata (
+        model_id, name, aliases_json, aa_slug, source_id, source_name, provider,
+        creator_json, agents_json, agent_models_json, context_window,
+        intelligence_index, benchmarks_json, pricing_json, released_at,
+        description, evidence_json, source, fetched_at
+      ) VALUES (
+        @model_id, @name, @aliases_json, @aa_slug, @source_id, @source_name, @provider,
+        @creator_json, @agents_json, @agent_models_json, @context_window,
+        @intelligence_index, @benchmarks_json, @pricing_json, @released_at,
+        @description, @evidence_json, @source, @fetched_at
+      )
+    `);
+    this.db.transaction(() => {
+      this.db.prepare("DELETE FROM model_metadata").run();
+      for (const row of projection) insert.run(row);
     })();
   }
 
@@ -302,6 +361,95 @@ export class ModelIntelligenceStore {
       values: [],
     });
   }
+}
+
+type CompatibilityMetadataRow = {
+  model_id: string;
+  name: string;
+  aliases_json: string;
+  aa_slug: string | null;
+  source_id: string | null;
+  source_name: string | null;
+  provider: string | null;
+  creator_json: string | null;
+  agents_json: string;
+  agent_models_json: string;
+  context_window: number | null;
+  intelligence_index: number | null;
+  benchmarks_json: string;
+  pricing_json: string | null;
+  released_at: string | null;
+  description: string | null;
+  evidence_json: string;
+  source: string;
+  fetched_at: string;
+};
+
+function projectCompatibilityMetadata(rows: readonly ModelMetadata[]): CompatibilityMetadataRow[] {
+  const grouped = new Map<string, ModelMetadata[]>();
+  for (const row of rows) {
+    const group = grouped.get(row.id) ?? [];
+    group.push(row);
+    grouped.set(row.id, group);
+  }
+  return [...grouped.entries()].sort(([left], [right]) => left.localeCompare(right)).map(([id, group]) => {
+    group.sort((left, right) => (left.variant_id ?? left.id).localeCompare(right.variant_id ?? right.id));
+    const representative = group[0]!;
+    const enrichment = group.map((row) => JSON.stringify({
+      slug: row.slug,
+      source_id: row.source_id,
+      source_name: row.source_name,
+      provider: row.provider,
+      creator: row.creator,
+      intelligence_index: row.intelligence_index,
+      benchmarks: row.benchmarks,
+      pricing: row.pricing,
+      released_at: row.released_at,
+      source: row.source,
+      fetched_at: row.fetched_at,
+    }));
+    const enrichmentAgrees = new Set(enrichment).size === 1;
+    const windows = group.map((row) => row.context_window);
+    const contextWindow = windows.every((value): value is number => value !== null)
+      ? Math.min(...windows)
+      : null;
+    const aliases = [...new Set(group.flatMap((row) => row.aliases))].sort();
+    const agents = [...new Set(group.flatMap((row) => row.agents))].sort();
+    const agentModels = uniqueJson(group.flatMap((row) => row.agent_models));
+    const evidence = uniqueJson(group.flatMap((row) => row.evidence));
+    const descriptions = [...new Set(group.flatMap((row) => row.description ? [row.description] : []))];
+    const source = enrichmentAgrees ? representative : null;
+    return {
+      model_id: id,
+      name: representative.name,
+      aliases_json: JSON.stringify(aliases),
+      aa_slug: source?.slug ?? null,
+      source_id: source?.source_id ?? null,
+      source_name: source?.source_name ?? null,
+      provider: source?.provider ?? null,
+      creator_json: source?.creator ? JSON.stringify(source.creator) : null,
+      agents_json: JSON.stringify(agents),
+      agent_models_json: JSON.stringify(agentModels),
+      context_window: contextWindow,
+      intelligence_index: source?.intelligence_index ?? null,
+      benchmarks_json: JSON.stringify(source?.benchmarks ?? {}),
+      pricing_json: source?.pricing ? JSON.stringify(source.pricing) : null,
+      released_at: source?.released_at ?? null,
+      description: descriptions.length === 1 ? descriptions[0]! : null,
+      evidence_json: JSON.stringify(evidence),
+      source: source?.source ?? "model-intelligence:scope-enrichment-conflict",
+      fetched_at: group.map((row) => row.fetched_at).sort().at(-1)!,
+    };
+  });
+}
+
+function uniqueJson<T>(values: readonly T[]): T[] {
+  const seen = new Map<string, T>();
+  for (const value of values) {
+    const key = JSON.stringify(value);
+    if (!seen.has(key)) seen.set(key, value);
+  }
+  return [...seen.entries()].sort(([left], [right]) => left.localeCompare(right)).map(([, value]) => value);
 }
 
 function mapSource<T>(row: Record<string, unknown>): IntelligenceSourceSnapshot<T> {

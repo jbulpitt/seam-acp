@@ -1,10 +1,23 @@
 import type { ChildProcess } from "node:child_process";
 import fs from "node:fs/promises";
+import {
+  attachErrorClassification,
+  classified,
+  type AdapterErrorKind,
+} from "./error-classification.js";
 import { ProbeError, terminateProcessGroup, type ProbeErrorCode } from "./probe-process.js";
 
 /** Never retain raw CLI diagnostics: they may contain auth, prompts or paths. */
-export function agyFailure(code: ProbeErrorCode): ProbeError {
-  return new ProbeError(code, "native AGY lifecycle failed");
+export function agyFailure(code: ProbeErrorCode, errorKind?: AdapterErrorKind): ProbeError {
+  const failure = new ProbeError(code, "native AGY lifecycle failed");
+  if (errorKind) {
+    // #481: retain only the closed enum learned before the diagnostic is
+    // destroyed. Attaching `details` here would recreate the credential leak
+    // this boundary exists to prevent; agent id + kind are sufficient for the
+    // resolver, and every raw token/path/prompt still dies above this return.
+    attachErrorClassification(failure, classified("agy", errorKind));
+  }
+  return failure;
 }
 
 /** Abort a wait, not its underlying work; callers must own and close that work. */

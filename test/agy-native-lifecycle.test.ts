@@ -4,7 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { pino } from "pino";
 import { describe, it, expect, vi } from "vitest";
-import { makeAgyProfile } from "@seam/adapters";
+import { makeAgyProfile, readErrorClassification } from "@seam/adapters";
 import { AgentRuntime, type AgentEvent } from "../packages/core/src/agents/agent-runtime.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import { createManagedAgyFixture } from "./helpers/agy-runtime-fixture.js";
@@ -156,6 +156,86 @@ describe.sequential("R5 native production lifecycle", () => {
       }
     } finally { service.stop(); store.close(); managed.cleanup(); fs.rmSync(root, { recursive: true, force: true }); }
   }, 15_000);
+
+  it("#481 closes prompt-free stdin and preserves only auth_required through the real catalog consumer", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "seam-agy-auth-probe-"));
+    const invocationLog = path.join(root, "invocations");
+    const managed = createManagedAgyFixture({
+      source: path.join(fixtures, "fake-native-agy.mjs"), version: "agy fixture 1.1.28", cwd: root,
+      approvedEnvironment: {
+        SEAM_AGY_CAPABILITY_FIXTURE_DIR: fixtures,
+        SEAM_AGY_CAPABILITY_INVOCATIONS: invocationLog,
+        SEAM_AGY_R5_CATALOG_MODE: "auth-wait",
+      },
+    });
+    const profile = makeAgyProfile({ runtime: managed.runtime, defaultModel: "Fixture Native Model" });
+    const store = new ModelCatalogStore(path.join(root, "catalog.db"));
+    const warnings: Array<{ fields: Record<string, unknown>; message: string }> = [];
+    const captureLogger = {
+      info: () => {},
+      warn: (fields: Record<string, unknown>, message: string) => warnings.push({ fields, message }),
+    } as unknown as Logger;
+    const binding = { agentId: "agy", location: "local" };
+    const service = new ModelCatalogService({
+      store, logger: captureLogger, bindings: () => [binding], fetch: () => profile.catalog.fetch(),
+      scope: () => profile.catalog.scope(), refreshCron: "0 0 1 1 *",
+    });
+    const consoleErrors: unknown[][] = [];
+    const consoleSpy = vi.spyOn(console, "error").mockImplementation((...args) => { consoleErrors.push(args); });
+    try {
+      const started = Date.now();
+      const result = await service.refresh(binding);
+      expect(Date.now() - started).toBeLessThan(2_000);
+      expect(result).toMatchObject({ ok: false, result: "retained" });
+
+      const warning = warnings.find((entry) => entry.message === "model catalog refresh failed; previous snapshot retained");
+      expect(warning).toBeDefined();
+      const caught = warning!.fields.err;
+      expect(readErrorClassification(caught)).toMatchObject({
+        agentId: "agy",
+        errorKind: "auth_required",
+      });
+
+      const rows = fs.readFileSync(invocationLog, "utf8").trim().split("\n").map((line) => JSON.parse(line) as Row);
+      const launch = rows.find((row) => row.scenario === "catalog" && row.args?.includes("models"));
+      expect(launch?.pid).toBeTypeOf("number");
+      expect(rows.some((row) => row.scenario === "catalog-stdin-end" && row.pid === launch?.pid)).toBe(true);
+      expect(alive(launch!.pid!)).toBe(false);
+
+      const persisted = store.getRefreshStatus("agy@local");
+      expect(persisted?.error).toBe(result.error);
+      // `result.error` is what the Discord catalog card renders; the caught
+      // error is what the real logger serializes. Both stay generic while the
+      // closed enum survives in `data.errorKind` for the resolver.
+      const caughtRecord = caught as Error & { code?: unknown; detail?: unknown; data?: unknown };
+      const exposed = JSON.stringify({
+        result: result.error,
+        durable: persisted?.error,
+        logged: {
+          text: String(caughtRecord),
+          code: caughtRecord.code,
+          detail: caughtRecord.detail,
+          data: caughtRecord.data,
+        },
+        consoleErrors,
+      });
+      expect(exposed).toContain("auth_required");
+      for (const secret of [
+        "synthetic-secret-token-481",
+        "Authorization: Bearer",
+        root,
+        managed.executable,
+      ]) {
+        expect(exposed).not.toContain(secret);
+      }
+    } finally {
+      consoleSpy.mockRestore();
+      service.stop();
+      store.close();
+      managed.cleanup();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  }, 5_000);
   it.each([
     ["r5-exit", "exited_early"],
     ["r5-stderr", "output_overflow"],

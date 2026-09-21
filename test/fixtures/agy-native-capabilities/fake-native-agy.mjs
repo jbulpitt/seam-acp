@@ -109,6 +109,19 @@ appendInvocation({
   cwd: process.cwd(),
 });
 
+if (isModelsCommand && process.env.SEAM_AGY_R5_CATALOG_MODE === "auth-wait") {
+  process.stderr.write(
+    `Verification required. Please complete verification in your browser to continue. ` +
+    `Authorization: Bearer synthetic-secret-token-481 ${process.env.HOME}\n`,
+  );
+  process.stdin.resume();
+  process.stdin.once("end", () => {
+    appendInvocation({ scenario: "catalog-stdin-end", pid: process.pid });
+    process.exit(41);
+  });
+  setInterval(() => {}, 1_000);
+  await new Promise(() => {});
+}
 if (prompt === "r5-exit" || ((prompt === "ok" || isModelsCommand) && process.env.SEAM_AGY_R5_CATALOG_MODE === "fail")) {
   process.stderr.write(`private diagnostic synthetic-password ${process.env.HOME}\n`);
   process.exit(3);
@@ -186,6 +199,13 @@ const server = http.createServer(async (request, response) => {
   }
 
   if (request.url?.endsWith("/RetrieveUserQuotaSummary")) {
+    if (process.env.SEAM_AGY_QUOTA_DROP_CONNECTION === "1") {
+      // #481: make the real quota callback fail with an unknown diagnostic so
+      // the production probe boundary—not a test-local classifier call—has to
+      // preserve `unclassified` while destroying the raw detail.
+      request.socket.destroy();
+      return;
+    }
     // #361, observed on agy 1.1.27: the LS answers 500 while silent-auth is
     // still landing, then 200. The retry loop exists for exactly this.
     if (quotaFiveHundredsLeft > 0) {

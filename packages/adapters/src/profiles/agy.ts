@@ -94,6 +94,29 @@ function agyKindFromCode(code: string): AdapterErrorKind {
   }
 }
 
+function agyProbeKind(error: unknown): AdapterErrorKind {
+  // The probe helper has already redacted child stderr. Classify that text
+  // without its generic lifecycle code first, otherwise every auth exit is
+  // prematurely labelled `agent_exit` and the useful provider fact is lost.
+  // The runner's `native AGY:` label is transport context, not an AGY error
+  // shape; leaving it in makes the profile's generic native-error matcher turn
+  // every unknown callback failure into `protocol_error` instead of reporting
+  // the adapter's under-classification as `unclassified` (#440/#481).
+  const detail = error instanceof ProbeError
+    ? error.detail.replace(/^native AGY:\s*/i, "")
+    : error;
+  const fromDetail = classifyAgyError(
+    typeof detail === "string" ? new Error(detail) : detail,
+  ).errorKind;
+  if (fromDetail !== "unclassified" || !(error instanceof ProbeError)) return fromDetail;
+
+  // A deadline/cancellation/process-lifecycle code is independently known even
+  // when stderr says nothing. `protocol_error` is deliberately excluded: it
+  // is the wrapper for an arbitrary callback failure, so calling it classified
+  // would hide the #440 ownership signal for a shape AGY does not understand.
+  return error.code === "protocol_error" ? "unclassified" : agyKindFromCode(error.code);
+}
+
 function agyKindFromStreamCode(streamCode: string): AdapterErrorKind | null {
   if (streamCode === "unauthenticated") return "auth_required";
   if (streamCode === "permission_denied") return "permission_denied";
@@ -110,6 +133,12 @@ export function classifyAgyError(error: unknown, agentId = AGY_AGENT_ID): Adapte
 
 function matchAgyError(ctx: ClassifyContext): AdapterErrorClassification | AdapterErrorKind | null {
   const { haystack, agentId, message, data, errorCode } = ctx;
+  if (/\b(?:not authenticated|authentication required|verification required|no oauth token found|saved token invalid|oauth token (?:exchange )?failed|failed to (?:load|refresh|persist) (?:oauth )?(?:credentials|token)|enter (?:the )?(?:authorization|auth) code)\b/.test(haystack)) {
+    // Observed AGY 1.2.0 credential paths (#478). This refuses only the AGY
+    // operation whose silent auth failed; the bridge and every other adapter
+    // remain usable. The caller may retain this KIND, never this message.
+    return classified(agentId, "auth_required", { details: message });
+  }
   if (/\bunknown agy session\b/.test(haystack) || /\bunknown session\b/.test(haystack)) {
     return classified(agentId, "session_gone", {
       details: typeof data?.details === "string" ? data.details : message,
@@ -2286,11 +2315,26 @@ async function runAgyProbe<T>(
         proc = runtime.prepare(args, "/tmp", { detached: true, stdio: ["pipe", "pipe", "pipe"] }).spawn() as ChildProcessWithoutNullStreams;
         return proc;
       },
-      run: async (handle) => { stopObserving = observe?.(proc); return run(handle); },
+      run: async (handle) => {
+        // `runAgyProbe` has exactly two production callers: prompt-free
+        // `agy models` catalog and quota reads. Leaving stdin writable let an
+        // authorization-code prompt wait on a daemon that can never answer it
+        // (#478). EOF refuses this one probe promptly; interactive turns use a
+        // different lifecycle and keep their stdin transport unchanged.
+        handle.stdin.end();
+        stopObserving = observe?.(proc);
+        return run(handle);
+      },
     });
   } catch (error) {
-    // Even the shared redactor cannot know secrets loaded from native auth files.
-    throw agyFailure(error instanceof ProbeError ? error.code : "protocol_error");
+    // Classify the already-redacted diagnostic while it still exists, then
+    // discard ALL text. `agyFailure` accepts only the closed enum, so a token,
+    // authorization code, prompt or path cannot cross this boundary even when
+    // a future classifier recognises a new provider phrase.
+    throw agyFailure(
+      error instanceof ProbeError ? error.code : "protocol_error",
+      agyProbeKind(error),
+    );
   } finally {
     // Do not keep the validator parser/output alive after finite finalization.
     stopObserving?.();

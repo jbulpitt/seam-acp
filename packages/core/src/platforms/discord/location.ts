@@ -8,6 +8,7 @@ import { resolveThreadLocation } from "../../config.js";
 import {
   formatAgentAtLocation,
   formatHostPrefixed,
+  getAgentLocationDeny,
   hostEmoji,
   listAgentLocationChoices,
   listHosts,
@@ -31,6 +32,7 @@ export function agentLocationPickerChoices(
     profiles,
     hosts: listHosts(hosts),
     ...(hosts.agentsByHost ? { agentsByHost: hosts.agentsByHost } : {}),
+    deny: getAgentLocationDeny(),
   });
 }
 

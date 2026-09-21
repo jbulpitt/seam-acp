@@ -43,6 +43,8 @@ Copy `.env.example` to `.env` and fill it in.
 | `DATA_DIR` | no | Defaults to `./data` (sqlite lives here) |
 | `DEFAULT_AGENT` | no | `copilot` (default), `agy`, or `claude`. Plus any `copilot-<id>` / `agy-<id>` / `claude-<id>` registered via the `*_PROFILES` vars. |
 | `DEFAULT_MODEL` | no | Default Copilot model. Applies to **all** Copilot profiles (including extras from `COPILOT_PROFILES`). e.g. `gpt-5.4`, `claude-sonnet-4.5`, `claude-opus-4.7`, `auto` |
+| `AGENT_LOCATION_DENY` | no | Comma-separated `agentId@location` pairs withheld from pickers and spawn. The profile stays registered. Empty = nobody is withheld. Example: `copilot@local`. |
+| `COPILOT_ENABLED` | no | Global entitlement. `false` drops the copilot profile on every host, including `copilot@fhr-server`. Prefer `AGENT_LOCATION_DENY` for host scope. Default `true`. |
 | `COPILOT_CLI_PATH` | no | If `copilot` is not on `PATH` |
 | `AA_API_KEY` | no | Artificial Analysis Data API key. The coordinated model-intelligence refresh retains its independent source LKG when absent or unavailable. |
 | `MODEL_VALUE_STD_INPUT_TOKENS` | no | Uncached input-token count for value comparisons. Default `8000`. |

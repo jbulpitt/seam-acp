@@ -94,7 +94,7 @@ export function parseArgs(argv) {
   const values = new Map();
   const booleans = new Set();
   const valueFlags = new Set(["--target", "--sha", "--checksum", "--stage-id", "--activation-id", "--enrollment-id", "--timeout-seconds"]);
-  const boolFlags = new Set(["--apply", "--stage", "--enroll", "--restore-baseline", "--activate", "--rollback", "--rollout", "--all", "--auto-enroll", "--help"]);
+  const boolFlags = new Set(["--apply", "--stage", "--enroll", "--rebaseline", "--restore-baseline", "--activate", "--rollback", "--rollout", "--all", "--auto-enroll", "--help"]);
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (valueFlags.has(arg)) {
@@ -114,12 +114,12 @@ export function parseArgs(argv) {
   const all = booleans.has("--all");
   if (!target && !all) throw new Error("--target is required (exactly one host), or --all for every rollout-managed host");
   if (target && all) throw new Error("choose either --target <host> or --all, not both");
-  const actions = ["--stage", "--enroll", "--restore-baseline", "--activate", "--rollback", "--rollout"].filter((flag) => booleans.has(flag));
-  if (actions.length > 1) throw new Error("choose only one of --stage, --enroll, --restore-baseline, --activate, --rollback, or --rollout");
+  const actions = ["--stage", "--enroll", "--rebaseline", "--restore-baseline", "--activate", "--rollback", "--rollout"].filter((flag) => booleans.has(flag));
+  if (actions.length > 1) throw new Error("choose only one of --stage, --enroll, --rebaseline, --restore-baseline, --activate, --rollback, or --rollout");
   const action = actions[0]?.slice(2) ?? "preflight";
   const apply = booleans.has("--apply");
   if (action !== "preflight" && !apply) throw new Error(`${actions[0]} mutates a remote host and requires --apply`);
-  if (action === "preflight" && apply) throw new Error("--apply requires one of --stage, --enroll, --restore-baseline, --activate, --rollback, or --rollout");
+  if (action === "preflight" && apply) throw new Error("--apply requires one of --stage, --enroll, --rebaseline, --restore-baseline, --activate, --rollback, or --rollout");
   // #484: fleet mode is deliberately narrow. `restore-baseline`, `activate` and
   // `rollback` each carry an id minted for ONE host, so "the same one for all
   // of them" is meaningless rather than merely unwise; `enroll` across a whole
@@ -195,11 +195,52 @@ export function verifyChecksum(expected, actual) {
   return true;
 }
 
+/** Normal NTP is well under a second; 2s absorbs a slow step without hiding real skew. */
+export const RECEIPT_NTP_SKEW_MS = 2_000;
+
+function parseReceiptTime(value) {
+  const time = Date.parse(value);
+  return Number.isFinite(time) ? time : null;
+}
+
+function nonDecreasing(times) {
+  return times.every((time, index) => !index || time >= times[index - 1]);
+}
+
+/**
+ * Catalog RPCs and the controller ack are concurrent event streams. The bridge
+ * stamps both with Date.now() on the target, but they are not one happens-before
+ * chain: the controller may ack identity before catalog RPCs finish recording.
+ * A total order across those streams produced a false `unconfirmed` on
+ * plex-server (#483, 3ms). Order is enforced within each stream; membership in
+ * the activation window allows RECEIPT_NTP_SKEW_MS across streams.
+ */
+export function receiptEventStreamsAcceptable(receipt, expected, verifyAgent) {
+  const catalog = [
+    parseReceiptTime(receipt?.startedAt),
+    parseReceiptTime(receipt?.helloAcceptedAt),
+    parseReceiptTime(receipt?.catalogRpcs?.[verifyAgent]?.describeModelCatalogAt),
+    parseReceiptTime(receipt?.catalogRpcs?.[verifyAgent]?.fetchModelCatalogAt),
+  ];
+  const ack = [parseReceiptTime(receipt?.controllerVerifiedAt), parseReceiptTime(receipt?.completedAt)];
+  if (catalog.some((time) => time == null) || ack.some((time) => time == null)) return false;
+  if (!nonDecreasing(catalog) || !nonDecreasing(ack)) return false;
+  if (catalog[0] < expected.started - RECEIPT_NTP_SKEW_MS) return false;
+  if (ack[1] > expected.deadline + RECEIPT_NTP_SKEW_MS) return false;
+  if (ack[0] < expected.started - RECEIPT_NTP_SKEW_MS) return false;
+  return true;
+}
+
 export function validateReadyReceipt(receipt, expected) {
-  const times = [receipt?.startedAt, receipt?.helloAcceptedAt, receipt?.controllerVerifiedAt, receipt?.completedAt].map(Date.parse);
   if (!receipt || receipt.formatVersion !== 2 || receipt.activationId !== expected.activationId || receipt.bridgeId !== expected.bridgeId || receipt.sourceSha !== expected.sha || receipt.artifactChecksum !== expected.checksum || receipt.stageId !== expected.stageId) throw new Error("ready receipt does not identify this activation");
   if (receipt.oldPid !== expected.oldPid || receipt.pid !== expected.pid || receipt.pid === receipt.oldPid || receipt.instanceId !== expected.instanceId || receipt.protocolVersion !== expected.protocolVersion) throw new Error("ready receipt process identity mismatch");
-  if (times.some((time) => !Number.isFinite(time)) || times.some((time, index) => index && time < times[index - 1]) || times[0] < expected.notBefore || times.at(-1) > expected.notAfter) throw new Error("ready receipt is stale or outside the activation window");
+  // This validator never included catalog RPC times in the monotonic chain
+  // (startedAt → hello → controllerVerified → completed). Catalog timestamps
+  // are existence-checked below. Stream grouping still applies: startedAt/hello
+  // vs controllerVerified/completed can interleave by milliseconds.
+  if (!receiptEventStreamsAcceptable(receipt, { started: expected.notBefore, deadline: expected.notAfter }, expected.agentId)) {
+    throw new Error("ready receipt is stale or outside the activation window");
+  }
   const calls = receipt.catalogRpcs?.[expected.agentId];
   if (!calls?.describeModelCatalogAt || !calls?.fetchModelCatalogAt || receipt.controllerAck?.activationId !== expected.activationId || receipt.controllerAck?.bridgeId !== expected.bridgeId || receipt.controllerAck?.instanceId !== expected.instanceId || receipt.controllerAck?.pid !== expected.pid || receipt.controllerAck?.sourceSha !== expected.sha || receipt.controllerAck?.artifactChecksum !== expected.checksum) throw new Error(`catalog/controller verification failed for ${expected.agentId}`);
   return true;

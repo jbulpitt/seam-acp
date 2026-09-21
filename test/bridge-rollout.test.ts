@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { activationRefusal, artifactName, firstActivationFromBaselineAllowed, buildArtifact, commandRunner, makeScpCommand, makeSshCommand, parseArgs, parseKeyValues, resolveTarget, rollbackPlan, runActivation, runPreflight, validateReadyReceipt, validateTargetMap, verifyChecksum } from "../scripts/lib/bridge-rollout.mjs";
+import { activationRefusal, artifactName, firstActivationFromBaselineAllowed, buildArtifact, commandRunner, makeScpCommand, makeSshCommand, parseArgs, parseKeyValues, receiptEventStreamsAcceptable, resolveTarget, rollbackPlan, runActivation, runPreflight, validateReadyReceipt, validateTargetMap, verifyChecksum } from "../scripts/lib/bridge-rollout.mjs";
 
 const root = path.resolve(import.meta.dirname, "..");
 const configured = JSON.parse(fs.readFileSync(path.join(root, "ops/bridge/targets.json"), "utf8"));
@@ -97,6 +97,7 @@ describe("bridge rollout target safety (#241)", () => {
     // nobody could ever restore to — the inversion of the primitive's purpose.
     for (const argv of [
       ["--target", "unmanaged-host", "--enroll", "--apply"],
+      ["--target", "unmanaged-host", "--rebaseline", "--apply"],
       ["--target", "unmanaged-host", "--restore-baseline", "--enrollment-id", token, "--apply"],
     ]) {
       const parsed = parseArgs(argv);
@@ -183,6 +184,9 @@ describe("bridge rollout gating and verification (#241)", () => {
   it("defaults to one-host dry-run and requires immutable phase identities", () => {
     expect(parseArgs(["--target", "media-server"])).toMatchObject({ action: "preflight", apply: false });
     expect(parseArgs(["--target", "media-server", "--stage", "--apply"])).toMatchObject({ action: "stage", apply: true });
+    expect(parseArgs(["--target", "media-server", "--rebaseline", "--apply"])).toMatchObject({ action: "rebaseline", apply: true });
+    expect(() => parseArgs(["--target", "media-server", "--rebaseline"])).toThrow(/requires --apply/);
+    expect(() => parseArgs(["--all", "--rebaseline", "--apply"])).toThrow(/--all supports only/);
     expect(() => parseArgs(["--target", "media-server", "--stage"])).toThrow(/requires --apply/);
     expect(() => parseArgs(["--target", "media-server", "--activate", "--sha", "a".repeat(40), "--checksum", "b".repeat(64), "--apply"])).toThrow(/stage-id/);
     expect(() => parseArgs(["--target", "media-server", "--rollback", "--apply"])).toThrow(/activation-id/);
@@ -300,6 +304,47 @@ describe("bridge rollout gating and verification (#241)", () => {
     expect(() => validateReadyReceipt({ ...good, completedAt: "2026-09-09T00:00:00.000Z" }, expected)).toThrow(/stale/);
     expect(() => validateReadyReceipt({ ...good, controllerAck: undefined }, expected)).toThrow(/controller/);
     expect(() => validateReadyReceipt({ ...good, controllerAck: { ...good.controllerAck, artifactChecksum: "e".repeat(64) } }, expected)).toThrow(/controller/);
+    // #489: catalog vs controller-ack may invert by milliseconds. This list
+    // never included catalog times, so the plex-shaped receipt already passed
+    // here; stream grouping still accepts it and still rejects a same-stream
+    // inversion.
+    const plexShaped = {
+      ...good,
+      helloAcceptedAt: "2026-09-08T00:00:01.000Z",
+      catalogRpcs: { grok: { describeModelCatalogAt: "2026-09-08T00:00:01.010Z", fetchModelCatalogAt: "2026-09-08T00:00:01.020Z" } },
+      controllerVerifiedAt: "2026-09-08T00:00:01.007Z",
+      completedAt: "2026-09-08T00:00:01.007Z",
+    };
+    expect(validateReadyReceipt(plexShaped, expected)).toBe(true);
+    expect(() => validateReadyReceipt({
+      ...good,
+      helloAcceptedAt: "2026-09-08T00:00:03.000Z",
+      catalogRpcs: { grok: { describeModelCatalogAt: "2026-09-08T00:00:02.000Z", fetchModelCatalogAt: "2026-09-08T00:00:02.100Z" } },
+    }, expected)).toThrow(/stale or outside/);
+  });
+
+  it("#489: grouping catalog and controller-ack streams accepts the plex 3ms inversion", () => {
+    const expected = { started: Date.parse("2026-09-21T16:15:26.611Z"), deadline: Date.parse("2026-09-21T16:22:26.611Z") };
+    const plex = {
+      startedAt: "2026-09-21T16:15:26.611Z",
+      helloAcceptedAt: "2026-09-21T16:15:32.861Z",
+      catalogRpcs: { grok: { describeModelCatalogAt: "2026-09-21T16:15:33.562Z", fetchModelCatalogAt: "2026-09-21T16:15:33.830Z" } },
+      controllerVerifiedAt: "2026-09-21T16:15:33.559Z",
+      completedAt: "2026-09-21T16:15:33.559Z",
+    };
+    expect(receiptEventStreamsAcceptable(plex, expected, "grok")).toBe(true);
+    // Mutation: a single total order across both streams reintroduces the false unconfirmed.
+    const naive = [
+      plex.startedAt, plex.helloAcceptedAt,
+      plex.catalogRpcs.grok.describeModelCatalogAt, plex.catalogRpcs.grok.fetchModelCatalogAt,
+      plex.controllerVerifiedAt, plex.completedAt,
+    ].map(Date.parse);
+    expect(naive.every((time, index) => !index || time >= naive[index - 1])).toBe(false);
+    const invertedHello = {
+      ...plex,
+      helloAcceptedAt: "2026-09-21T16:15:33.900Z",
+    };
+    expect(receiptEventStreamsAcceptable(invertedHello, expected, "grok")).toBe(false);
   });
 
   it("bounds subprocess duration/output and redacts diagnostics", async () => {

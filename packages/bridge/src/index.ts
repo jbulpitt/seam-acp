@@ -58,6 +58,7 @@ import { dispatchBridgeRpc, type SlotSpawnConfig } from "./rpc.js";
 import { slotHealthSnapshot } from "./slot-health.js";
 import { createOutputLog, createLineFramer } from "./output-log.js";
 import { createStderrRegistry } from "./stderr-ring.js";
+import { resolveSlotAdapter, UnknownAgentError } from "./resolve-adapter.js";
 import { muxSend, forwardAgentStdout } from "./frame-out.js";
 import { BridgeMcpInputRewriter } from "./mcp-injection.js";
 import {
@@ -175,23 +176,22 @@ async function loadWs(): Promise<{ WebSocket: WsCtor; WebSocketServer: WssCtor }
   }
 }
 
-function resolveSlotAdapter(
-  adapters: Map<string, AgentAdapter>,
-  slotCfg?: SlotSpawnConfig
-): AgentAdapter | undefined {
-  const id = slotCfg?.agentId;
-  if (id && adapters.has(id)) return adapters.get(id);
-  if (adapters.size === 1) return [...adapters.values()][0];
-  return undefined;
-}
-
 function spawnAgent(
   adapters: Map<string, AgentAdapter>,
   copilotCmd: string,
   localCwd: string,
   slotCfg?: SlotSpawnConfig
 ): ChildProcess {
-  const adapter = resolveSlotAdapter(adapters, slotCfg);
+  const resolution = resolveSlotAdapter(adapters, slotCfg);
+  // #468: a stated agentId this bridge cannot serve used to fall through to
+  // the copilot legacy branch below — the requested agent never ran, nothing
+  // failed, and copilot did the work. Refuse instead: one dead slot an
+  // operator can see beats a turn that silently came from the wrong agent,
+  // and this is the layer that actually knows the inventory.
+  if (resolution.kind === "unknown") {
+    throw new UnknownAgentError(resolution.agentId, resolution.available);
+  }
+  const adapter = resolution.kind === "adapter" ? resolution.adapter : undefined;
   if (adapter && adapter.id !== "copilot") {
     console.error(
       `[bridge] Spawning adapter ${adapter.id}` +
@@ -318,7 +318,28 @@ function makeSlotManager(opts: {
     }
 
     console.error(`[bridge] Slot ${slot}: spawning agent`);
-    const agent = spawnAgent(adapters, copilotCmd, localCwd, slotConfigs.get(slot));
+    let agent: ChildProcess;
+    try {
+      agent = spawnAgent(adapters, copilotCmd, localCwd, slotConfigs.get(slot));
+    } catch (err) {
+      // #468: end the slot honestly rather than leaving seam-acp waiting on a
+      // stream that will never produce anything. One `exit` frame is enough —
+      // the mux marks the slot killed on receipt and stops forwarding stdin,
+      // so this cannot turn into a frame-per-write loop.
+      const reason = err instanceof Error ? err.message : String(err);
+      console.error(`[bridge] Slot ${slot}: refusing to spawn — ${reason}`);
+      muxSend(
+        currentWs,
+        WebSocket,
+        slot,
+        "exit",
+        // `spawnError` is additive: an old seam-acp reads `code` and ignores
+        // it, and still sees the slot stop instead of getting the wrong agent.
+        { code: 1, spawnError: reason },
+        outputLog,
+      );
+      return null;
+    }
     slots.set(slot, agent);
     slotInputRewriters.set(
       slot,

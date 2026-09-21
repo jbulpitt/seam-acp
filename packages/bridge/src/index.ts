@@ -55,6 +55,7 @@ import {
   type AgentAdapter,
 } from "@seam/adapters";
 import { dispatchBridgeRpc, type SlotSpawnConfig } from "./rpc.js";
+import { slotHealthSnapshot } from "./slot-health.js";
 import { BridgeMcpInputRewriter } from "./mcp-injection.js";
 import {
   inventoryFromAdapters,
@@ -526,21 +527,9 @@ function makeSlotManager(opts: {
         // omits `health` — which the caller treats as "no opinion" rather
         // than as "unhealthy". The frame is an array of objects so #456 can
         // hang a stderr tail off the same shape without another protocol turn.
-        const now = Date.now();
         result = {
           slots: [...slots.keys()],
-          health: [...slots.entries()].map(([slot, child]) => ({
-            slot,
-            // Liveness, not an opinion about the turn: `exitCode === null`
-            // and no signal means the OS still has this process.
-            alive: child.exitCode === null && child.signalCode === null && !child.killed,
-            pid: child.pid ?? null,
-            // `null`, never 0, when the bridge has never seen the event —
-            // "not observed" and "observed just now" are different facts and
-            // collapsing them is how a fresh slot reads as 0ms-silent.
-            lastStdoutMsAgo: lastStdoutAt.has(slot) ? now - lastStdoutAt.get(slot)! : null,
-            lastStdinMsAgo: lastStdinAt.has(slot) ? now - lastStdinAt.get(slot)! : null,
-          })),
+          health: slotHealthSnapshot(slots, lastStdoutAt, lastStdinAt, Date.now()),
         };
       } else if (action === "writeAttachment") {
         result = await writeAttachment(payload.cwd, payload.filename, payload.base64);

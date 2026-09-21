@@ -26,6 +26,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import { makeMux, type BridgeSlotHealth } from "@seam/adapters";
+import { slotHealthSnapshot } from "../packages/bridge/src/slot-health.js";
 
 /** A stand-in for the mux's WS: records frames and lets a test inject replies. */
 class FakeWs extends EventEmitter {
@@ -125,5 +126,70 @@ describe("#442 the reconnect probe uses health, not just existence", () => {
     expect(exits).toEqual([]);
     // But it IS surfaced, so the owner can act on it.
     expect(seen.at(-1)?.[0]?.lastStdoutMsAgo).toBe(400_000);
+  });
+});
+
+describe("#442 what the bridge itself reports", () => {
+  // Mutation found this had NO coverage: four changes to the handler — always
+  // claiming alive, collapsing never-observed into 0ms, dropping the
+  // backward-compatible slot list, dropping stdin tracking — all survived a
+  // full suite because every test above fed the mux a synthetic reply.
+  const child = (over: Partial<{ exitCode: number | null; signalCode: string | null; killed: boolean; pid: number }> = {}) => ({
+    exitCode: null, signalCode: null, killed: false, pid: 4242, ...over,
+  });
+
+  it("reports a running process as alive, with its pid", () => {
+    const [h] = slotHealthSnapshot(new Map([[1, child()]]), new Map(), new Map(), 1_000);
+    expect(h).toMatchObject({ slot: 1, alive: true, pid: 4242 });
+  });
+
+  it.each([
+    ["an exit code", { exitCode: 0 }],
+    ["a non-zero exit code", { exitCode: 1 }],
+    ["a signal", { signalCode: "SIGKILL" }],
+    ["an explicit kill", { killed: true }],
+  ])("reports a process with %s as NOT alive", (_label, over) => {
+    const [h] = slotHealthSnapshot(new Map([[1, child(over as never)]]), new Map(), new Map(), 1_000);
+    expect(h!.alive).toBe(false);
+  });
+
+  it("distinguishes never-observed from observed-just-now", () => {
+    // `null` and `0` are different facts. Collapsing them makes a slot that
+    // has never spoken look like one that spoke this instant — which is the
+    // reading that would keep a stuck turn looking healthy forever.
+    const now = 10_000;
+    const [never] = slotHealthSnapshot(new Map([[1, child()]]), new Map(), new Map(), now);
+    expect(never!.lastStdoutMsAgo).toBeNull();
+    expect(never!.lastStdinMsAgo).toBeNull();
+
+    const [seen] = slotHealthSnapshot(
+      new Map([[1, child()]]), new Map([[1, now]]), new Map([[1, now - 2_500]]), now
+    );
+    expect(seen!.lastStdoutMsAgo).toBe(0);
+    expect(seen!.lastStdinMsAgo).toBe(2_500);
+  });
+
+  it("reports the silence that makes the seam-acp judgement possible", () => {
+    // Silent 400s, but input arrived 401s ago: suspicious. The bridge states
+    // both numbers and draws no conclusion from them.
+    const now = 500_000;
+    const [h] = slotHealthSnapshot(
+      new Map([[7, child()]]),
+      new Map([[7, now - 400_000]]),
+      new Map([[7, now - 401_000]]),
+      now
+    );
+    expect(h).toMatchObject({ lastStdoutMsAgo: 400_000, lastStdinMsAgo: 401_000 });
+    expect(h).not.toHaveProperty("midTurn");
+  });
+
+  it("never reports a negative age if a clock moves backwards", () => {
+    const [h] = slotHealthSnapshot(new Map([[1, child()]]), new Map([[1, 5_000]]), new Map(), 1_000);
+    expect(h!.lastStdoutMsAgo).toBe(0);
+  });
+
+  it("reports every slot it holds, and nothing it does not", () => {
+    const snap = slotHealthSnapshot(new Map([[1, child()], [4, child()]]), new Map(), new Map(), 0);
+    expect(snap.map((h) => h.slot)).toEqual([1, 4]);
   });
 });

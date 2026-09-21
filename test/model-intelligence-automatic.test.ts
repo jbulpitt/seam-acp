@@ -78,6 +78,60 @@ const astraAaPayload = {
   ],
 };
 
+// Captured through the Artificial Analysis MCP on 2026-09-21. These names and
+// slugs are source-owned facts: the matcher under test must not derive its own
+// expectations from them.
+const claudeAaPayload = {
+  data: [
+    {
+      id: "cd55210d-358e-4df1-ba9c-9acb5f186cc9",
+      name: "Claude Fable 5 (Adaptive Reasoning, Max Effort, Opus 4.8 Fallback)",
+      slug: "claude-fable-5",
+      model_creator: { id: "anthropic", name: "Anthropic", slug: "anthropic" },
+      evaluations: { artificial_analysis_intelligence_index: 49.6 },
+    },
+    {
+      id: "992b7b84-5069-4c6a-9295-834252553d50",
+      name: "Claude Opus 4.8 (Adaptive Reasoning, Max Effort)",
+      slug: "claude-opus-4-8",
+      model_creator: { id: "anthropic", name: "Anthropic", slug: "anthropic" },
+      evaluations: { artificial_analysis_intelligence_index: 41.8, artificial_analysis_coding_index: 74.3 },
+    },
+    {
+      id: "53c98840-47af-49aa-94e6-469fb17e9a1b",
+      name: "Claude Opus 4.6 (Adaptive Reasoning, Max Effort)",
+      slug: "claude-opus-4-6-adaptive",
+      model_creator: { id: "anthropic", name: "Anthropic", slug: "anthropic" },
+      evaluations: { artificial_analysis_intelligence_index: 31.9 },
+    },
+    {
+      id: "4386585e-71b4-4a0c-8a63-afb333419cd6",
+      name: "Claude Opus 4.6 (Non-reasoning, High Effort)",
+      slug: "claude-opus-4-6",
+      model_creator: { id: "anthropic", name: "Anthropic", slug: "anthropic" },
+      evaluations: { artificial_analysis_intelligence_index: 26.4 },
+    },
+    {
+      id: "df8d14e0-3997-4e4d-b4ad-9c047acc9c69",
+      name: "Claude Sonnet 4.6 (Adaptive Reasoning, Max Effort)",
+      slug: "claude-sonnet-4-6-adaptive",
+      evaluations: { artificial_analysis_intelligence_index: 30.1 },
+    },
+    {
+      id: "2e40e695-3cec-43da-83f9-615af30b8e91",
+      name: "Claude Sonnet 4.6 (Non-reasoning, High Effort)",
+      slug: "claude-sonnet-4-6",
+      evaluations: { artificial_analysis_intelligence_index: 24.7, gpqa: 0.799 },
+    },
+    {
+      id: "f2e21112-192e-4aed-ae82-68ca3b38e667",
+      name: "Claude Sonnet 4.6 (Non-reasoning, Low Effort)",
+      slug: "claude-sonnet-4-6-non-reasoning-low-effort",
+      evaluations: { artificial_analysis_intelligence_index: 23.3 },
+    },
+  ],
+};
+
 describe("automatic model-intelligence matching (#249)", () => {
   it("enriches newly advertised Astra and Gemini models without registrations", () => {
     const aa = parseAaModels({
@@ -158,6 +212,76 @@ describe("automatic model-intelligence matching (#249)", () => {
     });
   });
 
+  it("enriches Claude composite qualifiers while keeping dotted and dashed ids opaque", () => {
+    const metadata = buildModelMetadataSnapshot({
+      catalog: [
+        {
+          agentId: "claude", location: "one", modelId: "claude-fable-5", name: "Fable 5",
+          contextWindow: 1_000_000, vision: false, effortChoices: ["default", "low", "medium", "high", "xhigh", "max"],
+          effortDefault: "default", effortMechanism: "meta", catalogScope: "binding:claude@one",
+        },
+        {
+          agentId: "claude", location: "one", modelId: "claude-opus-4-8", name: "Opus 4.8",
+          contextWindow: 1_000_000, vision: false, effortChoices: ["default", "low", "medium", "high", "xhigh", "max"],
+          effortDefault: "default", effortMechanism: "meta", catalogScope: "binding:claude@one",
+        },
+        {
+          agentId: "agy", location: "one", modelId: "claude-opus-4-6-thinking", name: "Claude Opus 4.6",
+          contextWindow: 250_000, vision: false, effortChoices: ["default"], effortDefault: "default",
+          effortMechanism: "modelBaked", catalogScope: "binding:agy@one",
+        },
+        {
+          agentId: "agy", location: "one", modelId: "claude-sonnet-4-6", name: "Claude Sonnet 4.6",
+          contextWindow: 250_000, vision: false, effortChoices: ["default"], effortDefault: "default",
+          effortMechanism: "modelBaked", catalogScope: "binding:agy@one",
+        },
+        {
+          agentId: "legacy", location: "one", modelId: "claude-sonnet-4.6", name: "Claude Sonnet 4.6",
+          contextWindow: 200_000, vision: false, effortChoices: ["default"], effortDefault: "default",
+          effortMechanism: "modelBaked", catalogScope: "binding:legacy@one",
+        },
+      ],
+      sourceModels: parseAaModels(claudeAaPayload),
+      source: "artificial-analysis",
+      fetchedAt: "2026-09-21T00:00:00.000Z",
+    });
+    const byVariant = new Map(metadata.rows.map((row) => [row.variant_id, row]));
+
+    expect(byVariant.get("binding:claude@one::claude-fable-5")).toMatchObject({
+      id: "claude-fable-5", slug: "claude-fable-5", intelligence_index: 49.6,
+      matching: { artificial_analysis: { status: "matched", selected_effort: "max" } },
+    });
+    expect(byVariant.get("binding:claude@one::claude-opus-4-8")).toMatchObject({
+      id: "claude-opus-4-8", slug: "claude-opus-4-8", intelligence_index: 41.8,
+      benchmarks: { artificial_analysis_coding_index: 74.3 },
+      matching: { artificial_analysis: { status: "matched", selected_effort: "max" } },
+    });
+    for (const variant of [
+      "binding:agy@one::claude-sonnet-4-6",
+      "binding:legacy@one::claude-sonnet-4.6",
+    ]) {
+      expect(byVariant.get(variant)).toMatchObject({
+        slug: "claude-sonnet-4-6", intelligence_index: 24.7,
+        benchmarks: { gpqa: 0.799 },
+        matching: { artificial_analysis: { status: "matched", selected_effort: "high" } },
+      });
+    }
+    expect(byVariant.get("binding:agy@one::claude-opus-4-6-thinking")).toMatchObject({
+      id: "claude-opus-4-6-thinking", slug: "claude-opus-4-6-adaptive", intelligence_index: 31.9,
+      matching: { artificial_analysis: { status: "matched", selected_effort: "max" } },
+    });
+    expect(metadata.rows.map((row) => row.id)).toEqual([
+      "claude-fable-5", "claude-opus-4-6-thinking", "claude-opus-4-8",
+      "claude-sonnet-4-6", "claude-sonnet-4.6",
+    ]);
+    expect(byVariant.get("binding:agy@one::claude-sonnet-4-6")?.benchmark_variants
+      ?.map((row) => [row.slug, row.effort])).toEqual([
+      ["claude-sonnet-4-6-adaptive", "max"],
+      ["claude-sonnet-4-6", "high"],
+      ["claude-sonnet-4-6-non-reasoning-low-effort", "low"],
+    ]);
+  });
+
   it("is order-invariant and leaves ambiguous or unknown-effort rows unresolved", () => {
     const rows = parseAaModels({ data: [
       { id: "one", name: "Nebula 7 (high)", slug: "nebula-7-high", evaluations: { intelligence_index: 4 } },
@@ -186,6 +310,17 @@ describe("automatic model-intelligence matching (#249)", () => {
       selectedEffort: null,
       candidates: ["nebula-7-extreme"],
       ignored: ["nebula-7-extreme"],
+    });
+    const compositeFuture = matchArtificialAnalysis(model, parseAaModels({ data: [{
+      id: "future-composite", name: "Nebula 7 (Adaptive Reasoning, Extreme Effort)",
+      slug: "nebula-7", evaluations: { intelligence_index: 10 },
+    }] }));
+    expect(compositeFuture).toEqual({
+      status: "unresolved-effort",
+      row: null,
+      selectedEffort: null,
+      candidates: ["nebula-7"],
+      ignored: ["nebula-7"],
     });
     expect(matchArtificialAnalysis(model, [{
       id: "different-version", name: "Nebula 70 (extreme)", slug: "nebula-70-extreme",
@@ -761,7 +896,7 @@ describe("coordinated model-intelligence generations (#249)", () => {
 
     expect(await manager.refresh({ forceSources: true })).toMatchObject({
       result: "published",
-      matchingPolicyVersion: "249.2",
+      matchingPolicyVersion: "249.3",
     });
     expect(store.active()?.metadata[0]).toMatchObject({
       id: "nebula-7",

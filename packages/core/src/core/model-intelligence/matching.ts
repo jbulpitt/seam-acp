@@ -11,6 +11,11 @@ const SOURCE_SPELLING_OVERRIDES: Readonly<Record<string, readonly string[]>> = {
   "claude-haiku-4-5": ["claude-4-5-haiku"],
 };
 
+interface IdentityKeys {
+  all: Set<string>;
+  exact: Set<string>;
+}
+
 export interface MatchableCatalogModel {
   modelId: string;
   displayName: string;
@@ -36,28 +41,44 @@ export function normalizeExternalModelName(value: string): string {
 }
 
 export function normalizeAaEffort(value: string): string | null {
-  const parenthesized = [...value.matchAll(/\(([^)]+)\)/g)].at(-1)?.[1]?.trim().toLowerCase();
+  const parenthesized = [...value.matchAll(/\(([^)]+)\)/g)].at(-1)?.[1];
   const suffix = splitEffort(value).effort;
-  const effort = parenthesized ?? suffix;
-  return effort && EFFORT_RANK.has(effort) ? effort : null;
+  return (parenthesized ? parseSourceQualifier(parenthesized).effort : null) ?? suffix;
 }
 
-function identityKeys(model: MatchableCatalogModel, source: "artificial-analysis" | "github-copilot-pricing"): Set<string> {
-  const keys = new Set(
-    [model.modelId, model.displayName, ...(model.aliases ?? [])]
+function identityKeys(model: MatchableCatalogModel, source: "artificial-analysis" | "github-copilot-pricing"): IdentityKeys {
+  const exact = new Set(
+    [model.modelId, ...(model.aliases ?? [])]
       .map(normalizeExternalModelName)
       .filter(Boolean)
   );
+  const all = new Set([...exact, normalizeExternalModelName(model.displayName)].filter(Boolean));
   if (source === "artificial-analysis") {
-    for (const key of [...keys]) {
-      for (const override of SOURCE_SPELLING_OVERRIDES[key] ?? []) keys.add(override);
+    for (const key of [...all]) {
+      const overrides = [
+        ...(SOURCE_SPELLING_OVERRIDES[key] ?? []),
+        // The live catalog calls Claude Opus 4.6's baked reasoning identity
+        // `thinking`; AA publishes that exact identity as `adaptive` (#465).
+        // Removing this leaves those nine live scoped rows unscored; it does
+        // not authorize fuzzy matching for any non-Claude identity.
+        ...(key.startsWith("claude-") && key.endsWith("-thinking")
+          ? [`${key.slice(0, -"-thinking".length)}-adaptive`]
+          : []),
+      ];
+      for (const override of overrides) {
+        all.add(override);
+        if (exact.has(key)) exact.add(override);
+      }
     }
   }
   if (model.effortMechanism === "modelBaked" || (model.effortChoices?.length ?? 0) === 0) {
     const baked = splitEffort(model.modelId);
-    if (baked.effort) keys.add(baked.base);
+    if (baked.effort) {
+      all.add(baked.base);
+      exact.add(baked.base);
+    }
   }
-  return keys;
+  return { all, exact };
 }
 
 function splitEffort(value: string): { base: string; effort: string | null } {
@@ -71,16 +92,33 @@ function splitEffort(value: string): { base: string; effort: string | null } {
 function splitSourceEffort(value: string): { base: string; effort: string | null; unknownEffort: string | null } {
   const match = value.match(/\(([^)]+)\)\s*$/);
   if (match) {
-    const token = normalizeExternalModelName(match[1]!);
     const base = normalizeExternalModelName(value.slice(0, match.index));
-    if (EFFORT_RANK.has(token)) return { base, effort: token, unknownEffort: null };
-    // AA effort variants are expressed as a trailing parenthesized qualifier.
-    // Preserve a future vocabulary item as evidence even when the operational
-    // catalog does not yet declare it: it may identify the exact model, but it
-    // must never be guessed into a supported runtime effort.
-    if (token) return { base, effort: null, unknownEffort: token };
+    return { base, ...parseSourceQualifier(match[1]!) };
   }
   return { ...splitEffort(value), unknownEffort: null };
+}
+
+function parseSourceQualifier(value: string): { effort: string | null; unknownEffort: string | null } {
+  // AA's current Claude rows put reasoning mode, effort, and fallback metadata
+  // in one parenthesis. Treating the whole phrase as an effort made all 60
+  // live Claude rows unresolved (#465), so parse its comma-delimited facts.
+  const unknown: string[] = [];
+  let effort: string | null = null;
+  for (const segment of value.split(",").map(normalizeExternalModelName).filter(Boolean)) {
+    const candidate = segment.endsWith("-effort") ? segment.slice(0, -"-effort".length) : segment;
+    if (EFFORT_RANK.has(candidate)) {
+      if (effort && effort !== candidate) unknown.push(segment);
+      else effort = candidate;
+      continue;
+    }
+    if (/^(?:(?:adaptive|non)-)?reasoning$/.test(segment) || segment === "thinking" || segment.endsWith("-fallback")) {
+      continue;
+    }
+    // A future AA qualifier is evidence, not permission to guess. Keep the
+    // affected model unresolved while unrelated models continue to enrich.
+    unknown.push(segment);
+  }
+  return { effort, unknownEffort: unknown.length > 0 ? unknown.join(",") : null };
 }
 
 /** Deterministic AA join. Ambiguity is data, never a row-order tie-break. */
@@ -90,21 +128,46 @@ export function matchArtificialAnalysis(
 ): AutomaticMatch<MetadataSourceModel> {
   const keys = identityKeys(model, "artificial-analysis");
   const supported = new Set((model.effortChoices ?? []).map((value) => value.toLowerCase()));
-  const bakedEffort = model.effortMechanism === "modelBaked" || supported.size === 0
+  const modelBaked = model.effortMechanism === "modelBaked";
+  const bakedEffort = modelBaked || supported.size === 0
     ? splitEffort(model.modelId).effort : null;
   const syntactic = rows.flatMap((row) => {
     const slug = splitSourceEffort(row.slug);
     const name = splitSourceEffort(row.name);
-    const baseMatches = keys.has(slug.base) || keys.has(name.base) ||
-      keys.has(normalizeExternalModelName(row.slug)) || keys.has(normalizeExternalModelName(row.name));
+    const normalizedSlug = normalizeExternalModelName(row.slug);
+    const normalizedName = normalizeExternalModelName(row.name);
+    const baseMatches = keys.all.has(slug.base) || keys.all.has(name.base) ||
+      keys.all.has(normalizedSlug) || keys.all.has(normalizedName);
     return baseMatches ? [{
       row,
       effort: slug.effort ?? name.effort,
       unknownEffort: name.unknownEffort ?? slug.unknownEffort,
+      exactIdentity: keys.exact.has(normalizedSlug) || keys.exact.has(normalizedName),
     }] : [];
   });
   if (syntactic.length === 0) {
     return { status: "no-source-record", row: null, selectedEffort: null, candidates: [], ignored: [] };
+  }
+  if (modelBaked && !bakedEffort) {
+    const exactBaked = syntactic.filter(({ exactIdentity }) => exactIdentity);
+    // Model-baked Claude Sonnet 4.6 has three nearby AA rows but its exact slug
+    // names the non-reasoning identity; Opus 4.6 thinking has one exact spelling
+    // override above. A display-name match cannot choose between modes. Refuse
+    // only this model's enrichment if exact identity is absent/ambiguous; the
+    // rest of the catalog continues through the normal effort policy.
+    const eligible = exactBaked.filter(({ unknownEffort }) => !unknownEffort);
+    const ignored = syntactic.filter(({ exactIdentity, unknownEffort }) => !exactIdentity || unknownEffort)
+      .map(({ row }) => row.slug).sort();
+    if (eligible.length === 0) {
+      return { status: "unresolved-effort", row: null, selectedEffort: null,
+        candidates: syntactic.map(({ row }) => row.slug).sort(), ignored };
+    }
+    if (eligible.length !== 1) {
+      return { status: "ambiguous", row: null, selectedEffort: null,
+        candidates: eligible.map(({ row }) => row.slug).sort(), ignored };
+    }
+    return { status: "matched", row: eligible[0]!.row, selectedEffort: eligible[0]!.effort,
+      candidates: syntactic.map(({ row }) => row.slug).sort(), ignored };
   }
   const eligible = syntactic.filter(({ effort, unknownEffort }) => !unknownEffort && (bakedEffort
     ? effort === bakedEffort
@@ -133,7 +196,7 @@ export function matchCopilotPricing(
   tier: "default" | "long-context" = "default"
 ): AutomaticMatch<CopilotPricing> {
   const keys = identityKeys(model, "github-copilot-pricing");
-  const matches = rows.filter((row) => keys.has(normalizeExternalModelName(row.modelName)));
+  const matches = rows.filter((row) => keys.all.has(normalizeExternalModelName(row.modelName)));
   const defaults = matches.filter((row) => (row.tier ?? "default") === tier);
   if (defaults.length === 0) {
     return { status: "no-source-record", row: null, selectedEffort: null, candidates: [], ignored: [] };

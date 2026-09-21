@@ -34,8 +34,17 @@ Artificial Analysis effort suffixes are accepted only when that exact catalog
 variant supports them. The displayed default benchmark policy chooses the
 highest supported published effort and records the selected source row; all
 matched benchmark variants remain inspectable. Unknown effort vocabulary is
-unresolved. A small source-specific Claude word-order exception set is the only
-override registry; new releases require no source edit.
+unresolved. AA may publish the effort inside a composite qualifier such as
+`(Adaptive Reasoning, Max Effort, Default Fallback)`; reasoning and fallback
+segments describe the source record, while the independently parsed effort
+still has to be supported by the catalog variant. A model-baked catalog id with
+no effort suffix may use one exact AA slug identity, but never a display-name
+near-match; this distinguishes Claude's reasoning/non-reasoning rows. Claude's
+`thinking` catalog spelling maps to AA's `adaptive` source spelling as a syntax
+rule. Dotted and dashed catalog IDs normalize to the same external lookup key
+but remain separate opaque persisted IDs. A small source-specific Claude
+word-order exception set is the only override registry; new releases require no
+source edit.
 
 GitHub pricing is matched independently. Default and long-context tiers remain
 distinct; the long-context row is selected only when total scenario input is

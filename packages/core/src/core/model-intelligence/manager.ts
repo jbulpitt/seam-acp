@@ -13,7 +13,7 @@ import { ModelIntelligenceStore, type IntelligenceSourceName, type IntelligenceS
 
 export const MODEL_INTELLIGENCE_REFRESH_CRON = "0 */12 * * *";
 export const MODEL_INTELLIGENCE_PARSER_VERSION = "249.1";
-export const MODEL_INTELLIGENCE_MATCHING_POLICY_VERSION = "249.2";
+export const MODEL_INTELLIGENCE_MATCHING_POLICY_VERSION = "249.3";
 
 export interface ModelIntelligenceRefreshResult {
   ok: boolean;

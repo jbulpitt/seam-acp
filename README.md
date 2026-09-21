@@ -118,6 +118,22 @@ restart it:
 npm run redeploy
 ```
 
+That writes an empty restart sentinel, which **drains in-flight turns first** — up to
+`RESTART_DRAIN_TIMEOUT_MS` (default 15 minutes) before interrupting them anyway. When a
+long-running turn is holding the drain and you want the new build live now:
+
+```sh
+npm run redeploy:now
+```
+
+Same build, but the sentinel body is `force`, so the drain is skipped and SIGTERM reaches
+live ACP processes immediately. Interrupted turns are continued after boot by turn-resume
+(#76) — they are not lost.
+
+Note the force flag is read **once**, when the sentinel is detected. Rewriting the file
+during a drain that has already started does not escalate it; that drain runs to its
+timeout.
+
 Other useful commands:
 
 ```sh

@@ -240,6 +240,32 @@ enrollment exactly as for every other phase: recording a baseline for a host
 with no verified management path would produce a rollback target nobody could
 restore to.
 
+### 1a-bis. REBASELINE (managed host, drifted or updated)
+
+```bash
+npm run bridge:rollout -- --target macbook-air --rebaseline --apply
+```
+
+`--enroll` refuses once the live entrypoint is a release stub
+(`enroll_requires_legacy_checkout`). That guard stays: a first baseline is still
+a legacy checkout. After the host is managed, ordinary maintenance — a
+`nodePath` correction, an `npm ci` that changes `node_modules` — makes
+PREFLIGHT report `enrolled=drifted` while the bridge stays healthy. There is no
+supported hand-edit of the baseline files; a baseline that cannot be restored
+to is worse than none, because it looks like one.
+
+`--rebaseline` is the auditable remedy. It requires an existing enrollment
+record (even if drifted) and a live managed release. It captures the current
+stub's **resolved release** (source SHA, checksum, stage id, realpath) plus the
+checkout runtime tree as it is now, writes a new enrollment record that keeps
+the previous id for audit, and writes `baselines/<id>.receipt.json` with
+`kind: "rebaseline"`. It does not signal or change the running process.
+
+An unchanged host re-reports `rebaseline=unchanged`. A legacy checkout is
+refused (`rebaseline_requires_managed_release`). Unreadable state still fails
+closed. A later `--rollback` of a subsequent activation restores the
+rebaselined release through the ordinary managed-to-managed path.
+
 Enrollment records `rollbackProof` on the baseline: which proof a rollback onto
 it could actually produce. `receipt` means the ordinary
 nonce/PID/instance/two-RPC proof is available. `reduced-baseline` means the
@@ -430,8 +456,12 @@ exact bridge ID and instance, call `describeModelCatalog` and `fetchModelCatalog
 successfully on that same connection, and echo the nonce, bridge ID, instance ID,
 and PID, plus the exact source SHA and artifact checksum it received from that
 connection. The bridge rejects an acknowledgement whose artifact identity does
-not exactly equal its activation envelope. It writes the ordered, in-window
-receipt. Only then is an
+not exactly equal its activation envelope. It writes the in-window receipt.
+Catalog RPC timestamps and the controller-ack stamp are concurrent event
+streams: the controller may ack identity before catalog RPCs finish recording.
+Order is enforced within each stream; a total order across them produced a
+false `unconfirmed` on plex-server (#483, 3ms). Membership in the activation
+window allows 2s of NTP skew across streams. Only then is an
 immutable `.verified.json` activation record written. The activation ID and its
 exact rollback command are recorded before signaling so they remain recoverable
 if activation itself fails. Once the replacement PID and entrypoint are proven, an

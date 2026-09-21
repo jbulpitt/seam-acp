@@ -17,6 +17,7 @@ function usage() {
   console.log("  node scripts/bridge-rollout.mjs --all --rollout --apply [--auto-enroll]");
   console.log("  node scripts/bridge-rollout.mjs --target <bridge-id> --stage --apply");
   console.log("  node scripts/bridge-rollout.mjs --target <bridge-id> --enroll --apply");
+  console.log("  node scripts/bridge-rollout.mjs --target <bridge-id> --rebaseline --apply");
   console.log("  node scripts/bridge-rollout.mjs --target <bridge-id> --restore-baseline --enrollment-id <64-hex> --apply");
   console.log("  node scripts/bridge-rollout.mjs --target <bridge-id> --activate --sha <40-hex> --checksum <64-hex> --stage-id <64-hex> --apply");
   console.log("  node scripts/bridge-rollout.mjs --target <bridge-id> --rollback --activation-id <64-hex> --apply");
@@ -242,6 +243,14 @@ async function main() {
   if (options.action === "enroll") {
     const enrolled = await enrollHost(target, remoteScript);
     console.log(`restore_command=npm run bridge:rollout -- --target ${target.bridgeId} --restore-baseline --enrollment-id ${enrolled.enrollment_id} --apply`);
+    return;
+  }
+  if (options.action === "rebaseline") {
+    const enrollmentId = nonce(); const operationId = nonce();
+    const result = await commandRunner(makeSshCommand(target, ["rebaseline", enrollmentId, operationId], remoteScript));
+    process.stdout.write(result.stdout);
+    const report = parseKeyValues(result.stdout);
+    if (report.process_signaled !== "no" || report.artifact_changed !== "no") throw new Error("rebaseline reported a mutation it must never perform");
     return;
   }
   if (options.action === "restore-baseline") {

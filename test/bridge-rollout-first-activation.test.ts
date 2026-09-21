@@ -435,3 +435,66 @@ describe.sequential("#288 first managed activation from an enrolled baseline", (
     expect(records.filter((r) => r.previous.kind === "enrolled-baseline")).toHaveLength(2);
   }, 240_000);
 });
+
+describe.sequential("#489 rebaseline of a managed host", () => {
+  it("refuses --rebaseline on a legacy checkout", async () => {
+    const f = await makeFixture();
+    await enroll(f);
+    await expect(f.run(["rebaseline", H("8"), H("9")])).rejects.toThrow(/rebaseline_requires_managed_release/);
+  }, 60_000);
+
+  it("refuses --enroll once the entrypoint is a stub, and records a managed baseline instead", async () => {
+    const f = await makeFixture();
+    await enroll(f);
+    const first = await f.stage("1".repeat(40), H("3"));
+    await f.run(["activate", first.sourceSha, first.checksum, first.stageId, H("4"), "20", H("5")]);
+    await expect(enroll(f, H("6"), H("7"))).rejects.toThrow(/enroll_requires_legacy_checkout/);
+
+    const result = parseKeyValues((await f.run(["rebaseline", H("8"), H("9")])).stdout);
+    expect(result.rebaseline).toBe("recorded");
+    expect(result.process_signaled).toBe("no");
+    expect(result.artifact_changed).toBe("no");
+    expect(result.previous_enrollment_id).toBe(H("1"));
+    expect(result.managed_release).toBe(`${first.sourceSha}:${first.checksum}`);
+    expect(result.baseline_rollback_proof).toBe("receipt");
+    expect(await fs.stat(path.join(f.releaseRoot, "baselines", `${H("8")}.receipt.json`))).toBeTruthy();
+
+    const pre = parseKeyValues((await f.run(["preflight"])).stdout);
+    expect(pre.enrolled).toBe("yes");
+    expect(pre.enrollment_id).toBe(H("8"));
+    expect(pre.artifact_mode).toBe("managed");
+  }, 180_000);
+
+  it("is idempotent when the managed host has not moved, and still rolls back after a later activation", async () => {
+    const f = await makeFixture();
+    await enroll(f);
+    const first = await f.stage("1".repeat(40), H("3"));
+    await f.run(["activate", first.sourceSha, first.checksum, first.stageId, H("4"), "20", H("5")]);
+    const recorded = parseKeyValues((await f.run(["rebaseline", H("8"), H("9")])).stdout);
+    const again = parseKeyValues((await f.run(["rebaseline", H("a"), H("b")])).stdout);
+    expect(again.rebaseline).toBe("unchanged");
+    expect(again.enrollment_id).toBe(recorded.enrollment_id);
+
+    const second = await f.stage("2".repeat(40), H("c"));
+    const activation = H("d");
+    const activated = parseKeyValues((await f.run(["activate", second.sourceSha, second.checksum, second.stageId, activation, "20", H("e")])).stdout);
+    expect(activated.activation).toBe("verified");
+    expect(activated.activation_from).toBeUndefined();
+
+    const rolled = parseKeyValues((await f.run(["rollback", activation, H("f"), "20", H("0")])).stdout);
+    expect(rolled.rollback).toBe("verified");
+    expect(rolled.restored_sha).toBe(first.sourceSha);
+    expect(await fs.realpath(f.entry)).toBe(path.join(first.release, "packages/bridge/dist/index.js"));
+    const pre = parseKeyValues((await f.run(["preflight"])).stdout);
+    expect(pre.enrolled).toBe("yes");
+    expect(pre.artifact_mode).toBe("managed");
+  }, 180_000);
+
+  it("refuses a host that has never been enrolled", async () => {
+    const f = await makeFixture();
+    const first = await f.stage("1".repeat(40), H("3"));
+    await fs.rm(f.entry);
+    await fs.symlink(path.join(first.release, "packages/bridge/dist/index.js"), f.entry);
+    await expect(f.run(["rebaseline", H("8"), H("9")])).rejects.toThrow(/rebaseline_requires_enrollment/);
+  }, 180_000);
+});

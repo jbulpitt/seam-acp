@@ -22,17 +22,67 @@ afterEach(() => {
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
+// Captured from the production AA v2 endpoint on 2026-09-20. Keep these
+// literal source facts independent of the parser and matcher under test.
+const astraAaPayload = {
+  data: [
+    {
+      id: "2f339a97-9a0d-499a-9cb5-e0db665bfa25",
+      name: "GPT-6 Astra (max)",
+      slug: "gpt-6-astra",
+      release_date: "2026-09-03",
+      model_creator: { id: "e67e56e3-15cd-43db-b679-da4660a69f41", name: "OpenAI", slug: "openai" },
+      evaluations: {
+        artificial_analysis_intelligence_index: 52.7,
+        artificial_analysis_coding_index: 76.9,
+        gpqa: 0.961,
+        hle: 0.547,
+        scicode: 0.565,
+      },
+      pricing: {
+        price_1m_input_tokens: 10,
+        price_1m_output_tokens: 50,
+        price_1m_blended_3_to_1: 20,
+      },
+    },
+    {
+      id: "1f541ef3-913f-4eb2-9d07-0e93c7a9a5e3",
+      name: "GPT-6 Astra (xhigh)",
+      slug: "gpt-6-astra-xhigh",
+      evaluations: {
+        artificial_analysis_intelligence_index: 52.4,
+        artificial_analysis_coding_index: 75.9,
+      },
+    },
+    {
+      id: "e05a4828-0536-4876-870d-a235023f992b",
+      name: "GPT-6 Astra (high)",
+      slug: "gpt-6-astra-high",
+      evaluations: {
+        artificial_analysis_intelligence_index: 50.9,
+        artificial_analysis_coding_index: 77.1,
+      },
+    },
+    {
+      id: "e97a4ef5-e817-480e-9595-12f81dc4974f",
+      name: "GPT-6 Astra (medium)",
+      slug: "gpt-6-astra-medium",
+      evaluations: { artificial_analysis_intelligence_index: 49.6 },
+    },
+    {
+      id: "a3f8100d-e38f-408b-b0fa-0085dae18dc1",
+      name: "GPT-6 Astra (low)",
+      slug: "gpt-6-astra-low",
+      evaluations: { artificial_analysis_intelligence_index: 45.8 },
+    },
+  ],
+};
+
 describe("automatic model-intelligence matching (#249)", () => {
   it("enriches newly advertised Astra and Gemini models without registrations", () => {
     const aa = parseAaModels({
       data: [
-        {
-          id: "aa-astra-max",
-          name: "GPT-6 Astra (max)",
-          slug: "gpt-6-astra-max",
-          model_creator: { id: "openai", name: "OpenAI", slug: "openai" },
-          evaluations: { artificial_analysis_intelligence_index: 52.8 },
-        },
+        ...astraAaPayload.data,
         {
           id: "aa-gemini-high",
           name: "Gemini 3.8 Flash (high)",
@@ -51,7 +101,29 @@ describe("automatic model-intelligence matching (#249)", () => {
       source: "artificial-analysis",
       fetchedAt: "2026-09-09T12:00:00.000Z",
     });
-    expect(metadata.rows.find((row) => row.id === "gpt-6-astra")?.slug).toBe("gpt-6-astra-max");
+    expect(metadata.rows.find((row) => row.id === "gpt-6-astra")).toMatchObject({
+      slug: "gpt-6-astra",
+      provider: "OpenAI",
+      released_at: "2026-09-03",
+      intelligence_index: 52.7,
+      benchmarks: {
+        artificial_analysis_intelligence_index: 52.7,
+        artificial_analysis_coding_index: 76.9,
+        gpqa: 0.961,
+        hle: 0.547,
+      },
+      pricing: { input_per_million: 10, output_per_million: 50, blended_per_million: 20 },
+      matching: { artificial_analysis: { selected_effort: "max" } },
+    });
+    expect(metadata.rows.find((row) => row.id === "gpt-6-astra")?.benchmark_variants
+      ?.map((row) => [row.effort, row.intelligence_index])
+      .sort(([left], [right]) => String(left).localeCompare(String(right)))).toEqual([
+      ["high", 50.9],
+      ["low", 45.8],
+      ["max", 52.7],
+      ["medium", 49.6],
+      ["xhigh", 52.4],
+    ]);
     expect(metadata.rows.find((row) => row.id === "gemini-3.8-flash")?.slug).toBe("gemini-3-8-flash-high");
 
     const value = buildModelValueSnapshot({
@@ -71,12 +143,12 @@ describe("automatic model-intelligence matching (#249)", () => {
       fetchedAt: "2026-09-09T12:00:00.000Z",
     });
     expect(value.rows.find((row) => row.copilotModel === "gpt-6-astra")).toMatchObject({
-      aaSlug: "gpt-6-astra-max",
-      intelligenceIndex: 52.8,
+      aaSlug: "gpt-6-astra",
+      intelligenceIndex: 52.7,
       inputRate: 10,
       outputRate: 50,
       creditsPerTask: 18,
-      valueScore: 52.8 / 18,
+      valueScore: 52.7 / 18,
     });
     expect(value.rows.find((row) => row.copilotModel === "gemini-3.8-flash")).toMatchObject({
       aaSlug: "gemini-3-8-flash-high",
@@ -260,8 +332,7 @@ describe("coordinated model-intelligence generations (#249)", () => {
     const values = new ModelValueStore(db, { inputTokens: 8_000, outputTokens: 2_000 });
     const store = new ModelIntelligenceStore(db);
     const aaRows = parseAaModels({ data: [
-      { id: "aa-astra", name: "GPT-6 Astra (max)", slug: "gpt-6-astra-max",
-        evaluations: { artificial_analysis_intelligence_index: 54 } },
+      ...astraAaPayload.data,
       { id: "aa-gemini", name: "Gemini 3.8 Flash (high)", slug: "gemini-3-8-flash-high",
         evaluations: { artificial_analysis_intelligence_index: 41.2 } },
     ] });
@@ -280,8 +351,17 @@ describe("coordinated model-intelligence generations (#249)", () => {
         catalogModel("gemini-3.8-flash", ["low", "medium", "high"]),
       ]),
       scenario: { uncached_input_tokens: 8_000, cached_input_tokens: 0, cache_write_tokens: 0,
-        output_tokens: 2_000, long_context_threshold_tokens: 200_000 },
+      output_tokens: 2_000, long_context_threshold_tokens: 200_000 },
     });
+    metadata.replaceSnapshot(buildModelMetadataSnapshot({
+      catalog: [
+        { agentId: "copilot", modelId: "gpt-6-astra", name: "GPT-6 Astra", contextWindow: 1_000_000, vision: false },
+        { agentId: "copilot", modelId: "gemini-3.8-flash", name: "Gemini 3.8 Flash", contextWindow: 1_000_000, vision: true },
+      ],
+      sourceModels: [],
+      source: "stale-pre-coordinator-cache",
+      fetchedAt: "2026-09-10T06:17:05.977Z",
+    }).rows);
     const result = await manager.refresh({ forceSources: true });
     expect(result).toMatchObject({ ok: true, result: "published", generation: 1 });
     expect(store.active()).toMatchObject({
@@ -289,10 +369,12 @@ describe("coordinated model-intelligence generations (#249)", () => {
       sourceSnapshots: { "artificial-analysis": 1, "github-copilot-pricing": 2 },
     });
     expect(metadata.get("gpt-6-astra").model).toMatchObject({
-      slug: "gpt-6-astra-max", intelligence_index: 54, enrichment_generation: 1,
+      slug: "gpt-6-astra", intelligence_index: 52.7, enrichment_generation: 1,
+      benchmarks: { artificial_analysis_coding_index: 76.9, gpqa: 0.961, hle: 0.547 },
+      matching: { artificial_analysis: { selected_effort: "max" } },
     });
     expect(values.getLatestRows()[0]).toMatchObject({
-      aaSlug: "gpt-6-astra-max", selectedBenchmarkEffort: "max", creditsPerTask: 18,
+      aaSlug: "gpt-6-astra", selectedBenchmarkEffort: "max", creditsPerTask: 18,
     });
     expect(metadata.query().models.find((row) => row.id === "gemini-3.8-flash")).toMatchObject({
       slug: "gemini-3-8-flash-high", intelligence_index: 41.2, enrichment_generation: 1,
@@ -306,6 +388,52 @@ describe("coordinated model-intelligence generations (#249)", () => {
     expect(rendered).toContain("generation 1");
     expect(rendered).toContain("AA <t:");
     expect(rendered).toContain("GitHub <t:");
+    const projection = new Database(db);
+    const projectedAstra = projection.prepare(`
+      SELECT aa_slug, provider, context_window, intelligence_index, benchmarks_json,
+             pricing_json, released_at, source, fetched_at
+      FROM model_metadata WHERE model_id = 'gpt-6-astra'
+    `).get() as Record<string, unknown>;
+    expect(projectedAstra).toMatchObject({
+      aa_slug: "gpt-6-astra",
+      provider: "OpenAI",
+      context_window: 1_000_000,
+      intelligence_index: 52.7,
+      released_at: "2026-09-03",
+      source: "artificial-analysis",
+    });
+    expect(JSON.parse(String(projectedAstra.benchmarks_json))).toMatchObject({
+      artificial_analysis_intelligence_index: 52.7,
+      artificial_analysis_coding_index: 76.9,
+      gpqa: 0.961,
+      hle: 0.547,
+    });
+    expect(JSON.parse(String(projectedAstra.pricing_json))).toEqual({
+      input_per_million: 10,
+      output_per_million: 50,
+      blended_per_million: 20,
+    });
+
+    // Reproduce the deployed shape: an authoritative coordinated generation
+    // exists, but the compatibility row is stale. An unchanged refresh must
+    // still backfill it; requiring a new AA/catalog generation would strand it.
+    projection.prepare(`
+      UPDATE model_metadata
+      SET aa_slug = NULL, provider = NULL, intelligence_index = NULL,
+          benchmarks_json = '{}', pricing_json = NULL, released_at = NULL
+      WHERE model_id = 'gpt-6-astra'
+    `).run();
+    expect(await manager.refresh({ forceSources: false })).toMatchObject({ result: "unchanged", generation: 1 });
+    expect(projection.prepare(`
+      SELECT aa_slug, provider, intelligence_index, benchmarks_json
+      FROM model_metadata WHERE model_id = 'gpt-6-astra'
+    `).get()).toMatchObject({
+      aa_slug: "gpt-6-astra",
+      provider: "OpenAI",
+      intelligence_index: 52.7,
+      benchmarks_json: expect.stringContaining("artificial_analysis_coding_index"),
+    });
+    projection.close();
     const active = store.active()!;
     const sabotage = new Database(db);
     sabotage.exec(`
@@ -326,6 +454,116 @@ describe("coordinated model-intelligence generations (#249)", () => {
     store.close();
     metadata.close();
     values.close();
+  });
+
+  it("merges covered opaque ids without deleting an omitted dotted id", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "seam-intelligence-projection-merge-"));
+    dirs.push(dir);
+    const db = path.join(dir, "seam.db");
+    const metadata = new ModelMetadataStore(db);
+    const dotted = buildModelMetadataSnapshot({
+      catalog: [{
+        agentId: "claude", modelId: "claude-sonnet-4.6", name: "Claude Sonnet 4.6",
+        contextWindow: 200_000, vision: true,
+      }],
+      sourceModels: [], source: "legacy-catalog", fetchedAt: "2026-09-10T00:00:00.000Z",
+    }).rows;
+    metadata.replaceSnapshot(dotted);
+    const inspection = new Database(db);
+    const dottedBefore = inspection.prepare(
+      "SELECT * FROM model_metadata WHERE model_id = 'claude-sonnet-4.6'"
+    ).get();
+
+    const coordinated = buildModelMetadataSnapshot({
+      catalog: [{
+        agentId: "claude", modelId: "claude-sonnet-4-6", name: "Claude Sonnet 4-6",
+        contextWindow: 1_000_000, vision: true,
+      }],
+      sourceModels: [], source: "coordinated-catalog", fetchedAt: "2026-09-21T00:00:00.000Z",
+    }).rows;
+    const store = new ModelIntelligenceStore(db);
+    store.publish({
+      publishedAt: "2026-09-21T00:00:00.000Z", catalogSignature: "dashed-only",
+      matchingPolicyVersion: "test",
+      sourceSnapshots: { "artificial-analysis": null, "github-copilot-pricing": null },
+      scenario: { uncached_input_tokens: 8_000, cached_input_tokens: 0, cache_write_tokens: 0,
+        output_tokens: 2_000, long_context_threshold_tokens: 200_000 },
+      diagnostics: [], metadata: coordinated, values: [],
+    });
+
+    // Removing merge semantics deletes the dotted row observed in live
+    // sessions. Treating punctuation-normalized ids as storage identity instead
+    // silently updates it. Neither is valid without an explicit migration.
+    expect(inspection.prepare(
+      "SELECT * FROM model_metadata WHERE model_id = 'claude-sonnet-4.6'"
+    ).get()).toEqual(dottedBefore);
+    expect(inspection.prepare(
+      "SELECT model_id, context_window, source FROM model_metadata ORDER BY model_id"
+    ).all()).toEqual([
+      { model_id: "claude-sonnet-4-6", context_window: 1_000_000, source: "coordinated-catalog" },
+      { model_id: "claude-sonnet-4.6", context_window: 200_000, source: "legacy-catalog" },
+    ]);
+    inspection.close();
+    store.close();
+    metadata.close();
+  });
+
+  it("does not invent one benchmark or context when scoped variants disagree", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "seam-intelligence-projection-conflict-"));
+    dirs.push(dir);
+    const db = path.join(dir, "seam.db");
+    const metadata = new ModelMetadataStore(db);
+    const store = new ModelIntelligenceStore(db);
+    const built = buildModelMetadataSnapshot({
+      catalog: [
+        {
+          agentId: "codex", location: "one", modelId: "nebula-7", name: "Nebula 7",
+          contextWindow: 1_000_000, vision: false, effortChoices: ["high"], effortDefault: "high",
+          effortMechanism: "configOption", catalogScope: "binding:codex@one", catalogGeneration: 1,
+          catalogState: "ready", catalogFetchedAt: "2026-09-20T00:00:00.000Z",
+        },
+        {
+          agentId: "codex", location: "two", modelId: "nebula-7", name: "Nebula 7",
+          contextWindow: null, vision: false, effortChoices: ["max"], effortDefault: "max",
+          effortMechanism: "configOption", catalogScope: "binding:codex@two", catalogGeneration: 1,
+          catalogState: "ready", catalogFetchedAt: "2026-09-20T00:00:00.000Z",
+        },
+      ],
+      sourceModels: parseAaModels({ data: [
+        { id: "nebula-high", name: "Nebula 7 (high)", slug: "nebula-7-high",
+          evaluations: { artificial_analysis_intelligence_index: 40 } },
+        { id: "nebula-max", name: "Nebula 7 (max)", slug: "nebula-7",
+          evaluations: { artificial_analysis_intelligence_index: 50 } },
+      ] }),
+      source: "artificial-analysis",
+      fetchedAt: "2026-09-20T00:00:00.000Z",
+    });
+    expect(built.rows.map((row) => [row.variant_id, row.intelligence_index])).toEqual([
+      ["binding:codex@one::nebula-7", 40],
+      ["binding:codex@two::nebula-7", 50],
+    ]);
+    store.publish({
+      publishedAt: "2026-09-20T00:00:00.000Z",
+      catalogSignature: "scope-conflict",
+      matchingPolicyVersion: "test",
+      sourceSnapshots: { "artificial-analysis": null, "github-copilot-pricing": null },
+      scenario: { uncached_input_tokens: 8_000, cached_input_tokens: 0, cache_write_tokens: 0,
+        output_tokens: 2_000, long_context_threshold_tokens: 200_000 },
+      diagnostics: [], metadata: built.rows, values: [],
+    });
+    const inspection = new Database(db, { readonly: true });
+    expect(inspection.prepare(`
+      SELECT source, aa_slug, intelligence_index, context_window
+      FROM model_metadata WHERE model_id = 'nebula-7'
+    `).get()).toEqual({
+      source: "model-intelligence:scope-enrichment-conflict",
+      aa_slug: null,
+      intelligence_index: null,
+      context_window: null,
+    });
+    inspection.close();
+    store.close();
+    metadata.close();
   });
 
   it("uses source-specific LKG after one source fails and republishes a newer catalog", async () => {

@@ -5,6 +5,7 @@ import path from "node:path";
 import { z } from "zod";
 import { parkedAgentMessage } from "./core/parked-agents.js";
 import { retiredAgentConfigMessage } from "./core/retired-agents.js";
+import { parseWarmSetHosts } from "./core/warm-set/hosts.js";
 
 const ModelsListSchema = z
   .string()
@@ -583,6 +584,15 @@ const Schema = z.object({
   /** Retire warm, idle ACP process trees after this many seconds while keeping
    * the durable session binding resumable. 0 disables. Default 2 hours. */
   RUNTIME_IDLE_TTL_SECONDS: z.coerce.number().int().min(0).max(604800).default(7200),
+  /**
+   * Opt-in warm-set (#452). Empty = nobody is warmed (the right default for
+   * the tail). Comma-separated host ids; optional `id=MB` overrides the
+   * measured holding budget. Example: `fhr-server=2500,rhc-server`.
+   */
+  WARM_SET_HOSTS: z.string().default("").transform((v) => parseWarmSetHosts(v)),
+  /** Simultaneous warm-ups per process. Mandatory bound, default 2, cap 4. */
+  WARM_SET_MAX_CONCURRENT: z.coerce.number().int().min(1).max(4).default(2),
+  WARM_SET_INTERVAL_MS: z.coerce.number().int().min(10_000).max(600_000).default(60_000),
   /**
    * How long the agent-quota poller keeps serving an agent's last-known-good
    * snapshot when an upstream read returns "unavailable", instead of flapping

@@ -456,6 +456,58 @@ describe("coordinated model-intelligence generations (#249)", () => {
     values.close();
   });
 
+  it("merges covered opaque ids without deleting an omitted dotted id", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "seam-intelligence-projection-merge-"));
+    dirs.push(dir);
+    const db = path.join(dir, "seam.db");
+    const metadata = new ModelMetadataStore(db);
+    const dotted = buildModelMetadataSnapshot({
+      catalog: [{
+        agentId: "claude", modelId: "claude-sonnet-4.6", name: "Claude Sonnet 4.6",
+        contextWindow: 200_000, vision: true,
+      }],
+      sourceModels: [], source: "legacy-catalog", fetchedAt: "2026-09-10T00:00:00.000Z",
+    }).rows;
+    metadata.replaceSnapshot(dotted);
+    const inspection = new Database(db);
+    const dottedBefore = inspection.prepare(
+      "SELECT * FROM model_metadata WHERE model_id = 'claude-sonnet-4.6'"
+    ).get();
+
+    const coordinated = buildModelMetadataSnapshot({
+      catalog: [{
+        agentId: "claude", modelId: "claude-sonnet-4-6", name: "Claude Sonnet 4-6",
+        contextWindow: 1_000_000, vision: true,
+      }],
+      sourceModels: [], source: "coordinated-catalog", fetchedAt: "2026-09-21T00:00:00.000Z",
+    }).rows;
+    const store = new ModelIntelligenceStore(db);
+    store.publish({
+      publishedAt: "2026-09-21T00:00:00.000Z", catalogSignature: "dashed-only",
+      matchingPolicyVersion: "test",
+      sourceSnapshots: { "artificial-analysis": null, "github-copilot-pricing": null },
+      scenario: { uncached_input_tokens: 8_000, cached_input_tokens: 0, cache_write_tokens: 0,
+        output_tokens: 2_000, long_context_threshold_tokens: 200_000 },
+      diagnostics: [], metadata: coordinated, values: [],
+    });
+
+    // Removing merge semantics deletes the dotted row observed in live
+    // sessions. Treating punctuation-normalized ids as storage identity instead
+    // silently updates it. Neither is valid without an explicit migration.
+    expect(inspection.prepare(
+      "SELECT * FROM model_metadata WHERE model_id = 'claude-sonnet-4.6'"
+    ).get()).toEqual(dottedBefore);
+    expect(inspection.prepare(
+      "SELECT model_id, context_window, source FROM model_metadata ORDER BY model_id"
+    ).all()).toEqual([
+      { model_id: "claude-sonnet-4-6", context_window: 1_000_000, source: "coordinated-catalog" },
+      { model_id: "claude-sonnet-4.6", context_window: 200_000, source: "legacy-catalog" },
+    ]);
+    inspection.close();
+    store.close();
+    metadata.close();
+  });
+
   it("does not invent one benchmark or context when scoped variants disagree", () => {
     const dir = mkdtempSync(path.join(tmpdir(), "seam-intelligence-projection-conflict-"));
     dirs.push(dir);

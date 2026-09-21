@@ -181,7 +181,7 @@ export class ModelIntelligenceManager {
         // A deployment can already have a coordinated generation while the
         // pre-#249 compatibility table is stale (#455). Repair it even when
         // none of the authoritative inputs require a new generation.
-        this.options.store.replaceMetadataCompatibilityProjection(built.metadata);
+        this.options.store.mergeMetadataCompatibilityProjection(built.metadata);
         return this.complete("unchanged", built.diagnostics, attemptedAt, forceSources);
       }
       const generation = this.options.store.publish({

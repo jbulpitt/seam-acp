@@ -184,7 +184,7 @@ export class ModelIntelligenceStore {
         ON CONFLICT(singleton) DO UPDATE SET generation = excluded.generation
       `).run(generation);
       if (input.catalogSignature !== "legacy-unknown") {
-        this.replaceMetadataCompatibilityProjection(metadata);
+        this.mergeMetadataCompatibilityProjection(metadata);
       }
       this.pruneHistory();
       return { generation, schemaVersion: MODEL_INTELLIGENCE_SCHEMA_VERSION, ...input, metadata, values };
@@ -199,6 +199,13 @@ export class ModelIntelligenceStore {
    * recreates that split brain; coordinated JSON readers keep working, but the
    * compatibility reader silently loses published benchmark evidence.
    *
+   * The coordinated generation is authoritative only for exact model ids it
+   * covers. It demonstrably contains fewer ids than the compatibility table,
+   * including ids used by live sessions, so deleting uncovered rows would turn
+   * incomplete enrichment into lost model identity. Exact ids are opaque here:
+   * `claude-sonnet-4.6` and `claude-sonnet-4-6` remain separate rows unless an
+   * explicit normalization policy is introduced elsewhere.
+   *
    * The old schema has one row per model, so scope variants are collapsed only
    * when their external enrichment agrees exactly. Catalog-owned availability
    * is merged conservatively: an unknown window in any scope leaves the
@@ -206,7 +213,7 @@ export class ModelIntelligenceStore {
    * The coordinated generation remains authoritative and retains every
    * per-effort benchmark variant and binding.
    */
-  replaceMetadataCompatibilityProjection(rows: readonly ModelMetadata[]): void {
+  mergeMetadataCompatibilityProjection(rows: readonly ModelMetadata[]): void {
     const table = this.db.prepare(
       "SELECT 1 FROM sqlite_master WHERE type='table' AND name='model_metadata'"
     ).get();
@@ -240,9 +247,27 @@ export class ModelIntelligenceStore {
         @intelligence_index, @benchmarks_json, @pricing_json, @released_at,
         @description, @evidence_json, @source, @fetched_at
       )
+      ON CONFLICT(model_id) DO UPDATE SET
+        name = excluded.name,
+        aliases_json = excluded.aliases_json,
+        aa_slug = excluded.aa_slug,
+        source_id = excluded.source_id,
+        source_name = excluded.source_name,
+        provider = excluded.provider,
+        creator_json = excluded.creator_json,
+        agents_json = excluded.agents_json,
+        agent_models_json = excluded.agent_models_json,
+        context_window = excluded.context_window,
+        intelligence_index = excluded.intelligence_index,
+        benchmarks_json = excluded.benchmarks_json,
+        pricing_json = excluded.pricing_json,
+        released_at = excluded.released_at,
+        description = excluded.description,
+        evidence_json = excluded.evidence_json,
+        source = excluded.source,
+        fetched_at = excluded.fetched_at
     `);
     this.db.transaction(() => {
-      this.db.prepare("DELETE FROM model_metadata").run();
       for (const row of projection) insert.run(row);
     })();
   }

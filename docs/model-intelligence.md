@@ -91,11 +91,15 @@ fix the parser/matcher and refresh through the same admin path.
 a real coordinated generation publishes. An unchanged refresh repairs that
 projection as well: this closes the #455 state where the active generation had
 complete Artificial Analysis data but the old table remained frozen with null
-benchmarks. The projection has one row per opaque model id. It collapses
-host/scope rows only when their external enrichment agrees exactly, uses the
-smallest known context window (or null if any scope is unknown), and exposes the
-highest supported published effort in its top-level benchmark fields. The
-authoritative coordinated row retains every binding and every matched effort in
-`benchmark_variants`; consumers that need a particular host or effort must use
-that scoped generation rather than infer it from the compatibility projection.
-Historical `model_value_snapshot` rows are not rewritten.
+benchmarks. Projection is an exact-id merge, not replacement: covered rows are
+updated or inserted, while rows absent from the coordinated generation remain
+untouched. Model ids are opaque, so dotted and dashed spellings remain distinct;
+this path does not silently normalize one into the other. The projection has one
+row per opaque model id. It collapses host/scope rows only when their external
+enrichment agrees exactly, uses the smallest known context window (or null if
+any scope is unknown), and exposes the highest supported published effort in
+its top-level benchmark fields. The authoritative coordinated row retains every
+binding and every matched effort in `benchmark_variants`; consumers that need a
+particular host or effort must use that scoped generation rather than infer it
+from the compatibility projection. Historical `model_value_snapshot` rows are
+not rewritten.

@@ -98,3 +98,15 @@ export function unknownAgentMessage(agentId: string, available: readonly string[
     `Refusing the slot rather than substituting another agent.`
   );
 }
+
+/**
+ * The `exit` frame payload for a slot that could not be spawned.
+ *
+ * Non-zero by construction: a slot that never started did not succeed, and an
+ * old seam-acp reads `code` alone — so the refusal still registers as a
+ * stopped slot there, which is the whole point. `spawnError` is additive and
+ * carries the reason for anyone who looks.
+ */
+export function spawnRefusalFrame(err: unknown): { code: number; spawnError: string } {
+  return { code: 1, spawnError: err instanceof Error ? err.message : String(err) };
+}

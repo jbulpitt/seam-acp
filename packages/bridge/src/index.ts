@@ -58,7 +58,7 @@ import { dispatchBridgeRpc, type SlotSpawnConfig } from "./rpc.js";
 import { slotHealthSnapshot } from "./slot-health.js";
 import { createOutputLog, createLineFramer } from "./output-log.js";
 import { createStderrRegistry } from "./stderr-ring.js";
-import { resolveSlotAdapter, UnknownAgentError } from "./resolve-adapter.js";
+import { resolveSlotAdapter, UnknownAgentError, spawnRefusalFrame } from "./resolve-adapter.js";
 import { muxSend, forwardAgentStdout } from "./frame-out.js";
 import { BridgeMcpInputRewriter } from "./mcp-injection.js";
 import {
@@ -326,18 +326,9 @@ function makeSlotManager(opts: {
       // stream that will never produce anything. One `exit` frame is enough —
       // the mux marks the slot killed on receipt and stops forwarding stdin,
       // so this cannot turn into a frame-per-write loop.
-      const reason = err instanceof Error ? err.message : String(err);
-      console.error(`[bridge] Slot ${slot}: refusing to spawn — ${reason}`);
-      muxSend(
-        currentWs,
-        WebSocket,
-        slot,
-        "exit",
-        // `spawnError` is additive: an old seam-acp reads `code` and ignores
-        // it, and still sees the slot stop instead of getting the wrong agent.
-        { code: 1, spawnError: reason },
-        outputLog,
-      );
+      const frame = spawnRefusalFrame(err);
+      console.error(`[bridge] Slot ${slot}: refusing to spawn — ${frame.spawnError}`);
+      muxSend(currentWs, WebSocket, slot, "exit", frame, outputLog);
       return null;
     }
     slots.set(slot, agent);

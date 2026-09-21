@@ -57,6 +57,7 @@ import {
 import { dispatchBridgeRpc, type SlotSpawnConfig } from "./rpc.js";
 import { slotHealthSnapshot } from "./slot-health.js";
 import { createOutputLog, createLineFramer } from "./output-log.js";
+import { createStderrRing, attachStderrDrain, exitFramePayload } from "./stderr-ring.js";
 import { muxSend, forwardAgentStdout } from "./frame-out.js";
 import { BridgeMcpInputRewriter } from "./mcp-injection.js";
 import {
@@ -257,6 +258,13 @@ function makeSlotManager(opts: {
   /** #444: stdout was forwarded as raw chunks, so a reconnect could splice a
    *  partial JSON line into a line-delimited JSON-RPC stream. */
   const lineFramers = new Map<number, ReturnType<typeof createLineFramer>>();
+  /**
+   * #456: agent fd 2 was piped with no reader, which stalls the child once the
+   * 64 KiB pipe buffer fills. Draining removes the stall; keeping a bounded
+   * ring means an abnormal exit can report its cause the way the local path
+   * already does.
+   */
+  const stderrRings = new Map<number, ReturnType<typeof createStderrRing>>();
   const slotInputRewriters = new Map<number, BridgeMcpInputRewriter>();
 
   function setWs(ws: WsSocket | null) {
@@ -317,6 +325,16 @@ function makeSlotManager(opts: {
       new BridgeMcpInputRewriter(slotConfigs.get(slot)?.mcpServers ?? [])
     );
 
+    // #456: fd 2 was piped and nothing ever read it, so the kernel pipe buffer
+    // filled at 64 KiB and the child blocked on its next write to stderr —
+    // a live process that has stopped producing output, which is exactly what
+    // a hung agent looks like from seam-acp. Attaching this handler is what
+    // keeps the pipe flowing; the ring is what turns the bytes into a cause we
+    // can report instead of infer.
+    const stderrRing = createStderrRing();
+    stderrRings.set(slot, stderrRing);
+    attachStderrDrain(agent, stderrRing);
+
     const framer = createLineFramer();
     lineFramers.set(slot, framer);
     agent.stdout?.on("data", (chunk: Buffer) => {
@@ -333,7 +351,9 @@ function makeSlotManager(opts: {
       slots.delete(slot);
       slotInputRewriters.delete(slot);
       flushFramer(slot);
-      muxSend(currentWs, WebSocket, slot, "exit", { code: 1 }, outputLog);
+      // A spawn error is abnormal by definition, so the tail goes out with it.
+      muxSend(currentWs, WebSocket, slot, "exit", exitFramePayload(1, null, stderrRings.get(slot)), outputLog);
+      stderrRings.delete(slot);
     });
 
     agent.on("exit", (code, signal) => {
@@ -343,7 +363,11 @@ function makeSlotManager(opts: {
       lastStdinAt.delete(slot);
       slotInputRewriters.delete(slot);
       flushFramer(slot);
-      muxSend(currentWs, WebSocket, slot, "exit", { code: code ?? 1 }, outputLog);
+      // #456: on an abnormal exit the agent's own stderr says WHY. It is a
+      // fact the bridge now holds, so it reports it rather than leaving
+      // seam-acp to infer a cause from an exit code alone.
+      muxSend(currentWs, WebSocket, slot, "exit", exitFramePayload(code, signal, stderrRings.get(slot)), outputLog);
+      stderrRings.delete(slot);
     });
 
     return agent;
@@ -662,6 +686,10 @@ function makeSlotManager(opts: {
         // consumer still needs — and the age bound reclaims it.)
         outputLog.dropSlot(msg.slot);
         lineFramers.delete(msg.slot);
+        // #456: the exit this kill provokes carries a signal, which would
+        // otherwise read as abnormal and ship a tail for a death seam-acp
+        // asked for. Dropping the ring first keeps a deliberate kill quiet.
+        stderrRings.delete(msg.slot);
         slotConfigs.delete(msg.slot);
         slotInputRewriters.delete(msg.slot);
       }

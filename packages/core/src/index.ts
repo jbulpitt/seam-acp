@@ -2,7 +2,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { loadConfig, isChannelLocked, resolveThreadLocation, resolveThreadTtsVoice, resolveThreadTtsPace, resolveThreadTtsStyle, adminParticipantOverlapIds, GROK_STATIC_MODELS, ZAI_STATIC_MODELS, OLLAMA_CLOUD_STATIC_MODELS } from "./config.js";
 import { enrichModelListWithKnownLimits } from "./core/context-window.js";
-import { hostEmoji } from "./core/location.js";
+import { hostEmoji, isLocalLocation } from "./core/location.js";
 import { LoopbackHost } from "./core/loopback-host.js";
 import { logger } from "./lib/logger.js";
 import { startHealthServer } from "./lib/health.js";
@@ -39,6 +39,7 @@ import { startTunnelGistPublisher } from "./lib/tunnel-gist.js";
 import { ScheduledPromptManager } from "./core/scheduled-prompts/manager.js";
 import { WakeManager } from "./core/wake/manager.js";
 import { ParkedPromptManager } from "./core/parked-prompts/manager.js";
+import { WarmSetManager } from "./core/warm-set/manager.js";
 import { WatchManager } from "./core/watch/manager.js";
 import { LiveHelpManager } from "./core/live-help/manager.js";
 import { VoiceConsoleManager } from "./core/voice-console/manager.js";
@@ -1264,6 +1265,21 @@ async function main(): Promise<void> {
   orchestrator.setParkedManager(parkedManager);
   parkedManager.start();
 
+  const warmSetManager = new WarmSetManager({
+    logger: logger.child({ mod: "warm-set" }),
+    store,
+    router,
+    hub: {
+      isBridgeReady: (location) => isLocalLocation(location) || Boolean(bridgeHub?.isBridgeReady(location)),
+      slotHealthFor: (location) => bridgeHub?.slotHealthFor(location) ?? [],
+    },
+    threadPresets: config.threadPresets,
+    hosts: config.WARM_SET_HOSTS,
+    intervalMs: config.WARM_SET_INTERVAL_MS,
+    maxConcurrent: config.WARM_SET_MAX_CONCURRENT,
+  });
+  warmSetManager.start();
+
   const cardGifs = new CardGifCatalog({
     url: config.SIMPLE_CARD_GIF_MANIFEST_URL,
     logger: logger.child({ mod: "card-gifs" }),
@@ -1514,6 +1530,7 @@ async function main(): Promise<void> {
     doneRetention.stop();
     wakeManager.stop();
     parkedManager.stop();
+    warmSetManager.stop();
     cardGifs.stop();
     watchManager.stop();
     // #174 HTTP ingress closes FIRST, and synchronously. `/mcp` and `/ingest`

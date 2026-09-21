@@ -653,6 +653,12 @@ export class AgentRuntime {
 
   /** Local transport process identity only; never an environment/process dump. */
   getProcessId(): number | undefined { return this.child?.pid; }
+
+  /** Mux slot when this runtime was spawned over a bridge; unset locally. */
+  getSlot(): number | undefined {
+    const slot = (this.child as { slot?: unknown } | undefined)?.slot;
+    return typeof slot === "number" ? slot : undefined;
+  }
   getProviderIdentity(): string | undefined { return this.providerIdentity; }
 
   /** Send an arbitrary ACP JSON-RPC method on the live connection (e.g. grok

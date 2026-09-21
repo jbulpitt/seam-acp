@@ -54,6 +54,14 @@ const LIVENESS_PROBE_GRACE_MS = 10_000;
 const LIVENESS_TICK_MS = 5_000;
 
 /**
+ * #444: consecutive unparseable frames before the stream is declared corrupt.
+ * One is a glitch worth counting; three in a row without a single good frame
+ * between them means the framing itself is wrong, and continuing to drop
+ * messages silently is the failure this replaces.
+ */
+const MAX_CONSECUTIVE_PARSE_FAILURES = 3;
+
+/**
  * A bridge RPC that failed because the peer is gone, as distinct from an
  * operation that is merely slow (#427).
  *
@@ -124,6 +132,8 @@ export class BridgeUnreachableError extends Error {
 
 interface MuxMsg {
   slot?: number;
+  /** #444: per-slot output sequence. Absent from an older bridge. */
+  seq?: number;
   type:
     | "data"
     | "kill"
@@ -211,6 +221,17 @@ export function makeMux(opts: {
   onHello?: (hello: HelloFrame) => void;
   onEvent?: (event: EventFrame) => void;
   onDisconnect?: () => void;
+  /** #444: observed when a frame cannot be parsed. Diagnostics only. */
+  onParseFailure?: (consecutive: number) => void;
+  /**
+   * #444: observed when replay reports output that was lost to retention.
+   * Surfaced rather than hidden — a consumer that cannot tell "here is the
+   * rest" from "some of it is gone" splices unrelated stream points together.
+   */
+  onOutputGap?: (
+    slot: number,
+    gap: { afterSeq: number; firstAvailableSeq: number; droppedFrames: number }
+  ) => void;
   /**
    * #442: per-slot health as the BRIDGE observed it, delivered on every
    * same-instance reconnect probe. Facts only — liveness and silence — with
@@ -288,6 +309,22 @@ export function makeMux(opts: {
       reject(new BridgeUnreachableError(why, true));
     }
   }
+
+  /**
+   * #444: how far this consumer has consumed each slot's output stream.
+   *
+   * This is the entire disconnection story. The cursor is durable across
+   * sockets, so a drop does not need handling — it just stops advancing — and
+   * catch-up is "ask for everything after where I was".
+   */
+  const outputCursor = new Map<number, number>();
+  /**
+   * #444: `catch { return; }` silently dropped an unparseable frame, so a
+   * corrupt stream degraded into missing messages nobody could see. Counted
+   * instead: isolated corruption is tolerated, repetition means the stream is
+   * no longer trustworthy and limping on is worse than restarting.
+   */
+  let parseFailures = 0;
 
   function attach(newWs: WebSocket) {
     // Replace the old bridge connection.
@@ -380,7 +417,26 @@ export function makeMux(opts: {
       let msg: MuxMsg;
       try {
         msg = JSON.parse(raw.toString()) as MuxMsg;
+        // A good frame means the stream recovered; corruption must be
+        // consecutive to count as corruption.
+        parseFailures = 0;
       } catch {
+        parseFailures += 1;
+        opts.onParseFailure?.(parseFailures);
+        if (parseFailures >= MAX_CONSECUTIVE_PARSE_FAILURES) {
+          // Not a frame we lost — a stream we can no longer read. Every slot
+          // on it is evicted so their runtimes restart, rather than each
+          // waiting out a timeout on messages that will never parse.
+          parseFailures = 0;
+          for (const [slot, entry] of [...slots]) {
+            if (entry.killed) continue;
+            entry.killed = true;
+            entry.stdout.push(null);
+            entry.fake.emit("exit", 1, null);
+            slots.delete(slot);
+          }
+          newWs.terminate();
+        }
         return;
       }
 
@@ -432,6 +488,43 @@ export function makeMux(opts: {
               reply.slots.filter((slot) => !deadOnBridge.has(slot))
             );
             if (health.length) opts.onSlotHealth?.(health);
+            // #444: catch up on output produced while the socket was down.
+            // Runs after eviction so a slot the bridge no longer has is not
+            // asked to replay. Fire-and-forget per slot: an OLD bridge rejects
+            // `replayOutput` as an unknown action, and that rejection means
+            // "no replay available" — the same behaviour as today, which is
+            // what keeps a mixed-version fleet safe.
+            for (const [slot, entry] of [...slots]) {
+              if (entry.killed || !liveOnBridge.has(slot)) continue;
+              const afterSeq = outputCursor.get(slot) ?? 0;
+              void sendCmd("replayOutput", { slot, afterSeq }).then((reply: {
+                slot?: number;
+                frames?: Array<{ seq?: number; type?: string; data?: string; code?: number }>;
+                gap?: { afterSeq: number; firstAvailableSeq: number; droppedFrames: number };
+              }) => {
+                const live = slots.get(slot);
+                if (!live || live.killed) return;
+                // The gap is reported BEFORE the frames it precedes, so a
+                // consumer sees the discontinuity in the right order rather
+                // than discovering it after acting on what followed.
+                if (reply?.gap) opts.onOutputGap?.(slot, reply.gap);
+                for (const frame of reply?.frames ?? []) {
+                  if (frame.type === "data" && typeof frame.data === "string") {
+                    if (typeof frame.seq === "number") outputCursor.set(slot, frame.seq);
+                    live.stdout.push(frame.data);
+                  } else if (frame.type === "exit") {
+                    live.killed = true;
+                    slots.delete(slot);
+                    live.stdout.push(null);
+                    live.fake.emit("exit", frame.code ?? 1, null);
+                  }
+                }
+                const through = outputCursor.get(slot);
+                // Acks only accelerate the bridge's trimming; its age and byte
+                // bounds are what actually reclaim memory.
+                if (through) void sendCmd("ackOutput", { slot, throughSeq: through }).catch(() => {});
+              }).catch(() => { /* old bridge: no replay, behave as today */ });
+            }
             for (const [slot, entry] of [...slots]) {
               if (!entry.killed && !liveOnBridge.has(slot)) {
                 send({ slot, type: "kill" });
@@ -494,6 +587,10 @@ export function makeMux(opts: {
       if (!entry || entry.killed) return;
 
       if (msg.type === "data" && msg.data !== undefined) {
+        // #444: advance only on frames that carry one. An old bridge sends no
+        // `seq`, which leaves the cursor at 0 and simply means "never ask for
+        // replay" — today's behaviour exactly.
+        if (typeof msg.seq === "number") outputCursor.set(msg.slot, msg.seq);
         entry.stdout.push(msg.data);
       } else if (msg.type === "exit") {
         entry.killed = true;

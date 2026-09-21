@@ -56,6 +56,7 @@ import {
 } from "@seam/adapters";
 import { dispatchBridgeRpc, type SlotSpawnConfig } from "./rpc.js";
 import { slotHealthSnapshot } from "./slot-health.js";
+import { createOutputLog, createLineFramer } from "./output-log.js";
 import { BridgeMcpInputRewriter } from "./mcp-injection.js";
 import {
   inventoryFromAdapters,
@@ -229,9 +230,20 @@ function muxSend(
   slot: number,
   type: string,
   payload: Record<string, unknown>,
+  /**
+   * #444: when given, the frame is recorded BEFORE the socket is consulted and
+   * carries its `seq` on the wire. The early return below used to discard
+   * output whenever the socket was not OPEN, while stdin in the other
+   * direction was queued and replayed — the asymmetry this story removes.
+   *
+   * An older seam-acp ignores the extra `seq` field, so tagging is safe on a
+   * mixed-version fleet.
+   */
+  log?: { append(slot: number, type: string, payload: Record<string, unknown>): number },
 ) {
+  const seq = log?.append(slot, type, payload);
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
-  ws.send(JSON.stringify({ slot, type, ...payload }));
+  ws.send(JSON.stringify({ slot, type, ...payload, ...(seq === undefined ? {} : { seq }) }));
 }
 
 /**
@@ -263,6 +275,16 @@ function makeSlotManager(opts: {
    * turn fact — seam-acp — decide, without the bridge guessing.
    */
   const lastStdinAt = new Map<number, number>();
+  /**
+   * #444: agent output buffered with per-slot sequences, so a disconnect stops
+   * the consumer's cursor advancing instead of destroying the frames. Bounded
+   * by age and bytes independently of any acknowledgment — an old seam-acp
+   * that never acks must still be safe on a host we cannot update.
+   */
+  const outputLog = createOutputLog();
+  /** #444: stdout was forwarded as raw chunks, so a reconnect could splice a
+   *  partial JSON line into a line-delimited JSON-RPC stream. */
+  const lineFramers = new Map<number, ReturnType<typeof createLineFramer>>();
   const slotInputRewriters = new Map<number, BridgeMcpInputRewriter>();
 
   function setWs(ws: WsSocket | null) {
@@ -297,6 +319,17 @@ function makeSlotManager(opts: {
     }
   }
 
+  /**
+   * #444: surrender any held partial line before the slot ends. An agent that
+   * dies mid-line has still produced those bytes, and holding them back would
+   * turn a crash into a silent truncation.
+   */
+  function flushFramer(slot: number): void {
+    const tail = lineFramers.get(slot)?.flush();
+    if (tail) muxSend(currentWs, WebSocket, slot, "data", { data: tail }, outputLog);
+    lineFramers.delete(slot);
+  }
+
   function getOrSpawnSlot(slot: number): ChildProcess | null {
     if (slots.has(slot)) return slots.get(slot) ?? null;
     if (draining) {
@@ -312,16 +345,23 @@ function makeSlotManager(opts: {
       new BridgeMcpInputRewriter(slotConfigs.get(slot)?.mcpServers ?? [])
     );
 
+    const framer = createLineFramer();
+    lineFramers.set(slot, framer);
     agent.stdout?.on("data", (chunk: Buffer) => {
       lastStdoutAt.set(slot, Date.now());
-      muxSend(currentWs, WebSocket, slot, "data", { data: chunk.toString("utf8") });
+      // One frame per complete line. A partial tail is held until its newline
+      // arrives, so a frame is always a whole JSON-RPC message.
+      for (const line of framer.push(chunk.toString("utf8"))) {
+        muxSend(currentWs, WebSocket, slot, "data", { data: line }, outputLog);
+      }
     });
 
     agent.on("error", (err) => {
       console.error(`[bridge] Slot ${slot} agent error: ${err.message}`);
       slots.delete(slot);
       slotInputRewriters.delete(slot);
-      muxSend(currentWs, WebSocket, slot, "exit", { code: 1 });
+      flushFramer(slot);
+      muxSend(currentWs, WebSocket, slot, "exit", { code: 1 }, outputLog);
     });
 
     agent.on("exit", (code, signal) => {
@@ -330,7 +370,8 @@ function makeSlotManager(opts: {
       lastStdoutAt.delete(slot);
       lastStdinAt.delete(slot);
       slotInputRewriters.delete(slot);
-      muxSend(currentWs, WebSocket, slot, "exit", { code: code ?? 1 });
+      flushFramer(slot);
+      muxSend(currentWs, WebSocket, slot, "exit", { code: code ?? 1 }, outputLog);
     });
 
     return agent;
@@ -531,6 +572,33 @@ function makeSlotManager(opts: {
           slots: [...slots.keys()],
           health: slotHealthSnapshot(slots, lastStdoutAt, lastStdinAt, Date.now()),
         };
+      } else if (action === "replayOutput") {
+        // #444: "read from where you were". The consumer's cursor is the only
+        // state that matters, so a disconnect needs no special handling here —
+        // it just asks again from the same place.
+        //
+        // An OLD bridge does not know this action and replies with an error,
+        // which the mux treats as "no replay available" and falls back to
+        // today's behaviour. That is why the fleet can be mixed-version.
+        const slot = Number(payload.slot);
+        const afterSeq = Number(payload.afterSeq ?? 0);
+        const replay = outputLog.since(slot, Number.isFinite(afterSeq) ? afterSeq : 0);
+        result = {
+          slot,
+          frames: replay.frames.map((f) => ({ seq: f.seq, type: f.type, ...f.payload })),
+          // Stated explicitly, never implied by a short reply. A consumer that
+          // cannot tell "here is the rest" from "some of it is gone" will
+          // splice two unrelated points of a JSON-RPC stream together.
+          ...(replay.gap ? { gap: replay.gap } : {}),
+        };
+      } else if (action === "ackOutput") {
+        // Acks only ACCELERATE trimming. The age and byte bounds are what
+        // guarantee memory comes back, because an old seam-acp never acks and
+        // four of eight hosts cannot be updated to one that does.
+        const slot = Number(payload.slot);
+        const throughSeq = Number(payload.throughSeq ?? 0);
+        if (Number.isFinite(slot) && Number.isFinite(throughSeq)) outputLog.ack(slot, throughSeq);
+        result = null;
       } else if (action === "writeAttachment") {
         result = await writeAttachment(payload.cwd, payload.filename, payload.base64);
       } else {
@@ -616,6 +684,12 @@ function makeSlotManager(opts: {
         console.error(`[bridge] Slot ${msg.slot}: kill received — terminating agent`);
         agent.kill();
         slots.delete(msg.slot);
+        // #444: seam-acp is explicitly done with this slot, so its replay
+        // window has no remaining consumer. (An agent that merely EXITS keeps
+        // its buffer — the final frames are exactly what a reconnecting
+        // consumer still needs — and the age bound reclaims it.)
+        outputLog.dropSlot(msg.slot);
+        lineFramers.delete(msg.slot);
         slotConfigs.delete(msg.slot);
         slotInputRewriters.delete(msg.slot);
       }

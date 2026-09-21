@@ -57,7 +57,7 @@ import {
 import { dispatchBridgeRpc, type SlotSpawnConfig } from "./rpc.js";
 import { slotHealthSnapshot } from "./slot-health.js";
 import { createOutputLog, createLineFramer } from "./output-log.js";
-import { createStderrRing, attachStderrDrain, exitFramePayload } from "./stderr-ring.js";
+import { createStderrRegistry } from "./stderr-ring.js";
 import { muxSend, forwardAgentStdout } from "./frame-out.js";
 import { BridgeMcpInputRewriter } from "./mcp-injection.js";
 import {
@@ -264,7 +264,7 @@ function makeSlotManager(opts: {
    * ring means an abnormal exit can report its cause the way the local path
    * already does.
    */
-  const stderrRings = new Map<number, ReturnType<typeof createStderrRing>>();
+  const stderrRegistry = createStderrRegistry();
   const slotInputRewriters = new Map<number, BridgeMcpInputRewriter>();
 
   function setWs(ws: WsSocket | null) {
@@ -331,9 +331,7 @@ function makeSlotManager(opts: {
     // a hung agent looks like from seam-acp. Attaching this handler is what
     // keeps the pipe flowing; the ring is what turns the bytes into a cause we
     // can report instead of infer.
-    const stderrRing = createStderrRing();
-    stderrRings.set(slot, stderrRing);
-    attachStderrDrain(agent, stderrRing);
+    stderrRegistry.attach(slot, agent);
 
     const framer = createLineFramer();
     lineFramers.set(slot, framer);
@@ -352,8 +350,7 @@ function makeSlotManager(opts: {
       slotInputRewriters.delete(slot);
       flushFramer(slot);
       // A spawn error is abnormal by definition, so the tail goes out with it.
-      muxSend(currentWs, WebSocket, slot, "exit", exitFramePayload(1, null, stderrRings.get(slot)), outputLog);
-      stderrRings.delete(slot);
+      muxSend(currentWs, WebSocket, slot, "exit", stderrRegistry.exitPayload(slot, 1, null), outputLog);
     });
 
     agent.on("exit", (code, signal) => {
@@ -366,8 +363,7 @@ function makeSlotManager(opts: {
       // #456: on an abnormal exit the agent's own stderr says WHY. It is a
       // fact the bridge now holds, so it reports it rather than leaving
       // seam-acp to infer a cause from an exit code alone.
-      muxSend(currentWs, WebSocket, slot, "exit", exitFramePayload(code, signal, stderrRings.get(slot)), outputLog);
-      stderrRings.delete(slot);
+      muxSend(currentWs, WebSocket, slot, "exit", stderrRegistry.exitPayload(slot, code, signal), outputLog);
     });
 
     return agent;
@@ -689,7 +685,7 @@ function makeSlotManager(opts: {
         // #456: the exit this kill provokes carries a signal, which would
         // otherwise read as abnormal and ship a tail for a death seam-acp
         // asked for. Dropping the ring first keeps a deliberate kill quiet.
-        stderrRings.delete(msg.slot);
+        stderrRegistry.drop(msg.slot);
         slotConfigs.delete(msg.slot);
         slotInputRewriters.delete(msg.slot);
       }

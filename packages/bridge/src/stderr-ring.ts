@@ -186,3 +186,49 @@ export function exitFramePayload(
     ...(tail ? { stderrTail: tail } : {}),
   };
 }
+
+/**
+ * Per-slot ownership of the above, so the lifecycle is covered by tests.
+ *
+ * Mutation testing killed 14/14 mutations of the ring while every mutation of
+ * the equivalent logic left inline in `index.ts` survived — including deleting
+ * the drain outright, which is this entire story silently undone. That file is
+ * the CLI entrypoint and `process.exit(1)`s on import, so nothing in it can be
+ * imported by a test. #442 and #444 each hit this, so the decisions live here
+ * and `index.ts` keeps only the call.
+ */
+export interface StderrRegistry {
+  /** Create a slot's ring and start draining. Safe on a null stderr. */
+  attach(slot: number, child: { stderr?: NodeJS.ReadableStream | null }): void;
+  /** Build the slot's exit payload and release its ring. */
+  exitPayload(
+    slot: number,
+    code: number | null,
+    signal: NodeJS.Signals | string | null,
+  ): Record<string, unknown>;
+  /** Forget a slot without reporting — used when seam-acp asked for the kill. */
+  drop(slot: number): void;
+  size(): number;
+}
+
+export function createStderrRegistry(options: StderrRingOptions = {}): StderrRegistry {
+  const rings = new Map<number, StderrRing>();
+  return {
+    attach(slot, child) {
+      const ring = createStderrRing(options);
+      rings.set(slot, ring);
+      attachStderrDrain(child, ring);
+    },
+    exitPayload(slot, code, signal) {
+      const payload = exitFramePayload(code, signal, rings.get(slot));
+      rings.delete(slot);
+      return payload;
+    },
+    drop(slot) {
+      rings.delete(slot);
+    },
+    size() {
+      return rings.size;
+    },
+  };
+}

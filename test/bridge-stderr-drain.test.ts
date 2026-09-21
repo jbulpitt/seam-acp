@@ -18,6 +18,7 @@ import {
   createStderrRing,
   attachStderrDrain,
   exitFramePayload,
+  createStderrRegistry,
 } from "../packages/bridge/src/stderr-ring.js";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -160,6 +161,73 @@ describe("#456 the exit frame reports cause instead of leaving it inferred", () 
     // Absent means "nothing to report". An empty string would be a claim.
     expect(exitFramePayload(1, null, createStderrRing())).toEqual({ code: 1 });
     expect(exitFramePayload(1, null, undefined)).toEqual({ code: 1 });
+  });
+});
+
+describe("#456 the per-slot lifecycle, which had no coverage until mutation said so", () => {
+  // Every mutation of this logic survived a full suite while it was inline in
+  // `index.ts` — including deleting the drain entirely, which is this whole
+  // story undone. `index.ts` is the CLI entrypoint and cannot be imported.
+  const fakeChild = () => {
+    const listeners: Array<(c: string) => void> = [];
+    return {
+      stderr: { on: (_e: string, fn: (c: string) => void) => { listeners.push(fn); } } as never,
+      emit: (text: string) => listeners.forEach((fn) => fn(text)),
+      listenerCount: () => listeners.length,
+    };
+  };
+
+  it("actually drains the child it is given", () => {
+    const registry = createStderrRegistry();
+    const child = fakeChild();
+    registry.attach(1, child);
+    // A handler on the stream is what keeps the pipe moving. No handler, no fix.
+    expect(child.listenerCount()).toBe(1);
+  });
+
+  it("reports what that slot's child wrote, on an abnormal exit", () => {
+    const registry = createStderrRegistry();
+    const child = fakeChild();
+    registry.attach(1, child);
+    child.emit("panic: disk full\n");
+    expect(registry.exitPayload(1, 1, null)).toMatchObject({
+      code: 1,
+      stderrTail: "panic: disk full",
+    });
+  });
+
+  it("keeps slots apart, so one agent's death never quotes another's stderr", () => {
+    const registry = createStderrRegistry();
+    const a = fakeChild();
+    const b = fakeChild();
+    registry.attach(1, a);
+    registry.attach(2, b);
+    a.emit("slot-one failed\n");
+    b.emit("slot-two failed\n");
+    expect(registry.exitPayload(2, 1, null).stderrTail).toBe("slot-two failed");
+  });
+
+  it("releases the ring once it has reported, so a slot cannot leak", () => {
+    const registry = createStderrRegistry();
+    registry.attach(1, fakeChild());
+    expect(registry.size()).toBe(1);
+    registry.exitPayload(1, 0, null);
+    expect(registry.size()).toBe(0);
+  });
+
+  it("stays quiet about a kill seam-acp asked for", () => {
+    // `kill` provokes an exit carrying a signal, which reads as abnormal. A
+    // death that was requested is not a failure to report.
+    const registry = createStderrRegistry();
+    const child = fakeChild();
+    registry.attach(1, child);
+    child.emit("interrupted\n");
+    registry.drop(1);
+    expect(registry.exitPayload(1, null, "SIGTERM")).toEqual({ code: 1 });
+  });
+
+  it("survives an exit for a slot it never saw", () => {
+    expect(createStderrRegistry().exitPayload(99, 1, null)).toEqual({ code: 1 });
   });
 });
 

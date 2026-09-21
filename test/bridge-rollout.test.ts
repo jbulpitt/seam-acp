@@ -255,6 +255,40 @@ describe("bridge rollout gating and verification (#241)", () => {
     expect(calls.some((c) => c.includes("--untracked-files=no"))).toBe(true);
   });
 
+  it("#484: still refuses when the BUILD changes the worktree", async () => {
+    // The post-build check used to compare against empty. It now compares
+    // against a pre-build snapshot, so a pre-existing untracked file cannot
+    // masquerade as a build side effect — but a real one must still refuse.
+    // Mutation found this guard had no coverage at all after the rewrite.
+    let builds = 0;
+    const fake = vi.fn(async (cmd: { file: string; args: string[] }) => {
+      if (cmd.file === "npm") { builds += 1; return { stdout: "", stderr: "" }; }
+      if (cmd.args?.includes("--untracked-files=no")) return { stdout: "", stderr: "" };
+      if (cmd.args?.includes("--untracked-files=all")) {
+        // Clean before the build; the build then wrote something.
+        return { stdout: builds ? "?? packages/bridge/generated.js\n" : "", stderr: "" };
+      }
+      if (cmd.args?.includes("rev-parse")) return { stdout: `${"a".repeat(40)}\n`, stderr: "" };
+      return { stdout: "", stderr: "" };
+    });
+    await expect(buildArtifact("/unused", fake as never)).rejects.toThrow(/build changed tracked or untracked source/);
+  });
+
+  it("#484: a pre-existing untracked file is not mistaken for a build side effect", async () => {
+    let builds = 0;
+    const fake = vi.fn(async (cmd: { file: string; args: string[] }) => {
+      if (cmd.file === "npm") { builds += 1; return { stdout: "", stderr: "" }; }
+      if (cmd.args?.includes("--untracked-files=no")) return { stdout: "", stderr: "" };
+      // The same scratch file before and after — unchanged by the build.
+      if (cmd.args?.includes("--untracked-files=all")) return { stdout: "?? scripts/scratch.mjs\n", stderr: "" };
+      if (cmd.args?.includes("rev-parse")) return { stdout: `${"a".repeat(40)}\n`, stderr: "" };
+      return { stdout: "", stderr: "" };
+    });
+    // Gets past both worktree gates and fails later, in artifact assembly.
+    await expect(buildArtifact("/unused", fake as never)).rejects.not.toThrow(/worktree|build changed/);
+    expect(builds).toBe(2);
+  });
+
   it("requires nonce, target, PIDs, instance, ordered fresh window, controller ack and both RPCs", () => {
     const t0 = Date.parse("2026-09-08T00:00:00.000Z");
     const expected = { activationId: "a".repeat(64), bridgeId: "media-server", sha: "b".repeat(40), checksum: "c".repeat(64), stageId: "d".repeat(64), oldPid: 41, pid: 57, instanceId: "instance", protocolVersion: 1, agentId: "grok", notBefore: t0, notAfter: t0 + 10_000 };

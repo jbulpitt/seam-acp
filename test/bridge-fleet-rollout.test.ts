@@ -235,6 +235,19 @@ describe("#484 an advisory is not a refusal", () => {
     expect(formatBlockers("macbook-air", blockers)).toContain("host_clear=macbook-air advisory=1");
   });
 
+  it("does not block a MANAGED host merely for being unenrolled", () => {
+    // A managed host is already rollout-ready and rolls forward without a
+    // recorded baseline; what it lacks is a rollback target, which is worth
+    // saying and is not a refusal. Mutation caught this untested.
+    const blockers = collectBlockers(
+      { ...CLEAN, artifact_mode: "managed", rollout_ready: "yes", enrolled: "no" },
+      targets.get("media-server")
+    );
+    const row = blockers.find((b) => b.code === "not_enrolled");
+    expect(row?.severity).toBe("advisory");
+    expect(blockingOnly(blockers)).toEqual([]);
+  });
+
   it("still calls a legacy host with no baseline blocked — there is no rollback target", () => {
     const blockers = collectBlockers(
       { ...CLEAN, artifact_mode: "legacy-checkout", enrolled: "no" },

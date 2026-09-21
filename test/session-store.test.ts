@@ -72,6 +72,22 @@ describe("SessionStore", () => {
     expect(store.countSessions()).toBe(2);
   });
 
+  it("listSessionsUncapped returns every row, which list(100) will not (#446)", () => {
+    for (let i = 0; i < 101; i++) {
+      const id = String(i).padStart(3, "0");
+      store.upsert({
+        ...sample(),
+        id: `discord:${id}`,
+        channelRef: id,
+        updatedUtc: `2026-01-01T00:00:${String(i % 60).padStart(2, "0")}.000Z`,
+      });
+    }
+    expect(store.countSessions()).toBe(101);
+    expect(store.list(100)).toHaveLength(100);
+    expect(store.listSessionsUncapped()).toHaveLength(101);
+    expect(store.listSessionsUncapped().length).toBe(store.countSessions());
+  });
+
   it("listSessionsByParent filters to one channel, newest first (#73)", () => {
     // Two threads under channel-1, one under channel-2, on different platforms.
     const t1: SessionRecord = { ...sample(), id: "discord:t1", channelRef: "t1", parentRef: "channel-1", updatedUtc: "2026-01-01T00:00:00Z" };

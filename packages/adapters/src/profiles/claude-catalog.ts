@@ -49,6 +49,7 @@ import {
 } from "@agentclientprotocol/sdk";
 import type { CatalogEffortMechanism, CatalogModelEvidence, ManifestCatalogModel } from "../model-catalog.js";
 import { runBoundedProbe } from "../probe-process.js";
+import { attachErrorClassification, classified } from "../error-classification.js";
 
 /** One advertised model as observed in its own fresh ACP session. */
 export interface ClaudeProbedModel {
@@ -463,9 +464,17 @@ export async function probeClaudeCatalog(options: {
     signal: controller.signal,
     read: async (session) => {
       const modelOption = selectOption(session.options, "model");
-      if (!modelOption) throw new Error("claude-agent-acp advertised no model config option");
+      if (!modelOption) {
+        const err = new Error("claude-agent-acp advertised no model config option");
+        attachErrorClassification(err, classified("claude", "capability_absent", { details: err.message }));
+        throw err;
+      }
       const advertised = flattenSelectOptions(modelOption.options);
-      if (!advertised.length) throw new Error("claude-agent-acp advertised an empty model list");
+      if (!advertised.length) {
+        const err = new Error("claude-agent-acp advertised an empty model list");
+        attachErrorClassification(err, classified("claude", "capability_absent", { details: err.message }));
+        throw err;
+      }
       const wrapperCurrentValue =
         typeof modelOption.currentValue === "string" ? modelOption.currentValue : null;
       const onSelf = advertised.find((entry) => entry.value === wrapperCurrentValue);

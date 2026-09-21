@@ -64,6 +64,90 @@ import {
   type SetSessionModeResponse,
 } from "@agentclientprotocol/sdk";
 import { AGENT_ADAPTER_VERSION, asLocalAdapter, type AgentProfile } from "../agent-profile.js";
+import {
+  classifyAndAttach,
+  classifyWith,
+  classified,
+  classifiedErrorData,
+  type AdapterErrorClassification,
+  type AdapterErrorKind,
+  type ClassifyContext,
+} from "../error-classification.js";
+
+const AGY_AGENT_ID = "agy";
+
+function agyKindFromCode(code: string): AdapterErrorKind {
+  switch (code) {
+    case "exited_early":
+    case "spawn_failed":
+    case "not_reaped":
+      return "agent_exit";
+    case "timeout":
+      return "timeout";
+    case "cancelled":
+      return "cancelled";
+    case "output_overflow":
+    case "protocol_error":
+    case "not_settled":
+    default:
+      return "protocol_error";
+  }
+}
+
+function agyKindFromStreamCode(streamCode: string): AdapterErrorKind | null {
+  if (streamCode === "unauthenticated") return "auth_required";
+  if (streamCode === "permission_denied") return "permission_denied";
+  return null;
+}
+
+function agyData(kind: AdapterErrorKind, extra: Record<string, unknown> = {}): Record<string, unknown> {
+  return classifiedErrorData(AGY_AGENT_ID, kind, extra);
+}
+
+export function classifyAgyError(error: unknown, agentId = AGY_AGENT_ID): AdapterErrorClassification {
+  return classifyWith(agentId, error, matchAgyError);
+}
+
+function matchAgyError(ctx: ClassifyContext): AdapterErrorClassification | AdapterErrorKind | null {
+  const { haystack, agentId, message, data, errorCode } = ctx;
+  if (/\bunknown agy session\b/.test(haystack) || /\bunknown session\b/.test(haystack)) {
+    return classified(agentId, "session_gone", {
+      details: typeof data?.details === "string" ? data.details : message,
+    });
+  }
+  if (/\bunknown agy model\b/.test(haystack)) {
+    return classified(agentId, "model_not_found", {
+      details: typeof data?.details === "string" ? data.details : message,
+    });
+  }
+  if (/\bagy session has no model selection\b/.test(haystack) ||
+      /\bbelongs to another backend\b/.test(haystack) ||
+      /\bbelongs to cwd\b/.test(haystack) ||
+      /\bno additional page\b/.test(haystack)) {
+    return classified(agentId, "invalid_request", {
+      details: typeof data?.details === "string" ? data.details : message,
+    });
+  }
+  const streamCode = typeof data?.streamCode === "string" ? data.streamCode : "";
+  const fromStream = streamCode ? agyKindFromStreamCode(streamCode) : null;
+  if (fromStream) {
+    return classified(agentId, fromStream, { details: message, sourceKind: streamCode });
+  }
+  const code = typeof errorCode === "string" ? errorCode
+    : typeof data?.code === "string" ? data.code
+    : "";
+  if (code && (code.startsWith("session_store_") || code === "protocol_error" || code === "exited_early" ||
+      code === "spawn_failed" || code === "timeout" || code === "cancelled" ||
+      code === "output_overflow" || code === "not_reaped" || code === "not_settled")) {
+    return classified(agentId, agyKindFromCode(code), { details: message, sourceKind: code });
+  }
+  if (/\bnative agy\b/.test(haystack)) {
+    const native = /native agy (\w+)/i.exec(message);
+    const nativeCode = native?.[1] ?? "protocol_error";
+    return classified(agentId, agyKindFromCode(nativeCode), { details: message, sourceKind: nativeCode });
+  }
+  return null;
+}
 import { AgyNativeRuntime } from "../agy-native-runtime.js";
 import { AgyTurnLifecycle, agyFailure, agyWait } from "../agy-lifecycle.js";
 import { runBoundedProbe, type ProbeHandle, ProbeError } from "../probe-process.js";
@@ -417,6 +501,9 @@ export function makeAgyProfile(opts: {
     // there is no separate reasoning-effort knob, so the picker is suppressed.
     effort: { mechanism: "modelBaked", levels: [] },
     runtime: runtime.descriptor,
+    classifyError(error: unknown) {
+      return classifyAndAttach(error, classifyAgyError(error, AGY_AGENT_ID));
+    },
     spawn() {
       return makeFakeAgyProcess(
         runtime,
@@ -1047,21 +1134,15 @@ class AgyAgent implements Agent {
     // known sessions and the rest of the adapter remain usable.
     if (!persisted) {
       const detail = `unknown AGY session ${params.sessionId}`;
-      throw RequestError.invalidParams({
-        details: detail,
-      }, detail);
+      throw RequestError.invalidParams(agyData("session_gone", { details: detail }), detail);
     }
     if (persisted.backend !== AGY_SESSION_BACKEND) {
       const detail = `AGY session ${params.sessionId} belongs to another backend`;
-      throw RequestError.invalidParams({
-        details: detail,
-      }, detail);
+      throw RequestError.invalidParams(agyData("invalid_request", { details: detail }), detail);
     }
     if (persisted.cwd && persisted.cwd !== params.cwd) {
       const detail = `AGY session ${params.sessionId} belongs to cwd ${persisted.cwd}`;
-      throw RequestError.invalidParams({
-        details: detail,
-      }, detail);
+      throw RequestError.invalidParams(agyData("invalid_request", { details: detail }), detail);
     }
     const mcpServers = params.mcpServers?.length ? params.mcpServers : this.defaultMcpServers;
     const mcpHome = await prepareAgyMcpHome(params.sessionId, mcpServers);
@@ -1075,9 +1156,10 @@ class AgyAgent implements Agent {
       // A persisted id must still exist in the exact current catalog; deleting this
       // check would pass a stale/unknown id to AGY or silently substitute a model.
       if (!modelId || !catalog.some((entry) => entry.modelId === modelId)) {
-        throw RequestError.invalidParams({
-          details: modelId ? `unknown AGY model ${modelId}` : "AGY session has no model selection",
-        });
+        throw RequestError.invalidParams(agyData(
+          modelId ? "model_not_found" : "invalid_request",
+          { details: modelId ? `unknown AGY model ${modelId}` : "AGY session has no model selection" },
+        ));
       }
       const legacyProgress = persisted.cascadeId && !persisted.cwd && !persisted.modelId
         ? conversationMaxStepIndex(persisted.cascadeId)
@@ -1105,7 +1187,9 @@ class AgyAgent implements Agent {
 
   async listSessions(params: ListSessionsRequest): Promise<ListSessionsResponse> {
     if (params.cursor) {
-      throw RequestError.invalidParams({ details: "AGY session list has no additional page" });
+      throw RequestError.invalidParams(agyData("invalid_request", {
+        details: "AGY session list has no additional page",
+      }));
     }
     const records = await this.sessionStore.list();
     return {
@@ -1156,7 +1240,7 @@ class AgyAgent implements Agent {
     } catch (error) {
       if (error instanceof AgySessionStoreError) {
         throw RequestError.internalError(
-          { code: `session_store_${error.code}` },
+          agyData("protocol_error", { code: `session_store_${error.code}` }),
           error.message,
         );
       }
@@ -1164,9 +1248,7 @@ class AgyAgent implements Agent {
     }
     if (!record) {
       const detail = `unknown AGY session ${params.sessionId}`;
-      throw RequestError.invalidParams({
-        details: detail,
-      }, detail);
+      throw RequestError.invalidParams(agyData("session_gone", { details: detail }), detail);
     }
     await deleteNativeSessionArtifacts(record.cascadeId);
     return {};
@@ -1185,7 +1267,9 @@ class AgyAgent implements Agent {
     // Config changes for an unknown session cannot be persisted or invoked;
     // deleting this guard would acknowledge a model choice that no session owns.
     if (!sess) {
-      throw RequestError.invalidParams({ details: `unknown session ${params.sessionId}` });
+      throw RequestError.invalidParams(agyData("session_gone", {
+        details: `unknown session ${params.sessionId}`,
+      }));
     }
     const catalog = await getCatalog(this.runtime).catch(catalogFallback);
     // An unavailable catalog cannot validate an exact model binding; deleting
@@ -1199,9 +1283,9 @@ class AgyAgent implements Agent {
     const modelId = params.value;
     const entry = catalog.find((e) => e.modelId === modelId);
     if (!entry) {
-      throw RequestError.invalidParams({
+      throw RequestError.invalidParams(agyData("model_not_found", {
         details: `unknown AGY model ${modelId}`,
-      });
+      }));
     }
     if (sess.modelId !== modelId) {
       // Persist before changing memory; deleting this order makes a failed write
@@ -1219,12 +1303,12 @@ class AgyAgent implements Agent {
       if (error instanceof RequestError) throw error;
       if (error instanceof AgySessionStoreError) {
         throw RequestError.internalError(
-          { code: `session_store_${error.code}` },
+          agyData("protocol_error", { code: `session_store_${error.code}` }),
           error.message,
         );
       }
       const code = error instanceof ProbeError ? error.code : "protocol_error";
-      throw RequestError.internalError({ code }, `native AGY ${code}`);
+      throw RequestError.internalError(agyData(agyKindFromCode(code), { code }), `native AGY ${code}`);
     });
     this.promptTail = next.catch(() => {});
     return next;
@@ -1250,7 +1334,7 @@ class AgyAgent implements Agent {
       if (error instanceof RequestError) throw error;
       if (error instanceof AgySessionStoreError) {
         throw RequestError.internalError(
-          { code: `session_store_${error.code}` },
+          agyData("protocol_error", { code: `session_store_${error.code}` }),
           error.message,
         );
       }
@@ -1258,11 +1342,21 @@ class AgyAgent implements Agent {
         // Refuse this interrupted stream only; preserve its named cause for
         // bridge operators while other turns/bindings remain usable.
         console.error(`[agy] ${error.message}`);
-        throw RequestError.internalError({ code: error.code, streamCode: error.streamCode, streamMessage: error.streamMessage }, error.message);
+        throw RequestError.internalError(agyData(
+          agyKindFromStreamCode(error.streamCode) ?? agyKindFromCode(error.code),
+          { code: error.code, streamCode: error.streamCode, streamMessage: error.streamMessage },
+        ), error.message);
       }
       // Upstream errors can embed private LS responses, argv or host paths.
-      const failure = error instanceof ProbeError ? error : run.abort.signal.reason ?? agyFailure("protocol_error");
-      throw RequestError.internalError({ code: failure.code }, `native AGY ${failure.code}`);
+      const failure = error instanceof ProbeError
+        ? error
+        : run.abort.signal.reason instanceof ProbeError
+          ? run.abort.signal.reason
+          : agyFailure("protocol_error");
+      throw RequestError.internalError(
+        agyData(agyKindFromCode(failure.code), { code: failure.code }),
+        `native AGY ${failure.code}`,
+      );
     }
   }
 
@@ -1270,9 +1364,9 @@ class AgyAgent implements Agent {
     if (!this.conn) throw new Error("ACP connection not bound");
     const sess = this.sessions.get(params.sessionId);
     if (!sess) {
-      throw RequestError.invalidParams({
+      throw RequestError.invalidParams(agyData("session_gone", {
         details: `unknown session ${params.sessionId}`,
-      });
+      }));
     }
 
     const promptText = flattenPrompt(params.prompt);
@@ -1293,7 +1387,10 @@ class AgyAgent implements Agent {
       sessionModelId: sess.modelId,
     });
     if (selected.error) {
-      throw RequestError.invalidParams({ details: selected.error });
+      throw RequestError.invalidParams(agyData(
+        /unknown AGY model/.test(selected.error) ? "model_not_found" : "invalid_request",
+        { details: selected.error },
+      ));
     }
     const currentModel = selected.entry;
     // A turn without an exact model would let the native CLI consult global

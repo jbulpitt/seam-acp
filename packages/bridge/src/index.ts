@@ -51,20 +51,19 @@ import type { IncomingMessage } from "node:http";
 import type { RawData, WebSocket as WsSocket } from "ws";
 import {
   PROTOCOL_VERSION,
-  buildCopilotMcpConfigJson,
   type AgentAdapter,
 } from "@seam/adapters";
 import { dispatchBridgeRpc, type SlotSpawnConfig } from "./rpc.js";
 import { slotHealthSnapshot } from "./slot-health.js";
 import { createOutputLog, createLineFramer } from "./output-log.js";
 import { createStderrRegistry } from "./stderr-ring.js";
-import { resolveSlotAdapter, UnknownAgentError, spawnRefusalFrame } from "./resolve-adapter.js";
+import { spawnRefusalFrame } from "./resolve-adapter.js";
+import { spawnAgent } from "./spawn-agent.js";
 import { muxSend, forwardAgentStdout } from "./frame-out.js";
 import { BridgeMcpInputRewriter } from "./mcp-injection.js";
 import {
   inventoryFromAdapters,
   loadHostAdapterInventory,
-  resolveCopilotHostLaunch,
 } from "./inventory.js";
 import { createReleaseReceiptWriter, type ReleaseReceiptWriter } from "./release-receipt.js";
 
@@ -174,49 +173,6 @@ async function loadWs(): Promise<{ WebSocket: WsCtor; WebSocketServer: WssCtor }
     console.error("Error: 'ws' package not found. Install it with: npm install ws");
     process.exit(1);
   }
-}
-
-function spawnAgent(
-  adapters: Map<string, AgentAdapter>,
-  copilotCmd: string,
-  localCwd: string,
-  slotCfg?: SlotSpawnConfig
-): ChildProcess {
-  const resolution = resolveSlotAdapter(adapters, slotCfg);
-  // #468: a stated agentId this bridge cannot serve used to fall through to
-  // the copilot legacy branch below — the requested agent never ran, nothing
-  // failed, and copilot did the work. Refuse instead: one dead slot an
-  // operator can see beats a turn that silently came from the wrong agent,
-  // and this is the layer that actually knows the inventory.
-  if (resolution.kind === "unknown") {
-    throw new UnknownAgentError(resolution.agentId, resolution.available);
-  }
-  const adapter = resolution.kind === "adapter" ? resolution.adapter : undefined;
-  if (adapter && adapter.id !== "copilot") {
-    console.error(
-      `[bridge] Spawning adapter ${adapter.id}` +
-        (slotCfg?.model ? ` model=${slotCfg.model}` : "") +
-        (slotCfg?.effort ? ` effort=${slotCfg.effort}` : "")
-    );
-    return adapter.spawn(slotCfg?.model, slotCfg?.effort);
-  }
-
-  const cwd = slotCfg?.cwd || localCwd;
-  const launch = resolveCopilotHostLaunch(copilotCmd, cwd, slotCfg?.env);
-  const cmdArgs = [...launch.args];
-  const mcpJson = buildCopilotMcpConfigJson(
-    Array.isArray(slotCfg?.mcpServers) ? slotCfg.mcpServers : []
-  );
-  if (mcpJson) {
-    cmdArgs.push("--additional-mcp-config", mcpJson);
-  }
-  const tokenLabel = launch.env.GH_TOKEN ? "present" : "missing";
-  console.error(`[bridge] Spawning agent: ${launch.cliPath} ${cmdArgs.filter((a) => a !== mcpJson).join(" ")} (GH_TOKEN: ${tokenLabel})`);
-  return spawn(launch.cliPath, cmdArgs, {
-    cwd: launch.cwd,
-    stdio: ["pipe", "pipe", "inherit"],
-    env: launch.env,
-  });
 }
 
 /**

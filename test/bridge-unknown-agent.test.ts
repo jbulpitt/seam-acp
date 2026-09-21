@@ -18,6 +18,7 @@ import {
   spawnRefusalFrame,
   type AdapterResolution,
 } from "../packages/bridge/src/resolve-adapter.js";
+import { spawnAgent } from "../packages/bridge/src/spawn-agent.js";
 
 const fake = (id: string) => ({ id }) as unknown as AgentAdapter;
 
@@ -115,6 +116,60 @@ describe("#468 everything that worked before still works", () => {
     expect(r.kind).toBe("unknown");
     if (r.kind !== "unknown") throw new Error("unreachable");
     expect(r.available).toEqual([]);
+  });
+});
+
+describe("#468 spawnAgent itself refuses, and spawns nothing while doing so", () => {
+  // Until `spawnAgent` was lifted out of `index.ts`, deleting the throw below
+  // left a green suite: the CLI entrypoint `process.exit(1)`s on import, so no
+  // test could reach it. That mutation is this story's whole fix, undone.
+  const spawning = (id: string) => {
+    let calls = 0;
+    const adapter = {
+      id,
+      spawn: () => { calls += 1; return { pid: 1 } as never; },
+    } as unknown as AgentAdapter;
+    return { adapter, spawned: () => calls };
+  };
+
+  it("throws UnknownAgentError for an id this bridge cannot serve", () => {
+    const { adapter } = spawning("agy");
+    const adapters = new Map([["agy", adapter]]);
+    expect(() => spawnAgent(adapters, "copilot", "/tmp", { agentId: "ollama-cloud" } as never))
+      .toThrow(UnknownAgentError);
+  });
+
+  it("launches NOTHING when it refuses — not the agent, not copilot", () => {
+    // The refusal has to happen before any process starts. Falling through to
+    // the copilot legacy branch is the defect, and it is a licensing boundary.
+    const { adapter, spawned } = spawning("agy");
+    const adapters = new Map([["agy", adapter]]);
+    try {
+      spawnAgent(adapters, "copilot", "/tmp", { agentId: "zai" } as never);
+    } catch { /* expected */ }
+    expect(spawned()).toBe(0);
+  });
+
+  it("names the agent and the inventory in what it throws", () => {
+    const { adapter } = spawning("agy");
+    expect(() => spawnAgent(new Map([["agy", adapter]]), "copilot", "/tmp", { agentId: "zai" } as never))
+      .toThrow(/"zai".*holds: agy/s);
+  });
+
+  it("still spawns a known adapter, passing model and effort through", () => {
+    let got: unknown[] = [];
+    const adapter = {
+      id: "claude",
+      spawn: (...args: unknown[]) => { got = args; return { pid: 2 } as never; },
+    } as unknown as AgentAdapter;
+    const child = spawnAgent(
+      new Map([["claude", adapter]]),
+      "copilot",
+      "/tmp",
+      { agentId: "claude", model: "opus", effort: "high" } as never
+    );
+    expect(child).toEqual({ pid: 2 });
+    expect(got).toEqual(["opus", "high"]);
   });
 });
 

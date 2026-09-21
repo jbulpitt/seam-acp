@@ -10,7 +10,9 @@ function fixture(error: unknown, classifyError?: AgentProfile["classifyError"], 
   const profile = { id: agentId, classifyError, spawn: () => { throw error; } } as unknown as AgentProfile;
   const runtime = new AgentRuntime({ profile, logger: logger as unknown as Logger });
   const prompt = vi.fn().mockRejectedValue(error);
-  Object.assign(runtime, { connection: { prompt, newSession: prompt, loadSession: prompt }, sessionId: "fixture-session", promptCapabilities: {} });
+  // This suite isolates classification; prompt recovery has its own behavioral
+  // suite. Ephemeral work is the production one-attempt path, not a mock gate.
+  Object.assign(runtime, { connection: { prompt, newSession: prompt, loadSession: prompt }, sessionId: "dispatch:fixture-session", promptCapabilities: {} });
   return { runtime, logger, prompt };
 }
 
@@ -28,7 +30,7 @@ describe("#441 real runtime boundary to pure resolver (no providers)", () => {
       .toMatchObject({ errorKind: "rate_limit", transience: "transient", startRung: 1 });
     expect(logger.warn).toHaveBeenCalledWith(
       { agentId: "claude", errorKind: "rate_limit", operation: "session/prompt" }, "adapter error classified");
-    expect(prompt).toHaveBeenCalledTimes(1); // #441 adds no retry owner.
+    expect(prompt).toHaveBeenCalledTimes(1); // #426 ephemeral work does not retry.
   });
 
   it.each(["missing", "unrecognized", "throws"] as const)("%s classifier is attributable unclassified, not invisible", async (mode) => {

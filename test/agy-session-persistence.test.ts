@@ -308,7 +308,7 @@ describe.sequential("AGY R7 session persistence", () => {
       .resolves.toMatchObject({ stopReason: "end_turn" });
   }, 20_000);
 
-  it("fails one session loudly when its conversation binding cannot be committed (#263)", async () => {
+  it.each(["ephemeral", "conversation"] as const)("fails one %s session loudly when its conversation binding cannot be committed (#263)", async recoveryScope => {
     const harness = makeHarness();
     const failing = await newRuntime(harness);
     const exposed: string[] = [];
@@ -329,12 +329,19 @@ describe.sequential("AGY R7 session persistence", () => {
       throw new Error("synthetic crash before atomic rename");
     });
 
-    await expect(failing.prompt("capability-turn-one"))
-      .rejects.toThrow("AGY session persistence failed");
+    // #448's conversation owner can make one follow-up attempt, but the
+    // adapter has retired this identity. It must NOT start another native turn.
+    // Ephemeral work reports the first failure without attempting recovery.
+    const failure = await failing.prompt("capability-turn-one", undefined, { recoveryScope }).catch(error => error);
+    if (recoveryScope === "ephemeral") expect(failure.message).toContain("AGY session persistence failed");
+    else expect(failure).toMatchObject({ data: { errorKind: "session_gone", details: expect.stringMatching(/unknown.*session/i) } });
     // The provider conversation id is committed before stream subscription;
     // if that commit fails, this one session is refused before any output can
     // be exposed while independent sessions remain available below.
     expect(exposed).toEqual([]);
+    const invocations = fs.readFileSync(path.join(harness.root, "invocations.jsonl"), "utf8")
+      .trim().split("\n").map(line => JSON.parse(line));
+    expect(invocations.filter(row => row.prompt === "capability-turn-one")).toHaveLength(1);
     rename.mockImplementation(realRename);
     expect(fs.readFileSync(mappingFile, "utf8")).toBe(prior);
 

@@ -1,12 +1,7 @@
-import nodeFs from "node:fs";
 import { Readable, Writable } from "node:stream";
-import {
-  CLAUDE_REFRESH_RETRY_ATTEMPTS,
-  claudeCredentialsPath,
-  claudeRefreshRetryDelayMs,
-  classifyClaudeAuthFailure,
-  readClaudeCredentialFacts,
-} from "../core/claude-oauth-contention.js";
+import { buildRecoveryDirective, runBoundedRecovery } from "../core/recovery-directive.js";
+import { DEFAULT_ERROR_RULES } from "../core/error-resolution-rules.js";
+import { CONTINUE_PROMPT } from "../core/dispatch/turn-resume.js";
 import {
   client,
   methods,
@@ -28,6 +23,8 @@ import {
   SEAM_AGY_JSON_SCHEMA_META,
   SEAM_AGY_CATALOG_REFRESH_META,
   attachErrorClassification,
+  readErrorClassification,
+  resolveError,
   unclassified,
   type AgentProfile,
   type CatalogEffort,
@@ -59,6 +56,7 @@ export interface AsyncUserInputQuestion {
 }
 
 export type AgentEvent =
+  | { kind: "recovery"; message: string }
   | { kind: "agent-text"; text: string; messageId?: string }
   | {
       kind: "async-user-input";
@@ -435,6 +433,7 @@ export class AgentRuntime {
    * strict arrival order end-to-end.
    */
   private readonly sessionUpdates = new SerialQueue();
+  private recoveryAbort?: AbortController;
 
   constructor(opts: {
     profile: AgentProfile;
@@ -863,19 +862,21 @@ export class AgentRuntime {
   async prompt(
     text: string,
     attachments?: ReadonlyArray<MessageAttachment>,
-    opts?: { jsonSchema?: Record<string, unknown> }
+    opts?: { jsonSchema?: Record<string, unknown>; recoveryScope?: "conversation" | "ephemeral" }
   ): Promise<PromptOutcome> {
-    return this.withClassifiedErrors("session/prompt", () => this.promptUnclassified(text, attachments, opts));
+    return this.withClassifiedErrors("session/prompt", () => this.promptUnclassified(text, attachments, opts), true);
   }
 
   /** #440/#441: one adapter report for each failure escaping the runtime.
    * Missing/broken classifiers refuse only certainty, not the original error or
    * recovery. Include every agent in the unclassified-rate denominator. Existing
-   * bounded retries stay owned here until #448; this adds no retry layer. */
-  private async withClassifiedErrors<T>(operation: string, run: () => Promise<T>): Promise<T> {
+   * prompt recovery consumes classifications here, never English downstream. */
+  private async withClassifiedErrors<T>(operation: string, run: () => Promise<T>, alreadyClassified = false): Promise<T> {
     try {
       return await run();
     } catch (original) {
+      // A prompt attempt was already classified before its recovery decision.
+      if (alreadyClassified && readErrorClassification(original)) throw original;
       // ACP normally throws mutable RequestError. Primitive/frozen rejections
       // must also carry data without masking their cause with an assignment error.
       let error: object = original && typeof original === "object" && Object.isExtensible(original)
@@ -907,7 +908,7 @@ export class AgentRuntime {
   private async promptUnclassified(
     text: string,
     attachments?: ReadonlyArray<MessageAttachment>,
-    opts?: { jsonSchema?: Record<string, unknown> }
+    opts?: { jsonSchema?: Record<string, unknown>; recoveryScope?: "conversation" | "ephemeral" }
   ): Promise<PromptOutcome> {
     const conn = this.requireConnection();
     const sid = this.requireSessionId();
@@ -959,6 +960,7 @@ export class AgentRuntime {
     this.touchActivity();
     this.promptInFlight = true;
     this.sawUpdateThisTurn = false;
+    const recoveryAbort = this.recoveryAbort = new AbortController();
     // Captured so the teardown fail-safe below can tell a CLEAN completion
     // (end_turn) from an abnormal one (cancel/abort/error). Stays undefined if
     // the RPC rejects (dispose/child-death) — which is itself an abnormal end.
@@ -968,61 +970,52 @@ export class AgentRuntime {
       // reject lets the child-exit handler (and dispose) force this await to
       // settle instead of hanging when the connection dies without a clean
       // close. On normal completion the RPC resolves first.
+      let continuing = false;
       const sendPrompt = (): Promise<{ stopReason: string }> =>
         new Promise<{ stopReason: string }>((resolve, reject) => {
           this.rejectInFlightPrompt = reject;
           conn.prompt({
             sessionId: sid,
-            prompt,
+            // Continue the recorded transcript after any output/tool update;
+            // never resend the original brief or attachments for that shape.
+            prompt: continuing ? [{ type: "text", text: CONTINUE_PROMPT }] : prompt,
             ...(opts?.jsonSchema
               ? { _meta: { [SEAM_AGY_JSON_SCHEMA_META]: opts.jsonSchema } }
               : {}),
           }).then(resolve, reject);
         });
 
-      // #404: every Claude agent on this host shares one credential store, and
-      // when its 8-hour token expires they all race to refresh it. The losers
-      // get a hard error and the turn never runs — in every channel at once.
-      //
-      // Retrying is only safe while the turn has produced NOTHING. Once any
-      // session update has arrived the model is running, and re-sending would
-      // duplicate the work and the billing; that case falls through and throws
-      // exactly as before.
-      let res: { stopReason: string };
-      for (let attempt = 0; ; attempt += 1) {
-        try {
-          res = await sendPrompt();
-          break;
-        } catch (err) {
-          const verdict = classifyClaudeAuthFailure(
-            err instanceof Error ? err.message : String(err),
-            readClaudeCredentialFacts(
-              (p, enc) => nodeFs.readFileSync(p, enc),
-              claudeCredentialsPath()
-            )
-          );
-          const canRetry = verdict.retryable
-            && !this.sawUpdateThisTurn
-            && attempt < CLAUDE_REFRESH_RETRY_ATTEMPTS;
-          if (!canRetry) {
-            if (verdict.kind === "refresh-contention") {
-              this.logger.error(
-                { sessionId: sid, attempt, reason: verdict.reason, sawOutput: this.sawUpdateThisTurn },
-                this.sawUpdateThisTurn
-                  ? "credential refresh race after the turn had started; not retrying a turn that produced output"
-                  : "credential refresh race persisted across every retry"
-              );
-            }
-            throw err;
+      // #448: one prompt owner replaces both #404's credential-file gate and
+      // the orchestrator's rate-limit loop. Adapters own classification; a cold
+      // credential cache or English prose cannot silently disable recovery.
+      // Only rung 1 executes here. Session/model-changing rungs need upstream
+      // identity transactions; #467 owns the eventual daemon executor.
+      const res = await runBoundedRecovery({
+        run: () => this.withClassifiedErrors("session/prompt", sendPrompt),
+        signal: recoveryAbort.signal,
+        delays: error => {
+          const resolution = resolveError(readErrorClassification(error) ?? unclassified(this.profile.id), DEFAULT_ERROR_RULES);
+          const directive = buildRecoveryDirective(resolution,
+            sid.startsWith("dispatch:") || opts?.recoveryScope === "ephemeral" ? "ephemeral" : "conversation");
+          this.logger.warn({ sessionId: sid, resolution, directive }, "turn recovery resolved");
+          const step = directive.steps.find(step => step.rung === 1);
+          return step?.backoffMs.slice(0, step.retryCount) ?? [];
+        },
+        onRetry: async (_error, retry, delayMs) => {
+          continuing ||= this.sawUpdateThisTurn;
+          if (continuing && this.suppressResumeReplay) {
+            // The next echo names `continue`, not the first request. Without
+            // moving this boundary a recovered cold turn loses its new answer
+            // as purported history. Prior replay stays suppressed; live output
+            // after the continuation echo keeps flowing (#64/#448).
+            this.resumePromptText = CONTINUE_PROMPT;
+            this.resumeEchoBuffer = "";
           }
-          const delay = claudeRefreshRetryDelayMs(attempt + 1);
-          this.logger.warn(
-            { sessionId: sid, attempt: attempt + 1, delayMs: delay, reason: verdict.reason },
-            "lost the shared Claude credential refresh race; retrying after jittered backoff"
-          );
-          await new Promise((r) => setTimeout(r, delay));
-        }
-      }
+          const message = `Recovery: ${continuing ? "continuing the existing conversation" : "retrying the request"} (attempt ${retry}/3, ${delayMs / 1000}s backoff).`;
+          this.logger.warn({ sessionId: sid, retry, delayMs, continuing }, message);
+          await this.emit({ kind: "recovery", message });
+        },
+      });
       outcomeStopReason = res.stopReason;
       return {
         stopReason: res.stopReason,
@@ -1031,6 +1024,7 @@ export class AgentRuntime {
       };
     } finally {
       this.promptInFlight = false;
+      this.recoveryAbort = undefined;
       this.touchActivity();
       this.rejectInFlightPrompt = undefined;
       if (firstResumedPrompt) {
@@ -1405,6 +1399,7 @@ export class AgentRuntime {
   }
 
   async cancel(): Promise<void> {
+    this.recoveryAbort?.abort();
     await this.cancelElicitations?.().catch((err) => {
       this.logger.warn({ err }, "elicitation cancellation failed");
     });
@@ -1536,10 +1531,8 @@ export class AgentRuntime {
   }
 
   private handleSessionUpdate(update: SessionUpdate): Promise<void> {
-    // #404: the retry below is only safe while a turn has produced nothing.
-    // Set here rather than in the handler body so a suppressed or filtered
-    // update still counts as "the model has started" — the question is whether
-    // the turn ran, not whether we chose to show it.
+    // #448: receipt of an update selects transcript continuation, NOT refusal.
+    // Count suppressed/filtered output too: what ran matters, not what we show.
     this.sawUpdateThisTurn = true;
     // Process updates one at a time, in arrival order. See `sessionUpdates`.
     return this.sessionUpdates.run(() => this.handleSessionUpdateInner(update));

@@ -14,7 +14,7 @@ import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 afterEach(() => vi.restoreAllMocks());
 
 describe("#441 real orchestrator consumer with fake ACP", () => {
-  it.each(["retry", "changed-kind", "no-classifier"] as const)("%s uses structured decisions at both catch sites", async (mode) => {
+  it.each(["retry", "changed-kind", "no-classifier", "output", "owned-output", "exhausted"] as const)("%s uses one structured prompt owner", async (mode) => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "seam-441-consumer-"));
     const store = new SessionStore(path.join(dir, "fixture.db"));
     const lines: string[] = [];
@@ -27,15 +27,30 @@ describe("#441 real orchestrator consumer with fake ACP", () => {
     const second = mode === "changed-kind"
       ? new RequestError(-32603, "Rate limited", { errorKind: "quota_exhausted", agentId: "claude" })
       : new RequestError(-32603, "opaque provider failure", { errorKind: "rate_limit", agentId: "claude" });
-    const prompt = vi.fn().mockRejectedValueOnce(first).mockRejectedValueOnce(second)
-      .mockResolvedValue({ stopReason: "end_turn" });
+    let calls = 0;
+    const prompt = vi.fn(async (_request: unknown) => {
+      calls++;
+      if (mode.endsWith("output") && calls === 1) {
+        await (runtime as any).handleSessionUpdate({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "partial answer" } });
+      }
+      if (calls === 1 || mode === "exhausted") throw first;
+      if (calls === 2) throw second;
+      return { stopReason: "end_turn" };
+    });
     Object.assign(runtime, { connection: { prompt }, sessionId: "fixture-acp", promptCapabilities: {},
       sessionInfo: { sessionId: "fixture-acp", availableModels: [], currentModelId: "fixture-model" } });
     const record = { id: "discord:fixture-thread", platform: "discord", channelRef: "fixture-thread",
       parentRef: null, agentId: "claude", acpSessionId: "fixture-acp", repoPath: dir, configJson: "{}",
       createdUtc: new Date().toISOString(), updatedUtc: new Date().toISOString() };
     store.upsert(record);
+    if (mode === "owned-output") {
+      store.admitInbound({ messageId: "owned-message", platform: "discord", channelRef: record.channelRef,
+        parentRef: null, sessionRecordId: record.id, authorId: "fixture-user", authorName: "Fixture",
+        text: "fixture", attachments: [], createdUtc: record.createdUtc });
+      store.claimInbound("owned-message", 0, record.createdUtc);
+    }
     const panels: unknown[] = [];
+    const messages: string[] = [];
     const orch = new Orchestrator({ logger: logger as never, store, renderer: discordRenderer,
       modelCatalog: fixtureModelCatalog([profile]),
       config: { DATA_DIR: dir, REPOS_ROOT: dir, TURN_TIMEOUT_SECONDS: 60, REPO_EMOJIS: new Map(),
@@ -48,7 +63,7 @@ describe("#441 real orchestrator consumer with fake ACP", () => {
       adapter: {
         async sendPanel(channel: unknown, panel: unknown) { panels.push(panel); return { channel, id: "panel" }; },
         async editPanel(_ref: unknown, panel: unknown) { panels.push(panel); },
-        async sendMessage(channel: unknown) { return { channel, id: "message" }; },
+        async sendMessage(channel: unknown, text: string) { messages.push(text); return { channel, id: "message" }; },
         async editMessage() {}, async sendFile() {},
       } as never,
     });
@@ -59,13 +74,19 @@ describe("#441 real orchestrator consumer with fake ACP", () => {
     try {
       await (orch as unknown as { executeIncomingMessage(message: unknown): Promise<void> }).executeIncomingMessage({
         channel: { platform: "discord", id: record.channelRef }, authorId: "fixture-user", authorIsBot: false, text: "fixture",
+        ...(mode === "owned-output" ? { messageId: "owned-message" } : {}),
       });
-      expect(prompt, lines.join("\n")).toHaveBeenCalledTimes(mode === "retry" ? 3 : mode === "changed-kind" ? 2 : 1);
+      expect(prompt, lines.join("\n")).toHaveBeenCalledTimes(mode === "changed-kind" ? 2 : mode === "exhausted" ? 4 : 3);
+      expect(messages.some(text => text.startsWith("Recovery:"))).toBe(true);
+      if (mode.endsWith("output")) {
+        expect(prompt.mock.calls[1]![0]).toMatchObject({ sessionId: "fixture-acp", prompt: [{ type: "text", text: "continue" }] });
+        expect(messages.some(text => text.includes("continuing the existing conversation"))).toBe(true);
+      }
       const resolution = lines.map((line) => JSON.parse(line)).find((line) => line.msg === "turn recovery resolved")?.resolution;
       expect(resolution).toMatchObject({ errorKind: mode === "no-classifier" ? "unclassified" : "rate_limit",
         startRung: 1, action: "recover", surface: true });
       const failures = lines.map((line) => JSON.parse(line)).filter((line) => line.msg === "turn failed");
-      expect(failures).toHaveLength(mode === "retry" ? 0 : 1);
+      expect(failures).toHaveLength(mode === "changed-kind" || mode === "exhausted" ? 1 : 0);
       expect(panels.length).toBeGreaterThan(0); // not a classifier-only test.
     } finally {
       store.close();

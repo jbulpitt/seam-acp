@@ -504,6 +504,11 @@ async function main(): Promise<void> {
       bridgeHub?.markSessionBridge(sessionId, location);
     },
     runtimeIdleTtlMs: config.RUNTIME_IDLE_TTL_SECONDS * 1000,
+    // #442: derived, not chosen. A turn cannot legitimately outlive the turn
+    // timeout, so silence past it means a `busy` belief is stale rather than
+    // the turn being slow — which makes the staleness verdict strictly later
+    // than the deadline that should already have fired.
+    turnStalenessBoundMs: config.TURN_TIMEOUT_SECONDS * 1000,
   });
   router.startIdleReaper();
 

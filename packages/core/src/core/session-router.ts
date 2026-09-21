@@ -1400,7 +1400,11 @@ export class SessionRouter {
         // through to newSession would overwrite the (good) acpSessionId and
         // detach the thread from its conversation. A brief escalating backoff
         // lets the agent finish starting before we give up.
-        const RESUME_ATTEMPTS = 3;
+        // #448: strict recovery delegates the complete start/load budget to
+        // its caller. Nesting local retries multiplied three acquisitions into
+        // nine loads. Refuse only this failed acquisition; ordinary attachment
+        // retains its short retries and all identity checks below remain active.
+        const RESUME_ATTEMPTS = 3; // Ordinary attachment only; strict failures escape below.
         const RESUME_RETRY_MS = 400;
         for (let attempt = 1; attempt <= RESUME_ATTEMPTS; attempt++) {
           try {
@@ -1434,22 +1438,19 @@ export class SessionRouter {
             );
             return runtime;
           } catch (err) {
-            // #307: this check keeps the 60s deadline global to one resume;
+            // Preserve the typed failure: the acquisition owner decides whether
+            // to retry. Calling a transient load failure an integrity refusal
+            // hid its cause; replay/newSession is still forbidden on this path.
+            if (recovery) throw err;
+            // #307: this check keeps the configured deadline global to one resume;
             // deleting it silently multiplies the outage across three retries.
             // A deadline is not a transient adapter-start race. Retrying it
             // would multiply the configured bound and keep this worker silent;
             // refuse only this resume and let the caller expose/retry it.
             if (err instanceof SessionLoadTimeoutError) {
-              if (recovery) {
-                throw new Error(`Strict resume refused: ${err.message}`, { cause: err });
-              }
               throw err;
             }
             const lastAttempt = attempt === RESUME_ATTEMPTS;
-            if (lastAttempt && recovery) {
-              const detail = err instanceof Error ? err.message : String(err);
-              throw new Error(`Strict resume refused: session/load failed after retries: ${detail}`, { cause: err });
-            }
             this.logger.warn(
               { err, sessionId: record.id, attempt, lastAttempt },
               lastAttempt

@@ -3,7 +3,7 @@ import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrato
 
 interface ScheduledRunnerThis {
   config: { TURN_TIMEOUT_SECONDS: number };
-  router: { reuseMcpServers: (sessionId: string) => unknown[] };
+  router: { reuseMcpServers: (sessionId: string) => unknown[]; describeConfig: () => { location: { value: string } } };
   injectTurn: (...args: unknown[]) => Promise<{ text: string; error?: string }>;
 }
 
@@ -35,7 +35,7 @@ describe("scheduled isolated Seam-MCP wiring", () => {
       runner.call(
         {
           config: { TURN_TIMEOUT_SECONDS: 120 },
-          router: { reuseMcpServers },
+          router: { reuseMcpServers, describeConfig: () => ({ location: { value: "local" } }) },
           injectTurn,
         },
         {

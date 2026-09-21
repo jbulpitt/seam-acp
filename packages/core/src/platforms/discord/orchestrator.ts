@@ -5629,8 +5629,15 @@ export class Orchestrator {
           try { opts.lifecycle?.onCleanup?.(); } catch { logger.warn("injectTurn cleanup attribution failed"); }
           const sid = rt.getSessionInfo()?.sessionId;
           await rt.dispose().catch(() => {});
-          if (sid && manager?.deleteSession && (!opts.lifecycle || opts.lifecycle.mayDeleteSession())) {
-            await manager.deleteSession(cwd, sid).catch(() => {});
+          if (sid && (!opts.lifecycle || opts.lifecycle.mayDeleteSession())) {
+            // #466: a remote session belongs to that host even when getProfile
+            // returned a local definition. Never delete a same-named local
+            // conversation; local cleanup and retained recovery remain intact.
+            if (!isLocalLocation(location)) {
+              await this.bridgeHub?.rpc(location, "deleteSession", { cwd, sessionId: sid }, profile.id).catch(() => {});
+            } else {
+              await manager?.deleteSession?.(cwd, sid).catch(() => {});
+            }
           }
         }
       }
@@ -11544,6 +11551,7 @@ export class Orchestrator {
         ok: true;
         agentId: string;
         profile: AgentProfile;
+        location: string;
         model: string;
         effort: string | null;
         cwd: string;
@@ -11576,6 +11584,7 @@ export class Orchestrator {
       ok: true,
       agentId,
       profile,
+      location: described.location.value,
       model: overrideModel ?? described.model.value,
       effort: described.effort.value,
       cwd: overrideCwd ?? described.cwd.value,
@@ -11584,11 +11593,13 @@ export class Orchestrator {
 
   private isolatedScheduleIdentityFields(identity: {
     agentId: string;
+    location: string;
     model: string;
     cwd: string;
   }): StructuredPanel["fields"] {
     return [
       { name: "Agent", value: `\`${identity.agentId}\``, inline: true },
+      { name: "Host", value: `\`${identity.location}\``, inline: true },
       { name: "Model", value: `\`${identity.model}\``, inline: true },
       { name: "Working dir", value: `\`${identity.cwd}\``, inline: true },
     ];
@@ -11799,9 +11810,9 @@ export class Orchestrator {
         await this.sendResultCard(
           target,
           `⏰ ${row.name} — failed`,
-          "Scheduled execution failed.",
+          result.error ?? "Scheduled execution failed.",
           0xe74c3c,
-          [],
+          row.sessionMode === "isolated" ? this.isolatedScheduleIdentityFields(occurrence.execution) : [],
           attempt.id
         );
       } else await this.postScheduledVisibleResult(target, row.id, row.name, result.output ?? "", row.outputType,
@@ -11971,7 +11982,8 @@ export class Orchestrator {
       return;
     }
     const { profile, agentId, cwd, model, effort } = identity;
-    const identityFields = this.isolatedScheduleIdentityFields({ agentId, model, cwd });
+    const location = owned?.occurrence.execution.location ?? identity.location;
+    const identityFields = this.isolatedScheduleIdentityFields({ agentId, location, model, cwd });
 
     // 3. Announce card — stays as a permanent run record (also auto-reopens an
     //    archived-but-unlocked thread). Not edited later. Fields match the
@@ -12064,7 +12076,7 @@ export class Orchestrator {
     }
   }
 
-  /** Spawn a throwaway runtime, run one prompt with attachments, collect the
+  /** Spawn a throwaway runtime on the occurrence's host, run its prompt, collect the
    *  text, forward any files the agent produced to the thread, then tear down
    *  and delete the temp session (so it doesn't clutter `/seam sessions`). */
   private async runIsolatedScheduledJob(args: {
@@ -12081,17 +12093,19 @@ export class Orchestrator {
     const owned = args.owned;
     const attempt = owned?.attempt;
     const resume = attempt?.promptStarted === true;
+    const location = owned?.occurrence.execution.location
+      ?? this.router.describeConfig(record).location.value;
     let submitted = false;
     let completed = false;
     // Target = the binding thread's session (what the job belongs to);
     // outputTo = where the run reports, which may be a different channel when
     // the schedule sets an explicit target.
-    const result = await this.injectTurn(record, resume ? CONTINUE_PROMPT : promptText, {
+    const options: InjectTurnOptions = {
       session: "isolated",
       profile,
       cwd,
+      location,
       ...(owned ? {
-        location: owned.occurrence.execution.location,
         strictModel: true,
         ...(attempt?.acpSessionId ? { resumeSessionId: attempt.acpSessionId } : {}),
         onSession: (sessionId: string) => this.store.turnAttempts.bind(attempt!, sessionId),
@@ -12147,8 +12161,37 @@ export class Orchestrator {
       // output isn't truncated (compaction already drains; #19 preserved the old
       // no-drain behavior here, but dropping trailing text is a real bug).
       awaitIdle: true,
-      logContext: { scheduled: "run" },
-    });
+      logContext: { scheduled: "run", location, agentId: profile.id },
+    };
+    try {
+      if (!isLocalLocation(location)) {
+        // #466: location metadata only scoped catalog lookup; without a spawn
+        // plan these remote schedules ran locally. Refuse only this occurrence
+        // if its bridge is unavailable; local schedules and other hosts work.
+        // Reuse the dispatch planner, but keep the authoring thread's MCP token
+        // (not a dispatch-scoped token). The bridge resolves project MCP at cwd;
+        // never read the controller's same-named directory or send loopback MCP.
+        if (!this.bridgeHub) throw new Error(`bridge "${location}" is not connected`);
+        const selection = this.modelCatalog.resolve({ agentId: profile.id, location }, {
+          model: model ?? "default", effort,
+        });
+        const planned = planIsolatedRemoteSpawn({
+          hub: this.bridgeHub, sessionId: record.id, location, agentId: profile.id,
+          cwd, model: selection.raw.model, effort: selection.raw.effort,
+          globalMcpServers: options.mcpServers?.filter(server => server.name !== "seam-mcp"),
+        });
+        options.spawnFn = planned.spawnFn;
+        options.mcpServers = planned.mcpServers;
+      }
+    } catch (cause) {
+      // Planning failed before injectTurn could record an outcome. Use the same
+      // fenced lifecycle, so the durable occurrence keeps the actual host cause
+      // and reports once instead of remaining active or falling back locally.
+      const result = { text: "", error: cause instanceof Error ? cause.message : String(cause), cause };
+      options.lifecycle?.onOutcome(result);
+      return { text: result.text, error: result.error };
+    }
+    const result = await this.injectTurn(record, resume ? CONTINUE_PROMPT : promptText, options);
     return { text: result.text, ...(result.error ? { error: result.error } : {}) };
   }
 

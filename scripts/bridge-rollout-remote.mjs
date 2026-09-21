@@ -591,11 +591,37 @@ async function writeActivationEnvelope(release, envelope) {
   await fsp.writeFile(temp, safeJson(envelope), { flag: "wx", mode: 0o600 }); await fsp.rename(temp, file);
 }
 
+// Catalog RPCs and the controller ack are concurrent event streams. A total
+// order across them produced a false unconfirmed on plex-server (#483, 3ms).
+// Normal NTP is well under a second; 2s absorbs a slow step.
+const RECEIPT_NTP_SKEW_MS = 2_000;
+function parseReceiptTime(value) {
+  const time = Date.parse(value);
+  return Number.isFinite(time) ? time : null;
+}
+function nonDecreasingTimes(times) {
+  return times.every((time, index) => !index || time >= times[index - 1]);
+}
+function receiptEventStreamsAcceptable(value, expected) {
+  const catalog = [
+    parseReceiptTime(value.startedAt),
+    parseReceiptTime(value.helloAcceptedAt),
+    parseReceiptTime(value.catalogRpcs?.[verifyAgent]?.describeModelCatalogAt),
+    parseReceiptTime(value.catalogRpcs?.[verifyAgent]?.fetchModelCatalogAt),
+  ];
+  const ack = [parseReceiptTime(value.controllerVerifiedAt), parseReceiptTime(value.completedAt)];
+  if (catalog.some((time) => time == null) || ack.some((time) => time == null)) return false;
+  if (!nonDecreasingTimes(catalog) || !nonDecreasingTimes(ack)) return false;
+  if (catalog[0] < expected.started - RECEIPT_NTP_SKEW_MS) return false;
+  if (ack[1] > expected.deadline + RECEIPT_NTP_SKEW_MS) return false;
+  if (ack[0] < expected.started - RECEIPT_NTP_SKEW_MS) return false;
+  return true;
+}
+
 async function readActivationReceipt(release, expected) {
   const receiptPath = `${release}/release-receipt.json`;
   try {
     const value = parseJson(await fsp.readFile(receiptPath), "activation_receipt_invalid");
-    const sequence = [value.startedAt,value.helloAcceptedAt,value.catalogRpcs?.[verifyAgent]?.describeModelCatalogAt,value.catalogRpcs?.[verifyAgent]?.fetchModelCatalogAt,value.controllerVerifiedAt,value.completedAt].map(Date.parse);
     // Receipts from a previous release predate #329 and therefore omit the
     // field; treating that as an empty list keeps exact rollback available.
     const adapterRefusals = value.adapterRefusals ?? [];
@@ -604,7 +630,7 @@ async function readActivationReceipt(release, expected) {
       ["configuration_incomplete", "executable_unavailable", "runtime_refused"].includes(item.code) &&
       (item.missing === undefined || (Array.isArray(item.missing) && item.missing.length <= ADAPTER_REQUIREMENTS.size && item.missing.every((name) => ADAPTER_REQUIREMENTS.has(name))))
     );
-    if (value.formatVersion === 2 && value.activationId === expected.activationId && value.bridgeId === bridgeId && value.sourceSha === expected.sourceSha && value.artifactChecksum === expected.artifactChecksum && value.stageId === expected.stageId && value.oldPid === expected.oldPid && value.pid === expected.newPid && INSTANCE.test(value.instanceId ?? "") && value.protocolVersion === 1 && adapterRefusalsValid && sequence.every(Number.isFinite) && sequence.every((time,index) => !index || time >= sequence[index-1]) && sequence[0] >= expected.started && sequence.at(-1) <= expected.deadline && value.controllerAck?.activationId === expected.activationId && value.controllerAck?.bridgeId === bridgeId && value.controllerAck?.instanceId === value.instanceId && value.controllerAck?.pid === expected.newPid && value.controllerAck?.sourceSha === expected.sourceSha && value.controllerAck?.artifactChecksum === expected.artifactChecksum) return { ...value, adapterRefusals };
+    if (value.formatVersion === 2 && value.activationId === expected.activationId && value.bridgeId === bridgeId && value.sourceSha === expected.sourceSha && value.artifactChecksum === expected.artifactChecksum && value.stageId === expected.stageId && value.oldPid === expected.oldPid && value.pid === expected.newPid && INSTANCE.test(value.instanceId ?? "") && value.protocolVersion === 1 && adapterRefusalsValid && receiptEventStreamsAcceptable(value, expected) && value.controllerAck?.activationId === expected.activationId && value.controllerAck?.bridgeId === bridgeId && value.controllerAck?.instanceId === value.instanceId && value.controllerAck?.pid === expected.newPid && value.controllerAck?.sourceSha === expected.sourceSha && value.controllerAck?.artifactChecksum === expected.artifactChecksum) return { ...value, adapterRefusals };
   } catch {}
   return null;
 }
@@ -969,6 +995,70 @@ const currentBaselinePath = `${baselineRoot}/current.json`;
  * being recorded as a blank — a baseline that cannot be restored to is worse
  * than no baseline, because it looks like one.
  */
+async function readBaselineRuntime() {
+  const runtimeEnv = { PATH: `${path.dirname(nodePath)}:/usr/bin:/bin`, HOME: process.env.HOME ?? checkoutPath };
+  let nodeVersion;
+  try { nodeVersion = (await runBounded(nodePath, ["--version"], { timeoutMs: 10_000, stdoutLimit: 1024, stderrLimit: 1024, env: runtimeEnv })).stdout.trim(); }
+  catch { fail("baseline_node_version_unavailable"); }
+  if (!/^v\d+\.\d+\.\d+/.test(nodeVersion)) fail("baseline_node_version_unavailable");
+  return nodeVersion;
+}
+
+function baselineTreeFields(measured, capabilities, identity, nodeVersion) {
+  return {
+    files: capabilities.files,
+    runtimeScope: [...RUNTIME_SCOPE.directories, ...RUNTIME_SCOPE.files],
+    runtimeTreeDigest: measured.tree.digest,
+    runtimeEntryCount: measured.tree.entryCount,
+    runtimeFileCount: measured.tree.fileCount,
+    runtimeBytes: measured.tree.bytes,
+    runtimeLinkCount: measured.tree.linkCount,
+    runtimeExternalRoots: measured.tree.externalRoots,
+    bridgeVersion: capabilities.bridgePackage.version,
+    protocolVersion: capabilities.protocolVersion,
+    drainSigusr2: capabilities.drainSupport,
+    describeModelCatalog: capabilities.describeSupport,
+    fetchModelCatalog: capabilities.fetchSupport,
+    rollbackProof: capabilities.rolloutReady === "yes" ? "receipt" : "reduced-baseline",
+    processManager: processManagerSnapshot(identity),
+    runtime: { nodePath, nodeVersion, platform: `${process.platform}-${process.arch}`, uid: expectedUid },
+  };
+}
+
+async function captureManagedBaseline(identity) {
+  const releaseDir = path.resolve(identity.entryReal, "../../../..");
+  const match = /^([0-9a-f]{40})-([0-9a-f]{64})$/.exec(path.basename(releaseDir));
+  if (!match) fail("rebaseline_release_name_invalid");
+  const staged = await validateRelease(releaseDir, match[1], match[2]);
+  if (identity.entryReal !== `${releaseDir}/packages/bridge/dist/index.js`) fail("rebaseline_entrypoint_unexpected_target");
+  const entryStat = await fsp.lstat(entrypointPath).catch(() => fail("baseline_entrypoint_unreadable"));
+  if (!entryStat.isSymbolicLink()) fail("rebaseline_entrypoint_not_stub");
+  const resolvedStat = await fsp.lstat(identity.entryReal).catch(() => fail("rebaseline_release_entrypoint_unreadable"));
+  if (!resolvedStat.isFile() || resolvedStat.isSymbolicLink()) fail("rebaseline_release_entrypoint_wrong_type");
+  assertUid(resolvedStat, expectedUid, "rebaseline_release_entrypoint_wrong_owner");
+  const entryBytes = await fsp.readFile(identity.entryReal);
+  const measured = await measureRuntime();
+  const capabilities = await readDeployedCapabilities(releaseDir);
+  const nodeVersion = await readBaselineRuntime();
+  const baseline = {
+    artifactMode: "managed",
+    checkoutPath,
+    checkoutSourceSha: measured.checkoutSourceSha,
+    entrypointPath,
+    entrypointSha256: hash(entryBytes),
+    entrypointSize: entryBytes.length,
+    entrypointMode: resolvedStat.mode & 0o7777,
+    managedRelease: {
+      sourceSha: staged.sourceSha,
+      artifactChecksum: staged.artifactChecksum,
+      stageId: staged.stageId,
+      entrypoint: identity.entryReal,
+    },
+    ...baselineTreeFields(measured, { ...capabilities, files: measured.files }, identity, nodeVersion),
+  };
+  return { baseline, digest: hash(Buffer.from(JSON.stringify(baseline), "utf8")), entryBytes, pid: identity.pid };
+}
+
 async function captureBaseline(identity) {
   if (!identity.legacy) fail("enroll_requires_legacy_checkout");
   const measured = await measureRuntime();
@@ -976,12 +1066,7 @@ async function captureBaseline(identity) {
   const capabilities = await readDeployedCapabilities(checkoutPath);
   const entryStat = await fsp.lstat(entrypointPath).catch(() => fail("baseline_entrypoint_unreadable"));
   if (!entryStat.isFile() || entryStat.isSymbolicLink()) fail("baseline_entrypoint_wrong_type");
-  const runtimeEnv = { PATH: `${path.dirname(nodePath)}:/usr/bin:/bin`, HOME: process.env.HOME ?? checkoutPath };
-  let nodeVersion;
-  try { nodeVersion = (await runBounded(nodePath, ["--version"], { timeoutMs: 10_000, stdoutLimit: 1024, stderrLimit: 1024, env: runtimeEnv })).stdout.trim(); }
-  catch { fail("baseline_node_version_unavailable"); }
-  if (!/^v\d+\.\d+\.\d+/.test(nodeVersion)) fail("baseline_node_version_unavailable");
-  // Fixed key order: this object is hashed, so its serialization is its identity.
+  const nodeVersion = await readBaselineRuntime();
   const baseline = {
     artifactMode: "legacy-checkout",
     checkoutPath,
@@ -990,36 +1075,7 @@ async function captureBaseline(identity) {
     entrypointSha256: capabilities.files[0].sha256,
     entrypointSize: capabilities.files[0].size,
     entrypointMode: entryStat.mode & 0o7777,
-    files: capabilities.files,
-    // The integrity anchor: every file the deployment can load, not a chosen
-    // few. A dormant dependency that drifts changes this digest.
-    runtimeScope: [...RUNTIME_SCOPE.directories, ...RUNTIME_SCOPE.files],
-    runtimeTreeDigest: measured.tree.digest,
-    // What the ceiling actually charges; the rest are diagnostics.
-    runtimeEntryCount: measured.tree.entryCount,
-    runtimeFileCount: measured.tree.fileCount,
-    runtimeBytes: measured.tree.bytes,
-    // Symlinks are followed and their targets hashed; these two fields make the
-    // inclusion explicit, so a reader can see how much of the baseline came
-    // from outside the declared scope rather than having to infer it.
-    runtimeLinkCount: measured.tree.linkCount,
-    runtimeExternalRoots: measured.tree.externalRoots,
-    bridgeVersion: capabilities.bridgePackage.version,
-    protocolVersion: capabilities.protocolVersion,
-    drainSigusr2: capabilities.drainSupport,
-    describeModelCatalog: capabilities.describeSupport,
-    fetchModelCatalog: capabilities.fetchSupport,
-    // WHICH proof a rollback onto this baseline can actually produce, from the
-    // captured bytes. A yes/no said only whether the baseline cleared a gate; a
-    // pre-catalog bridge can still prove a great deal about itself, just not the
-    // nonce/PID/instance/two-RPC receipt, and the record should describe that
-    // rather than collapse it. `receipt` means the standard proof is available;
-    // `reduced-baseline` means a restore onto it is provable by digest-exact
-    // content plus live process/PM2/protocol/drain evidence, with no
-    // controller-observed catalog RPCs.
-    rollbackProof: capabilities.rolloutReady === "yes" ? "receipt" : "reduced-baseline",
-    processManager: processManagerSnapshot(identity),
-    runtime: { nodePath, nodeVersion, platform: `${process.platform}-${process.arch}`, uid: expectedUid },
+    ...baselineTreeFields(measured, capabilities, identity, nodeVersion),
   };
   return { baseline, digest: hash(Buffer.from(JSON.stringify(baseline), "utf8")), entryBytes: capabilities.bytes[0], pid: identity.pid };
 }
@@ -1072,6 +1128,15 @@ async function verifyBaseline(record, identity) {
     if (!expected || expected.size !== file.size || expected.sha256 !== file.sha256) return { ok: false, reason: "baseline_runtime_file_mismatch" };
   }
   if (measured.tree.digest !== baseline.runtimeTreeDigest) return { ok: false, reason: "baseline_runtime_tree_mismatch" };
+  if (baseline.artifactMode === "managed") {
+    const expectedEntrypoint = baseline.managedRelease?.entrypoint;
+    if (typeof expectedEntrypoint !== "string" || !expectedEntrypoint.startsWith(`${releaseRoot}/releases/`)) {
+      return { ok: false, reason: "baseline_managed_release_invalid" };
+    }
+    if (identity && (identity.legacy || identity.entryReal !== expectedEntrypoint)) {
+      return { ok: false, reason: "baseline_managed_release_mismatch" };
+    }
+  }
   if (identity?.legacy) {
     const entryStat = await fsp.lstat(entrypointPath).catch(() => null);
     if (!entryStat?.isFile() || entryStat.isSymbolicLink()) return { ok: false, reason: "baseline_entrypoint_wrong_type" };
@@ -1162,6 +1227,81 @@ async function enroll() {
   });
 }
 
+async function publishBaselineRecord({ enrollmentId, captured, after, previousEnrollmentId = null, kind = "enrolled-baseline" }) {
+  const directory = `${baselineRoot}/${enrollmentId}`;
+  await fsp.mkdir(directory, { mode: 0o700 }).catch(() => fail("enrollment_directory_exists"));
+  await requireManagedDirectory(directory);
+  const entrypointDirectory = `${directory}/entrypoint`;
+  await fsp.mkdir(entrypointDirectory, { mode: 0o700 }); await requireManagedDirectory(entrypointDirectory);
+  const preserved = `${entrypointDirectory}/index.js`;
+  await fsp.writeFile(preserved, captured.entryBytes, { flag: "wx", mode: 0o600 });
+  if (hash(await fsp.readFile(preserved)) !== captured.baseline.entrypointSha256) fail("baseline_entrypoint_copy_mismatch");
+  const record = { formatVersion: 2, kind: "enrolled-baseline", enrollmentId, bridgeId, pm2App, baseline: captured.baseline, baselineDigest: captured.digest, preservedEntrypoint: preserved, livePid: after.pid, enrolledAt: nowIso() };
+  if (previousEnrollmentId) record.previousEnrollmentId = previousEnrollmentId;
+  await fsp.writeFile(`${baselineRoot}/${enrollmentId}.baseline.json`, safeJson(record), { flag: "wx", mode: 0o600 });
+  const pointer = { formatVersion: 1, bridgeId, enrollmentId, baselineDigest: captured.digest, publishedAt: nowIso() };
+  const temp = `${currentBaselinePath}.next-${enrollmentId}`;
+  await fsp.writeFile(temp, safeJson(pointer), { flag: "wx", mode: 0o600 });
+  await fsp.rename(temp, currentBaselinePath);
+  return { record, preserved };
+}
+
+async function rebaseline() {
+  safePhase = "rebaseline_arguments";
+  if (actionArgs.length !== 2) fail("rebaseline_argument_count");
+  const [enrollmentId, operationId] = actionArgs;
+  if (!HASH.test(enrollmentId) || !HASH.test(operationId)) fail("rebaseline_identity_invalid");
+  safePhase = "rebaseline_identity";
+  await readLiveIdentity();
+  await prepareManagedRoot();
+  await withLock(operationId, async () => {
+    safePhase = "rebaseline_existing";
+    const existing = await enrollmentState();
+    if (existing.status !== "recorded") fail("rebaseline_requires_enrollment");
+    const before = await readLiveIdentity();
+    if (before.legacy) fail("rebaseline_requires_managed_release");
+    safePhase = "rebaseline_capture";
+    const captured = await captureManagedBaseline(before);
+    const after = await readLiveIdentity();
+    const recaptured = await captureManagedBaseline(after);
+    if (after.pid !== before.pid || after.entryReal !== before.entryReal || recaptured.digest !== captured.digest) fail("rebaseline_live_state_drift");
+    if (existing.record.baselineDigest === captured.digest) {
+      console.log("rebaseline=unchanged"); console.log(`enrollment_id=${existing.record.enrollmentId}`);
+      console.log(`baseline_digest=${existing.record.baselineDigest}`);
+      console.log(`managed_release=${existing.record.baseline.managedRelease?.sourceSha}:${existing.record.baseline.managedRelease?.artifactChecksum}`);
+      console.log(`baseline_rollback_proof=${existing.record.baseline.rollbackProof}`); console.log(`live_pid=${after.pid}`);
+      console.log("process_signaled=no"); console.log("artifact_changed=no");
+      return;
+    }
+    safePhase = "rebaseline_record";
+    await publishBaselineRecord({
+      enrollmentId, captured, after, previousEnrollmentId: existing.record.enrollmentId, kind: "enrolled-baseline",
+    });
+    const receiptPath = `${baselineRoot}/${enrollmentId}.receipt.json`;
+    await fsp.writeFile(receiptPath, safeJson({
+      formatVersion: 2, kind: "rebaseline", enrollmentId, previousEnrollmentId: existing.record.enrollmentId,
+      previousBaselineDigest: existing.record.baselineDigest, baselineDigest: captured.digest,
+      bridgeId, pm2App, managedRelease: captured.baseline.managedRelease, livePid: after.pid,
+      processSignaled: "no", artifactChanged: "no", recordedAt: nowIso(),
+    }), { flag: "wx", mode: 0o600 });
+    safePhase = "rebaseline_verify";
+    const final = await readLiveIdentity();
+    if (final.pid !== after.pid || final.legacy || final.entryReal !== after.entryReal) fail("rebaseline_process_changed");
+    const published = await enrollmentStatus(final);
+    if (published.status !== "enrolled") fail("rebaseline_verification_failed");
+    console.log("rebaseline=recorded"); console.log(`enrollment_id=${enrollmentId}`);
+    console.log(`previous_enrollment_id=${existing.record.enrollmentId}`);
+    console.log(`baseline_digest=${captured.digest}`);
+    console.log(`managed_release=${captured.baseline.managedRelease.sourceSha}:${captured.baseline.managedRelease.artifactChecksum}`);
+    console.log(`managed_stage_id=${captured.baseline.managedRelease.stageId}`);
+    console.log(`baseline_entrypoint_sha256=${captured.baseline.entrypointSha256}`);
+    console.log(`baseline_rollback_proof=${captured.baseline.rollbackProof}`);
+    console.log(`receipt_path=${receiptPath}`);
+    console.log(`live_pid=${after.pid}`); console.log("process_signaled=no"); console.log("artifact_changed=no");
+    console.log(`next_preflight=npm run bridge:rollout -- --target ${bridgeId}`);
+  });
+}
+
 async function restoreBaseline() {
   safePhase = "restore_arguments";
   if (actionArgs.length !== 2) fail("restore_argument_count");
@@ -1187,15 +1327,28 @@ async function restoreBaseline() {
     const verified = await verifyBaseline(state.record, null);
     if (!verified.ok) fail(verified.reason);
     safePhase = "restore_entrypoint";
-    // Put the recorded bytes back at the exact recorded path and mode. This is
-    // the whole point of the baseline: the pre-enrollment artifact is restorable
-    // byte for byte, not merely described.
-    const temp = `${entrypointPath}.seam-restore-${process.pid}`;
-    await fsp.writeFile(temp, state.preservedBytes, { flag: "wx", mode: state.record.baseline.entrypointMode });
-    await fsp.chmod(temp, state.record.baseline.entrypointMode);
-    await fsp.rename(temp, entrypointPath);
+    const managed = state.record.baseline.artifactMode === "managed";
+    if (managed) {
+      const release = state.record.baseline.managedRelease;
+      if (!release || !SHA.test(release.sourceSha ?? "") || !HASH.test(release.artifactChecksum ?? "") || !HASH.test(release.stageId ?? "")) {
+        fail("baseline_managed_release_invalid");
+      }
+      const releaseDir = path.resolve(release.entrypoint, "../../../..");
+      await validateRelease(releaseDir, release.sourceSha, release.artifactChecksum, release.stageId);
+      await switchEntrypoint(release.entrypoint);
+    } else {
+      // Put the recorded bytes back at the exact recorded path and mode. This is
+      // the whole point of the baseline: the pre-enrollment artifact is restorable
+      // byte for byte, not merely described.
+      const temp = `${entrypointPath}.seam-restore-${process.pid}`;
+      await fsp.writeFile(temp, state.preservedBytes, { flag: "wx", mode: state.record.baseline.entrypointMode });
+      await fsp.chmod(temp, state.record.baseline.entrypointMode);
+      await fsp.rename(temp, entrypointPath);
+    }
     const restored = await readLiveIdentity();
-    if (!restored.legacy || restored.entryReal !== entrypointPath) fail("restore_entrypoint_mismatch");
+    if (managed) {
+      if (restored.legacy || restored.entryReal !== state.record.baseline.managedRelease.entrypoint) fail("restore_entrypoint_mismatch");
+    } else if (!restored.legacy || restored.entryReal !== entrypointPath) fail("restore_entrypoint_mismatch");
     const reproved = await verifyBaseline(state.record, restored);
     if (!reproved.ok) fail(reproved.reason);
     safePhase = "restore_publish";
@@ -1617,6 +1770,7 @@ try {
   else if (mode === "prepare-upload") await prepareUpload();
   else if (mode === "stage") await stage();
   else if (mode === "enroll") await enroll();
+  else if (mode === "rebaseline") await rebaseline();
   else if (mode === "restore-baseline") await restoreBaseline();
   else if (mode === "activate") await activate();
   else if (mode === "rollback") await rollback();

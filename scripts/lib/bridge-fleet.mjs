@@ -217,7 +217,9 @@ export function collectBlockers(report, target, targets = new Map()) {
       "enrolled_baseline_drift",
       "advisory",
       "the recorded baseline no longer matches this host (enrolled_baseline_state_drift)",
-      `re-enroll this host: npm run bridge:rollout -- --target ${id} --enroll --apply`
+      legacy
+        ? `re-enroll this host: npm run bridge:rollout -- --target ${id} --enroll --apply`
+        : `record the current managed release: npm run bridge:rollout -- --target ${id} --rebaseline --apply`
     );
   }
 

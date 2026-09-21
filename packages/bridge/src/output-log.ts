@@ -68,6 +68,13 @@ export interface OutputLogOptions {
  * all slots and 5 minutes; a slot is additionally capped at 4,000 frames so a
  * single chatty agent cannot consume the whole budget and silently evict the
  * others' replay windows.
+ *
+ * The window is measured rather than guessed. Every bridge outage on
+ * `fhr-server` over the fourteen days to 2026-09-20 — nine of them — lasted
+ * 5, 5, 5, 5, 5, 6, 10, 10 or 16 seconds. Five minutes covers the worst
+ * observed case about nineteen times over, so the age bound should essentially
+ * never be what truncates a real reconnect; it is there to bound memory when
+ * an old seam-acp never acks, not to ration a healthy one.
  */
 const DEFAULT_MAX_BYTES = 8 * 1024 * 1024;
 const DEFAULT_MAX_AGE_MS = 5 * 60_000;

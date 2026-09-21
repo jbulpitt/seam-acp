@@ -5,6 +5,13 @@ type WsCtor = typeof import("ws").WebSocket;
 /**
  * Outbound framing for the slot mux (#444).
  *
+ * Protocol: `{ slot, type, data?, code?, seq? }`
+ *   "data"  — ACP payload (UTF-8 text), one complete line per frame
+ *   "kill"  — seam-acp → bridge: terminate agent for this slot
+ *   "exit"  — bridge → seam-acp: agent exited
+ *   `seq`   — per-slot sequence for the output log; absent from an old
+ *             bridge, and an old consumer simply ignores it
+ *
  * Lives outside `index.ts` because that file is the CLI entrypoint and
  * `process.exit(1)`s on import, so nothing in it can be tested. Three
  * mutations to this logic survived a full suite while it was inline: not

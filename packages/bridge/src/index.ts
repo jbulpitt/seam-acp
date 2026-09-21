@@ -219,14 +219,6 @@ function spawnAgent(
 }
 
 /**
- * Send a multiplexed message over a WebSocket.
- * Protocol: { slot, type, data?, code? }
- *   "data"  — ACP payload (UTF-8 text)
- *   "kill"  — seam-acp → bridge: terminate agent for this slot
- *   "exit"  — bridge → seam-acp: agent exited
- */
-
-/**
  * Create a slot manager that multiplexes multiple agent processes over one WS.
  * Each slot gets its own agent process, spawned lazily on first message.
  * Agents survive WS reconnects — stdout is routed to `currentWs`.

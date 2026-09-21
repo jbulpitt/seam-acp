@@ -15,6 +15,7 @@ import {
   resolveSlotAdapter,
   unknownAgentMessage,
   UnknownAgentError,
+  spawnRefusalFrame,
   type AdapterResolution,
 } from "../packages/bridge/src/resolve-adapter.js";
 
@@ -127,6 +128,19 @@ describe("#468 the refusal an operator reads", () => {
 
   it("says 'none' rather than an empty gap when the host holds nothing", () => {
     expect(unknownAgentMessage("claude", [])).toContain("none");
+  });
+
+  it("ends the slot with a non-zero code, so a refusal is not read as success", () => {
+    // An old seam-acp reads `code` and nothing else. If this were 0 the slot
+    // would look like a clean finish and the turn would appear to have worked.
+    const frame = spawnRefusalFrame(new UnknownAgentError("zai", ["claude"]));
+    expect(frame.code).toBe(1);
+    expect(frame.spawnError).toContain("zai");
+  });
+
+  it("still carries a reason when something non-Error is thrown", () => {
+    expect(spawnRefusalFrame("boom").spawnError).toBe("boom");
+    expect(spawnRefusalFrame(new Error("plain")).spawnError).toBe("plain");
   });
 
   it("carries the id and inventory on the error, not only in prose", () => {

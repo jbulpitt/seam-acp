@@ -22,6 +22,97 @@ import {
 } from "./claude-catalog.js";
 import type { SessionSummary, SessionSummaryLine } from "../session-manager.js";
 import { CLAUDE_FAST_MODE } from "../fast-mode.js";
+import {
+  classifyAndAttach,
+  classifyWith,
+  classified,
+  isAdapterErrorKind,
+  type AdapterErrorClassification,
+  type AdapterErrorKind,
+  type ClassifyContext,
+} from "../error-classification.js";
+
+/**
+ * Claude ACP already attaches `data.errorKind` for some failures (observed:
+ * `authentication_failed`, `server_error`). Map those onto the Seam taxonomy
+ * so the orchestrator's `data.errorKind === "rate_limit"` check is a live
+ * field rather than dead code. Distinctive journal signatures override the
+ * ACP kind: Claude labelled a refresh-contention failure `server_error`.
+ */
+const CLAUDE_ACP_KIND: Record<string, AdapterErrorKind> = {
+  authentication_failed: "auth_required",
+  oauth_org_not_allowed: "auth_required",
+  billing_error: "quota_exhausted",
+  account_on_hold: "quota_exhausted",
+  rate_limit: "rate_limit",
+  rate_limited: "rate_limit",
+  overloaded: "overloaded",
+  invalid_request: "invalid_request",
+  model_not_found: "model_not_found",
+  max_output_tokens: "context_length",
+  server_error: "server_error",
+  worker_shutdown: "agent_exit",
+  transport_lost: "connection_closed",
+  no_result: "protocol_error",
+  auth_required: "auth_required",
+  quota_exhausted: "quota_exhausted",
+  budget_exhausted: "quota_exhausted",
+  context_exhausted: "context_length",
+  provider_error: "server_error",
+  bad_request: "invalid_request",
+};
+
+export function classifyClaudeError(error: unknown, agentId = "claude"): AdapterErrorClassification {
+  return classifyWith(agentId, error, matchClaudeError);
+}
+
+function matchClaudeError(ctx: ClassifyContext): AdapterErrorClassification | AdapterErrorKind | null {
+  const { haystack, agentId, message, data } = ctx;
+
+  // Journal 2026-09-13: "Failed to refresh OAuth token: another Claude Code
+  // process is refreshing it or exited mid-refresh". ACP labelled this
+  // `server_error`. Matching "refresh" or "OAuth" alone would also catch a
+  // revoked token; the distinctive phrase is the contention signature.
+  if (/\banother claude code process is refreshing it\b/.test(haystack)) {
+    return classified(agentId, "auth_contention", { details: message, sourceKind: sourceKindOf(data) });
+  }
+  // Journal 2026-09-13/15: "Failed to authenticate: OAuth session expired and
+  // could not be refreshed". ACP kind was `authentication_failed`.
+  if (/\boauth session expired and could not be refreshed\b/.test(haystack)) {
+    return classified(agentId, "auth_expired", { details: message, sourceKind: sourceKindOf(data) });
+  }
+  // Wording the orchestrator already retries; produce `rate_limit` so that
+  // check reads a field. Not observed in the current journal window.
+  if (/\btemporarily limiting requests\b/.test(haystack) || /(?:^|[·.]\s*)rate limited\b/.test(haystack)) {
+    return classified(agentId, "rate_limit", { details: message, sourceKind: sourceKindOf(data) });
+  }
+  if (/\bdimension limit for many-image\b/.test(haystack) || /\bexceeds the dimension limit\b/.test(haystack)) {
+    return classified(agentId, "context_length", { details: message });
+  }
+  if (/\bclaude-agent-acp advertised (?:no model config option|an empty model list)\b/.test(haystack)) {
+    return classified(agentId, "capability_absent", { details: message });
+  }
+
+  const acpKind = typeof data?.errorKind === "string" ? data.errorKind : null;
+  if (acpKind && CLAUDE_ACP_KIND[acpKind]) {
+    const mapped = CLAUDE_ACP_KIND[acpKind]!;
+    return classified(agentId, mapped, { details: message, sourceKind: acpKind });
+  }
+  if (acpKind && isAdapterErrorKind(acpKind) && acpKind !== "unclassified") {
+    return classified(agentId, acpKind, { details: message, sourceKind: acpKind });
+  }
+  return null;
+}
+
+function sourceKindOf(data: Record<string, unknown> | null): string | undefined {
+  return typeof data?.errorKind === "string" && data.errorKind ? data.errorKind : undefined;
+}
+
+export function claudeNoModelConfigError(agentId = "claude"): Error {
+  const err = new Error("claude-agent-acp advertised no model config option");
+  classifyAndAttach(err, classified(agentId, "capability_absent", { details: err.message }));
+  return err;
+}
 
 /**
  * Resolve the Claude Code projects directory for a given cwd. Claude Code's
@@ -210,8 +301,9 @@ export function makeClaudeProfile(opts: {
     return env;
   }
 
+  const profileId = opts.id ?? "claude";
   return asLocalAdapter({
-    id: opts.id ?? "claude",
+    id: profileId,
     displayName: opts.displayName ?? "Anthropic Claude",
     ...(opts.brand ? { brand: opts.brand } : {}),
     defaultModel: opts.defaultModel,
@@ -305,6 +397,9 @@ export function makeClaudeProfile(opts: {
     // Even opted in, this is eligibility only: AgentRuntime still requires the
     // live session to advertise config id `fast` before applying anything.
     ...(opts.directAnthropic ? { fastMode: CLAUDE_FAST_MODE } : {}),
+    classifyError(error: unknown) {
+      return classifyAndAttach(error, classifyClaudeError(error, profileId));
+    },
     spawn(modelOverride?: string, _effortOverride?: string) {
       return spawn(cli, [], {
         stdio: ["pipe", "pipe", "pipe"],

@@ -22,6 +22,45 @@ import {
   CodexSessionManager,
   defaultCodexSessionsRoot,
 } from "./codex-session-manager.js";
+import {
+  classifyAndAttach,
+  classifyWith,
+  classified,
+  type AdapterErrorClassification,
+  type AdapterErrorKind,
+  type ClassifyContext,
+} from "../error-classification.js";
+
+/**
+ * Codex ACP collapses provider reasons to `Internal error` with `data: null`.
+ * The usage-limit text in journal 2026-09-19 lived on DispatchTurnError.output,
+ * not the message. Matching the message "Internal error" would mis-label every
+ * unattributed upstream failure as quota.
+ */
+export function classifyCodexError(error: unknown, agentId = "codex"): AdapterErrorClassification {
+  return classifyWith(agentId, error, matchCodexError);
+}
+
+function matchCodexError(ctx: ClassifyContext): AdapterErrorClassification | AdapterErrorKind | null {
+  const { haystack, agentId, message, data } = ctx;
+  if (/\byou've hit your usage limit\b/.test(haystack) ||
+      /\bpurchase more credits or try again at\b/.test(haystack) ||
+      /\binsufficient_quota\b/.test(haystack)) {
+    return classified(agentId, "quota_exhausted", { details: message });
+  }
+  if (/\bno rollout found\b/.test(haystack) || /\bsession not found\b/.test(haystack)) {
+    return classified(agentId, "session_gone", {
+      details: typeof data?.details === "string" ? data.details : message,
+    });
+  }
+  if (/\bcontext_length_exceeded\b/.test(haystack)) {
+    return classified(agentId, "context_length", { details: message });
+  }
+  if (/\bmodel_not_found\b/.test(haystack)) {
+    return classified(agentId, "model_not_found", { details: message });
+  }
+  return null;
+}
 
 export { CodexSessionManager, defaultCodexSessionsRoot } from "./codex-session-manager.js";
 
@@ -687,8 +726,9 @@ export function makeCodexProfile(opts: {
     backend: opts.extraEnv?.OPENAI_BASE_URL,
     credentialProfile,
   });
+  const profileId = opts.id ?? "codex";
   return asLocalAdapter({
-    id: opts.id ?? "codex",
+    id: profileId,
     displayName: opts.displayName ?? "OpenAI Codex",
     defaultModel: opts.defaultModel,
     catalog: {
@@ -757,6 +797,9 @@ export function makeCodexProfile(opts: {
     },
     // Codex uses the same configOption effort mechanism as Copilot (both OpenAI).
     effort: catalogEffort,
+    classifyError(error: unknown) {
+      return classifyAndAttach(error, classifyCodexError(error, profileId));
+    },
     spawn() {
       return spawnCodexRuntime(runtime, []);
     },

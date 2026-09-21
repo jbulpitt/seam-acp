@@ -42,7 +42,8 @@ function modelOptions() {
     options: [{ value: MODEL, name: "Opus" }] }];
 }
 
-function syntheticAcp(calls: AcpCalls, mode: "ok" | "no-load" | "reject-load" | "hang-load" | "hang-load-once") {
+type AcpMode = "ok" | "no-load" | "reject-load" | "reject-load-once" | "hang-load" | "hang-load-once";
+function syntheticAcp(calls: AcpCalls, mode: AcpMode) {
   return () => {
     const stdin = new PassThrough();
     const stdout = new PassThrough();
@@ -71,7 +72,7 @@ function syntheticAcp(calls: AcpCalls, mode: "ok" | "no-load" | "reject-load" | 
       })
       .onRequest(methods.agent.session.load, ({ params }) => {
         calls.loads.push(params.sessionId);
-        if (mode === "reject-load") throw new Error("synthetic remote session/load refusal");
+        if (mode === "reject-load" || (mode === "reject-load-once" && calls.loads.length === 1)) throw new Error("synthetic remote session/load refusal");
         if (mode === "hang-load" || (mode === "hang-load-once" && calls.loads.length === 1)) return new Promise(() => {});
         return { sessionId: params.sessionId, configOptions: modelOptions() };
       })
@@ -105,7 +106,7 @@ afterEach(async () => {
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
 });
 
-function harness(location: "local" | "bridge-a", mode: "ok" | "no-load" | "reject-load" | "hang-load" | "hang-load-once"): Harness {
+function harness(location: "local" | "bridge-a", mode: AcpMode): Harness {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "seam-302-runtime-"));
   const store = new SessionStore(path.join(dir, "seam.db"));
   const calls: AcpCalls = { initialized: 0, loads: [], news: 0, prompts: [], children: [] };
@@ -236,9 +237,15 @@ describe("#302 real ACP handshake and strict session/load recovery", () => {
         generation: 2,
         stalledReason: expect.stringMatching(mode === "no-load"
           ? /does not advertise session\/load/
-          : /Strict resume refused: session\/load failed after retries/),
+          : /boot recovery exhausted 3 pre-prompt acquisition attempts/),
       });
-      if (mode === "reject-load") expect(h.calls.loads).toEqual([RECORDED, RECORDED, RECORDED]);
+      if (mode === "reject-load") {
+        expect(h.calls.loads).toEqual([RECORDED, RECORDED, RECORDED]);
+        // The count is unchanged; ownership is not. Each load now belongs to
+        // one acquisition, not three retries inside a single router call.
+        expect(h.calls.initialized).toBe(3);
+        expect(h.calls.children.every(child => child.killed)).toBe(true);
+      }
     },
   );
 
@@ -269,4 +276,36 @@ describe("#302 real ACP handshake and strict session/load recovery", () => {
     expect(h.calls.children[0]?.killed).toBe(true);
     expect(h.store.turnAttempts.get(id)).toMatchObject({ state: "completed", generation: 2 });
   }, 10_000);
+
+  it("#448 retries a rejected load through the acquisition owner and continues once", async () => {
+    const h = harness("local", "reject-load-once"); const id = seedPromptedAttempt(h);
+    await resume(h);
+    expect(h.calls.loads).toEqual([RECORDED, RECORDED]);
+    expect(h.calls.initialized).toBe(2);
+    expect(h.calls.children[0]?.killed).toBe(true);
+    expect(h.calls.news).toBe(0);
+    expect(h.calls.prompts).toEqual(["continue"]);
+    expect(h.store.turnAttempts.get(id)?.state).toBe("completed");
+  });
+
+  it("#448 strict router acquisition makes one load attempt and never creates a replacement session", async () => {
+    const h = harness("local", "reject-load");
+    const record = h.store.get(`discord:${THREAD}`)!;
+    await expect(h.router.getOrStartRuntime(record, { resumeSessionId: RECORDED })).rejects.toThrow();
+    expect(h.calls.loads).toEqual([RECORDED]);
+    expect(h.calls.initialized).toBe(1);
+    expect(h.calls.news).toBe(0);
+    expect(h.calls.children[0]?.killed).toBe(true);
+    expect(h.store.get(record.id)?.acpSessionId).toBe(RECORDED);
+  });
+
+  it("#448 ordinary attachment retains its local load retries", async () => {
+    const h = harness("local", "reject-load-once");
+    const record = h.store.get(`discord:${THREAD}`)!;
+    await h.router.getOrStartRuntime(record);
+    expect(h.calls.loads).toEqual([RECORDED, RECORDED]);
+    expect(h.calls.initialized).toBe(1);
+    expect(h.calls.news).toBe(0);
+    expect(h.store.get(record.id)?.acpSessionId).toBe(RECORDED);
+  });
 });

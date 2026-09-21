@@ -70,14 +70,24 @@ wrong here, and ordering a lane around it cost a slot.
 **Critical path:** #440 → #441 → #448 → #450 → #454. Start #440 and #455 immediately;
 everything else queues behind one of them.
 
-## ⚠️ `copilot` is off limits for this epic
+## ⚠️ `copilot` is for FHR work, and this epic is not FHR work
 
-**GitHub Copilot is licensed and paid for by FHR, for FHR projects only. Nothing in this
-epic runs on it.**
+**GitHub Copilot is paid for by FHR, for FHR projects.** That is where it belongs and
+where it should keep running — FHR/HIPE work lives on `fhr-server`, which is the whole
+reason that work was moved onto its own host. **The separation is the enforcement.**
 
-This is not a quota preference, it is a licensing boundary, and it is easy to cross by
-accident: **three of the four models here can route through `copilot`**, so an unpinned
-dispatch may land there silently.
+What is off limits is running *this* epic on it. seam-acp is not an FHR project, so
+nothing here routes to `copilot`. That is a dispatch-time rule, not a global switch.
+
+**Do not disable copilot globally to enforce this.** `COPILOT_ENABLED=false` removes the
+profile for every host at once, including `copilot@fhr-server` — it took down 14
+legitimate FHR threads on 2026-09-20 and `planRuntimeSpawn` throws rather than
+substituting, so they simply failed. The flag has no host scope. Placement plus explicit
+pinning already does the job the flag was reached for.
+
+It is easy to cross the line by accident in the other direction too: **three of the four
+models here can route through `copilot`**, so an unpinned dispatch may land there
+silently.
 
 Every dispatch pins its agent explicitly:
 

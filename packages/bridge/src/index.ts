@@ -56,6 +56,7 @@ import {
 } from "@seam/adapters";
 import { dispatchBridgeRpc, type SlotSpawnConfig } from "./rpc.js";
 import { slotHealthSnapshot } from "./slot-health.js";
+import { collectHangEvidence, createProbeGate, readLiveProviderSocket } from "./hang-probe.js";
 import { createOutputLog, createLineFramer } from "./output-log.js";
 import { createStderrRegistry } from "./stderr-ring.js";
 import { spawnRefusalFrame } from "./resolve-adapter.js";
@@ -223,6 +224,12 @@ function makeSlotManager(opts: {
    */
   const stderrRegistry = createStderrRegistry();
   const slotInputRewriters = new Map<number, BridgeMcpInputRewriter>();
+  /**
+   * #443: absorbs the hang-probe response so it never becomes a turn error.
+   * One probe per slot. The id is unique, so a late reply cannot swallow a
+   * real stdout line.
+   */
+  const probes = createProbeGate();
 
   function setWs(ws: WsSocket | null) {
     currentWs = ws;
@@ -305,18 +312,25 @@ function makeSlotManager(opts: {
     const framer = createLineFramer();
     lineFramers.set(slot, framer);
     agent.stdout?.on("data", (chunk: Buffer) => {
-      lastStdoutAt.set(slot, Date.now());
       // One frame per complete line. A partial tail is held until its newline
-      // arrives, so a frame is always a whole JSON-RPC message.
-      forwardAgentStdout(chunk, framer, (line) =>
-        muxSend(currentWs, WebSocket, slot, "data", { data: line }, outputLog)
-      );
+      // arrives, so a frame is always a whole JSON-RPC message. A line that
+      // is our own hang-probe response is not agent output and does not
+      // refresh the silence clock — otherwise the probe would look like the
+      // turn had spoken.
+      let forwarded = false;
+      forwardAgentStdout(chunk, framer, (line) => {
+        if (probes.absorb(slot, line)) return;
+        forwarded = true;
+        muxSend(currentWs, WebSocket, slot, "data", { data: line }, outputLog);
+      });
+      if (forwarded || framer.pending() > 0) lastStdoutAt.set(slot, Date.now());
     });
 
     agent.on("error", (err) => {
       console.error(`[bridge] Slot ${slot} agent error: ${err.message}`);
       slots.delete(slot);
       slotInputRewriters.delete(slot);
+      probes.close(slot);
       flushFramer(slot);
       // A spawn error is abnormal by definition, so the tail goes out with it.
       muxSend(currentWs, WebSocket, slot, "exit", stderrRegistry.exitPayload(slot, 1, null), outputLog);
@@ -328,6 +342,7 @@ function makeSlotManager(opts: {
       lastStdoutAt.delete(slot);
       lastStdinAt.delete(slot);
       slotInputRewriters.delete(slot);
+      probes.close(slot);
       flushFramer(slot);
       // #456: on an abnormal exit the agent's own stderr says WHY. It is a
       // fact the bridge now holds, so it reports it rather than leaving
@@ -519,6 +534,26 @@ function makeSlotManager(opts: {
           `UPDATE sessions SET updated_at = ${escapeSql(nowIso)} WHERE id = ${escapeSql(payload.sessionId)}`
         );
         result = null;
+      } else if (action === "probeHang") {
+        // #443: seam-acp asks because it knows a prompt is outstanding. The
+        // bridge answers because it holds the child. Refusing a slot we do
+        // not have fails this command only — the turn is left running, and
+        // every other slot is untouched.
+        const slot = Number(payload?.slot);
+        const agent = Number.isInteger(slot) ? slots.get(slot) : undefined;
+        if (!agent || agent.exitCode !== null || agent.killed || !agent.stdin?.writable) {
+          throw new Error("probeHang: slot has no live process");
+        }
+        const id = randomUUID();
+        // Arm before writing. A late method-not-found stays absorbed until
+        // the slot exits: the id is unique, so this cannot hide real output.
+        const response = probes.arm(slot, id);
+        result = await collectHangEvidence({
+          id,
+          writeLine: (line) => { agent.stdin?.write(line); },
+          response,
+          sockets: () => readLiveProviderSocket(agent.pid),
+        });
       } else if (action === "listSlots") {
         // #442: the bridge holds the process. It is the only participant that
         // can answer "is it alive" and "when did it last speak" by OBSERVING
@@ -657,6 +692,7 @@ function makeSlotManager(opts: {
         stderrRegistry.drop(msg.slot);
         slotConfigs.delete(msg.slot);
         slotInputRewriters.delete(msg.slot);
+        probes.close(msg.slot);
       }
     } else if (msg.type === "cmd") {
       handleCmd(msg);

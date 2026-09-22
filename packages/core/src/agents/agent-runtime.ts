@@ -39,6 +39,7 @@ import {
 } from "./attachments.js";
 import { blockToFile } from "./agent-content.js";
 import { SerialQueue } from "../core/serial-queue.js";
+import { HANG_SILENCE_MS, readHangProbeReport, watchRemoteHang, type HangAction } from "./hang-watch.js";
 import {
   fastModeAgentRefusal,
   fastModeEnvRefusal,
@@ -329,6 +330,9 @@ export class AgentRuntime {
   private readonly catalogEffort?: CatalogEffort;
   private readonly bridgeHealth?: Partial<BridgeHealthSource>;
   private readonly loadSessionTimeoutMs: number;
+  /** Quiet time before asking the bridge whether a remote turn is hung.
+   *  Production is one minute. Tests pass a few milliseconds. */
+  private readonly hangSilenceMs: number;
 
   private child?: ReturnType<AgentProfile["spawn"]>;
   private connection?: ClientSideConnection;
@@ -469,6 +473,8 @@ export class AgentRuntime {
     ) => ReturnType<AgentProfile["spawn"]> | Promise<ReturnType<AgentProfile["spawn"]>>;
     /** Test/embedding override. Production uses SESSION_LOAD_TIMEOUT_MS. */
     loadSessionTimeoutMs?: number;
+    /** Test override. Production waits HANG_SILENCE_MS before probing. */
+    hangSilenceMs?: number;
   }) {
     this.profile = opts.profile;
     this.logger = opts.logger.child({ agent: opts.profile.id });
@@ -476,6 +482,7 @@ export class AgentRuntime {
     this.catalogEffort = opts.effortDescriptor;
     this.bridgeHealth = opts.bridgeHealth;
     this.loadSessionTimeoutMs = opts.loadSessionTimeoutMs ?? SESSION_LOAD_TIMEOUT_MS;
+    this.hangSilenceMs = opts.hangSilenceMs ?? HANG_SILENCE_MS;
     this.onDead = opts.onDead;
     this.onCatalogRefresh = opts.onCatalogRefresh;
     this.spawnFn = opts.spawnFn;
@@ -893,12 +900,22 @@ export class AgentRuntime {
           original instanceof Error ? original.message : String(original), { cause: original }),
           original && typeof original === "object" ? original : {});
       let classification: AdapterErrorClassification;
-      try {
-        classification = this.profile.classifyError?.(error) ?? unclassified(this.profile.id);
-      } catch {
-        // Adapter failure must remain attributable without replacing the provider
-        // error with a classifier bug. No downstream English parsing fallback.
-        classification = unclassified(this.profile.id, "adapter classifier threw");
+      // A kind already attached by this agent is the observation. Re-deriving
+      // it from the message would turn the hang probe's "event loop did not
+      // answer" back into unclassified, and unclassified retries — which is
+      // the wrong response for a wedged process. Profiles that go through
+      // classifyWith already keep an existing kind; this covers the rest.
+      const existing = readErrorClassification(error);
+      if (existing && existing.agentId === this.profile.id) {
+        classification = existing;
+      } else {
+        try {
+          classification = this.profile.classifyError?.(error) ?? unclassified(this.profile.id);
+        } catch {
+          // Adapter failure must remain attributable without replacing the provider
+          // error with a classifier bug. No downstream English parsing fallback.
+          classification = unclassified(this.profile.id, "adapter classifier threw");
+        }
       }
       classification = { ...classification, agentId: this.profile.id };
       const slot = this.getSlot();
@@ -998,6 +1015,14 @@ export class AgentRuntime {
     this.promptInFlight = true;
     this.sawUpdateThisTurn = false;
     const recoveryAbort = this.recoveryAbort = new AbortController();
+    // #443: only a remote slot has its child on another machine. Local
+    // processes are not probed here. The watch asks the bridge; it does not
+    // decide from silence. Aborting it when the turn ends is what keeps a
+    // finished prompt from being restarted.
+    const hangAbort = new AbortController();
+    if (this.getSlot() !== undefined && this.bridgeHealth?.sendCmd) {
+      void this.watchInFlightHang(hangAbort.signal);
+    }
     // Captured so the teardown fail-safe below can tell a CLEAN completion
     // (end_turn) from an abnormal one (cancel/abort/error). Stays undefined if
     // the RPC rejects (dispose/child-death) — which is itself an abnormal end.
@@ -1060,6 +1085,7 @@ export class AgentRuntime {
         ...(rejected ? { rejectedAttachments: rejected } : {}),
       };
     } finally {
+      hangAbort.abort();
       this.promptInFlight = false;
       this.recoveryAbort = undefined;
       this.touchActivity();
@@ -1108,6 +1134,62 @@ export class AgentRuntime {
         this.resumePromptText = undefined;
       }
     }
+  }
+
+  /**
+   * #443: quiet remote turn. Restart kills this slot only, and only after
+   * this runtime has answered a probe and then missed two in a row.
+   * `retry` rejects the in-flight prompt with `errorKind: "timeout"` and
+   * lets the existing recovery ladder decide whether anything is sent
+   * again. It does not re-prompt on its own. Anything we could not measure
+   * leaves the turn running — silence and a dead websocket are not evidence
+   * the child is hung. Other slots, local agents, and a bridge that does
+   * not know `probeHang` are unchanged.
+   */
+  private watchInFlightHang(signal: AbortSignal): Promise<void> {
+    const slot = this.getSlot();
+    let notedUnavailable = false;
+    return watchRemoteHang({
+      silenceMs: this.hangSilenceMs,
+      signal,
+      lastActivityAt: () => this.lastActivityMs,
+      inFlight: () => this.promptInFlight,
+      probe: async () => {
+        try {
+          return readHangProbeReport(await this.bridgeHealth?.sendCmd?.("probeHang", { slot }));
+        } catch (err) {
+          if (!notedUnavailable) {
+            notedUnavailable = true;
+            this.logger.debug({ err, slot }, "hang probe unavailable; silence is not a verdict");
+          }
+          return null;
+        }
+      },
+      onAction: (action) => {
+        if (signal.aborted || !this.promptInFlight) return;
+        this.applyHangAction(action);
+      },
+    });
+  }
+
+  private applyHangAction(action: HangAction): void {
+    if (action === "leave") return;
+    const agentId = this.profile.id;
+    if (action === "restart") {
+      const err = new Error("agent event loop did not answer seam/hangProbe; restarting this slot");
+      attachErrorClassification(err, { errorKind: "connection_closed", agentId, details: err.message });
+      this.logger.warn({ slot: this.getSlot(), action }, err.message);
+      this.rejectInFlightPrompt?.(err);
+      try { this.child?.kill(); } catch { /* the process is already gone */ }
+      // Mux kill does not emit exit, so the router would keep this runtime
+      // and send the next turn to a dead slot. Evict it. One session.
+      this.onDead?.();
+      return;
+    }
+    const err = new Error("provider socket stopped progressing while the agent event loop answered seam/hangProbe");
+    attachErrorClassification(err, { errorKind: "timeout", agentId, details: err.message });
+    this.logger.warn({ slot: this.getSlot(), action }, err.message);
+    this.rejectInFlightPrompt?.(err);
   }
 
   /** Whether a prompt is currently in flight (turn running). */

@@ -69,6 +69,7 @@ import {
   classifyWith,
   classified,
   classifiedErrorData,
+  readErrorClassification,
   type AdapterErrorClassification,
   type AdapterErrorKind,
   type ClassifyContext,
@@ -1348,7 +1349,14 @@ class AgyAgent implements Agent {
     // A replacement may not spawn while its predecessor still owns children.
     const previous = this.active;
     if (previous) { previous.cancel(); await previous.done; await previous.close(); }
-    const run = new AgyTurnLifecycle(params.sessionId, (this.printTimeoutSeconds ?? 600) * 1000);
+    const run = new AgyTurnLifecycle(
+      params.sessionId,
+      (this.printTimeoutSeconds ?? 600) * 1000,
+      // The lifecycle passes an already-redacted, bounded copy and keeps only
+      // this closed enum. This is the production call site that turns a nested
+      // child diagnostic into evidence without retaining the diagnostic.
+      diagnostic => classifyAgyError(new Error(diagnostic)).errorKind,
+    );
     this.active = run;
     try {
       try { return await this.runPrompt(params, run); }
@@ -1382,9 +1390,23 @@ class AgyAgent implements Agent {
         : run.abort.signal.reason instanceof ProbeError
           ? run.abort.signal.reason
           : agyFailure("protocol_error");
+      const classification = readErrorClassification(failure);
+      const errorKind = classification?.errorKind ?? agyKindFromCode(failure.code);
+      const safeEvidence = {
+        code: failure.code,
+        ...(classification?.exitCode !== undefined ? { exitCode: classification.exitCode } : {}),
+        ...(classification?.signal !== undefined ? { signal: classification.signal } : {}),
+        ...(classification?.sourceKind ? { sourceKind: classification.sourceKind } : {}),
+      };
+      const cause = classification && classification.errorKind !== agyKindFromCode(failure.code)
+        ? `${failure.code}: ${classification.errorKind}`
+        : failure.code;
+      const childExit = classification?.exitCode !== undefined || classification?.signal !== undefined
+        ? ` (child exit code=${classification.exitCode ?? "none"}, signal=${classification.signal ?? "none"})`
+        : "";
       throw RequestError.internalError(
-        agyData(agyKindFromCode(failure.code), { code: failure.code }),
-        `native AGY ${failure.code}`,
+        agyData(errorKind, safeEvidence),
+        `native AGY ${cause}${childExit}`,
       );
     }
   }
@@ -1467,7 +1489,12 @@ class AgyAgent implements Agent {
       detached: true,
       stdio: [useStdin ? "pipe" : "ignore", "pipe", "pipe"],
     }).spawn();
-    runRef.attach(proc, !!jsonSchema, useStdin);
+    runRef.attach(proc, !!jsonSchema, useStdin, [
+      sess.cwd,
+      sess.mcpHome ?? "",
+      agyLogPath,
+      schemaFile ?? "",
+    ]);
 
     if (useStdin && proc.stdin) {
       proc.stdin.write(promptText);
@@ -1730,7 +1757,15 @@ class AgyAgent implements Agent {
       await fs.unlink(agyLogPath).catch(() => {});
     }
 
-    if (proc.exitCode !== null && proc.exitCode !== 0) throw agyFailure("exited_early");
+    if (proc.exitCode !== null && proc.exitCode !== 0) {
+      const recorded = runRef.abort.signal.reason;
+      throw recorded instanceof ProbeError
+        ? recorded
+        : agyFailure("exited_early", "unclassified", {
+          exitCode: proc.exitCode,
+          signal: proc.signalCode,
+        });
+    }
     return { stopReason: "end_turn" };
   }
 

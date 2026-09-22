@@ -16,14 +16,14 @@ const logger = pino({ level: "silent" }) as unknown as Logger;
 type Row = { scenario?: string; pid?: number; prompt?: string; args?: string[]; home?: string; signal?: string; mcpConfig?: unknown };
 const alive = (pid: number): boolean => { try { process.kill(pid, 0); return true; } catch { return false; } };
 
-async function fixture(timeoutSeconds = 10) {
+async function fixture(timeoutSeconds = 10, fixtureLogger: Logger = logger) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "seam-agy-r5-"));
   const log = path.join(root, "invocations");
   const managed = createManagedAgyFixture({
     source: path.join(fixtures, "fake-native-agy.mjs"), version: "agy fixture 1.1.28", cwd: root,
     approvedEnvironment: { SEAM_AGY_CAPABILITY_FIXTURE_DIR: fixtures, SEAM_AGY_CAPABILITY_INVOCATIONS: log },
   });
-  const runtime = new AgentRuntime({ logger, profile: makeAgyProfile({
+  const runtime = new AgentRuntime({ logger: fixtureLogger, profile: makeAgyProfile({
     runtime: managed.runtime, dataDir: root, defaultModel: "Fixture Native Model",
     printTimeoutSeconds: timeoutSeconds, exposeGlobalStaging: false,
     mcpServers: [{ type: "http", name: "must-not-inherit", url: "http://127.0.0.1:9", headers: [] }],
@@ -130,6 +130,78 @@ describe.sequential("R5 native production lifecycle", () => {
       finally { await f.close(); }
     }, 15_000,
   );
+
+  it("#491 classifies a nested child auth exit after partial output without leaking its diagnostic", async () => {
+    const records: unknown[][] = [];
+    const captureLogger = {
+      child() { return this; },
+      trace: (...args: unknown[]) => records.push(args),
+      debug: (...args: unknown[]) => records.push(args),
+      info: (...args: unknown[]) => records.push(args),
+      warn: (...args: unknown[]) => records.push(args),
+      error: (...args: unknown[]) => records.push(args),
+      fatal: (...args: unknown[]) => records.push(args),
+    } as unknown as Logger;
+    const f = await fixture(10, captureLogger);
+    const consoleErrors: unknown[][] = [];
+    const consoleSpy = vi.spyOn(console, "error").mockImplementation((...args) => { consoleErrors.push(args); });
+    try {
+      const caught = await f.runtime.prompt(
+        "r5-turn-auth-exit",
+        undefined,
+        { recoveryScope: "ephemeral" },
+      ).then(() => undefined, (error: unknown) => error);
+
+      const text = f.events.flatMap((event) => event.kind === "agent-text" ? [event.text] : []).join("");
+      expect(text).toContain("partial");
+      expect(caught).toBeInstanceOf(Error);
+      expect(readErrorClassification(caught)).toMatchObject({
+        agentId: "agy",
+        errorKind: "auth_required",
+        exitCode: 41,
+        signal: null,
+      });
+      expect(String(caught)).toContain("auth_required");
+      expect(String(caught)).toContain("child exit code=41, signal=none");
+
+      // This is the returned error, AgentRuntime log/event surface, and direct
+      // console surface together. Deleting classify-before-discard either
+      // loses auth_required or tempts raw stderr across one of these borders.
+      const exposed = JSON.stringify({ caught, text: String(caught), events: f.events, records, consoleErrors });
+      for (const secret of [
+        "synthetic-secret-token-491",
+        "Authorization: Bearer",
+        f.root,
+        f.managed.executable,
+      ]) {
+        expect(exposed).not.toContain(secret);
+      }
+    } finally {
+      consoleSpy.mockRestore();
+      await f.close();
+    }
+  }, 15_000);
+
+  it("#491 reports an unknown nested child exit as unclassified, not adapter death", async () => {
+    const f = await fixture();
+    try {
+      const caught = await f.runtime.prompt(
+        "r5-turn-unknown-exit",
+        undefined,
+        { recoveryScope: "ephemeral" },
+      ).then(() => undefined, (error: unknown) => error);
+      expect(readErrorClassification(caught)).toMatchObject({
+        agentId: "agy",
+        errorKind: "unclassified",
+        exitCode: 52,
+        signal: null,
+      });
+      expect(String(caught)).toContain("unclassified");
+      expect(String(caught)).toContain("child exit code=52, signal=none");
+      expect(String(caught)).not.toContain("future AGY child failure");
+    } finally { await f.close(); }
+  }, 15_000);
+
   it("persists only the safe native failure through the real catalog service", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "seam-agy-r5-durable-"));
     const managed = createManagedAgyFixture({

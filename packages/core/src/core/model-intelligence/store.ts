@@ -7,6 +7,22 @@ export const MODEL_INTELLIGENCE_SOURCE_HISTORY_LIMIT = 96;
 export const MODEL_INTELLIGENCE_GENERATION_HISTORY_LIMIT = 96;
 export const MODEL_INTELLIGENCE_SCHEMA_VERSION = 1;
 
+/**
+ * The one `source` value that means "the projection refused to publish a
+ * number", as opposed to "this generation had no enrichment opinion".
+ *
+ * #471 made null-means-absent the rule for every AA column, so a missing join
+ * can no longer destroy a stored score. Scope conflict is the deliberate
+ * exception: disagreement between scoped variants must clear the collapsed
+ * row rather than silently keep whichever number happened to land first.
+ *
+ * It is a constant because the compatibility upsert matches it in SQL twelve
+ * times. Renaming the string without it would leave those CASE arms matching
+ * nothing — conflict-clearing would quietly revert to preserving the stored
+ * value, with no error and no failing test at the rename site.
+ */
+export const SCOPE_ENRICHMENT_CONFLICT_SOURCE = "model-intelligence:scope-enrichment-conflict";
+
 export interface IntelligenceSourceSnapshot<T = unknown> {
   id: number;
   source: IntelligenceSourceName;
@@ -270,47 +286,47 @@ export class ModelIntelligenceStore {
         -- Clearing for any other reason needs its own mechanism; this upsert
         -- cannot express "AA removed it".
         aa_slug = CASE
-          WHEN excluded.source = 'model-intelligence:scope-enrichment-conflict' THEN NULL
+          WHEN excluded.source = '${SCOPE_ENRICHMENT_CONFLICT_SOURCE}' THEN NULL
           WHEN excluded.aa_slug IS NULL THEN model_metadata.aa_slug
           ELSE excluded.aa_slug
         END,
         source_id = CASE
-          WHEN excluded.source = 'model-intelligence:scope-enrichment-conflict' THEN NULL
+          WHEN excluded.source = '${SCOPE_ENRICHMENT_CONFLICT_SOURCE}' THEN NULL
           WHEN excluded.source_id IS NULL THEN model_metadata.source_id
           ELSE excluded.source_id
         END,
         source_name = CASE
-          WHEN excluded.source = 'model-intelligence:scope-enrichment-conflict' THEN NULL
+          WHEN excluded.source = '${SCOPE_ENRICHMENT_CONFLICT_SOURCE}' THEN NULL
           WHEN excluded.source_name IS NULL THEN model_metadata.source_name
           ELSE excluded.source_name
         END,
         provider = CASE
-          WHEN excluded.source = 'model-intelligence:scope-enrichment-conflict' THEN NULL
+          WHEN excluded.source = '${SCOPE_ENRICHMENT_CONFLICT_SOURCE}' THEN NULL
           WHEN excluded.provider IS NULL THEN model_metadata.provider
           ELSE excluded.provider
         END,
         creator_json = CASE
-          WHEN excluded.source = 'model-intelligence:scope-enrichment-conflict' THEN NULL
+          WHEN excluded.source = '${SCOPE_ENRICHMENT_CONFLICT_SOURCE}' THEN NULL
           WHEN excluded.creator_json IS NULL THEN model_metadata.creator_json
           ELSE excluded.creator_json
         END,
         intelligence_index = CASE
-          WHEN excluded.source = 'model-intelligence:scope-enrichment-conflict' THEN NULL
+          WHEN excluded.source = '${SCOPE_ENRICHMENT_CONFLICT_SOURCE}' THEN NULL
           WHEN excluded.intelligence_index IS NULL THEN model_metadata.intelligence_index
           ELSE excluded.intelligence_index
         END,
         benchmarks_json = CASE
-          WHEN excluded.source = 'model-intelligence:scope-enrichment-conflict' THEN excluded.benchmarks_json
+          WHEN excluded.source = '${SCOPE_ENRICHMENT_CONFLICT_SOURCE}' THEN excluded.benchmarks_json
           WHEN excluded.benchmarks_json IS NOT NULL AND excluded.benchmarks_json != '{}' THEN excluded.benchmarks_json
           ELSE model_metadata.benchmarks_json
         END,
         pricing_json = CASE
-          WHEN excluded.source = 'model-intelligence:scope-enrichment-conflict' THEN NULL
+          WHEN excluded.source = '${SCOPE_ENRICHMENT_CONFLICT_SOURCE}' THEN NULL
           WHEN excluded.pricing_json IS NULL THEN model_metadata.pricing_json
           ELSE excluded.pricing_json
         END,
         released_at = CASE
-          WHEN excluded.source = 'model-intelligence:scope-enrichment-conflict' THEN NULL
+          WHEN excluded.source = '${SCOPE_ENRICHMENT_CONFLICT_SOURCE}' THEN NULL
           WHEN excluded.released_at IS NULL THEN model_metadata.released_at
           ELSE excluded.released_at
         END,
@@ -319,7 +335,7 @@ export class ModelIntelligenceStore {
         -- the stored index was refetched. A conflict or a real incoming
         -- opinion is a new fact, so those do advance the timestamp.
         source = CASE
-          WHEN excluded.source = 'model-intelligence:scope-enrichment-conflict'
+          WHEN excluded.source = '${SCOPE_ENRICHMENT_CONFLICT_SOURCE}'
             OR excluded.intelligence_index IS NOT NULL
             OR (excluded.benchmarks_json IS NOT NULL AND excluded.benchmarks_json != '{}')
             OR excluded.aa_slug IS NOT NULL
@@ -333,7 +349,7 @@ export class ModelIntelligenceStore {
           ELSE model_metadata.source
         END,
         fetched_at = CASE
-          WHEN excluded.source = 'model-intelligence:scope-enrichment-conflict'
+          WHEN excluded.source = '${SCOPE_ENRICHMENT_CONFLICT_SOURCE}'
             OR excluded.intelligence_index IS NOT NULL
             OR (excluded.benchmarks_json IS NOT NULL AND excluded.benchmarks_json != '{}')
             OR excluded.aa_slug IS NOT NULL
@@ -542,7 +558,7 @@ function projectCompatibilityMetadata(rows: readonly ModelMetadata[]): Compatibi
       released_at: source?.released_at ?? null,
       description: descriptions.length === 1 ? descriptions[0]! : null,
       evidence_json: JSON.stringify(evidence),
-      source: source?.source ?? "model-intelligence:scope-enrichment-conflict",
+      source: source?.source ?? SCOPE_ENRICHMENT_CONFLICT_SOURCE,
       fetched_at: group.map((row) => row.fetched_at).sort().at(-1)!,
     };
   });

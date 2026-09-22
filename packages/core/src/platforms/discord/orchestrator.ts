@@ -5387,6 +5387,8 @@ export class Orchestrator {
     const acCfg = this.store.readConfig(record);
     const acNewId = await this.seedNewSession({
       profile, restrictionChannelId: record.parentRef ?? record.channelRef, cwd,
+      location,
+      sessionId: record.id,
       ...(acCfg.model ? { model: acCfg.model } : {}),
       ...(acCfg.reasoningEffort ? { effort: acCfg.reasoningEffort } : {}),
       summary: built.seed,
@@ -5551,19 +5553,51 @@ export class Orchestrator {
       const manager = opts.sessionManager ?? profile.sessionManager;
       let rt: AgentRuntime | undefined;
       let sessionId: string | undefined;
+      // Location selects the catalog. It does not, by itself, select the
+      // machine. A remote isolated turn with no caller-supplied spawn plan
+      // uses the host planner. If that host is unreachable this turn fails;
+      // the controller's profile.spawn is not a fallback (#466, #480).
+      // Callers that already passed spawnFn (schedules, ingest, dispatch)
+      // keep their plan. Local turns still use profile.spawn.
+      let spawnFn = opts.spawnFn;
+      let mcpServers = opts.mcpServers ?? [];
+      if (!spawnFn) {
+        try {
+          const launch = this.launchForLocation({
+            profile,
+            location,
+            cwd,
+            model: selection.raw.model,
+            ...(selection.raw.effort ? { effort: selection.raw.effort } : {}),
+            mcpServers,
+            sessionId: (target && isSessionRecord(target) ? target.id : undefined)
+              ?? restrictionChannelId
+              ?? `isolated:${profile.id}`,
+          });
+          spawnFn = launch.spawnFn;
+          mcpServers = launch.mcpServers;
+        } catch (err) {
+          return settle({
+            text,
+            error: err instanceof Error ? err.message : String(err),
+            cause: err,
+            ...correlation,
+          });
+        }
+      }
       try {
         rt = new AgentRuntime({
           profile,
           logger,
-          mcpServers: opts.mcpServers ?? [],
+          mcpServers,
           // #487: isolated schedules/dispatches bypass SessionRouter's runtime
           // construction, but must consult the same child-owning bridge too.
           bridgeHealth: isLocalLocation(location) ? undefined : this.bridgeHub?.get(location)?.mux,
           ...(selection.model ? { effortDescriptor: selection.model.effort } : {}),
-          spawnFn: opts.spawnFn ?? (() => profile.spawn(
+          spawnFn: spawnFn ?? (() => profile.spawn(
             selection.raw.model,
             selection.raw.effort,
-            opts.mcpServers ?? []
+            mcpServers
           )),
         });
         await acquire(() => rt!.start());
@@ -5921,6 +5955,8 @@ export class Orchestrator {
     cwd: string;
     channel?: ChannelRef;
     restrictionChannelId?: string;
+    /** Execution host. Omitted stays local, which is only correct for a local thread. */
+    location?: string;
     onProgress?: (msg: string) => void;
   }): Promise<PremiumCompactionResult> {
     const { profile, manager, sessionId, cwd, channel, onProgress } = args;
@@ -5959,7 +5995,8 @@ export class Orchestrator {
     // xhigh, Copilot high; agy/remote have no separate knob) — fidelity is the
     // whole point of this tier.
     const runAgent = this.makeCompactionRunAgent(profile, manager, {
-      effort: this.compactionEffortFor(profile, "default", "premium"),
+      effort: this.compactionEffortFor(profile, "default", "premium", args.location ?? LOCAL_LOCATION),
+      ...(args.location ? { location: args.location } : {}),
       ...(args.restrictionChannelId ? { restrictionChannelId: args.restrictionChannelId } : {}),
     });
     return runPremiumCompaction({
@@ -6208,6 +6245,67 @@ export class Orchestrator {
    *  (unlike overwriting a JSONL with a synthetic assistant message, which hangs
    *  on `--resume`). Returns the new session id; the caller binds the thread to
    *  it and the original session is left intact (recoverable / deletable). */
+  /**
+   * Where an isolated child actually starts (#480).
+   *
+   * Refuses only this launch when a remote host has no connected bridge.
+   * Local launches, callers that already hold a spawn plan, and every other
+   * host keep working. There is no local spawn fallback: a summary written
+   * by the controller's provider would be the wrong context, and compaction
+   * persists it.
+   */
+  private launchForLocation(args: {
+    profile: AgentProfile;
+    location: string;
+    cwd: string;
+    model?: string;
+    effort?: string;
+    mcpServers?: McpServer[];
+    sessionId: string;
+  }): { spawnFn?: InjectTurnOptions["spawnFn"]; mcpServers: McpServer[] } {
+    const mcpServers = args.mcpServers ?? [];
+    if (isLocalLocation(args.location)) return { mcpServers };
+    if (!this.bridgeHub) throw new Error(`bridge "${args.location}" is not connected`);
+    const planned = planIsolatedRemoteSpawn({
+      hub: this.bridgeHub,
+      sessionId: args.sessionId,
+      location: args.location,
+      agentId: args.profile.id,
+      cwd: args.cwd,
+      ...(args.model ? { model: args.model } : {}),
+      ...(args.effort ? { effort: args.effort } : {}),
+      // The bridge loads project MCP from the execution host's cwd. Drop a
+      // controller seam entry so it cannot be forwarded as loopback.
+      globalMcpServers: mcpServers.filter((server) => server.name !== "seam-mcp"),
+    });
+    return { spawnFn: planned.spawnFn, mcpServers: planned.mcpServers };
+  }
+
+  /** Drop a throwaway analysis session on the host that created it. */
+  private async deleteThrowawaySession(args: {
+    location: string;
+    profile: AgentProfile;
+    manager?: { deleteSession?(cwd: string, sessionId: string): Promise<void> };
+    cwd: string;
+    sessionId: string;
+    label: string;
+  }): Promise<void> {
+    try {
+      if (!isLocalLocation(args.location)) {
+        await this.bridgeHub?.rpc(
+          args.location,
+          "deleteSession",
+          { cwd: args.cwd, sessionId: args.sessionId },
+          args.profile.id,
+        );
+      } else {
+        await args.manager?.deleteSession?.(args.cwd, args.sessionId);
+      }
+    } catch (err) {
+      this.logger.warn({ err, sessionId: args.sessionId }, args.label);
+    }
+  }
+
   private async seedNewSession(args: {
     profile: AgentProfile;
     restrictionChannelId: string;
@@ -6215,16 +6313,34 @@ export class Orchestrator {
     model?: string;
     effort?: string;
     summary: string;
+    /** Execution host. Omitted means local, matching a local-bound thread. */
+    location?: string;
+    /** Seam session the remote spawn token is bound to. Defaults to the channel. */
+    sessionId?: string;
     /** `null` = seed text is already complete (Rebuild). Omit for compaction lead-in. */
     leadIn?: string | null;
   }): Promise<string> {
     const { profile, restrictionChannelId, cwd, model, effort, summary } = args;
+    const location = args.location ?? LOCAL_LOCATION;
     // #308: protects compaction/rebuild seed turns; deleting it lets a direct
     // AgentRuntime construction evade the same channel allowlist as dispatch.
     this.router.assertAgentAllowedForChannel(profile.id, restrictionChannelId);
     let rt: AgentRuntime | undefined;
     try {
-      rt = new AgentRuntime({ profile, logger: this.logger.child({ compaction: "seed" }), mcpServers: [] });
+      const launch = this.launchForLocation({
+        profile,
+        location,
+        cwd,
+        ...(model ? { model } : {}),
+        ...(effort ? { effort } : {}),
+        sessionId: args.sessionId ?? restrictionChannelId,
+      });
+      rt = new AgentRuntime({
+        profile,
+        logger: this.logger.child({ compaction: "seed" }),
+        mcpServers: launch.mcpServers,
+        ...(launch.spawnFn ? { spawnFn: launch.spawnFn } : {}),
+      });
       await rt.start();
       const info = await rt.newSession({ cwd, ...(model ? { model } : {}), ...(effort ? { effort } : {}) });
       const leadIn =
@@ -6311,7 +6427,9 @@ export class Orchestrator {
     analysisExecutor: PremiumCompactionResult["analysisExecutor"];
   }> {
     const source = opts?.source ?? "session";
-    const profile = this.router.getProfile(record.agentId);
+    const described = this.router.describeConfig(record);
+    const location = described.location?.value ?? LOCAL_LOCATION;
+    const profile = this.router.getProfile(record.agentId, location) ?? this.router.getProfile(record.agentId);
     if (!profile) {
       throw new Error(`Agent profile "${record.agentId}" not found, so this thread has no compactable session.`);
     }
@@ -6355,6 +6473,7 @@ export class Orchestrator {
             sessionId,
             cwd,
             channel,
+            location,
             restrictionChannelId: record.parentRef ?? record.channelRef,
             ...(onProgress ? { onProgress } : {}),
           });
@@ -6369,6 +6488,8 @@ export class Orchestrator {
       profile,
       restrictionChannelId: record.parentRef ?? record.channelRef,
       cwd,
+      location,
+      sessionId: record.id,
       ...(cfg.model ? { model: cfg.model } : {}),
       ...(cfg.reasoningEffort ? { effort: cfg.reasoningEffort } : {}),
       summary: result.assembledSeed,
@@ -17646,35 +17767,52 @@ export class Orchestrator {
         "compact-thread: transcript assembled"
       );
 
-      transcriptFile = path.join(
-        cwd,
-        `.compact-thread-transcript-${channelRef.id}-${Date.now()}.txt`
-      );
-      await fsp.writeFile(transcriptFile, sanitizedTranscript, "utf8");
-      const compactionPrompt =
-        `${fullTemplate}\n\n` +
-        `The conversation transcript has been saved to the file: ${transcriptFile}\n` +
-        `Read that file NOW and then produce your summary. ` +
-        `The file contains ${rawMessages.length} messages (${sanitizedTranscript.length} chars). ` +
-        `You MUST read the ENTIRE file before summarizing — do not stop partway through.`;
-
-      tempRuntime = new AgentRuntime({
-        profile,
-        logger: this.logger.child({ session: `temp-compact-thread-${channelRef.id}` }),
-        mcpServers: [],
-      });
-      await tempRuntime.start();
-      await tempRuntime.newSession({
-        cwd,
-        model: compactionModel,
-        meta: { reasoningEffort: "low" },
-      });
-
       let summaryText = "";
-      tempRuntime.onEvent((event) => {
-        if (event.kind === "agent-text") summaryText += event.text;
-      });
-      await tempRuntime.prompt(compactionPrompt);
+      if (!isLocalLocation(compactLocation)) {
+        // The transcript file below lives on the controller. A remote agent
+        // cannot read it, so the fitted text goes in the prompt and the
+        // launch planner starts the child on the bound host.
+        const runAgent = this.makeCompactionRunAgent(profile, manager, {
+          model: compactionModel,
+          cwd,
+          effort: "low",
+          location: compactLocation,
+          restrictionChannelId: record.parentRef ?? record.channelRef,
+        });
+        summaryText = (await runAgent(
+          `${fullTemplate}\n\nConversation Transcript:\n${sanitizedTranscript}`,
+          "compact-thread",
+        )).trim();
+      } else {
+        transcriptFile = path.join(
+          cwd,
+          `.compact-thread-transcript-${channelRef.id}-${Date.now()}.txt`
+        );
+        await fsp.writeFile(transcriptFile, sanitizedTranscript, "utf8");
+        const compactionPrompt =
+          `${fullTemplate}\n\n` +
+          `The conversation transcript has been saved to the file: ${transcriptFile}\n` +
+          `Read that file NOW and then produce your summary. ` +
+          `The file contains ${rawMessages.length} messages (${sanitizedTranscript.length} chars). ` +
+          `You MUST read the ENTIRE file before summarizing — do not stop partway through.`;
+
+        tempRuntime = new AgentRuntime({
+          profile,
+          logger: this.logger.child({ session: `temp-compact-thread-${channelRef.id}` }),
+          mcpServers: [],
+        });
+        await tempRuntime.start();
+        await tempRuntime.newSession({
+          cwd,
+          model: compactionModel,
+          meta: { reasoningEffort: "low" },
+        });
+
+        tempRuntime.onEvent((event) => {
+          if (event.kind === "agent-text") summaryText += event.text;
+        });
+        await tempRuntime.prompt(compactionPrompt);
+      }
       if (!summaryText.trim()) {
         throw new Error("Agent completed but returned an empty summary.");
       }
@@ -17684,6 +17822,8 @@ export class Orchestrator {
         profile,
         restrictionChannelId: record.parentRef ?? record.channelRef,
         cwd,
+        location: compactLocation,
+        sessionId: record.id,
         ...(rbCfg.model ? { model: rbCfg.model } : {}),
         ...(rbCfg.reasoningEffort ? { effort: rbCfg.reasoningEffort } : {}),
         summary: summaryText,
@@ -17941,6 +18081,8 @@ export class Orchestrator {
         profile,
         restrictionChannelId: record.parentRef ?? record.channelRef,
         cwd,
+        location: described.location.value,
+        sessionId: record.id,
         ...(destinationModel ? { model: destinationModel } : {}),
         ...(described.effort?.value ? { effort: described.effort.value } : {}),
         summary: seed.text,
@@ -19044,16 +19186,24 @@ export class Orchestrator {
               // #308: protects the session-summary helper; deleting it allows
               // its direct temporary runtime to bypass the channel rule.
               this.router.assertAgentAllowedForRecord(record, profile.id);
+              const launch = this.launchForLocation({
+                profile,
+                location: sessionBinding.location,
+                cwd,
+                model: summarySelection.raw.model,
+                ...(summarySelection.raw.effort ? { effort: summarySelection.raw.effort } : {}),
+                sessionId: record.id,
+              });
               tempRuntime = new AgentRuntime({
                 profile,
                 logger: this.logger.child({ session: `temp-summary-${session.sessionId}` }),
-                mcpServers: [],
+                mcpServers: launch.mcpServers,
                 ...(summarySelection.model ? { effortDescriptor: summarySelection.model.effort } : {}),
-                spawnFn: () => profile.spawn(
+                spawnFn: launch.spawnFn ?? (() => profile.spawn(
                   summarySelection.raw.model,
                   summarySelection.raw.effort,
                   []
-                ),
+                )),
               });
 
               await tempRuntime.start();
@@ -19132,8 +19282,13 @@ export class Orchestrator {
                 const tempSessionId = tempRuntime.getSessionInfo()?.sessionId;
                 await tempRuntime.dispose().catch(() => {});
                 if (tempSessionId) {
-                  await manager.deleteSession(cwd, tempSessionId).catch((err) => {
-                    this.logger.warn({ err, sessionId: tempSessionId }, "failed to clean up temporary summary session");
+                  await this.deleteThrowawaySession({
+                    location: sessionBinding.location,
+                    profile,
+                    manager,
+                    cwd,
+                    sessionId: tempSessionId,
+                    label: "failed to clean up temporary summary session",
                   });
                 }
               }
@@ -19199,6 +19354,8 @@ export class Orchestrator {
                 const cfg = this.store.readConfig(record);
                 const newId = await this.seedNewSession({
                   profile, restrictionChannelId: record.parentRef ?? record.channelRef, cwd,
+                  location: sessionBinding.location,
+                  sessionId: record.id,
                   ...(cfg.model ? { model: cfg.model } : {}),
                   ...(cfg.reasoningEffort ? { effort: cfg.reasoningEffort } : {}),
                   summary: built.seed,
@@ -19383,10 +19540,18 @@ export class Orchestrator {
             // #308: protects the import summarizer; deleting it allows this
             // direct temporary runtime to bypass the channel rule.
             this.router.assertAgentAllowedForRecord(record, profile.id);
+            const launch = this.launchForLocation({
+              profile,
+              location: sessionBinding.location,
+              cwd: targetCwd,
+              model: compactionModel,
+              sessionId: record.id,
+            });
             tempRuntime = new AgentRuntime({
               profile,
               logger: this.logger.child({ session: `temp-import-${session.sessionId}` }),
-              mcpServers: [],
+              mcpServers: launch.mcpServers,
+              ...(launch.spawnFn ? { spawnFn: launch.spawnFn } : {}),
             });
 
             await tempRuntime.start();
@@ -19411,6 +19576,8 @@ export class Orchestrator {
             const imCfg = this.store.readConfig(record);
             const newSessionId = await this.seedNewSession({
               profile, restrictionChannelId: record.parentRef ?? record.channelRef, cwd: targetCwd,
+              location: sessionBinding.location,
+              sessionId: record.id,
               ...(imCfg.model ? { model: imCfg.model } : {}),
               ...(imCfg.reasoningEffort ? { effort: imCfg.reasoningEffort } : {}),
               summary: summaryText,
@@ -19464,11 +19631,13 @@ export class Orchestrator {
               const tempSessionId = tempRuntime.getSessionInfo()?.sessionId;
               await tempRuntime.dispose().catch(() => {});
               if (tempSessionId) {
-                await manager.deleteSession(targetCwd, tempSessionId).catch((cleanupErr) => {
-                  this.logger.warn(
-                    { err: cleanupErr, sessionId: tempSessionId },
-                    "failed to clean up temporary import session"
-                  );
+                await this.deleteThrowawaySession({
+                  location: sessionBinding.location,
+                  profile,
+                  manager,
+                  cwd: targetCwd,
+                  sessionId: tempSessionId,
+                  label: "failed to clean up temporary import session",
                 });
               }
             }
@@ -19586,10 +19755,18 @@ export class Orchestrator {
               // #308: protects the migration summarizer; deleting it allows
               // this direct temporary runtime to bypass the channel rule.
               this.router.assertAgentAllowedForRecord(record, profile.id);
+              const launch = this.launchForLocation({
+                profile,
+                location: sessionBinding.location,
+                cwd,
+                model: compactionModel,
+                sessionId: record.id,
+              });
               tempRuntime = new AgentRuntime({
                 profile,
                 logger: this.logger.child({ session: `temp-migrate-${session.sessionId}` }),
-                mcpServers: [],
+                mcpServers: launch.mcpServers,
+                ...(launch.spawnFn ? { spawnFn: launch.spawnFn } : {}),
               });
 
               await tempRuntime.start();
@@ -19619,6 +19796,8 @@ export class Orchestrator {
                 profile: targetProfile,
                 restrictionChannelId: record.parentRef ?? record.channelRef,
                 cwd,
+                location: sessionBinding.location,
+                sessionId: record.id,
                 summary: summaryText,
               });
 
@@ -19694,8 +19873,13 @@ export class Orchestrator {
                 const tempSessionId = tempRuntime.getSessionInfo()?.sessionId;
                 await tempRuntime.dispose().catch(() => {});
                 if (tempSessionId) {
-                  await manager.deleteSession(cwd, tempSessionId).catch((err) => {
-                    this.logger.warn({ err, sessionId: tempSessionId }, "failed to clean up temporary summary session");
+                  await this.deleteThrowawaySession({
+                    location: sessionBinding.location,
+                    profile,
+                    manager,
+                    cwd,
+                    sessionId: tempSessionId,
+                    label: "failed to clean up temporary migration session",
                   });
                 }
               }

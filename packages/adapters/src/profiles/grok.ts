@@ -68,9 +68,11 @@ function errorIsProbe(ctx: ClassifyContext): boolean {
 }
 
 /**
- * Journal 2026-09: 16 times, `code=null, signal=SIGILL`. Structured fields on
- * the error are what classification keys on; interpolating them only into the
- * message is how SIGILL and a clean exit became indistinguishable.
+ * Journal 2026-09: Grok 1.0.30 hit `sha512su0` unconditionally 16 times on
+ * Neoverse-N1 (`code=null, signal=SIGILL`); 1.0.40 retains that instruction but
+ * gates its AWS-LC hardware path on Linux HWCAP_SHA512. Keep the structured
+ * fields: interpolating them only into the message made SIGILL and a clean exit
+ * indistinguishable while the affected runtime was pinned to 1.0.25.
  */
 export function grokExitBeforeBillingError(
   code: number | null,

@@ -1,5 +1,6 @@
 import type Database from "better-sqlite3";
 import type { SubmissionEvidence } from "../../agents/submission-evidence.js";
+import type { RemoteRecoveryBinding, RemoteRecoveryResult } from "@seam/adapters";
 import type { DispatchResult, DispatchSpec } from "./types.js";
 import { compareExecutionIdentity } from "./execution-identity.js";
 import { deliveryNonce, type DurableDeliveryPayload } from "./delivery-proof.js";
@@ -87,6 +88,7 @@ export interface TurnAttempt {
   /** Absent means unobserved (including old adapters), never proof of health. */
   stdoutFallback?: { count: number; reasons: Record<string, number>; lastUtc: string };
   submissions?: Array<SubmissionEvidence & { generation: number }>;
+  remoteRecovery?: RemoteRecoveryBinding & { generation: number };
   providerIdentity: string | null;
   source: "dispatch" | "inbound" | "schedule";
   deliveryDone: boolean;
@@ -274,7 +276,7 @@ export class TurnAttemptStore {
     // permission to reclaim (provenDead must still reject unknown ownership).
     const evidenceOnly = runtime && typeof runtime === "object"
       && Object.keys(runtime).length > 0
-      && Object.keys(runtime).every(key => key === "stdoutFallback" || key === "submissions");
+      && Object.keys(runtime).every(key => key === "stdoutFallback" || key === "submissions" || key === "remoteRecovery");
     return row ? {
       id: row.id, generation: row.generation, ownerBoot: row.owner_boot,
       state: row.state, identity: row.identity, spec: JSON.parse(row.spec_json),
@@ -283,6 +285,7 @@ export class TurnAttemptStore {
       runtimeOwner: evidenceOnly ? null : runtime,
       stdoutFallback: runtime?.stdoutFallback,
       submissions: runtime?.submissions,
+      remoteRecovery: runtime?.remoteRecovery,
       providerIdentity: row.provider_identity,
       source: row.source, deliveryDone: row.delivery_done === 1,
       deliveryProtocol: row.delivery_protocol === 1,
@@ -383,10 +386,11 @@ export class TurnAttemptStore {
         `runtime reports provider identity ${providerIdentity ?? "(none)"} but the attempt recorded ${a.providerIdentity}`);
     }
     const owner = pid ? processOwner(pid) : null;
-    const { stdoutFallback, submissions } = this.get(a.id)!;
+    const { stdoutFallback, submissions, remoteRecovery } = this.get(a.id)!;
     this.db.prepare("UPDATE turn_attempts SET runtime_json=?, provider_identity=? WHERE id=? AND generation=? AND owner_boot=? AND state='active'")
-      .run(owner || stdoutFallback || submissions ? JSON.stringify({ ...owner,
-        ...(stdoutFallback ? { stdoutFallback } : {}), ...(submissions ? { submissions } : {}) }) : null,
+      .run(owner || stdoutFallback || submissions || remoteRecovery ? JSON.stringify({ ...owner,
+        ...(stdoutFallback ? { stdoutFallback } : {}), ...(submissions ? { submissions } : {}),
+        ...(remoteRecovery ? { remoteRecovery } : {}) }) : null,
         providerIdentity ?? null, a.id, a.generation, a.ownerBoot);
   }
 
@@ -406,7 +410,8 @@ export class TurnAttemptStore {
     return this.db.prepare(`UPDATE turn_attempts SET runtime_json=?
       WHERE id=? AND generation=? AND owner_boot=? AND state='active'`)
       .run(JSON.stringify({ ...current.runtimeOwner, stdoutFallback,
-        ...(current.submissions ? { submissions: current.submissions } : {}) }), a.id, a.generation, a.ownerBoot).changes === 1;
+        ...(current.submissions ? { submissions: current.submissions } : {}),
+        ...(current.remoteRecovery ? { remoteRecovery: current.remoteRecovery } : {}) }), a.id, a.generation, a.ownerBoot).changes === 1;
   }
 
   /** #536: extend the existing receipt, never a second synchronized ledger.
@@ -425,9 +430,53 @@ export class TurnAttemptStore {
       return this.db.prepare(`UPDATE turn_attempts SET runtime_json=?
         WHERE id=? AND generation=? AND owner_boot=? AND state='active'`)
         .run(JSON.stringify({ ...current?.runtimeOwner,
-          ...(current?.stdoutFallback ? { stdoutFallback: current.stdoutFallback } : {}), submissions }),
+          ...(current?.stdoutFallback ? { stdoutFallback: current.stdoutFallback } : {}), submissions,
+          ...(current?.remoteRecovery ? { remoteRecovery: current.remoteRecovery } : {}) }),
         a.id, a.generation, a.ownerBoot).changes === 1;
     })();
+  }
+
+  /** #467: delegation is durable before the original prompt bytes are sent.
+   * Once present, boot recovery may adopt output but must never submit again. */
+  recordRemoteRecovery(a: TurnAttempt, binding: RemoteRecoveryBinding): boolean {
+    const current = this.get(a.id);
+    if (!current) return false;
+    const remoteRecovery = { ...binding, generation: a.generation };
+    return this.db.prepare(`UPDATE turn_attempts SET runtime_json=?
+      WHERE id=? AND generation=? AND owner_boot=? AND state='active'`)
+      .run(JSON.stringify({ ...current.runtimeOwner,
+        ...(current.stdoutFallback ? { stdoutFallback: current.stdoutFallback } : {}),
+        ...(current.submissions ? { submissions: current.submissions } : {}),
+        remoteRecovery }), a.id, a.generation, a.ownerBoot).changes === 1;
+  }
+
+  /** Remove only a bridge-proven pre-write arm. The bridge refuses disarm after
+   * seeing prompt bytes, so this cannot hand an accepted submission back to
+   * the controller or authorize a resend. */
+  releaseRemoteRecovery(a: TurnAttempt, binding: RemoteRecoveryBinding): boolean {
+    return this.db.prepare(`UPDATE turn_attempts
+      SET runtime_json=json_remove(runtime_json, '$.remoteRecovery')
+      WHERE id=? AND generation=? AND owner_boot=? AND state='active'
+        AND json_extract(runtime_json, '$.remoteRecovery.submissionId')=?
+        AND json_extract(runtime_json, '$.remoteRecovery.acpSessionId')=?
+        AND json_extract(runtime_json, '$.remoteRecovery.location')=?
+        AND json_extract(runtime_json, '$.remoteRecovery.slot')=?
+        AND json_extract(runtime_json, '$.remoteRecovery.delegatedUtc')=?`)
+      .run(a.id, a.generation, a.ownerBoot, binding.submissionId,
+        binding.acpSessionId, binding.location, binding.slot, binding.delegatedUtc).changes === 1;
+  }
+
+  /** Adopt a bridge-completed result without claiming or prompting again. */
+  adoptRemoteResult(a: TurnAttempt, result: RemoteRecoveryResult, outcome: DispatchResult): boolean {
+    const binding = a.remoteRecovery;
+    if (!binding || binding.submissionId !== result.submissionId
+      || binding.acpSessionId !== result.acpSessionId
+      || binding.generation !== a.generation) return false;
+    return this.db.prepare(`UPDATE turn_attempts SET state='completed', outcome_json=?,
+      delivery_abandoned_reason=COALESCE(delivery_abandoned_reason, ?), updated_utc=?
+      WHERE id=? AND generation=? AND state='suspended' AND json_extract(runtime_json,'$.remoteRecovery.submissionId')=?`)
+      .run(JSON.stringify(outcome), suppressedOnwardDeliveryReason(outcome), new Date().toISOString(),
+        a.id, a.generation, result.submissionId).changes === 1;
   }
 
   assertCurrent(a: TurnAttempt): void {
@@ -749,6 +798,10 @@ export class TurnAttemptStore {
     }
     for (const attempt of this.list("suspended")) {
       if (attempt.source !== "dispatch" || !attempt.promptStarted) continue;
+      // A delegated attempt is still executing beside its child. Settling it
+      // to unblock later input would discard the exact bridge result #467 is
+      // responsible for adopting; pending work stays blocked on this target.
+      if (attempt.remoteRecovery) continue;
       const key = attempt.spec?.target;
       if (!key || (target !== undefined && key !== target)) continue;
       const rows = prompted.get(key) ?? [];

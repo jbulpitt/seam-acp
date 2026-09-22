@@ -56,7 +56,13 @@ import type {
   SessionRecord,
 } from "../chat-adapter.js";
 import { AgentRuntime, type AgentEventHandler, type PromptOutcome } from "../../agents/agent-runtime.js";
-import { readErrorClassification, resolveError, unclassified } from "@seam/adapters";
+import {
+  isRemoteRecoverySnapshot,
+  readErrorClassification,
+  resolveError,
+  unclassified,
+  type RemoteRecoveryResult,
+} from "@seam/adapters";
 import { DEFAULT_ERROR_RULES } from "../../core/error-resolution-rules.js";
 import { cleanTextForPreview, scanWorkspaces, type SessionSummary, type SessionSummaryLine, type ISessionManager } from "@seam/adapters";
 import type { ModelCatalogService, CatalogBinding } from "../../core/model-catalog/service.js";
@@ -960,6 +966,8 @@ export class Orchestrator {
    * Synchronous durable winner before teardown is allowed to reject prompts. */
   suspendForRestart(): void {
     this.restartCutoff = true;
+    for (const unsubscribe of this.remoteAdoptionWaiters.values()) unsubscribe();
+    this.remoteAdoptionWaiters.clear();
     this.store.turnAttempts.suspendBoot(this.attemptBoot);
     for (const phase of this.dispatchAcquisitions) phase.shutdown();
   }
@@ -1077,6 +1085,11 @@ export class Orchestrator {
   private readonly activeThreadVoiceDispatch = new Map<string, string>();
   private readonly quarantinedThreadVoiceDispatches = new Set<string>();
   private readonly interruptedDispatches = new Set<string>();
+  /** Attempts whose exact bridge result is being adopted in this process.
+   * Boot delivery reconciliation skips them so it cannot race the adopter's
+   * nonce-backed first send; every other completed attempt still recovers. */
+  private readonly adoptingRemoteResults = new Set<string>();
+  private readonly remoteAdoptionWaiters = new Map<string, () => void>();
   /** channelRef → the harness-stamped speaker id of the human turn CURRENTLY
    *  processing on that thread (#71/#57). Set at turn start when speaker identity
    *  is on and there's an author id, cleared in the turn's finally so it never
@@ -2217,12 +2230,37 @@ export class Orchestrator {
       .map((attempt) => attempt.id);
     const queuedDispatchIds = pending.map((attempt) => attempt.id);
     const retainedDispatchIds = retained.map((attempt) => attempt.id);
+    const remoteRecovery = attempts.flatMap((attempt) => {
+      const binding = attempt.remoteRecovery;
+      if (!binding) return [];
+      const observed = this.bridgeHub?.slotHealthFor(binding.location)
+        .find((health) => health.slot === binding.slot)?.recovery;
+      const exact = observed?.submissionId === binding.submissionId
+        && observed.acpSessionId === binding.acpSessionId ? observed : undefined;
+      return [{
+        attemptId: attempt.id,
+        owner: "bridge" as const,
+        location: binding.location,
+        slot: binding.slot,
+        submissionId: binding.submissionId,
+        observed: exact !== undefined,
+        ...(exact ? { phase: exact.phase, retry: exact.retry, remaining: exact.remaining,
+          ...(exact.terminalReason ? { terminalReason: exact.terminalReason } : {}) } : {}),
+      }];
+    });
+    const bridgeRecoveryDispatchIds = remoteRecovery
+      .filter((recovery) => recovery.observed
+        && recovery.phase !== "succeeded"
+        && recovery.phase !== "exhausted"
+        && recovery.phase !== "awaiting_app")
+      .map((recovery) => recovery.attemptId);
     // This is the exact #428 blockage, reported but not repaired here: a
     // prompted retained attempt prevents the pending pile behind it claiming.
     const blockedByDispatchIds = pending.length > 0
       ? retained.filter((attempt) => attempt.promptStarted).map((attempt) => attempt.id)
       : [];
-    const progressing = queue.runtimeBusy || runningDispatchIds.length > 0;
+    const progressing = queue.runtimeBusy || runningDispatchIds.length > 0
+      || bridgeRecoveryDispatchIds.length > 0;
     const state: ThreadWorkProgress["state"] = progressing
       ? "running"
       : assignedNotStartedDispatchIds.length > 0
@@ -2238,6 +2276,7 @@ export class Orchestrator {
                 : "idle";
     const nonprogressing = attempts.filter((attempt) =>
       !runningDispatchIds.includes(attempt.id)
+      && !bridgeRecoveryDispatchIds.includes(attempt.id)
     );
     const attemptAgeMs = nonprogressing.reduce((oldest, attempt) => {
       const updatedMs = Date.parse(attempt.updatedUtc);
@@ -2257,6 +2296,7 @@ export class Orchestrator {
       retainedDispatchIds,
       watcherOwnedDispatchIds,
       blockedByDispatchIds,
+      remoteRecovery,
       ageMs: Math.max(attemptAgeMs, queueAgeMs),
     };
   }
@@ -4624,7 +4664,29 @@ export class Orchestrator {
           if (afterPromptRefusal) throw afterPromptRefusal;
         }
         result = await raceWithTimeout(
-          activeRuntime.prompt(promptText, promptAttachments, { submissionEvidence }),
+          activeRuntime.prompt(promptText, promptAttachments, {
+            submissionEvidence,
+            ...(humanAttempt ? {
+              onRemoteRecovery: (binding: import("../../agents/agent-runtime.js").RemoteRecoveryDelegation) => {
+                if (!this.store.turnAttempts.recordRemoteRecovery(humanAttempt!, {
+                  ...binding,
+                  location: described.location.value,
+                })) {
+                  throw DispatchSuspendedError.superseded(humanAttempt!.id,
+                    "remote recovery binding lost inbound ownership before prompt submission");
+                }
+              },
+              onRemoteRecoveryReleased: (binding: import("../../agents/agent-runtime.js").RemoteRecoveryDelegation) => {
+                if (!this.store.turnAttempts.releaseRemoteRecovery(humanAttempt!, {
+                  ...binding,
+                  location: described.location.value,
+                })) {
+                  throw DispatchSuspendedError.superseded(humanAttempt!.id,
+                    "remote recovery handback lost inbound ownership after a pre-write failure");
+                }
+              },
+            } : {}),
+          }),
           timeoutMs,
           () => activeRuntime.lastActivityAtMs,
         );
@@ -5772,6 +5834,14 @@ export class Orchestrator {
       // outward-effect replay while live transcript continuations keep working.
       const promptOptions = { ...(opts.jsonSchema ? { jsonSchema: opts.jsonSchema } : {}),
         ...(submissionEvidence ? { submissionEvidence } : {}),
+        ...(opts.lifecycle?.onRemoteRecovery
+          ? {
+              onRemoteRecovery: opts.lifecycle.onRemoteRecovery,
+              ...(opts.lifecycle.onRemoteRecoveryReleased
+                ? { onRemoteRecoveryReleased: opts.lifecycle.onRemoteRecoveryReleased }
+                : {}),
+            }
+          : {}),
         recoveryScope: opts.session === "isolated" ? "ephemeral" as const : "conversation" as const };
       opts.noteActivity?.();
       return opts.timeoutMs === undefined
@@ -9755,6 +9825,18 @@ export class Orchestrator {
         isCurrent: () => !this.restartCutoff && this.store.turnAttempts.isCurrent(attempt),
         onStdoutFallback: code => this.recordStdoutFallback(attempt, code),
         onSubmissionEvidence: evidence => this.recordSubmissionEvidence(attempt, evidence),
+        onRemoteRecovery: (binding) => {
+          if (!this.store.turnAttempts.recordRemoteRecovery(attempt, { ...binding, location: workerLocation })) {
+            throw DispatchSuspendedError.superseded(spec.id,
+              "remote recovery binding lost attempt ownership before prompt submission");
+          }
+        },
+        onRemoteRecoveryReleased: (binding) => {
+          if (!this.store.turnAttempts.releaseRemoteRecovery(attempt, { ...binding, location: workerLocation })) {
+            throw DispatchSuspendedError.superseded(spec.id,
+              "remote recovery handback lost attempt ownership after a pre-write failure");
+          }
+        },
         acquire: async operation => {
           try { return await phase.acquire(operation); }
           catch (err) {
@@ -10662,6 +10744,18 @@ export class Orchestrator {
             !this.restartCutoff && Boolean(attempt && attemptStore.isCurrent(attempt)),
           onStdoutFallback: code => { if (attempt) this.recordStdoutFallback(attempt, code); },
           onSubmissionEvidence: evidence => { if (attempt) this.recordSubmissionEvidence(attempt, evidence); },
+          onRemoteRecovery: (binding) => {
+            if (!attempt || !attemptStore.recordRemoteRecovery(attempt, { ...binding, location })) {
+              throw DispatchSuspendedError.superseded(spec.id,
+                "remote recovery binding lost ingest ownership before prompt submission");
+            }
+          },
+          onRemoteRecoveryReleased: (binding) => {
+            if (!attempt || !attemptStore.releaseRemoteRecovery(attempt, { ...binding, location })) {
+              throw DispatchSuspendedError.superseded(spec.id,
+                "remote recovery handback lost ingest ownership after a pre-write failure");
+            }
+          },
           onRuntime: (pid, providerIdentity) => {
             try {
               if (!attempt) {
@@ -12114,6 +12208,10 @@ export class Orchestrator {
     if (saved?.settled) return;
     if (saved && prior?.state === "completed") { await this.deliverScheduledCompletion(saved, prior); return; }
     if (saved && prior?.state === "cancelled") { await this.settleScheduleCancellation(saved); return; }
+    if (saved && prior?.state === "suspended" && prior.remoteRecovery) {
+      await this.adoptRemoteRecovery(prior);
+      return;
+    }
     const occurrence = this.store.scheduledOccurrences.prepare(key, row, row => this.scheduleExecution(row));
     if (!occurrence) { this.patchScheduledStatus(row.id, "skipped: still running"); return; }
     if (occurrence.settled) return;
@@ -12614,6 +12712,18 @@ export class Orchestrator {
           isCurrent: () => !this.restartCutoff && this.store.turnAttempts.isCurrent(attempt!),
           onStdoutFallback: (code: string) => this.recordStdoutFallback(attempt!, code),
           onSubmissionEvidence: (evidence: SubmissionEvidence) => this.recordSubmissionEvidence(attempt!, evidence),
+          onRemoteRecovery: (binding) => {
+            if (!this.store.turnAttempts.recordRemoteRecovery(attempt!, { ...binding, location })) {
+              throw DispatchSuspendedError.superseded(attempt!.id,
+                "remote recovery binding lost schedule ownership before prompt submission");
+            }
+          },
+          onRemoteRecoveryReleased: (binding) => {
+            if (!this.store.turnAttempts.releaseRemoteRecovery(attempt!, { ...binding, location })) {
+              throw DispatchSuspendedError.superseded(attempt!.id,
+                "remote recovery handback lost schedule ownership after a pre-write failure");
+            }
+          },
           onRuntime: (pid: number | undefined, providerIdentity?: string) => this.store.turnAttempts.bindRuntime(attempt!, pid, providerIdentity),
           beforePrompt: () => {
             if (this.restartCutoff) {
@@ -15511,6 +15621,155 @@ export class Orchestrator {
   }
 
   /**
+   * Re-bind one suspended attempt to the bridge slot it already owns (#467).
+   *
+   * This path is read-only with respect to the provider: it never writes
+   * stdin and never constructs a prompt. The attempt ledger proves ownership;
+   * `listSlots` proves the same bridge still owns that exact submission. A
+   * mismatch retains this one attempt and never falls back to local retry.
+   */
+  private async adoptRemoteRecovery(attempt: TurnAttempt): Promise<boolean> {
+    const binding = attempt.remoteRecovery;
+    if (!binding) return false;
+    const mux = this.bridgeHub?.muxFor(binding.location);
+    if (!mux) {
+      this.deferRemoteRecoveryAdoption(attempt);
+      this.logger.info({ attempt: attempt.id, location: binding.location },
+        "remote recovery retained until its bridge reconnects");
+      return true;
+    }
+    let snapshot;
+    try {
+      const reply = await mux.sendCmd("listSlots", {}) as { health?: unknown[] };
+      snapshot = (reply.health ?? []).find((entry: unknown) => {
+        if (!entry || typeof entry !== "object") return false;
+        const row = entry as { slot?: unknown; recovery?: unknown };
+        return row.slot === binding.slot && isRemoteRecoverySnapshot(row.recovery)
+          && row.recovery.submissionId === binding.submissionId
+          && row.recovery.acpSessionId === binding.acpSessionId;
+      }) as { recovery: import("@seam/adapters").RemoteRecoverySnapshot } | undefined;
+    } catch (err) {
+      this.deferRemoteRecoveryAdoption(attempt);
+      this.logger.warn({ err, attempt: attempt.id, location: binding.location },
+        "remote recovery snapshot unavailable; attempt retained without resubmission");
+      return true;
+    }
+    if (!snapshot) {
+      this.store.turnAttempts.markStalled(attempt.id,
+        "delegated remote recovery slot/submission no longer matches the bridge snapshot; original prompt was not replayed");
+      return true;
+    }
+
+    let child;
+    try {
+      child = mux.adopt(binding.slot);
+    } catch (err) {
+      this.logger.warn({ err, attempt: attempt.id, slot: binding.slot },
+        "remote recovery slot could not be rebound; attempt retained");
+      return true;
+    }
+    this.remoteAdoptionWaiters.get(attempt.id)?.();
+    this.remoteAdoptionWaiters.delete(attempt.id);
+    this.adoptingRemoteResults.add(attempt.id);
+
+    const finalize = async (result: RemoteRecoveryResult): Promise<void> => {
+      if (result.submissionId !== binding.submissionId
+        || result.acpSessionId !== binding.acpSessionId) return;
+      const current = this.store.turnAttempts.get(attempt.id);
+      if (!current || current.state !== "suspended"
+        || current.generation !== attempt.generation
+        || current.remoteRecovery?.submissionId !== binding.submissionId) return;
+      const failed = result.status === "failed";
+      const error = failed
+        ? `remote rung-1 recovery exhausted (${result.errorKind ?? "unclassified"})`
+        : undefined;
+      const outcome: DispatchResult = {
+        id: current.id,
+        target: current.spec.target,
+        status: failed ? "failed" : "completed",
+        output: result.text,
+        stopReason: result.stopReason,
+        ...(error ? { error, workerError: error } : {}),
+        workerStatus: failed ? "failed" : "completed",
+        kind: current.spec.kind,
+        returnTo: current.spec.returnTo,
+        chainId: current.spec.chainId,
+        correlationId: current.spec.correlationId,
+        finishedUtc: result.finishedUtc,
+      };
+      if (!this.store.turnAttempts.adoptRemoteResult(current, result, outcome)) return;
+
+      const completed = this.store.turnAttempts.get(current.id);
+      if (!completed?.outcome) return;
+      if (current.source === "dispatch") {
+        await this.dispatchWatcher?.publishAdoptedResult(current.id, completed.outcome);
+      }
+
+      if (current.source === "schedule") {
+        const occurrence = this.store.scheduledOccurrences.get(current.id);
+        if (occurrence) await this.deliverScheduledCompletion(occurrence, completed);
+      } else {
+        const target: ChannelRef = { platform: PLATFORM, id: current.spec.target };
+        const body = failed
+          ? `❌ ${error}${result.text.trim() ? `\n\n${result.text}` : ""}`
+          : (result.text.trim() || "✅ Done — no output.");
+        try {
+          await this.sendTerminalAttemptDelivery(current.id, target, { kind: "message", text: body });
+          this.store.turnAttempts.markDeliveryDone(current.id);
+        } catch (err) {
+          // The completed row plus nonce-backed payload is the recovery plan.
+          this.logger.warn({ err, attempt: current.id }, "adopted remote result delivery deferred");
+        }
+      }
+
+      if (current.source === "dispatch") {
+        await this.replayCompletedDispatch(outcome,
+          completionRoute(outcome, this.store.getDelegation(current.id)));
+      } else if (current.source === "inbound") {
+        this.store.settleInboundExecution(current.id.slice("inbound-".length));
+        await finishLiveTurn(this.config.DATA_DIR, {
+          id: current.id,
+          status: failed ? "failed" : "completed",
+          channelRef: current.spec.target,
+          finishedUtc: result.finishedUtc,
+          ...(error ? { reason: error } : {}),
+        }).catch(() => {});
+      }
+      try { child.kill(); } catch { /* result is already durable */ }
+    };
+    child.on("remoteRecoveryResult", (result: RemoteRecoveryResult) => {
+      void finalize(result).catch((err) =>
+        this.logger.warn({ err, attempt: attempt.id }, "remote recovery result adoption failed"))
+        .finally(() => this.adoptingRemoteResults.delete(attempt.id));
+    });
+    child.on("error", (err) => {
+      this.adoptingRemoteResults.delete(attempt.id);
+      this.logger.warn({ err, attempt: attempt.id }, "remote recovery replay failed; attempt retained");
+    });
+    this.logger.info({ attempt: attempt.id, location: binding.location, slot: binding.slot,
+      phase: snapshot.recovery.phase, retry: snapshot.recovery.retry },
+    "rebound controller to bridge-owned rung-1 recovery");
+    return true;
+  }
+
+  private deferRemoteRecoveryAdoption(attempt: TurnAttempt): void {
+    const binding = attempt.remoteRecovery;
+    if (!binding || !this.bridgeHub || this.remoteAdoptionWaiters.has(attempt.id)) return;
+    const unsubscribe = this.bridgeHub.onBridgeReady((location) => {
+      if (location !== binding.location) return;
+      unsubscribe();
+      this.remoteAdoptionWaiters.delete(attempt.id);
+      const current = this.store.turnAttempts.get(attempt.id);
+      if (!current || current.state !== "suspended"
+        || current.generation !== attempt.generation
+        || current.remoteRecovery?.submissionId !== binding.submissionId) return;
+      void this.adoptRemoteRecovery(current).catch((err) =>
+        this.logger.warn({ err, attempt: attempt.id }, "deferred remote recovery adoption failed"));
+    });
+    this.remoteAdoptionWaiters.set(attempt.id, unsubscribe);
+  }
+
+  /**
    * Boot recovery (#76). Markers are ALWAYS reconciled (max-age / deleted
    * thread → abandon + notice). Auto-resume ("continue" + loadSession) is
    * gated by SEAM_TURN_RESUME_ENABLED — default off means unconfigured ==
@@ -15538,6 +15797,10 @@ export class Orchestrator {
         continue;
       }
       if (a) {
+        if (a.state === "suspended" && a.remoteRecovery) {
+          await this.adoptRemoteRecovery(a);
+          continue;
+        }
         if (isAwaitingReauth(a.stalledReason)) continue;
         if (a.state !== "suspended" || (a.promptStarted && !enabled)) continue;
         if (await this.checkResumePreconditions(this.inboundMessage(row).channel) !== "ok") continue;
@@ -15589,6 +15852,10 @@ export class Orchestrator {
       for (const spec of await this.dispatchWatcher.listStaleRunning()) {
         const owned = this.store.turnAttempts.get(spec.id);
         if (!owned || owned.state !== "suspended") continue;
+        if (owned.remoteRecovery) {
+          await this.adoptRemoteRecovery(owned);
+          continue;
+        }
         // Defer only opted-out prompted work. Never-started dispatches and
         // unrelated targets remain available, without original-input replay.
         if (owned.promptStarted && !enabled) continue;
@@ -15747,6 +16014,7 @@ export class Orchestrator {
     }
     for (const a of this.store.turnAttempts?.list("completed") ?? []) {
       if (a.source !== "inbound" || a.deliveryDone || !a.outcome) continue;
+      if (this.adoptingRemoteResults.has(a.id)) continue;
       const row = this.store.getInbound(a.id.slice("inbound-".length));
       if (!row || row.channelRef !== a.spec.target) continue;
       const channel = this.inboundMessage(row).channel;
@@ -15918,6 +16186,11 @@ export class Orchestrator {
   /** Operator-initiated resume from `/seam workflows` — bypasses max-age
    *  and the auto-resume flag (the operator clicked Resume). */
   async resumeTurnManually(id: string): Promise<string> {
+    const delegated = this.store.turnAttempts.get(id);
+    if (delegated?.state === "suspended" && delegated.remoteRecovery) {
+      await this.adoptRemoteRecovery(delegated);
+      return `Rebound \`${id}\` to its bridge-owned recovery; the original prompt was not sent again.`;
+    }
     const live = await this.liveTurnInventory();
     const marker = live.find((m) => m.id === id);
     if (marker) {

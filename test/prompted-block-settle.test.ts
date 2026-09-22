@@ -33,6 +33,26 @@ function spec(id: string, target = "thread-1", prompt = id): DispatchSpec {
 }
 
 describe("settleBlockedPromptedAttempts", () => {
+  it("releases only the exact bridge-proven pre-write owner", async () => {
+    const store = await attempts();
+    const drafted = spec("pre-write", "thread-a");
+    store.admit(drafted);
+    const claimed = store.claim(drafted, "identity", "boot-1");
+    const binding = {
+      version: 1 as const,
+      location: "remote-one",
+      slot: 3,
+      submissionId: "submission-pre-write",
+      acpSessionId: "acp-pre-write",
+      delegatedUtc: "2026-09-22T12:00:00.000Z",
+    };
+    expect(store.recordRemoteRecovery(claimed, binding)).toBe(true);
+    expect(store.releaseRemoteRecovery(claimed, { ...binding, submissionId: "different" })).toBe(false);
+    expect(store.get(claimed.id)?.remoteRecovery).toMatchObject(binding);
+    expect(store.releaseRemoteRecovery(claimed, binding)).toBe(true);
+    expect(store.get(claimed.id)?.remoteRecovery).toBeUndefined();
+  });
+
   const dirs: string[] = [];
   const stores: SessionStore[] = [];
   afterEach(async () => {
@@ -85,6 +105,30 @@ describe("settleBlockedPromptedAttempts", () => {
     prompted(store, "alone", "thread-a");
     expect(store.settleBlockedPromptedAttempts()).toEqual([]);
     expect(store.get("alone")?.state).toBe("suspended");
+  });
+
+  it("does not settle a bridge-owned retry to release a later dispatch", async () => {
+    const store = await attempts();
+    const drafted = spec("bridge-owned", "thread-a", "original prompt that already ran");
+    store.admit(drafted);
+    const claimed = store.claim(drafted, "identity", "boot-1");
+    store.bind(claimed, "acp-bridge");
+    store.startPrompt(claimed);
+    store.recordRemoteRecovery(claimed, {
+      version: 1,
+      location: "remote-one",
+      slot: 3,
+      submissionId: "submission-3",
+      acpSessionId: "acp-bridge",
+      delegatedUtc: "2026-09-22T12:00:00.000Z",
+    });
+    store.suspend(claimed.id, "boot-1");
+    store.admit(spec("waiting", "thread-a"));
+
+    expect(store.settleBlockedPromptedAttempts()).toEqual([]);
+    expect(store.get("bridge-owned")?.state).toBe("suspended");
+    expect(store.get("waiting")?.state).toBe("pending");
+    // Removing the remoteRecovery guard cancels the sole bridge result owner.
   });
 
   it("does not cancel a suspension that never started, even when a sibling is pending", async () => {

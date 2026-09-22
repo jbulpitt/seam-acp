@@ -17,7 +17,9 @@ import {
   ATTACH_MAX_BYTES,
   readProjectMcpServers,
   isModelFallbackPlan,
+  isRemoteRung1Policy,
   type ModelFallbackPlan,
+  type RemoteRung1Policy,
 } from "@seam/adapters";
 
 const execFileAsync = promisify(execFile);
@@ -31,6 +33,7 @@ export interface SlotSpawnConfig {
   model?: string;
   modelFallbacks?: ModelFallbackPlan;
   effort?: string;
+  rung1Recovery?: RemoteRung1Policy;
 }
 
 export interface RpcContext {
@@ -154,6 +157,12 @@ async function dispatchAdapter(
     if (params.modelFallbacks !== undefined && !modelFallbacks) {
       console.error("[bridge] unsupported or mismatched model fallback plan; keeping requested model without substitution");
     }
+    const rung1Recovery = isRemoteRung1Policy(params.rung1Recovery)
+      ? params.rung1Recovery
+      : undefined;
+    if (params.rung1Recovery !== undefined && !rung1Recovery) {
+      throw new Error("spawn received an invalid rung-1 recovery policy");
+    }
     ctx.configureSlot?.(slot, {
       agentId: str(params.agentId) ?? agentId,
       cwd,
@@ -162,12 +171,14 @@ async function dispatchAdapter(
       model: str(params.model),
       ...(modelFallbacks ? { modelFallbacks } : {}),
       effort: str(params.effort),
+      ...(rung1Recovery ? { rung1Recovery } : {}),
     });
     return {
       ok: true,
       slot,
       projectMcpInjection: true,
       projectMcpServers: projectMcpServers.map((server) => server.name),
+      ...(rung1Recovery ? { rung1RecoveryVersion: 1 } : {}),
     };
   }
 

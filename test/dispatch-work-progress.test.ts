@@ -236,6 +236,66 @@ describe("#530 composed thread work progress", () => {
     });
   });
 
+  it("reports bridge-owned retry progress from exact closed recovery facts", () => {
+    store.turnAttempts.registerOwner(OWNER);
+    const dispatch = spec("remote-retry");
+    store.turnAttempts.admit(dispatch);
+    const active = store.turnAttempts.claim(dispatch, "fixture identity", OWNER);
+    store.turnAttempts.bind(active, "acp-remote");
+    store.turnAttempts.startPrompt(active);
+    store.turnAttempts.recordRemoteRecovery(active, {
+      version: 1,
+      location: "remote-one",
+      slot: 9,
+      submissionId: "submission-9",
+      acpSessionId: "acp-remote",
+      delegatedUtc: "2026-09-22T12:00:00.000Z",
+    });
+    store.turnAttempts.suspendBoot(OWNER);
+    host.setBridgeHub({
+      slotHealthFor: () => [{
+        slot: 9,
+        alive: true,
+        pid: 123,
+        lastStdoutMsAgo: 20,
+        lastStdinMsAgo: 30,
+        recovery: {
+          version: 1,
+          owner: "bridge",
+          submissionId: "submission-9",
+          acpSessionId: "acp-remote",
+          rung: 1,
+          phase: "backoff",
+          retry: 1,
+          budget: 3,
+          remaining: 2,
+          disposition: "continue_same_session",
+          errorKind: "timeout",
+          updatedUtc: "2026-09-22T12:00:30.000Z",
+        },
+      }],
+    } as any);
+
+    expect(host.inspectThreadWorkProgress(TARGET)).toMatchObject({
+      state: "running",
+      progressing: true,
+      runtimeBusy: false,
+      remoteRecovery: [{
+        attemptId: "remote-retry",
+        owner: "bridge",
+        location: "remote-one",
+        slot: 9,
+        submissionId: "submission-9",
+        observed: true,
+        phase: "backoff",
+        retry: 1,
+        remaining: 2,
+      }],
+    });
+    // Mutation proof: dropping the exact bridge snapshot makes this retained,
+    // not progressing; the ledger binding alone is never treated as liveness.
+  });
+
   it("preserves ordinary live-runtime progress with no dispatch row", () => {
     runtimeBusy = true;
     expect(host.inspectThreadWorkProgress(TARGET)).toMatchObject({

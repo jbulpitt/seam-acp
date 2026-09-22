@@ -10,14 +10,16 @@
  * ## Why there is no `midTurn` here
  *
  * The story offered it and the manifesto's rule decides against it: one owner
- * per fact, and the owner is whoever observes it directly. The bridge is a
- * byte mux — it forwards frames and never parses ACP, so it cannot observe a
- * `session/prompt` begin or end. To report `midTurn` it would have to INFER
+ * per fact, and the owner is whoever observes it directly. Before #467 the
+ * bridge was a byte mux and could not observe a `session/prompt` begin or end.
+ * #467 adds a narrow parser only for an explicitly delegated submission;
+ * ordinary slot health still has no such authority. To report `midTurn` it
+ * would have to INFER
  * from "stdin arrived and stdout has not", which re-derives a fact seam-acp
  * already holds authoritatively, one layer further from the evidence. That is
  * the bug this epic exists to remove, not a way to fix it.
  *
- * So the bridge reports only what it sees — `alive`, `pid`, and the two
+ * So ordinary slot health reports only what it sees — `alive`, `pid`, and the two
  * silences — and `lastStdinMsAgo` is what makes the seam-acp-side judgement
  * possible: silence *since input* is suspicious, silence with no input is
  * just an idle agent.

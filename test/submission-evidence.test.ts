@@ -76,7 +76,7 @@ async function runtimeFixture(fault: "before" | "accepted" | "effect" | "update"
   return { ...h, runtime, prompts, effects: () => effects, releaseNewSessionWrite: () => releaseNewSessionWrite?.() };
 }
 
-describe("#536 evidence, not retry policy", () => {
+describe("#536 evidence with #467's acceptance-scoped retry policy", () => {
   // Without the pre-call receipt, a crash before runtime.prompt disappears from the inventory.
   it("retains intent/unknown before submission and survives reopening", () => {
     const h = storeFixture(), evidence = newSubmissionEvidence("session");
@@ -99,7 +99,7 @@ describe("#536 evidence, not retry policy", () => {
     const [first, second] = h.store.turnAttempts.get("job")!.submissions!;
     expect(h.prompts).toHaveLength(1);
     expect(first).toMatchObject({ outcome: "failed", failure: { kind: "server_error" } });
-    expect(second).toMatchObject({ phase: "intent", outcome: "not_sent", retry: { number: 1, mode: "resend" },
+    expect(second).toMatchObject({ phase: "intent", outcome: "not_sent", retry: { number: 1, mode: "continue" },
       acceptance: { state: "not_accepted", reason: "rpc_never_invoked" } });
     expect(second!.localWriteCompletedUtc).toBeUndefined();
   });
@@ -128,7 +128,7 @@ describe("#536 evidence, not retry policy", () => {
   });
 
   // A supported feed must reach durable storage; wrapper activity must not become billing proof or alter sawUpdate.
-  it("records the supported Claude feed after acceptance without changing resend policy", async () => {
+  it("records the supported Claude feed and continues rather than resending accepted work", async () => {
     const h = await runtimeFixture("accepted");
     await h.runtime.prompt("PRIVATE ORIGINAL");
     const [first, second] = h.store.turnAttempts.get("job")!.submissions!;
@@ -136,20 +136,22 @@ describe("#536 evidence, not retry policy", () => {
       acceptance: { state: "unknown", scope: "provider_submission" },
       providerMessage: { state: "accepted", scope: "provider_message_started", correlation: "active_session_window", lastId: "msg-1" },
       wrapperCommand: { scope: "claude_wrapper_command_lifecycle", lastId: "cmd-1", lastState: "started" } });
-    expect(second).toMatchObject({ outcome: "completed", retry: { mode: "resend", previousSubmissionId: first!.id } });
-    expect(h.prompts.map(p => p.prompt)).toEqual(Array(2).fill([{ type: "text", text: "PRIVATE ORIGINAL" }]));
+    expect(second).toMatchObject({ outcome: "completed", retry: { mode: "continue", previousSubmissionId: first!.id } });
+    expect(h.prompts[1].prompt).not.toEqual(h.prompts[0].prompt);
     expect(JSON.stringify([first, second])).not.toMatch(/PRIVATE/);
   });
 
-  // This deliberately preserves the known duplicate: deleting its assertion could hide a retry-policy change.
-  it("records unknown after an effect whose notification was lost; the unchanged retry duplicates it", async () => {
+  // Unknown acceptance cannot authorize a billable resend. Continuing may be
+  // useless when nothing ran, but that is cheaper and recoverable (#467).
+  it("continues after an effect whose acceptance notification was lost", async () => {
     const h = await runtimeFixture("effect", "codex");
     await h.runtime.prompt("PRIVATE ORIGINAL");
     expect(h.effects()).toBe(2);
     expect(h.store.turnAttempts.get("job")!.submissions).toMatchObject([
       { outcome: "failed", acceptance: { state: "unknown" }, providerMessage: { state: "unknown" }, observedUpdateTypes: [] },
-      { outcome: "completed", acceptance: { state: "unknown" }, retry: { mode: "resend" } },
+      { outcome: "completed", acceptance: { state: "unknown" }, retry: { mode: "continue" } },
     ]);
+    expect(h.prompts[1].prompt).not.toEqual(h.prompts[0].prompt);
   });
 
   // No signal is a useful answer; deleting this would let success masquerade as acceptance telemetry.

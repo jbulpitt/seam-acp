@@ -596,6 +596,13 @@ export class DispatchWatcher {
     });
   }
 
+  /** Publish an adopted bridge result without entering the provider again.
+   * SQL already owns the terminal outcome; this repairs only its filesystem
+   * projection and leaves every other dispatch runnable. */
+  async publishAdoptedResult(id: string, result: DispatchResult): Promise<void> {
+    await this.withArtifact(id, () => this.finishLocked(id, result));
+  }
+
   /**
    * Synchronously revoke every current claim for a target and block new ones.
    * The caller must do this before its first await, then retain the returned

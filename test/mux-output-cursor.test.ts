@@ -76,6 +76,41 @@ async function reconnect(ws: FakeWs, liveSlots: number[]) {
 }
 
 describe("#444 the cursor is what survives a disconnect", () => {
+  it("#467 rebinds an existing slot and replays its exact recovery result without input", async () => {
+    const ws = new FakeWs();
+    const mux = makeMux({ id: "b1" });
+    mux.attach(ws as never);
+    const child = mux.adopt(12);
+    const results: unknown[] = [];
+    child.on("remoteRecoveryResult", (result) => results.push(result));
+    child.stdin.write("must never reach the pre-restart child\n");
+    await flush();
+
+    const replay = ws.cmds("replayOutput").at(-1)!;
+    expect(replay.payload).toEqual({ slot: 12, afterSeq: 0 });
+    expect(ws.sent.filter((frame) => frame.type === "data" || frame.type === "spawn")).toEqual([]);
+    ws.reply(replay, {
+      slot: 12,
+      frames: [{ seq: 3, type: "recovery_result", recoveryResult: {
+        version: 1,
+        submissionId: "submission-12",
+        acpSessionId: "session-12",
+        status: "completed",
+        text: "adopted result",
+        finishedUtc: "2026-09-22T12:00:00.000Z",
+      } }],
+    });
+    await flush();
+
+    expect(results).toEqual([expect.objectContaining({
+      submissionId: "submission-12",
+      text: "adopted result",
+    })]);
+    // This is result adoption, never resubmission: removing `adopt()` strands
+    // the frame; replacing it with `spawn()` emits provider-bound input.
+    expect(ws.sent.filter((frame) => frame.type === "data" || frame.type === "spawn")).toEqual([]);
+  });
+
   it("#431 continues an in-flight slot after a real socket replacement without replaying its prompt", async () => {
     const disconnects: string[] = [];
     const { ws, mux, child, chunks } = harness({

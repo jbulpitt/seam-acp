@@ -678,6 +678,20 @@ export interface ThreadWorkProgress {
    * ownership, not by itself evidence that a provider prompt has started. */
   watcherOwnedDispatchIds: string[];
   blockedByDispatchIds: string[];
+  /** Bridge-owned rung-1 facts for attempts already delegated before a
+   * controller restart. No prompt, raw diagnostic, or inferred liveness. */
+  remoteRecovery: Array<{
+    attemptId: string;
+    owner: "bridge";
+    location: string;
+    slot: number;
+    submissionId: string;
+    observed: boolean;
+    phase?: import("@seam/adapters").RemoteRecoveryPhase;
+    retry?: number;
+    remaining?: number;
+    terminalReason?: import("@seam/adapters").RemoteRecoverySnapshot["terminalReason"];
+  }>;
   /** Age of the oldest non-progressing durable observation, or zero. */
   ageMs: number;
 }

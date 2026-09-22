@@ -17,7 +17,7 @@
 import type { AgentProfile } from "@seam/adapters";
 import type { SubmissionEvidence } from "../agents/submission-evidence.js";
 import type { McpServer } from "@agentclientprotocol/sdk";
-import type { AgentEventHandler } from "../agents/agent-runtime.js";
+import type { AgentEventHandler, RemoteRecoveryDelegation } from "../agents/agent-runtime.js";
 import type { ISessionManager } from "@seam/adapters";
 import type { ChannelRef, MessageAttachment } from "../platforms/chat-adapter.js";
 import type { SessionRecord } from "./types.js";
@@ -124,6 +124,11 @@ export interface InjectTurnOptions {
     /** Observational only: a telemetry failure must not fail a successful turn. */
     onStdoutFallback?(code: string): void;
     onSubmissionEvidence?(evidence: SubmissionEvidence): void;
+    /** Must durably bind the slot/submission before bridge ownership activates. */
+    onRemoteRecovery?(binding: RemoteRecoveryDelegation): void | Promise<void>;
+    /** Exact pre-write handback. A false/ambiguous bridge response must retain
+     * ownership instead, so this may only remove the supplied binding. */
+    onRemoteRecoveryReleased?(binding: RemoteRecoveryDelegation): void | Promise<void>;
     beforePrompt(): SubmissionEvidence | void;
     onOutcome(result: InjectTurnResult): void;
     /** Read-only attribution hook before isolated disposal, including failures. */

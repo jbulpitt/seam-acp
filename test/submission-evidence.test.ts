@@ -219,14 +219,21 @@ describe("#536 evidence with #467's acceptance-scoped retry policy", () => {
   it("attributes a queued write to its original request, not the current retry", async () => {
     const h = await runtimeFixture("none", "codex", true);
     let retryInvoked!: () => void;
+    let originalInterrupted = false;
     const retryReady = new Promise<void>(resolve => { retryInvoked = resolve; });
     h.runtime.onEvent(event => {
       if (event.kind !== "submission-evidence") return;
       h.store.turnAttempts.recordSubmission(h.attempt, event.evidence);
       if (event.evidence.phase !== "rpc_invoked") return;
       if (event.evidence.retry) retryInvoked();
-      else setImmediate(() => (h.runtime as any).rejectInFlightPrompt(
-        RequestError.internalError({ errorKind: "server_error", agentId: "codex" }, "interrupted queued write")));
+      else if (!originalInterrupted) {
+        // The same mutable receipt is published more than once. Schedule one
+        // interruption only; a duplicate callback can otherwise run after the
+        // prompt's finally block has cleared rejectInFlightPrompt.
+        originalInterrupted = true;
+        setImmediate(() => (h.runtime as any).rejectInFlightPrompt(
+          RequestError.internalError({ errorKind: "server_error", agentId: "codex" }, "interrupted queued write")));
+      }
     });
     const turn = h.runtime.prompt("PRIVATE ORIGINAL");
     await retryReady;

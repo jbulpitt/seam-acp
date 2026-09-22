@@ -46,6 +46,16 @@ export interface OomEvidenceTracker {
   cancel(): void;
 }
 
+export interface OomEvidenceRegistry {
+  attach(slot: number, rootPid: number | undefined): void;
+  drop(slot: number): void;
+  exitPayload(
+    slot: number,
+    payload: Record<string, unknown>,
+    abnormal: boolean,
+  ): Promise<Record<string, unknown>>;
+}
+
 interface TrackerOptions {
   now?: () => number;
   sampleIntervalMs?: number;
@@ -235,6 +245,41 @@ export function createOomEvidenceTracker(
         return match ? { kind: "host_oom", ...match } : undefined;
       })();
       return finished;
+    },
+  };
+}
+
+/**
+ * Per-slot owner for publication as well as collection. Keeping the
+ * `hostOom` field here makes the production exit path executable in tests;
+ * when publication lived as a spread in the CLI entrypoint, deleting that
+ * exact line survived every behavioural test even though the diagnosis was
+ * then lost on the wire.
+ */
+export function createOomEvidenceRegistry(options: {
+  trackerFactory?: (rootPid: number | undefined) => OomEvidenceTracker;
+} = {}): OomEvidenceRegistry {
+  const factory = options.trackerFactory ?? ((pid) => createOomEvidenceTracker(pid));
+  const trackers = new Map<number, OomEvidenceTracker>();
+  return {
+    attach(slot, rootPid) {
+      trackers.get(slot)?.cancel();
+      trackers.set(slot, factory(rootPid));
+    },
+    drop(slot) {
+      trackers.get(slot)?.cancel();
+      trackers.delete(slot);
+    },
+    async exitPayload(slot, payload, abnormal) {
+      const tracker = trackers.get(slot);
+      trackers.delete(slot);
+      if (!tracker) return payload;
+      if (!abnormal) {
+        tracker.cancel();
+        return payload;
+      }
+      const hostOom = await tracker.finish();
+      return hostOom ? { ...payload, hostOom } : payload;
     },
   };
 }

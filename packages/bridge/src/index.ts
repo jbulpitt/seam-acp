@@ -58,7 +58,7 @@ import { dispatchBridgeRpc, type SlotSpawnConfig } from "./rpc.js";
 import { slotHealthSnapshot } from "./slot-health.js";
 import { collectHangEvidence, createProbeGate, readLiveProviderSocket } from "./hang-probe.js";
 import { createOutputLog, createLineFramer } from "./output-log.js";
-import { createOomEvidenceTracker, type OomEvidenceTracker } from "./oom-evidence.js";
+import { createOomEvidenceRegistry } from "./oom-evidence.js";
 import { createStderrRegistry } from "./stderr-ring.js";
 import { spawnRefusalFrame } from "./resolve-adapter.js";
 import { spawnAgent } from "./spawn-agent.js";
@@ -226,7 +226,7 @@ function makeSlotManager(opts: {
   const stderrRegistry = createStderrRegistry();
   /** #516: exact descendant ownership while the child is alive. Kernel OOM
    * evidence is useful only when its killed pid was observed in this tree. */
-  const oomTrackers = new Map<number, OomEvidenceTracker>();
+  const oomEvidence = createOomEvidenceRegistry();
   const slotInputRewriters = new Map<number, BridgeMcpInputRewriter>();
   /**
    * #443: absorbs the hang-probe response so it never becomes a turn error.
@@ -300,7 +300,7 @@ function makeSlotManager(opts: {
       return null;
     }
     slots.set(slot, agent);
-    oomTrackers.set(slot, createOomEvidenceTracker(agent.pid));
+    oomEvidence.attach(slot, agent.pid);
     slotInputRewriters.set(
       slot,
       new BridgeMcpInputRewriter(slotConfigs.get(slot)?.mcpServers ?? [])
@@ -336,8 +336,7 @@ function makeSlotManager(opts: {
       slots.delete(slot);
       slotInputRewriters.delete(slot);
       probes.close(slot);
-      oomTrackers.get(slot)?.cancel();
-      oomTrackers.delete(slot);
+      oomEvidence.drop(slot);
       flushFramer(slot);
       // A spawn error is abnormal by definition, so the tail goes out with it.
       muxSend(currentWs, WebSocket, slot, "exit", stderrRegistry.exitPayload(slot, 1, null), outputLog);
@@ -351,25 +350,15 @@ function makeSlotManager(opts: {
       slotInputRewriters.delete(slot);
       probes.close(slot);
       flushFramer(slot);
-      const tracker = oomTrackers.get(slot);
-      oomTrackers.delete(slot);
       const payload = stderrRegistry.exitPayload(slot, code, signal);
       const abnormal = (code !== 0 && code !== null) || signal != null;
-      if (!abnormal || !tracker) {
-        tracker?.cancel();
-        muxSend(currentWs, WebSocket, slot, "exit", payload, outputLog);
-        return;
-      }
       // #516: code=1 from an ACP wrapper is not evidence that the wrapper was
       // the kernel victim. Match a recent kernel OOM record to a pid this
       // slot's process tree actually owned, then emit only the closed fact.
       // The query is bounded; failure refuses this diagnosis alone and the
       // ordinary exit frame still goes out.
-      void tracker.finish().then((hostOom) => {
-        muxSend(currentWs, WebSocket, slot, "exit", {
-          ...payload,
-          ...(hostOom ? { hostOom } : {}),
-        }, outputLog);
+      void oomEvidence.exitPayload(slot, payload, abnormal).then((exitPayload) => {
+        muxSend(currentWs, WebSocket, slot, "exit", exitPayload, outputLog);
       });
     });
 
@@ -713,8 +702,7 @@ function makeSlotManager(opts: {
         // otherwise read as abnormal and ship a tail for a death seam-acp
         // asked for. Dropping the ring first keeps a deliberate kill quiet.
         stderrRegistry.drop(msg.slot);
-        oomTrackers.get(msg.slot)?.cancel();
-        oomTrackers.delete(msg.slot);
+        oomEvidence.drop(msg.slot);
         slotConfigs.delete(msg.slot);
         slotInputRewriters.delete(msg.slot);
         probes.close(msg.slot);

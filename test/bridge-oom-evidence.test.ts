@@ -1,5 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { readFileSync } from "node:fs";
+import path from "node:path";
+import { describe, expect, it, vi } from "vitest";
 import {
+  createOomEvidenceRegistry,
   createOomEvidenceTracker,
   parseKernelOomRecords,
   type KernelOomRecord,
@@ -62,5 +65,34 @@ describe("#516 bridge-owned kernel OOM evidence", () => {
     await tracker.sampleNow();
     now = 1_790_033_600_000;
     await expect(tracker.finish()).resolves.toBeUndefined();
+  });
+
+  it("publishes the matched fact through the per-slot production registry", async () => {
+    const hostOom = {
+      kind: "host_oom" as const,
+      killedPid: 221249,
+      observedAt: 1_790_033_574_259,
+      scope: "global" as const,
+    };
+    const finish = vi.fn(async () => hostOom);
+    const cancel = vi.fn();
+    const registry = createOomEvidenceRegistry({ trackerFactory: () => ({
+      sampleNow: async () => {},
+      finish,
+      cancel,
+    }) });
+    registry.attach(7, 100);
+    await expect(registry.exitPayload(7, { code: 1 }, true)).resolves.toEqual({ code: 1, hostOom });
+    expect(finish).toHaveBeenCalledOnce();
+    await expect(registry.exitPayload(7, { code: 1 }, true)).resolves.toEqual({ code: 1 });
+  });
+
+  it("keeps the unimportable bridge CLI wired through the tested registry", () => {
+    // index.ts invokes the CLI on import, so it cannot be executed in-process.
+    // The registry above owns the behaviour; this narrow contract pins its one
+    // production call site after deleting that call survived mutation.
+    const source = readFileSync(path.resolve("packages/bridge/src/index.ts"), "utf8");
+    expect(source).toMatch(/oomEvidence\.exitPayload\(slot, payload, abnormal\)\.then\(\(exitPayload\) => \{/);
+    expect(source).toContain('muxSend(currentWs, WebSocket, slot, "exit", exitPayload, outputLog)');
   });
 });

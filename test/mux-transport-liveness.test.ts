@@ -18,9 +18,13 @@
  * path actually looks like.
  */
 import { createServer, type Server } from "node:http";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { WebSocket, WebSocketServer } from "ws";
-import { makeMux, BridgeUnreachableError } from "@seam/adapters";
+import {
+  makeMux,
+  BridgeUnreachableError,
+  type BridgeLivenessTimeout,
+} from "@seam/adapters";
 
 const servers: Server[] = [];
 const sockets: WebSocket[] = [];
@@ -43,6 +47,7 @@ async function connectedPair(liveness?: {
   serverWs: WebSocket;
   clientWs: WebSocket;
   events: string[];
+  livenessTimeouts: BridgeLivenessTimeout[];
 }> {
   const http = createServer();
   servers.push(http);
@@ -51,25 +56,32 @@ async function connectedPair(liveness?: {
   const port = (http.address() as { port: number }).port;
 
   const events: string[] = [];
+  const livenessTimeouts: BridgeLivenessTimeout[] = [];
   const mux = makeMux({
     id: "test-bridge",
     onDisconnect: () => events.push("disconnect"),
-    onLivenessTimeout: () => events.push("liveness-timeout"),
+    onLivenessTimeout: (event) => {
+      events.push("liveness-timeout");
+      livenessTimeouts.push(event);
+    },
     ...(liveness ? { liveness } : {}),
   } as never);
 
+  let clientWs!: WebSocket;
   const serverWs = await new Promise<WebSocket>((resolve) => {
     wss.on("connection", (ws) => resolve(ws as never));
-    const c = new WebSocket(`ws://127.0.0.1:${port}`);
+    clientWs = new WebSocket(`ws://127.0.0.1:${port}`);
     // Teardown terminates these; a socket still mid-handshake then emits
     // "closed before the connection was established", which vitest counts as
     // an unhandled error even though every test passed. Own it here.
-    c.on("error", () => {});
-    sockets.push(c as never);
+    clientWs.on("error", () => {});
+    sockets.push(clientWs as never);
   });
-  const clientWs = [...wss.clients][0] as never as WebSocket;
+  if (clientWs.readyState !== WebSocket.OPEN) {
+    await new Promise<void>((resolve) => clientWs.once("open", resolve));
+  }
   mux.attach(serverWs as never);
-  return { mux, serverWs, clientWs, events };
+  return { mux, serverWs, clientWs, events, livenessTimeouts };
 }
 
 const settled = async <T>(p: Promise<T>): Promise<unknown> =>
@@ -85,18 +97,31 @@ describe("#427 a half-open socket is detected and terminated", () => {
     // `readyState` stays OPEN and nothing would ever close it. Pausing the
     // underlying socket stops the library's automatic pong without sending
     // anything, which is exactly what a vanished TCP path looks like.
-    const { serverWs, clientWs, events } = await connectedPair(FAST);
+    const { mux, serverWs, clientWs, events, livenessTimeouts } = await connectedPair(FAST);
     expect(serverWs.readyState).toBe(WebSocket.OPEN);
     const closed = new Promise<void>((r) => serverWs.once("close", () => r()));
+    const farSideClosed = new Promise<number>((r) => clientWs.once("close", r));
+    const child = mux.spawn();
+    const childExit = vi.fn();
+    child.on("exit", childExit);
 
     (clientWs as never as { _socket: { pause(): void } })._socket.pause();
 
     await closed;
     expect(events).toContain("liveness-timeout");
+    expect(livenessTimeouts).toHaveLength(1);
+    expect(livenessTimeouts[0]!.observedSilenceMs).toBeGreaterThanOrEqual(90);
+    expect(livenessTimeouts[0]!.unansweredProbeMs).toBeGreaterThanOrEqual(40);
     expect(serverWs.readyState).not.toBe(WebSocket.OPEN);
+    (clientWs as never as { _socket: { resume(): void } })._socket.resume();
+    expect(await farSideClosed).toBe(1006);
     // `close` fired, which is the event the client's existing reconnect waits
     // for — the whole reason terminate() is used rather than close().
     expect(events).toContain("disconnect");
+    // Losing the transport is not itself an agent exit. The fake child stays
+    // available for same-instance reconnect/replay instead of becoming the
+    // bare `agent_exit` that #436 asked us to distinguish.
+    expect(childExit).not.toHaveBeenCalled();
   }, 15_000);
 
   it("fails an RPC issued on a dying socket as unreachable, not as a timeout", async () => {

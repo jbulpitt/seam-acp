@@ -3,6 +3,7 @@ export { makeMux, BridgeUnreachableError } from "./mux.js";
 export type {
   MuxSpawnOpts,
   MuxChild,
+  BridgeLivenessTimeout,
   RemoteExitEvidence,
   RemoteHostOomEvidence,
 } from "./mux.js";

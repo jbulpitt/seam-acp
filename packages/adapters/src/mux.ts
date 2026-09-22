@@ -93,6 +93,14 @@ export interface BridgeSlotHealth {
   lastStdinMsAgo: number | null;
 }
 
+/** Facts captured at the instant the server gives up on one bridge socket. */
+export interface BridgeLivenessTimeout {
+  /** Total time since the server last received any frame, ping, or pong. */
+  observedSilenceMs: number;
+  /** Time elapsed since the server's active WebSocket ping went unanswered. */
+  unansweredProbeMs: number;
+}
+
 export class BridgeUnreachableError extends Error {
   readonly bridgeUnreachable = true;
   /**
@@ -279,8 +287,8 @@ export function makeMux(opts: {
    * on whether a prompt is outstanding, and that fact lives in seam-acp.
    */
   onSlotHealth?: (health: readonly BridgeSlotHealth[]) => void;
-  /** #427: fired when liveness terminates a socket, before `close`. */
-  onLivenessTimeout?: () => void;
+  /** #436: fired when liveness terminates a socket, before `close`. */
+  onLivenessTimeout?: (event: BridgeLivenessTimeout) => void;
   /**
    * #427: liveness timings, overridable so a test can drive the REAL monitor
    * on real timers in milliseconds instead of waiting out the production
@@ -449,12 +457,18 @@ export function makeMux(opts: {
         const now = Date.now();
         if (probeSentAt !== null) {
           if (now - probeSentAt >= graceMs) {
-            opts.onLivenessTimeout?.();
-            // terminate(), not close(): close() writes a frame and waits for a
-            // reply that a half-open peer will never send, which is the same
-            // hang one level down. terminate() destroys the socket locally and
-            // fires `close`, which is the event the client's reconnect needs.
-            newWs.terminate();
+            try {
+              opts.onLivenessTimeout?.({
+                observedSilenceMs: now - lastSeenAt,
+                unansweredProbeMs: now - probeSentAt,
+              });
+            } finally {
+              // terminate(), not close(): close() writes a frame and waits for a
+              // reply that a half-open peer will never send, which is the same
+              // hang one level down. terminate() destroys the socket locally and
+              // fires `close`, which is the event the client's reconnect needs.
+              newWs.terminate();
+            }
           }
           return;
         }

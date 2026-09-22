@@ -72,7 +72,10 @@ function profileFor(harness: Harness) {
 
 function runStoreWriter(file: string, sessionId: string): Promise<void> {
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [storeWriter, file, sessionId], {
+    // The child exists to prove cross-PROCESS lock ownership, not package
+    // emission. Run the TypeScript source through the repository's existing
+    // loader so a fresh worktree does not require adapters/dist first (#547).
+    const child = spawn(process.execPath, ["--import", "tsx", storeWriter, file, sessionId], {
       stdio: ["ignore", "ignore", "pipe"],
     });
     let stderr = "";

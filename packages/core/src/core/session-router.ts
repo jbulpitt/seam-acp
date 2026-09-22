@@ -940,6 +940,8 @@ export class SessionRouter {
   ): Promise<"idle" | "cancelled" | "killed"> {
     const rt = this.runtimes.get(sessionId);
     if (!rt) return "idle";
+    // Outstanding prompt RPC, including one `turnHealth` already calls stalled.
+    // `isBusy` would read idle here and skip the force-kill.
     const wasBusy = rt.busy;
     await rt.cancel().catch(() => {});
     this.logger.info({ sessionId }, "sent cancel signal to agent runtime");

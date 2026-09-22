@@ -2810,8 +2810,8 @@ export class SeamMcpServer {
       lines.push(
         `• ${name} — id ${t.id} [${flags.join(", ")}]` +
           (cfg ? `\n    identity: ${cfg}${t.cwd ? ` @ ${t.cwd}` : ""}` : "") +
-          (t.queueState === "stalled"
-            ? `\n    retained dispatches (does NOT block handoff — this thread is dispatchable): ${(t.stalledDispatchIds ?? []).join(", ") || t.stalledDispatchCount || "unknown"}; /seam workflows can resume or abandon them`
+          (t.queueState === "stalled" && ((t.stalledDispatchCount ?? 0) > 0 || (t.stalledDispatchIds?.length ?? 0) > 0)
+            ? `\n    retained dispatches (does NOT block handoff — this thread is dispatchable): ${(t.stalledDispatchIds ?? []).join(", ") || t.stalledDispatchCount}; /seam workflows can resume or abandon them`
             : "") +
           // #419: reported whatever the queue state says. An unsettled
           // completion holds admission while the thread still looks merely

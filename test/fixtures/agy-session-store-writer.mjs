@@ -13,8 +13,12 @@ fs.rename = async (...args) => {
   return rename(...args);
 };
 
+// This fixture exercises independent OS-process ownership of the store. It is
+// intentionally source-backed: package build output is not part of that
+// contract, and requiring it made a fresh-worktree setup error look like a
+// timing failure (#547). The parent supplies the repository's `tsx` loader.
 const { AgySessionStore } = await import(
-  "../../packages/adapters/dist/agy-session-store.js"
+  "../../packages/adapters/src/agy-session-store.ts"
 );
 const store = new AgySessionStore(file);
 await store.put(sessionId, {

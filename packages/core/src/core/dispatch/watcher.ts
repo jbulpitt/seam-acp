@@ -285,15 +285,20 @@ export class DispatchWatcher {
     }
   }
 
-  /** Create the projection dirs, retire proven-dead SQL owners, then
-   * start polling. Callers may arm boot reconciliation plus the first dispatch
-   * pass in the background; admission stays closed until reconciliation ends. */
+  /** Create the projection dirs, make already-accepted ingress visible in
+   * SQL, retire proven-dead owners, then start polling. Callers may arm boot
+   * reconciliation plus the first dispatch pass in the background; admission
+   * stays closed until reconciliation ends. Visibility does not. */
   async start(opts: DispatchWatcherStartOpts = {}): Promise<void> {
     const lifecycleEpoch = ++this.lifecycleEpoch;
     for (const dir of [this.dirs.pending, this.dirs.running, this.dirs.done]) {
       await mkdir(dir, { recursive: true }).catch(err =>
         this.logger.warn({ dir, err }, "dispatch: filesystem contract unavailable; admitted SQL work remains available"));
     }
+    // Files accepted by a process that died before `admit` are invisible until
+    // the first claim. Claim waits out boot recovery. Materialize the pending
+    // rows first, so a query during that wait sees `pending` rather than nothing.
+    await this.materializePendingIngress();
     // SINGLE-INSTANCE ASSUMPTION: recovery assumes no other seam-acp process
     // owns these specs. Two processes on one DATA_DIR would double-resume.
     this.attempts.retireDeadOwners();
@@ -705,6 +710,34 @@ export class DispatchWatcher {
       });
     } finally {
       this.quarantined.delete(id);
+    }
+  }
+
+  /** Turn durable ingress into `pending` rows without claiming it. */
+  private async materializePendingIngress(): Promise<void> {
+    let names: string[];
+    try {
+      names = await this.readDir(this.dirs.pending);
+    } catch (err) {
+      this.logger.warn({ err }, "dispatch: pending ingress unreadable; visibility waits for a later scan");
+      return;
+    }
+    for (const name of names) {
+      if (!name.endsWith(".json") || name.startsWith(".")) continue;
+      const id = name.slice(0, -".json".length);
+      try {
+        if (this.attempts.get(id) || this.isCompleted(id)) continue;
+        try {
+          await access(path.join(this.dirs.done, name));
+          continue;
+        } catch {
+          // No done-file. A missing one is not completion.
+        }
+        const spec = parseDispatchSpec(id, await readFile(path.join(this.dirs.pending, name), "utf8"));
+        this.attempts.admit(spec);
+      } catch (err) {
+        this.logger.warn({ id, err }, "dispatch: pending ingress left unreadable; not invented as an attempt");
+      }
     }
   }
 

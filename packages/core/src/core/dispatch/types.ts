@@ -626,10 +626,16 @@ export function dispatchDirs(dataDir: string): {
  * dot-prefixed tmp, then rename), so the DispatchWatcher never observes a
  * half-written file. The filename stem is the canonical id. Shared by the
  * seam-MCP tools and `Orchestrator.enqueueReportBack`.
+ *
+ * When `attempts` is passed, the `pending` row is committed before this
+ * returns. Boot recovery holds claim closed until interrupted turns are
+ * reconciled, and a caller that sees no row cannot tell "accepted, not yet
+ * claimed" from "gone". `pending` is that state — generation 0, not started.
  */
 export async function enqueueDispatchSpec(
   dataDir: string,
-  spec: DispatchSpec
+  spec: DispatchSpec,
+  attempts?: { admit(spec: DispatchSpec): unknown },
 ): Promise<void> {
   const dirs = dispatchDirs(dataDir);
   await mkdir(dirs.pending, { recursive: true });
@@ -637,6 +643,7 @@ export async function enqueueDispatchSpec(
   const final = path.join(dirs.pending, `${spec.id}.json`);
   await writeFile(tmp, `${JSON.stringify(spec, null, 2)}\n`, "utf8");
   await rename(tmp, final);
+  attempts?.admit(spec);
 }
 
 /** Locate the durable artifact for one exact dispatch id. */

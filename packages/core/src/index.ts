@@ -639,7 +639,7 @@ async function main(): Promise<void> {
     store,
     results: choiceResults,
     logger: logger.child({ mod: "ingest" }),
-    enqueue: (spec) => enqueueDispatchSpec(config.DATA_DIR, spec),
+    enqueue: (spec) => enqueueDispatchSpec(config.DATA_DIR, spec, store.turnAttempts),
     destLive: (card, optionIndex) => orchestrator.inspectChoiceDestLive(card, optionIndex),
     threadLive: (threadId) => orchestrator.inspectThreadLive(threadId),
     authoringSession: (channelRef) => store.getByChannel("discord", channelRef),
@@ -772,7 +772,7 @@ async function main(): Promise<void> {
         if (!sid) return undefined;
         return store.get(sid) ?? orchestrator.resolveIngestJob(sid);
       },
-      enqueueDispatch: (spec) => enqueueDispatchSpec(config.DATA_DIR, spec),
+      enqueueDispatch: (spec) => enqueueDispatchSpec(config.DATA_DIR, spec, store.turnAttempts),
       dispatchResponderUserId: (caller) => orchestrator.dispatchResponderUserId(caller),
       resolveThread: (threadId) => store.getByChannel("discord", threadId),
       getThreadLiveState: (threadId) =>
@@ -1191,7 +1191,7 @@ async function main(): Promise<void> {
           voiceConsoleBindingId: request.bindingId,
           createdUtc: request.createdUtc,
         };
-        await enqueueDispatchSpec(config.DATA_DIR, spec);
+        await enqueueDispatchSpec(config.DATA_DIR, spec, store.turnAttempts);
       },
     },
   });

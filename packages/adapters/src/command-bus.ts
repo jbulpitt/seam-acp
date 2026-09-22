@@ -77,6 +77,11 @@ export interface HelloFrame {
   bridgeId: string;
   instanceId: string;
   protocolVersion: number;
+  /**
+   * Git sha of the release this process is running. Omitted when the bridge
+   * has no stage receipt. Absence is unknown — never infer it from a sibling.
+   */
+  releaseSha?: string;
   host: HelloHostInfo;
   agents: HelloAgentInventory[];
   /** True when the bridge process registered dev-mode RPC handlers. */

@@ -102,6 +102,22 @@ export class ReleaseReceiptWriter {
   }
 }
 
+/**
+ * The release this process is actually running, from the stage receipt beside
+ * the code. No activation envelope is required: that window is rollout proof,
+ * and it closes. A missing or unreadable receipt is null — the bridge then
+ * omits the sha, and the controller records unknown rather than guessing.
+ */
+export async function readRunningReleaseSha(receiptPath?: string): Promise<string | null> {
+  const target = receiptPath ?? fileURLToPath(new URL("../../../release-receipt.json", import.meta.url));
+  try {
+    const stage = JSON.parse(await fs.readFile(target, "utf8")) as unknown;
+    return isStageReceipt(stage) ? stage.sourceSha : null;
+  } catch {
+    return null;
+  }
+}
+
 export async function createReleaseReceiptWriter(options: { bridgeId: string; instanceId: string; protocolVersion: number; adapterRefusals: HostAdapterRefusal[]; releaseStatePath?: string; activationEnvelopePath?: string; receiptPath?: string }): Promise<ReleaseReceiptWriter | null> {
   if (!SAFE_NAME.test(options.bridgeId) || !INSTANCE.test(options.instanceId) || options.protocolVersion !== 1) return null;
   const receiptPath = options.receiptPath ?? fileURLToPath(new URL("../../../release-receipt.json", import.meta.url));

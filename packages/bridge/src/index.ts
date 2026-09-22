@@ -68,7 +68,7 @@ import {
   inventoryFromAdapters,
   loadHostAdapterInventory,
 } from "./inventory.js";
-import { createReleaseReceiptWriter, type ReleaseReceiptWriter } from "./release-receipt.js";
+import { createReleaseReceiptWriter, readRunningReleaseSha, type ReleaseReceiptWriter } from "./release-receipt.js";
 
 type WsCtor = typeof import("ws").WebSocket;
 type WssCtor = typeof import("ws").WebSocketServer;
@@ -192,8 +192,10 @@ function makeSlotManager(opts: {
   devMode: boolean;
   adapters: Map<string, AgentAdapter>;
   releaseReceipt?: ReleaseReceiptWriter | null;
+  /** Standing release identity. Null when this process has no stage receipt. */
+  releaseSha?: string | null;
 }): SlotManager {
-  const { copilotCmd, localCwd, workspaceRoot, WebSocket, bridgeId, devMode, adapters, releaseReceipt } = opts;
+  const { copilotCmd, localCwd, workspaceRoot, WebSocket, bridgeId, devMode, adapters, releaseReceipt, releaseSha } = opts;
   let currentWs: WsSocket | null = null;
   const slots = new Map<number, ChildProcess>();
   const slotConfigs = new Map<number, SlotSpawnConfig>();
@@ -252,6 +254,7 @@ function makeSlotManager(opts: {
             bridgeId,
             instanceId: BRIDGE_INSTANCE_ID,
             protocolVersion: PROTOCOL_VERSION,
+            ...(releaseSha ? { releaseSha } : {}),
             host: {
               os: process.platform,
               arch: process.arch,
@@ -787,6 +790,7 @@ async function runClientMode(
   await sweepAgyHomesAtBridgeStartup();
   const { adapters, adapterRefusals } = loadHostAdapterInventory(copilotCmd, { cwd: localCwd });
   const releaseReceipt = await createReleaseReceiptWriter({ bridgeId: bridgeOpts.bridgeId, instanceId: BRIDGE_INSTANCE_ID, protocolVersion: PROTOCOL_VERSION, adapterRefusals });
+  const releaseSha = await readRunningReleaseSha();
   const mgr = makeSlotManager({
     copilotCmd,
     localCwd,
@@ -796,6 +800,7 @@ async function runClientMode(
     devMode: bridgeOpts.devMode,
     adapters,
     releaseReceipt,
+    releaseSha,
   });
   activeMgr = mgr;
 
@@ -874,6 +879,7 @@ async function runServerMode(
   await sweepAgyHomesAtBridgeStartup();
   const { adapters, adapterRefusals } = loadHostAdapterInventory(copilotCmd, { cwd: localCwd });
   const releaseReceipt = await createReleaseReceiptWriter({ bridgeId: bridgeOpts.bridgeId, instanceId: BRIDGE_INSTANCE_ID, protocolVersion: PROTOCOL_VERSION, adapterRefusals });
+  const releaseSha = await readRunningReleaseSha();
   const mgr = makeSlotManager({
     copilotCmd,
     localCwd,
@@ -883,6 +889,7 @@ async function runServerMode(
     devMode: bridgeOpts.devMode,
     adapters,
     releaseReceipt,
+    releaseSha,
   });
   activeMgr = mgr;
 

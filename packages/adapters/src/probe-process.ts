@@ -145,6 +145,12 @@ export interface BoundedProbeOptions<T> {
    * error this helper produces.
    */
   env?: NodeJS.ProcessEnv;
+  /**
+   * Per-child capabilities carried outside the environment (for example an
+   * argv/header nonce). These values are redacted just as aggressively as env
+   * credentials without making them part of the child's durable identity.
+   */
+  sensitiveValues?: ReadonlyArray<string>;
   timeoutMs?: number;
   signal?: AbortSignal;
   killGraceMs?: number;
@@ -200,15 +206,20 @@ const CREDENTIAL_PATTERNS: ReadonlyArray<RegExp> = [
  * child that echoes its own environment is the exact hostile case), then
  * credential-shaped patterns for secrets that never appeared in that env.
  */
-export function redactProbeText(text: string, env?: NodeJS.ProcessEnv): string {
+export function redactProbeText(
+  text: string,
+  env?: NodeJS.ProcessEnv,
+  sensitiveValues: ReadonlyArray<string> = [],
+): string {
   let out = text;
-  if (env) {
-    const values = Object.values(env)
-      .filter((value): value is string => typeof value === "string" && value.length >= 4)
-      // Longest first, so an overlapping shorter value cannot leave a fragment.
-      .sort((a, b) => b.length - a.length);
-    for (const value of values) out = out.split(value).join("[redacted]");
-  }
+  const values = [
+    ...(env ? Object.values(env) : []),
+    ...sensitiveValues,
+  ]
+    .filter((value): value is string => typeof value === "string" && value.length >= 4)
+    // Longest first, so an overlapping shorter value cannot leave a fragment.
+    .sort((a, b) => b.length - a.length);
+  for (const value of values) out = out.split(value).join("[redacted]");
   for (const pattern of CREDENTIAL_PATTERNS) out = out.replace(pattern, "[redacted]");
   return out;
 }
@@ -228,7 +239,11 @@ export async function runBoundedProbe<T>(options: BoundedProbeOptions<T>): Promi
   const stderrLimit = options.maxStderrBytes ?? PROBE_STDERR_LIMIT_BYTES;
   const killGraceMs = options.killGraceMs ?? PROBE_DEFAULT_KILL_GRACE_MS;
   const finalizeDeadlineMs = options.finalizeDeadlineMs ?? PROBE_DEFAULT_FINALIZE_DEADLINE_MS;
-  const redact = (text: string): string => redactProbeText(text, options.env);
+  const redact = (text: string): string => redactProbeText(
+    text,
+    options.env,
+    options.sensitiveValues,
+  );
 
   if (options.signal?.aborted) {
     throw new ProbeError("cancelled", `${label} cancelled before spawn`);

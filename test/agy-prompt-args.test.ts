@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import os from "node:os";
 import path from "node:path";
 import {
+  AGY_CSRF_FLAG,
   AGY_NO_SLASH_EXPANSION,
   buildAgyPromptArgs,
   type AgyExecutionPolicy,
@@ -22,6 +23,19 @@ const base = {
   cwd: "/workspace",
   execution: CHAT_POLICY,
 };
+
+describe("buildAgyPromptArgs — child-owned CSRF capability (#503)", () => {
+  it("passes the exact hidden launch flag once when this child owns a token", () => {
+    const token = "fixture-child-token-503";
+    const args = buildAgyPromptArgs({ ...base, csrfToken: token });
+    expect(args.filter((arg) => arg === `${AGY_CSRF_FLAG}=${token}`)).toHaveLength(1);
+    expect(args).not.toContain(AGY_CSRF_FLAG);
+  });
+
+  it("omits the flag only for an explicitly detected legacy child", () => {
+    expect(buildAgyPromptArgs(base).some((arg) => arg.startsWith(`${AGY_CSRF_FLAG}=`))).toBe(false);
+  });
+});
 
 // agy >= 1.1.9 resolves a print-mode prompt whose first token is one of its own
 // commands or an installed skill instead of sending it to the model. Verified on

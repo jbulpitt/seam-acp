@@ -1,0 +1,21 @@
+[Unit]
+Description=Seam nightly CLI release and drift report (no updates or model prompts)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/Projects/seam-acp
+Environment=HOME=/home/ubuntu
+Environment=PATH=/home/ubuntu/.nvm/versions/node/v22.22.2/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/ubuntu/.nvm/versions/node/v22.22.2/bin/node scripts/cli-health-report.mjs
+TimeoutStartSec=15min
+Nice=10
+IOSchedulingClass=idle
+UMask=0077
+SyslogIdentifier=seam-cli-health-report
+# Output is one consolidated report in the journal. Re-render the same day's
+# immutable observations with: npm run cli:health-report -- --report YYYY-MM-DD
+# No dependency on seam-acp.service: this unit cannot restart or deploy Seam.

@@ -1,0 +1,11 @@
+[Unit]
+Description=Nightly report-only CLI discovery and drift observation
+
+[Timer]
+OnCalendar=*-*-* 03:00:00 America/Chicago
+Persistent=false
+Unit=seam-cli-health-report.service
+# Sleeping/unreachable hosts are unchecked. No hold-for-wake or catch-up job.
+
+[Install]
+WantedBy=timers.target

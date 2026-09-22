@@ -540,6 +540,24 @@ describe("Orchestrator.dispatchInjectTurn — compact branch", () => {
     expect(t.statuses).toContain("running");
     expect(t.statuses).toContain("completed");
   });
+
+  // #426: without terminal-ledger settlement this non-provider branch leaks when the watcher completes its pending row.
+  it("settles compact's real callback with a real attempt store, without transport proof", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "seam-426-compact-"));
+    const store = new SessionStore(path.join(dir, "test.db"));
+    try {
+      const t = makeDispatchOrch();
+      Object.assign(t.orch, { store });
+      const spec = compactSpec();
+      store.turnAttempts.admit(spec);
+      const result = await t.orch.dispatchInjectTurn(spec);
+      store.turnAttempts.completePending(spec.id, { id: spec.id, target: spec.target,
+        status: "completed", output: result.output, finishedUtc: new Date().toISOString() });
+      expect(store.getDelegation(spec.id)?.status).toBe("completed");
+      expect(store.turnAttempts.isDeliveryDispositionTerminal(spec.id)).toBe(true);
+      expect(store.turnAttempts.isDeliveryProven(spec.id)).toBe(false);
+    } finally { store.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+  });
 });
 
 // -------------------------------------------------------------------------

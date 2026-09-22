@@ -226,6 +226,19 @@ describe("trusted Thread Voice dispatch boundary", () => {
     expect(markDispatchSettled).not.toHaveBeenCalled();
   });
 
+  // #426: voice finishes through the inbound callback, then the watcher; neither may leave an open dispatch receipt.
+  it("settles a completed trusted voice dispatch without claiming transport proof", async () => {
+    (orch as any).handleIncomingMessageInner = vi.fn(async () => {});
+    const spec = trusted();
+    store.turnAttempts.admit(spec);
+    const result = await orch.dispatchInjectTurn(spec);
+    store.turnAttempts.completePending(spec.id, { id: spec.id, target: spec.target,
+      status: "completed", output: result.output, finishedUtc: new Date().toISOString() });
+    expect(store.getDelegation(spec.id)?.status).toBe("completed");
+    expect(store.turnAttempts.isDeliveryDispositionTerminal(spec.id)).toBe(true);
+    expect(store.turnAttempts.isDeliveryProven(spec.id)).toBe(false);
+  });
+
   it("queues verified voice non-preemptively, while a later typed message interrupts it normally", async () => {
     let releaseVoice!: () => void;
     const voiceBlocked = new Promise<void>((resolve) => { releaseVoice = resolve; });

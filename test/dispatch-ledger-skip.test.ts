@@ -14,7 +14,7 @@
  * dodged is the actual one, and they assert on captured log records rather
  * than on source text.
  */
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -169,6 +169,46 @@ afterEach(() => {
 });
 
 describe("#170 dispatchInjectTurn skips an already-ledgered spec", () => {
+  // #509: deleting the onward-first ordering would hide a failed report-back claim; replay must settle without rerunning the worker.
+  it("leaves a failed onward claim unsettled until completion replay succeeds", async () => {
+    const { logger } = capturingLogger();
+    const job = spec({ id: "onward-failure", returnTo: "caller" });
+    store.turnAttempts.admit(job);
+    const orch = makeOrch(dataDir, store, logger);
+    const onward = vi.fn(async () => {
+      expect(store.getDelegation(job.id)?.status).toBe("running");
+      expect(store.turnAttempts.isDeliveryDispositionTerminal(job.id)).toBe(false);
+      throw new Error("synthetic onward claim failure");
+    });
+    Object.assign(orch, { enqueueReportBack: onward });
+    await expect(orch.dispatchInjectTurn(job)).rejects.toThrow("synthetic onward claim failure");
+    expect(store.turnAttempts.isDeliveryDispositionTerminal(job.id)).toBe(false);
+    onward.mockImplementation(async () => undefined);
+    await orch.replayCompletedDispatch(store.turnAttempts.get(job.id)!.outcome!, { action: "report_back", returnTo: "caller" });
+    expect(onward).toHaveBeenCalledTimes(2);
+    expect(store.getDelegation(job.id)?.status).toBe("completed");
+    expect(store.turnAttempts.isDeliveryDispositionTerminal(job.id)).toBe(true);
+    expect(store.turnAttempts.isDeliveryProven(job.id)).toBe(false);
+  });
+
+  // #509: exercise the real producer, not just a new store API; deleting settlement reopens normal dispatch leaks.
+  it.each(["handoff", "forward", "report_back", "scheduled", "wake", "watch", "peek", "inbox", "parked", "choice", "migrate_self"] as const)("settles the real %s completion without inventing delivery proof", async (kind) => {
+    const { logger } = capturingLogger();
+    const job = spec({ id: `settle-${kind}`, kind });
+    const orch = makeOrch(dataDir, store, logger);
+    if (kind === "migrate_self") {
+      job.migration = { agent: "claude", model: "default" } as never;
+      orch.setSelfMigrationHandler(async () => ({ ok: true, record: sessionRecord(), agent: "claude", newSessionId: "acp-1" }) as never);
+    }
+    store.turnAttempts.admit(job);
+    await orch.dispatchInjectTurn(job);
+    expect(store.getDelegation(job.id)?.status).toBe("completed");
+    expect(store.turnAttempts.get(job.id)?.state).toBe("completed");
+    expect(store.turnAttempts.listUnsettledCompletions()).toEqual([]);
+    expect(store.turnAttempts.isDeliveryDispositionTerminal(job.id)).toBe(true);
+    expect(store.turnAttempts.isDeliveryProven(job.id)).toBe(false);
+  });
+
   it("a pre-claimed report-back records one row and logs no ledger warning", async () => {
     // Exactly what claimAndEnqueueReportBack writes before enqueueing.
     store.tryRecordReportBack({

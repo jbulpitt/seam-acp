@@ -648,6 +648,8 @@ function ingestFailureText(err: unknown): string {
   return (raw.trim() || "unknown failure").replace(/\s+/g, " ").slice(0, 1_000);
 }
 
+// `stalled` remains accepted at the MCP compatibility boundary; queue inspection
+// no longer emits it. Retention is an attempt diagnostic, not a queue state.
 export type ChannelQueueState = "idle" | "runtime_busy" | "queued" | "wedged" | "stalled";
 
 /**
@@ -2142,21 +2144,7 @@ export class Orchestrator {
     const stalled = this.store.turnAttempts.listStalled(channelRef);
     const listUnsettled = this.store.turnAttempts.listUnsettledCompletions?.bind(this.store.turnAttempts);
     const unsettled = listUnsettled ? listUnsettled(channelRef) : [];
-    if (!meta && !runtimeBusy && durable.length === 0 && stalled.length === 0 && unsettled.length === 0) {
-      return {
-        state: "idle",
-        epoch: this.queueEpoch(channelRef),
-        queued: 0,
-        ageMs: 0,
-        runtimeBusy: false,
-        stalledDispatchCount: 0,
-        stalledDispatchIds: [],
-        unsettledDispatchCount: 0,
-        unsettledDispatchIds: [],
-      };
-    }
     const durableSince = durable.length > 0 ? Date.parse(durable[0]!.updatedUtc) : Number.NaN;
-    const stalledSince = stalled.length > 0 ? Date.parse(stalled[0]!.stalledUtc!) : Number.NaN;
     const idleSince = meta?.runtimeIdleSinceMs ?? meta?.lastProgressAtMs;
     const ageMs = runtimeBusy
       ? 0
@@ -2164,9 +2152,7 @@ export class Orchestrator {
         ? Math.max(0, nowMs - idleSince)
         : Number.isFinite(durableSince)
           ? Math.max(0, nowMs - durableSince)
-          : Number.isFinite(stalledSince)
-            ? Math.max(0, nowMs - stalledSince)
-            : 0;
+          : 0;
     const graceMs = (this.config.CHANNEL_QUEUE_WEDGE_GRACE_SECONDS ?? 30) * 1000;
     const state: ChannelQueueState = runtimeBusy
       ? "runtime_busy"
@@ -2174,7 +2160,11 @@ export class Orchestrator {
         ? "wedged"
         : meta || durable.length > 0
           ? "queued"
-          : "stalled";
+          // #509: retained defects and completed receipts describe attempts,
+          // not a channel queue. With no admitted/running work the channel is
+          // idle, even if diagnostic history exists. Defects remain quarantined
+          // and visible below; this does not retry or abandon them.
+          : "idle";
     return {
       state,
       epoch: meta?.epoch ?? this.queueEpoch(channelRef),
@@ -2240,7 +2230,7 @@ export class Orchestrator {
             ? "blocked"
             : queuedDispatchIds.length > 0 || queue.state === "queued"
               ? "queued"
-              : retainedDispatchIds.length > 0 || queue.state === "stalled"
+              : retainedDispatchIds.length > 0
                 ? "retained"
                 : "idle";
     const nonprogressing = attempts.filter((attempt) =>

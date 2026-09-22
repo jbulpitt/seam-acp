@@ -152,9 +152,9 @@ export function createStderrRing(options: StderrRingOptions = {}): StderrRing {
  * anything left inline there has no coverage — the lesson #442 and #444 both
  * paid for.
  *
- * `stderr` is null on the copilot legacy inline path, which spawns
- * `["pipe","pipe","inherit"]` and sends fd 2 to the bridge's own stderr. That
- * path can never fill and must keep behaving exactly as it does today.
+ * `stderr` is null when the child inherited fd 2. There is nothing to drain
+ * then. Every bridge agent, including copilot, is spawned with a pipe, and
+ * this handler is what keeps that pipe from filling.
  */
 export function attachStderrDrain(
   child: { stderr?: NodeJS.ReadableStream | null },

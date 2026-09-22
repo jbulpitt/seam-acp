@@ -284,7 +284,7 @@ function makeSlotManager(opts: {
     console.error(`[bridge] Slot ${slot}: spawning agent`);
     let agent: ChildProcess;
     try {
-      agent = spawnAgent(adapters, copilotCmd, localCwd, slotConfigs.get(slot));
+      agent = spawnAgent(adapters, slotConfigs.get(slot));
     } catch (err) {
       // #468: end the slot honestly rather than leaving seam-acp waiting on a
       // stream that will never produce anything. One `exit` frame is enough —

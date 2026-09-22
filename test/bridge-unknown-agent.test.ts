@@ -9,16 +9,29 @@
  * The assertions that matter most here are negative ones: what must NOT come
  * back. A test that only checks the happy path is exactly what let this live.
  */
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import type { McpServer } from "@agentclientprotocol/sdk";
 import type { AgentAdapter } from "@seam/adapters";
 import {
   resolveSlotAdapter,
   unknownAgentMessage,
+  unspecifiedAgentMessage,
   UnknownAgentError,
+  UnspecifiedAgentError,
   spawnRefusalFrame,
   type AdapterResolution,
 } from "../packages/bridge/src/resolve-adapter.js";
 import { spawnAgent } from "../packages/bridge/src/spawn-agent.js";
+
+// The legacy copilot branch called `node:child_process.spawn` directly.
+// `adapter.spawn` being invoked is not enough: a branch that launches copilot
+// and also calls the adapter would still look successful. This count is what
+// fails that mutation, and it stops the regression from starting a real CLI.
+const childProcessSpawn = vi.hoisted(() => vi.fn());
+vi.mock("node:child_process", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:child_process")>();
+  return { ...actual, spawn: (...args: unknown[]) => childProcessSpawn(...args) };
+});
 
 const fake = (id: string) => ({ id }) as unknown as AgentAdapter;
 
@@ -48,7 +61,7 @@ describe("#468 an agent this bridge cannot serve is refused, not substituted", (
     // arbitrary work onto it without anyone choosing that.
     const r = resolveSlotAdapter(FLEET, cfg("ollama-cloud"));
     expect(adapterOf(r)).not.toBe("copilot");
-    expect(r.kind).not.toBe("legacy"); // `legacy` IS the copilot path
+    expect(r.kind).toBe("unknown");
   });
 
   it("refuses a typo rather than quietly running something else", () => {
@@ -99,16 +112,22 @@ describe("#468 everything that worked before still works", () => {
   });
 
   it("resolves an explicit copilot id to the copilot adapter", () => {
-    // The caller then routes it to the legacy inline path, as it always has.
     expect(adapterOf(resolveSlotAdapter(FLEET, cfg("copilot")))).toBe("copilot");
   });
 
-  it("falls back to the legacy path when no id is stated and several exist", () => {
-    expect(resolveSlotAdapter(FLEET, undefined).kind).toBe("legacy");
+  it("refuses when no id is stated and several adapters exist", () => {
+    // Several agents and no name used to exec copilot. That is a substitution.
+    const r = resolveSlotAdapter(FLEET, undefined);
+    expect(r.kind).toBe("unspecified");
+    if (r.kind !== "unspecified") throw new Error("expected a refusal");
+    expect(r.available).toEqual(["agy", "claude", "codex", "copilot", "grok"]);
   });
 
-  it("falls back to the legacy path on a host holding no adapters at all", () => {
-    expect(resolveSlotAdapter(new Map(), undefined).kind).toBe("legacy");
+  it("refuses when the host holds no adapters and no id was stated", () => {
+    const r = resolveSlotAdapter(new Map(), undefined);
+    expect(r.kind).toBe("unspecified");
+    if (r.kind !== "unspecified") throw new Error("expected a refusal");
+    expect(r.available).toEqual([]);
   });
 
   it("refuses a stated id on a host holding no adapters, rather than guessing", () => {
@@ -135,43 +154,122 @@ describe("#468 spawnAgent itself refuses, and spawns nothing while doing so", ()
   it("throws UnknownAgentError for an id this bridge cannot serve", () => {
     const { adapter } = spawning("agy");
     const adapters = new Map([["agy", adapter]]);
-    expect(() => spawnAgent(adapters, "copilot", "/tmp", { agentId: "ollama-cloud" } as never))
+    expect(() => spawnAgent(adapters, { agentId: "ollama-cloud" } as never))
       .toThrow(UnknownAgentError);
+    expect(childProcessSpawn).not.toHaveBeenCalled();
   });
 
   it("launches NOTHING when it refuses — not the agent, not copilot", () => {
     // The refusal has to happen before any process starts. Falling through to
-    // the copilot legacy branch is the defect, and it is a licensing boundary.
+    // a copilot launcher is the defect, and it is a licensing boundary.
     const { adapter, spawned } = spawning("agy");
     const adapters = new Map([["agy", adapter]]);
     try {
-      spawnAgent(adapters, "copilot", "/tmp", { agentId: "zai" } as never);
+      spawnAgent(adapters, { agentId: "zai" } as never);
     } catch { /* expected */ }
     expect(spawned()).toBe(0);
+    expect(childProcessSpawn).not.toHaveBeenCalled();
   });
 
   it("names the agent and the inventory in what it throws", () => {
     const { adapter } = spawning("agy");
-    expect(() => spawnAgent(new Map([["agy", adapter]]), "copilot", "/tmp", { agentId: "zai" } as never))
+    expect(() => spawnAgent(new Map([["agy", adapter]]), { agentId: "zai" } as never))
       .toThrow(/"zai".*holds: agy/s);
   });
 
-  it("still spawns a known adapter, passing model and effort through", () => {
+  it("still spawns a known adapter, passing model, effort, mcp, cwd, and env", () => {
     let got: unknown[] = [];
     const adapter = {
       id: "claude",
       spawn: (...args: unknown[]) => { got = args; return { pid: 2 } as never; },
     } as unknown as AgentAdapter;
+    const mcp = [{ name: "seam-mcp" }] as McpServer[];
     const child = spawnAgent(
       new Map([["claude", adapter]]),
-      "copilot",
-      "/tmp",
-      { agentId: "claude", model: "opus", effort: "high" } as never
+      {
+        agentId: "claude",
+        model: "opus",
+        effort: "high",
+        mcpServers: mcp,
+        cwd: "/remote/repository",
+        env: { GH_TOKEN: "slot-credential-token" },
+      } as never
     );
     expect(child).toEqual({ pid: 2 });
-    expect(got).toEqual(["opus", "high"]);
+    expect(got).toEqual([
+      "opus",
+      "high",
+      mcp,
+      { cwd: "/remote/repository", env: { GH_TOKEN: "slot-credential-token" } },
+    ]);
+    expect(childProcessSpawn).not.toHaveBeenCalled();
+  });
+
+  it("spawns an explicit copilot id through that adapter, not a second launcher", () => {
+    let got: unknown[] = [];
+    const adapter = {
+      id: "copilot",
+      spawn: (...args: unknown[]) => { got = args; return { pid: 4 } as never; },
+    } as unknown as AgentAdapter;
+    const mcp = [{ name: "seam-mcp" }] as McpServer[];
+    const child = spawnAgent(FLEET_WITH(adapter), {
+      agentId: "copilot",
+      model: "gpt-5.4",
+      effort: "high",
+      mcpServers: mcp,
+      cwd: "/remote/repository",
+      env: { GH_TOKEN: "slot-credential-token" },
+    } as never);
+    expect(child).toEqual({ pid: 4 });
+    expect(got).toEqual([
+      "gpt-5.4",
+      "high",
+      mcp,
+      { cwd: "/remote/repository", env: { GH_TOKEN: "slot-credential-token" } },
+    ]);
+    // Restoring `adapter.id !== "copilot"` skips this spawn and execs the CLI.
+    expect(childProcessSpawn).not.toHaveBeenCalled();
+  });
+
+  it("refuses an unnamed slot on a multi-agent host instead of spawning copilot", () => {
+    const { adapter, spawned } = spawning("copilot");
+    const adapters = new Map<string, AgentAdapter>([
+      ["copilot", adapter],
+      ["claude", { id: "claude", spawn: () => { throw new Error("claude spawn"); } } as never],
+    ]);
+    expect(() => spawnAgent(adapters, undefined)).toThrow(UnspecifiedAgentError);
+    expect(spawned()).toBe(0);
+    expect(childProcessSpawn).not.toHaveBeenCalled();
+  });
+
+  it("refuses an unnamed slot when the host holds nothing, instead of execing copilot", () => {
+    expect(() => spawnAgent(new Map(), undefined)).toThrow(UnspecifiedAgentError);
+    expect(() => spawnAgent(new Map(), undefined)).toThrow(/holds: none/);
+    expect(childProcessSpawn).not.toHaveBeenCalled();
+  });
+
+  it("still serves the one adapter when a copilot-only host is not told an id", () => {
+    let calls = 0;
+    const adapter = {
+      id: "copilot",
+      spawn: () => { calls += 1; return { pid: 5 } as never; },
+    } as unknown as AgentAdapter;
+    const child = spawnAgent(new Map([["copilot", adapter]]), undefined);
+    expect(child).toEqual({ pid: 5 });
+    expect(calls).toBe(1);
+    expect(childProcessSpawn).not.toHaveBeenCalled();
   });
 });
+
+function FLEET_WITH(copilot: AgentAdapter): Map<string, AgentAdapter> {
+  return new Map([
+    ["copilot", copilot],
+    ["claude", fake("claude")],
+    ["agy", fake("agy")],
+    ["codex", fake("codex")],
+    ["grok", fake("grok")],
+  ]);
+}
 
 describe("#468 the refusal an operator reads", () => {
   it("states the agent, the inventory, and that nothing was substituted", () => {
@@ -183,6 +281,9 @@ describe("#468 the refusal an operator reads", () => {
 
   it("says 'none' rather than an empty gap when the host holds nothing", () => {
     expect(unknownAgentMessage("claude", [])).toContain("none");
+    expect(unspecifiedAgentMessage([])).toContain("none");
+    expect(unspecifiedAgentMessage(["copilot", "claude"])).toContain("copilot, claude");
+    expect(unspecifiedAgentMessage(["copilot"])).toMatch(/refusing/i);
   });
 
   it("ends the slot with a non-zero code, so a refusal is not read as success", () => {

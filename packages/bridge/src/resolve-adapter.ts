@@ -27,6 +27,10 @@
  * The single-adapter convenience survives only where it is genuinely a
  * convenience: when no id is stated at all. It may no longer override one.
  *
+ * #453: no id and anything other than exactly one adapter used to be the
+ * copilot legacy path — including a host whose map does not contain copilot.
+ * That is the same silent substitution. Those slots are refused.
+ *
  * ## Why this is a separate module
  *
  * `index.ts` is the CLI entrypoint and `process.exit(1)`s on import, so
@@ -38,12 +42,12 @@ import type { AgentAdapter } from "@seam/adapters";
 import type { SlotSpawnConfig } from "./rpc.js";
 
 export type AdapterResolution =
-  /** Serve the slot with this adapter. A `copilot` id still routes to the
-   *  legacy inline path, exactly as before. */
+  /** Serve the slot with this adapter. Copilot is this same result: the
+   *  caller spawns it through `adapter.spawn`, like every other id. */
   | { kind: "adapter"; adapter: AgentAdapter }
-  /** No id was stated and no single adapter applies: the historical
-   *  copilot legacy path, unchanged. */
-  | { kind: "legacy" }
+  /** No id was stated, and this host does not hold exactly one adapter.
+   *  Nothing is spawned. Defaulting to copilot was the legacy branch. */
+  | { kind: "unspecified"; available: string[] }
   /** An id was stated that this bridge cannot serve. Never substitute. */
   | { kind: "unknown"; agentId: string; available: string[] };
 
@@ -68,7 +72,7 @@ export function resolveSlotAdapter(
     const only = [...adapters.values()][0];
     if (only) return { kind: "adapter", adapter: only };
   }
-  return { kind: "legacy" };
+  return { kind: "unspecified", available: [...adapters.keys()].sort() };
 }
 
 /**
@@ -82,6 +86,27 @@ export class UnknownAgentError extends Error {
     super(unknownAgentMessage(agentId, available));
     this.name = "UnknownAgentError";
     this.agentId = agentId;
+    this.available = available;
+  }
+}
+
+/**
+ * No agent was named, and this host does not hold exactly one. Naming the
+ * inventory keeps the refusal from reading as "the bridge is down".
+ */
+export function unspecifiedAgentMessage(available: readonly string[]): string {
+  const held = available.length ? available.join(", ") : "none";
+  return (
+    `this bridge was not told which agent to spawn (holds: ${held}). ` +
+    `Refusing the slot rather than defaulting to one.`
+  );
+}
+
+export class UnspecifiedAgentError extends Error {
+  readonly available: readonly string[];
+  constructor(available: readonly string[]) {
+    super(unspecifiedAgentMessage(available));
+    this.name = "UnspecifiedAgentError";
     this.available = available;
   }
 }

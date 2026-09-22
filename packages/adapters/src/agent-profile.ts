@@ -121,8 +121,9 @@ export interface AttachmentBytes {
  * §4 agent-adapter contract, implemented in-process for PR1.
  *
  * SUPERSET of the pre-PR1 `AgentProfile`: every existing field and
- * `spawn(modelOverride?, effortOverride?)` stay as the runtime path.
- * `spawn(cwd, opts)` is a later-PR concern and is not added here.
+ * `spawn(modelOverride?, effortOverride?, mcpServers?, slot?)` stay as the
+ * runtime path. `slot` is per-slot cwd and env. It is not `spawn(cwd, opts)`,
+ * which would move the model argument and break every existing caller.
  *
  * New methods are real (not comments) but are safe no-ops or
  * `sessionManager` delegates until PR3/PR4 call them over the bus.
@@ -183,7 +184,15 @@ export interface AgentAdapter {
      * does not: it must receive them at process spawn via
      * `--additional-mcp-config`, otherwise a resumed process loses seam-MCP.
      */
-    mcpServers?: McpServer[]
+    mcpServers?: McpServer[],
+    /**
+     * Per-slot process context. `cwd` overrides the cwd this adapter was built
+     * with; `env` is overlaid on its environment. Agents that take the
+     * workspace from ACP `session/new` ignore it. Copilot CLI binds the repo
+     * and `GH_TOKEN` when the process starts, so it reads both — a bridge
+     * slot's repo is not the bridge process cwd.
+     */
+    slot?: { cwd?: string; env?: NodeJS.ProcessEnv }
   ): ChildProcessByStdio<NodeWritable, NodeReadable, NodeReadable>;
 
   /**

@@ -149,31 +149,59 @@ describe("sweepAgyMcpHomes", () => {
     if (root) fs.rmSync(root, { recursive: true, force: true });
   });
 
-  it("removes an orphan without following credential links and retains a live process owner", async () => {
+  it("removes current and legacy UUID orphans without following credential links", async () => {
     root = fs.mkdtempSync(path.join(os.tmpdir(), "agy-home-sweep-"));
     const realGemini = path.join(root, "real-gemini");
     const stagingRoot = path.join(root, "staged-homes");
+    fs.mkdirSync(stagingRoot, { recursive: true, mode: 0o700 });
     fs.mkdirSync(realGemini, { recursive: true });
     const credential = path.join(realGemini, "oauth_creds.json");
     fs.writeFileSync(credential, "fixture-credential");
 
-    const live = await prepareAgyMcpHome("live", [seamHttp], realGemini, stagingRoot);
-    const orphan = path.join(stagingRoot, "session-orphan");
-    fs.mkdirSync(path.join(orphan, ".gemini"), { recursive: true, mode: 0o700 });
-    fs.symlinkSync(credential, path.join(orphan, ".gemini/oauth_creds.json"));
+    const orphans = [
+      path.join(stagingRoot, "session-orphan"),
+      path.join(stagingRoot, "03553f25-27f0-4bac-8f6d-f123918b285d"),
+    ];
+    for (const orphan of orphans) {
+      fs.mkdirSync(path.join(orphan, ".gemini"), { recursive: true, mode: 0o700 });
+      fs.symlinkSync(credential, path.join(orphan, ".gemini/oauth_creds.json"));
+    }
 
     const result = await sweepAgyMcpHomes({ root: stagingRoot, maxHomes: 10, maxEntries: 100, maxMs: 1_000 });
     expect(result).toEqual({
       examinedHomes: 2,
-      removedHomes: 1,
-      retainedActiveHomes: 1,
+      removedHomes: 2,
+      retainedActiveHomes: 0,
       failedHomes: 0,
       visitedEntries: expect.any(Number),
       bounded: false,
     });
-    expect(fs.existsSync(orphan)).toBe(false);
-    expect(fs.existsSync(live!)).toBe(true);
+    expect(orphans.every((orphan) => !fs.existsSync(orphan))).toBe(true);
     expect(fs.readFileSync(credential, "utf8")).toBe("fixture-credential");
+  });
+
+  it("retains live-owned current and legacy UUID homes through the owner check", async () => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), "agy-home-sweep-live-"));
+    const realGemini = path.join(root, "real-gemini");
+    const stagingRoot = path.join(root, "staged-homes");
+    fs.mkdirSync(realGemini, { recursive: true });
+
+    const current = await prepareAgyMcpHome("live-current", [seamHttp], realGemini, stagingRoot);
+    const generated = await prepareAgyMcpHome("live-legacy", [seamHttp], realGemini, stagingRoot);
+    const legacy = path.join(stagingRoot, "8e21ecc2-35d4-4cc5-b4f5-59f6ea882350");
+    fs.renameSync(generated!, legacy);
+
+    const result = await sweepAgyMcpHomes({ root: stagingRoot, maxHomes: 10, maxEntries: 100, maxMs: 1_000 });
+    expect(result).toEqual({
+      examinedHomes: 2,
+      removedHomes: 0,
+      retainedActiveHomes: 2,
+      failedHomes: 0,
+      visitedEntries: 2,
+      bounded: false,
+    });
+    expect(fs.existsSync(current!)).toBe(true);
+    expect(fs.existsSync(legacy)).toBe(true);
   });
 
   it("stops at the configured home ceiling and leaves the remainder for a later boot", async () => {

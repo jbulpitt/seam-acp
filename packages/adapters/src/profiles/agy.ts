@@ -524,7 +524,6 @@ export async function sweepAgyMcpHomes(options: {
       if (!entry) break;
       budget.remainingEntries -= 1;
       budget.visitedEntries += 1;
-      if (!entry.name.startsWith("session-")) continue;
       if (!entry.isDirectory()) {
         result.failedHomes += 1;
         continue;

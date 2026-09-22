@@ -47,10 +47,24 @@ export const inboundAttemptId = (messageId: string): string => `inbound-${messag
 export const PROMPTED_BLOCK_SETTLED_REASON =
   "settled without resending: a never-started dispatch is waiting on this target";
 
+/**
+ * An active claim never reached session/prompt, and a later attempt on the
+ * same target has since completed. Nothing was sent (#559). Not the
+ * prompted-block reason: that one is a prompt that already started.
+ */
+export const UNSTARTED_SUPERSEDED_REASON =
+  "settled without prompting: a later attempt on this target completed";
+
 export interface SettledPromptedBlock {
   target: string;
   settledId: string;
   pendingIds: string[];
+}
+
+export interface SettledUnstartedAttempt {
+  target: string;
+  settledId: string;
+  laterId: string;
 }
 
 export const UNSETTLED_COMPLETION_MAX_AGE_MS = 60 * 60 * 1000;
@@ -751,6 +765,90 @@ export class TurnAttemptStore {
       }
     }
     return settled;
+  }
+
+  /**
+   * #559: attempt 65534f0d stayed `active` after its claim returned before
+   * session/prompt, while later live attempts on the same target completed.
+   * `assigned_not_started` then never resolves. Deleting this leaves that row
+   * active. `prompt_started=1` is not this predicate (#428). `owner_boot` is
+   * not read — the live owner was the current process. An isolated completion
+   * does not prove the serial queue moved. `finishedUtc` is the completion;
+   * a later touch of `updated_utc` on an older completion is not.
+   */
+  settleSupersededUnstartedAttempts(target?: string): SettledUnstartedAttempt[] {
+    const settled: SettledUnstartedAttempt[] = [];
+    for (const attempt of this.list("active")) {
+      if (attempt.promptStarted || attempt.acpSessionId) continue;
+      const key = attempt.spec?.target;
+      if (!key || (target !== undefined && key !== target)) continue;
+      const laterId = this.laterQueueCompletion(key, attempt.id, attempt.updatedUtc);
+      if (!laterId) continue;
+      if (!this.cancelUnstarted(attempt, UNSTARTED_SUPERSEDED_REASON)) continue;
+      settled.push({ target: key, settledId: attempt.id, laterId });
+    }
+    return settled;
+  }
+
+  /**
+   * The claim that holds `attempt` is returning before session/prompt.
+   * Leaving it active is the #559 strand. Shutdown and retryable still
+   * belong to the next boot. A defect stays quarantined. Superseded work
+   * was never sent, so it is cancelled rather than replayed. A started
+   * prompt or a bound session is unchanged — that is #428.
+   */
+  releaseUnstartedClaim(
+    attempt: TurnAttempt,
+    suspension: SuspensionClass,
+    reason: string,
+  ): "cancelled" | "suspended" | "stalled" | "unchanged" {
+    return this.db.transaction(() => {
+      const current = this.get(attempt.id);
+      if (!current
+        || current.generation !== attempt.generation
+        || current.ownerBoot !== attempt.ownerBoot
+        || current.state !== "active"
+        || current.promptStarted
+        || current.acpSessionId) return "unchanged";
+      if (suspension === "shutdown" || suspension === "retryable") {
+        this.suspend(attempt.id, attempt.ownerBoot);
+        return "suspended";
+      }
+      if (suspension === "defect") {
+        this.markStalled(attempt.id, reason);
+        return "stalled";
+      }
+      return this.cancelUnstarted(current, reason) ? "cancelled" : "unchanged";
+    }).immediate();
+  }
+
+  /** A completion whose finished time is after this claim, on the serial queue. */
+  private laterQueueCompletion(target: string, id: string, claimedUtc: string): string | null {
+    const row = this.db.prepare(`SELECT id FROM turn_attempts
+      WHERE id != ?
+        AND state = 'completed'
+        AND json_extract(spec_json, '$.target') = ?
+        AND COALESCE(json_extract(spec_json, '$.session'), 'live') != 'isolated'
+        AND typeof(json_extract(outcome_json, '$.finishedUtc')) = 'text'
+        AND json_extract(outcome_json, '$.finishedUtc') > ?
+      ORDER BY json_extract(outcome_json, '$.finishedUtc'), id
+      LIMIT 1`).get(id, target, claimedUtc) as { id: string } | undefined;
+    return row?.id ?? null;
+  }
+
+  /** One statement, so a prompt that starts between the read and the write
+   * is not cancelled. `prompt_started=1` cannot match. */
+  private cancelUnstarted(attempt: TurnAttempt, reason: string): boolean {
+    const finishedUtc = new Date().toISOString();
+    const outcome: DispatchResult = {
+      id: attempt.id, target: attempt.spec.target, status: "failed", workerStatus: "failed",
+      error: reason, suppressedOnward: true,
+      kind: attempt.spec.kind, correlationId: attempt.spec.correlationId,
+      returnTo: attempt.spec.returnTo, chainId: attempt.spec.chainId, finishedUtc,
+    };
+    return this.db.prepare(`UPDATE turn_attempts SET state='cancelled', outcome_json=?, updated_utc=?
+      WHERE id=? AND generation=? AND state='active' AND prompt_started=0 AND acp_session_id IS NULL`)
+      .run(JSON.stringify(outcome), finishedUtc, attempt.id, attempt.generation).changes === 1;
   }
 
   /** Explicit cancellation may win against suspension, never against captured completion. */

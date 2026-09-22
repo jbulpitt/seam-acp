@@ -67,7 +67,8 @@ import { evaluateWatch } from "./core/watch/evaluate.js";
 import { createRuntimeDispatchWatcher } from "./core/dispatch/watcher.js";
 import { reconcileCompletedDoneFiles } from "./core/dispatch/done-reconcile.js";
 import { bindDoneDeliveryResolver, DoneRetention } from "./core/dispatch/done-retention.js";
-import { dispatchDirs, enqueueDispatchSpec, type DispatchSpec } from "./core/dispatch/types.js";
+import { dispatchDirs, type DispatchSpec } from "./core/dispatch/types.js";
+import { publishDispatch } from "./core/dispatch/publish.js";
 import { SeamTokenRegistry } from "./core/mcp/token-registry.js";
 import { SeamMcpServer } from "./core/mcp/seam-mcp-server.js";
 import { ThreadSessionControlService } from "./core/thread-session-control.js";
@@ -172,6 +173,15 @@ async function main(): Promise<void> {
 
   const seamDbPath = path.join(config.DATA_DIR, "seam.db");
   const store = new SessionStore(seamDbPath);
+  const admitDispatch = async (spec: DispatchSpec): Promise<void> => {
+    const published = await publishDispatch(store.turnAttempts, config.DATA_DIR, spec);
+    if (published.projection === "admitted-only") {
+      logger.error(
+        { err: published.error, dispatchId: spec.id },
+        "dispatch admitted; queue file was not written",
+      );
+    }
+  };
   if (config.AGY_NATIVE_RESTORE && !store.agyIdentityRestored()) {
     const changes = planAgyIdentityMigration(
       store.list(store.countSessions()),
@@ -639,7 +649,7 @@ async function main(): Promise<void> {
     store,
     results: choiceResults,
     logger: logger.child({ mod: "ingest" }),
-    enqueue: (spec) => enqueueDispatchSpec(config.DATA_DIR, spec),
+    enqueue: admitDispatch,
     destLive: (card, optionIndex) => orchestrator.inspectChoiceDestLive(card, optionIndex),
     threadLive: (threadId) => orchestrator.inspectThreadLive(threadId),
     authoringSession: (channelRef) => store.getByChannel("discord", channelRef),
@@ -772,7 +782,7 @@ async function main(): Promise<void> {
         if (!sid) return undefined;
         return store.get(sid) ?? orchestrator.resolveIngestJob(sid);
       },
-      enqueueDispatch: (spec) => enqueueDispatchSpec(config.DATA_DIR, spec),
+      enqueueDispatch: admitDispatch,
       dispatchResponderUserId: (caller) => orchestrator.dispatchResponderUserId(caller),
       resolveThread: (threadId) => store.getByChannel("discord", threadId),
       getThreadLiveState: (threadId) =>
@@ -1191,7 +1201,7 @@ async function main(): Promise<void> {
           voiceConsoleBindingId: request.bindingId,
           createdUtc: request.createdUtc,
         };
-        await enqueueDispatchSpec(config.DATA_DIR, spec);
+        await admitDispatch(spec);
       },
     },
   });

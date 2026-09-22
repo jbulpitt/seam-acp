@@ -404,7 +404,6 @@ import {
   dispatchOriginRefs,
   dispatchDisplayPrompt,
   resolveDispatchRuntimePrompt,
-  enqueueDispatchSpec,
   findQueuedReportBackSpec,
   isStatelessHandoffWorker,
   shouldInlineCardReportBack,
@@ -416,6 +415,7 @@ import {
   rollingLineWindow,
 } from "../../core/rolling-line-window.js";
 import { completionRoute, type CompletionRoute } from "../../core/dispatch/done-reconcile.js";
+import { publishDispatch } from "../../core/dispatch/publish.js";
 import type { DurableDeliveryPayload } from "../../core/dispatch/delivery-proof.js";
 import { promptExcerpt } from "../../core/prompt-excerpt.js";
 import { buildSeamHelpPages } from "./help-text.js";
@@ -7194,7 +7194,7 @@ export class Orchestrator {
       correlationId: dispatchId,
       createdUtc: new Date().toISOString(),
     };
-    await enqueueDispatchSpec(this.config.DATA_DIR, spec);
+    await publishDispatch(this.store.turnAttempts, this.config.DATA_DIR, spec, this.logger);
 
     this.logger.info(
       { from: caller.channelRef, to: target, fresh, cancelled, interruptedDispatch: activeId ?? null, dispatchId },
@@ -7373,7 +7373,7 @@ export class Orchestrator {
       correlationId: wake.id,
       createdUtc: new Date().toISOString(),
     };
-    await enqueueDispatchSpec(this.config.DATA_DIR, spec);
+    await publishDispatch(this.store.turnAttempts, this.config.DATA_DIR, spec, this.logger);
     this.logger.info(
       { id: wake.id, dispatch: spec.id, channel: wake.channelRef, chainDepth: wake.chainDepth },
       "wake: fired (dispatch enqueued)"
@@ -7792,7 +7792,7 @@ export class Orchestrator {
       correlationId: parked.id,
       createdUtc: new Date().toISOString(),
     };
-    await enqueueDispatchSpec(this.config.DATA_DIR, spec);
+    await publishDispatch(this.store.turnAttempts, this.config.DATA_DIR, spec, this.logger);
     this.logger.info(
       { id: parked.id, dispatch: spec.id, channel: parked.channelRef, location: parked.location },
       "parked: fired (dispatch enqueued)"
@@ -8815,7 +8815,7 @@ export class Orchestrator {
         location,
         createdUtc: new Date().toISOString(),
       };
-      await enqueueDispatchSpec(this.config.DATA_DIR, spec);
+      await publishDispatch(this.store.turnAttempts, this.config.DATA_DIR, spec, this.logger);
       await i.editReply("▶️ Running now — nothing was in flight.");
       return;
     }
@@ -9049,7 +9049,7 @@ export class Orchestrator {
       correlationId: watch.id,
       createdUtc: new Date().toISOString(),
     };
-    await enqueueDispatchSpec(this.config.DATA_DIR, spec);
+    await publishDispatch(this.store.turnAttempts, this.config.DATA_DIR, spec, this.logger);
     this.logger.info(
       { id: watch.id, dispatch: spec.id, channel: watch.channelRef, kind: watch.kind },
       "watch: fired (dispatch enqueued)"
@@ -9082,7 +9082,7 @@ export class Orchestrator {
       correlationId: watch.id,
       createdUtc: new Date().toISOString(),
     };
-    await enqueueDispatchSpec(this.config.DATA_DIR, spec);
+    await publishDispatch(this.store.turnAttempts, this.config.DATA_DIR, spec, this.logger);
     this.logger.info(
       { id: watch.id, dispatch: spec.id, channel: watch.channelRef, fireCount: watch.fireCount },
       "watch: expiry turn enqueued"
@@ -10848,7 +10848,7 @@ export class Orchestrator {
         // The DB claim is the durable outbox key. A crash can land after that
         // commit but before the pending file rename; reconstruct the complete
         // spec from the parent's done output and reuse the claimed id.
-        await enqueueDispatchSpec(this.config.DATA_DIR, {
+        await publishDispatch(this.store.turnAttempts, this.config.DATA_DIR, {
           ...spec,
           id: existingClaim.id,
           createdUtc: existingClaim.createdUtc,
@@ -10901,7 +10901,7 @@ export class Orchestrator {
       );
       return false;
     }
-    await enqueueDispatchSpec(this.config.DATA_DIR, spec);
+    await publishDispatch(this.store.turnAttempts, this.config.DATA_DIR, spec, this.logger);
     return true;
   }
 
@@ -11057,7 +11057,7 @@ export class Orchestrator {
       });
       const artifact = await dispatchArtifactState(this.config.DATA_DIR, plan.dispatchId,
         (id) => this.store.isDispatchCompleted(id));
-      if (!artifact) await enqueueDispatchSpec(this.config.DATA_DIR, next);
+      if (!artifact) await publishDispatch(this.store.turnAttempts, this.config.DATA_DIR, next, this.logger);
       this.logger.info(
         { chainId, dispatch: next.id, worker: plan.nextHop, repaired: !plan.created },
         "chain: next hop durably queued"
@@ -11079,7 +11079,7 @@ export class Orchestrator {
   /** Deliver a chain's terminal output into its origin thread as a fresh live
    *  dispatch (correlation-linked to the chain). Deliberately carries NO
    *  `chainId`, so this delivery does not itself try to advance a chain.
-   *  Written atomically via `enqueueDispatchSpec`. Idempotent on `chainId`
+   *  Admitted to `turn_attempts` before the pending file. Idempotent on `chainId`
    *  via the same #77 report-back claim as a normal handoff report-back. */
   private async enqueueChainDelivery(
     originRef: string,
@@ -15618,7 +15618,7 @@ export class Orchestrator {
         return `Cannot resume \`${id}\` — missing target or ACP session.`;
       }
       const resumeKind = ledger.kind === "inbox" ? "handoff" : ledger.kind;
-      await enqueueDispatchSpec(this.config.DATA_DIR, {
+      await publishDispatch(this.store.turnAttempts, this.config.DATA_DIR, {
         id: `${id}-resume`,
         target,
         prompt: CONTINUE_PROMPT,
@@ -22464,7 +22464,7 @@ export class Orchestrator {
         optionIndex,
         actor: { id: evt.userId, name: evt.userName },
         payload,
-        enqueue: (spec) => enqueueDispatchSpec(this.config.DATA_DIR, spec),
+        enqueue: (spec) => publishDispatch(this.store.turnAttempts, this.config.DATA_DIR, spec, this.logger),
         authoringSession,
         ...(authoringSession ? { cwd: this.effectiveCwd(authoringSession) } : {}),
         destLive,
@@ -22556,7 +22556,7 @@ export class Orchestrator {
         card: claimed.card,
         optionIndices: indices,
         actor: { id: evt.userId, name: evt.userName },
-        enqueue: (spec) => enqueueDispatchSpec(this.config.DATA_DIR, spec),
+        enqueue: (spec) => publishDispatch(this.store.turnAttempts, this.config.DATA_DIR, spec, this.logger),
         authoringSession,
         ...(authoringSession ? { cwd: this.effectiveCwd(authoringSession) } : {}),
         destLive,

@@ -190,7 +190,7 @@ export interface SeamMcpServerDeps {
   logger: Logger;
   /** token → the calling session's record (or undefined if unknown/revoked). */
   resolveSession: (token: string | undefined) => SessionRecord | undefined;
-  /** Persist a dispatch spec into the pending queue (the DispatchWatcher runs it). */
+  /** Admit the attempt row, then write the pending file. The watcher runs it. */
   enqueueDispatch: (spec: DispatchSpec) => Promise<void>;
   /** Trusted active-turn ownership, not caller-supplied tool arguments. */
   dispatchResponderUserId?: (caller: SessionRecord) => string | undefined;

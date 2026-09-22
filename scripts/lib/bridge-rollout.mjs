@@ -9,6 +9,11 @@ const SAFE_PATH = /^\/[A-Za-z0-9._/-]{1,511}$/;
 const SHA = /^[0-9a-f]{40}$/;
 const CHECKSUM = /^[0-9a-f]{64}$/;
 const TOKEN = /^[0-9a-f]{64}$/;
+// The remote program computes the configured interpreter's ABI. Recheck the
+// closed allowlist locally instead of trusting a boolean in its report: this
+// refuses only rollout work for that host while its incumbent bridge and the
+// rest of the fleet keep serving (#412, #521).
+export const NATIVE_PREBUILD_ABIS = new Set(["108", "115", "127", "131"]);
 const TARGET_KEYS = new Set([
   "sshAlias", "pm2App", "verifyAgent", "checkoutPath", "entrypointPath",
   "expectedUid", "nodePath", "pm2ModulePath", "workspaceArg",
@@ -427,7 +432,9 @@ export async function runPreflight(target, remoteScript, run = commandRunner) {
     if (report.enrollment_id !== "none" || report.baseline_digest !== "none" || report.baseline_rollback_proof !== "none") throw new Error("remote enrollment evidence is inconsistent");
   } else if (!TOKEN.test(report.enrollment_id ?? "") || !CHECKSUM.test(report.baseline_digest ?? "") || !/^(receipt|reduced-baseline)$/.test(report.baseline_rollback_proof ?? "")) throw new Error("remote enrollment evidence is incomplete");
   if (report.node_path !== target.nodePath || !/^v(?:2[2-9]|[3-9]\d)\.\d+\.\d+/.test(report.node_version ?? "") || !/^\d+\.\d+\.\d+/.test(report.npm_version ?? "") || report.disk_path !== target.checkoutPath || !/^\d+$/.test(report.disk_bytes_available ?? "") || BigInt(report.disk_bytes_available) <= 0n) throw new Error("remote runtime capacity evidence is incomplete");
-  if (!/^(ready|bootstrap-required)$/.test(report.release_parent ?? "") || report.native_dependency !== "better-sqlite3@11.10.0" || report.native_install_strategy !== "locked-prebuild" || !/^better-sqlite3@11\.10\.0-node-v\d+-(?:darwin|linux)-(?:arm|arm64|x64)$/.test(report.native_prebuild ?? "") || !/^(yes|no)$/.test(report.native_install_ready ?? "")) throw new Error("remote native install preflight evidence is incomplete");
+  const prebuild = /^better-sqlite3@11\.10\.0-node-v(\d+)-(?:darwin|linux)-(?:arm|arm64|x64)$/.exec(report.native_prebuild ?? "");
+  if (!/^(ready|bootstrap-required)$/.test(report.release_parent ?? "") || report.native_dependency !== "better-sqlite3@11.10.0" || report.native_install_strategy !== "locked-prebuild" || !prebuild || !/^\d+$/.test(report.node_abi ?? "") || report.node_abi !== prebuild[1] || !/^(yes|no)$/.test(report.native_install_ready ?? "")) throw new Error("remote native install preflight evidence is incomplete");
+  if (!NATIVE_PREBUILD_ABIS.has(report.node_abi)) throw new Error(`remote runtime preflight refused: configured interpreter ${report.node_path} uses unsupported ABI ${report.node_abi}; reviewed ABIs are ${[...NATIVE_PREBUILD_ABIS].join(", ")}`);
   if (report.native_install_ready !== "yes") throw new Error(`remote native install preflight refused: ${report.native_prebuild} has no reviewed prebuild; staging will not fall back to an undeclared Python/compiler toolchain`);
   return { command, report, stdout: result.stdout };
 }

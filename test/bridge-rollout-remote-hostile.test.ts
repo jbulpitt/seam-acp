@@ -121,7 +121,7 @@ describe.sequential("production remote shell deployment identity defenses (#241)
     expect(preflight.stdout).toContain(`checkout_source_sha=${sha}`); expect(preflight.stdout).toContain("artifact_source_sha=unmanaged"); expect(preflight.stdout).toContain("artifact_mode=legacy-checkout"); expect(preflight.stdout).toMatch(/artifact_identity=entrypoint-sha256:[0-9a-f]{64}/);
     expect(preflight.stdout).toContain("protocol_version=1"); expect(preflight.stdout).toContain("drain_SIGUSR2=yes");
     expect(preflight.stdout).toContain("describeModelCatalog=yes"); expect(preflight.stdout).toContain("fetchModelCatalog=yes");
-    expect(preflight.stdout).toMatch(/node_version=v(?:2[2-9]|[3-9]\d)\./); expect(preflight.stdout).toMatch(/npm_version=\d+\.\d+\.\d+/); expect(preflight.stdout).toMatch(/disk_bytes_available=\d+/);
+    expect(preflight.stdout).toMatch(/node_version=v(?:2[2-9]|[3-9]\d)\./); expect(preflight.stdout).toMatch(/node_abi=\d+/); expect(preflight.stdout).toMatch(/npm_version=\d+\.\d+\.\d+/); expect(preflight.stdout).toMatch(/disk_bytes_available=\d+/);
     expect(preflight.stdout).toContain("native_dependency=better-sqlite3@11.10.0"); expect(preflight.stdout).toContain("native_install_strategy=locked-prebuild"); expect(preflight.stdout).toContain("native_install_ready=yes");
     await expect(runRemote(["preflight"],{app:"wrong-app"})).rejects.toThrow(/pm2_app_pid_mismatch/);
     await expect(runRemote(["preflight"],{uid:String(process.getuid!()+1)})).rejects.toThrow(/wrong_owner/);

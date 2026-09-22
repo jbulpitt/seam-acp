@@ -28,6 +28,12 @@ set -euo pipefail
 REPO_SLUG="${SEAM_REPO_SLUG:-jbulpitt/seam-acp}"
 REPO_BRANCH="${SEAM_REPO_BRANCH:-main}"
 NODE_MAJOR_MIN=22
+# Keep this literal in lockstep with NATIVE_PREBUILD_ABIS in
+# bridge-rollout-remote.mjs. These are the ABIs for which the pinned
+# better-sqlite3 release has a reviewed prebuild; "newer Node" is not a
+# substitute for that evidence (#412, #521).
+NODE_NATIVE_PREBUILD_ABIS="108 115 127 131"
+NODE_NATIVE_DEPENDENCY="better-sqlite3@11.10.0"
 SEAM_HOME="${SEAM_HOME:-$HOME/.seam}"
 DEFAULT_REPO_DIR="$SEAM_HOME/seam-acp"
 NODE_PREFIX="$SEAM_HOME/node"
@@ -47,6 +53,11 @@ BRIDGE_ID=""
 TOKEN=""
 CONNECT_CWD=""
 CONNECT_DEV=0
+
+# Bound once by the runtime preflight and reused for both the wrapper and PM2.
+# An ambient `node` lookup after the check would recreate #412's ABI-137 entry.
+NODE_BIN=""
+NODE_ABI=""
 
 log()  { printf '==> %s\n' "$*"; }
 info() { printf '    %s\n' "$*"; }
@@ -330,8 +341,49 @@ require_macos() {
   fi
 }
 
-node_major() {
-  node -v 2>/dev/null | sed -e 's/^v//' -e 's/\..*//'
+node_abi_allowed() {
+  local wanted="$1" candidate
+  for candidate in $NODE_NATIVE_PREBUILD_ABIS; do
+    [ "$candidate" = "$wanted" ] && return 0
+  done
+  return 1
+}
+
+node_interpreter_supported() {
+  local candidate="$1" version major abi
+  case "$candidate" in /*) ;; *) return 1 ;; esac
+  [ -x "$candidate" ] || return 1
+  version=$("$candidate" --version 2>/dev/null) || return 1
+  major=$(printf '%s' "$version" | sed -n 's/^v\([0-9][0-9]*\)\..*/\1/p')
+  [ -n "$major" ] && [ "$major" -ge "$NODE_MAJOR_MIN" ] 2>/dev/null || return 1
+  abi=$("$candidate" -p 'process.versions.modules' 2>/dev/null) || return 1
+  case "$abi" in *[!0-9]*|'') return 1 ;; esac
+  node_abi_allowed "$abi"
+}
+
+require_supported_node_interpreter() {
+  local candidate="${1:-}" version major abi
+  [ -n "$candidate" ] || die "node interpreter is missing; refusing to create or recreate the bridge entry"
+  case "$candidate" in
+    /*) ;;
+    *) die "node interpreter must be an absolute path (got $candidate); refusing to create or recreate the bridge entry" ;;
+  esac
+  [ -x "$candidate" ] || die "node interpreter is not executable at $candidate; refusing to create or recreate the bridge entry"
+  version=$("$candidate" --version 2>/dev/null) || die "node interpreter version probe failed at $candidate"
+  major=$(printf '%s' "$version" | sed -n 's/^v\([0-9][0-9]*\)\..*/\1/p')
+  [ -n "$major" ] && [ "$major" -ge "$NODE_MAJOR_MIN" ] 2>/dev/null || \
+    die "node interpreter $candidate reports unsupported version $version; Node v$NODE_MAJOR_MIN or newer is required"
+  abi=$("$candidate" -p 'process.versions.modules' 2>/dev/null) || \
+    die "node interpreter ABI probe failed at $candidate"
+  case "$abi" in *[!0-9]*|'') die "node interpreter at $candidate reported invalid ABI $abi" ;; esac
+  if ! node_abi_allowed "$abi"; then
+    # Refuse only this create/recreate operation. An already-running bridge is
+    # untouched; the incident this prevents is macbook-air being recreated by
+    # an nvm lts/* alias onto v24/ABI 137 after #412 pinned the live PM2 entry.
+    die "node interpreter $candidate is $version with unsupported ABI $abi for $NODE_NATIVE_DEPENDENCY (reviewed ABIs: $NODE_NATIVE_PREBUILD_ABIS); refusing to create or recreate the bridge entry"
+  fi
+  NODE_BIN=$candidate
+  NODE_ABI=$abi
 }
 
 git_works() {
@@ -412,13 +464,16 @@ investigate() {
 ensure_node() {
   prepend_path "$NODE_PREFIX/bin"
   if have node; then
-    local major
-    major=$(node_major)
-    if [ -n "$major" ] && [ "$major" -ge "$NODE_MAJOR_MIN" ]; then
-      log "Node $(node -v) is new enough"
+    local candidate version abi
+    candidate=$(command -v node)
+    if node_interpreter_supported "$candidate"; then
+      require_supported_node_interpreter "$candidate"
+      log "Node $("$NODE_BIN" --version) / ABI $NODE_ABI is supported at $NODE_BIN"
       return 0
     fi
-    warn "Node $(node -v) is older than v$NODE_MAJOR_MIN — installing a private copy"
+    version=$("$candidate" --version 2>/dev/null || printf 'unknown')
+    abi=$("$candidate" -p 'process.versions.modules' 2>/dev/null || printf 'unknown')
+    warn "Node $version / ABI $abi at $candidate is not a reviewed bridge runtime — installing a private v$NODE_MAJOR_MIN copy"
   else
     log "Installing Node $NODE_MAJOR_MIN.x (official darwin tarball, no Xcode)"
   fi
@@ -449,7 +504,8 @@ ensure_node() {
   rm -rf "$tmp"
   prepend_path "$NODE_PREFIX/bin"
   have node || die "node still missing after install"
-  log "Node $(node -v) ready at $NODE_PREFIX/bin/node"
+  require_supported_node_interpreter "$(command -v node)"
+  log "Node $("$NODE_BIN" --version) / ABI $NODE_ABI ready at $NODE_BIN"
 }
 
 # ---------------------------------------------------------------------------
@@ -670,10 +726,11 @@ prompt_dev() {
 
 # ---------------------------------------------------------------------------
 write_wrapper() {
+  [ -n "$NODE_BIN" ] || die "node runtime preflight did not bind an interpreter"
   mkdir -p "$HOME/.local/bin"
   cat > "$HOME/.local/bin/seam-bridge" <<EOF
 #!/bin/sh
-exec "$(command -v node)" "$REPO_DIR/packages/bridge/dist/index.js" "\$@"
+exec "$NODE_BIN" "$REPO_DIR/packages/bridge/dist/index.js" "\$@"
 EOF
   chmod 755 "$HOME/.local/bin/seam-bridge"
   prepend_path "$HOME/.local/bin"
@@ -681,11 +738,15 @@ EOF
 
 write_and_start_pm2() {
   local conf_dir eco envfile node_bin pm2_name args extra_path
+  # Re-probe immediately before the first write. If the selected artifact was
+  # replaced after dependency setup, this create/recreate is the only thing
+  # refused; the incumbent PM2 process and the rest of the host keep running.
+  require_supported_node_interpreter "$NODE_BIN"
   conf_dir="$SEAM_HOME/bridge"
   mkdir -p "$conf_dir"
   eco="$conf_dir/ecosystem.config.cjs"
   envfile="$conf_dir/bridge.env"
-  node_bin=$(command -v node)
+  node_bin=$NODE_BIN
 
   extra_path="$SEAM_HOME/git/bin:$NODE_PREFIX/bin:$PM2_PREFIX/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$HOME/.fnm/aliases/default/bin:$PATH"
 
@@ -748,6 +809,7 @@ EOF
 
 # ---------------------------------------------------------------------------
 main() {
+  local node_candidate
   require_macos
   investigate
 
@@ -766,6 +828,13 @@ main() {
     [ -f "$REPO_DIR/packages/bridge/dist/index.js" ] || die "--skip-deps needs a built repo at $REPO_DIR"
     have pm2 || die "--skip-deps needs pm2 on PATH"
   fi
+
+  # The installer is a PM2-entry creation path, not just a package installer.
+  # Bind the exact absolute interpreter and ABI before prompting or writing
+  # config so an ambient nvm/fnm default cannot silently choose ABI 137.
+  node_candidate=$NODE_BIN
+  [ -n "$node_candidate" ] || node_candidate=$(command -v node 2>/dev/null || true)
+  require_supported_node_interpreter "$node_candidate"
 
   prompt_connect
   prompt_cwd

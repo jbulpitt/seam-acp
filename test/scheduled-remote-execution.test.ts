@@ -120,6 +120,10 @@ describe("#545 durable scheduled degradation", () => {
       prompt: "fixture input", createdUtc: new Date().toISOString() });
     expect(h.store.turnAttempts.get("degraded-ingest")).toMatchObject({ state: "completed",
       stdoutFallback: { count: 1, reasons: { unauthenticated: 1 } } });
+    // #536: without either ingest/inject hook, successful turns silently lose their submission receipt.
+    expect(h.store.turnAttempts.get("degraded-ingest")!.submissions).toMatchObject([
+      { phase: "local_write_completed", outcome: "completed", acceptance: { state: "unknown" } },
+    ]);
   });
 
   it.each(["unauthenticated", "unimplemented", "http_503", undefined])("records %s without failing a completed remote turn", async code => {
@@ -128,6 +132,10 @@ describe("#545 durable scheduled degradation", () => {
     const attempts = h.store.turnAttempts.list("completed");
     expect(attempts).toHaveLength(1);
     expect(attempts[0]!.outcome).toMatchObject({ status: "completed", output: "synthetic result" });
+    // #536: scheduled work must use the same durable evidence path as conversational turns.
+    expect(attempts[0]!.submissions).toMatchObject([
+      { phase: "local_write_completed", outcome: "completed", acceptance: { state: "unknown" } },
+    ]);
     if (code) expect(attempts[0]!.stdoutFallback).toMatchObject({ count: 1, reasons: { [code]: 1 } });
     else expect(attempts[0]!.stdoutFallback).toBeUndefined();
   });

@@ -234,7 +234,7 @@ export function interruptedRowForCompletedAttempt(attempt: {
     && !attempt.deliveryUncertainReason;
   const reason = attempt.deliveryAbandonedReason ?? attempt.deliveryUncertainReason
     ?? (unsettled
-      ? "completed but never settled its delivery disposition; it holds thread admission until abandoned"
+      ? "completed without a delivery disposition; output retained, ages out after one hour without claiming delivery"
       : null);
   if (!reason) return null;
   return {

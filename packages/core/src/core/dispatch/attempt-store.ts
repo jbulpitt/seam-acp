@@ -52,6 +52,8 @@ export interface SettledPromptedBlock {
   pendingIds: string[];
 }
 
+export const UNSETTLED_COMPLETION_MAX_AGE_MS = 60 * 60 * 1000;
+
 /** A logical dispatch has many process attempts, but only one terminal winner.
  * This is ownership metadata for the existing queue, not a second queue/outbox.
  * Specs/outcomes are private: never log this row or expose it in diagnostics.
@@ -221,9 +223,10 @@ export class TurnAttemptStore {
   /** A non-provider callback/setup failure can settle an admitted job before
    * execution claims it. Never overwrite a provider-owned generation. */
   completePending(id: string, outcome: DispatchResult): boolean {
-    return this.db.prepare(`UPDATE turn_attempts SET state='completed', outcome_json=?, updated_utc=?
+    return this.db.prepare(`UPDATE turn_attempts SET state='completed', outcome_json=?,
+      delivery_abandoned_reason=COALESCE(delivery_abandoned_reason, ?), updated_utc=?
       WHERE id=? AND state='pending'`)
-      .run(JSON.stringify(outcome), new Date().toISOString(), id).changes === 1;
+      .run(JSON.stringify(outcome), suppressedOnwardDeliveryReason(outcome), new Date().toISOString(), id).changes === 1;
   }
 
   retireDeadOwners(): number {
@@ -427,8 +430,8 @@ export class TurnAttemptStore {
     // completion. Suppressing onward delivery and settling its disposition used
     // to be unconnected, so a card-click whose report-back was inlined landed as
     // `completed` with `delivery_done=0` and no reason — which
-    // `isDeliveryDispositionTerminal` treats as outstanding forever, holding
-    // thread admission. `b27578fe` blocked a thread for 25 minutes that way.
+    // `isDeliveryDispositionTerminal` treats as outstanding forever, poisoning
+    // queue diagnostics. #426 established these receipts do NOT gate admission.
     //
     // It is one statement rather than a follow-up call on purpose: any gap
     // between "completed" and "settled" is the same hole, just narrower, and a
@@ -452,17 +455,16 @@ export class TurnAttemptStore {
   /**
    * Completed attempts with no delivery disposition at all (#419).
    *
-   * These are invisible to every operator control: `/seam workflows` keys on
-   * `stalled_utc`, cancel targets a running turn, and nothing times an
-   * unsettled delivery out. `markStalled` cannot reach them either — it is
+   * Exposed separately from retained work in `/seam workflows`. `markStalled`
+   * cannot reach them — it is
    * gated on `state IN ('pending','active','suspended')`, and widening it would
    * rewrite a finished attempt's state to `suspended`, destroying the record
    * that the turn ran and inviting a resume of work already done.
    *
    * So they are surfaced as what they are rather than disguised as stalled.
-   * With the settlement above this should stay empty; it exists because the
-   * trigger fix only closes the causes we know about, and the next unsettled
-   * completion should be recoverable without database access.
+   * A fresh completion may still owe finalization. Terminal ledger writes settle
+   * dispatches; the one-hour reaper bounds missed receipts without changing
+   * transport proof or onward recovery. These rows do not gate admission.
    */
   listUnsettledCompletions(target?: string): TurnAttempt[] {
     const rows = target
@@ -475,6 +477,36 @@ export class TurnAttemptStore {
             AND delivery_abandoned_reason IS NULL AND delivery_uncertain_reason IS NULL
           ORDER BY updated_utc,id`).all();
     return (rows as { id: string }[]).map(({ id }) => this.get(id)!);
+  }
+
+  /** #509: the dispatch ledger terminalizes AFTER completion effects (including
+   * durable onward claims). Unlike inbound delivery, these renderers do not
+   * produce nonce-backed receipts. Record that uncertainty, not delivery proof.
+   * Non-provider callbacks terminalize the ledger before completePending, so
+   * retain the disposition on their pending row too; execution is not changed.
+   * Active/suspended owners and inbound/scheduled delivery keep their protocols.
+   */
+  settleDispatchCompletion(id: string): void {
+    this.db.prepare(`UPDATE turn_attempts SET delivery_uncertain_reason=?, updated_utc=?
+      WHERE id=? AND source='dispatch' AND state IN ('pending','completed')
+        AND delivery_done=0 AND delivery_abandoned_reason IS NULL AND delivery_uncertain_reason IS NULL`)
+      .run("dispatch completion effects finalized without a nonce-backed transport receipt; output retained",
+        new Date().toISOString(), id);
+  }
+
+  /** #509: a missed settlement must not live forever (1,403 observed receipts).
+   * Age settles only the diagnostic disposition: it does not assert transport,
+   * delete output, alter the delegation ledger, or resume quarantined defects.
+   * Fresh completions keep their delivery window; late receipts may still prove
+   * delivery and durable onward recovery remains independently ledger-owned.
+   */
+  reapUnsettledCompletions(nowMs = Date.now()): number {
+    return this.db.prepare(`UPDATE turn_attempts SET delivery_uncertain_reason=?, updated_utc=?
+      WHERE state='completed' AND delivery_done=0
+        AND delivery_abandoned_reason IS NULL AND delivery_uncertain_reason IS NULL
+        AND updated_utc <= ?`)
+      .run("completion disposition timed out after one hour without delivery proof; output retained",
+        new Date(nowMs).toISOString(), new Date(nowMs - UNSETTLED_COMPLETION_MAX_AGE_MS).toISOString()).changes;
   }
 
   /** Record the exact terminal create-message before it can reach Discord. */

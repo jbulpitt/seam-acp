@@ -12,6 +12,8 @@ export interface DoneRetentionDeps {
   /** The delivery resolver's durable decision, never inferred from file age,
    * worker success, or a completed parent with an unresolved onward result. */
   isArtifactDeletable: (id: string) => boolean;
+  /** Lifecycle maintenance only; its count is NOT a deletion predicate. */
+  reapUnsettledCompletions?: () => number;
 }
 
 /** Bind the canonical #305 route-aware resolver without putting any delivery
@@ -19,8 +21,10 @@ export interface DoneRetentionDeps {
 export function bindDoneDeliveryResolver(opts: DoneDeliveryProofLookup & {
   dataDir: string;
   logger: Logger;
+  reapUnsettledCompletions?: () => number;
 }): DoneRetentionDeps {
-  return { dataDir: opts.dataDir, logger: opts.logger, isArtifactDeletable: (id) => {
+  return { dataDir: opts.dataDir, logger: opts.logger,
+    reapUnsettledCompletions: opts.reapUnsettledCompletions, isArtifactDeletable: (id) => {
     const row = opts.getDelegation(id);
     if (!row) return false; // Unknown ownership cannot supply the canonical proof input.
     const raw = readFileSync(path.join(dispatchDirs(opts.dataDir).done, `${id}.json`), "utf8");
@@ -161,6 +165,13 @@ export class DoneRetention {
   private sweep(): Promise<DonePruneSummary> | undefined {
     // Coalesce slow scans; otherwise an interval can multiply backlog work.
     if (this.stopped || this.active) return this.active;
+    try {
+      const reaped = this.deps.reapUnsettledCompletions?.() ?? 0;
+      if (reaped) this.deps.logger.warn({ reaped }, "completion dispositions aged out without delivery proof");
+    } catch (err) {
+      // A failed disposition sweep must not stop independent proven-output cleanup.
+      this.deps.logger.warn({ err }, "completion disposition reaper failed");
+    }
     const work = pruneDoneArtifacts(this.deps, { shouldStop: () => this.stopped });
     this.active = work;
     void work.then((summary) => {

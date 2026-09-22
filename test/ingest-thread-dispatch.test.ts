@@ -254,6 +254,20 @@ function expectJob(results: ChoiceResultHub, dispatchId: string, schema: unknown
 }
 
 describe("#224 live-thread ingest dispatch", () => {
+  // #509: ingest owns an HTTP result, not a Discord nonce; deleting settlement leaks both live and isolated receipts.
+  it.each([true, false])("settles ingest disposition (live=%s) without inventing Discord delivery", async (live) => {
+    const job = planEndpointDispatch({ endpoint: endpoint({ thread: live ? THREAD : null }), payload: "synthetic" });
+    store.turnAttempts.admit(job);
+    const { orch } = makeOrch(dataDir, store, { profile: { id: "claude", defaultModel: "default" } });
+    // Keep isolated provider execution synthetic; the real ingest lifecycle
+    // records its outcome and settles the HTTP/ledger effects around this call.
+    if (!live) Object.assign(orch, { injectTurn: async () => ({ text: "synthetic result", stopReason: "end_turn" }) });
+    await orch.dispatchInjectTurn(job);
+    expect(store.getDelegation(job.id)?.status).toBe("completed");
+    expect(store.turnAttempts.isDeliveryDispositionTerminal(job.id)).toBe(true);
+    expect(store.turnAttempts.isDeliveryProven(job.id)).toBe(false);
+  });
+
   it("injects into the target thread's own session, not a synthetic isolated one", async () => {
     const spec = planEndpointDispatch({ endpoint: endpoint(), payload: "a visitor question" });
     expect(spec.session).toBe("live");

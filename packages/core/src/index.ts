@@ -1057,6 +1057,7 @@ async function main(): Promise<void> {
     getDelegation: (id) => store.getDelegation(id),
     getReportBackByCorrelation: (id) => store.getReportBackByCorrelation(id),
     isAttemptDeliveryProven: (id) => store.turnAttempts.isDeliveryProven(id),
+    reapUnsettledCompletions: () => store.turnAttempts.reapUnsettledCompletions(),
     getExpirationAuthorization: (id) => store.getDoneArtifactExpirationAuthorization(id),
   }));
   const dispatchWatcher = createRuntimeDispatchWatcher({

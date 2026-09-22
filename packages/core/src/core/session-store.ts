@@ -2093,9 +2093,18 @@ export class SessionStore {
       sets.push(`${column} = @${key}`);
       params[key] = key === "promptPreview" ? truncatePreview(value) : value;
     }
-    this.db
-      .prepare(`UPDATE delegation_log SET ${sets.join(", ")} WHERE id = @id`)
-      .run(params);
+    this.db.transaction(() => {
+      const changed = this.db
+        .prepare(`UPDATE delegation_log SET ${sets.join(", ")} WHERE id = @id`)
+        .run(params).changes;
+      // #509: every normal dispatch finalized this ledger but left its attempt
+      // unsettled (~94/day). Commit the disposition with the terminal ledger,
+      // AFTER callers durably claim onward work. Unknown ids remain no-ops;
+      // nonterminal rows still owe completion. This is never transport proof.
+      if (changed && DELEGATION_TERMINAL_STATUSES.includes(status)) {
+        this.turnAttempts.settleDispatchCompletion(id);
+      }
+    })();
   }
 
   /** Explicitly terminalize an unrouteable legacy completion with evidence. */

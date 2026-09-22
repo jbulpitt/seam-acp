@@ -992,8 +992,11 @@ export class DiscordAdapter implements ChatAdapter {
 
   async editMessage(message: MessageRef, text: string): Promise<void> {
     const ch = await this.fetchSendableChannel(message.channel.id);
-    const msg = await ch.messages.fetch(message.id);
-    await msg.edit({
+    // PATCH by id. A post-restart backlog is exactly when the message cache is
+    // cold, and fetching first is a second round trip on every card (#445).
+    // A missing message still fails the edit; the turn that owns the card
+    // keeps running because callers treat a status edit as best-effort.
+    await ch.messages.edit(message.id, {
       content: text,
       flags: MessageFlags.SuppressEmbeds,
       allowedMentions: { parse: [] },
@@ -1776,7 +1779,6 @@ export class DiscordAdapter implements ChatAdapter {
     panel: StructuredPanel
   ): Promise<void> {
     const ch = await this.fetchSendableChannel(message.channel.id);
-    const msg = await ch.messages.fetch(message.id);
     const embed = DiscordAdapter.buildEmbed(panel);
     const payload: {
       content: string;
@@ -1795,7 +1797,7 @@ export class DiscordAdapter implements ChatAdapter {
       payload.files = panel.files.map((f) => new AttachmentBuilder(f.data, { name: f.filename }));
       payload.attachments = [];
     }
-    await msg.edit(payload);
+    await ch.messages.edit(message.id, payload);
   }
 
   async sendLayout(

@@ -38,9 +38,8 @@ function makeUnitPanel(titlePrefix = "📨 Handoff") {
         edits.push(p);
       },
     },
-    // Debounce 0 → every refresh edits immediately; huge heartbeat so it never
-    // fires during the test (and it is unref'd anyway).
-    { debounceMs: 0, heartbeatMs: 1_000_000 }
+    // Debounce 0 → every real snapshot change edits immediately.
+    { debounceMs: 0 }
   );
   return { panel, status, edits, getPosted: () => posted };
 }
@@ -68,6 +67,21 @@ describe("DispatchStatusPanel: drives TurnStatus from onEvent", () => {
     expect(status.model).toBe("claude-opus-4-8");
 
     await panel.finalize("Done", "Completed");
+  });
+
+  it("does not edit again when the same tool is observed later (#445)", async () => {
+    const { panel, edits } = makeUnitPanel();
+    await panel.start();
+    panel.handleEvent({ kind: "tool-start", toolCallId: "t1", title: "Read file.ts" });
+    const deadline = Date.now() + 1_000;
+    while (edits.length === 0 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const after = edits.length;
+    expect(after).toBeGreaterThan(0);
+    panel.handleEvent({ kind: "tool-start", toolCallId: "t2", title: "Read file.ts" });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(edits.length).toBe(after);
   });
 
   // Protects real empty/compacted telemetry; dropping zero-used updates hides a newly smaller budget.

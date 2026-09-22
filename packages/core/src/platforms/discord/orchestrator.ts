@@ -426,6 +426,7 @@ import {
   hasOrigin,
 } from "../../core/status-panel.js";
 import { DispatchStatusPanel } from "../../core/dispatch-status-panel.js";
+import { StatusSnapshotCard, observationFromTurn } from "../../core/status-snapshot.js";
 import { LiveHelpManager } from "../../core/live-help/manager.js";
 import type { VoiceConsoleManager } from "../../core/voice-console/manager.js";
 import type { VoiceConsoleController } from "./voice-console-controller.js";
@@ -3579,10 +3580,16 @@ export class Orchestrator {
       status.context = formatContextUsage(status.contextUsedHighWater, modelContextFloor);
     }
 
-    const initialPanel = withBrandAttachment(
-      renderStatusPanel(this.renderer, status.toInput(), Date.now()),
-      brandAsset
+    const openedAt = Date.now();
+    const statusCard = new StatusSnapshotCard();
+    const openedView = observationFromTurn(status);
+    statusCard.publish(openedView.observation, openedView.contextWindow, openedAt);
+    const initialRendered = renderStatusPanel(
+      this.renderer,
+      status.toInput(),
+      status.startedUtc + (statusCard.current()?.elapsedSeconds ?? 0) * 1000,
     );
+    const initialPanel = withBrandAttachment(initialRendered, brandAsset);
     this.assertQueueFence(queueFence);
     const statusMsg = this.adapter.sendPanel
       ? await this.adapter.sendPanel(channel, initialPanel)
@@ -3601,8 +3608,9 @@ export class Orchestrator {
       });
     }
 
+    statusCard.bind();
     let lastEdit = 0;
-    let lastRendered = "";
+    let lastRendered = JSON.stringify(initialRendered);
     let pendingRefresh: NodeJS.Timeout | undefined;
     const refresh = async (force = false) => {
       if (!this.queueFenceCurrent(queueFence)) return;
@@ -3622,29 +3630,33 @@ export class Orchestrator {
         clearTimeout(pendingRefresh);
         pendingRefresh = undefined;
       }
-      const panel = renderStatusPanel(this.renderer, status.toInput(), now);
+      // Same snapshot content is not a new card and not a changed one. Elapsed
+      // stays at the stamp from the edit that actually changed the record.
+      const viewed = observationFromTurn(status);
+      statusCard.publish(viewed.observation, viewed.contextWindow, now);
+      if (statusCard.plan().action === "skip") return;
+      const stamped = status.startedUtc + (statusCard.current()?.elapsedSeconds ?? 0) * 1000;
+      const panel = renderStatusPanel(this.renderer, status.toInput(), stamped);
       const fingerprint = JSON.stringify(panel);
-      if (fingerprint === lastRendered) return;
-      lastRendered = fingerprint;
-      lastEdit = now;
+      if (fingerprint === lastRendered) {
+        statusCard.acknowledge();
+        return;
+      }
       try {
         if (this.adapter.editPanel) {
           await this.adapter.editPanel(statusMsg, panel);
         } else {
           await this.adapter.editMessage(statusMsg, serializePanelText(panel));
         }
+        lastRendered = fingerprint;
+        lastEdit = now;
+        statusCard.acknowledge();
       } catch (err) {
+        // The card is still the previous artifact. A later refresh can edit
+        // it; the turn itself is not failed by a status write.
         this.logger.warn({ err }, "status edit failed");
       }
     };
-
-    // Heartbeat: tick the elapsed counter periodically. Edits to the same
-    // message are heavily rate-limited by Discord (~5/5s per message), and
-    // those rate-limit waits also queue behind regular sends — so we keep
-    // this conservative.
-    const heartbeat = setInterval(() => {
-      void refresh();
-    }, STATUS_HEARTBEAT_MS);
 
     // Typing indicator: refresh on real agent activity (text, tool calls,
     // thoughts) rather than a dumb timer. Discord's typing indicator
@@ -4739,7 +4751,6 @@ export class Orchestrator {
       if (scheduledAttempt) this.scheduledActivity?.phase(scheduledAttempt.id, "cleanup");
       if (!this.queueFenceCurrent(queueFence) || (humanAttempt && !humanOutcomeOwned)) {
         turnFinalized = true;
-        clearInterval(heartbeat);
         cancelFlushTimer();
         if (pendingRefresh) clearTimeout(pendingRefresh);
         this.currentSpeakerIds.delete(record.channelRef);
@@ -4767,7 +4778,6 @@ export class Orchestrator {
       // this runtime is an agent-initiated woken turn (handled in eventHandler),
       // not the in-turn backlog already drained above.
       turnFinalized = true;
-      clearInterval(heartbeat);
       if (pendingRefresh) {
         clearTimeout(pendingRefresh);
         pendingRefresh = undefined;
@@ -11304,7 +11314,6 @@ export class Orchestrator {
       },
       {
         debounceMs: STATUS_EDIT_DEBOUNCE_MS,
-        heartbeatMs: STATUS_HEARTBEAT_MS,
       }
     );
     await panel.start();

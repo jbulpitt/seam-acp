@@ -160,7 +160,7 @@ function capturePanels(style: "full" | "simple") {
       },
       edit: async (_ref, value) => { rendered.push(value); },
     },
-    { debounceMs: 0, heartbeatMs: 1_000_000 },
+    { debounceMs: 0 },
   );
   return { panel, rendered };
 }

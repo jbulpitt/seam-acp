@@ -18,8 +18,10 @@
  * It owns exactly the two defences the user-turn panel relies on, so a burst of
  * agent events can never turn into an editMessage storm or a reordered render:
  *
- *   1. **Throttle** — coalesce refreshes into at most one edit per `debounceMs`,
- *      with a periodic heartbeat so the elapsed clock still ticks while idle.
+ *   1. **Throttle** — coalesce refreshes into at most one edit per `debounceMs`.
+ *      Idle time does not tick the card. Elapsed advances only when the
+ *      snapshot content changes, so a re-render of the same state is not a
+ *      second write (#445).
  *   2. **Serialize** — every edit runs through a {@link SerialQueue}, so a slow
  *      edit can't be overtaken by a later one (the ACP read-loop concurrency
  *      landmine).
@@ -32,6 +34,7 @@ import type { AgentEvent } from "../agents/agent-runtime.js";
 import type { Renderer } from "../platforms/renderer.js";
 import { SerialQueue } from "./serial-queue.js";
 import { TurnStatus, renderStatusPanel, formatContextUsage } from "./status-panel.js";
+import { StatusSnapshotCard, observationFromTurn } from "./status-snapshot.js";
 import type { StructuredPanel, TurnState } from "./types.js";
 
 /** Platform I/O for the panel message. `post` sends the initial panel as a
@@ -50,9 +53,6 @@ export interface DispatchStatusPanelOptions {
   /** Minimum spacing between throttled edits. Defaults to 2500ms, matching the
    *  user-turn panel's `STATUS_EDIT_DEBOUNCE_MS`. */
   debounceMs?: number;
-  /** Heartbeat interval that ticks the elapsed clock while otherwise idle.
-   *  Defaults to 5000ms, matching the user-turn panel's `STATUS_HEARTBEAT_MS`. */
-  heartbeatMs?: number;
 }
 
 export class DispatchStatusPanel<TRef = unknown> {
@@ -62,9 +62,9 @@ export class DispatchStatusPanel<TRef = unknown> {
 
   private ref: TRef | undefined;
   private readonly queue = new SerialQueue();
+  private readonly card = new StatusSnapshotCard();
   private lastEditAt = 0;
   private pending: ReturnType<typeof setTimeout> | undefined;
-  private heartbeat: ReturnType<typeof setInterval> | undefined;
   private lastRendered = "";
   private finalized = false;
   private started = false;
@@ -91,12 +91,14 @@ export class DispatchStatusPanel<TRef = unknown> {
     return this.ref !== undefined;
   }
 
-  /** Post the initial panel and arm the heartbeat. Returns true when the panel
-   *  is live; false when the post failed (the panel then no-ops every event).
-   *  Best-effort — never throws. */
+  /** Post the one panel. Returns true when it is live; false when the post
+   *  failed (the panel then no-ops every event). Best-effort — never throws.
+   *  A second start does not post again. */
   async start(): Promise<boolean> {
     if (this.started) return this.isLive;
     this.started = true;
+    const viewed = observationFromTurn(this.status);
+    this.card.publish(viewed.observation, viewed.contextWindow, Date.now());
     const panel = this.renderPanel();
     this.lastRendered = JSON.stringify(panel);
     this.renders += 1;
@@ -106,12 +108,7 @@ export class DispatchStatusPanel<TRef = unknown> {
       this.ref = undefined;
     }
     if (this.ref === undefined) return false;
-    const hb = this.opts.heartbeatMs ?? 5000;
-    this.heartbeat = setInterval(() => {
-      void this.refresh();
-    }, hb);
-    // Don't keep the event loop alive on the heartbeat alone.
-    if (typeof this.heartbeat.unref === "function") this.heartbeat.unref();
+    this.card.bind();
     return true;
   }
 
@@ -175,9 +172,9 @@ export class DispatchStatusPanel<TRef = unknown> {
   }
 
   /**
-   * Finalize the panel: set the terminal state/action, stop the heartbeat, and
-   * issue one last serialized render. Idempotent — a second call just awaits the
-   * queue. Best-effort — never throws.
+   * Finalize the panel: set the terminal state/action and issue one last
+   * serialized render when that state is actually new. Idempotent — a second
+   * call just awaits the queue. Best-effort — never throws.
    */
   async finalize(state: TurnState, action?: string): Promise<void> {
     if (this.finalized) {
@@ -185,10 +182,6 @@ export class DispatchStatusPanel<TRef = unknown> {
       return;
     }
     this.finalized = true;
-    if (this.heartbeat) {
-      clearInterval(this.heartbeat);
-      this.heartbeat = undefined;
-    }
     if (this.pending) {
       clearTimeout(this.pending);
       this.pending = undefined;
@@ -203,7 +196,14 @@ export class DispatchStatusPanel<TRef = unknown> {
    *  card the user-turn path builds (`renderStatusPanel`). The IO decides how to
    *  ship it (real `sendPanel`/`editPanel` card, with a plain-text fallback). */
   private renderPanel(): StructuredPanel {
-    return renderStatusPanel(this.renderer, this.status.toInput(), Date.now());
+    // Elapsed comes from the snapshot stamp, not from a fresh clock read, so
+    // rendering the same record twice cannot produce a different panel.
+    const elapsed = this.card.current()?.elapsedSeconds ?? 0;
+    return renderStatusPanel(
+      this.renderer,
+      this.status.toInput(),
+      this.status.startedUtc + elapsed * 1000,
+    );
   }
 
   /** Throttled refresh: edit now if the debounce window has elapsed, else
@@ -230,19 +230,27 @@ export class DispatchStatusPanel<TRef = unknown> {
     await this.enqueueRender(false);
   }
 
-  /** Render + enqueue one serialized edit. Skips a redundant edit when the
-   *  rendered panel is byte-identical to the last one (unless forced/terminal).
-   *  The dedupe fingerprint is `JSON.stringify(panel)` — the exact same
-   *  structural fingerprint the user-turn `refresh` uses. */
-  private enqueueRender(done: boolean, force = false): Promise<void> {
+  /** Render + enqueue one serialized edit. An unchanged snapshot does not
+   *  edit, including when the caller forces a terminal redraw: the terminal
+   *  state is itself a snapshot change, and a clock tick is not. */
+  private enqueueRender(_done: boolean, _force = false): Promise<void> {
     this.lastEditAt = Date.now();
+    const viewed = observationFromTurn(this.status);
+    this.card.publish(viewed.observation, viewed.contextWindow, Date.now());
+    if (this.card.plan().action === "skip") return Promise.resolve();
     const panel = this.renderPanel();
     const fingerprint = JSON.stringify(panel);
-    if (!force && fingerprint === this.lastRendered) return Promise.resolve();
-    this.lastRendered = fingerprint;
+    if (fingerprint === this.lastRendered) {
+      this.card.acknowledge();
+      return Promise.resolve();
+    }
     this.renders += 1;
     const ref = this.ref;
     if (ref === undefined) return Promise.resolve();
-    return this.queue.run(() => this.io.edit(ref, panel));
+    return this.queue.run(async () => {
+      await this.io.edit(ref, panel);
+      this.lastRendered = fingerprint;
+      this.card.acknowledge();
+    });
   }
 }

@@ -150,6 +150,8 @@ interface MuxMsg {
     | "bridge_hello";
   data?: string;
   code?: number;
+  signal?: string | null;
+  hostOom?: RemoteHostOomEvidence;
   cmdId?: string;
   action?: string;
   payload?: any;
@@ -187,8 +189,24 @@ export interface MuxSpawnOpts {
 }
 
 /** Fake child returned by `mux.spawn()`. `slot` is the mux slot id. */
+export interface RemoteHostOomEvidence {
+  kind: "host_oom";
+  killedPid: number;
+  observedAt: number;
+  scope: "global" | "cgroup" | "unknown";
+}
+
+export interface RemoteExitEvidence {
+  /** Configured bridge identity, never a path or credential. */
+  bridgeId: string;
+  /** Present only after the child-owning host positively matched a kernel OOM record. */
+  hostOom?: RemoteHostOomEvidence;
+}
+
 export type MuxChild = ChildProcessByStdio<NodeWritable, NodeReadable, NodeReadable> & {
   readonly slot: number;
+  /** Set immediately before the remote exit event is emitted. */
+  remoteExit?: RemoteExitEvidence;
 };
 
 type FakeProcess = EventEmitter & {
@@ -196,8 +214,30 @@ type FakeProcess = EventEmitter & {
   stdout: NodeReadable;
   stderr: NodeReadable;
   readonly killed: boolean;
+  remoteExit?: RemoteExitEvidence;
   kill(): void;
 };
+
+function remoteHostOom(value: unknown): RemoteHostOomEvidence | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const record = value as Partial<RemoteHostOomEvidence>;
+  if (record.kind !== "host_oom"
+    || !Number.isSafeInteger(record.killedPid) || (record.killedPid ?? 0) < 2
+    || !Number.isFinite(record.observedAt) || (record.observedAt ?? 0) <= 0
+    || !["global", "cgroup", "unknown"].includes(record.scope ?? "")) return undefined;
+  return {
+    kind: "host_oom",
+    killedPid: record.killedPid!,
+    observedAt: record.observedAt!,
+    scope: record.scope!,
+  };
+}
+
+function exitSignal(value: unknown): NodeJS.Signals | null {
+  return typeof value === "string" && /^SIG[A-Z0-9]+$/.test(value)
+    ? value as NodeJS.Signals
+    : null;
+}
 
 // ---------------------------------------------------------------------------
 // Shared mux logic
@@ -256,6 +296,27 @@ export function makeMux(opts: {
   const bridgeWaiters: Array<{ slot: number; timeout: ReturnType<typeof setTimeout> }> = [];
   const pendingCmds = new Map<string, { resolve: (val: any) => void; reject: (err: Error) => void }>();
   const pendingRpcs = new Map<string, { resolve: (val: unknown) => void; reject: (err: Error) => void }>();
+
+  function applyRemoteExit(
+    slot: number,
+    entry: SlotEntry,
+    frame: { code?: number; signal?: unknown; hostOom?: unknown },
+  ): void {
+    const hostOom = remoteHostOom(frame.hostOom);
+    // This marker is set only for an exit frame observed by the child-owning
+    // bridge. Transport eviction remains a different failure. It lets the
+    // runtime say "the remote supervisor exited" when code=1/signal=null,
+    // rather than falsely claiming the process the controller represents was
+    // itself the kernel victim (#516).
+    entry.fake.remoteExit = {
+      bridgeId: opts.id,
+      ...(hostOom ? { hostOom } : {}),
+    };
+    entry.killed = true;
+    slots.delete(slot);
+    entry.stdout.push(null);
+    entry.fake.emit("exit", frame.code ?? 1, exitSignal(frame.signal));
+  }
 
   function send(msg: MuxMsg) {
     if (bridgeWs?.readyState === WebSocket.OPEN) {
@@ -499,7 +560,14 @@ export function makeMux(opts: {
               const afterSeq = outputCursor.get(slot) ?? 0;
               void sendCmd("replayOutput", { slot, afterSeq }).then((reply: {
                 slot?: number;
-                frames?: Array<{ seq?: number; type?: string; data?: string; code?: number }>;
+                frames?: Array<{
+                  seq?: number;
+                  type?: string;
+                  data?: string;
+                  code?: number;
+                  signal?: string | null;
+                  hostOom?: RemoteHostOomEvidence;
+                }>;
                 gap?: { afterSeq: number; firstAvailableSeq: number; droppedFrames: number };
               }) => {
                 const live = slots.get(slot);
@@ -513,10 +581,7 @@ export function makeMux(opts: {
                     if (typeof frame.seq === "number") outputCursor.set(slot, frame.seq);
                     live.stdout.push(frame.data);
                   } else if (frame.type === "exit") {
-                    live.killed = true;
-                    slots.delete(slot);
-                    live.stdout.push(null);
-                    live.fake.emit("exit", frame.code ?? 1, null);
+                    applyRemoteExit(slot, live, frame);
                   }
                 }
                 const through = outputCursor.get(slot);
@@ -593,10 +658,7 @@ export function makeMux(opts: {
         if (typeof msg.seq === "number") outputCursor.set(msg.slot, msg.seq);
         entry.stdout.push(msg.data);
       } else if (msg.type === "exit") {
-        entry.killed = true;
-        slots.delete(msg.slot);
-        entry.stdout.push(null);
-        entry.fake.emit("exit", msg.code ?? 1, null);
+        applyRemoteExit(msg.slot, entry, msg);
       }
     });
 

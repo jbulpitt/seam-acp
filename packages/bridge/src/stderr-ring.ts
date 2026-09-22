@@ -188,6 +188,10 @@ export function exitFramePayload(
   const tail = abnormal ? ring?.tail() : undefined;
   return {
     code: code ?? 1,
+    // #516: the controller used to replace every remote signal with null.
+    // Keep clean/code-only frames byte-identical for old peers, but preserve a
+    // signal when the child-owning host actually observed one.
+    ...(signal ? { signal } : {}),
     ...(tail ? { stderrTail: tail } : {}),
   };
 }

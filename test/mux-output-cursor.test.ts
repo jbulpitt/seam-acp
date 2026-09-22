@@ -76,6 +76,22 @@ async function reconnect(ws: FakeWs, liveSlots: number[]) {
 }
 
 describe("#444 the cursor is what survives a disconnect", () => {
+  it("carries live remote SIGKILL and OOM evidence to the fake child", async () => {
+    const { ws, child } = harness();
+    const exits: Array<[number | null, string | null]> = [];
+    child.on("exit", (code: number | null, signal: string | null) => exits.push([code, signal]));
+    ws.deliver({
+      slot: child.slot,
+      type: "exit",
+      code: 1,
+      signal: "SIGKILL",
+      hostOom: { kind: "host_oom", killedPid: 221249, observedAt: 1_790_033_574_259, scope: "global" },
+    });
+    await flush();
+    expect(exits).toEqual([[1, "SIGKILL"]]);
+    expect(child.remoteExit?.hostOom?.killedPid).toBe(221249);
+  });
+
   it("asks for everything after the last seq it actually saw", async () => {
     const { ws, child } = harness();
     ws.deliver({ slot: child.slot, type: "data", data: "a\n", seq: 7 });
@@ -144,6 +160,29 @@ describe("#444 the cursor is what survives a disconnect", () => {
     });
     await flush();
     expect(exits).toEqual([3]);
+  });
+
+  it("preserves a replayed remote signal and host OOM fact", async () => {
+    const { ws, child } = harness();
+    const exits: Array<[number | null, string | null]> = [];
+    child.on("exit", (code: number | null, signal: string | null) => exits.push([code, signal]));
+    await reconnect(ws, [child.slot]);
+    ws.reply(ws.cmds("replayOutput").at(-1)!, {
+      slot: child.slot,
+      frames: [{
+        seq: 2,
+        type: "exit",
+        code: 1,
+        signal: "SIGKILL",
+        hostOom: { kind: "host_oom", killedPid: 221249, observedAt: 1_790_033_574_259, scope: "global" },
+      }],
+    });
+    await flush();
+    expect(exits).toEqual([[1, "SIGKILL"]]);
+    expect(child.remoteExit).toEqual({
+      bridgeId: "b1",
+      hostOom: { kind: "host_oom", killedPid: 221249, observedAt: 1_790_033_574_259, scope: "global" },
+    });
   });
 });
 

@@ -144,6 +144,57 @@ describe("#487 production remote construction paths", () => {
       expect(h.calls.children[0].killed).toBe(false);
     } finally { await router.disposeAll(); }
   });
+
+  it("surfaces a bridge-proven host OOM through the real scheduled turn state without replaying", async () => {
+    const h = setup();
+    h.onPrompt.mockImplementation(async () => {
+      const child = h.calls.children[0];
+      child.remoteExit = {
+        bridgeId: "fhr-server",
+        hostOom: { kind: "host_oom", killedPid: 221249, observedAt: 1_790_033_574_259, scope: "global" },
+      };
+      child.exitCode = 1;
+      child.emit("exit", 1, null);
+      // Ensure the runtime's death rejection wins the ACP response race.
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    });
+    await h.make().runScheduledPrompt(h.row.id);
+    expect(h.calls.prompts).toHaveLength(1);
+    expect(h.store.getScheduled(h.row.id)?.lastStatus).toContain("memory exhaustion on host 'fhr-server'");
+    expect(h.logs).toContainEqual(expect.objectContaining({
+      msg: "adapter error classified",
+      errorKind: "host_oom",
+    }));
+    expect(h.logs).toContainEqual(expect.objectContaining({
+      msg: "turn recovery resolved",
+      resolution: expect.objectContaining({
+        errorKind: "host_oom",
+        transience: "transient",
+        startRung: 3,
+      }),
+    }));
+  });
+
+  it("names a code-only remote supervisor exit without inventing a SIGKILL cause", async () => {
+    const h = setup();
+    h.onPrompt.mockImplementation(async () => {
+      const child = h.calls.children[0];
+      child.remoteExit = { bridgeId: "fhr-server" };
+      child.killed = true;
+      child.exitCode = 1;
+      child.emit("exit", 1, null);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    });
+    await h.make().runScheduledPrompt(h.row.id);
+    expect(h.store.getScheduled(h.row.id)?.lastStatus).toContain(
+      "remote agent supervisor exited mid-turn on host 'fhr-server' (code=1, signal=null)"
+    );
+    expect(h.store.getScheduled(h.row.id)?.lastStatus).not.toContain("memory exhaustion");
+    expect(h.logs).toContainEqual(expect.objectContaining({
+      msg: "adapter error classified",
+      errorKind: "agent_exit",
+    }));
+  });
 });
 
 describe("#466 scheduled execution boundary", () => {

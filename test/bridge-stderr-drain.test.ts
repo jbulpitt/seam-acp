@@ -151,7 +151,10 @@ describe("#456 the exit frame reports cause instead of leaving it inferred", () 
   });
 
   it("treats a signal death as abnormal", () => {
-    expect(exitFramePayload(null, "SIGSEGV", ringWith("boom\n"))).toHaveProperty("stderrTail");
+    expect(exitFramePayload(null, "SIGSEGV", ringWith("boom\n"))).toMatchObject({
+      signal: "SIGSEGV",
+      stderrTail: "boom",
+    });
   });
 
   it("stays silent on a clean exit, so a healthy turn carries no payload", () => {
@@ -232,7 +235,7 @@ describe("#456 the per-slot lifecycle, which had no coverage until mutation said
     registry.attach(1, child);
     child.emit("interrupted\n");
     registry.drop(1);
-    expect(registry.exitPayload(1, null, "SIGTERM")).toEqual({ code: 1 });
+    expect(registry.exitPayload(1, null, "SIGTERM")).toEqual({ code: 1, signal: "SIGTERM" });
   });
 
   it("survives an exit for a slot it never saw", () => {
@@ -251,7 +254,7 @@ describe("#456 mixed-version: the wire must not change for anyone who is not ask
     const payload = exitFramePayload(137, "SIGKILL", ringWith2());
     expect(payload.code).toBe(137);
     // Old consumers destructure `code`; an unknown sibling field is ignored.
-    expect(Object.keys(payload).sort()).toEqual(["code", "stderrTail"]);
+    expect(Object.keys(payload).sort()).toEqual(["code", "signal", "stderrTail"]);
   });
 
   function ringWith2() {

@@ -1,6 +1,11 @@
 /** Public surface of `@seam/adapters`: AgentAdapter, profile factories, makeMux. */
 export { makeMux, BridgeUnreachableError } from "./mux.js";
-export type { MuxSpawnOpts, MuxChild } from "./mux.js";
+export type {
+  MuxSpawnOpts,
+  MuxChild,
+  RemoteExitEvidence,
+  RemoteHostOomEvidence,
+} from "./mux.js";
 export * from "./agent-profile.js";
 export * from "./error-classification.js";
 export * from "./error-resolver.js";

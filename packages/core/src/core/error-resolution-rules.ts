@@ -16,6 +16,10 @@ const POLICY: Record<Exclude<AdapterErrorKind, "unclassified">,
   connection_closed: { transience: "transient", startRung: 3, needsHuman: "no" },
   protocol_error: { transience: "unknown", startRung: 1, needsHuman: "unknown" },
   agent_exit: { transience: "unknown", startRung: 3, needsHuman: "unknown" },
+  // #516: the host, not the adapter, exhausted memory. Reattach/fallback is
+  // appropriate, but rung 1 would replay a possibly billable prompt into the
+  // same dead process. Refuse that replay only; recovery starts at reattach.
+  host_oom: { transience: "transient", startRung: 3, needsHuman: "no" },
   overloaded: { transience: "transient", startRung: 1, needsHuman: "no" },
   invalid_request: { transience: "terminal", startRung: 4, needsHuman: "unknown" },
   context_length: { transience: "terminal", startRung: 4, needsHuman: "no" },

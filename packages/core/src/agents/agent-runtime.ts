@@ -30,6 +30,7 @@ import {
   type AgentProfile,
   type AdapterErrorClassification,
   type CatalogEffort,
+  type RemoteExitEvidence,
   type makeMux,
 } from "@seam/adapters";
 import type { Logger } from "../lib/logger.js";
@@ -526,6 +527,50 @@ export class AgentRuntime {
       : this.profile.spawn(this.modelOverride, this.effortOverride, this.mcpServers);
     this.child = child;
 
+    const processExitError = (
+      code: number | null,
+      signal: NodeJS.Signals | null,
+      phase: "before initialize" | "mid-turn",
+    ): Error => {
+      const remoteExit = (child as { remoteExit?: RemoteExitEvidence }).remoteExit;
+      if (remoteExit?.hostOom) {
+        const scope = remoteExit.hostOom.scope === "unknown" ? "" : ` (${remoteExit.hostOom.scope})`;
+        const error = new Error(
+          `remote agent process tree was killed by memory exhaustion on host '${remoteExit.bridgeId}'${scope}; `
+          + `kernel killed pid ${remoteExit.hostOom.killedPid}, supervisor exited (code=${code}, signal=${signal})`
+        );
+        attachErrorClassification(error, {
+          errorKind: "host_oom",
+          agentId: this.profile.id,
+          exitCode: code,
+          signal,
+          sourceKind: "kernel_oom",
+          details: `bridge '${remoteExit.bridgeId}' matched kernel OOM evidence to this slot's process tree`,
+        });
+        return error;
+      }
+      if (remoteExit) {
+        // A remote code=1/signal=null describes the ACP supervisor, not
+        // necessarily the descendant that failed. The two production OOMs in
+        // #516 had exactly that shape. Preserve the exit while refusing the
+        // false claim that this represented process was itself signalled.
+        const error = new Error(
+          `remote agent supervisor exited ${phase} on host '${remoteExit.bridgeId}' `
+          + `(code=${code}, signal=${signal}); no matching host OOM evidence was available`
+        );
+        attachErrorClassification(error, {
+          errorKind: "agent_exit",
+          agentId: this.profile.id,
+          exitCode: code,
+          signal,
+          sourceKind: "remote_supervisor_exit",
+          details: `bridge '${remoteExit.bridgeId}' observed the supervisor exit; descendant cause was not proven`,
+        });
+        return error;
+      }
+      return new Error(`agent process exited ${phase} (code=${code}, signal=${signal})`);
+    };
+
     // Capture spawn errors (ENOENT, EACCES, etc.) so they surface as a
     // rejected start() promise instead of letting the ACP handshake hang
     // indefinitely on a stdout that will never produce data.
@@ -547,11 +592,7 @@ export class AgentRuntime {
       child.once("exit", (code, signal) => {
         if (!spawnError && this.connection === undefined) {
           // Process died before initialize completed.
-          reject(
-            new Error(
-              `agent process exited before initialize (code=${code}, signal=${signal})`
-            )
-          );
+          reject(processExitError(code, signal, "before initialize"));
         }
       });
     });
@@ -572,9 +613,7 @@ export class AgentRuntime {
       // but the channel queue wedges — card stuck "working", activeTurns never
       // decrements, no new turn starts, and `/seam cancel` reports "no active
       // turn" (the runtime is already gone). Previously only a restart cleared it.
-      this.rejectInFlightPrompt?.(
-        new Error(`agent process exited mid-turn (code=${code}, signal=${signal})`)
-      );
+      this.rejectInFlightPrompt?.(processExitError(code, signal, "mid-turn"));
       // If initialize already completed, notify the router so it can evict
       // this runtime and attempt session/load on the next incoming message.
       if (this.connection !== undefined) {

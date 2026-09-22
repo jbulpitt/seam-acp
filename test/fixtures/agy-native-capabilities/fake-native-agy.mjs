@@ -3,6 +3,7 @@ import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 
 const args = process.argv.slice(2);
 const fixtureDir = process.env.SEAM_AGY_CAPABILITY_FIXTURE_DIR;
@@ -29,6 +30,14 @@ const isModelsCommand = args.includes("models");
 const logFile = argValue("--log-file");
 const resumedConversation = argValue("--conversation");
 const schemaFile = argValue("--json-schema");
+const csrfArg = args.find((arg) => arg.startsWith("--csrf_token="));
+const csrfToken = csrfArg?.slice("--csrf_token=".length);
+const csrfFingerprint = csrfToken
+  ? createHash("sha256").update(csrfToken).digest("hex")
+  : null;
+const safeArgs = args.map((arg) => arg.startsWith("--csrf_token=")
+  ? "--csrf_token=[redacted]"
+  : arg);
 
 const readJson = (file) => JSON.parse(fs.readFileSync(file, "utf8"));
 // #361: how many 500s to emit before the quota RPC starts answering.
@@ -105,9 +114,21 @@ appendInvocation({
   home: process.env.HOME ?? null,
   mcpConfig: mcpConfig ?? null,
   jsonSchema: jsonSchema ?? null,
-  args,
+  args: safeArgs,
+  csrfFingerprint,
   cwd: process.cwd(),
 });
+
+if (process.env.SEAM_AGY_CSRF_FLAG_MODE === "unsupported" && csrfToken) {
+  fs.writeSync(2, `unknown flag: --csrf_token=${csrfToken}\n`);
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  process.exit(2);
+}
+if (process.env.SEAM_AGY_CSRF_FLAG_MODE === "echo-fail" && csrfToken) {
+  fs.writeSync(2, `synthetic child rejected csrf capability ${csrfToken}\n`);
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  process.exit(42);
+}
 
 if (isModelsCommand && process.env.SEAM_AGY_R5_CATALOG_MODE === "auth-wait") {
   process.stderr.write(
@@ -161,6 +182,34 @@ const server = http.createServer(async (request, response) => {
     response.setHeader("content-type", "application/json");
     response.end(JSON.stringify({ status: "ok", instanceId: `fixture-${process.pid}` }));
     return;
+  }
+
+  const rpc = request.url?.split("/").at(-1) ?? "unknown";
+  const suppliedCsrf = request.headers["x-codeium-csrf-token"];
+  const csrfStatus = suppliedCsrf === undefined
+    ? "missing"
+    : suppliedCsrf === csrfToken
+      ? "match"
+      : "wrong";
+  if (process.env.SEAM_AGY_CSRF_MODE === "enforce") {
+    appendInvocation({ scenario: "csrf-rpc", rpc, csrfStatus, csrfFingerprint });
+    if (!csrfToken || csrfStatus !== "match") {
+      if (request.url?.endsWith("/StreamAgentStateUpdates")) {
+        response.statusCode = 200;
+        response.setHeader("content-type", "application/connect+json");
+        response.end(envelope(2, { error: {
+          code: "unauthenticated",
+          message: csrfStatus === "missing" ? "missing CSRF token" : "invalid CSRF token",
+        } }));
+      } else {
+        response.statusCode = 403;
+        response.end(JSON.stringify({ error: {
+          code: "unauthenticated",
+          message: csrfStatus === "missing" ? "missing CSRF token" : "invalid CSRF token",
+        } }));
+      }
+      return;
+    }
   }
 
   if (request.url?.endsWith("/GetAvailableModels")) {

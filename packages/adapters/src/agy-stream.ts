@@ -33,9 +33,9 @@ export class AgyStreamUnavailableError extends ProbeError {
     return ["unauthenticated", "permission_denied", "unimplemented", "protocol_error"].includes(this.streamCode)
       || /^http_(?:4\d\d|5\d\d|200)$/.test(this.streamCode);
   }
-  constructor(code: string, message: string) {
-    const safeCode = redactProbeText(code, process.env).slice(0, 100);
-    const safeMessage = redactProbeText(message, process.env).slice(0, 2000);
+  constructor(code: string, message: string, sensitiveValues: ReadonlyArray<string> = []) {
+    const safeCode = redactProbeText(code, process.env, sensitiveValues).slice(0, 100);
+    const safeMessage = redactProbeText(message, process.env, sensitiveValues).slice(0, 2000);
     super("protocol_error", `AGY stream ${safeCode}: ${safeMessage}`);
     this.streamCode = safeCode;
     this.streamMessage = safeMessage;
@@ -240,6 +240,8 @@ export interface AgyStep {
 export async function* subscribeToAgyStream(opts: {
   port: number;
   conversationId: string;
+  /** Capability owned by this exact child; never a session credential. */
+  csrfToken?: string;
   subscriberId?: string;
   signal?: AbortSignal;
 }): AsyncGenerator<AgyStreamUpdate, void, void> {
@@ -256,13 +258,20 @@ export async function* subscribeToAgyStream(opts: {
 
   const resp = await fetch(url, {
     method: "POST",
-    headers: { "content-type": "application/connect+json" },
+    headers: {
+      "content-type": "application/connect+json",
+      ...(opts.csrfToken ? { "x-codeium-csrf-token": opts.csrfToken } : {}),
+    },
     body,
     signal: opts.signal,
   });
   if (!resp.ok || !resp.body) {
     await resp.body?.cancel();
-    throw new AgyStreamUnavailableError(`http_${resp.status}`, resp.statusText || "subscription has no response body");
+    throw new AgyStreamUnavailableError(
+      `http_${resp.status}`,
+      resp.statusText || "subscription has no response body",
+      opts.csrfToken ? [opts.csrfToken] : [],
+    );
   }
 
   for await (const env of readConnectEnvelopes(resp.body)) {
@@ -282,6 +291,7 @@ export async function* subscribeToAgyStream(opts: {
         throw new AgyStreamUnavailableError(
           typeof error.code === "string" ? error.code : "unknown",
           typeof error.message === "string" ? error.message : "subscription rejected",
+          opts.csrfToken ? [opts.csrfToken] : [],
         );
       }
       return;

@@ -20,7 +20,7 @@
  */
 
 import { type ChildProcess, type ChildProcessByStdio, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { setTimeout as delay } from "node:timers/promises";
 import fsSync from "node:fs";
@@ -1180,6 +1180,34 @@ export function agyExecutionPolicyArgs(
  * output with and without the flag on the `--model` validator probe.
  */
 export const AGY_NO_SLASH_EXPANSION = "--disable-slash-commands";
+/** Hidden AGY launch option verified by the #503 real-binary matrix. */
+export const AGY_CSRF_FLAG = "--csrf_token";
+
+type AgyCsrfCapability = "supported" | "unsupported";
+interface AgyChildConnection {
+  /** Per-child capability; absent only for an explicitly detected legacy CLI. */
+  csrfToken?: string;
+}
+
+const agyCsrfCapabilities = new Map<string, AgyCsrfCapability>();
+
+function newAgyCsrfToken(): string {
+  // 192 bits is ample for a loopback capability and stays below the generic
+  // long-token heuristic, so explicit registration remains independently
+  // testable rather than accidentally protected by a catch-all regex.
+  return randomBytes(24).toString("base64url");
+}
+
+function agyCsrfArg(token: string): string {
+  return `${AGY_CSRF_FLAG}=${token}`;
+}
+
+function agyRpcHeaders(csrfToken?: string): Record<string, string> {
+  return {
+    "Content-Type": "application/json",
+    ...(csrfToken ? { "x-codeium-csrf-token": csrfToken } : {}),
+  };
+}
 
 /** ACP `_meta` key: a JSON Schema object for this print-mode turn only. */
 export const SEAM_AGY_JSON_SCHEMA_META = "seam/agyJsonSchema";
@@ -1209,6 +1237,8 @@ export function buildAgyPromptArgs(opts: {
   printTimeoutSeconds: number;
   cwd: string;
   execution: AgyExecutionPolicy;
+  /** Omitted only after a prompt-free child proved this artifact rejects it. */
+  csrfToken?: string;
   cascadeId?: string;
   /**
    * Print-mode structured output (agy >= 1.1.8). When set, BOTH
@@ -1220,6 +1250,7 @@ export function buildAgyPromptArgs(opts: {
   return [
     ...(opts.useStdin ? [] : ["-p", opts.promptText]),
     AGY_NO_SLASH_EXPANSION,
+    ...(opts.csrfToken ? [agyCsrfArg(opts.csrfToken)] : []),
     "--model",
     opts.modelDisplayName,
     // Redirect this spawn's log to a private path we own and read back for
@@ -1689,6 +1720,9 @@ class AgyAgent implements Agent {
       await fs.writeFile(schemaFile, JSON.stringify(jsonSchema), { encoding: "utf8", mode: 0o600, flag: "wx" });
     }
 
+    const csrfToken = agyCsrfCapabilities.get(this.runtime.identityKey) === "unsupported"
+      ? undefined
+      : newAgyCsrfToken();
     const args = buildAgyPromptArgs({
       promptText,
       useStdin,
@@ -1697,10 +1731,10 @@ class AgyAgent implements Agent {
       printTimeoutSeconds: this.printTimeoutSeconds ?? 600,
       cwd: sess.cwd,
       execution: this.execution,
+      ...(csrfToken ? { csrfToken } : {}),
       ...(sess.cascadeId ? { cascadeId: sess.cascadeId } : {}),
       ...(schemaFile ? { structuredOutput: { jsonSchema: schemaFile } } : {}),
     });
-
     if (process.env.AGY_PROFILE_DEBUG) {
       // eslint-disable-next-line no-console
       console.error(`[agy] spawning verified native runtime useStdin=${useStdin} argvCount=${args.length}`);
@@ -1716,6 +1750,7 @@ class AgyAgent implements Agent {
       sess.mcpHome ?? "",
       agyLogPath,
       schemaFile ?? "",
+      csrfToken ?? "",
     ]);
 
     if (useStdin && proc.stdin) {
@@ -1737,6 +1772,7 @@ class AgyAgent implements Agent {
         this.runtime,
         ls.port,
         cancelAbort.signal,
+        csrfToken,
       ).then(async (available) => {
         if (!available) return;
         const enriched = await getCatalog(this.runtime);
@@ -1813,6 +1849,7 @@ class AgyAgent implements Agent {
           for await (const update of subscribeToAgyStream({
             port: ls.port,
             conversationId: cid,
+            ...(csrfToken ? { csrfToken } : {}),
             signal: cancelAbort.signal,
           })) {
             if (cancelAbort.signal.aborted) break outer;
@@ -2553,7 +2590,7 @@ export function parseAgyModelsList(output: string): Array<{ modelId: string; raw
 /** Finite discovery uses the shared lifecycle, retaining R4's current protocol. */
 async function runAgyProbe<T>(
   runtime: AgyNativeRuntime, args: string[], timeoutMs: number,
-  run: (handle: ProbeHandle) => Promise<T>,
+  run: (handle: ProbeHandle, connection: AgyChildConnection) => Promise<T>,
   observe?: (proc: ChildProcessWithoutNullStreams) => (() => void),
   acceptNonzeroExit = false,
   /** #361: a caller's cancellation. `runBoundedProbe` refuses to spawn when it
@@ -2561,28 +2598,66 @@ async function runAgyProbe<T>(
    * work stops rather than the wait. */
   signal?: AbortSignal,
 ): Promise<T> {
-  let proc: ChildProcessWithoutNullStreams;
-  let stopObserving: (() => void) | undefined;
+  const attempt = async (csrfToken?: string): Promise<T> => {
+    let proc: ChildProcessWithoutNullStreams;
+    let stopObserving: (() => void) | undefined;
+    const childArgs = csrfToken ? [agyCsrfArg(csrfToken), ...args] : args;
+    try {
+      return await runBoundedProbe({
+        executable: "native-agy", label: "native AGY", timeoutMs, killGraceMs: 500,
+        processGroup: true, allowCleanExit: true, acceptNonzeroExit,
+        ...(signal ? { signal } : {}),
+        ...(csrfToken ? { sensitiveValues: [csrfToken] } : {}),
+        spawnOverride: () => {
+          proc = runtime.prepare(childArgs, "/tmp", { detached: true, stdio: ["pipe", "pipe", "pipe"] }).spawn() as ChildProcessWithoutNullStreams;
+          return proc;
+        },
+        run: async (handle) => {
+          // `runAgyProbe` has exactly two production callers: prompt-free
+          // `agy models` catalog and quota reads. Leaving stdin writable let an
+          // authorization-code prompt wait on a daemon that can never answer it
+          // (#478). EOF refuses this one probe promptly; interactive turns use a
+          // different lifecycle and keep their stdin transport unchanged.
+          handle.stdin.end();
+          stopObserving = observe?.(proc);
+          return run(handle, csrfToken ? { csrfToken } : {});
+        },
+      });
+    } finally {
+      // Do not keep the validator parser/output alive after finite finalization.
+      stopObserving?.();
+    }
+  };
+
   try {
-    return await runBoundedProbe({
-      executable: "native-agy", label: "native AGY", timeoutMs, killGraceMs: 500,
-      processGroup: true, allowCleanExit: true, acceptNonzeroExit,
-      ...(signal ? { signal } : {}),
-      spawnOverride: () => {
-        proc = runtime.prepare(args, "/tmp", { detached: true, stdio: ["pipe", "pipe", "pipe"] }).spawn() as ChildProcessWithoutNullStreams;
-        return proc;
-      },
-      run: async (handle) => {
-        // `runAgyProbe` has exactly two production callers: prompt-free
-        // `agy models` catalog and quota reads. Leaving stdin writable let an
-        // authorization-code prompt wait on a daemon that can never answer it
-        // (#478). EOF refuses this one probe promptly; interactive turns use a
-        // different lifecycle and keep their stdin transport unchanged.
-        handle.stdin.end();
-        stopObserving = observe?.(proc);
-        return run(handle);
-      },
-    });
+    const capability = agyCsrfCapabilities.get(runtime.identityKey);
+    if (capability === "unsupported") return await attempt();
+    try {
+      const result = await attempt(newAgyCsrfToken());
+      agyCsrfCapabilities.set(runtime.identityKey, "supported");
+      return result;
+    } catch (error) {
+      const detail = error instanceof ProbeError ? error.detail : "";
+      // The shared credential redactor intentionally replaces the operand in
+      // `unknown flag: --csrf_token=...`, so the safe diagnostic may no longer
+      // contain the flag name. This FIRST probe differs from the established
+      // prompt-free argv by exactly one option: our CSRF flag. An unknown-flag
+      // result therefore identifies that option without retaining raw argv.
+      if (
+        capability !== undefined ||
+        !(error instanceof ProbeError) ||
+        error.code !== "exited_early" ||
+        !/\bunknown (?:flag|option)\b/i.test(detail)
+      ) {
+        throw error;
+      }
+      // Compatibility is learned on a prompt-free `models` child, so this one
+      // retry cannot duplicate a billable turn. It preserves an older working
+      // binding without inventing a version boundary. Real prompts are never
+      // retried: deleting that distinction can charge twice for one request.
+      agyCsrfCapabilities.set(runtime.identityKey, "unsupported");
+      return await attempt();
+    }
   } catch (error) {
     // Classify the already-redacted diagnostic while it still exists, then
     // discard ALL text. `agyFailure` accepts only the closed enum, so a token,
@@ -2592,9 +2667,6 @@ async function runAgyProbe<T>(
       error instanceof ProbeError ? error.code : "protocol_error",
       agyProbeKind(error),
     );
-  } finally {
-    // Do not keep the validator parser/output alive after finite finalization.
-    stopObserving?.();
   }
 }
 
@@ -2841,7 +2913,7 @@ export async function fetchAgyUserStatus(
     // exits 0; adding `-p`/`--print`/`--prompt` here would restore a billable
     // turn on every cold quota refresh. `test/agy-quota-no-prompt.test.ts`
     // fails if one reappears.
-    return await runAgyProbe(runtime, ["--log-file", logFile, "models"], AGY_QUOTA_PROBE_TIMEOUT_MS, async (handle) => {
+    return await runAgyProbe(runtime, ["--log-file", logFile, "models"], AGY_QUOTA_PROBE_TIMEOUT_MS, async (handle, connection) => {
     handle.stdout.resume();
     const ls = await discoverAgyLs({
       logFile,
@@ -2856,7 +2928,7 @@ export async function fetchAgyUserStatus(
     while (!handle.signal.aborted) {
       const res = await fetch(url, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: agyRpcHeaders(connection.csrfToken),
         body: JSON.stringify({}),
         signal: handle.signal,
       });
@@ -2998,6 +3070,7 @@ async function learnAgyCatalogFromSession(
   runtime: AgyNativeRuntime,
   port: number,
   signal: AbortSignal,
+  csrfToken?: string,
 ): Promise<boolean> {
   if (sessionCatalogMetadata.has(runtime.identityKey)) return true;
   const selectable = await getCatalogRows(runtime);
@@ -3008,7 +3081,7 @@ async function learnAgyCatalogFromSession(
     signal.throwIfAborted();
     const response = await fetch(url, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: agyRpcHeaders(csrfToken),
       body: "{}",
       signal,
     });

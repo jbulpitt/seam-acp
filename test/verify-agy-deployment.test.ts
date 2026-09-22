@@ -7,7 +7,7 @@
  *
  *   A. root-owned `/opt/seam/agy-runtime/<sha>/agy`, pins in a file  — correct
  *   B. `$HOME/.seam/agy-runtime/<sha>/agy`, pins in a file           — replaceable
- *   C. pins present only in the live pm2 process environment (#390)  — one reboot from dark
+ *   C. pins present in the running environment and in no file (fhr-server) — enforced
  *
  * B and C both WORKED when observed. Both reported `provenance mode:
  * immutable-path`. That is the whole difficulty: the failure is invisible from
@@ -30,6 +30,8 @@ import {
   AGY_DEPLOYMENT_PINS,
   canonicalExecutable,
   formatDeploymentReport,
+  exitCodeFor,
+  launcherEnvPath,
   main,
   parsePm2EcosystemPins,
   readOnlyIo,
@@ -241,17 +243,17 @@ describe("#265 the three layouts observed on 2026-09-12", () => {
     expect(ancestors.detail).toContain(h.runtimeRoot);
   });
 
-  it("refuses a host whose pins exist only in the live process environment", () => {
+  it("treats pins the running environment carries as enforced when the file has none", () => {
+    // fhr-server. systemd injects /etc/seam-bridge-agy.env into the process.
+    // ~/.config/seam-bridge/bridge.env has no AGY pins. Failing that host
+    // because the file is empty is the report people learn to ignore.
     const h = host({ pinsInFile: false });
     const report = verdictFor(h);
-    expect(report.verdict).toBe("fail");
+    expect(report.verdict).toBe("pass");
     const pinCheck = byId(report, "pins-in-file");
-    expect(pinCheck.reasonCode).toBe("pins_only_in_process_env");
-    // The cost has to be in the message, because the host looks healthy.
-    expect(pinCheck.detail).toContain("restart");
+    expect(pinCheck.status).toBe("pass");
+    expect(pinCheck.detail).toContain("running process environment");
     expect(report.observed.pinSources.AGY_SHA256).toBe("process-env");
-    // Everything downstream still resolves, which is why this was invisible:
-    // the artifact is genuinely fine, only its configuration is unrecorded.
     expect(byId(report, "artifact-digest").status).toBe("pass");
   });
 
@@ -265,7 +267,8 @@ describe("#265 the three layouts observed on 2026-09-12", () => {
     const hardened = [path.dirname(h.cliPath), h.runtimeRoot];
     for (const dir of hardened) fs.chmodSync(dir, 0o555);
     const detail = byId(verdictFor(h, {}, readOnlyIo()), "ancestors-durable").detail;
-    expect(detail).toContain("which is why this stays invisible");
+    expect(detail).toContain("That acceptance is not durability");
+    expect(detail).not.toContain("stays invisible");
     // Named individually, because those are the ones an operator will look at
     // and conclude are already correct.
     for (const dir of hardened) expect(detail).toContain(dir);
@@ -675,5 +678,93 @@ describe("#265 pin resolution", () => {
     expect(byId(report, "pins-in-file").reasonCode).toBe("pins_missing");
     expect(report.observed.pinSources.AGY_VERSION).toBe("absent");
     expect(report.observed.version).toBeNull();
+  });
+});
+
+describe("#395 the enforcing source is not the same file on every host", () => {
+  it("follows the bridge.env the launcher names, even when exec env is empty", () => {
+    // plex-server. The launcher reads bridge.env after start. /proc/environ
+    // and an unrelated env file are empty; failing on those is the false FAIL.
+    const h = host();
+    const launcher = path.join(h.root, "launch.mjs");
+    const decoy = path.join(h.root, "empty.env");
+    fs.writeFileSync(launcher, `const configPath = "${h.envFile}";\nreadFileSync(configPath);\n`);
+    fs.writeFileSync(decoy, "GROK_CLI_PATH=/usr/bin/grok\n");
+    const report = verdictFor(h, {
+      envFile: decoy,
+      launcher,
+      processEnv: {},
+      processEnvSupplied: true,
+    });
+    expect(report.verdict).toBe("pass");
+    expect(report.observed.authority).toBe("launcher");
+    expect(byId(report, "pins-in-file").detail).toContain(h.envFile);
+    expect(byId(report, "artifact-digest").status).toBe("pass");
+  });
+
+  it("refuses to guess when a launcher names two env files", () => {
+    const named = launcherEnvPath(`const a = "/a/bridge.env";\nconst b = "/b/bridge.env";\n`);
+    expect(named.ambiguous).toBe(true);
+    const h = host();
+    const launcher = path.join(h.root, "launch.mjs");
+    const other = path.join(h.root, "other", "bridge.env");
+    fs.mkdirSync(path.dirname(other), { recursive: true });
+    fs.writeFileSync(other, "");
+    fs.writeFileSync(launcher, `const a = "${h.envFile}";\nconst b = "${other}";\n`);
+    const report = verdictFor(h, { launcher, processEnv: {}, processEnvSupplied: true });
+    expect(report.verdict).toBe("unknown");
+    expect(exitCodeFor(report.verdict)).toBe(5);
+    expect(byId(report, "pins-in-file").reasonCode).toBe("pin_source_unknown");
+  });
+
+  it("treats a dotenv file as enforced when the exec environment has no pins", () => {
+    // rhc-server. systemd starts the process with no AGY keys; dotenv
+    // override loads the repo .env.
+    const h = host();
+    const report = verdictFor(h, {
+      envFile: path.join(h.root, "missing.env"),
+      dotenvFile: h.envFile,
+      processEnv: {},
+      processEnvSupplied: true,
+    });
+    expect(report.verdict).toBe("pass");
+    expect(report.observed.authority).toBe("dotenv");
+    expect(byId(report, "artifact-digest").status).toBe("pass");
+  });
+
+  it("calls an ecosystem pin unenforced when the running environment has none", () => {
+    // macbook-air and jennifer-laptop. The file records the pin. pm2's
+    // environment does not have the keys. That is not a pass and not a
+    // misdeployed artifact.
+    const h = host({ pinsFormat: "pm2" });
+    const report = verdictFor(h, { processEnv: {}, processEnvSupplied: true });
+    expect(report.verdict).toBe("recorded-unenforced");
+    expect(exitCodeFor(report.verdict)).toBe(6);
+    const pinCheck = byId(report, "pins-in-file");
+    expect(pinCheck.status).toBe("unenforced");
+    expect(pinCheck.reasonCode).toBe("pins_recorded_unenforced");
+    expect(pinCheck.detail).toContain("not enforced");
+    expect(byId(report, "artifact-digest").status).toBe("pass");
+  });
+
+  it("says unknown, not unpinned, when an existing file has no pins and the process was not read", () => {
+    // The empty bridge.env on fhr-server. Opening it and stopping there is
+    // how a pinned host was reported as having no agy.
+    const h = host({ pinsInFile: false });
+    const report = verifyAgyDeployment({
+      envFile: h.envFile,
+      runtimeParent: h.runtimeParent,
+      platform: "darwin",
+    }, rootOwnedIo());
+    expect(report.verdict).toBe("unknown");
+    expect(exitCodeFor(report.verdict)).toBe(5);
+    expect(byId(report, "pins-in-file").detail).toContain("not evidence the host is unpinned");
+  });
+
+  it("says unknown when a key=value file has pins but the running environment does not and no loader names the file", () => {
+    const h = host();
+    const report = verdictFor(h, { processEnv: {}, processEnvSupplied: true });
+    expect(report.verdict).toBe("unknown");
+    expect(byId(report, "pins-in-file").status).toBe("unknown");
   });
 });

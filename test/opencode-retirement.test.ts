@@ -13,7 +13,7 @@ import { PassThrough } from "node:stream";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { pino } from "pino";
 import type { AgentProfile } from "@seam/adapters";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
@@ -96,26 +96,14 @@ function makeRouter(): SessionRouter {
 // --- the surface is gone -----------------------------------------------------
 
 describe("#12 opencode surface removed", () => {
-  const saved = { ...process.env };
-  afterEach(() => {
-    process.env = { ...saved };
-  });
+  let env: Record<string, string | undefined>;
 
   function baseEnv(extra: Record<string, string | undefined>) {
-    process.env = {
-      ...saved,
+    env = {
       DISCORD_BOT_TOKEN: "test-token",
       DISCORD_ALLOWED_USER_IDS: "123",
       REPOS_ROOT: repoRoot,
       CHANNEL_PRESETS_FILE: undefined,
-      // #474: `config.ts` runs `dotenv.config({ override: true })` at import,
-      // so the operator's real .env is already in `saved` and cannot be
-      // displaced from the test command line. A host that denies an agent at
-      // local (e.g. `copilot@local`) makes DEFAULT_AGENT=copilot legitimately
-      // refusable — true of the host, irrelevant to retirement semantics,
-      // which is what these cases assert. Clear it so the fixture states its
-      // own world instead of inheriting the operator's.
-      AGENT_LOCATION_DENY: undefined,
       ...extra,
     } as NodeJS.ProcessEnv;
   }
@@ -140,7 +128,7 @@ describe("#12 opencode surface removed", () => {
 
   it("leaves no OPENCODE_* key in the parsed config", () => {
     baseEnv({});
-    const cfg = loadConfig() as unknown as Record<string, unknown>;
+    const cfg = loadConfig({ env }) as unknown as Record<string, unknown>;
     expect(Object.keys(cfg).filter((k) => k.startsWith("OPENCODE_"))).toEqual([]);
   });
 
@@ -160,7 +148,7 @@ describe("#12 opencode surface removed", () => {
       OPENCODE_DDG_SEARCH: "true",
       OPENCODE_TAVILY_URL: "https://mcp.tavily.com/mcp/",
     });
-    const cfg = loadConfig() as unknown as Record<string, unknown>;
+    const cfg = loadConfig({ env }) as unknown as Record<string, unknown>;
     expect(Object.keys(cfg).filter((k) => k.startsWith("OPENCODE_"))).toEqual([]);
     expect(cfg.REPOS_ROOT).toBe(repoRoot);
   });
@@ -170,15 +158,15 @@ describe("#12 opencode surface removed", () => {
   // accepting it would mint broken threads that only fail on their first turn.
   it("refuses to boot when DEFAULT_AGENT names the retired agent", () => {
     baseEnv({ DEFAULT_AGENT: "opencode" });
-    expect(() => loadConfig()).toThrow(/DEFAULT_AGENT="opencode"/);
-    expect(() => loadConfig()).toThrow(/retired/i);
+    expect(() => loadConfig({ env })).toThrow(/DEFAULT_AGENT="opencode"/);
+    expect(() => loadConfig({ env })).toThrow(/retired/i);
   });
 
   it("the DEFAULT_AGENT refusal names a supported replacement and does not substitute one", () => {
     baseEnv({ DEFAULT_AGENT: "opencode" });
     let message = "";
     try {
-      loadConfig();
+      loadConfig({ env });
     } catch (err) {
       message = (err as Error).message;
     }
@@ -189,25 +177,25 @@ describe("#12 opencode surface removed", () => {
     // bound to a thread yet.
     expect(message).not.toContain("/seam config agent");
     // It must fail, not fall back: no config object is produced at all.
-    expect(() => loadConfig()).toThrow();
+    expect(() => loadConfig({ env })).toThrow();
   });
 
   it("refuses a retired DEFAULT_AGENT even alongside the legacy OPENCODE_* keys", () => {
     // The exact legacy shape: OPENCODE_ENABLED=true plus a retired default.
     baseEnv({ DEFAULT_AGENT: "opencode", OPENCODE_ENABLED: "true" });
-    expect(() => loadConfig()).toThrow(/retired/i);
+    expect(() => loadConfig({ env })).toThrow(/retired/i);
   });
 
   it("still accepts every supported DEFAULT_AGENT", () => {
     for (const agent of ["copilot", "claude", "codex", "grok", "agy"]) {
       baseEnv({ DEFAULT_AGENT: agent });
-      expect(loadConfig().DEFAULT_AGENT, agent).toBe(agent);
+      expect(loadConfig({ env }).DEFAULT_AGENT, agent).toBe(agent);
     }
   });
 
   it("accepts DEFAULT_AGENT=ollama-cloud only when OLLAMA_CLOUD_ENABLED is true", () => {
     baseEnv({ DEFAULT_AGENT: "ollama-cloud", OLLAMA_CLOUD_ENABLED: "true" });
-    expect(loadConfig().DEFAULT_AGENT).toBe("ollama-cloud");
+    expect(loadConfig({ env }).DEFAULT_AGENT).toBe("ollama-cloud");
   });
 
   it("leaves an unrecognized DEFAULT_AGENT alone (only RETIRED/parked ids are refused here)", () => {
@@ -216,7 +204,7 @@ describe("#12 opencode surface removed", () => {
     // depends on which agents are enabled). A typo still reaches the router's
     // generic unknown-agent error.
     baseEnv({ DEFAULT_AGENT: "cluade" });
-    expect(loadConfig().DEFAULT_AGENT).toBe("cluade");
+    expect(loadConfig({ env }).DEFAULT_AGENT).toBe("cluade");
   });
 });
 

@@ -1,15 +1,13 @@
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { loadConfig } from "../packages/core/src/config.js";
 
 describe("package-backed agy configuration gates", () => {
-  const saved = { ...process.env };
-  afterEach(() => { process.env = { ...saved }; });
+  let env: Record<string, string | undefined>;
 
   function base(extra: Record<string, string | undefined> = {}): void {
-    process.env = {
-      ...saved,
+    env = {
       DISCORD_BOT_TOKEN: "test-token",
       DISCORD_ALLOWED_USER_IDS: "123",
       REPOS_ROOT: process.cwd(),
@@ -39,36 +37,36 @@ describe("package-backed agy configuration gates", () => {
 
   it("keeps native agy disabled by default", () => {
     base({ AGY_ENABLED: undefined, AGY_OLD_ROLLBACK_ENABLED: undefined });
-    const config = loadConfig();
+    const config = loadConfig({ env });
     expect(config.AGY_ENABLED).toBe(false);
     expect(config.AGY_OLD_ROLLBACK_ENABLED).toBe(false);
   });
 
   it("accepts only the exact native runtime", () => {
     enabled();
-    expect(loadConfig()).toMatchObject({
+    expect(loadConfig({ env })).toMatchObject({
       AGY_VERSION: "1.1.28",
       AGY_SHA256: "a".repeat(64),
       AGY_RUNTIME_ROOT: "/opt/agy/runtime",
     });
 
     enabled({ AGY_CREDENTIAL_SCOPE: "person@example.com" });
-    expect(() => loadConfig()).toThrow(/semantic identifier/);
+    expect(() => loadConfig({ env })).toThrow(/semantic identifier/);
 
     enabled({ AGY_VERSION: "" });
-    expect(() => loadConfig()).toThrow(/AGY_VERSION/);
+    expect(() => loadConfig({ env })).toThrow(/AGY_VERSION/);
     enabled({ AGY_SHA256: "" });
-    expect(() => loadConfig()).toThrow(/AGY_SHA256/);
+    expect(() => loadConfig({ env })).toThrow(/AGY_SHA256/);
     enabled({ AGY_DEFAULT_MODEL: "" });
-    expect(() => loadConfig()).toThrow(/AGY_DEFAULT_MODEL/);
+    expect(() => loadConfig({ env })).toThrow(/AGY_DEFAULT_MODEL/);
   });
 
   it("requires an explicit native path and default model", () => {
     base({ AGY_ENABLED: "true", AGY_CLI_PATH: undefined, AGY_OLD_CLI_PATH: undefined, AGY_BIN: undefined });
-    expect(() => loadConfig()).toThrow(/AGY_CLI_PATH/);
+    expect(() => loadConfig({ env })).toThrow(/AGY_CLI_PATH/);
     base({ AGY_ENABLED: "true", AGY_CLI_PATH: "/opt/agy/runtime/" + "a".repeat(64) + "/agy", AGY_BIN: undefined, AGY_DEFAULT_MODEL: "gemini-high", AGY_VERSION: "1.1.28", AGY_SHA256: "a".repeat(64), AGY_RUNTIME_ROOT: "/opt/agy/runtime" });
-    expect(loadConfig()).toMatchObject({ AGY_ENABLED: true, AGY_CLI_PATH: "/opt/agy/runtime/" + "a".repeat(64) + "/agy" });
+    expect(loadConfig({ env })).toMatchObject({ AGY_ENABLED: true, AGY_CLI_PATH: "/opt/agy/runtime/" + "a".repeat(64) + "/agy" });
     base({ AGY_OLD_ROLLBACK_ENABLED: "true", AGY_OLD_CLI_PATH: "/opt/agy/runtime/" + "a".repeat(64) + "/agy", AGY_BIN: undefined, AGY_DEFAULT_MODEL: "gemini-high", AGY_CLI_PATH: undefined, AGY_VERSION: "1.1.28", AGY_SHA256: "a".repeat(64), AGY_RUNTIME_ROOT: "/opt/agy/runtime" });
-    expect(loadConfig().AGY_OLD_ROLLBACK_ENABLED).toBe(true);
+    expect(loadConfig({ env }).AGY_OLD_ROLLBACK_ENABLED).toBe(true);
   });
 });

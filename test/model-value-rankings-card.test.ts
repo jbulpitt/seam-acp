@@ -230,14 +230,10 @@ describe("model value rankings card lifecycle", () => {
 });
 
 describe("DISCORD_RANKINGS_THREAD_ID", () => {
-  const saved = { ...process.env };
-  afterEach(() => {
-    process.env = { ...saved };
-  });
+  let env: Record<string, string | undefined>;
 
   function setEnv(value: string | undefined): void {
-    process.env = {
-      ...saved,
+    env = {
       DISCORD_BOT_TOKEN: "test-token",
       DISCORD_ALLOWED_USER_IDS: "123",
       REPOS_ROOT: process.cwd(),
@@ -248,8 +244,8 @@ describe("DISCORD_RANKINGS_THREAD_ID", () => {
 
   it("accepts a numeric Discord id and rejects names", () => {
     setEnv("1544386824204583052");
-    expect(loadConfig().DISCORD_RANKINGS_THREAD_ID).toBe("1544386824204583052");
+    expect(loadConfig({ env }).DISCORD_RANKINGS_THREAD_ID).toBe("1544386824204583052");
     setEnv("rankings-thread");
-    expect(() => loadConfig()).toThrow(/DISCORD_RANKINGS_THREAD_ID/);
+    expect(() => loadConfig({ env })).toThrow(/DISCORD_RANKINGS_THREAD_ID/);
   });
 });

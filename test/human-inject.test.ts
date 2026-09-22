@@ -258,23 +258,11 @@ describe("SEAM_MIDTURN_REPLY_MODE config (#63)", () => {
   };
 
   it("defaults to 'abort' (ships dark — no behavior change)", () => {
-    const saved = process.env;
-    try {
-      process.env = { ...baseEnv } as NodeJS.ProcessEnv;
-      expect(loadConfig().SEAM_MIDTURN_REPLY_MODE).toBe("abort");
-    } finally {
-      process.env = saved;
-    }
+    expect(loadConfig({ env: baseEnv }).SEAM_MIDTURN_REPLY_MODE).toBe("abort");
   });
 
   it("accepts 'inbox' when explicitly set", () => {
-    const saved = process.env;
-    try {
-      process.env = { ...baseEnv, SEAM_MIDTURN_REPLY_MODE: "inbox" } as NodeJS.ProcessEnv;
-      expect(loadConfig().SEAM_MIDTURN_REPLY_MODE).toBe("inbox");
-    } finally {
-      process.env = saved;
-    }
+    expect(loadConfig({ env: { ...baseEnv, SEAM_MIDTURN_REPLY_MODE: "inbox" } }).SEAM_MIDTURN_REPLY_MODE).toBe("inbox");
   });
 });
 
@@ -286,22 +274,10 @@ describe("SEAM_INBOX_PREAMBLE_ENABLED config (#61)", () => {
   };
 
   it("defaults to false (ships dark — golden preamble unchanged)", () => {
-    const saved = process.env;
-    try {
-      process.env = { ...baseEnv } as NodeJS.ProcessEnv;
-      expect(loadConfig().SEAM_INBOX_PREAMBLE_ENABLED).toBe(false);
-    } finally {
-      process.env = saved;
-    }
+    expect(loadConfig({ env: baseEnv }).SEAM_INBOX_PREAMBLE_ENABLED).toBe(false);
   });
 
   it("accepts true when explicitly set", () => {
-    const saved = process.env;
-    try {
-      process.env = { ...baseEnv, SEAM_INBOX_PREAMBLE_ENABLED: "true" } as NodeJS.ProcessEnv;
-      expect(loadConfig().SEAM_INBOX_PREAMBLE_ENABLED).toBe(true);
-    } finally {
-      process.env = saved;
-    }
+    expect(loadConfig({ env: { ...baseEnv, SEAM_INBOX_PREAMBLE_ENABLED: "true" } }).SEAM_INBOX_PREAMBLE_ENABLED).toBe(true);
   });
 });

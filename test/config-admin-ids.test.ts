@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach } from "vitest";
+import { describe, it, expect } from "vitest";
 import { loadConfig } from "../packages/core/src/config.js";
 
 /**
@@ -7,42 +7,35 @@ import { loadConfig } from "../packages/core/src/config.js";
  * NOT "nobody"), so the lock/apply gates preserve today's behavior.
  */
 describe("SEAM_CONFIG_ADMIN_USER_IDS parsing (#71)", () => {
-  const saved = { ...process.env };
-  afterEach(() => {
-    process.env = { ...saved };
-  });
+  let env: Record<string, string | undefined>;
 
   function baseEnv(extra: Record<string, string | undefined>) {
-    process.env = {
-      ...saved,
+    env = {
       DISCORD_BOT_TOKEN: "test-token",
       DISCORD_ALLOWED_USER_IDS: "123",
       REPOS_ROOT: process.cwd(),
-      // Neutralize any inherited .env pointers that would fail loadConfig for
-      // reasons unrelated to this test (this suite only exercises admin-id parsing).
-      CHANNEL_PRESETS_FILE: undefined,
       ...extra,
     } as NodeJS.ProcessEnv;
   }
 
   it("unset ⇒ undefined (opt-out, not an empty deny-all set)", () => {
     baseEnv({ SEAM_CONFIG_ADMIN_USER_IDS: undefined });
-    expect(loadConfig().SEAM_CONFIG_ADMIN_USER_IDS).toBeUndefined();
+    expect(loadConfig({ env }).SEAM_CONFIG_ADMIN_USER_IDS).toBeUndefined();
   });
 
   it("empty string ⇒ undefined (treated as unset, NOT 'nobody')", () => {
     baseEnv({ SEAM_CONFIG_ADMIN_USER_IDS: "" });
-    expect(loadConfig().SEAM_CONFIG_ADMIN_USER_IDS).toBeUndefined();
+    expect(loadConfig({ env }).SEAM_CONFIG_ADMIN_USER_IDS).toBeUndefined();
   });
 
   it("whitespace/trailing commas collapse to undefined", () => {
     baseEnv({ SEAM_CONFIG_ADMIN_USER_IDS: "  , ,  " });
-    expect(loadConfig().SEAM_CONFIG_ADMIN_USER_IDS).toBeUndefined();
+    expect(loadConfig({ env }).SEAM_CONFIG_ADMIN_USER_IDS).toBeUndefined();
   });
 
   it("parses a comma-separated numeric list into a Set", () => {
     baseEnv({ SEAM_CONFIG_ADMIN_USER_IDS: "1487094572696867019, 42 " });
-    const set = loadConfig().SEAM_CONFIG_ADMIN_USER_IDS;
+    const set = loadConfig({ env }).SEAM_CONFIG_ADMIN_USER_IDS;
     expect(set).toBeInstanceOf(Set);
     expect(set?.has("1487094572696867019")).toBe(true);
     expect(set?.has("42")).toBe(true);
@@ -51,6 +44,6 @@ describe("SEAM_CONFIG_ADMIN_USER_IDS parsing (#71)", () => {
 
   it("rejects a non-numeric id (same validation as DISCORD_ALLOWED_USER_IDS)", () => {
     baseEnv({ SEAM_CONFIG_ADMIN_USER_IDS: "not-a-number" });
-    expect(() => loadConfig()).toThrow(/SEAM_CONFIG_ADMIN_USER_IDS/);
+    expect(() => loadConfig({ env })).toThrow(/SEAM_CONFIG_ADMIN_USER_IDS/);
   });
 });

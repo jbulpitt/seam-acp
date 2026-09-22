@@ -255,13 +255,12 @@ describe("service status refresh interaction", () => {
 });
 
 describe("DISCORD_SERVICE_STATUS_THREAD_ID", () => {
-  const saved = { ...process.env };
-  afterEach(() => { process.env = { ...saved }; });
+  let env: Record<string, string | undefined>;
 
   it("accepts a numeric Discord id and rejects names", () => {
-    process.env = { ...saved, DISCORD_BOT_TOKEN: "test", DISCORD_ALLOWED_USER_IDS: "123", REPOS_ROOT: process.cwd(), CHANNEL_PRESETS_FILE: undefined, DISCORD_SERVICE_STATUS_THREAD_ID: "1545197204208222309" } as NodeJS.ProcessEnv;
-    expect(loadConfig().DISCORD_SERVICE_STATUS_THREAD_ID).toBe("1545197204208222309");
-    process.env.DISCORD_SERVICE_STATUS_THREAD_ID = "status-thread";
-    expect(() => loadConfig()).toThrow(/DISCORD_SERVICE_STATUS_THREAD_ID/);
+    env = { DISCORD_BOT_TOKEN: "test", DISCORD_ALLOWED_USER_IDS: "123", REPOS_ROOT: process.cwd(), CHANNEL_PRESETS_FILE: undefined, DISCORD_SERVICE_STATUS_THREAD_ID: "1545197204208222309" } as NodeJS.ProcessEnv;
+    expect(loadConfig({ env }).DISCORD_SERVICE_STATUS_THREAD_ID).toBe("1545197204208222309");
+    env.DISCORD_SERVICE_STATUS_THREAD_ID = "status-thread";
+    expect(() => loadConfig({ env })).toThrow(/DISCORD_SERVICE_STATUS_THREAD_ID/);
   });
 });

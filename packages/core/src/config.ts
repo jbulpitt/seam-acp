@@ -1207,8 +1207,14 @@ export function resolveThreadLocation(
   return loc && loc.trim().length > 0 ? loc.trim() : "local";
 }
 
-export function loadConfig(): Config {
-  const parsed = Schema.safeParse(process.env);
+/** Explicit environments are complete inputs, not overlays on the operator's
+ * .env (#495). Missing fixture keys must fail/default on their own; unrelated
+ * deployment settings must not invalidate them. No-argument production callers
+ * retain the existing import-time dotenv override and process.env semantics. */
+export function loadConfig({ env = process.env }: {
+  env?: Readonly<Record<string, string | undefined>>;
+} = {}): Config {
+  const parsed = Schema.safeParse(env);
   if (!parsed.success) {
     const issues = parsed.error.issues
       .map((i) => `  - ${i.path.join(".") || "(root)"}: ${i.message}`)
@@ -1221,7 +1227,7 @@ export function loadConfig(): Config {
     throw new Error(
       `REPOS_ROOT does not exist or is not a directory: ${reposRoot}\n` +
         `Set REPOS_ROOT in your .env to a real folder containing your repos ` +
-        `(e.g. REPOS_ROOT=${path.join(process.env.HOME ?? "", "Projects")}).`
+        `(e.g. REPOS_ROOT=${path.join(env.HOME ?? "", "Projects")}).`
     );
   }
   cfg.REPOS_ROOT = reposRoot;

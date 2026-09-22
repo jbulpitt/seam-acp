@@ -4,6 +4,8 @@
  */
 import { describe, expect, it } from "vitest";
 import {
+  REAUTH_COMPLETED_PREFIX,
+  REAUTH_WAITING_PREFIX,
   recoveryFactsFromAttempt,
   recoveryStory,
 } from "../packages/core/src/core/dispatch/recovery-story.js";
@@ -110,6 +112,28 @@ describe("recoveryStory", () => {
     expect(note.startsWith("Recovery:\n")).toBe(true);
     expect(note).toContain("claude reported rate_limit.");
     expect(note).toContain("rung 1, retry 2 of 3 after 5s");
+  });
+
+  it("tells a completed re-auth to continue without replaying the prompt", () => {
+    const facts = recoveryFactsFromAttempt({
+      updatedUtc: "2026-09-22T06:00:00.000Z",
+      stalledUtc: "2026-09-22T04:00:00.000Z",
+      stalledReason: `${REAUTH_COMPLETED_PREFIX} provider authentication was completed outside this turn`,
+      promptStarted: true,
+      identity: JSON.stringify({ agent: "claude", model: "claude-opus-5", cwd: "/repo" }),
+    }, new Date("2026-09-22T06:00:00.000Z"));
+    expect(facts.cause).toBe("reauthentication");
+    const { prompt, note } = recoveryStory(facts);
+    expect(prompt.startsWith("continue\n")).toBe(true);
+    expect(prompt).toContain("Authentication was completed outside this turn.");
+    expect(prompt).toContain("Do not repeat it.");
+    expect(prompt).toContain("The attempt was last recorded 2h ago.");
+    expect(prompt).not.toContain("retries it as-is");
+    expect(prompt).not.toContain("The process restarted");
+    expect(prompt).not.toContain(REAUTH_COMPLETED_PREFIX);
+    expect(prompt).not.toContain(REAUTH_WAITING_PREFIX);
+    expect(note.startsWith("Recovery:\n")).toBe(true);
+    expect(note).not.toContain("resuming after restart");
   });
 
   it("a classified retry with no output says it is retrying the request", () => {

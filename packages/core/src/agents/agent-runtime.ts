@@ -1,5 +1,15 @@
+import { readFileSync } from "node:fs";
 import { Readable, Writable } from "node:stream";
 import { buildRecoveryDirective, runBoundedRecovery } from "../core/recovery-directive.js";
+import {
+  negotiateReauth,
+  ReauthParked,
+} from "../core/reauth-negotiation.js";
+import {
+  claudeCredentialsPath,
+  readClaudeCredentialFacts,
+  type ClaudeCredentialFacts,
+} from "../core/claude-oauth-contention.js";
 import { DEFAULT_ERROR_RULES } from "../core/error-resolution-rules.js";
 import { CONTINUE_PROMPT } from "../core/dispatch/turn-resume.js";
 import { recoveryStory } from "../core/dispatch/recovery-story.js";
@@ -308,6 +318,18 @@ function withTimeout<T = never>(ms: number, message: string): Promise<T> {
   });
 }
 
+function bridgeCloseCode(error: unknown): number | undefined {
+  if (!error || typeof error !== "object") return undefined;
+  const rec = error as { code?: unknown; closeCode?: unknown; cause?: unknown };
+  if (rec.closeCode === 4001 || rec.code === 4001) return 4001;
+  const cause = rec.cause;
+  if (cause && typeof cause === "object") {
+    const inner = cause as { code?: unknown; closeCode?: unknown };
+    if (inner.closeCode === 4001 || inner.code === 4001) return 4001;
+  }
+  return undefined;
+}
+
 export class AgentRuntime {
   private readonly profile: AgentProfile;
   private readonly logger: Logger;
@@ -335,6 +357,7 @@ export class AgentRuntime {
   /** Quiet time before asking the bridge whether a remote turn is hung.
    *  Production is one minute. Tests pass a few milliseconds. */
   private readonly hangSilenceMs: number;
+  private readonly claudeCredentialFacts?: () => ClaudeCredentialFacts | undefined;
 
   private child?: ReturnType<AgentProfile["spawn"]>;
   private connection?: ClientSideConnection;
@@ -479,6 +502,12 @@ export class AgentRuntime {
     loadSessionTimeoutMs?: number;
     /** Test override. Production waits HANG_SILENCE_MS before probing. */
     hangSilenceMs?: number;
+    /**
+     * Claude refresh-token expiry for a re-auth decision. Production omits
+     * this and reads the local store. `undefined` means the store was not
+     * consulted. A thrown read is unreadable, not expired.
+     */
+    claudeCredentialFacts?: () => ClaudeCredentialFacts | undefined;
   }) {
     this.profile = opts.profile;
     this.logger = opts.logger.child({ agent: opts.profile.id });
@@ -487,6 +516,7 @@ export class AgentRuntime {
     this.bridgeHealth = opts.bridgeHealth;
     this.loadSessionTimeoutMs = opts.loadSessionTimeoutMs ?? SESSION_LOAD_TIMEOUT_MS;
     this.hangSilenceMs = opts.hangSilenceMs ?? HANG_SILENCE_MS;
+    this.claudeCredentialFacts = opts.claudeCredentialFacts;
     this.onDead = opts.onDead;
     this.onCatalogRefresh = opts.onCatalogRefresh;
     this.spawnFn = opts.spawnFn;
@@ -933,6 +963,9 @@ export class AgentRuntime {
     try {
       return await run();
     } catch (original) {
+      // The prompt owner already decided this is a parked re-auth. Reclassifying
+      // the park would turn it back into an ordinary provider error.
+      if (original instanceof ReauthParked) throw original;
       // A prompt attempt was already classified before its recovery decision.
       if (alreadyClassified && readErrorClassification(original)) throw original;
       // ACP normally throws mutable RequestError. Primitive/frozen rejections
@@ -1069,6 +1102,7 @@ export class AgentRuntime {
     // (end_turn) from an abnormal one (cancel/abort/error). Stays undefined if
     // the RPC rejects (dispose/child-death) — which is itself an abnormal end.
     let outcomeStopReason: string | undefined;
+    let lastErrorKind: string | undefined;
     try {
       // Race the ACP prompt RPC against a death/dispose rejection. Storing the
       // reject lets the child-exit handler (and dispose) force this await to
@@ -1095,7 +1129,6 @@ export class AgentRuntime {
       // Only rung 1 executes here. Session/model-changing rungs need upstream
       // identity transactions; #467 owns the eventual daemon executor.
       let retryBudget = 0;
-      let lastErrorKind: string | undefined;
       const res = await runBoundedRecovery({
         run: () => this.withClassifiedErrors("session/prompt", sendPrompt),
         signal: recoveryAbort.signal,
@@ -1144,6 +1177,10 @@ export class AgentRuntime {
         cancelled: res.stopReason === "cancelled",
         ...(rejected ? { rejectedAttachments: rejected } : {}),
       };
+    } catch (error) {
+      const parked = this.reauthPark(error, lastErrorKind);
+      if (parked) throw parked;
+      throw error;
     } finally {
       hangAbort.abort();
       this.promptInFlight = false;
@@ -1194,6 +1231,38 @@ export class AgentRuntime {
         this.resumePromptText = undefined;
       }
     }
+  }
+
+  /**
+   * Park only a provider authentication failure the turn cannot answer.
+   * Contention that the prompt owner can still retry, an unreadable or
+   * still-valid refresh token, an unclassified error, and bridge close
+   * 4001 all return null so the original error keeps its existing path.
+   * A remote Claude process is not this machine's credential file.
+   */
+  private reauthPark(error: unknown, lastErrorKind: string | undefined): ReauthParked | null {
+    const classified = readErrorClassification(error);
+    const kind = classified?.errorKind ?? lastErrorKind;
+    const message = error instanceof Error ? error.message : String(error);
+    const details = classified?.details;
+    const decision = negotiateReauth({
+      errorKind: kind,
+      agentId: classified?.agentId ?? this.profile.id,
+      message: details && details !== message ? `${message}\n${details}` : message,
+      bridgeCloseCode: bridgeCloseCode(error),
+      claudeCredentials: this.credentialFactsFor(kind),
+    });
+    return decision.action === "park" ? new ReauthParked(decision, error) : null;
+  }
+
+  private credentialFactsFor(kind: string | undefined): ClaudeCredentialFacts | undefined {
+    if (kind !== "auth_expired" && kind !== "auth_required" && kind !== "auth_contention") return undefined;
+    if (this.claudeCredentialFacts) {
+      try { return this.claudeCredentialFacts(); }
+      catch { return { refreshTokenExpiresAt: null }; }
+    }
+    if (this.profile.id !== "claude" || this.getSlot() !== undefined) return undefined;
+    return readClaudeCredentialFacts(readFileSync, claudeCredentialsPath());
   }
 
   /**

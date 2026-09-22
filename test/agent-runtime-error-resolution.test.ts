@@ -2,14 +2,17 @@ import { describe, expect, it, vi } from "vitest";
 import { RequestError } from "@agentclientprotocol/sdk";
 import { classifyAgyError, classifyClaudeError, readErrorClassification, resolveError, type AgentProfile } from "@seam/adapters";
 import { AgentRuntime } from "../packages/core/src/agents/agent-runtime.js";
+import { ReauthParked } from "../packages/core/src/core/reauth-negotiation.js";
+import type { ClaudeCredentialFacts } from "../packages/core/src/core/claude-oauth-contention.js";
 import { DEFAULT_ERROR_RULES } from "../packages/core/src/core/error-resolution-rules.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 
 function fixture(error: unknown, classifyError?: AgentProfile["classifyError"], agentId = "claude",
-  bridgeHealth?: ConstructorParameters<typeof AgentRuntime>[0]["bridgeHealth"]) {
+  bridgeHealth?: ConstructorParameters<typeof AgentRuntime>[0]["bridgeHealth"],
+  claudeCredentialFacts?: () => ClaudeCredentialFacts | undefined) {
   const logger = { warn: vi.fn(), info: vi.fn(), error: vi.fn(), debug: vi.fn(), child() { return this; } };
   const profile = { id: agentId, classifyError, spawn: () => { throw error; } } as unknown as AgentProfile;
-  const runtime = new AgentRuntime({ profile, logger: logger as unknown as Logger, bridgeHealth });
+  const runtime = new AgentRuntime({ profile, logger: logger as unknown as Logger, bridgeHealth, claudeCredentialFacts });
   const prompt = vi.fn().mockRejectedValue(error);
   // This suite isolates classification; prompt recovery has its own behavioral
   // suite. Ephemeral work is the production one-attempt path, not a mock gate.
@@ -68,6 +71,30 @@ describe("#441 real runtime boundary to pure resolver (no providers)", () => {
     await expect(call).rejects.toBe(original);
     expect(readErrorClassification(original)).toMatchObject({ errorKind: "auth_expired", agentId: "claude" });
     expect(logger.warn).toHaveBeenCalledWith({ agentId: "claude", errorKind: "auth_expired", operation }, "adapter error classified");
+  });
+
+  it("parks a prompt when the refresh token is dead and does not park when it is still valid or unreadable", async () => {
+    const expired = new RequestError(-32603,
+      "Failed to authenticate: OAuth session expired and could not be refreshed https://device.example.com/start code ABCD-EFGH",
+      { errorKind: "authentication_failed" });
+    const dead = fixture(expired, classifyClaudeError, "claude", undefined,
+      () => ({ refreshTokenExpiresAt: 1 }));
+    await expect(dead.runtime.prompt("fixture")).rejects.toBeInstanceOf(ReauthParked);
+    expect(dead.prompt).toHaveBeenCalledTimes(1);
+
+    const valid = fixture(expired, classifyClaudeError, "claude", undefined,
+      () => ({ refreshTokenExpiresAt: Date.now() + 86_400_000 }));
+    await expect(valid.runtime.prompt("fixture")).rejects.toBe(expired);
+    expect(valid.prompt).toHaveBeenCalledTimes(1);
+
+    const unreadable = fixture(expired, classifyClaudeError, "claude", undefined,
+      () => ({ refreshTokenExpiresAt: null }));
+    await expect(unreadable.runtime.prompt("fixture")).rejects.toBe(expired);
+
+    const bridge = Object.assign(new RequestError(-32603, expired.message, { errorKind: "authentication_failed" }), { closeCode: 4001 });
+    const rejected = fixture(bridge, classifyClaudeError, "claude", undefined,
+      () => ({ refreshTokenExpiresAt: 1 }));
+    await expect(rejected.runtime.prompt("fixture")).rejects.toBe(bridge);
   });
 
   it("leaves a successful prompt unchanged and emits no failure metric", async () => {

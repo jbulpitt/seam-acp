@@ -643,6 +643,152 @@ describe("coordinated model-intelligence generations (#249)", () => {
     metadata.close();
   });
 
+  it("keeps a stored score when a covered generation has no enrichment for that model (#471)", () => {
+    // #455 checked that uncovered rows survive and that no row is dropped.
+    // A covered row can still be made worse: the generation includes the id
+    // and its enrichment columns are null. Absence of a new score is not a
+    // deletion. A later generation that does carry a score must still replace
+    // it, and catalog-owned fields must still move.
+    const dir = mkdtempSync(path.join(tmpdir(), "seam-intelligence-projection-null-"));
+    dirs.push(dir);
+    const db = path.join(dir, "seam.db");
+    const metadata = new ModelMetadataStore(db);
+    const store = new ModelIntelligenceStore(db);
+    const enriched = buildModelMetadataSnapshot({
+      catalog: [{
+        agentId: "claude", modelId: "claude-opus-5", name: "Claude Opus 5",
+        contextWindow: 200_000, vision: true,
+      }],
+      sourceModels: parseAaModels({ data: [{
+        id: "aa-opus-5", name: "Claude Opus 5", slug: "claude-opus-5",
+        release_date: "2026-08-01",
+        model_creator: { id: "anthropic", name: "Anthropic", slug: "anthropic" },
+        evaluations: { artificial_analysis_intelligence_index: 50.7, gpqa: 0.81 },
+        pricing: { price_1m_input_tokens: 5, price_1m_output_tokens: 25, price_1m_blended_3_to_1: 10 },
+      }] }),
+      source: "artificial-analysis",
+      fetchedAt: "2026-09-10T00:00:00.000Z",
+    }).rows;
+    expect(enriched.find((row) => row.id === "claude-opus-5")?.intelligence_index).toBe(50.7);
+    const scenario = {
+      uncached_input_tokens: 8_000, cached_input_tokens: 0, cache_write_tokens: 0,
+      output_tokens: 2_000, long_context_threshold_tokens: 200_000,
+    };
+    store.publish({
+      publishedAt: "2026-09-10T00:00:00.000Z", catalogSignature: "enriched",
+      matchingPolicyVersion: "test",
+      sourceSnapshots: { "artificial-analysis": null, "github-copilot-pricing": null },
+      scenario, diagnostics: [], metadata: enriched, values: [],
+    });
+    const bare = buildModelMetadataSnapshot({
+      catalog: [{
+        agentId: "claude", modelId: "claude-opus-5", name: "Claude Opus 5",
+        contextWindow: 1_000_000, vision: true,
+        description: "catalog description",
+      }],
+      sourceModels: [],
+      source: "coordinated-catalog",
+      fetchedAt: "2026-09-21T03:08:53.000Z",
+    }).rows;
+    expect(bare.find((row) => row.id === "claude-opus-5")?.intelligence_index).toBeNull();
+    store.publish({
+      publishedAt: "2026-09-21T03:08:53.000Z", catalogSignature: "covered-but-unenriched",
+      matchingPolicyVersion: "test",
+      sourceSnapshots: { "artificial-analysis": null, "github-copilot-pricing": null },
+      scenario, diagnostics: [], metadata: bare, values: [],
+    });
+    const inspection = new Database(db);
+    const kept = inspection.prepare(`
+      SELECT intelligence_index, benchmarks_json, aa_slug, pricing_json, released_at,
+             provider, source, fetched_at, context_window, description
+      FROM model_metadata WHERE model_id = 'claude-opus-5'
+    `).get() as Record<string, unknown>;
+    expect(kept.intelligence_index).toBe(50.7);
+    expect(JSON.parse(String(kept.benchmarks_json))).toMatchObject({
+      artificial_analysis_intelligence_index: 50.7,
+      gpqa: 0.81,
+    });
+    expect(kept.aa_slug).toBe("claude-opus-5");
+    expect(kept.provider).toBe("Anthropic");
+    expect(kept.released_at).toBe("2026-08-01");
+    expect(JSON.parse(String(kept.pricing_json))).toMatchObject({ input_per_million: 5 });
+    expect(kept.source).toBe("artificial-analysis");
+    expect(kept.fetched_at).toBe("2026-09-10T00:00:00.000Z");
+    expect(kept.context_window).toBe(1_000_000);
+    expect(kept.description).toBe("catalog description");
+
+    const corrected = buildModelMetadataSnapshot({
+      catalog: [{
+        agentId: "claude", modelId: "claude-opus-5", name: "Claude Opus 5",
+        contextWindow: 1_000_000, vision: true,
+      }],
+      sourceModels: parseAaModels({ data: [{
+        id: "aa-opus-5", name: "Claude Opus 5", slug: "claude-opus-5",
+        evaluations: { artificial_analysis_intelligence_index: 51 },
+      }] }),
+      source: "artificial-analysis",
+      fetchedAt: "2026-09-22T00:00:00.000Z",
+    }).rows;
+    store.publish({
+      publishedAt: "2026-09-22T00:00:00.000Z", catalogSignature: "re-enriched",
+      matchingPolicyVersion: "test",
+      sourceSnapshots: { "artificial-analysis": null, "github-copilot-pricing": null },
+      scenario, diagnostics: [], metadata: corrected, values: [],
+    });
+    expect(inspection.prepare(
+      "SELECT intelligence_index, fetched_at, source FROM model_metadata WHERE model_id = 'claude-opus-5'"
+    ).get()).toEqual({
+      intelligence_index: 51,
+      fetched_at: "2026-09-22T00:00:00.000Z",
+      source: "artificial-analysis",
+    });
+
+    // Scope disagreement is an opinion, not an absence: the projection
+    // refuses to publish one number, so the stored score is cleared.
+    const conflicted = buildModelMetadataSnapshot({
+      catalog: [
+        {
+          agentId: "claude", location: "one", modelId: "claude-opus-5", name: "Claude Opus 5",
+          contextWindow: 1_000_000, vision: true, effortChoices: ["high"], effortDefault: "high",
+          effortMechanism: "configOption", catalogScope: "binding:claude@one", catalogGeneration: 1,
+          catalogState: "ready", catalogFetchedAt: "2026-09-22T01:00:00.000Z",
+        },
+        {
+          agentId: "claude", location: "two", modelId: "claude-opus-5", name: "Claude Opus 5",
+          contextWindow: 200_000, vision: true, effortChoices: ["max"], effortDefault: "max",
+          effortMechanism: "configOption", catalogScope: "binding:claude@two", catalogGeneration: 1,
+          catalogState: "ready", catalogFetchedAt: "2026-09-22T01:00:00.000Z",
+        },
+      ],
+      sourceModels: parseAaModels({ data: [
+        { id: "opus-high", name: "Claude Opus 5 (high)", slug: "claude-opus-5-high",
+          evaluations: { artificial_analysis_intelligence_index: 40 } },
+        { id: "opus-max", name: "Claude Opus 5 (max)", slug: "claude-opus-5",
+          evaluations: { artificial_analysis_intelligence_index: 55 } },
+      ] }),
+      source: "artificial-analysis",
+      fetchedAt: "2026-09-22T01:00:00.000Z",
+    }).rows;
+    expect(new Set(conflicted.map((row) => row.intelligence_index)).size).toBeGreaterThan(1);
+    store.publish({
+      publishedAt: "2026-09-22T01:00:00.000Z", catalogSignature: "scopes-disagree",
+      matchingPolicyVersion: "test",
+      sourceSnapshots: { "artificial-analysis": null, "github-copilot-pricing": null },
+      scenario, diagnostics: [], metadata: conflicted, values: [],
+    });
+    expect(inspection.prepare(
+      "SELECT source, intelligence_index, aa_slug, fetched_at FROM model_metadata WHERE model_id = 'claude-opus-5'"
+    ).get()).toEqual({
+      source: "model-intelligence:scope-enrichment-conflict",
+      intelligence_index: null,
+      aa_slug: null,
+      fetched_at: "2026-09-22T01:00:00.000Z",
+    });
+    inspection.close();
+    store.close();
+    metadata.close();
+  });
+
   it("does not invent one benchmark or context when scoped variants disagree", () => {
     const dir = mkdtempSync(path.join(tmpdir(), "seam-intelligence-projection-conflict-"));
     dirs.push(dir);

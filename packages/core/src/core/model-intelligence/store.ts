@@ -202,7 +202,9 @@ export class ModelIntelligenceStore {
    * The coordinated generation is authoritative only for exact model ids it
    * covers. It demonstrably contains fewer ids than the compatibility table,
    * including ids used by live sessions, so deleting uncovered rows would turn
-   * incomplete enrichment into lost model identity. Exact ids are opaque here:
+   * incomplete enrichment into lost model identity. A covered id with a null
+   * enrichment field is the same kind of absence (#471): no AA opinion, not a
+   * deletion. Exact ids are opaque here:
    * `claude-sonnet-4.6` and `claude-sonnet-4-6` remain separate rows unless an
    * explicit normalization policy is introduced elsewhere.
    *
@@ -248,24 +250,102 @@ export class ModelIntelligenceStore {
         @description, @evidence_json, @source, @fetched_at
       )
       ON CONFLICT(model_id) DO UPDATE SET
+        -- Catalog-owned columns. The generation is the current fact, so a
+        -- null here means the catalog no longer has that value and it must
+        -- propagate. context_window is the documented case: a scope that
+        -- reports no window makes the projected window unknown.
         name = excluded.name,
         aliases_json = excluded.aliases_json,
-        aa_slug = excluded.aa_slug,
-        source_id = excluded.source_id,
-        source_name = excluded.source_name,
-        provider = excluded.provider,
-        creator_json = excluded.creator_json,
         agents_json = excluded.agents_json,
         agent_models_json = excluded.agent_models_json,
         context_window = excluded.context_window,
-        intelligence_index = excluded.intelligence_index,
-        benchmarks_json = excluded.benchmarks_json,
-        pricing_json = excluded.pricing_json,
-        released_at = excluded.released_at,
         description = excluded.description,
         evidence_json = excluded.evidence_json,
-        source = excluded.source,
-        fetched_at = excluded.fetched_at
+        -- AA-sourced columns. A null (or empty benchmark object) means this
+        -- generation has no enrichment opinion, not that the previous score
+        -- was deleted (#471). A real incoming value still replaces the stored
+        -- one, so a corrected index or a new slug propagates. The one
+        -- exception is an explicit scope conflict: the projection refuses to
+        -- publish one number, and that refusal clears the collapsed row.
+        -- Clearing for any other reason needs its own mechanism; this upsert
+        -- cannot express "AA removed it".
+        aa_slug = CASE
+          WHEN excluded.source = 'model-intelligence:scope-enrichment-conflict' THEN NULL
+          WHEN excluded.aa_slug IS NULL THEN model_metadata.aa_slug
+          ELSE excluded.aa_slug
+        END,
+        source_id = CASE
+          WHEN excluded.source = 'model-intelligence:scope-enrichment-conflict' THEN NULL
+          WHEN excluded.source_id IS NULL THEN model_metadata.source_id
+          ELSE excluded.source_id
+        END,
+        source_name = CASE
+          WHEN excluded.source = 'model-intelligence:scope-enrichment-conflict' THEN NULL
+          WHEN excluded.source_name IS NULL THEN model_metadata.source_name
+          ELSE excluded.source_name
+        END,
+        provider = CASE
+          WHEN excluded.source = 'model-intelligence:scope-enrichment-conflict' THEN NULL
+          WHEN excluded.provider IS NULL THEN model_metadata.provider
+          ELSE excluded.provider
+        END,
+        creator_json = CASE
+          WHEN excluded.source = 'model-intelligence:scope-enrichment-conflict' THEN NULL
+          WHEN excluded.creator_json IS NULL THEN model_metadata.creator_json
+          ELSE excluded.creator_json
+        END,
+        intelligence_index = CASE
+          WHEN excluded.source = 'model-intelligence:scope-enrichment-conflict' THEN NULL
+          WHEN excluded.intelligence_index IS NULL THEN model_metadata.intelligence_index
+          ELSE excluded.intelligence_index
+        END,
+        benchmarks_json = CASE
+          WHEN excluded.source = 'model-intelligence:scope-enrichment-conflict' THEN excluded.benchmarks_json
+          WHEN excluded.benchmarks_json IS NOT NULL AND excluded.benchmarks_json != '{}' THEN excluded.benchmarks_json
+          ELSE model_metadata.benchmarks_json
+        END,
+        pricing_json = CASE
+          WHEN excluded.source = 'model-intelligence:scope-enrichment-conflict' THEN NULL
+          WHEN excluded.pricing_json IS NULL THEN model_metadata.pricing_json
+          ELSE excluded.pricing_json
+        END,
+        released_at = CASE
+          WHEN excluded.source = 'model-intelligence:scope-enrichment-conflict' THEN NULL
+          WHEN excluded.released_at IS NULL THEN model_metadata.released_at
+          ELSE excluded.released_at
+        END,
+        -- fetched_at and source describe the enrichment, not the catalog
+        -- touch. Advancing them when every AA field was preserved would claim
+        -- the stored index was refetched. A conflict or a real incoming
+        -- opinion is a new fact, so those do advance the timestamp.
+        source = CASE
+          WHEN excluded.source = 'model-intelligence:scope-enrichment-conflict'
+            OR excluded.intelligence_index IS NOT NULL
+            OR (excluded.benchmarks_json IS NOT NULL AND excluded.benchmarks_json != '{}')
+            OR excluded.aa_slug IS NOT NULL
+            OR excluded.source_id IS NOT NULL
+            OR excluded.pricing_json IS NOT NULL
+            OR excluded.released_at IS NOT NULL
+            OR excluded.source_name IS NOT NULL
+            OR excluded.provider IS NOT NULL
+            OR excluded.creator_json IS NOT NULL
+          THEN excluded.source
+          ELSE model_metadata.source
+        END,
+        fetched_at = CASE
+          WHEN excluded.source = 'model-intelligence:scope-enrichment-conflict'
+            OR excluded.intelligence_index IS NOT NULL
+            OR (excluded.benchmarks_json IS NOT NULL AND excluded.benchmarks_json != '{}')
+            OR excluded.aa_slug IS NOT NULL
+            OR excluded.source_id IS NOT NULL
+            OR excluded.pricing_json IS NOT NULL
+            OR excluded.released_at IS NOT NULL
+            OR excluded.source_name IS NOT NULL
+            OR excluded.provider IS NOT NULL
+            OR excluded.creator_json IS NOT NULL
+          THEN excluded.fetched_at
+          ELSE model_metadata.fetched_at
+        END
     `);
     this.db.transaction(() => {
       for (const row of projection) insert.run(row);

@@ -1926,7 +1926,13 @@ describe("SeamMcpServer", () => {
     expect(text).toContain("💻");
   });
 
-  it("threads renders retained dispatch quarantine instead of calling the target idle (#290)", async () => {
+  // #290 asserted the opposite of this: that a retained dispatch made the entry
+  // read as `[stalled]` rather than idle. #508 reversed it. `stalled` is not an
+  // answer to "can I dispatch here" — `index.ts` deliberately excludes it from
+  // `busy` — and printing it as a third state took the whole worker pool out of
+  // service, because agents read the flag as "unusable" and routed around it.
+  // The retained-dispatch detail is still reported; only the flag changed.
+  it("threads reports a retained dispatch as still dispatchable, keeping its detail (#508)", async () => {
     h = await makeHarness({
       listThreads: async () => [{
         id: "111111111111111111",
@@ -1951,10 +1957,16 @@ describe("SeamMcpServer", () => {
     );
     expect(body.result.isError).toBeFalsy();
     const text = body.result.content[0].text as string;
-    expect(text).toContain("[stalled]");
+    // The flag answers only "can I dispatch here". This thread is not busy, so
+    // it is idle — and must never be labelled with a third state that reads as
+    // unusable.
+    expect(text).toContain("[idle]");
+    expect(text).not.toContain("[stalled]");
+    // The bookkeeping is not hidden: the ids and the recovery route still print,
+    // and the line says in so many words that they do not block a handoff.
     expect(text).toContain("dispatch-stalled-1");
     expect(text).toContain("/seam workflows");
-    expect(text).not.toContain("[idle]");
+    expect(text).toContain("does NOT block handoff");
   });
 
   it("threads refuses a scope that names another channel (self-scope, #73)", async () => {

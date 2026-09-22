@@ -69,13 +69,14 @@ const sessionRecord = (over: Partial<SessionRecord> = {}): SessionRecord => ({
 });
 
 /** Minimal runtime that answers immediately and stops cleanly. */
-function fakeRuntime() {
+function fakeRuntime(fallbackCode?: string) {
   let handler: ((e: unknown) => void | Promise<void>) | undefined;
   return {
     onEvent(h: (e: unknown) => void | Promise<void>) {
       handler = h;
     },
     async prompt() {
+      if (fallbackCode) await handler?.({ kind: "agy-stdout-fallback", code: fallbackCode });
       await handler?.({ kind: "agent-text", text: "done" });
       return { stopReason: "end_turn" };
     },
@@ -104,8 +105,8 @@ function spyAdapter() {
   };
 }
 
-function makeOrch(dataDir: string, store: SessionStore, logger: Logger): Orchestrator {
-  const rt = fakeRuntime();
+function makeOrch(dataDir: string, store: SessionStore, logger: Logger, fallbackCode?: string): Orchestrator {
+  const rt = fakeRuntime(fallbackCode);
   const router = {
     listProfiles: () => [],
     describeConfig: () => ({}),
@@ -169,6 +170,12 @@ afterEach(() => {
 });
 
 describe("#170 dispatchInjectTurn skips an already-ledgered spec", () => {
+  it("#545 records degradation on a successfully completed live dispatch", async () => {
+    const { logger } = capturingLogger();
+    await makeOrch(dataDir, store, logger, "unauthenticated").dispatchInjectTurn(spec());
+    expect(store.turnAttempts.get("disp-1")).toMatchObject({ state: "completed",
+      stdoutFallback: { count: 1, reasons: { unauthenticated: 1 } } });
+  });
   // #509: deleting the onward-first ordering would hide a failed report-back claim; replay must settle without rerunning the worker.
   it("leaves a failed onward claim unsettled until completion replay succeeds", async () => {
     const { logger } = capturingLogger();

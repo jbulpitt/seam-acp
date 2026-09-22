@@ -34,6 +34,8 @@ import {
 import {
   SEAM_AGY_JSON_SCHEMA_META,
   SEAM_AGY_CATALOG_REFRESH_META,
+  SEAM_AGY_STDOUT_FALLBACK_META,
+  permitsAgyStdoutFallback,
   attachErrorClassification,
   readErrorClassification,
   resolveError,
@@ -75,6 +77,7 @@ export interface AsyncUserInputQuestion {
 }
 
 export type AgentEvent =
+  | { kind: "agy-stdout-fallback"; code: string }
   | { kind: "recovery"; message: string }
   | { kind: "agent-text"; text: string; messageId?: string }
   | {
@@ -1897,6 +1900,14 @@ export class AgentRuntime {
    *  resumed first prompt that never echoes must still emit — see the flush in
    *  `prompt()`'s teardown). */
   private async dispatchSessionUpdate(update: SessionUpdate): Promise<void> {
+    const fallback = objectRecord(objectRecord(update._meta)?.[SEAM_AGY_STDOUT_FALLBACK_META]);
+    // Refuse only malformed/foreign telemetry. The answer and existing caveat
+    // still flow; neither prose nor an unrelated adapter can assert this fact.
+    if (this.profile.id === "agy" &&
+        (update.sessionUpdate === "agent_message_chunk" || update.sessionUpdate === "agent_thought_chunk") &&
+        typeof fallback?.code === "string" && permitsAgyStdoutFallback(fallback.code)) {
+      await this.emit({ kind: "agy-stdout-fallback", code: fallback.code });
+    }
     switch (update.sessionUpdate) {
       case "agent_message_chunk": {
         const asyncInput = codexAsyncUserInputFromUpdate(update);

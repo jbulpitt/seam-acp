@@ -23,6 +23,14 @@ import { setTimeout as delay } from "node:timers/promises";
 import { agyFailure } from "./agy-lifecycle.js";
 import { ProbeError, redactProbeText } from "./probe-process.js";
 
+/** Structured evidence on the existing caveat update; never parse its prose. */
+export const SEAM_AGY_STDOUT_FALLBACK_META = "seam/agyStdoutFallback";
+
+export function permitsAgyStdoutFallback(code: string): boolean {
+  return ["unauthenticated", "permission_denied", "unimplemented", "protocol_error"].includes(code)
+    || /^http_(?:4\d\d|5\d\d|200)$/.test(code);
+}
+
 /** Explicit subscription rejection, not corrupt frames or a broken active stream. */
 export class AgyStreamUnavailableError extends ProbeError {
   readonly streamCode: string;
@@ -30,8 +38,7 @@ export class AgyStreamUnavailableError extends ProbeError {
   get permitsStdoutFallback(): boolean {
     // Refuse provider/application failures (quota, cancellation, etc.) as
     // failures of this turn; only subscription auth/protocol loses streaming.
-    return ["unauthenticated", "permission_denied", "unimplemented", "protocol_error"].includes(this.streamCode)
-      || /^http_(?:4\d\d|5\d\d|200)$/.test(this.streamCode);
+    return permitsAgyStdoutFallback(this.streamCode);
   }
   constructor(code: string, message: string, sensitiveValues: ReadonlyArray<string> = []) {
     const safeCode = redactProbeText(code, process.env, sensitiveValues).slice(0, 100);

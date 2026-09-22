@@ -308,7 +308,9 @@ const server = http.createServer(async (request, response) => {
           }] } },
         } }));
       }
-      response.end(envelope(2, { error: { code: "unauthenticated", message: "missing CSRF token" } }));
+      response.end(envelope(2, { error: prompt === "r5-stream-unimplemented"
+        ? { code: "unimplemented", message: "RPC unavailable in this version" }
+        : { code: "unauthenticated", message: "missing CSRF token" } }));
       if (prompt === "r5-stream-hang") return;
       setTimeout(() => {
         process.stdout.write(schemaFile ? JSON.stringify({ status: "SUCCESS", structured_output: { answer: "OK" } })

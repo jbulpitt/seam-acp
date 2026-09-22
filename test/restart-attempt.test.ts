@@ -29,6 +29,59 @@ const identity = executionIdentity({ agent: "synthetic-provider", location: "loc
   model: "synthetic-model", effort: "", cwd: "/synthetic", config: {} });
 
 describe("#250 durable attempt winner", () => {
+  it("#545 does not reinterpret malformed legacy runtime ownership as absent", () => {
+    const db = database(), attempts = db.open().turnAttempts;
+    attempts.claim(spec, identity, "boot-A");
+    const raw = new Database(db.file);
+    try { raw.prepare("UPDATE turn_attempts SET runtime_json='{}' WHERE id=?").run(spec.id); }
+    finally { raw.close(); }
+    expect(attempts.get(spec.id)?.runtimeOwner).toEqual({});
+    expect(provenDead(attempts.get(spec.id)!.runtimeOwner!)).toBe(false);
+  });
+
+  it("#545 persists fallback counts without changing completion or runtime ownership", () => {
+    const db = database();
+    const attempts = db.open().turnAttempts;
+    const a = attempts.claim(spec, identity, "boot-A");
+    expect(attempts.get(a.id)?.stdoutFallback).toBeUndefined(); // unknown, not healthy
+    attempts.bindRuntime(a, process.pid);
+    const owner = attempts.get(a.id)?.runtimeOwner;
+    expect(attempts.recordStdoutFallback(a, "unauthenticated")).toBe(true);
+    expect(attempts.get(a.id)?.runtimeOwner).toMatchObject(owner!);
+    attempts.bindRuntime(a, undefined); // remote/rebound runtime must keep evidence
+    expect(attempts.get(a.id)?.runtimeOwner).toBeNull();
+    expect(attempts.recordStdoutFallback(a, "unimplemented")).toBe(true);
+    expect(attempts.recordStdoutFallback(a, "unauthenticated")).toBe(true);
+    attempts.bind(a, "acp"); attempts.startPrompt(a);
+    expect(attempts.complete(a, { id: a.id, target: spec.target, status: "completed",
+      output: "stdout answer", finishedUtc: spec.createdUtc })).toBe(true);
+    const reopened = db.open().turnAttempts.get(a.id)!;
+    expect(reopened).toMatchObject({ state: "completed", outcome: { status: "completed", output: "stdout answer" },
+      stdoutFallback: { count: 3, reasons: { unauthenticated: 2, unimplemented: 1 }, lastUtc: expect.any(String) } });
+    // One SQL query can measure degradation; no second counter to synchronize.
+    const raw = new Database(db.file);
+    try {
+      expect(raw.prepare("SELECT sum(json_extract(runtime_json, '$.stdoutFallback.count')) AS count FROM turn_attempts").get())
+        .toEqual({ count: 3 });
+    } finally { raw.close(); }
+    expect(attempts.recordStdoutFallback(a, "http_503")).toBe(false);
+  });
+
+  it("#545 rejects stale fallback writers while retaining evidence across reclaim", () => {
+    simulateRetiredOwnerProcess();
+    const attempts = database().open().turnAttempts;
+    attempts.registerOwner("boot-A");
+    const a = attempts.claim(spec, identity, "boot-A");
+    attempts.recordStdoutFallback(a, "unauthenticated");
+    attempts.suspendBoot("boot-A");
+    expect(attempts.recordStdoutFallback(a, "http_503")).toBe(false);
+    const b = attempts.claim(spec, identity, "boot-B");
+    expect(attempts.recordStdoutFallback(a, "http_503")).toBe(false);
+    attempts.bindRuntime(b, undefined);
+    expect(attempts.recordStdoutFallback(b, "unimplemented")).toBe(true);
+    expect(attempts.get(a.id)?.stdoutFallback).toMatchObject({ count: 2,
+      reasons: { unauthenticated: 1, unimplemented: 1 } });
+  });
   it.each(["missing", "null", "{}", "invalid-json", "invalid-pid", "missing-start"])(
     "retains suspended ownership when the prior owner proof is %s", proof => {
       const db = database();

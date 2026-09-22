@@ -46,6 +46,23 @@ let dataDir: string;
 let store: SessionStore;
 let dirs: ReturnType<typeof dispatchDirs>;
 const watchers = new Set<DispatchWatcher>();
+/** Releases every turn a test is still holding. `drain()` waits for that
+ *  `onDispatch`. An assertion that throws first used to leave the promise
+ *  unresolved, and the hook sat until its 10s timeout. */
+const releases: Array<() => void> = [];
+
+function hold(): { promise: Promise<void>; release: () => void } {
+  let release = () => {};
+  const promise = new Promise<void>((resolve) => { release = resolve; });
+  let opened = false;
+  const once = () => {
+    if (opened) return;
+    opened = true;
+    release();
+  };
+  releases.push(once);
+  return { promise, release: once };
+}
 
 beforeEach(async () => {
   dataDir = await mkdtemp(path.join(tmpdir(), "seam-409-"));
@@ -54,6 +71,8 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  for (const release of releases) release();
+  releases.length = 0;
   for (const w of watchers) w.stop();
   await Promise.all([...watchers].map((w) => w.drain()));
   watchers.clear();
@@ -78,9 +97,11 @@ const only = (lines: Line[], msg: string) => lines.filter((l) => l.msg === msg);
 describe("#409 admitted and running are different moments", () => {
   it("does not call a queued turn running while another holds its target", async () => {
     // The reproduction. Two dispatches on ONE target: the first blocks until
-    // released, the second can only be queued behind it.
-    let releaseFirst: () => void = () => {};
-    const firstHolding = new Promise<void>((r) => { releaseFirst = r; });
+    // released, the second can only be queued behind it. The wait is the
+    // holder's own promise, not a clock.
+    const held = hold();
+    let holderEntered: () => void = () => {};
+    const holderRunning = new Promise<void>((resolve) => { holderEntered = resolve; });
     const started: string[] = [];
 
     const { logger, lines } = recordingLogger();
@@ -88,7 +109,10 @@ describe("#409 admitted and running are different moments", () => {
       attempts: store.turnAttempts, dataDir, logger,
       onDispatch: async (spec) => {
         started.push(spec.id);
-        if (spec.id === "holder") await firstHolding;
+        if (spec.id === "holder") {
+          holderEntered();
+          await held.promise;
+        }
         return { output: spec.id, stopReason: "end_turn" };
       },
     });
@@ -97,10 +121,11 @@ describe("#409 admitted and running are different moments", () => {
     await dropSpec({ id: "holder" });
     await dropSpec({ id: "queued" });
     const run = watcher.start();
-    // Let the watcher select both and start the holder.
-    await new Promise((r) => setTimeout(r, 50));
+    await holderRunning;
 
-    // Both were ADMITTED — selection happened for each.
+    // Both were ADMITTED — selection happened for each. `admitted` is logged
+    // before either turn enters the target queue, so it is already true once
+    // the holder has reached onDispatch.
     expect(only(lines, "dispatch: admitted").map((l) => l.obj.id).sort())
       .toEqual(["holder", "queued"]);
     // Only the holder is RUNNING. This is the whole bug: before #409 the
@@ -111,7 +136,7 @@ describe("#409 admitted and running are different moments", () => {
     // And the database agrees with the log rather than contradicting it.
     expect(store.turnAttempts.get("queued")?.state).toBe("pending");
 
-    releaseFirst();
+    held.release();
     watcher.stop();
     await run;
     await watcher.drain();
@@ -124,14 +149,23 @@ describe("#409 admitted and running are different moments", () => {
 
   it("reports how long the queued turn waited, so the wait is one number", async () => {
     // The issue is about 13.5 minutes being invisible. `queuedMs` makes it
-    // readable without diffing two timestamps across a busy journal.
-    let release: () => void = () => {};
-    const held = new Promise<void>((r) => { release = r; });
+    // readable without diffing two timestamps across a busy journal. The
+    // clock is injected: the number is the wait the test applied, not how
+    // long the scheduler took to notice.
+    const held = hold();
+    let holderEntered: () => void = () => {};
+    const holderRunning = new Promise<void>((resolve) => { holderEntered = resolve; });
+    let now = 1_000_000;
+    const heldFor = 13.5 * 60 * 1000;
     const { logger, lines } = recordingLogger();
     const watcher = new DispatchWatcher({
       attempts: store.turnAttempts, dataDir, logger,
+      now: () => now,
       onDispatch: async (spec) => {
-        if (spec.id === "holder") await held;
+        if (spec.id === "holder") {
+          holderEntered();
+          await held.promise;
+        }
         return { output: spec.id, stopReason: "end_turn" };
       },
     });
@@ -140,20 +174,24 @@ describe("#409 admitted and running are different moments", () => {
     await dropSpec({ id: "holder" });
     await dropSpec({ id: "queued" });
     const run = watcher.start();
-    await new Promise((r) => setTimeout(r, 120));
-    release();
+    await holderRunning;
+    now += heldFor;
+    held.release();
     watcher.stop();
     await run;
     await watcher.drain();
 
     const queued = only(lines, "dispatch: running").find((l) => l.obj.id === "queued");
-    expect(queued).toBeDefined();
-    expect(queued!.obj.queuedMs).toBeGreaterThanOrEqual(100);
-
-    // The holder waited on nobody, so its own wait is small — the field
-    // distinguishes the two rather than being decorative.
     const holder = only(lines, "dispatch: running").find((l) => l.obj.id === "holder");
-    expect(holder!.obj.queuedMs as number).toBeLessThan(queued!.obj.queuedMs as number);
+    expect(queued).toBeDefined();
+    expect(holder).toBeDefined();
+    // Holder was admitted and started on the same clock reading. The queued
+    // turn's wait is exactly the advance applied while the holder blocked it.
+    expect(holder!.obj.queuedMs).toBe(0);
+    expect(queued!.obj.queuedMs).toBe(heldFor);
+    expect(only(lines, "dispatch: admitted").map((l) => l.obj.id)).toEqual(["holder", "queued"]);
+    const runningAt = only(lines, "dispatch: running").map((l) => l.obj.id);
+    expect(runningAt).toEqual(["holder", "queued"]);
   });
 
   it("emits running immediately before execution, not merely at some later point", async () => {

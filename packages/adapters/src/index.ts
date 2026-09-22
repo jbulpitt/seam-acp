@@ -11,6 +11,7 @@ export * from "./error-classification.js";
 export * from "./error-resolver.js";
 export * from "./catalog-evidence.js";
 export * from "./model-catalog.js";
+export * from "./model-fallback.js";
 export * from "./probe-process.js";
 export * from "./fast-mode.js";
 export * from "./session-manager.js";

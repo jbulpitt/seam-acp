@@ -493,6 +493,7 @@ async function main(): Promise<void> {
     store,
     profiles,
     modelCatalog,
+    modelMetadata: modelMetadataStore,
     ollamaCloudEnabled: config.OLLAMA_CLOUD_ENABLED,
     defaultAgentId: config.DEFAULT_AGENT,
     defaultModel: config.DEFAULT_MODEL,

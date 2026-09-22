@@ -11,7 +11,12 @@ afterEach(() => {
   for (const root of temporaryRoots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
-function fakeInstallerHost(version: string, abi: string, relativeNode = false) {
+function fakeInstallerHost(
+  version: string,
+  abi: string,
+  relativeNode = false,
+  replacement?: { version: string; abi: string },
+) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "seam-macos-installer-"));
   temporaryRoots.push(root);
   const home = path.join(root, "home");
@@ -21,12 +26,13 @@ function fakeInstallerHost(version: string, abi: string, relativeNode = false) {
   const fakeBin = path.join(root, "fake-bin");
   const nodeDir = relativeNode ? path.join(root, "relative-bin") : path.join(seamHome, "node", "bin");
   const pm2Log = path.join(root, "pm2.log");
+  const nodeProbeState = path.join(root, "node-probed");
   for (const dir of [home, repo, workspace, fakeBin, nodeDir, path.join(seamHome, "bin"), path.join(repo, "packages/bridge/dist")]) {
     fs.mkdirSync(dir, { recursive: true });
   }
   fs.writeFileSync(path.join(repo, "packages/bridge/dist/index.js"), "// fixture\n");
   const node = path.join(nodeDir, "node");
-  fs.writeFileSync(node, `#!/bin/sh\ncase "$1" in\n  -v|--version) printf '%s\\n' '${version}' ;;\n  -p) printf '%s\\n' '${abi}' ;;\n  *) exit 64 ;;\nesac\n`, { mode: 0o755 });
+  fs.writeFileSync(node, `#!/bin/sh\ncase "$1" in\n  -v|--version) if test -e '${nodeProbeState}'; then printf '%s\\n' '${replacement?.version ?? version}'; else printf '%s\\n' '${version}'; fi ;;\n  -p) if test -e '${nodeProbeState}'; then printf '%s\\n' '${replacement?.abi ?? abi}'; else : > '${nodeProbeState}'; printf '%s\\n' '${abi}'; fi ;;\n  *) exit 64 ;;\nesac\n`, { mode: 0o755 });
   fs.writeFileSync(path.join(fakeBin, "uname"), "#!/bin/sh\ncase \"$1\" in -s) echo Darwin ;; -m) echo arm64 ;; *) echo Darwin ;; esac\n", { mode: 0o755 });
   fs.writeFileSync(path.join(fakeBin, "sw_vers"), "#!/bin/sh\necho 15.0\n", { mode: 0o755 });
   fs.writeFileSync(path.join(seamHome, "bin", "pm2"), "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$PM2_LOG\"\ncase \"$1\" in -v) echo 6.0.0; exit 0 ;; describe) exit 1 ;; *) exit 0 ;; esac\n", { mode: 0o755 });
@@ -49,15 +55,18 @@ function fakeInstallerHost(version: string, abi: string, relativeNode = false) {
   };
 }
 
-function runInstaller(fixture: ReturnType<typeof fakeInstallerHost>) {
-  return spawnSync("/bin/bash", [
+function runInstaller(fixture: ReturnType<typeof fakeInstallerHost>, pairing = true) {
+  const args = [
     script,
     "--skip-deps",
+    "--dir", fixture.repo,
+  ];
+  if (pairing) args.push(
     "--connect", "seam-bridge connect --server wss://example.invalid/bridge --id fixture --token fixture-token",
     "--cwd", fixture.workspace,
-    "--dir", fixture.repo,
     "-y",
-  ], { cwd: fixture.root, env: fixture.env, encoding: "utf8" });
+  );
+  return spawnSync("/bin/bash", args, { cwd: fixture.root, env: fixture.env, encoding: "utf8" });
 }
 
 describe("install-macos-bridge.sh parser", () => {
@@ -78,6 +87,14 @@ describe("install-macos-bridge.sh parser", () => {
     expect(fs.existsSync(fixture.pm2Log)).toBe(false);
   });
 
+  it("refuses an unsupported runtime before requesting pairing credentials", () => {
+    const fixture = fakeInstallerHost("v24.15.0", "137");
+    const result = runInstaller(fixture, false);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("unsupported ABI 137");
+    expect(result.stderr).not.toContain("could not find --server");
+  });
+
   it("pins the independently allowed ABI 127 interpreter by absolute path", () => {
     const fixture = fakeInstallerHost("v22.22.2", "127");
     const result = runInstaller(fixture);
@@ -94,6 +111,15 @@ describe("install-macos-bridge.sh parser", () => {
     expect(result.status).toBe(1);
     expect(result.stderr).toContain("node interpreter must be an absolute path");
     expect(fs.existsSync(path.join(fixture.seamHome, "bridge", "ecosystem.config.cjs"))).toBe(false);
+  });
+
+  it("re-probes the bound artifact immediately before the first PM2 config write", () => {
+    const fixture = fakeInstallerHost("v22.22.2", "127", false, { version: "v24.15.0", abi: "137" });
+    const result = runInstaller(fixture);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("unsupported ABI 137");
+    expect(fs.existsSync(path.join(fixture.seamHome, "bridge", "ecosystem.config.cjs"))).toBe(false);
+    expect(fs.existsSync(fixture.pm2Log)).toBe(false);
   });
 
   it("keeps the installer ABI allowlist aligned with the rollout contract", () => {

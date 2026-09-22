@@ -322,6 +322,187 @@ function driftConsequence(difference, pinsFile) {
   return `${difference.key} is absent from ${missingIn}`;
 }
 
+/**
+ * The path a launcher script loads, taken from a string literal only.
+ *
+ * plex-server's launcher names `/home/mediaserver/.config/seam-bridge/bridge.env`
+ * and reads it after exec, so the process environment at start is empty of
+ * pins and is not the configuration. The text is never executed: more than
+ * one named `bridge.env` is ambiguous rather than a guess.
+ */
+export function launcherEnvPath(text) {
+  const found = [];
+  const re = /["']([^"'\n]*bridge\.env)["']/g;
+  let match = re.exec(String(text));
+  while (match) {
+    if (!found.includes(match[1])) found.push(match[1]);
+    match = re.exec(String(text));
+  }
+  if (found.length === 1) return { path: found[0], ambiguous: false };
+  if (found.length === 0) return { path: null, ambiguous: false };
+  return { path: null, ambiguous: true, paths: found };
+}
+
+/**
+ * Which reading is actually configuring the process (#395, after the fleet audit).
+ *
+ * A pin does not live in one path on this fleet:
+ *
+ *   launcher — the script names an env file and loads it after exec (plex).
+ *              An empty exec environment does not contradict that file.
+ *   dotenv   — the process loads this file over its environment (rhc).
+ *              Same: the exec environment can be empty and the file still enforces.
+ *   process  — the running environment itself carries the pins (fhr, where
+ *              systemd injects `/etc/seam-bridge-agy.env`). That is enforced,
+ *              not a volatile leftover, when no launcher or dotenv file claims them.
+ *   recorded — an ecosystem file has the pins and the running environment was
+ *              read and does not. Recorded, not enforced (#415). Not a pass.
+ *
+ * A source that was not read is not empty. Empty evidence is not a failing pin.
+ * When the readings do not identify an enforcing source, the result is
+ * `unknown`, not `fail`.
+ *
+ * @param {{
+ *   launcher?: { supplied: boolean, pins: Map<string, string>, path?: string|null },
+ *   dotenv?: { supplied: boolean, pins: Map<string, string>, path?: string|null },
+ *   processEnv?: { supplied: boolean, pins: Map<string, string> },
+ *   recorded?: { supplied: boolean, pins: Map<string, string>, path?: string, format?: string },
+ * }} evidence
+ */
+export function selectPinAuthority(evidence) {
+  const launcher = evidence.launcher ?? { supplied: false, pins: new Map() };
+  const dotenv = evidence.dotenv ?? { supplied: false, pins: new Map() };
+  const processEnv = evidence.processEnv ?? { supplied: false, pins: new Map() };
+  const recorded = evidence.recorded ?? { supplied: false, pins: new Map() };
+  const count = (source) => (source.supplied ? source.pins.size : 0);
+  const complete = (source) => source.supplied
+    && AGY_DEPLOYMENT_PINS.every((key) => source.pins.has(key) && source.pins.get(key));
+
+  if (launcher.supplied && launcher.ambiguous) {
+    return {
+      kind: "unknown",
+      source: "launcher",
+      pins: new Map(),
+      detail: "the launcher names more than one bridge.env, so the file it loads cannot be determined",
+    };
+  }
+  if (complete(launcher)) {
+    return { kind: "enforced", source: "launcher", pins: launcher.pins, path: launcher.path };
+  }
+  if (complete(dotenv)) {
+    return { kind: "enforced", source: "dotenv", pins: dotenv.pins, path: dotenv.path };
+  }
+  if (complete(recorded) && complete(processEnv)) {
+    // Both readings exist. The file is what an operator edits; disagreement
+    // with the process is drift, reported by the source comparison, and the
+    // artifact is checked against the file. Preferring the process here would
+    // turn a version mismatch into a missing-binary failure.
+    const source = recorded.format === "pm2-ecosystem" ? "pm2-ecosystem" : (recorded.format ?? "file");
+    return { kind: "enforced", source, pins: recorded.pins, path: recorded.path };
+  }
+  if (complete(processEnv) && !complete(recorded)) {
+    return { kind: "enforced", source: "process-env", pins: processEnv.pins };
+  }
+  if (recorded.format === "pm2-ecosystem" && complete(recorded)
+      && processEnv.supplied && count(processEnv) === 0) {
+    return {
+      kind: "recorded-unenforced",
+      source: "pm2-ecosystem",
+      pins: recorded.pins,
+      path: recorded.path,
+      detail: `the ecosystem file ${recorded.path} records all ${AGY_DEPLOYMENT_PINS.length} pins, ` +
+        "and the running process environment has none of them. The pin is recorded but not " +
+        "enforced: it reads as safe and the process is not using it",
+    };
+  }
+  if (recorded.supplied && complete(recorded) && processEnv.supplied && count(processEnv) === 0
+      && !complete(launcher) && !complete(dotenv)) {
+    return {
+      kind: "unknown",
+      source: recorded.format ?? "file",
+      pins: recorded.pins,
+      path: recorded.path,
+      detail: `the file ${recorded.path} records pins and the running environment has none, ` +
+        "and nothing names this file as what the process loads. That is not a failing pin " +
+        "and it is not a pass",
+    };
+  }
+  if (complete(recorded) && !processEnv.supplied && !complete(launcher) && !complete(dotenv)) {
+    if (recorded.format === "pm2-ecosystem") {
+      return {
+        kind: "enforced",
+        source: "pm2-ecosystem",
+        pins: recorded.pins,
+        path: recorded.path,
+        detail: `all ${AGY_DEPLOYMENT_PINS.length} pins read from the pm2 ecosystem file ` +
+          `${recorded.path}. pm2 re-reads this file only on \`pm2 delete <app> && pm2 start ${recorded.path}\` — ` +
+          `\`pm2 restart\` does not — and a reboot restores from ~/.pm2/dump.pm2, not ` +
+          "from here, so run `pm2 save` after any change or the next boot uses the " +
+          "last saved process list instead. The running environment was not read, so " +
+          "this does not show that the process is enforcing the file",
+      };
+    }
+    return { kind: "enforced", source: "file", pins: recorded.pins, path: recorded.path };
+  }
+  if (recorded.supplied && count(recorded) > 0 && !complete(recorded) && recorded.format !== "absent") {
+    const missing = AGY_DEPLOYMENT_PINS.filter((key) => !recorded.pins.has(key));
+    return {
+      kind: "incomplete",
+      source: recorded.format ?? "file",
+      pins: recorded.pins,
+      path: recorded.path,
+      detail: `absent from ${recorded.path} and from the process environment: ${missing.join(", ")}`,
+    };
+  }
+  const anySupplied = [launcher, dotenv, processEnv, recorded].some((source) => source.supplied);
+  if (!anySupplied) {
+    return {
+      kind: "unknown",
+      source: "absent",
+      pins: new Map(),
+      detail: "no configuration source was read, so the pin is unknown rather than failed",
+    };
+  }
+  if (processEnv.supplied && count(processEnv) === 0 && count(launcher) === 0
+      && count(dotenv) === 0 && count(recorded) === 0) {
+    return {
+      kind: "not-deployed",
+      source: "absent",
+      pins: new Map(),
+      detail: "the running environment has no AGY pins, and neither does any configuration file that was read",
+    };
+  }
+  if (!processEnv.supplied && count(recorded) === 0 && count(launcher) === 0 && count(dotenv) === 0) {
+    // A missing pins file and no other reading is the host that does not run
+    // agy. An existing file with no pins, and no look at the process, is not
+    // that fact: fhr-server's bridge.env is empty of pins while systemd injects
+    // them. Those two must not share a verdict.
+    if (recorded.supplied && recorded.missingFile) {
+      return {
+        kind: "not-deployed",
+        source: "absent",
+        pins: new Map(),
+        detail: recorded.detail,
+      };
+    }
+    return {
+      kind: "unknown",
+      source: "absent",
+      pins: new Map(),
+      detail: recorded.supplied
+        ? `${recorded.path} carries no AGY pins, and the running environment was not read. ` +
+          "That is not evidence the host is unpinned"
+        : "no enforcing source could be read, so the pin is unknown rather than failed",
+    };
+  }
+  return {
+    kind: "unknown",
+    source: "absent",
+    pins: new Map(),
+    detail: "the readings do not identify which source enforces the pin, so this is unknown rather than a failure",
+  };
+}
+
 export function resolvePinSources(pinsFileText, processEnv = {}, format = null) {
   const fromFile = new Map();
   // "absent" rather than "file" when there is nothing to read, so the header
@@ -374,11 +555,14 @@ export function verifyAgyDeployment(options, io = readOnlyIo()) {
   const {
     envFile,
     processEnv = {},
+    processEnvSupplied = false,
     runtimeParent = DEFAULT_RUNTIME_PARENT,
     platform = process.platform,
     probe = null,
     format = null,
     pm2Dump = null,
+    launcher = null,
+    dotenvFile = null,
   } = options;
 
   let envFileText = null;
@@ -391,65 +575,133 @@ export function verifyAgyDeployment(options, io = readOnlyIo()) {
 
   const { sources: pins, fileSource, ecosystem } =
     resolvePinSources(envFileText, processEnv, format);
-  const value = (key) => pins[key]?.value ?? null;
+
+  const readPins = (text) => {
+    const map = new Map();
+    if (typeof text !== "string") return map;
+    const { index } = parseEnvFile(text);
+    for (const key of AGY_DEPLOYMENT_PINS) {
+      const found = index.get(key);
+      if (found !== undefined && found.value) map.set(key, found.value);
+    }
+    return map;
+  };
+
+  let launcherReading = { supplied: false, pins: new Map() };
+  if (launcher) {
+    try {
+      const named = launcherEnvPath(io.readFileSync(launcher, "utf8"));
+      if (named.ambiguous) {
+        launcherReading = { supplied: true, ambiguous: true, pins: new Map(), path: null };
+      } else if (!named.path) {
+        launcherReading = { supplied: true, pins: new Map(), path: null };
+      } else {
+        try {
+          launcherReading = {
+            supplied: true,
+            path: named.path,
+            pins: readPins(io.readFileSync(named.path, "utf8")),
+          };
+        } catch (error) {
+          launcherReading = {
+            supplied: true,
+            path: named.path,
+            pins: new Map(),
+            detail: `launcher names ${named.path} (${error?.code ?? "EUNKNOWN"})`,
+          };
+        }
+      }
+    } catch (error) {
+      launcherReading = {
+        supplied: true,
+        pins: new Map(),
+        detail: `cannot read launcher ${launcher} (${error?.code ?? "EUNKNOWN"})`,
+      };
+    }
+  }
+
+  let dotenvReading = { supplied: false, pins: new Map() };
+  if (dotenvFile) {
+    try {
+      dotenvReading = { supplied: true, path: dotenvFile, pins: readPins(io.readFileSync(dotenvFile, "utf8")) };
+    } catch (error) {
+      dotenvReading = {
+        supplied: true,
+        path: dotenvFile,
+        pins: new Map(),
+        detail: `cannot read ${dotenvFile} (${error?.code ?? "EUNKNOWN"})`,
+      };
+    }
+  }
+
+  const processSupplied = processEnvSupplied || AGY_DEPLOYMENT_PINS.some((key) =>
+    Object.prototype.hasOwnProperty.call(processEnv, key));
+  const processPins = new Map(AGY_DEPLOYMENT_PINS
+    .filter((key) => Object.prototype.hasOwnProperty.call(processEnv, key) && processEnv[key])
+    .map((key) => [key, String(processEnv[key])]));
+  const recordedPins = new Map(AGY_DEPLOYMENT_PINS
+    .filter((key) => pins[key]?.source === fileSource && pins[key]?.value)
+    .map((key) => [key, pins[key].value]));
+  const recordedMissing = envFileError && !ecosystem?.ambiguous;
+  const authority = ecosystem?.ambiguous
+    ? { kind: "ambiguous", pins: new Map(), source: "pm2-ecosystem" }
+    : selectPinAuthority({
+      launcher: launcherReading,
+      dotenv: dotenvReading,
+      processEnv: { supplied: processSupplied, pins: processPins },
+      recorded: {
+        supplied: envFileText !== null || Boolean(envFileError),
+        pins: recordedPins,
+        path: envFile,
+        format: fileSource,
+        missingFile: Boolean(envFileError),
+        detail: envFileError
+          ? `no pins file at ${envFile} (${envFileError}) and no AGY pins in the process environment`
+          : `${envFile} carries no AGY pins, and neither does the process environment`,
+      },
+    });
+  const value = (key) => (authority.pins?.has(key) ? authority.pins.get(key) : pins[key]?.value ?? null);
   const checks = [];
 
-  const absent = AGY_DEPLOYMENT_PINS.filter((k) => pins[k].source === "absent");
-  const processOnly = AGY_DEPLOYMENT_PINS.filter((k) => pins[k].source === "process-env");
+  // A missing pins file and no other reading is NOT DEPLOYED (media-server:
+  // a bridge and no agy). An empty file we happened to open is not that fact,
+  // and a pin the process environment is enforcing is not a failure either.
+  // Ambiguous ecosystem files stay a failure: two apps both carrying pins is
+  // a conflict, not an absence.
+  const notDeployed = authority.kind === "not-deployed";
 
-  // A host with no pins file and no AGY pins anywhere is NOT DEPLOYED, which is
-  // a different fact from being deployed wrongly. media-server is exactly this:
-  // it runs a bridge and no agy. Reporting that as a failure would be the
-  // question-4 error this tool exists to avoid — it would describe a correct
-  // host as broken — so it gets its own verdict and its own exit status.
-  // "Ambiguous" is emphatically not "absent": a file with AGY pins in two apps
-  // has agy deployed and cannot say which app owns it. Letting that fall into
-  // the not-deployed path would report a configuration conflict as a host that
-  // simply does not run agy.
-  const notDeployed = absent.length === AGY_DEPLOYMENT_PINS.length
-    && !processOnly.length
-    && !ecosystem?.ambiguous;
-
-  // 1. Pins must live in a file, not only in volatile process state.
-  if (notDeployed) {
-    checks.push(check("pins-in-file", "skipped",
-      envFileError
-        ? `no pins file at ${envFile} (${envFileError}) and no AGY pins in the process environment`
-        : `${envFile} carries no AGY pins, and neither does the process environment`,
-      "agy_not_deployed"));
-  } else if (envFileError) {
-    checks.push(check("pins-in-file", "fail",
-      `cannot read pins file ${envFile} (${envFileError})`, "pins_file_unreadable"));
-  } else if (ecosystem?.ambiguous) {
+  if (ecosystem?.ambiguous) {
     checks.push(check("pins-in-file", "fail",
       `AGY pins appear in ${ecosystem.blocks.length} separate env blocks ` +
       `(${ecosystem.blocks.map((b) => b.app ?? "unnamed").join(", ")}); ` +
       `which app serves agy cannot be determined from the file alone`,
       "pins_in_multiple_apps"));
-  } else if (processOnly.length) {
-    checks.push(check("pins-in-file", "fail",
-      `present only in the live process environment, absent from ${envFile}: ` +
-      `${processOnly.join(", ")} — a restart resurrects this host without them`,
-      "pins_only_in_process_env"));
-  } else if (absent.length) {
-    checks.push(check("pins-in-file", "fail",
-      `absent from ${envFile} and from the process environment: ${absent.join(", ")}`,
-      "pins_missing"));
-  } else if (fileSource === "pm2-ecosystem") {
-    // PASS, deliberately. The question this check asks is whether the pins are
-    // recorded on disk rather than existing only in volatile process state, and
-    // here they are — in the file the whole fleet actually uses. Failing it
-    // would mean no host in the fleet can reach the passing state, which is a
-    // gate nobody can satisfy. The pm2 lifecycle hazard below is real but it is
-    // a property of pm2, not of this host being misdeployed (#390), so it is
-    // reported as the consequence rather than as the verdict.
+  } else if (authority.kind === "not-deployed") {
+    checks.push(check("pins-in-file", "skipped", authority.detail, "agy_not_deployed"));
+  } else if (authority.kind === "incomplete") {
+    checks.push(check("pins-in-file", "fail", authority.detail, "pins_missing"));
+  } else if (authority.kind === "recorded-unenforced") {
+    checks.push(check("pins-in-file", "unenforced", authority.detail, "pins_recorded_unenforced"));
+  } else if (authority.kind === "unknown") {
+    checks.push(check("pins-in-file", "unknown", authority.detail, "pin_source_unknown"));
+  } else if (authority.source === "process-env") {
     checks.push(check("pins-in-file", "pass",
-      `all ${AGY_DEPLOYMENT_PINS.length} pins read from the pm2 ecosystem file ` +
-      `${envFile}${ecosystem?.app ? ` (app "${ecosystem.app}")` : ""}. ` +
-      `pm2 re-reads this file only on \`pm2 delete <app> && pm2 start ${envFile}\` — ` +
-      `\`pm2 restart\` does not — and a reboot restores from ~/.pm2/dump.pm2, not ` +
-      `from here, so run \`pm2 save\` after any change or the next boot uses the ` +
-      `last saved process list instead`));
+      `all ${AGY_DEPLOYMENT_PINS.length} pins are enforced by the running process environment. ` +
+      `${envFile} is not that source` +
+      (envFileError ? ` (${envFileError})` : "")));
+  } else if (authority.source === "launcher") {
+    checks.push(check("pins-in-file", "pass",
+      `all ${AGY_DEPLOYMENT_PINS.length} pins are enforced by ${authority.path}, ` +
+      "the file the launcher loads after exec. The process environment at start " +
+      "does not have to carry them"));
+  } else if (authority.source === "dotenv") {
+    checks.push(check("pins-in-file", "pass",
+      `all ${AGY_DEPLOYMENT_PINS.length} pins are enforced by ${authority.path}, ` +
+      "loaded over the process environment"));
+  } else if (authority.source === "pm2-ecosystem") {
+    checks.push(check("pins-in-file", "pass",
+      authority.detail ??
+      `all ${AGY_DEPLOYMENT_PINS.length} pins read from the pm2 ecosystem file ${envFile}`));
   } else {
     checks.push(check("pins-in-file", "pass",
       `all ${AGY_DEPLOYMENT_PINS.length} pins read from ${envFile}`));
@@ -490,17 +742,17 @@ export function verifyAgyDeployment(options, io = readOnlyIo()) {
     }
   }
 
-  const livePins = Object.keys(processEnv).length
-    ? new Map(AGY_DEPLOYMENT_PINS
-      .filter((k) => Object.prototype.hasOwnProperty.call(processEnv, k))
-      .map((k) => [k, String(processEnv[k])]))
+  const livePins = processSupplied
+    ? processPins
     : UNAVAILABLE;
 
-  const filePins = envFileError || ecosystem?.ambiguous
+  // An empty file is not a pin source that disagrees. fhr-server's
+  // bridge.env has no AGY pins; the process environment does, and that is
+  // the configuration. Comparing the empty file as "missing" would call a
+  // correctly injected host drifted.
+  const filePins = envFileError || ecosystem?.ambiguous || recordedPins.size === 0
     ? UNAVAILABLE
-    : new Map(AGY_DEPLOYMENT_PINS
-      .filter((k) => pins[k].source === fileSource && pins[k].value !== null)
-      .map((k) => [k, pins[k].value]));
+    : recordedPins;
 
   const comparison = compareAgyPinSources({ file: filePins, dump: dumpPins, live: livePins });
   if (notDeployed) {
@@ -671,11 +923,12 @@ export function verifyAgyDeployment(options, io = readOnlyIo()) {
       // between a refusal an operator acts on and one they read as a false
       // positive, because agy is visibly working on every host in this state.
       const admitted = acceptedToday.length
-        ? ` The running bridge accepts ${acceptedToday.length} of these today` +
-          ` (${acceptedToday.join(", ")}), which is why this stays invisible.`
+        ? ` The running bridge still accepts ${acceptedToday.length} of these today` +
+          ` (${acceptedToday.join(", ")}). That acceptance is not durability;` +
+          ` it is why a replaceable tree can look fine while it is serving.`
         : "";
       checks.push(check("ancestors-durable", "fail",
-        `not root-owned, so the tree can be replaced by its owner: ${weak.join(", ")}.${admitted}`,
+        `not root-owned, so the owner can replace the tree: ${weak.join(", ")}.${admitted}`,
         "ancestor_not_root_owned"));
     }
   }
@@ -705,8 +958,10 @@ export function verifyAgyDeployment(options, io = readOnlyIo()) {
     // Precedence: a wrong artifact outranks fragile configuration, which
     // outranks "agy is not here". Each is a different remediation.
     verdict: checks.some((c) => c.status === "fail") ? "fail"
-      : notDeployed ? "not-deployed"
-        : checks.some((c) => c.status === "drift") ? "drift" : "pass",
+      : checks.some((c) => c.status === "unenforced") ? "recorded-unenforced"
+        : notDeployed ? "not-deployed"
+          : checks.some((c) => c.status === "unknown") ? "unknown"
+            : checks.some((c) => c.status === "drift") ? "drift" : "pass",
     // Always false, and asserted by the tests against a byte-level snapshot of
     // the host tree. A verifier that could repair would be a deployment tool
     // that half-applies, which is the outcome this whole story exists under.
@@ -718,8 +973,9 @@ export function verifyAgyDeployment(options, io = readOnlyIo()) {
       pinSourcesCompared: comparison.compared,
       pm2App: ecosystem?.app ?? null,
       runtimeParent: path.resolve(runtimeParent),
+      authority: authority.kind === "ambiguous" ? "pm2-ecosystem" : authority.source,
       pinSources: Object.fromEntries(
-        AGY_DEPLOYMENT_PINS.map((k) => [k, pins[k].source])),
+        AGY_DEPLOYMENT_PINS.map((k) => [k, authority.pins?.has(k) ? authority.source : pins[k].source])),
       version: value("AGY_VERSION"),
       sha256,
       cliPath,
@@ -731,7 +987,10 @@ export function verifyAgyDeployment(options, io = readOnlyIo()) {
 }
 
 export function formatDeploymentReport(report) {
-  const glyph = { pass: "PASS", fail: "FAIL", skipped: "SKIP", drift: "DRIFT" };
+  const glyph = {
+    pass: "PASS", fail: "FAIL", skipped: "SKIP", drift: "DRIFT",
+    unknown: "UNKNOWN", unenforced: "UNENFORCED",
+  };
   const lines = [
     `agy deployment: ${report.verdict.toUpperCase()}  (host was not modified)`,
     `  pins file      ${report.observed.pinsFile} (${report.observed.pinsFileFormat})`,
@@ -761,6 +1020,7 @@ export function formatDeploymentReport(report) {
  */
 export const AGY_DEPLOYMENT_FLAGS = Object.freeze([
   "--pins-file", "--format", "--runtime-parent", "--process-env", "--pm2-dump",
+  "--launcher", "--dotenv-file",
   "--host", "--fleet-targets", "--bridge-registry", "--probe", "--json",
 ]);
 
@@ -782,6 +1042,12 @@ export function exitCodeFor(verdict) {
   // `pm2 save` / `delete` + `start`, not re-staging the artifact, and a
   // caller that cannot tell those apart will do the wrong one.
   if (verdict === "drift") return 4;
+  // 5 and 6 are not failures and not passes. Unknown means the enforcing
+  // source was not identified. Recorded-unenforced means a file has the pin
+  // and the running process does not (#415). Exit 1 would send an operator
+  // to re-stage a runtime that is not the problem.
+  if (verdict === "unknown") return 5;
+  if (verdict === "recorded-unenforced") return 6;
   return 1;
 }
 
@@ -815,6 +1081,8 @@ function parseArgs(argv) {
     else if (arg === "--format") opts.format = argv[++i];
     else if (arg === "--runtime-parent") opts.runtimeParent = argv[++i];
     else if (arg === "--process-env") opts.processEnvFile = argv[++i];
+    else if (arg === "--launcher") opts.launcher = argv[++i];
+    else if (arg === "--dotenv-file") opts.dotenvFile = argv[++i];
     else if (arg === "--pm2-dump") opts.pm2Dump = argv[++i];
     else if (arg === "--host") opts.host = argv[++i];
     else if (arg === "--fleet-targets") opts.fleetTargets = argv[++i];
@@ -835,6 +1103,7 @@ export async function main(argv, out = console) {
   const opts = parseArgs(argv);
   if (opts.processEnvFile) {
     opts.processEnv = JSON.parse(fs.readFileSync(opts.processEnvFile, "utf8"));
+    opts.processEnvSupplied = true;
   }
   let fleet;
   if (opts.fleetTargets) {

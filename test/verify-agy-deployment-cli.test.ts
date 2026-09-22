@@ -223,6 +223,7 @@ describe("#397 no flag this tool accepts may be one node also parses", () => {
     // parser — which is the direction that silently removes coverage.
     expect([...AGY_DEPLOYMENT_FLAGS]).toEqual([
       "--pins-file", "--format", "--runtime-parent", "--process-env", "--pm2-dump",
+      "--launcher", "--dotenv-file",
       "--host", "--fleet-targets", "--bridge-registry", "--probe", "--json",
     ]);
     const source = fs.readFileSync(SCRIPT, "utf8");

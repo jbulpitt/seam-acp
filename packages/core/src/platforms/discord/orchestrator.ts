@@ -104,6 +104,7 @@ import {
   waitForRestartDrain,
 } from "../../core/restart-sentinel.js";
 import {
+  raceUntilSilence,
   settleWithTurnWatchdog,
   turnWatchdogTimeoutMs,
   TurnWatchdogTimeoutError,
@@ -2677,9 +2678,19 @@ export class Orchestrator {
         const timeoutMs = turnWatchdogTimeoutMs(
           this.config.TURN_TIMEOUT_SECONDS ?? 900
         );
+        const startedAt = Date.now();
+        const sessionId = makeSessionId(PLATFORM, channelId);
         const value = await settleWithTurnWatchdog(() => task(fence), {
           timeoutMs,
           label: `channel turn ${channelId}`,
+          // Same last-output mark as the prompt deadline. Before a runtime
+          // exists, the clock is this task's start so a hung boot still ends.
+          lastActivityAt: () => {
+            const read = this.router.getRuntime;
+            if (typeof read !== "function") return startedAt;
+            const at = read.call(this.router, sessionId)?.lastActivityAtMs;
+            return typeof at === "number" && Number.isFinite(at) ? Math.max(startedAt, at) : startedAt;
+          },
         });
         this.assertQueueFence(fence);
         return value;
@@ -4412,7 +4423,11 @@ export class Orchestrator {
           const afterPromptRefusal = humanRefusal();
           if (afterPromptRefusal) throw afterPromptRefusal;
         }
-        result = await raceWithTimeout(activeRuntime.prompt(promptText, promptAttachments), timeoutMs);
+        result = await raceWithTimeout(
+          activeRuntime.prompt(promptText, promptAttachments),
+          timeoutMs,
+          () => activeRuntime.lastActivityAtMs,
+        );
         this.assertQueueFence(queueFence);
       } catch (promptErr) {
         const resolution = resolveError(
@@ -4432,7 +4447,11 @@ export class Orchestrator {
           observedContextBudget = undefined;
           acpUsageReceived = false;
           activeRuntime.onEvent(eventHandler);
-          result = await raceWithTimeout(activeRuntime.prompt(promptText, promptAttachments), timeoutMs);
+          result = await raceWithTimeout(
+          activeRuntime.prompt(promptText, promptAttachments),
+          timeoutMs,
+          () => activeRuntime.lastActivityAtMs,
+        );
         } else if (isConnectionClosedError(promptErr)) {
           this.logger.warn({ session: record.id }, "connection closed mid-turn; waiting for reconnect and retrying");
           await this.router.invalidate(record.id, { clearAcpSession: false });
@@ -4442,7 +4461,11 @@ export class Orchestrator {
           observedContextBudget = undefined;
           acpUsageReceived = false;
           activeRuntime.onEvent(eventHandler);
-          result = await raceWithTimeout(activeRuntime.prompt(promptText, promptAttachments), timeoutMs);
+          result = await raceWithTimeout(
+          activeRuntime.prompt(promptText, promptAttachments),
+          timeoutMs,
+          () => activeRuntime.lastActivityAtMs,
+        );
         } else {
           // #448: AgentRuntime owns the bounded prompt budget, including turns
           // with output. Refuse only an exhausted operation and report it here;
@@ -4580,7 +4603,7 @@ export class Orchestrator {
         ]);
         await this.router.invalidate(record.id, { clearAcpSession: false });
         status.setState("Timed out");
-        status.setAction(`Exceeded ${this.config.TURN_TIMEOUT_SECONDS}s`);
+        status.setAction(`No output for ${this.config.TURN_TIMEOUT_SECONDS}s`);
       } else if (result.cancelled) {
         status.setState("Failed");
         status.setAction("Cancelled");
@@ -5467,6 +5490,7 @@ export class Orchestrator {
       if (event.kind === "usage-update" && budgetIdentity && validContextUsage(event.used, event.size)) {
         this.recordContextBudget(budgetIdentity, event.used, event.size, budgetRecord);
       }
+      opts.noteActivity?.();
       if (event.kind === "agent-text") {
         text += event.text;
       } else if (event.kind === "agent-file") {
@@ -5503,11 +5527,13 @@ export class Orchestrator {
       // outward-effect replay while live transcript continuations keep working.
       const promptOptions = { ...(opts.jsonSchema ? { jsonSchema: opts.jsonSchema } : {}),
         recoveryScope: opts.session === "isolated" ? "ephemeral" as const : "conversation" as const };
+      opts.noteActivity?.();
       return opts.timeoutMs === undefined
         ? await rt.prompt(prompt, attachments, promptOptions)
         : await raceWithTimeout(
             rt.prompt(prompt, attachments, promptOptions),
-            opts.timeoutMs
+            opts.timeoutMs,
+            () => rt.lastActivityAtMs,
           );
     };
 
@@ -9426,6 +9452,9 @@ export class Orchestrator {
     // answer streams below WITHOUT the ▶ header. Read defensively — a raw test
     // config may not carry the zod default.
     const statusPanelOn = this.config.SEAM_DISPATCH_STATUS_PANEL !== false;
+    // Isolated dispatches do not register their runtime on the router, so the
+    // watchdog cannot see turnHealth's clock unless the turn notes it here.
+    const activity = { at: Date.now() };
 
     const run = async (queueFence?: ChannelQueueFence): Promise<{ output: string; stopReason: string }> => {
       this.assertQueueFence(queueFence);
@@ -9775,6 +9804,7 @@ export class Orchestrator {
           outputTo: target,
           ...(spec.correlationId ? { correlationId: spec.correlationId } : {}),
           timeoutMs: this.config.TURN_TIMEOUT_SECONDS * 1000,
+          noteActivity: () => { activity.at = Date.now(); },
           // Isolated: newSession() just returned — THIS is the running
           // transition. Write the session id now, before prompt(), so a
           // SIGKILL still leaves a pointer on the ledger (#75).
@@ -10066,6 +10096,7 @@ export class Orchestrator {
           this.config.TURN_TIMEOUT_SECONDS ?? 900
         ),
         label: `isolated dispatch ${spec.id}`,
+        lastActivityAt: () => activity.at,
       });
     } catch (err) {
       if (err instanceof TurnWatchdogTimeoutError) {
@@ -24219,17 +24250,20 @@ export class Orchestrator {
 
 async function raceWithTimeout<T>(
   promise: Promise<T>,
-  timeoutMs: number
+  timeoutMs: number,
+  lastActivityAt?: () => number,
 ): Promise<T | "timeout"> {
-  let timer: NodeJS.Timeout | undefined;
-  const timeout = new Promise<"timeout">((resolve) => {
-    timer = setTimeout(() => resolve("timeout"), timeoutMs);
+  // #460: the deadline is silence since the same last-output mark turnHealth
+  // reads, not wall time since prompt start. Omitting the mark keeps the old
+  // wall clock (no runtime yet). A missing hang-probe report is not read.
+  const started = Date.now();
+  return raceUntilSilence(promise, {
+    silenceMs: timeoutMs,
+    lastActivityAt: () => {
+      const at = lastActivityAt?.();
+      return typeof at === "number" && Number.isFinite(at) ? at : started;
+    },
   });
-  try {
-    return await Promise.race([promise, timeout]);
-  } finally {
-    if (timer) clearTimeout(timer);
-  }
 }
 
 function parseCsv(s: string): string[] {

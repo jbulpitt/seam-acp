@@ -32,8 +32,11 @@ can accompany an active release or an unchanged baseline. Reporting does not
 remove a stale lock or infer that it is safe to steal one.
 
 All failure outcomes retain exit code 1 for automation. Successful activation
-output is unchanged and triggers no extra observation. The existing #328
-remote deployed-but-unconfirmed receipt reporting remains intact.
+output is unchanged and triggers no extra observation. The #328 remote path
+that reported `deployed_verification_unconfirmed` after waiting out a catalog
+receipt was replaced by #492. Hello verifies the deploy, a missing catalog
+stamp is named `catalog_rpc_not_observed`, and a contradictory or unreachable
+replacement is `verification_failed`.
 
 ## Mutation evidence
 

@@ -333,7 +333,7 @@ describe.sequential("#288 first managed activation from an enrolled baseline", (
    * they only assert the happy path's record fields. A malformed receipt must
    * be what fails.
    */
-  it("records a first activation with a non-binding receipt as deployed but unconfirmed", async () => {
+  it("records a first activation whose receipt never binds as verification failed", async () => {
     const f = await makeFixture({ receipt: "wrong-nonce" });
     await enroll(f);
     const release = await f.stage("1".repeat(40), H("3"));
@@ -345,8 +345,9 @@ describe.sequential("#288 first managed activation from an enrolled baseline", (
     expect(result.verification_reason).toBe("activation_receipt_identity_mismatch");
     expect(result.activation_from).toBe("enrolled-baseline");
     expect(result.rollback_proof).toBe("reduced-baseline");
-    // Observed and explicitly unconfirmed, never verified: rollback remains
-    // available by activation id without misreporting the deployment as failed.
+    // The replacement came up, but the receipt still names a different
+    // activation after the observation window. That is verification_failed,
+    // not a successful deploy. Rollback stays available by activation id.
     await expect(fs.stat(path.join(f.releaseRoot, "activations", `${activation}.verified.json`))).rejects.toThrow();
     await expect(fs.stat(path.join(f.releaseRoot, "activations", `${activation}.observed.json`))).resolves.toBeTruthy();
     const failed = JSON.parse(await fs.readFile(path.join(f.releaseRoot, "activations", `${activation}.failed.json`), "utf8"));

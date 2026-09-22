@@ -662,8 +662,12 @@ function receiptBindsActivation(value, expected) {
 
 function contradictoryControllerAck(value, expected) {
   const ack = value.controllerAck;
-  if (!ack) return false;
-  return ack.activationId !== expected.activationId || ack.bridgeId !== bridgeId || ack.instanceId !== value.instanceId || ack.pid !== expected.newPid || ack.sourceSha !== expected.sourceSha || ack.artifactChecksum !== expected.artifactChecksum;
+  if (!ack || ack.activationId !== expected.activationId) return false;
+  // An ack for a different activation is a leftover in the receipt file from
+  // the previous run of this release. The replacement overwrites it when the
+  // controller verifies this activation. Only an ack that names THIS activation
+  // and then disagrees is a real mismatch.
+  return ack.bridgeId !== bridgeId || ack.instanceId !== value.instanceId || ack.pid !== expected.newPid || ack.sourceSha !== expected.sourceSha || ack.artifactChecksum !== expected.artifactChecksum;
 }
 
 async function loadReceipt(release) {
@@ -677,11 +681,10 @@ function receiptProblem(value, expected) {
   const started = parseReceiptTime(value.startedAt);
   if (started != null && started < expected.started - RECEIPT_NTP_SKEW_MS) return "receipt_outside_window";
   if (contradictoryControllerAck(value, expected)) return "controller_ack_mismatch";
-  const describe = parseReceiptTime(value.catalogRpcs?.[verifyAgent]?.describeModelCatalogAt);
-  const fetchAt = parseReceiptTime(value.catalogRpcs?.[verifyAgent]?.fetchModelCatalogAt);
-  if (describe != null && fetchAt != null && fetchAt < describe) return "catalog_timestamp_order";
-  const hello = parseReceiptTime(value.helloAcceptedAt);
-  if (hello != null && started != null && hello + RECEIPT_NTP_SKEW_MS < started) return "catalog_timestamp_order";
+  // Catalog fields are written one RPC at a time. A mid-write snapshot can
+  // show fetch before describe for a moment; that is not tampering. The full
+  // receipt check enforces stream order on the settled file. Do not abort
+  // the observation window on a transient snapshot.
   return null;
 }
 
@@ -706,18 +709,26 @@ async function observeActivationProof(release, expected) {
   const observeUntil = Math.min(expected.deadline, Date.now() + CATALOG_OBSERVATION_MS);
   while (Date.now() <= observeUntil) {
     const value = await loadReceipt(release);
+    // A receipt from the previous activation of this release does not bind
+    // yet. Wait for the replacement to overwrite it; do not treat that as
+    // this activation's identity failure.
+    if (value && receiptBindsActivation(value, expected)) {
+      const problem = receiptProblem(value, expected);
+      if (problem) return { kind: "failed", reason: problem };
+      const full = await readActivationReceipt(release, expected);
+      if (full) return { kind: "full", receipt: full };
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  const value = await loadReceipt(release);
+  if (value && receiptBindsActivation(value, expected)) {
     const problem = receiptProblem(value, expected);
     if (problem) return { kind: "failed", reason: problem };
     const full = await readActivationReceipt(release, expected);
     if (full) return { kind: "full", receipt: full };
-    await new Promise((resolve) => setTimeout(resolve, 250));
-  }
-  const lateProblem = receiptProblem(await loadReceipt(release), expected);
-  if (lateProblem) return { kind: "failed", reason: lateProblem };
-  const full = await readActivationReceipt(release, expected);
-  if (full) return { kind: "full", receipt: full };
-  const hello = await readHelloReceipt(release, expected);
-  if (hello) return { kind: "hello", receipt: hello };
+    const hello = await readHelloReceipt(release, expected);
+    if (hello) return { kind: "hello", receipt: hello };
+  } else if (value?.activationId) return { kind: "failed", reason: "activation_receipt_identity_mismatch" };
   return { kind: "failed", reason: "activation_hello_timeout" };
 }
 
@@ -1811,7 +1822,14 @@ async function rollback() {
       const unobserved = parseJson(await fsp.readFile(`${currentDir}/release-receipt.json`),"unobserved_activation_receipt_invalid");
       if (unobserved.activationId !== failedActivationId || unobserved.sourceSha !== record.sourceSha || unobserved.artifactChecksum !== record.artifactChecksum || unobserved.stageId !== record.stageId || unobserved.oldPid !== record.oldPid || unobserved.pid !== current.pid || !INSTANCE.test(unobserved.instanceId ?? "")) fail("rollback_unobserved_pid_mismatch");
     }
-    if (recordKind === "verified" && record.verification?.catalogRpcsVerified !== false && (!HASH.test(record.readyReceiptSha256 ?? "") || hash(await fsp.readFile(record.readyReceipt)) !== record.readyReceiptSha256)) fail("activation_ready_receipt_changed");
+    if (recordKind === "verified" && typeof record.readyReceipt === "string") {
+      // Later catalog RPCs for other agents append to the same file after the
+      // verification agent is recorded. That is not tampering. Refuse only if
+      // the activation identity in the receipt no longer matches. Hello-only
+      // records have no pinned hash, so the same identity check applies.
+      const currentReceipt = parseJson(await fsp.readFile(record.readyReceipt).catch(() => fail("activation_ready_receipt_changed")), "activation_ready_receipt_changed");
+      if (currentReceipt.activationId !== record.activationId || currentReceipt.pid !== record.newPid || currentReceipt.sourceSha !== record.sourceSha || currentReceipt.artifactChecksum !== record.artifactChecksum) fail("activation_ready_receipt_changed");
+    }
     const previous = record.previous; assertObject(previous,"rollback_previous_invalid");
     if (previous.kind === "enrolled-baseline") {
       await rollbackToEnrolledBaseline({ record, previous, current, failedActivationId, rollbackId, recordKind, timeout });

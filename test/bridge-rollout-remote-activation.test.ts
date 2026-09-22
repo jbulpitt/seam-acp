@@ -28,7 +28,7 @@ function makeArchive(sourceSha:string,indexSource:string){
   return gzipSync(Buffer.concat([tarMember("bridge-release.json",manifest),...files.map((f)=>tarMember(f.path,f.bytes)),Buffer.alloc(1024)]));
 }
 
-async function makeFixture(behavior:"good"|"stale"|"wrong-ack"|"adapter-loss"|"cross-clock"|"hello-only"|"no-hello"="good", oldBehavior:"good"|"interrupt"="good") {
+async function makeFixture(behavior:"good"|"stale"|"wrong-ack"|"adapter-loss"|"cross-clock"|"hello-only"|"no-hello"|"settle"="good", oldBehavior:"good"|"interrupt"="good") {
   const root=await fs.mkdtemp(path.join(os.tmpdir(),"bridge-activation-e2e-")); const checkout=path.join(root,"checkout"); const releaseRoot=path.join(root,"rollouts"); const entry=path.join(checkout,"packages/bridge/dist/index.js"); const pidFile=path.join(root,"fixture-app-0.pid"); const pm2File=path.join(root,"pm2.json"); const pm2Module=path.join(root,"pm2.cjs"); const runtime=path.join(root,"runtime"); const node=path.join(runtime,"node"); const failPrebuild=path.join(root,"fail-prebuild");
   await fs.mkdir(path.dirname(entry),{recursive:true}); await fs.mkdir(runtime); await fs.link(process.execPath,node); await fs.writeFile(path.join(runtime,"npm"),`#!/bin/sh
 set -eu
@@ -39,7 +39,7 @@ printf '%s\\n' "import fs from 'node:fs'; fs.writeFileSync(new URL('../better-sq
 if [ -f ${failPrebuild} ]; then node-gyp; fi
 prebuild-install
 `,{mode:0o755});
-  const bridgeSource=(mode:string)=>`import fs from 'node:fs';import path from 'node:path';import{spawn}from'node:child_process';const entry=${JSON.stringify(entry)},pidFile=${JSON.stringify(pidFile)},pm2File=${JSON.stringify(pm2File)},node=${JSON.stringify(node)},cwd=${JSON.stringify(checkout)},mode=${JSON.stringify(mode)};let signalCount=0;function update(pid){const j=JSON.parse(fs.readFileSync(pm2File));j.pid=pid;j.pm_uptime=Date.now();fs.writeFileSync(pm2File,JSON.stringify(j));fs.writeFileSync(pidFile,String(pid));}const release=path.resolve(new URL('.',import.meta.url).pathname,'../../..');const ep=path.join(release,'activation-envelope.json'),rp=path.join(release,'release-receipt.json');if(mode!=='no-hello'&&fs.existsSync(ep)){const e=JSON.parse(fs.readFileSync(ep)),s=JSON.parse(fs.readFileSync(rp)),now=Date.now(),iso=ms=>new Date(ms).toISOString(),t=iso(now),describeAt=mode==='cross-clock'?iso(now+10):t,fetchAt=mode==='cross-clock'?iso(now+20):t,ackAt=mode==='cross-clock'?iso(now+7):t,started=mode==='stale'?'2000-01-01T00:00:00.000Z':e.startedAt,instance='instance-'+e.activationId.slice(0,12),ackChecksum=mode==='wrong-ack'?'f'.repeat(64):e.artifactChecksum,adapterRefusals=mode==='adapter-loss'?[{agentId:'agy',code:'configuration_incomplete',missing:['AGY_ENABLED=true','AGY_SHA256']}]:[];fs.writeFileSync(rp,JSON.stringify({...s,...e,pid:process.pid,instanceId:instance,protocolVersion:1,startedAt:started,helloAcceptedAt:t,adapterRefusals,...(mode==='hello-only'?{}:{catalogRpcs:{grok:{describeModelCatalogAt:describeAt,fetchModelCatalogAt:fetchAt}},controllerAck:{activationId:e.activationId,bridgeId:e.bridgeId,instanceId:instance,pid:process.pid,sourceSha:e.sourceSha,artifactChecksum:ackChecksum},controllerVerifiedAt:ackAt,completedAt:ackAt})})+'\\n');}process.on('SIGUSR2',()=>{signalCount+=1;if(mode==='interrupt'&&signalCount===1)return;const c=spawn(node,[entry],{cwd,detached:true,stdio:'ignore'});c.unref();update(c.pid);setTimeout(()=>process.exit(0),100);});setInterval(()=>{},1000);\n`;
+  const bridgeSource=(mode:string)=>`import fs from 'node:fs';import path from 'node:path';import{spawn}from'node:child_process';const entry=${JSON.stringify(entry)},pidFile=${JSON.stringify(pidFile)},pm2File=${JSON.stringify(pm2File)},node=${JSON.stringify(node)},cwd=${JSON.stringify(checkout)},mode=${JSON.stringify(mode)};let signalCount=0;function update(pid){const j=JSON.parse(fs.readFileSync(pm2File));j.pid=pid;j.pm_uptime=Date.now();fs.writeFileSync(pm2File,JSON.stringify(j));fs.writeFileSync(pidFile,String(pid));}const release=path.resolve(new URL('.',import.meta.url).pathname,'../../..');const ep=path.join(release,'activation-envelope.json'),rp=path.join(release,'release-receipt.json');if(mode!=='no-hello'&&fs.existsSync(ep)){const e=JSON.parse(fs.readFileSync(ep)),s=JSON.parse(fs.readFileSync(rp)),now=Date.now(),iso=ms=>new Date(ms).toISOString(),t=iso(now),describeAt=mode==='cross-clock'?iso(now+10):t,fetchAt=mode==='cross-clock'?iso(now+20):t,ackAt=mode==='cross-clock'?iso(now+7):t,started=mode==='stale'?'2000-01-01T00:00:00.000Z':e.startedAt,instance='instance-'+e.activationId.slice(0,12),ackChecksum=mode==='wrong-ack'?'f'.repeat(64):e.artifactChecksum,adapterRefusals=mode==='adapter-loss'?[{agentId:'agy',code:'configuration_incomplete',missing:['AGY_ENABLED=true','AGY_SHA256']}]:[];const good=mode==='hello-only'?{}:{catalogRpcs:{grok:{describeModelCatalogAt:describeAt,fetchModelCatalogAt:fetchAt}},controllerAck:{activationId:e.activationId,bridgeId:e.bridgeId,instanceId:instance,pid:process.pid,sourceSha:e.sourceSha,artifactChecksum:ackChecksum},controllerVerifiedAt:ackAt,completedAt:ackAt};function publish(extra){fs.writeFileSync(rp,JSON.stringify({...s,...e,pid:process.pid,instanceId:instance,protocolVersion:1,startedAt:started,helloAcceptedAt:t,adapterRefusals,...extra})+String.fromCharCode(10));}if(mode==='settle'){fs.writeFileSync(rp,JSON.stringify({...s,formatVersion:2,activationId:'a'.repeat(64),bridgeId:e.bridgeId,sourceSha:e.sourceSha,artifactChecksum:e.artifactChecksum,stageId:e.stageId,oldPid:e.oldPid,pid:process.pid,instanceId:instance,protocolVersion:1,helloAcceptedAt:t,startedAt:started})+String.fromCharCode(10));setTimeout(()=>publish({catalogRpcs:{grok:{describeModelCatalogAt:iso(now+50),fetchModelCatalogAt:iso(now+10)}},controllerAck:{activationId:'b'.repeat(64),bridgeId:e.bridgeId,instanceId:instance,pid:process.pid,sourceSha:e.sourceSha,artifactChecksum:e.artifactChecksum},controllerVerifiedAt:ackAt,completedAt:ackAt}),400);setTimeout(()=>publish(good),900);}else publish(good);}process.on('SIGUSR2',()=>{signalCount+=1;if(mode==='interrupt'&&signalCount===1)return;const c=spawn(node,[entry],{cwd,detached:true,stdio:'ignore'});c.unref();update(c.pid);setTimeout(()=>process.exit(0),100);});setInterval(()=>{},1000);\n`;
   await fs.writeFile(entry,bridgeSource("legacy"));
   await fs.writeFile(pm2Module,`const fs=require('fs'),p=${JSON.stringify(pm2File)};module.exports={connect(cb){setImmediate(()=>cb(null))},describe(_n,cb){const j=JSON.parse(fs.readFileSync(p,'utf8'));setImmediate(()=>cb(null,[{pid:j.pid,pm_id:j.pm_id,pm2_env:{name:j.name,pm_id:j.pm_id,pm_pid_path:j.pidFile,pm_cwd:j.cwd,pm_exec_path:j.entry,exec_interpreter:j.node,pm_uptime:j.pm_uptime,args:['connect','--server','wss://controller.invalid','--token','fixture-token','--id','fixture']}}]))},disconnect(){}}`);
   const start=spawn(node,[entry],{cwd:checkout,detached:true,stdio:"ignore"});start.unref(); await fs.writeFile(pidFile,String(start.pid)); await fs.writeFile(pm2File,JSON.stringify({pid:start.pid,pm_id:0,pidFile,name:"fixture-app",cwd:checkout,entry,node,pm_uptime:Date.now()}));
@@ -153,6 +153,36 @@ describe.sequential("production remote shell activation and rollback gates (#241
     await expect(fs.stat(path.join(f.releaseRoot,"activations",`${activation}.verified.json`))).rejects.toThrow();
   },60_000);
 
+  it("waits out a leftover receipt, a stale ack, and a mid-write catalog snapshot (#492)", async () => {
+    const f = await makeFixture("settle");
+    const started = Date.now();
+    const result = await f.run(["activate", f.next.sourceSha, f.next.checksum, f.next.stageId, H("a"), "40", H("b")], 60_000);
+    expect(Date.now() - started).toBeLessThan(15_000);
+    expect(result.stdout).toContain("activation=verified");
+    expect(result.stdout).toContain("catalog_rpcs_verified=yes");
+    expect(result.stdout).not.toContain("activation_receipt_identity_mismatch");
+    expect(result.stdout).not.toContain("controller_ack_mismatch");
+    expect(result.stdout).not.toContain("catalog_timestamp_order");
+  }, 60_000);
+
+  it("rolls back after later agents append catalog stamps to a verified receipt (#492)", async () => {
+    const f = await makeFixture("good");
+    const activation = H("c");
+    const activated = await f.run(["activate", f.next.sourceSha, f.next.checksum, f.next.stageId, activation, "20", H("d")], 30_000);
+    expect(activated.stdout).toContain("activation=verified");
+    expect(activated.stdout).toContain("catalog_rpcs_verified=yes");
+    const receiptPath = path.join(f.next.release, "release-receipt.json");
+    const receipt = JSON.parse(await fs.readFile(receiptPath, "utf8"));
+    receipt.catalogRpcs.claude = {
+      describeModelCatalogAt: new Date().toISOString(),
+      fetchModelCatalogAt: new Date().toISOString(),
+    };
+    await fs.writeFile(receiptPath, `${JSON.stringify(receipt)}\n`);
+    const rolled = await f.run(["rollback", activation, H("e"), "20", H("f")], 30_000);
+    expect(rolled.stdout).toContain("rollback=verified");
+    expect(await fs.realpath(f.entry)).toBe(path.join(f.old.release, "packages/bridge/dist/index.js"));
+  }, 60_000);
+
   it("verifies from hello when no catalog refresh stamps the receipt (#492)", async () => {
     const f = await makeFixture("hello-only");
     const started = Date.now();
@@ -164,7 +194,11 @@ describe.sequential("production remote shell activation and rollback gates (#241
     expect(result.stdout).not.toContain("activation_receipt_timeout");
     const verified = JSON.parse(await fs.readFile(path.join(f.releaseRoot, "activations", `${H("1")}.verified.json`), "utf8"));
     expect(verified.verification).toEqual({ forward: "hello", catalogRpcsVerified: false });
-  }, 60_000);
+    expect(verified.readyReceiptSha256).toBeUndefined();
+    const rolled = await f.run(["rollback", H("1"), H("7"), "20", H("8")], 30_000);
+    expect(rolled.stdout).toContain("rollback=verified");
+    expect(await fs.realpath(f.entry)).toBe(path.join(f.old.release, "packages/bridge/dist/index.js"));
+  }, 90_000);
 
   it("fails verification when the replacement never reconnects (#492)", async () => {
     const f = await makeFixture("no-hello");

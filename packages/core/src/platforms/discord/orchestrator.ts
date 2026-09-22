@@ -421,6 +421,7 @@ import {
   shouldInlineCardReportBack,
   type DispatchResult,
   type DispatchSpec,
+  type ThreadWorkProgress,
 } from "../../core/dispatch/types.js";
 import {
   DISPATCH_CARD_WINDOW_CHARS,
@@ -2181,6 +2182,86 @@ export class Orchestrator {
       unsettledDispatchIds: unsettled.map((a) => a.id),
       stalledDispatchCount: stalled.length,
       stalledDispatchIds: stalled.map((attempt) => attempt.id),
+    };
+  }
+
+  /**
+   * The single composed answer to "is work on this thread progressing?" (#530).
+   *
+   * Router `busy`, watcher ownership, and the SQL attempt phase are all true
+   * about different moments. None is promoted over the others: positive
+   * progress requires either a live router turn or BOTH current watcher
+   * ownership and a durable prompt_started bit. An active pre-prompt row is
+   * therefore `assigned_not_started`, never silently presented as running.
+   *
+   * This is observation only. Unknown/retained work is reported narrowly and
+   * cannot disable the thread, change admission, or reclassify an attempt.
+   */
+  inspectThreadWorkProgress(
+    channelRef: string,
+    nowMs = Date.now(),
+    queue = this.inspectChannelQueue(channelRef, nowMs)
+  ): ThreadWorkProgress {
+    const attempts = this.store.turnAttempts.listNonterminalDispatches(channelRef, (id, err) =>
+      this.logger.warn({ id, err, channelRef }, "thread progress: attempt row unreadable")
+    );
+    const watcherOwnedDispatchIds = this.dispatchWatcher?.inFlightIdsForTarget(channelRef) ?? [];
+    const owned = new Set(watcherOwnedDispatchIds);
+    const active = attempts.filter((attempt) => attempt.state === "active");
+    const pending = attempts.filter((attempt) => attempt.state === "pending");
+    const retained = attempts.filter((attempt) => attempt.state === "suspended");
+    const runningDispatchIds = active
+      .filter((attempt) => attempt.promptStarted && owned.has(attempt.id))
+      .map((attempt) => attempt.id);
+    const assignedNotStartedDispatchIds = active
+      .filter((attempt) => !attempt.promptStarted)
+      .map((attempt) => attempt.id);
+    const activeUnobservedDispatchIds = active
+      .filter((attempt) => attempt.promptStarted && !owned.has(attempt.id))
+      .map((attempt) => attempt.id);
+    const queuedDispatchIds = pending.map((attempt) => attempt.id);
+    const retainedDispatchIds = retained.map((attempt) => attempt.id);
+    // This is the exact #428 blockage, reported but not repaired here: a
+    // prompted retained attempt prevents the pending pile behind it claiming.
+    const blockedByDispatchIds = pending.length > 0
+      ? retained.filter((attempt) => attempt.promptStarted).map((attempt) => attempt.id)
+      : [];
+    const progressing = queue.runtimeBusy || runningDispatchIds.length > 0;
+    const state: ThreadWorkProgress["state"] = progressing
+      ? "running"
+      : assignedNotStartedDispatchIds.length > 0
+        ? "assigned_not_started"
+        : activeUnobservedDispatchIds.length > 0
+          ? "active_unobserved"
+          : blockedByDispatchIds.length > 0 || queue.state === "wedged"
+            ? "blocked"
+            : queuedDispatchIds.length > 0 || queue.state === "queued"
+              ? "queued"
+              : retainedDispatchIds.length > 0 || queue.state === "stalled"
+                ? "retained"
+                : "idle";
+    const nonprogressing = attempts.filter((attempt) =>
+      !runningDispatchIds.includes(attempt.id)
+    );
+    const attemptAgeMs = nonprogressing.reduce((oldest, attempt) => {
+      const updatedMs = Date.parse(attempt.updatedUtc);
+      return Number.isFinite(updatedMs)
+        ? Math.max(oldest, Math.max(0, nowMs - updatedMs))
+        : oldest;
+    }, 0);
+    const queueAgeMs = !progressing && queue.state !== "idle" ? queue.ageMs : 0;
+    return {
+      state,
+      progressing,
+      runtimeBusy: queue.runtimeBusy,
+      runningDispatchIds,
+      assignedNotStartedDispatchIds,
+      activeUnobservedDispatchIds,
+      queuedDispatchIds,
+      retainedDispatchIds,
+      watcherOwnedDispatchIds,
+      blockedByDispatchIds,
+      ageMs: Math.max(attemptAgeMs, queueAgeMs),
     };
   }
 

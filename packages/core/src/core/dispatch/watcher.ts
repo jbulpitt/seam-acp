@@ -384,6 +384,22 @@ export class DispatchWatcher {
   }
 
   /**
+   * Current process ownership for one target (#530).
+   *
+   * This is intentionally ids-only: specs can contain prompts. A selected id
+   * may still be waiting in the target SerialQueue, so callers must combine
+   * this with durable `prompt_started` before claiming execution progress.
+   * Removing this observation makes isolated turns invisible because they do
+   * not register their runtime on SessionRouter.
+   */
+  inFlightIdsForTarget(target: string): string[] {
+    return [...this.inFlight.values()]
+      .filter((owner) => owner.spec.target === target)
+      .map((owner) => owner.spec.id)
+      .sort();
+  }
+
+  /**
    * Resolve once every CLAIMED spec has finished and its done-file is written.
    *
    * This is the real barrier `stop()` is not. A spec's report-back and chain

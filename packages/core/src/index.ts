@@ -70,6 +70,7 @@ import { bindDoneDeliveryResolver, DoneRetention } from "./core/dispatch/done-re
 import { dispatchDirs, enqueueDispatchSpec, type DispatchSpec } from "./core/dispatch/types.js";
 import { SeamTokenRegistry } from "./core/mcp/token-registry.js";
 import { SeamMcpServer } from "./core/mcp/seam-mcp-server.js";
+import { listSiblingThreadEntries } from "./core/mcp/thread-inventory.js";
 import { ThreadSessionControlService } from "./core/thread-session-control.js";
 import { watchChannelPresets } from "./core/config-reload.js";
 import { BridgeHub } from "./core/bridge-hub.js";
@@ -880,61 +881,24 @@ async function main(): Promise<void> {
       // precedence from the router, and the platform's thread-name/live-state
       // lookups. Self-scoped: the channel is record.parentRef, never an arg.
       getScheduledWork: (record) => orchestrator.scheduledWorkForCaller(record),
-      listThreads: async (record) => {
-        if (!record.parentRef) return [];
-        const siblings = store.listSessionsByParent(record.platform, record.parentRef);
-        return Promise.all(
-          siblings.map(async (s) => {
-            const cfg = router.describeConfig(s);
-            let name: string | null = null;
-            let status: "active" | "archived" | "gone" = "active";
-            try {
-              name =
-                (await adapter.getThreadName?.({ platform: s.platform, id: s.channelRef })) ??
-                null;
-            } catch {
-              name = null;
-            }
-            try {
-              const live = adapter.getThreadLiveState
-                ? await adapter.getThreadLiveState({ platform: s.platform, id: s.channelRef })
-                : { locked: false, archived: false };
-              // undefined ⇒ platform confirmed the thread is gone; {archived} ⇒
-              // dormant but still bound; otherwise addressable now.
-              if (live === undefined) status = "gone";
-              else if (live.archived) status = "archived";
-            } catch {
-              // Transient lookup failure — treat as active rather than hiding it.
-              status = "active";
-            }
-            const location = resolveThreadLocation(config, s.channelRef);
-            const host = location === "local" ? undefined : config.bridgePresets.get(location);
-            const queue = orchestrator.inspectChannelQueue(s.channelRef);
-            return {
-              id: s.channelRef,
-              name,
-              isSelf: s.id === record.id,
-              agent: cfg.agent.value,
-              model: cfg.model.value,
-              effort: cfg.effort.value,
-              fastMode: cfg.fastMode?.value === true,
-              cwd: cfg.cwd.value,
-              busy: router.isBusy(s.id) || (queue.state !== "idle" && queue.state !== "stalled"),
-              queueState: queue.state,
-              queueAgeMs: queue.ageMs,
-              queueEpoch: queue.epoch,
-              stalledDispatchCount: queue.stalledDispatchCount,
-              stalledDispatchIds: queue.stalledDispatchIds,
-              unsettledDispatchCount: queue.unsettledDispatchCount,
-              unsettledDispatchIds: queue.unsettledDispatchIds,
-              status,
-              lastActivityUtc: s.updatedUtc,
-              location,
-              hostEmoji: hostEmoji(host, location),
-            };
-          })
-        );
-      },
+      listThreads: (record) => listSiblingThreadEntries(record, {
+        listSessionsByParent: (platform, parentRef) =>
+          store.listSessionsByParent(platform, parentRef),
+        describeConfig: (session) => router.describeConfig(session),
+        isRuntimeBusy: (sessionId) => router.isBusy(sessionId),
+        adapter,
+        inspectQueue: (channelRef) => orchestrator.inspectChannelQueue(channelRef),
+        inspectWorkProgress: (channelRef, nowMs, queue) =>
+          orchestrator.inspectThreadWorkProgress(channelRef, nowMs, queue),
+        locationFor: (channelRef) => {
+          const location = resolveThreadLocation(config, channelRef);
+          const host = location === "local" ? undefined : config.bridgePresets.get(location);
+          return {
+            location,
+            hostEmoji: hostEmoji(host, location),
+          };
+        },
+      }),
       // #58 P1: read-only config introspection. describeConfig re-derives the
       // exact precedence startRuntime applies (which layer won); listConfigEntities
       // projects the schedules/presets visible to the calling thread. Both are

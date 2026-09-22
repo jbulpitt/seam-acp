@@ -1969,6 +1969,51 @@ describe("SeamMcpServer", () => {
     expect(text).toContain("does NOT block handoff");
   });
 
+  it("threads renders assigned pre-prompt work as not progressing (#530)", async () => {
+    h = await makeHarness({
+      listThreads: async () => [{
+        id: "111111111111111111",
+        name: "assigned worker",
+        isSelf: false,
+        agent: "codex",
+        model: "gpt",
+        effort: null,
+        cwd: "/repo",
+        // Routing stays idle: this field still answers how to contact it.
+        busy: false,
+        queueState: "idle",
+        stalledDispatchCount: 0,
+        stalledDispatchIds: [],
+        workProgress: {
+          state: "assigned_not_started",
+          progressing: false,
+          runtimeBusy: false,
+          runningDispatchIds: [],
+          assignedNotStartedDispatchIds: ["dispatch-assigned-1"],
+          activeUnobservedDispatchIds: [],
+          queuedDispatchIds: [],
+          retainedDispatchIds: [],
+          watcherOwnedDispatchIds: [],
+          blockedByDispatchIds: [],
+          ageMs: 7_200_000,
+        },
+        status: "active",
+        lastActivityUtc: "2026-09-22T04:49:10.000Z",
+      }],
+    });
+    const { body } = await h.call(
+      "tools/call",
+      { name: "threads", arguments: {} },
+      { "X-Seam-Session": "good-token" }
+    );
+    expect(body.result.isError).toBeFalsy();
+    const text = body.result.content[0].text as string;
+    expect(text).toContain("[idle]");
+    expect(text).toContain("work progress: NOT observed (assigned_not_started, age 7200000ms)");
+    expect(text).toContain("assigned but prompt not submitted: dispatch-assigned-1");
+    expect(text).toContain("watcher-owned: none");
+  });
+
   it("threads refuses a scope that names another channel (self-scope, #73)", async () => {
     h = await makeHarness({ listThreads: async () => [] });
     const { body } = await h.call(

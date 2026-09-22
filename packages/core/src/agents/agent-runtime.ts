@@ -1137,11 +1137,14 @@ export class AgentRuntime {
   }
 
   /**
-   * #443: quiet remote turn. Restart kills this slot only. Retry re-prompts
-   * this turn on the same process. Anything we could not measure leaves the
-   * turn running — silence and a dead websocket are not evidence the child
-   * is hung. Other slots, local agents, and a bridge that does not know
-   * `probeHang` are unchanged.
+   * #443: quiet remote turn. Restart kills this slot only, and only after
+   * this runtime has answered a probe and then missed two in a row.
+   * `retry` rejects the in-flight prompt with `errorKind: "timeout"` and
+   * lets the existing recovery ladder decide whether anything is sent
+   * again. It does not re-prompt on its own. Anything we could not measure
+   * leaves the turn running — silence and a dead websocket are not evidence
+   * the child is hung. Other slots, local agents, and a bridge that does
+   * not know `probeHang` are unchanged.
    */
   private watchInFlightHang(signal: AbortSignal): Promise<void> {
     const slot = this.getSlot();

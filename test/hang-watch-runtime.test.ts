@@ -37,11 +37,15 @@ function runtime(opts: {
 }
 
 describe("#443 remote hang watch", () => {
-  it("restarts only the silent slot whose event loop did not answer", async () => {
+  it("restarts only the silent slot whose event loop missed twice after answering once", async () => {
     const kill = vi.fn();
     const onDead = vi.fn();
+    let probes = 0;
     const sendCmd = vi.fn(async (action: string) => {
       expect(action).toBe("probeHang");
+      probes += 1;
+      // One proof the method works, then two misses. A single miss must not kill.
+      if (probes === 1) return { probe: "answered", providerSocket: "progressing" };
       return { probe: "unanswered", providerSocket: "unavailable" };
     });
     const { rt, logger } = runtime({
@@ -56,8 +60,29 @@ describe("#443 remote hang watch", () => {
     expect(readErrorClassification(thrown)?.errorKind).toBe("connection_closed");
     expect(kill).toHaveBeenCalledOnce();
     expect(onDead).toHaveBeenCalledOnce();
+    expect(probes).toBe(3);
     expect(sendCmd).toHaveBeenCalledWith("probeHang", { slot: 4 });
     expect(logger.warn).toHaveBeenCalledWith(expect.objectContaining({ action: "restart", slot: 4 }), expect.stringMatching(/restarting this slot/));
+  });
+
+  it("does not kill a runtime that has never answered a probe", async () => {
+    const kill = vi.fn();
+    const onDead = vi.fn();
+    const sendCmd = vi.fn(async () => ({ probe: "unanswered", providerSocket: "unavailable" }));
+    let release: (value: { stopReason: string }) => void = () => {};
+    const { rt } = runtime({
+      sendCmd,
+      kill,
+      onDead,
+      prompt: () => new Promise((resolve) => { release = resolve; }),
+    });
+    const pending = rt.prompt("quiet");
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    expect(sendCmd.mock.calls.length).toBeGreaterThanOrEqual(2);
+    expect(kill).not.toHaveBeenCalled();
+    expect(onDead).not.toHaveBeenCalled();
+    release({ stopReason: "end_turn" });
+    await expect(pending).resolves.toMatchObject({ stopReason: "end_turn" });
   });
 
   it("retries the same process when the provider socket is not progressing", async () => {

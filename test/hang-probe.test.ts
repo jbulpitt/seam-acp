@@ -15,7 +15,7 @@ import {
   providerSocketProgress,
   HANG_PROBE_METHOD,
 } from "../packages/bridge/src/hang-probe.js";
-import { decideHang, readHangProbeReport, watchRemoteHang } from "../packages/core/src/agents/hang-watch.js";
+import { decideHang, freshHangHistory, readHangProbeReport, watchRemoteHang, type HangProbeHistory } from "../packages/core/src/agents/hang-watch.js";
 
 const ID = "probe-id-1";
 
@@ -171,21 +171,45 @@ describe("#443 provider socket progress is the kernel's fact", () => {
   });
 });
 
+function history(over: Partial<HangProbeHistory> = {}): HangProbeHistory {
+  return { ...freshHangHistory(), ...over };
+}
+
 describe("#443 seam-acp decides from the report and from nothing else", () => {
-  it("restarts only an unanswered event loop", () => {
-    expect(decideHang({ probe: "unanswered", providerSocket: "unavailable" })).toBe("restart");
-    expect(decideHang({ probe: "unanswered", providerSocket: "progressing" })).toBe("restart");
+  it("does not restart a runtime that has never answered a probe", () => {
+    const never = freshHangHistory();
+    expect(decideHang({ probe: "unanswered", providerSocket: "unavailable" }, never)).toBe("leave");
+    expect(decideHang({ probe: "unanswered", providerSocket: "unavailable" }, never)).toBe("leave");
+    expect(never).toEqual({ supported: false, consecutiveUnanswered: 0 });
+  });
+
+  it("restarts only after a proven probe misses twice in a row", () => {
+    const proven = history({ supported: true });
+    expect(decideHang({ probe: "unanswered", providerSocket: "progressing" }, proven)).toBe("leave");
+    expect(proven.consecutiveUnanswered).toBe(1);
+    expect(decideHang({ probe: "unanswered", providerSocket: "unavailable" }, proven)).toBe("restart");
+    // One answer between misses clears the streak.
+    const reset = history({ supported: true, consecutiveUnanswered: 1 });
+    expect(decideHang({ probe: "answered", providerSocket: "progressing" }, reset)).toBe("leave");
+    expect(reset.consecutiveUnanswered).toBe(0);
+    expect(decideHang({ probe: "unanswered", providerSocket: "unavailable" }, reset)).toBe("leave");
   });
 
   it("retries only when the kernel says the peer stopped taking data", () => {
-    expect(decideHang({ probe: "answered", providerSocket: "not_progressing" })).toBe("retry");
+    const proven = freshHangHistory();
+    expect(decideHang({ probe: "answered", providerSocket: "not_progressing" }, proven)).toBe("retry");
+    expect(proven.supported).toBe(true);
   });
 
   it("leaves a working turn, a closed process, and anything it could not measure", () => {
-    expect(decideHang({ probe: "answered", providerSocket: "progressing" })).toBe("leave");
-    expect(decideHang({ probe: "answered", providerSocket: "unavailable" })).toBe("leave");
-    expect(decideHang({ probe: "closed", providerSocket: "not_progressing" })).toBe("leave");
-    expect(decideHang(null)).toBe("leave");
+    const h = freshHangHistory();
+    expect(decideHang({ probe: "answered", providerSocket: "progressing" }, h)).toBe("leave");
+    expect(decideHang({ probe: "answered", providerSocket: "unavailable" }, h)).toBe("leave");
+    expect(decideHang({ probe: "closed", providerSocket: "not_progressing" }, h)).toBe("leave");
+    expect(h.consecutiveUnanswered).toBe(0);
+    const streak = history({ supported: true, consecutiveUnanswered: 1 });
+    expect(decideHang(null, streak)).toBe("leave");
+    expect(streak.consecutiveUnanswered).toBe(1);
     expect(readHangProbeReport({ probe: "answered" })).toBeNull();
     expect(readHangProbeReport({ probe: "wedged", providerSocket: "unavailable" })).toBeNull();
     expect(readHangProbeReport(null)).toBeNull();
@@ -226,14 +250,16 @@ describe("#443 seam-acp decides from the report and from nothing else", () => {
       lastActivityAt: () => 0,
       inFlight: () => !ac.signal.aborted,
       sleep: async () => {},
-      probe: async () => actions.length === 0
-        ? { probe: "answered", providerSocket: "not_progressing" }
-        : { probe: "unanswered", providerSocket: "unavailable" },
+      probe: async () => {
+        if (actions.length === 0) return { probe: "answered", providerSocket: "not_progressing" };
+        return { probe: "unanswered", providerSocket: "unavailable" };
+      },
       onAction: (action) => {
         actions.push(action);
         if (action === "restart") ac.abort();
       },
     });
+    // One answered probe proves the method, then one miss is not enough.
     expect(actions).toEqual(["retry", "restart"]);
   });
 });

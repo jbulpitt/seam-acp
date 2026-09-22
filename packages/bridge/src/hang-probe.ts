@@ -10,11 +10,13 @@ import fsp from "node:fs/promises";
  * read it as "the child did not answer".
  *
  * The probe is one unknown JSON-RPC method (`seam/hangProbe`). ACP has no
- * ping, and every real session method can change the session. JSON-RPC still
- * requires a response, including -32601 Method not found, and an unknown
- * method has no handler to run. Agents already do this: `describeModelCatalog`
- * was answered with method-not-found thousands of times without disturbing
- * the turn that was in flight.
+ * ping, and every real session method can change the session. Checked
+ * against the shipped agents, not against the spec: `claude-agent-acp`,
+ * `codex-acp`, and `grok agent stdio` each wrote a -32601 response for this
+ * method. agy does not speak ACP; the child this probe writes to is the
+ * seam adapter, and its AgentSideConnection answers an unhandled request
+ * with methodNotFound. A runtime that never produces such a response is
+ * not restarted for it — seam-acp treats that as an unsupported probe.
  */
 
 export const HANG_PROBE_METHOD = "seam/hangProbe";

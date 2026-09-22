@@ -35,26 +35,46 @@ export function readHangProbeReport(value: unknown): HangProbeReport | null {
   };
 }
 
+/** Per runtime, not per turn. A child that has never answered a probe has
+ *  not shown that this method is implemented. One 3s miss is not a wedge:
+ *  these CLIs are single-threaded, and synchronous work during a long tool
+ *  call blocks the event loop past the probe timeout. */
+export interface HangProbeHistory {
+  supported: boolean;
+  consecutiveUnanswered: number;
+}
+
+export function freshHangHistory(): HangProbeHistory {
+  return { supported: false, consecutiveUnanswered: 0 };
+}
+
 /**
  * #307: each branch refuses one outcome and leaves the others running.
  *
- * - `restart` — the event loop did not answer. Deleting it leaves a wedged
- *   process looking like a model that is thinking, and the turn never ends.
- *   It restarts this slot only. It does not run when the process merely
- *   exited (`closed`): that death already has an owner.
+ * - `restart` — this runtime has answered a probe before, and then missed
+ *   two in a row. Deleting the "answered before" gate kills an agent that
+ *   drops unknown methods on every quiet minute. Deleting the second-miss
+ *   gate kills a child for one 3s stall during ordinary CPU work. One slot.
+ *   It does not run on `closed`: that death already has an owner.
  * - `retry` — the event loop answered and the kernel says the peer is not
  *   taking data. Deleting it leaves that turn hung on a dead provider
  *   connection. It does not run on `unavailable`, which is every Mac and
- *   every process with no TCP socket of its own: treating "could not tell"
- *   as "stuck" would retry a healthy long tool call.
- * - `leave` — answered and still progressing, or we could not tell. The
- *   turn keeps going. Silence alone never selects either of the other two.
+ *   every process with no TCP socket of its own.
+ * - `leave` — one miss, a runtime that has never answered, a working
+ *   socket, or no report. The turn keeps going.
  */
-export function decideHang(report: HangProbeReport | null): HangAction {
+export function decideHang(report: HangProbeReport | null, history: HangProbeHistory): HangAction {
   if (!report || report.probe === "closed") return "leave";
-  if (report.probe === "unanswered") return "restart";
-  if (report.providerSocket === "not_progressing") return "retry";
-  return "leave";
+  if (report.probe === "answered") {
+    history.supported = true;
+    history.consecutiveUnanswered = 0;
+    return report.providerSocket === "not_progressing" ? "retry" : "leave";
+  }
+  // unanswered. A runtime that has never produced a probe response is not
+  // wedged; the probe is unsupported until one answer proves otherwise.
+  if (!history.supported) return "leave";
+  history.consecutiveUnanswered += 1;
+  return history.consecutiveUnanswered >= 2 ? "restart" : "leave";
 }
 
 /**
@@ -79,6 +99,7 @@ export async function watchRemoteHang(opts: {
 }): Promise<void> {
   const now = opts.now ?? Date.now;
   const sleep = opts.sleep ?? abortableSleep;
+  const history = freshHangHistory();
   while (!opts.signal.aborted && opts.inFlight()) {
     const quietFor = now() - opts.lastActivityAt();
     if (quietFor < opts.silenceMs) {
@@ -86,7 +107,7 @@ export async function watchRemoteHang(opts: {
       continue;
     }
     if (opts.signal.aborted || !opts.inFlight()) return;
-    const action = decideHang(await opts.probe().catch(() => null));
+    const action = decideHang(await opts.probe().catch(() => null), history);
     if (action !== "leave") await opts.onAction?.(action);
     if (opts.signal.aborted || !opts.inFlight()) return;
     await sleep(opts.silenceMs, opts.signal);

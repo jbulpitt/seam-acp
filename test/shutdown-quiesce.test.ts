@@ -48,6 +48,7 @@ import {
   SHUTDOWN_BUDGET_MS,
   SHUTDOWN_EXIT_FALLBACK_MS,
   SHUTDOWN_OVERHEAD_ALLOWANCE_MS,
+  type DeadlineClock,
 } from "../packages/core/src/lib/shutdown-budget.js";
 import { SeamMcpServer } from "../packages/core/src/core/mcp/seam-mcp-server.js";
 import {
@@ -137,6 +138,53 @@ const deferred = () => {
   const promise = new Promise<void>((r) => (resolve = r));
   return { promise, resolve };
 };
+
+/**
+ * Deadline clock the test advances itself.
+ *
+ * `sleep` stays pending until `fireNext`, and `now` jumps by that armed delay
+ * at the same moment. `readings` are the samples production took, so a test
+ * that ignores the clock fails instead of measuring wall time. The host-budget
+ * `>= 3_000` figure is arithmetic margin, not one of these deadlines.
+ */
+function scriptedClock() {
+  let now = 0;
+  const readings: number[] = [];
+  const armed: Array<{ ms: number; resolve: () => void }> = [];
+  const clock: DeadlineClock & {
+    armedMs: () => number[];
+    readings: () => number[];
+    fireNext: () => void;
+  } = {
+    now() {
+      readings.push(now);
+      return now;
+    },
+    sleep(ms: number) {
+      return new Promise<void>((resolve) => {
+        armed.push({ ms, resolve });
+      });
+    },
+    armedMs: () => armed.map((entry) => entry.ms),
+    readings: () => readings.slice(),
+    fireNext() {
+      const next = armed.shift();
+      if (!next) throw new Error("no deadline armed");
+      now += next.ms;
+      next.resolve();
+    },
+  };
+  return clock;
+}
+
+/** Whether `work` is still unsettled after a flush. A deadline that already
+ * lost the race cannot hide behind an unflushed microtask. */
+async function stillPending(work: Promise<unknown>): Promise<boolean> {
+  let settled = false;
+  work.then(() => { settled = true; }, () => { settled = true; });
+  await flush();
+  return !settled;
+}
 
 // ---------------------------------------------------------------------------
 // 1. The drain barrier — `stop()` is not "drained"
@@ -350,8 +398,8 @@ function makeQuiesceHost(over: Record<string, unknown> = {}) {
     ...over,
   });
   return self as unknown as {
-    quiesce(o?: { timeoutMs?: number }): Promise<QuiesceOutcome>;
-    drainAfterDispose(o?: { timeoutMs?: number }): Promise<QuiesceOutcome>;
+    quiesce(o?: { timeoutMs?: number; clock?: DeadlineClock }): Promise<QuiesceOutcome>;
+    drainAfterDispose(o?: { timeoutMs?: number; clock?: DeadlineClock }): Promise<QuiesceOutcome>;
     trackContinuation(p: Promise<void>): void;
     settleTrackedContinuations(): Promise<void>;
     beginTurn(): () => void;
@@ -402,10 +450,17 @@ describe("#174 bounded quiesce", () => {
   it("times out instead of hanging on a wedged continuation", async () => {
     const host = makeQuiesceHost();
     host.trackContinuation(new Promise<void>(() => {})); // never settles
-    const started = Date.now();
-    const out = await host.quiesce({ timeoutMs: 60 });
+    const clock = scriptedClock();
+    const pending = host.quiesce({ timeoutMs: 60, clock });
+    // The continuation never settles, so the drain is still waiting on the
+    // 60ms deadline. Releasing that deadline is what ends it.
+    expect(clock.armedMs()).toEqual([60]);
+    expect(clock.readings()).toEqual([0]);
+    expect(await stillPending(pending)).toBe(true);
+    clock.fireNext();
+    const out = await pending;
     expect(out.timedOut).toBe(true);
-    expect(Date.now() - started).toBeLessThan(3000);
+    expect(clock.readings()).toEqual([0, 60]);
     expect(out.continuations).toBe(1); // surfaced, not silently dropped
   });
 
@@ -431,13 +486,12 @@ describe("#174 bounded quiesce", () => {
     });
 
     // Generous deadline on purpose: if the barrier only stopped because the
-    // clock ran out, this test would still pass with a spin. It must stop on
-    // its own, well inside the timeout.
-    const started = Date.now();
-    const phase = host.quiesce({ timeoutMs: 30_000 });
-
-    const outcome = await phase;
-    expect(Date.now() - started).toBeLessThan(5_000); // returned, did not wait out 30s
+    // clock ran out, this test would still be waiting. It must stop on its
+    // own, with the 30s deadline still armed and no time observed.
+    const clock = scriptedClock();
+    const outcome = await host.quiesce({ timeoutMs: 30_000, clock });
+    expect(clock.armedMs()).toEqual([30_000]);
+    expect(clock.readings()).toEqual([0, 0]);
     expect(outcome.drained).toBe(false);
     expect(outcome.barrierFailed).toBe(true);
     // NOT a retry storm: the stage is attempted once per pass and the barrier
@@ -2588,10 +2642,15 @@ describe("#174 HTTP ingress closes admission before the snapshot", () => {
         await flush();
         expect((await health.drainIngress(1)).outstanding).toBe(1);
       });
-      const started = Date.now();
-      const result = await health.drainIngress(120);
+      const clock = scriptedClock();
+      const pending = health.drainIngress(120, clock);
+      expect(clock.armedMs()).toEqual([120]);
+      expect(clock.readings()).toEqual([0]);
+      expect(await stillPending(pending)).toBe(true);
+      clock.fireNext();
+      const result = await pending;
       expect(result).toEqual({ drained: false, outstanding: 1 });
-      expect(Date.now() - started).toBeLessThan(3000); // bounded, not hung
+      expect(clock.readings()).toEqual([0, 120]);
     } finally {
       health.close();
     }
@@ -2685,9 +2744,17 @@ describe("#174 seam-mcp shares one gate across both entry points", () => {
       sock.once("error", reject);
     });
     try {
-      const started = Date.now();
-      await server.stop({ timeoutMs: 150 });
-      expect(Date.now() - started).toBeLessThan(3000); // gave up, did not hang
+      const clock = scriptedClock();
+      const pending = server.stop({ timeoutMs: 150, clock });
+      // The open socket holds `server.close()`. Stop is still waiting, so
+      // only the 150ms deadline can abandon it.
+      expect(clock.armedMs()).toEqual([150]);
+      expect(clock.readings()).toEqual([0]);
+      expect(await stillPending(pending)).toBe(true);
+      clock.fireNext();
+      await pending;
+      expect(clock.readings()).toEqual([0, 150]);
+      expect(sock.destroyed).toBe(false);
     } finally {
       sock.destroy();
     }
@@ -2697,9 +2764,14 @@ describe("#174 seam-mcp shares one gate across both entry points", () => {
     const server = makeMcpHost({ handleAdmitted: () => new Promise<void>(() => {}) });
     void server.handleRequest({ method: "POST", url: "/mcp" } as never, fakeRes() as never);
     server.closeAdmission();
-    const started = Date.now();
-    expect(await server.drainRequests(120)).toEqual({ drained: false, outstanding: 1 });
-    expect(Date.now() - started).toBeLessThan(3000);
+    const clock = scriptedClock();
+    const pending = server.drainRequests(120, clock);
+    expect(clock.armedMs()).toEqual([120]);
+    expect(clock.readings()).toEqual([0]);
+    expect(await stillPending(pending)).toBe(true);
+    clock.fireNext();
+    expect(await pending).toEqual({ drained: false, outstanding: 1 });
+    expect(clock.readings()).toEqual([0, 120]);
   });
 });
 
@@ -4073,19 +4145,25 @@ describe("#174 a bounded step's verdict is what gates the closes", () => {
     let finishedLate = false;
     const onTimeout = vi.fn();
 
-    const started = Date.now();
-    const verdict = await runBoundedStep({
+    const clock = scriptedClock();
+    const pending = runBoundedStep({
       label: "wedged dispose",
       timeoutMs: 60,
       onTimeout,
+      clock,
       work: async () => {
         await gate.promise;
         finishedLate = true;
       },
     });
+    expect(clock.armedMs()).toEqual([60]);
+    expect(clock.readings()).toEqual([0]);
+    expect(await stillPending(pending)).toBe(true);
+    clock.fireNext();
+    const verdict = await pending;
 
     expect(verdict).toBe(false);
-    expect(Date.now() - started).toBeLessThan(3000); // bounded, not hung
+    expect(clock.readings()).toEqual([0, 60]);
     expect(onTimeout).toHaveBeenCalledWith("wedged dispose", 60);
     expect(finishedLate).toBe(false); // still outstanding at the decision point
 

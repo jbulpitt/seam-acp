@@ -25,6 +25,7 @@ import { randomUUID } from "node:crypto";
 import type { HttpHeader, McpServer } from "@agentclientprotocol/sdk";
 import { formatCatalogEvidence } from "../catalog-evidence-render.js";
 import type { Logger } from "../../lib/logger.js";
+import { raceDeadline, type DeadlineClock } from "../../lib/shutdown-budget.js";
 import type { SessionRecord } from "../types.js";
 import type { DispatchSpec, ThreadWorkProgress } from "../dispatch/types.js";
 import { frameSteerPrompt } from "../steer.js";
@@ -1890,15 +1891,12 @@ export class SeamMcpServer {
    * the store is still open, which is the entire point: an admitted call's
    * ledger write and dispatch enqueue must land.
    */
-  async drainRequests(timeoutMs: number): Promise<{ drained: boolean; outstanding: number }> {
+  async drainRequests(
+    timeoutMs: number,
+    clock?: DeadlineClock,
+  ): Promise<{ drained: boolean; outstanding: number }> {
     if (this.inFlight.size === 0) return { drained: true, outstanding: 0 };
-    let timer: NodeJS.Timeout | undefined;
-    const deadline = new Promise<void>((resolve) => {
-      timer = setTimeout(resolve, timeoutMs);
-      timer.unref?.();
-    });
-    await Promise.race([Promise.allSettled([...this.inFlight]), deadline]);
-    if (timer) clearTimeout(timer);
+    await raceDeadline(Promise.allSettled([...this.inFlight]), timeoutMs, clock);
     const outstanding = this.inFlight.size;
     if (outstanding > 0) {
       this.logger.warn({ outstanding, timeoutMs }, "seam-mcp request drain timed out");
@@ -1913,22 +1911,18 @@ export class SeamMcpServer {
    * timeout in the first place. Past the deadline the process exits anyway and
    * the socket dies with it.
    */
-  async stop(opts: { timeoutMs?: number } = {}): Promise<void> {
+  async stop(opts: { timeoutMs?: number; clock?: DeadlineClock } = {}): Promise<void> {
     this.closeAdmission();
     const server = this.server;
     if (!server) return;
     this.server = undefined;
-    let timer: NodeJS.Timeout | undefined;
+    const timeoutMs = opts.timeoutMs ?? 5000;
     const closed = new Promise<void>((resolve) => server.close(() => resolve()));
-    const deadline = new Promise<void>((resolve) => {
-      timer = setTimeout(() => {
-        this.logger.warn({ timeoutMs: opts.timeoutMs }, "seam-mcp close timed out; abandoning");
-        resolve();
-      }, opts.timeoutMs ?? 5000);
-      timer.unref?.();
-    });
-    await Promise.race([closed, deadline]);
-    if (timer) clearTimeout(timer);
+    const deadline = await raceDeadline(closed, timeoutMs, opts.clock);
+    if (deadline.timedOut) {
+      // The logged field is the caller's timeoutMs, absent when they omitted it.
+      this.logger.warn({ timeoutMs: opts.timeoutMs }, "seam-mcp close timed out; abandoning");
+    }
   }
 
   // --- HTTP / JSON-RPC plumbing -------------------------------------------

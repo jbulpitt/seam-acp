@@ -1,5 +1,6 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { Logger } from "./logger.js";
+import { raceDeadline, type DeadlineClock } from "./shutdown-budget.js";
 
 /**
  * The health server, plus the two controls shutdown needs (#174).
@@ -19,7 +20,10 @@ export interface HealthServer extends Server {
    */
   closeIngress(): void;
   /** Await requests admitted before `closeIngress()`, bounded. */
-  drainIngress(timeoutMs: number): Promise<{ drained: boolean; outstanding: number }>;
+  drainIngress(
+    timeoutMs: number,
+    clock?: DeadlineClock,
+  ): Promise<{ drained: boolean; outstanding: number }>;
 }
 
 export function startHealthServer(
@@ -92,15 +96,9 @@ export function startHealthServer(
     logger.info({ outstanding: inFlight.size }, "health ingress closed; /mcp and /ingest refused");
   };
 
-  server.drainIngress = async (timeoutMs: number) => {
+  server.drainIngress = async (timeoutMs: number, clock?: DeadlineClock) => {
     if (inFlight.size === 0) return { drained: true, outstanding: 0 };
-    let timer: NodeJS.Timeout | undefined;
-    const deadline = new Promise<void>((resolve) => {
-      timer = setTimeout(resolve, timeoutMs);
-      timer.unref?.();
-    });
-    await Promise.race([Promise.allSettled([...inFlight]), deadline]);
-    if (timer) clearTimeout(timer);
+    await raceDeadline(Promise.allSettled([...inFlight]), timeoutMs, clock);
     const outstanding = inFlight.size;
     if (outstanding > 0) {
       logger.warn({ outstanding, timeoutMs }, "health ingress drain timed out");

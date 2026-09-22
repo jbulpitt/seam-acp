@@ -41,8 +41,11 @@ overridable on the command line.
   `/Users/jessebulpitt/.seam/seam-acp`, and rollout root
   `/Users/jessebulpitt/.seam/bridge-rollouts`.
 - `macbook-pro` and `home-hub` are enabled PM2 targets alongside the two above.
-- Three AGY-only laptops retain SSH aliases but deliberately have no rollout
-  identity and remain disabled.
+- `allie-laptop`, `alaina-laptop`, and `jennifer-laptop` keep their SSH aliases
+  and stay disabled, with no rollout identity. The recorded reason is per host:
+  the first two run pm2 as a user the SSH login cannot write as, and
+  `jennifer-laptop` must not be updated until its agy runtime is root-owned
+  (#388).
 - `plex-server` and `fhr-server` are enabled systemd targets. They run
   `~/.local/libexec/seam-bridge-launch.mjs`, which `import()`s the stable
   checkout entrypoint; activation swaps that path for a stub into

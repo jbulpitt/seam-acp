@@ -62,10 +62,20 @@ describe("#413 bridge fleet accounting", () => {
   it("keeps offline and deliberately excluded hosts in the denominator", () => {
     const fleet = describeTargetFleet(targetMap, validateBridgeRegistry(registeredShape));
     expect(fleet.registered).toContain("jennifer-laptop");
-    expect(fleet.rolloutExcluded).toContainEqual(expect.objectContaining({
-      id: "jennifer-laptop",
-      reason: expect.stringMatching(/outside the PM2 bridge rollout contract/),
-    }));
+    expect(fleet.rolloutExcluded).toEqual([
+      {
+        id: "alaina-laptop",
+        reason: "pm2 seam-bridge runs as alaina uid 502; SSH user jessebulpitt cannot write that home and rollout does not elevate (#494)",
+      },
+      {
+        id: "allie-laptop",
+        reason: "pm2 seam-bridge runs as alliebulpitt uid 502; SSH user jessebulpitt cannot write that home and rollout does not elevate (#494)",
+      },
+      {
+        id: "jennifer-laptop",
+        reason: "agy-only pm2 host has no passwordless sudo; its Aug 21 bridge ignores runtime pins, so a rollout would take it dark (#388)",
+      },
+    ]);
   });
 
   it("runs reconciliation in the real rollout CLI before any host command", () => {
@@ -110,7 +120,9 @@ describe("#413 bridge fleet accounting", () => {
     }
     expect(stdout).toContain("fleet_registered=10");
     expect(stdout).toContain("fleet_rollout_managed=7 of 10");
-    expect(stdout).toContain("fleet_excluded=jennifer-laptop: AGY-only host is outside the PM2 bridge rollout contract");
-    expect(stderr).toMatch(/jennifer-laptop is explicitly excluded.*AGY-only/);
+    expect(stdout).toContain("fleet_excluded=jennifer-laptop: agy-only pm2 host has no passwordless sudo; its Aug 21 bridge ignores runtime pins, so a rollout would take it dark (#388)");
+    expect(stdout).toContain("fleet_excluded=allie-laptop: pm2 seam-bridge runs as alliebulpitt uid 502; SSH user jessebulpitt cannot write that home and rollout does not elevate (#494)");
+    expect(stdout).toContain("fleet_excluded=alaina-laptop: pm2 seam-bridge runs as alaina uid 502; SSH user jessebulpitt cannot write that home and rollout does not elevate (#494)");
+    expect(stderr).toMatch(/jennifer-laptop is explicitly excluded.*#388/);
   });
 });

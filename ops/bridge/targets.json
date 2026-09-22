@@ -34,7 +34,7 @@
       "pm2App": null,
       "verifyAgent": null,
       "rolloutEnabled": false,
-      "unmanagedReason": "AGY-only host is outside the PM2 bridge rollout contract"
+      "unmanagedReason": "agy-only pm2 host has no passwordless sudo; its Aug 21 bridge ignores runtime pins, so a rollout would take it dark (#388)"
     },
     "macbook-pro": {
       "sshAlias": "macbook-pro",
@@ -55,14 +55,14 @@
       "pm2App": null,
       "verifyAgent": null,
       "rolloutEnabled": false,
-      "unmanagedReason": "AGY-only host is outside the PM2 bridge rollout contract"
+      "unmanagedReason": "pm2 seam-bridge runs as alaina uid 502; SSH user jessebulpitt cannot write that home and rollout does not elevate (#494)"
     },
     "allie-laptop": {
       "sshAlias": "laptop-allie",
       "pm2App": null,
       "verifyAgent": null,
       "rolloutEnabled": false,
-      "unmanagedReason": "AGY-only host is outside the PM2 bridge rollout contract"
+      "unmanagedReason": "pm2 seam-bridge runs as alliebulpitt uid 502; SSH user jessebulpitt cannot write that home and rollout does not elevate (#494)"
     },
     "fhr-server": {
       "sshAlias": "fhr-server",

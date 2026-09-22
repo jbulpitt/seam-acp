@@ -9,6 +9,8 @@ import { accessSync, constants } from "node:fs";
 import {
   AGENT_ADAPTER_VERSION,
   makeAgyNativeRuntime,
+  makeAgyUnpinnedRuntime,
+  standingAgyPinKeys,
   describeProvenanceMode,
   makeAgyProfile,
   makeClaudeProfile,
@@ -171,16 +173,25 @@ export function loadHostAdapters(
   const agyNativeBin = env.AGY_CLI_PATH?.trim() || env.AGY_OLD_CLI_PATH?.trim() || agyBin;
   const agyEnabled = env.AGY_ENABLED === "true" || env.AGY_OLD_ROLLBACK_ENABLED === "true";
   const agyExplicitlyDisabled = env.AGY_ENABLED === "false" && env.AGY_OLD_ROLLBACK_ENABLED !== "true";
-  const agyCandidate = agyNativeBin || "agy";
+  const agyUnpinned = env.AGY_PIN?.trim() === "unpinned";
+  const agyCandidate = agyUnpinned && agyEnabled ? "agy" : (agyNativeBin || "agy");
   const agyExecutableAvailable = !agyExplicitlyDisabled && exists(agyCandidate);
-  const agyMissing = [
-    ...(!agyEnabled ? [AGY_NATIVE_REQUIREMENTS[0]] : []),
-    ...(!agyNativeBin || !path.isAbsolute(agyNativeBin) ? [AGY_NATIVE_REQUIREMENTS[1]] : []),
-    ...(!agyDefaultModel ? [AGY_NATIVE_REQUIREMENTS[2]] : []),
-    ...(!agyVersion ? [AGY_NATIVE_REQUIREMENTS[3]] : []),
-    ...(!agySha256 ? [AGY_NATIVE_REQUIREMENTS[4]] : []),
-    ...(!agyRuntimeRoot || !path.isAbsolute(agyRuntimeRoot) ? [AGY_NATIVE_REQUIREMENTS[5]] : []),
-  ];
+  const standingPin = standingAgyPinKeys(env);
+  const agyMissing = agyUnpinned && agyEnabled
+    ? [
+        ...(!agyDefaultModel ? [AGY_NATIVE_REQUIREMENTS[2]] : []),
+        ...(standingPin.length
+          ? [`AGY_PIN=unpinned still has ${standingPin.join(", ")}`]
+          : []),
+      ]
+    : [
+        ...(!agyEnabled ? [AGY_NATIVE_REQUIREMENTS[0]] : []),
+        ...(!agyNativeBin || !path.isAbsolute(agyNativeBin) ? [AGY_NATIVE_REQUIREMENTS[1]] : []),
+        ...(!agyDefaultModel ? [AGY_NATIVE_REQUIREMENTS[2]] : []),
+        ...(!agyVersion ? [AGY_NATIVE_REQUIREMENTS[3]] : []),
+        ...(!agySha256 ? [AGY_NATIVE_REQUIREMENTS[4]] : []),
+        ...(!agyRuntimeRoot || !path.isAbsolute(agyRuntimeRoot) ? [AGY_NATIVE_REQUIREMENTS[5]] : []),
+      ];
   if (!agyExplicitlyDisabled && (agyEnabled || agyExecutableAvailable)) {
     if (agyMissing.length > 0) {
       reportUnavailable(options, {
@@ -242,18 +253,24 @@ export function loadHostAdapters(
     },
     ...(agyLoadable ? [{
       id: "agy",
-      bin: agyNativeBin!,
+      bin: agyUnpinned ? "agy" : agyNativeBin!,
       strict: true,
       make: () => makeAgyProfile({
-        runtime: makeAgyNativeRuntime({
-          executable: agyNativeBin!,
-          runtimeRoot: agyRuntimeRoot!,
-          version: agyVersion!,
-          sha256: agySha256!,
-          credentialScope: env.AGY_CREDENTIAL_SCOPE ?? "antigravity-oauth:default",
-          cwd: options.cwd ?? process.cwd(),
-          baseEnv: env,
-        }),
+        runtime: agyUnpinned
+          ? makeAgyUnpinnedRuntime({
+              credentialScope: env.AGY_CREDENTIAL_SCOPE ?? "antigravity-oauth:default",
+              cwd: options.cwd ?? process.cwd(),
+              baseEnv: env,
+            })
+          : makeAgyNativeRuntime({
+              executable: agyNativeBin!,
+              runtimeRoot: agyRuntimeRoot!,
+              version: agyVersion!,
+              sha256: agySha256!,
+              credentialScope: env.AGY_CREDENTIAL_SCOPE ?? "antigravity-oauth:default",
+              cwd: options.cwd ?? process.cwd(),
+              baseEnv: env,
+            }),
         defaultModel: agyDefaultModel!,
         staticModels: agyModels,
       }),
@@ -298,8 +315,11 @@ export function loadHostAdapters(
       if (f.strict) {
         // Mode is null until a snapshot is actually opened (prepare()), so say
         // "pending" rather than assert a platform default — the two disagree
-        // for a Node fixture on darwin. #330 review.
-        console.error(`[bridge] adapter ${f.id} loaded; provenance mode: ${describeProvenanceMode() ?? "pending first launch"}`);
+        // for a Node fixture on darwin. #330 review. Unpinned never opens one.
+        const provenance = f.id === "agy" && agyUnpinned
+          ? "unpinned (no digest; ordinary PATH binary)"
+          : (describeProvenanceMode() ?? "pending first launch");
+        console.error(`[bridge] adapter ${f.id} loaded; provenance mode: ${provenance}`);
       }
     } catch (error) {
       // Factory threw (missing optional deps) — skip.
@@ -353,7 +373,9 @@ export function inventoryFromAdapters(
   const bins: Record<string, string> = {
     copilot: copilotCmd,
     claude: env.CLAUDE_CLI_PATH ?? "claude-agent-acp",
-    agy: env.AGY_CLI_PATH?.trim() || env.AGY_OLD_CLI_PATH?.trim() || env.AGY_BIN?.trim() || "agy",
+    agy: env.AGY_PIN?.trim() === "unpinned"
+      ? "agy"
+      : env.AGY_CLI_PATH?.trim() || env.AGY_OLD_CLI_PATH?.trim() || env.AGY_BIN?.trim() || "agy",
     codex: "codex-acp",
     grok: env.GROK_CLI_PATH?.trim() || "grok",
   };

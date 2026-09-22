@@ -36,6 +36,35 @@ describe("loadHostAdapters", () => {
     }]);
   });
 
+  it("loads AGY_PIN=unpinned from PATH and still refuses a pin left beside it", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "seam-agy-unpinned-bridge-"));
+    const executable = path.join(dir, "agy");
+    fs.writeFileSync(executable, "#!/bin/sh\necho 1.2.8\n", { mode: 0o755 });
+    try {
+      const env = {
+        PATH: dir,
+        HOME: os.homedir(),
+        AGY_ENABLED: "true",
+        AGY_PIN: "unpinned",
+        AGY_DEFAULT_MODEL: "gemini-high",
+      };
+      const loaded = loadHostAdapters("copilot", {
+        env,
+        exists: (bin) => bin === "agy" || bin === "copilot",
+      });
+      expect(loaded.get("agy")?.id).toBe("agy");
+      const refused = loadHostAdapterInventory("copilot", {
+        env: { ...env, AGY_SHA256: "ab" },
+        exists: () => true,
+      });
+      expect(refused.adapters.has("agy")).toBe(false);
+      expect(refused.adapterRefusals.find((row) => row.agentId === "agy")?.missing?.join(" "))
+        .toContain("AGY_SHA256");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("treats explicit AGY_ENABLED=false as a deliberate clean removal", () => {
     const refusals: unknown[] = [];
     const adapters = loadHostAdapters("copilot", {

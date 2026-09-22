@@ -37,6 +37,7 @@ import { makeCopilotProfile } from "@seam/adapters";
 import { makeClaudeProfile } from "@seam/adapters";
 import {
   makeAgyNativeRuntime,
+  makeAgyUnpinnedRuntime,
   makeAgyProfile,
   scrubStaleGlobalSeamStdio,
   sweepAgyMcpHomes,
@@ -272,17 +273,23 @@ async function main(): Promise<void> {
       })
     : undefined;
 
-  const agyRuntime = config.AGY_ENABLED || config.AGY_OLD_ROLLBACK_ENABLED
-    ? makeAgyNativeRuntime({
-        executable: config.AGY_CLI_PATH!,
-        runtimeRoot: config.AGY_RUNTIME_ROOT!,
-        version: config.AGY_VERSION,
-        sha256: config.AGY_SHA256,
-        credentialScope: config.AGY_CREDENTIAL_SCOPE,
-        cwd: process.cwd(),
-        baseEnv: process.env,
-      })
-    : undefined;
+  const agyRuntime = !(config.AGY_ENABLED || config.AGY_OLD_ROLLBACK_ENABLED)
+    ? undefined
+    : config.AGY_PIN === "unpinned"
+      ? makeAgyUnpinnedRuntime({
+          credentialScope: config.AGY_CREDENTIAL_SCOPE,
+          cwd: process.cwd(),
+          baseEnv: process.env,
+        })
+      : makeAgyNativeRuntime({
+          executable: config.AGY_CLI_PATH!,
+          runtimeRoot: config.AGY_RUNTIME_ROOT!,
+          version: config.AGY_VERSION,
+          sha256: config.AGY_SHA256,
+          credentialScope: config.AGY_CREDENTIAL_SCOPE,
+          cwd: process.cwd(),
+          baseEnv: process.env,
+        });
   const agy = agyRuntime
     ? makeAgyProfile({
         runtime: agyRuntime,

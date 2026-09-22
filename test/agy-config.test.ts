@@ -61,6 +61,28 @@ describe("package-backed agy configuration gates", () => {
     expect(() => loadConfig({ env })).toThrow(/AGY_DEFAULT_MODEL/);
   });
 
+  it("does not treat missing pins as unpinned", () => {
+    enabled({ AGY_SHA256: "", AGY_VERSION: "", AGY_RUNTIME_ROOT: undefined });
+    expect(() => loadConfig({ env })).toThrow(/does not unpin agy/);
+    expect(() => loadConfig({ env })).toThrow(/AGY_PIN=unpinned/);
+  });
+
+  it("accepts AGY_PIN=unpinned without a digest and refuses a pin left beside it", () => {
+    enabled({
+      AGY_PIN: "unpinned",
+      AGY_CLI_PATH: undefined,
+      AGY_BIN: undefined,
+      AGY_OLD_CLI_PATH: undefined,
+      AGY_SHA256: "",
+      AGY_VERSION: "",
+      AGY_RUNTIME_ROOT: undefined,
+    });
+    expect(loadConfig({ env })).toMatchObject({ AGY_PIN: "unpinned", AGY_ENABLED: true });
+    enabled({ AGY_PIN: "unpinned", AGY_SHA256: "a".repeat(64) });
+    expect(() => loadConfig({ env })).toThrow(/AGY_SHA256/);
+    expect(() => loadConfig({ env })).toThrow(/snapshot/);
+  });
+
   it("requires an explicit native path and default model", () => {
     base({ AGY_ENABLED: "true", AGY_CLI_PATH: undefined, AGY_OLD_CLI_PATH: undefined, AGY_BIN: undefined });
     expect(() => loadConfig({ env })).toThrow(/AGY_CLI_PATH/);

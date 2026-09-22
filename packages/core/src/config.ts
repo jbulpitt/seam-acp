@@ -350,6 +350,22 @@ const Schema = z.object({
   AGY_OLD_CLI_PATH: z.string().optional(),
   /** Exact executable for the native agy adapter. */
   AGY_CLI_PATH: z.string().optional(),
+  /**
+   * `pinned` (or unset) is the content-addressed artifact. `unpinned` runs
+   * the ordinary `agy` on PATH and does not check a digest.
+   *
+   * Unpinned is not what deleting AGY_CLI_PATH, AGY_SHA256, and AGY_VERSION
+   * means. Those missing is a misconfigured pin and still fails. On Linux the
+   * pinned path executes the verified bytes from a snapshot, so a swap after
+   * verification cannot change the child. Unpinned does not: a binary that
+   * was one version when someone looked can be another by the time it runs.
+   * That is the writable-path replacement a pin exists to catch. The pin
+   * stays available — unset AGY_PIN and set the four identity values together.
+   */
+  AGY_PIN: z.preprocess(
+    (value) => (typeof value === "string" && value.trim() === "" ? undefined : value),
+    z.enum(["pinned", "unpinned"]).optional(),
+  ),
   /** Exact model id; must be present in fresh discovery. */
   AGY_DEFAULT_MODEL: z.string().default(""),
   /** Optional native static catalog; the package collector does not consume it. */
@@ -1233,6 +1249,31 @@ export function loadConfig({ env = process.env }: {
   cfg.REPOS_ROOT = reposRoot;
 
   if (cfg.AGY_ENABLED || cfg.AGY_OLD_ROLLBACK_ENABLED) {
+    if (cfg.AGY_PIN === "unpinned") {
+      const standing = [
+        ["AGY_CLI_PATH", cfg.AGY_CLI_PATH],
+        ["AGY_OLD_CLI_PATH", cfg.AGY_OLD_CLI_PATH],
+        ["AGY_BIN", cfg.AGY_BIN],
+        ["AGY_SHA256", cfg.AGY_SHA256],
+        ["AGY_VERSION", cfg.AGY_VERSION],
+        ["AGY_RUNTIME_ROOT", cfg.AGY_RUNTIME_ROOT],
+      ].filter(([, value]) => typeof value === "string" && value.trim()).map(([name]) => name);
+      if (standing.length) {
+        throw new Error(
+          "Invalid configuration: AGY_PIN=unpinned still has " +
+          `${standing.join(", ")}. Remove the standing pin, or unset AGY_PIN to keep it. ` +
+          "Unpinned runs the ordinary agy on PATH and does not check a digest. " +
+          "On Linux the pinned path executes the verified bytes from a snapshot, so a swap after verification cannot change the child. " +
+          "This mode does not: a binary that was one version when someone looked can be another by the time it runs.",
+        );
+      }
+      if (!cfg.AGY_DEFAULT_MODEL.trim()) {
+        throw new Error("Invalid configuration: native agy requires AGY_DEFAULT_MODEL");
+      }
+      if (!/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,63}$/.test(cfg.AGY_CREDENTIAL_SCOPE)) {
+        throw new Error("Invalid configuration: AGY_CREDENTIAL_SCOPE must be a non-secret semantic identifier");
+      }
+    } else {
     cfg.AGY_CLI_PATH = cfg.AGY_CLI_PATH?.trim() || cfg.AGY_OLD_CLI_PATH?.trim() || cfg.AGY_BIN?.trim();
     if (!cfg.AGY_CLI_PATH || !path.isAbsolute(cfg.AGY_CLI_PATH)) {
       throw new Error("Invalid configuration: native agy requires an absolute AGY_CLI_PATH (AGY_OLD_CLI_PATH / AGY_BIN accepted as aliases)");
@@ -1246,7 +1287,10 @@ export function loadConfig({ env = process.env }: {
       ["AGY_RUNTIME_ROOT", cfg.AGY_RUNTIME_ROOT],
     ].filter(([, value]) => !value).map(([name]) => name);
     if (missing.length) {
-      throw new Error(`Invalid configuration: native agy requires ${missing.join(", ")}`);
+      throw new Error(
+        `Invalid configuration: native agy requires ${missing.join(", ")}. ` +
+        "Omitting them does not unpin agy. AGY_PIN=unpinned is the mode that runs the ordinary agy on PATH with no digest check.",
+      );
     }
     if (!path.isAbsolute(cfg.AGY_RUNTIME_ROOT!)) {
       throw new Error("Invalid configuration: AGY_RUNTIME_ROOT must be an absolute path");
@@ -1262,6 +1306,7 @@ export function loadConfig({ env = process.env }: {
     }
     if (!/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,63}$/.test(cfg.AGY_CREDENTIAL_SCOPE)) {
       throw new Error("Invalid configuration: AGY_CREDENTIAL_SCOPE must be a non-secret semantic identifier");
+    }
     }
   }
   if (cfg.AGY_NATIVE_RESTORE && !cfg.AGY_ENABLED) throw new Error("AGY_NATIVE_RESTORE requires native AGY_ENABLED");

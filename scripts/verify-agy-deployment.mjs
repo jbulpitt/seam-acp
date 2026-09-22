@@ -54,6 +54,23 @@ export const AGY_DEPLOYMENT_SCHEMA_VERSION = 1;
  */
 export const AGY_DEPLOYMENT_PINS = Object.freeze([...AGY_PINS, "AGY_ENABLED"]);
 
+/** Explicit mode. Not one of the pins: a pinned host does not have to set it. */
+export const AGY_PIN_KEY = "AGY_PIN";
+export const AGY_PIN_UNPINNED = "unpinned";
+export const AGY_IDENTITY_PINS = Object.freeze([
+  "AGY_RUNTIME_ROOT",
+  "AGY_SHA256",
+  "AGY_CLI_PATH",
+  "AGY_VERSION",
+]);
+export const AGY_UNPINNED_GIVE_UP =
+  "Unpinned AGY runs the ordinary agy on PATH and does not check a digest. " +
+  "On Linux the pinned path executes the verified bytes from a snapshot, so a swap after verification cannot change the child. " +
+  "This mode does not do that: a binary that checked as one version can be another by the time it runs, which is the writable-path replacement a pin exists to catch. " +
+  "The pin is still available. Unset AGY_PIN and set AGY_CLI_PATH, AGY_SHA256, AGY_VERSION, and AGY_RUNTIME_ROOT together.";
+
+const PIN_READING_KEYS = Object.freeze([...AGY_DEPLOYMENT_PINS, AGY_PIN_KEY]);
+
 /**
  * The entire filesystem surface. Five functions, all read-only, frozen.
  *
@@ -377,6 +394,10 @@ export function selectPinAuthority(evidence) {
   const count = (source) => (source.supplied ? source.pins.size : 0);
   const complete = (source) => source.supplied
     && AGY_DEPLOYMENT_PINS.every((key) => source.pins.has(key) && source.pins.get(key));
+  const explicitlyUnpinned = (source) => source.supplied
+    && source.pins.get(AGY_PIN_KEY) === AGY_PIN_UNPINNED
+    && source.pins.get("AGY_ENABLED") === "true";
+  const identityBeside = (source) => AGY_IDENTITY_PINS.filter((key) => source.pins.get(key));
 
   if (launcher.supplied && launcher.ambiguous) {
     return {
@@ -384,6 +405,41 @@ export function selectPinAuthority(evidence) {
       source: "launcher",
       pins: new Map(),
       detail: "the launcher names more than one bridge.env, so the file it loads cannot be determined",
+    };
+  }
+  for (const source of [launcher, dotenv, processEnv, recorded]) {
+    const beside = identityBeside(source);
+    if (explicitlyUnpinned(source) && beside.length > 0) {
+      return {
+        kind: "contradictory",
+        source: source.path ? "file" : "process-env",
+        pins: source.pins,
+        path: source.path,
+        detail: `AGY_PIN=unpinned is set beside ${beside.join(", ")}. ` +
+          "Unpinned is a mode, not the absence of a pin. Remove the standing pin or remove AGY_PIN. " +
+          AGY_UNPINNED_GIVE_UP,
+      };
+    }
+  }
+  const anyComplete = [launcher, dotenv, processEnv, recorded].some(complete);
+  const unpinnedSource = [launcher, dotenv, processEnv, recorded].find((source) =>
+    explicitlyUnpinned(source) && identityBeside(source).length === 0);
+  if (unpinnedSource && !anyComplete) {
+    if (!unpinnedSource.pins.get("AGY_DEFAULT_MODEL")) {
+      return {
+        kind: "incomplete",
+        source: unpinnedSource.path ? "file" : "process-env",
+        pins: unpinnedSource.pins,
+        path: unpinnedSource.path,
+        detail: "AGY_PIN=unpinned requires AGY_DEFAULT_MODEL. The digest pins are not required, and their absence is not the fault.",
+      };
+    }
+    return {
+      kind: "deliberately-unpinned",
+      source: unpinnedSource.path ? (unpinnedSource.format ?? "file") : "process-env",
+      pins: unpinnedSource.pins,
+      path: unpinnedSource.path,
+      detail: AGY_UNPINNED_GIVE_UP + " This is not a failure and it is not silence.",
     };
   }
   if (complete(launcher)) {
@@ -516,20 +572,20 @@ export function resolvePinSources(pinsFileText, processEnv = {}, format = null) 
       fileSource = "pm2-ecosystem";
       ecosystem = parsePm2EcosystemPins(pinsFileText);
       if (!ecosystem.ambiguous) {
-        for (const key of AGY_DEPLOYMENT_PINS) {
+        for (const key of PIN_READING_KEYS) {
           if (ecosystem.pins.has(key)) fromFile.set(key, ecosystem.pins.get(key));
         }
       }
     } else {
       const { index } = parseEnvFile(pinsFileText);
-      for (const key of AGY_DEPLOYMENT_PINS) {
+      for (const key of PIN_READING_KEYS) {
         const found = index.get(key);
         if (found !== undefined) fromFile.set(key, found.value);
       }
     }
   }
   const sources = {};
-  for (const key of AGY_DEPLOYMENT_PINS) {
+  for (const key of PIN_READING_KEYS) {
     if (fromFile.has(key)) sources[key] = { value: fromFile.get(key), source: fileSource };
     else if (Object.prototype.hasOwnProperty.call(processEnv, key)) {
       sources[key] = { value: processEnv[key], source: "process-env" };
@@ -580,7 +636,7 @@ export function verifyAgyDeployment(options, io = readOnlyIo()) {
     const map = new Map();
     if (typeof text !== "string") return map;
     const { index } = parseEnvFile(text);
-    for (const key of AGY_DEPLOYMENT_PINS) {
+    for (const key of PIN_READING_KEYS) {
       const found = index.get(key);
       if (found !== undefined && found.value) map.set(key, found.value);
     }
@@ -634,12 +690,12 @@ export function verifyAgyDeployment(options, io = readOnlyIo()) {
     }
   }
 
-  const processSupplied = processEnvSupplied || AGY_DEPLOYMENT_PINS.some((key) =>
+  const processSupplied = processEnvSupplied || PIN_READING_KEYS.some((key) =>
     Object.prototype.hasOwnProperty.call(processEnv, key));
-  const processPins = new Map(AGY_DEPLOYMENT_PINS
+  const processPins = new Map(PIN_READING_KEYS
     .filter((key) => Object.prototype.hasOwnProperty.call(processEnv, key) && processEnv[key])
     .map((key) => [key, String(processEnv[key])]));
-  const recordedPins = new Map(AGY_DEPLOYMENT_PINS
+  const recordedPins = new Map(PIN_READING_KEYS
     .filter((key) => pins[key]?.source === fileSource && pins[key]?.value)
     .map((key) => [key, pins[key].value]));
   const recordedMissing = envFileError && !ecosystem?.ambiguous;
@@ -678,8 +734,12 @@ export function verifyAgyDeployment(options, io = readOnlyIo()) {
       "pins_in_multiple_apps"));
   } else if (authority.kind === "not-deployed") {
     checks.push(check("pins-in-file", "skipped", authority.detail, "agy_not_deployed"));
+  } else if (authority.kind === "contradictory") {
+    checks.push(check("pins-in-file", "fail", authority.detail, "pin_mode_contradicts_pin"));
   } else if (authority.kind === "incomplete") {
     checks.push(check("pins-in-file", "fail", authority.detail, "pins_missing"));
+  } else if (authority.kind === "deliberately-unpinned") {
+    checks.push(check("pin-mode", "unpinned", authority.detail, "deliberately_unpinned"));
   } else if (authority.kind === "recorded-unenforced") {
     checks.push(check("pins-in-file", "unenforced", authority.detail, "pins_recorded_unenforced"));
   } else if (authority.kind === "unknown") {
@@ -787,9 +847,20 @@ export function verifyAgyDeployment(options, io = readOnlyIo()) {
   const runtimeRoot = value("AGY_RUNTIME_ROOT");
   const sha256 = value("AGY_SHA256");
   const cliPath = value("AGY_CLI_PATH");
+  const deliberatelyUnpinned = authority.kind === "deliberately-unpinned";
 
   // 2 and 3. The layout itself, before anything is read off the disk.
-  if (!runtimeRoot || !sha256 || !cliPath) {
+  // Unpinned has no digest path. Skipping these is the verdict, not silence:
+  // pin-mode above says what was given up.
+  if (deliberatelyUnpinned) {
+    for (const id of [
+      "layout-canonical", "runtime-root-managed", "artifact-present", "artifact-digest",
+      "artifact-mode", "path-not-symlinked", "ancestors-durable",
+    ]) {
+      checks.push(check(id, "skipped",
+        "digest verification is not in force under AGY_PIN=unpinned", "deliberately_unpinned"));
+    }
+  } else if (!runtimeRoot || !sha256 || !cliPath) {
     checks.push(check("layout-canonical", "skipped",
       "AGY_RUNTIME_ROOT, AGY_SHA256 or AGY_CLI_PATH is unset", "pins_missing"));
     checks.push(check("runtime-root-managed", "skipped",
@@ -817,8 +888,10 @@ export function verifyAgyDeployment(options, io = readOnlyIo()) {
 
   // 4, 5, 6. The artifact the pins point at — which may simply be gone. Two of
   // the three hosts that had agy 1.1.27 lost it during #342, which is why this
-  // is a first-class check and not an assumption.
+  // is a first-class check and not an assumption. Unpinned already recorded
+  // these as not in force.
   let artifactStat = null;
+  if (!deliberatelyUnpinned) {
   if (!cliPath) {
     for (const id of ["artifact-present", "artifact-digest", "artifact-mode"]) {
       checks.push(check(id, "skipped", "AGY_CLI_PATH is unset", "pins_missing"));
@@ -932,6 +1005,7 @@ export function verifyAgyDeployment(options, io = readOnlyIo()) {
         "ancestor_not_root_owned"));
     }
   }
+  }
 
   // 9. Capability. Identity is not capability (#371); saying nothing about
   // capability is honest, and claiming it without probing would not be.
@@ -939,6 +1013,10 @@ export function verifyAgyDeployment(options, io = readOnlyIo()) {
     checks.push(check("capability", "skipped",
       "not probed; identity checks above do not prove this binary can serve a turn (#371). " +
       "Re-run with --probe to spawn the prompt-free `agy models` check.", "not_probed"));
+  } else if (deliberatelyUnpinned) {
+    checks.push(check("capability", "skipped",
+      "AGY_PIN=unpinned names no pinned artifact. The mode is the finding; a digest probe is not in force.",
+      "deliberately_unpinned"));
   } else if (!cliPath || !artifactStat) {
     checks.push(check("capability", "skipped", "no readable artifact to probe", "artifact_missing"));
   } else {
@@ -957,7 +1035,9 @@ export function verifyAgyDeployment(options, io = readOnlyIo()) {
     kind: "agy-deployment-verification",
     // Precedence: a wrong artifact outranks fragile configuration, which
     // outranks "agy is not here". Each is a different remediation.
-    verdict: checks.some((c) => c.status === "fail") ? "fail"
+    verdict: deliberatelyUnpinned && !checks.some((c) => c.status === "fail")
+      ? "deliberately-unpinned"
+      : checks.some((c) => c.status === "fail") ? "fail"
       : checks.some((c) => c.status === "unenforced") ? "recorded-unenforced"
         : notDeployed ? "not-deployed"
           : checks.some((c) => c.status === "unknown") ? "unknown"
@@ -989,7 +1069,7 @@ export function verifyAgyDeployment(options, io = readOnlyIo()) {
 export function formatDeploymentReport(report) {
   const glyph = {
     pass: "PASS", fail: "FAIL", skipped: "SKIP", drift: "DRIFT",
-    unknown: "UNKNOWN", unenforced: "UNENFORCED",
+    unknown: "UNKNOWN", unenforced: "UNENFORCED", unpinned: "UNPINNED",
   };
   const lines = [
     `agy deployment: ${report.verdict.toUpperCase()}  (host was not modified)`,
@@ -1048,6 +1128,9 @@ export function exitCodeFor(verdict) {
   // to re-stage a runtime that is not the problem.
   if (verdict === "unknown") return 5;
   if (verdict === "recorded-unenforced") return 6;
+  // 7 is the explicit mode. Not a pass (that is a verified pin) and not a
+  // failure (that is a missing pin, which still exits 1).
+  if (verdict === "deliberately-unpinned") return 7;
   return 1;
 }
 

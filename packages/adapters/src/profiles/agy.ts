@@ -184,7 +184,7 @@ function matchAgyError(ctx: ClassifyContext): AdapterErrorClassification | Adapt
   }
   return null;
 }
-import { AgyNativeRuntime } from "../agy-native-runtime.js";
+import { type AgyLaunchRuntime } from "../agy-native-runtime.js";
 import { AgyTurnLifecycle, agyFailure, agyWait } from "../agy-lifecycle.js";
 import { runBoundedProbe, type ProbeHandle, ProbeError } from "../probe-process.js";
 import {
@@ -662,7 +662,7 @@ export function agyNativeCatalogScope(opts: AgyNativeCatalogScopeOptions): Catal
 
 export function makeAgyProfile(opts: {
   /** One verified launch identity shared by catalog, quota, turns and helpers. */
-  runtime: AgyNativeRuntime;
+  runtime: AgyLaunchRuntime;
   /** Global managed MCP servers (playwright, …). Per-session seam-mcp arrives on newSession. */
   mcpServers?: McpServer[];
   /**
@@ -1020,7 +1020,7 @@ export function makeAgyProfile(opts: {
 type FakeProc = ChildProcessByStdio<Writable, Readable, Readable>;
 
 function makeFakeAgyProcess(
-  runtime: AgyNativeRuntime,
+  runtime: AgyLaunchRuntime,
   sessionStore: AgySessionStore,
   defaultModel: string,
   printTimeoutSeconds?: number,
@@ -1337,7 +1337,7 @@ class AgyAgent implements Agent {
   private catalogRefreshSignalled = false;
 
   constructor(
-    private readonly runtime: AgyNativeRuntime,
+    private readonly runtime: AgyLaunchRuntime,
     private readonly sessionStore: AgySessionStore,
     private readonly defaultModel: string,
     private readonly printTimeoutSeconds?: number,
@@ -2594,7 +2594,7 @@ export function parseAgyModelsList(output: string): Array<{ modelId: string; raw
 
 /** Finite discovery uses the shared lifecycle, retaining R4's current protocol. */
 async function runAgyProbe<T>(
-  runtime: AgyNativeRuntime, args: string[], timeoutMs: number,
+  runtime: AgyLaunchRuntime, args: string[], timeoutMs: number,
   run: (handle: ProbeHandle, connection: AgyChildConnection) => Promise<T>,
   observe?: (proc: ChildProcessWithoutNullStreams) => (() => void),
   acceptNonzeroExit = false,
@@ -2730,7 +2730,7 @@ function catalogFallback(error: unknown): AgyCatalogEntry[] {
   return [];
 }
 
-async function getCatalogRows(runtime: AgyNativeRuntime): Promise<AgyCatalogEntry[]> {
+async function getCatalogRows(runtime: AgyLaunchRuntime): Promise<AgyCatalogEntry[]> {
   const cached = catalogRowsPromises.get(runtime.identityKey);
   const base = cached ?? fetchAgyModelCatalog(runtime)
     .then((rows) => {
@@ -2771,7 +2771,7 @@ async function getCatalogRows(runtime: AgyNativeRuntime): Promise<AgyCatalogEntr
  * enrich those exact ids from its already-running language server; enrichment
  * never starts a process or prompt of its own and is never required.
  */
-async function getCatalog(runtime: AgyNativeRuntime): Promise<AgyCatalogEntry[]> {
+async function getCatalog(runtime: AgyLaunchRuntime): Promise<AgyCatalogEntry[]> {
   return getCatalogRows(runtime);
 }
 
@@ -2900,7 +2900,7 @@ const usageCache = new Map<string, { at: number; data: AgyUsage }>();
  * Cached for {@link USAGE_CACHE_TTL_MS} after a successful call.
  */
 export async function fetchAgyUserStatus(
-  runtime: AgyNativeRuntime,
+  runtime: AgyLaunchRuntime,
   signal?: AbortSignal
 ): Promise<AgyUsage> {
   const cached = usageCache.get(runtime.identityKey);
@@ -2980,7 +2980,7 @@ export async function fetchAgyUserStatus(
  * publishing as a guessed `contextLimit` — and #346 learns the real values
  * from a session's own long-lived server.
  */
-async function fetchAgyModelCatalog(runtime: AgyNativeRuntime): Promise<AgyCatalogEntry[]> {
+async function fetchAgyModelCatalog(runtime: AgyLaunchRuntime): Promise<AgyCatalogEntry[]> {
   const logFile = await newSpawnLogPath();
   try {
     return await runAgyProbe(runtime, ["--log-file", logFile, "models"], 30_000, async (handle) => {
@@ -3072,7 +3072,7 @@ const AGY_SESSION_CATALOG_DEADLINE_MS = 10_000;
  * the active turn and the conservative prompt-free catalog keep working.
  */
 async function learnAgyCatalogFromSession(
-  runtime: AgyNativeRuntime,
+  runtime: AgyLaunchRuntime,
   port: number,
   signal: AbortSignal,
   csrfToken?: string,

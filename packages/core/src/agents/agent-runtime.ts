@@ -2,6 +2,7 @@ import { Readable, Writable } from "node:stream";
 import { buildRecoveryDirective, runBoundedRecovery } from "../core/recovery-directive.js";
 import { DEFAULT_ERROR_RULES } from "../core/error-resolution-rules.js";
 import { CONTINUE_PROMPT } from "../core/dispatch/turn-resume.js";
+import { recoveryStory } from "../core/dispatch/recovery-story.js";
 import {
   client,
   methods,
@@ -419,6 +420,8 @@ export class AgentRuntime {
   /** Trimmed text of the in-flight first-post-resume prompt, matched against the
    *  echoed `user_message_chunk` to locate the live-turn boundary. */
   private resumePromptText?: string;
+  /** Situation-bearing continuation. Set before a retry that continues. */
+  private continuationText = CONTINUE_PROMPT;
   /** Accumulates echoed user-message text while suppressing so a boundary split
    *  across chunks still matches the sent prompt. */
   private resumeEchoBuffer = "";
@@ -1040,7 +1043,7 @@ export class AgentRuntime {
             sessionId: sid,
             // Continue the recorded transcript after any output/tool update;
             // never resend the original brief or attachments for that shape.
-            prompt: continuing ? [{ type: "text", text: CONTINUE_PROMPT }] : prompt,
+            prompt: continuing ? [{ type: "text", text: this.continuationText }] : prompt,
             ...(opts?.jsonSchema
               ? { _meta: { [SEAM_AGY_JSON_SCHEMA_META]: opts.jsonSchema } }
               : {}),
@@ -1052,6 +1055,8 @@ export class AgentRuntime {
       // credential cache or English prose cannot silently disable recovery.
       // Only rung 1 executes here. Session/model-changing rungs need upstream
       // identity transactions; #467 owns the eventual daemon executor.
+      let retryBudget = 0;
+      let lastErrorKind: string | undefined;
       const res = await runBoundedRecovery({
         run: () => this.withClassifiedErrors("session/prompt", sendPrompt),
         signal: recoveryAbort.signal,
@@ -1060,22 +1065,38 @@ export class AgentRuntime {
           const directive = buildRecoveryDirective(resolution,
             sid.startsWith("dispatch:") || opts?.recoveryScope === "ephemeral" ? "ephemeral" : "conversation");
           this.logger.warn({ sessionId: sid, resolution, directive }, "turn recovery resolved");
+          lastErrorKind = resolution.errorKind;
           const step = directive.steps.find(step => step.rung === 1);
-          return step?.backoffMs.slice(0, step.retryCount) ?? [];
+          const schedule = step?.backoffMs.slice(0, step.retryCount) ?? [];
+          retryBudget = schedule.length;
+          return schedule;
         },
         onRetry: async (_error, retry, delayMs) => {
           continuing ||= this.sawUpdateThisTurn;
+          // This owner only executes rung 1. The note and the continuation
+          // prompt are the same facts (#451). A retry that resends the
+          // original request does not append them to that request.
+          const story = recoveryStory({
+            cause: "classified_retry",
+            errorKind: lastErrorKind,
+            agentId: this.profile.id,
+            rung: 1,
+            retry,
+            retryBudget,
+            backoffSeconds: delayMs / 1000,
+            alreadyProducedOutput: continuing,
+            promptStarted: true,
+          });
+          this.continuationText = story.prompt;
           if (continuing && this.suppressResumeReplay) {
-            // The next echo names `continue`, not the first request. Without
-            // moving this boundary a recovered cold turn loses its new answer
-            // as purported history. Prior replay stays suppressed; live output
-            // after the continuation echo keeps flowing (#64/#448).
-            this.resumePromptText = CONTINUE_PROMPT;
+            // The next echo is the continuation we are about to send, not the
+            // first request. The boundary has to name that text or the
+            // recovered answer is held as replay (#64/#448).
+            this.resumePromptText = story.prompt;
             this.resumeEchoBuffer = "";
           }
-          const message = `Recovery: ${continuing ? "continuing the existing conversation" : "retrying the request"} (attempt ${retry}/3, ${delayMs / 1000}s backoff).`;
-          this.logger.warn({ sessionId: sid, retry, delayMs, continuing }, message);
-          await this.emit({ kind: "recovery", message });
+          this.logger.warn({ sessionId: sid, retry, delayMs, continuing }, story.note);
+          await this.emit({ kind: "recovery", message: story.note });
         },
       });
       outcomeStopReason = res.stopReason;

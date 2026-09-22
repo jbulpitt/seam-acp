@@ -42,8 +42,14 @@ describe("#448 one bounded prompt owner", () => {
     const { runtime, prompt, events } = fixture({ output: kind === "text", tool: kind === "tool" });
     await expect(runtime.prompt("send the email")).resolves.toMatchObject({ stopReason: "end_turn" });
     expect(prompt).toHaveBeenCalledTimes(2);
-    expect(prompt.mock.calls[1]![0]).toEqual({ sessionId: "s1", prompt: [{ type: "text", text: "continue" }] });
-    expect(events).toContainEqual(expect.objectContaining({ kind: "recovery", message: expect.stringContaining("continuing the existing conversation") }));
+    const continued = (prompt.mock.calls[1]![0] as { prompt: Array<{ text: string }> }).prompt[0]!.text;
+    expect(continued.startsWith("continue\n")).toBe(true);
+    expect(continued).toContain("claude reported auth_contention.");
+    expect(continued).toContain("continuing the existing conversation");
+    expect(events).toContainEqual(expect.objectContaining({
+      kind: "recovery",
+      message: expect.stringContaining("claude reported auth_contention."),
+    }));
   });
 
   it.each([false, true])("preserves the dispatch exception (output=%s)", async output => {
@@ -72,8 +78,8 @@ describe("#448 one bounded prompt owner", () => {
       await feed("user_message_chunk", "original brief");
       await feed("agent_message_chunk", "partial answer");
       throw new Error(CONTENTION);
-    }).mockImplementationOnce(async () => {
-      await feed("user_message_chunk", "continue");
+    }).mockImplementationOnce(async (request: { prompt: Array<{ text: string }> }) => {
+      await feed("user_message_chunk", request.prompt[0]!.text);
       await feed("agent_message_chunk", "recovered answer");
       return { stopReason: "end_turn" };
     });

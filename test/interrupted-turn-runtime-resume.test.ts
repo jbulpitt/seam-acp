@@ -197,8 +197,10 @@ describe("#302 real ACP handshake and strict session/load recovery", () => {
     expect(h.calls.initialized).toBe(1);
     expect(h.calls.loads).toEqual([RECORDED]);
     expect(h.calls.news).toBe(0);
-    expect(h.calls.prompts).toEqual(["continue"]);
-    expect(h.calls.prompts).not.toContain(ORIGINAL);
+    expect(h.calls.prompts).toHaveLength(1);
+    expect(h.calls.prompts[0]?.startsWith("continue\n")).toBe(true);
+    expect(h.calls.prompts[0]).toContain("The process restarted while the turn was in flight.");
+    expect(h.calls.prompts[0]).not.toContain(ORIGINAL);
     expect(h.store.turnAttempts.get(id)).toMatchObject({ state: "completed", generation: 2 });
   });
 
@@ -221,7 +223,10 @@ describe("#302 real ACP handshake and strict session/load recovery", () => {
     expect(h.router.describeConfig(h.store.get(`discord:${THREAD}`)!).location.value).toBe("bridge-a");
     expect(h.calls.loads).toEqual([RECORDED]);
     expect(h.calls.news).toBe(0);
-    expect(h.calls.prompts).toEqual(["continue"]);
+    expect(h.calls.prompts).toHaveLength(1);
+    expect(h.calls.prompts[0]?.startsWith("continue\n")).toBe(true);
+    expect(h.calls.prompts[0]).toContain("The session runs on bridge-a. This resume does not include that host's git state.");
+    expect(h.calls.prompts[0]).not.toContain(ORIGINAL);
     expect(h.store.turnAttempts.get(id)?.state).toBe("completed");
   });
 
@@ -272,7 +277,9 @@ describe("#302 real ACP handshake and strict session/load recovery", () => {
     await resume(h);
     expect(h.calls.loads).toEqual([RECORDED, RECORDED]);
     expect(h.calls.news).toBe(0);
-    expect(h.calls.prompts).toEqual(["continue"]);
+    expect(h.calls.prompts).toHaveLength(1);
+    expect(h.calls.prompts[0]?.startsWith("continue\n")).toBe(true);
+    expect(h.calls.prompts[0]).toContain("does not include that host's git state");
     expect(h.calls.children[0]?.killed).toBe(true);
     expect(h.store.turnAttempts.get(id)).toMatchObject({ state: "completed", generation: 2 });
   }, 10_000);
@@ -284,7 +291,10 @@ describe("#302 real ACP handshake and strict session/load recovery", () => {
     expect(h.calls.initialized).toBe(2);
     expect(h.calls.children[0]?.killed).toBe(true);
     expect(h.calls.news).toBe(0);
-    expect(h.calls.prompts).toEqual(["continue"]);
+    expect(h.calls.prompts).toHaveLength(1);
+    expect(h.calls.prompts[0]?.startsWith("continue\n")).toBe(true);
+    expect(h.calls.prompts[0]).toContain("The process restarted while the turn was in flight.");
+    expect(h.calls.prompts[0]).not.toContain(ORIGINAL);
     expect(h.store.turnAttempts.get(id)?.state).toBe("completed");
   });
 

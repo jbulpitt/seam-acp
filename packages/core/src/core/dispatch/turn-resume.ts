@@ -25,7 +25,12 @@ import { access, mkdir, readdir, readFile, rename, rm, stat, writeFile } from "n
 import * as path from "node:path";
 import type { DispatchSpec } from "./types.js";
 
-/** Prompt substituted for the original on resume. Never replay the brief. */
+/**
+ * Stable prefix of a resumed prompt. Never replay the brief.
+ * The situation is appended by `recoveryStory` (#451). The word alone is
+ * not the resume: the model needs why the turn stopped and what is already
+ * in the transcript. Do not put that variable text in the harness preamble.
+ */
 export const CONTINUE_PROMPT = "continue";
 
 /** In-thread announcement so a resumed turn is not mistaken for a malfunction. */

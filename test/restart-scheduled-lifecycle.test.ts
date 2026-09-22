@@ -137,7 +137,10 @@ describe("#252 actual isolated scheduler + injectTurn, synthetic transport", () 
     Object.assign(h.adapter, { getThreadLiveState: async () => ({ locked: false, archived: false }) });
     transport.prompt.mockResolvedValue({ stopReason: 'end_turn' });
     await h.make().runScheduledPrompt(h.row.id, key);
-    expect(transport.prompt.mock.calls[1]?.[0]).toBe('continue');
+    const resumed = String(transport.prompt.mock.calls[1]?.[0]);
+    expect(resumed.startsWith("continue\n")).toBe(true);
+    expect(resumed).toContain("The turn stopped and this session is being resumed in place.");
+    expect(resumed).not.toContain("ORIGINAL DISPOSABLE SCHEDULE");
   });
 
   it("freezes identity before publication even if the later runner setup fails", async () => {
@@ -191,7 +194,11 @@ describe("#252 actual isolated scheduler + injectTurn, synthetic transport", () 
     transport.prompt.mockResolvedValueOnce({ stopReason: "end_turn" });
     await h.make().runScheduledPrompt(h.row.id, key);
     expect(transport.prompt.mock.calls[0]?.[0]).toContain("ORIGINAL DISPOSABLE SCHEDULE");
-    expect(transport.prompt.mock.calls.slice(1).map(c => c[0])).toEqual(["continue", "continue"]);
+    for (const text of transport.prompt.mock.calls.slice(1).map(c => String(c[0]))) {
+      expect(text.startsWith("continue\n")).toBe(true);
+      expect(text).toContain("The process restarted while the turn was in flight.");
+      expect(text).not.toContain("ORIGINAL DISPOSABLE SCHEDULE");
+    }
     expect(h.store.turnAttempts.get(key.id)).toMatchObject({ generation: 3, state: "completed", deliveryDone: true });
     expect(h.store.scheduledOccurrences.get(key.id)?.settled).toBe(true);
     if (mode === "isolated") {
@@ -209,10 +216,11 @@ describe("#252 actual isolated scheduler + injectTurn, synthetic transport", () 
     transport.prompt.mockResolvedValueOnce({ stopReason: "end_turn" });
     await h.make().runScheduledPrompt(h.row.id, key);
     expect(transport.load).toHaveBeenCalledWith("new-disposable-session");
-    expect(transport.prompt.mock.calls.map((call) => call[0])).toEqual([
-      expect.stringContaining(h.row.promptText),
-      "continue",
-    ]);
+    const resumed = String(transport.prompt.mock.calls[1]?.[0]);
+    expect(String(transport.prompt.mock.calls[0]?.[0])).toContain(h.row.promptText);
+    expect(resumed.startsWith("continue\n")).toBe(true);
+    expect(resumed).toContain("The process restarted while the turn was in flight.");
+    expect(resumed).not.toContain(h.row.promptText);
     expect(h.store.turnAttempts.get(key.id)).toMatchObject({ state: "completed", generation: 2 });
   });
 
@@ -229,10 +237,11 @@ describe("#252 actual isolated scheduler + injectTurn, synthetic transport", () 
     await h.make().runScheduledPrompt(h.row.id, key);
 
     expect(transport.load).toHaveBeenLastCalledWith(recorded);
-    expect(transport.prompt.mock.calls.map((call) => call[0])).toEqual([
-      expect.stringContaining(h.row.promptText),
-      "continue",
-    ]);
+    const resumed = String(transport.prompt.mock.calls[1]?.[0]);
+    expect(String(transport.prompt.mock.calls[0]?.[0])).toContain(h.row.promptText);
+    expect(resumed.startsWith("continue\n")).toBe(true);
+    expect(resumed).toContain("The process restarted while the turn was in flight.");
+    expect(resumed).not.toContain(h.row.promptText);
     expect(h.store.turnAttempts.get(key.id)).toMatchObject({ state: "completed", generation: 2 });
   });
 
@@ -299,7 +308,8 @@ describe("#252 actual isolated scheduler + injectTurn, synthetic transport", () 
     h.store.deleteScheduled(h.row.id);
     transport.prompt.mockResolvedValue({ stopReason: "end_turn" });
     await h.make().runScheduledPrompt(h.row.id, key);
-    expect(transport.prompt.mock.calls.at(-1)?.[0]).toBe("continue");
+    expect(String(transport.prompt.mock.calls.at(-1)?.[0]).startsWith("continue\n")).toBe(true);
+    expect(String(transport.prompt.mock.calls.at(-1)?.[0])).toContain("The process restarted while the turn was in flight.");
     expect(h.store.getScheduled(h.row.id)).toBeNull();
     h.store.upsertScheduled(h.row);
     const cancelledKey = scheduledOccurrenceKey(h.row.id);
@@ -325,7 +335,8 @@ describe("#252 actual isolated scheduler + injectTurn, synthetic transport", () 
       onFire: (id, occurrence) => fresh.runScheduledPrompt(id, occurrence) });
     manager.start(); await manager.drain(); manager.stop();
     expect(transport.prompt).toHaveBeenCalledTimes(2);
-    expect(transport.prompt.mock.calls[1]?.[0]).toBe("continue");
+    expect(String(transport.prompt.mock.calls[1]?.[0]).startsWith("continue\n")).toBe(true);
+    expect(String(transport.prompt.mock.calls[1]?.[0])).toContain("The process restarted while the turn was in flight.");
     expect(h.store.scheduledOccurrences.pending()).toEqual([]);
   });
 

@@ -81,7 +81,9 @@ describe("#250 production dispatch lifecycle (synthetic transport, no providers)
     if (delivered) h.store.turnAttempts.markStallNoticeDelivered(h.spec.id);
     h.adapter.sendMessage.mockClear();
     h.runtime.prompt.mockImplementationOnce(async text => {
-      expect(text).toBe("continue");
+      expect(text.startsWith("continue\n")).toBe(true);
+      expect(text).toContain("execution failed before the provider took the turn and the attempt is suspended");
+      expect(text).not.toContain("original work");
       expect(h.store.turnAttempts.get(h.spec.id)).toMatchObject({ generation: 2,
         stalledUtc: null, stalledReason: null, stallNoticeUtc: null });
       return { stopReason: "end_turn" };
@@ -94,7 +96,9 @@ describe("#250 production dispatch lifecycle (synthetic transport, no providers)
     next.setDispatchWatcher(watcher); cleanups.push(() => watcher.stop());
     await watcher.start();
     expect(h.runtime.prompt).toHaveBeenCalledTimes(2);
-    expect(h.runtime.prompt.mock.calls.at(-1)?.[0]).toBe("continue");
+    expect(String(h.runtime.prompt.mock.calls.at(-1)?.[0])).toContain(
+      "execution failed before the provider took the turn and the attempt is suspended");
+    expect(String(h.runtime.prompt.mock.calls.at(-1)?.[0])).not.toContain("original work");
     expect(h.router.getOrStartRuntime.mock.calls.at(-1)).toMatchObject([
       { channelRef: "worker" }, { resumeSessionId: "recorded-acp" },
     ]);
@@ -184,7 +188,9 @@ describe("#250 production dispatch lifecycle (synthetic transport, no providers)
       dataDir: h.dataDir, logger: logger as any, runtime: next, resumeEnabled: true });
     next.setDispatchWatcher(watcher); cleanups.push(() => watcher.stop());
     await watcher.start();
-    expect(h.runtime.prompt.mock.calls.at(-1)?.[0]).toBe("continue");
+    expect(String(h.runtime.prompt.mock.calls.at(-1)?.[0]).startsWith("continue\n")).toBe(true);
+    expect(String(h.runtime.prompt.mock.calls.at(-1)?.[0])).toContain("The process restarted while the turn was in flight.");
+    expect(String(h.runtime.prompt.mock.calls.at(-1)?.[0])).not.toContain("original work");
     expect(h.runtime.prompt).toHaveBeenCalledTimes(2);
     expect(h.router.getOrStartRuntime.mock.calls.at(-1)).toMatchObject([
       { channelRef: "worker" }, { resumeSessionId: "recorded-acp" },
@@ -257,7 +263,9 @@ describe("#250 production dispatch lifecycle (synthetic transport, no providers)
     expect(h.notices).not.toHaveBeenCalled();
     expect(h.store.turnAttempts.get(h.spec.id)).toMatchObject({ state: "completed", generation: 2,
       acpSessionId: "recorded-acp", promptStarted: true, stalledUtc: null });
-    expect(h.runtime.prompt.mock.calls.at(-1)?.[0]).toBe("continue");
+    expect(String(h.runtime.prompt.mock.calls.at(-1)?.[0]).startsWith("continue\n")).toBe(true);
+    expect(String(h.runtime.prompt.mock.calls.at(-1)?.[0])).toContain("The process restarted while the turn was in flight.");
+    expect(String(h.runtime.prompt.mock.calls.at(-1)?.[0])).not.toContain("original work");
     expect(h.router.getOrStartRuntime.mock.calls.at(-1)).toMatchObject([{}, { resumeSessionId: "recorded-acp" }]);
     expect(h.notices).not.toHaveBeenCalled();
   });
@@ -379,7 +387,9 @@ describe("#250 production dispatch lifecycle (synthetic transport, no providers)
     const resumed = h.makeOrch();
     const report = vi.spyOn(resumed as any, "enqueueReportBack").mockResolvedValue(undefined);
     await resumed.dispatchInjectTurn({ ...h.spec, resume: true });
-    expect(h.runtime.prompt.mock.calls.at(-1)?.[0]).toBe("continue");
+    expect(String(h.runtime.prompt.mock.calls.at(-1)?.[0]).startsWith("continue\n")).toBe(true);
+    expect(String(h.runtime.prompt.mock.calls.at(-1)?.[0])).toContain("The process restarted while the turn was in flight.");
+    expect(String(h.runtime.prompt.mock.calls.at(-1)?.[0])).not.toContain("original work");
     expect(h.store.turnAttempts.get(h.spec.id)?.acpSessionId).toBe("recorded-acp");
     expect(h.store.turnAttempts.get(h.spec.id)?.generation).toBe(2);
     expect(report).toHaveBeenCalledTimes(1);

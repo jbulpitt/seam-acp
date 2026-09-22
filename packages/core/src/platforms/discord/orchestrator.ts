@@ -162,7 +162,6 @@ import {
 } from "../../core/dispatch/watcher.js";
 import {
   CONTINUE_PROMPT,
-  RESUME_ANNOUNCE,
   TURN_RESUME_CONCURRENCY,
   TURN_RESUME_MAX_AGE_SECONDS,
   TURN_RESUME_STAGGER_MS,
@@ -177,6 +176,13 @@ import {
   type LiveTurnMarker,
   type ResumePrecondition,
 } from "../../core/dispatch/turn-resume.js";
+import {
+  recoveryFactsFromAttempt,
+  recoveryStory,
+  type RecoveryAttemptSource,
+  type RecoveryRender,
+} from "../../core/dispatch/recovery-story.js";
+import { readDefaultBranchHead } from "../../core/dispatch/default-branch-head.js";
 import {
   formatConfigAuditView,
   formatConfigAuditDetail,
@@ -1087,6 +1093,8 @@ export class Orchestrator {
   /** Stash a marker so a live-turn re-fire reuses it instead of writing a
    *  second one (which would double-resume on the next crash). */
   private readonly pendingLiveResume = new Map<string, LiveTurnMarker>();
+  /** Situation already announced for a live refire. The prompt must reuse it. */
+  private readonly stagedRecovery = new Map<string, RecoveryRender>();
   /** Shared start-gate so N resumes stagger instead of firing at once. */
   private readonly resumeScheduler = createResumeScheduler({
     concurrency: TURN_RESUME_CONCURRENCY,
@@ -3434,8 +3442,18 @@ export class Orchestrator {
           "restart cutoff reached before the prompt was submitted");
       }
       // Never restage old attachments, re-transcribe voice or rebuild the
-      // original brief while resuming a submitted human turn.
-      if (humanResume) msg = { ...msg, text: CONTINUE_PROMPT, attachments: undefined };
+      // original brief while resuming a submitted human turn. The model gets
+      // the situation appended to "continue" (#451), from the attempt as it
+      // was recorded — claim() clears the stall reason after this snapshot.
+      if (humanResume && priorHuman) {
+        const staged = this.stagedRecovery.get(channel.id);
+        this.stagedRecovery.delete(channel.id);
+        const render = staged ?? await this.processRestartRender(priorHuman);
+        if (!staged) await this.postResumeNotice(channel.id, render.note);
+        msg = { ...msg, text: render.prompt, attachments: undefined };
+      } else {
+        this.stagedRecovery.delete(channel.id);
+      }
     }
     const humanCurrent = () => !humanAttempt || (!this.restartCutoff && this.store.turnAttempts.isCurrent(humanAttempt));
     /**
@@ -4279,7 +4297,7 @@ export class Orchestrator {
       // since the last turn. Omit the gap on the first/only turn or a bad stamp.
       const nowMs = Date.now();
       const lastTurnMs = Date.parse(record.updatedUtc ?? "");
-      let promptText = humanResume ? CONTINUE_PROMPT : withHarnessPreamble(msg.text, extraRules, speaker, {
+      let promptText = humanResume ? msg.text : withHarnessPreamble(msg.text, extraRules, speaker, {
         inboxAwareness: this.config.SEAM_INBOX_PREAMBLE_ENABLED,
         seamMcp,
         seamFences,
@@ -9372,8 +9390,12 @@ export class Orchestrator {
       applyPresetIdentity(runtimePrompt.prompt, preset),
       Boolean(spec.watchFeedback && seamMcp)
     );
+    // #250: a dispatch resume stays quiet in the thread. The situation goes
+    // to the model only. The note exists so a live resume can post the same
+    // sentences; posting it here would be the intermediate restart message
+    // that path refuses.
     const effectivePrompt = isResume
-      ? CONTINUE_PROMPT
+      ? (await this.processRestartRender(previousAttempt!)).prompt
       : withHarnessPreamble(tasked, choiceAuthoringRules({ fence: false, mcp: seamMcp }), undefined, {
           seamMcp,
           seamFences: false,
@@ -10457,7 +10479,7 @@ export class Orchestrator {
         });
       }
 
-      result = await this.injectTurn(null, isResume ? CONTINUE_PROMPT : prompt, {
+      result = await this.injectTurn(null, isResume ? (await this.processRestartRender(previousAttempt!)).prompt : prompt, {
         session: "isolated",
         profile,
         ...(restrictionChannelId ? { restrictionChannelId } : {}),
@@ -11845,7 +11867,13 @@ export class Orchestrator {
         cwd: execution.cwd, ...(execution.effort ? { effort: execution.effort } : {}),
       }, execution.fingerprint, this.attemptBoot, "schedule");
       try {
-        const execute = () => this.runScheduledPromptInner(occurrence.row, { occurrence, attempt });
+        const execute = () => this.runScheduledPromptInner(occurrence.row, {
+          occurrence,
+          attempt,
+          // claim() rewrites updatedUtc and clears the stall reason. The
+          // situation has to be read from the pre-claim row.
+          ...(prior?.promptStarted ? { stopped: prior } : {}),
+        });
         // Scheduled recovery is a separate boot producer from DispatchWatcher;
         // use the same start gate so it cannot recreate the boot-time stampede.
         await (prior?.promptStarted && !manualResume ? this.resumeScheduler.run(execute) : execute());
@@ -11989,7 +12017,11 @@ export class Orchestrator {
       id: occurrence.id, status: "completed", channelRef: occurrence.row.channelRef, finishedUtc: new Date().toISOString() });
   }
 
-  private async runScheduledPromptInner(row: ScheduledPrompt, owned?: { occurrence: PreparedScheduledOccurrence; attempt: TurnAttempt }): Promise<void> {
+  private async runScheduledPromptInner(row: ScheduledPrompt, owned?: {
+    occurrence: PreparedScheduledOccurrence;
+    attempt: TurnAttempt;
+    stopped?: RecoveryAttemptSource;
+  }): Promise<void> {
     const assertOwned = (): void => {
       if (!owned) return;
       if (this.restartCutoff) {
@@ -12355,7 +12387,11 @@ export class Orchestrator {
       options.lifecycle?.onOutcome(result);
       return { text: result.text, error: result.error };
     }
-    const result = await this.injectTurn(record, resume ? CONTINUE_PROMPT : promptText, options);
+    const result = await this.injectTurn(
+      record,
+      resume ? (await this.processRestartRender(owned?.stopped ?? attempt!)).prompt : promptText,
+      options,
+    );
     return { text: result.text, ...(result.error ? { error: result.error } : {}) };
   }
 
@@ -15108,8 +15144,10 @@ export class Orchestrator {
       id: marker.channelRef,
       ...(marker.parentRef ? { parentId: marker.parentRef } : {}),
     };
+    const render = await this.processRestartRender(this.liveRestartSource(marker));
+    this.stagedRecovery.set(marker.channelRef, render);
     try {
-      await this.adapter.sendMessage?.(channel, RESUME_ANNOUNCE);
+      await this.adapter.sendMessage?.(channel, render.note);
     } catch (err) {
       this.logger.warn({ err, id: marker.id }, "live-turn resume announce failed");
     }
@@ -15117,7 +15155,7 @@ export class Orchestrator {
       channel,
       authorId: marker.authorId ?? "system",
       authorIsBot: false,
-      text: CONTINUE_PROMPT,
+      text: render.prompt,
     };
     this.pendingLiveResume.set(marker.channelRef, marker);
     try {
@@ -15133,7 +15171,35 @@ export class Orchestrator {
     } catch (err) {
       this.pendingLiveResume.delete(marker.channelRef);
       this.logger.warn({ err, id: marker.id }, "live-turn resume failed");
+    } finally {
+      this.stagedRecovery.delete(marker.channelRef);
     }
+  }
+
+  /** Pre-claim attempt when this marker has one; otherwise the session directory. */
+  private liveRestartSource(marker: LiveTurnMarker): RecoveryAttemptSource {
+    const attempt = this.store.turnAttempts?.get(marker.id);
+    if (attempt) return attempt;
+    const record = this.store.get(marker.sessionRecordId);
+    return {
+      promptStarted: true,
+      location: marker.location,
+      spec: record?.repoPath ? { cwd: record.repoPath } : undefined,
+    };
+  }
+
+  /**
+   * Situation for a process-restart resume. Local checkouts contribute the
+   * default-branch tip they actually have. A remote session does not get
+   * this machine's git state. A failed read is omitted.
+   */
+  private async processRestartRender(source: RecoveryAttemptSource): Promise<RecoveryRender> {
+    const facts = recoveryFactsFromAttempt(source);
+    if (facts.cwd && isLocalLocation(facts.location)) {
+      const head = await readDefaultBranchHead(facts.cwd);
+      if (head) facts.defaultBranch = head;
+    }
+    return recoveryStory(facts);
   }
 
   /**

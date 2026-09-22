@@ -2,7 +2,8 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { createReleaseReceiptWriter } from "../packages/bridge/src/release-receipt.js";
+import { releaseShaFromHello } from "../packages/core/src/core/bridge-hub.js";
+import { createReleaseReceiptWriter, readRunningReleaseSha } from "../packages/bridge/src/release-receipt.js";
 
 const H = (value: string) => value.repeat(64);
 
@@ -33,6 +34,36 @@ describe("bridge activation receipt (#241)", () => {
     await fs.writeFile(receipt, JSON.stringify({ formatVersion: 2, bridgeId: "media-server", sourceSha: "a".repeat(40), artifactChecksum: H("b"), verificationAgent: "grok", stageId: H("c"), treeDigest: H("d"), stagedAt: new Date().toISOString() }));
     await fs.writeFile(activation, JSON.stringify({ formatVersion: 2, activationId: H("e"), bridgeId: "other", sourceSha: "a".repeat(40), artifactChecksum: H("b"), verificationAgent: "grok", stageId: H("c"), oldPid: 41, startedAt: new Date(Date.now()-10_000).toISOString(), deadlineAt: new Date(Date.now()-1_000).toISOString() }));
     expect(await createReleaseReceiptWriter({ bridgeId: "media-server", instanceId: "x", protocolVersion: 1, adapterRefusals: [], activationEnvelopePath: activation, receiptPath: receipt })).toBeNull();
+    // The activation window closed. The stage receipt is still the release
+    // this directory is. Identification does not require the envelope.
+    expect(await readRunningReleaseSha(receipt)).toBe("a".repeat(40));
     await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  it("omits a sha when the receipt is missing or not a stage receipt", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "bridge-receipt-none-"));
+    expect(await readRunningReleaseSha(path.join(dir, "release-receipt.json"))).toBeNull();
+    await fs.writeFile(path.join(dir, "release-receipt.json"), JSON.stringify({ sourceSha: "a".repeat(40) }));
+    expect(await readRunningReleaseSha(path.join(dir, "release-receipt.json"))).toBeNull();
+    await fs.writeFile(path.join(dir, "release-receipt.json"), JSON.stringify({
+      formatVersion: 2, bridgeId: "media-server", sourceSha: "A".repeat(40),
+      artifactChecksum: H("b"), verificationAgent: "grok", stageId: H("c"),
+      treeDigest: H("d"), stagedAt: new Date().toISOString(),
+    }));
+    expect(await readRunningReleaseSha(path.join(dir, "release-receipt.json"))).toBeNull();
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+});
+
+describe("hello release sha (#557)", () => {
+  const sha = "a".repeat(40);
+
+  it("accepts a 40-hex sha and nothing else", () => {
+    expect(releaseShaFromHello(sha)).toBe(sha);
+    expect(releaseShaFromHello(undefined)).toBeNull();
+    expect(releaseShaFromHello("")).toBeNull();
+    expect(releaseShaFromHello("A".repeat(40))).toBeNull();
+    expect(releaseShaFromHello(`${sha}0`)).toBeNull();
+    expect(releaseShaFromHello(sha.slice(0, 12))).toBeNull();
   });
 });

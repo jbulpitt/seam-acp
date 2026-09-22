@@ -31,6 +31,11 @@ export interface BridgeStatusRow {
   devMode?: boolean;
   /** Threads with a parked prompt waiting on this host (#88 D7). */
   waiting?: number;
+  /**
+   * Release sha from the latest hello. Null means that hello did not carry
+   * one. Omit on an offline row so the last observation is kept.
+   */
+  releaseSha?: string | null;
 }
 
 export interface ServerStatusSnapshot {
@@ -59,9 +64,29 @@ export interface BridgeMemoryEntry {
   arch?: string;
   agents: BridgeAgent[];
   offlineSince?: number;
+  /** Last hello. Null is an explicit unknown, not a missing observation. */
+  releaseSha?: string | null;
 }
 
 export type BridgeMemory = Record<string, BridgeMemoryEntry>;
+
+/**
+ * What the last hello said this host runs. Null and a missing entry are
+ * unknown — not the controller's own sha, and not a sibling's.
+ */
+export function observedBridgeRelease(entry: BridgeMemoryEntry | undefined): string | "unknown" {
+  return entry?.releaseSha ? entry.releaseSha : "unknown";
+}
+
+/** Whether this host's last hello was exactly `sha`. Unknown is not "no". */
+export function bridgeHasRelease(
+  entry: BridgeMemoryEntry | undefined,
+  sha: string,
+): "yes" | "no" | "unknown" {
+  const observed = entry?.releaseSha;
+  if (!observed) return "unknown";
+  return observed === sha ? "yes" : "no";
+}
 
 export function formatDuration(ms: number): string {
   const s = Math.max(0, Math.floor(ms / 1000));
@@ -180,6 +205,9 @@ export function rememberBridgeState(
         ...(b.os ? { os: b.os } : {}),
         ...(b.arch ? { arch: b.arch } : {}),
         agents: b.agents,
+        // A connected hello that omitted the sha replaces a previous one.
+        // Keeping the old sha would claim this process is still that release.
+        releaseSha: b.releaseSha ?? null,
       };
       continue;
     }
@@ -192,6 +220,7 @@ export function rememberBridgeState(
       ...(arch ? { arch } : {}),
       agents,
       offlineSince,
+      releaseSha: prev?.releaseSha ?? null,
     };
     if (os) b.os = os;
     if (arch) b.arch = arch;

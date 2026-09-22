@@ -35,6 +35,15 @@ import fs from "node:fs";
 import path from "node:path";
 
 const RELEASE_SHA = /^[0-9a-f]{40}$/;
+
+/**
+ * The sha hello actually carried. Missing, empty, or not 40 lowercase hex
+ * is unknown. Do not keep a previous sha in that case: that process did
+ * not say what it is running.
+ */
+export function releaseShaFromHello(value: unknown): string | null {
+  return typeof value === "string" && RELEASE_SHA.test(value) ? value : null;
+}
 const RELEASE_CHECKSUM = /^[0-9a-f]{64}$/;
 const RELEASE_AGENT = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 const RELEASE_INSTANCE = /^[A-Za-z0-9._-]{8,128}$/;
@@ -85,6 +94,8 @@ export interface ConnectedBridge {
     home?: string;
   };
   devMode: boolean;
+  /** Null when hello did not carry a valid release sha. That is unknown. */
+  releaseSha: string | null;
   agents: Map<string, {
     version: number;
     installed: boolean;
@@ -468,11 +479,13 @@ export class BridgeHub {
       }
     }
 
+    const releaseSha = releaseShaFromHello(hello.releaseSha);
     const conn: ConnectedBridge = {
       bridgeId: expectedId,
       instanceId: hello.instanceId,
       host: hello.host ?? { os: "unknown", arch: "unknown" },
       devMode: hello.devMode === true,
+      releaseSha,
       agents,
       mux,
       connectedAt: Date.now(),
@@ -534,6 +547,7 @@ export class BridgeHub {
         bridgeId: expectedId,
         agents: [...agents.entries()].map(([id, s]) => ({ id, ...s })),
         devMode: conn.devMode,
+        releaseSha: releaseSha ?? "unknown",
       },
       "bridge reconciled"
     );

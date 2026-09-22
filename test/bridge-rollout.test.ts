@@ -38,6 +38,7 @@ function preflightReport(target: ReturnType<typeof resolveTarget>, overrides: Re
     baseline_rollback_proof: "none",
     node_path: target.nodePath,
     node_version: "v24.15.0",
+    node_abi: "127",
     npm_version: "11.6.2",
     disk_path: target.checkoutPath,
     disk_bytes_available: "1024",
@@ -168,6 +169,7 @@ describe("bridge rollout target safety (#241)", () => {
     const base = { ...configured.targets["media-server"] };
     expect(() => validateTargetMap({ schemaVersion: 3, targets: { ok: { ...base, sshAlias: "host;id" } } })).toThrow(/unsafe SSH/);
     expect(() => validateTargetMap({ schemaVersion: 3, targets: { ok: { ...base, checkoutPath: "/safe/../escape", entrypointPath: "/safe/../escape/packages/bridge/dist/index.js" } } })).toThrow(/unsafe checkout/);
+    expect(() => validateTargetMap({ schemaVersion: 3, targets: { ok: { ...base, nodePath: "node" } } })).toThrow(/unsafe nodePath/);
     expect(() => validateTargetMap({ schemaVersion: 3, targets: { ok: { ...base, surprise: "x" } } })).toThrow(/unknown target property/);
     expect(() => validateTargetMap({ schemaVersion: 3, targets: { ok: { ...base, pidFilePath: "/stale/app-0.pid" } } })).toThrow(/unknown target property.*pidFilePath/);
     expect(() => validateTargetMap({ schemaVersion: 3, targets: { ok: { sshAlias: null, pm2App: null, verifyAgent: null, rolloutEnabled: false } } })).toThrow(/requires a safe reason/);
@@ -217,9 +219,18 @@ describe("bridge rollout gating and verification (#241)", () => {
     const target = resolveTarget(targets, "media-server");
     const fake = vi.fn(async (command: { mutates: boolean }) => {
       expect(command.mutates).toBe(false);
-      return { stdout: preflightReport(target, { native_prebuild: "better-sqlite3@11.10.0-node-v137-darwin-x64", native_install_ready: "no" }), stderr: "" };
+      return { stdout: preflightReport(target, { node_abi: "137", native_prebuild: "better-sqlite3@11.10.0-node-v137-darwin-x64", native_install_ready: "no" }), stderr: "" };
     });
-    await expect(runPreflight(target, "fixed-script", fake)).rejects.toThrow(/no reviewed prebuild.*undeclared Python\/compiler toolchain/);
+    await expect(runPreflight(target, "fixed-script", fake)).rejects.toThrow(/configured interpreter .* unsupported ABI 137.*reviewed ABIs are 108, 115, 127, 131/);
+  });
+
+  it("does not trust a remote ready flag for an unreviewed interpreter ABI", async () => {
+    const target = resolveTarget(targets, "media-server");
+    const fake = vi.fn(async () => ({
+      stdout: preflightReport(target, { node_abi: "137", native_prebuild: "better-sqlite3@11.10.0-node-v137-darwin-x64", native_install_ready: "yes" }),
+      stderr: "",
+    }));
+    await expect(runPreflight(target, "fixed-script", fake)).rejects.toThrow(/configured interpreter .* unsupported ABI 137/);
   });
 
   it("refuses a mapped SSH host whose reported bridge id differs from the target before mutation (#282)", async () => {

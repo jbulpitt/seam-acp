@@ -1470,7 +1470,7 @@ async function preflight() {
   console.log(`artifact_mode=${artifactMode}`); console.log(`artifact_identity=${artifactIdentity}`); console.log(`artifact_source_sha=${artifactSourceSha}`); console.log(`checkout_source_sha=${checkoutSourceSha}`); console.log(`artifact_checksum=${artifactChecksum}`); console.log(`entrypoint_sha256=${entrypointSha256}`);
   console.log(`bridge_version=${bridgePackage.version}`); console.log(`protocol_version=${protocolVersion}`); console.log(`drain_SIGUSR2=${drainSupport}`); console.log(`describeModelCatalog=${describeSupport}`); console.log(`fetchModelCatalog=${fetchSupport}`); console.log(`rollout_ready=${rolloutReady}`);
   console.log(`verification_agent=${verifyAgent}`); console.log(`process_started_at=${identity.processStartedAt}`);
-  console.log(`node_path=${nodePath}`); console.log(`node_version=${nodeVersion}`); console.log(`npm_version=${npmVersion}`); console.log(`disk_path=${checkoutPath}`); console.log(`disk_bytes_available=${diskBytesAvailable}`);
+  console.log(`node_path=${nodePath}`); console.log(`node_version=${nodeVersion}`); console.log(`node_abi=${nativeInstall.abi}`); console.log(`npm_version=${npmVersion}`); console.log(`disk_path=${checkoutPath}`); console.log(`disk_bytes_available=${diskBytesAvailable}`);
   console.log(`release_parent=${parentState}`); console.log(`native_dependency=${NATIVE_DEPENDENCY}`); console.log("native_install_strategy=locked-prebuild");
   console.log(`native_prebuild=${nativeInstall.prebuild}`); console.log(`native_install_ready=${nativeInstall.ready ? "yes" : "no"}`);
   // Enrollment state is re-derived from live state, never trusted from the file:

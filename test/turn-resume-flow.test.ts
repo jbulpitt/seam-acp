@@ -15,7 +15,6 @@ import { SessionStore } from "../packages/core/src/core/session-store.js";
 import { DispatchWatcher, createRuntimeDispatchWatcher } from "../packages/core/src/core/dispatch/watcher.js";
 import { dispatchDirs, type DispatchSpec } from "../packages/core/src/core/dispatch/types.js";
 import {
-  CONTINUE_PROMPT,
   finishLiveTurn,
   listLiveMarkers,
   writeLiveMarker,
@@ -221,7 +220,11 @@ describe("dispatch-path resume: continue + loadSession (#76)", () => {
       return { text: "picked up where I left off", error: undefined, stopReason: "end_turn" };
     };
     await orch.dispatchInjectTurn(handoffSpec({ resume: true }));
-    expect(seen).toEqual([CONTINUE_PROMPT]);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.startsWith("continue\n")).toBe(true);
+    expect(seen[0]).toContain("The turn stopped and this session is being resumed in place.");
+    expect(seen[0]).toContain("The process restarted while the turn was in flight.");
+    expect(seen[0]).not.toContain("do the overnight git push");
     expect(newSession).not.toHaveBeenCalled();
     void loadSession;
   });
@@ -577,7 +580,10 @@ describe("watcher recoverStale vs resumeEnabled", () => {
 
     const { orch, sent } = makeOrch({ enabled: true });
     (orch as any).injectTurn = async (_t: unknown, prompt: string, opts: InjectTurnOptions) => {
-      expect(prompt).toBe(CONTINUE_PROMPT);
+      expect(prompt.startsWith("continue\n")).toBe(true);
+      expect(prompt).toContain("The session runs on remote-a. This resume does not include that host's git state.");
+      expect(prompt).not.toMatch(/is currently [0-9a-f]{40}/);
+      expect(prompt).not.toContain("do the overnight git push");
       await syntheticStart(opts);
       return { text: "continued after reconciliation", error: undefined, stopReason: "end_turn" };
     };
@@ -706,7 +712,8 @@ describe("watcher recoverStale vs resumeEnabled", () => {
 describe("live-turn re-fire + flag + preconditions", () => {
   it("re-fires via queueOnChannel + handleIncomingMessageInner with text continue", async () => {
     const inner = vi.fn(async (msg: { text: string }) => {
-      expect(msg.text).toBe(CONTINUE_PROMPT);
+      expect(msg.text.startsWith("continue\n")).toBe(true);
+      expect(msg.text).toContain("The process restarted while the turn was in flight.");
     });
     const { orch, announced } = makeOrch({ enabled: true, handleInner: inner });
     await writeLiveMarker(dir, {
@@ -720,7 +727,10 @@ describe("live-turn re-fire + flag + preconditions", () => {
     });
     await orch.recoverInterruptedTurns();
     expect(inner).toHaveBeenCalledTimes(1);
-    expect(announced.some((t) => t.includes("resuming after restart"))).toBe(true);
+    expect(announced.some((t) =>
+      t.includes("resuming after restart") &&
+      t.includes("The process restarted while the turn was in flight.")
+    )).toBe(true);
   });
 
   it("with SEAM_TURN_RESUME_ENABLED=false, markers are reconciled but nothing auto-resumes", async () => {
@@ -779,7 +789,8 @@ describe("live-turn re-fire + flag + preconditions", () => {
 
   it("manual resume from workflows works even when the flag is off", async () => {
     const inner = vi.fn(async (msg: { text: string }) => {
-      expect(msg.text).toBe(CONTINUE_PROMPT);
+      expect(msg.text.startsWith("continue\n")).toBe(true);
+      expect(msg.text).toContain("The process restarted while the turn was in flight.");
     });
     const { orch } = makeOrch({ enabled: false, handleInner: inner });
     await writeLiveMarker(dir, {

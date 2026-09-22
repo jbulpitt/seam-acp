@@ -261,9 +261,12 @@ describe("#466 scheduled execution boundary", () => {
     expect(h.remoteSpawn).toHaveBeenCalledTimes(2);
     expect(h.calls.news).toHaveLength(1);
     expect(h.calls.loads).toEqual([expect.objectContaining({ sessionId: "scheduled-acp", cwd: h.cwd })]);
-    expect(h.calls.prompts.map(p => p.prompt)).toEqual([
-      [{ type: "text", text: h.row.promptText }], [{ type: "text", text: "continue" }],
-    ]);
+    const sent = h.calls.prompts.map(p => p.prompt[0].text as string);
+    expect(sent[0]).toBe(h.row.promptText);
+    expect(sent[1]?.startsWith("continue\n")).toBe(true);
+    expect(sent[1]).toContain("The process restarted while the turn was in flight.");
+    expect(sent[1]).toContain(`The session runs on ${REMOTE}. This resume does not include that host's git state.`);
+    expect(sent[1]).not.toContain("ORIGINAL SCHEDULE");
     expect(h.store.turnAttempts.get(key.id)).toMatchObject({ state: "completed", generation: 2, deliveryDone: true });
     expect(h.store.scheduledOccurrences.get(key.id)).toMatchObject({ settled: true, execution: { location: REMOTE } });
     expect(h.hub.rpc).toHaveBeenCalledTimes(1);

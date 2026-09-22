@@ -700,7 +700,11 @@ describe("#246 isolated ingest owns every terminal transition", () => {
     await expect(resumed.dispatchInjectTurn({ ...spec, resume: true })).resolves.toMatchObject({
       stopReason: "end_turn",
     });
-    expect(seen).toEqual([{ prompt: "continue", resumeSessionId: "acp-ingest-recorded" }]);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.prompt.startsWith("continue\n")).toBe(true);
+    expect(seen[0]?.prompt).toContain("The process restarted while the turn was in flight.");
+    expect(seen[0]?.prompt).not.toContain("synthetic original input");
+    expect(seen[0]?.resumeSessionId).toBe("acp-ingest-recorded");
     await expect(pending).resolves.toEqual({ answer: 9 });
     expect(store.getChoiceResult(spec.id)).toMatchObject({ status: "ok", body: { answer: 9 } });
     expect(store.getDelegation(spec.id)?.status).toBe("completed");
@@ -749,7 +753,11 @@ describe("#246 isolated ingest owns every terminal transition", () => {
     };
     await expect(restarted.dispatchInjectTurn({ ...spec, resume: true }))
       .resolves.toMatchObject({ stopReason: "end_turn" });
-    expect(seen).toEqual([{ prompt: "continue", resumeSessionId: "acp-claude-recorded" }]);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.prompt.startsWith("continue\n")).toBe(true);
+    expect(seen[0]?.prompt).toContain("The process restarted while the turn was in flight.");
+    expect(seen[0]?.prompt).not.toContain("synthetic original input");
+    expect(seen[0]?.resumeSessionId).toBe("acp-claude-recorded");
     expect(store.getDelegation(spec.id)?.status).toBe("completed");
     expect(store.turnAttempts.get(spec.id)).toMatchObject({
       state: "completed",

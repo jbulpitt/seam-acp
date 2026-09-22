@@ -79,7 +79,10 @@ describe("#441 real orchestrator consumer with fake ACP", () => {
       expect(prompt, lines.join("\n")).toHaveBeenCalledTimes(mode === "changed-kind" ? 2 : mode === "exhausted" ? 4 : 3);
       expect(messages.some(text => text.startsWith("Recovery:"))).toBe(true);
       if (mode.endsWith("output")) {
-        expect(prompt.mock.calls[1]![0]).toMatchObject({ sessionId: "fixture-acp", prompt: [{ type: "text", text: "continue" }] });
+        const continued = (prompt.mock.calls[1]![0] as { prompt: Array<{ text: string }> }).prompt[0]!.text;
+        expect(continued.startsWith("continue\n")).toBe(true);
+        expect(continued).toContain("claude reported rate_limit.");
+        expect(messages.some(text => text.includes("claude reported rate_limit."))).toBe(true);
         expect(messages.some(text => text.includes("continuing the existing conversation"))).toBe(true);
       }
       const resolution = lines.map((line) => JSON.parse(line)).find((line) => line.msg === "turn recovery resolved")?.resolution;

@@ -146,7 +146,9 @@ describe("#250 human turn production pipeline, synthetic transport only", () => 
     expect(h.adapter.sendMessage).not.toHaveBeenCalled();
     h.runtime.prompt.mockImplementationOnce(async () => { await h.emit("final answer"); return { stopReason: "end_turn" }; });
     await h.run(h.make());
-    expect(h.runtime.prompt.mock.calls[1]?.[0]).toBe("continue");
+    expect(String(h.runtime.prompt.mock.calls[1]?.[0]).startsWith("continue\n")).toBe(true);
+    expect(String(h.runtime.prompt.mock.calls[1]?.[0])).toContain("The process restarted while the turn was in flight.");
+    expect(String(h.runtime.prompt.mock.calls[1]?.[0])).not.toContain("NEW NEVER-SUBMITTED");
     expect(h.router.getOrStartRuntime.mock.calls.at(-1)?.[1]).toEqual({ resumeSessionId: "recorded-acp" });
     expect(h.store.turnAttempts.get("inbound-1")).toMatchObject({ state: "completed", generation: 2, deliveryDone: true });
     expect(await listLiveMarkers(h.dir)).toEqual([]);

@@ -179,19 +179,23 @@ describe("#530 composed thread work progress", () => {
     host.setDispatchWatcher(watcher);
 
     const running = watcher.start();
-    await entered.promise;
-    expect(host.inspectThreadWorkProgress(TARGET)).toMatchObject({
-      state: "running",
-      progressing: true,
-      runtimeBusy: false,
-      runningDispatchIds: ["isolated-running"],
-      watcherOwnedDispatchIds: ["isolated-running"],
-    });
-
-    release.resolve();
-    watcher.stop();
-    await running;
-    await watcher.drain();
+    try {
+      await entered.promise;
+      expect(host.inspectThreadWorkProgress(TARGET)).toMatchObject({
+        state: "running",
+        progressing: true,
+        runtimeBusy: false,
+        runningDispatchIds: ["isolated-running"],
+        watcherOwnedDispatchIds: ["isolated-running"],
+      });
+    } finally {
+      // Keep a failed assertion from stranding the real watcher callback. This
+      // also makes the mutation proof fail as an assertion, not as a timeout.
+      release.resolve();
+      watcher.stop();
+      await running;
+      await watcher.drain();
+    }
   });
 
   it("reports a pending pile blocked by a prompted retained attempt without changing either row", () => {

@@ -235,6 +235,19 @@ const server = http.createServer(async (request, response) => {
   if (request.url?.endsWith("/StreamAgentStateUpdates") && trace) {
     response.statusCode = 200;
     response.setHeader("content-type", "application/connect+json");
+    if (prompt === "r5-turn-auth-exit" || prompt === "r5-turn-unknown-exit") {
+      // #491: the real incident emitted a message before the nested `agy -p`
+      // child exited. Keep the stream open after one real update so the child
+      // exit—not a synthetic response error—is what ends the production path.
+      await writeFragmented(response, envelope(0, { update: trace.updates[0] }));
+      setTimeout(() => {
+        process.stderr.write(prompt === "r5-turn-auth-exit"
+          ? `Verification required. Authorization: Bearer synthetic-secret-token-491 ${process.env.HOME}\n`
+          : `future AGY child failure synthetic-secret-token-491 ${process.env.HOME}\n`);
+        process.exit(prompt === "r5-turn-auth-exit" ? 41 : 52);
+      }, 75);
+      return;
+    }
     if (prompt.startsWith("r5-stream-")) {
       if (!schemaFile) process.stdout.write("STDOUT ONLY ");
       if (prompt === "r5-stream-partial") {

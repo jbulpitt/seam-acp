@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach } from "vitest";
+import { describe, it, expect } from "vitest";
 import {
   CHANNEL_OBFUSCATED_FLAG,
   DISCORD_HIDDEN_CHANNEL_NAME,
@@ -43,14 +43,10 @@ describe("channel obfuscation (#52)", () => {
 });
 
 describe("DISCORD_ALLOWED_CHANNEL_IDS (#52 — IDs only, no guild enumeration)", () => {
-  const saved = { ...process.env };
-  afterEach(() => {
-    process.env = { ...saved };
-  });
+  let env: Record<string, string | undefined>;
 
   function baseEnv(extra: Record<string, string | undefined>) {
-    process.env = {
-      ...saved,
+    env = {
       DISCORD_BOT_TOKEN: "test-token",
       DISCORD_ALLOWED_USER_IDS: "123",
       REPOS_ROOT: process.cwd(),
@@ -61,7 +57,7 @@ describe("DISCORD_ALLOWED_CHANNEL_IDS (#52 — IDs only, no guild enumeration)",
 
   it("parses a comma-separated numeric id list (never names)", () => {
     baseEnv({ DISCORD_ALLOWED_CHANNEL_IDS: "111, 222 " });
-    const set = loadConfig().DISCORD_ALLOWED_CHANNEL_IDS;
+    const set = loadConfig({ env }).DISCORD_ALLOWED_CHANNEL_IDS;
     expect(set).toBeInstanceOf(Set);
     expect(set?.has("111")).toBe(true);
     expect(set?.has("222")).toBe(true);
@@ -69,11 +65,11 @@ describe("DISCORD_ALLOWED_CHANNEL_IDS (#52 — IDs only, no guild enumeration)",
 
   it("rejects a channel name (including the obfuscation sentinel)", () => {
     baseEnv({ DISCORD_ALLOWED_CHANNEL_IDS: DISCORD_HIDDEN_CHANNEL_NAME });
-    expect(() => loadConfig()).toThrow(/DISCORD_ALLOWED_CHANNEL_IDS/);
+    expect(() => loadConfig({ env })).toThrow(/DISCORD_ALLOWED_CHANNEL_IDS/);
   });
 
   it("unset ⇒ undefined (no guild-wide channel listing)", () => {
     baseEnv({ DISCORD_ALLOWED_CHANNEL_IDS: undefined });
-    expect(loadConfig().DISCORD_ALLOWED_CHANNEL_IDS).toBeUndefined();
+    expect(loadConfig({ env }).DISCORD_ALLOWED_CHANNEL_IDS).toBeUndefined();
   });
 });

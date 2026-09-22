@@ -305,37 +305,27 @@ describe("#474 SessionRouter: copilot@fhr-server still plans; copilot@local does
 });
 
 describe("#474 DEFAULT_AGENT denied at local refuses boot", () => {
-  const saved = { ...process.env };
-  afterEach(() => {
-    process.env = { ...saved };
-  });
+  let env: Record<string, string | undefined>;
 
   function baseEnv(extra: Record<string, string | undefined>) {
-    const env = {
-      ...saved,
+    env = {
       DISCORD_BOT_TOKEN: "test-token",
       DISCORD_ALLOWED_USER_IDS: "123",
       REPOS_ROOT: repoRoot,
-    } as NodeJS.ProcessEnv;
-    delete env.CHANNEL_PRESETS_FILE;
-    delete env.AGENT_LOCATION_DENY;
-    for (const [key, value] of Object.entries(extra)) {
-      if (value === undefined) delete env[key];
-      else env[key] = value;
-    }
-    process.env = env;
+      ...extra,
+    };
   }
 
   it("refuses DEFAULT_AGENT=copilot when copilot@local is denied", () => {
     baseEnv({ DEFAULT_AGENT: "copilot", AGENT_LOCATION_DENY: "copilot@local" });
-    expect(() => loadConfig()).toThrow(/AGENT_LOCATION_DENY/);
-    expect(() => loadConfig()).toThrow(/will not substitute one for you/);
-    expect(() => loadConfig()).not.toThrow(/\/seam config agent/);
+    expect(() => loadConfig({ env })).toThrow(/AGENT_LOCATION_DENY/);
+    expect(() => loadConfig({ env })).toThrow(/will not substitute one for you/);
+    expect(() => loadConfig({ env })).not.toThrow(/\/seam config agent/);
   });
 
   it("accepts DEFAULT_AGENT=claude with copilot@local denied", () => {
     baseEnv({ DEFAULT_AGENT: "claude", AGENT_LOCATION_DENY: "copilot@local" });
-    const cfg = loadConfig();
+    const cfg = loadConfig({ env });
     expect(cfg.DEFAULT_AGENT).toBe("claude");
     expect(cfg.AGENT_LOCATION_DENY).toEqual([{ agentId: "copilot", location: "local" }]);
   });

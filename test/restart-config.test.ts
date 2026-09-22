@@ -1,16 +1,11 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { loadConfig } from "../packages/core/src/config.js";
 
 describe("RESTART_DRAIN_TIMEOUT_MS", () => {
-  const saved = { ...process.env };
-
-  afterEach(() => {
-    process.env = { ...saved };
-  });
+  let env: Record<string, string | undefined>;
 
   function baseEnv(value?: string) {
-    process.env = {
-      ...saved,
+    env = {
       DISCORD_BOT_TOKEN: "test-token",
       DISCORD_ALLOWED_USER_IDS: "123",
       REPOS_ROOT: process.cwd(),
@@ -21,11 +16,11 @@ describe("RESTART_DRAIN_TIMEOUT_MS", () => {
 
   it("defaults to fifteen minutes", () => {
     baseEnv(undefined);
-    expect(loadConfig().RESTART_DRAIN_TIMEOUT_MS).toBe(900_000);
+    expect(loadConfig({ env }).RESTART_DRAIN_TIMEOUT_MS).toBe(900_000);
   });
 
   it("accepts an operator override", () => {
     baseEnv("1234");
-    expect(loadConfig().RESTART_DRAIN_TIMEOUT_MS).toBe(1_234);
+    expect(loadConfig({ env }).RESTART_DRAIN_TIMEOUT_MS).toBe(1_234);
   });
 });

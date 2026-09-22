@@ -11,7 +11,7 @@ import { PassThrough } from "node:stream";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { pino } from "pino";
 import type { AgentProfile } from "@seam/adapters";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
@@ -140,24 +140,21 @@ describe("#220 ollama-cloud is parked, not deleted", () => {
   });
 
   it("keeps OLLAMA_CLOUD_* keys in the parsed config schema", () => {
-    const saved = { ...process.env };
-    process.env = {
-      ...saved,
+    const env = {
       DISCORD_BOT_TOKEN: "test-token",
       DISCORD_ALLOWED_USER_IDS: "123",
       REPOS_ROOT: repoRoot,
-      CHANNEL_PRESETS_FILE: undefined,
       OLLAMA_CLOUD_ENABLED: "false",
-    } as NodeJS.ProcessEnv;
-    try {
-      const cfg = loadConfig() as unknown as Record<string, unknown>;
-      expect(cfg.OLLAMA_CLOUD_ENABLED).toBe(false);
-      expect("OLLAMA_CLOUD_API_KEY" in cfg).toBe(true);
-      expect("OLLAMA_CLOUD_DEFAULT_MODEL" in cfg).toBe(true);
-      expect("OLLAMA_USAGE_CLI_PATH" in cfg).toBe(true);
-    } finally {
-      process.env = saved;
-    }
+      // #495: optional-key presence formerly relied on the operator's .env.
+      // Supply inert values explicitly; no provider or executable is invoked.
+      OLLAMA_CLOUD_API_KEY: "fixture-key",
+      OLLAMA_USAGE_CLI_PATH: "/fixture/ollama-usage",
+    };
+    const cfg = loadConfig({ env }) as unknown as Record<string, unknown>;
+    expect(cfg.OLLAMA_CLOUD_ENABLED).toBe(false);
+    expect(cfg.OLLAMA_CLOUD_API_KEY).toBe("fixture-key");
+    expect("OLLAMA_CLOUD_DEFAULT_MODEL" in cfg).toBe(true);
+    expect(cfg.OLLAMA_USAGE_CLI_PATH).toBe("/fixture/ollama-usage");
   });
 });
 
@@ -481,14 +478,10 @@ describe("#220 linkworks-ollama is gated on the same flag", () => {
 });
 
 describe("#220 DEFAULT_AGENT while parked", () => {
-  const saved = { ...process.env };
-  afterEach(() => {
-    process.env = { ...saved };
-  });
+  let env: Record<string, string | undefined>;
 
   function baseEnv(extra: Record<string, string | undefined>) {
-    process.env = {
-      ...saved,
+    env = {
       DISCORD_BOT_TOKEN: "test-token",
       DISCORD_ALLOWED_USER_IDS: "123",
       REPOS_ROOT: repoRoot,
@@ -499,9 +492,9 @@ describe("#220 DEFAULT_AGENT while parked", () => {
 
   it("refuses to boot when DEFAULT_AGENT names parked ollama-cloud", () => {
     baseEnv({ DEFAULT_AGENT: OLLAMA_CLOUD_AGENT_ID, OLLAMA_CLOUD_ENABLED: "false" });
-    expect(() => loadConfig()).toThrow(/DEFAULT_AGENT="ollama-cloud"/);
-    expect(() => loadConfig()).toThrow(/parked/);
-    expect(() => loadConfig()).toThrow(OLLAMA_CLOUD_ENABLE_FLAG);
-    expect(() => loadConfig()).not.toThrow(/is retired:/);
+    expect(() => loadConfig({ env })).toThrow(/DEFAULT_AGENT="ollama-cloud"/);
+    expect(() => loadConfig({ env })).toThrow(/parked/);
+    expect(() => loadConfig({ env })).toThrow(OLLAMA_CLOUD_ENABLE_FLAG);
+    expect(() => loadConfig({ env })).not.toThrow(/is retired:/);
   });
 });

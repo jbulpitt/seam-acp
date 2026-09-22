@@ -77,6 +77,12 @@ import {
 
 const AGY_AGENT_ID = "agy";
 
+export const AGY_MCP_HOME_ROOT = path.join(os.tmpdir(), "seam-agy-homes");
+const AGY_MCP_HOME_OWNER_FILE = ".seam-owner-pid";
+const AGY_MCP_HOME_SWEEP_MAX_HOMES = 1_024;
+const AGY_MCP_HOME_SWEEP_MAX_ENTRIES = 32_768;
+const AGY_MCP_HOME_SWEEP_MAX_MS = 5_000;
+
 function agyKindFromCode(code: string): AdapterErrorKind {
   switch (code) {
     case "exited_early":
@@ -287,46 +293,263 @@ export function scrubStaleGlobalSeamStdio(configPath = REAL_MCP_CONFIG): boolean
 export async function prepareAgyMcpHome(
   _sessionId: string,
   servers: McpServer[],
-  realGemini = REAL_GEMINI
+  realGemini = REAL_GEMINI,
+  base = AGY_MCP_HOME_ROOT,
 ): Promise<string | undefined> {
   // Empty means NO MCP, not inherit the host's tools. Unique homes also prevent
   // a resumed runtime's config being deleted by its predecessor's disposal.
-  const base = path.join(os.tmpdir(), "seam-agy-homes");
   await fs.mkdir(base, { recursive: true, mode: 0o700 });
+  await fs.chmod(base, 0o700);
   const home = await fs.mkdtemp(path.join(base, "session-"));
   try {
-  const gemini = path.join(home, ".gemini");
-  const cfgDir = path.join(gemini, "config");
-  await fs.mkdir(cfgDir, { recursive: true, mode: 0o700 });
-  await fs.chmod(home, 0o700);
-  await fs.chmod(gemini, 0o700);
-  await fs.chmod(cfgDir, 0o700);
-  try {
-    const ents = await fs.readdir(realGemini, { withFileTypes: true });
-    for (const ent of ents) {
-      if (ent.name === "config") continue;
-      const dest = path.join(gemini, ent.name);
-      try {
-        await fs.lstat(dest);
-      } catch {
-        await fs.symlink(path.join(realGemini, ent.name), dest);
+    // A bridge and the controller may share a host. The startup sweep uses this
+    // marker to retain another still-running process's session HOME; without it,
+    // recovering one process could break the other's cross-session MCP config.
+    await fs.writeFile(path.join(home, AGY_MCP_HOME_OWNER_FILE), `${process.pid}\n`, {
+      encoding: "utf8",
+      mode: 0o600,
+    });
+    const gemini = path.join(home, ".gemini");
+    const cfgDir = path.join(gemini, "config");
+    await fs.mkdir(cfgDir, { recursive: true, mode: 0o700 });
+    await fs.chmod(home, 0o700);
+    await fs.chmod(gemini, 0o700);
+    await fs.chmod(cfgDir, 0o700);
+    try {
+      const ents = await fs.readdir(realGemini, { withFileTypes: true });
+      for (const ent of ents) {
+        if (ent.name === "config") continue;
+        const dest = path.join(gemini, ent.name);
+        try {
+          await fs.lstat(dest);
+        } catch {
+          await fs.symlink(path.join(realGemini, ent.name), dest);
+        }
       }
+    } catch {
+      /* no real ~/.gemini */
     }
-  } catch {
-    /* no real ~/.gemini */
-  }
-  try {
-    await fs.copyFile(path.join(realGemini, "config", "config.json"), path.join(cfgDir, "config.json"));
-  } catch {
-    /* optional userSettings */
-  }
-  await fs.writeFile(path.join(cfgDir, "mcp_config.json"), `${buildAgyMcpConfigJson(servers)}\n`, { mode: 0o600 });
-  return home;
+    try {
+      await fs.copyFile(path.join(realGemini, "config", "config.json"), path.join(cfgDir, "config.json"));
+    } catch {
+      /* optional userSettings */
+    }
+    await fs.writeFile(path.join(cfgDir, "mcp_config.json"), `${buildAgyMcpConfigJson(servers)}\n`, { mode: 0o600 });
+    return home;
   } catch {
     // A failed MCP config write must not leave a credential-bearing temp HOME.
     await fs.rm(home, { recursive: true, force: true });
     throw agyFailure("spawn_failed");
   }
+}
+
+export interface AgyMcpHomeSweepResult {
+  examinedHomes: number;
+  removedHomes: number;
+  retainedActiveHomes: number;
+  failedHomes: number;
+  visitedEntries: number;
+  bounded: boolean;
+}
+
+interface AgyMcpHomeSweepBudget {
+  remainingEntries: number;
+  deadline: number;
+  visitedEntries: number;
+  bounded: boolean;
+}
+
+function agyMcpHomeSweepHasBudget(budget: AgyMcpHomeSweepBudget): boolean {
+  if (budget.remainingEntries <= 0 || Date.now() >= budget.deadline) {
+    budget.bounded = true;
+    return false;
+  }
+  return true;
+}
+
+function agyMcpHomeOwnerIsAlive(pid: number): boolean {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== "ESRCH";
+  }
+}
+
+async function agyMcpHomeHasLiveOwner(home: string): Promise<boolean> {
+  try {
+    const raw = await fs.readFile(path.join(home, AGY_MCP_HOME_OWNER_FILE), "utf8");
+    return agyMcpHomeOwnerIsAlive(Number(raw.trim()));
+  } catch {
+    // Homes created before #493 have no marker. At process startup they are
+    // crash/test residue, so they remain eligible for the bounded legacy sweep.
+    return false;
+  }
+}
+
+async function removeAgyMcpHomeTree(
+  directory: string,
+  budget: AgyMcpHomeSweepBudget,
+): Promise<"removed" | "bounded" | "failed"> {
+  if (!agyMcpHomeSweepHasBudget(budget)) return "bounded";
+
+  let handle: Awaited<ReturnType<typeof fs.opendir>>;
+  try {
+    handle = await fs.opendir(directory);
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT" ? "removed" : "failed";
+  }
+
+  let status: "removed" | "bounded" | "failed" = "removed";
+  try {
+    while (true) {
+      if (!agyMcpHomeSweepHasBudget(budget)) {
+        status = "bounded";
+        break;
+      }
+      let entry;
+      try {
+        entry = await handle.read();
+      } catch {
+        status = "failed";
+        break;
+      }
+      if (!entry) break;
+      budget.remainingEntries -= 1;
+      budget.visitedEntries += 1;
+      const child = path.join(directory, entry.name);
+      let directoryEntry = entry.isDirectory();
+      if (!directoryEntry && !entry.isFile() && !entry.isSymbolicLink()) {
+        try {
+          directoryEntry = (await fs.lstat(child)).isDirectory();
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+          status = "failed";
+          break;
+        }
+      }
+      if (directoryEntry) {
+        status = await removeAgyMcpHomeTree(child, budget);
+        if (status !== "removed") break;
+        continue;
+      }
+      try {
+        // Symlinks are unlinked, never followed: provider credentials remain
+        // on the real Gemini tree while this reference point disappears.
+        await fs.unlink(child);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+          status = "failed";
+          break;
+        }
+      }
+    }
+  } finally {
+    await handle.close().catch(() => {});
+  }
+
+  if (status !== "removed") return status;
+  try {
+    await fs.rmdir(directory);
+    return "removed";
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT" ? "removed" : "failed";
+  }
+}
+
+/**
+ * Remove AGY session HOMEs orphaned by a prior process. This startup recovery
+ * is independently bounded by home count, tree-entry count, and wall time: a
+ * corrupt/pathological temp tree may leave residue for the next boot, but it
+ * cannot hold adapter startup open without limit. Live owner markers are kept.
+ */
+export async function sweepAgyMcpHomes(options: {
+  root?: string;
+  maxHomes?: number;
+  maxEntries?: number;
+  maxMs?: number;
+} = {}): Promise<AgyMcpHomeSweepResult> {
+  const root = options.root ?? AGY_MCP_HOME_ROOT;
+  const maxHomes = Math.max(1, Math.trunc(options.maxHomes ?? AGY_MCP_HOME_SWEEP_MAX_HOMES));
+  const maxEntries = Math.max(1, Math.trunc(options.maxEntries ?? AGY_MCP_HOME_SWEEP_MAX_ENTRIES));
+  const maxMs = Math.max(1, Math.trunc(options.maxMs ?? AGY_MCP_HOME_SWEEP_MAX_MS));
+  const result: AgyMcpHomeSweepResult = {
+    examinedHomes: 0,
+    removedHomes: 0,
+    retainedActiveHomes: 0,
+    failedHomes: 0,
+    visitedEntries: 0,
+    bounded: false,
+  };
+  const budget: AgyMcpHomeSweepBudget = {
+    remainingEntries: maxEntries,
+    deadline: Date.now() + maxMs,
+    visitedEntries: 0,
+    bounded: false,
+  };
+
+  let rootStat;
+  try {
+    rootStat = await fs.lstat(root);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return result;
+    result.failedHomes = 1;
+    return result;
+  }
+  // Never follow a substituted root. Refuse only this cleanup pass; AGY
+  // session creation and every other adapter remain available.
+  if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) {
+    result.failedHomes = 1;
+    return result;
+  }
+
+  let handle: Awaited<ReturnType<typeof fs.opendir>>;
+  try {
+    handle = await fs.opendir(root);
+  } catch {
+    result.failedHomes = 1;
+    return result;
+  }
+  try {
+    while (true) {
+      if (!agyMcpHomeSweepHasBudget(budget)) break;
+      let entry;
+      try {
+        entry = await handle.read();
+      } catch {
+        result.failedHomes += 1;
+        break;
+      }
+      if (!entry) break;
+      budget.remainingEntries -= 1;
+      budget.visitedEntries += 1;
+      if (!entry.name.startsWith("session-")) continue;
+      if (!entry.isDirectory()) {
+        result.failedHomes += 1;
+        continue;
+      }
+      if (result.examinedHomes >= maxHomes) {
+        budget.bounded = true;
+        break;
+      }
+      result.examinedHomes += 1;
+      const home = path.join(root, entry.name);
+      if (await agyMcpHomeHasLiveOwner(home)) {
+        result.retainedActiveHomes += 1;
+        continue;
+      }
+      const removed = await removeAgyMcpHomeTree(home, budget);
+      if (removed === "removed") result.removedHomes += 1;
+      else if (removed === "failed") result.failedHomes += 1;
+      else break;
+    }
+  } finally {
+    await handle.close().catch(() => {});
+  }
+  result.visitedEntries = budget.visitedEntries;
+  result.bounded = budget.bounded;
+  return result;
 }
 /**
  * Where we point each spawned `agy`'s `--log-file`. Every turn (and every

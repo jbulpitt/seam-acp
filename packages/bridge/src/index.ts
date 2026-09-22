@@ -51,6 +51,7 @@ import type { IncomingMessage } from "node:http";
 import type { RawData, WebSocket as WsSocket } from "ws";
 import {
   PROTOCOL_VERSION,
+  sweepAgyMcpHomes,
   type AgentAdapter,
 } from "@seam/adapters";
 import { dispatchBridgeRpc, type SlotSpawnConfig } from "./rpc.js";
@@ -714,6 +715,18 @@ function makeSlotManager(opts: {
   return { setWs, handleMessage, drain };
 }
 
+async function sweepAgyHomesAtBridgeStartup(): Promise<void> {
+  // #493: sweep before adapters can admit a session. The sweep is bounded and
+  // fail-open: residue may remain, but it cannot make this host unavailable.
+  const result = await sweepAgyMcpHomes();
+  if (result.removedHomes > 0) {
+    console.error(`[bridge] Removed ${result.removedHomes} orphaned AGY session HOME(s)`);
+  }
+  if (result.bounded || result.failedHomes > 0) {
+    console.error("[bridge] AGY session HOME sweep incomplete; residue retained for a later boot");
+  }
+}
+
 async function runClientMode(
   wsUrl: string,
   token: string,
@@ -722,6 +735,7 @@ async function runClientMode(
   bridgeOpts: { bridgeId: string; devMode: boolean; workspaceRoot: string }
 ) {
   const { WebSocket } = await loadWs();
+  await sweepAgyHomesAtBridgeStartup();
   const { adapters, adapterRefusals } = loadHostAdapterInventory(copilotCmd, { cwd: localCwd });
   const releaseReceipt = await createReleaseReceiptWriter({ bridgeId: bridgeOpts.bridgeId, instanceId: BRIDGE_INSTANCE_ID, protocolVersion: PROTOCOL_VERSION, adapterRefusals });
   const mgr = makeSlotManager({
@@ -807,6 +821,8 @@ async function runServerMode(
   bridgeOpts: { bridgeId: string; devMode: boolean; workspaceRoot: string }
 ) {
   const { WebSocket, WebSocketServer } = await loadWs();
+  // Server mode is a separate bridge startup path and owns the same temp root.
+  await sweepAgyHomesAtBridgeStartup();
   const { adapters, adapterRefusals } = loadHostAdapterInventory(copilotCmd, { cwd: localCwd });
   const releaseReceipt = await createReleaseReceiptWriter({ bridgeId: bridgeOpts.bridgeId, instanceId: BRIDGE_INSTANCE_ID, protocolVersion: PROTOCOL_VERSION, adapterRefusals });
   const mgr = makeSlotManager({

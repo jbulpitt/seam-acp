@@ -378,6 +378,24 @@ describe.sequential("R5 native production lifecycle", () => {
     } finally { await f.close(); }
   }, 15_000);
 
+  it("#493 retains the HOME across a successful turn and removes it when the ACP session runtime ends", async () => {
+    const f = await fixture();
+    let home: string | undefined;
+    try {
+      await expect(f.runtime.prompt("capability-turn-one")).resolves.toMatchObject({ stopReason: "end_turn" });
+      home = f.rows().find(row => row.prompt === "capability-turn-one")?.home;
+      expect(home).toBeTypeOf("string");
+      // A successful prompt is not the end of the ACP session: deleting here
+      // would break the next turn's isolated MCP config and credential links.
+      expect(fs.existsSync(home!)).toBe(true);
+
+      await f.runtime.dispose();
+      expect(fs.existsSync(home!)).toBe(false);
+    } finally {
+      await f.close();
+    }
+  }, 15_000);
+
   it("reaps TERM-resistant descendants before a subsequent prompt starts", async () => {
     const f = await fixture();
     try {

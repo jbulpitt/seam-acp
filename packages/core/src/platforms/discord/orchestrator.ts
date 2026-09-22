@@ -188,11 +188,14 @@ import {
   type RecoveryRender,
 } from "../../core/dispatch/recovery-story.js";
 import {
+  acceptReauthWait,
   isAwaitingReauth,
   parkReauthAttempt,
   ReauthParked,
   reauthWaitNotice,
+  type ReauthPark,
 } from "../../core/reauth-negotiation.js";
+import { reauthAcceptAttemptId, reauthChoiceSpec } from "../../core/reauth-card.js";
 import { readDefaultBranchHead } from "../../core/dispatch/default-branch-head.js";
 import {
   formatConfigAuditView,
@@ -4916,6 +4919,7 @@ export class Orchestrator {
             await this.adapter.sendMessage(channel, reauthWaitNotice(err.park)).catch((noticeErr) => {
               this.logger.warn({ err: noticeErr, session: record.id }, "reauth wait notice failed");
             });
+            await this.postReauthCard(channel.id, humanAttempt.id, err.park);
             this.logger.warn({ session: record.id, attempt: humanAttempt.id }, "turn parked for provider authentication");
             return;
           }
@@ -10102,7 +10106,10 @@ export class Orchestrator {
       } catch (err) {
         if (err instanceof ReauthParked && submittedThisAttempt && lifecycle && !outcomeOwned) {
           const parked = parkReauthAttempt(this.store.turnAttempts, spec.id, err.park);
-          if (parked) throw parked;
+          if (parked) {
+            await this.postReauthCard(spec.target, spec.id, err.park);
+            throw parked;
+          }
         }
         if (!(err instanceof DispatchSuspendedError) && lifecycle && !outcomeOwned) {
           lifecycle.onOutcome({ text: "", error: err instanceof Error ? err.message : String(err) });
@@ -10739,7 +10746,10 @@ export class Orchestrator {
       failure = err;
       if (err instanceof ReauthParked && submittedThisAttempt && lifecycle && !outcomeOwned && attemptStore) {
         const parked = parkReauthAttempt(attemptStore, spec.id, err.park);
-        if (parked) failure = parked;
+        if (parked) {
+          await this.postReauthCard(spec.target, spec.id, err.park);
+          failure = parked;
+        }
       }
       if (!(failure instanceof DispatchSuspendedError) && lifecycle && !outcomeOwned) {
         try {
@@ -12110,6 +12120,7 @@ export class Orchestrator {
               ).catch((noticeErr) => {
                 this.logger.warn({ err: noticeErr, id: attempt.id }, "reauth wait notice failed");
               });
+              await this.postReauthCard(row.channelRef, attempt.id, err.park);
               return;
             }
           }
@@ -12629,7 +12640,7 @@ export class Orchestrator {
     }
     const result = await this.injectTurn(
       record,
-      resume ? (await this.processRestartRender(owned?.attempt ?? attempt!)).prompt : promptText,
+      resume ? (await this.processRestartRender(owned?.stopped ?? owned?.attempt ?? attempt!)).prompt : promptText,
       options,
     );
     return { text: result.text, ...(result.error ? { error: result.error } : {}) };
@@ -22632,6 +22643,96 @@ export class Orchestrator {
     }
   }
 
+  /** Choice card for a parked re-auth. Not an elicitation row. */
+  private async postReauthCard(channelRef: string, attemptId: string, park: ReauthPark): Promise<void> {
+    try {
+      if (!this.adapter.sendChoiceCard) return;
+      const record = this.store.getByChannel(PLATFORM, channelRef)
+        ?? this.router.ensureSessionRecord?.({
+          platform: PLATFORM,
+          channelRef,
+          cwd: this.config.REPOS_ROOT,
+        });
+      if (!record) return;
+      const posted = await this.publishChoiceCard(record, reauthChoiceSpec(attemptId, park));
+      if (!posted.ok) {
+        this.logger.warn({ err: posted.error, attemptId, channelRef }, "reauth card was not posted");
+      }
+    } catch (err) {
+      this.logger.warn({ err, attemptId, channelRef }, "reauth card was not posted");
+    }
+  }
+
+  /**
+   * Accept records authentication and continues the same attempt. The click
+   * does not enqueue a new dispatch.
+   */
+  private async acceptReauthChoice(
+    evt: ChoiceInteraction,
+    card: ChoiceCard,
+    optionIndex: number,
+    attemptId: string,
+  ): Promise<void> {
+    await evt.deferUpdate();
+    const claimed = this.store.claimChoiceClick({
+      choiceId: card.id,
+      userId: evt.userId,
+      userName: evt.userName,
+      optionIndex,
+    });
+    if (!claimed.ok) {
+      const msg =
+        claimed.reason === "already-clicked"
+          ? "You already used this card."
+          : claimed.reason === "exhausted"
+            ? "This card is already taken."
+            : "This card is closed.";
+      await evt.followUpEphemeral(msg).catch(() => {});
+      return;
+    }
+    const story = acceptReauthWait(this.store.turnAttempts, attemptId);
+    const fresh = () => this.store.getChoiceCard(card.id) ?? claimed.card;
+    if (!story) {
+      await evt.followUpEphemeral("This attempt is not waiting for authentication.").catch(() => {});
+      await this.refreshChoiceCard(fresh());
+      return;
+    }
+    const refusal = await this.continueAcceptedReauth(attemptId);
+    await evt.followUpEphemeral(
+      refusal
+        ? `Authentication was recorded. The parked turn did not continue: ${refusal}`
+        : "Continuing the parked turn. The original prompt is not sent again.",
+    ).catch(() => {});
+    await this.refreshChoiceCard(fresh());
+  }
+
+  /** Same executors as operator Resume, after the waiting prefix has been swapped. */
+  private async continueAcceptedReauth(attemptId: string): Promise<string | null> {
+    const attempt = this.store.turnAttempts.get(attemptId);
+    if (!attempt || attempt.state !== "suspended") return "the attempt is not suspended";
+    if (attempt.source === "schedule") {
+      const occurrence = this.store.scheduledOccurrences?.get(attemptId);
+      if (!occurrence) return "no suspended occurrence";
+      void this.runScheduledPrompt(occurrence.scheduleId, occurrence, true).catch((err) => {
+        this.logger.warn({ err, id: attemptId }, "reauth schedule continuation failed");
+      });
+      return null;
+    }
+    if (attempt.source === "inbound") {
+      const messageId = attemptId.startsWith("inbound-") ? attemptId.slice("inbound-".length) : "";
+      const row = messageId ? this.store.getInbound(messageId) : null;
+      if (!row) return "admission is terminal";
+      const pending = this.store.recoverInboundChannel(row.channelRef, new Date().toISOString());
+      if (!pending) return "admission is terminal";
+      await this.startRecoveredInbound(pending);
+      return null;
+    }
+    const stale = (await this.dispatchWatcher?.listStaleRunning()) ?? [];
+    const spec = stale.find((item) => item.id === attemptId);
+    if (!spec) return "no suspended dispatch execution is recorded";
+    return this.requestDispatchContinuation(spec);
+  }
+
   private async handleChoiceCardInteraction(evt: ChoiceInteraction): Promise<void> {
     const parsed = parseChoiceCustomId(evt.customId);
     if (!parsed) return;
@@ -22671,6 +22772,12 @@ export class Orchestrator {
     const option = card.options[optionIndex];
     if (!option) {
       await evt.replyEphemeral("Unknown option.");
+      return;
+    }
+
+    const reauthAttemptId = option.kind === "prompt" ? reauthAcceptAttemptId(option.payload) : null;
+    if (reauthAttemptId) {
+      await this.acceptReauthChoice(evt, card, optionIndex, reauthAttemptId);
       return;
     }
 

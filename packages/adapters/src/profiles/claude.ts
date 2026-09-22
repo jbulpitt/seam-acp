@@ -407,6 +407,7 @@ export function makeClaudeProfile(opts: {
         detached: true,
       });
     },
+    submissionSignals: "claude_sdk",
     newSessionMeta(modelId?: string, effort?: string) {
       const model = modelId || opts.defaultModel;
       const options: Record<string, unknown> = {};
@@ -444,8 +445,12 @@ export function makeClaudeProfile(opts: {
         options.thinking = { type: "adaptive", display: thinkingDisplay };
       }
 
-      if (Object.keys(options).length === 0) return undefined;
-      return { claudeCode: { options } };
+      // #536: use the supported feed, not a wrapper patch. The receiver retains
+      // only lifecycle enums and message IDs; never raw SDK content. These
+      // events do not count as output or change the existing retry heuristic.
+      return { claudeCode: { options,
+        emitRawSDKMessages: [{ type: "command_lifecycle" }, { type: "stream_event" }],
+      } };
     },
     async whoami() {
       if (identityCache !== undefined) return identityCache;

@@ -75,7 +75,9 @@ function fakeRuntime(fallbackCode?: string) {
     onEvent(h: (e: unknown) => void | Promise<void>) {
       handler = h;
     },
-    async prompt() {
+    async prompt(_text?: string, _attachments?: unknown, opts?: any) {
+      if (opts?.submissionEvidence) await handler?.({ kind: "submission-evidence",
+        evidence: { ...opts.submissionEvidence, revision: 1, phase: "rpc_invoked", outcome: "completed" } });
       if (fallbackCode) await handler?.({ kind: "agy-stdout-fallback", code: fallbackCode });
       await handler?.({ kind: "agent-text", text: "done" });
       return { stopReason: "end_turn" };
@@ -175,6 +177,10 @@ describe("#170 dispatchInjectTurn skips an already-ledgered spec", () => {
     await makeOrch(dataDir, store, logger, "unauthenticated").dispatchInjectTurn(spec());
     expect(store.turnAttempts.get("disp-1")).toMatchObject({ state: "completed",
       stdoutFallback: { count: 1, reasons: { unauthenticated: 1 } } });
+    // #536: the ordinary live-dispatch lifecycle must not discard runtime submission evidence.
+    expect(store.turnAttempts.get("disp-1")!.submissions).toMatchObject([
+      { phase: "rpc_invoked", outcome: "completed", acceptance: { state: "unknown" } },
+    ]);
   });
   // #509: deleting the onward-first ordering would hide a failed report-back claim; replay must settle without rerunning the worker.
   it("leaves a failed onward claim unsettled until completion replay succeeds", async () => {

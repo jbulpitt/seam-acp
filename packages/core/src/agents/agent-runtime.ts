@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { Readable, Writable } from "node:stream";
 import { buildRecoveryDirective, runBoundedRecovery } from "../core/recovery-directive.js";
+import { newSubmissionEvidence, observeClaudeSubmission, observePromptWrites, type SubmissionEvidence } from "./submission-evidence.js";
 import {
   negotiateReauth,
   ReauthParked,
@@ -77,6 +78,7 @@ export interface AsyncUserInputQuestion {
 }
 
 export type AgentEvent =
+  | { kind: "submission-evidence"; evidence: SubmissionEvidence }
   | { kind: "agy-stdout-fallback"; code: string }
   | { kind: "recovery"; message: string }
   | { kind: "agent-text"; text: string; messageId?: string }
@@ -385,6 +387,23 @@ export class AgentRuntime {
   private promptInFlight = false;
   /** #404: has the in-flight turn produced any session update yet? */
   private sawUpdateThisTurn = false;
+  private receivingSubmission?: SubmissionEvidence;
+  private readonly submissionSinks = new WeakMap<SubmissionEvidence, AgentEventHandler>();
+  private readonly submissionRequests = new WeakMap<object, SubmissionEvidence>();
+
+  private async publishSubmission(evidence: SubmissionEvidence): Promise<void> {
+    evidence.revision++;
+    try {
+      // Do not touchActivity or drain model notices: telemetry must not change
+      // timeout/retry behavior. Capture the original owner; late write callbacks
+      // may not publish an old receipt through a replacement turn's handler.
+      await this.submissionSinks.get(evidence)?.({ kind: "submission-evidence", evidence: structuredClone(evidence) });
+    } catch {
+      // Evidence failure refuses only this observation, not the user's turn.
+      // Never persist the original exception: it may contain provider content.
+      this.logger.warn({ submissionId: evidence.id }, "submission evidence could not be recorded");
+    }
+  }
   /** Last meaningful runtime activity. The session router uses this only to
    * retire warm, idle processes; it is not durable conversation state. */
   private lastActivityMs = Date.now();
@@ -678,9 +697,23 @@ export class AgentRuntime {
       child.stdout
     ) as unknown as ReadableStream<Uint8Array>;
 
-    const stream = ndJsonStream(writable, readable);
+    const stream = observePromptWrites(ndJsonStream(writable, readable), params => {
+      const evidence = this.submissionRequests.get(params);
+      if (!evidence) return undefined;
+      return async phase => {
+        evidence.phase = phase;
+        if (phase === "local_write_started") evidence.localWriteStartedUtc = new Date().toISOString();
+        else evidence.localWriteCompletedUtc = new Date().toISOString();
+        await this.publishSubmission(evidence);
+      };
+    });
 
     const app = client()
+      .onNotification("_claude/sdkMessage", (params: unknown) => params, async ({ params }) => {
+        const evidence = this.receivingSubmission;
+        if (evidence && this.profile.submissionSignals === "claude_sdk"
+          && observeClaudeSubmission(evidence, params)) await this.publishSubmission(evidence);
+      })
       .onRequest(methods.client.session.requestPermission, ({ params }) =>
         this.permissionPolicy(params)
       )
@@ -959,9 +992,34 @@ export class AgentRuntime {
   async prompt(
     text: string,
     attachments?: ReadonlyArray<MessageAttachment>,
-    opts?: { jsonSchema?: Record<string, unknown>; recoveryScope?: "conversation" | "ephemeral" }
+    opts?: { jsonSchema?: Record<string, unknown>; recoveryScope?: "conversation" | "ephemeral"; submissionEvidence?: SubmissionEvidence }
   ): Promise<PromptOutcome> {
-    return this.withClassifiedErrors("session/prompt", () => this.promptUnclassified(text, attachments, opts), true);
+    const receipt = { submission: opts?.submissionEvidence ?? newSubmissionEvidence(this.sessionId ?? null) };
+    receipt.submission.adapterId = this.profile.id;
+    if (this.eventHandler) this.submissionSinks.set(receipt.submission, this.eventHandler);
+    this.receivingSubmission = undefined;
+    await this.publishSubmission(receipt.submission);
+    try {
+      const result = await this.withClassifiedErrors("session/prompt", () => this.promptUnclassified(receipt, text, attachments, opts), true);
+      receipt.submission.outcome = result.cancelled ? "cancelled" : "completed";
+      return result;
+    } catch (error) {
+      if (receipt.submission.phase === "intent") receipt.submission.outcome = "not_sent";
+      else receipt.submission.outcome = "failed";
+      receipt.submission.failure ??= { kind: readErrorClassification(error)?.errorKind ?? "unclassified" };
+      throw error;
+    } finally {
+      const evidence = receipt.submission;
+      if (evidence.phase === "intent") {
+        evidence.acceptance = { state: "not_accepted", scope: "provider_submission", reason: "rpc_never_invoked" };
+      }
+      evidence.finishedUtc = new Date().toISOString();
+      await this.publishSubmission(evidence);
+      // RPC/transport callbacks populate this field across the await above.
+      const receiving = this.receivingSubmission as SubmissionEvidence | undefined;
+      if (receiving === evidence
+        || receiving?.id === evidence.retry?.previousSubmissionId) this.receivingSubmission = undefined;
+    }
   }
 
   /** #440/#441: one adapter report for each failure escaping the runtime.
@@ -1044,6 +1102,7 @@ export class AgentRuntime {
   }
 
   private async promptUnclassified(
+    receipt: { submission: SubmissionEvidence },
     text: string,
     attachments?: ReadonlyArray<MessageAttachment>,
     opts?: { jsonSchema?: Record<string, unknown>; recoveryScope?: "conversation" | "ephemeral" }
@@ -1125,15 +1184,17 @@ export class AgentRuntime {
       const sendPrompt = (): Promise<{ stopReason: string }> =>
         new Promise<{ stopReason: string }>((resolve, reject) => {
           this.rejectInFlightPrompt = reject;
-          conn.prompt({
+          const params = {
             sessionId: sid,
             // Continue the recorded transcript after any output/tool update;
             // never resend the original brief or attachments for that shape.
-            prompt: continuing ? [{ type: "text", text: this.continuationText }] : prompt,
+            prompt: continuing ? [{ type: "text" as const, text: this.continuationText }] : prompt,
             ...(opts?.jsonSchema
               ? { _meta: { [SEAM_AGY_JSON_SCHEMA_META]: opts.jsonSchema } }
               : {}),
-          }).then(resolve, reject);
+          };
+          this.submissionRequests.set(params, receipt.submission);
+          conn.prompt(params).then(resolve, reject);
         });
 
       // #448: one prompt owner replaces both #404's credential-file gate and
@@ -1143,7 +1204,14 @@ export class AgentRuntime {
       // identity transactions; #467 owns the eventual daemon executor.
       let retryBudget = 0;
       const res = await runBoundedRecovery({
-        run: () => this.withClassifiedErrors("session/prompt", sendPrompt),
+        run: async () => {
+          const evidence = receipt.submission;
+          evidence.phase = "rpc_invoked";
+          evidence.rpcInvokedUtc = new Date().toISOString();
+          this.receivingSubmission = evidence;
+          await this.publishSubmission(evidence);
+          return this.withClassifiedErrors("session/prompt", sendPrompt);
+        },
         signal: recoveryAbort.signal,
         delays: error => {
           const resolution = resolveError(readErrorClassification(error) ?? unclassified(this.profile.id), DEFAULT_ERROR_RULES);
@@ -1151,6 +1219,12 @@ export class AgentRuntime {
             sid.startsWith("dispatch:") || opts?.recoveryScope === "ephemeral" ? "ephemeral" : "conversation");
           this.logger.warn({ sessionId: sid, resolution, directive }, "turn recovery resolved");
           lastErrorKind = resolution.errorKind;
+          const evidence = receipt.submission;
+          evidence.failure = { kind: resolution.errorKind };
+          evidence.outcome = "failed";
+          evidence.finishedUtc = new Date().toISOString();
+          // The callback is synchronous policy; publishing is chained by the
+          // subsequent onRetry/finally before any replacement submission.
           const step = directive.steps.find(step => step.rung === 1);
           const schedule = step?.backoffMs.slice(0, step.retryCount) ?? [];
           retryBudget = schedule.length;
@@ -1158,6 +1232,15 @@ export class AgentRuntime {
         },
         onRetry: async (_error, retry, delayMs) => {
           continuing ||= this.sawUpdateThisTurn;
+          await this.publishSubmission(receipt.submission);
+          const previousSubmissionId = receipt.submission.id;
+          const sink = this.submissionSinks.get(receipt.submission);
+          receipt.submission = newSubmissionEvidence(sid, {
+            number: retry, delayMs, mode: continuing ? "continue" : "resend", previousSubmissionId,
+          });
+          receipt.submission.adapterId = this.profile.id;
+          if (sink) this.submissionSinks.set(receipt.submission, sink);
+          await this.publishSubmission(receipt.submission);
           // This owner only executes rung 1. The note and the continuation
           // prompt are the same facts (#451). A retry that resends the
           // original request does not append them to that request.
@@ -1833,6 +1916,11 @@ export class AgentRuntime {
     // #448: receipt of an update selects transcript continuation, NOT refusal.
     // Count suppressed/filtered output too: what ran matters, not what we show.
     this.sawUpdateThisTurn = true;
+    const evidence = this.receivingSubmission;
+    if (evidence && !evidence.observedUpdateTypes.includes(update.sessionUpdate)) {
+      evidence.observedUpdateTypes.push(update.sessionUpdate);
+      void this.publishSubmission(evidence);
+    }
     // Process updates one at a time, in arrival order. See `sessionUpdates`.
     return this.sessionUpdates.run(() => this.handleSessionUpdateInner(update));
   }

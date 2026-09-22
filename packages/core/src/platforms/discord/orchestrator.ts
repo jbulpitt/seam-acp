@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { newSubmissionEvidence, type SubmissionEvidence } from "../../agents/submission-evidence.js";
 import { matchesContextBudget, validContextUsage, type ContextBudgetIdentity, type ContextBudgetObservation } from "../../core/context-budget.js";
 import { promises as fsp } from "node:fs";
 import path from "node:path";
@@ -4117,6 +4118,10 @@ export class Orchestrator {
       const eventHandler = async (event: Parameters<Parameters<typeof activeRuntime.onEvent>[0]>[0]) => {
         if (!this.queueFenceCurrent(queueFence)) return;
         if (!humanOutcomeOwned && !humanCurrent()) return;
+        if (event.kind === "submission-evidence") {
+          if (humanAttempt) this.recordSubmissionEvidence(humanAttempt, event.evidence);
+          return; // Evidence is not progress, model output, or timeout activity.
+        }
         if (event.kind === "agy-stdout-fallback" && humanAttempt) {
           this.recordStdoutFallback(humanAttempt, event.code);
         }
@@ -4599,12 +4604,14 @@ export class Orchestrator {
       //     are intact; keep the session ID so loadSession() resumes context.
       //     getOrStartRuntime will wait up to 44s for the bridge to reconnect.
       let result: PromptOutcome | "timeout";
+      let submissionEvidence: SubmissionEvidence | undefined;
       try {
         this.assertQueueFence(queueFence);
         if (humanAttempt) {
           const beforePromptRefusal = humanRefusal();
           if (beforePromptRefusal) throw beforePromptRefusal;
           this.store.turnAttempts.startPrompt(humanAttempt);
+          submissionEvidence = this.beginSubmissionEvidence(humanAttempt);
           if (scheduledAttempt) this.scheduledActivity?.phase(scheduledAttempt.id, "provider");
           humanPromptSubmitted = true;
           // SQL owns this phase. The file is a recoverable inventory projection.
@@ -4613,7 +4620,7 @@ export class Orchestrator {
           if (afterPromptRefusal) throw afterPromptRefusal;
         }
         result = await raceWithTimeout(
-          activeRuntime.prompt(promptText, promptAttachments),
+          activeRuntime.prompt(promptText, promptAttachments, { submissionEvidence }),
           timeoutMs,
           () => activeRuntime.lastActivityAtMs,
         );
@@ -5656,6 +5663,24 @@ export class Orchestrator {
     }
   }
 
+  private beginSubmissionEvidence(attempt: TurnAttempt): SubmissionEvidence {
+    const evidence = newSubmissionEvidence(attempt.acpSessionId);
+    this.recordSubmissionEvidence(attempt, evidence);
+    return evidence;
+  }
+
+  private recordSubmissionEvidence(attempt: TurnAttempt, evidence: SubmissionEvidence): void {
+    try {
+      if (!this.store.turnAttempts.recordSubmission(attempt, evidence)) {
+        this.logger.warn({ attemptId: attempt.id, submissionId: evidence.id }, "submission evidence not recorded: obsolete snapshot or owner");
+      }
+    } catch {
+      // Refuse only this evidence write. No provider content in diagnostics;
+      // a telemetry outage must not create a failed turn or an extra retry.
+      this.logger.warn({ attemptId: attempt.id, submissionId: evidence.id }, "submission evidence could not be persisted");
+    }
+  }
+
   /**
    * Run one agent turn **programmatically** — no Discord user message behind
    * it. The single primitive every non-user-initiated turn goes through.
@@ -5695,6 +5720,10 @@ export class Orchestrator {
     let budgetRecord: SessionRecord | undefined;
     const handler: AgentEventHandler = async (event) => {
       if (opts.lifecycle && !opts.lifecycle.isCurrent()) return;
+      if (event.kind === "submission-evidence") {
+        opts.lifecycle?.onSubmissionEvidence?.(event.evidence);
+        return;
+      }
       if (event.kind === "agy-stdout-fallback") opts.lifecycle?.onStdoutFallback?.(event.code);
       if (event.kind === "model-changed" && budgetIdentity) {
         budgetIdentity = this.contextIdentityForModel(budgetIdentity, event.modelId);
@@ -5733,11 +5762,12 @@ export class Orchestrator {
     const acquire = <T>(operation: () => Promise<T>): Promise<T> =>
       opts.lifecycle?.acquire ? opts.lifecycle.acquire(operation) : operation();
     const runPrompt = async (rt: AgentRuntime): Promise<PromptOutcome | "timeout"> => {
-      opts.lifecycle?.beforePrompt();
+      const submissionEvidence = opts.lifecycle?.beforePrompt();
       // ACP ids for isolated runtimes are provider-generated, not necessarily
       // `dispatch:` prefixed. Carry isolation explicitly: refuse automatic
       // outward-effect replay while live transcript continuations keep working.
       const promptOptions = { ...(opts.jsonSchema ? { jsonSchema: opts.jsonSchema } : {}),
+        ...(submissionEvidence ? { submissionEvidence } : {}),
         recoveryScope: opts.session === "isolated" ? "ephemeral" as const : "conversation" as const };
       opts.noteActivity?.();
       return opts.timeoutMs === undefined
@@ -9710,6 +9740,7 @@ export class Orchestrator {
       const lifecycle: InjectTurnOptions["lifecycle"] = attempt ? {
         isCurrent: () => !this.restartCutoff && this.store.turnAttempts.isCurrent(attempt),
         onStdoutFallback: code => this.recordStdoutFallback(attempt, code),
+        onSubmissionEvidence: evidence => this.recordSubmissionEvidence(attempt, evidence),
         acquire: async operation => {
           try { return await phase.acquire(operation); }
           catch (err) {
@@ -9737,6 +9768,7 @@ export class Orchestrator {
             this.assertQueueFence(queueFence);
             this.store.turnAttempts.startPrompt(attempt);
             submittedThisAttempt = true;
+            return this.beginSubmissionEvidence(attempt);
           } catch (promptErr) { throw DispatchSuspendedError.from(promptErr, spec.id, "recording prompt submission failed"); }
         },
         onOutcome: (outcome) => {
@@ -10603,6 +10635,7 @@ export class Orchestrator {
           isCurrent: () =>
             !this.restartCutoff && Boolean(attempt && attemptStore.isCurrent(attempt)),
           onStdoutFallback: code => { if (attempt) this.recordStdoutFallback(attempt, code); },
+          onSubmissionEvidence: evidence => { if (attempt) this.recordSubmissionEvidence(attempt, evidence); },
           onRuntime: (pid, providerIdentity) => {
             try {
               if (!attempt) {
@@ -10623,6 +10656,7 @@ export class Orchestrator {
               }
               attemptStore.startPrompt(attempt);
               submittedThisAttempt = true;
+              return this.beginSubmissionEvidence(attempt);
             } catch (promptErr) {
               throw DispatchSuspendedError.from(promptErr, spec.id, "recording prompt submission failed");
             }
@@ -12553,6 +12587,7 @@ export class Orchestrator {
         lifecycle: {
           isCurrent: () => !this.restartCutoff && this.store.turnAttempts.isCurrent(attempt!),
           onStdoutFallback: (code: string) => this.recordStdoutFallback(attempt!, code),
+          onSubmissionEvidence: (evidence: SubmissionEvidence) => this.recordSubmissionEvidence(attempt!, evidence),
           onRuntime: (pid: number | undefined, providerIdentity?: string) => this.store.turnAttempts.bindRuntime(attempt!, pid, providerIdentity),
           beforePrompt: () => {
             if (this.restartCutoff) {
@@ -12561,6 +12596,7 @@ export class Orchestrator {
             }
             this.store.turnAttempts.startPrompt(attempt!); submitted = true;
             this.scheduledActivity?.phase(attempt!.id, "provider");
+            return this.beginSubmissionEvidence(attempt!);
           },
           onOutcome: (outcome: InjectTurnResult) => {
             if (this.restartCutoff) {

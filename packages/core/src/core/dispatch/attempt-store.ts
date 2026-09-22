@@ -1,4 +1,5 @@
 import type Database from "better-sqlite3";
+import type { SubmissionEvidence } from "../../agents/submission-evidence.js";
 import type { DispatchResult, DispatchSpec } from "./types.js";
 import { compareExecutionIdentity } from "./execution-identity.js";
 import { deliveryNonce, type DurableDeliveryPayload } from "./delivery-proof.js";
@@ -71,6 +72,7 @@ export interface TurnAttempt {
   runtimeOwner: ProcessOwner | null;
   /** Absent means unobserved (including old adapters), never proof of health. */
   stdoutFallback?: { count: number; reasons: Record<string, number>; lastUtc: string };
+  submissions?: Array<SubmissionEvidence & { generation: number }>;
   providerIdentity: string | null;
   source: "dispatch" | "inbound" | "schedule";
   deliveryDone: boolean;
@@ -257,7 +259,8 @@ export class TurnAttemptStore {
     // only that new exact shape; do not turn malformed legacy ownership into
     // permission to reclaim (provenDead must still reject unknown ownership).
     const evidenceOnly = runtime && typeof runtime === "object"
-      && Object.keys(runtime).length === 1 && "stdoutFallback" in runtime;
+      && Object.keys(runtime).length > 0
+      && Object.keys(runtime).every(key => key === "stdoutFallback" || key === "submissions");
     return row ? {
       id: row.id, generation: row.generation, ownerBoot: row.owner_boot,
       state: row.state, identity: row.identity, spec: JSON.parse(row.spec_json),
@@ -265,6 +268,7 @@ export class TurnAttemptStore {
       outcome: row.outcome_json ? JSON.parse(row.outcome_json) : null,
       runtimeOwner: evidenceOnly ? null : runtime,
       stdoutFallback: runtime?.stdoutFallback,
+      submissions: runtime?.submissions,
       providerIdentity: row.provider_identity,
       source: row.source, deliveryDone: row.delivery_done === 1,
       deliveryProtocol: row.delivery_protocol === 1,
@@ -365,9 +369,10 @@ export class TurnAttemptStore {
         `runtime reports provider identity ${providerIdentity ?? "(none)"} but the attempt recorded ${a.providerIdentity}`);
     }
     const owner = pid ? processOwner(pid) : null;
-    const stdoutFallback = this.get(a.id)?.stdoutFallback;
+    const { stdoutFallback, submissions } = this.get(a.id)!;
     this.db.prepare("UPDATE turn_attempts SET runtime_json=?, provider_identity=? WHERE id=? AND generation=? AND owner_boot=? AND state='active'")
-      .run(owner || stdoutFallback ? JSON.stringify({ ...owner, ...(stdoutFallback ? { stdoutFallback } : {}) }) : null,
+      .run(owner || stdoutFallback || submissions ? JSON.stringify({ ...owner,
+        ...(stdoutFallback ? { stdoutFallback } : {}), ...(submissions ? { submissions } : {}) }) : null,
         providerIdentity ?? null, a.id, a.generation, a.ownerBoot);
   }
 
@@ -386,7 +391,29 @@ export class TurnAttemptStore {
     };
     return this.db.prepare(`UPDATE turn_attempts SET runtime_json=?
       WHERE id=? AND generation=? AND owner_boot=? AND state='active'`)
-      .run(JSON.stringify({ ...current.runtimeOwner, stdoutFallback }), a.id, a.generation, a.ownerBoot).changes === 1;
+      .run(JSON.stringify({ ...current.runtimeOwner, stdoutFallback,
+        ...(current.submissions ? { submissions: current.submissions } : {}) }), a.id, a.generation, a.ownerBoot).changes === 1;
+  }
+
+  /** #536: extend the existing receipt, never a second synchronized ledger.
+   * A stale callback or older snapshot may not replace a newer submission or
+   * generation. No delivery proof, progress stamp, or retry policy is changed. */
+  recordSubmission(a: TurnAttempt, evidence: SubmissionEvidence): boolean {
+    return this.db.transaction(() => {
+      // Ownership belongs to the fenced UPDATE below, not another precheck.
+      const current = this.get(a.id);
+      const submissions = [...(current?.submissions ?? [])];
+      const index = submissions.findIndex(entry => entry.id === evidence.id);
+      if (index >= 0 && (submissions[index]!.generation !== a.generation
+        || submissions[index]!.revision >= evidence.revision)) return false;
+      const entry = { ...evidence, generation: a.generation };
+      if (index < 0) submissions.push(entry); else submissions[index] = entry;
+      return this.db.prepare(`UPDATE turn_attempts SET runtime_json=?
+        WHERE id=? AND generation=? AND owner_boot=? AND state='active'`)
+        .run(JSON.stringify({ ...current?.runtimeOwner,
+          ...(current?.stdoutFallback ? { stdoutFallback: current.stdoutFallback } : {}), submissions }),
+        a.id, a.generation, a.ownerBoot).changes === 1;
+    })();
   }
 
   assertCurrent(a: TurnAttempt): void {

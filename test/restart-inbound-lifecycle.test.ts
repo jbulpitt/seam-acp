@@ -66,11 +66,25 @@ function setup() {
     authorId: "user", authorIsBot: false, text: "ORIGINAL DISPOSABLE WORK" };
   const run = (host = orch) => (host as any).handleIncomingMessageInner(message) as Promise<void>;
   return { dir, store, started, release, runtime, router, adapter, orch, make, run,
+    evidence: (evidence: unknown) => onEvent({ kind: "submission-evidence", evidence }),
     fallback: (code: string) => onEvent({ kind: "agy-stdout-fallback", code }),
     emit: (text: string) => onEvent({ kind: "agent-text", text }) };
 }
 
 describe("#250 human turn production pipeline, synthetic transport only", () => {
+  // #536: deleting the inbound hook must lose the new snapshot, not silently pass on the initial intent alone.
+  it("records inbound submission observations on the existing receipt", async () => {
+    const h = setup();
+    h.runtime.prompt.mockImplementation((async (...args: any[]) => {
+      const evidence = args[2].submissionEvidence;
+      expect(h.store.turnAttempts.get("inbound-1")!.submissions).toMatchObject([{ id: evidence.id, phase: "intent" }]);
+      await h.evidence({ ...evidence, revision: 1, phase: "rpc_invoked", outcome: "completed" });
+      return { stopReason: "end_turn" };
+    }) as any);
+    await h.run();
+    expect(h.store.turnAttempts.get("inbound-1")).toMatchObject({ state: "completed",
+      submissions: [{ phase: "rpc_invoked", outcome: "completed", acceptance: { state: "unknown" } }] });
+  });
   it("#545 records an inbound fallback without changing successful settlement", async () => {
     const h = setup();
     h.runtime.prompt.mockImplementation(async () => {

@@ -202,6 +202,8 @@ export interface AgentAdapter {
    * during resume and can leave a restored session without callable tools.
    */
   readonly mcpServersAtSpawn?: boolean;
+  /** Supported, opt-in SDK feed. Absent is explicitly unknown, never rejection. */
+  readonly submissionSignals?: "claude_sdk";
 
   /**
    * How this agent exposes reasoning effort, if at all. Drives both the

@@ -15,6 +15,7 @@
  */
 
 import type { AgentProfile } from "@seam/adapters";
+import type { SubmissionEvidence } from "../agents/submission-evidence.js";
 import type { McpServer } from "@agentclientprotocol/sdk";
 import type { AgentEventHandler } from "../agents/agent-runtime.js";
 import type { ISessionManager } from "@seam/adapters";
@@ -122,7 +123,8 @@ export interface InjectTurnOptions {
     onRuntime?(pid: number | undefined, providerIdentity?: string): void;
     /** Observational only: a telemetry failure must not fail a successful turn. */
     onStdoutFallback?(code: string): void;
-    beforePrompt(): void;
+    onSubmissionEvidence?(evidence: SubmissionEvidence): void;
+    beforePrompt(): SubmissionEvidence | void;
     onOutcome(result: InjectTurnResult): void;
     /** Read-only attribution hook before isolated disposal, including failures. */
     onCleanup?(): void;

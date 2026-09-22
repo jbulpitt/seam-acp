@@ -1969,6 +1969,40 @@ describe("SeamMcpServer", () => {
     expect(text).toContain("does NOT block handoff");
   });
 
+  it("does not invent retained dispatches when the queue is stalled only by unsettled completions (#426)", async () => {
+    h = await makeHarness({
+      listThreads: async () => [{
+        id: "111111111111111111",
+        name: "unsettled worker",
+        isSelf: false,
+        agent: "codex",
+        model: "gpt",
+        effort: null,
+        cwd: "/repo",
+        busy: false,
+        queueState: "stalled",
+        stalledDispatchCount: 0,
+        stalledDispatchIds: [],
+        unsettledDispatchCount: 1,
+        unsettledDispatchIds: ["dispatch-unsettled-1"],
+        status: "active",
+        lastActivityUtc: "2026-09-22T04:49:10.000Z",
+      }],
+    });
+    const { body } = await h.call(
+      "tools/call",
+      { name: "threads", arguments: {} },
+      { "X-Seam-Session": "good-token" }
+    );
+    expect(body.result.isError).toBeFalsy();
+    const text = body.result.content[0].text as string;
+    expect(text).toContain("[idle]");
+    expect(text).toContain("dispatch-unsettled-1");
+    expect(text).toContain("completed but unsettled");
+    expect(text).not.toContain("retained dispatches");
+    expect(text).not.toContain("unknown");
+  });
+
   it("threads renders assigned pre-prompt work as not progressing (#530)", async () => {
     h = await makeHarness({
       listThreads: async () => [{

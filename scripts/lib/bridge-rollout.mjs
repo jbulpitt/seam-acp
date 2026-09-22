@@ -410,7 +410,10 @@ export async function renderRemoteScript(shellTemplatePath, nodeProgramPath) {
   const marker = "__SEAM_BRIDGE_ROLLOUT_NODE_PROGRAM__";
   if (shell.split(marker).length !== 2) throw new Error("remote shell template marker is missing or ambiguous");
   if (program.includes("\nSEAM_REMOTE_NODE\n")) throw new Error("remote node program collides with shell delimiter");
-  return shell.replace(marker, program);
+  // Source is literal, not a replacement template. The report observer's regex
+  // template ends in dollar/backtick; string replacement injected shell source
+  // there and made the actual remote program fail to parse (#504).
+  return shell.replace(marker, () => program);
 }
 
 export async function runPreflight(target, remoteScript, run = commandRunner) {

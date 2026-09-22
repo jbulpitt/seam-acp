@@ -34,7 +34,12 @@ import {
 } from "./core/parked-agents.js";
 import { makeCopilotProfile } from "@seam/adapters";
 import { makeClaudeProfile } from "@seam/adapters";
-import { makeAgyNativeRuntime, makeAgyProfile, scrubStaleGlobalSeamStdio } from "@seam/adapters";
+import {
+  makeAgyNativeRuntime,
+  makeAgyProfile,
+  scrubStaleGlobalSeamStdio,
+  sweepAgyMcpHomes,
+} from "@seam/adapters";
 import { makeCodexProfile } from "@seam/adapters";
 import { buildOllamaCodexCatalog } from "./agents/ollama-codex-catalog.js";
 import { makeGrokProfile, fetchXaiModels } from "@seam/adapters";
@@ -119,6 +124,16 @@ async function main(): Promise<void> {
     },
     "seam-acp starting"
   );
+  // #493: normal disposal removes each session HOME; this bounded startup pass
+  // is only for crash residue. A cap/error leaves some residue for the next
+  // boot while the bot and every adapter continue starting normally.
+  const agyHomeSweep = await sweepAgyMcpHomes();
+  if (agyHomeSweep.removedHomes > 0) {
+    logger.info(agyHomeSweep, "removed orphaned AGY session HOMEs");
+  }
+  if (agyHomeSweep.bounded || agyHomeSweep.failedHomes > 0) {
+    logger.warn(agyHomeSweep, "AGY session HOME sweep incomplete; residue retained for a later boot");
+  }
   // #74: an id in BOTH admin and participant sets is an admin, not a restricted
   // participant. Silently picking one is how a privilege bug hides — name them.
   const adminParticipantOverlap = adminParticipantOverlapIds(config);

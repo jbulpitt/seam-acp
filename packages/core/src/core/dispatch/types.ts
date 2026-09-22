@@ -646,6 +646,42 @@ export async function enqueueDispatchSpec(
   attempts?.admit(spec);
 }
 
+/**
+ * One target thread's composed execution truth (#530).
+ *
+ * `busy` remains the routing answer (interrupt vs inbox). This projection
+ * answers a different question: whether there is positive evidence that work
+ * is past assignment and currently executing. The id buckets are deliberately
+ * explicit so a caller never has to join router, watcher, and SQL state itself.
+ */
+export type ThreadWorkProgressState =
+  | "idle"
+  | "running"
+  | "assigned_not_started"
+  | "active_unobserved"
+  | "blocked"
+  | "queued"
+  | "retained";
+
+export interface ThreadWorkProgress {
+  state: ThreadWorkProgressState;
+  /** Positive execution evidence only: a live router turn, or a watcher-owned
+   * dispatch whose prompt_started bit is durable. Assignment alone is false. */
+  progressing: boolean;
+  runtimeBusy: boolean;
+  runningDispatchIds: string[];
+  assignedNotStartedDispatchIds: string[];
+  activeUnobservedDispatchIds: string[];
+  queuedDispatchIds: string[];
+  retainedDispatchIds: string[];
+  /** Current watcher ownership includes serial-queue waits; it is evidence of
+   * ownership, not by itself evidence that a provider prompt has started. */
+  watcherOwnedDispatchIds: string[];
+  blockedByDispatchIds: string[];
+  /** Age of the oldest non-progressing durable observation, or zero. */
+  ageMs: number;
+}
+
 /** Locate the durable artifact for one exact dispatch id. */
 export async function dispatchArtifactState(
   dataDir: string,

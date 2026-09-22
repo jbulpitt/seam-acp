@@ -586,6 +586,35 @@ export class TurnAttemptStore {
     return (rows as { id: string }[]).map(({ id }) => this.get(id)!);
   }
 
+  /**
+   * Read-only dispatch work for one exact target (#530).
+   *
+   * This query exists so the progress read model can compose durable phase
+   * with live runtime ownership in one place. It changes no lifecycle state:
+   * in particular, an empty owner_boot on `pending` is ordinary admission and
+   * is never reclassified as a dead owner.
+   */
+  listNonterminalDispatches(
+    target: string,
+    onUnreadable: (id: string, err: unknown) => void =
+      (id, err) => console.error("dispatch: unreadable SQL attempt; progress remains partial", id, err)
+  ): TurnAttempt[] {
+    const rows = this.db.prepare(`SELECT id FROM turn_attempts
+      WHERE source='dispatch' AND state IN ('pending','active','suspended')
+        AND json_extract(spec_json, '$.target')=?
+      ORDER BY updated_utc,id`).all(target) as { id: string }[];
+    const attempts: TurnAttempt[] = [];
+    for (const { id } of rows) {
+      try {
+        const attempt = this.get(id);
+        if (attempt) attempts.push(attempt);
+      } catch (err) {
+        onUnreadable(id, err);
+      }
+    }
+    return attempts;
+  }
+
   /** Synchronous cutoff, before any transport/runtime teardown can reject. */
   suspendBoot(ownerBoot: string): number {
     return this.db.prepare(`UPDATE turn_attempts SET state='suspended', updated_utc=?

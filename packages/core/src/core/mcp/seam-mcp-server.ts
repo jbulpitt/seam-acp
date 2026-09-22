@@ -26,7 +26,7 @@ import type { HttpHeader, McpServer } from "@agentclientprotocol/sdk";
 import { formatCatalogEvidence } from "../catalog-evidence-render.js";
 import type { Logger } from "../../lib/logger.js";
 import type { SessionRecord } from "../types.js";
-import type { DispatchSpec } from "../dispatch/types.js";
+import type { DispatchSpec, ThreadWorkProgress } from "../dispatch/types.js";
 import { frameSteerPrompt } from "../steer.js";
 import { formatLocalTime } from "../format-time.js";
 import { buildChainHopSpec } from "../dispatch/types.js";
@@ -173,6 +173,10 @@ export interface ThreadEntry {
   stalledDispatchIds: string[];
   unsettledDispatchCount?: number;
   unsettledDispatchIds?: string[];
+  /** Composite router + watcher + attempt-ledger answer to whether work has
+   * positive execution evidence. Optional for legacy embedders; production
+   * index.ts always supplies it. Separate from `busy`, which remains routing. */
+  workProgress?: ThreadWorkProgress;
   /** Host binding (D10). Omit ⇒ `local`. Rendered as `agentId@location`. */
   location?: string;
   /** Host emoji prefix (local 🏠 + each paired bridge). */
@@ -691,7 +695,9 @@ const TOOLS = [
       "teammate), `isSelf` (true for YOUR OWN thread — never hand off to yourself), the teammate's " +
       "`agent`/`model`/`cwd` (agent is `agentId@location` with host emoji), `status` (active | archived | gone), `lastActivityUtc`, and `busy`. " +
       "`busy` IS LOAD-BEARING for choosing HOW to reach a teammate: it includes admitted channel work even " +
-      "when the ACP runtime is idle. `queueState` distinguishes runtime_busy, queued, wedged, and stalled. `stalled` means " +
+      "when the ACP runtime is idle. `workProgress` separately composes router, watcher and durable attempt evidence " +
+      "to answer whether work is actually executing; assigned_not_started is explicitly not progress. `queueState` " +
+      "distinguishes runtime_busy, queued, wedged, and stalled. `stalled` means " +
       "a retained dispatch is held for `/seam workflows` resume/abandon; its ids are included. It is HOUSEKEEPING, not a health " +
       "verdict: a stalled thread is a perfectly valid handoff target and must never be skipped, routed around, or replaced with a " +
       "cold preset on account of the flag. Dispatch on fit and `busy` alone. To resume work such a thread was carrying, hand off " +
@@ -1741,7 +1747,7 @@ const INSTRUCTIONS = [
   "You are one teammate in a shared workspace of parallel agent threads. These tools let you",
   "coordinate with the others without leaving your own turn:",
   "",
-  "- threads(): list the teammate threads in YOUR channel (id, name, agent/model/effort identity, busy, status). START",
+  "- threads(): list teammate threads plus routing `busy` and composed work progress. START",
   "  HERE for same-channel coordination; `busy` tells you",
   "  HOW to reach a teammate: busy ⇒ prefer send (pull-only, won't interrupt); idle ⇒ handoff/forward land",
   "  a turn cleanly. The entry marked isSelf is YOUR OWN thread — never hand off to it.",
@@ -2770,6 +2776,37 @@ export class SeamMcpServer {
         // Only ever shown when ON — an "off" badge on every idle thread is noise.
         t.fastMode ? "⚡ fast on" : null,
       ].filter(Boolean).join(" / ");
+      const progress = t.workProgress;
+      const progressLine = progress
+        ? progress.state === "idle"
+          ? "\n    work progress: none — no current work"
+          : `\n    work progress: ${progress.progressing ? "observed" : "NOT observed"} (${progress.state}, age ${progress.ageMs}ms)` +
+            (progress.runningDispatchIds.length > 0
+              ? `; running dispatches: ${progress.runningDispatchIds.join(", ")}`
+              : "") +
+            (progress.assignedNotStartedDispatchIds.length > 0
+              ? `; assigned but prompt not submitted: ${progress.assignedNotStartedDispatchIds.join(", ")}`
+              : "") +
+            (progress.activeUnobservedDispatchIds.length > 0
+              ? `; active without live watcher/runtime evidence: ${progress.activeUnobservedDispatchIds.join(", ")}`
+              : "") +
+            (progress.queuedDispatchIds.length > 0
+              ? `; queued: ${progress.queuedDispatchIds.join(", ")}`
+              : "") +
+            (progress.blockedByDispatchIds.length > 0
+              ? `; blocked by prompted retained dispatch: ${progress.blockedByDispatchIds.join(", ")}`
+              : "") +
+            (progress.retainedDispatchIds.length > 0
+              ? `; retained: ${progress.retainedDispatchIds.join(", ")}`
+              : "") +
+            (progress.runningDispatchIds.length +
+              progress.assignedNotStartedDispatchIds.length +
+              progress.activeUnobservedDispatchIds.length +
+              progress.queuedDispatchIds.length +
+              progress.retainedDispatchIds.length > 0
+              ? `; watcher-owned: ${progress.watcherOwnedDispatchIds.join(", ") || "none"}`
+              : "")
+        : "";
       lines.push(
         `• ${name} — id ${t.id} [${flags.join(", ")}]` +
           (cfg ? `\n    identity: ${cfg}${t.cwd ? ` @ ${t.cwd}` : ""}` : "") +
@@ -2783,6 +2820,7 @@ export class SeamMcpServer {
           ((t.unsettledDispatchCount ?? 0) > 0
             ? `\n    ⚠️ completed but unsettled (holding admission): ${(t.unsettledDispatchIds ?? []).join(", ")}; abandon THESE DISPATCH IDS via /seam workflows — do not resume them, they already ran. The thread itself is unaffected and can still take new work.`
             : "") +
+          progressLine +
           `\n    last active ${formatLocalTime(t.lastActivityUtc)}`
       );
     }
@@ -2798,7 +2836,8 @@ export class SeamMcpServer {
     lines.push(
       "",
       "To reach a teammate: use its `id` above. If it is busy, prefer send (pull-only, won't interrupt); " +
-        "if idle, handoff/forward start a turn directly. Retained or unsettled dispatches are bookkeeping " +
+        "if idle, handoff/forward start a turn directly. `work progress` answers execution separately: " +
+        "assigned_not_started and active_unobserved mean no execution progress is proven. Retained or unsettled dispatches are bookkeeping " +
         "only: they NEVER make a thread an invalid target, so choose workers on fit and busy alone. To pick " +
         "up work a thread was carrying, hand off `continue` to it. Prefer a stateful thread over a cold " +
         "preset whenever its context is relevant. Never hand off to the entry marked YOU."

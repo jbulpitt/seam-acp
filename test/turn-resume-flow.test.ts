@@ -443,7 +443,7 @@ describe("command-layer cancel vs dispose / onDead", () => {
 });
 
 describe("watcher recoverStale vs resumeEnabled", () => {
-  it("keeps boot admission closed until a slow resume pass restores thread FIFO (#303)", async () => {
+  it("settles a prompted interruption when never-started successors are waiting (#428)", async () => {
     const dirs = dispatchDirs(dir);
     await mkdir(dirs.running, { recursive: true });
     await mkdir(dirs.pending, { recursive: true });
@@ -465,10 +465,51 @@ describe("watcher recoverStale vs resumeEnabled", () => {
     });
 
     await seedInterrupted(p1);
-    let resumePassEntered!: () => void;
-    const resumePassStarted = new Promise<void>((resolve) => { resumePassEntered = resolve; });
+    const { orch } = makeOrch({ enabled: true });
+    const seen: string[] = [];
+    const watcher = createRuntimeDispatchWatcher({ attempts: store.turnAttempts,
+      dataDir: dir,
+      logger: silent,
+      resumeEnabled: true,
+      pollMs: 60_000,
+      runtime: {
+        dispatchInjectTurn: async (spec) => {
+          seen.push(spec.id);
+          return { output: spec.id, stopReason: "end_turn" };
+        },
+        observeRetainedDispatch: (spec) => orch.observeRetainedDispatch(spec),
+        recoverInterruptedTurns: () => orch.recoverInterruptedTurns(),
+      },
+    });
+    orch.setDispatchWatcher(watcher);
+
+    await watcher.start({ waitForInitialDispatches: false });
+    await watcher.initialDispatchesSettled();
+    watcher.stop();
+
+    // #428: p1 already started its prompt. Never-started successors are the
+    // work that may run. Reattaching p1 would hold the target ahead of them.
+    expect(seen).toEqual(["p2", "p3"]);
+    expect(store.turnAttempts.get("p1")).toMatchObject({
+      state: "cancelled",
+      promptStarted: true,
+    });
+    expect(store.turnAttempts.get("p2")?.promptStarted).toBe(false);
+    expect(store.turnAttempts.get("p3")?.promptStarted).toBe(false);
+  });
+
+  it("keeps boot admission closed while a lone prompted resume is still unresolved (#303)", async () => {
+    const dirs = dispatchDirs(dir);
+    await mkdir(dirs.running, { recursive: true });
+    await mkdir(dirs.pending, { recursive: true });
+    await mkdir(dirs.done, { recursive: true });
+    const p1 = handoffSpec({ id: "p1", createdUtc: new Date().toISOString() });
+    await writeFile(path.join(dirs.running, "p1.json"), JSON.stringify(p1), "utf8");
+    await seedInterrupted(p1);
     let releaseResumePass!: () => void;
     const slowResumePass = new Promise<void>((resolve) => { releaseResumePass = resolve; });
+    let resumePassEntered!: () => void;
+    const resumePassStarted = new Promise<void>((resolve) => { resumePassEntered = resolve; });
     const { orch } = makeOrch({
       enabled: true,
       getThreadLiveState: async () => {
@@ -493,19 +534,14 @@ describe("watcher recoverStale vs resumeEnabled", () => {
       },
     });
     orch.setDispatchWatcher(watcher);
-
     await watcher.start({ waitForInitialDispatches: false });
     await resumePassStarted;
-    // #307: protects the closed boot gate; deleting this assertion lets queued
-    // work begin while interrupted-turn preconditions are still unresolved.
     expect(seen).toEqual([]);
     releaseResumePass();
     await watcher.initialDispatchesSettled();
     watcher.stop();
-
-    // #307: protects restart FIFO and original pending order; deleting this
-    // assertion lets the interrupted turn land behind either queued successor.
-    expect(seen).toEqual(["p1", "p2", "p3"]);
+    expect(seen).toEqual(["p1"]);
+    expect(store.turnAttempts.get("p1")?.state).not.toBe("cancelled");
   });
 
   it("resume opt-out never replays prompted SQL work; opt-in continues without files", async () => {

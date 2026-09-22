@@ -1010,8 +1010,8 @@ export class Orchestrator {
    * callback/output path checks its captured epoch before observable work. */
   private channelQueueEpochs = new Map<string, number>();
   private channelQueueMeta = new Map<string, ChannelQueueMeta>();
-  /** Per-session timers that settle a woken "Working" card back to "Monitoring"
-   *  after background activity goes quiet. Display-only; cleared when a new turn
+  /** Per-session timers that settle a woken "Working" card back to "Done"
+   *  after resumed output goes quiet. Display-only; cleared when a new turn
    *  takes over the session's status card. */
   private readonly bgSettleTimers = new Map<string, NodeJS.Timeout>();
   /** Set by index.ts after construction; used by /seamadmin schedule handlers to
@@ -3716,20 +3716,18 @@ export class Orchestrator {
     if (voiceConsoleSpeech) this.voiceConsoleSpeechByChannel.set(channel.id, voiceConsoleSpeech);
 
     // A new turn owns this session's status card now — cancel any lingering
-    // "settle back to Monitoring" timer left by the previous turn's background
-    // activity so it can't edit the new card.
+    // settle-back-to-Done timer left by the previous turn's resumed output
+    // so it can't edit the new card.
     const prevSettle = this.bgSettleTimers.get(record.id);
     if (prevSettle) {
       clearTimeout(prevSettle);
       this.bgSettleTimers.delete(record.id);
     }
-    // `backgroundLaunched`: the agent started a Monitor / background task this
-    // turn, so it should rest at "Monitoring" instead of "Done". `turnFinalized`:
-    // the main turn has fully finalized, so any *further* generative activity is
-    // an agent-initiated woken turn (not the trailing in-turn backlog the idle()
-    // drain handles) and should flip the card back to Working. Display-only.
+    // `turnFinalized`: the main turn has fully finalized, so any *further*
+    // generative activity is output that actually resumed (not the trailing
+    // in-turn backlog the idle() drain handles) and flips the card back to
+    // Working. A finished turn says Done. Display-only.
     const BG_SETTLE_MS = 10_000;
-    let backgroundLaunched = false;
     let turnFinalized = false;
 
     const cfg = this.store.readConfig(record);
@@ -4121,26 +4119,16 @@ export class Orchestrator {
         if (!this.queueFenceCurrent(queueFence)) return;
         if (!humanOutcomeOwned && !humanCurrent()) return;
         if (!humanOutcomeOwned && event.kind === "agent-text") humanOutput += event.text;
-        // Note the agent launching a Monitor so the turn rests at "Monitoring"
-        // rather than "Done" even before any woken activity arrives. Anchored to
-        // the title start to avoid matching ordinary tools that merely mention
-        // "monitor" (e.g. reading monitor.ts); the reactive path below backstops
-        // any miss when the first woken activity actually arrives.
-        if (event.kind === "tool-start" && /^\s*monitor\b/i.test(event.title ?? "")) {
-          backgroundLaunched = true;
-        }
-        // Woken/background turn: once the main turn has finalized, further
-        // generative activity is the agent resuming on its own (a Monitor wake
-        // or a background task reporting). Flip the card back to Working and
-        // settle to Monitoring on quiescence, so it never sits on a stale "Done"
-        // while output is still streaming. Display-only — no session state touched.
+        // Once the main turn has finalized, further generative activity is
+        // output that actually resumed. Flip the card back to Working and,
+        // after it goes quiet, back to Done. Display-only — no session state
+        // touched. A tool title is not evidence of pending work.
         if (
           turnFinalized &&
           (event.kind === "agent-text" ||
             event.kind === "agent-thought" ||
             event.kind === "tool-start")
         ) {
-          backgroundLaunched = true;
           if (status.state !== "Working") {
             status.setState("Working");
             status.setAction("Resumed — background activity");
@@ -4152,8 +4140,8 @@ export class Orchestrator {
             record.id,
             setTimeout(() => {
               this.bgSettleTimers.delete(record.id);
-              status.setState("Monitoring");
-              status.setAction("🛰️ Background task active — resumes when it reports");
+              status.setState("Done");
+              status.setAction("Resumed — output complete");
               void refresh(true);
             }, BG_SETTLE_MS)
           );
@@ -4806,12 +4794,6 @@ export class Orchestrator {
       } else if (result.cancelled) {
         status.setState("Failed");
         status.setAction("Cancelled");
-      } else if (backgroundLaunched) {
-        // The agent launched a Monitor / background task and yielded the turn —
-        // it isn't finished, it's watching and may resume. Rest at Monitoring;
-        // a woken turn flips it back to Working (see the event handler).
-        status.setState("Monitoring");
-        status.setAction("🛰️ Background task active — resumes when it reports");
       } else {
         status.setState("Done");
         status.setAction(result.stopReason);

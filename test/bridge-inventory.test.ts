@@ -106,14 +106,6 @@ describe("loadHostAdapters", () => {
           cwd: "/remote/workspace",
         });
       expect(runtimeLaunch.env.GH_TOKEN).toBe("remote-credential-token");
-
-      const slotLaunch = resolveCopilotHostLaunch(command, "/remote/repository", {
-        GH_TOKEN: "slot-credential-token",
-      });
-      expect(slotLaunch.cliPath).toBe(runtimeLaunch.cliPath);
-      expect(slotLaunch.args).toEqual(runtimeLaunch.args);
-      expect(slotLaunch.cwd).toBe("/remote/repository");
-      expect(slotLaunch.env.GH_TOKEN).toBe("slot-credential-token");
     } finally {
       if (priorArgs === undefined) delete process.env.COPILOT_ARGS;
       else process.env.COPILOT_ARGS = priorArgs;

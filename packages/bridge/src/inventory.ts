@@ -94,7 +94,6 @@ function reportUnavailable(
 export function resolveCopilotHostLaunch(
   copilotCmd: string,
   cwd: string,
-  extraEnv: NodeJS.ProcessEnv = {},
   baseEnv: NodeJS.ProcessEnv = process.env
 ): CopilotCatalogLaunch {
   const commandParts = copilotCmd.split(" ");
@@ -116,7 +115,6 @@ export function resolveCopilotHostLaunch(
       // The ACP probe will report auth failure without exposing credentials.
     }
   }
-  Object.assign(env, extraEnv);
   return { cliPath, args, cwd, env };
 }
 
@@ -126,7 +124,7 @@ function copilotProfileForHost(
   env: NodeJS.ProcessEnv,
   catalogProbe?: (launch: CopilotCatalogLaunch) => Promise<CopilotCatalogProbe>
 ): AgentAdapter {
-  const launch = resolveCopilotHostLaunch(copilotCmd, cwd, {}, env);
+  const launch = resolveCopilotHostLaunch(copilotCmd, cwd, env);
   const token = launch.env.GH_TOKEN || launch.env.COPILOT_GITHUB_TOKEN;
   const credentialProfile = token
     ? `github-token-sha256:${createHash("sha256").update(token).digest("hex")}`

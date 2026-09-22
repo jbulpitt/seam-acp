@@ -567,8 +567,19 @@ export function makeCopilotProfile(opts: {
     classifyError(error: unknown) {
       return classifyAndAttach(error, classifyCopilotError(error, profileId));
     },
-    spawn(_modelOverride?: string, _effortOverride?: string, sessionMcpServers?: McpServer[]) {
-      const launch = copilotAcpLaunchSpec(cli, acpArgs, runtimeCwd, probeEnvironment());
+    spawn(
+      _modelOverride?: string,
+      _effortOverride?: string,
+      sessionMcpServers?: McpServer[],
+      slot?: { cwd?: string; env?: NodeJS.ProcessEnv },
+    ) {
+      // Model and effort are ACP config options after session create, not CLI
+      // flags. The slot's cwd and env are process-start facts: Copilot resolves
+      // the repo from the process cwd, and a slot may carry its own GH_TOKEN.
+      const cwd = slot?.cwd || runtimeCwd;
+      const env = probeEnvironment();
+      if (slot?.env) Object.assign(env, slot.env);
+      const launch = copilotAcpLaunchSpec(cli, acpArgs, cwd, env);
       const args = launch.args;
       // Copilot ignores ACP session/new + session/load `mcpServers`. Supply the
       // runtime-specific seam-MCP URL/token when the ACP *process* starts so a

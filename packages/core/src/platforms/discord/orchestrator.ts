@@ -182,6 +182,12 @@ import {
   type RecoveryAttemptSource,
   type RecoveryRender,
 } from "../../core/dispatch/recovery-story.js";
+import {
+  isAwaitingReauth,
+  parkReauthAttempt,
+  ReauthParked,
+  reauthWaitNotice,
+} from "../../core/reauth-negotiation.js";
 import { readDefaultBranchHead } from "../../core/dispatch/default-branch-head.js";
 import {
   formatConfigAuditView,
@@ -3443,6 +3449,11 @@ export class Orchestrator {
     let humanOutput = "";
     const priorHuman = scheduledAttempt ?? (admission ? this.store.turnAttempts.get(inboundAttemptId(admission.messageId)) : null);
     const humanResume = priorHuman?.promptStarted === true;
+    // Claim clears stalled_reason. A waiting re-auth must not be claimed, or
+    // the next boot sends a billable continue before anyone has authenticated.
+    if (priorHuman && isAwaitingReauth(priorHuman.stalledReason)) {
+      throw DispatchSuspendedError.defect(priorHuman.id, priorHuman.stalledReason);
+    }
     if (admission || scheduledAttempt) {
       if (priorHuman?.state === "completed" || priorHuman?.state === "cancelled") return;
       if (priorHuman?.acpSessionId && record.acpSessionId && priorHuman.acpSessionId !== record.acpSessionId) {
@@ -4762,6 +4773,21 @@ export class Orchestrator {
       if (humanAttempt) {
         const refusal = humanOutcomeOwned ? null : humanRefusal();
         if (refusal) throw refusal;
+        if (err instanceof ReauthParked && humanPromptSubmitted) {
+          const parked = parkReauthAttempt(this.store.turnAttempts, humanAttempt.id, err.park);
+          if (parked) {
+            status.setState("Waiting");
+            status.setAction("provider authentication");
+            await refresh(true).catch((noticeErr) => {
+              this.logger.warn({ err: noticeErr, session: record.id }, "reauth status refresh failed");
+            });
+            await this.adapter.sendMessage(channel, reauthWaitNotice(err.park)).catch((noticeErr) => {
+              this.logger.warn({ err: noticeErr, session: record.id }, "reauth wait notice failed");
+            });
+            this.logger.warn({ session: record.id, attempt: humanAttempt.id }, "turn parked for provider authentication");
+            return;
+          }
+        }
         if (err instanceof DispatchSuspendedError) throw err;
         completeHuman(err instanceof Error ? err.message : String(err));
       }
@@ -5750,6 +5776,7 @@ export class Orchestrator {
         });
       } catch (err) {
         if (err instanceof DispatchSuspendedError) throw err;
+        if (err instanceof ReauthParked && opts.lifecycle) throw err;
         return settle({
           text,
           error: (err as Error).message,
@@ -5830,6 +5857,7 @@ export class Orchestrator {
       });
     } catch (err) {
       if (err instanceof DispatchSuspendedError) throw err;
+      if (err instanceof ReauthParked && opts.lifecycle) throw err;
       return settle({
         text,
         error: (err as Error).message,
@@ -9251,6 +9279,9 @@ export class Orchestrator {
     if (prior?.state === "cancelled") {
       throw DispatchSuspendedError.superseded(spec.id, "the dispatch was cancelled");
     }
+    if (prior && isAwaitingReauth(prior.stalledReason)) {
+      throw DispatchSuspendedError.defect(spec.id, prior.stalledReason);
+    }
     if (this.restartCutoff) {
       throw DispatchSuspendedError.shutdown(spec.id, "restart cutoff reached before execution began");
     }
@@ -9937,6 +9968,10 @@ export class Orchestrator {
         if (lifecycle && !outcomeOwned) lifecycle.onOutcome(result);
         this.assertQueueFence(queueFence);
       } catch (err) {
+        if (err instanceof ReauthParked && submittedThisAttempt && lifecycle && !outcomeOwned) {
+          const parked = parkReauthAttempt(this.store.turnAttempts, spec.id, err.park);
+          if (parked) throw parked;
+        }
         if (!(err instanceof DispatchSuspendedError) && lifecycle && !outcomeOwned) {
           lifecycle.onOutcome({ text: "", error: err instanceof Error ? err.message : String(err) });
         }
@@ -10570,7 +10605,11 @@ export class Orchestrator {
       completed = { output: result.text, stopReason: result.stopReason ?? "" };
     } catch (err) {
       failure = err;
-      if (!(err instanceof DispatchSuspendedError) && lifecycle && !outcomeOwned) {
+      if (err instanceof ReauthParked && submittedThisAttempt && lifecycle && !outcomeOwned && attemptStore) {
+        const parked = parkReauthAttempt(attemptStore, spec.id, err.park);
+        if (parked) failure = parked;
+      }
+      if (!(failure instanceof DispatchSuspendedError) && lifecycle && !outcomeOwned) {
         try {
           lifecycle.onOutcome({
             text: result?.text ?? "",
@@ -11900,6 +11939,10 @@ export class Orchestrator {
       return;
     }
     if (this.restartCutoff) return;
+    if (isAwaitingReauth(prior?.stalledReason)) {
+      this.patchScheduledStatus(row.id, `retained: ${prior.stalledReason}`);
+      return;
+    }
     // `startPrompt` requires a recorded ACP id, so the feature flag is the only
     // pre-runtime gate. session/load capability is verified by the same strict
     // reattachment path used for human turns (#302).
@@ -11923,6 +11966,22 @@ export class Orchestrator {
         // use the same start gate so it cannot recreate the boot-time stampede.
         await (prior?.promptStarted && !manualResume ? this.resumeScheduler.run(execute) : execute());
       } catch (err) {
+        if (err instanceof ReauthParked) {
+          const current = this.store.turnAttempts.get(attempt.id);
+          if (current?.promptStarted && current.acpSessionId) {
+            const parked = parkReauthAttempt(this.store.turnAttempts, attempt.id, err.park);
+            if (parked) {
+              this.patchScheduledStatus(row.id, `retained: ${parked.reason}`);
+              await this.adapter.sendMessage(
+                { platform: PLATFORM, id: row.channelRef },
+                reauthWaitNotice(err.park),
+              ).catch((noticeErr) => {
+                this.logger.warn({ err: noticeErr, id: attempt.id }, "reauth wait notice failed");
+              });
+              return;
+            }
+          }
+        }
         if (err instanceof DispatchSuspendedError) {
           // #333: this used to branch on whether a reason happened to be
           // present, which quarantined exactly the five sites that had one and
@@ -12186,6 +12245,10 @@ export class Orchestrator {
               "the scheduled occurrence is still active under another owner");
           }
           if (done.state === "suspended") {
+            if (isAwaitingReauth(done.stalledReason)) {
+              this.patchScheduledStatus(id, `retained: ${done.stalledReason}`);
+              return;
+            }
             throw DispatchSuspendedError.defect(done.id,
               "the scheduled turn returned without settling its attempt");
           }
@@ -15275,6 +15338,7 @@ export class Orchestrator {
         continue;
       }
       if (a) {
+        if (isAwaitingReauth(a.stalledReason)) continue;
         if (a.state !== "suspended" || (a.promptStarted && !enabled)) continue;
         if (await this.checkResumePreconditions(this.inboundMessage(row).channel) !== "ok") continue;
       } else if (row.state !== "pending" || live.some(m => m.channelRef === row.channelRef)) {
@@ -15599,6 +15663,7 @@ export class Orchestrator {
   private async dispatchContinuationRefusal(spec: DispatchSpec): Promise<string | null> {
     const attempt = this.store.turnAttempts.get(spec.id);
     if (!attempt || attempt.state !== "suspended") return "no suspended SQL execution is recorded";
+    if (isAwaitingReauth(attempt.stalledReason)) return attempt.stalledReason;
     if (attempt.stalledUtc && !attempt.promptStarted) {
       return "the stalled attempt never started a prompt; continuation cannot be distinguished from replaying its original brief";
     }
@@ -15637,6 +15702,7 @@ export class Orchestrator {
         const a = this.store.turnAttempts.get(id);
         const row = this.store.getInbound(marker.inboundMessageId);
         if (!a || a.state !== "suspended" || !row) return `Cannot resume \`${id}\` — no suspended, identity-bound execution.`;
+        if (isAwaitingReauth(a.stalledReason)) return `Cannot resume \`${id}\` — ${a.stalledReason}.`;
         const pending = this.store.recoverInboundChannel(row.channelRef, new Date().toISOString());
         if (!pending) return `Cannot resume \`${id}\` — admission is terminal.`;
         this.startRecoveredInbound(pending);

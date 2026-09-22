@@ -19,7 +19,11 @@ const CHECK_WORK =
 const TRANSCRIPT =
   "What is safe to assume is the transcript: tool calls and their results from before the stop are already in this session.";
 
-export type RecoveryCause = "process_restart" | "classified_retry";
+export type RecoveryCause = "process_restart" | "classified_retry" | "reauthentication";
+
+/** Attempt `stalled_reason` prefixes (#454). One spelling, shared with the negotiator. */
+export const REAUTH_WAITING_PREFIX = "reauth-waiting:";
+export const REAUTH_COMPLETED_PREFIX = "reauth-completed:";
 
 export interface DefaultBranchHead {
   /** `origin/main` shape. The caller observed it; this module does not. */
@@ -56,6 +60,8 @@ export interface RecoveryStoryFacts {
 export interface RecoveryAttemptSource {
   updatedUtc?: string;
   stalledReason?: string | null;
+  /** Original stall. A later accept refreshes `updatedUtc` and must not erase the gap. */
+  stalledUtc?: string | null;
   promptStarted?: boolean;
   providerIdentity?: string | null;
   identity?: string | null;
@@ -114,11 +120,17 @@ export function recoveryFactsFromAttempt(
   if (!cwd && source.spec?.cwd) cwd = ident(source.spec.cwd, 500);
   if (!location && source.location) location = ident(source.location);
   const recorded = source.stalledReason ? clamp(source.stalledReason, 500) : undefined;
-  const gapSeconds = gapSince(source.updatedUtc, now);
+  const cause: RecoveryCause = recorded?.startsWith(REAUTH_COMPLETED_PREFIX)
+    ? "reauthentication"
+    : "process_restart";
+  const gapSeconds = gapSince(
+    cause === "reauthentication" && source.stalledUtc ? source.stalledUtc : source.updatedUtc,
+    now,
+  );
   const provider = providerLabel(source.providerIdentity);
   return {
-    cause: "process_restart",
-    ...(recorded ? { recordedReason: recorded } : {}),
+    cause,
+    ...(cause === "process_restart" && recorded ? { recordedReason: recorded } : {}),
     ...(gapSeconds !== undefined ? { gapSeconds } : {}),
     ...(agentId ? { agentId } : {}),
     ...(model ? { model } : {}),
@@ -166,7 +178,9 @@ function formatGap(seconds: number): string {
 
 function situation(facts: RecoveryStoryFacts): string[] {
   const lines: string[] = [];
-  if (facts.cause === "classified_retry") {
+  if (facts.cause === "reauthentication") {
+    lines.push("Authentication was completed outside this turn.");
+  } else if (facts.cause === "classified_retry") {
     const kind = facts.errorKind && TOKEN.test(facts.errorKind) ? facts.errorKind : "unclassified";
     const agent = ident(facts.agentId);
     lines.push(agent ? `${agent} reported ${kind}.` : `The error kind is ${kind}.`);
@@ -176,7 +190,10 @@ function situation(facts: RecoveryStoryFacts): string[] {
     else lines.push("The process restarted while the turn was in flight.");
   }
 
-  if (facts.cause === "process_restart" && facts.gapSeconds !== undefined && facts.gapSeconds >= 1) {
+  if (
+    (facts.cause === "process_restart" || facts.cause === "reauthentication") &&
+    facts.gapSeconds !== undefined && facts.gapSeconds >= 1
+  ) {
     lines.push(`The attempt was last recorded ${formatGap(facts.gapSeconds)} ago.`);
   }
 
@@ -223,7 +240,10 @@ function situation(facts: RecoveryStoryFacts): string[] {
     lines.push(`The default branch ${branch.name} is currently ${branch.sha}.`);
   }
 
-  if (facts.alreadyProducedOutput) {
+  if (facts.cause === "reauthentication") {
+    lines.push("The prompt had already been submitted. Do not repeat it. The transcript in this session is the work done before the stop.");
+    lines.push(TRANSCRIPT);
+  } else if (facts.alreadyProducedOutput) {
     lines.push("The turn already produced output, so this is continuing the existing conversation.");
   } else if (facts.cause === "classified_retry") {
     lines.push("The request had not produced output yet, so this retries it as-is.");

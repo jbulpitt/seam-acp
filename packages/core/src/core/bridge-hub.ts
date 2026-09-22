@@ -400,6 +400,16 @@ export class BridgeHub {
           this.readyEvents.emit("disconnect", bridgeId);
         }
       },
+      onLivenessTimeout: ({ observedSilenceMs, unansweredProbeMs }) => {
+        // #436: the far side sees terminate() as an abnormal network close.
+        // Record the server-owned evidence before that ambiguity is created.
+        // This refuses only the one half-open bridge socket; other bridges and
+        // local agents remain available, and this bridge may reconnect.
+        this.logger.warn(
+          { bridgeId, observedSilenceMs, unansweredProbeMs },
+          "bridge liveness terminated socket after unanswered probe"
+        );
+      },
       onSlotHealth: (health) => {
         this.slotHealth.set(bridgeId, health);
       },

@@ -20,6 +20,8 @@ export * from "./attachment-staging.js";
 export * from "./agy-stream.js";
 export * from "./agy-native-translation.js";
 export * from "./agy-native-runtime.js";
+export * from "./agy-pin-mode.js";
+export * from "./agy-unpinned-runtime.js";
 export * from "./agy-session-store.js";
 export * from "./agy-session-store.js";
 export * from "./command-bus.js";

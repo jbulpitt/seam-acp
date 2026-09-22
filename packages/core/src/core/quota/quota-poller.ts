@@ -8,7 +8,7 @@ import {
   fetchOllamaCloudUsage,
   type AgentProfile,
 } from "@seam/adapters";
-import type { AgyNativeRuntime } from "@seam/adapters";
+import type { AgyLaunchRuntime } from "@seam/adapters";
 import type { Logger } from "../../lib/logger.js";
 import { isOllamaCloudAgentId } from "../parked-agents.js";
 import {
@@ -67,7 +67,7 @@ export interface AgentQuotaRefreshSummary {
 export function createAgentQuotaSources(
   profiles: AgentProfile[],
   opts: {
-    agyRuntime?: AgyNativeRuntime;
+    agyRuntime?: AgyLaunchRuntime;
     grokCliPath?: string;
     ollamaUsageCliPath?: string;
     /**

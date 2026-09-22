@@ -402,7 +402,7 @@ function openVerifiedSnapshot(
   }
 }
 
-function buildApprovedEnvironment(
+export function buildApprovedEnvironment(
   base: NodeJS.ProcessEnv,
   additions: Readonly<Record<string, string>>
 ): NodeJS.ProcessEnv {
@@ -466,7 +466,25 @@ export function verifyAgyManagedRuntimeIdentity(options: {
   }
 }
 
-export class AgyNativeRuntime {
+/** What catalog, quota, and turns call. Pinned and unpinned both satisfy it. */
+export interface AgyLaunchRuntime {
+  readonly descriptor: AdapterRuntimeDescriptor;
+  readonly identityKey: string;
+  readonly credentialScope: string;
+  prepare(
+    argv: ReadonlyArray<string>,
+    cwd: string,
+    options: AgyNativeSpawnOptions,
+  ): AgyNativePreparedLaunch;
+  spawn(
+    argv: ReadonlyArray<string>,
+    cwd: string,
+    options: AgyNativeSpawnOptions,
+  ): Promise<ChildProcess>;
+  verify(cwd: string): void;
+}
+
+export class AgyNativeRuntime implements AgyLaunchRuntime {
   readonly descriptor: AdapterRuntimeDescriptor;
   readonly identityKey: string;
   readonly credentialScope: string;

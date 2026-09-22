@@ -747,6 +747,31 @@ describe("#395 the enforcing source is not the same file on every host", () => {
     expect(byId(report, "artifact-digest").status).toBe("pass");
   });
 
+  it("reports AGY_PIN=unpinned as its own verdict, not as a missing pin", () => {
+    const h = host({
+      omitPins: ["AGY_RUNTIME_ROOT", "AGY_SHA256", "AGY_CLI_PATH", "AGY_VERSION"],
+    });
+    fs.appendFileSync(h.envFile, "AGY_PIN=unpinned\n");
+    const report = verdictFor(h, { processEnv: {}, processEnvSupplied: true });
+    expect(report.verdict).toBe("deliberately-unpinned");
+    expect(exitCodeFor(report.verdict)).toBe(7);
+    expect(byId(report, "pin-mode").status).toBe("unpinned");
+    expect(byId(report, "pin-mode").detail).toContain("does not check a digest");
+    expect(byId(report, "artifact-digest").status).toBe("skipped");
+    expect(byId(report, "artifact-digest").reasonCode).toBe("deliberately_unpinned");
+    expect(byId(report, "ancestors-durable").detail).toContain("not in force");
+  });
+
+  it("fails when AGY_PIN=unpinned is set beside a standing digest pin", () => {
+    const h = host();
+    fs.appendFileSync(h.envFile, "AGY_PIN=unpinned\n");
+    const report = verdictFor(h);
+    expect(report.verdict).toBe("fail");
+    expect(exitCodeFor(report.verdict)).toBe(1);
+    expect(byId(report, "pins-in-file").reasonCode).toBe("pin_mode_contradicts_pin");
+    expect(byId(report, "pins-in-file").detail).toContain("AGY_SHA256");
+  });
+
   it("says unknown, not unpinned, when an existing file has no pins and the process was not read", () => {
     // The empty bridge.env on fhr-server. Opening it and stopping there is
     // how a pinned host was reported as having no agy.

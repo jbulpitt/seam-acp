@@ -545,7 +545,7 @@ import {
   resolveModelVisionRouting,
 } from "../../agents/attachments.js";
 import { stageAttachment, sweepStagedAttachments } from "@seam/adapters";
-import type { AgyNativeRuntime } from "@seam/adapters";
+import type { AgyLaunchRuntime } from "@seam/adapters";
 import {
   authorizeStagedImage,
   stagedAttachmentOwnerKey,
@@ -1121,7 +1121,7 @@ export class Orchestrator {
     staggerMs: TURN_RESUME_STAGGER_MS,
   });
   private readonly recoverySleep: (ms: number) => Promise<void>;
-  private readonly agyRuntime?: AgyNativeRuntime;
+  private readonly agyRuntime?: AgyLaunchRuntime;
 
   constructor(opts: {
     logger: Logger;
@@ -1132,7 +1132,7 @@ export class Orchestrator {
     renderer: Renderer;
     quotaPoller?: AgentQuotaPoller;
     modelCatalog: ModelCatalogService;
-    agyRuntime?: AgyNativeRuntime;
+    agyRuntime?: AgyLaunchRuntime;
     refreshModelIntelligence?: (forceSources: boolean) => Promise<ModelIntelligenceRefreshResult>;
     restartProcess?: () => Promise<void>;
     /** Test seam for bounded boot-recovery backoff. */

@@ -2898,16 +2898,40 @@ export class Orchestrator {
       dispatches,
       priorState: before.state,
     };
+    // A prompted suspension is work that already ran. Fencing the channel
+    // queue does not finish it, and the pending handoffs behind it stay
+    // unclaimed. Calling that "recovered" is the false success (#428).
+    const block = this.promptedAttemptBlock(channelRef);
+    const drained = block === null;
     this.store.recordConfigMutation({
       id: `queue-recovery-${randomUUID()}`,
       tier: "operator",
       actorId: actor?.id ?? null,
       actorName: actor?.name ?? null,
       scope: `thread:${channelRef}`,
-      summary: `Recovered channel queue (${mode})`,
+      summary: drained
+        ? `Recovered channel queue (${mode})`
+        : `Fenced channel queue (${mode}); prompted attempt still blocks it`,
       beforeJson: JSON.stringify(before),
-      afterJson: JSON.stringify(detail),
+      afterJson: JSON.stringify({ ...detail, ...(block ?? {}) }),
     });
+    if (!drained) {
+      this.logger.warn(
+        { ...detail, suspendedId: block.suspendedId, pendingIds: block.pendingIds },
+        "channel queue fenced; prompted attempt still blocks the target"
+      );
+      const pending = block.pendingIds.length;
+      return {
+        ok: false,
+        before,
+        epoch,
+        message:
+          `Fenced <#${channelRef}> at queue epoch ${epoch}. ` +
+          `Attempt ${block.suspendedId} already started its prompt and is still suspended. ` +
+          `${pending} pending handoff${pending === 1 ? "" : "s"} ` +
+          `${pending === 1 ? "is" : "are"} still unclaimed. The sweep did not clear that pile.`,
+      };
+    }
     this.logger.warn(detail, "channel queue recovered by operator");
     return {
       ok: true,
@@ -2915,6 +2939,27 @@ export class Orchestrator {
       epoch,
       message: `Recovered <#${channelRef}> at queue epoch ${epoch}; ${inbound ? "restarted its durable message" : "no inbound message was pending"}; ${dispatches.length} dispatch artifact(s) re-queued.`,
     };
+  }
+
+  /**
+   * A target whose suspended attempt already submitted a prompt. Pending
+   * rows on that target are unclaimed handoffs, not dead owners — `admit`
+   * leaves `owner_boot` empty, and that emptiness is not a reason to suspend
+   * them. Read-only: this does not reclassify anything.
+   */
+  private promptedAttemptBlock(channelRef: string): { suspendedId: string; pendingIds: string[] } | null {
+    const pendingIds: string[] = [];
+    let suspendedId: string | undefined;
+    for (const state of ["pending", "suspended"] as const) {
+      for (const attempt of this.store.turnAttempts.list(state, () => {})) {
+        if (attempt.source !== "dispatch" || attempt.spec?.target !== channelRef) continue;
+        if (state === "pending" && !attempt.promptStarted) pendingIds.push(attempt.id);
+        if (state === "suspended" && attempt.promptStarted && suspendedId === undefined) {
+          suspendedId = attempt.id;
+        }
+      }
+    }
+    return suspendedId === undefined ? null : { suspendedId, pendingIds };
   }
 
   /** Best-effort cancellation after the watchdog has already settled the queue. */

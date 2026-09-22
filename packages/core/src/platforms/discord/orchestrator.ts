@@ -7194,7 +7194,7 @@ export class Orchestrator {
       correlationId: dispatchId,
       createdUtc: new Date().toISOString(),
     };
-    await enqueueDispatchSpec(this.config.DATA_DIR, spec);
+    await enqueueDispatchSpec(this.config.DATA_DIR, spec, this.store.turnAttempts);
 
     this.logger.info(
       { from: caller.channelRef, to: target, fresh, cancelled, interruptedDispatch: activeId ?? null, dispatchId },
@@ -7373,7 +7373,7 @@ export class Orchestrator {
       correlationId: wake.id,
       createdUtc: new Date().toISOString(),
     };
-    await enqueueDispatchSpec(this.config.DATA_DIR, spec);
+    await enqueueDispatchSpec(this.config.DATA_DIR, spec, this.store.turnAttempts);
     this.logger.info(
       { id: wake.id, dispatch: spec.id, channel: wake.channelRef, chainDepth: wake.chainDepth },
       "wake: fired (dispatch enqueued)"
@@ -7792,7 +7792,7 @@ export class Orchestrator {
       correlationId: parked.id,
       createdUtc: new Date().toISOString(),
     };
-    await enqueueDispatchSpec(this.config.DATA_DIR, spec);
+    await enqueueDispatchSpec(this.config.DATA_DIR, spec, this.store.turnAttempts);
     this.logger.info(
       { id: parked.id, dispatch: spec.id, channel: parked.channelRef, location: parked.location },
       "parked: fired (dispatch enqueued)"
@@ -8815,7 +8815,7 @@ export class Orchestrator {
         location,
         createdUtc: new Date().toISOString(),
       };
-      await enqueueDispatchSpec(this.config.DATA_DIR, spec);
+      await enqueueDispatchSpec(this.config.DATA_DIR, spec, this.store.turnAttempts);
       await i.editReply("▶️ Running now — nothing was in flight.");
       return;
     }
@@ -9049,7 +9049,7 @@ export class Orchestrator {
       correlationId: watch.id,
       createdUtc: new Date().toISOString(),
     };
-    await enqueueDispatchSpec(this.config.DATA_DIR, spec);
+    await enqueueDispatchSpec(this.config.DATA_DIR, spec, this.store.turnAttempts);
     this.logger.info(
       { id: watch.id, dispatch: spec.id, channel: watch.channelRef, kind: watch.kind },
       "watch: fired (dispatch enqueued)"
@@ -9082,7 +9082,7 @@ export class Orchestrator {
       correlationId: watch.id,
       createdUtc: new Date().toISOString(),
     };
-    await enqueueDispatchSpec(this.config.DATA_DIR, spec);
+    await enqueueDispatchSpec(this.config.DATA_DIR, spec, this.store.turnAttempts);
     this.logger.info(
       { id: watch.id, dispatch: spec.id, channel: watch.channelRef, fireCount: watch.fireCount },
       "watch: expiry turn enqueued"
@@ -10852,7 +10852,7 @@ export class Orchestrator {
           ...spec,
           id: existingClaim.id,
           createdUtc: existingClaim.createdUtc,
-        });
+        }, this.store.turnAttempts);
         this.store.updateDelegationStatus(existingClaim.id, "dispatched");
         this.logger.warn(
           { correlationId, spec: existingClaim.id },
@@ -10901,7 +10901,7 @@ export class Orchestrator {
       );
       return false;
     }
-    await enqueueDispatchSpec(this.config.DATA_DIR, spec);
+    await enqueueDispatchSpec(this.config.DATA_DIR, spec, this.store.turnAttempts);
     return true;
   }
 
@@ -11057,7 +11057,7 @@ export class Orchestrator {
       });
       const artifact = await dispatchArtifactState(this.config.DATA_DIR, plan.dispatchId,
         (id) => this.store.isDispatchCompleted(id));
-      if (!artifact) await enqueueDispatchSpec(this.config.DATA_DIR, next);
+      if (!artifact) await enqueueDispatchSpec(this.config.DATA_DIR, next, this.store.turnAttempts);
       this.logger.info(
         { chainId, dispatch: next.id, worker: plan.nextHop, repaired: !plan.created },
         "chain: next hop durably queued"
@@ -15627,7 +15627,7 @@ export class Orchestrator {
         kind: resumeKind,
         ...(ledger.correlationId ? { correlationId: ledger.correlationId } : {}),
         createdUtc: new Date().toISOString(),
-      });
+      }, this.store.turnAttempts);
       // Point the new spec at the recorded session via a ledger row the
       // dispatcher will look up — stamp the original's session on a
       // running-shaped row so loadSession finds it. The new spec id is
@@ -22464,7 +22464,7 @@ export class Orchestrator {
         optionIndex,
         actor: { id: evt.userId, name: evt.userName },
         payload,
-        enqueue: (spec) => enqueueDispatchSpec(this.config.DATA_DIR, spec),
+        enqueue: (spec) => enqueueDispatchSpec(this.config.DATA_DIR, spec, this.store.turnAttempts),
         authoringSession,
         ...(authoringSession ? { cwd: this.effectiveCwd(authoringSession) } : {}),
         destLive,
@@ -22556,7 +22556,7 @@ export class Orchestrator {
         card: claimed.card,
         optionIndices: indices,
         actor: { id: evt.userId, name: evt.userName },
-        enqueue: (spec) => enqueueDispatchSpec(this.config.DATA_DIR, spec),
+        enqueue: (spec) => enqueueDispatchSpec(this.config.DATA_DIR, spec, this.store.turnAttempts),
         authoringSession,
         ...(authoringSession ? { cwd: this.effectiveCwd(authoringSession) } : {}),
         destLive,

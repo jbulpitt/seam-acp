@@ -104,6 +104,8 @@ export interface DispatchWatcherOpts {
   onResultPublished?: (id: string) => Promise<void>;
   /** Test seam for bounded boot-recovery backoff. Production uses timers. */
   recoverySleep?: (ms: number) => Promise<void>;
+  /** Clock for `queuedMs`. Production uses `Date.now`. */
+  now?: () => number;
   /**
    * Directory-listing seam. Defaults to `fs.readdir`.
    *
@@ -229,6 +231,7 @@ export class DispatchWatcher {
   private timer?: NodeJS.Timeout;
   private ready = false;
   private readonly recoverySleep: (ms: number) => Promise<void>;
+  private readonly now: () => number;
   /** #303: invalidates a delayed boot opener; deleting this fence lets stop()
    * race a slow admission barrier and accidentally reopen intake afterward. */
   private lifecycleEpoch = 0;
@@ -257,6 +260,7 @@ export class DispatchWatcher {
     this.isCompleted = opts.isCompleted ?? (() => false);
     this.onResultPublished = opts.onResultPublished;
     this.recoverySleep = opts.recoverySleep ?? ((ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+    this.now = opts.now ?? Date.now;
     this.readDir = opts.readDir ?? readdir;
     this.beforeOwnedDoneCommit = opts.beforeOwnedDoneCommit;
     this.beforeRecoveryPublish = opts.beforeRecoveryPublish;
@@ -942,7 +946,7 @@ export class DispatchWatcher {
     // to say "running", which was not. The schema already draws the
     // distinction; the log now uses the schema's word for it. `attempts.admit()`
     // is what just happened a few lines above, and it leaves the row `pending`.
-    const admittedAt = Date.now();
+    const admittedAt = this.now();
     this.logger.info(
       { id, target: spec.target, session: spec.session, correlationId: spec.correlationId },
       "dispatch: admitted"
@@ -1006,7 +1010,7 @@ export class DispatchWatcher {
         {
           id, target: spec.target, session: spec.session,
           ...(spec.correlationId ? { correlationId: spec.correlationId } : {}),
-          queuedMs: Date.now() - admittedAt,
+          queuedMs: this.now() - admittedAt,
         },
         "dispatch: running"
       );

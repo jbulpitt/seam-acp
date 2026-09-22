@@ -14,6 +14,7 @@ import { BootAcquisitionExhaustedError, DispatchAcquisitionPhase, isRetryableBoo
 import { compareExecutionIdentity, executionIdentity } from "../../core/dispatch/execution-identity.js";
 import { MessageFlags, EmbedBuilder, ButtonBuilder, ActionRowBuilder, ButtonStyle, StringSelectMenuBuilder, ModalBuilder, TextInputBuilder, TextInputStyle, AttachmentBuilder, type ChatInputCommandInteraction, type AutocompleteInteraction, type MessageComponentInteraction, type Message, type InteractionEditReplyOptions } from "discord.js";
 import type { Logger } from "../../lib/logger.js";
+import { raceDeadline, type DeadlineClock } from "../../lib/shutdown-budget.js";
 import type { Config } from "../../config.js";
 import {
   resolveChannelPreset,
@@ -3320,9 +3321,12 @@ export class Orchestrator {
    * `timedOut: true` and shutdown proceeds — the boot-time done-file
    * reconciliation is what makes giving up safe.
    */
-  async quiesce(opts: { timeoutMs?: number } = {}): Promise<QuiesceOutcome> {
-    return this.runBoundedDrain("pre-dispose", opts.timeoutMs ?? QUIESCE_TIMEOUT_MS, (onErr) =>
-      this.settleAllWork(onErr)
+  async quiesce(opts: { timeoutMs?: number; clock?: DeadlineClock } = {}): Promise<QuiesceOutcome> {
+    return this.runBoundedDrain(
+      "pre-dispose",
+      opts.timeoutMs ?? QUIESCE_TIMEOUT_MS,
+      (onErr) => this.settleAllWork(onErr),
+      opts.clock,
     );
   }
 
@@ -3345,9 +3349,12 @@ export class Orchestrator {
    * unwritten and close the store on top of it. That is the original #174 race,
    * one phase later.
    */
-  async drainAfterDispose(opts: { timeoutMs?: number } = {}): Promise<QuiesceOutcome> {
-    return this.runBoundedDrain("post-dispose", opts.timeoutMs ?? QUIESCE_TIMEOUT_MS, (onErr) =>
-      this.settleAllWork(onErr)
+  async drainAfterDispose(opts: { timeoutMs?: number; clock?: DeadlineClock } = {}): Promise<QuiesceOutcome> {
+    return this.runBoundedDrain(
+      "post-dispose",
+      opts.timeoutMs ?? QUIESCE_TIMEOUT_MS,
+      (onErr) => this.settleAllWork(onErr),
+      opts.clock,
     );
   }
 
@@ -3457,22 +3464,14 @@ export class Orchestrator {
   private async runBoundedDrain(
     phase: "pre-dispose" | "post-dispose",
     timeoutMs: number,
-    barrier: (onStageError: (err: unknown) => void) => Promise<void>
+    barrier: (onStageError: (err: unknown) => void) => Promise<void>,
+    clock?: DeadlineClock,
   ): Promise<QuiesceOutcome> {
     // Both drains are shutdown-only, so this closes the gateway too — a
     // handler admitted after the snapshot is work the barrier is not waiting
     // for and the store is about to close underneath.
     this.closeAdmission();
-    let timer: NodeJS.Timeout | undefined;
-    let timedOut = false;
     let barrierFailed = false;
-    const deadline = new Promise<void>((resolve) => {
-      timer = setTimeout(() => {
-        timedOut = true;
-        resolve();
-      }, timeoutMs);
-      timer.unref?.();
-    });
 
     // A stage failure is recorded, never fatal, and never silently successful.
     const noteFailure = (err: unknown) => {
@@ -3484,8 +3483,8 @@ export class Orchestrator {
     // and do not let the swallow turn into a report of a clean drain.
     const running = barrier(noteFailure).catch(noteFailure);
 
-    await Promise.race([running, deadline]);
-    if (timer) clearTimeout(timer);
+    const deadline = await raceDeadline(running, timeoutMs, clock);
+    const timedOut = deadline.timedOut;
 
     const state: QuiesceOutcome = {
       phase,

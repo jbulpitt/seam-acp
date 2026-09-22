@@ -50,6 +50,16 @@ export function shutdownFitsHostBudget(): boolean {
   );
 }
 
+/**
+ * Clock for a shutdown deadline. Production uses `Date.now` and `setTimeout`.
+ * A test advances `now` when it releases `sleep`, so a loaded machine cannot
+ * turn scheduler delay into a reported hang.
+ */
+export interface DeadlineClock {
+  now?: () => number;
+  sleep?: (ms: number) => Promise<void>;
+}
+
 /** How long one bounded shutdown stage may wait. */
 export interface ShutdownBudget {
   /** Milliseconds left in the whole shutdown. */
@@ -82,6 +92,41 @@ export function startShutdownBudget(
 }
 
 /**
+ * Race `work` against a deadline of `timeoutMs`.
+ *
+ * The real timer is cleared if `work` wins, so a late tick cannot flip the
+ * verdict. An injected `sleep` is the test's timer: it resolves only when
+ * the test says that many milliseconds have passed. `elapsedMs` is read from
+ * the same clock, which stays `Date.now` when no clock is passed.
+ */
+export async function raceDeadline(
+  work: Promise<unknown>,
+  timeoutMs: number,
+  clock?: DeadlineClock,
+): Promise<{ timedOut: boolean; elapsedMs: number }> {
+  const now = clock?.now ?? Date.now;
+  const started = now();
+  let timedOut = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const wait = Math.max(0, timeoutMs);
+  const deadline = clock?.sleep
+    ? clock.sleep(wait).then(() => { timedOut = true; })
+    : new Promise<void>((resolve) => {
+        timer = setTimeout(() => {
+          timedOut = true;
+          resolve();
+        }, wait);
+        timer.unref?.();
+      });
+  try {
+    await Promise.race([work, deadline]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+  return { timedOut, elapsedMs: now() - started };
+}
+
+/**
  * Run one teardown step against a deadline. Never throws.
  *
  * Returns whether the step actually FINISHED. That distinction is the whole
@@ -97,18 +142,10 @@ export async function runBoundedStep(opts: {
   /** Reported when the deadline won. The work is abandoned, not cancelled. */
   onTimeout?: (label: string, timeoutMs: number) => void;
   onError?: (label: string, err: unknown) => void;
+  clock?: DeadlineClock;
 }): Promise<boolean> {
-  let timer: NodeJS.Timeout | undefined;
-  let timedOut = false;
   let failed = false;
-  const deadline = new Promise<void>((resolve) => {
-    timer = setTimeout(() => {
-      timedOut = true;
-      resolve();
-    }, opts.timeoutMs);
-    timer.unref?.();
-  });
-  await Promise.race([
+  const result = await raceDeadline(
     // `.then(work)` so a SYNCHRONOUS throw is a failed step, not a thrown one.
     Promise.resolve()
       .then(opts.work)
@@ -116,11 +153,11 @@ export async function runBoundedStep(opts: {
         failed = true;
         opts.onError?.(opts.label, err);
       }),
-    deadline,
-  ]);
-  if (timer) clearTimeout(timer);
-  if (timedOut) opts.onTimeout?.(opts.label, opts.timeoutMs);
-  return !timedOut && !failed;
+    opts.timeoutMs,
+    opts.clock,
+  );
+  if (result.timedOut) opts.onTimeout?.(opts.label, opts.timeoutMs);
+  return !result.timedOut && !failed;
 }
 
 /** One bounded stage's verdict: did it finish, or did it give up? */

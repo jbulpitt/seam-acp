@@ -12389,7 +12389,7 @@ export class Orchestrator {
     }
     const result = await this.injectTurn(
       record,
-      resume ? (await this.processRestartRender(owned?.stopped ?? attempt!)).prompt : promptText,
+      resume ? (await this.processRestartRender(owned?.attempt ?? attempt!)).prompt : promptText,
       options,
     );
     return { text: result.text, ...(result.error ? { error: result.error } : {}) };

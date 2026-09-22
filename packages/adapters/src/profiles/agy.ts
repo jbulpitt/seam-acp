@@ -199,6 +199,7 @@ import {
   discoverAgyLs,
   subscribeToAgyStream,
   AgyStreamUnavailableError,
+  SEAM_AGY_STDOUT_FALLBACK_META,
   waitForAgyConversationId,
   readAgyJsonResponse,
 } from "../agy-stream.js";
@@ -1944,6 +1945,10 @@ class AgyAgent implements Agent {
               update: {
                 // Keep the caveat visible without corrupting schema-only JSON.
                 sessionUpdate: jsonSchema ? "agent_thought_chunk" : "agent_message_chunk",
+                // #545: successful stdout turns otherwise look healthy in the
+                // attempt ledger. Carry the existing rejection code, not raw
+                // diagnostics (which can contain credentials or prompt text).
+                _meta: { [SEAM_AGY_STDOUT_FALLBACK_META]: { code: streamErr.streamCode } },
                 content: { type: "text", text: `[AGY stream unavailable (${streamErr.streamCode}: ${streamErr.streamMessage}). Using stdout only; streamed thoughts, tool updates and permission prompts are unavailable. Existing permission policy is unchanged.]\n\n` },
               },
             });

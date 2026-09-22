@@ -69,6 +69,8 @@ export interface TurnAttempt {
   promptStarted: boolean;
   outcome: DispatchResult | null;
   runtimeOwner: ProcessOwner | null;
+  /** Absent means unobserved (including old adapters), never proof of health. */
+  stdoutFallback?: { count: number; reasons: Record<string, number>; lastUtc: string };
   providerIdentity: string | null;
   source: "dispatch" | "inbound" | "schedule";
   deliveryDone: boolean;
@@ -250,12 +252,19 @@ export class TurnAttemptStore {
         delivery_abandoned_reason: string | null;
         delivery_uncertain_reason: string | null;
         stalled_utc: string | null; stalled_reason: string | null; stall_notice_utc: string | null } | undefined;
+    const runtime = row?.runtime_json ? JSON.parse(row.runtime_json) : null;
+    // Remote runtimes can have telemetry but no local process owner. Recognize
+    // only that new exact shape; do not turn malformed legacy ownership into
+    // permission to reclaim (provenDead must still reject unknown ownership).
+    const evidenceOnly = runtime && typeof runtime === "object"
+      && Object.keys(runtime).length === 1 && "stdoutFallback" in runtime;
     return row ? {
       id: row.id, generation: row.generation, ownerBoot: row.owner_boot,
       state: row.state, identity: row.identity, spec: JSON.parse(row.spec_json),
       acpSessionId: row.acp_session_id, promptStarted: row.prompt_started === 1,
       outcome: row.outcome_json ? JSON.parse(row.outcome_json) : null,
-      runtimeOwner: row.runtime_json ? JSON.parse(row.runtime_json) : null,
+      runtimeOwner: evidenceOnly ? null : runtime,
+      stdoutFallback: runtime?.stdoutFallback,
       providerIdentity: row.provider_identity,
       source: row.source, deliveryDone: row.delivery_done === 1,
       deliveryProtocol: row.delivery_protocol === 1,
@@ -356,8 +365,28 @@ export class TurnAttemptStore {
         `runtime reports provider identity ${providerIdentity ?? "(none)"} but the attempt recorded ${a.providerIdentity}`);
     }
     const owner = pid ? processOwner(pid) : null;
+    const stdoutFallback = this.get(a.id)?.stdoutFallback;
     this.db.prepare("UPDATE turn_attempts SET runtime_json=?, provider_identity=? WHERE id=? AND generation=? AND owner_boot=? AND state='active'")
-      .run(owner ? JSON.stringify(owner) : null, providerIdentity ?? null, a.id, a.generation, a.ownerBoot);
+      .run(owner || stdoutFallback ? JSON.stringify({ ...owner, ...(stdoutFallback ? { stdoutFallback } : {}) }) : null,
+        providerIdentity ?? null, a.id, a.generation, a.ownerBoot);
+  }
+
+  /** #545: retain observed degradation in the existing runtime evidence, not
+   * a second receipt/outcome store. Completion and runtime rebinding preserve
+   * it. Only this active generation may add observations; stale callbacks must
+   * not attribute an old provider's fallback to a replacement's execution. */
+  recordStdoutFallback(a: TurnAttempt, code: string): boolean {
+    const current = this.get(a.id);
+    if (!current) return false;
+    const prior = current.stdoutFallback;
+    const stdoutFallback = {
+      count: (prior?.count ?? 0) + 1,
+      reasons: { ...prior?.reasons, [code]: (prior?.reasons[code] ?? 0) + 1 },
+      lastUtc: new Date().toISOString(),
+    };
+    return this.db.prepare(`UPDATE turn_attempts SET runtime_json=?
+      WHERE id=? AND generation=? AND owner_boot=? AND state='active'`)
+      .run(JSON.stringify({ ...current.runtimeOwner, stdoutFallback }), a.id, a.generation, a.ownerBoot).changes === 1;
   }
 
   assertCurrent(a: TurnAttempt): void {

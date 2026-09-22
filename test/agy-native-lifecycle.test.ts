@@ -56,6 +56,8 @@ describe.sequential("R5 native production lifecycle", () => {
       expect(emitted).toContain("unauthenticated: missing CSRF token");
       expect(log).toHaveBeenCalledWith(expect.stringContaining("unauthenticated: missing CSRF token; using stdout fallback"));
       expect(f.rows().filter(row => row.prompt === "r5-stream-auth")).toHaveLength(1);
+      expect(f.events.filter(event => event.kind === "agy-stdout-fallback"))
+        .toEqual([{ kind: "agy-stdout-fallback", code: "unauthenticated" }]);
     } finally { log.mockRestore(); await f.close(); }
   }, 15_000);
 
@@ -66,6 +68,17 @@ describe.sequential("R5 native production lifecycle", () => {
       const text = f.events.flatMap(event => event.kind === "agent-text" ? [event.text] : []).join("");
       expect(JSON.parse(text)).toEqual({ answer: "OK" });
       expect(f.events.some(event => event.kind === "agent-thought" && event.text.includes("Using stdout only"))).toBe(true);
+      expect(f.events.filter(event => event.kind === "agy-stdout-fallback"))
+        .toEqual([{ kind: "agy-stdout-fallback", code: "unauthenticated" }]);
+    } finally { await f.close(); }
+  }, 15_000);
+
+  it("#545 retains a version-incompatible subscription code, not a generic auth label", async () => {
+    const f = await fixture();
+    try {
+      await expect(f.runtime.prompt("r5-stream-unimplemented")).resolves.toMatchObject({ stopReason: "end_turn" });
+      expect(f.events.filter(event => event.kind === "agy-stdout-fallback"))
+        .toEqual([{ kind: "agy-stdout-fallback", code: "unimplemented" }]);
     } finally { await f.close(); }
   }, 15_000);
 
@@ -77,6 +90,7 @@ describe.sequential("R5 native production lifecycle", () => {
       expect(f.events.some(event => event.kind === "agent-thought")).toBe(true);
       expect(emitted).not.toContain("DO NOT USE STDOUT");
       expect(emitted).not.toContain("Using stdout only");
+      expect(f.events.some(event => event.kind === "agy-stdout-fallback")).toBe(false);
     } finally { await f.close(); }
   }, 15_000);
 
@@ -118,6 +132,7 @@ describe.sequential("R5 native production lifecycle", () => {
       const emitted = JSON.stringify(f.events);
       expect(emitted).toContain("PARTIAL STREAM");
       expect(emitted).not.toContain("STDOUT ONLY");
+      expect(f.events.some(event => event.kind === "agy-stdout-fallback")).toBe(false);
       expect(emitted).not.toContain("Using stdout only");
       expect(log).toHaveBeenCalledWith(expect.stringContaining("unauthenticated: missing CSRF token"));
     } finally { log.mockRestore(); await f.close(); }
@@ -322,6 +337,7 @@ describe.sequential("R5 native production lifecycle", () => {
       // conversation may now recover; its total budget is tested in #448.
       const error = await f.runtime.prompt(prompt, undefined, { recoveryScope: "ephemeral" }).then(() => "unexpected success", error => String(error));
       expect(error).toContain(code);
+      expect(f.events.some(event => event.kind === "agy-stdout-fallback")).toBe(false);
       expect(Date.now() - start).toBeLessThan(5000);
       const row = f.rows().find(row => row.prompt === prompt)!;
       expect(row.pid).toBeTypeOf("number");

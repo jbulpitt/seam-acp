@@ -66,10 +66,22 @@ function setup() {
     authorId: "user", authorIsBot: false, text: "ORIGINAL DISPOSABLE WORK" };
   const run = (host = orch) => (host as any).handleIncomingMessageInner(message) as Promise<void>;
   return { dir, store, started, release, runtime, router, adapter, orch, make, run,
+    fallback: (code: string) => onEvent({ kind: "agy-stdout-fallback", code }),
     emit: (text: string) => onEvent({ kind: "agent-text", text }) };
 }
 
 describe("#250 human turn production pipeline, synthetic transport only", () => {
+  it("#545 records an inbound fallback without changing successful settlement", async () => {
+    const h = setup();
+    h.runtime.prompt.mockImplementation(async () => {
+      await h.fallback("unimplemented");
+      await h.emit("stdout answer");
+      return { stopReason: "end_turn" };
+    });
+    await h.run();
+    expect(h.store.turnAttempts.get("inbound-1")).toMatchObject({ state: "completed",
+      stdoutFallback: { count: 1, reasons: { unimplemented: 1 } } });
+  });
   it("does not let a stale epoch or superseded invocation release input", () => {
     const h = setup();
     expect(h.store.releaseUnstartedInbound("1", 1, new Date().toISOString())).toBe(false);

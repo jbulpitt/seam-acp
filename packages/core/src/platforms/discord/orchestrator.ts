@@ -4118,6 +4118,9 @@ export class Orchestrator {
       const eventHandler = async (event: Parameters<Parameters<typeof activeRuntime.onEvent>[0]>[0]) => {
         if (!this.queueFenceCurrent(queueFence)) return;
         if (!humanOutcomeOwned && !humanCurrent()) return;
+        if (event.kind === "agy-stdout-fallback" && humanAttempt) {
+          this.recordStdoutFallback(humanAttempt, event.code);
+        }
         if (!humanOutcomeOwned && event.kind === "agent-text") humanOutput += event.text;
         // Once the main turn has finalized, further generative activity is
         // output that actually resumed. Flip the card back to Working and,
@@ -5642,6 +5645,18 @@ export class Orchestrator {
     } catch { /* best-effort */ }
   }
 
+  private recordStdoutFallback(attempt: TurnAttempt, code: string): void {
+    try {
+      if (!this.store.turnAttempts.recordStdoutFallback(attempt, code)) {
+        this.logger.warn({ attemptId: attempt.id, code }, "stdout fallback evidence not recorded: attempt no longer current");
+      }
+    } catch (err) {
+      // Refuse only the evidence write on storage failure, never the successful
+      // fallback answer (#545). Report uncertainty rather than claiming a save.
+      this.logger.warn({ err, attemptId: attempt.id, code }, "stdout fallback evidence could not be persisted");
+    }
+  }
+
   /**
    * Run one agent turn **programmatically** — no Discord user message behind
    * it. The single primitive every non-user-initiated turn goes through.
@@ -5681,6 +5696,7 @@ export class Orchestrator {
     let budgetRecord: SessionRecord | undefined;
     const handler: AgentEventHandler = async (event) => {
       if (opts.lifecycle && !opts.lifecycle.isCurrent()) return;
+      if (event.kind === "agy-stdout-fallback") opts.lifecycle?.onStdoutFallback?.(event.code);
       if (event.kind === "model-changed" && budgetIdentity) {
         budgetIdentity = this.contextIdentityForModel(budgetIdentity, event.modelId);
       }
@@ -9694,6 +9710,7 @@ export class Orchestrator {
       let submittedThisAttempt = false;
       const lifecycle: InjectTurnOptions["lifecycle"] = attempt ? {
         isCurrent: () => !this.restartCutoff && this.store.turnAttempts.isCurrent(attempt),
+        onStdoutFallback: code => this.recordStdoutFallback(attempt, code),
         acquire: async operation => {
           try { return await phase.acquire(operation); }
           catch (err) {
@@ -10586,6 +10603,7 @@ export class Orchestrator {
         lifecycle = {
           isCurrent: () =>
             !this.restartCutoff && Boolean(attempt && attemptStore.isCurrent(attempt)),
+          onStdoutFallback: code => { if (attempt) this.recordStdoutFallback(attempt, code); },
           onRuntime: (pid, providerIdentity) => {
             try {
               if (!attempt) {
@@ -12535,6 +12553,7 @@ export class Orchestrator {
         onSession: (sessionId: string) => this.store.turnAttempts.bind(attempt!, sessionId),
         lifecycle: {
           isCurrent: () => !this.restartCutoff && this.store.turnAttempts.isCurrent(attempt!),
+          onStdoutFallback: (code: string) => this.recordStdoutFallback(attempt!, code),
           onRuntime: (pid: number | undefined, providerIdentity?: string) => this.store.turnAttempts.bindRuntime(attempt!, pid, providerIdentity),
           beforePrompt: () => {
             if (this.restartCutoff) {

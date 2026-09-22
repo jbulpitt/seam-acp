@@ -6,7 +6,7 @@ import path from "node:path";
 import { EventEmitter } from "node:events";
 import { PassThrough, Readable, Writable } from "node:stream";
 import { agent, methods, ndJsonStream, PROTOCOL_VERSION, RequestError } from "@agentclientprotocol/sdk";
-import { classifyAgyError, readErrorClassification, type AgentProfile } from "@seam/adapters";
+import { classifyAgyError, readErrorClassification, SEAM_AGY_STDOUT_FALLBACK_META, type AgentProfile } from "@seam/adapters";
 import { pino } from "pino";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
@@ -39,6 +39,7 @@ function setup(location = REMOTE) {
   const calls = { news: [] as any[], loads: [] as any[], prompts: [] as any[], configs: [] as any[], children: [] as any[] };
   const onPrompt = vi.fn(async () => {});
   const afterText = vi.fn(async () => {});
+  const fallback = { code: undefined as string | undefined };
   const logs: any[] = [];
   const logger = pino({ level: "warn" }, { write(line) { logs.push(JSON.parse(line)); } }) as any;
   function spawn() {
@@ -59,7 +60,8 @@ function setup(location = REMOTE) {
       .onRequest(methods.agent.session.prompt, async ({ params, client }) => {
         calls.prompts.push(params); await onPrompt();
         await client.notify(methods.client.session.update, { sessionId: params.sessionId,
-          update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "synthetic result" } } });
+          update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "synthetic result" },
+            ...(fallback.code ? { _meta: { [SEAM_AGY_STDOUT_FALLBACK_META]: { code: fallback.code } } } : {}) } });
         await afterText();
         return { stopReason: "end_turn" };
       })
@@ -88,6 +90,7 @@ function setup(location = REMOTE) {
   const router = { ensureSessionRecord: () => ({ ...record }), getProfile: () => profile, listProfiles: () => [profile],
     resolveProfileForChannel: () => profile, assertAgentAllowedForChannel() {}, assertAgentAllowedForRecord() {},
     reuseMcpServers: vi.fn(() => [globalMcp, seam]), isBusy: () => false,
+    revokeMcpSession: vi.fn(),
     describeConfig: () => ({ agent: { value: profile.id }, model: { value: MODEL }, effort: { value: "high" },
       cwd: { value: cwd }, location: { value: location }, fastMode: { value: false } }) };
   const mux = { spawn: remoteSpawn, rpc: vi.fn(async (_method: string, _params: unknown, _opts?: unknown) => ({ projectMcpInjection: true })), releaseStdin: vi.fn(),
@@ -106,8 +109,37 @@ function setup(location = REMOTE) {
     orch.setBridgeHub(hub as any);
     return orch;
   };
-  return { cwd, store, calls, onPrompt, afterText, logs, logger, localSpawn, remoteSpawn, localDelete, profile, record, row, router, mux, hub, adapter, make, globalMcp, remoteSeam };
+  return { cwd, store, calls, onPrompt, afterText, fallback, logs, logger, localSpawn, remoteSpawn, localDelete, profile, record, row, router, mux, hub, adapter, make, globalMcp, remoteSeam };
 }
+
+describe("#545 durable scheduled degradation", () => {
+  it("records an isolated ingest fallback through real injectTurn and the durable attempt", async () => {
+    const h = setup(); h.fallback.code = "unauthenticated";
+    await h.make().dispatchInjectTurn({ id: "degraded-ingest", target: "headless", kind: "ingest",
+      session: "isolated", agentId: "agy", location: REMOTE, cwd: h.cwd, model: MODEL,
+      prompt: "fixture input", createdUtc: new Date().toISOString() });
+    expect(h.store.turnAttempts.get("degraded-ingest")).toMatchObject({ state: "completed",
+      stdoutFallback: { count: 1, reasons: { unauthenticated: 1 } } });
+  });
+
+  it.each(["unauthenticated", "unimplemented", "http_503", undefined])("records %s without failing a completed remote turn", async code => {
+    const h = setup(), orch = h.make(); h.fallback.code = code;
+    await orch.runScheduledPrompt(h.row.id);
+    const attempts = h.store.turnAttempts.list("completed");
+    expect(attempts).toHaveLength(1);
+    expect(attempts[0]!.outcome).toMatchObject({ status: "completed", output: "synthetic result" });
+    if (code) expect(attempts[0]!.stdoutFallback).toMatchObject({ count: 1, reasons: { [code]: 1 } });
+    else expect(attempts[0]!.stdoutFallback).toBeUndefined();
+  });
+
+  it("does not fail a successful turn when observational storage fails, and reports the gap", async () => {
+    const h = setup(); h.fallback.code = "unauthenticated";
+    vi.spyOn(h.store.turnAttempts, "recordStdoutFallback").mockImplementation(() => { throw new Error("fixture storage fault"); });
+    await h.make().runScheduledPrompt(h.row.id);
+    expect(h.store.turnAttempts.list("completed")).toHaveLength(1);
+    expect(h.logs).toContainEqual(expect.objectContaining({ msg: "stdout fallback evidence could not be persisted", code: "unauthenticated" }));
+  });
+});
 
 describe("#487 production remote construction paths", () => {
   const failAfterText = () => { throw new RequestError(-32603, "Internal error: native AGY exited_early", { code: "exited_early" }); };

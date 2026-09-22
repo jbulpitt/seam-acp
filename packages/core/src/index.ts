@@ -28,6 +28,7 @@ import { SessionStore } from "./core/session-store.js";
 import { DelegationReconciler } from "./core/delegation-reconciler.js";
 import { DELEGATION_TERMINAL_STATUSES } from "./core/types.js";
 import { SessionRouter } from "./core/session-router.js";
+import { turnStalenessBoundMs } from "./core/turn-watchdog.js";
 import {
   shouldIncludeLinkworksOllamaSource,
   shouldRegisterOllamaCloud,
@@ -534,11 +535,12 @@ async function main(): Promise<void> {
       bridgeHub?.markSessionBridge(sessionId, location);
     },
     runtimeIdleTtlMs: config.RUNTIME_IDLE_TTL_SECONDS * 1000,
-    // #442: derived, not chosen. A turn cannot legitimately outlive the turn
-    // timeout, so silence past it means a `busy` belief is stale rather than
-    // the turn being slow — which makes the staleness verdict strictly later
-    // than the deadline that should already have fired.
-    turnStalenessBoundMs: config.TURN_TIMEOUT_SECONDS * 1000,
+    // #442/#460: one silence observation. The prompt deadline fires when output
+    // has been quiet for TURN_TIMEOUT_SECONDS. This bound is that deadline
+    // plus the watchdog grace, so `stalled` is strictly later — it only stops
+    // believing `busy` when the deadline did not end the turn. It is not a
+    // second timer on the same instant.
+    turnStalenessBoundMs: turnStalenessBoundMs(config.TURN_TIMEOUT_SECONDS),
   });
   installAgentLocationDeny(router, config.AGENT_LOCATION_DENY);
   router.startIdleReaper();

@@ -1065,11 +1065,11 @@ export class SessionRouter {
    * advances on real agent output. Where they disagree past the point any
    * legal turn could still be running, the observation wins.
    *
-   * The staleness bound is derived, not chosen: a turn cannot legitimately
-   * outlive `TURN_TIMEOUT_SECONDS`, so silence beyond it means the belief is
-   * wrong rather than the turn being slow. That makes `stalled` strictly
-   * later than the deadline that should already have fired — it fires only
-   * when that deadline did NOT, which is precisely the bug.
+   * The staleness bound is derived, not chosen. The prompt deadline ends a
+   * turn that has been silent for `TURN_TIMEOUT_SECONDS`. The caller passes
+   * that deadline plus the watchdog grace, so `stalled` is strictly later:
+   * it fires only when that deadline did not clear the turn. It is not a
+   * second kill on the same silence.
    */
   turnHealth(sessionId: string, nowMs = Date.now()): {
     busy: boolean;

@@ -84,9 +84,14 @@ export interface InjectTurnOptions {
   /** Attachments to send with the prompt. Empty/omitted ⇒ none. */
   attachments?: ReadonlyArray<MessageAttachment>;
 
-  /** Wall-clock cap on the prompt. Omitted ⇒ no timeout (the compaction
-   *  fan-out deliberately runs unbounded). */
+  /** Silence cap since the runtime's last output. Omitted ⇒ no timeout
+   *  (the compaction fan-out deliberately runs unbounded). Not a wall clock
+   *  from prompt start, and not a hang-probe verdict. */
   timeoutMs?: number;
+
+  /** Bumps the caller's silence clock. The prompt deadline and the watchdog
+   *  read that clock; this does not decide the turn is dead. */
+  noteActivity?: () => void;
 
   /** Drain the runtime's session-update queue before returning, so trailing
    *  text that arrived after the prompt RPC resolved is included in `text`. */

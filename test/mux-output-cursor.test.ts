@@ -76,6 +76,51 @@ async function reconnect(ws: FakeWs, liveSlots: number[]) {
 }
 
 describe("#444 the cursor is what survives a disconnect", () => {
+  it("#431 continues an in-flight slot after a real socket replacement without replaying its prompt", async () => {
+    const disconnects: string[] = [];
+    const { ws, mux, child, chunks } = harness({
+      onDisconnect: () => disconnects.push("disconnected"),
+    });
+    const exits: number[] = [];
+    child.on("exit", () => exits.push(1));
+
+    // Establish the bridge instance and send the prompt exactly once.
+    ws.deliver({ type: "hello", instanceId: "inst-1" });
+    child.stdin.write("session/prompt\n");
+    await flush();
+    expect(ws.sent.filter((frame) => frame.type === "data")).toEqual([
+      { slot: child.slot, type: "data", data: "session/prompt\n" },
+    ]);
+
+    // A link loss says nothing about the child. The mux keeps the slot and the
+    // pending prompt instead of manufacturing agent_exit or retiring it.
+    ws.emit("close");
+    await flush();
+    expect(disconnects).toEqual(["disconnected"]);
+    expect(exits).toEqual([]);
+
+    const replacement = new FakeWs();
+    mux.attach(replacement as never);
+    replacement.deliver({ type: "hello", instanceId: "inst-1" });
+    await flush();
+    const probe = replacement.cmds("listSlots").at(-1)!;
+    replacement.reply(probe, { slots: [child.slot] });
+    await flush();
+
+    // Reconnection repairs the output stream; it must never resend input for
+    // a prompt that already started (#536 owns any future replay policy).
+    expect(replacement.sent.filter((frame) => frame.type === "data")).toEqual([]);
+    const replay = replacement.cmds("replayOutput").at(-1)!;
+    replacement.reply(replay, {
+      slot: child.slot,
+      frames: [{ seq: 1, type: "data", data: "missed response\n" }],
+    });
+    await flush();
+
+    expect(chunks.join("")).toBe("missed response\n");
+    expect(exits).toEqual([]);
+  });
+
   it("carries live remote SIGKILL and OOM evidence to the fake child", async () => {
     const { ws, child } = harness();
     const exits: Array<[number | null, string | null]> = [];

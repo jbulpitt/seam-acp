@@ -363,9 +363,10 @@ describe("bridge rollout gating and verification (#241)", () => {
     expect(local).toContain("await runActivation(");
     expect(local).not.toContain('console.error("activation=failed_or_incomplete")');
     expect(local).not.toContain("activation=deployed_verification_unconfirmed");
-    expect(remote).toContain("activation=deployed_verification_unconfirmed");
-    expect(remote.indexOf('console.log("verification_reason=activation_receipt_timeout")'))
-      .toBeLessThan(remote.indexOf("console.log(`rollback_command="));
+    expect(remote).toContain("activation=verification_failed");
+    expect(remote).toContain("verification_reason=catalog_rpc_not_observed");
+    expect(remote).toContain('reason: "activation_hello_timeout"');
+    expect(remote).not.toContain("activation_receipt_timeout");
   });
 
   it("contains SIGUSR2 only and no secret-bearing or immediate PM2 command", () => {

@@ -448,47 +448,58 @@ deadline. It atomically switches only the stable entrypoint and sends only
 `SIGUSR2` to the proven old PID.
 
 Within the bounded timeout, success requires positive observation that the old
-PID exited; a distinct, owned PID appeared in the exact PID file; PM2 still maps
-that PID to the exact app/interpreter/cwd/stable entrypoint/argv; the stable
-entrypoint resolves to the requested release; and that process presents the
-exact activation nonce and PID in its hello. The controller must accept that
-exact bridge ID and instance, call `describeModelCatalog` and `fetchModelCatalog`
-successfully on that same connection, and echo the nonce, bridge ID, instance ID,
-and PID, plus the exact source SHA and artifact checksum it received from that
-connection. The bridge rejects an acknowledgement whose artifact identity does
-not exactly equal its activation envelope. It writes the in-window receipt.
+PID exited; a distinct, owned PID appeared in the exact PID file; the supervisor
+still maps that PID to the exact app/interpreter/cwd/stable entrypoint/argv; the
+stable entrypoint resolves to the requested release; and that process presents
+the exact activation nonce and PID in its hello. The deployed tree must still
+advertise protocol 1, `SIGUSR2` drain, and rollout readiness.
+
+Catalog reachability is a stronger claim than deployed. The running controller
+already refreshes one binding on hello (`verifyStagedReleaseCatalogRpcs`); that
+is not the periodic fleet sweep, and activation does not wait for the sweep.
+After the replacement is up, activation watches the receipt for 20 seconds —
+long enough for the on-hello call. Do not lengthen that watch to the refresh
+interval.
+
+- A binding receipt with both catalog RPCs and a matching controller ack is
+  `activation=verified` and `catalog_rpcs_verified=yes`. The record is
+  `.verified.json` with `verification.forward` `receipt`.
+- Hello with no settled catalog receipt is still `activation=verified`,
+  `catalog_rpcs_verified=no`, and `verification_reason=catalog_rpc_not_observed`.
+  The record is `.verified.json` with `verification.forward` `hello`. That is
+  not a failure.
+- A receipt that binds and then contradicts this activation (a start time
+  before the window, or a controller ack for this activation id that
+  disagrees), or a replacement that never reconnects, is
+  `activation=verification_failed` with a named reason and `.failed.json`.
+  A receipt left by an earlier activation of the same release is not that
+  contradiction; activation waits for the replacement to overwrite it. The
+  remote command exits 0 so the named lines are the report and rollback stays
+  available. A pointer, PID, or supervisor identity that changes during the
+  re-check is still a hard failure.
+
 Catalog RPC timestamps and the controller-ack stamp are concurrent event
-streams: the controller may ack identity before catalog RPCs finish recording.
-Order is enforced within each stream; a total order across them produced a
-false `unconfirmed` on plex-server (#483, 3ms). Membership in the activation
-window allows 2s of NTP skew across streams. Only then is an
-immutable `.verified.json` activation record written. The activation ID and its
-exact rollback command are recorded before signaling so they remain recoverable
-if activation itself fails. Once the replacement PID and entrypoint are proven, an
-immutable `.observed.json` is also written; it permits an explicit rollback of a
-replacement whose catalog/receipt verification timed out without guessing a PID.
-The intent and observation mark receipt verification as pending; only a valid
-receipt changes `catalogRpcsVerified` to true in `.verified.json`.
+streams. Order is enforced within each stream on the settled receipt. The
+window allows 2s of NTP skew across streams. A mid-write snapshot, including
+fetch stamped before describe, is not treated as tampering. The bridge rejects
+an acknowledgement whose artifact identity does not exactly equal its
+activation envelope.
 
-A receipt timeout after those deployment facts are proven is not reported as a
-failed activation. The remote checker re-proves the active symlink target, old
-PID exit, replacement PID/PM2 identity and process start time; re-runs the
-deployed release's protocol, drain and both catalog capability checks once; and
-then re-reads the receipt once to close the deadline race. If the receipt is
-still unavailable, it writes an immutable `.unconfirmed.json` record and
-reports `activation=deployed_verification_unconfirmed`. Operator output leads
-with the deployed SHA/checksum, live target, process evidence, verification
-agent, and post-activation capability flags. It then names the missing proof
-and offers the explicit rollback command last. This refuses only confirmation:
-it does not claim the deployment failed or steer an operator toward stale code.
-If the pointer, PID or PM2 identity changed during the re-check, the command
-still fails because the deployment outcome is genuinely ambiguous.
+The activation ID and its exact rollback command are recorded before signaling
+so they remain recoverable if activation itself fails. Once the replacement PID
+and entrypoint are proven, an immutable `.observed.json` is also written; it
+permits an explicit rollback of a replacement without guessing a PID.
 
-A stale/shared receipt, different process, different connection, or missing RPC
-cannot satisfy the receipt gate; a live old PID or changed replacement identity
-remains an activation failure. The runner also bounds
-wall time and stdout/stderr bytes, kills and awaits an over-limit subprocess,
-cleans listeners/timers, and returns symbolic/redacted diagnostics.
+Operator output for a failed verification leads with the deployed SHA/checksum,
+live target, process evidence, verification agent, and post-activation
+capability flags. It then names the reason and offers the explicit rollback
+command last. A hello-only success is not reported as a failure, and a failed
+verification is not reported as a success.
+
+A live old PID or a changed replacement identity remains an activation failure.
+The runner also bounds wall time and stdout/stderr bytes, kills and awaits an
+over-limit subprocess, cleans listeners/timers, and returns symbolic/redacted
+diagnostics.
 
 The ready receipt also carries secret-free adapter refusals from the replacement
 bridge. A verified activation with one or more refusals remains active and prints
@@ -528,10 +539,15 @@ must bind it to the same failed activation. The current failed release, its
 activation envelope, and the exact previous release receipt/tree are fully
 revalidated before any switch. ROLLBACK then writes an immutable rollback
 intent, atomically restores the exact previous entrypoint, and sends only
-`SIGUSR2` to the currently proven PID. It applies the same old-exit/new-PID/PM2/
-entrypoint/fresh-handshake/two-RPC proof to the previous SHA, checksum, stage ID,
-and a new rollback nonce. Success produces an immutable versioned rollback
-outcome; mutable target-only state is never used.
+`SIGUSR2` to the currently proven PID. It applies the same old-exit/new-PID/
+supervisor/entrypoint proof, and the same 20s hello observation, to the
+previous SHA, checksum, stage ID, and a new rollback nonce. Catalog RPCs in
+that window are recorded when they arrive; they are not a second wait on the
+fleet sweep. A verified forward record does not require its receipt file to
+stay byte-identical. Later catalog RPCs for other agents append to it.
+Rollback refuses that record only when the activation id, pid, source SHA, or
+artifact checksum no longer match. Success produces an immutable versioned
+rollback outcome; mutable target-only state is never used.
 
 ## Locks and recovery boundaries
 

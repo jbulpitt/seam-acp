@@ -221,7 +221,7 @@ describe("#419 the trap: unsettled completions are reachable by an operator", ()
     expect(row.id).toBe("b27578fe");
     expect(row.status).toBe("interrupted");
     expect(row.targetRef).toBeNull();
-    expect(row.reason).toMatch(/holds thread admission until abandoned/);
+    expect(row.reason).toMatch(/output retained, ages out after one hour without claiming delivery/);
     expect(interruptedRowActions(row)).toEqual(["abandon"]);
   });
 
@@ -253,7 +253,7 @@ describe("#419 the trap: unsettled completions are reachable by an operator", ()
       correlationId: null, status: "interrupted" as const,
       startedUtc: "2026-09-17T22:36:57.301Z", acpSessionId: "01a078e3",
       targetRef: null,
-      reason: "completed but never settled its delivery disposition; it holds thread admission until abandoned",
+      reason: "completed without a delivery disposition; output retained, ages out after one hour without claiming delivery",
     };
     // Abandon offered, Resume withheld — the precise control set.
     expect(interruptedRowActions(row)).toEqual(["abandon"]);

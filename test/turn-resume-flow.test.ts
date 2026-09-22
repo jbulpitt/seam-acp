@@ -719,8 +719,10 @@ describe("watcher recoverStale vs resumeEnabled", () => {
     const notice = sent.find((message) => message.channel === "thread-boss")!.text;
     expect(notice).toContain("execution failed before the provider took the turn");
     expect(notice).not.toContain("is stalled after restart");
+    // #426: quarantine remains explicit below and is never auto-retried, but
+    // deleting idle classification would mislabel the otherwise empty queue.
     expect(orch.inspectChannelQueue("thread-worker", Date.now())).toMatchObject({
-      state: "stalled",
+      state: "idle",
       runtimeBusy: false,
       stalledDispatchCount: 1,
       stalledDispatchIds: [spec.id],

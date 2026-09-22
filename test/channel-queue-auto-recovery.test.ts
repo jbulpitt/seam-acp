@@ -101,6 +101,27 @@ function admitStale(messageId: string, createdUtc = "2026-09-19T00:00:00.000Z"):
 }
 
 describe("#423 a wedged thread self-heals without an operator", () => {
+  // #509: deleting idle fallthrough poisons an empty queue; deleting diagnostics hides genuine non-retryable defects.
+  it("reports idle with stale completion receipts and retained defects, without retrying either", async () => {
+    const { host } = makeHost();
+    const finished = { id: "receipt", target: CHANNEL, prompt: "p", session: "live" } as never;
+    store.turnAttempts.admit(finished);
+    store.turnAttempts.completePending("receipt", {
+      id: "receipt", target: CHANNEL, status: "completed", output: "retained", finishedUtc: new Date().toISOString(),
+    });
+    const defect = { id: "defect", target: CHANNEL, prompt: "p", session: "live" } as never;
+    store.turnAttempts.admit(defect);
+    store.turnAttempts.markStalled("defect", "defect: session binding missing");
+    const before = store.turnAttempts.get("defect");
+    expect(host.inspectChannelQueue(CHANNEL)).toMatchObject({
+      state: "idle", runtimeBusy: false, queued: 0,
+      stalledDispatchIds: ["defect"], unsettledDispatchIds: ["receipt"],
+    });
+    expect(await host.sweepWedgedQueues()).toEqual([]);
+    expect(store.turnAttempts.get("defect")).toEqual(before);
+    expect(store.listConfigMutations()).toEqual([]);
+  });
+
   it("recovers a real wedge in one sweep, with no human action", async () => {
     // The acceptance case, built rather than asserted: a durable admission
     // sitting behind an idle runtime, older than the grace period.

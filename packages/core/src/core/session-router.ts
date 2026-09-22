@@ -1,6 +1,10 @@
 import path from "node:path";
 import { AgentRuntime, SessionLoadTimeoutError, type BridgeHealthSource } from "../agents/agent-runtime.js";
-import { asRemoteCatalogAdapter, type AgentProfile, type CatalogModelEvidence } from "@seam/adapters";
+import {
+  asRemoteCatalogAdapter,
+  type AgentProfile,
+  type CatalogModelEvidence,
+} from "@seam/adapters";
 import type { Logger } from "../lib/logger.js";
 import type { SessionStore } from "./session-store.js";
 import type { SessionRecord, PermissionPolicyMode, StatusCardStyle } from "./types.js";
@@ -28,6 +32,7 @@ import { handleElicitationWithPermissionPolicy } from "./elicitation/approval-po
 import {
   planSeamMcpInjection,
   spawnRemoteSlot,
+  DEFAULT_REMOTE_RUNG1_POLICY,
   type MuxHandle,
 } from "./remote-spawn.js";
 import { bindingKey } from "./model-catalog/service.js";
@@ -1299,6 +1304,7 @@ export class SessionRouter {
           modelFallbacks: this.planModelFallbacks({ agentId, location }, modelOverride ?? model, effortOverride, fallbackContextTokens),
           effort: effortOverride,
           cwd,
+          rung1Recovery: DEFAULT_REMOTE_RUNG1_POLICY,
         });
     }
 

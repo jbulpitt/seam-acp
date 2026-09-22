@@ -31,11 +31,20 @@ function fixture(options: { output?: boolean; tool?: boolean; failures?: number;
 }
 
 describe("#448 one bounded prompt owner", () => {
-  it("recovers the measured refresh race before output on the same session", async () => {
+  it("continues the measured unknown-acceptance refresh race without resending", async () => {
     const { runtime, prompt } = fixture({ failures: 2 });
     await expect(runtime.prompt("original brief")).resolves.toMatchObject({ stopReason: "end_turn" });
     expect(prompt).toHaveBeenCalledTimes(3);
-    expect(prompt.mock.calls.map(([request]) => request)).toEqual(Array(3).fill({ sessionId: "s1", prompt: [{ type: "text", text: "original brief" }] }));
+    const requests = prompt.mock.calls.map(([request]) => request as {
+      sessionId: string;
+      prompt: Array<{ type: string; text: string }>;
+    });
+    expect(requests[0]).toEqual({ sessionId: "s1", prompt: [{ type: "text", text: "original brief" }] });
+    expect(requests.slice(1).map((request) => request.prompt[0]!.text)).toEqual([
+      expect.stringMatching(/^continue\n[\s\S]*retry 1 of 3/),
+      expect.stringMatching(/^continue\n[\s\S]*retry 2 of 3/),
+    ]);
+    expect(JSON.stringify(requests.slice(1))).not.toContain("original brief");
   });
 
   it.each(["text", "tool"])("continues after %s output instead of refusing or replaying", async kind => {

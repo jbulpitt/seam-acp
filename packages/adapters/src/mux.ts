@@ -12,6 +12,12 @@ import type {
 import { WebSocket } from "ws";
 import type { EventFrame, HelloFrame, RpcReplyFrame } from "./command-bus.js";
 import { PROTOCOL_VERSION } from "./command-bus.js";
+import {
+  isRemoteRecoveryResult,
+  isRemoteRecoverySnapshot,
+  type RemoteRecoveryResult,
+  type RemoteRecoverySnapshot,
+} from "./remote-recovery.js";
 
 /**
  * How long spawn() will wait for a bridge connection before emitting an error
@@ -91,6 +97,8 @@ export interface BridgeSlotHealth {
   /** Null when the bridge has never observed the event, never 0. */
   lastStdoutMsAgo: number | null;
   lastStdinMsAgo: number | null;
+  /** Child-owner facts, never inferred from socket state or silence (#467). */
+  recovery?: RemoteRecoverySnapshot;
 }
 
 /** Facts captured at the instant the server gives up on one bridge socket. */
@@ -153,6 +161,8 @@ interface MuxMsg {
     | "rpc"
     | "rpc_reply"
     | "event"
+    | "recovery"
+    | "recovery_result"
     | "ping"
     | "pong"
     | "bridge_hello";
@@ -175,6 +185,8 @@ interface MuxMsg {
   bridgeId?: string;
   protocolVersion?: number;
   name?: string;
+  recovery?: RemoteRecoverySnapshot;
+  recoveryResult?: RemoteRecoveryResult;
 }
 
 interface SlotEntry {
@@ -287,6 +299,9 @@ export function makeMux(opts: {
    * on whether a prompt is outstanding, and that fact lives in seam-acp.
    */
   onSlotHealth?: (health: readonly BridgeSlotHealth[]) => void;
+  /** #467: closed bridge-owned recovery facts carried on the existing slot
+   * stream. Consumers may display them but must not re-derive liveness. */
+  onRemoteRecovery?: (slot: number, recovery: RemoteRecoverySnapshot) => void;
   /** #436: fired when liveness terminates a socket, before `close`. */
   onLivenessTimeout?: (event: BridgeLivenessTimeout) => void;
   /**
@@ -581,6 +596,8 @@ export function makeMux(opts: {
                   code?: number;
                   signal?: string | null;
                   hostOom?: RemoteHostOomEvidence;
+                  recovery?: RemoteRecoverySnapshot;
+                  recoveryResult?: RemoteRecoveryResult;
                 }>;
                 gap?: { afterSeq: number; firstAvailableSeq: number; droppedFrames: number };
               }) => {
@@ -594,6 +611,13 @@ export function makeMux(opts: {
                   if (frame.type === "data" && typeof frame.data === "string") {
                     if (typeof frame.seq === "number") outputCursor.set(slot, frame.seq);
                     live.stdout.push(frame.data);
+                  } else if (frame.type === "recovery" && isRemoteRecoverySnapshot(frame.recovery)) {
+                    if (typeof frame.seq === "number") outputCursor.set(slot, frame.seq);
+                    opts.onRemoteRecovery?.(slot, frame.recovery);
+                    live.fake.emit("remoteRecovery", frame.recovery);
+                  } else if (frame.type === "recovery_result" && isRemoteRecoveryResult(frame.recoveryResult)) {
+                    if (typeof frame.seq === "number") outputCursor.set(slot, frame.seq);
+                    live.fake.emit("remoteRecoveryResult", frame.recoveryResult);
                   } else if (frame.type === "exit") {
                     applyRemoteExit(slot, live, frame);
                   }
@@ -671,6 +695,11 @@ export function makeMux(opts: {
         // replay" — today's behaviour exactly.
         if (typeof msg.seq === "number") outputCursor.set(msg.slot, msg.seq);
         entry.stdout.push(msg.data);
+      } else if (msg.type === "recovery" && isRemoteRecoverySnapshot(msg.recovery)) {
+        opts.onRemoteRecovery?.(msg.slot, msg.recovery);
+        entry.fake.emit("remoteRecovery", msg.recovery);
+      } else if (msg.type === "recovery_result" && isRemoteRecoveryResult(msg.recoveryResult)) {
+        entry.fake.emit("remoteRecoveryResult", msg.recoveryResult);
       } else if (msg.type === "exit") {
         applyRemoteExit(msg.slot, entry, msg);
       }
@@ -698,8 +727,12 @@ export function makeMux(opts: {
     });
   }
 
-  function spawn(spawnOpts?: MuxSpawnOpts): MuxChild {
-    const slot = nextSlot++;
+  function bindSlot(
+    slot: number,
+    spawnOpts: MuxSpawnOpts | undefined,
+    waitForBridge: boolean,
+    allowInput: boolean,
+  ): MuxChild {
     const stdinPT = new PassThrough();
     const stdoutPT = new PassThrough();
     const stderrPT = new PassThrough();
@@ -738,6 +771,10 @@ export function makeMux(opts: {
     stdinPT.on("data", (chunk: Buffer) => {
       const entry = slots.get(slot);
       if (!entry || entry.killed) return;
+      // An adopted binding exists only to consume the exact retained result.
+      // Silently consuming accidental writes here is safer than letting a
+      // fresh controller submit anything to the pre-restart child.
+      if (!allowInput) return;
       const text = chunk.toString("utf8");
       if (bridgeWs?.readyState === WebSocket.OPEN && !entry.holdStdin) {
         // Flush any previously buffered data first.
@@ -751,7 +788,7 @@ export function makeMux(opts: {
     });
 
     // If bridge isn't online yet, start a connect timeout.
-    if (!bridgeWs || bridgeWs.readyState !== WebSocket.OPEN) {
+    if (waitForBridge && (!bridgeWs || bridgeWs.readyState !== WebSocket.OPEN)) {
       const timeout = setTimeout(() => {
         const idx = bridgeWaiters.findIndex((w) => w.slot === slot);
         if (idx >= 0) bridgeWaiters.splice(idx, 1);
@@ -770,6 +807,65 @@ export function makeMux(opts: {
     }
 
     return fake as unknown as MuxChild;
+  }
+
+  function spawn(spawnOpts?: MuxSpawnOpts): MuxChild {
+    return bindSlot(nextSlot++, spawnOpts, true, true);
+  }
+
+  /**
+   * Re-bind a fresh controller to a slot proven by its durable attempt ledger
+   * and the bridge snapshot (#467). No spawn frame and no stdin are sent.
+   * Existing local ownership is never replaced.
+   */
+  function adopt(slot: number): MuxChild {
+    if (!Number.isSafeInteger(slot) || slot < 0) throw new Error("adopt requires a non-negative slot");
+    if (slots.has(slot)) throw new Error(`slot ${slot} is already bound in this controller`);
+    nextSlot = Math.max(nextSlot, slot + 1);
+    const child = bindSlot(slot, undefined, false, false);
+    // Replay begins after this function returns, so the caller can attach its
+    // result listener first. A missing/old bridge refuses this adoption only.
+    queueMicrotask(() => {
+      const entry = slots.get(slot);
+      if (!entry || entry.killed) return;
+      void sendCmd("replayOutput", { slot, afterSeq: 0 }).then((reply: {
+        frames?: Array<{
+          seq?: number;
+          type?: string;
+          data?: string;
+          code?: number;
+          signal?: string | null;
+          hostOom?: RemoteHostOomEvidence;
+          recovery?: RemoteRecoverySnapshot;
+          recoveryResult?: RemoteRecoveryResult;
+        }>;
+        gap?: { afterSeq: number; firstAvailableSeq: number; droppedFrames: number };
+      }) => {
+        const live = slots.get(slot);
+        if (!live || live.killed) return;
+        if (reply?.gap) opts.onOutputGap?.(slot, reply.gap);
+        for (const frame of reply?.frames ?? []) {
+          if (frame.type === "data" && typeof frame.data === "string") {
+            if (typeof frame.seq === "number") outputCursor.set(slot, frame.seq);
+            live.stdout.push(frame.data);
+          } else if (frame.type === "recovery" && isRemoteRecoverySnapshot(frame.recovery)) {
+            if (typeof frame.seq === "number") outputCursor.set(slot, frame.seq);
+            opts.onRemoteRecovery?.(slot, frame.recovery);
+            live.fake.emit("remoteRecovery", frame.recovery);
+          } else if (frame.type === "recovery_result" && isRemoteRecoveryResult(frame.recoveryResult)) {
+            if (typeof frame.seq === "number") outputCursor.set(slot, frame.seq);
+            live.fake.emit("remoteRecoveryResult", frame.recoveryResult);
+          } else if (frame.type === "exit") {
+            applyRemoteExit(slot, live, frame);
+          }
+        }
+        const through = outputCursor.get(slot);
+        if (through) void sendCmd("ackOutput", { slot, throughSeq: through }).catch(() => {});
+      }).catch((error) => {
+        child.emit("error", error);
+      });
+    });
+    return child;
   }
 
   async function sendCmd(action: string, payload: any): Promise<any> {
@@ -849,5 +945,5 @@ export function makeMux(opts: {
     return !!bridgeWs && bridgeWs.readyState === WebSocket.OPEN;
   }
 
-  return { attach, spawn, sendCmd, rpc, sendFrame, helloAck, connected, releaseStdin };
+  return { attach, spawn, adopt, sendCmd, rpc, sendFrame, helloAck, connected, releaseStdin };
 }

@@ -10,6 +10,7 @@ import { discordRenderer } from "../packages/core/src/platforms/discord/renderer
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 import { listLiveMarkers } from "../packages/core/src/core/dispatch/turn-resume.js";
 import type { DeliveryNonceLookup } from "../packages/core/src/platforms/chat-adapter.js";
+import { EventEmitter } from "node:events";
 
 const cleanups: (() => void)[] = [];
 afterEach(() => { for (const f of cleanups.splice(0).reverse()) f(); vi.restoreAllMocks(); });
@@ -54,10 +55,11 @@ function setup() {
   const config = { DATA_DIR: dir, REPOS_ROOT: "/synthetic", TURN_TIMEOUT_SECONDS: 60,
     DEFAULT_MODEL: "test", REPO_EMOJIS: new Map(), SEAM_TURN_RESUME_ENABLED: true,
     channelPresets: new Map(), threadPresets: new Map() };
-  const make = () => {
+  const make = (bridgeHub?: unknown) => {
     const orch = new Orchestrator({ logger: pino({ level: "silent" }) as any,
       modelCatalog: fixtureModelCatalog([]), store, router: router as any,
       adapter: adapter as any, renderer: discordRenderer as any, config: config as any });
+    if (bridgeHub) orch.setBridgeHub(bridgeHub as any);
     vi.spyOn(orch as any, "checkResumePreconditions").mockResolvedValue("ok");
     return orch;
   };
@@ -72,6 +74,85 @@ function setup() {
 }
 
 describe("#250 human turn production pipeline, synthetic transport only", () => {
+  it("#467 adopts a bridge result after a full controller restart without resubmitting", async () => {
+    const h = setup();
+    const attempts = h.store.turnAttempts;
+    attempts.registerOwner("pre-restart-owner");
+    const attempt = attempts.claim({
+      id: "inbound-1",
+      target: "worker",
+      prompt: "ORIGINAL DISPOSABLE WORK",
+      session: "live",
+      kind: "parked",
+      createdUtc: new Date().toISOString(),
+    }, "synthetic-identity", "pre-restart-owner", "inbound");
+    attempts.bind(attempt, "recorded-acp");
+    attempts.startPrompt(attempt);
+    expect(attempts.recordRemoteRecovery(attempt, {
+      version: 1,
+      location: "remote-one",
+      slot: 6,
+      submissionId: "submission-6",
+      acpSessionId: "recorded-acp",
+      delegatedUtc: "2026-09-22T12:00:00.000Z",
+    })).toBe(true);
+    expect(attempts.suspendBoot("pre-restart-owner")).toBe(1);
+
+    const adopted = new EventEmitter() as EventEmitter & { kill: ReturnType<typeof vi.fn> };
+    adopted.kill = vi.fn();
+    const mux = {
+      sendCmd: vi.fn(async () => ({ health: [{
+        slot: 6,
+        recovery: {
+          version: 1,
+          owner: "bridge",
+          submissionId: "submission-6",
+          acpSessionId: "recorded-acp",
+          rung: 1,
+          phase: "succeeded",
+          retry: 1,
+          budget: 3,
+          remaining: 2,
+          disposition: "none",
+          terminalReason: "completed",
+          updatedUtc: "2026-09-22T12:01:00.000Z",
+        },
+      }] })),
+      adopt: vi.fn(() => {
+        queueMicrotask(() => adopted.emit("remoteRecoveryResult", {
+          version: 1,
+          submissionId: "submission-6",
+          acpSessionId: "recorded-acp",
+          status: "completed",
+          text: "result completed while Seam was restarting",
+          stopReason: "end_turn",
+          finishedUtc: "2026-09-22T12:01:00.000Z",
+        }));
+        return adopted;
+      }),
+    };
+    const bridgeHub = { muxFor: (location: string) => location === "remote-one" ? mux : undefined,
+      slotHealthFor: () => [] };
+
+    const restarted = h.make(bridgeHub);
+    await restarted.recoverInterruptedTurns();
+    for (let i = 0; i < 8; i += 1) await new Promise((resolve) => setImmediate(resolve));
+
+    expect(mux.adopt).toHaveBeenCalledWith(6);
+    expect(h.runtime.prompt).not.toHaveBeenCalled();
+    expect(h.adapter.sendMessage).toHaveBeenCalledTimes(1);
+    expect(h.adapter.sendMessage.mock.calls[0]?.[1]).toBe("result completed while Seam was restarting");
+    expect(attempts.get("inbound-1")).toMatchObject({
+      state: "completed",
+      deliveryDone: true,
+      outcome: { output: "result completed while Seam was restarting" },
+    });
+    expect(h.store.getInbound("1")?.state).toBe("completed");
+    await vi.waitFor(() => expect(adopted.kill).toHaveBeenCalledTimes(1));
+    // Mutation proof: removing recoverInterruptedTurns' re-binding leaves the
+    // row suspended and this exact result never reaches the original thread.
+  });
+
   // #536: deleting the inbound hook must lose the new snapshot, not silently pass on the initial intent alone.
   it("records inbound submission observations on the existing receipt", async () => {
     const h = setup();

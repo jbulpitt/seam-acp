@@ -41,6 +41,7 @@ import {
   readErrorClassification,
   resolveError,
   unclassified,
+  isRemoteRecoverySnapshot,
   type AgentProfile,
   type AdapterErrorClassification,
   type CatalogEffort,
@@ -70,6 +71,25 @@ import type {
 
 /** The existing bridge control command, pinned to the mux that owns this child. */
 export type BridgeHealthSource = Pick<ReturnType<typeof makeMux>, "sendCmd">;
+
+export interface RemoteRecoveryDelegation {
+  version: 1;
+  slot: number;
+  submissionId: string;
+  acpSessionId: string;
+  delegatedUtc: string;
+}
+
+interface PromptOptions {
+  jsonSchema?: Record<string, unknown>;
+  recoveryScope?: "conversation" | "ephemeral";
+  submissionEvidence?: SubmissionEvidence;
+  /** Must durably bind the attempt before the original prompt is written. */
+  onRemoteRecovery?: (binding: RemoteRecoveryDelegation) => void | Promise<void>;
+  /** Removes that exact durable binding only when the bridge proves it never
+   * observed the prompt request. This is a failed operation, never fail-back. */
+  onRemoteRecoveryReleased?: (binding: RemoteRecoveryDelegation) => void | Promise<void>;
+}
 
 /** Events surfaced from the ACP `session/update` stream. */
 export interface AsyncUserInputQuestion {
@@ -992,7 +1012,7 @@ export class AgentRuntime {
   async prompt(
     text: string,
     attachments?: ReadonlyArray<MessageAttachment>,
-    opts?: { jsonSchema?: Record<string, unknown>; recoveryScope?: "conversation" | "ephemeral"; submissionEvidence?: SubmissionEvidence }
+    opts?: PromptOptions
   ): Promise<PromptOutcome> {
     const receipt = { submission: opts?.submissionEvidence ?? newSubmissionEvidence(this.sessionId ?? null) };
     receipt.submission.adapterId = this.profile.id;
@@ -1105,7 +1125,7 @@ export class AgentRuntime {
     receipt: { submission: SubmissionEvidence },
     text: string,
     attachments?: ReadonlyArray<MessageAttachment>,
-    opts?: { jsonSchema?: Record<string, unknown>; recoveryScope?: "conversation" | "ephemeral" }
+    opts?: PromptOptions
   ): Promise<PromptOutcome> {
     const conn = this.requireConnection();
     const sid = this.requireSessionId();
@@ -1170,6 +1190,52 @@ export class AgentRuntime {
     if (this.getSlot() !== undefined && this.bridgeHealth?.sendCmd) {
       void this.watchInFlightHang(hangAbort.signal);
     }
+    let remoteRecoveryDelegated = false;
+    let remoteRecoveryBinding: RemoteRecoveryDelegation | undefined;
+    const slot = this.getSlot();
+    if (
+      slot !== undefined
+      && (this.child as { remoteRung1Recovery?: unknown } | undefined)?.remoteRung1Recovery === true
+      && this.bridgeHealth?.sendCmd
+      && opts?.onRemoteRecovery
+      && opts.onRemoteRecoveryReleased
+    ) {
+      const snapshot = await this.bridgeHealth.sendCmd("armRung1Recovery", {
+        slot,
+        submissionId: receipt.submission.id,
+        acpSessionId: sid,
+        // Never the original brief. All adapters share this ACP prompt path,
+        // so this is the same no-replay guarantee for every remote profile.
+        continuation: CONTINUE_PROMPT,
+      });
+      if (!isRemoteRecoverySnapshot(snapshot)
+        || snapshot.submissionId !== receipt.submission.id
+        || snapshot.acpSessionId !== sid
+        || snapshot.phase !== "armed") {
+        throw new Error("remote rung-1 recovery acknowledgement was invalid");
+      }
+      const binding: RemoteRecoveryDelegation = {
+          version: 1,
+          slot,
+          submissionId: receipt.submission.id,
+          acpSessionId: sid,
+          delegatedUtc: snapshot.updatedUtc,
+      };
+      try {
+        await opts.onRemoteRecovery(binding);
+      } catch (error) {
+        // The bridge has not observed prompt bytes yet, so this is the one safe
+        // point to undo delegation. A failed durable bind refuses this prompt;
+        // it never creates two retry owners.
+        await this.bridgeHealth.sendCmd("disarmRung1Recovery", {
+          slot,
+          submissionId: receipt.submission.id,
+        }).catch(() => {});
+        throw error;
+      }
+      remoteRecoveryDelegated = true;
+      remoteRecoveryBinding = binding;
+    }
     // Captured so the teardown fail-safe below can tell a CLEAN completion
     // (end_turn) from an abnormal one (cancel/abort/error). Stays undefined if
     // the RPC rejects (dispose/child-death) — which is itself an abnormal end.
@@ -1203,15 +1269,46 @@ export class AgentRuntime {
       // Only rung 1 executes here. Session/model-changing rungs need upstream
       // identity transactions; #467 owns the eventual daemon executor.
       let retryBudget = 0;
-      const res = await runBoundedRecovery({
-        run: async () => {
+      const run = async () => {
           const evidence = receipt.submission;
           evidence.phase = "rpc_invoked";
           evidence.rpcInvokedUtc = new Date().toISOString();
           this.receivingSubmission = evidence;
           await this.publishSubmission(evidence);
           return this.withClassifiedErrors("session/prompt", sendPrompt);
-        },
+        };
+      let res: { stopReason: string };
+      if (remoteRecoveryDelegated) {
+        try {
+          res = await run();
+        } catch (error) {
+          // A rejected write is not proof that the bridge missed the bytes.
+          // Ask the bridge that observed the stream. Only its positive disarm
+          // acknowledgement permits removal of the durable owner, and even
+          // then this operation fails rather than falling back to local retry.
+          const release = remoteRecoveryBinding && opts?.onRemoteRecoveryReleased;
+          let disarmed: unknown;
+          if (release && remoteRecoveryBinding && this.bridgeHealth?.sendCmd) {
+            try {
+              disarmed = await this.bridgeHealth.sendCmd("disarmRung1Recovery", {
+                slot: remoteRecoveryBinding.slot,
+                submissionId: remoteRecoveryBinding.submissionId,
+              });
+            } catch {
+              // Unknown means retain the bridge owner. Local recovery may not
+              // infer that the unobserved acknowledgement was negative.
+            }
+          }
+          if (release && disarmed !== null && typeof disarmed === "object"
+            && !Array.isArray(disarmed)
+            && (disarmed as { disarmed?: unknown }).disarmed === true) {
+            await release(remoteRecoveryBinding!);
+          }
+          throw error;
+        }
+      } else {
+        res = await runBoundedRecovery({
+        run,
         signal: recoveryAbort.signal,
         delays: error => {
           const resolution = resolveError(readErrorClassification(error) ?? unclassified(this.profile.id), DEFAULT_ERROR_RULES);
@@ -1231,7 +1328,9 @@ export class AgentRuntime {
           return schedule;
         },
         onRetry: async (_error, retry, delayMs) => {
-          continuing ||= this.sawUpdateThisTurn;
+          // #536/#467: unknown acceptance makes RESEND unsafe, not continue.
+          // Only positive rpc_never_invoked evidence permits original replay.
+          continuing = receipt.submission.acceptance.state !== "not_accepted";
           await this.publishSubmission(receipt.submission);
           const previousSubmissionId = receipt.submission.id;
           const sink = this.submissionSinks.get(receipt.submission);
@@ -1266,7 +1365,8 @@ export class AgentRuntime {
           this.logger.warn({ sessionId: sid, retry, delayMs, continuing }, story.note);
           await this.emit({ kind: "recovery", message: story.note });
         },
-      });
+        });
+      }
       outcomeStopReason = res.stopReason;
       return {
         stopReason: res.stopReason,

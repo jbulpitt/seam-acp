@@ -11,6 +11,7 @@
 import type { ChildProcessByStdio } from "node:child_process";
 import type { Readable, Writable } from "node:stream";
 import type { McpServer } from "@agentclientprotocol/sdk";
+import type { RemoteRung1Policy } from "@seam/adapters";
 import { buildSeamMcpServerEntry } from "./mcp/seam-mcp-server.js";
 import { resolveReachableMcpUrl } from "./mcp-url.js";
 import type { SeamTokenRegistry } from "./mcp/token-registry.js";
@@ -26,8 +27,26 @@ export interface SeamMcpInjectionWiring {
   mcpServersForRemoteSpawn?: (sessionId: string) => ReturnType<typeof buildSeamMcpServerEntry> | undefined;
 }
 
+/** #467: same-child retry policy travels as data to the child owner. Model,
+ * session and user-facing recovery remain controller-owned. */
+export const DEFAULT_REMOTE_RUNG1_POLICY: RemoteRung1Policy = Object.freeze<RemoteRung1Policy>({
+  version: 1,
+  retryCount: 3,
+  backoffMs: [2_000, 5_000, 10_000],
+  retryableErrorKinds: [
+    "rate_limit",
+    "auth_contention",
+    "protocol_error",
+    "overloaded",
+    "server_error",
+    "timeout",
+    "unclassified",
+  ],
+});
+
 export type MuxSpawnedProcess = ChildProcessByStdio<Writable, Readable, Readable> & {
   readonly slot: number;
+  remoteRung1Recovery?: boolean;
 };
 
 /** Subset of makeMux() used to spawn a remote slot. */
@@ -107,6 +126,7 @@ export interface RemoteSlotSpawnParams {
   modelFallbacks?: import("@seam/adapters").ModelFallbackPlan;
   effort?: string;
   cwd?: string;
+  rung1Recovery?: RemoteRung1Policy;
 }
 
 /**
@@ -128,6 +148,7 @@ export async function spawnRemoteSlot(
   if (params.modelFallbacks !== undefined) rpcParams.modelFallbacks = params.modelFallbacks;
   if (params.effort !== undefined) rpcParams.effort = params.effort;
   if (params.cwd !== undefined) rpcParams.cwd = params.cwd;
+  if (params.rung1Recovery !== undefined) rpcParams.rung1Recovery = params.rung1Recovery;
   try {
     const result = await mux.rpc("spawn", rpcParams, { agentId: params.agentId });
     const projectMcpInjection = result && typeof result === "object"
@@ -141,6 +162,8 @@ export async function spawnRemoteSlot(
         "continuing without remote project .mcp.json"
       );
     }
+    child.remoteRung1Recovery = Boolean(result && typeof result === "object"
+      && (result as { rung1RecoveryVersion?: unknown }).rung1RecoveryVersion === 1);
   } catch (err) {
     try {
       child.kill();

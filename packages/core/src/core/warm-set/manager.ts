@@ -19,6 +19,7 @@ import type { WarmSetHostOpt } from "./hosts.js";
 import { BoundPool } from "./pool.js";
 import { selectWarmSet, type WarmCandidate } from "./select.js";
 import { loadCost } from "./footprint.js";
+import type { RemoteRecoverySnapshot } from "@seam/adapters";
 
 export interface SlotHealthFact {
   slot: number;
@@ -26,6 +27,7 @@ export interface SlotHealthFact {
   pid: number | null;
   lastStdoutMsAgo: number | null;
   lastStdinMsAgo: number | null;
+  recovery?: RemoteRecoverySnapshot;
 }
 
 export interface WarmSetHub {

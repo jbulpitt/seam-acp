@@ -17,7 +17,12 @@ import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 import { BridgeHub } from "../packages/core/src/core/bridge-hub.js";
 import { SessionRouter } from "../packages/core/src/core/session-router.js";
 import { SeamTokenRegistry } from "../packages/core/src/core/mcp/token-registry.js";
-import { planSeamMcpInjection, spawnRemoteSlot, type MuxHandle } from "../packages/core/src/core/remote-spawn.js";
+import {
+  DEFAULT_REMOTE_RUNG1_POLICY,
+  planSeamMcpInjection,
+  spawnRemoteSlot,
+  type MuxHandle,
+} from "../packages/core/src/core/remote-spawn.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import type { Config } from "../packages/core/src/config.js";
 import type { ConfigMutationService } from "../packages/core/src/core/config-mutation.js";
@@ -275,6 +280,39 @@ describe("remote spawn drives token + reachable MCP URL (#84)", () => {
     expect(frames.some((f) => f.type === "rpc" && f.method === "spawn")).toBe(true);
     const data = frames.filter((f) => f.type === "data");
     expect(data).toEqual([{ slot: child.slot, type: "data", data: "ACP-INIT" }]);
+  });
+
+  it("enables bridge recovery only after the spawn capability is acknowledged", async () => {
+    const calls: unknown[] = [];
+    const child = Object.assign(new EventEmitter(), { slot: 4, stdin: new PassThrough(),
+      stdout: new PassThrough(), stderr: new PassThrough(), killed: false, kill() {} });
+    const mux = {
+      spawn: () => child,
+      rpc: async (_method: string, params: unknown) => {
+        calls.push(params);
+        return { ok: true, rung1RecoveryVersion: 1 };
+      },
+      releaseStdin() {},
+    } as unknown as MuxHandle;
+    const spawned = await spawnRemoteSlot(mux, { mcpServers: [], agentId: "claude",
+      rung1Recovery: DEFAULT_REMOTE_RUNG1_POLICY });
+    expect(calls).toEqual([expect.objectContaining({
+      slot: 4,
+      rung1Recovery: DEFAULT_REMOTE_RUNG1_POLICY,
+    })]);
+    expect(spawned.remoteRung1Recovery).toBe(true);
+
+    const oldChild = Object.assign(new EventEmitter(), { slot: 5, stdin: new PassThrough(),
+      stdout: new PassThrough(), stderr: new PassThrough(), killed: false, kill() {} });
+    const old = await spawnRemoteSlot({
+      spawn: () => oldChild,
+      rpc: async () => ({ ok: true }),
+      releaseStdin() {},
+    } as unknown as MuxHandle, { mcpServers: [], agentId: "claude",
+      rung1Recovery: DEFAULT_REMOTE_RUNG1_POLICY });
+    // Mixed-version safety: an old bridge keeps normal controller recovery;
+    // a missing acknowledgement never creates two rung-1 owners.
+    expect(old.remoteRung1Recovery).toBe(false);
   });
 });
 

@@ -697,7 +697,8 @@ const TOOLS = [
       "`agent`/`model`/`cwd` (agent is `agentId@location` with host emoji), `status` (active | archived | gone), `lastActivityUtc`, and `busy`. " +
       "`busy` IS LOAD-BEARING for choosing HOW to reach a teammate: it includes admitted channel work even " +
       "when the ACP runtime is idle. `workProgress` separately composes router, watcher and durable attempt evidence " +
-      "to answer whether work is actually executing; assigned_not_started is explicitly not progress. `queueState` " +
+      "to answer whether work is actually executing; bridge-owned rung-1 recovery is reported there from closed " +
+      "child-owner facts, while assigned_not_started is explicitly not progress. `queueState` " +
       "distinguishes runtime_busy, queued, wedged, and stalled. `stalled` means " +
       "a retained dispatch is held for `/seam workflows` resume/abandon; its ids are included. It is HOUSEKEEPING, not a health " +
       "verdict: a stalled thread is a perfectly valid handoff target and must never be skipped, routed around, or replaced with a " +
@@ -2778,6 +2779,11 @@ export class SeamMcpServer {
             (progress.runningDispatchIds.length > 0
               ? `; running dispatches: ${progress.runningDispatchIds.join(", ")}`
               : "") +
+            ((progress.remoteRecovery?.length ?? 0) > 0
+              ? `; bridge recovery: ${progress.remoteRecovery!.map((recovery) =>
+                `${recovery.attemptId}=${recovery.observed ? `${recovery.phase ?? "unknown"}, retry ${recovery.retry ?? "?"}, ${recovery.remaining ?? "?"} remain` : "unobserved"}`
+              ).join(", ")}`
+              : "") +
             (progress.assignedNotStartedDispatchIds.length > 0
               ? `; assigned but prompt not submitted: ${progress.assignedNotStartedDispatchIds.join(", ")}`
               : "") +
@@ -2831,6 +2837,7 @@ export class SeamMcpServer {
       "",
       "To reach a teammate: use its `id` above. If it is busy, prefer send (pull-only, won't interrupt); " +
         "if idle, handoff/forward start a turn directly. `work progress` answers execution separately: " +
+        "bridge recovery is positive only when the child-owning bridge reports its exact submission; " +
         "assigned_not_started and active_unobserved mean no execution progress is proven. Retained or unsettled dispatches are bookkeeping " +
         "only: they NEVER make a thread an invalid target, so choose workers on fit and busy alone. To pick " +
         "up work a thread was carrying, hand off `continue` to it. Prefer a stateful thread over a cold " +

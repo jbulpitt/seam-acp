@@ -10,6 +10,7 @@ export type {
 export * from "./agent-profile.js";
 export * from "./error-classification.js";
 export * from "./error-resolver.js";
+export * from "./remote-recovery.js";
 export * from "./catalog-evidence.js";
 export * from "./model-catalog.js";
 export * from "./model-fallback.js";

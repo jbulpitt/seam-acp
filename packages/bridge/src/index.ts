@@ -52,6 +52,7 @@ import type { RawData, WebSocket as WsSocket } from "ws";
 import {
   PROTOCOL_VERSION,
   sweepAgyMcpHomes,
+  unclassified,
   type AgentAdapter,
 } from "@seam/adapters";
 import { dispatchBridgeRpc, type SlotSpawnConfig } from "./rpc.js";
@@ -69,6 +70,7 @@ import {
   loadHostAdapterInventory,
 } from "./inventory.js";
 import { createReleaseReceiptWriter, readRunningReleaseSha, type ReleaseReceiptWriter } from "./release-receipt.js";
+import { createRung1Recovery } from "./rung1-recovery.js";
 
 type WsCtor = typeof import("ws").WebSocket;
 type WssCtor = typeof import("ws").WebSocketServer;
@@ -219,6 +221,9 @@ function makeSlotManager(opts: {
   /** #444: stdout was forwarded as raw chunks, so a reconnect could splice a
    *  partial JSON line into a line-delimited JSON-RPC stream. */
   const lineFramers = new Map<number, ReturnType<typeof createLineFramer>>();
+  /** The controller stream is chunked too. Recovery must see one complete ACP
+   * request even when a JSON line crosses websocket/stream chunk boundaries. */
+  const inputLineFramers = new Map<number, ReturnType<typeof createLineFramer>>();
   /**
    * #456: agent fd 2 was piped with no reader, which stalls the child once the
    * 64 KiB pipe buffer fills. Draining removes the stall; keeping a bounded
@@ -236,6 +241,36 @@ function makeSlotManager(opts: {
    * real stdout line.
    */
   const probes = createProbeGate();
+  /** #467: one same-child, same-session retry owner. Wider recovery remains
+   * controller-owned; raw errors and original prompts never enter its state. */
+  const rung1Recovery = createRung1Recovery({
+    policyFor: (slot) => slotConfigs.get(slot)?.rung1Recovery,
+    classify: (slot, error) => {
+      const agentId = slotConfigs.get(slot)?.agentId;
+      const adapter = agentId ? adapters.get(agentId) : undefined;
+      try {
+        return (adapter?.classifyError?.(error) ?? unclassified(agentId ?? "unknown")).errorKind;
+      } catch {
+        return "unclassified";
+      }
+    },
+    write: (slot, line) => {
+      const agent = slots.get(slot);
+      if (!agent || agent.exitCode !== null || agent.signalCode !== null || agent.killed || !agent.stdin?.writable) {
+        return false;
+      }
+      lastStdinAt.set(slot, Date.now());
+      agent.stdin.write(line);
+      return true;
+    },
+    publishSnapshot: (slot, recovery) => {
+      muxSend(currentWs, WebSocket, slot, "recovery", { recovery }, outputLog);
+    },
+    publishResult: (slot, recoveryResult) => {
+      muxSend(currentWs, WebSocket, slot, "recovery_result", { recoveryResult }, outputLog);
+    },
+    controllerConnected: () => currentWs?.readyState === WebSocket.OPEN,
+  });
 
   function setWs(ws: WsSocket | null) {
     currentWs = ws;
@@ -308,6 +343,7 @@ function makeSlotManager(opts: {
       slot,
       new BridgeMcpInputRewriter(slotConfigs.get(slot)?.mcpServers ?? [])
     );
+    inputLineFramers.set(slot, createLineFramer());
 
     // #456: fd 2 was piped and nothing ever read it, so the kernel pipe buffer
     // filled — 64 KiB on Linux, smaller to start on Darwin — and the child
@@ -328,16 +364,21 @@ function makeSlotManager(opts: {
       let forwarded = false;
       forwardAgentStdout(chunk, framer, (line) => {
         if (probes.absorb(slot, line)) return;
-        forwarded = true;
-        muxSend(currentWs, WebSocket, slot, "data", { data: line }, outputLog);
+        const decision = rung1Recovery.observeOutput(slot, line);
+        if (decision.forward !== null) {
+          forwarded = true;
+          muxSend(currentWs, WebSocket, slot, "data", { data: decision.forward }, outputLog);
+        }
       });
       if (forwarded || framer.pending() > 0) lastStdoutAt.set(slot, Date.now());
     });
 
     agent.on("error", (err) => {
       console.error(`[bridge] Slot ${slot} agent error: ${err.message}`);
+      rung1Recovery.childExited(slot);
       slots.delete(slot);
       slotInputRewriters.delete(slot);
+      inputLineFramers.delete(slot);
       probes.close(slot);
       oomEvidence.drop(slot);
       flushFramer(slot);
@@ -347,10 +388,12 @@ function makeSlotManager(opts: {
 
     agent.on("exit", (code, signal) => {
       console.error(`[bridge] Slot ${slot} agent exited (code=${code}, signal=${signal})`);
+      rung1Recovery.childExited(slot);
       slots.delete(slot);
       lastStdoutAt.delete(slot);
       lastStdinAt.delete(slot);
       slotInputRewriters.delete(slot);
+      inputLineFramers.delete(slot);
       probes.close(slot);
       flushFramer(slot);
       const payload = stderrRegistry.exitPayload(slot, code, signal);
@@ -579,10 +622,40 @@ function makeSlotManager(opts: {
         // omits `health` — which the caller treats as "no opinion" rather
         // than as "unhealthy". The frame is an array of objects so #456 can
         // hang a stderr tail off the same shape without another protocol turn.
+        const health = slotHealthSnapshot(slots, lastStdoutAt, lastStdinAt, Date.now()).map((entry) => {
+          const recovery = rung1Recovery.snapshot(entry.slot);
+          return { ...entry, ...(recovery ? { recovery } : {}) };
+        });
+        const represented = new Set(health.map((entry) => entry.slot));
+        for (const { slot, recovery } of rung1Recovery.snapshots()) {
+          if (!represented.has(slot)) health.push({
+            slot,
+            alive: false,
+            pid: null,
+            lastStdoutMsAgo: null,
+            lastStdinMsAgo: null,
+            recovery,
+          });
+        }
         result = {
           slots: [...slots.keys()],
-          health: slotHealthSnapshot(slots, lastStdoutAt, lastStdinAt, Date.now()),
+          health,
         };
+      } else if (action === "armRung1Recovery") {
+        const slot = Number(payload?.slot);
+        const agent = Number.isInteger(slot) ? slots.get(slot) : undefined;
+        if (!agent || agent.exitCode !== null || agent.signalCode !== null || agent.killed) {
+          throw new Error("armRung1Recovery: slot has no live process");
+        }
+        result = rung1Recovery.arm(slot, {
+          submissionId: payload?.submissionId,
+          acpSessionId: payload?.acpSessionId,
+          continuation: payload?.continuation,
+        });
+      } else if (action === "disarmRung1Recovery") {
+        const slot = Number(payload?.slot);
+        result = { disarmed: Number.isInteger(slot)
+          && rung1Recovery.disarm(slot, payload?.submissionId) };
       } else if (action === "replayOutput") {
         // #444: "read from where you were". The consumer's cursor is the only
         // state that matters, so a disconnect needs no special handling here —
@@ -594,9 +667,20 @@ function makeSlotManager(opts: {
         const slot = Number(payload.slot);
         const afterSeq = Number(payload.afterSeq ?? 0);
         const replay = outputLog.since(slot, Number.isFinite(afterSeq) ? afterSeq : 0);
+        const frames: Array<Record<string, unknown> & { type: string }> = replay.frames
+          .map((f) => ({ seq: f.seq, type: f.type, ...f.payload }));
+        // A result is the adoption authority, not transient socket delivery.
+        // Keep it available after a consumer ack so a controller that dies
+        // after receipt but before its SQL commit can still adopt exactly once.
+        const terminal = afterSeq === 0 ? rung1Recovery.terminalResult(slot) : undefined;
+        if (terminal && !frames.some((frame) => frame.type === "recovery_result"
+          && (frame as { recoveryResult?: { submissionId?: string } }).recoveryResult?.submissionId
+            === terminal.submissionId)) {
+          frames.push({ type: "recovery_result", recoveryResult: terminal });
+        }
         result = {
           slot,
-          frames: replay.frames.map((f) => ({ seq: f.seq, type: f.type, ...f.payload })),
+          frames,
           // Stated explicitly, never implied by a short reply. A consumer that
           // cannot tell "here is the rest" from "some of it is gone" will
           // splice two unrelated points of a JSON-RPC stream together.
@@ -649,6 +733,12 @@ function makeSlotManager(opts: {
             cwd: localCwd,
             devMode,
             configureSlot: (slot, cfg) => {
+              // A spawn RPC is explicit replacement, unlike adoption. Clear a
+              // retired slot's bounded replay/result before reusing its number.
+              if (!slots.has(slot)) {
+                outputLog.dropSlot(slot);
+                rung1Recovery.drop(slot);
+              }
               slotConfigs.set(slot, cfg);
             },
           });
@@ -685,6 +775,10 @@ function makeSlotManager(opts: {
       if (agent && !agent.killed) {
         const rewritten = slotInputRewriters.get(msg.slot)?.push(msg.data) ?? msg.data;
         if (rewritten) {
+          rung1Recovery.observeInputBytes(msg.slot);
+          for (const line of inputLineFramers.get(msg.slot)?.push(rewritten) ?? []) {
+            rung1Recovery.observeInput(msg.slot, line);
+          }
           lastStdinAt.set(msg.slot, Date.now());
           agent.stdin?.write(rewritten);
         }
@@ -695,21 +789,20 @@ function makeSlotManager(opts: {
         console.error(`[bridge] Slot ${msg.slot}: kill received — terminating agent`);
         agent.kill();
         slots.delete(msg.slot);
-        // #444: seam-acp is explicitly done with this slot, so its replay
-        // window has no remaining consumer. (An agent that merely EXITS keeps
-        // its buffer — the final frames are exactly what a reconnecting
-        // consumer still needs — and the age bound reclaims it.)
-        outputLog.dropSlot(msg.slot);
-        lineFramers.delete(msg.slot);
-        // #456: the exit this kill provokes carries a signal, which would
-        // otherwise read as abnormal and ship a tail for a death seam-acp
-        // asked for. Dropping the ring first keeps a deliberate kill quiet.
-        stderrRegistry.drop(msg.slot);
-        oomEvidence.drop(msg.slot);
-        slotConfigs.delete(msg.slot);
-        slotInputRewriters.delete(msg.slot);
-        probes.close(msg.slot);
       }
+      // #444/#467: seam-acp is explicitly done with this slot, even when the
+      // child exited before its retained result was adopted. The replay window
+      // then has no remaining consumer. An unrequested EXIT still retains it.
+      outputLog.dropSlot(msg.slot);
+      lineFramers.delete(msg.slot);
+      inputLineFramers.delete(msg.slot);
+      // #456: a deliberate kill must not surface a stale diagnostic tail.
+      stderrRegistry.drop(msg.slot);
+      oomEvidence.drop(msg.slot);
+      slotConfigs.delete(msg.slot);
+      slotInputRewriters.delete(msg.slot);
+      probes.close(msg.slot);
+      rung1Recovery.drop(msg.slot);
     } else if (msg.type === "cmd") {
       handleCmd(msg);
     }

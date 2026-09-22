@@ -424,6 +424,14 @@ export class BridgeHub {
       onSlotHealth: (health) => {
         this.slotHealth.set(bridgeId, health);
       },
+      onRemoteRecovery: (slot, recovery) => {
+        const health = [...(this.slotHealth.get(bridgeId) ?? [])];
+        const index = health.findIndex((entry) => entry.slot === slot);
+        if (index >= 0) health[index] = { ...health[index]!, recovery };
+        else health.push({ slot, alive: true, pid: null,
+          lastStdoutMsAgo: null, lastStdinMsAgo: null, recovery });
+        this.slotHealth.set(bridgeId, health);
+      },
     });
     this.muxes.set(bridgeId, mux);
     return mux;

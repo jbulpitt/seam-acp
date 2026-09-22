@@ -66,7 +66,14 @@ function runInstaller(fixture: ReturnType<typeof fakeInstallerHost>, pairing = t
     "--cwd", fixture.workspace,
     "-y",
   );
-  return spawnSync("/bin/bash", args, { cwd: fixture.root, env: fixture.env, encoding: "utf8" });
+  return spawnSync("/bin/bash", args, {
+    cwd: fixture.root,
+    env: fixture.env,
+    encoding: "utf8",
+    // A removed early preflight reaches /dev/tty and recreates the incident's
+    // silent wait shape under a PTY. Keep the regression itself bounded.
+    timeout: 5_000,
+  });
 }
 
 describe("install-macos-bridge.sh parser", () => {

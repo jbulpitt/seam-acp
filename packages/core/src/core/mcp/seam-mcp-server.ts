@@ -692,7 +692,10 @@ const TOOLS = [
       "`agent`/`model`/`cwd` (agent is `agentId@location` with host emoji), `status` (active | archived | gone), `lastActivityUtc`, and `busy`. " +
       "`busy` IS LOAD-BEARING for choosing HOW to reach a teammate: it includes admitted channel work even " +
       "when the ACP runtime is idle. `queueState` distinguishes runtime_busy, queued, wedged, and stalled. `stalled` means " +
-      "a retained dispatch is durably quarantined and needs `/seam workflows` resume/abandon action; its ids are included. When busy:true a live turn " +
+      "a retained dispatch is held for `/seam workflows` resume/abandon; its ids are included. It is HOUSEKEEPING, not a health " +
+      "verdict: a stalled thread is a perfectly valid handoff target and must never be skipped, routed around, or replaced with a " +
+      "cold preset on account of the flag. Dispatch on fit and `busy` alone. To resume work such a thread was carrying, hand off " +
+      "`continue` to it. When busy:true a live turn " +
       "is running, so prefer `send` (PULL-ONLY — it waits in the inbox and never interrupts) unless you " +
       "truly need to preempt, in which case use `steer` or `send(interrupt:true)`; when busy:false the " +
       "teammate is idle, so `handoff`/`forward` (which START a turn) land cleanly. Read-only and " +
@@ -2748,7 +2751,13 @@ export class SeamMcpServer {
       const name = t.name ?? "(unnamed)";
       const flags = [
         t.isSelf ? "YOU" : null,
-        t.busy ? "busy" : t.queueState === "stalled" ? "stalled" : "idle",
+        // The flag answers exactly one question: can I dispatch here right now.
+        // `stalled` is NOT an answer to it — index.ts deliberately excludes it
+        // from `busy`, because retained dispatches are bookkeeping and do not
+        // stop the thread starting a turn. Printing it here as a third state
+        // read as "unusable" and took the whole worker pool out of service.
+        // The retained-dispatch detail still prints below.
+        t.busy ? "busy" : "idle",
         t.status !== "active" ? t.status : null,
         addressable ? null : "not addressable",
       ].filter(Boolean);
@@ -2765,14 +2774,14 @@ export class SeamMcpServer {
         `• ${name} — id ${t.id} [${flags.join(", ")}]` +
           (cfg ? `\n    identity: ${cfg}${t.cwd ? ` @ ${t.cwd}` : ""}` : "") +
           (t.queueState === "stalled"
-            ? `\n    retained dispatches: ${(t.stalledDispatchIds ?? []).join(", ") || t.stalledDispatchCount || "unknown"}; use /seam workflows to resume or abandon`
+            ? `\n    retained dispatches (does NOT block handoff — this thread is dispatchable): ${(t.stalledDispatchIds ?? []).join(", ") || t.stalledDispatchCount || "unknown"}; /seam workflows can resume or abandon them`
             : "") +
           // #419: reported whatever the queue state says. An unsettled
           // completion holds admission while the thread still looks merely
           // "busy", so gating this on `stalled` would hide the one case that
           // has no other way of being seen.
           ((t.unsettledDispatchCount ?? 0) > 0
-            ? `\n    ⚠️ completed but unsettled (holding admission): ${(t.unsettledDispatchIds ?? []).join(", ")}; abandon via /seam workflows — do NOT resume, these already ran`
+            ? `\n    ⚠️ completed but unsettled (holding admission): ${(t.unsettledDispatchIds ?? []).join(", ")}; abandon THESE DISPATCH IDS via /seam workflows — do not resume them, they already ran. The thread itself is unaffected and can still take new work.`
             : "") +
           `\n    last active ${formatLocalTime(t.lastActivityUtc)}`
       );
@@ -2789,8 +2798,10 @@ export class SeamMcpServer {
     lines.push(
       "",
       "To reach a teammate: use its `id` above. If it is busy, prefer send (pull-only, won't interrupt); " +
-        "if idle, handoff/forward start a turn directly. A stalled entry needs /seam workflows recovery. " +
-        "Never hand off to the entry marked YOU."
+        "if idle, handoff/forward start a turn directly. Retained or unsettled dispatches are bookkeeping " +
+        "only: they NEVER make a thread an invalid target, so choose workers on fit and busy alone. To pick " +
+        "up work a thread was carrying, hand off `continue` to it. Prefer a stateful thread over a cold " +
+        "preset whenever its context is relevant. Never hand off to the entry marked YOU."
     );
     return textResult(lines.join("\n"));
   }

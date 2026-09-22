@@ -104,6 +104,7 @@ export interface RemoteSlotSpawnParams {
   mcpServers: McpServer[];
   agentId: string;
   model?: string;
+  modelFallbacks?: import("@seam/adapters").ModelFallbackPlan;
   effort?: string;
   cwd?: string;
 }
@@ -124,6 +125,7 @@ export async function spawnRemoteSlot(
     agentId: params.agentId,
   };
   if (params.model !== undefined) rpcParams.model = params.model;
+  if (params.modelFallbacks !== undefined) rpcParams.modelFallbacks = params.modelFallbacks;
   if (params.effort !== undefined) rpcParams.effort = params.effort;
   if (params.cwd !== undefined) rpcParams.cwd = params.cwd;
   try {

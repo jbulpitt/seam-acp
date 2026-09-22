@@ -13,6 +13,7 @@ import {
 import { DEFAULT_ERROR_RULES } from "../core/error-resolution-rules.js";
 import { CONTINUE_PROMPT } from "../core/dispatch/turn-resume.js";
 import { recoveryStory } from "../core/dispatch/recovery-story.js";
+import type { ModelFallbackPlan } from "../core/model-fallback.js";
 import {
   client,
   methods,
@@ -353,6 +354,10 @@ export class AgentRuntime {
   ) => ReturnType<AgentProfile["spawn"]> | Promise<ReturnType<AgentProfile["spawn"]>>;
   private readonly catalogEffort?: CatalogEffort;
   private readonly bridgeHealth?: Partial<BridgeHealthSource>;
+  private readonly modelFallbacks?: (model: string, used?: number, effort?: string) => ModelFallbackPlan;
+  private observedContextUsed?: number;
+  private lastModelFallbackNotice?: string;
+  private readonly pendingModelNotices: string[] = [];
   private readonly loadSessionTimeoutMs: number;
   /** Quiet time before asking the bridge whether a remote turn is hung.
    *  Production is one minute. Tests pass a few milliseconds. */
@@ -481,6 +486,8 @@ export class AgentRuntime {
     effortDescriptor?: CatalogEffort;
     /** Remote child owner; absent on local runtimes / older embedding shims. */
     bridgeHealth?: Partial<BridgeHealthSource>;
+    /** Upstream precomputation, called before trying a model, never on failure. */
+    modelFallbacks?: (model: string, used?: number, effort?: string) => ModelFallbackPlan;
     elicitationHandler?: ElicitationHandler;
     completeElicitationHandler?: (
       notification: CompleteElicitationNotification
@@ -514,6 +521,7 @@ export class AgentRuntime {
     this.mcpServers = opts.mcpServers ?? [];
     this.catalogEffort = opts.effortDescriptor;
     this.bridgeHealth = opts.bridgeHealth;
+    this.modelFallbacks = opts.modelFallbacks;
     this.loadSessionTimeoutMs = opts.loadSessionTimeoutMs ?? SESSION_LOAD_TIMEOUT_MS;
     this.hangSilenceMs = opts.hangSilenceMs ?? HANG_SILENCE_MS;
     this.claudeCredentialFacts = opts.claudeCredentialFacts;
@@ -802,8 +810,7 @@ export class AgentRuntime {
       const isAvailable = this.sessionInfo.availableModels.some((m) => m.modelId === wantedModel);
       if (isExplicit || isAvailable) {
         try {
-          await this.setModel(wantedModel);
-          this.sessionInfo = { ...this.sessionInfo, currentModelId: wantedModel };
+          await this.setModel(wantedModel, { allowFallback: !opts.strictModel, effort: opts.effort });
         } catch (err) {
           if (opts.strictModel) {
             const detail = err instanceof Error ? err.message : String(err);
@@ -906,8 +913,7 @@ export class AgentRuntime {
       const isAvailable = this.sessionInfo.availableModels.some((m) => m.modelId === wantedModel);
       if (isExplicit || isAvailable) {
         try {
-          await this.setModel(wantedModel);
-          this.sessionInfo = { ...this.sessionInfo, currentModelId: wantedModel };
+          await this.setModel(wantedModel, { allowFallback: !opts.strictModel, effort: opts.effort });
         } catch (err) {
           if (opts.strictModel) {
             const detail = err instanceof Error ? err.message : String(err);
@@ -1041,6 +1047,10 @@ export class AgentRuntime {
   ): Promise<PromptOutcome> {
     const conn = this.requireConnection();
     const sid = this.requireSessionId();
+
+    for (const message of this.pendingModelNotices.splice(0)) {
+      await this.emit({ kind: "recovery", message });
+    }
 
     const prompt: Array<import("@agentclientprotocol/sdk").ContentBlock> = [];
     if (text) prompt.push({ type: "text", text });
@@ -1342,14 +1352,49 @@ export class AgentRuntime {
     await this.sessionUpdates.idle();
   }
 
-  async setModel(modelId: string): Promise<void> {
+  getLastModelFallbackNotice(): string | undefined {
+    return this.lastModelFallbackNotice;
+  }
+
+  async setModel(modelId: string, opts?: { allowFallback?: boolean; effort?: string }): Promise<void> {
     // ACP 1.x: model selection is a session config option (configId "model");
     // the old `unstable_setSessionModel` RPC is gone. Full canonical IDs
     // exact-match the agent's advertised option values and bypass the fuzzy
     // resolver; aliases (e.g. "default") fall through to it agent-side.
-    await this.setConfigOption("model", modelId);
+    let alternatives: ModelFallbackPlan["alternatives"] = [];
+    this.lastModelFallbackNotice = undefined;
+    if (opts?.allowFallback !== false) {
+      try { alternatives = this.modelFallbacks?.(modelId, this.observedContextUsed, opts?.effort)?.alternatives ?? []; }
+      catch (err) {
+        // A broken metadata cache refuses substitution, not the requested model.
+        this.logger.warn({ err, modelId }, "model fallback metadata unavailable; trying requested model");
+      }
+    }
+    const candidates = [{ model: modelId, notice: undefined as string | undefined },
+      ...alternatives.filter(option => option.applicationMode === "live")];
+    let selected = modelId;
+    for (let i = 0; i < candidates.length; i++) {
+      const candidate = candidates[i]!;
+      try {
+        await this.withClassifiedErrors("session/set_config_option:model", () => this.setConfigOption("model", candidate.model));
+      } catch (err) {
+        // Only a rejected model selection can advance this list. Auth, transport,
+        // cancellation and unknown failures retain their cause and session. No
+        // prompt is retried and no process/session is replaced here (#448/#467).
+        if (readErrorClassification(err)?.errorKind !== "model_not_found" || i + 1 === candidates.length) throw err;
+        continue;
+      }
+      selected = candidate.model;
+      if (candidate.notice) {
+        this.lastModelFallbackNotice = candidate.notice;
+        this.logger.warn({ requestedModel: modelId, selectedModel: selected }, candidate.notice);
+        if (this.eventHandler) await this.emit({ kind: "recovery", message: candidate.notice });
+        else this.pendingModelNotices.push(candidate.notice);
+      }
+      break;
+    }
     if (this.sessionInfo) {
-      this.sessionInfo = { ...this.sessionInfo, currentModelId: modelId };
+      this.sessionInfo = { ...this.sessionInfo, currentModelId: selected };
     }
     // #37: Fast availability is per MODEL, and a Claude model switch is
     // live-config — the same session now advertises a different option set.
@@ -1744,6 +1789,9 @@ export class AgentRuntime {
     this.touchActivity();
     if (!this.eventHandler) return;
     try {
+      for (const message of this.pendingModelNotices.splice(0)) {
+        await this.eventHandler({ kind: "recovery", message });
+      }
       await this.eventHandler(event);
     } catch (err) {
       this.logger.error({ err, event }, "event handler failed");
@@ -1925,6 +1973,7 @@ export class AgentRuntime {
       case "usage_update": {
         const u = update as unknown as { used?: number; size?: number };
         if (typeof u.used === "number" && typeof u.size === "number" && u.size > 0) {
+          this.observedContextUsed = Math.max(this.observedContextUsed ?? 0, u.used);
           await this.emit({ kind: "usage-update", used: u.used, size: u.size });
         }
         return;

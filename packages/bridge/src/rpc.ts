@@ -16,6 +16,8 @@ import {
   isPathWithinRoot,
   ATTACH_MAX_BYTES,
   readProjectMcpServers,
+  isModelFallbackPlan,
+  type ModelFallbackPlan,
 } from "@seam/adapters";
 
 const execFileAsync = promisify(execFile);
@@ -27,6 +29,7 @@ export interface SlotSpawnConfig {
   env?: Record<string, string>;
   mcpServers?: McpServer[];
   model?: string;
+  modelFallbacks?: ModelFallbackPlan;
   effort?: string;
 }
 
@@ -145,12 +148,19 @@ async function dispatchAdapter(
       environment: process.env,
     });
     const mcpServers = [...transportedMcpServers, ...projectMcpServers];
+    const modelFallbacks = isModelFallbackPlan(params.modelFallbacks) &&
+      params.modelFallbacks.agentId === (str(params.agentId) ?? agentId) &&
+      params.modelFallbacks.requestedModel === str(params.model) ? params.modelFallbacks : undefined;
+    if (params.modelFallbacks !== undefined && !modelFallbacks) {
+      console.error("[bridge] unsupported or mismatched model fallback plan; keeping requested model without substitution");
+    }
     ctx.configureSlot?.(slot, {
       agentId: str(params.agentId) ?? agentId,
       cwd,
       env,
       mcpServers,
       model: str(params.model),
+      ...(modelFallbacks ? { modelFallbacks } : {}),
       effort: str(params.effort),
     });
     return {

@@ -124,7 +124,8 @@ export interface SessionControlRuntime {
   getConfigSelectValues(configId: string): ReadonlyArray<string>;
   /** #37: what Fast actually resolved to on the live session, if determined. */
   getFastModeOutcome?(): FastModeOutcome | undefined;
-  setModel(modelId: string): Promise<void>;
+  getLastModelFallbackNotice?(): string | undefined;
+  setModel(modelId: string, opts?: { effort?: string }): Promise<void>;
   setConfigOption(configId: string, value: string | boolean): Promise<void>;
 }
 
@@ -634,9 +635,12 @@ export class ThreadSessionControlService {
           { agentId: nextAgentId, location },
           { model: nextModel, effort: desiredEffort }
         );
-        await runtime.setModel(selection.raw.model);
+        await runtime.setModel(selection.raw.model, { effort: selection.raw.effort });
       }
     }
+
+    const fallbackNotice = runtime.getLastModelFallbackNotice?.();
+    if (fallbackNotice && (modelChanged || runtimeReloaded || reset.sessionReset)) warnings.push(fallbackNotice);
 
     // Config-option agents may advertise a model-dependent subset. Validate
     // against the live session before claiming success. Claude never enters

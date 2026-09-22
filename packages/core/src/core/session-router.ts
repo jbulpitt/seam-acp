@@ -32,6 +32,9 @@ import {
 } from "./remote-spawn.js";
 import { bindingKey } from "./model-catalog/service.js";
 import { isLocalLocation } from "./location.js";
+import { planModelFallbacks, type ModelFallbackPlan } from "./model-fallback.js";
+import type { ModelMetadataStore } from "./model-metadata/store.js";
+import { matchesContextBudget, validContextUsage } from "./context-budget.js";
 
 /**
  * Wiring for the per-session seam-MCP surface. The token identifies the
@@ -70,6 +73,8 @@ export interface RuntimeSpawnPlan {
   location: string;
   profile: AgentProfile;
   model: string;
+  /** Conservative capacity floor until this runtime observes its own usage. */
+  fallbackContextTokens?: number | null;
   effort?: string;
   effortDescriptor?: CatalogEffort;
   /** Claude Fast mode (#37). Only ever true when the profile declares Fast —
@@ -288,6 +293,7 @@ export class SessionRouter {
   private readonly profileById: Map<string, AgentProfile>;
   private readonly remoteProfiles = new Map<string, { generation: number; profile: AgentProfile }>();
   private readonly modelCatalog: ModelCatalogService;
+  private readonly modelMetadata?: Pick<ModelMetadataStore, "getAll">;
   private readonly defaultAgentId: string;
   private readonly defaultPermissionMode: PermissionPolicyMode;
   private readonly mcpServers: McpServer[];
@@ -328,6 +334,7 @@ export class SessionRouter {
     store: SessionStore;
     profiles: AgentProfile[];
     modelCatalog: ModelCatalogService;
+    modelMetadata?: Pick<ModelMetadataStore, "getAll">;
     defaultAgentId: string;
     defaultModel: string;
     defaultPermissionMode?: PermissionPolicyMode;
@@ -362,6 +369,7 @@ export class SessionRouter {
     this.store = opts.store;
     this.profileById = new Map(opts.profiles.map((p) => [p.id, p]));
     this.modelCatalog = opts.modelCatalog;
+    this.modelMetadata = opts.modelMetadata;
     this.defaultAgentId = opts.defaultAgentId;
     this.defaultPermissionMode = opts.defaultPermissionMode ?? "ask";
     this.mcpServers = opts.mcpServers ?? [];
@@ -1139,17 +1147,27 @@ export class SessionRouter {
     this.seamMcp?.registry.revokeSession(sessionId);
   }
 
+  /** Cached metadata only, evaluated BEFORE model selection. Reading the current
+   * snapshots here makes catalog/enrichment refreshes visible to warm runtimes,
+   * without a provider lookup in an error handler or another retry owner. */
+  private planModelFallbacks(binding: { agentId: string; location: string }, model: string, effort: string | undefined, requiredContextTokens: number | null): ModelFallbackPlan {
+    const { agentId, location } = binding;
+    const catalog = this.modelCatalog.models({ agentId, location });
+    try {
+      return planModelFallbacks({ agentId, location, model, effort, requiredContextTokens,
+        metadata: this.modelMetadata?.getAll() ?? [], catalog });
+    } catch (err) {
+      this.logger.warn({ err, agentId, location }, "fallback metadata unavailable; keeping requested model");
+      return { version: 1, agentId, location, requestedModel: model, requiredContextTokens, alternatives: [] };
+    }
+  }
+
   /**
-   * Resolve spawn inputs for a runtime start without actually starting the
-   * agent. Tests (and later PR4) use this to inspect MCP injection + the
-   * remote spawn path. `startRuntime` is the only production caller.
-   *
-   * #308: this is the runtime gate for SessionRouter-managed turns:
-   * getOrStartRuntime calls it before the warm-cache return, and startRuntime
-   * calls it again before a process is spawned. Resolver calls in orchestrator
-   * are courtesy refusals that surface a blocked dispatch early; they are not
-   * sufficient on their own. Throwaway AgentRuntime constructions cannot use a
-   * session spawn plan and instead call assertAgentAllowedForChannel directly.
+   * Resolve spawn inputs without starting the agent. #308: this is the runtime
+   * gate for SessionRouter-managed turns: getOrStartRuntime calls it before the
+   * warm-cache return, and startRuntime before spawning. Orchestrator checks
+   * are courtesy refusals, not sufficient alone. Throwaway runtimes must call
+   * assertAgentAllowedForChannel directly when they cannot use this plan.
    */
   planRuntimeSpawn(record: SessionRecord): RuntimeSpawnPlan {
     if (this.store.needsAgyIdentityRebuild(record.id)) {
@@ -1204,6 +1222,17 @@ export class SessionRouter {
       { model: selectedModel, effort: selectedEffort }
     );
     const model = catalogSelection.raw.model;
+    // Until this runtime observes usage, preserve capacity rather than guess
+    // that a resumed history is empty. In particular an explicit switch to a
+    // smaller requested model cannot redefine how much context history needs.
+    // A legacy resume with no capacity record refuses only substitution.
+    const budget = cfg.lastContextUsage?.budget;
+    const budgetMatches = matchesContextBudget(budget, { agentId, location,
+      acpSessionId: record.acpSessionId, model: catalogSelection.normalized.model,
+      requestedTier: profile.requestedContextTier ?? null });
+    const fallbackContextTokens = record.acpSessionId
+      ? budgetMatches && budget && validContextUsage(budget.used, budget.promptBudget) ? budget.promptBudget : null
+      : catalogSelection.model?.context.effective ?? null;
     const effort = catalogSelection.raw.effort;
     // Null when the binding has no catalog yet (#339 rule 15). The runtime
     // treats an absent descriptor as "this agent advertises no effort control",
@@ -1265,6 +1294,9 @@ export class SessionRouter {
           mcpServers,
           agentId,
           model: modelOverride,
+          // The current bridge stores policy; #467 will execute it. Keep model
+          // for old bridges, which continue to attempt exactly the requested id.
+          modelFallbacks: this.planModelFallbacks({ agentId, location }, modelOverride ?? model, effortOverride, fallbackContextTokens),
           effort: effortOverride,
           cwd,
         });
@@ -1275,6 +1307,7 @@ export class SessionRouter {
       location,
       profile,
       model,
+      fallbackContextTokens,
       effort,
       ...(effortDescriptor ? { effortDescriptor } : {}),
       fastMode,
@@ -1320,6 +1353,8 @@ export class SessionRouter {
       mcpServers,
       spawnFn: plan.spawnChild,
       bridgeHealth: plan.bridgeHealth,
+      modelFallbacks: (requestedModel, used, requestedEffort) =>
+        this.planModelFallbacks({ agentId, location }, requestedModel, requestedEffort, used ?? plan.fallbackContextTokens ?? null),
       ...(effortDescriptor ? { effortDescriptor } : {}),
       onDead: () => {
         // Involuntary death — #76: leave turn markers intact. This is an

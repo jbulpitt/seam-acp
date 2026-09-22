@@ -108,8 +108,12 @@ repeated.
 ### Phase B — Numbers (AA as an event feed)
 
 Call `model_metadata_query` with `hasBenchmark: true`, sort by benchmark
-desc, limit 15–25. Also query recently released names (`releasedAfter` ≈ 60
-days) and `nameContains` for creators **not** on the storyline list.
+desc, limit 15–25. The cache returns one row per agent binding, so extract
+unique scored models (slug) before ranking. If 15–25 rows collapse to fewer
+than ~12 unique SKUs, raise the limit until that unique set is in hand. Do
+not treat raw row count as the model count. Also query recently released
+names (`releasedAfter` ≈ 60 days) and `nameContains` for creators **not**
+on the storyline list.
 
 Write `snapshots/YYYY-MM-DD.md` with Intelligence Index (and Coding if
 present) for the top ~12 plus any new name. Diff against the previous
@@ -140,7 +144,7 @@ bar in §4 is true.
 founding posts, departures, timing claims, cancellations. Minimum handles to
 try (add new ones to this list when they clear the bar — that is self-update):
 
-- xAI / Grok: `elonmusk`, `xai`, `grok`
+- xAI / Grok: `elonmusk`, `xai`, `SpaceXAI`, `grok` (launch posts are on `SpaceXAI`)
 - OpenAI: `sama`, `OpenAI`
 - Anthropic: `AnthropicAI`, `darioamodei`
 - Safety / pacing: Jacob Coxon (`hilbertspaess`), Joe Benton (`JoeJBenton`), Josh Engels (`JoshAEngels`; formerly Google DeepMind, now METR), Evan Hubinger (`EvanHub`), Samuel Marks (`saprmarks`)

@@ -12534,7 +12534,12 @@ export class Orchestrator {
     effort?: string;
     channel: ChannelRef;
     promptText: string;
-    owned?: { occurrence: PreparedScheduledOccurrence; attempt: TurnAttempt };
+    owned?: {
+      occurrence: PreparedScheduledOccurrence;
+      attempt: TurnAttempt;
+      /** Pre-claim row. `claim` clears the stall reason before the story is built. */
+      stopped?: RecoveryAttemptSource;
+    };
   }): Promise<{ text: string; error?: string }> {
     const { profile, record, cwd, model, effort, channel, promptText } = args;
     const owned = args.owned;

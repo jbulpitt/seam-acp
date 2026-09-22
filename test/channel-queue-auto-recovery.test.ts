@@ -183,13 +183,13 @@ describe("#423 a wedged thread self-heals without an operator", () => {
     expect(store.getInbound("306")?.state).toBe("running");
   });
 
-  it("does not report recovery while a prompted attempt still blocks the target (#428)", async () => {
-    // The sweep fenced the channel queue and logged success while the attempt
-    // layer stayed dead: one suspended attempt that had already started its
-    // prompt, and pending handoffs that nothing had claimed. Replaying the
-    // suspended attempt would bill the interrupted turn again, and an empty
-    // owner_boot on the pending rows is not a dead owner — admit writes it
-    // that way. The repair may fence the queue. It may not call that recovered.
+  it("settles a prompted suspension without resending it when never-started work is waiting (#428)", async () => {
+    // The sweep used to fence the queue and leave the prompted suspension in
+    // front of handoffs that had never been claimed. Resending that prompt
+    // would bill the interrupted turn again. Empty owner_boot on the pending
+    // row is not a dead owner. Settle the prompted row and leave the
+    // never-started one pending. That is not "recovered": the successor has
+    // not run yet.
     const { host } = makeHost();
     expect(admitStale("428")).toBe(true);
     const suspended = {
@@ -212,7 +212,7 @@ describe("#423 a wedged thread self-heals without an operator", () => {
     expect(await host.sweepWedgedQueues()).toEqual([]);
 
     expect(store.turnAttempts.get("suspended-prompted")).toMatchObject({
-      state: "suspended",
+      state: "cancelled",
       promptStarted: true,
     });
     expect(store.turnAttempts.get("pending-never")).toMatchObject({
@@ -224,7 +224,7 @@ describe("#423 a wedged thread self-heals without an operator", () => {
     const audit = store.listConfigMutations().filter((m) => m.scope === `thread:${CHANNEL}`);
     expect(audit).toHaveLength(1);
     expect(audit[0]!.summary).toBe(
-      "Fenced channel queue (auto); prompted attempt still blocks it",
+      "Settled prompted suspension (auto); the interrupted prompt was not resent",
     );
     expect(audit[0]!.summary).not.toMatch(/Recovered channel queue/);
   });

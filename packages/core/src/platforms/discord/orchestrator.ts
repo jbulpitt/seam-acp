@@ -4,7 +4,12 @@ import { promises as fsp } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { randomUUID } from "node:crypto";
-import { DispatchSuspendedError, inboundAttemptId, type TurnAttempt } from "../../core/dispatch/attempt-store.js";
+import {
+  DispatchSuspendedError,
+  inboundAttemptId,
+  type SettledPromptedBlock,
+  type TurnAttempt,
+} from "../../core/dispatch/attempt-store.js";
 import { BootAcquisitionExhaustedError, DispatchAcquisitionPhase, isRetryableBootAcquisitionError } from "../../core/dispatch/acquisition-phase.js";
 import { compareExecutionIdentity, executionIdentity } from "../../core/dispatch/execution-identity.js";
 import { MessageFlags, EmbedBuilder, ButtonBuilder, ActionRowBuilder, ButtonStyle, StringSelectMenuBuilder, ModalBuilder, TextInputBuilder, TextInputStyle, AttachmentBuilder, type ChatInputCommandInteraction, type AutocompleteInteraction, type MessageComponentInteraction, type Message, type InteractionEditReplyOptions } from "discord.js";
@@ -2327,7 +2332,12 @@ export class Orchestrator {
       }
       try {
         const result = await this.recoverChannel(channelRef, "auto", AUTO_RECOVERY_ACTOR);
-        if (result.ok) {
+        if (result.settledPrompted) {
+          this.logger.warn(
+            { channelRef, reason: result.message },
+            "queue sweep: settled a prompted suspension; the interrupted prompt was not resent"
+          );
+        } else if (result.ok) {
           recovered.push(channelRef);
           this.logger.warn(
             { channelRef, queued: health.queued, ageMs: health.ageMs,
@@ -2836,7 +2846,13 @@ export class Orchestrator {
     channelRef: string,
     mode: "auto" | "force",
     actor?: { id: string; name: string }
-  ): Promise<{ ok: boolean; message: string; before: ChannelQueueHealth; epoch: number }> {
+  ): Promise<{
+    ok: boolean;
+    message: string;
+    before: ChannelQueueHealth;
+    epoch: number;
+    settledPrompted?: boolean;
+  }> {
     const before = this.inspectChannelQueue(channelRef);
     const currentEpoch = this.queueEpoch(channelRef);
     if (mode === "auto" && before.state !== "wedged") {
@@ -2862,6 +2878,12 @@ export class Orchestrator {
       return { ok: false, before, epoch: currentEpoch,
         message: "Refused: a legacy running admission has no frozen execution identity. Recovery cannot safely replay it." };
     }
+
+    // A prompted suspension ahead of never-started work is not reattached.
+    // Cancel it before recoverTarget, which would otherwise mark it ready
+    // and run it in front of the successor. owner_boot is not consulted.
+    const settled = this.store.turnAttempts.settleBlockedPromptedAttempts(channelRef);
+    this.noteSettledPromptedBlocks(settled);
 
     // Fence SYNCHRONOUSLY before the first recovery await. Keep that fence
     // armed through filesystem reconciliation and runtime abort/invalidation,
@@ -2907,6 +2929,35 @@ export class Orchestrator {
     // A prompted suspension is work that already ran. Fencing the channel
     // queue does not finish it, and the pending handoffs behind it stay
     // unclaimed. Calling that "recovered" is the false success (#428).
+    // Settling one is also not recovery: the successor has not run yet.
+    if (settled.length > 0) {
+      const pending = settled.reduce((n, row) => n + row.pendingIds.length, 0);
+      const summary = `Settled prompted suspension (${mode}); the interrupted prompt was not resent`;
+      this.store.recordConfigMutation({
+        id: `queue-recovery-${randomUUID()}`,
+        tier: "operator",
+        actorId: actor?.id ?? null,
+        actorName: actor?.name ?? null,
+        scope: `thread:${channelRef}`,
+        summary,
+        beforeJson: JSON.stringify(before),
+        afterJson: JSON.stringify({ ...detail, settled }),
+      });
+      this.logger.warn(
+        { ...detail, settled },
+        "channel queue fenced; prompted suspension settled without resending"
+      );
+      return {
+        ok: false,
+        settledPrompted: true,
+        before,
+        epoch,
+        message:
+          `Settled ${settled.map((row) => row.settledId).join(", ")} on <#${channelRef}> ` +
+          `without resending the interrupted prompt. ` +
+          `${pending} never-started dispatch${pending === 1 ? "" : "es"} remain pending.`,
+      };
+    }
     const block = this.promptedAttemptBlock(channelRef);
     const drained = block === null;
     this.store.recordConfigMutation({
@@ -15381,6 +15432,10 @@ export class Orchestrator {
     }
 
     if (this.dispatchWatcher) {
+      // Successors already admitted must not wait behind a reattach of work
+      // that has already been prompted. Reattach stays available when nothing
+      // never-started is waiting.
+      this.noteSettledPromptedBlocks(this.store.turnAttempts.settleBlockedPromptedAttempts());
       for (const spec of await this.dispatchWatcher.listStaleRunning()) {
         const owned = this.store.turnAttempts.get(spec.id);
         if (!owned || owned.state !== "suspended") continue;
@@ -15654,6 +15709,22 @@ export class Orchestrator {
       }
     }
     return legacy;
+  }
+
+  /** Tell the thread that an interrupted prompt was not sent again. */
+  noteSettledPromptedBlocks(settled: readonly SettledPromptedBlock[]): void {
+    for (const row of settled) {
+      const n = row.pendingIds.length;
+      this.logger.warn(
+        { target: row.target, settledId: row.settledId, pendingIds: row.pendingIds },
+        "dispatch: settled prompted suspension so never-started work can run",
+      );
+      void this.postResumeNotice(
+        row.target,
+        `⏸️ Settled interrupted dispatch \`${row.settledId}\` without resending its prompt. ` +
+          `${n} never-started dispatch${n === 1 ? "" : "es"} on this thread can run.`,
+      );
+    }
   }
 
   /** One admission decision for boot and operator dispatch continuation.

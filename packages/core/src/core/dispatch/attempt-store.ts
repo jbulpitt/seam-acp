@@ -39,6 +39,19 @@ function recordedOwner(raw: string | undefined): ProcessOwner | null {
 
 export const inboundAttemptId = (messageId: string): string => `inbound-${messageId}`;
 
+/**
+ * A prompted suspension was cancelled so a never-started dispatch on the
+ * same target can run. The original prompt is not sent again.
+ */
+export const PROMPTED_BLOCK_SETTLED_REASON =
+  "settled without resending: a never-started dispatch is waiting on this target";
+
+export interface SettledPromptedBlock {
+  target: string;
+  settledId: string;
+  pendingIds: string[];
+}
+
 /** A logical dispatch has many process attempts, but only one terminal winner.
  * This is ownership metadata for the existing queue, not a second queue/outbox.
  * Specs/outcomes are private: never log this row or expose it in diagnostics.
@@ -583,6 +596,44 @@ export class TurnAttemptStore {
   suspend(id: string, ownerBoot: string): boolean {
     return this.db.prepare("UPDATE turn_attempts SET state='suspended', updated_utc=? WHERE id=? AND owner_boot=? AND state='active'")
       .run(new Date().toISOString(), id, ownerBoot).changes === 1;
+  }
+
+  /**
+   * Drop a prompted suspension that is sitting ahead of work which has not
+   * started. `prompt_started=0` is left pending: that dispatch has not been
+   * billed and the watcher may claim it. A prompted row with no never-started
+   * sibling is left suspended so reattach can still continue it.
+   * `owner_boot` is not a signal — `admit` writes it empty.
+   */
+  settleBlockedPromptedAttempts(target?: string): SettledPromptedBlock[] {
+    const waiting = new Map<string, string[]>();
+    const prompted = new Map<string, TurnAttempt[]>();
+    for (const attempt of this.list("pending")) {
+      if (attempt.source !== "dispatch" || attempt.promptStarted) continue;
+      const key = attempt.spec?.target;
+      if (!key || (target !== undefined && key !== target)) continue;
+      const ids = waiting.get(key) ?? [];
+      ids.push(attempt.id);
+      waiting.set(key, ids);
+    }
+    for (const attempt of this.list("suspended")) {
+      if (attempt.source !== "dispatch" || !attempt.promptStarted) continue;
+      const key = attempt.spec?.target;
+      if (!key || (target !== undefined && key !== target)) continue;
+      const rows = prompted.get(key) ?? [];
+      rows.push(attempt);
+      prompted.set(key, rows);
+    }
+    const settled: SettledPromptedBlock[] = [];
+    for (const [key, rows] of prompted) {
+      const pendingIds = waiting.get(key);
+      if (!pendingIds || pendingIds.length === 0) continue;
+      for (const attempt of rows) {
+        if (!this.cancel(attempt.id, PROMPTED_BLOCK_SETTLED_REASON)) continue;
+        settled.push({ target: key, settledId: attempt.id, pendingIds: [...pendingIds] });
+      }
+    }
+    return settled;
   }
 
   /** Explicit cancellation may win against suspension, never against captured completion. */

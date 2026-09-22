@@ -455,6 +455,15 @@ export class DispatchWatcher {
    * suspension and, when that callback is still in flight, drop the queue so
    * the successor can be claimed. The interrupted prompt is not sent.
    */
+  private settleSupersededUnstarted(): void {
+    const settled = this.attempts.settleSupersededUnstartedAttempts();
+    if (settled.length === 0) return;
+    this.logger.warn(
+      { settled },
+      "dispatch: settled an active attempt that never started a prompt",
+    );
+  }
+
   private releasePromptedBlocks(): void {
     const settled = this.attempts.settleBlockedPromptedAttempts();
     if (settled.length === 0) return;
@@ -498,6 +507,10 @@ export class DispatchWatcher {
     // shutdown barrier has already decided it is not waiting for. The specs
     // stay in `pending/` and are delivered on the next boot.
     if (!this.ready) return;
+    // During operation, not only at boot. A live owner can hold an active
+    // row that never reached session/prompt (#559). Boot recovery alone
+    // never sees it.
+    this.settleSupersededUnstarted();
     this.releasePromptedBlocks();
     const ids = [...new Set([...names
       .filter((name) => name.endsWith(".json"))
@@ -1027,6 +1040,24 @@ export class DispatchWatcher {
           this.logger.info({ id, target: spec.target, chars: output.length }, "dispatch: completed");
         }
       } catch (err) {
+        if (err instanceof DispatchSuspendedError) {
+          const settled = this.attempts.get(id);
+          // The claim returned before session/prompt and cancelled itself.
+          // The running marker is not work the next boot should resume.
+          // This has to run before the ownership check: a queue fence drops
+          // ownership and used to return here with the row still active.
+          if (settled?.state === "cancelled" && !settled.promptStarted && !settled.acpSessionId) {
+            await this.withArtifact(id, async () => {
+              await rm(path.join(this.dirs.running, `${id}.json`), { force: true });
+              await rm(path.join(this.dirs.pending, `${id}.json`), { force: true });
+            });
+            this.logger.info(
+              { id, target: spec.target, suspension: err.suspension, reason: err.reason },
+              "dispatch: unstarted claim settled before prompt",
+            );
+            return;
+          }
+        }
         if (!this.owns(owner)) return;
         if (err instanceof DispatchSuspendedError) {
           this.deferred.add(id);

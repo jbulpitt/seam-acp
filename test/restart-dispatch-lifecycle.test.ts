@@ -151,6 +151,30 @@ describe("#250 production dispatch lifecycle (synthetic transport, no providers)
       }
     });
 
+  it("#559 a queue fence after claim and before prompt cancels the unstarted attempt", async () => {
+    const h = setup();
+    h.router.getOrStartRuntime.mockImplementationOnce(async () => {
+      (h.orch as any).advanceChannelQueueEpoch(h.spec.target);
+      return h.runtime;
+    });
+    await h.watcher.start();
+    await enqueueDispatchSpec(h.dataDir, h.spec);
+    await h.watcher.tick();
+    await h.watcher.drain();
+    expect(h.runtime.prompt).not.toHaveBeenCalled();
+    expect(h.notices).not.toHaveBeenCalled();
+    expect(h.store.turnAttempts.get(h.spec.id)).toMatchObject({
+      state: "cancelled",
+      promptStarted: false,
+      acpSessionId: null,
+      outcome: { error: expect.stringContaining("fenced") },
+    });
+    expect(existsSync(path.join(dispatchDirs(h.dataDir).running, `${h.spec.id}.json`))).toBe(false);
+    // The return settled the row. The sweep is the net for a row this path
+    // did not reach, and it has nothing to do here.
+    expect(h.store.turnAttempts.settleSupersededUnstartedAttempts()).toEqual([]);
+  });
+
   it("#304 admitting to SQL does not turn an ordinary setup failure into a stall", async () => {
     const h = setup();
     vi.spyOn(h.router, "ensureSessionRecord").mockImplementationOnce(() => { throw new Error("target unavailable"); });

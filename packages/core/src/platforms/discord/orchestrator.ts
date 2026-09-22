@@ -9,6 +9,7 @@ import {
   DispatchSuspendedError,
   inboundAttemptId,
   type SettledPromptedBlock,
+  type SettledUnstartedAttempt,
   type TurnAttempt,
 } from "../../core/dispatch/attempt-store.js";
 import { BootAcquisitionExhaustedError, DispatchAcquisitionPhase, isRetryableBootAcquisitionError } from "../../core/dispatch/acquisition-phase.js";
@@ -2960,6 +2961,9 @@ export class Orchestrator {
     // and run it in front of the successor. owner_boot is not consulted.
     const settled = this.store.turnAttempts.settleBlockedPromptedAttempts(channelRef);
     this.noteSettledPromptedBlocks(settled);
+    this.noteSettledUnstartedAttempts(
+      this.store.turnAttempts.settleSupersededUnstartedAttempts(channelRef),
+    );
 
     // Fence SYNCHRONOUSLY before the first recovery await. Keep that fence
     // armed through filesystem reconciliation and runtime abort/invalidation,
@@ -9457,6 +9461,13 @@ export class Orchestrator {
       try { current = this.store.turnAttempts?.get(spec.id); }
       catch (readErr) { throw DispatchSuspendedError.from(readErr, spec.id, "reading the attempt row failed"); }
       if (current?.state === "cancelled") {
+        // An unstarted claim that settled itself on the way out (#559) must
+        // keep its suspension class. Operator cancel uses a different reason
+        // and still becomes the terminal turn error below.
+        if (err instanceof DispatchSuspendedError && !current.promptStarted && !current.acpSessionId
+          && current.outcome?.error !== "cancelled by operator") {
+          throw err;
+        }
         this.interruptedDispatches.delete(spec.id);
         let completionPending = false;
         try { this.store.updateDelegationStatus(spec.id, "failed"); }
@@ -9706,6 +9717,8 @@ export class Orchestrator {
     // Isolated dispatches do not register their runtime on the router, so the
     // watchdog cannot see turnHealth's clock unless the turn notes it here.
     const activity = { at: Date.now() };
+    // Set only after claim(). A throw before that did not make this row active.
+    let unstartedClaim: TurnAttempt | undefined;
 
     const run = async (queueFence?: ChannelQueueFence): Promise<{ output: string; stopReason: string }> => {
       this.assertQueueFence(queueFence);
@@ -9735,6 +9748,7 @@ export class Orchestrator {
       });
       this.store.turnAttempts?.registerOwner(this.attemptBoot);
       const attempt = this.store.turnAttempts?.claim(spec, identity, this.attemptBoot);
+      unstartedClaim = attempt;
       let outcomeOwned = false;
       let submittedThisAttempt = false;
       const lifecycle: InjectTurnOptions["lifecycle"] = attempt ? {
@@ -10343,32 +10357,44 @@ export class Orchestrator {
     const gatedRun = (queueFence?: ChannelQueueFence) =>
       isResume ? this.resumeScheduler.run(() => run(queueFence)) : run(queueFence);
 
-    if (effectiveSession === "live") {
-      // Share the thread's persistent session ⇒ must not overlap a user turn.
-      return this.queueOnChannel(spec.target, gatedRun);
-    }
-    // Isolated: own throwaway runtime, so it cannot collide with the thread's
-    // live session and needn't queue. It therefore appears in NO channel queue
-    // — `beginTurn` is the only thing that makes it visible to shutdown.
-    const endTurn = this.beginTurn();
     try {
-      return await settleWithTurnWatchdog(gatedRun, {
-        timeoutMs: turnWatchdogTimeoutMs(
-          this.config.TURN_TIMEOUT_SECONDS ?? 900
-        ),
-        label: `isolated dispatch ${spec.id}`,
-        lastActivityAt: () => activity.at,
-      });
+      if (effectiveSession === "live") {
+        // Share the thread's persistent session ⇒ must not overlap a user turn.
+        return await this.queueOnChannel(spec.target, gatedRun);
+      }
+      // Isolated: own throwaway runtime, so it cannot collide with the thread's
+      // live session and needn't queue. It therefore appears in NO channel queue
+      // — `beginTurn` is the only thing that makes it visible to shutdown.
+      const endTurn = this.beginTurn();
+      try {
+        return await settleWithTurnWatchdog(gatedRun, {
+          timeoutMs: turnWatchdogTimeoutMs(
+            this.config.TURN_TIMEOUT_SECONDS ?? 900
+          ),
+          label: `isolated dispatch ${spec.id}`,
+          lastActivityAt: () => activity.at,
+        });
+      } catch (err) {
+        if (err instanceof TurnWatchdogTimeoutError) {
+          this.logger.error(
+            { err, dispatch: spec.id, target: spec.target, timeoutMs: err.timeoutMs },
+            "isolated dispatch watchdog expired; releasing the turn"
+          );
+        }
+        throw err;
+      } finally {
+        endTurn();
+      }
     } catch (err) {
-      if (err instanceof TurnWatchdogTimeoutError) {
-        this.logger.error(
-          { err, dispatch: spec.id, target: spec.target, timeoutMs: err.timeoutMs },
-          "isolated dispatch watchdog expired; releasing the turn"
-        );
+      // #559: claim() already ran. A suspension thrown before session/prompt
+      // used to leave the row active, and the watcher treats that as "SQL
+      // owns suspension" — which was false. Shutdown still hands the row to
+      // the next boot; a superseded fence cancels it. The operational sweep
+      // is the net for a row this return did not reach.
+      if (unstartedClaim && err instanceof DispatchSuspendedError) {
+        this.store.turnAttempts.releaseUnstartedClaim(unstartedClaim, err.suspension, err.reason);
       }
       throw err;
-    } finally {
-      endTurn();
     }
   }
 
@@ -15559,6 +15585,7 @@ export class Orchestrator {
       // that has already been prompted. Reattach stays available when nothing
       // never-started is waiting.
       this.noteSettledPromptedBlocks(this.store.turnAttempts.settleBlockedPromptedAttempts());
+      this.noteSettledUnstartedAttempts(this.store.turnAttempts.settleSupersededUnstartedAttempts());
       for (const spec of await this.dispatchWatcher.listStaleRunning()) {
         const owned = this.store.turnAttempts.get(spec.id);
         if (!owned || owned.state !== "suspended") continue;
@@ -15832,6 +15859,16 @@ export class Orchestrator {
       }
     }
     return legacy;
+  }
+
+  /** History only. The thread already moved on; this does not post a notice. */
+  noteSettledUnstartedAttempts(settled: readonly SettledUnstartedAttempt[]): void {
+    for (const row of settled) {
+      this.logger.warn(
+        { target: row.target, settledId: row.settledId, laterId: row.laterId },
+        "dispatch: settled an active attempt that never started a prompt",
+      );
+    }
   }
 
   /** Tell the thread that an interrupted prompt was not sent again. */

@@ -57,9 +57,13 @@ describe("bridge rollout target safety (#241)", () => {
     expect(resolveTarget(targets, "macbook-air")).toMatchObject({ bridgeId: "macbook-air", sshAlias: "macbook-air", pm2App: "seam-bridge", expectedUid: 501, workspaceArg: "/Users/jessebulpitt" });
   });
 
-  it("keeps AGY-only hosts mapped but outside this rollout", () => {
+  it("keeps the AGY laptops excluded for the surveyed reason, not a shared PM2-contract claim", () => {
     expect(configured.targets["jennifer-laptop"].sshAlias).toBe("macbook-air-j");
-    expect(() => resolveTarget(targets, "jennifer-laptop")).toThrow(/explicitly excluded.*AGY-only/);
+    expect(configured.targets["allie-laptop"].sshAlias).toBe("laptop-allie");
+    expect(configured.targets["alaina-laptop"].sshAlias).toBe("laptop-alaina");
+    expect(() => resolveTarget(targets, "jennifer-laptop")).toThrow(/explicitly excluded.*#388/);
+    expect(() => resolveTarget(targets, "allie-laptop")).toThrow(/explicitly excluded.*alliebulpitt uid 502/);
+    expect(() => resolveTarget(targets, "alaina-laptop")).toThrow(/explicitly excluded.*\balaina uid 502/);
   });
 
   it("refuses every mutating phase for an explicitly unmanaged host, before command construction (#281, #282)", () => {

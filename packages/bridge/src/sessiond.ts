@@ -8,9 +8,16 @@ function valueAfter(flag: string): string | undefined {
   return index === -1 ? undefined : process.argv[index + 1];
 }
 
-const defaults = defaultSessiondPaths();
-const socketPath = valueAfter("--socket") ?? defaults.socketPath;
-const statePath = valueAfter("--state") ?? defaults.statePath;
+// #595: resolve defaults only for the flags argv did NOT supply. A fully
+// specified launch (the controller's systemd unit, and connectSessiond's own
+// spawn) must not depend on HOME being present in a deliberately scrubbed env.
+const socketArg = valueAfter("--socket");
+const stateArg = valueAfter("--state");
+const defaults = socketArg && stateArg
+  ? { socketPath: socketArg, statePath: stateArg }
+  : defaultSessiondPaths();
+const socketPath = socketArg ?? defaults.socketPath;
+const statePath = stateArg ?? defaults.statePath;
 
 const server = new SessiondServer({ socketPath, statePath });
 await server.start();

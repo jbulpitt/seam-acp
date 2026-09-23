@@ -4,7 +4,7 @@
 >
 > **Cadence**: Weekly sweep (recommended: Monday), with ad-hoc checks when a major release is announced.
 >
-> **Last updated**: 2026-09-21 (daily sweep)
+> **Last updated**: 2026-09-23 (daily sweep)
 >
 > **⚠️ AGENT CONSTRAINT — READ-ONLY / REPORTING MODE**: Agents executing this runbook must **never** modify seam-acp source files, run `npm run redeploy`, apply patches, or make any code changes during a monitoring sweep. All code work is tracked via GitHub issues and implemented in **separate, explicitly tasked sessions**. Your job during a sweep is to **find, classify, and file or update GitHub issues** — not to implement fixes.
 
@@ -424,17 +424,17 @@ Use this checklist for each monitoring sweep. Copy it into your report and check
 ### Gather Checklist
 
 #### Google / Antigravity CLI (agy)
-- [ ] Check [Antigravity CLI releases](https://github.com/google-antigravity/antigravity-cli/releases) — last checked version: **1.2.7** (2026-09-20 sweep; installed 1.2.2, latest 1.2.7; 1.2.7: inline Kitty LaTeX/Mermaid rendering, ask_question UX improvements, project ID in banner, 30s max retry backoff, 20k token rule budget, retirement of legacy find_by_name/grep_search/list_dir from default baseline; Bubble Tea v2.0.9; 1.2.6: remote control, unlimited default headless timeout, structured AGY_ERROR on stderr with exit 3; #415 immutable staging)
+- [ ] Check [Antigravity CLI releases](https://github.com/google-antigravity/antigravity-cli/releases) — last checked version: **1.2.9** (2026-09-23 sweep; installed 1.2.2, latest 1.2.9; 1.2.9: @<subagent> <message> prompt syntax, Vim counts, headless -p daemon termination and task deadline wait, DB file lock concurrency fix, compaction checkpoint fix, stream chunk crash fix; 1.2.8: context compaction prompt budgeting and context-window sizing, custom models support PDF/audio; #415 immutable staging)
 - [ ] Check [Antigravity CLI CHANGELOG](https://github.com/google-antigravity/antigravity-cli/blob/main/CHANGELOG.md)
 - [ ] Check [Gemini API release notes](https://ai.google.dev/gemini-api/docs/changelog) (models shared with agy; Antigravity Agent 09-2026 released Sep 17, Gemini 3.8 Live GA Sep 15, Lyria 3.5 preview Sep 3, Gemini 3.8 Flash GA Sep 2)
 - [ ] Scan [Google AI Blog](https://blog.google/technology/ai/) for announcements
 - [ ] Check [Google AI pricing](https://ai.google.dev/gemini-api/docs/pricing) for changes
 
 #### Anthropic / Claude Code
-- [ ] Check [Claude Code releases](https://github.com/anthropics/claude-code/releases) — last checked version: **2.1.278** (2026-09-20 sweep; installed 2.1.278, latest 2.1.278; 2.1.278: server-side auto mode classifier default without overhead charges; 2.1.277: AGENTS.md support when no CLAUDE.md, gateway proxy boundary, headers map for gateway, background task notification in panels, fixed claude -p hangs, fixed empty text content block errors; 2.1.276: fixed ANTHROPIC_BASE_URL 400 error regression)
+- [ ] Check [Claude Code releases](https://github.com/anthropics/claude-code/releases) — last checked version: **2.1.280** (2026-09-23 sweep; installed 2.1.278, latest 2.1.280; 2.1.280: Claude Opus 5.5 released as default Opus model (1M ctx, $4/$20 Mtok), default Opus on Pro/Team Standard, CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH, effort decoupling, symlink write security fix, subagent messaging/compaction fixes)
 - [ ] Check [Claude Code CHANGELOG](https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md)
 - [ ] Check [Claude Code docs changelog](https://docs.anthropic.com/en/docs/claude-code/changelog)
-- [ ] Check [claude-agent-acp releases](https://github.com/agentclientprotocol/claude-agent-acp/releases) — last checked version: **0.79.0** (2026-09-20 sweep; installed 0.75.1, latest 0.79.0 GA; 0.79.0: update to claude agent sdk 0.3.274 #1143, show shell commands in permission prompts #1070, hold through placeholder task results; 0.78.0: experimental ACP compaction update support #1134)
+- [ ] Check [claude-agent-acp releases](https://github.com/agentclientprotocol/claude-agent-acp/releases) — last checked version: **0.81.1 GA** (2026-09-23 sweep; installed 0.75.1, latest 0.81.1 GA; 0.81.1: settle steered turns on answering result #1166, model on usage updates #1032, recreate session query on limit/skill change #1097/#968, preserve context on spend limit #1132, disableBypassPermissionsMode #1165; 0.81.0: Claude Agent SDK 0.3.280 with Opus 5.5 support #1157, experimental session notices #1155; 0.80.0: close interrupted compactions #1154, terminal output deltas #1150)
 - [ ] Check [claude-agent-acp CHANGELOG](https://github.com/agentclientprotocol/claude-agent-acp/blob/main/CHANGELOG.md)
 - [ ] Scan [Anthropic News](https://www.anthropic.com/news) for announcements (LSVP biology verification, pacing and safety measurements report)
 - [ ] Check [Anthropic platform release notes](https://docs.anthropic.com/en/release-notes)
@@ -443,7 +443,7 @@ Use this checklist for each monitoring sweep. Copy it into your report and check
 - [ ] Check [Anthropic status](https://status.anthropic.com/) for ongoing incidents
 
 #### GitHub / Copilot
-- [ ] Check [Copilot CLI releases](https://github.com/github/copilot-cli/releases) — last checked version: **1.0.86 GA**, preview **1.0.87-0** (2026-09-20 sweep; installed 1.0.34; 1.0.87-0 preview: consecutive steering prompts combine, worktreePathTemplate setting, auto routing tier defaults, MCP slowConnectionThresholdMs, prompt mode child task exit fix, failing MCP server isolation fix; 1.0.86 GA: include-custom-instructions in frontmatter; Oct 19 model deprecation announced for GPT-5.4, GPT-5.5, Gemini 3.7 Flash, Grok 4.5, GPT-5 mini)
+- [ ] Check [Copilot CLI releases](https://github.com/github/copilot-cli/releases) — last checked version: **1.0.88 GA**, preview **1.0.89-0** (2026-09-23 sweep; installed 1.0.34; 1.0.89-0 preview: Claude Opus 5.5 support, connector consent progress; 1.0.88 GA: enterprise managed settings in ACP mode, bounded session resume memory, custom agent reasoning effort, prompt mode task timeout warning, OSC 777 notifications; OTel in Copilot app; Copilot for JetBrains 1.18.0; WCI C++ indexing; Oct 19 model deprecation for GPT-5.4/5.5/mini, Gemini 3.7 Flash, Grok 4.5)
 - [ ] Check [Copilot CLI CHANGELOG](https://github.com/github/copilot-cli/blob/main/CHANGELOG.md)
 - [ ] Scan [GitHub Changelog](https://github.blog/changelog/) for Copilot entries (Oct 19 model deprecations, weekly release auto selection tiers, Copilot code review improvements)
 - [ ] Scan [GitHub Blog](https://github.blog/) for Copilot announcements (Toub Copilot runtime Rust migration report Sep 17)

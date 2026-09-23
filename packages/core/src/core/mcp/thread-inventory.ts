@@ -90,6 +90,8 @@ export async function listSiblingThreadEntries(
         effort: cfg.effort.value,
         fastMode: cfg.fastMode?.value === true,
         cwd: cfg.cwd.value,
+        // Bridge recovery stays off this flag. A retry the local runtime has
+        // already called stalled must not read as "wait for the live turn".
         busy: runtimeBusy || (queue.state !== "idle" && queue.state !== "stalled"),
         queueState: queue.state,
         queueAgeMs: queue.ageMs,

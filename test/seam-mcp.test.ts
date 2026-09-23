@@ -1928,10 +1928,11 @@ describe("SeamMcpServer", () => {
 
   // #290 asserted the opposite of this: that a retained dispatch made the entry
   // read as `[stalled]` rather than idle. #508 reversed it. `stalled` is not an
-  // answer to "can I dispatch here" — `index.ts` deliberately excludes it from
+  // answer to "can I dispatch here" — the inventory deliberately excludes it from
   // `busy` — and printing it as a third state took the whole worker pool out of
   // service, because agents read the flag as "unusable" and routed around it.
-  // The retained-dispatch detail is still reported; only the flag changed.
+  // The queue inspector no longer emits queue state `stalled` (#541); the attempt
+  // still surfaces as retained work.
   it("threads reports a retained dispatch as still dispatchable, keeping its detail (#508)", async () => {
     h = await makeHarness({
       listThreads: async () => [{
@@ -1943,9 +1944,23 @@ describe("SeamMcpServer", () => {
         effort: null,
         cwd: "/repo",
         busy: false,
-        queueState: "stalled",
+        queueState: "idle",
         stalledDispatchCount: 1,
         stalledDispatchIds: ["dispatch-stalled-1"],
+        workProgress: {
+          state: "retained",
+          progressing: false,
+          runtimeBusy: false,
+          runningDispatchIds: [],
+          assignedNotStartedDispatchIds: [],
+          activeUnobservedDispatchIds: [],
+          queuedDispatchIds: [],
+          retainedDispatchIds: ["dispatch-stalled-1"],
+          watcherOwnedDispatchIds: [],
+          blockedByDispatchIds: [],
+          remoteRecovery: [],
+          ageMs: 0,
+        },
         status: "active",
         lastActivityUtc: "2026-09-10T08:31:13.000Z",
       }],
@@ -1962,11 +1977,11 @@ describe("SeamMcpServer", () => {
     // unusable.
     expect(text).toContain("[idle]");
     expect(text).not.toContain("[stalled]");
-    // The bookkeeping is not hidden: the ids and the recovery route still print,
-    // and the line says in so many words that they do not block a handoff.
-    expect(text).toContain("dispatch-stalled-1");
-    expect(text).toContain("/seam workflows");
-    expect(text).toContain("does NOT block handoff");
+    expect(text).not.toContain("handoff decision: mid-recovery —");
+    // The bookkeeping is not hidden: the id still prints as retained work,
+    // and the listing says in so many words that it does not block a handoff.
+    expect(text).toContain("retained: dispatch-stalled-1");
+    expect(text).toContain("do NOT block handoff");
   });
 
   it("does not invent retained dispatches when the queue is stalled only by unsettled completions (#426)", async () => {
@@ -2046,6 +2061,142 @@ describe("SeamMcpServer", () => {
     expect(text).toContain("work progress: NOT observed (assigned_not_started, age 7200000ms)");
     expect(text).toContain("assigned but prompt not submitted: dispatch-assigned-1");
     expect(text).toContain("watcher-owned: none");
+  });
+
+  function recoveryProgress(
+    phase: "backoff" | "succeeded",
+    observed: boolean,
+  ) {
+    return {
+      state: observed && phase === "backoff" ? "running" as const : "retained" as const,
+      progressing: observed && phase === "backoff",
+      runtimeBusy: false,
+      runningDispatchIds: [] as string[],
+      assignedNotStartedDispatchIds: [] as string[],
+      activeUnobservedDispatchIds: [] as string[],
+      queuedDispatchIds: [] as string[],
+      retainedDispatchIds: [] as string[],
+      watcherOwnedDispatchIds: [] as string[],
+      blockedByDispatchIds: [] as string[],
+      remoteRecovery: [{
+        attemptId: "dispatch-recovering",
+        owner: "bridge" as const,
+        location: "remote-one",
+        slot: 9,
+        submissionId: "submission-9",
+        observed,
+        ...(observed ? { phase, retry: 1, remaining: 2 } : {}),
+      }],
+      ageMs: 0,
+    };
+  }
+
+  it("names an observed bridge retry as mid-recovery without marking the thread busy (#563)", async () => {
+    h = await makeHarness({
+      listThreads: async () => [{
+        id: "111111111111111111",
+        name: "recovering worker",
+        isSelf: false,
+        agent: "codex",
+        model: "gpt",
+        effort: null,
+        cwd: "/repo",
+        busy: false,
+        queueState: "idle",
+        stalledDispatchCount: 0,
+        stalledDispatchIds: [],
+        workProgress: recoveryProgress("backoff", true),
+        status: "active",
+        lastActivityUtc: "2026-09-22T12:00:00.000Z",
+      }],
+    });
+    const { body } = await h.call(
+      "tools/call",
+      { name: "threads", arguments: {} },
+      { "X-Seam-Session": "good-token" }
+    );
+    expect(body.result.isError).toBeFalsy();
+    const text = body.result.content[0].text as string;
+    expect(text).toContain("[idle]");
+    expect(text).not.toContain("[busy]");
+    expect(text).toContain("handoff decision: mid-recovery —");
+    expect(text).toContain("dispatch-recovering");
+    expect(text).toContain("Hand off `continue`");
+    expect(text).toContain("Do not dispatch new work");
+  });
+
+  it("does not call a finished or unobserved bridge binding mid-recovery (#563)", async () => {
+    for (const workProgress of [recoveryProgress("succeeded", true), recoveryProgress("backoff", false)]) {
+      h = await makeHarness({
+        listThreads: async () => [{
+          id: "111111111111111111",
+          name: "settled worker",
+          isSelf: false,
+          agent: "codex",
+          model: "gpt",
+          effort: null,
+          cwd: "/repo",
+          busy: false,
+          queueState: "idle",
+          stalledDispatchCount: 0,
+          stalledDispatchIds: [],
+          workProgress,
+          status: "active",
+          lastActivityUtc: "2026-09-22T12:00:00.000Z",
+        }],
+      });
+      const { body } = await h.call(
+        "tools/call",
+        { name: "threads", arguments: {} },
+        { "X-Seam-Session": "good-token" }
+      );
+      expect(body.result.isError).toBeFalsy();
+      const text = body.result.content[0].text as string;
+      expect(text).toContain("[idle]");
+      expect(text).not.toContain("handoff decision: mid-recovery —");
+    }
+  });
+
+  it("keeps a live turn as wait even when a bridge retry is also listed (#563)", async () => {
+    h = await makeHarness({
+      listThreads: async () => [{
+        id: "111111111111111111",
+        name: "live worker",
+        isSelf: false,
+        agent: "codex",
+        model: "gpt",
+        effort: null,
+        cwd: "/repo",
+        busy: true,
+        queueState: "runtime_busy",
+        stalledDispatchCount: 0,
+        stalledDispatchIds: [],
+        workProgress: recoveryProgress("backoff", true),
+        status: "active",
+        lastActivityUtc: "2026-09-22T12:00:00.000Z",
+      }],
+    });
+    const { body } = await h.call(
+      "tools/call",
+      { name: "threads", arguments: {} },
+      { "X-Seam-Session": "good-token" }
+    );
+    expect(body.result.isError).toBeFalsy();
+    const text = body.result.content[0].text as string;
+    expect(text).toContain("[busy]");
+    expect(text).not.toContain("handoff decision: mid-recovery —");
+  });
+
+  it("teaches the three handoff states in the threads tool description (#563)", async () => {
+    h = await makeHarness();
+    const { body } = await h.call("tools/list");
+    const threads = (body.result.tools as Array<{ name: string; description: string }>)
+      .find((tool) => tool.name === "threads");
+    expect(threads?.description).toContain("handoff decision: mid-recovery");
+    expect(threads?.description).toContain("Hand off `continue`");
+    expect(threads?.description).toContain("Do not dispatch new work");
+    expect(threads?.description).not.toContain("Dispatch on fit and `busy` alone");
+    expect(threads?.description).not.toContain("distinguishes runtime_busy, queued, wedged, and stalled");
   });
 
   it("threads refuses a scope that names another channel (self-scope, #73)", async () => {

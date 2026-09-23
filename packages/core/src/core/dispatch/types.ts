@@ -696,6 +696,19 @@ export interface ThreadWorkProgress {
   ageMs: number;
 }
 
+/** Phases that have left the bridge's retry. An unobserved binding is not a
+ * retry either: the ledger row alone is not the child owner's report. */
+const BRIDGE_RETRY_SETTLED = new Set(["succeeded", "exhausted", "awaiting_app"]);
+
+/** The handoff fact #563 names separately from `busy`. True only when the
+ * bridge has published this exact submission and the retry is still underway. */
+export function bridgeOwnedRetryInProgress(
+  recovery: ThreadWorkProgress["remoteRecovery"][number],
+): boolean {
+  return recovery.observed
+    && (recovery.phase === undefined || !BRIDGE_RETRY_SETTLED.has(recovery.phase));
+}
+
 /** Locate the durable artifact for one exact dispatch id. */
 export async function dispatchArtifactState(
   dataDir: string,

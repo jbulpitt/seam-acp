@@ -5,7 +5,7 @@ import path from "node:path";
 import { pino } from "pino";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
 import { DispatchWatcher } from "../packages/core/src/core/dispatch/watcher.js";
-import type { DispatchSpec } from "../packages/core/src/core/dispatch/types.js";
+import { bridgeOwnedRetryInProgress, type DispatchSpec } from "../packages/core/src/core/dispatch/types.js";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
 import { listSiblingThreadEntries } from "../packages/core/src/core/mcp/thread-inventory.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
@@ -236,7 +236,7 @@ describe("#530 composed thread work progress", () => {
     });
   });
 
-  it("reports bridge-owned retry progress from exact closed recovery facts", () => {
+  it("reports bridge-owned retry progress from exact closed recovery facts", async () => {
     store.turnAttempts.registerOwner(OWNER);
     const dispatch = spec("remote-retry");
     store.turnAttempts.admit(dispatch);
@@ -294,6 +294,71 @@ describe("#530 composed thread work progress", () => {
     });
     // Mutation proof: dropping the exact bridge snapshot makes this retained,
     // not progressing; the ledger binding alone is never treated as liveness.
+
+    const caller = store.get(`discord:${TARGET}`)!;
+    const entries = await listSiblingThreadEntries(caller, {
+      listSessionsByParent: (platform, parentRef) =>
+        store.listSessionsByParent(platform, parentRef),
+      describeConfig: () => ({
+        agent: { value: "codex", source: "session config" },
+        model: { value: "gpt", source: "default" },
+        effort: { value: null, source: "default" },
+        fastMode: { value: false, source: "default" },
+        cwd: { value: "/repo", source: "default" },
+      } as never),
+      isRuntimeBusy: () => false,
+      adapter: {
+        getThreadName: async () => "worker",
+        getThreadLiveState: async () => ({ locked: false, archived: false }),
+      },
+      inspectQueue: (channelRef) => host.inspectChannelQueue(channelRef),
+      inspectWorkProgress: (channelRef, nowMs, queue) =>
+        host.inspectThreadWorkProgress(channelRef, nowMs, queue),
+      locationFor: () => ({ location: "remote-one", hostEmoji: "" }),
+    });
+    expect(entries[0]).toMatchObject({
+      busy: false,
+      workProgress: { progressing: true, state: "running" },
+    });
+  });
+
+  it("does not treat a settled bridge phase as an in-flight retry", () => {
+    expect(bridgeOwnedRetryInProgress({
+      attemptId: "done",
+      owner: "bridge",
+      location: "remote-one",
+      slot: 1,
+      submissionId: "submission",
+      observed: true,
+      phase: "succeeded",
+    })).toBe(false);
+    expect(bridgeOwnedRetryInProgress({
+      attemptId: "waiting",
+      owner: "bridge",
+      location: "remote-one",
+      slot: 1,
+      submissionId: "submission",
+      observed: true,
+      phase: "awaiting_app",
+    })).toBe(false);
+    expect(bridgeOwnedRetryInProgress({
+      attemptId: "unseen",
+      owner: "bridge",
+      location: "remote-one",
+      slot: 1,
+      submissionId: "submission",
+      observed: false,
+      phase: "backoff",
+    })).toBe(false);
+    expect(bridgeOwnedRetryInProgress({
+      attemptId: "retrying",
+      owner: "bridge",
+      location: "remote-one",
+      slot: 1,
+      submissionId: "submission",
+      observed: true,
+      phase: "retrying",
+    })).toBe(true);
   });
 
   it("preserves ordinary live-runtime progress with no dispatch row", () => {

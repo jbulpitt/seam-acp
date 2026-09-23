@@ -267,6 +267,22 @@ describe("#444 the cursor is what survives a disconnect", () => {
 });
 
 describe("#444 an old bridge must behave exactly as today", () => {
+  it("#574 evicts on a new instance when the bridge does not advertise durable slots", async () => {
+    const { ws, child } = harness();
+    const exits: number[] = [];
+    child.on("exit", () => exits.push(1));
+    ws.deliver({ type: "hello", instanceId: "old-instance" });
+    await flush();
+    const probesBeforeRestart = ws.cmds("listSlots").length;
+
+    ws.deliver({ type: "hello", instanceId: "new-instance" });
+    await flush();
+
+    expect(exits).toEqual([1]);
+    expect(ws.sent.filter((frame) => frame.type === "kill")).toEqual([]);
+    expect(ws.cmds("listSlots")).toHaveLength(probesBeforeRestart);
+  });
+
   it("never advances a cursor for frames that carry no seq", async () => {
     const { ws, child } = harness();
     ws.deliver({ slot: child.slot, type: "data", data: "a\n" });
@@ -293,6 +309,81 @@ describe("#444 an old bridge must behave exactly as today", () => {
   it("does not ask a slot the bridge no longer has to replay", async () => {
     const { ws, child } = harness();
     await reconnect(ws, []); // bridge reports the slot gone
+    expect(ws.cmds("replayOutput")).toHaveLength(0);
+  });
+});
+
+describe("#574 a supervisor-backed bridge restart preserves live slots", () => {
+  it("reconciles a new capable instance, replays its gap, and never sends kill", async () => {
+    const { ws, child, chunks } = harness();
+    const exits: number[] = [];
+    child.on("exit", () => exits.push(1));
+    ws.deliver({
+      type: "hello",
+      instanceId: "old-instance",
+      capabilities: { durableSlots: true },
+    });
+    ws.deliver({ slot: child.slot, type: "data", data: "before\n", seq: 1 });
+    await flush();
+
+    ws.deliver({
+      type: "hello",
+      instanceId: "new-instance",
+      capabilities: { durableSlots: true },
+    });
+    await flush();
+    const probe = ws.cmds("listSlots").at(-1)!;
+    expect(probe).toBeDefined();
+    ws.reply(probe, {
+      slots: [child.slot],
+      health: [{
+        slot: child.slot,
+        alive: true,
+        pid: 4242,
+        lastStdoutMsAgo: 5,
+        lastStdinMsAgo: 10,
+      }],
+    });
+    await flush();
+
+    const replay = ws.cmds("replayOutput").at(-1)!;
+    expect(replay.payload).toEqual({ slot: child.slot, afterSeq: 1 });
+    ws.reply(replay, {
+      slot: child.slot,
+      frames: [
+        { seq: 2, type: "data", data: "gap-1\n" },
+        { seq: 3, type: "data", data: "gap-2\n" },
+      ],
+    });
+    await flush();
+
+    expect(chunks.join("")).toBe("before\ngap-1\ngap-2\n");
+    expect(exits).toEqual([]);
+    expect(ws.sent.filter((frame) => frame.type === "kill")).toEqual([]);
+  });
+
+  it("still evicts a supervised slot whose owning process is dead", async () => {
+    const { ws, child } = harness();
+    const exits: number[] = [];
+    child.on("exit", () => exits.push(1));
+    ws.deliver({ type: "hello", instanceId: "old", capabilities: { durableSlots: true } });
+    await flush();
+    ws.deliver({ type: "hello", instanceId: "new", capabilities: { durableSlots: true } });
+    await flush();
+    const probe = ws.cmds("listSlots").at(-1)!;
+    ws.reply(probe, {
+      slots: [child.slot],
+      health: [{
+        slot: child.slot,
+        alive: false,
+        pid: 4242,
+        lastStdoutMsAgo: 5,
+        lastStdinMsAgo: 10,
+      }],
+    });
+    await flush();
+
+    expect(exits).toEqual([1]);
     expect(ws.cmds("replayOutput")).toHaveLength(0);
   });
 });

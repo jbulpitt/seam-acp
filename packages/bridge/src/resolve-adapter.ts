@@ -4,7 +4,7 @@
  * ## The defect
  *
  * `resolveSlotAdapter` returned `undefined` for an `agentId` this bridge does
- * not hold, and `spawnAgent` then fell through to the copilot legacy branch.
+ * not hold, and the old direct-spawn path then fell through to copilot.
  * The requested agent was not spawned, nothing failed, and copilot ran the
  * work. The turn succeeded and the output came from an agent nobody asked for.
  *

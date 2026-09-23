@@ -1,12 +1,16 @@
 /**
- * Choosing and launching the agent process for a slot (#468, #453).
+ * Choosing and launching the adapter inside the sessiond-owned slot host
+ * (#574, #468, #453).
  *
  * Lives outside `index.ts` because that file is the CLI entrypoint and
  * `process.exit(1)`s on import, so nothing left inline there can be reached by
  * a test. #442, #444 and #456 each shipped with a mutation surviving for that
  * reason. The refusal has to be thrown from here, or deleting it stays green.
  *
- * Every held agent, including copilot, launches through `adapter.spawn`.
+ * This module has exactly one production caller: `adapter-child.ts`, itself
+ * launched and held by sessiond. The bridge control plane no longer receives
+ * a ChildProcess or owns its stdio. Every held agent, including copilot,
+ * launches through `adapter.spawn` inside that supervised host.
  * The binary, base argv, and install detection live on the adapter. Model,
  * effort, MCP servers, cwd, and env arrive as slot data. There is no
  * agent-id branch and no second copilot launcher.
@@ -20,7 +24,7 @@ import {
   UnspecifiedAgentError,
 } from "./resolve-adapter.js";
 
-export function spawnAgent(
+export function spawnSupervisedAdapter(
   adapters: Map<string, AgentAdapter>,
   slotCfg?: SlotSpawnConfig
 ): ChildProcess {

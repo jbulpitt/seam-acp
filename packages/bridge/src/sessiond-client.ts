@@ -18,7 +18,12 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
 const MAX_WIRE_BYTES = 12 * 1024 * 1024;
 
 export class SessiondClientError extends Error {
-  constructor(readonly code: string, message: string) {
+  constructor(
+    readonly code: string,
+    message: string,
+    readonly processCode?: string,
+    readonly syscall?: string,
+  ) {
     super(message);
   }
 }
@@ -160,7 +165,12 @@ export class SessiondClient {
     this.pending.delete(response.id);
     clearTimeout(pending.timer);
     if (response.ok) pending.resolve(response.payload);
-    else pending.reject(new SessiondClientError(response.error?.code ?? "internal_error", response.error?.message ?? "sessiond request failed"));
+    else pending.reject(new SessiondClientError(
+      response.error?.code ?? "internal_error",
+      response.error?.message ?? "sessiond request failed",
+      response.error?.processCode,
+      response.error?.syscall,
+    ));
   }
 
   private failAll(error: Error): void {

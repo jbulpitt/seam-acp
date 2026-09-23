@@ -99,12 +99,12 @@ export function createProbeGate() {
 
 export async function collectHangEvidence(opts: {
   id: string;
-  writeLine: (line: string) => void;
+  writeLine: (line: string) => void | Promise<void>;
   response: Promise<"answered" | "closed">;
   timeoutMs?: number;
   sockets: () => Promise<HangProbeReport["providerSocket"]>;
 }): Promise<HangProbeReport> {
-  opts.writeLine(probeRequestLine(opts.id));
+  await opts.writeLine(probeRequestLine(opts.id));
   const timeoutMs = opts.timeoutMs ?? HANG_PROBE_TIMEOUT_MS;
   const outcome = await new Promise<"answered" | "unanswered" | "closed">((resolve) => {
     const timer = setTimeout(() => resolve("unanswered"), timeoutMs);

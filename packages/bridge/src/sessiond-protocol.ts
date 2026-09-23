@@ -25,6 +25,11 @@ export interface SessiondSpawnParams {
   cwd: string;
   /** Exact child environment. The daemon does not merge provider policy. */
   env: Record<string, string>;
+  /**
+   * Optional opaque bootstrap bytes written before spawn is acknowledged.
+   * They are never persisted and do not count as provider input activity.
+   */
+  initialStdinBase64?: string;
 }
 
 export interface SessiondWriteParams {
@@ -70,6 +75,10 @@ export interface SessiondResponse {
       | "internal_error";
     /** Closed, non-secret diagnostic. Never a raw child/process error. */
     message: string;
+    /** Sanitized OS error code, for example ENOENT. */
+    processCode?: string;
+    /** Operation only (for example "spawn"), never Node's path-bearing text. */
+    syscall?: string;
   };
 }
 

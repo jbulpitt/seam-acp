@@ -209,6 +209,8 @@ export function exitFramePayload(
 export interface StderrRegistry {
   /** Create a slot's ring and start draining. Safe on a null stderr. */
   attach(slot: number, child: { stderr?: NodeJS.ReadableStream | null }): void;
+  /** Feed stderr owned by an external descriptor supervisor (#574). */
+  observe(slot: number, chunk: string | Buffer): void;
   /** Build the slot's exit payload and release its ring. */
   exitPayload(
     slot: number,
@@ -227,6 +229,14 @@ export function createStderrRegistry(options: StderrRingOptions = {}): StderrReg
       const ring = createStderrRing(options);
       rings.set(slot, ring);
       attachStderrDrain(child, ring);
+    },
+    observe(slot, chunk) {
+      let ring = rings.get(slot);
+      if (!ring) {
+        ring = createStderrRing(options);
+        rings.set(slot, ring);
+      }
+      ring.push(chunk);
     },
     exitPayload(slot, code, signal) {
       const payload = exitFramePayload(code, signal, rings.get(slot));

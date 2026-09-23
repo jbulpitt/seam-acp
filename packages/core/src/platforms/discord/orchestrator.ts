@@ -2942,6 +2942,29 @@ export class Orchestrator {
     return a?.state === "completed" || a?.state === "cancelled";
   }
 
+  /** Reconcile only immutable terminal ledger facts when no live status
+   * controller survived. Suspended/active rows stay with #578's serialized
+   * in-memory owner path; projecting those here could race a resumed Working
+   * edit. Failure refuses only this best-effort card repair—the completed turn,
+   * delivery recovery and unrelated cards continue. */
+  private async projectPersistedTerminalAttemptCard(attempt: TurnAttempt): Promise<void> {
+    const latest = this.store.turnAttempts.get(attempt.id);
+    if (!latest || (latest.state !== "completed" && latest.state !== "cancelled")) return;
+    if (!latest.statusCard || !this.adapter.editStatusPanelProjection) return;
+    const projection = projectAttemptCard(latest, latest);
+    if (!projection) return;
+    const ref = {
+      channel: { platform: PLATFORM, id: latest.statusCard.channelId },
+      id: latest.statusCard.messageId,
+    };
+    try {
+      await this.adapter.editStatusPanelProjection(ref, projection);
+    } catch (err) {
+      this.logger.warn({ err, attempt: latest.id },
+        "durable terminal status-card projection failed");
+    }
+  }
+
   /** Enqueue an already-durable row without passing back through duplicate
    * admission. Used at boot and by localized recovery. */
   private startRecoveredInbound(row: InboundAdmission): Promise<void> {
@@ -3680,7 +3703,10 @@ export class Orchestrator {
       throw DispatchSuspendedError.defect(priorHuman.id, priorHuman.stalledReason);
     }
     if (admission || scheduledAttempt) {
-      if (priorHuman?.state === "completed" || priorHuman?.state === "cancelled") return;
+      if (priorHuman?.state === "completed" || priorHuman?.state === "cancelled") {
+        await this.projectPersistedTerminalAttemptCard(priorHuman);
+        return;
+      }
       if (priorHuman?.acpSessionId && record.acpSessionId && priorHuman.acpSessionId !== record.acpSessionId) {
         throw DispatchSuspendedError.defect(priorHuman.id,
           "the thread moved to a different ACP session since this turn was recorded");
@@ -3899,9 +3925,25 @@ export class Orchestrator {
     );
     const initialPanel = withBrandAttachment(initialRendered, brandAsset);
     this.assertQueueFence(queueFence);
-    const statusMsg = this.adapter.sendPanel
-      ? await this.adapter.sendPanel(channel, initialPanel)
-      : await this.adapter.sendMessage(channel, serializePanelText(initialPanel));
+    const persistedStatusCard = humanAttempt?.statusCard;
+    if (persistedStatusCard && persistedStatusCard.channelId !== channel.id) {
+      throw DispatchSuspendedError.defect(humanAttempt!.id,
+        "persisted status card belongs to a different channel");
+    }
+    const statusMsg = persistedStatusCard
+      ? {
+          channel: { platform: channel.platform, id: persistedStatusCard.channelId },
+          id: persistedStatusCard.messageId,
+        }
+      : this.adapter.sendPanel
+        ? await this.adapter.sendPanel(channel, initialPanel)
+        : await this.adapter.sendMessage(channel, serializePanelText(initialPanel));
+    if (humanAttempt && !persistedStatusCard) {
+      this.store.turnAttempts.bindStatusCard(humanAttempt, {
+        channelId: statusMsg.channel.id,
+        messageId: statusMsg.id,
+      });
+    }
     this.assertQueueFence(queueFence);
     // Standalone GIF: posted once, never edited (embed edits restart the
     // animation). Deleted on Done/Failed/Timed out. Restart mid-turn may orphan.
@@ -15947,6 +15989,7 @@ export class Orchestrator {
     for (const row of inbound) {
       const a = this.store.turnAttempts?.get(inboundAttemptId(row.messageId));
       if (a?.state === "completed" || a?.state === "cancelled") {
+        await this.projectPersistedTerminalAttemptCard(a);
         this.store.settleInboundExecution(row.messageId);
         continue;
       }

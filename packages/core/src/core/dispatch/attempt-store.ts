@@ -97,6 +97,10 @@ export interface TurnAttempt {
   remoteRecovery?: RemoteRecoveryBinding & { generation: number };
   providerIdentity: string | null;
   source: "dispatch" | "inbound" | "schedule";
+  /** The one Discord status card owned by this logical attempt. It survives
+   * generation changes so restart recovery edits the admission artifact
+   * instead of posting a second card. */
+  statusCard: { channelId: string; messageId: string } | null;
   deliveryDone: boolean;
   deliveryProtocol: boolean;
   deliveryNonce: string | null;
@@ -228,6 +232,8 @@ export class TurnAttemptStore {
       "ALTER TABLE turn_attempts ADD COLUMN stalled_reason TEXT",
       "ALTER TABLE turn_attempts ADD COLUMN stall_notice_utc TEXT",
       "ALTER TABLE turn_attempts ADD COLUMN stall_notice_reason TEXT",
+      "ALTER TABLE turn_attempts ADD COLUMN status_card_channel TEXT",
+      "ALTER TABLE turn_attempts ADD COLUMN status_card_message TEXT",
     ]) {
       try { db.exec(ddl); } catch (err) {
         if (!(err instanceof Error) || !err.message.includes("duplicate column name")) throw err;
@@ -280,7 +286,8 @@ export class TurnAttemptStore {
         delivery_abandoned_reason: string | null;
         delivery_uncertain_reason: string | null;
         stalled_utc: string | null; stalled_reason: string | null;
-        stall_notice_utc: string | null; stall_notice_reason: string | null } | undefined;
+        stall_notice_utc: string | null; stall_notice_reason: string | null;
+        status_card_channel: string | null; status_card_message: string | null } | undefined;
     const runtime = row?.runtime_json ? JSON.parse(row.runtime_json) : null;
     // Remote runtimes can have telemetry but no local process owner. Recognize
     // only that new exact shape; do not turn malformed legacy ownership into
@@ -298,7 +305,11 @@ export class TurnAttemptStore {
       submissions: runtime?.submissions,
       remoteRecovery: runtime?.remoteRecovery,
       providerIdentity: row.provider_identity,
-      source: row.source, deliveryDone: row.delivery_done === 1,
+      source: row.source,
+      statusCard: row.status_card_channel && row.status_card_message
+        ? { channelId: row.status_card_channel, messageId: row.status_card_message }
+        : null,
+      deliveryDone: row.delivery_done === 1,
       deliveryProtocol: row.delivery_protocol === 1,
       deliveryNonce: row.delivery_nonce,
       deliveryChannel: row.delivery_channel,
@@ -393,6 +404,35 @@ export class TurnAttemptStore {
     return Boolean(this.db.prepare(`SELECT 1 FROM turn_attempts
       WHERE id=? AND generation=? AND owner_boot=? AND state='active'`)
       .get(a.id, a.generation, a.ownerBoot));
+  }
+
+  /** Bind the logical attempt's one status card before provider work starts.
+   * A resumed generation reuses this address; replacing it would orphan the
+   * pre-restart card and recreate #586. Refuse only this attempt on conflict. */
+  bindStatusCard(
+    a: TurnAttempt,
+    ref: { channelId: string; messageId: string }
+  ): void {
+    if (!ref.channelId || !ref.messageId) {
+      throw DispatchSuspendedError.defect(a.id, "status card reference is incomplete");
+    }
+    const current = this.get(a.id);
+    if (current?.statusCard) {
+      if (current.statusCard.channelId !== ref.channelId ||
+          current.statusCard.messageId !== ref.messageId) {
+        throw DispatchSuspendedError.defect(a.id,
+          "attempt is already bound to a different status card");
+      }
+      a.statusCard = current.statusCard;
+      return;
+    }
+    const n = this.db.prepare(`UPDATE turn_attempts
+      SET status_card_channel=?, status_card_message=?
+      WHERE id=? AND generation=? AND owner_boot=? AND state='active'
+        AND status_card_channel IS NULL AND status_card_message IS NULL`)
+      .run(ref.channelId, ref.messageId, a.id, a.generation, a.ownerBoot).changes;
+    if (n !== 1) throw this.notCurrent(a, "status card");
+    a.statusCard = { ...ref };
   }
 
   bindRuntime(a: TurnAttempt, pid: number | undefined, providerIdentity?: string): void {

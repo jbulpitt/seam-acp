@@ -14,6 +14,13 @@ const COLOR_BY_STATE: Record<StatusPanel["state"], number> = {
   Monitoring: 0x1abc9c, // teal — resting, background work pending
 };
 
+/** Shared with the restart-only Discord projection path. Keeping this map in
+ * one place prevents a durable terminal edit from rendering a different state
+ * color than the live status-card renderer. */
+export function discordStatusColor(state: StatusPanel["state"]): number {
+  return COLOR_BY_STATE[state];
+}
+
 function trim(s: string, max: number): string {
   const t = (s ?? "").trim();
   return t.length <= max ? t : `${t.slice(0, max)}…`;

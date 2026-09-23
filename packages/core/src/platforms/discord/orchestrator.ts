@@ -14,6 +14,7 @@ import {
 } from "../../core/dispatch/attempt-store.js";
 import { BootAcquisitionExhaustedError, DispatchAcquisitionPhase, isRetryableBootAcquisitionError } from "../../core/dispatch/acquisition-phase.js";
 import { compareExecutionIdentity, executionIdentity } from "../../core/dispatch/execution-identity.js";
+import { projectAttemptCard } from "../../core/attempt-card-projection.js";
 import { MessageFlags, EmbedBuilder, ButtonBuilder, ActionRowBuilder, ButtonStyle, StringSelectMenuBuilder, ModalBuilder, TextInputBuilder, TextInputStyle, AttachmentBuilder, type ChatInputCommandInteraction, type AutocompleteInteraction, type MessageComponentInteraction, type Message, type InteractionEditReplyOptions } from "discord.js";
 import type { Logger } from "../../lib/logger.js";
 import { raceDeadline, type DeadlineClock } from "../../lib/shutdown-budget.js";
@@ -3887,26 +3888,13 @@ export class Orchestrator {
     let lastEdit = 0;
     let lastRendered = JSON.stringify(initialRendered);
     let pendingRefresh: NodeJS.Timeout | undefined;
-    const refresh = async (force = false) => {
-      if (!this.queueFenceCurrent(queueFence)) return;
-      if (!humanOutcomeOwned && !humanCurrent()) return;
-      const now = Date.now();
-      if (!force && now - lastEdit < STATUS_EDIT_DEBOUNCE_MS) {
-        if (!pendingRefresh) {
-          const remaining = STATUS_EDIT_DEBOUNCE_MS - (now - lastEdit);
-          pendingRefresh = setTimeout(() => {
-            pendingRefresh = undefined;
-            void refresh(false);
-          }, remaining);
-        }
-        return;
-      }
-      if (pendingRefresh) {
-        clearTimeout(pendingRefresh);
-        pendingRefresh = undefined;
-      }
+    const statusEditQueue = new SerialQueue();
+    let statusCardSettled = false;
+    const editStatusSnapshot = (settlement = false): Promise<void> => statusEditQueue.run(async () => {
+      if (statusCardSettled && !settlement) return;
       // Same snapshot content is not a new card and not a changed one. Elapsed
       // stays at the stamp from the edit that actually changed the record.
+      const now = Date.now();
       const viewed = observationFromTurn(status);
       statusCard.publish(viewed.observation, viewed.contextWindow, now);
       if (statusCard.plan().action === "skip") return;
@@ -3931,6 +3919,46 @@ export class Orchestrator {
         // it; the turn itself is not failed by a status write.
         this.logger.warn({ err }, "status edit failed");
       }
+    });
+    const refresh = async (force = false) => {
+      if (statusCardSettled) return;
+      if (!this.queueFenceCurrent(queueFence)) return;
+      if (!humanOutcomeOwned && !humanCurrent()) return;
+      const now = Date.now();
+      if (!force && now - lastEdit < STATUS_EDIT_DEBOUNCE_MS) {
+        if (!pendingRefresh) {
+          const remaining = STATUS_EDIT_DEBOUNCE_MS - (now - lastEdit);
+          pendingRefresh = setTimeout(() => {
+            pendingRefresh = undefined;
+            void refresh(false);
+          }, remaining);
+        }
+        return;
+      }
+      if (pendingRefresh) {
+        clearTimeout(pendingRefresh);
+        pendingRefresh = undefined;
+      }
+      await editStatusSnapshot();
+    };
+    const settleAttemptCard = async (): Promise<void> => {
+      if (!humanAttempt) return;
+      const projection = projectAttemptCard(
+        this.store.turnAttempts.get(humanAttempt.id),
+        humanAttempt
+      );
+      if (!projection) return;
+      // Closing this controller does not grant execution ownership. It only
+      // permits one final edit of the immutable message ref captured above;
+      // replacement turns own different refs and remain unreachable here.
+      statusCardSettled = true;
+      if (pendingRefresh) {
+        clearTimeout(pendingRefresh);
+        pendingRefresh = undefined;
+      }
+      status.setState(projection.state);
+      status.setAction(projection.action);
+      await editStatusSnapshot(true);
     };
 
     // Typing indicator: refresh on real agent activity (text, tool calls,
@@ -5071,6 +5099,7 @@ export class Orchestrator {
         turnFinalized = true;
         cancelFlushTimer();
         if (pendingRefresh) clearTimeout(pendingRefresh);
+        await settleAttemptCard();
         this.currentSpeakerIds.delete(record.channelRef);
         this.currentAuthorIds.delete(record.channelRef);
         if (voiceConsoleSpeech) {

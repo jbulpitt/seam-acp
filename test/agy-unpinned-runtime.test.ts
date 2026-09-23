@@ -7,7 +7,11 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { AGY_UNPINNED_GIVE_UP } from "../packages/adapters/src/agy-pin-mode.js";
+import {
+  AGY_UNPINNED_EXECUTABLE_LABEL,
+  AGY_UNPINNED_GIVE_UP,
+} from "../packages/adapters/src/agy-pin-mode.js";
+import { safeNativeAgyRuntimeProvenance } from "../packages/core/src/core/config-mutation.js";
 import {
   makeAgyUnpinnedRuntime,
   resolveOrdinaryAgyExecutable,
@@ -34,6 +38,35 @@ describe("unpinned AGY", () => {
     expect(AGY_UNPINNED_GIVE_UP).toContain("writable-path");
   });
 
+  it("publishes an inventory the controller's hello guard accepts", () => {
+    // The gap that shipped #510: the bridge loaded unpinned happily and the
+    // controller then refused the hello, which drops EVERY agent on that
+    // bridge, not just agy. Observed live on allie-laptop. Nothing exercised
+    // the descriptor across that boundary, so assert the round trip here.
+    const { dir, executable } = installAgy("#!/bin/sh\necho 1.2.2\n");
+    const runtime = makeAgyUnpinnedRuntime({
+      credentialScope: "antigravity-oauth:default",
+      cwd: dir,
+      baseEnv: { PATH: dir, HOME: os.homedir() },
+    });
+    expect(runtime.descriptor.executable).not.toBe(executable);
+    const safe = safeNativeAgyRuntimeProvenance(runtime.descriptor);
+    expect(safe.topology).toBe("virtual-acp-native-cli");
+    expect(JSON.stringify(safe)).not.toContain(dir);
+  });
+
+  it("still refuses an inventory that names a real path", () => {
+    const { dir, executable } = installAgy("#!/bin/sh\necho 1.2.2\n");
+    const runtime = makeAgyUnpinnedRuntime({
+      credentialScope: "antigravity-oauth:default",
+      cwd: dir,
+      baseEnv: { PATH: dir, HOME: os.homedir() },
+    });
+    expect(() =>
+      safeNativeAgyRuntimeProvenance({ ...runtime.descriptor, executable })
+    ).toThrow(/private or invalid launch data/);
+  });
+
   it("executes the PATH entry by name, so a rewrite is what the next child runs", () => {
     const first = "#!/bin/sh\necho no-fd3\n";
     const { dir, executable } = installAgy(first);
@@ -45,7 +78,11 @@ describe("unpinned AGY", () => {
       baseEnv: env,
     });
     expect(runtime.descriptor.provenance.sha256).toBeUndefined();
-    expect(runtime.descriptor.executable).toBe(executable);
+    // #566: the descriptor publishes the MODE, not the resolved path. It had
+    // asserted the path here, which is exactly the private launch data the
+    // controller refuses — and a refused hello drops the whole bridge.
+    expect(runtime.descriptor.executable).toBe(AGY_UNPINNED_EXECUTABLE_LABEL);
+    expect(runtime.descriptor.executable).not.toContain(path.sep);
 
     const run = () => {
       const child = runtime.prepare(["--version"], dir, {

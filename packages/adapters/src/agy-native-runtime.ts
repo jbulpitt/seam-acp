@@ -8,6 +8,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { AdapterRuntimeDescriptor } from "./agent-profile.js";
+import { AGY_MANAGED_EXECUTABLE_LABEL } from "./agy-pin-mode.js";
 
 const SAFE_ENV_KEYS = [
   "HOME", "USERPROFILE", "PATH", "TMPDIR", "TMP", "TEMP",
@@ -527,7 +528,7 @@ export class AgyNativeRuntime implements AgyLaunchRuntime {
     })).digest("hex");
     this.descriptor = {
       identity: this.identityKey,
-      executable: "managed-artifact",
+      executable: AGY_MANAGED_EXECUTABLE_LABEL,
       argv: [],
       cwd: "session-workspace",
       environment: {},

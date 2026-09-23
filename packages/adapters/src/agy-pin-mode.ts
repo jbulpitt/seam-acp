@@ -22,6 +22,23 @@ export const AGY_UNPINNED_GIVE_UP =
   "This mode does not do that: a binary that checked as one version can be another by the time it runs, which is the writable-path replacement a pin exists to catch. " +
   "The pin is still available. Unset AGY_PIN and set AGY_CLI_PATH, AGY_SHA256, AGY_VERSION, and AGY_RUNTIME_ROOT together.";
 
+/**
+ * What a runtime descriptor is allowed to name as its executable (#566).
+ *
+ * The descriptor crosses the bridge → controller boundary inside the hello
+ * frame, so it must never carry a real filesystem path: the controller's
+ * `safeNativeAgyRuntimeProvenance` treats one as private launch data and
+ * refuses the hello, which drops the WHOLE bridge rather than just agy. Both
+ * runtimes therefore publish a mode label here and keep the resolved path in
+ * their identity hash, where it is only ever a digest input.
+ */
+export const AGY_MANAGED_EXECUTABLE_LABEL = "managed-artifact";
+export const AGY_UNPINNED_EXECUTABLE_LABEL = "ordinary-path";
+export const AGY_EXECUTABLE_LABELS: readonly string[] = [
+  AGY_MANAGED_EXECUTABLE_LABEL,
+  AGY_UNPINNED_EXECUTABLE_LABEL,
+];
+
 /** Identity of a content-addressed pin. AGY_DEFAULT_MODEL is not one of these. */
 export const AGY_IDENTITY_PIN_KEYS = [
   "AGY_CLI_PATH",

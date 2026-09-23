@@ -3,7 +3,7 @@ import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import type { AdapterRuntimeDescriptor } from "./agent-profile.js";
-import { AGY_UNPINNED_GIVE_UP } from "./agy-pin-mode.js";
+import { AGY_UNPINNED_EXECUTABLE_LABEL, AGY_UNPINNED_GIVE_UP } from "./agy-pin-mode.js";
 import {
   type AgyLaunchRuntime,
   type AgyNativePreparedLaunch,
@@ -63,7 +63,10 @@ export class AgyUnpinnedRuntime implements AgyLaunchRuntime {
     })).digest("hex");
     this.descriptor = {
       identity: this.identityKey,
-      executable,
+      // The mode label, never the resolved path. `executable` above is a
+      // digest input only; publishing it here is private launch data and the
+      // controller refuses the hello for the whole bridge (#566).
+      executable: AGY_UNPINNED_EXECUTABLE_LABEL,
       argv: [],
       cwd: "session-workspace",
       environment: {},

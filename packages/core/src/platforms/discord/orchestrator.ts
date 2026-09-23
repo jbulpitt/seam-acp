@@ -427,6 +427,7 @@ import {
   dispatchOriginRefs,
   dispatchDisplayPrompt,
   resolveDispatchRuntimePrompt,
+  bridgeOwnedRetryInProgress,
   enqueueDispatchSpec,
   findQueuedReportBackSpec,
   isStatelessHandoffWorker,
@@ -2249,10 +2250,7 @@ export class Orchestrator {
       }];
     });
     const bridgeRecoveryDispatchIds = remoteRecovery
-      .filter((recovery) => recovery.observed
-        && recovery.phase !== "succeeded"
-        && recovery.phase !== "exhausted"
-        && recovery.phase !== "awaiting_app")
+      .filter(bridgeOwnedRetryInProgress)
       .map((recovery) => recovery.attemptId);
     // This is the exact #428 blockage, reported but not repaired here: a
     // prompted retained attempt prevents the pending pile behind it claiming.

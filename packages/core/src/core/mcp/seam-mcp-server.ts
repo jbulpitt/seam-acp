@@ -27,10 +27,14 @@ import { formatCatalogEvidence } from "../catalog-evidence-render.js";
 import type { Logger } from "../../lib/logger.js";
 import { raceDeadline, type DeadlineClock } from "../../lib/shutdown-budget.js";
 import type { SessionRecord } from "../types.js";
-import type { DispatchSpec, ThreadWorkProgress } from "../dispatch/types.js";
+import {
+  bridgeOwnedRetryInProgress,
+  buildChainHopSpec,
+  type DispatchSpec,
+  type ThreadWorkProgress,
+} from "../dispatch/types.js";
 import { frameSteerPrompt } from "../steer.js";
 import { formatLocalTime } from "../format-time.js";
-import { buildChainHopSpec } from "../dispatch/types.js";
 import type { ConfigDescription } from "../session-router.js";
 import type { ConfigMutationInput } from "../config-mutation.js";
 import { isRestrictedParticipant, PARTICIPANT_CONFIG_REFUSAL } from "../../config.js";
@@ -158,10 +162,10 @@ export interface ThreadEntry {
    *  in the same identity line as agent/model/effort. */
   fastMode?: boolean;
   cwd: string;
-  /** Whether a live turn is CURRENTLY running in that thread — the load-bearing
-   *  field: choose `send` (non-interrupting) over `steer`/`handoff`
-   *  (interrupting) when a teammate is busy. Derived from the control-plane
-   *  runtime even when the agent process lives on a bridge. */
+  /** Whether a handoff would interrupt a live turn or admitted channel work.
+   *  A bridge-owned retry does not set this: that is a third handoff state,
+   *  printed on its own line, because folding it in would make a handoff wait
+   *  on a retry the local runtime has already called stalled. */
   busy: boolean;
   /** Channel-tail truth. `wedged` means runtime-idle but an admitted queue tail
    * exceeded its bounded progress grace. */
@@ -694,19 +698,15 @@ const TOOLS = [
       "send/chain all take a thread id you must first obtain here). Each entry reports: `id` (pass this " +
       "verbatim as the thread arg elsewhere), `name` (the human thread title — how you pick the right " +
       "teammate), `isSelf` (true for YOUR OWN thread — never hand off to yourself), the teammate's " +
-      "`agent`/`model`/`cwd` (agent is `agentId@location` with host emoji), `status` (active | archived | gone), `lastActivityUtc`, and `busy`. " +
-      "`busy` IS LOAD-BEARING for choosing HOW to reach a teammate: it includes admitted channel work even " +
-      "when the ACP runtime is idle. `workProgress` separately composes router, watcher and durable attempt evidence " +
-      "to answer whether work is actually executing; bridge-owned rung-1 recovery is reported there from closed " +
-      "child-owner facts, while assigned_not_started is explicitly not progress. `queueState` " +
-      "distinguishes runtime_busy, queued, wedged, and stalled. `stalled` means " +
-      "a retained dispatch is held for `/seam workflows` resume/abandon; its ids are included. It is HOUSEKEEPING, not a health " +
-      "verdict: a stalled thread is a perfectly valid handoff target and must never be skipped, routed around, or replaced with a " +
-      "cold preset on account of the flag. Dispatch on fit and `busy` alone. To resume work such a thread was carrying, hand off " +
-      "`continue` to it. When busy:true a live turn " +
-      "is running, so prefer `send` (PULL-ONLY — it waits in the inbox and never interrupts) unless you " +
-      "truly need to preempt, in which case use `steer` or `send(interrupt:true)`; when busy:false the " +
-      "teammate is idle, so `handoff`/`forward` (which START a turn) land cleanly. Read-only and " +
+      "`agent`/`model`/`cwd` (agent is `agentId@location` with host emoji), `status` (active | archived | gone), `lastActivityUtc`, `busy`, and `workProgress`. " +
+      "`busy` answers only whether a handoff would interrupt a live turn or admitted channel work. It stays false when the local runtime is idle, including a turn that runtime has already called stalled. " +
+      "`workProgress` answers whether execution was observed. An observed bridge-owned rung-1 retry that is not succeeded, exhausted, or awaiting_app counts as execution; assigned_not_started does not. Do not fold the two fields together. " +
+      "Read three handoff states. " +
+      "(1) The entry contains `handoff decision: mid-recovery`: busy is false and the bridge still owns the retry. Hand off `continue`. Do not dispatch new work, do not skip the thread, and do not treat it as a live turn. " +
+      "(2) busy:true, with or without a bridge retry listed: a live turn or admitted queue is running. Prefer `send` (PULL-ONLY — it waits and never interrupts) unless you truly need to preempt, in which case use `steer` or `send(interrupt:true)`. The live turn wins over the retry. " +
+      "(3) busy:false and no mid-recovery line: the teammate is free. `handoff`/`forward` start a turn. Choose on fit. " +
+      "A retained or stalled attempt is housekeeping, not mid-recovery and not a health verdict. It still surfaces as retained work and does NOT block handoff — never skip the thread or replace it with a cold preset because of it. " +
+      "`queueState` is runtime_busy, queued, wedged, or idle. Read-only and " +
       "self-scoped: it ALWAYS lists your own channel (resolved from your session, never an argument) and " +
       "works even in a locked channel (metadata only, no message content). A `status:\"gone\"` entry is a " +
       "dead thread — do not address it.",
@@ -2772,6 +2772,12 @@ export class SeamMcpServer {
         t.fastMode ? "⚡ fast on" : null,
       ].filter(Boolean).join(" / ");
       const progress = t.workProgress;
+      const bridgeRetries = (progress?.remoteRecovery ?? []).filter(bridgeOwnedRetryInProgress);
+      // Only the idle case is the third handoff state. A live turn still means
+      // wait; saying `continue` there would interrupt it.
+      const handoffLine = !t.busy && bridgeRetries.length > 0
+        ? `\n    handoff decision: mid-recovery — bridge still owns ${bridgeRetries.map((recovery) => recovery.attemptId).join(", ")}. Not free, and not a live local turn. Hand off \`continue\`. Do not dispatch new work.`
+        : "";
       const progressLine = progress
         ? progress.state === "idle"
           ? "\n    work progress: none — no current work"
@@ -2810,9 +2816,6 @@ export class SeamMcpServer {
       lines.push(
         `• ${name} — id ${t.id} [${flags.join(", ")}]` +
           (cfg ? `\n    identity: ${cfg}${t.cwd ? ` @ ${t.cwd}` : ""}` : "") +
-          (t.queueState === "stalled" && ((t.stalledDispatchCount ?? 0) > 0 || (t.stalledDispatchIds?.length ?? 0) > 0)
-            ? `\n    retained dispatches (does NOT block handoff — this thread is dispatchable): ${(t.stalledDispatchIds ?? []).join(", ") || t.stalledDispatchCount}; /seam workflows can resume or abandon them`
-            : "") +
           // #419: reported whatever the queue state says. An unsettled
           // completion holds admission while the thread still looks merely
           // "busy", so gating this on `stalled` would hide the one case that
@@ -2821,6 +2824,7 @@ export class SeamMcpServer {
             ? `\n    ⚠️ completed but unsettled (holding admission): ${(t.unsettledDispatchIds ?? []).join(", ")}; abandon THESE DISPATCH IDS via /seam workflows — do not resume them, they already ran. The thread itself is unaffected and can still take new work.`
             : "") +
           progressLine +
+          handoffLine +
           `\n    last active ${formatLocalTime(t.lastActivityUtc)}`
       );
     }
@@ -2835,12 +2839,13 @@ export class SeamMcpServer {
     }
     lines.push(
       "",
-      "To reach a teammate: use its `id` above. If it is busy, prefer send (pull-only, won't interrupt); " +
-        "if idle, handoff/forward start a turn directly. `work progress` answers execution separately: " +
-        "bridge recovery is positive only when the child-owning bridge reports its exact submission; " +
+      "To reach a teammate: use its `id` above. Read the handoff decision before the busy flag. " +
+        "A line that says `handoff decision: mid-recovery` means the bridge still owns a retry: hand off `continue`, and do not dispatch new work. " +
+        "That is not a live turn, so it is not busy, and it is not free. " +
+        "Otherwise if it is busy, prefer send (pull-only, won't interrupt); if idle, handoff/forward start a turn directly. " +
+        "`work progress` answers execution separately: bridge recovery is positive only when the child-owning bridge reports its exact submission and the retry is not succeeded, exhausted, or awaiting_app; " +
         "assigned_not_started and active_unobserved mean no execution progress is proven. Retained or unsettled dispatches are bookkeeping " +
-        "only: they NEVER make a thread an invalid target, so choose workers on fit and busy alone. To pick " +
-        "up work a thread was carrying, hand off `continue` to it. Prefer a stateful thread over a cold " +
+        "only: they NEVER make a thread an invalid target and do NOT block handoff. Prefer a stateful thread over a cold " +
         "preset whenever its context is relevant. Never hand off to the entry marked YOU."
     );
     return textResult(lines.join("\n"));

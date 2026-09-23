@@ -319,3 +319,46 @@ describe("#423 the auto-apply condition", () => {
     }
   });
 });
+
+describe("#570 a turn that is executing is never wedged", () => {
+  /**
+   * Observed live on 2026-09-23 on the orchestrator thread: the sweep declared
+   * the channel wedged WHILE a turn was running, bumped the epoch, and the
+   * turn's post-execution `assertQueueFence` then threw — discarding a finished
+   * turn's result and escaping as `level:50 message handler crashed`. The card
+   * went green and the user's message was dropped.
+   *
+   * The cause was the busy signal, not the sweep: `router.isBusy` reports the
+   * ACP runtime mid-prompt, which a long tool-using turn drops between
+   * segments. Idle runtime plus a stale durable admission satisfied "wedged"
+   * while the queue was demonstrably executing.
+   */
+  it("does not classify a channel wedged while its turn is still running", async () => {
+    const { host } = makeHost();
+    // A stale durable admission — the other half of the wedge predicate.
+    expect(admitStale("570")).toBe(true);
+    // Without an executing turn this is the wedge the sweep is built for.
+    expect(host.inspectChannelQueue(CHANNEL).state).toBe("wedged");
+
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => { release = resolve; });
+    // isBusy stays false throughout: this is exactly the tool-call gap.
+    const running = (host as never as {
+      queueOnChannel<T>(id: string, task: () => Promise<T>): Promise<T>;
+    }).queueOnChannel(CHANNEL, async () => { await blocked; return "done"; });
+    await Promise.resolve();
+
+    const duringTurn = host.inspectChannelQueue(CHANNEL);
+    expect(duringTurn.runtimeBusy).toBe(true);
+    expect(duringTurn.state).not.toBe("wedged");
+    // And the sweep must leave it alone rather than fence live work.
+    expect(await host.sweepWedgedQueues()).toEqual([]);
+
+    release();
+    await expect(running).resolves.toBe("done");
+    // Once the turn ends the channel is judged on its own merits again, so a
+    // genuine wedge is still recoverable — the fix must not wedge-proof it.
+    expect(host.inspectChannelQueue(CHANNEL).state).toBe("wedged");
+    expect(await host.sweepWedgedQueues()).toEqual([CHANNEL]);
+  });
+});

@@ -733,6 +733,18 @@ interface ChannelQueueMeta {
   admittedAtMs: number;
   lastProgressAtMs: number;
   runtimeIdleSinceMs?: number;
+  /**
+   * #570: channel turns currently EXECUTING, not merely admitted.
+   *
+   * `router.isBusy` answers "is the ACP runtime mid-prompt", which a long
+   * tool-using turn drops to false between segments. That is not idleness, and
+   * treating it as such let the wedge sweep fence a turn that was running: the
+   * epoch moved underneath it, its post-turn `assertQueueFence` threw, the
+   * result was discarded and the throw escaped as a crashed message handler.
+   * Execution is a fact this queue owns directly, so read it here instead of
+   * inferring it from the runtime.
+   */
+  executing?: number;
 }
 
 export class ChannelQueueFencedError extends Error {
@@ -2154,8 +2166,12 @@ export class Orchestrator {
   inspectChannelQueue(channelRef: string, nowMs = Date.now()): ChannelQueueHealth {
     this.channelQueueMeta ??= new Map<string, ChannelQueueMeta>();
     const record = this.store.getByChannel(PLATFORM, channelRef);
-    const runtimeBusy = record ? this.router.isBusy(record.id) : false;
     const meta = this.channelQueueMeta.get(channelRef);
+    // #570: a turn this queue is executing counts as busy even while the ACP
+    // runtime reports idle between tool segments. Asking only the runtime let
+    // the sweep fence work that was actively running.
+    const runtimeBusy = (record ? this.router.isBusy(record.id) : false)
+      || (meta?.executing ?? 0) > 0;
     const listInbound = (this.store as Partial<SessionStore>).listInboundNonterminal;
     const durable = listInbound ? listInbound.call(this.store, channelRef) : [];
     const stalled = this.store.turnAttempts.listStalled(channelRef);
@@ -2813,6 +2829,10 @@ export class Orchestrator {
       }
       // Counted for the restart drain, and awaited by the shutdown barrier.
       const endTurn = this.beginTurn();
+      // #570: from here the turn is executing. Released in the finally below,
+      // on every path including the watchdog and a fence thrown after the turn.
+      const executingMeta = this.channelQueueMeta.get(channelId);
+      if (executingMeta) executingMeta.executing = (executingMeta.executing ?? 0) + 1;
       try {
         const timeoutMs = turnWatchdogTimeoutMs(
           this.config.TURN_TIMEOUT_SECONDS ?? 900
@@ -2843,6 +2863,11 @@ export class Orchestrator {
         }
         throw err;
       } finally {
+        // #570: release execution against the meta the increment ran on, which
+        // is not necessarily the current one — a recovery may have replaced it
+        // mid-turn, and leaking the count there would wedge-proof the channel
+        // forever. `queued`/`lastProgressAtMs` stay epoch-scoped as before.
+        if (executingMeta) executingMeta.executing = Math.max(0, (executingMeta.executing ?? 1) - 1);
         const currentMeta = this.channelQueueMeta.get(channelId);
         if (currentMeta?.epoch === epoch) {
           currentMeta.queued = Math.max(0, currentMeta.queued - 1);

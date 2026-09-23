@@ -14,6 +14,7 @@ export default defineConfig({
     exclude: [...NON_LIVE_TEST_EXCLUDE],
     environment: "node",
     setupFiles: [path.join(root, "test/non-live-env.ts")],
+    globalSetup: [path.join(root, "test/global-priority.ts")],
   },
   resolve: {
     alias: {

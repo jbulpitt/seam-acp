@@ -92,7 +92,7 @@ describe("#516 bridge-owned kernel OOM evidence", () => {
     // The registry above owns the behaviour; this narrow contract pins its one
     // production call site after deleting that call survived mutation.
     const source = readFileSync(path.resolve("packages/bridge/src/index.ts"), "utf8");
-    expect(source).toMatch(/oomEvidence\.exitPayload\(slot, payload, abnormal\)\.then\(\(exitPayload\) => \{/);
-    expect(source).toContain('muxSend(currentWs, WebSocket, slot, "exit", exitPayload, outputLog)');
+    expect(source).toMatch(/oomEvidence\.exitPayload\(frame\.slot, payload, abnormal\)\.then\(\(exitPayload\) => \{/);
+    expect(source).toMatch(/wsSend\(\{\s*slot: frame\.slot,\s*type: "exit",\s*\.\.\.exitPayload,/s);
   });
 });

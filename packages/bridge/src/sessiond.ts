@@ -1,18 +1,16 @@
 #!/usr/bin/env node
-import os from "node:os";
 import path from "node:path";
 import { SessiondServer } from "./sessiond-server.js";
+import { defaultSessiondPaths } from "./sessiond-paths.js";
 
 function valueAfter(flag: string): string | undefined {
   const index = process.argv.indexOf(flag);
   return index === -1 ? undefined : process.argv[index + 1];
 }
 
-const uid = typeof process.getuid === "function" ? process.getuid() : 0;
-const runtimeBase = process.env.XDG_RUNTIME_DIR || os.tmpdir();
-const runtimeDir = path.join(runtimeBase, `seam-sessiond-${uid}`);
-const socketPath = valueAfter("--socket") ?? process.env.SEAM_SESSIOND_SOCKET ?? path.join(runtimeDir, "control.sock");
-const statePath = valueAfter("--state") ?? process.env.SEAM_SESSIOND_STATE ?? path.join(runtimeDir, "slots.json");
+const defaults = defaultSessiondPaths();
+const socketPath = valueAfter("--socket") ?? defaults.socketPath;
+const statePath = valueAfter("--state") ?? defaults.statePath;
 
 const server = new SessiondServer({ socketPath, statePath });
 await server.start();

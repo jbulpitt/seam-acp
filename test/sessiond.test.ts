@@ -6,7 +6,7 @@
  * a process losing its anonymous pipe endpoints when its parent goes away.
  */
 import { afterEach, describe, expect, it } from "vitest";
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -17,6 +17,7 @@ import type { SessiondEvent, SessiondOutputFrame } from "../packages/bridge/src/
 const roots: string[] = [];
 const servers: SessiondServer[] = [];
 const clients: SessiondClient[] = [];
+const daemons: ChildProcess[] = [];
 
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -65,6 +66,16 @@ function stdoutText(events: SessiondEvent[]): string {
 afterEach(async () => {
   for (const client of clients.splice(0)) client.close();
   for (const server of servers.splice(0)) await server.close({ terminateChildren: true });
+  for (const daemon of daemons.splice(0)) {
+    if (daemon.exitCode !== null || daemon.signalCode !== null) continue;
+    const exited = new Promise<void>((resolve) => daemon.once("exit", () => resolve()));
+    daemon.kill("SIGTERM");
+    await Promise.race([exited, delay(1_000)]);
+    if (daemon.exitCode === null && daemon.signalCode === null) {
+      daemon.kill("SIGKILL");
+      await exited;
+    }
+  }
   for (const root of roots.splice(0)) await fs.rm(root, { recursive: true, force: true });
 });
 
@@ -263,16 +274,29 @@ describe("#573 seam-sessiond control-plane restart", () => {
     expect(persisted).not.toContain(secret);
     expect(persisted).not.toContain(process.execPath);
 
-    await expect(client.spawn({
+    const failed = await client.spawn({
       slot: 17,
       executable: "/definitely/missing/private/bin",
       args: [secret],
       cwd: "/private/missing/cwd",
       env: { SECRET: secret },
-    })).rejects.toMatchObject<Partial<SessiondClientError>>({
+    }).catch((error) => error as SessiondClientError);
+    expect(failed).toMatchObject<Partial<SessiondClientError>>({
       code: "spawn_failed",
-      message: "spawn returned no child pid",
+      processCode: "ENOENT",
+      syscall: "spawn",
     });
+    // #583: Node's raw spawn error serializes `path` and `spawnargs`. The
+    // supervisor emits only its closed typed fields, so a credential-shaped
+    // argv value cannot escape through an unhandled event or the wire reply.
+    expect(JSON.stringify({
+      code: failed.code,
+      message: failed.message,
+      processCode: failed.processCode,
+      syscall: failed.syscall,
+    })).not.toContain(secret);
+    expect(failed).not.toHaveProperty("path");
+    expect(failed).not.toHaveProperty("spawnargs");
     const secondError = await client.spawn({
       slot: 18,
       executable: "/another/missing/private/bin",
@@ -281,6 +305,45 @@ describe("#573 seam-sessiond control-plane restart", () => {
       env: {},
     }).catch((error) => error);
     expect(String(secondError)).not.toContain("/another/private");
+  });
+
+  it("keeps token-shaped spawnargs out of the supervisor process output", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "seam-sessiond-cli-test-"));
+    await fs.chmod(root, 0o700);
+    roots.push(root);
+    const socketPath = path.join(root, "control.sock");
+    const statePath = path.join(root, "slots.json");
+    const secret = "TOKEN_SHAPED_VALUE_573";
+    const daemon = spawn(process.execPath, [
+      "--import", "tsx",
+      path.resolve("packages/bridge/src/sessiond.ts"),
+      "--socket", socketPath,
+      "--state", statePath,
+    ], { cwd: process.cwd(), stdio: ["ignore", "ignore", "pipe"] });
+    daemons.push(daemon);
+    let emitted = "";
+    daemon.stderr?.on("data", (chunk) => { emitted += chunk.toString(); });
+    const client = await waitForAsync(async () => {
+      try {
+        return await SessiondClient.connect(socketPath, { requestTimeoutMs: 1_000 });
+      } catch {
+        return undefined;
+      }
+    });
+    clients.push(client);
+
+    await expect(client.spawn({
+      slot: 19,
+      executable: "/missing/private/sessiond-agent",
+      args: [secret],
+      cwd: "/missing/private/cwd",
+      env: { PRIVATE_TOKEN: secret },
+    })).rejects.toMatchObject({ code: "spawn_failed", processCode: "ENOENT", syscall: "spawn" });
+    await delay(50);
+
+    expect(daemon.exitCode).toBeNull();
+    expect(emitted).not.toContain(secret);
+    expect(emitted).not.toContain("/missing/private");
   });
 
   it("creates a private socket and state file", async () => {

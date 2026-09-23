@@ -182,6 +182,7 @@ interface MuxMsg {
   result?: unknown;
   ok?: boolean;
   instanceId?: string;
+  capabilities?: HelloFrame["capabilities"];
   bridgeId?: string;
   protocolVersion?: number;
   name?: string;
@@ -532,18 +533,24 @@ export function makeMux(opts: {
 
       // Bridge announces its instance ID on every connect (`hello` is the
       // typed bus frame; `bridge_hello` remains accepted for the slot-mux
-      // eviction path). If it changed, the bridge process restarted and all
-      // its agent slots are gone — emit exit events so runtimes are evicted.
+      // eviction path). A legacy bridge owns its children, so a changed id
+      // still proves they are gone. A bridge advertising durableSlots has a
+      // separate descriptor owner: for that one bridge only, reconcile the
+      // supervisor's facts instead of destroying work merely because its
+      // control plane restarted (#574). Every bridge without the capability
+      // keeps the exact pre-#574 eviction contract.
       if (msg.type === "hello" || msg.type === "bridge_hello") {
         const newId = msg.instanceId;
         const isNewInstance = !!(newId && lastBridgeInstanceId && newId !== lastBridgeInstanceId);
+        const canReattach = msg.type === "hello" && msg.capabilities?.durableSlots === true;
 
-        if (isNewInstance) {
+        if (isNewInstance && !canReattach) {
           for (const [slot, entry] of slots) {
             if (!entry.killed) {
-              // Tell the new bridge process to kill any agent it spawned for
-              // this slot (flushQueues may have already sent stdin to it).
-              send({ slot, type: "kill" });
+              // Legacy bridge: preserve the controller-side eviction exactly.
+              // The old kill frame was provably dead — a fresh bridge owned an
+              // empty slots map — so #574 deletes it rather than carrying a
+              // second, fictional child owner into the supervised design.
               entry.killed = true;
               entry.stdout.push(null);
               entry.fake.emit("exit", 1, null);
@@ -553,12 +560,10 @@ export function makeMux(opts: {
         }
         lastBridgeInstanceId = newId;
 
-        // For same-instance reconnects (WS drop/reconnect without bridge restart),
-        // probe which slots are still live. Any seam-acp slot the bridge no longer
-        // knows about had its turn complete (or was lost) while the WS was down —
-        // evict it immediately so the turn fails fast rather than waiting for the
-        // turn timeout.
-        if (!isNewInstance && slots.size > 0) {
+        // Same-instance reconnects and supervisor-backed new instances both
+        // reconcile by slot. Any slot the child owner no longer knows about
+        // completed (or was lost) while disconnected and is evicted promptly.
+        if ((!isNewInstance || canReattach) && slots.size > 0) {
           void sendCmd("listSlots", {}).then((reply: {
             slots: number[];
             health?: BridgeSlotHealth[];
@@ -696,9 +701,11 @@ export function makeMux(opts: {
         if (typeof msg.seq === "number") outputCursor.set(msg.slot, msg.seq);
         entry.stdout.push(msg.data);
       } else if (msg.type === "recovery" && isRemoteRecoverySnapshot(msg.recovery)) {
+        if (typeof msg.seq === "number") outputCursor.set(msg.slot, msg.seq);
         opts.onRemoteRecovery?.(msg.slot, msg.recovery);
         entry.fake.emit("remoteRecovery", msg.recovery);
       } else if (msg.type === "recovery_result" && isRemoteRecoveryResult(msg.recoveryResult)) {
+        if (typeof msg.seq === "number") outputCursor.set(msg.slot, msg.seq);
         entry.fake.emit("remoteRecoveryResult", msg.recoveryResult);
       } else if (msg.type === "exit") {
         applyRemoteExit(msg.slot, entry, msg);

@@ -1,7 +1,7 @@
 /**
  * #468 — an `agentId` the bridge does not hold silently spawned copilot.
  *
- * `resolveSlotAdapter` returned `undefined` for an unknown id and `spawnAgent`
+ * `resolveSlotAdapter` returned `undefined` for an unknown id and the launch
  * fell through to the copilot legacy branch. The requested agent never ran,
  * nothing failed, and copilot did the work — blast radius 5, silently wrong,
  * across a licensing boundary that dispatch-time pinning enforces correctly.
@@ -21,7 +21,7 @@ import {
   spawnRefusalFrame,
   type AdapterResolution,
 } from "../packages/bridge/src/resolve-adapter.js";
-import { spawnAgent } from "../packages/bridge/src/spawn-agent.js";
+import { spawnSupervisedAdapter } from "../packages/bridge/src/spawn-agent.js";
 
 // The legacy copilot branch called `node:child_process.spawn` directly.
 // `adapter.spawn` being invoked is not enough: a branch that launches copilot
@@ -138,8 +138,8 @@ describe("#468 everything that worked before still works", () => {
   });
 });
 
-describe("#468 spawnAgent itself refuses, and spawns nothing while doing so", () => {
-  // Until `spawnAgent` was lifted out of `index.ts`, deleting the throw below
+describe("#468 the supervised adapter launch refuses, and spawns nothing while doing so", () => {
+  // Until adapter launch was lifted out of `index.ts`, deleting the throw below
   // left a green suite: the CLI entrypoint `process.exit(1)`s on import, so no
   // test could reach it. That mutation is this story's whole fix, undone.
   const spawning = (id: string) => {
@@ -154,7 +154,7 @@ describe("#468 spawnAgent itself refuses, and spawns nothing while doing so", ()
   it("throws UnknownAgentError for an id this bridge cannot serve", () => {
     const { adapter } = spawning("agy");
     const adapters = new Map([["agy", adapter]]);
-    expect(() => spawnAgent(adapters, { agentId: "ollama-cloud" } as never))
+    expect(() => spawnSupervisedAdapter(adapters, { agentId: "ollama-cloud" } as never))
       .toThrow(UnknownAgentError);
     expect(childProcessSpawn).not.toHaveBeenCalled();
   });
@@ -165,7 +165,7 @@ describe("#468 spawnAgent itself refuses, and spawns nothing while doing so", ()
     const { adapter, spawned } = spawning("agy");
     const adapters = new Map([["agy", adapter]]);
     try {
-      spawnAgent(adapters, { agentId: "zai" } as never);
+      spawnSupervisedAdapter(adapters, { agentId: "zai" } as never);
     } catch { /* expected */ }
     expect(spawned()).toBe(0);
     expect(childProcessSpawn).not.toHaveBeenCalled();
@@ -173,7 +173,7 @@ describe("#468 spawnAgent itself refuses, and spawns nothing while doing so", ()
 
   it("names the agent and the inventory in what it throws", () => {
     const { adapter } = spawning("agy");
-    expect(() => spawnAgent(new Map([["agy", adapter]]), { agentId: "zai" } as never))
+    expect(() => spawnSupervisedAdapter(new Map([["agy", adapter]]), { agentId: "zai" } as never))
       .toThrow(/"zai".*holds: agy/s);
   });
 
@@ -184,7 +184,7 @@ describe("#468 spawnAgent itself refuses, and spawns nothing while doing so", ()
       spawn: (...args: unknown[]) => { got = args; return { pid: 2 } as never; },
     } as unknown as AgentAdapter;
     const mcp = [{ name: "seam-mcp" }] as McpServer[];
-    const child = spawnAgent(
+    const child = spawnSupervisedAdapter(
       new Map([["claude", adapter]]),
       {
         agentId: "claude",
@@ -212,7 +212,7 @@ describe("#468 spawnAgent itself refuses, and spawns nothing while doing so", ()
       spawn: (...args: unknown[]) => { got = args; return { pid: 4 } as never; },
     } as unknown as AgentAdapter;
     const mcp = [{ name: "seam-mcp" }] as McpServer[];
-    const child = spawnAgent(FLEET_WITH(adapter), {
+    const child = spawnSupervisedAdapter(FLEET_WITH(adapter), {
       agentId: "copilot",
       model: "gpt-5.4",
       effort: "high",
@@ -237,14 +237,14 @@ describe("#468 spawnAgent itself refuses, and spawns nothing while doing so", ()
       ["copilot", adapter],
       ["claude", { id: "claude", spawn: () => { throw new Error("claude spawn"); } } as never],
     ]);
-    expect(() => spawnAgent(adapters, undefined)).toThrow(UnspecifiedAgentError);
+    expect(() => spawnSupervisedAdapter(adapters, undefined)).toThrow(UnspecifiedAgentError);
     expect(spawned()).toBe(0);
     expect(childProcessSpawn).not.toHaveBeenCalled();
   });
 
   it("refuses an unnamed slot when the host holds nothing, instead of execing copilot", () => {
-    expect(() => spawnAgent(new Map(), undefined)).toThrow(UnspecifiedAgentError);
-    expect(() => spawnAgent(new Map(), undefined)).toThrow(/holds: none/);
+    expect(() => spawnSupervisedAdapter(new Map(), undefined)).toThrow(UnspecifiedAgentError);
+    expect(() => spawnSupervisedAdapter(new Map(), undefined)).toThrow(/holds: none/);
     expect(childProcessSpawn).not.toHaveBeenCalled();
   });
 
@@ -254,7 +254,7 @@ describe("#468 spawnAgent itself refuses, and spawns nothing while doing so", ()
       id: "copilot",
       spawn: () => { calls += 1; return { pid: 5 } as never; },
     } as unknown as AgentAdapter;
-    const child = spawnAgent(new Map([["copilot", adapter]]), undefined);
+    const child = spawnSupervisedAdapter(new Map([["copilot", adapter]]), undefined);
     expect(child).toEqual({ pid: 5 });
     expect(calls).toBe(1);
     expect(childProcessSpawn).not.toHaveBeenCalled();

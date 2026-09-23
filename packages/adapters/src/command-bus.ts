@@ -84,6 +84,11 @@ export interface HelloFrame {
   releaseSha?: string;
   host: HelloHostInfo;
   agents: HelloAgentInventory[];
+  /** Optional bridge behaviours. Absence is the legacy contract. */
+  capabilities?: {
+    /** Agent slots outlive this bridge process and can be reconciled by id. */
+    durableSlots?: boolean;
+  };
   /** True when the bridge process registered dev-mode RPC handlers. */
   devMode?: boolean;
   /** Secret-free staged-release identity used only for rollout verification. */

@@ -42,7 +42,7 @@
  * ─────────────────────────────────────────────────────────────────────────────
  */
 
-import { spawn, execSync, execFileSync, type ChildProcess } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import fsp from "node:fs/promises";
@@ -52,25 +52,22 @@ import type { RawData, WebSocket as WsSocket } from "ws";
 import {
   PROTOCOL_VERSION,
   sweepAgyMcpHomes,
-  unclassified,
   type AgentAdapter,
 } from "@seam/adapters";
 import { dispatchBridgeRpc, type SlotSpawnConfig } from "./rpc.js";
-import { slotHealthSnapshot } from "./slot-health.js";
 import { collectHangEvidence, createProbeGate, readLiveProviderSocket } from "./hang-probe.js";
-import { createOutputLog, createLineFramer } from "./output-log.js";
 import { createOomEvidenceRegistry } from "./oom-evidence.js";
 import { createStderrRegistry } from "./stderr-ring.js";
-import { spawnRefusalFrame } from "./resolve-adapter.js";
-import { spawnAgent } from "./spawn-agent.js";
-import { muxSend, forwardAgentStdout } from "./frame-out.js";
 import { BridgeMcpInputRewriter } from "./mcp-injection.js";
 import {
   inventoryFromAdapters,
   loadHostAdapterInventory,
 } from "./inventory.js";
 import { createReleaseReceiptWriter, readRunningReleaseSha, type ReleaseReceiptWriter } from "./release-receipt.js";
-import { createRung1Recovery } from "./rung1-recovery.js";
+import { connectSessiond } from "./sessiond-connect.js";
+import type { SessiondClient } from "./sessiond-client.js";
+import { SupervisedSlots, type SupervisedBridgeFrame } from "./supervised-slots.js";
+import { bridgeHello } from "./hello.js";
 
 type WsCtor = typeof import("ws").WebSocket;
 type WssCtor = typeof import("ws").WebSocketServer;
@@ -181,11 +178,11 @@ async function loadWs(): Promise<{ WebSocket: WsCtor; WebSocketServer: WssCtor }
 }
 
 /**
- * Create a slot manager that multiplexes multiple agent processes over one WS.
- * Each slot gets its own agent process, spawned lazily on first message.
- * Agents survive WS reconnects — stdout is routed to `currentWs`.
+ * Create the restartable control-plane view of sessiond-owned slots.
+ * New slots are admitted lazily on first input; retained slots rebind as
+ * output-only and survive both websocket and bridge-process restarts.
  */
-function makeSlotManager(opts: {
+async function makeSlotManager(opts: {
   copilotCmd: string;
   localCwd: string;
   workspaceRoot: string;
@@ -196,34 +193,12 @@ function makeSlotManager(opts: {
   releaseReceipt?: ReleaseReceiptWriter | null;
   /** Standing release identity. Null when this process has no stage receipt. */
   releaseSha?: string | null;
-}): SlotManager {
-  const { copilotCmd, localCwd, workspaceRoot, WebSocket, bridgeId, devMode, adapters, releaseReceipt, releaseSha } = opts;
+  sessiond: SessiondClient;
+}): Promise<SlotManager> {
+  const { copilotCmd, localCwd, workspaceRoot, WebSocket, bridgeId, devMode, adapters, releaseReceipt, releaseSha, sessiond } = opts;
   let currentWs: WsSocket | null = null;
-  const slots = new Map<number, ChildProcess>();
   const slotConfigs = new Map<number, SlotSpawnConfig>();
   let draining = false;
-  const lastStdoutAt = new Map<number, number>();
-  /**
-   * #442: when seam-acp last wrote INTO this slot. Directly observed by the
-   * bridge, and the half that makes silence interpretable: stdout silence
-   * alone cannot distinguish "working on a prompt" from "idle, nobody asked
-   * it anything". Paired with `lastStdoutMsAgo` it lets the OWNER of the
-   * turn fact — seam-acp — decide, without the bridge guessing.
-   */
-  const lastStdinAt = new Map<number, number>();
-  /**
-   * #444: agent output buffered with per-slot sequences, so a disconnect stops
-   * the consumer's cursor advancing instead of destroying the frames. Bounded
-   * by age and bytes independently of any acknowledgment — an old seam-acp
-   * that never acks must still be safe on a host we cannot update.
-   */
-  const outputLog = createOutputLog();
-  /** #444: stdout was forwarded as raw chunks, so a reconnect could splice a
-   *  partial JSON line into a line-delimited JSON-RPC stream. */
-  const lineFramers = new Map<number, ReturnType<typeof createLineFramer>>();
-  /** The controller stream is chunked too. Recovery must see one complete ACP
-   * request even when a JSON line crosses websocket/stream chunk boundaries. */
-  const inputLineFramers = new Map<number, ReturnType<typeof createLineFramer>>();
   /**
    * #456: agent fd 2 was piped with no reader, which stalls the child once the
    * 64 KiB pipe buffer fills. Draining removes the stall; keeping a bounded
@@ -241,36 +216,56 @@ function makeSlotManager(opts: {
    * real stdout line.
    */
   const probes = createProbeGate();
-  /** #467: one same-child, same-session retry owner. Wider recovery remains
-   * controller-owned; raw errors and original prompts never enter its state. */
-  const rung1Recovery = createRung1Recovery({
-    policyFor: (slot) => slotConfigs.get(slot)?.rung1Recovery,
-    classify: (slot, error) => {
-      const agentId = slotConfigs.get(slot)?.agentId;
-      const adapter = agentId ? adapters.get(agentId) : undefined;
-      try {
-        return (adapter?.classifyError?.(error) ?? unclassified(agentId ?? "unknown")).errorKind;
-      } catch {
-        return "unclassified";
+
+  function wsSend(payload: Record<string, unknown>) {
+    if (currentWs && currentWs.readyState === WebSocket.OPEN) {
+      currentWs.send(JSON.stringify(payload));
+    }
+  }
+
+  const sendSupervisedFrame = (frame: SupervisedBridgeFrame & { slot: number }): void => {
+    if (frame.type === "data" && frame.data !== undefined) {
+      if (!probes.absorb(frame.slot, frame.data)) {
+        wsSend({ slot: frame.slot, type: "data", data: frame.data, seq: frame.seq });
       }
-    },
-    write: (slot, line) => {
-      const agent = slots.get(slot);
-      if (!agent || agent.exitCode !== null || agent.signalCode !== null || agent.killed || !agent.stdin?.writable) {
-        return false;
-      }
-      lastStdinAt.set(slot, Date.now());
-      agent.stdin.write(line);
-      return true;
-    },
-    publishSnapshot: (slot, recovery) => {
-      muxSend(currentWs, WebSocket, slot, "recovery", { recovery }, outputLog);
-    },
-    publishResult: (slot, recoveryResult) => {
-      muxSend(currentWs, WebSocket, slot, "recovery_result", { recoveryResult }, outputLog);
-    },
-    controllerConnected: () => currentWs?.readyState === WebSocket.OPEN,
+      return;
+    }
+    if (frame.type === "recovery" && frame.recovery) {
+      wsSend({ slot: frame.slot, type: "recovery", recovery: frame.recovery, seq: frame.seq });
+      return;
+    }
+    if (frame.type === "recovery_result" && frame.recoveryResult) {
+      wsSend({ slot: frame.slot, type: "recovery_result", recoveryResult: frame.recoveryResult, seq: frame.seq });
+      return;
+    }
+    if (frame.type !== "exit") return;
+    slotInputRewriters.delete(frame.slot);
+    probes.close(frame.slot);
+    const payload = stderrRegistry.exitPayload(frame.slot, frame.code ?? null, frame.signal ?? null);
+    const abnormal = (frame.code !== 0 && frame.code !== null) || frame.signal != null;
+    void oomEvidence.exitPayload(frame.slot, payload, abnormal).then((exitPayload) => {
+      wsSend({
+        slot: frame.slot,
+        type: "exit",
+        ...exitPayload,
+        ...(frame.spawnError ? { spawnError: frame.spawnError } : {}),
+        seq: frame.seq,
+      });
+    });
+  };
+
+  const supervised = new SupervisedSlots({
+    client: sessiond,
+    copilotCmd,
+    localCwd,
+    onFrame: sendSupervisedFrame,
+    onStderr: (slot, chunk) => stderrRegistry.observe(slot, chunk),
+    onSpawn: (slot, pid) => oomEvidence.attach(slot, pid),
   });
+  const retained = await supervised.rebind();
+  for (const health of retained.health) {
+    if (health.alive) oomEvidence.attach(health.slot, health.pid ?? undefined);
+  }
 
   function setWs(ws: WsSocket | null) {
     currentWs = ws;
@@ -283,9 +278,7 @@ function makeSlotManager(opts: {
           ready: false,
         }));
         ws.send(
-          JSON.stringify({
-            v: PROTOCOL_VERSION,
-            type: "hello",
+          JSON.stringify(bridgeHello({
             bridgeId,
             instanceId: BRIDGE_INSTANCE_ID,
             protocolVersion: PROTOCOL_VERSION,
@@ -299,123 +292,12 @@ function makeSlotManager(opts: {
             agents,
             devMode,
             ...(releaseReceipt ? { release: releaseReceipt.helloMetadata() } : {}),
-          })
+          }))
         );
       } catch { /* ws may not be open yet — best effort */ }
     }
   }
 
-  /**
-   * #444: surrender any held partial line before the slot ends. An agent that
-   * dies mid-line has still produced those bytes, and holding them back would
-   * turn a crash into a silent truncation.
-   */
-  function flushFramer(slot: number): void {
-    const tail = lineFramers.get(slot)?.flush();
-    if (tail) muxSend(currentWs, WebSocket, slot, "data", { data: tail }, outputLog);
-    lineFramers.delete(slot);
-  }
-
-  function getOrSpawnSlot(slot: number): ChildProcess | null {
-    if (slots.has(slot)) return slots.get(slot) ?? null;
-    if (draining) {
-      console.error(`[bridge] Slot ${slot}: drain mode — ignoring new slot spawn`);
-      return null;
-    }
-
-    console.error(`[bridge] Slot ${slot}: spawning agent`);
-    let agent: ChildProcess;
-    try {
-      agent = spawnAgent(adapters, slotConfigs.get(slot));
-    } catch (err) {
-      // #468: end the slot honestly rather than leaving seam-acp waiting on a
-      // stream that will never produce anything. One `exit` frame is enough —
-      // the mux marks the slot killed on receipt and stops forwarding stdin,
-      // so this cannot turn into a frame-per-write loop.
-      const frame = spawnRefusalFrame(err);
-      console.error(`[bridge] Slot ${slot}: refusing to spawn — ${frame.spawnError}`);
-      muxSend(currentWs, WebSocket, slot, "exit", frame, outputLog);
-      return null;
-    }
-    slots.set(slot, agent);
-    oomEvidence.attach(slot, agent.pid);
-    slotInputRewriters.set(
-      slot,
-      new BridgeMcpInputRewriter(slotConfigs.get(slot)?.mcpServers ?? [])
-    );
-    inputLineFramers.set(slot, createLineFramer());
-
-    // #456: fd 2 was piped and nothing ever read it, so the kernel pipe buffer
-    // filled — 64 KiB on Linux, smaller to start on Darwin — and the child
-    // blocked on its next write to stderr. That is a live process which has
-    // stopped producing output — exactly what a hung agent looks like from
-    // seam-acp. Attaching this handler is what keeps the pipe flowing; the
-    // ring is what turns the bytes into a cause we can report instead of infer.
-    stderrRegistry.attach(slot, agent);
-
-    const framer = createLineFramer();
-    lineFramers.set(slot, framer);
-    agent.stdout?.on("data", (chunk: Buffer) => {
-      // One frame per complete line. A partial tail is held until its newline
-      // arrives, so a frame is always a whole JSON-RPC message. A line that
-      // is our own hang-probe response is not agent output and does not
-      // refresh the silence clock — otherwise the probe would look like the
-      // turn had spoken.
-      let forwarded = false;
-      forwardAgentStdout(chunk, framer, (line) => {
-        if (probes.absorb(slot, line)) return;
-        const decision = rung1Recovery.observeOutput(slot, line);
-        if (decision.forward !== null) {
-          forwarded = true;
-          muxSend(currentWs, WebSocket, slot, "data", { data: decision.forward }, outputLog);
-        }
-      });
-      if (forwarded || framer.pending() > 0) lastStdoutAt.set(slot, Date.now());
-    });
-
-    agent.on("error", (err) => {
-      console.error(`[bridge] Slot ${slot} agent error: ${err.message}`);
-      rung1Recovery.childExited(slot);
-      slots.delete(slot);
-      slotInputRewriters.delete(slot);
-      inputLineFramers.delete(slot);
-      probes.close(slot);
-      oomEvidence.drop(slot);
-      flushFramer(slot);
-      // A spawn error is abnormal by definition, so the tail goes out with it.
-      muxSend(currentWs, WebSocket, slot, "exit", stderrRegistry.exitPayload(slot, 1, null), outputLog);
-    });
-
-    agent.on("exit", (code, signal) => {
-      console.error(`[bridge] Slot ${slot} agent exited (code=${code}, signal=${signal})`);
-      rung1Recovery.childExited(slot);
-      slots.delete(slot);
-      lastStdoutAt.delete(slot);
-      lastStdinAt.delete(slot);
-      slotInputRewriters.delete(slot);
-      inputLineFramers.delete(slot);
-      probes.close(slot);
-      flushFramer(slot);
-      const payload = stderrRegistry.exitPayload(slot, code, signal);
-      const abnormal = (code !== 0 && code !== null) || signal != null;
-      // #516: code=1 from an ACP wrapper is not evidence that the wrapper was
-      // the kernel victim. Match a recent kernel OOM record to a pid this
-      // slot's process tree actually owned, then emit only the closed fact.
-      // The query is bounded; failure refuses this diagnosis alone and the
-      // ordinary exit frame still goes out.
-      void oomEvidence.exitPayload(slot, payload, abnormal).then((exitPayload) => {
-        muxSend(currentWs, WebSocket, slot, "exit", exitPayload, outputLog);
-      });
-    });
-
-    return agent;
-  }
-
-  function wsSend(payload: Record<string, unknown>) {
-    if (currentWs && currentWs.readyState === WebSocket.OPEN) {
-      currentWs.send(JSON.stringify(payload));
-    }
-  }
 
   async function handleCmd(msg: { cmdId: string; action: string; payload: any }) {
     const { cmdId, action } = msg;
@@ -423,6 +305,7 @@ function makeSlotManager(opts: {
     console.error(`[bridge] cmd: ${action} (cmdId=${cmdId})`);
     try {
       let result: unknown;
+      let activateReplay: (() => void) | undefined;
       if (action === "listSessions") {
         try {
           await fsp.access(dbPath);
@@ -598,8 +481,9 @@ function makeSlotManager(opts: {
         // not have fails this command only — the turn is left running, and
         // every other slot is untouched.
         const slot = Number(payload?.slot);
-        const agent = Number.isInteger(slot) ? slots.get(slot) : undefined;
-        if (!agent || agent.exitCode !== null || agent.killed || !agent.stdin?.writable) {
+        const listed = Number.isInteger(slot) ? await supervised.listSlots() : undefined;
+        const health = listed?.health.find((entry) => entry.slot === slot);
+        if (!health?.alive) {
           throw new Error("probeHang: slot has no live process");
         }
         const id = randomUUID();
@@ -608,12 +492,16 @@ function makeSlotManager(opts: {
         const response = probes.arm(slot, id);
         result = await collectHangEvidence({
           id,
-          writeLine: (line) => { agent.stdin?.write(line); },
+          writeLine: async (line) => {
+            if (!await supervised.writeInput(slot, line)) {
+              throw new Error("probeHang: retained slot is output-only after bridge restart");
+            }
+          },
           response,
-          sockets: () => readLiveProviderSocket(agent.pid),
+          sockets: () => readLiveProviderSocket(health.pid ?? undefined),
         });
       } else if (action === "listSlots") {
-        // #442: the bridge holds the process. It is the only participant that
+        // #442/#574: sessiond holds the process. It is the only participant that
         // can answer "is it alive" and "when did it last speak" by OBSERVING
         // rather than inferring, so it answers exactly those and no more.
         //
@@ -622,40 +510,22 @@ function makeSlotManager(opts: {
         // omits `health` — which the caller treats as "no opinion" rather
         // than as "unhealthy". The frame is an array of objects so #456 can
         // hang a stderr tail off the same shape without another protocol turn.
-        const health = slotHealthSnapshot(slots, lastStdoutAt, lastStdinAt, Date.now()).map((entry) => {
-          const recovery = rung1Recovery.snapshot(entry.slot);
-          return { ...entry, ...(recovery ? { recovery } : {}) };
-        });
-        const represented = new Set(health.map((entry) => entry.slot));
-        for (const { slot, recovery } of rung1Recovery.snapshots()) {
-          if (!represented.has(slot)) health.push({
-            slot,
-            alive: false,
-            pid: null,
-            lastStdoutMsAgo: null,
-            lastStdinMsAgo: null,
-            recovery,
-          });
-        }
-        result = {
-          slots: [...slots.keys()],
-          health,
-        };
+        result = await supervised.listSlots();
       } else if (action === "armRung1Recovery") {
         const slot = Number(payload?.slot);
-        const agent = Number.isInteger(slot) ? slots.get(slot) : undefined;
-        if (!agent || agent.exitCode !== null || agent.signalCode !== null || agent.killed) {
+        if (!Number.isInteger(slot)) {
           throw new Error("armRung1Recovery: slot has no live process");
         }
-        result = rung1Recovery.arm(slot, {
+        result = await supervised.armRecovery(slot, {
           submissionId: payload?.submissionId,
           acpSessionId: payload?.acpSessionId,
           continuation: payload?.continuation,
         });
       } else if (action === "disarmRung1Recovery") {
         const slot = Number(payload?.slot);
-        result = { disarmed: Number.isInteger(slot)
-          && rung1Recovery.disarm(slot, payload?.submissionId) };
+        result = Number.isInteger(slot)
+          ? await supervised.disarmRecovery(slot, payload?.submissionId)
+          : { disarmed: false };
       } else if (action === "replayOutput") {
         // #444: "read from where you were". The consumer's cursor is the only
         // state that matters, so a disconnect needs no special handling here —
@@ -666,33 +536,15 @@ function makeSlotManager(opts: {
         // today's behaviour. That is why the fleet can be mixed-version.
         const slot = Number(payload.slot);
         const afterSeq = Number(payload.afterSeq ?? 0);
-        const replay = outputLog.since(slot, Number.isFinite(afterSeq) ? afterSeq : 0);
-        const frames: Array<Record<string, unknown> & { type: string }> = replay.frames
-          .map((f) => ({ seq: f.seq, type: f.type, ...f.payload }));
-        // A result is the adoption authority, not transient socket delivery.
-        // Keep it available after a consumer ack so a controller that dies
-        // after receipt but before its SQL commit can still adopt exactly once.
-        const terminal = afterSeq === 0 ? rung1Recovery.terminalResult(slot) : undefined;
-        if (terminal && !frames.some((frame) => frame.type === "recovery_result"
-          && (frame as { recoveryResult?: { submissionId?: string } }).recoveryResult?.submissionId
-            === terminal.submissionId)) {
-          frames.push({ type: "recovery_result", recoveryResult: terminal });
-        }
-        result = {
-          slot,
-          frames,
-          // Stated explicitly, never implied by a short reply. A consumer that
-          // cannot tell "here is the rest" from "some of it is gone" will
-          // splice two unrelated points of a JSON-RPC stream together.
-          ...(replay.gap ? { gap: replay.gap } : {}),
-        };
+        const replay = await supervised.replay(slot, Number.isFinite(afterSeq) ? afterSeq : 0);
+        result = replay.result;
+        activateReplay = replay.activate;
       } else if (action === "ackOutput") {
         // Acks only ACCELERATE trimming. The age and byte bounds are what
         // guarantee memory comes back, because an old seam-acp never acks and
         // four of eight hosts cannot be updated to one that does.
-        const slot = Number(payload.slot);
-        const throughSeq = Number(payload.throughSeq ?? 0);
-        if (Number.isFinite(slot) && Number.isFinite(throughSeq)) outputLog.ack(slot, throughSeq);
+        // sessiond retention is bounded independently of acknowledgements.
+        // Keep accepting this old acceleration hint for wire compatibility.
         result = null;
       } else if (action === "writeAttachment") {
         result = await writeAttachment(payload.cwd, payload.filename, payload.base64);
@@ -700,6 +552,7 @@ function makeSlotManager(opts: {
         throw new Error(`Unknown action: ${action}`);
       }
       wsSend({ type: "cmd_reply", cmdId, payload: result });
+      activateReplay?.();
     } catch (err: any) {
       console.error(`[bridge] Error handling cmd ${action}:`, err);
       wsSend({ type: "cmd_reply", cmdId, error: err.message });
@@ -733,13 +586,8 @@ function makeSlotManager(opts: {
             cwd: localCwd,
             devMode,
             configureSlot: (slot, cfg) => {
-              // A spawn RPC is explicit replacement, unlike adoption. Clear a
-              // retired slot's bounded replay/result before reusing its number.
-              if (!slots.has(slot)) {
-                outputLog.dropSlot(slot);
-                rung1Recovery.drop(slot);
-              }
               slotConfigs.set(slot, cfg);
+              supervised.configure(slot, cfg);
             },
           });
           await releaseReceipt?.recordCatalogRpc(method, msg.agentId);
@@ -771,38 +619,25 @@ function makeSlotManager(opts: {
     }
 
     if (msg.type === "data" && msg.data !== undefined) {
-      const agent = getOrSpawnSlot(msg.slot);
-      if (agent && !agent.killed) {
-        const rewritten = slotInputRewriters.get(msg.slot)?.push(msg.data) ?? msg.data;
-        if (rewritten) {
-          rung1Recovery.observeInputBytes(msg.slot);
-          for (const line of inputLineFramers.get(msg.slot)?.push(rewritten) ?? []) {
-            rung1Recovery.observeInput(msg.slot, line);
-          }
-          lastStdinAt.set(msg.slot, Date.now());
-          agent.stdin?.write(rewritten);
-        }
+      if (draining) return;
+      let rewriter = slotInputRewriters.get(msg.slot);
+      if (!rewriter) {
+        rewriter = new BridgeMcpInputRewriter(slotConfigs.get(msg.slot)?.mcpServers ?? []);
+        slotInputRewriters.set(msg.slot, rewriter);
       }
+      const rewritten = rewriter.push(msg.data);
+      if (rewritten) void supervised.writeInput(msg.slot, rewritten).catch(() => {
+        wsSend({ slot: msg.slot, type: "exit", code: 1, spawnError: "supervised slot unavailable" });
+      });
     } else if (msg.type === "kill") {
-      const agent = slots.get(msg.slot);
-      if (agent) {
-        console.error(`[bridge] Slot ${msg.slot}: kill received — terminating agent`);
-        agent.kill();
-        slots.delete(msg.slot);
-      }
-      // #444/#467: seam-acp is explicitly done with this slot, even when the
-      // child exited before its retained result was adopted. The replay window
-      // then has no remaining consumer. An unrequested EXIT still retains it.
-      outputLog.dropSlot(msg.slot);
-      lineFramers.delete(msg.slot);
-      inputLineFramers.delete(msg.slot);
+      console.error(`[bridge] Slot ${msg.slot}: kill received — terminating supervised agent`);
+      void supervised.kill(msg.slot).catch(() => undefined);
       // #456: a deliberate kill must not surface a stale diagnostic tail.
       stderrRegistry.drop(msg.slot);
       oomEvidence.drop(msg.slot);
       slotConfigs.delete(msg.slot);
       slotInputRewriters.delete(msg.slot);
       probes.close(msg.slot);
-      rung1Recovery.drop(msg.slot);
     } else if (msg.type === "cmd") {
       handleCmd(msg);
     }
@@ -812,49 +647,40 @@ function makeSlotManager(opts: {
     if (draining) return;
     draining = true;
 
-    if (slots.size === 0) {
-      console.error("[bridge] Drain complete (no active slots) — exiting for restart");
-      process.exit(0);
-    }
-
-    console.error(`[bridge] Drain mode entered — waiting for ${slots.size} active slot(s) to go idle`);
-
     const IDLE_SILENCE_MS = 10_000;
     const POLL_INTERVAL_MS = 2_000;
     const HARD_TIMEOUT_MS = 5 * 60 * 1_000;
     const deadline = Date.now() + HARD_TIMEOUT_MS;
 
-    const timer = setInterval(() => {
+    let polling = false;
+    const poll = async (): Promise<void> => {
+      if (polling) return;
+      polling = true;
       const now = Date.now();
       if (now >= deadline) {
         clearInterval(timer);
         console.error("[bridge] Drain hard timeout reached — forcing exit for restart");
         process.exit(0);
       }
-
-      if (slots.size === 0) {
+      const listed = await supervised.listSlots().catch(() => undefined);
+      const live = listed?.health.filter((entry) => entry.alive) ?? [];
+      if (live.length === 0) {
         clearInterval(timer);
         console.error("[bridge] Drain complete — exiting for restart");
         process.exit(0);
       }
-
-      const allIdle = [...slots.keys()].every((slot) => {
-        const last = lastStdoutAt.get(slot) ?? 0;
-        return now - last >= IDLE_SILENCE_MS;
-      });
-
+      const allIdle = live.every((entry) => (entry.lastStdoutMsAgo ?? Number.POSITIVE_INFINITY) >= IDLE_SILENCE_MS);
       if (allIdle) {
         clearInterval(timer);
         console.error("[bridge] Drain complete — exiting for restart");
         process.exit(0);
       }
-
-      const remaining = [...slots.keys()].filter((slot) => {
-        const last = lastStdoutAt.get(slot) ?? 0;
-        return now - last < IDLE_SILENCE_MS;
-      });
+      const remaining = live.filter((entry) => (entry.lastStdoutMsAgo ?? Number.POSITIVE_INFINITY) < IDLE_SILENCE_MS);
       console.error(`[bridge] Draining — ${remaining.length} slot(s) still active`);
-    }, POLL_INTERVAL_MS);
+      polling = false;
+    };
+    const timer = setInterval(() => { void poll(); }, POLL_INTERVAL_MS);
+    void poll();
   }
 
   return { setWs, handleMessage, drain };
@@ -884,7 +710,8 @@ async function runClientMode(
   const { adapters, adapterRefusals } = loadHostAdapterInventory(copilotCmd, { cwd: localCwd });
   const releaseReceipt = await createReleaseReceiptWriter({ bridgeId: bridgeOpts.bridgeId, instanceId: BRIDGE_INSTANCE_ID, protocolVersion: PROTOCOL_VERSION, adapterRefusals });
   const releaseSha = await readRunningReleaseSha();
-  const mgr = makeSlotManager({
+  const sessiond = await connectSessiond();
+  const mgr = await makeSlotManager({
     copilotCmd,
     localCwd,
     workspaceRoot: bridgeOpts.workspaceRoot,
@@ -894,6 +721,7 @@ async function runClientMode(
     adapters,
     releaseReceipt,
     releaseSha,
+    sessiond,
   });
   activeMgr = mgr;
 
@@ -973,7 +801,8 @@ async function runServerMode(
   const { adapters, adapterRefusals } = loadHostAdapterInventory(copilotCmd, { cwd: localCwd });
   const releaseReceipt = await createReleaseReceiptWriter({ bridgeId: bridgeOpts.bridgeId, instanceId: BRIDGE_INSTANCE_ID, protocolVersion: PROTOCOL_VERSION, adapterRefusals });
   const releaseSha = await readRunningReleaseSha();
-  const mgr = makeSlotManager({
+  const sessiond = await connectSessiond();
+  const mgr = await makeSlotManager({
     copilotCmd,
     localCwd,
     workspaceRoot: bridgeOpts.workspaceRoot,
@@ -983,6 +812,7 @@ async function runServerMode(
     adapters,
     releaseReceipt,
     releaseSha,
+    sessiond,
   });
   activeMgr = mgr;
 

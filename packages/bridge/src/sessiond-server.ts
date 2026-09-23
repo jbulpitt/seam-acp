@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { promises as fs, readFileSync } from "node:fs";
 import net, { type Socket } from "node:net";
 import path from "node:path";
-import { createOutputLog, type OutputLog, type OutputLogOptions } from "./output-log.js";
+import { createLineFramer, createOutputLog, type OutputLog, type OutputLogOptions } from "./output-log.js";
 import {
   SESSIOND_PROTOCOL_VERSION,
   type SessiondEvent,
@@ -60,6 +60,7 @@ interface SlotEntry {
   exitCode?: number | null;
   signal?: NodeJS.Signals | null;
   orphanReason?: SessiondSlotHealth["orphanReason"];
+  stdoutFramer?: ReturnType<typeof createLineFramer>;
 }
 
 interface ConnectionState {
@@ -78,6 +79,8 @@ class SessiondError extends Error {
   constructor(
     readonly code: NonNullable<SessiondResponse["error"]>["code"],
     message: string,
+    readonly processCode?: string,
+    readonly syscall?: string,
   ) {
     super(message);
   }
@@ -128,12 +131,18 @@ function parseSpawnParams(raw: unknown): SessiondSpawnParams {
     }
     env[key] = noNul(item, `spawn env ${key}`);
   }
+  if (value.initialStdinBase64 !== undefined && typeof value.initialStdinBase64 !== "string") {
+    throw new SessiondError("invalid_request", "spawn initialStdinBase64 must be a string");
+  }
   return {
     slot,
     executable: noNul(value.executable, "spawn executable"),
     args,
     cwd: noNul(value.cwd, "spawn cwd"),
     env,
+    ...(typeof value.initialStdinBase64 === "string"
+      ? { initialStdinBase64: value.initialStdinBase64 }
+      : {}),
   };
 }
 
@@ -410,7 +419,12 @@ export class SessiondServer {
         v: SESSIOND_PROTOCOL_VERSION,
         id,
         ok: false,
-        error: { code: known.code, message: known.message },
+        error: {
+          code: known.code,
+          message: known.message,
+          ...(known.processCode ? { processCode: known.processCode } : {}),
+          ...(known.syscall ? { syscall: known.syscall } : {}),
+        },
       });
     }
   }
@@ -446,13 +460,34 @@ export class SessiondServer {
         shell: false,
         stdio: ["pipe", "pipe", "pipe"],
       });
-    } catch {
-      throw new SessiondError("spawn_failed", "spawn failed before a child was created");
+    } catch (error) {
+      const cause = error as NodeJS.ErrnoException;
+      throw new SessiondError(
+        "spawn_failed",
+        "spawn failed before a child was created",
+        cause.code,
+        "spawn",
+      );
     }
-    // `spawn()` reports ENOENT asynchronously. Until the slot is fully
-    // admitted, absorb that raw OS error; the caller receives a closed,
-    // path-free spawn_failed diagnostic below.
-    child.once("error", () => undefined);
+    // #583: ENOENT is asynchronous. Attach BOTH the permanent absorber and
+    // the typed admission listener synchronously, before the first await. The
+    // raw Node error contains path + spawnargs, so it must never escape this
+    // supervisor boundary; one failed slot is refused and all others run.
+    child.on("error", () => undefined);
+    const admitted = new Promise<void>((resolve, reject) => {
+      child.once("spawn", resolve);
+      child.once("error", (error: NodeJS.ErrnoException) => reject(new SessiondError(
+        "spawn_failed",
+        "spawn failed before the child became ready",
+        error.code,
+        "spawn",
+      )));
+    });
+    try {
+      await admitted;
+    } catch (error) {
+      throw error;
+    }
     const pid = child.pid;
     if (!pid) {
       child.kill("SIGKILL");
@@ -465,9 +500,36 @@ export class SessiondServer {
       child.kill("SIGKILL");
       throw new SessiondError("spawn_failed", "spawned child identity could not be verified");
     }
-    const entry: SlotEntry = { slot: params.slot, child, pid, identity, attached: true };
+    const entry: SlotEntry = {
+      slot: params.slot,
+      child,
+      pid,
+      identity,
+      attached: true,
+      stdoutFramer: createLineFramer(),
+    };
     this.slots.set(params.slot, entry);
     this.attachChild(entry, child);
+    if (params.initialStdinBase64 !== undefined) {
+      let initial: Buffer;
+      try {
+        initial = Buffer.from(params.initialStdinBase64, "base64");
+        if (initial.toString("base64") !== params.initialStdinBase64) throw new Error("invalid base64");
+      } catch {
+        child.kill("SIGKILL");
+        throw new SessiondError("invalid_request", "spawn initialStdinBase64 is invalid");
+      }
+      if (initial.length > MAX_WRITE_BYTES) {
+        child.kill("SIGKILL");
+        throw new SessiondError("invalid_request", "spawn initial stdin exceeds the 8 MiB limit");
+      }
+      try {
+        child.stdin.write(initial);
+      } catch {
+        child.kill("SIGKILL");
+        throw new SessiondError("write_failed", "spawn bootstrap failed before bytes were accepted");
+      }
+    }
     await this.persist();
     return { slot: params.slot, pid };
   }
@@ -475,7 +537,9 @@ export class SessiondServer {
   private attachChild(entry: SlotEntry, child: ChildProcessWithoutNullStreams): void {
     child.stdout.on("data", (chunk: Buffer) => {
       entry.lastStdoutAt = Date.now();
-      this.publish(entry.slot, "stdout", { dataBase64: chunk.toString("base64") }, entry.lastStdoutAt);
+      for (const line of entry.stdoutFramer?.push(chunk.toString()) ?? []) {
+        this.publish(entry.slot, "stdout", { dataBase64: Buffer.from(line).toString("base64") }, entry.lastStdoutAt);
+      }
     });
     // The supervisor must drain fd 2 even while no control plane is attached;
     // otherwise a full pipe blocks the child and manufactures a hang.
@@ -491,6 +555,8 @@ export class SessiondServer {
       void this.persist().catch(() => undefined);
     });
     child.on("exit", (code, signal) => {
+      const tail = entry.stdoutFramer?.flush();
+      if (tail) this.publish(entry.slot, "stdout", { dataBase64: Buffer.from(tail).toString("base64") });
       entry.exitCode = code;
       entry.signal = signal as NodeJS.Signals | null;
       this.backpressured.delete(entry.slot);

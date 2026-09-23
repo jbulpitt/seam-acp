@@ -29,7 +29,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import type { AdapterRuntimeDescriptor } from "@seam/adapters";
+import { AGY_EXECUTABLE_LABELS, type AdapterRuntimeDescriptor } from "@seam/adapters";
 import { PresetsFileSchema } from "../config.js";
 import { renderCatalogEvidenceLines } from "./catalog-evidence-render.js";
 import { uniqueBridgeId } from "./bridge-pairing.js";
@@ -384,7 +384,7 @@ export function safeNativeAgyRuntimeProvenance(runtime: AdapterRuntimeDescriptor
 } {
   if (
     runtime.topology !== "virtual-acp-native-cli" ||
-    runtime.executable !== "managed-artifact" ||
+    !AGY_EXECUTABLE_LABELS.includes(runtime.executable) ||
     runtime.cwd !== "session-workspace" ||
     runtime.cwdPolicy !== "session" ||
     runtime.argv.length !== 0 ||

@@ -45,6 +45,7 @@ const record = (over: Partial<SessionRecord> = {}): SessionRecord => ({
 });
 
 function makeOrch(opts?: {
+  isBusy?: boolean;
   enabled?: boolean;
   getThreadLiveState?: (ch: { id: string }) => Promise<{ locked: boolean; archived: boolean } | undefined>;
   loadSession?: ReturnType<typeof vi.fn<(opts: { sessionId: string }) => Promise<{ sessionId: string }>>>;
@@ -97,6 +98,7 @@ function makeOrch(opts?: {
       },
     }),
     hasRuntime: () => true,
+    isBusy: vi.fn(() => opts?.isBusy ?? false),
     abortTurn: vi.fn(async () => "cancelled"),
     invalidate: vi.fn(async () => {}),
     killAll: vi.fn(async () => 1),
@@ -907,5 +909,62 @@ describe("finishLiveTurn is not invoked by dispose helpers", () => {
       finishedUtc: new Date().toISOString(),
     });
     expect(await listLiveMarkers(dir)).toHaveLength(0);
+  });
+});
+
+describe("#588 a message arriving during the post-turn tail is not an interruption", () => {
+  /**
+   * Observed live 2026-09-23 on thread 1516907689874161764, every single turn.
+   *
+   * The guard for "is a turn running" was `channelQueues.has(channelId)`, which
+   * answers "does this channel hold an unresolved queue link". That stays true
+   * through the whole POST-TURN TAIL — finalization, delivery, report-back —
+   * measured at one to three minutes after the agent turn logged `turn timing`
+   * and the user had already read the answer.
+   *
+   * So replying promptly was classified as interrupting a running turn. The
+   * abort then tore down the tail that was about to settle the status card:
+   * the card stayed Working forever, and the next prompt queued behind an abort
+   * of a turn that had already finished. It repeated on every turn.
+   */
+  function primeQueueLink(orch: unknown, channelId: string): void {
+    // A resolved link is exactly the post-turn tail shape: `has()` is true,
+    // nothing is executing.
+    (orch as { channelQueues: Map<string, Promise<void>> })
+      .channelQueues.set(channelId, Promise.resolve());
+  }
+
+  it("queues instead of aborting when no agent prompt is in flight", async () => {
+    const { orch } = makeOrch({ isBusy: false, handleInner: async () => {} });
+    primeQueueLink(orch, "chan-tail");
+    const router = (orch as unknown as { router: { abortTurn: ReturnType<typeof vi.fn> } }).router;
+
+    await (orch as unknown as { handleIncomingMessage: (m: unknown) => Promise<void> })
+      .handleIncomingMessage({
+        messageId: "1552300000000000001",
+        channel: { platform: "discord", id: "chan-tail" },
+        authorId: "u1",
+        text: "next prompt",
+      });
+
+    // The tail is not a turn. Nothing to cancel.
+    expect(router.abortTurn).not.toHaveBeenCalled();
+  });
+
+  it("still aborts when an agent prompt really is in flight", async () => {
+    // The behaviour this must not regress: a genuine mid-turn interruption.
+    const { orch } = makeOrch({ isBusy: true, handleInner: async () => {} });
+    primeQueueLink(orch, "chan-live");
+    const router = (orch as unknown as { router: { abortTurn: ReturnType<typeof vi.fn> } }).router;
+
+    await (orch as unknown as { handleIncomingMessage: (m: unknown) => Promise<void> })
+      .handleIncomingMessage({
+        messageId: "1552300000000000002",
+        channel: { platform: "discord", id: "chan-live" },
+        authorId: "u1",
+        text: "stop and do this instead",
+      });
+
+    expect(router.abortTurn).toHaveBeenCalled();
   });
 });

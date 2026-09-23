@@ -2730,14 +2730,41 @@ export class Orchestrator {
         ...(channel.parentId ? { parentRef: channel.parentId } : {}),
         cwd: this.config.REPOS_ROOT,
       });
-      this.logger.info({ channelId, sessionId: record.id }, "new message arrived while turn active; aborting running turn");
-      // User intent: the new message replaces the running turn. Clear the
-      // marker at this layer (NOT dispose) so a crash mid-abort does not
-      // resume the turn the user just superseded.
-      await this.clearTurnMarkersForChannel(channelId, "cancelled");
-      // Escalate to a force-kill if the turn ignores the graceful cancel, so a
-      // hung turn can't block the new message behind it forever.
-      await this.router.abortTurn(record.id, { force: true });
+      // `channelQueues.has()` answers "does this channel hold an unresolved
+      // queue link", which stays true through the whole POST-TURN TAIL —
+      // finalization, delivery, report-back, voice. Measured on a live thread:
+      // the agent turn logged `turn timing` and the tail ran on for another
+      // one to three minutes.
+      //
+      // So a user who read the answer and replied promptly was classified as
+      // interrupting a running turn. The abort then tore down the tail that was
+      // about to settle the status card, which is why that thread's card never
+      // left Working and its next prompt always queued behind an abort. Every
+      // turn, indefinitely.
+      //
+      // Aborting is only meaningful while an agent prompt is actually in
+      // flight. Without one there is nothing to cancel, and the new message
+      // should simply queue behind the tail — which `queueOnChannel` already
+      // does correctly.
+      // Defensive read: a router without `isBusy` keeps the prior
+      // abort-always behaviour rather than silently changing it.
+      const promptInFlight =
+        typeof this.router.isBusy === "function" ? this.router.isBusy(record.id) : true;
+      if (!promptInFlight) {
+        this.logger.info(
+          { channelId, sessionId: record.id },
+          "new message arrived during the post-turn tail; queueing instead of aborting"
+        );
+      } else {
+        this.logger.info({ channelId, sessionId: record.id }, "new message arrived while turn active; aborting running turn");
+        // User intent: the new message replaces the running turn. Clear the
+        // marker at this layer (NOT dispose) so a crash mid-abort does not
+        // resume the turn the user just superseded.
+        await this.clearTurnMarkersForChannel(channelId, "cancelled");
+        // Escalate to a force-kill if the turn ignores the graceful cancel, so
+        // a hung turn can't block the new message behind it forever.
+        await this.router.abortTurn(record.id, { force: true });
+      }
     }
 
     // #88 D8: park BEFORE getOrStartRuntime when this thread is bound to a

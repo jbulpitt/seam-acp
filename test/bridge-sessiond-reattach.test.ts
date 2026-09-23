@@ -43,7 +43,7 @@ afterEach(async () => {
 });
 
 describe("#574 bridge process reattachment", () => {
-  it("completes across a restart with gap output once, ordered, and retained stdin guarded", async () => {
+  it("completes across a restart with gap output once, ordered, and retained stdin usable", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "seam-574-"));
     roots.push(root);
     await fs.chmod(root, 0o700);
@@ -68,7 +68,7 @@ describe("#574 bridge process reattachment", () => {
           }
           if (frame.type !== "input") continue;
           const text = Buffer.from(frame.dataBase64, "base64").toString();
-          if (text.includes("must-not-reach-child")) out("UNSAFE-RESEND\\n");
+          if (text.includes("post-restart-resume")) out("RESUMED\\n");
           if (!text.includes("begin")) continue;
           out("before\\n");
           setTimeout(() => out("gap-1\\n"), 100);
@@ -98,15 +98,16 @@ describe("#574 bridge process reattachment", () => {
     const second = bridgeProcess([socketPath, childPath, "second", String(before.seq)]);
     const rebound = await message(second, "rebound");
     expect(rebound.alive).toBe(true);
-    expect(rebound.accepted).toBe(false);
-    expect(rebound.frames.map((frame: { data?: string }) => frame.data).filter(Boolean)).toEqual([
-      "gap-1\n",
-      "gap-2\n",
-    ]);
+    expect(rebound.accepted).toBe(true);
+    const reboundData = rebound.frames.map((frame: { data?: string }) => frame.data).filter(Boolean);
+    // The gap frames still replay exactly once, in order.
+    expect(reboundData.slice(0, 2)).toEqual(["gap-1\n", "gap-2\n"]);
+    // And the post-restart write reached the retained child. #584 refused this,
+    // which left a restarted thread unable to accept a prompt ever again.
+    expect(reboundData).toContain("RESUMED\n");
     const live = await message(second, "live");
     expect(live.data).toBe("after\n");
     expect(live.seq).toBeGreaterThan(rebound.frames.at(-1).seq);
-    expect(JSON.stringify([rebound, live])).not.toContain("UNSAFE-RESEND");
     await new Promise<void>((resolve) => second.once("exit", () => resolve()));
 
     const observer = await SessiondClient.connect(socketPath);

@@ -47,7 +47,7 @@ if (phase === "first") {
   await slots.writeInput(7, "begin\n");
 } else {
   const listed = await slots.rebind();
-  const accepted = await slots.writeInput(7, "must-not-reach-child\n");
+  const accepted = await slots.writeInput(7, "post-restart-resume\n");
   const replay = await slots.replay(7, Number(rawCursor));
   report({
     type: "rebound",

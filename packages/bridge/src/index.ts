@@ -180,8 +180,8 @@ async function loadWs(): Promise<{ WebSocket: WsCtor; WebSocketServer: WssCtor }
 
 /**
  * Create the restartable control-plane view of sessiond-owned slots.
- * New slots are admitted lazily on first input; retained slots rebind as
- * output-only and survive both websocket and bridge-process restarts.
+ * New slots are admitted lazily on first input; retained slots rebind fully
+ * usable and survive both websocket and bridge-process restarts.
  */
 async function makeSlotManager(opts: {
   copilotCmd: string;
@@ -494,9 +494,7 @@ async function makeSlotManager(opts: {
         result = await collectHangEvidence({
           id,
           writeLine: async (line) => {
-            if (!await supervised.writeInput(slot, line)) {
-              throw new Error("probeHang: retained slot is output-only after bridge restart");
-            }
+            await supervised.writeInput(slot, line);
           },
           response,
           sockets: () => readLiveProviderSocket(health.pid ?? undefined),

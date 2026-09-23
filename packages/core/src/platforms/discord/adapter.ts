@@ -36,6 +36,7 @@ import {
   type MessageCreateOptions,
   type VoiceBasedChannel,
   type VoiceState,
+  type APIEmbed,
 } from "discord.js";
 import {
   VoiceConnectionStatus,
@@ -74,8 +75,9 @@ import type {
   MessageAttachment,
   MessageRef,
 } from "../chat-adapter.js";
-import type { PanelButton, StructuredPanel } from "../../core/types.js";
+import type { PanelButton, StructuredPanel, TurnState } from "../../core/types.js";
 import { clampPanelForDiscord } from "../../core/panel-limits.js";
+import { discordStatusColor } from "./renderer.js";
 import {
   CHOICE_CUSTOM_ID_PREFIX,
   CHOICE_CUSTOM_TEXT_MAX,
@@ -404,6 +406,46 @@ export function classifyDiscordInteraction(interaction: {
   if (cid.startsWith(CHOICE_CUSTOM_ID_PREFIX)) return "choice";
   if (cid.startsWith("seam-elicit:")) return "elicitation";
   return "none";
+}
+
+const STATUS_STATES: readonly TurnState[] = [
+  "Working", "Done", "Failed", "Timed out", "Waiting", "Monitoring",
+];
+
+/** Patch only the state/action facts on the embed Discord already stores.
+ * The old process's model, repo, elapsed time and observations are preserved;
+ * inventing a replacement TurnStatus after restart would be less truthful.
+ * Applying the same projection twice produces the same embed. */
+export function projectDiscordStatusEmbed(
+  source: APIEmbed,
+  projection: { state: TurnState; action: string }
+): APIEmbed {
+  const projected: APIEmbed = {
+    ...source,
+    color: discordStatusColor(projection.state),
+    fields: [...(source.fields ?? [])],
+  };
+  if (source.title) {
+    const suffix = STATUS_STATES.find(state => source.title === state || source.title?.endsWith(` · ${state}`));
+    projected.title = suffix && source.title.endsWith(` · ${suffix}`)
+      ? `${source.title.slice(0, -suffix.length)}${projection.state}`
+      : projection.state;
+  } else if (source.author) {
+    projected.author = { ...source.author, name: projection.state };
+  } else {
+    projected.title = projection.state;
+  }
+  const actionIndex = projected.fields!.findIndex(field => field.name === "Action");
+  const field = {
+    name: "Action",
+    value: projection.action,
+    ...(actionIndex >= 0 && projected.fields![actionIndex]!.inline !== undefined
+      ? { inline: projected.fields![actionIndex]!.inline }
+      : { inline: true }),
+  };
+  if (actionIndex >= 0) projected.fields![actionIndex] = field;
+  else projected.fields!.push(field);
+  return projected;
 }
 
 /**
@@ -1798,6 +1840,17 @@ export class DiscordAdapter implements ChatAdapter {
       payload.attachments = [];
     }
     await ch.messages.edit(message.id, payload);
+  }
+
+  async editStatusPanelProjection(
+    message: MessageRef,
+    projection: { state: TurnState; action: string }
+  ): Promise<void> {
+    const ch = await this.fetchSendableChannel(message.channel.id);
+    const msg = await ch.messages.fetch(message.id);
+    const source = msg.embeds[0]?.toJSON();
+    if (!source) throw new Error("persisted status card has no embed");
+    await msg.edit({ embeds: [projectDiscordStatusEmbed(source, projection)] });
   }
 
   async sendLayout(

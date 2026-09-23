@@ -51,6 +51,7 @@ function setup() {
     sendMessage: vi.fn(async (channel: any, _text: string, _delivery?: unknown) => ({ channel, id: "message" })),
     sendFile: vi.fn(async () => {}),
     findMessageByNonce: vi.fn(async (): Promise<DeliveryNonceLookup> => ({ status: "absent" })),
+    editStatusPanelProjection: vi.fn(async () => {}),
     editPanel: vi.fn(async () => {}), editMessage: vi.fn(async () => {}) };
   const config = { DATA_DIR: dir, REPOS_ROOT: "/synthetic", TURN_TIMEOUT_SECONDS: 60,
     DEFAULT_MODEL: "test", REPO_EMOJIS: new Map(), SEAM_TURN_RESUME_ENABLED: true,
@@ -260,7 +261,49 @@ describe("#250 human turn production pipeline, synthetic transport only", () => 
     expect(String(h.runtime.prompt.mock.calls[1]?.[0])).not.toContain("NEW NEVER-SUBMITTED");
     expect(h.router.getOrStartRuntime.mock.calls.at(-1)?.[1]).toEqual({ resumeSessionId: "recorded-acp" });
     expect(h.store.turnAttempts.get("inbound-1")).toMatchObject({ state: "completed", generation: 2, deliveryDone: true });
+    // Protects the durable card binding: deleting it posts a replacement panel
+    // after restart and leaves the original admission card permanently amber.
+    expect(h.adapter.sendPanel).toHaveBeenCalledTimes(1);
     expect(await listLiveMarkers(h.dir)).toEqual([]);
+  });
+
+  it("projects a terminal durable outcome onto its persisted card with no live panel", async () => {
+    const h = setup();
+    const attempts = h.store.turnAttempts;
+    attempts.registerOwner("pre-restart-owner");
+    const attempt = attempts.claim({
+      id: "inbound-1",
+      target: "worker",
+      prompt: "ORIGINAL DISPOSABLE WORK",
+      session: "live",
+      kind: "parked",
+      createdUtc: new Date().toISOString(),
+    }, "synthetic-identity", "pre-restart-owner", "inbound");
+    (attempts as unknown as {
+      bindStatusCard(a: typeof attempt, ref: { channelId: string; messageId: string }): void;
+    }).bindStatusCard(attempt, { channelId: "worker", messageId: "persisted-panel" });
+    expect(attempts.complete(attempt, {
+      id: attempt.id,
+      target: "worker",
+      status: "completed",
+      stopReason: "end_turn",
+      finishedUtc: new Date().toISOString(),
+    })).toBe(true);
+    attempts.markDeliveryDone(attempt.id);
+    h.adapter.sendPanel.mockClear();
+    h.adapter.editStatusPanelProjection.mockClear();
+
+    await h.make().recoverInterruptedTurns();
+
+    // Protects the restart-only route from depending on an in-memory
+    // TurnStatus: the new process did not create a panel, yet the exact
+    // persisted Discord message received the ledger's immutable outcome.
+    expect(h.adapter.sendPanel).not.toHaveBeenCalled();
+    expect(h.adapter.editStatusPanelProjection).toHaveBeenCalledWith(
+      { channel: { platform: "discord", id: "worker" }, id: "persisted-panel" },
+      { state: "Done", action: "end_turn" }
+    );
+    expect(h.store.getInbound("1")?.state).toBe("completed");
   });
 
   it("does not transparently replay an owned original prompt on transport failure", async () => {

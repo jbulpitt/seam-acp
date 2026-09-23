@@ -22,6 +22,7 @@ const base = (): TurnAttempt => ({
   runtimeOwner: null,
   providerIdentity: "synthetic",
   source: "inbound",
+  statusCard: null,
   deliveryDone: false,
   deliveryProtocol: false,
   deliveryNonce: null,

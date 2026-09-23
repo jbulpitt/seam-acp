@@ -52,7 +52,7 @@ function setup(location: string, existing = true, failAt: "spawn" | "selection" 
     defaultAgentId: "claude", defaultModel: "original", threadPresets: new Map([["worker", { location }]]), ...(location === "local" ? {} : {
       seamMcp: { getPort: () => undefined, isRemoteSession: () => true, bindSessionLocation: vi.fn(), muxForSession: () => mux } as unknown as SeamMcpWiring,
     }) });
-  return { make, get store() { return store; }, localSpawns, remoteSpawns, select, load, create, prompt,
+  return { make, profile, metadata, get store() { return store; }, localSpawns, remoteSpawns, select, load, create, prompt,
     reopen: () => { store.close(); store = new SessionStore(db); } };
 }
 
@@ -141,5 +141,36 @@ describe("production acquisition with persisted model selection", () => {
     expect(h.localSpawns.mock.calls.map(c => c[0])).toEqual(["original"]);
     expect(h.store.readConfig(h.store.get("discord:worker")!).modelAcquisition).toBeUndefined();
     await rt.dispose();
+  });
+  it("does not use an original-model sample to shrink history after a larger substitution", async () => {
+    const h = setup("local", true, "selection");
+    const models = h.profile.staticModels as Array<{ modelId: string; name: string; contextLimit: number }>;
+    models[1]!.contextLimit = 2_000_000;
+    h.metadata[1]!.context_window = 2_000_000;
+    models.push({ modelId: "smaller", name: "smaller", contextLimit: 1_000_000 });
+    h.metadata.push({ ...h.metadata[1]!, id: "smaller", name: "smaller", context_window: 1_000_000 });
+    const rt = await h.make().getOrStartRuntime(h.store.get("discord:worker")!, { resumeSessionId: "history" });
+    await rt.dispose(); h.reopen(); h.localSpawns.mockClear();
+    h.select.mockImplementation(async ({ value }) => {
+      if (value === "sibling") throw rejection();
+      return { configOptions: [] };
+    });
+    // Die after durably advancing past the larger model, before checking the
+    // smaller candidate. The next process must retain the larger history bound.
+    const upsert = h.store.upsert.bind(h.store);
+    vi.spyOn(h.store, "upsert").mockImplementation(row => {
+      upsert(row);
+      const state = h.store.readConfig(row).modelAcquisition;
+      if (state?.index === 1 && state.phase === "trying") throw new Error("crash after rejection");
+    });
+    await expect(h.make().getOrStartRuntime(h.store.get("discord:worker")!, { resumeSessionId: "history" }))
+      .rejects.toThrow("crash after rejection");
+    h.reopen();
+    await expect(h.make().getOrStartRuntime(h.store.get("discord:worker")!, { resumeSessionId: "history" }))
+      .rejects.toMatchObject({ acquisitionRecoveryExhausted: true });
+    expect(h.localSpawns.mock.calls.map(c => c[0])).toEqual(["sibling"]);
+    expect(h.store.readConfig(h.store.get("discord:worker")!).modelAcquisition?.plan.requiredContextTokens).toBe(2_000_000);
+    expect(h.create).not.toHaveBeenCalled();
+    expect(h.prompt).not.toHaveBeenCalled();
   });
 });

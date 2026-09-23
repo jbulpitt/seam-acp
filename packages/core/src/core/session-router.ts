@@ -1368,10 +1368,17 @@ export class SessionRouter {
     // A later valid usage sample can increase it, never make a stale selection
     // authorize a smaller model. Unrelated usage is already rejected by the
     // context-budget identity helper in planRuntimeSpawn.
-    const floor = Math.max(plan.fallbackContextTokens ?? 0, saved?.plan.requiredContextTokens ?? 0, selectedBudget) || null;
+    // After a move to a larger model, the last sample may still describe the
+    // ORIGINAL model. Without usage matched to the selected model/session,
+    // its full window is the conservative bound; the old sample cannot grant
+    // a subsequent smaller substitution. Carry that bound through trying as
+    // well, so another restart during load does not forget it.
+    const resumedCapacity = selectedBudget || selected?.contextWindow || 0;
+    const floor = Math.max(plan.fallbackContextTokens ?? 0, saved?.plan.requiredContextTokens ?? 0, resumedCapacity) || null;
     const fallbacks = this.planModelFallbacks({ agentId: plan.agentId, location: plan.location }, plan.model, plan.effort, floor);
     const acquired = await acquireWithModelFallback({
-      identity, plan: fallbacks, saved,
+      identity, plan: fallbacks,
+      saved: saved ? { ...saved, plan: { ...saved.plan, requiredContextTokens: floor } } : undefined,
       save: state => {
         const live = this.store.get(record.id) ?? record;
         if (live.acpSessionId !== record.acpSessionId || configIdentity(live) !== admittedConfig) {

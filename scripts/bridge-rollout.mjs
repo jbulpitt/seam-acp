@@ -3,7 +3,7 @@ import { randomBytes } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { activationRefusal, buildArtifact, firstActivationFromBaselineAllowed, commandRunner, loadTargetMap, makeScpCommand, makeSshCommand, parseArgs, parseKeyValues, renderRemoteScript, resolveTarget, runActivation, runPreflight } from "./lib/bridge-rollout.mjs";
-import { blockingOnly, collectBlockers, describeTargetFleet, fleetRunExitCode, formatBlockers, formatFleetCoverage, formatFleetRunSummary, loadBridgeRegistry, makeReachabilityProbe, partitionReachability, planFleetRun } from "./lib/bridge-fleet.mjs";
+import { assertTargetRegistered, blockingOnly, collectBlockers, describeTargetFleet, fleetRunExitCode, formatBlockers, formatFleetCoverage, formatFleetRunSummary, loadBridgeRegistry, makeReachabilityProbe, partitionReachability, planFleetRun } from "./lib/bridge-fleet.mjs";
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(scriptDir, "..");
@@ -212,6 +212,7 @@ async function main() {
   if (options.all) return runFleet({ targets, fleet, options, remoteScript });
 
   const target = resolveTarget(targets, options.target);
+  assertTargetRegistered(fleet, target.bridgeId);
   const preflight = await preflightOnce(target, remoteScript);
   process.stdout.write(preflight.raw.stdout);
 

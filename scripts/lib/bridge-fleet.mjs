@@ -24,29 +24,53 @@ export function describeTargetFleet(targets, registered = new Set(targets.keys()
   const missingTargets = [...registered].filter((id) => !targetIds.has(id)).sort();
   const unregisteredTargets = [...targetIds].filter((id) => !registered.has(id)).sort();
 
-  // This refuses only a fleet-wide rollout/preflight claim. Bridges, adapters,
-  // single-host dispatch, and every already-running host keep serving. The
-  // reachable incident is #413: plex-server and rhc-server existed only in the
-  // live registry, so five "all hosts" checks silently never considered them.
-  if (missingTargets.length || unregisteredTargets.length) {
-    const parts = [];
-    if (missingTargets.length) parts.push(`registered bridge(s) absent from targets.json: ${missingTargets.join(", ")}`);
-    if (unregisteredTargets.length) parts.push(`targets.json host(s) absent from the bridge registry: ${unregisteredTargets.join(", ")}`);
-    throw new Error(`bridge fleet registry divergence: ${parts.join("; ")}`);
-  }
+  // #413 is why divergence must never be silent: plex-server and rhc-server
+  // existed only in the live registry, so five "all hosts" checks quietly
+  // never considered them. The answer to a silent gap is LOUD, not STOPPED.
+  //
+  // Refusing the whole fleet because one host diverges punishes nine healthy
+  // machines for one anomaly, and a retired host or an unreachable laptop is
+  // an ordinary state, not an emergency. `cli-health-report.mjs` already got
+  // this right with `unchecked-registry-divergence`: narrow the scope to the
+  // affected host and keep going. This now matches it.
+  //
+  // Divergent hosts are reported, excluded from managed scope, and named in
+  // every coverage line, so a run can never claim coverage it does not have.
+  // A caller that targets a divergent host specifically still fails — the
+  // thing #413 actually needed was that you cannot operate on a host whose
+  // registration you do not understand.
+  const diverged = [
+    ...missingTargets.map((id) => ({ id, reason: "registered bridge absent from targets.json" })),
+    ...unregisteredTargets.map((id) => ({ id, reason: "targets.json host absent from the bridge registry" })),
+  ].sort((a, b) => a.id.localeCompare(b.id));
 
   const rolloutManaged = [];
   const rolloutExcluded = [];
   for (const id of [...registered].sort()) {
+    if (!targetIds.has(id)) continue; // diverged; reported below, never managed
     const target = targets.get(id);
     if (target.rolloutEnabled) rolloutManaged.push(id);
     else rolloutExcluded.push({ id, reason: target.unmanagedReason });
   }
+  for (const row of diverged) rolloutExcluded.push({ id: row.id, reason: `registry divergence: ${row.reason}` });
+
   return Object.freeze({
     registered: Object.freeze([...registered].sort()),
     rolloutManaged: Object.freeze(rolloutManaged),
-    rolloutExcluded: Object.freeze(rolloutExcluded.map((row) => Object.freeze(row))),
+    rolloutExcluded: Object.freeze(rolloutExcluded.sort((a, b) => a.id.localeCompare(b.id)).map((row) => Object.freeze(row))),
+    diverged: Object.freeze(diverged.map((row) => Object.freeze(row))),
   });
+}
+
+/** Refuse ONLY when the host being operated on is itself divergent. */
+export function assertTargetRegistered(fleet, targetId) {
+  const row = fleet.diverged.find((d) => d.id === targetId);
+  if (row) {
+    throw new Error(
+      `bridge fleet registry divergence for ${targetId}: ${row.reason}. ` +
+      `Other hosts are unaffected and remain operable.`
+    );
+  }
 }
 
 export function formatFleetCoverage(fleet, selectedHost = null) {

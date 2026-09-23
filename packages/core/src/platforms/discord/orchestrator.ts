@@ -605,6 +605,11 @@ import {
 
 const STATUS_EDIT_DEBOUNCE_MS = 2500;
 const STATUS_HEARTBEAT_MS = 5000;
+// A status card must not claim Done while its separate output queue is still
+// delivering. Five seconds matches the adjacent session-update drain guard:
+// after that, refuse only the claim of complete presentation, never settlement
+// of the turn, answer ledger, or report-back (#576/#423).
+export const DISPATCH_OUTPUT_DRAIN_TIMEOUT_MS = 5_000;
 const PLATFORM = "discord";
 
 const CONFIG_SET_FIELD_NAMES = [
@@ -10345,22 +10350,44 @@ export class Orchestrator {
       // throw in the visibility/finalize code below can never leak the flag.
       const wasInterrupted = this.interruptedDispatches.delete(spec.id) || result.cancelled === true;
 
-      // Finalize the STATUS PANEL to its terminal state. It is an INDEPENDENT
-      // message from the plain-output stream (its own throttle + SerialQueue), so
-      // it settles on its own. Carries the final context/elapsed/tools already
-      // accumulated on the TurnStatus. Best-effort — a panel edit failure never
-      // affects the answer delivery / report-back below.
+      // The STATUS PANEL and plain-output stream have independent SerialQueues.
+      // Drain the complete visible messages path first: `runtime.idle()` above
+      // only drains ACP session updates, not StreamingMessageRenderer. A bounded
+      // wait prevents a stuck Discord send from recreating #423 (forever-Working
+      // cards). On timeout/failure the card says that OUTPUT delivery did not
+      // settle; answer persistence and report-back below still proceed.
+      let messagesPresentationStarted = false;
+      let outputPresentation: "delivered" | "timed_out" | "failed" = "delivered";
+      if (msgRenderer && statusPanel) {
+        messagesPresentationStarted = true;
+        outputPresentation = await this.awaitDispatchOutputPresentation(
+          this.finalizeMessagesStream(target, spec, msgRenderer, result, panelRef, header, showHeader),
+          spec.id
+        );
+      }
+
+      // Finalize the STATUS PANEL to its terminal state only after presentation
+      // settles or reaches its bound. Best-effort remains one-way: a panel edit
+      // failure never affects the answer delivery / report-back below.
       if (statusPanel) {
         const finalState: TurnState = result.timedOut
           ? "Timed out"
           : result.error
             ? "Failed"
-            : "Done";
+            : outputPresentation === "timed_out"
+              ? "Timed out"
+              : outputPresentation === "failed"
+                ? "Failed"
+                : "Done";
         const finalAction = result.timedOut
           ? `Timed out after ${this.config.TURN_TIMEOUT_SECONDS}s`
           : result.error
             ? result.error.slice(0, 200)
-            : (result.stopReason || "Completed");
+            : outputPresentation === "timed_out"
+              ? `Output delivery still pending after ${DISPATCH_OUTPUT_DRAIN_TIMEOUT_MS / 1000}s`
+              : outputPresentation === "failed"
+                ? "Output delivery failed; turn completed"
+                : (result.stopReason || "Completed");
         await statusPanel.finalize(finalState, finalAction).catch((err) =>
           this.logger.warn({ err, dispatch: spec.id }, "dispatch: status panel finalize failed")
         );
@@ -10373,7 +10400,12 @@ export class Orchestrator {
       if (msgRenderer) {
         // "messages" style: the OUTPUT already streamed as fresh real messages;
         // drain the tail, surface any error / empty line, flip the ▶ indicator.
-        await this.finalizeMessagesStream(target, spec, msgRenderer, result, panelRef, header, showHeader);
+        // With a status panel this already started above. A timed-out promise
+        // keeps draining in the background; awaiting it again would defeat the
+        // settlement bound and strand report-back.
+        if (!messagesPresentationStarted) {
+          await this.finalizeMessagesStream(target, spec, msgRenderer, result, panelRef, header, showHeader);
+        }
       } else if (streamPanel && panelRef) {
         await this.finalizeDispatchStream(target, spec, streamPanel, streamState, result);
       } else if (statelessCard) {
@@ -11957,6 +11989,41 @@ export class Orchestrator {
         this.logger.warn({ err, dispatch: spec.id }, "dispatch: stream indicator finalize failed");
       }
     }
+  }
+
+  /** Bound the display-only queue without cancelling it. The renderer retains
+   * ownership and may finish after this returns; the dispatch must still settle.
+   * Rejections are observed even after timeout, so background completion cannot
+   * become an unhandled rejection. */
+  private async awaitDispatchOutputPresentation(
+    presentation: Promise<void>,
+    dispatchId: string
+  ): Promise<"delivered" | "timed_out" | "failed"> {
+    const guarded = presentation.then(
+      () => ({ status: "delivered" as const }),
+      (err) => ({ status: "failed" as const, err })
+    );
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timedOut = new Promise<{ status: "timed_out" }>((resolve) => {
+      timer = setTimeout(() => resolve({ status: "timed_out" }), DISPATCH_OUTPUT_DRAIN_TIMEOUT_MS);
+      if (typeof timer.unref === "function") timer.unref();
+    });
+    const outcome = await Promise.race([guarded, timedOut]);
+    if (timer) clearTimeout(timer);
+    if (outcome.status === "failed") {
+      this.logger.warn({ err: outcome.err, dispatch: dispatchId }, "dispatch: output presentation failed before status settlement");
+    } else if (outcome.status === "timed_out") {
+      this.logger.warn(
+        { dispatch: dispatchId, timeoutMs: DISPATCH_OUTPUT_DRAIN_TIMEOUT_MS },
+        "dispatch: output presentation still pending at status settlement"
+      );
+      void guarded.then((late) => {
+        if (late.status === "failed") {
+          this.logger.warn({ err: late.err, dispatch: dispatchId }, "dispatch: output presentation failed after settlement timeout");
+        }
+      });
+    }
+    return outcome.status;
   }
 
   /** Build the streaming/indicator panel for a dispatch. `done: false` renders

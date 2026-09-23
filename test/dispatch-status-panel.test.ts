@@ -291,6 +291,94 @@ afterEach(() => {
 });
 
 describe("dispatchInjectTurn: status panel ON (default)", () => {
+  it("does not turn the panel Done until the queued output message is delivered", async () => {
+    const order: string[] = [];
+    let releaseOutput!: () => void;
+    const outputGate = new Promise<void>((resolve) => { releaseOutput = resolve; });
+    const rt = fakeRuntime({ text: ["answer still queued for Discord"] });
+    const { adapter, calls } = spyAdapter();
+    adapter.sendMessage = async (channel, text) => {
+      order.push("output-started");
+      await outputGate;
+      order.push("output-delivered");
+      const ref = { channel, id: `msg-txt-${calls.sendMessage.length + 1}` };
+      calls.sendMessage.push({ channel, text, ref });
+      return ref;
+    };
+    adapter.editPanel = async (ref, panel) => {
+      calls.editPanel.push({ ref, panel });
+      if (panel.title.includes("· Done")) order.push("panel-done");
+    };
+    const orch = makeOrch({ dataDir, rt, adapter });
+
+    const turn = orch.dispatchInjectTurn(baseSpec());
+    await vi.waitFor(() => expect(order).toContain("output-started"));
+    expect(order).not.toContain("panel-done");
+    releaseOutput();
+    await turn;
+
+    expect(order.indexOf("output-delivered")).toBeLessThan(order.indexOf("panel-done"));
+  });
+
+  it("bounds a stuck output drain, settles honestly, and still completes the dispatch", async () => {
+    vi.useFakeTimers();
+    try {
+      let outputStarted!: () => void;
+      const started = new Promise<void>((resolve) => { outputStarted = resolve; });
+      const never = new Promise<MessageRef>(() => {});
+      const rt = fakeRuntime({ text: ["answer captured before Discord stalled"] });
+      const { adapter, calls } = spyAdapter();
+      adapter.sendMessage = async () => {
+        outputStarted();
+        return never;
+      };
+      const claim = vi.fn((entry: unknown) => entry);
+      const orch = makeOrch({ dataDir, rt, adapter, storeOverrides: { tryRecordReportBack: claim } });
+
+      const turn = orch.dispatchInjectTurn(baseSpec({ returnTo: "origin-thread" }));
+      await started;
+      await vi.advanceTimersByTimeAsync(5_000);
+      const result = await turn;
+
+      const finalPanel = calls.editPanel[calls.editPanel.length - 1]!.panel;
+      expect(finalPanel.title).toContain("📨 Handoff · Timed out");
+      expect(serializePanelText(finalPanel)).toContain("Output delivery still pending after 5s");
+      expect(result.output).toBe("answer captured before Discord stalled");
+      expect(claim).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("labels an output-presentation failure without blocking captured output", async () => {
+    const rt = fakeRuntime({ text: ["captured answer"] });
+    const { adapter, calls } = spyAdapter();
+    const orch = makeOrch({ dataDir, rt, adapter });
+    vi.spyOn(orch as any, "finalizeMessagesStream").mockRejectedValue(new Error("renderer queue failed"));
+
+    const result = await orch.dispatchInjectTurn(baseSpec());
+
+    const finalPanel = calls.editPanel[calls.editPanel.length - 1]!.panel;
+    expect(finalPanel.title).toContain("📨 Handoff · Failed");
+    expect(serializePanelText(finalPanel)).toContain("Output delivery failed; turn completed");
+    expect(result.output).toBe("captured answer");
+  });
+
+  it("keeps terminal panel edits best-effort after output delivery", async () => {
+    const rt = fakeRuntime({ text: ["answer survives panel failure"] });
+    const { adapter, calls } = spyAdapter();
+    adapter.editPanel = async (ref, panel) => {
+      calls.editPanel.push({ ref, panel });
+      if (panel.title.includes("· Done")) throw new Error("Discord refused panel edit");
+    };
+    const orch = makeOrch({ dataDir, rt, adapter });
+
+    const result = await orch.dispatchInjectTurn(baseSpec());
+
+    expect(calls.sendMessage.some((message) => message.text === "answer survives panel failure")).toBe(true);
+    expect(result.output).toBe("answer survives panel failure");
+  });
+
   it("posts the panel, omits the ▶ line, and streams the plain answer as its own real message", async () => {
     const rt = fakeRuntime({
       events: [

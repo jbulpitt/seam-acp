@@ -1184,13 +1184,10 @@ export const AGY_NO_SLASH_EXPANSION = "--disable-slash-commands";
 /** Hidden AGY launch option verified by the #503 real-binary matrix. */
 export const AGY_CSRF_FLAG = "--csrf_token";
 
-type AgyCsrfCapability = "supported" | "unsupported";
 interface AgyChildConnection {
   /** Per-child capability; absent only for an explicitly detected legacy CLI. */
   csrfToken?: string;
 }
-
-const agyCsrfCapabilities = new Map<string, AgyCsrfCapability>();
 
 function newAgyCsrfToken(): string {
   // 192 bits is ample for a loopback capability and stays below the generic
@@ -1721,9 +1718,12 @@ class AgyAgent implements Agent {
       await fs.writeFile(schemaFile, JSON.stringify(jsonSchema), { encoding: "utf8", mode: 0o600, flag: "wx" });
     }
 
-    const csrfToken = agyCsrfCapabilities.get(this.runtime.identityKey) === "unsupported"
-      ? undefined
-      : newAgyCsrfToken();
+    // Every turn gets a capability. The old conditional consulted a map that
+    // only the `agy models` probe ever wrote, and that probe could not express
+    // the question — so this read was always undefined and the branch was
+    // decoration. A real fallback belongs HERE, on the command that actually
+    // accepts the flag, if a future build ever refuses it.
+    const csrfToken = newAgyCsrfToken();
     const args = buildAgyPromptArgs({
       promptText,
       useStdin,
@@ -2603,16 +2603,27 @@ async function runAgyProbe<T>(
    * work stops rather than the wait. */
   signal?: AbortSignal,
 ): Promise<T> {
-  const attempt = async (csrfToken?: string): Promise<T> => {
+  // #503 probed CSRF capability here, on a prompt-free `agy models` child, to
+  // avoid paying for a turn. But `--csrf_token` is a MAIN-COMMAND flag: every
+  // agy build refuses it on a subcommand with Go's flag-package wording —
+  // "flags provided but not defined: -csrf_token", exit 1 — so this probe could
+  // never answer the question it was asked. Verified on 1.2.0 (pinned) and
+  // 1.2.9 (PATH); a real turn accepts the same flag happily.
+  //
+  // The probe therefore either rethrew, killing every agy turn until the
+  // durable catalog was warm again, or would have recorded "unsupported" and
+  // stripped the flag from turns that support it. Both answers are wrong, so
+  // the question is gone: probes run without a token, and capability is not
+  // learned from a command that cannot express it.
+  const attempt = async (): Promise<T> => {
     let proc: ChildProcessWithoutNullStreams;
     let stopObserving: (() => void) | undefined;
-    const childArgs = csrfToken ? [agyCsrfArg(csrfToken), ...args] : args;
+    const childArgs = args;
     try {
       return await runBoundedProbe({
         executable: "native-agy", label: "native AGY", timeoutMs, killGraceMs: 500,
         processGroup: true, allowCleanExit: true, acceptNonzeroExit,
         ...(signal ? { signal } : {}),
-        ...(csrfToken ? { sensitiveValues: [csrfToken] } : {}),
         spawnOverride: () => {
           proc = runtime.prepare(childArgs, "/tmp", { detached: true, stdio: ["pipe", "pipe", "pipe"] }).spawn() as ChildProcessWithoutNullStreams;
           return proc;
@@ -2625,7 +2636,7 @@ async function runAgyProbe<T>(
           // different lifecycle and keep their stdin transport unchanged.
           handle.stdin.end();
           stopObserving = observe?.(proc);
-          return run(handle, csrfToken ? { csrfToken } : {});
+          return run(handle, {});
         },
       });
     } finally {
@@ -2635,34 +2646,7 @@ async function runAgyProbe<T>(
   };
 
   try {
-    const capability = agyCsrfCapabilities.get(runtime.identityKey);
-    if (capability === "unsupported") return await attempt();
-    try {
-      const result = await attempt(newAgyCsrfToken());
-      agyCsrfCapabilities.set(runtime.identityKey, "supported");
-      return result;
-    } catch (error) {
-      const detail = error instanceof ProbeError ? error.detail : "";
-      // The shared credential redactor intentionally replaces the operand in
-      // `unknown flag: --csrf_token=...`, so the safe diagnostic may no longer
-      // contain the flag name. This FIRST probe differs from the established
-      // prompt-free argv by exactly one option: our CSRF flag. An unknown-flag
-      // result therefore identifies that option without retaining raw argv.
-      if (
-        capability !== undefined ||
-        !(error instanceof ProbeError) ||
-        error.code !== "exited_early" ||
-        !/\bunknown (?:flag|option)\b/i.test(detail)
-      ) {
-        throw error;
-      }
-      // Compatibility is learned on a prompt-free `models` child, so this one
-      // retry cannot duplicate a billable turn. It preserves an older working
-      // binding without inventing a version boundary. Real prompts are never
-      // retried: deleting that distinction can charge twice for one request.
-      agyCsrfCapabilities.set(runtime.identityKey, "unsupported");
-      return await attempt();
-    }
+    return await attempt();
   } catch (error) {
     // Classify the already-redacted diagnostic while it still exists, then
     // discard ALL text. `agyFailure` accepts only the closed enum, so a token,
@@ -2951,7 +2935,7 @@ export async function fetchAgyUserStatus(
     throw new Error(`RetrieveUserQuotaSummary HTTP ${lastStatus}`);
     }, undefined, false, signal);
   } finally {
-    await fs.unlink(logFile).catch(() => {});
+    /* no CLI log path is claimed for this probe */
   }
 }
 
@@ -2981,9 +2965,15 @@ export async function fetchAgyUserStatus(
  * from a session's own long-lived server.
  */
 async function fetchAgyModelCatalog(runtime: AgyLaunchRuntime): Promise<AgyCatalogEntry[]> {
-  const logFile = await newSpawnLogPath();
+  // `agy models` accepts EXACTLY -h/--help. Every other flag is refused with
+  // "flags provided but not defined" and exit 1 — verified on 1.2.0 (pinned)
+  // and 1.2.9 (PATH). This probe passed --log-file purely to own the CLI log
+  // path, then unlinked the file without ever reading it, so the flag bought
+  // nothing and cost the whole catalog: the fetch failed, ACP initialize hit
+  // its 45s budget, and every agy turn died until the durable catalog was warm
+  // again. The list we want is on stdout with no flags at all.
   try {
-    return await runAgyProbe(runtime, ["--log-file", logFile, "models"], 30_000, async (handle) => {
+    return await runAgyProbe(runtime, ["models"], 30_000, async (handle) => {
       let output = "";
       for await (const chunk of handle.stdout) output += chunk.toString();
       await handle.completed;
@@ -2999,7 +2989,7 @@ async function fetchAgyModelCatalog(runtime: AgyLaunchRuntime): Promise<AgyCatal
       })));
     });
   } finally {
-    await fs.unlink(logFile).catch(() => {});
+    /* No CLI log path is claimed for this probe, so there is nothing to remove. */
   }
 }
 

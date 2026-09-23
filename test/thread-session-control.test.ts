@@ -106,7 +106,11 @@ function harness(opts: {
   const records = new Map<string, SessionRecord>([[target.id, target], [caller.id, caller]]);
   const runtimes: SessionControlRuntime[] = [];
   const invalidated: string[] = [];
-  const invalidationOptions: Array<{ clearStartFailure?: boolean } | undefined> = [];
+  const invalidationOptions: Array<{
+    clearAcpSession?: boolean;
+    clearStartFailure?: boolean;
+    operatorIntent?: "replace-session";
+  } | undefined> = [];
   const mutations: SessionConfigChanges[] = [];
   const overlays: Array<{
     agent?: string | null;
@@ -370,6 +374,8 @@ describe("ThreadSessionControlService", () => {
       newSessionId: "session-new-1",
       runtimeReloaded: false,
     });
+    // Removing the intent tag makes agent switches strand the outgoing session's work.
+    expect(h.invalidationOptions).toEqual([{ operatorIntent: "replace-session" }]);
     expect(h.overlays[0]).toEqual({ agent: "codex", model: "gpt-old", effort: "default" });
   });
 
@@ -459,6 +465,8 @@ describe("ThreadSessionControlService", () => {
       model: "claude-old",
     });
     expect(h.invalidated).toEqual([h.target.id]);
+    // Removing the intent tag leaves old-session dispatches eligible for boot warnings forever.
+    expect(h.invalidationOptions).toEqual([{ operatorIntent: "replace-session" }]);
     expect(h.mutations).toEqual([]);
     expect(h.applyThreadName).toHaveBeenCalledOnce();
   });

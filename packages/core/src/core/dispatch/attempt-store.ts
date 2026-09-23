@@ -56,6 +56,12 @@ export const PROMPTED_BLOCK_SETTLED_REASON =
 export const UNSTARTED_SUPERSEDED_REASON =
   "settled without prompting: a later attempt on this target completed";
 
+/** Terminal cancellation chosen by the operator action that replaced the ACP
+ * conversation. It records why recovery is no longer owed without claiming
+ * that any output was delivered. */
+export const OPERATOR_SESSION_REPLACED_REASON =
+  "cancelled because an operator replaced the bound ACP session";
+
 export interface SettledPromptedBlock {
   target: string;
   settledId: string;
@@ -101,11 +107,14 @@ export interface TurnAttempt {
   deliveryUncertainReason: string | null;
   updatedUtc: string;
   /** Durable evidence of a retained attempt. Safe recorded-session continuation
-   * may reclaim it automatically; only a successful fenced claim clears this
-   * evidence. Unresolved safety failures remain quarantined. */
+   * may reclaim it automatically; only a recorded new prompt submission clears
+   * this evidence. Unresolved safety failures remain quarantined. */
   stalledUtc: string | null;
   stalledReason: string | null;
   stallNoticeUtc: string | null;
+  /** Reason paired with the last delivered notice. Unlike the active stall
+   * reason, this survives a reclaim so an identical boot refusal deduplicates. */
+  stallNoticeReason: string | null;
 }
 
 /**
@@ -218,6 +227,7 @@ export class TurnAttemptStore {
       "ALTER TABLE turn_attempts ADD COLUMN stalled_utc TEXT",
       "ALTER TABLE turn_attempts ADD COLUMN stalled_reason TEXT",
       "ALTER TABLE turn_attempts ADD COLUMN stall_notice_utc TEXT",
+      "ALTER TABLE turn_attempts ADD COLUMN stall_notice_reason TEXT",
     ]) {
       try { db.exec(ddl); } catch (err) {
         if (!(err instanceof Error) || !err.message.includes("duplicate column name")) throw err;
@@ -269,7 +279,8 @@ export class TurnAttemptStore {
         delivery_payload_json: string | null; delivery_started_utc: string | null;
         delivery_abandoned_reason: string | null;
         delivery_uncertain_reason: string | null;
-        stalled_utc: string | null; stalled_reason: string | null; stall_notice_utc: string | null } | undefined;
+        stalled_utc: string | null; stalled_reason: string | null;
+        stall_notice_utc: string | null; stall_notice_reason: string | null } | undefined;
     const runtime = row?.runtime_json ? JSON.parse(row.runtime_json) : null;
     // Remote runtimes can have telemetry but no local process owner. Recognize
     // only that new exact shape; do not turn malformed legacy ownership into
@@ -299,6 +310,7 @@ export class TurnAttemptStore {
       stalledUtc: row.stalled_utc,
       stalledReason: row.stalled_reason,
       stallNoticeUtc: row.stall_notice_utc,
+      stallNoticeReason: row.stall_notice_reason,
     } : null;
   }
 
@@ -307,7 +319,9 @@ export class TurnAttemptStore {
       const old = this.get(spec.id);
       if (old && old.generation === 0 && (old.state === "pending" || old.state === "suspended") && old.source === source) {
         this.db.prepare(`UPDATE turn_attempts SET generation=1, owner_boot=?, state='active',
-          identity=?, stalled_utc=NULL, stalled_reason=NULL, stall_notice_utc=NULL,
+          identity=?, stalled_reason=NULL,
+          stall_notice_reason=CASE WHEN stall_notice_utc IS NOT NULL
+            THEN COALESCE(stall_notice_reason, stalled_reason) ELSE stall_notice_reason END,
           updated_utc=? WHERE id=? AND generation=0 AND state IN ('pending','suspended')`)
           .run(ownerBoot, identity, new Date().toISOString(), spec.id);
       } else if (old) {
@@ -360,8 +374,10 @@ export class TurnAttemptStore {
             "the previous provider process for this attempt is still running");
         }
         this.db.prepare(`UPDATE turn_attempts SET generation=generation+1,
-          owner_boot=?, state='active', stalled_utc=NULL, stalled_reason=NULL,
-          stall_notice_utc=NULL, updated_utc=? WHERE id=? AND state='suspended'`)
+          owner_boot=?, state='active', stalled_reason=NULL,
+          stall_notice_reason=CASE WHEN stall_notice_utc IS NOT NULL
+            THEN COALESCE(stall_notice_reason, stalled_reason) ELSE stall_notice_reason END,
+          updated_utc=? WHERE id=? AND state='suspended'`)
           .run(ownerBoot, new Date().toISOString(), spec.id);
       } else {
         this.db.prepare(`INSERT INTO turn_attempts
@@ -528,7 +544,9 @@ export class TurnAttemptStore {
   /** Written immediately BEFORE prompt submission. A crash in that tiny gap is
    * ambiguous; continuation is safe, replay of the original task is not. */
   startPrompt(a: TurnAttempt): void {
-    const n = this.db.prepare(`UPDATE turn_attempts SET prompt_started=1, updated_utc=?
+    const n = this.db.prepare(`UPDATE turn_attempts SET prompt_started=1,
+      stalled_utc=NULL, stalled_reason=NULL, stall_notice_utc=NULL,
+      stall_notice_reason=NULL, updated_utc=?
       WHERE id=? AND generation=? AND owner_boot=? AND state='active' AND acp_session_id IS NOT NULL`)
       .run(new Date().toISOString(), a.id, a.generation, a.ownerBoot).changes;
     if (n !== 1) {
@@ -714,15 +732,18 @@ export class TurnAttemptStore {
    * observations do not repeatedly notify. */
   markStalled(id: string, reason: string, now = new Date().toISOString()): boolean {
     return this.db.prepare(`UPDATE turn_attempts
-      SET state='suspended', stalled_utc=COALESCE(stalled_utc,?), stalled_reason=?,
-          stall_notice_utc=NULL, updated_utc=?
+      SET state='suspended',
+          stalled_utc=COALESCE(stalled_utc,?),
+          stall_notice_utc=CASE WHEN stall_notice_reason IS ? THEN stall_notice_utc ELSE NULL END,
+          stalled_reason=?, updated_utc=?
       WHERE id=? AND state IN ('pending','active','suspended')
-        AND (stalled_utc IS NULL OR stalled_reason IS NOT ?)`)
-      .run(now, reason, now, id, reason).changes === 1;
+        AND (state != 'suspended' OR stalled_utc IS NULL OR stalled_reason IS NOT ?)`)
+      .run(now, reason, reason, now, id, reason).changes === 1;
   }
 
   markStallNoticeDelivered(id: string, now = new Date().toISOString()): boolean {
-    return this.db.prepare(`UPDATE turn_attempts SET stall_notice_utc=?, updated_utc=?
+    return this.db.prepare(`UPDATE turn_attempts SET stall_notice_utc=?,
+      stall_notice_reason=stalled_reason, updated_utc=?
       WHERE id=? AND state='suspended' AND stalled_utc IS NOT NULL AND stall_notice_utc IS NULL`)
       .run(now, now, id).changes === 1;
   }
@@ -919,6 +940,28 @@ export class TurnAttemptStore {
         WHERE id=? AND state IN ('pending','active','suspended')`)
         .run(JSON.stringify(outcome), outcome.finishedUtc, id).changes === 1;
     }).immediate();
+  }
+
+  /**
+   * Settle only work tied to the exact conversation an operator replaced.
+   *
+   * #580: broad target-only cancellation would discard a newer session's
+   * work; broad ACP-only cancellation could cross threads if an adapter ever
+   * reused an id. Both predicates are required. Runtime failures never call
+   * this method, so timeout and warm-eviction recovery remain visible.
+   */
+  settleOperatorSessionReplacement(target: string, acpSessionId: string): string[] {
+    if (!target || !acpSessionId) return [];
+    const rows = this.db.prepare(`SELECT id FROM turn_attempts
+      WHERE state IN ('pending','active','suspended')
+        AND acp_session_id=?
+        AND json_extract(spec_json, '$.target')=?
+      ORDER BY id`).all(acpSessionId, target) as { id: string }[];
+    const settled: string[] = [];
+    for (const { id } of rows) {
+      if (this.cancel(id, OPERATOR_SESSION_REPLACED_REASON)) settled.push(id);
+    }
+    return settled;
   }
 
   list(state: TurnAttempt["state"], onUnreadable: (id: string, err: unknown) => void =

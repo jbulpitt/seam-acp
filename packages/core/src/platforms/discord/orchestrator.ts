@@ -7534,7 +7534,10 @@ export class Orchestrator {
     // ACP session id so the redirected turn starts a brand-new session. Kept
     // otherwise, so the agent pivots off its partial work with full context.
     if (fresh) {
-      await this.router.invalidate(record.id, { clearAcpSession: true });
+      await this.router.invalidate(record.id, {
+        clearAcpSession: true,
+        operatorIntent: "replace-session",
+      });
     }
 
     // (c) Redirect — enqueue a fresh LIVE dispatch of the framed directive into
@@ -16676,7 +16679,7 @@ export class Orchestrator {
       return;
     }
     // Stop the live runtime (if any) so any in-flight turn is killed.
-    await this.router.invalidate(record.id);
+    await this.router.invalidate(record.id, { operatorIntent: "replace-session" });
     // Clear the persisted ACP session id so the next message creates a
     // fresh session (which picks up any new MCP servers / config).
     this.store.upsert({
@@ -16982,6 +16985,12 @@ export class Orchestrator {
       }
 
       bindSessionLocation(this.bridgeHub, verified.id, nextLocation);
+      // The switch is now committed. Settling earlier would cancel old-session
+      // work even when validation failed and rollback restored that session.
+      this.store.turnAttempts.settleOperatorSessionReplacement(
+        channel.id,
+        sessionBefore.acpSessionId
+      );
       await this.applyThreadName(verified);
       const at = formatAgentAtLocation(parsed.agentId, nextLocation);
       const message = `🤖 Agent switched to \`${at}\` (${profile.displayName}), model \`${intendedModel}\`. Next message will start a fresh session.`;
@@ -17590,7 +17599,11 @@ export class Orchestrator {
       const bound = this.store.getByChannel(PLATFORM, draft.threadId);
       if (bound) {
         await this.router
-          .invalidate(bound.id, { clearAcpSession: true, clearStartFailure: true })
+          .invalidate(bound.id, {
+            clearAcpSession: true,
+            clearStartFailure: true,
+            operatorIntent: "replace-session",
+          })
           .catch((err) =>
             this.logger.warn({ err, threadId: draft.threadId }, "fast-mode session reset failed")
           );
@@ -19753,7 +19766,10 @@ export class Orchestrator {
           try {
             await manager.deleteSession(cwd, session.sessionId);
             if (record.acpSessionId === session.sessionId) {
-              await this.router.invalidate(record.id, { clearAcpSession: true });
+              await this.router.invalidate(record.id, {
+                clearAcpSession: true,
+                operatorIntent: "replace-session",
+              });
               const fresh = this.store.get(record.id);
               if (fresh) {
                 record.acpSessionId = fresh.acpSessionId;

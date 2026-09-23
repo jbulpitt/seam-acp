@@ -40,6 +40,7 @@ import {
   sweepAgyMcpHomes,
 } from "@seam/adapters";
 import { makeCodexProfile } from "@seam/adapters";
+import { mainClaudeCatalogSource } from "./agents/claude-catalog-source.js";
 import { buildOllamaCodexCatalog } from "./agents/ollama-codex-catalog.js";
 import { makeGrokProfile, fetchXaiModels } from "@seam/adapters";
 import { discordRenderer } from "./platforms/discord/renderer.js";
@@ -449,6 +450,10 @@ async function main(): Promise<void> {
   const profiles: AgentProfile[] = registered;
   const localCatalogProfiles = () =>
     profiles.filter((profile) => !isAgentLocationDenied(profile.id, LOCAL_LOCATION, config.AGENT_LOCATION_DENY));
+  const mainClaudeApiCatalogEnabled = Boolean(
+    process.env.CLAUDE_CATALOG_API_KEY?.trim() &&
+    localCatalogProfiles().some((profile) => profile.id === "claude")
+  );
   const modelCatalog = new ModelCatalogService({
     store: modelCatalogStore,
     logger: logger.child({ mod: "model-catalog" }),
@@ -468,6 +473,7 @@ async function main(): Promise<void> {
       return bindings;
     },
     isOnline: ({ location }) => Boolean(bridgeHub?.isBridgeReady(location)),
+    source: (binding) => mainClaudeCatalogSource(binding, mainClaudeApiCatalogEnabled),
     scope: async ({ agentId, location }) => {
       if (!bridgeHub) throw new Error("bridge hub is not ready");
       return await bridgeHub.rpc(location, "describeModelCatalog", {}, agentId) as ReturnType<AgentProfile["catalog"]["scope"]>;

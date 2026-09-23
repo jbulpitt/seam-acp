@@ -18,6 +18,7 @@ import { SessionRouter } from "../packages/core/src/core/session-router.js";
 import { catalogEffortChoices } from "../packages/core/src/platforms/discord/orchestrator.js";
 import type { AgentProfile } from "@seam/adapters";
 import { localBridgeWiring } from "./local-bridge-fixture.js";
+import { mainClaudeCatalogSource } from "../packages/core/src/agents/claude-catalog-source.js";
 
 const logger = pino({ level: "silent" }) as unknown as Logger;
 const dirs: string[] = [];
@@ -99,12 +100,14 @@ function service(opts: {
   bindings?: Array<{ agentId: string; location: string }>;
   online?: (binding: { agentId: string; location: string }) => boolean;
   scope?: (binding: { agentId: string; location: string }) => AdapterCatalogCandidate["scope"];
+  source?: (binding: { agentId: string; location: string }) => { agentId: string; location: string };
 }) {
   return new ModelCatalogService({
     store: opts.store,
     logger,
     bindings: () => opts.bindings ?? [{ agentId: "fake", location: "local" }],
     ...(opts.scope ? { scope: opts.scope } : {}),
+    ...(opts.source ? { source: opts.source } : {}),
     fetch: opts.fetch,
     isOnline: opts.online,
     refreshCron: "0 0 1 1 *",
@@ -112,6 +115,59 @@ function service(opts: {
 }
 
 describe("ModelCatalogService", () => {
+  it("uses the main Anthropic API catalog for every ordinary Claude bridge binding", async () => {
+    const opened = db();
+    const local = { agentId: "claude", location: "local" };
+    const remote = { agentId: "claude", location: "macbook-air" };
+    const vertex = { agentId: "claude-vertex", location: "macbook-air" };
+    const fetched: string[] = [];
+    let claudeIds = ["default", "claude-opus-5-5"];
+    const catalog = service({
+      store: opened.store,
+      bindings: [local, remote, vertex],
+      source: (binding) => mainClaudeCatalogSource(binding, true),
+      online: (binding) => binding.location === "local" || binding.agentId === "claude-vertex",
+      scope: (binding) => shared(
+        binding.agentId === "claude" ? claudeIds : ["vertex-model"],
+        binding.agentId,
+      ).scope,
+      fetch: async (binding) => {
+        fetched.push(`${binding.agentId}@${binding.location}`);
+        return shared(
+          binding.agentId === "claude" ? claudeIds : ["vertex-model"],
+          binding.agentId,
+        );
+      },
+    });
+
+    await catalog.refresh(local);
+    const remoteRefresh = await catalog.refresh(remote);
+    await catalog.refresh(vertex);
+
+    expect(remoteRefresh.mode).toBe("shared");
+    expect(catalog.models(remote).map((entry) => entry.id)).toEqual([
+      "default",
+      "claude-opus-5-5",
+    ]);
+    expect(catalog.lookup(remote).state).toBe("stale");
+    // Once attached, the bridge reads the same generation. It does not need
+    // another bridge refresh when the controller's API catalog advances.
+    claudeIds = [...claudeIds, "claude-sonnet-5-5"];
+    await catalog.refresh(local);
+    expect(catalog.models(remote).map((entry) => entry.id)).toEqual([
+      "default",
+      "claude-opus-5-5",
+      "claude-sonnet-5-5",
+    ]);
+    expect(fetched).toEqual([
+      "claude@local",
+      "claude@local",
+      "claude-vertex@macbook-air",
+      "claude@local",
+    ]);
+    expect(catalog.models(vertex).map((entry) => entry.id)).toEqual(["vertex-model"]);
+  });
+
   it("recovers quarantined Claude bindings independently without replacing default or effort", async () => {
     const opened = db();
     const local = { agentId: "claude", location: "local" };

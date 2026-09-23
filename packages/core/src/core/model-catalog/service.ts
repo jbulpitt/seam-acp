@@ -199,6 +199,15 @@ export class ModelCatalogService {
     configuredLocalAgentIds?: () => ReadonlyArray<string>;
     /** Adapter-owned semantic scope; no provider work is allowed here. */
     scope?: (binding: CatalogBinding) => CatalogScope | Promise<CatalogScope>;
+    /**
+     * Explicit controller-owned catalog source for a binding.
+     *
+     * This is deliberately opt-in rather than inferred from an agent id or a
+     * scope label. It protects bindings whose execution is remote but whose
+     * catalog authority is one controller-side API; deleting it makes those
+     * bindings fall back to their bridge wrapper's potentially stale list.
+     */
+    source?: (binding: CatalogBinding) => CatalogBinding;
     fetch: (binding: CatalogBinding) => Promise<AdapterCatalogCandidate>;
     isOnline?: (binding: CatalogBinding) => boolean;
     now?: () => Date;
@@ -469,7 +478,8 @@ export class ModelCatalogService {
     const prior = this.lookup(binding).snapshot;
     const attemptedAt = (this.options.now?.() ?? new Date()).toISOString();
     const base = { binding, previousGeneration: prior?.generation ?? null, generation: prior?.generation ?? null, added: 0, removed: 0, changed: 0 };
-    if (this.options.isOnline && !this.options.isOnline(binding)) {
+    const source = this.catalogSource(binding);
+    if (this.options.isOnline && !this.options.isOnline(source)) {
       const error = "host offline; previous snapshot retained";
       // An unavailable host is NOT an independent confirming observation.
       // Without this, quarantine -> offline -> identical candidate published
@@ -479,7 +489,7 @@ export class ModelCatalogService {
       return { ...base, ok: Boolean(prior), result: "unavailable", error };
     }
     try {
-      const { candidate: fetched, fetchedBy } = await this.fetchCandidate(binding);
+      const { candidate: fetched, fetchedBy } = await this.fetchCandidate(source);
       // The portable screen runs again here: a candidate may have arrived over
       // the bridge, and a remote host is not a trust boundary we defer past.
       // Normalization returns the sanitized, canonically ordered candidate that
@@ -732,14 +742,15 @@ export class ModelCatalogService {
   }
 
   private async fetchCandidate(binding: CatalogBinding): Promise<FetchedCatalogCandidate> {
-    // #339 rules 11-12: dedupe concurrent refreshes of the SAME binding, and
-    // never across a binding boundary.
+    // #339 rules 11-12: dedupe concurrent refreshes of the SAME source binding,
+    // and never infer that source from a provider/scope label.
     //
     // This used to key the in-flight map by scope, so two bindings that merely
     // looked equivalent shared one provider fetch — and then one host's answer
     // was published as the other's. Saving a probe is not worth asserting an
-    // equivalence we cannot prove. Bindings that genuinely do share a scope
-    // still share the published generation; they just each ask for it.
+    // equivalence we cannot prove. An explicit `options.source` mapping is the
+    // sole exception: it names the one adapter that actually performs the
+    // fetch, so all consumers of that authority may share its in-flight work.
     const declared = this.options.scope ? await this.options.scope(binding) : null;
     const fetchKey = bindingKey(binding);
     const existing = this.fetchInFlight.get(fetchKey);
@@ -759,6 +770,10 @@ export class ModelCatalogService {
     }).finally(() => this.fetchInFlight.delete(fetchKey));
     this.fetchInFlight.set(fetchKey, promise);
     return promise;
+  }
+
+  private catalogSource(binding: CatalogBinding): CatalogBinding {
+    return this.options.source?.(binding) ?? binding;
   }
 }
 

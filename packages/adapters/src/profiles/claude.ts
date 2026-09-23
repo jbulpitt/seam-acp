@@ -260,6 +260,9 @@ export function makeClaudeProfile(opts: {
   // context windows were never verified against this account's evidence, so
   // they must not inherit the direct catalog as a side effect.
   const liveCatalog = opts.directAnthropic === true;
+  const catalogApiEnabled = liveCatalog && Boolean(
+    opts.catalogApiKey?.trim() || process.env.CLAUDE_CATALOG_API_KEY?.trim()
+  );
   const configuredLabels = new Map(catalogModels.map((model) => [model.modelId, model.name]));
 
   /**
@@ -333,7 +336,9 @@ export function makeClaudeProfile(opts: {
         credentialProfile: configDir ?? "default",
         project: opts.extraEnv?.ANTHROPIC_VERTEX_PROJECT_ID,
         region: opts.extraEnv?.CLOUD_ML_REGION,
-      }), ...(liveCatalog ? { sharing: "binding" as const } : {}) }),
+      }), ...(liveCatalog
+        ? { sharing: catalogApiEnabled ? ("shared" as const) : ("binding" as const) }
+        : {}) }),
       async fetch() {
         const common = {
           provider: opts.directAnthropic ? "anthropic" : (opts.brand ?? "claude-compatible"),
@@ -402,7 +407,11 @@ export function makeClaudeProfile(opts: {
           // A config-directory label (especially "default") does not prove
           // that two hosts have the same account, wrapper, or advertised list.
           // Sharing it lets one host quarantine every model on the other.
-          candidate.scope.sharing = "binding";
+          // `/v1/models` is the controller-owned canonical inventory, so all
+          // ordinary Claude bridge bindings may consume this exact snapshot.
+          // The wrapper probe remains binding-local: two hosts can advertise
+          // different lists, and pretending otherwise caused the #337 outage.
+          candidate.scope.sharing = apiModels ? "shared" : "binding";
           candidate.cliVersion = await readCliVersion(cli);
           candidate.sourceVersion = apiModels
             ? `anthropic-api-${ANTHROPIC_MODELS_API_VERSION}`

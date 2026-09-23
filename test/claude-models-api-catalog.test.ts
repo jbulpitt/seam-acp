@@ -114,6 +114,7 @@ describe("Anthropic Models API catalog", () => {
     const candidate = await profile.catalog.fetch();
     validateCandidate(candidate);
     expect(candidate.source).toBe("anthropic-models-api");
+    expect(candidate.scope.sharing).toBe("shared");
     expect(candidate.sourceVersion).toBe("anthropic-api-2023-06-01");
     expect(candidate.models.map((model) => model.id)).toEqual(["default", "claude-opus-5-5"]);
     expect(candidate.models.find((model) => model.id === "claude-opus-5-5")).toMatchObject({

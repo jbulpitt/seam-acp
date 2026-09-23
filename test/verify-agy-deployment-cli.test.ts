@@ -157,9 +157,9 @@ describe("#397 the exit-code contract, from a real node process", () => {
       "--bridge-registry", registry,
     ]);
     expect(result.code).toBe(3);
-    expect(result.stdout).toContain("fleet_registered=10");
-    expect(result.stdout).toContain("fleet_rollout_managed=7 of 10");
-    expect(result.stdout).toContain("operation_scope=1 of 10 registered hosts: jennifer-laptop");
+    expect(result.stdout).toContain("fleet_registered=9");
+    expect(result.stdout).toContain("fleet_rollout_managed=6 of 9");
+    expect(result.stdout).toContain("operation_scope=1 of 9 registered hosts: jennifer-laptop");
     expect(result.stdout).toContain("fleet_excluded=jennifer-laptop: agy-only pm2 host has no passwordless sudo; its Aug 21 bridge ignores runtime pins, so a rollout would take it dark (#388)");
   });
 

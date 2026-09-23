@@ -79,20 +79,6 @@
       "releaseRoot": "/home/jessebulpitt/.seam/bridge-rollouts",
       "rolloutEnabled": true
     },
-    "home-hub": {
-      "sshAlias": "home-hub",
-      "pm2App": "seam-bridge",
-      "verifyAgent": "grok",
-      "checkoutPath": "/Users/jessebulpitt/.seam/seam-acp",
-      "entrypointPath": "/Users/jessebulpitt/.seam/seam-acp/packages/bridge/dist/index.js",
-      "expectedUid": 501,
-      "nodePath": "/Users/jessebulpitt/.seam/node/bin/node",
-      "pm2ModulePath": "/Users/jessebulpitt/.seam/lib/node_modules/pm2",
-      "workspaceArg": "/Users/jessebulpitt/Projects",
-      "devMode": false,
-      "releaseRoot": "/Users/jessebulpitt/.seam/bridge-rollouts",
-      "rolloutEnabled": true
-    },
     "plex-server": {
       "sshAlias": "plex-server",
       "launcher": "systemd",

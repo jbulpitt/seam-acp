@@ -230,6 +230,25 @@ function flattenConfigSelectOptions(
  * 15-minute Discord deferred-reply timeout.
  */
 const START_TIMEOUT_MS = 45_000;
+
+/**
+ * Attach a child's retained stderr to a start failure.
+ *
+ * An abnormal EXIT already reports this tail. A HANG does not: the child is
+ * still alive, so nothing exits, the timeout wins the race, and the operator
+ * gets a fixed sentence whose only hint is a guess. agy spent an afternoon
+ * looking like an authentication failure for exactly this reason, while the
+ * real cause — a CLI flag the binary rejected — sat unread in this ring.
+ *
+ * Attaches, never replaces: the original message still names the budget and the
+ * agent, so callers matching on it keep working.
+ */
+export function withRetainedStderr(error: unknown, lines: readonly string[]): unknown {
+  if (!(error instanceof Error)) return error;
+  const tail = lines.slice(-40).join("\n").slice(-4000).trim();
+  if (!tail) return error;
+  return new Error(`${error.message}\nagent stderr (last lines):\n${tail}`, { cause: error });
+}
 const NEW_SESSION_TIMEOUT_MS = 45_000;
 /**
  * A healthy load may replay a large history, so it gets more room than startup.
@@ -764,6 +783,14 @@ export class AgentRuntime {
         agent.request<T>(method, params),
     } as unknown as ClientSideConnection;
 
+    // The child's stderr is already ringed above, and an abnormal EXIT reports
+    // it. A hang does not: the child is still alive, so nothing exits, the
+    // timeout wins the race, and the operator gets a fixed sentence whose only
+    // hint ("check that it is installed and authenticated") is a guess. agy
+    // spent an afternoon looking like an auth failure for exactly this reason
+    // while the real cause — a rejected CLI flag — sat unread in this ring.
+    // Diagnostics we already hold must not be withheld because the process had
+    // the manners to hang instead of crash.
     const initResult = await Promise.race([
       this.connection.initialize({
         protocolVersion: PROTOCOL_VERSION,
@@ -775,7 +802,16 @@ export class AgentRuntime {
         `ACP initialize timed out after ${START_TIMEOUT_MS / 1000}s ` +
           `(agent never responded; check that '${this.profile.id}' is installed and authenticated)`
       ),
-    ]);
+    ]).catch((error: unknown) => {
+      const enriched = withRetainedStderr(error, stderrRing);
+      if (enriched !== error) {
+        this.logger.warn(
+          { agentId: this.profile.id },
+          "agent start failed; retained stderr attached to the error",
+        );
+      }
+      throw enriched;
+    });
     this.promptCapabilities =
       initResult.agentCapabilities?.promptCapabilities ?? undefined;
     this.loadSessionSupported = initResult.agentCapabilities?.loadSession === true;

@@ -19,6 +19,10 @@ export async function connectSessiond(): Promise<SessiondClient> {
       stdio: "ignore",
       env: {
         PATH: process.env.PATH ?? "",
+        // #595: the daemon resolves its durable runtime directory from HOME.
+        // Both paths are passed on argv above, so this is belt-and-braces for
+        // anything the daemon later derives from the same base.
+        ...(process.env.HOME ? { HOME: process.env.HOME } : {}),
         ...(process.env.LANG ? { LANG: process.env.LANG } : {}),
       },
     });

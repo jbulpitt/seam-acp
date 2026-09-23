@@ -1,10 +1,14 @@
 import { describe, expect, it, vi } from "vitest";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
+import { localBridgeHub } from "./local-bridge-fixture.js";
+import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 
 interface ScheduledRunnerThis {
   config: { TURN_TIMEOUT_SECONDS: number };
   router: { reuseMcpServers: (sessionId: string) => unknown[]; describeConfig: () => { location: { value: string } } };
   injectTurn: (...args: unknown[]) => Promise<{ text: string; error?: string }>;
+  bridgeHub: unknown;
+  modelCatalog: ReturnType<typeof fixtureModelCatalog>;
 }
 
 interface ScheduledRunnerArgs {
@@ -22,6 +26,9 @@ describe("scheduled isolated Seam-MCP wiring", () => {
     const mcpServers = [{ name: "seam-mcp", url: "http://127.0.0.1/mcp" }];
     const reuseMcpServers = vi.fn(() => mcpServers);
     const injectTurn = vi.fn(async () => ({ text: "inspected" }));
+    const profile = { id: "ollama-cloud", defaultModel: "glm-5.3:cloud" } as any;
+    const bridgeHub = localBridgeHub([profile], "/tmp");
+    vi.spyOn(bridgeHub, "mcpServersForBridgeSpawn").mockReturnValue(mcpServers[0] as any);
     const runner = (
       Orchestrator.prototype as unknown as {
         runIsolatedScheduledJob(
@@ -37,9 +44,11 @@ describe("scheduled isolated Seam-MCP wiring", () => {
           config: { TURN_TIMEOUT_SECONDS: 120 },
           router: { reuseMcpServers, describeConfig: () => ({ location: { value: "local" } }) },
           injectTurn,
+          bridgeHub,
+          modelCatalog: fixtureModelCatalog([profile]),
         },
         {
-          profile: { id: "ollama-cloud" },
+          profile,
           record: { id: "discord:scheduled-owner" },
           cwd: "/tmp",
           model: "glm-5.3:cloud",

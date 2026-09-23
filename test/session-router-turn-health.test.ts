@@ -5,6 +5,7 @@ import type { Logger } from "../packages/core/src/lib/logger.js";
 import type { SessionRecord, SessionConfigState } from "../packages/core/src/core/types.js";
 import type { SessionStore } from "../packages/core/src/core/session-store.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
+import { localBridgeWiring } from "./local-bridge-fixture.js";
 
 const runtimeState = vi.hoisted(() => ({
   failLoad: false,
@@ -106,6 +107,7 @@ function makeRouter(record: SessionRecord): SessionRouter {
     defaultAgentId: "copilot",
     defaultModel: "gpt-test",
     runtimeIdleTtlMs: 1_000,
+    seamMcp: localBridgeWiring(profile),
   });
 }
 
@@ -228,6 +230,7 @@ describe("#442 one owner for the mid-turn fact", () => {
       defaultAgentId: "copilot",
       defaultModel: "gpt-test",
       runtimeIdleTtlMs: 1_000,
+      seamMcp: localBridgeWiring(profile),
       turnStalenessBoundMs: BOUND,
     });
   }

@@ -293,6 +293,7 @@ describe("ACP v1 elicitation validation and capability", () => {
     const runtime = new AgentRuntime({
       profile,
       logger,
+      spawnFn: profile.spawn.bind(profile),
       elicitationHandler: createHandler,
       completeElicitationHandler: completeHandler,
     });

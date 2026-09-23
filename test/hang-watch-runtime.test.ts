@@ -24,6 +24,7 @@ function runtime(opts: {
     profile,
     logger: logger as unknown as Logger,
     bridgeHealth: { sendCmd: opts.sendCmd },
+    spawnFn: () => { throw new Error("unused"); },
     hangSilenceMs: 20,
     onDead: opts.onDead,
   });
@@ -135,10 +136,10 @@ describe("#443 remote hang watch", () => {
     await expect(pending2).resolves.toMatchObject({ stopReason: "end_turn" });
   });
 
-  it("does not probe a local runtime or a prompt that finishes quickly", async () => {
+  it("does not probe a runtime with no bridge health or a prompt that finishes quickly", async () => {
     const logger = { warn: vi.fn(), info: vi.fn(), error: vi.fn(), debug: vi.fn(), child() { return this; } };
     const profile = { id: "grok", spawn: () => { throw new Error("unused"); } } as unknown as AgentProfile;
-    const local = new AgentRuntime({ profile, logger: logger as unknown as Logger, hangSilenceMs: 5 });
+    const local = new AgentRuntime({ profile, logger: logger as unknown as Logger, hangSilenceMs: 5, spawnFn: profile.spawn.bind(profile) });
     Object.assign(local, {
       connection: { prompt: vi.fn().mockResolvedValue({ stopReason: "end_turn" }) },
       sessionId: "thread-1",

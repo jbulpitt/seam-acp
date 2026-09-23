@@ -10,6 +10,7 @@ import { resolveContextWindow } from "../packages/core/src/core/context-window.j
 import { matchesContextBudget, type ContextBudgetIdentity } from "../packages/core/src/core/context-budget.js";
 import { copilotRequestedContextTier, makeCopilotProfile } from "../packages/adapters/src/profiles/copilot.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
+import { attachLocalBridge } from "./local-bridge-fixture.js";
 import type { SessionRecord } from "../packages/core/src/core/types.js";
 import { discordRenderer } from "../packages/core/src/platforms/discord/renderer.js";
 
@@ -157,6 +158,7 @@ function injectionFixture() {
       getOrStartRuntime: async () => runtime,
     },
   });
+  attachLocalBridge(orch, [profile as never], dir);
   return { orch, record, profile, runtime, setEvents: (next: AgentEvent[]) => { events = next; } };
 }
 
@@ -199,6 +201,7 @@ describe("real injection recording, offline runtime only", () => {
         async editMessage() {}, async sendFile() {},
       } as never,
     });
+    attachLocalBridge(orch, [profile as never], dir);
     await (orch as any).handleIncomingMessageInner({
       messageId: "synthetic-message", channel: { platform: "discord", id: record.channelRef },
       authorId: "synthetic-user", authorIsBot: false, text: "offline fixture",

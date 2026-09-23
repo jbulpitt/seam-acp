@@ -76,7 +76,7 @@ function setup(location = REMOTE) {
       cwd: { value: cwd }, location: { value: location }, fastMode: { value: false } }) };
   const mux = { spawn: remoteSpawn, rpc: vi.fn(async () => ({ projectMcpInjection: true })), releaseStdin: vi.fn() };
   const hub = { markSessionBridge: vi.fn(), get: vi.fn(() => ({ mux })),
-    mcpServersForRemoteSpawn: vi.fn(() => remoteSeam),
+    mcpServersForBridgeSpawn: vi.fn(() => remoteSeam),
     rpc: vi.fn(async () => ({})) };
   const make = () => {
     const orch = new Orchestrator({ logger: silent, store, router: router as any, adapter: {} as any,
@@ -151,7 +151,7 @@ describe("#480 compaction execution boundary", () => {
     expect(h.remoteSpawn).not.toHaveBeenCalled();
   });
 
-  it("keeps a local-bound compaction on the local provider", async () => {
+  it("keeps a local-bound compaction on the local bridge", async () => {
     const h = setup("local");
     const orch = h.make() as any;
     await orch.buildDefaultCompactionSeed({
@@ -171,8 +171,8 @@ describe("#480 compaction execution boundary", () => {
       sessionId: h.record.id,
       summary: "local seed",
     });
-    expect(h.localSpawn).toHaveBeenCalled();
-    expect(h.remoteSpawn).not.toHaveBeenCalled();
-    expect(h.hub.rpc).not.toHaveBeenCalled();
+    expect(h.localSpawn).not.toHaveBeenCalled();
+    expect(h.remoteSpawn).toHaveBeenCalled();
+    expect(h.hub.rpc).toHaveBeenCalled();
   });
 });

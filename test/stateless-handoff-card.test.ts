@@ -25,6 +25,7 @@ import type { Preset, SessionRecord, StructuredPanel } from "../packages/core/sr
 import type { ChannelRef, MessageRef } from "../packages/core/src/platforms/chat-adapter.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 import { BridgeHub } from "../packages/core/src/core/bridge-hub.js";
+import { attachLocalBridge } from "./local-bridge-fixture.js";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
 
@@ -148,6 +149,7 @@ function makeOrch(opts: {
     store: store as any,
     renderer: {} as any,
   });
+  attachLocalBridge(orchestrator, [catalogProfile], opts.dataDir);
   (orchestrator as any).injectTurn = async (
     _record: unknown,
     _prompt: unknown,
@@ -210,7 +212,7 @@ function fakeRemoteHub(opts: {
       defaultCwdForLocation,
       markSessionBridge: vi.fn(),
       get: () => ({ mux }),
-      mcpServersForRemoteSpawn: () => undefined,
+      mcpServersForBridgeSpawn: () => undefined,
     },
   };
 }
@@ -368,7 +370,7 @@ describe("stateless/preset handoff embed card", () => {
         marked.push({ sessionId, location });
       },
       get: () => ({ mux: {} }),
-      mcpServersForRemoteSpawn: () => undefined,
+      mcpServersForBridgeSpawn: () => undefined,
     } as any);
     let injected: any;
     (orch as any).injectTurn = async (_record: unknown, _prompt: string, opts: unknown) => {
@@ -468,7 +470,7 @@ describe("stateless/preset handoff embed card", () => {
 
     expect(injected.cwd).toBe("/repo");
     expect(injected.location).toBe("local");
-    expect(injected.spawnFn).toBeUndefined();
+    expect(injected.spawnFn).toEqual(expect.any(Function));
   });
 
   it("refuses only an implicit remote dispatch when the host reports no safe default (#367)", async () => {
@@ -513,7 +515,7 @@ describe("stateless/preset handoff embed card", () => {
       }]]),
     };
     hub.markSessionBridge = vi.fn();
-    hub.mcpServersForRemoteSpawn = () => undefined;
+    hub.mcpServersForBridgeSpawn = () => undefined;
     orch.setBridgeHub(hub);
     let injected: any;
     (orch as any).injectTurn = async (_record: unknown, _prompt: string, opts: any) => {

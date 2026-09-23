@@ -14,6 +14,7 @@ import type { SessionRecord } from "../packages/core/src/core/types.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 import { DispatchSuspendedError } from "../packages/core/src/core/dispatch/attempt-store.js";
 import { DispatchAcquisitionPhase } from "../packages/core/src/core/dispatch/acquisition-phase.js";
+import { attachLocalBridge } from "./local-bridge-fixture.js";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
 
@@ -100,6 +101,7 @@ describe("injectTurn isolated resumeSessionId", () => {
       adapter: {} as any, renderer: {} as any, modelCatalog: fixtureModelCatalog([profile]),
       router: { listProfiles: () => [], describeConfig: () => ({ location: { value: "local" } }),
         assertAgentAllowedForChannel: () => {} } as any });
+    attachLocalBridge(orch, [profile], dir);
     acquisitionFailure = stage;
     for (const phase of ["execution", "boot-recovery"] as const) {
       const acquisition = new DispatchAcquisitionPhase("job", phase);
@@ -135,6 +137,7 @@ describe("injectTurn isolated resumeSessionId", () => {
       adapter: {} as any, renderer: {} as any, modelCatalog: fixtureModelCatalog([profile]),
       router: { listProfiles: () => [], describeConfig: () => ({ location: { value: "local" } }),
         assertAgentAllowedForChannel: () => {} } as any });
+    attachLocalBridge(orch, [profile], dir);
     let completed = false;
     await orch.injectTurn(record(), "disposable", { session: "isolated", profile, cwd: dir,
       lifecycle: { isCurrent: () => true, beforePrompt: () => {}, onOutcome: () => { completed = true; },
@@ -154,6 +157,7 @@ describe("injectTurn isolated resumeSessionId", () => {
       router: { listProfiles: () => [], describeConfig: () => ({ location: { value: "local" } }),
         assertAgentAllowedForChannel: () => {} } as any,
     });
+    attachLocalBridge(orch, [profile], dir);
     let active = true, completed = false;
     beforeOutcome = () => { active = false; };
     const lifecycle = {
@@ -183,6 +187,7 @@ describe("injectTurn isolated resumeSessionId", () => {
       router: { listProfiles: () => [], describeConfig: () => ({ location: { value: "local" } }),
         assertAgentAllowedForChannel: () => {} } as any,
     });
+    attachLocalBridge(orch, [profile], dir);
     await expect(orch.injectTurn(record(), "original", {
       session: "isolated", profile, cwd: dir,
       onSession: () => { throw DispatchSuspendedError.defect("db-write-failed", "fixture write failure"); },
@@ -218,6 +223,7 @@ describe("injectTurn isolated resumeSessionId", () => {
       store,
       renderer: {} as any,
     });
+    attachLocalBridge(orch, [catalogProfile], dir);
 
     const result = await orch.injectTurn(record(), "continue", {
       session: "isolated",

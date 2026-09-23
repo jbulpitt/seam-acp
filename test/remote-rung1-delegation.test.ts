@@ -42,7 +42,7 @@ function runtimeFixture(opts: {
     };
   });
   const profile = { id: "fixture" } as unknown as AgentProfile;
-  const runtime = new AgentRuntime({ profile, logger, bridgeHealth: { sendCmd } });
+  const runtime = new AgentRuntime({ profile, logger, bridgeHealth: { sendCmd }, spawnFn: () => { throw new Error("unused"); } });
   Object.assign(runtime, {
     connection: { prompt },
     sessionId: "session-remote",

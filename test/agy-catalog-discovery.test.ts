@@ -139,7 +139,7 @@ describe("#260 native catalog discovery is prompt-free", () => {
       // carries a default to start on.
       expect(profile.id).toBe("agy");
       expect(profile.defaultModel).toBe("fixture-native-model");
-      const runtime = new AgentRuntime({ profile, logger });
+      const runtime = new AgentRuntime({ profile, logger, spawnFn: profile.spawn.bind(profile) });
       await runtime.start();
       await runtime.dispose();
     } finally {
@@ -164,7 +164,7 @@ describe("#260 native catalog discovery is prompt-free", () => {
       defaultModel: "fixture-native-model",
       exposeGlobalStaging: false,
     });
-    const runtime = new AgentRuntime({ profile, logger });
+    const runtime = new AgentRuntime({ profile, logger, spawnFn: profile.spawn.bind(profile) });
     try {
       const cold = await profile.catalog.fetch();
       expect(cold.models[0]?.context.maximum).toBeNull();

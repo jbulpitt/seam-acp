@@ -30,7 +30,6 @@ import {
 } from "./config-mutation.js";
 import type { SeamTokenRegistry } from "./mcp/token-registry.js";
 import { isLocalLocation, normalizeLocation } from "./location.js";
-import type { LoopbackHost } from "./loopback-host.js";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -115,6 +114,8 @@ export interface BridgeHubOpts {
   getMcpRegistry?: () => SeamTokenRegistry | undefined;
   healthPort: number;
   dataDir: string;
+  /** Persistent controller-host credential for the separate local bridge. */
+  localBridgeTokenHash: string;
 }
 
 function bearerToken(req: IncomingMessage): string | undefined {
@@ -127,8 +128,10 @@ function bearerToken(req: IncomingMessage): string | undefined {
 
 function findBridgeByToken(
   token: string,
-  bridges: Map<string, BridgeHostConfig>
+  bridges: Map<string, BridgeHostConfig>,
+  local?: BridgeHostConfig,
 ): BridgeHostConfig | undefined {
+  if (local && tokenMatchesHash(token, local.tokenHash)) return local;
   for (const b of bridges.values()) {
     if (tokenMatchesHash(token, b.tokenHash)) return b;
   }
@@ -160,6 +163,7 @@ export class BridgeHub {
   private readonly mutation: ConfigMutationService;
   private readonly healthPort: number;
   private readonly dataDir: string;
+  private readonly localBridge: BridgeHostConfig;
   private readonly getMcpPort?: () => number | undefined;
   private readonly getMcpRegistry?: () => SeamTokenRegistry | undefined;
   private wss?: WebSocketServer;
@@ -174,7 +178,6 @@ export class BridgeHub {
   /** In-memory session → bridge mapping. Persistence is the thread-preset `location`. */
   private readonly sessionBridge = new Map<string, string>();
   private readonly readyEvents = new EventEmitter();
-  private loopback?: LoopbackHost;
 
   constructor(opts: BridgeHubOpts) {
     this.logger = opts.logger.child({ comp: "bridge-hub" });
@@ -182,15 +185,17 @@ export class BridgeHub {
     this.mutation = opts.mutation;
     this.healthPort = opts.healthPort;
     this.dataDir = opts.dataDir;
+    this.localBridge = {
+      id: "local",
+      tokenHash: opts.localBridgeTokenHash,
+      shortName: "local",
+      workspaceRoot: opts.config.REPOS_ROOT,
+    };
     this.getMcpPort = opts.getMcpPort;
     this.getMcpRegistry = opts.getMcpRegistry;
     this.wss = new WebSocketServer({ server: opts.httpServer, path: "/bridge" });
     this.wss.on("connection", (ws, req) => this.onConnection(ws, req));
     this.logger.info({ path: "/bridge" }, "bridge websocket listening");
-  }
-
-  setLoopback(loopback: LoopbackHost): void {
-    this.loopback = loopback;
   }
 
   listConnected(): ConnectedBridge[] {
@@ -215,12 +220,12 @@ export class BridgeHub {
   }
 
   /**
-   * True when a remote bridge has finished hello + prepare(), or when
-   * `location` is the local loopback (always ready).
+   * True only after this host's bridge has finished hello + prepare(). Local
+   * is deliberately not special: if its separate process is down, local work
+   * is unavailable while every other connected host keeps working (#575).
    */
   isBridgeReady(bridgeId: string): boolean {
     const id = normalizeLocation(bridgeId);
-    if (isLocalLocation(id)) return true;
     const conn = this.connections.get(id);
     if (!conn) return false;
     const installed = [...conn.agents.values()].filter((a) => a.installed);
@@ -263,7 +268,7 @@ export class BridgeHub {
   }
 
   /**
-   * Host-owned default cwd for an implicit remote dispatch (#367).
+   * Host-owned default cwd for an implicit bridged dispatch (#367/#575).
    *
    * The connected bridge's actual `--cwd` wins over the controller's paired
    * copy, because it describes the process that will execute this turn. Older
@@ -274,9 +279,8 @@ export class BridgeHub {
    */
   defaultCwdForLocation(bridgeId: string): string | undefined {
     const id = normalizeLocation(bridgeId);
-    if (isLocalLocation(id)) return undefined;
     const connected = this.connections.get(id)?.host;
-    const paired = this.config.bridgePresets.get(id);
+    const paired = isLocalLocation(id) ? this.localBridge : this.config.bridgePresets.get(id);
     return resolveBridgeDefaultCwd({
       reportedWorkspaceRoot: connected?.workspaceRoot,
       configuredWorkspaceRoot: paired?.workspaceRoot,
@@ -307,11 +311,18 @@ export class BridgeHub {
    * MCP servers entry for a session spawned on a bridge. Reuses the
    * X-Seam-Session header; URL is reachable from the bridge host (#84).
    */
-  mcpServersForRemoteSpawn(sessionId: string): ReturnType<typeof buildSeamMcpServerEntry> | undefined {
+  mcpServersForBridgeSpawn(sessionId: string): ReturnType<typeof buildSeamMcpServerEntry> | undefined {
     const port = this.getMcpPort?.();
     const registry = this.getMcpRegistry?.();
     if (port === undefined || !registry) return undefined;
     const token = registry.peek(sessionId) ?? registry.mint(sessionId);
+    const bridgeId = this.sessionBridge.get(sessionId);
+    if (!bridgeId) return undefined;
+    if (isLocalLocation(bridgeId)) {
+      return buildSeamMcpServerEntry(port, token, {
+        url: `http://127.0.0.1:${this.healthPort}/mcp`,
+      });
+    }
     const url = this.mcpUrlForRemote();
     return buildSeamMcpServerEntry(port, token, url ? { url } : { url: resolveReachableMcpUrl({ port, healthPort: this.healthPort, remote: true }) });
   }
@@ -323,10 +334,6 @@ export class BridgeHub {
     agentId?: string
   ): Promise<unknown> {
     const id = normalizeLocation(bridgeId);
-    if (isLocalLocation(id)) {
-      if (!this.loopback) throw new Error('loopback host is not configured');
-      return this.loopback.rpc(method, params, { agentId });
-    }
     const conn = this.connections.get(id);
     if (!conn) throw new Error(`bridge "${id}" is not connected`);
     return conn.mux.rpc(method, params, { agentId });
@@ -337,13 +344,9 @@ export class BridgeHub {
     return Array.isArray(result) ? (result as WorkspaceInfo[]) : [];
   }
 
-  /** Bind a session to a bridge. `local` unbinds (loopback MCP as today). */
+  /** Bind a session to its execution bridge. Local is a real bridge (#575). */
   markSessionBridge(sessionId: string, bridgeId: string): void {
-    if (isLocalLocation(bridgeId)) {
-      this.sessionBridge.delete(sessionId);
-      return;
-    }
-    this.sessionBridge.set(sessionId, bridgeId);
+    this.sessionBridge.set(sessionId, normalizeLocation(bridgeId));
   }
 
   sessionBridgeId(sessionId: string): string | undefined {
@@ -382,7 +385,7 @@ export class BridgeHub {
       ws.close(4001, "unauthorized");
       return;
     }
-    const paired = findBridgeByToken(token, this.config.bridgePresets);
+    const paired = findBridgeByToken(token, this.config.bridgePresets, this.localBridge);
     if (!paired) {
       this.logger.warn("bridge connection refused: token does not match any paired bridge");
       ws.close(4001, "unauthorized");

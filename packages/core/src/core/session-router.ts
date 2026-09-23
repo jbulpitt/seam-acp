@@ -13,7 +13,6 @@ import { defaultSessionConfig, resolvePermissionMode } from "./types.js";
 import { makeSessionId } from "./session-store.js";
 import { resolveChannelPreset, resolveThreadLocation } from "../config.js";
 import type { ChannelPreset, ThreadPreset } from "../config.js";
-import { buildProjectMcpServers } from "../mcp.js";
 import { parkedAgentMessage } from "./parked-agents.js";
 import { retiredAgentMessage } from "./retired-agents.js";
 import type { ModelCatalogService } from "./model-catalog/service.js";
@@ -56,20 +55,19 @@ export interface SeamMcpWiring {
   getPort: () => number | undefined;
   /** Stable loopback MCP URL (health `/mcp` proxy). Prefer over the ephemeral bind port. */
   getLoopbackUrl?: () => string | undefined;
-  /** Full MCP URL for a remote (bridge) spawn; never 127.0.0.1 when that is local-only. */
+  /** Full MCP URL for a non-local bridge spawn; never 127.0.0.1 when that is local-only. */
   getPublicUrl?: () => string | undefined;
-  /** True when this session's agent process runs on a paired bridge (#84). */
-  isRemoteSession?: (sessionId: string) => boolean;
+  /** True when this session's agent process runs on a bridge (#84/#575). */
+  isBridgeSession?: (sessionId: string) => boolean;
   /**
-   * Hub helper: mint X-Seam-Session + reachable (non-loopback) MCP URL.
-   * Preferred over getPublicUrl when the session is remote.
+   * Hub helper: mint X-Seam-Session + execution-host-reachable MCP URL.
+   * Local receives loopback; remote hosts receive the public URL.
    */
-  mcpServersForRemoteSpawn?: (sessionId: string) => McpServer | undefined;
+  mcpServersForBridgeSpawn?: (sessionId: string) => McpServer | undefined;
   /** Mux of the connected bridge this session is bound to, if any. */
   muxForSession?: (sessionId: string) => (MuxHandle & Partial<BridgeHealthSource>) | undefined;
   /**
-   * Bind `sessionId` to a remote bridge id. Called on runtime start when the
-   * thread preset's `location` is not `local`. Local stays unbound.
+   * Bind `sessionId` to its execution bridge. Local is a real bridge (#575).
    */
   bindSessionLocation?: (sessionId: string, location: string) => void;
 }
@@ -90,7 +88,6 @@ export interface RuntimeSpawnPlan {
   fastMode: boolean;
   cwd: string;
   mcpServers: McpServer[];
-  remote: boolean;
   bridgeHealth?: Partial<BridgeHealthSource>;
   spawnChild: (
     model?: string,
@@ -1323,7 +1320,7 @@ export class SessionRouter {
       );
     }
 
-    const { mcpServers: injectedMcpServers, remote } = planSeamMcpInjection({
+    const { mcpServers, bridged } = planSeamMcpInjection({
       sessionId: record.id,
       globalMcpServers: this.mcpServers,
       seamMcp: this.seamMcp,
@@ -1332,47 +1329,32 @@ export class SessionRouter {
       // send a header the new process no longer knows.
       reuseToken: true,
     });
-    // Local sessions read local project config here. Remote cwd belongs to the
-    // bridge host, so the spawn RPC loads it there and the bridge enriches
-    // session/new|load without returning resolved credentials to this process.
-    // Reading a remote path on the controller can select an unrelated local
-    // repo with the same pathname.
-    const mcpServers = [
-      ...injectedMcpServers,
-      ...(remote
-        ? []
-        : buildProjectMcpServers(
-            cwd,
-            this.logger,
-            new Set(injectedMcpServers.map((s) => s.name))
-          )),
-    ];
-
-    let spawnChild: RuntimeSpawnPlan["spawnChild"] = (modelOverride, effortOverride) =>
-      profile.spawn(modelOverride, effortOverride, mcpServers);
-    let bridgeHealth: RuntimeSpawnPlan["bridgeHealth"];
-
-    if (remote) {
-      const mux = this.seamMcp?.muxForSession?.(record.id);
-      if (!mux) {
-        throw new Error(
-          `Session ${record.id} is bound to a remote bridge that is not connected`
-        );
-      }
-      bridgeHealth = mux;
-      spawnChild = (modelOverride, effortOverride) =>
-        spawnRemoteSlot(mux, {
-          mcpServers,
-          agentId,
-          model: modelOverride,
-          // Seam selects the scalar. Bridge recovery owns same-model rung 1
-          // only; transporting this plan never delegates execution identity.
-          modelFallbacks: this.planModelFallbacks({ agentId, location }, modelOverride ?? model, effortOverride, fallbackContextTokens),
-          effort: effortOverride,
-          cwd,
-          rung1Recovery: DEFAULT_REMOTE_RUNG1_POLICY,
-        });
+    // Every production runtime belongs to a bridge. Project MCP configuration
+    // is therefore resolved on the execution host, including `local`; reading
+    // it here would recreate the second spawn/configuration implementation
+    // that #575 removes.
+    if (!bridged) {
+      throw new Error(`Session ${record.id} has no execution bridge binding`);
     }
+    const mux = this.seamMcp?.muxForSession?.(record.id);
+    if (!mux) {
+      // Refuse this host-bound session only. Other bridge locations and all
+      // non-agent control-plane surfaces remain available (#575 blast radius).
+      throw new Error(`Session ${record.id} is bound to bridge "${location}" that is not connected`);
+    }
+    const bridgeHealth: RuntimeSpawnPlan["bridgeHealth"] = mux;
+    const spawnChild: RuntimeSpawnPlan["spawnChild"] = (modelOverride, effortOverride) =>
+      spawnRemoteSlot(mux, {
+        mcpServers,
+        agentId,
+        model: modelOverride,
+        // Seam selects the scalar. Bridge recovery owns same-model rung 1
+        // only; transporting this plan never delegates execution identity.
+        modelFallbacks: this.planModelFallbacks({ agentId, location }, modelOverride ?? model, effortOverride, fallbackContextTokens),
+        effort: effortOverride,
+        cwd,
+        rung1Recovery: DEFAULT_REMOTE_RUNG1_POLICY,
+      });
 
     return {
       agentId,
@@ -1385,16 +1367,14 @@ export class SessionRouter {
       fastMode,
       cwd,
       mcpServers,
-      remote,
       bridgeHealth,
       spawnChild,
     };
   }
 
   /**
-   * On session start: if the thread is bound to a remote host, call
-   * `markSessionBridge` so `planRuntimeSpawn` takes the remote path.
-   * Local stays unbound (loopback MCP as today).
+   * Bind every session to its execution bridge before planning. `local` is a
+   * separate bridge process, not an in-process direct-spawn exception (#575).
    */
   bindRecordLocation(record: SessionRecord, locationOverride?: string): string {
     const location =

@@ -68,6 +68,7 @@ import { connectSessiond } from "./sessiond-connect.js";
 import type { SessiondClient } from "./sessiond-client.js";
 import { SupervisedSlots, type SupervisedBridgeFrame } from "./supervised-slots.js";
 import { bridgeHello } from "./hello.js";
+import { acquireProcessLease } from "./process-lease.js";
 
 type WsCtor = typeof import("ws").WebSocket;
 type WssCtor = typeof import("ws").WebSocketServer;
@@ -882,6 +883,8 @@ const gistArg = extractFlag("--gist");
 const idArg = extractFlag("--id") ?? extractFlag("--bridge-id");
 const serverFlag = extractFlag("--server");
 const tokenFlag = extractFlag("--token");
+const tokenFileFlag = extractFlag("--token-file");
+const singletonSocket = extractFlag("--singleton-socket");
 const devFlag = extractBoolFlag("--dev") || process.env.SEAM_BRIDGE_DEV === "1";
 
 const localCwd = cwdArg ? cwdArg.replace(/^~/, homedir()) : process.cwd();
@@ -936,42 +939,55 @@ process.on("SIGUSR2", () => {
 });
 
 function usageAndExit(): never {
-  console.error("Usage: seam-bridge connect --server <wss-url> --id <bridgeId> --token <token> [--cwd <path>] [--dev]");
+  console.error("Usage: seam-bridge connect --server <wss-url> --id <bridgeId> (--token <token> | --token-file <path>) [--cwd <path>] [--dev]");
   console.error("       seam-bridge --server <port> --token <token> [--id <bridgeId>] [--cwd <path>] [--dev] [copilot-cmd]");
   console.error("       seam-bridge [--gist <owner/gistId>] <ws-url> <token> [--id <bridgeId>] [--cwd <path>] [--dev]");
   process.exit(1);
 }
 
-if (rawArgs[0] === "connect") {
-  rawArgs.shift();
-  const wsUrl = serverFlag ?? rawArgs[0];
-  const token = tokenFlag ?? rawArgs[1];
-  const copilotCmd = process.env.COPILOT_CMD ?? "copilot";
-  if (!wsUrl || !token) usageAndExit();
-  runClientMode(wsUrl, token, copilotCmd, localCwd, bridgeOpts);
-} else if (rawArgs[0] === "--server" || serverFlag) {
-  const port = Number(rawArgs[0] === "--server" ? rawArgs[1] : serverFlag);
-  const token = tokenFlag ?? (rawArgs[0] === "--server" ? rawArgs[2] : rawArgs[0]);
-  const copilotCmd = process.env.COPILOT_CMD ?? (rawArgs[0] === "--server" ? rawArgs[3] : rawArgs[1]) ?? "copilot";
-  if (!port || !token) usageAndExit();
-  runServerMode(port, token, copilotCmd, localCwd, bridgeOpts);
-} else {
-  // wsUrl may come from --gist flag or as a positional arg.
-  const wsUrlPositional = rawArgs[0];
-  const token = tokenFlag ?? rawArgs[1];
-  const copilotCmd = process.env.COPILOT_CMD ?? rawArgs[2] ?? "copilot";
-
-  if (!token && !gistArg) usageAndExit();
-
-  if (gistArg) {
-    const tokenFromArg = tokenFlag ?? rawArgs[0];
-    const copilotCmdFromArg = process.env.COPILOT_CMD ?? rawArgs[1] ?? "copilot";
-    if (!tokenFromArg) usageAndExit();
-    resolveUrlFromGist(gistArg).then((wsUrl) => {
-      runClientMode(wsUrl, tokenFromArg, copilotCmdFromArg, localCwd, bridgeOpts);
-    });
+async function main(): Promise<void> {
+  if (singletonSocket && !(await acquireProcessLease(singletonSocket))) {
+    console.error("[bridge] Another bridge process owns this singleton; exiting.");
+    return;
+  }
+  const tokenFromFile = tokenFileFlag ? (await fsp.readFile(tokenFileFlag, "utf8")).trim() : undefined;
+  if (tokenFileFlag && !tokenFromFile) throw new Error("bridge token file is empty");
+  if (rawArgs[0] === "connect") {
+    rawArgs.shift();
+    const wsUrl = serverFlag ?? rawArgs[0];
+    const token = tokenFlag ?? tokenFromFile ?? process.env.SEAM_BRIDGE_TOKEN ?? rawArgs[1];
+    const copilotCmd = process.env.COPILOT_CMD ?? "copilot";
+    if (!wsUrl || !token) usageAndExit();
+    runClientMode(wsUrl, token, copilotCmd, localCwd, bridgeOpts);
+  } else if (rawArgs[0] === "--server" || serverFlag) {
+    const port = Number(rawArgs[0] === "--server" ? rawArgs[1] : serverFlag);
+    const token = tokenFlag ?? tokenFromFile ?? process.env.SEAM_BRIDGE_TOKEN ?? (rawArgs[0] === "--server" ? rawArgs[2] : rawArgs[0]);
+    const copilotCmd = process.env.COPILOT_CMD ?? (rawArgs[0] === "--server" ? rawArgs[3] : rawArgs[1]) ?? "copilot";
+    if (!port || !token) usageAndExit();
+    runServerMode(port, token, copilotCmd, localCwd, bridgeOpts);
   } else {
-    if (!wsUrlPositional || !token) usageAndExit();
-    runClientMode(wsUrlPositional, token, copilotCmd, localCwd, bridgeOpts);
+    // wsUrl may come from --gist flag or as a positional arg.
+    const wsUrlPositional = rawArgs[0];
+    const token = tokenFlag ?? tokenFromFile ?? process.env.SEAM_BRIDGE_TOKEN ?? rawArgs[1];
+    const copilotCmd = process.env.COPILOT_CMD ?? rawArgs[2] ?? "copilot";
+
+    if (!token && !gistArg) usageAndExit();
+
+    if (gistArg) {
+      const tokenFromArg = tokenFlag ?? tokenFromFile ?? process.env.SEAM_BRIDGE_TOKEN ?? rawArgs[0];
+      const copilotCmdFromArg = process.env.COPILOT_CMD ?? rawArgs[1] ?? "copilot";
+      if (!tokenFromArg) usageAndExit();
+      resolveUrlFromGist(gistArg).then((wsUrl) => {
+        runClientMode(wsUrl, tokenFromArg, copilotCmdFromArg, localCwd, bridgeOpts);
+      });
+    } else {
+      if (!wsUrlPositional || !token) usageAndExit();
+      runClientMode(wsUrlPositional, token, copilotCmd, localCwd, bridgeOpts);
+    }
   }
 }
+
+void main().catch((error) => {
+  console.error(`[bridge] Startup failed: ${error instanceof Error ? error.message : String(error)}`);
+  process.exit(1);
+});

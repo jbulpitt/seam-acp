@@ -29,6 +29,7 @@ import type { ConfigMutationService } from "../packages/core/src/core/config-mut
 import type { SessionRecord, SessionConfigState } from "../packages/core/src/core/types.js";
 import type { SessionStore } from "../packages/core/src/core/session-store.js";
 import type { McpServer } from "@agentclientprotocol/sdk";
+import { hashBridgeToken } from "../packages/core/src/core/bridge-pairing.js";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
 
@@ -153,6 +154,7 @@ describe("remote spawn drives token + reachable MCP URL (#84)", () => {
       getMcpRegistry: () => registry,
       healthPort: 3000,
       dataDir: tmp,
+      localBridgeTokenHash: hashBridgeToken("local-test-token"),
     });
     return hub;
   }
@@ -165,7 +167,7 @@ describe("remote spawn drives token + reachable MCP URL (#84)", () => {
     expect(h.sessionBridgeId("discord:thread-remote")).toBe("mac");
   });
 
-  it("bound session rpc-spawns with X-Seam-Session and a non-loopback URL; unbound stays loopback", async () => {
+  it("routes remote and local sessions through their bridge without direct profile spawn", async () => {
     const registry = new SeamTokenRegistry();
     const h = await makeHub(registry);
     const rpcCalls: RpcCall[] = [];
@@ -185,8 +187,8 @@ describe("remote spawn drives token + reachable MCP URL (#84)", () => {
       seamMcp: {
         registry,
         getPort: () => 18765,
-        isRemoteSession: (sessionId) => !!h.sessionBridgeId(sessionId),
-        mcpServersForRemoteSpawn: (sessionId) => h.mcpServersForRemoteSpawn(sessionId),
+        isBridgeSession: (sessionId) => !!h.sessionBridgeId(sessionId),
+        mcpServersForBridgeSpawn: (sessionId) => h.mcpServersForBridgeSpawn(sessionId),
         muxForSession: (sessionId) => (h.sessionBridgeId(sessionId) ? mux : undefined),
       },
     });
@@ -200,7 +202,6 @@ describe("remote spawn drives token + reachable MCP URL (#84)", () => {
     }));
     const remoteRecord = makeRecord({ repoPath: remoteCwd });
     const plan = router.planRuntimeSpawn(remoteRecord);
-    expect(plan.remote).toBe(true);
     // The pathname belongs to the bridge host. Even if an unrelated local
     // directory has the same spelling, the controller must not read it.
     expect(plan.mcpServers.map((server) => server.name)).not.toContain("controllerOnly");
@@ -235,17 +236,21 @@ describe("remote spawn drives token + reachable MCP URL (#84)", () => {
     expect(localSpawnCalls).toHaveLength(0);
 
     const localRecord = makeRecord({ id: "discord:thread-local", channelRef: "thread-local" });
+    h.markSessionBridge(localRecord.id, "local");
     const localPlan = router.planRuntimeSpawn(localRecord);
-    expect(localPlan.remote).toBe(false);
     const localSeam = seamEntry(localPlan.mcpServers);
-    expect(localSeam.url).toBe("http://127.0.0.1:18765/mcp");
+    expect(localSeam.url).toBe("http://127.0.0.1:3000/mcp");
     expect(localSeam.headers[0]!.name).toBe("X-Seam-Session");
     const localAgain = router.planRuntimeSpawn(localRecord);
     expect(seamEntry(localAgain.mcpServers).headers[0]!.value).toBe(localSeam.headers[0]!.value);
 
-    localPlan.spawnChild(localPlan.model, localPlan.effort);
-    expect(rpcCalls).toHaveLength(1);
-    expect(localSpawnCalls).toHaveLength(1);
+    await localPlan.spawnChild(localPlan.model, localPlan.effort);
+    expect(rpcCalls).toHaveLength(2);
+    expect(rpcCalls[1]).toMatchObject({
+      method: "spawn",
+      opts: { agentId: "claude" },
+    });
+    expect(localSpawnCalls).toHaveLength(0);
   });
 
   it("mux queues stdin until rpc spawn is released", async () => {

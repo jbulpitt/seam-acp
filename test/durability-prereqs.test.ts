@@ -15,6 +15,7 @@ import type { DispatchSpec } from "../packages/core/src/core/dispatch/types.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import type { SessionRecord } from "../packages/core/src/core/types.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
+import { attachLocalBridge } from "./local-bridge-fixture.js";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
 
@@ -133,6 +134,7 @@ function makeOrch(store: SessionStore, dataDir: string): Orchestrator {
     store,
     renderer: {} as any,
   });
+  attachLocalBridge(orch, [catalogProfile], dataDir);
   (orch as any).postDispatchStartIndicator = async () => undefined;
   (orch as any).postDispatchOutput = async () => {};
   return orch;

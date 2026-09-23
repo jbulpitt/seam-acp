@@ -49,9 +49,9 @@ function setup(location: string, existing = true, failAt: "spawn" | "selection" 
   });
   const make = () => new SessionRouter({ logger: pino({ level: "silent" }), store, profiles: [profile],
     modelCatalog: fixtureModelCatalog([profile]), modelMetadata: { getAll: () => metadata },
-    defaultAgentId: "claude", defaultModel: "original", threadPresets: new Map([["worker", { location }]]), ...(location === "local" ? {} : {
-      seamMcp: { getPort: () => undefined, isRemoteSession: () => true, bindSessionLocation: vi.fn(), muxForSession: () => mux } as unknown as SeamMcpWiring,
-    }) });
+    defaultAgentId: "claude", defaultModel: "original", threadPresets: new Map([["worker", { location }]]),
+    seamMcp: { registry: {} as any, getPort: () => undefined, isBridgeSession: () => true,
+      bindSessionLocation: vi.fn(), muxForSession: () => mux } as unknown as SeamMcpWiring });
   return { make, profile, metadata, get store() { return store; }, localSpawns, remoteSpawns, select, load, create, prompt,
     reopen: () => { store.close(); store = new SessionStore(db); } };
 }
@@ -63,9 +63,9 @@ describe("production acquisition with persisted model selection", () => {
     expect(rt.getSessionInfo()).toMatchObject({ sessionId: "history", currentModelId: "sibling" });
     expect(h.create).not.toHaveBeenCalled();
     expect(h.prompt).not.toHaveBeenCalled();
-    const spawns = location === "local" ? h.localSpawns : h.remoteSpawns;
+    const spawns = h.remoteSpawns;
     expect(spawns.mock.calls.map(c => c[0])).toEqual(["original", "sibling"]);
-    expect((location === "local" ? h.remoteSpawns : h.localSpawns)).not.toHaveBeenCalled();
+    expect(h.localSpawns).not.toHaveBeenCalled();
     const cfg = h.store.readConfig(h.store.get("discord:worker")!);
     expect(cfg.model).toBe("original");
     expect(cfg.modelAcquisition).toMatchObject({ phase: "selected", index: 0, identity: { acpSessionId: "history", location } });
@@ -96,7 +96,7 @@ describe("production acquisition with persisted model selection", () => {
     const rt = await h.make().getOrStartRuntime(h.store.get("discord:worker")!, { resumeSessionId: "history" });
     expect(h.load).toHaveBeenCalledTimes(2);
     expect(h.select.mock.calls.map(c => c[0].value)).toEqual(["original", "sibling"]);
-    expect(h.localSpawns.mock.calls.map(c => c[0])).toEqual(["original", "sibling"]);
+    expect(h.remoteSpawns.mock.calls.map(c => c[0])).toEqual(["original", "sibling"]);
     expect(h.create).not.toHaveBeenCalled();
     expect(h.prompt).not.toHaveBeenCalled();
     await rt.dispose();
@@ -122,23 +122,23 @@ describe("production acquisition with persisted model selection", () => {
     await unaffected.dispose();
     budget.acpSessionId = "history";
     h.store.upsert({ ...h.store.get(row.id)!, configJson: JSON.stringify(cfg) });
-    h.localSpawns.mockClear();
+    h.remoteSpawns.mockClear();
     await expect(h.make().getOrStartRuntime(h.store.get(row.id)!, { resumeSessionId: "history" }))
       .rejects.toMatchObject({ acquisitionRecoveryExhausted: true });
-    expect(h.localSpawns).not.toHaveBeenCalled();
+    expect(h.remoteSpawns).not.toHaveBeenCalled();
   });
   it("keeps a boot budget exhausted but lets a new user turn retry a repaired original", async () => {
     const h = setup("local", true, "selection");
     h.select.mockRejectedValue(rejection());
     await expect(h.make().getOrStartRuntime(h.store.get("discord:worker")!, { resumeSessionId: "history" }))
       .rejects.toMatchObject({ acquisitionRecoveryExhausted: true });
-    h.localSpawns.mockClear();
+    h.remoteSpawns.mockClear();
     await expect(h.make().getOrStartRuntime(h.store.get("discord:worker")!, { resumeSessionId: "history" }))
       .rejects.toMatchObject({ acquisitionRecoveryExhausted: true });
-    expect(h.localSpawns).not.toHaveBeenCalled();
+    expect(h.remoteSpawns).not.toHaveBeenCalled();
     h.select.mockResolvedValue({ configOptions: [] });
     const rt = await h.make().getOrStartRuntime(h.store.get("discord:worker")!);
-    expect(h.localSpawns.mock.calls.map(c => c[0])).toEqual(["original"]);
+    expect(h.remoteSpawns.mock.calls.map(c => c[0])).toEqual(["original"]);
     expect(h.store.readConfig(h.store.get("discord:worker")!).modelAcquisition).toBeUndefined();
     await rt.dispose();
   });
@@ -150,7 +150,7 @@ describe("production acquisition with persisted model selection", () => {
     models.push({ modelId: "smaller", name: "smaller", contextLimit: 1_000_000 });
     h.metadata.push({ ...h.metadata[1]!, id: "smaller", name: "smaller", context_window: 1_000_000 });
     const rt = await h.make().getOrStartRuntime(h.store.get("discord:worker")!, { resumeSessionId: "history" });
-    await rt.dispose(); h.reopen(); h.localSpawns.mockClear();
+    await rt.dispose(); h.reopen(); h.remoteSpawns.mockClear();
     h.select.mockImplementation(async ({ value }) => {
       if (value === "sibling") throw rejection();
       return { configOptions: [] };
@@ -168,7 +168,7 @@ describe("production acquisition with persisted model selection", () => {
     h.reopen();
     await expect(h.make().getOrStartRuntime(h.store.get("discord:worker")!, { resumeSessionId: "history" }))
       .rejects.toMatchObject({ acquisitionRecoveryExhausted: true });
-    expect(h.localSpawns.mock.calls.map(c => c[0])).toEqual(["sibling"]);
+    expect(h.remoteSpawns.mock.calls.map(c => c[0])).toEqual(["sibling"]);
     expect(h.store.readConfig(h.store.get("discord:worker")!).modelAcquisition?.plan.requiredContextTokens).toBe(2_000_000);
     expect(h.create).not.toHaveBeenCalled();
     expect(h.prompt).not.toHaveBeenCalled();

@@ -11,7 +11,6 @@ import {
 } from "../packages/core/src/core/bridge-resume.js";
 import type { BridgeHub } from "../packages/core/src/core/bridge-hub.js";
 import { bindSessionLocation } from "../packages/core/src/core/location-bind.js";
-import { isLocalLocation } from "../packages/core/src/core/location.js";
 
 function fakeHub(opts?: {
   ready?: Set<string>;
@@ -30,7 +29,7 @@ function fakeHub(opts?: {
   }
   return {
     bound,
-    isBridgeReady: (id: string) => ready.has(id) || isLocalLocation(id),
+    isBridgeReady: (id: string) => ready.has(id),
     onBridgeReady: (listener: (bridgeId: string) => void) => {
       events.on("ready", listener);
       return () => {
@@ -38,17 +37,16 @@ function fakeHub(opts?: {
       };
     },
     markSessionBridge: (sessionId: string, bridgeId: string) => {
-      if (isLocalLocation(bridgeId)) bound.delete(sessionId);
-      else bound.set(sessionId, bridgeId);
+      bound.set(sessionId, bridgeId);
     },
   };
 }
 
 describe("resume same host (#85)", () => {
-  it("local resume does not wait on a bridge", async () => {
-    const hub = fakeHub();
-    const result = await waitUntilBridgeReady(hub, "local", { deadlineMs: 1 });
-    expect(result).toBe("local");
+  it("local resume waits for the local bridge like every other host", async () => {
+    const hub = fakeHub({ emitAfterMs: { id: "local", ms: 20 } });
+    const result = await waitUntilBridgeReady(hub, "local", { deadlineMs: 1000 });
+    expect(result).toBe("ready");
   });
 
   it("resume is deferred until the same bridge is ready (event, not poll)", async () => {
@@ -77,8 +75,8 @@ describe("resume same host (#85)", () => {
     const hub = fakeHub();
     bindSessionLocation(hub, "discord:thread-1", "mac");
     expect(hub.bound.get("discord:thread-1")).toBe("mac");
-    // A resume on the same host keeps mac. Switching to local would unbind —
-    // #85 forbids using that path for a @mac marker.
+    // A resume on the same host keeps mac. Switching to local would bind a
+    // different real bridge; #85 forbids that replacement.
     expect(hub.bound.get("discord:thread-1")).not.toBe("local");
     expect(hub.bound.get("discord:thread-1")).not.toBeUndefined();
   });

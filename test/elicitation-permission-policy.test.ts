@@ -15,6 +15,7 @@ import {
 } from "@agentclientprotocol/sdk";
 import type { AgentProfile } from "@seam/adapters";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
+import { localBridgeWiring } from "./local-bridge-fixture.js";
 import { SessionRouter } from "../packages/core/src/core/session-router.js";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
 import {
@@ -339,6 +340,7 @@ describe("SessionRouter permission vs elicitation wiring", () => {
       defaultAgentId: "codex",
       defaultModel: "gpt-test",
       defaultPermissionMode: "ask",
+      seamMcp: localBridgeWiring(profile),
     });
     router.setAskUser(async (_record, req) => {
       permissionCalls.push(req);

@@ -22,6 +22,7 @@ import {
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import type { SessionRecord } from "../packages/core/src/core/types.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
+import { attachLocalBridge } from "./local-bridge-fixture.js";
 import { DispatchSuspendedError } from "../packages/core/src/core/dispatch/attempt-store.js";
 import type { InjectTurnOptions } from "../packages/core/src/core/inject-turn.js";
 
@@ -131,6 +132,7 @@ function makeOrch(opts?: {
       panel: () => ({ title: "", fields: [] }),
     } as any,
   });
+  attachLocalBridge(orch, catalogProfiles as any, dir);
   (orch as any).postDispatchStartIndicator = async () => undefined;
   (orch as any).postDispatchOutput = async () => {};
   if (opts?.handleInner) {
@@ -164,7 +166,7 @@ async function seedInterrupted(spec: DispatchSpec = handoffSpec()): Promise<void
       defaultCwdForLocation: () => "/remote/workspace",
       markSessionBridge: () => {},
       get: () => ({ mux: {} }),
-      mcpServersForRemoteSpawn: () => undefined,
+      mcpServersForBridgeSpawn: () => undefined,
     } as any);
   }
   (orch as any).injectTurn = async (_t: unknown, _p: string, opts: InjectTurnOptions) => {
@@ -635,7 +637,7 @@ describe("watcher recoverStale vs resumeEnabled", () => {
       },
       markSessionBridge,
       get: () => ({ mux: {} }),
-      mcpServersForRemoteSpawn: () => undefined,
+      mcpServersForBridgeSpawn: () => undefined,
     } as any);
     const watcher = createRuntimeDispatchWatcher({ attempts: store.turnAttempts,
       dataDir: dir,

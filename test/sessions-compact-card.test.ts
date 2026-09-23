@@ -36,6 +36,7 @@ import os from "node:os";
 import path from "node:path";
 import { pino } from "pino";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
+import { attachLocalBridge } from "./local-bridge-fixture.js";
 
 /**
  * Three branches read a prompt template from a hard-coded absolute path. Stub
@@ -399,6 +400,7 @@ function makeHarness(opts: HarnessOpts = {}) {
     renderer: {} as any,
     modelCatalog: fixtureModelCatalog([profile, target, ...(agy ? [agy] : [])] as any),
   });
+  attachLocalBridge(orch, [profile, target, ...(agy ? [agy] : [])] as any, opts.dataDir ?? dataDir);
 
   // The compaction / rebuild pipelines are held open by explicit deferreds and
   // signal entry, so the test never has to guess that a job has started.

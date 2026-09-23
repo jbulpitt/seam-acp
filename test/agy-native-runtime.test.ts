@@ -115,7 +115,7 @@ describe("native AGY R2 runtime identity", () => {
       defaultModel: "Fixture Native Model",
       exposeGlobalStaging: false,
     });
-    const agent = new AgentRuntime({ profile, logger });
+    const agent = new AgentRuntime({ profile, logger, spawnFn: profile.spawn.bind(profile) });
     try {
       const usage = await fetchAgyUserStatus(fixture.runtime);
       expect(usage).toEqual({
@@ -384,6 +384,7 @@ describe("native AGY R2 runtime identity", () => {
         mutation,
         healthPort: 3000,
         dataDir: dir,
+        localBridgeTokenHash: "a".repeat(64),
       });
       const helloAck = vi.fn();
       const mux = {
@@ -505,7 +506,9 @@ describe("native AGY R2 runtime identity", () => {
         path.join(here, "..", "packages", "core", "src", "index.ts"),
         "utf8",
       );
-      expect(bootstrapSource).toContain(
+      // #575: the local bridge owns local adapter inventory/provenance. The
+      // controller must not publish a second, potentially disagreeing copy.
+      expect(bootstrapSource).not.toContain(
         "publishLocalAgyRuntimeProvenance(orchestrator, agyRuntime);",
       );
     } finally {

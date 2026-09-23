@@ -14,7 +14,7 @@ import type { SessionStore } from "../session-store.js";
 import type { SessionRouter } from "../session-router.js";
 import type { SessionRecord } from "../types.js";
 import { listSessionsForHost } from "../host-sessions.js";
-import { isLocalLocation, normalizeLocation } from "../location.js";
+import { normalizeLocation } from "../location.js";
 import type { WarmSetHostOpt } from "./hosts.js";
 import { BoundPool } from "./pool.js";
 import { selectWarmSet, type WarmCandidate } from "./select.js";
@@ -111,7 +111,7 @@ export class WarmSetManager {
 
   private async tickHost(host: WarmSetHostOpt, sessions: SessionRecord[]): Promise<void> {
     const location = normalizeLocation(host.id);
-    if (!isLocalLocation(location) && !this.opts.hub.isBridgeReady(location)) {
+    if (!this.opts.hub.isBridgeReady(location)) {
       this.opts.logger.debug({ location }, "warm-set: host not ready");
       return;
     }
@@ -171,18 +171,16 @@ export class WarmSetManager {
       void this.opts.router.invalidate(sessionId).catch(() => {});
       return;
     }
-    if (!isLocalLocation(location)) {
-      const runtime = this.opts.router.getRuntime(sessionId);
-      const slot = runtime?.getSlot?.();
-      const snap = slot != null
-        ? this.opts.hub.slotHealthFor?.(location)?.find((h) => h.slot === slot)
-        : undefined;
-      if (snap && !snap.alive) {
-        this.opts.logger.info({ session: sessionId, slot }, "warm-set: bridge slot dead; marking cold");
-        this.cold.set(sessionId, this.opts.store.get(sessionId)?.acpSessionId ?? "");
-        void this.opts.router.invalidate(sessionId).catch(() => {});
-        return;
-      }
+    const runtime = this.opts.router.getRuntime(sessionId);
+    const slot = runtime?.getSlot?.();
+    const snap = slot != null
+      ? this.opts.hub.slotHealthFor?.(location)?.find((h) => h.slot === slot)
+      : undefined;
+    if (snap && !snap.alive) {
+      this.opts.logger.info({ session: sessionId, slot }, "warm-set: bridge slot dead; marking cold");
+      this.cold.set(sessionId, this.opts.store.get(sessionId)?.acpSessionId ?? "");
+      void this.opts.router.invalidate(sessionId).catch(() => {});
+      return;
     }
     this.opts.router.getRuntime(sessionId)?.markActivity();
   }

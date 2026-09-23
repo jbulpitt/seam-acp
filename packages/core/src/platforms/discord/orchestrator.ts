@@ -65,7 +65,7 @@ import {
   type RemoteRecoveryResult,
 } from "@seam/adapters";
 import { DEFAULT_ERROR_RULES } from "../../core/error-resolution-rules.js";
-import { cleanTextForPreview, scanWorkspaces, type SessionSummary, type SessionSummaryLine, type ISessionManager } from "@seam/adapters";
+import { cleanTextForPreview, type SessionSummary, type SessionSummaryLine, type ISessionManager } from "@seam/adapters";
 import type { ModelCatalogService, CatalogBinding } from "../../core/model-catalog/service.js";
 import type { ModelIntelligenceRefreshResult } from "../../core/model-intelligence/manager.js";
 import { readRichHistory, renderHistory, type HistoryEvent, type RichHistory } from "../../core/compaction/source-reader.js";
@@ -294,7 +294,7 @@ import {
 import {
   bindSessionLocation,
   isolatedBindSessionId,
-  planIsolatedRemoteSpawn,
+  planIsolatedBridgeSpawn,
 } from "../../core/location-bind.js";
 import { remainingMaxAgeMs, waitUntilBridgeReady } from "../../core/bridge-resume.js";
 import {
@@ -5949,15 +5949,12 @@ export class Orchestrator {
         model: requestedModel,
         effort: opts.effort,
       });
-      const manager = opts.sessionManager ?? profile.sessionManager;
       let rt: AgentRuntime | undefined;
       let sessionId: string | undefined;
-      // Location selects the catalog. It does not, by itself, select the
-      // machine. A remote isolated turn with no caller-supplied spawn plan
-      // uses the host planner. If that host is unreachable this turn fails;
-      // the controller's profile.spawn is not a fallback (#466, #480).
-      // Callers that already passed spawnFn (schedules, ingest, dispatch)
-      // keep their plan. Local turns still use profile.spawn.
+      // Location selects both catalog and execution bridge. Callers that
+      // already passed a spawn plan keep it; otherwise this shared planner
+      // routes local and remote alike. A disconnected host refuses this turn
+      // only; direct profile.spawn is not a fallback (#466/#480/#575).
       let spawnFn = opts.spawnFn;
       let mcpServers = opts.mcpServers ?? [];
       if (!spawnFn) {
@@ -5991,13 +5988,9 @@ export class Orchestrator {
           mcpServers,
           // #487: isolated schedules/dispatches bypass SessionRouter's runtime
           // construction, but must consult the same child-owning bridge too.
-          bridgeHealth: isLocalLocation(location) ? undefined : this.bridgeHub?.get(location)?.mux,
+          bridgeHealth: this.bridgeHub?.get(location)?.mux,
           ...(selection.model ? { effortDescriptor: selection.model.effort } : {}),
-          spawnFn: spawnFn ?? (() => profile.spawn(
-            selection.raw.model,
-            selection.raw.effort,
-            mcpServers
-          )),
+          spawnFn,
         });
         await acquire(() => rt!.start());
         opts.lifecycle?.onRuntime?.(rt.getProcessId?.(), rt.getProviderIdentity?.());
@@ -6077,14 +6070,14 @@ export class Orchestrator {
           const sid = rt.getSessionInfo()?.sessionId;
           await rt.dispose().catch(() => {});
           if (sid && (!opts.lifecycle || opts.lifecycle.mayDeleteSession())) {
-            // #466: a remote session belongs to that host even when getProfile
-            // returned a local definition. Never delete a same-named local
-            // conversation; local cleanup and retained recovery remain intact.
-            if (!isLocalLocation(location)) {
-              await this.bridgeHub?.rpc(location, "deleteSession", { cwd, sessionId: sid }, profile.id).catch(() => {});
-            } else {
-              await manager?.deleteSession?.(cwd, sid).catch(() => {});
-            }
+            // #466/#575: the execution host owns the session for every
+            // location. Never delete a same-named controller-side session.
+            await this.bridgeHub?.rpc(
+              location,
+              "deleteSession",
+              { cwd, sessionId: sid },
+              profile.id,
+            ).catch(() => {});
           }
         }
       }
@@ -6649,11 +6642,10 @@ export class Orchestrator {
   /**
    * Where an isolated child actually starts (#480).
    *
-   * Refuses only this launch when a remote host has no connected bridge.
-   * Local launches, callers that already hold a spawn plan, and every other
-   * host keep working. There is no local spawn fallback: a summary written
-   * by the controller's provider would be the wrong context, and compaction
-   * persists it.
+   * Refuses only this launch when its host has no connected bridge. Every
+   * other host and non-agent control-plane surface keeps working. There is no
+   * direct spawn fallback: it would create a second child owner and destroy
+   * restart adoption (#575).
    */
   private launchForLocation(args: {
     profile: AgentProfile;
@@ -6663,11 +6655,10 @@ export class Orchestrator {
     effort?: string;
     mcpServers?: McpServer[];
     sessionId: string;
-  }): { spawnFn?: InjectTurnOptions["spawnFn"]; mcpServers: McpServer[] } {
+  }): { spawnFn: NonNullable<InjectTurnOptions["spawnFn"]>; mcpServers: McpServer[] } {
     const mcpServers = args.mcpServers ?? [];
-    if (isLocalLocation(args.location)) return { mcpServers };
     if (!this.bridgeHub) throw new Error(`bridge "${args.location}" is not connected`);
-    const planned = planIsolatedRemoteSpawn({
+    const planned = planIsolatedBridgeSpawn({
       hub: this.bridgeHub,
       sessionId: args.sessionId,
       location: args.location,
@@ -6692,16 +6683,12 @@ export class Orchestrator {
     label: string;
   }): Promise<void> {
     try {
-      if (!isLocalLocation(args.location)) {
-        await this.bridgeHub?.rpc(
-          args.location,
-          "deleteSession",
-          { cwd: args.cwd, sessionId: args.sessionId },
-          args.profile.id,
-        );
-      } else {
-        await args.manager?.deleteSession?.(args.cwd, args.sessionId);
-      }
+      await this.bridgeHub?.rpc(
+        args.location,
+        "deleteSession",
+        { cwd: args.cwd, sessionId: args.sessionId },
+        args.profile.id,
+      );
     } catch (err) {
       this.logger.warn({ err, sessionId: args.sessionId }, args.label);
     }
@@ -6740,7 +6727,7 @@ export class Orchestrator {
         profile,
         logger: this.logger.child({ compaction: "seed" }),
         mcpServers: launch.mcpServers,
-        ...(launch.spawnFn ? { spawnFn: launch.spawnFn } : {}),
+        spawnFn: launch.spawnFn,
       });
       await rt.start();
       const info = await rt.newSession({ cwd, ...(model ? { model } : {}), ...(effort ? { effort } : {}) });
@@ -7038,9 +7025,7 @@ export class Orchestrator {
       await this.abandonLiveMarker(marker, "bridge not ready (past max-age)");
       return;
     }
-    if (!isLocalLocation(loc)) {
-      bindSessionLocation(this.bridgeHub, marker.sessionRecordId, loc);
-    }
+    bindSessionLocation(this.bridgeHub, marker.sessionRecordId, loc);
     await this.refireLiveTurn(marker);
   }
 
@@ -7050,7 +7035,6 @@ export class Orchestrator {
     maxAgeSeconds: number,
     now: Date
   ): Promise<"ok" | "abandon"> {
-    if (isLocalLocation(location)) return "ok";
     if (!this.bridgeHub) return "abandon";
     const deadlineMs = remainingMaxAgeMs(startedUtc, maxAgeSeconds, now);
     const result = await waitUntilBridgeReady(this.bridgeHub, location, { deadlineMs });
@@ -7125,7 +7109,7 @@ export class Orchestrator {
     );
   }
 
-  /** Isolated workers on a bridge: bind + remote spawn. Live runs bind in SessionRouter. */
+  /** Isolated workers: bind + bridge spawn. Live runs bind in SessionRouter. */
   private remoteDispatchSpawnOpts(opts: {
     spec: DispatchSpec;
     record: SessionRecord;
@@ -7154,18 +7138,10 @@ export class Orchestrator {
       model: requestedModel,
       effort: opts.effort,
     });
-    if (isLocalLocation(opts.workerLocation)) {
-      return {
-        mcpServers: opts.mcpServers ?? this.router.reuseMcpServers(opts.record.id),
-        model: selection.normalized.model,
-        effort: selection.normalized.effort,
-        location: opts.workerLocation,
-      };
-    }
     if (!this.bridgeHub) {
       throw new Error(`dispatch ${opts.spec.id}: location "${opts.workerLocation}" needs a connected bridge`);
     }
-    const planned = planIsolatedRemoteSpawn({
+    const planned = planIsolatedBridgeSpawn({
       hub: this.bridgeHub,
       sessionId: isolatedBindSessionId(opts.spec.id),
       location: opts.workerLocation,
@@ -7754,21 +7730,20 @@ export class Orchestrator {
   // --- parked prompts (#88) -------------------------------------------------
 
   /**
-   * Gate for #88: this user message would park because the thread is bound to
-   * a remote bridge that is not ready. Side-effect free — the D9 live-path
+   * Gate for #88: this user message would park because its execution bridge
+   * is not ready. Side-effect free — the D9 live-path
    * clear uses this so it does not wipe a row we are about to replace.
    */
   private wouldParkForOfflineBridge(msg: IncomingMessage): boolean {
     if (!msg.raw) return false;
     if (!this.bridgeHub) return false;
     const location = resolveThreadLocation(this.config, msg.channel.id);
-    if (isLocalLocation(location)) return false;
     if (this.bridgeHub.isBridgeReady(location)) return false;
     return true;
   }
 
   /**
-   * Park this user message if the thread is bound to a remote bridge that is
+   * Park this user message if the thread's execution bridge is
    * not ready. Returns true when parked (caller must return without starting
    * a runtime). Real Discord messages only (`msg.raw`) — synthetic
    * schedule/wake/resume turns go through Inner and must not park here.
@@ -7800,13 +7775,12 @@ export class Orchestrator {
     skipped: string[];
   }): string {
     const host = this.parkedHostLabel(opts.location);
-    const remote = !isLocalLocation(opts.location);
-    const ready = !remote || !!this.bridgeHub?.isBridgeReady(opts.location);
+    const ready = !!this.bridgeHub?.isBridgeReady(opts.location);
     let body: string;
     if (opts.kind === "user_queue") {
       const when: string[] = [];
       if (opts.busy) when.push("the current turn ends");
-      if (remote && !ready) when.push(`**${host}** reconnects`);
+      if (!ready) when.push(`**${host}** reconnects`);
       const clause =
         when.length === 0
           ? `when **${host}** reconnects`
@@ -8065,15 +8039,10 @@ export class Orchestrator {
     bindSessionLocation(this.bridgeHub, record.id, parked.location);
     const cwd = this.effectiveCwd(record);
     const pathLines: string[] = [];
-    const ferryToHost = !isLocalLocation(parked.location);
     for (const a of parked.attachments) {
       const bytes = await loadParkedAttachmentBytes(this.config.DATA_DIR, parked.id, a);
       if (!bytes) {
         pathLines.push(`- \`${a.filename}\` — could not be loaded from parked storage`);
-        continue;
-      }
-      if (!ferryToHost) {
-        pathLines.push(`- \`${a.filename}\` — parked locally (not ferried)`);
         continue;
       }
       try {
@@ -8209,7 +8178,7 @@ export class Orchestrator {
       );
       return;
     }
-    if (!isLocalLocation(parked.location) && !this.bridgeHub?.isBridgeReady(parked.location)) {
+    if (!this.bridgeHub?.isBridgeReady(parked.location)) {
       return;
     }
     this.store.deleteParked(parked.id);
@@ -9135,8 +9104,7 @@ export class Orchestrator {
     const channelId = record.channelRef;
     const location = resolveThreadLocation(this.config, channelId);
     const busy = this.channelQueues.has(channelId);
-    const ready =
-      isLocalLocation(location) || !!this.bridgeHub?.isBridgeReady(location);
+    const ready = !!this.bridgeHub?.isBridgeReady(location);
     const channel: ChannelRef = {
       platform: PLATFORM,
       id: channelId,
@@ -10786,12 +10754,6 @@ export class Orchestrator {
       };
       this.ingestJobs.set(spec.id, synthetic);
 
-      // A remote plan mints its own reachable Seam MCP entry through BridgeHub.
-      // Feeding it the local entry would duplicate the server name and leak a
-      // loopback URL to the bridge. Local ingest keeps the direct mint path.
-      const mcpServers = isLocalLocation(location)
-        ? this.router.mintMcpServersForSession(spec.id)
-        : undefined;
       const isolatedSpawn = this.remoteDispatchSpawnOpts({
         spec,
         record: synthetic,
@@ -10801,7 +10763,6 @@ export class Orchestrator {
         cwd,
         ...(model ? { model } : {}),
         ...(effort ? { effort } : {}),
-        ...(mcpServers ? { mcpServers } : {}),
       });
       const resumeSessionId = previousAttempt?.acpSessionId ?? undefined;
       if (isResume && !resumeSessionId) {
@@ -12900,25 +12861,19 @@ export class Orchestrator {
       logContext: { scheduled: "run", location, agentId: profile.id },
     };
     try {
-      if (!isLocalLocation(location)) {
-        // #466: location metadata only scoped catalog lookup; without a spawn
-        // plan these remote schedules ran locally. Refuse only this occurrence
-        // if its bridge is unavailable; local schedules and other hosts work.
-        // Reuse the dispatch planner, but keep the authoring thread's MCP token
-        // (not a dispatch-scoped token). The bridge resolves project MCP at cwd;
-        // never read the controller's same-named directory or send loopback MCP.
-        if (!this.bridgeHub) throw new Error(`bridge "${location}" is not connected`);
-        const selection = this.modelCatalog.resolve({ agentId: profile.id, location }, {
-          model: model ?? "default", effort,
-        });
-        const planned = planIsolatedRemoteSpawn({
-          hub: this.bridgeHub, sessionId: record.id, location, agentId: profile.id,
-          cwd, model: selection.raw.model, effort: selection.raw.effort,
-          globalMcpServers: options.mcpServers?.filter(server => server.name !== "seam-mcp"),
-        });
-        options.spawnFn = planned.spawnFn;
-        options.mcpServers = planned.mcpServers;
-      }
+      // #466/#575: location metadata must select the execution boundary for
+      // every host. Refuse only this occurrence when that bridge is unavailable.
+      if (!this.bridgeHub) throw new Error(`bridge "${location}" is not connected`);
+      const selection = this.modelCatalog.resolve({ agentId: profile.id, location }, {
+        model: model ?? "default", effort,
+      });
+      const planned = planIsolatedBridgeSpawn({
+        hub: this.bridgeHub, sessionId: record.id, location, agentId: profile.id,
+        cwd, model: selection.raw.model, effort: selection.raw.effort,
+        globalMcpServers: options.mcpServers?.filter(server => server.name !== "seam-mcp"),
+      });
+      options.spawnFn = planned.spawnFn;
+      options.mcpServers = planned.mcpServers;
     } catch (cause) {
       // Planning failed before injectTurn could record an outcome. Use the same
       // fenced lifecycle, so the durable occurrence keeps the actual host cause
@@ -16001,7 +15956,7 @@ export class Orchestrator {
             await this.abandonDispatchSpec(spec, "bridge not ready (past max-age)");
             return;
           }
-          if (!isLocalLocation(loc)) bindSessionLocation(this.bridgeHub, `discord:${spec.target}`, loc);
+          bindSessionLocation(this.bridgeHub, `discord:${spec.target}`, loc);
           const refusal = await this.requestDispatchContinuation(spec);
           if (refusal) await this.observeRetainedDispatch(spec, DispatchSuspendedError.defect(spec.id, refusal));
         })());
@@ -18645,10 +18600,19 @@ export class Orchestrator {
           `The file contains ${rawMessages.length} messages (${sanitizedTranscript.length} chars). ` +
           `You MUST read the ENTIRE file before summarizing — do not stop partway through.`;
 
+        const launch = this.launchForLocation({
+          profile,
+          location: compactLocation,
+          cwd,
+          model: compactionModel,
+          effort: "low",
+          sessionId: record.id,
+        });
         tempRuntime = new AgentRuntime({
           profile,
           logger: this.logger.child({ session: `temp-compact-thread-${channelRef.id}` }),
-          mcpServers: [],
+          mcpServers: launch.mcpServers,
+          spawnFn: launch.spawnFn,
         });
         await tempRuntime.start();
         await tempRuntime.newSession({
@@ -20051,11 +20015,7 @@ export class Orchestrator {
                 logger: this.logger.child({ session: `temp-summary-${session.sessionId}` }),
                 mcpServers: launch.mcpServers,
                 ...(summarySelection.model ? { effortDescriptor: summarySelection.model.effort } : {}),
-                spawnFn: launch.spawnFn ?? (() => profile.spawn(
-                  summarySelection.raw.model,
-                  summarySelection.raw.effort,
-                  []
-                )),
+                spawnFn: launch.spawnFn,
               });
 
               await tempRuntime.start();
@@ -20403,7 +20363,7 @@ export class Orchestrator {
               profile,
               logger: this.logger.child({ session: `temp-import-${session.sessionId}` }),
               mcpServers: launch.mcpServers,
-              ...(launch.spawnFn ? { spawnFn: launch.spawnFn } : {}),
+              spawnFn: launch.spawnFn,
             });
 
             await tempRuntime.start();
@@ -20618,7 +20578,7 @@ export class Orchestrator {
                 profile,
                 logger: this.logger.child({ session: `temp-migrate-${session.sessionId}` }),
                 mcpServers: launch.mcpServers,
-                ...(launch.spawnFn ? { spawnFn: launch.spawnFn } : {}),
+                spawnFn: launch.spawnFn,
               });
 
               await tempRuntime.start();
@@ -21239,9 +21199,7 @@ export class Orchestrator {
     const location = resolveThreadLocation(this.config, threadId);
     if (!dirs) {
       await i.reply({
-        content: isLocalLocation(location)
-          ? `REPOS_ROOT not found: \`${this.config.REPOS_ROOT}\``
-          : `Host \`${location}\` did not report a workspace root.`,
+        content: `Host \`${location}\` did not report a workspace root.`,
         flags: MessageFlags.Ephemeral,
       });
       return;
@@ -23607,8 +23565,7 @@ export class Orchestrator {
   /**
    * Resolve user input to a repo path on the thread's bound host. Absolute
    * paths pass through (caller still sandboxes with isWithinRoot on local);
-   * relative names join under REPOS_ROOT locally, or match a listed workspace
-   * by basename on a remote host.
+   * relative names match the execution bridge's listed workspace by basename.
    */
   private async resolveRequestedRepoPath(
     channel: ChannelRef,
@@ -23616,9 +23573,6 @@ export class Orchestrator {
     locationOverride?: string
   ): Promise<string> {
     const location = locationOverride ?? resolveThreadLocation(this.config, channel.id);
-    if (isLocalLocation(location)) {
-      return resolveRepoPath(this.config.REPOS_ROOT, requested);
-    }
     if (requested.startsWith("/")) return requested;
     return (
       (await this.listHostWorkspacePaths(channel.id, location))?.find(
@@ -23674,9 +23628,7 @@ export class Orchestrator {
     if (dirs === undefined) {
       await this.adapter.sendMessage(
         channel,
-        isLocalLocation(location)
-          ? `❌ REPOS_ROOT not found: \`${this.config.REPOS_ROOT}\``
-          : `❌ Host \`${location}\` did not report workspaces.`
+        `❌ Host \`${location}\` did not report workspaces.`
       );
       return null;
     }
@@ -23751,8 +23703,8 @@ export class Orchestrator {
   }
 
   /**
-   * D11: enumerate workspaces on the bound host. Remote → rpc listWorkspaces
-   * (absolute host paths, no cwd rewrite). Local → loopback scan of REPOS_ROOT.
+   * D11/#575: enumerate workspaces on the bound bridge. Local and remote use
+   * the same RPC and readiness semantics.
    */
   private async listHostWorkspacePaths(
     threadId?: string,
@@ -23765,16 +23717,10 @@ export class Orchestrator {
         return ws.map((w) => w.path);
       } catch (err) {
         this.logger.warn({ err, location }, "listWorkspaces on host failed");
-        if (!isLocalLocation(location)) return [];
+        return [];
       }
     }
-    return this.listRepoDirs();
-  }
-
-  private listRepoDirs(): string[] | undefined {
-    const root = this.config.REPOS_ROOT;
-    if (!fs.existsSync(root)) return undefined;
-    return scanWorkspaces(root).map((w) => w.path);
+    return [];
   }
 
   // --- /seam preset … -------------------------------------------------------

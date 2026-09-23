@@ -163,14 +163,14 @@ describe("park while remote bridge offline (#88)", () => {
     expect(sent.join(" ")).toMatch(/huge\.bin/);
   });
 
-  it("does not park a local thread", async () => {
+  it("parks a local thread while its real bridge is offline", async () => {
     const { orch } = makeOrch({ ready: false });
     (orch as any).config.threadPresets = new Map();
     const inner = vi.fn(async () => {});
     (orch as any).handleIncomingMessageInner = inner;
     await (orch as any).handleIncomingMessage(userMsg());
-    expect(store.getParkedByChannel("discord", "thread-1")).toBeNull();
-    expect(inner).toHaveBeenCalledTimes(1);
+    expect(store.getParkedByChannel("discord", "thread-1")).toMatchObject({ location: "local" });
+    expect(inner).not.toHaveBeenCalled();
   });
 
   it("does not park when the bridge is already ready", async () => {

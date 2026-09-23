@@ -8,6 +8,7 @@ import type { SessionStore } from "../packages/core/src/core/session-store.js";
 import type { SessionRecord } from "../packages/core/src/core/types.js";
 import type { ModelMetadata } from "../packages/core/src/core/model-metadata/types.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
+import { localBridgeWiring } from "./local-bridge-fixture.js";
 
 const logger = pino({ level: "silent" });
 const profile = { id: "claude", defaultModel: "original",
@@ -35,7 +36,7 @@ function connection(fail: (model: string) => unknown = model => model === "origi
 }
 function runtime(plan = fallback(), fail?: (model: string) => unknown) {
   const compute = vi.fn(() => plan);
-  const rt = new AgentRuntime({ profile, logger, modelFallbacks: compute });
+  const rt = new AgentRuntime({ profile, logger, modelFallbacks: compute, spawnFn: () => { throw new Error("unused"); } });
   const conn = connection(fail);
   Object.assign(rt, { connection: conn, promptCapabilities: {} });
   return { rt, conn, compute };
@@ -130,7 +131,8 @@ describe("production router → real runtime → synthetic ACP model boundary", 
       Object.assign(this, { connection: conn, promptCapabilities: {} });
     });
     const router = new SessionRouter({ logger, store, profiles: [boundProfile], modelCatalog,
-      modelMetadata: { getAll: () => rows }, defaultAgentId: "claude", defaultModel: "original" });
+      modelMetadata: { getAll: () => rows }, defaultAgentId: "claude", defaultModel: "original",
+      seamMcp: localBridgeWiring(boundProfile) });
     const rt = await router.getOrStartRuntime(record);
     expect(attempts(conn)).toEqual(["original", "sibling"]);
     expect(rt.getSessionInfo()).toMatchObject({ sessionId: "same-session", currentModelId: "sibling" });

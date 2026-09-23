@@ -90,7 +90,7 @@ export function listHosts(opts: {
       id: LOCAL_LOCATION,
       emoji: LOCAL_HOST_EMOJI,
       shortName: LOCAL_LOCATION,
-      ready: true,
+      ready: opts.connected?.has(LOCAL_LOCATION) === true,
     },
   ];
   for (const b of opts.bridges) {
@@ -111,10 +111,11 @@ export interface AgentLocationChoice {
   description: string;
 }
 
-/** Flattened picker entries: local = every control-plane profile; remote =
- *  only agent ids that host advertised as installed (hello inventory).
- *  A deny-list entry is omitted rather than shown disabled — offering a
- *  choice that spawn will refuse is how the picker becomes decoration. */
+/** Flattened picker entries from each bridge's advertised inventory. Local is
+ *  a bridge too (#575), so the controller never invents a local capability
+ *  merely because it has a metadata profile for that agent. A deny-list entry
+ *  is omitted rather than shown disabled — offering a choice that spawn will
+ *  refuse is how the picker becomes decoration. */
 export function listAgentLocationChoices(opts: {
   profiles: ReadonlyArray<Pick<AgentProfile, "id" | "displayName">>;
   hosts: ReadonlyArray<HostInfo>;
@@ -127,17 +128,14 @@ export function listAgentLocationChoices(opts: {
   const deny = opts.deny ?? [];
   const out: AgentLocationChoice[] = [];
   for (const host of opts.hosts) {
-    const remoteIds =
-      host.id === LOCAL_LOCATION ? undefined : opts.agentsByHost?.get(host.id);
-    const profiles = host.id === LOCAL_LOCATION
-      ? [...opts.profiles]
-      : [
-          ...opts.profiles.filter((p) => remoteIds?.has(p.id)),
-          ...[...(remoteIds ?? [])]
-            .filter((id) => !opts.profiles.some((profile) => profile.id === id))
-            .sort()
-            .map((id) => ({ id, displayName: id })),
-        ];
+    const advertisedIds = opts.agentsByHost?.get(host.id);
+    const profiles = [
+      ...opts.profiles.filter((p) => advertisedIds?.has(p.id)),
+      ...[...(advertisedIds ?? [])]
+        .filter((id) => !opts.profiles.some((profile) => profile.id === id))
+        .sort()
+        .map((id) => ({ id, displayName: id })),
+    ];
     for (const p of profiles) {
       if (isAgentLocationDenied(p.id, host.id, deny)) continue;
       const value = formatAgentAtLocation(p.id, host.id);
@@ -324,30 +322,10 @@ export function getAgentLocationDeny(): readonly AgentLocationDeny[] {
 }
 
 /**
- * Local spawn is `profile.spawn`. Remote turns use `spawnFn` / `spawnRemoteSlot`,
- * so wrapping spawn refuses `agent@local` without touching `copilot@fhr-server`.
- * A deny list that only filters the picker is decoration; this is the spawn gate.
- */
-export function guardLocalProfileSpawn<T extends Pick<AgentProfile, "id" | "spawn">>(
-  profile: T,
-  deny: readonly AgentLocationDeny[],
-): T {
-  if (!isAgentLocationDenied(profile.id, LOCAL_LOCATION, deny)) return profile;
-  const spawn = profile.spawn.bind(profile);
-  return {
-    ...profile,
-    spawn: ((...args: Parameters<AgentProfile["spawn"]>) => {
-      assertAgentLocationAllowed(profile.id, LOCAL_LOCATION, deny);
-      return spawn(...args);
-    }) as T["spawn"],
-  };
-}
-
-/**
- * Wire the deny list onto a SessionRouter without editing session-router.ts
- * (#448 is live there). getProfile returning undefined is what
- * `isAgentAvailable` and leftover-session planning consult; planRuntimeSpawn
- * is wrapped so a mutation that restores getProfile still cannot spawn.
+ * Wire the deny list onto a SessionRouter. getProfile returning undefined is
+ * what `isAgentAvailable` and leftover-session planning consult;
+ * planRuntimeSpawn is wrapped so a mutation that restores getProfile still
+ * cannot ask the local bridge to spawn a denied adapter.
  */
 export function installAgentLocationDeny<R>(
   router: {

@@ -72,7 +72,7 @@ class FakeConn {
 }
 
 function makeRuntime() {
-  const rt = new AgentRuntime({ profile: fakeProfile, logger });
+  const rt = new AgentRuntime({ profile: fakeProfile, logger, spawnFn: () => { throw new Error("unused"); } });
   const conn = new FakeConn(rt);
   // Inject the fake connection + capabilities, bypassing start()/spawn.
   (rt as unknown as { connection: unknown }).connection = conn;

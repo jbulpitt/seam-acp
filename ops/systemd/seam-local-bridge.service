@@ -1,0 +1,36 @@
+[Unit]
+Description=Seam bridge for the controller host
+Wants=network-online.target
+After=network-online.target seam-sessiond.service
+Requires=seam-sessiond.service
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/Projects/seam-acp
+Environment=HOME=/home/ubuntu
+Environment=NODE_ENV=production
+Environment=PATH=/home/ubuntu/.nvm/versions/node/v22.22.2/bin:/home/ubuntu/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=DATA_DIR=/home/ubuntu/Projects/seam-acp/data
+Environment=REPOS_ROOT=/home/ubuntu/Projects
+Environment=HEALTH_PORT=3000
+Environment=SEAM_SESSIOND_SOCKET=/run/seam-sessiond/control.sock
+Environment=SEAM_SESSIOND_STATE=/run/seam-sessiond/slots.json
+EnvironmentFile=-/home/ubuntu/Projects/seam-acp/.env
+RuntimeDirectory=seam-local-bridge
+RuntimeDirectoryMode=0700
+ExecStart=/home/ubuntu/.nvm/versions/node/v22.22.2/bin/node packages/bridge/dist/index.js connect --server ws://127.0.0.1:${HEALTH_PORT}/bridge --id local --token-file ${DATA_DIR}/local-bridge/token --cwd ${REPOS_ROOT} --singleton-socket /run/seam-local-bridge/bridge.sock
+Restart=always
+RestartSec=2s
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=30s
+FinalKillSignal=SIGKILL
+SendSIGKILL=yes
+OOMPolicy=continue
+LimitNOFILE=65535
+SyslogIdentifier=seam-local-bridge
+
+[Install]
+WantedBy=multi-user.target

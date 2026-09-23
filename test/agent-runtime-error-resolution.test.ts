@@ -12,7 +12,7 @@ function fixture(error: unknown, classifyError?: AgentProfile["classifyError"], 
   claudeCredentialFacts?: () => ClaudeCredentialFacts | undefined) {
   const logger = { warn: vi.fn(), info: vi.fn(), error: vi.fn(), debug: vi.fn(), child() { return this; } };
   const profile = { id: agentId, classifyError, spawn: () => { throw error; } } as unknown as AgentProfile;
-  const runtime = new AgentRuntime({ profile, logger: logger as unknown as Logger, bridgeHealth, claudeCredentialFacts });
+  const runtime = new AgentRuntime({ profile, logger: logger as unknown as Logger, bridgeHealth, claudeCredentialFacts, spawnFn: () => { throw error; } });
   const prompt = vi.fn().mockRejectedValue(error);
   // This suite isolates classification; prompt recovery has its own behavioral
   // suite. Ephemeral work is the production one-attempt path, not a mock gate.

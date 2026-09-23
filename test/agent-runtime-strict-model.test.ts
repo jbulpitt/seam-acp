@@ -51,7 +51,7 @@ class FakeConn {
 
 function makeRuntime() {
   const { logger, warns } = makeLogger();
-  const rt = new AgentRuntime({ profile: fakeProfile, logger });
+  const rt = new AgentRuntime({ profile: fakeProfile, logger, spawnFn: () => { throw new Error("unused"); } });
   const conn = new FakeConn();
   (rt as unknown as { connection: unknown }).connection = conn;
   (rt as unknown as { promptCapabilities: unknown }).promptCapabilities = {};

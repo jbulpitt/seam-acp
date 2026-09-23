@@ -146,7 +146,7 @@ describe.sequential("#503 child-owned AGY CSRF authentication", () => {
 
   it("authenticates stream and metadata with a fresh token on continuation", async () => {
     const f = subject({ SEAM_AGY_CSRF_MODE: "enforce" });
-    const runtime = new AgentRuntime({ profile: f.profile, logger });
+    const runtime = new AgentRuntime({ profile: f.profile, logger, spawnFn: f.profile.spawn.bind(f.profile) });
     cleanups.push(() => runtime.dispose().catch(() => {}));
     await runtime.start();
     await runtime.newSession({ cwd: f.root, model: "fixture-native-model", strictModel: true });
@@ -193,8 +193,8 @@ describe.sequential("#503 child-owned AGY CSRF authentication", () => {
 
   it("keeps concurrent children on distinct launch/header pairs and private logs", async () => {
     const f = subject({ SEAM_AGY_CSRF_MODE: "enforce" });
-    const first = new AgentRuntime({ profile: f.profile, logger });
-    const second = new AgentRuntime({ profile: f.profile, logger });
+    const first = new AgentRuntime({ profile: f.profile, logger, spawnFn: f.profile.spawn.bind(f.profile) });
+    const second = new AgentRuntime({ profile: f.profile, logger, spawnFn: f.profile.spawn.bind(f.profile) });
     cleanups.push(() => Promise.all([first.dispose().catch(() => {}), second.dispose().catch(() => {})]).then(() => {}));
     await Promise.all([first.start(), second.start()]);
     await Promise.all([
@@ -256,7 +256,7 @@ describe.sequential("#503 child-owned AGY CSRF authentication", () => {
     const candidate = await f.profile.catalog.fetch();
     expect(candidate.models).toHaveLength(2);
 
-    const runtime = new AgentRuntime({ profile: f.profile, logger });
+    const runtime = new AgentRuntime({ profile: f.profile, logger, spawnFn: f.profile.spawn.bind(f.profile) });
     cleanups.push(() => runtime.dispose().catch(() => {}));
     await runtime.start();
     await runtime.newSession({ cwd: f.root, model: "fixture-native-model", strictModel: true });

@@ -16,7 +16,6 @@ import type { AgentProfile } from "@seam/adapters";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 import { scanWorkspaces } from "@seam/adapters";
 import { SessionRouter } from "../packages/core/src/core/session-router.js";
-import { LoopbackHost } from "../packages/core/src/core/loopback-host.js";
 import { SeamTokenRegistry } from "../packages/core/src/core/mcp/token-registry.js";
 import {
   formatAgentAtLocation,
@@ -136,7 +135,7 @@ describe("markSessionBridge is called on start when location is a bridge id (#84
       seamMcp: {
         registry: new SeamTokenRegistry(),
         getPort: () => undefined,
-        isRemoteSession: () => true,
+        isBridgeSession: () => true,
         muxForSession: () => ({}) as any,
       },
     });
@@ -147,7 +146,6 @@ describe("markSessionBridge is called on start when location is a bridge id (#84
     expect(plan).toMatchObject({
       agentId: "remote-grok",
       model: "remote-grok",
-      remote: true,
       profile: { id: "remote-grok" },
     });
     expect(router.getProfile("remote-grok", "mac")?.id).toBe("remote-grok");
@@ -170,13 +168,12 @@ describe("markSessionBridge is called on start when location is a bridge id (#84
       threadPresets,
       bindSessionLocation: (sessionId, location) => {
         marked.push({ sessionId, location });
-        if (location === "local") sessionBridge.delete(sessionId);
-        else sessionBridge.set(sessionId, location);
+        sessionBridge.set(sessionId, location);
       },
       seamMcp: {
         registry,
         getPort: () => 18765,
-        isRemoteSession: (sessionId) => sessionBridge.has(sessionId),
+        isBridgeSession: (sessionId) => sessionBridge.has(sessionId),
         muxForSession: () => undefined,
       },
     });
@@ -188,7 +185,7 @@ describe("markSessionBridge is called on start when location is a bridge id (#84
     expect(localSpawnCalls).toHaveLength(0);
   });
 
-  it("does not mark a local thread (unbound ⇒ loopback MCP)", () => {
+  it("binds a local thread and spawns it through the local bridge", async () => {
     const marked: Array<{ sessionId: string; location: string }> = [];
     const localSpawnCalls: unknown[] = [];
     const registry = new SeamTokenRegistry();
@@ -203,25 +200,28 @@ describe("markSessionBridge is called on start when location is a bridge id (#84
       seamMcp: {
         registry,
         getPort: () => 18765,
-        isRemoteSession: () => false,
+        isBridgeSession: () => true,
         bindSessionLocation: (sessionId, location) => {
           marked.push({ sessionId, location });
         },
+        muxForSession: () => ({
+          spawn: () => Object.assign(new EventEmitter(), {
+            slot: 1,
+            stdin: new PassThrough(),
+            stdout: new PassThrough(),
+            stderr: new PassThrough(),
+            kill() {},
+          }),
+          rpc: async () => ({ projectMcpInjection: true }),
+          releaseStdin() {},
+        }),
       },
     });
     const plan = router.planRuntimeSpawn(makeRecord());
-    expect(plan.remote).toBe(false);
     expect(marked).toEqual([{ sessionId: "discord:thread-1", location: "local" }]);
-    plan.spawnChild(plan.model, plan.effort);
-    expect(localSpawnCalls).toHaveLength(1);
-    expect(localSpawnCalls[0]).toMatchObject({
-      mcpServers: [
-        expect.objectContaining({
-          name: "seam-mcp",
-          type: "http",
-        }),
-      ],
-    });
+    await plan.spawnChild(plan.model, plan.effort);
+    expect(localSpawnCalls).toHaveLength(0);
+    expect(plan.mcpServers).toEqual([expect.objectContaining({ name: "seam-mcp", type: "http" })]);
   });
 });
 
@@ -258,14 +258,17 @@ describe("flattened host-prefixed picker (D10)", () => {
         },
       ],
     ]);
-    const hosts = listHosts({ bridges: bridges.values(), connected: new Set(["mac"]) });
+    const hosts = listHosts({ bridges: bridges.values(), connected: new Set(["local", "mac"]) });
     const choices = listAgentLocationChoices({
       profiles: [
         { id: "claude", displayName: "Claude" },
         { id: "grok", displayName: "Grok" },
       ],
       hosts,
-      agentsByHost: new Map([["mac", new Set(["claude", "grok"])]]),
+      agentsByHost: new Map([
+        ["local", new Set(["claude", "grok"])],
+        ["mac", new Set(["claude", "grok"])],
+      ]),
     });
     expect(choices.map((c) => c.value)).toEqual([
       "claude@local",
@@ -296,7 +299,7 @@ describe("flattened host-prefixed picker (D10)", () => {
     ]);
     const hosts = listHosts({
       bridges: bridges.values(),
-      connected: new Set(["media-server"]),
+      connected: new Set(["local", "media-server"]),
     });
     const choices = listAgentLocationChoices({
       profiles: [
@@ -305,7 +308,10 @@ describe("flattened host-prefixed picker (D10)", () => {
         { id: "grok", displayName: "Grok" },
       ],
       hosts,
-      agentsByHost: new Map([["media-server", new Set(["grok"])]]),
+      agentsByHost: new Map([
+        ["local", new Set(["claude", "copilot", "grok"])],
+        ["media-server", new Set(["grok"])],
+      ]),
     });
     expect(choices.map((c) => c.value)).toEqual([
       "claude@local",
@@ -318,12 +324,15 @@ describe("flattened host-prefixed picker (D10)", () => {
   it("lists an advertised remote-only agent without inventing a local row", () => {
     const hosts = listHosts({
       bridges: [{ id: "gpu", emoji: "🖥️", shortName: "gpu", tokenHash: "d".repeat(64) }],
-      connected: new Set(["gpu"]),
+      connected: new Set(["local", "gpu"]),
     });
     const choices = listAgentLocationChoices({
       profiles: [{ id: "claude", displayName: "Claude" }],
       hosts,
-      agentsByHost: new Map([["gpu", new Set(["remote-zai"])]]),
+      agentsByHost: new Map([
+        ["local", new Set(["claude"])],
+        ["gpu", new Set(["remote-zai"])],
+      ]),
     });
     expect(choices.map((choice) => choice.value)).toEqual([
       "claude@local",
@@ -340,29 +349,22 @@ describe("flattened host-prefixed picker (D10)", () => {
       profiles: [{ id: "claude", displayName: "Claude" }],
       hosts,
     });
-    expect(choices.map((c) => c.value)).toEqual(["claude@local"]);
+    expect(choices.map((c) => c.value)).toEqual([]);
   });
 });
 
-describe("D9 loopback host + D11 workspace scan", () => {
+describe("D11 workspace scan", () => {
   let tmp: string;
   afterEach(() => {
     if (tmp) fs.rmSync(tmp, { recursive: true, force: true });
   });
 
-  it("loopback rpc listWorkspaces scans the host root (same adapter-over-bus method)", async () => {
+  it("scans the host root for the bridge RPC implementation", () => {
     tmp = fs.mkdtempSync(path.join(os.tmpdir(), "seam-ws-"));
     fs.mkdirSync(path.join(tmp, "alpha"));
     fs.mkdirSync(path.join(tmp, "beta"));
     fs.mkdirSync(path.join(tmp, ".hidden"));
     fs.symlinkSync(path.join(tmp, "alpha"), path.join(tmp, "alias"));
-    const loopback = new LoopbackHost({
-      adapters: [stubProfile("claude", [])],
-      workspaceRoot: tmp,
-    });
-    const listed = (await loopback.rpc("listWorkspaces", {})) as Array<{ path: string; name: string }>;
-    expect(listed.map((w) => w.name).sort()).toEqual(["alpha", "beta"]);
-    expect(listed.every((w) => w.path.startsWith(tmp))).toBe(true);
     expect(scanWorkspaces(tmp).map((w) => w.name).sort()).toEqual(["alpha", "beta"]);
   });
 });

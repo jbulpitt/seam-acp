@@ -9,6 +9,7 @@ import { SessionStore } from "../packages/core/src/core/session-store.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import type { SessionRecord } from "../packages/core/src/core/types.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
+import { localBridgeWiring } from "./local-bridge-fixture.js";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
 const PARENT = "111111111111111111";
@@ -58,6 +59,7 @@ function router() {
     modelCatalog: fixtureModelCatalog([profile]),
     defaultAgentId: "copilot",
     defaultModel: "gpt-5.4",
+    seamMcp: localBridgeWiring(profile),
   });
 }
 

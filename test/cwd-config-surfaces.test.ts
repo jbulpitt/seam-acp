@@ -14,6 +14,7 @@ import { SessionStore } from "../packages/core/src/core/session-store.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import type { AgentProfile } from "@seam/adapters";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
+import { localBridgeHub, localBridgeWiring } from "./local-bridge-fixture.js";
 import type { ChannelPreset, ThreadPreset } from "../packages/core/src/config.js";
 import type { SessionRecord, StructuredPanel } from "../packages/core/src/core/types.js";
 import type { ChannelRef, IncomingMessage } from "../packages/core/src/platforms/chat-adapter.js";
@@ -77,6 +78,7 @@ function makeOrch() {
     channelPresets,
     threadPresets,
     defaultCwd: dir,
+    seamMcp: localBridgeWiring(profiles),
   });
   const orch = new Orchestrator({
     logger: silent,
@@ -100,11 +102,15 @@ function makeOrch() {
     store,
     renderer: {} as any,
   });
+  orch.setBridgeHub(localBridgeHub(profiles, dir));
   return { orch, router, store, presetsFile, channelPresets, threadPresets };
 }
 
 beforeEach(() => {
   dir = fs.mkdtempSync(path.join(os.tmpdir(), "seam-cwd-surfaces-"));
+  for (const name of ["alpha", "beta", "gamma", "seam-acp", "other"]) {
+    fs.mkdirSync(path.join(dir, name));
+  }
 });
 afterEach(() => {
   fs.rmSync(dir, { recursive: true, force: true });
@@ -168,6 +174,7 @@ describe("/seam config repo scope", () => {
       defaultPermissionMode: "ask",
       channelPresets,
       threadPresets,
+      seamMcp: localBridgeWiring(profiles),
     });
     const session: SessionRecord = {
       id: "discord:thread-1",
@@ -481,6 +488,7 @@ describe("#207 orchestrator live-turn spawn + status card", () => {
       channelPresets,
       threadPresets,
       defaultCwd: dir,
+      seamMcp: localBridgeWiring(runtimeProfiles),
     });
     const channel: ChannelRef = { platform: "discord", id: THREAD, parentId: PARENT };
     const orch = new Orchestrator({
@@ -513,6 +521,7 @@ describe("#207 orchestrator live-turn spawn + status card", () => {
       store,
       renderer: discordRenderer,
     });
+    orch.setBridgeHub(localBridgeHub(runtimeProfiles, dir));
 
     const rec = store.get(`discord:${THREAD}`)!;
     expect(router.describeConfig(rec).cwd).toEqual({

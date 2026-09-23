@@ -12,6 +12,7 @@ import { discordRenderer } from "../packages/core/src/platforms/discord/renderer
 import { projectAttemptCompletions } from "../packages/core/src/core/dispatch/attempt-recovery.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 import { DispatchSuspendedError } from "../packages/core/src/core/dispatch/attempt-store.js";
+import { attachLocalBridge } from "./local-bridge-fixture.js";
 
 const cleanups: (() => void)[] = [];
 afterEach(() => { for (const f of cleanups.splice(0).reverse()) f(); vi.restoreAllMocks(); });
@@ -47,11 +48,11 @@ function setup() {
     SEAM_DISPATCH_OUTPUT_STYLE: "messages", REPO_EMOJIS: new Map(),
     channelPresets: {}, threadPresets: {} };
   const acquisitionSleep = vi.fn(async (_ms: number) => {});
-  const makeOrch = () => new Orchestrator({ logger: pino({ level: "silent" }) as any,
+  const makeOrch = () => attachLocalBridge(new Orchestrator({ logger: pino({ level: "silent" }) as any,
     recoverySleep: acquisitionSleep,
     modelCatalog: fixtureModelCatalog([]),
     store, router: router as any, adapter: adapter as any, renderer: discordRenderer as any,
-    config: config as any });
+    config: config as any }), [], dataDir);
   const orch = makeOrch();
   const reports = vi.spyOn(orch as any, "enqueueReportBack").mockResolvedValue(undefined);
   const notices = vi.fn((s: DispatchSpec, err: DispatchSuspendedError) => orch.observeRetainedDispatch(s, err));

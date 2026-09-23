@@ -1,5 +1,5 @@
 /**
- * Drive token + reachable MCP URL into a remote (bridge) spawn (#84).
+ * Drive token + execution-host MCP URL into a bridge spawn (#84/#575).
  *
  * SessionRouter.startRuntime uses this so a bound session:
  *  - injects a seam-MCP entry whose URL is not 127.0.0.1
@@ -23,8 +23,8 @@ export interface SeamMcpInjectionWiring {
   getPublicUrl?: () => string | undefined;
   /** Stable loopback MCP URL (health `/mcp` proxy). Prefer this over the ephemeral bind port. */
   getLoopbackUrl?: () => string | undefined;
-  isRemoteSession?: (sessionId: string) => boolean;
-  mcpServersForRemoteSpawn?: (sessionId: string) => ReturnType<typeof buildSeamMcpServerEntry> | undefined;
+  isBridgeSession?: (sessionId: string) => boolean;
+  mcpServersForBridgeSpawn?: (sessionId: string) => ReturnType<typeof buildSeamMcpServerEntry> | undefined;
 }
 
 /** #467: same-child retry policy travels as data to the child owner. Model,
@@ -51,7 +51,13 @@ export type MuxSpawnedProcess = ChildProcessByStdio<Writable, Readable, Readable
 
 /** Subset of makeMux() used to spawn a remote slot. */
 export interface MuxHandle {
-  spawn(opts?: { holdStdinUntilReady?: boolean }): MuxSpawnedProcess;
+  spawn(opts?: {
+    holdStdinUntilReady?: boolean;
+    /** Controller-selected identity accompanying this allocation. The bridge
+     * RPC below remains authoritative; local wrappers may use this only to
+     * construct the matching transport endpoint. */
+    launch?: RemoteSlotSpawnParams;
+  }): MuxSpawnedProcess;
   rpc(
     method: string,
     params: unknown,
@@ -62,13 +68,13 @@ export interface MuxHandle {
 
 export interface SeamMcpInjection {
   mcpServers: McpServer[];
-  remote: boolean;
+  bridged: boolean;
 }
 
 /**
- * Resolve the mcpServers list for a runtime start. Remote sessions go through
- * `mcpServersForRemoteSpawn` (reachable URL + minted X-Seam-Session). Unbound
- * sessions keep the loopback entry.
+ * Resolve the mcpServers list for a runtime start. Every production session is
+ * bridge-bound. Its host selects the reachable URL: loopback for the separate
+ * local bridge process, public/non-loopback for a remote bridge.
  */
 export function planSeamMcpInjection(opts: {
   sessionId: string;
@@ -80,17 +86,17 @@ export function planSeamMcpInjection(opts: {
 }): SeamMcpInjection {
   const { sessionId, globalMcpServers, seamMcp } = opts;
   if (!seamMcp) {
-    return { mcpServers: globalMcpServers, remote: false };
+    return { mcpServers: globalMcpServers, bridged: false };
   }
-  const remote = seamMcp.isRemoteSession?.(sessionId) === true;
-  if (remote) {
-    const entry = seamMcp.mcpServersForRemoteSpawn?.(sessionId);
+  const bridged = seamMcp.isBridgeSession?.(sessionId) === true;
+  if (bridged) {
+    const entry = seamMcp.mcpServersForBridgeSpawn?.(sessionId);
     if (entry) {
-      return { mcpServers: [...globalMcpServers, entry], remote: true };
+      return { mcpServers: [...globalMcpServers, entry], bridged: true };
     }
     const port = seamMcp.getPort();
     if (port === undefined) {
-      return { mcpServers: globalMcpServers, remote: true };
+      return { mcpServers: globalMcpServers, bridged: true };
     }
     const token = opts.reuseToken
       ? (seamMcp.registry.peek(sessionId) ?? seamMcp.registry.mint(sessionId))
@@ -99,12 +105,12 @@ export function planSeamMcpInjection(opts: {
     const url = publicUrl ?? resolveReachableMcpUrl({ port, remote: true });
     return {
       mcpServers: [...globalMcpServers, buildSeamMcpServerEntry(port, token, { url })],
-      remote: true,
+      bridged: true,
     };
   }
   const port = seamMcp.getPort();
   if (port === undefined) {
-    return { mcpServers: globalMcpServers, remote: false };
+    return { mcpServers: globalMcpServers, bridged: false };
   }
   const token = opts.reuseToken
     ? (seamMcp.registry.peek(sessionId) ?? seamMcp.registry.mint(sessionId))
@@ -115,7 +121,7 @@ export function planSeamMcpInjection(opts: {
       ...globalMcpServers,
       buildSeamMcpServerEntry(port, token, loopback ? { url: loopback } : undefined),
     ],
-    remote: false,
+    bridged: false,
   };
 }
 
@@ -137,7 +143,7 @@ export async function spawnRemoteSlot(
   mux: MuxHandle,
   params: RemoteSlotSpawnParams
 ): Promise<MuxSpawnedProcess> {
-  const child = mux.spawn({ holdStdinUntilReady: true });
+  const child = mux.spawn({ holdStdinUntilReady: true, launch: params });
   const slot = child.slot;
   const rpcParams: Record<string, unknown> = {
     slot,

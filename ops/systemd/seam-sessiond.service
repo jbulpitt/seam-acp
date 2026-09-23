@@ -1,9 +1,6 @@
 [Unit]
-Description=Seam ACP Discord bot
-Wants=network-online.target seam-local-bridge.service
-After=network-online.target seam-local-bridge.service
-StartLimitIntervalSec=300
-StartLimitBurst=6
+Description=Seam durable local agent process supervisor
+After=local-fs.target
 
 [Service]
 Type=simple
@@ -11,19 +8,20 @@ User=ubuntu
 Group=ubuntu
 WorkingDirectory=/home/ubuntu/Projects/seam-acp
 Environment=HOME=/home/ubuntu
-Environment=NODE_ENV=production
 Environment=PATH=/home/ubuntu/.nvm/versions/node/v22.22.2/bin:/home/ubuntu/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-ExecStart=/home/ubuntu/.nvm/versions/node/v22.22.2/bin/node packages/core/dist/index.js
+RuntimeDirectory=seam-sessiond
+RuntimeDirectoryMode=0700
+ExecStart=/home/ubuntu/.nvm/versions/node/v22.22.2/bin/node packages/bridge/dist/sessiond.js --socket /run/seam-sessiond/control.sock --state /run/seam-sessiond/slots.json
 Restart=always
-RestartSec=5s
-TimeoutStopSec=120s
+RestartSec=2s
 KillSignal=SIGTERM
 KillMode=mixed
+TimeoutStopSec=30s
 FinalKillSignal=SIGKILL
 SendSIGKILL=yes
 OOMPolicy=continue
 LimitNOFILE=65535
-SyslogIdentifier=seam-acp
+SyslogIdentifier=seam-sessiond
 
 [Install]
 WantedBy=multi-user.target

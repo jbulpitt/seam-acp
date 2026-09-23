@@ -10,7 +10,7 @@
  * location. Same answer — refuse, name it, never substitute.
  *
  * The mutation this story exists to kill: a deny list that filters the
- * picker but still permits a direct local spawn.
+ * picker but still permits the router to ask the local bridge to spawn.
  */
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
@@ -27,7 +27,6 @@ import {
   assertAgentLocationAllowed,
   deniedAgentLocationMessage,
   getAgentLocationDeny,
-  guardLocalProfileSpawn,
   installAgentLocationDeny,
   isAgentLocationDenied,
   listAgentLocationChoices,
@@ -148,7 +147,7 @@ describe("#474 picker omits the denied pair and keeps the rest", () => {
   const deny = parseAgentLocationDeny("copilot@local");
   const hosts = listHosts({
     bridges: [{ id: "fhr-server", tokenHash: "a".repeat(64), shortName: "fhr-server" }],
-    connected: new Set(["fhr-server"]),
+    connected: new Set(["local", "fhr-server"]),
   });
   const profiles = [
     { id: "claude", displayName: "Claude" },
@@ -159,7 +158,10 @@ describe("#474 picker omits the denied pair and keeps the rest", () => {
     const choices = listAgentLocationChoices({
       profiles,
       hosts,
-      agentsByHost: new Map([["fhr-server", new Set(["copilot", "agy"])]]),
+      agentsByHost: new Map([
+        ["local", new Set(["claude", "copilot"])],
+        ["fhr-server", new Set(["copilot", "agy"])],
+      ]),
       deny,
     });
     expect(choices.map((c) => c.value)).not.toContain("copilot@local");
@@ -171,8 +173,11 @@ describe("#474 picker omits the denied pair and keeps the rest", () => {
     setAgentLocationDeny(deny);
     const choices = agentLocationPickerChoices(profiles, {
       bridges: [{ id: "fhr-server", tokenHash: "a".repeat(64), shortName: "fhr-server" }],
-      connected: new Set(["fhr-server"]),
-      agentsByHost: new Map([["fhr-server", new Set(["copilot"])]]),
+      connected: new Set(["local", "fhr-server"]),
+      agentsByHost: new Map([
+        ["local", new Set(["claude", "copilot"])],
+        ["fhr-server", new Set(["copilot"])],
+      ]),
     });
     expect(choices.map((c) => c.value)).not.toContain("copilot@local");
     expect(choices.map((c) => c.value)).toContain("copilot@fhr-server");
@@ -180,38 +185,8 @@ describe("#474 picker omits the denied pair and keeps the rest", () => {
   });
 });
 
-describe("#474 spawn refusal — independent of the picker", () => {
+describe("#474 bridge-plan refusal — independent of the picker", () => {
   const deny = parseAgentLocationDeny("copilot@local");
-
-  it("throws DeniedAgentLocationError and does not call the inner spawn", () => {
-    const calls: unknown[] = [];
-    const guarded = guardLocalProfileSpawn(stubProfile("copilot", calls), deny);
-    expect(() => guarded.spawn("gpt-5.4")).toThrow(DeniedAgentLocationError);
-    expect(calls).toEqual([]);
-  });
-
-  it("does not wrap an agent that is not denied at local", () => {
-    const calls: unknown[] = [];
-    const claude = stubProfile("claude", calls);
-    const guarded = guardLocalProfileSpawn(claude, deny);
-    expect(guarded).toBe(claude);
-    guarded.spawn();
-    expect(calls).toHaveLength(1);
-  });
-
-  it("NEVER substitutes another agent when local spawn is denied", () => {
-    const calls: unknown[] = [];
-    const guarded = guardLocalProfileSpawn(stubProfile("copilot", calls), deny);
-    try {
-      guarded.spawn();
-    } catch (err) {
-      expect((err as Error).message).toContain("copilot");
-      expect((err as Error).message).toContain("local");
-      expect((err as Error).message).toContain("AGENT_LOCATION_DENY");
-      expect((err as Error).message).not.toMatch(/claude|codex|grok/i);
-    }
-    expect(calls).toEqual([]);
-  });
 
   it("assertAgentLocationAllowed is the spawn gate, not a picker helper", () => {
     expect(() => assertAgentLocationAllowed("copilot", "local", deny)).toThrow(
@@ -226,7 +201,7 @@ describe("#474 SessionRouter: copilot@fhr-server still plans; copilot@local does
   const deny = parseAgentLocationDeny("copilot@local");
 
   function makeRouter(threadPresets: Map<string, ThreadPreset>, spawnCalls: unknown[]) {
-    const copilot = guardLocalProfileSpawn(stubProfile("copilot", spawnCalls), deny);
+    const copilot = stubProfile("copilot", spawnCalls);
     const claude = stubProfile("claude", []);
     const router = new SessionRouter({
       logger: silent,
@@ -236,6 +211,12 @@ describe("#474 SessionRouter: copilot@fhr-server still plans; copilot@local does
       defaultAgentId: "claude",
       defaultModel: "opus",
       threadPresets,
+      seamMcp: {
+        registry: { mint: () => "token", peek: () => "token" } as never,
+        getPort: () => undefined,
+        isBridgeSession: () => true,
+        muxForSession: () => ({ spawn() {}, rpc: async () => ({}), releaseStdin() {} }) as never,
+      },
     });
     installAgentLocationDeny(router, deny);
     return router;
@@ -294,14 +275,6 @@ describe("#474 SessionRouter: copilot@fhr-server still plans; copilot@local does
     expect(refused).toEqual([]);
   });
 
-  it("direct local spawn is refused even if planRuntimeSpawn is bypassed", () => {
-    const spawnCalls: unknown[] = [];
-    const router = makeRouter(new Map(), spawnCalls);
-    const profile = router.listProfiles().find((p) => p.id === "copilot");
-    expect(profile).toBeDefined();
-    expect(() => profile!.spawn()).toThrow(DeniedAgentLocationError);
-    expect(spawnCalls).toEqual([]);
-  });
 });
 
 describe("#474 DEFAULT_AGENT denied at local refuses boot", () => {
@@ -361,16 +334,16 @@ describe("#474 prove the outcome against real channel-presets.json", () => {
 });
 
 describe("#474 wiring is not decoration — index.ts actually installs the gates", () => {
-  it("index.ts registers the deny list, wraps local spawn, and installs the router gate", () => {
+  it("index.ts registers the deny list and installs the router gate", () => {
     const src = fs.readFileSync(path.join(repoRoot, "packages/core/src/index.ts"), "utf8");
     expect(src).toContain("setAgentLocationDeny(config.AGENT_LOCATION_DENY)");
-    expect(src).toContain("guardLocalProfileSpawn");
+    expect(src).not.toContain("guardLocalProfileSpawn");
     expect(src).toContain("installAgentLocationDeny(router, config.AGENT_LOCATION_DENY)");
   });
 
-  it("guardLocalProfileSpawn still contains the spawn-time assert", () => {
+  it("the router wrapper still contains the execution-boundary assert", () => {
     const src = fs.readFileSync(path.join(repoRoot, "packages/core/src/core/location.ts"), "utf8");
-    expect(src).toMatch(/spawn:\s*\(\(\.\.\.args[\s\S]*assertAgentLocationAllowed\(profile\.id, LOCAL_LOCATION/);
+    expect(src).toMatch(/router\.planRuntimeSpawn = \(record\)[\s\S]*assertAgentLocationAllowed\(plan\.agentId, plan\.location/);
   });
 
   it("denied copy names the setting and does not substitute", () => {

@@ -131,7 +131,7 @@ function makeRuntime(
       : {}),
     exposeGlobalStaging: false,
   });
-  return new AgentRuntime({ profile, logger, mcpServers: [seamMcp] });
+  return new AgentRuntime({ profile, logger, mcpServers: [seamMcp], spawnFn: profile.spawn.bind(profile) });
 }
 
 function processExists(pid: number): boolean {
@@ -831,7 +831,7 @@ describe.sequential("native AGY R1 capability contract", () => {
       defaultModel: "Fixture Native Model",
       exposeGlobalStaging: false,
     });
-    const runtime = new AgentRuntime({ profile, logger, mcpServers: [seamMcp] });
+    const runtime = new AgentRuntime({ profile, logger, mcpServers: [seamMcp], spawnFn: profile.spawn.bind(profile) });
     await runtime.start();
     const session = await runtime.newSession({
       cwd: root,

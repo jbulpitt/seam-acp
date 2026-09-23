@@ -1,4 +1,3 @@
-import { readFileSync } from "node:fs";
 import { Readable, Writable } from "node:stream";
 import { buildRecoveryDirective, runBoundedRecovery } from "../core/recovery-directive.js";
 import { newSubmissionEvidence, observeClaudeSubmission, observePromptWrites, type SubmissionEvidence } from "./submission-evidence.js";
@@ -6,11 +5,7 @@ import {
   negotiateReauth,
   ReauthParked,
 } from "../core/reauth-negotiation.js";
-import {
-  claudeCredentialsPath,
-  readClaudeCredentialFacts,
-  type ClaudeCredentialFacts,
-} from "../core/claude-oauth-contention.js";
+import type { ClaudeCredentialFacts } from "../core/claude-oauth-contention.js";
 import { DEFAULT_ERROR_RULES } from "../core/error-resolution-rules.js";
 import { CONTINUE_PROMPT } from "../core/dispatch/turn-resume.js";
 import { recoveryStory } from "../core/dispatch/recovery-story.js";
@@ -371,12 +366,10 @@ export class AgentRuntime {
     notification: CompleteElicitationNotification
   ) => Promise<void>;
   private readonly cancelElicitations?: () => Promise<void>;
-  /**
-   * Optional spawn override. Remote (bridge) sessions pass a function that
-   * mux.spawn()s a slot then rpc("spawn", { slot, mcpServers, … }) before the
-   * first ACP data. Local agents omit this and keep profile.spawn(model?, effort?).
-   */
-  private readonly spawnFn?: (
+  /** Bridge spawn. There is deliberately no profile.spawn fallback: local is
+   * a separate bridge process and a second child owner would defeat restart
+   * adoption (#575). */
+  private readonly spawnFn: (
     model?: string,
     effort?: string
   ) => ReturnType<AgentProfile["spawn"]> | Promise<ReturnType<AgentProfile["spawn"]>>;
@@ -529,7 +522,7 @@ export class AgentRuntime {
     mcpServers?: McpServer[];
     /** Model-specific transport declaration from the pinned catalog generation. */
     effortDescriptor?: CatalogEffort;
-    /** Remote child owner; absent on local runtimes / older embedding shims. */
+    /** Bridge child owner; absent only in narrow test/embedding shims. */
     bridgeHealth?: Partial<BridgeHealthSource>;
     /** Upstream precomputation, called before trying a model, never on failure. */
     modelFallbacks?: (model: string, used?: number, effort?: string) => ModelFallbackPlan;
@@ -542,11 +535,8 @@ export class AgentRuntime {
     onDead?: () => void;
     /** Refresh this runtime's exact host binding after adapter-owned metadata changes. */
     onCatalogRefresh?: () => void | Promise<void>;
-    /**
-     * Override process spawn. When set, `start()` uses this instead of
-     * `profile.spawn(model?, effort?)`. Local agents leave it unset.
-     */
-    spawnFn?: (
+    /** Spawn through the process that owns the child (a bridge in production). */
+    spawnFn: (
       model?: string,
       effort?: string
     ) => ReturnType<AgentProfile["spawn"]> | Promise<ReturnType<AgentProfile["spawn"]>>;
@@ -605,9 +595,7 @@ export class AgentRuntime {
 
   private async startUnclassified(): Promise<void> {
     if (this.connection) return;
-    const child = this.spawnFn
-      ? await this.spawnFn(this.modelOverride, this.effortOverride)
-      : this.profile.spawn(this.modelOverride, this.effortOverride, this.mcpServers);
+    const child = await this.spawnFn(this.modelOverride, this.effortOverride);
     this.child = child;
 
     const processExitError = (
@@ -1188,12 +1176,12 @@ export class AgentRuntime {
     this.promptInFlight = true;
     this.sawUpdateThisTurn = false;
     const recoveryAbort = this.recoveryAbort = new AbortController();
-    // #443: only a remote slot has its child on another machine. Local
-    // processes are not probed here. The watch asks the bridge; it does not
+    // #443/#575: every production child belongs to a bridge slot. The watch
+    // asks that child owner; it does not
     // decide from silence. Aborting it when the turn ends is what keeps a
     // finished prompt from being restarted.
     const hangAbort = new AbortController();
-    if (this.getSlot() !== undefined && this.bridgeHealth?.sendCmd) {
+    if (this.bridgeHealth?.sendCmd) {
       void this.watchInFlightHang(hangAbort.signal);
     }
     let remoteRecoveryDelegated = false;
@@ -1464,18 +1452,17 @@ export class AgentRuntime {
       try { return this.claudeCredentialFacts(); }
       catch { return { refreshTokenExpiresAt: null }; }
     }
-    if (this.profile.id !== "claude" || this.getSlot() !== undefined) return undefined;
-    return readClaudeCredentialFacts(readFileSync, claudeCredentialsPath());
+    return undefined;
   }
 
   /**
-   * #443: quiet remote turn. Restart kills this slot only, and only after
+   * #443/#575: quiet bridged turn. Restart kills this slot only, and only after
    * this runtime has answered a probe and then missed two in a row.
    * `retry` rejects the in-flight prompt with `errorKind: "timeout"` and
    * lets the existing recovery ladder decide whether anything is sent
    * again. It does not re-prompt on its own. Anything we could not measure
    * leaves the turn running — silence and a dead websocket are not evidence
-   * the child is hung. Other slots, local agents, and a bridge that does
+   * the child is hung. Other slots and a bridge that does
    * not know `probeHang` are unchanged.
    */
   private watchInFlightHang(signal: AbortSignal): Promise<void> {

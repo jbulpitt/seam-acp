@@ -16,6 +16,7 @@ import { SessionStore } from "../packages/core/src/core/session-store.js";
 import { discordRenderer } from "../packages/core/src/platforms/discord/renderer.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 import type { DeliveryNonceLookup } from "../packages/core/src/platforms/chat-adapter.js";
+import { simulateRetiredOwnerProcess } from "./restart-process-fixture.js";
 
 const cleanups: (() => void)[] = [];
 afterEach(() => {
@@ -70,19 +71,27 @@ function setup() {
     getProfile: () => undefined,
     getOrStartRuntime: vi.fn(async () => runtime),
   };
-  const panels: { title?: string; author?: string; fields?: { name: string; value: string }[] }[] = [];
-  const take = (panel: { title?: string; author?: string; fields?: { name: string; value: string }[] }) => {
+  type Panel = { title?: string; author?: string; fields?: { name: string; value: string }[] };
+  const panels: Panel[] = [];
+  const writes: Array<{ kind: "send" | "edit"; id: string; panel: Panel }> = [];
+  let panelNumber = 0;
+  const take = (panel: Panel) => {
     panels.push(panel);
   };
   const adapter = {
-    sendPanel: vi.fn(async (channel: { id: string }, panel: { title?: string }) => {
+    sendPanel: vi.fn(async (channel: { id: string }, panel: Panel) => {
       take(panel);
-      return { channel, id: "panel" };
+      const id = `panel-${++panelNumber}`;
+      writes.push({ kind: "send", id, panel });
+      return { channel, id };
     }),
     sendMessage: vi.fn(async (channel: { id: string }) => ({ channel, id: "message" })),
     sendFile: vi.fn(async () => {}),
     findMessageByNonce: vi.fn(async (): Promise<DeliveryNonceLookup> => ({ status: "absent" })),
-    editPanel: vi.fn(async (_msg: unknown, panel: { title?: string }) => { take(panel); }),
+    editPanel: vi.fn(async (msg: { id: string }, panel: Panel) => {
+      take(panel);
+      writes.push({ kind: "edit", id: msg.id, panel });
+    }),
     editMessage: vi.fn(async () => {}),
   };
   const orch = new Orchestrator({
@@ -105,7 +114,11 @@ function setup() {
   const label = (panel: { title?: string; author?: string }) => panel.title ?? panel.author ?? "";
   return {
     orch,
+    store,
+    runtime,
+    adapter,
     panels,
+    writes,
     label,
     run: () => (orch as unknown as { handleIncomingMessageInner(m: unknown): Promise<void> })
       .handleIncomingMessageInner(message),
@@ -132,5 +145,72 @@ describe("finished turn card (#437)", () => {
     const action = last.fields?.find((field) => field.name === "Action")?.value;
     expect(action).toBe("Resumed — output complete");
     expect(states()).not.toContain("Monitoring");
+  });
+
+  it("projects a durable cancellation onto the card that owned the interrupted turn (#576)", async () => {
+    const h = setup();
+    let release!: () => void;
+    let entered!: () => void;
+    const started = new Promise<void>((resolve) => { entered = resolve; });
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    h.runtime.prompt.mockImplementationOnce(async () => {
+      entered();
+      await gate;
+      return { stopReason: "cancelled", cancelled: true };
+    });
+
+    const running = h.run();
+    await started;
+    expect(h.store.turnAttempts.cancel("inbound-1")).toBe(true);
+    release();
+    await running.catch(() => {});
+
+    const oldCardEdits = h.writes.filter((write) => write.kind === "edit" && write.id === "panel-1");
+    const terminal = oldCardEdits.at(-1)?.panel;
+    // Protects the live #576 failure: deleting durable terminal projection leaves
+    // attempt inbound-1552209792582418483's card stuck at Working after cancellation.
+    expect(terminal?.title).toBe("Failed");
+    expect(terminal?.fields?.find((field) => field.name === "Action")?.value).toMatch(/^Cancelled/);
+  });
+
+  it("settles a superseded turn only on its captured card reference (#576)", async () => {
+    simulateRetiredOwnerProcess();
+    const h = setup();
+    let release!: () => void;
+    let entered!: () => void;
+    const started = new Promise<void>((resolve) => { entered = resolve; });
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    h.runtime.prompt.mockImplementationOnce(async () => {
+      entered();
+      await gate;
+      return { stopReason: "end_turn" };
+    });
+
+    const running = h.run();
+    await started;
+    const original = h.store.turnAttempts.get("inbound-1")!;
+    expect(h.store.turnAttempts.suspendBoot(original.ownerBoot)).toBe(1);
+    h.store.turnAttempts.registerOwner("replacement-owner");
+    h.store.turnAttempts.claim(
+      original.spec,
+      original.identity,
+      "replacement-owner",
+      "inbound"
+    );
+    const replacement = await h.adapter.sendPanel(
+      { platform: "discord", id: "worker" } as never,
+      { title: "Working", fields: [{ name: "Action", value: "Replacement turn" }] }
+    );
+
+    release();
+    await running.catch(() => {});
+
+    const oldCardEdits = h.writes.filter((write) => write.kind === "edit" && write.id === "panel-1");
+    const terminal = oldCardEdits.at(-1)?.panel;
+    // Protects the owner guard: deleting captured-reference isolation lets stale
+    // completion overwrite the replacement card instead of only its own artifact.
+    expect(terminal?.title).toBe("Waiting");
+    expect(terminal?.fields?.find((field) => field.name === "Action")?.value).toMatch(/^Superseded/);
+    expect(h.writes.some((write) => write.kind === "edit" && write.id === replacement.id)).toBe(false);
   });
 });

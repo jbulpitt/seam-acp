@@ -149,7 +149,11 @@ describe("Orchestrator.interruptRedirect (#67)", () => {
     if (!res.ok) return;
     expect(res.fresh).toBe(true);
     // Session reset: clearAcpSession so the redirected turn starts fresh.
-    expect(invalidate).toHaveBeenCalledWith("discord:thread-worker", { clearAcpSession: true });
+    // Removing operator intent leaves older work bound to the discarded session recoverable.
+    expect(invalidate).toHaveBeenCalledWith("discord:thread-worker", {
+      clearAcpSession: true,
+      operatorIntent: "replace-session",
+    });
     const spec = pendingSpecs()[0]!;
     expect(spec.prompt).toContain("session was reset");
   });

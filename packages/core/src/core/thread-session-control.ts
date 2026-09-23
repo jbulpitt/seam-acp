@@ -4,7 +4,7 @@ import {
   type AppliedSessionConfig,
   type SessionConfigChanges,
 } from "./config-mutation.js";
-import type { ConfigDescription } from "./session-router.js";
+import type { ConfigDescription, SessionInvalidationOptions } from "./session-router.js";
 import {
   FAST_MODE_COST_WARNING,
   FAST_MODE_CONFIG_ID,
@@ -156,7 +156,7 @@ export interface ThreadSessionControlDeps {
     getOrStartRuntime(record: SessionRecord): Promise<SessionControlRuntime>;
     invalidate(
       sessionId: string,
-      opts?: { clearAcpSession?: boolean; clearStartFailure?: boolean }
+      opts?: SessionInvalidationOptions
     ): Promise<void>;
   };
   mutation: SessionConfigMutation & {
@@ -840,7 +840,7 @@ export class ThreadSessionControlService {
   private async forgeFreshSession(
     sessionId: string
   ): Promise<{ record: SessionRecord; runtime: SessionControlRuntime }> {
-    await this.deps.router.invalidate(sessionId);
+    await this.deps.router.invalidate(sessionId, { operatorIntent: "replace-session" });
     const current = this.deps.store.get(sessionId);
     if (!current) throw new Error("Target session disappeared while resetting.");
     this.deps.store.upsert({

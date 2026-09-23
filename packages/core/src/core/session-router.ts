@@ -117,6 +117,15 @@ export type CancelElicitationsFn = (
   detail: string
 ) => Promise<void>;
 
+export interface SessionInvalidationOptions {
+  clearAcpSession?: boolean;
+  clearStartFailure?: boolean;
+  /** #580: positive operator intent that the outgoing ACP conversation is
+   * being replaced. Omitting it keeps timeout/finalizer/eviction work eligible
+   * for recovery and warning; `clearAcpSession` alone is not this evidence. */
+  operatorIntent?: "replace-session";
+}
+
 /**
  * Which configuration layer supplied an effective value. Mirrors the precedence
  * the runtime actually applies in `startRuntime`: a channel/thread preset (the
@@ -894,11 +903,25 @@ export class SessionRouter {
    *  silent no-op on every graceful reboot. Command layer clears them. */
   async invalidate(
     sessionId: string,
-    opts?: { clearAcpSession?: boolean; clearStartFailure?: boolean }
+    opts?: SessionInvalidationOptions
   ): Promise<void> {
     // Keep the seam-MCP token. It identifies the Discord session; Grok (and
     // others) reconnect HTTP MCP with the header from session/new. A later
     // start reuses it (reuseToken). Revoke only when the session row is gone.
+    const outgoing = this.store.get(sessionId);
+    if (opts?.operatorIntent === "replace-session" && outgoing?.acpSessionId) {
+      const settled = this.store.turnAttempts.settleOperatorSessionReplacement(
+        outgoing.channelRef,
+        outgoing.acpSessionId
+      );
+      if (settled.length > 0) {
+        this.logger.info(
+          { sessionId, settledAttempts: settled.length },
+          "settled dispatches bound to operator-replaced ACP session"
+        );
+      }
+    }
+
     const retiring = this.retirements.get(sessionId);
     if (retiring) await retiring;
 

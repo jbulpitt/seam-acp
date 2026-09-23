@@ -1,8 +1,11 @@
 /**
- * Live-first direct-Anthropic Claude catalog (#232).
+ * Direct-Anthropic Claude catalog.
  *
- * All Claude-specific discovery, aliasing, merging, and verification metadata
- * lives here so core stays free of provider naming conventions.
+ * When `CLAUDE_CATALOG_API_KEY` is configured, Anthropic `GET /v1/models` is
+ * the authoritative canonical inventory. `claude-agent-acp` is not consulted;
+ * only the configured `default` compatibility row is retained. Without that
+ * credential, the pre-existing ACP + verified-overlay strategy below remains
+ * available as a deployment fallback.
  *
  * ## Why this is not just "read the advertised list"
  *
@@ -75,6 +78,151 @@ export interface ClaudeCatalogProbe {
   models: ClaudeProbedModel[];
   /** `model` `currentValue` of a bare session — recorded, never used as a default. */
   wrapperCurrentValue: string | null;
+}
+
+/** One canonical model returned by Anthropic's public `GET /v1/models`. */
+export interface AnthropicApiModel {
+  id: string;
+  displayName: string;
+  maxInputTokens: number | null;
+  effortChoices: string[];
+  imageInput: boolean;
+}
+
+export interface AnthropicModelsApiOptions {
+  apiKey: string;
+  workspaceId?: string;
+  fetchImpl?: typeof fetch;
+  timeoutMs?: number;
+}
+
+const ANTHROPIC_MODELS_API = "https://api.anthropic.com/v1/models";
+export const ANTHROPIC_MODELS_API_VERSION = "2023-06-01";
+const ANTHROPIC_EFFORT_ORDER = ["low", "medium", "high", "xhigh", "max"] as const;
+
+/**
+ * Read Anthropic's canonical model inventory, following every page.
+ *
+ * The API key is deliberately accepted only by this fetch boundary. It never
+ * enters the Claude child environment: exporting it as `ANTHROPIC_API_KEY`
+ * would switch Claude Code from the operator's subscription to API billing.
+ */
+export async function fetchAnthropicModelsApi(
+  options: AnthropicModelsApiOptions
+): Promise<AnthropicApiModel[]> {
+  const apiKey = options.apiKey.trim();
+  if (!apiKey) throw new Error("Anthropic Models API key is empty");
+  const fetchImpl = options.fetchImpl ?? fetch;
+  const controller = new AbortController();
+  const timeoutMs = options.timeoutMs ?? 30_000;
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  timer.unref?.();
+
+  const models: AnthropicApiModel[] = [];
+  const seenIds = new Set<string>();
+  const seenCursors = new Set<string>();
+  let afterId: string | undefined;
+
+  try {
+    for (;;) {
+      const url = new URL(ANTHROPIC_MODELS_API);
+      url.searchParams.set("limit", "1000");
+      if (afterId) url.searchParams.set("after_id", afterId);
+      const response = await fetchImpl(url, {
+        method: "GET",
+        headers: {
+          "anthropic-version": ANTHROPIC_MODELS_API_VERSION,
+          "x-api-key": apiKey,
+          ...(options.workspaceId?.trim()
+            ? { "anthropic-workspace-id": options.workspaceId.trim() }
+            : {}),
+        },
+        signal: controller.signal,
+      });
+      if (!response.ok) {
+        // Do not quote the response body. Auth gateways may echo request
+        // material, and status + endpoint are sufficient to diagnose failure.
+        throw new Error(`Anthropic Models API returned HTTP ${response.status}`);
+      }
+      const page = await response.json() as unknown;
+      const parsed = parseAnthropicModelsPage(page);
+      for (const model of parsed.models) {
+        if (seenIds.has(model.id)) continue;
+        seenIds.add(model.id);
+        models.push(model);
+      }
+      if (!parsed.hasMore) break;
+      // A provider bug returning `has_more` without advancing the cursor would
+      // otherwise keep every catalog refresh alive until shutdown. Refuse only
+      // this refresh; ModelCatalogService retains the previous generation.
+      if (!parsed.lastId || seenCursors.has(parsed.lastId)) {
+        throw new Error("Anthropic Models API pagination did not advance");
+      }
+      seenCursors.add(parsed.lastId);
+      afterId = parsed.lastId;
+    }
+    if (!models.length) throw new Error("Anthropic Models API returned an empty model list");
+    return models;
+  } catch (error) {
+    if (controller.signal.aborted) {
+      throw new Error(`Anthropic Models API timed out after ${timeoutMs}ms`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function parseAnthropicModelsPage(value: unknown): {
+  models: AnthropicApiModel[];
+  hasMore: boolean;
+  lastId: string | null;
+} {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("Anthropic Models API returned an invalid response");
+  }
+  const page = value as Record<string, unknown>;
+  if (!Array.isArray(page.data) || typeof page.has_more !== "boolean") {
+    throw new Error("Anthropic Models API returned an invalid response");
+  }
+  const models = page.data.map((raw): AnthropicApiModel => {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+      throw new Error("Anthropic Models API returned an invalid model row");
+    }
+    const row = raw as Record<string, unknown>;
+    if (typeof row.id !== "string" || !row.id.trim() || typeof row.display_name !== "string") {
+      throw new Error("Anthropic Models API returned an invalid model row");
+    }
+    const capabilities = row.capabilities && typeof row.capabilities === "object" && !Array.isArray(row.capabilities)
+      ? row.capabilities as Record<string, unknown>
+      : {};
+    const effort = capabilities.effort && typeof capabilities.effort === "object" && !Array.isArray(capabilities.effort)
+      ? capabilities.effort as Record<string, unknown>
+      : {};
+    const effortChoices = ANTHROPIC_EFFORT_ORDER.filter((level) => {
+      const capability = effort[level];
+      return Boolean(capability && typeof capability === "object" &&
+        (capability as Record<string, unknown>).supported === true);
+    });
+    const image = capabilities.image_input;
+    const maxInputTokens = typeof row.max_input_tokens === "number" &&
+      Number.isSafeInteger(row.max_input_tokens) && row.max_input_tokens > 0
+      ? row.max_input_tokens
+      : null;
+    return {
+      id: row.id.trim(),
+      displayName: row.display_name.trim() || row.id.trim(),
+      maxInputTokens,
+      effortChoices,
+      imageInput: Boolean(image && typeof image === "object" &&
+        (image as Record<string, unknown>).supported === true),
+    };
+  });
+  return {
+    models,
+    hasMore: page.has_more,
+    lastId: typeof page.last_id === "string" && page.last_id ? page.last_id : null,
+  };
 }
 
 /** A JSONL-verified model kept available when the wrapper stops advertising it. */
@@ -692,6 +840,70 @@ export function mergeClaudeCatalogModels(input: ClaudeCatalogMergeInput): Manife
   }
 
   return merged;
+}
+
+export interface AnthropicApiCatalogMergeInput {
+  apiModels: ReadonlyArray<AnthropicApiModel>;
+  /** Non-canonical runtime aliases retained for compatibility (`default`). */
+  aliases?: ReadonlyArray<ManifestCatalogModel>;
+  /** Operator-configured labels, keyed by exact canonical API id. */
+  displayNames?: ReadonlyMap<string, string>;
+  effortMechanism: CatalogEffortMechanism;
+  effortConfigId?: string;
+  scopeRef?: string;
+}
+
+/**
+ * Publish `/v1/models` as the canonical inventory while retaining only
+ * configured non-canonical compatibility aliases (`default`).
+ *
+ * Canonical rows absent from the API are intentionally dropped even if an old
+ * wrapper or static overlay still names them. That is what makes the API — not
+ * claude-agent-acp release cadence — authoritative for same-day discovery.
+ */
+export function mergeAnthropicApiCatalogModels(
+  input: AnthropicApiCatalogMergeInput
+): ManifestCatalogModel[] {
+  const apiIds = new Set(input.apiModels.map((model) => model.id));
+  const aliases = (input.aliases ?? [])
+    .filter((model) => !apiIds.has(model.modelId) && !model.modelId.startsWith("claude-"))
+    .map((model) => ({ ...model }));
+
+  const canonical = input.apiModels.map((model): ManifestCatalogModel => {
+    const choices = normalizeEffortChoices(model.effortChoices);
+    const context = model.maxInputTokens;
+    const evidence: CatalogModelEvidence = {
+      kind: "live-observation",
+      source: "Anthropic Models API",
+      resolvedModel: model.id,
+      ...(input.scopeRef ? { scopeRef: input.scopeRef } : {}),
+      ...(context !== null
+        ? { context: { native: context, maximum: context, effective: context, method: "provider-reported" } }
+        : {}),
+      ...(model.effortChoices.length
+        ? { effort: { choices, selectionDefault: EFFORT_DEFAULT, method: "provider-reported" } }
+        : {}),
+    };
+    return {
+      modelId: model.id,
+      runtimeId: model.id,
+      name: input.displayNames?.get(model.id) ?? model.displayName,
+      context: { native: context, maximum: context, effective: context },
+      ...(context !== null ? { contextLimit: context } : {}),
+      evidence: [evidence],
+      ...(model.imageInput
+        ? { modalities: { input: ["text", "image"], output: ["text"] }, visionMode: "native" as const }
+        : {}),
+      effort: {
+        mechanism: model.effortChoices.length ? input.effortMechanism : "none",
+        ...(model.effortChoices.length && input.effortConfigId ? { configId: input.effortConfigId } : {}),
+        choices,
+        selectionDefault: EFFORT_DEFAULT,
+      },
+    };
+  });
+
+  return [...aliases, ...canonical];
 }
 
 /**

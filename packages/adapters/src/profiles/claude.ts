@@ -14,7 +14,10 @@ import { manifestCatalogScope, manifestCatalogSource, readCliVersion } from "../
 import {
   CLAUDE_VERIFIED_OVERLAY,
   CLAUDE_VERIFIED_OVERLAY_VERSION,
+  ANTHROPIC_MODELS_API_VERSION,
   claudeCredentialScope,
+  fetchAnthropicModelsApi,
+  mergeAnthropicApiCatalogModels,
   mergeClaudeCatalogModels,
   probeClaudeCatalog,
   resolveClaudeDefaultModel,
@@ -222,6 +225,16 @@ export function makeClaudeProfile(opts: {
    */
   directAnthropic?: boolean;
   /**
+   * Dedicated API credential for canonical `GET /v1/models` discovery.
+   * Defaults to `CLAUDE_CATALOG_API_KEY`. Catalog-only: never copied into the
+   * Claude Code child environment.
+   */
+  catalogApiKey?: string;
+  /** Optional Anthropic workspace selector for multi-workspace API credentials. */
+  catalogWorkspaceId?: string;
+  /** Test seam for the bounded Models API request. Production uses global fetch. */
+  catalogApiFetch?: typeof fetch;
+  /**
    * Test/embedding seam for the #232 live catalog probe. Production leaves it
    * unset and probes this profile's own `claude-agent-acp`.
    */
@@ -273,6 +286,12 @@ export function makeClaudeProfile(opts: {
         delete env.ANTHROPIC_API_KEY;
       }
     }
+    // The catalog credential exists only to read `/v1/models`. Since runtime
+    // children inherit the bridge environment, failing to remove it exposes an
+    // unrelated API credential to claude-agent-acp. Refuse only that exposure;
+    // catalog refresh and subscription-backed runtime selection keep working.
+    delete env.CLAUDE_CATALOG_API_KEY;
+    delete env.CLAUDE_CATALOG_WORKSPACE_ID;
     // For non-Anthropic backends (Ollama Cloud, Z.ai, etc.): override the
     // model env vars so the adapter sends the right model to the backend.
     // setModel() (ACP config option) is rejected by claude-agent-acp for
@@ -324,46 +343,70 @@ export function makeClaudeProfile(opts: {
           region: opts.extraEnv?.CLOUD_ML_REGION,
           adapterVersion: AGENT_ADAPTER_VERSION,
         };
-        // #232 live-first, direct Anthropic only. A probe failure THROWS rather
-        // than degrading to the overlay: ModelCatalogService retains the
-        // previous generation on a thrown fetch, which is what "preserve the
-        // previous generation on failure" requires. Quietly publishing a
-        // narrower catalog instead would overwrite good live data with a guess.
+        // Direct Anthropic only. With a catalog credential, `/v1/models` is the
+        // whole canonical inventory; claude-agent-acp is not consulted. A fetch
+        // failure throws so ModelCatalogService retains the previous generation.
+        // Without a catalog credential, preserve the existing ACP strategy.
         if (liveCatalog) {
           const scope = manifestCatalogScope(common);
-          const probe = opts.catalogProbe
-            ? await opts.catalogProbe()
-            : await probeClaudeCatalog({
-                cliPath: cli,
-                env: buildClaudeSpawnEnv(),
-                // Canonical identity: the value a real catalog selection spawns
-                // with, not the raw advertised one.
-                modelEnv: (canonicalModelId) => buildClaudeSpawnEnv(canonicalModelId),
+          const catalogApiKey = opts.catalogApiKey?.trim()
+            || process.env.CLAUDE_CATALOG_API_KEY?.trim();
+          const catalogWorkspaceId = opts.catalogWorkspaceId?.trim()
+            || process.env.CLAUDE_CATALOG_WORKSPACE_ID?.trim();
+          const apiModels = catalogApiKey
+            ? await fetchAnthropicModelsApi({
+                apiKey: catalogApiKey,
+                ...(catalogWorkspaceId
+                  ? { workspaceId: catalogWorkspaceId }
+                  : {}),
+                ...(opts.catalogApiFetch ? { fetchImpl: opts.catalogApiFetch } : {}),
+              })
+            : null;
+          const models = apiModels
+            ? mergeAnthropicApiCatalogModels({
+                apiModels,
+                aliases: catalogModels,
+                displayNames: configuredLabels,
+                effortMechanism: catalogEffort.mechanism,
+                scopeRef: scope.fingerprint,
+                ...(catalogEffort.configId ? { effortConfigId: catalogEffort.configId } : {}),
+              })
+            : mergeClaudeCatalogModels({
+                probe: opts.catalogProbe
+                  ? await opts.catalogProbe()
+                  : await probeClaudeCatalog({
+                      cliPath: cli,
+                      env: buildClaudeSpawnEnv(),
+                      // Canonical identity: the value a real catalog selection spawns
+                      // with, not the raw advertised one.
+                      modelEnv: (canonicalModelId) => buildClaudeSpawnEnv(canonicalModelId),
+                    }),
+                overlay: CLAUDE_VERIFIED_OVERLAY,
+                displayNames: configuredLabels,
+                effortMechanism: catalogEffort.mechanism,
+                // The overlay is filtered to THIS profile's credential scope, so an
+                // alternate credential profile never inherits evidence captured on
+                // the default one.
+                credentialScope: claudeCredentialScope(configDir),
+                scopeRef: scope.fingerprint,
+                ...(catalogEffort.configId ? { effortConfigId: catalogEffort.configId } : {}),
               });
-          const models = mergeClaudeCatalogModels({
-            probe,
-            overlay: CLAUDE_VERIFIED_OVERLAY,
-            displayNames: configuredLabels,
-            effortMechanism: catalogEffort.mechanism,
-            // The overlay is filtered to THIS profile's credential scope, so an
-            // alternate credential profile never inherits evidence captured on
-            // the default one.
-            credentialScope: claudeCredentialScope(configDir),
-            scopeRef: scope.fingerprint,
-            ...(catalogEffort.configId ? { effortConfigId: catalogEffort.configId } : {}),
-          });
           const candidate = await manifestCatalogSource({
             ...common,
             defaultModel: resolveClaudeDefaultModel(models, opts.defaultModel),
             models: () => models,
-            source: "claude-acp-live+verified-overlay",
+            source: apiModels
+              ? "anthropic-models-api"
+              : "claude-acp-live+verified-overlay",
           }).fetch();
           // A config-directory label (especially "default") does not prove
           // that two hosts have the same account, wrapper, or advertised list.
           // Sharing it lets one host quarantine every model on the other.
           candidate.scope.sharing = "binding";
           candidate.cliVersion = await readCliVersion(cli);
-          candidate.sourceVersion = `overlay-v${CLAUDE_VERIFIED_OVERLAY_VERSION}`;
+          candidate.sourceVersion = apiModels
+            ? `anthropic-api-${ANTHROPIC_MODELS_API_VERSION}`
+            : `overlay-v${CLAUDE_VERIFIED_OVERLAY_VERSION}`;
           return candidate;
         }
         const candidate = await manifestCatalogSource({
@@ -1087,7 +1130,12 @@ const CLAUDE_CONTEXT_WINDOWS: Readonly<Record<string, number>> = {
  *  can keep pointing them at the newest model server-side. */
 export function isForwardableFullModelId(modelId?: string): boolean {
   if (!modelId) return false;
-  return /^claude-[a-z]+-\d/.test(modelId.trim().toLowerCase());
+  // Official API ids span both family-first (`claude-opus-5-5`) and legacy
+  // version-first (`claude-3-5-sonnet-20241022`) forms. Requiring one naming
+  // order made the second form fall back to the wrapper's fuzzy selector. A
+  // full, hyphenated `claude-*` id is safe to forward exactly; short aliases
+  // remain excluded so Anthropic may keep resolving them dynamically.
+  return /^claude-[a-z0-9]+(?:-[a-z0-9]+)+$/.test(modelId.trim().toLowerCase());
 }
 
 /** Map a model id to its TRUE context window, which drives the auto-compaction

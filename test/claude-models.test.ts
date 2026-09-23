@@ -49,6 +49,8 @@ describe("isForwardableFullModelId", () => {
       "claude-fable-5-1",
       "claude-fable-5",
       "claude-sonnet-5",
+      "claude-opus-5-5",
+      "claude-3-5-sonnet-20241022",
       "  Claude-Opus-5  ",
     ]) {
       expect(isForwardableFullModelId(id)).toBe(true);

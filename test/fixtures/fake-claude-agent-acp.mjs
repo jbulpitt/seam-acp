@@ -32,6 +32,8 @@ if (log) {
       pid: process.pid,
       anthropicModel: process.env.ANTHROPIC_MODEL ?? null,
       configDir: process.env.CLAUDE_CONFIG_DIR ?? null,
+      catalogApiKeyPresent: Boolean(process.env.CLAUDE_CATALOG_API_KEY),
+      catalogWorkspacePresent: Boolean(process.env.CLAUDE_CATALOG_WORKSPACE_ID),
     }) + "\n"
   );
 }

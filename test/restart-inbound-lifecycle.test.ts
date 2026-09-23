@@ -74,7 +74,7 @@ function setup() {
 }
 
 describe("#250 human turn production pipeline, synthetic transport only", () => {
-  it("#467 adopts a bridge result after a full controller restart without resubmitting", async () => {
+  it.each([undefined, "Model fallback: original → sibling; capability unknown; price unknown."])("#467 adopts a bridge result after restart without resubmitting, preserving notice %s", async notice => {
     const h = setup();
     const attempts = h.store.turnAttempts;
     attempts.registerOwner("pre-restart-owner");
@@ -95,6 +95,7 @@ describe("#250 human turn production pipeline, synthetic transport only", () => 
       submissionId: "submission-6",
       acpSessionId: "recorded-acp",
       delegatedUtc: "2026-09-22T12:00:00.000Z",
+      ...(notice ? { modelFallbackNotice: notice } : {}),
     })).toBe(true);
     expect(attempts.suspendBoot("pre-restart-owner")).toBe(1);
 
@@ -141,11 +142,12 @@ describe("#250 human turn production pipeline, synthetic transport only", () => 
     expect(mux.adopt).toHaveBeenCalledWith(6);
     expect(h.runtime.prompt).not.toHaveBeenCalled();
     expect(h.adapter.sendMessage).toHaveBeenCalledTimes(1);
-    expect(h.adapter.sendMessage.mock.calls[0]?.[1]).toBe("result completed while Seam was restarting");
+    const output = `${notice ? `${notice}\n\n` : ""}result completed while Seam was restarting`;
+    expect(h.adapter.sendMessage.mock.calls[0]?.[1]).toBe(output);
     expect(attempts.get("inbound-1")).toMatchObject({
       state: "completed",
       deliveryDone: true,
-      outcome: { output: "result completed while Seam was restarting" },
+      outcome: { output },
     });
     expect(h.store.getInbound("1")?.state).toBe("completed");
     await vi.waitFor(() => expect(adopted.kill).toHaveBeenCalledTimes(1));

@@ -55,9 +55,11 @@ function runtimeFixture(opts: {
 describe("#467 controller-to-bridge recovery delegation", () => {
   it("durably binds an acknowledged bridge owner before the original prompt is written", async () => {
     const h = runtimeFixture({ capability: true });
+    h.runtime.queueModelFallbackNotice("Model fallback: original → sibling; capability unknown; price unknown.");
     const bind = vi.fn(async (binding) => {
       h.order.push("durable-bind");
       expect(binding).toMatchObject({ slot: 14, acpSessionId: "session-remote" });
+      expect(binding.modelFallbackNotice).toBe("Model fallback: original → sibling; capability unknown; price unknown.");
     });
     const release = vi.fn();
     await h.runtime.prompt("ORIGINAL PRIVATE BRIEF", undefined, {

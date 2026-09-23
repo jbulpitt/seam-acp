@@ -73,6 +73,7 @@ import type {
 export type BridgeHealthSource = Pick<ReturnType<typeof makeMux>, "sendCmd">;
 
 export interface RemoteRecoveryDelegation {
+  modelFallbackNotice?: string;
   version: 1;
   slot: number;
   submissionId: string;
@@ -148,6 +149,8 @@ export type PermissionPolicy = (
 ) => Promise<RequestPermissionResponse>;
 
 export interface NewSessionOptions {
+  /** The router owns the spawn/load candidate budget, not setModel's loop. */
+  acquisitionModelFallback?: boolean;
   cwd: string;
   /** Optional model override (passed via `_meta`; agent applied via `set_model`). */
   model?: string;
@@ -866,8 +869,9 @@ export class AgentRuntime {
       const isAvailable = this.sessionInfo.availableModels.some((m) => m.modelId === wantedModel);
       if (isExplicit || isAvailable) {
         try {
-          await this.setModel(wantedModel, { allowFallback: !opts.strictModel, effort: opts.effort });
+          await this.setModel(wantedModel, { allowFallback: !opts.strictModel && !opts.acquisitionModelFallback, effort: opts.effort });
         } catch (err) {
+          if (opts.acquisitionModelFallback && readErrorClassification(err)?.errorKind === "model_not_found") throw err;
           if (opts.strictModel) {
             const detail = err instanceof Error ? err.message : String(err);
             throw new Error(`failed to set initial model "${wantedModel}": ${detail}`);
@@ -889,6 +893,7 @@ export class AgentRuntime {
 
   /** Resume an existing ACP session. */
   async loadSession(opts: {
+    acquisitionModelFallback?: boolean;
     sessionId: string;
     cwd: string;
     model?: string;
@@ -969,8 +974,9 @@ export class AgentRuntime {
       const isAvailable = this.sessionInfo.availableModels.some((m) => m.modelId === wantedModel);
       if (isExplicit || isAvailable) {
         try {
-          await this.setModel(wantedModel, { allowFallback: !opts.strictModel, effort: opts.effort });
+          await this.setModel(wantedModel, { allowFallback: !opts.strictModel && !opts.acquisitionModelFallback, effort: opts.effort });
         } catch (err) {
+          if (opts.acquisitionModelFallback && readErrorClassification(err)?.errorKind === "model_not_found") throw err;
           if (opts.strictModel) {
             const detail = err instanceof Error ? err.message : String(err);
             throw new Error(
@@ -1220,6 +1226,7 @@ export class AgentRuntime {
           submissionId: receipt.submission.id,
           acpSessionId: sid,
           delegatedUtc: snapshot.updatedUtc,
+          ...(this.lastModelFallbackNotice ? { modelFallbackNotice: this.lastModelFallbackNotice } : {}),
       };
       try {
         await opts.onRemoteRecovery(binding);
@@ -1540,6 +1547,12 @@ export class AgentRuntime {
 
   getLastModelFallbackNotice(): string | undefined {
     return this.lastModelFallbackNotice;
+  }
+
+  /** Rehydrated by Seam after acquisition; the original notice survives restart. */
+  queueModelFallbackNotice(notice: string): void {
+    this.lastModelFallbackNotice = notice;
+    this.pendingModelNotices.push(notice);
   }
 
   async setModel(modelId: string, opts?: { allowFallback?: boolean; effort?: string }): Promise<void> {

@@ -2,6 +2,7 @@ import path from "node:path";
 import { AgentRuntime, SessionLoadTimeoutError, type BridgeHealthSource } from "../agents/agent-runtime.js";
 import {
   asRemoteCatalogAdapter,
+  readErrorClassification,
   type AgentProfile,
   type CatalogModelEvidence,
 } from "@seam/adapters";
@@ -40,6 +41,8 @@ import { isLocalLocation } from "./location.js";
 import { planModelFallbacks, type ModelFallbackPlan } from "./model-fallback.js";
 import type { ModelMetadataStore } from "./model-metadata/store.js";
 import { matchesContextBudget, validContextUsage } from "./context-budget.js";
+import { acquireWithModelFallback, matchingModelAcquisition } from "./model-acquisition.js";
+import { executionIdentity } from "./dispatch/execution-identity.js";
 
 /**
  * Wiring for the per-session seam-MCP surface. The token identifies the
@@ -1157,8 +1160,8 @@ export class SessionRouter {
    * without a provider lookup in an error handler or another retry owner. */
   private planModelFallbacks(binding: { agentId: string; location: string }, model: string, effort: string | undefined, requiredContextTokens: number | null): ModelFallbackPlan {
     const { agentId, location } = binding;
-    const catalog = this.modelCatalog.models({ agentId, location });
     try {
+      const catalog = this.modelCatalog.models({ agentId, location });
       return planModelFallbacks({ agentId, location, model, effort, requiredContextTokens,
         metadata: this.modelMetadata?.getAll() ?? [], catalog });
     } catch (err) {
@@ -1299,8 +1302,8 @@ export class SessionRouter {
           mcpServers,
           agentId,
           model: modelOverride,
-          // The current bridge stores policy; #467 will execute it. Keep model
-          // for old bridges, which continue to attempt exactly the requested id.
+          // Seam selects the scalar. Bridge recovery owns same-model rung 1
+          // only; transporting this plan never delegates execution identity.
           modelFallbacks: this.planModelFallbacks({ agentId, location }, modelOverride ?? model, effortOverride, fallbackContextTokens),
           effort: effortOverride,
           cwd,
@@ -1345,13 +1348,75 @@ export class SessionRouter {
   }
 
   private async startRuntime(record: SessionRecord, recovery?: { resumeSessionId: string }): Promise<AgentRuntime> {
+    const plan = this.planRuntimeSpawn(record);
+    const identity = { agentId: plan.agentId, location: plan.location, requestedModel: plan.model,
+      effort: plan.effort, cwd: plan.cwd, acpSessionId: recovery?.resumeSessionId ?? record.acpSessionId };
+    const matched = matchingModelAcquisition(this.store.readConfig(record).modelAcquisition, identity);
+    // Boot/watcher retries cannot replenish exhaustion. A new ordinary user
+    // turn may try again: exhaustion refuses one recovery, not this thread for
+    // all time (the provider/catalog may have recovered since the last turn).
+    const saved = matched?.phase === "exhausted" && !recovery ? undefined : matched;
+    const configIdentity = (row: SessionRecord) => executionIdentity({ agentId: row.agentId, cwd: row.repoPath, config: row.configJson });
+    const admittedConfig = configIdentity(record);
+    const selected = saved?.plan.alternatives[saved.index];
+    const budget = this.store.readConfig(record).lastContextUsage?.budget;
+    const selectedBudget = selected && matchesContextBudget(budget, {
+      agentId: plan.agentId, location: plan.location, acpSessionId: identity.acpSessionId,
+      model: selected.normalizedModel, requestedTier: plan.profile.requestedContextTier ?? null,
+    }) && budget && validContextUsage(budget.used, budget.promptBudget) ? budget.promptBudget : 0;
+    // The recorded capacity floor belongs to this exact session/configuration.
+    // A later valid usage sample can increase it, never make a stale selection
+    // authorize a smaller model. Unrelated usage is already rejected by the
+    // context-budget identity helper in planRuntimeSpawn.
+    const floor = Math.max(plan.fallbackContextTokens ?? 0, saved?.plan.requiredContextTokens ?? 0, selectedBudget) || null;
+    const fallbacks = this.planModelFallbacks({ agentId: plan.agentId, location: plan.location }, plan.model, plan.effort, floor);
+    const acquired = await acquireWithModelFallback({
+      identity, plan: fallbacks, saved,
+      save: state => {
+        const live = this.store.get(record.id) ?? record;
+        if (live.acpSessionId !== record.acpSessionId || configIdentity(live) !== admittedConfig) {
+          // Refuse only this stale acquisition, not the user's new selection.
+          throw new Error("Thread configuration changed during model acquisition");
+        }
+        const updated = { ...live, acpSessionId: state.identity.acpSessionId,
+          configJson: JSON.stringify({ ...this.store.readConfig(live), modelAcquisition: state }),
+          updatedUtc: new Date().toISOString() };
+        this.store.upsert(updated);
+        Object.assign(record, updated);
+      },
+      acquire: (model, effort) => this.startRuntimeCandidate(record, recovery, plan, model, effort),
+      sessionId: result => result.sessionId,
+      notice: (result, notice) => result.runtime.queueModelFallbackNotice(notice),
+      discard: result => result.runtime.dispose(),
+    });
+    // The selected cursor and ACP id are saved together above. A successful
+    // original request has no cursor; keep its existing persistence behavior.
+    const { runtime, sessionId } = acquired;
+    try {
+      const cfg = this.store.readConfig(record);
+      const clearCursor = runtime.modelOverride === plan.model && cfg.modelAcquisition !== undefined;
+      if (record.acpSessionId !== sessionId || clearCursor) {
+        if (clearCursor) delete cfg.modelAcquisition;
+        const updated = { ...record, acpSessionId: sessionId,
+          configJson: JSON.stringify(cfg), updatedUtc: new Date().toISOString() };
+        this.store.upsert(updated);
+        Object.assign(record, updated);
+      }
+    } catch (error) {
+      await runtime.dispose();
+      throw error;
+    }
+    return runtime;
+  }
+
+  private async startRuntimeCandidate(record: SessionRecord, recovery: { resumeSessionId: string } | undefined,
+    plan: RuntimeSpawnPlan, model: string, effort: string | undefined): Promise<{ runtime: AgentRuntime; sessionId: string }> {
     // Channel/thread presets are the source of truth for locked-down
     // channels: re-resolved on every runtime start (not just session
     // creation) so a stored record can never drift from the config file —
     // whatever's in CHANNEL_PRESETS_FILE wins, regardless of what's in the
     // DB. See resolveChannelPreset in config.ts.
-    const plan = this.planRuntimeSpawn(record);
-    const { agentId, location, profile, model, effort, effortDescriptor, fastMode, cwd, mcpServers } = plan;
+    const { agentId, location, profile, effortDescriptor, fastMode, cwd, mcpServers } = plan;
 
     const runtime = new AgentRuntime({
       profile,
@@ -1435,9 +1500,11 @@ export class SessionRouter {
     // For agents that accept reasoning effort via CLI flags (e.g. Grok
     // --reasoning-effort), pass it at spawn time.
     runtime.effortOverride = effort;
+    const preserveSession = recovery || (model !== plan.model && record.acpSessionId
+      ? { resumeSessionId: record.acpSessionId } : undefined);
     try {
       await runtime.start();
-      if (recovery && !runtime.supportsSessionLoad()) {
+      if (preserveSession && !runtime.supportsSessionLoad()) {
         throw new Error("Strict resume refused: provider does not advertise session/load");
       }
 
@@ -1460,14 +1527,15 @@ export class SessionRouter {
               sessionId: recovery?.resumeSessionId ?? record.acpSessionId,
               cwd,
               model,
+              acquisitionModelFallback: true,
               ...(effort ? { effort } : {}),
               // #37: the persisted REQUEST, for reporting only. loadSession
               // never applies Fast — re-enabling it on a session that already
               // has history is the repricing case the design forbids.
               ...(fastMode ? { fastMode: true } : {}),
-              ...(recovery ? { strictModel: true } : {}),
+              ...(preserveSession ? { strictModel: true } : {}),
             });
-            if (recovery && runtime.getSessionInfo()?.sessionId !== recovery.resumeSessionId) {
+            if (preserveSession && runtime.getSessionInfo()?.sessionId !== preserveSession.resumeSessionId) {
               throw new Error("Strict resume refused: loaded runtime has a different ACP session");
             }
             if (recovery) {
@@ -1475,21 +1543,17 @@ export class SessionRouter {
               if (current?.acpSessionId && current.acpSessionId !== recovery.resumeSessionId) {
                 throw new Error("Strict resume refused: thread session changed during acquisition");
               }
-              if (!record.acpSessionId) {
-                record.acpSessionId = recovery.resumeSessionId;
-                this.store.upsert({ ...record, updatedUtc: new Date().toISOString() });
-              }
             }
             this.logger.debug(
               { sessionId: record.id, acpSessionId: record.acpSessionId, attempt },
               "resumed acp session"
             );
-            return runtime;
+            return { runtime, sessionId: recovery?.resumeSessionId ?? record.acpSessionId };
           } catch (err) {
             // Preserve the typed failure: the acquisition owner decides whether
             // to retry. Calling a transient load failure an integrity refusal
             // hid its cause; replay/newSession is still forbidden on this path.
-            if (recovery) throw err;
+            if (preserveSession || readErrorClassification(err)?.errorKind === "model_not_found") throw err;
             // #307: this check keeps the configured deadline global to one resume;
             // deleting it silently multiplies the outage across three retries.
             // A deadline is not a transient adapter-start race. Retrying it
@@ -1515,24 +1579,19 @@ export class SessionRouter {
       const info = await runtime.newSession({
         cwd,
         model,
+        acquisitionModelFallback: true,
+        // Refuse only an unapplied substitute; do not announce a sibling and
+        // then prompt whichever default the provider happened to retain.
+        ...(model !== plan.model ? { strictModel: true } : {}),
         ...(effort ? { effort } : {}),
         // #37: Fast is a session-start dimension, so it is passed HERE only.
         // The resume branch above deliberately omits it — re-enabling Fast on a
         // loaded session is the repricing case the design forbids.
         ...(fastMode ? { fastMode: true } : {}),
       });
-      // Persist the new ACP session id so we can resume on restart. Also sync the
-      // caller's in-memory record: getOrStartRuntime receives the same record the
-      // orchestrator reuses for the rest of the turn, and if it kept the empty
-      // placeholder, a later config write (persistConfig spreads `...record`)
-      // would upsert "" back over this id — silently unbinding the thread so the
-      // NEXT restart resumes nothing and the user has to re-attach.
-      record.acpSessionId = info.sessionId;
-      this.store.upsert({
-        ...record,
-        updatedUtc: new Date().toISOString(),
-      });
-      return runtime;
+      // The acquisition owner commits the ACP id with its model cursor. No
+      // prompt has been sent here, so a rejected initial selection owns no work.
+      return { runtime, sessionId: info.sessionId };
     } catch (err) {
       // A failed replacement must not leak an untracked child: getOrStartRuntime
       // caches only successful starts, so invalidate() cannot see this runtime.

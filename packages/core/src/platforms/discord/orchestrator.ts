@@ -15678,6 +15678,11 @@ export class Orchestrator {
         || current.generation !== attempt.generation
         || current.remoteRecovery?.submissionId !== binding.submissionId) return;
       const failed = result.status === "failed";
+      // A substitution selected before restart must still be visible when the
+      // result is adopted without an AgentRuntime/event handler. Use the notice
+      // bound before prompt bytes, not today's possibly changed thread config.
+      const output = binding.modelFallbackNotice
+        ? `${binding.modelFallbackNotice}\n\n${result.text}` : result.text;
       const error = failed
         ? `remote rung-1 recovery exhausted (${result.errorKind ?? "unclassified"})`
         : undefined;
@@ -15685,7 +15690,7 @@ export class Orchestrator {
         id: current.id,
         target: current.spec.target,
         status: failed ? "failed" : "completed",
-        output: result.text,
+        output,
         stopReason: result.stopReason,
         ...(error ? { error, workerError: error } : {}),
         workerStatus: failed ? "failed" : "completed",
@@ -15709,8 +15714,8 @@ export class Orchestrator {
       } else {
         const target: ChannelRef = { platform: PLATFORM, id: current.spec.target };
         const body = failed
-          ? `❌ ${error}${result.text.trim() ? `\n\n${result.text}` : ""}`
-          : (result.text.trim() || "✅ Done — no output.");
+          ? `❌ ${error}${output.trim() ? `\n\n${output}` : ""}`
+          : (output.trim() || "✅ Done — no output.");
         try {
           await this.sendTerminalAttemptDelivery(current.id, target, { kind: "message", text: body });
           this.store.turnAttempts.markDeliveryDone(current.id);

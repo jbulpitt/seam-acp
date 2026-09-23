@@ -65,7 +65,9 @@ function text(value: unknown): string {
  * its own identity. Both concerns are settled here, once, rather than at each
  * caller — the asymmetry is exactly what a per-caller convention produced.
  */
-const VOLATILE_CONFIG_KEYS = new Set(["lastContextUsage"]);
+// The fallback cursor records recovery of this execution, not a user routing
+// change. Including it would strand the very attempt that recorded the cursor.
+const VOLATILE_CONFIG_KEYS = new Set(["lastContextUsage", "modelAcquisition"]);
 
 function configIdentity(value: unknown): string {
   if (value === null || value === undefined) return "";

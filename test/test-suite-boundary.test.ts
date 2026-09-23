@@ -19,8 +19,12 @@ describe("test suite billing boundary", () => {
       fs.readFileSync(path.join(root, "package.json"), "utf8")
     ) as { scripts?: Record<string, string> };
 
-    expect(packageJson.scripts?.["test:int"]).toBe(
-      "vitest run --config vitest.int.config.ts"
+    // Exact, minus a leading `nice` — the billing guarantee is that the live
+    // suite runs under its OWN config and nothing else, which a scheduling
+    // prefix cannot weaken. Keep this strict: anything after `vitest run` other
+    // than the opt-in config is what this test exists to catch.
+    expect(packageJson.scripts?.["test:int"]).toMatch(
+      /^(nice -n \d+ )?vitest run --config vitest\.int\.config\.ts$/
     );
     expect(packageJson.scripts?.pretest).toBe(
       "node scripts/report-test-scope.mjs non-live"

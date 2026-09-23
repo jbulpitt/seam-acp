@@ -304,6 +304,17 @@ export function simpleCardGifForRender(d: ConfigDescription): boolean {
  *
  * This is a port of the runtime-management bits of SessionRuntimeManager.cs.
  */
+/**
+ * How long to wait for the cancel SIGNAL itself before proceeding (#581).
+ *
+ * ACP `session/cancel` is a notification, and `AgentRuntime.cancel()` also
+ * awaits elicitation cancellation. Neither is bounded by the protocol, so a
+ * hung connection makes the await permanent. `dispose()` has raced this call
+ * at 2s since it was written; this matches it so abortTurn can always reach
+ * its escalation.
+ */
+const CANCEL_SIGNAL_TIMEOUT_MS = 2000;
+
 export class SessionRouter {
   private readonly logger: Logger;
   private readonly store: SessionStore;
@@ -972,20 +983,49 @@ export class SessionRouter {
    *  which a healthy turn honors). With `force`, escalate: if the turn is still
    *  running shortly after the cancel (a hung turn ignoring it), invalidate the
    *  runtime — which disposes it and force-kills the agent process group.
-   *  Returns "idle" | "cancelled" | "killed". */
+   *  Returns "idle" | "cancelled" | "unacknowledged" | "killed". */
   async abortTurn(
     sessionId: string,
     opts?: { force?: boolean; graceMs?: number }
-  ): Promise<"idle" | "cancelled" | "killed"> {
+  ): Promise<"idle" | "cancelled" | "unacknowledged" | "killed"> {
     const rt = this.runtimes.get(sessionId);
     if (!rt) return "idle";
     // Outstanding prompt RPC, including one `turnHealth` already calls stalled.
     // `isBusy` would read idle here and skip the force-kill.
     const wasBusy = rt.busy;
-    await rt.cancel().catch(() => {});
-    this.logger.info({ sessionId }, "sent cancel signal to agent runtime");
+    // The cancel SIGNAL must be bounded, or this function cannot reach the
+    // escalation below it. `AgentRuntime.cancel()` awaits an elicitation
+    // cancellation and an ACP `session/cancel` write, and neither is bounded:
+    // against a hung connection or a child that has stopped reading, it never
+    // settles. `dispose()` already races this same call at 2s because it knew
+    // that — this path did not, so a caller awaiting abortTurn hung forever.
+    //
+    // Observed 2026-09-23: a message arrived while a turn was active, the
+    // handler called abortTurn(force:true) to make room for it, cancel never
+    // returned, and the thread answered nothing further. Every later message
+    // repeated it. The force-kill that would have recovered the thread sits
+    // ten lines below and was never reached.
+    const signalled = await Promise.race([
+      rt.cancel().then(() => true, () => true),
+      new Promise<boolean>((resolve) =>
+        setTimeout(() => resolve(false), CANCEL_SIGNAL_TIMEOUT_MS).unref?.()
+      ),
+    ]);
+    if (signalled) {
+      this.logger.info({ sessionId }, "sent cancel signal to agent runtime");
+    } else {
+      // Not a failure to report upward: the turn may still be cancellable by
+      // force. Say plainly that the signal did not complete rather than
+      // logging "sent", which is what made this invisible.
+      this.logger.warn(
+        { sessionId, timeoutMs: CANCEL_SIGNAL_TIMEOUT_MS },
+        "cancel signal did not complete; proceeding to escalation"
+      );
+    }
     if (!wasBusy) return "idle";
-    if (!opts?.force) return "cancelled";
+    // A graceful caller cannot claim the turn stopped when the signal never
+    // landed. Report the honest outcome so the caller can decide to force.
+    if (!opts?.force) return signalled ? "cancelled" : "unacknowledged";
 
     // Escalation: give the graceful cancel a moment to actually end the turn.
     const graceMs = opts.graceMs ?? 3000;

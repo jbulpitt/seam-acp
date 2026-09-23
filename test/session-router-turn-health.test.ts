@@ -317,3 +317,47 @@ describe("#442 one owner for the mid-turn fact", () => {
     await expect(router.getOrStartRuntime(record)).rejects.toThrow(/silent for/);
   });
 });
+
+describe("#581 abortTurn must be bounded so it can reach its own escalation", () => {
+  /**
+   * Observed live 2026-09-23 on an orchestrator thread. A message arrived while
+   * a turn was active; the handler called `abortTurn(force: true)` to make room
+   * for it. `AgentRuntime.cancel()` awaits an elicitation cancellation and an
+   * ACP `session/cancel` write, and neither is bounded — against a hung
+   * connection it never settles. So abortTurn never returned, the handler that
+   * awaited it never finished, the user's message stayed `pending` forever, and
+   * every later message repeated it. The force-kill that would have recovered
+   * the thread sits ten lines below the hang and was never reached.
+   *
+   * `dispose()` has raced this same call at 2s since it was written, which is
+   * the tell: the hazard was known and this path did not apply it.
+   */
+  it("escalates to a force-kill when the cancel signal never settles", async () => {
+    const record = makeRecord();
+    const router = makeRouter(record);
+    await router.getOrStartRuntime(record);
+    const rt = runtimeState.instances.at(-1)!;
+    rt.busy = true;
+    // The failure mode: cancel() never resolves.
+    (rt as unknown as { cancel: () => Promise<void> }).cancel = () => new Promise<void>(() => {});
+
+    const outcome = await router.abortTurn(record.id, { force: true, graceMs: 50 });
+
+    // Before the fix this never returned at all.
+    expect(outcome).toBe("killed");
+    expect(rt.disposed).toBe(true);
+  });
+
+  it("tells a graceful caller the signal was never acknowledged, rather than claiming it cancelled", async () => {
+    const record = makeRecord();
+    const router = makeRouter(record);
+    await router.getOrStartRuntime(record);
+    const rt = runtimeState.instances.at(-1)!;
+    rt.busy = true;
+    (rt as unknown as { cancel: () => Promise<void> }).cancel = () => new Promise<void>(() => {});
+
+    // "cancelled" here would be a lie, and it is the lie that hid this bug:
+    // the log said "sent cancel signal" and nothing had stopped.
+    await expect(router.abortTurn(record.id)).resolves.toBe("unacknowledged");
+  });
+});

@@ -3177,7 +3177,7 @@ export class Orchestrator {
       abortTurn?: (
         sessionId: string,
         opts: { force: boolean }
-      ) => Promise<"idle" | "cancelled" | "killed">;
+      ) => Promise<"idle" | "cancelled" | "unacknowledged" | "killed">;
     };
     const record = maybeStore.getByChannel?.(PLATFORM, channelId);
     if (!record || !maybeRouter.abortTurn) return;
@@ -7499,7 +7499,7 @@ export class Orchestrator {
     message: string,
     fresh: boolean
   ): Promise<
-    | { ok: true; cancelled: "idle" | "cancelled" | "killed"; fresh: boolean; dispatchId: string }
+    | { ok: true; cancelled: "idle" | "cancelled" | "unacknowledged" | "killed"; fresh: boolean; dispatchId: string }
     | { ok: false; error: string }
   > {
     const body = (message ?? "").trim();

@@ -435,7 +435,7 @@ export interface SeamMcpServerDeps {
     message: string,
     fresh: boolean
   ) => Promise<
-    | { ok: true; cancelled: "idle" | "cancelled" | "killed"; fresh: boolean; dispatchId: string }
+    | { ok: true; cancelled: "idle" | "cancelled" | "unacknowledged" | "killed"; fresh: boolean; dispatchId: string }
     | { ok: false; error: string }
   >;
   /**

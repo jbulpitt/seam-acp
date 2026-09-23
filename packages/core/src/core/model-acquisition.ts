@@ -64,7 +64,8 @@ export async function acquireWithModelFallback<T>(input: {
     }
     state = { version: 1, identity: input.identity, plan: input.plan, index: 0, phase: "trying" };
   }
-  if (state.phase === "exhausted") throw new ModelAcquisitionExhaustedError();
+  // Exhaustion is index === alternatives.length. A separate phase guard was
+  // mutation-tested and redundant: the persisted cursor is the budget owner.
   for (; state.index < state.plan.alternatives.length;) {
     const candidate = state.plan.alternatives[state.index]!;
     const advance = () => {

@@ -1,84 +1,71 @@
 # LLM Industry Watch
 
-- **last_sweep:** 2026-09-22
-- **one_line:** Xiaomi open-sourced MiMo-V2.6 (AA 46, MIT) and SpaceXAI shipped Grok 4.7 (AA 46); closed leaders stay Fable 5.1 / Astra at 53.
+- **last_sweep:** 2026-09-23
+- **one_line:** Opus 5.5 leads the public Intelligence Index at 58; GPT-6 Sol and Luna shipped at half the 5.6 price; open-weight lead MiMo-V2.6 stays at 46, so the closed gap is 12.
 
 ## Frontier snapshot
 
-Public methodology is still **v4.3.2**. Seam AA source snapshot **114 → 126** (generation 581 → 689). No ≥1.0 rescore of a model that was already selected yesterday.
+Public methodology is still **v4.3.2**. Seam AA source snapshot **126 → 138** (generation 689 → 782). No ≥1.0 rescore of a model already in yesterday’s selected set.
 
-Selected cache, unique SKUs: Fable 5.1 **53.4 / 81.6 Coding** (back in the returned set; public integer still 53), Astra **52.7 / 76.9**, Opus 5 **50.8 / 78**, Fable 5 **49.6 / 76.5**, Sol **47.0 / 77.4**, **Grok 4.7 46.4** (new; no Coding Index on the row), Grok 4.6 44.2 / 75.9, Terra 42.1 / 76.7. Astra, Sol, Grok 4.6, and Terra are unchanged. Fable / Opus / Fable 5 returning is coverage; the decimals sit within 0.4 of the public integers already on the board.
+Selected cache, unique SKUs: Fable 5.1 **53.4 / 81.6 Coding**, Astra **52.7 / 76.9**, Opus 5 **50.8 / 78**, Fable 5 **49.6 / 76.5**, GPT-5.6 Sol **47.0 / 77.4**, Grok 4.7 **46.4**, Grok 4.6 **44.2 / 75.9**, Terra **42.1 / 76.7**. Those match yesterday.
 
-Public AA integers: Fable 5.1 **53**, Astra **53**, **MiMo-V2.6-Pro 46** (new), **Grok 4.7 46** (new), GLM-5.3 **45**, Kimi K3 **44**, Step 5 Preview **44** (proprietary), DeepSeek V4.1 Flash **39**. Open-weight gap is **7** (MiMo 46 vs closed 53). Yesterday it was 8 (GLM 45). Seam cache has Grok 4.7 and still has no MiMo row.
+Public changelog integers, 22 Sept, not in the Seam cache: Opus 5.5 (max) **58** (xhigh 56, high 54, medium 51, low 42), GPT-6 Sol (max) **48**, GPT-6 Luna (max) **37**, MiMo-V2.6-Pro **46**, GLM-5.3 **45**, Kimi K3 **44**, Step 5 Preview **44**. Open-weight gap is **12** (MiMo 46 vs Opus 5.5 58). Yesterday it was 7 against the 53 tie. `nameContains` for `opus-5-5`, `gpt-6-sol`, and `mimo` returned 0.
 
 ## Live storylines
 
-### Xiaomi MiMo-V2.6 — GA, confirmed
+### Claude Opus 5.5 — GA, confirmed
 
-Xiaomi shipped Pro and Flash. MIT weights are on Hugging Face. AA changelog scores Pro **46**, 1 above GLM-5.3. Xiaomi: “the highest among open-source models.” Code Arena WebDev early AutoEval **1628** (~#10); Arena says live votes are still coming in. No Flash score on the AA changelog. Seam cache: 0 MiMo rows.
+First AA score **58**. Anthropic: “It performs at the level of Claude Fable 5.1 on most work and costs 40% less to run than Opus 5.” $4/$20. “Claude Sonnet 5.5 and Claude Haiku 5.5 will follow in the coming weeks.” Seam cache: no row.
+
+### GPT-6 Sol and Luna — GA, confirmed
+
+Altman: “half the price per token, and even less per task.” AA’s article says Intelligence Index scores “remain level with GPT-5.6”; the changelog lists Sol (max) **48** and Luna (max) **37**. Prior public GPT-5.6 Sol (max) was 47. In Work and Codex for paid plans; Luna also on Free/Go desktop. Arena: scores coming soon.
 
 ### Grok 4.7 — GA, confirmed
 
-SpaceXAI, 21 Sep: “It's a notable improvement over Grok 4.6 at the same price and speed.” AA **46** at xhigh, +2 vs 4.6. With Grok Build, Coding Agent Index **56**, 4th among native harnesses behind Fable 5.1, Astra, and Opus 5. $2/$6, 500k context. Arena has it in Agent Arena; scores not posted. August “exceed all current models” sits against a 46 vs 53.
+AA **46**. Arena, 22 Sep: Code Arena WebDev **#10 at 1632** (+16 vs 4.6 High at 1616, #16). No quoted 4.8 window. Twelve points behind Opus 5.5.
+
+### Xiaomi MiMo-V2.6 — GA, confirmed
+
+MIT weights and AA **46** still stand. A 9B Qwen distill is a research SFT, not a new flagship score. No Flash row on the AA changelog.
 
 ### StepFun Step 5 Preview — shipping, confirmed
 
-API and public AA **44** still stand. Quoted weight drop remains 15 Oct. Today’s parameter restatement is the same 600B / 27B SKU.
+API and public AA **44** still stand. Quoted weight drop remains 15 Oct.
 
-### Anthropic pacing / Accenture evaluator — training, confirmed
+### Anthropic Mythos / LSVP — shipping, confirmed
 
-No second evaluator. Accenture/Faculty remains the named embedded evaluator; other evaluators “in the coming weeks.”
+Opus 5.5 ships with Fable-class cyber and biology safeguards. LSVP is open for its biology use. Official: Cyber Verification expansion “in the coming weeks,” with tiers “including access to Claude Mythos models.” The 17 Sep high-risk limit is not stated as lifted.
 
-### Anthropic Mythos LSVP — shipping, confirmed
+### Anthropic pacing — training, confirmed
 
-No gate change. High-risk Mythos still US-government limited.
+Opus 5.5 is “our first release since we called for pacing the frontier,” pre-tested by Frontier Design and METR. Accenture / Faculty is still the only named embedded evaluator. “we expect to share more details on these efforts soon.”
 
-### DeepSeek V4 Pro routing — shipping, confirmed
+### Other live rows, no new signal
 
-No V4.1 Pro timing. Public AA still has V4.1 Flash at **39**.
-
-### OpenAI unnamed post-Astra trainer — training, confirmed
-
-Still unnamed. OpenAI’s new post is an independent mathematics advisory group, not a model id or access slice.
-
-### Google Flash cadence / missing Pro — delayed, credible
-
-No Pro artifact. Dean’s note is a thank-you for a Discovery Loop conversation. Pichai’s post is a laptop, not a model.
-
-### Arena / access color
-
-Grok 4.7 is in Agent Arena with scores still open. MiMo-V2.6-Pro’s WebDev number is an early AutoEval, not a settled human leaderboard.
-
-### Open and non-U.S. frontier lines
-
-Kimi, GLM, Hy4, Qwen Max, Mistral, Nex, DeepSeek, and Step 5 still have no Seam-cache row. Hy4 remains preview-only. Kimi’s new browser extension is a product surface, not a K4.
+Astra Plus/Business completion unstated. Gemini still has no Pro artifact. DeepSeek still has no V4.1 Pro timing. Mistral still has no flagship-run proof. The distillation cluster has no new restriction. OpenAI’s unnamed internal model is still unnamed. Nex still has no AA row.
 
 ## New this sweep
 
-None. Both movers were already live rows.
+- **Claude Opus 5.5** — first AA score 58 and an official GA post.
+- **GPT-6 Sol and Luna** — official half-price ship plus first changelog scores 48 and 37.
 
 ## Calendar / expected
 
+- Sonnet 5.5 and Haiku 5.5: official “in the coming weeks.”
+- Cyber Verification expansion, including Mythos tiers: official “in the coming weeks.”
+- Further pacing details: official “soon.”
 - Step 5 Preview weights: official “Open weights on Oct 15.”
-- V4.1 Pro: unspecified.
-- Anthropic: individual Pro/Max LSVP “over time”; high-risk Mythos still US-government limited; additional evaluators “in the coming weeks.”
-- Grok 4.7 and MiMo-V2.6: shipped. No quoted next-SKU window.
-- OpenAI’s unnamed internal model, Astra Plus completion, Gemini Pro, Mistral’s next flagship, K4, non-preview Hy4, Nex’s next release, and the next Qwen Max snapshot: unspecified.
+- V4.1 Pro, Astra Plus completion, Gemini Pro, a next Grok SKU, K4, non-preview Hy4, Mistral’s flagship run, and OpenAI’s unnamed internal model: unspecified.
 
 ## Quiet
 
-- **gpt-6-astra:** no Plus/Business completion or new access slice.
-- **google-gemini-flagship-gap:** no Pro artifact.
-- **anthropic-fable-mythos-gates:** LSVP unchanged.
-- **meta-muse-spark:** Wang’s post is the Muse ideas tab, not a new SKU.
-- **kimi-k3:** browser extension only; no K4.
-- **glm-5-3:** no successor.
-- **tencent-hy4:** still preview-only.
-- **qwen-3-8-max:** no new Max snapshot. Qwen3.8 Max (0902) at 45 has been on the AA changelog since 15 Sep.
+- **gpt-6-astra:** Sol/Luna is a different SKU. No Plus/Business completion for Astra.
+- **google-gemini-flagship-gap:** no Pro artifact. Hassabis, DeepMind, Pichai, and Dean silent.
 - **deepseek-v4-1-flash:** no V4.1 Pro timing.
 - **mistral-frontier-bid:** no flagship-run proof.
-- **china-distillation-policy-cluster:** no new restriction or direct lab response.
-- **openai-next-internal-training:** math advisory group; no identifier.
-- **frontier-pacing-and-safety-exits:** no second evaluator.
+- **china-distillation-policy-cluster:** no new restriction or direct lab response. Opus 5.5 adds the existing preserved-thinking control.
+- **openai-next-internal-training:** Sol/Luna does not name the internal trainer.
 - **nex-n2-5:** no AA row.
 - **step-5-preview:** no 15 Oct weights.
+- **Stale after 14 quiet sweeps:** Muse Spark, Kimi K3, GLM-5.3, Hy4 preview, Qwen3.8 Max. Kimi’s Bedrock listing and browser extension, Qwen-Audio-3.1, and Hy Image 3.5 are product surfaces, not new text flagships.

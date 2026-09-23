@@ -38,6 +38,7 @@ import type { InjectTurnOptions } from "../packages/core/src/core/inject-turn.js
 import type { SessionRecord } from "../packages/core/src/core/types.js";
 import type { ChannelRef, MessageRef } from "../packages/core/src/platforms/chat-adapter.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
+import { attachLocalBridge } from "./local-bridge-fixture.js";
 import { simulateRetiredOwnerProcess } from "./restart-process-fixture.js";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
@@ -209,6 +210,7 @@ function makeOrch(
           : []
     ),
   });
+  attachLocalBridge(orch, (opts.catalogProfile ? [opts.catalogProfile] : opts.profile ? [opts.profile] : []) as any, dataDir);
   return { orch, ensured, runtimeFor, profileLookups, restrictionChecks };
 }
 
@@ -542,7 +544,7 @@ describe("#224 isolated ingest routing", () => {
         marked.push({ sessionId, location });
       },
       get: () => ({ mux: {} }),
-      mcpServersForRemoteSpawn: () => undefined,
+      mcpServersForBridgeSpawn: () => undefined,
     } as any);
     let injected: any;
     (orch as any).injectTurn = async (_record: unknown, _prompt: string, opts: unknown) => {

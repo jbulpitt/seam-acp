@@ -16,9 +16,11 @@ maybe("AgentRuntime against `copilot --acp` (integration)", () => {
   it(
     "init → newSession → prompt → cancel → dispose",
     async () => {
+      const profile = makeCopilotProfile({ defaultModel: "gpt-5.4" });
       const runtime = new AgentRuntime({
-        profile: makeCopilotProfile({ defaultModel: "gpt-5.4" }),
+        profile,
         logger,
+        spawnFn: profile.spawn.bind(profile),
       });
 
       const events: string[] = [];

@@ -12,6 +12,7 @@ import { SessionRouter } from "../packages/core/src/core/session-router.js";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
+import { localBridgeWiring } from "./local-bridge-fixture.js";
 
 let dir: string;
 const logs = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
@@ -144,7 +145,7 @@ describe("production router and ACP MCP delivery", () => {
       },
     } as unknown as AgentProfile;
     const store = new SessionStore(path.join(dir, "test.db"));
-    const router = new SessionRouter({ logger, store, profiles: [profile], modelCatalog: fixtureModelCatalog([profile]), defaultAgentId: "codex", defaultModel: "default", defaultCwd: dir });
+    const router = new SessionRouter({ logger, store, profiles: [profile], modelCatalog: fixtureModelCatalog([profile]), defaultAgentId: "codex", defaultModel: "default", defaultCwd: dir, seamMcp: localBridgeWiring(profile) });
     const record = { id: "discord:test", platform: "discord", channelRef: "test", parentRef: "parent", agentId: "codex", acpSessionId: "", repoPath: dir, configJson: "{}", createdUtc: "2026-01-01T00:00:00Z", updatedUtc: "2026-01-01T00:00:00Z" };
     store.upsert(record);
     try {
@@ -153,7 +154,9 @@ describe("production router and ACP MCP delivery", () => {
       const saved = store.get(record.id)!;
       expect(saved.acpSessionId).toBe("kept-conversation");
       await router.getOrStartRuntime(saved);
-      expect(seen).toEqual([{ mode: "new", servers: [expectedSentry] }, { mode: "load", servers: [expectedSentry] }]);
+      // #575: project MCP is resolved by the execution bridge, even for
+      // local. The controller deliberately sends no same-named local file.
+      expect(seen).toEqual([{ mode: "new", servers: [] }, { mode: "load", servers: [] }]);
       expect(store.get(record.id)!.acpSessionId).toBe("kept-conversation");
     } finally { await router.disposeAll(); store.close(); }
   });

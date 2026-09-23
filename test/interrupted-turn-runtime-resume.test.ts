@@ -20,6 +20,7 @@ import { executionIdentity } from "../packages/core/src/core/dispatch/execution-
 import type { ThreadPreset } from "../packages/core/src/config.js";
 import type { IncomingMessage } from "../packages/core/src/platforms/chat-adapter.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
+import { localBridgeWiring } from "./local-bridge-fixture.js";
 import * as owners from "../packages/core/src/core/dispatch/process-owner.js";
 
 const silent = pino({ level: "silent" }) as any;
@@ -128,7 +129,7 @@ function harness(location: "local" | "bridge-a", mode: AcpMode): Harness {
     createdUtc: now, updatedUtc: now });
   const router = new SessionRouter({ logger: silent, store, profiles: [profile], modelCatalog: catalog,
     defaultAgentId: "claude", defaultModel: MODEL, defaultPermissionMode: "deny",
-    threadPresets, defaultCwd: dir,
+    threadPresets, defaultCwd: dir, seamMcp: localBridgeWiring(profile),
     ...(mode === "hang-load" || mode === "hang-load-once" ? { sessionLoadTimeoutMs: 25 } : {}) });
   (router as any).startFailureCooldownMs = 0;
   if (location !== "local") {

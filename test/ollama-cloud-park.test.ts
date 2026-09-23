@@ -15,6 +15,7 @@ import { describe, expect, it, vi } from "vitest";
 import { pino } from "pino";
 import type { AgentProfile } from "@seam/adapters";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
+import { localBridgeWiring } from "./local-bridge-fixture.js";
 import * as adapters from "@seam/adapters";
 import { makeCodexProfile } from "@seam/adapters";
 
@@ -121,6 +122,7 @@ function makeRouter(opts: {
     defaultModel: "opus",
     threadPresets: new Map(),
     ollamaCloudEnabled: opts.ollamaCloudEnabled,
+    seamMcp: localBridgeWiring(profiles),
   });
 }
 
@@ -227,7 +229,11 @@ describe("#220 registration gate", () => {
     const router = makeRouter({ profiles, ollamaCloudEnabled: false });
     expect(router.listProfiles().map((p) => p.id)).not.toContain(OLLAMA_CLOUD_AGENT_ID);
     expect(router.getProfile(OLLAMA_CLOUD_AGENT_ID)).toBeUndefined();
-    const choices = agentLocationPickerChoices(router.listProfiles(), { bridges: [] });
+    const choices = agentLocationPickerChoices(router.listProfiles(), {
+      bridges: [],
+      connected: new Set(["local"]),
+      agentsByHost: new Map([["local", new Set(router.listProfiles().map((profile) => profile.id))]]),
+    });
     expect(choices.some((c) => c.value.includes(OLLAMA_CLOUD_AGENT_ID))).toBe(false);
     expect(choices.some((c) => c.value.includes("claude"))).toBe(true);
   });
@@ -241,7 +247,11 @@ describe("#220 registration gate", () => {
     const profiles = [stubProfile("claude"), stubProfile(OLLAMA_CLOUD_AGENT_ID)];
     const router = makeRouter({ profiles, ollamaCloudEnabled: true });
     expect(router.listProfiles().map((p) => p.id)).toContain(OLLAMA_CLOUD_AGENT_ID);
-    const choices = agentLocationPickerChoices(router.listProfiles(), { bridges: [] });
+    const choices = agentLocationPickerChoices(router.listProfiles(), {
+      bridges: [],
+      connected: new Set(["local"]),
+      agentsByHost: new Map([["local", new Set(router.listProfiles().map((profile) => profile.id))]]),
+    });
     expect(choices.some((c) => c.value.includes(`${OLLAMA_CLOUD_AGENT_ID}@local`))).toBe(true);
   });
 

@@ -6,10 +6,10 @@
  * session is never rebound to `@local`.
  */
 import type { BridgeHub } from "./bridge-hub.js";
-import { isLocalLocation, normalizeLocation } from "./location.js";
+import { normalizeLocation } from "./location.js";
 import { isPastMaxAge } from "./dispatch/turn-resume.js";
 
-export type BridgeResumeWait = "ready" | "timeout" | "local";
+export type BridgeResumeWait = "ready" | "timeout";
 
 export function remainingMaxAgeMs(
   startedUtc: string,
@@ -25,7 +25,8 @@ export function remainingMaxAgeMs(
 
 /**
  * Wait until `bridgeId` has finished hello + prepare(), or until `deadlineMs`.
- * Local is always ready. Subscribes to the hub's ready event — no polling.
+ * Local is an ordinary bridge (#575). Subscribes to the hub's ready event —
+ * no polling and no controller-local bypass.
  */
 export function waitUntilBridgeReady(
   hub: Pick<BridgeHub, "isBridgeReady" | "onBridgeReady">,
@@ -33,7 +34,6 @@ export function waitUntilBridgeReady(
   opts: { deadlineMs: number }
 ): Promise<BridgeResumeWait> {
   const loc = normalizeLocation(location);
-  if (isLocalLocation(loc)) return Promise.resolve("local");
   if (hub.isBridgeReady(loc)) return Promise.resolve("ready");
   if (opts.deadlineMs <= 0) return Promise.resolve("timeout");
 

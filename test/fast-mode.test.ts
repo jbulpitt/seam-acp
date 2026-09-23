@@ -145,6 +145,7 @@ function runtimeFor(profile: Partial<AgentProfile>) {
   const rt = new AgentRuntime({
     profile: { id: "claude", defaultModel: "claude-opus-5", ...profile } as AgentProfile,
     logger,
+    spawnFn: () => { throw new Error("unused"); },
   });
   const conn = new FastConn();
   (rt as unknown as { connection: unknown }).connection = conn;

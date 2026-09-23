@@ -18,7 +18,6 @@ import type { ScheduledPrompt } from "../packages/core/src/core/scheduled-prompt
 import { scheduledOccurrenceKey } from "../packages/core/src/core/scheduled-prompts/occurrence-store.js";
 import { ScheduledPromptManager } from "../packages/core/src/core/scheduled-prompts/manager.js";
 import { simulateRetiredOwnerProcess } from "./restart-process-fixture.js";
-import { guardLocalProfileSpawn, parseAgentLocationDeny } from "../packages/core/src/core/location.js";
 
 const REMOTE = "remote-synthetic";
 const MODEL = "synthetic-exact-model";
@@ -96,7 +95,7 @@ function setup(location = REMOTE) {
   const mux = { spawn: remoteSpawn, rpc: vi.fn(async (_method: string, _params: unknown, _opts?: unknown) => ({ projectMcpInjection: true })), releaseStdin: vi.fn(),
     sendCmd: vi.fn(async (_action: string, _payload: unknown) => ({ health: calls.children.map(child => ({ slot: child.slot, alive: !child.killed })) })) };
   const hub = { markSessionBridge: vi.fn(), get: vi.fn(() => ({ mux })),
-    mcpServersForRemoteSpawn: vi.fn(() => remoteSeam), rpc: vi.fn(async (_location: string, _method: string, _params: unknown, _agent: string) => ({})) };
+    mcpServersForBridgeSpawn: vi.fn(() => remoteSeam), rpc: vi.fn(async (_location: string, _method: string, _params: unknown, _agent: string) => ({})) };
   const adapter = { sendPanel: vi.fn(async (channel: any, _panel?: unknown) => ({ channel, id: "panel" })),
     sendMessage: vi.fn(async (channel: any, _text?: string) => ({ channel, id: "message" })),
     editPanel: vi.fn(async () => {}), editMessage: vi.fn(async () => {}),
@@ -171,7 +170,7 @@ describe("#487 production remote construction paths", () => {
     const router = new SessionRouter({ logger: h.logger, store: h.store, profiles: [h.profile],
       modelCatalog: fixtureModelCatalog([h.profile]), defaultAgentId: "agy", defaultModel: MODEL,
       threadPresets: new Map([["author", { location: REMOTE }]]), defaultCwd: h.cwd,
-      seamMcp: { registry: new SeamTokenRegistry(), getPort: () => undefined, isRemoteSession: () => true, muxForSession } });
+      seamMcp: { registry: new SeamTokenRegistry(), getPort: () => undefined, isBridgeSession: () => true, muxForSession } });
     try {
       const runtime = await router.getOrStartRuntime(h.record);
       // A later binding change must not ask a different host about this slot.
@@ -263,14 +262,14 @@ describe("#466 scheduled execution boundary", () => {
       resolveExecution: row => orch.scheduleExecution(row), onFire: (id, key) => orch.runScheduledPrompt(id, key) });
     try { await manager.runNow(h.row.id); } finally { manager.stop(); }
     expect(h.localSpawn).not.toHaveBeenCalled();
-    expect(h.remoteSpawn).toHaveBeenCalledExactlyOnceWith({ holdStdinUntilReady: true });
+    expect(h.remoteSpawn).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ holdStdinUntilReady: true }));
     expect(h.mux.rpc).toHaveBeenCalledExactlyOnceWith("spawn", {
       slot: 0, agentId: "agy", model: MODEL, effort: "high", cwd: h.cwd,
       mcpServers: [h.globalMcp, h.remoteSeam],
     }, { agentId: "agy" });
     expect(h.hub.get).toHaveBeenCalledWith(REMOTE);
     expect(h.hub.markSessionBridge).toHaveBeenCalledWith(h.record.id, REMOTE);
-    expect(h.hub.mcpServersForRemoteSpawn).toHaveBeenCalledExactlyOnceWith(h.record.id);
+    expect(h.hub.mcpServersForBridgeSpawn).toHaveBeenCalledExactlyOnceWith(h.record.id);
     expect(h.router.reuseMcpServers).toHaveBeenCalledExactlyOnceWith(h.record.id);
     expect(h.calls.news).toEqual([expect.objectContaining({ cwd: h.cwd, mcpServers: [h.globalMcp, h.remoteSeam] })]);
     expect(h.calls.configs).toEqual([]); // The advertised model is already exact.
@@ -287,13 +286,16 @@ describe("#466 scheduled execution boundary", () => {
     expect(h.hub.rpc).toHaveBeenCalledExactlyOnceWith(REMOTE, "deleteSession", { cwd: h.cwd, sessionId: "scheduled-acp" }, "agy");
   });
 
-  it("keeps a local isolated schedule local", async () => {
+  it("routes a local isolated schedule through the local bridge", async () => {
     const h = setup("local");
     await h.make().runScheduledPrompt(h.row.id);
-    expect(h.localSpawn).toHaveBeenCalledTimes(1);
-    expect(h.remoteSpawn).not.toHaveBeenCalled();
-    expect(h.localDelete).toHaveBeenCalledExactlyOnceWith(h.cwd, "scheduled-acp");
-    expect(h.hub.rpc).not.toHaveBeenCalled();
+    expect(h.localSpawn).not.toHaveBeenCalled();
+    expect(h.remoteSpawn).toHaveBeenCalledTimes(1);
+    expect(h.localDelete).not.toHaveBeenCalled();
+    expect(h.hub.rpc).toHaveBeenCalledWith("local", "deleteSession", {
+      cwd: h.cwd,
+      sessionId: "scheduled-acp",
+    }, "agy");
     expect(h.store.getScheduled(h.row.id)?.lastStatus).toBe("ok");
   });
 
@@ -325,18 +327,9 @@ describe("#466 scheduled execution boundary", () => {
       expect.objectContaining({ description: `❌ ${reason}`, fields: expect.arrayContaining([{ name: "Host", value: `\`${REMOTE}\``, inline: true }]) }), expect.anything());
     expect(h.calls.children.every(child => child.killed)).toBe(true);
     const local = setup("local"); await local.make().runScheduledPrompt(local.row.id);
-    expect(local.localSpawn).toHaveBeenCalledTimes(1);
+    expect(local.localSpawn).not.toHaveBeenCalled();
+    expect(local.remoteSpawn).toHaveBeenCalledTimes(1);
     expect(local.store.getScheduled(local.row.id)?.lastStatus).toBe("ok");
-  });
-
-  it("does not depend on #474 denying local spawn", async () => {
-    const h = setup();
-    const guarded = guardLocalProfileSpawn(h.profile, parseAgentLocationDeny("agy@local"));
-    h.profile.spawn = guarded.spawn;
-    await h.make().runScheduledPrompt(h.row.id);
-    expect(h.remoteSpawn).toHaveBeenCalledTimes(1);
-    expect(h.localSpawn).not.toHaveBeenCalled();
-    expect(h.store.getScheduled(h.row.id)?.lastStatus).toBe("ok");
   });
 
   it("recovers the same remote occurrence and recorded session with continue, never replacement work", async () => {

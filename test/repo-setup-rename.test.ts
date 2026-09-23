@@ -15,6 +15,7 @@ import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrato
 import { SessionRouter } from "../packages/core/src/core/session-router.js";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
+import { localBridgeHub, localBridgeWiring } from "./local-bridge-fixture.js";
 import {
   applyPickerValue,
   isDirty,
@@ -128,6 +129,7 @@ function makeOrch() {
     defaultPermissionMode: "ask",
     channelPresets,
     threadPresets,
+    seamMcp: localBridgeWiring(profiles),
   });
 
   const created: Array<{ parent: ChannelRef; name: string }> = [];
@@ -186,6 +188,7 @@ function makeOrch() {
     store,
     renderer: { codeBlock: (value: string) => value } as any,
   });
+  orch.setBridgeHub(localBridgeHub(profiles, reposRoot));
 
   return {
     orch,

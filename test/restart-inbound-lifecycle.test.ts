@@ -75,7 +75,10 @@ function setup() {
 }
 
 describe("#250 human turn production pipeline, synthetic transport only", () => {
-  it.each([undefined, "Model fallback: original → sibling; capability unknown; price unknown."])("#467 adopts a bridge result after restart without resubmitting, preserving notice %s", async notice => {
+  it.each([
+    { location: "remote-one", notice: undefined },
+    { location: "local", notice: "Model fallback: original → sibling; capability unknown; price unknown." },
+  ])("#467/#575 adopts $location bridge result after Seam restart without resubmitting", async ({ location, notice }) => {
     const h = setup();
     const attempts = h.store.turnAttempts;
     attempts.registerOwner("pre-restart-owner");
@@ -91,7 +94,7 @@ describe("#250 human turn production pipeline, synthetic transport only", () => 
     attempts.startPrompt(attempt);
     expect(attempts.recordRemoteRecovery(attempt, {
       version: 1,
-      location: "remote-one",
+      location,
       slot: 6,
       submissionId: "submission-6",
       acpSessionId: "recorded-acp",
@@ -133,7 +136,7 @@ describe("#250 human turn production pipeline, synthetic transport only", () => 
         return adopted;
       }),
     };
-    const bridgeHub = { muxFor: (location: string) => location === "remote-one" ? mux : undefined,
+    const bridgeHub = { muxFor: (requested: string) => requested === location ? mux : undefined,
       slotHealthFor: () => [] };
 
     const restarted = h.make(bridgeHub);

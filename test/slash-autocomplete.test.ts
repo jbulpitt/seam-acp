@@ -17,6 +17,7 @@ import type { Logger } from "../packages/core/src/lib/logger.js";
 import type { SessionRecord } from "../packages/core/src/core/types.js";
 import type { ScheduledPrompt } from "../packages/core/src/core/scheduled-prompts/types.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
+import { attachLocalBridge } from "./local-bridge-fixture.js";
 import type { ChoiceCard } from "../packages/core/src/core/choice/types.js";
 import type { IngestEndpoint } from "../packages/core/src/core/choice/endpoint.js";
 import type { WakeEvent } from "../packages/core/src/core/wake/types.js";
@@ -186,6 +187,7 @@ function makeOrch(over?: {
     store,
     renderer: { codeBlock: (s: string) => s } as any,
   });
+  attachLocalBridge(orch, [grokProfile, copilotProfile] as any, reposRoot);
   return { orch };
 }
 

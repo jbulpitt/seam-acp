@@ -39,6 +39,7 @@ function harness(facts: () => { refreshTokenExpiresAt: number | null } | undefin
   const runtime = new AgentRuntime({
     profile, logger: logger as never,
     claudeCredentialFacts: facts,
+    spawnFn: profile.spawn.bind(profile),
   });
   const prompt = vi.fn(async () => {
     throw new RequestError(-32603, OAUTH, { errorKind: "authentication_failed" });

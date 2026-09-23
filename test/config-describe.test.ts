@@ -8,6 +8,7 @@ import type { Logger } from "../packages/core/src/lib/logger.js";
 import type { SessionRecord, SessionConfigState } from "../packages/core/src/core/types.js";
 import type { ChannelPreset, ThreadPreset } from "../packages/core/src/config.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
+import { localBridgeWiring } from "./local-bridge-fixture.js";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
 
@@ -57,6 +58,7 @@ function makeRouter(opts?: {
     channelPresets: opts?.channelPresets ?? new Map(),
     threadPresets: opts?.threadPresets ?? new Map(),
     ...(opts?.defaultCwd ? { defaultCwd: opts.defaultCwd } : {}),
+    seamMcp: localBridgeWiring(profiles),
   });
 }
 

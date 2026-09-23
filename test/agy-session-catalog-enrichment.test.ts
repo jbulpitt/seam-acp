@@ -15,6 +15,7 @@ import { ModelCatalogService } from "../packages/core/src/core/model-catalog/ser
 import { ModelCatalogStore } from "../packages/core/src/core/model-catalog/store.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import { createManagedAgyFixture } from "./helpers/agy-runtime-fixture.js";
+import { localBridgeWiring } from "./local-bridge-fixture.js";
 
 const fixtureDir = fileURLToPath(new URL("./fixtures/agy-native-capabilities/", import.meta.url));
 const fakeCli = path.join(fixtureDir, "fake-native-agy.mjs");
@@ -94,6 +95,7 @@ describe.sequential("#346 real-session catalog enrichment", () => {
       defaultAgentId: "agy",
       defaultModel: "fixture-native-model",
       defaultCwd: root,
+      seamMcp: localBridgeWiring(local.profile),
     });
     try {
       expect(await catalog.refresh(localBinding)).toMatchObject({ result: "published", generation: 1 });
@@ -178,6 +180,7 @@ describe.sequential("#346 real-session catalog enrichment", () => {
       defaultAgentId: "agy",
       defaultModel: "fixture-native-model",
       defaultCwd: root,
+      seamMcp: localBridgeWiring(subject.profile),
     });
     try {
       await catalog.refresh(binding);
@@ -213,7 +216,7 @@ describe.sequential("#346 real-session catalog enrichment", () => {
       subject.managed.cleanup();
       fs.rmSync(root, { recursive: true, force: true });
     }
-  });
+  }, 15_000);
 
   it("ignores rich metadata whose model id is not an exact catalog id", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "seam-agy-r4b-mismatch-"));
@@ -237,6 +240,7 @@ describe.sequential("#346 real-session catalog enrichment", () => {
       defaultAgentId: "agy",
       defaultModel: "fixture-native-model",
       defaultCwd: root,
+      seamMcp: localBridgeWiring(subject.profile),
     });
     try {
       expect(await catalog.refresh(binding)).toMatchObject({ result: "published", generation: 1 });
@@ -258,5 +262,5 @@ describe.sequential("#346 real-session catalog enrichment", () => {
       subject.managed.cleanup();
       fs.rmSync(root, { recursive: true, force: true });
     }
-  });
+  }, 15_000);
 });

@@ -67,7 +67,7 @@ async function runtimeFixture(fault: "before" | "accepted" | "effect" | "update"
     .connect(ndJsonStream(Writable.toWeb(stdout) as WritableStream<Uint8Array>, Readable.toWeb(stdin) as ReadableStream<Uint8Array>));
   const profile = { ...(adapter === "claude" ? makeClaudeProfile({}) : { id: adapter }),
     defaultModel: "default", spawn: () => child } as unknown as AgentProfile;
-  const runtime = new AgentRuntime({ profile, logger });
+  const runtime = new AgentRuntime({ profile, logger, spawnFn: profile.spawn.bind(profile) });
   runtime.onEvent(event => { if (event.kind === "submission-evidence") h.store.turnAttempts.recordSubmission(h.attempt, event.evidence); });
   await runtime.start(); await runtime.newSession({ cwd: tmpdir() });
   const timeout = globalThis.setTimeout;

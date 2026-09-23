@@ -12,6 +12,7 @@ import type { AgentProfile } from "@seam/adapters";
 import type { ChannelPreset, ThreadPreset } from "../packages/core/src/config.js";
 import type { SessionConfigState, SessionRecord } from "../packages/core/src/core/types.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
+import { localBridgeWiring } from "./local-bridge-fixture.js";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
 const ADMIN = "1487094572696867019";
@@ -132,6 +133,7 @@ function makeOrch(opts?: {
     defaultPermissionMode: "ask",
     channelPresets,
     threadPresets,
+    seamMcp: localBridgeWiring(profiles),
   });
   const sent: string[] = [];
   const orch = new Orchestrator({

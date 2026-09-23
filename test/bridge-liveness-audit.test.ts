@@ -59,6 +59,7 @@ describe("bridge liveness audit", () => {
       mutation: {} as never,
       healthPort: 3000,
       dataDir: "/tmp",
+      localBridgeTokenHash: "a".repeat(64),
     });
 
     vi.useFakeTimers();

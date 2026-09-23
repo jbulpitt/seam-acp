@@ -35,7 +35,7 @@ function runtime(mcpServersAtSpawn: boolean) {
     defaultModel: "default",
     mcpServersAtSpawn,
   } as unknown as AgentProfile;
-  const rt = new AgentRuntime({ profile, logger, mcpServers: [seamMcp] });
+  const rt = new AgentRuntime({ profile, logger, mcpServers: [seamMcp], spawnFn: () => { throw new Error("unused"); } });
   const conn = new FakeConn();
   (rt as unknown as { connection: unknown }).connection = conn;
   (rt as unknown as { promptCapabilities: unknown }).promptCapabilities = {};

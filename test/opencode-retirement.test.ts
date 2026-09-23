@@ -17,6 +17,7 @@ import { describe, expect, it } from "vitest";
 import { pino } from "pino";
 import type { AgentProfile } from "@seam/adapters";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
+import { localBridgeWiring } from "./local-bridge-fixture.js";
 import * as adapters from "@seam/adapters";
 import { SessionRouter } from "../packages/core/src/core/session-router.js";
 import {
@@ -90,6 +91,7 @@ function makeRouter(): SessionRouter {
     defaultAgentId: "claude",
     defaultModel: "opus",
     threadPresets: new Map(),
+    seamMcp: localBridgeWiring(profiles),
   });
 }
 

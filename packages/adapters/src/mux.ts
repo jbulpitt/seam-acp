@@ -200,7 +200,7 @@ interface SlotEntry {
   holdStdin: boolean;
 }
 
-/** Optional mux.spawn() argument. Local `profile.spawn(model?, effort?)` is unchanged. */
+/** Optional mux.spawn() argument. Local and remote agents share this path. */
 export interface MuxSpawnOpts {
   /**
    * Queue stdin (even on an open WS) until `releaseStdin(slot)`. Used so

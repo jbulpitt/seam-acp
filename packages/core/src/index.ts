@@ -3,15 +3,12 @@ import { randomUUID } from "node:crypto";
 import { loadConfig, isChannelLocked, resolveThreadLocation, resolveThreadTtsVoice, resolveThreadTtsPace, resolveThreadTtsStyle, adminParticipantOverlapIds, GROK_STATIC_MODELS, ZAI_STATIC_MODELS, OLLAMA_CLOUD_STATIC_MODELS } from "./config.js";
 import { enrichModelListWithKnownLimits } from "./core/context-window.js";
 import {
-  guardLocalProfileSpawn,
   hostEmoji,
   installAgentLocationDeny,
   isAgentLocationDenied,
-  isLocalLocation,
   LOCAL_LOCATION,
   setAgentLocationDeny,
 } from "./core/location.js";
-import { LoopbackHost } from "./core/loopback-host.js";
 import { logger } from "./lib/logger.js";
 import { startHealthServer } from "./lib/health.js";
 import {
@@ -93,7 +90,7 @@ import {
   createAgentQuotaSources,
 } from "./core/quota/quota-poller.js";
 import { AgentQuotaCard } from "./core/quota/agent-quota-card.js";
-import { publishLocalAgyRuntimeProvenance } from "./core/agy-runtime-provenance.js";
+import { loadOrCreateLocalBridgeCredential } from "./core/local-bridge-credential.js";
 import { ModelValueStore } from "./core/model-value/store.js";
 import { ModelMetadataStore } from "./core/model-metadata/store.js";
 import { ArtificialAnalysisMetadataSource } from "./core/model-metadata/artificial-analysis.js";
@@ -116,6 +113,7 @@ import { planAgyIdentityMigration, readAgyHandleOwnership } from "./core/agy-ide
 
 async function main(): Promise<void> {
   const config = loadConfig();
+  const localBridgeCredential = await loadOrCreateLocalBridgeCredential(config.DATA_DIR);
   setAgentLocationDeny(config.AGENT_LOCATION_DENY);
   console.log(`[BOOT] Loaded REPO_EMOJIS with ${config.REPO_EMOJIS.size} entries.`);
   logger.info(
@@ -448,10 +446,7 @@ async function main(): Promise<void> {
   let serviceStatusSources: ReturnType<typeof createDefaultServiceStatusSources> | undefined;
 
   const registered: AgentProfile[] = [...(copilotEnabled ? [copilot, ...extraCopilots] : []), claude, ...extraClaudes, ...(claudeVertex ? [claudeVertex] : []), ...(agy ? [agy] : []), ...(codex ? [codex] : []), ...(grok ? [grok] : []), ...(zai ? [zai] : []), ...(ollamaCloud ? [ollamaCloud] : [])];
-  const profiles: AgentProfile[] = registered.map((profile) =>
-    guardLocalProfileSpawn(profile, config.AGENT_LOCATION_DENY)
-  );
-  const profilesById = new Map(profiles.map((profile) => [profile.id, profile]));
+  const profiles: AgentProfile[] = registered;
   const localCatalogProfiles = () =>
     profiles.filter((profile) => !isAgentLocationDenied(profile.id, LOCAL_LOCATION, config.AGENT_LOCATION_DENY));
   const modelCatalog = new ModelCatalogService({
@@ -472,24 +467,12 @@ async function main(): Promise<void> {
       }
       return bindings;
     },
-    isOnline: ({ location }) => location === "local" || Boolean(bridgeHub?.isBridgeReady(location)),
+    isOnline: ({ location }) => Boolean(bridgeHub?.isBridgeReady(location)),
     scope: async ({ agentId, location }) => {
-      if (location === "local") {
-        const profile = profilesById.get(agentId);
-        if (!profile) throw new Error(`unknown local agent ${agentId}`);
-        return profile.catalog.scope();
-      }
       if (!bridgeHub) throw new Error("bridge hub is not ready");
       return await bridgeHub.rpc(location, "describeModelCatalog", {}, agentId) as ReturnType<AgentProfile["catalog"]["scope"]>;
     },
     fetch: async ({ agentId, location }): Promise<AdapterCatalogCandidate> => {
-      if (location === "local") {
-        const profile = profilesById.get(agentId);
-        if (!profile) throw new Error(`unknown local agent ${agentId}`);
-        const candidate = await profile.catalog.fetch();
-        profile.catalog.validate?.(candidate);
-        return candidate;
-      }
       if (!bridgeHub) throw new Error("bridge hub is not ready");
       return await bridgeHub.rpc(location, "fetchModelCatalog", {}, agentId) as AdapterCatalogCandidate;
     },
@@ -524,9 +507,9 @@ async function main(): Promise<void> {
             },
             getLoopbackUrl: () => `http://127.0.0.1:${config.HEALTH_PORT}/mcp`,
             getPublicUrl: () => bridgeHub?.mcpUrlForRemote(),
-            isRemoteSession: (sessionId) => !!bridgeHub?.sessionBridgeId(sessionId),
-            mcpServersForRemoteSpawn: (sessionId) =>
-              bridgeHub?.mcpServersForRemoteSpawn(sessionId),
+            isBridgeSession: (sessionId) => !!bridgeHub?.sessionBridgeId(sessionId),
+            mcpServersForBridgeSpawn: (sessionId) =>
+              bridgeHub?.mcpServersForBridgeSpawn(sessionId),
             muxForSession: (sessionId) => {
               const id = bridgeHub?.sessionBridgeId(sessionId);
               return id ? bridgeHub?.muxFor(id) ?? bridgeHub?.get(id)?.mux : undefined;
@@ -617,8 +600,6 @@ async function main(): Promise<void> {
     refreshModelIntelligence: (forceSources) => modelIntelligenceManager.refresh({ forceSources }),
   });
 
-  publishLocalAgyRuntimeProvenance(orchestrator, agyRuntime);
-
   orchestrator.install();
 
   const choiceResults = new ChoiceResultHub({
@@ -679,14 +660,9 @@ async function main(): Promise<void> {
     getMcpRegistry: () => seamTokenRegistry,
     healthPort: config.HEALTH_PORT,
     dataDir: config.DATA_DIR,
+    localBridgeTokenHash: localBridgeCredential.tokenHash,
   });
   orchestrator.setBridgeHub(bridgeHub);
-  bridgeHub.setLoopback(
-    new LoopbackHost({
-      adapters: router.listProfiles(),
-      workspaceRoot: config.REPOS_ROOT,
-    })
-  );
   stopCatalogBridgeRefresh = bridgeHub.onBridgeReady((location) => {
     const bridge = bridgeHub?.get(location);
     for (const [agentId, info] of bridge?.agents ?? []) {
@@ -1275,7 +1251,7 @@ async function main(): Promise<void> {
     store,
     router,
     hub: {
-      isBridgeReady: (location) => isLocalLocation(location) || Boolean(bridgeHub?.isBridgeReady(location)),
+      isBridgeReady: (location) => Boolean(bridgeHub?.isBridgeReady(location)),
       slotHealthFor: (location) => bridgeHub?.slotHealthFor(location) ?? [],
     },
     threadPresets: config.threadPresets,

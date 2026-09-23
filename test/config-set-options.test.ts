@@ -13,6 +13,7 @@ import type { Logger } from "../packages/core/src/lib/logger.js";
 import type { SessionConfigState, SessionRecord } from "../packages/core/src/core/types.js";
 import type { ChannelRef } from "../packages/core/src/platforms/chat-adapter.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
+import { localBridgeHub, localBridgeWiring } from "./local-bridge-fixture.js";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
 const THREAD = "333333333333333333";
@@ -113,6 +114,7 @@ function makeHarness(opts?: { channelPreset?: ChannelPreset }) {
     defaultPermissionMode: "ask",
     channelPresets,
     threadPresets,
+    seamMcp: localBridgeWiring(profiles),
   });
   const created: Array<{ parent: ChannelRef; name: string }> = [];
   const addedMembers: Array<{ channel: ChannelRef; userId: string }> = [];
@@ -146,6 +148,7 @@ function makeHarness(opts?: { channelPreset?: ChannelPreset }) {
     store,
     renderer: { codeBlock: (value: string) => value } as any,
   });
+  orch.setBridgeHub(localBridgeHub(profiles, reposRoot));
   const applyThreadName = vi.fn(async () => ({ status: "unchanged" }));
   (orch as any).applyThreadName = applyThreadName;
   const cfg: SessionConfigState = {

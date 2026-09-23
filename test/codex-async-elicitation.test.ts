@@ -31,6 +31,7 @@ import type {
   MessageRef,
 } from "../packages/core/src/platforms/chat-adapter.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
+import { localBridgeWiring } from "./local-bridge-fixture.js";
 import { ElicitationManager, type CodexAsyncRefusalReason } from "../packages/core/src/core/elicitation/manager.js";
 import { parseDispatchSpec } from "../packages/core/src/core/dispatch/types.js";
 import ts from "typescript";
@@ -248,6 +249,7 @@ function makeHarness(
     defaultModel: "gpt-fixture",
     defaultPermissionMode: "ask",
     defaultCwd: dir,
+    seamMcp: localBridgeWiring(profile),
   });
   const adapter = new FakeChatAdapter();
   const orchestrator = new Orchestrator({

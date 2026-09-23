@@ -23,11 +23,12 @@ async function fixture(timeoutSeconds = 10, fixtureLogger: Logger = logger) {
     source: path.join(fixtures, "fake-native-agy.mjs"), version: "agy fixture 1.1.28", cwd: root,
     approvedEnvironment: { SEAM_AGY_CAPABILITY_FIXTURE_DIR: fixtures, SEAM_AGY_CAPABILITY_INVOCATIONS: log },
   });
-  const runtime = new AgentRuntime({ logger: fixtureLogger, profile: makeAgyProfile({
+  const profile = makeAgyProfile({
     runtime: managed.runtime, dataDir: root, defaultModel: "Fixture Native Model",
     printTimeoutSeconds: timeoutSeconds, exposeGlobalStaging: false,
     mcpServers: [{ type: "http", name: "must-not-inherit", url: "http://127.0.0.1:9", headers: [] }],
-  }) });
+  });
+  const runtime = new AgentRuntime({ logger: fixtureLogger, profile, spawnFn: profile.spawn.bind(profile) });
   const events: AgentEvent[] = [];
   runtime.onEvent(event => { events.push(event); });
   await runtime.start();

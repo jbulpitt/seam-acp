@@ -12,6 +12,7 @@ import type { ScheduledPrompt } from "../packages/core/src/core/scheduled-prompt
 import { scheduledOccurrenceKey } from "../packages/core/src/core/scheduled-prompts/occurrence-store.js";
 import { ScheduledPromptManager } from "../packages/core/src/core/scheduled-prompts/manager.js";
 import type { DeliveryNonceLookup } from "../packages/core/src/platforms/chat-adapter.js";
+import { attachLocalBridge } from "./local-bridge-fixture.js";
 
 const transport = vi.hoisted(() => ({ prompt: vi.fn(), load: vi.fn(), fresh: vi.fn(), delete: vi.fn(), dispose: vi.fn() }));
 vi.mock("../packages/core/src/agents/agent-runtime.js", async importOriginal => {
@@ -64,10 +65,10 @@ function setup(mode: "live" | "isolated" = "isolated", agentId = "codex") {
     sendMessage: vi.fn(async (channel: any, _text: string, _delivery?: unknown) => ({ channel, id: "message" })),
     findMessageByNonce: vi.fn(async (): Promise<DeliveryNonceLookup> => ({ status: "absent" })),
     editPanel: vi.fn(async () => {}), editMessage: vi.fn(async () => {}) };
-  const make = () => new Orchestrator({ logger: pino({ level: "silent" }) as any, store, router: router as any,
+  const make = () => attachLocalBridge(new Orchestrator({ logger: pino({ level: "silent" }) as any, store, router: router as any,
     adapter: adapter as any, renderer: discordRenderer as any, modelCatalog: fixtureModelCatalog([profile]),
     config: { DATA_DIR: dir, REPOS_ROOT: "/synthetic", REPO_EMOJIS: new Map(), TURN_TIMEOUT_SECONDS: 60,
-      SEAM_TURN_RESUME_ENABLED: true, channelPresets: new Map(), threadPresets: new Map() } as any });
+      SEAM_TURN_RESUME_ENABLED: true, channelPresets: new Map(), threadPresets: new Map() } as any }), [profile], dir);
   return { dir, store, make, adapter, row, router };
 }
 

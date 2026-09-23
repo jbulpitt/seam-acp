@@ -55,6 +55,7 @@ async function newRuntime(harness: Harness): Promise<AgentRuntime> {
   const runtime = new AgentRuntime({
     logger,
     profile,
+    spawnFn: profile.spawn.bind(profile),
   });
   harness.runtimes.push(runtime);
   await runtime.start();

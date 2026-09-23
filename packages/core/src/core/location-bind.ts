@@ -1,23 +1,21 @@
 /**
- * Bind a session to a host and (for isolated remote workers) plan a
+ * Bind a session to a host and (for isolated workers) plan a
  * bridge spawn. `markSessionBridge` is the #84 hook — this module is
  * the only production caller besides tests.
  */
 import type { AgentProfile } from "@seam/adapters";
 import type { McpServer } from "@agentclientprotocol/sdk";
 import type { BridgeHub } from "./bridge-hub.js";
-import { isLocalLocation, LOCAL_LOCATION, normalizeLocation } from "./location.js";
+import { LOCAL_LOCATION, normalizeLocation } from "./location.js";
 import { spawnRemoteSlot } from "./remote-spawn.js";
 
-/** Bind `sessionId` to `location` when it is a remote bridge. Local is unbound. */
+/** Bind `sessionId` to its execution bridge, including the local bridge. */
 export function bindSessionLocation(
   hub: Pick<BridgeHub, "markSessionBridge"> | undefined,
   sessionId: string,
   location: string | undefined
 ): void {
   const loc = normalizeLocation(location);
-  // Always write: `local` unbinds so a @mac → @local switch does not keep
-  // the remote spawn path. Remote ids call the #84 hook.
   hub?.markSessionBridge(sessionId, loc);
 }
 
@@ -25,7 +23,7 @@ export function isolatedBindSessionId(dispatchId: string): string {
   return `dispatch:${dispatchId}`;
 }
 
-export function planIsolatedRemoteSpawn(opts: {
+export function planIsolatedBridgeSpawn(opts: {
   hub: BridgeHub;
   sessionId: string;
   location: string;
@@ -43,15 +41,12 @@ export function planIsolatedRemoteSpawn(opts: {
   mcpServers: McpServer[];
 } {
   const loc = normalizeLocation(opts.location);
-  if (isLocalLocation(loc)) {
-    throw new Error("planIsolatedRemoteSpawn is for remote locations only");
-  }
   bindSessionLocation(opts.hub, opts.sessionId, loc);
   const mux = opts.hub.get(loc)?.mux;
   if (!mux) {
     throw new Error(`bridge "${loc}" is not connected`);
   }
-  const entry = opts.hub.mcpServersForRemoteSpawn(opts.sessionId);
+  const entry = opts.hub.mcpServersForBridgeSpawn(opts.sessionId);
   const mcpServers = entry
     ? [...(opts.globalMcpServers ?? []), entry]
     : (opts.globalMcpServers ?? []);

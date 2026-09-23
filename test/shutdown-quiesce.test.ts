@@ -19,6 +19,7 @@ import { mkdtemp, mkdir, rm, writeFile, readdir, readFile } from "node:fs/promis
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { pino } from "pino";
+import { localBridgeHub } from "./local-bridge-fixture.js";
 import {
   DispatchWatcher,
   type DispatchWatcherOpts,
@@ -2528,6 +2529,7 @@ describe("#174 an ingest job stays registered through its durable tail", () => {
         },
       },
       injectTurn: async () => ({ text: "scored" }),
+      bridgeHub: localBridgeHub([{ id: "a", defaultModel: "default" } as any], "/tmp"),
     }) as unknown as ReturnType<typeof makeQuiesceHost> & {
       dispatchIngestEndpoint(s: Record<string, unknown>): Promise<{ output: string }>;
     };

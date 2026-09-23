@@ -9,7 +9,7 @@ const profile = { id: "claude", classifyError: classifyClaudeError } as unknown 
 afterEach(() => vi.restoreAllMocks());
 
 function fixture(options: { output?: boolean; tool?: boolean; failures?: number; sessionId?: string; error?: Error } = {}) {
-  const runtime = new AgentRuntime({ profile, logger });
+  const runtime = new AgentRuntime({ profile, logger, spawnFn: () => { throw new Error("unused"); } });
   const events: AgentEvent[] = [];
   runtime.onEvent(event => { events.push(event); });
   let attempts = 0;

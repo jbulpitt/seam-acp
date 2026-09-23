@@ -10,6 +10,7 @@ import { SessionRouter } from "../packages/core/src/core/session-router.js";
 import { pino } from "pino";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
+import { localBridgeWiring } from "./local-bridge-fixture.js";
 
 const stores: SessionStore[] = [];
 const dirs: string[] = [];
@@ -44,7 +45,7 @@ describe("owner-approved local AGY restoration", () => {
     const spawn = vi.fn(() => { throw new Error("audit fixture must never spawn"); });
     const profile = { id: "agy", displayName: "AGY fixture", defaultModel: "exact-high", spawn } as unknown as AgentProfile;
     const router = new SessionRouter({ logger: pino({ level: "silent" }) as unknown as Logger,
-      store, profiles: [profile], modelCatalog: fixtureModelCatalog([profile]), defaultAgentId: "agy", defaultModel: "exact-high", threadPresets: new Map() });
+      store, profiles: [profile], modelCatalog: fixtureModelCatalog([profile]), defaultAgentId: "agy", defaultModel: "exact-high", threadPresets: new Map(), seamMcp: localBridgeWiring(profile) });
     expect(() => router.planRuntimeSpawn(store.get("package")!)).toThrow(/requires Discord reconstruction/);
     store.compareAndSwapAcpSession("package", "", "rebuilt-native");
     expect(store.completeAgyIdentityRebuild("package", "rebuilt-native")).toBe(true);

@@ -20,6 +20,9 @@ export interface RemoteRecoveryBinding {
   submissionId: string;
   acpSessionId: string;
   delegatedUtc: string;
+  /** Seam's already-selected model notice, persisted with submission ownership.
+   * The bridge neither chooses a model nor interprets this delivery metadata. */
+  modelFallbackNotice?: string;
 }
 
 export type RemoteRecoveryPhase =

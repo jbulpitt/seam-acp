@@ -1,8 +1,8 @@
 import type { CatalogApplicationMode } from "./model-catalog.js";
 
 /** Versioned upstream policy, safe to carry in a slot's spawn configuration.
- * The requested scalar remains for older bridges. #467 owns daemon execution;
- * storing this list does NOT mean this bridge can recover an ACP session yet. */
+ * The requested scalar remains for older bridges. Seam owns model selection;
+ * #467 delegates only same-model rung 1, never walking this list. */
 export interface ModelFallbackPlan {
   version: 1;
   agentId: string;
@@ -29,7 +29,7 @@ export function isModelFallbackPlan(value: unknown): value is ModelFallbackPlan 
     typeof p.requestedModel === "string" &&
     (p.requiredContextTokens === null || (typeof p.requiredContextTokens === "number" && Number.isFinite(p.requiredContextTokens) && p.requiredContextTokens >= 0)) &&
     Array.isArray(p.alternatives) && p.alternatives.every(c => c && typeof c === "object" &&
-      typeof c.model === "string" && typeof c.normalizedModel === "string" && typeof c.notice === "string" &&
+      typeof c.model === "string" && typeof c.normalizedModel === "string" && typeof c.notice === "string" && c.notice.trim().length > 0 &&
       (c.effort === undefined || typeof c.effort === "string") &&
       ["live", "reload", "freshSession"].includes(c.applicationMode) &&
       Number.isFinite(c.contextWindow) && c.contextWindow >= 0);

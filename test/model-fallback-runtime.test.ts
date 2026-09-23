@@ -143,7 +143,10 @@ describe("production router → real runtime → synthetic ACP model boundary", 
     conn.setSessionConfigOption.mockClear();
     await rt.setModel("original");
     expect(attempts(conn)).toEqual(["original", "replacement"]);
-    expect(conn.newSession).toHaveBeenCalledTimes(1);
+    // Startup now gives the acquisition owner spawn/reload candidates too.
+    // Both empty sessions precede any prompt; the warm switch creates none.
+    expect(conn.newSession).toHaveBeenCalledTimes(2);
+    expect(conn.prompt).not.toHaveBeenCalled();
     expect(rt.getSessionInfo()?.sessionId).toBe("same-session");
 
     // A legacy/unrelated usage sample must not make this large session appear

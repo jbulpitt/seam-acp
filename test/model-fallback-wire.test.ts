@@ -49,5 +49,6 @@ describe("precomputed model policy wire", () => {
     expect(isModelFallbackPlan(plan)).toBe(true);
     expect(isModelFallbackPlan({ ...plan, requiredContextTokens: Infinity })).toBe(false);
     expect(isModelFallbackPlan({ ...plan, requiredContextTokens: -1 })).toBe(false);
+    expect(isModelFallbackPlan({ ...plan, alternatives: [{ ...plan.alternatives[0], notice: "  " }] })).toBe(false);
   });
 });

@@ -22,6 +22,8 @@ export function parseSimpleCardGif(v: unknown): boolean | undefined {
  * Mostly mirrors the C# `SessionConfigState`, generalized for multi-agent use.
  */
 export interface SessionConfigState {
+  /** Seam-owned pre-prompt fallback cursor; not a user model override. */
+  modelAcquisition?: import("./model-acquisition.js").ModelAcquisitionState;
   /** Free-form thread role used by the data-driven thread namer. */
   role?: string;
   /** Thread-local opt-out from all automatic prefix naming. */

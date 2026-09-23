@@ -124,6 +124,15 @@ if (process.env.SEAM_AGY_CSRF_FLAG_MODE === "unsupported" && csrfToken) {
   await new Promise((resolve) => setTimeout(resolve, 25));
   process.exit(2);
 }
+// The wording real agy actually uses. 1.2.9 rejects the flag through Go's flag
+// package, which says "flags provided but not defined" and never "unknown
+// flag" — the phrase the old detector required. This mode reproduces the
+// production failure the "unsupported" mode above could not.
+if (process.env.SEAM_AGY_CSRF_FLAG_MODE === "unsupported-go" && csrfToken) {
+  fs.writeSync(2, `Error: flags provided but not defined: -csrf_token\n`);
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  process.exit(2);
+}
 if (process.env.SEAM_AGY_CSRF_FLAG_MODE === "echo-fail" && csrfToken) {
   fs.writeSync(2, `synthetic child rejected csrf capability ${csrfToken}\n`);
   await new Promise((resolve) => setTimeout(resolve, 25));
@@ -346,12 +355,18 @@ const server = http.createServer(async (request, response) => {
 
 server.listen(0, "127.0.0.1", () => {
   const address = server.address();
-  if (!address || typeof address === "string" || !logFile) process.exit(2);
-  fs.writeFileSync(
-    logFile,
-    `Language server listening on random port at ${address.port} for HTTP\n` +
-      `Created conversation ${conversationId}\n`,
-  );
+  if (!address || typeof address === "string") process.exit(2);
+  // agy >= 1.2.0 refuses every flag on the `models` SUBCOMMAND, so the catalog
+  // probe cannot pass --log-file any more and reads its rows off stdout. Only
+  // write the log when a path was actually supplied; the 1.1.27 shape this
+  // fixture was built from is no longer the only one to model.
+  if (logFile) {
+    fs.writeFileSync(
+      logFile,
+      `Language server listening on random port at ${address.port} for HTTP\n` +
+        `Created conversation ${conversationId}\n`,
+    );
+  }
   if (!isModelsCommand) return;
   // Observed on agy 1.1.27: `models` prints its rows and exits after ~1.7-2.8s,
   // and its language server is answerable for part of that window — 500 during

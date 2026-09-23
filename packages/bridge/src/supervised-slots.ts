@@ -27,7 +27,6 @@ export interface SupervisedBridgeFrame {
 }
 
 interface SlotBinding {
-  allowInput: boolean;
   mode: "idle" | "live" | "buffering";
   buffered: Map<number, SupervisedBridgeFrame>;
   gap?: { afterSeq: number; firstAvailableSeq: number; droppedFrames: number };
@@ -75,9 +74,22 @@ function outputFrame(frame: SessiondOutputFrame, parsedOutput?: ReturnType<typeo
 /**
  * Restartable bridge-side view of sessiond slots (#574).
  *
- * A retained binding is output-only. The new control plane never submits to a
- * pre-restart child because it cannot prove what input the old one accepted;
- * only output replay and an explicit kill remain available for that slot.
+ * A retained slot accepts input exactly like a freshly spawned one. #584 made
+ * retained bindings output-only to avoid an "unknown resend" into a child whose
+ * submission state the new control plane could not prove. That protection does
+ * not apply here and cost more than it saved:
+ *
+ * - `recovery-directive.ts` already decides this. Duplicate submission is a
+ *   refusal predicate for EPHEMERAL outward-effect work only; persistent
+ *   conversations keep their transcript, so a repeat is absorbed, not doubled.
+ * - Rung-1 recovery resubmits into a live session on purpose
+ *   (`disposition: "continue_same_session"`, `retry.mode: "continue" | "resend"`).
+ *   Refusing the same write here contradicted the layer above it.
+ * - Resuming a conversation is "continue". That is the normal path, not a hazard.
+ *
+ * What it actually did was turn "this slot is uncertain" into "this thread can
+ * never accept input again", surfaced as a failed turn that discarded the
+ * operator's prompt. Uncertainty is not an operating mode.
  */
 export class SupervisedSlots {
   private readonly bindings = new Map<number, SlotBinding>();
@@ -100,7 +112,6 @@ export class SupervisedSlots {
     const listed = await this.options.client.listSlots();
     for (const health of listed.health) {
       this.bindings.set(health.slot, {
-        allowInput: false,
         mode: "idle",
         buffered: new Map(),
       });
@@ -135,18 +146,23 @@ export class SupervisedSlots {
     };
   }
 
+  /** False means UNDELIVERABLE — the child is gone — never "I declined to try".
+   * Liveness is the only thing that can refuse a write. Where the slot came from
+   * is not a reason: a retained child is as writable as one spawned a moment ago. */
   async writeInput(slot: number, data: string): Promise<boolean> {
     return this.serial(slot, async () => {
-      const binding = await this.ensure(slot);
-      // The write is deliberately consumed. A fresh bridge knows the slot but
-      // not the old submission queue; refusing only this input preserves the
-      // live child and its output while preventing an unknown resend.
-      if (!binding.allowInput) return false;
-      await this.writeControl(slot, {
-        v: ADAPTER_CHILD_PROTOCOL_VERSION,
-        type: "input",
-        dataBase64: Buffer.from(data).toString("base64"),
-      });
+      await this.ensure(slot);
+      try {
+        await this.writeControl(slot, {
+          v: ADAPTER_CHILD_PROTOCOL_VERSION,
+          type: "input",
+          dataBase64: Buffer.from(data).toString("base64"),
+        });
+      } catch {
+        // A dead slot cannot take stdin. Report it so the caller can respawn,
+        // rather than throwing through a control plane that has no recovery here.
+        return false;
+      }
       return true;
     }) as Promise<boolean>;
   }
@@ -157,8 +173,7 @@ export class SupervisedSlots {
     continuation: unknown;
   }): Promise<RemoteRecoverySnapshot> {
     return this.serial(slot, async () => {
-      const binding = await this.ensure(slot);
-      if (!binding.allowInput) throw new Error("retained slot is output-only after bridge restart");
+      await this.ensure(slot);
       const requestId = randomUUID();
       const response = this.waitForControl(requestId);
       try {
@@ -178,8 +193,7 @@ export class SupervisedSlots {
 
   async disarmRecovery(slot: number, submissionId: unknown): Promise<{ disarmed: boolean }> {
     return this.serial(slot, async () => {
-      const binding = this.bindings.get(slot);
-      if (!binding?.allowInput) return { disarmed: false };
+      if (!this.bindings.get(slot)) return { disarmed: false };
       const requestId = randomUUID();
       const response = this.waitForControl(requestId);
       try {
@@ -279,7 +293,7 @@ export class SupervisedSlots {
       initialStdinBase64: Buffer.from(bootstrap).toString("base64"),
     });
     this.options.onSpawn?.(slot, spawned.pid);
-    const binding: SlotBinding = { allowInput: true, mode: "live", buffered: new Map() };
+    const binding: SlotBinding = { mode: "live", buffered: new Map() };
     this.bindings.set(slot, binding);
     await this.options.client.subscribe({ slot, afterSeq: 0 }, (event) => this.onEvent(slot, event));
     return binding;

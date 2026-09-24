@@ -27,3 +27,7 @@ process.env.AGY_ENABLED = "false";
 process.env.AGY_PACKAGE_ENABLED = "false";
 process.env.AGY_OLD_ROLLBACK_ENABLED = "false";
 process.env.AGY_NATIVE_RESTORE = "false";
+// Catalog API access is networked but token-free. Non-live tests still must not
+// inherit the production credential; tests opt in with a synthetic fetch.
+delete process.env.CLAUDE_CATALOG_API_KEY;
+delete process.env.CLAUDE_CATALOG_WORKSPACE_ID;

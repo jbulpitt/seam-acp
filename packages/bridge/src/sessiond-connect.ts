@@ -7,8 +7,22 @@ const START_TIMEOUT_MS = 5_000;
 
 const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
-/** Connect to the descriptor owner, starting it when this user has none yet. */
+/**
+ * Connect to the descriptor owner, starting it when this user has none yet.
+ * If sessiond later restarts (to be updated), this bridge exits so its
+ * supervisor restarts it against the new one; running slots stay with their
+ * holders and are rebound on start (#631).
+ */
 export async function connectSessiond(): Promise<SessiondClient> {
+  const client = await connectOnce();
+  client.onDisconnect(() => {
+    console.error("[bridge] seam-sessiond went away; restarting to reconnect (running slots are unaffected)");
+    process.exit(1);
+  });
+  return client;
+}
+
+async function connectOnce(): Promise<SessiondClient> {
   const paths = defaultSessiondPaths();
   try {
     return await SessiondClient.connect(paths.socketPath);

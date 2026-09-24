@@ -451,3 +451,18 @@ describe("#573 seam-sessiond control-plane restart", () => {
     expect((await fs.stat(statePath)).mode & 0o777).toBe(0o600);
   });
 });
+
+describe("#631 a bridge notices when sessiond goes away", () => {
+  it("reports an unexpected disconnect once, and not its own close", async () => {
+    const { server, client } = await harness();
+    const other = await SessiondClient.connect((server as unknown as { options: { socketPath: string } }).options.socketPath);
+    const lost: string[] = [];
+    client.onDisconnect(() => lost.push("client"));
+    other.onDisconnect(() => lost.push("other"));
+    other.close();
+    await server.close();
+    servers.splice(servers.indexOf(server), 1);
+    await waitFor(() => lost.includes("client") ? true : undefined);
+    expect(lost).toEqual(["client"]);
+  });
+});

@@ -44,6 +44,8 @@ export class SessiondClient {
   private readonly subscriptions = new Map<number, (event: SessiondEvent) => void>();
   private input = Buffer.alloc(0);
   private closed = false;
+  private disconnected?: () => void;
+  private closedByClient = false;
 
   private constructor(
     private readonly socket: Socket,
@@ -51,7 +53,15 @@ export class SessiondClient {
   ) {
     socket.on("data", (chunk: Buffer) => this.receive(chunk));
     socket.on("error", (error) => this.failAll(error));
-    socket.on("close", () => this.failAll(new SessiondClientError("disconnected", "seam-sessiond disconnected")));
+    socket.on("close", () => {
+      this.failAll(new SessiondClientError("disconnected", "seam-sessiond disconnected"));
+      if (!this.closedByClient) this.disconnected?.();
+    });
+  }
+
+  /** Called once when sessiond goes away without this client closing it. */
+  onDisconnect(listener: () => void): void {
+    this.disconnected = listener;
   }
 
   static async connect(socketPath: string, options: SessiondClientOptions = {}): Promise<SessiondClient> {
@@ -106,6 +116,7 @@ export class SessiondClient {
   }
 
   close(): void {
+    this.closedByClient = true;
     if (this.closed) return;
     this.closed = true;
     this.socket.end();

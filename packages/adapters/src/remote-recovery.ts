@@ -11,6 +11,13 @@ export interface RemoteRung1Policy {
   retryCount: number;
   backoffMs: number[];
   retryableErrorKinds: AdapterErrorKind[];
+  /**
+   * Optional per-kind schedule that replaces `backoffMs` for that kind,
+   * indexed by how many times that kind has been retried; past its end, that
+   * kind stops retrying. Added after v1 shipped, so it is never required to
+   * validate: an older bridge ignores it and keeps `backoffMs` (#626).
+   */
+  backoffMsByKind?: Partial<Record<AdapterErrorKind, number[]>>;
 }
 
 export interface RemoteRecoveryBinding {
@@ -105,6 +112,27 @@ export function isRemoteRung1Policy(value: unknown): value is RemoteRung1Policy 
     && Array.isArray(policy.retryableErrorKinds)
     && policy.retryableErrorKinds.length <= ADAPTER_ERROR_KINDS.length
     && policy.retryableErrorKinds.every((kind) => ADAPTER_ERROR_KINDS.includes(kind));
+}
+
+/**
+ * The schedule `backoffMsByKind` gives this kind, or undefined when it gives
+ * none or a malformed one; the caller then uses `backoffMs`. A malformed
+ * entry refuses only that override — the policy, its spawn, and every other
+ * kind keep working — because controllers and bridges ship at different
+ * times and a bad value here must not stop a host from starting agents.
+ */
+export function remoteRung1KindBackoff(
+  policy: RemoteRung1Policy,
+  kind: AdapterErrorKind,
+): readonly number[] | undefined {
+  const byKind: unknown = policy.backoffMsByKind;
+  if (!byKind || typeof byKind !== "object" || Array.isArray(byKind)) return undefined;
+  const schedule: unknown = (byKind as Record<string, unknown>)[kind];
+  return Array.isArray(schedule)
+    && schedule.length <= 10
+    && schedule.every((delay) => Number.isSafeInteger(delay) && delay >= 0 && delay <= 60_000)
+    ? schedule as number[]
+    : undefined;
 }
 
 export function isRemoteRecoverySnapshot(value: unknown): value is RemoteRecoverySnapshot {

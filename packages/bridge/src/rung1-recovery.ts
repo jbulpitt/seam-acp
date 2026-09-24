@@ -1,9 +1,10 @@
 import { randomUUID } from "node:crypto";
-import type {
-  AdapterErrorKind,
-  RemoteRecoveryResult,
-  RemoteRecoverySnapshot,
-  RemoteRung1Policy,
+import {
+  remoteRung1KindBackoff,
+  type AdapterErrorKind,
+  type RemoteRecoveryResult,
+  type RemoteRecoverySnapshot,
+  type RemoteRung1Policy,
 } from "@seam/adapters";
 
 const MAX_RESULT_CHARS = 2 * 1024 * 1024;
@@ -24,6 +25,8 @@ interface ArmedRecovery {
   originalRequestId?: string | number;
   activeRequestId?: string | number;
   retry: number;
+  /** Retries already spent per kind; indexes `backoffMsByKind` (#626). */
+  kindRetries: Map<AdapterErrorKind, number>;
   text: string;
   result?: RemoteRecoveryResult;
   terminal: boolean;
@@ -145,21 +148,20 @@ export function createRung1Recovery(hooks: Rung1RecoveryHooks) {
     hooks.publishResult(slot, { ...state.result });
   };
 
+  /** False when no retry is left for this kind; the caller then finishes the
+   * recovery AND forwards the error. A per-kind schedule can end before the
+   * overall budget (#626), and swallowing that error would hang the turn. */
   const scheduleContinuation = (
     slot: number,
     state: ArmedRecovery,
     kind: AdapterErrorKind,
-  ): void => {
-    const delay = state.policy.backoffMs[state.retry];
-    if (delay === undefined || !state.policy.retryableErrorKinds.includes(kind)) {
-      finish(slot, state, "failed", {
-        phase: "exhausted",
-        terminalReason: "budget_exhausted",
-        errorKind: kind,
-      });
-      return;
-    }
+  ): boolean => {
+    const kindSchedule = remoteRung1KindBackoff(state.policy, kind);
+    const kindRetry = state.kindRetries.get(kind) ?? 0;
+    const delay = kindSchedule ? kindSchedule[kindRetry] : state.policy.backoffMs[state.retry];
+    if (delay === undefined || !state.policy.retryableErrorKinds.includes(kind)) return false;
     state.retry += 1;
+    state.kindRetries.set(kind, kindRetry + 1);
     publish(slot, state, {
       phase: "backoff",
       disposition: "continue_same_session",
@@ -192,6 +194,7 @@ export function createRung1Recovery(hooks: Rung1RecoveryHooks) {
       }
     }, delay);
     state.timer.unref?.();
+    return true;
   };
 
   return {
@@ -232,6 +235,7 @@ export function createRung1Recovery(hooks: Rung1RecoveryHooks) {
         continuation: input.continuation,
         policy,
         retry: 0,
+        kindRetries: new Map(),
         text: "",
         terminal: false,
         resultLimitExceeded: false,
@@ -320,10 +324,7 @@ export function createRung1Recovery(hooks: Rung1RecoveryHooks) {
       const kind = hooks.classify(slot, errorForClassification(message));
       const shouldRetry = state.retry < state.policy.retryCount
         && state.policy.retryableErrorKinds.includes(kind);
-      if (shouldRetry) {
-        scheduleContinuation(slot, state, kind);
-        return { forward: null };
-      }
+      if (shouldRetry && scheduleContinuation(slot, state, kind)) return { forward: null };
       finish(slot, state, "failed", {
         phase: "exhausted",
         terminalReason: "budget_exhausted",

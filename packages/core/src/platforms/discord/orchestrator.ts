@@ -15914,9 +15914,23 @@ export class Orchestrator {
   private deferRemoteRecoveryAdoption(attempt: TurnAttempt): void {
     const binding = attempt.remoteRecovery;
     if (!binding || !this.bridgeHub || this.remoteAdoptionWaiters.has(attempt.id)) return;
+    // Tier 3 (#631): after 15 minutes without the bridge, say so plainly and
+    // keep waiting. The turn continues the moment the bridge is back.
+    const target = attempt.spec?.target;
+    let told = false;
+    const notice = setTimeout(() => {
+      if (!target) return;
+      told = true;
+      void this.postResumeNotice(target,
+        `🔌 Still reconnecting to \`${binding.location}\`: its bridge has been unreachable for 15 minutes. `
+          + "I'll keep trying, and this turn continues as soon as it's back.");
+    }, 15 * 60_000);
+    notice.unref?.();
     const unsubscribe = this.bridgeHub.onBridgeReady((location) => {
       if (location !== binding.location) return;
       unsubscribe();
+      clearTimeout(notice);
+      if (told && target) void this.postResumeNotice(target, "🔌 Reconnected to session");
       this.remoteAdoptionWaiters.delete(attempt.id);
       const current = this.store.turnAttempts.get(attempt.id);
       if (!current || current.state !== "suspended"
@@ -15925,7 +15939,10 @@ export class Orchestrator {
       void this.adoptRemoteRecovery(current).catch((err) =>
         this.logger.warn({ err, attempt: attempt.id }, "deferred remote recovery adoption failed"));
     });
-    this.remoteAdoptionWaiters.set(attempt.id, unsubscribe);
+    this.remoteAdoptionWaiters.set(attempt.id, () => {
+      clearTimeout(notice);
+      unsubscribe();
+    });
   }
 
   /**

@@ -95,3 +95,38 @@ describe("#631 a shared ACP session is forked for the newer thread", () => {
     expect(sent).toEqual([]);
   });
 });
+
+describe("#631 tier 3: a bridge that stays unreachable", () => {
+  it("says so after 15 minutes, keeps waiting, and says when it is back", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const sent: Array<{ channel: string; text: string }> = [];
+      const ready: Array<(location: string) => void> = [];
+      const built = new Orchestrator({
+        modelCatalog: fixtureModelCatalog([]),
+        logger: silent,
+        config: { DATA_DIR: dir, REPOS_ROOT: "/repo", channelPresets: new Map(), threadPresets: new Map(), bridgePresets: new Map() } as never,
+        adapter: { sendMessage: async (channel: { id: string }, text: string) => { sent.push({ channel: channel.id, text }); return { id: "m" }; } } as never,
+        router: {} as never,
+        store,
+        renderer: {} as never,
+      });
+      built.setBridgeHub({ onBridgeReady: (cb: (location: string) => void) => { ready.push(cb); return () => undefined; } } as never);
+      Object.assign(built as never, { adoptRemoteRecovery: vi.fn(async () => true) });
+      (built as unknown as { deferRemoteRecoveryAdoption(a: unknown): void }).deferRemoteRecoveryAdoption({
+        id: "turn-1", generation: 1, spec: { target: "thread-9" },
+        remoteRecovery: { location: "fhr-server", submissionId: "sub", slot: 1 },
+      });
+      vi.advanceTimersByTime(14 * 60_000);
+      expect(sent).toEqual([]);
+      vi.advanceTimersByTime(60_000);
+      await Promise.resolve();
+      expect(sent).toEqual([{ channel: "thread-9", text: expect.stringContaining("Still reconnecting to `fhr-server`") }]);
+      ready[0]!("fhr-server");
+      await Promise.resolve();
+      expect(sent.at(-1)).toEqual({ channel: "thread-9", text: "🔌 Reconnected to session" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});

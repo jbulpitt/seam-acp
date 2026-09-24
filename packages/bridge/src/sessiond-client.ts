@@ -1,3 +1,4 @@
+import { createNdjsonReader } from "./ndjson-reader.js";
 import { randomUUID } from "node:crypto";
 import net, { type Socket } from "node:net";
 import {
@@ -16,7 +17,8 @@ import {
 } from "./sessiond-protocol.js";
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
-const MAX_WIRE_BYTES = 12 * 1024 * 1024;
+// Matches sessiond's request cap; see sessiond-server.ts.
+const MAX_WIRE_BYTES = 256 * 1024 * 1024;
 
 export class SessiondClientError extends Error {
   constructor(
@@ -42,7 +44,7 @@ export interface SessiondClientOptions {
 export class SessiondClient {
   private readonly pending = new Map<string, PendingRequest>();
   private readonly subscriptions = new Map<number, (event: SessiondEvent) => void>();
-  private input = Buffer.alloc(0);
+  private readonly reader = createNdjsonReader((line) => this.deliver(line.toString("utf8")), MAX_WIRE_BYTES);
   private closed = false;
   private disconnected?: () => void;
   private closedByClient = false;
@@ -141,23 +143,11 @@ export class SessiondClient {
   }
 
   private receive(chunk: Buffer): void {
-    this.input = Buffer.concat([this.input, chunk]);
-    if (this.input.length > MAX_WIRE_BYTES && this.input.indexOf(0x0a) === -1) {
+    if (!this.reader.push(chunk)) {
       this.socket.destroy(new SessiondClientError("protocol_error", "sessiond frame exceeded the wire limit"));
-      return;
-    }
-    let newline = this.input.indexOf(0x0a);
-    while (newline !== -1) {
-      const line = this.input.subarray(0, newline);
-      this.input = this.input.subarray(newline + 1);
-      if (line.length > MAX_WIRE_BYTES) {
-        this.socket.destroy(new SessiondClientError("protocol_error", "sessiond frame exceeded the wire limit"));
-        return;
-      }
-      if (line.length) this.deliver(line.toString("utf8"));
-      newline = this.input.indexOf(0x0a);
     }
   }
+
 
   private deliver(line: string): void {
     let message: SessiondWireMessage;

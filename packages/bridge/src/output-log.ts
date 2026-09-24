@@ -233,11 +233,14 @@ export function createOutputLog(options: OutputLogOptions = {}): OutputLog {
  * silently is the very discontinuity this exists to prevent — the consumer's
  * parse-failure counter then sees it.
  */
-export function createLineFramer(maxLineBytes = 8 * 1024 * 1024) {
+export function createLineFramer(maxLineBytes = 256 * 1024 * 1024) {
   let residual = "";
   return {
     /** Complete lines (newline included) from this chunk. */
     push(chunk: string): string[] {
+      // Only the new chunk can hold the next newline; scanning the whole
+      // residual again on every chunk made large lines quadratic.
+      const scanFrom = residual.length;
       residual += chunk;
       if (residual.length > maxLineBytes) {
         const overflow = residual;
@@ -245,12 +248,14 @@ export function createLineFramer(maxLineBytes = 8 * 1024 * 1024) {
         return [overflow];
       }
       const lines: string[] = [];
-      let index = residual.indexOf("\n");
+      let start = 0;
+      let index = residual.indexOf("\n", scanFrom);
       while (index !== -1) {
-        lines.push(residual.slice(0, index + 1));
-        residual = residual.slice(index + 1);
-        index = residual.indexOf("\n");
+        lines.push(residual.slice(start, index + 1));
+        start = index + 1;
+        index = residual.indexOf("\n", start);
       }
+      if (start > 0) residual = residual.slice(start);
       return lines;
     },
     /** Whatever is held back, for flushing when the process exits. */

@@ -22,6 +22,8 @@ export type SlotHolderInput =
       args?: string[];
       cwd: string;
       env: Record<string, string>;
+      /** First sequence number, when resuming after a restart. */
+      firstSeq?: number;
     }
   | { v: typeof SLOT_HOLDER_PROTOCOL_VERSION; type: "write"; id: string; dataBase64: string }
   | { v: typeof SLOT_HOLDER_PROTOCOL_VERSION; type: "ack"; throughSeq: number }

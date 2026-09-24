@@ -161,9 +161,10 @@ export function createOutputLog(options: OutputLogOptions = {}): OutputLog {
       const seq = given ?? expected;
       const log = slotLog(slot);
       if (seq > expected) {
-        // The producer dropped these before they reached this log.
+        // The producer dropped these before they reached this log. A slot
+        // relaunched after a restart starts far ahead; its loss is unknown.
         log.droppedThrough = Math.max(log.droppedThrough, seq - 1);
-        log.droppedCount += seq - expected;
+        if (expected > 1) log.droppedCount += seq - expected;
       }
       nextSeq.set(slot, seq);
       const bytes = JSON.stringify(payload).length;

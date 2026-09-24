@@ -92,6 +92,14 @@ export interface SessiondServerOptions {
   outputLog?: OutputLogOptions;
   /** The slot holder entry point; tests run it from source. */
   holderPath?: string;
+  /** Where children record turns to resume after a host restart. Must persist across reboots. */
+  resumeDir?: string;
+}
+
+/** Where the production daemon keeps resume records: it must survive a reboot. */
+export function defaultSessiondResumeDir(): string {
+  return process.env.SEAM_SESSIOND_RESUME_DIR
+    ?? path.join(process.env.XDG_STATE_HOME || path.join(process.env.HOME ?? "/tmp", ".local/state"), "seam/sessiond-resume");
 }
 
 function defaultHolderPath(): string {
@@ -350,6 +358,12 @@ export class SessiondServer {
     await assertPrivateDirectory(path.dirname(this.options.socketPath));
     await assertPrivateDirectory(path.dirname(this.options.statePath));
     await this.recoverPersistedSlots();
+    // Children write resume records here; it must exist before any spawn.
+    const resumeReady = await assertPrivateDirectory(this.resumeDir()).then(() => true, (error: NodeJS.ErrnoException) => {
+      console.error(`[seam-sessiond] resume directory unusable (${error.code ?? "error"}); turns will not resume after a host restart`);
+      return false;
+    });
+    if (resumeReady) await this.relaunchRecordedTurns();
     await removeStaleSocket(this.options.socketPath);
     await new Promise<void>((resolve, reject) => {
       const onError = (error: Error) => reject(error);
@@ -486,7 +500,19 @@ export class SessiondServer {
     return path.join(path.dirname(this.options.socketPath), "slots");
   }
 
-  private async spawnSlot(params: SessiondSpawnParams): Promise<{ slot: number; pid: number }> {
+  private resumeDir(): string {
+    return this.options.resumeDir ?? path.join(path.dirname(this.options.statePath), "resume");
+  }
+
+  private resumeFile(slot: number): string {
+    return path.join(this.resumeDir(), `${slot}.json`);
+  }
+
+  private dropResumeRecord(slot: number): void {
+    void fs.unlink(this.resumeFile(slot)).catch(() => undefined);
+  }
+
+  private async spawnSlot(params: SessiondSpawnParams, launch: { firstSeq?: number } = {}): Promise<{ slot: number; pid: number }> {
     const existing = this.slots.get(params.slot);
     if (existing && this.entryAlive(existing)) {
       throw new SessiondError("slot_exists", "spawn refused: slot already has a live process");
@@ -572,7 +598,9 @@ export class SessiondServer {
       executable: params.executable,
       args: params.args ?? [],
       cwd: params.cwd,
-      env: params.env,
+      // The child records a turn to resume here; see adapter-child-resume.ts.
+      env: { ...params.env, SEAM_SESSIOND_RESUME_FILE: this.resumeFile(params.slot) },
+      ...(launch.firstSeq ? { firstSeq: launch.firstSeq } : {}),
     }).catch(() => undefined);
     if (!result || result.type !== "spawn_result" || !result.ok || !result.pid) {
       const code = result?.type === "spawn_result" ? result.code : undefined;
@@ -703,6 +731,8 @@ export class SessiondServer {
     if (frame.stream === "stdout") entry.lastStdoutAt = frame.at;
     if (frame.stream === "exit") {
       entry.exited = true;
+      // This supervisor saw the slot end, so there is nothing to resume.
+      this.dropResumeRecord(entry.slot);
       entry.exitCode = frame.code ?? null;
       entry.signal = frame.signal ?? null;
       this.backpressured.delete(entry.slot);
@@ -784,6 +814,8 @@ export class SessiondServer {
     const entry = this.slots.get(params.slot);
     if (!entry) throw new SessiondError("slot_not_found", "kill refused: slot does not exist");
     if (!this.entryAlive(entry)) return { slot: params.slot, signalled: false, alreadyDead: true };
+    // An explicit kill ends this slot's work: never resume it after a restart.
+    this.dropResumeRecord(params.slot);
     const signal = params.signal ?? "SIGTERM";
     let signalled = false;
     if (signal !== "SIGKILL" && entry.link && !entry.link.destroyed) {
@@ -912,6 +944,36 @@ export class SessiondServer {
       }
     }
     await this.persist();
+  }
+
+  /**
+   * #631: a host restart ended slots whose turns were still running. Each
+   * left a resume record; relaunch it before accepting clients, so the bridge
+   * sees the slot live on its first look. What the child does with its
+   * bootstrap is its business.
+   */
+  private async relaunchRecordedTurns(): Promise<void> {
+    const directory = this.resumeDir();
+    const names = await fs.readdir(directory).catch(() => [] as string[]);
+    await Promise.all(names.filter((name) => /^\d+\.json$/.test(name)).map(async (name) => {
+      const file = path.join(directory, name);
+      try {
+        const record = JSON.parse(await fs.readFile(file, "utf8")) as {
+          version?: unknown; slot?: unknown; initialStdinBase64?: unknown;
+          launch?: { executable?: unknown; args?: unknown; cwd?: unknown; env?: unknown };
+        };
+        const existing = this.slots.get(Number(record.slot));
+        if (existing && this.entryAlive(existing)) return;
+        const params = parseSpawnParams({ slot: record.slot, ...record.launch, initialStdinBase64: record.initialStdinBase64 });
+        // Sequence numbers well past anything a consumer read before the restart.
+        const { pid } = await this.spawnSlot(params, { firstSeq: Date.now() * 1000 });
+        console.error(`[seam-sessiond] relaunched slot ${params.slot} (pid ${pid}) to resume its interrupted turn`);
+      } catch (error) {
+        const reason = error instanceof SessiondError ? error.message : "unreadable record";
+        console.error(`[seam-sessiond] could not relaunch ${name}: ${reason}; kept as ${name}.failed`);
+        await fs.rename(file, `${file}.failed`).catch(() => undefined);
+      }
+    }));
   }
 
   private persist(): Promise<void> {

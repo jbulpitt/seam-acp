@@ -69,6 +69,7 @@ function startChild(message: Extract<SlotHolderInput, { type: "spawn" }>, socket
     send(socket, { v: SLOT_HOLDER_PROTOCOL_VERSION, type: "spawn_result", ok: false, code: "EEXIST" });
     return;
   }
+  if (message.firstSeq && message.firstSeq > seq) seq = message.firstSeq - 1;
   let spawned: ChildProcessWithoutNullStreams;
   try {
     spawned = spawn(message.executable, message.args ?? [], {

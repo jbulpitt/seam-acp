@@ -17,11 +17,13 @@ import { loadHostAdapterInventory } from "./inventory.js";
 import { createRung1Recovery } from "./rung1-recovery.js";
 import { spawnSupervisedAdapter } from "./spawn-agent.js";
 import { spawnRefusalFrame } from "./resolve-adapter.js";
+import { createResumeRecorder } from "./adapter-child-resume.js";
 import {
   ADAPTER_CHILD_PROTOCOL_VERSION,
   adapterChildLine,
   type AdapterChildBootstrap,
   type AdapterChildInput,
+  type AdapterChildResume,
   type AdapterChildOutput,
 } from "./adapter-child-protocol.js";
 
@@ -77,6 +79,7 @@ function start(config: AdapterChildBootstrap): void {
     return;
   }
   child = spawned;
+  const resumeRecord = createResumeRecorder(process.env.SEAM_SESSIOND_RESUME_FILE, config);
   const recovery = createRung1Recovery({
     policyFor: () => config.config.rung1Recovery,
     classify: (_slot, error) => {
@@ -93,18 +96,70 @@ function start(config: AdapterChildBootstrap): void {
       type: "recovery",
       recovery: snapshot,
     }),
-    publishResult: (_slot, result) => publish({
-      v: ADAPTER_CHILD_PROTOCOL_VERSION,
-      type: "recovery_result",
-      recoveryResult: result,
-    }),
+    publishResult: (_slot, result) => {
+      publish({
+        v: ADAPTER_CHILD_PROTOCOL_VERSION,
+        type: "recovery_result",
+        recoveryResult: result,
+      });
+      resumeRecord.clear();
+    },
     // The durable output stream retains child-to-client requests while the
     // bridge is absent. The replacement controller can answer after replay.
     controllerConnected: () => true,
   });
 
+  // #631: relaunched after a host restart. Bring the agent back to the same
+  // session, then continue the interrupted turn under its original request id.
+  let resuming: { resume: AdapterChildResume; phase: "initialize" | "load" } | undefined;
+  const RESUME_INITIALIZE = "seam-resume-initialize";
+  const RESUME_LOAD = "seam-resume-load";
+  const resumeOutput = (line: string): boolean => {
+    if (!resuming) return false;
+    let message: { id?: unknown; method?: unknown; error?: { message?: unknown } };
+    try {
+      message = JSON.parse(line) as typeof message;
+    } catch {
+      return false;
+    }
+    // session/load replays the conversation; the controller already has it.
+    if (resuming.phase === "load" && message.method === "session/update") return true;
+    if (resuming.phase === "initialize" && message.id === RESUME_INITIALIZE) {
+      if (message.error) {
+        exitWithRefusal(`resume after restart: initialize failed (${String(message.error.message ?? "error")})`);
+        return true;
+      }
+      resuming.phase = "load";
+      writeAgent(`${JSON.stringify({ jsonrpc: "2.0", id: RESUME_LOAD, method: "session/load", params: resuming.resume.load })}\n`);
+      return true;
+    }
+    if (resuming.phase === "load" && message.id === RESUME_LOAD) {
+      if (message.error) {
+        exitWithRefusal(`resume after restart: session/load failed (${String(message.error.message ?? "error")})`);
+        return true;
+      }
+      const { recovery: turn } = resuming.resume;
+      resuming = undefined;
+      process.stderr.write(`[adapter-child] resumed session ${turn.acpSessionId} after a restart; continuing the turn\n`);
+      recovery.arm(config.slot, {
+        submissionId: turn.submissionId,
+        acpSessionId: turn.acpSessionId,
+        continuation: turn.continuation,
+      });
+      deliverInput(Buffer.from(`${JSON.stringify({
+        jsonrpc: "2.0",
+        id: turn.originalRequestId,
+        method: "session/prompt",
+        params: { sessionId: turn.acpSessionId, prompt: [{ type: "text", text: turn.continuation }] },
+      })}\n`));
+      return true;
+    }
+    return false;
+  };
+
   child.stdout?.on("data", (chunk: Buffer | string) => {
     for (const line of agentOutput.push(chunk.toString())) {
+      if (resumeOutput(line)) continue;
       const decision = recovery.observeOutput(config.slot, line);
       if (decision.forward !== null) publish({
         v: ADAPTER_CHILD_PROTOCOL_VERSION,
@@ -144,10 +199,7 @@ function start(config: AdapterChildBootstrap): void {
       return;
     }
     if (message.type === "input") {
-      const bytes = Buffer.from(message.dataBase64, "base64");
-      recovery.observeInputBytes(config.slot);
-      for (const line of agentInput.push(bytes.toString())) recovery.observeInput(config.slot, line);
-      if (!writeAgent(bytes)) exitWithRefusal("agent stdin is closed; input could not be delivered");
+      deliverInput(Buffer.from(message.dataBase64, "base64"));
     } else if (message.type === "arm_recovery") {
       try {
         publish({
@@ -181,7 +233,21 @@ function start(config: AdapterChildBootstrap): void {
       });
     }
   };
+  function deliverInput(bytes: Buffer): void {
+    recovery.observeInputBytes(config.slot);
+    for (const line of agentInput.push(bytes.toString())) {
+      recovery.observeInput(config.slot, line);
+      resumeRecord.observeInput(line);
+      resumeRecord.record(recovery.resumable(config.slot));
+    }
+    if (!writeAgent(bytes)) exitWithRefusal("agent stdin is closed; input could not be delivered");
+  }
+
   consume = handle;
+  if (config.resume) {
+    resuming = { resume: config.resume, phase: "initialize" };
+    writeAgent(`${JSON.stringify({ jsonrpc: "2.0", id: RESUME_INITIALIZE, method: "initialize", params: config.resume.initialize })}\n`);
+  }
 }
 
 let consume = (message: AdapterChildInput): void => {

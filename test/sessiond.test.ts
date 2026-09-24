@@ -55,6 +55,10 @@ async function harness(outputLog?: { maxBytes?: number; maxAgeMs?: number; maxFr
   return { root, socketPath, statePath, server, client };
 }
 
+async function listedDead(client: SessiondClient, slot: number): Promise<boolean> {
+  return (await client.listSlots()).health.some((entry) => entry.slot === slot && !entry.alive);
+}
+
 function stdoutText(events: SessiondEvent[]): string {
   return events
     .filter((event): event is Extract<SessiondEvent, { type: "output" }> =>
@@ -236,6 +240,36 @@ describe("#573 seam-sessiond control-plane restart", () => {
     expect(events.some((event) => event.type === "output_gap")).toBe(false);
     const text = stdoutText(events);
     for (let n = 1; n <= 20; n += 1) expect(text).toContain(`line ${n}\n`);
+  });
+
+  it("keeps a resume record only when nobody saw the slot end (#631)", async () => {
+    const { root, socketPath, statePath, server, client } = await harness();
+    const writer = (exit: boolean) => ["-e",
+      `require("fs").writeFileSync(process.env.SEAM_SESSIOND_RESUME_FILE, "{}"); ${exit ? "setTimeout(() => process.exit(0), 200)" : "setInterval(() => {}, 1000)"}`];
+    const spawnWriter = (slot: number, exit: boolean) => client.spawn({
+      slot, executable: process.execPath, args: writer(exit), cwd: process.cwd(), env: { PATH: process.env.PATH ?? "" },
+    });
+    const record = (slot: number) => path.join(root, "resume", `${slot}.json`);
+    const exists = (file: string) => fs.access(file).then(() => true, () => false);
+
+    await spawnWriter(21, false);
+    await waitForAsync(async () => (await exists(record(21))) || undefined);
+    await client.kill({ slot: 21 });
+    await waitForAsync(async () => (await exists(record(21))) ? undefined : true);
+
+    await spawnWriter(22, true);
+    await waitForAsync(async () => (await listedDead(client, 22)) || undefined);
+    await waitForAsync(async () => (await exists(record(22))) ? undefined : true);
+
+    await spawnWriter(23, false);
+    await waitForAsync(async () => (await exists(record(23))) || undefined);
+    client.close();
+    await server.close();
+    servers.splice(servers.indexOf(server), 1);
+    expect(await exists(record(23))).toBe(true);
+    const successor = new SessiondServer({ socketPath, statePath });
+    servers.push(successor);
+    await successor.start();
   });
 
   it("never signals a persisted pid when its start identity does not match", async () => {

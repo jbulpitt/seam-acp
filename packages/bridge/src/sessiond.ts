@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import path from "node:path";
-import { SessiondServer } from "./sessiond-server.js";
+import { SessiondServer, defaultSessiondResumeDir } from "./sessiond-server.js";
 import { defaultSessiondPaths } from "./sessiond-paths.js";
 
 function valueAfter(flag: string): string | undefined {
@@ -19,7 +19,11 @@ const defaults = socketArg && stateArg
 const socketPath = socketArg ?? defaults.socketPath;
 const statePath = stateArg ?? defaults.statePath;
 
-const server = new SessiondServer({ socketPath, statePath });
+const server = new SessiondServer({
+  socketPath,
+  statePath,
+  resumeDir: valueAfter("--resume-dir") ?? defaultSessiondResumeDir(),
+});
 await server.start();
 console.error(`[seam-sessiond] listening (${path.basename(socketPath)})`);
 

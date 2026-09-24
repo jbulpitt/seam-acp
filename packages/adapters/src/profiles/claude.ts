@@ -1122,6 +1122,11 @@ function pickStringField(
 const CLAUDE_CONTEXT_WINDOWS: Readonly<Record<string, number>> = {
   "claude-fable-5-1": 1_000_000,
   "claude-opus-5": 1_000_000,
+  // `default` now auto-rolls to this model. Verified 2026-09-23 on claude-agent-acp
+  // 0.81.1: an explicit selection ran as claude-opus-5-5, ACP usage_update.size
+  // 1000000, and raw `claude /context` showed 1m. Without this row an explicit
+  // pick computed a 200K compaction threshold (160K) on a 1M model.
+  "claude-opus-5-5": 1_000_000,
   "claude-opus-4-8": 1_000_000,
   "claude-opus-4-7": 1_000_000,
   "claude-fable-5": 1_000_000,

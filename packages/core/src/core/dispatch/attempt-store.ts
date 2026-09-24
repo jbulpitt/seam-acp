@@ -42,13 +42,6 @@ function recordedOwner(raw: string | undefined): ProcessOwner | null {
 export const inboundAttemptId = (messageId: string): string => `inbound-${messageId}`;
 
 /**
- * A prompted suspension was cancelled so a never-started dispatch on the
- * same target can run. The original prompt is not sent again.
- */
-export const PROMPTED_BLOCK_SETTLED_REASON =
-  "settled without resending: a never-started dispatch is waiting on this target";
-
-/**
  * An active claim never reached session/prompt, and a later attempt on the
  * same target has since completed. Nothing was sent (#559). Not the
  * prompted-block reason: that one is a prompt that already started.
@@ -61,12 +54,6 @@ export const UNSTARTED_SUPERSEDED_REASON =
  * that any output was delivered. */
 export const OPERATOR_SESSION_REPLACED_REASON =
   "cancelled because an operator replaced the bound ACP session";
-
-export interface SettledPromptedBlock {
-  target: string;
-  settledId: string;
-  pendingIds: string[];
-}
 
 export interface SettledUnstartedAttempt {
   target: string;
@@ -522,6 +509,18 @@ export class TurnAttemptStore {
         binding.acpSessionId, binding.location, binding.slot, binding.delegatedUtc).changes === 1;
   }
 
+  /** The bridge no longer holds this suspended turn (its slot is gone or died
+   * without a result). Drop the delegation so the turn continues in its
+   * recorded session like any other interrupted turn (#631). */
+  releaseLostRemoteRecovery(a: TurnAttempt, binding: RemoteRecoveryBinding): boolean {
+    return this.db.prepare(`UPDATE turn_attempts
+      SET runtime_json=json_remove(runtime_json, '$.remoteRecovery'), updated_utc=?
+      WHERE id=? AND generation=? AND state='suspended'
+        AND json_extract(runtime_json, '$.remoteRecovery.submissionId')=?
+        AND json_extract(runtime_json, '$.remoteRecovery.slot')=?`)
+      .run(new Date().toISOString(), a.id, a.generation, binding.submissionId, binding.slot).changes === 1;
+  }
+
   /** Adopt a bridge-completed result without claiming or prompting again. */
   adoptRemoteResult(a: TurnAttempt, result: RemoteRecoveryResult, outcome: DispatchResult): boolean {
     const binding = a.remoteRecovery;
@@ -837,48 +836,6 @@ export class TurnAttemptStore {
   suspend(id: string, ownerBoot: string): boolean {
     return this.db.prepare("UPDATE turn_attempts SET state='suspended', updated_utc=? WHERE id=? AND owner_boot=? AND state='active'")
       .run(new Date().toISOString(), id, ownerBoot).changes === 1;
-  }
-
-  /**
-   * Drop a prompted suspension that is sitting ahead of work which has not
-   * started. `prompt_started=0` is left pending: that dispatch has not been
-   * billed and the watcher may claim it. A prompted row with no never-started
-   * sibling is left suspended so reattach can still continue it.
-   * `owner_boot` is not a signal — `admit` writes it empty.
-   */
-  settleBlockedPromptedAttempts(target?: string): SettledPromptedBlock[] {
-    const waiting = new Map<string, string[]>();
-    const prompted = new Map<string, TurnAttempt[]>();
-    for (const attempt of this.list("pending")) {
-      if (attempt.source !== "dispatch" || attempt.promptStarted) continue;
-      const key = attempt.spec?.target;
-      if (!key || (target !== undefined && key !== target)) continue;
-      const ids = waiting.get(key) ?? [];
-      ids.push(attempt.id);
-      waiting.set(key, ids);
-    }
-    for (const attempt of this.list("suspended")) {
-      if (attempt.source !== "dispatch" || !attempt.promptStarted) continue;
-      // A delegated attempt is still executing beside its child. Settling it
-      // to unblock later input would discard the exact bridge result #467 is
-      // responsible for adopting; pending work stays blocked on this target.
-      if (attempt.remoteRecovery) continue;
-      const key = attempt.spec?.target;
-      if (!key || (target !== undefined && key !== target)) continue;
-      const rows = prompted.get(key) ?? [];
-      rows.push(attempt);
-      prompted.set(key, rows);
-    }
-    const settled: SettledPromptedBlock[] = [];
-    for (const [key, rows] of prompted) {
-      const pendingIds = waiting.get(key);
-      if (!pendingIds || pendingIds.length === 0) continue;
-      for (const attempt of rows) {
-        if (!this.cancel(attempt.id, PROMPTED_BLOCK_SETTLED_REASON)) continue;
-        settled.push({ target: key, settledId: attempt.id, pendingIds: [...pendingIds] });
-      }
-    }
-    return settled;
   }
 
   /**

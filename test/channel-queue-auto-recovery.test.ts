@@ -204,13 +204,9 @@ describe("#423 a wedged thread self-heals without an operator", () => {
     expect(store.getInbound("306")?.state).toBe("running");
   });
 
-  it("settles a prompted suspension without resending it when never-started work is waiting (#428)", async () => {
-    // The sweep used to fence the queue and leave the prompted suspension in
-    // front of handoffs that had never been claimed. Resending that prompt
-    // would bill the interrupted turn again. Empty owner_boot on the pending
-    // row is not a dead owner. Settle the prompted row and leave the
-    // never-started one pending. That is not "recovered": the successor has
-    // not run yet.
+  it("never cancels a prompted suspension to make room for later work (#631)", async () => {
+    // A prompted turn is continued in its recorded session; the queued work
+    // runs after it. The sweep must not cancel it.
     const { host } = makeHost();
     expect(admitStale("428")).toBe(true);
     const suspended = {
@@ -230,24 +226,9 @@ describe("#423 a wedged thread self-heals without an operator", () => {
     store.turnAttempts.admit(pending);
     expect(host.inspectChannelQueue(CHANNEL).state).toBe("wedged");
 
-    expect(await host.sweepWedgedQueues()).toEqual([]);
-
-    expect(store.turnAttempts.get("suspended-prompted")).toMatchObject({
-      state: "cancelled",
-      promptStarted: true,
-    });
-    expect(store.turnAttempts.get("pending-never")).toMatchObject({
-      state: "pending",
-      promptStarted: false,
-      ownerBoot: "",
-      generation: 0,
-    });
-    const audit = store.listConfigMutations().filter((m) => m.scope === `thread:${CHANNEL}`);
-    expect(audit).toHaveLength(1);
-    expect(audit[0]!.summary).toBe(
-      "Settled prompted suspension (auto); the interrupted prompt was not resent",
-    );
-    expect(audit[0]!.summary).not.toMatch(/Recovered channel queue/);
+    await host.sweepWedgedQueues();
+    expect(store.turnAttempts.get("suspended-prompted")?.state).not.toBe("cancelled");
+    expect(store.turnAttempts.get("pending-never")?.state).toBe("pending");
   });
 
   it("detects but does not repair when auto-recovery is switched off", async () => {

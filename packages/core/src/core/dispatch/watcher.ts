@@ -16,7 +16,6 @@ import * as path from "node:path";
 import { SerialQueue } from "../serial-queue.js";
 import {
   DispatchSuspendedError,
-  type SettledPromptedBlock,
   type TurnAttemptStore,
 } from "./attempt-store.js";
 import type { Logger } from "../../lib/logger.js";
@@ -75,11 +74,6 @@ export interface DispatchWatcherOpts {
    * quarantine can name its cause instead of guessing one.
    */
   onRetained?: (spec: DispatchSpec, err: DispatchSuspendedError) => Promise<void>;
-  /**
-   * A prompted suspension was cancelled because a never-started dispatch is
-   * waiting on its target. The watcher does not send the interrupted prompt.
-   */
-  onPromptedBlockSettled?: (settled: readonly SettledPromptedBlock[]) => void;
   /** Poll interval in ms. Default 1000. */
   pollMs?: number;
   /**
@@ -144,7 +138,6 @@ export function createRuntimeDispatchWatcher(
       dispatchInjectTurn(spec: DispatchSpec): Promise<{ output: string; stopReason: string }>;
       observeRetainedDispatch(spec: DispatchSpec, err?: DispatchSuspendedError): Promise<void>;
       recoverInterruptedTurns(): Promise<void>;
-      noteSettledPromptedBlocks?(settled: readonly SettledPromptedBlock[]): void;
     };
   }
 ): DispatchWatcher {
@@ -153,7 +146,6 @@ export function createRuntimeDispatchWatcher(
     ...watcherOpts,
     onDispatch: (spec) => runtime.dispatchInjectTurn(spec),
     onRetained: (spec, err) => runtime.observeRetainedDispatch(spec, err),
-    onPromptedBlockSettled: (settled) => runtime.noteSettledPromptedBlocks?.(settled),
     // #307: protects the production recovery barrier; deleting this wire lets
     // the runtime watcher admit pending work before interrupted turns requeue.
     beforeAdmission: () => runtime.recoverInterruptedTurns(),
@@ -180,7 +172,6 @@ export class DispatchWatcher {
   private readonly logger: Logger;
   private readonly onDispatch: DispatchWatcherOpts["onDispatch"];
   private readonly onRetained?: DispatchWatcherOpts["onRetained"];
-  private readonly onPromptedBlockSettled?: DispatchWatcherOpts["onPromptedBlockSettled"];
   private readonly pollMs: number;
   private readonly mayRecover: (id: string) => boolean;
   private readonly attempts: TurnAttemptStore;
@@ -251,7 +242,6 @@ export class DispatchWatcher {
     this.logger = opts.logger.child({ comp: "dispatch-watcher" });
     this.onDispatch = opts.onDispatch;
     this.onRetained = opts.onRetained;
-    this.onPromptedBlockSettled = opts.onPromptedBlockSettled;
     this.pollMs = opts.pollMs ?? 1000;
     this.mayRecover = opts.mayRecover ?? (() => true);
     this.attempts = opts.attempts;
@@ -464,36 +454,6 @@ export class DispatchWatcher {
     );
   }
 
-  private releasePromptedBlocks(): void {
-    const settled = this.attempts.settleBlockedPromptedAttempts();
-    if (settled.length === 0) return;
-    const settledIds = new Set(settled.map((row) => row.settledId));
-    const held = new Set<string>();
-    for (const owner of this.inFlight.values()) {
-      if (settledIds.has(owner.spec.id)) held.add(owner.spec.target);
-    }
-    for (const target of held) {
-      const fence = this.fenceTarget(target);
-      this.releaseTargetFence(fence);
-    }
-    for (const row of settled) {
-      this.recoveryReady.delete(row.settledId);
-      this.deferred.delete(row.settledId);
-    }
-    if (!this.onPromptedBlockSettled) {
-      this.logger.warn(
-        { settled },
-        "dispatch: settled prompted suspension so never-started work can run",
-      );
-      return;
-    }
-    try {
-      this.onPromptedBlockSettled(settled);
-    } catch (err) {
-      this.logger.warn({ err }, "dispatch: prompted-block notice failed");
-    }
-  }
-
   private async tickInner(): Promise<void> {
     let names: string[];
     try {
@@ -511,7 +471,6 @@ export class DispatchWatcher {
     // row that never reached session/prompt (#559). Boot recovery alone
     // never sees it.
     this.settleSupersededUnstarted();
-    this.releasePromptedBlocks();
     const ids = [...new Set([...names
       .filter((name) => name.endsWith(".json"))
       .map((name) => name.slice(0, -".json".length)),

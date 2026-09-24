@@ -342,6 +342,23 @@ export function createRung1Recovery(hooks: Rung1RecoveryHooks) {
       return value ? { ...value } : undefined;
     },
 
+    /** What a relaunched child needs to continue this turn after a host restart. */
+    resumable(slot: number): {
+      submissionId: string;
+      acpSessionId: string;
+      continuation: string;
+      originalRequestId: string | number;
+    } | undefined {
+      const state = armed.get(slot);
+      if (!state || state.terminal || state.originalRequestId === undefined) return undefined;
+      return {
+        submissionId: state.submissionId,
+        acpSessionId: state.acpSessionId,
+        continuation: state.continuation,
+        originalRequestId: state.originalRequestId,
+      };
+    },
+
     terminalResult(slot: number): RemoteRecoveryResult | undefined {
       const value = armed.get(slot)?.result;
       return value ? { ...value } : undefined;

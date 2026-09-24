@@ -447,7 +447,7 @@ describe("command-layer cancel vs dispose / onDead", () => {
 });
 
 describe("watcher recoverStale vs resumeEnabled", () => {
-  it("settles a prompted interruption when never-started successors are waiting (#428)", async () => {
+  it("continues a prompted interruption before never-started successors (#631)", async () => {
     const dirs = dispatchDirs(dir);
     await mkdir(dirs.running, { recursive: true });
     await mkdir(dirs.pending, { recursive: true });
@@ -491,15 +491,10 @@ describe("watcher recoverStale vs resumeEnabled", () => {
     await watcher.initialDispatchesSettled();
     watcher.stop();
 
-    // #428: p1 already started its prompt. Never-started successors are the
-    // work that may run. Reattaching p1 would hold the target ahead of them.
-    expect(seen).toEqual(["p2", "p3"]);
-    expect(store.turnAttempts.get("p1")).toMatchObject({
-      state: "cancelled",
-      promptStarted: true,
-    });
-    expect(store.turnAttempts.get("p2")?.promptStarted).toBe(false);
-    expect(store.turnAttempts.get("p3")?.promptStarted).toBe(false);
+    // p1 already started its prompt: it is continued in its recorded session
+    // first, then the successors run. Nothing is cancelled.
+    expect(seen).toEqual(["p1", "p2", "p3"]);
+    expect(store.turnAttempts.get("p1")?.state).not.toBe("cancelled");
   });
 
   it("keeps boot admission closed while a lone prompted resume is still unresolved (#303)", async () => {
@@ -769,10 +764,7 @@ describe("live-turn re-fire + flag + preconditions", () => {
     });
     await orch.recoverInterruptedTurns();
     expect(inner).toHaveBeenCalledTimes(1);
-    expect(announced.some((t) =>
-      t.includes("resuming after restart") &&
-      t.includes("The process restarted while the turn was in flight.")
-    )).toBe(true);
+    expect(announced).toContain("🔌 Reconnected to session");
   });
 
   it("with SEAM_TURN_RESUME_ENABLED=false, markers are reconciled but nothing auto-resumes", async () => {

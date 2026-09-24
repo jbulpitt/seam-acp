@@ -7,6 +7,7 @@ import {
   type SessiondListSlotsResult,
   type SessiondMethod,
   type SessiondReplayOutputParams,
+  type SessiondAckParams,
   type SessiondReplayOutputResult,
   type SessiondResponse,
   type SessiondSpawnParams,
@@ -98,6 +99,10 @@ export class SessiondClient {
 
   async replayOutput(params: SessiondReplayOutputParams): Promise<SessiondReplayOutputResult> {
     return this.request("replayOutput", params) as Promise<SessiondReplayOutputResult>;
+  }
+
+  async ack(params: SessiondAckParams): Promise<{ slot: number }> {
+    return this.request("ack", params) as Promise<{ slot: number }>;
   }
 
   close(): void {

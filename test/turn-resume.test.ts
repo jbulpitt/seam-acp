@@ -59,7 +59,7 @@ describe("markSpecAsResume / CONTINUE_PROMPT", () => {
     expect(spec.resume).toBe(true);
     expect(spec.prompt).toBe("do the overnight run");
     expect(CONTINUE_PROMPT).toBe("continue");
-    expect(RESUME_ANNOUNCE).toMatch(/resuming after restart/);
+    expect(RESUME_ANNOUNCE).toBe("🔌 Reconnected to session");
   });
 });
 
@@ -115,7 +115,7 @@ describe("isPastMaxAge / decideResume", () => {
       acpSessionId: "s",
     });
     expect(d).toEqual({ action: "abandon", reason: "past max-age" });
-    expect(abandonedNotice("past max-age", TURN_RESUME_MAX_AGE_SECONDS)).toMatch(/older than 2h/);
+    expect(abandonedNotice("past max-age", TURN_RESUME_MAX_AGE_SECONDS)).toMatch(/older than 7 days/);
   });
 
   it("resumes when in-window, reachable, and a session pointer exists", () => {

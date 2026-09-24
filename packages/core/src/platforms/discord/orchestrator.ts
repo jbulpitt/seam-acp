@@ -8,7 +8,6 @@ import { randomUUID } from "node:crypto";
 import {
   DispatchSuspendedError,
   inboundAttemptId,
-  type SettledPromptedBlock,
   type SettledUnstartedAttempt,
   type TurnAttempt,
 } from "../../core/dispatch/attempt-store.js";
@@ -1108,6 +1107,7 @@ export class Orchestrator {
    * Boot delivery reconciliation skips them so it cannot race the adopter's
    * nonce-backed first send; every other completed attempt still recovers. */
   private readonly adoptingRemoteResults = new Set<string>();
+  private readonly sharedSessionAttempts = new Set<string>();
   private readonly remoteAdoptionWaiters = new Map<string, () => void>();
   /** channelRef → the harness-stamped speaker id of the human turn CURRENTLY
    *  processing on that thread (#71/#57). Set at turn start when speaker identity
@@ -2469,12 +2469,7 @@ export class Orchestrator {
       }
       try {
         const result = await this.recoverChannel(channelRef, "auto", AUTO_RECOVERY_ACTOR);
-        if (result.settledPrompted) {
-          this.logger.warn(
-            { channelRef, reason: result.message },
-            "queue sweep: settled a prompted suspension; the interrupted prompt was not resent"
-          );
-        } else if (result.ok) {
+        if (result.ok) {
           recovered.push(channelRef);
           this.logger.warn(
             { channelRef, queued: health.queued, ageMs: health.ageMs,
@@ -3047,7 +3042,6 @@ export class Orchestrator {
     message: string;
     before: ChannelQueueHealth;
     epoch: number;
-    settledPrompted?: boolean;
   }> {
     const before = this.inspectChannelQueue(channelRef);
     const currentEpoch = this.queueEpoch(channelRef);
@@ -3075,11 +3069,6 @@ export class Orchestrator {
         message: "Refused: a legacy running admission has no frozen execution identity. Recovery cannot safely replay it." };
     }
 
-    // A prompted suspension ahead of never-started work is not reattached.
-    // Cancel it before recoverTarget, which would otherwise mark it ready
-    // and run it in front of the successor. owner_boot is not consulted.
-    const settled = this.store.turnAttempts.settleBlockedPromptedAttempts(channelRef);
-    this.noteSettledPromptedBlocks(settled);
     this.noteSettledUnstartedAttempts(
       this.store.turnAttempts.settleSupersededUnstartedAttempts(channelRef),
     );
@@ -3125,38 +3114,6 @@ export class Orchestrator {
       dispatches,
       priorState: before.state,
     };
-    // A prompted suspension is work that already ran. Fencing the channel
-    // queue does not finish it, and the pending handoffs behind it stay
-    // unclaimed. Calling that "recovered" is the false success (#428).
-    // Settling one is also not recovery: the successor has not run yet.
-    if (settled.length > 0) {
-      const pending = settled.reduce((n, row) => n + row.pendingIds.length, 0);
-      const summary = `Settled prompted suspension (${mode}); the interrupted prompt was not resent`;
-      this.store.recordConfigMutation({
-        id: `queue-recovery-${randomUUID()}`,
-        tier: "operator",
-        actorId: actor?.id ?? null,
-        actorName: actor?.name ?? null,
-        scope: `thread:${channelRef}`,
-        summary,
-        beforeJson: JSON.stringify(before),
-        afterJson: JSON.stringify({ ...detail, settled }),
-      });
-      this.logger.warn(
-        { ...detail, settled },
-        "channel queue fenced; prompted suspension settled without resending"
-      );
-      return {
-        ok: false,
-        settledPrompted: true,
-        before,
-        epoch,
-        message:
-          `Settled ${settled.map((row) => row.settledId).join(", ")} on <#${channelRef}> ` +
-          `without resending the interrupted prompt. ` +
-          `${pending} never-started dispatch${pending === 1 ? "" : "es"} remain pending.`,
-      };
-    }
     const block = this.promptedAttemptBlock(channelRef);
     const drained = block === null;
     this.store.recordConfigMutation({
@@ -4257,6 +4214,10 @@ export class Orchestrator {
           () => this.rebuildThreadFromDiscord(record));
         this.assertQueueFence(queueFence);
         Object.assign(record, this.store.get(record.id));
+      }
+      if (!priorHuman?.acpSessionId) {
+        await this.ensureOwnSession(record, channel);
+        this.assertQueueFence(queueFence);
       }
       let activeRuntime = humanResume && priorHuman?.acpSessionId
         ? await this.acquireRecordedRuntime(record, priorHuman.id, priorHuman.acpSessionId)
@@ -6165,6 +6126,7 @@ export class Orchestrator {
           cwd: opts.cwd ?? this.config.REPOS_ROOT,
         });
     try {
+      if (!opts.resumeSessionId) await this.ensureOwnSession(record, target);
       const rt = await acquire(() => opts.resumeSessionId
         // The same owner serves human and live-dispatch continuations. The
         // enclosing phase sees its exhausted outcome, never a fresh budget.
@@ -15786,14 +15748,21 @@ export class Orchestrator {
     }
     let snapshot;
     try {
-      const reply = await mux.sendCmd("listSlots", {}) as { health?: unknown[] };
-      snapshot = (reply.health ?? []).find((entry: unknown) => {
-        if (!entry || typeof entry !== "object") return false;
-        const row = entry as { slot?: unknown; recovery?: unknown };
-        return row.slot === binding.slot && isRemoteRecoverySnapshot(row.recovery)
+      // A just-restarted bridge may still be collecting a live slot's recovery
+      // record; give a live slot a few seconds before calling its owner lost.
+      for (let check = 0; ; check += 1) {
+        const reply = await mux.sendCmd("listSlots", {}) as { health?: unknown[] };
+        const rows = (reply.health ?? []) as Array<{ slot?: unknown; alive?: unknown; recovery?: unknown }>;
+        snapshot = rows.find((row) => row && row.slot === binding.slot && isRemoteRecoverySnapshot(row.recovery)
           && row.recovery.submissionId === binding.submissionId
-          && row.recovery.acpSessionId === binding.acpSessionId;
-      }) as { recovery: import("@seam/adapters").RemoteRecoverySnapshot } | undefined;
+          && row.recovery.acpSessionId === binding.acpSessionId
+        ) as { recovery: import("@seam/adapters").RemoteRecoverySnapshot } | undefined;
+        const alive = rows.some((row) => row && row.slot === binding.slot && row.alive === true);
+        // A slot relaunched after a host restart re-arms before it reloads,
+        // but give a large session's load up to a minute.
+        if (snapshot || !alive || check >= 30) break;
+        await new Promise((resolve) => setTimeout(resolve, 2_000));
+      }
     } catch (err) {
       this.deferRemoteRecoveryAdoption(attempt);
       this.logger.warn({ err, attempt: attempt.id, location: binding.location },
@@ -15801,8 +15770,7 @@ export class Orchestrator {
       return true;
     }
     if (!snapshot) {
-      this.store.turnAttempts.markStalled(attempt.id,
-        "delegated remote recovery slot/submission no longer matches the bridge snapshot; original prompt was not replayed");
+      this.continueLostRemoteTurn(attempt, "the bridge no longer holds this turn's slot");
       return true;
     }
 
@@ -15810,8 +15778,7 @@ export class Orchestrator {
     try {
       child = mux.adopt(binding.slot);
     } catch (err) {
-      this.logger.warn({ err, attempt: attempt.id, slot: binding.slot },
-        "remote recovery slot could not be rebound; attempt retained");
+      this.continueLostRemoteTurn(attempt, `the slot could not be re-bound (${err instanceof Error ? err.message : String(err)})`);
       return true;
     }
     this.remoteAdoptionWaiters.get(attempt.id)?.();
@@ -15825,6 +15792,12 @@ export class Orchestrator {
       if (!current || current.state !== "suspended"
         || current.generation !== attempt.generation
         || current.remoteRecovery?.submissionId !== binding.submissionId) return;
+      if (result.status === "failed" && result.errorKind === "connection_closed") {
+        // The agent process died mid-turn. Its session is intact on disk.
+        try { child.kill(); } catch { /* already gone */ }
+        this.continueLostRemoteTurn(current, "the agent process exited before the turn finished");
+        return;
+      }
       const failed = result.status === "failed";
       // A substitution selected before restart must still be visible when the
       // result is adopted without an AgentRuntime/event handler. Use the notice
@@ -15895,7 +15868,16 @@ export class Orchestrator {
     });
     child.on("error", (err) => {
       this.adoptingRemoteResults.delete(attempt.id);
-      this.logger.warn({ err, attempt: attempt.id }, "remote recovery replay failed; attempt retained");
+      this.continueLostRemoteTurn(attempt, `replay from the bridge failed (${err instanceof Error ? err.message : String(err)})`);
+    });
+    child.on("exit", () => {
+      // An exit with no result frame: the owner died with the turn unfinished.
+      setImmediate(() => {
+        if (this.store.turnAttempts.get(attempt.id)?.remoteRecovery) {
+          this.adoptingRemoteResults.delete(attempt.id);
+          this.continueLostRemoteTurn(attempt, "the slot exited without a result");
+        }
+      });
     });
     this.logger.info({ attempt: attempt.id, location: binding.location, slot: binding.slot,
       phase: snapshot.recovery.phase, retry: snapshot.recovery.retry },
@@ -15903,12 +15885,96 @@ export class Orchestrator {
     return true;
   }
 
+  /**
+   * The bridge can no longer produce this turn's result. The conversation is
+   * intact in its ACP session, so continue it there like any other
+   * interrupted turn (#631): the turn is never left waiting on a dead owner.
+   */
+  private continueLostRemoteTurn(attempt: TurnAttempt, cause: string): void {
+    const binding = attempt.remoteRecovery;
+    // The SQL release is the single gate: exactly one caller gets past it.
+    if (!binding || !this.store.turnAttempts.releaseLostRemoteRecovery(attempt, binding)) return;
+    this.logger.warn({ attempt: attempt.id, location: binding.location, slot: binding.slot, cause },
+      "delegated turn lost its bridge owner; continuing it in its recorded session");
+    void (async () => {
+      // Never run two processes on one session: the old slot is gone first.
+      await this.stopLingeringSlot(binding.location, binding.slot);
+      const message = await this.resumeTurnManually(attempt.id);
+      this.logger.info({ attempt: attempt.id, message }, "lost remote turn continuation requested");
+      if (/^(Cannot resume|No interrupted)/.test(message) && attempt.spec?.target) {
+        await this.postResumeNotice(attempt.spec.target,
+          `⚠️ An interrupted turn could not continue on its own: ${message}`);
+      }
+    })().catch((err) => this.logger.error({ err, attempt: attempt.id }, "lost remote turn continuation failed"));
+  }
+
+  /**
+   * #631: slots now outlive controllers, so a slot nobody owns would run and
+   * hold memory forever: a detached turn whose attempt ended elsewhere, or a
+   * slot relaunched after a restart for a turn that was since cancelled. A
+   * minute and a half after a bridge is ready (after adoption has had its
+   * chance), stop every live slot this controller neither has bound nor has a
+   * suspended delegated turn for.
+   */
+  sweepUnownedSlots(location: string): void {
+    setTimeout(() => {
+      const mux = this.bridgeHub?.muxFor(location);
+      if (!mux) return;
+      void (async () => {
+        const reply = await mux.sendCmd("listSlots", {}) as { health?: Array<{ slot?: unknown; alive?: unknown }> };
+        const owned = new Set(this.store.turnAttempts.list("suspended")
+          .filter((attempt) => attempt.remoteRecovery?.location === location)
+          .map((attempt) => attempt.remoteRecovery!.slot));
+        for (const row of reply.health ?? []) {
+          if (row.alive !== true || typeof row.slot !== "number") continue;
+          if (mux.isBound(row.slot) || owned.has(row.slot)) continue;
+          this.logger.warn({ location, slot: row.slot }, "stopping a slot no turn owns");
+          mux.sendFrame({ slot: row.slot, type: "kill" });
+        }
+      })().catch((err) => this.logger.debug({ err, location }, "unowned-slot sweep skipped"));
+    }, 90_000).unref?.();
+  }
+
+  /** Stop a slot this controller no longer owns, and wait until it is gone. */
+  private async stopLingeringSlot(location: string, slot: number): Promise<void> {
+    const mux = this.bridgeHub?.muxFor(location);
+    if (!mux) return;
+    const alive = async () => ((await mux.sendCmd("listSlots", {}) as { health?: Array<{ slot?: unknown; alive?: unknown }> })
+      .health ?? []).some((row) => row.slot === slot && row.alive === true);
+    try {
+      if (!await alive()) return;
+      mux.sendFrame({ slot, type: "kill" });
+      for (let check = 0; check < 20; check += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        if (!await alive()) return;
+      }
+      this.logger.warn({ location, slot }, "a lingering slot did not stop within 10s");
+    } catch (err) {
+      this.logger.warn({ err, location, slot }, "could not confirm a lingering slot stopped");
+    }
+  }
+
+
   private deferRemoteRecoveryAdoption(attempt: TurnAttempt): void {
     const binding = attempt.remoteRecovery;
     if (!binding || !this.bridgeHub || this.remoteAdoptionWaiters.has(attempt.id)) return;
+    // Tier 3 (#631): after 15 minutes without the bridge, say so plainly and
+    // keep waiting. The turn continues the moment the bridge is back.
+    const target = attempt.spec?.target;
+    let told = false;
+    const notice = setTimeout(() => {
+      if (!target) return;
+      told = true;
+      void this.postResumeNotice(target,
+        `🔌 Still reconnecting to \`${binding.location}\`: its bridge has been unreachable for 15 minutes. `
+          + "I'll keep trying, and this turn continues as soon as it's back.");
+    }, 15 * 60_000);
+    notice.unref?.();
     const unsubscribe = this.bridgeHub.onBridgeReady((location) => {
       if (location !== binding.location) return;
       unsubscribe();
+      clearTimeout(notice);
+      if (told && target) void this.postResumeNotice(target, "🔌 Reconnected to session");
       this.remoteAdoptionWaiters.delete(attempt.id);
       const current = this.store.turnAttempts.get(attempt.id);
       if (!current || current.state !== "suspended"
@@ -15917,7 +15983,10 @@ export class Orchestrator {
       void this.adoptRemoteRecovery(current).catch((err) =>
         this.logger.warn({ err, attempt: attempt.id }, "deferred remote recovery adoption failed"));
     });
-    this.remoteAdoptionWaiters.set(attempt.id, unsubscribe);
+    this.remoteAdoptionWaiters.set(attempt.id, () => {
+      clearTimeout(notice);
+      unsubscribe();
+    });
   }
 
   /**
@@ -15999,7 +16068,6 @@ export class Orchestrator {
       // Successors already admitted must not wait behind a reattach of work
       // that has already been prompted. Reattach stays available when nothing
       // never-started is waiting.
-      this.noteSettledPromptedBlocks(this.store.turnAttempts.settleBlockedPromptedAttempts());
       this.noteSettledUnstartedAttempts(this.store.turnAttempts.settleSupersededUnstartedAttempts());
       for (const spec of await this.dispatchWatcher.listStaleRunning()) {
         const owned = this.store.turnAttempts.get(spec.id);
@@ -16287,22 +16355,6 @@ export class Orchestrator {
       this.logger.warn(
         { target: row.target, settledId: row.settledId, laterId: row.laterId },
         "dispatch: settled an active attempt that never started a prompt",
-      );
-    }
-  }
-
-  /** Tell the thread that an interrupted prompt was not sent again. */
-  noteSettledPromptedBlocks(settled: readonly SettledPromptedBlock[]): void {
-    for (const row of settled) {
-      const n = row.pendingIds.length;
-      this.logger.warn(
-        { target: row.target, settledId: row.settledId, pendingIds: row.pendingIds },
-        "dispatch: settled prompted suspension so never-started work can run",
-      );
-      void this.postResumeNotice(
-        row.target,
-        `⏸️ Settled interrupted dispatch \`${row.settledId}\` without resending its prompt. ` +
-          `${n} never-started dispatch${n === 1 ? "" : "es"} on this thread can run.`,
       );
     }
   }
@@ -18782,6 +18834,43 @@ export class Orchestrator {
       { platform: channel.platform, id: channel.id },
       freshRecord
     );
+  }
+
+  /**
+   * #631: one ACP session must have one thread. When this thread shares its
+   * session with an older thread, it gets its own copy before the turn: a
+   * native fork where the agent supports one (exact context), otherwise the
+   * deterministic rebuild from this thread's Discord history. Both threads
+   * keep going and diverge from here. A failure leaves the turn on the shared
+   * session, as before, and says why in the log.
+   */
+  private async ensureOwnSession(record: SessionRecord, channel: ChannelRef): Promise<void> {
+    if (!record.acpSessionId) return;
+    const holders = this.store.findByAcpSessionId?.(record.acpSessionId) ?? [];
+    const owner = holders[0];
+    if (!owner || owner.id === record.id || !holders.some((row) => row.id === record.id)) return;
+    const shared = record.acpSessionId;
+    // One attempt per thread per boot: a rebuild is a billable seed turn.
+    if (this.sharedSessionAttempts.has(record.id)) return;
+    this.sharedSessionAttempts.add(record.id);
+    try {
+      const forked = await this.router.forkSharedSession(record);
+      if (!forked) {
+        await this.router.invalidate(record.id, { clearAcpSession: false });
+        const rebuilt = await this.rebuildThreadFromDiscord(record);
+        if (!rebuilt.attached) throw new Error(`rebuild did not attach: ${rebuilt.attachmentReason}`);
+      }
+      Object.assign(record, this.store.get(record.id));
+      if (record.acpSessionId === shared) throw new Error("the thread still has the shared session");
+      this.logger.info({ thread: record.channelRef, owner: owner.channelRef, shared, own: record.acpSessionId, forked: !!forked },
+        "thread shared an ACP session with another thread; gave it its own copy");
+      await this.postResumeNotice(channel.id,
+        `🔀 This thread was sharing a conversation with <#${owner.channelRef}>. It now has its own copy`
+          + `${forked ? "" : " rebuilt from this thread's history"}, so the two continue separately.`);
+    } catch (err) {
+      this.logger.warn({ err, thread: record.channelRef, owner: owner.channelRef, shared },
+        "could not give this thread its own session; the turn continues on the shared one");
+    }
   }
 
   /**

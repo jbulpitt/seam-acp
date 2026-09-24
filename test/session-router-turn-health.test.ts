@@ -39,6 +39,7 @@ vi.mock("../packages/core/src/agents/agent-runtime.js", async (importOriginal) =
       effortOverride?: string;
       async start(): Promise<void> {}
       supportsSessionLoad(): boolean { return true; }
+      hasDelegatedTurnInFlight(): boolean { return false; }
       markActivity(): void {
         this.lastActivityAtMs = Date.now();
       }

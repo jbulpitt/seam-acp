@@ -1138,6 +1138,15 @@ export class SessionStore {
    * are exactly the ones recency would otherwise starve, and they are the
    * ones a host still owns.
    */
+  /** Every thread bound to this ACP session (normally one). */
+  findByAcpSessionId(acpSessionId: string): SessionRecord[] {
+    if (!acpSessionId) return [];
+    return this.db
+      .prepare<[string], Row>("SELECT * FROM sessions WHERE acp_session_id = ? ORDER BY created_utc ASC, id ASC")
+      .all(acpSessionId)
+      .map(mapRow);
+  }
+
   listSessionsUncapped(): SessionRecord[] {
     return this.db
       .prepare<[], Row>("SELECT * FROM sessions ORDER BY updated_utc DESC, id ASC")

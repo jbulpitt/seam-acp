@@ -14,6 +14,20 @@ export interface AdapterChildBootstrap {
   localCwd: string;
   slot: number;
   config: SlotSpawnConfig;
+  /** Present when sessiond relaunches this slot after a host restart (#631). */
+  resume?: AdapterChildResume;
+}
+
+/** Everything needed to continue an interrupted turn in a fresh agent process. */
+export interface AdapterChildResume {
+  initialize: unknown;
+  load: { sessionId: string; cwd: unknown; mcpServers: unknown };
+  recovery: {
+    submissionId: string;
+    acpSessionId: string;
+    continuation: string;
+    originalRequestId: string | number;
+  };
 }
 
 export type AdapterChildInput =
@@ -36,6 +50,11 @@ export type AdapterChildInput =
       type: "disarm_recovery";
       requestId: string;
       submissionId: unknown;
+    }
+  | {
+      /** Re-publish the current recovery state; a restarted bridge asks. */
+      v: typeof ADAPTER_CHILD_PROTOCOL_VERSION;
+      type: "report_recovery";
     };
 
 export type AdapterChildOutput =

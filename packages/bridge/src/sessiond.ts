@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import path from "node:path";
-import { SessiondServer } from "./sessiond-server.js";
+import { SessiondServer, defaultSessiondResumeDir } from "./sessiond-server.js";
 import { defaultSessiondPaths } from "./sessiond-paths.js";
 
 function valueAfter(flag: string): string | undefined {
@@ -19,7 +19,11 @@ const defaults = socketArg && stateArg
 const socketPath = socketArg ?? defaults.socketPath;
 const statePath = stateArg ?? defaults.statePath;
 
-const server = new SessiondServer({ socketPath, statePath });
+const server = new SessiondServer({
+  socketPath,
+  statePath,
+  resumeDir: valueAfter("--resume-dir") ?? defaultSessiondResumeDir(),
+});
 await server.start();
 console.error(`[seam-sessiond] listening (${path.basename(socketPath)})`);
 
@@ -27,9 +31,10 @@ let stopping = false;
 async function stop(signal: NodeJS.Signals): Promise<void> {
   if (stopping) return;
   stopping = true;
-  console.error(`[seam-sessiond] ${signal}: terminating owned children and closing`);
+  // Running slots live in their holders and outlast this process (#631).
+  console.error(`[seam-sessiond] ${signal}: closing; running slots keep running`);
   try {
-    await server.close({ terminateChildren: true });
+    await server.close();
     process.exit(0);
   } catch {
     process.exit(1);

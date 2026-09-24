@@ -871,11 +871,11 @@ const Schema = z.object({
     .transform((v) => v === "true"),
   /**
    * Max age of an interrupted turn (seconds) that auto-resume will re-fire.
-   * Mirrors scheduled-prompt `catchupSeconds`. Past this window the turn is
-   * marked `abandoned` and a notice is posted rather than resumed. Manual
-   * resume from `/seam workflows` still works. Default 7200 (2h).
+   * Past this window the turn is marked `abandoned` with a notice. Manual
+   * resume from `/seam workflows` still works. Default 7 days: a host that
+   * was down overnight still resumes its work (#631).
    */
-  SEAM_TURN_RESUME_MAX_AGE_SECONDS: z.coerce.number().int().min(0).max(604800).default(7200),
+  SEAM_TURN_RESUME_MAX_AGE_SECONDS: z.coerce.number().int().min(0).max(604800).default(604800),
   /**
    * HTTPS URL of the curated GIF manifest (`{ version, gifs: [url, ...] }`)
    * used by the simple status-card thumbnail mod. Fetched at boot + ~10 min.

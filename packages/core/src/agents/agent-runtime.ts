@@ -420,6 +420,9 @@ export class AgentRuntime {
   /** True while a `session/prompt` is awaiting a response — lets the abort path
    *  tell whether a graceful cancel actually ended the turn before escalating. */
   private promptInFlight = false;
+  /** The bridge owns this in-flight turn's result (#467); set while it runs. */
+  private delegatedTurn = false;
+  private detached = false;
   /** #404: has the in-flight turn produced any session update yet? */
   private sawUpdateThisTurn = false;
   private receivingSubmission?: SubmissionEvidence;
@@ -449,6 +452,7 @@ export class AgentRuntime {
   private rejectInFlightPrompt?: (err: Error) => void;
   private promptCapabilities?: PromptCapabilities;
   private loadSessionSupported = false;
+  private sessionForkSupported = false;
   private providerIdentity?: string;
   private sessionCwd?: string;
   /** Model override applied at spawn time for non-Anthropic backends where
@@ -819,6 +823,8 @@ export class AgentRuntime {
     this.promptCapabilities =
       initResult.agentCapabilities?.promptCapabilities ?? undefined;
     this.loadSessionSupported = initResult.agentCapabilities?.loadSession === true;
+    this.sessionForkSupported = !!(initResult.agentCapabilities as { sessionCapabilities?: { fork?: unknown } } | undefined)
+      ?.sessionCapabilities?.fork;
     this.providerIdentity = JSON.stringify(initResult.agentInfo ?? null);
     this.logger.debug(
       { promptCapabilities: this.promptCapabilities },
@@ -832,6 +838,22 @@ export class AgentRuntime {
   }
 
   supportsSessionLoad(): boolean { return this.loadSessionSupported; }
+
+  supportsSessionFork(): boolean { return this.sessionForkSupported; }
+
+  /** Copy a session's conversation into a new session; returns the new id. */
+  async forkSession(opts: { sessionId: string; cwd: string }): Promise<string> {
+    const conn = this.requireConnection() as unknown as {
+      request<T>(method: string, params: unknown): Promise<T>;
+    };
+    const result = await conn.request<{ sessionId?: unknown }>("session/fork", {
+      sessionId: opts.sessionId,
+      cwd: opts.cwd,
+      mcpServers: this.profile.mcpServersAtSpawn ? [] : this.mcpServers,
+    });
+    if (typeof result?.sessionId !== "string" || !result.sessionId) throw new Error("session/fork returned no session id");
+    return result.sessionId;
+  }
 
   /** Local transport process identity only; never an environment/process dump. */
   getProcessId(): number | undefined { return this.child?.pid; }
@@ -1270,6 +1292,7 @@ export class AgentRuntime {
       }
       remoteRecoveryDelegated = true;
       remoteRecoveryBinding = binding;
+      this.delegatedTurn = true;
     }
     // Captured so the teardown fail-safe below can tell a CLEAN completion
     // (end_turn) from an abnormal one (cancel/abort/error). Stays undefined if
@@ -1321,6 +1344,8 @@ export class AgentRuntime {
           // Ask the bridge that observed the stream. Only its positive disarm
           // acknowledgement permits removal of the durable owner, and even
           // then this operation fails rather than falling back to local retry.
+          // A detached runtime left the turn running on the bridge on purpose.
+          if (this.detached) throw error;
           const release = remoteRecoveryBinding && opts?.onRemoteRecoveryReleased;
           let disarmed: unknown;
           if (release && remoteRecoveryBinding && this.bridgeHealth?.sendCmd) {
@@ -1415,6 +1440,7 @@ export class AgentRuntime {
     } finally {
       hangAbort.abort();
       this.promptInFlight = false;
+      this.delegatedTurn = false;
       this.recoveryAbort = undefined;
       this.touchActivity();
       this.rejectInFlightPrompt = undefined;
@@ -1928,6 +1954,30 @@ export class AgentRuntime {
     } catch (err) {
       this.logger.warn({ err }, "cancel failed");
     }
+  }
+
+  /** True while a prompt runs whose result the bridge will capture (#467). */
+  hasDelegatedTurnInFlight(): boolean {
+    return this.promptInFlight && this.delegatedTurn;
+  }
+
+  /**
+   * Release this controller's side and leave the agent running. Used at
+   * controller shutdown for a delegated turn: the bridge keeps the turn going
+   * and captures its result, and the next controller adopts it (#631). No
+   * cancel and no kill reach the agent.
+   */
+  async detach(): Promise<void> {
+    this.detached = true;
+    const child = this.child as { detach?: () => void } | undefined;
+    child?.detach?.();
+    this.transportConnection?.close();
+    this.transportConnection = undefined;
+    this.connection = undefined;
+    this.sessionId = undefined;
+    this.sessionInfo = undefined;
+    this.sessionConfigOptions = [];
+    this.child = undefined;
   }
 
   async dispose(): Promise<void> {

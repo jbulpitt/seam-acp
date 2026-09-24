@@ -34,13 +34,10 @@ import type { DispatchSpec } from "./types.js";
 export const CONTINUE_PROMPT = "continue";
 
 /** In-thread announcement so a resumed turn is not mistaken for a malfunction. */
-export const RESUME_ANNOUNCE = "▶️ resuming after restart";
+export const RESUME_ANNOUNCE = "🔌 Reconnected to session";
 
-/**
- * Max-age window mirroring scheduled-prompt `catchupSeconds` (default 7200).
- * Past this, the turn is abandoned with a notice rather than resumed.
- */
-export const TURN_RESUME_MAX_AGE_SECONDS = 7200;
+/** Max-age window (7 days). Past this, the turn is abandoned with a notice. */
+export const TURN_RESUME_MAX_AGE_SECONDS = 604_800;
 
 /** Delay between resume starts — avoids a boot-time rate-limit spike. */
 export const TURN_RESUME_STAGGER_MS = 1500;
@@ -311,7 +308,8 @@ export function parseLiveMarker(id: string, raw: string): LiveTurnMarker {
 export function abandonedNotice(reason: string, maxAgeSeconds: number): string {
   if (reason === "past max-age") {
     const hours = Math.round(maxAgeSeconds / 3600);
-    return `⏸️ abandoned interrupted turn (older than ${hours}h) — not resuming`;
+    const age = hours >= 48 ? `${Math.round(hours / 24)} days` : `${hours}h`;
+    return `⏸️ abandoned interrupted turn (older than ${age}) — not resuming`;
   }
   if (reason === "thread deleted") {
     return "⏸️ abandoned interrupted turn (thread deleted)";

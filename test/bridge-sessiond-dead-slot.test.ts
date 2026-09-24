@@ -47,9 +47,17 @@ const CHILD = `
       const line = buffered.slice(0, newline);
       buffered = buffered.slice(newline + 1);
       const frame = JSON.parse(line);
+      if (frame.type === "report_recovery") {
+        send({ type: "recovery", recovery: { submissionId: "sub-r", acpSessionId: "acp-r", phase: "executing" } });
+        continue;
+      }
       if (frame.type !== "input") continue;
       const text = Buffer.from(frame.dataBase64, "base64").toString();
       if (text.includes("exit-now")) process.exit(0);
+      if (text.includes("recover-now")) {
+        send({ type: "recovery", recovery: { submissionId: "sub-1", acpSessionId: "acp-1", phase: "executing" } });
+        continue;
+      }
       send({ type: "data", data: "echo:" + text });
     }
   });
@@ -98,6 +106,35 @@ async function until(check: () => Promise<boolean> | boolean, what: string) {
   }
   throw new Error(`timed out waiting for ${what}`);
 }
+
+describe("#631 a killed slot has no recovery to adopt", () => {
+  it("stops reporting the recovery once the slot is killed", async () => {
+    const { socketPath, childPath } = await sessiond();
+    const only = await bridge(socketPath, childPath);
+    only.slots.configure(9, { agentId: "fixture" });
+    await expect(only.slots.writeInput(9, "recover-now\n")).resolves.toBe(true);
+    const recoveryOf = async () => (await only.slots.listSlots()).health
+      .find((entry) => entry.slot === 9) as { recovery?: unknown } | undefined;
+    await until(async () => (await recoveryOf())?.recovery !== undefined, "the recovery snapshot");
+    await only.slots.kill(9);
+    expect((await recoveryOf())?.recovery).toBeUndefined();
+  });
+});
+
+describe("#631 a restarted bridge recovers live slots' recovery records", () => {
+  it("asks each live child for its current recovery state", async () => {
+    const { socketPath, childPath } = await sessiond();
+    const first = await bridge(socketPath, childPath);
+    first.slots.configure(11, { agentId: "fixture" });
+    await expect(first.slots.writeInput(11, "hello\n")).resolves.toBe(true);
+    first.client.close();
+
+    const second = await bridge(socketPath, childPath);
+    await second.slots.rebind();
+    const row = (await second.slots.listSlots()).health.find((entry) => entry.slot === 11) as { recovery?: unknown };
+    expect(row.recovery).toMatchObject({ submissionId: "sub-r" });
+  });
+});
 
 describe("#606 dead sessiond slots", () => {
   it("spawns a fresh child when a restarted bridge reuses a dead slot number", async () => {

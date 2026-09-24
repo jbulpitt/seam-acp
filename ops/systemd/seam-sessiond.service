@@ -11,11 +11,15 @@ Environment=HOME=/home/ubuntu
 Environment=PATH=/home/ubuntu/.nvm/versions/node/v22.22.2/bin:/home/ubuntu/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 RuntimeDirectory=seam-sessiond
 RuntimeDirectoryMode=0700
+# Keep holder sockets and slots.json across a sessiond restart (#631).
+RuntimeDirectoryPreserve=yes
 ExecStart=/home/ubuntu/.nvm/versions/node/v22.22.2/bin/node packages/bridge/dist/sessiond.js --socket /run/seam-sessiond/control.sock --state /run/seam-sessiond/slots.json
 Restart=always
 RestartSec=2s
 KillSignal=SIGTERM
-KillMode=mixed
+# Stop only sessiond itself. Each slot runs under its own holder and keeps
+# running; the next sessiond reconnects to it (#631).
+KillMode=process
 TimeoutStopSec=30s
 FinalKillSignal=SIGKILL
 SendSIGKILL=yes

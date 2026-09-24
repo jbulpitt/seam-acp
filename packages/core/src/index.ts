@@ -675,6 +675,8 @@ async function main(): Promise<void> {
     localBridgeTokenHash: localBridgeCredential.tokenHash,
   });
   orchestrator.setBridgeHub(bridgeHub);
+  // #631: slots outlive controllers; stop the ones no turn owns.
+  bridgeHub.onBridgeReady((location) => orchestrator.sweepUnownedSlots(location));
   stopCatalogBridgeRefresh = bridgeHub.onBridgeReady((location) => {
     const bridge = bridgeHub?.get(location);
     for (const [agentId, info] of bridge?.agents ?? []) {

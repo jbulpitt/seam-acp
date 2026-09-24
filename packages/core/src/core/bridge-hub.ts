@@ -434,6 +434,10 @@ export class BridgeHub {
       onSlotHealth: (health) => {
         this.slotHealth.set(bridgeId, health);
       },
+      onOutputGap: (slot, gap) => {
+        this.logger.error({ bridgeId, slot, ...gap },
+          "bridge output was lost before this controller read it; the slot's stream has a gap");
+      },
       onRemoteRecovery: (slot, recovery) => {
         const health = [...(this.slotHealth.get(bridgeId) ?? [])];
         const index = health.findIndex((entry) => entry.slot === slot);

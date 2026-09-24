@@ -12,7 +12,8 @@ Environment=HOME=<home>
 ExecStart=<home>/.local/libexec/seam-sessiond-launch.sh
 Restart=always
 RestartSec=2s
-KillMode=mixed
+# Stop only sessiond; slots keep running under their holders (#631).
+KillMode=process
 OOMPolicy=continue
 
 [Install]

@@ -265,6 +265,8 @@ function integer(value: number | undefined): number | undefined {
 export function recoveryStory(facts: RecoveryStoryFacts): RecoveryRender {
   const body = situation(facts).join("\n");
   const prompt = `${CONTINUE_PROMPT}\n\n${LEAD}\n\n${body}`;
-  const header = facts.cause === "process_restart" ? RESUME_ANNOUNCE : "Recovery:";
-  return { prompt, note: `${header}\n\n${LEAD}\n\n${body}` };
+  // After a restart the person sees one line; the details are for the model
+  // and the log (#631).
+  if (facts.cause === "process_restart") return { prompt, note: RESUME_ANNOUNCE };
+  return { prompt, note: `Recovery:\n\n${LEAD}\n\n${body}` };
 }

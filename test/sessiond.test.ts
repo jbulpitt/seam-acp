@@ -55,6 +55,10 @@ async function harness(outputLog?: { maxBytes?: number; maxAgeMs?: number; maxFr
   return { root, socketPath, statePath, server, client };
 }
 
+async function listedDead(client: SessiondClient, slot: number): Promise<boolean> {
+  return (await client.listSlots()).health.some((entry) => entry.slot === slot && !entry.alive);
+}
+
 function stdoutText(events: SessiondEvent[]): string {
   return events
     .filter((event): event is Extract<SessiondEvent, { type: "output" }> =>
@@ -182,18 +186,19 @@ describe("#573 seam-sessiond control-plane restart", () => {
     expect(replay.gap!.droppedFrames).toBeGreaterThan(0);
   });
 
-  it("reaps an exactly identified orphan on supervisor restart and never calls it attached", async () => {
+  it("keeps a running slot through a supervisor restart and reattaches it fully (#631)", async () => {
     const { socketPath, statePath, server, client } = await harness();
     const { pid } = await client.spawn({
       slot: 11,
       executable: process.execPath,
-      args: ["-e", "setInterval(() => {}, 1000)"],
+      args: ["-e", 'process.stdin.on("data", (d) => process.stdout.write("echo:" + d))'],
       cwd: process.cwd(),
       env: { PATH: process.env.PATH ?? "" },
     });
     client.close();
-    await server.close({ terminateChildren: false });
+    await server.close();
     servers.splice(servers.indexOf(server), 1);
+    expect(() => process.kill(pid, 0)).not.toThrow();
 
     const successor = new SessiondServer({ socketPath, statePath });
     servers.push(successor);
@@ -201,17 +206,104 @@ describe("#573 seam-sessiond control-plane restart", () => {
     const replacement = await SessiondClient.connect(socketPath);
     clients.push(replacement);
     const listed = await replacement.listSlots();
-    expect(listed.slots).toEqual([11]);
     expect(listed.health).toEqual([
-      expect.objectContaining({
-        slot: 11,
-        alive: false,
-        pid,
-        attached: false,
-        orphanReason: "supervisor_restarted",
-      }),
+      expect.objectContaining({ slot: 11, alive: true, pid, attached: true }),
     ]);
-    expect(() => process.kill(pid, 0)).toThrow();
+    const events: SessiondEvent[] = [];
+    await replacement.subscribe({ slot: 11, afterSeq: 0 }, (event) => events.push(event));
+    await replacement.write(11, "after restart\n");
+    await waitFor(() => stdoutText(events).includes("echo:after restart") ? true : undefined);
+  });
+
+  it("loses no output produced while sessiond is down (#631)", async () => {
+    const { socketPath, statePath, server, client } = await harness();
+    await client.spawn({
+      slot: 13,
+      executable: process.execPath,
+      args: ["-e", 'let n = 0; const t = setInterval(() => { process.stdout.write("line " + (++n) + "\\n"); if (n === 20) { clearInterval(t); process.exit(0); } }, 25)'],
+      cwd: process.cwd(),
+      env: { PATH: process.env.PATH ?? "" },
+    });
+    client.close();
+    await server.close();
+    servers.splice(servers.indexOf(server), 1);
+    await delay(800);
+
+    const successor = new SessiondServer({ socketPath, statePath });
+    servers.push(successor);
+    await successor.start();
+    const replacement = await SessiondClient.connect(socketPath);
+    clients.push(replacement);
+    const events: SessiondEvent[] = [];
+    await replacement.subscribe({ slot: 13, afterSeq: 0 }, (event) => events.push(event));
+    await waitFor(() => events.some((event) => event.type === "output" && event.frame.stream === "exit") ? true : undefined);
+    expect(events.some((event) => event.type === "output_gap")).toBe(false);
+    const text = stdoutText(events);
+    for (let n = 1; n <= 20; n += 1) expect(text).toContain(`line ${n}\n`);
+  });
+
+  it("keeps a resume record only when nobody saw the slot end (#631)", async () => {
+    const { root, socketPath, statePath, server, client } = await harness();
+    const writer = (exit: boolean) => ["-e",
+      `require("fs").writeFileSync(process.env.SEAM_SESSIOND_RESUME_FILE, "{}"); ${exit ? "setTimeout(() => process.exit(0), 200)" : "setInterval(() => {}, 1000)"}`];
+    const spawnWriter = (slot: number, exit: boolean) => client.spawn({
+      slot, executable: process.execPath, args: writer(exit), cwd: process.cwd(), env: { PATH: process.env.PATH ?? "" },
+    });
+    const record = (slot: number) => path.join(root, "resume", `${slot}.json`);
+    const exists = (file: string) => fs.access(file).then(() => true, () => false);
+
+    await spawnWriter(21, false);
+    await waitForAsync(async () => (await exists(record(21))) || undefined);
+    await client.kill({ slot: 21 });
+    await waitForAsync(async () => (await exists(record(21))) ? undefined : true);
+
+    await spawnWriter(22, true);
+    await waitForAsync(async () => (await listedDead(client, 22)) || undefined);
+    await waitForAsync(async () => (await exists(record(22))) ? undefined : true);
+
+    await spawnWriter(23, false);
+    await waitForAsync(async () => (await exists(record(23))) || undefined);
+    client.close();
+    await server.close();
+    servers.splice(servers.indexOf(server), 1);
+    expect(await exists(record(23))).toBe(true);
+    const successor = new SessiondServer({ socketPath, statePath });
+    servers.push(successor);
+    await successor.start();
+  });
+
+  it("reconnects a live holder whose link dropped, and never calls it exited (#631)", async () => {
+    const { server, client } = await harness();
+    await client.spawn({ slot: 31, executable: process.execPath, args: ["-e", "setInterval(() => {}, 1000)"],
+      cwd: process.cwd(), env: { PATH: process.env.PATH ?? "" } });
+    (server as unknown as { slots: Map<number, { link?: { destroy(): void } }> }).slots.get(31)!.link!.destroy();
+    await delay(300);
+    expect((await client.listSlots()).health).toEqual([expect.objectContaining({ slot: 31, alive: true, attached: true })]);
+  });
+
+  it("drops the resume record of a slot whose holder was killed from outside (#631)", async () => {
+    const { root, statePath, client } = await harness();
+    await client.spawn({ slot: 32, executable: process.execPath,
+      args: ["-e", 'require("fs").writeFileSync(process.env.SEAM_SESSIOND_RESUME_FILE, "{}"); setInterval(() => {}, 1000)'],
+      cwd: process.cwd(), env: { PATH: process.env.PATH ?? "" } });
+    const record = path.join(root, "resume", "32.json");
+    await waitForAsync(async () => fs.access(record).then(() => true, () => undefined));
+    const state = JSON.parse(await fs.readFile(statePath, "utf8")) as { slots: Array<{ slot: number; identity: { pgid: number } }> };
+    process.kill(-state.slots.find((row) => row.slot === 32)!.identity.pgid, "SIGKILL");
+    await waitForAsync(async () => (await listedDead(client, 32)) || undefined);
+    await waitForAsync(async () => fs.access(record).then(() => undefined, () => true));
+  });
+
+  it("forgets slots that ended more than a day ago (#631)", async () => {
+    const { server, client } = await harness();
+    await client.spawn({ slot: 33, executable: process.execPath, args: ["-e", "process.exit(0)"],
+      cwd: process.cwd(), env: { PATH: process.env.PATH ?? "" } });
+    await waitForAsync(async () => (await listedDead(client, 33)) || undefined);
+    const internals = server as unknown as { pruneExited(now: number): void };
+    internals.pruneExited(Date.now());
+    expect((await client.listSlots()).slots).toEqual([33]);
+    internals.pruneExited(Date.now() + 25 * 60 * 60_000);
+    expect((await client.listSlots()).slots).toEqual([]);
   });
 
   it("never signals a persisted pid when its start identity does not match", async () => {

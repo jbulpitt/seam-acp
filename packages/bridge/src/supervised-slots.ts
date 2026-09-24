@@ -114,18 +114,19 @@ function outputFrame(frame: SessiondOutputFrame, parsedOutput?: ReturnType<typeo
  * contract is testable; `index.ts` exits on import and cannot be.
  */
 export async function forwardInput(
-  slots: Pick<SupervisedSlots, "writeInput">,
+  slots: Pick<SupervisedSlots, "writeInput"> & Partial<Pick<SupervisedSlots, "undeliverableReason">>,
   slot: number,
   data: string,
-  onUndeliverable: (slot: number) => void,
+  onUndeliverable: (slot: number, reason: string) => void,
 ): Promise<void> {
   let delivered = false;
+  let reason: string | undefined;
   try {
     delivered = await slots.writeInput(slot, data);
-  } catch {
-    delivered = false;
+  } catch (error) {
+    reason = error instanceof Error ? error.message : String(error);
   }
-  if (!delivered) onUndeliverable(slot);
+  if (!delivered) onUndeliverable(slot, reason ?? slots.undeliverableReason?.(slot) ?? "cause not recorded");
 }
 
 export class SupervisedSlots {
@@ -138,6 +139,7 @@ export class SupervisedSlots {
     reject(error: Error): void;
     timer: NodeJS.Timeout;
   }>();
+  private readonly undeliverable = new Map<number, string>();
   private readonly adapterChildPath: string;
 
   constructor(private readonly options: SupervisedSlotsOptions) {
@@ -214,7 +216,10 @@ export class SupervisedSlots {
       // it mid-session ACP frames would hide that death (#574's "instead of
       // resurrecting the dead slot"). Report it undeliverable; the binding stays
       // so the dead child's exit frame can still be replayed to settle its turn.
-      if (this.bindings.get(slot)?.dead) return false;
+      if (this.bindings.get(slot)?.dead) {
+        this.undeliverable.set(slot, "the slot's process has already exited");
+        return false;
+      }
       await this.ensure(slot);
       try {
         await this.writeControl(slot, {
@@ -222,7 +227,8 @@ export class SupervisedSlots {
           type: "input",
           dataBase64: Buffer.from(data).toString("base64"),
         });
-      } catch {
+      } catch (error) {
+        this.undeliverable.set(slot, `sessiond refused the write (${error instanceof Error ? error.message : String(error)})`);
         // The child died between ensure() and this write. Mark it so the next
         // input respawns rather than writing into the same corpse forever, and
         // return false. The caller MUST report false as undeliverable: #599
@@ -279,6 +285,11 @@ export class SupervisedSlots {
       }
       return await response as { disarmed: boolean };
     }) as Promise<{ disarmed: boolean }>;
+  }
+
+  /** Why the last write to this slot could not be delivered. */
+  undeliverableReason(slot: number): string | undefined {
+    return this.undeliverable.get(slot);
   }
 
   /** The controller has read this slot's output through `throughSeq`. */

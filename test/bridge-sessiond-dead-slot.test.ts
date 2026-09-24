@@ -179,9 +179,10 @@ describe("#606 dead sessiond slots", () => {
 
     // Continuation input for the dead child: undeliverable, reported, and no
     // blank child is spawned to receive mid-session frames (#574).
-    const reported: number[] = [];
-    await forwardInput(only.slots, 3, "continuation\n", (slot) => reported.push(slot));
-    expect(reported).toEqual([3]);
+    const reported: Array<[number, string]> = [];
+    await forwardInput(only.slots, 3, "continuation\n", (slot, reason) => reported.push([slot, reason]));
+    // The report names why, not just that it failed.
+    expect(reported).toEqual([[3, "the slot's process has already exited"]]);
     expect((await health(only.client, 3))?.alive).toBe(false);
 
     // A new runtime configures the slot first (`rpc("spawn")`), then writes.

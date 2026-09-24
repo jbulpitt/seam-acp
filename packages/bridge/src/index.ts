@@ -634,8 +634,9 @@ async function makeSlotManager(opts: {
       // ACP-initialize timeout #606 fixed for the write-side failure. This
       // names the specific frame that never reached a slot at all.
       if (rewritten) {
-        void forwardInput(supervised, msg.slot, rewritten, (slot) => {
-          wsSend({ slot, type: "exit", code: 1, spawnError: "supervised slot unavailable" });
+        void forwardInput(supervised, msg.slot, rewritten, (slot, reason) => {
+          console.error(`[bridge] Slot ${slot}: input undeliverable: ${reason}`);
+          wsSend({ slot, type: "exit", code: 1, spawnError: `supervised slot unavailable: ${reason}` });
         });
       } else {
         console.error(

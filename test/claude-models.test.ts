@@ -20,6 +20,7 @@ describe("getClaudeContextWindow", () => {
   it("resolves exact canonical IDs to their native window", () => {
     expect(getClaudeContextWindow("claude-fable-5-1")).toBe(1_000_000);
     expect(getClaudeContextWindow("claude-opus-5")).toBe(1_000_000);
+    expect(getClaudeContextWindow("claude-opus-5-5")).toBe(1_000_000);
     expect(getClaudeContextWindow("claude-opus-4-8")).toBe(1_000_000);
     expect(getClaudeContextWindow("claude-opus-4-7")).toBe(1_000_000);
     expect(getClaudeContextWindow("claude-fable-5")).toBe(1_000_000);
@@ -37,6 +38,8 @@ describe("lookupClaudeNativeContextWindow", () => {
   it("returns only verified native windows", () => {
     expect(lookupClaudeNativeContextWindow("default")).toBe(1_000_000);
     expect(lookupClaudeNativeContextWindow("claude-opus-4.8")).toBe(1_000_000);
+    expect(lookupClaudeNativeContextWindow("claude-opus-5-5")).toBe(1_000_000);
+    expect(lookupClaudeNativeContextWindow("claude-opus-5.5")).toBe(1_000_000);
     expect(lookupClaudeNativeContextWindow("claude-haiku-4-5")).toBeUndefined();
   });
 });

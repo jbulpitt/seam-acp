@@ -72,10 +72,11 @@ beforeAll(async () => {
   bridge = spawn(process.execPath, [entrypoint], { cwd: checkout, stdio: "ignore" }); await new Promise((resolve) => setTimeout(resolve,100));
   await fs.writeFile(pidFile, String(bridge.pid)); await fs.writeFile(path.join(pm2Module,"package.json"), JSON.stringify({ type:"commonjs", main:"index.cjs" }));
   await fs.writeFile(path.join(pm2Module,"index.cjs"), `const fs=require('fs');const p=${JSON.stringify(path.join(fixture,"pm2.json"))};module.exports={connect(cb){cb(null)},describe(_n,cb){const j=JSON.parse(fs.readFileSync(p));cb(null,[{pid:j.pid,pm_id:j.pm_id,pm2_env:{name:j.name,pm_id:j.pm_id,pm_pid_path:j.pidFile,pm_cwd:j.pm_cwd,pm_exec_path:j.pm_exec_path,exec_interpreter:j.exec_interpreter,args:j.args}}])},disconnect(){}};`);
+  process.env.XDG_CONFIG_HOME = path.join(fixture, "config");
   await writePm2(); remoteScript = await renderRemoteScript(path.join(repo,"scripts/bridge-rollout-remote.sh"),path.join(repo,"scripts/bridge-rollout-remote.mjs")); await runRemote(["prepare-upload",H("f")]);
 });
 
-afterAll(async () => { if (bridge?.pid) { try { process.kill(bridge.pid,"SIGKILL"); } catch {} } await fs.rm(fixture,{recursive:true,force:true}); });
+afterAll(async () => { delete process.env.XDG_CONFIG_HOME; if (bridge?.pid) { try { process.kill(bridge.pid,"SIGKILL"); } catch {} } await fs.rm(fixture,{recursive:true,force:true}); });
 
 describe.sequential("production remote shell archive defenses (#241)", () => {
   const attacks: Array<[string, () => Buffer, RegExp]> = [
@@ -128,6 +129,29 @@ describe.sequential("production remote shell deployment identity defenses (#241)
     await fs.writeFile(pidFile,String(process.pid)); await writePm2({pid:process.pid}); await expect(runRemote(["preflight"])).rejects.toThrow(/process_cwd_mismatch/); await fs.writeFile(pidFile,String(bridge.pid)); await writePm2();
     await writePm2({pm_exec_path:path.join(checkout,"other.js")}); await expect(runRemote(["preflight"])).rejects.toThrow(/pm2_launcher_mismatch/); await writePm2();
     await writePm2({args:["connect","--server","wss://controller.invalid","--token","fixture-token","--id","fixture","--dev"]}); await expect(runRemote(["preflight"])).rejects.toThrow(/pm2_dev_mode_mismatch/); await writePm2();
+  });
+
+  it("#618 verifies a bare `connect` bridge against the host's config file instead of argv", async () => {
+    const configFile = path.join(fixture, "config", "seam", "bridge.env");
+    await writePm2({ args: ["connect"] });
+    await expect(runRemote(["preflight"])).rejects.toThrow(/bridge_config_missing/);
+    await fs.mkdir(path.dirname(configFile), { recursive: true });
+    const write = (lines: string[]) => fs.writeFile(configFile, `${lines.join("\n")}\n`, { mode: 0o600 });
+    const valid = ["SEAM_BRIDGE_SERVER=wss://controller.invalid/bridge", "SEAM_BRIDGE_ID=fixture", "SEAM_BRIDGE_TOKEN=fixture-token"];
+    await write(valid);
+    const preflight = await runRemote(["preflight"]);
+    expect(preflight.stdout).toContain("rollout_ready=yes");
+    expect(preflight.stdout).not.toContain("fixture-token");
+    await write(["SEAM_BRIDGE_SERVER=wss://controller.invalid/bridge", "SEAM_BRIDGE_ID=other-host", "SEAM_BRIDGE_TOKEN=fixture-token"]);
+    await expect(runRemote(["preflight"])).rejects.toThrow(/bridge_config_id_mismatch/);
+    await write([...valid, "SEAM_BRIDGE_DEV=1"]);
+    await expect(runRemote(["preflight"])).rejects.toThrow(/bridge_config_dev_mode_mismatch/);
+    await write([...valid, "SEAM_BRIDGE_CWD=/somewhere"]);
+    await expect(runRemote(["preflight"])).rejects.toThrow(/bridge_config_workspace_mismatch/);
+    await write(["SEAM_BRIDGE_SERVER=wss://controller.invalid/bridge", "SEAM_BRIDGE_ID=fixture"]);
+    await expect(runRemote(["preflight"])).rejects.toThrow(/bridge_config_connect_incomplete/);
+    await fs.rm(configFile);
+    await writePm2();
   });
 
   it("follows the current PM2 id resolved by app name and still refuses a missing PID file (#390)", async () => {

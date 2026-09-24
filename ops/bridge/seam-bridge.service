@@ -1,0 +1,24 @@
+# /etc/systemd/system/seam-bridge.service — replace <user> and <home>.
+# Settings live in <home>/.config/seam/bridge.env, not in this unit.
+[Unit]
+Description=Seam ACP remote bridge
+Wants=network-online.target
+After=network-online.target seam-sessiond.service
+Requires=seam-sessiond.service
+
+[Service]
+Type=simple
+User=<user>
+Group=<user>
+WorkingDirectory=<home>/.seam/seam-acp
+Environment=HOME=<home>
+ExecStart=<home>/.nvm/versions/node/v22.22.2/bin/node <home>/.local/libexec/seam-bridge-launch.mjs
+Restart=always
+RestartSec=5s
+KillSignal=SIGUSR2
+TimeoutStopSec=120s
+OOMPolicy=continue
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

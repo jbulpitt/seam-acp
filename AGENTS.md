@@ -107,14 +107,14 @@ Discord ─ controller (seam-acp.service) ─ws─ bridge (one per host) ─ ses
 
 - **controller:** Discord, orchestration, persistence. It is redeployed often.
 - **bridge:** one per host, including this one (`seam-local-bridge`). It is restarted on rollouts.
-- **sessiond:** a small, stable daemon that owns every agent process and retains its output. **It exists so that a running turn never has to die because the controller or bridge restarted, or the network dropped.** It rarely changes, on purpose.
+- **sessiond:** a small, stable daemon that owns every agent process and retains its output. **Its job is that running work never stops.** It keeps sessions alive through controller and bridge restarts and network loss. When it can't (its own redeploy, a host reboot), it resumes each interrupted session itself: respawn the agent, load the same ACP session, and send "continue". Upstream just sees output resume.
 
 ## How we build here
 
 These are the defaults. When in doubt, choose the one that keeps the user's work moving.
 
 1. **Seam's own lifecycle never ends a turn.** A turn ends only when the user cancels it or the agent exits. Redeploys (including `redeploy:now`), bridge restarts, reconnects, reconciliation, and network loss *detach* and later *re-attach*. They never kill. If you find code that kills a slot for any other reason, that code is the bug.
-2. **Recover; don't give up.** When something breaks, the next step is to reconnect, retry, respawn and reload the session, or rebuild. Keep trying for as long as the cause could plausibly clear. For a lost bridge or network that means 15 minutes, which covers a host reboot. The user sees `Reconnecting to session…`, not a failure. Stopping is for causes that can't clear, like an agent that isn't installed, and even then only that one operation stops.
+2. **Recover; don't give up. Resume at the lowest layer that can.** When something breaks, the next step is to reconnect, retry, respawn and reload the session, or rebuild. Keep trying for as long as the cause could plausibly clear. For a lost bridge or network that means 15 minutes, which covers a host reboot. The user sees `Reconnecting to session…`, not a failure. Stopping is for causes that can't clear, like an agent that isn't installed, and even then only that one operation stops.
 3. **Errors carry their real cause.** Pass the underlying error through. Never swap it for a generic one, and never swallow it into "retained" or a log line nobody reads. If the provider CLI would reject something (an unknown model id, bad input), let it; don't pre-refuse from a cache that may be stale.
 4. **Add a check only for a failure you have seen.** A new guard, retry, state, quarantine, or refusal needs an observed failure behind it; name it in the PR description. "It could happen" isn't enough. Prefer deleting a mechanism to adding one around it.
 5. **Keep comments short.** Say what the code does and why, briefly. Incident narratives and issue-number chains belong in the PR or issue, not the source; agents copy whatever style they see.

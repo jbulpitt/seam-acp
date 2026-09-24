@@ -31,6 +31,17 @@ interface SlotBinding {
   buffered: Map<number, SupervisedBridgeFrame>;
   gap?: { afterSeq: number; firstAvailableSeq: number; droppedFrames: number };
   exitSeen?: boolean;
+  /**
+   * #606: the child behind this binding has exited (or its descriptors died
+   * with a previous sessiond). The binding stays so its retained output —
+   * including the exit frame that settles the turn it was serving — can still
+   * be replayed. It must never be reused for NEW input: `ensure()` respawns.
+   *
+   * Separate from `exitSeen`, which `replay()` resets to de-duplicate exit
+   * frames per consumer cursor. That reset is right for replay and would be
+   * wrong here: a replayed death is still a death.
+   */
+  dead?: boolean;
 }
 
 export interface SupervisedSlotsOptions {
@@ -91,6 +102,31 @@ function outputFrame(frame: SessiondOutputFrame, parsedOutput?: ReturnType<typeo
  * never accept input again", surfaced as a failed turn that discarded the
  * operator's prompt. Uncertainty is not an operating mode.
  */
+/**
+ * #606: deliver controller input to a slot and REPORT when it cannot land.
+ *
+ * `writeInput` resolves false for an undeliverable write and rejects when a
+ * spawn fails. The bridge used to handle only the rejection, so a resolved
+ * false vanished: no exit frame reached the controller, which then waited out
+ * its 45s ACP-initialize timeout and blamed installation and authentication.
+ * Both outcomes now produce the same immediate, named failure. Exported so the
+ * contract is testable; `index.ts` exits on import and cannot be.
+ */
+export async function forwardInput(
+  slots: Pick<SupervisedSlots, "writeInput">,
+  slot: number,
+  data: string,
+  onUndeliverable: (slot: number) => void,
+): Promise<void> {
+  let delivered = false;
+  try {
+    delivered = await slots.writeInput(slot, data);
+  } catch {
+    delivered = false;
+  }
+  if (!delivered) onUndeliverable(slot);
+}
+
 export class SupervisedSlots {
   private readonly bindings = new Map<number, SlotBinding>();
   private readonly configs = new Map<number, SlotSpawnConfig>();
@@ -111,9 +147,16 @@ export class SupervisedSlots {
   async rebind(): Promise<SessiondListSlotsResult> {
     const listed = await this.options.client.listSlots();
     for (const health of listed.health) {
+      // #606: sessiond keeps entries for exited children, and slot numbers
+      // restart near zero on every bridge connection. Binding a dead entry as
+      // though it were live meant the first turns after a bridge-only restart
+      // collided with it, `ensure()` returned it without spawning, and the
+      // write went to a process that no longer existed. Keep it replayable;
+      // refuse it for input.
       this.bindings.set(health.slot, {
         mode: "idle",
         buffered: new Map(),
+        ...(!health.alive || !health.attached ? { dead: true } : {}),
       });
       const replay = await this.options.client.replayOutput({ slot: health.slot, afterSeq: 0 });
       for (const retained of replay.frames) {
@@ -130,6 +173,16 @@ export class SupervisedSlots {
   }
 
   configure(slot: number, config: SlotSpawnConfig): void {
+    // #606: the controller configures a slot with `rpc("spawn")` before the
+    // first ACP frame of a NEW runtime (mux.ts). If the binding under that slot
+    // number is dead, this is the declaration that a new child belongs there:
+    // drop the dead binding so the next input spawns. sessiond replaces the
+    // dead entry on spawn (`spawnSlot`), and the old recovery snapshot described
+    // the dead child's submission, not this one's.
+    if (this.bindings.get(slot)?.dead) {
+      this.bindings.delete(slot);
+      this.recoveries.delete(slot);
+    }
     this.configs.set(slot, config);
   }
 
@@ -151,6 +204,12 @@ export class SupervisedSlots {
    * is not a reason: a retained child is as writable as one spawned a moment ago. */
   async writeInput(slot: number, data: string): Promise<boolean> {
     return this.serial(slot, async () => {
+      // #606: input for a dead child WITHOUT a fresh configure is a continuation
+      // of a session whose process is gone. Spawning a blank child and feeding
+      // it mid-session ACP frames would hide that death (#574's "instead of
+      // resurrecting the dead slot"). Report it undeliverable; the binding stays
+      // so the dead child's exit frame can still be replayed to settle its turn.
+      if (this.bindings.get(slot)?.dead) return false;
       await this.ensure(slot);
       try {
         await this.writeControl(slot, {
@@ -159,8 +218,14 @@ export class SupervisedSlots {
           dataBase64: Buffer.from(data).toString("base64"),
         });
       } catch {
-        // A dead slot cannot take stdin. Report it so the caller can respawn,
-        // rather than throwing through a control plane that has no recovery here.
+        // The child died between ensure() and this write. Mark it so the next
+        // input respawns rather than writing into the same corpse forever, and
+        // return false. The caller MUST report false as undeliverable: #599
+        // introduced this return and nothing read it, so a dead slot became a
+        // silent 45-second ACP-initialize timeout instead of an immediate error
+        // (#606). See `forwardInput`.
+        const binding = this.bindings.get(slot);
+        if (binding) binding.dead = true;
         return false;
       }
       return true;
@@ -330,6 +395,9 @@ export class SupervisedSlots {
     const frame = outputFrame(event.frame, parsed);
     if (!frame) return;
     if (frame.type === "exit") {
+      // #606: without this, a child that exited normally left a binding that
+      // `ensure()` would hand back for the next input on the same slot.
+      binding.dead = true;
       if (binding.exitSeen) return;
       binding.exitSeen = true;
     }

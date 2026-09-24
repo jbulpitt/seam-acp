@@ -66,7 +66,7 @@ import {
 import { createReleaseReceiptWriter, readRunningReleaseSha, type ReleaseReceiptWriter } from "./release-receipt.js";
 import { connectSessiond } from "./sessiond-connect.js";
 import type { SessiondClient } from "./sessiond-client.js";
-import { SupervisedSlots, type SupervisedBridgeFrame } from "./supervised-slots.js";
+import { SupervisedSlots, forwardInput, type SupervisedBridgeFrame } from "./supervised-slots.js";
 import { bridgeHello } from "./hello.js";
 import { acquireProcessLease } from "./process-lease.js";
 
@@ -625,8 +625,11 @@ async function makeSlotManager(opts: {
         slotInputRewriters.set(msg.slot, rewriter);
       }
       const rewritten = rewriter.push(msg.data);
-      if (rewritten) void supervised.writeInput(msg.slot, rewritten).catch(() => {
-        wsSend({ slot: msg.slot, type: "exit", code: 1, spawnError: "supervised slot unavailable" });
+      // #606: a resolved `false` is as undeliverable as a rejection. Handling
+      // only the rejection turned every dead-slot write into a silent 45s
+      // ACP-initialize timeout on the controller.
+      if (rewritten) void forwardInput(supervised, msg.slot, rewritten, (slot) => {
+        wsSend({ slot, type: "exit", code: 1, spawnError: "supervised slot unavailable" });
       });
     } else if (msg.type === "kill") {
       console.error(`[bridge] Slot ${msg.slot}: kill received — terminating supervised agent`);

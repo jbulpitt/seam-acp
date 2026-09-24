@@ -101,6 +101,7 @@ function service(opts: {
   online?: (binding: { agentId: string; location: string }) => boolean;
   scope?: (binding: { agentId: string; location: string }) => AdapterCatalogCandidate["scope"];
   source?: (binding: { agentId: string; location: string }) => { agentId: string; location: string };
+  withheld?: (binding: { agentId: string; location: string }) => string | null;
 }) {
   return new ModelCatalogService({
     store: opts.store,
@@ -108,6 +109,7 @@ function service(opts: {
     bindings: () => opts.bindings ?? [{ agentId: "fake", location: "local" }],
     ...(opts.scope ? { scope: opts.scope } : {}),
     ...(opts.source ? { source: opts.source } : {}),
+    ...(opts.withheld ? { withheld: opts.withheld } : {}),
     fetch: opts.fetch,
     isOnline: opts.online,
     refreshCron: "0 0 1 1 *",
@@ -115,6 +117,37 @@ function service(opts: {
 }
 
 describe("ModelCatalogService", () => {
+  it("never fetches a withheld binding, whichever caller asks, and still refreshes the rest (#622)", async () => {
+    const opened = db();
+    const withheld = { agentId: "copilot", location: "local" };
+    const sameHost = { agentId: "claude", location: "local" };
+    const otherHost = { agentId: "copilot", location: "fhr-server" };
+    const fetched: string[] = [];
+    const catalog = service({
+      store: opened.store,
+      bindings: [withheld, sameHost, otherHost],
+      withheld: ({ agentId, location }) =>
+        agentId === "copilot" && location === "local" ? "is withheld by AGENT_LOCATION_DENY" : null,
+      fetch: async (binding) => {
+        fetched.push(`${binding.agentId}@${binding.location}`);
+        return candidate();
+      },
+    });
+
+    // Direct refresh is what onBridgeReady / session start / manual refresh do.
+    const direct = await catalog.refresh(withheld, "startup");
+    const all = await catalog.refreshAll("scheduled");
+
+    expect(direct).toMatchObject({
+      result: "unavailable",
+      ok: false,
+      error: "copilot@local is withheld by AGENT_LOCATION_DENY; no catalog fetch made",
+    });
+    expect(fetched.sort()).toEqual(["claude@local", "copilot@fhr-server"]);
+    expect(all.find((r) => r.binding.location === "fhr-server")?.result).toBe("published");
+    expect(catalog.lookup(withheld).snapshot).toBeNull();
+  });
+
   it("uses the main Anthropic API catalog for every ordinary Claude bridge binding", async () => {
     const opened = db();
     const local = { agentId: "claude", location: "local" };

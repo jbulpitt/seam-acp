@@ -210,6 +210,14 @@ export class ModelCatalogService {
     source?: (binding: CatalogBinding) => CatalogBinding;
     fetch: (binding: CatalogBinding) => Promise<AdapterCatalogCandidate>;
     isOnline?: (binding: CatalogBinding) => boolean;
+    /**
+     * Operator-withheld bindings (AGENT_LOCATION_DENY): returns the refusal
+     * reason, or null. Checked in `refresh()` because every caller funnels
+     * through it; filtering one caller's binding list (#623) missed
+     * `onBridgeReady`, which kept spawning `copilot --acp` on the controller
+     * host and orphaning an Xvfb per probe (#622).
+     */
+    withheld?: (binding: CatalogBinding) => string | null;
     now?: () => Date;
     refreshCron?: string;
     concurrency?: number;
@@ -424,6 +432,23 @@ export class ModelCatalogService {
     reason: CatalogRefreshReason = "manual",
     opts: CatalogRefreshOptions = {}
   ): Promise<CatalogRefreshResult> {
+    // Refuses only the withheld binding — no fetch, no store write, any
+    // existing snapshot untouched. Every other binding refreshes normally.
+    const withheld = this.options.withheld?.(binding);
+    if (withheld) {
+      const prior = this.lookup(binding).snapshot;
+      return Promise.resolve({
+        binding,
+        ok: Boolean(prior),
+        result: "unavailable",
+        previousGeneration: prior?.generation ?? null,
+        generation: prior?.generation ?? null,
+        added: 0,
+        removed: 0,
+        changed: 0,
+        error: `${bindingKey(binding)} ${withheld}; no catalog fetch made`,
+      });
+    }
     const key = bindingKey(binding);
     // An accepting refresh must not be satisfied by an in-flight non-accepting
     // one (or vice versa), so acceptance is part of the single-flight identity.

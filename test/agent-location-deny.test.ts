@@ -33,6 +33,7 @@ import {
   listHosts,
   parseAgentLocationDeny,
   setAgentLocationDeny,
+  withoutDeniedBindings,
 } from "../packages/core/src/core/location.js";
 import { agentLocationPickerChoices } from "../packages/core/src/platforms/discord/location.js";
 import { loadConfig } from "../packages/core/src/config.js";
@@ -351,5 +352,36 @@ describe("#474 wiring is not decoration — index.ts actually installs the gates
     expect(session).toContain("AGENT_LOCATION_DENY");
     expect(session).toContain("/seam config agent");
     expect(session).not.toMatch(/will run as claude/i);
+  });
+});
+
+describe("#622 the deny list covers catalog bindings from every source", () => {
+  const deny = parseAgentLocationDeny("copilot@local");
+
+  it("drops the denied pair however it was added, and nothing else", () => {
+    // The three sources the catalog merges: local profiles, durable
+    // observations, and connected bridges — where #593 made `local` a bridge.
+    const merged = [
+      { agentId: "claude", location: "local" },   // local profile list
+      { agentId: "copilot", location: "local" },  // durable observation from before the deny
+      { agentId: "copilot", location: "local" },  // the local bridge advertising it
+      { agentId: "copilot", location: "fhr-server" },
+      { agentId: "codex", location: "rhc-server" },
+    ];
+    expect(withoutDeniedBindings(merged, deny)).toEqual([
+      { agentId: "claude", location: "local" },
+      { agentId: "copilot", location: "fhr-server" },
+      { agentId: "codex", location: "rhc-server" },
+    ]);
+  });
+
+  it("is host-scoped: the same agent elsewhere keeps its catalog", () => {
+    const kept = withoutDeniedBindings([{ agentId: "copilot", location: "fhr-server" }], deny);
+    expect(kept).toEqual([{ agentId: "copilot", location: "fhr-server" }]);
+  });
+
+  it("changes nothing when nobody is denied", () => {
+    const all = [{ agentId: "copilot", location: "local" }];
+    expect(withoutDeniedBindings(all, [])).toEqual(all);
   });
 });

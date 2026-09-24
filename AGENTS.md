@@ -99,195 +99,28 @@ hand-editing runtime state.
 
 `poll_inbox` at the start of a turn (and at checkpoints). Empty is normal.
 
-## ⚠️ CRITICAL: Blast radius must equal the scope of the uncertainty
+## How a turn runs
 
-When a check cannot be satisfied, **refuse the smallest thing that is actually
-in doubt.** If you cannot verify one model, refuse one model. One adapter,
-refuse one adapter. One binding, refuse one binding. A check may narrow what is
-possible; it may never remove the capability.
+```
+Discord ─ controller (seam-acp.service) ─ws─ bridge (one per host) ─ sessiond ─ adapter-child ─ agent CLI (ACP)
+```
 
-Rank outcomes worst to best and pick the best one available:
+- **controller:** Discord, orchestration, persistence. It is redeployed often.
+- **bridge:** one per host, including this one (`seam-local-bridge`). It is restarted on rollouts.
+- **sessiond:** a small, stable daemon that owns every agent process and retains its output. **It exists so that a running turn never has to die because the controller or bridge restarted, or the network dropped.** It rarely changes, on purpose.
 
-1. Works correctly.
-2. Works with a labeled caveat.
-3. One narrow operation fails with a clear, named reason — **recoverable**.
-4. The whole capability fails — **a non-starter for real work**.
-5. Silently does the wrong thing — **worse than 4**.
+## How we build here
 
-**Never choose 4 when 3 exists. Never choose 5.**
+These are the defaults. When in doubt, choose the one that keeps the user's work moving.
 
-Being told "that model was rejected" is a pesky annoyance you route around.
-Being told the tool is unusable stops the work entirely. Those are not two
-points on one scale; they are different categories, and a safety check that
-produces the second when the first was available is a design defect, not
-caution.
+1. **Seam's own lifecycle never ends a turn.** A turn ends only when the user cancels it or the agent exits. Redeploys (including `redeploy:now`), bridge restarts, reconnects, reconciliation, and network loss *detach* and later *re-attach*. They never kill. If you find code that kills a slot for any other reason, that code is the bug.
+2. **Recover; don't give up.** When something breaks, the next step is to reconnect, retry, respawn and reload the session, or rebuild. Keep trying for as long as the cause could plausibly clear. For a lost bridge or network that means 15 minutes, which covers a host reboot. The user sees `Reconnecting to session…`, not a failure. Stopping is for causes that can't clear, like an agent that isn't installed, and even then only that one operation stops.
+3. **Errors carry their real cause.** Pass the underlying error through. Never swap it for a generic one, and never swallow it into "retained" or a log line nobody reads. If the provider CLI would reject something (an unknown model id, bad input), let it; don't pre-refuse from a cache that may be stale.
+4. **Add a check only for a failure you have seen.** A new guard, retry, state, quarantine, or refusal needs an observed failure behind it; name it in the PR description. "It could happen" isn't enough. Prefer deleting a mechanism to adding one around it.
+5. **Keep comments short.** Say what the code does and why, briefly. Incident narratives and issue-number chains belong in the PR or issue, not the source; agents copy whatever style they see.
+6. **Done means it ran on the real host.** Tests that restate the implementation are not evidence. Run the real path (a real turn, a real restart) and say what you didn't check.
 
-This is the single most common defect in this codebase, because each check is
-written by someone reasoning locally — *"I cannot prove this, so I must
-refuse"* — which is correct about the check and wrong about the scope. The
-missing question is always **"refuse what, exactly?"**
-
-Real examples, all found in production on 2026-09-11:
-
-- A catalog that could not be read made the **entire host** unable to accept
-  work, when `default` would have started fine (#326).
-- Unverifiable agy provenance **removed the agent**; on agy-only hosts that
-  meant zero agents, when refusing agy and keeping the host was available
-  (#329).
-- One adapter's verification failure **killed the whole bridge**, when refusing
-  that adapter and serving the rest was available (#330).
-- Two catalogs disagreeing made **even `default` unavailable** on a healthy
-  binding, when each using its own was available (#337).
-- A delivery predicate treated *failed* delivery as proof of delivery and would
-  have permanently deleted 2,976 artifacts — an instance of 5 (#305/#306).
-
-When you write a guard, state in the comment **what you refuse and what keeps
-working.** If you cannot name something that keeps working, you have probably
-chosen 4, and should look again for the narrower refusal.
-
-## ⚠️ CRITICAL: Ask whether a mechanism should exist, not only whether it works
-
-Review reliably asks *is this implemented correctly?* It almost never asks *why
-is this here at all?* Both questions have to be asked, and only the first one
-has an obvious answer, so the second has to be forced.
-
-The incentive is structural rather than anyone's fault: a worker who adds a
-guard and proves it discriminates has something to show. A worker who deletes
-one has nothing to demonstrate. **Thoroughness is measurable; necessity is not,
-unless someone asks.**
-
-### The four questions, in order
-
-Apply these to every new guard, gate, derived identifier, reconciliation layer,
-retention rule or quarantine — anything that can refuse, transform or persist.
-Each one is answerable with evidence, and **"I cannot answer this" is itself a
-finding**, not a pass.
-
-**1. Delete it on paper. Which test fails, and what does that failure prove
-about production?**
-If nothing fails, the mechanism is dead — delete it. If something fails but the
-failing assertion only describes the mechanism's own shape, the test is
-circular: it proves the mechanism exists, not that anything needed it.
-
-**2. Is the failure it prevents actually reachable?**
-Name the state it refuses and say how the system gets there. If an earlier
-layer already makes that state impossible — a SQL constraint, a type, a guard
-upstream — the check is decoration, and decoration costs refusals.
-
-**3. Is the mechanism reached in production?**
-Find the production call site that supplies the value which turns it on. If the
-only places that enable it are tests, the tests are proving the behaviour of a
-path nobody runs.
-
-**4. Does it report what actually happened?**
-A mechanism can be present, reached, and still report the wrong outcome. Assert
-the *content* of a refusal, not merely that one occurred — a test that checks
-"it refused" passes whether or not the refusal says anything useful.
-
-### Real examples, all from this codebase
-
-- **We verified for weeks that `--sandbox` was passed correctly. Nobody asked
-  whether it was passed at all** (#324). It is not:
-  `DEFAULT_AGY_EXECUTION_POLICY` sets `sandbox: false`, neither production
-  construction site overrides it, and `sandbox: true` existed only in two test
-  files covering an unwired helper path. The tests proved the argv shape of a
-  path nobody runs. That is question 3. The resolution is also the model
-  answer: the mechanism was not fixed, the docs were corrected to describe the
-  real posture, and `test/agy-sandbox-posture.test.ts` now fails if the
-  default changes — so the recorded answer cannot go stale (#360).
-- **`agy-stream.ts` held the language server's real error message and threw a
-  bare `protocol_error`** (#371). Every test asserted that the refusal
-  happened; none asked whether it should carry its cause. Diagnosing a live
-  outage meant patching a running production bridge to recover a string the
-  code already had in hand. That is question 4.
-- **Activation reported failure after succeeding**, and offered to roll back a
-  working host (#370). The mechanism worked; the reported outcome was wrong.
-  Also question 4.
-- **`executionIdentity` hashed the operator's credential files and provider
-  environment**, passed review, and permanently stranded any suspended turn
-  whose token happened to rotate (#302). Reviewed for correctness, never for
-  necessity: nothing about which session work belongs to changes when a
-  credential refreshes. That is question 2.
-- **The continuation guard shipped with a hardcoded vendor name and an
-  `!acpSessionId` clause that SQL already makes unreachable** (#302). Reviewed,
-  passed, deleted later. Question 2.
-- **`done/` grew to 31 MB of cleartext prompts** because nothing deleted and no
-  review asked what the retention policy was (#305/#306).
-
-### Record the answer, in the code
-
-When you add one of these, **state in the comment the failure it prevents, in
-terms of something that has happened or demonstrably can.** Not a hypothetical.
-The `!acpSessionId` clause is the worked example of the failure mode: it read
-as prudent and guarded a state the schema forbids.
-
-This is also what stops the rule becoming a licence to relitigate. **A recorded
-answer closes the question.** A reviewer who disagrees with a recorded
-justification must bring new evidence — a case the comment does not cover — not
-a fresh opinion. If there is no recorded answer, the question is open and
-asking it is in scope.
-
-### What this costs, and where it does not apply
-
-It will sometimes slow a review down, and occasionally reopen something that
-felt settled. That is the intended trade: six review rounds went into the
-wording of a mechanism in #296 without anyone asking whether the mechanism was
-needed, which is a worse use of the same time.
-
-It does **not** apply to:
-
-- a mechanism whose justification is already recorded — see above;
-- pure refactors and renames, which change no behaviour to justify;
-- bug fixes to an existing mechanism whose necessity is recorded, where the
-  question is whether the fix is right;
-- anything where the answer is "it is load-bearing and here is the incident" —
-  that is a pass, and a short one.
-
-### Review briefs must ask it
-
-Every QA or review brief includes: **what breaks if this mechanism is removed
-entirely?** A reviewer who cannot answer concretely should say so in the report
-rather than passing the change; an unanswerable necessity question is a
-finding, and reporting it is the correct outcome.
-
-Two supporting habits, both of which have already paid for themselves here:
-
-- **Prefer plain comparisons to derived values** wherever a human reads the
-  refusal. Two mismatched hex digests cost three exchanges of debugging that a
-  field name answered instantly; `executionIdentity` v2 now compares named
-  fields and says "thread switched from codex to claude" (#302).
-- **Report surviving mutations rather than dropping them.** A mutation that
-  does not fail any test is telling you the mechanism is unprotected, dead, or
-  redundant with something else — all three are question-1 answers. Several
-  deletions in #362 and #364 started as a survived mutation nobody hid.
-
-### A review that returns no verdict is not a pass
-
-This is question 4 turned on the review process itself. A review turn can come
-back empty for reasons that have nothing to do with the code: a vendor input
-filter, a crashed adapter, a zero-character turn from a lost session, a worker
-that ran out of context. **What arrives is an absence of findings, which on a
-screen is indistinguishable from a review that found nothing wrong.**
-
-So: an empty or refused review is neither PASS nor FAIL. Re-issue it, and
-record in the PR that the first attempt returned no verdict — the record is the
-point, because the failure mode is silent by construction. If a second attempt
-also returns nothing, move the review to a different agent family rather than
-retrying, and say that you did: reviewer independence is what you just spent to
-keep, and a later reader needs to know which reviewer actually looked.
-
-Four QA turns were lost to this in one day in September 2026 (#313), each
-returning no work at all. The vendor filter that caused those specific losses
-did not reproduce when it was re-tested on 2026-09-12, so do not write briefs
-around it. The way the loss was *read* is the durable hazard, and that part is
-not vendor-specific.
-
-One related habit, for a different reason: **in this repo, "break the
-production path" is not a metaphor.** Workers here hold host access and deploy
-authority. Keep review briefs as adversarial as they need to be — that framing
-is why reviews here catch vacuous tests and real bypasses — but aim the verbs
-at a named artifact rather than at the running system, for the same reason the
-blast-radius rule above exists.
+Reviewing? Read `docs/agent-guides/review-guide.md`. It covers the delete-first questions, the outcome ranking that code comments cite as "blast radius", and what to do with an empty review.
 
 ## ⚠️ CRITICAL: Applying code changes or restarting the app
 
@@ -338,7 +171,15 @@ journalctl -u seam-acp -n 100 --no-pager
 systemctl status pronoa-playwright-mcp --no-pager
 journalctl -u pronoa-playwright-mcp -n 100 --no-pager
 curl -fsS http://127.0.0.1:3000/health
+systemctl status seam-local-bridge seam-sessiond --no-pager
+sudo journalctl -u seam-local-bridge -n 100 --no-pager
 ```
+
+`journalctl` for these units needs `sudo`; an empty result without it is a
+permissions issue, not a quiet log. Restarting `seam-local-bridge` leaves
+running turns alone (sessiond holds them). Remote bridges are updated with
+`npm run bridge:rollout -- --target <host>` (dry run), then add
+`--rollout --apply` to apply; see `docs/bridge-rollout.md`.
 
 An unauthenticated `http://127.0.0.1:8766/mcp` probe returns HTTP 403 when the
 Playwright listener is healthy. Restarting that service interrupts active
@@ -354,7 +195,8 @@ inspection instead.
 - `packages/adapters/src/` — ACP process/session infrastructure and agent profiles
 - `packages/core/src/` — Discord adapter, orchestration, persistence, workflows,
   MCP, voice, status, and configuration
-- `packages/bridge/src/` — lightweight remote-host agent bridge
+- `packages/bridge/src/` — the per-host bridge, sessiond, and adapter-child
+- `ops/bridge/` — bridge/sessiond units, launcher, and per-host config (`~/.config/seam/bridge.env`)
 - `packages/*/dist/` — compiled output (do not edit directly)
 - `ops/systemd/` — production units, PM2 OOM-policy drop-in, and operations runbook
 - `data/` — SQLite database (runtime, not committed)
@@ -374,164 +216,16 @@ Use this host's `wt` CLI only (`~/.local/bin/wt`). Do **not** call `git worktree
 
 Layout: `~/Projects/.worktrees/seam-acp/<name>/`. Bind-mount `node_modules` from the main checkout (never symlink). Teardown unmounts first — a force-remove of a still-mounted `node_modules` deletes the main install. After reboot: `wt bind-all --repo /home/ubuntu/Projects/seam-acp`.
 
-Load `~/.local/share/wt-helpers/AGENTS.md` before creating or tearing down a tree. If `wt` is missing, run `~/.local/share/wt-helpers/install.sh` then `wt doctor`.
+Create with `wt create --repo <checkout> --name <name> --branch <b> --from origin/main`; tear down with `wt teardown <name> --repo <checkout>`. Load `~/.local/share/wt-helpers/AGENTS.md` before creating or tearing down a tree. If `wt` is missing, run `~/.local/share/wt-helpers/install.sh` then `wt doctor`.
 
-## Slash command tree (`/seam` + `/seamadmin`)
+## Reference guides (open when relevant)
 
-Discord caps a **single** application command at 8,000 characters — the sum of
-every name, description and choice value in the tree — and at 25 top-level
-options. Blowing either makes Discord reject registration of the **entire
-command at boot**, not just the new option. `/seam` reached 7,885/8,000, which
-is why #150 could only add `role-name` by deleting help text.
-
-The budget is **per command**, so #151 split the tree in two. Hard cutover —
-Discord has no aliases; old invocations simply disappear.
-
-### `/seam` — everyday user + agent surface (8 slots)
-
-**Top-level (5):** `cancel`, `steer`, `new`, `workflows`, `queue`
-
-**Groups (3):**
-- `config` (18): `model` `effort` `agent` `role` `mode` `repo` `tools` `card`
-  `gif` `approve` `reset` `init` `detach` `tts` `show` `edit` `set` `audit`
-  - `role` sets a thread's naming role. `rename` / `namer` are **no longer
-    here** — they live under `/seamadmin naming`.
-  - `edit` is the visual configuration surface (#157): `/seam new` with no
-    config arguments and `/seam config init` both post this card instead of
-    running a setup wizard. `/seam new` may instead take the same JSON or named
-    fields as `config set` and creates the thread already configured (#294).
-    There is no host selector on it — an agent id is `agentId@location`, so
-    the **Agent** picker binds the host too and Host is shown read-only (#156).
-    To pre-bind a host that is currently offline (it lists no agents), use
-    `/seam config agent id:<agentId>@<host>`.
-- `info` (6): `whoami` `usage` `avatar` `help` `sessions` `repos`
-- `preset` (7): `list` `create` `apply` `delete` `show` `edit` `thread`
-
-### `/seamadmin` — operator surface (12 slots)
-
-Registered with `default_member_permissions = ManageGuild` and
-`contexts = [Guild]` (via `setContexts`, not the deprecated `setDMPermission`),
-so it does not appear in the command picker for non-admins and is unavailable
-in DMs.
-
-That permission is **visibility, not authorization** — a guild admin can grant
-the command to anyone, so every runtime refusal stays exactly where it was:
-`SEAM_CONFIG_ADMIN_USER_IDS` for `upload` / `rebuild` / `compact-thread` / `naming`, plus
-`BRIDGE_ADMIN_REFUSAL` and `THREAD_VOICE_ADMIN_REFUSAL`.
-
-**Top-level (3):** `rebuild` `compact-thread` `recover`
-
-`/seamadmin rebuild` is deterministic Discord reconstruction (no summarizer; one destination seed turn that may consume up to 60% of the destination context window). `/seamadmin compact-thread` is the former model-assisted rebuild. `Premium Compact (Discord)` remains the AGY fan-out pipeline. `/seam config reset` starts a blank session with no history.
-
-**Groups (9):**
-- `catalog` (1): `refresh` — refresh one `agent@location` catalog or all
-  catalogs. Reads remain cache-only; the durable response reports generation,
-  source/provenance, diff, scope, and any retained/quarantined failure.
-- `restrictions` (3): `set` `list` `clear` — immediate, audited per-agent
-  Discord-channel allowlists. An absent rule allows existing routing unchanged.
-- `schedule` (5): `add` `list` `remove` `toggle` `edit` — **no attachments**
-  (#158). A scheduled prompt carries no files on any surface; when a job needs
-  substantial instructions, commit a runbook and make the prompt a short request
-  to follow it. A pre-#158 row that still records files is **quarantined** (never
-  armed, never fired); editing the schedule clears that record and re-arms it.
-  Stored bytes under `data/scheduled-attachments/` are never deleted by Seam.
-- `project` (3): `new` `list` `remove`
-- `upload` (3): `pull` `push` `secret`
-- `bridge` (6), `debug` (6) — pairing / host config / safe restart / debug (`voice-ping` /
-  `voice-capture` / `voice-live` are the live-help spike)
-- `voice` (7): `start` `add` `remove` `configure` `console` `status` `stop` —
-  Shared Voice Console V2
-- `naming` (2): `rename` `namer` — lifted out of `config` by #151. `rename`
-  refreshes/migrates thread names (`migrate-legacy:true` for old hand-typed
-  prefixes, `role-name:true` to rebuild from the role); `namer` edits the
-  agent/model/role symbol tables. **Do not hand-rename a thread to fix its
-  prefix** — set the identity and the name follows.
-
-**Moved by #151:** `/seam rebuild|schedule|project|upload|bridge|debug|voice`
-→ `/seamadmin …`, and `/seam config rename|namer` → `/seamadmin naming …`.
-
-**Queue:** `/seam queue prompt:…` parks the next live turn (does not abort).
-Idle + host ready runs now. A later bare message still interrupts and
-cancels the queued prompt. Shares the `#88` parked row.
-
-**Cancel options** (not new keywords):
-- `/seam cancel` — this thread, graceful
-- `/seam cancel force:true` — this thread, escalate (old `abort`)
-- `/seam cancel scope:all` — kill every active session bot-wide (old `kill`). Privileged: **not** lock-exempt, **not** participant-allowed.
-
-**Removed:** `/seam image`.
-
-## Interactive prompts (#91 / #92 / #94)
-
-Frozen Discord click-cards and HTTP ingest for microsites. **While pairing in
-this repo, a card is the check-in** — see Dogfood above. Canonical how-to:
-`docs/agent-guides/interactive-prompts.md`. Default is **live in this thread,
-one person, one pick** — after they choose, the card shows the selection and
-buttons go away. **Multi-select (#94):** set `select: { min, max }` for a
-dropdown + Confirm instead of one-click buttons — the user ticks several
-options and **one combined prompt** is emitted, then the card freezes showing
-`Selected: A, B, C`. All options must be `kind:"prompt"`; not combinable with
-`maxClicks` > 1. `maxClicks` > 1 only for multi-user. MCP `create_choice` /
-`cancel_choice` / `submit_result`, or fences `seam-choice` / `seam-result`.
-HTTP `POST /ingest` is a custom-option submit; the site gets **declared JSON**
-from `submit_result`. Microsites that need **no Discord card** use MCP
-`create_ingest` (isolated silent, retries unlimited; `preset` resolved at
-fire). Participants click; they do not author.
-
-## Live help (#98)
-
-Gemini joins a Discord **voice channel** (not TTS, not STT). Coaching agents
-mint with MCP `create_live_help` (no fence); `cancel_live_help` hangs up.
-`voiceChannelId` comes from **this thread’s rider** if it names a VC, else
-family-guild General. Students may request, start, and stop their own session
-through the course agent; do not ask a parent/admin for approval.
-Canonical: `docs/agent-guides/live-help.md`. School overlay paste:
-`docs/agent-guides/live-help-onboarding.md`. Do not use `/seamadmin debug voice-*`
-from a course thread.
-
-## Thread Voice V2
-
-One admin owns one guild-scoped Shared Voice Console in their current self-muted
-voice channel. `/seamadmin voice start` creates its first thread binding; `add`,
-`remove`, and `configure` manage up to ten aliased bindings. The canonical
-five-row card exists only in the voice channel's built-in chat. The owner/admin
-selects one input binding or explicitly arms fan-out; allowlisted speakers are
-captured automatically while present, and final
-transcripts retain the actual speaker identity and enter each thread's normal
-turn queue. Every visible bound-thread response shares one fair VC speech
-scheduler, while per-binding output may be disabled. `stop` preserves finalized
-text by default. Canonical operator notes: `docs/agent-guides/thread-voice.md`.
-
-Thread Voice and Live Help share one guild voice lease. A conflict should name
-the active product/session; it is never an authorization or parent-approval
-failure. Live Help remains student self-service through course agents.
-
-## Agent-scheduled wake events (#59)
-
-An agent can schedule its **own** one-shot future re-entry into its thread —
-"wake me in N minutes and replay this prompt." This is the working substrate for
-deferred self-follow-up; the **native `ScheduleWakeup` / `Monitor` tools do NOT
-function over ACP** (nothing is emitted post-`end_turn`), so agents must use this
-mechanism instead:
-
-- **With seam-MCP:** `schedule_wake({ delaySeconds, reason, prompt })` →
-  `{ wakeId }`, and `cancel_wake(wakeId)`.
-- **Without MCP (e.g. agy):** emit a fenced block tagged `seam-wake` whose body
-  is JSON `{ delaySeconds, reason, prompt }`. The bridge arms the wake and
-  removes the block (same path the MCP tool wraps).
-
-Semantics mirror upstream `ScheduleWakeup`: **one-shot** (fires once, then the
-row is deleted), **durable** (survives `npm run redeploy`), delivered as a
-**live** turn with the thread's context intact, and **self-renewing only if you
-re-arm during the woken turn** — nothing repeats automatically. Delay floor 60s,
-ceiling 7 days. Loop-safety backstops (min-delay, chain-depth cap, per-thread
-cap) live in `src/core/wake/types.ts`.
-
-Implementation: `wake_events` table (`session-store.ts`), the DB sweeper
-`src/core/wake/manager.ts` (D11 — poll, don't arm timers), and delivery through
-the shipped dispatch queue (`fireWake` → `enqueueDispatchSpec` → `DispatchWatcher`
-→ `dispatchInjectTurn`, ledgered as `kind: "wake"`). Pending wakes are visible
-and cancellable via `/seam workflows` (and `/seam workflows cancel-wake:<id>`).
+- Slash commands, and the 8,000-character Discord budget: `docs/agent-guides/slash-commands.md`
+- Interactive prompts and cards: `docs/agent-guides/interactive-prompts.md`
+- Live help (Gemini in a voice channel): `docs/agent-guides/live-help.md`
+- Thread Voice V2: `docs/agent-guides/thread-voice.md`
+- Wake events (implementation): `docs/agent-guides/wake-events.md`
+- The agent primer and index of all guides: `docs/agent-guides/README.md`
 
 ## Environment variables
 

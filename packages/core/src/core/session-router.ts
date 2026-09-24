@@ -913,6 +913,24 @@ export class SessionRouter {
    *  #76: MUST NOT clear turn-resume markers. User cancel and host shutdown
    *  both land here via dispose(); wiping markers would make resume a
    *  silent no-op on every graceful reboot. Command layer clears them. */
+  /**
+   * Give this thread its own copy of an ACP session another thread also uses
+   * (#631). Returns the new session id, or undefined when the agent cannot
+   * fork (the caller rebuilds from the thread's history instead).
+   */
+  async forkSharedSession(record: SessionRecord): Promise<string | undefined> {
+    const shared = record.acpSessionId;
+    const runtime = await this.getOrStartRuntime(record);
+    if (!runtime.supportsSessionFork()) return undefined;
+    const forked = await runtime.forkSession({ sessionId: shared, cwd: this.describeConfig(record).cwd.value });
+    const live = this.store.get(record.id) ?? record;
+    this.store.upsert({ ...live, acpSessionId: forked, updatedUtc: new Date().toISOString() });
+    record.acpSessionId = forked;
+    // The warm runtime is on the shared session; the next acquisition loads the fork.
+    await this.invalidate(record.id, { clearAcpSession: false });
+    return forked;
+  }
+
   async invalidate(
     sessionId: string,
     opts?: SessionInvalidationOptions

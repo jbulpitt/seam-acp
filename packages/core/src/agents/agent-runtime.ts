@@ -452,6 +452,7 @@ export class AgentRuntime {
   private rejectInFlightPrompt?: (err: Error) => void;
   private promptCapabilities?: PromptCapabilities;
   private loadSessionSupported = false;
+  private sessionForkSupported = false;
   private providerIdentity?: string;
   private sessionCwd?: string;
   /** Model override applied at spawn time for non-Anthropic backends where
@@ -822,6 +823,8 @@ export class AgentRuntime {
     this.promptCapabilities =
       initResult.agentCapabilities?.promptCapabilities ?? undefined;
     this.loadSessionSupported = initResult.agentCapabilities?.loadSession === true;
+    this.sessionForkSupported = !!(initResult.agentCapabilities as { sessionCapabilities?: { fork?: unknown } } | undefined)
+      ?.sessionCapabilities?.fork;
     this.providerIdentity = JSON.stringify(initResult.agentInfo ?? null);
     this.logger.debug(
       { promptCapabilities: this.promptCapabilities },
@@ -835,6 +838,22 @@ export class AgentRuntime {
   }
 
   supportsSessionLoad(): boolean { return this.loadSessionSupported; }
+
+  supportsSessionFork(): boolean { return this.sessionForkSupported; }
+
+  /** Copy a session's conversation into a new session; returns the new id. */
+  async forkSession(opts: { sessionId: string; cwd: string }): Promise<string> {
+    const conn = this.requireConnection() as unknown as {
+      request<T>(method: string, params: unknown): Promise<T>;
+    };
+    const result = await conn.request<{ sessionId?: unknown }>("session/fork", {
+      sessionId: opts.sessionId,
+      cwd: opts.cwd,
+      mcpServers: this.profile.mcpServersAtSpawn ? [] : this.mcpServers,
+    });
+    if (typeof result?.sessionId !== "string" || !result.sessionId) throw new Error("session/fork returned no session id");
+    return result.sessionId;
+  }
 
   /** Local transport process identity only; never an environment/process dump. */
   getProcessId(): number | undefined { return this.child?.pid; }

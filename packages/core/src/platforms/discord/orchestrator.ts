@@ -4215,6 +4215,10 @@ export class Orchestrator {
         this.assertQueueFence(queueFence);
         Object.assign(record, this.store.get(record.id));
       }
+      if (!priorHuman?.acpSessionId) {
+        await this.ensureOwnSession(record, channel);
+        this.assertQueueFence(queueFence);
+      }
       let activeRuntime = humanResume && priorHuman?.acpSessionId
         ? await this.acquireRecordedRuntime(record, priorHuman.id, priorHuman.acpSessionId)
         : priorHuman?.acpSessionId
@@ -6122,6 +6126,7 @@ export class Orchestrator {
           cwd: opts.cwd ?? this.config.REPOS_ROOT,
         });
     try {
+      if (!opts.resumeSessionId) await this.ensureOwnSession(record, target);
       const rt = await acquire(() => opts.resumeSessionId
         // The same owner serves human and live-dispatch continuations. The
         // enclosing phase sees its exhausted outcome, never a fresh budget.
@@ -18768,6 +18773,38 @@ export class Orchestrator {
       { platform: channel.platform, id: channel.id },
       freshRecord
     );
+  }
+
+  /**
+   * #631: one ACP session must have one thread. When this thread shares its
+   * session with an older thread, it gets its own copy before the turn: a
+   * native fork where the agent supports one (exact context), otherwise the
+   * deterministic rebuild from this thread's Discord history. Both threads
+   * keep going and diverge from here. A failure leaves the turn on the shared
+   * session, as before, and says why in the log.
+   */
+  private async ensureOwnSession(record: SessionRecord, channel: ChannelRef): Promise<void> {
+    if (!record.acpSessionId) return;
+    const holders = this.store.findByAcpSessionId?.(record.acpSessionId) ?? [];
+    const owner = holders[0];
+    if (!owner || owner.id === record.id || !holders.some((row) => row.id === record.id)) return;
+    const shared = record.acpSessionId;
+    try {
+      const forked = await this.router.forkSharedSession(record);
+      if (!forked) {
+        await this.router.invalidate(record.id, { clearAcpSession: false });
+        await this.rebuildThreadFromDiscord(record);
+      }
+      Object.assign(record, this.store.get(record.id));
+      this.logger.info({ thread: record.channelRef, owner: owner.channelRef, shared, own: record.acpSessionId, forked: !!forked },
+        "thread shared an ACP session with another thread; gave it its own copy");
+      await this.postResumeNotice(channel.id,
+        `🔀 This thread was sharing a conversation with <#${owner.channelRef}>. It now has its own copy`
+          + `${forked ? "" : " rebuilt from this thread's history"}, so the two continue separately.`);
+    } catch (err) {
+      this.logger.warn({ err, thread: record.channelRef, owner: owner.channelRef, shared },
+        "could not give this thread its own session; the turn continues on the shared one");
+    }
   }
 
   /**

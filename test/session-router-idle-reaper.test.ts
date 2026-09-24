@@ -9,6 +9,7 @@ import { localBridgeWiring } from "./local-bridge-fixture.js";
 
 const runtimeState = vi.hoisted(() => ({
   failLoad: false,
+  canFork: true,
   instances: [] as Array<{
     busy: boolean;
     lastActivityAtMs: number;
@@ -44,6 +45,8 @@ vi.mock("../packages/core/src/agents/agent-runtime.js", async (importOriginal) =
       delegated = false;
       detached = false;
       hasDelegatedTurnInFlight(): boolean { return this.delegated; }
+      supportsSessionFork(): boolean { return runtimeState.canFork; }
+      async forkSession(opts: { sessionId: string }): Promise<string> { return `fork-of-${opts.sessionId}`; }
       async detach(): Promise<void> { this.detached = true; }
       markActivity(): void {
         this.lastActivityAtMs = Date.now();
@@ -120,6 +123,37 @@ function makeRouter(record: SessionRecord): SessionRouter {
 beforeEach(() => {
   runtimeState.instances.length = 0;
   runtimeState.failLoad = false;
+  runtimeState.canFork = true;
+});
+
+describe("SessionRouter shared session fork (#631)", () => {
+  it("gives the thread its own forked session and loads it on the next acquisition", async () => {
+    const record = makeRecord();
+    const store = makeStore(record);
+    const router = new SessionRouter({
+      logger: silent, store, profiles: [profile], modelCatalog: fixtureModelCatalog([profile]),
+      defaultAgentId: "copilot", defaultModel: "gpt-test", runtimeIdleTtlMs: 1_000, seamMcp: localBridgeWiring(profile),
+    });
+    await expect(router.forkSharedSession(record)).resolves.toBe("fork-of-acp-durable-1");
+    expect(store.get(record.id)?.acpSessionId).toBe("fork-of-acp-durable-1");
+    expect(runtimeState.instances[0]!.disposed).toBe(true);
+    await router.getOrStartRuntime(store.get(record.id)!);
+    expect(runtimeState.instances[1]!.loadCalls).toEqual([expect.objectContaining({ sessionId: "fork-of-acp-durable-1" })]);
+    await router.disposeAll();
+  });
+
+  it("reports that it cannot fork, and changes nothing, when the agent has no fork", async () => {
+    runtimeState.canFork = false;
+    const record = makeRecord();
+    const store = makeStore(record);
+    const router = new SessionRouter({
+      logger: silent, store, profiles: [profile], modelCatalog: fixtureModelCatalog([profile]),
+      defaultAgentId: "copilot", defaultModel: "gpt-test", runtimeIdleTtlMs: 1_000, seamMcp: localBridgeWiring(profile),
+    });
+    await expect(router.forkSharedSession(record)).resolves.toBeUndefined();
+    expect(store.get(record.id)?.acpSessionId).toBe("acp-durable-1");
+    await router.disposeAll();
+  });
 });
 
 describe("SessionRouter shutdown (#631)", () => {

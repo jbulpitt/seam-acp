@@ -342,7 +342,7 @@ export class SessionRouter {
 
   private readonly runtimes = new Map<string, AgentRuntime>();
   private readonly creationLocks = new Map<string, Promise<AgentRuntime>>();
-  private readonly lastStartFailure = new Map<string, number>();
+  private readonly lastStartFailure = new Map<string, { at: number; cause: string }>();
   private readonly startFailureCooldownMs = 30_000;
   /** A retiring runtime stays here until its process tree is fully gone. New
    * turns wait on this barrier before respawning the same durable session. */
@@ -879,12 +879,12 @@ export class SessionRouter {
     if (inflight) return verify(await inflight);
 
     const lastFail = this.lastStartFailure.get(record.id);
-    if (lastFail && Date.now() - lastFail < this.startFailureCooldownMs) {
+    if (lastFail && Date.now() - lastFail.at < this.startFailureCooldownMs) {
       const wait = Math.ceil(
-        (this.startFailureCooldownMs - (Date.now() - lastFail)) / 1000
+        (this.startFailureCooldownMs - (Date.now() - lastFail.at)) / 1000
       );
       throw new Error(
-        `Agent recently failed to start; waiting ${wait}s before retry.`
+        `Agent recently failed to start (${lastFail.cause}); waiting ${wait}s before retry.`
       );
     }
 
@@ -897,7 +897,11 @@ export class SessionRouter {
       },
       (err) => {
         this.creationLocks.delete(record.id);
-        this.lastStartFailure.set(record.id, Date.now());
+        const message = err instanceof Error ? err.message : String(err);
+        this.lastStartFailure.set(record.id, {
+          at: Date.now(),
+          cause: (message.split("\n", 1)[0] ?? "").slice(0, 300),
+        });
         throw err;
       }
     );

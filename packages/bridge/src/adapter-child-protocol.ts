@@ -60,6 +60,12 @@ export type AdapterChildOutput =
       spawnError: string;
     }
   | {
+      /** The slot is stopping after it started; `reason` reaches the controller. */
+      v: typeof ADAPTER_CHILD_PROTOCOL_VERSION;
+      type: "refusal";
+      reason: string;
+    }
+  | {
       v: typeof ADAPTER_CHILD_PROTOCOL_VERSION;
       type: "control_result";
       requestId: string;
@@ -84,6 +90,9 @@ export function parseAdapterChildOutput(line: string): AdapterChildOutput | unde
       return value as AdapterChildOutput;
     }
     if (value.type === "spawn_refusal" && typeof value.spawnError === "string") {
+      return value as AdapterChildOutput;
+    }
+    if (value.type === "refusal" && typeof value.reason === "string") {
       return value as AdapterChildOutput;
     }
     if (value.type === "control_result" && typeof value.requestId === "string" && typeof value.ok === "boolean") {

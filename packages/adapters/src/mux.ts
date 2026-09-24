@@ -222,6 +222,10 @@ export interface RemoteExitEvidence {
   bridgeId: string;
   /** Present only after the child-owning host positively matched a kernel OOM record. */
   hostOom?: RemoteHostOomEvidence;
+  /** The bridge's stated reason the slot stopped (a refusal, a spawn failure). */
+  reason?: string;
+  /** The last stderr the child-owning host captured before an abnormal exit. */
+  stderrTail?: string;
 }
 
 export type MuxChild = ChildProcessByStdio<NodeWritable, NodeReadable, NodeReadable> & {
@@ -235,6 +239,8 @@ type FakeProcess = EventEmitter & {
   stdout: NodeReadable;
   stderr: NodeReadable;
   readonly killed: boolean;
+  exitCode: number | null;
+  signalCode: NodeJS.Signals | null;
   remoteExit?: RemoteExitEvidence;
   kill(): void;
 };
@@ -324,9 +330,15 @@ export function makeMux(opts: {
   function applyRemoteExit(
     slot: number,
     entry: SlotEntry,
-    frame: { code?: number; signal?: unknown; hostOom?: unknown },
+    frame: { code?: number; signal?: unknown; hostOom?: unknown; spawnError?: unknown; stderrTail?: unknown },
   ): void {
     const hostOom = remoteHostOom(frame.hostOom);
+    const reason = typeof frame.spawnError === "string" && frame.spawnError.trim()
+      ? frame.spawnError.trim().slice(0, 2_000)
+      : undefined;
+    const stderrTail = typeof frame.stderrTail === "string" && frame.stderrTail.trim()
+      ? frame.stderrTail.slice(-4_000)
+      : undefined;
     // This marker is set only for an exit frame observed by the child-owning
     // bridge. Transport eviction remains a different failure. It lets the
     // runtime say "the remote supervisor exited" when code=1/signal=null,
@@ -335,11 +347,15 @@ export function makeMux(opts: {
     entry.fake.remoteExit = {
       bridgeId: opts.id,
       ...(hostOom ? { hostOom } : {}),
+      ...(reason ? { reason } : {}),
+      ...(stderrTail ? { stderrTail } : {}),
     };
     entry.killed = true;
     slots.delete(slot);
     entry.stdout.push(null);
-    entry.fake.emit("exit", frame.code ?? 1, exitSignal(frame.signal));
+    entry.fake.exitCode = frame.code ?? 1;
+    entry.fake.signalCode = exitSignal(frame.signal);
+    entry.fake.emit("exit", entry.fake.exitCode, entry.fake.signalCode);
   }
 
   function send(msg: MuxMsg) {
@@ -752,9 +768,9 @@ export function makeMux(opts: {
       stdin: stdinPT as NodeWritable,
       stdout: stdoutPT as NodeReadable,
       stderr: stderrPT as NodeReadable,
-      get killed() {
-        return killed;
-      },
+      // ChildProcess contract: null while running; applyRemoteExit sets them.
+      exitCode: null as number | null,
+      signalCode: null as NodeJS.Signals | null,
       kill() {
         if (killed) return;
         killed = true;
@@ -766,6 +782,9 @@ export function makeMux(opts: {
         stdoutPT.push(null);
       },
     }) as FakeProcess & { slot: number };
+    // A getter inside Object.assign is copied as its value at this moment,
+    // which froze `killed` at false (same defect as #609).
+    Object.defineProperty(fake, "killed", { enumerable: true, get: () => killed });
 
     slots.set(slot, {
       stdout: stdoutPT,

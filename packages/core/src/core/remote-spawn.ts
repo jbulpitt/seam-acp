@@ -42,6 +42,14 @@ export const DEFAULT_REMOTE_RUNG1_POLICY: RemoteRung1Policy = Object.freeze<Remo
     "timeout",
     "unclassified",
   ],
+  // #626: Claude Code raises auth_contention only when its OAuth refresh lock
+  // went unchanged for ~7.5s (holder dead or stalled) while the token is
+  // expired, and proper-lockfile will not take over that lock until it is 60s
+  // stale. 2s/5s/10s all land inside that window: on 2026-09-24 a wake failed
+  // four times in 46s and was dropped. One retry at 60s lands past it. The
+  // delay stays within the v1 validator's 60s cap, and old bridges ignore
+  // this field and keep `backoffMs`.
+  backoffMsByKind: { auth_contention: [60_000] },
 });
 
 export type MuxSpawnedProcess = ChildProcessByStdio<Writable, Readable, Readable> & {

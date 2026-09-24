@@ -1054,23 +1054,42 @@ function makeFakeAgyProcess(
     return agent;
   }, stream);
 
+  // #610: this object is cast to FakeProc (ChildProcessByStdio) below, so
+  // adapter-child.ts's generic `writeAgent` guard applies Node's own
+  // ChildProcess contract to it: a running process has `exitCode === null`
+  // and `signalCode === null`; only exit sets them to a real value. Leaving
+  // both properties absent left them `undefined`, and `undefined !== null`
+  // made `writeAgent` treat every agy session as already-exited from the
+  // moment it spawned — every ACP input after the bootstrap (which bypasses
+  // this object entirely, written straight to the wrapper's own real stdin
+  // by sessiond) was silently refused, forever. No agy turn could ever
+  // reach `initialize`; every session timed out at 45s with no diagnostic
+  // anywhere, indistinguishable from an installation or auth failure.
+  let exitCode: number | null = null;
+  // `Object.assign` copies an accessor property by invoking its getter ONCE
+  // and storing the result as a plain value on the target (MDN: "Properties
+  // in the target object are overwritten... source object['s] getters are
+  // invoked"). A `get killed()`/`get exitCode()` inside the object literal
+  // below would therefore freeze at their value at construction time — this
+  // silently shipped for `killed` already; `exitCode` would have repeated it.
+  // `Object.defineProperties` keeps them live for the object's whole life.
   const fake = Object.assign(emitter, {
     stdin: fakeStdin as unknown as Writable,
     stdout: fakeStdout as unknown as Readable,
     stderr: fakeStderr as unknown as Readable,
-    get killed() {
-      return killed;
-    },
+    signalCode: null,
     kill(): boolean {
       if (killed) return false;
       killed = true;
       // Do not report virtual process exit while a native child is still owned.
       void agent.shutdown().then(() => {
+        exitCode = 0;
         fakeStdin.destroy();
         fakeStdout.push(null);
         fakeStderr.push(null);
         emitter.emit("exit", 0, null);
       }, () => {
+        exitCode = 1;
         fakeStdin.destroy();
         fakeStdout.push(null);
         fakeStderr.push(null);
@@ -1079,6 +1098,10 @@ function makeFakeAgyProcess(
       return true;
     },
     pid: undefined,
+  });
+  Object.defineProperties(fake, {
+    killed: { enumerable: true, get: () => killed },
+    exitCode: { enumerable: true, get: () => exitCode },
   });
 
   return fake as unknown as FakeProc;

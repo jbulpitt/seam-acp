@@ -625,12 +625,22 @@ async function makeSlotManager(opts: {
         slotInputRewriters.set(msg.slot, rewriter);
       }
       const rewritten = rewriter.push(msg.data);
-      // #606: a resolved `false` is as undeliverable as a rejection. Handling
-      // only the rejection turned every dead-slot write into a silent 45s
-      // ACP-initialize timeout on the controller.
-      if (rewritten) void forwardInput(supervised, msg.slot, rewritten, (slot) => {
-        wsSend({ slot, type: "exit", code: 1, spawnError: "supervised slot unavailable" });
-      });
+      // #609: `push` only withholds bytes that have no terminating newline
+      // yet — normal for a fragmented write, permanent for one that never
+      // arrives complete. Silence here was indistinguishable from a healthy
+      // slot: the controller's only symptom was the same blind 45s
+      // ACP-initialize timeout #606 fixed for the write-side failure. This
+      // names the specific frame that never reached a slot at all.
+      if (rewritten) {
+        void forwardInput(supervised, msg.slot, rewritten, (slot) => {
+          wsSend({ slot, type: "exit", code: 1, spawnError: "supervised slot unavailable" });
+        });
+      } else {
+        console.error(
+          `[bridge] Slot ${msg.slot}: received ${msg.data.length} bytes with no terminating newline; ` +
+            "buffered, not delivered"
+        );
+      }
     } else if (msg.type === "kill") {
       console.error(`[bridge] Slot ${msg.slot}: kill received — terminating supervised agent`);
       void supervised.kill(msg.slot).catch(() => undefined);

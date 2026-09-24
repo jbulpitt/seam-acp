@@ -4,6 +4,7 @@ import { promises as fs, openSync, closeSync, readFileSync } from "node:fs";
 import net, { type Socket } from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { createNdjsonReader } from "./ndjson-reader.js";
 import { createOutputLog, type OutputLog, type OutputLogOptions } from "./output-log.js";
 import {
   SESSIOND_PROTOCOL_VERSION,
@@ -29,8 +30,10 @@ import {
   type SlotHolderOutput,
 } from "./slot-holder-protocol.js";
 
-const MAX_WIRE_BYTES = 12 * 1024 * 1024;
-const MAX_WRITE_BYTES = 8 * 1024 * 1024;
+// A prompt may carry 8 attachments of 5 MB, and it is base64-encoded twice
+// on the way here (adapter envelope, then this request): up to ~95 MB.
+const MAX_WIRE_BYTES = 256 * 1024 * 1024;
+const MAX_WRITE_BYTES = 128 * 1024 * 1024;
 const ORPHAN_TERM_GRACE_MS = 500;
 const ORPHAN_KILL_GRACE_MS = 500;
 const EXITED_SLOT_RETENTION_MS = 24 * 60 * 60_000;
@@ -86,7 +89,7 @@ interface SlotEntry {
 interface ConnectionState {
   socket: Socket;
   subscriptions: Set<number>;
-  input: Buffer;
+  reader: ReturnType<typeof createNdjsonReader>;
 }
 
 export interface SessiondServerOptions {
@@ -423,7 +426,8 @@ export class SessiondServer {
   }
 
   private accept(socket: Socket): void {
-    const connection: ConnectionState = { socket, subscriptions: new Set(), input: Buffer.alloc(0) };
+    const connection = { socket, subscriptions: new Set<number>() } as ConnectionState;
+    connection.reader = createNdjsonReader((line) => void this.handleLine(connection, line.toString("utf8")), MAX_WIRE_BYTES);
     this.connections.add(connection);
     socket.on("data", (chunk: Buffer) => this.receive(connection, chunk));
     socket.on("error", () => undefined);
@@ -435,23 +439,12 @@ export class SessiondServer {
   }
 
   private receive(connection: ConnectionState, chunk: Buffer): void {
-    connection.input = Buffer.concat([connection.input, chunk]);
-    if (connection.input.length > MAX_WIRE_BYTES && connection.input.indexOf(0x0a) === -1) {
+    if (!connection.reader.push(chunk)) {
+      console.error(`[seam-sessiond] closed a client connection: a request exceeded ${MAX_WIRE_BYTES} bytes`);
       connection.socket.destroy();
-      return;
-    }
-    let newline = connection.input.indexOf(0x0a);
-    while (newline !== -1) {
-      const line = connection.input.subarray(0, newline);
-      connection.input = connection.input.subarray(newline + 1);
-      if (line.length > MAX_WIRE_BYTES) {
-        connection.socket.destroy();
-        return;
-      }
-      if (line.length) void this.handleLine(connection, line.toString("utf8"));
-      newline = connection.input.indexOf(0x0a);
     }
   }
+
 
   private async handleLine(connection: ConnectionState, line: string): Promise<void> {
     let request: SessiondRequest;
@@ -543,7 +536,7 @@ export class SessiondServer {
         throw new SessiondError("invalid_request", "spawn initialStdinBase64 is invalid");
       }
       if (initial.length > MAX_WRITE_BYTES) {
-        throw new SessiondError("invalid_request", "spawn initial stdin exceeds the 8 MiB limit");
+        throw new SessiondError("invalid_request", "spawn initial stdin exceeds the 128 MiB limit");
       }
     }
 
@@ -656,18 +649,12 @@ export class SessiondServer {
   private bindHolderSocket(entry: SlotEntry, socket: Socket): void {
     entry.link?.destroy();
     entry.link = socket;
-    let input = "";
-    socket.on("data", (chunk: Buffer) => {
-      input += chunk.toString();
-      let newline: number;
-      while ((newline = input.indexOf("\n")) !== -1) {
-        const line = input.slice(0, newline);
-        input = input.slice(newline + 1);
+    const reader = createNdjsonReader((line) => {
         let message: SlotHolderOutput;
         try {
-          message = JSON.parse(line) as SlotHolderOutput;
+          message = JSON.parse(line.toString("utf8")) as SlotHolderOutput;
         } catch {
-          continue;
+          return;
         }
         if (message.type === "frame") this.onHolderFrame(entry, message.frame);
         else {
@@ -678,7 +665,9 @@ export class SessiondServer {
             reply(message);
           }
         }
-      }
+    }, MAX_WIRE_BYTES);
+    socket.on("data", (chunk: Buffer) => {
+      if (!reader.push(chunk)) socket.destroy();
     });
     socket.on("error", () => undefined);
     socket.on("drain", () => this.backpressured.delete(entry.slot));
@@ -800,15 +789,14 @@ export class SessiondServer {
     }
     let data: Buffer;
     try {
-      if (params.dataBase64.length % 4 !== 0 || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(params.dataBase64)) {
-        throw new Error("invalid base64");
-      }
+      // A canonical round trip is the whole check. The previous regex overflowed
+      // V8's stack past ~6 MB and rejected valid photo prompts as invalid.
       data = Buffer.from(params.dataBase64, "base64");
-      if (data.toString("base64") !== params.dataBase64) throw new Error("invalid base64");
+      if (params.dataBase64.length % 4 !== 0 || data.toString("base64") !== params.dataBase64) throw new Error("invalid base64");
     } catch {
       throw new SessiondError("invalid_request", "write dataBase64 is invalid");
     }
-    if (data.length > MAX_WRITE_BYTES) throw new SessiondError("invalid_request", "write exceeds the 8 MiB limit");
+    if (data.length > MAX_WRITE_BYTES) throw new SessiondError("invalid_request", "write exceeds the 128 MiB limit");
     const ok = await this.holderWrite(entry, data).catch(() => false);
     if (!ok) throw new SessiondError("write_failed", "write failed before bytes were accepted");
     entry.lastStdinAt = Date.now();

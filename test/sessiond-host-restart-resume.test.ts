@@ -64,6 +64,26 @@ async function host(root: string) {
   return { server, client, slots, frames };
 }
 
+describe("large prompts reach the agent", () => {
+  it("delivers a 20 MB prompt (several full-size photos) through sessiond, the holder and adapter-child", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "seam-big-"));
+    roots.push(root);
+    await fs.chmod(root, 0o700);
+    const one = await host(root);
+    one.slots.configure(6, { agentId: "copilot", cwd: root });
+    await one.slots.writeInput(6, line({ id: 1, method: "initialize", params: { protocolVersion: 1 } }));
+    await one.slots.writeInput(6, line({ id: 2, method: "session/new", params: { cwd: root, mcpServers: [] } }));
+    await until(() => one.frames.find((f) => f.data?.includes("\"sessionId\":\"s1\"")), "session/new");
+    const image = { type: "image", mimeType: "image/jpeg", data: Buffer.alloc(15 * 1024 * 1024, 5).toString("base64") };
+    const prompt = line({ id: 3, method: "session/prompt", params: { sessionId: "s1", prompt: [image, { type: "text", text: "long job" }] } });
+    expect(prompt.length).toBeGreaterThan(20 * 1024 * 1024);
+    const delivered = await one.slots.writeInput(6, prompt);
+    expect(one.slots.undeliverableReason(6)).toBeUndefined();
+    expect(delivered).toBe(true);
+    await until(() => one.frames.find((f) => f.data?.includes("working on it")), "the agent to answer the large prompt", 60_000);
+  }, 90_000);
+});
+
 describe("#631 host restart mid-turn", () => {
   it("relaunches the slot, reloads the session and finishes the turn under its original id", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "seam-631r-"));

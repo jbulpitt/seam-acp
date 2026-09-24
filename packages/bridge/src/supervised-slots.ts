@@ -228,7 +228,7 @@ export class SupervisedSlots {
           dataBase64: Buffer.from(data).toString("base64"),
         });
       } catch (error) {
-        this.undeliverable.set(slot, `sessiond refused the write (${error instanceof Error ? error.message : String(error)})`);
+        this.undeliverable.set(slot, `sessiond refused a ${data.length}-byte write (${error instanceof Error ? error.message : String(error)})`);
         // The child died between ensure() and this write. Mark it so the next
         // input respawns rather than writing into the same corpse forever, and
         // return false. The caller MUST report false as undeliverable: #599

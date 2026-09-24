@@ -14,6 +14,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import fs from "node:fs";
 import net from "node:net";
 import { createLineFramer } from "./output-log.js";
+import { createNdjsonReader } from "./ndjson-reader.js";
 import {
   SLOT_HOLDER_PROTOCOL_VERSION,
   type SlotHolderFrame,
@@ -140,26 +141,22 @@ function handle(socket: net.Socket, message: SlotHolderInput): void {
 
 try { fs.unlinkSync(socketPath); } catch { /* none */ }
 const server = net.createServer((socket) => {
-  let input = "";
-  socket.on("data", (chunk: Buffer) => {
-    input += chunk.toString();
-    let newline: number;
-    while ((newline = input.indexOf("\n")) !== -1) {
-      const line = input.slice(0, newline);
-      input = input.slice(newline + 1);
-      let message: SlotHolderInput;
-      try {
-        message = JSON.parse(line) as SlotHolderInput;
-      } catch {
-        socket.destroy();
-        return;
-      }
-      if (message.v !== SLOT_HOLDER_PROTOCOL_VERSION) {
-        socket.destroy();
-        return;
-      }
-      handle(socket, message);
+  const reader = createNdjsonReader((line) => {
+    let message: SlotHolderInput;
+    try {
+      message = JSON.parse(line.toString("utf8")) as SlotHolderInput;
+    } catch {
+      socket.destroy();
+      return;
     }
+    if (message.v !== SLOT_HOLDER_PROTOCOL_VERSION) {
+      socket.destroy();
+      return;
+    }
+    handle(socket, message);
+  }, 512 * 1024 * 1024);
+  socket.on("data", (chunk: Buffer) => {
+    if (!reader.push(chunk)) socket.destroy();
   });
   socket.on("error", () => undefined);
   socket.on("close", () => {

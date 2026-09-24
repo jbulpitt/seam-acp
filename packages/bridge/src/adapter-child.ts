@@ -44,11 +44,22 @@ function fail(message: string): never {
 }
 
 function writeAgent(data: string | Buffer): boolean {
-  if (!child || child.exitCode !== null || child.signalCode !== null || child.killed || !child.stdin?.writable) {
-    return false;
-  }
+  if (!child?.stdin?.writable) return false;
   child.stdin.write(data);
   return true;
+}
+
+let refused = false;
+/** Stop this slot and send the reason to the controller as the exit frame's
+ *  spawnError. A dropped input with no report surfaced only as a 45s
+ *  "never responded" timeout (#609, #610). */
+function exitWithRefusal(reason: string): void {
+  if (refused) return;
+  refused = true;
+  process.stdout.write(
+    adapterChildLine({ v: ADAPTER_CHILD_PROTOCOL_VERSION, type: "refusal", reason }),
+    () => process.exit(1),
+  );
 }
 
 function start(config: AdapterChildBootstrap): void {
@@ -103,6 +114,9 @@ function start(config: AdapterChildBootstrap): void {
     }
   });
   child.stderr?.on("data", (chunk: Buffer | string) => process.stderr.write(chunk));
+  child.stdin?.on("error", (error: NodeJS.ErrnoException) => {
+    exitWithRefusal(`agent stdin failed (${error.code ?? "write error"})`);
+  });
   child.on("error", () => {
     recovery.childExited(config.slot);
     fail("adapter process emitted an error");
@@ -124,12 +138,16 @@ function start(config: AdapterChildBootstrap): void {
   });
 
   const handle = (message: AdapterChildInput): void => {
-    if (message.v !== ADAPTER_CHILD_PROTOCOL_VERSION) return;
+    if (refused) return;
+    if (message.v !== ADAPTER_CHILD_PROTOCOL_VERSION) {
+      exitWithRefusal(`unsupported control protocol version ${String(message.v)}`);
+      return;
+    }
     if (message.type === "input") {
       const bytes = Buffer.from(message.dataBase64, "base64");
       recovery.observeInputBytes(config.slot);
       for (const line of agentInput.push(bytes.toString())) recovery.observeInput(config.slot, line);
-      writeAgent(bytes);
+      if (!writeAgent(bytes)) exitWithRefusal("agent stdin is closed; input could not be delivered");
     } else if (message.type === "arm_recovery") {
       try {
         publish({

@@ -1,22 +1,9 @@
 /**
- * #610 — the ACP host `profile.spawn()` returns for agy is a fabricated,
- * in-process object (no real OS child; `makeFakeAgyProcess` in
- * packages/adapters/src/profiles/agy.ts), cast to Node's real
- * `ChildProcessByStdio` type. `adapter-child.ts`'s generic `writeAgent` guard
- * — written for a real ChildProcess, where a running process always has
- * `exitCode === null` and `signalCode === null` — treats ANY other value,
- * including `undefined`, as "already exited" and refuses to write.
- *
- * The fake object never set either property, so they read as `undefined`.
- * `undefined !== null`, so every input write after the bootstrap (which
- * bypasses this object — sessiond writes it straight to the wrapper
- * process's own real stdin) was silently refused. No agy turn could ever
- * deliver `initialize`; every session timed out at 45s with a message
- * indistinguishable from a real installation or auth failure. This is
- * NOT the same bug as #606 (a resolved `false` from `writeInput` going
- * unreported) or #608/#609 (a stale AGY version pin, or a bridge-only
- * restart poisoning sessiond's slot map) — it reproduces standalone, with
- * no bridge, sessiond, or restart involved at all.
+ * #609 — agy's in-process ACP host must honour Node's ChildProcess exit state:
+ * exitCode/signalCode are null while running and set on exit, and `killed` is
+ * live. Without that, adapter-child treated every agy session as exited and
+ * dropped its input. The end-to-end path is covered by
+ * bridge-adapter-child-real.test.ts.
  */
 import fs from "node:fs";
 import os from "node:os";
@@ -49,19 +36,6 @@ function spawnFakeAgyProc() {
   return profile.spawn("gemini-3.8-flash-high", undefined, [], { cwd: dir });
 }
 
-/** adapter-child.ts's exact guard (packages/bridge/src/adapter-child.ts). A
- *  future rewrite of either side must keep this expression's meaning intact
- *  for the fake process to stay writable — assert the real predicate, not a
- *  paraphrase of it. */
-function writableByAdapterChild(child: {
-  exitCode: number | null;
-  signalCode: NodeJS.Signals | null;
-  killed: boolean;
-  stdin?: { writable?: boolean } | null;
-}): boolean {
-  return !(!child || child.exitCode !== null || child.signalCode !== null || child.killed || !child.stdin?.writable);
-}
-
 describe("agy fake ACP process — Node ChildProcess contract", () => {
   it("reports exitCode and signalCode as null while running, like a real ChildProcess", () => {
     const proc = spawnFakeAgyProc();
@@ -71,22 +45,13 @@ describe("agy fake ACP process — Node ChildProcess contract", () => {
     proc.kill();
   });
 
-  it("is writable by adapter-child.ts's guard immediately after spawn", () => {
-    const proc = spawnFakeAgyProc();
-    // This is the exact condition that silently dropped every agy input
-    // frame: it evaluated to `false` the instant the process was created,
-    // before any real work happened and with nothing that could recover.
-    expect(writableByAdapterChild(proc)).toBe(true);
-    proc.kill();
-  });
-
-  it("sets a real exitCode only after kill(), and stops being writable", async () => {
+  it("sets a real exitCode and killed only after kill()", async () => {
     const proc = spawnFakeAgyProc();
     const exited = new Promise<void>((resolve) => proc.once("exit", () => resolve()));
     proc.kill();
     await exited;
     expect(proc.exitCode).not.toBeNull();
-    expect(writableByAdapterChild(proc)).toBe(false);
+    expect(proc.killed).toBe(true);
   });
 
   it("answers a real ACP initialize request written to its stdin", async () => {

@@ -640,13 +640,17 @@ export class AgentRuntime {
         return error;
       }
       if (remoteExit) {
+        if (remoteExit.stderrTail && !remoteStderrRetained) {
+          remoteStderrRetained = true;
+          stderrRing.push(...remoteExit.stderrTail.split("\n").filter(Boolean));
+        }
         // A remote code=1/signal=null describes the ACP supervisor, not
-        // necessarily the descendant that failed. The two production OOMs in
-        // #516 had exactly that shape. Preserve the exit while refusing the
-        // false claim that this represented process was itself signalled.
+        // necessarily the descendant that failed (#516). When the bridge says
+        // why, that reason is the cause; without one, say only what is known.
         const error = new Error(
           `remote agent supervisor exited ${phase} on host '${remoteExit.bridgeId}' `
-          + `(code=${code}, signal=${signal}); no matching host OOM evidence was available`
+          + `(code=${code}, signal=${signal})`
+          + (remoteExit.reason ? `: ${remoteExit.reason}` : "; the bridge reported no reason")
         );
         attachErrorClassification(error, {
           errorKind: "agent_exit",
@@ -654,7 +658,8 @@ export class AgentRuntime {
           exitCode: code,
           signal,
           sourceKind: "remote_supervisor_exit",
-          details: `bridge '${remoteExit.bridgeId}' observed the supervisor exit; descendant cause was not proven`,
+          details: remoteExit.reason
+            ?? `bridge '${remoteExit.bridgeId}' observed the supervisor exit; descendant cause was not proven`,
         });
         return error;
       }
@@ -668,6 +673,10 @@ export class AgentRuntime {
     // WHY it died (agent stderr is otherwise debug-only, dropped at info level).
     // Bounded to the last ~100 lines.
     const stderrRing: string[] = [];
+    let remoteStderrRetained = false;
+    // `this.connection` is assigned synchronously below, before any exit can
+    // be observed, so it cannot tell "initialize not done yet" (#610).
+    let initialized = false;
 
     let spawnError: Error | undefined;
     const errorWaiter = new Promise<never>((_resolve, reject) => {
@@ -680,7 +689,7 @@ export class AgentRuntime {
         reject(new Error(`agent spawn failed: ${err.message}${hint}`));
       });
       child.once("exit", (code, signal) => {
-        if (!spawnError && this.connection === undefined) {
+        if (!spawnError && !initialized) {
           // Process died before initialize completed.
           reject(processExitError(code, signal, "before initialize"));
         }
@@ -783,14 +792,8 @@ export class AgentRuntime {
         agent.request<T>(method, params),
     } as unknown as ClientSideConnection;
 
-    // The child's stderr is already ringed above, and an abnormal EXIT reports
-    // it. A hang does not: the child is still alive, so nothing exits, the
-    // timeout wins the race, and the operator gets a fixed sentence whose only
-    // hint ("check that it is installed and authenticated") is a guess. agy
-    // spent an afternoon looking like an auth failure for exactly this reason
-    // while the real cause — a rejected CLI flag — sat unread in this ring.
-    // Diagnostics we already hold must not be withheld because the process had
-    // the manners to hang instead of crash.
+    // A hang produces no exit, so the timeout wins; attach the stderr we hold
+    // rather than guess at a cause (#602, #610).
     const initResult = await Promise.race([
       this.connection.initialize({
         protocolVersion: PROTOCOL_VERSION,
@@ -799,8 +802,8 @@ export class AgentRuntime {
       errorWaiter,
       withTimeout(
         START_TIMEOUT_MS,
-        `ACP initialize timed out after ${START_TIMEOUT_MS / 1000}s ` +
-          `(agent never responded; check that '${this.profile.id}' is installed and authenticated)`
+        `ACP initialize timed out after ${START_TIMEOUT_MS / 1000}s: ` +
+          `agent '${this.profile.id}' neither answered nor exited`
       ),
     ]).catch((error: unknown) => {
       const enriched = withRetainedStderr(error, stderrRing);
@@ -812,6 +815,7 @@ export class AgentRuntime {
       }
       throw enriched;
     });
+    initialized = true;
     this.promptCapabilities =
       initResult.agentCapabilities?.promptCapabilities ?? undefined;
     this.loadSessionSupported = initResult.agentCapabilities?.loadSession === true;
@@ -1949,22 +1953,12 @@ export class AgentRuntime {
         child.once("error", resolve);
       });
 
-      if (child.pid && (child as any).detached) {
-        try {
-          process.kill(-child.pid, "SIGTERM");
-        } catch {
-          try {
-            child.kill("SIGTERM");
-          } catch {
-            /* ignore */
-          }
-        }
-      } else {
-        try {
-          child.kill("SIGTERM");
-        } catch {
-          /* ignore */
-        }
+      // Production children are bridge slots; the bridge's sessiond owns the
+      // real process group, so a kill here is a request to it (#593).
+      try {
+        child.kill("SIGTERM");
+      } catch {
+        /* ignore */
       }
 
       // Wait up to 3 seconds for graceful exit
@@ -1975,15 +1969,9 @@ export class AgentRuntime {
 
       // Force kill if still alive
       if (child.exitCode === null && child.signalCode === null) {
-        if (child.pid && (child as any).detached) {
-          try {
-            process.kill(-child.pid, "SIGKILL");
-          } catch { /* ignore */ }
-        } else {
-          try {
-            child.kill("SIGKILL");
-          } catch { /* ignore */ }
-        }
+        try {
+          child.kill("SIGKILL");
+        } catch { /* ignore */ }
       }
     }
     this.transportConnection?.close();

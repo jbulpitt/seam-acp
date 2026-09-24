@@ -79,7 +79,8 @@ function outputFrame(frame: SessiondOutputFrame, parsedOutput?: ReturnType<typeo
     return { seq: frame.seq, type: "recovery_result", recoveryResult: parsed.recoveryResult };
   }
   if (parsed.type === "control_result") return undefined;
-  return { seq: frame.seq, type: "exit", code: 1, signal: null, spawnError: parsed.spawnError };
+  const spawnError = parsed.type === "refusal" ? parsed.reason : parsed.spawnError;
+  return { seq: frame.seq, type: "exit", code: 1, signal: null, spawnError };
 }
 
 /**

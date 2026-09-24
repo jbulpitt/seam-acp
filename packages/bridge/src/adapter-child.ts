@@ -42,6 +42,7 @@ function fail(message: string): never {
   // Closed diagnostic only. Bootstrap, argv, paths, and raw spawn errors may
   // carry secrets and never cross fd 2 from this host.
   process.stderr.write(`[adapter-child] ${message}\n`);
+  clearResumeRecord();
   process.exit(1);
 }
 
@@ -52,12 +53,15 @@ function writeAgent(data: string | Buffer): boolean {
 }
 
 let refused = false;
+/** Set once a resume record exists; a refusal or failure ends the work for good. */
+let clearResumeRecord = (): void => {};
 /** Stop this slot and send the reason to the controller as the exit frame's
  *  spawnError. A dropped input with no report surfaced only as a 45s
  *  "never responded" timeout (#609, #610). */
 function exitWithRefusal(reason: string): void {
   if (refused) return;
   refused = true;
+  clearResumeRecord();
   process.stdout.write(
     adapterChildLine({ v: ADAPTER_CHILD_PROTOCOL_VERSION, type: "refusal", reason }),
     () => process.exit(1),
@@ -80,6 +84,7 @@ function start(config: AdapterChildBootstrap): void {
   }
   child = spawned;
   const resumeRecord = createResumeRecorder(process.env.SEAM_SESSIOND_RESUME_FILE, config);
+  clearResumeRecord = () => resumeRecord.clear();
   const recovery = createRung1Recovery({
     policyFor: () => config.config.rung1Recovery,
     classify: (_slot, error) => {
@@ -141,11 +146,6 @@ function start(config: AdapterChildBootstrap): void {
       const { recovery: turn } = resuming.resume;
       resuming = undefined;
       process.stderr.write(`[adapter-child] resumed session ${turn.acpSessionId} after a restart; continuing the turn\n`);
-      recovery.arm(config.slot, {
-        submissionId: turn.submissionId,
-        acpSessionId: turn.acpSessionId,
-        continuation: turn.continuation,
-      });
       deliverInput(Buffer.from(`${JSON.stringify({
         jsonrpc: "2.0",
         id: turn.originalRequestId,
@@ -187,6 +187,8 @@ function start(config: AdapterChildBootstrap): void {
       });
     }
     recovery.childExited(config.slot);
+    // Ending on its own (not by a signal, as at shutdown) leaves nothing to resume.
+    if (!signal) resumeRecord.clear();
     if (stopping) process.exit(0);
     if (signal) process.kill(process.pid, signal);
     process.exit(code ?? 1);
@@ -245,6 +247,13 @@ function start(config: AdapterChildBootstrap): void {
 
   consume = handle;
   if (config.resume) {
+    // Re-arm first: the controller sees this slot owns the turn while the
+    // session reloads, and does not start a second continuation.
+    recovery.arm(config.slot, {
+      submissionId: config.resume.recovery.submissionId,
+      acpSessionId: config.resume.recovery.acpSessionId,
+      continuation: config.resume.recovery.continuation,
+    });
     resuming = { resume: config.resume, phase: "initialize" };
     writeAgent(`${JSON.stringify({ jsonrpc: "2.0", id: RESUME_INITIALIZE, method: "initialize", params: config.resume.initialize })}\n`);
   }

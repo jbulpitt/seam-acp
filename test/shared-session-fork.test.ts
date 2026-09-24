@@ -35,7 +35,7 @@ function thread(id: string, createdUtc: string) {
   return record;
 }
 
-function host(forkResult: string | undefined) {
+function host(forkResult: string | undefined, rebuildAttaches = true) {
   const sent: Array<{ channel: string; text: string }> = [];
   const router = {
     forkSharedSession: vi.fn(async (record: { id: string; acpSessionId: string }) => {
@@ -54,7 +54,10 @@ function host(forkResult: string | undefined) {
     store,
     renderer: {} as never,
   });
-  const rebuild = vi.fn(async () => undefined);
+  const rebuild = vi.fn(async (record: { id: string }) => {
+    if (rebuildAttaches) store.upsert({ ...store.get(record.id)!, acpSessionId: "acp-rebuilt" });
+    return { attached: rebuildAttaches, attachmentReason: rebuildAttaches ? "attached" : "thread moved on" };
+  });
   Object.assign(orchestrator as never, { rebuildThreadFromDiscord: rebuild });
   const ensure = (record: { channelRef: string }) =>
     (orchestrator as unknown as { ensureOwnSession(r: unknown, c: unknown): Promise<void> })
@@ -85,6 +88,16 @@ describe("#631 a shared ACP session is forked for the newer thread", () => {
     await ensure(newer);
     expect(rebuild).toHaveBeenCalledTimes(1);
     expect(sent[0]?.text).toContain("rebuilt from this thread's history");
+  });
+
+  it("does not claim success when the rebuild did not attach", async () => {
+    thread("older", "2026-09-01T00:00:00.000Z");
+    const newer = thread("newer", "2026-09-02T00:00:00.000Z");
+    const { rebuild, sent, ensure } = host(undefined, false);
+    await ensure(newer);
+    await ensure(newer);
+    expect(rebuild).toHaveBeenCalledTimes(1);
+    expect(sent).toEqual([]);
   });
 
   it("does nothing for a thread that is the only holder of its session", async () => {
@@ -122,11 +135,74 @@ describe("#631 tier 3: a bridge that stays unreachable", () => {
       vi.advanceTimersByTime(60_000);
       await Promise.resolve();
       expect(sent).toEqual([{ channel: "thread-9", text: expect.stringContaining("Still reconnecting to `fhr-server`") }]);
-      ready[0]!("fhr-server");
+      for (const listener of ready) listener("fhr-server");
       await Promise.resolve();
       expect(sent.at(-1)).toEqual({ channel: "thread-9", text: "🔌 Reconnected to session" });
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+function orchestratorWith(mux: Record<string, unknown>) {
+  const sent: Array<{ channel: string; text: string }> = [];
+  const built = new Orchestrator({
+    modelCatalog: fixtureModelCatalog([]),
+    logger: silent,
+    config: { DATA_DIR: dir, REPOS_ROOT: "/repo", channelPresets: new Map(), threadPresets: new Map(), bridgePresets: new Map() } as never,
+    adapter: { sendMessage: async (channel: { id: string }, text: string) => { sent.push({ channel: channel.id, text }); return { id: "m" }; } } as never,
+    router: {} as never,
+    store,
+    renderer: {} as never,
+  });
+  built.setBridgeHub({ muxFor: () => mux, onBridgeReady: () => () => undefined } as never);
+  return { built, sent };
+}
+
+describe("#631 slots nobody owns", () => {
+  it("stops live slots that are neither bound nor owned by a suspended delegated turn", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout"] });
+    try {
+      const killed: number[] = [];
+      const mux = {
+        sendCmd: async () => ({ health: [
+          { slot: 1, alive: true }, { slot: 2, alive: true }, { slot: 3, alive: true }, { slot: 4, alive: false },
+        ] }),
+        isBound: (slot: number) => slot === 1,
+        sendFrame: (frame: { slot: number }) => killed.push(frame.slot),
+      };
+      const { built } = orchestratorWith(mux);
+      vi.spyOn(store.turnAttempts, "list").mockImplementation((state?: string) =>
+        (state === "suspended" ? [{ remoteRecovery: { location: "local", slot: 2 } }] : []) as never);
+      built.sweepUnownedSlots("local");
+      await vi.advanceTimersByTimeAsync(90_000);
+      expect(killed).toEqual([3]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("#631 a lost delegated turn continues only after its old slot is gone", () => {
+  it("waits for the kill before continuing, and continues exactly once", async () => {
+    let alive = true;
+    const order: string[] = [];
+    const mux = {
+      sendCmd: async () => ({ health: [{ slot: 7, alive }] }),
+      sendFrame: () => { order.push("kill"); setTimeout(() => { alive = false; }, 700); },
+    };
+    const { built } = orchestratorWith(mux);
+    const resume = vi.fn(async () => { order.push(alive ? "resume-while-alive" : "resume"); return "▶️ Continuation requested"; });
+    Object.assign(built as never, { resumeTurnManually: resume });
+    const release = vi.spyOn(store.turnAttempts, "releaseLostRemoteRecovery").mockReturnValueOnce(true).mockReturnValue(false);
+    const attempt = { id: "t1", spec: { target: "thread-1" },
+      remoteRecovery: { location: "local", slot: 7, submissionId: "s" } };
+    const lose = (built as unknown as { continueLostRemoteTurn(a: unknown, cause: string): void });
+    lose.continueLostRemoteTurn(attempt, "test");
+    lose.continueLostRemoteTurn(attempt, "test again");
+    await vi.waitFor(() => expect(resume).toHaveBeenCalled(), { timeout: 5_000 });
+    expect(order).toEqual(["kill", "resume"]);
+    expect(release).toHaveBeenCalledTimes(2);
+    expect(resume).toHaveBeenCalledTimes(1);
   });
 });

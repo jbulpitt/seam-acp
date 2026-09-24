@@ -170,6 +170,9 @@ const server = net.createServer((socket) => {
 server.listen(socketPath, () => {
   fs.chmodSync(socketPath, 0o600);
 });
+// sessiond sends the launch right after starting this holder. If it never
+// arrives (sessiond died in between), there is nothing to hold.
+setTimeout(() => { if (!child) finish(); }, 60_000).unref();
 
 // sessiond's own stop signals never reach here (separate process group). A
 // SIGTERM to the holder is an explicit stop of this slot: pass it to the child.
@@ -177,4 +180,3 @@ process.on("SIGTERM", () => {
   if (child && child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
   else finish();
 });
-process.on("SIGHUP", () => undefined);

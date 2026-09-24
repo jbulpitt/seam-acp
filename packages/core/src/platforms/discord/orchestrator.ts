@@ -1107,7 +1107,7 @@ export class Orchestrator {
    * Boot delivery reconciliation skips them so it cannot race the adopter's
    * nonce-backed first send; every other completed attempt still recovers. */
   private readonly adoptingRemoteResults = new Set<string>();
-  private readonly continuingLostTurns = new Set<string>();
+  private readonly sharedSessionAttempts = new Set<string>();
   private readonly remoteAdoptionWaiters = new Map<string, () => void>();
   /** channelRef → the harness-stamped speaker id of the human turn CURRENTLY
    *  processing on that thread (#71/#57). Set at turn start when speaker identity
@@ -15758,7 +15758,9 @@ export class Orchestrator {
           && row.recovery.acpSessionId === binding.acpSessionId
         ) as { recovery: import("@seam/adapters").RemoteRecoverySnapshot } | undefined;
         const alive = rows.some((row) => row && row.slot === binding.slot && row.alive === true);
-        if (snapshot || !alive || check >= 5) break;
+        // A slot relaunched after a host restart re-arms before it reloads,
+        // but give a large session's load up to a minute.
+        if (snapshot || !alive || check >= 30) break;
         await new Promise((resolve) => setTimeout(resolve, 2_000));
       }
     } catch (err) {
@@ -15890,26 +15892,68 @@ export class Orchestrator {
    */
   private continueLostRemoteTurn(attempt: TurnAttempt, cause: string): void {
     const binding = attempt.remoteRecovery;
-    if (!binding || this.continuingLostTurns.has(attempt.id)) return;
-    this.continuingLostTurns.add(attempt.id);
-    const mux = this.bridgeHub?.muxFor(binding.location);
-    // Never run two processes on one session: stop the old slot if it lingers.
-    void mux?.sendCmd("listSlots", {}).then((reply) => {
-      const alive = ((reply as { health?: Array<{ slot?: unknown; alive?: unknown }> }).health ?? [])
-        .some((row) => row.slot === binding.slot && row.alive === true);
-      if (alive) mux.sendFrame({ slot: binding.slot, type: "kill" });
-    }).catch(() => {});
+    // The SQL release is the single gate: exactly one caller gets past it.
+    if (!binding || !this.store.turnAttempts.releaseLostRemoteRecovery(attempt, binding)) return;
     this.logger.warn({ attempt: attempt.id, location: binding.location, slot: binding.slot, cause },
       "delegated turn lost its bridge owner; continuing it in its recorded session");
-    if (!this.store.turnAttempts.releaseLostRemoteRecovery(attempt, binding)) {
-      this.continuingLostTurns.delete(attempt.id);
-      return;
-    }
-    void this.resumeTurnManually(attempt.id)
-      .then((message) => this.logger.info({ attempt: attempt.id, message }, "lost remote turn continuation requested"))
-      .catch((err) => this.logger.error({ err, attempt: attempt.id }, "lost remote turn continuation failed"))
-      .finally(() => this.continuingLostTurns.delete(attempt.id));
+    void (async () => {
+      // Never run two processes on one session: the old slot is gone first.
+      await this.stopLingeringSlot(binding.location, binding.slot);
+      const message = await this.resumeTurnManually(attempt.id);
+      this.logger.info({ attempt: attempt.id, message }, "lost remote turn continuation requested");
+      if (/^(Cannot resume|No interrupted)/.test(message) && attempt.spec?.target) {
+        await this.postResumeNotice(attempt.spec.target,
+          `⚠️ An interrupted turn could not continue on its own: ${message}`);
+      }
+    })().catch((err) => this.logger.error({ err, attempt: attempt.id }, "lost remote turn continuation failed"));
   }
+
+  /**
+   * #631: slots now outlive controllers, so a slot nobody owns would run and
+   * hold memory forever: a detached turn whose attempt ended elsewhere, or a
+   * slot relaunched after a restart for a turn that was since cancelled. A
+   * minute and a half after a bridge is ready (after adoption has had its
+   * chance), stop every live slot this controller neither has bound nor has a
+   * suspended delegated turn for.
+   */
+  sweepUnownedSlots(location: string): void {
+    setTimeout(() => {
+      const mux = this.bridgeHub?.muxFor(location);
+      if (!mux) return;
+      void (async () => {
+        const reply = await mux.sendCmd("listSlots", {}) as { health?: Array<{ slot?: unknown; alive?: unknown }> };
+        const owned = new Set(this.store.turnAttempts.list("suspended")
+          .filter((attempt) => attempt.remoteRecovery?.location === location)
+          .map((attempt) => attempt.remoteRecovery!.slot));
+        for (const row of reply.health ?? []) {
+          if (row.alive !== true || typeof row.slot !== "number") continue;
+          if (mux.isBound(row.slot) || owned.has(row.slot)) continue;
+          this.logger.warn({ location, slot: row.slot }, "stopping a slot no turn owns");
+          mux.sendFrame({ slot: row.slot, type: "kill" });
+        }
+      })().catch((err) => this.logger.debug({ err, location }, "unowned-slot sweep skipped"));
+    }, 90_000).unref?.();
+  }
+
+  /** Stop a slot this controller no longer owns, and wait until it is gone. */
+  private async stopLingeringSlot(location: string, slot: number): Promise<void> {
+    const mux = this.bridgeHub?.muxFor(location);
+    if (!mux) return;
+    const alive = async () => ((await mux.sendCmd("listSlots", {}) as { health?: Array<{ slot?: unknown; alive?: unknown }> })
+      .health ?? []).some((row) => row.slot === slot && row.alive === true);
+    try {
+      if (!await alive()) return;
+      mux.sendFrame({ slot, type: "kill" });
+      for (let check = 0; check < 20; check += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        if (!await alive()) return;
+      }
+      this.logger.warn({ location, slot }, "a lingering slot did not stop within 10s");
+    } catch (err) {
+      this.logger.warn({ err, location, slot }, "could not confirm a lingering slot stopped");
+    }
+  }
+
 
   private deferRemoteRecoveryAdoption(attempt: TurnAttempt): void {
     const binding = attempt.remoteRecovery;
@@ -18806,13 +18850,18 @@ export class Orchestrator {
     const owner = holders[0];
     if (!owner || owner.id === record.id || !holders.some((row) => row.id === record.id)) return;
     const shared = record.acpSessionId;
+    // One attempt per thread per boot: a rebuild is a billable seed turn.
+    if (this.sharedSessionAttempts.has(record.id)) return;
+    this.sharedSessionAttempts.add(record.id);
     try {
       const forked = await this.router.forkSharedSession(record);
       if (!forked) {
         await this.router.invalidate(record.id, { clearAcpSession: false });
-        await this.rebuildThreadFromDiscord(record);
+        const rebuilt = await this.rebuildThreadFromDiscord(record);
+        if (!rebuilt.attached) throw new Error(`rebuild did not attach: ${rebuilt.attachmentReason}`);
       }
       Object.assign(record, this.store.get(record.id));
+      if (record.acpSessionId === shared) throw new Error("the thread still has the shared session");
       this.logger.info({ thread: record.channelRef, owner: owner.channelRef, shared, own: record.acpSessionId, forked: !!forked },
         "thread shared an ACP session with another thread; gave it its own copy");
       await this.postResumeNotice(channel.id,

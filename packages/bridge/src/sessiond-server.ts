@@ -33,6 +33,7 @@ const MAX_WIRE_BYTES = 12 * 1024 * 1024;
 const MAX_WRITE_BYTES = 8 * 1024 * 1024;
 const ORPHAN_TERM_GRACE_MS = 500;
 const ORPHAN_KILL_GRACE_MS = 500;
+const EXITED_SLOT_RETENTION_MS = 24 * 60 * 60_000;
 
 interface ProcessIdentity {
   pid: number;
@@ -46,6 +47,7 @@ interface PersistedSlot {
   pid: number | null;
   /** The slot holder's socket (#631). Absent for pre-holder records. */
   socketPath?: string;
+  exitedAt?: number;
   identity?: ProcessIdentity;
   status: "live" | "dead";
   lastStdoutAt?: number;
@@ -71,6 +73,7 @@ interface SlotEntry {
   attached: boolean;
   /** The holder reported the child's exit. */
   exited?: boolean;
+  exitedAt?: number;
   lastSeq: number;
   replies: Map<string, (message: SlotHolderOutput) => void>;
   lastStdoutAt?: number;
@@ -239,6 +242,8 @@ export function readSessiondProcessIdentity(pid: number): ProcessIdentity | unde
       const close = stat.lastIndexOf(")");
       if (close === -1) return undefined;
       const fields = stat.slice(close + 2).trim().split(/\s+/);
+      // A zombie has exited; it only waits to be reaped (#631).
+      if (fields[0] === "Z" || fields[0] === "X") return undefined;
       const pgid = Number(fields[2]);
       const startTicks = fields[19];
       if (!Number.isSafeInteger(pgid) || !startTicks) return undefined;
@@ -248,15 +253,16 @@ export function readSessiondProcessIdentity(pid: number): ProcessIdentity | unde
     }
   }
   try {
-    const raw = execFileSync("/bin/ps", ["-p", String(pid), "-o", "pid=", "-o", "pgid=", "-o", "lstart="], {
+    const raw = execFileSync("/bin/ps", ["-p", String(pid), "-o", "pid=", "-o", "stat=", "-o", "pgid=", "-o", "lstart="], {
       encoding: "utf8",
       timeout: 1_000,
       maxBuffer: 8 * 1024,
       stdio: ["ignore", "pipe", "ignore"],
     }).trim();
-    const match = /^(\d+)\s+(\d+)\s+(.+)$/.exec(raw);
+    const match = /^(\d+)\s+(\S+)\s+(\d+)\s+(.+)$/.exec(raw);
     if (!match || Number(match[1]) !== pid) return undefined;
-    return { pid, pgid: Number(match[2]), started: match[3]!.trim().replace(/\s+/g, " ") };
+    if (match[2]!.startsWith("Z")) return undefined;
+    return { pid, pgid: Number(match[3]), started: match[4]!.trim().replace(/\s+/g, " ") };
   } catch {
     return undefined;
   }
@@ -347,6 +353,7 @@ export class SessiondServer {
   private persistQueue: Promise<void> = Promise.resolve();
   private started = false;
   private closing = false;
+  private pruneTimer?: ReturnType<typeof setInterval>;
 
   constructor(private readonly options: SessiondServerOptions) {
     this.outputLog = createOutputLog(options.outputLog);
@@ -375,6 +382,8 @@ export class SessiondServer {
     });
     await fs.chmod(this.options.socketPath, 0o600);
     this.started = true;
+    this.pruneTimer = setInterval(() => this.pruneExited(), 10 * 60_000);
+    this.pruneTimer.unref();
   }
 
   /**
@@ -385,6 +394,7 @@ export class SessiondServer {
   async close(options: { terminateChildren?: boolean } = {}): Promise<void> {
     const ownedSocket = this.started;
     this.closing = true;
+    if (this.pruneTimer) clearInterval(this.pruneTimer);
     if (options.terminateChildren) {
       const live = [...this.slots.values()].filter((entry) => this.holderAlive(entry));
       for (const entry of live) {
@@ -684,19 +694,44 @@ export class SessiondServer {
 
   /** The link dropped. A live holder is reconnected; a gone one is a dead slot. */
   private async afterHolderLoss(entry: SlotEntry): Promise<void> {
-    if (this.closing || this.slots.get(entry.slot) !== entry) return;
-    if (this.holderAlive(entry)) {
-      if (await this.connectHolder(entry, 10_000)) return;
+    while (!this.closing && this.slots.get(entry.slot) === entry && !entry.link) {
+      if (!this.holderAlive(entry)) break;
+      if (await this.connectHolder(entry, 5_000)) return;
+      if (!this.holderAlive(entry)) break;
+      // Still running but not answering: keep trying rather than call it dead.
+      entry.orphanReason = "supervisor_restarted";
+      await new Promise((resolve) => setTimeout(resolve, 5_000));
     }
-    if (!entry.exited) {
-      // The holder died without reporting the child's exit (killed with it).
-      console.error(`[seam-sessiond] slot ${entry.slot} (pid ${entry.pid ?? "?"}) lost its holder without an exit report; the process group was killed from outside`);
-      entry.exited = true;
-      entry.exitCode = entry.exitCode ?? null;
-      entry.signal = entry.signal ?? null;
-      this.publish(entry.slot, { seq: entry.lastSeq + 1, at: Date.now(), stream: "exit", code: null, signal: null });
-    }
+    if (this.closing || this.slots.get(entry.slot) !== entry || entry.link || entry.exited) return;
+    console.error(`[seam-sessiond] slot ${entry.slot} (pid ${entry.pid ?? "?"}) lost its holder without an exit report; the process group was killed from outside`);
+    this.dropResumeRecord(entry.slot);
+    this.markExited(entry, null, null);
+    this.publish(entry.slot, { seq: entry.lastSeq + 1, at: Date.now(), stream: "exit", code: null, signal: null });
     void this.persist().catch(() => undefined);
+  }
+
+  private markExited(entry: SlotEntry, code: number | null, signal: NodeJS.Signals | null): void {
+    entry.exited = true;
+    entry.exitedAt = Date.now();
+    entry.exitCode = code;
+    entry.signal = signal;
+    this.backpressured.delete(entry.slot);
+  }
+
+  /** Forget slots that ended more than a day ago; their output has expired too. */
+  private pruneExited(now = Date.now()): void {
+    let pruned = false;
+    for (const entry of [...this.slots.values()]) {
+      if (!entry.exited) continue;
+      entry.exitedAt ??= now;
+      if (now - entry.exitedAt < EXITED_SLOT_RETENTION_MS) continue;
+      this.slots.delete(entry.slot);
+      this.outputLog.dropSlot(entry.slot);
+      void fs.unlink(path.join(this.slotsDirectory(), `${entry.slot}.log`)).catch(() => undefined);
+      if (entry.socketPath) void fs.unlink(entry.socketPath).catch(() => undefined);
+      pruned = true;
+    }
+    if (pruned) void this.persist().catch(() => undefined);
   }
 
   private holderRequest(entry: SlotEntry, replyType: string, message: SlotHolderInput): Promise<SlotHolderOutput> {
@@ -731,13 +766,10 @@ export class SessiondServer {
     if (frame.seq <= entry.lastSeq) return;
     if (frame.stream === "stdout") entry.lastStdoutAt = frame.at;
     if (frame.stream === "exit") {
-      entry.exited = true;
       // This supervisor saw the slot end, so there is nothing to resume.
       this.dropResumeRecord(entry.slot);
       console.error(`[seam-sessiond] slot ${entry.slot} (pid ${entry.pid ?? "?"}) exited: code ${frame.code ?? "none"}, signal ${frame.signal ?? "none"}`);
-      entry.exitCode = frame.code ?? null;
-      entry.signal = frame.signal ?? null;
-      this.backpressured.delete(entry.slot);
+      this.markExited(entry, frame.code ?? null, frame.signal ?? null);
       void this.persist().catch(() => undefined);
     }
     this.publish(entry.slot, frame);
@@ -888,7 +920,7 @@ export class SessiondServer {
         identity: record.identity,
         ...(record.socketPath ? { socketPath: record.socketPath } : {}),
         attached: false,
-        ...(record.status !== "live" ? { exited: true } : {}),
+        ...(record.status !== "live" ? { exited: true, exitedAt: record.exitedAt ?? Date.now() } : {}),
         lastSeq: 0,
         replies: new Map(),
         lastStdoutAt: record.lastStdoutAt,
@@ -977,8 +1009,9 @@ export class SessiondServer {
         console.error(`[seam-sessiond] relaunched slot ${params.slot} (pid ${pid}) to resume the turn a host restart interrupted`);
       } catch (error) {
         const reason = error instanceof SessiondError ? error.message : "unreadable record";
-        console.error(`[seam-sessiond] could not relaunch ${name}: ${reason}; kept as ${name}.failed`);
-        await fs.rename(file, `${file}.failed`).catch(() => undefined);
+        // The record holds credentials; do not keep one that cannot be used.
+        console.error(`[seam-sessiond] could not relaunch ${name}: ${reason}; record removed`);
+        await fs.unlink(file).catch(() => undefined);
       }
     }));
   }
@@ -992,6 +1025,7 @@ export class SessiondServer {
           pid: entry.pid,
           ...(entry.identity ? { identity: entry.identity } : {}),
           ...(entry.socketPath ? { socketPath: entry.socketPath } : {}),
+          ...(entry.exitedAt ? { exitedAt: entry.exitedAt } : {}),
           status: this.entryAlive(entry) ? "live" : "dead",
           ...(entry.lastStdoutAt !== undefined ? { lastStdoutAt: entry.lastStdoutAt } : {}),
           ...(entry.lastStdinAt !== undefined ? { lastStdinAt: entry.lastStdinAt } : {}),

@@ -272,6 +272,40 @@ describe("#573 seam-sessiond control-plane restart", () => {
     await successor.start();
   });
 
+  it("reconnects a live holder whose link dropped, and never calls it exited (#631)", async () => {
+    const { server, client } = await harness();
+    await client.spawn({ slot: 31, executable: process.execPath, args: ["-e", "setInterval(() => {}, 1000)"],
+      cwd: process.cwd(), env: { PATH: process.env.PATH ?? "" } });
+    (server as unknown as { slots: Map<number, { link?: { destroy(): void } }> }).slots.get(31)!.link!.destroy();
+    await delay(300);
+    expect((await client.listSlots()).health).toEqual([expect.objectContaining({ slot: 31, alive: true, attached: true })]);
+  });
+
+  it("drops the resume record of a slot whose holder was killed from outside (#631)", async () => {
+    const { root, statePath, client } = await harness();
+    await client.spawn({ slot: 32, executable: process.execPath,
+      args: ["-e", 'require("fs").writeFileSync(process.env.SEAM_SESSIOND_RESUME_FILE, "{}"); setInterval(() => {}, 1000)'],
+      cwd: process.cwd(), env: { PATH: process.env.PATH ?? "" } });
+    const record = path.join(root, "resume", "32.json");
+    await waitForAsync(async () => fs.access(record).then(() => true, () => undefined));
+    const state = JSON.parse(await fs.readFile(statePath, "utf8")) as { slots: Array<{ slot: number; identity: { pgid: number } }> };
+    process.kill(-state.slots.find((row) => row.slot === 32)!.identity.pgid, "SIGKILL");
+    await waitForAsync(async () => (await listedDead(client, 32)) || undefined);
+    await waitForAsync(async () => fs.access(record).then(() => undefined, () => true));
+  });
+
+  it("forgets slots that ended more than a day ago (#631)", async () => {
+    const { server, client } = await harness();
+    await client.spawn({ slot: 33, executable: process.execPath, args: ["-e", "process.exit(0)"],
+      cwd: process.cwd(), env: { PATH: process.env.PATH ?? "" } });
+    await waitForAsync(async () => (await listedDead(client, 33)) || undefined);
+    const internals = server as unknown as { pruneExited(now: number): void };
+    internals.pruneExited(Date.now());
+    expect((await client.listSlots()).slots).toEqual([33]);
+    internals.pruneExited(Date.now() + 25 * 60 * 60_000);
+    expect((await client.listSlots()).slots).toEqual([]);
+  });
+
   it("never signals a persisted pid when its start identity does not match", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "seam-sessiond-test-"));
     await fs.chmod(root, 0o700);

@@ -1014,5 +1014,10 @@ export function makeMux(opts: {
     return !!bridgeWs && bridgeWs.readyState === WebSocket.OPEN;
   }
 
-  return { attach, spawn, adopt, sendCmd, rpc, sendFrame, helloAck, connected, releaseStdin };
+  /** Whether this controller has the slot bound (spawned or adopted). */
+  function isBound(slot: number): boolean {
+    return slots.has(slot);
+  }
+
+  return { attach, spawn, adopt, sendCmd, rpc, sendFrame, helloAck, connected, releaseStdin, isBound };
 }

@@ -27,6 +27,9 @@ process.env.AGY_ENABLED = "false";
 process.env.AGY_PACKAGE_ENABLED = "false";
 process.env.AGY_OLD_ROLLBACK_ENABLED = "false";
 process.env.AGY_NATIVE_RESTORE = "false";
+// A host running unpinned agy (AGY_PIN=unpinned) would resolve every fixture
+// to the bare `agy` on PATH instead of the fixture binary.
+delete process.env.AGY_PIN;
 // Catalog API access is networked but token-free. Non-live tests still must not
 // inherit the production credential; tests opt in with a synthetic fetch.
 delete process.env.CLAUDE_CATALOG_API_KEY;

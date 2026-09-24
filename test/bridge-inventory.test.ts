@@ -9,6 +9,7 @@ import {
   resolveCopilotHostLaunch,
 } from "../packages/bridge/src/inventory.js";
 import { createManagedAgyFixture } from "./helpers/agy-runtime-fixture.js";
+import { copilotProbeMcpArgs } from "../packages/adapters/src/profiles/copilot.js";
 
 describe("loadHostAdapters", () => {
   it("surfaces the legacy agy-on-PATH upgrade loss while keeping other adapters", () => {
@@ -128,7 +129,11 @@ describe("loadHostAdapters", () => {
       expect(candidate.scope.credentialProfile).toMatch(/^github-token-sha256:[a-f0-9]{64}$/);
       expect(candidate.scope.credentialProfile).not.toContain("remote-credential-token");
       const runtimeLaunch = resolveCopilotHostLaunch(command, "/remote/workspace");
-      expect(launch).toEqual(runtimeLaunch);
+      // The probe launches the runtime tuple with MCP servers off (#622).
+      expect(launch).toEqual({
+        ...runtimeLaunch,
+        args: [...runtimeLaunch.args, ...copilotProbeMcpArgs(undefined, runtimeLaunch.env)],
+      });
       expect(runtimeLaunch).toMatchObject({
           cliPath: "/configured/bin/copilot",
           args: ["--tenant", "enterprise", "--acp", "--remote-mode"],

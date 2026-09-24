@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { HelloFrame } from "@seam/adapters";
+import { CATALOG_FETCH_TIMEOUT_MS } from "@seam/adapters";
 import { verifyStagedReleaseCatalogRpcs } from "../packages/core/src/core/bridge-hub.js";
 
 function hello(overrides: Partial<HelloFrame["release"]> = {}): HelloFrame {
@@ -38,7 +39,7 @@ describe("staged bridge handshake verification (#241)", () => {
     )).resolves.toBe("grok");
     expect(rpc.mock.calls).toEqual([
       ["describeModelCatalog", {}, { agentId: "grok" }],
-      ["fetchModelCatalog", {}, { agentId: "grok" }],
+      ["fetchModelCatalog", {}, { agentId: "grok", timeoutMs: CATALOG_FETCH_TIMEOUT_MS }],
     ]);
   });
 

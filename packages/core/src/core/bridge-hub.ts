@@ -13,6 +13,7 @@ import {
   type HelloFrame,
   type WorkspaceInfo,
 } from "@seam/adapters";
+import { CATALOG_FETCH_TIMEOUT_MS } from "@seam/adapters";
 import type { SlotHealthFact } from "./warm-set/manager.js";
 import { buildSeamMcpServerEntry } from "./mcp/seam-mcp-server.js";
 import {
@@ -50,7 +51,7 @@ const RELEASE_INSTANCE = /^[A-Za-z0-9._-]{8,128}$/;
 export async function verifyStagedReleaseCatalogRpcs(
   hello: HelloFrame,
   agents: ReadonlyMap<string, { installed: boolean }>,
-  rpc: (method: string, params: unknown, options: { agentId: string }) => Promise<unknown>,
+  rpc: (method: string, params: unknown, options: { agentId: string; timeoutMs?: number }) => Promise<unknown>,
 ): Promise<string | null> {
   const release = hello.release;
   const startedAt = Date.parse(release?.startedAt ?? "");
@@ -79,7 +80,7 @@ export async function verifyStagedReleaseCatalogRpcs(
     !agents.get(release.verificationAgent)?.installed
   ) return null;
   await rpc("describeModelCatalog", {}, { agentId: release.verificationAgent });
-  await rpc("fetchModelCatalog", {}, { agentId: release.verificationAgent });
+  await rpc("fetchModelCatalog", {}, { agentId: release.verificationAgent, timeoutMs: CATALOG_FETCH_TIMEOUT_MS });
   return release.verificationAgent;
 }
 
@@ -331,12 +332,18 @@ export class BridgeHub {
     bridgeId: string,
     method: string,
     params: unknown,
-    agentId?: string
+    agentId?: string,
+    options: { timeoutMs?: number } = {}
   ): Promise<unknown> {
     const id = normalizeLocation(bridgeId);
     const conn = this.connections.get(id);
     if (!conn) throw new Error(`bridge "${id}" is not connected`);
-    return conn.mux.rpc(method, params, { agentId });
+    return conn.mux.rpc(method, params, { agentId, ...options });
+  }
+
+  /** Background catalog refresh; see CATALOG_FETCH_TIMEOUT_MS for the bound. */
+  async fetchModelCatalog(location: string, agentId: string): Promise<unknown> {
+    return this.rpc(location, "fetchModelCatalog", {}, agentId, { timeoutMs: CATALOG_FETCH_TIMEOUT_MS });
   }
 
   async listWorkspaces(location: string, agentId?: string): Promise<WorkspaceInfo[]> {

@@ -486,7 +486,7 @@ async function main(): Promise<void> {
     },
     fetch: async ({ agentId, location }): Promise<AdapterCatalogCandidate> => {
       if (!bridgeHub) throw new Error("bridge hub is not ready");
-      return await bridgeHub.rpc(location, "fetchModelCatalog", {}, agentId) as AdapterCatalogCandidate;
+      return await bridgeHub.fetchModelCatalog(location, agentId) as AdapterCatalogCandidate;
     },
   });
 

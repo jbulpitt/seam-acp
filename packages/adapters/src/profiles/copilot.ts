@@ -1,5 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import fs, { promises as fsp } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { Readable, Writable } from "node:stream";
 import Database from "better-sqlite3";
@@ -435,6 +436,25 @@ export async function probeCopilotCatalog(options: {
   }
 }
 
+/**
+ * Catalog probes only list models, so they start no MCP servers. Otherwise
+ * every probe process (one per model) launches the profile's MCP servers:
+ * 101s instead of 79s for a 30-model catalog, and a user server launched via
+ * `xvfb-run` leaked one orphaned X display per process (#622). Live sessions
+ * keep their MCP servers; only the probe launch changes.
+ */
+export function copilotProbeMcpArgs(configDir: string | undefined, env: NodeJS.ProcessEnv): string[] {
+  const dir = configDir ?? path.join(env.HOME?.trim() || os.homedir(), ".copilot");
+  let names: string[] = [];
+  try {
+    const config = JSON.parse(fs.readFileSync(path.join(dir, "mcp-config.json"), "utf8")) as { mcpServers?: Record<string, unknown> };
+    names = Object.keys(config.mcpServers ?? {});
+  } catch {
+    // No readable user MCP config: nothing of the user's to disable.
+  }
+  return ["--disable-builtin-mcps", ...names.flatMap((name) => ["--disable-mcp-server", name])];
+}
+
 /** Read the actual launch selection without claiming ACP acknowledged it (#4275). */
 export function copilotRequestedContextTier(args: readonly string[]): string | undefined {
   let tier: string | undefined;
@@ -520,11 +540,12 @@ export function makeCopilotProfile(opts: {
         credentialProfile,
       }),
       async fetch() {
+        const env = probeEnvironment();
         const catalogLaunch: CopilotCatalogLaunch = {
           cliPath: cli,
-          args: [...acpArgs],
+          args: [...acpArgs, ...copilotProbeMcpArgs(configDir, env)],
           cwd: runtimeCwd,
-          env: probeEnvironment(),
+          env,
         };
         const probe = opts.catalogProbe
           ? await opts.catalogProbe(catalogLaunch)

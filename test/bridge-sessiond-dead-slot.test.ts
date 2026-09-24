@@ -50,6 +50,10 @@ const CHILD = `
       if (frame.type !== "input") continue;
       const text = Buffer.from(frame.dataBase64, "base64").toString();
       if (text.includes("exit-now")) process.exit(0);
+      if (text.includes("recover-now")) {
+        send({ type: "recovery", recovery: { submissionId: "sub-1", acpSessionId: "acp-1", phase: "executing" } });
+        continue;
+      }
       send({ type: "data", data: "echo:" + text });
     }
   });
@@ -98,6 +102,20 @@ async function until(check: () => Promise<boolean> | boolean, what: string) {
   }
   throw new Error(`timed out waiting for ${what}`);
 }
+
+describe("#631 a killed slot has no recovery to adopt", () => {
+  it("stops reporting the recovery once the slot is killed", async () => {
+    const { socketPath, childPath } = await sessiond();
+    const only = await bridge(socketPath, childPath);
+    only.slots.configure(9, { agentId: "fixture" });
+    await expect(only.slots.writeInput(9, "recover-now\n")).resolves.toBe(true);
+    const recoveryOf = async () => (await only.slots.listSlots()).health
+      .find((entry) => entry.slot === 9) as { recovery?: unknown } | undefined;
+    await until(async () => (await recoveryOf())?.recovery !== undefined, "the recovery snapshot");
+    await only.slots.kill(9);
+    expect((await recoveryOf())?.recovery).toBeUndefined();
+  });
+});
 
 describe("#606 dead sessiond slots", () => {
   it("spawns a fresh child when a restarted bridge reuses a dead slot number", async () => {

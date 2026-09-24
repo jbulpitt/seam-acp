@@ -8,7 +8,6 @@ import { randomUUID } from "node:crypto";
 import {
   DispatchSuspendedError,
   inboundAttemptId,
-  type SettledPromptedBlock,
   type SettledUnstartedAttempt,
   type TurnAttempt,
 } from "../../core/dispatch/attempt-store.js";
@@ -1108,6 +1107,7 @@ export class Orchestrator {
    * Boot delivery reconciliation skips them so it cannot race the adopter's
    * nonce-backed first send; every other completed attempt still recovers. */
   private readonly adoptingRemoteResults = new Set<string>();
+  private readonly continuingLostTurns = new Set<string>();
   private readonly remoteAdoptionWaiters = new Map<string, () => void>();
   /** channelRef → the harness-stamped speaker id of the human turn CURRENTLY
    *  processing on that thread (#71/#57). Set at turn start when speaker identity
@@ -2469,12 +2469,7 @@ export class Orchestrator {
       }
       try {
         const result = await this.recoverChannel(channelRef, "auto", AUTO_RECOVERY_ACTOR);
-        if (result.settledPrompted) {
-          this.logger.warn(
-            { channelRef, reason: result.message },
-            "queue sweep: settled a prompted suspension; the interrupted prompt was not resent"
-          );
-        } else if (result.ok) {
+        if (result.ok) {
           recovered.push(channelRef);
           this.logger.warn(
             { channelRef, queued: health.queued, ageMs: health.ageMs,
@@ -3047,7 +3042,6 @@ export class Orchestrator {
     message: string;
     before: ChannelQueueHealth;
     epoch: number;
-    settledPrompted?: boolean;
   }> {
     const before = this.inspectChannelQueue(channelRef);
     const currentEpoch = this.queueEpoch(channelRef);
@@ -3075,11 +3069,6 @@ export class Orchestrator {
         message: "Refused: a legacy running admission has no frozen execution identity. Recovery cannot safely replay it." };
     }
 
-    // A prompted suspension ahead of never-started work is not reattached.
-    // Cancel it before recoverTarget, which would otherwise mark it ready
-    // and run it in front of the successor. owner_boot is not consulted.
-    const settled = this.store.turnAttempts.settleBlockedPromptedAttempts(channelRef);
-    this.noteSettledPromptedBlocks(settled);
     this.noteSettledUnstartedAttempts(
       this.store.turnAttempts.settleSupersededUnstartedAttempts(channelRef),
     );
@@ -3125,38 +3114,6 @@ export class Orchestrator {
       dispatches,
       priorState: before.state,
     };
-    // A prompted suspension is work that already ran. Fencing the channel
-    // queue does not finish it, and the pending handoffs behind it stay
-    // unclaimed. Calling that "recovered" is the false success (#428).
-    // Settling one is also not recovery: the successor has not run yet.
-    if (settled.length > 0) {
-      const pending = settled.reduce((n, row) => n + row.pendingIds.length, 0);
-      const summary = `Settled prompted suspension (${mode}); the interrupted prompt was not resent`;
-      this.store.recordConfigMutation({
-        id: `queue-recovery-${randomUUID()}`,
-        tier: "operator",
-        actorId: actor?.id ?? null,
-        actorName: actor?.name ?? null,
-        scope: `thread:${channelRef}`,
-        summary,
-        beforeJson: JSON.stringify(before),
-        afterJson: JSON.stringify({ ...detail, settled }),
-      });
-      this.logger.warn(
-        { ...detail, settled },
-        "channel queue fenced; prompted suspension settled without resending"
-      );
-      return {
-        ok: false,
-        settledPrompted: true,
-        before,
-        epoch,
-        message:
-          `Settled ${settled.map((row) => row.settledId).join(", ")} on <#${channelRef}> ` +
-          `without resending the interrupted prompt. ` +
-          `${pending} never-started dispatch${pending === 1 ? "" : "es"} remain pending.`,
-      };
-    }
     const block = this.promptedAttemptBlock(channelRef);
     const drained = block === null;
     this.store.recordConfigMutation({
@@ -15801,8 +15758,7 @@ export class Orchestrator {
       return true;
     }
     if (!snapshot) {
-      this.store.turnAttempts.markStalled(attempt.id,
-        "delegated remote recovery slot/submission no longer matches the bridge snapshot; original prompt was not replayed");
+      this.continueLostRemoteTurn(attempt, "the bridge no longer holds this turn's slot");
       return true;
     }
 
@@ -15810,8 +15766,7 @@ export class Orchestrator {
     try {
       child = mux.adopt(binding.slot);
     } catch (err) {
-      this.logger.warn({ err, attempt: attempt.id, slot: binding.slot },
-        "remote recovery slot could not be rebound; attempt retained");
+      this.continueLostRemoteTurn(attempt, `the slot could not be re-bound (${err instanceof Error ? err.message : String(err)})`);
       return true;
     }
     this.remoteAdoptionWaiters.get(attempt.id)?.();
@@ -15825,6 +15780,12 @@ export class Orchestrator {
       if (!current || current.state !== "suspended"
         || current.generation !== attempt.generation
         || current.remoteRecovery?.submissionId !== binding.submissionId) return;
+      if (result.status === "failed" && result.errorKind === "connection_closed") {
+        // The agent process died mid-turn. Its session is intact on disk.
+        try { child.kill(); } catch { /* already gone */ }
+        this.continueLostRemoteTurn(current, "the agent process exited before the turn finished");
+        return;
+      }
       const failed = result.status === "failed";
       // A substitution selected before restart must still be visible when the
       // result is adopted without an AgentRuntime/event handler. Use the notice
@@ -15895,12 +15856,49 @@ export class Orchestrator {
     });
     child.on("error", (err) => {
       this.adoptingRemoteResults.delete(attempt.id);
-      this.logger.warn({ err, attempt: attempt.id }, "remote recovery replay failed; attempt retained");
+      this.continueLostRemoteTurn(attempt, `replay from the bridge failed (${err instanceof Error ? err.message : String(err)})`);
+    });
+    child.on("exit", () => {
+      // An exit with no result frame: the owner died with the turn unfinished.
+      setImmediate(() => {
+        if (this.store.turnAttempts.get(attempt.id)?.remoteRecovery) {
+          this.adoptingRemoteResults.delete(attempt.id);
+          this.continueLostRemoteTurn(attempt, "the slot exited without a result");
+        }
+      });
     });
     this.logger.info({ attempt: attempt.id, location: binding.location, slot: binding.slot,
       phase: snapshot.recovery.phase, retry: snapshot.recovery.retry },
     "rebound controller to bridge-owned rung-1 recovery");
     return true;
+  }
+
+  /**
+   * The bridge can no longer produce this turn's result. The conversation is
+   * intact in its ACP session, so continue it there like any other
+   * interrupted turn (#631): the turn is never left waiting on a dead owner.
+   */
+  private continueLostRemoteTurn(attempt: TurnAttempt, cause: string): void {
+    const binding = attempt.remoteRecovery;
+    if (!binding || this.continuingLostTurns.has(attempt.id)) return;
+    this.continuingLostTurns.add(attempt.id);
+    const mux = this.bridgeHub?.muxFor(binding.location);
+    // Never run two processes on one session: stop the old slot if it lingers.
+    void mux?.sendCmd("listSlots", {}).then((reply) => {
+      const alive = ((reply as { health?: Array<{ slot?: unknown; alive?: unknown }> }).health ?? [])
+        .some((row) => row.slot === binding.slot && row.alive === true);
+      if (alive) mux.sendFrame({ slot: binding.slot, type: "kill" });
+    }).catch(() => {});
+    this.logger.warn({ attempt: attempt.id, location: binding.location, slot: binding.slot, cause },
+      "delegated turn lost its bridge owner; continuing it in its recorded session");
+    if (!this.store.turnAttempts.releaseLostRemoteRecovery(attempt, binding)) {
+      this.continuingLostTurns.delete(attempt.id);
+      return;
+    }
+    void this.resumeTurnManually(attempt.id)
+      .then((message) => this.logger.info({ attempt: attempt.id, message }, "lost remote turn continuation requested"))
+      .catch((err) => this.logger.error({ err, attempt: attempt.id }, "lost remote turn continuation failed"))
+      .finally(() => this.continuingLostTurns.delete(attempt.id));
   }
 
   private deferRemoteRecoveryAdoption(attempt: TurnAttempt): void {
@@ -15999,7 +15997,6 @@ export class Orchestrator {
       // Successors already admitted must not wait behind a reattach of work
       // that has already been prompted. Reattach stays available when nothing
       // never-started is waiting.
-      this.noteSettledPromptedBlocks(this.store.turnAttempts.settleBlockedPromptedAttempts());
       this.noteSettledUnstartedAttempts(this.store.turnAttempts.settleSupersededUnstartedAttempts());
       for (const spec of await this.dispatchWatcher.listStaleRunning()) {
         const owned = this.store.turnAttempts.get(spec.id);
@@ -16287,22 +16284,6 @@ export class Orchestrator {
       this.logger.warn(
         { target: row.target, settledId: row.settledId, laterId: row.laterId },
         "dispatch: settled an active attempt that never started a prompt",
-      );
-    }
-  }
-
-  /** Tell the thread that an interrupted prompt was not sent again. */
-  noteSettledPromptedBlocks(settled: readonly SettledPromptedBlock[]): void {
-    for (const row of settled) {
-      const n = row.pendingIds.length;
-      this.logger.warn(
-        { target: row.target, settledId: row.settledId, pendingIds: row.pendingIds },
-        "dispatch: settled prompted suspension so never-started work can run",
-      );
-      void this.postResumeNotice(
-        row.target,
-        `⏸️ Settled interrupted dispatch \`${row.settledId}\` without resending its prompt. ` +
-          `${n} never-started dispatch${n === 1 ? "" : "es"} on this thread can run.`,
       );
     }
   }

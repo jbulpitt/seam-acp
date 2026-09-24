@@ -193,7 +193,8 @@ export class SupervisedSlots {
       ...listed,
       health: listed.health.map((entry) => ({
         ...entry,
-        ...(this.recoveries.has(entry.slot)
+        // Only a slot this bridge can replay has a recovery to adopt.
+        ...(this.recoveries.has(entry.slot) && this.bindings.has(entry.slot)
           ? { recovery: this.recoveries.get(entry.slot) }
           : {}),
       })) as SessiondListSlotsResult["health"],
@@ -284,6 +285,7 @@ export class SupervisedSlots {
       } finally {
         this.bindings.delete(slot);
         this.configs.delete(slot);
+        this.recoveries.delete(slot);
       }
     });
   }

@@ -13,6 +13,8 @@ const runtimeState = vi.hoisted(() => ({
     busy: boolean;
     lastActivityAtMs: number;
     disposed: boolean;
+    detached: boolean;
+    delegated: boolean;
     disposeWait?: Promise<void>;
     loadCalls: Array<{ sessionId: string }>;
     newCalls: number;
@@ -39,6 +41,10 @@ vi.mock("../packages/core/src/agents/agent-runtime.js", async (importOriginal) =
       effortOverride?: string;
       async start(): Promise<void> {}
       supportsSessionLoad(): boolean { return true; }
+      delegated = false;
+      detached = false;
+      hasDelegatedTurnInFlight(): boolean { return this.delegated; }
+      async detach(): Promise<void> { this.detached = true; }
       markActivity(): void {
         this.lastActivityAtMs = Date.now();
       }
@@ -114,6 +120,22 @@ function makeRouter(record: SessionRecord): SessionRouter {
 beforeEach(() => {
   runtimeState.instances.length = 0;
   runtimeState.failLoad = false;
+});
+
+describe("SessionRouter shutdown (#631)", () => {
+  it("leaves a delegated in-flight turn running and disposes idle runtimes", async () => {
+    const running = makeRecord();
+    const idle = { ...makeRecord(), id: "discord:idle-2", channelRef: "idle-2", acpSessionId: "acp-durable-2" };
+    const store = makeStore(running);
+    const router = makeRouter(running);
+    await router.getOrStartRuntime(running);
+    (router as unknown as { store: SessionStore }).store = { ...store, get: () => ({ ...idle }) } as unknown as SessionStore;
+    await router.getOrStartRuntime(idle);
+    runtimeState.instances[0]!.delegated = true;
+    await router.disposeAll();
+    expect(runtimeState.instances[0]).toMatchObject({ detached: true, disposed: false });
+    expect(runtimeState.instances[1]).toMatchObject({ detached: false, disposed: true });
+  });
 });
 
 describe("SessionRouter idle runtime reaping", () => {

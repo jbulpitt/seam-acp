@@ -75,6 +75,23 @@ async function reconnect(ws: FakeWs, liveSlots: number[]) {
   await flush();
 }
 
+describe("#631 controller restarts never end a running slot", () => {
+  it("detach releases the binding without telling the bridge to kill", async () => {
+    const { ws, child } = harness();
+    (child as unknown as { detach(): void }).detach();
+    await flush();
+    expect(ws.sent.filter((frame) => frame.type === "kill")).toEqual([]);
+    child.kill();
+    expect(ws.sent.filter((frame) => frame.type === "kill")).toEqual([]);
+  });
+
+  it("allocates slot ids that a later controller cannot reuse", async () => {
+    const before = Date.now();
+    const { child } = harness();
+    expect(child.slot).toBeGreaterThanOrEqual(before);
+  });
+});
+
 describe("#444 the cursor is what survives a disconnect", () => {
   it("#467 rebinds an existing slot and replays its exact recovery result without input", async () => {
     const ws = new FakeWs();

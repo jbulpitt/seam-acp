@@ -241,6 +241,9 @@ export type MuxChild = ChildProcessByStdio<NodeWritable, NodeReadable, NodeReada
   readonly slot: number;
   /** Set immediately before the remote exit event is emitted. */
   remoteExit?: RemoteExitEvidence;
+  /** Release this controller's binding and leave the agent running on the
+   *  bridge. A later controller re-attaches through the slot id. */
+  detach(): void;
 };
 
 type FakeProcess = EventEmitter & {
@@ -252,6 +255,7 @@ type FakeProcess = EventEmitter & {
   signalCode: NodeJS.Signals | null;
   remoteExit?: RemoteExitEvidence;
   kill(): void;
+  detach(): void;
 };
 
 function remoteHostOom(value: unknown): RemoteHostOomEvidence | undefined {
@@ -329,7 +333,11 @@ export function makeMux(opts: {
 }) {
   let bridgeWs: WebSocket | null = null;
   let lastBridgeInstanceId: string | undefined;
-  let nextSlot = 0;
+  // Slot ids must never repeat across controller restarts: the bridge keeps
+  // running slots from the previous controller, and a reused id would bind a
+  // new session to an old agent process. Seeding from the clock makes each
+  // boot's range disjoint without persisting a counter.
+  let nextSlot = Date.now();
   const slots = new Map<number, SlotEntry>();
   /** Timeout handles for spawn() calls waiting for the bridge to come online. */
   const bridgeWaiters: Array<{ slot: number; timeout: ReturnType<typeof setTimeout> }> = [];
@@ -787,6 +795,15 @@ export function makeMux(opts: {
         if (entry) entry.killed = true;
         slots.delete(slot);
         send({ slot, type: "kill" });
+        stdinPT.destroy();
+        stdoutPT.push(null);
+      },
+      detach() {
+        if (killed) return;
+        killed = true;
+        const entry = slots.get(slot);
+        if (entry) entry.killed = true;
+        slots.delete(slot);
         stdinPT.destroy();
         stdoutPT.push(null);
       },

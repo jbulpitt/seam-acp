@@ -1671,9 +1671,12 @@ export class SessionRouter {
     // Claim retirement synchronously before dispose yields. getOrStartRuntime
     // sees the barrier and cannot overlap a new process with the old one.
     this.runtimes.delete(sessionId);
+    // Shutdown never ends a running delegated turn: the bridge finishes it
+    // and the next controller adopts the result (#631).
+    const detach = reason === "shutdown" && rt.hasDelegatedTurnInFlight();
+    if (detach) this.logger.info({ sessionId }, "shutdown: leaving the in-flight turn running on its bridge");
     let retirement!: Promise<void>;
-    retirement = rt
-      .dispose()
+    retirement = (detach ? rt.detach() : rt.dispose())
       .catch((err) => {
         this.logger.warn({ err, sessionId, reason }, "runtime retirement failed");
       })

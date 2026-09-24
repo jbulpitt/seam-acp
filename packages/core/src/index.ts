@@ -6,6 +6,7 @@ import {
   hostEmoji,
   installAgentLocationDeny,
   isAgentLocationDenied,
+  withoutDeniedBindings,
   LOCAL_LOCATION,
   setAgentLocationDeny,
 } from "./core/location.js";
@@ -470,7 +471,9 @@ async function main(): Promise<void> {
           if (info.installed) bindings.push({ agentId, location: bridge.bridgeId });
         }
       }
-      return bindings;
+      // #622: the deny list must cover every source above, not only the
+      // local profile list — see `withoutDeniedBindings`.
+      return withoutDeniedBindings(bindings, config.AGENT_LOCATION_DENY);
     },
     isOnline: ({ location }) => Boolean(bridgeHub?.isBridgeReady(location)),
     source: (binding) => mainClaudeCatalogSource(binding, mainClaudeApiCatalogEnabled),

@@ -180,7 +180,8 @@ const Schema = z.object({
     }),
 
 
-  DEFAULT_AGENT: z.string().default("copilot"),
+  // Copilot is a seat licence enabled per host, not a default (#622).
+  DEFAULT_AGENT: z.string().default("claude"),
   DEFAULT_MODEL: z.string().default("gpt-5.4"),
   /** Copilot is licensed per-seat and may be entitled to one project only.
    * Set false to refuse it on EVERY host — including `copilot@fhr-server`.
@@ -238,7 +239,9 @@ const Schema = z.object({
   /** Path to the `claude-agent-acp` binary. Defaults to looking it up on PATH. */
   CLAUDE_CLI_PATH: z.string().optional(),
   /** Per-agent model override for the Claude profile. */
-  CLAUDE_DEFAULT_MODEL: z.string().default("claude-sonnet-4.5"),
+  // `default` is the alias the wrapper always advertises and resolves itself;
+  // a pinned id here goes stale (this one was claude-sonnet-4.5).
+  CLAUDE_DEFAULT_MODEL: z.string().default("default"),
   /**
    * Optional fixed extended-thinking budget, forwarded as the (deprecated)
    * `MAX_THINKING_TOKENS` env var. Default 0 = unset, which is what you want:

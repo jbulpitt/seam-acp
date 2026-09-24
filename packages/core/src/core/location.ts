@@ -259,6 +259,27 @@ export function isAgentLocationDenied(
   return deny.some((entry) => entry.agentId === id && entry.location === loc);
 }
 
+/**
+ * #622: apply `AGENT_LOCATION_DENY` to a list of bindings, whatever built it.
+ *
+ * Refuses exactly the denied `agentId@location` pairs; every other binding,
+ * including the same agent at another location, is kept. The model catalog
+ * filtered denied profiles out of its LOCAL list, then re-added them from two
+ * other sources — durable observations recorded before the deny, and the
+ * connected-bridge loop, where #593 made "local" a real bridge that still
+ * advertises the adapter. So a denied copilot@local was refreshed anyway:
+ * each refresh spawned `copilot --acp` on the local bridge, copilot started
+ * its xvfb-wrapped Playwright MCP, and the probe's kill orphaned the display —
+ * 86 spawns in two minutes after one restart. Filtering the final list closes
+ * every source at once, including any added later.
+ */
+export function withoutDeniedBindings<T extends { agentId: string; location: string }>(
+  bindings: readonly T[],
+  deny: readonly AgentLocationDeny[],
+): T[] {
+  return bindings.filter(({ agentId, location }) => !isAgentLocationDenied(agentId, location, deny));
+}
+
 export function assertAgentLocationAllowed(
   agentId: string,
   location: string | undefined | null,

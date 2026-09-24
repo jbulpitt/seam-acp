@@ -1340,7 +1340,7 @@ export class Orchestrator {
         described.location?.value ?? LOCAL_LOCATION
       );
     }
-    return this.cachedDefaultModel(this.config.DEFAULT_AGENT ?? "copilot", LOCAL_LOCATION);
+    return this.cachedDefaultModel(this.config.DEFAULT_AGENT ?? "claude", LOCAL_LOCATION);
   }
 
   private catalogModelForAutocomplete(ctx: AutocompleteContext, binding: CatalogBinding): string | null {

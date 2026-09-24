@@ -166,6 +166,11 @@ function start(config: AdapterChildBootstrap): void {
           error: error instanceof Error ? error.message : "recovery arm failed",
         });
       }
+    } else if (message.type === "report_recovery") {
+      const snapshot = recovery.snapshot(config.slot);
+      if (snapshot) publish({ v: ADAPTER_CHILD_PROTOCOL_VERSION, type: "recovery", recovery: snapshot });
+      const result = recovery.terminalResult(config.slot);
+      if (result) publish({ v: ADAPTER_CHILD_PROTOCOL_VERSION, type: "recovery_result", recoveryResult: result });
     } else if (message.type === "disarm_recovery") {
       publish({
         v: ADAPTER_CHILD_PROTOCOL_VERSION,

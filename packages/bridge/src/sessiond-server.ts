@@ -11,6 +11,7 @@ import {
   type SessiondListSlotsResult,
   type SessiondOutputFrame,
   type SessiondReplayOutputParams,
+  type SessiondAckParams,
   type SessiondReplayOutputResult,
   type SessiondRequest,
   type SessiondResponse,
@@ -160,6 +161,11 @@ function parseCursorParams(raw: unknown): SessiondSubscribeParams | SessiondRepl
     slot: safeInteger(value.slot, "slot"),
     afterSeq: safeInteger(value.afterSeq, "afterSeq"),
   };
+}
+
+function parseAckParams(raw: unknown): SessiondAckParams {
+  const value = plainRecord(raw);
+  return { slot: safeInteger(value.slot, "slot"), throughSeq: safeInteger(value.throughSeq, "throughSeq") };
 }
 
 const ALLOWED_SIGNALS = new Set<NodeJS.Signals>(["SIGTERM", "SIGKILL", "SIGINT", "SIGHUP"]);
@@ -437,6 +443,11 @@ export class SessiondServer {
       case "kill": return this.killSlot(parseKillParams(request.params));
       case "listSlots": return this.listSlots();
       case "replayOutput": return this.replayOutput(parseCursorParams(request.params));
+      case "ack": {
+        const params = parseAckParams(request.params);
+        this.outputLog.ack(params.slot, params.throughSeq);
+        return { slot: params.slot };
+      }
       default: throw new SessiondError("invalid_request", "unknown sessiond method");
     }
   }

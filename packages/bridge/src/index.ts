@@ -540,11 +540,12 @@ async function makeSlotManager(opts: {
         result = replay.result;
         activateReplay = replay.activate;
       } else if (action === "ackOutput") {
-        // Acks only ACCELERATE trimming. The age and byte bounds are what
-        // guarantee memory comes back, because an old seam-acp never acks and
-        // four of eight hosts cannot be updated to one that does.
-        // sessiond retention is bounded independently of acknowledgements.
-        // Keep accepting this old acceleration hint for wire compatibility.
+        // Unread output is retained until the controller reads it (#631).
+        const slot = Number(payload.slot);
+        const throughSeq = Number(payload.throughSeq);
+        if (Number.isSafeInteger(slot) && Number.isSafeInteger(throughSeq)) {
+          await supervised.ack(slot, throughSeq);
+        }
         result = null;
       } else if (action === "writeAttachment") {
         result = await writeAttachment(payload.cwd, payload.filename, payload.base64);

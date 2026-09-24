@@ -57,31 +57,35 @@ export interface OutputLogReplay {
 export interface OutputLogOptions {
   /** Total retained bytes across all slots. */
   maxBytes?: number;
-  /** Frames older than this are dropped regardless of acknowledgment. */
+  /** Per-slot byte cap, so one noisy agent cannot evict every other slot. */
+  maxBytesPerSlot?: number;
+  /** How long a frame the consumer has already read stays replayable. */
   maxAgeMs?: number;
-  /** Per-slot cap, so one noisy agent cannot evict every other slot. */
+  /** How long a frame nobody has read yet is kept. */
+  maxUnackedAgeMs?: number;
+  /** Per-slot frame cap. */
   maxFramesPerSlot?: number;
 }
 
 /**
- * Defaults sized for "minutes, then fall back to the transcript". 8 MiB across
- * all slots and 5 minutes; a slot is additionally capped at 4,000 frames so a
- * single chatty agent cannot consume the whole budget and silently evict the
- * others' replay windows.
- *
- * The window is measured rather than guessed. Every bridge outage on
- * `fhr-server` over the fourteen days to 2026-09-20 — nine of them — lasted
- * 5, 5, 5, 5, 5, 6, 10, 10 or 16 seconds. Five minutes covers the worst
- * observed case about nineteen times over, so the age bound should essentially
- * never be what truncates a real reconnect; it is there to bound memory when
- * an old seam-acp never acks, not to ration a healthy one.
+ * Output nobody has read yet is kept until it is read (#631): a controller
+ * restart, a bridge restart, or a network outage of up to 15 minutes must not
+ * lose any of a running turn's stream. The caps below are the safety net for
+ * a consumer that never comes back, not a replay window. Frames that have
+ * been read stay replayable for five minutes, which is what a bridge restart
+ * uses to rebuild its recovery records.
  */
-const DEFAULT_MAX_BYTES = 8 * 1024 * 1024;
+const DEFAULT_MAX_BYTES = 256 * 1024 * 1024;
+const DEFAULT_MAX_BYTES_PER_SLOT = 64 * 1024 * 1024;
 const DEFAULT_MAX_AGE_MS = 5 * 60_000;
-const DEFAULT_MAX_FRAMES_PER_SLOT = 4_000;
+const DEFAULT_MAX_UNACKED_AGE_MS = 24 * 60 * 60_000;
+const DEFAULT_MAX_FRAMES_PER_SLOT = 1_000_000;
 
 interface SlotLog {
   frames: OutputLogFrame[];
+  bytes: number;
+  /** Highest seq the consumer has read. */
+  ackedThrough: number;
   /** Highest seq ever dropped, so a gap can be reported precisely. */
   droppedThrough: number;
   droppedCount: number;
@@ -90,7 +94,7 @@ interface SlotLog {
 export interface OutputLog {
   append(slot: number, type: string, payload: Record<string, unknown>, now?: number): number;
   since(slot: number, afterSeq: number, now?: number): OutputLogReplay;
-  ack(slot: number, throughSeq: number): void;
+  ack(slot: number, throughSeq: number, now?: number): void;
   dropSlot(slot: number): void;
   /** Diagnostics only. */
   stats(): { slots: number; frames: number; bytes: number };
@@ -98,7 +102,9 @@ export interface OutputLog {
 
 export function createOutputLog(options: OutputLogOptions = {}): OutputLog {
   const maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES;
+  const maxBytesPerSlot = options.maxBytesPerSlot ?? DEFAULT_MAX_BYTES_PER_SLOT;
   const maxAgeMs = options.maxAgeMs ?? DEFAULT_MAX_AGE_MS;
+  const maxUnackedAgeMs = options.maxUnackedAgeMs ?? DEFAULT_MAX_UNACKED_AGE_MS;
   const maxFramesPerSlot = options.maxFramesPerSlot ?? DEFAULT_MAX_FRAMES_PER_SLOT;
 
   const logs = new Map<number, SlotLog>();
@@ -110,7 +116,7 @@ export function createOutputLog(options: OutputLogOptions = {}): OutputLog {
   function slotLog(slot: number): SlotLog {
     let log = logs.get(slot);
     if (!log) {
-      log = { frames: [], droppedThrough: 0, droppedCount: 0 };
+      log = { frames: [], bytes: 0, ackedThrough: 0, droppedThrough: 0, droppedCount: 0 };
       logs.set(slot, log);
     }
     return log;
@@ -120,19 +126,23 @@ export function createOutputLog(options: OutputLogOptions = {}): OutputLog {
     const frame = log.frames.shift();
     if (!frame) return;
     totalBytes -= frame.bytes;
+    log.bytes -= frame.bytes;
     log.droppedThrough = Math.max(log.droppedThrough, frame.seq);
-    log.droppedCount += 1;
+    // Only unread frames count as lost output.
+    if (frame.seq > log.ackedThrough) log.droppedCount += 1;
+  }
+
+  function expired(log: SlotLog, frame: OutputLogFrame, now: number): boolean {
+    const age = now - frame.at;
+    return frame.seq <= log.ackedThrough ? age > maxAgeMs : age > maxUnackedAgeMs;
   }
 
   function enforceBounds(now: number): void {
-    // Age first: stale frames are worthless to a consumer that is minutes
-    // behind, and dropping them may make the byte bound moot.
     for (const log of logs.values()) {
-      while (log.frames.length && now - log.frames[0]!.at > maxAgeMs) dropFront(log);
-      while (log.frames.length > maxFramesPerSlot) dropFront(log);
+      while (log.frames.length && expired(log, log.frames[0]!, now)) dropFront(log);
+      while (log.frames.length > maxFramesPerSlot || log.bytes > maxBytesPerSlot) dropFront(log);
     }
-    // Then bytes, oldest-first across slots, so pressure is shared rather than
-    // falling entirely on whichever slot happens to be examined first.
+    // Then total bytes, oldest-first across slots, so pressure is shared.
     while (totalBytes > maxBytes) {
       let oldest: SlotLog | undefined;
       for (const log of logs.values()) {
@@ -151,6 +161,7 @@ export function createOutputLog(options: OutputLogOptions = {}): OutputLog {
       const log = slotLog(slot);
       const bytes = JSON.stringify(payload).length;
       log.frames.push({ seq, at: now, type, payload, bytes });
+      log.bytes += bytes;
       totalBytes += bytes;
       enforceBounds(now);
       return seq;
@@ -176,26 +187,13 @@ export function createOutputLog(options: OutputLogOptions = {}): OutputLog {
       return { frames };
     },
 
-    ack(slot, throughSeq) {
+    ack(slot, throughSeq, now = Date.now()) {
       const log = logs.get(slot);
       if (!log) return;
-      // Acks accelerate trimming; they are never the only thing that trims.
-      // An old seam-acp that never acks must still be bounded.
-      while (log.frames.length && log.frames[0]!.seq <= throughSeq) {
-        const frame = log.frames.shift()!;
-        totalBytes -= frame.bytes;
-        // These frames really are gone, so record it. Mutation testing caught
-        // the earlier version, which deliberately did NOT — on the theory that
-        // an acked frame can never be missed. That is only true for the
-        // consumer that acked: a cursor RESET back before `throughSeq` would
-        // have been handed the later frames with no indication that anything
-        // preceded them, which is the silent discontinuity this whole design
-        // exists to prevent.
-        //
-        // It costs nothing in the normal case, because that consumer's cursor
-        // is at or beyond `throughSeq` and `since()` compares against it.
-        log.droppedThrough = Math.max(log.droppedThrough, frame.seq);
-      }
+      // Reading a frame makes it eligible for the short replay window; it is
+      // not dropped at once, because a bridge restart replays recent frames.
+      log.ackedThrough = Math.max(log.ackedThrough, throughSeq);
+      enforceBounds(now);
     },
 
     dropSlot(slot) {

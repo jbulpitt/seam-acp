@@ -15,7 +15,8 @@ export type SessiondMethod =
   | "subscribe"
   | "kill"
   | "listSlots"
-  | "replayOutput";
+  | "replayOutput"
+  | "ack";
 
 export interface SessiondSpawnParams {
   slot: number;
@@ -50,6 +51,12 @@ export interface SessiondKillParams {
 export interface SessiondReplayOutputParams {
   slot: number;
   afterSeq: number;
+}
+
+/** The consumer has read this slot's output through `throughSeq`. */
+export interface SessiondAckParams {
+  slot: number;
+  throughSeq: number;
 }
 
 export interface SessiondRequest {

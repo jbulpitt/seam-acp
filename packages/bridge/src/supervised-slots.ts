@@ -159,16 +159,20 @@ export class SupervisedSlots {
         buffered: new Map(),
         ...(!health.alive || !health.attached ? { dead: true } : {}),
       });
-      const replay = await this.options.client.replayOutput({ slot: health.slot, afterSeq: 0 });
-      for (const retained of replay.frames) {
-        if (retained.stream === "stderr" && retained.dataBase64) {
-          this.options.onStderr(health.slot, Buffer.from(retained.dataBase64, "base64"));
-        }
-        const frame = outputFrame(retained);
-        if (frame?.type === "recovery" && frame.recovery) {
-          this.recoveries.set(health.slot, frame.recovery);
-        }
-      }
+      // Idle subscription: rebuilds stderr and recovery records from the
+      // retained log and keeps them current, without forwarding anything.
+      await this.options.client.subscribe({ slot: health.slot, afterSeq: 0 }, (event) => this.onEvent(health.slot, event));
+    }
+    // Read output expires from the log after a few minutes, so a long turn's
+    // recovery record may no longer be there. Ask each live child for it.
+    const live = listed.health.filter((health) => health.alive && health.attached);
+    await Promise.all(live.map((health) => this.writeControl(health.slot, {
+      v: ADAPTER_CHILD_PROTOCOL_VERSION,
+      type: "report_recovery",
+    }).catch(() => {})));
+    const deadline = Date.now() + 1_000;
+    while (Date.now() < deadline && live.some((health) => !this.recoveries.has(health.slot))) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
     }
     return listed;
   }
@@ -276,6 +280,12 @@ export class SupervisedSlots {
       }
       return await response as { disarmed: boolean };
     }) as Promise<{ disarmed: boolean }>;
+  }
+
+  /** The controller has read this slot's output through `throughSeq`. */
+  async ack(slot: number, throughSeq: number): Promise<void> {
+    // A sessiond from before #631 has no ack method; its time bound still applies.
+    await this.options.client.ack({ slot, throughSeq }).catch(() => {});
   }
 
   async kill(slot: number): Promise<void> {

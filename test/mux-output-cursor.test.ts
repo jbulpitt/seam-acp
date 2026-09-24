@@ -85,6 +85,21 @@ describe("#631 controller restarts never end a running slot", () => {
     expect(ws.sent.filter((frame) => frame.type === "kill")).toEqual([]);
   });
 
+  it("acknowledges live output it has read, so the bridge can release it", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout"] });
+    try {
+      const { ws, child, chunks } = harness();
+      ws.deliver({ slot: child.slot, type: "data", data: "a\n", seq: 1 });
+      ws.deliver({ slot: child.slot, type: "data", data: "b\n", seq: 2 });
+      expect(chunks.join("")).toBe("a\nb\n");
+      expect(ws.cmds("ackOutput")).toEqual([]);
+      vi.advanceTimersByTime(2_000);
+      expect(ws.cmds("ackOutput").map((cmd) => cmd.payload)).toEqual([{ slot: child.slot, throughSeq: 2 }]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("allocates slot ids that a later controller cannot reuse", async () => {
     const before = Date.now();
     const { child } = harness();

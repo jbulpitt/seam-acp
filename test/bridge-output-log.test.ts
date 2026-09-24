@@ -51,15 +51,17 @@ describe("#444 the log keeps output a disconnect used to destroy", () => {
 });
 
 describe("#444 trimming is bounded without any acknowledgment", () => {
-  it("drops by age even if the consumer never acks", () => {
-    // The mixed-version case: an old seam-acp never sends `ackOutput`.
-    const log = createOutputLog({ maxAgeMs: 1_000 });
+  it("keeps unread frames past the read window, then bounds them by the unread age (#631)", () => {
+    const log = createOutputLog({ maxAgeMs: 1_000, maxUnackedAgeMs: 10_000 });
     log.append(1, "data", frame(1), 0);
     log.append(1, "data", frame(2), 500);
     log.append(1, "data", frame(3), 2_000);
-    const replay = log.since(1, 0, 2_000);
-    expect(replay.frames.map((f) => f.seq)).toEqual([3]);
-    expect(replay.gap).toBeDefined();
+    const early = log.since(1, 0, 2_000);
+    expect(early.frames.map((f) => f.seq)).toEqual([1, 2, 3]);
+    expect(early.gap).toBeUndefined();
+    const late = log.since(1, 0, 10_800);
+    expect(late.frames.map((f) => f.seq)).toEqual([3]);
+    expect(late.gap).toBeDefined();
   });
 
   it("drops by bytes even if the consumer never acks", () => {
@@ -168,10 +170,10 @@ describe("#444 an acked-then-trimmed range is still a gap to a reset cursor", ()
     // Found by mutation. The first version treated acked frames as "can never
     // be missed", which holds only for the consumer that acked. A cursor that
     // resets to 0 has genuinely not seen 1-3, and they are gone.
-    const log = createOutputLog();
-    for (let i = 1; i <= 5; i += 1) log.append(1, "data", frame(i));
-    log.ack(1, 3);
-    const rewound = log.since(1, 0);
+    const log = createOutputLog({ maxAgeMs: 1_000 });
+    for (let i = 1; i <= 5; i += 1) log.append(1, "data", frame(i), 0);
+    log.ack(1, 3, 0);
+    const rewound = log.since(1, 0, 5_000);
     expect(rewound.gap).toMatchObject({ afterSeq: 0, firstAvailableSeq: 4 });
     expect(rewound.frames.map((f) => f.seq)).toEqual([4, 5]);
   });

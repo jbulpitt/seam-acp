@@ -15743,14 +15743,19 @@ export class Orchestrator {
     }
     let snapshot;
     try {
-      const reply = await mux.sendCmd("listSlots", {}) as { health?: unknown[] };
-      snapshot = (reply.health ?? []).find((entry: unknown) => {
-        if (!entry || typeof entry !== "object") return false;
-        const row = entry as { slot?: unknown; recovery?: unknown };
-        return row.slot === binding.slot && isRemoteRecoverySnapshot(row.recovery)
+      // A just-restarted bridge may still be collecting a live slot's recovery
+      // record; give a live slot a few seconds before calling its owner lost.
+      for (let check = 0; ; check += 1) {
+        const reply = await mux.sendCmd("listSlots", {}) as { health?: unknown[] };
+        const rows = (reply.health ?? []) as Array<{ slot?: unknown; alive?: unknown; recovery?: unknown }>;
+        snapshot = rows.find((row) => row && row.slot === binding.slot && isRemoteRecoverySnapshot(row.recovery)
           && row.recovery.submissionId === binding.submissionId
-          && row.recovery.acpSessionId === binding.acpSessionId;
-      }) as { recovery: import("@seam/adapters").RemoteRecoverySnapshot } | undefined;
+          && row.recovery.acpSessionId === binding.acpSessionId
+        ) as { recovery: import("@seam/adapters").RemoteRecoverySnapshot } | undefined;
+        const alive = rows.some((row) => row && row.slot === binding.slot && row.alive === true);
+        if (snapshot || !alive || check >= 5) break;
+        await new Promise((resolve) => setTimeout(resolve, 2_000));
+      }
     } catch (err) {
       this.deferRemoteRecoveryAdoption(attempt);
       this.logger.warn({ err, attempt: attempt.id, location: binding.location },

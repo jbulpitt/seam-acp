@@ -47,6 +47,10 @@ const CHILD = `
       const line = buffered.slice(0, newline);
       buffered = buffered.slice(newline + 1);
       const frame = JSON.parse(line);
+      if (frame.type === "report_recovery") {
+        send({ type: "recovery", recovery: { submissionId: "sub-r", acpSessionId: "acp-r", phase: "executing" } });
+        continue;
+      }
       if (frame.type !== "input") continue;
       const text = Buffer.from(frame.dataBase64, "base64").toString();
       if (text.includes("exit-now")) process.exit(0);
@@ -114,6 +118,21 @@ describe("#631 a killed slot has no recovery to adopt", () => {
     await until(async () => (await recoveryOf())?.recovery !== undefined, "the recovery snapshot");
     await only.slots.kill(9);
     expect((await recoveryOf())?.recovery).toBeUndefined();
+  });
+});
+
+describe("#631 a restarted bridge recovers live slots' recovery records", () => {
+  it("asks each live child for its current recovery state", async () => {
+    const { socketPath, childPath } = await sessiond();
+    const first = await bridge(socketPath, childPath);
+    first.slots.configure(11, { agentId: "fixture" });
+    await expect(first.slots.writeInput(11, "hello\n")).resolves.toBe(true);
+    first.client.close();
+
+    const second = await bridge(socketPath, childPath);
+    await second.slots.rebind();
+    const row = (await second.slots.listSlots()).health.find((entry) => entry.slot === 11) as { recovery?: unknown };
+    expect(row.recovery).toMatchObject({ submissionId: "sub-r" });
   });
 });
 

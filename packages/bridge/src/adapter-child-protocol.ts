@@ -36,6 +36,11 @@ export type AdapterChildInput =
       type: "disarm_recovery";
       requestId: string;
       submissionId: unknown;
+    }
+  | {
+      /** Re-publish the current recovery state; a restarted bridge asks. */
+      v: typeof ADAPTER_CHILD_PROTOCOL_VERSION;
+      type: "report_recovery";
     };
 
 export type AdapterChildOutput =

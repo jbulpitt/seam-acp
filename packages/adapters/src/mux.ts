@@ -726,6 +726,7 @@ export function makeMux(opts: {
       if (msg.slot === undefined) return;
       const entry = slots.get(msg.slot);
       if (!entry || entry.killed) return;
+      if (typeof msg.seq === "number") scheduleAck(msg.slot);
 
       if (msg.type === "data" && msg.data !== undefined) {
         // #444: advance only on frames that carry one. An old bridge sends no
@@ -942,6 +943,22 @@ export function makeMux(opts: {
 
       send({ type: "cmd", cmdId, action, payload });
     });
+  }
+
+  // The bridge keeps unread output until it is acknowledged (#631), so ack
+  // what this controller has read, at most every two seconds per slot.
+  const ackTimers = new Map<number, ReturnType<typeof setTimeout>>();
+  function scheduleAck(slot: number): void {
+    if (ackTimers.has(slot)) return;
+    const timer = setTimeout(() => {
+      ackTimers.delete(slot);
+      const through = outputCursor.get(slot);
+      if (through && bridgeWs?.readyState === WebSocket.OPEN) {
+        void sendCmd("ackOutput", { slot, throughSeq: through }).catch(() => {});
+      }
+    }, 2_000);
+    if (typeof timer.unref === "function") timer.unref();
+    ackTimers.set(slot, timer);
   }
 
   function sendFrame(msg: Record<string, unknown>): void {

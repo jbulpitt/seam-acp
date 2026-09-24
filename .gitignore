@@ -12,12 +12,9 @@ docs/*
 !docs/model-catalog.md
 !docs/dispatch-result-retention.md
 !docs/agent-guides/
-docs/agent-guides/*
-!docs/agent-guides/README.md
-!docs/agent-guides/interactive-ingest.md
-!docs/agent-guides/native-async-questions.md
-!docs/agent-guides/session-authority-manifesto.md
-!docs/agent-guides/session-authority-build-guide.md
+# Agent guides are tracked by default; these two are local-only.
+docs/agent-guides/helpdesk.md
+docs/agent-guides/klipy-gif-curation-prompt.md
 !docs/industry-watch/
 !docs/industry-watch/**
 .DS_Store

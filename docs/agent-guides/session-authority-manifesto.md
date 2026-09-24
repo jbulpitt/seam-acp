@@ -2,10 +2,8 @@
 
 Read this before touching anything under epic #439. It is short on purpose.
 
-This complements — does not replace — the two CRITICAL sections in `AGENTS.md`: the
-**blast-radius rule** (outcome ordering; never choose 4 when 3 exists, never choose 5)
-and the **#307 necessity rule** (ask whether a mechanism should exist, not only whether
-it works). Both apply here in full.
+This complements the defaults in `AGENTS.md` (*How we build here*) and the
+review guide (`docs/agent-guides/review-guide.md`). Both apply here in full.
 
 ## The thesis, in one paragraph
 
@@ -33,8 +31,9 @@ This was argued twice during design — first against automatic model fallback, 
 "preserve and report, don't guess" default on unknown errors — and both were wrong for
 the same reason: weighing the risk of acting without weighing the cost of not acting.
 
-**Always continue. Always surface. Every path ends still-trying or honestly-stopped,
-never silent.**
+**Always continue. Always surface. Every path ends still trying, never silent.** A
+process or connection that went away is reconnected, respawned, or waited for; it is
+not a reason to stop the turn (#631).
 
 ### 2. Do not name a bug as a state and then build machinery to manage it
 

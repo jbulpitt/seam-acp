@@ -690,6 +690,7 @@ export class SessiondServer {
     }
     if (!entry.exited) {
       // The holder died without reporting the child's exit (killed with it).
+      console.error(`[seam-sessiond] slot ${entry.slot} (pid ${entry.pid ?? "?"}) lost its holder without an exit report; the process group was killed from outside`);
       entry.exited = true;
       entry.exitCode = entry.exitCode ?? null;
       entry.signal = entry.signal ?? null;
@@ -733,6 +734,7 @@ export class SessiondServer {
       entry.exited = true;
       // This supervisor saw the slot end, so there is nothing to resume.
       this.dropResumeRecord(entry.slot);
+      console.error(`[seam-sessiond] slot ${entry.slot} (pid ${entry.pid ?? "?"}) exited: code ${frame.code ?? "none"}, signal ${frame.signal ?? "none"}`);
       entry.exitCode = frame.code ?? null;
       entry.signal = frame.signal ?? null;
       this.backpressured.delete(entry.slot);
@@ -918,7 +920,12 @@ export class SessiondServer {
     // #631: a slot holder outlived the previous sessiond. Reconnect and carry
     // on: the child, its stdio and its unread output are all still there.
     await Promise.all(held.map(async (entry) => {
-      if (!await this.connectHolder(entry, 3_000)) entry.orphanReason = "supervisor_restarted";
+      if (await this.connectHolder(entry, 3_000)) {
+        console.error(`[seam-sessiond] reattached slot ${entry.slot} (pid ${entry.pid ?? "?"}) after a sessiond restart`);
+      } else {
+        console.error(`[seam-sessiond] slot ${entry.slot}'s holder is running but unreachable; the slot cannot take input`);
+        entry.orphanReason = "supervisor_restarted";
+      }
     }));
 
     // Pre-holder children had their stdio in the old sessiond, so they lost
@@ -967,7 +974,7 @@ export class SessiondServer {
         const params = parseSpawnParams({ slot: record.slot, ...record.launch, initialStdinBase64: record.initialStdinBase64 });
         // Sequence numbers well past anything a consumer read before the restart.
         const { pid } = await this.spawnSlot(params, { firstSeq: Date.now() * 1000 });
-        console.error(`[seam-sessiond] relaunched slot ${params.slot} (pid ${pid}) to resume its interrupted turn`);
+        console.error(`[seam-sessiond] relaunched slot ${params.slot} (pid ${pid}) to resume the turn a host restart interrupted`);
       } catch (error) {
         const reason = error instanceof SessiondError ? error.message : "unreadable record";
         console.error(`[seam-sessiond] could not relaunch ${name}: ${reason}; kept as ${name}.failed`);

@@ -764,10 +764,7 @@ describe("live-turn re-fire + flag + preconditions", () => {
     });
     await orch.recoverInterruptedTurns();
     expect(inner).toHaveBeenCalledTimes(1);
-    expect(announced.some((t) =>
-      t.includes("resuming after restart") &&
-      t.includes("The process restarted while the turn was in flight.")
-    )).toBe(true);
+    expect(announced).toContain("🔌 Reconnected to session");
   });
 
   it("with SEAM_TURN_RESUME_ENABLED=false, markers are reconciled but nothing auto-resumes", async () => {

@@ -44,10 +44,8 @@ describe("recoveryStory", () => {
     expect(prompt).toContain("The attempt does not record that worktree or pull request.");
     expect(prompt).not.toContain("worktree path");
 
-    expect(note.startsWith("▶️ resuming after restart\n")).toBe(true);
-    expect(note).toContain("The process restarted while the turn was in flight.");
-    expect(note).toContain(`The default branch origin/main is currently ${SHA}.`);
-    expect(note).toContain(LEAD);
+    // The person sees one line; the situation is for the model (#631).
+    expect(note).toBe("🔌 Reconnected to session");
   });
 
   it("uses a stored stall reason and does not invent a worktree or a sha", () => {

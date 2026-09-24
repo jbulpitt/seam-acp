@@ -24,6 +24,10 @@ Key names only; values (the token) are never logged.
 | `ecosystem.config.cjs` | anywhere; pm2 hosts start both apps from it |
 
 sessiond runs as its own unit/app so agent children survive a bridge restart (#598).
+Each slot's child runs under its own slot holder, so restarting sessiond
+itself (to update it) leaves running turns alone: the new sessiond reconnects
+to every holder (#631). Its unit uses `KillMode=process` and the pm2 app
+`treekill: false` for that reason; keep them.
 
 ## Migrating a host
 

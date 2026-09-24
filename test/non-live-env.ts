@@ -1,4 +1,6 @@
 import os from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 // Deprioritise this worker against live agent turns.
 //
@@ -34,3 +36,7 @@ delete process.env.AGY_PIN;
 // inherit the production credential; tests opt in with a synthetic fetch.
 delete process.env.CLAUDE_CATALOG_API_KEY;
 delete process.env.CLAUDE_CATALOG_WORKSPACE_ID;
+
+// sessiond runs each slot's child under a slot holder (#631); in tests that
+// holder runs from source.
+process.env.SEAM_SLOT_HOLDER_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), "helpers/slot-holder-source.mjs");

@@ -92,7 +92,8 @@ interface SlotLog {
 }
 
 export interface OutputLog {
-  append(slot: number, type: string, payload: Record<string, unknown>, now?: number): number;
+  /** `seq` is the producer's own number when it assigns them (slot holder). */
+  append(slot: number, type: string, payload: Record<string, unknown>, now?: number, seq?: number): number;
   since(slot: number, afterSeq: number, now?: number): OutputLogReplay;
   ack(slot: number, throughSeq: number, now?: number): void;
   dropSlot(slot: number): void;
@@ -155,10 +156,16 @@ export function createOutputLog(options: OutputLogOptions = {}): OutputLog {
   }
 
   return {
-    append(slot, type, payload, now = Date.now()) {
-      const seq = (nextSeq.get(slot) ?? 0) + 1;
-      nextSeq.set(slot, seq);
+    append(slot, type, payload, now = Date.now(), given?: number) {
+      const expected = (nextSeq.get(slot) ?? 0) + 1;
+      const seq = given ?? expected;
       const log = slotLog(slot);
+      if (seq > expected) {
+        // The producer dropped these before they reached this log.
+        log.droppedThrough = Math.max(log.droppedThrough, seq - 1);
+        log.droppedCount += seq - expected;
+      }
+      nextSeq.set(slot, seq);
       const bytes = JSON.stringify(payload).length;
       log.frames.push({ seq, at: now, type, payload, bytes });
       log.bytes += bytes;

@@ -15,6 +15,8 @@ module.exports = {
       interpreter: "bash",
       cwd: home,
       restart_delay: 2000,
+      // Stop only sessiond; slots keep running under their holders (#631).
+      treekill: false,
     },
     {
       name: "seam-bridge",

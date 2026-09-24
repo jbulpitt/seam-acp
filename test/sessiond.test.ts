@@ -182,18 +182,19 @@ describe("#573 seam-sessiond control-plane restart", () => {
     expect(replay.gap!.droppedFrames).toBeGreaterThan(0);
   });
 
-  it("reaps an exactly identified orphan on supervisor restart and never calls it attached", async () => {
+  it("keeps a running slot through a supervisor restart and reattaches it fully (#631)", async () => {
     const { socketPath, statePath, server, client } = await harness();
     const { pid } = await client.spawn({
       slot: 11,
       executable: process.execPath,
-      args: ["-e", "setInterval(() => {}, 1000)"],
+      args: ["-e", 'process.stdin.on("data", (d) => process.stdout.write("echo:" + d))'],
       cwd: process.cwd(),
       env: { PATH: process.env.PATH ?? "" },
     });
     client.close();
-    await server.close({ terminateChildren: false });
+    await server.close();
     servers.splice(servers.indexOf(server), 1);
+    expect(() => process.kill(pid, 0)).not.toThrow();
 
     const successor = new SessiondServer({ socketPath, statePath });
     servers.push(successor);
@@ -201,17 +202,40 @@ describe("#573 seam-sessiond control-plane restart", () => {
     const replacement = await SessiondClient.connect(socketPath);
     clients.push(replacement);
     const listed = await replacement.listSlots();
-    expect(listed.slots).toEqual([11]);
     expect(listed.health).toEqual([
-      expect.objectContaining({
-        slot: 11,
-        alive: false,
-        pid,
-        attached: false,
-        orphanReason: "supervisor_restarted",
-      }),
+      expect.objectContaining({ slot: 11, alive: true, pid, attached: true }),
     ]);
-    expect(() => process.kill(pid, 0)).toThrow();
+    const events: SessiondEvent[] = [];
+    await replacement.subscribe({ slot: 11, afterSeq: 0 }, (event) => events.push(event));
+    await replacement.write(11, "after restart\n");
+    await waitFor(() => stdoutText(events).includes("echo:after restart") ? true : undefined);
+  });
+
+  it("loses no output produced while sessiond is down (#631)", async () => {
+    const { socketPath, statePath, server, client } = await harness();
+    await client.spawn({
+      slot: 13,
+      executable: process.execPath,
+      args: ["-e", 'let n = 0; const t = setInterval(() => { process.stdout.write("line " + (++n) + "\\n"); if (n === 20) { clearInterval(t); process.exit(0); } }, 25)'],
+      cwd: process.cwd(),
+      env: { PATH: process.env.PATH ?? "" },
+    });
+    client.close();
+    await server.close();
+    servers.splice(servers.indexOf(server), 1);
+    await delay(800);
+
+    const successor = new SessiondServer({ socketPath, statePath });
+    servers.push(successor);
+    await successor.start();
+    const replacement = await SessiondClient.connect(socketPath);
+    clients.push(replacement);
+    const events: SessiondEvent[] = [];
+    await replacement.subscribe({ slot: 13, afterSeq: 0 }, (event) => events.push(event));
+    await waitFor(() => events.some((event) => event.type === "output" && event.frame.stream === "exit") ? true : undefined);
+    expect(events.some((event) => event.type === "output_gap")).toBe(false);
+    const text = stdoutText(events);
+    for (let n = 1; n <= 20; n += 1) expect(text).toContain(`line ${n}\n`);
   });
 
   it("never signals a persisted pid when its start identity does not match", async () => {

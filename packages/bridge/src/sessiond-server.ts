@@ -1,9 +1,10 @@
-import { spawn, execFileSync, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { spawn, execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { promises as fs, readFileSync } from "node:fs";
+import { promises as fs, openSync, closeSync, readFileSync } from "node:fs";
 import net, { type Socket } from "node:net";
 import path from "node:path";
-import { createLineFramer, createOutputLog, type OutputLog, type OutputLogOptions } from "./output-log.js";
+import { fileURLToPath } from "node:url";
+import { createOutputLog, type OutputLog, type OutputLogOptions } from "./output-log.js";
 import {
   SESSIOND_PROTOCOL_VERSION,
   type SessiondEvent,
@@ -21,6 +22,12 @@ import {
   type SessiondWireMessage,
   type SessiondWriteParams,
 } from "./sessiond-protocol.js";
+import {
+  SLOT_HOLDER_PROTOCOL_VERSION,
+  type SlotHolderFrame,
+  type SlotHolderInput,
+  type SlotHolderOutput,
+} from "./slot-holder-protocol.js";
 
 const MAX_WIRE_BYTES = 12 * 1024 * 1024;
 const MAX_WRITE_BYTES = 8 * 1024 * 1024;
@@ -37,6 +44,8 @@ interface ProcessIdentity {
 interface PersistedSlot {
   slot: number;
   pid: number | null;
+  /** The slot holder's socket (#631). Absent for pre-holder records. */
+  socketPath?: string;
   identity?: ProcessIdentity;
   status: "live" | "dead";
   lastStdoutAt?: number;
@@ -52,16 +61,23 @@ interface PersistedState {
 
 interface SlotEntry {
   slot: number;
-  child?: ChildProcessWithoutNullStreams;
+  /** The supervised child's pid, as reported to clients. */
   pid: number | null;
+  /** The slot holder's identity: it owns the child and its stdio. */
   identity?: ProcessIdentity;
+  socketPath?: string;
+  link?: Socket;
+  /** True while this sessiond is connected to the slot's holder. */
   attached: boolean;
+  /** The holder reported the child's exit. */
+  exited?: boolean;
+  lastSeq: number;
+  replies: Map<string, (message: SlotHolderOutput) => void>;
   lastStdoutAt?: number;
   lastStdinAt?: number;
   exitCode?: number | null;
   signal?: NodeJS.Signals | null;
   orphanReason?: SessiondSlotHealth["orphanReason"];
-  stdoutFramer?: ReturnType<typeof createLineFramer>;
 }
 
 interface ConnectionState {
@@ -74,6 +90,17 @@ export interface SessiondServerOptions {
   socketPath: string;
   statePath: string;
   outputLog?: OutputLogOptions;
+  /** The slot holder entry point; tests run it from source. */
+  holderPath?: string;
+}
+
+function defaultHolderPath(): string {
+  return process.env.SEAM_SLOT_HOLDER_PATH
+    ?? fileURLToPath(new URL("./slot-holder.js", import.meta.url));
+}
+
+function holderMessage(message: SlotHolderInput): string {
+  return `${JSON.stringify(message)}\n`;
 }
 
 class SessiondError extends Error {
@@ -311,6 +338,7 @@ export class SessiondServer {
   private readonly backpressured = new Set<number>();
   private persistQueue: Promise<void> = Promise.resolve();
   private started = false;
+  private closing = false;
 
   constructor(private readonly options: SessiondServerOptions) {
     this.outputLog = createOutputLog(options.outputLog);
@@ -336,27 +364,26 @@ export class SessiondServer {
   }
 
   /**
-   * Stop only the control socket when `terminateChildren` is false. Production
-   * signals use true; false exists for crash/restart tests and leaves exactly
-   * the state a successor must recover. A client disconnect never calls this.
+   * Stop this supervisor. Slots keep running in their holders and the next
+   * sessiond reconnects to them (#631). `terminateChildren` ends every slot;
+   * only tests use it, to clean up.
    */
   async close(options: { terminateChildren?: boolean } = {}): Promise<void> {
     const ownedSocket = this.started;
+    this.closing = true;
     if (options.terminateChildren) {
-      const live = [...this.slots.values()].filter((entry) => entry.attached && this.entryAlive(entry));
-      for (const entry of this.slots.values()) {
-        if (entry.attached && this.entryAlive(entry)) entry.child?.kill("SIGTERM");
+      const live = [...this.slots.values()].filter((entry) => this.holderAlive(entry));
+      for (const entry of live) {
+        try { process.kill(-entry.identity!.pgid, "SIGTERM"); } catch { /* gone */ }
       }
       await Promise.all(live.map(async (entry) => {
-        const deadline = Date.now() + ORPHAN_TERM_GRACE_MS;
-        while (this.entryAlive(entry) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
-        if (this.entryAlive(entry)) {
-          entry.child?.kill("SIGKILL");
-          const killDeadline = Date.now() + ORPHAN_KILL_GRACE_MS;
-          while (this.entryAlive(entry) && Date.now() < killDeadline) await new Promise((resolve) => setTimeout(resolve, 10));
+        if (!await waitUntilGone(entry.identity!, ORPHAN_TERM_GRACE_MS)) {
+          try { process.kill(-entry.identity!.pgid, "SIGKILL"); } catch { /* gone */ }
+          await waitUntilGone(entry.identity!, ORPHAN_KILL_GRACE_MS);
         }
       }));
     }
+    for (const entry of this.slots.values()) entry.link?.destroy();
     for (const connection of this.connections) connection.socket.destroy();
     this.connections.clear();
     if (this.started) {
@@ -446,10 +473,17 @@ export class SessiondServer {
       case "ack": {
         const params = parseAckParams(request.params);
         this.outputLog.ack(params.slot, params.throughSeq);
+        // The holder keeps unread output across a sessiond restart; let it go.
+        const entry = this.slots.get(params.slot);
+        entry?.link?.write(holderMessage({ v: SLOT_HOLDER_PROTOCOL_VERSION, type: "ack", throughSeq: params.throughSeq }));
         return { slot: params.slot };
       }
       default: throw new SessiondError("invalid_request", "unknown sessiond method");
     }
+  }
+
+  private slotsDirectory(): string {
+    return path.join(path.dirname(this.options.socketPath), "slots");
   }
 
   private async spawnSlot(params: SessiondSpawnParams): Promise<{ slot: number; pid: number }> {
@@ -458,137 +492,243 @@ export class SessiondServer {
       throw new SessiondError("slot_exists", "spawn refused: slot already has a live process");
     }
     if (existing) {
+      // A finished holder may still be waiting to hand over the exit.
+      if (existing.identity && this.holderAlive(existing)) {
+        try { process.kill(existing.identity.pid, "SIGTERM"); } catch { /* gone */ }
+      }
+      existing.link?.destroy();
       this.slots.delete(params.slot);
       this.outputLog.dropSlot(params.slot);
     }
+    let initial: Buffer | undefined;
+    if (params.initialStdinBase64 !== undefined) {
+      initial = Buffer.from(params.initialStdinBase64, "base64");
+      if (initial.toString("base64") !== params.initialStdinBase64) {
+        throw new SessiondError("invalid_request", "spawn initialStdinBase64 is invalid");
+      }
+      if (initial.length > MAX_WRITE_BYTES) {
+        throw new SessiondError("invalid_request", "spawn initial stdin exceeds the 8 MiB limit");
+      }
+    }
 
-    let child: ChildProcessWithoutNullStreams;
+    // The holder owns the child's stdio so the child outlives this process.
+    // Its own output goes to a private per-slot log for diagnosis.
+    const directory = this.slotsDirectory();
+    await assertPrivateDirectory(directory);
+    const socketPath = path.join(directory, `${params.slot}-${randomUUID().slice(0, 8)}.sock`);
+    const logFd = openSync(path.join(directory, `${params.slot}.log`), "a", 0o600);
+    let holder;
     try {
-      child = spawn(params.executable, params.args ?? [], {
-        cwd: params.cwd,
-        env: params.env,
+      holder = spawn(process.execPath, [this.options.holderPath ?? defaultHolderPath(), socketPath], {
+        cwd: "/",
+        env: { PATH: process.env.PATH ?? "", HOME: process.env.HOME ?? "",
+          ...(process.env.SEAM_SLOT_HOLDER_PATH ? { SEAM_SLOT_HOLDER_PATH: process.env.SEAM_SLOT_HOLDER_PATH } : {}) },
         detached: true,
         shell: false,
-        stdio: ["pipe", "pipe", "pipe"],
+        stdio: ["ignore", logFd, logFd],
       });
     } catch (error) {
-      const cause = error as NodeJS.ErrnoException;
-      throw new SessiondError(
-        "spawn_failed",
-        "spawn failed before a child was created",
-        cause.code,
-        "spawn",
-      );
+      throw new SessiondError("spawn_failed", "spawn failed before a child was created",
+        (error as NodeJS.ErrnoException).code, "spawn");
+    } finally {
+      closeSync(logFd);
     }
-    // #583: ENOENT is asynchronous. Attach BOTH the permanent absorber and
-    // the typed admission listener synchronously, before the first await. The
-    // raw Node error contains path + spawnargs, so it must never escape this
-    // supervisor boundary; one failed slot is refused and all others run.
-    child.on("error", () => undefined);
-    const admitted = new Promise<void>((resolve, reject) => {
-      child.once("spawn", resolve);
-      child.once("error", (error: NodeJS.ErrnoException) => reject(new SessiondError(
-        "spawn_failed",
-        "spawn failed before the child became ready",
-        error.code,
-        "spawn",
-      )));
+    holder.on("error", () => undefined);
+    await new Promise<void>((resolve, reject) => {
+      holder.once("spawn", resolve);
+      holder.once("error", (error: NodeJS.ErrnoException) => reject(new SessiondError(
+        "spawn_failed", "spawn failed before the child became ready", error.code, "spawn")));
     });
-    try {
-      await admitted;
-    } catch (error) {
-      throw error;
-    }
-    const pid = child.pid;
-    if (!pid) {
-      child.kill("SIGKILL");
-      throw new SessiondError("spawn_failed", "spawn returned no child pid");
-    }
-    const identity = readSessiondProcessIdentity(pid);
-    if (!identity || identity.pgid !== pid) {
-      // Without a pid-reuse guard a successor could kill an unrelated process.
-      // Refuse only this spawn; the daemon and every other slot keep working.
-      child.kill("SIGKILL");
+    holder.unref();
+    const holderPid = holder.pid;
+    const identity = holderPid ? readSessiondProcessIdentity(holderPid) : undefined;
+    if (!holderPid || !identity || identity.pgid !== holderPid) {
+      // Without a pid-reuse guard a successor could signal an unrelated process.
+      if (holderPid) try { process.kill(-holderPid, "SIGKILL"); } catch { /* gone */ }
       throw new SessiondError("spawn_failed", "spawned child identity could not be verified");
     }
     const entry: SlotEntry = {
       slot: params.slot,
-      child,
-      pid,
+      pid: null,
       identity,
-      attached: true,
-      stdoutFramer: createLineFramer(),
+      socketPath,
+      attached: false,
+      lastSeq: 0,
+      replies: new Map(),
     };
     this.slots.set(params.slot, entry);
-    this.attachChild(entry, child);
-    if (params.initialStdinBase64 !== undefined) {
-      let initial: Buffer;
-      try {
-        initial = Buffer.from(params.initialStdinBase64, "base64");
-        if (initial.toString("base64") !== params.initialStdinBase64) throw new Error("invalid base64");
-      } catch {
-        child.kill("SIGKILL");
-        throw new SessiondError("invalid_request", "spawn initialStdinBase64 is invalid");
-      }
-      if (initial.length > MAX_WRITE_BYTES) {
-        child.kill("SIGKILL");
-        throw new SessiondError("invalid_request", "spawn initial stdin exceeds the 8 MiB limit");
-      }
-      try {
-        child.stdin.write(initial);
-      } catch {
-        child.kill("SIGKILL");
-        throw new SessiondError("write_failed", "spawn bootstrap failed before bytes were accepted");
-      }
+    const abandon = (error: SessiondError): never => {
+      try { process.kill(-identity.pgid, "SIGKILL"); } catch { /* gone */ }
+      entry.link?.destroy();
+      this.slots.delete(params.slot);
+      throw error;
+    };
+    if (!await this.connectHolder(entry, 5_000)) {
+      abandon(new SessiondError("spawn_failed", "the slot holder did not start"));
+    }
+    const result = await this.holderRequest(entry, "spawn_result", {
+      v: SLOT_HOLDER_PROTOCOL_VERSION,
+      type: "spawn",
+      executable: params.executable,
+      args: params.args ?? [],
+      cwd: params.cwd,
+      env: params.env,
+    }).catch(() => undefined);
+    if (!result || result.type !== "spawn_result" || !result.ok || !result.pid) {
+      const code = result?.type === "spawn_result" ? result.code : undefined;
+      abandon(new SessiondError("spawn_failed", "spawn failed before the child became ready", code, "spawn"));
+    }
+    entry.pid = (result as { pid: number }).pid;
+    if (initial) {
+      const written = await this.holderWrite(entry, initial).catch(() => false);
+      if (!written) abandon(new SessiondError("write_failed", "spawn bootstrap failed before bytes were accepted"));
     }
     await this.persist();
-    return { slot: params.slot, pid };
+    return { slot: params.slot, pid: entry.pid! };
   }
 
-  private attachChild(entry: SlotEntry, child: ChildProcessWithoutNullStreams): void {
-    child.stdout.on("data", (chunk: Buffer) => {
-      entry.lastStdoutAt = Date.now();
-      for (const line of entry.stdoutFramer?.push(chunk.toString()) ?? []) {
-        this.publish(entry.slot, "stdout", { dataBase64: Buffer.from(line).toString("base64") }, entry.lastStdoutAt);
+  /** Connect (or reconnect) to a slot's holder and resume its stream. */
+  private async connectHolder(entry: SlotEntry, timeoutMs: number): Promise<boolean> {
+    const socketPath = entry.socketPath;
+    if (!socketPath) return false;
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      const socket = await new Promise<Socket | undefined>((resolve) => {
+        const attempt = net.createConnection(socketPath);
+        attempt.once("connect", () => resolve(attempt));
+        attempt.once("error", () => { attempt.destroy(); resolve(undefined); });
+      });
+      if (socket) {
+        this.bindHolderSocket(entry, socket);
+        const ack = await this.holderRequest(entry, "hello_ack",
+          { v: SLOT_HOLDER_PROTOCOL_VERSION, type: "hello", afterSeq: entry.lastSeq }).catch(() => undefined);
+        if (ack?.type === "hello_ack") {
+          if (ack.pid) entry.pid = ack.pid;
+          entry.attached = true;
+          entry.orphanReason = undefined;
+          return true;
+        }
+        socket.destroy();
+      }
+      if (Date.now() >= deadline || !this.holderAlive(entry)) return false;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  }
+
+  private bindHolderSocket(entry: SlotEntry, socket: Socket): void {
+    entry.link?.destroy();
+    entry.link = socket;
+    let input = "";
+    socket.on("data", (chunk: Buffer) => {
+      input += chunk.toString();
+      let newline: number;
+      while ((newline = input.indexOf("\n")) !== -1) {
+        const line = input.slice(0, newline);
+        input = input.slice(newline + 1);
+        let message: SlotHolderOutput;
+        try {
+          message = JSON.parse(line) as SlotHolderOutput;
+        } catch {
+          continue;
+        }
+        if (message.type === "frame") this.onHolderFrame(entry, message.frame);
+        else {
+          const key = message.type === "write_result" ? `write:${message.id}` : message.type;
+          const reply = entry.replies.get(key);
+          if (reply) {
+            entry.replies.delete(key);
+            reply(message);
+          }
+        }
       }
     });
-    // The supervisor must drain fd 2 even while no control plane is attached;
-    // otherwise a full pipe blocks the child and manufactures a hang.
-    child.stderr.on("data", (chunk: Buffer) => {
-      this.publish(entry.slot, "stderr", { dataBase64: chunk.toString("base64") });
-    });
-    child.on("error", () => {
-      // The exit event is the authoritative terminal record when it follows.
-      // If it does not, retain a dead entry rather than leaking raw OS detail.
-      if (this.entryAlive(entry)) return;
-      entry.exitCode = child.exitCode;
-      entry.signal = child.signalCode as NodeJS.Signals | null;
-      void this.persist().catch(() => undefined);
-    });
-    child.on("exit", (code, signal) => {
-      const tail = entry.stdoutFramer?.flush();
-      if (tail) this.publish(entry.slot, "stdout", { dataBase64: Buffer.from(tail).toString("base64") });
-      entry.exitCode = code;
-      entry.signal = signal as NodeJS.Signals | null;
-      this.backpressured.delete(entry.slot);
-      this.publish(entry.slot, "exit", { code, signal });
-      void this.persist().catch(() => undefined);
+    socket.on("error", () => undefined);
+    socket.on("drain", () => this.backpressured.delete(entry.slot));
+    socket.on("close", () => {
+      if (entry.link !== socket) return;
+      entry.link = undefined;
+      entry.attached = false;
+      for (const reply of entry.replies.values()) reply({ v: SLOT_HOLDER_PROTOCOL_VERSION, type: "write_result", id: "", ok: false });
+      entry.replies.clear();
+      void this.afterHolderLoss(entry);
     });
   }
 
-  private publish(slot: number, stream: SessiondOutputFrame["stream"], payload: Record<string, unknown>, now = Date.now()): void {
-    const seq = this.outputLog.append(slot, stream, payload, now);
-    const frame = outputFrame({ seq, at: now, type: stream, payload });
-    const event: SessiondEvent = { v: SESSIOND_PROTOCOL_VERSION, type: "output", slot, frame, replay: false };
+  /** The link dropped. A live holder is reconnected; a gone one is a dead slot. */
+  private async afterHolderLoss(entry: SlotEntry): Promise<void> {
+    if (this.closing || this.slots.get(entry.slot) !== entry) return;
+    if (this.holderAlive(entry)) {
+      if (await this.connectHolder(entry, 10_000)) return;
+    }
+    if (!entry.exited) {
+      // The holder died without reporting the child's exit (killed with it).
+      entry.exited = true;
+      entry.exitCode = entry.exitCode ?? null;
+      entry.signal = entry.signal ?? null;
+      this.publish(entry.slot, { seq: entry.lastSeq + 1, at: Date.now(), stream: "exit", code: null, signal: null });
+    }
+    void this.persist().catch(() => undefined);
+  }
+
+  private holderRequest(entry: SlotEntry, replyType: string, message: SlotHolderInput): Promise<SlotHolderOutput> {
+    return new Promise((resolve, reject) => {
+      if (!entry.link || entry.link.destroyed) {
+        reject(new Error("slot holder is not connected"));
+        return;
+      }
+      const timer = setTimeout(() => {
+        entry.replies.delete(replyType);
+        reject(new Error("slot holder did not answer"));
+      }, 10_000);
+      timer.unref();
+      entry.replies.set(replyType, (reply) => {
+        clearTimeout(timer);
+        resolve(reply);
+      });
+      if (!entry.link.write(holderMessage(message))) this.backpressured.add(entry.slot);
+    });
+  }
+
+  private async holderWrite(entry: SlotEntry, data: Buffer): Promise<boolean> {
+    const id = randomUUID();
+    const reply = await this.holderRequest(entry, `write:${id}`, {
+      v: SLOT_HOLDER_PROTOCOL_VERSION, type: "write", id, dataBase64: data.toString("base64"),
+    });
+    return reply.type === "write_result" && reply.ok;
+  }
+
+  private onHolderFrame(entry: SlotEntry, frame: SlotHolderFrame): void {
+    // A reconnect resends what this sessiond may already hold.
+    if (frame.seq <= entry.lastSeq) return;
+    if (frame.stream === "stdout") entry.lastStdoutAt = frame.at;
+    if (frame.stream === "exit") {
+      entry.exited = true;
+      entry.exitCode = frame.code ?? null;
+      entry.signal = frame.signal ?? null;
+      this.backpressured.delete(entry.slot);
+      void this.persist().catch(() => undefined);
+    }
+    this.publish(entry.slot, frame);
+  }
+
+  private publish(slot: number, frame: SlotHolderFrame): void {
+    const entry = this.slots.get(slot);
+    if (entry) entry.lastSeq = Math.max(entry.lastSeq, frame.seq);
+    const payload: Record<string, unknown> = frame.stream === "exit"
+      ? { code: frame.code ?? null, signal: frame.signal ?? null }
+      : { dataBase64: frame.dataBase64 };
+    const seq = this.outputLog.append(slot, frame.stream, payload, frame.at, frame.seq);
+    const event: SessiondEvent = { v: SESSIOND_PROTOCOL_VERSION, type: "output", slot,
+      frame: outputFrame({ seq, at: frame.at, type: frame.stream, payload }), replay: false };
     for (const connection of this.connections) {
       if (connection.subscriptions.has(slot)) writeWire(connection.socket, event);
     }
   }
 
-  private writeSlot(params: SessiondWriteParams): { slot: number; acceptedBytes: number; backpressured: boolean } {
+  private async writeSlot(params: SessiondWriteParams): Promise<{ slot: number; acceptedBytes: number; backpressured: boolean }> {
     const entry = this.slots.get(params.slot);
     if (!entry) throw new SessiondError("slot_not_found", "write refused: slot does not exist");
-    if (!entry.attached || !this.entryAlive(entry) || !entry.child?.stdin.writable) {
+    if (!entry.attached || !this.entryAlive(entry)) {
       throw new SessiondError("slot_not_alive", "write refused: slot has no attached live process");
     }
     if (this.backpressured.has(params.slot)) {
@@ -600,25 +740,15 @@ export class SessiondServer {
         throw new Error("invalid base64");
       }
       data = Buffer.from(params.dataBase64, "base64");
-      if (data.toString("base64") !== params.dataBase64) {
-        // Buffer's decoder is deliberately forgiving; the protocol is not.
-        throw new Error("invalid base64");
-      }
+      if (data.toString("base64") !== params.dataBase64) throw new Error("invalid base64");
     } catch {
       throw new SessiondError("invalid_request", "write dataBase64 is invalid");
     }
     if (data.length > MAX_WRITE_BYTES) throw new SessiondError("invalid_request", "write exceeds the 8 MiB limit");
-    try {
-      const writable = entry.child.stdin.write(data);
-      entry.lastStdinAt = Date.now();
-      if (!writable) {
-        this.backpressured.add(params.slot);
-        entry.child.stdin.once("drain", () => this.backpressured.delete(params.slot));
-      }
-      return { slot: params.slot, acceptedBytes: data.length, backpressured: !writable };
-    } catch {
-      throw new SessiondError("write_failed", "write failed before bytes were accepted");
-    }
+    const ok = await this.holderWrite(entry, data).catch(() => false);
+    if (!ok) throw new SessiondError("write_failed", "write failed before bytes were accepted");
+    entry.lastStdinAt = Date.now();
+    return { slot: params.slot, acceptedBytes: data.length, backpressured: this.backpressured.has(params.slot) };
   }
 
   private subscribe(connection: ConnectionState, params: SessiondSubscribeParams): { slot: number; subscribed: true; throughSeq: number } {
@@ -656,8 +786,9 @@ export class SessiondServer {
     if (!this.entryAlive(entry)) return { slot: params.slot, signalled: false, alreadyDead: true };
     const signal = params.signal ?? "SIGTERM";
     let signalled = false;
-    if (entry.attached && entry.child) {
-      signalled = entry.child.kill(signal);
+    if (signal !== "SIGKILL" && entry.link && !entry.link.destroyed) {
+      // The holder passes it to the child and reports the exit.
+      signalled = entry.link.write(holderMessage({ v: SLOT_HOLDER_PROTOCOL_VERSION, type: "signal", signal })) || true;
     } else if (entry.identity && sameIdentity(entry.identity, readSessiondProcessIdentity(entry.identity.pid))) {
       try {
         process.kill(-entry.identity.pgid, signal);
@@ -696,14 +827,12 @@ export class SessiondServer {
     };
   }
 
-  private entryAlive(entry: SlotEntry): boolean {
-    if (entry.attached && entry.child) {
-      // `ChildProcess.killed` means only that kill() successfully sent a
-      // signal. A TERM-ignoring child is still alive until exitCode/signalCode
-      // changes, and listSlots must report that fact rather than intent.
-      return entry.child.exitCode === null && entry.child.signalCode === null;
-    }
+  private holderAlive(entry: SlotEntry): boolean {
     return !!entry.identity && sameIdentity(entry.identity, readSessiondProcessIdentity(entry.identity.pid));
+  }
+
+  private entryAlive(entry: SlotEntry): boolean {
+    return !entry.exited && this.holderAlive(entry);
   }
 
   private async recoverPersistedSlots(): Promise<void> {
@@ -716,13 +845,18 @@ export class SessiondServer {
       throw new Error("sessiond state file is invalid");
     }
 
-    const verified: Array<{ entry: SlotEntry; identity: ProcessIdentity }> = [];
+    const legacy: Array<{ entry: SlotEntry; identity: ProcessIdentity }> = [];
+    const held: SlotEntry[] = [];
     for (const record of parsed.slots) {
       const entry: SlotEntry = {
         slot: record.slot,
         pid: record.pid,
         identity: record.identity,
+        ...(record.socketPath ? { socketPath: record.socketPath } : {}),
         attached: false,
+        ...(record.status !== "live" ? { exited: true } : {}),
+        lastSeq: 0,
+        replies: new Map(),
         lastStdoutAt: record.lastStdoutAt,
         lastStdinAt: record.lastStdinAt,
         exitCode: record.exitCode,
@@ -730,42 +864,48 @@ export class SessiondServer {
       };
       this.slots.set(entry.slot, entry);
       if (record.status !== "live") continue;
-      if (!record.identity || !record.pid) {
+      if (!record.identity) {
         entry.orphanReason = "identity_unverifiable";
-        entry.pid = null;
+        entry.exited = true;
         continue;
       }
-      const observed = readSessiondProcessIdentity(record.pid);
-      if (!observed) {
-        entry.orphanReason = "supervisor_restarted";
+      const observed = readSessiondProcessIdentity(record.identity.pid);
+      if (!observed || !sameIdentity(record.identity, observed)) {
+        entry.orphanReason = observed ? "identity_mismatch" : "supervisor_restarted";
+        if (observed) entry.pid = null;
+        entry.exited = true;
         entry.exitCode = null;
         entry.signal = null;
-      } else if (!sameIdentity(record.identity, observed)) {
-        entry.orphanReason = "identity_mismatch";
-        entry.pid = null;
-        entry.exitCode = null;
-        entry.signal = null;
+      } else if (record.socketPath) {
+        held.push(entry);
       } else {
-        verified.push({ entry, identity: record.identity });
+        legacy.push({ entry, identity: record.identity });
       }
     }
 
-    // A supervisor crash destroyed these slots' descriptors. The exact
-    // pid+pgid+start stamp is positive ownership evidence; only those process
-    // groups are reaped. An unverifiable record is reported, never signalled.
+    // #631: a slot holder outlived the previous sessiond. Reconnect and carry
+    // on: the child, its stdio and its unread output are all still there.
+    await Promise.all(held.map(async (entry) => {
+      if (!await this.connectHolder(entry, 3_000)) entry.orphanReason = "supervisor_restarted";
+    }));
+
+    // Pre-holder children had their stdio in the old sessiond, so they lost
+    // it when it exited and can do no further work. Their exact identity is
+    // positive ownership evidence; only those process groups are reaped.
     const escalated = new Set<number>();
-    for (const { identity } of verified) {
+    for (const { identity } of legacy) {
       try { process.kill(-identity.pgid, "SIGTERM"); } catch { /* already gone */ }
     }
-    await Promise.all(verified.map(({ identity }) => waitUntilGone(identity, ORPHAN_TERM_GRACE_MS)));
-    for (const { identity } of verified) {
+    await Promise.all(legacy.map(({ identity }) => waitUntilGone(identity, ORPHAN_TERM_GRACE_MS)));
+    for (const { identity } of legacy) {
       if (!sameIdentity(identity, readSessiondProcessIdentity(identity.pid))) continue;
       try { process.kill(-identity.pgid, "SIGKILL"); } catch { /* already gone */ }
       escalated.add(identity.pid);
     }
-    await Promise.all(verified.map(({ identity }) => waitUntilGone(identity, ORPHAN_KILL_GRACE_MS)));
-    for (const { entry, identity } of verified) {
+    await Promise.all(legacy.map(({ identity }) => waitUntilGone(identity, ORPHAN_KILL_GRACE_MS)));
+    for (const { entry, identity } of legacy) {
       entry.orphanReason = "supervisor_restarted";
+      entry.exited = true;
       if (!sameIdentity(identity, readSessiondProcessIdentity(identity.pid))) {
         entry.exitCode = null;
         entry.signal = escalated.has(identity.pid) ? "SIGKILL" : "SIGTERM";
@@ -782,6 +922,7 @@ export class SessiondServer {
           slot: entry.slot,
           pid: entry.pid,
           ...(entry.identity ? { identity: entry.identity } : {}),
+          ...(entry.socketPath ? { socketPath: entry.socketPath } : {}),
           status: this.entryAlive(entry) ? "live" : "dead",
           ...(entry.lastStdoutAt !== undefined ? { lastStdoutAt: entry.lastStdoutAt } : {}),
           ...(entry.lastStdinAt !== undefined ? { lastStdinAt: entry.lastStdinAt } : {}),

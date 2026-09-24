@@ -1,0 +1,19 @@
+# /etc/systemd/system/seam-sessiond.service — replace <user> and <home>.
+# Its own unit so agent children survive a bridge restart (#598).
+[Unit]
+Description=Seam durable agent process supervisor
+After=local-fs.target
+
+[Service]
+Type=simple
+User=<user>
+Group=<user>
+Environment=HOME=<home>
+ExecStart=<home>/.local/libexec/seam-sessiond-launch.sh
+Restart=always
+RestartSec=2s
+KillMode=mixed
+OOMPolicy=continue
+
+[Install]
+WantedBy=multi-user.target

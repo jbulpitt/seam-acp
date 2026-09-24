@@ -4,6 +4,8 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
+import os from "node:os";
+import { parseEnv } from "node:util";
 import process from "node:process";
 import { gunzipSync } from "node:zlib";
 
@@ -175,8 +177,26 @@ async function systemdMainPid() {
   return parsePid(await systemctlShow("MainPID"), "systemd_mainpid_invalid");
 }
 
+// #618: a bare `connect` takes every setting from the host's bridge config
+// file, so the same identity checks run against that file instead of argv.
+function bridgeConfigPath() {
+  const base = process.env.XDG_CONFIG_HOME?.trim() || path.join(process.env.HOME?.trim() || os.homedir(), ".config");
+  return path.join(base, "seam", "bridge.env");
+}
+
+function validateBridgeConfigFile() {
+  let text;
+  try { text = fs.readFileSync(bridgeConfigPath(), "utf8"); } catch { fail("bridge_config_missing"); }
+  const config = parseEnv(text);
+  if (config.SEAM_BRIDGE_ID !== bridgeId) fail("bridge_config_id_mismatch");
+  if (workspaceArg === null ? config.SEAM_BRIDGE_CWD !== undefined : config.SEAM_BRIDGE_CWD !== workspaceArg) fail("bridge_config_workspace_mismatch");
+  if ((config.SEAM_BRIDGE_DEV === "1") !== expectedDevMode) fail("bridge_config_dev_mode_mismatch");
+  if (!config.SEAM_BRIDGE_SERVER || !config.SEAM_BRIDGE_TOKEN) fail("bridge_config_connect_incomplete");
+}
+
 function validatePm2Args(raw) {
   const args = Array.isArray(raw) ? raw.map(String) : [];
+  if (args.length === 1 && args[0] === "connect") return validateBridgeConfigFile();
   if (!args.length || args.some((value) => !value || /[\x00-\x1f\x7f]/.test(value))) fail("pm2_argv_invalid");
   const idOffsets = args.flatMap((value, index) => value === "--id" ? [index] : []);
   if (idOffsets.length !== 1 || args[idOffsets[0] + 1] !== bridgeId) fail("pm2_bridge_id_mismatch");

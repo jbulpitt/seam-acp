@@ -42,6 +42,7 @@
  * ─────────────────────────────────────────────────────────────────────────────
  */
 
+import "./load-bridge-config.js";
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
@@ -889,9 +890,9 @@ function extractBoolFlag(flag: string): boolean {
 }
 
 // Extract all named flags before touching positional args.
-const cwdArg = extractFlag("--cwd");
+const cwdArg = extractFlag("--cwd") ?? process.env.SEAM_BRIDGE_CWD;
 const gistArg = extractFlag("--gist");
-const idArg = extractFlag("--id") ?? extractFlag("--bridge-id");
+const idArg = extractFlag("--id") ?? extractFlag("--bridge-id") ?? process.env.SEAM_BRIDGE_ID;
 const serverFlag = extractFlag("--server");
 const tokenFlag = extractFlag("--token");
 const tokenFileFlag = extractFlag("--token-file");
@@ -951,6 +952,7 @@ process.on("SIGUSR2", () => {
 
 function usageAndExit(): never {
   console.error("Usage: seam-bridge connect --server <wss-url> --id <bridgeId> (--token <token> | --token-file <path>) [--cwd <path>] [--dev]");
+  console.error("       seam-bridge connect   (every setting from ~/.config/seam/bridge.env: SEAM_BRIDGE_SERVER, SEAM_BRIDGE_ID, SEAM_BRIDGE_TOKEN, SEAM_BRIDGE_CWD, SEAM_BRIDGE_DEV)");
   console.error("       seam-bridge --server <port> --token <token> [--id <bridgeId>] [--cwd <path>] [--dev] [copilot-cmd]");
   console.error("       seam-bridge [--gist <owner/gistId>] <ws-url> <token> [--id <bridgeId>] [--cwd <path>] [--dev]");
   process.exit(1);
@@ -965,7 +967,7 @@ async function main(): Promise<void> {
   if (tokenFileFlag && !tokenFromFile) throw new Error("bridge token file is empty");
   if (rawArgs[0] === "connect") {
     rawArgs.shift();
-    const wsUrl = serverFlag ?? rawArgs[0];
+    const wsUrl = serverFlag ?? rawArgs[0] ?? process.env.SEAM_BRIDGE_SERVER;
     const token = tokenFlag ?? tokenFromFile ?? process.env.SEAM_BRIDGE_TOKEN ?? rawArgs[1];
     const copilotCmd = process.env.COPILOT_CMD ?? "copilot";
     if (!wsUrl || !token) usageAndExit();

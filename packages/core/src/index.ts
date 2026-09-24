@@ -471,11 +471,14 @@ async function main(): Promise<void> {
           if (info.installed) bindings.push({ agentId, location: bridge.bridgeId });
         }
       }
-      // #622: the deny list must cover every source above, not only the
-      // local profile list — see `withoutDeniedBindings`.
+      // #622: keeps withheld bindings out of refresh-all and the fleet view.
+      // The fetch refusal itself is `withheld` below, which covers callers
+      // that never read this list (onBridgeReady, session, manual refresh).
       return withoutDeniedBindings(bindings, config.AGENT_LOCATION_DENY);
     },
     isOnline: ({ location }) => Boolean(bridgeHub?.isBridgeReady(location)),
+    withheld: ({ agentId, location }) =>
+      isAgentLocationDenied(agentId, location, config.AGENT_LOCATION_DENY) ? "is withheld by AGENT_LOCATION_DENY" : null,
     source: (binding) => mainClaudeCatalogSource(binding, mainClaudeApiCatalogEnabled),
     scope: async ({ agentId, location }) => {
       if (!bridgeHub) throw new Error("bridge hub is not ready");

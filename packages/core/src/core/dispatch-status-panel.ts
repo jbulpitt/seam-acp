@@ -53,6 +53,8 @@ export interface DispatchStatusPanelOptions {
   /** Minimum spacing between throttled edits. Defaults to 2500ms, matching the
    *  user-turn panel's `STATUS_EDIT_DEBOUNCE_MS`. */
   debounceMs?: number;
+  /** How often the elapsed clock ticks while nothing else changes. Default 5000ms. */
+  heartbeatMs?: number;
 }
 
 export class DispatchStatusPanel<TRef = unknown> {
@@ -65,6 +67,7 @@ export class DispatchStatusPanel<TRef = unknown> {
   private readonly card = new StatusSnapshotCard();
   private lastEditAt = 0;
   private pending: ReturnType<typeof setTimeout> | undefined;
+  private heartbeat: ReturnType<typeof setInterval> | undefined;
   private lastRendered = "";
   private finalized = false;
   private started = false;
@@ -109,6 +112,8 @@ export class DispatchStatusPanel<TRef = unknown> {
     }
     if (this.ref === undefined) return false;
     this.card.bind();
+    this.heartbeat = setInterval(() => void this.refresh(), this.opts.heartbeatMs ?? 5000);
+    this.heartbeat.unref?.();
     return true;
   }
 
@@ -182,6 +187,7 @@ export class DispatchStatusPanel<TRef = unknown> {
       return;
     }
     this.finalized = true;
+    if (this.heartbeat) clearInterval(this.heartbeat);
     if (this.pending) {
       clearTimeout(this.pending);
       this.pending = undefined;
@@ -230,9 +236,8 @@ export class DispatchStatusPanel<TRef = unknown> {
     await this.enqueueRender(false);
   }
 
-  /** Render + enqueue one serialized edit. An unchanged snapshot does not
-   *  edit, including when the caller forces a terminal redraw: the terminal
-   *  state is itself a snapshot change, and a clock tick is not. */
+  /** Render + enqueue one serialized edit. An unchanged snapshot (same
+   *  content, same elapsed second) does not edit. */
   private enqueueRender(_done: boolean, _force = false): Promise<void> {
     this.lastEditAt = Date.now();
     const viewed = observationFromTurn(this.status);

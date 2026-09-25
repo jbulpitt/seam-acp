@@ -548,7 +548,9 @@ export class DiscordAdapter implements ChatAdapter {
       for (const thread of threads.values()) {
         if (!thread.lastMessageId || BigInt(thread.lastMessageId) <= BigInt(after)) continue;
         const page = await thread.messages.fetch({ after, limit: 100 });
-        missed.push(...page.values());
+        for (const msg of page.values()) {
+          if (!msg.author.bot && this.config.DISCORD_ALLOWED_USER_IDS.has(msg.author.id)) missed.push(msg);
+        }
       }
     }
     missed.sort((a, b) => (BigInt(a.id) < BigInt(b.id) ? -1 : 1));

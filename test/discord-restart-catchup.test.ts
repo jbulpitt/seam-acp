@@ -17,8 +17,9 @@ describe("DiscordAdapter.catchUpMessagesAfter (#653)", () => {
     const late = id(since + 9_000);
     const quietFetch = vi.fn();
     const busyFetch = vi.fn(async () => new Map([
-      [late, { id: late }],
-      [early, { id: early }],
+      [late, { id: late, author: { id: "human", bot: false } }],
+      [id(since + 5_000), { id: "seam-reply", author: { id: "bot", bot: true } }],
+      [early, { id: early, author: { id: "human", bot: false } }],
     ]));
     const threads = new Map([
       ["quiet", { lastMessageId: id(since - 60_000), messages: { fetch: quietFetch } }],

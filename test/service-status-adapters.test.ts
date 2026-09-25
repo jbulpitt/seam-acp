@@ -344,14 +344,15 @@ describe("statuspage adapter", () => {
     expect(updates.map((update) => update.order)).toEqual([0, 1, 2, 3]);
   });
 
-  it("rejects an unknown component status rather than guessing", () => {
+  it("grades an unknown component status as unknown and keeps the feed", () => {
     const summary = JSON.parse(fixture("statuspage/github-summary.json")) as {
       components: { status: string }[];
     };
     summary.components[0]!.status = "on_fire";
-    expect(() =>
-      normalizeStatuspage(statuspageConfig(), { summary: JSON.stringify(summary), incidents: null }, NOW)
-    ).toThrow(/unknown status/i);
+    summary.components[1]!.status = "full_outage";
+    const result = normalizeStatuspage(statuspageConfig(), { summary: JSON.stringify(summary), incidents: null }, NOW);
+    expect(result.components[0]!.status).toBe("unknown");
+    expect(result.components[1]!.status).toBe("major_outage");
   });
 
   it("rejects an over-length incident feed instead of reading a prefix", () => {

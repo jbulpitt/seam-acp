@@ -231,6 +231,25 @@ describe("#423 a wedged thread self-heals without an operator", () => {
     expect(store.turnAttempts.get("pending-never")?.state).toBe("pending");
   });
 
+  it("never restarts a turn its bridge is still finishing after a controller restart", async () => {
+    // Thread 1516907689874161764 on 2026-09-24: the sweep called this wedged,
+    // restarted the turn, and the finished answer from the bridge was dropped.
+    const { host } = makeHost();
+    expect(admitStale("bridge-owned")).toBe(true);
+    const spec = { id: "delegated-turn", target: CHANNEL, prompt: "long job", session: "live" } as never;
+    const claimed = store.turnAttempts.claim(store.turnAttempts.admit(spec), "identity", "boot-1");
+    store.turnAttempts.bind(claimed, "acp-bridge");
+    store.turnAttempts.recordRemoteRecovery(claimed, {
+      version: 1, location: "local", slot: 1790300936172, submissionId: "sub-1",
+      acpSessionId: "acp-bridge", delegatedUtc: "2026-09-25T02:27:57.000Z",
+    });
+    store.turnAttempts.startPrompt(claimed);
+    store.turnAttempts.suspend(claimed.id, "boot-1");
+    expect(host.inspectChannelQueue(CHANNEL).state).toBe("runtime_busy");
+    expect(await host.sweepWedgedQueues()).toEqual([]);
+    expect(store.listConfigMutations()).toHaveLength(0);
+  });
+
   it("detects but does not repair when auto-recovery is switched off", async () => {
     // Degrading to visibility, not back to silence.
     const { host } = makeHost({ CHANNEL_QUEUE_AUTO_RECOVER: false });

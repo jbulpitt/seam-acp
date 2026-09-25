@@ -117,6 +117,30 @@ describe("DispatchStatusPanel: drives TurnStatus from onEvent", () => {
     expect(last.title).toContain("Done"); // title is "⏰ Wake · Done"
   });
 
+  it("keeps the elapsed clock counting while nothing else changes", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval", "setTimeout", "clearTimeout", "Date"] });
+    try {
+      const edits: StructuredPanel[] = [];
+      const status = new TurnStatus({ model: "opus", repoDisplay: "repo", titlePrefix: "📨 Handoff" });
+      const panel = new DispatchStatusPanel<MessageRef>(
+        discordRenderer,
+        status,
+        { post: async () => ({ channel: { platform: "discord", id: "t" }, id: "m1" }), edit: async (_ref, p) => { edits.push(p); } },
+        { debounceMs: 0, heartbeatMs: 5_000 },
+      );
+      await panel.start();
+      await vi.advanceTimersByTimeAsync(12_000);
+      expect(edits.length).toBeGreaterThanOrEqual(2);
+      expect(JSON.stringify(edits.at(-1))).toContain("10s");
+      await panel.finalize("Done");
+      const settled = edits.length;
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect(edits.length).toBe(settled);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("is inert when the initial post fails (best-effort, never throws)", async () => {
     const status = new TurnStatus({ model: "opus", repoDisplay: "repo", titlePrefix: "📨 Handoff" });
     const panel = new DispatchStatusPanel<MessageRef>(

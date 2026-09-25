@@ -2,10 +2,9 @@
  * Current-state status for one turn (#445).
  *
  * This is not the output log. The log is a cursor over bytes and replaying it
- * redraws every intermediate frame. A snapshot is one record: publishing the
- * same content again does not replace it, does not advance elapsed time, and
- * does not describe a second Discord message. The caller renders the latest
- * and skips everything in between.
+ * redraws every intermediate frame. A snapshot is one record and one Discord
+ * message: the caller renders the latest and skips everything in between.
+ * Elapsed time always reflects the clock.
  *
  * `contextUsed` is the token count already read from the session transcript.
  * The catalog window is not a field of this record — seam-acp supplies it at
@@ -26,8 +25,7 @@ export interface StatusSnapshot {
   latestTool: string | null;
   textTail: string;
   /**
-   * Seconds since start, stamped when the content last changed. A later
-   * re-render of that same content keeps this value.
+   * Seconds since start, as of the latest publish.
    */
   elapsedSeconds: number;
 }
@@ -164,21 +162,22 @@ export class StatusSnapshotCard {
   }
 
   /**
-   * Fold the latest observation in. Identical content keeps the stored
-   * snapshot, including its elapsed stamp, even when `now` has moved.
-   * A catalog-window change updates the rendered body only.
+   * Fold the latest observation in. A catalog-window change alone updates
+   * the rendered body only.
    */
   publish(observation: StatusObservation, contextWindow: number | null, now: number): StatusSnapshot {
     const content = contentOf(observation);
     const window = normalizeWindow(contextWindow);
-    if (this.snapshot && sameContent(this.snapshot, content)) {
+    const elapsedSeconds = Math.max(0, Math.floor((now - observation.startedAt) / 1000));
+    // The clock is part of what the card shows: a later publish of the same
+    // content still moves it, so a long quiet turn visibly keeps counting.
+    if (this.snapshot && sameContent(this.snapshot, content) && this.snapshot.elapsedSeconds === elapsedSeconds) {
       if (this.window !== window) {
         this.window = window;
         this.body = renderStatusSnapshot(this.snapshot, window);
       }
       return { ...this.snapshot };
     }
-    const elapsedSeconds = Math.max(0, Math.floor((now - observation.startedAt) / 1000));
     this.snapshot = { ...content, elapsedSeconds };
     this.window = window;
     this.body = renderStatusSnapshot(this.snapshot, window);

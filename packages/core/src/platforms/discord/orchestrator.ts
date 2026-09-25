@@ -3923,8 +3923,6 @@ export class Orchestrator {
     let statusCardSettled = false;
     const editStatusSnapshot = (settlement = false): Promise<void> => statusEditQueue.run(async () => {
       if (statusCardSettled && !settlement) return;
-      // Same snapshot content is not a new card and not a changed one. Elapsed
-      // stays at the stamp from the edit that actually changed the record.
       const now = Date.now();
       const viewed = observationFromTurn(status);
       statusCard.publish(viewed.observation, viewed.contextWindow, now);
@@ -3991,6 +3989,14 @@ export class Orchestrator {
       status.setAction(projection.action);
       await editStatusSnapshot(true);
     };
+
+    // Heartbeat: tick the elapsed clock while nothing else changes, so a long
+    // quiet model request still visibly counts. Discord rate-limits edits to
+    // one message (~5 per 5s), so keep this conservative.
+    const heartbeat = setInterval(() => {
+      void refresh();
+    }, STATUS_HEARTBEAT_MS);
+    heartbeat.unref?.();
 
     // Typing indicator: refresh on real agent activity (text, tool calls,
     // thoughts) rather than a dumb timer. Discord's typing indicator
@@ -5132,6 +5138,7 @@ export class Orchestrator {
       if (scheduledAttempt) this.scheduledActivity?.phase(scheduledAttempt.id, "cleanup");
       if (!this.queueFenceCurrent(queueFence) || (humanAttempt && !humanOutcomeOwned)) {
         turnFinalized = true;
+        clearInterval(heartbeat);
         cancelFlushTimer();
         if (pendingRefresh) clearTimeout(pendingRefresh);
         await settleAttemptCard();
@@ -5160,6 +5167,7 @@ export class Orchestrator {
       // this runtime is an agent-initiated woken turn (handled in eventHandler),
       // not the in-turn backlog already drained above.
       turnFinalized = true;
+      clearInterval(heartbeat);
       if (pendingRefresh) {
         clearTimeout(pendingRefresh);
         pendingRefresh = undefined;

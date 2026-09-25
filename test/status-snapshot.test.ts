@@ -18,19 +18,21 @@ const observation = (over: Partial<StatusObservation> = {}): StatusObservation =
 });
 
 describe("status snapshot (#445)", () => {
-  it("re-rendering the same state keeps one record and does not move elapsed", () => {
+  it("the same state in the same second keeps one record; a later second moves the clock", () => {
     const card = new StatusSnapshotCard();
     const first = card.publish(observation(), 200_000, 6_000);
     card.bind();
     const body = card.renderedBody();
 
-    const again = card.publish(observation(), 200_000, 26_000);
+    const again = card.publish(observation(), 200_000, 6_400);
     expect(again).toEqual(first);
-    expect(again.elapsedSeconds).toBe(5);
-    expect(card.renderedBody()).toBe(body);
-    expect(card.plan()).toEqual({ action: "skip", body });
     expect(card.plan()).toEqual({ action: "skip", body });
     expect(card.current()).not.toHaveProperty("contextWindow");
+
+    // A long quiet turn keeps counting on the same card.
+    const later = card.publish(observation(), 200_000, 26_000);
+    expect(later.elapsedSeconds).toBe(25);
+    expect(card.plan().action).toBe("edit");
   });
 
   it("a real change edits the same card and does not ask for a second message", () => {
@@ -58,7 +60,7 @@ describe("status snapshot (#445)", () => {
     expect(renderStatusSnapshot(snapshot, 200_000)).toBe(withWindow);
 
     card.bind();
-    card.publish(observation({ contextUsed: 12 }), 200_000, 9_000);
+    card.publish(observation({ contextUsed: 12 }), 200_000, 1_000);
     expect(card.plan().action).toBe("skip");
     expect(card.renderedBody()).toBe(withWindow);
   });
@@ -76,7 +78,7 @@ describe("status snapshot (#445)", () => {
     const card = new StatusSnapshotCard();
     const first = card.publish(observation(), null, 6_000);
     card.bind();
-    const second = card.publish(observation(), 200_000, 26_000);
+    const second = card.publish(observation(), 200_000, 6_000);
     expect(second).toEqual(first);
     expect(card.plan().action).toBe("edit");
     expect(card.renderedBody()).toContain("50000/200000");

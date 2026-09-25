@@ -5,7 +5,7 @@
  */
 import { execFile, exec } from "node:child_process";
 import { promisify } from "node:util";
-import { promises as fsp } from "node:fs";
+import { existsSync, promises as fsp } from "node:fs";
 import path from "node:path";
 import type { McpServer } from "@agentclientprotocol/sdk";
 import type { AgentAdapter } from "@seam/adapters";
@@ -28,6 +28,8 @@ const execAsync = promisify(exec);
 export interface SlotSpawnConfig {
   agentId?: string;
   cwd?: string;
+  /** The controller's cwd, when this host lacks it and runs in `cwd` instead. */
+  requestedCwd?: string;
   env?: Record<string, string>;
   mcpServers?: McpServer[];
   model?: string;
@@ -135,6 +137,10 @@ async function dispatchAdapter(
   if (method === "spawn") {
     const slot = params.slot;
     if (typeof slot !== "number") throw new Error("spawn requires numeric slot");
+    // A thread can move to a host that does not have its directory (a new
+    // agent@host binding). Work in this host's workspace instead, and say so.
+    const requestedCwd = cwd;
+    const spawnCwd = existsSync(requestedCwd) ? requestedCwd : ctx.cwd;
     const env =
       params.env && typeof params.env === "object" && !Array.isArray(params.env)
         ? Object.fromEntries(
@@ -145,7 +151,7 @@ async function dispatchAdapter(
         : undefined;
     const transportedMcpServers = assertTransportableRemoteMcpServers(params.mcpServers);
     const projectMcpServers = readProjectMcpServers({
-      cwd,
+      cwd: spawnCwd,
       logger: projectMcpLogger,
       reservedNames: new Set(transportedMcpServers.map((server) => server.name)),
       environment: process.env,
@@ -165,7 +171,8 @@ async function dispatchAdapter(
     }
     ctx.configureSlot?.(slot, {
       agentId: str(params.agentId) ?? agentId,
-      cwd,
+      cwd: spawnCwd,
+      ...(spawnCwd !== requestedCwd ? { requestedCwd } : {}),
       env,
       mcpServers,
       model: str(params.model),
@@ -179,6 +186,7 @@ async function dispatchAdapter(
       projectMcpInjection: true,
       projectMcpServers: projectMcpServers.map((server) => server.name),
       ...(rung1Recovery ? { rung1RecoveryVersion: 1 } : {}),
+      ...(spawnCwd !== requestedCwd ? { cwdFallback: { requested: requestedCwd, used: spawnCwd } } : {}),
     };
   }
 

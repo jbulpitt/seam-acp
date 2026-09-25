@@ -623,7 +623,9 @@ async function makeSlotManager(opts: {
       if (draining) return;
       let rewriter = slotInputRewriters.get(msg.slot);
       if (!rewriter) {
-        rewriter = new BridgeMcpInputRewriter(slotConfigs.get(msg.slot)?.mcpServers ?? []);
+        const config = slotConfigs.get(msg.slot);
+        rewriter = new BridgeMcpInputRewriter(config?.mcpServers ?? [],
+          config?.requestedCwd && config.cwd ? { from: config.requestedCwd, to: config.cwd } : undefined);
         slotInputRewriters.set(msg.slot, rewriter);
       }
       const rewritten = rewriter.push(msg.data);

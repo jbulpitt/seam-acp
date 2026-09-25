@@ -450,9 +450,12 @@ export class SupervisedSlots {
   private serial<T>(slot: number, task: () => Promise<T>): Promise<T> {
     const prior = this.queues.get(slot) ?? Promise.resolve();
     const next = prior.catch(() => undefined).then(task);
+    // The caller handles `next`; this bookkeeping copy must not become an
+    // unhandled rejection that exits the whole bridge.
     const tracked = next.finally(() => {
       if (this.queues.get(slot) === tracked) this.queues.delete(slot);
     });
+    tracked.catch(() => undefined);
     this.queues.set(slot, tracked);
     return next;
   }

@@ -363,18 +363,17 @@ export class CodexSessionManager implements ISessionManager {
     sessionId: string,
     cwd?: string
   ): Promise<string | null> {
+    // Rollouts reach hundreds of MB, so match names first and read only each
+    // file's first line when no name matches.
     const files = await this.collectJsonl(this.sessionsRoot);
+    const named = files.find((filePath) =>
+      sessionIdFromRolloutFilename(path.basename(filePath)) === sessionId);
+    if (named) return named;
     for (const filePath of files) {
-      const fromName = sessionIdFromRolloutFilename(path.basename(filePath));
-      if (fromName === sessionId) return filePath;
-      try {
-        const parsed = await this.parseRollout(filePath);
-        if (parsed.meta?.sessionId !== sessionId) continue;
-        if (cwd && parsed.meta.cwd && parsed.meta.cwd !== cwd) continue;
-        return filePath;
-      } catch {
-        // skip
-      }
+      const meta = await this.peekMeta(filePath);
+      if (meta?.sessionId !== sessionId) continue;
+      if (cwd && meta.cwd && meta.cwd !== cwd) continue;
+      return filePath;
     }
     return null;
   }

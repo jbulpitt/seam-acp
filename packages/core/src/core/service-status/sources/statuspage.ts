@@ -134,7 +134,8 @@ export function normalizeStatuspage(
   const components = normalizeComponents(
     label,
     requireArray(label, summary.components, "summary.components"),
-    config.selectedComponentIds
+    config.selectedComponentIds,
+    notes
   );
 
   const fromSummary = summary.incidents === undefined
@@ -182,10 +183,10 @@ export function normalizeStatuspage(
 function normalizeComponents(
   label: string,
   raw: unknown[],
-  selectedComponentIds: readonly string[]
+  selectedComponentIds: readonly string[],
+  notes: string[]
 ): NormalizedComponent[] {
   const selection = new Set(selectedComponentIds);
-  const selectAll = selection.size === 0;
 
   interface Parsed {
     id: string;
@@ -227,18 +228,18 @@ function normalizeComponents(
     else childrenByGroup.set(component.groupId, [component]);
   }
 
-  // Every configured id must exist on the page. If one has vanished we can no
-  // longer prove what we are watching, so the refresh fails and the previous
-  // last-known-good snapshot stands. Silently selecting fewer components — or
-  // none at all — would publish a green source over an unwatched outage.
+  // A configured id that has left the page is named in a note and the rest
+  // are still watched; if none remain, every component is. Failing the fetch
+  // instead left the OpenAI source two weeks stale through a real outage.
   const present = new Set(parsed.map((component) => component.id));
-  for (const id of selection) {
-    if (!present.has(id)) {
-      failSchema(
-        label,
-        `configured component id ${JSON.stringify(id)} is absent from the page`
-      );
-    }
+  const missing = [...selection].filter((id) => !present.has(id));
+  for (const id of missing) selection.delete(id);
+  const selectAll = selection.size === 0;
+  if (missing.length > 0) {
+    notes.push(
+      `configured component ids absent from the page: ${missing.join(", ")}; ` +
+        (selectAll ? "watching every component" : "watching the rest")
+    );
   }
 
   // Selection pass 1: ids configured by the operator. Selecting a group also

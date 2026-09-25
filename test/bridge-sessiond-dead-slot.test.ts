@@ -219,3 +219,23 @@ describe("#606 forwardInput reports undeliverable input", () => {
     expect(reported).toEqual([]);
   });
 });
+
+describe("a slot that cannot start never takes the bridge down", () => {
+  it("reports the cause and leaves no unhandled rejection", async () => {
+    const { socketPath, childPath } = await sessiond();
+    const only = await bridge(socketPath, childPath);
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => unhandled.push(reason);
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      only.slots.configure(21, { agentId: "fixture", cwd: "/definitely/not/a/directory" });
+      const reported: Array<[number, string]> = [];
+      await forwardInput(only.slots, 21, "hello\n", (slot, reason) => reported.push([slot, reason]));
+      await delay(200);
+      expect(reported).toEqual([[21, expect.stringContaining("ENOENT")]]);
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
+  });
+});

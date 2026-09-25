@@ -55,6 +55,8 @@ export const DEFAULT_REMOTE_RUNG1_POLICY: RemoteRung1Policy = Object.freeze<Remo
 export type MuxSpawnedProcess = ChildProcessByStdio<Writable, Readable, Readable> & {
   readonly slot: number;
   remoteRung1Recovery?: boolean;
+  /** One line for the thread about a substitution the host made at spawn. */
+  hostNotice?: string;
 };
 
 /** Subset of makeMux() used to spawn a remote slot. */
@@ -178,6 +180,12 @@ export async function spawnRemoteSlot(
     }
     child.remoteRung1Recovery = Boolean(result && typeof result === "object"
       && (result as { rung1RecoveryVersion?: unknown }).rung1RecoveryVersion === 1);
+    const cwdFallback = result && typeof result === "object"
+      ? (result as { cwdFallback?: { requested?: unknown; used?: unknown } }).cwdFallback
+      : undefined;
+    if (cwdFallback && typeof cwdFallback.requested === "string" && typeof cwdFallback.used === "string") {
+      child.hostNotice = `📁 \`${cwdFallback.requested}\` isn't on this host, so this session works in \`${cwdFallback.used}\`.`;
+    }
   } catch (err) {
     try {
       child.kill();

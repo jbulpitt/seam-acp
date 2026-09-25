@@ -173,7 +173,9 @@ export class SessiondClient {
     if (response.ok) pending.resolve(response.payload);
     else pending.reject(new SessiondClientError(
       response.error?.code ?? "internal_error",
-      response.error?.message ?? "sessiond request failed",
+      // The OS code (e.g. ENOENT: executable or working directory missing)
+      // is the cause a reader needs; keep it in the message.
+      [response.error?.message ?? "sessiond request failed", response.error?.processCode].filter(Boolean).join(": "),
       response.error?.processCode,
       response.error?.syscall,
     ));

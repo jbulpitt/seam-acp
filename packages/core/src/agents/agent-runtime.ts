@@ -620,6 +620,8 @@ export class AgentRuntime {
     if (this.connection) return;
     const child = await this.spawnFn(this.modelOverride, this.effortOverride);
     this.child = child;
+    const hostNotice = (child as { hostNotice?: unknown }).hostNotice;
+    if (typeof hostNotice === "string") this.pendingModelNotices.push(hostNotice);
 
     const processExitError = (
       code: number | null,

@@ -7,6 +7,7 @@ import {
   resolvePublicBridgeWsUrl,
   publicBaseFromBridgeWsUrl,
   resolveIngestPublicBase,
+  dialedOriginFromUpgrade,
 } from "../packages/core/src/core/mcp-url.js";
 
 describe("reachable seam-MCP URL (#84)", () => {
@@ -132,5 +133,26 @@ describe("ingest public origin", () => {
         healthPort: 3000,
       })
     ).toBe("http://127.0.0.1:3000");
+  });
+});
+
+describe("seam-MCP follows the origin a bridge dialed (#650)", () => {
+  it("a bridge on the WireGuard link gets its private http origin", () => {
+    const origin = dialedOriginFromUpgrade({ host: "10.66.50.1:3000" });
+    expect(origin).toBe("http://10.66.50.1:3000");
+    expect(resolveReachableMcpUrl({ port: 4321, publicBaseUrl: origin, remote: true }))
+      .toBe("http://10.66.50.1:3000/mcp");
+  });
+
+  it("a bridge through the tunnel keeps the public https origin", () => {
+    expect(dialedOriginFromUpgrade({
+      host: "seamacp.runbooksynthesis.com",
+      "x-forwarded-proto": "https",
+    })).toBe("https://seamacp.runbooksynthesis.com");
+  });
+
+  it("a loopback or missing host falls back to the public URL", () => {
+    expect(dialedOriginFromUpgrade({ host: "127.0.0.1:3000" })).toBeUndefined();
+    expect(dialedOriginFromUpgrade({})).toBeUndefined();
   });
 });

@@ -17,6 +17,7 @@ import { CATALOG_FETCH_TIMEOUT_MS } from "@seam/adapters";
 import type { SlotHealthFact } from "./warm-set/manager.js";
 import { buildSeamMcpServerEntry } from "./mcp/seam-mcp-server.js";
 import {
+  dialedOriginFromUpgrade,
   publicBaseFromBridgeWsUrl,
   resolvePublicBridgeWsUrl,
   resolveReachableMcpUrl,
@@ -178,6 +179,8 @@ export class BridgeHub {
   private readonly slotHealth = new Map<string, readonly SlotHealthFact[]>();
   /** In-memory session → bridge mapping. Persistence is the thread-preset `location`. */
   private readonly sessionBridge = new Map<string, string>();
+  /** Origin each remote bridge last dialed; its agents reach seam-MCP there (#650). */
+  private readonly dialedOrigins = new Map<string, string>();
   private readonly readyEvents = new EventEmitter();
 
   constructor(opts: BridgeHubOpts) {
@@ -297,13 +300,14 @@ export class BridgeHub {
     });
   }
 
-  mcpUrlForRemote(): string | undefined {
+  mcpUrlForRemote(bridgeId?: string): string | undefined {
     const port = this.getMcpPort?.();
     if (port === undefined) return undefined;
+    const dialed = bridgeId ? this.dialedOrigins.get(normalizeLocation(bridgeId)) : undefined;
     return resolveReachableMcpUrl({
       port,
       healthPort: this.healthPort,
-      publicBaseUrl: publicBaseFromBridgeWsUrl(this.publicWsUrl()),
+      publicBaseUrl: dialed ?? publicBaseFromBridgeWsUrl(this.publicWsUrl()),
       remote: true,
     });
   }
@@ -324,7 +328,7 @@ export class BridgeHub {
         url: `http://127.0.0.1:${this.healthPort}/mcp`,
       });
     }
-    const url = this.mcpUrlForRemote();
+    const url = this.mcpUrlForRemote(bridgeId);
     return buildSeamMcpServerEntry(port, token, url ? { url } : { url: resolveReachableMcpUrl({ port, healthPort: this.healthPort, remote: true }) });
   }
 
@@ -399,9 +403,13 @@ export class BridgeHub {
       return;
     }
 
+    const dialed = dialedOriginFromUpgrade(req.headers);
+    if (dialed) this.dialedOrigins.set(paired.id, dialed);
+    else this.dialedOrigins.delete(paired.id);
+
     const mux = this.ensureMux(paired.id);
     mux.attach(ws);
-    this.logger.info({ bridgeId: paired.id }, "bridge websocket accepted");
+    this.logger.info({ bridgeId: paired.id, dialed }, "bridge websocket accepted");
   }
 
   private ensureMux(bridgeId: string): ReturnType<typeof makeMux> {

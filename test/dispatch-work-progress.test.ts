@@ -279,7 +279,8 @@ describe("#530 composed thread work progress", () => {
     expect(host.inspectThreadWorkProgress(TARGET)).toMatchObject({
       state: "running",
       progressing: true,
-      runtimeBusy: false,
+      // The bridge is executing this turn; the thread is busy (#631 sweep fix).
+      runtimeBusy: true,
       remoteRecovery: [{
         attemptId: "remote-retry",
         owner: "bridge",
@@ -317,7 +318,7 @@ describe("#530 composed thread work progress", () => {
       locationFor: () => ({ location: "remote-one", hostEmoji: "" }),
     });
     expect(entries[0]).toMatchObject({
-      busy: false,
+      busy: true,
       workProgress: { progressing: true, state: "running" },
     });
   });

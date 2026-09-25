@@ -2176,8 +2176,15 @@ export class Orchestrator {
     // #570: a turn this queue is executing counts as busy even while the ACP
     // runtime reports idle between tool segments. Asking only the runtime let
     // the sweep fence work that was actively running.
+    // A turn its bridge is finishing across a controller restart is executing
+    // too: this controller only holds a read-only link to it, not a runtime.
+    // Calling that "wedged" restarted the turn beside the one still running
+    // and discarded its finished answer (thread 1516907689874161764).
+    const bridgeOwned = this.store.turnAttempts.list("suspended")
+      .some((attempt) => attempt.remoteRecovery && attempt.spec?.target === channelRef);
     const runtimeBusy = (record ? this.router.isBusy(record.id) : false)
-      || (meta?.executing ?? 0) > 0;
+      || (meta?.executing ?? 0) > 0
+      || bridgeOwned;
     const listInbound = (this.store as Partial<SessionStore>).listInboundNonterminal;
     const durable = listInbound ? listInbound.call(this.store, channelRef) : [];
     const stalled = this.store.turnAttempts.listStalled(channelRef);

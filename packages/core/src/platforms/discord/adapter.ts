@@ -23,6 +23,7 @@ import {
   TextInputStyle,
   AttachmentBuilder,
   PermissionFlagsBits,
+  SnowflakeUtil,
   type Message,
   type TextChannel,
   type ThreadChannel,
@@ -532,6 +533,33 @@ export class DiscordAdapter implements ChatAdapter {
     this.logger.info({ botUserId: this.botUserId }, "discord adapter ready");
     await this.registerSlashCommands();
     await this.applyAvatarIfNeeded();
+  }
+
+  /**
+   * Replay thread messages this process never took (#653): those refused
+   * after shutdown closed admission, and those sent while no process held the
+   * gateway. A thread whose last message predates `sinceMs` costs nothing past
+   * the one active-threads call per guild. Inbound admission is keyed by
+   * message id, so a message that was taken live is ignored.
+   */
+  async catchUpMessagesSince(sinceMs: number): Promise<number> {
+    const after = SnowflakeUtil.generate({ timestamp: sinceMs }).toString();
+    const missed: Message[] = [];
+    for (const guild of this.client.guilds.cache.values()) {
+      const { threads } = await guild.channels.fetchActiveThreads();
+      for (const thread of threads.values()) {
+        if (!thread.lastMessageId || BigInt(thread.lastMessageId) <= BigInt(after)) continue;
+        const page = await thread.messages.fetch({ after, limit: 100 });
+        missed.push(...page.values());
+      }
+    }
+    missed.sort((a, b) => (BigInt(a.id) < BigInt(b.id) ? -1 : 1));
+    for (const msg of missed) {
+      this.handleMessage(msg).catch((err) => {
+        this.logger.error({ err, messageId: msg.id }, "caught-up message handler crashed");
+      });
+    }
+    return missed.length;
   }
 
   getBotUserId(): string | undefined {

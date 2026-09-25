@@ -702,6 +702,9 @@ async function main(): Promise<void> {
   await orchestrator.recoverElicitations().catch((err) => {
     logger.warn({ err }, "elicitation recovery failed");
   });
+  void orchestrator.catchUpAfterRestart().catch((err) => {
+    logger.warn({ err }, "restart message catch-up failed");
+  });
   // Seed one normalized snapshot per configured agent before MCP/card startup,
   // then let each agent's own recent turn rate drive its recursive poll timer.
   await quotaPoller.start();

@@ -23,7 +23,6 @@ import {
   TextInputStyle,
   AttachmentBuilder,
   PermissionFlagsBits,
-  SnowflakeUtil,
   type Message,
   type TextChannel,
   type ThreadChannel,
@@ -542,8 +541,7 @@ export class DiscordAdapter implements ChatAdapter {
    * the one active-threads call per guild. Inbound admission is keyed by
    * message id, so a message that was taken live is ignored.
    */
-  async catchUpMessagesSince(sinceMs: number): Promise<number> {
-    const after = SnowflakeUtil.generate({ timestamp: sinceMs }).toString();
+  async catchUpMessagesAfter(after: string): Promise<number> {
     const missed: Message[] = [];
     for (const guild of this.client.guilds.cache.values()) {
       const { threads } = await guild.channels.fetchActiveThreads();

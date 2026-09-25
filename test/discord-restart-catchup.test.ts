@@ -4,7 +4,7 @@ import { DiscordAdapter } from "../packages/core/src/platforms/discord/adapter.j
 
 const id = (ms: number) => SnowflakeUtil.generate({ timestamp: ms }).toString();
 
-describe("DiscordAdapter.catchUpMessagesSince (#653)", () => {
+describe("DiscordAdapter.catchUpMessagesAfter (#653)", () => {
   it("fetches only threads with newer messages and replays them oldest first", async () => {
     const logger = { child: vi.fn(), warn: vi.fn(), error: vi.fn(), info: vi.fn() };
     logger.child.mockReturnValue(logger);
@@ -30,13 +30,12 @@ describe("DiscordAdapter.catchUpMessagesSince (#653)", () => {
     const handled: string[] = [];
     (adapter as any).handleMessage = vi.fn(async (msg: { id: string }) => { handled.push(msg.id); });
 
-    const found = await adapter.catchUpMessagesSince(since);
+    const after = id(since);
+    const found = await adapter.catchUpMessagesAfter(after);
 
     expect(found).toBe(2);
     expect(quietFetch).not.toHaveBeenCalled();
-    const [{ after, limit }] = busyFetch.mock.calls[0] as unknown as [{ after: string; limit: number }];
-    expect(SnowflakeUtil.timestampFrom(after)).toBe(since);
-    expect(limit).toBe(100);
+    expect(busyFetch).toHaveBeenCalledWith({ after, limit: 100 });
     expect(handled).toEqual([early, late]);
   });
 });

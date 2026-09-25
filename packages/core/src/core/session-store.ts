@@ -2861,6 +2861,16 @@ export class SessionStore {
     return row ? mapInboundAdmission(row) : null;
   }
 
+  /** Newest Discord message this controller took, by message id (#653). */
+  newestInboundMessageId(): string | undefined {
+    const row = this.db
+      .prepare<[], { message_id: string }>(
+        "SELECT message_id FROM inbound_admissions ORDER BY length(message_id) DESC, message_id DESC LIMIT 1"
+      )
+      .get();
+    return row?.message_id;
+  }
+
   listInboundNonterminal(channelRef?: string): InboundAdmission[] {
     const rows = channelRef
       ? this.db

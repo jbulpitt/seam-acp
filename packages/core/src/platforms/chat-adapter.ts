@@ -150,9 +150,9 @@ export interface ChatAdapter {
    */
   fetchMessagePage?(threadId: string, request: MessagePageRequest): Promise<MessagePage>;
 
-  /** Optional: pass messages created at or after `sinceMs` through the normal
-   *  inbound handler, oldest first. Returns how many were found. */
-  catchUpMessagesSince?(sinceMs: number): Promise<number>;
+  /** Optional: pass messages newer than `afterId` through the normal inbound
+   *  handler, oldest first. Returns how many were found. */
+  catchUpMessagesAfter?(afterId: string): Promise<number>;
 
   /** Optional: this application's bot user id, used to identify Seam assistant posts. */
   getBotUserId?(): string | undefined;

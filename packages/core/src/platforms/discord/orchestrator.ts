@@ -752,10 +752,6 @@ interface ChannelQueueMeta {
   executing?: number;
 }
 
-/** When the last process stopped taking Discord messages (#653). */
-function admissionClosedMarkerPath(dataDir: string): string {
-  return path.join(dataDir, "admission-closed-at");
-}
 
 export class ChannelQueueFencedError extends Error {
   constructor(readonly channelId: string, readonly epoch: number) {
@@ -3375,11 +3371,6 @@ export class Orchestrator {
     this.stopIntake();
     if (this.gatewayClosed) return;
     this.gatewayClosed = true;
-    try {
-      fs.writeFileSync(admissionClosedMarkerPath(this.config.DATA_DIR), new Date().toISOString());
-    } catch (err) {
-      this.logger.warn({ err }, "could not record admission close; the next boot will not catch up");
-    }
     this.logger.info(
       { inboundWork: this.inboundWork.size },
       "gateway admission closed; Discord ingress refused"
@@ -3387,25 +3378,16 @@ export class Orchestrator {
   }
 
   /**
-   * Run Discord messages that arrived between the previous process closing
-   * admission and this one connecting (#653). Called once, after the adapter
+   * Run Discord messages newer than the last one this controller took (#653):
+   * those refused while shutting down and those sent while no process held the
+   * gateway, after a clean restart or a crash. Called once, after the adapter
    * is up.
    */
   async catchUpAfterRestart(): Promise<void> {
-    const marker = admissionClosedMarkerPath(this.config.DATA_DIR);
-    let closedAt: number;
-    try {
-      closedAt = Date.parse(fs.readFileSync(marker, "utf8").trim());
-      fs.rmSync(marker, { force: true });
-    } catch {
-      return;
-    }
-    if (!Number.isFinite(closedAt) || !this.adapter.catchUpMessagesSince) return;
-    const found = await this.adapter.catchUpMessagesSince(closedAt);
-    this.logger.info(
-      { since: new Date(closedAt).toISOString(), found },
-      "caught up on Discord messages sent during the restart"
-    );
+    const after = this.store.newestInboundMessageId();
+    if (!after || !this.adapter.catchUpMessagesAfter) return;
+    const found = await this.adapter.catchUpMessagesAfter(after);
+    this.logger.info({ after, found }, "caught up on Discord messages sent during the restart");
   }
 
   /**

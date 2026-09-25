@@ -247,28 +247,39 @@ describe("statuspage adapter", () => {
     ).toBe("major_outage");
   });
 
-  it("fails closed when a configured component id has left the page", () => {
+  it("watches the remaining components and notes one that has left the page", () => {
     const summary = JSON.parse(fixture("statuspage/github-summary.json")) as {
       components: { id: string }[];
     };
     summary.components = summary.components.filter(
       (component) => component.id !== GITHUB_COMPONENT_IDS.copilot
     );
+    const result = normalizeStatuspage(
+      statuspageConfig({
+        selectedComponentIds: [GITHUB_COMPONENT_IDS.apiRequests, GITHUB_COMPONENT_IDS.copilot],
+      }),
+      { summary: JSON.stringify(summary), incidents: null },
+      NOW
+    );
+    expect(result.components.filter((c) => c.selected).map((c) => c.id)).toEqual([
+      GITHUB_COMPONENT_IDS.apiRequests,
+    ]);
+    expect(result.notes.join(" ")).toMatch(/absent from the page: pjmpxvq2cmr2; watching the rest/);
+  });
 
-    expect(() =>
-      normalizeStatuspage(
-        statuspageConfig({
-          selectedComponentIds: [GITHUB_COMPONENT_IDS.apiRequests, GITHUB_COMPONENT_IDS.copilot],
-        }),
-        { summary: JSON.stringify(summary), incidents: null },
-        NOW
-      )
-    ).toThrow(/configured component id "pjmpxvq2cmr2" is absent from the page/i);
+  it("watches every component when all configured ones have left the page", () => {
+    const summary = fixture("statuspage/github-summary.json");
+    const result = normalizeStatuspage(
+      statuspageConfig({ selectedComponentIds: ["gone-1"] }),
+      { summary, incidents: null },
+      NOW
+    );
+    expect(result.components.every((c) => c.selected)).toBe(true);
+    expect(result.notes.join(" ")).toMatch(/watching every component/);
   });
 
   it("never silently selects zero components", () => {
-    // Every configured id resolves, or the refresh throws — there is no path
-    // that yields an empty selection from a non-empty configuration.
+    // A non-empty configuration never yields an empty selection.
     const summary = fixture("statuspage/github-summary.json");
     for (const id of Object.values(GITHUB_COMPONENT_IDS)) {
       const result = normalizeStatuspage(

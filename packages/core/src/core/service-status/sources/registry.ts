@@ -63,11 +63,10 @@ export const ANTHROPIC_COMPONENT_IDS = {
 } as const;
 
 export const OPENAI_COMPONENT_IDS = {
-  responses: "01JP8CD9JR3HR6Y7G4Q75N4DVW",
-  chatCompletions: "01JMXBRMFE6N2NNT7DG6XZQ6PW",
   codexApi: "01KMP3KP5MGE23B80K1EK4S8PV",
+  /** "CLI" — the Codex CLI Seam runs. */
+  cli: "01KMKFAMWKNQ84Z1766MV08ZDE",
   codexWeb: "01JVCV8YSWZFRSM1G5CVP253SK",
-  codexInChatGptDesktop: "01KMKFAMWKQ81YWSE1Z18R6VHR",
   vsCodeExtension: "01KMP3KP5M8X0EBTVW6KN327EE",
 } as const;
 

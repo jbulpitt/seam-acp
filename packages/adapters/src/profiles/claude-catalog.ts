@@ -251,7 +251,7 @@ export interface ClaudeVerifiedOverlayEntry {
  * Versioned. Bump when entries change so an auditor can tell which generation
  * of evidence a published snapshot carries.
  */
-export const CLAUDE_VERIFIED_OVERLAY_VERSION = 1;
+export const CLAUDE_VERIFIED_OVERLAY_VERSION = 2;
 
 /**
  * Verified 2026-09-02 (docs/model-management-runbook.md, "Current verified
@@ -270,14 +270,26 @@ export const CLAUDE_VERIFIED_OVERLAY: ReadonlyArray<ClaudeVerifiedOverlayEntry> 
   {
     modelId: "default",
     displayName: "Opus latest",
-    verifiedOn: "2026-09-02",
-    wrapperVersion: "claude-agent-acp 0.73.0",
-    claudeCodeVersion: "@anthropic-ai/claude-code (ACP SDK 1.4.0)",
+    verifiedOn: "2026-09-24",
+    wrapperVersion: "claude-agent-acp 0.81.1",
+    claudeCodeVersion: "@anthropic-ai/claude-code 2.1.282 (claude-agent-sdk 0.3.280)",
     credentialScope: "default",
-    resolvedModel: "claude-opus-5",
+    resolvedModel: "claude-opus-5-5",
     contextWindow: 1_000_000,
     effortChoices: ["default", "low", "medium", "high", "xhigh", "max"],
     evidence: "runbook §4 JSONL entry.message.model + §4a raw-CLI /context; §11 JSONL effort",
+  },
+  {
+    modelId: "claude-opus-5-5",
+    displayName: "Opus 5.5",
+    verifiedOn: "2026-09-24",
+    wrapperVersion: "claude-agent-acp 0.81.1",
+    claudeCodeVersion: "@anthropic-ai/claude-code 2.1.282 (claude-agent-sdk 0.3.280)",
+    credentialScope: "default",
+    resolvedModel: "claude-opus-5-5",
+    contextWindow: 1_000_000,
+    effortChoices: ["default", "low", "medium", "high", "xhigh", "max"],
+    evidence: "runbook §4 JSONL entry.message.model + usage_update size 1000000; effort levels not separately probed (§11)",
   },
   {
     modelId: "claude-fable-5-1",

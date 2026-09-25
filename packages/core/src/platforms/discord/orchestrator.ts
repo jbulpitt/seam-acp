@@ -3377,6 +3377,43 @@ export class Orchestrator {
     );
   }
 
+  /** Transcribe a message's voice notes, post the Heard: line, and return
+   *  the text block the prompt carries (a fail-visible note on error). */
+  private async transcribeVoiceNotes(msg: IncomingMessage, channel: ChannelRef): Promise<string | undefined> {
+    const speakerLabel = (msg.authorName && msg.authorName.trim()) || "user";
+    try {
+      const voiced = await applyVoiceNoteTranscriptions({
+        prompt: "",
+        attachments: msg.attachments ?? [],
+        provider: this.config.SEAM_GEMINI_SPEECH_PROVIDER,
+        apiKey: this.config.SEAM_GEMINI_API_KEY,
+        vertexProjectId: this.config.SEAM_GEMINI_VERTEX_PROJECT_ID,
+        vertexLocation: this.config.SEAM_GEMINI_VERTEX_LOCATION,
+        model: this.config.SEAM_GEMINI_SPEECH_PROVIDER === "vertex"
+          ? this.config.SEAM_GEMINI_VERTEX_STT_MODEL
+          : this.config.SEAM_GEMINI_STT_MODEL,
+        customVocabulary: this.config.SEAM_GEMINI_STT_CUSTOM_VOCABULARY,
+        onFallback: (event) => {
+          this.logger.warn(event, "voice-note STT fell back to general Gemini model");
+        },
+        speakerLabel,
+      });
+      const heard = formatHeardMessage(voiced.notes);
+      if (heard) {
+        await this.adapter.sendMessage(channel, heard).catch((err) => {
+          this.logger.warn({ err }, "failed to post voice-note Heard: line");
+        });
+      }
+      return voiced.prompt || undefined;
+    } catch (err) {
+      this.logger.warn({ err }, "voice-note STT threw; continuing with fail-visible note");
+      await this.adapter.sendMessage(channel, `_Couldn't transcribe voice note:_ unexpected error`).catch(
+        () => {}
+      );
+      return `_Voice note from ${speakerLabel} (transcription failed: unexpected error)._`;
+    }
+  }
+
   /**
    * Run Discord messages newer than the last one this controller took (#653):
    * those refused while shutting down and those sent while no process held the
@@ -4566,6 +4603,12 @@ export class Orchestrator {
       };
       activeRuntime.onEvent(eventHandler);
 
+      // Voice notes are transcribed before the first card post so the Heard:
+      // line lands above the status card, in the order the user reads them.
+      const voiceNoteText = msg.attachments?.length
+        ? await this.transcribeVoiceNotes(msg, channel)
+        : undefined;
+
       status.setAction("Thinking…");
       await refresh(true);
       refreshTyping();
@@ -4716,43 +4759,7 @@ export class Orchestrator {
         if (promptAttachments.length === 0) promptAttachments = undefined;
       }
 
-      if (msg.attachments && msg.attachments.length > 0) {
-        const speakerLabel =
-          (msg.authorName && msg.authorName.trim()) || speaker?.name || "user";
-        try {
-          const voiced = await applyVoiceNoteTranscriptions({
-            prompt: promptText,
-            attachments: msg.attachments,
-            provider: this.config.SEAM_GEMINI_SPEECH_PROVIDER,
-            apiKey: this.config.SEAM_GEMINI_API_KEY,
-            vertexProjectId: this.config.SEAM_GEMINI_VERTEX_PROJECT_ID,
-            vertexLocation: this.config.SEAM_GEMINI_VERTEX_LOCATION,
-            model: this.config.SEAM_GEMINI_SPEECH_PROVIDER === "vertex"
-              ? this.config.SEAM_GEMINI_VERTEX_STT_MODEL
-              : this.config.SEAM_GEMINI_STT_MODEL,
-            customVocabulary: this.config.SEAM_GEMINI_STT_CUSTOM_VOCABULARY,
-            onFallback: (event) => {
-              this.logger.warn(event, "voice-note STT fell back to general Gemini model");
-            },
-            speakerLabel,
-          });
-          promptText = voiced.prompt;
-          const heard = formatHeardMessage(voiced.notes);
-          if (heard) {
-            await this.adapter.sendMessage(channel, heard).catch((err) => {
-              this.logger.warn({ err }, "failed to post voice-note Heard: line");
-            });
-          }
-        } catch (err) {
-          this.logger.warn({ err }, "voice-note STT threw; continuing with fail-visible note");
-          const fail =
-            `_Voice note from ${speakerLabel} (transcription failed: unexpected error)._`;
-          promptText = promptText ? `${promptText}\n\n${fail}` : fail;
-          await this.adapter.sendMessage(channel, `_Couldn't transcribe voice note:_ unexpected error`).catch(
-            () => {}
-          );
-        }
-      }
+      if (voiceNoteText) promptText = promptText ? `${promptText}\n\n${voiceNoteText}` : voiceNoteText;
 
       // One transparent retry on transient failures. Both cases fire before any
       // output is buffered so the retry is invisible to the user.

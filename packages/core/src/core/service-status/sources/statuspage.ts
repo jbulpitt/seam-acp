@@ -54,6 +54,7 @@ const COMPONENT_STATUSES: Readonly<Record<string, ServiceStatusLevel>> = {
   degraded_performance: "degraded",
   partial_outage: "partial_outage",
   major_outage: "major_outage",
+  full_outage: "major_outage",
 };
 
 const INCIDENT_IMPACTS: Readonly<Record<string, ServiceStatusLevel>> = {
@@ -203,10 +204,9 @@ function normalizeComponents(
     const id = requireString(label, record.id, "component.id");
     const name = requireString(label, record.name, "component.name");
     const statusValue = requireString(label, record.status, "component.status");
-    const reported = COMPONENT_STATUSES[statusValue];
-    if (!reported) {
-      failSchema(label, `component ${JSON.stringify(name)} has unknown status ${JSON.stringify(statusValue)}`);
-    }
+    // An unrecognized word grades as `unknown` rather than failing the whole
+    // feed: one component's new status blinded the OpenAI source for two weeks.
+    const reported = COMPONENT_STATUSES[statusValue] ?? "unknown";
     parsed.push({
       id,
       name,

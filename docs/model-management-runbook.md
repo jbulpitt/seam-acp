@@ -72,7 +72,8 @@ model's native window comes from the `CLAUDE_CONTEXT_WINDOWS` table in
 
 | Picker value | Resolves to (JSONL) | Window | Mechanism |
 |---|---|---|---|
-| `default` ⭐ | claude-opus-5 (auto-rolls) | 1M | alias (Max → latest Opus) |
+| `default` ⭐ | claude-opus-5-5 (auto-rolls; re-verified 2026-09-24) | 1M | alias (Max → latest Opus) |
+| `claude-opus-5-5` | claude-opus-5-5 | 1M | full ID (`ANTHROPIC_MODEL` + exact-match); verified 2026-09-24 on claude-agent-acp 0.81.1 |
 | `claude-fable-5-1` | claude-fable-5-1 | 1M | full ID (`ANTHROPIC_MODEL` + exact-match) |
 | `claude-opus-5` | claude-opus-5 | 1M | full ID (`ANTHROPIC_MODEL` + exact-match) |
 | `claude-opus-4-8` | claude-opus-4-8 | 1M | full ID (`ANTHROPIC_MODEL` + exact-match) |

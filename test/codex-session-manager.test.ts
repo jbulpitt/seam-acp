@@ -325,6 +325,23 @@ describe("Codex Session Manager", () => {
     expect(usage.model).toBe("gpt-5.4");
   });
 
+  it("getUsage finds a rollout by its first line when the name has no id", async () => {
+    writeRollout(root, ID_B, "/other/repo");
+    const file = writeRollout(root, ID_A, "/workspace/repo", [
+      rolloutLine("event_msg", {
+        type: "token_count",
+        info: {
+          total_token_usage: { total_tokens: 70 },
+          last_token_usage: { total_tokens: 70 },
+          model_context_window: 258400,
+        },
+      }),
+    ]);
+    fs.renameSync(file, path.join(path.dirname(file), "rollout-renamed.jsonl"));
+    const usage = await manager.getUsage("/workspace/repo", ID_A);
+    expect(usage.totalUsed).toBe(70);
+  });
+
   it("never throws from listSessions on a missing root", async () => {
     const missing = new CodexSessionManager({
       sessionsRoot: path.join(root, "does-not-exist"),

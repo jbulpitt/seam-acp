@@ -119,6 +119,20 @@ export function resolvePublicBridgeWsUrl(opts: {
   return `ws://127.0.0.1:${opts.healthPort}${BRIDGE_PATH}`;
 }
 
+/**
+ * Origin a bridge dialed to reach this controller, from its upgrade request
+ * (#650). Its agents can reach seam-MCP on the same path: a bridge on the
+ * WireGuard link gets `http://10.x:3000`, one through the tunnel gets the
+ * public https origin. Undefined when there is no usable host.
+ */
+export function dialedOriginFromUpgrade(headers: Record<string, string | string[] | undefined>): string | undefined {
+  const first = (v: string | string[] | undefined) => (Array.isArray(v) ? v[0] : v)?.split(",")[0]?.trim();
+  const host = first(headers["x-forwarded-host"]) || first(headers.host);
+  if (!host || isLoopbackHost(baseHost(`http://${host}`))) return undefined;
+  const proto = first(headers["x-forwarded-proto"]) === "https" ? "https" : "http";
+  return `${proto}://${host}`;
+}
+
 /** Origin used to build `https://host/mcp` from a `/bridge` WS URL. */
 export function publicBaseFromBridgeWsUrl(wsUrl: string): string | undefined {
   return publicBaseFromTunnelUrl(wsUrl.replace(/\/bridge\/?$/, ""));

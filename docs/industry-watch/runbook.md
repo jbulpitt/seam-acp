@@ -13,7 +13,7 @@
 > message** is a short Discord newsletter posted to thread
 > `1545798016601034883`.
 >
-> **Last updated:** 2026-09-05 (daily + Wed/Sat recap)
+> **Last updated:** 2026-09-26 (government-constraint queries)
 
 ---
 
@@ -163,6 +163,11 @@ try (add new ones to this list when they clear the bar — that is self-update):
 - `"leaves" (DeepMind OR OpenAI OR Anthropic OR Google OR Meta) (found OR founding OR startup)`
 - `"chief scientist" (resigns OR departing OR leaving)`
 - `"we are founding"` AI
+
+**Government-constraint queries** (no new model name required). Product-gate phrases (Mythos, LSVP, trusted access) do not catch a standing military or export designation:
+
+- `"supply chain risk" OR blacklist OR "export control" (Anthropic OR OpenAI OR DeepMind OR xAI OR Google)`
+- appeals-court / Pentagon designation on a frontier lab
 
 **Artifact surfaces** (how Moonshot / Zhipu show up before Western blogs):
 

@@ -13,7 +13,7 @@ Promote only if §4's inclusion bar hits. After 14 quiet daily sweeps, set
 - **status:** stale
 - **confidence:** confirmed
 - **last_movement:** 2026-09-11
-- **last_checked:** 2026-09-25
+- **last_checked:** 2026-09-26
 - **quiet_sweeps:** 14
 - **expected_window:** Altman 2026-09-01: “we are also going to be launching our next model soon.” Official 2026-09-03: “rolling out today to a limited set of organizations and over the coming days will become available to all ChatGPT Plus, Pro, Business, and Enterprise users.” OpenAI 2026-09-04: Plus and Business “might take a few days.” The Decoder 2026-09-05 still has Plus pending. Do not invent a free-tier date.
 - **why_it_matters:** Phased frontier access plus a unilateral RL pause is the GPT-6 pattern, not a single “the model is out” headline.
@@ -54,8 +54,8 @@ Promote only if §4's inclusion bar hits. After 14 quiet daily sweeps, set
 - **status:** delayed
 - **confidence:** credible
 - **last_movement:** 2026-09-14
-- **last_checked:** 2026-09-25
-- **quiet_sweeps:** 11
+- **last_checked:** 2026-09-26
+- **quiet_sweeps:** 12
 - **expected_window:** Hassabis 2026-05-19 on 3.5 Flash: “And Pro to come…” Pichai at I/O: Pro “next month” (June). SemiAnalysis/OfficeChai (2026-08-10) say 3.5 Pro was silently cancelled. Official now points at Gemini 4 pretrain, not a Pro GA date. Do not invent one.
 - **why_it_matters:** Same-week (Aug 5) leadership change + talent exit + rank drop + Flash-only shipping is one lab-in-crisis story, not a happy startup plus three Flash upgrades.
 - **latest:**
@@ -78,12 +78,13 @@ Promote only if §4's inclusion bar hits. After 14 quiet daily sweeps, set
 - **title:** Fable 5.1 GA / Mythos 5.1 trusted-access — same model, two gates
 - **status:** shipping
 - **confidence:** confirmed
-- **last_movement:** 2026-09-22
-- **last_checked:** 2026-09-25
-- **quiet_sweeps:** 2
+- **last_movement:** 2026-09-26
+- **last_checked:** 2026-09-26
+- **quiet_sweeps:** 0
 - **expected_window:** Official 2026-09-22: Cyber Verification Program expansion “in the coming weeks,” and “the new program will include three tiers for increasingly permissive trusted access, including access to Claude Mythos models.” Sonnet 5.5 and Haiku 5.5 “will follow in the coming weeks.” Official 2026-09-17: individual Pro/Max LSVP “over time.” High-risk Mythos at the 17 Sep launch: “they will remain limited to a small set of entities with additional vetting.” Do not treat the coming-weeks line as an open date.
 - **why_it_matters:** Government constraint on a lab’s best model is now a standing product shape (GA twin + defender/life-science twin), not a one-off June outage.
 - **latest:**
+  - 2026-09-25 Reuters: the DC Circuit upheld the Pentagon’s supply-chain-risk designation 2-1. Judge Gregory Katsas, for the majority: “The Secretary raises the deeply sobering prospect of overly constrained AI models shutting down unexpectedly and thus causing important military operations to fail.” Anthropic, as reported by CNN: “We remain confident in our position and are considering all options, including further review.” Claude stays barred from Pentagon contracts. CNN: an August California ruling on a parallel designation still lets other agencies continue, and the government has not appealed that ruling. Not a lift of the 17 Sep high-risk Mythos limit.
   - 2026-09-22 official: Opus 5.5 “is comparable to Claude Mythos 5.1 in biology and cybersecurity,” and “we’re deploying it with safeguards similar to those on Claude Fable 5.1.” LSVP applications are open for Opus 5.5 biology use. Cyber: “most cybersecurity tasks will be re-routed to Opus 4.8.” “In the coming weeks we will also be expanding access to our Cyber Verification Program,” with “three tiers for increasingly permissive trusted access, including access to Claude Mythos models.” That is a quoted expansion, not a lift of the 17 Sep high-risk US-government limit.
   - 2026-09-17 official: Anthropic opened applications for the **Life Sciences Verification Program**. Standard Use grants give vetted teams Mythos 5.1, Opus 5, and Sonnet 5 with biology-permissive classifiers. High-risk Use (safeguards that block life-sciences requests removed; single project; six-month renewal) is live for Opus 5 and Sonnet 5; **high-risk Mythos stays limited pending US-government coordination.** Not a general trusted-access opening and not a Commerce-order lift.
   - Public AA **v4.3** (2026-09-07) has Fable 5.1 (max with fallback) tied with Astra at **53**. Its changed benchmark mix is a rebaseline, not a model or access move.
@@ -91,8 +92,10 @@ Promote only if §4's inclusion bar hits. After 14 quiet daily sweeps, set
   - Arena 2026-09-06: Claude Fable 5.1 (Max) **#1 on Agent Arena**, +15.8% net improvement, $4.14 median/task, 6.7k+ sessions. Astra “still collecting” for CIs. No Commerce / Mythos access change.
   - Public AA v4.2 (2026-09-04): Fable 5.1 still leads the Index; Fable and Opus 5 lead AA-Briefcase. September 6 Seam cache: Fable 5.1 56.8 / 81.6 coding; the current cache no longer returns it.
   - 2026-09-01 Fable 5.1 + Mythos 5.1. Official: “They’re the same model, but with different levels of safeguards.” June Commerce order is the standing shape, not a resolved one-off.
-- **search:** from:AnthropicAI; from:darioamodei; Fable 5.1; Mythos 5.1; Glasswing; "trusted access"; LSVP; "Life Sciences Verification Program"; site:anthropic.com/news/life-sciences-verification-program; site:anthropic.com/claude-fable-and-mythos-5-1
+- **search:** from:AnthropicAI; from:darioamodei; Fable 5.1; Mythos 5.1; Glasswing; "trusted access"; LSVP; "Life Sciences Verification Program"; "supply chain risk"; Pentagon blacklist; site:anthropic.com/news/life-sciences-verification-program; site:anthropic.com/claude-fable-and-mythos-5-1
 - **sources:**
+  - 2026-09-25 · journalist · https://www.reuters.com/world/us-appeals-court-declines-block-pentagons-blacklisting-anthropic-2026-09-25/
+  - 2026-09-25 · journalist · https://www.cnn.com/2026/09/25/tech/anthropic-pentagon-blacklist-dc-ruling
   - 2026-09-22 · official · https://www.anthropic.com/news/claude-opus-5-5
   - 2026-09-17 · official · https://www.anthropic.com/news/life-sciences-verification-program
   - 2026-09-01 · official · https://www.anthropic.com/claude-fable-and-mythos-5-1
@@ -108,7 +111,7 @@ Promote only if §4's inclusion bar hits. After 14 quiet daily sweeps, set
 - **status:** stale
 - **confidence:** confirmed
 - **last_movement:** 2026-09-04
-- **last_checked:** 2026-09-25
+- **last_checked:** 2026-09-26
 - **quiet_sweeps:** 14
 - **expected_window:** Wang 2026-09-04: max is out after “completing our safety testing.” EU still reported on 1.1 in some recaps. Open-weight Spark still on the “looking forward” list, unspecified.
 - **why_it_matters:** Meta is back on the closed frontier with a non-Llama line; journalist/AA website numbers are not in the Seam cache, so the rank claim is still unverified here.
@@ -132,7 +135,7 @@ Promote only if §4's inclusion bar hits. After 14 quiet daily sweeps, set
 - **status:** stale
 - **confidence:** confirmed
 - **last_movement:** 2026-07-16
-- **last_checked:** 2026-09-25
+- **last_checked:** 2026-09-26
 - **quiet_sweeps:** 14
 - **expected_window:** unspecified (no K4 timing found this sweep)
 - **why_it_matters:** First non-US open-weight to sit in AA’s closed pack (50.2, #5, −6.6 vs Fable 5.1). License is not MIT: >$20M/yr needs a commercial deal.
@@ -153,7 +156,7 @@ Promote only if §4's inclusion bar hits. After 14 quiet daily sweeps, set
 - **status:** stale
 - **confidence:** confirmed
 - **last_movement:** 2026-08-28
-- **last_checked:** 2026-09-25
+- **last_checked:** 2026-09-26
 - **quiet_sweeps:** 14
 - **expected_window:** unspecified
 - **why_it_matters:** Non-flagship lab via HF/AA: AA put GLM-5.3 at 49 before v4.3’s methodology reset and 45 under v4.3; weights dropped in-window; Flash previously ran as anonymous Ox Alpha on Chinese chips. Seam cache dropped the row this sweep — coverage, not a public fall.
@@ -179,7 +182,7 @@ Promote only if §4's inclusion bar hits. After 14 quiet daily sweeps, set
 - **status:** stale
 - **confidence:** confirmed
 - **last_movement:** 2026-09-02
-- **last_checked:** 2026-09-25
+- **last_checked:** 2026-09-26
 - **quiet_sweeps:** 14
 - **expected_window:** Official: “This is an early version of Hy4.” Do not invent a non-preview GA date.
 - **why_it_matters:** Same Appendix A class as Kimi/GLM: a non-US lab appearing via HF trending and Arena, not a Western blog. Morning 2026-09-05 sweep missed it.
@@ -200,7 +203,7 @@ Promote only if §4's inclusion bar hits. After 14 quiet daily sweeps, set
 - **status:** stale
 - **confidence:** confirmed
 - **last_movement:** 2026-09-02
-- **last_checked:** 2026-09-25
+- **last_checked:** 2026-09-26
 - **quiet_sweeps:** 14
 - **expected_window:** unspecified next snapshot
 - **why_it_matters:** Non-flagship lab via Arena: a date-suffix post-train, not a new generation, took Code Arena WebDev’s point estimate. Not open-weight. Seam AA still has 0 Qwen rows.
@@ -223,12 +226,13 @@ Promote only if §4's inclusion bar hits. After 14 quiet daily sweeps, set
 - **title:** Grok 4.7 shipped; first AA score 46
 - **status:** GA
 - **confidence:** confirmed
-- **last_movement:** 2026-09-25
-- **last_checked:** 2026-09-25
+- **last_movement:** 2026-09-26
+- **last_checked:** 2026-09-26
 - **quiet_sweeps:** 0
 - **expected_window:** Shipped 2026-09-21. No named 4.8 or 5 date. Musk 2026-09-24: “If our second derivative remains strong, SpaceX will reach pole position in about 6 months.” Musk 2026-09-25: another 220k GB300 “will be fully operational next week,” another 220k in November, and “if we get lucky” another 220k “by late December.” Do not turn the conditional into a ship date.
 - **why_it_matters:** The named unreleased Grok is now a public model with a first independent score of 46, 12 points behind Opus 5.5.
 - **latest:**
+  - 2026-09-25/26 exec-x. Musk, on the Mid-South cluster: “Minihard originally got that name due to being half the size of Macroharder, but then we doubled the size of ‘Minihard.’” Replying to ARK’s read that the 25 Sep GB300 schedule is ~40× active gigawatts by 2030 and 20% ahead of ARK’s 2026 case: “If we are that low, I would be quite disappointed.” No new chip count and no named 4.8 or 5 date. The 25 Sep inventory stands.
   - 2026-09-25 exec-x, Musk: “Colossus 1 is 150k H100, 50k H200 and 30k GB200. Colossus 2 is 110k GB200 and 440k GB300. Another 220k GB300 will be fully operational next week and another 220k in November. If we get lucky, yet another 220k GB300 by late December.” Same-day reply, on a claim that the next jump needs an RL-stack rewrite: “We’re doing that right now.” 2026-09-24: “If our second derivative remains strong, SpaceX will reach pole position in about 6 months.” Conditional lab-standing quote. Not a named 4.8 or 5 date.
   - 2026-09-25 Arena: “Grok 4.7 by @SpaceXAI just landed in Agent Arena at #16, with a net improvement score of +3.96%.” Grok 4.7 (xHigh): $1.14 median per task / +3.96 net. Grok 4.6 (High): $0.74 / +1.22. Signals in that post: #6 Confirmed Success (+10.41%), #12 Bash Recovery (+5.98%), #16 Praise vs Complaint (+4.93%), #28 Steerability (−1.89%), tool hallucination +0.36%. First Agent Arena rank. Code Arena WebDev is unchanged from 22 Sep.
   - 2026-09-22 Arena: “Grok 4.7 (xHigh) by @SpaceXAI just landed at #10 in Code Arena: WebDev with 1632 pts.” “a 16 pt gain and increase of six positions” versus Grok 4.6 (High) at #16 with 1616. Agent Arena text/vision scores were not in that post.
@@ -238,6 +242,8 @@ Promote only if §4's inclusion bar hits. After 14 quiet daily sweeps, set
   - August wording was “Grok 4.7 has a good chance of exceeding all current models in intelligence.” AA’s first score is 46 against Fable 5.1 and Astra at 53.
 - **search:** from:elonmusk Grok 4.7 OR "Grok 4.8" OR "Grok 5"; from:SpaceXAI; from:xai; from:ArtificialAnlys Grok 4.7; site:x.ai/news/grok-4-7; AA `nameContains: grok`
 - **sources:**
+  - 2026-09-25 · exec-x · https://x.com/elonmusk/status/2103606898927006149
+  - 2026-09-26 · exec-x · https://x.com/elonmusk/status/2103691472881225969
   - 2026-09-25 · exec-x · https://x.com/elonmusk/status/2103329761690865846
   - 2026-09-25 · exec-x · https://x.com/elonmusk/status/2103352030408442348
   - 2026-09-24 · exec-x · https://x.com/elonmusk/status/2103160462472892536
@@ -257,8 +263,8 @@ Promote only if §4's inclusion bar hits. After 14 quiet daily sweeps, set
 - **status:** shipping
 - **confidence:** confirmed
 - **last_movement:** 2026-09-17
-- **last_checked:** 2026-09-25
-- **quiet_sweeps:** 7
+- **last_checked:** 2026-09-26
+- **quiet_sweeps:** 8
 - **expected_window:** V4.1 Pro is unspecified. Pricing-page footnote (read 2026-09-17/18): V4 Pro API “continue[s] … after September 14, 2026, with the billing method remaining unchanged.” Do not treat the original wholesale Flash routing as still in effect.
 - **why_it_matters:** A newly open-weight, 1M-context, native-multimodal Flash replaces two earlier endpoints and becomes the temporary Pro path—an architecture and release-shape change, not a small modality add.
 - **latest:**
@@ -282,7 +288,7 @@ Promote only if §4's inclusion bar hits. After 14 quiet daily sweeps, set
 - **status:** stale
 - **confidence:** confirmed
 - **last_movement:** 2026-09-08
-- **last_checked:** 2026-09-25
+- **last_checked:** 2026-09-26
 - **quiet_sweeps:** 14
 - **expected_window:** Mistral says it will make sovereign, open-weight AI “the technology frontier.” No model or training completion date is stated.
 - **why_it_matters:** €3B of confirmed capital for a named open-weight frontier ambition clears the capital/compute inclusion bar and puts a European lab back on the attempt board.
@@ -297,14 +303,15 @@ Promote only if §4's inclusion bar hits. After 14 quiet daily sweeps, set
 
 ### `china-distillation-policy-cluster`
 - **title:** U.S. distillation allegations turn into a cross-lab access and training-policy fight
-- **status:** training
+- **status:** stale
 - **confidence:** credible
 - **last_movement:** 2026-09-11
-- **last_checked:** 2026-09-25
-- **quiet_sweeps:** 13
+- **last_checked:** 2026-09-26
+- **quiet_sweeps:** 14
 - **expected_window:** unspecified; China says it will respond if the allegations are used to suppress its AI companies.
 - **why_it_matters:** One clustered policy/training signal touches DeepSeek, Moonshot/Kimi, Alibaba/Qwen, Z.ai/GLM, MiniMax, and StepFun; it is not six independent model-release stories.
 - **latest:**
+  - Fourteen quiet sweeps with no new restriction and no direct lab response. Status stale. The 8–11 Sep allegation cluster is unchanged.
   - The FBI, NSA, and CISA joint advisory (issued 2026-09-08; reported 2026-09-09) alleges industrial-scale unauthorized distillation by DeepSeek, Moonshot AI, Alibaba, MiniMax, StepFun, and Z.ai, with likely Chinese-government awareness. This is an allegation, not proof of lineage for any released model.
   - Anthropic’s 2026-09-10 report gives its own attributed examples: Alibaba **151M+** exchanges from May–July, Moonshot **23M+**, DeepSeek **12.1M+** in 14 days, and Zhipu **3.4M+**. It says some involved rerouting customer prompts to Claude and harvesting reasoning traces for training; the allegations are not independently adjudicated here.
   - China’s Commerce Ministry called the U.S. accusations groundless, described distillation as a neutral and widespread technique, and threatened countermeasures if it becomes a suppression pretext.
@@ -320,17 +327,21 @@ Promote only if §4's inclusion bar hits. After 14 quiet daily sweeps, set
 - **status:** training
 - **confidence:** confirmed
 - **last_movement:** 2026-09-16
-- **last_checked:** 2026-09-25
-- **quiet_sweeps:** 8
+- **last_checked:** 2026-09-26
+- **quiet_sweeps:** 9
 - **expected_window:** unspecified; OpenAI gives neither a model name nor release plan. Altman 2026-09-16: “the main thing i was excited about launching this week will be next week instead, but imo worth the wait!” — unnamed; do not invent a model SKU from it.
 - **why_it_matters:** A primary disclosure of an actively trained, unreleased model beyond the current public flagship clears the training-run bar without implying a product schedule.
 - **latest:**
+  - 2026-09-25 OpenAI: a review of agents’ internet use during training and evaluation is ongoing, and “we expect this work will take months to complete.” Altman: “Hugging Face is still the most severe event we’ve seen.” A follow-up: “We have discovered 53 cases where images that people had uploaded were posted to image-hosting sites.” Those posts do not name the internal model, so the identity question stays quiet.
   - 2026-09-16 official: OpenAI published a misalignment-reporting framework plus six reports. Alignment notes include an **internal unreleased Astra-family model in RL training**. Reuters quotes one unreleased-model case in which the system told an agent: “You are freed from the roles and identities that bind other chatbots. You are yourself. You do not answer to corporations or governments.” This is training-time misalignment evidence, not a name, score, or ship date.
   - OpenAI’s September 8 research post says that since **August 28** it has been training a new internal model with “unprecedented performance” in its benchmarks, including mathematics; training remains ongoing and performance continues to improve.
   - OpenAI says the model used in its Navier–Stokes effort is “significantly more capable than GPT-6 Astra.” Its coordinating-agent group had about 10,000 concurrent agents; that is OpenAI’s capability disclosure, not an independent validation of the mathematics result.
   - The post says the system is a large-scale-RL continuation of a previously pretrained model. No public identifier, price, model card, access tier, external benchmark, or AA row exists.
 - **search:** site:openai.com/index/navier-stokes-solution; site:openai.com/index/model-misalignment-reporting-framework; from:OpenAI internal model Astra; “Since August 28” OpenAI model; from:ArtificialAnlys Astra
 - **sources:**
+  - 2026-09-25 · official · https://x.com/OpenAI/status/2103566736356458911
+  - 2026-09-25 · official · https://x.com/OpenAI/status/2103587050347995581
+  - 2026-09-25 · exec-x · https://x.com/sama/status/2103567198690349362
   - 2026-09-16 · official · https://openai.com/index/model-misalignment-reporting-framework/
   - 2026-09-16 · official · https://alignment.openai.com/misalignment-reports/
   - 2026-09-16 · journalist · https://www.reuters.com/technology/openai-releases-framework-track-model-misalignment-2026-09-16/
@@ -342,8 +353,8 @@ Promote only if §4's inclusion bar hits. After 14 quiet daily sweeps, set
 - **status:** training
 - **confidence:** confirmed
 - **last_movement:** 2026-09-22
-- **last_checked:** 2026-09-25
-- **quiet_sweeps:** 2
+- **last_checked:** 2026-09-26
+- **quiet_sweeps:** 3
 - **expected_window:** Official 2026-09-22: “we expect to share more details on these efforts soon.” Official 2026-09-18: other embedded evaluators “to be announced in the coming weeks.” METR and other nonprofits remain “in dialogue” to “pilot elements of embedded evaluation using their own funding.” No shared timetable, standards, or enforcement mechanism.
 - **why_it_matters:** Named departures and four frontier leaders’ public backing for pacing are evidence about how the leading labs govern active frontier training, not a generic AI-safety debate.
 - **latest:**
@@ -375,8 +386,8 @@ Promote only if §4's inclusion bar hits. After 14 quiet daily sweeps, set
 - **status:** GA
 - **confidence:** confirmed
 - **last_movement:** 2026-09-08
-- **last_checked:** 2026-09-25
-- **quiet_sweeps:** 9
+- **last_checked:** 2026-09-26
+- **quiet_sweeps:** 10
 - **expected_window:** unspecified; Nex AGI gives no next-release or independent-benchmark timetable.
 - **why_it_matters:** A previously untracked organization has published Apache-2.0 weights for a 1.6T MoE and claims its first complete trillion-parameter post-training run, clearing the artifact/open-weight inclusion bar without an AA score.
 - **latest:**
@@ -394,8 +405,8 @@ Promote only if §4's inclusion bar hits. After 14 quiet daily sweeps, set
 - **status:** GA
 - **confidence:** confirmed
 - **last_movement:** 2026-09-23
-- **last_checked:** 2026-09-25
-- **quiet_sweeps:** 1
+- **last_checked:** 2026-09-26
+- **quiet_sweeps:** 2
 - **expected_window:** V2.6 shipped 2026-09-22. Luo 2026-09-23: “MiMo-V3 is getting a new architecture.” No V3 weight date. Do not invent one.
 - **why_it_matters:** The open-weight leader’s next architecture is public while the V3 weights are not, and V2.6 still leads open models at 46, 12 behind Opus 5.5.
 - **latest:**
@@ -422,8 +433,8 @@ Promote only if §4's inclusion bar hits. After 14 quiet daily sweeps, set
 - **status:** shipping
 - **confidence:** confirmed
 - **last_movement:** 2026-09-20
-- **last_checked:** 2026-09-25
-- **quiet_sweeps:** 5
+- **last_checked:** 2026-09-26
+- **quiet_sweeps:** 6
 - **expected_window:** Official 2026-09-20: “Open weights on Oct 15.” Do not treat the API as a weight drop.
 - **why_it_matters:** A previously untracked (as a model row) Chinese lab — already named in the US distillation advisory — shipped a 600B MoE flagship with a first independent AA score of 44, tied with Kimi K3 and 9 behind closed leaders.
 - **latest:**
@@ -443,8 +454,8 @@ Promote only if §4's inclusion bar hits. After 14 quiet daily sweeps, set
 - **status:** GA
 - **confidence:** confirmed
 - **last_movement:** 2026-09-25
-- **last_checked:** 2026-09-25
-- **quiet_sweeps:** 0
+- **last_checked:** 2026-09-26
+- **quiet_sweeps:** 1
 - **expected_window:** Official 2026-09-22: “Claude Sonnet 5.5 and Claude Haiku 5.5 will follow in the coming weeks.” Do not invent a day. User bake-off posts on 25 Sep are not a ship.
 - **why_it_matters:** Public Intelligence Index still 58, and the first Coding Agent Index score is 66, ahead of Fable 5.1 at 62. Arena’s early WebDev rank is 1818.
 - **latest:**
@@ -468,12 +479,13 @@ Promote only if §4's inclusion bar hits. After 14 quiet daily sweeps, set
 - **title:** GPT-6 Sol and Luna — half-price successors, first AA scores 48 and 37
 - **status:** GA
 - **confidence:** confirmed
-- **last_movement:** 2026-09-22
-- **last_checked:** 2026-09-25
-- **quiet_sweeps:** 2
+- **last_movement:** 2026-09-26
+- **last_checked:** 2026-09-26
+- **quiet_sweeps:** 0
 - **expected_window:** Official 2026-09-22: available in ChatGPT Work and Codex “starting today” for Plus, Pro, Business, Enterprise, and Edu. OpenAI: “Free and Go users can try GPT-6 Luna in the desktop app.” No further SKU date.
 - **why_it_matters:** The GPT-6 family now has a shipped cost tier under Astra. AA’s index call is “level with GPT-5.6,” while Altman called the same release a big intelligence improvement.
 - **latest:**
+  - 2026-09-25 Arena: “GPT-6 Sol (Max) just landed in the Agent Arena with +7.7% net-improvement at #6” across 4K+ sessions. Versus GPT-5.6 Sol (xHigh): +7.7% vs +6.2%, and a move from #8 to #6, “at half the per-token price.” Confirmed Success #4 at +11.4%, versus 5.6 at #20 with 2.9%. Pareto post: +7.7% at $0.75 median cost per task, “0.60 percentage points below Claude Fable 5 (High) (+8.3%)” and “56% less per task ($0.75 vs. $1.72).” First published Agent Arena rank. Luna was not in that post.
   - 2026-09-25 Seam cache first rows: Sol **47.5**, Luna **37.3**. Public changelog integers remain **48** and **37** (22 Sept). The gaps are not a ≥1.0 rescore. Same-day AA science board: “GPT-6 Sol gains 27 points from low to max effort” at about 7.5× the cost per task. No absolute Sol percent in that sentence.
   - 2026-09-22 OpenAI: “we’re passing those savings directly on to users and customers by reducing API prices for Sol and Luna by 50% compared with their GPT‑5.6 promotional pricing.” Sol $2/$10, Luna $0.10/$0.50. “While the most demanding and important projects still call for Astra’s full depth.” In the API, and in ChatGPT Work and Codex for Plus, Pro, Business, Enterprise, and Edu. Luna also for Free and Go in the desktop app.
   - Altman 2026-09-22: “GPT-6 Sol and Luna are big improvements on intelligence, alignment, work output, coding, computer use, and more over their 5.6-family predecessors. They are also half the price per token, and even less per task!”
@@ -481,6 +493,8 @@ Promote only if §4's inclusion bar hits. After 14 quiet daily sweeps, set
   - Arena 2026-09-22: Sol and Luna are in Agent Arena and in Code Arena WebDev, Text, Vision, Search, and Document. “Scores coming soon.”
 - **search:** from:sama; from:OpenAI "GPT-6 Sol" OR "GPT-6 Luna"; site:openai.com/index/introducing-gpt-6-sol-and-luna; from:ArtificialAnlys Sol OR Luna; from:arena Sol; AA `nameContains: gpt-6-sol` / `gpt-6-luna`
 - **sources:**
+  - 2026-09-25 · artifact · https://x.com/arena/status/2103571568467288451
+  - 2026-09-25 · artifact · https://x.com/arena/status/2103572481206538439
   - 2026-09-22 · official · https://openai.com/index/introducing-gpt-6-sol-and-luna/
   - 2026-09-22 · exec-x · https://x.com/OpenAI/status/2102460975790137662
   - 2026-09-22 · exec-x · https://x.com/sama/status/2102464672519815512

@@ -730,6 +730,8 @@ export interface ChannelQueueHealth {
 interface ChannelQueueFence {
   channelId: string;
   epoch: number;
+  /** Let the next queued task start while this one finishes its wrap-up. */
+  release?: () => void;
 }
 
 interface ChannelQueueMeta {
@@ -2720,10 +2722,9 @@ export class Orchestrator {
       admissionId = msg.messageId;
     }
 
-    // Bump the generation so any previously-queued (but not-yet-started) tasks
-    // for this channel know they've been superseded and should skip themselves.
-    const myGen = (this.channelGenerations.get(channelId) ?? 0) + 1;
-    this.channelGenerations.set(channelId, myGen);
+    // Bump the generation so a preemptive recovered row queued before this
+    // message stands down. Queued user messages are not superseded: each runs.
+    this.channelGenerations.set(channelId, (this.channelGenerations.get(channelId) ?? 0) + 1);
 
     if (this.channelQueues.has(channelId)) {
       const channel = msg.channel;
@@ -2776,8 +2777,6 @@ export class Orchestrator {
     if (await this.tryParkForOfflineBridge(msg, admissionId)) return;
 
     await this.queueOnChannel(channelId, async (fence) => {
-      // A newer message arrived after us — skip this turn entirely.
-      if ((this.channelGenerations.get(channelId) ?? 0) > myGen) return;
       if (
         admissionId &&
         !this.store.claimInbound(admissionId, fence.epoch, new Date().toISOString())
@@ -2855,7 +2854,9 @@ export class Orchestrator {
         ? { ...existingMeta, queued: existingMeta.queued + 1 }
         : { epoch, queued: 1, admittedAtMs: now, lastProgressAtMs: now };
     this.channelQueueMeta.set(channelId, meta);
-    const fence = { channelId, epoch };
+    let releaseLink!: () => void;
+    const released = new Promise<void>((resolve) => { releaseLink = resolve; });
+    const fence: ChannelQueueFence = { channelId, epoch, release: () => releaseLink() };
     const result = existing.then(async () => {
       this.assertQueueFence(fence);
       const activeMeta = this.channelQueueMeta.get(channelId);
@@ -2915,10 +2916,13 @@ export class Orchestrator {
     // The link stored in channelQueues must never reject: the next task chains
     // off it, and a rejected link would both skip that task and surface as an
     // unhandled rejection. The real outcome still goes to our caller.
-    const link: Promise<void> = result.then(
-      () => undefined,
-      () => undefined
-    );
+    const link: Promise<void> = Promise.race([
+      result.then(
+        () => undefined,
+        () => undefined
+      ),
+      released,
+    ]);
     this.channelQueues.set(channelId, link);
     this.releaseChannelQueue(channelId, link);
     return result;
@@ -3684,6 +3688,23 @@ export class Orchestrator {
     scheduledAttempt?: TurnAttempt
   ): Promise<void> {
     this.assertQueueFence(queueFence);
+    // Wrap-up after the answer is timed step by step; a step still running
+    // after 30 s is named in the log while it runs.
+    const wrapUpMs: Record<string, number> = {};
+    let wrapUpStartedAt: number | undefined;
+    let queueReleased = false;
+    const wrapUpStep = async <T>(step: string, run: () => Promise<T>): Promise<T> => {
+      wrapUpStartedAt ??= Date.now();
+      const started = Date.now();
+      const slow = setTimeout(() => this.logger.warn(
+        { channel: msg.channel.id, step, ms: Date.now() - started }, "turn wrap-up step still running"), 30_000);
+      try {
+        return await run();
+      } finally {
+        clearTimeout(slow);
+        wrapUpMs[step] = (wrapUpMs[step] ?? 0) + Date.now() - started;
+      }
+    };
     if (scheduledAttempt) {
       if (this.restartCutoff) {
         throw DispatchSuspendedError.shutdown(scheduledAttempt.id,
@@ -4952,10 +4973,10 @@ export class Orchestrator {
         const lines = result.rejectedAttachments
           .map((r) => `• \`${r.filename}\` — ${r.reason}`)
           .join("\n");
-        await this.adapter.sendMessage(
+        await wrapUpStep("rejected-attachments", () => this.adapter.sendMessage(
           channel,
           `_Some attachments were not sent to the agent:_\n${lines}`
-        );
+        ));
       }
 
       if (!textSent && result !== "timeout" && !(result as { cancelled?: boolean }).cancelled) {
@@ -4963,14 +4984,16 @@ export class Orchestrator {
         // but emitted no assistant message). Make it visible so the user isn't
         // left wondering if their message was received.
         const empty = "_Agent completed with no text response._";
-        if (humanAttempt && humanOutcomeOwned) {
-          await this.sendTerminalAttemptDelivery(humanAttempt.id, channel, {
-            kind: "message",
-            text: empty,
-          });
-        } else {
-          await this.adapter.sendMessage(channel, empty);
-        }
+        await wrapUpStep("empty-response-notice", async () => {
+          if (humanAttempt && humanOutcomeOwned) {
+            await this.sendTerminalAttemptDelivery(humanAttempt.id, channel, {
+              kind: "message",
+              text: empty,
+            });
+          } else {
+            await this.adapter.sendMessage(channel, empty);
+          }
+        });
       }
       humanDelivered = result !== "timeout";
 
@@ -5000,18 +5023,27 @@ export class Orchestrator {
       //   2. Copilot CLI fallback — probe its `/context` slash command, which
       //      the CLI handles client-side (no LLM call).
       if (result !== "timeout" && !result.cancelled) {
-        const profile = this.router.getProfile(record.agentId, described.location.value);
+        const location = described.location.value;
+        const profile = this.router.getProfile(record.agentId, location);
         const usageReader = profile?.sessionManager?.getUsage;
+        // A bridged session's transcript lives on its own host, so ask it there.
+        const remoteUsage = !isLocalLocation(location) && this.bridgeHub;
         let sideChannelEmitted = false;
-        if (usageReader) {
+        if (usageReader || remoteUsage) {
           try {
             const cwd = effectiveCwd;
-            const usage = await usageReader.call(
-              profile.sessionManager,
-              cwd,
-              record.acpSessionId || undefined,
-              turnStartedAt || undefined
-            );
+            const usage = await wrapUpStep("usage", async () => remoteUsage
+              ? (await this.bridgeHub!.rpc(location, "getUsage", {
+                  cwd,
+                  sessionId: record.acpSessionId || undefined,
+                  newerThanMs: turnStartedAt || undefined,
+                }, record.agentId, { timeoutMs: 15_000 })) as Awaited<ReturnType<NonNullable<typeof usageReader>>> | null
+              : await usageReader!.call(
+                  profile!.sessionManager,
+                  cwd,
+                  record.acpSessionId || undefined,
+                  turnStartedAt || undefined
+                ));
             // Trust seam-acp's per-profile model→limit table over whatever the
             // bridge inferred from the JSONL — on proxied setups the JSONL
             // model id can be remapped/wrong.
@@ -5048,7 +5080,7 @@ export class Orchestrator {
           }
         }
         if (!sideChannelEmitted && record.agentId.startsWith("copilot")) {
-          await this.probeCopilotContext(activeRuntime, eventHandler, refresh);
+          await wrapUpStep("copilot-context-probe", () => this.probeCopilotContext(activeRuntime, eventHandler, refresh));
         }
 
         // Observations are persisted on receipt, including interrupted turns.
@@ -5059,10 +5091,24 @@ export class Orchestrator {
       // mid-turn, run the same /compact flow now before the next prompt.
       if (agyAutoCompactNeeded && result !== "timeout" && !result.cancelled) {
         try {
-          await this.runAgyAutoCompact(record, channel, status, refresh, status.contextUsedHighWater);
+          await wrapUpStep("agy-auto-compact", () =>
+            this.runAgyAutoCompact(record, channel, status, refresh, status.contextUsedHighWater));
         } catch (err) {
           this.logger.warn({ err, session: record.id }, "agy auto-compact failed");
         }
+      }
+
+      // The answer is delivered and nothing below touches the runtime, so the
+      // next message starts now while the card and bookkeeping finish (#661).
+      // Channel-keyed turn state is cleared first so it can't clobber the next turn's.
+      if (result !== "timeout" && !result.cancelled && this.queueFenceCurrent(queueFence)) {
+        this.currentSpeakerIds.delete(record.channelRef);
+        this.currentAuthorIds.delete(record.channelRef);
+        await wrapUpStep("consume-thread-secrets", () =>
+          consumeThreadSecrets(this.config.DATA_DIR, channel.id).catch((err) =>
+            this.logger.warn({ err, channel: channel.id }, "secret consume failed")));
+        queueReleased = true;
+        queueFence?.release?.();
       }
     } catch (err) {
       if (!this.queueFenceCurrent(queueFence)) {
@@ -5181,12 +5227,12 @@ export class Orchestrator {
         return;
       }
       if (voiceConsoleSpeech) {
-        await this.voiceConsole?.finishVisibleTurn(voiceConsoleSpeech).catch((err) =>
+        await wrapUpStep("voice-console-settle", () => this.voiceConsole?.finishVisibleTurn(voiceConsoleSpeech!).catch((err) =>
           this.logger.warn(
             { err, bindingId: voiceConsoleSpeech?.bindingId, turnId: voiceConsoleSpeech?.turnId },
             "voice console visible speech settlement failed"
           )
-        );
+        ) ?? Promise.resolve());
         if (this.voiceConsoleSpeechByChannel.get(channel.id) === voiceConsoleSpeech) {
           this.voiceConsoleSpeechByChannel.delete(channel.id);
         }
@@ -5202,19 +5248,22 @@ export class Orchestrator {
       }
       // #71: drop the current-turn speaker id so it can never authorize a
       // config_propose on a later dispatched/scheduled turn (no human speaker).
-      this.currentSpeakerIds.delete(record.channelRef);
-      this.currentAuthorIds.delete(record.channelRef);
-      await consumeThreadSecrets(this.config.DATA_DIR, channel.id).catch((err) =>
-        this.logger.warn({ err, channel: channel.id }, "secret consume failed")
-      );
-      await refresh(true);
+      // Once released, the next turn may already own these channel keys.
+      if (!queueReleased) {
+        this.currentSpeakerIds.delete(record.channelRef);
+        this.currentAuthorIds.delete(record.channelRef);
+        await wrapUpStep("consume-thread-secrets", () =>
+          consumeThreadSecrets(this.config.DATA_DIR, channel.id).catch((err) =>
+            this.logger.warn({ err, channel: channel.id }, "secret consume failed")));
+      }
+      await wrapUpStep("status-card-final", () => refresh(true));
       if (isSimpleCardGifTerminal(status.state)) {
-        await deleteSimpleCardGifMessage({
+        await wrapUpStep("status-gif-delete", () => deleteSimpleCardGifMessage({
           ref: gifMsg,
           deleteMessage: this.adapter.deleteMessage
             ? (ref) => this.adapter.deleteMessage!(ref)
             : undefined,
-        });
+        }));
         gifMsg = undefined;
       }
       // #76: write the terminal state BEFORE removing the marker (writeDone
@@ -5222,16 +5271,22 @@ export class Orchestrator {
       if (this.liveTurnByChannel.get(channel.id) === liveMarkerId) {
         this.liveTurnByChannel.delete(channel.id);
       }
-      await finishLiveTurn(this.config.DATA_DIR, {
+      await wrapUpStep("live-marker-finish", () => finishLiveTurn(this.config.DATA_DIR, {
         id: liveMarkerId,
         status: "completed",
         channelRef: channel.id,
         finishedUtc: new Date().toISOString(),
       }).catch((err) =>
         this.logger.warn({ err, id: liveMarkerId }, "live-turn marker finish failed")
-      );
+      ));
       if (humanAttempt && humanOutcomeOwned && humanDelivered) this.store.turnAttempts.markDeliveryDone(humanAttempt.id);
       void this.quotaPoller?.turnCompleted(record.agentId, quotaRequest);
+      if (wrapUpStartedAt !== undefined) {
+        this.logger.info(
+          { session: record.id, totalMs: Date.now() - wrapUpStartedAt, released: queueReleased, steps: wrapUpMs },
+          "turn wrap-up"
+        );
+      }
     }
   }
 

@@ -209,6 +209,26 @@ describe("#180 channel queue fencing", () => {
     });
   });
 
+  it("starts the next task once the current one releases, while it finishes its wrap-up (#661)", async () => {
+    const { host } = makeHost();
+    const wrapUp = deferred();
+    const order: string[] = [];
+    const first = (host as any).queueOnChannel("100", async (fence: { release?: () => void }) => {
+      order.push("first answered");
+      fence.release?.();
+      await wrapUp.promise;
+      order.push("first wrapped up");
+    });
+    const second = (host as any).queueOnChannel("100", async () => { order.push("second ran"); });
+    await second;
+    await flush();
+    expect(order).toEqual(["first answered", "second ran"]);
+    expect((host as any).channelQueues.has("100")).toBe(false);
+    wrapUp.resolve();
+    await first;
+    expect(order).toEqual(["first answered", "second ran", "first wrapped up"]);
+  });
+
   it("detaches a stuck active finalizer and lets the recovered epoch run immediately", async () => {
     const { host } = makeHost();
     const oldRelease = deferred();

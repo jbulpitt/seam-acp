@@ -1512,7 +1512,7 @@ describe("#174 admission gates", () => {
    * without touching the store — while the message that superseded it is held
    * by both its turn and its own inbound entry.
    */
-  it("holds quiesce for a queued message, including one the generation bump skips", async () => {
+  it("holds quiesce for queued messages, which each run in order (#661)", async () => {
     const inner = deferred();
     const q0 = deferred();
     const started: string[] = [];
@@ -1557,14 +1557,15 @@ describe("#174 admission gates", () => {
 
     q0.resolve();
     await flush();
-    // The superseded message took the skip branch: it started nothing, left no
-    // turn behind, and its inbound entry is gone.
-    expect(started).toEqual(["second"]);
+    // The older message is not superseded: it runs first, the newer one waits.
+    expect(started).toEqual(["first"]);
     expect(host.activeTurns).toBe(1);
-    expect(host.inboundWork.size).toBe(1);
-    expect(drained).toBe(false); // still held by the turn that replaced it
+    expect(host.inboundWork.size).toBe(2);
+    expect(drained).toBe(false);
 
     inner.resolve();
+    await flush();
+    expect(started).toEqual(["first", "second"]);
     expect((await phase).drained).toBe(true);
     await Promise.all([first, second]);
     expect(host.activeTurns).toBe(0);

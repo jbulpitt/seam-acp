@@ -16013,6 +16013,7 @@ export class Orchestrator {
           ...(error ? { reason: error } : {}),
         }).catch(() => {});
       }
+      await this.projectPersistedTerminalAttemptCard(completed);
       try { child.kill(); } catch { /* result is already durable */ }
     };
     child.on("remoteRecoveryResult", (result: RemoteRecoveryResult) => {

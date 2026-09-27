@@ -91,6 +91,10 @@ describe("#250 human turn production pipeline, synthetic transport only", () => 
       createdUtc: new Date().toISOString(),
     }, "synthetic-identity", "pre-restart-owner", "inbound");
     attempts.bind(attempt, "recorded-acp");
+    attempts.bindStatusCard(attempt, {
+      channelId: "worker",
+      messageId: "persisted-panel",
+    });
     attempts.startPrompt(attempt);
     expect(attempts.recordRemoteRecovery(attempt, {
       version: 1,
@@ -155,8 +159,11 @@ describe("#250 human turn production pipeline, synthetic transport only", () => 
     });
     expect(h.store.getInbound("1")?.state).toBe("completed");
     await vi.waitFor(() => expect(adopted.kill).toHaveBeenCalledTimes(1));
-    // Mutation proof: removing recoverInterruptedTurns' re-binding leaves the
-    // row suspended and this exact result never reaches the original thread.
+    expect(h.adapter.editStatusPanelProjection).toHaveBeenCalledWith(
+      { channel: { platform: "discord", id: "worker" }, id: "persisted-panel" },
+      { state: "Done", action: "end_turn" }
+    );
+    // The restart path owns delivery, settlement, and the original card.
   });
 
   // #536: deleting the inbound hook must lose the new snapshot, not silently pass on the initial intent alone.

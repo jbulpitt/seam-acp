@@ -40,12 +40,16 @@ describe("staging canary observations", () => {
 
   it("keeps the real terminal cause from the status card", () => {
     const observed = observeCanaryMessages([
-      message({ components: ["Failed", "Error: spawn /missing/grok ENOENT"] }),
+      message({
+        embeds: [
+          "Failed\nRepo: /workspace\nAction: remote agent supervisor exited before initialize on host 'local'",
+        ],
+      }),
     ], "unused");
     expect(observed).toEqual({
       state: "failed",
       nonceSeen: false,
-      cause: "spawn /missing/grok ENOENT",
+      cause: "remote agent supervisor exited before initialize on host 'local'",
     });
   });
 });

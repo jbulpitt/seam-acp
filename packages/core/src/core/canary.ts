@@ -102,7 +102,7 @@ function failureCause(messages: TesterMessage[]): string | undefined {
     .map(messageText)
     .filter(Boolean)
     .join("\n");
-  const named = text.match(/(?:Error|Cause|Failure)\s*:\s*([^\n]+)/i)?.[1];
+  const named = text.match(/(?:Error|Cause|Failure|Action)\s*:\s*([^\n]+)/i)?.[1];
   if (named) return bounded(named);
   const lines = text.split("\n").map((line) => line.trim()).filter(Boolean);
   const terminal = lines.find((line) => /(?:failed|timed out|error|unavailable|refused)/i.test(line));

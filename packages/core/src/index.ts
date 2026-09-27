@@ -1,4 +1,5 @@
 import path from "node:path";
+import { makeTestInteractionHandler, TestDriverClient } from "./core/test-driver.js";
 import { TesterBot } from "./core/tester-bot.js";
 import { randomUUID } from "node:crypto";
 import { loadConfig, buildChannelPresetMaps, isChannelLocked, resolveThreadLocation, resolveThreadTtsVoice, resolveThreadTtsPace, resolveThreadTtsStyle, adminParticipantOverlapIds, GROK_STATIC_MODELS, ZAI_STATIC_MODELS, OLLAMA_CLOUD_STATIC_MODELS } from "./config.js";
@@ -164,6 +165,9 @@ async function main(): Promise<void> {
   let ingestHttpHandle:
     | ((req: IncomingMessage, res: ServerResponse) => void | Promise<void>)
     | undefined;
+  let testInteractionHandle:
+    | ((req: IncomingMessage, res: ServerResponse) => void | Promise<void>)
+    | undefined;
   const health = startHealthServer(config.HEALTH_PORT, logger, {
     onMcp: (req, res) => {
       if (!mcpHttpHandle) {
@@ -173,6 +177,18 @@ async function main(): Promise<void> {
       }
       return mcpHttpHandle(req, res);
     },
+    ...(config.SEAM_TEST_DRIVER_KEY && config.SEAM_TEST_DRIVER_ACTOR_ID
+      ? {
+          onTestInteraction: (req: IncomingMessage, res: ServerResponse) => {
+            if (!testInteractionHandle) {
+              res.writeHead(503, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ error: "test driver not ready" }));
+              return;
+            }
+            return testInteractionHandle(req, res);
+          },
+        }
+      : {}),
     onIngest: (req, res) => {
       if (!ingestHttpHandle) {
         res.writeHead(503, { "Content-Type": "application/json" });
@@ -710,6 +726,15 @@ async function main(): Promise<void> {
   });
 
   await adapter.start();
+  if (config.SEAM_TEST_DRIVER_KEY && config.SEAM_TEST_DRIVER_ACTOR_ID) {
+    testInteractionHandle = makeTestInteractionHandler({
+      key: config.SEAM_TEST_DRIVER_KEY,
+      actorId: config.SEAM_TEST_DRIVER_ACTOR_ID,
+      inject: (spec, actorId) => adapter.injectTestInteraction(spec, actorId),
+      logger,
+    });
+    logger.warn({ actorId: config.SEAM_TEST_DRIVER_ACTOR_ID }, "test interaction driver enabled");
+  }
   await orchestrator.recoverElicitations().catch((err) => {
     logger.warn({ err }, "elicitation recovery failed");
   });
@@ -782,6 +807,9 @@ async function main(): Promise<void> {
       logger,
       ...(config.SEAM_TEST_BOT_TOKEN
         ? { testerBot: new TesterBot(config.SEAM_TEST_BOT_TOKEN, config.SEAM_TEST_BOT_CHANNEL_IDS) }
+        : {}),
+      ...(config.SEAM_TEST_DRIVER_URL && config.SEAM_TEST_DRIVER_KEY
+        ? { testDriver: new TestDriverClient(config.SEAM_TEST_DRIVER_URL, config.SEAM_TEST_DRIVER_KEY) }
         : {}),
       resolveSession: (token) => {
         const sid = seamTokenRegistry.resolve(token);

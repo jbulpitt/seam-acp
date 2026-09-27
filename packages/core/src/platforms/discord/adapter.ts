@@ -38,6 +38,7 @@ import {
   type VoiceState,
   type APIEmbed,
 } from "discord.js";
+import { SyntheticInteraction, validateSlashSpec, type TestInteractionSpec, type TranscriptEntry } from "./synthetic-interaction.js";
 import {
   VoiceConnectionStatus,
   entersState,
@@ -566,6 +567,51 @@ export class DiscordAdapter implements ChatAdapter {
   private isPersonAuthor(author: { id: string; bot?: boolean | null }): boolean {
     if (author.id === this.getBotUserId()) return false;
     return !author.bot || this.config.DISCORD_ALLOWED_BOT_IDS?.has(author.id) === true;
+  }
+
+  /**
+   * Test deployments only: build a stand-in interaction acting as `actorId`
+   * and emit it on the client's own interactionCreate stream, so slash
+   * commands, persistent components, choice cards and awaitMessageComponent
+   * waits all receive it as they would a real one. Resolves with what the
+   * handlers did once they have been quiet for `quietMs`.
+   */
+  async injectTestInteraction(
+    spec: TestInteractionSpec,
+    actorId: string,
+    opts: { quietMs?: number; maxMs?: number } = {}
+  ): Promise<{ transcript: TranscriptEntry[]; replied: boolean; deferred: boolean }> {
+    const channel = await this.client.channels.fetch(spec.channelId);
+    if (!channel?.isTextBased() || !("send" in channel)) {
+      throw new Error(`channel ${spec.channelId} is not a text channel this bot can see`);
+    }
+    const user = await this.client.users.fetch(actorId);
+    const guild = "guild" in channel ? channel.guild : null;
+    const member = guild ? await guild.members.fetch(actorId).catch(() => null) : null;
+    const messageId = "messageId" in spec ? spec.messageId : undefined;
+    const message = messageId ? await channel.messages.fetch(messageId) : undefined;
+    const slashTypes = spec.kind === "slash" ? validateSlashSpec(spec, buildSlashRegistrationBody()) : undefined;
+    const interaction = new SyntheticInteraction(
+      spec,
+      { client: this.client, channel: channel as never, user, member, ...(message ? { message } : {}) },
+      slashTypes
+    );
+    this.client.emit(Events.InteractionCreate, interaction as never);
+    const quietMs = opts.quietMs ?? 3_000;
+    const maxMs = opts.maxMs ?? 60_000;
+    const started = Date.now();
+    let seen = -1;
+    let changedAt = started;
+    while (Date.now() - started < maxMs) {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      if (interaction.transcript.length !== seen) {
+        seen = interaction.transcript.length;
+        changedAt = Date.now();
+      } else if (Date.now() - changedAt >= quietMs) {
+        break;
+      }
+    }
+    return { transcript: interaction.transcript, replied: interaction.replied, deferred: interaction.deferred };
   }
 
   getBotUserId(): string | undefined {

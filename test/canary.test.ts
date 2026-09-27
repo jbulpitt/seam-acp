@@ -1,11 +1,21 @@
-import { describe, expect, it } from "vitest";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
 import {
   observeCanaryMessages,
   observeDurabilityOutput,
   renderCanaryLayout,
+  StagingCanaryRunner,
   type CanaryRunResult,
 } from "../packages/core/src/core/canary.js";
 import type { TesterMessage } from "../packages/core/src/core/tester-bot.js";
+
+const tempDirs: string[] = [];
+
+afterEach(async () => {
+  await Promise.all(tempDirs.splice(0).map((dir) => fs.rm(dir, { recursive: true, force: true })));
+});
 
 function message(input: Partial<TesterMessage>): TesterMessage {
   return {
@@ -65,6 +75,21 @@ describe("staging canary observations", () => {
     });
   });
 
+  it("does not mistake a completed tool chip for a terminal status card", () => {
+    const observed = observeCanaryMessages([
+      message({
+        embeds: [
+          "Working\n`✅ mcp__artificial-analysis__startup`  `▶️ Terminal`\nAction: Running tool",
+        ],
+      }),
+    ], "unused");
+    expect(observed).toEqual({
+      state: "working",
+      nonceSeen: false,
+      toolSeen: true,
+    });
+  });
+
   it("names missing, duplicated, out-of-order, and duplicate reply evidence", () => {
     const expected = ["nonce-1", "nonce-2", "nonce-3"];
     const observed = observeDurabilityOutput([
@@ -78,6 +103,92 @@ describe("staging canary observations", () => {
       inOrder: false,
       replyCount: 2,
     });
+  });
+});
+
+describe("staging durability canary", () => {
+  it("waits through each restart when a completed tool chip appears before the turn is Done", async () => {
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "seam-canary-restart-"));
+    tempDirs.push(dataDir);
+    await fs.writeFile(path.join(dataDir, "canary-staging-threads.json"), JSON.stringify({
+      version: 1,
+      threads: {
+        "local@codex": {
+          threadId: "thread",
+          threadName: "canary-local-codex",
+          createdAt: "2026-09-27T00:00:00.000Z",
+        },
+      },
+    }));
+
+    let controller = 1;
+    let bridge = 1;
+    let activeNonce = "";
+    let restarted = false;
+    const restarts: string[] = [];
+    const inventory = () => ({
+      controllerInstanceId: `controller-${controller}`,
+      branch: "fix/682-bridge-restart",
+      commit: "abcdef0123456789",
+      bridges: [{
+        host: "local",
+        instanceId: `bridge-${bridge}`,
+        ready: true,
+        agents: [{ id: "codex", installed: true, ready: true }],
+      }],
+    });
+    const runner = new StagingCanaryRunner({
+      dataDir,
+      stagingChannelId: "parent",
+      timeoutMs: 100,
+      pollMs: 1,
+      nonce: (() => {
+        let ordinal = 0;
+        return () => `nonce${++ordinal}`;
+      })(),
+      sleep: async () => {},
+      testerBot: {
+        findThread: async () => "thread",
+        post: async ({ text }) => {
+          activeNonce = text.match(/echo ([a-z0-9]+)-\$i/i)?.[1] ?? "missing";
+          restarted = false;
+          return { threadId: "thread", messageId: `prompt-${activeNonce}` };
+        },
+        read: async () => restarted
+          ? [
+              message({
+                id: "card",
+                embeds: ["Done\n`✅ startup`  `⚙️ Terminal`\nAction: end_turn"],
+              }),
+              message({
+                id: "reply",
+                content: [1, 2, 3, 4, 5, 6].map((i) => `${activeNonce}-${i}`).join("\n"),
+              }),
+            ]
+          : [message({
+              id: "card",
+              embeds: ["Working\n`✅ startup`  `▶️ Terminal`\nAction: Running tool"],
+            })],
+      },
+      testDriver: {
+        interact: async () => ({ transcript: [], replied: true, deferred: false }),
+        inventory: async () => inventory(),
+        health: async () => {},
+        restart: async (action) => {
+          restarts.push(action);
+          if (action === "controller" || action === "controller_bridge") controller += 1;
+          if (action !== "controller") bridge += 1;
+          restarted = true;
+          return { accepted: true, action };
+        },
+      },
+    });
+
+    const result = await runner.run("staging", { durability: true });
+
+    expect(restarts).toEqual(["controller", "bridge", "controller_bridge", "sessiond"]);
+    expect(result.rows).toHaveLength(4);
+    expect(result.rows.every((row) => row.status === "passed")).toBe(true);
   });
 });
 

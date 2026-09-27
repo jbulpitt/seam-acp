@@ -142,19 +142,28 @@ export function observeCanaryMessages(
   nonce: string,
 ): CanaryMessageObservation {
   const botMessages = messages.filter((message) => message.authorIsBot);
-  const statusText = botMessages.flatMap((message) => [...message.embeds, ...(message.components ?? [])]).join("\n");
+  const statusEntries = botMessages.flatMap((message) => [
+    ...message.embeds,
+    ...(message.components ?? []),
+  ]);
+  const statusText = statusEntries.join("\n");
+  const statusHeads = statusEntries.map((entry) =>
+    entry.split(/\r?\n/).map((line) => line.trim()).find(Boolean) ?? ""
+  );
   const nonceSeen = botMessages.some((message) => message.content.includes(nonce));
   const toolSeen = /\bTool\s*:\s*\S/i.test(statusText)
     || statusText.includes("`▶️")
     || statusText.includes("`⚙️");
-  if (/(?:❌|\b)Failed\b/i.test(statusText)) {
+  if (statusHeads.some((head) => /^(?:❌\s*)?Failed\b/i.test(head))) {
     return { state: "failed", nonceSeen, toolSeen, cause: failureCause(botMessages) };
   }
-  if (/(?:Timed out|Timeout)/i.test(statusText)) {
+  if (statusHeads.some((head) => /^(?:⏱️\s*)?(?:Timed out|Timeout)\b/i.test(head))) {
     return { state: "timed_out", nonceSeen, toolSeen, cause: failureCause(botMessages) };
   }
-  if (/(?:✅|\b)Done\b/i.test(statusText)) return { state: "done", nonceSeen, toolSeen };
-  if (/(?:Working|Waiting|Reconnecting|Monitoring)/i.test(statusText)) {
+  if (statusHeads.some((head) => /^(?:✅\s*)?Done\b/i.test(head))) {
+    return { state: "done", nonceSeen, toolSeen };
+  }
+  if (statusHeads.some((head) => /^(?:Working|Waiting|Reconnecting|Monitoring)\b/i.test(head))) {
     return { state: "working", nonceSeen, toolSeen };
   }
   return { state: "unknown", nonceSeen, toolSeen };

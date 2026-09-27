@@ -19,6 +19,7 @@
  * report-back own correlation and delivery — exactly as the operator-dispatch
  * bridge and the `<seam-*>` fence directives already do.
  */
+import type { TesterBot } from "../tester-bot.js";
 import * as http from "node:http";
 import type { AddressInfo } from "node:net";
 import { randomUUID } from "node:crypto";
@@ -284,6 +285,8 @@ export interface SeamMcpServerDeps {
     record: SessionRecord,
     req: { path: string; question?: string }
   ) => Promise<{ model: string; observations: string }>;
+  /** The test deployment's person-like bot (SEAM_TEST_BOT_TOKEN). */
+  testerBot?: TesterBot;
   /**
    * Compute the EFFECTIVE config + which layer won for the calling session
    * (#58 P1). Undefined ⇒ config introspection is unsupported on this
@@ -1010,6 +1013,37 @@ const TOOLS = [
         },
       },
       required: [],
+    },
+  },
+  {
+    name: "tester_post",
+    description:
+      "Post a message as the TEST bot into a test deployment, which handles it exactly like a person's " +
+      "message. Only allowlisted test channels and their threads. Pass threadName to start a new thread " +
+      "in a test channel first (the way a person does). Returns the thread id and message id; follow up with tester_read.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        channel: { type: "string", description: "Allowlisted test channel id, or a thread id under one." },
+        text: { type: "string", description: "Message text, up to 2000 characters." },
+        threadName: { type: "string", description: "Start a new thread with this name in the channel, then post there." },
+      },
+      required: ["channel", "text"],
+    },
+  },
+  {
+    name: "tester_read",
+    description:
+      "Read messages (oldest first) from an allowlisted test channel or thread as the TEST bot, including " +
+      "the test deployment's replies and status-card text. Pass after (a message id) to see only newer messages.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        channel: { type: "string", description: "Allowlisted test channel id, or a thread id under one." },
+        after: { type: "string", description: "Only messages newer than this message id." },
+        limit: { type: "number", description: "How many messages (default 20, max 100)." },
+      },
+      required: ["channel"],
     },
   },
   {
@@ -1770,6 +1804,8 @@ const INSTRUCTIONS = [
   "  so a repeat call reports `rate_limited` instead of re-fetching. Partial failure is normal: each source",
   "  returns its own success, duration and error. Prefer service_status unless you specifically need fresh data.",
   "- inspect_image(path, question?): inspect a Seam-staged image through the configured vision sidecar.",
+  "- tester_post(channel, text, threadName?) / tester_read(channel, after?, limit?): drive a TEST deployment as",
+  "  a person through its test bot, in allowlisted test channels only; read its replies back.",
   "- handoff(worker, prompt, returnTo?): delegate a task. `worker` is a thread id (a stateful",
   "  teammate) or a preset name (a fresh stateless specialist). You do NOT block — the worker's",
   "  result is dispatched back into your thread when it completes.",
@@ -2074,6 +2110,10 @@ export class SeamMcpServer {
           return rpcResult(id, this.toolModelMetadataQuery(args));
         case "model_value_rankings":
           return rpcResult(id, this.toolModelValueRankings(args));
+        case "tester_post":
+          return rpcResult(id, await this.toolTesterPost(args));
+        case "tester_read":
+          return rpcResult(id, await this.toolTesterRead(args));
         case "inspect_image":
           return rpcResult(id, await this.toolInspectImage(record, args));
         case "chain":
@@ -2127,6 +2167,28 @@ export class SeamMcpServer {
   }
 
   // --- the three tools -----------------------------------------------------
+
+  private async toolTesterPost(args: Record<string, unknown>): Promise<McpToolResult> {
+    if (!this.deps.testerBot) return textResult("tester_post is not configured on this deployment (SEAM_TEST_BOT_TOKEN).", true);
+    const threadName = optionalString(args, "threadName");
+    const posted = await this.deps.testerBot.post({
+      channel: requireString(args, "channel"),
+      text: requireString(args, "text"),
+      ...(threadName ? { threadName } : {}),
+    });
+    return textResult(JSON.stringify(posted));
+  }
+
+  private async toolTesterRead(args: Record<string, unknown>): Promise<McpToolResult> {
+    if (!this.deps.testerBot) return textResult("tester_read is not configured on this deployment (SEAM_TEST_BOT_TOKEN).", true);
+    const after = optionalString(args, "after");
+    const messages = await this.deps.testerBot.read({
+      channel: requireString(args, "channel"),
+      ...(after ? { after } : {}),
+      ...(typeof args.limit === "number" ? { limit: args.limit } : {}),
+    });
+    return textResult(JSON.stringify(messages, null, 2));
+  }
 
   private async toolInspectImage(
     caller: SessionRecord,

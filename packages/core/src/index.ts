@@ -1,4 +1,5 @@
 import path from "node:path";
+import { TesterBot } from "./core/tester-bot.js";
 import { randomUUID } from "node:crypto";
 import { loadConfig, buildChannelPresetMaps, isChannelLocked, resolveThreadLocation, resolveThreadTtsVoice, resolveThreadTtsPace, resolveThreadTtsStyle, adminParticipantOverlapIds, GROK_STATIC_MODELS, ZAI_STATIC_MODELS, OLLAMA_CLOUD_STATIC_MODELS } from "./config.js";
 import { enrichModelListWithKnownLimits } from "./core/context-window.js";
@@ -779,6 +780,9 @@ async function main(): Promise<void> {
     );
     seamMcpServer = new SeamMcpServer({
       logger,
+      ...(config.SEAM_TEST_BOT_TOKEN
+        ? { testerBot: new TesterBot(config.SEAM_TEST_BOT_TOKEN, config.SEAM_TEST_BOT_CHANNEL_IDS) }
+        : {}),
       resolveSession: (token) => {
         const sid = seamTokenRegistry.resolve(token);
         if (!sid) return undefined;

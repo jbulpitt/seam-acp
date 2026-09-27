@@ -449,6 +449,38 @@ const Schema = z.object({
    * admin, not a restricted participant (see `isRestrictedParticipant`). The
    * overlap is logged at boot so a privilege bug cannot hide in a silent pick.
    */
+  /**
+   * Bot accounts whose messages are handled exactly like a person's. A listed
+   * bot still needs to be in DISCORD_ALLOWED_USER_IDS; this only lifts the
+   * "ignore bots" rule for it. This bot's own messages are always ignored.
+   */
+  DISCORD_ALLOWED_BOT_IDS: z
+    .string()
+    .default("")
+    .transform((v) => {
+      const ids = v.split(",").map((s) => s.trim()).filter(Boolean);
+      if (ids.some((id) => !/^\d+$/.test(id))) {
+        throw new Error("DISCORD_ALLOWED_BOT_IDS must be comma-separated numeric Discord user IDs");
+      }
+      return new Set(ids) as ReadonlySet<string>;
+    }),
+  /**
+   * A separate bot that agents drive as a person in a test deployment, through
+   * the tester_post / tester_read tools. It only posts and reads over REST, and
+   * only in SEAM_TEST_BOT_CHANNEL_IDS (parent channels) and their threads.
+   */
+  SEAM_TEST_BOT_TOKEN: z.string().optional(),
+  SEAM_TEST_BOT_CHANNEL_IDS: z
+    .string()
+    .default("")
+    .transform((v) => {
+      const ids = v.split(",").map((s) => s.trim()).filter(Boolean);
+      if (ids.some((id) => !/^\d+$/.test(id))) {
+        throw new Error("SEAM_TEST_BOT_CHANNEL_IDS must be comma-separated numeric Discord channel IDs");
+      }
+      return new Set(ids) as ReadonlySet<string>;
+    }),
+
   SEAM_PARTICIPANT_USER_IDS: z
     .string()
     .default("")

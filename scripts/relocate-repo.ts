@@ -6,7 +6,7 @@
  * folder, --symlink leaves the old name as an alias (the repo picker skips
  * symlink dirs), --vendor remaps Claude / AGY / Grok sessions (PATH CLIs
  * clamp / claude-mv / cc-port if present, plus native cwd/jsonl rewrite).
- * Successful --apply writes a force-restart sentinel unless --no-restart.
+ * Successful --apply writes a restart sentinel unless --no-restart.
  *
  *   npx tsx scripts/relocate-repo.ts --from /old --to /new
  *   npx tsx scripts/relocate-repo.ts --from /old --to /new --apply --move --symlink --vendor
@@ -19,7 +19,7 @@ import {
   collectRelocatePlan,
   type RelocateHit,
 } from "../packages/core/src/core/relocate-repo.js";
-import { writeForceRestartSentinel } from "../packages/core/src/core/restart-sentinel.js";
+import { writeRestartSentinel } from "../packages/core/src/core/restart-sentinel.js";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -70,9 +70,9 @@ Write flags (off by default — dry-run prints the plan and exits):
                        AGY (agy-sessions.json, trustedWorkspaces, history,
                        conversation_summaries.db), Grok (encoded session dir +
                        working_directory / git_root_dir)
-  --no-restart         After --apply, do not write the force-restart sentinel.
-                       Default is to write it so seam-acp SIGTERMs live turns;
-                       turn-resume continues them after boot.
+  --no-restart         After --apply, do not write the restart sentinel.
+                       Default is to restart the controller so it reloads paths;
+                       running turns reattach after boot.
 
 Paths (defaults from .env):
   --data-dir PATH      DATA_DIR (default ./data)
@@ -81,9 +81,8 @@ Paths (defaults from .env):
   --dispatch-dir PATH  dispatch/{pending,running}
 
 Does not rewrite rider prose or .env. channel-presets.json hot-reloads on write.
-A successful --apply writes data/.restart-pending with body "force" unless
---no-restart: seam-acp skips the drain, pm2-restarts, and turn-resume continues
-interrupted turns at the new cwd.`;
+A successful --apply writes data/.restart-pending unless --no-restart.
+The controller restarts promptly and running turns reattach at the new cwd.`;
 }
 
 function formatHit(h: RelocateHit): string {
@@ -147,7 +146,7 @@ function main(): void {
   if (!apply) {
     console.log("Re-run with --apply to write. Add --move / --symlink / --vendor as needed.");
     if (!noRestart) {
-      console.log("A successful --apply writes a force-restart sentinel (seam-acp SIGTERMs; turn-resume continues). Pass --no-restart to skip.");
+      console.log("A successful --apply writes a restart sentinel; running turns reattach. Pass --no-restart to skip.");
     }
     return;
   }
@@ -175,9 +174,9 @@ function main(): void {
   for (const w of result.warnings) console.log(`warning: ${w}`);
 
   if (!noRestart && result.applied.length > 0) {
-    const sentinel = writeForceRestartSentinel(dataDir);
-    console.log(`force-restart sentinel written: ${sentinel}`);
-    console.log("seam-acp will skip the drain, SIGTERM live turns, and turn-resume them after boot.");
+    const sentinel = writeRestartSentinel(dataDir);
+    console.log(`restart sentinel written: ${sentinel}`);
+    console.log("seam-acp will restart the controller; running turns reattach after boot.");
   }
 }
 

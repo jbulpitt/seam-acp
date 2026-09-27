@@ -125,7 +125,7 @@ interface SelfCanaryRunnerOptions {
 }
 
 const DURABILITY_CHECKS: ReadonlyArray<{ label: string; action: TestRestartAction }> = [
-  { label: "redeploy:now", action: "controller" },
+  { label: "redeploy", action: "controller" },
   { label: "bridge restart", action: "bridge" },
   { label: "controller + bridge", action: "controller_bridge" },
   { label: "sessiond restart", action: "sessiond" },

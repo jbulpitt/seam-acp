@@ -640,14 +640,6 @@ const Schema = z.object({
     .enum(["true", "false"])
     .default("true")
     .transform((v) => v === "true"),
-  /** Maximum graceful restart drain. On expiry the existing force-restart path
-   * takes over so a leaked turn counter can never wedge redeploy indefinitely. */
-  RESTART_DRAIN_TIMEOUT_MS: z.coerce
-    .number()
-    .int()
-    .min(100)
-    .max(3_600_000)
-    .default(900_000),
   /**
    * #174: ceiling on the pre-close quiesce barrier — how long shutdown waits
    * for claimed dispatches, active channel turns and post-turn continuations

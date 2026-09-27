@@ -37,9 +37,10 @@ deployment contract.
 ## Lifecycle
 
 Enable the session supervisor and local bridge before the controller. Apply
-Seam code changes with `npm run redeploy`; do not directly restart the
-controller from an active agent turn. The redeploy command builds, drains
-admitted work, and then lets the supervisor restart the service.
+Seam code changes with `npm run redeploy`; do not directly restart
+the controller from an active agent turn. The command builds, runs the bounded
+shutdown quiesce, and lets the supervisor restart the service. Running turns
+stay with sessiond and reattach.
 
 Use read-only checks such as:
 

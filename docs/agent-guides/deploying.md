@@ -20,10 +20,10 @@ right command on the wrong host.
 npm run redeploy
 ```
 
-Run it in the checkout the controller runs from. It builds, then writes a
-restart sentinel. The running controller stops taking new work, lets
-running turns finish, and exits; systemd restarts it. Messages sent while it's
-down are caught up from Discord on startup.
+Run it in the checkout the controller runs from. It builds, writes a restart
+sentinel, and promptly enters the bounded shutdown quiesce; systemd restarts
+the controller. Running turns stay with sessiond and reattach. Messages sent
+while the controller is down are caught up from Discord on startup.
 
 In any other checkout, `npm run redeploy` writes a sentinel that no controller
 reads, so nothing restarts. Never restart the controller directly with

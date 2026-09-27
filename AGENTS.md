@@ -96,8 +96,8 @@ hand-editing runtime state.
   --to <new>` (dry-run), then `--apply --move --vendor`. Do not hand-edit
   `sessions.repo_path` or `channel-presets.json` cwd. Leftover `--symlink` is
   optional; the repo picker skips symlink dirs. Successful `--apply` writes a
-  **force** restart sentinel (SIGTERM live turns; turn-resume continues).
-  `npm run redeploy` is the drain-style restart for code changes.
+  restart sentinel; the controller restarts promptly and running turns reattach.
+  `npm run redeploy` applies ordinary code changes.
 - **Is the upstream down, or is it us?** MCP `service_status` — cached, instant,
   no network. Check it *before* debugging Seam when agent calls start failing.
   Read the two axes separately: `reportedStatus` is what the provider said,
@@ -157,10 +157,9 @@ npm run redeploy
 
 This is the only safe way to apply code changes or restart the bot. It:
 1. Compiles the TypeScript (`npm run build`)
-2. Echoes a confirmation so the reply is delivered
-3. Lets the running process drain admitted work
-4. Signals Seam with SIGTERM after the drain
-5. Lets `seam-acp.service` restart it under systemd
+2. Writes the restart sentinel
+3. Enters the bounded SIGTERM shutdown quiesce
+4. Lets `seam-acp.service` restart the controller and reattach running turns
 
 If you are asked to:
 - Apply code changes → run `npm run redeploy`

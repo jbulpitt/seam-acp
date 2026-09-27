@@ -1300,7 +1300,7 @@ describe("#174 admission gates", () => {
     expect(listScheduledByChannel).not.toHaveBeenCalled();
   });
 
-  it("stopIntake does NOT stop the scheduled manager (preserves the cron-drain fix)", () => {
+  it("leaves the scheduled manager to its shutdown owner", () => {
     const schedStop = vi.fn();
     const dispatchStop = vi.fn();
     const self = {
@@ -1314,189 +1314,29 @@ describe("#174 admission gates", () => {
 
     self.stopIntake();
     expect(dispatchStop).toHaveBeenCalled();
-    // Regression guard: stopping cron here is what made report-update miss 5:25.
     expect(schedStop).not.toHaveBeenCalled();
   });
 
-  /**
-   * Drive the REAL `handleRestartSentinel` — the method that owns the ordering
-   * this blocker is about — with only its collaborators faked.
-   *
-   * What is real: the sentinel read, `stopIntake()`, `waitForRestartDrain`'s
-   * polling, the 2s flush wait, the unlink, the order of all of it — and the
-   * turns, which are registered through the same `beginTurn()` primitive
-   * `runScheduledPrompt` uses, so the drain reads them exactly as it would in
-   * production. What is stubbed is only WHAT the due fire does, not that it
-   * is counted.
-   */
-  it("keeps cron running through the drain and stops it only in the last beat", async () => {
-    vi.useFakeTimers();
-    try {
-      const order: string[] = [];
-      await writeFile(path.join(dataDir, ".restart-pending"), "", "utf8"); // graceful
-      const self = makeQuiesceHost({
-        config: { DATA_DIR: dataDir, RESTART_DRAIN_TIMEOUT_MS: 60_000 },
-        restartPending: false,
-        dispatchWatcher: { stop: () => order.push("dispatch-intake"), inFlightCount: 0 },
-        scheduledManager: { stop: () => order.push("cron") },
-        postNotification: async () => {},
-        restartProcess: async () => void order.push("process-restart"),
-      }) as unknown as ReturnType<typeof makeQuiesceHost> & {
-        handleRestartSentinel(): Promise<void>;
-      };
-      // A real user turn is mid-flight when the sentinel lands — registered
-      // through the primitive the drain actually reads, not a hand-set number.
-      const endUserTurn = self.beginTurn();
+  it("restart sentinel signals promptly without waiting for active turns", async () => {
+    const order: string[] = [];
+    await writeFile(path.join(dataDir, ".restart-pending"), "", "utf8");
+    const self = makeQuiesceHost({
+      config: { DATA_DIR: dataDir },
+      restartPending: false,
+      dispatchWatcher: { stop: () => order.push("dispatch-intake"), inFlightCount: 0 },
+      scheduledManager: { stop: () => order.push("cron") },
+      restartProcess: async () => void order.push("process-restart"),
+    }) as unknown as ReturnType<typeof makeQuiesceHost> & {
+      handleRestartSentinel(): Promise<void>;
+    };
+    const endTurn = self.beginTurn();
 
-      const done = self.handleRestartSentinel();
-      await vi.advanceTimersByTimeAsync(0);
-      // Dispatch/user/parked admission closes BEFORE the drain samples turns…
-      expect(self.intakeStopped).toBe(true);
-      expect(order).toEqual(["dispatch-intake"]);
+    await self.handleRestartSentinel();
 
-      // …and cron keeps its timers, which is the only reason a schedule can
-      // still come due here. One does: it registers a turn even as the
-      // original user turn finishes.
-      await vi.advanceTimersByTimeAsync(1500);
-      expect(order).not.toContain("cron");
-      const endDueFire = self.beginTurn(); // a schedule comes due and fires
-      endUserTurn(); // the original user turn ends; the fire is still running
-      expect(self.activeTurns).toBe(1);
-      await vi.advanceTimersByTimeAsync(1500);
-      expect(order).not.toContain("process-restart"); // the fire extended the drain
-
-      endDueFire(); // the scheduled fire finishes
-      expect(self.activeTurns).toBe(0);
-      await vi.advanceTimersByTimeAsync(500); // drain poll notices
-      expect(order).not.toContain("process-restart"); // still in the 2s flush wait
-      await vi.advanceTimersByTimeAsync(2000);
-      await done;
-
-      // Last beat, in order: cron stops, then the managed process restarts. `stopIntake` is
-      // called twice by this path and must stay idempotent — one entry, and
-      // never a second "cron" from the earlier call.
-      expect(order).toEqual(["dispatch-intake", "cron", "process-restart"]);
-      expect(await readdir(dataDir)).not.toContain(".restart-pending");
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  /**
-   * The restart drain and SIGTERM close DIFFERENT doors, and conflating them
-   * is a trap: the drain can hold for `RESTART_DRAIN_TIMEOUT_MS` (15 min) with
-   * the store and the gateway fully alive, so refusing Discord ingress there
-   * takes `/seam cancel` — the one lever that ends the wedged turn the drain is
-   * waiting on — away from the operator, for the entire wait.
-   */
-  it("keeps the Discord control surface reachable for the whole restart drain", async () => {
-    vi.useFakeTimers();
-    try {
-      await writeFile(path.join(dataDir, ".restart-pending"), "", "utf8"); // graceful
-      const fireParked = vi.fn(async (..._args: any[]) => {});
-      const self = makeQuiesceHost({
-        config: { DATA_DIR: dataDir, RESTART_DRAIN_TIMEOUT_MS: 60_000 },
-        restartPending: false,
-        dispatchWatcher: { stop: () => {}, inFlightCount: 0 },
-        scheduledManager: { stop: () => {} },
-        postNotification: async () => {},
-        restartProcess: async () => {},
-        fireParked,
-        store: { getParkedByChannel: () => ({ id: "p1", channelRef: "c1" }), deleteParked: vi.fn() },
-      });
-      const endWedgedTurn = self.beginTurn(); // something is holding the drain
-
-      const done = self.handleRestartSentinel();
-      await vi.advanceTimersByTimeAsync(0);
-
-      // WORK intake is shut — a parked prompt must not open a new turn here…
-      expect(self.intakeStopped).toBe(true);
-      await (self as unknown as { tryFireParked(c: string): Promise<void> }).tryFireParked("c1");
-      expect(fireParked).not.toHaveBeenCalled();
-
-      // …but the transport is NOT, so a slash command still reaches its handler
-      // rather than being answered "Restarting — that command was not run".
-      expect(self.admissionClosed).toBe(false);
-      const cancelRan = vi.fn(async (..._args: any[]) => {});
-      const refused = vi.fn(async (..._args: any[]) => {});
-      await self.runInbound("slash", cancelRan, refused);
-      expect(cancelRan).toHaveBeenCalledOnce();
-      expect(refused).not.toHaveBeenCalled();
-
-      endWedgedTurn();
-      await vi.advanceTimersByTimeAsync(3000);
-      await done;
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  /**
-   * `activeTurns` is a turn's-eye view: a message counts only once its channel
-   * FIFO reaches it. Everything before that — the pre-queue body, which writes
-   * the store, and the wait for its place in line — reads as zero, so a message
-   * admitted while the channel is idle could let the drain sample 0, skip the
-   * wait entirely, and start a full agent turn on the far side of it.
-   */
-  it("waits for a message admitted before it has become a turn", async () => {
-    vi.useFakeTimers();
-    try {
-      const order: string[] = [];
-      const notes: string[] = [];
-      const gate = deferred(); // parks the message inside its PRE-QUEUE body
-      await writeFile(path.join(dataDir, ".restart-pending"), "", "utf8"); // graceful
-      const host = makeQuiesceHost({
-        config: {
-          DATA_DIR: dataDir,
-          RESTART_DRAIN_TIMEOUT_MS: 60_000,
-          TURN_TIMEOUT_SECONDS: 900,
-        },
-        restartPending: false,
-        dispatchWatcher: { stop: () => {}, inFlightCount: 0 },
-        scheduledManager: { stop: () => {} },
-        postNotification: async (m: string) => void notes.push(m),
-        restartProcess: async () => void order.push("process-restart"),
-        channelGenerations: new Map<string, number>(),
-        lastUserMessageAt: new Map<string, number>(),
-        store: {},
-        router: { ensureSessionRecord: () => ({ id: "discord:c1" }), abortTurn: async () => "" },
-        tryConsumeConfigEditorRiderUpload: async () => {
-          await gate.promise;
-          return false;
-        },
-        clearTurnMarkersForChannel: async () => {},
-        tryParkForOfflineBridge: async () => false,
-        handleIncomingMessageInner: async () => void order.push("turn-ran"),
-      });
-
-      void host
-        .runInbound("message", () =>
-          (host as unknown as { handleIncomingMessage(m: unknown): Promise<void> })
-            .handleIncomingMessage({ channel: { id: "c1" }, text: "hi", authorId: "u1" })
-        )
-        .catch(() => {});
-      await vi.advanceTimersByTimeAsync(0);
-      // The sharp state: admitted and doing store-backed work, but not a turn.
-      expect(host.activeTurns).toBe(0);
-      expect(host.inboundWork.size).toBe(1);
-
-      const done = (host as unknown as { handleRestartSentinel(): Promise<void> })
-        .handleRestartSentinel();
-      await vi.advanceTimersByTimeAsync(5000);
-      // The load-bearing assertion: the drain was ENTERED and is holding for
-      // this message. Sampling `activeTurns` alone reads 0 here, takes the
-      // no-drain branch — announcing nothing — and restarts straight through it.
-      expect(notes).toEqual(["♻️ Restart requested — waiting for 1 in-flight item to finish."]);
-      expect(order).toEqual([]);
-
-      gate.resolve();
-      await vi.advanceTimersByTimeAsync(5000);
-      await done;
-      // The turn ran to completion first, and only then did the restart fire.
-      expect(order).toEqual(["turn-ran", "process-restart"]);
-    } finally {
-      vi.useRealTimers();
-    }
+    expect(self.activeTurns).toBe(1);
+    expect(order).toEqual(["dispatch-intake", "cron", "process-restart"]);
+    expect(await readdir(dataDir)).not.toContain(".restart-pending");
+    endTurn();
   });
 
   /**

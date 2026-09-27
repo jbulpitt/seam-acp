@@ -1995,6 +1995,12 @@ export class DiscordAdapter implements ChatAdapter {
     }
   }
 
+  async unpinMessage(message: MessageRef): Promise<void> {
+    const ch = await this.fetchSendableChannel(message.channel.id);
+    const msg = await ch.messages.fetch(message.id);
+    await msg.unpin();
+  }
+
   private static buttonStyle(style: PanelButton["style"]): ButtonStyle {
     switch (style) {
       case "primary":

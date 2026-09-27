@@ -101,6 +101,7 @@ export interface ConnectedBridge {
     version: number;
     installed: boolean;
     ready: boolean;
+    reason?: string;
     runtime?: AdapterRuntimeDescriptor;
   }>;
   mux: ReturnType<typeof makeMux>;
@@ -491,6 +492,7 @@ export class BridgeHub {
       version: number;
       installed: boolean;
       ready: boolean;
+      reason?: string;
       runtime?: AdapterRuntimeDescriptor;
     }>();
     for (const a of hello.agents ?? []) {
@@ -537,6 +539,7 @@ export class BridgeHub {
         await mux.rpc("prepare", {}, { agentId });
         state.ready = true;
       } catch (err) {
+        state.reason = err instanceof Error ? err.message : String(err);
         this.logger.warn(
           { err, bridgeId: expectedId, agentId },
           "prepare() failed; agent not marked ready"

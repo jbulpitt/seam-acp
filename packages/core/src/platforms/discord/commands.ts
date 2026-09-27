@@ -659,7 +659,7 @@ export function buildSeamAdminCommand(): SlashCommandBuilder {
     // Guild-only. setDMPermission is deprecated; setContexts is the replacement.
     .setContexts(InteractionContextType.Guild);
 
-  // --- top-level (3): rebuild, compact-thread, recover -----------------------
+  // --- top-level (4): rebuild, compact-thread, recover, canary ---------------
 
   cmd.addSubcommand((sub) =>
     sub
@@ -701,6 +701,19 @@ export function buildSeamAdminCommand(): SlashCommandBuilder {
             { name: "auto", value: "auto" },
             { name: "force", value: "force" }
           )
+      )
+  );
+
+  cmd.addSubcommand((sub) =>
+    sub
+      .setName("canary")
+      .setDescription("Run the real host and agent matrix on a test deployment")
+      .addStringOption((o) =>
+        o
+          .setName("target")
+          .setDescription("Deployment to test")
+          .setRequired(true)
+          .addChoices({ name: "staging", value: "staging" })
       )
   );
 
@@ -1167,6 +1180,7 @@ export type SeamSubcommand =
   | "rebuild"
   | "compact-thread"
   | "recover"
+  | "canary"
   | "restart"
   | "pull"
   | "push"

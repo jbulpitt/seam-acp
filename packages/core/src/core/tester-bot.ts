@@ -13,6 +13,7 @@ export interface TesterMessage {
   authorIsBot: boolean;
   content: string;
   embeds: string[];
+  components?: string[];
   attachments: string[];
   timestamp: string;
 }
@@ -22,8 +23,23 @@ interface RawMessage {
   author: { username: string; bot?: boolean };
   content: string;
   embeds?: Array<{ title?: string; description?: string; fields?: Array<{ name: string; value: string }> }>;
+  components?: unknown[];
   attachments?: Array<{ filename: string }>;
   timestamp: string;
+}
+
+function componentText(value: unknown): string[] {
+  if (!value || typeof value !== "object") return [];
+  const item = value as {
+    content?: unknown;
+    label?: unknown;
+    components?: unknown[];
+  };
+  return [
+    ...(typeof item.content === "string" ? [item.content] : []),
+    ...(typeof item.label === "string" ? [item.label] : []),
+    ...(item.components ?? []).flatMap(componentText),
+  ];
 }
 
 export class TesterBot {
@@ -74,6 +90,25 @@ export class TesterBot {
     return { threadId: target, messageId: message.id };
   }
 
+  async findThread(parentChannelId: string, name: string): Promise<string | undefined> {
+    if (!this.channels.has(parentChannelId)) {
+      throw new Error(`channel ${parentChannelId} is not in SEAM_TEST_BOT_CHANNEL_IDS`);
+    }
+    const parent = await this.call<{ guild_id?: string }>("GET", `/channels/${parentChannelId}`);
+    if (!parent.guild_id) throw new Error(`channel ${parentChannelId} has no guild`);
+    const active = await this.call<{ threads?: Array<{ id: string; name: string; parent_id?: string }> }>(
+      "GET",
+      `/guilds/${parent.guild_id}/threads/active`,
+    );
+    const archived = await this.call<{ threads?: Array<{ id: string; name: string; parent_id?: string }> }>(
+      "GET",
+      `/channels/${parentChannelId}/threads/archived/public?limit=100`,
+    );
+    return [...(active.threads ?? []), ...(archived.threads ?? [])]
+      .find((thread) => thread.parent_id === parentChannelId && thread.name === name)
+      ?.id;
+  }
+
   /** Messages oldest first, after `after` when given, otherwise the most recent. */
   async read(input: { channel: string; after?: string; limit?: number }): Promise<TesterMessage[]> {
     await this.allowed(input.channel);
@@ -89,6 +124,7 @@ export class TesterBot {
         content: m.content,
         embeds: (m.embeds ?? []).map((e) =>
           [e.title, e.description, ...(e.fields ?? []).map((f) => `${f.name}: ${f.value}`)].filter(Boolean).join("\n")),
+        components: (m.components ?? []).flatMap(componentText),
         attachments: (m.attachments ?? []).map((a) => a.filename),
         timestamp: m.timestamp,
       }));

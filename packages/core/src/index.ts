@@ -1,6 +1,19 @@
 import path from "node:path";
-import { makeTestInteractionHandler, TestDriverClient } from "./core/test-driver.js";
+import {
+  makeTestInteractionHandler,
+  makeTestInventoryHandler,
+  TestDriverClient,
+} from "./core/test-driver.js";
 import { TesterBot } from "./core/tester-bot.js";
+import {
+  StagingCanaryRunner,
+  formatCanaryResult,
+  providerSourceForAgent,
+  publishCanaryCard,
+  readGitIdentity,
+  type CanaryRunResult,
+  type CanaryTarget,
+} from "./core/canary.js";
 import { randomUUID } from "node:crypto";
 import { loadConfig, buildChannelPresetMaps, isChannelLocked, resolveThreadLocation, resolveThreadTtsVoice, resolveThreadTtsPace, resolveThreadTtsStyle, adminParticipantOverlapIds, GROK_STATIC_MODELS, ZAI_STATIC_MODELS, OLLAMA_CLOUD_STATIC_MODELS } from "./config.js";
 import { enrichModelListWithKnownLimits } from "./core/context-window.js";
@@ -168,6 +181,9 @@ async function main(): Promise<void> {
   let testInteractionHandle:
     | ((req: IncomingMessage, res: ServerResponse) => void | Promise<void>)
     | undefined;
+  let testInventoryHandle:
+    | ((req: IncomingMessage, res: ServerResponse) => void | Promise<void>)
+    | undefined;
   const health = startHealthServer(config.HEALTH_PORT, logger, {
     onMcp: (req, res) => {
       if (!mcpHttpHandle) {
@@ -186,6 +202,18 @@ async function main(): Promise<void> {
               return;
             }
             return testInteractionHandle(req, res);
+          },
+        }
+      : {}),
+    ...(config.SEAM_TEST_DRIVER_KEY
+      ? {
+          onTestInventory: (req: IncomingMessage, res: ServerResponse) => {
+            if (!testInventoryHandle) {
+              res.writeHead(503, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ error: "test inventory not ready" }));
+              return;
+            }
+            return testInventoryHandle(req, res);
           },
         }
       : {}),
@@ -614,6 +642,12 @@ async function main(): Promise<void> {
   });
 
   const renderer = discordRenderer;
+  const testerBot = config.SEAM_TEST_BOT_TOKEN
+    ? new TesterBot(config.SEAM_TEST_BOT_TOKEN, config.SEAM_TEST_BOT_CHANNEL_IDS)
+    : undefined;
+  const testDriver = config.SEAM_TEST_DRIVER_URL && config.SEAM_TEST_DRIVER_KEY
+    ? new TestDriverClient(config.SEAM_TEST_DRIVER_URL, config.SEAM_TEST_DRIVER_KEY)
+    : undefined;
 
   const adapter: DiscordAdapter = new DiscordAdapter({
     config,
@@ -735,6 +769,50 @@ async function main(): Promise<void> {
     });
     logger.warn({ actorId: config.SEAM_TEST_DRIVER_ACTOR_ID }, "test interaction driver enabled");
   }
+  if (config.SEAM_TEST_DRIVER_KEY) {
+    testInventoryHandle = makeTestInventoryHandler({
+      key: config.SEAM_TEST_DRIVER_KEY,
+      inventory: () => {
+        const identity = readGitIdentity();
+        const configured = router.listProfiles().map((profile) => profile.id).sort();
+        return {
+          ...identity,
+          bridges: (bridgeHub?.listConnected() ?? []).map((bridge) => ({
+            host: bridge.bridgeId,
+            ready: bridgeHub?.isBridgeReady(bridge.bridgeId) ?? false,
+            agents: configured.map((agentId) => {
+              const observed = bridge.agents.get(agentId);
+              if (isAgentLocationDenied(agentId, bridge.bridgeId, config.AGENT_LOCATION_DENY)) {
+                return {
+                  id: agentId,
+                  installed: observed?.installed ?? false,
+                  ready: false,
+                  reason: "withheld by AGENT_LOCATION_DENY",
+                };
+              }
+              if (!observed) {
+                return {
+                  id: agentId,
+                  installed: false,
+                  ready: false,
+                  reason: "not reported by bridge (disabled or unavailable)",
+                };
+              }
+              return {
+                id: agentId,
+                installed: observed.installed,
+                ready: observed.ready,
+                ...(!observed.ready
+                  ? { reason: observed.reason ?? (observed.installed ? "not ready" : "not installed") }
+                  : {}),
+              };
+            }),
+          })),
+        };
+      },
+    });
+    logger.warn("test inventory driver enabled");
+  }
   await orchestrator.recoverElicitations().catch((err) => {
     logger.warn({ err }, "elicitation recovery failed");
   });
@@ -780,6 +858,47 @@ async function main(): Promise<void> {
     });
   }
 
+  let runCanary: ((target: CanaryTarget) => Promise<CanaryRunResult>) | undefined;
+  if (
+    testerBot &&
+    testDriver &&
+    config.SEAM_CANARY_STAGING_CHANNEL_ID &&
+    config.SEAM_CANARY_RESULT_CHANNEL_ID
+  ) {
+    const runner = new StagingCanaryRunner({
+      testerBot,
+      testDriver,
+      dataDir: config.DATA_DIR,
+      stagingChannelId: config.SEAM_CANARY_STAGING_CHANNEL_ID,
+      providerStatus: (agentId) => {
+        const sourceId = providerSourceForAgent(agentId);
+        if (!sourceId || !serviceStatusView) return undefined;
+        try {
+          const source = serviceStatusView.read({ sourceIds: [sourceId] }).sources[0];
+          if (!source) return undefined;
+          if (source.reportedStatus === "operational" && source.observation.health === "ok") {
+            return undefined;
+          }
+          return `${source.label} reports ${source.reportedStatus}; observation ${source.observation.health}`;
+        } catch {
+          return undefined;
+        }
+      },
+    });
+    runCanary = async (target) => {
+      const result = await runner.run(target);
+      await publishCanaryCard({
+        result,
+        adapter,
+        channelId: config.SEAM_CANARY_RESULT_CHANNEL_ID!,
+        dataDir: config.DATA_DIR,
+        logger,
+      });
+      return result;
+    };
+    orchestrator.setCanaryRunner(runCanary);
+  }
+
   // Start the shared seam-MCP server now that the adapter exists (peek reads
   // threads through it). Its ephemeral port feeds the router's late-bound
   // getPort, so per-session injection works from here on. The tools only
@@ -805,11 +924,10 @@ async function main(): Promise<void> {
     );
     seamMcpServer = new SeamMcpServer({
       logger,
-      ...(config.SEAM_TEST_BOT_TOKEN
-        ? { testerBot: new TesterBot(config.SEAM_TEST_BOT_TOKEN, config.SEAM_TEST_BOT_CHANNEL_IDS) }
-        : {}),
-      ...(config.SEAM_TEST_DRIVER_URL && config.SEAM_TEST_DRIVER_KEY
-        ? { testDriver: new TestDriverClient(config.SEAM_TEST_DRIVER_URL, config.SEAM_TEST_DRIVER_KEY) }
+      ...(testerBot ? { testerBot } : {}),
+      ...(testDriver ? { testDriver } : {}),
+      ...(runCanary
+        ? { runCanary: async (target: CanaryTarget) => formatCanaryResult(await runCanary!(target)) }
         : {}),
       resolveSession: (token) => {
         const sid = seamTokenRegistry.resolve(token);

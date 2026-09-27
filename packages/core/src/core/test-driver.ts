@@ -38,6 +38,17 @@ export interface TestRestartResult {
   action: TestRestartAction;
 }
 
+export interface TestDispatchSpec {
+  id: string;
+  channelId: string;
+  prompt: string;
+}
+
+export interface TestDispatchResult {
+  accepted: true;
+  id: string;
+}
+
 const MAX_BODY = 64 * 1024;
 
 function keyMatches(given: string | undefined, key: string): boolean {
@@ -150,6 +161,42 @@ export function makeTestRestartHandler(opts: {
   };
 }
 
+export function makeTestDispatchHandler(opts: {
+  key: string;
+  enqueue: (spec: TestDispatchSpec) => Promise<void>;
+  logger: Logger;
+}): (req: IncomingMessage, res: ServerResponse) => Promise<void> {
+  return async (req, res) => {
+    if (req.method !== "POST") return send(res, 405, { error: "POST only" });
+    const auth = req.headers.authorization;
+    const given = typeof auth === "string" && auth.startsWith("Bearer ") ? auth.slice(7) : undefined;
+    if (!keyMatches(given, opts.key)) return send(res, 401, { error: "unauthorized" });
+    let spec: TestDispatchSpec;
+    try {
+      const body = await readJson(req) as Partial<TestDispatchSpec>;
+      if (typeof body.id !== "string" || body.id.length === 0 || body.id.length > 200) {
+        return send(res, 400, { error: "id must be a non-empty string of at most 200 characters" });
+      }
+      if (typeof body.channelId !== "string" || !/^\d+$/.test(body.channelId)) {
+        return send(res, 400, { error: "channelId must be a Discord snowflake" });
+      }
+      if (typeof body.prompt !== "string" || body.prompt.length === 0 || body.prompt.length > 8_000) {
+        return send(res, 400, { error: "prompt must be a non-empty string of at most 8000 characters" });
+      }
+      spec = { id: body.id, channelId: body.channelId, prompt: body.prompt };
+    } catch (err) {
+      return send(res, 400, { error: `invalid JSON: ${(err as Error).message}` });
+    }
+    try {
+      await opts.enqueue(spec);
+      opts.logger.info({ id: spec.id, channelId: spec.channelId }, "test dispatch enqueued");
+      send(res, 202, { accepted: true, id: spec.id });
+    } catch (err) {
+      send(res, 422, { error: (err as Error).message });
+    }
+  };
+}
+
 export class TestDriverClient {
   constructor(
     private readonly url: string,
@@ -197,6 +244,18 @@ export class TestDriverClient {
     });
     const body = (await res.json().catch(() => ({}))) as TestRestartResult & { error?: string };
     if (!res.ok) throw new Error(body.error ?? `test restart returned ${res.status}`);
+    return body;
+  }
+
+  async dispatch(spec: TestDispatchSpec): Promise<TestDispatchResult> {
+    const res = await this.fetchFn(`${this.url.replace(/\/+$/, "")}/test/dispatch`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${this.key}`, "content-type": "application/json" },
+      body: JSON.stringify(spec),
+      signal: AbortSignal.timeout(30_000),
+    });
+    const body = (await res.json().catch(() => ({}))) as TestDispatchResult & { error?: string };
+    if (!res.ok) throw new Error(body.error ?? `test dispatch returned ${res.status}`);
     return body;
   }
 }

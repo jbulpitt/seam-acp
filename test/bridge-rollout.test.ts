@@ -4,7 +4,7 @@ import { describe, expect, it, vi } from "vitest";
 import { activationRefusal, artifactName, firstActivationFromBaselineAllowed, buildArtifact, commandRunner, makeScpCommand, makeSshCommand, parseArgs, parseKeyValues, receiptEventStreamsAcceptable, resolveTarget, rollbackPlan, runActivation, runPreflight, validateReadyReceipt, validateTargetMap, verifyChecksum } from "../scripts/lib/bridge-rollout.mjs";
 
 const root = path.resolve(import.meta.dirname, "..");
-const configured = JSON.parse(fs.readFileSync(path.join(root, "ops/bridge/targets.json"), "utf8"));
+const configured = JSON.parse(fs.readFileSync(path.join(root, "ops/bridge/targets.example.json"), "utf8"));
 const targets = validateTargetMap(configured);
 const token = "c".repeat(64);
 
@@ -53,22 +53,22 @@ function preflightReport(target: ReturnType<typeof resolveTarget>, overrides: Re
 
 describe("bridge rollout target safety (#241)", () => {
   it("pins the full operator-owned deployment identity", () => {
-    expect(resolveTarget(targets, "media-server")).toMatchObject({ bridgeId: "media-server", sshAlias: "media-server", pm2App: "remote-agent-bridge", expectedUid: 501, checkoutPath: "/Users/jesse/seam-acp", entrypointPath: "/Users/jesse/seam-acp/packages/bridge/dist/index.js", releaseRoot: "/Users/jesse/.seam/bridge-rollouts" });
-    expect(configured.targets["media-server"]).not.toHaveProperty("pidFilePath");
-    expect(resolveTarget(targets, "macbook-air")).toMatchObject({ bridgeId: "macbook-air", sshAlias: "macbook-air", pm2App: "seam-bridge", expectedUid: 501, workspaceArg: "/Users/jessebulpitt" });
+    expect(resolveTarget(targets, "workstation")).toMatchObject({ bridgeId: "workstation", sshAlias: "workstation", pm2App: "remote-agent-bridge", expectedUid: 501, checkoutPath: "/Users/operator/seam-acp", entrypointPath: "/Users/operator/seam-acp/packages/bridge/dist/index.js", releaseRoot: "/Users/operator/.seam/bridge-rollouts" });
+    expect(configured.targets["workstation"]).not.toHaveProperty("pidFilePath");
+    expect(resolveTarget(targets, "laptop-a")).toMatchObject({ bridgeId: "laptop-a", sshAlias: "laptop-a", pm2App: "seam-bridge", expectedUid: 501, workspaceArg: "/Users/operator" });
   });
 
   it("keeps the AGY laptops excluded for the surveyed reason, not a shared PM2-contract claim", () => {
-    expect(configured.targets["jennifer-laptop"].sshAlias).toBe("macbook-air-j");
-    expect(configured.targets["allie-laptop"].sshAlias).toBe("laptop-allie");
-    expect(configured.targets["alaina-laptop"].sshAlias).toBe("laptop-alaina");
-    expect(() => resolveTarget(targets, "jennifer-laptop")).toThrow(/explicitly excluded.*#388/);
-    expect(() => resolveTarget(targets, "allie-laptop")).toThrow(/explicitly excluded.*alliebulpitt uid 502/);
-    expect(() => resolveTarget(targets, "alaina-laptop")).toThrow(/explicitly excluded.*\balaina uid 502/);
+    expect(configured.targets["excluded-laptop-a"].sshAlias).toBe("excluded-laptop-a");
+    expect(configured.targets["excluded-laptop-c"].sshAlias).toBe("excluded-laptop-c");
+    expect(configured.targets["excluded-laptop-b"].sshAlias).toBe("excluded-laptop-b");
+    expect(() => resolveTarget(targets, "excluded-laptop-a")).toThrow(/explicitly excluded.*privileged management/);
+    expect(() => resolveTarget(targets, "excluded-laptop-c")).toThrow(/explicitly excluded.*different account/);
+    expect(() => resolveTarget(targets, "excluded-laptop-b")).toThrow(/explicitly excluded.*different account/);
   });
 
   it("refuses every mutating phase for an explicitly unmanaged host, before command construction (#281, #282)", () => {
-    // Deliberately synthetic. This guard used to read `macbook-pro` out of the
+    // Deliberately synthetic. This guard used to read `laptop-b` out of the
     // live target map, so enrolling that host once it HAD a verified SSH path
     // (#342) invalidated the guard rather than the rule — the assertion broke
     // while the behaviour it protects was untouched. The rule is about the
@@ -112,21 +112,21 @@ describe("bridge rollout target safety (#241)", () => {
     expect(() => makeScpCommand(target, "/tmp/release.tgz", `${artifactName("a".repeat(40), "b".repeat(64))}.upload-${token}`)).toThrow(/explicitly excluded/);
   });
 
-  it("records macbook-pro as managed now that it has a verified SSH path (#342)", () => {
+  it("records laptop-b as managed now that it has a verified SSH path (#342)", () => {
     // The state change the guard above deliberately no longer encodes.
     // Enrolling was only legitimate BECAUSE the path now exists: a chisel
     // reverse tunnel on port 2228 under pm2, with key auth from the server.
     // #281's invariant — never record a baseline for a host nobody could
     // restore to — is preserved by that fact, not by the host staying marked
     // unmanaged.
-    const target = resolveTarget(targets, "macbook-pro");
-    expect(target.sshAlias).toBe("macbook-pro");
+    const target = resolveTarget(targets, "laptop-b");
+    expect(target.sshAlias).toBe("laptop-b");
     expect(target.rolloutEnabled).toBe(true);
     expect(target.unmanagedReason ?? null).toBeNull();
   });
 
   it("surfaces the enrollment-specific reason behind the activation capability gate (#281)", () => {
-    const target = resolveTarget(targets, "media-server");
+    const target = resolveTarget(targets, "workstation");
     // The gate itself is unchanged — it still refuses — but a legacy host no
     // longer gets a generic capability message that hides which of the four
     // legacy states it is actually in.
@@ -165,8 +165,8 @@ describe("bridge rollout target safety (#241)", () => {
 
   it("rejects unknown fields, shell characters, path ambiguity, and incomplete identities", () => {
     expect(() => resolveTarget(targets, "unknown-host")).toThrow(/unknown/);
-    expect(() => parseArgs(["--target", "media-server", "--app", "anything"])).toThrow(/unknown option/);
-    const base = { ...configured.targets["media-server"] };
+    expect(() => parseArgs(["--target", "workstation", "--app", "anything"])).toThrow(/unknown option/);
+    const base = { ...configured.targets["workstation"] };
     expect(() => validateTargetMap({ schemaVersion: 3, targets: { ok: { ...base, sshAlias: "host;id" } } })).toThrow(/unsafe SSH/);
     expect(() => validateTargetMap({ schemaVersion: 3, targets: { ok: { ...base, checkoutPath: "/safe/../escape", entrypointPath: "/safe/../escape/packages/bridge/dist/index.js" } } })).toThrow(/unsafe checkout/);
     expect(() => validateTargetMap({ schemaVersion: 3, targets: { ok: { ...base, nodePath: "node" } } })).toThrow(/unsafe nodePath/);
@@ -177,30 +177,30 @@ describe("bridge rollout target safety (#241)", () => {
   });
 
   it("constructs argv directly with every pinned identity field", () => {
-    const target = resolveTarget(targets, "media-server");
+    const target = resolveTarget(targets, "workstation");
     const ssh = makeSshCommand(target, ["preflight"], "fixed-script");
     expect(ssh.file).toBe("ssh"); expect(ssh.input).toBe("fixed-script"); expect(ssh.mutates).toBe(false);
-    expect(ssh.args).toContain(target.nodePath); expect(ssh.args).toContain(target.entrypointPath); expect(ssh.args).not.toContain("/Users/jesse/.pm2/pids/remote-agent-bridge-0.pid"); expect(ssh.args.at(-1)).toBe("preflight");
+    expect(ssh.args).toContain(target.nodePath); expect(ssh.args).toContain(target.entrypointPath); expect(ssh.args).not.toContain("/Users/operator/.pm2/pids/remote-agent-bridge-0.pid"); expect(ssh.args.at(-1)).toBe("preflight");
     const name = `${artifactName("a".repeat(40), "b".repeat(64))}.upload-${token}`;
-    expect(makeScpCommand(target, "/tmp/release.tgz", name).args.at(-1)).toBe(`media-server:${target.releaseRoot}/incoming/${name}`);
+    expect(makeScpCommand(target, "/tmp/release.tgz", name).args.at(-1)).toBe(`workstation:${target.releaseRoot}/incoming/${name}`);
   });
 });
 
 describe("bridge rollout gating and verification (#241)", () => {
   it("defaults to one-host dry-run and requires immutable phase identities", () => {
-    expect(parseArgs(["--target", "media-server"])).toMatchObject({ action: "preflight", apply: false });
-    expect(parseArgs(["--target", "media-server", "--stage", "--apply"])).toMatchObject({ action: "stage", apply: true });
-    expect(parseArgs(["--target", "media-server", "--rebaseline", "--apply"])).toMatchObject({ action: "rebaseline", apply: true });
-    expect(() => parseArgs(["--target", "media-server", "--rebaseline"])).toThrow(/requires --apply/);
+    expect(parseArgs(["--target", "workstation"])).toMatchObject({ action: "preflight", apply: false });
+    expect(parseArgs(["--target", "workstation", "--stage", "--apply"])).toMatchObject({ action: "stage", apply: true });
+    expect(parseArgs(["--target", "workstation", "--rebaseline", "--apply"])).toMatchObject({ action: "rebaseline", apply: true });
+    expect(() => parseArgs(["--target", "workstation", "--rebaseline"])).toThrow(/requires --apply/);
     expect(() => parseArgs(["--all", "--rebaseline", "--apply"])).toThrow(/--all supports only/);
-    expect(() => parseArgs(["--target", "media-server", "--stage"])).toThrow(/requires --apply/);
-    expect(() => parseArgs(["--target", "media-server", "--activate", "--sha", "a".repeat(40), "--checksum", "b".repeat(64), "--apply"])).toThrow(/stage-id/);
-    expect(() => parseArgs(["--target", "media-server", "--rollback", "--apply"])).toThrow(/activation-id/);
+    expect(() => parseArgs(["--target", "workstation", "--stage"])).toThrow(/requires --apply/);
+    expect(() => parseArgs(["--target", "workstation", "--activate", "--sha", "a".repeat(40), "--checksum", "b".repeat(64), "--apply"])).toThrow(/stage-id/);
+    expect(() => parseArgs(["--target", "workstation", "--rollback", "--apply"])).toThrow(/activation-id/);
     expect(() => parseArgs([])).toThrow(/exactly one host/);
   });
 
   it("dry-run accepts only a fully bound identity response", async () => {
-    const target = resolveTarget(targets, "macbook-air");
+    const target = resolveTarget(targets, "laptop-a");
     const fake = vi.fn(async (command: { mutates: boolean }) => { expect(command.mutates).toBe(false); return { stdout: preflightReport(target), stderr: "" }; });
     expect((await runPreflight(target, "fixed-script", fake)).report.pid).toBe("123");
     const mismatch = vi.fn(async () => ({ stdout: "bridge_id=other\npm2_app=seam-bridge\nidentity_bound=yes\n", stderr: "" }));
@@ -216,7 +216,7 @@ describe("bridge rollout gating and verification (#241)", () => {
   });
 
   it("refuses an unsupported native runtime in preflight before staging", async () => {
-    const target = resolveTarget(targets, "media-server");
+    const target = resolveTarget(targets, "workstation");
     const fake = vi.fn(async (command: { mutates: boolean }) => {
       expect(command.mutates).toBe(false);
       return { stdout: preflightReport(target, { node_abi: "137", native_prebuild: "better-sqlite3@11.10.0-node-v137-darwin-x64", native_install_ready: "no" }), stderr: "" };
@@ -225,7 +225,7 @@ describe("bridge rollout gating and verification (#241)", () => {
   });
 
   it("does not trust a remote ready flag for an unreviewed interpreter ABI", async () => {
-    const target = resolveTarget(targets, "media-server");
+    const target = resolveTarget(targets, "workstation");
     const fake = vi.fn(async () => ({
       stdout: preflightReport(target, { node_abi: "137", native_prebuild: "better-sqlite3@11.10.0-node-v137-darwin-x64", native_install_ready: "yes" }),
       stderr: "",
@@ -234,15 +234,15 @@ describe("bridge rollout gating and verification (#241)", () => {
   });
 
   it("refuses a mapped SSH host whose reported bridge id differs from the target before mutation (#282)", async () => {
-    const media = configured.targets["media-server"];
+    const media = configured.targets["workstation"];
     const mapped = validateTargetMap({
       schemaVersion: 3,
-      targets: { "macbook-pro": { ...media, sshAlias: "home-hub" } },
+      targets: { "laptop-b": { ...media, sshAlias: "home-bridge" } },
     });
-    const target = resolveTarget(mapped, "macbook-pro");
+    const target = resolveTarget(mapped, "laptop-b");
     const fake = vi.fn(async (command: { mutates: boolean }) => {
       expect(command.mutates).toBe(false);
-      return { stdout: preflightReport(target, { bridge_id: "home-hub" }), stderr: "" };
+      return { stdout: preflightReport(target, { bridge_id: "home-bridge" }), stderr: "" };
     });
     await expect(runPreflight(target, "fixed-script", fake)).rejects.toThrow(/remote deployment identity did not match/);
     expect(fake).toHaveBeenCalledOnce();
@@ -311,7 +311,7 @@ describe("bridge rollout gating and verification (#241)", () => {
 
   it("requires nonce, target, PIDs, instance, ordered fresh window, controller ack and both RPCs", () => {
     const t0 = Date.parse("2026-09-08T00:00:00.000Z");
-    const expected = { activationId: "a".repeat(64), bridgeId: "media-server", sha: "b".repeat(40), checksum: "c".repeat(64), stageId: "d".repeat(64), oldPid: 41, pid: 57, instanceId: "instance", protocolVersion: 1, agentId: "grok", notBefore: t0, notAfter: t0 + 10_000 };
+    const expected = { activationId: "a".repeat(64), bridgeId: "workstation", sha: "b".repeat(40), checksum: "c".repeat(64), stageId: "d".repeat(64), oldPid: 41, pid: 57, instanceId: "instance", protocolVersion: 1, agentId: "grok", notBefore: t0, notAfter: t0 + 10_000 };
     const good = { formatVersion: 2, activationId: expected.activationId, bridgeId: expected.bridgeId, sourceSha: expected.sha, artifactChecksum: expected.checksum, stageId: expected.stageId, oldPid: 41, pid: 57, instanceId: "instance", protocolVersion: 1, startedAt: "2026-09-08T00:00:00.000Z", helloAcceptedAt: "2026-09-08T00:00:01.000Z", controllerVerifiedAt: "2026-09-08T00:00:04.000Z", completedAt: "2026-09-08T00:00:04.000Z", catalogRpcs: { grok: { describeModelCatalogAt: "2026-09-08T00:00:02.000Z", fetchModelCatalogAt: "2026-09-08T00:00:03.000Z" } }, controllerAck: { activationId: expected.activationId, bridgeId: expected.bridgeId, instanceId: "instance", pid: 57, sourceSha: expected.sha, artifactChecksum: expected.checksum } };
     expect(validateReadyReceipt(good, expected)).toBe(true);
     expect(() => validateReadyReceipt({ ...good, activationId: "e".repeat(64) }, expected)).toThrow(/this activation/);
@@ -369,7 +369,7 @@ describe("bridge rollout gating and verification (#241)", () => {
   });
 
   it("generates only an explicit version-bound rollback", () => {
-    expect(rollbackPlan(resolveTarget(targets, "media-server"), token)).toEqual({ target: "media-server", command: `npm run bridge:rollout -- --target media-server --rollback --activation-id ${token} --apply`, automatic: false });
+    expect(rollbackPlan(resolveTarget(targets, "workstation"), token)).toEqual({ target: "workstation", command: `npm run bridge:rollout -- --target workstation --rollback --activation-id ${token} --apply`, automatic: false });
   });
 
   it("separates an incomplete activation from deployed-but-unconfirmed verification output (#328)", () => {

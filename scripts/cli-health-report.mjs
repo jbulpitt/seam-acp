@@ -13,6 +13,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { renderRemoteScript, validateTargetMap } from "./lib/bridge-rollout.mjs";
 import { validateBridgeRegistry } from "./lib/bridge-fleet.mjs";
+import { resolveBridgeTargetsFile } from "./lib/bridge-targets.mjs";
 import { observeHost } from "./cli-health-observe.mjs";
 import {
   beginRun, bridgeObservation, discoverReleases, finishRun, inspectTarget,
@@ -87,7 +88,7 @@ export async function main(argv = process.argv.slice(2)) {
     // report it below. Never publish a previous clean run as today's result.
     try {
       const { targets, registered, issues } = reportConfiguration(
-        await json(options.targets ?? path.join(root, "ops/bridge/targets.json")),
+        await json(options.targets ?? resolveBridgeTargetsFile(root)),
         await json(options.registry ?? path.join(data, "channel-presets.json")));
       const cachePath = path.join(data, "server-status-card.json");
       let cacheMtime = NaN;

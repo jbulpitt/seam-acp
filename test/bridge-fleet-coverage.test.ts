@@ -7,7 +7,7 @@ import { assertTargetRegistered, describeTargetFleet, formatFleetCoverage, valid
 import { validateTargetMap } from "../scripts/lib/bridge-rollout.mjs";
 
 const root = path.resolve(import.meta.dirname, "..");
-const configured = JSON.parse(fs.readFileSync(path.join(root, "ops/bridge/targets.json"), "utf8"));
+const configured = JSON.parse(fs.readFileSync(path.join(root, "ops/bridge/targets.example.json"), "utf8"));
 const targetMap = validateTargetMap(configured);
 const registeredShape = {
   bridges: Object.fromEntries(Object.keys(configured.targets).map((id) => [id, { workspaceRoot: `/fixture/${id}` }])),
@@ -27,16 +27,16 @@ function tempRegistry(shape = registeredShape): string {
 }
 
 describe("#413 bridge fleet accounting", () => {
-  it("reconciles all nine registered hosts and names every rollout exclusion", () => {
+  it("reconciles all ten registered hosts and names every rollout exclusion", () => {
     const registered = validateBridgeRegistry(registeredShape);
     const fleet = describeTargetFleet(targetMap, registered);
-    expect(fleet.registered).toHaveLength(9);
-    expect(fleet.rolloutManaged).toEqual(["fhr-server", "macbook-air", "macbook-pro", "media-server", "plex-server", "rhc-server"]);
+    expect(fleet.registered).toHaveLength(10);
+    expect(fleet.rolloutManaged).toEqual(["arm-bridge", "dev-bridge", "laptop-a", "laptop-b", "linux-bridge", "media-bridge", "workstation"]);
     expect(fleet.rolloutExcluded.map((row) => row.id)).toEqual([
-      "alaina-laptop", "allie-laptop", "jennifer-laptop",
+      "excluded-laptop-a", "excluded-laptop-b", "excluded-laptop-c",
     ]);
-    expect(formatFleetCoverage(fleet, "media-server")).toContain("fleet_rollout_managed=6 of 9");
-    expect(formatFleetCoverage(fleet, "media-server")).toContain("operation_scope=1 of 9 registered hosts: media-server");
+    expect(formatFleetCoverage(fleet, "workstation")).toContain("fleet_rollout_managed=7 of 10");
+    expect(formatFleetCoverage(fleet, "workstation")).toContain("operation_scope=1 of 10 registered hosts: workstation");
   });
 
   it("narrows to the divergent host when a live registered bridge has no rollout record", () => {
@@ -45,11 +45,11 @@ describe("#413 bridge fleet accounting", () => {
     // ordinary state (a retired box, an unreachable laptop). It is reported,
     // excluded from managed scope, and named in the coverage line instead.
     const missing = structuredClone(configured);
-    delete missing.targets["plex-server"];
+    delete missing.targets["media-bridge"];
     const fleet = describeTargetFleet(validateTargetMap(missing), validateBridgeRegistry(registeredShape));
-    expect(fleet.diverged.map((d) => d.id)).toEqual(["plex-server"]);
-    expect(fleet.rolloutManaged).not.toContain("plex-server");
-    expect(formatFleetCoverage(fleet)).toContain("plex-server");
+    expect(fleet.diverged.map((d) => d.id)).toEqual(["media-bridge"]);
+    expect(fleet.rolloutManaged).not.toContain("media-bridge");
+    expect(formatFleetCoverage(fleet)).toContain("media-bridge");
     // …and the coverage claim shrinks with it, so a run can never overstate.
     expect(fleet.rolloutManaged.length).toBeLessThan(fleet.registered.length);
   });
@@ -58,12 +58,12 @@ describe("#413 bridge fleet accounting", () => {
     // The protection #413 actually needed: you cannot act on a host whose
     // registration you do not understand.
     const missing = structuredClone(configured);
-    delete missing.targets["plex-server"];
+    delete missing.targets["media-bridge"];
     const fleet = describeTargetFleet(validateTargetMap(missing), validateBridgeRegistry(registeredShape));
-    expect(() => assertTargetRegistered(fleet, "plex-server"))
-      .toThrow(/registry divergence for plex-server/);
+    expect(() => assertTargetRegistered(fleet, "media-bridge"))
+      .toThrow(/registry divergence for media-bridge/);
     // Every other host stays operable.
-    expect(() => assertTargetRegistered(fleet, "media-server")).not.toThrow();
+    expect(() => assertTargetRegistered(fleet, "workstation")).not.toThrow();
   });
 
   it("narrows a stale rollout target that is no longer registered", () => {
@@ -83,19 +83,19 @@ describe("#413 bridge fleet accounting", () => {
 
   it("keeps offline and deliberately excluded hosts in the denominator", () => {
     const fleet = describeTargetFleet(targetMap, validateBridgeRegistry(registeredShape));
-    expect(fleet.registered).toContain("jennifer-laptop");
+    expect(fleet.registered).toContain("excluded-laptop-a");
     expect(fleet.rolloutExcluded).toEqual([
       {
-        id: "alaina-laptop",
-        reason: "pm2 seam-bridge runs as alaina uid 502; SSH user jessebulpitt cannot write that home and rollout does not elevate (#494)",
+        id: "excluded-laptop-a",
+        reason: "no verified privileged management path for this host",
       },
       {
-        id: "allie-laptop",
-        reason: "pm2 seam-bridge runs as alliebulpitt uid 502; SSH user jessebulpitt cannot write that home and rollout does not elevate (#494)",
+        id: "excluded-laptop-b",
+        reason: "bridge runs under a different account; management user cannot write that home",
       },
       {
-        id: "jennifer-laptop",
-        reason: "agy-only pm2 host has no passwordless sudo; its Aug 21 bridge ignores runtime pins, so a rollout would take it dark (#388)",
+        id: "excluded-laptop-c",
+        reason: "bridge runs under a different account; management user cannot write that home",
       },
     ]);
   });
@@ -109,9 +109,9 @@ describe("#413 bridge fleet accounting", () => {
       // Select an excluded target so even a mutation removing reconciliation
       // cannot cross the test boundary into SSH; it will stop at the ordinary
       // target refusal instead.
-      execFileSync(process.execPath, [path.join(root, "scripts/bridge-rollout.mjs"), "--target", "jennifer-laptop"], {
+      execFileSync(process.execPath, [path.join(root, "scripts/bridge-rollout.mjs"), "--target", "excluded-laptop-a"], {
         cwd: root,
-        env: { ...process.env, CHANNEL_PRESETS_FILE: registry },
+        env: { ...process.env, CHANNEL_PRESETS_FILE: registry, SEAM_BRIDGE_TARGETS_FILE: path.join(root, "ops/bridge/targets.example.json") },
         encoding: "utf8",
         stdio: ["ignore", "pipe", "pipe"],
         timeout: 10_000,
@@ -123,7 +123,7 @@ describe("#413 bridge fleet accounting", () => {
     // coverage and excluded; the command then stops at the ordinary refusal for
     // the target actually selected. Never reaching SSH is still the boundary.
     expect(stderr).not.toContain("ssh:");
-    expect(stderr).toMatch(/jennifer-laptop/);
+    expect(stderr).toMatch(/excluded-laptop-a/);
   });
 
   it("prints the complete denominator before refusing an explicitly excluded target", () => {
@@ -131,9 +131,9 @@ describe("#413 bridge fleet accounting", () => {
     let stdout = "";
     let stderr = "";
     try {
-      execFileSync(process.execPath, [path.join(root, "scripts/bridge-rollout.mjs"), "--target", "jennifer-laptop"], {
+      execFileSync(process.execPath, [path.join(root, "scripts/bridge-rollout.mjs"), "--target", "excluded-laptop-a"], {
         cwd: root,
-        env: { ...process.env, CHANNEL_PRESETS_FILE: registry },
+        env: { ...process.env, CHANNEL_PRESETS_FILE: registry, SEAM_BRIDGE_TARGETS_FILE: path.join(root, "ops/bridge/targets.example.json") },
         encoding: "utf8",
         stdio: ["ignore", "pipe", "pipe"],
         timeout: 10_000,
@@ -143,11 +143,11 @@ describe("#413 bridge fleet accounting", () => {
       stdout = e.stdout ?? "";
       stderr = e.stderr ?? "";
     }
-    expect(stdout).toContain("fleet_registered=9");
-    expect(stdout).toContain("fleet_rollout_managed=6 of 9");
-    expect(stdout).toContain("fleet_excluded=jennifer-laptop: agy-only pm2 host has no passwordless sudo; its Aug 21 bridge ignores runtime pins, so a rollout would take it dark (#388)");
-    expect(stdout).toContain("fleet_excluded=allie-laptop: pm2 seam-bridge runs as alliebulpitt uid 502; SSH user jessebulpitt cannot write that home and rollout does not elevate (#494)");
-    expect(stdout).toContain("fleet_excluded=alaina-laptop: pm2 seam-bridge runs as alaina uid 502; SSH user jessebulpitt cannot write that home and rollout does not elevate (#494)");
-    expect(stderr).toMatch(/jennifer-laptop is explicitly excluded.*#388/);
+    expect(stdout).toContain("fleet_registered=10");
+    expect(stdout).toContain("fleet_rollout_managed=7 of 10");
+    expect(stdout).toContain("fleet_excluded=excluded-laptop-a: no verified privileged management path for this host");
+    expect(stdout).toContain("fleet_excluded=excluded-laptop-c: bridge runs under a different account; management user cannot write that home");
+    expect(stdout).toContain("fleet_excluded=excluded-laptop-b: bridge runs under a different account; management user cannot write that home");
+    expect(stderr).toMatch(/excluded-laptop-a is explicitly excluded.*privileged management/);
   });
 });

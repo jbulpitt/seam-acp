@@ -1,0 +1,127 @@
+{
+  "schemaVersion": 3,
+  "targets": {
+    "workstation": {
+      "sshAlias": "workstation",
+      "pm2App": "remote-agent-bridge",
+      "verifyAgent": "grok",
+      "checkoutPath": "/Users/operator/seam-acp",
+      "entrypointPath": "/Users/operator/seam-acp/packages/bridge/dist/index.js",
+      "expectedUid": 501,
+      "nodePath": "/Users/operator/.nvm/versions/node/v22.23.2/bin/node",
+      "pm2ModulePath": "/Users/operator/.nvm/versions/node/v22.23.2/lib/node_modules/pm2",
+      "workspaceArg": null,
+      "devMode": true,
+      "releaseRoot": "/Users/operator/.seam/bridge-rollouts",
+      "rolloutEnabled": true
+    },
+    "laptop-a": {
+      "sshAlias": "laptop-a",
+      "pm2App": "seam-bridge",
+      "verifyAgent": "grok",
+      "checkoutPath": "/Users/operator/.seam/seam-acp",
+      "entrypointPath": "/Users/operator/.seam/seam-acp/packages/bridge/dist/index.js",
+      "expectedUid": 501,
+      "nodePath": "/Users/operator/.nvm/versions/node/v22.22.2/bin/node",
+      "pm2ModulePath": "/Users/operator/.seam/lib/node_modules/pm2",
+      "workspaceArg": "/Users/operator",
+      "devMode": true,
+      "releaseRoot": "/Users/operator/.seam/bridge-rollouts",
+      "rolloutEnabled": true
+    },
+    "excluded-laptop-a": {
+      "sshAlias": "excluded-laptop-a",
+      "pm2App": null,
+      "verifyAgent": null,
+      "rolloutEnabled": false,
+      "unmanagedReason": "no verified privileged management path for this host"
+    },
+    "laptop-b": {
+      "sshAlias": "laptop-b",
+      "pm2App": "seam-bridge",
+      "verifyAgent": "grok",
+      "checkoutPath": "/Users/operator/.seam/seam-acp",
+      "entrypointPath": "/Users/operator/.seam/seam-acp/packages/bridge/dist/index.js",
+      "expectedUid": 501,
+      "nodePath": "/Users/operator/.seam/node/bin/node",
+      "pm2ModulePath": "/Users/operator/.seam/lib/node_modules/pm2",
+      "workspaceArg": "/Users/operator",
+      "devMode": true,
+      "releaseRoot": "/Users/operator/.seam/bridge-rollouts",
+      "rolloutEnabled": true
+    },
+    "excluded-laptop-b": {
+      "sshAlias": "excluded-laptop-b",
+      "pm2App": null,
+      "verifyAgent": null,
+      "rolloutEnabled": false,
+      "unmanagedReason": "bridge runs under a different account; management user cannot write that home"
+    },
+    "excluded-laptop-c": {
+      "sshAlias": "excluded-laptop-c",
+      "pm2App": null,
+      "verifyAgent": null,
+      "rolloutEnabled": false,
+      "unmanagedReason": "bridge runs under a different account; management user cannot write that home"
+    },
+    "linux-bridge": {
+      "sshAlias": "linux-bridge",
+      "launcher": "systemd",
+      "pm2App": "seam-bridge",
+      "launcherPath": "/home/operator/.local/libexec/seam-bridge-launch.mjs",
+      "verifyAgent": "agy",
+      "checkoutPath": "/home/operator/.seam/seam-acp",
+      "entrypointPath": "/home/operator/.seam/seam-acp/packages/bridge/dist/index.js",
+      "expectedUid": 1000,
+      "nodePath": "/home/operator/.nvm/versions/node/v22.22.2/bin/node",
+      "workspaceArg": "/home/operator/Projects",
+      "devMode": true,
+      "releaseRoot": "/home/operator/.seam/bridge-rollouts",
+      "rolloutEnabled": true
+    },
+    "media-bridge": {
+      "sshAlias": "media-bridge",
+      "launcher": "systemd",
+      "pm2App": "seam-bridge",
+      "launcherPath": "/home/operator/.local/libexec/seam-bridge-launch.mjs",
+      "verifyAgent": "grok",
+      "checkoutPath": "/home/operator/.seam/seam-acp",
+      "entrypointPath": "/home/operator/.seam/seam-acp/packages/bridge/dist/index.js",
+      "expectedUid": 1000,
+      "nodePath": "/home/operator/.seam/node-v22.22.2/bin/node",
+      "workspaceArg": "/home/operator/Projects",
+      "devMode": false,
+      "releaseRoot": "/home/operator/.seam/bridge-rollouts",
+      "rolloutEnabled": true
+    },
+    "arm-bridge": {
+      "sshAlias": "arm-bridge",
+      "pm2App": "seam-bridge",
+      "verifyAgent": "agy",
+      "checkoutPath": "/home/operator/.seam/seam-acp",
+      "entrypointPath": "/home/operator/.seam/seam-acp/packages/bridge/dist/index.js",
+      "expectedUid": 1001,
+      "nodePath": "/home/operator/.nvm/versions/node/v22.22.2/bin/node",
+      "pm2ModulePath": "/home/operator/.nvm/versions/node/v22.22.2/lib/node_modules/pm2",
+      "workspaceArg": "/home/operator/Projects",
+      "devMode": true,
+      "releaseRoot": "/home/operator/.seam/bridge-rollouts",
+      "rolloutEnabled": true
+    },
+    "dev-bridge": {
+      "sshAlias": "dev-bridge",
+      "launcher": "systemd",
+      "pm2App": "seam-bridge",
+      "launcherPath": "/home/operator/.local/libexec/seam-bridge-launch.mjs",
+      "verifyAgent": "agy",
+      "checkoutPath": "/home/operator/.seam/seam-acp",
+      "entrypointPath": "/home/operator/.seam/seam-acp/packages/bridge/dist/index.js",
+      "expectedUid": 1000,
+      "nodePath": "/home/operator/.nvm/versions/node/v22.22.2/bin/node",
+      "workspaceArg": "/home/operator/Projects",
+      "devMode": true,
+      "releaseRoot": "/home/operator/.seam/bridge-rollouts",
+      "rolloutEnabled": true
+    }
+  }
+}

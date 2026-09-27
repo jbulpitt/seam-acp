@@ -101,21 +101,21 @@ describe("nightly release/drift report (#504)", () => {
     expect(bridgeObservation(cache, 1000, "laptop", 1001)).toBe("observed-connected");
     expect(bridgeObservation(cache, 1000, "laptop", 200000)).toBe("unknown");
     expect(bridgeObservation({ lastSeen: { laptop: { agents: [], offlineSince: 1 } } }, 1000, "laptop", 1001)).toBe("observed-disconnected");
-    const targets = validateTargetMap(JSON.parse(await fs.readFile(path.join(root, "ops/bridge/targets.json"), "utf8")));
+    const targets = validateTargetMap(JSON.parse(await fs.readFile(path.join(root, "ops/bridge/targets.example.json"), "utf8")));
     const run = vi.fn(async (_command: any) => { throw new Error("channel 0: open failed: connect failed: Connection refused secret/path"); });
-    expect(await inspectTarget(targets.get("macbook-air"), {}, run)).toMatchObject({ management: "tunnel-forward-refused", preflight: "unchecked" });
-    expect(await inspectTarget(targets.get("allie-laptop"), {}, run)).toMatchObject({ management: "excluded", preflight: "unchecked" });
+    expect(await inspectTarget(targets.get("laptop-a"), {}, run)).toMatchObject({ management: "tunnel-forward-refused", preflight: "unchecked" });
+    expect(await inspectTarget(targets.get("excluded-laptop-c"), {}, run)).toMatchObject({ management: "excluded", preflight: "unchecked" });
     expect(run).toHaveBeenCalledTimes(1);
     expect(run.mock.calls[0]![0].args).toContain("StrictHostKeyChecking=yes");
   });
 
   // Necessity: reuse must retain the real preflight's refusal without suppressing other observations.
   it("uses the existing preflight evaluator and inventories even after refusal", async () => {
-    const targets = validateTargetMap(JSON.parse(await fs.readFile(path.join(root, "ops/bridge/targets.json"), "utf8")));
+    const targets = validateTargetMap(JSON.parse(await fs.readFile(path.join(root, "ops/bridge/targets.example.json"), "utf8")));
     const run = vi.fn(async (command: { input?: string }) => ({ stdout: command.input === "preflight"
-      ? `bridge_id=macbook-air\nidentity_bound=yes\nnode_version=v22.22.2\nnative_install_ready=no\n`
+      ? `bridge_id=laptop-a\nidentity_bound=yes\nnode_version=v22.22.2\nnative_install_ready=no\n`
       : command.input === "observe" ? JSON.stringify({ schemaVersion: 1, artifacts: [], defaultNode: { version: "24.15.0", floating: true } }) : "" }));
-    const found = await inspectTarget(targets.get("macbook-air"), { preflight: "preflight", observe: "observe" }, run);
+    const found = await inspectTarget(targets.get("laptop-a"), { preflight: "preflight", observe: "observe" }, run);
     expect(found.preflight).toBe("refused-by-existing-preflight");
     expect(found.serviceNode).toBe("22.22.2");
     expect(found.preflightFindings[0].code).toBe("native_prebuild_unavailable");
@@ -125,11 +125,11 @@ describe("nightly release/drift report (#504)", () => {
 
   // Necessity: one missing mapping must not shrink coverage or block otherwise observable hosts.
   it("walks union coverage with narrow divergence and local unknowns", async () => {
-    const configured = JSON.parse(await fs.readFile(path.join(root, "ops/bridge/targets.json"), "utf8"));
-    configured.targets["macbook-air"].nodePath = "unsafe";
+    const configured = JSON.parse(await fs.readFile(path.join(root, "ops/bridge/targets.example.json"), "utf8"));
+    configured.targets["laptop-a"].nodePath = "unsafe";
     const validated = reportTargets(configured);
-    expect(validated.get("macbook-air")).toBeNull();
-    expect(validated.get("macbook-pro").nodePath).toMatch(/^\//);
+    expect(validated.get("laptop-a")).toBeNull();
+    expect(validated.get("laptop-b").nodePath).toMatch(/^\//);
     const inspect = vi.fn(async () => ({ host: "ok", management: "reachable", preflight: "passed" }));
     const result = await collectReport({ targets: new Map([["ok", {}], ["unregistered", {}]]), registered: new Set(["ok", "missing"]),
       scripts: {}, cache: {}, cacheMtime: 0, local: {}, canary: null },

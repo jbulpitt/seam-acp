@@ -217,7 +217,7 @@ function nonDecreasing(times) {
  * stamps both with Date.now() on the target, but they are not one happens-before
  * chain: the controller may ack identity before catalog RPCs finish recording.
  * A total order across those streams produced a false `unconfirmed` on
- * plex-server (#483, 3ms). Order is enforced within each stream; membership in
+ * one systemd target (#483, 3ms). Order is enforced within each stream; membership in
  * the activation window allows RECEIPT_NTP_SKEW_MS across streams.
  */
 export function receiptEventStreamsAcceptable(receipt, expected, verifyAgent) {

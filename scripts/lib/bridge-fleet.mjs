@@ -24,11 +24,11 @@ export function describeTargetFleet(targets, registered = new Set(targets.keys()
   const missingTargets = [...registered].filter((id) => !targetIds.has(id)).sort();
   const unregisteredTargets = [...targetIds].filter((id) => !registered.has(id)).sort();
 
-  // #413 is why divergence must never be silent: plex-server and rhc-server
+  // #413 is why divergence must never be silent: two registered bridges
   // existed only in the live registry, so five "all hosts" checks quietly
   // never considered them. The answer to a silent gap is LOUD, not STOPPED.
   //
-  // Refusing the whole fleet because one host diverges punishes nine healthy
+  // Refusing the whole fleet because one host diverges punishes healthy
   // machines for one anomaly, and a retired host or an unreachable laptop is
   // an ordinary state, not an emergency. `cli-health-report.mjs` already got
   // this right with `unchecked-registry-divergence`: narrow the scope to the
@@ -40,8 +40,8 @@ export function describeTargetFleet(targets, registered = new Set(targets.keys()
   // thing #413 actually needed was that you cannot operate on a host whose
   // registration you do not understand.
   const diverged = [
-    ...missingTargets.map((id) => ({ id, reason: "registered bridge absent from targets.json" })),
-    ...unregisteredTargets.map((id) => ({ id, reason: "targets.json host absent from the bridge registry" })),
+    ...missingTargets.map((id) => ({ id, reason: "registered bridge absent from the target map" })),
+    ...unregisteredTargets.map((id) => ({ id, reason: "the target map host absent from the bridge registry" })),
   ].sort((a, b) => a.id.localeCompare(b.id));
 
   const rolloutManaged = [];
@@ -213,7 +213,7 @@ export function collectBlockers(report, target, targets = new Map()) {
       `${report.native_dependency ?? "native dependency"} has no reviewed prebuild for ABI ${abi} ` +
       `(node ${report.node_version ?? "unknown"} at ${report.node_path ?? "unknown path"}).${drift}`,
       drift
-        ? `point nodePath at the fleet standard v${baseline} in ops/bridge/targets.json, or add a reviewed prebuild for ${abi}`
+        ? `point nodePath at the fleet standard v${baseline} in the deployment target map, or add a reviewed prebuild for ${abi}`
         : `add a reviewed prebuild for ${abi}, or move this host to a node whose ABI already has one`
     );
   }
@@ -224,8 +224,8 @@ export function collectBlockers(report, target, targets = new Map()) {
     add(
       "node_path_drift",
       "advisory",
-      `targets.json declares ${target.nodePath}; the host resolved ${report.node_path}`,
-      `reconcile ops/bridge/targets.json with the host, or repoint the host's node`
+      `the target map declares ${target.nodePath}; the host resolved ${report.node_path}`,
+      `reconcile ops/bridge/the target map with the host, or repoint the host's node`
     );
   }
 

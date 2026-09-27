@@ -1,14 +1,8 @@
 /**
- * One-shot per-thread secrets for `/seamadmin upload secret`.
+ * Temporary per-thread secrets for `/seamadmin upload secret`.
  *
- * Values live as 0600 files under `<dataDir>/secrets/<threadId>/<name>`.
- * The agent is told the PATH only (harness). After the next live turn in that
- * thread finishes, the files are deleted. A TTL sweep is the backstop if no
- * turn happens.
- *
- * Detecting "the agent read the file" is unreliable (no atime, no ACP hook),
- * so turn-end is the consume event — not a memory register (those die on
- * restart and duplicate the file store).
+ * Values live as 0600 files under `<dataDir>/secrets/<threadId>/<name>`
+ * until the TTL sweep removes them.
  */
 import { promises as fsp } from "node:fs";
 import path from "node:path";
@@ -98,17 +92,8 @@ export function secretHarnessRules(
   if (secrets.length === 0) return [];
   return secrets.map(
     (s) =>
-      `A one-shot secret named \`${s.name}\` is at \`${s.absPath}\`. Read the file if you need the value. Never echo, quote, or restate the contents. It will be deleted when this turn ends.`
+      `A temporary secret named \`${s.name}\` is at \`${s.absPath}\`. Read the file if you need the value. Never echo, quote, or restate the contents. It will be deleted about an hour after upload.`
   );
-}
-
-/** Delete every secret for this thread (end-of-turn consume). */
-export async function consumeThreadSecrets(
-  dataDir: string,
-  threadId: string
-): Promise<void> {
-  const dir = threadSecretsDir(dataDir, threadId);
-  await fsp.rm(dir, { recursive: true, force: true });
 }
 
 /** Drop secret files older than TTL. Safe to call from the sentinel poller. */

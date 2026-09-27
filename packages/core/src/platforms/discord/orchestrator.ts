@@ -577,7 +577,6 @@ import {
   writeThreadSecret,
   listThreadSecrets,
   secretHarnessRules,
-  consumeThreadSecrets,
   sweepExpiredSecrets,
 } from "../../core/thread-secrets.js";
 import {
@@ -4947,9 +4946,6 @@ export class Orchestrator {
       if (result !== "timeout" && !result.cancelled && this.queueFenceCurrent(queueFence)) {
         this.currentSpeakerIds.delete(record.channelRef);
         this.currentAuthorIds.delete(record.channelRef);
-        await wrapUpStep("consume-thread-secrets", () =>
-          consumeThreadSecrets(this.config.DATA_DIR, channel.id).catch((err) =>
-            this.logger.warn({ err, channel: channel.id }, "secret consume failed")));
         queueReleased = true;
         queueFence?.release?.();
       }
@@ -5095,9 +5091,6 @@ export class Orchestrator {
       if (!queueReleased) {
         this.currentSpeakerIds.delete(record.channelRef);
         this.currentAuthorIds.delete(record.channelRef);
-        await wrapUpStep("consume-thread-secrets", () =>
-          consumeThreadSecrets(this.config.DATA_DIR, channel.id).catch((err) =>
-            this.logger.warn({ err, channel: channel.id }, "secret consume failed")));
       }
       await wrapUpStep("status-card-final", () => refresh(true));
       if (isSimpleCardGifTerminal(status.state)) {
@@ -22267,7 +22260,7 @@ export class Orchestrator {
     await i.editReply(`Wrote \`${file.name ?? "file"}\` → \`${dest}\` (${bytes.byteLength} B).`);
   }
 
-  /** `/seamadmin upload secret` — modal for name+value; one-shot file, path-only. */
+  /** `/seamadmin upload secret` — modal for a temporary path-only value. */
   private async cmdUploadSecret(i: ChatInputCommandInteraction): Promise<void> {
     const channel = this.channelRefFromInteraction(i);
     if (!channel) {
@@ -22279,7 +22272,7 @@ export class Orchestrator {
     }
     const modal = new ModalBuilder()
       .setCustomId(`upload:secret:${i.id}`)
-      .setTitle("One-shot secret")
+      .setTitle("Temporary secret")
       .addComponents(
         new ActionRowBuilder<TextInputBuilder>().addComponents(
           new TextInputBuilder()
@@ -22312,7 +22305,7 @@ export class Orchestrator {
       await sub.reply({
         content:
           `🔐 Secret \`${written.name}\` stored for this thread at \`${written.absPath}\`.\n` +
-          `The next agent turn will see the path (not the value). It is deleted when that turn ends, or after 1 hour.`,
+          `Agent turns will see the path (not the value). It is deleted about 1 hour after upload.`,
         flags: MessageFlags.Ephemeral,
       });
     } catch (err) {

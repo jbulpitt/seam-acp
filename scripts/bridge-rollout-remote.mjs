@@ -612,7 +612,7 @@ async function writeActivationEnvelope(release, envelope) {
 }
 
 // Catalog RPCs and the controller ack are concurrent event streams. A total
-// order across them produced a false unconfirmed on plex-server (#483, 3ms).
+// order across them produced a false unconfirmed on one systemd target (#483, 3ms).
 // Normal NTP is well under a second; 2s absorbs a slow step.
 const RECEIPT_NTP_SKEW_MS = 2_000;
 function parseReceiptTime(value) {

@@ -7,7 +7,7 @@
  * invisible to an in-process caller. `--env-file` is a node option, and node
  * scans the whole argv for its own options even after the script path — so
  * `node verify-agy-deployment.mjs --env-file <MISSING>` aborted at exit 9 with
- * the script never running, on exactly the host (`media-server`) whose
+ * the script never running, on exactly the host (`workstation`) whose
  * NOT-DEPLOYED verdict and exit 3 had just been written for it.
  *
  * Every test here spawns a real `node`. That is the point; an in-process
@@ -104,7 +104,7 @@ describe("#397 the exit-code contract, from a real node process", () => {
    * reaches a fully-passing state for every check a fixture is able to set up,
    * and that the only failure is the one the environment makes inevitable.
    * Exit 0 itself is covered by running the built tool on the real fleet, where
-   * macbook-pro, macbook-air and home-hub return it — see the PR.
+   * laptop-b, laptop-a and home-bridge return it — see the PR.
    */
   it("passes every check a fixture can control, failing only on ancestors it cannot", () => {
     const { pinsFile, runtimeParent } = fixture({ correct: true });
@@ -130,7 +130,7 @@ describe("#397 the exit-code contract, from a real node process", () => {
   });
 
   it("exits 3 when agy is not deployed, with the pins file absent", () => {
-    // media-server. This is the case #397 made unreachable through the
+    // workstation. This is the case #397 made unreachable through the
     // documented invocation, so it is asserted through a real spawn.
     const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "seam-397-")));
     roots.push(root);
@@ -144,7 +144,7 @@ describe("#397 the exit-code contract, from a real node process", () => {
   it("states the fleet denominator when given both reconciled registries", () => {
     const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "seam-413-")));
     roots.push(dir);
-    const targets = path.join(import.meta.dirname, "..", "ops", "bridge", "targets.json");
+    const targets = path.join(import.meta.dirname, "..", "ops", "bridge", "targets.example.json");
     const targetShape = JSON.parse(fs.readFileSync(targets, "utf8"));
     const registry = path.join(dir, "channel-presets.json");
     fs.writeFileSync(registry, JSON.stringify({
@@ -152,19 +152,19 @@ describe("#397 the exit-code contract, from a real node process", () => {
     }));
     const result = run([
       "--pins-file", path.join(dir, "missing.cjs"),
-      "--host", "jennifer-laptop",
+      "--host", "excluded-laptop-a",
       "--fleet-targets", targets,
       "--bridge-registry", registry,
     ]);
     expect(result.code).toBe(3);
-    expect(result.stdout).toContain("fleet_registered=9");
-    expect(result.stdout).toContain("fleet_rollout_managed=6 of 9");
-    expect(result.stdout).toContain("operation_scope=1 of 9 registered hosts: jennifer-laptop");
-    expect(result.stdout).toContain("fleet_excluded=jennifer-laptop: agy-only pm2 host has no passwordless sudo; its Aug 21 bridge ignores runtime pins, so a rollout would take it dark (#388)");
+    expect(result.stdout).toContain("fleet_registered=10");
+    expect(result.stdout).toContain("fleet_rollout_managed=7 of 10");
+    expect(result.stdout).toContain("operation_scope=1 of 10 registered hosts: excluded-laptop-a");
+    expect(result.stdout).toContain("fleet_excluded=excluded-laptop-a: no verified privileged management path for this host");
   });
 
   it("refuses a partial fleet scope instead of implying completeness", () => {
-    const result = run(["--pins-file", "/nonexistent", "--host", "plex-server"]);
+    const result = run(["--pins-file", "/nonexistent", "--host", "media-bridge"]);
     expect(result.code).toBe(2);
     expect(result.stderr).toContain("requires --host, --fleet-targets, and --bridge-registry together");
     expect(result.stdout).not.toContain("agy deployment:");

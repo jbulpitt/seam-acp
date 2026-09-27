@@ -15,7 +15,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { makeSshCommand, validateTargetMap } from "../scripts/lib/bridge-rollout.mjs";
 
 const root = path.resolve(import.meta.dirname, "..");
-const configured = JSON.parse(fs.readFileSync(path.join(root, "ops/bridge/targets.json"), "utf8"));
+const configured = JSON.parse(fs.readFileSync(path.join(root, "ops/bridge/targets.example.json"), "utf8"));
 const dirs: string[] = [];
 
 afterEach(async () => {
@@ -25,23 +25,23 @@ afterEach(async () => {
 const systemdFixture = {
   rolloutEnabled: true,
   launcher: "systemd",
-  sshAlias: "plex-server",
+  sshAlias: "media-bridge",
   pm2App: "seam-bridge",
-  launcherPath: "/home/mediaserver/.local/libexec/seam-bridge-launch.mjs",
+  launcherPath: "/home/operator/.local/libexec/seam-bridge-launch.mjs",
   verifyAgent: "grok",
   expectedUid: 1000,
-  checkoutPath: "/home/mediaserver/.seam/seam-acp",
-  entrypointPath: "/home/mediaserver/.seam/seam-acp/packages/bridge/dist/index.js",
-  nodePath: "/home/mediaserver/.seam/node-v22.22.2/bin/node",
-  workspaceArg: "/home/mediaserver/Projects",
+  checkoutPath: "/home/operator/.seam/seam-acp",
+  entrypointPath: "/home/operator/.seam/seam-acp/packages/bridge/dist/index.js",
+  nodePath: "/home/operator/.seam/node-v22.22.2/bin/node",
+  workspaceArg: "/home/operator/Projects",
   devMode: false,
-  releaseRoot: "/home/mediaserver/.seam/bridge-rollouts",
+  releaseRoot: "/home/operator/.seam/bridge-rollouts",
 };
 
 describe("#483 systemd target identity", () => {
   it("accepts a systemd target without a PM2 module", () => {
-    const targets = validateTargetMap({ schemaVersion: 3, targets: { "plex-server": systemdFixture } });
-    const plex = targets.get("plex-server");
+    const targets = validateTargetMap({ schemaVersion: 3, targets: { "media-bridge": systemdFixture } });
+    const plex = targets.get("media-bridge");
     expect(plex?.launcher).toBe("systemd");
     expect(plex?.launcherPath).toBe(systemdFixture.launcherPath);
     expect(plex?.pm2App).toBe("seam-bridge");
@@ -51,7 +51,7 @@ describe("#483 systemd target identity", () => {
   it("refuses a systemd target that still names a PM2 module", () => {
     expect(() => validateTargetMap({
       schemaVersion: 3,
-      targets: { "plex-server": { ...systemdFixture, pm2ModulePath: "/home/mediaserver/.seam/lib/node_modules/pm2" } },
+      targets: { "media-bridge": { ...systemdFixture, pm2ModulePath: "/home/operator/.seam/lib/node_modules/pm2" } },
     })).toThrow(/must not declare a PM2 module/);
   });
 
@@ -84,8 +84,8 @@ describe("#483 systemd target identity", () => {
   });
 
   it("streams launcher=systemd and the launcher path as remote identity args", () => {
-    const targets = validateTargetMap({ schemaVersion: 3, targets: { "plex-server": systemdFixture } });
-    const command = makeSshCommand(targets.get("plex-server")!, ["preflight"], "script");
+    const targets = validateTargetMap({ schemaVersion: 3, targets: { "media-bridge": systemdFixture } });
+    const command = makeSshCommand(targets.get("media-bridge")!, ["preflight"], "script");
     expect(command.args).toContain("systemd");
     expect(command.args).toContain(systemdFixture.launcherPath);
     expect(command.args).not.toContain("systemctl restart");
@@ -93,18 +93,18 @@ describe("#483 systemd target identity", () => {
 
   it("pins both live systemd hosts in the operator map", () => {
     const targets = validateTargetMap(configured);
-    expect(targets.get("plex-server")).toMatchObject({
+    expect(targets.get("media-bridge")).toMatchObject({
       launcher: "systemd",
       pm2App: "seam-bridge",
       expectedUid: 1000,
-      nodePath: "/home/mediaserver/.seam/node-v22.22.2/bin/node",
+      nodePath: "/home/operator/.seam/node-v22.22.2/bin/node",
     });
-    expect(targets.get("fhr-server")).toMatchObject({
+    expect(targets.get("linux-bridge")).toMatchObject({
       launcher: "systemd",
       pm2App: "seam-bridge",
       expectedUid: 1000,
       devMode: true,
-      nodePath: "/home/jessebulpitt/.nvm/versions/node/v22.22.2/bin/node",
+      nodePath: "/home/operator/.nvm/versions/node/v22.22.2/bin/node",
     });
   });
 });

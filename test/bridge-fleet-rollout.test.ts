@@ -28,21 +28,21 @@ import {
 } from "../scripts/lib/bridge-fleet.mjs";
 
 const root = path.resolve(import.meta.dirname, "..");
-const configured = JSON.parse(fs.readFileSync(path.join(root, "ops/bridge/targets.json"), "utf8"));
+const configured = JSON.parse(fs.readFileSync(path.join(root, "ops/bridge/targets.example.json"), "utf8"));
 const targets = validateTargetMap(configured);
 const fleet = describeTargetFleet(targets, new Set(Object.keys(configured.targets)));
 
 /** A well-formed preflight report with nothing wrong with it. */
 const CLEAN = Object.freeze({
-  bridge_id: "media-server",
-  node_path: "/Users/jesse/.nvm/versions/node/v22.23.2/bin/node",
+  bridge_id: "workstation",
+  node_path: "/Users/operator/.nvm/versions/node/v22.23.2/bin/node",
   node_version: "v22.23.2",
   native_install_ready: "yes",
   native_dependency: "better-sqlite3@11.10.0",
   native_prebuild: "better-sqlite3@11.10.0-node-v127-linux-x64",
   enrolled: "yes",
   rollout_ready: "yes",
-  disk_path: "/Users/jesse/seam-acp",
+  disk_path: "/Users/operator/seam-acp",
   disk_bytes_available: "50000000000",
 });
 
@@ -52,7 +52,7 @@ describe("#484 fleet mode exists at all", () => {
   });
 
   it("refuses naming both a host and the fleet", () => {
-    expect(() => parseArgs(["--all", "--target", "media-server"])).toThrow(/either --target .* or --all/);
+    expect(() => parseArgs(["--all", "--target", "workstation"])).toThrow(/either --target .* or --all/);
   });
 
   it("still refuses naming neither, and now says how to ask for the fleet", () => {
@@ -73,7 +73,7 @@ describe("#484 fleet mode exists at all", () => {
   });
 
   it("keeps the single-host scope line exactly as it was", () => {
-    expect(formatFleetCoverage(fleet, "media-server")).toContain("operation_scope=1 of");
+    expect(formatFleetCoverage(fleet, "workstation")).toContain("operation_scope=1 of");
   });
 });
 
@@ -94,28 +94,28 @@ describe("#484 --all is narrow on purpose", () => {
 
   it("still requires --apply for the combined path", () => {
     expect(() => parseArgs(["--all", "--rollout"])).toThrow(/requires --apply/);
-    expect(() => parseArgs(["--target", "media-server", "--rollout"])).toThrow(/requires --apply/);
+    expect(() => parseArgs(["--target", "workstation", "--rollout"])).toThrow(/requires --apply/);
   });
 
   it("confines --auto-enroll to the combined path", () => {
-    expect(() => parseArgs(["--target", "media-server", "--auto-enroll"])).toThrow(/applies only to --rollout/);
+    expect(() => parseArgs(["--target", "workstation", "--auto-enroll"])).toThrow(/applies only to --rollout/);
     expect(parseArgs(["--all", "--rollout", "--auto-enroll", "--apply"])).toMatchObject({ autoEnroll: true });
   });
 
   it("does not let --rollout be combined with another action", () => {
-    expect(() => parseArgs(["--target", "media-server", "--rollout", "--enroll", "--apply"])).toThrow(/choose only one/);
+    expect(() => parseArgs(["--target", "workstation", "--rollout", "--enroll", "--apply"])).toThrow(/choose only one/);
   });
 });
 
 describe("#484 unreachable is a normal state, not an error", () => {
   it("splits probes and keeps the reason for each skip", () => {
     const split = partitionReachability([
-      { id: "rhc-server", reachable: true },
-      { id: "macbook-air", reachable: false, detail: "ssh timed out after 15000ms" },
-      { id: "home-hub", reachable: false },
+      { id: "arm-bridge", reachable: true },
+      { id: "laptop-a", reachable: false, detail: "ssh timed out after 15000ms" },
+      { id: "home-bridge", reachable: false },
     ]);
-    expect(split.reachable).toEqual(["rhc-server"]);
-    expect(split.unreachable.map((r) => r.id)).toEqual(["macbook-air", "home-hub"]);
+    expect(split.reachable).toEqual(["arm-bridge"]);
+    expect(split.unreachable.map((r) => r.id)).toEqual(["laptop-a", "home-bridge"]);
     expect(split.unreachable[0]!.detail).toMatch(/timed out/);
     expect(split.unreachable[1]!.detail).toBe("ssh probe failed");
   });
@@ -124,9 +124,9 @@ describe("#484 unreachable is a normal state, not an error", () => {
     // Six of ten hosts were unreachable on 2026-09-21. That is a fleet of
     // laptops behaving normally.
     const results = [
-      { id: "rhc-server", outcome: "succeeded" },
-      { id: "macbook-air", outcome: "skipped-unreachable" },
-      { id: "home-hub", outcome: "skipped-unreachable" },
+      { id: "arm-bridge", outcome: "succeeded" },
+      { id: "laptop-a", outcome: "skipped-unreachable" },
+      { id: "home-bridge", outcome: "skipped-unreachable" },
     ];
     expect(fleetRunExitCode(results)).toBe(0);
     expect(formatFleetRunSummary(results)).toContain("skipped_unreachable=2");
@@ -177,15 +177,15 @@ describe("#484 the reachability probe asks one question and mutates nothing", ()
 
 describe("#484 every blocker at once, each with its remediation", () => {
   it("reports NOTHING for a healthy host", () => {
-    expect(collectBlockers(CLEAN, targets.get("media-server"))).toEqual([]);
-    expect(formatBlockers("media-server", [])).toBe("host_clear=media-server");
+    expect(collectBlockers(CLEAN, targets.get("workstation"))).toEqual([]);
+    expect(formatBlockers("workstation", [])).toBe("host_clear=workstation");
   });
 
   it("collects four blockers from ONE report instead of one per round trip", () => {
     // This is the morning of 2026-09-21 compressed into a single answer.
     const blockers = collectBlockers(
       { ...CLEAN, native_install_ready: "no", enrolled: "no", rollout_ready: "no", disk_bytes_available: "1024" },
-      targets.get("media-server"),
+      targets.get("workstation"),
       targets
     );
     expect(blockers.map((b) => b.code).sort()).toEqual(
@@ -195,26 +195,26 @@ describe("#484 every blocker at once, each with its remediation", () => {
   });
 
   it("names the enrollment remediation that cost a round trip", () => {
-    const [blocker] = collectBlockers({ ...CLEAN, enrolled: "no", artifact_mode: "legacy-checkout" }, targets.get("media-server"));
+    const [blocker] = collectBlockers({ ...CLEAN, enrolled: "no", artifact_mode: "legacy-checkout" }, targets.get("workstation"));
     expect(blocker!.code).toBe("not_enrolled");
     expect(blocker!.detail).toContain("legacy_previous_release_not_receipt_capable");
     expect(blocker!.remediation).toContain("--enroll --apply");
   });
 
   it("distinguishes a drifted baseline from an absent one", () => {
-    const codes = collectBlockers({ ...CLEAN, enrolled: "drifted" }, targets.get("media-server")).map((b) => b.code);
+    const codes = collectBlockers({ ...CLEAN, enrolled: "drifted" }, targets.get("workstation")).map((b) => b.code);
     expect(codes).toContain("enrolled_baseline_drift");
     expect(codes).not.toContain("not_enrolled");
   });
 
   it("survives a malformed report rather than throwing over it", () => {
-    expect(collectBlockers(null, targets.get("media-server"))).toEqual([]);
-    expect(collectBlockers("nonsense" as never, targets.get("media-server"))).toEqual([]);
+    expect(collectBlockers(null, targets.get("workstation"))).toEqual([]);
+    expect(collectBlockers("nonsense" as never, targets.get("workstation"))).toEqual([]);
   });
 
   it("prints each blocker with its remediation underneath", () => {
-    const text = formatBlockers("media-server", collectBlockers({ ...CLEAN, enrolled: "no", artifact_mode: "legacy-checkout" }, targets.get("media-server")));
-    expect(text).toContain("host_blocked=media-server blocking=1");
+    const text = formatBlockers("workstation", collectBlockers({ ...CLEAN, enrolled: "no", artifact_mode: "legacy-checkout" }, targets.get("workstation")));
+    expect(text).toContain("host_blocked=workstation blocking=1");
     expect(text).toContain("blocking=not_enrolled");
     expect(text).toContain("remediation=");
   });
@@ -222,17 +222,17 @@ describe("#484 every blocker at once, each with its remediation", () => {
 
 describe("#484 an advisory is not a refusal", () => {
   // A real read-only fleet preflight caught this reporting layer inventing a
-  // refusal: macbook-air was managed, rollout_ready=yes and serving, and got
+  // refusal: laptop-a was managed, rollout_ready=yes and serving, and got
   // reported as refused purely because its recorded rollback baseline had
   // drifted. Severity is now read off the gates that already exist.
   it("does not call a managed, rollout-ready host refused over a stale baseline", () => {
     const blockers = collectBlockers(
-      { ...CLEAN, artifact_mode: "managed", rollout_ready: "yes", enrolled: "drifted", node_path: "/Users/jessebulpitt/.nvm/versions/node/v22.22.2/bin/node" },
-      targets.get("macbook-air")
+      { ...CLEAN, artifact_mode: "managed", rollout_ready: "yes", enrolled: "drifted", node_path: "/Users/operator/.nvm/versions/node/v22.22.2/bin/node" },
+      targets.get("laptop-a")
     );
     expect(blockers.map((b) => b.code)).toContain("enrolled_baseline_drift");
     expect(blockingOnly(blockers)).toEqual([]);
-    expect(formatBlockers("macbook-air", blockers)).toContain("host_clear=macbook-air advisory=1");
+    expect(formatBlockers("laptop-a", blockers)).toContain("host_clear=laptop-a advisory=1");
   });
 
   it("does not block a MANAGED host merely for being unenrolled", () => {
@@ -241,7 +241,7 @@ describe("#484 an advisory is not a refusal", () => {
     // saying and is not a refusal. Mutation caught this untested.
     const blockers = collectBlockers(
       { ...CLEAN, artifact_mode: "managed", rollout_ready: "yes", enrolled: "no" },
-      targets.get("media-server")
+      targets.get("workstation")
     );
     const row = blockers.find((b) => b.code === "not_enrolled");
     expect(row?.severity).toBe("advisory");
@@ -251,7 +251,7 @@ describe("#484 an advisory is not a refusal", () => {
   it("still calls a legacy host with no baseline blocked — there is no rollback target", () => {
     const blockers = collectBlockers(
       { ...CLEAN, artifact_mode: "legacy-checkout", enrolled: "no" },
-      targets.get("macbook-air")
+      targets.get("laptop-a")
     );
     expect(blockingOnly(blockers).map((b) => b.code)).toContain("not_enrolled");
   });
@@ -262,7 +262,7 @@ describe("#484 an advisory is not a refusal", () => {
     // refusal the tool would not actually make.
     const blockers = collectBlockers(
       { ...CLEAN, artifact_mode: "legacy-checkout", enrolled: "yes", rollout_ready: "no", protocol_version: "1", drain_SIGUSR2: "yes" },
-      targets.get("macbook-air")
+      targets.get("laptop-a")
     );
     const ready = blockers.find((b) => b.code === "not_rollout_ready");
     expect(ready?.severity).toBe("advisory");
@@ -271,44 +271,44 @@ describe("#484 an advisory is not a refusal", () => {
   it("keeps not-rollout-ready blocking when no baseline route exists", () => {
     const blockers = collectBlockers(
       { ...CLEAN, artifact_mode: "managed", rollout_ready: "no", protocol_version: "0", drain_SIGUSR2: "no" },
-      targets.get("macbook-air")
+      targets.get("laptop-a")
     );
     expect(blockingOnly(blockers).map((b) => b.code)).toContain("not_rollout_ready");
   });
 
   it("keeps a missing prebuild blocking — the gate that stopped a half-done Mac rollout", () => {
-    const blockers = collectBlockers({ ...CLEAN, native_install_ready: "no" }, targets.get("macbook-air"), targets);
+    const blockers = collectBlockers({ ...CLEAN, native_install_ready: "no" }, targets.get("laptop-a"), targets);
     expect(blockingOnly(blockers).map((b) => b.code)).toContain("native_prebuild_unavailable");
   });
 });
 
 describe("#484 item 6: the nodePath diagnosis nobody assembled", () => {
-  // macbook-air was pinned to an absolute v24.15.0 path while the fleet moved
+  // laptop-a was pinned to an absolute v24.15.0 path while the fleet moved
   // to v22.22.2, and it surfaced as an opaque native-prebuild refusal (#412).
   // Every fact was in the report; nothing put them together.
   const drifted = new Map([
-    ["macbook-air", { bridgeId: "macbook-air", nodePath: "/Users/j/.nvm/versions/node/v24.15.0/bin/node" }],
-    ["rhc-server", { bridgeId: "rhc-server", nodePath: "/home/ubuntu/.nvm/versions/node/v22.22.2/bin/node" }],
-    ["media-server", { bridgeId: "media-server", nodePath: "/Users/jesse/.nvm/versions/node/v22.22.2/bin/node" }],
+    ["laptop-a", { bridgeId: "laptop-a", nodePath: "/Users/j/.nvm/versions/node/v24.15.0/bin/node" }],
+    ["arm-bridge", { bridgeId: "arm-bridge", nodePath: "/home/operator/.nvm/versions/node/v22.22.2/bin/node" }],
+    ["workstation", { bridgeId: "workstation", nodePath: "/Users/operator/.nvm/versions/node/v22.22.2/bin/node" }],
   ]);
 
   it("says which node is pinned, which ABI is missing, and what the fleet uses", () => {
     const [blocker] = collectBlockers(
       { ...CLEAN, native_install_ready: "no", node_version: "v24.15.0", native_prebuild: "better-sqlite3@11.10.0-node-v137-darwin-arm64" },
-      drifted.get("macbook-air"),
+      drifted.get("laptop-a"),
       drifted
     );
     expect(blocker!.code).toBe("native_prebuild_unavailable");
     expect(blocker!.detail).toContain("v137");          // the ABI actually missing
     expect(blocker!.detail).toContain("v24.15.0");      // what this host pins
     expect(blocker!.detail).toContain("v22.22.2");      // what the fleet runs
-    expect(blocker!.remediation).toContain("targets.json");
+    expect(blocker!.remediation).toContain("target map");
   });
 
   it("does not invent drift when the host already matches the fleet", () => {
     const [blocker] = collectBlockers(
       { ...CLEAN, native_install_ready: "no", node_version: "v22.22.2" },
-      drifted.get("rhc-server"),
+      drifted.get("arm-bridge"),
       drifted
     );
     expect(blocker!.detail).not.toContain("fleet standard");
@@ -318,7 +318,7 @@ describe("#484 item 6: the nodePath diagnosis nobody assembled", () => {
   it("reports declared-vs-observed drift separately, since both can be true", () => {
     const codes = collectBlockers(
       { ...CLEAN, node_path: "/somewhere/else/bin/node" },
-      targets.get("media-server")
+      targets.get("workstation")
     ).map((b) => b.code);
     expect(codes).toContain("node_path_drift");
   });

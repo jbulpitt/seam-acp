@@ -212,7 +212,7 @@ dependent and the base cannot be restored to reopen it. That cost a detour today
 
 ## Gates before merge
 
-- Full suite, not a targeted subset, whenever `ops/bridge/targets.json`, the fleet tests,
+- Full suite, not a targeted subset, whenever `the deployment's bridge target map`, the fleet tests,
   or anything under `docs/` guarded by the allowlist is touched. Skipping this broke main
   once already.
 - For anything touching the bridge or the transport: **verify on a real host**. Loopback

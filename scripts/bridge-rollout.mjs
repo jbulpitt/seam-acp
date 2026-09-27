@@ -3,6 +3,7 @@ import { randomBytes } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { activationRefusal, buildArtifact, firstActivationFromBaselineAllowed, commandRunner, loadTargetMap, makeScpCommand, makeSshCommand, parseArgs, parseKeyValues, renderRemoteScript, resolveTarget, runActivation, runPreflight } from "./lib/bridge-rollout.mjs";
+import { resolveBridgeTargetsFile } from "./lib/bridge-targets.mjs";
 import { assertTargetRegistered, blockingOnly, collectBlockers, describeTargetFleet, fleetRunExitCode, formatBlockers, formatFleetCoverage, formatFleetRunSummary, loadBridgeRegistry, makeReachabilityProbe, partitionReachability, planFleetRun } from "./lib/bridge-fleet.mjs";
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
@@ -133,9 +134,8 @@ async function runFleet({ targets, fleet, options, remoteScript }) {
   const plan = planFleetRun(fleet);
   const results = [];
 
-  // Reachability first. Six of ten hosts were unreachable on 2026-09-21; for a
-  // fleet of laptops that is ordinary, so it is a counted skip and not an
-  // error. Probes are read-only, so they run together.
+  // Reachability first. Several hosts may be unreachable; for a mixed fleet
+  // that can be ordinary, so it is a counted skip and not an error. Probes are read-only, so they run together.
   const probes = await Promise.all(plan.attempt.map(async (id) => {
     const target = targets.get(id);
     try {
@@ -172,8 +172,8 @@ async function runFleet({ targets, fleet, options, remoteScript }) {
       if (options.action === "preflight") {
         // Only a BLOCKING finding means this host would be turned away. An
         // advisory is reported and counted, but calling it a refusal would
-        // invent one — a real fleet preflight flagged a managed, rollout-ready
-        // host as refused purely over a stale rollback baseline.
+        // invent one — a fleet preflight flagged a managed, rollout-ready host as
+        // refused purely over a stale rollback baseline.
         const blocking = blockingOnly(blockers);
         results.push({
           id,
@@ -200,7 +200,8 @@ async function runFleet({ targets, fleet, options, remoteScript }) {
 async function main() {
   const options = parseArgs(process.argv.slice(2));
   if (options.help) return usage();
-  const targets = await loadTargetMap(path.join(repoRoot, "ops/bridge/targets.json"));
+  const targetsFile = resolveBridgeTargetsFile(repoRoot);
+  const targets = await loadTargetMap(targetsFile);
   const configuredRegistry = process.env.CHANNEL_PRESETS_FILE ??
     path.join(process.env.DATA_DIR ?? "data", "channel-presets.json");
   const registryFile = path.resolve(repoRoot, configuredRegistry);

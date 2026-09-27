@@ -11,76 +11,42 @@ target, and one phase. There is no host loop, implicit rollback, PM2 restart or
 reload fallback, environment dump, provider authentication, or provider catalog
 parsing.
 
-## Fixed deployment identities
+## Target inventory
 
-[`ops/bridge/targets.json`](../ops/bridge/targets.json) is the rollout inventory.
-It names every bridge registered in `data/channel-presets.json`, including hosts
-that are deliberately excluded from this PM2 rollout. Before constructing any
-SSH command, the controller compares those two key sets and refuses a fleet
-claim if either has an unrecorded host. This guard refuses only the rollout
-operation; connected bridges, adapters, dispatches, and other hosts keep
-serving. Set `CHANNEL_PRESETS_FILE` when the live registry is not at
-`data/channel-presets.json` relative to the checkout.
+The rollout inventory is deployment-owned. By default the tool reads
+`docs/local/bridge-targets.json`; set `SEAM_BRIDGE_TARGETS_FILE` to an
+absolute path or a path relative to the checkout when the map lives elsewhere.
+For compatibility, an existing `ops/bridge/targets.json` is used only when
+the private default is absent. Start a new map from
+[`ops/bridge/targets.example.json`](../ops/bridge/targets.example.json).
+Tracked documentation names no deployment-specific target file.
 
-Every preflight prints the denominator: ten registered hosts, seven managed by
-this rollout, and three excluded with a reason, plus the one selected host. A
-successful selected-host preflight is therefore never presented as verification
-of an unnamed whole fleet.
+The map names every bridge registered in `data/channel-presets.json`,
+including deliberately excluded hosts. Before constructing an SSH command, the
+controller compares the two key sets and reports any divergence without
+stopping unrelated hosts. Set `CHANNEL_PRESETS_FILE` when the live registry
+is elsewhere.
 
-For each enabled bridge the target map pins the bridge ID, SSH alias, supervisor
-name (`pm2App`: the PM2 app or the systemd unit), verification agent, UID,
-checkout/cwd, stable entrypoint, Node executable, optional workspace argument,
-and rollout root. PM2 hosts also pin the PM2 module. systemd hosts pin
-`launcher=systemd` and the `seam-bridge-launch.mjs` path instead. None is
-overridable on the command line.
+For each enabled bridge the map pins the bridge ID, SSH alias, supervisor name,
+verification agent, UID, checkout, stable entrypoint, Node executable, optional
+workspace argument, and rollout root. PM2 targets also pin the PM2 module;
+systemd targets pin `launcher=systemd` and their launcher path. None is
+overridable on the command line. Excluded hosts remain in the fleet denominator
+and every attempted phase refuses with the recorded reason.
 
-- `media-server` maps to SSH `media-server`, PM2 `remote-agent-bridge`, UID 501,
-  checkout `/Users/jesse/seam-acp`, and rollout root
-  `/Users/jesse/.seam/bridge-rollouts`.
-- `macbook-air` maps to SSH `macbook-air`, PM2 `seam-bridge`, UID 501, checkout
-  `/Users/jessebulpitt/.seam/seam-acp`, and rollout root
-  `/Users/jessebulpitt/.seam/bridge-rollouts`.
-- `macbook-pro` and `home-hub` are enabled PM2 targets alongside the two above.
-- `allie-laptop`, `alaina-laptop`, and `jennifer-laptop` keep their SSH aliases
-  and stay disabled, with no rollout identity. The recorded reason is per host:
-  the first two run pm2 as a user the SSH login cannot write as, and
-  `jennifer-laptop` must not be updated until its agy runtime is root-owned
-  (#388).
-- `plex-server` and `fhr-server` are enabled systemd targets. They run
-  `~/.local/libexec/seam-bridge-launch.mjs`, which `import()`s the stable
-  checkout entrypoint; activation swaps that path for a stub into
-  `~/.seam/bridge-rollouts/releases/<sha>-<checksum>/` and signals `MainPID`
-  with `SIGUSR2`. The units already use `KillSignal=SIGUSR2` and
-  `Restart=always`, so the process restarts without sudo and without converting
-  the unit to a user session.
-- `rhc-server` is an enabled Linux aarch64 PM2 target with a verified rollout
-  identity alongside the macOS PM2 targets.
-
-An excluded host remains in the fleet denominator and every attempted phase
-refuses with its recorded reason. Absence is not used to mean exclusion.
-
-Before any mutation, the remote program proves the live process identity. On
-PM2 hosts that is one PM2 record whose PID equals the owned PID file, with
-entrypoint/interpreter/argv matching the target map. On systemd hosts that is
-`systemctl show` of `MainPID` for the pinned unit, the process owned by the
-configured UID running the exact Node executable at the checkout cwd, and
-`/proc/<pid>/cmdline` naming the pinned launcher — not `systemctl restart`.
-All configured paths and owners are canonical. Secret argument values are
-compared in memory and never printed. Ambiguity, symlink escape, wrong owner,
-unexpected flags, or any mismatch refuses the phase.
-
-An SSH alias is not identity evidence by itself. The preflight response must
-report the same bridge ID as the selected inventory key; a response such as
-`bridge_id=home-hub` for target `macbook-pro` refuses before build, upload,
-staging, signaling, or activation.
+Before mutation, the remote program proves the live process identity. Secret
+argument values are compared in memory and never printed. Ambiguity, symlink
+escape, wrong owner, unexpected flags, bridge-id disagreement, or any other
+identity mismatch refuses before build, upload, staging, signaling, or
+activation. Deployment-specific target names, paths, and exceptions belong in
+`docs/local/`.
 
 ## State machine
 
 ### 1. PREFLIGHT (read-only)
 
 ```bash
-npm run bridge:rollout -- --target media-server
-npm run bridge:rollout -- --target macbook-air
+npm run bridge:rollout -- --target <bridge-id>
 ```
 
 This performs only the identity proof above and reports `remote_mutation=no`.
@@ -96,8 +62,8 @@ an old bridge inspectable while ACTIVATE and ROLLBACK refuse unless readiness is
 Legacy checkout identity is read directly from Git metadata without invoking
 remote Git; a
 managed release is fully revalidated before its receipt is reported. Run the
-preflight separately for each host. The canary remains `media-server`; observe
-and obtain separate authorization before doing anything to `macbook-air`.
+preflight separately for each host. Choose and document a canary in
+`docs/local/`; obtain separate authorization before operating on another host.
 
 PREFLIGHT also reports the inventory-bound `verification_agent` and the PM2
 `process_started_at` time (or `unknown` if PM2 does not expose one). Before
@@ -124,7 +90,7 @@ not pruned for Grok-only hosts.
 ### 1a. ENROLL (legacy → managed baseline)
 
 ```bash
-npm run bridge:rollout -- --target media-server --enroll --apply
+npm run bridge:rollout -- --target <bridge-id> --enroll --apply
 ```
 
 Every remote bridge is an unmanaged legacy checkout, and ACTIVATE refuses from
@@ -246,7 +212,7 @@ restore to.
 ### 1a-bis. REBASELINE (managed host, drifted or updated)
 
 ```bash
-npm run bridge:rollout -- --target macbook-air --rebaseline --apply
+npm run bridge:rollout -- --target <bridge-id> --rebaseline --apply
 ```
 
 `--enroll` refuses once the live entrypoint is a release stub
@@ -380,7 +346,7 @@ reached a terminal event, so a host must not be activated mid-turn.
 ### 2. PREPARE + UPLOAD + STAGE
 
 ```bash
-npm run bridge:rollout -- --target media-server --stage --apply
+npm run bridge:rollout -- --target <bridge-id> --stage --apply
 ```
 
 The local side refuses a dirty worktree, resolves `git rev-parse HEAD`, builds
@@ -436,7 +402,7 @@ stage ID. Do not substitute a branch, tag, or different stage ID.
 Use the exact command printed by STAGE. Shape:
 
 ```bash
-npm run bridge:rollout -- --target media-server --activate \
+npm run bridge:rollout -- --target <bridge-id> --activate \
   --sha 0123456789abcdef0123456789abcdef01234567 \
   --checksum 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
   --stage-id 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
@@ -514,7 +480,7 @@ verified is refused, while the host and its other adapters keep serving (#329).
 An operator who intentionally removes native agy must set `AGY_ENABLED=false`;
 that explicit state produces `adapter_refusals=none`. An absent enable flag while
 an `agy` executable is still installed is not treated as intent, because that
-was the exact macbook-pro/home-hub upgrade state that silently removed agy.
+has previously removed agy from a deployment during an upgrade.
 
 After a managed activation, PREFLIGHT may report `enrolled=drifted` because the
 live entrypoint deliberately moved away from the enrolled legacy baseline. That
@@ -527,7 +493,7 @@ baseline as that transition's rollback target.
 Use only the exact activation ID printed by the failed canary activation:
 
 ```bash
-npm run bridge:rollout -- --target media-server --rollback \
+npm run bridge:rollout -- --target <bridge-id> --rollback \
   --activation-id 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
   --apply
 ```

@@ -10088,6 +10088,12 @@ export class Orchestrator {
             }, queueFence);
           })()
         : undefined;
+      if (attempt && statusPanel?.reference) {
+        this.store.turnAttempts.bindStatusCard(attempt, {
+          channelId: statusPanel.reference.channel.id,
+          messageId: statusPanel.reference.id,
+        });
+      }
 
       // START INDICATOR: post the slim ▶ indicator that then streams the answer.
       // When the STATUS PANEL is on it carries the dispatch type, so we suppress
@@ -15800,15 +15806,40 @@ export class Orchestrator {
     return recoveryStory(facts);
   }
 
+  private async adoptRemoteRecovery(attempt: TurnAttempt): Promise<boolean> {
+    if (!attempt.remoteRecovery) return false;
+    if (this.adoptingRemoteResults.has(attempt.id)) return true;
+    if (!this.bridgeHub?.muxFor(attempt.remoteRecovery.location)) {
+      return this.adoptRemoteRecoveryOwned(attempt);
+    }
+
+    this.adoptingRemoteResults.add(attempt.id);
+    const run = () => this.adoptRemoteRecoveryOwned(attempt);
+    if (attempt.spec.session === "live") {
+      void this.queueOnChannel(attempt.spec.target, async () => {
+        await run();
+      }).catch((err) => {
+        this.logger.warn({ err, attempt: attempt.id }, "remote recovery queue ownership failed");
+      }).finally(() => {
+        this.adoptingRemoteResults.delete(attempt.id);
+      });
+      return true;
+    }
+    try {
+      return await run();
+    } finally {
+      this.adoptingRemoteResults.delete(attempt.id);
+    }
+  }
+
   /**
    * Re-bind one suspended attempt to the bridge slot it already owns (#467).
    *
-   * This path is read-only with respect to the provider: it never writes
-   * stdin and never constructs a prompt. The attempt ledger proves ownership;
-   * `listSlots` proves the same bridge still owns that exact submission. A
-   * mismatch retains this one attempt and never falls back to local retry.
+   * The attempt ledger proves ownership; `listSlots` proves the same bridge
+   * still owns that exact submission. A mismatch retains this one attempt and
+   * never falls back to local retry.
    */
-  private async adoptRemoteRecovery(attempt: TurnAttempt): Promise<boolean> {
+  private async adoptRemoteRecoveryOwned(attempt: TurnAttempt): Promise<boolean> {
     const binding = attempt.remoteRecovery;
     if (!binding) return false;
     const mux = this.bridgeHub?.muxFor(binding.location);
@@ -15847,15 +15878,38 @@ export class Orchestrator {
     }
 
     let child;
+    let recoveryRuntime: AgentRuntime | undefined;
+    let recoveryRecord: SessionRecord | undefined;
     try {
-      child = mux.adopt(binding.slot);
+      child = mux.adopt(binding.slot, {
+        allowAppTraffic: attempt.spec.session === "live",
+      });
+      if (attempt.spec.session === "live") {
+        recoveryRecord = this.store.getByChannel(PLATFORM, attempt.spec.target) ?? undefined;
+        if (!recoveryRecord) throw new Error("the recovered thread session no longer exists");
+        recoveryRuntime = this.router.adoptRecoveryRuntime(
+          recoveryRecord,
+          child,
+          binding.acpSessionId,
+        );
+      }
     } catch (err) {
       this.continueLostRemoteTurn(attempt, `the slot could not be re-bound (${err instanceof Error ? err.message : String(err)})`);
       return true;
     }
     this.remoteAdoptionWaiters.get(attempt.id)?.();
     this.remoteAdoptionWaiters.delete(attempt.id);
-    this.adoptingRemoteResults.add(attempt.id);
+    let settle!: () => void;
+    let settled = false;
+    const completion = new Promise<void>((resolve) => { settle = resolve; });
+    const finishAdoption = (): void => {
+      if (settled) return;
+      settled = true;
+      if (recoveryRuntime && recoveryRecord) {
+        this.router.releaseRecoveryRuntime(recoveryRecord.id, recoveryRuntime);
+      }
+      settle();
+    };
 
     const finalize = async (result: RemoteRecoveryResult): Promise<void> => {
       if (result.submissionId !== binding.submissionId
@@ -15935,26 +15989,29 @@ export class Orchestrator {
       try { child.kill(); } catch { /* result is already durable */ }
     };
     child.on("remoteRecoveryResult", (result: RemoteRecoveryResult) => {
+      if (result.submissionId !== binding.submissionId
+        || result.acpSessionId !== binding.acpSessionId) return;
       void finalize(result).catch((err) =>
         this.logger.warn({ err, attempt: attempt.id }, "remote recovery result adoption failed"))
-        .finally(() => this.adoptingRemoteResults.delete(attempt.id));
+        .finally(finishAdoption);
     });
     child.on("error", (err) => {
-      this.adoptingRemoteResults.delete(attempt.id);
       this.continueLostRemoteTurn(attempt, `replay from the bridge failed (${err instanceof Error ? err.message : String(err)})`);
+      finishAdoption();
     });
     child.on("exit", () => {
       // An exit with no result frame: the owner died with the turn unfinished.
       setImmediate(() => {
         if (this.store.turnAttempts.get(attempt.id)?.remoteRecovery) {
-          this.adoptingRemoteResults.delete(attempt.id);
           this.continueLostRemoteTurn(attempt, "the slot exited without a result");
         }
+        finishAdoption();
       });
     });
     this.logger.info({ attempt: attempt.id, location: binding.location, slot: binding.slot,
       phase: snapshot.recovery.phase, retry: snapshot.recovery.retry },
     "rebound controller to bridge-owned rung-1 recovery");
+    await completion;
     return true;
   }
 

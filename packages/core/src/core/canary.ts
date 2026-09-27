@@ -71,7 +71,7 @@ interface CanaryThreadFile {
 
 interface CanaryRunnerOptions {
   testerBot: Pick<TesterBot, "post" | "read" | "findThread">;
-  testDriver: Pick<TestDriverClient, "interact" | "inventory" | "health" | "restart">;
+  testDriver: Pick<TestDriverClient, "interact" | "inventory" | "health" | "restart" | "dispatch">;
   dataDir: string;
   stagingChannelId: string;
   timeoutMs?: number;
@@ -126,8 +126,9 @@ interface SelfCanaryRunnerOptions {
   providerStatus?: (agentId: string) => string | undefined;
 }
 
-const DURABILITY_CHECKS: ReadonlyArray<{ label: string; action: TestRestartAction }> = [
+const DURABILITY_CHECKS: ReadonlyArray<{ label: string; action: TestRestartAction; dispatch?: true }> = [
   { label: "redeploy", action: "controller" },
+  { label: "dispatched redeploy", action: "controller", dispatch: true },
   { label: "bridge restart", action: "bridge" },
   { label: "controller + bridge", action: "controller_bridge" },
   { label: "sessiond restart", action: "sessiond" },
@@ -191,16 +192,16 @@ export function observeCanaryMessages(
   const nonceSeen = botMessages.some((message) => message.content.includes(nonce));
   const toolSeen = /\bTool\s*:\s*\S/i.test(statusText)
     || TOOL_ACTIVITY_EMOJIS.some((emoji) => statusText.includes(`\`${emoji}`));
-  if (statusHeads.some((head) => /^(?:❌\s*)?Failed\b/i.test(head))) {
+  if (statusHeads.some((head) => /^(?:.*?·\s*)?(?:❌\s*)?Failed\b/i.test(head))) {
     return { state: "failed", nonceSeen, toolSeen, cause: failureCause(botMessages) };
   }
-  if (statusHeads.some((head) => /^(?:⏱️\s*)?(?:Timed out|Timeout)\b/i.test(head))) {
+  if (statusHeads.some((head) => /^(?:.*?·\s*)?(?:⏱️\s*)?(?:Timed out|Timeout)\b/i.test(head))) {
     return { state: "timed_out", nonceSeen, toolSeen, cause: failureCause(botMessages) };
   }
-  if (statusHeads.some((head) => /^(?:✅\s*)?Done\b/i.test(head))) {
+  if (statusHeads.some((head) => /^(?:.*?·\s*)?(?:✅\s*)?Done\b/i.test(head))) {
     return { state: "done", nonceSeen, toolSeen };
   }
-  if (statusHeads.some((head) => /^(?:Working|Waiting|Reconnecting|Monitoring)\b/i.test(head))) {
+  if (statusHeads.some((head) => /^(?:.*?·\s*)?(?:Working|Waiting|Reconnecting|Monitoring)\b/i.test(head))) {
     return { state: "working", nonceSeen, toolSeen };
   }
   return { state: "unknown", nonceSeen, toolSeen };
@@ -543,7 +544,7 @@ export class StagingCanaryRunner {
     host: string,
     agent: string,
     threadId: string,
-    check: { label: string; action: TestRestartAction },
+    check: { label: string; action: TestRestartAction; dispatch?: true },
   ): Promise<CanaryRow> {
     const nonce = this.makeNonce();
     const expected = [1, 2, 3, 4, 5, 6].map((index) => `${nonce}-${index}`);
@@ -564,13 +565,32 @@ export class StagingCanaryRunner {
 
     try {
       const before = await this.options.testDriver.inventory();
-      const posted = await this.options.testerBot.post({
-        channel: threadId,
-        text:
-          "Run the shell command " +
-          `\`for i in 1 2 3 4 5 6; do echo ${nonce}-$i; sleep 5; done\` ` +
-          "and reply with only the complete six-line output, in order.",
-      });
+      let posted: { messageId: string };
+      if (check.dispatch) {
+        const latest = await this.options.testerBot.read({ channel: threadId, limit: 1 });
+        const anchor = latest.at(-1)?.id;
+        if (!anchor) throw new Error("could not anchor the dispatched canary turn");
+        const id = `canary-dispatch-${randomUUID()}`;
+        await this.options.testDriver.dispatch({
+          id,
+          channelId: threadId,
+          prompt:
+            "Run these two shell commands in order as two separate tool calls. First run " +
+            `\`for i in 1 2 3; do echo ${nonce}-$i; sleep 5; done\`. ` +
+            "After it finishes, run " +
+            `\`for i in 4 5 6; do echo ${nonce}-$i; sleep 5; done\`. ` +
+            "Reply with only the complete six-line output, in order.",
+        });
+        posted = { messageId: anchor };
+      } else {
+        posted = await this.options.testerBot.post({
+          channel: threadId,
+          text:
+            "Run the shell command " +
+            `\`for i in 1 2 3 4 5 6; do echo ${nonce}-$i; sleep 5; done\` ` +
+            "and reply with only the complete six-line output, in order.",
+        });
+      }
       const startedTurn = await this.waitForRestartPoint(threadId, posted.messageId, nonce);
       if (startedTurn.status === "failed") return fail(startedTurn.cause);
       await this.options.testDriver.restart(check.action);
@@ -631,7 +651,7 @@ export class StagingCanaryRunner {
   private async waitForRecovery(
     before: TestInventory,
     host: string,
-    check: { label: string; action: TestRestartAction },
+    check: { label: string; action: TestRestartAction; dispatch?: true },
   ): Promise<{ status: "ready" } | { status: "failed"; cause: string }> {
     const deadline = this.now() + this.timeoutMs;
     const oldBridge = before.bridges.find((bridge) => bridge.host === host)?.instanceId;

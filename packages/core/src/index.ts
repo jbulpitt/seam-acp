@@ -1,5 +1,6 @@
 import path from "node:path";
 import {
+  makeTestDispatchHandler,
   makeTestInteractionHandler,
   makeTestInventoryHandler,
   makeTestRestartHandler,
@@ -193,6 +194,9 @@ async function main(): Promise<void> {
   let testRestartHandle:
     | ((req: IncomingMessage, res: ServerResponse) => void | Promise<void>)
     | undefined;
+  let testDispatchHandle:
+    | ((req: IncomingMessage, res: ServerResponse) => void | Promise<void>)
+    | undefined;
   const health = startHealthServer(config.HEALTH_PORT, logger, {
     onMcp: (req, res) => {
       if (!mcpHttpHandle) {
@@ -219,6 +223,14 @@ async function main(): Promise<void> {
               return;
             }
             return testRestartHandle(req, res);
+          },
+          onTestDispatch: (req: IncomingMessage, res: ServerResponse) => {
+            if (!testDispatchHandle) {
+              res.writeHead(503, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ error: "test dispatch driver not ready" }));
+              return;
+            }
+            return testDispatchHandle(req, res);
           },
         }
       : {}),
@@ -816,6 +828,21 @@ async function main(): Promise<void> {
     });
     logger.warn({ actorId: config.SEAM_TEST_DRIVER_ACTOR_ID }, "test interaction driver enabled");
     logger.warn("test durability restart driver enabled");
+    testDispatchHandle = makeTestDispatchHandler({
+      key: config.SEAM_TEST_DRIVER_KEY,
+      logger,
+      enqueue: ({ id, channelId, prompt }) => enqueueDispatchSpec(config.DATA_DIR, {
+        id,
+        target: channelId,
+        prompt,
+        originPrompt: prompt,
+        session: "live",
+        kind: "wake",
+        correlationId: id,
+        createdUtc: new Date().toISOString(),
+      }, store.turnAttempts),
+    });
+    logger.warn("test dispatch driver enabled");
   }
   if (config.SEAM_TEST_DRIVER_KEY) {
     testInventoryHandle = makeTestInventoryHandler({

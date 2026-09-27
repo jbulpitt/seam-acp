@@ -868,14 +868,15 @@ export function makeMux(opts: {
 
   /**
    * Re-bind a fresh controller to a slot proven by its durable attempt ledger
-   * and the bridge snapshot (#467). No spawn frame and no stdin are sent.
+   * and the bridge snapshot (#467). No spawn frame is sent. Recovered live
+   * turns can reattach their application-side ACP transport.
    * Existing local ownership is never replaced.
    */
-  function adopt(slot: number): MuxChild {
+  function adopt(slot: number, options: { allowAppTraffic?: boolean } = {}): MuxChild {
     if (!Number.isSafeInteger(slot) || slot < 0) throw new Error("adopt requires a non-negative slot");
     if (slots.has(slot)) throw new Error(`slot ${slot} is already bound in this controller`);
     nextSlot = Math.max(nextSlot, slot + 1);
-    const child = bindSlot(slot, undefined, false, false);
+    const child = bindSlot(slot, undefined, false, options.allowAppTraffic === true);
     // Replay begins after this function returns, so the caller can attach its
     // result listener first. A missing/old bridge refuses this adoption only.
     queueMicrotask(() => {

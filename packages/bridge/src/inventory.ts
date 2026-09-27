@@ -107,16 +107,6 @@ export function resolveCopilotHostLaunch(
       : ["--acp"]),
   ];
   const env: NodeJS.ProcessEnv = { ...baseEnv };
-  if (!env.GH_TOKEN) {
-    try {
-      env.GH_TOKEN = execFileSync("gh", ["auth", "token"], {
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "ignore"],
-      }).trim();
-    } catch {
-      // The ACP probe will report auth failure without exposing credentials.
-    }
-  }
   return { cliPath, args, cwd, env };
 }
 

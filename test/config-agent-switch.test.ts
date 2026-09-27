@@ -58,6 +58,7 @@ function slashI(over: {
 }) {
   const replies: Array<{ content?: string; flags?: number }> = [];
   const edits: string[] = [];
+  let deferredFlags: number | undefined;
   const i = {
     options: {
       getString: (name: string, _req?: boolean) => over.strings?.[name] ?? null,
@@ -74,11 +75,14 @@ function slashI(over: {
       i.replied = true;
       replies.push(payload);
     }),
-    deferReply: vi.fn(async () => {
+    deferReply: vi.fn(async (payload?: { flags?: number }) => {
       i.deferred = true;
+      deferredFlags = payload?.flags;
     }),
-    editReply: vi.fn(async (content: string) => {
+    editReply: vi.fn(async (payload: string | { content?: string }) => {
+      const content = typeof payload === "string" ? payload : payload.content ?? "";
       edits.push(content);
+      replies.push({ content, flags: deferredFlags });
     }),
   };
   return { i, replies, edits };
@@ -232,6 +236,25 @@ describe("/seam config agent — #178 session/overlay split-brain", () => {
     expect(described.model.value).toBe("gpt-5.6-sol");
     expect(spawn.agentId).toBe("codex");
     expect(spawn.model).toBe("gpt-5.6-sol");
+  });
+
+  it("acknowledges an explicit switch before invalidating the old runtime", async () => {
+    const { orch, router, store } = makeOrch();
+    seedSession(store);
+    const { i, edits } = slashI({ strings: { id: "codex@local" } });
+    const invalidate = router.invalidate.bind(router);
+    router.invalidate = vi.fn(async (...args: Parameters<typeof invalidate>) => {
+      expect(i.deferred).toBe(true);
+      return invalidate(...args);
+    }) as typeof router.invalidate;
+
+    await (orch as any).cmdAgent(i);
+
+    expect(i.deferReply).toHaveBeenCalledOnce();
+    expect(i.deferReply).toHaveBeenCalledWith({ flags: MessageFlags.Ephemeral });
+    expect(i.editReply).toHaveBeenCalledOnce();
+    expect(edits[0]).toMatch(/Agent switched to `codex@local`/);
+    expect(i.reply).not.toHaveBeenCalled();
   });
 
   it("opening /seam config model immediately afterward shows the new default as current", async () => {

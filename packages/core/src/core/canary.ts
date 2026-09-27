@@ -5,6 +5,7 @@ import path from "node:path";
 import type { Logger } from "../lib/logger.js";
 import type { ChatAdapter, MessageRef } from "../platforms/chat-adapter.js";
 import type { StructuredLayout } from "./types.js";
+import { TOOL_ACTIVITY_EMOJIS } from "../platforms/discord/renderer.js";
 import type {
   TestDriverClient,
   TestInventory,
@@ -88,6 +89,7 @@ const THREAD_FILE = "canary-staging-threads.json";
 const HISTORY_FILE = "canary-staging-history.jsonl";
 const LATEST_CARD_FILE = "canary-staging-latest-card.json";
 const DURABILITY_AGENT = "codex";
+
 
 export interface SelfCanaryInventory {
   bridges: Array<{
@@ -188,8 +190,7 @@ export function observeCanaryMessages(
   );
   const nonceSeen = botMessages.some((message) => message.content.includes(nonce));
   const toolSeen = /\bTool\s*:\s*\S/i.test(statusText)
-    || statusText.includes("`▶️")
-    || statusText.includes("`⚙️");
+    || TOOL_ACTIVITY_EMOJIS.some((emoji) => statusText.includes(`\`${emoji}`));
   if (statusHeads.some((head) => /^(?:❌\s*)?Failed\b/i.test(head))) {
     return { state: "failed", nonceSeen, toolSeen, cause: failureCause(botMessages) };
   }

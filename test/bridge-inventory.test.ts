@@ -89,6 +89,30 @@ describe("loadHostAdapters", () => {
     expect(adapters.has("agy")).toBe(false);
   });
 
+  it("does not replace Copilot's stored sign-in with an ambient gh token", () => {
+    const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "seam-fake-gh-"));
+    const gh = path.join(temporary, "gh");
+    const priorPath = process.env.PATH;
+    fs.writeFileSync(gh, "#!/bin/sh\nprintf 'ambient-gh-token\\n'\n", { mode: 0o755 });
+    try {
+      process.env.PATH = temporary;
+      const configuredEnv = {
+        HOME: "/copilot-profile",
+        PATH: "/configured/runtime/bin",
+      };
+      const launch = resolveCopilotHostLaunch(
+        "/configured/bin/copilot",
+        "/remote/workspace",
+        configuredEnv,
+      );
+      expect(launch.env).toEqual(configuredEnv);
+      expect(launch.env.GH_TOKEN).toBeUndefined();
+    } finally {
+      process.env.PATH = priorPath;
+      fs.rmSync(temporary, { recursive: true, force: true });
+    }
+  });
+
   it("binds remote catalog fetches to the configured Copilot launch tuple", async () => {
     const priorArgs = process.env.COPILOT_ARGS;
     const priorToken = process.env.GH_TOKEN;

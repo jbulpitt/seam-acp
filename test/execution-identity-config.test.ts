@@ -69,6 +69,12 @@ describe("execution identity treats an unchanged configuration as unchanged", ()
     expect(after).toBe(before);
   });
 
+  it("does not drift when only the cwd provenance flag is set", () => {
+    const before = identityWith(RAW_CONFIG_JSON);
+    const after = identityWith(JSON.stringify({ ...LIVE_CONFIG, sessionCwdExplicit: true }, null, 2));
+    expect(after).toBe(before);
+  });
+
   it("ignores key order, which is not a configuration change", () => {
     const reordered = { role: "worker", reasoningEffort: "xhigh", permissionPolicy: "always", model: "gpt-5.6-sol" };
     const { lastContextUsage: _usage, ...parsed } = LIVE_CONFIG;

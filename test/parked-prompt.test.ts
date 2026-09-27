@@ -116,6 +116,7 @@ function makeOrch(opts?: {
     isBridgeReady: (id: string) => ready && id === "mac",
     onBridgeReady: () => () => {},
     markSessionBridge: () => {},
+    writeAttachment: rpc,
     rpc,
   } as any);
   return { orch, getOrStartRuntime, abortTurn, killAll, sent, edited, panels, rpc };
@@ -391,9 +392,9 @@ describe("park while remote bridge offline (#88)", () => {
     await orch.fireParked(store.getParked("park-fire")!);
     expect(rpc).toHaveBeenCalledWith(
       "mac",
-      "writeAttachment",
-      expect.objectContaining({ filename: "note.txt", cwd: "/repo" }),
-      "claude"
+      "/repo",
+      "note.txt",
+      expect.any(Buffer)
     );
     const dirs = dispatchDirs(dir);
     const pending = await readdir(dirs.pending);

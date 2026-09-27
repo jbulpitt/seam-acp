@@ -1,0 +1,87 @@
+/**
+ * Drive a test deployment's clicks and slash commands. The test deployment
+ * serves POST /test/interaction behind a shared key; the driving deployment
+ * calls it for agents through tester_interact.
+ */
+import { timingSafeEqual } from "node:crypto";
+import type { IncomingMessage, ServerResponse } from "node:http";
+import type { Logger } from "../lib/logger.js";
+import type { TestInteractionSpec, TranscriptEntry } from "../platforms/discord/synthetic-interaction.js";
+
+export interface TestInteractionResult {
+  transcript: TranscriptEntry[];
+  replied: boolean;
+  deferred: boolean;
+}
+
+const MAX_BODY = 64 * 1024;
+
+function keyMatches(given: string | undefined, key: string): boolean {
+  if (!given) return false;
+  const a = Buffer.from(given);
+  const b = Buffer.from(key);
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
+async function readJson(req: IncomingMessage): Promise<unknown> {
+  let size = 0;
+  const chunks: Buffer[] = [];
+  for await (const chunk of req) {
+    size += (chunk as Buffer).length;
+    if (size > MAX_BODY) throw new Error("request body too large");
+    chunks.push(chunk as Buffer);
+  }
+  return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+}
+
+function send(res: ServerResponse, status: number, body: unknown): void {
+  res.writeHead(status, { "Content-Type": "application/json" });
+  res.end(JSON.stringify(body));
+}
+
+export function makeTestInteractionHandler(opts: {
+  key: string;
+  actorId: string;
+  inject: (spec: TestInteractionSpec, actorId: string) => Promise<TestInteractionResult>;
+  logger: Logger;
+}): (req: IncomingMessage, res: ServerResponse) => Promise<void> {
+  return async (req, res) => {
+    if (req.method !== "POST") return send(res, 405, { error: "POST only" });
+    const auth = req.headers.authorization;
+    const given = typeof auth === "string" && auth.startsWith("Bearer ") ? auth.slice(7) : undefined;
+    if (!keyMatches(given, opts.key)) return send(res, 401, { error: "unauthorized" });
+    let spec: TestInteractionSpec;
+    try {
+      spec = (await readJson(req)) as TestInteractionSpec;
+    } catch (err) {
+      return send(res, 400, { error: `invalid JSON: ${(err as Error).message}` });
+    }
+    try {
+      const result = await opts.inject(spec, opts.actorId);
+      opts.logger.info({ kind: spec.kind, channelId: spec.channelId, ops: result.transcript.length }, "test interaction injected");
+      send(res, 200, result);
+    } catch (err) {
+      send(res, 422, { error: (err as Error).message });
+    }
+  };
+}
+
+export class TestDriverClient {
+  constructor(
+    private readonly url: string,
+    private readonly key: string,
+    private readonly fetchFn: typeof fetch = fetch,
+  ) {}
+
+  async interact(spec: TestInteractionSpec): Promise<TestInteractionResult> {
+    const res = await this.fetchFn(`${this.url.replace(/\/+$/, "")}/test/interaction`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${this.key}`, "content-type": "application/json" },
+      body: JSON.stringify(spec),
+      signal: AbortSignal.timeout(90_000),
+    });
+    const body = (await res.json().catch(() => ({}))) as TestInteractionResult & { error?: string };
+    if (!res.ok) throw new Error(body.error ?? `test driver returned ${res.status}`);
+    return body;
+  }
+}

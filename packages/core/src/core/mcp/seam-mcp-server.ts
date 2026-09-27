@@ -19,6 +19,8 @@
  * report-back own correlation and delivery — exactly as the operator-dispatch
  * bridge and the `<seam-*>` fence directives already do.
  */
+import type { TestDriverClient } from "../test-driver.js";
+import type { TestInteractionSpec } from "../../platforms/discord/synthetic-interaction.js";
 import type { TesterBot } from "../tester-bot.js";
 import * as http from "node:http";
 import type { AddressInfo } from "node:net";
@@ -287,6 +289,8 @@ export interface SeamMcpServerDeps {
   ) => Promise<{ model: string; observations: string }>;
   /** The test deployment's person-like bot (SEAM_TEST_BOT_TOKEN). */
   testerBot?: TesterBot;
+  /** The test deployment's click and slash-command driver (SEAM_TEST_DRIVER_URL). */
+  testDriver?: TestDriverClient;
   /**
    * Compute the EFFECTIVE config + which layer won for the calling session
    * (#58 P1). Undefined ⇒ config introspection is unsupported on this
@@ -1029,6 +1033,30 @@ const TOOLS = [
         threadName: { type: "string", description: "Start a new thread with this name in the channel, then post there." },
       },
       required: ["channel", "text"],
+    },
+  },
+  {
+    name: "tester_interact",
+    description:
+      "Click a button, pick from a dropdown, submit a form, or run a slash command in a TEST deployment, " +
+      "acting as its test user. Discord's rules apply: the handler must acknowledge within 3 s (10062 after), " +
+      "only once (40060), and follow-ups end after 15 min. Ephemeral replies are posted in the thread with a " +
+      "marker. Returns every reply/defer/edit/modal the handlers made. Get message and button ids from tester_read.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        kind: { type: "string", enum: ["button", "select", "modal", "slash"] },
+        channel: { type: "string", description: "Test channel or thread id." },
+        messageId: { type: "string", description: "Message holding the button or dropdown (button/select; optional for modal)." },
+        customId: { type: "string", description: "The component's or modal's custom id (button/select/modal)." },
+        values: { type: "array", items: { type: "string" }, description: "Picked dropdown values (select)." },
+        fields: { type: "object", description: "Form field id → value (modal)." },
+        command: { type: "string", description: "Slash command name, e.g. seam (slash)." },
+        subcommandGroup: { type: "string" },
+        subcommand: { type: "string" },
+        options: { type: "object", description: "Slash option name → value, checked against the registered command." },
+      },
+      required: ["kind", "channel"],
     },
   },
   {
@@ -1806,6 +1834,7 @@ const INSTRUCTIONS = [
   "- inspect_image(path, question?): inspect a Seam-staged image through the configured vision sidecar.",
   "- tester_post(channel, text, threadName?) / tester_read(channel, after?, limit?): drive a TEST deployment as",
   "  a person through its test bot, in allowlisted test channels only; read its replies back.",
+  "- tester_interact(kind, channel, ...): click, pick, submit a form, or run a slash command in a TEST deployment.",
   "- handoff(worker, prompt, returnTo?): delegate a task. `worker` is a thread id (a stateful",
   "  teammate) or a preset name (a fresh stateless specialist). You do NOT block — the worker's",
   "  result is dispatched back into your thread when it completes.",
@@ -2112,6 +2141,8 @@ export class SeamMcpServer {
           return rpcResult(id, this.toolModelValueRankings(args));
         case "tester_post":
           return rpcResult(id, await this.toolTesterPost(args));
+        case "tester_interact":
+          return rpcResult(id, await this.toolTesterInteract(args));
         case "tester_read":
           return rpcResult(id, await this.toolTesterRead(args));
         case "inspect_image":
@@ -2177,6 +2208,38 @@ export class SeamMcpServer {
       ...(threadName ? { threadName } : {}),
     });
     return textResult(JSON.stringify(posted));
+  }
+
+  private async toolTesterInteract(args: Record<string, unknown>): Promise<McpToolResult> {
+    if (!this.deps.testDriver) return textResult("tester_interact is not configured on this deployment (SEAM_TEST_DRIVER_URL, SEAM_TEST_DRIVER_KEY).", true);
+    const kind = requireString(args, "kind");
+    const channelId = requireString(args, "channel");
+    const str = (k: string) => optionalString(args, k);
+    let spec: TestInteractionSpec;
+    switch (kind) {
+      case "button":
+        spec = { kind, channelId, messageId: requireString(args, "messageId"), customId: requireString(args, "customId") };
+        break;
+      case "select":
+        spec = { kind, channelId, messageId: requireString(args, "messageId"), customId: requireString(args, "customId"),
+          values: Array.isArray(args.values) ? args.values.map(String) : [] };
+        break;
+      case "modal":
+        spec = { kind, channelId, customId: requireString(args, "customId"),
+          fields: Object.fromEntries(Object.entries((args.fields ?? {}) as Record<string, unknown>).map(([k, v]) => [k, String(v)])),
+          ...(str("messageId") ? { messageId: str("messageId")! } : {}) };
+        break;
+      case "slash":
+        spec = { kind, channelId, command: requireString(args, "command"),
+          ...(str("subcommandGroup") ? { subcommandGroup: str("subcommandGroup")! } : {}),
+          ...(str("subcommand") ? { subcommand: str("subcommand")! } : {}),
+          ...(args.options && typeof args.options === "object" ? { options: args.options as Record<string, string | number | boolean> } : {}) };
+        break;
+      default:
+        return textResult(`kind must be button, select, modal or slash (got ${kind})`, true);
+    }
+    const result = await this.deps.testDriver.interact(spec);
+    return textResult(JSON.stringify(result, null, 2));
   }
 
   private async toolTesterRead(args: Record<string, unknown>): Promise<McpToolResult> {

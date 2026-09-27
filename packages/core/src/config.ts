@@ -470,6 +470,15 @@ const Schema = z.object({
    * only in SEAM_TEST_BOT_CHANNEL_IDS (parent channels) and their threads.
    */
   SEAM_TEST_BOT_TOKEN: z.string().optional(),
+  /**
+   * Test interaction driver. On a test deployment, KEY plus ACTOR_ID turn on
+   * POST /test/interaction, which injects stand-in clicks and slash commands
+   * acting as ACTOR_ID. On the driving deployment, KEY plus URL give agents
+   * the tester_interact tool. Never set these on a deployment people use.
+   */
+  SEAM_TEST_DRIVER_KEY: z.string().optional(),
+  SEAM_TEST_DRIVER_ACTOR_ID: z.string().regex(/^\d+$/).optional(),
+  SEAM_TEST_DRIVER_URL: z.string().url().optional(),
   SEAM_TEST_BOT_CHANNEL_IDS: z
     .string()
     .default("")

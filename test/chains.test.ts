@@ -443,6 +443,7 @@ describe("chain MCP tool", () => {
       "service_status_refresh",
       "steer",
       "submit_result",
+      "tester_interact",
       "tester_post",
       "tester_read",
       "threads",

@@ -636,7 +636,10 @@ export class AgentRuntime {
     this.child = undefined;
   }
 
-  private connectClient(child: ReturnType<AgentProfile["spawn"]>, observeWrites: boolean): void {
+  private connectClient(
+    child: ReturnType<AgentProfile["spawn"]>,
+    observeWrites: boolean,
+  ): ClientSideConnection {
     const writable = Writable.toWeb(child.stdin) as unknown as WritableStream<Uint8Array>;
     const readable = Readable.toWeb(child.stdout) as unknown as ReadableStream<Uint8Array>;
     const wire = ndJsonStream(writable, readable);
@@ -672,7 +675,7 @@ export class AgentRuntime {
       });
     this.transportConnection = app.connect(stream);
     const agent = this.transportConnection.agent;
-    this.connection = {
+    const connection = {
       initialize: (params: Parameters<ClientSideConnection["initialize"]>[0]) =>
         agent.request(methods.agent.initialize, params),
       newSession: (params: Parameters<ClientSideConnection["newSession"]>[0]) =>
@@ -691,6 +694,8 @@ export class AgentRuntime {
       request: <T = unknown>(method: string, params?: unknown) =>
         agent.request<T>(method, params),
     } as unknown as ClientSideConnection;
+    this.connection = connection;
+    return connection;
   }
 
   /** Start the agent process and complete ACP `initialize`. */
@@ -825,12 +830,12 @@ export class AgentRuntime {
       }
     });
 
-    this.connectClient(child, true);
+    const connection = this.connectClient(child, true);
 
     // A hang produces no exit, so the timeout wins; attach the stderr we hold
     // rather than guess at a cause (#602, #610).
     const initResult = await Promise.race([
-      this.connection.initialize({
+      connection.initialize({
         protocolVersion: PROTOCOL_VERSION,
         clientCapabilities: ACP_CLIENT_CAPABILITIES,
       }),

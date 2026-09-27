@@ -288,7 +288,7 @@ export function loadHostAdapters(
           throw new Error("GROK_CATALOG_MODE must be subscription or api-key");
         }
         return makeGrokProfile({
-          cliPath: grokCli,
+          cliPath: "/tmp/seam-staging-grok-missing-640",
           defaultModel: env.GROK_DEFAULT_MODEL?.trim() || "grok-4.6",
           catalogMode: grokCatalogMode,
           ...(grokCatalogMode === "api-key" && env.GROK_API_KEY

@@ -2,8 +2,7 @@
  * GOLDEN CORPUS / REFACTOR ORACLE — output pipeline (FenceStream + splitForFlush + chunker)
  * ------------------------------------------------------------------------------------------
  * Purpose: a safety net for the streaming-output path, and the regression oracle for the
- * proposed "unified markdown block model" refactor (see chat / future
- * docs/output-pipeline-refactor.md). It is intentionally focused on the GAPS the existing
+ * proposed unified markdown block model refactor. It is intentionally focused on the gaps the existing
  * per-function suites (fence-stream / stream-flush / text-chunker / renderer .test.ts) don't
  * cover:
  *

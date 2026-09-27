@@ -14,7 +14,7 @@ staging transaction moves its pins:
    turn contract: stream subscription, thinking, MCP, usage, structured output,
    session continuity and complete cleanup.
 
-This distinction comes from the macbook-pro incident in #371. AGY 1.2.2 had a
+This distinction comes from the a canary host incident in #371. AGY 1.2.2 had a
 valid digest, immutable provenance, and working `--version`, yet its language
 server rejected `StreamAgentStateUpdates` as unauthenticated because the new
 CSRF token was available only to its IDE sidecar. Identity checks described the
@@ -29,7 +29,7 @@ none is a runtime policy.
 
 The gate runs inside `applyAgyStaging` before the five AGY pins move. A refusal
 removes only artifacts created by that attempted staging. The old pins and old
-runtime remain authoritative, so an agy-only laptop stays up. Initial migration
+runtime remain authoritative, so a single-agent host stays up. Initial migration
 of identical bytes is not reclassified as an upgrade; a changed digest is.
 
 No force or bypass switch exists. A missing report, mismatched version/digest,

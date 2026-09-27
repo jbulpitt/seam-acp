@@ -257,8 +257,7 @@ empirical process. Key non-negotiables from it:
   selection moved to `setSessionConfigOption`, which exact-matches full canonical
   `claude-*` IDs against the agent's advertised list *before* the fuzzy resolver,
   so full IDs resolve to themselves. `scripts/patch-claude-agent-acp.mjs` is
-  retired (its anchor `unstable_setSessionModel` no longer exists). **Caveat on
-  this account**: a raw wrapper session can reject an un-advertised full ID, so
+  retired (its anchor `unstable_setSessionModel` no longer exists). **Deployment caveat**: a raw wrapper session can reject an un-advertised full ID, so
   the Seam Claude profile forwards canonical IDs through `ANTHROPIC_MODEL`.
   Every picker entry was JSONL-verified on 2026-09-02; `default` resolves to
   Claude Opus 5 with a 1M window.

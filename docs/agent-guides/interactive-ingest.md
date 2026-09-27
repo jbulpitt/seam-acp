@@ -115,7 +115,7 @@ session: its agent, its model, its history, output posted there as usual, and
 ```json
 {
   "name": "site-questions",
-  "thread": "1516907849349857421",
+  "thread": "<target-thread-id>",
   "wrapper": "A visitor asked this through the website form. Answer it here."
 }
 ```
@@ -149,10 +149,11 @@ Content-Type: application/json
 
 Form-encoded bodies are also accepted. `studentId` is an untrusted label.
 
-The public host is `https://ingest.runbooksynthesis.com/ingest`. Public clients
-should use `POST /ingest?wait=0`, receive `{ jobId, poll }`, then poll
-`GET /ingest/jobs/{jobId}` with the same Bearer token. A held public POST may be
-cut off by Cloudflare before Seam's own wait ceiling.
+Use the `ingestUrl` returned by `create_ingest`. Public clients should use
+`POST /ingest?wait=0`, receive `{ jobId, poll }`, then follow the returned poll
+URL with the same Bearer token. A long-held POST may be cut off by an upstream
+proxy before Seam's own wait ceiling. Deployment-specific public hostnames
+belong in `docs/local/`.
 
 The token is shown once. Inject it server-side or at build time; do not ship it
 in public client-side JavaScript when a small backend can hold it.

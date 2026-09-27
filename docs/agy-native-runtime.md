@@ -181,7 +181,7 @@ to tell it from the second.
 
 **It cannot repair anything.** Its entire filesystem surface is five read
 calls — `stat`, `lstat`, `readFile`, `access`, `realpath` — so a misdiagnosis
-cannot take an agy-only laptop to zero agents; repair is always a deliberate
+cannot take a single-agent host to zero agents; repair is always a deliberate
 `stage-agy-runtime.mjs` run by an operator who has read the output. The
 ecosystem file is read as **text and never executed**: `require()`ing host
 config would hand it this process and discard that guarantee to save a regex.
@@ -196,7 +196,7 @@ outcome worse than a refusal here.
 1. **`pins-in-file`** — all six of `AGY_RUNTIME_ROOT`, `AGY_SHA256`,
    `AGY_CLI_PATH`, `AGY_VERSION`, `AGY_DEFAULT_MODEL` and `AGY_ENABLED`
    resolve from a *file*. A pin that resolves only from the running process is
-   a failure, not a pass: macbook-air reported `provenance mode:
+   a failure, not a pass: a canary host reported `provenance mode:
    immutable-path` from exactly that state with a `dump.pm2` stale since
    August, and one reboot would have brought it back with no pins and no trail
    back to a cause. Pass `--process-env <file.json>` to supply the live
@@ -243,14 +243,13 @@ A pm2 host has three, and until now nothing compared them:
   from the *running* list, so it can lag the file or drop an app entirely.
 - **live** — the running process environment, what is serving turns right now.
 
-macbook-air had its pins in **live only**: absent from the file, absent from a
+a canary host had its pins in **live only**: absent from the file, absent from a
 dump stale since Aug 30. It worked, reported `immutable-path`, and no file on
 the host explained how — one reboot from silently losing agy on an agy-only
 laptop.
 
 The dump is read as JSON through the same frozen read calls, never by shelling
-out to `pm2`: that binary is not on a non-interactive `PATH` on any Mac in this
-fleet, which is #390's sixth failure and bit twice while this was being built.
+out to `pm2`: that binary is not on a non-interactive `PATH` on affected macOS hosts, which is #390's sixth failure and bit twice while this was being built.
 Override the path with `--pm2-dump <file>`; it defaults to `$PM2_HOME/dump.pm2`
 or `~/.pm2/dump.pm2`. Supply the running environment with
 `--process-env <file.json>` to compare all three — without it only two are
@@ -302,7 +301,7 @@ does not, even while it works.
 `capability` is **skipped** unless `--probe` is passed, and a skipped check is
 reported as skipped rather than omitted. Identity is not capability: agy 1.2.2
 had a valid digest, immutable provenance and a working `--version` on
-macbook-pro while its language server rejected every subscription (#371).
+a canary host while its language server rejected every subscription (#371).
 `--probe` runs the same prompt-free `agy --log-file <temp> models` check
 staging uses — no `-p`, no prompt, nothing billable (#361).
 
@@ -322,7 +321,7 @@ printing it:
 
 ```bash
 set -euo pipefail
-agy_source=/home/ubuntu/.local/bin/agy
+agy_source=/path/to/agy
 agy_root=/opt/seam/agy-runtime
 agy_version=1.2.0
 agy_sha=77dc197a05ca2a47d143ad135a4679b28ef85976cfd268569233d2f3d08ce999

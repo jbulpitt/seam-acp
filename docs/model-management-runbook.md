@@ -82,7 +82,7 @@ model's native window comes from the `CLAUDE_CONTEXT_WINDOWS` table in
 | `claude-sonnet-5` | claude-sonnet-5 | 1M | full ID (`ANTHROPIC_MODEL` + exact-match) |
 
 **Account caveat (covered, but keep testing):** a raw 0.73.0 wrapper session on
-this account still rejects some full IDs that are absent from its advertised
+some deployments reject full IDs that are absent from the advertised
 list. Seam deliberately forwards a selected canonical ID through
 `ANTHROPIC_MODEL`, which adds it to the wrapper's available list and selects it.
 The 2026-09-02 probe verified every picker row above through that actual Seam
@@ -346,7 +346,7 @@ timeout 300 node /tmp/probe-models.mjs 2>/dev/null
 **How to read the output — a model entry is VERIFIED only if ALL hold:**
 1. `set_config_option` was NOT rejected (no `⚠ ... REJECTED` on the line). A
    rejection with `Invalid value for config option model` means the full ID is
-   not advertised on this account and cannot be selected as-is — see the account
+   not advertised by the deployment and cannot be selected as-is — see the deployment
    caveat in §5 for the fix.
 2. `API model` matches the model you intended (e.g. `default` → `claude-opus-5`,
    NOT a different family).

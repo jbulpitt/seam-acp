@@ -1,5 +1,5 @@
 /**
- * Discord gap-detector for premium compaction (docs/premium-compaction-design.md §5).
+ * Discord gap-detector for premium compaction.
  *
  * Runs ALWAYS, cheaply (timestamps / markers, no LLM). Decides whether the
  * Discord thread holds history the session store has lost or never had, and for

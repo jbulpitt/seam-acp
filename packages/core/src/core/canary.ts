@@ -216,40 +216,48 @@ export class StagingCanaryRunner {
         a.bridge.host.localeCompare(b.bridge.host) || a.agent.id.localeCompare(b.agent.id)
       );
 
-    const rows = await Promise.all(targets.map(async ({ bridge, agent }): Promise<CanaryRow> => {
+    const rows: CanaryRow[] = [];
+    const runnable: Array<{ host: string; agent: string; threadId: string }> = [];
+    for (const { bridge, agent } of targets) {
       if (!bridge.ready) {
-        return {
+        rows.push({
           host: bridge.host,
           agent: agent.id,
           status: "skipped",
           durationMs: null,
           cause: "bridge not ready",
-        };
+        });
+        continue;
       }
       if (!agent.installed || !agent.ready) {
-        return {
+        rows.push({
           host: bridge.host,
           agent: agent.id,
           status: "skipped",
           durationMs: null,
           cause: agent.reason ?? (!agent.installed ? "not installed" : "not ready"),
-        };
+        });
+        continue;
       }
       try {
-        const id = await this.ensureThread(registry, bridge.host, agent.id);
-        return await this.runTurn(bridge.host, agent.id, id);
+        const threadId = await this.ensureThread(registry, bridge.host, agent.id);
+        runnable.push({ host: bridge.host, agent: agent.id, threadId });
       } catch (error) {
         const providerNote = this.options.providerStatus?.(agent.id);
-        return {
+        rows.push({
           host: bridge.host,
           agent: agent.id,
           status: "failed",
           durationMs: null,
           cause: bounded(error instanceof Error ? error.message : String(error)),
           ...(providerNote ? { providerNote } : {}),
-        };
+        });
       }
-    }));
+    }
+    rows.push(...await Promise.all(
+      runnable.map(({ host, agent, threadId }) => this.runTurn(host, agent, threadId))
+    ));
+    rows.sort((a, b) => a.host.localeCompare(b.host) || a.agent.localeCompare(b.agent));
 
     if (rows.length === 0) {
       rows.push({

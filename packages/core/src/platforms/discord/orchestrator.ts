@@ -15958,7 +15958,7 @@ export class Orchestrator {
       return true;
     }
     if (!snapshot) {
-      await this.settleDeadRemoteRecovery(attempt,
+      this.continueLostRemoteTurn(attempt,
         `bridge slot ${binding.slot} on ${binding.location} is not live`);
       return true;
     }
@@ -16065,34 +16065,6 @@ export class Orchestrator {
     "rebound controller to bridge-owned rung-1 recovery");
     await completion;
     return true;
-  }
-
-  private async settleDeadRemoteRecovery(attempt: TurnAttempt, cause: string): Promise<void> {
-    const current = this.store.turnAttempts.get(attempt.id);
-    if (!current || current.state !== "suspended"
-      || current.generation !== attempt.generation
-      || current.remoteRecovery?.submissionId !== attempt.remoteRecovery?.submissionId) return;
-    const error = `remote recovery cannot continue: ${cause}`;
-    const outcome: DispatchResult = {
-      id: current.id,
-      target: current.spec.target,
-      status: "failed",
-      output: "",
-      error,
-      workerError: error,
-      workerStatus: "failed",
-      kind: current.spec.kind,
-      returnTo: current.spec.returnTo,
-      chainId: current.spec.chainId,
-      correlationId: current.spec.correlationId,
-      finishedUtc: new Date().toISOString(),
-    };
-    if (!this.store.turnAttempts.settleRemoteRecovery(current, outcome)) return;
-    const completed = this.store.turnAttempts.get(current.id);
-    if (!completed?.outcome) return;
-    this.logger.warn({ attempt: current.id, location: current.remoteRecovery?.location,
-      slot: current.remoteRecovery?.slot, cause }, "dead remote recovery settled");
-    await this.finishRemoteRecoveryCompletion(current, completed);
   }
 
   private async finishRemoteRecoveryCompletion(

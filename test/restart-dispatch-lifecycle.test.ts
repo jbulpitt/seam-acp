@@ -14,6 +14,7 @@ import { discordRenderer } from "../packages/core/src/platforms/discord/renderer
 import { projectAttemptCompletions } from "../packages/core/src/core/dispatch/attempt-recovery.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 import { DispatchSuspendedError } from "../packages/core/src/core/dispatch/attempt-store.js";
+import { executionIdentity } from "../packages/core/src/core/dispatch/execution-identity.js";
 import { attachLocalBridge } from "./local-bridge-fixture.js";
 import { AgentRuntime } from "../packages/core/src/agents/agent-runtime.js";
 import type { AgentProfile } from "@seam/adapters";
@@ -597,12 +598,14 @@ describe("#250 production dispatch lifecycle (synthetic transport, no providers)
     );
   });
 
-  it("settles a dead remote recovery before the next queued wake runs", async () => {
+  it("continues a dead remote recovery before the next queued wake runs", async () => {
     const h = setup();
+    simulateRetiredOwnerProcess();
     h.store.turnAttempts.registerOwner("controller-before-restart");
     const attempt = h.store.turnAttempts.claim(
       { ...h.spec, id: "dead-wake", kind: "wake", returnTo: undefined },
-      "synthetic-identity",
+      executionIdentity({ agentId: "codex", location: "local", session: "live",
+        cwd: "/synthetic", config: "{}" }),
       "controller-before-restart",
       "dispatch",
     );
@@ -642,7 +645,21 @@ describe("#250 production dispatch lifecycle (synthetic transport, no providers)
       }] })),
       adopt: vi.fn(),
     };
-    h.runtime.prompt.mockResolvedValue({ stopReason: "end_turn" });
+    let continuationStarted!: () => void;
+    let releaseContinuation!: () => void;
+    const started = new Promise<void>((resolve) => { continuationStarted = resolve; });
+    const release = new Promise<void>((resolve) => { releaseContinuation = resolve; });
+    h.runtime.prompt
+      .mockImplementationOnce(async (text) => {
+        continuationStarted();
+        expect(String(text)).toContain("continue");
+        await release;
+        return { stopReason: "end_turn" };
+      })
+      .mockImplementationOnce(async (text) => {
+        expect(String(text)).toContain("queued wake");
+        return { stopReason: "end_turn" };
+      });
     const restarted = h.makeOrch();
     restarted.setBridgeHub({
       muxFor: (location: string) => location === "remote-one" ? mux : undefined,
@@ -659,6 +676,15 @@ describe("#250 production dispatch lifecycle (synthetic transport, no providers)
     });
     restarted.setDispatchWatcher(watcher);
     cleanups.push(() => watcher.stop());
+    const resume = vi.spyOn(restarted, "resumeTurnManually");
+
+    const boot = watcher.start();
+    await vi.waitFor(() => expect(resume).toHaveBeenCalledWith("dead-wake"));
+    await resume.mock.results[0]!.value;
+    const continuation = h.runtime.prompt.mock.calls.length === 0
+      ? watcher.tick()
+      : Promise.resolve();
+    await started;
     await enqueueDispatchSpec(h.dataDir, {
       ...h.spec,
       id: "wake-after-dead",
@@ -666,29 +692,24 @@ describe("#250 production dispatch lifecycle (synthetic transport, no providers)
       returnTo: undefined,
       prompt: "queued wake",
     });
-
-    await watcher.start();
-    await watcher.initialDispatchesSettled();
+    releaseContinuation();
+    await Promise.all([boot, continuation]);
+    await watcher.tick();
+    await vi.waitFor(() => expect(h.store.turnAttempts.get("dead-wake")?.state).toBe("completed"));
+    await vi.waitFor(() => expect(h.store.turnAttempts.get("wake-after-dead")?.state).toBe("completed"));
 
     expect(mux.adopt).not.toHaveBeenCalled();
     expect(h.store.turnAttempts.get("dead-wake")).toMatchObject({
       state: "completed",
       outcome: {
-        status: "failed",
-        error: "remote recovery cannot continue: bridge slot 19 on remote-one is not live",
+        status: "completed",
       },
     });
     expect(h.store.turnAttempts.get("wake-after-dead")?.state).toBe("completed");
-    expect(h.runtime.prompt).toHaveBeenCalledTimes(1);
-    expect(String(h.runtime.prompt.mock.calls[0]?.[0])).toContain("queued wake");
-    expect(h.adapter.editStatusPanelProjection).toHaveBeenCalledWith(
-      { channel: { platform: "discord", id: "worker" }, id: "dead-card" },
-      {
-        state: "Failed",
-        action: "Failed — remote recovery cannot continue: bridge slot 19 on remote-one is not live",
-      },
-    );
-  });
+    expect(h.runtime.prompt).toHaveBeenCalledTimes(2);
+    expect(String(h.runtime.prompt.mock.calls[0]?.[0])).toContain("continue");
+    expect(String(h.runtime.prompt.mock.calls[1]?.[0])).toContain("queued wake");
+  }, 15_000);
 
   it("runs a queued report-back after a human interrupts the active dispatch", async () => {
     const h = setup();

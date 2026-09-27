@@ -70,6 +70,11 @@ import type { SessiondClient } from "./sessiond-client.js";
 import { SupervisedSlots, forwardInput, type SupervisedBridgeFrame } from "./supervised-slots.js";
 import { bridgeHello } from "./hello.js";
 import { acquireProcessLease } from "./process-lease.js";
+import {
+  startHostSecretSweeper,
+  writeHostAttachment,
+  writeHostSecret,
+} from "./host-files.js";
 
 type WsCtor = typeof import("ws").WebSocket;
 type WssCtor = typeof import("ws").WebSocketServer;
@@ -85,21 +90,6 @@ interface SlotManager {
 const copilotDir = path.join(homedir(), ".copilot");
 const dbPath = path.join(copilotDir, "session-store.db");
 const sessionStateDir = path.join(copilotDir, "session-state");
-
-/** Write an uploaded attachment to this machine's filesystem under
- *  `<cwd>/.seam-attachments/<filename>` and return the absolute path. Used by
- *  network-restricted remote agents that can't fetch Discord CDN URLs but
- *  can still consume local files. */
-async function writeAttachment(cwd: string, filename: string, base64: string) {
-  // Sanitize filename: strip path separators so callers can't write outside
-  // the .seam-attachments directory.
-  const safe = path.basename(filename).replace(/[\/\\]/g, "_");
-  const dir = path.join(cwd, ".seam-attachments");
-  await fsp.mkdir(dir, { recursive: true });
-  const absPath = path.join(dir, safe);
-  await fsp.writeFile(absPath, Buffer.from(base64, "base64"));
-  return { path: absPath };
-}
 
 function escapeSql(val: unknown) {
   if (val === null || val === undefined) return "NULL";
@@ -548,7 +538,19 @@ async function makeSlotManager(opts: {
         }
         result = null;
       } else if (action === "writeAttachment") {
-        result = await writeAttachment(payload.cwd, payload.filename, payload.base64);
+        result = await writeHostAttachment({
+          requestedCwd: payload.cwd,
+          fallbackCwd: localCwd,
+          filename: payload.filename,
+          base64: payload.base64,
+        });
+      } else if (action === "writeSecret") {
+        result = await writeHostSecret({
+          threadId: payload.threadId,
+          name: payload.name,
+          base64: payload.base64,
+          expiresAt: payload.expiresAt,
+        });
       } else {
         throw new Error(`Unknown action: ${action}`);
       }
@@ -967,6 +969,7 @@ async function main(): Promise<void> {
     console.error("[bridge] Another bridge process owns this singleton; exiting.");
     return;
   }
+  startHostSecretSweeper();
   const tokenFromFile = tokenFileFlag ? (await fsp.readFile(tokenFileFlag, "utf8")).trim() : undefined;
   if (tokenFileFlag && !tokenFromFile) throw new Error("bridge token file is empty");
   if (rawArgs[0] === "connect") {

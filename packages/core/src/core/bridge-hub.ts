@@ -356,6 +356,40 @@ export class BridgeHub {
     return Array.isArray(result) ? (result as WorkspaceInfo[]) : [];
   }
 
+  async writeAttachment(
+    location: string,
+    cwd: string,
+    filename: string,
+    bytes: Uint8Array
+  ): Promise<{ path: string }> {
+    const id = normalizeLocation(location);
+    const conn = this.connections.get(id);
+    if (!conn) throw new Error(`bridge "${id}" is not connected`);
+    return conn.mux.sendCmd("writeAttachment", {
+      cwd,
+      filename,
+      base64: Buffer.from(bytes).toString("base64"),
+    }) as Promise<{ path: string }>;
+  }
+
+  async writeSecret(
+    location: string,
+    threadId: string,
+    name: string,
+    bytes: Uint8Array,
+    expiresAt: number
+  ): Promise<{ path: string }> {
+    const id = normalizeLocation(location);
+    const conn = this.connections.get(id);
+    if (!conn) throw new Error(`bridge "${id}" is not connected`);
+    return conn.mux.sendCmd("writeSecret", {
+      threadId,
+      name,
+      base64: Buffer.from(bytes).toString("base64"),
+      expiresAt,
+    }) as Promise<{ path: string }>;
+  }
+
   /** Bind a session to its execution bridge. Local is a real bridge (#575). */
   markSessionBridge(sessionId: string, bridgeId: string): void {
     this.sessionBridge.set(sessionId, normalizeLocation(bridgeId));

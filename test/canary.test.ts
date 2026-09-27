@@ -63,6 +63,14 @@ describe("staging canary observations", () => {
     ], nonce)).toEqual({ state: "done", nonceSeen: true, toolSeen: true });
 
     expect(observeCanaryMessages([
+      message({ embeds: ["⏰ Wake · Working\n`▶️ Terminal`\nAction: Running tool"] }),
+    ], nonce)).toEqual({ state: "working", nonceSeen: false, toolSeen: true });
+    expect(observeCanaryMessages([
+      message({ content: nonce }),
+      message({ embeds: ["⏰ Wake · Done\n`✅ Terminal`\nAction: end_turn"] }),
+    ], nonce)).toEqual({ state: "done", nonceSeen: true, toolSeen: true });
+
+    expect(observeCanaryMessages([
       message({ content: nonce }),
       message({ embeds: ["Done\n`🔬 Echo the given string`\nAction: end_turn"] }),
     ], nonce)).toEqual({ state: "done", nonceSeen: true, toolSeen: true });

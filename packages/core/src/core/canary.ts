@@ -192,16 +192,16 @@ export function observeCanaryMessages(
   const nonceSeen = botMessages.some((message) => message.content.includes(nonce));
   const toolSeen = /\bTool\s*:\s*\S/i.test(statusText)
     || TOOL_ACTIVITY_EMOJIS.some((emoji) => statusText.includes(`\`${emoji}`));
-  if (statusHeads.some((head) => /^(?:❌\s*)?Failed\b/i.test(head))) {
+  if (statusHeads.some((head) => /^(?:.*?·\s*)?(?:❌\s*)?Failed\b/i.test(head))) {
     return { state: "failed", nonceSeen, toolSeen, cause: failureCause(botMessages) };
   }
-  if (statusHeads.some((head) => /^(?:⏱️\s*)?(?:Timed out|Timeout)\b/i.test(head))) {
+  if (statusHeads.some((head) => /^(?:.*?·\s*)?(?:⏱️\s*)?(?:Timed out|Timeout)\b/i.test(head))) {
     return { state: "timed_out", nonceSeen, toolSeen, cause: failureCause(botMessages) };
   }
-  if (statusHeads.some((head) => /^(?:✅\s*)?Done\b/i.test(head))) {
+  if (statusHeads.some((head) => /^(?:.*?·\s*)?(?:✅\s*)?Done\b/i.test(head))) {
     return { state: "done", nonceSeen, toolSeen };
   }
-  if (statusHeads.some((head) => /^(?:Working|Waiting|Reconnecting|Monitoring)\b/i.test(head))) {
+  if (statusHeads.some((head) => /^(?:.*?·\s*)?(?:Working|Waiting|Reconnecting|Monitoring)\b/i.test(head))) {
     return { state: "working", nonceSeen, toolSeen };
   }
   return { state: "unknown", nonceSeen, toolSeen };

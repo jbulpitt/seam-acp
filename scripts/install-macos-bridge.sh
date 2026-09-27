@@ -195,9 +195,9 @@ run_self_test() {
   expect_ok "discord paste" \
     "Paired **mac**. Run this **once** on the host (token is not stored in plaintext and will not be shown again):
 \`\`\`
-seam-bridge connect --server wss://seamacp.runbooksynthesis.com/bridge --id mac --token THE_TOKEN
+seam-bridge connect --server wss://seam.example.com/bridge --id mac --token THE_TOKEN
 \`\`\`" \
-    "wss://seamacp.runbooksynthesis.com/bridge" "mac" "THE_TOKEN"
+    "wss://seam.example.com/bridge" "mac" "THE_TOKEN"
 
   expect_ok "positional wss" \
     "wss://x.example/bridge leftover --id box --token t" \
@@ -378,7 +378,7 @@ require_supported_node_interpreter() {
   case "$abi" in *[!0-9]*|'') die "node interpreter at $candidate reported invalid ABI $abi" ;; esac
   if ! node_abi_allowed "$abi"; then
     # Refuse only this create/recreate operation. An already-running bridge is
-    # untouched; the incident this prevents is macbook-air being recreated by
+    # untouched; the incident this prevents is macos-canary-a being recreated by
     # an nvm lts/* alias onto v24/ABI 137 after #412 pinned the live PM2 entry.
     die "node interpreter $candidate is $version with unsupported ABI $abi for $NODE_NATIVE_DEPENDENCY (reviewed ABIs: $NODE_NATIVE_PREBUILD_ABIS); refusing to create or recreate the bridge entry"
   fi

@@ -23,6 +23,9 @@ scripts/prune-dead-sessions.mjs
 scripts/rename-threads.mjs
 scripts/fix-cpfs-threads.mjs
 
+# Local agent state may contain command history or credentials.
+.claude/
+
 # Agent instructions (local only — customize per environment)
 # AGENTS.md
 

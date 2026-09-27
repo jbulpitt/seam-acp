@@ -184,7 +184,7 @@ const Schema = z.object({
   DEFAULT_AGENT: z.string().default("claude"),
   DEFAULT_MODEL: z.string().default("gpt-5.4"),
   /** Copilot is licensed per-seat and may be entitled to one project only.
-   * Set false to refuse it on EVERY host — including `copilot@fhr-server`.
+   * Set false to refuse it on EVERY host — including remote locations.
    * The narrower "not on this host" case is `AGENT_LOCATION_DENY`. */
   COPILOT_ENABLED: z.enum(["true", "false"]).default("true").transform((v) => v === "true"),
   /**
@@ -659,7 +659,7 @@ const Schema = z.object({
   /**
    * Opt-in warm-set (#452). Empty = nobody is warmed (the right default for
    * the tail). Comma-separated host ids; optional `id=MB` overrides the
-   * measured holding budget. Example: `fhr-server=2500,rhc-server`.
+   * conservative default budget. Example: `worker-a=2500,worker-b`.
    */
   WARM_SET_HOSTS: z.string().default("").transform((v) => parseWarmSetHosts(v)),
   /** Simultaneous warm-ups per process. Mandatory bound, default 2, cap 4. */
@@ -733,7 +733,7 @@ const Schema = z.object({
    * Public origin for minted `POST /ingest` URLs (`create_ingest`). Pages hubs
    * are told to use this host, not the bridge hostname. Empty/unset ⇒ derive
    * from `SEAM_BRIDGE_PUBLIC_URL` / tunnel / loopback (local/dev). Trailing
-   * slash is stripped. Example: `https://ingest.runbooksynthesis.com`.
+   * slash is stripped. Example: `https://ingest.example.com`.
    */
   SEAM_INGEST_PUBLIC_URL: z
     .string()
@@ -855,7 +855,7 @@ const Schema = z.object({
    * Permanent public WebSocket URL for remote-bridge bootstrap
    * (`/seamadmin bridge add`). Survives reboot — unlike data/tunnel-url.txt,
    * which is overwritten by the Cloudflare *quick* tunnel every start.
-   * Example: `wss://seamacp.runbooksynthesis.com/bridge`. Empty/unset ⇒
+   * Example: `wss://seam.example.com/bridge`. Empty/unset ⇒
    * fall back to tunnel-url.txt, then `ws://127.0.0.1:$HEALTH_PORT/bridge`.
    */
   SEAM_BRIDGE_PUBLIC_URL: z

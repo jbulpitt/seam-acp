@@ -37,7 +37,7 @@ const THREAD = "1545798689216397383";
 const PARENT = "111111111111111111";
 const REPOS_ROOT = "/repos-root";
 const STALE_CWD = "/stale/copilot-cwd";
-const EFFECTIVE_CWD = "/home/ubuntu/Projects/seam-acp";
+const EFFECTIVE_CWD = "/home/operator/Projects/seam-acp";
 const OVERRIDE_CWD = "/override/scheduled-cwd";
 const STALE_MODEL = "claude-sonnet-4.6";
 const EFFECTIVE_MODEL = "grok-4.6";
@@ -87,7 +87,7 @@ function schedule(over: Partial<ScheduledPrompt> = {}): ScheduledPrompt {
     catchupSeconds: 7200,
     enabled: true,
     legacyAttachmentCount: 0,
-    createdBy: "user-jesse",
+    createdBy: "user-alex",
     createdUtc: "2026-01-01T00:00:00.000Z",
     updatedUtc: "2026-01-01T00:00:00.000Z",
     lastRunUtc: null,
@@ -231,7 +231,7 @@ async function renderBuilder(
   let card: RenderedCard | undefined;
   const interaction = {
     isChatInputCommand: () => true,
-    user: { id: "user-jesse" },
+    user: { id: "user-alex" },
     deferred: false,
     replied: false,
     reply: async (payload: RenderedCard) => {

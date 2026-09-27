@@ -21,7 +21,7 @@ describe("footprint measurements", () => {
     expect(holdingMb("grok")).toBe(110);
     expect(holdingMb("copilot")).toBeNull();
     expect(holdingMb("agy")).toBeNull();
-    expect(holdingMb("copilot-jbulpitt")).toBeNull();
+    expect(holdingMb("copilot-example")).toBeNull();
     expect(agentFamily("ollama-cloud")).toBe("codex");
     expect(loadCost("codex")).toBe("high");
     expect(loadCost("claude")).toBe("low");
@@ -34,10 +34,10 @@ describe("parseWarmSetHosts", () => {
     expect(parseWarmSetHosts("   ")).toEqual([]);
   });
 
-  it("applies measured host defaults and explicit MB overrides", () => {
-    expect(parseWarmSetHosts("fhr-server,rhc-server=8000")).toEqual([
-      { id: "fhr-server", budgetMb: 2500 },
-      { id: "rhc-server", budgetMb: 8000 },
+  it("applies the conservative default and explicit MB overrides", () => {
+    expect(parseWarmSetHosts("worker-a,worker-b=8000")).toEqual([
+      { id: "worker-a", budgetMb: 4096 },
+      { id: "worker-b", budgetMb: 8000 },
     ]);
   });
 });

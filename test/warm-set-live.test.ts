@@ -68,9 +68,12 @@ describe.skipIf(!hasLive)("#452 live snapshot packing", () => {
     expect(store!.countSessions()).toBe(before.count);
   });
 
-  it("packs fhr-server and rhc-server under their measured budgets without starting unmeasured agents", () => {
+  it("packs discovered remote hosts under the generic budget without starting unmeasured agents", () => {
     const sessions = store!.listSessionsUncapped();
-    for (const host of ["fhr-server", "rhc-server"] as const) {
+    const hosts = [...new Set([...presets.threadPresets.values()]
+      .map((preset) => preset.location)
+      .filter((location): location is string => Boolean(location && location !== "local")))].slice(0, 2);
+    for (const host of hosts) {
       const owned = listSessionsForHost(host, { threadPresets: presets.threadPresets, sessions });
       const decisions = selectWarmSet({
         budgetMb: budgetForHost(host),

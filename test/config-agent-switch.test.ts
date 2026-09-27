@@ -62,7 +62,7 @@ function slashI(over: {
     options: {
       getString: (name: string, _req?: boolean) => over.strings?.[name] ?? null,
     },
-    user: { id: ADMIN, username: "jesse", displayName: "Jesse" },
+    user: { id: ADMIN, username: "alex", displayName: "Alex" },
     channelId: over.channelId ?? THREAD,
     channel: {
       isThread: () => true,
@@ -262,7 +262,7 @@ describe("/seam config agent — #178 session/overlay split-brain", () => {
         order.push("picked");
         const result = await opts.commit(
           { value: "codex@local", label: "OpenAI Codex @ local" },
-          "jesse"
+          "alex"
         );
         order.push("commit-done");
         if (result.ok) {
@@ -393,7 +393,7 @@ describe("/seam config agent — #178 session/overlay split-brain", () => {
         });
         const result = await opts.commit(
           { value: "codex@local", label: "codex" },
-          "jesse"
+          "alex"
         );
         expect(result.ok).toBe(true);
         return { value: "codex@local", userId: ADMIN };

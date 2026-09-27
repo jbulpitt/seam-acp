@@ -24,7 +24,7 @@ describe("recoveryStory", () => {
         agent: "claude",
         model: "claude-opus-5",
         location: "local",
-        cwd: "/home/ubuntu/Projects/seam-acp",
+        cwd: "/home/operator/Projects/seam-acp",
       }),
     }, new Date("2026-09-22T04:48:31.000Z"));
     facts.defaultBranch = { name: "origin/main", sha: SHA };
@@ -37,7 +37,7 @@ describe("recoveryStory", () => {
     expect(prompt).toContain("The recorded model is claude-opus-5.");
     expect(prompt).toContain("The recorded agent is claude.");
     expect(prompt).toContain("The provider is Claude Agent.");
-    expect(prompt).toContain("The session directory is /home/ubuntu/Projects/seam-acp.");
+    expect(prompt).toContain("The session directory is /home/operator/Projects/seam-acp.");
     expect(prompt).toContain(`The default branch origin/main is currently ${SHA}.`);
     expect(prompt).toContain("The transcript in this session is the work done before the stop.");
     expect(prompt).toContain("What is safe to assume is the transcript");
@@ -55,14 +55,14 @@ describe("recoveryStory", () => {
       promptStarted: true,
       identity: JSON.stringify({
         agent: "codex",
-        location: "rhc-server",
-        cwd: "/home/ubuntu/Projects/pronoa",
+        location: "remote-b",
+        cwd: "/home/operator/Projects/pronoa",
       }),
     }, new Date("2026-09-22T05:00:00.000Z")));
 
     expect(prompt).toContain("The recorded reason is: provider acquisition failed during execution: rpc timed out.");
     expect(prompt).not.toContain("The process restarted while the turn was in flight.");
-    expect(prompt).toContain("The session runs on rhc-server. This resume does not include that host's git state.");
+    expect(prompt).toContain("The session runs on remote-b. This resume does not include that host's git state.");
     expect(prompt).not.toContain("is currently");
     expect(prompt).not.toContain("/.worktrees/");
   });
@@ -71,7 +71,7 @@ describe("recoveryStory", () => {
     const { prompt, note } = recoveryStory({
       cause: "process_restart",
       promptStarted: true,
-      location: "rhc-server",
+      location: "remote-b",
       defaultBranch: { name: "origin/main", sha: SHA },
     });
     expect(prompt).not.toContain(SHA);

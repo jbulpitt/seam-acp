@@ -15,7 +15,7 @@ const entry = (over: Partial<ConfigAuditEntry> = {}): ConfigAuditEntry => ({
   id: "cfg-abc12345def",
   tier: "session",
   actorId: "9001",
-  actorName: "jesse",
+  actorName: "alex",
   scope: "discord:thread-a",
   summary: "model → claude-opus-4-8",
   beforeJson: '{"model":"claude-sonnet-5"}',
@@ -30,7 +30,7 @@ describe("auditLine", () => {
     const line = auditLine(entry(), NOW);
     expect(line).toContain("`abc12345`"); // short id, not the full one
     expect(line).toContain("2m"); // coarse age
-    expect(line).toContain("jesse");
+    expect(line).toContain("alex");
     expect(line).toContain("session");
     expect(line).toContain("thread-a");
     expect(line).toContain("model → claude-opus-4-8");
@@ -114,7 +114,7 @@ describe("formatConfigAuditDetail", () => {
     const labels = detail.meta.map((m) => m.label);
     expect(labels).toEqual(["actor", "tier", "scope", "when", "correlation"]);
     const actor = detail.meta.find((m) => m.label === "actor")!.value;
-    expect(actor).toBe("jesse (9001)");
+    expect(actor).toBe("alex (9001)");
   });
 
   it("omits the correlation row when there is none", () => {

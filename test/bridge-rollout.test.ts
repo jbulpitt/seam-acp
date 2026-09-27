@@ -55,20 +55,20 @@ describe("bridge rollout target safety (#241)", () => {
   it("pins the full operator-owned deployment identity", () => {
     expect(resolveTarget(targets, "workstation")).toMatchObject({ bridgeId: "workstation", sshAlias: "workstation", pm2App: "remote-agent-bridge", expectedUid: 501, checkoutPath: "/Users/operator/seam-acp", entrypointPath: "/Users/operator/seam-acp/packages/bridge/dist/index.js", releaseRoot: "/Users/operator/.seam/bridge-rollouts" });
     expect(configured.targets["workstation"]).not.toHaveProperty("pidFilePath");
-    expect(resolveTarget(targets, "laptop-a")).toMatchObject({ bridgeId: "laptop-a", sshAlias: "laptop-a", pm2App: "seam-bridge", expectedUid: 501, workspaceArg: "/Users/operator" });
+    expect(resolveTarget(targets, "portable-a")).toMatchObject({ bridgeId: "portable-a", sshAlias: "portable-a", pm2App: "seam-bridge", expectedUid: 501, workspaceArg: "/Users/operator" });
   });
 
   it("keeps the AGY laptops excluded for the surveyed reason, not a shared PM2-contract claim", () => {
-    expect(configured.targets["excluded-laptop-a"].sshAlias).toBe("excluded-laptop-a");
-    expect(configured.targets["excluded-laptop-c"].sshAlias).toBe("excluded-laptop-c");
-    expect(configured.targets["excluded-laptop-b"].sshAlias).toBe("excluded-laptop-b");
-    expect(() => resolveTarget(targets, "excluded-laptop-a")).toThrow(/explicitly excluded.*privileged management/);
-    expect(() => resolveTarget(targets, "excluded-laptop-c")).toThrow(/explicitly excluded.*different account/);
-    expect(() => resolveTarget(targets, "excluded-laptop-b")).toThrow(/explicitly excluded.*different account/);
+    expect(configured.targets["excluded-portable-a"].sshAlias).toBe("excluded-portable-a");
+    expect(configured.targets["excluded-portable-c"].sshAlias).toBe("excluded-portable-c");
+    expect(configured.targets["excluded-portable-b"].sshAlias).toBe("excluded-portable-b");
+    expect(() => resolveTarget(targets, "excluded-portable-a")).toThrow(/explicitly excluded.*privileged management/);
+    expect(() => resolveTarget(targets, "excluded-portable-c")).toThrow(/explicitly excluded.*different account/);
+    expect(() => resolveTarget(targets, "excluded-portable-b")).toThrow(/explicitly excluded.*different account/);
   });
 
   it("refuses every mutating phase for an explicitly unmanaged host, before command construction (#281, #282)", () => {
-    // Deliberately synthetic. This guard used to read `laptop-b` out of the
+    // Deliberately synthetic. This guard used to read `portable-b` out of the
     // live target map, so enrolling that host once it HAD a verified SSH path
     // (#342) invalidated the guard rather than the rule — the assertion broke
     // while the behaviour it protects was untouched. The rule is about the
@@ -112,15 +112,15 @@ describe("bridge rollout target safety (#241)", () => {
     expect(() => makeScpCommand(target, "/tmp/release.tgz", `${artifactName("a".repeat(40), "b".repeat(64))}.upload-${token}`)).toThrow(/explicitly excluded/);
   });
 
-  it("records laptop-b as managed now that it has a verified SSH path (#342)", () => {
+  it("records portable-b as managed now that it has a verified SSH path (#342)", () => {
     // The state change the guard above deliberately no longer encodes.
     // Enrolling was only legitimate BECAUSE the path now exists: a chisel
     // reverse tunnel on port 2228 under pm2, with key auth from the server.
     // #281's invariant — never record a baseline for a host nobody could
     // restore to — is preserved by that fact, not by the host staying marked
     // unmanaged.
-    const target = resolveTarget(targets, "laptop-b");
-    expect(target.sshAlias).toBe("laptop-b");
+    const target = resolveTarget(targets, "portable-b");
+    expect(target.sshAlias).toBe("portable-b");
     expect(target.rolloutEnabled).toBe(true);
     expect(target.unmanagedReason ?? null).toBeNull();
   });
@@ -200,7 +200,7 @@ describe("bridge rollout gating and verification (#241)", () => {
   });
 
   it("dry-run accepts only a fully bound identity response", async () => {
-    const target = resolveTarget(targets, "laptop-a");
+    const target = resolveTarget(targets, "portable-a");
     const fake = vi.fn(async (command: { mutates: boolean }) => { expect(command.mutates).toBe(false); return { stdout: preflightReport(target), stderr: "" }; });
     expect((await runPreflight(target, "fixed-script", fake)).report.pid).toBe("123");
     const mismatch = vi.fn(async () => ({ stdout: "bridge_id=other\npm2_app=seam-bridge\nidentity_bound=yes\n", stderr: "" }));
@@ -237,9 +237,9 @@ describe("bridge rollout gating and verification (#241)", () => {
     const media = configured.targets["workstation"];
     const mapped = validateTargetMap({
       schemaVersion: 3,
-      targets: { "laptop-b": { ...media, sshAlias: "home-bridge" } },
+      targets: { "portable-b": { ...media, sshAlias: "home-bridge" } },
     });
-    const target = resolveTarget(mapped, "laptop-b");
+    const target = resolveTarget(mapped, "portable-b");
     const fake = vi.fn(async (command: { mutates: boolean }) => {
       expect(command.mutates).toBe(false);
       return { stdout: preflightReport(target, { bridge_id: "home-bridge" }), stderr: "" };

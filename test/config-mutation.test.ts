@@ -153,7 +153,7 @@ describe("agent channel restriction mutation (#308)", () => {
     const set = svc.setAgentChannelRestriction({
       agentId: "copilot",
       allowedChannelIds: ["222", "111", "222"],
-      actor: { id: "user-jesse", name: "Jesse" },
+      actor: { id: "user-alex", name: "Alex" },
     });
     expect(set).toMatchObject({ ok: true, rule: { agentId: "copilot", allowedChannelIds: ["222", "111"] } });
     expect(svc.listAgentChannelRestrictions()).toEqual([
@@ -163,8 +163,8 @@ describe("agent channel restriction mutation (#308)", () => {
     expect(audit).toMatchObject({
       tier: "agent-channel-restriction",
       scope: "agent-channel-restriction:copilot",
-      actorId: "user-jesse",
-      actorName: "Jesse",
+      actorId: "user-alex",
+      actorName: "Alex",
     });
     expect(JSON.parse(audit.afterJson)).toEqual({
       restriction: { agentId: "copilot", allowedChannelIds: ["222", "111"] },
@@ -172,7 +172,7 @@ describe("agent channel restriction mutation (#308)", () => {
 
     const clear = svc.clearAgentChannelRestriction({
       agentId: "copilot",
-      actor: { id: "user-jesse", name: "Jesse" },
+      actor: { id: "user-alex", name: "Alex" },
     });
     expect(clear).toMatchObject({ ok: true, cleared: true });
     expect(svc.listAgentChannelRestrictions()).toEqual([]);
@@ -190,7 +190,7 @@ describe("#366 all four configuration proposal doors", () => {
     it.each(passthroughCases)(`${site}: $name`, async fixture => {
       // Channel overlays have no host dimension; the other three use the real
       // failing binding, including an existing raw-string thread location.
-      const location = site === "channelPreset" ? "local" : "macbook-pro";
+      const location = site === "channelPreset" ? "local" : "macos-a";
       const cache = await passthroughCatalog(fixture.warm, location);
       try {
         if (!fixture.warm) expect(cache.generationRows()).toBe(0);
@@ -198,7 +198,7 @@ describe("#366 all four configuration proposal doors", () => {
         store.upsert(record);
         const file = path.join(dir, "presets.json");
         fs.writeFileSync(file, JSON.stringify({ channels: { [record.parentRef!]: { agent: { value: "claude" } } },
-          threads: { [record.channelRef]: { agent: { value: "claude" }, location: "macbook-pro" } } }));
+          threads: { [record.channelRef]: { agent: { value: "claude" }, location: "macos-a" } } }));
         const svc = makeService({ catalog: cache.catalog, presetsFile: file, tierCEnabled: true,
           describe: row => ({ ...describeConfig(row), location: { value: location, source: "thread preset" } }),
         });
@@ -271,7 +271,7 @@ describe("session config mutation (Tier A)", () => {
     expect(built.ok).toBe(true);
     if (!built.ok) return;
 
-    const result = built.proposal.apply({ id: "user-jesse", name: "Jesse" });
+    const result = built.proposal.apply({ id: "user-alex", name: "Alex" });
     expect(result.ok).toBe(true);
 
     const after = store.readConfig(store.get(record.id)!);
@@ -282,8 +282,8 @@ describe("session config mutation (Tier A)", () => {
     expect(audit).toHaveLength(1);
     expect(audit[0]).toMatchObject({
       tier: "session",
-      actorId: "user-jesse",
-      actorName: "Jesse",
+      actorId: "user-alex",
+      actorName: "Alex",
       scope: "thread-1",
     });
     expect(audit[0]!.beforeJson).toContain("gpt-5.4");
@@ -356,7 +356,7 @@ describe("preset mutation (Tier B)", () => {
     // Not created before apply.
     expect(store.getPresetByNameScoped("reviewer", record.parentRef)).toBeNull();
 
-    built.proposal.apply({ id: "user-jesse", name: "Jesse" });
+    built.proposal.apply({ id: "user-alex", name: "Alex" });
     const preset = store.getPresetByNameScoped("reviewer", record.parentRef);
     expect(preset).not.toBeNull();
     expect(preset!.agentId).toBe("claude");
@@ -381,7 +381,7 @@ describe("preset mutation (Tier B)", () => {
     if (!built.ok) return;
     // The diff surfaces the identity change...
     expect(built.proposal.fields.map((f) => f.label)).toContain("instructions");
-    built.proposal.apply({ id: "user-jesse", name: "Jesse" });
+    built.proposal.apply({ id: "user-alex", name: "Alex" });
     // ...and it round-trips onto the stored preset.
     const preset = store.getPresetByNameScoped("reviewer", record.parentRef);
     expect(preset!.instructions).toBe("Be terse and adversarial.");
@@ -446,7 +446,7 @@ describe("preset mutation (Tier B)", () => {
     // Still present before apply (D5).
     expect(store.getPresetByNameScoped("temp", record.parentRef)).not.toBeNull();
 
-    del.proposal.apply({ id: "user-jesse", name: "Jesse" });
+    del.proposal.apply({ id: "user-alex", name: "Alex" });
 
     // Gone.
     expect(store.getPresetByNameScoped("temp", record.parentRef)).toBeNull();
@@ -589,7 +589,7 @@ describe("statusCardStyle channel/thread overlay", () => {
     const result = svc.applyChannelOverlay({
       channelId: CHAN,
       changes: { statusCardStyle: "simple" },
-      actor: { id: "user-jesse", name: "Jesse" },
+      actor: { id: "user-alex", name: "Alex" },
     });
     expect(result.ok).toBe(true);
     if (!result.ok) return;
@@ -618,7 +618,7 @@ describe("statusCardStyle channel/thread overlay", () => {
       threadId: THREAD,
       parentRef: CHAN,
       changes: { statusCardStyle: "full" },
-      actor: { id: "user-jesse", name: "Jesse" },
+      actor: { id: "user-alex", name: "Alex" },
     });
     expect(result.ok).toBe(true);
     if (!result.ok) return;
@@ -642,7 +642,7 @@ describe("statusCardStyle channel/thread overlay", () => {
     const result = svc.applyChannelOverlay({
       channelId: CHAN,
       changes: { role: "analyst" },
-      actor: { id: "user-jesse", name: "Jesse" },
+      actor: { id: "user-alex", name: "Alex" },
     });
     expect(result.ok).toBe(true);
     if (!result.ok) return;
@@ -665,7 +665,7 @@ describe("statusCardStyle channel/thread overlay", () => {
     const result = svc.applyChannelOverlay({
       channelId: CHAN,
       changes: { cwd: "/repo/class" },
-      actor: { id: "user-jesse", name: "Jesse" },
+      actor: { id: "user-alex", name: "Alex" },
     });
     expect(result.ok).toBe(true);
     if (!result.ok) return;
@@ -692,7 +692,7 @@ describe("statusCardStyle channel/thread overlay", () => {
       threadId: THREAD,
       parentRef: CHAN,
       changes: { cwd: "/repo/this-thread" },
-      actor: { id: "user-jesse", name: "Jesse" },
+      actor: { id: "user-alex", name: "Alex" },
     });
     expect(result.ok).toBe(true);
     if (!result.ok) return;
@@ -775,7 +775,7 @@ describe("simpleCardGif channel/thread overlay", () => {
     const result = svc.applyChannelOverlay({
       channelId: CHAN,
       changes: { simpleCardGif: true },
-      actor: { id: "user-jesse", name: "Jesse" },
+      actor: { id: "user-alex", name: "Alex" },
     });
     expect(result.ok).toBe(true);
     if (!result.ok) return;
@@ -804,7 +804,7 @@ describe("simpleCardGif channel/thread overlay", () => {
       threadId: THREAD,
       parentRef: CHAN,
       changes: { simpleCardGif: false },
-      actor: { id: "user-jesse", name: "Jesse" },
+      actor: { id: "user-alex", name: "Alex" },
     });
     expect(result.ok).toBe(true);
     if (!result.ok) return;
@@ -876,7 +876,7 @@ describe("channel-preset mutation (Tier C)", () => {
     const built = svc.buildProposal(record, { channelPreset: { model: "claude-opus-4.8", rider: "stay in your lane" } });
     expect(built.ok).toBe(true);
     if (!built.ok) return;
-    built.proposal.apply({ id: "user-jesse", name: "Jesse" });
+    built.proposal.apply({ id: "user-alex", name: "Alex" });
 
     // The written file round-trips through the exact boot schema.
     const raw = JSON.parse(fs.readFileSync(file, "utf8"));
@@ -975,7 +975,7 @@ describe("thread-preset mutation (Tier C, #68)", () => {
     // Side-effect free until apply (D5): the file is unchanged after buildProposal.
     expect(fs.readFileSync(file, "utf8")).toBe(before);
 
-    built.proposal.apply({ id: "user-jesse", name: "Jesse" });
+    built.proposal.apply({ id: "user-alex", name: "Alex" });
 
     const raw = JSON.parse(fs.readFileSync(file, "utf8"));
     expect(PresetsFileSchema.safeParse(raw).success).toBe(true);
@@ -1080,7 +1080,7 @@ describe("thread-preset mutation (Tier C, #68)", () => {
     expect(built.proposal.fields).toEqual([
       { label: "detached", before: "false", after: "true" },
     ]);
-    built.proposal.apply({ id: "user-jesse", name: "Jesse" });
+    built.proposal.apply({ id: "user-alex", name: "Alex" });
 
     const raw = JSON.parse(fs.readFileSync(file, "utf8"));
     expect(PresetsFileSchema.safeParse(raw).success).toBe(true);
@@ -1115,7 +1115,7 @@ describe("thread-preset mutation (Tier C, #68)", () => {
     if (!built.ok) return;
     expect(built.proposal.restartsSession).toBe(false);
     expect(built.proposal.fields).toEqual([{ label: "tts", before: "false", after: "true" }]);
-    built.proposal.apply({ id: "user-jesse", name: "Jesse" });
+    built.proposal.apply({ id: "user-alex", name: "Alex" });
 
     const raw = JSON.parse(fs.readFileSync(file, "utf8"));
     expect(raw.threads[THREAD].tts).toBe(true);
@@ -1169,7 +1169,7 @@ describe("thread-preset mutation (Tier C, #68)", () => {
       threadId: THREAD,
       parentRef: CHAN,
       detached: true,
-      actor: { id: "user-jesse", name: "Jesse" },
+      actor: { id: "user-alex", name: "Alex" },
     });
     expect(result.ok).toBe(true);
     if (!result.ok) return;
@@ -1203,7 +1203,7 @@ describe("thread-preset mutation (Tier C, #68)", () => {
     expect(built.proposal.fields).toEqual([
       { label: "location", before: "local", after: "mac" },
     ]);
-    built.proposal.apply({ id: "user-jesse", name: "Jesse" });
+    built.proposal.apply({ id: "user-alex", name: "Alex" });
 
     const raw = JSON.parse(fs.readFileSync(file, "utf8"));
     expect(PresetsFileSchema.safeParse(raw).success).toBe(true);
@@ -1244,7 +1244,7 @@ describe("thread-preset mutation (Tier C, #68)", () => {
       threadId: THREAD,
       parentRef: CHAN,
       location: "mac",
-      actor: { id: "user-jesse", name: "Jesse" },
+      actor: { id: "user-alex", name: "Alex" },
     });
     expect(result.ok).toBe(true);
     if (!result.ok) return;
@@ -1275,7 +1275,7 @@ describe("thread-preset mutation (Tier C, #68)", () => {
       threadId: THREAD,
       parentRef: CHAN,
       changes: { agent: "ollama-cloud", model: "kimi-k3:cloud" },
-      actor: { id: "user-jesse", name: "Jesse" },
+      actor: { id: "user-alex", name: "Alex" },
     });
     expect(result.ok).toBe(true);
     if (!result.ok) return;
@@ -1302,7 +1302,7 @@ describe("thread-preset mutation (Tier C, #68)", () => {
       threadId: THREAD,
       parentRef: CHAN,
       changes: { agent: "codex", model: "gpt-5.6-sol" },
-      actor: { id: "user-jesse", name: "Jesse" },
+      actor: { id: "user-alex", name: "Alex" },
     });
     expect(result.ok).toBe(false);
     if (result.ok) return;
@@ -1336,7 +1336,7 @@ describe("scheduled-prompt mutation (Tier D)", () => {
       catchupSeconds: 7200,
       enabled: true,
       legacyAttachmentCount: 0,
-      createdBy: "user-jesse",
+      createdBy: "user-alex",
       createdUtc: "2026-01-01T00:00:00Z",
       updatedUtc: "2026-01-01T00:00:00Z",
       lastRunUtc: null,
@@ -1372,7 +1372,7 @@ describe("scheduled-prompt mutation (Tier D)", () => {
     expect(store.listScheduledByChannel("discord", "thread-1")).toHaveLength(0);
     expect(rescheduled).toHaveLength(0);
 
-    built.proposal.apply({ id: "user-jesse", name: "Jesse" });
+    built.proposal.apply({ id: "user-alex", name: "Alex" });
 
     const rows = store.listScheduledByChannel("discord", "thread-1");
     expect(rows).toHaveLength(1);
@@ -1421,7 +1421,7 @@ describe("scheduled-prompt mutation (Tier D)", () => {
     });
     expect(built.ok).toBe(true);
     if (!built.ok) return;
-    built.proposal.apply({ id: "user-jesse", name: "Jesse" });
+    built.proposal.apply({ id: "user-alex", name: "Alex" });
 
     const row = store.getScheduled(seed.id)!;
     expect(row.cron).toBe("0 9 * * 1-5");
@@ -1439,7 +1439,7 @@ describe("scheduled-prompt mutation (Tier D)", () => {
     const built = svc.buildProposal(record, { schedule: { action: "enable", id: seed.id } });
     expect(built.ok).toBe(true);
     if (!built.ok) return;
-    built.proposal.apply({ id: "user-jesse", name: "Jesse" });
+    built.proposal.apply({ id: "user-alex", name: "Alex" });
 
     expect(store.getScheduled(seed.id)!.enabled).toBe(true);
     expect(rescheduled).toEqual([seed.id]);
@@ -1458,7 +1458,7 @@ describe("scheduled-prompt mutation (Tier D)", () => {
     const built = svc.buildProposal(record, { schedule: { action: "delete", id: seed.id } });
     expect(built.ok).toBe(true);
     if (!built.ok) return;
-    built.proposal.apply({ id: "user-jesse", name: "Jesse" });
+    built.proposal.apply({ id: "user-alex", name: "Alex" });
 
     expect(store.getScheduled(seed.id)).toBeNull();
     expect(rescheduled).toEqual([seed.id]); // reschedule with row gone → disarm
@@ -1497,7 +1497,7 @@ describe("scheduled-prompt mutation (Tier D)", () => {
     expect(built.ok).toBe(true);
     if (!built.ok) return;
     expect(built.proposal.warnings.some((w) => w.includes("Live mode ignores"))).toBe(true);
-    built.proposal.apply({ id: "user-jesse", name: "Jesse" });
+    built.proposal.apply({ id: "user-alex", name: "Alex" });
     const row = store.listScheduledByChannel("discord", "thread-1")[0]!;
     expect(row.sessionMode).toBe("live");
     expect(row.model).toBeNull();

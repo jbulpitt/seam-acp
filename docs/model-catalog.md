@@ -488,7 +488,7 @@ A local observation is marked retired only when the server's authoritative
 configured-profile list no longer contains that adapter. It is excluded from
 refresh and fleet selection, retained for audit, and reported to the cache-only
 fleet view as `retired`. Remote observations are never retired from local
-absence or age: an offline laptop may legitimately be gone for days, and its
+absence or age: an offline host may legitimately be gone for days, and its
 durable fleet evidence remains available when it returns.
 A binding
 with no valid generation reports `warming`; selection fails closed. Runtime ACP

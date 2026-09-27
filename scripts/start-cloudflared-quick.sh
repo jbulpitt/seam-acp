@@ -5,7 +5,8 @@
 # publish it to the discovery gist.
 set -euo pipefail
 
-DATA_DIR="${DATA_DIR:-/home/ubuntu/Projects/seam-acp/data}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+DATA_DIR="${DATA_DIR:-$SCRIPT_DIR/../data}"
 mkdir -p "$DATA_DIR"
 URL_FILE="$DATA_DIR/tunnel-url.txt"
 

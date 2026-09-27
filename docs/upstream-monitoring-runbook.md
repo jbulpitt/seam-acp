@@ -812,7 +812,7 @@ This runbook must evolve as the ecosystem changes. Here's how to keep it current
 - **New analysis question**: If a monitoring sweep reveals a new class of concern, add it to §4.
 - **New reaction pattern**: If you handle an upstream change in a novel way, codify it in §5.
 - **Structural changes to seam-acp**: If key files are renamed, moved, or the architecture changes, update the "integration points" in §1 and file references in §4.
-- **New platform adapter**: When Slack, Google Chat, or MS Teams adapters are added (see `docs/integration-*.md` plans), add their sources and integration points.
+- **New platform adapter**: When a platform adapter is added, add its sources and integration points. Historical integration plans may live in private `docs/local/` operator notes.
 - **After every monitoring sweep**: If any checklist items were confusing, incomplete, or missing, update the checklist.
 
 ### How to update

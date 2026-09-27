@@ -38,7 +38,7 @@ function userMsg(over: Partial<IncomingMessage> = {}): IncomingMessage {
   return {
     channel: { platform: "discord", id: "thread-1", parentId: "channel-1" },
     authorId: "user-1",
-    authorName: "Jesse",
+    authorName: "Alex",
     authorIsBot: false,
     text: "please keep going when you're back",
     raw: { id: "discord-msg" },
@@ -369,7 +369,7 @@ describe("park while remote bridge offline (#88)", () => {
   });
 
   it("fire enqueues a live parked dispatch on the same host after writeAttachment", async () => {
-    const rpc = vi.fn(async () => ({ path: "/Users/jesse/proj/.seam-attachments/note.txt" }));
+    const rpc = vi.fn(async () => ({ path: "/Users/alex/proj/.seam-attachments/note.txt" }));
     const { orch } = makeOrch({ ready: true, rpc });
     const parkedDir = path.join(dir, "parked-attachments", "park-fire");
     fs.mkdirSync(parkedDir, { recursive: true });
@@ -383,7 +383,7 @@ describe("park while remote bridge offline (#88)", () => {
       kind: "bridge_offline",
       prompt: "use the note",
       authorId: "u",
-      authorName: "Jesse",
+      authorName: "Alex",
       noticeMessageId: "notice-1",
       attachments: [{ filename: "note.txt", mime: "text/plain", size: 2 }],
       createdUtc: new Date().toISOString(),
@@ -403,7 +403,7 @@ describe("park while remote bridge offline (#88)", () => {
     expect(spec.session).toBe("live");
     expect(spec.location).toBe("mac");
     expect(spec.prompt).toContain("use the note");
-    expect(spec.prompt).toContain("/Users/jesse/proj/.seam-attachments/note.txt");
+    expect(spec.prompt).toContain("/Users/alex/proj/.seam-attachments/note.txt");
   });
 
   it("manager + ready event fires the parked row", async () => {
@@ -469,7 +469,7 @@ function queueIx(prompt: string, over: Record<string, unknown> = {}) {
     },
     channelId: "thread-1",
     channel: { parentId: "channel-1" },
-    user: { id: "user-1", username: "Jesse", globalName: null },
+    user: { id: "user-1", username: "Alex", globalName: null },
     ...over,
   };
   return {
@@ -489,7 +489,7 @@ function insertBufferedVoice(): void {
     guildId: "guild-1",
     voiceChannelId: "vc-1",
     ownerUserId: "user-1",
-    ownerName: "Jesse",
+    ownerName: "Alex",
     status: "ready",
     noticeMessageId: null,
     transmittedAudioMs: 0,
@@ -609,7 +609,7 @@ describe("/seam queue (#89)", () => {
         guildId: "guild-1",
         voiceChannelId: "vc-1",
         ownerUserId: "user-1",
-        ownerName: "Jesse",
+        ownerName: "Alex",
         status: "ready",
         noticeMessageId: null,
         transmittedAudioMs: 0,

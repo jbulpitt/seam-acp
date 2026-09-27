@@ -245,8 +245,7 @@ A pm2 host has three, and until now nothing compared them:
 
 a canary host had its pins in **live only**: absent from the file, absent from a
 dump stale since Aug 30. It worked, reported `immutable-path`, and no file on
-the host explained how — one reboot from silently losing agy on an agy-only
-laptop.
+the host explained how — one reboot from silently losing agy on a single-agent host.
 
 The dump is read as JSON through the same frozen read calls, never by shelling
 out to `pm2`: that binary is not on a non-interactive `PATH` on affected macOS hosts, which is #390's sixth failure and bit twice while this was being built.

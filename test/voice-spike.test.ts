@@ -34,7 +34,7 @@ describe("live-help voice spike allowlist", () => {
   it("refuses school-named channels even if the id matched", () => {
     const r = checkSpikeVoiceChannel({
       id: LIVE_HELP_SPIKE_VOICE_CHANNEL_ID,
-      name: "school-allie",
+      name: "school-taylor",
       type: ChannelType.GuildVoice,
     });
     expect(r.ok).toBe(false);
@@ -46,7 +46,7 @@ describe("live-help voice spike allowlist", () => {
       id: LIVE_HELP_SPIKE_VOICE_CHANNEL_ID,
       name: "General",
       type: ChannelType.GuildVoice,
-      parentName: "school-alaina",
+      parentName: "school-morgan",
     });
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.reason).toMatch(/school-named parent/);

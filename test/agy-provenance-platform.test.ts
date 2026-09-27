@@ -11,7 +11,7 @@ import {
 import { loadHostAdapters } from "../packages/bridge/src/inventory.js";
 
 /**
- * #330. Two failures, one of which took a laptop offline.
+ * #330. Two failures, one of which took a portable-host offline.
  *
  * 1. macOS cannot exec a code-signed Mach-O through `/dev/fd/N`, so the
  *    descriptor-bound provenance route was Linux-only in practice even though

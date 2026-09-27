@@ -97,7 +97,7 @@ describe("#580 operator session replacement", () => {
       operatorIntent: "replace-session",
     });
 
-    // Removing the explicit intent settlement revives Jesse's reset dispatch at every boot.
+    // Removing the explicit intent settlement revives Alex's reset dispatch at every boot.
     expect(store.turnAttempts.get("old-bound")).toMatchObject({
       state: "cancelled",
       outcome: {

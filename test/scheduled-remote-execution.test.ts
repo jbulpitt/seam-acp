@@ -189,7 +189,7 @@ describe("#487 production remote construction paths", () => {
     h.onPrompt.mockImplementation(async () => {
       const child = h.calls.children[0];
       child.remoteExit = {
-        bridgeId: "fhr-server",
+        bridgeId: "remote-a",
         hostOom: { kind: "host_oom", killedPid: 221249, observedAt: 1_790_033_574_259, scope: "global" },
       };
       child.exitCode = 1;
@@ -199,7 +199,7 @@ describe("#487 production remote construction paths", () => {
     });
     await h.make().runScheduledPrompt(h.row.id);
     expect(h.calls.prompts).toHaveLength(1);
-    expect(h.store.getScheduled(h.row.id)?.lastStatus).toContain("memory exhaustion on host 'fhr-server'");
+    expect(h.store.getScheduled(h.row.id)?.lastStatus).toContain("memory exhaustion on host 'remote-a'");
     expect(h.logs).toContainEqual(expect.objectContaining({
       msg: "adapter error classified",
       errorKind: "host_oom",
@@ -218,7 +218,7 @@ describe("#487 production remote construction paths", () => {
     const h = setup();
     h.onPrompt.mockImplementation(async () => {
       const child = h.calls.children[0];
-      child.remoteExit = { bridgeId: "fhr-server" };
+      child.remoteExit = { bridgeId: "remote-a" };
       child.killed = true;
       child.exitCode = 1;
       child.emit("exit", 1, null);
@@ -226,7 +226,7 @@ describe("#487 production remote construction paths", () => {
     });
     await h.make().runScheduledPrompt(h.row.id);
     expect(h.store.getScheduled(h.row.id)?.lastStatus).toContain(
-      "remote agent supervisor exited mid-turn on host 'fhr-server' (code=1, signal=null)"
+      "remote agent supervisor exited mid-turn on host 'remote-a' (code=1, signal=null)"
     );
     expect(h.store.getScheduled(h.row.id)?.lastStatus).not.toContain("memory exhaustion");
     expect(h.logs).toContainEqual(expect.objectContaining({

@@ -41,7 +41,7 @@ describe("unpinned AGY", () => {
   it("publishes an inventory the controller's hello guard accepts", () => {
     // The gap that shipped #510: the bridge loaded unpinned happily and the
     // controller then refused the hello, which drops EVERY agent on that
-    // bridge, not just agy. Observed live on allie-laptop. Nothing exercised
+    // bridge, not just agy. Observed live on portable-c. Nothing exercised
     // the descriptor across that boundary, so assert the round trip here.
     const { dir, executable } = installAgy("#!/bin/sh\necho 1.2.2\n");
     const runtime = makeAgyUnpinnedRuntime({

@@ -36,7 +36,7 @@ const startRequest = {
   parentRef: "channel-1",
   guildId: "guild-1",
   ownerUserId: "user-1",
-  ownerName: "Jesse",
+  ownerName: "Alex",
 };
 
 function durableSession(over: Partial<ThreadVoiceSession> = {}): ThreadVoiceSession {

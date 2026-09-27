@@ -22,7 +22,7 @@ function session(over: Partial<ThreadVoiceSession> = {}): ThreadVoiceSession {
     guildId: "guild-1",
     voiceChannelId: "vc-1",
     ownerUserId: "user-1",
-    ownerName: "Jesse",
+    ownerName: "Alex",
     status: "ready",
     noticeMessageId: null,
     transmittedAudioMs: 0,

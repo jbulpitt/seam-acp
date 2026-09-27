@@ -6,7 +6,7 @@
  *
  * Availability at a location is a separate fact from registration (#474).
  * `AGENT_LOCATION_DENY=copilot@local` withholds that pair from pickers and
- * from spawn; the profile stays registered so `copilot@fhr-server` still
+ * from spawn; the profile stays registered so `copilot@remote-host` still
  * resolves. Same contract as `retired-agents.ts`: fail clearly, never
  * silently substitute. Adjacent to #468, which asks the same question from
  * the other end of the wire (does this bridge hold the adapter?).
@@ -187,7 +187,7 @@ export function parseDispatchWorker(worker: string): DispatchWorkerTarget {
  * Host-scoped availability (#474).
  *
  * Registration and availability are different facts. `COPILOT_ENABLED=false`
- * removes the profile everywhere, including `copilot@fhr-server`. A deny list
+ * removes the profile everywhere, including `copilot@remote-host`. A deny list
  * withholds one `agentId@location` while the profile stays registered.
  *
  * #468 (bridge) asks "does this host hold this adapter?" and refuses a stated

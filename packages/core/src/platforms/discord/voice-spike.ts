@@ -1,6 +1,6 @@
 /**
  * Live-help spike (docs/agent-guides/live-help.md).
- * Hard-allowlists Jesse's General VC in this guild. Never school channels.
+ * Restricts the diagnostic to one operator-configured voice channel.
  */
 import { spawn } from "node:child_process";
 import { existsSync, unlinkSync, writeFileSync } from "node:fs";
@@ -32,8 +32,9 @@ import { liveAudioRoundTrip } from "../../core/audio/gemini-live-spike.js";
 import { encodePcmToOggOpus } from "../../core/audio/pcm-to-opus.js";
 import { isObfuscatedChannel, visibleDiscordChannelName } from "./channel-visibility.js";
 
-/** Family-guild General voice. Confirmed GUILD_VOICE, parent "Voice Channels". */
-export const LIVE_HELP_SPIKE_VOICE_CHANNEL_ID = "1487095870188027987";
+/** Diagnostic voice channel. An unset value disables the spike on real guilds. */
+export const LIVE_HELP_SPIKE_VOICE_CHANNEL_ID =
+  process.env.SEAM_LIVE_HELP_SPIKE_VOICE_CHANNEL_ID?.trim() || "000000000000000000";
 
 export const SPIKE_OGG_RELATIVE = "data/tts-voice-samples/Kore.ogg";
 

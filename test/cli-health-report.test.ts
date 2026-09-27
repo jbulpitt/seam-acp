@@ -32,7 +32,7 @@ const evidence = (version: string, sha: string, verdict = "pass") => ({
 });
 const release = { status: "observed", latest: "1.0.40" };
 const record = (management = "reachable", preflight = "passed") => ({
-  releases: { grok: release }, hosts: [{ host: "laptop", management, preflight, bridge: "observed-connected", inventory: null }], canary: null,
+  releases: { grok: release }, hosts: [{ host: "portable-host", management, preflight, bridge: "observed-connected", inventory: null }], canary: null,
 });
 
 describe("nightly release/drift report (#504)", () => {
@@ -97,14 +97,14 @@ describe("nightly release/drift report (#504)", () => {
 
   // Necessity: #550 separates serving presence from SSH access; stale cache cannot assert up.
   it("keeps presence, SSH refusal, sleeping and exclusion distinct", async () => {
-    const cache = { lastSeen: { laptop: { agents: [] } } };
-    expect(bridgeObservation(cache, 1000, "laptop", 1001)).toBe("observed-connected");
-    expect(bridgeObservation(cache, 1000, "laptop", 200000)).toBe("unknown");
-    expect(bridgeObservation({ lastSeen: { laptop: { agents: [], offlineSince: 1 } } }, 1000, "laptop", 1001)).toBe("observed-disconnected");
+    const cache = { lastSeen: { "portable-host": { agents: [] } } };
+    expect(bridgeObservation(cache, 1000, "portable-host", 1001)).toBe("observed-connected");
+    expect(bridgeObservation(cache, 1000, "portable-host", 200000)).toBe("unknown");
+    expect(bridgeObservation({ lastSeen: { "portable-host": { agents: [], offlineSince: 1 } } }, 1000, "portable-host", 1001)).toBe("observed-disconnected");
     const targets = validateTargetMap(JSON.parse(await fs.readFile(path.join(root, "ops/bridge/targets.example.json"), "utf8")));
     const run = vi.fn(async (_command: any) => { throw new Error("channel 0: open failed: connect failed: Connection refused secret/path"); });
-    expect(await inspectTarget(targets.get("laptop-a"), {}, run)).toMatchObject({ management: "tunnel-forward-refused", preflight: "unchecked" });
-    expect(await inspectTarget(targets.get("excluded-laptop-c"), {}, run)).toMatchObject({ management: "excluded", preflight: "unchecked" });
+    expect(await inspectTarget(targets.get("portable-a"), {}, run)).toMatchObject({ management: "tunnel-forward-refused", preflight: "unchecked" });
+    expect(await inspectTarget(targets.get("excluded-portable-c"), {}, run)).toMatchObject({ management: "excluded", preflight: "unchecked" });
     expect(run).toHaveBeenCalledTimes(1);
     expect(run.mock.calls[0]![0].args).toContain("StrictHostKeyChecking=yes");
   });
@@ -113,9 +113,9 @@ describe("nightly release/drift report (#504)", () => {
   it("uses the existing preflight evaluator and inventories even after refusal", async () => {
     const targets = validateTargetMap(JSON.parse(await fs.readFile(path.join(root, "ops/bridge/targets.example.json"), "utf8")));
     const run = vi.fn(async (command: { input?: string }) => ({ stdout: command.input === "preflight"
-      ? `bridge_id=laptop-a\nidentity_bound=yes\nnode_version=v22.22.2\nnative_install_ready=no\n`
+      ? `bridge_id=portable-a\nidentity_bound=yes\nnode_version=v22.22.2\nnative_install_ready=no\n`
       : command.input === "observe" ? JSON.stringify({ schemaVersion: 1, artifacts: [], defaultNode: { version: "24.15.0", floating: true } }) : "" }));
-    const found = await inspectTarget(targets.get("laptop-a"), { preflight: "preflight", observe: "observe" }, run);
+    const found = await inspectTarget(targets.get("portable-a"), { preflight: "preflight", observe: "observe" }, run);
     expect(found.preflight).toBe("refused-by-existing-preflight");
     expect(found.serviceNode).toBe("22.22.2");
     expect(found.preflightFindings[0].code).toBe("native_prebuild_unavailable");
@@ -126,10 +126,10 @@ describe("nightly release/drift report (#504)", () => {
   // Necessity: one missing mapping must not shrink coverage or block otherwise observable hosts.
   it("walks union coverage with narrow divergence and local unknowns", async () => {
     const configured = JSON.parse(await fs.readFile(path.join(root, "ops/bridge/targets.example.json"), "utf8"));
-    configured.targets["laptop-a"].nodePath = "unsafe";
+    configured.targets["portable-a"].nodePath = "unsafe";
     const validated = reportTargets(configured);
-    expect(validated.get("laptop-a")).toBeNull();
-    expect(validated.get("laptop-b").nodePath).toMatch(/^\//);
+    expect(validated.get("portable-a")).toBeNull();
+    expect(validated.get("portable-b").nodePath).toMatch(/^\//);
     const inspect = vi.fn(async () => ({ host: "ok", management: "reachable", preflight: "passed" }));
     const result = await collectReport({ targets: new Map([["ok", {}], ["unregistered", {}]]), registered: new Set(["ok", "missing"]),
       scripts: {}, cache: {}, cacheMtime: 0, local: {}, canary: null },
@@ -142,12 +142,12 @@ describe("nightly release/drift report (#504)", () => {
 
   // Necessity: an unreadable fleet file must not suppress independent discovery or invent fleet coverage.
   it("keeps release observations when coverage configuration cannot be read", async () => {
-    const config = reportConfiguration(null, { bridges: { laptop: {} } });
+    const config = reportConfiguration(null, { bridges: { "portable-host": {} } });
     expect(config.issues).toEqual(["target-map-unreadable"]);
     const found = await collectReport({ ...config, scripts: {}, cache: {}, cacheMtime: 0, local: {}, canary: null },
       { discover: async () => ({ grok: release }), observe: async () => ({ schemaVersion: 1, artifacts: [] }) });
     expect(found.releases.grok.latest).toBe("1.0.40");
-    expect(found.hosts[0]).toMatchObject({ host: "laptop", management: "unchecked-registry-divergence" });
+    expect(found.hosts[0]).toMatchObject({ host: "portable-host", management: "unchecked-registry-divergence" });
     expect(renderDay("2026-09-22", [{ ...found, coverageIssues: config.issues }])).toContain("Fleet coverage unknown: target-map-unreadable");
   });
 
@@ -219,7 +219,7 @@ describe("nightly release/drift report (#504)", () => {
     expect(service).toContain("node scripts/cli-health-report.mjs");
     expect(service).not.toMatch(/ExecStart=.*(?:redeploy|rollout|update)/);
     expect(timer).toContain("Persistent=false");
-    expect(timer).toContain("03:00:00 America/Chicago");
+    expect(timer).toContain("OnCalendar=daily");
   });
 
   // Necessity: pure helpers alone cannot prove the scheduled entry point actually persists discovery.

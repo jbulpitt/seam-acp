@@ -266,32 +266,32 @@ describe("renderServerStatusPanel", () => {
 
   it("keeps a reported release while offline and replaces it when a hello omits one", () => {
     const sha = "a".repeat(40);
-    const up = [{ id: "macbook-pro", connected: true, agents: [], releaseSha: sha }];
+    const up = [{ id: "macos-a", connected: true, agents: [], releaseSha: sha }];
     const memory = rememberBridgeState(up, {}, NOW);
-    expect(observedBridgeRelease(memory["macbook-pro"])).toBe(sha);
-    expect(bridgeHasRelease(memory["macbook-pro"], sha)).toBe("yes");
-    expect(bridgeHasRelease(memory["macbook-pro"], "b".repeat(40))).toBe("no");
+    expect(observedBridgeRelease(memory["macos-a"])).toBe(sha);
+    expect(bridgeHasRelease(memory["macos-a"], sha)).toBe("yes");
+    expect(bridgeHasRelease(memory["macos-a"], "b".repeat(40))).toBe("no");
 
-    const down = [{ id: "macbook-pro", connected: false, agents: [] as { id: string }[] }];
+    const down = [{ id: "macos-a", connected: false, agents: [] as { id: string }[] }];
     const offline = rememberBridgeState(down, memory, NOW + 1_000);
-    expect(offline["macbook-pro"]?.releaseSha).toBe(sha);
-    expect(bridgeHasRelease(offline["macbook-pro"], sha)).toBe("yes");
+    expect(offline["macos-a"]?.releaseSha).toBe(sha);
+    expect(bridgeHasRelease(offline["macos-a"], sha)).toBe("yes");
 
-    const older = [{ id: "macbook-pro", connected: true, agents: [], releaseSha: null }];
+    const older = [{ id: "macos-a", connected: true, agents: [], releaseSha: null }];
     const replaced = rememberBridgeState(older, offline, NOW + 2_000);
-    expect(replaced["macbook-pro"]?.releaseSha).toBeNull();
-    expect(observedBridgeRelease(replaced["macbook-pro"])).toBe("unknown");
-    expect(bridgeHasRelease(replaced["macbook-pro"], sha)).toBe("unknown");
+    expect(replaced["macos-a"]?.releaseSha).toBeNull();
+    expect(observedBridgeRelease(replaced["macos-a"])).toBe("unknown");
+    expect(bridgeHasRelease(replaced["macos-a"], sha)).toBe("unknown");
   });
 
   it("does not invent a release for a bridge that has never sent one", () => {
     const memory = rememberBridgeState(
-      [{ id: "home-hub", connected: false, agents: [] }],
+      [{ id: "remote-c", connected: false, agents: [] }],
       {},
       NOW,
     );
-    expect(observedBridgeRelease(memory["home-hub"])).toBe("unknown");
-    expect(bridgeHasRelease(memory["home-hub"], "a".repeat(40))).toBe("unknown");
+    expect(observedBridgeRelease(memory["remote-c"])).toBe("unknown");
+    expect(bridgeHasRelease(memory["remote-c"], "a".repeat(40))).toBe("unknown");
   });
 
   it("marks a draining restart", () => {

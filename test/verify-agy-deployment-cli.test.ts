@@ -104,7 +104,7 @@ describe("#397 the exit-code contract, from a real node process", () => {
    * reaches a fully-passing state for every check a fixture is able to set up,
    * and that the only failure is the one the environment makes inevitable.
    * Exit 0 itself is covered by running the built tool on the real fleet, where
-   * laptop-b, laptop-a and home-bridge return it — see the PR.
+   * portable-b, portable-a and home-bridge return it — see the PR.
    */
   it("passes every check a fixture can control, failing only on ancestors it cannot", () => {
     const { pinsFile, runtimeParent } = fixture({ correct: true });
@@ -152,15 +152,15 @@ describe("#397 the exit-code contract, from a real node process", () => {
     }));
     const result = run([
       "--pins-file", path.join(dir, "missing.cjs"),
-      "--host", "excluded-laptop-a",
+      "--host", "excluded-portable-a",
       "--fleet-targets", targets,
       "--bridge-registry", registry,
     ]);
     expect(result.code).toBe(3);
     expect(result.stdout).toContain("fleet_registered=10");
     expect(result.stdout).toContain("fleet_rollout_managed=7 of 10");
-    expect(result.stdout).toContain("operation_scope=1 of 10 registered hosts: excluded-laptop-a");
-    expect(result.stdout).toContain("fleet_excluded=excluded-laptop-a: no verified privileged management path for this host");
+    expect(result.stdout).toContain("operation_scope=1 of 10 registered hosts: excluded-portable-a");
+    expect(result.stdout).toContain("fleet_excluded=excluded-portable-a: no verified privileged management path for this host");
   });
 
   it("refuses a partial fleet scope instead of implying completeness", () => {

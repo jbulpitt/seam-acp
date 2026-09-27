@@ -7,7 +7,7 @@ export interface WarmSetHostOpt {
 
 /**
  * Parse `WARM_SET_HOSTS`. Empty = opt-out (nobody is warmed).
- * `fhr-server,rhc-server=10000` — bare ids use measured host defaults.
+ * `worker-a,worker-b=10000` — bare ids use the conservative default budget.
  */
 export function parseWarmSetHosts(raw: string): WarmSetHostOpt[] {
   const out: WarmSetHostOpt[] = [];

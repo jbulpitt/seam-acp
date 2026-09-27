@@ -9,8 +9,8 @@ import {
 } from "../packages/bridge/src/oom-evidence.js";
 
 const KERNEL_SAMPLE = [
-  "1790033574.259647 fhr-server kernel: oom-kill:constraint=CONSTRAINT_NONE,nodemask=(null),cpuset=/,mems_allowed=0,global_oom,task_memcg=/system.slice/seam-bridge.service,task=node,pid=221249,uid=1000",
-  "1790033574.260775 fhr-server kernel: Out of memory: Killed process 221249 (node) total-vm:2233508kB, anon-rss:619500kB, oom_score_adj:300",
+  "1790033574.259647 remote-a kernel: oom-kill:constraint=CONSTRAINT_NONE,nodemask=(null),cpuset=/,mems_allowed=0,global_oom,task_memcg=/system.slice/seam-bridge.service,task=node,pid=221249,uid=1000",
+  "1790033574.260775 remote-a kernel: Out of memory: Killed process 221249 (node) total-vm:2233508kB, anon-rss:619500kB, oom_score_adj:300",
 ].join("\n");
 
 describe("#516 bridge-owned kernel OOM evidence", () => {

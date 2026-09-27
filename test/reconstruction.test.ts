@@ -29,7 +29,7 @@ function post(
     messageId: id,
     timestampMs: 1_700_000_000_000 + Number(id) * 1000,
     authorId: over.authorType === "bot" ? (over.authorId ?? SEAM) : (over.authorId ?? "human-1"),
-    authorName: over.authorName ?? (over.authorType === "bot" ? "Seam" : "Jesse"),
+    authorName: over.authorName ?? (over.authorType === "bot" ? "Seam" : "Alex"),
     authorType: over.authorType,
     content: over.content,
     attachmentNames: over.attachmentNames ?? [],
@@ -47,7 +47,7 @@ function msg(
     id,
     sourcePostIds: [id],
     role,
-    authorName: role === "user" ? "Jesse" : "Seam",
+    authorName: role === "user" ? "Alex" : "Seam",
     timestampMs: 1_700_000_000_000 + Number(id.replace(/\D/g, "") || 0) * 1000,
     text,
   };
@@ -249,7 +249,7 @@ describe("opening block", () => {
       "```ts",
       "const id = 'abc-123';",
       "```",
-      "path: /home/ubuntu/Projects/seam-acp/src/index.ts",
+      "path: /home/operator/Projects/seam-acp/src/index.ts",
     ].join("\n"));
     const opening = selectOpeningExchanges([special, msg("2", "assistant", "ok")]);
     expect(opening[0]?.text).toBe(special.text);
@@ -439,13 +439,13 @@ describe("conservative normalization", () => {
 
   it("substitutes repeated absolute-path prefixes with an in-band legend", () => {
     const text = [
-      "/home/ubuntu/Projects/seam-acp/src/a.ts",
-      "/home/ubuntu/Projects/seam-acp/src/b.ts",
-      "/home/ubuntu/Projects/seam-acp/src/c.ts",
+      "/home/operator/Projects/seam-acp/src/a.ts",
+      "/home/operator/Projects/seam-acp/src/b.ts",
+      "/home/operator/Projects/seam-acp/src/c.ts",
     ].join("\n");
     const once = normalizeReconstructionMessage(text);
     expect(once.text).toContain("Path aliases used in this message:");
-    expect(once.text).toContain("$P0 = /home/ubuntu/Projects/seam-acp");
+    expect(once.text).toContain("$P0 = /home/operator/Projects/seam-acp");
     expect(once.text).toContain("$P0/src/a.ts");
     const twice = normalizeReconstructionMessage(once.text);
     expect(twice.text).toBe(once.text);
@@ -528,9 +528,9 @@ describe("golden corpus hashes", () => {
       retainedLogicalCount: 41,
       omittedLogicalCount: 39,
       omittedRawPostCount: 39,
-      estimatedTokens: 1166,
+      estimatedTokens: 1161,
       transformSavedTokens: 13,
-      hash: "7620cc4f1fa2f9dfbf5d7f957a8bc5f0248b191528c354d2f3b8bed67dbfa925",
+      hash: "d2e407d7edc2b03c7ff869756e5171fa9ae615d1b8f75bfdf5375bce5c81a6c8",
     });
     expect(createHash("sha256").update(again.text).digest("hex")).toBe(hash);
   });
@@ -538,7 +538,7 @@ describe("golden corpus hashes", () => {
 
 describe("render headings", () => {
   it("uses Human — name and Assistant — Seam", () => {
-    expect(renderLogicalMessage(msg("1", "user", "hi"))).toBe("Human — Jesse\n\nhi");
+    expect(renderLogicalMessage(msg("1", "user", "hi"))).toBe("Human — Alex\n\nhi");
     expect(renderLogicalMessage(msg("2", "assistant", "yo"))).toBe("Assistant — Seam\n\nyo");
   });
 });

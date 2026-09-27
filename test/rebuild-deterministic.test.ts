@@ -28,7 +28,7 @@ function post(id: string, content: string, over: Partial<MessagePageItem> = {}):
     messageId: id,
     timestampMs: 1_700_000_000_000 + Number(id) * 1000,
     authorId: over.authorType === "bot" ? (over.authorId ?? SEAM) : "human-1",
-    authorName: over.authorName ?? (over.authorType === "bot" ? "Seam" : "Jesse"),
+    authorName: over.authorName ?? (over.authorType === "bot" ? "Seam" : "Alex"),
     authorType: over.authorType ?? "human",
     content,
     attachmentNames: over.attachmentNames ?? [],
@@ -254,7 +254,7 @@ describe("reconstructSessionFromDiscord", () => {
     expect(t.seedCalls[0].model).toBe("claude-opus-4.8");
     expect(t.seedCalls[0].leadIn).toBeNull();
     expect(t.seedCalls[0].summary).toContain("deterministic reconstruction");
-    expect(t.seedCalls[0].summary).toContain("Human — Jesse");
+    expect(t.seedCalls[0].summary).toContain("Human — Alex");
     expect(t.seedCalls[0].summary).toContain("Assistant — Seam");
     expect(res.newSessionId).toBe("sess-new");
     expect(t.casCalls).toEqual([{ expected: "acp-active", next: "sess-new", ok: true }]);

@@ -56,7 +56,7 @@ function slashI(over: {
       getBoolean: (_name: string, _req?: boolean) => false,
       getInteger: (_name: string, _req?: boolean) => null,
     },
-    user: { id: over.userId ?? ADMIN, username: "jesse", displayName: "jesse" },
+    user: { id: over.userId ?? ADMIN, username: "alex", displayName: "alex" },
     channelId: over.channelId ?? "chan-1",
     channel: {
       isThread: () => over.isThread === true,
@@ -80,7 +80,7 @@ function componentEvt(customId: string, userId: string) {
     interactionId: `int-${userId}`,
     customId,
     userId,
-    userName: "jesse",
+    userName: "alex",
     channel: { platform: "discord", id: "thread-new", parentId: "chan-1" } as ChannelRef,
     messageId: "panel-1",
     kind: "button" as const,

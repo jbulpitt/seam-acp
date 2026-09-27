@@ -7,7 +7,7 @@
  * there is no descriptor-bound exec (#330). Current Mac staging lives under
  * `$HOME`, which the service user can rename, so it fails that walk by design.
  * Four of the five agy hosts are agy-ONLY, so enforcing before migrating would
- * leave a family laptop advertising nothing.
+ * leave a single-agent host advertising nothing.
  *
  * This exists because that migration is four hosts of the same risky steps, and
  * a half-applied one is worse than not starting: it is the "host with zero
@@ -69,7 +69,7 @@ export class StagingRefusal extends Error {
  * service user write this right now". A directory owned by the service user at
  * mode 0555 passes it, because the owner's write bit is clear. But the owner
  * can `chmod` it back, so it is not a guarantee; that is exactly the
- * `macbook-air` state #342 describes. Only root ownership answers the second
+ * `macos-canary-a` state #342 describes. Only root ownership answers the second
  * question, so that is what this script requires and what it reports on.
  */
 export function inspectComponent(target, opts = {}) {
@@ -108,7 +108,7 @@ export function pathChain(leaf) {
 /**
  * Parse a `KEY=value` environment file into an ordered map, preserving every
  * line so a rewrite is a minimal edit rather than a regeneration. A pins file
- * on a laptop holds more than agy's five keys and none of the rest are ours.
+ * on a portable host holds more than agy's five keys and none of the rest are ours.
  */
 export function parseEnvFile(text) {
   const lines = text.split("\n");
@@ -154,7 +154,7 @@ function readAgyVersion(binary, run) {
  * Prove the staged artifact can start its language server and list models.
  *
  * `agy --version` is deliberately insufficient: agy 1.2.2 reported its
- * version and passed every digest/provenance check on macbook-pro while its
+ * version and passed every digest/provenance check on macos-canary-b while its
  * language server rejected every adapter subscription with `missing CSRF
  * token` (#371). `models` exercises that capability without `-p`, `--prompt`,
  * or any billable turn (#361).
@@ -432,7 +432,7 @@ export async function applyAgyStaging(plan, options = {}) {
       sha256: plan.sha256,
     });
 
-    // Identity and immutability do not imply usability. macbook-pro proved
+    // Identity and immutability do not imply usability. macos-canary-b proved
     // that distinction with a fully verified agy 1.2.2 that could not serve a
     // turn. Keep this inside the same pre-pin transaction boundary so failure
     // refuses only the new artifact and leaves the working host unchanged.

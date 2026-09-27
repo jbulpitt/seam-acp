@@ -19,7 +19,7 @@ function action(prefix: string, detail?: string): string {
  * invocation (#576). The card is only a view: cancellation, suspension and a
  * replacement generation all revoke execution ownership, but none makes the
  * already-posted artifact disappear. Without this mapping the real cancelled
- * attempt inbound-1552209792582418483 remained amber forever.
+ * one inbound attempt remained amber forever.
  *
  * Returning null is deliberately narrow: a missing row or the same active
  * generation has no terminal fact to report. Refuse only that projection; the

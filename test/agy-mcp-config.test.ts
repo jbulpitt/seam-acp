@@ -57,7 +57,7 @@ describe("scrubStaleGlobalSeamStdio", () => {
         mcpServers: {
           seam: {
             command: "node",
-            args: ["/home/ubuntu/Projects/seam-acp/scripts/agy-mcp-server.mjs"],
+            args: ["/home/operator/Projects/seam-acp/scripts/agy-mcp-server.mjs"],
             env: {},
           },
           other: { command: "echo", args: ["ok"] },

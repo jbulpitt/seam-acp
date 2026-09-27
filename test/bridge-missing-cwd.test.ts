@@ -1,8 +1,8 @@
 /**
  * A thread moved to a host that lacks its directory keeps working there, in
  * the host's workspace, and the thread is told once (2026-09-24: thread
- * 1543322695524159598 moved to claude@local; /home/ubuntu/Projects/pronoa
- * exists only on rhc-server, and the start failed).
+ * 1543322695524159598 moved to claude@local; /home/operator/Projects/pronoa
+ * exists only on remote-b, and the start failed).
  */
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";

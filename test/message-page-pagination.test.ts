@@ -46,10 +46,10 @@ function raw(id: number, over: RawOverrides = {}) {
     author: {
       id: over.bot ? "bot-1" : "human-1",
       bot: over.bot ?? false,
-      username: over.bot ? "seam" : "jesse",
-      globalName: over.bot ? "Seam" : "Jesse",
+      username: over.bot ? "seam" : "alex",
+      globalName: over.bot ? "Seam" : "Alex",
     },
-    member: over.bot ? null : { displayName: "Jesse" },
+    member: over.bot ? null : { displayName: "Alex" },
     content: over.content ?? `post ${id}`,
     attachments: { map: <T,>(fn: (a: { name: string }) => T): T[] => [] },
     embeds: over.embeds ?? [],

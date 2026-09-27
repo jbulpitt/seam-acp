@@ -596,7 +596,7 @@ describe("#37 contract 6 — canonical mutation writes an auditable field", () =
       const res = svc.applyThreadOverlay({
         threadId: "123456789012345678",
         changes: { fastMode: true },
-        actor: { id: "u1", name: "jesse" },
+        actor: { id: "u1", name: "alex" },
       });
       expect(res.ok).toBe(true);
       const doc = JSON.parse(fs.readFileSync(file, "utf8"));
@@ -620,7 +620,7 @@ describe("#37 contract 6 — canonical mutation writes an auditable field", () =
       svc.applyThreadOverlay({
         threadId: "123456789012345678",
         changes: { fastMode: false },
-        actor: { id: "u1", name: "jesse" },
+        actor: { id: "u1", name: "alex" },
       });
       const doc = JSON.parse(fs.readFileSync(file, "utf8"));
       expect(doc.threads["123456789012345678"]?.fastMode).toBeUndefined();
@@ -636,7 +636,7 @@ describe("#37 contract 6 — canonical mutation writes an auditable field", () =
       const res = svc.applyThreadOverlay({
         threadId: "123456789012345678",
         changes: { fastMode: false },
-        actor: { id: "u1", name: "jesse" },
+        actor: { id: "u1", name: "alex" },
       });
       expect(res.ok).toBe(true);
       if (res.ok) expect(res.auditId).toBe("");
@@ -1190,7 +1190,7 @@ function saveHarness(opts: {
 
   const evt = {
     userId: "u1",
-    userName: "jesse",
+    userName: "alex",
     channel: { platform: "discord", id: "t1", parentId: "c1" },
     messageId: "m1",
     followUpEphemeral: async (t: string) => { ephemerals.push(t); },

@@ -10,13 +10,13 @@ import type { StructuredPanel } from "../packages/core/src/core/types.js";
 describe("resolveAgentBrand (#96)", () => {
   it("groups copilot* onto copilot", () => {
     expect(resolveAgentBrand("copilot")).toBe("copilot");
-    expect(resolveAgentBrand("copilot-jbulpitt")).toBe("copilot");
+    expect(resolveAgentBrand("copilot-amorgan")).toBe("copilot");
     expect(resolveAgentBrand("copilot-fhr")).toBe("copilot");
   });
 
   it("groups claude and claude-<account> onto claude", () => {
     expect(resolveAgentBrand("claude")).toBe("claude");
-    expect(resolveAgentBrand("claude-jbulpitt")).toBe("claude");
+    expect(resolveAgentBrand("claude-amorgan")).toBe("claude");
   });
 
   it("overrides Claude-harness services to their service brand (before grouping)", () => {

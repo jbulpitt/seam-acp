@@ -73,7 +73,7 @@ async function connectClient(opts: {
   const connecting = GeminiLiveTranscribeClient.connect({
     apiKey: "test-key",
     webSocketFactory: opts.harness.factory,
-    customVocabulary: [" Seam ", "seam", "Allie"],
+    customVocabulary: [" Seam ", "seam", "Taylor"],
     ...(opts.unaryFallback ? { unaryFallback: opts.unaryFallback } : {}),
     ...(opts.handlers ? { handlers: opts.handlers } : {}),
     ...(opts.finalizationTimeoutMs !== undefined
@@ -110,7 +110,7 @@ describe("Gemini Live Transcribe setup", () => {
   it("builds the documented Text, Smart, manual-VAD setup with voice-note vocabulary rules", () => {
     expect(
       buildGeminiLiveTranscribeSetup({
-        customVocabulary: [" Seam ", "seam", "", "Allie"],
+        customVocabulary: [" Seam ", "seam", "", "Taylor"],
       })
     ).toEqual({
       setup: {
@@ -119,7 +119,7 @@ describe("Gemini Live Transcribe setup", () => {
         inputAudioTranscription: {
           languageCodes: [],
           mode: "SMART",
-          customVocabulary: ["Seam", "Allie"],
+          customVocabulary: ["Seam", "Taylor"],
         },
         realtimeInputConfig: {
           automaticActivityDetection: { disabled: true },
@@ -240,7 +240,7 @@ describe("GeminiLiveTranscribeClient", () => {
         apiKey: "test-key",
         model: "gemini-3.5-transcribe",
         pcm16k: callerBuffer,
-        customVocabulary: ["Seam", "Allie"],
+        customVocabulary: ["Seam", "Taylor"],
       });
 
       socket.server({
@@ -376,7 +376,7 @@ describe("GeminiLiveTranscribeClient", () => {
     const connecting = GeminiLiveTranscribeClient.connect({
       apiKey: "test-key",
       unaryModel: "gemini-3.5-transcribe",
-      customVocabulary: [" Seam ", "seam", "Allie"],
+      customVocabulary: [" Seam ", "seam", "Taylor"],
       webSocketFactory: harness.factory,
       fetchFn: (async (input: string | URL | Request, init?: RequestInit) => {
         const request = new Request(input, init);
@@ -418,7 +418,7 @@ describe("GeminiLiveTranscribeClient", () => {
         transcription_config: {
           language_codes: [],
           mode: "smart",
-          custom_vocabulary: ["Seam", "Allie"],
+          custom_vocabulary: ["Seam", "Taylor"],
         },
       },
     });
@@ -442,7 +442,7 @@ describe("GeminiLiveTranscribeClient", () => {
 
     expect(events).toEqual(["go_away", "rotated"]);
     expect(second.sent[0]).toEqual(
-      buildGeminiLiveTranscribeSetup({ customVocabulary: ["Seam", "Allie"] })
+      buildGeminiLiveTranscribeSetup({ customVocabulary: ["Seam", "Taylor"] })
     );
     await client.startUtterance();
     expect(second.sent[1]).toEqual({ realtimeInput: { activityStart: {} } });

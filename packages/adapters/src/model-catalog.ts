@@ -67,7 +67,7 @@ export interface CatalogScope {
    * omitted value and `"binding"` both mean binding-local.
    *
    * This used to read `sharing !== "binding"`, i.e. sharing was inferred from
-   * silence, which is how `macbook-air` on `claude-agent-acp` 0.70.0 came to
+   * silence, which is how `macos-canary-a` on `claude-agent-acp` 0.70.0 came to
    * share a scope with hosts on 0.75.1 and then get quarantined for describing
    * itself accurately.
    */

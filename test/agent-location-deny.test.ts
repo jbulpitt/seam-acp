@@ -2,8 +2,8 @@
  * #474 — host-scoped agent availability.
  *
  * `COPILOT_ENABLED=false` removed the profile everywhere, including the 14
- * FHR threads on `fhr-server`. A deny list withholds `copilot@local` while
- * the profile stays registered so `copilot@fhr-server` still resolves.
+ * FHR threads on `remote-a`. A deny list withholds `copilot@local` while
+ * the profile stays registered so `copilot@remote-a` still resolves.
  *
  * #468 (bridge, Opus) refuses a stated agentId the host does not hold.
  * This is the adjacent controller question: a known agent, a denied
@@ -44,9 +44,9 @@ import type { ThreadPreset } from "../packages/core/src/config.js";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const MAIN_PRESETS = "/home/ubuntu/Projects/seam-acp/data/channel-presets.json";
+const MAIN_PRESETS = "/home/operator/Projects/seam-acp/data/channel-presets.json";
 
-/** Measured 2026-09-20: 15 explicit copilot thread presets, 14 on fhr-server. */
+/** Measured 2026-09-20: 15 explicit copilot thread presets, 14 on remote-a. */
 const FHR_COPILOT_THREADS = [
   "1538909622981627996",
   "1541667810021875843",
@@ -128,9 +128,9 @@ describe("#474 parseAgentLocationDeny", () => {
     expect(parseAgentLocationDeny("copilot@local")).toEqual([
       { agentId: "copilot", location: "local" },
     ]);
-    expect(parseAgentLocationDeny("copilot@local,ollama-cloud@fhr-server")).toEqual([
+    expect(parseAgentLocationDeny("copilot@local,ollama-cloud@remote-a")).toEqual([
       { agentId: "copilot", location: "local" },
-      { agentId: "ollama-cloud", location: "fhr-server" },
+      { agentId: "ollama-cloud", location: "remote-a" },
     ]);
   });
 
@@ -147,8 +147,8 @@ describe("#474 parseAgentLocationDeny", () => {
 describe("#474 picker omits the denied pair and keeps the rest", () => {
   const deny = parseAgentLocationDeny("copilot@local");
   const hosts = listHosts({
-    bridges: [{ id: "fhr-server", tokenHash: "a".repeat(64), shortName: "fhr-server" }],
-    connected: new Set(["local", "fhr-server"]),
+    bridges: [{ id: "remote-a", tokenHash: "a".repeat(64), shortName: "remote-a" }],
+    connected: new Set(["local", "remote-a"]),
   });
   const profiles = [
     { id: "claude", displayName: "Claude" },
@@ -161,27 +161,27 @@ describe("#474 picker omits the denied pair and keeps the rest", () => {
       hosts,
       agentsByHost: new Map([
         ["local", new Set(["claude", "copilot"])],
-        ["fhr-server", new Set(["copilot", "agy"])],
+        ["remote-a", new Set(["copilot", "agy"])],
       ]),
       deny,
     });
     expect(choices.map((c) => c.value)).not.toContain("copilot@local");
-    expect(choices.map((c) => c.value)).toContain("copilot@fhr-server");
+    expect(choices.map((c) => c.value)).toContain("copilot@remote-a");
     expect(choices.map((c) => c.value)).toContain("claude@local");
   });
 
   it("installed deny reaches the orchestrator picker wrapper without an extra arg", () => {
     setAgentLocationDeny(deny);
     const choices = agentLocationPickerChoices(profiles, {
-      bridges: [{ id: "fhr-server", tokenHash: "a".repeat(64), shortName: "fhr-server" }],
-      connected: new Set(["local", "fhr-server"]),
+      bridges: [{ id: "remote-a", tokenHash: "a".repeat(64), shortName: "remote-a" }],
+      connected: new Set(["local", "remote-a"]),
       agentsByHost: new Map([
         ["local", new Set(["claude", "copilot"])],
-        ["fhr-server", new Set(["copilot"])],
+        ["remote-a", new Set(["copilot"])],
       ]),
     });
     expect(choices.map((c) => c.value)).not.toContain("copilot@local");
-    expect(choices.map((c) => c.value)).toContain("copilot@fhr-server");
+    expect(choices.map((c) => c.value)).toContain("copilot@remote-a");
     expect(getAgentLocationDeny()).toEqual(deny);
   });
 });
@@ -193,12 +193,12 @@ describe("#474 bridge-plan refusal — independent of the picker", () => {
     expect(() => assertAgentLocationAllowed("copilot", "local", deny)).toThrow(
       DeniedAgentLocationError,
     );
-    expect(() => assertAgentLocationAllowed("copilot", "fhr-server", deny)).not.toThrow();
-    expect(isAgentLocationDenied("copilot", "fhr-server", deny)).toBe(false);
+    expect(() => assertAgentLocationAllowed("copilot", "remote-a", deny)).not.toThrow();
+    expect(isAgentLocationDenied("copilot", "remote-a", deny)).toBe(false);
   });
 });
 
-describe("#474 SessionRouter: copilot@fhr-server still plans; copilot@local does not", () => {
+describe("#474 SessionRouter: copilot@remote-a still plans; copilot@local does not", () => {
   const deny = parseAgentLocationDeny("copilot@local");
 
   function makeRouter(threadPresets: Map<string, ThreadPreset>, spawnCalls: unknown[]) {
@@ -223,10 +223,10 @@ describe("#474 SessionRouter: copilot@fhr-server still plans; copilot@local does
     return router;
   }
 
-  it("getProfile withholds local and still returns the registered profile for fhr-server", () => {
+  it("getProfile withholds local and still returns the registered profile for remote-a", () => {
     const router = makeRouter(new Map(), []);
     expect(router.getProfile("copilot", "local")).toBeUndefined();
-    expect(router.getProfile("copilot", "fhr-server")?.id).toBe("copilot");
+    expect(router.getProfile("copilot", "remote-a")?.id).toBe("copilot");
     expect(router.getProfile("claude", "local")?.id).toBe("claude");
     expect(router.listProfiles().map((p) => p.id)).toEqual(["copilot", "claude"]);
   });
@@ -244,22 +244,22 @@ describe("#474 SessionRouter: copilot@fhr-server still plans; copilot@local does
     );
   });
 
-  it("planRuntimeSpawn still resolves copilot for an fhr-server thread", () => {
+  it("planRuntimeSpawn still resolves copilot for an remote-a thread", () => {
     const threadPresets = new Map<string, ThreadPreset>([
-      [FHR_COPILOT_THREADS[0], { agent: { value: "copilot" }, location: "fhr-server" }],
+      [FHR_COPILOT_THREADS[0], { agent: { value: "copilot" }, location: "remote-a" }],
     ]);
     const router = makeRouter(threadPresets, []);
     const plan = router.planRuntimeSpawn(
       makeRecord({ channelRef: FHR_COPILOT_THREADS[0], agentId: "copilot" }),
     );
     expect(plan.agentId).toBe("copilot");
-    expect(plan.location).toBe("fhr-server");
+    expect(plan.location).toBe("remote-a");
     expect(plan.profile.id).toBe("copilot");
   });
 
-  it("all 14 measured fhr-server copilot presets still resolve", () => {
+  it("all 14 measured remote-a copilot presets still resolve", () => {
     const threadPresets = new Map<string, ThreadPreset>(
-      FHR_COPILOT_THREADS.map((id) => [id, { agent: { value: "copilot" }, location: "fhr-server" }]),
+      FHR_COPILOT_THREADS.map((id) => [id, { agent: { value: "copilot" }, location: "remote-a" }]),
     );
     const router = makeRouter(threadPresets, []);
     const resolved: string[] = [];
@@ -267,7 +267,7 @@ describe("#474 SessionRouter: copilot@fhr-server still plans; copilot@local does
     for (const id of FHR_COPILOT_THREADS) {
       try {
         const plan = router.planRuntimeSpawn(makeRecord({ channelRef: id, agentId: "copilot" }));
-        if (plan.agentId === "copilot" && plan.location === "fhr-server") resolved.push(id);
+        if (plan.agentId === "copilot" && plan.location === "remote-a") resolved.push(id);
       } catch {
         refused.push(id);
       }
@@ -309,7 +309,7 @@ describe("#474 prove the outcome against real channel-presets.json", () => {
   const deny = parseAgentLocationDeny("copilot@local");
 
   it.skipIf(!fs.existsSync(MAIN_PRESETS))(
-    "live file: 14 fhr-server copilot presets stay allowed; local copilot is denied",
+    "live file: 14 remote-a copilot presets stay allowed; local copilot is denied",
     () => {
     const data = JSON.parse(fs.readFileSync(MAIN_PRESETS, "utf8")) as {
       threads?: Record<string, { agent?: { value?: string }; location?: string }>;
@@ -318,9 +318,9 @@ describe("#474 prove the outcome against real channel-presets.json", () => {
     const explicitCopilot = Object.entries(threads).filter(
       ([, t]) => t.agent?.value === "copilot",
     );
-    const fhr = explicitCopilot.filter(([, t]) => t.location === "fhr-server");
+    const fhr = explicitCopilot.filter(([, t]) => t.location === "remote-a");
     const local = explicitCopilot.filter(([, t]) => !t.location || t.location === "local");
-    expect(fhr.length, "fhr-server copilot presets").toBe(14);
+    expect(fhr.length, "remote-a copilot presets").toBe(14);
     expect(local.length, "local copilot presets").toBe(1);
     for (const [, t] of fhr) {
       expect(isAgentLocationDenied("copilot", t.location, deny)).toBe(false);
@@ -365,19 +365,19 @@ describe("#622 the deny list covers catalog bindings from every source", () => {
       { agentId: "claude", location: "local" },   // local profile list
       { agentId: "copilot", location: "local" },  // durable observation from before the deny
       { agentId: "copilot", location: "local" },  // the local bridge advertising it
-      { agentId: "copilot", location: "fhr-server" },
-      { agentId: "codex", location: "rhc-server" },
+      { agentId: "copilot", location: "remote-a" },
+      { agentId: "codex", location: "remote-b" },
     ];
     expect(withoutDeniedBindings(merged, deny)).toEqual([
       { agentId: "claude", location: "local" },
-      { agentId: "copilot", location: "fhr-server" },
-      { agentId: "codex", location: "rhc-server" },
+      { agentId: "copilot", location: "remote-a" },
+      { agentId: "codex", location: "remote-b" },
     ]);
   });
 
   it("is host-scoped: the same agent elsewhere keeps its catalog", () => {
-    const kept = withoutDeniedBindings([{ agentId: "copilot", location: "fhr-server" }], deny);
-    expect(kept).toEqual([{ agentId: "copilot", location: "fhr-server" }]);
+    const kept = withoutDeniedBindings([{ agentId: "copilot", location: "remote-a" }], deny);
+    expect(kept).toEqual([{ agentId: "copilot", location: "remote-a" }]);
   });
 
   it("changes nothing when nobody is denied", () => {

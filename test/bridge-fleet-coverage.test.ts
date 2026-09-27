@@ -31,9 +31,9 @@ describe("#413 bridge fleet accounting", () => {
     const registered = validateBridgeRegistry(registeredShape);
     const fleet = describeTargetFleet(targetMap, registered);
     expect(fleet.registered).toHaveLength(10);
-    expect(fleet.rolloutManaged).toEqual(["arm-bridge", "dev-bridge", "laptop-a", "laptop-b", "linux-bridge", "media-bridge", "workstation"]);
+    expect(fleet.rolloutManaged).toEqual(["arm-bridge", "dev-bridge", "linux-bridge", "media-bridge", "portable-a", "portable-b", "workstation"]);
     expect(fleet.rolloutExcluded.map((row) => row.id)).toEqual([
-      "excluded-laptop-a", "excluded-laptop-b", "excluded-laptop-c",
+      "excluded-portable-a", "excluded-portable-b", "excluded-portable-c",
     ]);
     expect(formatFleetCoverage(fleet, "workstation")).toContain("fleet_rollout_managed=7 of 10");
     expect(formatFleetCoverage(fleet, "workstation")).toContain("operation_scope=1 of 10 registered hosts: workstation");
@@ -42,7 +42,7 @@ describe("#413 bridge fleet accounting", () => {
   it("narrows to the divergent host when a live registered bridge has no rollout record", () => {
     // #413 needed divergence to be LOUD, not to stop the fleet. Refusing all
     // ten hosts because one diverged punished nine healthy machines for an
-    // ordinary state (a retired box, an unreachable laptop). It is reported,
+    // ordinary state (a retired box, an unreachable portable-host). It is reported,
     // excluded from managed scope, and named in the coverage line instead.
     const missing = structuredClone(configured);
     delete missing.targets["media-bridge"];
@@ -83,18 +83,18 @@ describe("#413 bridge fleet accounting", () => {
 
   it("keeps offline and deliberately excluded hosts in the denominator", () => {
     const fleet = describeTargetFleet(targetMap, validateBridgeRegistry(registeredShape));
-    expect(fleet.registered).toContain("excluded-laptop-a");
+    expect(fleet.registered).toContain("excluded-portable-a");
     expect(fleet.rolloutExcluded).toEqual([
       {
-        id: "excluded-laptop-a",
+        id: "excluded-portable-a",
         reason: "no verified privileged management path for this host",
       },
       {
-        id: "excluded-laptop-b",
+        id: "excluded-portable-b",
         reason: "bridge runs under a different account; management user cannot write that home",
       },
       {
-        id: "excluded-laptop-c",
+        id: "excluded-portable-c",
         reason: "bridge runs under a different account; management user cannot write that home",
       },
     ]);
@@ -109,7 +109,7 @@ describe("#413 bridge fleet accounting", () => {
       // Select an excluded target so even a mutation removing reconciliation
       // cannot cross the test boundary into SSH; it will stop at the ordinary
       // target refusal instead.
-      execFileSync(process.execPath, [path.join(root, "scripts/bridge-rollout.mjs"), "--target", "excluded-laptop-a"], {
+      execFileSync(process.execPath, [path.join(root, "scripts/bridge-rollout.mjs"), "--target", "excluded-portable-a"], {
         cwd: root,
         env: { ...process.env, CHANNEL_PRESETS_FILE: registry, SEAM_BRIDGE_TARGETS_FILE: path.join(root, "ops/bridge/targets.example.json") },
         encoding: "utf8",
@@ -123,7 +123,7 @@ describe("#413 bridge fleet accounting", () => {
     // coverage and excluded; the command then stops at the ordinary refusal for
     // the target actually selected. Never reaching SSH is still the boundary.
     expect(stderr).not.toContain("ssh:");
-    expect(stderr).toMatch(/excluded-laptop-a/);
+    expect(stderr).toMatch(/excluded-portable-a/);
   });
 
   it("prints the complete denominator before refusing an explicitly excluded target", () => {
@@ -131,7 +131,7 @@ describe("#413 bridge fleet accounting", () => {
     let stdout = "";
     let stderr = "";
     try {
-      execFileSync(process.execPath, [path.join(root, "scripts/bridge-rollout.mjs"), "--target", "excluded-laptop-a"], {
+      execFileSync(process.execPath, [path.join(root, "scripts/bridge-rollout.mjs"), "--target", "excluded-portable-a"], {
         cwd: root,
         env: { ...process.env, CHANNEL_PRESETS_FILE: registry, SEAM_BRIDGE_TARGETS_FILE: path.join(root, "ops/bridge/targets.example.json") },
         encoding: "utf8",
@@ -145,9 +145,9 @@ describe("#413 bridge fleet accounting", () => {
     }
     expect(stdout).toContain("fleet_registered=10");
     expect(stdout).toContain("fleet_rollout_managed=7 of 10");
-    expect(stdout).toContain("fleet_excluded=excluded-laptop-a: no verified privileged management path for this host");
-    expect(stdout).toContain("fleet_excluded=excluded-laptop-c: bridge runs under a different account; management user cannot write that home");
-    expect(stdout).toContain("fleet_excluded=excluded-laptop-b: bridge runs under a different account; management user cannot write that home");
-    expect(stderr).toMatch(/excluded-laptop-a is explicitly excluded.*privileged management/);
+    expect(stdout).toContain("fleet_excluded=excluded-portable-a: no verified privileged management path for this host");
+    expect(stdout).toContain("fleet_excluded=excluded-portable-c: bridge runs under a different account; management user cannot write that home");
+    expect(stdout).toContain("fleet_excluded=excluded-portable-b: bridge runs under a different account; management user cannot write that home");
+    expect(stderr).toMatch(/excluded-portable-a is explicitly excluded.*privileged management/);
   });
 });

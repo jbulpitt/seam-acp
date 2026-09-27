@@ -131,8 +131,8 @@ describe("#236 declared-VALUE policy at both boundaries", () => {
     ["array displayName", (c) => {
       (c.models[0] as unknown as Record<string, unknown>).displayName = ["x"];
     }],
-    ["path in displayName", (c) => { c.models[0]!.displayName = "see /home/ubuntu/.claude"; }],
-    ["path in runtimeId", (c) => { c.models[0]!.runtimeId = "/home/ubuntu/.codex/model"; }],
+    ["path in displayName", (c) => { c.models[0]!.displayName = "see /home/operator/.claude"; }],
+    ["path in runtimeId", (c) => { c.models[0]!.runtimeId = "/home/operator/.codex/model"; }],
     ["control characters in id", (c) => { c.models[0]!.id = `neb${BELL}ula`; }],
     ["duplicate aliases", (c) => { c.models[0]!.aliases = ["dup", "dup"]; }],
     ["bad enum visionMode", (c) => {
@@ -196,8 +196,8 @@ describe("#236 declared-VALUE policy at both boundaries", () => {
    * cross", not "the fetch fails".
    */
   const SCOPE_ATTACKS: Array<[string, string, (c: AdapterCatalogCandidate) => void]> = [
-    ["scope PII", "jesse@example.com", (c) => { c.scope.credentialProfile = "jesse@example.com"; }],
-    ["scope secret path", "/home/ubuntu/.ssh/id_rsa", (c) => { c.scope.project = "/home/ubuntu/.ssh/id_rsa"; }],
+    ["scope PII", "alex@example.com", (c) => { c.scope.credentialProfile = "alex@example.com"; }],
+    ["scope secret path", "/home/operator/.ssh/id_rsa", (c) => { c.scope.project = "/home/operator/.ssh/id_rsa"; }],
   ];
 
   it.each(SCOPE_ATTACKS)("bridge boundary neutralizes %s before transport", async (_name, secret, fn) => {
@@ -238,15 +238,15 @@ describe("#236 declared-VALUE policy at both boundaries", () => {
     // CONSTANT. A truncated digest of a low-entropy path is dictionary
     // reversible, which would leak the very path the replacement removes.
     const raw = candidate([model("nebula", { default: true })]);
-    raw.scope = { ...raw.scope, credentialProfile: "/home/ubuntu/.codex" };
+    raw.scope = { ...raw.scope, credentialProfile: "/home/operator/.codex" };
     const normalized = normalizeCatalogCandidate(raw);
     expect(normalized.scope.credentialProfile).toBe(CATALOG_SCOPE_LABEL_REDACTED);
-    expect(JSON.stringify(normalized)).not.toContain("/home/ubuntu");
+    expect(JSON.stringify(normalized)).not.toContain("/home/operator");
     expect(() => validateCandidate(normalized)).not.toThrow();
 
     // Not derived from the input: two different unsafe paths give the SAME
     // sentinel, so nothing can be recovered by guessing.
-    const other = { ...raw, scope: { ...raw.scope, credentialProfile: "/home/ubuntu/.claude" } };
+    const other = { ...raw, scope: { ...raw.scope, credentialProfile: "/home/operator/.claude" } };
     expect(normalizeCatalogCandidate(other).scope.credentialProfile)
       .toBe(normalized.scope.credentialProfile);
     // Distinctness is unaffected because identity is the fingerprint.
@@ -256,7 +256,7 @@ describe("#236 declared-VALUE policy at both boundaries", () => {
     expect(normalizeCatalogCandidate(safe).scope.credentialProfile).toBe("team-prod_1");
     // And it never mutates the caller's object — adapters memoize their scope,
     // and the service deep-freezes what it publishes.
-    expect(raw.scope.credentialProfile).toBe("/home/ubuntu/.codex");
+    expect(raw.scope.credentialProfile).toBe("/home/operator/.codex");
     expect(Object.isFrozen(raw.scope)).toBe(false);
   });
 
@@ -269,9 +269,9 @@ describe("#236 declared-VALUE policy at both boundaries", () => {
     expect(normalizeCatalogCandidate(named).scope.fingerprint).toBe("team-prod_1");
     // An UNSAFE fingerprint is refused, not silently changed — rewriting it
     // would fork the scope and split the generation history in two.
-    const unsafe = { ...raw, scope: { ...raw.scope, fingerprint: "/home/ubuntu/private-scope" } };
+    const unsafe = { ...raw, scope: { ...raw.scope, fingerprint: "/home/operator/private-scope" } };
     expect(() => normalizeCatalogCandidate(unsafe)).toThrow(/fingerprint/);
-    expect(unsafe.scope.fingerprint).toBe("/home/ubuntu/private-scope");
+    expect(unsafe.scope.fingerprint).toBe("/home/operator/private-scope");
   });
 
   it("normalization survives a frozen input candidate", () => {
@@ -279,7 +279,7 @@ describe("#236 declared-VALUE policy at both boundaries", () => {
     // and the service deep-freezes published snapshots — so a second refresh
     // would hit a frozen object if normalization mutated in place.
     const raw = candidate([model("nebula", { default: true })]);
-    raw.scope = { ...raw.scope, credentialProfile: "/home/ubuntu/.codex" };
+    raw.scope = { ...raw.scope, credentialProfile: "/home/operator/.codex" };
     const frozen = Object.freeze({ ...raw, scope: Object.freeze({ ...raw.scope }) });
     expect(() => normalizeCatalogCandidate(frozen)).not.toThrow();
     expect(normalizeCatalogCandidate(frozen).scope.credentialProfile)

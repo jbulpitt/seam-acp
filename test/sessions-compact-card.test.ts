@@ -1444,7 +1444,7 @@ describe("#179 dead-token recovery", () => {
     await h.open();
     await h.collector.click("sessions:premium");
     await h.started;
-    h.pipeline.reject(new Error("boom at /home/ubuntu/secret/path with TOKEN=abc123"));
+    h.pipeline.reject(new Error("boom at /home/operator/secret/path with TOKEN=abc123"));
     await h.settle();
 
     expect(h.threadMessages).toEqual([CARD_FALLBACK_TEXT.compaction.failed]);
@@ -1453,7 +1453,7 @@ describe("#179 dead-token recovery", () => {
     expect(posted).not.toContain("acp-source");
     expect(posted).not.toContain("acp-new");
     expect(posted).not.toContain("TOKEN=abc123");
-    expect(posted).not.toContain("/home/ubuntu/secret");
+    expect(posted).not.toContain("/home/operator/secret");
   });
 
   it("every fixed notice is free of ids and error detail by construction", () => {

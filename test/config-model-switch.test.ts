@@ -45,7 +45,7 @@ function slashI(over: {
     options: {
       getString: (name: string, _req?: boolean) => over.strings?.[name] ?? null,
     },
-    user: { id: ADMIN, username: "jesse", displayName: "Jesse" },
+    user: { id: ADMIN, username: "alex", displayName: "Alex" },
     channelId: over.channelId ?? THREAD,
     channel: {
       isThread: () => true,
@@ -218,7 +218,7 @@ describe("/seam config model — #191 failure-atomic commit", () => {
         order.push("picked");
         const result = await opts.commit(
           { value: "claude-sonnet-4.6", label: "Sonnet 4.6" },
-          "jesse"
+          "alex"
         );
         order.push("commit-done");
         if (result.ok) {
@@ -325,7 +325,7 @@ describe("/seam config model — #191 failure-atomic commit", () => {
         });
         const result = await opts.commit(
           { value: "claude-sonnet-4.6", label: "Sonnet 4.6" },
-          "jesse"
+          "alex"
         );
         expect(result.ok).toBe(true);
         return { value: "claude-sonnet-4.6", userId: ADMIN };
@@ -358,7 +358,7 @@ describe("/seam config model — #191 failure-atomic commit", () => {
         mutation.applyThreadOverlay = () => ({ ok: false, error: "injected overlay failure" });
         const result = await opts.commit(
           { value: "claude-sonnet-4.6", label: "Sonnet 4.6" },
-          "jesse"
+          "alex"
         );
         expect(result.ok).toBe(false);
         return null;

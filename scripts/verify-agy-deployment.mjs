@@ -19,7 +19,7 @@
  *      repaired — repair is `stage-agy-runtime.mjs`, which an operator runs
  *      deliberately after reading this output.
  *   2. It never claims more than it checked. `agy 1.2.2` passed every identity
- *      check on macbook-pro while serving zero turns (#371), so identity checks
+ *      check on macos-canary-b while serving zero turns (#371), so identity checks
  *      here report identity and say so. Capability is a separate check that is
  *      SKIPPED unless `--probe` is passed, and a skipped check is reported as
  *      skipped rather than quietly omitted.
@@ -159,7 +159,7 @@ const PM2_PIN_LINE =
  *
  * `require()`ing host config here would hand arbitrary host code the verifier's
  * process, which is precisely the property `readOnlyIo()` exists to guarantee
- * away — a misdiagnosis must not be able to take an agy-only laptop to zero
+ * away — a misdiagnosis must not be able to take a single-agent host to zero
  * agents, and running the file makes that guarantee unprovable. So this is a
  * text scan, and it is deliberately strict rather than lenient: a lenient match
  * over JS syntax produces a quiet FALSE PASS, which is worse here than a
@@ -220,7 +220,7 @@ export function looksLikePm2Ecosystem(text) {
  *
  * The distinction is the point, and there are THREE sources rather than two.
  * A pin present in the live process environment and absent from every file is
- * not "configured" — macbook-air reported `provenance mode: immutable-path`
+ * not "configured" — one affected host reported `provenance mode: immutable-path`
  * from exactly that state, with a `dump.pm2` stale since August, and a reboot
  * would have resurrected it without pins and dropped agy with no trail back to
  * a cause. A pin in the pm2 ecosystem file IS recorded on disk, but pm2 only
@@ -230,13 +230,12 @@ export function looksLikePm2Ecosystem(text) {
 /**
  * Read AGY pins out of `~/.pm2/dump.pm2` — what a REBOOT actually restores.
  *
- * Observed on macbook-pro/macbook-air/home-hub on 2026-09-13: the dump is a
+ * Observed across several pm2 bridge hosts: the dump is a
  * JSON **array** of app objects, each with `name` and `env`. Some pm2 versions
- * write `{ apps: [...] }`, so both are accepted — but the array form is the one
- * this fleet has, and it is the one the fixtures are built from.
+ * write `{ apps: [...] }`, so both are accepted — but the array form is the deployed shape observed during the incident, and it is the one the fixtures are built from.
  *
  * Parsed as JSON through the frozen read calls, never by shelling out to `pm2`:
- * the binary is not on a non-interactive PATH on any Mac in this fleet (#390's
+ * the binary is not on a non-interactive PATH on the affected macOS hosts (#390's
  * sixth failure, which bit twice while building this), and spawning a process
  * manager from a read-only verifier would discard the property that makes a
  * misdiagnosis unable to change anything.
@@ -277,7 +276,7 @@ const UNAVAILABLE = Symbol("unavailable");
  *           the RUNNING list, so it can lag the file or drop apps entirely.
  *   live  — the running process environment, what is serving turns right now.
  *
- * macbook-air had pins in `live` only: the file lacked them and the dump was
+ * macos-canary-a had pins in `live` only: the file lacked them and the dump was
  * stale since Aug 30. It worked, reported `immutable-path`, and no file on the
  * host explained why — one reboot from silently losing agy.
  *
@@ -342,7 +341,7 @@ function driftConsequence(difference, pinsFile) {
 /**
  * The path a launcher script loads, taken from a string literal only.
  *
- * plex-server's launcher names `/home/mediaserver/.config/seam-bridge/bridge.env`
+ * one launcher names `/home/operator/.config/seam-bridge/bridge.env`
  * and reads it after exec, so the process environment at start is empty of
  * pins and is not the configuration. The text is never executed: more than
  * one named `bridge.env` is ambiguous rather than a guess.
@@ -531,7 +530,7 @@ export function selectPinAuthority(evidence) {
   if (!processEnv.supplied && count(recorded) === 0 && count(launcher) === 0 && count(dotenv) === 0) {
     // A missing pins file and no other reading is the host that does not run
     // agy. An existing file with no pins, and no look at the process, is not
-    // that fact: fhr-server's bridge.env is empty of pins while systemd injects
+    // that fact: one host's bridge.env is empty of pins while systemd injects
     // them. Those two must not share a verdict.
     if (recorded.supplied && recorded.missingFile) {
       return {
@@ -769,7 +768,7 @@ export function verifyAgyDeployment(options, io = readOnlyIo()) {
 
   // 1b. The three sources of truth, compared (#390).
   //
-  // This is the check that would have caught macbook-air. Everything else in
+  // This is the check that would have caught macos-canary-a. Everything else in
   // this file describes the artifact; this one asks whether the configuration
   // pointing at it will still be there after a restart or a reboot.
   let dumpPins = UNAVAILABLE;
@@ -806,7 +805,7 @@ export function verifyAgyDeployment(options, io = readOnlyIo()) {
     ? processPins
     : UNAVAILABLE;
 
-  // An empty file is not a pin source that disagrees. fhr-server's
+  // An empty file is not a pin source that disagrees. one host's
   // bridge.env has no AGY pins; the process environment does, and that is
   // the configuration. Comparing the empty file as "missing" would call a
   // correctly injected host drifted.
@@ -969,7 +968,7 @@ export function verifyAgyDeployment(options, io = readOnlyIo()) {
   // user OWNS satisfies the first and fails the second, and a host in that state
   // reports `immutable-path` while being one chmod from replaceable. That is
   // reported as a failure on every platform, not only darwin, because the
-  // question here is whether the host matches the reference layout — macbook-air
+  // question here is whether the host matches the reference layout — macos-canary-a
   // worked, reported immutable-path, and was still one reboot from dark.
   if (!cliPath) {
     checks.push(check("ancestors-durable", "skipped", "AGY_CLI_PATH is unset", "pins_missing"));

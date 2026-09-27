@@ -19,7 +19,7 @@
  * Build the inbox `fromRef` for a human producer. Prefer the resolved display
  * name (speaker-identity #57: override map → nickname → global name → username),
  * falling back to the raw author id so attribution is never empty. Prefixed
- * `human:` so a drained message reads `from human:Jesse`, unambiguously a person
+ * `human:` so a drained message reads `from human:Alex`, unambiguously a person
  * rather than another agent's channel ref.
  */
 export function humanInboxFrom(name: string | null | undefined, id: string): string {

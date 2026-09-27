@@ -31,7 +31,7 @@ function threadMessages(count = 12) {
     ts: Date.parse("2026-01-01T00:00:00Z") + i * 1000,
     authorIsBot: i % 2 === 1,
     text: `message ${i} ${"content ".repeat(30)}`,
-    authorName: i % 2 === 0 ? "jesse" : "bot",
+    authorName: i % 2 === 0 ? "alex" : "bot",
   }));
 }
 

@@ -437,7 +437,7 @@ describe("#236 bounded probe lifecycle", () => {
     fs.writeFileSync(
       leaky,
       `process.stderr.write("dumping env: SUPER_SECRET_TOKEN=" + process.env.SUPER_SECRET_TOKEN + "\\n");\n` +
-      `process.stderr.write("also sk-live_abcdefghijklmnop and jesse@example.com\\n");\n` +
+      `process.stderr.write("also sk-live_abcdefghijklmnop and alex@example.com\\n");\n` +
       `process.exit(7);\n`
     );
     let seen = "";
@@ -458,7 +458,7 @@ describe("#236 bounded probe lifecycle", () => {
     for (const text of [seen]) {
       expect(text).not.toContain("s3cr3t-value-abc");
       expect(text).not.toContain("sk-live_abcdefghijklmnop");
-      expect(text).not.toContain("jesse@example.com");
+      expect(text).not.toContain("alex@example.com");
       expect(text).toContain("[redacted]");
     }
   });

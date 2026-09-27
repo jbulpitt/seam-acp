@@ -111,7 +111,7 @@ describe("preset instructions injection (#72, end-to-end)", () => {
     });
     expect(built.ok).toBe(true);
     if (!built.ok) return;
-    built.proposal.apply({ id: "user-jesse", name: "Jesse" });
+    built.proposal.apply({ id: "user-alex", name: "Alex" });
 
     // 2. Resolve it EXACTLY as dispatchInjectTurn does (store.getPresetByName).
     const preset = store.getPresetByName("reviewer");

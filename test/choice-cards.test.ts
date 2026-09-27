@@ -265,14 +265,14 @@ describe("D8 payload wrap", () => {
     const text = wrapChoicePrompt({
       cardId: "cid1",
       optionLabel: "Approve",
-      clickerName: "Jesse",
+      clickerName: "Alex",
       clickerId: "1487",
       authoringThread: "thread-1",
       destination: "live",
       payload: "Approved. Merge.",
     });
     expect(text).toContain("<seam-choice>");
-    expect(text).toContain('option "Approve" clicked by Jesse (id 1487)');
+    expect(text).toContain('option "Approve" clicked by Alex (id 1487)');
     expect(text).toContain("Authoring thread: thread-1");
     expect(text).toContain("Destination: live");
     expect(text).toMatch(/<\/seam-choice>\n\nApproved\. Merge\./);
@@ -358,7 +358,7 @@ describe("emitChoice helper", () => {
     const r = await emitChoice({
       card: makeCard(),
       optionIndex: 0,
-      actor: { id: "1", name: "Jesse" },
+      actor: { id: "1", name: "Alex" },
       payload: "Approved.",
       enqueue: async (s) => {
         enqueued.push(s);
@@ -380,7 +380,7 @@ describe("emitChoice helper", () => {
     const r = await emitChoice({
       card: makeCard(),
       optionIndex: 1,
-      actor: { id: "1", name: "Jesse" },
+      actor: { id: "1", name: "Alex" },
       payload: "typed fix",
       enqueue: async (s) => {
         enqueued.push(s);
@@ -446,14 +446,14 @@ describe("D8 multi-select wrap + emit (#94)", () => {
     const text = wrapChoiceMultiPrompt({
       cardId: "cid1",
       optionLabels: ["Loops", "Testing"],
-      clickerName: "Jesse",
+      clickerName: "Alex",
       clickerId: "1487",
       authoringThread: "thread-1",
       destination: "live",
       payloads: ["Cover loops.", "Cover testing."],
     });
     expect(text).toContain("<seam-choice>");
-    expect(text).toContain('options "Loops, Testing" clicked by Jesse (id 1487)');
+    expect(text).toContain('options "Loops, Testing" clicked by Alex (id 1487)');
     expect(text).toMatch(/<\/seam-choice>\n\nSelected: Loops, Testing\nCover loops\.\nCover testing\./);
   });
 
@@ -466,7 +466,7 @@ describe("D8 multi-select wrap + emit (#94)", () => {
         options: multiOpts,
       }),
       optionIndices: [0, 2],
-      actor: { id: "1", name: "Jesse" },
+      actor: { id: "1", name: "Alex" },
       enqueue: async (s) => {
         enqueued.push(s);
       },
@@ -607,15 +607,15 @@ describe("renderChoicePanel", () => {
       makeCard({
         status: "exhausted",
         clickCount: 1,
-        lastClickerName: "Jesse",
+        lastClickerName: "Alex",
         lastOptionIndex: 0,
       })
     );
     expect(closed.footer).toBe("Done");
-    expect(closed.fields.some((f) => /Approve/.test(f.value) && /Jesse/.test(f.value))).toBe(true);
+    expect(closed.fields.some((f) => /Approve/.test(f.value) && /Alex/.test(f.value))).toBe(true);
     expect(
       choiceCardHideButtons(
-        makeCard({ status: "exhausted", clickCount: 1, lastOptionIndex: 0, lastClickerName: "Jesse" })
+        makeCard({ status: "exhausted", clickCount: 1, lastOptionIndex: 0, lastClickerName: "Alex" })
       )
     ).toBe(true);
   });
@@ -632,7 +632,7 @@ describe("renderChoicePanel", () => {
     expect(open.footer).toMatch(/0\/10 · open/);
     expect(choiceCardHideButtons(makeCard({ maxClicks: 10 }))).toBe(false);
     const closed = renderChoicePanel(
-      makeCard({ maxClicks: 10, status: "exhausted", clickCount: 10, lastClickerName: "Alaina" })
+      makeCard({ maxClicks: 10, status: "exhausted", clickCount: 10, lastClickerName: "Morgan" })
     );
     expect(closed.footer).toMatch(/10\/10 · closed/);
     expect(choiceCardHideButtons(makeCard({ maxClicks: 10, status: "exhausted", clickCount: 10 }))).toBe(
@@ -647,7 +647,7 @@ describe("renderChoicePanel", () => {
         options: multiOpts,
         status: "exhausted",
         clickCount: 1,
-        lastClickerName: "Jesse",
+        lastClickerName: "Alex",
         lastOptionIndex: 0,
         lastOptionIndices: [0, 2],
       })
@@ -655,7 +655,7 @@ describe("renderChoicePanel", () => {
     expect(closed.footer).toBe("Done");
     const selected = closed.fields.find((f) => f.name === "Selected");
     expect(selected?.value).toMatch(/Loops, Testing/);
-    expect(selected?.value).toMatch(/Jesse/);
+    expect(selected?.value).toMatch(/Alex/);
     expect(
       choiceCardHideButtons(
         makeCard({
@@ -676,7 +676,7 @@ function mockChoiceEvt(
   const edited: unknown[] = [];
   const evt = {
     userId: "1",
-    userName: "Jesse",
+    userName: "Alex",
     channel: { platform: "discord" as const, id: "thread-1" },
     messageId: "msg-1",
     kind: "select" as const,
@@ -842,7 +842,7 @@ describe("multi-select lifecycle (#94)", () => {
       kind: "select",
       values: ["0", "1"],
       userId: "2",
-      userName: "Alaina",
+      userName: "Morgan",
     });
     await (orch as any).handleChoiceCardInteraction(target);
     expect(target.ephemeral).toEqual([]);
@@ -852,7 +852,7 @@ describe("multi-select lifecycle (#94)", () => {
       customId: makeChoiceConfirmId("c-multi"),
       kind: "button",
       userId: "2",
-      userName: "Alaina",
+      userName: "Morgan",
     });
     await (orch as any).handleChoiceCardInteraction(confirm);
     expect(confirm.ephemeral).toEqual([]);

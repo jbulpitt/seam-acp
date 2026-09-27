@@ -39,7 +39,7 @@ function slashI(over: {
     options: {
       getString: (name: string, _req?: boolean) => over.strings?.[name] ?? null,
     },
-    user: { id: ADMIN, username: "jesse" },
+    user: { id: ADMIN, username: "alex" },
     channelId: over.channelId ?? "333333333333333333",
     channel: {
       isThread: () => true,

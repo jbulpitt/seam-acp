@@ -15,8 +15,8 @@
       "releaseRoot": "/Users/operator/.seam/bridge-rollouts",
       "rolloutEnabled": true
     },
-    "laptop-a": {
-      "sshAlias": "laptop-a",
+    "portable-a": {
+      "sshAlias": "portable-a",
       "pm2App": "seam-bridge",
       "verifyAgent": "grok",
       "checkoutPath": "/Users/operator/.seam/seam-acp",
@@ -29,15 +29,15 @@
       "releaseRoot": "/Users/operator/.seam/bridge-rollouts",
       "rolloutEnabled": true
     },
-    "excluded-laptop-a": {
-      "sshAlias": "excluded-laptop-a",
+    "excluded-portable-a": {
+      "sshAlias": "excluded-portable-a",
       "pm2App": null,
       "verifyAgent": null,
       "rolloutEnabled": false,
       "unmanagedReason": "no verified privileged management path for this host"
     },
-    "laptop-b": {
-      "sshAlias": "laptop-b",
+    "portable-b": {
+      "sshAlias": "portable-b",
       "pm2App": "seam-bridge",
       "verifyAgent": "grok",
       "checkoutPath": "/Users/operator/.seam/seam-acp",
@@ -50,15 +50,15 @@
       "releaseRoot": "/Users/operator/.seam/bridge-rollouts",
       "rolloutEnabled": true
     },
-    "excluded-laptop-b": {
-      "sshAlias": "excluded-laptop-b",
+    "excluded-portable-b": {
+      "sshAlias": "excluded-portable-b",
       "pm2App": null,
       "verifyAgent": null,
       "rolloutEnabled": false,
       "unmanagedReason": "bridge runs under a different account; management user cannot write that home"
     },
-    "excluded-laptop-c": {
-      "sshAlias": "excluded-laptop-c",
+    "excluded-portable-c": {
+      "sshAlias": "excluded-portable-c",
       "pm2App": null,
       "verifyAgent": null,
       "rolloutEnabled": false,

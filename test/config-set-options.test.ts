@@ -64,7 +64,7 @@ function interaction(
       getSubcommandGroup: () => null,
       data: [],
     },
-    user: { id: USER, username: "jesse", displayName: "Jesse" },
+    user: { id: USER, username: "alex", displayName: "Alex" },
     channelId: target.channelId ?? THREAD,
     channel: { isThread: () => true, parentId: target.parentId ?? PARENT },
     deferred: false,

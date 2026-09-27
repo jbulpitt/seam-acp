@@ -74,7 +74,7 @@ function fixture() {
     if (command === "git" && args.includes("worktree") && args.includes("list")) return porcelain;
     if (command === "git" && args.includes("status")) return args[1] === trees.dirty ? "?? notes.txt\n" : "";
     if (command === "git" && args.includes("prune")) return "";
-    if (command === "gh" && args[0] === "repo") return JSON.stringify({ nameWithOwner: "jbulpitt/seam-acp" });
+    if (command === "gh" && args[0] === "repo") return JSON.stringify({ nameWithOwner: "amorgan/seam-acp" });
     if (command === "gh" && args[0] === "pr") {
       const branch = args[args.indexOf("--head") + 1];
       return JSON.stringify(prs[branch] ?? []);

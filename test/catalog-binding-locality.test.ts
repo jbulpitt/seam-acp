@@ -4,8 +4,8 @@
  *
  * A catalog was keyed by a *scope* meant to mean "same credentials, same
  * runtime, same advertised capabilities", derived from labels — provider name,
- * config-directory name — that prove none of that. `macbook-air` runs
- * `claude-agent-acp` 0.70.0 while `local` and `home-hub` run 0.75.1, so one
+ * config-directory name — that prove none of that. `macos-b` runs
+ * `claude-agent-acp` 0.70.0 while `local` and `remote-c` run 0.75.1, so one
  * label covered two different sets of capabilities.
  *
  * That scope did two jobs: fetch deduplication (an optimisation) and drift
@@ -113,13 +113,13 @@ function service(opts: {
 }
 
 const local = { agentId: "claude", location: "local" };
-const air = { agentId: "claude", location: "macbook-air" };
+const air = { agentId: "claude", location: "macos-b" };
 
 describe("#339 catalogs are binding-local and disagreement never costs availability", () => {
   it("keeps both bindings serving when a peer disagrees, and names both sides", async () => {
     // Rule 8, the headline. Two hosts on different wrapper versions, both
     // declaring a shared scope — so this is the case where the old code had
-    // something to quarantine. `local` publishes first; `macbook-air` then
+    // something to quarantine. `local` publishes first; `macos-b` then
     // reports a genuinely different catalog.
     const store = newStore();
     const catalog = service({
@@ -149,7 +149,7 @@ describe("#339 catalogs are binding-local and disagreement never costs availabil
 
     // ZERO loss of availability, on either side (rules 5, 6, 8). This is the
     // assertion the mutation in the PR body targets: restoring
-    // quarantine-on-disagreement empties `macbook-air` and `default` with it.
+    // quarantine-on-disagreement empties `macos-b` and `default` with it.
     expect(catalog.models(air).map((entry) => entry.id)).toEqual(["sonnet"]);
     expect(catalog.models(local).map((entry) => entry.id)).toEqual(["sonnet", "opus"]);
     expect(catalog.lookup(air).state).toBe("ready");
@@ -200,7 +200,7 @@ describe("#339 catalogs are binding-local and disagreement never costs availabil
     expect([first.result, second.result]).toEqual(["published", "published"]);
     expect([first.mode, second.mode]).toEqual(["binding-local", "binding-local"]);
     expect(first.scope).toBe("binding:claude@local");
-    expect(second.scope).toBe("binding:claude@macbook-air");
+    expect(second.scope).toBe("binding:claude@macos-b");
     expect(second.conflict).toBeUndefined();
     expect(catalog.models(local).map((entry) => entry.id)).toEqual(["sonnet", "opus"]);
     expect(catalog.models(air).map((entry) => entry.id)).toEqual(["sonnet"]);
@@ -245,7 +245,7 @@ describe("#339 catalogs are binding-local and disagreement never costs availabil
 
   it("keeps peer entries as display hints, not typed-selection normalization", async () => {
     // Rules 16-17 still provide display hints. #366 keeps typed selection
-    // independent: a peer cannot normalize a model for this account/host.
+    // independent: a peer cannot normalize a model for the local account/host.
     const store = newStore();
     const catalog = service({
       store,

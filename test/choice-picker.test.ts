@@ -208,7 +208,7 @@ describe("finalizeChoicePick commit-then-render order", () => {
     const order: string[] = [];
     const result = await finalizeChoicePick({
       picked,
-      username: "jesse",
+      username: "alex",
       commit: async () => {
         order.push("commit");
         return { ok: true, successPanel: { color: 0x57f287, title: "✅ Agent changed", fields: [] } };
@@ -228,7 +228,7 @@ describe("finalizeChoicePick commit-then-render order", () => {
     const order: string[] = [];
     const result = await finalizeChoicePick({
       picked,
-      username: "jesse",
+      username: "alex",
       successPanel: () => ({ color: 0x57f287, title: "✅ Agent changed", fields: [] }),
       commit: async () => {
         order.push("commit");
@@ -249,7 +249,7 @@ describe("finalizeChoicePick commit-then-render order", () => {
     const order: string[] = [];
     const result = await finalizeChoicePick({
       picked,
-      username: "jesse",
+      username: "alex",
       commit: async () => {
         order.push("commit");
         throw new Error("injected persistence exception");

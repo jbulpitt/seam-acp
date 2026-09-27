@@ -111,11 +111,11 @@ describe("#484 unreachable is a normal state, not an error", () => {
   it("splits probes and keeps the reason for each skip", () => {
     const split = partitionReachability([
       { id: "arm-bridge", reachable: true },
-      { id: "laptop-a", reachable: false, detail: "ssh timed out after 15000ms" },
+      { id: "portable-a", reachable: false, detail: "ssh timed out after 15000ms" },
       { id: "home-bridge", reachable: false },
     ]);
     expect(split.reachable).toEqual(["arm-bridge"]);
-    expect(split.unreachable.map((r) => r.id)).toEqual(["laptop-a", "home-bridge"]);
+    expect(split.unreachable.map((r) => r.id)).toEqual(["portable-a", "home-bridge"]);
     expect(split.unreachable[0]!.detail).toMatch(/timed out/);
     expect(split.unreachable[1]!.detail).toBe("ssh probe failed");
   });
@@ -125,7 +125,7 @@ describe("#484 unreachable is a normal state, not an error", () => {
     // laptops behaving normally.
     const results = [
       { id: "arm-bridge", outcome: "succeeded" },
-      { id: "laptop-a", outcome: "skipped-unreachable" },
+      { id: "portable-a", outcome: "skipped-unreachable" },
       { id: "home-bridge", outcome: "skipped-unreachable" },
     ];
     expect(fleetRunExitCode(results)).toBe(0);
@@ -165,7 +165,7 @@ describe("#484 the reachability probe asks one question and mutates nothing", ()
     expect(probe.args).not.toContain(target.nodePath);
   });
 
-  it("gives up quickly, because the expected answer for a laptop is no", () => {
+  it("gives up quickly, because the expected answer for a portable-host is no", () => {
     expect(makeReachabilityProbe(target).timeoutMs).toBeLessThanOrEqual(15_000);
   });
 
@@ -222,17 +222,17 @@ describe("#484 every blocker at once, each with its remediation", () => {
 
 describe("#484 an advisory is not a refusal", () => {
   // A real read-only fleet preflight caught this reporting layer inventing a
-  // refusal: laptop-a was managed, rollout_ready=yes and serving, and got
+  // refusal: portable-a was managed, rollout_ready=yes and serving, and got
   // reported as refused purely because its recorded rollback baseline had
   // drifted. Severity is now read off the gates that already exist.
   it("does not call a managed, rollout-ready host refused over a stale baseline", () => {
     const blockers = collectBlockers(
       { ...CLEAN, artifact_mode: "managed", rollout_ready: "yes", enrolled: "drifted", node_path: "/Users/operator/.nvm/versions/node/v22.22.2/bin/node" },
-      targets.get("laptop-a")
+      targets.get("portable-a")
     );
     expect(blockers.map((b) => b.code)).toContain("enrolled_baseline_drift");
     expect(blockingOnly(blockers)).toEqual([]);
-    expect(formatBlockers("laptop-a", blockers)).toContain("host_clear=laptop-a advisory=1");
+    expect(formatBlockers("portable-a", blockers)).toContain("host_clear=portable-a advisory=1");
   });
 
   it("does not block a MANAGED host merely for being unenrolled", () => {
@@ -251,7 +251,7 @@ describe("#484 an advisory is not a refusal", () => {
   it("still calls a legacy host with no baseline blocked — there is no rollback target", () => {
     const blockers = collectBlockers(
       { ...CLEAN, artifact_mode: "legacy-checkout", enrolled: "no" },
-      targets.get("laptop-a")
+      targets.get("portable-a")
     );
     expect(blockingOnly(blockers).map((b) => b.code)).toContain("not_enrolled");
   });
@@ -262,7 +262,7 @@ describe("#484 an advisory is not a refusal", () => {
     // refusal the tool would not actually make.
     const blockers = collectBlockers(
       { ...CLEAN, artifact_mode: "legacy-checkout", enrolled: "yes", rollout_ready: "no", protocol_version: "1", drain_SIGUSR2: "yes" },
-      targets.get("laptop-a")
+      targets.get("portable-a")
     );
     const ready = blockers.find((b) => b.code === "not_rollout_ready");
     expect(ready?.severity).toBe("advisory");
@@ -271,23 +271,23 @@ describe("#484 an advisory is not a refusal", () => {
   it("keeps not-rollout-ready blocking when no baseline route exists", () => {
     const blockers = collectBlockers(
       { ...CLEAN, artifact_mode: "managed", rollout_ready: "no", protocol_version: "0", drain_SIGUSR2: "no" },
-      targets.get("laptop-a")
+      targets.get("portable-a")
     );
     expect(blockingOnly(blockers).map((b) => b.code)).toContain("not_rollout_ready");
   });
 
   it("keeps a missing prebuild blocking — the gate that stopped a half-done Mac rollout", () => {
-    const blockers = collectBlockers({ ...CLEAN, native_install_ready: "no" }, targets.get("laptop-a"), targets);
+    const blockers = collectBlockers({ ...CLEAN, native_install_ready: "no" }, targets.get("portable-a"), targets);
     expect(blockingOnly(blockers).map((b) => b.code)).toContain("native_prebuild_unavailable");
   });
 });
 
 describe("#484 item 6: the nodePath diagnosis nobody assembled", () => {
-  // laptop-a was pinned to an absolute v24.15.0 path while the fleet moved
+  // portable-a was pinned to an absolute v24.15.0 path while the fleet moved
   // to v22.22.2, and it surfaced as an opaque native-prebuild refusal (#412).
   // Every fact was in the report; nothing put them together.
   const drifted = new Map([
-    ["laptop-a", { bridgeId: "laptop-a", nodePath: "/Users/j/.nvm/versions/node/v24.15.0/bin/node" }],
+    ["portable-a", { bridgeId: "portable-a", nodePath: "/Users/j/.nvm/versions/node/v24.15.0/bin/node" }],
     ["arm-bridge", { bridgeId: "arm-bridge", nodePath: "/home/operator/.nvm/versions/node/v22.22.2/bin/node" }],
     ["workstation", { bridgeId: "workstation", nodePath: "/Users/operator/.nvm/versions/node/v22.22.2/bin/node" }],
   ]);
@@ -295,7 +295,7 @@ describe("#484 item 6: the nodePath diagnosis nobody assembled", () => {
   it("says which node is pinned, which ABI is missing, and what the fleet uses", () => {
     const [blocker] = collectBlockers(
       { ...CLEAN, native_install_ready: "no", node_version: "v24.15.0", native_prebuild: "better-sqlite3@11.10.0-node-v137-darwin-arm64" },
-      drifted.get("laptop-a"),
+      drifted.get("portable-a"),
       drifted
     );
     expect(blocker!.code).toBe("native_prebuild_unavailable");

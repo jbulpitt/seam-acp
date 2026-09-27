@@ -4388,6 +4388,11 @@ export class Orchestrator {
           );
         }
         switch (event.kind) {
+          case "cwd-fallback": {
+            status.setRepo(`${this.repoDisplay(event.used)} · fallback from ${event.requested}`);
+            await refresh(true);
+            return;
+          }
           case "recovery": {
             await this.adapter.sendMessage(msg.channel, event.message);
             return;

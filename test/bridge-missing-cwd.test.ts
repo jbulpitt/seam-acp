@@ -5,9 +5,15 @@
  * exists only on remote-b, and the start failed).
  */
 import { EventEmitter } from "node:events";
-import { PassThrough } from "node:stream";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { PassThrough, Readable, Writable } from "node:stream";
 import { describe, expect, it } from "vitest";
+import { agent, methods, ndJsonStream, PROTOCOL_VERSION } from "@agentclientprotocol/sdk";
+import type { AgentProfile } from "@seam/adapters";
 import { dispatchBridgeRpc, type SlotSpawnConfig } from "../packages/bridge/src/rpc.js";
+import { AgentRuntime, type AgentEvent } from "../packages/core/src/agents/agent-runtime.js";
 import { BridgeMcpInputRewriter } from "../packages/bridge/src/mcp-injection.js";
 import { spawnRemoteSlot, type MuxHandle } from "../packages/core/src/core/remote-spawn.js";
 
@@ -47,7 +53,96 @@ describe("a directory missing on this host", () => {
       releaseStdin() {},
     } as unknown as MuxHandle;
     const spawned = await spawnRemoteSlot(mux, { mcpServers: [], agentId: "claude", cwd: "/no/such/project" });
+    expect(spawned.cwdFallback).toEqual({ requested: "/no/such/project", used: "/tmp" });
     expect(spawned.hostNotice).toContain("/no/such/project");
     expect(spawned.hostNotice).toContain("/tmp");
+  });
+
+  it("uses the bridge-selected cwd for ACP new, load, and fork", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "seam-missing-cwd-"));
+    const requested = path.join(root, "missing-on-host");
+    const configured: SlotSpawnConfig[] = [];
+    const received: Array<{ method: string; cwd: string }> = [];
+    const child = Object.assign(new EventEmitter(), {
+      slot: 8,
+      stdin: new PassThrough(),
+      stdout: new PassThrough(),
+      stderr: new PassThrough(),
+      killed: false,
+      kill() { this.killed = true; return true; },
+    });
+    agent({ name: "missing-cwd-fixture" })
+      .onRequest(methods.agent.initialize, () => ({
+        protocolVersion: PROTOCOL_VERSION,
+        agentCapabilities: { loadSession: true, sessionCapabilities: { fork: {} } },
+      }))
+      .onRequest(methods.agent.session.new, ({ params }) => {
+        received.push({ method: "new", cwd: params.cwd });
+        return { sessionId: "new-session" };
+      })
+      .onRequest(methods.agent.session.load, ({ params }) => {
+        received.push({ method: "load", cwd: params.cwd });
+        return { sessionId: params.sessionId };
+      })
+      .onRequest("session/fork" as never, ({ params }: { params: { cwd: string } }) => {
+        received.push({ method: "fork", cwd: params.cwd });
+        return { sessionId: "forked-session" };
+      })
+      .onRequest(methods.agent.session.prompt, () => ({ stopReason: "end_turn" }))
+      .onNotification(methods.agent.session.cancel, () => {})
+      .connect(ndJsonStream(
+        Writable.toWeb(child.stdout) as WritableStream<Uint8Array>,
+        Readable.toWeb(child.stdin) as ReadableStream<Uint8Array>
+      ));
+    const mux = {
+      spawn: () => child,
+      rpc: (method: string, params: unknown, opts?: { agentId?: string }) =>
+        dispatchBridgeRpc(method, params, opts?.agentId, {
+          adapters: new Map(),
+          workspaceRoot: root,
+          cwd: root,
+          devMode: false,
+          configureSlot: (_slot: number, config: SlotSpawnConfig) => configured.push(config),
+        }),
+      releaseStdin() {},
+    } as unknown as MuxHandle;
+    const profile = {
+      id: "claude",
+      displayName: "Claude",
+      defaultModel: "default",
+    } as AgentProfile;
+    const logger = {
+      child() { return this; }, debug() {}, info() {}, warn() {}, error() {},
+    } as never;
+    const runtime = new AgentRuntime({
+      profile,
+      logger,
+      spawnFn: () => spawnRemoteSlot(mux, {
+        mcpServers: [],
+        agentId: "claude",
+        cwd: requested,
+      }),
+    });
+    const events: AgentEvent[] = [];
+    runtime.onEvent((event) => { events.push(event); });
+
+    try {
+      await runtime.start();
+      await runtime.newSession({ cwd: requested });
+      await runtime.prompt("show cwd");
+      await runtime.loadSession({ sessionId: "existing-session", cwd: requested });
+      await runtime.forkSession({ sessionId: "existing-session", cwd: requested });
+    } finally {
+      await runtime.dispose();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+
+    expect(configured[0]).toMatchObject({ cwd: root, requestedCwd: requested });
+    expect(received).toEqual([
+      { method: "new", cwd: root },
+      { method: "load", cwd: root },
+      { method: "fork", cwd: root },
+    ]);
+    expect(events).toContainEqual({ kind: "cwd-fallback", requested, used: root });
   });
 });

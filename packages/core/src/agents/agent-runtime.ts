@@ -97,6 +97,7 @@ export type AgentEvent =
   | { kind: "submission-evidence"; evidence: SubmissionEvidence }
   | { kind: "agy-stdout-fallback"; code: string }
   | { kind: "recovery"; message: string }
+  | { kind: "cwd-fallback"; requested: string; used: string }
   | { kind: "agent-text"; text: string; messageId?: string }
   | {
       kind: "async-user-input";
@@ -398,6 +399,8 @@ export class AgentRuntime {
   private observedContextUsed?: number;
   private lastModelFallbackNotice?: string;
   private readonly pendingModelNotices: string[] = [];
+  private cwdFallback?: { requested: string; used: string };
+  private cwdFallbackPending = false;
   private readonly loadSessionTimeoutMs: number;
   /** Quiet time before asking the bridge whether a remote turn is hung.
    *  Production is one minute. Tests pass a few milliseconds. */
@@ -620,8 +623,16 @@ export class AgentRuntime {
     if (this.connection) return;
     const child = await this.spawnFn(this.modelOverride, this.effortOverride);
     this.child = child;
-    const hostNotice = (child as { hostNotice?: unknown }).hostNotice;
-    if (typeof hostNotice === "string") this.pendingModelNotices.push(hostNotice);
+    const cwdFallback = (child as { cwdFallback?: unknown }).cwdFallback;
+    if (cwdFallback && typeof cwdFallback === "object"
+      && typeof (cwdFallback as { requested?: unknown }).requested === "string"
+      && typeof (cwdFallback as { used?: unknown }).used === "string") {
+      this.cwdFallback = cwdFallback as { requested: string; used: string };
+      this.cwdFallbackPending = true;
+    } else {
+      const hostNotice = (child as { hostNotice?: unknown }).hostNotice;
+      if (typeof hostNotice === "string") this.pendingModelNotices.push(hostNotice);
+    }
 
     const processExitError = (
       code: number | null,
@@ -843,14 +854,19 @@ export class AgentRuntime {
 
   supportsSessionFork(): boolean { return this.sessionForkSupported; }
 
+  private cwdForHost(requested: string): string {
+    return this.cwdFallback?.requested === requested ? this.cwdFallback.used : requested;
+  }
+
   /** Copy a session's conversation into a new session; returns the new id. */
   async forkSession(opts: { sessionId: string; cwd: string }): Promise<string> {
     const conn = this.requireConnection() as unknown as {
       request<T>(method: string, params: unknown): Promise<T>;
     };
+    const cwd = this.cwdForHost(opts.cwd);
     const result = await conn.request<{ sessionId?: unknown }>("session/fork", {
       sessionId: opts.sessionId,
-      cwd: opts.cwd,
+      cwd,
       mcpServers: this.profile.mcpServersAtSpawn ? [] : this.mcpServers,
     });
     if (typeof result?.sessionId !== "string" || !result.sessionId) throw new Error("session/fork returned no session id");
@@ -890,10 +906,11 @@ export class AgentRuntime {
       ...(this.profile.newSessionMeta?.(opts.model, opts.effort) ?? {}),
       ...(opts.meta ?? {}),
     };
+    const cwd = this.cwdForHost(opts.cwd);
 
     const result = await Promise.race([
       conn.newSession({
-        cwd: opts.cwd,
+        cwd,
         mcpServers: this.profile.mcpServersAtSpawn ? [] : this.mcpServers,
         ...(Object.keys(meta).length > 0 ? { _meta: meta } : {}),
       }),
@@ -904,7 +921,7 @@ export class AgentRuntime {
       ),
     ]);
 
-    this.sessionCwd = opts.cwd;
+    this.sessionCwd = cwd;
     this.sessionId = result.sessionId;
     this.sessionConfigOptions = result.configOptions ?? [];
     this.sessionInfo = this.buildSessionInfo(result);
@@ -967,6 +984,7 @@ export class AgentRuntime {
     const meta: Record<string, unknown> = {
       ...(this.profile.newSessionMeta?.(opts.model, opts.effort) ?? {}),
     };
+    const cwd = this.cwdForHost(opts.cwd);
     // Bracket the load call: any history the wrapper replays arrives while this
     // await runs. `handleSessionUpdateInner` drops replayed content in that
     // window and records `replayLoadedDuringLoad` so the first prompt below can
@@ -980,7 +998,7 @@ export class AgentRuntime {
         result = await Promise.race([
           conn.loadSession({
             sessionId: opts.sessionId,
-            cwd: opts.cwd,
+            cwd,
             mcpServers: this.profile.mcpServersAtSpawn ? [] : this.mcpServers,
             ...(Object.keys(meta).length > 0 ? { _meta: meta } : {}),
           }),
@@ -1000,7 +1018,7 @@ export class AgentRuntime {
     } finally {
       this.loadReplayInProgress = false;
     }
-    this.sessionCwd = opts.cwd;
+    this.sessionCwd = cwd;
     this.sessionId = opts.sessionId;
     this.sessionConfigOptions = result.configOptions ?? [];
     this.sessionInfo = {
@@ -1187,6 +1205,11 @@ export class AgentRuntime {
   ): Promise<PromptOutcome> {
     const conn = this.requireConnection();
     const sid = this.requireSessionId();
+
+    if (this.cwdFallbackPending && this.cwdFallback) {
+      this.cwdFallbackPending = false;
+      await this.emit({ kind: "cwd-fallback", ...this.cwdFallback });
+    }
 
     for (const message of this.pendingModelNotices.splice(0)) {
       await this.emit({ kind: "recovery", message });

@@ -138,6 +138,9 @@ export class DispatchStatusPanel<TRef = unknown> {
     if (this.finalized || !this.isLive) return;
     const s = this.status;
     switch (event.kind) {
+      case "cwd-fallback":
+        s.setRepo(`${event.used} · fallback from ${event.requested}`);
+        break;
       case "tool-start": {
         const label = event.title ?? event.kindLabel ?? "…";
         s.setAction(`Tool: ${label}`);

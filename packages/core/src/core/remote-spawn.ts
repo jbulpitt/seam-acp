@@ -57,6 +57,8 @@ export type MuxSpawnedProcess = ChildProcessByStdio<Writable, Readable, Readable
   remoteRung1Recovery?: boolean;
   /** One line for the thread about a substitution the host made at spawn. */
   hostNotice?: string;
+  /** Host-selected cwd when the requested path is absent there. */
+  cwdFallback?: { requested: string; used: string };
 };
 
 /** Subset of makeMux() used to spawn a remote slot. */
@@ -184,6 +186,7 @@ export async function spawnRemoteSlot(
       ? (result as { cwdFallback?: { requested?: unknown; used?: unknown } }).cwdFallback
       : undefined;
     if (cwdFallback && typeof cwdFallback.requested === "string" && typeof cwdFallback.used === "string") {
+      child.cwdFallback = { requested: cwdFallback.requested, used: cwdFallback.used };
       child.hostNotice = `📁 \`${cwdFallback.requested}\` isn't on this host, so this session works in \`${cwdFallback.used}\`.`;
     }
   } catch (err) {

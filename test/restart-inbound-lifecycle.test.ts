@@ -11,6 +11,10 @@ import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 import { listLiveMarkers } from "../packages/core/src/core/dispatch/turn-resume.js";
 import type { DeliveryNonceLookup } from "../packages/core/src/platforms/chat-adapter.js";
 import { EventEmitter } from "node:events";
+import {
+  StreamingMessageRenderer,
+  streamingMessageChunks,
+} from "../packages/core/src/core/streaming-message-renderer.js";
 
 const cleanups: (() => void)[] = [];
 afterEach(() => { for (const f of cleanups.splice(0).reverse()) f(); vi.restoreAllMocks(); });
@@ -41,7 +45,11 @@ function setup() {
       entered(); await gate; throw new Error("ACP connection closed");
     }), idle: async () => {}, cancel: async () => {},
   };
-  const recoveryRuntime = {};
+  let onRecoveryEvent: (event: any) => Promise<void> = async () => {};
+  const recoveryRuntime = {
+    onEvent(f: typeof onRecoveryEvent) { onRecoveryEvent = f; },
+    idle: async () => {},
+  };
   const router = { listProfiles: () => [],
     describeConfig: () => ({ agent: { value: "codex" }, model: { value: "test" },
       effort: { value: null }, cwd: { value: "/synthetic" }, location: { value: "local" }, fastMode: { value: false } }),
@@ -74,7 +82,9 @@ function setup() {
   return { dir, store, started, release, runtime, router, adapter, orch, make, run,
     evidence: (evidence: unknown) => onEvent({ kind: "submission-evidence", evidence }),
     fallback: (code: string) => onEvent({ kind: "agy-stdout-fallback", code }),
-    emit: (text: string) => onEvent({ kind: "agent-text", text }) };
+    emit: (text: string) => onEvent({ kind: "agent-text", text }),
+    emitRecovery: (event: any) => onRecoveryEvent(event),
+  };
 }
 
 describe("#250 human turn production pipeline, synthetic transport only", () => {
@@ -174,6 +184,124 @@ describe("#250 human turn production pipeline, synthetic transport only", () => 
       { state: "Done", action: "end_turn" }
     );
     // The restart path owns delivery, settlement, and the original card.
+  });
+
+  it("#702 resumes adopted text and tool status without replaying acknowledged output", async () => {
+    const h = setup();
+    const attempts = h.store.turnAttempts;
+    attempts.registerOwner("pre-restart-owner");
+    const attempt = attempts.claim({
+      id: "inbound-1",
+      target: "worker",
+      prompt: "ORIGINAL DISPOSABLE WORK",
+      session: "live",
+      kind: "parked",
+      createdUtc: new Date().toISOString(),
+    }, "synthetic-identity", "pre-restart-owner", "inbound");
+    attempts.bind(attempt, "recorded-acp");
+    attempts.bindStatusCard(attempt, { channelId: "worker", messageId: "persisted-panel" });
+    attempts.startPrompt(attempt);
+    expect(attempts.recordRemoteRecovery(attempt, {
+      version: 1,
+      location: "remote-one",
+      slot: 6,
+      submissionId: "submission-6",
+      acpSessionId: "recorded-acp",
+      delegatedUtc: "2026-09-22T12:00:00.000Z",
+    })).toBe(true);
+    expect(attempts.suspendBoot("pre-restart-owner")).toBe(1);
+
+    const alreadyVisible = "before restart\n\n";
+    const resumedFirst = `${"A".repeat(2100)}\n\n`;
+    const resumedLast = `${"B".repeat(2200)} done`;
+    const resumedText = resumedFirst + resumedLast;
+    const adopted = new EventEmitter() as EventEmitter & { kill: ReturnType<typeof vi.fn> };
+    adopted.kill = vi.fn();
+    const mux = {
+      sendCmd: vi.fn(async () => ({ health: [{
+        slot: 6,
+        alive: true,
+        outputAckedThrough: 41,
+        recovery: {
+          version: 1,
+          owner: "bridge",
+          submissionId: "submission-6",
+          acpSessionId: "recorded-acp",
+          rung: 1,
+          phase: "executing",
+          retry: 0,
+          budget: 3,
+          remaining: 3,
+          disposition: "none",
+          updatedUtc: "2026-09-22T12:01:00.000Z",
+        },
+      }] })),
+      adopt: vi.fn(() => {
+        queueMicrotask(async () => {
+          await h.emitRecovery({ kind: "agent-text", text: resumedFirst });
+          await h.emitRecovery({ kind: "tool-start", toolCallId: "tool-1", title: "Read file" });
+          await h.emitRecovery({ kind: "tool-update", toolCallId: "tool-1", status: "completed" });
+          await h.emitRecovery({ kind: "agent-text", text: resumedLast });
+          adopted.emit("remoteRecoveryResult", {
+            version: 1,
+            submissionId: "submission-6",
+            acpSessionId: "recorded-acp",
+            status: "completed",
+            text: alreadyVisible + resumedText,
+            stopReason: "end_turn",
+            finishedUtc: "2026-09-22T12:02:00.000Z",
+          });
+        });
+        return adopted;
+      }),
+    };
+    const visible: string[] = [];
+    const nonces = new Map<string, { channel: any; id: string }>();
+    h.adapter.sendMessage.mockImplementation(async (channel: any, text: string, delivery?: { nonce?: string }) => {
+      const nonce = delivery?.nonce;
+      if (nonce && nonces.has(nonce)) return nonces.get(nonce)!;
+      const ref = { channel, id: `message-${visible.length}` };
+      visible.push(text);
+      if (nonce) nonces.set(nonce, ref);
+      return ref;
+    });
+    const restarted = h.make({
+      muxFor: (requested: string) => requested === "remote-one" ? mux : undefined,
+      slotHealthFor: () => [],
+    });
+
+    await restarted.recoverInterruptedTurns();
+    await vi.waitFor(() => expect(attempts.get("inbound-1")?.state).toBe("completed"));
+
+    expect(mux.adopt).toHaveBeenCalledWith(6, {
+      allowAppTraffic: true,
+      afterSeq: 41,
+    });
+    const expectedVisible: string[] = [];
+    const expectedRenderer = new StreamingMessageRenderer(async (text) => {
+      expectedVisible.push(text);
+    });
+    expectedRenderer.feed(resumedFirst);
+    await expectedRenderer.flush();
+    expectedRenderer.feed(resumedLast);
+    await expectedRenderer.finalize();
+    expect(visible).toEqual(expectedVisible);
+    expect(visible).not.toContain(alreadyVisible);
+    expect(visible.every((text) => text.length <= 1800)).toBe(true);
+    expect(attempts.get("inbound-1")).toMatchObject({
+      state: "completed",
+      deliveryDone: true,
+      deliveryPayload: { kind: "messages", texts: visible },
+      outcome: { output: alreadyVisible + resumedText },
+    });
+    expect(h.adapter.editStatusPanelProjection).toHaveBeenCalledWith(
+      { channel: { platform: "discord", id: "worker" }, id: "persisted-panel" },
+      { state: "Working", action: "Tool: Read file" }
+    );
+    expect(h.adapter.editStatusPanelProjection).toHaveBeenLastCalledWith(
+      { channel: { platform: "discord", id: "worker" }, id: "persisted-panel" },
+      { state: "Done", action: "end_turn" }
+    );
   });
 
   // #536: deleting the inbound hook must lose the new snapshot, not silently pass on the initial intent alone.
@@ -391,6 +519,78 @@ describe("#250 human turn production pipeline, synthetic transport only", () => 
     // equality reintroduces at-least-once duplicate delivery.
     expect(replayDelivery).toEqual(firstDelivery);
     expect(replayDelivery).toMatchObject({ enforceNonce: true });
+  });
+
+  it("#702 splits an existing oversized recorded payload during boot replay", async () => {
+    const h = setup();
+    const attempts = h.store.turnAttempts;
+    attempts.registerOwner("old-owner");
+    const attempt = attempts.claim({
+      id: "inbound-1", target: "worker", prompt: "legacy", session: "live",
+      kind: "parked", createdUtc: new Date().toISOString(),
+    }, "synthetic-identity", "old-owner", "inbound");
+    const body = `${"first paragraph. ".repeat(160)}\n\n${"second paragraph. ".repeat(160)}`;
+    attempts.complete(attempt, {
+      id: attempt.id,
+      target: "worker",
+      status: "completed",
+      output: body,
+      finishedUtc: new Date().toISOString(),
+    });
+    attempts.prepareDelivery(attempt.id, "worker", { kind: "message", text: body });
+    h.adapter.findMessageByNonce.mockResolvedValue({ status: "absent" });
+    const sent: Array<{ text: string; nonce?: string }> = [];
+    h.adapter.sendMessage.mockImplementation(async (channel: any, text: string, delivery?: { nonce?: string }) => {
+      sent.push({ text, nonce: delivery?.nonce });
+      return { channel, id: `replayed-${sent.length}` };
+    });
+
+    await h.make().recoverInterruptedTurns();
+
+    expect(sent.length).toBeGreaterThan(1);
+    expect(sent.map(({ text }) => text)).toEqual(await streamingMessageChunks(body));
+    expect(sent.every(({ text }) => text.length <= 1800)).toBe(true);
+    expect(new Set(sent.map(({ nonce }) => nonce)).size).toBe(sent.length);
+    expect(attempts.get(attempt.id)?.deliveryDone).toBe(true);
+    expect(h.runtime.prompt).not.toHaveBeenCalled();
+  });
+
+  it("#702 replays only missing chunks from a partially accepted payload", async () => {
+    const h = setup();
+    const attempts = h.store.turnAttempts;
+    attempts.registerOwner("old-owner");
+    const attempt = attempts.claim({
+      id: "inbound-1", target: "worker", prompt: "legacy", session: "live",
+      kind: "parked", createdUtc: new Date().toISOString(),
+    }, "synthetic-identity", "old-owner", "inbound");
+    const body = `${"accepted prefix. ".repeat(150)}\n\n${"missing suffix. ".repeat(150)}`;
+    attempts.complete(attempt, {
+      id: attempt.id,
+      target: "worker",
+      status: "completed",
+      output: body,
+      finishedUtc: new Date().toISOString(),
+    });
+    attempts.prepareDelivery(attempt.id, "worker", { kind: "message", text: body });
+    const chunks = await streamingMessageChunks(body);
+    h.adapter.findMessageByNonce
+      .mockResolvedValueOnce({
+        status: "found",
+        message: { channel: { platform: "discord", id: "worker" }, id: "accepted" },
+      })
+      .mockResolvedValue({ status: "absent" });
+    const sent: string[] = [];
+    h.adapter.sendMessage.mockImplementation(async (channel: any, text: string) => {
+      sent.push(text);
+      return { channel, id: `replayed-${sent.length}` };
+    });
+
+    await h.make().recoverInterruptedTurns();
+
+    expect(h.adapter.findMessageByNonce).toHaveBeenCalledTimes(chunks.length);
+    expect(sent).toEqual(chunks.slice(1));
+    expect(attempts.get(attempt.id)?.deliveryDone).toBe(true);
+    expect(h.runtime.prompt).not.toHaveBeenCalled();
   });
 
   it("confirms a Discord-accepted nonce after crashing before delivery_done", async () => {

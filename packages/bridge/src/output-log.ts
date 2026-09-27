@@ -96,6 +96,8 @@ export interface OutputLog {
   append(slot: number, type: string, payload: Record<string, unknown>, now?: number, seq?: number): number;
   since(slot: number, afterSeq: number, now?: number): OutputLogReplay;
   ack(slot: number, throughSeq: number, now?: number): void;
+  /** Highest frame the controller acknowledged before a reconnect/restart. */
+  acknowledgedThrough(slot: number): number;
   dropSlot(slot: number): void;
   /** Diagnostics only. */
   stats(): { slots: number; frames: number; bytes: number };
@@ -202,6 +204,10 @@ export function createOutputLog(options: OutputLogOptions = {}): OutputLog {
       // not dropped at once, because a bridge restart replays recent frames.
       log.ackedThrough = Math.max(log.ackedThrough, throughSeq);
       enforceBounds(now);
+    },
+
+    acknowledgedThrough(slot) {
+      return logs.get(slot)?.ackedThrough ?? 0;
     },
 
     dropSlot(slot) {

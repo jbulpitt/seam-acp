@@ -143,6 +143,16 @@ describe("#444 the cursor is what survives a disconnect", () => {
     expect(ws.sent.filter((frame) => frame.type === "data" || frame.type === "spawn")).toEqual([]);
   });
 
+  it("#702 adopts after the cursor acknowledged by the prior controller", async () => {
+    const ws = new FakeWs();
+    const mux = makeMux({ id: "b1" });
+    mux.attach(ws as never);
+    mux.adopt(12, { afterSeq: 27 });
+    await flush();
+
+    expect(ws.cmds("replayOutput").at(-1)?.payload).toEqual({ slot: 12, afterSeq: 27 });
+  });
+
   it("#431 continues an in-flight slot after a real socket replacement without replaying its prompt", async () => {
     const disconnects: string[] = [];
     const { ws, mux, child, chunks } = harness({

@@ -48,6 +48,16 @@ describe("#444 the log keeps output a disconnect used to destroy", () => {
   it("returns nothing for a slot it has never seen, rather than inventing a gap", () => {
     expect(createOutputLog().since(99, 0)).toEqual({ frames: [] });
   });
+
+  it("reports the controller cursor retained for restart adoption", () => {
+    const log = createOutputLog();
+    log.append(1, "data", frame(1));
+    log.append(1, "data", frame(2));
+    log.ack(1, 2);
+
+    expect(log.acknowledgedThrough(1)).toBe(2);
+    expect(log.acknowledgedThrough(99)).toBe(0);
+  });
 });
 
 describe("#444 trimming is bounded without any acknowledgment", () => {

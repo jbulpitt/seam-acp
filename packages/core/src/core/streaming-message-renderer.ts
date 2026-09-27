@@ -126,6 +126,17 @@ export class StreamingMessageRenderer {
     return this.flushQueue.idle();
   }
 
+  /** Force-drain prose received so far without ending the stream. */
+  async flush(): Promise<void> {
+    if (this.finalized) {
+      await this.flushQueue.idle();
+      return;
+    }
+    this.cancelIdleTimer();
+    void this.commitBuffer();
+    await this.flushQueue.idle();
+  }
+
   /** Feed one chunk of streamed agent text. Runs it through the fence extractor
    *  and routes each ordered segment: prose into the flush pipeline, a fence-open
    *  commits the preceding prose, a fence-close re-emits the fence as its own
@@ -238,8 +249,7 @@ export class StreamingMessageRenderer {
           });
           this.sent += 1;
           if (notice) {
-            await this.send(notice);
-            this.sent += 1;
+            await this.sendBounded(notice);
           }
           return;
         } catch (err) {
@@ -251,16 +261,31 @@ export class StreamingMessageRenderer {
             ? `${notice}\n_(couldn't render latex)_`
             : "_(couldn't render latex)_";
           const reconstructed = "```" + (fence.lang ?? "") + "\n" + fence.content + "\n```";
-          await this.send(`${reconstructed}\n${failNotice}`);
-          this.sent += 1;
+          await this.sendBounded(`${reconstructed}\n${failNotice}`);
           return;
         }
       }
       const reconstructed = "```" + (fence.lang ?? "") + "\n" + fence.content + "\n```";
       const text = notice ? `${reconstructed}\n${notice}` : reconstructed;
-      await this.send(text);
-      this.sent += 1;
+      await this.sendBounded(text);
     });
+  }
+
+  private async sendBounded(text: string): Promise<void> {
+    let rest = text;
+    while (rest) {
+      const split = splitForFlush(rest, {
+        maxLen: this.hardMax,
+        softMin: this.softMin,
+        force: true,
+        allowUnsafeCut: true,
+      });
+      const next = split?.send ?? rest.slice(0, this.hardMax);
+      rest = split?.send ? split.keep : rest.slice(next.length);
+      if (!next) break;
+      await this.send(next);
+      this.sent += 1;
+    }
   }
 
   private tripFenceWatchdog(notice: string): void {
@@ -348,4 +373,16 @@ export class StreamingMessageRenderer {
     // in the normal path anyway.
     this.idleTimer.unref?.();
   }
+}
+
+/** Render completed text into the exact message chunks the live renderer uses. */
+export async function streamingMessageChunks(text: string): Promise<string[]> {
+  if (!text) return [];
+  const chunks: string[] = [];
+  const renderer = new StreamingMessageRenderer(async (chunk) => {
+    chunks.push(chunk);
+  });
+  renderer.feed(text);
+  await renderer.finalize();
+  return chunks;
 }

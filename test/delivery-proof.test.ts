@@ -7,6 +7,7 @@ import path from "node:path";
 import { DiscordAdapter } from "../packages/core/src/platforms/discord/adapter.js";
 import {
   DELIVERY_NONCE_LENGTH,
+  deliveryChunkNonce,
   deliveryNonce,
 } from "../packages/core/src/core/dispatch/delivery-proof.js";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
@@ -41,6 +42,14 @@ describe("#305 Discord nonce delivery proof", () => {
     expect(deliveryNonce("dispatch-305")).toBe("Zb2vDQoTQKsHKsy1kfvGLbSVK");
     expect(deliveryNonce("dispatch-305")).toHaveLength(DELIVERY_NONCE_LENGTH);
     expect(deliveryNonce("different-dispatch")).not.toBe("Zb2vDQoTQKsHKsy1kfvGLbSVK");
+  });
+
+  it("derives one stable nonce per terminal message chunk", () => {
+    const base = deliveryNonce("dispatch-305");
+    expect(deliveryChunkNonce(base, 0)).toBe(base);
+    expect(deliveryChunkNonce(base, 1)).toHaveLength(DELIVERY_NONCE_LENGTH);
+    expect(deliveryChunkNonce(base, 1)).not.toBe(base);
+    expect(deliveryChunkNonce(base, 2)).not.toBe(deliveryChunkNonce(base, 1));
   });
 
   it("forwards nonce enforcement through the actual discord.js send path", async () => {

@@ -1,6 +1,6 @@
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { loadConfig, isChannelLocked, resolveThreadLocation, resolveThreadTtsVoice, resolveThreadTtsPace, resolveThreadTtsStyle, adminParticipantOverlapIds, GROK_STATIC_MODELS, ZAI_STATIC_MODELS, OLLAMA_CLOUD_STATIC_MODELS } from "./config.js";
+import { loadConfig, buildChannelPresetMaps, isChannelLocked, resolveThreadLocation, resolveThreadTtsVoice, resolveThreadTtsPace, resolveThreadTtsStyle, adminParticipantOverlapIds, GROK_STATIC_MODELS, ZAI_STATIC_MODELS, OLLAMA_CLOUD_STATIC_MODELS } from "./config.js";
 import { enrichModelListWithKnownLimits } from "./core/context-window.js";
 import {
   hostEmoji,
@@ -115,6 +115,16 @@ import { planAgyIdentityMigration, readAgyHandleOwnership } from "./core/agy-ide
 
 async function main(): Promise<void> {
   const config = loadConfig();
+  // Thread agent/model choices are saved in the presets file; with none
+  // configured every switch was refused, so a fresh install keeps one here.
+  if (!config.CHANNEL_PRESETS_FILE) {
+    const file = path.join(config.DATA_DIR, "channel-presets.json");
+    if (!fs.existsSync(file)) {
+      fs.mkdirSync(config.DATA_DIR, { recursive: true });
+      fs.writeFileSync(file, `${JSON.stringify({ channels: {}, threads: {}, bridges: {} }, null, 2)}\n`);
+    }
+    Object.assign(config, { CHANNEL_PRESETS_FILE: file }, buildChannelPresetMaps(file));
+  }
   const localBridgeCredential = await loadOrCreateLocalBridgeCredential(config.DATA_DIR);
   setAgentLocationDeny(config.AGENT_LOCATION_DENY);
   console.log(`[BOOT] Loaded REPO_EMOJIS with ${config.REPO_EMOJIS.size} entries.`);

@@ -502,6 +502,10 @@ import {
   speakReplyToOgg,
 } from "../../core/audio/voice-replies.js";
 import { ATTACH_FENCE_LANG, WAKE_FENCE_LANG, WATCH_FENCE_LANG, CHOICE_FENCE_LANG, RESULT_FENCE_LANG, isMathFenceLang, sanitizeSpeakerName, sessionHasSeamMcp, withHarnessPreamble } from "../../core/agent-conventions.js";
+
+const SEAM_DIRECTIVE_FENCE_LANGS: ReadonlySet<string> = new Set([
+  ATTACH_FENCE_LANG, WAKE_FENCE_LANG, WATCH_FENCE_LANG, CHOICE_FENCE_LANG, RESULT_FENCE_LANG,
+]);
 import {
   ThreadNamer,
   ThreadNamerConfigStore,
@@ -10233,6 +10237,15 @@ export class Orchestrator {
                   }
                 }
               : undefined,
+            // Seam directive fences run through the same handler as a live turn.
+            handleFence: async (fence) => {
+              if (!fence.lang || !SEAM_DIRECTIVE_FENCE_LANGS.has(fence.lang)) return false;
+              if (!this.queueFenceCurrent(queueFence)) return true;
+              await this.emitClosedFence(target, fence, 0, {
+                preferredRoot: isolatedWorkerCwd ?? this.effectiveCwd(record),
+              });
+              return true;
+            },
           }
         );
       } else if (streaming && panelRef) {

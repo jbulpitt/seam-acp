@@ -630,7 +630,7 @@ export class DispatchWatcher {
    */
   async cancelRunning(filter?: { target?: string; id?: string }): Promise<string[]> {
     const targetFence = filter?.target ? this.fenceTarget(filter.target) : undefined;
-    const globalFence = filter?.target ? undefined : this.fenceAll();
+    const globalFence = filter?.target || filter?.id ? undefined : this.fenceAll();
     if (filter?.id) {
       this.quarantined.add(filter.id);
       this.revokeArtifact(filter.id);

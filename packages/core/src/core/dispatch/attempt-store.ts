@@ -514,7 +514,7 @@ export class TurnAttemptStore {
    * recorded session like any other interrupted turn (#631). */
   releaseLostRemoteRecovery(a: TurnAttempt, binding: RemoteRecoveryBinding): boolean {
     return this.db.prepare(`UPDATE turn_attempts
-      SET runtime_json=json_remove(runtime_json, '$.remoteRecovery'), updated_utc=?
+      SET runtime_json=NULLIF(json_remove(runtime_json, '$.remoteRecovery'), '{}'), updated_utc=?
       WHERE id=? AND generation=? AND state='suspended'
         AND json_extract(runtime_json, '$.remoteRecovery.submissionId')=?
         AND json_extract(runtime_json, '$.remoteRecovery.slot')=?`)
@@ -531,7 +531,7 @@ export class TurnAttemptStore {
       delivery_abandoned_reason=COALESCE(delivery_abandoned_reason, ?), updated_utc=?
       WHERE id=? AND generation=? AND state='suspended' AND json_extract(runtime_json,'$.remoteRecovery.submissionId')=?`)
       .run(JSON.stringify(outcome), suppressedOnwardDeliveryReason(outcome), new Date().toISOString(),
-        a.id, a.generation, result.submissionId).changes === 1;
+        a.id, a.generation, binding.submissionId).changes === 1;
   }
 
   assertCurrent(a: TurnAttempt): void {

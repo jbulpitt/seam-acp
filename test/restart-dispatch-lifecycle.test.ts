@@ -14,6 +14,7 @@ import { discordRenderer } from "../packages/core/src/platforms/discord/renderer
 import { projectAttemptCompletions } from "../packages/core/src/core/dispatch/attempt-recovery.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 import { DispatchSuspendedError } from "../packages/core/src/core/dispatch/attempt-store.js";
+import { executionIdentity } from "../packages/core/src/core/dispatch/execution-identity.js";
 import { attachLocalBridge } from "./local-bridge-fixture.js";
 import { AgentRuntime } from "../packages/core/src/agents/agent-runtime.js";
 import type { AgentProfile } from "@seam/adapters";
@@ -596,4 +597,176 @@ describe("#250 production dispatch lifecycle (synthetic transport, no providers)
       { state: "Done", action: "end_turn" },
     );
   });
+
+  it("continues a dead remote recovery before the next queued wake runs", async () => {
+    const h = setup();
+    simulateRetiredOwnerProcess();
+    h.store.turnAttempts.registerOwner("controller-before-restart");
+    const attempt = h.store.turnAttempts.claim(
+      { ...h.spec, id: "dead-wake", kind: "wake", returnTo: undefined },
+      executionIdentity({ agentId: "codex", location: "local", session: "live",
+        cwd: "/synthetic", config: "{}" }),
+      "controller-before-restart",
+      "dispatch",
+    );
+    h.store.turnAttempts.bind(attempt, "recorded-acp");
+    h.store.turnAttempts.bindStatusCard(attempt, {
+      channelId: "worker",
+      messageId: "dead-card",
+    });
+    h.store.turnAttempts.startPrompt(attempt);
+    h.store.turnAttempts.recordRemoteRecovery(attempt, {
+      version: 1,
+      location: "remote-one",
+      slot: 19,
+      submissionId: "submission-dead",
+      acpSessionId: "recorded-acp",
+      delegatedUtc: "2026-09-27T20:11:00.000Z",
+    });
+    h.store.turnAttempts.suspendBoot("controller-before-restart");
+
+    const mux = {
+      sendCmd: vi.fn(async () => ({ health: [{
+        slot: 19,
+        alive: false,
+        recovery: {
+          version: 1,
+          owner: "bridge",
+          submissionId: "submission-dead",
+          acpSessionId: "recorded-acp",
+          rung: 1,
+          phase: "local_write_completed",
+          retry: 0,
+          budget: 3,
+          remaining: 3,
+          disposition: "none",
+          updatedUtc: "2026-09-27T20:12:00.000Z",
+        },
+      }] })),
+      adopt: vi.fn(),
+    };
+    let continuationStarted!: () => void;
+    let releaseContinuation!: () => void;
+    const started = new Promise<void>((resolve) => { continuationStarted = resolve; });
+    const release = new Promise<void>((resolve) => { releaseContinuation = resolve; });
+    h.runtime.prompt
+      .mockImplementationOnce(async (text) => {
+        continuationStarted();
+        expect(String(text)).toContain("continue");
+        await release;
+        return { stopReason: "end_turn" };
+      })
+      .mockImplementationOnce(async (text) => {
+        expect(String(text)).toContain("queued wake");
+        return { stopReason: "end_turn" };
+      });
+    const restarted = h.makeOrch();
+    restarted.setBridgeHub({
+      muxFor: (location: string) => location === "remote-one" ? mux : undefined,
+      slotHealthFor: () => [],
+    } as any);
+    vi.spyOn(restarted as any, "enqueueReportBack").mockResolvedValue(undefined);
+    const watcher = createRuntimeDispatchWatcher({
+      attempts: h.store.turnAttempts,
+      dataDir: h.dataDir,
+      logger: pino({ level: "silent" }) as any,
+      resumeEnabled: true,
+      runtime: restarted,
+      pollMs: 1_000_000,
+    });
+    restarted.setDispatchWatcher(watcher);
+    cleanups.push(() => watcher.stop());
+    const resume = vi.spyOn(restarted, "resumeTurnManually");
+
+    const boot = watcher.start();
+    await vi.waitFor(() => expect(resume).toHaveBeenCalledWith("dead-wake"));
+    await resume.mock.results[0]!.value;
+    const continuation = h.runtime.prompt.mock.calls.length === 0
+      ? watcher.tick()
+      : Promise.resolve();
+    await started;
+    await enqueueDispatchSpec(h.dataDir, {
+      ...h.spec,
+      id: "wake-after-dead",
+      kind: "wake",
+      returnTo: undefined,
+      prompt: "queued wake",
+    });
+    releaseContinuation();
+    await Promise.all([boot, continuation]);
+    await watcher.tick();
+    await vi.waitFor(() => expect(h.store.turnAttempts.get("dead-wake")?.state).toBe("completed"));
+    await vi.waitFor(() => expect(h.store.turnAttempts.get("wake-after-dead")?.state).toBe("completed"));
+
+    expect(mux.adopt).not.toHaveBeenCalled();
+    expect(h.store.turnAttempts.get("dead-wake")).toMatchObject({
+      state: "completed",
+      outcome: {
+        status: "completed",
+      },
+    });
+    expect(h.store.turnAttempts.get("wake-after-dead")?.state).toBe("completed");
+    expect(h.runtime.prompt).toHaveBeenCalledTimes(2);
+    expect(String(h.runtime.prompt.mock.calls[0]?.[0])).toContain("continue");
+    expect(String(h.runtime.prompt.mock.calls[1]?.[0])).toContain("queued wake");
+  }, 15_000);
+
+  it("runs a queued report-back after a human interrupts the active dispatch", async () => {
+    const h = setup();
+    const order: string[] = [];
+    let releaseActive!: () => void;
+    let activeStarted!: () => void;
+    const active = new Promise<void>((resolve) => { activeStarted = resolve; });
+    const release = new Promise<void>((resolve) => { releaseActive = resolve; });
+    h.runtime.prompt
+      .mockImplementationOnce(async () => {
+        order.push("active dispatch");
+        activeStarted();
+        await release;
+        return { stopReason: "cancelled" };
+      })
+      .mockImplementationOnce(async () => {
+        order.push("report-back");
+        return { stopReason: "end_turn" };
+      });
+    Object.assign(h.router, {
+      isBusy: () => true,
+      abortTurn: vi.fn(async () => {
+        releaseActive();
+        return "cancelled" as const;
+      }),
+    });
+    vi.spyOn(h.orch as any, "handleIncomingMessageInner").mockImplementation(async () => {
+      order.push("human");
+    });
+    await h.watcher.start();
+    await enqueueDispatchSpec(h.dataDir, { ...h.spec, returnTo: undefined });
+    await enqueueDispatchSpec(h.dataDir, {
+      ...h.spec,
+      id: "queued-report-back",
+      kind: "report_back",
+      returnTo: undefined,
+      prompt: "worker result",
+    });
+    void h.watcher.tick();
+    await active;
+
+    const handling = (h.orch as any).handleIncomingMessage({
+      messageId: "1553034067430215711",
+      channel: { platform: "discord", id: "worker" },
+      authorId: "human",
+      authorName: "Human",
+      authorIsBot: false,
+      text: "new human direction",
+    });
+    await vi.waitFor(() => expect(order).toContain("human"));
+    await handling;
+    await vi.waitFor(() =>
+      expect(h.store.turnAttempts.get("queued-report-back")?.state).toBe("completed")
+    );
+
+    expect(h.store.turnAttempts.get("held")?.state).toBe("cancelled");
+    expect(h.store.turnAttempts.get("queued-report-back")?.outcome?.error).toBeUndefined();
+    expect(order).toEqual(["active dispatch", "human", "report-back"]);
+  }, 15_000);
 });

@@ -549,7 +549,7 @@ export class DiscordAdapter implements ChatAdapter {
         if (!thread.lastMessageId || BigInt(thread.lastMessageId) <= BigInt(after)) continue;
         const page = await thread.messages.fetch({ after, limit: 100 });
         for (const msg of page.values()) {
-          if (!msg.author.bot && this.config.DISCORD_ALLOWED_USER_IDS.has(msg.author.id)) missed.push(msg);
+          if (this.isPersonAuthor(msg.author) && this.config.DISCORD_ALLOWED_USER_IDS.has(msg.author.id)) missed.push(msg);
         }
       }
     }
@@ -562,8 +562,14 @@ export class DiscordAdapter implements ChatAdapter {
     return missed.length;
   }
 
+  /** A person, or a bot listed in DISCORD_ALLOWED_BOT_IDS; never this bot. */
+  private isPersonAuthor(author: { id: string; bot?: boolean | null }): boolean {
+    if (author.id === this.getBotUserId()) return false;
+    return !author.bot || this.config.DISCORD_ALLOWED_BOT_IDS?.has(author.id) === true;
+  }
+
   getBotUserId(): string | undefined {
-    return this.botUserId ?? this.client.user?.id;
+    return this.botUserId ?? this.client?.user?.id;
   }
 
   /** Gateway heartbeat RTT in ms; undefined if the WS isn't ready. */
@@ -1622,7 +1628,7 @@ export class DiscordAdapter implements ChatAdapter {
         // Skip bot messages that are status cards / panels. These are embed-
         // only messages (or embed + minimal content) that show operational info
         // (model, context usage, timing) — useless noise for Compact from Thread.
-        if (msg.author.bot && msg.embeds.length > 0 && !msg.content?.trim()) continue;
+        if (!this.isPersonAuthor(msg.author) && msg.embeds.length > 0 && !msg.content?.trim()) continue;
 
         let text = msg.content ?? "";
         if (msg.attachments.size > 0) {
@@ -1631,9 +1637,9 @@ export class DiscordAdapter implements ChatAdapter {
         }
 
         messages.push({
-          authorIsBot: msg.author.bot,
+          authorIsBot: !this.isPersonAuthor(msg.author),
           text: text.trim(),
-          ...(msg.author.bot ? {} : { authorName: this.resolveAuthorName(msg) }),
+          ...(this.isPersonAuthor(msg.author) ? { authorName: this.resolveAuthorName(msg) } : {}),
         });
       }
       
@@ -1700,7 +1706,7 @@ export class DiscordAdapter implements ChatAdapter {
         timestampMs: msg.createdTimestamp,
         authorId: msg.author.id,
         authorName: this.resolveAuthorName(msg),
-        authorType: msg.author.bot ? "bot" : "human",
+        authorType: this.isPersonAuthor(msg.author) ? "human" : "bot",
         content: msg.content?.trim() || embedText,
         attachmentNames,
         hasEmbeds: msg.embeds.length > 0,
@@ -1769,9 +1775,9 @@ export class DiscordAdapter implements ChatAdapter {
         }
         messages.push({
           ts,
-          authorIsBot: msg.author.bot,
+          authorIsBot: !this.isPersonAuthor(msg.author),
           text: text.trim(),
-          ...(msg.author.bot ? {} : { authorName: this.resolveAuthorName(msg) }),
+          ...(this.isPersonAuthor(msg.author) ? { authorName: this.resolveAuthorName(msg) } : {}),
         });
       }
 
@@ -2423,7 +2429,7 @@ export class DiscordAdapter implements ChatAdapter {
 
   private async handleMessage(msg: Message): Promise<void> {
     if (!this.messageHandler) return;
-    if (msg.author.bot) return;
+    if (!this.isPersonAuthor(msg.author)) return;
     if (msg.type !== MessageType.Default && msg.type !== MessageType.Reply) return;
     if (!this.config.DISCORD_ALLOWED_USER_IDS.has(msg.author.id)) return;
     if (!msg.channel.isThread()) return;

@@ -609,7 +609,6 @@ describe("Copilot isolated catalog probing (#234)", () => {
       adapters: new Map([[profile.id, profile]]),
       workspaceRoot: "/workspace",
       cwd: "/workspace",
-      devMode: false,
     }) as typeof local;
 
     expect(remote.models).toEqual(local.models);

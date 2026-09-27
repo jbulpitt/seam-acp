@@ -1,7 +1,6 @@
 /**
  * Bridge-side RPC dispatcher. Calls `@seam/adapters` methods; never imports
- * discord.js. `rpc.method` must be on the adapter allow-list, or a dev-mode
- * handler when `--dev` / `SEAM_BRIDGE_DEV=1` registered them.
+ * discord.js. RPC methods must be on the bridge allow-list.
  */
 import { execFile, exec } from "node:child_process";
 import { promisify } from "node:util";
@@ -11,7 +10,7 @@ import type { McpServer } from "@agentclientprotocol/sdk";
 import type { AgentAdapter } from "@seam/adapters";
 import {
   isAllowedRpcMethod,
-  isDevRpcMethod,
+  isHostRpcMethod,
   invokeAdapterRpc,
   isPathWithinRoot,
   ATTACH_MAX_BYTES,
@@ -42,7 +41,6 @@ export interface RpcContext {
   adapters: Map<string, AgentAdapter>;
   workspaceRoot: string;
   cwd: string;
-  devMode: boolean;
   configureSlot?: (slot: number, cfg: SlotSpawnConfig) => void;
 }
 
@@ -117,11 +115,11 @@ export async function dispatchBridgeRpc(
   agentId: string | undefined,
   ctx: RpcContext
 ): Promise<unknown> {
-  if (!isAllowedRpcMethod(method, { devMode: ctx.devMode })) {
+  if (!isAllowedRpcMethod(method)) {
     throw new Error(`unknown rpc method: ${method}`);
   }
-  if (isDevRpcMethod(method)) {
-    return dispatchDev(method, asRecord(params), ctx);
+  if (isHostRpcMethod(method)) {
+    return dispatchHost(method, asRecord(params), ctx);
   }
   return dispatchAdapter(method, asRecord(params), agentId, ctx);
 }
@@ -206,12 +204,11 @@ async function dispatchAdapter(
   });
 }
 
-async function dispatchDev(
+async function dispatchHost(
   method: string,
   params: Record<string, unknown>,
   ctx: RpcContext
 ): Promise<unknown> {
-  if (!ctx.devMode) throw new Error("dev-mode RPC is not registered on this bridge");
   const root = ctx.workspaceRoot;
 
   switch (method) {

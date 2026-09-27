@@ -48,7 +48,7 @@ async function writePm2(overrides: Record<string, unknown> = {}) {
 }
 
 function baseArgs(overrides: Partial<{ bridgeId:string; app:string; uid:string; checkout:string; entrypoint:string; releaseRoot:string }> = {}) {
-  return [overrides.bridgeId ?? "fixture", overrides.app ?? "fixture-app", "grok", overrides.uid ?? String(process.getuid!()), overrides.checkout ?? checkout, overrides.entrypoint ?? entrypoint, process.execPath, pm2Module, "-", "no", overrides.releaseRoot ?? releaseRoot, "pm2", "-"];
+  return [overrides.bridgeId ?? "fixture", overrides.app ?? "fixture-app", "grok", overrides.uid ?? String(process.getuid!()), overrides.checkout ?? checkout, overrides.entrypoint ?? entrypoint, process.execPath, pm2Module, "-", overrides.releaseRoot ?? releaseRoot, "pm2", "-"];
 }
 
 async function runRemote(action: string[], overrides = {}) {
@@ -128,7 +128,6 @@ describe.sequential("production remote shell deployment identity defenses (#241)
     await expect(runRemote(["preflight"],{uid:String(process.getuid!()+1)})).rejects.toThrow(/wrong_owner/);
     await fs.writeFile(pidFile,String(process.pid)); await writePm2({pid:process.pid}); await expect(runRemote(["preflight"])).rejects.toThrow(/process_cwd_mismatch/); await fs.writeFile(pidFile,String(bridge.pid)); await writePm2();
     await writePm2({pm_exec_path:path.join(checkout,"other.js")}); await expect(runRemote(["preflight"])).rejects.toThrow(/pm2_launcher_mismatch/); await writePm2();
-    await writePm2({args:["connect","--server","wss://controller.invalid","--token","fixture-token","--id","fixture","--dev"]}); await expect(runRemote(["preflight"])).rejects.toThrow(/pm2_dev_mode_mismatch/); await writePm2();
   });
 
   it("#618 verifies a bare `connect` bridge against the host's config file instead of argv", async () => {
@@ -144,8 +143,6 @@ describe.sequential("production remote shell deployment identity defenses (#241)
     expect(preflight.stdout).not.toContain("fixture-token");
     await write(["SEAM_BRIDGE_SERVER=wss://controller.invalid/bridge", "SEAM_BRIDGE_ID=other-host", "SEAM_BRIDGE_TOKEN=fixture-token"]);
     await expect(runRemote(["preflight"])).rejects.toThrow(/bridge_config_id_mismatch/);
-    await write([...valid, "SEAM_BRIDGE_DEV=1"]);
-    await expect(runRemote(["preflight"])).rejects.toThrow(/bridge_config_dev_mode_mismatch/);
     await write([...valid, "SEAM_BRIDGE_CWD=/somewhere"]);
     await expect(runRemote(["preflight"])).rejects.toThrow(/bridge_config_workspace_mismatch/);
     await write(["SEAM_BRIDGE_SERVER=wss://controller.invalid/bridge", "SEAM_BRIDGE_ID=fixture"]);

@@ -28,7 +28,6 @@ import type { Logger } from "../lib/logger.js";
 import {
   safeNativeAgyRuntimeProvenance,
   type ConfigMutationService,
-  type MutationActor,
 } from "./config-mutation.js";
 import type { SeamTokenRegistry } from "./mcp/token-registry.js";
 import { isLocalLocation, normalizeLocation } from "./location.js";
@@ -94,7 +93,6 @@ export interface ConnectedBridge {
     workspaceRoot?: string;
     home?: string;
   };
-  devMode: boolean;
   /** Null when hello did not carry a valid release sha. That is unknown. */
   releaseSha: string | null;
   agents: Map<string, {
@@ -516,22 +514,12 @@ export class BridgeHub {
       bridgeId: expectedId,
       instanceId: hello.instanceId,
       host: hello.host ?? { os: "unknown", arch: "unknown" },
-      devMode: hello.devMode === true,
       releaseSha,
       agents,
       mux,
       connectedAt: Date.now(),
     };
     this.connections.set(expectedId, conn);
-
-    if (conn.devMode) {
-      this.mutation.recordBridgeAudit({
-        bridgeId: expectedId,
-        action: "dev-mode-enable",
-        actor: { id: "bridge", name: expectedId } satisfies MutationActor,
-        extra: { instanceId: hello.instanceId },
-      });
-    }
 
     for (const [agentId, state] of agents) {
       if (!state.installed) continue;
@@ -579,7 +567,6 @@ export class BridgeHub {
       {
         bridgeId: expectedId,
         agents: [...agents.entries()].map(([id, s]) => ({ id, ...s })),
-        devMode: conn.devMode,
         releaseSha: releaseSha ?? "unknown",
       },
       "bridge reconciled"

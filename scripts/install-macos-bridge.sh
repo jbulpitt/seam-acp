@@ -42,7 +42,6 @@ APP_NAME_DEFAULT="seam-bridge"
 
 YES=0
 SKIP_DEPS=0
-DEV=0
 CONNECT_BLOB="${SEAM_CONNECT:-}"
 CWD_ARG="${SEAM_BRIDGE_CWD:-}"
 REPO_DIR_ARG=""
@@ -52,7 +51,6 @@ SERVER=""
 BRIDGE_ID=""
 TOKEN=""
 CONNECT_CWD=""
-CONNECT_DEV=0
 
 # Bound once by the runtime preflight and reused for both the wrapper and PM2.
 # An ambient `node` lookup after the check would recreate #412's ABI-137 entry.
@@ -107,7 +105,6 @@ parse_connect_blob() {
   BRIDGE_ID=""
   TOKEN=""
   CONNECT_CWD=""
-  CONNECT_DEV=0
 
   # shellcheck disable=SC2086
   set -- $1
@@ -132,10 +129,6 @@ parse_connect_blob() {
         [ $# -ge 2 ] || return 1
         CONNECT_CWD=$2
         shift 2
-        ;;
-      --dev)
-        CONNECT_DEV=1
-        shift
         ;;
       wss://*|ws://*)
         SERVER=$1
@@ -207,12 +200,12 @@ seam-bridge connect --server wss://seam.example.com/bridge --id mac --token THE_
     "seam-bridge connect --server ws://localhost:3000/bridge --id local --token t" \
     "ws://localhost:3000/bridge" "local" "t"
 
-  parse_connect_blob "$(collapse_ws "seam-bridge connect --server wss://h/b --id i --token t --cwd /Users/me/Projects --dev")"
-  if [ "$CONNECT_CWD" != "/Users/me/Projects" ] || [ "$CONNECT_DEV" -ne 1 ]; then
-    printf 'FAIL cwd/dev flags\n'
+  parse_connect_blob "$(collapse_ws "seam-bridge connect --server wss://h/b --id i --token t --cwd /Users/me/Projects")"
+  if [ "$CONNECT_CWD" != "/Users/me/Projects" ]; then
+    printf 'FAIL cwd flag\n'
     fails=$((fails + 1))
   else
-    printf 'ok   cwd/dev flags\n'
+    printf 'ok   cwd flag\n'
   fi
 
   expect_fail "missing token" "seam-bridge connect --server wss://h/b --id mac"
@@ -258,7 +251,6 @@ while [ $# -gt 0 ]; do
     --self-test) SELF_TEST=1; shift ;;
     -y|--yes) YES=1; shift ;;
     --skip-deps) SKIP_DEPS=1; shift ;;
-    --dev) DEV=1; shift ;;
     --connect)
       [ $# -ge 2 ] || die "--connect needs the bootstrap line"
       CONNECT_BLOB=$2
@@ -708,22 +700,6 @@ prompt_cwd() {
   [ -d "$WORKSPACE_ROOT" ] || die "workspace root is not a directory: $WORKSPACE_ROOT"
 }
 
-prompt_dev() {
-  if [ "$DEV" -eq 1 ] || [ "$CONNECT_DEV" -eq 1 ]; then
-    DEV=1
-    return
-  fi
-  if [ "$YES" -eq 1 ]; then
-    DEV=0
-    return
-  fi
-  if confirm "Enable --dev (lets /seam debug exec/tail on this Mac)?"; then
-    DEV=1
-  else
-    DEV=0
-  fi
-}
-
 # ---------------------------------------------------------------------------
 write_wrapper() {
   [ -n "$NODE_BIN" ] || die "node runtime preflight did not bind an interpreter"
@@ -755,15 +731,10 @@ SEAM_BRIDGE_SERVER=$SERVER
 SEAM_BRIDGE_ID=$BRIDGE_ID
 SEAM_BRIDGE_TOKEN=$TOKEN
 SEAM_BRIDGE_CWD=$WORKSPACE_ROOT
-SEAM_BRIDGE_DEV=$DEV
 EOF
   chmod 600 "$envfile"
 
   args="connect --server $SERVER --id $BRIDGE_ID --token $TOKEN --cwd $WORKSPACE_ROOT"
-  if [ "$DEV" -eq 1 ]; then
-    args="$args --dev"
-  fi
-
   pm2_name=$APP_NAME_DEFAULT
   if have pm2; then
     if pm2 describe remote-agent-bridge >/dev/null 2>&1; then
@@ -786,7 +757,6 @@ EOF
     printf '      kill_timeout: 30000,\n'
     printf '      env: {\n'
     printf '        PATH: %s,\n' "$(json_str "$extra_path")"
-    printf '        SEAM_BRIDGE_DEV: %s,\n' "$( [ "$DEV" -eq 1 ] && json_str 1 || json_str "" )"
     printf '      },\n'
     printf '    },\n'
     printf '  ],\n'
@@ -838,10 +808,9 @@ main() {
 
   prompt_connect
   prompt_cwd
-  prompt_dev
 
   log "Will run:"
-  info "seam-bridge connect --server $SERVER --id $BRIDGE_ID --token *** --cwd $WORKSPACE_ROOT$( [ "$DEV" -eq 1 ] && printf ' --dev' )"
+  info "seam-bridge connect --server $SERVER --id $BRIDGE_ID --token *** --cwd $WORKSPACE_ROOT"
   if ! confirm "Start / restart the bridge under pm2?"; then
     die "aborted"
   fi

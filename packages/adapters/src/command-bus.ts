@@ -3,8 +3,7 @@
  *
  * Frames share the existing per-bridge WebSocket with the slot mux
  * (`data` / `kill` / `exit`). `rpc.method` is restricted to the adapter
- * allow-list; `exec` / `shell` / `tailLog` / `writeFile` exist only when
- * the bridge process is in dev mode.
+ * allow-list. Host RPCs execute with the bridge process permissions.
  */
 
 export const PROTOCOL_VERSION = 1;
@@ -30,27 +29,23 @@ export const ADAPTER_RPC_METHODS = [
 
 export type AdapterRpcMethod = (typeof ADAPTER_RPC_METHODS)[number];
 
-export const DEV_RPC_METHODS = ["exec", "shell", "tailLog", "writeFile"] as const;
-export type DevRpcMethod = (typeof DEV_RPC_METHODS)[number];
+export const HOST_RPC_METHODS = ["exec", "shell", "tailLog", "writeFile"] as const;
+export type HostRpcMethod = (typeof HOST_RPC_METHODS)[number];
 
 const ADAPTER_RPC_SET = new Set<string>(ADAPTER_RPC_METHODS);
-const DEV_RPC_SET = new Set<string>(DEV_RPC_METHODS);
+const HOST_RPC_SET = new Set<string>(HOST_RPC_METHODS);
 
 export function isAdapterRpcMethod(method: string): method is AdapterRpcMethod {
   return ADAPTER_RPC_SET.has(method);
 }
 
-export function isDevRpcMethod(method: string): method is DevRpcMethod {
-  return DEV_RPC_SET.has(method);
+export function isHostRpcMethod(method: string): method is HostRpcMethod {
+  return HOST_RPC_SET.has(method);
 }
 
-/** True when the method may be dispatched for this connection. */
-export function isAllowedRpcMethod(
-  method: string,
-  opts: { devMode: boolean }
-): boolean {
-  if (isAdapterRpcMethod(method)) return true;
-  return opts.devMode && isDevRpcMethod(method);
+/** True when the method may be dispatched by a bridge. */
+export function isAllowedRpcMethod(method: string): boolean {
+  return isAdapterRpcMethod(method) || isHostRpcMethod(method);
 }
 
 export interface HelloAgentInventory {
@@ -89,7 +84,7 @@ export interface HelloFrame {
     /** Agent slots outlive this bridge process and can be reconciled by id. */
     durableSlots?: boolean;
   };
-  /** True when the bridge process registered dev-mode RPC handlers. */
+  /** Legacy rollout field. Receivers must ignore it. */
   devMode?: boolean;
   /** Secret-free staged-release identity used only for rollout verification. */
   release?: {

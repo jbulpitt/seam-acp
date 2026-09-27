@@ -8,7 +8,7 @@
  * (hello / hello_ack / rpc / rpc_reply / event). listSlots still uses
  * cmd / cmd_reply. SIGUSR2 enters drain mode.
  *
- *   seam-bridge connect --server <wss-url> --id <bridgeId> --token <token> [--cwd] [--dev]
+ *   seam-bridge connect --server <wss-url> --id <bridgeId> --token <token> [--cwd]
  *
  * ─────────────────────────────────────────────────────────────────────────────
  * CLIENT MODE (default): bridge dials out to seam-acp's WS server.
@@ -190,14 +190,13 @@ async function makeSlotManager(opts: {
   workspaceRoot: string;
   WebSocket: WsCtor;
   bridgeId: string;
-  devMode: boolean;
   adapters: Map<string, AgentAdapter>;
   releaseReceipt?: ReleaseReceiptWriter | null;
   /** Standing release identity. Null when this process has no stage receipt. */
   releaseSha?: string | null;
   sessiond: SessiondClient;
 }): Promise<SlotManager> {
-  const { copilotCmd, localCwd, workspaceRoot, WebSocket, bridgeId, devMode, adapters, releaseReceipt, releaseSha, sessiond } = opts;
+  const { copilotCmd, localCwd, workspaceRoot, WebSocket, bridgeId, adapters, releaseReceipt, releaseSha, sessiond } = opts;
   let currentWs: WsSocket | null = null;
   const slotConfigs = new Map<number, SlotSpawnConfig>();
   let draining = false;
@@ -292,7 +291,8 @@ async function makeSlotManager(opts: {
               home: homedir(),
             },
             agents,
-            devMode,
+            // Legacy controllers gate host RPCs on this field.
+            devMode: true,
             ...(releaseReceipt ? { release: releaseReceipt.helloMetadata() } : {}),
           }))
         );
@@ -585,7 +585,6 @@ async function makeSlotManager(opts: {
             adapters,
             workspaceRoot,
             cwd: localCwd,
-            devMode,
             configureSlot: (slot, cfg) => {
               slotConfigs.set(slot, cfg);
               supervised.configure(slot, cfg);
@@ -720,7 +719,7 @@ async function runClientMode(
   token: string,
   copilotCmd: string,
   localCwd: string,
-  bridgeOpts: { bridgeId: string; devMode: boolean; workspaceRoot: string }
+  bridgeOpts: { bridgeId: string; workspaceRoot: string }
 ) {
   const { WebSocket } = await loadWs();
   await sweepAgyHomesAtBridgeStartup();
@@ -734,7 +733,6 @@ async function runClientMode(
     workspaceRoot: bridgeOpts.workspaceRoot,
     WebSocket,
     bridgeId: bridgeOpts.bridgeId,
-    devMode: bridgeOpts.devMode,
     adapters,
     releaseReceipt,
     releaseSha,
@@ -810,7 +808,7 @@ async function runServerMode(
   token: string,
   copilotCmd: string,
   localCwd: string,
-  bridgeOpts: { bridgeId: string; devMode: boolean; workspaceRoot: string }
+  bridgeOpts: { bridgeId: string; workspaceRoot: string }
 ) {
   const { WebSocket, WebSocketServer } = await loadWs();
   // Server mode is a separate bridge startup path and owns the same temp root.
@@ -825,7 +823,6 @@ async function runServerMode(
     workspaceRoot: bridgeOpts.workspaceRoot,
     WebSocket,
     bridgeId: bridgeOpts.bridgeId,
-    devMode: bridgeOpts.devMode,
     adapters,
     releaseReceipt,
     releaseSha,
@@ -886,13 +883,6 @@ function extractFlag(flag: string): string | null {
   return val;
 }
 
-function extractBoolFlag(flag: string): boolean {
-  const idx = rawArgs.indexOf(flag);
-  if (idx === -1) return false;
-  rawArgs.splice(idx, 1);
-  return true;
-}
-
 // Extract all named flags before touching positional args.
 const cwdArg = extractFlag("--cwd") ?? process.env.SEAM_BRIDGE_CWD;
 const gistArg = extractFlag("--gist");
@@ -901,17 +891,12 @@ const serverFlag = extractFlag("--server");
 const tokenFlag = extractFlag("--token");
 const tokenFileFlag = extractFlag("--token-file");
 const singletonSocket = extractFlag("--singleton-socket");
-const devFlag = extractBoolFlag("--dev") || process.env.SEAM_BRIDGE_DEV === "1";
-
 const localCwd = cwdArg ? cwdArg.replace(/^~/, homedir()) : process.cwd();
 const workspaceRoot = localCwd;
 const bridgeId = idArg ?? "bridge";
-const bridgeOpts = { bridgeId, devMode: devFlag, workspaceRoot };
+const bridgeOpts = { bridgeId, workspaceRoot };
 
 console.error(`[bridge] Local cwd: ${localCwd}`);
-if (devFlag) {
-  console.error("[bridge] Dev mode ON — exec/shell/tailLog/writeFile RPC handlers registered");
-}
 
 /**
  * Resolve a WebSocket URL from a GitHub Gist.
@@ -955,10 +940,10 @@ process.on("SIGUSR2", () => {
 });
 
 function usageAndExit(): never {
-  console.error("Usage: seam-bridge connect --server <wss-url> --id <bridgeId> (--token <token> | --token-file <path>) [--cwd <path>] [--dev]");
-  console.error("       seam-bridge connect   (every setting from ~/.config/seam/bridge.env: SEAM_BRIDGE_SERVER, SEAM_BRIDGE_ID, SEAM_BRIDGE_TOKEN, SEAM_BRIDGE_CWD, SEAM_BRIDGE_DEV)");
-  console.error("       seam-bridge --server <port> --token <token> [--id <bridgeId>] [--cwd <path>] [--dev] [copilot-cmd]");
-  console.error("       seam-bridge [--gist <owner/gistId>] <ws-url> <token> [--id <bridgeId>] [--cwd <path>] [--dev]");
+  console.error("Usage: seam-bridge connect --server <wss-url> --id <bridgeId> (--token <token> | --token-file <path>) [--cwd <path>]");
+  console.error("       seam-bridge connect   (every setting from ~/.config/seam/bridge.env: SEAM_BRIDGE_SERVER, SEAM_BRIDGE_ID, SEAM_BRIDGE_TOKEN, SEAM_BRIDGE_CWD)");
+  console.error("       seam-bridge --server <port> --token <token> [--id <bridgeId>] [--cwd <path>] [copilot-cmd]");
+  console.error("       seam-bridge [--gist <owner/gistId>] <ws-url> <token> [--id <bridgeId>] [--cwd <path>]");
   process.exit(1);
 }
 

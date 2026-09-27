@@ -52,8 +52,8 @@ function live(pid) { try { process.kill(pid, 0); return true; } catch { return f
 function assertUid(stat, uid, code) { if (stat.uid !== uid) fail(code); }
 
 const argv = process.argv.slice(2);
-if (argv.length < 14) fail("argument_count");
-const [bridgeId, pm2App, verifyAgent, uidText, checkoutPath, entrypointPath, nodePath, pm2ModulePath, workspaceText, devModeText, releaseRoot, launcherKind, launcherPathText, mode, ...actionArgs] = argv;
+if (argv.length < 13) fail("argument_count");
+const [bridgeId, pm2App, verifyAgent, uidText, checkoutPath, entrypointPath, nodePath, pm2ModulePath, workspaceText, releaseRoot, launcherKind, launcherPathText, mode, ...actionArgs] = argv;
 let safePhase = "arguments";
 let pidFilePath = "";
 if (![bridgeId, pm2App, verifyAgent].every((v) => NAME.test(v))) fail("unsafe_identity_name");
@@ -68,8 +68,6 @@ if (launcherKind === "systemd") {
 for (const [value, code] of [[checkoutPath,"unsafe_checkout"],[entrypointPath,"unsafe_entrypoint"],[nodePath,"unsafe_node"],[releaseRoot,"unsafe_release_root"]]) exactPath(value, code);
 if (launcherKind === "pm2") exactPath(pm2ModulePath, "unsafe_pm2_module");
 const workspaceArg = workspaceText === "-" ? null : exactPath(workspaceText, "unsafe_workspace");
-if (devModeText !== "yes" && devModeText !== "no") fail("unsafe_dev_mode");
-const expectedDevMode = devModeText === "yes";
 if (entrypointPath !== `${checkoutPath}/packages/bridge/dist/index.js`) fail("entrypoint_not_stable_launcher");
 if (releaseRoot === checkoutPath || releaseRoot.startsWith(`${checkoutPath}/`) || checkoutPath.startsWith(`${releaseRoot}/`)) fail("roots_overlap");
 
@@ -190,7 +188,6 @@ function validateBridgeConfigFile() {
   const config = parseEnv(text);
   if (config.SEAM_BRIDGE_ID !== bridgeId) fail("bridge_config_id_mismatch");
   if (workspaceArg === null ? config.SEAM_BRIDGE_CWD !== undefined : config.SEAM_BRIDGE_CWD !== workspaceArg) fail("bridge_config_workspace_mismatch");
-  if ((config.SEAM_BRIDGE_DEV === "1") !== expectedDevMode) fail("bridge_config_dev_mode_mismatch");
   if (!config.SEAM_BRIDGE_SERVER || !config.SEAM_BRIDGE_TOKEN) fail("bridge_config_connect_incomplete");
 }
 
@@ -202,13 +199,11 @@ function validatePm2Args(raw) {
   if (idOffsets.length !== 1 || args[idOffsets[0] + 1] !== bridgeId) fail("pm2_bridge_id_mismatch");
   const cwdOffsets = args.flatMap((value, index) => value === "--cwd" ? [index] : []);
   if (workspaceArg === null ? cwdOffsets.length !== 0 : cwdOffsets.length !== 1 || args[cwdOffsets[0] + 1] !== workspaceArg) fail("pm2_workspace_mismatch");
-  const devOffsets = args.flatMap((value,index)=>value === "--dev" ? [index] : []);
-  if (expectedDevMode ? devOffsets.length !== 1 : devOffsets.length !== 0) fail("pm2_dev_mode_mismatch");
   const start = args[0] === "connect" ? 1 : 0;
   const flags = new Map(); let positional = 0;
   for (let index = start; index < args.length; index += 1) {
     const value = args[index];
-    if (value === "--dev") continue;
+    if (value === "--dev") continue; // Legacy supervisor args are inert.
     if (value.startsWith("--")) {
       if (!["--server","--token","--id","--cwd","--gist"].includes(value) || flags.has(value) || index + 1 >= args.length || args[index + 1].startsWith("--")) fail("pm2_argv_unexpected");
       flags.set(value,args[++index]);

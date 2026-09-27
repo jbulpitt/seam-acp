@@ -3,13 +3,16 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  formatCanaryResult,
   observeCanaryMessages,
   observeDurabilityOutput,
-  renderCanaryLayout,
+  publishCanaryCard,
+  renderCanaryLayouts,
   SelfCanaryRunner,
   StagingCanaryRunner,
   type CanaryRunResult,
 } from "../packages/core/src/core/canary.js";
+import type { StructuredLayout } from "../packages/core/src/core/types.js";
 import type { TesterMessage } from "../packages/core/src/core/tester-bot.js";
 
 const tempDirs: string[] = [];
@@ -309,7 +312,7 @@ describe("staging canary result card", () => {
       ],
     };
 
-    const layout = renderCanaryLayout(result);
+    const layout = renderCanaryLayouts(result)[0]!;
     const text = layout.blocks
       .filter((block) => block.kind === "text")
       .map((block) => block.content)
@@ -322,7 +325,7 @@ describe("staging canary result card", () => {
     expect(text).toContain("❌ **dev@grok** · 2.0s");
     expect(text).toContain("spawn /missing/grok ENOENT");
     expect(text).toContain("Provider: xAI reports degraded_performance");
-    expect(text).toContain("⏭️ **dev@agy** · —");
+    expect(text).toContain("⏭️ **dev** · agy — not ready");
   });
 
   it("renders one labeled row per durability check", () => {
@@ -345,7 +348,7 @@ describe("staging canary result card", () => {
         },
       ],
     };
-    const layout = renderCanaryLayout(result);
+    const layout = renderCanaryLayouts(result)[0]!;
     const text = layout.blocks
       .filter((block) => block.kind === "text")
       .map((block) => block.content)
@@ -353,5 +356,110 @@ describe("staging canary result card", () => {
     expect(text).toContain("Staging durability — RED");
     expect(text).toContain("**dev@codex** · sessiond restart · 42s");
     expect(text).toContain("missing: nonce-4, nonce-5");
+  });
+
+  it("publishes a production-sized mixed matrix without overflowing a container", async () => {
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "seam-canary-card-"));
+    tempDirs.push(dataDir);
+    const rows: CanaryRunResult["rows"] = Array.from({ length: 48 }, (_, index) => {
+      const base = {
+        host: `host-${index % 4}`,
+        agent: `agent-${index}`,
+        durationMs: index < 40 ? 1_000 + index : null,
+      };
+      if (index < 20) return { ...base, status: "passed" as const, threadId: `thread-${index}` };
+      if (index < 40) {
+        return {
+          ...base,
+          status: "failed" as const,
+          cause: `real failure ${index}`,
+          providerNote: index % 2 === 0 ? "provider degraded" : undefined,
+        };
+      }
+      return {
+        ...base,
+        status: "skipped" as const,
+        cause: index % 2 === 0
+          ? "not reported by bridge (disabled or unavailable)"
+          : "withheld by AGENT_LOCATION_DENY",
+      };
+    });
+    const result: CanaryRunResult = {
+      id: "production-sized-run",
+      target: "self",
+      startedAt: "2026-09-27T00:00:00.000Z",
+      finishedAt: "2026-09-27T00:01:00.000Z",
+      branch: "main",
+      commit: "0123456789abcdef",
+      rows,
+    };
+    const layouts: StructuredLayout[] = [];
+    const pinned: string[] = [];
+    const published = await publishCanaryCard({
+      result,
+      dataDir,
+      channelId: "canary-channel",
+      logger: {
+        warn: () => undefined,
+        error: () => undefined,
+      } as never,
+      adapter: {
+        sendLayout: async (channel, layout) => {
+          expect(layout.blocks.length).toBeLessThanOrEqual(40);
+          layouts.push(layout);
+          return { channel, id: `message-${layouts.length}` };
+        },
+        pinMessage: async (message) => {
+          pinned.push(message.id);
+        },
+        unpinMessage: async () => undefined,
+      },
+    });
+
+    expect(published.cardError).toBeUndefined();
+    expect(layouts).toHaveLength(2);
+    expect(pinned).toEqual(["message-1"]);
+    const text = layouts
+      .flatMap((layout) => layout.blocks)
+      .filter((block) => block.kind === "text")
+      .map((block) => block.content)
+      .join("\n");
+    expect(text).toContain("page 1/2");
+    expect(text).toContain("page 2/2");
+    expect(text.match(/❌ \*\*host-\d@agent-\d+\*\*/g)).toHaveLength(20);
+    expect(text.match(/⏭️ \*\*host-\d\*\*/g)).toHaveLength(4);
+    expect(text).toContain("not reported by bridge (disabled or unavailable)");
+    expect(text).toContain("withheld by AGENT_LOCATION_DENY");
+    expect(text).not.toContain("**host-0@agent-40**");
+  });
+
+  it("returns the run text before a card-posting error", async () => {
+    const result: CanaryRunResult = {
+      id: "failed-card-run",
+      target: "self",
+      startedAt: "2026-09-27T00:00:00.000Z",
+      finishedAt: "2026-09-27T00:01:00.000Z",
+      branch: "main",
+      commit: "0123456789abcdef",
+      rows: [{ host: "local", agent: "codex", status: "failed", durationMs: 1_000, cause: "turn failed" }],
+    };
+    const published = await publishCanaryCard({
+      result,
+      dataDir: "/unused",
+      channelId: "canary-channel",
+      logger: { warn: () => undefined, error: () => undefined } as never,
+      adapter: {
+        sendLayout: async () => {
+          throw new Error("Invalid Form Body: too many components");
+        },
+      },
+    });
+    const text = formatCanaryResult(published);
+
+    expect(text).toContain("Self canary: RED");
+    expect(text).toContain("❌ local@codex · 1.0s — turn failed");
+    expect(text.split("\n").at(-1)).toBe(
+      "Result card error: Invalid Form Body: too many components",
+    );
   });
 });

@@ -405,6 +405,31 @@ describe("dispatchInjectTurn: status panel ON (default)", () => {
     expect(result.statusCardDone).toBe(false);
   });
 
+  it("reports a canary attempt's durable failure cause instead of lost ownership", async () => {
+    const reason = "reauth-waiting: provider authentication expired";
+    const rt = fakeRuntime({ text: [] });
+    const { adapter } = spyAdapter();
+    const orch = makeOrch({
+      dataDir,
+      rt,
+      adapter,
+      storeOverrides: {
+        turnAttempts: {
+          get: () => ({
+            state: "suspended",
+            stalledReason: reason,
+            outcome: null,
+          }),
+        },
+      },
+    });
+
+    const failure = await orch.dispatchCanaryTurn(baseSpec()).catch((error) => error as Error);
+
+    expect(failure.message).toBe(reason);
+    expect(failure.message).not.toContain("no longer owns execution");
+  });
+
   it("posts the panel, omits the ▶ line, and streams the plain answer as its own real message", async () => {
     const rt = fakeRuntime({
       events: [

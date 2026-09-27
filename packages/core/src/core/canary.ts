@@ -35,6 +35,7 @@ export interface CanaryRunResult {
   commit: string;
   durability?: boolean;
   rows: CanaryRow[];
+  cardError?: string;
 }
 
 export interface CanaryRunOptions {
@@ -952,10 +953,50 @@ export function formatCanaryResult(result: CanaryRunResult): string {
     `${targetLabel(result.target)} ${result.durability ? "durability" : "canary"}: ${state} (${failed} failed, ${skipped} skipped)`,
     `Revision: ${result.branch} @ ${result.commit.slice(0, 12)}`,
     ...rows,
+    ...(result.cardError ? [`Result card error: ${result.cardError}`] : []),
   ].join("\n");
 }
 
-export function renderCanaryLayout(result: CanaryRunResult): StructuredLayout {
+const MAX_CANARY_CONTAINER_BLOCKS = 40;
+const CANARY_PAGE_FRAME_BLOCKS = 4;
+
+function renderCanaryRow(row: CanaryRow): StructuredLayout["blocks"][number] {
+  const thread = row.threadId ? ` · <#${row.threadId}>` : "";
+  const check = row.check ? ` · ${row.check}` : "";
+  const cause = row.cause ? `\n↳ ${bounded(row.cause)}` : "";
+  const provider = row.providerNote ? `\n↳ Provider: ${bounded(row.providerNote)}` : "";
+  return {
+    kind: "text",
+    content:
+      `${rowIcon(row.status)} **${row.host}@${row.agent}**${check} · ${formatDuration(row.durationMs)}${thread}` +
+      cause +
+      provider,
+  };
+}
+
+function renderSkippedRows(rows: CanaryRow[]): StructuredLayout["blocks"] {
+  const byHost = new Map<string, Map<string, string[]>>();
+  for (const row of rows) {
+    const reasons = byHost.get(row.host) ?? new Map<string, string[]>();
+    const reason = row.cause ?? "not ready";
+    const agents = reasons.get(reason) ?? [];
+    agents.push(row.check ? `${row.agent} (${row.check})` : row.agent);
+    reasons.set(reason, agents);
+    byHost.set(row.host, reasons);
+  }
+  return [...byHost.entries()].map(([host, reasons]) => ({
+    kind: "text" as const,
+    content: bounded(
+      `⏭️ **${host}** · ` +
+        [...reasons.entries()]
+          .map(([reason, agents]) => `${agents.join(", ")} — ${reason}`)
+          .join(" · "),
+      3_800,
+    ),
+  }));
+}
+
+export function renderCanaryLayouts(result: CanaryRunResult): StructuredLayout[] {
   const failed = result.rows.some((row) => row.status === "failed");
   const passed = result.rows.filter((row) => row.status === "passed").length;
   const skipped = result.rows.filter((row) => row.status === "skipped").length;
@@ -963,46 +1004,47 @@ export function renderCanaryLayout(result: CanaryRunResult): StructuredLayout {
   const header = failed
     ? `❌ ${targetLabel(result.target)} ${label} — RED`
     : `✅ ${targetLabel(result.target)} ${label} — GREEN`;
-  const blocks: StructuredLayout["blocks"] = [
-    {
-      kind: "text",
-      content:
-        `## ${header}\n` +
-        `**Revision:** \`${result.branch}\` @ \`${result.commit.slice(0, 12)}\`\n` +
-        `**Run:** ${result.id.slice(0, 8)} · ${passed} passed · ${skipped} skipped`,
-    },
-    { kind: "separator", spacing: "small" },
+  const rows = [
+    ...result.rows.filter((row) => row.status !== "skipped").map(renderCanaryRow),
+    ...renderSkippedRows(result.rows.filter((row) => row.status === "skipped")),
   ];
-  for (const row of result.rows) {
-    const thread = row.threadId ? ` · <#${row.threadId}>` : "";
-    const check = row.check ? ` · ${row.check}` : "";
-    const cause = row.cause ? `\n↳ ${bounded(row.cause)}` : "";
-    const provider = row.providerNote ? `\n↳ Provider: ${bounded(row.providerNote)}` : "";
-    blocks.push({
-      kind: "text",
-      content:
-        `${rowIcon(row.status)} **${row.host}@${row.agent}**${check} · ${formatDuration(row.durationMs)}${thread}` +
-        cause +
-        provider,
-    });
-  }
-  blocks.push(
-    { kind: "separator", spacing: "small" },
-    { kind: "text", content: `Completed <t:${Math.floor(Date.parse(result.finishedAt) / 1000)}:R>` },
-  );
-  return { color: failed ? 0xed4245 : 0x57f287, blocks };
+  const rowsPerPage = MAX_CANARY_CONTAINER_BLOCKS - CANARY_PAGE_FRAME_BLOCKS;
+  const pageCount = Math.max(1, Math.ceil(rows.length / rowsPerPage));
+  return Array.from({ length: pageCount }, (_, pageIndex) => {
+    const page = pageCount > 1 ? ` · page ${pageIndex + 1}/${pageCount}` : "";
+    const blocks: StructuredLayout["blocks"] = [
+      {
+        kind: "text",
+        content:
+          `## ${header}${page}\n` +
+          `**Revision:** \`${result.branch}\` @ \`${result.commit.slice(0, 12)}\`\n` +
+          `**Run:** ${result.id.slice(0, 8)} · ${passed} passed · ${skipped} skipped`,
+      },
+      { kind: "separator", spacing: "small" },
+      ...rows.slice(pageIndex * rowsPerPage, (pageIndex + 1) * rowsPerPage),
+      { kind: "separator", spacing: "small" },
+      { kind: "text", content: `Completed <t:${Math.floor(Date.parse(result.finishedAt) / 1000)}:R>` },
+    ];
+    return { color: failed ? 0xed4245 : 0x57f287, blocks };
+  });
 }
 
-export async function publishCanaryCard(options: {
+interface CanaryCardOptions {
   result: CanaryRunResult;
   adapter: Pick<ChatAdapter, "sendLayout" | "pinMessage" | "unpinMessage">;
   channelId: string;
   dataDir: string;
   logger: Logger;
-}): Promise<MessageRef> {
+}
+
+async function postCanaryCards(options: CanaryCardOptions): Promise<MessageRef> {
   if (!options.adapter.sendLayout) throw new Error("adapter cannot post canary result cards");
   const channel = { platform: "discord", id: options.channelId };
-  const message = await options.adapter.sendLayout(channel, renderCanaryLayout(options.result));
+  const messages: MessageRef[] = [];
+  for (const layout of renderCanaryLayouts(options.result)) {
+    messages.push(await options.adapter.sendLayout(channel, layout));
+  }
+  const message = messages[0]!;
   await options.adapter.pinMessage?.(message).catch((error) => {
     options.logger.warn({ error }, "canary latest-card pin failed");
   });
@@ -1024,6 +1066,20 @@ export async function publishCanaryCard(options: {
     });
   }
   return message;
+}
+
+export async function publishCanaryCard(options: CanaryCardOptions): Promise<CanaryRunResult> {
+  try {
+    await postCanaryCards(options);
+    return options.result;
+  } catch (error) {
+    const cardError = error instanceof Error ? error.message : String(error);
+    options.logger.error(
+      { error, canaryRunId: options.result.id },
+      "canary result card failed",
+    );
+    return { ...options.result, cardError };
+  }
 }
 
 export function providerSourceForAgent(agentId: string): string | undefined {

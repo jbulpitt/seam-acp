@@ -9705,7 +9705,26 @@ export class Orchestrator {
   }
 
   async dispatchCanaryTurn(spec: DispatchSpec): Promise<DispatchInjectTurnResult> {
-    return this.dispatchInjectTurnWithEvidence(spec);
+    try {
+      return await this.dispatchInjectTurnWithEvidence(spec);
+    } catch (error) {
+      let attempt: TurnAttempt | null | undefined;
+      try {
+        attempt = this.store.turnAttempts?.get(spec.id);
+      } catch {
+        attempt = undefined;
+      }
+      const classification = readErrorClassification(error);
+      const message = error instanceof Error ? error.message : String(error);
+      const cause =
+        attempt?.outcome?.workerError ??
+        attempt?.outcome?.error ??
+        attempt?.stalledReason ??
+        (classification ? `${classification.errorKind}: ${message}` : undefined) ??
+        (error instanceof DispatchSuspendedError ? error.reason : undefined);
+      if (!cause || cause === message) throw error;
+      throw new Error(cause, error instanceof Error ? { cause: error } : undefined);
+    }
   }
 
   private async dispatchInjectTurnWithEvidence(spec: DispatchSpec): Promise<DispatchInjectTurnResult> {

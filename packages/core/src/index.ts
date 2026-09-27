@@ -1003,28 +1003,26 @@ async function main(): Promise<void> {
           throw new Error("staging canary is not configured on this deployment");
         }
         const result = await stagingCanary.run(target, options);
-        await publishCanaryCard({
+        return publishCanaryCard({
           result,
           adapter,
           channelId: config.SEAM_CANARY_RESULT_CHANNEL_ID,
           dataDir: config.DATA_DIR,
           logger,
         });
-        return result;
       }
       if (options?.durability) throw new Error("durability is available only for target staging");
       if (!selfCanary || !selfCanaryChannelId) {
         throw new Error("self canary is not configured on this deployment");
       }
       const result = await selfCanary.run(target);
-      await publishCanaryCard({
+      return publishCanaryCard({
         result,
         adapter,
         channelId: selfCanaryChannelId,
         dataDir: config.DATA_DIR,
         logger,
       });
-      return result;
     };
     orchestrator.setCanaryRunner(runCanary);
   }

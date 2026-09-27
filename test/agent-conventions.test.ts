@@ -75,6 +75,14 @@ describe("harnessPreamble — capability gates (#108)", () => {
     expect(harnessPreamble([], undefined, { seamMcp: true, inboxAwareness: true })).toContain("poll_inbox");
   });
 
+  it("mentions host tools only when both seam MCP and the channel setting are on", () => {
+    expect(harnessPreamble([], undefined, { hostTools: true })).not.toContain("host_exec");
+    expect(harnessPreamble([], undefined, { seamMcp: true })).not.toContain("host_exec");
+    expect(
+      harnessPreamble([], undefined, { seamMcp: true, hostTools: true })
+    ).toContain("host_exec");
+  });
+
   it("sessionHasSeamMcp keys off the seam-mcp entry name, not agentId", () => {
     expect(sessionHasSeamMcp([])).toBe(false);
     expect(sessionHasSeamMcp([{ name: "playwright" }])).toBe(false);

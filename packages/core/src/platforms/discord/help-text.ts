@@ -84,7 +84,7 @@ export function seamHelpSections(): string[] {
       "`/seamadmin project` — `new` `list` `remove` (activate a channel, no redeploy)",
       "`/seamadmin upload` — `pull <path>` `push <file> <path>` `secret`",
       "`/seamadmin bridge` — `add` `rotate` `configure` `list` `remove` `restart` (remote hosts + safe restart)",
-      "`/seamadmin debug` — `tail` `exec` `status` `voice-ping` `voice-capture` `voice-live`",
+      "`/seamadmin debug` — `work` `status` `voice-ping` `voice-capture` `voice-live`",
       "`/seamadmin voice` — `start` `add` `remove` `configure` `console` `status` `stop`",
       "`/seamadmin catalog refresh <agent@location|all>` — refresh the operational model catalog",
       "`/seamadmin restrictions` — set, list, or clear agent channel allowlists",

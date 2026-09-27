@@ -344,6 +344,66 @@ export class BridgeHub {
     return conn.mux.rpc(method, params, { agentId, ...options });
   }
 
+  async hostExec(
+    bridgeId: string,
+    input: { command: string; cwd?: string; timeoutSec?: number }
+  ): Promise<{
+    stdout: string;
+    stderr: string;
+    exitCode: number | null;
+    signal: string | null;
+    timedOut: boolean;
+    stdoutTruncated: boolean;
+    stderrTruncated: boolean;
+  }> {
+    const timeoutSec = input.timeoutSec ?? 30;
+    return this.rpc(bridgeId, "shell", input, undefined, {
+      timeoutMs: timeoutSec * 1000 + 5_000,
+    }) as Promise<{
+      stdout: string;
+      stderr: string;
+      exitCode: number | null;
+      signal: string | null;
+      timedOut: boolean;
+      stdoutTruncated: boolean;
+      stderrTruncated: boolean;
+    }>;
+  }
+
+  async readHostFile(
+    bridgeId: string,
+    requested: string
+  ): Promise<{ bytesBase64: string; filename: string; size: number }> {
+    const result = (await this.rpc(bridgeId, "readAttachment", {
+      hostPath: true,
+      path: requested,
+    })) as { bytesBase64?: unknown; filename?: unknown; size?: unknown };
+    if (typeof result.bytesBase64 !== "string" || typeof result.size !== "number") {
+      throw new Error(`bridge "${normalizeLocation(bridgeId)}" returned an invalid file payload`);
+    }
+    return {
+      bytesBase64: result.bytesBase64,
+      filename: typeof result.filename === "string" ? result.filename : "file",
+      size: result.size,
+    };
+  }
+
+  async writeHostFile(
+    bridgeId: string,
+    requested: string,
+    bytesBase64: string
+  ): Promise<{ path: string; size: number }> {
+    const result = (await this.rpc(bridgeId, "writeAttachment", {
+      hostPath: true,
+      path: requested,
+      bytesBase64,
+    })) as { path?: unknown; size?: unknown };
+    if (typeof result.path !== "string" || typeof result.size !== "number") {
+      throw new Error(`bridge "${normalizeLocation(bridgeId)}" returned an invalid write result`);
+    }
+    return { path: result.path, size: result.size };
+  }
+
   /** Background catalog refresh; see CATALOG_FETCH_TIMEOUT_MS for the bound. */
   async fetchModelCatalog(location: string, agentId: string): Promise<unknown> {
     return this.rpc(location, "fetchModelCatalog", {}, agentId, { timeoutMs: CATALOG_FETCH_TIMEOUT_MS });

@@ -21,7 +21,7 @@ import {
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { writeRestartSentinel } from "./core/restart-sentinel.js";
-import { loadConfig, buildChannelPresetMaps, isChannelLocked, resolveThreadLocation, resolveThreadTtsVoice, resolveThreadTtsPace, resolveThreadTtsStyle, adminParticipantOverlapIds, GROK_STATIC_MODELS, ZAI_STATIC_MODELS, OLLAMA_CLOUD_STATIC_MODELS } from "./config.js";
+import { loadConfig, buildChannelPresetMaps, areHostToolsEnabled, isChannelLocked, resolveThreadLocation, resolveThreadTtsVoice, resolveThreadTtsPace, resolveThreadTtsStyle, adminParticipantOverlapIds, GROK_STATIC_MODELS, ZAI_STATIC_MODELS, OLLAMA_CLOUD_STATIC_MODELS } from "./config.js";
 import { enrichModelListWithKnownLimits } from "./core/context-window.js";
 import {
   hostEmoji,
@@ -1272,6 +1272,40 @@ async function main(): Promise<void> {
       configAdminUserIds: config.SEAM_CONFIG_ADMIN_USER_IDS,
       configParticipantUserIds: config.SEAM_PARTICIPANT_USER_IDS,
       currentSpeakerId: (record) => orchestrator.currentSpeaker(record.channelRef),
+      hostToolsEnabled: (record) =>
+        areHostToolsEnabled(config, record.parentRef ?? undefined),
+      hostExec: async (_record, input) => {
+        if (!bridgeHub) throw new Error("bridge hub is not available");
+        return bridgeHub.hostExec(input.host, input);
+      },
+      hostPush: async (record, input) => {
+        if (!bridgeHub) throw new Error("bridge hub is not available");
+        const sourceHost = bridgeHub.sessionBridgeId(record.id);
+        if (!sourceHost) throw new Error("calling agent session has no bridge host");
+        const file = await bridgeHub.readHostFile(sourceHost, input.from);
+        const written = await bridgeHub.writeHostFile(input.host, input.to, file.bytesBase64);
+        if (written.size !== file.size) throw new Error("host push byte count mismatch");
+        return {
+          sourceHost,
+          targetHost: input.host,
+          bytes: written.size,
+          path: written.path,
+        };
+      },
+      hostPull: async (record, input) => {
+        if (!bridgeHub) throw new Error("bridge hub is not available");
+        const targetHost = bridgeHub.sessionBridgeId(record.id);
+        if (!targetHost) throw new Error("calling agent session has no bridge host");
+        const file = await bridgeHub.readHostFile(input.host, input.from);
+        const written = await bridgeHub.writeHostFile(targetHost, input.to, file.bytesBase64);
+        if (written.size !== file.size) throw new Error("host pull byte count mismatch");
+        return {
+          sourceHost: input.host,
+          targetHost,
+          bytes: written.size,
+          path: written.path,
+        };
+      },
       // #58 P2/P3: propose-then-confirm mutation. The orchestrator validates,
       // renders the confirm card, and applies only on a human click (D5),
       // auditing every change (D6).

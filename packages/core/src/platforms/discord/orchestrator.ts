@@ -20,6 +20,7 @@ import { raceDeadline, type DeadlineClock } from "../../lib/shutdown-budget.js";
 import type { Config } from "../../config.js";
 import {
   resolveChannelPreset,
+  areHostToolsEnabled,
   resolveThreadLocation,
   isChannelLocked,
   isThreadDetached,
@@ -4542,6 +4543,7 @@ export class Orchestrator {
       let promptText = humanResume ? msg.text : withHarnessPreamble(msg.text, extraRules, speaker, {
         inboxAwareness: this.config.SEAM_INBOX_PREAMBLE_ENABLED,
         seamMcp,
+        hostTools: areHostToolsEnabled(this.config, record.parentRef ?? undefined),
         seamFences,
         localTime: formatLocalTime(nowMs),
         timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
@@ -5426,7 +5428,6 @@ export class Orchestrator {
     if (interaction.options.getSubcommandGroup(false) === "debug") {
       if (sub === "work") return this.cmdScheduledWork(interaction);
       return handleDebugSlash(interaction, {
-        mutation: this.configMutation,
         hub: this.bridgeHub,
         logger: this.logger,
         playSpikeOgg: async () => {
@@ -9794,6 +9795,7 @@ export class Orchestrator {
       ? (await this.processRestartRender(previousAttempt!)).prompt
       : withHarnessPreamble(tasked, choiceAuthoringRules({ fence: false, mcp: seamMcp }), undefined, {
           seamMcp,
+          hostTools: areHostToolsEnabled(this.config, record.parentRef ?? undefined),
           seamFences: false,
           ...(runtimePrompt.provenance ? { provenance: runtimePrompt.provenance } : {}),
         });

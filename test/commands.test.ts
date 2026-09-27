@@ -465,8 +465,6 @@ describe("/seamadmin — operator surface (#151)", () => {
     ]);
     expect(leafNames(json, "debug")).toEqual([
       "work",
-      "tail",
-      "exec",
       "status",
       "voice-ping",
       "voice-capture",

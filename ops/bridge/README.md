@@ -5,8 +5,9 @@ Every bridge host keeps its settings in **one file**, `~/.config/seam/bridge.env
 pm2 or systemd — only runs a command. Keys in the file replace the same keys
 from the supervisor, so a pm2 dump can never reinstate a removed setting.
 
-Host RPCs (exec, shell, tailLog, and writeFile) are available on every bridge.
-They use the same OS permissions as the bridge process.
+The channel-gated `host_exec`, `host_push`, and `host_pull` agent tools use the
+bridge command and attachment RPCs. Paths are not workspace-jailed; the bridge
+process user's OS permissions and the attachment size cap are the limits.
 
 The bridge's first log line says what it loaded:
 

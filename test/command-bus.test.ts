@@ -22,10 +22,10 @@ describe("command-bus rpc allow-list", () => {
   });
 
   it("accepts host methods", () => {
-    expect(isAllowedRpcMethod("exec")).toBe(true);
     expect(isAllowedRpcMethod("shell")).toBe(true);
-    expect(isAllowedRpcMethod("tailLog")).toBe(true);
-    expect(isAllowedRpcMethod("writeFile")).toBe(true);
+    expect(isAllowedRpcMethod("exec")).toBe(false);
+    expect(isAllowedRpcMethod("tailLog")).toBe(false);
+    expect(isAllowedRpcMethod("writeFile")).toBe(false);
   });
 
   it("dispatch rejects unknown methods", async () => {

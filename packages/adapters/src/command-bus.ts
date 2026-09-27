@@ -29,7 +29,7 @@ export const ADAPTER_RPC_METHODS = [
 
 export type AdapterRpcMethod = (typeof ADAPTER_RPC_METHODS)[number];
 
-export const HOST_RPC_METHODS = ["exec", "shell", "tailLog", "writeFile"] as const;
+export const HOST_RPC_METHODS = ["shell"] as const;
 export type HostRpcMethod = (typeof HOST_RPC_METHODS)[number];
 
 const ADAPTER_RPC_SET = new Set<string>(ADAPTER_RPC_METHODS);

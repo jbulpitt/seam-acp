@@ -12,7 +12,7 @@ import type {
 } from "./test-driver.js";
 import type { TesterBot, TesterMessage } from "./tester-bot.js";
 
-export type CanaryTarget = "staging";
+export type CanaryTarget = "staging" | "self";
 export type CanaryRowStatus = "passed" | "failed" | "skipped";
 
 export interface CanaryRow {
@@ -87,6 +87,41 @@ const THREAD_FILE = "canary-staging-threads.json";
 const HISTORY_FILE = "canary-staging-history.jsonl";
 const LATEST_CARD_FILE = "canary-staging-latest-card.json";
 const DURABILITY_AGENT = "codex";
+
+export interface SelfCanaryInventory {
+  bridges: Array<{
+    host: string;
+    ready: boolean;
+    agents: Array<{
+      id: string;
+      installed: boolean;
+      ready: boolean;
+      reason?: string;
+    }>;
+  }>;
+}
+
+export interface SelfCanaryDispatchResult {
+  output: string;
+  deliveredOutput: string;
+  toolSeen: boolean;
+  statusCardDone: boolean;
+}
+
+interface SelfCanaryRunnerOptions {
+  dataDir: string;
+  inventory: () => SelfCanaryInventory;
+  createThread: (host: string, agent: string, name: string) => Promise<string>;
+  threadExists: (threadId: string) => Promise<boolean>;
+  dispatchTurn: (
+    threadId: string,
+    prompt: string,
+    dispatchId: string,
+  ) => Promise<SelfCanaryDispatchResult>;
+  now?: () => number;
+  nonce?: () => string;
+  providerStatus?: (agentId: string) => string | undefined;
+}
 
 const DURABILITY_CHECKS: ReadonlyArray<{ label: string; action: TestRestartAction }> = [
   { label: "redeploy:now", action: "controller" },
@@ -215,8 +250,8 @@ class CanaryThreadRegistry {
     this.state = state;
   }
 
-  static async load(dataDir: string): Promise<CanaryThreadRegistry> {
-    const file = path.join(dataDir, THREAD_FILE);
+  static async load(dataDir: string, filename = THREAD_FILE): Promise<CanaryThreadRegistry> {
+    const file = path.join(dataDir, filename);
     try {
       const parsed = JSON.parse(await fs.readFile(file, "utf8")) as CanaryThreadFile;
       if (parsed.version === 1 && parsed.threads && typeof parsed.threads === "object") {
@@ -725,6 +760,168 @@ export class StagingCanaryRunner {
   }
 }
 
+export class SelfCanaryRunner {
+  private readonly now: () => number;
+  private readonly makeNonce: () => string;
+
+  constructor(private readonly options: SelfCanaryRunnerOptions) {
+    this.now = options.now ?? Date.now;
+    this.makeNonce = options.nonce ?? (() => randomUUID().replaceAll("-", ""));
+  }
+
+  async run(target: CanaryTarget = "self"): Promise<CanaryRunResult> {
+    if (target !== "self") throw new Error(`unsupported self canary target: ${target}`);
+    const started = this.now();
+    const inventory = this.options.inventory();
+    const registry = await CanaryThreadRegistry.load(
+      this.options.dataDir,
+      "canary-self-threads.json",
+    );
+    const targets = inventory.bridges
+      .flatMap((bridge) => bridge.agents.map((agent) => ({ bridge, agent })))
+      .sort((a, b) =>
+        a.bridge.host.localeCompare(b.bridge.host) || a.agent.id.localeCompare(b.agent.id)
+      );
+
+    const rows: CanaryRow[] = [];
+    const runnable: Array<{ host: string; agent: string; threadId: string }> = [];
+    for (const { bridge, agent } of targets) {
+      if (!agent.installed || !agent.ready) {
+        rows.push({
+          host: bridge.host,
+          agent: agent.id,
+          status: "skipped",
+          durationMs: null,
+          cause: agent.reason ?? (!agent.installed ? "not installed" : "not ready"),
+        });
+        continue;
+      }
+      try {
+        const threadId = await this.ensureThread(registry, bridge.host, agent.id);
+        runnable.push({ host: bridge.host, agent: agent.id, threadId });
+      } catch (error) {
+        rows.push(this.failedRow(
+          bridge.host,
+          agent.id,
+          null,
+          error instanceof Error ? error.message : String(error),
+        ));
+      }
+    }
+
+    rows.push(...await Promise.all(
+      runnable.map(({ host, agent, threadId }) => this.runTurn(host, agent, threadId))
+    ));
+    rows.sort((a, b) => a.host.localeCompare(b.host) || a.agent.localeCompare(b.agent));
+    if (rows.length === 0) {
+      rows.push({
+        host: "self",
+        agent: "inventory",
+        status: "failed",
+        durationMs: null,
+        cause: "controller reported no connected bridges",
+      });
+    }
+
+    const identity = readGitIdentity();
+    const result: CanaryRunResult = {
+      id: randomUUID(),
+      target,
+      startedAt: new Date(started).toISOString(),
+      finishedAt: new Date(this.now()).toISOString(),
+      branch: identity.branch,
+      commit: identity.commit,
+      rows,
+    };
+    await this.appendHistory(result);
+    return result;
+  }
+
+  private async ensureThread(
+    registry: CanaryThreadRegistry,
+    host: string,
+    agent: string,
+  ): Promise<string> {
+    const key = threadKey(host, agent);
+    const saved = registry.get(key);
+    if (saved && await this.options.threadExists(saved.threadId)) return saved.threadId;
+
+    const name = threadName(host, agent);
+    const threadId = await this.options.createThread(host, agent, name);
+    await registry.set(key, {
+      threadId,
+      threadName: name,
+      createdAt: new Date(this.now()).toISOString(),
+    });
+    return threadId;
+  }
+
+  private async runTurn(host: string, agent: string, threadId: string): Promise<CanaryRow> {
+    const nonce = this.makeNonce();
+    const started = this.now();
+    try {
+      const result = await this.options.dispatchTurn(
+        threadId,
+        `Run the shell command \`echo ${nonce}\` and reply with only its output.`,
+        `canary-${randomUUID()}`,
+      );
+      const issues: string[] = [];
+      if (!result.output.includes(nonce)) issues.push("agent output did not contain the nonce");
+      if (!result.deliveredOutput.includes(nonce)) {
+        issues.push("no Discord reply contained the nonce");
+      }
+      if (!result.toolSeen) issues.push("no tool step was visible on the status card");
+      if (!result.statusCardDone) issues.push("status card did not finish Done");
+      if (issues.length > 0) {
+        return this.failedRow(host, agent, this.now() - started, issues.join("; "), threadId);
+      }
+      return {
+        host,
+        agent,
+        status: "passed",
+        durationMs: this.now() - started,
+        threadId,
+      };
+    } catch (error) {
+      return this.failedRow(
+        host,
+        agent,
+        this.now() - started,
+        error instanceof Error ? error.message : String(error),
+        threadId,
+      );
+    }
+  }
+
+  private failedRow(
+    host: string,
+    agent: string,
+    durationMs: number | null,
+    cause: string,
+    threadId?: string,
+  ): CanaryRow {
+    const providerNote = this.options.providerStatus?.(agent);
+    return {
+      host,
+      agent,
+      status: "failed",
+      durationMs,
+      ...(threadId ? { threadId } : {}),
+      cause: bounded(cause),
+      ...(providerNote ? { providerNote } : {}),
+    };
+  }
+
+  private async appendHistory(result: CanaryRunResult): Promise<void> {
+    await fs.mkdir(this.options.dataDir, { recursive: true });
+    await fs.appendFile(
+      path.join(this.options.dataDir, "canary-self-history.jsonl"),
+      JSON.stringify(result) + "\n",
+      { mode: 0o600 },
+    );
+  }
+}
+
 function formatDuration(ms: number | null): string {
   if (ms === null) return "—";
   if (ms < 1_000) return `${ms}ms`;
@@ -735,6 +932,10 @@ function rowIcon(status: CanaryRowStatus): string {
   if (status === "passed") return "✅";
   if (status === "skipped") return "⏭️";
   return "❌";
+}
+
+function targetLabel(target: CanaryTarget): string {
+  return target === "self" ? "Self" : "Staging";
 }
 
 export function formatCanaryResult(result: CanaryRunResult): string {
@@ -748,7 +949,7 @@ export function formatCanaryResult(result: CanaryRunResult): string {
     return `${rowIcon(row.status)} ${row.host}@${row.agent}${check} · ${formatDuration(row.durationMs)}${detail}${provider}`;
   });
   return [
-    `Staging ${result.durability ? "durability" : "canary"}: ${state} (${failed} failed, ${skipped} skipped)`,
+    `${targetLabel(result.target)} ${result.durability ? "durability" : "canary"}: ${state} (${failed} failed, ${skipped} skipped)`,
     `Revision: ${result.branch} @ ${result.commit.slice(0, 12)}`,
     ...rows,
   ].join("\n");
@@ -759,7 +960,9 @@ export function renderCanaryLayout(result: CanaryRunResult): StructuredLayout {
   const passed = result.rows.filter((row) => row.status === "passed").length;
   const skipped = result.rows.filter((row) => row.status === "skipped").length;
   const label = result.durability ? "durability" : "canary";
-  const header = failed ? `❌ Staging ${label} — RED` : `✅ Staging ${label} — GREEN`;
+  const header = failed
+    ? `❌ ${targetLabel(result.target)} ${label} — RED`
+    : `✅ ${targetLabel(result.target)} ${label} — GREEN`;
   const blocks: StructuredLayout["blocks"] = [
     {
       kind: "text",

@@ -397,10 +397,12 @@ describe("dispatchInjectTurn: status panel ON (default)", () => {
     };
     const orch = makeOrch({ dataDir, rt, adapter });
 
-    const result = await orch.dispatchInjectTurn(baseSpec());
+    const result = await orch.dispatchCanaryTurn(baseSpec());
 
     expect(calls.sendMessage.some((message) => message.text === "answer survives panel failure")).toBe(true);
     expect(result.output).toBe("answer survives panel failure");
+    expect(result.deliveredOutput).toBe("answer survives panel failure");
+    expect(result.statusCardDone).toBe(false);
   });
 
   it("posts the panel, omits the ▶ line, and streams the plain answer as its own real message", async () => {
@@ -416,7 +418,7 @@ describe("dispatchInjectTurn: status panel ON (default)", () => {
     const { adapter, calls } = spyAdapter();
     const orch = makeOrch({ dataDir, rt, adapter });
 
-    const res = await orch.dispatchInjectTurn(baseSpec());
+    const res = await orch.dispatchCanaryTurn(baseSpec());
 
     // The status panel is a REAL embed card via sendPanel (the SAME path a normal
     // turn uses), titled with the dispatch type — NOT a plain-text message.
@@ -454,6 +456,11 @@ describe("dispatchInjectTurn: status panel ON (default)", () => {
 
     // Lossless capture unaffected.
     expect(res.output).toBe("Hello world");
+    expect(res).toMatchObject({
+      deliveredOutput: "Hello world",
+      toolSeen: true,
+      statusCardDone: true,
+    });
   });
 
   it("titles the panel by dispatch kind (wake / watch / report_back)", async () => {

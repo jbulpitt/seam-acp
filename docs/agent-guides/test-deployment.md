@@ -51,6 +51,8 @@ That exercises the real Discord path before a change is merged.
   long-lived host+agent canary threads.
 - `SEAM_CANARY_RESULT_CHANNEL_ID`: the channel where controller-initiated
   runs post their result card.
+- `SEAM_CANARY_SELF_CHANNEL_ID`: this deployment's own parent channel for
+  long-lived canary threads and result cards.
 
 ## Tools (seam-MCP)
 
@@ -71,6 +73,11 @@ That exercises the real Discord path before a change is merged.
   turns sequentially, interrupting them with controller, bridge, combined and
   sessiond restarts. The CLI equivalent is
   `npm run canary -- --target staging --durability`.
+- **`canary_run({ target: "self" })`:** asks the current controller for every
+  connected bridge's agent inventory, then runs the ready host+agent pairs in
+  parallel through live dispatch. Each persistent thread keeps its configured
+  model; only a newly created thread is initialized to the agent's catalog
+  default.
 
 ## How close to Discord it is
 

@@ -46,7 +46,7 @@ import type { StructuredPanel, TurnState } from "./types.js";
  *  never touches plain message content and can't hit the 2000-char limit. */
 export interface DispatchStatusPanelIO<TRef> {
   post: (panel: StructuredPanel) => Promise<TRef | undefined>;
-  edit: (ref: TRef, panel: StructuredPanel) => Promise<void>;
+  edit: (ref: TRef, panel: StructuredPanel) => Promise<void | boolean>;
 }
 
 export interface DispatchStatusPanelOptions {
@@ -72,6 +72,7 @@ export class DispatchStatusPanel<TRef = unknown> {
   private finalized = false;
   private started = false;
   private renders = 0;
+  private editSucceeded = false;
 
   constructor(
     private readonly renderer: Renderer,
@@ -92,6 +93,11 @@ export class DispatchStatusPanel<TRef = unknown> {
    *  panel is live and will receive edits. */
   get isLive(): boolean {
     return this.ref !== undefined;
+  }
+
+  /** Whether the latest requested edit reached the platform. */
+  get lastEditSucceeded(): boolean {
+    return this.editSucceeded;
   }
 
   /** Post the one panel. Returns true when it is live; false when the post
@@ -253,9 +259,17 @@ export class DispatchStatusPanel<TRef = unknown> {
     const ref = this.ref;
     if (ref === undefined) return Promise.resolve();
     return this.queue.run(async () => {
-      await this.io.edit(ref, panel);
-      this.lastRendered = fingerprint;
-      this.card.acknowledge();
+      try {
+        const edited = await this.io.edit(ref, panel);
+        this.editSucceeded = edited !== false;
+        if (this.editSucceeded) {
+          this.lastRendered = fingerprint;
+          this.card.acknowledge();
+        }
+      } catch (error) {
+        this.editSucceeded = false;
+        throw error;
+      }
     });
   }
 }

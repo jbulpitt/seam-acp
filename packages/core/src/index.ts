@@ -931,7 +931,9 @@ async function main(): Promise<void> {
         providerStatus,
       })
     : undefined;
-  const selfCanary = config.SEAM_CANARY_SELF_CHANNEL_ID && bridgeHub
+  const selfCanaryChannelId = config.SEAM_CANARY_SELF_CHANNEL_ID
+    ?? config.SEAM_CANARY_RESULT_CHANNEL_ID;
+  const selfCanary = selfCanaryChannelId && bridgeHub
     ? new SelfCanaryRunner({
         dataDir: config.DATA_DIR,
         inventory: () => {
@@ -971,7 +973,7 @@ async function main(): Promise<void> {
           };
         },
         createThread: (host, agent, name) =>
-          orchestrator.createCanaryThread(config.SEAM_CANARY_SELF_CHANNEL_ID!, host, agent, name),
+          orchestrator.createCanaryThread(selfCanaryChannelId, host, agent, name),
         threadExists: async (threadId) => {
           if (!adapter.getThreadLiveState) throw new Error("adapter cannot verify canary threads");
           return (await adapter.getThreadLiveState({ platform: "discord", id: threadId })) !== undefined;
@@ -1011,14 +1013,14 @@ async function main(): Promise<void> {
         return result;
       }
       if (options?.durability) throw new Error("durability is available only for target staging");
-      if (!selfCanary || !config.SEAM_CANARY_SELF_CHANNEL_ID) {
+      if (!selfCanary || !selfCanaryChannelId) {
         throw new Error("self canary is not configured on this deployment");
       }
       const result = await selfCanary.run(target);
       await publishCanaryCard({
         result,
         adapter,
-        channelId: config.SEAM_CANARY_SELF_CHANNEL_ID,
+        channelId: selfCanaryChannelId,
         dataDir: config.DATA_DIR,
         logger,
       });

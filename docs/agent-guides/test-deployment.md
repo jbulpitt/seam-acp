@@ -51,8 +51,9 @@ That exercises the real Discord path before a change is merged.
   long-lived host+agent canary threads.
 - `SEAM_CANARY_RESULT_CHANNEL_ID`: the channel where controller-initiated
   runs post their result card.
-- `SEAM_CANARY_SELF_CHANNEL_ID`: this deployment's own parent channel for
-  long-lived canary threads and result cards.
+- `SEAM_CANARY_SELF_CHANNEL_ID`: optional override for this deployment's own
+  parent channel. Self canary threads and cards otherwise use
+  `SEAM_CANARY_RESULT_CHANNEL_ID`.
 
 ## Tools (seam-MCP)
 

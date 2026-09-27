@@ -9,9 +9,7 @@
 > expected). Other days are movers-only; if nothing cleared the bar, the
 > Discord message is a single "no movers" line.
 >
-> **Product:** `digest.md` is the notebook you reread. The agent's **final
-> message** is a short Discord newsletter posted to thread
-> `1545798016601034883`.
+> **Product:** `digest.md` is the notebook you reread. The agent's **final message** is a short Discord newsletter posted to the schedule's configured output thread.
 >
 > **Last updated:** 2026-09-26 (government-constraint queries)
 
@@ -32,7 +30,7 @@ directory. Read them before searching:
 **Do not** read or edit `docs/upstream-monitoring-runbook.md`. That is a
 different job (tool changelogs → code impact).
 
-**Do not** seed or revive Jesse's example headlines as storylines unless this
+**Do not** seed or revive the operator's example headlines as storylines unless this
 sweep independently found them. Those examples live only in Appendix A as a
 retroactive inclusion test.
 
@@ -207,9 +205,7 @@ Push if you have network and it is cheap; host disk is what the next fire reads.
 
 ### Phase F — Discord newsletter (your final message)
 
-The scheduled runner **captures your last assistant message** and posts it
-to Discord thread `1545798016601034883` (via the schedule's Output id, or
-because the schedule is bound there).
+The scheduled runner **captures your last assistant message** and posts it to the schedule's configured output thread (via its Output id or binding).
 
 **That final message must be only the newsletter.** No chain-of-thought, no
 "I committed…", no file paths dump, no MCP narration. Work log belongs in
@@ -226,8 +222,7 @@ News thread — that starts or inboxes another agent. The schedule's
 `targetChannel` + `outputType: messages` is the delivery path.
 
 If you are running this **manually** (not a scheduled fire), still make the
-final message the newsletter; it will land in the thread you are in. Prefer
-a scheduled fire so delivery hits `1545798016601034883`.
+final message the newsletter; it will land in the thread you are in. Prefer a scheduled fire so delivery uses the configured output binding.
 
 ---
 

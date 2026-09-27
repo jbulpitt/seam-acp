@@ -274,7 +274,7 @@ export interface StatusPanel {
 // --- delegation ledger -----------------------------------------------------
 // Durable log of every programmatic turn / cross-thread handoff. Written by
 // the delegation runtime so a handoff's return path is a recorded fact rather
-// than a behavioral hope (see docs/seam-mcp-vision.md §1).
+// than a behavioral hope.
 
 /** What kind of programmatic turn a ledger row records. */
 export type DelegationKind =

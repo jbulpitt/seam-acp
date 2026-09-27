@@ -6,19 +6,8 @@ dist
 data/
 *.log
 
-# Local docs (reports, plans, specs — not committed; tracked files unaffected).
-# Explicit exceptions keep new canonical agent entry points visible to Git.
-docs/*
-# Deployment-specific notes (README "Your deployment's notes"); never tracked.
+# Deployment-specific operator notes; never tracked.
 docs/local/
-!docs/model-catalog.md
-!docs/dispatch-result-retention.md
-!docs/agent-guides/
-# Agent guides are tracked by default; these two are local-only.
-docs/agent-guides/helpdesk.md
-docs/agent-guides/klipy-gif-curation-prompt.md
-!docs/industry-watch/
-!docs/industry-watch/**
 .DS_Store
 
 # Playwright MCP scratch outputs

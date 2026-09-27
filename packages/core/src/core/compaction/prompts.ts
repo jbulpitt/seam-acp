@@ -1,5 +1,5 @@
 /**
- * The premium-compaction prompt suite (docs/premium-compaction-design.md §6).
+ * The premium-compaction prompt suite.
  *
  * Each stage's output is the next stage's input, so the contracts must line up.
  * seam-acp runs these in temp AgentRuntimes (not the schema-enforced Workflow

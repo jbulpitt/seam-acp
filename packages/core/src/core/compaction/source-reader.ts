@@ -1,5 +1,5 @@
 /**
- * Richest-source reader for premium compaction (docs/premium-compaction-design.md).
+ * Richest-source reader for premium compaction.
  *
  * Reads a Claude Code session's RAW JSONL and produces a structure-preserving
  * history that keeps everything the model actually saw — user/assistant text,

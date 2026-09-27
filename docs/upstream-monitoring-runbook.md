@@ -868,7 +868,7 @@ npm list -g @github/copilot --depth=0
 # npm list -g @google/gemini-cli --depth=0  # DEPRECATED
 
 # ── Check project dependency versions ──
-cd /home/ubuntu/Projects/seam-acp
+cd /path/to/seam-acp
 npm ls @agentclientprotocol/sdk
 npm ls discord.js
 
@@ -938,9 +938,4 @@ https://registry.npmjs.org/@github/copilot
 - [`model-management-runbook.md`](model-management-runbook.md) — Authoritative Claude model management process
 - [`agy-upgrade-gate.md`](agy-upgrade-gate.md) — Native AGY candidate capability and performance evidence gate
 - [`remote-agent.md`](remote-agent.md) — Remote agent setup via WebSocket bridge
-- [`premium-compaction-design.md`](premium-compaction-design.md) — Compaction system design
-- [`durable-jobs-plan.md`](durable-jobs-plan.md) — Durable jobs feature plan
-- [`scheduled-prompts-plan.md`](scheduled-prompts-plan.md) — Scheduled prompts feature plan
-- [`integration-slack.md`](integration-slack.md) — Slack adapter plan
-- [`integration-google-chat.md`](integration-google-chat.md) — Google Chat adapter plan
-- [`integration-ms-teams.md`](integration-ms-teams.md) — MS Teams adapter plan
+Deployment-specific planning, research, and historical design records may be kept in the private `docs/local/` operator notes.

@@ -1,5 +1,5 @@
 /**
- * Premium-compaction pipeline (docs/premium-compaction-design.md §4).
+ * Premium-compaction pipeline.
  *
  * Orchestrates the simplified fan-out compaction flow:
  * Partitions history into verbatim Head (10%), verbatim Tail (20%), and Middle (70%).

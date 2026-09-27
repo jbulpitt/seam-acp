@@ -115,6 +115,7 @@ describe("#250 human turn production pipeline, synthetic transport only", () => 
     const mux = {
       sendCmd: vi.fn(async () => ({ health: [{
         slot: 6,
+        alive: true,
         recovery: {
           version: 1,
           owner: "bridge",

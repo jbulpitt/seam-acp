@@ -172,6 +172,7 @@ import {
   BOOT_RECOVERY_ATTEMPTS,
   BOOT_RECOVERY_BACKOFF_MS,
   DispatchWatcher,
+  type DispatchTargetFence,
 } from "../../core/dispatch/watcher.js";
 import {
   CONTINUE_PROMPT,
@@ -2629,6 +2630,23 @@ export class Orchestrator {
     // message stands down. Queued user messages are not superseded: each runs.
     this.channelGenerations.set(channelId, (this.channelGenerations.get(channelId) ?? 0) + 1);
 
+    let interruptedDispatchFence: DispatchTargetFence | undefined;
+    const resumeQueuedDispatches = async (): Promise<void> => {
+      const fence = interruptedDispatchFence;
+      if (!fence || !this.dispatchWatcher) return;
+      interruptedDispatchFence = undefined;
+      try {
+        await this.dispatchWatcher.recoverTarget(fence);
+      } catch (err) {
+        this.logger.warn({ err, channelId }, "queued dispatch recovery after user interrupt failed");
+      } finally {
+        this.dispatchWatcher.releaseTargetFence(fence);
+        void this.dispatchWatcher.tick().catch((err) =>
+          this.logger.warn({ err, channelId }, "queued dispatch tick after user interrupt failed")
+        );
+      }
+    };
+
     if (this.channelQueues.has(channelId)) {
       const channel = msg.channel;
       record ??= this.router.ensureSessionRecord({
@@ -2664,22 +2682,40 @@ export class Orchestrator {
         );
       } else {
         this.logger.info({ channelId, sessionId: record.id }, "new message arrived while turn active; aborting running turn");
-        // User intent: the new message replaces the running turn. Clear the
-        // marker at this layer (NOT dispose) so a crash mid-abort does not
-        // resume the turn the user just superseded.
-        await this.clearTurnMarkersForChannel(channelId, "cancelled");
-        // Escalate to a force-kill if the turn ignores the graceful cancel, so
-        // a hung turn can't block the new message behind it forever.
-        await this.router.abortTurn(record.id, { force: true });
+        interruptedDispatchFence = this.dispatchWatcher?.fenceTarget(channelId);
+        try {
+          // User intent: the new message replaces the running turn. Clear the
+          // marker at this layer (NOT dispose) so a crash mid-abort does not
+          // resume the turn the user just superseded.
+          await this.clearTurnMarkersForChannel(channelId, "cancelled", {
+            cancelLiveOnly: true,
+          });
+          // Escalate to a force-kill if the turn ignores the graceful cancel, so
+          // a hung turn can't block the new message behind it forever.
+          await this.router.abortTurn(record.id, { force: true });
+        } catch (err) {
+          await resumeQueuedDispatches();
+          throw err;
+        }
       }
     }
 
     // #88 D8: park BEFORE getOrStartRuntime when this thread is bound to a
     // remote bridge that is not ready. After aborting any in-flight turn so
     // this message replaces it. Does not hold the Discord turn open.
-    if (await this.tryParkForOfflineBridge(msg, admissionId)) return;
+    let parked = false;
+    try {
+      parked = await this.tryParkForOfflineBridge(msg, admissionId);
+    } catch (err) {
+      await resumeQueuedDispatches();
+      throw err;
+    }
+    if (parked) {
+      await resumeQueuedDispatches();
+      return;
+    }
 
-    await this.queueOnChannel(channelId, async (fence) => {
+    const turn = this.queueOnChannel(channelId, async (fence) => {
       if (
         admissionId &&
         !this.store.claimInbound(admissionId, fence.epoch, new Date().toISOString())
@@ -2698,6 +2734,8 @@ export class Orchestrator {
         }
       }
     });
+    await resumeQueuedDispatches();
+    await turn;
   }
 
   /**
@@ -15647,9 +15685,14 @@ export class Orchestrator {
   private async clearTurnMarkersForChannel(
     channelRef: string,
     status: "cancelled",
-    opts?: { preserveDispatch?: boolean }
+    opts?: { preserveDispatch?: boolean; cancelLiveOnly?: boolean }
   ): Promise<void> {
-    if (!opts?.preserveDispatch) {
+    const liveId = this.liveTurnByChannel.get(channelRef);
+    const liveDispatchId = this.activeLiveDispatch.get(channelRef);
+    if (opts?.cancelLiveOnly) {
+      const attemptId = liveDispatchId ?? liveId;
+      if (attemptId) this.store.turnAttempts.cancel(attemptId);
+    } else if (!opts?.preserveDispatch) {
       for (const state of ["active", "suspended"] as const) {
         for (const a of this.store.turnAttempts?.list(state) ?? []) {
           // A normal user turn replaces the active live schedule, not an
@@ -15660,7 +15703,6 @@ export class Orchestrator {
       }
     }
     const now = new Date().toISOString();
-    const liveId = this.liveTurnByChannel.get(channelRef);
     if (liveId) this.liveTurnByChannel.delete(channelRef);
     const markers = await this.liveTurnInventory();
     for (const m of markers) {
@@ -15676,7 +15718,13 @@ export class Orchestrator {
         this.logger.warn({ err, id: m.id }, "live-turn marker cancel failed")
       );
     }
-    if (!opts?.preserveDispatch) {
+    if (opts?.cancelLiveOnly && liveDispatchId) {
+      await this.dispatchWatcher
+        ?.cancelRunning({ id: liveDispatchId })
+        .catch((err) =>
+          this.logger.warn({ err, channelRef, dispatch: liveDispatchId }, "active dispatch cancellation failed")
+        );
+    } else if (!opts?.preserveDispatch) {
       await this.dispatchWatcher
         ?.cancelRunning({ target: channelRef })
         .catch((err) =>
@@ -15892,7 +15940,8 @@ export class Orchestrator {
       for (let check = 0; ; check += 1) {
         const reply = await mux.sendCmd("listSlots", {}) as { health?: unknown[] };
         const rows = (reply.health ?? []) as Array<{ slot?: unknown; alive?: unknown; recovery?: unknown }>;
-        snapshot = rows.find((row) => row && row.slot === binding.slot && isRemoteRecoverySnapshot(row.recovery)
+        snapshot = rows.find((row) => row && row.slot === binding.slot && row.alive === true
+          && isRemoteRecoverySnapshot(row.recovery)
           && row.recovery.submissionId === binding.submissionId
           && row.recovery.acpSessionId === binding.acpSessionId
         ) as { recovery: import("@seam/adapters").RemoteRecoverySnapshot } | undefined;
@@ -15909,7 +15958,8 @@ export class Orchestrator {
       return true;
     }
     if (!snapshot) {
-      this.continueLostRemoteTurn(attempt, "the bridge no longer holds this turn's slot");
+      await this.settleDeadRemoteRecovery(attempt,
+        `bridge slot ${binding.slot} on ${binding.location} is not live`);
       return true;
     }
 
@@ -15987,41 +16037,7 @@ export class Orchestrator {
 
       const completed = this.store.turnAttempts.get(current.id);
       if (!completed?.outcome) return;
-      if (current.source === "dispatch") {
-        await this.dispatchWatcher?.publishAdoptedResult(current.id, completed.outcome);
-      }
-
-      if (current.source === "schedule") {
-        const occurrence = this.store.scheduledOccurrences.get(current.id);
-        if (occurrence) await this.deliverScheduledCompletion(occurrence, completed);
-      } else {
-        const target: ChannelRef = { platform: PLATFORM, id: current.spec.target };
-        const body = failed
-          ? `❌ ${error}${output.trim() ? `\n\n${output}` : ""}`
-          : (output.trim() || "✅ Done — no output.");
-        try {
-          await this.sendTerminalAttemptDelivery(current.id, target, { kind: "message", text: body });
-          this.store.turnAttempts.markDeliveryDone(current.id);
-        } catch (err) {
-          // The completed row plus nonce-backed payload is the recovery plan.
-          this.logger.warn({ err, attempt: current.id }, "adopted remote result delivery deferred");
-        }
-      }
-
-      if (current.source === "dispatch") {
-        await this.replayCompletedDispatch(outcome,
-          completionRoute(outcome, this.store.getDelegation(current.id)));
-      } else if (current.source === "inbound") {
-        this.store.settleInboundExecution(current.id.slice("inbound-".length));
-        await finishLiveTurn(this.config.DATA_DIR, {
-          id: current.id,
-          status: failed ? "failed" : "completed",
-          channelRef: current.spec.target,
-          finishedUtc: result.finishedUtc,
-          ...(error ? { reason: error } : {}),
-        }).catch(() => {});
-      }
-      await this.projectPersistedTerminalAttemptCard(completed);
+      await this.finishRemoteRecoveryCompletion(current, completed);
       try { child.kill(); } catch { /* result is already durable */ }
     };
     child.on("remoteRecoveryResult", (result: RemoteRecoveryResult) => {
@@ -16049,6 +16065,76 @@ export class Orchestrator {
     "rebound controller to bridge-owned rung-1 recovery");
     await completion;
     return true;
+  }
+
+  private async settleDeadRemoteRecovery(attempt: TurnAttempt, cause: string): Promise<void> {
+    const current = this.store.turnAttempts.get(attempt.id);
+    if (!current || current.state !== "suspended"
+      || current.generation !== attempt.generation
+      || current.remoteRecovery?.submissionId !== attempt.remoteRecovery?.submissionId) return;
+    const error = `remote recovery cannot continue: ${cause}`;
+    const outcome: DispatchResult = {
+      id: current.id,
+      target: current.spec.target,
+      status: "failed",
+      output: "",
+      error,
+      workerError: error,
+      workerStatus: "failed",
+      kind: current.spec.kind,
+      returnTo: current.spec.returnTo,
+      chainId: current.spec.chainId,
+      correlationId: current.spec.correlationId,
+      finishedUtc: new Date().toISOString(),
+    };
+    if (!this.store.turnAttempts.settleRemoteRecovery(current, outcome)) return;
+    const completed = this.store.turnAttempts.get(current.id);
+    if (!completed?.outcome) return;
+    this.logger.warn({ attempt: current.id, location: current.remoteRecovery?.location,
+      slot: current.remoteRecovery?.slot, cause }, "dead remote recovery settled");
+    await this.finishRemoteRecoveryCompletion(current, completed);
+  }
+
+  private async finishRemoteRecoveryCompletion(
+    prior: TurnAttempt,
+    completed: TurnAttempt,
+  ): Promise<void> {
+    const outcome = completed.outcome!;
+    if (prior.source === "dispatch") {
+      await this.dispatchWatcher?.publishAdoptedResult(prior.id, outcome);
+    }
+
+    if (prior.source === "schedule") {
+      const occurrence = this.store.scheduledOccurrences.get(prior.id);
+      if (occurrence) await this.deliverScheduledCompletion(occurrence, completed);
+    } else {
+      const target: ChannelRef = { platform: PLATFORM, id: prior.spec.target };
+      const output = outcome.output ?? "";
+      const body = outcome.status === "failed"
+        ? `❌ ${outcome.error ?? "remote recovery failed"}${output.trim() ? `\n\n${output}` : ""}`
+        : (output.trim() || "✅ Done — no output.");
+      try {
+        await this.sendTerminalAttemptDelivery(prior.id, target, { kind: "message", text: body });
+        this.store.turnAttempts.markDeliveryDone(prior.id);
+      } catch (err) {
+        this.logger.warn({ err, attempt: prior.id }, "adopted remote result delivery deferred");
+      }
+    }
+
+    if (prior.source === "dispatch") {
+      await this.replayCompletedDispatch(outcome,
+        completionRoute(outcome, this.store.getDelegation(prior.id)));
+    } else if (prior.source === "inbound") {
+      this.store.settleInboundExecution(prior.id.slice("inbound-".length));
+      await finishLiveTurn(this.config.DATA_DIR, {
+        id: prior.id,
+        status: outcome.status === "failed" ? "failed" : "completed",
+        channelRef: prior.spec.target,
+        finishedUtc: outcome.finishedUtc ?? new Date().toISOString(),
+        ...(outcome.error ? { reason: outcome.error } : {}),
+      }).catch(() => {});
+    }
+    await this.projectPersistedTerminalAttemptCard(completed);
   }
 
   /**

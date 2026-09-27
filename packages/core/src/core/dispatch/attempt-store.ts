@@ -527,11 +527,18 @@ export class TurnAttemptStore {
     if (!binding || binding.submissionId !== result.submissionId
       || binding.acpSessionId !== result.acpSessionId
       || binding.generation !== a.generation) return false;
+    return this.settleRemoteRecovery(a, outcome);
+  }
+
+  /** Settle a suspended bridge-owned turn without submitting it again. */
+  settleRemoteRecovery(a: TurnAttempt, outcome: DispatchResult): boolean {
+    const binding = a.remoteRecovery;
+    if (!binding || binding.generation !== a.generation) return false;
     return this.db.prepare(`UPDATE turn_attempts SET state='completed', outcome_json=?,
       delivery_abandoned_reason=COALESCE(delivery_abandoned_reason, ?), updated_utc=?
       WHERE id=? AND generation=? AND state='suspended' AND json_extract(runtime_json,'$.remoteRecovery.submissionId')=?`)
       .run(JSON.stringify(outcome), suppressedOnwardDeliveryReason(outcome), new Date().toISOString(),
-        a.id, a.generation, result.submissionId).changes === 1;
+        a.id, a.generation, binding.submissionId).changes === 1;
   }
 
   assertCurrent(a: TurnAttempt): void {

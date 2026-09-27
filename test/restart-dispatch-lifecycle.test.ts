@@ -596,4 +596,156 @@ describe("#250 production dispatch lifecycle (synthetic transport, no providers)
       { state: "Done", action: "end_turn" },
     );
   });
+
+  it("settles a dead remote recovery before the next queued wake runs", async () => {
+    const h = setup();
+    h.store.turnAttempts.registerOwner("controller-before-restart");
+    const attempt = h.store.turnAttempts.claim(
+      { ...h.spec, id: "dead-wake", kind: "wake", returnTo: undefined },
+      "synthetic-identity",
+      "controller-before-restart",
+      "dispatch",
+    );
+    h.store.turnAttempts.bind(attempt, "recorded-acp");
+    h.store.turnAttempts.bindStatusCard(attempt, {
+      channelId: "worker",
+      messageId: "dead-card",
+    });
+    h.store.turnAttempts.startPrompt(attempt);
+    h.store.turnAttempts.recordRemoteRecovery(attempt, {
+      version: 1,
+      location: "remote-one",
+      slot: 19,
+      submissionId: "submission-dead",
+      acpSessionId: "recorded-acp",
+      delegatedUtc: "2026-09-27T20:11:00.000Z",
+    });
+    h.store.turnAttempts.suspendBoot("controller-before-restart");
+
+    const mux = {
+      sendCmd: vi.fn(async () => ({ health: [{
+        slot: 19,
+        alive: false,
+        recovery: {
+          version: 1,
+          owner: "bridge",
+          submissionId: "submission-dead",
+          acpSessionId: "recorded-acp",
+          rung: 1,
+          phase: "local_write_completed",
+          retry: 0,
+          budget: 3,
+          remaining: 3,
+          disposition: "none",
+          updatedUtc: "2026-09-27T20:12:00.000Z",
+        },
+      }] })),
+      adopt: vi.fn(),
+    };
+    h.runtime.prompt.mockResolvedValue({ stopReason: "end_turn" });
+    const restarted = h.makeOrch();
+    restarted.setBridgeHub({
+      muxFor: (location: string) => location === "remote-one" ? mux : undefined,
+      slotHealthFor: () => [],
+    } as any);
+    vi.spyOn(restarted as any, "enqueueReportBack").mockResolvedValue(undefined);
+    const watcher = createRuntimeDispatchWatcher({
+      attempts: h.store.turnAttempts,
+      dataDir: h.dataDir,
+      logger: pino({ level: "silent" }) as any,
+      resumeEnabled: true,
+      runtime: restarted,
+      pollMs: 1_000_000,
+    });
+    restarted.setDispatchWatcher(watcher);
+    cleanups.push(() => watcher.stop());
+    await enqueueDispatchSpec(h.dataDir, {
+      ...h.spec,
+      id: "wake-after-dead",
+      kind: "wake",
+      returnTo: undefined,
+      prompt: "queued wake",
+    });
+
+    await watcher.start();
+    await watcher.initialDispatchesSettled();
+
+    expect(mux.adopt).not.toHaveBeenCalled();
+    expect(h.store.turnAttempts.get("dead-wake")).toMatchObject({
+      state: "completed",
+      outcome: {
+        status: "failed",
+        error: "remote recovery cannot continue: bridge slot 19 on remote-one is not live",
+      },
+    });
+    expect(h.store.turnAttempts.get("wake-after-dead")?.state).toBe("completed");
+    expect(h.runtime.prompt).toHaveBeenCalledTimes(1);
+    expect(String(h.runtime.prompt.mock.calls[0]?.[0])).toContain("queued wake");
+    expect(h.adapter.editStatusPanelProjection).toHaveBeenCalledWith(
+      { channel: { platform: "discord", id: "worker" }, id: "dead-card" },
+      {
+        state: "Failed",
+        action: "Failed — remote recovery cannot continue: bridge slot 19 on remote-one is not live",
+      },
+    );
+  });
+
+  it("runs a queued report-back after a human interrupts the active dispatch", async () => {
+    const h = setup();
+    const order: string[] = [];
+    let releaseActive!: () => void;
+    let activeStarted!: () => void;
+    const active = new Promise<void>((resolve) => { activeStarted = resolve; });
+    const release = new Promise<void>((resolve) => { releaseActive = resolve; });
+    h.runtime.prompt
+      .mockImplementationOnce(async () => {
+        order.push("active dispatch");
+        activeStarted();
+        await release;
+        return { stopReason: "cancelled" };
+      })
+      .mockImplementationOnce(async () => {
+        order.push("report-back");
+        return { stopReason: "end_turn" };
+      });
+    Object.assign(h.router, {
+      isBusy: () => true,
+      abortTurn: vi.fn(async () => {
+        releaseActive();
+        return "cancelled" as const;
+      }),
+    });
+    vi.spyOn(h.orch as any, "handleIncomingMessageInner").mockImplementation(async () => {
+      order.push("human");
+    });
+    await h.watcher.start();
+    await enqueueDispatchSpec(h.dataDir, { ...h.spec, returnTo: undefined });
+    await enqueueDispatchSpec(h.dataDir, {
+      ...h.spec,
+      id: "queued-report-back",
+      kind: "report_back",
+      returnTo: undefined,
+      prompt: "worker result",
+    });
+    void h.watcher.tick();
+    await active;
+
+    const handling = (h.orch as any).handleIncomingMessage({
+      messageId: "1553034067430215711",
+      channel: { platform: "discord", id: "worker" },
+      authorId: "human",
+      authorName: "Human",
+      authorIsBot: false,
+      text: "new human direction",
+    });
+    await vi.waitFor(() => expect(order).toContain("human"));
+    await handling;
+    await vi.waitFor(() =>
+      expect(h.store.turnAttempts.get("queued-report-back")?.state).toBe("completed")
+    );
+
+    expect(h.store.turnAttempts.get("held")?.state).toBe("cancelled");
+    expect(h.store.turnAttempts.get("queued-report-back")?.outcome?.error).toBeUndefined();
+    expect(order).toEqual(["active dispatch", "human", "report-back"]);
+  }, 15_000);
 });

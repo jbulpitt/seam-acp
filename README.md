@@ -82,6 +82,26 @@ changes that, and none ever has. See
 [the native lifecycle notes](docs/agy-native-lifecycle.md) for the full posture
 and why there is deliberately no acknowledgement flag (#324, #380).
 
+## Your deployment's notes (`docs/local/`)
+
+Keep everything that's true only for your deployment in `docs/local/`:
+- which hosts run the controller and the bridges, and how they connect;
+- the exact deploy, restart and rollout commands for your setup;
+- guild, channel and bot ids, and any staging or test deployment;
+- host tooling and conventions your agents should follow.
+
+`docs/local/` is gitignored, and `AGENTS.md` and the agent guides point
+agents there for environment-specific details, so it's the place agents
+read before deploying or touching a host. It can be plain files, or a clone
+of a private repo so every host shares one versioned copy:
+
+```bash
+git clone <your-private-notes-repo> docs/local
+```
+
+Start it with a `README.md` that indexes the rest. Never put secrets there:
+tokens and keys stay in `.env` and each host's config files.
+
 ## Run (local dev)
 
 ```sh

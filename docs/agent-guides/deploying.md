@@ -1,8 +1,8 @@
 # Deploying and restarting
 
 How Seam's processes are deployed and restarted. Your deployment's hosts,
-checkouts and exact commands live in its operator context (`docs/local/`,
-if present). Read that before running anything; most mistakes here are the
+checkouts and exact commands live in `docs/local/` (see the README's
+"Your deployment's notes"). Read that before running anything; most mistakes here are the
 right command on the wrong host.
 
 ## The processes

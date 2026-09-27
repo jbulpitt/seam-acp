@@ -6,14 +6,17 @@ This file contains instructions for AI agents (Copilot, Claude, Gemini, etc.) wo
 
 `seam-acp` is the Discord bot you are currently running inside. It bridges Discord messages to AI agent CLIs via the Agent Client Protocol (ACP). You are likely talking to yourself.
 
-## Operator context: read it first
+## Your deployment's details: `docs/local/`
 
-This repo is public and describes how Seam works. What's true only for the
-deployment you're in (its hosts, ids, exact deploy commands and host tooling)
-lives in a private operator repo cloned into the gitignored `docs/local/`.
-If `docs/local/README.md` exists, read it before any deploy, restart or host
-command. From a worktree, it's in the main checkout:
+This repo describes how Seam works, not where or how any one deployment runs.
+Each deployment keeps its own details in the gitignored `docs/local/`: hosts,
+ids, the exact deploy and restart commands, host tooling and local
+conventions. Start with `docs/local/README.md` if it exists, and check
+`docs/local/` before any deploy, restart or host command. From a worktree
+it's in the main checkout:
 `$(git rev-parse --path-format=absolute --git-common-dir)/../docs/local/`.
+When you learn something true only for this deployment, write it there, not
+in tracked files.
 
 ## Output formatting
 
@@ -37,7 +40,7 @@ hand-editing runtime state.
   they do not author.
 - **Gemini in a voice channel (live help):** MCP `create_live_help` (no fence)
   after packing `system` + optional `historySummary`. `voiceChannelId`: this
-  thread’s rider first, else the deployment's default voice channel (operator context). Students may *be in* the
+  thread’s rider first, else the default voice channel named in `docs/local/`. Students may *be in* the
   VC and may ask their course agent to start or stop their own session; no
   parent/admin approval is required. How-to:
   `docs/agent-guides/live-help.md`. School overlays:
@@ -137,7 +140,7 @@ Reviewing? Read `docs/agent-guides/review-guide.md`. It covers the delete-first 
 controller. `npm run redeploy` only restarts a controller that runs from the
 checkout you're in; anywhere else it builds, restarts nothing, and says
 nothing. Which host runs what, and the exact commands for each app, are in
-the operator context (`docs/local/deployments.md`). How deploys, bridges,
+`docs/local/`. How deploys, bridges,
 sessiond and staging work in general is in `docs/agent-guides/deploying.md`.
 
 The checked-in units and recovery procedure live in `ops/systemd/README.md`.
@@ -213,7 +216,7 @@ file/test counts.
 
 ## Git worktrees
 
-Use the host's worktree tooling as described in the operator context (`docs/local/worktrees.md`). Never park a worktree under `/tmp`, symlink `node_modules`, or install a second copy of dependencies inside a tree. If the tree shares the main install through a mount, tear it down with that tooling **before** `gh pr merge --delete-branch`: gh's own worktree removal deletes through the mount into the main install.
+Use the host's worktree tooling as described in `docs/local/`. Never park a worktree under `/tmp`, symlink `node_modules`, or install a second copy of dependencies inside a tree. If the tree shares the main install through a mount, tear it down with that tooling **before** `gh pr merge --delete-branch`: gh's own worktree removal deletes through the mount into the main install.
 
 ## Reference guides (open when relevant)
 

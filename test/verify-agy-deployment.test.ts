@@ -7,7 +7,7 @@
  *
  *   A. root-owned `/opt/seam/agy-runtime/<sha>/agy`, pins in a file  — correct
  *   B. `$HOME/.seam/agy-runtime/<sha>/agy`, pins in a file           — replaceable
- *   C. pins present in the running environment and in no file (fhr-server) — enforced
+ *   C. pins present in the running environment and in no file (remote-a) — enforced
  *
  * B and C both WORKED when observed. Both reported `provenance mode:
  * immutable-path`. That is the whole difficulty: the failure is invisible from
@@ -15,7 +15,7 @@
  * reports the specific thing that is wrong rather than an overall mood.
  *
  * The second load-bearing property is negative. Four of five hosts are agy-only,
- * so a tool that "fixes" a host it misdiagnosed takes a family laptop to zero
+ * so a tool that "fixes" a host it misdiagnosed takes a single-agent host to zero
  * agents — outcome 4 in the blast-radius ordering. The verifier therefore has no
  * write surface at all, and that is asserted two ways: a byte-level snapshot of
  * a failing host before and after, and an `io` that throws on any function
@@ -88,7 +88,7 @@ interface Host {
  *
  * `underHome` chooses between the managed parent and `$HOME` staging;
  * `pinsInFile: false` writes an env file with no AGY keys and puts them in the
- * process environment instead, which is exactly macbook-air as found.
+ * process environment instead, which is exactly macos-b as found.
  */
 function host(opts: {
   underHome?: boolean;
@@ -139,7 +139,7 @@ function host(opts: {
   };
 
   // The fleet keeps pins in a pm2 ecosystem module, not a KEY=VALUE file. This
-  // shape is copied from macbook-pro/macbook-air/home-hub as observed on
+  // shape is copied from macos-a/macos-b/remote-c as observed on
   // 2026-09-13 — indentation, quoting and trailing commas included — because
   // the previous fixtures took the pins-file shape from the documentation and
   // that is the single assumption #395 turned on.
@@ -244,7 +244,7 @@ describe("#265 the three layouts observed on 2026-09-12", () => {
   });
 
   it("treats pins the running environment carries as enforced when the file has none", () => {
-    // fhr-server. systemd injects /etc/seam-bridge-agy.env into the process.
+    // remote-a. systemd injects /etc/seam-bridge-agy.env into the process.
     // ~/.config/seam-bridge/bridge.env has no AGY pins. Failing that host
     // because the file is empty is the report people learn to ignore.
     const h = host({ pinsInFile: false });
@@ -385,7 +385,7 @@ describe("#265 the artifact the pins point at", () => {
 
 describe("#265 identity is not capability", () => {
   it("skips the capability check by default and says that it skipped it", () => {
-    // macbook-pro passed every identity check while serving zero turns (#371).
+    // macos-a passed every identity check while serving zero turns (#371).
     // A report that silently omitted capability would read as "verified".
     const report = verdictFor(host());
     const capability = byId(report, "capability");
@@ -683,7 +683,7 @@ describe("#265 pin resolution", () => {
 
 describe("#395 the enforcing source is not the same file on every host", () => {
   it("follows the bridge.env the launcher names, even when exec env is empty", () => {
-    // plex-server. The launcher reads bridge.env after start. /proc/environ
+    // media-host. The launcher reads bridge.env after start. /proc/environ
     // and an unrelated env file are empty; failing on those is the false FAIL.
     const h = host();
     const launcher = path.join(h.root, "launch.mjs");
@@ -718,7 +718,7 @@ describe("#395 the enforcing source is not the same file on every host", () => {
   });
 
   it("treats a dotenv file as enforced when the exec environment has no pins", () => {
-    // rhc-server. systemd starts the process with no AGY keys; dotenv
+    // remote-b. systemd starts the process with no AGY keys; dotenv
     // override loads the repo .env.
     const h = host();
     const report = verdictFor(h, {
@@ -733,7 +733,7 @@ describe("#395 the enforcing source is not the same file on every host", () => {
   });
 
   it("calls an ecosystem pin unenforced when the running environment has none", () => {
-    // macbook-air and jennifer-laptop. The file records the pin. pm2's
+    // macos-b and portable-d. The file records the pin. pm2's
     // environment does not have the keys. That is not a pass and not a
     // misdeployed artifact.
     const h = host({ pinsFormat: "pm2" });
@@ -773,7 +773,7 @@ describe("#395 the enforcing source is not the same file on every host", () => {
   });
 
   it("says unknown, not unpinned, when an existing file has no pins and the process was not read", () => {
-    // The empty bridge.env on fhr-server. Opening it and stopping there is
+    // The empty bridge.env on remote-a. Opening it and stopping there is
     // how a pinned host was reported as having no agy.
     const h = host({ pinsInFile: false });
     const report = verifyAgyDeployment({

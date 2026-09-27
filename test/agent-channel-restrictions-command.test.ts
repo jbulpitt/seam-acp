@@ -67,7 +67,7 @@ function interaction(sub: "set" | "list" | "clear", values: Record<string, strin
         getSubcommand: () => sub,
         getString: (name: string) => values[name] ?? null,
       },
-      user: { id: userId, username: "Jesse" },
+      user: { id: userId, username: "Alex" },
       reply: async (payload: { content?: string; flags?: number }) => { replies.push(payload); },
     },
   };

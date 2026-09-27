@@ -1,5 +1,5 @@
 /**
- * #622 — copilot catalog refreshes on fhr-server timed out at the 30s RPC
+ * #622 — copilot catalog refreshes on remote-a timed out at the 30s RPC
  * default for 7 days (a probe takes 79-101s), and each probe started the
  * user's MCP servers, leaking xvfb-run's Xvfb on hosts with a browser MCP.
  */
@@ -74,8 +74,8 @@ describe("controller catalog fetch", () => {
       localBridgeTokenHash: "a".repeat(64),
     });
     const rpc = vi.fn(async () => ({}));
-    (hub as unknown as { connections: Map<string, unknown> }).connections.set("fhr-server", { mux: { rpc } });
-    await hub.fetchModelCatalog("fhr-server", "copilot");
+    (hub as unknown as { connections: Map<string, unknown> }).connections.set("remote-a", { mux: { rpc } });
+    await hub.fetchModelCatalog("remote-a", "copilot");
     expect(rpc).toHaveBeenCalledWith("fetchModelCatalog", {}, expect.objectContaining({ agentId: "copilot" }));
     const timeoutMs = (rpc.mock.calls[0] as unknown[])[2] as { timeoutMs?: number };
     // Measured probe: 79s without MCP servers, 101s with them.

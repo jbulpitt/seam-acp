@@ -19,7 +19,7 @@ function makeParked(over: Partial<ParkedPrompt> = {}): ParkedPrompt {
     kind: "bridge_offline",
     prompt: "continue the doc when you're back",
     authorId: "user-1",
-    authorName: "Jesse",
+    authorName: "Alex",
     noticeMessageId: "msg-1",
     attachments: [{ filename: "note.txt", mime: "text/plain", size: 12 }],
     createdUtc: "2026-08-18T00:00:00.000Z",

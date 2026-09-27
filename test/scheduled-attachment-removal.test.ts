@@ -50,7 +50,7 @@ function schedule(over: Partial<ScheduledPrompt> = {}): ScheduledPrompt {
     catchupSeconds: 7200,
     enabled: true,
     legacyAttachmentCount: 0,
-    createdBy: "user-jesse",
+    createdBy: "user-alex",
     createdUtc: "2026-01-01T00:00:00.000Z",
     updatedUtc: "2026-01-01T00:00:00.000Z",
     lastRunUtc: null,
@@ -374,7 +374,7 @@ describe("#158 config_propose schedule mutations", () => {
     });
     expect(built.ok).toBe(true);
     if (!built.ok) return;
-    built.proposal.apply({ id: "user-jesse", name: "Jesse" });
+    built.proposal.apply({ id: "user-alex", name: "Alex" });
     const rows = store.listScheduledByChannel("discord", "thread-1");
     expect(rows).toHaveLength(1);
     expect(rows[0]!.legacyAttachmentCount).toBe(0);
@@ -398,7 +398,7 @@ describe("#158 config_propose schedule mutations", () => {
     expect(built.proposal.warnings.join(" ")).toMatch(/quarantined/i);
     expect(built.proposal.warnings.join(" ")).toContain("left on disk");
 
-    built.proposal.apply({ id: "user-jesse", name: "Jesse" });
+    built.proposal.apply({ id: "user-alex", name: "Alex" });
     expect(store.getScheduled("sch_legacy")!.legacyAttachmentCount).toBe(0);
     expect(rescheduled).toEqual(["sch_legacy"]);
   });
@@ -418,7 +418,7 @@ describe("#158 config_propose schedule mutations", () => {
     expect(built.proposal.warnings.join(" ")).toContain("will NOT run");
 
     // Enabling preserves the manifest — only an edit lifts the quarantine.
-    built.proposal.apply({ id: "user-jesse", name: "Jesse" });
+    built.proposal.apply({ id: "user-alex", name: "Alex" });
     expect(store.getScheduled("sch_legacy")!.legacyAttachmentCount).toBe(1);
   });
 
@@ -435,7 +435,7 @@ describe("#158 config_propose schedule mutations", () => {
     expect(built.ok).toBe(true);
     if (!built.ok) return;
     expect(built.proposal.warnings.join(" ")).toContain("Seam does not delete them");
-    built.proposal.apply({ id: "user-jesse", name: "Jesse" });
+    built.proposal.apply({ id: "user-alex", name: "Alex" });
     expect(store.getScheduled("sch_legacy")).toBeNull();
   });
 });
@@ -452,7 +452,7 @@ async function renderBuilderCard(existing?: ScheduledPrompt): Promise<RenderedCa
   let card: RenderedCard | undefined;
   const interaction = {
     isChatInputCommand: () => true,
-    user: { id: "user-jesse" },
+    user: { id: "user-alex" },
     options: { getAttachment: () => null },
     reply: async (payload: RenderedCard) => {
       card = payload;

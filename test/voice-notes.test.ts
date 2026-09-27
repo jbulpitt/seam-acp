@@ -52,26 +52,26 @@ describe("isVoiceNoteAttachment", () => {
 
 describe("formatVoiceNoteBlock", () => {
   it("quotes a successful transcript", () => {
-    const text = formatVoiceNoteBlock("Jesse", [
+    const text = formatVoiceNoteBlock("Alex", [
       { filename: "voice-message.ogg", transcript: "Hello there" },
     ]);
-    expect(text).toContain("The user (Jesse) sent a voice note");
+    expect(text).toContain("The user (Alex) sent a voice note");
     expect(text).toContain('"Hello there"');
     expect(text).not.toContain("voice-message.ogg");
     expect(text).not.toContain("Original audio");
   });
 
   it("is fail-visible when STT errors", () => {
-    const text = formatVoiceNoteBlock("Jesse", [
+    const text = formatVoiceNoteBlock("Alex", [
       { filename: "voice-message.ogg", error: "STT HTTP 500" },
     ]);
-    expect(text).toMatch(/The user \(Jesse\) sent a voice note \(transcription failed: STT HTTP 500\)/);
+    expect(text).toMatch(/The user \(Alex\) sent a voice note \(transcription failed: STT HTTP 500\)/);
     expect(text).not.toContain("undefined");
   });
 
   it("points at Discord's CDN copy instead of a local file", () => {
     const url = "https://cdn.discordapp.com/attachments/1/2/voice-message.ogg?ex=abc";
-    const text = formatVoiceNoteBlock("Jesse", [
+    const text = formatVoiceNoteBlock("Alex", [
       { filename: "voice-message.ogg", transcript: "Hello there", sourceUrl: url },
     ]);
     expect(text).toContain('"Hello there"');
@@ -164,7 +164,7 @@ describe("transcribeAudioWithGemini", () => {
       expect(body.generation_config.transcription_config).toEqual({
         language_codes: [],
         mode: "smart",
-        custom_vocabulary: ["Seam", "Allie"],
+        custom_vocabulary: ["Seam", "Taylor"],
       });
       return Response.json({
         status: "completed",
@@ -181,7 +181,7 @@ describe("transcribeAudioWithGemini", () => {
       apiKey: "test-key",
       bytes: new Uint8Array([1, 2, 3]),
       mimeType: "application/ogg",
-      customVocabulary: ["Seam", " seam ", "Allie"],
+      customVocabulary: ["Seam", " seam ", "Taylor"],
       fetchFn,
     });
     expect(result).toEqual({ ok: true, text: "polished voice note" });
@@ -269,7 +269,7 @@ describe("applyVoiceNoteTranscriptions", () => {
       prompt,
       attachments: [voice()],
       apiKey: "",
-      speakerLabel: "Jesse",
+      speakerLabel: "Alex",
       fetchFn,
     });
     expect(out.prompt).toBe(prompt);
@@ -289,8 +289,8 @@ describe("applyVoiceNoteTranscriptions", () => {
       };
       expect(body.generation_config.transcription_config.custom_vocabulary).toEqual([
         "Seam",
-        "Allie",
-        "Jesse Bulpitt",
+        "Taylor",
+        "Alex Morgan",
       ]);
       return Response.json({
         steps: [
@@ -305,12 +305,12 @@ describe("applyVoiceNoteTranscriptions", () => {
       prompt: "harness preamble here",
       attachments: [voice(), { url: "https://cdn.example/pic.png", filename: "pic.png", contentType: "image/png", size: 10 }],
       apiKey: "test-key",
-      speakerLabel: "Jesse Bulpitt",
-      customVocabulary: ["Seam", "Allie"],
+      speakerLabel: "Alex Morgan",
+      customVocabulary: ["Seam", "Taylor"],
       fetchFn,
     });
     expect(out.prompt.startsWith("harness preamble here")).toBe(true);
-    expect(out.prompt).toContain("The user (Jesse Bulpitt) sent a voice note");
+    expect(out.prompt).toContain("The user (Alex Morgan) sent a voice note");
     expect(out.prompt).toContain("Are you able to interpret this?");
     expect(out.prompt).toContain("https://cdn.example/voice-message.ogg");
     expect(out.prompt).not.toContain("pic.png");
@@ -329,7 +329,7 @@ describe("applyVoiceNoteTranscriptions", () => {
       prompt: "please transcribe",
       attachments: [voice()],
       apiKey: "test-key",
-      speakerLabel: "Jesse",
+      speakerLabel: "Alex",
       fetchFn,
     });
     expect(out.prompt).toContain("please transcribe");

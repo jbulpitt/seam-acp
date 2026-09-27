@@ -60,8 +60,8 @@ describe("WarmSetManager", () => {
         invalidate,
       },
       hub: { isBridgeReady: () => true },
-      threadPresets: new Map([["g", { location: "fhr-server" }]]),
-      hosts: [{ id: "fhr-server", budgetMb: 2500 }],
+      threadPresets: new Map([["g", { location: "remote-a" }]]),
+      hosts: [{ id: "remote-a", budgetMb: 2500 }],
       intervalMs: 60_000,
       maxConcurrent: 2,
     });
@@ -88,8 +88,8 @@ describe("WarmSetManager", () => {
         invalidate: async () => {},
       },
       hub: { isBridgeReady: () => false },
-      threadPresets: new Map([["g", { location: "rhc-server" }]]),
-      hosts: [{ id: "rhc-server", budgetMb: 10_000 }],
+      threadPresets: new Map([["g", { location: "remote-b" }]]),
+      hosts: [{ id: "remote-b", budgetMb: 10_000 }],
       intervalMs: 60_000,
       maxConcurrent: 2,
     });
@@ -115,8 +115,8 @@ describe("WarmSetManager", () => {
         isBridgeReady: () => true,
         slotHealthFor: () => [{ slot: 3, alive: false, pid: null, lastStdoutMsAgo: null, lastStdinMsAgo: null }],
       },
-      threadPresets: new Map([["g", { location: "rhc-server" }]]),
-      hosts: [{ id: "rhc-server", budgetMb: 10_000 }],
+      threadPresets: new Map([["g", { location: "remote-b" }]]),
+      hosts: [{ id: "remote-b", budgetMb: 10_000 }],
       intervalMs: 60_000,
       maxConcurrent: 2,
     });

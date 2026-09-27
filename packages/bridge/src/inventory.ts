@@ -85,7 +85,7 @@ function reportUnavailable(
     : "";
   // Refuse only this adapter. The bridge and every independently loadable
   // adapter keep serving; this names the code-upgrade loss that was silent on
-  // macbook-pro and home-hub (#329).
+  // two affected bridge hosts (#329).
   console.error(
     `[bridge] adapter ${refusal.agentId} unavailable (${refusal.code})${missing}; ` +
     "adapter will not be advertised, but the bridge and other adapters remain available",
@@ -328,7 +328,7 @@ export function loadHostAdapters(
       // it. Rethrowing here escaped loadHostAdapters and killed the process,
       // so one agent failing verification became a HOST outage — and on a
       // single-agent host those are the same event with very different blast
-      // radii. An agy provenance failure on macOS took an entire laptop
+      // radii. An agy provenance failure on macOS took an entire host
       // offline this way. Refuse the agent loudly and keep serving the rest.
       const reason = error instanceof Error ? error.message : String(error);
       if (f.strict) {

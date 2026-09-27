@@ -28,7 +28,7 @@ const logger = { warn: vi.fn(), info: vi.fn(), error: vi.fn(), debug: vi.fn(), c
 
 function remoteRuntime() {
   const ws = new FakeWs();
-  const mux = makeMux({ id: "laptop" } as never);
+  const mux = makeMux({ id: "portable-host" } as never);
   mux.attach(ws as never);
   let child: ReturnType<typeof mux.spawn> | undefined;
   const runtime = new AgentRuntime({
@@ -60,7 +60,7 @@ describe("#610 remote start failure cause", () => {
     const error = await failure;
     expect(Date.now() - started).toBeLessThan(5_000);
     expect(error.message).toContain(
-      "remote agent supervisor exited before initialize on host 'laptop' (code=1, signal=null): "
+      "remote agent supervisor exited before initialize on host 'portable-host' (code=1, signal=null): "
       + "agent stdin is closed; input could not be delivered",
     );
     expect(error.message).toContain("adapter-child: last words");

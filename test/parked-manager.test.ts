@@ -20,7 +20,7 @@ function makeParked(over: Partial<ParkedPrompt> = {}): ParkedPrompt {
     kind: "bridge_offline",
     prompt: "hello",
     authorId: "u1",
-    authorName: "Jesse",
+    authorName: "Alex",
     noticeMessageId: "m1",
     attachments: [],
     createdUtc: "2026-08-18T00:00:00.000Z",

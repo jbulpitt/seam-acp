@@ -218,11 +218,11 @@ function harness(opts: {
   };
 }
 
-describe("#366 existing claude@macbook-pro thread configuration", () => {
+describe("#366 existing claude@macos-a thread configuration", () => {
   it("agent-only switch to a cold binding uses provider default", async () => {
     const cache = await passthroughCatalog(false);
     try {
-      const h = harness({ catalog: cache.catalog, location: "macbook-pro",
+      const h = harness({ catalog: cache.catalog, location: "macos-a",
         target: record({ agentId: "codex", configJson: JSON.stringify({ model: "gpt-old" }) }) });
       expect(await h.service.configure(h.caller, h.target, { agent: "claude" })).toMatchObject({
         ok: true, verification: "unverified", applied: { agent: "claude", model: "default" },
@@ -233,7 +233,7 @@ describe("#366 existing claude@macbook-pro thread configuration", () => {
     const cache = await passthroughCatalog(fixture.warm);
     try {
       if (!fixture.warm) expect(cache.generationRows()).toBe(0);
-      const h = harness({ catalog: cache.catalog, location: "macbook-pro" });
+      const h = harness({ catalog: cache.catalog, location: "macos-a" });
       const result = await h.service.configure(h.caller, h.target, { model: fixture.typed });
       expect(result.ok).toBe(fixture.allowed);
       if (!result.ok) {

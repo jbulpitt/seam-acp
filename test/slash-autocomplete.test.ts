@@ -209,7 +209,7 @@ function schedule(over: Partial<ScheduledPrompt> = {}): ScheduledPrompt {
     catchupSeconds: 7200,
     enabled: true,
     legacyAttachmentCount: 0,
-    createdBy: "user-jesse",
+    createdBy: "user-alex",
     createdUtc: now,
     updatedUtc: now,
     lastRunUtc: null,

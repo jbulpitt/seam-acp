@@ -121,7 +121,7 @@ describe("ModelCatalogService", () => {
     const opened = db();
     const withheld = { agentId: "copilot", location: "local" };
     const sameHost = { agentId: "claude", location: "local" };
-    const otherHost = { agentId: "copilot", location: "fhr-server" };
+    const otherHost = { agentId: "copilot", location: "remote-a" };
     const fetched: string[] = [];
     const catalog = service({
       store: opened.store,
@@ -143,16 +143,16 @@ describe("ModelCatalogService", () => {
       ok: false,
       error: "copilot@local is withheld by AGENT_LOCATION_DENY; no catalog fetch made",
     });
-    expect(fetched.sort()).toEqual(["claude@local", "copilot@fhr-server"]);
-    expect(all.find((r) => r.binding.location === "fhr-server")?.result).toBe("published");
+    expect(fetched.sort()).toEqual(["claude@local", "copilot@remote-a"]);
+    expect(all.find((r) => r.binding.location === "remote-a")?.result).toBe("published");
     expect(catalog.lookup(withheld).snapshot).toBeNull();
   });
 
   it("uses the main Anthropic API catalog for every ordinary Claude bridge binding", async () => {
     const opened = db();
     const local = { agentId: "claude", location: "local" };
-    const remote = { agentId: "claude", location: "macbook-air" };
-    const vertex = { agentId: "claude-vertex", location: "macbook-air" };
+    const remote = { agentId: "claude", location: "macos-b" };
+    const vertex = { agentId: "claude-vertex", location: "macos-b" };
     const fetched: string[] = [];
     let claudeIds = ["default", "claude-opus-5-5"];
     const catalog = service({
@@ -195,7 +195,7 @@ describe("ModelCatalogService", () => {
     expect(fetched).toEqual([
       "claude@local",
       "claude@local",
-      "claude-vertex@macbook-air",
+      "claude-vertex@macos-b",
       "claude@local",
     ]);
     expect(catalog.models(vertex).map((entry) => entry.id)).toEqual(["vertex-model"]);
@@ -687,7 +687,7 @@ describe("ModelCatalogService", () => {
   it("retires only a positively removed local adapter and preserves an offline remote observation", async () => {
     const opened = db();
     const removedLocal = { agentId: "agy-package", location: "local" };
-    const offlineRemote = { agentId: "agy", location: "jennifer-laptop" };
+    const offlineRemote = { agentId: "agy", location: "portable-d" };
     const seeded = service({
       store: opened.store,
       bindings: [removedLocal, offlineRemote],
@@ -731,7 +731,7 @@ describe("ModelCatalogService", () => {
     // A remote host's absence from this server's local profiles proves
     // nothing. Even after arbitrary downtime its durable fleet evidence stays
     // current and serves as a stale last-known-good snapshot.
-    expect(observations.get("agy@jennifer-laptop")).toMatchObject({
+    expect(observations.get("agy@portable-d")).toMatchObject({
       retiredAt: null,
       retirementReason: null,
     });

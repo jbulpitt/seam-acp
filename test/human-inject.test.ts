@@ -16,7 +16,7 @@ const silent = pino({ level: "silent" }) as unknown as Logger;
 
 describe("humanInboxFrom (#63 attribution via #57)", () => {
   it("prefers the resolved display name, prefixed human:", () => {
-    expect(humanInboxFrom("Jesse", "1487094572696867019")).toBe("human:Jesse");
+    expect(humanInboxFrom("Alex", "1487094572696867019")).toBe("human:Alex");
   });
 
   it("falls back to the author id when no name resolved", () => {
@@ -26,7 +26,7 @@ describe("humanInboxFrom (#63 attribution via #57)", () => {
   });
 
   it("trims incidental whitespace around the name", () => {
-    expect(humanInboxFrom("  Allie ", "9")).toBe("human:Allie");
+    expect(humanInboxFrom("  Taylor ", "9")).toBe("human:Taylor");
   });
 });
 
@@ -114,23 +114,23 @@ afterEach(() => {
 describe("Orchestrator.pushHumanInbox (#63)", () => {
   it("queues the human's text with the given from attribution", () => {
     const { orch } = makeOrch({});
-    const res = orch.pushHumanInbox(record(), "human:Jesse", "go check the logs");
+    const res = orch.pushHumanInbox(record(), "human:Alex", "go check the logs");
     expect(res.queued).toBe(1);
     const listed = store.listInbox("discord:thread-1");
     expect(listed).toHaveLength(1);
-    expect(listed[0]!.fromRef).toBe("human:Jesse");
+    expect(listed[0]!.fromRef).toBe("human:Alex");
     expect(listed[0]!.body).toBe("go check the logs");
   });
 
   it("scrubs Discord URLs only for a restrictDiscordAccess target", () => {
     const restricted = makeOrch({ restrictDiscordAccess: true });
-    restricted.orch.pushHumanInbox(record(), "human:Jesse", "look at https://discord.com/channels/1/2/3");
+    restricted.orch.pushHumanInbox(record(), "human:Alex", "look at https://discord.com/channels/1/2/3");
     expect(store.listInbox("discord:thread-1")[0]!.body).toBe("look at [discord link removed]");
 
     store.drainInbox("discord:thread-1");
 
     const open = makeOrch({ restrictDiscordAccess: false });
-    open.orch.pushHumanInbox(record(), "human:Jesse", "look at https://discord.com/channels/1/2/3");
+    open.orch.pushHumanInbox(record(), "human:Alex", "look at https://discord.com/channels/1/2/3");
     expect(store.listInbox("discord:thread-1")[0]!.body).toBe("look at https://discord.com/channels/1/2/3");
   });
 });
@@ -142,7 +142,7 @@ describe("Orchestrator mid-turn reply routing (#63)", () => {
     const msg = {
       channel: { platform: "discord", id: "thread-9" },
       authorId: "1487094572696867019",
-      authorName: "Jesse",
+      authorName: "Alex",
       authorIsBot: false,
       text: "actually, prioritize the migration",
       raw: { react },
@@ -152,7 +152,7 @@ describe("Orchestrator mid-turn reply routing (#63)", () => {
     const listed = store.listInbox("discord:thread-9");
     expect(listed).toHaveLength(1);
     expect(listed[0]!.body).toBe("actually, prioritize the migration");
-    expect(listed[0]!.fromRef).toBe("human:Jesse");
+    expect(listed[0]!.fromRef).toBe("human:Alex");
     // Cooperative — the running turn is NOT aborted.
     expect(abortTurn).not.toHaveBeenCalled();
     // Light 💬 ack.
@@ -164,7 +164,7 @@ describe("Orchestrator mid-turn reply routing (#63)", () => {
     await (orch as any).routeMidTurnReplyToInbox({
       channel: { platform: "discord", id: "thread-9" },
       authorId: "42",
-      authorName: "Jesse",
+      authorName: "Alex",
       authorIsBot: false,
       text: "   ",
       raw: {},
@@ -190,7 +190,7 @@ function steerInteraction(opts: { now: boolean; prompt?: string; thread?: string
     deferReply,
     editReply,
     reply,
-    user: { id: "1487094572696867019", username: "jbulpitt", globalName: "Jesse" },
+    user: { id: "1487094572696867019", username: "amorgan", globalName: "Alex" },
     member: null,
   };
   return { i, editReply, deferReply, reply };
@@ -205,7 +205,7 @@ describe("Orchestrator.cmdSteer now: option (#63)", () => {
     const listed = store.listInbox("discord:1007");
     expect(listed).toHaveLength(1);
     expect(listed[0]!.body).toBe("check the logs");
-    expect(listed[0]!.fromRef).toBe("human:Jesse");
+    expect(listed[0]!.fromRef).toBe("human:Alex");
     // Cooperative: the running turn is never cancelled.
     expect(abortTurn).not.toHaveBeenCalled();
   });

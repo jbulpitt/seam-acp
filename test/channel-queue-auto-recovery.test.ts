@@ -5,7 +5,7 @@
  * on a thread, that attempt holds the thread's queue with no timeout and no
  * retry, and every later message admits an attempt that stays `state=pending`,
  * `prompt_started=0` indefinitely. The card is rendered at ADMISSION, so it
- * shows Working… and never changes. Two of Jesse's threads sat that way for 7
+ * shows Working… and never changes. Two of Alex's threads sat that way for 7
  * and 13 hours while unrelated threads completed turns normally.
  *
  * Nothing about detection or repair was missing. `inspectChannelQueue` already

@@ -8,7 +8,7 @@ import { parseEnv } from "node:util";
  * settings live, whatever supervises it. Values in the file replace the same
  * keys in the process environment, because pm2 replays a captured environment
  * on every restart and cannot unset a key — a removed agy pin kept coming back
- * that way on rhc-server.
+ * that way on an affected host.
  */
 export function bridgeConfigPath(env: NodeJS.ProcessEnv = process.env): string {
   const base = env.XDG_CONFIG_HOME?.trim() || path.join(env.HOME?.trim() || os.homedir(), ".config");

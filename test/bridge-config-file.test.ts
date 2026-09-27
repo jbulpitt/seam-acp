@@ -1,6 +1,6 @@
 /**
  * #618 — a bridge host's settings live in one file the bridge reads itself.
- * On rhc-server the config was split between a pm2 dump and an ecosystem file,
+ * On remote-b the config was split between a pm2 dump and an ecosystem file,
  * so an unpin rebuilt from the dump silently dropped grok and two MCP secrets.
  */
 import { spawn, type ChildProcess } from "node:child_process";

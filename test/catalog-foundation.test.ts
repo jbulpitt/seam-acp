@@ -190,8 +190,8 @@ describe("#236 per-model description and structured evidence", () => {
       })]));
     expect(withNote("QA_SECRET=hunter2000")).toThrow(/rejected content/);
     expect(withNote("token is sk-live_abcdefghijklmnop")).toThrow(/rejected content/);
-    expect(withNote("contact jesse@example.com")).toThrow(/rejected content/);
-    expect(withNote("see /home/ubuntu/.claude/.credentials.json")).toThrow(/rejected content/);
+    expect(withNote("contact alex@example.com")).toThrow(/rejected content/);
+    expect(withNote("see /home/operator/.claude/.credentials.json")).toThrow(/rejected content/);
     expect(withNote("bearer abcdefghijklmno")).toThrow(/rejected content/);
     expect(withNote("read the api_key from settings")).toThrow(/rejected content/);
     // A legitimate operational note still passes.
@@ -229,7 +229,7 @@ describe("#236 per-model description and structured evidence", () => {
       })]));
     expect(withScope(SCOPE.fingerprint)).not.toThrow();
     expect(withScope("work-account")).not.toThrow();
-    expect(withScope("/home/ubuntu/.claude")).toThrow(/scope fingerprint or a bounded sanitized identifier/);
+    expect(withScope("/home/operator/.claude")).toThrow(/scope fingerprint or a bounded sanitized identifier/);
     expect(withScope("x".repeat(65))).toThrow(/scope fingerprint or a bounded sanitized identifier/);
   });
 
@@ -792,8 +792,8 @@ describe("#236 portable validation runs before bridge transport", () => {
     for (const bad of [
       { unknownKey: "x".repeat(50_000) },
       { note: "QA_SECRET=secret-value" },
-      { note: "reach me at jesse@example.com" },
-      { scopeRef: "/home/ubuntu/.claude/.credentials.json" },
+      { note: "reach me at alex@example.com" },
+      { scopeRef: "/home/operator/.claude/.credentials.json" },
       { effort: { choices: Array.from({ length: 40 }, (_, i) => `e${i}`) } },
       { context: { native: 9, maximum: 5 } },
     ]) {

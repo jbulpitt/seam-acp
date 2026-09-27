@@ -15,7 +15,7 @@ export const passthroughCases = [
 
 /** Real SQLite-backed catalog, no provider/network calls. Cold means genuinely
  * zero generation rows, not a mock that happens to return null. */
-export async function passthroughCatalog(warm: boolean, location = "macbook-pro") {
+export async function passthroughCatalog(warm: boolean, location = "macos-a") {
   const binding = { agentId: "claude", location };
   const store = new ModelCatalogStore(":memory:");
   const models = fixtureModelCatalog([{ id: "claude", defaultModel: "known",

@@ -58,7 +58,7 @@ describe("live-help voice-channel validation", () => {
     expect(
       checkLiveHelpVoiceChannel({
         id: "1487095870188027987",
-        name: "school-allie",
+        name: "school-taylor",
         type: ChannelType.GuildVoice,
       }).ok
     ).toBe(true);
@@ -67,7 +67,7 @@ describe("live-help voice-channel validation", () => {
         id: "1487095870188027987",
         name: "General",
         type: ChannelType.GuildVoice,
-        parentName: "school-alaina",
+        parentName: "school-morgan",
       }).ok
     ).toBe(true);
   });
@@ -169,7 +169,7 @@ describe("live-help mint spec + self-service authorization", () => {
         ok: true as const,
         liveId: "lh_student",
         guildId: "guild-1",
-        channelName: "school-allie",
+        channelName: "school-taylor",
       }));
       const cancel = vi.fn(() => ({ ok: true as const }));
       const orch = new Orchestrator({

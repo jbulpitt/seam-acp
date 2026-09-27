@@ -718,7 +718,7 @@ describe("#232 overlay evidence is scoped to the credential set that proved it",
   it("maps a config directory to a non-default, non-path credential scope", () => {
     expect(claudeCredentialScope(undefined)).toBe("default");
     expect(claudeCredentialScope("   ")).toBe("default");
-    const scoped = claudeCredentialScope("/home/ubuntu/.claude-work");
+    const scoped = claudeCredentialScope("/home/operator/.claude-work");
     expect(scoped).not.toBe("default");
     // Never a filesystem path: a scope identity must not carry one into evidence.
     expect(scoped).not.toContain("/");

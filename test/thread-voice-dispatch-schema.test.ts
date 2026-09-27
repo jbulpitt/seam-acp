@@ -22,14 +22,14 @@ describe("thread_voice dispatch schema", () => {
       ...base,
       kind: "thread_voice",
       authorId: "user-1",
-      authorName: "Jesse",
+      authorName: "Alex",
       voiceConsoleId: "tvc-1",
       voiceConsoleBindingId: "tvb-1",
     }))).toMatchObject({
       id: "tvd-1",
       kind: "thread_voice",
       authorId: "user-1",
-      authorName: "Jesse",
+      authorName: "Alex",
       voiceConsoleId: "tvc-1",
       voiceConsoleBindingId: "tvb-1",
       session: "live",
@@ -45,7 +45,7 @@ describe("thread_voice dispatch schema", () => {
       session: "isolated",
       kind: "thread_voice",
       authorId: "user-1",
-      authorName: "Jesse",
+      authorName: "Alex",
       voiceConsoleId: "tvc-1",
       voiceConsoleBindingId: "tvb-1",
     }))).toThrow(/must use the live session/);
@@ -53,7 +53,7 @@ describe("thread_voice dispatch schema", () => {
       ...base,
       kind: "thread_voice",
       authorId: "user-1",
-      authorName: "Jesse",
+      authorName: "Alex",
       voiceConsoleId: "tvc-1",
       voiceConsoleBindingId: "tvb-1",
       threadVoiceSessionId: "tv-legacy",
@@ -135,7 +135,7 @@ describe("trusted Thread Voice dispatch boundary", () => {
       consoleId: "tvc_trusted",
       captureId: "capture-1",
       speakerId: "user-1",
-      speakerName: "Jesse",
+      speakerName: "Alex",
       capturedStartedUtc: "start",
     })!;
     store.finalizeVoiceConsoleCapture({
@@ -144,7 +144,7 @@ describe("trusted Thread Voice dispatch boundary", () => {
       speakerId: "user-1",
       capturedStartedUtc: capture.capturedStartedUtc,
       targets: capture.assignments.map(({ bindingId, sequence }) => ({ bindingId, sequence })),
-      speakerName: "Jesse",
+      speakerName: "Alex",
       transcript: "voice prompt",
       audioMs: 200,
       capturedEndedUtc: "end",
@@ -207,7 +207,7 @@ describe("trusted Thread Voice dispatch boundary", () => {
       prompt: batchPrompt,
       kind: "thread_voice",
       authorId: "user-1",
-      authorName: "Jesse",
+      authorName: "Alex",
       voiceConsoleId: "tvc_trusted",
       voiceConsoleBindingId: "tvb_trusted",
       ...over,
@@ -253,7 +253,7 @@ describe("trusted Thread Voice dispatch boundary", () => {
     await vi.waitFor(() => expect(inner).toHaveBeenCalledTimes(1));
     expect(seen[0]).toMatchObject({
       authorId: "user-1",
-      authorName: "Jesse",
+      authorName: "Alex",
       authorIsBot: false,
       text: batchPrompt,
     });
@@ -263,7 +263,7 @@ describe("trusted Thread Voice dispatch boundary", () => {
     const typedTurn = (orch as any).handleIncomingMessage({
       channel: { platform: "discord", id: "thread-1", parentId: "channel-1" },
       authorId: "user-1",
-      authorName: "Jesse",
+      authorName: "Alex",
       authorIsBot: false,
       text: "typed correction",
       raw: { id: "discord-message" },

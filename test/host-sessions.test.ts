@@ -29,11 +29,11 @@ function session(over: Partial<HostSessionInput> & Pick<HostSessionInput, "id" |
 describe("locationOfThread matches resolveThreadLocation", () => {
   it("treats omit / empty as local, and trims an explicit host", () => {
     const presets = new Map([
-      ["explicit", { location: "rhc-server" }],
+      ["explicit", { location: "remote-b" }],
       ["blank", { location: "  " }],
       ["local-written", { location: "local" }],
     ]);
-    expect(locationOfThread(presets, "explicit")).toEqual({ location: "rhc-server", explicit: true });
+    expect(locationOfThread(presets, "explicit")).toEqual({ location: "remote-b", explicit: true });
     expect(locationOfThread(presets, "blank")).toEqual({ location: LOCAL_LOCATION, explicit: false });
     expect(locationOfThread(presets, "missing")).toEqual({ location: LOCAL_LOCATION, explicit: false });
     expect(locationOfThread(presets, "local-written")).toEqual({ location: LOCAL_LOCATION, explicit: true });
@@ -45,9 +45,9 @@ describe("locationOfThread matches resolveThreadLocation", () => {
 
 describe("listSessionsForHost", () => {
   const presets = new Map([
-    ["remote-a", { location: "rhc-server" }],
-    ["remote-b", { location: "rhc-server" }],
-    ["other-host", { location: "fhr-server" }],
+    ["remote-a", { location: "remote-b" }],
+    ["remote-b", { location: "remote-b" }],
+    ["other-host", { location: "remote-a" }],
   ]);
   const sessions: HostSessionInput[] = [
     session({ id: "discord:remote-a", channelRef: "remote-a", updatedUtc: "2026-09-20T12:00:00.000Z", agentId: "codex" }),
@@ -58,10 +58,10 @@ describe("listSessionsForHost", () => {
   ];
 
   it("lists only the requested host, newest first, and does not invent a session for a preset with no row", () => {
-    const rhc = listSessionsForHost("rhc-server", { threadPresets: presets, sessions });
+    const rhc = listSessionsForHost("remote-b", { threadPresets: presets, sessions });
     expect(rhc.map((row) => row.sessionId)).toEqual(["discord:remote-a", "discord:remote-b"]);
     expect(rhc[0]).toMatchObject({
-      channelRef: "remote-a", agentId: "codex", location: "rhc-server", explicit: true,
+      channelRef: "remote-a", agentId: "codex", location: "remote-b", explicit: true,
     });
     expect(listSessionsForHost("media-server", { threadPresets: presets, sessions })).toEqual([]);
   });
@@ -73,12 +73,12 @@ describe("listSessionsForHost", () => {
   });
 
   it("excludes isolated dispatch: ids even when their channel is bound to the host", () => {
-    const rhc = listSessionsForHost("rhc-server", { threadPresets: presets, sessions });
+    const rhc = listSessionsForHost("remote-b", { threadPresets: presets, sessions });
     expect(rhc.some((row) => row.sessionId.startsWith("dispatch:"))).toBe(false);
   });
 
   it("partitions every durable session onto exactly one host", () => {
-    const hosts = ["local", "rhc-server", "fhr-server"];
+    const hosts = ["local", "remote-b", "remote-a"];
     const durable = sessions.filter((row) => !row.id.startsWith("dispatch:"));
     const seen = hosts.flatMap((host) => listSessionsForHost(host, { threadPresets: presets, sessions }).map((row) => row.sessionId));
     expect(seen.sort()).toEqual(durable.map((row) => row.id).sort());

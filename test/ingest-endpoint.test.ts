@@ -266,9 +266,9 @@ describe("ingest endpoint store", () => {
   });
   it("unique-student claim rejects a duplicate id", () => {
     store.insertIngestEndpoint(endpoint({ uniqueStudent: true }));
-    expect(store.claimIngestStudent("ie_test1", "alaina").ok).toBe(true);
-    expect(store.claimIngestStudent("ie_test1", "alaina").ok).toBe(false);
-    expect(store.claimIngestStudent("ie_test1", "allie").ok).toBe(true);
+    expect(store.claimIngestStudent("ie_test1", "morgan").ok).toBe(true);
+    expect(store.claimIngestStudent("ie_test1", "morgan").ok).toBe(false);
+    expect(store.claimIngestStudent("ie_test1", "taylor").ok).toBe(true);
   });
 });
 

@@ -146,7 +146,7 @@ function state(over: Partial<VoiceConsolePanelState> = {}): VoiceConsolePanelSta
     consoleId: "tvc_console",
     revision: 12,
     ownerUserId: "111111111111111111",
-    ownerName: "Jesse",
+    ownerName: "Alex",
     voiceChannelId: "222222222222222222",
     cardChannelId: "222222222222222222",
     lifecycle: "ready",

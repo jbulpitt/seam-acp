@@ -60,24 +60,24 @@ describe("reachable seam-MCP URL (#84)", () => {
 
 describe("permanent bridge public URL", () => {
   it("normalizes host, https, and missing /bridge", () => {
-    expect(normalizePublicBridgeWsUrl("seamacp.runbooksynthesis.com")).toBe(
-      "wss://seamacp.runbooksynthesis.com/bridge"
+    expect(normalizePublicBridgeWsUrl("seam.example.com")).toBe(
+      "wss://seam.example.com/bridge"
     );
-    expect(normalizePublicBridgeWsUrl("https://seamacp.runbooksynthesis.com")).toBe(
-      "wss://seamacp.runbooksynthesis.com/bridge"
+    expect(normalizePublicBridgeWsUrl("https://seam.example.com")).toBe(
+      "wss://seam.example.com/bridge"
     );
-    expect(normalizePublicBridgeWsUrl("wss://seamacp.runbooksynthesis.com/bridge")).toBe(
-      "wss://seamacp.runbooksynthesis.com/bridge"
+    expect(normalizePublicBridgeWsUrl("wss://seam.example.com/bridge")).toBe(
+      "wss://seam.example.com/bridge"
     );
   });
 
   it("prefers SEAM_BRIDGE_PUBLIC_URL over the quick-tunnel file", () => {
     const url = resolvePublicBridgeWsUrl({
-      configured: "wss://seamacp.runbooksynthesis.com/bridge",
+      configured: "wss://seam.example.com/bridge",
       tunnelUrl: "wss://yamaha-airport-street-almost.trycloudflare.com",
       healthPort: 3000,
     });
-    expect(url).toBe("wss://seamacp.runbooksynthesis.com/bridge");
+    expect(url).toBe("wss://seam.example.com/bridge");
     expect(url).not.toContain("trycloudflare");
   });
 
@@ -98,8 +98,8 @@ describe("permanent bridge public URL", () => {
   });
 
   it("MCP origin strips /bridge so we do not produce /bridge/mcp", () => {
-    expect(publicBaseFromBridgeWsUrl("wss://seamacp.runbooksynthesis.com/bridge")).toBe(
-      "https://seamacp.runbooksynthesis.com"
+    expect(publicBaseFromBridgeWsUrl("wss://seam.example.com/bridge")).toBe(
+      "https://seam.example.com"
     );
   });
 });
@@ -108,21 +108,21 @@ describe("ingest public origin", () => {
   it("SEAM_INGEST_PUBLIC_URL wins over the bridge URL", () => {
     expect(
       resolveIngestPublicBase({
-        ingestPublicUrl: "https://ingest.runbooksynthesis.com/",
-        bridgeWsUrl: "wss://seamacp.runbooksynthesis.com/bridge",
+        ingestPublicUrl: "https://ingest.example.com/",
+        bridgeWsUrl: "wss://seam.example.com/bridge",
         healthPort: 3000,
       })
-    ).toBe("https://ingest.runbooksynthesis.com");
+    ).toBe("https://ingest.example.com");
   });
 
   it("falls back to the bridge origin when ingest public URL is unset", () => {
     expect(
       resolveIngestPublicBase({
         ingestPublicUrl: "",
-        bridgeWsUrl: "wss://seamacp.runbooksynthesis.com/bridge",
+        bridgeWsUrl: "wss://seam.example.com/bridge",
         healthPort: 3000,
       })
-    ).toBe("https://seamacp.runbooksynthesis.com");
+    ).toBe("https://seam.example.com");
   });
 
   it("loopback is last resort", () => {
@@ -138,17 +138,17 @@ describe("ingest public origin", () => {
 
 describe("seam-MCP follows the origin a bridge dialed (#650)", () => {
   it("a bridge on the WireGuard link gets its private http origin", () => {
-    const origin = dialedOriginFromUpgrade({ host: "10.66.50.1:3000" });
-    expect(origin).toBe("http://10.66.50.1:3000");
+    const origin = dialedOriginFromUpgrade({ host: "192.0.2.10:3000" });
+    expect(origin).toBe("http://192.0.2.10:3000");
     expect(resolveReachableMcpUrl({ port: 4321, publicBaseUrl: origin, remote: true }))
-      .toBe("http://10.66.50.1:3000/mcp");
+      .toBe("http://192.0.2.10:3000/mcp");
   });
 
   it("a bridge through the tunnel keeps the public https origin", () => {
     expect(dialedOriginFromUpgrade({
-      host: "seamacp.runbooksynthesis.com",
+      host: "seam.example.com",
       "x-forwarded-proto": "https",
-    })).toBe("https://seamacp.runbooksynthesis.com");
+    })).toBe("https://seam.example.com");
   });
 
   it("a loopback or missing host falls back to the public URL", () => {

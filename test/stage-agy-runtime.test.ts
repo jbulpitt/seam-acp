@@ -2,9 +2,9 @@
  * #342 — the staging migration must be a no-op when any gate fails.
  *
  * Four Macs need this and four of the five agy hosts are agy-ONLY, so a
- * half-applied run leaves a family laptop advertising nothing: outcome 4 in the
+ * half-applied run leaves a single-agent host advertising nothing: outcome 4 in the
  * blast-radius ordering, which is the outcome that ordering exists to prevent.
- * `allie-laptop` has already been taken to zero agents once by an improvised
+ * `portable-c` has already been taken to zero agents once by an improvised
  * partial upgrade. The load-bearing property is therefore not "it migrates
  * correctly" but "a failed run changed nothing", so that is what most of this
  * file asserts.
@@ -215,7 +215,7 @@ describe("#342 what actually satisfies the runtime check", () => {
   it("distinguishes 'not writable today' from 'cannot be made writable'", () => {
     // #342's prose says root-owned mode 0555. The check in the adapter is
     // `accessSync(W_OK)`, so a SERVICE-USER-owned 0555 directory passes it too
-    // — and its owner can chmod it straight back. That is the `macbook-air`
+    // — and its owner can chmod it straight back. That is the `macos-b`
     // state, and the reason this script gates on ownership instead of mode.
     const fixture = host();
     const mine = path.join(fixture.root, "mine");
@@ -296,7 +296,7 @@ describe("#342 a failed gate leaves the host exactly as it was", () => {
   });
 
   it("refuses a provenance-valid binary that cannot list models and leaves the working pins untouched", async () => {
-    // macbook-pro's agy 1.2.2 passed version, digest, ownership, ancestry, and
+    // macos-a's agy 1.2.2 passed version, digest, ownership, ancestry, and
     // provenance checks but failed every real turn with `missing CSRF token`.
     // This protects against making that unusable artifact authoritative; if
     // the capability call is removed, this test observes the pins move to it.
@@ -348,7 +348,7 @@ describe("#342 a failed gate leaves the host exactly as it was", () => {
   it("restores the pins when the post-restart confirmation fails", async () => {
     // The only window where the host is genuinely in a bad state: pins moved,
     // bridge not confirming. Rollback has to put the bytes back AND restart
-    // again, or the run ends with a laptop serving nothing.
+    // again, or the run ends with a portable-host serving nothing.
     const fixture = host();
     const before = fs.readFileSync(fixture.envFile, "utf8");
     const staged = plan(fixture);
@@ -435,7 +435,7 @@ describe("#342 a failed gate leaves the host exactly as it was", () => {
   });
 
   it("refuses a service-user-owned 0555 ancestor, which the runtime check accepts", () => {
-    // The macbook-air hole, and the reason the gate is ownership rather than
+    // The macos-b hole, and the reason the gate is ownership rather than
     // the runtime check. 0555 owned by the service user passes
     // `accessSync(W_OK)` — the owner is simply one `chmod` away from
     // undoing it, and staging into it would advertise provenance on a tree the

@@ -128,14 +128,14 @@ describe("#631 tier 3: a bridge that stays unreachable", () => {
       Object.assign(built as never, { adoptRemoteRecovery: vi.fn(async () => true) });
       (built as unknown as { deferRemoteRecoveryAdoption(a: unknown): void }).deferRemoteRecoveryAdoption({
         id: "turn-1", generation: 1, spec: { target: "thread-9" },
-        remoteRecovery: { location: "fhr-server", submissionId: "sub", slot: 1 },
+        remoteRecovery: { location: "remote-a", submissionId: "sub", slot: 1 },
       });
       vi.advanceTimersByTime(14 * 60_000);
       expect(sent).toEqual([]);
       vi.advanceTimersByTime(60_000);
       await Promise.resolve();
-      expect(sent).toEqual([{ channel: "thread-9", text: expect.stringContaining("Still reconnecting to `fhr-server`") }]);
-      for (const listener of ready) listener("fhr-server");
+      expect(sent).toEqual([{ channel: "thread-9", text: expect.stringContaining("Still reconnecting to `remote-a`") }]);
+      for (const listener of ready) listener("remote-a");
       await Promise.resolve();
       expect(sent.at(-1)).toEqual({ channel: "thread-9", text: "🔌 Reconnected to session" });
     } finally {

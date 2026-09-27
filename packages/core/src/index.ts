@@ -227,7 +227,7 @@ async function main(): Promise<void> {
   });
 
   // #439 / #474: COPILOT_ENABLED=false is the global "not entitled at all"
-  // switch — it drops the profile, so copilot@fhr-server dies with it.
+  // switch — it drops the profile, so copilot@remote-host dies with it.
   // Host-scoped withholding is AGENT_LOCATION_DENY (profile stays registered).
   const copilotEnabled = config.COPILOT_ENABLED !== false;
 

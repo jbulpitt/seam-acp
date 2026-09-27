@@ -8,7 +8,7 @@ from the supervisor, so a pm2 dump can never reinstate a removed setting.
 The bridge's first log line says what it loaded:
 
 ```
-[bridge] config: /home/ubuntu/.config/seam/bridge.env set 14 keys: AGY_ENABLED, AGY_PIN, ..., SEAM_BRIDGE_TOKEN
+[bridge] config: /home/operator/.config/seam/bridge.env set 14 keys: AGY_ENABLED, AGY_PIN, ..., SEAM_BRIDGE_TOKEN
 ```
 
 Key names only; values (the token) are never logged.

@@ -1650,7 +1650,7 @@ describe("SeamMcpServer", () => {
         {
           messageId: "1",
           timestamp: "2026-08-01T00:00:00.000Z",
-          author: "Jesse",
+          author: "Alex",
           authorId: "human",
           authorType: "human" as const,
           content: "hello",

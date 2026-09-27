@@ -568,7 +568,7 @@ export class ModelCatalogService {
       // defect in AGENTS.md — the doubt was about the shared generation, and
       // the thing refused was the whole binding.
       //
-      // Disagreement is an observation, not a fault. macbook-air advertising
+      // Disagreement is an observation, not a fault. macos-canary-a advertising
       // 0.70.0 while local advertises 0.75.1 is TRUE information. So the
       // disagreeing binding stops sharing, publishes what its own adapter
       // actually reported under its own key, and both sides keep serving. It

@@ -40,7 +40,7 @@ function identityWith(config: unknown): string {
     session: "live",
     model: "gpt-5.6-sol",
     effort: "xhigh",
-    cwd: "/home/ubuntu/Projects/pronoa",
+    cwd: "/home/operator/Projects/pronoa",
     config,
   });
 }
@@ -90,7 +90,7 @@ describe("execution identity treats an unchanged configuration as unchanged", ()
     const admitted = identityWith(RAW_CONFIG_JSON);
     const moved = executionIdentity({
       agent: "claude", location: "local", session: "live", model: "gpt-5.6-sol",
-      effort: "xhigh", cwd: "/home/ubuntu/Projects/pronoa", config: RAW_CONFIG_JSON,
+      effort: "xhigh", cwd: "/home/operator/Projects/pronoa", config: RAW_CONFIG_JSON,
     });
     expect(compareExecutionIdentity(admitted, moved)).toMatchObject({
       match: false, field: "agent", reason: "thread switched from codex to claude",
@@ -108,7 +108,7 @@ describe("execution identity treats an unchanged configuration as unchanged", ()
     // must continue on their own; rewriting stored history is not required.
     const legacyStored = JSON.stringify({
       version: 2, agent: "codex", location: "local", session: "live", model: "gpt-5.6-sol",
-      effort: "xhigh", cwd: "/home/ubuntu/Projects/pronoa", config: RAW_CONFIG_JSON,
+      effort: "xhigh", cwd: "/home/operator/Projects/pronoa", config: RAW_CONFIG_JSON,
     });
     const { lastContextUsage: _usage, ...parsed } = LIVE_CONFIG;
     expect(compareExecutionIdentity(legacyStored, identityWith(parsed))).toEqual({ match: true, legacy: false });

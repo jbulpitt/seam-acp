@@ -2182,7 +2182,7 @@ export class Orchestrator {
     // A turn its bridge is finishing across a controller restart is executing
     // too: this controller only holds a read-only link to it, not a runtime.
     // Calling that "wedged" restarted the turn beside the one still running
-    // and discarded its finished answer (thread 1516907689874161764).
+    // and discarded its finished answer.
     const bridgeOwned = this.store.turnAttempts.list("suspended")
       .some((attempt) => attempt.remoteRecovery && attempt.spec?.target === channelRef);
     const runtimeBusy = (record ? this.router.isBusy(record.id) : false)
@@ -2418,7 +2418,7 @@ export class Orchestrator {
    *
    * Three sources, and the two durable ones are what matter. `channelQueueMeta`
    * is in-memory, so it only knows about channels this process has queued for
-   * since boot. The threads Jesse lost were blocked for 7 and 13 HOURS across
+   * since boot. The affected threads were blocked for 7 and 13 HOURS across
    * restarts, and were invisible to the hot set by then.
    *
    * The durable sources are the queued message itself
@@ -6700,7 +6700,7 @@ export class Orchestrator {
     if (olderTurns.length > 0) {
       log("summarizing older history…");
       const olderText = olderTurns.join("\n\n");
-      const template = await fsp.readFile("/home/ubuntu/Projects/compact.md", "utf8");
+      const template = await fsp.readFile(path.join(this.config.REPOS_ROOT, "compact.md"), "utf8");
       const overhead = template.length + "\n\nConversation Transcript:\n".length;
       const fitted = fitTranscriptToWindow(olderText, overhead, window);
       summaryMarkdown = (await runAgent(`${template}\n\nConversation Transcript:\n${fitted}`, "summary")).trim();
@@ -18757,7 +18757,7 @@ export class Orchestrator {
       if (!compactionModel) {
         throw new Error(`Compact from Thread is not supported for agent profile \`${record.agentId}\``);
       }
-      const promptTemplate = await fsp.readFile("/home/ubuntu/Projects/compact.md", "utf8");
+      const promptTemplate = await fsp.readFile(path.join(this.config.REPOS_ROOT, "compact.md"), "utf8");
       const compactAddendum =
         "\n\nIMPORTANT: This is a full thread reconstruction from Discord history. " +
         "The transcript below contains the ENTIRE conversation. You MUST cover " +
@@ -20525,7 +20525,7 @@ export class Orchestrator {
                 .setLabel("Target cwd (absolute or under REPOS_ROOT)")
                 .setStyle(TextInputStyle.Short)
                 .setRequired(true)
-                .setPlaceholder("/home/ubuntu/Projects/some-repo")
+                .setPlaceholder("/srv/repos/example-project")
             )
           );
 
@@ -20586,7 +20586,7 @@ export class Orchestrator {
               )
               .join("\n");
 
-            const promptTemplate = await fsp.readFile("/home/ubuntu/Projects/compact.md", "utf8");
+            const promptTemplate = await fsp.readFile(path.join(this.config.REPOS_ROOT, "compact.md"), "utf8");
             const templateOverhead = promptTemplate.length + "\n\nConversation Transcript:\n".length;
             sanitizedTranscript = fitTranscriptToWindow(
               sanitizedTranscript,
@@ -20801,7 +20801,7 @@ export class Orchestrator {
               if (!compactionModel) {
                 throw new Error(`Migration compaction is not supported for source agent profile \`${record.agentId}\``);
               }
-              const promptTemplate = await fsp.readFile("/home/ubuntu/Projects/compact.md", "utf8");
+              const promptTemplate = await fsp.readFile(path.join(this.config.REPOS_ROOT, "compact.md"), "utf8");
               const templateOverhead = promptTemplate.length + "\n\nConversation Transcript:\n".length;
               sanitizedTranscript = fitTranscriptToWindow(
                 sanitizedTranscript,
@@ -21475,7 +21475,7 @@ export class Orchestrator {
    * boolean on the thread preset (`threads.<id>.detached`). Does NOT create a
    * session row (D10: key the write on channelId). Does NOT delete an existing
    * session row or clear acp_session_id (D6). Not lock-exempt and not
-   * participant-allowed (D5) — admin immunity is what lets Jesse run this in
+   * participant-allowed (D5) — admin immunity is what lets an operator run this in
    * a locked school channel.
    *
    * v1 inbound hole: schedules / wakes / watches / handoffs / steer still

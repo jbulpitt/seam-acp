@@ -16,7 +16,7 @@ describe("#366 execution shares configuration evidence policy", () => {
     } finally { cache.close(); }
   });
 
-  it("a peer hint cannot normalize default or an alias for claude@macbook-pro", async () => {
+  it("a peer hint cannot normalize default or an alias for claude@macos-a", async () => {
     const cache = await passthroughCatalog(false);
     try {
       await cache.catalog.refresh({ agentId: "claude", location: "local" });

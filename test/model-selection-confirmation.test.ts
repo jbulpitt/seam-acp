@@ -3,23 +3,23 @@ import { modelSelectionConfirmationPanel } from "../packages/core/src/platforms/
 
 describe("modelSelectionConfirmationPanel", () => {
   it("reports an exact no-op instead of claiming the model changed", () => {
-    expect(modelSelectionConfirmationPanel("default", "default", "Jesse")).toEqual({
+    expect(modelSelectionConfirmationPanel("default", "default", "Alex")).toEqual({
       color: 0x57f287,
       title: "✅ Model confirmed",
       fields: [{ name: "Model", value: "`default` *(no change)*", inline: true }],
-      footer: "Confirmed by Jesse",
+      footer: "Confirmed by Alex",
     });
   });
 
   it("reports both identities when the model changes", () => {
-    expect(modelSelectionConfirmationPanel("default", "claude-opus-5", "Jesse")).toEqual({
+    expect(modelSelectionConfirmationPanel("default", "claude-opus-5", "Alex")).toEqual({
       color: 0x57f287,
       title: "✅ Model changed",
       fields: [
         { name: "Previous", value: "`default`", inline: true },
         { name: "New", value: "`claude-opus-5`", inline: true },
       ],
-      footer: "Changed by Jesse",
+      footer: "Changed by Alex",
     });
   });
 });

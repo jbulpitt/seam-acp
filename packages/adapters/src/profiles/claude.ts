@@ -257,7 +257,7 @@ export function makeClaudeProfile(opts: {
   // and any extra credential profiles). Vertex, Z.ai, Ollama Cloud and every
   // other Anthropic-compatible backend keep the validated-manifest strategy:
   // they answer a different API whose advertised list, effort support and
-  // context windows were never verified against this account's evidence, so
+  // context windows were never verified against the deployment's evidence, so
   // they must not inherit the direct catalog as a side effect.
   const liveCatalog = opts.directAnthropic === true;
   const catalogApiEnabled = liveCatalog && Boolean(
@@ -305,7 +305,7 @@ export function makeClaudeProfile(opts: {
       env.ANTHROPIC_DEFAULT_HAIKU_MODEL = modelOverride;
       env.ANTHROPIC_DEFAULT_OPUS_MODEL = modelOverride;
     } else if (modelOverride && isForwardableFullModelId(modelOverride)) {
-      // Direct Anthropic backend: this account's claude-agent-acp advertises
+      // Direct Anthropic backend: the deployment's claude-agent-acp advertises
       // only a fixed alias set. A full
       // canonical ID that isn't advertised (e.g. a model that shipped after
       // this CLI version) is REJECTED by setSessionConfigOption("model", …)

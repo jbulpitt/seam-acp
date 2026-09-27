@@ -153,8 +153,8 @@ describe("SessionRouter.describeConfig — layer provenance (#58 P1)", () => {
   });
 
   it("treats a REPOS_ROOT-equal repoPath as the creation default, not a session overlay (#207)", () => {
-    const defaultCwd = "/home/ubuntu/Projects";
-    const selected = "/home/ubuntu/Projects/seam-acp";
+    const defaultCwd = "/home/operator/Projects";
+    const selected = "/home/operator/Projects/seam-acp";
     const channelPresets = new Map<string, ChannelPreset>([
       ["chan-1", { cwd: { value: "/repo/chan" }, locked: false }],
     ]);
@@ -170,8 +170,8 @@ describe("SessionRouter.describeConfig — layer provenance (#58 P1)", () => {
   });
 
   it("lets an explicit session pin to REPOS_ROOT still win over a thread overlay", () => {
-    const defaultCwd = "/home/ubuntu/Projects";
-    const selected = "/home/ubuntu/Projects/seam-acp";
+    const defaultCwd = "/home/operator/Projects";
+    const selected = "/home/operator/Projects/seam-acp";
     const threadPresets = new Map<string, ThreadPreset>([
       ["thread-1", { cwd: { value: selected } }],
     ]);
@@ -187,7 +187,7 @@ describe("SessionRouter.describeConfig — layer provenance (#58 P1)", () => {
   });
 
   it("falls through to defaultCwd with a truthful default label when nothing is pinned", () => {
-    const defaultCwd = "/home/ubuntu/Projects";
+    const defaultCwd = "/home/operator/Projects";
     const router = makeRouter({ defaultCwd });
     expect(router.describeConfig(makeRecord({ repoPath: defaultCwd })).cwd).toEqual({
       value: defaultCwd,

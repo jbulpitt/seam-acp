@@ -29,7 +29,7 @@ export function describeTargetFleet(targets, registered = new Set(targets.keys()
   // never considered them. The answer to a silent gap is LOUD, not STOPPED.
   //
   // Refusing the whole fleet because one host diverges punishes healthy
-  // machines for one anomaly, and a retired host or an unreachable laptop is
+  // machines for one anomaly, and a retired host or an unreachable host is
   // an ordinary state, not an emergency. `cli-health-report.mjs` already got
   // this right with `unchecked-registry-divergence`: narrow the scope to the
   // affected host and keep going. This now matches it.
@@ -103,7 +103,7 @@ export function formatFleetCoverage(fleet, selectedHost = null) {
  *
  * Deliberately not `makeSshCommand`: that carries the full deployment identity
  * and is the shape used for operations. This asks one question and mutates
- * nothing, with a short timeout because the expected answer for a laptop is no.
+ * nothing, with a short timeout because the expected answer for a portable host is no.
  */
 export function makeReachabilityProbe(target) {
   if (!SAFE_BRIDGE_ID.test(target?.sshAlias ?? "")) {
@@ -190,7 +190,7 @@ export function collectBlockers(report, target, targets = new Map()) {
   if (!report || typeof report !== "object") return Object.freeze([]);
   const id = target?.bridgeId ?? report.bridge_id ?? "target";
   // Severity is read off the gates that already exist rather than invented
-  // here. A real fleet preflight on 2026-09-21 marked macbook-air "refused"
+  // here. A real fleet preflight on 2026-09-21 marked macos-canary-a "refused"
   // over a stale baseline while it was managed, rollout-ready and serving —
   // a refusal this reporting layer had made up. Advisory findings are still
   // shown; they simply do not claim a rollout would be turned away.
@@ -317,7 +317,7 @@ export function formatFleetRunSummary(results) {
 
 /**
  * A fleet run fails if any host failed or was refused. Unreachable does not
- * fail the run — a closed laptop is not a broken rollout — but it is always
+ * fail the run — an offline host is not a broken rollout — but it is always
  * counted above so it can never pass unnoticed.
  */
 export function fleetRunExitCode(results) {

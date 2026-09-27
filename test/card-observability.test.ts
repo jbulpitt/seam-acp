@@ -615,7 +615,7 @@ describe("queued-prompt card (#154)", () => {
       location: "local",
       prompt: "rerun the ledger audit once the bridge is back",
       authorId: "1",
-      authorName: "Jesse",
+      authorName: "Alex",
       kind: "user_queue",
       busy: true,
     });
@@ -680,7 +680,7 @@ function steerInteraction(opts: {
       deferReply: vi.fn(async () => {}),
       editReply,
       reply: vi.fn(async () => {}),
-      user: { id: "1", username: "jbulpitt", globalName: "Jesse" },
+      user: { id: "1", username: "amorgan", globalName: "Alex" },
       member: null,
     },
     editReply,
@@ -708,7 +708,7 @@ describe("slash steer card (#155)", () => {
     );
     // Attributed, and the steer came from another thread in the SAME channel,
     // so the channel label is dropped as noise.
-    expect(field(card.panel, "From")?.value).toBe("Jesse");
+    expect(field(card.panel, "From")?.value).toBe("Alex");
   });
 
   it("posts the card before the steered turn runs, on the preemptive path", async () => {
@@ -759,7 +759,7 @@ describe("slash steer card (#155)", () => {
     await (orch as never as { cmdSteer(i: unknown): Promise<void> }).cmdSteer(i);
 
     expect(field(calls.sendPanel.at(-1)!.panel, "From")?.value).toBe(
-      "Jesse · ops console · #ops"
+      "Alex · ops console · #ops"
     );
   });
 

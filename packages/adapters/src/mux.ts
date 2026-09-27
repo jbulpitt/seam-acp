@@ -221,7 +221,7 @@ export interface RemoteHostOomEvidence {
  * How long the controller waits for a bridge to build a model catalog. A
  * copilot catalog probes every model in its own process: 79s on a healthy host
  * (101s when the user's MCP servers also start). The 30s RPC default failed
- * every copilot refresh on fhr-server for 7 days. Refreshes run in the
+ * every Copilot refresh on one remote host for several days. Refreshes run in the
  * background (turns read the cached snapshot), so waiting longer blocks nothing.
  */
 export const CATALOG_FETCH_TIMEOUT_MS = 240_000;

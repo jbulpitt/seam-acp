@@ -90,7 +90,7 @@ describe("#302 execution identity", () => {
     const base = selection();
     const cases: Array<[Record<string, unknown>, RegExp]> = [
       [{ agent: "codex" }, /thread switched from claude to codex/],
-      [{ location: "macbook-air" }, /thread moved from local to macbook-air/],
+      [{ location: "macos-b" }, /thread moved from local to macos-b/],
       [{ session: "isolated" }, /session kind changed from live to isolated/],
       [{ model: "claude-sonnet-5" }, /model changed from claude-opus-5 to claude-sonnet-5/],
       [{ effort: "low" }, /effort changed from high to low/],

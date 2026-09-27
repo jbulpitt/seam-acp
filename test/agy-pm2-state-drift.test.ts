@@ -7,13 +7,13 @@
  *         the running list, so it can lag the file or drop apps entirely.
  *   live  the running process environment — what is serving turns right now.
  *
- * macbook-air had pins in `live` only, with the file missing them and the dump
+ * macos-b had pins in `live` only, with the file missing them and the dump
  * stale since Aug 30. It worked, reported `provenance mode: immutable-path`,
  * and no file on the host explained how. One reboot from silently losing agy on
- * an agy-only laptop.
+ * a single-agent host.
  *
- * The dump fixtures are the shape observed on macbook-pro, macbook-air and
- * home-hub on 2026-09-13: a JSON **array** of app objects, each with `name` and
+ * The dump fixtures are the shape observed on macos-a, macos-b and
+ * remote-c on 2026-09-13: a JSON **array** of app objects, each with `name` and
  * `env`. That matters — #395 happened because a fixture's file shape came from
  * documentation instead of from a host, so this one was read off a host first.
  *
@@ -157,7 +157,7 @@ describe("#390 the comparison itself", () => {
     ]);
   });
 
-  it("reports a pin only the live process has, which is macbook-air", () => {
+  it("reports a pin only the live process has, which is macos-b", () => {
     const result = compareAgyPinSources({
       file: pins({ AGY_SHA256: null }), dump: pins({ AGY_SHA256: null }), live: pins(),
     });

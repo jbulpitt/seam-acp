@@ -15,8 +15,8 @@ import {
 } from "../packages/core/src/core/relocate-repo.js";
 
 describe("remapAbsPath", () => {
-  const from = "/home/ubuntu/Projects/old-name";
-  const to = "/home/ubuntu/Projects/new-name";
+  const from = "/home/operator/Projects/old-name";
+  const to = "/home/operator/Projects/new-name";
 
   it("rewrites an exact match", () => {
     expect(remapAbsPath(from, from, to)).toBe(to);
@@ -27,17 +27,17 @@ describe("remapAbsPath", () => {
   });
 
   it("does not match a sibling that shares a prefix", () => {
-    expect(remapAbsPath("/home/ubuntu/Projects/old-name-2", from, to)).toBeNull();
+    expect(remapAbsPath("/home/operator/Projects/old-name-2", from, to)).toBeNull();
   });
 
   it("does not match an unrelated path", () => {
-    expect(remapAbsPath("/home/ubuntu/Projects/other", from, to)).toBeNull();
+    expect(remapAbsPath("/home/operator/Projects/other", from, to)).toBeNull();
   });
 });
 
 describe("rewritePathOccurrences", () => {
-  const from = "/home/ubuntu/Projects/old-name";
-  const to = "/home/ubuntu/Projects/new-name";
+  const from = "/home/operator/Projects/old-name";
+  const to = "/home/operator/Projects/new-name";
 
   it("rewrites cwd JSON and nested files, not sibling prefixes", () => {
     const src = `{"cwd":"${from}","other":"${from}-2","file":"${from}/src/a.ts"}`;
@@ -197,12 +197,12 @@ describe("collect + apply against sqlite, presets, dispatch, fs", () => {
 
 describe("vendor encodings", () => {
   it("slug Claude the same way the adapter does (slash → dash)", () => {
-    expect(claudeProjectSlug("/home/ubuntu/Projects/foo")).toBe("-home-ubuntu-Projects-foo");
+    expect(claudeProjectSlug("/home/operator/Projects/foo")).toBe("-home-operator-Projects-foo");
   });
 
   it("encodes Grok session dirs the same way the adapter does", () => {
-    const dir = grokSessionsDir("/tmp/.grok", "/home/ubuntu/Projects/foo");
-    expect(dir).toBe(`/tmp/.grok/sessions/${encodeURIComponent("/home/ubuntu/Projects/foo")}`);
+    const dir = grokSessionsDir("/tmp/.grok", "/home/operator/Projects/foo");
+    expect(dir).toBe(`/tmp/.grok/sessions/${encodeURIComponent("/home/operator/Projects/foo")}`);
   });
 });
 
@@ -214,8 +214,8 @@ describe("vendor dir remap", () => {
 
   it("renames Claude and Grok session dirs and can leave old-name symlinks", () => {
     tmp = fs.mkdtempSync(path.join(os.tmpdir(), "seam-vendor-"));
-    const from = "/home/ubuntu/Projects/old-name";
-    const to = "/home/ubuntu/Projects/new-name";
+    const from = "/home/operator/Projects/old-name";
+    const to = "/home/operator/Projects/new-name";
     const claudeDir = path.join(tmp, ".claude");
     const grokHome = path.join(tmp, ".grok");
     const claudeFrom = path.join(claudeDir, "projects", claudeProjectSlug(from));

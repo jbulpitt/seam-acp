@@ -163,8 +163,10 @@ describe("staging durability canary", () => {
           restarted = false;
           return { threadId: "thread", messageId: `prompt-${activeNonce}` };
         },
-        read: async () => restarted
-          ? [
+        read: async (input) => !input.after
+          ? [message({ id: "anchor", content: "prior message" })]
+          : restarted
+            ? [
               message({
                 id: "card",
                 embeds: ["Done\n`✅ startup`  `⚙️ Terminal`\nAction: end_turn"],
@@ -174,15 +176,20 @@ describe("staging durability canary", () => {
                 content: [1, 2, 3, 4, 5, 6].map((i) => `${activeNonce}-${i}`).join("\n"),
               }),
             ]
-          : [message({
-              id: "card",
-              embeds: ["Working\n`✅ startup`  `▶️ Terminal`\nAction: Running tool"],
-            })],
+            : [message({
+                id: "card",
+                embeds: ["Working\n`✅ startup`  `▶️ Terminal`\nAction: Running tool"],
+              })],
       },
       testDriver: {
         interact: async () => ({ transcript: [], replied: true, deferred: false }),
         inventory: async () => inventory(),
         health: async () => {},
+        dispatch: async (spec) => {
+          activeNonce = spec.prompt.match(/echo ([a-z0-9]+)-\$i/i)?.[1] ?? "missing";
+          restarted = false;
+          return { accepted: true, id: spec.id };
+        },
         restart: async (action) => {
           restarts.push(action);
           if (action === "controller" || action === "controller_bridge") controller += 1;
@@ -195,9 +202,10 @@ describe("staging durability canary", () => {
 
     const result = await runner.run("staging", { durability: true });
 
-    expect(restarts).toEqual(["controller", "bridge", "controller_bridge", "sessiond"]);
-    expect(result.rows).toHaveLength(4);
+    expect(restarts).toEqual(["controller", "controller", "bridge", "controller_bridge", "sessiond"]);
+    expect(result.rows).toHaveLength(5);
     expect(result.rows[0]?.check).toBe("redeploy");
+    expect(result.rows[1]?.check).toBe("dispatched redeploy");
     expect(result.rows.every((row) => row.status === "passed")).toBe(true);
   });
 });

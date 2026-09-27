@@ -6,6 +6,7 @@ import {
 } from "../packages/core/src/platforms/discord/synthetic-interaction.js";
 import { buildSlashRegistrationBody } from "../packages/core/src/platforms/discord/commands.js";
 import {
+  makeTestDispatchHandler,
   makeTestInteractionHandler,
   makeTestRestartHandler,
 } from "../packages/core/src/core/test-driver.js";
@@ -150,5 +151,39 @@ describe("test restart HTTP handler", () => {
     await new Promise((resolve) => setTimeout(resolve, 5));
     expect(prepare).toHaveBeenCalledWith("sessiond");
     expect(restart).toHaveBeenCalledOnce();
+  });
+});
+
+describe("test dispatch HTTP handler", () => {
+  function request(body: unknown, auth = "Bearer k") {
+    const req = Readable.from([Buffer.from(JSON.stringify(body))]) as unknown as Record<string, unknown>;
+    req.method = "POST";
+    req.headers = { authorization: auth };
+    return req as never;
+  }
+
+  it("authenticates and enqueues the exact live dispatch request", async () => {
+    const enqueue = vi.fn(async () => {});
+    const handler = makeTestDispatchHandler({
+      key: "k",
+      enqueue,
+      logger: { info: vi.fn() } as never,
+    });
+    const out: { status?: number; body?: string } = {};
+    const response = {
+      writeHead: (status: number) => { out.status = status; },
+      end: (body: string) => { out.body = body; },
+    } as never;
+    const spec = {
+      id: "canary-dispatch-id",
+      channelId: "1553671326785339402",
+      prompt: "run two tools",
+    };
+
+    await handler(request(spec), response);
+
+    expect(out.status).toBe(202);
+    expect(JSON.parse(out.body ?? "{}")).toEqual({ accepted: true, id: spec.id });
+    expect(enqueue).toHaveBeenCalledWith(spec);
   });
 });

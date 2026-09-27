@@ -211,6 +211,7 @@ import {
 } from "./config-audit-view.js";
 import { summarizeAnomalies } from "../../core/watchdog.js";
 import type { BridgeHub } from "../../core/bridge-hub.js";
+import { remoteSessionManager } from "../../core/remote-session-manager.js";
 import { handleBridgeSlash } from "./bridge.js";
 import { handleDebugSlash } from "./debug.js";
 import {
@@ -5011,8 +5012,11 @@ export class Orchestrator {
         await this.router.invalidate(record.id, { clearAcpSession: !needsRepair });
 
         if (needsRepair) {
-          const profile = this.router.getProfile(record.agentId);
-          const manager = profile?.sessionManager;
+          const location = this.router.describeConfig(record).location.value;
+          const profile = this.router.getProfile(record.agentId, location);
+          const manager = profile
+            ? this.sessionManagerFor(profile, record.agentId, location)
+            : undefined;
           const cwd = effectiveCwd;
           let repaired = false;
 
@@ -5600,6 +5604,16 @@ export class Orchestrator {
     return typeof fn === "function" ? fn.call(this.router, agentId) : null;
   }
 
+  private sessionManagerFor(
+    profile: AgentProfile,
+    agentId: string,
+    location: string
+  ): ISessionManager | undefined {
+    return isLocalLocation(location)
+      ? profile.sessionManager
+      : remoteSessionManager(this.bridgeHub, location, agentId);
+  }
+
   /** Generic compaction policy over the operational catalog: use the available
    *  model with the largest effective context, preferring the declared default
    *  on ties. Provider ids and model slugs never enter the decision. */
@@ -5639,7 +5653,9 @@ export class Orchestrator {
   ): Promise<void> {
     const location = this.router.describeConfig(record).location.value;
     const profile = this.router.getProfile(record.agentId, location);
-    const manager = profile?.sessionManager;
+    const manager = profile
+      ? this.sessionManagerFor(profile, record.agentId, location)
+      : undefined;
     if (!profile || !manager?.getTranscript) {
       this.logger.debug({ agent: record.agentId }, "auto-compact skipped: missing manager methods");
       return;
@@ -6788,7 +6804,7 @@ export class Orchestrator {
     if (!profile) {
       throw new Error(`Agent profile "${record.agentId}" not found, so this thread has no compactable session.`);
     }
-    const manager = profile.sessionManager;
+    const manager = this.sessionManagerFor(profile, record.agentId, location);
     if (!manager) {
       throw new Error(
         `Agent \`${record.agentId}\` (${profile.displayName}) does not support session management, ` +
@@ -18798,7 +18814,7 @@ export class Orchestrator {
     // #308: protects the direct Discord-history compactor; deleting it makes
     // this temporary AgentRuntime a bypass around normal turn resolution.
     this.router.assertAgentAllowedForRecord(record, profile.id);
-    const manager = profile.sessionManager;
+    const manager = this.sessionManagerFor(profile, compactAgentId, compactLocation);
     if (!manager) {
       throw new Error(
         `Agent profile \`${record.agentId}\` (${profile.displayName}) does not support session management.`
@@ -19467,7 +19483,11 @@ export class Orchestrator {
       return;
     }
 
-    const manager = profile.sessionManager;
+    const manager = this.sessionManagerFor(
+      profile,
+      sessionBinding.agentId,
+      sessionBinding.location
+    );
     if (!manager) {
       await i.reply({
         content: `Agent profile \`${record.agentId}\` (${profile.displayName}) does not support session management.`,

@@ -71,6 +71,11 @@ const TOOL_EMOJI: [RegExp, string][] = [
   [/\bcode action\b/i, "📑"],
 ];
 
+export const TOOL_ACTIVITY_EMOJIS = Object.freeze([
+  ...new Set(TOOL_EMOJI.map(([, emoji]) => emoji)),
+  "⚙️",
+]);
+
 function toolEmoji(label: string): string {
   for (const [pattern, emoji] of TOOL_EMOJI) {
     if (pattern.test(label)) return emoji;

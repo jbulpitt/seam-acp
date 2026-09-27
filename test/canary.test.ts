@@ -61,6 +61,11 @@ describe("staging canary observations", () => {
       message({ content: nonce }),
       message({ embeds: ["Done\n`▶️ Terminal`  `⚙️ echo canary-nonce`\nAction: end_turn"] }),
     ], nonce)).toEqual({ state: "done", nonceSeen: true, toolSeen: true });
+
+    expect(observeCanaryMessages([
+      message({ content: nonce }),
+      message({ embeds: ["Done\n`🔬 Echo the given string`\nAction: end_turn"] }),
+    ], nonce)).toEqual({ state: "done", nonceSeen: true, toolSeen: true });
   });
 
   it("keeps the real terminal cause from the status card", () => {

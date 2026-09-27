@@ -41,6 +41,7 @@ function slashI(over: {
 }) {
   const replies: Array<{ content?: string; flags?: number }> = [];
   const edits: string[] = [];
+  let deferredFlags: number | undefined;
   const i = {
     options: {
       getString: (name: string, _req?: boolean) => over.strings?.[name] ?? null,
@@ -57,11 +58,14 @@ function slashI(over: {
       i.replied = true;
       replies.push(payload);
     }),
-    deferReply: vi.fn(async () => {
+    deferReply: vi.fn(async (payload?: { flags?: number }) => {
       i.deferred = true;
+      deferredFlags = payload?.flags;
     }),
-    editReply: vi.fn(async (content: string) => {
+    editReply: vi.fn(async (payload: string | { content?: string }) => {
+      const content = typeof payload === "string" ? payload : payload.content ?? "";
       edits.push(content);
+      replies.push({ content, flags: deferredFlags });
     }),
   };
   return { i, replies, edits };
@@ -182,6 +186,26 @@ afterEach(() => {
 });
 
 describe("/seam config model — #191 failure-atomic commit", () => {
+  it("explicit-id defers before invalidating a live runtime", async () => {
+    const order: string[] = [];
+    const { orch, router, store } = makeOrch();
+    seedSession(store);
+    router.hasRuntime = () => true;
+    router.invalidate = vi.fn(async () => {
+      order.push("invalidate");
+    });
+    const { i, edits } = slashI({ strings: { id: "claude-sonnet-4.6" } });
+    i.deferReply = vi.fn(async () => {
+      order.push("defer");
+      i.deferred = true;
+    });
+
+    await (orch as any).cmdModel(i);
+
+    expect(order).toEqual(["defer", "invalidate"]);
+    expect(edits[0]).toMatch(/Model will be `claude-sonnet-4\.6`/);
+  });
+
   it("explicit-id persists the new model in session and overlay", async () => {
     const { orch, router, store, threadPresets } = makeOrch();
     seedSession(store);

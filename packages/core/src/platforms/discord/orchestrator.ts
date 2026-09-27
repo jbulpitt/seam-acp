@@ -14827,6 +14827,7 @@ export class Orchestrator {
       });
       return;
     }
+    await i.deferReply({ flags: MessageFlags.Ephemeral });
     await this.applyModelChange(channel, record, id, i);
   }
 
@@ -14844,7 +14845,9 @@ export class Orchestrator {
   ): Promise<{ ok: true; message: string } | { ok: false; error: string }> {
     const respond = async (msg: string): Promise<void> => {
       if (interaction) {
-        if (!interaction.replied && !interaction.deferred) {
+        if (interaction.deferred) {
+          await interaction.editReply({ content: msg });
+        } else if (!interaction.replied) {
           await interaction.reply({ content: msg, flags: MessageFlags.Ephemeral });
         } else {
           await this.adapter.sendMessage(channel, msg);
@@ -16948,6 +16951,7 @@ export class Orchestrator {
       return;
     }
 
+    await i.deferReply({ flags: MessageFlags.Ephemeral });
     await this.applyAgentChange(channel, record, id, i);
   }
 
@@ -16960,7 +16964,9 @@ export class Orchestrator {
     const parsed = parseAgentAtLocation(id);
     const respond = async (msg: string): Promise<void> => {
       if (interaction) {
-        if (!interaction.replied && !interaction.deferred) {
+        if (interaction.deferred) {
+          await interaction.editReply({ content: msg });
+        } else if (!interaction.replied) {
           await interaction.reply({ content: msg, flags: MessageFlags.Ephemeral });
         } else {
           await this.adapter.sendMessage(channel, msg);

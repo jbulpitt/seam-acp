@@ -10095,6 +10095,12 @@ export class Orchestrator {
             }, queueFence);
           })()
         : undefined;
+      if (attempt && statusPanel?.reference) {
+        this.store.turnAttempts.bindStatusCard(attempt, {
+          channelId: statusPanel.reference.channel.id,
+          messageId: statusPanel.reference.id,
+        });
+      }
 
       // START INDICATOR: post the slim ▶ indicator that then streams the answer.
       // When the STATUS PANEL is on it carries the dispatch type, so we suppress

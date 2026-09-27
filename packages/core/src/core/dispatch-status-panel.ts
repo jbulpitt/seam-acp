@@ -95,6 +95,11 @@ export class DispatchStatusPanel<TRef = unknown> {
     return this.ref !== undefined;
   }
 
+  /** The posted card reference, used to persist restart recovery ownership. */
+  get reference(): TRef | undefined {
+    return this.ref;
+  }
+
   /** Whether the latest requested edit reached the platform. */
   get lastEditSucceeded(): boolean {
     return this.editSucceeded;

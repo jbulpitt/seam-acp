@@ -74,7 +74,7 @@ function setup() {
   const spec: DispatchSpec = { id: "held", target: "worker", prompt: "original work", session: "live",
     returnTo: "origin", correlationId: "logical", kind: "handoff", stream: false,
     createdUtc: new Date().toISOString() };
-  return { orch, store, watcher, dataDir, spec, reports, runtime, router, adapter, notices, refusals, started, release, makeOrch, acquisitionSleep };
+  return { orch, store, watcher, dataDir, spec, reports, runtime, router, adapter, config, notices, refusals, started, release, makeOrch, acquisitionSleep };
 }
 
 describe("#250 production dispatch lifecycle (synthetic transport, no providers)", () => {
@@ -453,6 +453,19 @@ describe("#250 production dispatch lifecycle (synthetic transport, no providers)
     await projectAttemptCompletions(h.dataDir, h.store.turnAttempts);
     expect(existsSync(path.join(dispatchDirs(h.dataDir).done, "held.json"))).toBe(true);
     expect(h.runtime.prompt).toHaveBeenCalledTimes(1);
+  });
+
+  it("#691 persists a dispatched status card on the owning attempt", async () => {
+    const h = setup();
+    h.config.SEAM_DISPATCH_STATUS_PANEL = true;
+    h.runtime.prompt.mockResolvedValueOnce({ stopReason: "end_turn" });
+
+    await h.orch.dispatchInjectTurn(h.spec);
+
+    expect(h.store.turnAttempts.get(h.spec.id)?.statusCard).toEqual({
+      channelId: "worker",
+      messageId: "panel",
+    });
   });
 
   it("#691 reattaches the ACP client and adopts a dispatched result after restart", async () => {

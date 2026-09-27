@@ -58,7 +58,7 @@ describe("#253 scheduled metadata boundaries", () => {
     if (enabled) {
       expect(payload.content).toContain("occurrence occ-1");
       expect(payload.content).toContain("1 turn accounting token(s)");
-      expect(payload.content).toContain("Cron remains open");
+      expect(payload.content).toContain("bounded shutdown quiesce");
     } else expect(payload.content).toContain("admin-only");
   });
 

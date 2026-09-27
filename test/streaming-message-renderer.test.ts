@@ -179,3 +179,36 @@ describe("StreamingMessageRenderer (real FenceStream + splitForFlush + SerialQue
     expect(fenceMsg).toBe("```latex\ne^{i\\pi}+1=0\n```");
   });
 });
+
+describe("StreamingMessageRenderer handleFence", () => {
+  it("hands a directive fence to the handler instead of posting it, and posts other fences", async () => {
+    const { sent, send } = collector();
+    const handled: string[] = [];
+    const r = new StreamingMessageRenderer(send, {
+      handleFence: async (fence) => {
+        if (fence.lang !== "seam-choice") return false;
+        handled.push(fence.content);
+        return true;
+      },
+    });
+    r.feed('Pick one:\n\n```seam-choice\n{"title":"T","options":[]}\n```\n\n');
+    r.feed("```ts\nconst x = 1;\n```\n\nDone.");
+    await r.finalize();
+
+    expect(handled).toEqual(['{"title":"T","options":[]}']);
+    expect(sent.join("\n")).not.toContain("seam-choice");
+    expect(sent).toContain("```ts\nconst x = 1;\n```");
+    expect(sent[0]).toContain("Pick one:");
+    expect(sent.at(-1)).toContain("Done.");
+  });
+});
+
+describe("StreamingMessageRenderer ordering around fences", () => {
+  it("posts prose before a fence ahead of it, even when the rest arrives in the same chunk", async () => {
+    const { sent, send } = collector();
+    const r = new StreamingMessageRenderer(send);
+    r.feed("Intro.\n\n```ts\nconst x = 1;\n```\n\nDone.");
+    await r.finalize();
+    expect(sent.map((m) => m.trim())).toEqual(["Intro.", "```ts\nconst x = 1;\n```", "Done."]);
+  });
+});

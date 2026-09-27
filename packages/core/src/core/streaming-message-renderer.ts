@@ -57,6 +57,10 @@ export interface StreamingMessageRendererOptions {
    *  a PNG instead of reconstructed markdown. Existing callers that pass only
    *  `send` keep today's source-fence behavior. */
   sendFile?: (file: { data: Buffer; filename: string; mimeType: string }) => Promise<void>;
+  /** Optional directive handler (seam-choice, seam-attach, …). Called for each
+   *  closed fence before it is posted; returning true means it was handled and
+   *  nothing is posted for it. */
+  handleFence?: (fence: CompletedFence) => Promise<boolean>;
 }
 
 // Same constants the user-turn path uses in handleIncomingMessageInner.
@@ -93,6 +97,7 @@ export class StreamingMessageRenderer {
     mimeType: string;
   }) => Promise<void>;
   private mathFenceCounter = 0;
+  private readonly handleFence?: (fence: CompletedFence) => Promise<boolean>;
 
   constructor(
     private readonly send: SendMessage,
@@ -106,6 +111,7 @@ export class StreamingMessageRenderer {
     this.now = opts.now ?? Date.now;
     if (opts.logger) this.logger = opts.logger;
     if (opts.sendFile) this.sendFile = opts.sendFile;
+    if (opts.handleFence) this.handleFence = opts.handleFence;
   }
 
   /** How many messages have been posted so far (progressive flushes + fences +
@@ -138,7 +144,7 @@ export class StreamingMessageRenderer {
         // Commit any pending prose before the fence so message ordering matches
         // the agent's stream order.
         this.cancelIdleTimer();
-        void this.drainBuffer(true);
+        void this.commitBuffer();
       } else {
         // fence-close: re-emit the fence verbatim as its own message.
         void this.emitFence(seg.fence);
@@ -181,8 +187,9 @@ export class StreamingMessageRenderer {
         if (seg.text) this.textBuffer += seg.text;
       } else if (seg.kind === "fence-open") {
         // Shouldn't appear in flush output, but handle defensively.
-        void this.drainBuffer(true, true);
+        void this.commitBuffer();
       } else {
+        void this.commitBuffer();
         void this.emitFence(seg.fence);
       }
     }
@@ -192,7 +199,7 @@ export class StreamingMessageRenderer {
         "turn ended with an unclosed code fence; emitting partial"
       );
       // Drain any prose preceding the unclosed fence first.
-      void this.drainBuffer(true, true);
+      void this.commitBuffer();
       void this.emitFence(tail.unclosed, "_(fence was not closed by the agent)_");
     }
     // Must drain everything. An open link will never be closed, so allow unsafe
@@ -208,6 +215,10 @@ export class StreamingMessageRenderer {
    *  typeset to a PNG instead (still on this queue so uploads stay ordered). */
   private emitFence(fence: CompletedFence, notice?: string): Promise<void> {
     return this.flushQueue.run(async () => {
+      if (this.handleFence && (await this.handleFence(fence))) {
+        this.sent += 1;
+        return;
+      }
       if (isMathFenceLang(fence.lang) && this.sendFile) {
         const body = fence.content.trim();
         if (!body) {
@@ -279,6 +290,30 @@ export class StreamingMessageRenderer {
       }
       if (!force) return;
     }
+  }
+
+  /** Send everything buffered so far, taken now rather than when the queue
+   *  reaches it: prose fed after this call (e.g. after the fence) must not
+   *  join it. */
+  private commitBuffer(): Promise<void> {
+    let rest = this.textBuffer;
+    this.textBuffer = "";
+    return this.flushQueue.run(async () => {
+      while (rest) {
+        const split = splitForFlush(rest, {
+          maxLen: this.hardMax,
+          softMin: this.softMin,
+          force: true,
+          allowUnsafeCut: true,
+        });
+        const send = split?.send ?? rest;
+        rest = split?.send ? split.keep : "";
+        if (send) {
+          await this.send(send);
+          this.sent += 1;
+        }
+      }
+    });
   }
 
   private drainBuffer(force: boolean, allowUnsafeCut = false): Promise<void> {

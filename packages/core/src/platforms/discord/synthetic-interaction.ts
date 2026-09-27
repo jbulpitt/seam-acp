@@ -12,6 +12,7 @@
 import {
   ApplicationCommandOptionType,
   ComponentType,
+  Events,
   InteractionType,
   SnowflakeUtil,
   type APIApplicationCommandOption,
@@ -391,6 +392,30 @@ export class SyntheticInteraction {
       return [];
     });
     this.record({ op: "showModal", modal: { customId: j.custom_id ?? "", title: j.title ?? "", inputs } });
+  }
+
+  async awaitModalSubmit(opts: {
+    filter?: (interaction: SyntheticInteraction) => boolean;
+    time?: number;
+  }): Promise<SyntheticInteraction> {
+    return new Promise((resolve, reject) => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const cleanup = () => {
+        this.client.off(Events.InteractionCreate, onInteraction as never);
+        if (timer) clearTimeout(timer);
+      };
+      const onInteraction = (interaction: unknown) => {
+        const candidate = interaction as SyntheticInteraction;
+        if (!candidate.isModalSubmit?.() || (opts.filter && !opts.filter(candidate))) return;
+        cleanup();
+        resolve(candidate);
+      };
+      this.client.on(Events.InteractionCreate, onInteraction as never);
+      timer = setTimeout(() => {
+        cleanup();
+        reject(new Error("Modal submit timed out"));
+      }, opts.time ?? 15 * 60_000);
+    });
   }
 
   async respond(_choices: unknown[]): Promise<void> {

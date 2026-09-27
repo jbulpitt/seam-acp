@@ -1,4 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
+import { EventEmitter } from "node:events";
+import { Events } from "discord.js";
 import { Readable } from "node:stream";
 import {
   SyntheticInteraction,
@@ -82,6 +84,26 @@ describe("SyntheticInteraction keeps Discord's interaction rules", () => {
     const m = new SyntheticInteraction({ kind: "modal", channelId: "c1", customId: "form", fields: { note: "hi" } }, ctx);
     expect(m.fields!.getTextInputValue("note")).toBe("hi");
     expect(() => m.fields!.getTextInputValue("missing")).toThrow();
+  });
+
+  it("resolves a slash command's modal waiter from a later submission", async () => {
+    const now = { t: 0 };
+    const { ctx } = context(now);
+    const client = new EventEmitter();
+    const slash = new SyntheticInteraction(
+      { kind: "slash", channelId: "c1", command: "seam" },
+      { ...ctx, client: client as never },
+    );
+    const submission = slash.awaitModalSubmit({
+      filter: (i) => i.customId === "form" && i.user.id === "tester",
+      time: 1_000,
+    });
+    const modal = new SyntheticInteraction(
+      { kind: "modal", channelId: "c1", customId: "form", fields: { note: "hi" } },
+      { ...ctx, client: client as never },
+    );
+    client.emit(Events.InteractionCreate, modal);
+    await expect(submission).resolves.toBe(modal);
   });
 });
 

@@ -795,7 +795,7 @@ export function buildSeamAdminCommand(): SlashCommandBuilder {
   cmd.addSubcommandGroup((g) =>
     g
       .setName("upload")
-      .setDescription("Admin-only: pull/push host files, or pass a one-shot secret")
+      .setDescription("Admin-only: pull/push host files, or pass a temporary secret")
       .addSubcommand((sub) =>
         sub
           .setName("pull")
@@ -824,7 +824,7 @@ export function buildSeamAdminCommand(): SlashCommandBuilder {
       .addSubcommand((sub) =>
         sub
           .setName("secret")
-          .setDescription("One-shot secret for this thread (path-only; deleted after the next turn)")
+          .setDescription("Temporary secret for this thread (path-only; expires after about 1 hour)")
       )
   );
 

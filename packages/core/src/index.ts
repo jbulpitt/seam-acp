@@ -372,7 +372,7 @@ async function main(): Promise<void> {
   // catalog collector and runs only during background/manual refresh.
   const grok = config.GROK_ENABLED
     ? makeGrokProfile({
-        cliPath: "/tmp/seam-staging-grok-missing-640",
+        ...(config.GROK_CLI_PATH ? { cliPath: config.GROK_CLI_PATH } : {}),
         defaultModel: config.GROK_DEFAULT_MODEL,
         staticModels: enrichModelListWithKnownLimits(config.GROK_MODELS, GROK_STATIC_MODELS)
           ?? GROK_STATIC_MODELS,

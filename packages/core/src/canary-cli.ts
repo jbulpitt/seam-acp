@@ -15,12 +15,15 @@ function targetArg(argv: string[]): CanaryTarget {
   const inline = argv.find((arg) => arg.startsWith("--target="))?.slice("--target=".length);
   const index = argv.indexOf("--target");
   const value = inline ?? (index >= 0 ? argv[index + 1] : undefined);
-  if (value !== "staging") throw new Error("usage: npm run canary -- --target staging");
+  if (value !== "staging") {
+    throw new Error("usage: npm run canary -- --target staging [--durability]");
+  }
   return value;
 }
 
 async function main(): Promise<void> {
-  const target = targetArg(process.argv.slice(2));
+  const argv = process.argv.slice(2);
+  const target = targetArg(argv);
   const stagingChannelId = required("SEAM_CANARY_STAGING_CHANNEL_ID");
   const channels = new Set(
     required("SEAM_TEST_BOT_CHANNEL_IDS").split(",").map((value) => value.trim()).filter(Boolean),
@@ -37,7 +40,7 @@ async function main(): Promise<void> {
     dataDir: path.resolve(process.env.DATA_DIR?.trim() || "data"),
     stagingChannelId,
   });
-  const result = await runner.run(target);
+  const result = await runner.run(target, { durability: argv.includes("--durability") });
   console.log(formatCanaryResult(result));
   if (result.rows.some((row) => row.status === "failed")) process.exitCode = 1;
 }

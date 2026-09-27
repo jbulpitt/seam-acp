@@ -32,10 +32,13 @@ That exercises the real Discord path before a change is merged.
   admin-only config.
 - `SEAM_TEST_DRIVER_KEY`: a random shared secret.
 - `SEAM_TEST_DRIVER_ACTOR_ID`: the tester bot's user id.
+- `SEAM_TEST_DRIVER_BRIDGE_UNIT`: the staging bridge systemd unit.
+- `SEAM_TEST_DRIVER_SESSIOND_UNIT`: the staging sessiond systemd unit.
 
   The key turns on key-protected `GET /test/inventory`; together with the actor
-  id it also turns on `POST /test/interaction` on the health port. Never set
-  them on a deployment people use.
+  id it also turns on `POST /test/interaction` and `POST /test/restart` on the
+  health port. The restart route accepts only controller, bridge, combined and
+  sessiond actions. Never set them on a deployment people use.
 
 **Driving `.env`** (the deployment your agents run in):
 - `SEAM_TEST_BOT_TOKEN`: the tester bot's token.
@@ -64,6 +67,10 @@ That exercises the real Discord path before a change is merged.
 - **`canary_run({ target: "staging" })`:** asks staging for its live bridge
   and agent matrix, runs one real Discord turn for each ready pair in parallel,
   and posts one result card.
+- **`canary_run({ target: "staging", durability: true })`:** runs four Codex
+  turns sequentially, interrupting them with controller, bridge, combined and
+  sessiond restarts. The CLI equivalent is
+  `npm run canary -- --target staging --durability`.
 
 ## How close to Discord it is
 

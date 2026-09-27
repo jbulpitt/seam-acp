@@ -2,6 +2,7 @@ import path from "node:path";
 import {
   makeTestInteractionHandler,
   makeTestInventoryHandler,
+  makeTestRestartHandler,
   TestDriverClient,
 } from "./core/test-driver.js";
 import { TesterBot } from "./core/tester-bot.js";
@@ -11,10 +12,13 @@ import {
   providerSourceForAgent,
   publishCanaryCard,
   readGitIdentity,
+  type CanaryRunOptions,
   type CanaryRunResult,
   type CanaryTarget,
 } from "./core/canary.js";
 import { randomUUID } from "node:crypto";
+import { spawn } from "node:child_process";
+import { writeForceRestartSentinel } from "./core/restart-sentinel.js";
 import { loadConfig, buildChannelPresetMaps, isChannelLocked, resolveThreadLocation, resolveThreadTtsVoice, resolveThreadTtsPace, resolveThreadTtsStyle, adminParticipantOverlapIds, GROK_STATIC_MODELS, ZAI_STATIC_MODELS, OLLAMA_CLOUD_STATIC_MODELS } from "./config.js";
 import { enrichModelListWithKnownLimits } from "./core/context-window.js";
 import {
@@ -130,6 +134,7 @@ import { planAgyIdentityMigration, readAgyHandleOwnership } from "./core/agy-ide
 
 async function main(): Promise<void> {
   const config = loadConfig();
+  const controllerInstanceId = randomUUID();
   // Thread agent/model choices are saved in the presets file; with none
   // configured every switch was refused, so a fresh install keeps one here.
   if (!config.CHANNEL_PRESETS_FILE) {
@@ -184,6 +189,9 @@ async function main(): Promise<void> {
   let testInventoryHandle:
     | ((req: IncomingMessage, res: ServerResponse) => void | Promise<void>)
     | undefined;
+  let testRestartHandle:
+    | ((req: IncomingMessage, res: ServerResponse) => void | Promise<void>)
+    | undefined;
   const health = startHealthServer(config.HEALTH_PORT, logger, {
     onMcp: (req, res) => {
       if (!mcpHttpHandle) {
@@ -202,6 +210,14 @@ async function main(): Promise<void> {
               return;
             }
             return testInteractionHandle(req, res);
+          },
+          onTestRestart: (req: IncomingMessage, res: ServerResponse) => {
+            if (!testRestartHandle) {
+              res.writeHead(503, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ error: "test restart driver not ready" }));
+              return;
+            }
+            return testRestartHandle(req, res);
           },
         }
       : {}),
@@ -767,7 +783,38 @@ async function main(): Promise<void> {
       inject: (spec, actorId) => adapter.injectTestInteraction(spec, actorId),
       logger,
     });
+    const restartUnit = (unit: string): void => {
+      const child = spawn("sudo", ["-n", "systemctl", "restart", unit], {
+        detached: true,
+        stdio: "ignore",
+      });
+      child.on("error", (err) => logger.error({ err, unit }, "test systemd restart failed to launch"));
+      child.unref();
+    };
+    testRestartHandle = makeTestRestartHandler({
+      key: config.SEAM_TEST_DRIVER_KEY,
+      logger,
+      prepare: (action) => {
+        const needsBridge = action === "bridge" || action === "controller_bridge";
+        const needsSessiond = action === "sessiond";
+        const unit = needsBridge
+          ? config.SEAM_TEST_DRIVER_BRIDGE_UNIT
+          : needsSessiond
+            ? config.SEAM_TEST_DRIVER_SESSIOND_UNIT
+            : undefined;
+        if ((needsBridge || needsSessiond) && !unit) {
+          throw new Error(`test restart unit is not configured for ${action}`);
+        }
+        return () => {
+          if (unit) restartUnit(unit);
+          if (action === "controller" || action === "controller_bridge") {
+            writeForceRestartSentinel(config.DATA_DIR);
+          }
+        };
+      },
+    });
     logger.warn({ actorId: config.SEAM_TEST_DRIVER_ACTOR_ID }, "test interaction driver enabled");
+    logger.warn("test durability restart driver enabled");
   }
   if (config.SEAM_TEST_DRIVER_KEY) {
     testInventoryHandle = makeTestInventoryHandler({
@@ -776,9 +823,11 @@ async function main(): Promise<void> {
         const identity = readGitIdentity();
         const configured = router.listProfiles().map((profile) => profile.id).sort();
         return {
+          controllerInstanceId,
           ...identity,
           bridges: (bridgeHub?.listConnected() ?? []).map((bridge) => ({
             host: bridge.bridgeId,
+            instanceId: bridge.instanceId,
             ready: bridgeHub?.isBridgeReady(bridge.bridgeId) ?? false,
             agents: configured.map((agentId) => {
               const observed = bridge.agents.get(agentId);
@@ -858,7 +907,9 @@ async function main(): Promise<void> {
     });
   }
 
-  let runCanary: ((target: CanaryTarget) => Promise<CanaryRunResult>) | undefined;
+  let runCanary:
+    | ((target: CanaryTarget, options?: CanaryRunOptions) => Promise<CanaryRunResult>)
+    | undefined;
   if (
     testerBot &&
     testDriver &&
@@ -885,8 +936,8 @@ async function main(): Promise<void> {
         }
       },
     });
-    runCanary = async (target) => {
-      const result = await runner.run(target);
+    runCanary = async (target, options) => {
+      const result = await runner.run(target, options);
       await publishCanaryCard({
         result,
         adapter,
@@ -927,7 +978,10 @@ async function main(): Promise<void> {
       ...(testerBot ? { testerBot } : {}),
       ...(testDriver ? { testDriver } : {}),
       ...(runCanary
-        ? { runCanary: async (target: CanaryTarget) => formatCanaryResult(await runCanary!(target)) }
+        ? {
+            runCanary: async (target: CanaryTarget, options?: CanaryRunOptions) =>
+              formatCanaryResult(await runCanary!(target, options)),
+          }
         : {}),
       resolveSession: (token) => {
         const sid = seamTokenRegistry.resolve(token);

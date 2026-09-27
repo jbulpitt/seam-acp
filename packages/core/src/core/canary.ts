@@ -5,7 +5,11 @@ import path from "node:path";
 import type { Logger } from "../lib/logger.js";
 import type { ChatAdapter, MessageRef } from "../platforms/chat-adapter.js";
 import type { StructuredLayout } from "./types.js";
-import type { TestDriverClient, TestInventory } from "./test-driver.js";
+import type {
+  TestDriverClient,
+  TestInventory,
+  TestRestartAction,
+} from "./test-driver.js";
 import type { TesterBot, TesterMessage } from "./tester-bot.js";
 
 export type CanaryTarget = "staging";
@@ -14,6 +18,7 @@ export type CanaryRowStatus = "passed" | "failed" | "skipped";
 export interface CanaryRow {
   host: string;
   agent: string;
+  check?: string;
   status: CanaryRowStatus;
   durationMs: number | null;
   threadId?: string;
@@ -28,13 +33,27 @@ export interface CanaryRunResult {
   finishedAt: string;
   branch: string;
   commit: string;
+  durability?: boolean;
   rows: CanaryRow[];
+}
+
+export interface CanaryRunOptions {
+  durability?: boolean;
 }
 
 export interface CanaryMessageObservation {
   state: "working" | "done" | "failed" | "timed_out" | "unknown";
   nonceSeen: boolean;
+  toolSeen: boolean;
   cause?: string;
+}
+
+export interface DurabilityOutputObservation {
+  missing: string[];
+  duplicated: Array<{ line: string; count: number }>;
+  observed: string[];
+  inOrder: boolean;
+  replyCount: number;
 }
 
 interface CanaryThreadEntry {
@@ -50,7 +69,7 @@ interface CanaryThreadFile {
 
 interface CanaryRunnerOptions {
   testerBot: Pick<TesterBot, "post" | "read" | "findThread">;
-  testDriver: Pick<TestDriverClient, "interact" | "inventory">;
+  testDriver: Pick<TestDriverClient, "interact" | "inventory" | "health" | "restart">;
   dataDir: string;
   stagingChannelId: string;
   timeoutMs?: number;
@@ -59,6 +78,7 @@ interface CanaryRunnerOptions {
   sleep?: (ms: number) => Promise<void>;
   nonce?: () => string;
   providerStatus?: (agentId: string) => string | undefined;
+  durabilityAgentId?: string;
 }
 
 const DEFAULT_TIMEOUT_MS = 5 * 60_000;
@@ -66,6 +86,14 @@ const DEFAULT_POLL_MS = 2_000;
 const THREAD_FILE = "canary-staging-threads.json";
 const HISTORY_FILE = "canary-staging-history.jsonl";
 const LATEST_CARD_FILE = "canary-staging-latest-card.json";
+const DURABILITY_AGENT = "codex";
+
+const DURABILITY_CHECKS: ReadonlyArray<{ label: string; action: TestRestartAction }> = [
+  { label: "redeploy:now", action: "controller" },
+  { label: "bridge restart", action: "bridge" },
+  { label: "controller + bridge", action: "controller_bridge" },
+  { label: "sessiond restart", action: "sessiond" },
+];
 
 export function readGitIdentity(cwd = process.cwd()): { branch: string; commit: string } {
   const read = (args: string[]): string =>
@@ -116,17 +144,43 @@ export function observeCanaryMessages(
   const botMessages = messages.filter((message) => message.authorIsBot);
   const statusText = botMessages.flatMap((message) => [...message.embeds, ...(message.components ?? [])]).join("\n");
   const nonceSeen = botMessages.some((message) => message.content.includes(nonce));
+  const toolSeen = /\bTool\s*:\s*\S/i.test(statusText)
+    || statusText.includes("`▶️")
+    || statusText.includes("`⚙️");
   if (/(?:❌|\b)Failed\b/i.test(statusText)) {
-    return { state: "failed", nonceSeen, cause: failureCause(botMessages) };
+    return { state: "failed", nonceSeen, toolSeen, cause: failureCause(botMessages) };
   }
   if (/(?:Timed out|Timeout)/i.test(statusText)) {
-    return { state: "timed_out", nonceSeen, cause: failureCause(botMessages) };
+    return { state: "timed_out", nonceSeen, toolSeen, cause: failureCause(botMessages) };
   }
-  if (/(?:✅|\b)Done\b/i.test(statusText)) return { state: "done", nonceSeen };
+  if (/(?:✅|\b)Done\b/i.test(statusText)) return { state: "done", nonceSeen, toolSeen };
   if (/(?:Working|Waiting|Reconnecting|Monitoring)/i.test(statusText)) {
-    return { state: "working", nonceSeen };
+    return { state: "working", nonceSeen, toolSeen };
   }
-  return { state: "unknown", nonceSeen };
+  return { state: "unknown", nonceSeen, toolSeen };
+}
+
+export function observeDurabilityOutput(
+  messages: TesterMessage[],
+  expected: string[],
+): DurabilityOutputObservation {
+  const replies = messages.filter((message) =>
+    message.authorIsBot && expected.some((line) => message.content.includes(line))
+  );
+  const seen = replies.flatMap((message) =>
+    message.content.split(/\r?\n/).map((line) => line.trim()).filter((line) => expected.includes(line))
+  );
+  const counts = new Map(expected.map((line) => [line, 0]));
+  for (const line of seen) counts.set(line, (counts.get(line) ?? 0) + 1);
+  return {
+    missing: expected.filter((line) => counts.get(line) === 0),
+    duplicated: expected
+      .map((line) => ({ line, count: counts.get(line) ?? 0 }))
+      .filter(({ count }) => count > 1),
+    observed: seen,
+    inOrder: seen.length === expected.length && seen.every((line, index) => line === expected[index]),
+    replyCount: replies.length,
+  };
 }
 
 function interactionFailure(
@@ -205,8 +259,16 @@ export class StagingCanaryRunner {
     this.makeNonce = options.nonce ?? (() => randomUUID().replaceAll("-", ""));
   }
 
-  async run(target: CanaryTarget = "staging"): Promise<CanaryRunResult> {
+  async run(
+    target: CanaryTarget = "staging",
+    runOptions: CanaryRunOptions = {},
+  ): Promise<CanaryRunResult> {
     if (target !== "staging") throw new Error(`unsupported canary target: ${target}`);
+    if (runOptions.durability) return this.runDurability(target);
+    return this.runBasic(target);
+  }
+
+  private async runBasic(target: CanaryTarget): Promise<CanaryRunResult> {
     const started = this.now();
     const inventory = await this.options.testDriver.inventory();
     const registry = await CanaryThreadRegistry.load(this.options.dataDir);
@@ -282,6 +344,76 @@ export class StagingCanaryRunner {
     return result;
   }
 
+  private async runDurability(target: CanaryTarget): Promise<CanaryRunResult> {
+    const started = this.now();
+    const inventory = await this.options.testDriver.inventory();
+    const registry = await CanaryThreadRegistry.load(this.options.dataDir);
+    const agentId = this.options.durabilityAgentId ?? DURABILITY_AGENT;
+    const candidates = inventory.bridges
+      .map((bridge) => ({ bridge, agent: bridge.agents.find((agent) => agent.id === agentId) }))
+      .filter((entry) => entry.agent)
+      .sort((a, b) => a.bridge.host.localeCompare(b.bridge.host));
+    const selected = candidates.find(({ bridge, agent }) => bridge.ready && agent!.installed && agent!.ready);
+    const rows: CanaryRow[] = [];
+
+    if (!selected) {
+      const candidate = candidates[0];
+      const cause = candidate
+        ? candidate.agent!.reason ?? (!candidate.bridge.ready ? "bridge not ready" : `${agentId} not ready`)
+        : `${agentId} was not reported by staging`;
+      for (const check of DURABILITY_CHECKS) {
+        rows.push({
+          host: candidate?.bridge.host ?? "staging",
+          agent: agentId,
+          check: check.label,
+          status: "failed",
+          durationMs: null,
+          cause,
+        });
+      }
+    } else {
+      let threadId: string | undefined;
+      try {
+        threadId = await this.ensureThread(registry, selected.bridge.host, agentId);
+      } catch (error) {
+        const cause = bounded(error instanceof Error ? error.message : String(error));
+        for (const check of DURABILITY_CHECKS) {
+          rows.push({
+            host: selected.bridge.host,
+            agent: agentId,
+            check: check.label,
+            status: "failed",
+            durationMs: null,
+            cause,
+          });
+        }
+      }
+      if (threadId) {
+        for (const check of DURABILITY_CHECKS) {
+          rows.push(await this.runDurabilityTurn(
+            selected.bridge.host,
+            agentId,
+            threadId,
+            check,
+          ));
+        }
+      }
+    }
+
+    const result: CanaryRunResult = {
+      id: randomUUID(),
+      target,
+      startedAt: new Date(started).toISOString(),
+      finishedAt: new Date(this.now()).toISOString(),
+      branch: inventory.branch,
+      commit: inventory.commit,
+      durability: true,
+      rows,
+    };
+    await this.appendHistory(result);
+    return result;
+  }
+
   private async ensureThread(
     registry: CanaryThreadRegistry,
     host: string,
@@ -301,7 +433,7 @@ export class StagingCanaryRunner {
         text: `Reply with only ${initNonce}.`,
       });
       id = posted.threadId;
-      const initialized = await this.waitForTurn(id, posted.messageId, initNonce);
+      const initialized = await this.waitForTurn(id, posted.messageId, initNonce, false);
       if (initialized.status !== "passed") {
         throw new Error(`canary thread initialization failed: ${initialized.cause}`);
       }
@@ -361,29 +493,209 @@ export class StagingCanaryRunner {
     };
   }
 
-  private async waitForTurn(
+  private async runDurabilityTurn(
+    host: string,
+    agent: string,
+    threadId: string,
+    check: { label: string; action: TestRestartAction },
+  ): Promise<CanaryRow> {
+    const nonce = this.makeNonce();
+    const expected = [1, 2, 3, 4, 5, 6].map((index) => `${nonce}-${index}`);
+    const started = this.now();
+    const fail = (cause: string): CanaryRow => {
+      const providerNote = this.options.providerStatus?.(agent);
+      return {
+        host,
+        agent,
+        check: check.label,
+        status: "failed",
+        durationMs: this.now() - started,
+        threadId,
+        cause: bounded(cause),
+        ...(providerNote ? { providerNote } : {}),
+      };
+    };
+
+    try {
+      const before = await this.options.testDriver.inventory();
+      const posted = await this.options.testerBot.post({
+        channel: threadId,
+        text:
+          "Run the shell command " +
+          `\`for i in 1 2 3 4 5 6; do echo ${nonce}-$i; sleep 5; done\` ` +
+          "and reply with only the complete six-line output, in order.",
+      });
+      const startedTurn = await this.waitForRestartPoint(threadId, posted.messageId, nonce);
+      if (startedTurn.status === "failed") return fail(startedTurn.cause);
+      await this.options.testDriver.restart(check.action);
+      const recovered = await this.waitForRecovery(before, host, check);
+      if (recovered.status === "failed") return fail(recovered.cause);
+      const outcome = await this.waitForDurabilityTurn(
+        threadId,
+        posted.messageId,
+        nonce,
+        expected,
+        startedTurn.toolSeen,
+      );
+      if (outcome.status === "failed") return fail(outcome.cause);
+      return {
+        host,
+        agent,
+        check: check.label,
+        status: "passed",
+        durationMs: this.now() - started,
+        threadId,
+      };
+    } catch (error) {
+      return fail(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  private async waitForRestartPoint(
     threadId: string,
     after: string,
     nonce: string,
-  ): Promise<{ status: "passed" } | { status: "failed"; cause: string }> {
+  ): Promise<{ status: "ready"; toolSeen: true } | { status: "failed"; cause: string }> {
     const deadline = this.now() + this.timeoutMs;
     let lastState: CanaryMessageObservation["state"] = "unknown";
-    let doneAt: number | undefined;
     while (this.now() < deadline) {
       const messages = await this.options.testerBot.read({ channel: threadId, after, limit: 100 });
       const observed = observeCanaryMessages(messages, nonce);
       lastState = observed.state;
+      if (observed.state === "failed" || observed.state === "timed_out") {
+        return { status: "failed", cause: observed.cause ?? `status card finished ${observed.state}` };
+      }
+      if (observed.state === "done") {
+        return {
+          status: "failed",
+          cause: `status card reached Done before ${observed.toolSeen ? "" : "a tool step and "}the restart trigger`,
+        };
+      }
+      if (observed.state === "working" && observed.toolSeen) {
+        return { status: "ready", toolSeen: true };
+      }
+      await this.sleep(Math.min(this.pollMs, Math.max(0, deadline - this.now())));
+    }
+    return {
+      status: "failed",
+      cause: `restart was not triggered: no visible Working tool step after ${Math.round(this.timeoutMs / 1000)}s; last state seen: ${lastState}`,
+    };
+  }
+
+  private async waitForRecovery(
+    before: TestInventory,
+    host: string,
+    check: { label: string; action: TestRestartAction },
+  ): Promise<{ status: "ready" } | { status: "failed"; cause: string }> {
+    const deadline = this.now() + this.timeoutMs;
+    const oldBridge = before.bridges.find((bridge) => bridge.host === host)?.instanceId;
+    let lastCause = "staging health and inventory have not returned";
+    while (this.now() < deadline) {
+      try {
+        await this.options.testDriver.health();
+        const current = await this.options.testDriver.inventory();
+        const bridge = current.bridges.find((item) => item.host === host);
+        const controllerChanged = current.controllerInstanceId !== before.controllerInstanceId;
+        const bridgeChanged = Boolean(bridge && oldBridge && bridge.instanceId !== oldBridge);
+        const needsController = check.action === "controller" || check.action === "controller_bridge";
+        const needsBridge = check.action !== "controller";
+        if ((!needsController || controllerChanged) && (!needsBridge || bridgeChanged) && bridge?.ready) {
+          return { status: "ready" };
+        }
+        const waiting = [
+          ...(needsController && !controllerChanged ? ["controller instance change"] : []),
+          ...(needsBridge && !bridgeChanged ? ["bridge instance change"] : []),
+          ...(!bridge?.ready ? ["ready bridge inventory"] : []),
+        ];
+        lastCause = `waiting for ${waiting.join(", ")}`;
+      } catch (error) {
+        lastCause = error instanceof Error ? error.message : String(error);
+      }
+      await this.sleep(Math.min(this.pollMs, Math.max(0, deadline - this.now())));
+    }
+    return {
+      status: "failed",
+      cause: `${check.label} did not recover within ${Math.round(this.timeoutMs / 1000)}s: ${lastCause}`,
+    };
+  }
+
+  private async waitForDurabilityTurn(
+    threadId: string,
+    after: string,
+    nonce: string,
+    expected: string[],
+    toolWasSeen: boolean,
+  ): Promise<{ status: "passed" } | { status: "failed"; cause: string }> {
+    const deadline = this.now() + this.timeoutMs;
+    let lastState: CanaryMessageObservation["state"] = "unknown";
+    let toolSeen = toolWasSeen;
+    while (this.now() < deadline) {
+      const messages = await this.options.testerBot.read({ channel: threadId, after, limit: 100 });
+      const observed = observeCanaryMessages(messages, nonce);
+      const output = observeDurabilityOutput(messages, expected);
+      lastState = observed.state;
+      toolSeen ||= observed.toolSeen;
+      if (observed.state === "failed" || observed.state === "timed_out") {
+        return { status: "failed", cause: observed.cause ?? `status card finished ${observed.state}` };
+      }
+      if (observed.state === "done") {
+        const issues: string[] = [];
+        if (!toolSeen) issues.push("no tool step was visible on the status card");
+        if (output.missing.length > 0) issues.push(`missing: ${output.missing.join(", ")}`);
+        if (output.duplicated.length > 0) {
+          issues.push(`duplicated: ${output.duplicated.map(({ line, count }) => `${line} ×${count}`).join(", ")}`);
+        }
+        if (!output.inOrder && output.missing.length === 0 && output.duplicated.length === 0) {
+          issues.push(`out of order: ${output.observed.join(", ")}`);
+        }
+        if (output.replyCount > 1) issues.push(`duplicate replies: ${output.replyCount}`);
+        if (issues.length === 0) return { status: "passed" };
+        return { status: "failed", cause: issues.join("; ") };
+      }
+      await this.sleep(Math.min(this.pollMs, Math.max(0, deadline - this.now())));
+    }
+    const output = observeDurabilityOutput(
+      await this.options.testerBot.read({ channel: threadId, after, limit: 100 }),
+      expected,
+    );
+    const detail = output.missing.length > 0 ? `; missing: ${output.missing.join(", ")}` : "";
+    return {
+      status: "failed",
+      cause: `timed out after ${Math.round(this.timeoutMs / 1000)}s; last state seen: ${lastState}${detail}`,
+    };
+  }
+
+  private async waitForTurn(
+    threadId: string,
+    after: string,
+    nonce: string,
+    requireTool = true,
+  ): Promise<{ status: "passed" } | { status: "failed"; cause: string }> {
+    const deadline = this.now() + this.timeoutMs;
+    let lastState: CanaryMessageObservation["state"] = "unknown";
+    let doneAt: number | undefined;
+    let toolSeen = false;
+    while (this.now() < deadline) {
+      const messages = await this.options.testerBot.read({ channel: threadId, after, limit: 100 });
+      const observed = observeCanaryMessages(messages, nonce);
+      lastState = observed.state;
+      toolSeen ||= observed.toolSeen;
       if (observed.state === "failed" || observed.state === "timed_out") {
         return {
           status: "failed",
           cause: observed.cause ?? `status card finished ${observed.state.replace("_", " ")}`,
         };
       }
-      if (observed.state === "done" && observed.nonceSeen) return { status: "passed" };
+      if (observed.state === "done" && observed.nonceSeen && (!requireTool || toolSeen)) {
+        return { status: "passed" };
+      }
       if (observed.state === "done") {
         doneAt ??= this.now();
         if (this.now() - doneAt >= Math.max(5_000, this.pollMs * 2)) {
-          return { status: "failed", cause: "status card finished Done, but no reply contained the nonce" };
+          const cause = !observed.nonceSeen
+            ? "status card finished Done, but no reply contained the nonce"
+            : "status card finished Done, but no tool step was visible";
+          return { status: "failed", cause };
         }
       }
       await this.sleep(Math.min(this.pollMs, Math.max(0, deadline - this.now())));
@@ -423,10 +735,11 @@ export function formatCanaryResult(result: CanaryRunResult): string {
   const rows = result.rows.map((row) => {
     const detail = row.cause ? ` — ${row.cause}` : "";
     const provider = row.providerNote ? ` Provider: ${row.providerNote}` : "";
-    return `${rowIcon(row.status)} ${row.host}@${row.agent} · ${formatDuration(row.durationMs)}${detail}${provider}`;
+    const check = row.check ? ` · ${row.check}` : "";
+    return `${rowIcon(row.status)} ${row.host}@${row.agent}${check} · ${formatDuration(row.durationMs)}${detail}${provider}`;
   });
   return [
-    `Staging canary: ${state} (${failed} failed, ${skipped} skipped)`,
+    `Staging ${result.durability ? "durability" : "canary"}: ${state} (${failed} failed, ${skipped} skipped)`,
     `Revision: ${result.branch} @ ${result.commit.slice(0, 12)}`,
     ...rows,
   ].join("\n");
@@ -436,7 +749,8 @@ export function renderCanaryLayout(result: CanaryRunResult): StructuredLayout {
   const failed = result.rows.some((row) => row.status === "failed");
   const passed = result.rows.filter((row) => row.status === "passed").length;
   const skipped = result.rows.filter((row) => row.status === "skipped").length;
-  const header = failed ? "❌ Staging canary — RED" : "✅ Staging canary — GREEN";
+  const label = result.durability ? "durability" : "canary";
+  const header = failed ? `❌ Staging ${label} — RED` : `✅ Staging ${label} — GREEN`;
   const blocks: StructuredLayout["blocks"] = [
     {
       kind: "text",
@@ -449,12 +763,13 @@ export function renderCanaryLayout(result: CanaryRunResult): StructuredLayout {
   ];
   for (const row of result.rows) {
     const thread = row.threadId ? ` · <#${row.threadId}>` : "";
+    const check = row.check ? ` · ${row.check}` : "";
     const cause = row.cause ? `\n↳ ${bounded(row.cause)}` : "";
     const provider = row.providerNote ? `\n↳ Provider: ${bounded(row.providerNote)}` : "";
     blocks.push({
       kind: "text",
       content:
-        `${rowIcon(row.status)} **${row.host}@${row.agent}** · ${formatDuration(row.durationMs)}${thread}` +
+        `${rowIcon(row.status)} **${row.host}@${row.agent}**${check} · ${formatDuration(row.durationMs)}${thread}` +
         cause +
         provider,
     });

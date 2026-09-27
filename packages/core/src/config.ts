@@ -479,6 +479,9 @@ const Schema = z.object({
   SEAM_TEST_DRIVER_KEY: z.string().optional(),
   SEAM_TEST_DRIVER_ACTOR_ID: z.string().regex(/^\d+$/).optional(),
   SEAM_TEST_DRIVER_URL: z.string().url().optional(),
+  /** Staging-only systemd units accepted by POST /test/restart. */
+  SEAM_TEST_DRIVER_BRIDGE_UNIT: z.string().regex(/^[A-Za-z0-9_.@-]+$/).optional(),
+  SEAM_TEST_DRIVER_SESSIOND_UNIT: z.string().regex(/^[A-Za-z0-9_.@-]+$/).optional(),
   /** Parent channel holding the long-lived staging canary threads. */
   SEAM_CANARY_STAGING_CHANNEL_ID: z.string().regex(/^\d+$/).optional(),
   /** Channel where this controller posts one result card per canary run. */

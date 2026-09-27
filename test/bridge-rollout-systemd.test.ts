@@ -34,7 +34,6 @@ const systemdFixture = {
   entrypointPath: "/home/operator/.seam/seam-acp/packages/bridge/dist/index.js",
   nodePath: "/home/operator/.seam/node-v22.22.2/bin/node",
   workspaceArg: "/home/operator/Projects",
-  devMode: false,
   releaseRoot: "/home/operator/.seam/bridge-rollouts",
 };
 
@@ -64,7 +63,7 @@ describe("#483 systemd target identity", () => {
           expectedUid: 501, checkoutPath: "/fixture/checkout",
           entrypointPath: "/fixture/checkout/packages/bridge/dist/index.js",
           nodePath: "/fixture/node", pm2ModulePath: "/fixture/pm2",
-          releaseRoot: "/fixture/releases", workspaceArg: null, devMode: false,
+          releaseRoot: "/fixture/releases", workspaceArg: null,
           launcherPath: "/fixture/launch.mjs",
         },
       },
@@ -103,7 +102,6 @@ describe("#483 systemd target identity", () => {
       launcher: "systemd",
       pm2App: "seam-bridge",
       expectedUid: 1000,
-      devMode: true,
       nodePath: "/home/operator/.nvm/versions/node/v22.22.2/bin/node",
     });
   });

@@ -906,7 +906,7 @@ export function buildSeamAdminCommand(): SlashCommandBuilder {
       .addSubcommand((sub) =>
         sub
           .setName("tail")
-          .setDescription("Tail a log file on the bridge host (dev-mode)")
+          .setDescription("Tail a log file on the bridge host")
           .addStringOption((o) =>
             o.setName("bridge").setDescription("Paired bridge id").setRequired(true)
           )
@@ -920,12 +920,12 @@ export function buildSeamAdminCommand(): SlashCommandBuilder {
       .addSubcommand((sub) =>
         sub
           .setName("exec")
-          .setDescription("Run a command on the bridge host (dev-mode)")
+          .setDescription("Run a command on the bridge host")
           .addStringOption((o) =>
             o.setName("bridge").setDescription("Paired bridge id").setRequired(true)
           )
           .addStringOption((o) =>
-            o.setName("command").setDescription("Command to run (dev-mode shell)").setRequired(true)
+            o.setName("command").setDescription("Command to run on the bridge host").setRequired(true)
           )
       )
       .addSubcommand((sub) =>

@@ -1,6 +1,5 @@
 /**
- * `/seamadmin debug` slash group (PR3 / D7 / #83). Admin-only even when the
- * bridge process has `--dev` / `SEAM_BRIDGE_DEV=1`.
+ * `/seamadmin debug` slash group (PR3 / D7 / #83). Admin-only.
  */
 import { MessageFlags, type ChatInputCommandInteraction } from "discord.js";
 import type { ConfigMutationService, MutationActor } from "../../core/config-mutation.js";
@@ -81,7 +80,7 @@ async function cmdStatus(
         return `${id} ${state}${provenance}`;
       })
       .join(", ");
-    return `**${c.bridgeId}** ${c.host.os}/${c.host.arch} dev=${c.devMode ? "on" : "off"} — ${agents || "no agents"}`;
+    return `**${c.bridgeId}** ${c.host.os}/${c.host.arch} — ${agents || "no agents"}`;
   });
   await i.reply({ content: lines.join("\n"), flags: MessageFlags.Ephemeral });
 }
@@ -94,13 +93,6 @@ async function cmdTail(
   const conn = deps.hub?.get(bridgeId);
   if (!conn) {
     await i.reply({ content: `Bridge **${bridgeId}** is not connected.`, flags: MessageFlags.Ephemeral });
-    return;
-  }
-  if (!conn.devMode) {
-    await i.reply({
-      content: `Bridge **${bridgeId}** is not in dev mode (\`--dev\` / \`SEAM_BRIDGE_DEV=1\`).`,
-      flags: MessageFlags.Ephemeral,
-    });
     return;
   }
   const logPath = i.options.getString("path") ?? ".";
@@ -134,13 +126,6 @@ async function cmdExec(
   const conn = deps.hub?.get(bridgeId);
   if (!conn) {
     await i.reply({ content: `Bridge **${bridgeId}** is not connected.`, flags: MessageFlags.Ephemeral });
-    return;
-  }
-  if (!conn.devMode) {
-    await i.reply({
-      content: `Bridge **${bridgeId}** is not in dev mode (\`--dev\` / \`SEAM_BRIDGE_DEV=1\`). \`SEAM_BRIDGE_DEV=1\` on the control plane does not open this tunnel.`,
-      flags: MessageFlags.Ephemeral,
-    });
     return;
   }
   deps.mutation.recordBridgeAudit({

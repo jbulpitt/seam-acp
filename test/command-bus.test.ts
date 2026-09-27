@@ -8,33 +8,32 @@ import { dispatchBridgeRpc } from "../packages/bridge/src/rpc.js";
 import { makeMux } from "@seam/adapters";
 
 describe("command-bus rpc allow-list", () => {
-  it("accepts adapter methods without dev mode", () => {
-    expect(isAllowedRpcMethod("readAttachment", { devMode: false })).toBe(true);
-    expect(isAllowedRpcMethod("prepare", { devMode: false })).toBe(true);
+  it("accepts adapter methods", () => {
+    expect(isAllowedRpcMethod("readAttachment")).toBe(true);
+    expect(isAllowedRpcMethod("prepare")).toBe(true);
     expect(isAdapterRpcMethod("fetchModelCatalog")).toBe(true);
     expect(isAdapterRpcMethod("describeModelCatalog")).toBe(true);
     expect(isAdapterRpcMethod("install")).toBe(true);
   });
 
   it("rejects unknown methods", () => {
-    expect(isAllowedRpcMethod("rm -rf", { devMode: false })).toBe(false);
-    expect(isAllowedRpcMethod("eval", { devMode: true })).toBe(false);
+    expect(isAllowedRpcMethod("rm -rf")).toBe(false);
+    expect(isAllowedRpcMethod("eval")).toBe(false);
   });
 
-  it("dev methods are off unless devMode is on", () => {
-    expect(isAllowedRpcMethod("exec", { devMode: false })).toBe(false);
-    expect(isAllowedRpcMethod("shell", { devMode: false })).toBe(false);
-    expect(isAllowedRpcMethod("exec", { devMode: true })).toBe(true);
-    expect(isAllowedRpcMethod("shell", { devMode: true })).toBe(true);
+  it("accepts host methods", () => {
+    expect(isAllowedRpcMethod("exec")).toBe(true);
+    expect(isAllowedRpcMethod("shell")).toBe(true);
+    expect(isAllowedRpcMethod("tailLog")).toBe(true);
+    expect(isAllowedRpcMethod("writeFile")).toBe(true);
   });
 
-  it("dispatch rejects unknown methods even in dev mode", async () => {
+  it("dispatch rejects unknown methods", async () => {
     await expect(
       dispatchBridgeRpc("notAMethod", {}, "claude", {
         adapters: new Map(),
         workspaceRoot: "/tmp",
         cwd: "/tmp",
-        devMode: true,
       })
     ).rejects.toThrow(/unknown rpc method/);
   });
@@ -64,7 +63,6 @@ describe("command-bus rpc allow-list", () => {
       } as any]]),
       workspaceRoot: "/tmp",
       cwd: "/tmp",
-      devMode: false,
     });
     expect(result).toEqual(candidate);
   });
@@ -76,7 +74,6 @@ describe("command-bus rpc allow-list", () => {
       adapters: new Map([["odd", { catalog: { scope: () => scope, fetch } } as any]]),
       workspaceRoot: "/tmp",
       cwd: "/tmp",
-      devMode: false,
     });
     expect(result).toEqual(scope);
     expect(fetch).not.toHaveBeenCalled();

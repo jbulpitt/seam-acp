@@ -407,7 +407,7 @@ describe("activation outcome reporting (#370)", () => {
       rolloutEnabled: true, sshAlias: "fixture-host", pm2App: "fixture-bridge", verifyAgent: "grok", expectedUid: 501,
       checkoutPath: "/fixture/checkout", entrypointPath: "/fixture/checkout/packages/bridge/dist/index.js",
       nodePath: "/fixture/node", pm2ModulePath: "/fixture/pm2",
-      releaseRoot: "/fixture/releases", workspaceArg: null, devMode: false,
+      releaseRoot: "/fixture/releases", workspaceArg: null,
     },
   } }), "fixture-host");
   const options = { sha: "d".repeat(40), checksum: "e".repeat(64), stageId: token, timeoutSeconds: 10 };

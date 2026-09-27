@@ -1726,7 +1726,6 @@ async function main(): Promise<void> {
               connectedAt: conn?.connectedAt,
               ...(conn ? { releaseSha: conn.releaseSha } : {}),
               agents,
-              devMode: conn?.devMode,
               waiting: store.countParkedByLocation(b.id),
             };
           });

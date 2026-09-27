@@ -101,7 +101,6 @@ describe("a directory missing on this host", () => {
           adapters: new Map(),
           workspaceRoot: root,
           cwd: root,
-          devMode: false,
           configureSlot: (_slot: number, config: SlotSpawnConfig) => configured.push(config),
         }),
       releaseStdin() {},

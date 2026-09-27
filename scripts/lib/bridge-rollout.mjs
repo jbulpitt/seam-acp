@@ -14,6 +14,7 @@ const TOKEN = /^[0-9a-f]{64}$/;
 // refuses only rollout work for that host while its incumbent bridge and the
 // rest of the fleet keep serving (#412, #521).
 export const NATIVE_PREBUILD_ABIS = new Set(["108", "115", "127", "131"]);
+// Older target maps may still carry devMode; it is accepted and ignored.
 const TARGET_KEYS = new Set([
   "sshAlias", "pm2App", "verifyAgent", "checkoutPath", "entrypointPath",
   "expectedUid", "nodePath", "pm2ModulePath", "workspaceArg",
@@ -58,7 +59,6 @@ export function validateTargetMap(input) {
     }
     if (!SAFE_NAME.test(value.verifyAgent ?? "")) throw new Error(`unsafe verification agent for ${bridgeId}`);
     if (!Number.isInteger(value.expectedUid) || value.expectedUid < 1 || value.expectedUid > 0x7fffffff) throw new Error(`unsafe expected UID for ${bridgeId}`);
-    if (typeof value.devMode !== "boolean") throw new Error(`missing devMode identity for ${bridgeId}`);
     const pathKeys = launcher === "systemd"
       ? ["checkoutPath", "entrypointPath", "nodePath", "releaseRoot", "launcherPath"]
       : ["checkoutPath", "entrypointPath", "nodePath", "pm2ModulePath", "releaseRoot"];
@@ -163,7 +163,7 @@ function targetArgs(target) {
   return [
     target.bridgeId, target.pm2App, target.verifyAgent, String(target.expectedUid),
     target.checkoutPath, target.entrypointPath, target.nodePath,
-    target.pm2ModulePath ?? "-", target.workspaceArg ?? "-", target.devMode ? "yes" : "no", target.releaseRoot,
+    target.pm2ModulePath ?? "-", target.workspaceArg ?? "-", target.releaseRoot,
     target.launcher ?? "pm2", target.launcherPath ?? "-",
   ];
 }

@@ -28,7 +28,6 @@ export interface BridgeStatusRow {
   /** First moment we observed this bridge down (persisted across ticks). */
   disconnectedAt?: number;
   agents: BridgeAgent[];
-  devMode?: boolean;
   /** Threads with a parked prompt waiting on this host (#88 D7). */
   waiting?: number;
   /**
@@ -175,13 +174,12 @@ export function bridgeFieldName(b: BridgeStatusRow): string {
   return `${light} ${host} ${name}`.slice(0, 256);
 }
 
-/** Value is icon groups separated by dots: os · up/down · dev · agents · waiting. */
+/** Value is icon groups separated by dots: os · up/down · agents · waiting. */
 export function bridgeFieldValue(b: BridgeStatusRow, nowUtc: number): string {
   const waiting = b.waiting && b.waiting > 0 ? `📥 ${b.waiting} waiting` : "";
   const groups = [
     formatOsIcons(b.os, b.arch),
     bridgeTimeGroup(b, nowUtc),
-    b.connected && b.devMode ? "⌨️" : "",
     agentIcons(b.agents),
     waiting,
   ].filter((g) => g.length > 0);

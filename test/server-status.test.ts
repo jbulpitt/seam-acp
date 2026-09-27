@@ -121,7 +121,6 @@ describe("renderServerStatusPanel", () => {
               { id: "grok", emoji: "🐺" },
               { id: "claude", emoji: "👾" },
             ],
-            devMode: true,
           },
         ],
       })
@@ -131,7 +130,7 @@ describe("renderServerStatusPanel", () => {
     const field = ok.fields.find((f) => f.name.includes("mac"));
     expect(field?.name).toBe("🟢 💻 mac");
     expect(field?.inline).toBe(false);
-    expect(field?.value).toBe("🍎🦾 · ⏱️ 12m · ⌨️ · 🐺 👾");
+    expect(field?.value).toBe("🍎🦾 · ⏱️ 12m · 🐺 👾");
     expect(ok.fields.some((f) => f.name === "Bridges")).toBe(false);
   });
 
@@ -212,7 +211,6 @@ describe("renderServerStatusPanel", () => {
             arch: "arm64",
             connectedAt: NOW - 12 * 60_000,
             agents: [{ id: "claude", emoji: "👾" }],
-            devMode: true,
           },
           {
             id: "media-server",
@@ -234,7 +232,7 @@ describe("renderServerStatusPanel", () => {
         (b) =>
           b.kind === "text" &&
           b.content.includes("**🟢 💻 mac**") &&
-          b.content.includes("🍎🦾 · ⏱️ 12m · ⌨️ · 👾")
+          b.content.includes("🍎🦾 · ⏱️ 12m · 👾")
       )
     ).toBe(true);
     expect(

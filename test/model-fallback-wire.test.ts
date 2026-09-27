@@ -22,7 +22,7 @@ describe("precomputed model policy wire", () => {
       rpc: async (method: string, params: unknown) => {
         expect(releaseStdin).not.toHaveBeenCalled();
         return dispatchBridgeRpc(method, JSON.parse(JSON.stringify(params)), "agy",
-          { adapters: new Map(), cwd, workspaceRoot: cwd, devMode: false, configureSlot: configured });
+          { adapters: new Map(), cwd, workspaceRoot: cwd, configureSlot: configured });
       },
     } as unknown as MuxHandle;
     await spawnRemoteSlot(mux, { agentId: "agy", model: "original", modelFallbacks: plan, cwd, mcpServers: [] });
@@ -37,7 +37,7 @@ describe("precomputed model policy wire", () => {
     const configured = vi.fn();
     const warn = vi.spyOn(console, "error").mockImplementation(() => {});
     await expect(dispatchBridgeRpc("spawn", { slot: 1, agentId: "agy", model: "original", modelFallbacks }, "agy",
-      { adapters: new Map(), cwd, workspaceRoot: cwd, devMode: false, configureSlot: configured }))
+      { adapters: new Map(), cwd, workspaceRoot: cwd, configureSlot: configured }))
       .resolves.toMatchObject({ ok: true });
     const config = configured.mock.calls[0]![1] as SlotSpawnConfig;
     expect(config.model).toBe("original");

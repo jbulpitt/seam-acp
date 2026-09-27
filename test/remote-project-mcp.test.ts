@@ -60,7 +60,6 @@ describe("remote project MCP ownership (#417)", () => {
       adapters: new Map<string, AgentAdapter>(),
       workspaceRoot: root,
       cwd: root,
-      devMode: false,
       configureSlot,
     };
   }

@@ -88,7 +88,7 @@ async function cmdAdd(
       `Paired **${result.bridgeId}**. Token is shown once and is not stored in plaintext.\n\n` +
       `Mac one-liner (installs git/node if needed, clones, starts pm2 — paste the connect line when asked):\n` +
       `\`\`\`\ncurl -fsSL https://raw.githubusercontent.com/jbulpitt/seam-acp/main/scripts/install-macos-bridge.sh | bash\n\`\`\`\n` +
-      `Connect line:\n\`\`\`\n${line}\n\`\`\``,
+      `Connect line (host exec, log, and file tools are available by default):\n\`\`\`\n${line}\n\`\`\``,
     flags: MessageFlags.Ephemeral,
   });
 }
@@ -120,7 +120,7 @@ async function cmdRotate(
     content:
       `Rotated token for **${bridgeId}**. Re-bootstrap the host. Mac (skip clone/build, paste this when asked):\n` +
       `\`\`\`\ncurl -fsSL https://raw.githubusercontent.com/jbulpitt/seam-acp/main/scripts/install-macos-bridge.sh | bash -s -- --skip-deps\n\`\`\`\n` +
-      `Connect line:\n\`\`\`\n${line}\n\`\`\``,
+      `Connect line (host exec, log, and file tools are available by default):\n\`\`\`\n${line}\n\`\`\``,
     flags: MessageFlags.Ephemeral,
   });
 }
@@ -170,7 +170,7 @@ async function cmdList(
     const emoji = b.emoji ?? "🖥️";
     const short = b.shortName ?? b.id;
     const conn = live
-      ? `connected (${[...live.agents.values()].filter((a) => a.ready).length}/${live.agents.size} ready${live.devMode ? ", dev" : ""})`
+      ? `connected (${[...live.agents.values()].filter((a) => a.ready).length}/${live.agents.size} ready)`
       : "offline";
     return `${emoji} **${short}** \`${b.id}\` — ${conn}`;
   });

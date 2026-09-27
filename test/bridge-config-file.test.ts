@@ -67,6 +67,14 @@ describe("#618 bridge config file loader", () => {
   it("defaults to ~/.config/seam/bridge.env", () => {
     expect(bridgeConfigPath({ HOME: "/home/someone" })).toBe("/home/someone/.config/seam/bridge.env");
   });
+
+  it("supports a second unit's explicit config path without changing XDG", () => {
+    expect(bridgeConfigPath({
+      HOME: "/home/someone",
+      XDG_CONFIG_HOME: "/home/someone/.config",
+      SEAM_BRIDGE_CONFIG_PATH: "/home/someone/.config/seam-staging/bridge.env",
+    })).toBe("/home/someone/.config/seam-staging/bridge.env");
+  });
 });
 
 describe("#618 bridge started with only `connect`", () => {

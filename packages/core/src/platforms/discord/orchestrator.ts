@@ -10096,7 +10096,7 @@ export class Orchestrator {
                     cachedUsage: cfg.lastContextUsage,
                   }
                 : {}),
-            }, queueFence);
+            }, queueFence, attempt?.statusCard ?? undefined);
           })()
         : undefined;
       if (attempt && statusPanel?.reference) {
@@ -11901,7 +11901,9 @@ export class Orchestrator {
       isolated: boolean;
       cachedUsage?: SessionConfigState["lastContextUsage"];
     },
-    queueFence?: ChannelQueueFence
+    queueFence?: ChannelQueueFence,
+    /** A resumed attempt's recorded card. It is edited in place, never reposted. */
+    existingCard?: { channelId: string; messageId: string }
   ): Promise<DispatchStatusPanel<MessageRef> | undefined> {
     if (!this.queueFenceCurrent(queueFence)) return undefined;
     const repoDisplay = this.repoDisplay(resolved.cwd);
@@ -11974,6 +11976,15 @@ export class Orchestrator {
           if (!this.queueFenceCurrent(queueFence)) return undefined;
           try {
             const toSend = withBrandAttachment(panel, dispatchBrandAsset);
+            if (existingCard) {
+              const ref: MessageRef = {
+                channel: { platform: target.platform, id: existingCard.channelId },
+                id: existingCard.messageId,
+              };
+              if (this.adapter.editPanel) await this.adapter.editPanel(ref, toSend);
+              else await this.adapter.editMessage(ref, serializePanelText(toSend));
+              return ref;
+            }
             return this.adapter.sendPanel
               ? await this.adapter.sendPanel(target, toSend)
               : await this.adapter.sendMessage(target, serializePanelText(toSend));

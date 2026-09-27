@@ -314,6 +314,26 @@ afterEach(() => {
   fs.rmSync(dataDir, { recursive: true, force: true });
 });
 
+describe("startDispatchStatusPanel: resumed attempt", () => {
+  it("edits the attempt's recorded card instead of posting a second one", async () => {
+    const { adapter, calls } = spyAdapter();
+    const orch = makeOrch({ dataDir, rt: fakeRuntime({ text: [] }), adapter });
+    const target = { platform: "discord", id: "thread-w" } as ChannelRef;
+
+    const panel = await (orch as any).startDispatchStatusPanel(
+      target,
+      baseSpec(),
+      { model: "opus", cwd: "/repo", isolated: true },
+      undefined,
+      { channelId: "thread-w", messageId: "card-before-restart" }
+    );
+
+    expect(calls.sendPanel).toHaveLength(0);
+    expect(calls.editPanel[0]!.ref.id).toBe("card-before-restart");
+    expect(panel.reference).toEqual({ channel: target, id: "card-before-restart" });
+  });
+});
+
 describe("dispatchInjectTurn: status panel ON (default)", () => {
   it("does not turn the panel Done until the queued output message is delivered", async () => {
     const order: string[] = [];

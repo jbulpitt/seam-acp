@@ -1,7 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { EventEmitter } from "node:events";
 import { simulateRetiredOwnerProcess } from "./restart-process-fixture.js";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { PassThrough } from "node:stream";
 import path from "node:path";
 import { pino } from "pino";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
@@ -13,6 +15,8 @@ import { projectAttemptCompletions } from "../packages/core/src/core/dispatch/at
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 import { DispatchSuspendedError } from "../packages/core/src/core/dispatch/attempt-store.js";
 import { attachLocalBridge } from "./local-bridge-fixture.js";
+import { AgentRuntime } from "../packages/core/src/agents/agent-runtime.js";
+import type { AgentProfile } from "@seam/adapters";
 
 const cleanups: (() => void)[] = [];
 afterEach(() => { for (const f of cleanups.splice(0).reverse()) f(); vi.restoreAllMocks(); });
@@ -37,11 +41,14 @@ function setup() {
   const router = {
     listProfiles: () => [], describeConfig: () => ({}),
     ensureSessionRecord: () => ({ ...record }), getProfile: () => undefined,
+    adoptRecoveryRuntime: vi.fn(),
+    releaseRecoveryRuntime: vi.fn(),
     getOrStartRuntime: vi.fn(async (_record: unknown, _opts?: { resumeSessionId: string }) => runtime),
   };
   const adapter = { sendPanel: async (channel: any) => ({ channel, id: "panel" }),
     sendMessage: vi.fn(async (channel: any, _text?: string) => ({ channel, id: "message" })),
-    editPanel: async () => {}, editMessage: async () => {} };
+    editPanel: async () => {}, editMessage: async () => {},
+    editStatusPanelProjection: vi.fn(async () => {}) };
   const config = { DATA_DIR: dataDir, REPOS_ROOT: "/synthetic", TURN_TIMEOUT_SECONDS: 60,
     SEAM_TURN_RESUME_ENABLED: true,
     DEFAULT_MODEL: "default", SEAM_DISPATCH_STATUS_PANEL: false,
@@ -446,5 +453,134 @@ describe("#250 production dispatch lifecycle (synthetic transport, no providers)
     await projectAttemptCompletions(h.dataDir, h.store.turnAttempts);
     expect(existsSync(path.join(dispatchDirs(h.dataDir).done, "held.json"))).toBe(true);
     expect(h.runtime.prompt).toHaveBeenCalledTimes(1);
+  });
+
+  it("#691 reattaches the ACP client and adopts a dispatched result after restart", async () => {
+    const h = setup();
+    h.spec.id = "wake-recovery";
+    h.spec.kind = "wake";
+    h.store.turnAttempts.registerOwner("controller-before-restart");
+    const attempt = h.store.turnAttempts.claim(
+      h.spec,
+      "synthetic-identity",
+      "controller-before-restart",
+      "dispatch",
+    );
+    h.store.turnAttempts.bind(attempt, "recorded-acp");
+    h.store.turnAttempts.bindStatusCard(attempt, {
+      channelId: "worker",
+      messageId: "wake-card",
+    });
+    h.store.turnAttempts.startPrompt(attempt);
+    h.store.turnAttempts.recordRemoteRecovery(attempt, {
+      version: 1,
+      location: "remote-one",
+      slot: 19,
+      submissionId: "submission-wake",
+      acpSessionId: "recorded-acp",
+      delegatedUtc: "2026-09-27T16:11:00.000Z",
+    });
+    h.store.turnAttempts.suspendBoot("controller-before-restart");
+
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    const child = Object.assign(new EventEmitter(), {
+      stdin,
+      stdout,
+      stderr,
+      killed: false,
+      kill: vi.fn(() => true),
+    });
+    let input = "";
+    const permissionAnswered = new Promise<void>((resolve) => {
+      stdin.on("data", (chunk) => {
+        input += chunk.toString();
+        for (const line of input.split("\n").filter(Boolean)) {
+          const frame = JSON.parse(line) as { id?: unknown; result?: unknown };
+          if (frame.id === 81) resolve();
+        }
+      });
+    });
+    const profile = { id: "codex" } as AgentProfile;
+    let adoptedRuntime: AgentRuntime | undefined;
+    h.router.adoptRecoveryRuntime.mockImplementation((_record, adoptedChild, acpSessionId) => {
+      const runtime = new AgentRuntime({
+        profile,
+        logger: pino({ level: "silent" }) as any,
+        spawnFn: () => { throw new Error("recovery must not spawn"); },
+      });
+      runtime.attachRecovery(adoptedChild, acpSessionId);
+      adoptedRuntime = runtime;
+      return runtime;
+    });
+    h.router.releaseRecoveryRuntime.mockImplementation((_recordId, runtime) => {
+      runtime.releaseRecovery();
+    });
+
+    const mux = {
+      sendCmd: vi.fn(async () => ({ health: [{
+        slot: 19,
+        alive: true,
+        recovery: {
+          version: 1,
+          owner: "bridge",
+          submissionId: "submission-wake",
+          acpSessionId: "recorded-acp",
+          rung: 1,
+          phase: "executing",
+          retry: 0,
+          budget: 3,
+          remaining: 3,
+          disposition: "none",
+          updatedUtc: "2026-09-27T16:12:00.000Z",
+        },
+      }] })),
+      adopt: vi.fn(() => {
+        queueMicrotask(() => stdout.write(JSON.stringify({
+          jsonrpc: "2.0",
+          id: 81,
+          method: "session/request_permission",
+          params: {
+            sessionId: "recorded-acp",
+            toolCall: { toolCallId: "tool-after-restart", kind: "execute", status: "pending", title: "second command" },
+            options: [{ optionId: "allow_once", name: "Allow", kind: "allow_once" }],
+          },
+        }) + "\n"));
+        void permissionAnswered.then(() => child.emit("remoteRecoveryResult", {
+          version: 1,
+          submissionId: "submission-wake",
+          acpSessionId: "recorded-acp",
+          status: "completed",
+          text: "recovered wake output",
+          stopReason: "end_turn",
+          finishedUtc: "2026-09-27T16:12:30.000Z",
+        }));
+        return child;
+      }),
+    };
+    const restarted = h.makeOrch();
+    restarted.setBridgeHub({ muxFor: (location: string) => location === "remote-one" ? mux : undefined,
+      slotHealthFor: () => [] } as any);
+    restarted.setDispatchWatcher(h.watcher);
+    vi.spyOn(restarted as any, "enqueueReportBack").mockResolvedValue(undefined);
+
+    await restarted.recoverInterruptedTurns();
+    await vi.waitFor(() => expect(h.store.turnAttempts.get(h.spec.id)?.state).toBe("completed"));
+
+    expect(mux.adopt).toHaveBeenCalledWith(19, { allowAppTraffic: true });
+    expect(input).toContain('"id":81');
+    expect(input).toContain('"optionId":"allow_once"');
+    expect(adoptedRuntime).toBeDefined();
+    expect(h.router.releaseRecoveryRuntime).toHaveBeenCalledTimes(1);
+    expect(h.adapter.sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "worker" }),
+      "recovered wake output",
+      expect.anything(),
+    );
+    expect(h.adapter.editStatusPanelProjection).toHaveBeenCalledWith(
+      { channel: { platform: "discord", id: "worker" }, id: "wake-card" },
+      { state: "Done", action: "end_turn" },
+    );
   });
 });

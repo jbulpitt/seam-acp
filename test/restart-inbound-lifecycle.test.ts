@@ -41,11 +41,14 @@ function setup() {
       entered(); await gate; throw new Error("ACP connection closed");
     }), idle: async () => {}, cancel: async () => {},
   };
+  const recoveryRuntime = {};
   const router = { listProfiles: () => [],
     describeConfig: () => ({ agent: { value: "codex" }, model: { value: "test" },
       effort: { value: null }, cwd: { value: "/synthetic" }, location: { value: "local" }, fastMode: { value: false } }),
     ensureSessionRecord: () => ({ ...record }), getProfile: () => undefined,
     getOrStartRuntime: vi.fn(async (_record: unknown, _recovery?: unknown) => runtime),
+    adoptRecoveryRuntime: vi.fn(() => recoveryRuntime),
+    releaseRecoveryRuntime: vi.fn(),
   };
   const adapter = { sendPanel: vi.fn(async (channel: any) => ({ channel, id: "panel" })),
     sendMessage: vi.fn(async (channel: any, _text: string, _delivery?: unknown) => ({ channel, id: "message" })),
@@ -147,7 +150,10 @@ describe("#250 human turn production pipeline, synthetic transport only", () => 
     await restarted.recoverInterruptedTurns();
     for (let i = 0; i < 8; i += 1) await new Promise((resolve) => setImmediate(resolve));
 
-    expect(mux.adopt).toHaveBeenCalledWith(6);
+    expect(mux.adopt).toHaveBeenCalledWith(6, { allowAppTraffic: true });
+    expect(h.router.adoptRecoveryRuntime).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "discord:worker" }), adopted, "recorded-acp"
+    );
     expect(h.runtime.prompt).not.toHaveBeenCalled();
     expect(h.adapter.sendMessage).toHaveBeenCalledTimes(1);
     const output = `${notice ? `${notice}\n\n` : ""}result completed while Seam was restarting`;
@@ -159,6 +165,9 @@ describe("#250 human turn production pipeline, synthetic transport only", () => 
     });
     expect(h.store.getInbound("1")?.state).toBe("completed");
     await vi.waitFor(() => expect(adopted.kill).toHaveBeenCalledTimes(1));
+    expect(h.router.releaseRecoveryRuntime).toHaveBeenCalledWith(
+      "discord:worker", expect.any(Object)
+    );
     expect(h.adapter.editStatusPanelProjection).toHaveBeenCalledWith(
       { channel: { platform: "discord", id: "worker" }, id: "persisted-panel" },
       { state: "Done", action: "end_turn" }

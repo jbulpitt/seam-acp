@@ -614,6 +614,85 @@ export class AgentRuntime {
     this.eventHandler = handler;
   }
 
+  /** Reattach the application side while the bridge retains prompt ownership. */
+  attachRecovery(child: ReturnType<AgentProfile["spawn"]>, sessionId: string): void {
+    if (this.connection || this.child) throw new Error("runtime is already attached");
+    this.child = child;
+    this.sessionId = sessionId;
+    this.promptInFlight = true;
+    this.delegatedTurn = true;
+
+    this.connectClient(child, false);
+  }
+
+  /** Release a completed adopted prompt without sending cancel or killing twice. */
+  releaseRecovery(): void {
+    this.promptInFlight = false;
+    this.delegatedTurn = false;
+    this.transportConnection?.close();
+    this.transportConnection = undefined;
+    this.connection = undefined;
+    this.sessionId = undefined;
+    this.child = undefined;
+  }
+
+  private connectClient(child: ReturnType<AgentProfile["spawn"]>, observeWrites: boolean): void {
+    const writable = Writable.toWeb(child.stdin) as unknown as WritableStream<Uint8Array>;
+    const readable = Readable.toWeb(child.stdout) as unknown as ReadableStream<Uint8Array>;
+    const wire = ndJsonStream(writable, readable);
+    const stream = observeWrites ? observePromptWrites(wire, params => {
+      const evidence = this.submissionRequests.get(params);
+      if (!evidence) return undefined;
+      return async phase => {
+        evidence.phase = phase;
+        if (phase === "local_write_started") evidence.localWriteStartedUtc = new Date().toISOString();
+        else evidence.localWriteCompletedUtc = new Date().toISOString();
+        await this.publishSubmission(evidence);
+      };
+    }) : wire;
+    const app = client()
+      .onNotification("_claude/sdkMessage", (params: unknown) => params, async ({ params }) => {
+        const evidence = this.receivingSubmission;
+        if (evidence && this.profile.submissionSignals === "claude_sdk"
+          && observeClaudeSubmission(evidence, params)) await this.publishSubmission(evidence);
+      })
+      .onRequest(methods.client.session.requestPermission, ({ params }) =>
+        this.permissionPolicy(params)
+      )
+      .onNotification(methods.client.session.update, async ({ params }) => {
+        await this.handleSessionUpdate(params.update);
+      })
+      .onRequest(methods.client.elicitation.create, async ({ params, requestId, signal }) => {
+        if (!this.elicitationHandler) return { action: "decline" };
+        const context: ElicitationRequestContext = { requestId, signal };
+        return this.elicitationHandler(params, context);
+      })
+      .onNotification(methods.client.elicitation.complete, async ({ params }) => {
+        await this.completeElicitationHandler?.(params);
+      });
+    this.transportConnection = app.connect(stream);
+    const agent = this.transportConnection.agent;
+    this.connection = {
+      initialize: (params: Parameters<ClientSideConnection["initialize"]>[0]) =>
+        agent.request(methods.agent.initialize, params),
+      newSession: (params: Parameters<ClientSideConnection["newSession"]>[0]) =>
+        agent.request(methods.agent.session.new, params),
+      loadSession: (params: Parameters<ClientSideConnection["loadSession"]>[0]) =>
+        agent.request(methods.agent.session.load, params),
+      prompt: (params: Parameters<ClientSideConnection["prompt"]>[0]) =>
+        agent.request(methods.agent.session.prompt, params),
+      setSessionMode: (params: Parameters<ClientSideConnection["setSessionMode"]>[0]) =>
+        agent.request(methods.agent.session.setMode, params),
+      setSessionConfigOption: (
+        params: Parameters<ClientSideConnection["setSessionConfigOption"]>[0]
+      ) => agent.request(methods.agent.session.setConfigOption, params),
+      cancel: (params: Parameters<ClientSideConnection["cancel"]>[0]) =>
+        agent.notify(methods.agent.session.cancel, params),
+      request: <T = unknown>(method: string, params?: unknown) =>
+        agent.request<T>(method, params),
+    } as unknown as ClientSideConnection;
+  }
+
   /** Start the agent process and complete ACP `initialize`. */
   async start(): Promise<void> {
     return this.withClassifiedErrors("start", () => this.startUnclassified());
@@ -746,68 +825,7 @@ export class AgentRuntime {
       }
     });
 
-    const writable = Writable.toWeb(
-      child.stdin
-    ) as unknown as WritableStream<Uint8Array>;
-    const readable = Readable.toWeb(
-      child.stdout
-    ) as unknown as ReadableStream<Uint8Array>;
-
-    const stream = observePromptWrites(ndJsonStream(writable, readable), params => {
-      const evidence = this.submissionRequests.get(params);
-      if (!evidence) return undefined;
-      return async phase => {
-        evidence.phase = phase;
-        if (phase === "local_write_started") evidence.localWriteStartedUtc = new Date().toISOString();
-        else evidence.localWriteCompletedUtc = new Date().toISOString();
-        await this.publishSubmission(evidence);
-      };
-    });
-
-    const app = client()
-      .onNotification("_claude/sdkMessage", (params: unknown) => params, async ({ params }) => {
-        const evidence = this.receivingSubmission;
-        if (evidence && this.profile.submissionSignals === "claude_sdk"
-          && observeClaudeSubmission(evidence, params)) await this.publishSubmission(evidence);
-      })
-      .onRequest(methods.client.session.requestPermission, ({ params }) =>
-        this.permissionPolicy(params)
-      )
-      .onNotification(methods.client.session.update, async ({ params }) => {
-        await this.handleSessionUpdate(params.update);
-      })
-      .onRequest(methods.client.elicitation.create, async ({ params, requestId, signal }) => {
-        if (!this.elicitationHandler) return { action: "decline" };
-        const context: ElicitationRequestContext = { requestId, signal };
-        return this.elicitationHandler(params, context);
-      })
-      .onNotification(methods.client.elicitation.complete, async ({ params }) => {
-        await this.completeElicitationHandler?.(params);
-      });
-    this.transportConnection = app.connect(stream);
-    const agent = this.transportConnection.agent;
-    // The current SDK's ClientApp exposes one generic typed context. Keep the
-    // runtime's existing narrow connection surface while routing each call
-    // through the stable v1 method constants.
-    this.connection = {
-      initialize: (params: Parameters<ClientSideConnection["initialize"]>[0]) =>
-        agent.request(methods.agent.initialize, params),
-      newSession: (params: Parameters<ClientSideConnection["newSession"]>[0]) =>
-        agent.request(methods.agent.session.new, params),
-      loadSession: (params: Parameters<ClientSideConnection["loadSession"]>[0]) =>
-        agent.request(methods.agent.session.load, params),
-      prompt: (params: Parameters<ClientSideConnection["prompt"]>[0]) =>
-        agent.request(methods.agent.session.prompt, params),
-      setSessionMode: (params: Parameters<ClientSideConnection["setSessionMode"]>[0]) =>
-        agent.request(methods.agent.session.setMode, params),
-      setSessionConfigOption: (
-        params: Parameters<ClientSideConnection["setSessionConfigOption"]>[0]
-      ) => agent.request(methods.agent.session.setConfigOption, params),
-      cancel: (params: Parameters<ClientSideConnection["cancel"]>[0]) =>
-        agent.notify(methods.agent.session.cancel, params),
-      request: <T = unknown>(method: string, params?: unknown) =>
-        agent.request<T>(method, params),
-    } as unknown as ClientSideConnection;
+    this.connectClient(child, true);
 
     // A hang produces no exit, so the timeout wins; attach the stderr we hold
     // rather than guess at a cause (#602, #610).

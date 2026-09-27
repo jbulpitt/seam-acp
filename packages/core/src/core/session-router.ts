@@ -1252,6 +1252,26 @@ export class SessionRouter {
     }
   }
 
+  adoptRecoveryRuntime(
+    record: SessionRecord,
+    child: Parameters<AgentRuntime["attachRecovery"]>[0],
+    acpSessionId: string,
+  ): AgentRuntime {
+    if (this.runtimes.has(record.id) || this.creationLocks.has(record.id) || this.retirements.has(record.id)) {
+      throw new Error("thread runtime is already owned by this controller");
+    }
+    const plan = this.planRuntimeSpawn(record);
+    const runtime = this.makeRuntime(record, plan, plan.model, plan.effort);
+    runtime.attachRecovery(child, acpSessionId);
+    this.runtimes.set(record.id, runtime);
+    return runtime;
+  }
+
+  releaseRecoveryRuntime(recordId: string, runtime: AgentRuntime): void {
+    if (this.runtimes.get(recordId) === runtime) this.runtimes.delete(recordId);
+    runtime.releaseRecovery();
+  }
+
   /**
    * Resolve spawn inputs without starting the agent. #308: this is the runtime
    * gate for SessionRouter-managed turns: getOrStartRuntime calls it before the
@@ -1481,15 +1501,13 @@ export class SessionRouter {
     return runtime;
   }
 
-  private async startRuntimeCandidate(record: SessionRecord, recovery: { resumeSessionId: string } | undefined,
-    plan: RuntimeSpawnPlan, model: string, effort: string | undefined): Promise<{ runtime: AgentRuntime; sessionId: string }> {
-    // Channel/thread presets are the source of truth for locked-down
-    // channels: re-resolved on every runtime start (not just session
-    // creation) so a stored record can never drift from the config file —
-    // whatever's in CHANNEL_PRESETS_FILE wins, regardless of what's in the
-    // DB. See resolveChannelPreset in config.ts.
-    const { agentId, location, profile, effortDescriptor, fastMode, cwd, mcpServers } = plan;
-
+  private makeRuntime(
+    record: SessionRecord,
+    plan: RuntimeSpawnPlan,
+    model: string,
+    effort: string | undefined,
+  ): AgentRuntime {
+    const { agentId, location, profile, effortDescriptor, mcpServers } = plan;
     const runtime = new AgentRuntime({
       profile,
       logger: this.logger.child({ session: record.id }),
@@ -1500,35 +1518,17 @@ export class SessionRouter {
         this.planModelFallbacks({ agentId, location }, requestedModel, requestedEffort, used ?? plan.fallbackContextTokens ?? null),
       ...(effortDescriptor ? { effortDescriptor } : {}),
       onDead: () => {
-        // Involuntary death — #76: leave turn markers intact. This is an
-        // interruption, not a cancellation. Recovery reattaches on the next
-        // boot (or the next recoverInterruptedTurns pass).
-        // Do NOT revoke the seam-MCP token: it names the Discord session, not
-        // the ACP subprocess. Grok's HTTP MCP client reconnects with the old
-        // header; rotating here is `-32001 unauthorized`.
         this.logger.info({ sessionId: record.id }, "agent process died; evicting runtime for auto-resume");
         this.runtimes.delete(record.id);
       },
       onCatalogRefresh: async () => {
-        // The adapter signal proves only that THIS runtime learned metadata.
-        // Refresh exactly its host binding; other hosts keep their independent
-        // binding/borrowed/unverified truth until their own real session runs.
         await this.modelCatalog.refresh({ agentId, location }, "session");
       },
       permissionPolicy: async (req) => {
-        // Always re-read from the live session row: the captured `record`
-        // would be stale if the user later changes the policy via
-        // `/seam approve` while the runtime is alive.
         const mode = this.livePermissionMode(record);
         if (mode === "always") {
-          const opt =
-            req.options.find((o) => o.kind?.startsWith("allow_")) ??
-            req.options[0];
-          if (opt) {
-            return {
-              outcome: { outcome: "selected", optionId: opt.optionId },
-            };
-          }
+          const opt = req.options.find((o) => o.kind?.startsWith("allow_")) ?? req.options[0];
+          if (opt) return { outcome: { outcome: "selected", optionId: opt.optionId } };
           return { outcome: { outcome: "cancelled" } };
         }
         if (mode === "ask" && this.askUser) {
@@ -1539,7 +1539,6 @@ export class SessionRouter {
             return { outcome: { outcome: "cancelled" } };
           }
         }
-        // mode === "deny" (or "ask" with no askUser wired)
         return { outcome: { outcome: "cancelled" } };
       },
       elicitationHandler: async (request, context) => {
@@ -1565,13 +1564,21 @@ export class SessionRouter {
         ? { loadSessionTimeoutMs: this.sessionLoadTimeoutMs }
         : {}),
     });
-
-    // For non-Anthropic backends (Ollama Cloud, Z.ai), setModel() is rejected
-    // by claude-agent-acp. Pass the model at spawn time via env vars instead.
     runtime.modelOverride = model;
-    // For agents that accept reasoning effort via CLI flags (e.g. Grok
-    // --reasoning-effort), pass it at spawn time.
     runtime.effortOverride = effort;
+    return runtime;
+  }
+
+  private async startRuntimeCandidate(record: SessionRecord, recovery: { resumeSessionId: string } | undefined,
+    plan: RuntimeSpawnPlan, model: string, effort: string | undefined): Promise<{ runtime: AgentRuntime; sessionId: string }> {
+    // Channel/thread presets are the source of truth for locked-down
+    // channels: re-resolved on every runtime start (not just session
+    // creation) so a stored record can never drift from the config file —
+    // whatever's in CHANNEL_PRESETS_FILE wins, regardless of what's in the
+    // DB. See resolveChannelPreset in config.ts.
+    const { fastMode, cwd } = plan;
+
+    const runtime = this.makeRuntime(record, plan, model, effort);
     const preserveSession = recovery || (model !== plan.model && record.acpSessionId
       ? { resumeSessionId: record.acpSessionId } : undefined);
     try {

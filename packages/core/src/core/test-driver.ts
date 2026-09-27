@@ -15,10 +15,12 @@ export interface TestInteractionResult {
 }
 
 export interface TestInventory {
+  controllerInstanceId: string;
   branch: string;
   commit: string;
   bridges: Array<{
     host: string;
+    instanceId: string;
     ready: boolean;
     agents: Array<{
       id: string;
@@ -27,6 +29,13 @@ export interface TestInventory {
       reason?: string;
     }>;
   }>;
+}
+
+export type TestRestartAction = "controller" | "bridge" | "controller_bridge" | "sessiond";
+
+export interface TestRestartResult {
+  accepted: true;
+  action: TestRestartAction;
 }
 
 const MAX_BODY = 64 * 1024;
@@ -94,6 +103,53 @@ export function makeTestInventoryHandler(opts: {
   };
 }
 
+export function makeTestRestartHandler(opts: {
+  key: string;
+  prepare: (action: TestRestartAction) => () => void;
+  logger: Logger;
+  delayMs?: number;
+}): (req: IncomingMessage, res: ServerResponse) => Promise<void> {
+  return async (req, res) => {
+    if (req.method !== "POST") return send(res, 405, { error: "POST only" });
+    const auth = req.headers.authorization;
+    const given = typeof auth === "string" && auth.startsWith("Bearer ") ? auth.slice(7) : undefined;
+    if (!keyMatches(given, opts.key)) return send(res, 401, { error: "unauthorized" });
+    let action: TestRestartAction;
+    try {
+      const body = await readJson(req) as { action?: unknown };
+      if (
+        body.action !== "controller" &&
+        body.action !== "bridge" &&
+        body.action !== "controller_bridge" &&
+        body.action !== "sessiond"
+      ) {
+        return send(res, 400, { error: "action must be controller, bridge, controller_bridge, or sessiond" });
+      }
+      action = body.action;
+    } catch (err) {
+      return send(res, 400, { error: `invalid JSON: ${(err as Error).message}` });
+    }
+
+    let restart: () => void;
+    try {
+      restart = opts.prepare(action);
+    } catch (err) {
+      return send(res, 422, { error: (err as Error).message });
+    }
+
+    send(res, 202, { accepted: true, action });
+    const timer = setTimeout(() => {
+      try {
+        restart();
+        opts.logger.warn({ action }, "test durability restart triggered");
+      } catch (err) {
+        opts.logger.error({ err, action }, "test durability restart failed to launch");
+      }
+    }, opts.delayMs ?? 250);
+    timer.unref();
+  };
+}
+
 export class TestDriverClient {
   constructor(
     private readonly url: string,
@@ -121,6 +177,26 @@ export class TestDriverClient {
     });
     const body = (await res.json().catch(() => ({}))) as TestInventory & { error?: string };
     if (!res.ok) throw new Error(body.error ?? `test inventory returned ${res.status}`);
+    return body;
+  }
+
+  async health(): Promise<void> {
+    const res = await this.fetchFn(`${this.url.replace(/\/+$/, "")}/health`, {
+      method: "GET",
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!res.ok) throw new Error(`test health returned ${res.status}`);
+  }
+
+  async restart(action: TestRestartAction): Promise<TestRestartResult> {
+    const res = await this.fetchFn(`${this.url.replace(/\/+$/, "")}/test/restart`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${this.key}`, "content-type": "application/json" },
+      body: JSON.stringify({ action }),
+      signal: AbortSignal.timeout(30_000),
+    });
+    const body = (await res.json().catch(() => ({}))) as TestRestartResult & { error?: string };
+    if (!res.ok) throw new Error(body.error ?? `test restart returned ${res.status}`);
     return body;
   }
 }

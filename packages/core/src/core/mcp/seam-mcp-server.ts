@@ -22,7 +22,7 @@
 import type { TestDriverClient } from "../test-driver.js";
 import type { TestInteractionSpec } from "../../platforms/discord/synthetic-interaction.js";
 import type { TesterBot } from "../tester-bot.js";
-import type { CanaryTarget } from "../canary.js";
+import type { CanaryRunOptions, CanaryTarget } from "../canary.js";
 import * as http from "node:http";
 import type { AddressInfo } from "node:net";
 import { randomUUID } from "node:crypto";
@@ -293,7 +293,7 @@ export interface SeamMcpServerDeps {
   /** The test deployment's click and slash-command driver (SEAM_TEST_DRIVER_URL). */
   testDriver?: TestDriverClient;
   /** Run the staging canary and post its result card. */
-  runCanary?: (target: CanaryTarget) => Promise<string>;
+  runCanary?: (target: CanaryTarget, options?: CanaryRunOptions) => Promise<string>;
   /**
    * Compute the EFFECTIVE config + which layer won for the calling session
    * (#58 P1). Undefined ⇒ config introspection is unsupported on this
@@ -1025,12 +1025,16 @@ const TOOLS = [
   {
     name: "canary_run",
     description:
-      "Run every live host+agent pair on the staging deployment through a real Discord turn, " +
-      "post one result card, and return the same result as text.",
+      "Run the staging deployment through real Discord turns, post one result card, and return " +
+      "the same result as text. Set durability to run the four mid-turn restart checks on Codex.",
     inputSchema: {
       type: "object",
       properties: {
         target: { type: "string", enum: ["staging"] },
+        durability: {
+          type: "boolean",
+          description: "Run controller, bridge, combined, and sessiond restart checks.",
+        },
       },
       required: ["target"],
     },
@@ -1851,7 +1855,7 @@ const INSTRUCTIONS = [
   "- tester_post(channel, text, threadName?) / tester_read(channel, after?, limit?): drive a TEST deployment as",
   "  a person through its test bot, in allowlisted test channels only; read its replies back.",
   "- tester_interact(kind, channel, ...): click, pick, submit a form, or run a slash command in a TEST deployment.",
-  "- canary_run(target): run every live host+agent pair on staging through Discord and post one result card.",
+  "- canary_run(target, durability?): run staging through Discord and post one result card; durability runs the four restart checks.",
   "- handoff(worker, prompt, returnTo?): delegate a task. `worker` is a thread id (a stateful",
   "  teammate) or a preset name (a fresh stateless specialist). You do NOT block — the worker's",
   "  result is dispatched back into your thread when it completes.",
@@ -2224,7 +2228,9 @@ export class SeamMcpServer {
     }
     const target = requireString(args, "target");
     if (target !== "staging") return textResult("target must be staging", true);
-    return textResult(await this.deps.runCanary(target));
+    return textResult(await this.deps.runCanary(target, {
+      durability: optionalBool(args, "durability") ?? false,
+    }));
   }
 
   private async toolTesterPost(args: Record<string, unknown>): Promise<McpToolResult> {

@@ -5,7 +5,10 @@ import {
   validateSlashSpec,
 } from "../packages/core/src/platforms/discord/synthetic-interaction.js";
 import { buildSlashRegistrationBody } from "../packages/core/src/platforms/discord/commands.js";
-import { makeTestInteractionHandler } from "../packages/core/src/core/test-driver.js";
+import {
+  makeTestInteractionHandler,
+  makeTestRestartHandler,
+} from "../packages/core/src/core/test-driver.js";
 
 function context(now: { t: number }) {
   const sent: Array<{ content?: string }> = [];
@@ -115,5 +118,37 @@ describe("test interaction HTTP handler", () => {
     await handler(req({ kind: "button", channelId: "c" }, "Bearer k"), good.r);
     expect(good.out.status).toBe(200);
     expect(inject).toHaveBeenCalledWith({ kind: "button", channelId: "c" }, "tester");
+  });
+});
+
+describe("test restart HTTP handler", () => {
+  function req(body: unknown, auth = "Bearer k") {
+    const r = Readable.from([Buffer.from(JSON.stringify(body))]) as unknown as Record<string, unknown>;
+    r.method = "POST";
+    r.headers = { authorization: auth };
+    return r as never;
+  }
+
+  it("answers before it performs an allowlisted restart", async () => {
+    let ended = false;
+    const restart = vi.fn(() => expect(ended).toBe(true));
+    const prepare = vi.fn(() => restart);
+    const out: { status?: number; body?: string } = {};
+    const res = {
+      writeHead: (status: number) => { out.status = status; },
+      end: (body: string) => { out.body = body; ended = true; },
+    } as never;
+    const handler = makeTestRestartHandler({
+      key: "k",
+      prepare,
+      logger: { warn: vi.fn(), error: vi.fn() } as never,
+      delayMs: 0,
+    });
+    await handler(req({ action: "sessiond" }), res);
+    expect(out.status).toBe(202);
+    expect(restart).not.toHaveBeenCalled();
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(prepare).toHaveBeenCalledWith("sessiond");
+    expect(restart).toHaveBeenCalledOnce();
   });
 });

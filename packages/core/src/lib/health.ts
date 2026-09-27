@@ -36,6 +36,8 @@ export function startHealthServer(
     onTestInteraction?: (req: IncomingMessage, res: ServerResponse) => void | Promise<void>;
     /** Test deployments only (SEAM_TEST_DRIVER_KEY). */
     onTestInventory?: (req: IncomingMessage, res: ServerResponse) => void | Promise<void>;
+    /** Test deployments only (SEAM_TEST_DRIVER_KEY plus actor id). */
+    onTestRestart?: (req: IncomingMessage, res: ServerResponse) => void | Promise<void>;
   }
 ): HealthServer {
   let ingressOpen = true;
@@ -98,6 +100,11 @@ export function startHealthServer(
     if (url === "/test/inventory" && opts?.onTestInventory) {
       if (!ingressOpen) return refuse(res);
       track("/test/inventory", opts.onTestInventory, req, res);
+      return;
+    }
+    if (url === "/test/restart" && opts?.onTestRestart) {
+      if (!ingressOpen) return refuse(res);
+      track("/test/restart", opts.onTestRestart, req, res);
       return;
     }
     res.writeHead(200, { "Content-Type": "text/plain" });

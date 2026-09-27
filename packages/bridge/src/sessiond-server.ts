@@ -864,6 +864,7 @@ export class SessiondServer {
       lastStdoutMsAgo: entry.lastStdoutAt === undefined ? null : Math.max(0, now - entry.lastStdoutAt),
       lastStdinMsAgo: entry.lastStdinAt === undefined ? null : Math.max(0, now - entry.lastStdinAt),
       attached: entry.attached,
+      outputAckedThrough: this.outputLog.acknowledgedThrough(entry.slot),
       ...(entry.exitCode !== undefined ? { exitCode: entry.exitCode } : {}),
       ...(entry.signal !== undefined ? { signal: entry.signal } : {}),
       ...(entry.orphanReason ? { orphanReason: entry.orphanReason } : {}),

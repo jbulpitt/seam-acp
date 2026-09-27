@@ -132,6 +132,8 @@ export interface SessiondSlotHealth {
   lastStdinMsAgo: number | null;
   /** False for a persisted orphan whose descriptors died with sessiond. */
   attached: boolean;
+  /** Highest stdout frame acknowledged by the prior controller. */
+  outputAckedThrough?: number;
   exitCode?: number | null;
   signal?: NodeJS.Signals | null;
   orphanReason?: "supervisor_restarted" | "identity_mismatch" | "identity_unverifiable";

@@ -445,7 +445,11 @@ import {
   rollingLineWindow,
 } from "../../core/rolling-line-window.js";
 import { completionRoute, type CompletionRoute } from "../../core/dispatch/done-reconcile.js";
-import type { DurableDeliveryPayload } from "../../core/dispatch/delivery-proof.js";
+import {
+  deliveryChunkNonce,
+  deliveryNonce,
+  type DurableDeliveryPayload,
+} from "../../core/dispatch/delivery-proof.js";
 import { promptExcerpt } from "../../core/prompt-excerpt.js";
 import { buildSeamHelpPages } from "./help-text.js";
 import { frameSteerPrompt, frameInterruptPrompt } from "../../core/steer.js";
@@ -570,7 +574,10 @@ import { FenceStream, type CompletedFence } from "../../core/fence-stream.js";
 import { SerialQueue } from "../../core/serial-queue.js";
 import { CardResultVault, type ClaimedCardResult } from "../../core/card-result-vault.js";
 import { StreamingPanel } from "../../core/streaming-panel.js";
-import { StreamingMessageRenderer } from "../../core/streaming-message-renderer.js";
+import {
+  StreamingMessageRenderer,
+  streamingMessageChunks,
+} from "../../core/streaming-message-renderer.js";
 import { mimeTypeForFilename } from "../../core/fence-mime.js";
 import { resolveHostPath } from "../../core/host-path.js";
 import { zipOneFile } from "../../core/zip-one.js";
@@ -15939,12 +15946,20 @@ export class Orchestrator {
       // record; give a live slot a few seconds before calling its owner lost.
       for (let check = 0; ; check += 1) {
         const reply = await mux.sendCmd("listSlots", {}) as { health?: unknown[] };
-        const rows = (reply.health ?? []) as Array<{ slot?: unknown; alive?: unknown; recovery?: unknown }>;
+        const rows = (reply.health ?? []) as Array<{
+          slot?: unknown;
+          alive?: unknown;
+          recovery?: unknown;
+          outputAckedThrough?: unknown;
+        }>;
         snapshot = rows.find((row) => row && row.slot === binding.slot && row.alive === true
           && isRemoteRecoverySnapshot(row.recovery)
           && row.recovery.submissionId === binding.submissionId
           && row.recovery.acpSessionId === binding.acpSessionId
-        ) as { recovery: import("@seam/adapters").RemoteRecoverySnapshot } | undefined;
+        ) as {
+          recovery: import("@seam/adapters").RemoteRecoverySnapshot;
+          outputAckedThrough?: number;
+        } | undefined;
         const alive = rows.some((row) => row && row.slot === binding.slot && row.alive === true);
         // A slot relaunched after a host restart re-arms before it reloads,
         // but give a large session's load up to a minute.
@@ -15969,6 +15984,9 @@ export class Orchestrator {
     try {
       child = mux.adopt(binding.slot, {
         allowAppTraffic: attempt.spec.session === "live",
+        ...(Number.isSafeInteger(snapshot.outputAckedThrough)
+          ? { afterSeq: snapshot.outputAckedThrough }
+          : {}),
       });
       if (attempt.spec.session === "live") {
         recoveryRecord = this.store.getByChannel(PLATFORM, attempt.spec.target) ?? undefined;
@@ -15982,6 +16000,102 @@ export class Orchestrator {
     } catch (err) {
       this.continueLostRemoteTurn(attempt, `the slot could not be re-bound (${err instanceof Error ? err.message : String(err)})`);
       return true;
+    }
+
+    const target: ChannelRef = { platform: PLATFORM, id: attempt.spec.target };
+    const adoptedChunks: string[] = [];
+    let collectOnly = false;
+    let adoptedRenderer: StreamingMessageRenderer | undefined;
+    let adoptedStatusQueue: SerialQueue | undefined;
+    if (recoveryRuntime && recoveryRecord) {
+      const baseNonce = deliveryNonce(attempt.id);
+      let fenceCounter = 0;
+      adoptedRenderer = new StreamingMessageRenderer(
+        async (text) => {
+          const index = adoptedChunks.length;
+          adoptedChunks.push(text);
+          if (collectOnly) return;
+          await this.adapter.sendMessage(target, text, {
+            nonce: deliveryChunkNonce(baseNonce, index),
+            enforceNonce: true,
+          });
+        },
+        {
+          logger: this.logger,
+          sendFile: this.adapter.sendFile
+            ? async (file) => {
+                await this.adapter.sendFile!(target, file);
+              }
+            : undefined,
+          handleFence: async (fence) => {
+            if (!fence.lang || !SEAM_DIRECTIVE_FENCE_LANGS.has(fence.lang)) return false;
+            fenceCounter += 1;
+            await this.emitClosedFence(target, fence, fenceCounter, {
+              preferredRoot: this.effectiveCwd(recoveryRecord!),
+            });
+            return true;
+          },
+        }
+      );
+      const cardRef = attempt.statusCard
+        ? {
+            channel: { platform: PLATFORM, id: attempt.statusCard.channelId },
+            id: attempt.statusCard.messageId,
+          }
+        : undefined;
+      adoptedStatusQueue = new SerialQueue();
+      const updateCard = async (action: string): Promise<void> => {
+        if (!cardRef || !this.adapter.editStatusPanelProjection) return;
+        await adoptedStatusQueue!.run(() => this.adapter.editStatusPanelProjection!(cardRef, {
+          state: "Working",
+          action,
+        })).catch((err) => this.logger.warn(
+          { err, attempt: attempt.id }, "adopted recovery status update failed"
+        ));
+      };
+      const renderer = adoptedRenderer;
+      recoveryRuntime.onEvent(async (event) => {
+        switch (event.kind) {
+          case "agent-text":
+            renderer.feed(event.text);
+            return;
+          case "tool-start":
+            await renderer.flush();
+            await updateCard(`Tool: ${event.title ?? event.kindLabel ?? "…"}`);
+            return;
+          case "tool-update":
+            await updateCard(event.status === "completed" || event.status === "failed"
+              ? "Working…"
+              : `Tool: ${event.title ?? "…"}`);
+            return;
+          case "agent-thought":
+            await updateCard("Thinking…");
+            return;
+          case "agent-state":
+            await updateCard(event.state);
+            return;
+          case "agent-file":
+            await renderer.flush();
+            await this.sendAgentFile(target, event);
+            return;
+          case "recovery":
+            await this.adapter.sendMessage(target, event.message);
+            return;
+          case "async-user-input":
+            await this.elicitations.createCodexAsync(recoveryRecord!, event);
+            return;
+          case "cwd-fallback":
+          case "model-changed":
+          case "mode-changed":
+          case "usage-update":
+          case "config-options":
+          case "submission-evidence":
+          case "agy-stdout-fallback":
+          case "error":
+            return;
+        }
+      });
+      void updateCard("Reconnected to session");
     }
     this.remoteAdoptionWaiters.get(attempt.id)?.();
     this.remoteAdoptionWaiters.delete(attempt.id);
@@ -16010,6 +16124,16 @@ export class Orchestrator {
         this.continueLostRemoteTurn(current, "the agent process exited before the turn finished");
         return;
       }
+      if (recoveryRuntime && adoptedRenderer) {
+        await Promise.race([
+          recoveryRuntime.idle(),
+          new Promise<void>((resolve) => setTimeout(resolve, 5_000)),
+        ]);
+        await adoptedRenderer.whenIdle();
+        collectOnly = true;
+        await adoptedRenderer.finalize();
+        await adoptedStatusQueue?.idle();
+      }
       const failed = result.status === "failed";
       // A substitution selected before restart must still be visible when the
       // result is adopted without an AgentRuntime/event handler. Use the notice
@@ -16037,7 +16161,18 @@ export class Orchestrator {
 
       const completed = this.store.turnAttempts.get(current.id);
       if (!completed?.outcome) return;
-      await this.finishRemoteRecoveryCompletion(current, completed);
+      let delivery: DurableDeliveryPayload | null | undefined;
+      if (adoptedRenderer) {
+        const texts = [...adoptedChunks];
+        if (failed) texts.push(`❌ ${error}`);
+        else if (texts.length === 0 && snapshot.outputAckedThrough === undefined && output.trim()) {
+          texts.push(...await streamingMessageChunks(output));
+        } else if (texts.length === 0 && !output.trim()) {
+          texts.push("✅ Done — no output.");
+        }
+        delivery = texts.length > 0 ? { kind: "messages", texts } : null;
+      }
+      await this.finishRemoteRecoveryCompletion(current, completed, delivery);
       try { child.kill(); } catch { /* result is already durable */ }
     };
     child.on("remoteRecoveryResult", (result: RemoteRecoveryResult) => {
@@ -16070,6 +16205,7 @@ export class Orchestrator {
   private async finishRemoteRecoveryCompletion(
     prior: TurnAttempt,
     completed: TurnAttempt,
+    delivery?: DurableDeliveryPayload | null,
   ): Promise<void> {
     const outcome = completed.outcome!;
     if (prior.source === "dispatch") {
@@ -16086,7 +16222,13 @@ export class Orchestrator {
         ? `❌ ${outcome.error ?? "remote recovery failed"}${output.trim() ? `\n\n${output}` : ""}`
         : (output.trim() || "✅ Done — no output.");
       try {
-        await this.sendTerminalAttemptDelivery(prior.id, target, { kind: "message", text: body });
+        if (delivery !== null) {
+          await this.sendTerminalAttemptDelivery(
+            prior.id,
+            target,
+            delivery ?? { kind: "message", text: body }
+          );
+        }
         this.store.turnAttempts.markDeliveryDone(prior.id);
       } catch (err) {
         this.logger.warn({ err, attempt: prior.id }, "adopted remote result delivery deferred");
@@ -16328,9 +16470,29 @@ export class Orchestrator {
     await Promise.all(liveJobs);
   }
 
-  private async sendDeliveryPayload(
-    channel: ChannelRef,
+  private async deliveryParts(
     payload: DurableDeliveryPayload,
+    nonce: string
+  ): Promise<Array<{ payload: Exclude<DurableDeliveryPayload, { kind: "messages" }>; nonce: string }>> {
+    if (payload.kind === "message") {
+      const chunks = await streamingMessageChunks(payload.text);
+      return (chunks.length > 0 ? chunks : [payload.text]).map((text, index) => ({
+        payload: { kind: "message", text },
+        nonce: deliveryChunkNonce(nonce, index),
+      }));
+    }
+    if (payload.kind === "messages") {
+      return payload.texts.map((text, index) => ({
+        payload: { kind: "message", text },
+        nonce: deliveryChunkNonce(nonce, index),
+      }));
+    }
+    return [{ payload, nonce }];
+  }
+
+  private async sendDeliveryPart(
+    channel: ChannelRef,
+    payload: Exclude<DurableDeliveryPayload, { kind: "messages" }>,
     nonce: string
   ): Promise<MessageRef> {
     const delivery = { nonce, enforceNonce: true as const };
@@ -16352,6 +16514,20 @@ export class Orchestrator {
       },
       delivery
     );
+  }
+
+  private async sendDeliveryPayload(
+    channel: ChannelRef,
+    payload: DurableDeliveryPayload,
+    nonce: string
+  ): Promise<MessageRef> {
+    const parts = await this.deliveryParts(payload, nonce);
+    let sent: MessageRef | undefined;
+    for (const part of parts) {
+      sent = await this.sendDeliveryPart(channel, part.payload, part.nonce);
+    }
+    if (!sent) throw new Error("recorded delivery contains no messages");
+    return sent;
   }
 
   /** Persist-before-send terminal delivery used by normal and recovery paths. */
@@ -16411,41 +16587,33 @@ export class Orchestrator {
       return "abandoned";
     }
 
-    let observed;
-    try {
-      observed = await this.adapter.findMessageByNonce(
-        channel,
-        attempt.deliveryNonce,
-        sinceMs
-      );
-    } catch (err) {
-      this.logger.warn({ err, id: attempt.id }, "Discord nonce lookup deferred");
-      return "deferred";
+    const parts = await this.deliveryParts(attempt.deliveryPayload, attempt.deliveryNonce);
+    for (const part of parts) {
+      let observed;
+      try {
+        observed = await this.adapter.findMessageByNonce(channel, part.nonce, sinceMs);
+      } catch (err) {
+        this.logger.warn({ err, id: attempt.id }, "Discord nonce lookup deferred");
+        return "deferred";
+      }
+      if (observed.status === "found") continue;
+      if (observed.status === "indeterminate") {
+        // Protects incomplete history scans from becoming destructive proof;
+        // deleting this distinction lets automatic abandonment authorize pruning.
+        this.store.turnAttempts.markDeliveryUncertain(attempt.id, observed.reason);
+        return "uncertain";
+      }
+      try {
+        // The same enforced nonce closes the lookup/send race at Discord: if a
+        // concurrent create won, Discord returns it rather than creating another.
+        await this.sendDeliveryPart(channel, part.payload, part.nonce);
+      } catch (err) {
+        this.logger.warn({ err, id: attempt.id }, "nonce-backed delivery replay deferred");
+        return "deferred";
+      }
     }
-    if (observed.status === "found") {
-      this.store.turnAttempts.markDeliveryDone(attempt.id);
-      return "delivered";
-    }
-    if (observed.status === "indeterminate") {
-      // Protects incomplete history scans from becoming destructive proof;
-      // deleting this distinction lets automatic abandonment authorize pruning.
-      this.store.turnAttempts.markDeliveryUncertain(attempt.id, observed.reason);
-      return "uncertain";
-    }
-    try {
-      // The same enforced nonce closes the lookup/send race at Discord: if a
-      // concurrent create won, Discord returns it rather than creating another.
-      await this.sendDeliveryPayload(
-        channel,
-        attempt.deliveryPayload,
-        attempt.deliveryNonce
-      );
-      this.store.turnAttempts.markDeliveryDone(attempt.id);
-      return "delivered";
-    } catch (err) {
-      this.logger.warn({ err, id: attempt.id }, "nonce-backed delivery replay deferred");
-      return "deferred";
-    }
+    this.store.turnAttempts.markDeliveryDone(attempt.id);
+    return "delivered";
   }
 
   /** Deliver the captured winner, never re-enter a provider. */

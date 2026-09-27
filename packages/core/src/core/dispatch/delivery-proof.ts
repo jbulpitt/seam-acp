@@ -19,9 +19,22 @@ export function deliveryNonce(attemptId: string): string {
     .slice(0, DELIVERY_NONCE_LENGTH);
 }
 
+/** Stable nonce for one message in a persisted multi-message delivery. */
+export function deliveryChunkNonce(baseNonce: string, index: number): string {
+  if (index === 0) return baseNonce;
+  return createHash("sha256")
+    .update("seam-terminal-delivery-chunk\0")
+    .update(baseNonce)
+    .update("\0")
+    .update(String(index))
+    .digest("base64url")
+    .slice(0, DELIVERY_NONCE_LENGTH);
+}
+
 /** The exact final Discord create-message payload retained across a crash. */
 export type DurableDeliveryPayload =
   | { kind: "message"; text: string }
+  | { kind: "messages"; texts: string[] }
   | { kind: "panel"; panel: StructuredPanel }
   | {
       kind: "file";

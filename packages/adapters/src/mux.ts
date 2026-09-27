@@ -99,6 +99,8 @@ export interface BridgeSlotHealth {
   lastStdinMsAgo: number | null;
   /** Child-owner facts, never inferred from socket state or silence (#467). */
   recovery?: RemoteRecoverySnapshot;
+  /** Highest stdout frame acknowledged by the prior controller. */
+  outputAckedThrough?: number;
 }
 
 /** Facts captured at the instant the server gives up on one bridge socket. */
@@ -872,17 +874,21 @@ export function makeMux(opts: {
    * turns can reattach their application-side ACP transport.
    * Existing local ownership is never replaced.
    */
-  function adopt(slot: number, options: { allowAppTraffic?: boolean } = {}): MuxChild {
+  function adopt(slot: number, options: { allowAppTraffic?: boolean; afterSeq?: number } = {}): MuxChild {
     if (!Number.isSafeInteger(slot) || slot < 0) throw new Error("adopt requires a non-negative slot");
     if (slots.has(slot)) throw new Error(`slot ${slot} is already bound in this controller`);
     nextSlot = Math.max(nextSlot, slot + 1);
     const child = bindSlot(slot, undefined, false, options.allowAppTraffic === true);
+    const afterSeq = Number.isSafeInteger(options.afterSeq) && options.afterSeq! >= 0
+      ? options.afterSeq!
+      : 0;
+    if (afterSeq > 0) outputCursor.set(slot, afterSeq);
     // Replay begins after this function returns, so the caller can attach its
     // result listener first. A missing/old bridge refuses this adoption only.
     queueMicrotask(() => {
       const entry = slots.get(slot);
       if (!entry || entry.killed) return;
-      void sendCmd("replayOutput", { slot, afterSeq: 0 }).then((reply: {
+      void sendCmd("replayOutput", { slot, afterSeq }).then((reply: {
         frames?: Array<{
           seq?: number;
           type?: string;

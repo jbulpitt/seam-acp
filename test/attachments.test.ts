@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import {
   mapAttachmentsToBlocks,
   isInlineableForAgent,
@@ -8,6 +8,7 @@ import {
   MAX_INLINE_TEXT_BYTES,
 } from "../packages/core/src/agents/attachments.js";
 import type { MessageAttachment } from "../packages/core/src/platforms/chat-adapter.js";
+import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
 
 function fakeFetch(map: Record<string, { body: string | Uint8Array; ok?: boolean }>): typeof fetch {
   return (async (input: string | URL | Request) => {
@@ -102,6 +103,45 @@ describe("resolveModelVisionRouting", () => {
       agentHasVision: undefined,
       viaTool: false,
     });
+  });
+});
+
+describe("remote attachment staging", () => {
+  it("keeps inline images and writes non-inline files to the agent host", async () => {
+    const image = a({
+      url: "https://cdn.example/cat.png",
+      filename: "cat.png",
+      contentType: "image/png",
+      size: 3,
+    });
+    const pdf = a({
+      url: "https://cdn.example/report.pdf",
+      filename: "report.pdf",
+      contentType: "application/pdf",
+      size: 8,
+    });
+    const hostWriter = vi.fn(async (filename: string) => `/remote/.seam-attachments/${filename}`);
+    const priorFetch = globalThis.fetch;
+    globalThis.fetch = fakeFetch({ [pdf.url]: { body: "pdf body" } });
+    try {
+      const result = await (Orchestrator.prototype as any).partitionAndStageAttachments.call(
+        { logger: { warn: vi.fn() } },
+        [image, pdf],
+        true,
+        false,
+        "discord:thread-1",
+        hostWriter
+      );
+      expect(result.inline).toEqual([image]);
+      expect(hostWriter).toHaveBeenCalledOnce();
+      expect(hostWriter.mock.calls[0]![0]).toMatch(/-report\.pdf$/);
+      expect(Buffer.from(hostWriter.mock.calls[0]![1] as Buffer).toString("utf8")).toBe("pdf body");
+      expect(result.hint).toContain("/remote/.seam-attachments/");
+      expect(result.hint).toContain("saved on the agent host");
+      expect(result.hint).not.toContain("auto-cleaned after ~48h");
+    } finally {
+      globalThis.fetch = priorFetch;
+    }
   });
 });
 

@@ -11,6 +11,8 @@ import { parseEnv } from "node:util";
  * that way on an affected host.
  */
 export function bridgeConfigPath(env: NodeJS.ProcessEnv = process.env): string {
+  const override = env.SEAM_BRIDGE_CONFIG_PATH?.trim();
+  if (override) return path.resolve(override);
   const base = env.XDG_CONFIG_HOME?.trim() || path.join(env.HOME?.trim() || os.homedir(), ".config");
   return path.join(base, "seam", "bridge.env");
 }

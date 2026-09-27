@@ -574,6 +574,9 @@ import { mimeTypeForFilename } from "../../core/fence-mime.js";
 import { resolveHostPath } from "../../core/host-path.js";
 import { zipOneFile } from "../../core/zip-one.js";
 import {
+  assertSecretName,
+  SECRET_TTL_MS,
+  recordThreadSecretPath,
   writeThreadSecret,
   listThreadSecrets,
   secretHarnessRules,
@@ -4551,12 +4554,8 @@ export class Orchestrator {
       if (
         activeProfile?.restrictDiscordAccess &&
         msg.attachments &&
-        msg.attachments.length > 0 &&
-        typeof activeProfile.sessionManager?.writeAttachment === "function"
+        msg.attachments.length > 0
       ) {
-        const writer = activeProfile.sessionManager.writeAttachment.bind(
-          activeProfile.sessionManager
-        );
         const cwd = effectiveCwd;
         const pathLines: string[] = [];
         for (const a of msg.attachments) {
@@ -4565,10 +4564,11 @@ export class Orchestrator {
             const res = await fetch(a.url);
             if (!res.ok) throw new Error(`download ${res.status} ${res.statusText}`);
             const buf = Buffer.from(await res.arrayBuffer());
-            const { path: written } = await writer(
+            const { path: written } = await this.writeAttachmentToHost(
+              described.location.value,
               cwd,
               a.filename,
-              buf.toString("base64")
+              buf
             );
             pathLines.push(`- \`${a.filename}\` → \`${written}\``);
           } catch (err) {
@@ -4610,7 +4610,15 @@ export class Orchestrator {
           msg.attachments,
           visionRouting.agentHasVision,
           visionRouting.viaTool,
-          record.id
+          record.id,
+          described.location.value === LOCAL_LOCATION
+            ? undefined
+            : (filename, bytes) => this.writeAttachmentToHost(
+                described.location.value,
+                effectiveCwd,
+                filename,
+                bytes
+              ).then((result) => result.path)
         );
         if (hint) promptText = promptText ? `${promptText}${hint}` : hint.trimStart();
         promptAttachments = inline.length > 0 ? withoutVoiceNotes(inline) : undefined;
@@ -8046,12 +8054,13 @@ export class Orchestrator {
         continue;
       }
       try {
-        const result = (await this.bridgeHub?.rpc(
+        if (!this.bridgeHub) throw new Error("bridge hub is not ready");
+        const result = await this.bridgeHub.writeAttachment(
           parked.location,
-          "writeAttachment",
-          { cwd, filename: a.filename, bytes: bytes.toString("base64") },
-          record.agentId
-        )) as { path?: string } | null | undefined;
+          cwd,
+          a.filename,
+          bytes
+        );
         const written = result?.path;
         pathLines.push(
           written
@@ -13144,11 +13153,22 @@ export class Orchestrator {
    *  its own tools can open. When vision is present (`true`) or unknown
    *  (`undefined`, e.g. the scheduled path with no live runtime), images stay
    *  inline as before. */
+  private async writeAttachmentToHost(
+    location: string,
+    cwd: string,
+    filename: string,
+    bytes: Uint8Array
+  ): Promise<{ path: string }> {
+    if (!this.bridgeHub) throw new Error("bridge hub is not ready");
+    return this.bridgeHub.writeAttachment(location, cwd, filename, bytes);
+  }
+
   private async partitionAndStageAttachments(
     attachments: ReadonlyArray<MessageAttachment>,
     agentHasVision?: boolean,
     toolVision = false,
-    stagingOwnerId?: string
+    stagingOwnerId?: string,
+    hostWriter?: (filename: string, bytes: Buffer) => Promise<string>
   ): Promise<{ inline: MessageAttachment[]; hint: string | null }> {
     const STAGE_MAX = 100 * 1024 * 1024; // don't fill /tmp with huge files
     const inline: MessageAttachment[] = [];
@@ -13182,8 +13202,10 @@ export class Orchestrator {
           stagedLines.push(`- \`${a.filename}\` — too large to stage (${buf.length} B)`);
           continue;
         }
-        const dest = await stageAttachment(a.filename, buf, batchId);
-        if (toolImage && stagingOwnerId) {
+        const dest = hostWriter
+          ? await hostWriter(`${batchId}-${a.filename}`, buf)
+          : await stageAttachment(a.filename, buf, batchId);
+        if (!hostWriter && toolImage && stagingOwnerId) {
           await authorizeStagedImage(stagingOwnerId, dest, buf);
         }
         stagedLines.push(`- \`${a.filename}\` → \`${dest}\``);
@@ -13193,14 +13215,17 @@ export class Orchestrator {
       }
     }
     if (stagedLines.length === 0) return { inline, hint: null };
-    void sweepStagedAttachments();
+    if (!hostWriter) void sweepStagedAttachments();
     const one = stagedLines.length === 1;
-    const action = toolVision
+    const action = toolVision && !hostWriter
       ? "call `inspect_image` for staged PNG/JPEG/WebP images and use file tools for other files"
       : `read ${one ? "it" : "them"} with your file tools`;
+    const location = hostWriter
+      ? "on the agent host"
+      : "to a temporary directory (auto-cleaned after ~48h)";
     const hint =
-      `\n\n_The following file${one ? " was" : "s were"} saved to a temporary directory ` +
-      `(auto-cleaned after ~48h) — ${action}, and copy into the workspace anything you need to keep:_\n` +
+      `\n\n_The following file${one ? " was" : "s were"} saved ${location} — ` +
+      `${action}, and copy into the workspace anything you need to keep:_\n` +
       stagedLines.join("\n");
     return { inline, hint };
   }
@@ -22355,20 +22380,46 @@ export class Orchestrator {
       })
       .catch(() => null);
     if (!sub) return;
+    await sub.deferReply({ flags: MessageFlags.Ephemeral });
     const name = sub.fields.getTextInputValue("name");
     const value = sub.fields.getTextInputValue("value");
     try {
-      const written = await writeThreadSecret(this.config.DATA_DIR, channel.id, name, value);
-      await sub.reply({
+      const safeName = assertSecretName(name);
+      const valueBytes = Buffer.from(value, "utf8");
+      const location = resolveThreadLocation(this.config, channel.id);
+      let written: { absPath: string; name: string };
+      if (location === LOCAL_LOCATION) {
+        written = await writeThreadSecret(
+          this.config.DATA_DIR,
+          channel.id,
+          safeName,
+          valueBytes
+        );
+      } else {
+        if (!this.bridgeHub) throw new Error("bridge hub is not ready");
+        const remote = await this.bridgeHub.writeSecret(
+          location,
+          channel.id,
+          safeName,
+          valueBytes,
+          Date.now() + SECRET_TTL_MS
+        );
+        written = await recordThreadSecretPath(
+          this.config.DATA_DIR,
+          channel.id,
+          safeName,
+          remote.path,
+          valueBytes.byteLength
+        );
+      }
+      await sub.editReply({
         content:
           `🔐 Secret \`${written.name}\` stored for this thread at \`${written.absPath}\`.\n` +
           `Agent turns will see the path (not the value). It is deleted about 1 hour after upload.`,
-        flags: MessageFlags.Ephemeral,
       });
     } catch (err) {
-      await sub.reply({
+      await sub.editReply({
         content: `Could not store secret: ${(err as Error).message}`,
-        flags: MessageFlags.Ephemeral,
       });
     }
   }

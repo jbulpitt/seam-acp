@@ -33,8 +33,9 @@ That exercises the real Discord path before a change is merged.
 - `SEAM_TEST_DRIVER_KEY`: a random shared secret.
 - `SEAM_TEST_DRIVER_ACTOR_ID`: the tester bot's user id.
 
-  Together these two turn on `POST /test/interaction` on the health port.
-  Never set them on a deployment people use.
+  The key turns on key-protected `GET /test/inventory`; together with the actor
+  id it also turns on `POST /test/interaction` on the health port. Never set
+  them on a deployment people use.
 
 **Driving `.env`** (the deployment your agents run in):
 - `SEAM_TEST_BOT_TOKEN`: the tester bot's token.
@@ -43,6 +44,10 @@ That exercises the real Discord path before a change is merged.
 - `SEAM_TEST_DRIVER_URL`: staging's health-port base URL, reachable from the
   driving host.
 - `SEAM_TEST_DRIVER_KEY`: the same secret as staging's.
+- `SEAM_CANARY_STAGING_CHANNEL_ID`: the staging parent channel that owns the
+  long-lived host+agent canary threads.
+- `SEAM_CANARY_RESULT_CHANNEL_ID`: the channel where controller-initiated
+  runs post their result card.
 
 ## Tools (seam-MCP)
 
@@ -56,6 +61,9 @@ That exercises the real Discord path before a change is merged.
   own event stream, so collectors waiting on a message see it the way they'd
   see a real click. It acts as `SEAM_TEST_DRIVER_ACTOR_ID`, so permission
   checks are real. Get message and custom ids from `tester_read`.
+- **`canary_run({ target: "staging" })`:** asks staging for its live bridge
+  and agent matrix, runs one real Discord turn for each ready pair in parallel,
+  and posts one result card.
 
 ## How close to Discord it is
 

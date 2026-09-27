@@ -77,6 +77,7 @@ export function seamHelpSections(): string[] {
       "`/seamadmin rebuild` — deterministic Discord reconstruction (no summarizer; one seed turn, up to 60% of destination context)",
       "`/seamadmin compact-thread [agent] [model]` — model-assisted reconstruction from Discord history",
       "`/seamadmin recover <thread> [mode]` — diagnose and repair one wedged channel queue",
+      "`/seamadmin canary target:staging` — run the live staging host and agent matrix",
       "`/seamadmin naming rename [scope] [migrate-legacy] [role-name]` — rebuild thread names",
       "`/seamadmin naming namer` — edit the agent/model/role symbol tables",
       "`/seamadmin schedule` — `add` `list` `remove` `toggle` `edit` (no attachments)",

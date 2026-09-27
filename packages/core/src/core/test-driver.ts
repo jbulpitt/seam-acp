@@ -14,6 +14,21 @@ export interface TestInteractionResult {
   deferred: boolean;
 }
 
+export interface TestInventory {
+  branch: string;
+  commit: string;
+  bridges: Array<{
+    host: string;
+    ready: boolean;
+    agents: Array<{
+      id: string;
+      installed: boolean;
+      ready: boolean;
+      reason?: string;
+    }>;
+  }>;
+}
+
 const MAX_BODY = 64 * 1024;
 
 function keyMatches(given: string | undefined, key: string): boolean {
@@ -66,6 +81,19 @@ export function makeTestInteractionHandler(opts: {
   };
 }
 
+export function makeTestInventoryHandler(opts: {
+  key: string;
+  inventory: () => TestInventory | Promise<TestInventory>;
+}): (req: IncomingMessage, res: ServerResponse) => Promise<void> {
+  return async (req, res) => {
+    if (req.method !== "GET") return send(res, 405, { error: "GET only" });
+    const auth = req.headers.authorization;
+    const given = typeof auth === "string" && auth.startsWith("Bearer ") ? auth.slice(7) : undefined;
+    if (!keyMatches(given, opts.key)) return send(res, 401, { error: "unauthorized" });
+    send(res, 200, await opts.inventory());
+  };
+}
+
 export class TestDriverClient {
   constructor(
     private readonly url: string,
@@ -82,6 +110,17 @@ export class TestDriverClient {
     });
     const body = (await res.json().catch(() => ({}))) as TestInteractionResult & { error?: string };
     if (!res.ok) throw new Error(body.error ?? `test driver returned ${res.status}`);
+    return body;
+  }
+
+  async inventory(): Promise<TestInventory> {
+    const res = await this.fetchFn(`${this.url.replace(/\/+$/, "")}/test/inventory`, {
+      method: "GET",
+      headers: { Authorization: `Bearer ${this.key}` },
+      signal: AbortSignal.timeout(30_000),
+    });
+    const body = (await res.json().catch(() => ({}))) as TestInventory & { error?: string };
+    if (!res.ok) throw new Error(body.error ?? `test inventory returned ${res.status}`);
     return body;
   }
 }

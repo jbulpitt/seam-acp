@@ -208,6 +208,8 @@ export interface ChatAdapter {
 
   /** Optional: pin a message (status card lives as the sticky post in its thread). */
   pinMessage?(message: MessageRef): Promise<void>;
+  /** Optional: unpin a superseded sticky message while retaining its history. */
+  unpinMessage?(message: MessageRef): Promise<void>;
 
   /** Optional: delete a previously-sent message (used to migrate embed → v2). */
   deleteMessage?(message: MessageRef): Promise<void>;

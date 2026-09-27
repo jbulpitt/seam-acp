@@ -413,6 +413,11 @@ import type {
 import { reloadChannelPresets } from "../../core/config-reload.js";
 import type { ConfigProposeOutcome } from "../../core/mcp/seam-mcp-server.js";
 import {
+  formatCanaryResult,
+  type CanaryRunResult,
+  type CanaryTarget,
+} from "../../core/canary.js";
+import {
   isSessionRecord,
   type InjectTarget,
   type InjectTurnOptions,
@@ -1002,6 +1007,8 @@ export class Orchestrator {
   private readonly refreshModelIntelligence?: (forceSources: boolean) => Promise<ModelIntelligenceRefreshResult>;
   /** Installed by index.ts only while the upstream-status subsystem is active. */
   private serviceStatusRefresh?: () => Promise<RefreshResult>;
+  /** Installed by index.ts only when the staging test driver is configured. */
+  private canaryRunner?: (target: CanaryTarget) => Promise<CanaryRunResult>;
   /** Injected only by deterministic restart tests; production uses detached PM2. */
   private readonly restartProcess: () => Promise<void>;
   /** Debounce for the quota-card "Refresh" button: the force-refresh bypasses
@@ -5696,6 +5703,8 @@ export class Orchestrator {
         return this.cmdCompactThread(interaction);
       case "recover":
         return this.cmdRecover(interaction);
+      case "canary":
+        return this.cmdCanary(interaction);
       default:
         await interaction.reply({
           content: `Unknown subcommand: ${sub}`,
@@ -7416,6 +7425,12 @@ export class Orchestrator {
 
   setServiceStatusRefresh(refresh: (() => Promise<RefreshResult>) | undefined): void {
     this.serviceStatusRefresh = refresh;
+  }
+
+  setCanaryRunner(
+    runner: ((target: CanaryTarget) => Promise<CanaryRunResult>) | undefined
+  ): void {
+    this.canaryRunner = runner;
   }
 
   // --- agent-scheduled wake events (#59) ------------------------------------
@@ -15468,6 +15483,41 @@ export class Orchestrator {
       name: this.interactionSpeakerName(i),
     });
     await i.editReply(`${result.ok ? "🛠️" : "ℹ️"} ${result.message}`);
+  }
+
+  private async cmdCanary(i: ChatInputCommandInteraction): Promise<void> {
+    const admins = this.config.SEAM_CONFIG_ADMIN_USER_IDS;
+    if (admins && !admins.has(i.user.id)) {
+      await i.reply({
+        content: "🔒 `/seamadmin canary` is config-admin-only.",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    if (!this.canaryRunner) {
+      await i.reply({
+        content: "The staging canary is not configured on this deployment.",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    const target = i.options.getString("target", true);
+    if (target !== "staging") {
+      await i.reply({
+        content: `Unknown canary target: ${target}`,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    await i.deferReply({ flags: MessageFlags.Ephemeral });
+    try {
+      const result = await this.canaryRunner(target);
+      await i.editReply(formatCanaryResult(result));
+    } catch (error) {
+      await i.editReply(
+        `Canary could not start: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
   }
 
   private async cmdBridgeRestart(i: ChatInputCommandInteraction): Promise<void> {

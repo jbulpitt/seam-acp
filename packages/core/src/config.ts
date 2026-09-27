@@ -479,6 +479,10 @@ const Schema = z.object({
   SEAM_TEST_DRIVER_KEY: z.string().optional(),
   SEAM_TEST_DRIVER_ACTOR_ID: z.string().regex(/^\d+$/).optional(),
   SEAM_TEST_DRIVER_URL: z.string().url().optional(),
+  /** Parent channel holding the long-lived staging canary threads. */
+  SEAM_CANARY_STAGING_CHANNEL_ID: z.string().regex(/^\d+$/).optional(),
+  /** Channel where this controller posts one result card per canary run. */
+  SEAM_CANARY_RESULT_CHANNEL_ID: z.string().regex(/^\d+$/).optional(),
   SEAM_TEST_BOT_CHANNEL_IDS: z
     .string()
     .default("")

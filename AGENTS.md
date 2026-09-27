@@ -124,6 +124,14 @@ Reviewing? Read `docs/agent-guides/review-guide.md`. It covers the delete-first 
 
 ## ⚠️ CRITICAL: Applying code changes or restarting the app
 
+**Check `hostname` first.** Dev threads run on `seam-dev-server`, where no
+production controller runs. There, `npm run redeploy` in `~/Projects/seam-acp`
+builds and restarts nothing, and says nothing about it. Production deploys go
+through `ssh seam-server`; staging lives in `~/seam-staging`. The full map of
+both apps, including bridges and sessiond, is in
+`docs/agent-guides/deploying.md`. The rest of this section describes
+seam-server.
+
 Production now runs Seam and the shared Pronoa Playwright MCP as separate
 native systemd services:
 
@@ -220,6 +228,7 @@ Create with `wt create --repo <checkout> --name <name> --branch <b> --from origi
 
 ## Reference guides (open when relevant)
 
+- Deploying and restarting production and staging: `docs/agent-guides/deploying.md`
 - Slash commands, and the 8,000-character Discord budget: `docs/agent-guides/slash-commands.md`
 - Interactive prompts and cards: `docs/agent-guides/interactive-prompts.md`
 - Live help (Gemini in a voice channel): `docs/agent-guides/live-help.md`

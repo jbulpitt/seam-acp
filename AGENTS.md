@@ -6,6 +6,15 @@ This file contains instructions for AI agents (Copilot, Claude, Gemini, etc.) wo
 
 `seam-acp` is the Discord bot you are currently running inside. It bridges Discord messages to AI agent CLIs via the Agent Client Protocol (ACP). You are likely talking to yourself.
 
+## Operator context: read it first
+
+This repo is public and describes how Seam works. What's true only for the
+deployment you're in (its hosts, ids, exact deploy commands and host tooling)
+lives in a private operator repo cloned into the gitignored `docs/local/`.
+If `docs/local/README.md` exists, read it before any deploy, restart or host
+command. From a worktree, it's in the main checkout:
+`$(git rev-parse --path-format=absolute --git-common-dir)/../docs/local/`.
+
 ## Output formatting
 
 Your output is streamed to Discord, which does **not** support markdown tables. Avoid using tables in your responses — they render as garbled text. Use bullet lists, bold labels, or plain text instead.
@@ -16,27 +25,27 @@ You are developing the bot you are running in. Use the product instead of
 prose workarounds, native ACP tools that do not fire over this bridge, or
 hand-editing runtime state.
 
-- **A pick from Jesse** (approve, which plan, ship vs wait): frozen click-card
+- **A pick from the user** (approve, which plan, ship vs wait): frozen click-card
   **in this thread**. MCP `create_choice` or a `seam-choice` fence. Default is
   live, one person, one pick — the card shows the selection and buttons go
-  away. Do not ask him to type "1 or 2". **Several of N at once** ("which of
+  away. Do not ask them to type "1 or 2". **Several of N at once** ("which of
   these should I work on?"): add `select: { min, max }` — the card becomes a
-  dropdown + Confirm and returns **one combined prompt** with just his picks;
-  don't ask him to list numbers. Protocol:
+  dropdown + Confirm and returns **one combined prompt** with just their picks;
+  don't ask them to list numbers. Protocol:
   `docs/agent-guides/interactive-prompts.md`. `maxClicks` > 1 only when several
   people should each click (not combinable with `select`). Participants click;
   they do not author.
 - **Gemini in a voice channel (live help):** MCP `create_live_help` (no fence)
   after packing `system` + optional `historySummary`. `voiceChannelId`: this
-  thread’s rider first, else family-guild General. Students may *be in* the
+  thread’s rider first, else the deployment's default voice channel (operator context). Students may *be in* the
   VC and may ask their course agent to start or stop their own session; no
   parent/admin approval is required. How-to:
   `docs/agent-guides/live-help.md`. School overlays:
   `docs/agent-guides/live-help-onboarding.md`. Not TTS, not STT, not Go Live.
-- **A file he should open:** `seam-attach` fence (path only), not a path in prose.
+- **A file they should open:** `seam-attach` fence (path only), not a path in prose.
 - **Another thread in this channel:** `threads()` first. Idle → `handoff` /
   `forward`. Busy → `send` (inbox; they `poll_inbox`). Set `returnTo` to that
-  thread when he does not want a report-back here. Never hand off to `isSelf`.
+  thread when they do not want a report-back here. Never hand off to `isSelf`.
 - **Find or read prior conversation:** `search_messages` searches your thread,
   selected siblings, or all threads in this channel and returns message-id
   anchors; `read_messages` loads latest / around / before / after context,
@@ -124,22 +133,12 @@ Reviewing? Read `docs/agent-guides/review-guide.md`. It covers the delete-first 
 
 ## ⚠️ CRITICAL: Applying code changes or restarting the app
 
-**Check `hostname` first.** Dev threads run on `seam-dev-server`, where no
-production controller runs. There, `npm run redeploy` in `~/Projects/seam-acp`
-builds and restarts nothing, and says nothing about it. Production deploys go
-through `ssh seam-server`; staging lives in `~/seam-staging`. The full map of
-both apps, including bridges and sessiond, is in
-`docs/agent-guides/deploying.md`. The rest of this section describes
-seam-server.
-
-Production now runs Seam and the shared Pronoa Playwright MCP as separate
-native systemd services:
-
-- `seam-acp.service` — the Discord bot and agent subprocesses
-- `pronoa-playwright-mcp.service` — Playwright/Chromium, with its own cgroup
-  memory limits and lower CPU/I/O priority
-- `pm2-ubuntu.service` — remaining helper processes only; it has
-  `OOMPolicy=continue`
+**Check `hostname` first.** Your thread may run on a different host from the
+controller. `npm run redeploy` only restarts a controller that runs from the
+checkout you're in; anywhere else it builds, restarts nothing, and says
+nothing. Which host runs what, and the exact commands for each app, are in
+the operator context (`docs/local/deployments.md`). How deploys, bridges,
+sessiond and staging work in general is in `docs/agent-guides/deploying.md`.
 
 The checked-in units and recovery procedure live in `ops/systemd/README.md`.
 
@@ -174,24 +173,18 @@ for a human over SSH, not the normal deployment path.
 
 ```bash
 systemctl status seam-acp --no-pager
-journalctl -u seam-acp -f
-journalctl -u seam-acp -n 100 --no-pager
-systemctl status pronoa-playwright-mcp --no-pager
-journalctl -u pronoa-playwright-mcp -n 100 --no-pager
+sudo journalctl -u seam-acp -n 100 --no-pager
 curl -fsS http://127.0.0.1:3000/health
 systemctl status seam-local-bridge seam-sessiond --no-pager
 sudo journalctl -u seam-local-bridge -n 100 --no-pager
 ```
 
-`journalctl` for these units needs `sudo`; an empty result without it is a
-permissions issue, not a quiet log. Restarting `seam-local-bridge` leaves
-running turns alone (sessiond holds them). Remote bridges are updated with
-`npm run bridge:rollout -- --target <host>` (dry run), then add
-`--rollout --apply` to apply; see `docs/bridge-rollout.md`.
-
-An unauthenticated `http://127.0.0.1:8766/mcp` probe returns HTTP 403 when the
-Playwright listener is healthy. Restarting that service interrupts active
-browser sessions but does not restart Seam.
+Run these on the controller host. `journalctl` for these units needs `sudo`;
+an empty result without it is a permissions issue, not a quiet log.
+Restarting `seam-local-bridge` leaves running turns alone (sessiond holds
+them). Remote bridges are updated with `npm run bridge:rollout -- --target
+<host>` (dry run), then add `--rollout --apply` to apply; see
+`docs/bridge-rollout.md`.
 
 Do not use raw `pm2 jlist`, `pm2 prettylist`, or `pm2 env` in streamed agent
 output: PM2 embeds application environment variables and may expose secrets.
@@ -220,15 +213,12 @@ file/test counts.
 
 ## Git worktrees
 
-Use this host's `wt` CLI only (`~/.local/bin/wt`). Do **not** call `git worktree add` / `git worktree remove --force`, symlink `node_modules`, `npm install` a second copy to satisfy a bundler, park trees under `/tmp` or as visible `~/Projects/<name>` siblings, or invent a project-local worktree helper. This repo has no provisioner — call `wt` directly.
-
-Layout: `~/Projects/.worktrees/seam-acp/<name>/`. Bind-mount `node_modules` from the main checkout (never symlink). Teardown unmounts first — a force-remove of a still-mounted `node_modules` deletes the main install. After reboot: `wt bind-all --repo /home/ubuntu/Projects/seam-acp`.
-
-Create with `wt create --repo <checkout> --name <name> --branch <b> --from origin/main`; tear down with `wt teardown <name> --repo <checkout>`. Load `~/.local/share/wt-helpers/AGENTS.md` before creating or tearing down a tree. If `wt` is missing, run `~/.local/share/wt-helpers/install.sh` then `wt doctor`.
+Use the host's worktree tooling as described in the operator context (`docs/local/worktrees.md`). Never park a worktree under `/tmp`, symlink `node_modules`, or install a second copy of dependencies inside a tree. If the tree shares the main install through a mount, tear it down with that tooling **before** `gh pr merge --delete-branch`: gh's own worktree removal deletes through the mount into the main install.
 
 ## Reference guides (open when relevant)
 
-- Deploying and restarting production and staging: `docs/agent-guides/deploying.md`
+- Deploying and restarting (controller, bridges, sessiond, staging): `docs/agent-guides/deploying.md`
+- Testing through a staging deployment and the `tester_*` tools: `docs/agent-guides/test-deployment.md`
 - Slash commands, and the 8,000-character Discord budget: `docs/agent-guides/slash-commands.md`
 - Interactive prompts and cards: `docs/agent-guides/interactive-prompts.md`
 - Live help (Gemini in a voice channel): `docs/agent-guides/live-help.md`

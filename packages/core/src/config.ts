@@ -531,9 +531,9 @@ const Schema = z.object({
 
   /**
    * Optional override map of Discord user id → display name, e.g.
-   * "1487094572696867019:Jesse,1534937951044112505:Allie". Takes precedence over
+   * "123456789012345678:Alex,234567890123456789:Sam". Takes precedence over
    * the Discord nickname/global-name/username, both to guarantee a clean label
-   * (raw display names are often unusable, e.g. "xX_allie_Xx") and — the load-
+   * (raw display names are often unusable, e.g. "xX_user_Xx") and — the load-
    * bearing reason — to move the displayed name from user control to admin
    * control (issue #57 D5). Parsed like REPO_EMOJIS (`:101`); ids are numeric so
    * splitting on the first `:` is unambiguous.

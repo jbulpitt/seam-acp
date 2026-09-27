@@ -34,6 +34,7 @@ export interface ThreadSecretMeta {
   name: string;
   createdUtc: string;
   bytes: number;
+  absPath?: string;
 }
 
 export async function writeThreadSecret(
@@ -59,6 +60,28 @@ export async function writeThreadSecret(
   return { absPath, name: safe };
 }
 
+export async function recordThreadSecretPath(
+  dataDir: string,
+  threadId: string,
+  name: string,
+  absPath: string,
+  bytes: number
+): Promise<{ absPath: string; name: string }> {
+  const safe = assertSecretName(name);
+  const dir = threadSecretsDir(dataDir, threadId);
+  await fsp.mkdir(dir, { recursive: true, mode: 0o700 });
+  const meta: ThreadSecretMeta = {
+    name: safe,
+    createdUtc: new Date().toISOString(),
+    bytes,
+    absPath,
+  };
+  const metaPath = path.join(dir, `${safe}${META}`);
+  await fsp.writeFile(metaPath, JSON.stringify(meta), { mode: 0o600 });
+  await fsp.chmod(metaPath, 0o600);
+  return { absPath, name: safe };
+}
+
 export async function listThreadSecrets(
   dataDir: string,
   threadId: string
@@ -71,17 +94,25 @@ export async function listThreadSecrets(
     return [];
   }
   const out: Array<{ name: string; absPath: string; createdUtc: string }> = [];
-  for (const n of names) {
-    if (n.endsWith(META)) continue;
-    const metaPath = path.join(dir, `${n}${META}`);
+  const listed = new Set<string>();
+  for (const metaFile of names.filter((n) => n.endsWith(META))) {
+    const fallbackName = metaFile.slice(0, -META.length);
     let createdUtc = "";
+    let name = fallbackName;
+    let absPath = path.join(dir, fallbackName);
     try {
-      const meta = JSON.parse(await fsp.readFile(metaPath, "utf8")) as ThreadSecretMeta;
+      const meta = JSON.parse(await fsp.readFile(path.join(dir, metaFile), "utf8")) as ThreadSecretMeta;
       createdUtc = meta.createdUtc ?? "";
+      name = meta.name ?? fallbackName;
+      absPath = meta.absPath ?? absPath;
     } catch {
-      /* missing meta — still list */
+      // Keep the local-path fallback.
     }
-    out.push({ name: n, absPath: path.join(dir, n), createdUtc });
+    listed.add(fallbackName);
+    out.push({ name, absPath, createdUtc });
+  }
+  for (const name of names.filter((n) => !n.endsWith(META) && !listed.has(n))) {
+    out.push({ name, absPath: path.join(dir, name), createdUtc: "" });
   }
   return out;
 }
@@ -118,14 +149,17 @@ export async function sweepExpiredSecrets(
       } catch {
         return;
       }
-      for (const f of files) {
-        if (f.endsWith(META)) continue;
-        const abs = path.join(dir, f);
+      const secretNames = new Set(
+        files.map((file) => file.endsWith(META) ? file.slice(0, -META.length) : file)
+      );
+      for (const name of secretNames) {
+        const abs = path.join(dir, name);
+        const metaPath = abs + META;
         try {
-          const st = await fsp.stat(abs);
+          const st = await fsp.stat(abs).catch(() => fsp.stat(metaPath));
           if (st.mtimeMs < cutoff) {
             await fsp.rm(abs, { force: true });
-            await fsp.rm(abs + META, { force: true });
+            await fsp.rm(metaPath, { force: true });
           }
         } catch {
           /* ignore */

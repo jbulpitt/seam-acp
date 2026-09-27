@@ -574,6 +574,9 @@ import { mimeTypeForFilename } from "../../core/fence-mime.js";
 import { resolveHostPath } from "../../core/host-path.js";
 import { zipOneFile } from "../../core/zip-one.js";
 import {
+  assertSecretName,
+  SECRET_TTL_MS,
+  recordThreadSecretPath,
   writeThreadSecret,
   listThreadSecrets,
   secretHarnessRules,
@@ -22320,20 +22323,46 @@ export class Orchestrator {
       })
       .catch(() => null);
     if (!sub) return;
+    await sub.deferReply({ flags: MessageFlags.Ephemeral });
     const name = sub.fields.getTextInputValue("name");
     const value = sub.fields.getTextInputValue("value");
     try {
-      const written = await writeThreadSecret(this.config.DATA_DIR, channel.id, name, value);
-      await sub.reply({
+      const safeName = assertSecretName(name);
+      const valueBytes = Buffer.from(value, "utf8");
+      const location = resolveThreadLocation(this.config, channel.id);
+      let written: { absPath: string; name: string };
+      if (location === LOCAL_LOCATION) {
+        written = await writeThreadSecret(
+          this.config.DATA_DIR,
+          channel.id,
+          safeName,
+          valueBytes
+        );
+      } else {
+        if (!this.bridgeHub) throw new Error("bridge hub is not ready");
+        const remote = await this.bridgeHub.writeSecret(
+          location,
+          channel.id,
+          safeName,
+          valueBytes,
+          Date.now() + SECRET_TTL_MS
+        );
+        written = await recordThreadSecretPath(
+          this.config.DATA_DIR,
+          channel.id,
+          safeName,
+          remote.path,
+          valueBytes.byteLength
+        );
+      }
+      await sub.editReply({
         content:
           `🔐 Secret \`${written.name}\` stored for this thread at \`${written.absPath}\`.\n` +
           `Agent turns will see the path (not the value). It is deleted about 1 hour after upload.`,
-        flags: MessageFlags.Ephemeral,
       });
     } catch (err) {
-      await sub.reply({
+      await sub.editReply({
         content: `Could not store secret: ${(err as Error).message}`,
-        flags: MessageFlags.Ephemeral,
       });
     }
   }

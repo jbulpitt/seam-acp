@@ -5,6 +5,7 @@ import path from "node:path";
 import { pino } from "pino";
 import {
   SECRET_TTL_MS,
+  recordThreadSecretPath,
   writeThreadSecret,
   listThreadSecrets,
   secretHarnessRules,
@@ -37,6 +38,34 @@ describe("thread secrets", () => {
       expect(rules[0]).toContain(written.absPath);
       expect(rules[0]).not.toContain("s3cret");
       expect(rules[0]).toContain("deleted about an hour after upload");
+    } finally {
+      await rm(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it("lists a remote host path without retaining the secret value", async () => {
+    const dataDir = await mkdtemp(path.join(os.tmpdir(), "seam-sec-ref-"));
+    const remotePath = "/home/ubuntu/.seam/thread-secrets/thread-1/API_KEY";
+    try {
+      await recordThreadSecretPath(dataDir, "thread-1", "API_KEY", remotePath, 12);
+      const listed = await listThreadSecrets(dataDir, "thread-1");
+      expect(listed).toEqual([
+        expect.objectContaining({ name: "API_KEY", absPath: remotePath }),
+      ]);
+      const metadata = await readFile(
+        path.join(dataDir, "secrets", "thread-1", "API_KEY.meta.json"),
+        "utf8"
+      );
+      expect(metadata).toContain(remotePath);
+      expect(metadata).not.toContain("s3cret");
+      const expired = new Date(Date.now() - SECRET_TTL_MS - 1_000);
+      await utimes(
+        path.join(dataDir, "secrets", "thread-1", "API_KEY.meta.json"),
+        expired,
+        expired
+      );
+      await sweepExpiredSecrets(dataDir);
+      expect(await listThreadSecrets(dataDir, "thread-1")).toEqual([]);
     } finally {
       await rm(dataDir, { recursive: true, force: true });
     }

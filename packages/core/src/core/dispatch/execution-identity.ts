@@ -67,7 +67,9 @@ function text(value: unknown): string {
  */
 // The fallback cursor records recovery of this execution, not a user routing
 // change. Including it would strand the very attempt that recorded the cursor.
-const VOLATILE_CONFIG_KEYS = new Set(["lastContextUsage", "modelAcquisition"]);
+// `sessionCwdExplicit` only says where the cwd came from; the effective cwd is
+// compared as its own field.
+const VOLATILE_CONFIG_KEYS = new Set(["lastContextUsage", "modelAcquisition", "sessionCwdExplicit"]);
 
 function configIdentity(value: unknown): string {
   if (value === null || value === undefined) return "";

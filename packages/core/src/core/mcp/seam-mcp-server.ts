@@ -1025,12 +1025,12 @@ const TOOLS = [
   {
     name: "canary_run",
     description:
-      "Run the staging deployment through real Discord turns, post one result card, and return " +
-      "the same result as text. Set durability to run the four mid-turn restart checks on Codex.",
+      "Run a deployment through real Discord turns, post one result card, and return the same " +
+      "result as text. Durability is available for staging only.",
     inputSchema: {
       type: "object",
       properties: {
-        target: { type: "string", enum: ["staging"] },
+        target: { type: "string", enum: ["staging", "self"] },
         durability: {
           type: "boolean",
           description: "Run controller, bridge, combined, and sessiond restart checks.",
@@ -1855,7 +1855,7 @@ const INSTRUCTIONS = [
   "- tester_post(channel, text, threadName?) / tester_read(channel, after?, limit?): drive a TEST deployment as",
   "  a person through its test bot, in allowlisted test channels only; read its replies back.",
   "- tester_interact(kind, channel, ...): click, pick, submit a form, or run a slash command in a TEST deployment.",
-  "- canary_run(target, durability?): run staging through Discord and post one result card; durability runs the four restart checks.",
+  "- canary_run(target, durability?): run staging or this deployment through Discord and post one result card; durability is staging-only.",
   "- handoff(worker, prompt, returnTo?): delegate a task. `worker` is a thread id (a stateful",
   "  teammate) or a preset name (a fresh stateless specialist). You do NOT block — the worker's",
   "  result is dispatched back into your thread when it completes.",
@@ -2227,7 +2227,7 @@ export class SeamMcpServer {
       return textResult("canary_run is not configured on this deployment.", true);
     }
     const target = requireString(args, "target");
-    if (target !== "staging") return textResult("target must be staging", true);
+    if (target !== "staging" && target !== "self") return textResult("target must be staging or self", true);
     return textResult(await this.deps.runCanary(target, {
       durability: optionalBool(args, "durability") ?? false,
     }));

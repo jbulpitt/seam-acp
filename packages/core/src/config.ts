@@ -486,6 +486,8 @@ const Schema = z.object({
   SEAM_CANARY_STAGING_CHANNEL_ID: z.string().regex(/^\d+$/).optional(),
   /** Channel where this controller posts one result card per canary run. */
   SEAM_CANARY_RESULT_CHANNEL_ID: z.string().regex(/^\d+$/).optional(),
+  /** Parent channel holding this deployment's own canary threads and result cards. */
+  SEAM_CANARY_SELF_CHANNEL_ID: z.string().regex(/^\d+$/).optional(),
   SEAM_TEST_BOT_CHANNEL_IDS: z
     .string()
     .default("")

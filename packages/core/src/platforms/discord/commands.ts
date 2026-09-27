@@ -707,13 +707,16 @@ export function buildSeamAdminCommand(): SlashCommandBuilder {
   cmd.addSubcommand((sub) =>
     sub
       .setName("canary")
-      .setDescription("Run the real host and agent matrix on a test deployment")
+      .setDescription("Run the real host and agent matrix on a deployment")
       .addStringOption((o) =>
         o
           .setName("target")
           .setDescription("Deployment to test")
           .setRequired(true)
-          .addChoices({ name: "staging", value: "staging" })
+          .addChoices(
+            { name: "staging", value: "staging" },
+            { name: "self", value: "self" },
+          )
       )
   );
 

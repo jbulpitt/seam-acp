@@ -8,6 +8,7 @@ import {
 import { TesterBot } from "./core/tester-bot.js";
 import {
   StagingCanaryRunner,
+  SelfCanaryRunner,
   formatCanaryResult,
   providerSourceForAgent,
   publishCanaryCard,
@@ -907,41 +908,119 @@ async function main(): Promise<void> {
     });
   }
 
+  const providerStatus = (agentId: string): string | undefined => {
+    const sourceId = providerSourceForAgent(agentId);
+    if (!sourceId || !serviceStatusView) return undefined;
+    try {
+      const source = serviceStatusView.read({ sourceIds: [sourceId] }).sources[0];
+      if (!source) return undefined;
+      if (source.reportedStatus === "operational" && source.observation.health === "ok") {
+        return undefined;
+      }
+      return `${source.label} reports ${source.reportedStatus}; observation ${source.observation.health}`;
+    } catch {
+      return undefined;
+    }
+  };
+  const stagingCanary = testerBot && testDriver && config.SEAM_CANARY_STAGING_CHANNEL_ID
+    ? new StagingCanaryRunner({
+        testerBot,
+        testDriver,
+        dataDir: config.DATA_DIR,
+        stagingChannelId: config.SEAM_CANARY_STAGING_CHANNEL_ID,
+        providerStatus,
+      })
+    : undefined;
+  const selfCanaryChannelId = config.SEAM_CANARY_SELF_CHANNEL_ID
+    ?? config.SEAM_CANARY_RESULT_CHANNEL_ID;
+  const selfCanary = selfCanaryChannelId && bridgeHub
+    ? new SelfCanaryRunner({
+        dataDir: config.DATA_DIR,
+        inventory: () => {
+          const configured = router.listProfiles().map((profile) => profile.id).sort();
+          return {
+            bridges: bridgeHub!.listConnected().map((bridge) => ({
+              host: bridge.bridgeId,
+              ready: bridgeHub!.isBridgeReady(bridge.bridgeId),
+              agents: configured.map((agentId) => {
+                const observed = bridge.agents.get(agentId);
+                if (isAgentLocationDenied(agentId, bridge.bridgeId, config.AGENT_LOCATION_DENY)) {
+                  return {
+                    id: agentId,
+                    installed: observed?.installed ?? false,
+                    ready: false,
+                    reason: "withheld by AGENT_LOCATION_DENY",
+                  };
+                }
+                if (!observed) {
+                  return {
+                    id: agentId,
+                    installed: false,
+                    ready: false,
+                    reason: "not reported by bridge (disabled or unavailable)",
+                  };
+                }
+                return {
+                  id: agentId,
+                  installed: observed.installed,
+                  ready: observed.ready,
+                  ...(!observed.ready
+                    ? { reason: observed.reason ?? (observed.installed ? "not ready" : "not installed") }
+                    : {}),
+                };
+              }),
+            })),
+          };
+        },
+        createThread: (host, agent, name) =>
+          orchestrator.createCanaryThread(selfCanaryChannelId, host, agent, name),
+        threadExists: async (threadId) => {
+          if (!adapter.getThreadLiveState) throw new Error("adapter cannot verify canary threads");
+          return (await adapter.getThreadLiveState({ platform: "discord", id: threadId })) !== undefined;
+        },
+        dispatchTurn: async (threadId, prompt, dispatchId) =>
+          orchestrator.dispatchCanaryTurn({
+            id: dispatchId,
+            target: threadId,
+            prompt,
+            session: "live",
+            kind: "handoff",
+            correlationId: dispatchId,
+            stream: true,
+            createdUtc: new Date().toISOString(),
+          }),
+        providerStatus,
+      })
+    : undefined;
+
   let runCanary:
     | ((target: CanaryTarget, options?: CanaryRunOptions) => Promise<CanaryRunResult>)
     | undefined;
-  if (
-    testerBot &&
-    testDriver &&
-    config.SEAM_CANARY_STAGING_CHANNEL_ID &&
-    config.SEAM_CANARY_RESULT_CHANNEL_ID
-  ) {
-    const runner = new StagingCanaryRunner({
-      testerBot,
-      testDriver,
-      dataDir: config.DATA_DIR,
-      stagingChannelId: config.SEAM_CANARY_STAGING_CHANNEL_ID,
-      providerStatus: (agentId) => {
-        const sourceId = providerSourceForAgent(agentId);
-        if (!sourceId || !serviceStatusView) return undefined;
-        try {
-          const source = serviceStatusView.read({ sourceIds: [sourceId] }).sources[0];
-          if (!source) return undefined;
-          if (source.reportedStatus === "operational" && source.observation.health === "ok") {
-            return undefined;
-          }
-          return `${source.label} reports ${source.reportedStatus}; observation ${source.observation.health}`;
-        } catch {
-          return undefined;
-        }
-      },
-    });
+  if (stagingCanary || selfCanary) {
     runCanary = async (target, options) => {
-      const result = await runner.run(target, options);
+      if (target === "staging") {
+        if (!stagingCanary || !config.SEAM_CANARY_RESULT_CHANNEL_ID) {
+          throw new Error("staging canary is not configured on this deployment");
+        }
+        const result = await stagingCanary.run(target, options);
+        await publishCanaryCard({
+          result,
+          adapter,
+          channelId: config.SEAM_CANARY_RESULT_CHANNEL_ID,
+          dataDir: config.DATA_DIR,
+          logger,
+        });
+        return result;
+      }
+      if (options?.durability) throw new Error("durability is available only for target staging");
+      if (!selfCanary || !selfCanaryChannelId) {
+        throw new Error("self canary is not configured on this deployment");
+      }
+      const result = await selfCanary.run(target);
       await publishCanaryCard({
         result,
         adapter,
-        channelId: config.SEAM_CANARY_RESULT_CHANNEL_ID!,
+        channelId: selfCanaryChannelId,
         dataDir: config.DATA_DIR,
         logger,
       });

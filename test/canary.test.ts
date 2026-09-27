@@ -6,6 +6,7 @@ import {
   observeCanaryMessages,
   observeDurabilityOutput,
   renderCanaryLayout,
+  SelfCanaryRunner,
   StagingCanaryRunner,
   type CanaryRunResult,
 } from "../packages/core/src/core/canary.js";
@@ -189,6 +190,99 @@ describe("staging durability canary", () => {
     expect(restarts).toEqual(["controller", "bridge", "controller_bridge", "sessiond"]);
     expect(result.rows).toHaveLength(4);
     expect(result.rows.every((row) => row.status === "passed")).toBe(true);
+  });
+});
+
+describe("self canary", () => {
+  it("builds the live matrix, reuses threads, and requires delivered tool-backed Done turns", async () => {
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "seam-self-canary-"));
+    tempDirs.push(dataDir);
+    const created: string[] = [];
+    const dispatched: string[] = [];
+    let active = 0;
+    let peak = 0;
+    const runner = new SelfCanaryRunner({
+      dataDir,
+      inventory: () => ({
+        bridges: [{
+          host: "local",
+          ready: true,
+          agents: [
+            { id: "claude", installed: true, ready: true },
+            { id: "codex", installed: true, ready: true },
+            { id: "grok", installed: false, ready: false, reason: "disabled" },
+          ],
+        }],
+      }),
+      threadExists: async () => true,
+      createThread: async (host, agent) => {
+        created.push(`${host}@${agent}`);
+        return `thread-${agent}`;
+      },
+      nonce: (() => {
+        let ordinal = 0;
+        return () => `nonce${++ordinal}`;
+      })(),
+      dispatchTurn: async (threadId, prompt) => {
+        active += 1;
+        peak = Math.max(peak, active);
+        dispatched.push(threadId);
+        await new Promise((resolve) => setImmediate(resolve));
+        active -= 1;
+        const nonce = prompt.match(/echo ([a-z0-9]+)/i)?.[1] ?? "missing";
+        return {
+          output: nonce,
+          deliveredOutput: nonce,
+          toolSeen: true,
+          statusCardDone: true,
+        };
+      },
+    });
+
+    const first = await runner.run("self");
+    const second = await runner.run("self");
+
+    expect(first.rows).toMatchObject([
+      { host: "local", agent: "claude", status: "passed", threadId: "thread-claude" },
+      { host: "local", agent: "codex", status: "passed", threadId: "thread-codex" },
+      { host: "local", agent: "grok", status: "skipped", cause: "disabled" },
+    ]);
+    expect(second.rows.filter((row) => row.status === "passed")).toHaveLength(2);
+    expect(created).toEqual(["local@claude", "local@codex"]);
+    expect(dispatched).toHaveLength(4);
+    expect(peak).toBe(2);
+  });
+
+  it("reports which observable pass condition is missing", async () => {
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "seam-self-canary-red-"));
+    tempDirs.push(dataDir);
+    const runner = new SelfCanaryRunner({
+      dataDir,
+      inventory: () => ({
+        bridges: [{
+          host: "local",
+          ready: true,
+          agents: [{ id: "codex", installed: true, ready: true }],
+        }],
+      }),
+      threadExists: async () => true,
+      createThread: async () => "thread-codex",
+      nonce: () => "nonce",
+      dispatchTurn: async () => ({
+        output: "nonce",
+        deliveredOutput: "",
+        toolSeen: false,
+        statusCardDone: false,
+      }),
+    });
+
+    const result = await runner.run("self");
+
+    expect(result.rows[0]).toMatchObject({
+      status: "failed",
+      cause:
+        "no Discord reply contained the nonce; no tool step was visible on the status card; status card did not finish Done",
+    });
   });
 });
 

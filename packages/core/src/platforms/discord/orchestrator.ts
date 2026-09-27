@@ -978,6 +978,14 @@ export interface VoiceConsoleOrchestratorPort {
   markBindingActivitySettled(channelRef: string): Promise<void>;
 }
 
+export interface DispatchInjectTurnResult {
+  output: string;
+  stopReason: string;
+  deliveredOutput: string;
+  toolSeen: boolean;
+  statusCardDone: boolean;
+}
+
 /**
  * Glues the Discord adapter, the SessionRouter, and the agent runtimes
  * together. Handles incoming thread messages and `/seam` slash commands.
@@ -7427,6 +7435,40 @@ export class Orchestrator {
     this.serviceStatusRefresh = refresh;
   }
 
+  async createCanaryThread(
+    parentChannelId: string,
+    host: string,
+    agent: string,
+    name: string,
+  ): Promise<string> {
+    const thread = await this.createChildThread(parentChannelId, name);
+    const record = this.bindSessionToThread(thread);
+    const switched = await this.applyAgentChange(thread, record, formatAgentAtLocation(agent, host));
+    if (!switched.ok) throw new Error(switched.error);
+    let configured = this.store.get(record.id) ?? record;
+    const effective = this.router.describeConfig(configured);
+    const catalogDefault = this.modelCatalog.models({ agentId: agent, location: host })
+      .find((model) => model.default);
+    if (!catalogDefault) throw new Error(`model catalog for ${agent}@${host} is warming/unavailable`);
+    if (effective.model.value !== catalogDefault.id) {
+      const selected = await this.applyModelChange(thread, configured, catalogDefault.id);
+      if (!selected.ok) throw new Error(selected.error);
+      configured = this.store.get(record.id) ?? configured;
+    }
+
+    const role = this.configMutation.applyThreadOverlay({
+      threadId: thread.id,
+      ...(thread.parentId ? { parentRef: thread.parentId } : {}),
+      changes: { role: "canary" },
+      actor: { id: null, name: "canary" },
+    });
+    if (!role.ok) throw new Error(role.error);
+
+    configured = this.store.get(record.id) ?? configured;
+    await this.applyThreadName(configured, { fresh: true });
+    return thread.id;
+  }
+
   setCanaryRunner(
     runner: ((target: CanaryTarget) => Promise<CanaryRunResult>) | undefined
   ): void {
@@ -9658,6 +9700,15 @@ export class Orchestrator {
    * scheduled-prompt runner posts it afterwards for the same reason.)
    */
   async dispatchInjectTurn(spec: DispatchSpec): Promise<{ output: string; stopReason: string }> {
+    const { output, stopReason } = await this.dispatchInjectTurnWithEvidence(spec);
+    return { output, stopReason };
+  }
+
+  async dispatchCanaryTurn(spec: DispatchSpec): Promise<DispatchInjectTurnResult> {
+    return this.dispatchInjectTurnWithEvidence(spec);
+  }
+
+  private async dispatchInjectTurnWithEvidence(spec: DispatchSpec): Promise<DispatchInjectTurnResult> {
     const prior = this.store.turnAttempts?.get(spec.id);
     if (prior?.state === "completed") {
       // Completed-output ownership never re-enters a provider. Boot projection
@@ -9670,7 +9721,13 @@ export class Orchestrator {
       if (prior.outcome.error) throw new DispatchTurnError(prior.outcome.error,
         prior.outcome.output ?? "", prior.outcome.stopReason, prior.outcome.workerStatus,
         prior.outcome.workerError, true, prior.outcome.suppressedOnward);
-      return { output: prior.outcome.output ?? "", stopReason: prior.outcome.stopReason ?? "" };
+      return {
+        output: prior.outcome.output ?? "",
+        stopReason: prior.outcome.stopReason ?? "",
+        deliveredOutput: "",
+        toolSeen: false,
+        statusCardDone: false,
+      };
     }
     if (prior?.state === "cancelled") {
       throw DispatchSuspendedError.superseded(spec.id, "the dispatch was cancelled");
@@ -9758,17 +9815,32 @@ export class Orchestrator {
     }
   }
 
-  private async dispatchInjectTurnOwned(spec: DispatchSpec, phase: DispatchAcquisitionPhase): Promise<{ output: string; stopReason: string }> {
+  private async dispatchInjectTurnOwned(spec: DispatchSpec, phase: DispatchAcquisitionPhase): Promise<DispatchInjectTurnResult> {
     // Compact dispatches don't inject a turn — they run the compaction pipeline
     // on the target thread and post a result card there. Same start-indicator +
     // ledger + done-file plumbing, different body (see dispatchCompact).
-    if (spec.kind === "compact") return this.dispatchCompact(spec);
+    if (spec.kind === "compact") return {
+      ...await this.dispatchCompact(spec),
+      deliveredOutput: "",
+      toolSeen: false,
+      statusCardDone: false,
+    };
     // #224: a `thread` endpoint plans `session: "live"` — a typical handoff into
     // the target thread's own session. It keeps `kind: "ingest"` for the HTTP
     // waiter and the ledger, but must NOT take the synthetic isolated record
     // below; it falls through to the normal live dispatch path.
-    if (spec.kind === "ingest" && spec.session !== "live") return this.dispatchIngestEndpoint(spec);
-    if (spec.kind === "thread_voice") return this.dispatchThreadVoice(spec);
+    if (spec.kind === "ingest" && spec.session !== "live") return {
+      ...await this.dispatchIngestEndpoint(spec),
+      deliveredOutput: "",
+      toolSeen: false,
+      statusCardDone: false,
+    };
+    if (spec.kind === "thread_voice") return {
+      ...await this.dispatchThreadVoice(spec),
+      deliveredOutput: "",
+      toolSeen: false,
+      statusCardDone: false,
+    };
 
     const target: ChannelRef = { platform: PLATFORM, id: spec.target };
     let record = this.router.ensureSessionRecord({
@@ -9959,7 +10031,7 @@ export class Orchestrator {
     // Set only after claim(). A throw before that did not make this row active.
     let unstartedClaim: TurnAttempt | undefined;
 
-    const run = async (queueFence?: ChannelQueueFence): Promise<{ output: string; stopReason: string }> => {
+    const run = async (queueFence?: ChannelQueueFence): Promise<DispatchInjectTurnResult> => {
       this.assertQueueFence(queueFence);
       if (this.restartCutoff) {
         throw DispatchSuspendedError.shutdown(spec.id, "restart cutoff reached before the turn started");
@@ -10142,6 +10214,9 @@ export class Orchestrator {
         } catch { /* best-effort */ }
       }
       const startedAt = Date.now();
+      let deliveredOutput = "";
+      let toolSeen = false;
+      let statusCardDone = false;
 
       // STATUS PANEL: post the traditional live panel FIRST (above the answer),
       // driven from injectTurn's onEvent below. Resolve the panel's model/effort/
@@ -10236,6 +10311,7 @@ export class Orchestrator {
             if (!this.queueFenceCurrent(queueFence)) return;
             try {
               await this.adapter.sendMessage(target, text);
+              deliveredOutput += text;
             } catch (err) {
               this.logger.warn({ err, dispatch: spec.id }, "dispatch: stream message send failed");
             }
@@ -10281,6 +10357,7 @@ export class Orchestrator {
           try {
             if (this.adapter.editPanel) await this.adapter.editPanel(ref, panel);
             else await this.adapter.editMessage(ref, serializePanelText(panel));
+            deliveredOutput = done ? (streamState.fullText ?? text) : text;
           } catch (err) {
             this.logger.warn({ err, dispatch: spec.id }, "dispatch: stream edit failed");
           }
@@ -10387,6 +10464,9 @@ export class Orchestrator {
               }
               if (msgRenderer) msgRenderer.feed(event.text);
               else if (streamPanel) streamPanel.append(event.text);
+            }
+            if (statusPanel && (event.kind === "tool-start" || event.kind === "tool-update")) {
+              toolSeen = true;
             }
             statusPanel?.handleEvent(event);
           },
@@ -10538,9 +10618,12 @@ export class Orchestrator {
               : outputPresentation === "failed"
                 ? "Output delivery failed; turn completed"
                 : (result.stopReason || "Completed");
-        await statusPanel.finalize(finalState, finalAction).catch((err) =>
-          this.logger.warn({ err, dispatch: spec.id }, "dispatch: status panel finalize failed")
-        );
+        try {
+          await statusPanel.finalize(finalState, finalAction);
+          statusCardDone = finalState === "Done" && statusPanel.lastEditSucceeded;
+        } catch (err) {
+          this.logger.warn({ err, dispatch: spec.id }, "dispatch: status panel finalize failed");
+        }
       }
 
       // Visibility post. Streaming: finalize the panel IN PLACE (no second copy
@@ -10636,7 +10719,13 @@ export class Orchestrator {
           wasInterrupted
         );
       }
-      return { output: result.text, stopReason: result.stopReason ?? "" };
+      return {
+        output: result.text,
+        stopReason: result.stopReason ?? "",
+        deliveredOutput,
+        toolSeen,
+        statusCardDone,
+      };
     };
 
     // #76: resume starts go through the stagger/concurrency gate so a dozen
@@ -12041,15 +12130,17 @@ export class Orchestrator {
           }
         },
         edit: async (ref, panel) => {
-          if (!this.queueFenceCurrent(queueFence)) return;
+          if (!this.queueFenceCurrent(queueFence)) return false;
           try {
             if (this.adapter.editPanel) {
               await this.adapter.editPanel(ref, panel);
             } else {
               await this.adapter.editMessage(ref, serializePanelText(panel));
             }
+            return true;
           } catch (err) {
             this.logger.warn({ err, dispatch: spec.id }, "dispatch: status panel edit failed");
+            return false;
           }
         },
       },
@@ -15496,13 +15587,13 @@ export class Orchestrator {
     }
     if (!this.canaryRunner) {
       await i.reply({
-        content: "The staging canary is not configured on this deployment.",
+        content: "The canary is not configured on this deployment.",
         flags: MessageFlags.Ephemeral,
       });
       return;
     }
     const target = i.options.getString("target", true);
-    if (target !== "staging") {
+    if (target !== "staging" && target !== "self") {
       await i.reply({
         content: `Unknown canary target: ${target}`,
         flags: MessageFlags.Ephemeral,

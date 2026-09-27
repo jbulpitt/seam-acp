@@ -144,7 +144,9 @@ export function observeCanaryMessages(
   const botMessages = messages.filter((message) => message.authorIsBot);
   const statusText = botMessages.flatMap((message) => [...message.embeds, ...(message.components ?? [])]).join("\n");
   const nonceSeen = botMessages.some((message) => message.content.includes(nonce));
-  const toolSeen = /\bTool\s*:\s*\S/i.test(statusText);
+  const toolSeen = /\bTool\s*:\s*\S/i.test(statusText)
+    || statusText.includes("`▶️")
+    || statusText.includes("`⚙️");
   if (/(?:❌|\b)Failed\b/i.test(statusText)) {
     return { state: "failed", nonceSeen, toolSeen, cause: failureCause(botMessages) };
   }

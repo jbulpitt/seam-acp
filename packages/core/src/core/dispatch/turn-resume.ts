@@ -42,10 +42,6 @@ export const TURN_RESUME_MAX_AGE_SECONDS = 604_800;
 /** Delay between resume starts — avoids a boot-time rate-limit spike. */
 export const TURN_RESUME_STAGGER_MS = 1500;
 
-/** Cap on concurrently-starting resumed turns. Per-channel FIFO still
- *  serializes the same thread. */
-export const TURN_RESUME_CONCURRENCY = 2;
-
 export function turnDirs(dataDir: string): {
   root: string;
   running: string;
@@ -318,11 +314,10 @@ export function abandonedNotice(reason: string, maxAgeSeconds: number): string {
 }
 
 /**
- * Staggered, concurrency-capped queue for resume starts. Holds a slot for
- * the duration of `fn` so N resumes do not fire simultaneously at boot.
+ * Staggers resume starts so N recovered turns do not fire at once at boot.
+ * It gates only the start: a running turn never delays another's start.
  */
 export function createResumeScheduler(opts?: {
-  concurrency?: number;
   staggerMs?: number;
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
@@ -332,37 +327,31 @@ export function createResumeScheduler(opts?: {
   started: () => number;
   active: () => number;
 } {
-  const concurrency = opts?.concurrency ?? TURN_RESUME_CONCURRENCY;
   const staggerMs = opts?.staggerMs ?? TURN_RESUME_STAGGER_MS;
   const now = opts?.now ?? Date.now;
   const sleep = opts?.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
   let inFlight = 0;
   let started = 0;
   let lastStart = Number.NaN;
-  const waiters: Array<() => void> = [];
-
-  const pump = (): void => {
-    const next = waiters.shift();
-    if (next) next();
-  };
+  let gate: Promise<void> = Promise.resolve();
 
   return {
     started: () => started,
     active: () => inFlight,
     run: async <T>(fn: () => Promise<T>): Promise<T> => {
-      while (inFlight >= concurrency) {
-        await new Promise<void>((r) => waiters.push(r));
-      }
-      const wait = Number.isNaN(lastStart) ? 0 : Math.max(0, staggerMs - (now() - lastStart));
-      if (wait > 0) await sleep(wait);
-      lastStart = now();
+      const turn = gate.then(async () => {
+        const wait = Number.isNaN(lastStart) ? 0 : Math.max(0, staggerMs - (now() - lastStart));
+        if (wait > 0) await sleep(wait);
+        lastStart = now();
+        started++;
+      });
+      gate = turn;
+      await turn;
       inFlight++;
-      started++;
       try {
         return await fn();
       } finally {
         inFlight--;
-        pump();
       }
     },
   };

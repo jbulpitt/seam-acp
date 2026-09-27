@@ -218,11 +218,10 @@ describe("live marker lifecycle (writeDone commit ordering)", () => {
   });
 });
 
-describe("createResumeScheduler (stagger + concurrency)", () => {
-  it("does not start N jobs simultaneously", async () => {
+describe("createResumeScheduler (stagger)", () => {
+  it("staggers starts instead of firing them together", async () => {
     let fakeNow = 0;
     const scheduler = createResumeScheduler({
-      concurrency: 2,
       staggerMs: 100,
       now: () => fakeNow,
       sleep: async (ms) => {
@@ -230,22 +229,19 @@ describe("createResumeScheduler (stagger + concurrency)", () => {
       },
     });
     const starts: number[] = [];
-    const jobs = [0, 1, 2, 3, 4].map((i) =>
-      scheduler.run(async () => {
-        starts.push(fakeNow);
-        // hold the slot briefly so concurrency is observable
-        await new Promise((r) => setTimeout(r, 5));
-        return i;
-      })
-    );
-    await Promise.all(jobs);
-    expect(scheduler.started()).toBe(5);
-    // First start is immediate; later starts are at least staggerMs apart
-    // when a slot is free, or wait for concurrency.
-    expect(starts[0]).toBe(0);
-    expect(Math.max(...starts)).toBeGreaterThanOrEqual(100);
-    // Never more than `concurrency` conceptually: we had 2 slots, 5 jobs,
-    // stagger 100ms — last start cannot be 0.
-    expect(new Set(starts).size).toBeGreaterThan(1);
+    await Promise.all([0, 1, 2].map(() => scheduler.run(async () => { starts.push(fakeNow); })));
+    expect(starts).toEqual([0, 100, 200]);
+  });
+
+  it("does not let a long-running resumed turn block a later start", async () => {
+    const scheduler = createResumeScheduler({ staggerMs: 0 });
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const long = [0, 1].map(() => scheduler.run(() => held));
+    const later = await scheduler.run(async () => "started");
+    expect(later).toBe("started");
+    expect(scheduler.active()).toBe(2);
+    release();
+    await Promise.all(long);
   });
 });

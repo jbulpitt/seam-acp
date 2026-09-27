@@ -175,7 +175,6 @@ import {
 } from "../../core/dispatch/watcher.js";
 import {
   CONTINUE_PROMPT,
-  TURN_RESUME_CONCURRENCY,
   TURN_RESUME_MAX_AGE_SECONDS,
   TURN_RESUME_STAGGER_MS,
   abandonedNotice,
@@ -1170,7 +1169,6 @@ export class Orchestrator {
   private readonly stagedRecovery = new Map<string, RecoveryRender>();
   /** Shared start-gate so N resumes stagger instead of firing at once. */
   private readonly resumeScheduler = createResumeScheduler({
-    concurrency: TURN_RESUME_CONCURRENCY,
     staggerMs: TURN_RESUME_STAGGER_MS,
   });
   private readonly recoverySleep: (ms: number) => Promise<void>;
@@ -9596,7 +9594,7 @@ export class Orchestrator {
       // readiness checks. Staggering only the earlier SQL requeue looked safe
       // but the watcher admitted every recovered target together once the boot
       // barrier opened. This refuses no capability: ordinary dispatches still
-      // run immediately, while recorded continuations start two at a time.
+      // run immediately, while recorded continuations start staggered.
       return await (phase.phase === "boot-recovery" ? this.resumeScheduler.run(run) : run());
     } catch (err) {
       let current;

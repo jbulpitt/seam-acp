@@ -894,6 +894,37 @@ describe("channel-preset mutation (Tier C)", () => {
     expect(store.listConfigMutations()[0]).toMatchObject({ tier: "channel-preset", scope: CHAN });
   });
 
+  it("enables and clears the raw hostTools channel setting", () => {
+    const record = makeRecord({ parentRef: CHAN });
+    const file = writePresetsFile({ channels: { [CHAN]: { locked: false } } });
+    const live = {
+      channelPresets: new Map<string, ChannelPreset>(),
+      threadPresets: new Map<string, ThreadPreset>(),
+    };
+    const svc = makeService({
+      presetsFile: file,
+      tierCEnabled: true,
+      reloadPresets: () => reloadChannelPresets(live, file, silent),
+    });
+
+    const enabled = svc.buildProposal(record, { channelPreset: { hostTools: true } });
+    expect(enabled.ok).toBe(true);
+    if (!enabled.ok) return;
+    enabled.proposal.apply({ id: "admin", name: "Admin" });
+    let raw = JSON.parse(fs.readFileSync(file, "utf8"));
+    expect(raw.channels[CHAN].hostTools).toBe(true);
+    expect(raw.channels[CHAN].hostTools).not.toEqual({ value: true });
+    expect(live.channelPresets.get(CHAN)?.hostTools).toBe(true);
+
+    const disabled = svc.buildProposal(record, { channelPreset: { hostTools: false } });
+    expect(disabled.ok).toBe(true);
+    if (!disabled.ok) return;
+    disabled.proposal.apply({ id: "admin", name: "Admin" });
+    raw = JSON.parse(fs.readFileSync(file, "utf8"));
+    expect(raw.channels[CHAN]).not.toHaveProperty("hostTools");
+    expect(live.channelPresets.get(CHAN)?.hostTools).toBeUndefined();
+  });
+
   it("never lets the `locked` flag be set through the tool (D2/P3)", () => {
     const record = makeRecord({ parentRef: CHAN });
     const file = writePresetsFile({ channels: { [CHAN]: { model: { value: "m" } } } });

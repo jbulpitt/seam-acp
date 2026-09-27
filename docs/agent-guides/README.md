@@ -102,6 +102,13 @@ Use this as a map, not as a substitute for each tool's live schema.
 - Mid-turn course correction: `steer`.
 - Ordered multi-worker pipeline: `chain`.
 
+### Operate paired hosts
+
+Channels explicitly enabled by an administrator also expose `host_exec`,
+`host_push`, and `host_pull`. They run commands or copy one file through an
+already paired bridge; host paths are limited by the bridge user's OS
+permissions, not the workspace root. These tools are absent in other channels.
+
 ### Manage thread sessions
 
 - Change another thread's agent/model/effort/role/Fast mode: `configure_thread`. The

@@ -383,6 +383,28 @@ export interface SeamMcpServerDeps {
    * channel (never fail open). Undefined ⇒ treated as "no admin speaker".
    */
   currentSpeakerId?: (record: SessionRecord) => string | undefined;
+  /** Per-channel gate for the bridge-backed host tool catalog and calls. */
+  hostToolsEnabled?: (record: SessionRecord) => boolean;
+  hostExec?: (
+    record: SessionRecord,
+    input: { host: string; command: string; cwd?: string; timeoutSec?: number }
+  ) => Promise<{
+    stdout: string;
+    stderr: string;
+    exitCode: number | null;
+    signal: string | null;
+    timedOut: boolean;
+    stdoutTruncated: boolean;
+    stderrTruncated: boolean;
+  }>;
+  hostPush?: (
+    record: SessionRecord,
+    input: { host: string; from: string; to: string }
+  ) => Promise<{ sourceHost: string; targetHost: string; bytes: number; path: string }>;
+  hostPull?: (
+    record: SessionRecord,
+    input: { host: string; from: string; to: string }
+  ) => Promise<{ sourceHost: string; targetHost: string; bytes: number; path: string }>;
   /**
    * Propose a config mutation for the calling thread (#58 P2/P3). The platform
    * validates + computes the diff, renders a confirm CARD, and applies only on a
@@ -1625,6 +1647,11 @@ const TOOLS = [
               description:
                 "Channel-wide simple-card GIF thumbnail. Inherited live unless a thread/session overlay wins.",
             },
+            hostTools: {
+              type: "boolean",
+              description:
+                "Admin-only. Expose host_exec, host_push, and host_pull to every thread in this channel.",
+            },
           },
         },
         schedule: {
@@ -1827,6 +1854,66 @@ const TOOLS = [
   },
 ] as const;
 
+const HOST_TOOLS = [
+  {
+    name: "host_exec",
+    description:
+      "Run a non-interactive shell command on a connected paired host. Output is bounded and reports " +
+      "truncation; failures preserve the offline, timeout, signal, or non-zero-exit cause.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        host: { type: "string", description: "Paired bridge id, including local." },
+        command: { type: "string", description: "Non-interactive shell command." },
+        cwd: { type: "string", description: "Optional host cwd. The bridge user permissions are the limit." },
+        timeoutSec: {
+          type: "number",
+          minimum: 1,
+          maximum: 900,
+          description: "Optional timeout in seconds (default 30, maximum 900).",
+        },
+      },
+      required: ["host", "command"],
+    },
+  },
+  {
+    name: "host_push",
+    description:
+      "Copy one file from this agent session's host to a paired target host through the controller. " +
+      "Paths are host paths; the existing attachment size cap applies.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        host: { type: "string", description: "Target paired bridge id, including local." },
+        from: { type: "string", description: "Source path on this agent session's host." },
+        to: { type: "string", description: "Destination path on the target host." },
+      },
+      required: ["host", "from", "to"],
+    },
+  },
+  {
+    name: "host_pull",
+    description:
+      "Copy one file from a paired source host to this agent session's host through the controller. " +
+      "Paths are host paths; the existing attachment size cap applies.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        host: { type: "string", description: "Source paired bridge id, including local." },
+        from: { type: "string", description: "Source path on the paired host." },
+        to: { type: "string", description: "Destination path on this agent session's host." },
+      },
+      required: ["host", "from", "to"],
+    },
+  },
+] as const;
+
+const HOST_TOOL_NAMES = new Set<string>(HOST_TOOLS.map((tool) => tool.name));
+const HOST_TOOL_INSTRUCTIONS = [
+  "- host_exec(host, command, cwd?, timeoutSec?): run a bounded non-interactive command on a paired host.",
+  "- host_push(host, from, to): copy a file from this agent's host to a paired host.",
+  "- host_pull(host, from, to): copy a file from a paired host to this agent's host.",
+].join("\n");
 const INSTRUCTIONS = [
   "You are one teammate in a shared workspace of parallel agent threads. These tools let you",
   "coordinate with the others without leaving your own turn:",
@@ -2078,6 +2165,31 @@ export class SeamMcpServer {
     res.end(JSON.stringify(response));
   }
 
+
+  private hostToolsAvailable(record: SessionRecord): boolean {
+    return Boolean(
+      this.deps.hostToolsEnabled?.(record) &&
+      this.deps.hostExec &&
+      this.deps.hostPush &&
+      this.deps.hostPull
+    );
+  }
+
+  private hostToolsAvailableForToken(token: string | undefined): boolean {
+    const record = this.deps.resolveSession(token);
+    return Boolean(record && this.hostToolsAvailable(record));
+  }
+
+  private toolsForToken(token: string | undefined) {
+    return this.hostToolsAvailableForToken(token) ? [...TOOLS, ...HOST_TOOLS] : TOOLS;
+  }
+
+  private instructionsForToken(token: string | undefined): string {
+    return this.hostToolsAvailableForToken(token)
+      ? `${INSTRUCTIONS}\n${HOST_TOOL_INSTRUCTIONS}`
+      : INSTRUCTIONS;
+  }
+
   private async dispatch(
     msg: JsonRpcRequest,
     token: string | undefined
@@ -2092,13 +2204,13 @@ export class SeamMcpServer {
               : DEFAULT_PROTOCOL_VERSION,
           serverInfo: { name: "seam-mcp", version: "1.0.0" },
           capabilities: { tools: {} },
-          instructions: INSTRUCTIONS,
+          instructions: this.instructionsForToken(token),
         });
       case "notifications/initialized":
       case "initialized":
         return rpcResult(id, {});
       case "tools/list":
-        return rpcResult(id, { tools: TOOLS });
+        return rpcResult(id, { tools: this.toolsForToken(token) });
       case "tools/call":
         return this.callTool(id, msg.params, token);
       default:
@@ -2125,9 +2237,18 @@ export class SeamMcpServer {
 
     const name = typeof params?.name === "string" ? params.name : "";
     const args = (params?.arguments ?? {}) as Record<string, unknown>;
+    if (HOST_TOOL_NAMES.has(name) && !this.hostToolsAvailable(record)) {
+      return rpcError(id, -32602, `unknown tool: ${name}`);
+    }
 
     try {
       switch (name) {
+        case "host_exec":
+          return rpcResult(id, await this.toolHostExec(record, args));
+        case "host_push":
+          return rpcResult(id, await this.toolHostPush(record, args));
+        case "host_pull":
+          return rpcResult(id, await this.toolHostPull(record, args));
         case "handoff":
           return rpcResult(id, await this.toolHandoff(record, args));
         case "forward":
@@ -2220,6 +2341,54 @@ export class SeamMcpServer {
     }
   }
 
+  private async toolHostExec(
+    caller: SessionRecord,
+    args: Record<string, unknown>
+  ): Promise<McpToolResult> {
+    const host = requireString(args, "host");
+    const command = requireString(args, "command");
+    const cwd = optionalString(args, "cwd");
+    const timeoutSec = optionalNumber(args, "timeoutSec");
+    if (timeoutSec !== undefined && (!Number.isFinite(timeoutSec) || timeoutSec < 1 || timeoutSec > 900)) {
+      return textResult("timeoutSec must be between 1 and 900.", true);
+    }
+    const result = await this.deps.hostExec!(caller, { host, command, cwd, timeoutSec });
+    const rendered = JSON.stringify({ host, ...result }, null, 2);
+    if (result.timedOut) {
+      throw new Error(`host "${host}" command timed out after ${timeoutSec ?? 30}s\n${rendered}`);
+    }
+    if (result.exitCode !== 0) {
+      const cause = result.signal
+        ? `terminated by signal ${result.signal}`
+        : `exited with code ${String(result.exitCode)}`;
+      throw new Error(`host "${host}" command ${cause}\n${rendered}`);
+    }
+    return textResult(rendered);
+  }
+
+  private async toolHostPush(
+    caller: SessionRecord,
+    args: Record<string, unknown>
+  ): Promise<McpToolResult> {
+    const result = await this.deps.hostPush!(caller, {
+      host: requireString(args, "host"),
+      from: requireString(args, "from"),
+      to: requireString(args, "to"),
+    });
+    return textResult(JSON.stringify(result, null, 2));
+  }
+
+  private async toolHostPull(
+    caller: SessionRecord,
+    args: Record<string, unknown>
+  ): Promise<McpToolResult> {
+    const result = await this.deps.hostPull!(caller, {
+      host: requireString(args, "host"),
+      from: requireString(args, "from"),
+      to: requireString(args, "to"),
+    });
+    return textResult(JSON.stringify(result, null, 2));
+  }
   // --- staging driver tools ------------------------------------------------
 
   private async toolCanaryRun(args: Record<string, unknown>): Promise<McpToolResult> {
@@ -3693,6 +3862,19 @@ export class SeamMcpServer {
     // we do not refuse here (the lock gate below still never fails open).
     // Admin-who-is-also-participant is NOT restricted (admin wins).
     const speakerIdForTier = this.deps.currentSpeakerId?.(caller);
+    const requestedHostTools =
+      args.channelPreset != null &&
+      typeof args.channelPreset === "object" &&
+      Object.hasOwn(args.channelPreset as object, "hostTools");
+    if (
+      requestedHostTools &&
+      !(speakerIdForTier != null && this.deps.configAdminUserIds?.has(speakerIdForTier))
+    ) {
+      return textResult(
+        "Refused: hostTools is an admin-only channel setting.",
+        true
+      );
+    }
     if (
       speakerIdForTier != null &&
       isRestrictedParticipant(

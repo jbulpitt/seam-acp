@@ -62,6 +62,22 @@ describe("channel-presets hot-reload (#58 P0)", () => {
     expect(live.threadPresets.get("333")?.cwd?.value).toBe(path.resolve("/tmp/new-thread"));
   });
 
+  it("loads hostTools only as a raw channel setting", () => {
+    writePresets(file, {
+      channels: { "111": { hostTools: true } },
+      threads: {},
+    });
+    expect(reloadChannelPresets(live, file, silent).ok).toBe(true);
+    expect(live.channelPresets.get("111")?.hostTools).toBe(true);
+
+    writePresets(file, {
+      channels: {},
+      threads: { "222": { hostTools: true } },
+    });
+    expect(reloadChannelPresets(live, file, silent).ok).toBe(false);
+    expect(live.channelPresets.get("111")?.hostTools).toBe(true);
+  });
+
   it("hot-reloads bridge host config in place (D11 / #86)", () => {
     const bridgeRef = live.bridgePresets;
     writePresets(file, {

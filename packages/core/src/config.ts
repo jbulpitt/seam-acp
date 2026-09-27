@@ -964,6 +964,7 @@ const PresetValuesSchema = z.object({
 
 const ChannelPresetSchema = PresetValuesSchema.extend({
   locked: z.boolean().optional().default(false),
+  hostTools: z.boolean().optional(),
   // Thread-only (#80). Rejected so a mistaken channel-level `detached` cannot
   // silently mute every thread under a school channel.
   detached: z
@@ -1017,6 +1018,11 @@ const ChannelPresetSchema = PresetValuesSchema.extend({
 // is only for agent/model/cwd/effort/rider). Absent / default false = attached.
 // `location` is a raw string (not `{value}`): omit / undefined ⇒ `local` (D10 / #86).
 const ThreadPresetSchema = PresetValuesSchema.extend({
+  hostTools: z
+    .undefined({
+      invalid_type_error: "hostTools is a channel-only setting",
+    })
+    .optional(),
   detached: z.boolean().optional().default(false),
   location: z
     .string()
@@ -1076,7 +1082,7 @@ export type PresetValues = {
   simpleCardGif?: ChannelPresetField<boolean>;
   disableThreadPrefix?: ChannelPresetField<boolean>;
 };
-export type ChannelPreset = PresetValues & { locked: boolean };
+export type ChannelPreset = PresetValues & { locked: boolean; hostTools?: boolean };
 export type ThreadPreset = PresetValues & {
   detached?: boolean;
   location?: string;
@@ -1201,6 +1207,16 @@ export function isChannelLocked(
 ): boolean {
   if (!parentId) return false;
   return config.channelPresets.get(parentId)?.locked ?? false;
+}
+
+/** Whether bridge-backed host tools are exposed in this channel. */
+export function areHostToolsEnabled(
+  config: { channelPresets?: Map<string, ChannelPreset> },
+  parentId: string | undefined
+): boolean {
+  if (!parentId) return false;
+  const presets = config.channelPresets;
+  return presets instanceof Map && presets.get(parentId)?.hostTools === true;
 }
 
 /** Is this thread detached (#80) — allowlisted chat, no bot replies, no

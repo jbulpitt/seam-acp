@@ -73,7 +73,7 @@ function addConfigSetOptions(sub: SlashCommandSubcommandBuilder): SlashCommandSu
  *     upload   (3)  pull push secret
  *     bridge   (6)  add rotate configure list remove restart
  *     schedule (5)  add list remove toggle edit — no attachments (#158)
- *     debug    (6)  tail exec status voice-ping voice-capture voice-live
+ *     debug    (5)  work status voice-ping voice-capture voice-live
  *     voice    (7)  start add remove configure console status stop
  *     naming   (2)  rename namer — lifted out of `config` (#151)
  *
@@ -901,33 +901,8 @@ export function buildSeamAdminCommand(): SlashCommandBuilder {
   cmd.addSubcommandGroup((g) =>
     g
       .setName("debug")
-      .setDescription("Admin-only: tail, exec, status a paired bridge, or live-help voice spike")
+      .setDescription("Admin-only: bridge status, active work, or live-help voice spike")
       .addSubcommand((sub) => sub.setName("work").setDescription("Identify active scheduled work and restart blockers"))
-      .addSubcommand((sub) =>
-        sub
-          .setName("tail")
-          .setDescription("Tail a log file on the bridge host")
-          .addStringOption((o) =>
-            o.setName("bridge").setDescription("Paired bridge id").setRequired(true)
-          )
-          .addStringOption((o) =>
-            o.setName("path").setDescription("Log path under the host workspace root").setRequired(false)
-          )
-          .addIntegerOption((o) =>
-            o.setName("lines").setDescription("Lines to return (default 80)").setRequired(false)
-          )
-      )
-      .addSubcommand((sub) =>
-        sub
-          .setName("exec")
-          .setDescription("Run a command on the bridge host")
-          .addStringOption((o) =>
-            o.setName("bridge").setDescription("Paired bridge id").setRequired(true)
-          )
-          .addStringOption((o) =>
-            o.setName("command").setDescription("Command to run on the bridge host").setRequired(true)
-          )
-      )
       .addSubcommand((sub) =>
         sub
           .setName("status")
@@ -1196,8 +1171,6 @@ export type SeamSubcommand =
   | "rotate"
   | "list"
   | "remove"
-  | "tail"
-  | "exec"
   | "status"
   | "voice-ping"
   | "voice-capture"

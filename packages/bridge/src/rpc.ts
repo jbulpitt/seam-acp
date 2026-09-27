@@ -2,8 +2,7 @@
  * Bridge-side RPC dispatcher. Calls `@seam/adapters` methods; never imports
  * discord.js. RPC methods must be on the bridge allow-list.
  */
-import { execFile, exec } from "node:child_process";
-import { promisify } from "node:util";
+import { spawn } from "node:child_process";
 import { existsSync, promises as fsp } from "node:fs";
 import path from "node:path";
 import type { McpServer } from "@agentclientprotocol/sdk";
@@ -12,7 +11,6 @@ import {
   isAllowedRpcMethod,
   isHostRpcMethod,
   invokeAdapterRpc,
-  isPathWithinRoot,
   ATTACH_MAX_BYTES,
   readProjectMcpServers,
   isModelFallbackPlan,
@@ -21,8 +19,9 @@ import {
   type RemoteRung1Policy,
 } from "@seam/adapters";
 
-const execFileAsync = promisify(execFile);
-const execAsync = promisify(exec);
+const HOST_EXEC_DEFAULT_TIMEOUT_MS = 30_000;
+const HOST_EXEC_MAX_TIMEOUT_MS = 15 * 60_000;
+const HOST_EXEC_OUTPUT_MAX_BYTES = 64 * 1024;
 
 export interface SlotSpawnConfig {
   agentId?: string;
@@ -101,14 +100,6 @@ export function assertTransportableRemoteMcpServers(raw: unknown): McpServer[] {
   });
 }
 
-function assertWithinRoot(target: string, root: string, label: string): string {
-  const resolved = path.resolve(target);
-  if (!isPathWithinRoot(resolved, root)) {
-    throw new Error(`${label} escapes workspace root`);
-  }
-  return resolved;
-}
-
 export async function dispatchBridgeRpc(
   method: string,
   params: unknown,
@@ -131,6 +122,37 @@ async function dispatchAdapter(
   ctx: RpcContext
 ): Promise<unknown> {
   const cwd = str(params.cwd) ?? ctx.cwd;
+
+  if (method === "readAttachment" && params.hostPath === true) {
+    const requested = str(params.path) ?? str(params.filename);
+    if (!requested) throw new Error("path required");
+    const resolved = path.resolve(cwd, requested);
+    const stat = await fsp.stat(resolved);
+    if (!stat.isFile()) throw new Error(`not a regular file: ${requested}`);
+    if (stat.size > ATTACH_MAX_BYTES) {
+      throw new Error(`file exceeds ${ATTACH_MAX_BYTES} byte attach cap (${stat.size} B)`);
+    }
+    const bytes = await fsp.readFile(resolved);
+    return {
+      bytesBase64: bytes.toString("base64"),
+      filename: path.basename(resolved),
+      size: bytes.byteLength,
+    };
+  }
+
+  if (method === "writeAttachment" && params.hostPath === true) {
+    const requested = str(params.path);
+    const base64 = str(params.bytesBase64) ?? str(params.base64);
+    if (!requested || base64 === undefined) throw new Error("path and bytesBase64 required");
+    const bytes = Buffer.from(base64, "base64");
+    if (bytes.byteLength > ATTACH_MAX_BYTES) {
+      throw new Error(`file exceeds ${ATTACH_MAX_BYTES} byte attach cap (${bytes.byteLength} B)`);
+    }
+    const resolved = path.resolve(cwd, requested);
+    await fsp.mkdir(path.dirname(resolved), { recursive: true });
+    await fsp.writeFile(resolved, bytes);
+    return { path: resolved, size: bytes.byteLength };
+  }
 
   if (method === "spawn") {
     const slot = params.slot;
@@ -209,55 +231,110 @@ async function dispatchHost(
   params: Record<string, unknown>,
   ctx: RpcContext
 ): Promise<unknown> {
-  const root = ctx.workspaceRoot;
-
   switch (method) {
-    case "exec": {
-      const file = str(params.file) ?? str(params.command);
-      if (!file) throw new Error("exec requires file");
-      const args = Array.isArray(params.args) ? params.args.map(String) : [];
-      const cwd = str(params.cwd) ? assertWithinRoot(str(params.cwd)!, root, "cwd") : ctx.cwd;
-      const { stdout, stderr } = await execFileAsync(file, args, {
-        cwd,
-        timeout: 30_000,
-        maxBuffer: 2 * 1024 * 1024,
-      });
-      return { stdout, stderr };
-    }
     case "shell": {
       const command = str(params.command);
       if (!command) throw new Error("shell requires command");
-      const cwd = str(params.cwd) ? assertWithinRoot(str(params.cwd)!, root, "cwd") : ctx.cwd;
-      const { stdout, stderr } = await execAsync(command, {
-        cwd,
-        timeout: 30_000,
-        maxBuffer: 2 * 1024 * 1024,
-      });
-      return { stdout, stderr };
-    }
-    case "tailLog": {
-      const p = str(params.path);
-      if (!p) throw new Error("tailLog requires path");
-      const abs = assertWithinRoot(path.isAbsolute(p) ? p : path.join(root, p), root, "path");
-      const lines = typeof params.lines === "number" ? Math.min(Math.max(params.lines, 1), 500) : 80;
-      const buf = await fsp.readFile(abs);
-      if (buf.byteLength > ATTACH_MAX_BYTES) {
-        throw new Error("log file exceeds attach cap");
+      const timeoutSec = typeof params.timeoutSec === "number" ? params.timeoutSec : undefined;
+      const timeoutMs = timeoutSec === undefined
+        ? HOST_EXEC_DEFAULT_TIMEOUT_MS
+        : Math.round(timeoutSec * 1000);
+      if (!Number.isFinite(timeoutMs) || timeoutMs < 1_000 || timeoutMs > HOST_EXEC_MAX_TIMEOUT_MS) {
+        throw new Error("timeoutSec must be between 1 and 900");
       }
-      const text = buf.toString("utf8");
-      const all = text.split(/\r?\n/);
-      return { text: all.slice(-lines).join("\n"), lines: Math.min(lines, all.length) };
-    }
-    case "writeFile": {
-      const p = str(params.path);
-      const content = str(params.content);
-      if (!p || content === undefined) throw new Error("writeFile requires path and content");
-      const abs = assertWithinRoot(path.isAbsolute(p) ? p : path.join(root, p), root, "path");
-      await fsp.mkdir(path.dirname(abs), { recursive: true });
-      await fsp.writeFile(abs, content, "utf8");
-      return { path: abs, bytes: Buffer.byteLength(content) };
+      return runHostCommand(command, str(params.cwd) ?? ctx.cwd, timeoutMs);
     }
     default:
       throw new Error(`unknown rpc method: ${method}`);
   }
+}
+
+type HostCommandResult = {
+  stdout: string;
+  stderr: string;
+  exitCode: number | null;
+  signal: NodeJS.Signals | null;
+  timedOut: boolean;
+  stdoutTruncated: boolean;
+  stderrTruncated: boolean;
+};
+
+function appendBounded(
+  chunks: Buffer[],
+  currentBytes: number,
+  value: Buffer
+): { bytes: number; truncated: boolean } {
+  const remaining = HOST_EXEC_OUTPUT_MAX_BYTES - currentBytes;
+  if (remaining <= 0) return { bytes: currentBytes, truncated: value.byteLength > 0 };
+  chunks.push(value.subarray(0, remaining));
+  return {
+    bytes: currentBytes + Math.min(value.byteLength, remaining),
+    truncated: value.byteLength > remaining,
+  };
+}
+
+export function runHostCommand(
+  command: string,
+  cwd: string,
+  timeoutMs: number
+): Promise<HostCommandResult> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, {
+      cwd,
+      shell: true,
+      stdio: ["ignore", "pipe", "pipe"],
+      detached: process.platform !== "win32",
+    });
+    const stdout: Buffer[] = [];
+    const stderr: Buffer[] = [];
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    let stdoutTruncated = false;
+    let stderrTruncated = false;
+    let timedOut = false;
+
+    child.stdout.on("data", (chunk: Buffer) => {
+      const appended = appendBounded(stdout, stdoutBytes, chunk);
+      stdoutBytes = appended.bytes;
+      stdoutTruncated ||= appended.truncated;
+    });
+    child.stderr.on("data", (chunk: Buffer) => {
+      const appended = appendBounded(stderr, stderrBytes, chunk);
+      stderrBytes = appended.bytes;
+      stderrTruncated ||= appended.truncated;
+    });
+    child.once("error", reject);
+
+    const stop = (signal: NodeJS.Signals) => {
+      if (!child.pid) return;
+      try {
+        if (process.platform === "win32") child.kill(signal);
+        else process.kill(-child.pid, signal);
+      } catch {
+        child.kill(signal);
+      }
+    };
+    let killTimer: NodeJS.Timeout | undefined;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      stop("SIGTERM");
+      killTimer = setTimeout(() => stop("SIGKILL"), 1_000);
+      killTimer.unref();
+    }, timeoutMs);
+    timer.unref();
+
+    child.once("close", (exitCode, signal) => {
+      clearTimeout(timer);
+      if (killTimer) clearTimeout(killTimer);
+      resolve({
+        stdout: Buffer.concat(stdout).toString("utf8"),
+        stderr: Buffer.concat(stderr).toString("utf8"),
+        exitCode,
+        signal,
+        timedOut,
+        stdoutTruncated,
+        stderrTruncated,
+      });
+    });
+  });
 }

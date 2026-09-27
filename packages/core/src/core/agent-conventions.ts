@@ -108,6 +108,8 @@ export interface HarnessOpts {
   /** Session actually has seam-mcp attached (injected mcpServers includes it). */
   seamMcp?: boolean;
   /** This turn's output path runs emitClosedFence (live yes, dispatch no). */
+  /** Bridge-backed host tools are present for this channel. */
+  hostTools?: boolean;
   seamFences?: boolean;
   /** Current wall-clock in the user's local zone, pre-formatted by the caller
    *  (e.g. "Aug 28, 2026, 8:47 AM CDT"). Emitted as a per-turn fact so the
@@ -163,6 +165,11 @@ export function harnessPreamble(
   // preamble flag and actual MCP attachment are on.
   if (opts?.inboxAwareness && opts?.seamMcp) {
     lines.push(`• ${INBOX_AWARENESS_RULE}`);
+  }
+  if (opts?.seamMcp && opts.hostTools) {
+    lines.push(
+      "• This channel enables paired-host administration: use `host_exec`, `host_push`, and `host_pull`.",
+    );
   }
   lines.push(...extraRules.map((rule) => `• ${rule}`));
   // Speaker is a fact about THIS turn, not a standing convention (D3): its own

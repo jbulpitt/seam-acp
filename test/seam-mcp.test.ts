@@ -195,6 +195,10 @@ async function makeHarness(opts?: {
   configParticipantUserIds?: ReadonlySet<string>;
   currentSpeakerId?: (record: SessionRecord) => string | undefined;
   proposeConfig?: (record: SessionRecord, input: unknown) => Promise<any>;
+  hostToolsEnabled?: SeamMcpServerDeps["hostToolsEnabled"];
+  hostExec?: SeamMcpServerDeps["hostExec"];
+  hostPush?: SeamMcpServerDeps["hostPush"];
+  hostPull?: SeamMcpServerDeps["hostPull"];
   pushInbox?: SeamMcpServerDeps["pushInbox"];
   drainInbox?: SeamMcpServerDeps["drainInbox"];
   interruptRedirect?: SeamMcpServerDeps["interruptRedirect"];
@@ -295,6 +299,10 @@ async function makeHarness(opts?: {
       : {}),
     ...(opts?.currentSpeakerId ? { currentSpeakerId: opts.currentSpeakerId } : {}),
     ...(opts?.proposeConfig ? { proposeConfig: opts.proposeConfig } : {}),
+    ...(opts?.hostToolsEnabled ? { hostToolsEnabled: opts.hostToolsEnabled } : {}),
+    ...(opts?.hostExec ? { hostExec: opts.hostExec } : {}),
+    ...(opts?.hostPush ? { hostPush: opts.hostPush } : {}),
+    ...(opts?.hostPull ? { hostPull: opts.hostPull } : {}),
     // The compact tool only ENQUEUES; its dep is a presence gate. Provide a stub
     // by default so the tool is enabled, and omit it when disableCompact is set.
     ...(opts?.disableCompact
@@ -464,6 +472,9 @@ describe("SeamMcpServer", () => {
     expect(configPropose.inputSchema.properties.channelPreset.properties.role).toMatchObject({
       type: "string",
     });
+    expect(configPropose.inputSchema.properties.channelPreset.properties.hostTools).toMatchObject({
+      type: "boolean",
+    });
     expect(configPropose.inputSchema.properties.preset.properties.disableThreadPrefix).toMatchObject({
       type: "boolean",
     });
@@ -479,6 +490,148 @@ describe("SeamMcpServer", () => {
     });
     expect(configureThread.inputSchema.properties.rebuild.description).toMatch(/deterministically rebuild/i);
     expect(configureThread.description).toMatch(/durable Rebuild card.*target thread/i);
+  });
+
+  it("allows only the stamped config admin to propose hostTools changes", async () => {
+    const proposed = vi.fn(async () => ({ ok: true, proposalId: "p1" }));
+    h = await makeHarness({
+      configAdminUserIds: new Set(["admin"]),
+      currentSpeakerId: () => "operator",
+      proposeConfig: proposed,
+    });
+    const refused = await h.call("tools/call", {
+      name: "config_propose",
+      arguments: { channelPreset: { hostTools: true } },
+    }, { "x-seam-session": "good-token" });
+    expect(refused.body.result.isError).toBe(true);
+    expect(refused.body.result.content[0].text).toContain("admin-only");
+    expect(proposed).not.toHaveBeenCalled();
+    await h.server.stop();
+
+    h = await makeHarness({
+      configAdminUserIds: new Set(["admin"]),
+      currentSpeakerId: () => "admin",
+      proposeConfig: proposed,
+    });
+    const allowed = await h.call("tools/call", {
+      name: "config_propose",
+      arguments: { channelPreset: { hostTools: true } },
+    }, { "x-seam-session": "good-token" });
+    expect(allowed.body.result.isError).not.toBe(true);
+    expect(proposed).toHaveBeenCalledWith(
+      expect.anything(),
+      { channelPreset: { hostTools: true } }
+    );
+  });
+
+  it("offers host tools and instructions only for an enabled calling channel", async () => {
+    const common = {
+      hostExec: vi.fn(async () => ({
+        stdout: "", stderr: "", exitCode: 0, signal: null, timedOut: false,
+        stdoutTruncated: false, stderrTruncated: false,
+      })),
+      hostPush: vi.fn(async () => ({
+        sourceHost: "local", targetHost: "remote", bytes: 1, path: "/tmp/to",
+      })),
+      hostPull: vi.fn(async () => ({
+        sourceHost: "remote", targetHost: "local", bytes: 1, path: "/tmp/to",
+      })),
+    };
+    h = await makeHarness({ hostToolsEnabled: () => false, ...common });
+    const disabled = await h.call("tools/list", undefined, { "x-seam-session": "good-token" });
+    expect(disabled.body.result.tools.map((tool: { name: string }) => tool.name)).not.toContain("host_exec");
+    await h.server.stop();
+
+    h = await makeHarness({ hostToolsEnabled: () => true, ...common });
+    const enabled = await h.call("tools/list", undefined, { "x-seam-session": "good-token" });
+    expect(enabled.body.result.tools.map((tool: { name: string }) => tool.name)).toEqual(
+      expect.arrayContaining(["host_exec", "host_push", "host_pull"])
+    );
+    const initialized = await h.call(
+      "initialize",
+      { protocolVersion: "2025-06-18" },
+      { "x-seam-session": "good-token" }
+    );
+    expect(initialized.body.result.instructions).toContain("host_exec(host");
+  });
+
+  it("refuses a direct host tool call when the channel setting is off", async () => {
+    h = await makeHarness({
+      hostToolsEnabled: () => false,
+      hostExec: vi.fn(),
+      hostPush: vi.fn(),
+      hostPull: vi.fn(),
+    });
+    const { body } = await h.call(
+      "tools/call",
+      { name: "host_exec", arguments: { host: "local", command: "true" } },
+      { "x-seam-session": "good-token" }
+    );
+    expect(body.error.message).toBe("unknown tool: host_exec");
+  });
+
+  it("returns host_exec output and preserves a non-zero exit cause", async () => {
+    const hostExec = vi.fn(async () => ({
+      stdout: "",
+      stderr: "package check failed",
+      exitCode: 9,
+      signal: null,
+      timedOut: false,
+      stdoutTruncated: false,
+      stderrTruncated: false,
+    }));
+    h = await makeHarness({
+      hostToolsEnabled: () => true,
+      hostExec,
+      hostPush: vi.fn(),
+      hostPull: vi.fn(),
+    });
+    const { body } = await h.call(
+      "tools/call",
+      {
+        name: "host_exec",
+        arguments: { host: "remote", command: "check-package", cwd: "/opt", timeoutSec: 600 },
+      },
+      { "x-seam-session": "good-token" }
+    );
+    expect(hostExec).toHaveBeenCalledWith(expect.anything(), {
+      host: "remote", command: "check-package", cwd: "/opt", timeoutSec: 600,
+    });
+    expect(body.result.isError).toBe(true);
+    expect(body.result.content[0].text).toContain('exited with code 9');
+    expect(body.result.content[0].text).toContain("package check failed");
+  });
+
+  it("routes host_push and host_pull through their bridge callbacks", async () => {
+    const hostPush = vi.fn(async () => ({
+      sourceHost: "local", targetHost: "remote", bytes: 8, path: "/remote/to.bin",
+    }));
+    const hostPull = vi.fn(async () => ({
+      sourceHost: "remote", targetHost: "local", bytes: 8, path: "/local/back.bin",
+    }));
+    h = await makeHarness({
+      hostToolsEnabled: () => true,
+      hostExec: vi.fn(),
+      hostPush,
+      hostPull,
+    });
+    const headers = { "x-seam-session": "good-token" };
+    const pushed = await h.call("tools/call", {
+      name: "host_push",
+      arguments: { host: "remote", from: "/local/from.bin", to: "/remote/to.bin" },
+    }, headers);
+    const pulled = await h.call("tools/call", {
+      name: "host_pull",
+      arguments: { host: "remote", from: "/remote/to.bin", to: "/local/back.bin" },
+    }, headers);
+    expect(hostPush).toHaveBeenCalledWith(expect.anything(), {
+      host: "remote", from: "/local/from.bin", to: "/remote/to.bin",
+    });
+    expect(hostPull).toHaveBeenCalledWith(expect.anything(), {
+      host: "remote", from: "/remote/to.bin", to: "/local/back.bin",
+    });
+    expect(pushed.body.result.content[0].text).toContain('"bytes": 8');
+    expect(pulled.body.result.content[0].text).toContain('"bytes": 8');
   });
 
   it("configure_thread permits a sibling in the caller's channel and passes flat changes", async () => {

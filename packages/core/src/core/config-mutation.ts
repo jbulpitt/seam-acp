@@ -140,6 +140,8 @@ export interface ChannelPresetChanges {
   statusCardStyle?: StatusCardStyle | null;
   /** Channel-wide simple-card GIF. Inherited live; session/thread overlay still wins. */
   simpleCardGif?: boolean | null;
+  /** Admin-only gate for bridge-backed host tools in this channel. */
+  hostTools?: boolean | null;
 }
 
 /** Tier C — the calling thread's OWN thread preset (channel-presets.json
@@ -1745,6 +1747,15 @@ export class ConfigMutationService {
     ];
     const fields: ProposedField[] = [];
     const next: Record<string, unknown> = { ...current };
+    if (effectiveChanges.hostTools !== undefined) {
+      const before = current.hostTools === true;
+      const after = effectiveChanges.hostTools === true;
+      if (before !== after) {
+        if (after) next.hostTools = true;
+        else delete next.hostTools;
+        fields.push({ label: "hostTools", before: String(before), after: String(after) });
+      }
+    }
     for (const key of keys) {
       const val = effectiveChanges[key];
       if (val === undefined) continue; // field not part of this proposal

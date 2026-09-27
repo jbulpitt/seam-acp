@@ -212,9 +212,13 @@ All commands are restricted to users listed in `DISCORD_ALLOWED_USER_IDS` and (w
 | `/seamadmin project` | DB-backed channel activation (`new` `list` `remove`), no redeploy |
 | `/seamadmin upload` | Host file transfer (`pull` `push` `secret`) |
 | `/seamadmin bridge` | Pair remote bridges (`add` `rotate` `list` `remove`) |
-| `/seamadmin debug` | Host debug (`tail` `exec` `status`) and the live-help voice spike |
+| `/seamadmin debug` | Bridge status, active work, and the live-help voice spike |
 | `/seamadmin voice` | Shared Voice Console V2 (`start` `add` `remove` `configure` `console` `status` `stop`) |
 | `/seamadmin catalog refresh <agent@location\|all>` | Force an operational catalog refresh and report generation, diff, scope, provenance, and retained/quarantined failures. |
+
+Channels with the admin-only `hostTools` channel setting expose `host_exec`,
+`host_push`, and `host_pull` to their agents. Other channels do not receive
+those tools or their harness instructions.
 
 Session history recovery (four distinct operations):
 

@@ -512,7 +512,7 @@ describe("/seamadmin — operator surface (#151)", () => {
     }
   });
 
-  it("exposes localized queue recovery and explicit restart modes (#180)", () => {
+  it("exposes localized queue recovery and a prompt controller restart", () => {
     const recover = slot(admin(), "recover");
     expect(recover?.type).toBe(SUB_COMMAND);
     expect(recover?.options?.map((o) => o.name)).toEqual(["thread", "mode"]);
@@ -523,12 +523,7 @@ describe("/seamadmin — operator surface (#151)", () => {
     ]);
 
     const restart = slot(admin(), "bridge")?.options?.find((o) => o.name === "restart");
-    expect(restart?.options?.map((o) => o.name)).toEqual(["mode", "confirm"]);
-    expect(restart?.options?.[0]?.choices?.map((choice) => choice.value)).toEqual([
-      "drain",
-      "force",
-    ]);
-    expect(restart?.options?.[1]?.type).toBe(BOOLEAN);
+    expect(restart?.options ?? []).toEqual([]);
   });
 });
 

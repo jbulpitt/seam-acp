@@ -294,10 +294,10 @@ describe("renderServerStatusPanel", () => {
     expect(bridgeHasRelease(memory["remote-c"], "a".repeat(40))).toBe("unknown");
   });
 
-  it("marks a draining restart", () => {
+  it("marks a pending restart", () => {
     const panel = renderServerStatusPanel(snap({ restartPending: true }));
     expect(panel.color).toBe(0xfaa61a);
-    expect(panel.title).toContain("draining");
+    expect(panel.title).toContain("restarting");
   });
 });
 

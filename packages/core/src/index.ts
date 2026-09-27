@@ -19,7 +19,7 @@ import {
 } from "./core/canary.js";
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
-import { writeForceRestartSentinel } from "./core/restart-sentinel.js";
+import { writeRestartSentinel } from "./core/restart-sentinel.js";
 import { loadConfig, buildChannelPresetMaps, isChannelLocked, resolveThreadLocation, resolveThreadTtsVoice, resolveThreadTtsPace, resolveThreadTtsStyle, adminParticipantOverlapIds, GROK_STATIC_MODELS, ZAI_STATIC_MODELS, OLLAMA_CLOUD_STATIC_MODELS } from "./config.js";
 import { enrichModelListWithKnownLimits } from "./core/context-window.js";
 import {
@@ -809,7 +809,7 @@ async function main(): Promise<void> {
         return () => {
           if (unit) restartUnit(unit);
           if (action === "controller" || action === "controller_bridge") {
-            writeForceRestartSentinel(config.DATA_DIR);
+            writeRestartSentinel(config.DATA_DIR);
           }
         };
       },
@@ -1840,10 +1840,8 @@ async function main(): Promise<void> {
     // draining. All three gates shut before the first await, so there is no
     // such window.
     //
-    // `closeAdmission()`, not `stopIntake()`: this is the only place that is
-    // allowed to refuse the Discord transport, because it is the only place
-    // where the store really is about to close. The restart-sentinel drain uses
-    // `stopIntake()` and keeps the control surface (`/seam cancel`) reachable.
+    // `closeAdmission()`, not `stopIntake()`: this is where the store is
+    // about to close, so no new Discord handler may cross the boundary.
     seamMcpServer?.closeAdmission();
     health.closeIngress();
     orchestrator.closeAdmission();

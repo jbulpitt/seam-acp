@@ -894,23 +894,7 @@ export function buildSeamAdminCommand(): SlashCommandBuilder {
       .addSubcommand((sub) =>
         sub
           .setName("restart")
-          .setDescription("Stage a safe bot restart (drain, or explicitly confirmed force)")
-          .addStringOption((o) =>
-            o
-              .setName("mode")
-              .setDescription("Restart mode")
-              .setRequired(true)
-              .addChoices(
-                { name: "drain", value: "drain" },
-                { name: "force", value: "force" }
-              )
-          )
-          .addBooleanOption((o) =>
-            o
-              .setName("confirm")
-              .setDescription("Required true for force mode")
-              .setRequired(false)
-          )
+          .setDescription("Stage a controller restart")
       )
   );
 

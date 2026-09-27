@@ -72,7 +72,8 @@ That exercises the real Discord path before a change is merged.
   and posts one result card.
 - **`canary_run({ target: "staging", durability: true })`:** runs four Codex
   turns sequentially, interrupting them with controller, bridge, combined and
-  sessiond restarts. The CLI equivalent is
+  sessiond restarts. The controller check writes the same empty sentinel as
+  plain `npm run redeploy`. The CLI equivalent is
   `npm run canary -- --target staging --durability`.
 - **`canary_run({ target: "self" })`:** asks the current controller for every
   connected bridge's agent inventory, then runs the ready host+agent pairs in

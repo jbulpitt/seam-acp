@@ -237,8 +237,8 @@ function headline(snap: ServerStatusSnapshot): { warn: boolean; title: string } 
   const icon = snap.restartPending ? "♻️" : warn ? "🟡" : "🟢";
   const bridgeTitle =
     paired === 0 ? "" : ` · ${up}/${paired} bridge${paired === 1 ? "" : "s"}`;
-  const drain = snap.restartPending ? " · draining" : "";
-  return { warn, title: `${icon} Seam${bridgeTitle}${drain}` };
+  const restart = snap.restartPending ? " · restarting" : "";
+  return { warn, title: `${icon} Seam${bridgeTitle}${restart}` };
 }
 
 function metricsLines(snap: ServerStatusSnapshot): string[] {

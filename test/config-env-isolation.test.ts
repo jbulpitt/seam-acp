@@ -38,7 +38,7 @@ describe("#495 actual config tests under real dotenv files", () => {
         .filter((test: any) => test.status === "failed").map((test: any) => test.fullName));
       expect({ exit: result, failures }).toEqual({ exit: 0, failures: [] });
       expect(summary.numPassedTests).toBeGreaterThan(100);
-      expect(summary.testResults).toHaveLength(12);
+      expect(summary.testResults).toHaveLength(11);
       expect(summary.numFailedTestSuites).toBe(0);
       console.info(`#495 ${mode} dotenv: ${summary.numPassedTests} tests passed across ${summary.testResults.length} files`);
     } finally {

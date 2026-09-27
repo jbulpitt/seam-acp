@@ -113,9 +113,7 @@ import type { InboxMessage } from "../../core/inbox/types.js";
 import {
   restartSeamAcpProcess,
   restartSentinelPath,
-  sentinelIsForce,
   stageRestartSentinel,
-  waitForRestartDrain,
 } from "../../core/restart-sentinel.js";
 import {
   raceUntilSilence,
@@ -1050,10 +1048,8 @@ export class Orchestrator {
    * than `intakeStopped` and deliberately separate — see `closeAdmission()`.
    */
   private gatewayClosed = false;
-  /**
-   * #174: post-turn continuations that run after `activeTurns--` and are
-   * therefore invisible to the restart drain. `quiesce()` awaits these.
-   */
+  /** Post-turn continuations run after the turn token is released.
+   * `quiesce()` awaits them before controller-owned resources close. */
   private readonly pendingContinuations = new Set<Promise<void>>();
   private readonly channelQueues = new Map<string, Promise<void>>();
   private readonly channelGenerations = new Map<string, number>();
@@ -2124,12 +2120,12 @@ export class Orchestrator {
     };
   }
 
-  /** In-flight turns (user + scheduled + dispatch) counted for restart drain. */
+  /** In-flight turns (user + scheduled + dispatch). */
   activeTurnCount(): number {
     return this.activeTurns;
   }
 
-  /** Counts logical occurrences, not the live schedule's nested drain tokens. */
+  /** Counts logical occurrences, not the live schedule's nested turn tokens. */
   activeScheduledOccurrenceCount(): number { return this.scheduledActivity?.snapshot().length ?? 0; }
 
   /** Token-resolved scope only. Require both frozen and current channel
@@ -2144,27 +2140,6 @@ export class Orchestrator {
         ? work.parentRef === caller.parentRef && current.parentRef === caller.parentRef
         : work.channelRef === caller.channelRef;
     }) };
-  }
-
-  /**
-   * What the restart-sentinel drain waits on: turns PLUS admitted gateway
-   * handlers.
-   *
-   * `activeTurns` alone is a turn's-eye view, and a message becomes a turn only
-   * once its channel FIFO reaches it. Everything before that — the pre-queue
-   * body (which writes the store: parked clear, turn markers, abort) and the
-   * wait for its place in line — counts as zero. So a message admitted while
-   * the channel is idle can leave the drain sampling 0, skipping the wait
-   * entirely, and start a full agent turn on the far side of it.
-   *
-   * `inboundWork` spans exactly that window: `handleIncomingMessage` is entered
-   * through `runInbound` and awaits its own queue link, so one entry covers
-   * admission through the last `endTurn()`. Counting both makes an admitted
-   * message extend the drain the same way a due cron fire does. The drain is
-   * still bounded by `RESTART_DRAIN_TIMEOUT_MS`, which force-restarts.
-   */
-  private get outstandingRestartWork(): number {
-    return this.activeTurns + this.inboundWork.size;
   }
 
   /** True when this thread has admitted work, including a tail whose runtime
@@ -2422,14 +2397,6 @@ export class Orchestrator {
     return restartSentinelPath(this.config.DATA_DIR);
   }
 
-  private readSentinelForce(): boolean {
-    try {
-      return sentinelIsForce(fs.readFileSync(this.sentinelPath(), "utf8"));
-    } catch {
-      return false;
-    }
-  }
-
   private queueSweepTimer: ReturnType<typeof setInterval> | null = null;
 
   /**
@@ -2556,101 +2523,17 @@ export class Orchestrator {
 
   private async handleRestartSentinel(): Promise<void> {
     this.restartPending = true;
-    const force = this.readSentinelForce();
-    let forceShutdown = force;
-    const drainTimeoutMs = this.config.RESTART_DRAIN_TIMEOUT_MS ?? 900_000;
-    // Keep cron timers running through the drain. Stopping them here is what
-    // made `report-update` miss 5:25 while a restart sat pending for hours —
-    // list still showed the stale next_run, and catch-up could then skip it.
-    // Isolated scheduled fires increment activeTurns, so they extend the drain
-    // instead of being SIGTERM'd. Stop only in the last beat before restart.
-    // `force` (relocate-repo) skips the drain so live ACP processes take
-    // SIGTERM; turn-resume continues them after boot.
-
-    // #174: close the WORK intake door BEFORE sampling activeTurns. Previously
-    // the dispatch watcher kept claiming specs throughout the drain and the 2s
-    // flush wait, so the counter could reach zero while fresh work was already
-    // being admitted behind it. Unclaimed specs stay in `pending/` and are
-    // delivered on the next boot, so this loses nothing.
-    //
-    // NOT `closeAdmission()`. The wait below can last `RESTART_DRAIN_TIMEOUT_MS`
-    // (15 min) with the store and the gateway fully alive, and refusing Discord
-    // ingress for that whole window would take `/seam cancel` away — the one
-    // lever that ends the wedged turn this drain is waiting on.
-    this.stopIntake();
-
-    if (force) {
-      void this.postNotification(
-        "♻️ Force restart — interrupting live turns; they will resume."
-      );
-      this.logger.info({ activeTurns: this.activeTurns }, "force restart sentinel; skipping drain");
-    } else if (this.outstandingRestartWork > 0) {
-      const outstanding = this.outstandingRestartWork;
-      const word = outstanding === 1 ? "item" : "items";
-      void this.postNotification(
-        `♻️ Restart requested — waiting for ${outstanding} in-flight ${word} to finish.`
-      );
-      this.logger.info(
-        { activeTurns: this.activeTurns, inboundWork: this.inboundWork.size,
-          scheduledOccurrences: this.activeScheduledOccurrenceCount(),
-          scheduledBlockers: this.scheduledActivity?.snapshot().slice(0, 20).map(({ occurrenceId, scheduleId, channelRef, mode, phase, elapsedMs }) =>
-            ({ occurrenceId, scheduleId, channelRef, mode, phase, elapsedMs })) ?? [] },
-        "restart pending, draining turns and admitted handlers"
-      );
-
-      const drain = await waitForRestartDrain(
-        () => this.outstandingRestartWork,
-        drainTimeoutMs
-      );
-      if (!drain.drained) {
-        forceShutdown = true;
-        void this.postNotification(
-          `♻️ Restart drain timed out with ${drain.activeTurns} in-flight item(s) — ` +
-            "interrupting them now; they will resume."
-        );
-        this.logger.warn(
-          {
-            outstanding: drain.activeTurns,
-            activeTurns: this.activeTurns,
-            inboundWork: this.inboundWork.size,
-            scheduledOccurrences: this.activeScheduledOccurrenceCount(),
-            scheduledBlockers: this.scheduledActivity?.snapshot().slice(0, 20).map(({ occurrenceId, scheduleId, channelRef, mode, phase, elapsedMs }) =>
-              ({ occurrenceId, scheduleId, channelRef, mode, phase, elapsedMs })) ?? [],
-            timeoutMs: drainTimeoutMs,
-          },
-          "restart drain timed out; continuing through force restart path"
-        );
-      }
-    }
-
-    if (!forceShutdown) {
-      // Give agents 2 seconds to flush their SQLite DBs and transcripts after the
-      // final JSON-RPC prompt() response is returned. Without this, the instant
-      // SIGTERM during shutdown can interrupt the final background DB commit.
-      this.logger.info("turns drained; waiting 2s for background I/O to flush");
-      await new Promise((resolve) => setTimeout(resolve, 2000));
-    }
-
-    this.logger.info(
-      forceShutdown
-        ? "force restart, terminating managed process"
-        : "all turns drained, executing restart"
-    );
-    // Dispatch/user/parked admission closed before the drain sample above.
-    // The SCHEDULED manager is stopped only here, in the last beat before pm2
-    // restart, preserving the deliberate "keep cron timers running through the
-    // drain" behaviour a due fire depends on.
     this.stopIntake();
     this.scheduledManager?.stop();
+    this.logger.info(
+      { activeTurns: this.activeTurns, inboundWork: this.inboundWork.size },
+      "restart pending; signaling managed process"
+    );
     try {
       await fsp.unlink(this.sentinelPath());
     } catch {
-      // ignore if already gone
+      // Ignore if already gone.
     }
-
-    // Graceful, explicit force, and drain-timeout all converge on this exact
-    // managed-process path. SIGTERM enters the bounded shutdown sequence; #76
-    // turn-resume owns continuation after the supervisor starts us again.
     await this.restartProcess();
   }
 
@@ -2828,33 +2711,9 @@ export class Orchestrator {
    * (The converse still holds — a user message arriving mid-dispatch aborts the
    * dispatch, because the user is the priority interrupt.)
    *
-   * #174 admission is stated here because this is the only place a channel turn
-   * is counted. The gate itself lives at the CALLERS, because they do not all
-   * want the same answer:
-   *
-   *   intake   `tryFireParked`, `startPresetOpeningTurn`, `cmdSteer now:true`
-   *            — they open an interactive NEW turn without going through
-   *            `handleIncomingMessage`, so they check `intakeStopped` and are
-   *            already closed for the whole restart drain.
-   *   intake   dispatch (`dispatchInjectTurn`) — upstream, by watcher intake:
-   *            unclaimed specs stay in `pending/` for the next boot.
-   *   OPEN     `runScheduledPrompt` — deliberate. A cron fire coming due mid
-   *            -drain must be able to start and EXTEND the drain; stopping
-   *            cron early is what made `report-update` miss 5:25.
-   *   OPEN     `refireLiveTurn` — boot-time resume, never runs during shutdown.
-   *
-   * Every Discord ingress — `handleIncomingMessage`, `handleSlashInteraction`,
-   * `handleAutocompleteInteraction`, the `onComponent` and `onChoiceInteraction`
-   * wrappers, thread-delete — is gated on the STRICTER `admissionClosed`, which
-   * only SIGTERM sets. An earlier revision of this comment argued they were safe
-   * because `adapter.stop()` runs before `store.close()`. That was wrong:
-   * `adapter.stop()` closes the gateway but does NOT await handlers already in
-   * flight, and none of that work is tracked by any drain — so a handler
-   * admitted after the snapshot can still be mid-await when the store closes.
-   *
-   * They are NOT gated on `intakeStopped`, because that door is also open for
-   * the restart drain's fifteen minutes, with the store fully alive; refusing
-   * `/seam cancel` there takes away the only lever that ends a wedged turn.
+   * New programmatic work checks `intakeStopped` at its caller or watcher.
+   * Discord ingress checks `admissionClosed` before it can touch the store;
+   * admitted handlers are tracked separately until they settle.
    */
   private queueOnChannel<T>(
     channelId: string,
@@ -2883,7 +2742,7 @@ export class Orchestrator {
         activeMeta.lastProgressAtMs = Date.now();
         activeMeta.runtimeIdleSinceMs = undefined;
       }
-      // Counted for the restart drain, and awaited by the shutdown barrier.
+      // Tracked by the bounded shutdown barrier.
       const endTurn = this.beginTurn();
       // #570: from here the turn is executing. Released in the finally below,
       // on every path including the watchdog and a fence thrown after the turn.
@@ -3233,10 +3092,8 @@ export class Orchestrator {
    * fire hook alongside `onBridgeReady`.
    */
   private releaseChannelQueue(channelId: string, link: Promise<void>): void {
-    // #174: this continuation runs strictly AFTER `activeTurns--`, so the
-    // restart drain structurally cannot see it — that is how a post-turn
-    // settlement ended up touching a closed store on an otherwise clean
-    // drain. Track it so `quiesce()` has something to await.
+    // This runs after the turn token is released, so track it separately
+    // for the bounded shutdown quiesce.
     const settled = link.then(async () => {
       if (this.channelQueues.get(channelId) !== link) return;
       this.channelQueues.delete(channelId);
@@ -3331,39 +3188,20 @@ export class Orchestrator {
         this.inboundWork.delete(tracked);
       });
     this.inboundWork.add(tracked);
-    // Wait on the SWALLOWED copy so the drain bookkeeping always completes,
-    // then hand back the original — settled by now, so this re-raises the
-    // failure to the adapter boundary instead of reporting a clean run.
+    // Wait on the swallowed copy so shutdown bookkeeping always completes,
+    // then return the original result or failure to the adapter boundary.
     await tracked;
     return running;
   }
 
   /**
-   * Close the WORK intake door: no new dispatch is claimed, no parked prompt
-   * fires, no preset opening turn or preemptive steer starts. Anything still in
-   * `dispatch/pending/` stays there and is delivered on the next boot, so
-   * stopping intake early is lossless.
-   *
-   * #174: this must run BEFORE the restart drain samples `activeTurns`, or the
-   * watcher keeps claiming specs into the very window the drain is trying to
-   * empty — observed on 2026-09-02, where a fresh dispatch started during the
-   * post-drain flush wait and was still running when the store closed.
-   *
-   * Deliberately does NOT touch the Discord transport. The restart drain holds
-   * this door shut for up to `RESTART_DRAIN_TIMEOUT_MS` while the store and the
-   * gateway are fully alive, and the bot has to stay answerable during it —
-   * `closeAdmission()` is the shutdown-only lever that refuses ingress.
+   * Stop new dispatches, parked prompts, preset openers, and preemptive steers.
+   * Pending durable work remains available after restart.
    */
   stopIntake(): void {
     if (this.intakeStopped) return;
     this.intakeStopped = true;
     this.dispatchWatcher?.stop();
-    // NOT `scheduledManager.stop()`. Cron timers deliberately keep running
-    // through the drain — stopping them here is what made `report-update` miss
-    // 5:25 while a restart sat pending, because `list` still showed the stale
-    // next_run and catch-up then skipped it. Isolated scheduled fires increment
-    // `activeTurns`, so a due schedule EXTENDS the drain rather than being lost.
-    // The scheduled manager is stopped in the last beat before process restart.
     this.logger.info(
       { activeTurns: this.activeTurns, inFlight: this.dispatchWatcher?.inFlightCount ?? 0 },
       "intake stopped; no new dispatch, parked fire, preset opener or preemptive steer will be admitted"
@@ -3371,24 +3209,8 @@ export class Orchestrator {
   }
 
   /**
-   * Close the Discord transport as well — every gateway handler refuses from
-   * here on. Implies `stopIntake()`.
-   *
-   * SHUTDOWN ONLY. This is deliberately a second, stricter lever rather than
-   * part of `stopIntake()`, because the two doors answer different questions
-   * and are open for wildly different lengths of time:
-   *
-   *   `stopIntake()`    "do not start new WORK." The restart-sentinel drain
-   *                     calls it and then waits up to `RESTART_DRAIN_TIMEOUT_MS`
-   *                     (15 min) with the store and the gateway fully alive.
-   *   `closeAdmission()` "the store is about to close." Only true once SIGTERM
-   *                     has been received; the window is seconds.
-   *
-   * Collapsing them refused every slash command, message, component click and
-   * choice-card pick for the WHOLE drain — including `/seam cancel`, the one
-   * lever that ends a wedged turn and lets the restart proceed. The operator
-   * was told "Restarting — that command was not run" by the very restart they
-   * were trying to unblock, for up to fifteen minutes.
+   * Close Discord ingress before shutdown can close the store. Implies
+   * `stopIntake()`.
    */
   closeAdmission(): void {
     this.stopIntake();
@@ -3477,11 +3299,8 @@ export class Orchestrator {
    * usable, so their DB-first completion work (ledger status, report-back
    * claim, chain advance) actually lands.
    *
-   * ALWAYS bounded. A hung agent must not be able to block a restart; that is
-   * what `RESTART_DRAIN_TIMEOUT_MS` exists to prevent, and a force restart is
-   * an explicit instruction to stop waiting. On timeout this returns
-   * `timedOut: true` and shutdown proceeds — the boot-time done-file
-   * reconciliation is what makes giving up safe.
+   * Always bounded by the shutdown budget. On timeout this returns
+   * `timedOut: true` and boot-time reconciliation repairs unfinished work.
    */
   async quiesce(opts: { timeoutMs?: number; clock?: DeadlineClock } = {}): Promise<QuiesceOutcome> {
     return this.runBoundedDrain(
@@ -15636,19 +15455,10 @@ export class Orchestrator {
   }
 
   private async cmdBridgeRestart(i: ChatInputCommandInteraction): Promise<void> {
-    const mode = i.options.getString("mode", true) === "force" ? "force" : "drain";
-    const confirmed = i.options.getBoolean("confirm") === true;
-    if (mode === "force" && !confirmed) {
-      await i.reply({
-        content: "Force restart interrupts every live turn. Run it again with `confirm:true`.",
-        flags: MessageFlags.Ephemeral,
-      });
-      return;
-    }
-    const staged = stageRestartSentinel(this.config.DATA_DIR, mode);
+    const staged = stageRestartSentinel(this.config.DATA_DIR);
     if (!staged.staged) {
       await i.reply({
-        content: "A restart request is already pending; its mode was left unchanged.",
+        content: "A restart request is already pending.",
         flags: MessageFlags.Ephemeral,
       });
       return;
@@ -15659,15 +15469,12 @@ export class Orchestrator {
       actorId: i.user.id,
       actorName: this.interactionSpeakerName(i),
       scope: "bot",
-      summary: `Staged ${mode} restart`,
+      summary: "Staged controller restart",
       beforeJson: JSON.stringify({ pending: false }),
-      afterJson: JSON.stringify({ pending: true, mode }),
+      afterJson: JSON.stringify({ pending: true }),
     });
     await i.reply({
-      content:
-        mode === "force"
-          ? "♻️ Force restart staged. The sentinel path will preserve interrupted-turn recovery."
-          : "♻️ Drain restart staged. New work intake will close before the #174 drain snapshot.",
+      content: "♻️ Controller restart staged. Running turns will reattach.",
       flags: MessageFlags.Ephemeral,
     });
   }
@@ -19534,10 +19341,10 @@ export class Orchestrator {
     }
     const work = this.scheduledActivity?.snapshot() ?? [];
     const lines = [
-      `Restart ${this.restartPending ? "draining" : "not pending"}: ${this.activeTurns} turn accounting token(s), ${this.inboundWork.size} admitted handler(s).`,
-      `${work.length} active scheduled occurrence(s), included in those tokens; live schedules may have nested queue tokens.`,
+      `Restart ${this.restartPending ? "pending" : "not pending"}: ${this.activeTurns} turn accounting token(s), ${this.inboundWork.size} admitted handler(s).`,
+      `${work.length} active scheduled occurrence(s), included in those tokens; live schedules may have nested turn tokens.`,
       ...work.map(scheduledActivityLine),
-      "This view attributes scheduled work; other turn/handler tokens may also block drain. Cron remains open during drain.",
+      "This view attributes scheduled work; the bounded shutdown quiesce also tracks other turns and handlers.",
     ];
     const content = lines.join("\n");
     await i.reply(content.length <= 1800 ? { content, flags: MessageFlags.Ephemeral } : {

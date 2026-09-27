@@ -849,13 +849,13 @@ describe("#180 dispatch and restart recovery", () => {
     expect(done).toMatchObject({ status: "completed", output: "recovered" });
   }, 15_000);
 
-  it("stages drain/force sentinels without overwriting the first request", async () => {
-    expect(stageRestartSentinel(dir, "drain").staged).toBe(true);
-    expect(stageRestartSentinel(dir, "force").staged).toBe(false);
+  it("stages a restart sentinel without overwriting the first request", async () => {
+    expect(stageRestartSentinel(dir).staged).toBe(true);
+    expect(stageRestartSentinel(dir).staged).toBe(false);
     expect(await readFile(path.join(dir, ".restart-pending"), "utf8")).toBe("");
   });
 
-  it("requires explicit confirmation before staging a force restart", async () => {
+  it("stages a prompt controller restart from the admin command", async () => {
     const record = {
       id: "discord:100",
       platform: "discord",
@@ -891,24 +891,16 @@ describe("#180 dispatch and restart recovery", () => {
       renderer: {} as never,
     });
     const replies: string[] = [];
-    const interaction = (confirm: boolean) => ({
+    const interaction = {
       user: { id: "1", username: "admin", globalName: null },
       member: null,
-      options: {
-        getString: (name: string) => (name === "mode" ? "force" : null),
-        getBoolean: () => confirm,
-      },
+      options: {},
       reply: async ({ content }: { content: string }) => void replies.push(content),
-    });
+    };
 
-    await (host as any).cmdBridgeRestart(interaction(false));
-    expect(replies.at(-1)).toContain("confirm:true");
-    await expect(readFile(path.join(dir, ".restart-pending"), "utf8")).rejects.toMatchObject({
-      code: "ENOENT",
-    });
-
-    await (host as any).cmdBridgeRestart(interaction(true));
-    expect(await readFile(path.join(dir, ".restart-pending"), "utf8")).toBe("force\n");
+    await (host as any).cmdBridgeRestart(interaction);
+    expect(replies.at(-1)).toContain("Running turns will reattach");
+    expect(await readFile(path.join(dir, ".restart-pending"), "utf8")).toBe("");
   });
 
   it("allows the established ManageGuild fallback when config-admin ids are unset", async () => {

@@ -433,7 +433,7 @@ describe("#252 actual isolated scheduler + injectTurn, synthetic transport", () 
     expect(orch.activeScheduledOccurrenceCount()).toBe(0); expect(orch.activeTurnCount()).toBe(0);
   });
 
-  it("#253 counts a live schedule once even while it owns two drain tokens", async () => {
+  it("#253 counts a live schedule once even while it owns two turn tokens", async () => {
     const h = setup("live"); const orch = h.make();
     transport.prompt.mockImplementationOnce(async () => {
       expect(orch.activeTurnCount()).toBe(2);
@@ -456,7 +456,7 @@ describe("#252 actual isolated scheduler + injectTurn, synthetic transport", () 
     expect(orch.activeScheduledOccurrenceCount()).toBe(0); expect(orch.activeTurnCount()).toBe(0);
   });
 
-  it("#253 cannot leak a drain token when metadata registration fails", async () => {
+  it("#253 cannot leak a turn token when metadata registration fails", async () => {
     const h = setup(); const orch = h.make();
     vi.spyOn((orch as any).scheduledActivity, "begin").mockImplementation(() => { throw new Error("synthetic metadata failure"); });
     await expect(orch.runScheduledPrompt(h.row.id)).rejects.toThrow("synthetic metadata failure");

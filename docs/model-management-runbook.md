@@ -501,7 +501,7 @@ The fix lives in `AgentRuntime.loadSession` (re-applies `opts.model` via
 1. On an existing thread with a known non-default model set, run one turn and
    confirm the resolved model on the card.
 2. Force a runtime restart so the next turn goes through `loadSession`:
-   `npm run redeploy` (drains turns, then restarts), or `/seam abort` then a new
+   `npm run redeploy` (restarts the controller; turns reattach), or `/seam abort` then a new
    message, or just wait for an idle eviction.
 3. Send another message. The status card's resolved model MUST be unchanged.
 4. If it reverted to the default, `loadSession` is not re-applying — inspect

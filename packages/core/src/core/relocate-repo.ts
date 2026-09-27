@@ -623,7 +623,7 @@ export function collectRelocatePlan(opts: RelocateCollectOpts): RelocatePlan {
 
   if (hits.some((h) => h.surface === "session")) {
     warnings.push(
-      "A successful --apply writes a force-restart sentinel so live ACP turns take SIGTERM and turn-resume continues them at the new cwd. Pass --no-restart to skip."
+      "A successful --apply writes a restart sentinel so the controller reloads paths and running turns reattach at the new cwd. Pass --no-restart to skip."
     );
   }
 

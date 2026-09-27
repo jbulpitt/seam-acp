@@ -192,6 +192,7 @@ describe("staging durability canary", () => {
 
     expect(restarts).toEqual(["controller", "bridge", "controller_bridge", "sessiond"]);
     expect(result.rows).toHaveLength(4);
+    expect(result.rows[0]?.check).toBe("redeploy");
     expect(result.rows.every((row) => row.status === "passed")).toBe(true);
   });
 });

@@ -38,7 +38,7 @@ import {
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
 import type { ChoiceInteraction } from "../packages/core/src/platforms/chat-adapter.js";
 import { harnessPreamble } from "../packages/core/src/core/agent-conventions.js";
-import type { DispatchSpec } from "../packages/core/src/core/dispatch/types.js";
+import { dispatchDisplayPrompt, type DispatchSpec } from "../packages/core/src/core/dispatch/types.js";
 import type { SessionRecord } from "../packages/core/src/core/types.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import { SeamMcpServer } from "../packages/core/src/core/mcp/seam-mcp-server.js";
@@ -373,6 +373,8 @@ describe("emitChoice helper", () => {
     expect(enqueued[0]!.target).toBe("thread-1");
     expect(enqueued[0]!.prompt).toContain("<seam-choice>");
     expect(enqueued[0]!.prompt).toContain("Approved.");
+    // The status card shows the pick, not the agent-facing frame.
+    expect(dispatchDisplayPrompt(enqueued[0]!)).toBe("Approved.");
   });
 
   it("isolated inherits authoring cwd/model/effort and stays on the card thread", async () => {

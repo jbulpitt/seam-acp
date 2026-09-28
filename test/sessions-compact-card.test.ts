@@ -215,6 +215,9 @@ class FakeCollector {
 interface HarnessOpts {
   bound?: string;
   sessions?: string[];
+  location?: string;
+  remoteSessions?: string[];
+  remoteError?: Error;
   /** Who is driving the browser — retrieval is keyed on this. */
   userId?: string;
   /** DATA_DIR, so two harnesses can share one result vault. */
@@ -253,11 +256,11 @@ function makeHarness(opts: HarnessOpts = {}) {
   let listed = (opts.sessions ?? ["acp-source", "acp-other"]).map(summaryRow);
   const transcript = deferred<string>();
   const manager = {
-    listSessions: async () => listed,
+    listSessions: vi.fn(async () => listed),
     getHistoryPath: () => "/tmp/history.jsonl",
-    getTranscript: async () => transcript.promise,
-    deleteSession: async () => {},
-    cloneSession: async () => {},
+    getTranscript: vi.fn(async () => transcript.promise),
+    deleteSession: vi.fn(async () => {}),
+    cloneSession: vi.fn(async () => {}),
   };
   const profile = {
     id: opts.agentId ?? "claude",
@@ -285,7 +288,7 @@ function makeHarness(opts: HarnessOpts = {}) {
     listProfiles: () => (agy ? [profile, target, agy] : [profile, target]),
     describeConfig: () => ({
       agent: { value: record.agentId },
-      location: { value: "local" },
+      location: { value: opts.location ?? "local" },
       model: { value: "default" },
       cwd: { value: "/repo" },
     }),
@@ -401,6 +404,26 @@ function makeHarness(opts: HarnessOpts = {}) {
     modelCatalog: fixtureModelCatalog([profile, target, ...(agy ? [agy] : [])] as any),
   });
   attachLocalBridge(orch, [profile, target, ...(agy ? [agy] : [])] as any, opts.dataDir ?? dataDir);
+  const remoteCalls: Array<{ location: string; method: string; params: any; agentId?: string }> = [];
+  if (opts.location && opts.location !== "local") {
+    let remoteListed = (opts.remoteSessions ?? ["remote-source", "remote-other"]).map(summaryRow);
+    const rpc = vi.fn(async (location: string, method: string, params: any, agentId?: string) => {
+      remoteCalls.push({ location, method, params, agentId });
+      if (opts.remoteError) throw opts.remoteError;
+      if (method === "listSessions") return remoteListed;
+      if (method === "getTranscript") return "### User\nremote hello\n\n### Assistant\nremote world";
+      if (method === "cloneSession") {
+        remoteListed = [...remoteListed, summaryRow(params.newSessionId)];
+        return {};
+      }
+      if (method === "deleteSession") {
+        remoteListed = remoteListed.filter((s) => s.sessionId !== params.sessionId);
+        return {};
+      }
+      throw new Error(`unexpected RPC ${method}`);
+    });
+    orch.setBridgeHub({ rpc } as any);
+  }
 
   // The compaction / rebuild pipelines are held open by explicit deferreds and
   // signal entry, so the test never has to guess that a job has started.
@@ -493,6 +516,8 @@ function makeHarness(opts: HarnessOpts = {}) {
     record,
     pipeline,
     transcript,
+    manager,
+    remoteCalls,
     compactCalls,
     seedCalls,
     attachViaPrimitive,
@@ -562,6 +587,50 @@ async function finishCompaction(h: ReturnType<typeof makeHarness>, customId: str
   await h.settle();
   return attachment;
 }
+
+describe("#706 remote session browser", () => {
+  it("lists, clones, and deletes through the thread's bridge", async () => {
+    const h = makeHarness({
+      bound: "remote-source",
+      sessions: ["controller-only"],
+      location: "staging-remote",
+      remoteSessions: ["remote-source", "remote-other"],
+    });
+
+    await h.open();
+    expect(text(h.last())).toContain("remote-source");
+    expect(text(h.last())).not.toContain("controller-only");
+    expect(h.manager.listSessions).not.toHaveBeenCalled();
+    expect(h.remoteCalls[0]).toEqual({
+      location: "staging-remote",
+      method: "listSessions",
+      params: { cwd: "/repo" },
+      agentId: "claude",
+    });
+
+    await h.collector.click("sessions:clone");
+    expect(h.remoteCalls.some((call) => call.method === "cloneSession")).toBe(true);
+    expect(h.manager.cloneSession).not.toHaveBeenCalled();
+
+    await h.collector.click("sessions:delete");
+    await h.collector.click("sessions:delete_confirm");
+    expect(h.remoteCalls.some((call) => call.method === "deleteSession")).toBe(true);
+    expect(h.manager.deleteSession).not.toHaveBeenCalled();
+  });
+
+  it("names the remote host when it cannot answer", async () => {
+    const h = makeHarness({
+      location: "offline-remote",
+      remoteError: new Error("transport closed"),
+    });
+
+    await h.open();
+    expect(text(h.last())).toContain(
+      'Session host "offline-remote" could not answer listSessions: transport closed'
+    );
+    expect(h.manager.listSessions).not.toHaveBeenCalled();
+  });
+});
 
 // ---------------------------------------------------------------------------
 // A. Attachment — decided at completion, from authoritative state

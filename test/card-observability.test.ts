@@ -14,7 +14,7 @@ import {
   graphemeLength,
   promptExcerpt,
 } from "../packages/core/src/core/prompt-excerpt.js";
-import {
+import { dispatchDisplayPrompt,
   dispatchOriginRefs,
   parseDispatchSpec,
   LEGACY_WAKE_HARNESS_PREFIX,
@@ -557,6 +557,13 @@ describe("report-back card (#153)", () => {
     // Its own prompt is the worker's wrapped OUTPUT — the wrong thing to show
     // as "the prompt", which is exactly why originPrompt exists.
     expect(spec.prompt).toContain("<seam-report-back");
+  });
+
+  it("never shows a report-back's wrapped output when its ask is unknown", () => {
+    expect(dispatchDisplayPrompt({
+      id: "rb", target: "t", session: "live", kind: "report_back", createdUtc: "2026-01-01T00:00:00Z",
+      prompt: '<seam-report-back correlation="c" from-thread="w">\nanswer\n</seam-report-back>',
+    })).toBe("");
   });
 
   it("excerpts the original ask, not the wrapped output, and names the worker", async () => {

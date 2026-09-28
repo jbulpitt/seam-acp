@@ -204,6 +204,23 @@ describe("#170 dispatchInjectTurn skips an already-ledgered spec", () => {
     expect(store.turnAttempts.isDeliveryProven(job.id)).toBe(false);
   });
 
+  it("boot replay carries the recorded ask to the report-back and finalizes the worker card", async () => {
+    const { logger } = capturingLogger();
+    const job = spec({ id: "replay-origin", returnTo: "caller" });
+    store.turnAttempts.admit(job);
+    const orch = makeOrch(dataDir, store, logger);
+    const onward = vi.fn(async (_spec: { prompt: string }) => { throw new Error("lost to shutdown"); });
+    Object.assign(orch, { enqueueReportBack: onward });
+    await expect(orch.dispatchInjectTurn(job)).rejects.toThrow("lost to shutdown");
+    onward.mockImplementation(async () => undefined);
+    const card = vi.fn(async () => undefined);
+    Object.assign(orch, { projectPersistedTerminalAttemptCard: card });
+    const { originPrompt: _dropped, ...outcome } = store.turnAttempts.get(job.id)!.outcome!;
+    await orch.replayCompletedDispatch(outcome, { action: "report_back", returnTo: "caller" });
+    expect(onward.mock.calls[1]![0].prompt).toBe(job.prompt);
+    expect(card).toHaveBeenCalledWith(expect.objectContaining({ id: job.id }));
+  });
+
   // #509: exercise the real producer, not just a new store API; deleting settlement reopens normal dispatch leaks.
   it.each(["handoff", "forward", "report_back", "scheduled", "wake", "watch", "peek", "inbox", "parked", "choice", "migrate_self"] as const)("settles the real %s completion without inventing delivery proof", async (kind) => {
     const { logger } = capturingLogger();

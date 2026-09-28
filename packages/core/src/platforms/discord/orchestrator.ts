@@ -628,6 +628,7 @@ const STATUS_HEARTBEAT_MS = 5000;
 // after that, refuse only the claim of complete presentation, never settlement
 // of the turn, answer ledger, or report-back (#576/#423).
 export const DISPATCH_OUTPUT_DRAIN_TIMEOUT_MS = 5_000;
+export const DISPATCH_SETTLEMENT_WARN_MS = 5_000;
 const PLATFORM = "discord";
 
 const CONFIG_SET_FIELD_NAMES = [
@@ -5859,6 +5860,9 @@ export class Orchestrator {
       ? { correlationId: opts.correlationId }
       : {};
     const logger = this.logger.child({ ...(opts.logContext ?? {}), ...correlation });
+    const settlementId = typeof opts.logContext?.dispatch === "string"
+      ? opts.logContext.dispatch
+      : opts.correlationId ?? (target && isSessionRecord(target) ? target.channelRef : "inject-turn");
 
     // Agent-emitted files go to the explicit route, else to the target when
     // it's a chat thread. No route ⇒ files are dropped.
@@ -6070,7 +6074,9 @@ export class Orchestrator {
             ...correlation,
           });
         }
-        if (opts.awaitIdle) await rt.idle();
+        if (opts.awaitIdle) {
+          await this.runDispatchSettlementStep(settlementId, "agent-output-drain", () => rt!.idle());
+        }
         return settle({
           text,
           stopReason: outcome.stopReason,
@@ -6095,17 +6101,31 @@ export class Orchestrator {
           // An observability callback must never prevent runtime disposal.
           try { opts.lifecycle?.onCleanup?.(); } catch { logger.warn("injectTurn cleanup attribution failed"); }
           const sid = rt.getSessionInfo()?.sessionId;
-          await rt.dispose().catch(() => {});
-          if (sid && (!opts.lifecycle || opts.lifecycle.mayDeleteSession())) {
-            // #466/#575: the execution host owns the session for every
-            // location. Never delete a same-named controller-side session.
-            await this.bridgeHub?.rpc(
-              location,
-              "deleteSession",
-              { cwd, sessionId: sid },
-              profile.id,
-            ).catch(() => {});
-          }
+          const teardown = () => this.runDispatchSettlementStep(
+            settlementId,
+            "runtime-teardown",
+            async () => {
+              const detailed = rt as AgentRuntime & {
+                disposeWithOutcome?: () => Promise<"clean" | "sigterm" | "sigkill">;
+              };
+              const outcome = typeof detailed.disposeWithOutcome === "function"
+                ? await detailed.disposeWithOutcome().catch(() => "sigkill" as const)
+                : await rt!.dispose().then(() => "clean" as const, () => "sigkill" as const);
+              if (sid && (!opts.lifecycle || opts.lifecycle.mayDeleteSession())) {
+                // #466/#575: the execution host owns the session for every
+                // location. Never delete a same-named controller-side session.
+                await this.bridgeHub?.rpc(
+                  location,
+                  "deleteSession",
+                  { cwd, sessionId: sid },
+                  profile.id,
+                ).catch(() => {});
+              }
+              return outcome;
+            },
+            (outcome) => outcome
+          );
+          await teardown();
         }
       }
     }
@@ -6152,7 +6172,13 @@ export class Orchestrator {
           ...correlation,
         });
       }
-      if (opts.awaitIdle) await rt.idle();
+      if (opts.awaitIdle) {
+        await this.runDispatchSettlementStep(settlementId, "agent-output-drain", () => rt.idle());
+      }
+      this.logger.info(
+        { dispatch: settlementId, step: "runtime-teardown", durationMs: 0, outcome: "retained" },
+        "dispatch: settlement step"
+      );
       return settle({
         text,
         stopReason: outcome.stopReason,
@@ -10492,15 +10518,23 @@ export class Orchestrator {
       // throw in the visibility/finalize code below can never leak the flag.
       const wasInterrupted = this.interruptedDispatches.delete(spec.id) || result.cancelled === true;
 
+      // The prompt is over and its outcome is durable. Nothing below touches
+      // the runtime, so let the next turn start before presentation cleanup.
+      if (isLiveDispatch) queueFence?.release?.();
+
+      // Claim onward work before best-effort Discord settlement. Boot replay
+      // can recover this claim; a stuck card edit must not be its gate.
+      await this.finishDispatchOnward(spec, result, wasInterrupted);
+
       // The STATUS PANEL and plain-output stream have independent SerialQueues.
       // Drain the complete visible messages path first: `runtime.idle()` above
       // only drains ACP session updates, not StreamingMessageRenderer. A bounded
       // wait prevents a stuck Discord send from recreating #423 (forever-Working
       // cards). On timeout/failure the card says that OUTPUT delivery did not
-      // settle; answer persistence and report-back below still proceed.
+      // settle; the answer and onward claim are already durable.
       let messagesPresentationStarted = false;
       let outputPresentation: "delivered" | "timed_out" | "failed" = "delivered";
-      if (msgRenderer && statusPanel) {
+      if (msgRenderer) {
         messagesPresentationStarted = true;
         outputPresentation = await this.awaitDispatchOutputPresentation(
           this.finalizeMessagesStream(target, spec, msgRenderer, result, panelRef, header, showHeader),
@@ -10510,7 +10544,7 @@ export class Orchestrator {
 
       // Finalize the STATUS PANEL to its terminal state only after presentation
       // settles or reaches its bound. Best-effort remains one-way: a panel edit
-      // failure never affects the answer delivery / report-back below.
+      // failure never affects the answer ledger or onward claim above.
       if (statusPanel) {
         const finalState: TurnState = result.timedOut
           ? "Timed out"
@@ -10530,12 +10564,13 @@ export class Orchestrator {
               : outputPresentation === "failed"
                 ? "Output delivery failed; turn completed"
                 : (result.stopReason || "Completed");
-        try {
-          await statusPanel.finalize(finalState, finalAction);
-          statusCardDone = finalState === "Done" && statusPanel.lastEditSucceeded;
-        } catch (err) {
-          this.logger.warn({ err, dispatch: spec.id }, "dispatch: status panel finalize failed");
-        }
+        const cardSettlement = await this.awaitBoundedDispatchSettlement(
+          spec.id,
+          "status-card-finalize",
+          statusPanel.finalize(finalState, finalAction)
+        );
+        statusCardDone = cardSettlement === "completed" &&
+          finalState === "Done" && statusPanel.lastEditSucceeded;
       }
 
       // Visibility post. Streaming: finalize the panel IN PLACE (no second copy
@@ -10552,72 +10587,32 @@ export class Orchestrator {
           await this.finalizeMessagesStream(target, spec, msgRenderer, result, panelRef, header, showHeader);
         }
       } else if (streamPanel && panelRef) {
-        await this.finalizeDispatchStream(target, spec, streamPanel, streamState, result);
+        await this.awaitBoundedDispatchSettlement(
+          spec.id,
+          "output-presentation",
+          this.finalizeDispatchStream(target, spec, streamPanel, streamState, result)
+        );
       } else if (statelessCard) {
         // Quiet (stream:false) stateless card: flip the indicator in place to
         // Done + Result. If the indicator never posted, send one Done card.
-        await this.publishStatelessHandoffCard(
-          target,
-          spec,
-          panelRef,
-          header,
-          startedAt,
-          result
+        await this.awaitBoundedDispatchSettlement(
+          spec.id,
+          "output-presentation",
+          this.publishStatelessHandoffCard(
+            target,
+            spec,
+            panelRef,
+            header,
+            startedAt,
+            result
+          )
         );
       } else {
         // Partial output is still output — post whatever was captured either way.
-        await this.postDispatchOutput(target, spec, result.text, result.error);
-      }
-      try {
-        // Chain advance (#25): a hop carrying a chainId drives the chain forward
-        // instead of a normal report-back — enqueue the next hop, or deliver the
-        // final output to the chain's origin.
-        if (wasInterrupted) {
-          // #67: this turn was preemptively cancelled by an interrupt. Deliver
-          // NOTHING onward — no report-back, no chain advance — the interrupt has
-          // already issued a fresh directive into this same thread in its place.
-          this.logger.info(
-            { dispatch: spec.id, target: spec.target, correlationId: spec.correlationId },
-            "dispatch: onward delivery suppressed — turn was interrupted (#67)"
-          );
-        } else if (spec.chainId) {
-          await this.advanceChain(spec, result.text, result.error);
-        } else if (spec.returnTo) {
-          // Report-back: if the caller set returnTo, deliver the result back by
-          // enqueuing a fresh dispatch into that thread (correlation-linked). The
-          // runtime owns this — the worker never had to "remember" to report.
-          // Stateless same-thread card: the Done embed already carries the
-          // result — do not inject a second live `<seam-report-back>` turn.
-          if (shouldInlineCardReportBack(spec)) {
-            this.logger.info(
-              { dispatch: spec.id, target: spec.target, returnTo: spec.returnTo },
-              "dispatch: report-back inlined onto stateless handoff card"
-            );
-          } else {
-            await this.enqueueReportBack(spec, result.text, result.error);
-          }
-        }
-        // Only terminalize after the onward action is durable.
-        const ledgerStatus = result.timedOut ? "timed_out" : result.error ? "failed" : "completed";
-        this.store.updateDelegationStatus(spec.id, ledgerStatus);
-      } catch (err) {
-        // Preserve the worker's output in done/ while leaving its ledger row
-        // non-terminal. Boot completion replay can then finish the durable side
-        // effect without paying for or rerunning the agent turn.
-        //
-        // `wasInterrupted` rides along: on that branch the only thing this try
-        // block did was the ledger write, so a throw here means the row is
-        // non-terminal AND nothing is owed onward. Without the flag the
-        // done-file's `returnTo`/`chainId` would send boot replay to deliver
-        // the very report-back #67 suppressed.
-        throw new DispatchTurnError(
-          (err as Error)?.message ?? String(err),
-          result.text,
-          result.stopReason ?? "",
-          result.timedOut ? "timed_out" : result.error ? "failed" : "completed",
-          result.error,
-          true,
-          wasInterrupted
+        await this.awaitBoundedDispatchSettlement(
+          spec.id,
+          "output-presentation",
+          this.postDispatchOutput(target, spec, result.text, result.error)
         );
       }
       if (result.error) {
@@ -10683,6 +10678,54 @@ export class Orchestrator {
         this.store.turnAttempts.releaseUnstartedClaim(unstartedClaim, err.suspension, err.reason);
       }
       throw err;
+    }
+  }
+
+  private async finishDispatchOnward(
+    spec: DispatchSpec,
+    result: InjectTurnResult,
+    wasInterrupted: boolean
+  ): Promise<void> {
+    try {
+      if (wasInterrupted) {
+        this.logger.info(
+          { dispatch: spec.id, target: spec.target, correlationId: spec.correlationId },
+          "dispatch: onward delivery suppressed — turn was interrupted (#67)"
+        );
+      } else if (spec.chainId) {
+        await this.runDispatchSettlementStep(
+          spec.id,
+          "chain-advance",
+          () => this.advanceChain(spec, result.text, result.error)
+        );
+      } else if (spec.returnTo) {
+        if (shouldInlineCardReportBack(spec)) {
+          this.logger.info(
+            { dispatch: spec.id, target: spec.target, returnTo: spec.returnTo },
+            "dispatch: report-back inlined onto stateless handoff card"
+          );
+        } else {
+          await this.runDispatchSettlementStep(
+            spec.id,
+            "report-back-claim",
+            () => this.enqueueReportBack(spec, result.text, result.error)
+          );
+        }
+      }
+      const ledgerStatus = result.timedOut ? "timed_out" : result.error ? "failed" : "completed";
+      await this.runDispatchSettlementStep(spec.id, "delegation-terminalize", async () => {
+        this.store.updateDelegationStatus(spec.id, ledgerStatus);
+      });
+    } catch (err) {
+      throw new DispatchTurnError(
+        (err as Error)?.message ?? String(err),
+        result.text,
+        result.stopReason ?? "",
+        result.timedOut ? "timed_out" : result.error ? "failed" : "completed",
+        result.error,
+        true,
+        wasInterrupted
+      );
     }
   }
 
@@ -12159,6 +12202,7 @@ export class Orchestrator {
     presentation: Promise<void>,
     dispatchId: string
   ): Promise<"delivered" | "timed_out" | "failed"> {
+    const startedAt = Date.now();
     const guarded = presentation.then(
       () => ({ status: "delivered" as const }),
       (err) => ({ status: "failed" as const, err })
@@ -12171,19 +12215,114 @@ export class Orchestrator {
     const outcome = await Promise.race([guarded, timedOut]);
     if (timer) clearTimeout(timer);
     if (outcome.status === "failed") {
-      this.logger.warn({ err: outcome.err, dispatch: dispatchId }, "dispatch: output presentation failed before status settlement");
+      this.logger.warn(
+        { err: outcome.err, dispatch: dispatchId, step: "output-drain", durationMs: Date.now() - startedAt, outcome: "failed" },
+        "dispatch: settlement step"
+      );
     } else if (outcome.status === "timed_out") {
       this.logger.warn(
-        { dispatch: dispatchId, timeoutMs: DISPATCH_OUTPUT_DRAIN_TIMEOUT_MS },
-        "dispatch: output presentation still pending at status settlement"
+        { dispatch: dispatchId, step: "output-drain", durationMs: Date.now() - startedAt,
+          outcome: "timed_out", timeoutMs: DISPATCH_OUTPUT_DRAIN_TIMEOUT_MS },
+        "dispatch: settlement step exceeded bound"
       );
       void guarded.then((late) => {
         if (late.status === "failed") {
-          this.logger.warn({ err: late.err, dispatch: dispatchId }, "dispatch: output presentation failed after settlement timeout");
+          this.logger.warn(
+            { err: late.err, dispatch: dispatchId, step: "output-drain",
+              durationMs: Date.now() - startedAt, outcome: "failed_late" },
+            "dispatch: settlement step"
+          );
+        } else {
+          this.logger.info(
+            { dispatch: dispatchId, step: "output-drain",
+              durationMs: Date.now() - startedAt, outcome: "completed_late" },
+            "dispatch: settlement step"
+          );
         }
       });
+    } else {
+      this.logger.info(
+        { dispatch: dispatchId, step: "output-drain", durationMs: Date.now() - startedAt, outcome: "completed" },
+        "dispatch: settlement step"
+      );
     }
     return outcome.status;
+  }
+
+  private async runDispatchSettlementStep<T>(
+    dispatchId: string,
+    step: string,
+    run: () => Promise<T>,
+    successOutcome: string | ((value: T) => string) = "completed"
+  ): Promise<T> {
+    const startedAt = Date.now();
+    const slow = setTimeout(() => {
+      this.logger.warn(
+        { dispatch: dispatchId, step, durationMs: Date.now() - startedAt,
+          outcome: "pending", timeoutMs: DISPATCH_SETTLEMENT_WARN_MS },
+        "dispatch: settlement step exceeded bound"
+      );
+    }, DISPATCH_SETTLEMENT_WARN_MS);
+    slow.unref?.();
+    try {
+      const value = await run();
+      this.logger.info(
+        { dispatch: dispatchId, step, durationMs: Date.now() - startedAt,
+          outcome: typeof successOutcome === "function" ? successOutcome(value) : successOutcome },
+        "dispatch: settlement step"
+      );
+      return value;
+    } catch (err) {
+      this.logger.warn(
+        { err, dispatch: dispatchId, step, durationMs: Date.now() - startedAt, outcome: "failed" },
+        "dispatch: settlement step"
+      );
+      throw err;
+    } finally {
+      clearTimeout(slow);
+    }
+  }
+
+  private async awaitBoundedDispatchSettlement(
+    dispatchId: string,
+    step: string,
+    settlement: Promise<void>
+  ): Promise<"completed" | "failed" | "timed_out"> {
+    const startedAt = Date.now();
+    const guarded = settlement.then(
+      () => ({ outcome: "completed" as const }),
+      (err) => ({ outcome: "failed" as const, err })
+    );
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timedOut = new Promise<{ outcome: "timed_out" }>((resolve) => {
+      timer = setTimeout(() => resolve({ outcome: "timed_out" }), DISPATCH_SETTLEMENT_WARN_MS);
+      timer.unref?.();
+    });
+    const result = await Promise.race([guarded, timedOut]);
+    if (timer) clearTimeout(timer);
+    const record = {
+      dispatch: dispatchId,
+      step,
+      durationMs: Date.now() - startedAt,
+      outcome: result.outcome,
+      ...(result.outcome === "timed_out" ? { timeoutMs: DISPATCH_SETTLEMENT_WARN_MS } : {}),
+    };
+    if (result.outcome === "timed_out") {
+      this.logger.warn(record, "dispatch: settlement step exceeded bound");
+      void guarded.then((late) => {
+        this.logger[late.outcome === "failed" ? "warn" : "info"](
+          { dispatch: dispatchId, step, durationMs: Date.now() - startedAt,
+            outcome: `${late.outcome}_late`, ...(late.outcome === "failed" ? { err: late.err } : {}) },
+          "dispatch: settlement step"
+        );
+      });
+    } else {
+      this.logger[result.outcome === "failed" ? "warn" : "info"](
+        { ...record, ...(result.outcome === "failed" ? { err: result.err } : {}) },
+        "dispatch: settlement step"
+      );
+    }
+    return result.outcome;
   }
 
   /** Build the streaming/indicator panel for a dispatch. `done: false` renders

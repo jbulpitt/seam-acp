@@ -9,7 +9,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough, Readable, Writable } from "node:stream";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { agent, methods, ndJsonStream, PROTOCOL_VERSION } from "@agentclientprotocol/sdk";
 import type { AgentProfile } from "@seam/adapters";
 import { dispatchBridgeRpc, type SlotSpawnConfig } from "../packages/bridge/src/rpc.js";
@@ -36,6 +36,37 @@ describe("a directory missing on this host", () => {
     } as never);
     expect(configured[0]?.cwd).toBe("/tmp");
     expect(reply).not.toHaveProperty("cwdFallback");
+  });
+
+  it("uses the host workspace for session RPCs when the requested cwd is missing", async () => {
+    const calls: Array<[string, string]> = [];
+    const adapter = {
+      listSessions: vi.fn(async (cwd: string) => { calls.push(["list", cwd]); return []; }),
+      getTranscript: vi.fn(async (cwd: string) => { calls.push(["transcript", cwd]); return ""; }),
+      usage: vi.fn(async (cwd: string) => { calls.push(["usage", cwd]); return null; }),
+      cloneSession: vi.fn(async (cwd: string) => { calls.push(["clone", cwd]); }),
+      deleteSession: vi.fn(async (cwd: string) => { calls.push(["delete", cwd]); }),
+    };
+    const ctx = {
+      adapters: new Map([["claude", adapter]]),
+      workspaceRoot: "/tmp",
+      cwd: "/tmp",
+    } as never;
+    const cwd = "/no/such/controller-workspace";
+
+    await dispatchBridgeRpc("listSessions", { cwd }, "claude", ctx);
+    await dispatchBridgeRpc("getTranscript", { cwd, sessionId: "old" }, "claude", ctx);
+    await dispatchBridgeRpc("getUsage", { cwd, sessionId: "old" }, "claude", ctx);
+    await dispatchBridgeRpc("cloneSession", { cwd, oldSessionId: "old", newSessionId: "new" }, "claude", ctx);
+    await dispatchBridgeRpc("deleteSession", { cwd, sessionId: "new" }, "claude", ctx);
+
+    expect(calls).toEqual([
+      ["list", "/tmp"],
+      ["transcript", "/tmp"],
+      ["usage", "/tmp"],
+      ["clone", "/tmp"],
+      ["delete", "/tmp"],
+    ]);
   });
 
   it("opens the ACP session in the directory the host actually uses", () => {

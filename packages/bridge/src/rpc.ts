@@ -22,6 +22,14 @@ import {
 const HOST_EXEC_DEFAULT_TIMEOUT_MS = 30_000;
 const HOST_EXEC_MAX_TIMEOUT_MS = 15 * 60_000;
 const HOST_EXEC_OUTPUT_MAX_BYTES = 64 * 1024;
+const SESSION_CWD_METHODS = new Set([
+  "listSessions",
+  "getTranscript",
+  "getUsage",
+  "usage",
+  "cloneSession",
+  "deleteSession",
+]);
 
 export interface SlotSpawnConfig {
   agentId?: string;
@@ -219,10 +227,13 @@ async function dispatchAdapter(
     }
     return { ok: true, ran: false, recipe };
   }
-  return invokeAdapterRpc(method, params, {
+  const adapterCwd = SESSION_CWD_METHODS.has(method) && !existsSync(cwd)
+    ? ctx.cwd
+    : cwd;
+  return invokeAdapterRpc(method, adapterCwd === cwd ? params : { ...params, cwd: adapterCwd }, {
     adapter,
     workspaceRoot: ctx.workspaceRoot,
-    cwd,
+    cwd: adapterCwd,
   });
 }
 

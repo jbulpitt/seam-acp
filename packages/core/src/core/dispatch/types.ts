@@ -509,6 +509,8 @@ export function splitLegacyGeneratedHarness(
 /** Actionable prompt for cards, indicators, and ledger previews. */
 export function dispatchDisplayPrompt(spec: DispatchSpec): string {
   if (spec.originPrompt) return spec.originPrompt;
+  // A report-back's prompt is the wrapped worker output, never the ask.
+  if (spec.kind === "report_back") return "";
   if (spec.kind === "wake" || spec.kind === "watch") {
     const split = splitLegacyGeneratedHarness(spec.prompt);
     if (split) return split.body;

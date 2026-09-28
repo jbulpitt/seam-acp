@@ -11377,7 +11377,7 @@ export class Orchestrator {
       // excerpts the ORIGINAL ask — its own `prompt` is the worker's wrapped
       // output, which would show the answer where the question belongs.
       originThreadRef: spec.target,
-      originPrompt: spec.prompt,
+      ...(spec.prompt ? { originPrompt: spec.prompt } : {}),
       createdUtc: new Date().toISOString(),
     };
     const enqueued = await this.claimAndEnqueueReportBack(correlation, reportSpec, {
@@ -11517,10 +11517,11 @@ export class Orchestrator {
     const routedChainId = route.action === "chain" ? route.chainId : result.chainId;
     const routedReturnTo = route.action === "report_back" ? route.returnTo : result.returnTo;
     // Rebuild only the fields the onward paths actually read.
+    const attempt = this.store.turnAttempts?.get(result.id);
     const spec: DispatchSpec = {
       id: result.id,
       target: result.target,
-      prompt: result.originPrompt ?? "",
+      prompt: result.originPrompt ?? attempt?.spec.prompt ?? "",
       session: "live",
       createdUtc: new Date().toISOString(),
       ...(result.correlationId ? { correlationId: result.correlationId } : {}),
@@ -11555,6 +11556,8 @@ export class Orchestrator {
     } else if (route.action === "report_back") {
       await this.enqueueReportBack(spec, text, workerError);
     }
+    // No live panel survived to flip the worker's card; project the outcome.
+    if (attempt) await this.projectPersistedTerminalAttemptCard(attempt);
 
     // #246: ingest's HTTP result is a completion side effect just like the
     // ledger transition. A definitive done artifact can settle a stranded

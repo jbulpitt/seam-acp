@@ -394,6 +394,95 @@ describe("dispatchInjectTurn: status panel ON (default)", () => {
     }
   });
 
+  it("records completion and releases the live queue before a stuck card edit settles", async () => {
+    vi.useFakeTimers();
+    try {
+      let editStarted!: () => void;
+      const started = new Promise<void>((resolve) => { editStarted = resolve; });
+      const never = new Promise<void>(() => {});
+      const completed = vi.fn(() => true);
+      let onwardStarted!: () => void;
+      const onward = vi.fn(async () => { onwardStarted(); });
+      const onwardCall = new Promise<void>((resolve) => { onwardStarted = resolve; });
+      const attempt = {
+        id: "disp-1",
+        generation: 1,
+        ownerBoot: "boot",
+        state: "active",
+        identity: {},
+        spec: baseSpec({ returnTo: "origin-thread" }),
+        acpSessionId: "acp-1",
+        promptStarted: false,
+        outcome: null,
+        runtime: null,
+        providerIdentity: null,
+        updatedUtc: "2026-01-01T00:00:00Z",
+        source: "dispatch",
+      };
+      const attempts = {
+        get: () => null,
+        registerOwner: () => {},
+        claim: () => attempt,
+        isCurrent: () => true,
+        bindStatusCard: () => true,
+        bind: () => true,
+        bindRuntime: () => true,
+        startPrompt: () => true,
+        recordSubmission: () => true,
+        complete: completed,
+      };
+      const rt = fakeRuntime({
+        events: [{ kind: "tool-start", toolCallId: "t1", title: "shell" }],
+        text: ["finished output"],
+      });
+      const { adapter, calls } = spyAdapter();
+      adapter.editPanel = async (ref, panel) => {
+        calls.editPanel.push({ ref, panel });
+        if (!panel.title.includes("· Done")) {
+          editStarted();
+          await never;
+        }
+      };
+      const orch = makeOrch({
+        dataDir,
+        rt,
+        adapter,
+        storeOverrides: { turnAttempts: attempts },
+      });
+      const warn = vi.spyOn((orch as any).logger, "warn");
+      Object.assign(orch, { enqueueReportBack: onward });
+
+      let settled = false;
+      const turn = orch.dispatchInjectTurn(baseSpec({ returnTo: "origin-thread" }))
+        .then((value) => { settled = true; return value; });
+      await started;
+      let nextRan = false;
+      const next = (orch as any).queueOnChannel("thread-w", async () => {
+        nextRan = true;
+      });
+      await onwardCall;
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(5_000);
+
+      expect(completed).toHaveBeenCalledTimes(1);
+      expect(onward).toHaveBeenCalledTimes(1);
+      expect(nextRan).toBe(true);
+      expect(settled).toBe(true);
+      expect(warn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          dispatch: "disp-1",
+          step: "status-card-finalize",
+          outcome: "timed_out",
+        }),
+        "dispatch: settlement step exceeded bound"
+      );
+      await turn;
+      await next;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("labels an output-presentation failure without blocking captured output", async () => {
     const rt = fakeRuntime({ text: ["captured answer"] });
     const { adapter, calls } = spyAdapter();

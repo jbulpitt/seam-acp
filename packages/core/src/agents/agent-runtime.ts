@@ -2029,6 +2029,11 @@ export class AgentRuntime {
   }
 
   async dispose(): Promise<void> {
+    await this.disposeWithOutcome();
+  }
+
+  async disposeWithOutcome(): Promise<"clean" | "sigterm" | "sigkill"> {
+    let outcome: "clean" | "sigterm" | "sigkill" = "clean";
     if (this.sessionId) {
       try {
         await Promise.race([
@@ -2055,6 +2060,7 @@ export class AgentRuntime {
       // real process group, so a kill here is a request to it (#593).
       try {
         child.kill("SIGTERM");
+        outcome = "sigterm";
       } catch {
         /* ignore */
       }
@@ -2069,7 +2075,10 @@ export class AgentRuntime {
       if (child.exitCode === null && child.signalCode === null) {
         try {
           child.kill("SIGKILL");
+          outcome = "sigkill";
         } catch { /* ignore */ }
+      } else if (child.signalCode === null) {
+        outcome = "clean";
       }
     }
     this.transportConnection?.close();
@@ -2079,6 +2088,7 @@ export class AgentRuntime {
     this.sessionInfo = undefined;
     this.sessionConfigOptions = [];
     this.child = undefined;
+    return outcome;
   }
 
   // --- internals ---

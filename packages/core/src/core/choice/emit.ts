@@ -87,6 +87,8 @@ export function planChoiceDispatch(input: EmitChoiceInput): EmitChoiceResult {
     kind: "choice",
     correlationId: input.card.id,
     createdUtc: new Date().toISOString(),
+    // Cards show what was picked, not the <seam-choice> frame the agent reads.
+    originPrompt: input.payload || option.label,
   };
   if (session === "isolated" && input.authoringSession) {
     const cfg = safeJson(input.authoringSession.configJson);
@@ -158,6 +160,8 @@ export function planChoiceMultiDispatch(input: EmitChoiceMultiInput): EmitChoice
     kind: "choice",
     correlationId: input.card.id,
     createdUtc: new Date().toISOString(),
+    originPrompt: [`Selected: ${options.map((o) => o!.label).join(", ")}`,
+      ...options.map((o) => o!.payload ?? "").filter(Boolean)].join("\n"),
   };
   if (session === "isolated" && input.authoringSession) {
     const cfg = safeJson(input.authoringSession.configJson);

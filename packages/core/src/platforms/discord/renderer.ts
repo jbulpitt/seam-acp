@@ -54,7 +54,7 @@ function box(opts: {
 
 /** Map tool label keywords to a relevant emoji. */
 const TOOL_EMOJI: [RegExp, string][] = [
-  [/\b(grep|search|find|semantic)\b/i, "🔍"],
+  [/\b(grep|rg|search|find|semantic)\b/i, "🔍"],
   [/\b(read|view|cat|head|wc)\b/i, "📄"],
   [/\b(edit|write|replace|creat)\b/i, "✏️"],
   [/\b(run|command|exec|terminal|bash|sh\b)/i, "▶️"],

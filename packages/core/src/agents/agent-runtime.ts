@@ -299,6 +299,38 @@ function objectRecord(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
+function toolActivityLabel(update: unknown): string | undefined {
+  const tool = objectRecord(update);
+  if (!tool) return undefined;
+  const title = typeof tool.title === "string" && tool.title.trim()
+    ? tool.title.trim()
+    : undefined;
+  const kind = typeof tool.kind === "string" ? tool.kind : undefined;
+
+  if (kind === "edit") {
+    const paths = [
+      ...(Array.isArray(tool.locations) ? tool.locations : []),
+      ...(Array.isArray(tool.content) ? tool.content : []),
+    ].flatMap((entry) => {
+      const path = objectRecord(entry)?.path;
+      return typeof path === "string" && path.trim() ? [path.trim()] : [];
+    });
+    return paths[0] ? `Edit ${paths[0]}` : title === "Editing files" ? "Edit files" : title;
+  }
+
+  if (kind === "execute") {
+    const command = objectRecord(tool.rawInput)?.command;
+    if (typeof command === "string" && command.trim()) {
+      const detail = title && title !== "Terminal" && title !== "Run command"
+        ? title
+        : command.trim();
+      return `Terminal · ${detail}`;
+    }
+  }
+
+  return title ?? kind;
+}
+
 function exactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
   const actual = Object.keys(value).sort();
   const expected = [...keys].sort();
@@ -2249,7 +2281,7 @@ export class AgentRuntime {
         await this.emit({
           kind: "tool-start",
           toolCallId: update.toolCallId,
-          title: update.title,
+          title: toolActivityLabel(update),
           kindLabel: update.kind,
         });
         if (Array.isArray(update.content)) {

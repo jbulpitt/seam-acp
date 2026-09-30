@@ -16162,7 +16162,9 @@ export class Orchestrator {
 
     const target: ChannelRef = { platform: PLATFORM, id: attempt.spec.target };
     const adoptedChunks: string[] = [];
+    let adoptedText = "";
     let collectOnly = false;
+    let adoptedCardSettled = false;
     let adoptedRenderer: StreamingMessageRenderer | undefined;
     let adoptedStatusQueue: SerialQueue | undefined;
     if (recoveryRuntime && recoveryRecord) {
@@ -16202,12 +16204,17 @@ export class Orchestrator {
           }
         : undefined;
       adoptedStatusQueue = new SerialQueue();
-      const updateCard = async (action: string): Promise<void> => {
-        if (!cardRef || !this.adapter.editStatusPanelProjection) return;
-        await adoptedStatusQueue!.run(() => this.adapter.editStatusPanelProjection!(cardRef, {
-          state: "Working",
-          action,
-        })).catch((err) => this.logger.warn(
+      let latestAction = "";
+      let renderedAction = "";
+      const updateCard = (action: string): void => {
+        if (adoptedCardSettled || !cardRef || !this.adapter.editStatusPanelProjection) return;
+        latestAction = action;
+        void adoptedStatusQueue!.run(async () => {
+          if (adoptedCardSettled || latestAction === renderedAction) return;
+          const action = latestAction;
+          await this.adapter.editStatusPanelProjection!(cardRef, { state: "Working", action });
+          renderedAction = action;
+        }).catch((err) => this.logger.warn(
           { err, attempt: attempt.id }, "adopted recovery status update failed"
         ));
       };
@@ -16215,22 +16222,23 @@ export class Orchestrator {
       recoveryRuntime.onEvent(async (event) => {
         switch (event.kind) {
           case "agent-text":
+            adoptedText += event.text;
             renderer.feed(event.text);
             return;
           case "tool-start":
             await renderer.flush();
-            await updateCard(`Tool: ${event.title ?? event.kindLabel ?? "…"}`);
+            updateCard(`Tool: ${event.title ?? event.kindLabel ?? "…"}`);
             return;
           case "tool-update":
-            await updateCard(event.status === "completed" || event.status === "failed"
+            updateCard(event.status === "completed" || event.status === "failed"
               ? "Working…"
               : `Tool: ${event.title ?? "…"}`);
             return;
           case "agent-thought":
-            await updateCard("Thinking…");
+            updateCard("Thinking…");
             return;
           case "agent-state":
-            await updateCard(event.state);
+            updateCard(event.state);
             return;
           case "agent-file":
             await renderer.flush();
@@ -16253,7 +16261,7 @@ export class Orchestrator {
             return;
         }
       });
-      void updateCard("Reconnected to session");
+      updateCard("Reconnected to session");
     }
     this.remoteAdoptionWaiters.get(attempt.id)?.();
     this.remoteAdoptionWaiters.delete(attempt.id);
@@ -16283,13 +16291,18 @@ export class Orchestrator {
         return;
       }
       if (recoveryRuntime && adoptedRenderer) {
-        await Promise.race([
-          recoveryRuntime.idle(),
-          new Promise<void>((resolve) => setTimeout(resolve, 5_000)),
-        ]);
+        // The result frame can arrive before the ACP reader queues preceding stdout.
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        await recoveryRuntime.idle();
         await adoptedRenderer.whenIdle();
+        const start = adoptedText ? result.text.lastIndexOf(adoptedText) : 0;
+        const through = start < 0 ? 0 : start + adoptedText.length;
+        const unseen = result.text.slice(through);
+        if (unseen) adoptedRenderer.feed(!adoptedText && binding.modelFallbackNotice
+          ? `${binding.modelFallbackNotice}\n\n${unseen}` : unseen);
         collectOnly = true;
         await adoptedRenderer.finalize();
+        adoptedCardSettled = true;
         await adoptedStatusQueue?.idle();
       }
       const failed = result.status === "failed";
@@ -16323,7 +16336,7 @@ export class Orchestrator {
       if (adoptedRenderer) {
         const texts = [...adoptedChunks];
         if (failed) texts.push(`❌ ${error}`);
-        else if (texts.length === 0 && snapshot.outputAckedThrough === undefined && output.trim()) {
+        else if (texts.length === 0 && output.trim()) {
           texts.push(...await streamingMessageChunks(output));
         } else if (texts.length === 0 && !output.trim()) {
           texts.push("✅ Done — no output.");

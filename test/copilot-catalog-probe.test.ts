@@ -440,6 +440,22 @@ describe("Copilot isolated catalog probing (#234)", () => {
     }
   });
 
+  it("collapses a model Copilot lists twice (1.0.89 lists auto twice)", async () => {
+    const models = modelFixtures(3);
+    const harness = fakeCopilotSpawner({ models: [{ ...models[0]!, priceCategory: undefined }, ...models] });
+    const probe = await probeCopilotCatalog({
+      cliPath: "/configured/bin/copilot",
+      cwd: "/credential/scope",
+      env: { PATH: "/bin" },
+      timeoutMs: 2_000,
+      overallTimeoutMs: 10_000,
+      cleanupTimeoutMs: 100,
+      spawnProcess: harness.spawnProcess,
+    });
+    expect(probe.models.map((model) => model.modelId)).toEqual(models.map((model) => model.id));
+    expect(probe.models[0]!.priceCategory).toBe(models[0]!.priceCategory ?? null);
+  });
+
   it("fails atomically and cleans every process/session on a partial probe error", async () => {
     const harness = fakeCopilotSpawner({ models: modelFixtures(10), failModel: "fixture-05" });
     await expect(probeCopilotCatalog({

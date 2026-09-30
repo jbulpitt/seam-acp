@@ -23258,11 +23258,20 @@ export class Orchestrator {
     const record = this.store.getByChannel(PLATFORM, channel.id);
     if (record && this.bridgeHub) {
       try {
-        const ferried = await this.bridgeHub.readAttachmentForSession(
-          record.id,
-          opts.preferredRoot ?? this.effectiveCwd(record),
-          reqPath
-        );
+        const cwd = opts.preferredRoot ?? this.effectiveCwd(record);
+        const bridgeId = this.bridgeHub.sessionBridgeId(record.id)
+          ?? this.router.describeConfig(record).location.value;
+        let ferried: { bytes: Buffer; filename: string; size: number } | null = null;
+        if (this.config.ATTACH_ALLOW_ANY_PATH && this.bridgeHub.muxFor(bridgeId)) {
+          // The operator allowed any readable path; the host's user permissions are the limit.
+          const file = await this.bridgeHub.readHostFile(
+            bridgeId,
+            path.isAbsolute(reqPath) ? reqPath : path.resolve(cwd, reqPath)
+          );
+          ferried = { bytes: Buffer.from(file.bytesBase64, "base64"), filename: file.filename, size: file.size };
+        } else {
+          ferried = await this.bridgeHub.readAttachmentForSession(record.id, cwd, reqPath);
+        }
         if (ferried) {
           const MAX = 25 * 1024 * 1024;
           if (ferried.size > MAX) {
@@ -23280,8 +23289,9 @@ export class Orchestrator {
         }
       } catch (err) {
         this.logger.warn({ err, reqPath, session: record.id }, "remote seam-attach ferry failed");
+        const cause = err instanceof Error ? err.message : String(err);
         await this.adapter
-          .sendMessage(channel, `_(couldn't read the file from the host: \`${reqPath}\`)_${note}`)
+          .sendMessage(channel, `_(couldn't read \`${reqPath}\` from the host: ${cause})_${note}`)
           .catch(() => {});
         return;
       }

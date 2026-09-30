@@ -61,25 +61,40 @@ before running any procedure in this runbook:
    of picker values → API models → context windows. Treat it as stale if any
    version has changed since the date shown.
 
-## Current verified picture (last updated 2026-09-02, claude-agent-acp 0.73.0 + ACP SDK 1.4.0, no patch)
+## Current verified picture (last updated 2026-09-30, claude-agent-acp 0.84.0 + Claude Code 2.1.285, no patch)
 
 This table is the *output* of the §4 process, kept here as a quick reference.
 **It is not a substitute for re-running §4 after any update** — treat it as stale
-the moment you touch versions. Model IDs are now **bare** (no `[1m]` suffix); each
+the moment you touch versions. Model IDs are **bare** (no `[1m]` suffix); each
 model's native window comes from the `CLAUDE_CONTEXT_WINDOWS` table in
 `claude.ts`, and the agent also reports the true window at runtime via
 `UsageUpdate.size`.
 
-| Picker value | Resolves to (JSONL) | Window | Mechanism |
-|---|---|---|---|
-| `default` ⭐ | claude-opus-5-5 (auto-rolls; re-verified 2026-09-24) | 1M | alias (Max → latest Opus) |
-| `claude-opus-5-5` | claude-opus-5-5 | 1M | full ID (`ANTHROPIC_MODEL` + exact-match); verified 2026-09-24 on claude-agent-acp 0.81.1 |
-| `claude-fable-5-1` | claude-fable-5-1 | 1M | full ID (`ANTHROPIC_MODEL` + exact-match) |
-| `claude-opus-5` | claude-opus-5 | 1M | full ID (`ANTHROPIC_MODEL` + exact-match) |
-| `claude-opus-4-8` | claude-opus-4-8 | 1M | full ID (`ANTHROPIC_MODEL` + exact-match) |
-| `claude-opus-4-7` | claude-opus-4-7 | 1M | full ID (`ANTHROPIC_MODEL` + exact-match) |
-| `claude-fable-5` | claude-fable-5 | 1M | full ID (`ANTHROPIC_MODEL` + exact-match) |
-| `claude-sonnet-5` | claude-sonnet-5 | 1M | full ID (`ANTHROPIC_MODEL` + exact-match) |
+Every row below was re-verified on 2026-09-30 through the Seam mechanism (canonical
+id forwarded via `ANTHROPIC_MODEL`). Each showed `usage_update.size` 1000000 and a
+raw `claude /context` denominator of 1m.
+
+| Picker value | Resolves to (JSONL) | Window |
+|---|---|---|
+| `default` ⭐ | claude-opus-5-5 (auto-rolls) | 1M |
+| `claude-opus-5-5` | claude-opus-5-5 | 1M |
+| `claude-sonnet-5-5` | claude-sonnet-5-5 | 1M |
+| `claude-fable-5-1` | claude-fable-5-1 | 1M |
+| `claude-opus-5` | claude-opus-5 | 1M |
+| `claude-opus-4-8` | claude-opus-4-8 | 1M |
+| `claude-opus-4-7` | claude-opus-4-7 | 1M |
+| `claude-fable-5` | claude-fable-5 | 1M |
+| `claude-sonnet-5` | claude-sonnet-5 | 1M |
+
+**`claude-sonnet-5-5` needs 0.84.0 or later.** On 0.81.1 the JSONL model was correct,
+but the bundled SDK ran it as a 200K model (`size` 200000; raw CLI 2.1.282
+`/context` showed 200k).
+
+**Changes in 0.84.0 to know about:**
+- It advertises bare ids (`opus`, `claude-fable-5-1`, …) instead of `[1m]` variants, plus more full ids. It still does not advertise `claude-sonnet-5-5` or `claude-opus-5-5`, so the overlay and `ANTHROPIC_MODEL` forwarding stay required.
+- `opus` now resolves to claude-opus-5-5 and `sonnet` to claude-sonnet-5-5. Keep them out of the picker anyway (rule below).
+- Per-model default effort, read from the JSONL with no effort set: opus-5-5 and sonnet-5-5 use medium; fable-5-1, opus-5, opus-4-8, fable-5 and sonnet-5 use high; opus-4-7 uses xhigh.
+- 0.82.0 introduced the "AIR tool call contract" (upstream #1153). Tool-call rendering must handle it (#724).
 
 **Account caveat (covered, but keep testing):** a raw 0.73.0 wrapper session on
 some deployments reject full IDs that are absent from the advertised

@@ -169,22 +169,23 @@ describe("#232 direct Claude publishes the live list plus verified overlays", ()
       "claude-opus-4-7",
       "claude-fable-5",
       "claude-sonnet-5",
+      "claude-sonnet-5-5",
     ]);
     const opus5 = candidate.models.find((model) => model.id === "claude-opus-5")!;
     const record = opus5.evidence![0]!;
     expect(record).toMatchObject({
       kind: "verified-record",
       source: "operator JSONL verification",
-      runtimeVersion: "claude-agent-acp 0.73.0",
+      runtimeVersion: "claude-agent-acp 0.84.0",
       resolvedModel: "claude-opus-5",
     });
-    expect(record.observedAt).toContain("2026-09-02");
+    expect(record.observedAt).toContain("2026-09-30");
     expect(record.context).toMatchObject({ native: 1_000_000 });
     expect(record.effort?.choices).toEqual(["default", "low", "medium", "high", "xhigh", "max"]);
     expect(record.note).toContain("credential scope default");
     // Existing verified models keep their proven native window.
     expect(opus5.context).toEqual({ native: 1_000_000, maximum: 1_000_000, effective: 1_000_000 });
-    expect(candidate.sourceVersion).toBe("overlay-v2");
+    expect(candidate.sourceVersion).toBe("overlay-v3");
   });
 
   it("merges by canonical identity without duplicating the [1m] variant", async () => {
@@ -223,7 +224,7 @@ describe("#232 direct Claude publishes the live list plus verified overlays", ()
     const verified = fallback.evidence!.find((r) => r.kind === "verified-record")!;
     expect(live.resolvedModel).toBeUndefined();
     expect(verified.resolvedModel).toBe("claude-opus-5-5");
-    expect(verified.observedAt).toContain("2026-09-24");
+    expect(verified.observedAt).toContain("2026-09-30");
     expect(fallback.context.native).toBe(1_000_000);
   });
 
@@ -370,6 +371,7 @@ describe("#232 scope, determinism, and failure handling", () => {
     expect(base.models.map((m) => m.id)).toEqual([
       "default", "opus[1m]", "claude-fable-5-1", "sonnet", "haiku",
       "claude-opus-5-5", "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7", "claude-fable-5", "claude-sonnet-5",
+      "claude-sonnet-5-5",
     ]);
     // No row on the alternate profile carries evidence captured elsewhere.
     for (const model of alternate.models) {

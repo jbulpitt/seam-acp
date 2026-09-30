@@ -195,7 +195,7 @@ export class ModelMetadataStore {
       : { model: null, ...(matches.length > 1 ? { ambiguous_variant_ids: matches.map((row) => row.variant_id ?? row.id) } : {}) };
   }
 
-  query(input: ModelMetadataQuery = {}): ModelMetadataQueryResult {
+  query(input: ModelMetadataQuery = {}, visible?: (rows: ModelMetadata[]) => ModelMetadata[]): ModelMetadataQueryResult {
     validateQuery(input);
     const filters = input.filters ?? {};
     const allRows = this.getAll();
@@ -245,6 +245,7 @@ export class ModelMetadataStore {
     if (filters.hasBenchmark !== undefined) {
       rows = rows.filter((row) => (Object.keys(row.benchmarks).length > 0) === filters.hasBenchmark);
     }
+    if (visible) rows = visible(rows);
     rows.sort(sorter(input.sort));
     if (input.limit !== undefined) rows = rows.slice(0, input.limit);
     const activeGeneration = this.activeIntelligenceGeneration();

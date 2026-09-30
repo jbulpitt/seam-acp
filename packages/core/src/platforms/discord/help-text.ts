@@ -87,6 +87,7 @@ export function seamHelpSections(): string[] {
       "`/seamadmin debug` — `work` `status` `voice-ping` `voice-capture` `voice-live`",
       "`/seamadmin voice` — `start` `add` `remove` `configure` `console` `status` `stop`",
       "`/seamadmin catalog refresh <agent@location|all>` — refresh the operational model catalog",
+      "`/seamadmin models` — `hide <pattern>` `unhide <pattern>` `list` (pinned models keep working)",
       "`/seamadmin restrictions` — set, list, or clear agent channel allowlists",
     ].join("\n"),
   ];

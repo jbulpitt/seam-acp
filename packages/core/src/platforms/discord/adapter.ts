@@ -590,7 +590,7 @@ export class DiscordAdapter implements ChatAdapter {
     const member = guild ? await guild.members.fetch(actorId).catch(() => null) : null;
     const messageId = "messageId" in spec ? spec.messageId : undefined;
     const message = messageId ? await channel.messages.fetch(messageId) : undefined;
-    const slashTypes = spec.kind === "slash" ? validateSlashSpec(spec, buildSlashRegistrationBody()) : undefined;
+    const slashTypes = spec.kind === "slash" || spec.kind === "autocomplete" ? validateSlashSpec(spec, buildSlashRegistrationBody()) : undefined;
     const interaction = new SyntheticInteraction(
       spec,
       { client: this.client, channel: channel as never, user, member, ...(message ? { message } : {}) },

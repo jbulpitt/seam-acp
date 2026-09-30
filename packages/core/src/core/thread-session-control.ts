@@ -238,7 +238,7 @@ export class ThreadSessionControlService {
     const catalogDefault = this.deps.modelCatalog.models({
       agentId: nextAgent,
       location,
-    }).find((model) => model.default);
+    }, { includeHidden: true }).find((model) => model.default);
     const requestedTargetModel = requestedModel ?? (agentChanged ? catalogDefault?.id : before.model.value);
     if (!requestedTargetModel) {
       return {
@@ -423,7 +423,7 @@ export class ThreadSessionControlService {
     const catalogDefault = this.deps.modelCatalog.models({
       agentId: nextAgentId,
       location,
-    }).find((model) => model.default);
+    }, { includeHidden: true }).find((model) => model.default);
     const requestedTargetModel = requestedModel ?? (agentChanged ? catalogDefault?.id ?? "default" : before.model.value);
     if (!requestedTargetModel) {
       return {
@@ -834,7 +834,7 @@ export class ThreadSessionControlService {
     void profile;
     void target;
     void agentChanged;
-    return binding ? this.deps.modelCatalog.models(binding).map((model) => model.id) : [];
+    return binding ? this.deps.modelCatalog.models(binding, { includeHidden: true }).map((model) => model.id) : [];
   }
 
   private async forgeFreshSession(

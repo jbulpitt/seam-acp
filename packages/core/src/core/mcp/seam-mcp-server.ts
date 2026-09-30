@@ -263,7 +263,7 @@ export interface SeamMcpServerDeps {
   getModelValueRankings?: (options: {
     tier?: string;
     benchmark?: string;
-  }) => ModelValueRankingsResult;
+  }, caller?: SessionRecord) => ModelValueRankingsResult;
   /**
    * Read the durable upstream service-status snapshot (#184). Cache only: it
    * performs no network work. Undefined ⇒ the service-status subsystem is not
@@ -281,7 +281,7 @@ export interface SeamMcpServerDeps {
   /** Read one model from the durable metadata cache. Never performs live I/O. */
   getModelMetadata?: (idOrSlug: string) => ModelMetadataGetResult;
   /** Query the durable metadata cache. Never performs live I/O. */
-  queryModelMetadata?: (options: ModelMetadataQuery) => ModelMetadataQueryResult;
+  queryModelMetadata?: (options: ModelMetadataQuery, caller?: SessionRecord) => ModelMetadataQueryResult;
   /** Inspect one Seam-staged image through a configured vision sidecar. The
    *  caller remains token-scoped; the implementation owns path containment. */
   inspectImage?: (
@@ -1080,14 +1080,15 @@ const TOOLS = [
   {
     name: "tester_interact",
     description:
-      "Click a button, pick from a dropdown, submit a form, or run a slash command in a TEST deployment, " +
+      "Click a button, pick from a dropdown, submit a form, run a slash command or query autocomplete in a TEST deployment, " +
       "acting as its test user. Discord's rules apply: the handler must acknowledge within 3 s (10062 after), " +
       "only once (40060), and follow-ups end after 15 min. Ephemeral replies are posted in the thread with a " +
       "marker. Returns every reply/defer/edit/modal the handlers made. Get message and button ids from tester_read.",
     inputSchema: {
       type: "object",
       properties: {
-        kind: { type: "string", enum: ["button", "select", "modal", "slash"] },
+        kind: { type: "string", enum: ["button", "select", "modal", "slash", "autocomplete"] },
+        focused: { type: "string", description: "Focused option name for autocomplete; its value comes from options." },
         channel: { type: "string", description: "Test channel or thread id." },
         messageId: { type: "string", description: "Message holding the button or dropdown (button/select; optional for modal)." },
         customId: { type: "string", description: "The component's or modal's custom id (button/select/modal)." },
@@ -1436,7 +1437,8 @@ const TOOLS = [
     description:
       "Propose a configuration change for YOUR OWN thread. This does NOT apply anything: it posts a " +
       "confirmation card in your thread showing the exact before→after diff, and a human must click " +
-      "Apply before it takes effect. Provide EXACTLY ONE of `session`, `preset`, `channelPreset`, `threadPreset`, or `schedule`.\n" +
+      "Apply before it takes effect. Provide EXACTLY ONE of `session`, `preset`, `channelPreset`, `threadPreset`, `schedule`, or `models`.\n" +
+      "- models: hide/unhide [agent[@host]:]model-glob patterns across this deployment; a config admin confirms. Pinned models and exact typed ids keep working.\n" +
       "- session: your thread's own runtime config (agent, model, effort, role, cwd, permission, statusCardStyle, simpleCardGif, disableThreadPrefix).\n" +
       "- preset: create/update a reusable specialist preset in this thread's project (including an optional role copied on apply).\n" +
       "- threadPreset: THIS thread's own preset in channel-presets.json (agent/model/role/cwd/effort/rider/statusCardStyle/simpleCardGif/disableThreadPrefix/detached/location/tts). " +
@@ -1452,11 +1454,17 @@ const TOOLS = [
       "NOTE: scheduled prompts carry NO file attachments, anywhere — a mutation naming one is refused. " +
       "For substantial instructions, commit a runbook to the repository and have `promptText` ask the " +
       "agent to read it.\n" +
-      "You can only ever change your OWN thread/channel — cross-thread config is not available here, and a " +
+      "Except for deployment-wide model hiding, you can only change your OWN thread/channel, and a " +
       "locked channel refuses every change.",
     inputSchema: {
       type: "object",
       properties: {
+        models: {
+          type: "object",
+          properties: { action: { type: "string", enum: ["hide", "unhide"] }, pattern: { type: "string" } },
+          required: ["action", "pattern"],
+          additionalProperties: false,
+        },
         session: {
           type: "object",
           description: "Tier A — your thread's own session config.",
@@ -2278,9 +2286,9 @@ export class SeamMcpServer {
         case "model_metadata_get":
           return rpcResult(id, this.toolModelMetadataGet(args));
         case "model_metadata_query":
-          return rpcResult(id, this.toolModelMetadataQuery(args));
+          return rpcResult(id, this.toolModelMetadataQuery(args, record));
         case "model_value_rankings":
-          return rpcResult(id, this.toolModelValueRankings(args));
+          return rpcResult(id, this.toolModelValueRankings(args, record));
         case "canary_run":
           return rpcResult(id, await this.toolCanaryRun(args));
         case "tester_post":
@@ -2432,14 +2440,16 @@ export class SeamMcpServer {
           fields: Object.fromEntries(Object.entries((args.fields ?? {}) as Record<string, unknown>).map(([k, v]) => [k, String(v)])),
           ...(str("messageId") ? { messageId: str("messageId")! } : {}) };
         break;
+      case "autocomplete":
       case "slash":
         spec = { kind, channelId, command: requireString(args, "command"),
+          ...(kind === "autocomplete" ? { focused: requireString(args, "focused") } : {}),
           ...(str("subcommandGroup") ? { subcommandGroup: str("subcommandGroup")! } : {}),
           ...(str("subcommand") ? { subcommand: str("subcommand")! } : {}),
           ...(args.options && typeof args.options === "object" ? { options: args.options as Record<string, string | number | boolean> } : {}) };
         break;
       default:
-        return textResult(`kind must be button, select, modal or slash (got ${kind})`, true);
+        return textResult(`kind must be button, select, modal, slash or autocomplete (got ${kind})`, true);
     }
     const result = await this.deps.testDriver.interact(spec);
     return textResult(JSON.stringify(result, null, 2));
@@ -3262,7 +3272,7 @@ export class SeamMcpServer {
 
   /** Fast cache-only model metadata query. The refresh source is deliberately
    * absent from SeamMcpServerDeps, making live I/O impossible on this path. */
-  private toolModelMetadataQuery(args: Record<string, unknown>): McpToolResult {
+  private toolModelMetadataQuery(args: Record<string, unknown>, caller?: SessionRecord): McpToolResult {
     if (!this.deps.queryModelMetadata) {
       return textResult("Model metadata is not supported on this deployment.", true);
     }
@@ -3279,7 +3289,7 @@ export class SeamMcpServer {
       ...(filters ? { filters } : {}),
       ...(sort ? { sort } : {}),
       ...(typeof limitValue === "number" ? { limit: limitValue } : {}),
-    });
+    }, caller);
     return {
       content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
       structuredContent: result,
@@ -3288,7 +3298,7 @@ export class SeamMcpServer {
 
   /** Fast, cache-only model ranking. Structured data is primary; the matching
    * JSON text block preserves compatibility with clients that ignore it. */
-  private toolModelValueRankings(args: Record<string, unknown>): McpToolResult {
+  private toolModelValueRankings(args: Record<string, unknown>, caller?: SessionRecord): McpToolResult {
     if (!this.deps.getModelValueRankings) {
       return textResult("Model value ranking data is not supported on this deployment.", true);
     }
@@ -3297,7 +3307,7 @@ export class SeamMcpServer {
     const rankings = this.deps.getModelValueRankings({
       ...(tier ? { tier } : {}),
       ...(benchmark ? { benchmark } : {}),
-    });
+    }, caller);
     return {
       content: [{ type: "text", text: JSON.stringify(rankings, null, 2) }],
       structuredContent: rankings,
@@ -3921,6 +3931,9 @@ export class SeamMcpServer {
     }
 
     const input: ConfigMutationInput = {};
+    if (args.models && typeof args.models === "object") {
+      input.models = args.models as ConfigMutationInput["models"];
+    }
     if (args.session && typeof args.session === "object") {
       input.session = args.session as ConfigMutationInput["session"];
     }

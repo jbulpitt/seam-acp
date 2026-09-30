@@ -25,6 +25,7 @@ import {
   type CatalogReductionPolicy,
 } from "@seam/adapters";
 import type { Logger } from "../../lib/logger.js";
+import { modelPatternMatches, type ModelHideList } from "./hide-list.js";
 import {
   catalogBindingContinuityFingerprint,
   type CatalogObservationRow,
@@ -193,6 +194,7 @@ export class ModelCatalogService {
 
   constructor(private readonly options: {
     store: ModelCatalogStore;
+    hideList?: ModelHideList;
     logger: Logger;
     bindings: () => ReadonlyArray<CatalogBinding>;
     /** Exact locally configured profiles; never inferred from remote presence. */
@@ -336,8 +338,23 @@ export class ModelCatalogService {
     return { state: online ? "ready" : "stale", snapshot, observation };
   }
 
-  models(binding: CatalogBinding): ReadonlyArray<CatalogModel> {
-    return this.lookup(binding).snapshot?.candidate.models ?? [];
+  get hideList(): ModelHideList | undefined { return this.options.hideList; }
+
+  isHidden(binding: CatalogBinding, id: string): boolean {
+    return this.options.hideList?.hidden(binding, this.model(binding, id)?.id ?? id) ?? false;
+  }
+
+  models(binding: CatalogBinding, view: { current?: string; includeHidden?: boolean } = {}): ReadonlyArray<CatalogModel> {
+    const models = this.lookup(binding).snapshot?.candidate.models ?? [];
+    if (view.includeHidden || !this.options.hideList) return models;
+    const patterns = this.options.hideList.list();
+    const current = view.current ? this.model(binding, view.current)?.id ?? view.current : undefined;
+    const visible = models.flatMap((model) => {
+      if (!patterns.some((pattern) => modelPatternMatches(pattern, binding, model.id))) return [model];
+      return model.id === current ? [{ ...model, displayName: `${model.displayName} (hidden)` }] : [];
+    });
+    const pinned = visible.find((model) => model.id === current);
+    return pinned ? [pinned, ...visible.filter((model) => model !== pinned)] : visible;
   }
 
   /**
@@ -359,7 +376,7 @@ export class ModelCatalogService {
       if (!snapshot?.candidate.models.length) continue;
       return {
         from: { agentId: observation.agentId, location: observation.location },
-        models: snapshot.candidate.models,
+        models: snapshot.candidate.models.filter((model) => !this.isHidden(binding, model.id)),
       };
     }
     return null;
@@ -367,7 +384,7 @@ export class ModelCatalogService {
 
   model(binding: CatalogBinding, idOrAlias: string): CatalogModel | null {
     const wanted = idOrAlias.trim().toLowerCase();
-    const models = this.models(binding);
+    const models = this.models(binding, { includeHidden: true });
     if (wanted === "default") return models.find((model) => model.default) ?? null;
     return models.find((model) =>
       model.id.toLowerCase() === wanted || model.aliases.some((alias) => alias.toLowerCase() === wanted)
@@ -424,7 +441,7 @@ export class ModelCatalogService {
 
 
   decode(binding: CatalogBinding, raw: RawCatalogSelection): NormalizedCatalogSelection | null {
-    return decodeCatalogSelection(this.models(binding), raw);
+    return decodeCatalogSelection(this.models(binding, { includeHidden: true }), raw);
   }
 
   refresh(

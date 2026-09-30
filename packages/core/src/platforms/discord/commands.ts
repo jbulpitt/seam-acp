@@ -720,7 +720,16 @@ export function buildSeamAdminCommand(): SlashCommandBuilder {
       )
   );
 
-  // --- groups (9) -----------------------------------------------------------
+  cmd.addSubcommandGroup((group) => group
+    .setName("models")
+    .setDescription("Hide models from lists without banning their use")
+    .addSubcommand((sub) => sub.setName("hide").setDescription("Hide matching models")
+      .addStringOption((option) => option.setName("pattern").setDescription("[agent[@host]:]model-glob").setRequired(true)))
+    .addSubcommand((sub) => sub.setName("unhide").setDescription("Remove a hide pattern")
+      .addStringOption((option) => option.setName("pattern").setDescription("Exact hide pattern to remove").setRequired(true)))
+    .addSubcommand((sub) => sub.setName("list").setDescription("List hidden model patterns")));
+
+  // --- groups --------------------------------------------------------------
 
   cmd.addSubcommandGroup((g) =>
     g

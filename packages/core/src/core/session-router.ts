@@ -1243,7 +1243,7 @@ export class SessionRouter {
   private planModelFallbacks(binding: { agentId: string; location: string }, model: string, effort: string | undefined, requiredContextTokens: number | null): ModelFallbackPlan {
     const { agentId, location } = binding;
     try {
-      const catalog = this.modelCatalog.models({ agentId, location });
+      const catalog = this.modelCatalog.models({ agentId, location }, { includeHidden: true });
       return planModelFallbacks({ agentId, location, model, effort, requiredContextTokens,
         metadata: this.modelMetadata?.getAll() ?? [], catalog });
     } catch (err) {

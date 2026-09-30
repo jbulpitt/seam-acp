@@ -168,6 +168,7 @@ export interface DraftAgentCapabilities {
 }
 
 export interface HubRenderContext {
+  modelHidden?: boolean;
   effortDisabled?: boolean;
   /** True when the drafted agent has no Fast mode (#37) — Claude-only, and only
    *  for direct-Anthropic backends. Disables the Fast control rather than
@@ -857,7 +858,7 @@ export function renderHub(
         pins.model ? "channel" : "default",
         draftNoteFor(o.channelModel, "not set")
       )
-    : fieldLine(code(s.model.value), sourceLabel(s.model.source), draftNoteFor(o.model, w.model));
+    : fieldLine(`${code(s.model.value)}${ctx.modelHidden ? " (hidden)" : ""}`, sourceLabel(s.model.source), draftNoteFor(o.model, w.model));
   const effortLine = channelScope
     ? fieldLine(
         pins.effort ? code(pins.effort) : "`not set`",

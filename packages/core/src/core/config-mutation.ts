@@ -37,6 +37,7 @@ import type { Logger } from "../lib/logger.js";
 import { parkedAgentMessage } from "./parked-agents.js";
 import type { ConfigDescription } from "./session-router.js";
 import { assessModelSelection, type ModelCatalogService, type ModelVerification } from "./model-catalog/service.js";
+import { normalizeModelPattern, type ModelHideList } from "./model-catalog/hide-list.js";
 import { validateCron, describeCron } from "./scheduled-prompts/cron.js";
 import { legacyAttachmentQuarantine } from "./scheduled-prompts/quarantine.js";
 import { FAST_MODE_COST_WARNING, FAST_MODE_RESET_NOTICE } from "./fast-mode.js";
@@ -63,7 +64,8 @@ export type ConfigMutationTier =
   | "schedule"
   | "bridge"
   | "runtime-provenance"
-  | "agent-channel-restriction";
+  | "agent-channel-restriction"
+  | "model-hide";
 
 /** Tier A — the calling thread's own session config. */
 export interface SessionConfigChanges {
@@ -223,6 +225,7 @@ export interface ScheduleChanges {
 /** A single `config_propose` request. Exactly one tier per call (D8: intent-
  *  shaped, not a table-mapped CRUD surface). */
 export interface ConfigMutationInput {
+  models?: { action: "hide" | "unhide"; pattern: string };
   session?: SessionConfigChanges;
   preset?: PresetChanges;
   channelPreset?: ChannelPresetChanges;
@@ -337,6 +340,7 @@ export interface ConfigMutationDeps {
   describeConfig: (record: SessionRecord) => ConfigDescription;
   /** Sole cache-only authority for operational model capabilities. */
   modelCatalog: Pick<ModelCatalogService, "model">;
+  modelHideList?: ModelHideList;
   /** Agent registration is independent of whether its model cache is warm. */
   isAgentAvailable?: (agentId: string, location: string) => boolean;
   /**
@@ -447,6 +451,7 @@ export class ConfigMutationService {
    */
   buildProposal(record: SessionRecord, input: ConfigMutationInput): BuildProposalResult {
     const tiers = [
+      input.models ? "model-hide" : null,
       input.session ? "session" : null,
       input.preset ? "preset" : null,
       input.channelPreset ? "channel-preset" : null,
@@ -458,7 +463,7 @@ export class ConfigMutationService {
       return {
         ok: false,
         error:
-          "Nothing to change. Provide exactly one of `session`, `preset`, `channelPreset`, `threadPreset`, or `schedule`.",
+          "Nothing to change. Provide exactly one of `session`, `preset`, `channelPreset`, `threadPreset`, `schedule`, or `models`.",
       };
     }
     if (tiers.length > 1) {
@@ -466,16 +471,43 @@ export class ConfigMutationService {
         ok: false,
         error:
           "One change at a time. A proposal must touch exactly one of `session`, " +
-          "`preset`, `channelPreset`, `threadPreset`, or `schedule` so the confirmation is unambiguous.",
+          "`preset`, `channelPreset`, `threadPreset`, `schedule`, or `models` so the confirmation is unambiguous.",
       };
     }
 
     const tier = tiers[0];
+    if (tier === "model-hide") return this.buildModelHideProposal(input.models!);
     if (tier === "session") return this.buildSessionProposal(record, input.session!);
     if (tier === "preset") return this.buildPresetProposal(record, input.preset!);
     if (tier === "thread-preset") return this.buildThreadPresetProposal(record, input.threadPreset!);
     if (tier === "schedule") return this.buildScheduleProposal(record, input.schedule!);
     return this.buildChannelPresetProposal(record, input.channelPreset!);
+  }
+
+  buildModelHideProposal(changes: NonNullable<ConfigMutationInput["models"]>): BuildProposalResult {
+    const list = this.deps.modelHideList;
+    if (!list) return { ok: false, error: "Model hiding is not configured on this deployment." };
+    let pattern: string;
+    try {
+      if (changes.action !== "hide" && changes.action !== "unhide") throw new Error("Use hide or unhide.");
+      pattern = normalizeModelPattern(changes.pattern);
+    } catch (err) {
+      return { ok: false, error: (err as Error).message };
+    }
+    const before = list.list();
+    const after = changes.action === "hide" ? [...new Set([...before, pattern])] : before.filter((entry) => entry !== pattern);
+    const id = randomUUID();
+    return { ok: true, proposal: {
+      id, tier: "model-hide", scope: "deployment", title: `${changes.action === "hide" ? "Hide" : "Unhide"} models: ${pattern}`,
+      fields: [{ label: "Hidden model patterns", before: before.join(", ") || "none", after: after.join(", ") || "none" }],
+      warnings: ["Pinned models and exact typed ids keep working."], restartsSession: false,
+      apply: (actor) => {
+        const change = list.change(changes.action, pattern);
+        const audit = this.writeAudit({ tier: "model-hide", scope: "deployment", correlationId: id, actor,
+          summary: `${changes.action} ${pattern}`, before: change.before, after: change.after });
+        return { ok: true, auditId: audit.id, message: `Model pattern \`${pattern}\` ${changes.action === "hide" ? "hidden" : "unhidden"}. Pinned models keep working.` };
+      },
+    } };
   }
 
   /**

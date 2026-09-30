@@ -121,6 +121,8 @@ import { fetchCopilotPricing } from "./core/model-value/sources.js";
 import { ModelIntelligenceStore } from "./core/model-intelligence/store.js";
 import { ModelIntelligenceManager } from "./core/model-intelligence/manager.js";
 import { ModelCatalogService, ModelCatalogStore } from "./core/model-catalog/index.js";
+import { ModelHideList } from "./core/model-catalog/hide-list.js";
+import { visibleModelMetadata, visibleModelRankings } from "./core/model-catalog/listings.js";
 import type { AdapterCatalogCandidate, AgentProfile } from "@seam/adapters";
 import { ModelValueRankingsCard } from "./core/model-value/rankings-card.js";
 import { LiveMessageSearch, MessageReader } from "./core/message-reader.js";
@@ -541,6 +543,7 @@ async function main(): Promise<void> {
   );
   const modelCatalog = new ModelCatalogService({
     store: modelCatalogStore,
+    hideList: new ModelHideList(path.join(config.DATA_DIR, "model-hide.json"), logger),
     logger: logger.child({ mod: "model-catalog" }),
     configuredLocalAgentIds: () => localCatalogProfiles().map((profile) => profile.id),
     bindings: () => {
@@ -1135,9 +1138,20 @@ async function main(): Promise<void> {
             refreshServiceStatus: (options) => serviceStatusView!.refresh(options),
           }
         : {}),
-      getModelValueRankings: (options) => modelValueStore.getRankings(options),
+      getModelValueRankings: (options, caller) => {
+        const current = caller ? router.describeConfig(caller) : undefined;
+        return visibleModelRankings(modelCatalog, modelValueStore.getRankings(options), current ? {
+          agentId: current.agent.value, location: current.location.value, model: current.model.value,
+        } : undefined);
+      },
       getModelMetadata: (idOrSlug) => modelMetadataStore.get(idOrSlug),
-      queryModelMetadata: (options) => modelMetadataStore.query(options),
+      queryModelMetadata: (options, caller) => {
+        const current = caller ? router.describeConfig(caller) : undefined;
+        const result = modelMetadataStore.query(options, (rows) => visibleModelMetadata(modelCatalog, rows, current ? {
+          agentId: current.agent.value, location: current.location.value, model: current.model.value,
+        } : undefined));
+        return result;
+      },
       // NO inspect_image BACKEND (#377). The only one was an agy-package
       // sidecar, removed with that agent: 0 sessions and 0 turn attempts for
       // agy-package, 0 for ollama-cloud (its only permitted caller), and

@@ -34,15 +34,17 @@ export type TestInteractionSpec =
   | { kind: "select"; channelId: string; messageId: string; customId: string; values: string[] }
   | { kind: "modal"; channelId: string; messageId?: string; customId: string; fields: Record<string, string> }
   | {
-      kind: "slash";
+      kind: "slash" | "autocomplete";
       channelId: string;
       command: string;
       subcommandGroup?: string;
       subcommand?: string;
       options?: Record<string, string | number | boolean>;
+      focused?: string;
     };
 
 export interface TranscriptEntry {
+  choices?: Array<{ name: string; value: string | number }>;
   op: string;
   atMs: number;
   ephemeral?: boolean;
@@ -117,6 +119,7 @@ class SyntheticOptions {
     private readonly sub: string | null,
     private readonly values: Record<string, string | number | boolean>,
     private readonly types: Map<string, number>,
+    private readonly focused?: string,
   ) {
     const leaf = Object.entries(values).map(([name, value]) => ({ name, type: types.get(name) ?? 3, value }));
     if (sub && group) this.data = [{ name: group, type: 2, options: [{ name: sub, type: 1, options: leaf }] }];
@@ -126,6 +129,11 @@ class SyntheticOptions {
   getSubcommandGroup(required = false): string | null {
     if (required && !this.group) throw discordError("CommandInteractionOptionNoSubcommandGroup", "No subcommand group specified for interaction.");
     return this.group;
+  }
+  getFocused(withName = false): unknown {
+    const name = this.focused ?? "";
+    const value = this.values[name] ?? "";
+    return withName ? { name, value, type: this.types.get(name) ?? 3 } : value;
   }
   getSubcommand(required = true): string | null {
     if (required && !this.sub) throw discordError("CommandInteractionOptionNoSubcommand", "No subcommand specified for interaction.");
@@ -147,7 +155,6 @@ class SyntheticOptions {
     const v = this.get(name, required);
     return v === null ? null : { url: String(v), name: String(v).split("/").pop() ?? "file", size: 0, contentType: null };
   }
-  getFocused(): string { return ""; }
 }
 
 /**
@@ -156,7 +163,7 @@ class SyntheticOptions {
  * and values fit their type and choices. Returns the option type map.
  */
 export function validateSlashSpec(
-  spec: Extract<TestInteractionSpec, { kind: "slash" }>,
+  spec: Extract<TestInteractionSpec, { command: string }>,
   commands: RESTPostAPIApplicationCommandsJSONBody[],
 ): Map<string, number> {
   const command = commands.find((c) => c.name === spec.command);
@@ -195,7 +202,10 @@ export function validateSlashSpec(
     }
   }
   for (const opt of level) {
-    if ("required" in opt && opt.required && !(opt.name in given)) throw new Error(`required option "${opt.name}" is missing`);
+    if (spec.kind !== "autocomplete" && "required" in opt && opt.required && !(opt.name in given)) throw new Error(`required option "${opt.name}" is missing`);
+  }
+  if (spec.kind === "autocomplete" && !level.some((opt) => opt.name === spec.focused && "autocomplete" in opt && opt.autocomplete)) {
+    throw new Error(`option "${spec.focused}" does not support autocomplete`);
   }
   return types;
 }
@@ -262,9 +272,11 @@ export class SyntheticInteraction {
         };
         break;
       }
+      case "autocomplete":
       case "slash":
-        this.type = InteractionType.ApplicationCommand; this.commandName = spec.command;
-        this.options = new SyntheticOptions(spec.subcommandGroup ?? null, spec.subcommand ?? null, spec.options ?? {}, slashTypes ?? new Map());
+        this.type = spec.kind === "autocomplete" ? InteractionType.ApplicationCommandAutocomplete : InteractionType.ApplicationCommand;
+        this.commandName = spec.command;
+        this.options = new SyntheticOptions(spec.subcommandGroup ?? null, spec.subcommand ?? null, spec.options ?? {}, slashTypes ?? new Map(), spec.focused);
         break;
     }
   }
@@ -272,7 +284,7 @@ export class SyntheticInteraction {
   get createdAt(): Date { return new Date(this.createdTimestamp); }
   inGuild(): boolean { return this.guildId !== null; }
   isRepliable(): boolean { return true; }
-  isAutocomplete(): boolean { return false; }
+  isAutocomplete(): boolean { return this.type === InteractionType.ApplicationCommandAutocomplete; }
   isChatInputCommand(): boolean { return this.type === InteractionType.ApplicationCommand; }
   isCommand(): boolean { return this.isChatInputCommand(); }
   isButton(): boolean { return this.componentType === ComponentType.Button; }
@@ -418,7 +430,9 @@ export class SyntheticInteraction {
     });
   }
 
-  async respond(_choices: unknown[]): Promise<void> {
-    this.record({ op: "respond" });
+  async respond(choices: Array<{ name: string; value: string | number }>): Promise<void> {
+    this.acknowledge("respond");
+    this.replied = true;
+    this.record({ op: "respond", choices });
   }
 }

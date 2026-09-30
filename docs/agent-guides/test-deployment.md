@@ -62,11 +62,13 @@ That exercises the real Discord path before a change is merged.
   Returns the thread and message ids.
 - **`tester_read({ channel, after?, limit? })`:** reads messages oldest first,
   including staging's replies and status-card text.
-- **`tester_interact({ kind, channel, ... })`:** `kind` is `slash`, `button`,
+- **`tester_interact({ kind, channel, ... })`:** `kind` is `slash`, `autocomplete`, `button`,
   `select` or `modal`. A stand-in interaction goes into the staging client's
   own event stream, so collectors waiting on a message see it the way they'd
   see a real click. It acts as `SEAM_TEST_DRIVER_ACTOR_ID`, so permission
   checks are real. Get message and custom ids from `tester_read`.
+  For autocomplete, pass `focused` (the option name) and its value in `options`;
+  the transcript returns the choices from the controller's real responder.
 - **`canary_run({ target: "staging" })`:** asks staging for its live bridge
   and agent matrix, runs one real Discord turn for each ready pair in parallel,
   and posts one result card.

@@ -1272,6 +1272,7 @@ export class Orchestrator {
       store: this.store,
       describeConfig: (record) => this.router.describeConfig(record),
       modelCatalog: this.modelCatalog,
+      modelHideList: this.modelCatalog.hideList,
       isAgentAvailable: (agentId, location) => Boolean(this.router.getProfile(agentId, location)),
       ollamaCloudEnabled: this.config.OLLAMA_CLOUD_ENABLED,
       presetsFile: this.config.CHANNEL_PRESETS_FILE,
@@ -1379,7 +1380,15 @@ export class Orchestrator {
     const record = this.store.get(makeSessionId(PLATFORM, ctx.channelId));
     const current = record ? this.router.describeConfig(record).model.value : null;
     if (current && this.modelCatalog.model(binding, current)) return current;
-    return this.modelCatalog.models(binding).find((model) => model.default)?.id ?? null;
+    return this.modelCatalog.model(binding, "default")?.id ?? null;
+  }
+
+  private currentModelForAutocomplete(ctx: AutocompleteContext, binding: CatalogBinding): string | undefined {
+    if (!ctx.channelId || ctx.group === null && ctx.subcommand === "new") return undefined;
+    const record = this.store.get(makeSessionId(PLATFORM, ctx.channelId));
+    if (!record) return undefined;
+    const current = this.router.describeConfig(record);
+    return current.agent.value === binding.agentId && current.location.value === binding.location ? current.model.value : undefined;
   }
 
   /** Connected inventory plus durable observations for offline remote-only agents. */
@@ -1476,7 +1485,7 @@ export class Orchestrator {
       try {
         const binding = this.catalogBinding(ctx);
         if (!binding) return [];
-        const models = this.modelCatalog.models(binding);
+        const models = this.modelCatalog.models(binding, { current: this.currentModelForAutocomplete(ctx, binding) });
         return labeledAutocompleteChoices(
           models.map((m) => ({
             name: m.displayName && m.displayName !== m.id ? `${m.displayName} (${m.id})` : m.id,
@@ -1495,7 +1504,7 @@ export class Orchestrator {
           (ctx.group === null && ctx.subcommand === "new" ? undefined : ctx.agentId);
         const binding = this.catalogBinding(ctx, selectedAgent);
         if (!binding) return [];
-        const models = this.modelCatalog.models(binding);
+        const models = this.modelCatalog.models(binding, { current: this.currentModelForAutocomplete(ctx, binding) });
         return labeledAutocompleteChoices(
           models.map((m) => ({
             name: m.displayName && m.displayName !== m.id ? `${m.displayName} (${m.id})` : m.id,
@@ -1888,6 +1897,9 @@ export class Orchestrator {
     // from the fallback (pass the may-configure set). Both unset ⇒ pass
     // nothing so postConfirmation falls back exactly as today.
     const adminIds = this.config.SEAM_CONFIG_ADMIN_USER_IDS;
+    if (proposal.tier === "model-hide" && !adminIds?.size) {
+      return { ok: false, error: "Model hiding requires a configured config admin to confirm." };
+    }
     const applyAuthorized = adminIds
       ? { authorizedUserIds: adminIds }
       : this.config.SEAM_PARTICIPANT_USER_IDS
@@ -5443,6 +5455,7 @@ export class Orchestrator {
     if (slashGroup === "catalog") {
       return this.cmdCatalogRefresh(interaction);
     }
+    if (slashGroup === "models") return this.cmdModels(interaction);
     if (slashGroup === "restrictions") {
       return this.cmdAgentChannelRestrictions(interaction);
     }
@@ -5666,7 +5679,7 @@ export class Orchestrator {
   private compactionModelFor(agentId: string, location: string): string {
     let selected: ReturnType<ModelCatalogService["model"]> = null;
     let selectedWindow = -1;
-    for (const model of this.modelCatalog.models({ agentId, location })) {
+    for (const model of this.modelCatalog.models({ agentId, location }, { includeHidden: true })) {
       if (model.availability !== "available" || model.lifecycle === "retired") continue;
       const window = model.context.effective ?? model.context.maximum ?? model.context.native ?? 0;
       if (
@@ -6492,7 +6505,7 @@ export class Orchestrator {
     const catalog = this.modelCatalog.models({
       agentId: analysisProfile.id,
       location: "local",
-    }).map((model) => ({
+    }, { includeHidden: true }).map((model) => ({
       modelId: model.id,
       name: model.displayName,
       ...(model.context.effective ? { contextLimit: model.context.effective } : {}),
@@ -7358,7 +7371,7 @@ export class Orchestrator {
     if (!switched.ok) throw new Error(switched.error);
     let configured = this.store.get(record.id) ?? record;
     const effective = this.router.describeConfig(configured);
-    const catalogDefault = this.modelCatalog.models({ agentId: agent, location: host })
+    const catalogDefault = this.modelCatalog.models({ agentId: agent, location: host }, { includeHidden: true })
       .find((model) => model.default);
     if (!catalogDefault) throw new Error(`model catalog for ${agent}@${host} is warming/unavailable`);
     if (effective.model.value !== catalogDefault.id) {
@@ -13881,6 +13894,22 @@ export class Orchestrator {
     }
   }
 
+  private async cmdModels(i: ChatInputCommandInteraction): Promise<void> {
+    if (!this.config.SEAM_CONFIG_ADMIN_USER_IDS?.has(i.user.id)) {
+      await i.reply({ content: "🔒 `/seamadmin models` is config-admin-only.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const action = i.options.getSubcommand(true);
+    if (action === "list") {
+      const patterns = this.modelCatalog.hideList?.list() ?? [];
+      await i.reply({ content: patterns.length ? `Hidden model patterns:\n${patterns.map((pattern) => `• \`${pattern}\``).join("\n")}` : "No models are hidden.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const built = this.configMutation.buildModelHideProposal({ action: action as "hide" | "unhide", pattern: i.options.getString("pattern", true) });
+    const message = built.ok ? built.proposal.apply({ id: i.user.id, name: i.user.username }).message : built.error;
+    await i.reply({ content: message, flags: MessageFlags.Ephemeral });
+  }
+
   private async cmdCatalogRefresh(i: ChatInputCommandInteraction): Promise<void> {
     const admins = this.config.SEAM_CONFIG_ADMIN_USER_IDS;
     if (admins && admins.size > 0 && !admins.has(i.user.id)) {
@@ -14366,7 +14395,7 @@ export class Orchestrator {
     const models = this.modelCatalog.models({
       agentId: inheritedAgent,
       location: described.location.value,
-    }).map((model) => ({ modelId: model.id, name: model.displayName })).slice(0, 24);
+    }, { current: sessionModel }).map((model) => ({ modelId: model.id, name: model.displayName })).slice(0, 24);
 
     const state = {
       name: existing?.name ?? "",
@@ -15007,7 +15036,8 @@ export class Orchestrator {
       const live = this.store.get(record.id) ?? record;
       const described = this.router.describeConfig(live);
       const current = described.model.value;
-      const displayCurrent = `\`${current}\``;
+      const binding = { agentId: described.agent.value, location: described.location.value };
+      const displayCurrent = `\`${current}\`${this.modelCatalog.isHidden?.(binding, current) ? " (hidden)" : ""}`;
       if (!this.adapter.sendChoicePicker) {
         await i.reply({
           content: `Current model: ${displayCurrent}`,
@@ -15016,9 +15046,8 @@ export class Orchestrator {
         return;
       }
       await i.deferReply({ flags: MessageFlags.Ephemeral });
-      const binding = { agentId: described.agent.value, location: described.location.value };
       const lookup = this.modelCatalog.lookup(binding);
-      const models = this.modelCatalog.models(binding);
+      const models = this.modelCatalog.models(binding, { current });
 
       if (models.length === 0) {
         await i.editReply(
@@ -17538,7 +17567,7 @@ export class Orchestrator {
       const live = this.store.get(record.id) ?? record;
       const cfg = this.store.readConfig(live);
       const nextBinding = { agentId: parsed.agentId, location: nextLocation };
-      const catalogDefault = this.modelCatalog.models(nextBinding).find((model) => model.default);
+      const catalogDefault = this.modelCatalog.models(nextBinding, { includeHidden: true }).find((model) => model.default);
       if (!catalogDefault) {
         throw new Error(`model catalog for ${parsed.agentId}@${nextLocation} is warming/unavailable`);
       }
@@ -17739,6 +17768,7 @@ export class Orchestrator {
       await this.editConfigEditorCard(channel, evicted.messageId, renderExpiredHub(evicted));
     }
     const panel = renderHub(draft, {
+      modelHidden: this.modelCatalog.isHidden?.(this.catalogBindingForDraft(draft), this.catalogModelForDraft(draft)),
       effortDisabled: this.effortDisabledFor(draft),
       fastDisabled: this.fastDisabledFor(draft),
       canEditChannel: Orchestrator.canEditChannelPreset(
@@ -17843,7 +17873,7 @@ export class Orchestrator {
   }
 
   private capsForAgent = (agentId: string, location = LOCAL_LOCATION): DraftAgentCapabilities | undefined => {
-    const models = this.modelCatalog.models({ agentId, location });
+    const models = this.modelCatalog.models({ agentId, location }, { includeHidden: true });
     if (!models.length) return undefined;
     return {
       models: models.map((model) => ({
@@ -17871,6 +17901,7 @@ export class Orchestrator {
   private async refreshConfigEditorHub(draft: ThreadConfigDraft): Promise<void> {
     if (!draft.messageId) return;
     const panel = renderHub(draft, {
+      modelHidden: this.modelCatalog.isHidden?.(this.catalogBindingForDraft(draft), this.catalogModelForDraft(draft)),
       effortDisabled: this.effortDisabledFor(draft),
       fastDisabled: this.fastDisabledFor(draft),
       canEditChannel: Orchestrator.canEditChannelPreset(
@@ -18405,7 +18436,7 @@ export class Orchestrator {
     } else if (action === "model") {
       const binding = this.catalogBindingForDraft(draft);
       const agentId = binding.agentId;
-      const models = this.modelCatalog.models(binding);
+      const models = this.modelCatalog.models(binding, { current: this.catalogModelForDraft(draft) });
       const choices = models.map((m) => ({
         value: m.id,
         label: m.displayName,
@@ -19523,7 +19554,7 @@ export class Orchestrator {
       const catalogModels = this.modelCatalog.models({
         agentId,
         location: described.location.value,
-      });
+      }, { includeHidden: true });
       const catalogEntry = this.modelCatalog.model(
         { agentId, location: described.location.value },
         destinationModel
@@ -24892,7 +24923,7 @@ export class Orchestrator {
       agentId: string | null
     ): Promise<ReadonlyArray<{ modelId: string; name: string }>> => {
       if (!agentId) return [];
-      return this.modelCatalog.models({ agentId, location: presetLocation })
+      return this.modelCatalog.models({ agentId, location: presetLocation }, { current: state.model ?? undefined })
         .map((model) => ({ modelId: model.id, name: model.displayName }));
     };
     let models = await loadModels(state.agentId);
@@ -25594,7 +25625,7 @@ export class Orchestrator {
           `⚠️ ${this.refuseUnregisteredAgent(preset.agentId, `Unknown agent \`${preset.agentId}\``)} — agent left unchanged.`
         );
       } else {
-        const catalogDefault = this.modelCatalog.models(binding).find((model) => model.default);
+        const catalogDefault = this.modelCatalog.models(binding, { includeHidden: true }).find((model) => model.default);
         if (!catalogDefault) {
           notes.push(`⚠️ Catalog for \`${preset.agentId}@${binding.location}\` is warming/unavailable — agent left unchanged.`);
         } else {

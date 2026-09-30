@@ -7,7 +7,8 @@ import { catalogScopeFingerprint, type AgentProfile, type AdapterCatalogCandidat
 import { ModelHideList, modelPatternMatches } from "../packages/core/src/core/model-catalog/hide-list.js";
 import { ModelCatalogService } from "../packages/core/src/core/model-catalog/service.js";
 import { ModelCatalogStore } from "../packages/core/src/core/model-catalog/store.js";
-import { visibleModelRankings } from "../packages/core/src/core/model-catalog/listings.js";
+import { visibleModelRankings, visibleModelValueRows } from "../packages/core/src/core/model-catalog/listings.js";
+import { renderModelValueRankingsLayout } from "../packages/core/src/core/model-value/rankings-card.js";
 import { ModelValueStore } from "../packages/core/src/core/model-value/store.js";
 import { buildModelValueSnapshot } from "../packages/core/src/core/model-value/ranking.js";
 import { ConfigMutationService } from "../packages/core/src/core/config-mutation.js";
@@ -112,6 +113,10 @@ describe("model hiding", () => {
     store.saveSnapshot(rows);
     list.change("hide", "gpt-5.*");
     expect(visibleModelRankings(service, store.getRankings()).rankings.map((row) => row.model)).toEqual(["gpt-6.1-sol"]);
+    const layout = renderModelValueRankingsLayout(visibleModelValueRows(service, store.getLatestRows()));
+    const cardText = JSON.stringify(layout);
+    expect(cardText).toContain("gpt-6.1-sol");
+    expect(cardText).not.toContain("gpt-5.6-sol");
     expect(visibleModelRankings(service, store.getRankings(), { ...binding, model: "gpt-5.6-sol" }).rankings.find((row) => row.model === "gpt-5.6-sol")?.display_name).toBe("gpt-5.6-sol (hidden)");
     const scoped = { ...store.getRankings(), rankings: store.getRankings().rankings.map((row) => ({ ...row, bindings: ["mac", "local"].map((location) => ({ agent: "copilot", location, scope: "test", generation: 1, state: "ready" as const })) })) };
     list.change("unhide", "gpt-5.*");

@@ -122,7 +122,7 @@ import { ModelIntelligenceStore } from "./core/model-intelligence/store.js";
 import { ModelIntelligenceManager } from "./core/model-intelligence/manager.js";
 import { ModelCatalogService, ModelCatalogStore } from "./core/model-catalog/index.js";
 import { ModelHideList } from "./core/model-catalog/hide-list.js";
-import { visibleModelMetadata, visibleModelRankings } from "./core/model-catalog/listings.js";
+import { visibleModelMetadata, visibleModelRankings, visibleModelValueRows } from "./core/model-catalog/listings.js";
 import type { AdapterCatalogCandidate, AgentProfile } from "@seam/adapters";
 import { ModelValueRankingsCard } from "./core/model-value/rankings-card.js";
 import { LiveMessageSearch, MessageReader } from "./core/message-reader.js";
@@ -1711,7 +1711,7 @@ async function main(): Promise<void> {
       adapter,
       threadId: config.DISCORD_RANKINGS_THREAD_ID,
       dataDir: config.DATA_DIR,
-      collect: () => modelValueStore.getLatestRows(),
+      collect: () => visibleModelValueRows(modelCatalog, modelValueStore.getLatestRows()),
     });
     modelIntelligenceManager.setOnUpdate(() => rankingsCard.poke());
     stopRankingsCard = () => {

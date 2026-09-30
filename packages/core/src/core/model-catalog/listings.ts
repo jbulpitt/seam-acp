@@ -1,5 +1,5 @@
 import type { ModelMetadata } from "../model-metadata/types.js";
-import type { ModelValueRankingsResult } from "../model-value/types.js";
+import type { ModelValueRankingsResult, ModelValueSnapshotRow } from "../model-value/types.js";
 import type { CatalogBinding, ModelCatalogService } from "./service.js";
 
 type CurrentModel = CatalogBinding & { model: string };
@@ -20,6 +20,16 @@ export function visibleModelRankings(catalog: Visibility, result: ModelValueRank
     return [{ ...row, ...(bindings ? { bindings } : {}),
       ...(hiddenCurrent ? { display_name: `${row.display_name ?? row.model} (hidden)` } : {}) }];
   }) };
+}
+
+export function visibleModelValueRows(catalog: Visibility, rows: ModelValueSnapshotRow[]): ModelValueSnapshotRow[] {
+  return rows.flatMap((row) => {
+    const bindings = row.bindings?.filter((binding) => !catalog.isHidden(
+      { agentId: binding.agent, location: binding.location }, row.copilotModel,
+    ));
+    if (row.bindings?.length ? !bindings?.length : catalog.isHidden({ agentId: "copilot", location: "local" }, row.copilotModel)) return [];
+    return [{ ...row, ...(bindings ? { bindings } : {}) }];
+  });
 }
 
 export function visibleModelMetadata(catalog: Visibility, rows: ModelMetadata[], current?: CurrentModel): ModelMetadata[] {

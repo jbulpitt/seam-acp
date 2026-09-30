@@ -139,6 +139,7 @@ function makeOrch(over?: {
     describeConfig: (record: SessionRecord) => ({
       agent: { value: record.agentId },
       model: { value: "grok-4" },
+      location: { value: "local" },
     }),
     ensureSessionRecord: (opts: {
       platform: string;

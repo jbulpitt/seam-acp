@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { blockToFile } from "../packages/core/src/agents/agent-content.js";
+import { blockToFile, resourceLinkText } from "../packages/core/src/agents/agent-content.js";
 
 describe("blockToFile", () => {
   it("returns undefined for non-objects and unknown types", () => {
@@ -95,5 +95,25 @@ describe("blockToFile", () => {
       resource: { uri: "/tmp/output.json", mimeType: "application/json", text: "{}" },
     });
     expect(r!.filename).toBe("output.json");
+  });
+});
+
+describe("resourceLinkText", () => {
+  it("turns a local file link into an attach fence", () => {
+    expect(resourceLinkText({ name: "environment.png", uri: "/home/u/tools/smoke/environment.png" }))
+      .toBe("\n```seam-attach\n/home/u/tools/smoke/environment.png\n```\n");
+    expect(resourceLinkText({ uri: "file:///home/u/a%20b.png" }))
+      .toBe("\n```seam-attach\n/home/u/a b.png\n```\n");
+  });
+
+  it("uploads images a tool views, and keeps other tool files out of chat", () => {
+    expect(resourceLinkText({ uri: "/home/u/tools/smoke/environment.png" }, "tool"))
+      .toBe("\n```seam-attach\n/home/u/tools/smoke/environment.png\n```\n");
+    expect(resourceLinkText({ uri: "/home/u/src/app.ts" }, "tool")).toBe("");
+  });
+
+  it("keeps web and other links as links", () => {
+    expect(resourceLinkText({ name: "docs", uri: "https://example.com/x" })).toBe("🔗 [docs](https://example.com/x)");
+    expect(resourceLinkText({ uri: "attachment://cat.png" })).toBe("🔗 [attachment://cat.png](attachment://cat.png)");
   });
 });

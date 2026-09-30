@@ -38,8 +38,7 @@ function matchCopilotError(ctx: ClassifyContext): AdapterErrorClassification | A
   if (/\bcopilot acp advertised no model config options\b/.test(haystack)) {
     return classified(agentId, "capability_absent", { details: message });
   }
-  if (/\bcopilot acp advertised duplicate model config options\b/.test(haystack) ||
-      /\bcopilot acp default model\b/.test(haystack)) {
+  if (/\bcopilot acp default model\b/.test(haystack)) {
     return classified(agentId, "invalid_request", { details: message });
   }
   if (/\bcopilot acp (?:initialize|catalog probe) timed out\b/.test(haystack)) {
@@ -149,6 +148,18 @@ function flattenSelectOptions(options: SessionConfigSelectOptions): SessionConfi
   return (options as Array<SessionConfigSelectOption | SessionConfigSelectGroup>).flatMap((option) =>
     "options" in option ? option.options : [option]
   );
+}
+
+/** Copilot CLI 1.0.89 lists `auto` twice (its built-in entry and the server's).
+ *  Both select the same value, so keep one, preferring the entry that carries `_meta`. */
+function uniqueModelOptions(options: SessionConfigSelectOption[]): SessionConfigSelectOption[] {
+  const byValue = new Map<string, SessionConfigSelectOption>();
+  for (const option of options) {
+    const kept = byValue.get(option.value);
+    const hasMeta = (o: SessionConfigSelectOption) => Boolean((o as { _meta?: unknown })._meta);
+    if (!kept || (!hasMeta(kept) && hasMeta(option))) byValue.set(option.value, option);
+  }
+  return [...byValue.values()];
 }
 
 function catalogConfigOptions(value: unknown): SessionConfigOption[] {
@@ -319,11 +330,8 @@ export async function probeCopilotCatalog(options: {
         return { defaultModel: modelSelect?.currentValue ?? "", models };
       },
     });
-    const models = discovery.models;
+    const models = uniqueModelOptions(discovery.models);
     if (!models.length) throw copilotNoModelConfigError();
-    if (new Set(models.map((model) => model.value)).size !== models.length) {
-      throw new Error("copilot ACP advertised duplicate model config options");
-    }
     if (!models.some((model) => model.value === discovery.defaultModel)) {
       throw new Error(
         `copilot ACP default model ${JSON.stringify(discovery.defaultModel)} is not in its model list`

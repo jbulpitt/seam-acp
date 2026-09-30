@@ -25,6 +25,7 @@ describe("getClaudeContextWindow", () => {
     expect(getClaudeContextWindow("claude-opus-4-7")).toBe(1_000_000);
     expect(getClaudeContextWindow("claude-fable-5")).toBe(1_000_000);
     expect(getClaudeContextWindow("claude-sonnet-5")).toBe(1_000_000);
+    expect(getClaudeContextWindow("claude-sonnet-5-5")).toBe(1_000_000);
   });
 
   it("falls back conservatively for models not admitted to the picker", () => {

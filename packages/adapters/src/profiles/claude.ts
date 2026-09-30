@@ -1131,6 +1131,10 @@ const CLAUDE_CONTEXT_WINDOWS: Readonly<Record<string, number>> = {
   "claude-opus-4-7": 1_000_000,
   "claude-fable-5": 1_000_000,
   "claude-sonnet-5": 1_000_000,
+  // Verified 2026-09-30 on claude-agent-acp 0.84.0: ran as claude-sonnet-5-5,
+  // usage_update.size 1000000, raw `claude /context` 1m. On 0.81.1 the bundled
+  // SDK treated it as 200K, so it needs 0.84.0 or later.
+  "claude-sonnet-5-5": 1_000_000,
 };
 
 /** Whether a model id should be force-forwarded to the direct Anthropic backend

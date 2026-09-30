@@ -49,7 +49,7 @@ import {
   mapAttachmentsToBlocks,
   type RejectedAttachment,
 } from "./attachments.js";
-import { blockToFile } from "./agent-content.js";
+import { blockToFile, resourceLinkText } from "./agent-content.js";
 import { SerialQueue } from "../core/serial-queue.js";
 import { HANG_SILENCE_MS, readHangProbeReport, watchRemoteHang, type HangAction } from "./hang-watch.js";
 import {
@@ -2399,15 +2399,11 @@ export class AgentRuntime {
     if (block.type === "resource_link") {
       // Surface as inline text so users see it in the chat. Easier than
       // building a separate UI for it.
-      const link = block as {
-        name?: string;
-        uri?: string;
-        mimeType?: string | null;
-      };
-      const label = link.name ?? link.uri ?? "resource";
+      const text = resourceLinkText(block as { name?: string; uri?: string }, source === "tool" ? "tool" : "agent");
+      if (!text) return;
       await this.emit({
         kind: "agent-text",
-        text: `🔗 [${label}](${link.uri ?? ""})`,
+        text,
         ...(extra.messageId ? { messageId: extra.messageId } : {}),
       });
     }

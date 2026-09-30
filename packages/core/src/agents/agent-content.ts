@@ -112,3 +112,28 @@ function mimeToExt(mime: string): string | undefined {
   };
   return map[mime.toLowerCase()];
 }
+
+/**
+ * Chat text for an ACP `resource_link`. A local file becomes an attach fence,
+ * so it is uploaded from the agent's host instead of posted as a dead path.
+ * Tool links (Codex's image viewer sends one per image it looks at) upload
+ * only images; other files a tool touches stay out of chat, like tool output.
+ */
+export function resourceLinkText(
+  link: { name?: string; uri?: string },
+  source: "agent" | "tool" = "agent",
+): string {
+  const uri = link.uri?.trim() ?? "";
+  let localPath: string | undefined;
+  if (uri.startsWith("file://")) {
+    try { localPath = decodeURIComponent(new URL(uri).pathname); } catch { /* leave as a link */ }
+  } else if (uri.startsWith("/")) {
+    localPath = uri;
+  }
+  if (localPath) {
+    if (source === "tool" && !/\.(png|jpe?g|gif|webp)$/i.test(localPath)) return "";
+    return `\n\`\`\`seam-attach\n${localPath}\n\`\`\`\n`;
+  }
+  const label = link.name ?? (uri || "resource");
+  return `🔗 [${label}](${uri})`;
+}

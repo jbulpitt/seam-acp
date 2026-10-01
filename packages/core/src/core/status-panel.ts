@@ -44,7 +44,7 @@ export interface StatusPanelInput {
   /** Last few lines of model reasoning (oldest → newest). */
   thinking?: string[];
   style?: StatusCardStyle;
-  brandFilename?: string;
+  brandIconURL?: string;
   authorName?: string;
 }
 
@@ -75,7 +75,7 @@ export function renderStatusPanel(
     activity: input.activity,
     thinking: input.thinking,
     ...(input.style ? { style: input.style } : {}),
-    ...(input.brandFilename ? { brandFilename: input.brandFilename } : {}),
+    ...(input.brandIconURL ? { brandIconURL: input.brandIconURL } : {}),
     ...(input.authorName ? { authorName: input.authorName } : {}),
   };
   return renderer.statusPanel(panel);
@@ -158,8 +158,8 @@ export class TurnStatus {
   activity: string[] = [];
   /** `"simple"` compact layout; default `"full"`. */
   style: StatusCardStyle = "full";
-  /** Brand logo filename for `attachment://` (set at turn start). */
-  brandFilename?: string;
+  /** Hosted brand icon, set at turn start. */
+  brandIconURL?: string;
   /** Full-card author name (agent display name). */
   authorName?: string;
   private static readonly MAX_ACTIVITY = 20;
@@ -178,7 +178,7 @@ export class TurnStatus {
     titlePrefix?: string;
     origin?: PanelOrigin;
     style?: StatusCardStyle;
-    brandFilename?: string;
+    brandIconURL?: string;
     authorName?: string;
   }) {
     this.model = opts.model;
@@ -189,7 +189,7 @@ export class TurnStatus {
     if (opts.titlePrefix) this.titlePrefix = opts.titlePrefix;
     if (opts.origin && hasOrigin(opts.origin)) this.origin = opts.origin;
     if (opts.style) this.style = opts.style;
-    if (opts.brandFilename) this.brandFilename = opts.brandFilename;
+    if (opts.brandIconURL) this.brandIconURL = opts.brandIconURL;
     if (opts.authorName) this.authorName = opts.authorName;
     this.startedUtc = Date.now();
   }
@@ -296,7 +296,7 @@ export class TurnStatus {
       activity: this.activity.length ? [...this.activity] : undefined,
       ...(thinking ? { thinking } : {}),
       ...(this.style !== "full" ? { style: this.style } : {}),
-      ...(this.brandFilename ? { brandFilename: this.brandFilename } : {}),
+      ...(this.brandIconURL ? { brandIconURL: this.brandIconURL } : {}),
       ...(this.authorName ? { authorName: this.authorName } : {}),
     };
   }

@@ -118,8 +118,8 @@ function originDescription(state: StatusPanel): string | undefined {
 }
 
 function authorIcon(state: StatusPanel): { authorIconURL?: string } {
-  if (!state.brandFilename) return {};
-  return { authorIconURL: `attachment://${state.brandFilename}` };
+  if (!state.brandIconURL) return {};
+  return { authorIconURL: state.brandIconURL };
 }
 
 function simpleFooter(state: StatusPanel): string {

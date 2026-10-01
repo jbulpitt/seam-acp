@@ -1,11 +1,10 @@
 import { describe, it, expect } from "vitest";
 import {
   brandIconUrl,
-  loadBrandAsset,
+  DEFAULT_BRAND_ICON_BASE_URL,
   resolveAgentBrand,
-  withBrandAttachment,
 } from "../packages/core/src/core/agent-brand.js";
-import type { StructuredPanel } from "../packages/core/src/core/types.js";
+import { loadConfig } from "../packages/core/src/config.js";
 
 describe("resolveAgentBrand (#96)", () => {
   it("groups copilot* onto copilot", () => {
@@ -41,8 +40,8 @@ describe("resolveAgentBrand (#96)", () => {
   });
 });
 
-describe("loadBrandAsset (#96)", () => {
-  it("loads seeded logos for known brands", () => {
+describe("hosted brand icons", () => {
+  it("uses pinned WebP URLs for every shipped brand", () => {
     for (const brand of [
       "agy",
       "claude",
@@ -54,35 +53,20 @@ describe("loadBrandAsset (#96)", () => {
       "vertex",
       "z-ai",
     ]) {
-      const asset = loadBrandAsset(brand);
-      expect(asset, `missing asset for ${brand}`).not.toBeNull();
-      expect(asset!.filename.startsWith(brand)).toBe(true);
-      expect(asset!.data.length).toBeGreaterThan(0);
-      expect(brandIconUrl(asset!.filename)).toBe(`attachment://${asset!.filename}`);
+      expect(brandIconUrl(brand)).toBe(`${DEFAULT_BRAND_ICON_BASE_URL}/${brand}.webp`);
     }
   });
 
-  it("returns null when no file exists (text-only fallback)", () => {
-    expect(loadBrandAsset("no-such-brand-xyz")).toBeNull();
+  it("keeps unknown brands text-only", () => {
+    expect(brandIconUrl("no-such-brand-xyz")).toBeUndefined();
   });
-});
 
-describe("withBrandAttachment", () => {
-  const panel: StructuredPanel = {
-    color: 1,
-    title: "Working",
-    fields: [],
-    author: "Working",
-    authorIconURL: "attachment://copilot.png",
-  };
-
-  it("adds files on first send and is a no-op without an asset", () => {
-    expect(withBrandAttachment(panel, null).files).toBeUndefined();
-    const asset = loadBrandAsset("copilot");
-    expect(asset).not.toBeNull();
-    const attached = withBrandAttachment(panel, asset);
-    expect(attached.files).toEqual([
-      { data: asset!.data, filename: asset!.filename },
-    ]);
+  it("uses the configurable base for a future asset host", () => {
+    const cfg = loadConfig({ env: {
+      DISCORD_BOT_TOKEN: "test", DISCORD_ALLOWED_USER_IDS: "123",
+      REPOS_ROOT: process.cwd(), BRAND_ICON_BASE_URL: "https://icons.example/agents/",
+    } });
+    expect(brandIconUrl("codex", cfg.BRAND_ICON_BASE_URL))
+      .toBe("https://icons.example/agents/codex.webp");
   });
 });

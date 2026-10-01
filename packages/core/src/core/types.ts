@@ -264,8 +264,8 @@ export interface StatusPanel {
   thinking?: string[];
   /** `"simple"` drops repo/model/action/effort/tool-tags; default `"full"`. */
   style?: StatusCardStyle;
-  /** Filename of the brand logo attached at card creation (`attachment://`). */
-  brandFilename?: string;
+  /** Hosted brand icon URL. */
+  brandIconURL?: string;
   /** Author name for the full card (agent display name / brand). Simple cards
    *  put the turn state in `author` instead and ignore this. */
   authorName?: string;
@@ -571,7 +571,7 @@ export interface StructuredPanel {
   title?: string;
   /** Optional author line (e.g. agent display name, or turn state on simple). */
   author?: string;
-  /** Discord `attachment://<filename>` (or a URL) for the author icon. */
+  /** Hosted author icon URL. */
   authorIconURL?: string;
   /** Discord embed main-image URL (standalone simple-card GIF message). */
   imageUrl?: string;

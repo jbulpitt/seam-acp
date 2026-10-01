@@ -8,19 +8,19 @@ describe("TurnStatus style + brand (#96)", () => {
     expect(s.toInput().style).toBeUndefined();
   });
 
-  it("threads simple style, brand filename, author, and contextPct", () => {
+  it("threads simple style, hosted icon, author, and contextPct", () => {
     const s = new TurnStatus({
       model: "m",
       repoDisplay: "r",
       style: "simple",
-      brandFilename: "grok.webp",
+      brandIconURL: "https://icons.example/grok.webp",
       authorName: "Grok Build",
     });
     s.contextUsedHighWater = 13_000;
     s.contextWindowSize = 100_000;
     const input = s.toInput();
     expect(input.style).toBe("simple");
-    expect(input.brandFilename).toBe("grok.webp");
+    expect(input.brandIconURL).toBe("https://icons.example/grok.webp");
     expect(input.authorName).toBe("Grok Build");
     expect(input.contextPct).toBe(13);
   });

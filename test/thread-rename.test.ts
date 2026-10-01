@@ -63,6 +63,7 @@ describe("/seamadmin naming rename and namer surfaces", () => {
     const applyThreadName = vi.fn(async () => ({ status: "renamed" }));
     let posted: any;
     const mock = {
+      config: { BRAND_ICON_BASE_URL: "https://icons.example/agents" },
       store: { get: () => target },
       applyThreadName,
       adapter: {
@@ -108,6 +109,8 @@ describe("/seamadmin naming rename and namer surfaces", () => {
     );
 
     expect(result).toMatchObject({ confirmationPosted: true, threadIdentityUpdated: true });
+    expect(posted.authorIconURL).toBe("https://icons.example/agents/claude.webp");
+    expect(posted.files).toBeUndefined();
     expect(applyThreadName).not.toHaveBeenCalled();
     expect(posted.fields).toEqual(expect.arrayContaining([
       expect.objectContaining({ name: "Agent", value: expect.stringContaining("Changed from") }),

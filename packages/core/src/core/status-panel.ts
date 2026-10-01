@@ -35,6 +35,7 @@ export interface StatusPanelInput {
    *  came from. Unset for normal user turns. */
   origin?: PanelOrigin;
   action: string;
+  notice?: string;
   /** Optional context-window line shown when tokens are known. */
   context?: string;
   /** Integer percent of the context window used, when known. */
@@ -70,6 +71,7 @@ export function renderStatusPanel(
     ...(input.titlePrefix ? { titlePrefix: input.titlePrefix } : {}),
     ...(input.origin ? { origin: input.origin } : {}),
     action: input.action,
+    ...(input.notice ? { notice: input.notice } : {}),
     context: input.context,
     ...(input.contextPct != null ? { contextPct: input.contextPct } : {}),
     activity: input.activity,
@@ -109,6 +111,11 @@ export function formatContextUsage(used: number, size: number): string {
   return `${fmtTokens(used)} / ${fmtTokens(size)} (${pct}%)`;
 }
 
+export function formatAgentNotice(notice: { title: string; description?: string | null }): string {
+  const text = [notice.title, notice.description].filter(Boolean).join(" — ").replace(/\s+/g, " ").trim();
+  return text.length > 400 ? `${text.slice(0, 397)}…` : text;
+}
+
 /** Compact a token count to a `k`/`m` suffixed string. */
 export function fmtTokens(n: number): string {
   if (n >= 1_000_000) return `${Math.round(n / 1_000_000)}m`;
@@ -123,6 +130,7 @@ export function fmtTokens(n: number): string {
 export class TurnStatus {
   state: TurnState = "Working";
   action = "Starting…";
+  notice?: string;
   model: string;
   /** Catalog-owned provenance for the selected model (#236), display only. */
   private modelDescription?: string;
@@ -291,6 +299,7 @@ export class TurnStatus {
       ...(this.titlePrefix ? { titlePrefix: this.titlePrefix } : {}),
       ...(this.origin ? { origin: this.origin } : {}),
       action: this.action,
+      ...(this.notice ? { notice: this.notice } : {}),
       context: this.context,
       ...(contextPct != null ? { contextPct } : {}),
       activity: this.activity.length ? [...this.activity] : undefined,

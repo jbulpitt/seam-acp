@@ -26,7 +26,7 @@ import {
   retiredAgentMessage,
 } from "../packages/core/src/core/retired-agents.js";
 import { loadConfig } from "../packages/core/src/config.js";
-import { resolveAgentBrand, loadBrandAsset } from "../packages/core/src/core/agent-brand.js";
+import { resolveAgentBrand, brandIconUrl } from "../packages/core/src/core/agent-brand.js";
 import { DEFAULT_THREAD_NAMER_CONFIG } from "../packages/core/src/platforms/discord/thread-namer.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import type { SessionRecord, SessionConfigState } from "../packages/core/src/core/types.js";
@@ -121,7 +121,7 @@ describe("#12 opencode surface removed", () => {
   it("ships no opencode profile module or brand asset", () => {
     expect(fs.existsSync(path.join(repoRoot, "packages/adapters/src/profiles/opencode.ts"))).toBe(false);
     expect(fs.existsSync(path.join(repoRoot, "assets/agents/opencode.webp"))).toBe(false);
-    expect(loadBrandAsset("opencode")).toBeNull();
+    expect(brandIconUrl("opencode")).toBeUndefined();
   });
 
   it("offers no opencode symbol in the thread-namer picker", () => {

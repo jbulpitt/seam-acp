@@ -559,6 +559,8 @@ describe("dispatchInjectTurn: status panel ON (default)", () => {
     expect(calls.sendPanel.length).toBe(1);
     const panelPost = calls.sendPanel[0]!;
     expect(panelPost.panel.title).toContain("📨 Handoff");
+    expect(panelPost.panel.authorIconURL).toMatch(/\/claude\.webp$/);
+    expect(panelPost.panel.files).toBeUndefined();
     // The panel never went out as message content (that path hits the 2000-char
     // 50035 limit); the type marker appears in NO plain sendMessage.
     expect(calls.sendMessage.some((m) => m.text.includes("Handoff"))).toBe(false);

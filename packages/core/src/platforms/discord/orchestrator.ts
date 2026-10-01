@@ -607,9 +607,7 @@ import {
 } from "../../core/types.js";
 import {
   brandIconUrl,
-  loadBrandAsset,
   resolveAgentBrand,
-  withBrandAttachment,
 } from "../../core/agent-brand.js";
 import { resolveDiscordSpeakerName } from "./adapter.js";
 import type {
@@ -3796,7 +3794,7 @@ export class Orchestrator {
     const repoDisplay = this.repoDisplay(effectiveCwd);
     const turnProfile = this.router.getProfile(described.agent.value, described.location.value);
     const brand = resolveAgentBrand(described.agent.value, turnProfile?.brand);
-    const brandAsset = loadBrandAsset(brand);
+    const brandIconURL = brandIconUrl(brand, this.config.BRAND_ICON_BASE_URL);
     const cardStyle = statusCardStyleForRender(described);
     const gifUrl = pickSimpleCardGifUrl({
       style: cardStyle,
@@ -3817,7 +3815,7 @@ export class Orchestrator {
         : {}),
       ...(described.effort.value ? { effort: described.effort.value } : {}),
       style: cardStyle,
-      ...(brandAsset ? { brandFilename: brandAsset.filename } : {}),
+      ...(brandIconURL ? { brandIconURL } : {}),
       authorName: turnProfile?.displayName ?? brand,
     });
 
@@ -3857,7 +3855,6 @@ export class Orchestrator {
       status.toInput(),
       status.startedUtc + (statusCard.current()?.elapsedSeconds ?? 0) * 1000,
     );
-    const initialPanel = withBrandAttachment(initialRendered, brandAsset);
     this.assertQueueFence(queueFence);
     const persistedStatusCard = humanAttempt?.statusCard;
     if (persistedStatusCard && persistedStatusCard.channelId !== channel.id) {
@@ -3870,8 +3867,8 @@ export class Orchestrator {
           id: persistedStatusCard.messageId,
         }
       : this.adapter.sendPanel
-        ? await this.adapter.sendPanel(channel, initialPanel)
-        : await this.adapter.sendMessage(channel, serializePanelText(initialPanel));
+        ? await this.adapter.sendPanel(channel, initialRendered)
+        : await this.adapter.sendMessage(channel, serializePanelText(initialRendered));
     if (humanAttempt && !persistedStatusCard) {
       this.store.turnAttempts.bindStatusCard(humanAttempt, {
         channelId: statusMsg.channel.id,
@@ -7265,12 +7262,12 @@ export class Orchestrator {
         : "Runtime kept";
     const profile = this.router.getProfile(outcome.applied.agent);
     const brand = resolveAgentBrand(outcome.applied.agent, profile?.brand);
-    const brandAsset = loadBrandAsset(brand);
+    const brandIconURL = brandIconUrl(brand, this.config.BRAND_ICON_BASE_URL);
     const panel: StructuredPanel = {
       color: 0x57f287,
       title: "✅ Thread configuration confirmed",
       author: profile?.displayName ?? outcome.applied.agent,
-      ...(brandAsset ? { authorIconURL: brandIconUrl(brandAsset.filename) } : {}),
+      ...(brandIconURL ? { authorIconURL: brandIconURL } : {}),
       fields: [
         { name: "Agent", value: displayField(outcome.changes.agent), inline: true },
         { name: "Model", value: displayField(outcome.changes.model), inline: true },
@@ -7289,7 +7286,7 @@ export class Orchestrator {
     let confirmationPosted = false;
     if (this.adapter.sendPanel) {
       try {
-        await this.adapter.sendPanel(channel, withBrandAttachment(panel, brandAsset));
+        await this.adapter.sendPanel(channel, panel);
         confirmationPosted = true;
       } catch (err) {
         presentationWarnings.push("confirmation card could not be posted");
@@ -12049,7 +12046,7 @@ export class Orchestrator {
     });
     const dispatchAgentId = resolved.profile?.id ?? destRecord?.agentId ?? "";
     const dispatchBrand = resolveAgentBrand(dispatchAgentId, resolved.profile?.brand);
-    const dispatchBrandAsset = loadBrandAsset(dispatchBrand);
+    const brandIconURL = brandIconUrl(dispatchBrand, this.config.BRAND_ICON_BASE_URL);
     const origin = await this.resolveDispatchOrigin(spec, target);
     const status = new TurnStatus({
       model: resolved.model,
@@ -12058,7 +12055,7 @@ export class Orchestrator {
       titlePrefix: this.dispatchPanelTitle(spec.kind, !!spec.chainId),
       ...(origin ? { origin } : {}),
       style: destStyle,
-      ...(dispatchBrandAsset ? { brandFilename: dispatchBrandAsset.filename } : {}),
+      ...(brandIconURL ? { brandIconURL } : {}),
       authorName: resolved.profile?.displayName ?? dispatchBrand,
     });
     status.setAction("Thinking…");
@@ -12093,19 +12090,18 @@ export class Orchestrator {
         post: async (panel) => {
           if (!this.queueFenceCurrent(queueFence)) return undefined;
           try {
-            const toSend = withBrandAttachment(panel, dispatchBrandAsset);
             if (existingCard) {
               const ref: MessageRef = {
                 channel: { platform: target.platform, id: existingCard.channelId },
                 id: existingCard.messageId,
               };
-              if (this.adapter.editPanel) await this.adapter.editPanel(ref, toSend);
-              else await this.adapter.editMessage(ref, serializePanelText(toSend));
+              if (this.adapter.editPanel) await this.adapter.editPanel(ref, panel);
+              else await this.adapter.editMessage(ref, serializePanelText(panel));
               return ref;
             }
             return this.adapter.sendPanel
-              ? await this.adapter.sendPanel(target, toSend)
-              : await this.adapter.sendMessage(target, serializePanelText(toSend));
+              ? await this.adapter.sendPanel(target, panel)
+              : await this.adapter.sendMessage(target, serializePanelText(panel));
           } catch (err) {
             this.logger.warn({ err, dispatch: spec.id }, "dispatch: status panel post failed");
             return undefined;

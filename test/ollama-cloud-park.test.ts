@@ -53,7 +53,7 @@ import { DEFAULT_THREAD_NAMER_CONFIG } from "../packages/core/src/platforms/disc
 import { agentLocationPickerChoices } from "../packages/core/src/platforms/discord/location.js";
 import { ConfigMutationService } from "../packages/core/src/core/config-mutation.js";
 import { ThreadSessionControlService } from "../packages/core/src/core/thread-session-control.js";
-import { resolveAgentBrand, loadBrandAsset } from "../packages/core/src/core/agent-brand.js";
+import { resolveAgentBrand, brandIconUrl } from "../packages/core/src/core/agent-brand.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import type { SessionRecord, SessionConfigState } from "../packages/core/src/core/types.js";
 import type { SessionStore } from "../packages/core/src/core/session-store.js";
@@ -133,7 +133,7 @@ describe("#220 ollama-cloud is parked, not deleted", () => {
     ).toBe(true);
     expect(fs.existsSync(path.join(repoRoot, "assets/agents/ollama-cloud.webp"))).toBe(true);
     expect(typeof adapters.fetchOllamaCloudUsage).toBe("function");
-    expect(loadBrandAsset("ollama-cloud")).not.toBeNull();
+    expect(brandIconUrl("ollama-cloud")).toMatch(/\/ollama-cloud\.webp$/);
     expect(resolveAgentBrand("ollama-cloud")).toBe("ollama-cloud");
     expect(DEFAULT_THREAD_NAMER_CONFIG.agents.map((a) => a.match)).toContain("ollama");
     expect(

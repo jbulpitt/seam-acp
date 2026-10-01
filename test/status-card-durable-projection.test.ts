@@ -1,4 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
+import { Collection } from "discord.js";
+import { brandIconUrl } from "../packages/core/src/core/agent-brand.js";
 import {
   DiscordAdapter,
   projectDiscordStatusEmbed,
@@ -67,6 +69,7 @@ describe("durable Discord status-card projection (#586)", () => {
     };
     const fetch = vi.fn(async () => ({
       embeds: [{ toJSON: () => source }],
+      attachments: new Collection(),
       edit,
     }));
     const adapter = Object.create(DiscordAdapter.prototype) as DiscordAdapter;
@@ -88,6 +91,80 @@ describe("durable Discord status-card projection (#586)", () => {
         color: discordStatusColor("Done"),
         fields: [{ name: "Action", value: "Completed", inline: true }],
       })],
+    });
+  });
+
+  it.each([
+    "https://cdn.discordapp.com/attachments/thread/card/codex.webp?ex=signed",
+    "https://media.discordapp.net/attachments/thread/card/codex.webp?ex=signed",
+    "attachment://codex.webp",
+  ])("removes a legacy logo referenced by %s while retaining unrelated files", async (icon) => {
+    const edit = vi.fn(async () => {});
+    const source = {
+      author: { name: "Working", icon_url: icon, proxy_icon_url: "old-proxy" },
+      fields: [{ name: "Action", value: "Starting…", inline: true }],
+    };
+    const attachments = new Collection([
+      ["logo", { id: "logo", name: "codex.webp",
+        url: "https://cdn.discordapp.com/attachments/thread/card/codex.webp?ex=signed",
+        proxyURL: "https://media.discordapp.net/attachments/thread/card/codex.webp?ex=signed" }],
+      ["other", { id: "other", name: "notes.txt", url: "notes-url", proxyURL: "notes-proxy" }],
+    ]);
+    const adapter = Object.create(DiscordAdapter.prototype) as DiscordAdapter;
+    Object.defineProperties(adapter, {
+      config: { value: { BRAND_ICON_BASE_URL: "https://icons.example/agents" } },
+      fetchSendableChannel: { value: vi.fn(async () => ({ messages: {
+        fetch: vi.fn(async () => ({ embeds: [{ toJSON: () => source }], attachments, edit })),
+      } })) },
+    });
+
+    await adapter.editStatusPanelProjection(
+      { channel: { platform: "discord", id: "thread" }, id: "legacy-card" },
+      { state: "Done", action: "Completed" }
+    );
+    expect(edit).toHaveBeenCalledWith({
+      embeds: [expect.objectContaining({
+        author: { name: "Done", icon_url: "https://icons.example/agents/codex.webp" },
+      })],
+      attachments: [{ id: "other" }],
+    });
+  });
+
+  it("preserves a hosted icon and unrelated attachments during projection", async () => {
+    const edit = vi.fn(async () => {});
+    const source = { author: { name: "Working", icon_url: brandIconUrl("claude") }, fields: [] };
+    const adapter = Object.create(DiscordAdapter.prototype) as DiscordAdapter;
+    Object.defineProperty(adapter, "fetchSendableChannel", { value: vi.fn(async () => ({
+      messages: { fetch: vi.fn(async () => ({ embeds: [{ toJSON: () => source }],
+        attachments: new Collection([["other", { id: "other", name: "notes.txt", url: "notes-url", proxyURL: "notes-proxy" }]]),
+        edit })) },
+    })) });
+
+    await adapter.editStatusPanelProjection(
+      { channel: { platform: "discord", id: "thread" }, id: "new-card" },
+      { state: "Working", action: "Reconnected" }
+    );
+    expect(edit).toHaveBeenCalledWith({ embeds: [expect.objectContaining({ author: source.author })] });
+  });
+
+  it("removes a legacy logo hidden from Discord's attachment list before the first projection", async () => {
+    const edit = vi.fn(async () => {});
+    const source = { author: { name: "Working",
+      icon_url: "https://cdn.discordapp.com/attachments/thread/logo/claude.webp?ex=signed" }, fields: [] };
+    const adapter = Object.create(DiscordAdapter.prototype) as DiscordAdapter;
+    Object.defineProperties(adapter, {
+      config: { value: {} },
+      fetchSendableChannel: { value: vi.fn(async () => ({ messages: {
+        fetch: vi.fn(async () => ({ embeds: [{ toJSON: () => source }], attachments: new Collection(), edit })),
+      } })) },
+    });
+    await adapter.editStatusPanelProjection(
+      { channel: { platform: "discord", id: "thread" }, id: "legacy-card" },
+      { state: "Working", action: "Reconnected" }
+    );
+    expect(edit).toHaveBeenCalledWith({
+      embeds: [expect.objectContaining({ author: { name: "Working", icon_url: brandIconUrl("claude") } })],
+      attachments: [],
     });
   });
 });

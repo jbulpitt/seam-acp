@@ -79,6 +79,7 @@ import type {
 import type { PanelButton, StructuredPanel, TurnState } from "../../core/types.js";
 import { clampPanelForDiscord } from "../../core/panel-limits.js";
 import { discordStatusColor } from "./renderer.js";
+import { brandIconUrl } from "../../core/agent-brand.js";
 import {
   CHOICE_CUSTOM_ID_PREFIX,
   CHOICE_CUSTOM_TEXT_MAX,
@@ -1930,7 +1931,32 @@ export class DiscordAdapter implements ChatAdapter {
     const msg = await ch.messages.fetch(message.id);
     const source = msg.embeds[0]?.toJSON();
     if (!source) throw new Error("persisted status card has no embed");
-    await msg.edit({ embeds: [projectDiscordStatusEmbed(source, projection)] });
+    const embed = projectDiscordStatusEmbed(source, projection);
+    const icon = source.author?.icon_url;
+    const logo = icon ? msg.attachments.find((attachment) =>
+      icon === attachment.url || icon === attachment.proxyURL ||
+      icon === `attachment://${attachment.name}`
+    ) : undefined;
+    // Discord omits attachments still referenced by an embed's attachment:// icon.
+    const ownIcon = icon?.match(
+      /^https:\/\/(?:cdn\.discordapp\.com|media\.discordapp\.net)\/attachments\/([^/]+)\/[^/]+\/([^?/#]+)/
+    );
+    const filename = logo?.name ?? (ownIcon?.[1] === message.channel.id ? ownIcon[2] : undefined);
+    const hostedIcon = filename && brandIconUrl(
+      filename.replace(/\.(webp|png|jpe?g|gif)$/i, ""), this.config.BRAND_ICON_BASE_URL
+    );
+    if (hostedIcon && embed.author) {
+      embed.author = { ...embed.author, icon_url: hostedIcon };
+      delete embed.author.proxy_icon_url;
+      await msg.edit({
+        embeds: [embed],
+        attachments: [...msg.attachments.values()]
+          .filter((attachment) => attachment.id !== logo?.id)
+          .map((attachment) => ({ id: attachment.id })),
+      });
+    } else {
+      await msg.edit({ embeds: [embed] });
+    }
   }
 
   async sendLayout(

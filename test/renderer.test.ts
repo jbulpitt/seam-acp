@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { discordRenderer } from "../packages/core/src/platforms/discord/renderer.js";
+import { brandIconUrl } from "../packages/core/src/core/agent-brand.js";
 
 describe("discordRenderer", () => {
   it("status panel uses the right icon and rows", () => {
@@ -28,19 +29,19 @@ describe("discordRenderer", () => {
     expect(out.footer).toContain("⏱ 3s elapsed");
   });
 
-  it("full card gains a brand author icon when brandFilename is set (#96)", () => {
+  it("full card has a hosted author icon without files", () => {
     const out = discordRenderer.statusPanel({
       state: "Working",
       repoDisplay: "myrepo",
       model: "gpt-5.4",
       action: "Starting…",
       elapsedSeconds: 3,
-      brandFilename: "copilot.png",
+      brandIconURL: brandIconUrl("copilot"),
       authorName: "GitHub Copilot",
     });
     expect(out.title).toBe("Working");
     expect(out.author).toBe("gpt-5.4"); // author line is the model; icon carries the agent
-    expect(out.authorIconURL).toBe("attachment://copilot.png");
+    expect(out.authorIconURL).toBe(brandIconUrl("copilot"));
     expect(out.fields.find((f) => f.name === "Repo")).toBeTruthy();
     expect(out.fields.find((f) => f.name === "Model")).toBeUndefined();
     expect(out.footer).toContain("🧠");
@@ -59,11 +60,11 @@ describe("discordRenderer", () => {
       thinking: ["old thought", "latest plan"],
       context: "128k / 1m (13%)",
       contextPct: 13,
-      brandFilename: "grok.webp",
+      brandIconURL: brandIconUrl("grok"),
     });
     expect(out.title).toBeUndefined();
     expect(out.author).toBe("Working");
-    expect(out.authorIconURL).toBe("attachment://grok.webp");
+    expect(out.authorIconURL).toBe(brandIconUrl("grok"));
     expect(out.fields).toEqual([]);
     expect(out.description).toBeUndefined();
     expect(out.footer).toMatch(/✏️/);

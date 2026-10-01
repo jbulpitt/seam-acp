@@ -4,6 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { z } from "zod";
 import { parkedAgentMessage } from "./core/parked-agents.js";
+import { DEFAULT_BRAND_ICON_BASE_URL } from "./core/agent-brand.js";
 import { retiredAgentConfigMessage } from "./core/retired-agents.js";
 import { parseWarmSetHosts } from "./core/warm-set/hosts.js";
 import {
@@ -31,6 +32,7 @@ const ModelsListSchema = z
 
 const Schema = z.object({
   DISCORD_BOT_TOKEN: z.string().min(1, "DISCORD_BOT_TOKEN is required"),
+  BRAND_ICON_BASE_URL: z.string().url().default(DEFAULT_BRAND_ICON_BASE_URL),
   DISCORD_ALLOWED_USER_IDS: z
     .string()
     .min(1, "DISCORD_ALLOWED_USER_IDS is required")

@@ -253,6 +253,8 @@ export interface StatusPanel {
   origin?: PanelOrigin;
   action: string;
   elapsedSeconds: number;
+  /** Latest quiet advisory, separate from tool activity and the answer. */
+  notice?: string;
   /** Optional context-window line shown when token info is known. */
   context?: string;
   /** Integer percent of the context window used, when known. Simple cards

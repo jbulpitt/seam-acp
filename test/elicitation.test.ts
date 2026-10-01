@@ -172,6 +172,7 @@ describe("ACP v1 elicitation validation and capability", () => {
     expect(ACP_CLIENT_CAPABILITIES).toEqual({
       fs: { readTextFile: false, writeTextFile: false },
       elicitation: { form: {}, url: {} },
+      session: { notices: {} },
     });
   });
 

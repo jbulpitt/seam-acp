@@ -21,6 +21,7 @@ import {
   type ClientCapabilities,
   type CompleteElicitationNotification,
   type McpServer,
+  type Notice,
   type PromptCapabilities,
   type RequestPermissionRequest,
   type RequestPermissionResponse,
@@ -94,6 +95,7 @@ export interface AsyncUserInputQuestion {
 }
 
 export type AgentEvent =
+  | ({ kind: "notice"; agent: string } & Notice)
   | { kind: "submission-evidence"; evidence: SubmissionEvidence }
   | { kind: "agy-stdout-fallback"; code: string }
   | { kind: "recovery"; message: string }
@@ -285,6 +287,7 @@ export class SessionLoadTimeoutError extends Error {
 export const ACP_CLIENT_CAPABILITIES = Object.freeze({
   fs: Object.freeze({ readTextFile: false, writeTextFile: false }),
   elicitation: Object.freeze({ form: Object.freeze({}), url: Object.freeze({}) }),
+  session: Object.freeze({ notices: Object.freeze({}) }),
 }) satisfies ClientCapabilities;
 
 const ASYNC_INPUT_MAX_QUESTIONS = 20;
@@ -2261,6 +2264,18 @@ export class AgentRuntime {
       await this.emit({ kind: "agy-stdout-fallback", code: fallback.code });
     }
     switch (update.sessionUpdate) {
+      case "notice": {
+        const notice = {
+          agent: this.profile.id,
+          severity: update.severity,
+          title: update.title,
+          description: update.description ?? null,
+        };
+        const level = update.severity === "error" ? "error" : update.severity === "warning" ? "warn" : "info";
+        this.logger[level](notice, "ACP session notice");
+        await this.emit({ kind: "notice", ...notice });
+        return;
+      }
       case "agent_message_chunk": {
         const asyncInput = codexAsyncUserInputFromUpdate(update);
         if (asyncInput) {

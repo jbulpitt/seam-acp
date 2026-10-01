@@ -463,6 +463,7 @@ import {
   TurnStatus,
   renderStatusPanel,
   formatContextUsage,
+  formatAgentNotice,
   fmtTokens,
   hasOrigin,
 } from "../../core/status-panel.js";
@@ -4264,6 +4265,14 @@ export class Orchestrator {
           );
         }
         switch (event.kind) {
+          case "notice":
+            if (event.severity === "warning") {
+              status.notice = formatAgentNotice(event);
+              void refresh();
+            } else if (event.severity === "error") {
+              await this.adapter.sendMessage(channel, `❗ ${formatAgentNotice(event)}`);
+            }
+            return;
           case "cwd-fallback": {
             status.setRepo(`${this.repoDisplay(event.used)} · fallback from ${event.requested}`);
             await refresh(true);
@@ -5896,6 +5905,9 @@ export class Orchestrator {
         this.recordContextBudget(budgetIdentity, event.used, event.size, budgetRecord);
       }
       opts.noteActivity?.();
+      if (event.kind === "notice" && event.severity === "error" && outputTo) {
+        await this.adapter.sendMessage(outputTo, `❗ ${formatAgentNotice(event)}`);
+      }
       if (event.kind === "agent-text") {
         text += event.text;
       } else if (event.kind === "agent-file") {
@@ -16246,6 +16258,10 @@ export class Orchestrator {
       const renderer = adoptedRenderer;
       recoveryRuntime.onEvent(async (event) => {
         switch (event.kind) {
+          case "notice":
+            if (event.severity === "warning") updateCard(`⚠️ ${formatAgentNotice(event)}`);
+            else if (event.severity === "error") await this.adapter.sendMessage(target, `❗ ${formatAgentNotice(event)}`);
+            return;
           case "agent-text":
             adoptedText += event.text;
             renderer.feed(event.text);

@@ -24,6 +24,7 @@ export interface StatusSnapshot {
   contextUsed: number | null;
   latestTool: string | null;
   textTail: string;
+  notice?: string;
   /**
    * Seconds since start, as of the latest publish.
    */
@@ -37,6 +38,7 @@ export interface StatusObservation {
   contextUsed: number | null;
   latestTool: string | null;
   textTail: string;
+  notice?: string;
   startedAt: number;
 }
 
@@ -46,6 +48,7 @@ export interface StatusObservation {
 export interface TurnSnapshotSource {
   state: string;
   action: string;
+  notice?: string;
   model: string;
   contextUsedHighWater: number;
   contextWindowSize: number;
@@ -79,6 +82,7 @@ function contentOf(observation: StatusObservation): Omit<StatusSnapshot, "elapse
     contextUsed: normalizeUsed(observation.contextUsed),
     latestTool: tool ? tool : null,
     textTail: boundTail(observation.textTail),
+    ...(observation.notice ? { notice: observation.notice } : {}),
   };
 }
 
@@ -91,7 +95,8 @@ function sameContent(
     && snapshot.model === content.model
     && snapshot.contextUsed === content.contextUsed
     && snapshot.latestTool === content.latestTool
-    && snapshot.textTail === content.textTail;
+    && snapshot.textTail === content.textTail
+    && snapshot.notice === content.notice;
 }
 
 export function observationFromTurn(status: TurnSnapshotSource): {
@@ -110,6 +115,7 @@ export function observationFromTurn(status: TurnSnapshotSource): {
       contextUsed: seen ? status.contextUsedHighWater : null,
       latestTool: latest,
       textTail,
+      ...(status.notice ? { notice: status.notice } : {}),
       startedAt: status.startedUtc,
     },
     contextWindow: status.contextWindowSize > 0 ? status.contextWindowSize : null,
@@ -137,6 +143,7 @@ export function renderStatusSnapshot(
     snapshot.model,
     snapshot.latestTool ?? "",
     snapshot.textTail,
+    ...(snapshot.notice ? [snapshot.notice] : []),
     String(snapshot.elapsedSeconds),
     usage,
   ].join("\n");

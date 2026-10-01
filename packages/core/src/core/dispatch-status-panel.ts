@@ -33,7 +33,7 @@
 import type { AgentEvent } from "../agents/agent-runtime.js";
 import type { Renderer } from "../platforms/renderer.js";
 import { SerialQueue } from "./serial-queue.js";
-import { TurnStatus, renderStatusPanel, formatContextUsage } from "./status-panel.js";
+import { TurnStatus, renderStatusPanel, formatContextUsage, formatAgentNotice } from "./status-panel.js";
 import { StatusSnapshotCard, observationFromTurn } from "./status-snapshot.js";
 import type { StructuredPanel, TurnState } from "./types.js";
 
@@ -143,6 +143,10 @@ export class DispatchStatusPanel<TRef = unknown> {
     if (this.finalized || !this.isLive) return;
     const s = this.status;
     switch (event.kind) {
+      case "notice":
+        if (event.severity !== "warning") return;
+        s.notice = formatAgentNotice(event);
+        break;
       case "cwd-fallback":
         s.setRepo(`${event.used} · fallback from ${event.requested}`);
         break;

@@ -120,11 +120,40 @@ function setup() {
     socket.deliver({ type: "hello", instanceId: "second", capabilities: { durableSlots: true } });
     await drain();
   };
-  return { store, run, adapter, visible, commands, text, update, complete, reconnect,
+  return { orch, store, run, adapter, visible, commands, text, update, complete, reconnect,
     runtime: () => runtime };
 }
 
 describe("adopted turns across a bridge reconnect", () => {
+  it("does not replay directive-only output after already rendering its choice", async () => {
+    const h = setup();
+    await drain();
+    const publish = vi.spyOn(h.orch, "createChoice").mockResolvedValue({ ok: true, choiceId: "choice", messageId: "card" });
+    const fence = '```seam-choice\n{"title":"Next","options":[{"label":"Continue","kind":"prompt","payload":"continue"}]}\n```';
+    h.text(fence);
+    h.complete(fence);
+    await h.run;
+    expect(publish).toHaveBeenCalledOnce();
+    expect(h.visible).toEqual([]);
+    expect(h.store.turnAttempts.get("inbound-1")).toMatchObject({ state: "completed", deliveryDone: true });
+  });
+
+  it("still projects Done after an intermediate adopted card edit is rejected", async () => {
+    const h = setup();
+    await drain();
+    h.adapter.editStatusPanelProjection.mockRejectedValueOnce(new Error("DiscordAPIError 50035"));
+    h.update({ sessionUpdate: "tool_call", toolCallId: "long", title: "heredoc ".repeat(300),
+      kind: "execute", status: "in_progress" });
+    await drain();
+    h.text("finished");
+    h.complete("finished");
+    await h.run;
+    expect(h.adapter.editStatusPanelProjection).toHaveBeenLastCalledWith(
+      { channel: { platform: "discord", id: "thread" }, id: "card" },
+      { state: "Done", action: "end_turn" });
+    expect(h.store.turnAttempts.get("inbound-1")).toMatchObject({ state: "completed", deliveryDone: true });
+  });
+
   it("delivers queued final text and leaves Done last when a card edit is slow", async () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     const h = setup();

@@ -107,7 +107,7 @@ export interface HarnessOpts {
   inboxAwareness?: boolean;
   /** Session actually has seam-mcp attached (injected mcpServers includes it). */
   seamMcp?: boolean;
-  /** This turn's output path runs emitClosedFence (live yes, dispatch no). */
+  /** This turn's output path processes directive fences. */
   /** Bridge-backed host tools are present for this channel. */
   hostTools?: boolean;
   seamFences?: boolean;

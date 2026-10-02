@@ -510,6 +510,7 @@ export class BridgeHub {
     if (existing) return existing;
     const mux = makeMux({
       id: bridgeId,
+      turnTimeoutSeconds: this.config.TURN_TIMEOUT_SECONDS,
       onHello: (hello) => {
         void this.onHello(bridgeId, mux, hello);
       },

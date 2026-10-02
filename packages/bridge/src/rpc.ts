@@ -41,6 +41,7 @@ export interface SlotSpawnConfig {
   model?: string;
   modelFallbacks?: ModelFallbackPlan;
   effort?: string;
+  turnTimeoutSeconds?: number;
   rung1Recovery?: RemoteRung1Policy;
 }
 
@@ -206,6 +207,7 @@ async function dispatchAdapter(
       model: str(params.model),
       ...(modelFallbacks ? { modelFallbacks } : {}),
       effort: str(params.effort),
+      ...(typeof params.turnTimeoutSeconds === "number" ? { turnTimeoutSeconds: params.turnTimeoutSeconds } : {}),
       ...(rung1Recovery ? { rung1Recovery } : {}),
     });
     return {

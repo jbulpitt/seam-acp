@@ -212,7 +212,7 @@ export class DispatchStatusPanel<TRef = unknown> {
     }
     this.status.setState(state);
     if (action !== undefined) this.status.setAction(action);
-    if (this.isLive) await this.enqueueRender(true, true);
+    if (this.isLive) await this.enqueueRender();
     await this.queue.idle();
   }
 
@@ -251,26 +251,26 @@ export class DispatchStatusPanel<TRef = unknown> {
       clearTimeout(this.pending);
       this.pending = undefined;
     }
-    await this.enqueueRender(false);
+    await this.enqueueRender();
   }
 
-  /** Render + enqueue one serialized edit. An unchanged snapshot (same
-   *  content, same elapsed second) does not edit. */
-  private enqueueRender(_done: boolean, _force = false): Promise<void> {
+  /** Queue an edit of the latest snapshot; unchanged content does no I/O. */
+  private enqueueRender(): Promise<void> {
     this.lastEditAt = Date.now();
-    const viewed = observationFromTurn(this.status);
-    this.card.publish(viewed.observation, viewed.contextWindow, Date.now());
-    if (this.card.plan().action === "skip") return Promise.resolve();
-    const panel = this.renderPanel();
-    const fingerprint = JSON.stringify(panel);
-    if (fingerprint === this.lastRendered) {
-      this.card.acknowledge();
-      return Promise.resolve();
-    }
-    this.renders += 1;
     const ref = this.ref;
     if (ref === undefined) return Promise.resolve();
     return this.queue.run(async () => {
+      // Read the latest state when the write runs, including terminal state.
+      const viewed = observationFromTurn(this.status);
+      this.card.publish(viewed.observation, viewed.contextWindow, Date.now());
+      if (this.card.plan().action === "skip") return;
+      const panel = this.renderPanel();
+      const fingerprint = JSON.stringify(panel);
+      if (fingerprint === this.lastRendered) {
+        this.card.acknowledge();
+        return;
+      }
+      this.renders += 1;
       try {
         const edited = await this.io.edit(ref, panel);
         this.editSucceeded = edited !== false;

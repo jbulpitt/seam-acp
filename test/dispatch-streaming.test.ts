@@ -167,6 +167,29 @@ afterEach(() => {
 });
 
 describe('dispatchInjectTurn: start indicator + live streaming ("card" style)', () => {
+  it.each([
+    { style: "messages" as const, stream: true },
+    { style: "card" as const, stream: true },
+    { style: "messages" as const, stream: false },
+    { style: "card" as const, stream: false },
+  ])("processes a forward choice fence for $style / stream=$stream", async ({ style, stream }) => {
+    const log: string[] = [];
+    const rt = fakeRuntime(["Before\n\n```seam-", 'choice\n{"title":"Pick","options":[{"label":"Continue","kind":"prompt","payload":"continue"}]}\n', "```\n\nAfter"], log);
+    const { adapter, calls } = spyAdapter(log);
+    const orch = makeOrch({ dataDir, rt, adapter, style });
+    (orch as any).store.getByChannel = () => record();
+    (orch as any).effectiveCwd = () => "/repo";
+    const publish = vi.spyOn(orch, "createChoice").mockResolvedValue({ ok: true, choiceId: "choice", messageId: "card" });
+    await orch.dispatchInjectTurn(baseSpec({ kind: "forward", stream }));
+    expect(publish).toHaveBeenCalledOnce();
+    expect(publish).toHaveBeenCalledWith(expect.any(Object), expect.objectContaining({ title: "Pick" }));
+    const displayed = [...calls.sendMessage.map(m => m.text), ...calls.sendPanel.map(m => m.panel.description),
+      ...calls.editPanel.map(m => m.panel.description)].join("");
+    expect(displayed).not.toContain("seam-choice");
+    expect(displayed).toContain("Before");
+    expect(displayed).toContain("After");
+  });
+
   it("publishes visible generic-dispatch prose exactly once and awaits source-local drain", async () => {
     const log: string[] = [];
     const rt = fakeRuntime(["First visible sentence. ", "Second visible sentence."], log);

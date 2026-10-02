@@ -513,9 +513,6 @@ import {
 } from "../../core/audio/voice-replies.js";
 import { ATTACH_FENCE_LANG, WAKE_FENCE_LANG, WATCH_FENCE_LANG, CHOICE_FENCE_LANG, RESULT_FENCE_LANG, isMathFenceLang, sanitizeSpeakerName, sessionHasSeamMcp, withHarnessPreamble } from "../../core/agent-conventions.js";
 
-const SEAM_DIRECTIVE_FENCE_LANGS: ReadonlySet<string> = new Set([
-  ATTACH_FENCE_LANG, WAKE_FENCE_LANG, WATCH_FENCE_LANG, CHOICE_FENCE_LANG, RESULT_FENCE_LANG,
-]);
 import {
   ThreadNamer,
   ThreadNamerConfigStore,
@@ -9871,8 +9868,6 @@ export class Orchestrator {
     // the prompt is untouched (applyWatchFeedback returns it verbatim).
     // Resume: do NOT re-apply identity / watch-feedback / harness — the session
     // already has that context. Replaying them on "continue" would fight its memory.
-    // #108: dispatch does not run emitClosedFence (seamFences: false). MCP tool
-    // ads stay on when this worker session actually has seam-mcp.
     const isolatedSpawn =
       effectiveSession === "isolated"
         ? this.remoteDispatchSpawnOpts({
@@ -9900,10 +9895,10 @@ export class Orchestrator {
     // that path refuses.
     const effectivePrompt = isResume
       ? (await this.processRestartRender(previousAttempt!)).prompt
-      : withHarnessPreamble(tasked, choiceAuthoringRules({ fence: false, mcp: seamMcp }), undefined, {
+      : withHarnessPreamble(tasked, choiceAuthoringRules({ fence: true, mcp: seamMcp }), undefined, {
           seamMcp,
           hostTools: areHostToolsEnabled(this.config, record.parentRef ?? undefined),
-          seamFences: false,
+          seamFences: true,
           ...(runtimePrompt.provenance ? { provenance: runtimePrompt.provenance } : {}),
         });
 
@@ -10253,6 +10248,9 @@ export class Orchestrator {
       //    (StreamingPanel) — the legacy embed path, unchanged.
       let streamPanel: StreamingPanel | undefined;
       let msgRenderer: StreamingMessageRenderer | undefined;
+      let cardRenderer: StreamingMessageRenderer | undefined;
+      let cardText = "";
+      let streamFenceCounter = 0;
       // Terminal-render context for the "card" path, filled in by
       // finalizeDispatchStream just before the last (done) edit.
       const streamState: {
@@ -10278,21 +10276,10 @@ export class Orchestrator {
           },
           {
             logger: this.logger,
-            sendFile: this.adapter.sendFile
-              ? async (file) => {
-                  if (!this.queueFenceCurrent(queueFence)) return;
-                  try {
-                    await this.adapter.sendFile!(target, file);
-                  } catch (err) {
-                    this.logger.warn({ err, dispatch: spec.id }, "dispatch: stream file send failed");
-                  }
-                }
-              : undefined,
-            // Seam directive fences run through the same handler as a live turn.
+            // Every fence uses the live turn's handler.
             handleFence: async (fence) => {
-              if (!fence.lang || !SEAM_DIRECTIVE_FENCE_LANGS.has(fence.lang)) return false;
               if (!this.queueFenceCurrent(queueFence)) return true;
-              await this.emitClosedFence(target, fence, 0, {
+              await this.emitClosedFence(target, fence, ++streamFenceCounter, {
                 preferredRoot: isolatedWorkerCwd ?? this.effectiveCwd(record),
               });
               return true;
@@ -10321,6 +10308,20 @@ export class Orchestrator {
           } catch (err) {
             this.logger.warn({ err, dispatch: spec.id }, "dispatch: stream edit failed");
           }
+        });
+        let fenceCounter = 0;
+        cardRenderer = new StreamingMessageRenderer(async (text) => {
+          cardText += text;
+          streamPanel!.append(text);
+        }, {
+          logger: this.logger,
+          handleFence: async (fence) => {
+            if (!this.queueFenceCurrent(queueFence)) return true;
+            await this.emitClosedFence(target, fence, ++fenceCounter, {
+              preferredRoot: isolatedWorkerCwd ?? this.effectiveCwd(record),
+            });
+            return true;
+          },
         });
       }
 
@@ -10423,7 +10424,7 @@ export class Orchestrator {
                 );
               }
               if (msgRenderer) msgRenderer.feed(event.text);
-              else if (streamPanel) streamPanel.append(event.text);
+              else if (cardRenderer) cardRenderer.feed(event.text);
             }
             if (statusPanel && (event.kind === "tool-start" || event.kind === "tool-update")) {
               toolSeen = true;
@@ -10612,7 +10613,9 @@ export class Orchestrator {
         await this.awaitBoundedDispatchSettlement(
           spec.id,
           "output-presentation",
-          this.finalizeDispatchStream(target, spec, streamPanel, streamState, result)
+          cardRenderer!.finalize().then(() => this.finalizeDispatchStream(
+            target, spec, streamPanel!, streamState, { ...result!, text: cardText }
+          ))
         );
       } else if (statelessCard) {
         // Quiet (stream:false) stateless card: flip the indicator in place to
@@ -11763,6 +11766,18 @@ export class Orchestrator {
     text: string,
     error?: string
   ): Promise<void> {
+    if (error) await this.postDispatchProse(channel, spec, "", error);
+    await this.renderCapturedAgentText(channel, text,
+      (prose) => prose.trim() || !error
+        ? this.postDispatchProse(channel, spec, prose) : Promise.resolve());
+  }
+
+  private async postDispatchProse(
+    channel: ChannelRef,
+    spec: DispatchSpec,
+    text: string,
+    error?: string
+  ): Promise<void> {
     const label = spec.correlationId ? `${spec.id} · ${spec.correlationId}` : spec.id;
     const style = this.config.SEAM_DISPATCH_OUTPUT_STYLE ?? "messages";
     try {
@@ -12472,9 +12487,11 @@ export class Orchestrator {
     startedAt: number,
     result: InjectTurnResult
   ): Promise<void> {
+    let text = "";
+    await this.renderCapturedAgentText(target, result.text ?? "", async (prose) => { text += prose; });
     const panel = this.dispatchStreamPanel({
       header,
-      text: result.text ?? "",
+      text,
       done: true,
       elapsedMs: Date.now() - startedAt,
       ...(result.error ? { error: result.error } : {}),
@@ -13221,6 +13238,21 @@ export class Orchestrator {
    *  messages per `outputType`; overflow → a single file attachment. Never edits
    *  the running card (it stays as a run record). */
   private async postScheduledResult(
+    channel: ChannelRef,
+    name: string,
+    text: string,
+    outputType: "card" | "messages",
+    identityFields: StructuredPanel["fields"] = [],
+    deliveryAttemptId?: string
+  ): Promise<void> {
+    let prose = "";
+    await this.renderCapturedAgentText(channel, text, async (part) => { prose += part; });
+    if (prose.trim() || !text.trim()) {
+      await this.postScheduledProse(channel, name, prose, outputType, identityFields, deliveryAttemptId);
+    }
+  }
+
+  private async postScheduledProse(
     channel: ChannelRef,
     name: string,
     text: string,
@@ -16219,13 +16251,7 @@ export class Orchestrator {
         },
         {
           logger: this.logger,
-          sendFile: this.adapter.sendFile
-            ? async (file) => {
-                await this.adapter.sendFile!(target, file);
-              }
-            : undefined,
           handleFence: async (fence) => {
-            if (!fence.lang || !SEAM_DIRECTIVE_FENCE_LANGS.has(fence.lang)) return false;
             fenceCounter += 1;
             await this.emitClosedFence(target, fence, fenceCounter, {
               preferredRoot: this.effectiveCwd(recoveryRecord!),
@@ -16377,7 +16403,7 @@ export class Orchestrator {
       if (adoptedRenderer) {
         const texts = [...adoptedChunks];
         if (failed) texts.push(`❌ ${error}`);
-        else if (texts.length === 0 && output.trim()) {
+        else if (texts.length === 0 && output.trim() && adoptedRenderer.sentCount === 0) {
           texts.push(...await streamingMessageChunks(output));
         } else if (texts.length === 0 && !output.trim()) {
           texts.push("✅ Done — no output.");
@@ -16686,17 +16712,20 @@ export class Orchestrator {
     payload: DurableDeliveryPayload,
     nonce: string
   ): Promise<Array<{ payload: Exclude<DurableDeliveryPayload, { kind: "messages" }>; nonce: string }>> {
-    if (payload.kind === "message") {
-      const chunks = await streamingMessageChunks(payload.text);
-      return (chunks.length > 0 ? chunks : [payload.text]).map((text, index) => ({
-        payload: { kind: "message", text },
-        nonce: deliveryChunkNonce(nonce, index),
-      }));
-    }
-    if (payload.kind === "messages") {
-      return payload.texts.map((text, index) => ({
-        payload: { kind: "message", text },
-        nonce: deliveryChunkNonce(nonce, index),
+    if (payload.kind === "message" || payload.kind === "messages") {
+      const texts = payload.kind === "messages" ? payload.texts : [payload.text];
+      const chunks: string[] = [];
+      for (const text of texts) {
+        for (const part of this.capturedAgentTextParts(text)) {
+          if ("fence" in part) {
+            chunks.push(`\`\`\`${part.fence.lang}\n${part.fence.content}\n\`\`\``);
+          } else {
+            chunks.push(...await streamingMessageChunks(part.text));
+          }
+        }
+      }
+      return (chunks.length ? chunks : texts).map((text, index) => ({
+        payload: { kind: "message", text }, nonce: deliveryChunkNonce(nonce, index),
       }));
     }
     return [{ payload, nonce }];
@@ -16706,17 +16735,27 @@ export class Orchestrator {
     channel: ChannelRef,
     payload: Exclude<DurableDeliveryPayload, { kind: "messages" }>,
     nonce: string
-  ): Promise<MessageRef> {
+  ): Promise<void> {
     const delivery = { nonce, enforceNonce: true as const };
     if (payload.kind === "message") {
-      return this.adapter.sendMessage(channel, payload.text, delivery);
+      await this.renderCapturedAgentText(channel, payload.text, async (text) => {
+        await this.adapter.sendMessage(channel, text, delivery);
+      });
+      return;
     }
     if (payload.kind === "panel") {
-      if (this.adapter.sendPanel) return this.adapter.sendPanel(channel, payload.panel, delivery);
-      return this.adapter.sendMessage(channel, serializePanelText(payload.panel), delivery);
+      let description = "";
+      const body = payload.panel.description ?? "";
+      await this.renderCapturedAgentText(channel, body, async (part) => { description += part; });
+      if (description.trim() || !body.trim()) {
+        const panel = { ...payload.panel, description };
+        if (this.adapter.sendPanel) await this.adapter.sendPanel(channel, panel, delivery);
+        else await this.adapter.sendMessage(channel, serializePanelText(panel), delivery);
+      }
+      return;
     }
     if (!this.adapter.sendFile) throw new Error("platform cannot replay the recorded delivery file");
-    return this.adapter.sendFile(
+    await this.adapter.sendFile(
       channel,
       {
         data: Buffer.from(payload.file.dataBase64, "base64"),
@@ -16732,14 +16771,11 @@ export class Orchestrator {
     channel: ChannelRef,
     payload: DurableDeliveryPayload,
     nonce: string
-  ): Promise<MessageRef> {
+  ): Promise<void> {
     const parts = await this.deliveryParts(payload, nonce);
-    let sent: MessageRef | undefined;
     for (const part of parts) {
-      sent = await this.sendDeliveryPart(channel, part.payload, part.nonce);
+      await this.sendDeliveryPart(channel, part.payload, part.nonce);
     }
-    if (!sent) throw new Error("recorded delivery contains no messages");
-    return sent;
   }
 
   /** Persist-before-send terminal delivery used by normal and recovery paths. */
@@ -16747,7 +16783,7 @@ export class Orchestrator {
     attemptId: string,
     channel: ChannelRef,
     payload: DurableDeliveryPayload
-  ): Promise<MessageRef> {
+  ): Promise<void> {
     const receipt = this.store.turnAttempts.prepareDelivery(attemptId, channel.id, payload);
     return this.sendDeliveryPayload(channel, payload, receipt.nonce);
   }
@@ -17310,6 +17346,16 @@ export class Orchestrator {
    *  `postDispatchOutput` (chunk to cards, overflow to a file) with a steer
    *  label. Best-effort — a posting failure must not break the steer. */
   private async postSteerOutput(
+    channel: ChannelRef,
+    text: string,
+    error?: string
+  ): Promise<void> {
+    if (error) await this.postSteerProse(channel, "", error);
+    await this.renderCapturedAgentText(channel, text, (prose) => prose.trim() || !error
+      ? this.postSteerProse(channel, prose) : Promise.resolve());
+  }
+
+  private async postSteerProse(
     channel: ChannelRef,
     text: string,
     error?: string
@@ -23173,14 +23219,41 @@ export class Orchestrator {
     }
   }
 
-  /**
-   * Render a closed fence to the chat thread. Routes between an inline
-   * markdown message and a file attachment based on the rendered inline
-   * size; bare-filename fences that resolve to a real host file under
-   * the allowed roots are uploaded as the actual file.
-   *
-   * Failures are logged, never thrown.
-   */
+  /** Preserve fences before any completion chunking can split their bodies. */
+  private capturedAgentTextParts(text: string): Array<{ text: string } | { fence: CompletedFence; notice?: string }> {
+    const stream = new FenceStream();
+    const head = stream.feed(text, Date.now());
+    const tail = stream.flush();
+    const parts: Array<{ text: string } | { fence: CompletedFence; notice?: string }> = [];
+    for (const segment of [...head.segments, ...tail.segments]) {
+      if (segment.kind === "prose") {
+        const last = parts.at(-1);
+        if (last && "text" in last) last.text += segment.text;
+        else parts.push({ text: segment.text });
+      } else if (segment.kind === "fence-close") {
+        parts.push({ fence: segment.fence });
+      }
+    }
+    if (tail.unclosed) parts.push({ fence: tail.unclosed, notice: "_(fence was not closed by the agent)_" });
+    return parts;
+  }
+
+  /** Captured completions use the live turn's fence extractor and handlers. */
+  private async renderCapturedAgentText(
+    channel: ChannelRef,
+    text: string,
+    postProse: (text: string) => Promise<void>
+  ): Promise<void> {
+    const parts = this.capturedAgentTextParts(text);
+    let counter = 0;
+    for (const part of parts) {
+      if ("fence" in part) await this.emitClosedFence(channel, part.fence, ++counter, { notice: part.notice });
+      else if (part.text.trim()) await postProse(part.text);
+    }
+    if (!text.trim()) await postProse(text);
+  }
+
+  /** Render a fence through the shared directive, math and attachment paths. */
   private async emitClosedFence(
     channel: ChannelRef,
     fence: CompletedFence,

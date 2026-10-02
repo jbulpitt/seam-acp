@@ -447,7 +447,22 @@ export function projectDiscordStatusEmbed(
   };
   if (actionIndex >= 0) projected.fields![actionIndex] = field;
   else projected.fields!.push(field);
-  return projected;
+  const clamped = clampPanelForDiscord({
+    color: projected.color!,
+    title: projected.title,
+    description: projected.description,
+    author: projected.author?.name,
+    footer: projected.footer?.text,
+    fields: projected.fields!,
+  });
+  return {
+    ...projected,
+    title: clamped.title,
+    description: clamped.description,
+    fields: clamped.fields.map(field => ({ ...field, value: field.value || "\u200B" })),
+    ...(projected.author ? { author: { ...projected.author, name: clamped.author! } } : {}),
+    footer: clamped.footer ? { ...projected.footer, text: clamped.footer } : undefined,
+  };
 }
 
 /**

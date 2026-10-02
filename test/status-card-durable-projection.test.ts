@@ -8,6 +8,42 @@ import {
 import { discordStatusColor } from "../packages/core/src/platforms/discord/renderer.js";
 
 describe("durable Discord status-card projection (#586)", () => {
+  it("clamps adopted tool titles before editing the actual Discord message", async () => {
+    const source = { title: "Report-back · Working", fields: [{ name: "Action", value: "Starting…" }] };
+    const edit = vi.fn(async ({ embeds }: any) => {
+      if (embeds[0].fields.some((field: any) => field.value.length > 1024)) {
+        throw new Error("DiscordAPIError 50035: field value exceeds 1024");
+      }
+    });
+    const adapter = Object.create(DiscordAdapter.prototype) as DiscordAdapter;
+    Object.defineProperty(adapter, "fetchSendableChannel", { value: vi.fn(async () => ({
+      messages: { fetch: vi.fn(async () => ({ embeds: [{ toJSON: () => source }],
+        attachments: new Collection(), edit })) },
+    })) });
+    const ref = { channel: { platform: "discord", id: "thread" }, id: "card" };
+    await adapter.editStatusPanelProjection(ref, { state: "Working", action: `Tool: ${"heredoc ".repeat(300)}` });
+    await adapter.editStatusPanelProjection(ref, { state: "Done", action: "end_turn" });
+    expect(edit.mock.calls[0]![0].embeds[0].fields[0].value).toHaveLength(1024);
+    expect(edit).toHaveBeenLastCalledWith({ embeds: [expect.objectContaining({ title: "Report-back · Done" })] });
+  });
+
+  it("uses the live renderer's per-part and aggregate budget while preserving embed metadata", () => {
+    const projected = projectDiscordStatusEmbed({
+      title: "X".repeat(250) + " · Working",
+      author: { name: "A".repeat(300), icon_url: "https://icons.example/codex.webp" },
+      description: "D".repeat(4096), footer: { text: "F".repeat(2048), icon_url: "https://icons.example/footer.webp" },
+      fields: [{ name: "Action", value: "old" }, ...Array.from({ length: 25 }, () => ({ name: "N".repeat(300), value: "V".repeat(1024) }))],
+    }, { state: "Working", action: "T".repeat(3000) });
+    expect(projected.title!.length).toBeLessThanOrEqual(256);
+    expect(projected.author!.name.length).toBeLessThanOrEqual(256);
+    expect(projected.author!.icon_url).toBe("https://icons.example/codex.webp");
+    expect(projected.fields!.length).toBeLessThanOrEqual(25);
+    expect(projected.fields!.every(f => f.name.length <= 256 && f.value.length <= 1024)).toBe(true);
+    const weight = [projected.title, projected.description, projected.author?.name, projected.footer?.text,
+      ...projected.fields!.flatMap(f => [f.name, f.value])].join("").length;
+    expect(weight).toBeLessThanOrEqual(6000);
+  });
+
   it("patches only durable state/action facts and is idempotent", () => {
     const source = {
       title: "Working",

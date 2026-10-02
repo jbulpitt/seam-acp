@@ -619,11 +619,6 @@ import {
 
 const STATUS_EDIT_DEBOUNCE_MS = 2500;
 const STATUS_HEARTBEAT_MS = 5000;
-// A status card must not claim Done while its separate output queue is still
-// delivering. Five seconds matches the adjacent session-update drain guard:
-// after that, refuse only the claim of complete presentation, never settlement
-// of the turn, answer ledger, or report-back (#576/#423).
-export const DISPATCH_OUTPUT_DRAIN_TIMEOUT_MS = 5_000;
 export const DISPATCH_SETTLEMENT_WARN_MS = 5_000;
 const PLATFORM = "discord";
 
@@ -10540,44 +10535,43 @@ export class Orchestrator {
       // can recover this claim; a stuck card edit must not be its gate.
       await this.finishDispatchOnward(spec, result, wasInterrupted);
 
-      // The STATUS PANEL and plain-output stream have independent SerialQueues.
-      // Drain the complete visible messages path first: `runtime.idle()` above
-      // only drains ACP session updates, not StreamingMessageRenderer. A bounded
-      // wait prevents a stuck Discord send from recreating #423 (forever-Working
-      // cards). On timeout/failure the card says that OUTPUT delivery did not
-      // settle; the answer and onward claim are already durable.
-      let messagesPresentationStarted = false;
-      let outputPresentation: "delivered" | "timed_out" | "failed" = "delivered";
-      if (msgRenderer) {
-        messagesPresentationStarted = true;
-        outputPresentation = await this.awaitDispatchOutputPresentation(
-          this.finalizeMessagesStream(target, spec, msgRenderer, result, panelRef, header, showHeader),
-          spec.id
-        );
-      }
+      // Finish delivery before the terminal card; the outcome and onward claim are already durable.
+      const outputPresentation = await this.runDispatchSettlementStep(
+        spec.id,
+        msgRenderer ? "output-drain" : "output-presentation",
+        async () => {
+          if (msgRenderer) {
+            await this.finalizeMessagesStream(target, spec, msgRenderer, result!, panelRef, header, showHeader);
+          } else if (streamPanel && panelRef) {
+            await cardRenderer!.finalize();
+            await this.finalizeDispatchStream(target, spec, streamPanel, streamState, { ...result!, text: cardText });
+          } else if (statelessCard) {
+            await this.publishStatelessHandoffCard(target, spec, panelRef, header, startedAt, result!);
+          } else {
+            await this.postDispatchOutput(target, spec, result!.text, result!.error);
+          }
+        }
+      ).then(
+        () => ({ status: "delivered" as const }),
+        (err) => ({ status: "failed" as const, err })
+      );
 
-      // Finalize the STATUS PANEL to its terminal state only after presentation
-      // settles or reaches its bound. Best-effort remains one-way: a panel edit
-      // failure never affects the answer ledger or onward claim above.
+      // Card edits remain best-effort and cannot change the recorded turn outcome.
       if (statusPanel) {
         const finalState: TurnState = result.timedOut
           ? "Timed out"
           : result.error
             ? "Failed"
-            : outputPresentation === "timed_out"
-              ? "Timed out"
-              : outputPresentation === "failed"
-                ? "Failed"
-                : "Done";
+            : outputPresentation.status === "failed"
+              ? "Failed"
+              : "Done";
         const finalAction = result.timedOut
           ? `Timed out after ${this.config.TURN_TIMEOUT_SECONDS}s`
           : result.error
             ? result.error.slice(0, 200)
-            : outputPresentation === "timed_out"
-              ? `Output delivery still pending after ${DISPATCH_OUTPUT_DRAIN_TIMEOUT_MS / 1000}s`
-              : outputPresentation === "failed"
-                ? "Output delivery failed; turn completed"
-                : (result.stopReason || "Completed");
+            : outputPresentation.status === "failed"
+              ? `Output delivery failed; turn completed: ${String(outputPresentation.err).slice(0, 200)}`
+              : (result.stopReason || "Completed");
         const cardSettlement = await this.awaitBoundedDispatchSettlement(
           spec.id,
           "status-card-finalize",
@@ -10587,50 +10581,6 @@ export class Orchestrator {
           finalState === "Done" && statusPanel.lastEditSucceeded;
       }
 
-      // Visibility post. Streaming: finalize the panel IN PLACE (no second copy
-      // of the body) — the streamed panel becomes the done card, with the full
-      // text spilled to a file only when it overflows the embed. Quiet: fall
-      // back to today's capture-and-post cards below the untouched indicator.
-      if (msgRenderer) {
-        // "messages" style: the OUTPUT already streamed as fresh real messages;
-        // drain the tail, surface any error / empty line, flip the ▶ indicator.
-        // With a status panel this already started above. A timed-out promise
-        // keeps draining in the background; awaiting it again would defeat the
-        // settlement bound and strand report-back.
-        if (!messagesPresentationStarted) {
-          await this.finalizeMessagesStream(target, spec, msgRenderer, result, panelRef, header, showHeader);
-        }
-      } else if (streamPanel && panelRef) {
-        await this.awaitBoundedDispatchSettlement(
-          spec.id,
-          "output-presentation",
-          cardRenderer!.finalize().then(() => this.finalizeDispatchStream(
-            target, spec, streamPanel!, streamState, { ...result!, text: cardText }
-          ))
-        );
-      } else if (statelessCard) {
-        // Quiet (stream:false) stateless card: flip the indicator in place to
-        // Done + Result. If the indicator never posted, send one Done card.
-        await this.awaitBoundedDispatchSettlement(
-          spec.id,
-          "output-presentation",
-          this.publishStatelessHandoffCard(
-            target,
-            spec,
-            panelRef,
-            header,
-            startedAt,
-            result
-          )
-        );
-      } else {
-        // Partial output is still output — post whatever was captured either way.
-        await this.awaitBoundedDispatchSettlement(
-          spec.id,
-          "output-presentation",
-          this.postDispatchOutput(target, spec, result.text, result.error)
-        );
-      }
       if (result.error) {
         throw new DispatchTurnError(
           result.error,
@@ -12221,61 +12171,6 @@ export class Orchestrator {
     }
   }
 
-  /** Bound the display-only queue without cancelling it. The renderer retains
-   * ownership and may finish after this returns; the dispatch must still settle.
-   * Rejections are observed even after timeout, so background completion cannot
-   * become an unhandled rejection. */
-  private async awaitDispatchOutputPresentation(
-    presentation: Promise<void>,
-    dispatchId: string
-  ): Promise<"delivered" | "timed_out" | "failed"> {
-    const startedAt = Date.now();
-    const guarded = presentation.then(
-      () => ({ status: "delivered" as const }),
-      (err) => ({ status: "failed" as const, err })
-    );
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const timedOut = new Promise<{ status: "timed_out" }>((resolve) => {
-      timer = setTimeout(() => resolve({ status: "timed_out" }), DISPATCH_OUTPUT_DRAIN_TIMEOUT_MS);
-      if (typeof timer.unref === "function") timer.unref();
-    });
-    const outcome = await Promise.race([guarded, timedOut]);
-    if (timer) clearTimeout(timer);
-    if (outcome.status === "failed") {
-      this.logger.warn(
-        { err: outcome.err, dispatch: dispatchId, step: "output-drain", durationMs: Date.now() - startedAt, outcome: "failed" },
-        "dispatch: settlement step"
-      );
-    } else if (outcome.status === "timed_out") {
-      this.logger.warn(
-        { dispatch: dispatchId, step: "output-drain", durationMs: Date.now() - startedAt,
-          outcome: "timed_out", timeoutMs: DISPATCH_OUTPUT_DRAIN_TIMEOUT_MS },
-        "dispatch: settlement step exceeded bound"
-      );
-      void guarded.then((late) => {
-        if (late.status === "failed") {
-          this.logger.warn(
-            { err: late.err, dispatch: dispatchId, step: "output-drain",
-              durationMs: Date.now() - startedAt, outcome: "failed_late" },
-            "dispatch: settlement step"
-          );
-        } else {
-          this.logger.info(
-            { dispatch: dispatchId, step: "output-drain",
-              durationMs: Date.now() - startedAt, outcome: "completed_late" },
-            "dispatch: settlement step"
-          );
-        }
-      });
-    } else {
-      this.logger.info(
-        { dispatch: dispatchId, step: "output-drain", durationMs: Date.now() - startedAt, outcome: "completed" },
-        "dispatch: settlement step"
-      );
-    }
-    return outcome.status;
-  }
-
   private async runDispatchSettlementStep<T>(
     dispatchId: string,
     step: string,
@@ -12287,7 +12182,7 @@ export class Orchestrator {
       this.logger.warn(
         { dispatch: dispatchId, step, durationMs: Date.now() - startedAt,
           outcome: "pending", timeoutMs: DISPATCH_SETTLEMENT_WARN_MS },
-        "dispatch: settlement step exceeded bound"
+        "dispatch: settlement step still pending"
       );
     }, DISPATCH_SETTLEMENT_WARN_MS);
     slow.unref?.();

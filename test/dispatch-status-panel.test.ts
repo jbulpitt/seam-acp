@@ -392,32 +392,49 @@ describe("dispatchInjectTurn: status panel ON (default)", () => {
     expect(order.indexOf("output-delivered")).toBeLessThan(order.indexOf("panel-done"));
   });
 
-  it("bounds a stuck output drain, settles honestly, and still completes the dispatch", async () => {
+  it.each([true, false])("waits for slow output delivery before Done without holding the live queue (stream=%s)", async (stream) => {
     vi.useFakeTimers();
+    let releaseOutput!: () => void;
     try {
       let outputStarted!: () => void;
       const started = new Promise<void>((resolve) => { outputStarted = resolve; });
-      const never = new Promise<MessageRef>(() => {});
-      const rt = fakeRuntime({ text: ["answer captured before Discord stalled"] });
+      const outputGate = new Promise<void>((resolve) => { releaseOutput = resolve; });
+      const answer = "Complete coaching notes. ".repeat(160) + "OUTPUT_BUDGET_DONE";
+      const rt = fakeRuntime({ text: [answer] });
       const { adapter, calls } = spyAdapter();
-      adapter.sendMessage = async () => {
+      const sendMessage = adapter.sendMessage;
+      adapter.sendMessage = async (channel, text) => {
         outputStarted();
-        return never;
+        await outputGate;
+        return sendMessage(channel, text);
       };
       const claim = vi.fn((entry: unknown) => entry);
       const orch = makeOrch({ dataDir, rt, adapter, storeOverrides: { tryRecordReportBack: claim } });
+      const finalizeMessages = vi.spyOn(orch as any, "finalizeMessagesStream");
 
-      const turn = orch.dispatchInjectTurn(baseSpec({ returnTo: "origin-thread" }));
+      let settled = false;
+      const turn = orch.dispatchInjectTurn(baseSpec({ kind: "parked", stream, returnTo: "origin-thread" }))
+        .then((value) => { settled = true; return value; });
       await started;
-      await vi.advanceTimersByTimeAsync(5_000);
+      await (orch as any).queueOnChannel("thread-w", async () => {});
+      if (stream) await vi.waitFor(() => expect(finalizeMessages).toHaveBeenCalled());
+      await vi.advanceTimersByTimeAsync(7_000);
+      expect(claim).toHaveBeenCalledTimes(1);
+      expect(settled).toBe(false);
+      expect(calls.editPanel.every(({ panel }) => panel.title === "📥 Parked · Working")).toBe(true);
+
+      releaseOutput();
       const result = await turn;
 
       const finalPanel = calls.editPanel[calls.editPanel.length - 1]!.panel;
-      expect(finalPanel.title).toContain("📨 Handoff · Timed out");
-      expect(serializePanelText(finalPanel)).toContain("Output delivery still pending after 5s");
-      expect(result.output).toBe("answer captured before Discord stalled");
-      expect(claim).toHaveBeenCalledTimes(1);
+      expect(finalPanel.title).toBe("📥 Parked · Done");
+      expect(finalPanel.color).toBe(0x57f287);
+      expect(finalPanel.fields.find((field) => field.name === "Action")?.value).toBe("end_turn");
+      expect(result.output).toBe(answer);
+      expect(calls.sendMessage.map(({ text }) => text).join("").replace(/\s/g, ""))
+        .toBe(answer.replace(/\s/g, ""));
     } finally {
+      releaseOutput?.();
       vi.useRealTimers();
     }
   });
@@ -522,6 +539,7 @@ describe("dispatchInjectTurn: status panel ON (default)", () => {
     const finalPanel = calls.editPanel[calls.editPanel.length - 1]!.panel;
     expect(finalPanel.title).toContain("📨 Handoff · Failed");
     expect(serializePanelText(finalPanel)).toContain("Output delivery failed; turn completed");
+    expect(serializePanelText(finalPanel)).toContain("renderer queue failed");
     expect(result.output).toBe("captured answer");
   });
 

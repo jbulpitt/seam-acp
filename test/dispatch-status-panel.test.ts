@@ -117,6 +117,34 @@ describe("DispatchStatusPanel: drives TurnStatus from onEvent", () => {
     expect(last.title).toContain("Done"); // title is "⏰ Wake · Done"
   });
 
+  it("coalesces queued Working renders into Done when the parked turn settles", async () => {
+    const edits: StructuredPanel[] = [];
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const status = new TurnStatus({ model: "opus", repoDisplay: "repo", titlePrefix: "📥 Parked" });
+    const panel = new DispatchStatusPanel<MessageRef>(discordRenderer, status, {
+      post: async () => ({ channel: { platform: "discord", id: "t" }, id: "parked-card" }),
+      edit: async (ref, value) => {
+        expect(ref.id).toBe("parked-card");
+        edits.push(value);
+        if (edits.length === 1) await gate;
+      },
+    }, { debounceMs: 0 });
+    await panel.start();
+    panel.handleEvent({ kind: "tool-start", toolCallId: "tool", title: "Read notes" });
+    await Promise.resolve();
+    expect(edits).toHaveLength(1);
+    panel.handleEvent({ kind: "tool-update", toolCallId: "tool", status: "completed" });
+    const finished = panel.finalize("Done", "end_turn");
+    release();
+    await finished;
+    expect(edits.slice(1).every((value) => value.title === "📥 Parked · Done")).toBe(true);
+    expect(edits.at(-1)?.title).toBe("📥 Parked · Done");
+    expect(edits.at(-1)?.color).toBe(0x57f287);
+    expect(edits.at(-1)?.fields.find((field) => field.name === "Action")?.value).toBe("end_turn");
+    expect(panel.lastEditSucceeded).toBe(true);
+  });
+
   it("keeps the elapsed clock counting while nothing else changes", async () => {
     vi.useFakeTimers({ toFake: ["setInterval", "clearInterval", "setTimeout", "clearTimeout", "Date"] });
     try {

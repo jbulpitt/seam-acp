@@ -3893,20 +3893,22 @@ export class Orchestrator {
     let pendingRefresh: NodeJS.Timeout | undefined;
     const statusEditQueue = new SerialQueue();
     let statusCardSettled = false;
-    const editStatusSnapshot = (settlement = false): Promise<void> => statusEditQueue.run(async () => {
-      if (statusCardSettled && !settlement) return;
-      const now = Date.now();
-      const viewed = observationFromTurn(status);
-      statusCard.publish(viewed.observation, viewed.contextWindow, now);
-      if (statusCard.plan().action === "skip") return;
-      const stamped = status.startedUtc + (statusCard.current()?.elapsedSeconds ?? 0) * 1000;
-      const panel = renderStatusPanel(this.renderer, status.toInput(), stamped);
-      const fingerprint = JSON.stringify(panel);
-      if (fingerprint === lastRendered) {
-        statusCard.acknowledge();
-        return;
-      }
-      try {
+    // Read the latest snapshot when the queued write runs, like adopted cards.
+    // Status I/O must never hold the ACP answer-processing queue.
+    const editStatusSnapshot = (settlement = false): void => {
+      void statusEditQueue.run(async () => {
+        if (statusCardSettled && !settlement) return;
+        const now = Date.now();
+        const viewed = observationFromTurn(status);
+        statusCard.publish(viewed.observation, viewed.contextWindow, now);
+        if (statusCard.plan().action === "skip") return;
+        const stamped = status.startedUtc + (statusCard.current()?.elapsedSeconds ?? 0) * 1000;
+        const panel = renderStatusPanel(this.renderer, status.toInput(), stamped);
+        const fingerprint = JSON.stringify(panel);
+        if (fingerprint === lastRendered) {
+          statusCard.acknowledge();
+          return;
+        }
         if (this.adapter.editPanel) {
           await this.adapter.editPanel(statusMsg, panel);
         } else {
@@ -3915,12 +3917,8 @@ export class Orchestrator {
         lastRendered = fingerprint;
         lastEdit = now;
         statusCard.acknowledge();
-      } catch (err) {
-        // The card is still the previous artifact. A later refresh can edit
-        // it; the turn itself is not failed by a status write.
-        this.logger.warn({ err }, "status edit failed");
-      }
-    });
+      }).catch((err) => this.logger.warn({ err }, "status edit failed"));
+    };
     const refresh = async (force = false) => {
       if (statusCardSettled) return;
       if (!this.queueFenceCurrent(queueFence)) return;
@@ -3940,7 +3938,7 @@ export class Orchestrator {
         clearTimeout(pendingRefresh);
         pendingRefresh = undefined;
       }
-      await editStatusSnapshot();
+      editStatusSnapshot();
     };
     const settleAttemptCard = async (): Promise<void> => {
       if (!humanAttempt) return;
@@ -3959,7 +3957,7 @@ export class Orchestrator {
       }
       status.setState(projection.state);
       status.setAction(projection.action);
-      await editStatusSnapshot(true);
+      editStatusSnapshot(true);
     };
 
     // Heartbeat: tick the elapsed clock while nothing else changes, so a long
@@ -4790,18 +4788,11 @@ export class Orchestrator {
         }
       }
 
-      // Drain the session-update queue so every update received before the
-      // prompt response is processed into the chat pipeline BEFORE we flush and
-      // finalize. Without this, updates still backlogged in the SerialQueue post
-      // and refresh the status card AFTER it already shows "Done" — the display
-      // trails the (already-finished) turn. Skip on timeout (the agent may be
-      // hung and idle() could then block), and race a short guard so a stuck
-      // update handler can't lock the turn open.
+      // Let the ACP reader enqueue preceding notifications, then drain them
+      // before completing or releasing ownership. Status writes are independent.
       if (result !== "timeout") {
-        await Promise.race([
-          activeRuntime.idle(),
-          new Promise<void>((r) => setTimeout(r, 5_000)),
-        ]);
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        await activeRuntime.idle();
       }
 
       completeHuman(result === "timeout" ? "turn timed out" : undefined,
@@ -5165,7 +5156,7 @@ export class Orchestrator {
         this.currentSpeakerIds.delete(record.channelRef);
         this.currentAuthorIds.delete(record.channelRef);
       }
-      await wrapUpStep("status-card-final", () => refresh(true));
+      void refresh(true);
       if (isSimpleCardGifTerminal(status.state)) {
         await wrapUpStep("status-gif-delete", () => deleteSimpleCardGifMessage({
           ref: gifMsg,

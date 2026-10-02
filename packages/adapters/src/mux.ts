@@ -299,6 +299,8 @@ function exitSignal(value: unknown): NodeJS.Signals | null {
  */
 export function makeMux(opts: {
   id: string;
+  /** Controller turn policy travels with every slot spawn, including isolated jobs. */
+  turnTimeoutSeconds?: number;
   onBridgeConnect?: () => void;
   onHello?: (hello: HelloFrame) => void;
   onEvent?: (event: EventFrame) => void;
@@ -1001,7 +1003,9 @@ export function makeMux(opts: {
         type: "rpc",
         id,
         method,
-        params,
+        params: method === "spawn" && opts.turnTimeoutSeconds !== undefined
+          ? { ...(params as Record<string, unknown>), turnTimeoutSeconds: opts.turnTimeoutSeconds }
+          : params,
         ...(optsRpc.agentId ? { agentId: optsRpc.agentId } : {}),
       } as MuxMsg);
     });

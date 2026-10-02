@@ -69,7 +69,10 @@ function exitWithRefusal(reason: string): void {
 }
 
 function start(config: AdapterChildBootstrap): void {
-  const { adapters } = loadHostAdapterInventory(config.copilotCmd, { cwd: config.localCwd });
+  const { adapters } = loadHostAdapterInventory(config.copilotCmd, {
+    cwd: config.localCwd,
+    turnTimeoutSeconds: config.config.turnTimeoutSeconds,
+  });
   let spawned: ChildProcess;
   try {
     spawned = spawnSupervisedAdapter(adapters, config.config);

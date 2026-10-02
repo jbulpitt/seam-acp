@@ -44,6 +44,7 @@ function commandExists(cmd: string): boolean {
 
 export interface HostAdapterRuntimeOptions {
   cwd?: string;
+  turnTimeoutSeconds?: number;
   env?: NodeJS.ProcessEnv;
   exists?: (bin: string) => boolean;
   copilotCatalogProbe?: (launch: CopilotCatalogLaunch) => Promise<CopilotCatalogProbe>;
@@ -263,6 +264,7 @@ export function loadHostAdapters(
             }),
         defaultModel: agyDefaultModel!,
         staticModels: agyModels,
+        printTimeoutSeconds: options.turnTimeoutSeconds,
       }),
     }] : []),
     {

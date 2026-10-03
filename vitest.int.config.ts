@@ -12,7 +12,7 @@ export default defineConfig({
     env: {
       SEAM_LIVE_ACP: "1",
     },
-    setupFiles: [path.join(root, "test/non-live-env.ts")],
+    setupFiles: [path.join(root, "test/live-env.ts")],
   },
   resolve: {
     alias: {

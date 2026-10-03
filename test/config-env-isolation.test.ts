@@ -10,12 +10,13 @@ import { createRequire } from "node:module";
 const exec = promisify(execFile);
 const root = fileURLToPath(new URL("../", import.meta.url));
 
-describe("#495 actual config tests under real dotenv files", () => {
+describe("non-live config isolation under real dotenv files", () => {
   it.each(["clean", "hostile"])("passes with a %s .env, without operator environment assistance", async mode => {
     const cwd = mkdtempSync(path.join(tmpdir(), "seam-config-env-"));
     try {
       writeFileSync(path.join(cwd, ".env"), [
         "SEAM_495_DOTENV_SENTINEL=from-real-dotenv-file",
+        "AGY_PIN=unpinned",
         ...(mode === "hostile" ? [
           "COPILOT_ENABLED=true", "AGENT_LOCATION_DENY=copilot@local", "DEFAULT_AGENT=opencode",
           "DISCORD_DEV_GUILD_ID=not-a-numeric-id", "CHANNEL_PRESETS_FILE=/missing/hostile-presets.json",
@@ -31,7 +32,8 @@ describe("#495 actual config tests under real dotenv files", () => {
         cwd, timeout: 90_000, maxBuffer: 4 * 1024 * 1024,
         // No credential, config, NODE_OPTIONS or other operator setting is
         // inherited. PATH is operational only; HOME is another disposable path.
-        env: { PATH: process.env.PATH, HOME: cwd, CI: "true", SEAM_495_DOTENV_SENTINEL: "inherited-wrong-value" },
+        env: { PATH: process.env.PATH, HOME: cwd, CI: "true", SEAM_495_DOTENV_SENTINEL: "inherited-wrong-value",
+          SEAM_620_OPERATOR_ONLY: "shell-only", AGY_PIN: "unpinned" },
       }).then(() => 0, (error: { code?: unknown }) => error.code);
       const summary = JSON.parse(readFileSync(report, "utf8"));
       const failures = summary.testResults.flatMap((file: any) => file.assertionResults

@@ -110,17 +110,44 @@ describe("#614 invalid optional recovery state", () => {
     await expect(client.write(450, "do not send")).rejects.toThrow(cause);
     await expect(client.spawn({ slot: 450, executable: process.execPath, args: [], cwd: root, env: {} })).rejects.toThrow(cause);
     await expect(client.subscribe({ slot: 450, afterSeq: 0 }, () => {})).rejects.toThrow(cause);
-    const bridge = new SupervisedSlots({ client, copilotCmd: "unused", localCwd: root, onFrame: () => {}, onStderr: () => {} });
-    await expect(bridge.rebind()).resolves.toMatchObject({ slots: [450] });
-    expect(await bridge.writeInput(450, "do not deliver")).toBe(false);
-    expect(bridge.undeliverableReason(450)).toContain(cause);
     expect(() => process.kill(old.pid, 0)).not.toThrow();
-    const fresh = await client.spawn({ slot: 451, executable: process.execPath, args: ["-e", 'process.stdin.on("data", chunk => process.stdout.write(chunk)); setInterval(() => {}, 1000)'], cwd: root, env: {} });
+    const fresh = await client.spawn({ slot: 451, executable: process.execPath, args: ["-e", `
+      let input = "";
+      process.stdin.on("data", chunk => {
+        input += chunk.toString();
+        let newline;
+        while ((newline = input.indexOf("\\n")) !== -1) {
+          const line = input.slice(0, newline); input = input.slice(newline + 1);
+          try {
+            const frame = JSON.parse(line);
+            if (frame.type === "input") process.stdout.write(JSON.stringify({ v: 1, type: "data", data: Buffer.from(frame.dataBase64, "base64").toString() }) + "\\n");
+          } catch { process.stdout.write(line + "\\n"); }
+        }
+      });
+      setInterval(() => {}, 1000);
+    `], cwd: root, env: {} });
     const events: SessiondEvent[] = [];
     await client.subscribe({ slot: 451, afterSeq: 0 }, (event) => events.push(event));
     await client.write(451, "new-session-works\n");
     await waitFor(() => stdoutText(events).includes("new-session-works") ? true : undefined);
     expect(fresh.pid).not.toBe(old.pid);
+    const listed = await client.listSlots();
+    vi.spyOn(client, "listSlots").mockResolvedValueOnce({
+      ...listed, health: [...listed.health].sort((left, right) => left.slot - right.slot),
+    });
+    const subscribe = vi.spyOn(client, "subscribe");
+    const onFrame = vi.fn();
+    const bridge = new SupervisedSlots({ client, copilotCmd: "unused", localCwd: root, onFrame, onStderr: () => {} });
+    await expect(bridge.rebind()).resolves.toMatchObject({ slots: expect.arrayContaining([450, 451]) });
+    expect(subscribe.mock.calls.map(([params]) => params.slot)).toEqual([450, 451]);
+    expect(await bridge.writeInput(450, "do not deliver")).toBe(false);
+    expect(bridge.undeliverableReason(450)).toContain(cause);
+    expect(log.mock.calls.flat().join("\n")).toContain(`[bridge] slot 450 disabled: sessiond state recovery refused: ${cause}`);
+    const replay = await bridge.replay(451, 0);
+    replay.activate();
+    expect(await bridge.writeInput(451, "bridge-session-works\n")).toBe(true);
+    await waitFor(() => onFrame.mock.calls.some(([frame]) => frame.slot === 451 && frame.data === "bridge-session-works\n") ? true : undefined);
+    expect((await client.listSlots()).health.find((entry) => entry.slot === 451)?.pid).toBe(fresh.pid);
     client.close();
     await second.close();
     const third = new SessiondServer({ socketPath, statePath }); servers.push(third);

@@ -135,9 +135,13 @@ import {
 } from "./core/service-status/index.js";
 import { ServiceStatusCard } from "./core/service-status-card.js";
 import { planAgyIdentityMigration, readAgyHandleOwnership } from "./core/agy-identity-migration.js";
+import { PluginHost } from "./plugins/host.js";
+import { BUILTIN_PLUGINS } from "./plugins/builtins.js";
 
 async function main(): Promise<void> {
   const config = loadConfig();
+  const plugins = new PluginHost(logger);
+  await plugins.loadBuiltins(BUILTIN_PLUGINS);
   const controllerInstanceId = randomUUID();
   // Thread agent/model choices are saved in the presets file; with none
   // configured every switch was refused, so a fresh install keeps one here.
@@ -694,6 +698,7 @@ async function main(): Promise<void> {
 
   const orchestrator = new Orchestrator({
     logger,
+    fences: plugins.fences,
     config,
     adapter,
     router,
@@ -2042,6 +2047,9 @@ async function main(): Promise<void> {
         }
       );
     verdicts.push({ stage: "post-dispose-drain", drained: postDisposeDrained });
+    if (safeToCloseResources(verdicts)) {
+      verdicts.push({ stage: "plugins", drained: await bounded("plugin dispose", config.SHUTDOWN_QUIESCE_TIMEOUT_MS, () => plugins.dispose()) });
+    }
 
     // #174: close the adapter and the SQLite handles ONLY when every drain
     // above proved nothing can still be running. A stage that timed out or

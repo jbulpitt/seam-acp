@@ -43,15 +43,6 @@ export const WATCH_FENCE_LANG = "seam-watch";
  *  path. Re-exported from `choice/types.ts` so callers can import either. */
 export { CHOICE_FENCE_LANG, RESULT_FENCE_LANG } from "./choice/types.js";
 
-/** Fence info tags that typeset as a PNG (issue #79). FenceStream already
- *  lowercases the lang tag; `isMathFenceLang` still lowercases so mixed-case
- *  callers match. */
-export const MATH_FENCE_LANGS = ["latex", "math", "tex", "katex"] as const;
-
-export function isMathFenceLang(lang: string): boolean {
-  return (MATH_FENCE_LANGS as readonly string[]).includes(lang.trim().toLowerCase());
-}
-
 /** A per-turn speaker stamp (issue #57). `id` is the authoritative, harness-
  *  stamped identity (not user-controlled); `name` is a user-editable convenience
  *  label that must never drive a scope/permission decision (D4). */
@@ -111,6 +102,8 @@ export interface HarnessOpts {
   /** Bridge-backed host tools are present for this channel. */
   hostTools?: boolean;
   seamFences?: boolean;
+  /** Instructions from this output path's active fence contributions. */
+  fenceInstructions?: readonly string[];
   /** Current wall-clock in the user's local zone, pre-formatted by the caller
    *  (e.g. "Aug 28, 2026, 8:47 AM CDT"). Emitted as a per-turn fact so the
    *  agent reasons about time-of-day from this, not a UTC timestamp. */
@@ -158,9 +151,7 @@ export function harnessPreamble(
       `• To send a file from the workspace to the user, output a fenced code block whose info tag is \`${ATTACH_FENCE_LANG}\` and whose only content is the file path (project-relative or absolute). The bridge uploads that file and removes the block from your message — do not otherwise describe this mechanism.`
     );
   }
-  lines.push(
-    "• To show a typeset equation, output a fenced code block whose info tag is `latex` (aliases `math`, `tex`) and whose body is the TeX. The bridge renders it as an image and removes the block — do not wrap that fence in another fence, and do not otherwise describe this mechanism. Simple inline math can stay as Unicode."
-  );
+  lines.push(...(opts?.fenceInstructions ?? []).map(instruction => `• ${instruction}`));
   // poll_inbox is a seam-mcp TOOL. Advertise only when both the inbox
   // preamble flag and actual MCP attachment are on.
   if (opts?.inboxAwareness && opts?.seamMcp) {

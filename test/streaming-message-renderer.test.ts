@@ -1,4 +1,7 @@
 import { describe, it, expect } from "vitest";
+import { pino } from "pino";
+import { PluginHost } from "../packages/core/src/plugins/host.js";
+import { BUILTIN_PLUGINS } from "../packages/core/src/plugins/builtins.js";
 import { StreamingMessageRenderer } from "../packages/core/src/core/streaming-message-renderer.js";
 
 /** Collects every posted message, in order. */
@@ -152,7 +155,9 @@ describe("StreamingMessageRenderer (real FenceStream + splitForFlush + SerialQue
     const sendFile = async (file: { data: Buffer; filename: string; mimeType: string }) => {
       files.push(file);
     };
-    const r = new StreamingMessageRenderer(send, { sendFile });
+    const plugins = new PluginHost(pino({ level: "silent" }));
+    await plugins.loadBuiltins(BUILTIN_PLUGINS);
+    const r = new StreamingMessageRenderer(send, { sendFile, fences: plugins.fences });
     r.feed("Before the equation.\n\n```latex\ne^{i\\pi}+1=0\n```\n\nAfter.");
     await r.finalize();
 
@@ -168,15 +173,19 @@ describe("StreamingMessageRenderer (real FenceStream + splitForFlush + SerialQue
     expect(sent.some((m) => m.includes("e^{i\\pi}+1=0"))).toBe(false);
     expect(sent.some((m) => m.includes("Before the equation."))).toBe(true);
     expect(sent.some((m) => m.includes("After."))).toBe(true);
+    await plugins.dispose();
   });
 
   it("without sendFile, a latex fence is still reconstructed as source", async () => {
     const { sent, send } = collector();
-    const r = new StreamingMessageRenderer(send);
+    const plugins = new PluginHost(pino({ level: "silent" }));
+    await plugins.loadBuiltins(BUILTIN_PLUGINS);
+    const r = new StreamingMessageRenderer(send, { fences: plugins.fences });
     r.feed("```latex\ne^{i\\pi}+1=0\n```");
     await r.finalize();
     const fenceMsg = sent.find((m) => m.startsWith("```latex"));
     expect(fenceMsg).toBe("```latex\ne^{i\\pi}+1=0\n```");
+    await plugins.dispose();
   });
 });
 

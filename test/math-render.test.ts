@@ -1,33 +1,11 @@
 import { describe, it, expect } from "vitest";
-import { isMathFenceLang, renderMathPng } from "../packages/core/src/core/math-render.js";
+import { renderMathPng } from "../packages/core/src/plugins/math/render.js";
 
 const PNG_SIG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 
 function isPng(buf: Buffer): boolean {
   return buf.subarray(0, 8).equals(PNG_SIG) && buf.byteLength > 100;
 }
-
-describe("isMathFenceLang", () => {
-  it("allows latex/math/tex/katex", () => {
-    expect(isMathFenceLang("latex")).toBe(true);
-    expect(isMathFenceLang("math")).toBe(true);
-    expect(isMathFenceLang("tex")).toBe(true);
-    expect(isMathFenceLang("katex")).toBe(true);
-  });
-
-  it("rejects non-math langs and the empty tag", () => {
-    expect(isMathFenceLang("python")).toBe(false);
-    expect(isMathFenceLang("seam-attach")).toBe(false);
-    expect(isMathFenceLang("")).toBe(false);
-  });
-
-  it("lowercases the tag (FenceStream does too; this is belt-and-suspenders)", () => {
-    expect(isMathFenceLang("LaTeX")).toBe(true);
-    expect(isMathFenceLang("MATH")).toBe(true);
-    expect(isMathFenceLang("TeX")).toBe(true);
-    expect(isMathFenceLang("  KaTeX  ")).toBe(true);
-  });
-});
 
 describe("renderMathPng", () => {
   it("typesets Euler's identity to a PNG", async () => {

@@ -401,6 +401,7 @@ export function classifyDiscordInteraction(interaction: {
     (cid.startsWith("seam-cfg-edit:") ||
       cid.startsWith("seam-tts:") ||
       cid.startsWith("tvc:") ||
+      cid.startsWith("seam-service-status:") ||
       cid.startsWith("seam-quota:"))
   ) {
     return "config-edit";

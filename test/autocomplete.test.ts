@@ -21,6 +21,7 @@ import {
   SEAM_COMMAND_NAME,
 } from "../packages/core/src/platforms/discord/commands.js";
 import { CHOICE_CUSTOM_ID_PREFIX } from "../packages/core/src/core/choice/types.js";
+import { SERVICE_STATUS_REFRESH_CUSTOM_ID } from "../packages/core/src/core/service-status-card.js";
 
 describe("AutocompleteRegistry", () => {
   it("keys responders by (group, subcommand, optionName)", async () => {
@@ -344,6 +345,12 @@ describe("classifyDiscordInteraction — autocomplete is a parallel branch", () 
     ).toBe("config-edit");
     expect(
       classifyDiscordInteraction(flags({ button: true, customId: "seam-tts:draft-1:toggle" }))
+    ).toBe("config-edit");
+  });
+
+  it("service status Refresh routes to the persistent-component handler", () => {
+    expect(
+      classifyDiscordInteraction(flags({ button: true, customId: SERVICE_STATUS_REFRESH_CUSTOM_ID }))
     ).toBe("config-edit");
   });
 

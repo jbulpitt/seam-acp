@@ -72,6 +72,9 @@ export interface SeamMcpWiring {
   bindSessionLocation?: (sessionId: string, location: string) => void;
 }
 
+/** Execution transport is required even when the optional MCP tools are off. */
+export type ExecutionBridgeWiring = Required<Pick<SeamMcpWiring, "isBridgeSession" | "muxForSession">>;
+
 /** Inputs `startRuntime` uses to construct and spawn an AgentRuntime. */
 export interface RuntimeSpawnPlan {
   agentId: string;
@@ -323,6 +326,10 @@ export class SessionRouter {
   private readonly defaultPermissionMode: PermissionPolicyMode;
   private readonly mcpServers: McpServer[];
   private readonly seamMcp?: SeamMcpWiring;
+  private readonly executionBridge?: ExecutionBridgeWiring;
+  private readonly defaultAgentDisabledReason?: string;
+  private readonly localAgentErrors: ReadonlyMap<string, string>;
+  private readonly agyMigrationErrors: ReadonlyMap<string, string>;
   private readonly bindSessionLocationFn?: (sessionId: string, location: string) => void;
   private readonly channelPresets: Map<string, ChannelPreset>;
   private readonly threadPresets: Map<string, ThreadPreset>;
@@ -361,10 +368,14 @@ export class SessionRouter {
     modelCatalog: ModelCatalogService;
     modelMetadata?: Pick<ModelMetadataStore, "getAll">;
     defaultAgentId: string;
+    defaultAgentDisabledReason?: string;
+    localAgentErrors?: ReadonlyMap<string, string>;
+    agyMigrationErrors?: ReadonlyMap<string, string>;
     defaultModel: string;
     defaultPermissionMode?: PermissionPolicyMode;
     mcpServers?: McpServer[];
     seamMcp?: SeamMcpWiring;
+    executionBridge?: ExecutionBridgeWiring;
     bindSessionLocation?: (sessionId: string, location: string) => void;
     channelPresets?: Map<string, ChannelPreset>;
     threadPresets?: Map<string, ThreadPreset>;
@@ -396,9 +407,14 @@ export class SessionRouter {
     this.modelCatalog = opts.modelCatalog;
     this.modelMetadata = opts.modelMetadata;
     this.defaultAgentId = opts.defaultAgentId;
+    this.defaultAgentDisabledReason = opts.defaultAgentDisabledReason;
+    this.localAgentErrors = opts.localAgentErrors ?? new Map();
+    this.agyMigrationErrors = opts.agyMigrationErrors ?? new Map();
     this.defaultPermissionMode = opts.defaultPermissionMode ?? "ask";
     this.mcpServers = opts.mcpServers ?? [];
     this.seamMcp = opts.seamMcp;
+    this.executionBridge = opts.executionBridge ?? (opts.seamMcp?.isBridgeSession && opts.seamMcp.muxForSession
+      ? { isBridgeSession: opts.seamMcp.isBridgeSession, muxForSession: opts.seamMcp.muxForSession } : undefined);
     this.bindSessionLocationFn = opts.bindSessionLocation ?? opts.seamMcp?.bindSessionLocation;
     this.channelPresets = opts.channelPresets ?? new Map();
     this.threadPresets = opts.threadPresets ?? new Map();
@@ -459,6 +475,7 @@ export class SessionRouter {
 
   /** Look up a local profile or synthesize a cache-backed remote-only one. */
   getProfile(id: string, location = "local"): AgentProfile | undefined {
+    if (isLocalLocation(location) && this.localAgentErrors.has(id)) return undefined;
     const local = this.profileById.get(id);
     if (local || isLocalLocation(location)) return local;
     const binding = { agentId: id, location };
@@ -526,6 +543,7 @@ export class SessionRouter {
    */
   unregisteredAgentMessage(agentId: string, fallback: string): string {
     return (
+      this.localAgentErrors.get(agentId) ??
       parkedAgentMessage(agentId, this.ollamaCloudEnabled, "select") ??
       retiredAgentMessage(agentId) ??
       fallback
@@ -535,6 +553,7 @@ export class SessionRouter {
   /** Leftover-session wording (parked, not "gone forever"). */
   unregisteredAgentSessionMessage(agentId: string, fallback: string): string {
     return (
+      this.localAgentErrors.get(agentId) ??
       parkedAgentMessage(agentId, this.ollamaCloudEnabled, "session") ??
       retiredAgentMessage(agentId) ??
       fallback
@@ -791,6 +810,9 @@ export class SessionRouter {
       { threadPresets: this.threadPresets },
       opts.channelRef
     );
+    if (!preset.agent && this.defaultAgentDisabledReason && isLocalLocation(location)) {
+      throw new Error(this.defaultAgentDisabledReason);
+    }
     const catalogDefault = this.modelCatalog.model({ agentId, location }, "default")?.id ?? "default";
     const cfg = defaultSessionConfig(preset.model?.value ?? catalogDefault, this.defaultPermissionMode);
     const now = new Date().toISOString();
@@ -1291,6 +1313,10 @@ export class SessionRouter {
     );
 
     const agentId = preset.agent?.value ?? record.agentId;
+    const migrationError = this.agyMigrationErrors.get(record.id);
+    if (migrationError && isLocalLocation(location) && ["agy", "agy-old"].includes(agentId)) {
+      throw new Error(migrationError);
+    }
     // #308: protects normal live turns, queued prompts, wakes, and interrupt
     // redirects; deleting it lets those shared runtime paths bypass the rule.
     const profile = this.resolveProfileForChannel(agentId, record.parentRef ?? record.channelRef, location);
@@ -1362,7 +1388,7 @@ export class SessionRouter {
       );
     }
 
-    const { mcpServers, bridged } = planSeamMcpInjection({
+    const { mcpServers } = planSeamMcpInjection({
       sessionId: record.id,
       globalMcpServers: this.mcpServers,
       seamMcp: this.seamMcp,
@@ -1375,10 +1401,10 @@ export class SessionRouter {
     // is therefore resolved on the execution host, including `local`; reading
     // it here would recreate the second spawn/configuration implementation
     // that #575 removes.
-    if (!bridged) {
+    if (!this.executionBridge?.isBridgeSession(record.id)) {
       throw new Error(`Session ${record.id} has no execution bridge binding`);
     }
-    const mux = this.seamMcp?.muxForSession?.(record.id);
+    const mux = this.executionBridge.muxForSession(record.id);
     if (!mux) {
       // Refuse this host-bound session only. Other bridge locations and all
       // non-agent control-plane surfaces remain available (#575 blast radius).

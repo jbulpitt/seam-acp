@@ -151,7 +151,9 @@ async function main(): Promise<void> {
       fs.mkdirSync(config.DATA_DIR, { recursive: true });
       fs.writeFileSync(file, `${JSON.stringify({ channels: {}, threads: {}, bridges: {} }, null, 2)}\n`);
     }
-    Object.assign(config, { CHANNEL_PRESETS_FILE: file }, buildChannelPresetMaps(file));
+    Object.assign(config, { CHANNEL_PRESETS_FILE: file }, buildChannelPresetMaps(file, {
+      dropInvalidEntries: true, warn: (message) => logger.warn(message),
+    }));
   }
   const localBridgeCredential = await loadOrCreateLocalBridgeCredential(config.DATA_DIR);
   setAgentLocationDeny(config.AGENT_LOCATION_DENY);
@@ -264,18 +266,33 @@ async function main(): Promise<void> {
 
   const seamDbPath = path.join(config.DATA_DIR, "seam.db");
   const store = new SessionStore(seamDbPath);
+  const agyMigrationErrors = new Map<string, string>();
   if (config.AGY_NATIVE_RESTORE && !store.agyIdentityRestored()) {
-    const changes = planAgyIdentityMigration(
-      store.list(store.countSessions()),
-      readAgyHandleOwnership(config.DATA_DIR, process.env.HOME ?? "", config.AGY_ACP_STATE_DIR ?? path.join(process.env.HOME ?? "", ".agy-acp")),
-      (record) => {
-        const explicitAgent = config.threadPresets.get(record.channelRef)?.agent?.value
-          ?? (record.parentRef ? config.channelPresets.get(record.parentRef)?.agent?.value : undefined);
-        return { agent: explicitAgent ?? record.agentId, explicitAgent, location: resolveThreadLocation(config, record.channelRef) };
-      },
-    );
-    store.applyAgyIdentityMigration(changes);
-    logger.info({ total: changes.length, rebuildRequired: changes.filter((change) => change.rebuild).length }, "local AGY native identity restoration applied");
+    const pending = store.list(store.countSessions()).filter((record) => !store.hasAgyIdentityMigration(record.id));
+    const binding = (record: ReturnType<SessionStore["list"]>[number]) => {
+      const explicitAgent = config.threadPresets.get(record.channelRef)?.agent?.value
+        ?? (record.parentRef ? config.channelPresets.get(record.parentRef)?.agent?.value : undefined);
+      return { agent: explicitAgent ?? record.agentId, explicitAgent, location: resolveThreadLocation(config, record.channelRef) };
+    };
+    const refuse = (record: ReturnType<SessionStore["list"]>[number], error: Error) => {
+      agyMigrationErrors.set(record.id, error.message);
+      logger.error({ session: record.id, err: error }, "AGY identity migration disabled for this session");
+    };
+    try {
+      const changes = planAgyIdentityMigration(
+        pending,
+        readAgyHandleOwnership(config.DATA_DIR, process.env.HOME ?? "", config.AGY_ACP_STATE_DIR ?? path.join(process.env.HOME ?? "", ".agy-acp")),
+        binding, refuse,
+      );
+      store.applyAgyIdentityMigration(changes, { complete: agyMigrationErrors.size === 0 });
+      logger.info({ total: changes.length, rebuildRequired: changes.filter((change) => change.rebuild).length }, "local AGY native identity restoration applied");
+    } catch (error) {
+      for (const record of pending) {
+        const effective = binding(record);
+        if (effective.location === "local" && ["agy", "agy-old"].includes(effective.agent)) refuse(record, error as Error);
+      }
+      logger.error({ err: error }, "AGY identity migration unavailable; unrelated sessions remain enabled");
+    }
   }
   const modelValueStore = new ModelValueStore(seamDbPath, {
     inputTokens: config.MODEL_VALUE_STD_INPUT_TOKENS,
@@ -363,23 +380,29 @@ async function main(): Promise<void> {
       })
     : undefined;
 
-  const agyRuntime = !(config.AGY_ENABLED || config.AGY_OLD_ROLLBACK_ENABLED)
-    ? undefined
-    : config.AGY_PIN === "unpinned"
-      ? makeAgyUnpinnedRuntime({
-          credentialScope: config.AGY_CREDENTIAL_SCOPE,
-          cwd: process.cwd(),
-          baseEnv: process.env,
-        })
-      : makeAgyNativeRuntime({
-          executable: config.AGY_CLI_PATH!,
-          runtimeRoot: config.AGY_RUNTIME_ROOT!,
-          version: config.AGY_VERSION,
-          sha256: config.AGY_SHA256,
-          credentialScope: config.AGY_CREDENTIAL_SCOPE,
-          cwd: process.cwd(),
-          baseEnv: process.env,
-        });
+  let agyRuntime: ReturnType<typeof makeAgyNativeRuntime> | ReturnType<typeof makeAgyUnpinnedRuntime> | undefined;
+  try {
+    agyRuntime = !(config.AGY_ENABLED || config.AGY_OLD_ROLLBACK_ENABLED)
+      ? undefined
+      : config.AGY_PIN === "unpinned"
+        ? makeAgyUnpinnedRuntime({
+            credentialScope: config.AGY_CREDENTIAL_SCOPE,
+            cwd: process.cwd(),
+            baseEnv: process.env,
+          })
+        : makeAgyNativeRuntime({
+            executable: config.AGY_CLI_PATH!,
+            runtimeRoot: config.AGY_RUNTIME_ROOT!,
+            version: config.AGY_VERSION,
+            sha256: config.AGY_SHA256,
+            credentialScope: config.AGY_CREDENTIAL_SCOPE,
+            cwd: process.cwd(),
+            baseEnv: process.env,
+          });
+  } catch (error) {
+    config.agyDisabledReason = (error as Error).message;
+    logger.error({ err: error }, "AGY disabled; unrelated agents remain enabled");
+  }
   const agy = agyRuntime
     ? makeAgyProfile({
         runtime: agyRuntime,
@@ -589,12 +612,22 @@ async function main(): Promise<void> {
     modelMetadata: modelMetadataStore,
     ollamaCloudEnabled: config.OLLAMA_CLOUD_ENABLED,
     defaultAgentId: config.DEFAULT_AGENT,
+    defaultAgentDisabledReason: config.defaultAgentDisabledReason,
+    localAgentErrors: config.agyDisabledReason ? new Map([["agy", config.agyDisabledReason]]) : undefined,
+    agyMigrationErrors,
     defaultModel: config.DEFAULT_MODEL,
     // Legacy DEFAULT_AUTO_APPROVE=true overrides the policy default to "always".
     defaultPermissionMode: config.DEFAULT_AUTO_APPROVE
       ? "always"
       : config.DEFAULT_PERMISSION_POLICY,
     mcpServers,
+    executionBridge: {
+      isBridgeSession: (sessionId) => !!bridgeHub?.sessionBridgeId(sessionId),
+      muxForSession: (sessionId) => {
+        const id = bridgeHub?.sessionBridgeId(sessionId);
+        return id ? bridgeHub?.muxFor(id) ?? bridgeHub?.get(id)?.mux : undefined;
+      },
+    },
     ...(config.SEAM_MCP_ENABLED
       ? {
           seamMcp: {
@@ -613,10 +646,6 @@ async function main(): Promise<void> {
             isBridgeSession: (sessionId) => !!bridgeHub?.sessionBridgeId(sessionId),
             mcpServersForBridgeSpawn: (sessionId) =>
               bridgeHub?.mcpServersForBridgeSpawn(sessionId),
-            muxForSession: (sessionId) => {
-              const id = bridgeHub?.sessionBridgeId(sessionId);
-              return id ? bridgeHub?.muxFor(id) ?? bridgeHub?.get(id)?.mux : undefined;
-            },
             bindSessionLocation: (sessionId, location) => {
               bridgeHub?.markSessionBridge(sessionId, location);
             },

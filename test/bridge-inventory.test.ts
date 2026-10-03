@@ -46,7 +46,7 @@ describe("loadHostAdapters", () => {
     }]);
   });
 
-  it("loads AGY_PIN=unpinned from PATH and still refuses a pin left beside it", () => {
+  it("loads AGY_PIN=unpinned from PATH while ignoring stale pins", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "seam-agy-unpinned-bridge-"));
     const executable = path.join(dir, "agy");
     fs.writeFileSync(executable, "#!/bin/sh\necho 1.2.8\n", { mode: 0o755 });
@@ -63,13 +63,12 @@ describe("loadHostAdapters", () => {
         exists: (bin) => bin === "agy" || bin === "copilot",
       });
       expect(loaded.get("agy")?.id).toBe("agy");
-      const refused = loadHostAdapterInventory("copilot", {
+      const stale = loadHostAdapterInventory("copilot", {
         env: { ...env, AGY_SHA256: "ab" },
         exists: () => true,
       });
-      expect(refused.adapters.has("agy")).toBe(false);
-      expect(refused.adapterRefusals.find((row) => row.agentId === "agy")?.missing?.join(" "))
-        .toContain("AGY_SHA256");
+      expect(stale.adapters.has("agy")).toBe(true);
+      expect(stale.adapterRefusals.find((row) => row.agentId === "agy")).toBeUndefined();
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }

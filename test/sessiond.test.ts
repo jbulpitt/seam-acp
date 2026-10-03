@@ -5,13 +5,14 @@
  * isolation would not prove the production boundary: the incident is exactly
  * a process losing its anonymous pipe endpoints when its parent goes away.
  */
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { spawn, type ChildProcess } from "node:child_process";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { SessiondClient, SessiondClientError } from "../packages/bridge/src/sessiond-client.js";
 import { readSessiondProcessIdentity, SessiondServer } from "../packages/bridge/src/sessiond-server.js";
+import { SupervisedSlots } from "../packages/bridge/src/supervised-slots.js";
 import type { SessiondEvent, SessiondOutputFrame } from "../packages/bridge/src/sessiond-protocol.js";
 
 const roots: string[] = [];
@@ -68,6 +69,7 @@ function stdoutText(events: SessiondEvent[]): string {
 }
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   for (const client of clients.splice(0)) client.close();
   for (const server of servers.splice(0)) await server.close({ terminateChildren: true });
   for (const daemon of daemons.splice(0)) {
@@ -81,6 +83,56 @@ afterEach(async () => {
     }
   }
   for (const root of roots.splice(0)) await fs.rm(root, { recursive: true, force: true });
+});
+
+describe("#614 invalid optional recovery state", () => {
+  it.each([
+    ["malformed", '{"private": "SECRET_CANARY"', "invalid JSON"],
+    ["future", JSON.stringify({ version: 99, slots: [], private: "SECRET_CANARY" }), "unsupported state version 99"],
+    ["invalid", JSON.stringify({ version: 1, slots: "SECRET_CANARY" }), "state slots must be an array"],
+  ])("%s state preserves existing work and accepts new sessions", async (_label, raw, cause) => {
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    const { root, socketPath, statePath, server: first, client: initial } = await harness();
+    const old = await initial.spawn({ slot: 450, executable: process.execPath, args: ["-e", 'process.stdin.resume(); setInterval(() => {}, 1000)'], cwd: root, env: {} });
+    initial.close();
+    await first.close();
+    await fs.writeFile(statePath, raw, { mode: 0o600 });
+    const second = new SessiondServer({ socketPath, statePath }); servers.push(second);
+    await second.start();
+    const client = await SessiondClient.connect(socketPath); clients.push(client);
+    const names = await fs.readdir(root);
+    const backup = names.find((name) => name.startsWith("slots.json.refused-"));
+    expect(backup).toBeTruthy();
+    expect(await fs.readFile(path.join(root, backup!), "utf8")).toBe(raw);
+    expect((await fs.stat(path.join(root, backup!))).mode & 0o777).toBe(0o600);
+    expect(log.mock.calls.flat().join("\n")).toContain(cause);
+    expect(log.mock.calls.flat().join("\n")).not.toContain("SECRET_CANARY");
+    await expect(client.write(450, "do not send")).rejects.toThrow(cause);
+    await expect(client.spawn({ slot: 450, executable: process.execPath, args: [], cwd: root, env: {} })).rejects.toThrow(cause);
+    await expect(client.subscribe({ slot: 450, afterSeq: 0 }, () => {})).rejects.toThrow(cause);
+    const bridge = new SupervisedSlots({ client, copilotCmd: "unused", localCwd: root, onFrame: () => {}, onStderr: () => {} });
+    await expect(bridge.rebind()).resolves.toMatchObject({ slots: [450] });
+    expect(await bridge.writeInput(450, "do not deliver")).toBe(false);
+    expect(bridge.undeliverableReason(450)).toContain(cause);
+    expect(() => process.kill(old.pid, 0)).not.toThrow();
+    const fresh = await client.spawn({ slot: 451, executable: process.execPath, args: ["-e", 'process.stdin.on("data", chunk => process.stdout.write(chunk)); setInterval(() => {}, 1000)'], cwd: root, env: {} });
+    const events: SessiondEvent[] = [];
+    await client.subscribe({ slot: 451, afterSeq: 0 }, (event) => events.push(event));
+    await client.write(451, "new-session-works\n");
+    await waitFor(() => stdoutText(events).includes("new-session-works") ? true : undefined);
+    expect(fresh.pid).not.toBe(old.pid);
+    client.close();
+    await second.close();
+    const third = new SessiondServer({ socketPath, statePath }); servers.push(third);
+    await third.start();
+    const restarted = await SessiondClient.connect(socketPath); clients.push(restarted);
+    await expect(restarted.write(450, "still refused")).rejects.toThrow(cause);
+    expect((await restarted.listSlots()).health).toEqual(expect.arrayContaining([
+      expect.objectContaining({ slot: 450, alive: false, orphanReason: "identity_unverifiable" }),
+      expect.objectContaining({ slot: 451, alive: true }),
+    ]));
+    expect(() => process.kill(old.pid, 0)).not.toThrow();
+  });
 });
 
 describe("#573 seam-sessiond control-plane restart", () => {

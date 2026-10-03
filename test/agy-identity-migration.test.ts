@@ -84,6 +84,36 @@ describe("owner-approved local AGY restoration", () => {
     expect(() => planAgyIdentityMigration([row("native", "agy-old")], ownership, () => ({ agent: "agy-old", explicitAgent: "agy-old", location: "local" }))).toThrow(/preset/);
   });
 
+  it("isolates an ambiguous record, preserves it, and finishes partial migration after restart and repair", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "agy-partial-")); dirs.push(root);
+    const file = path.join(root, "seam.db");
+    const first = new SessionStore(file);
+    const bad = row("ambiguous", "agy", "native");
+    const good = row("known", "agy-old", "known");
+    [bad, good].forEach((record) => first.upsert(record));
+    const errors = new Map<string, string>();
+    const own = { native: new Set(["native", "known"]), packaged: new Set(["native"]) };
+    const plan = planAgyIdentityMigration(first.list(), own, binding, (record, error) => errors.set(record.id, error.message));
+    first.applyAgyIdentityMigration(plan, { complete: errors.size === 0 });
+    expect(first.get(bad.id)).toEqual(bad);
+    expect(first.get(good.id)).toEqual({ ...good, agentId: "agy" });
+    expect(errors.get(bad.id)).toBe("Ambiguous AGY session ownership");
+    expect(first.agyIdentityRestored()).toBe(false);
+    first.close();
+    const restarted = new SessionStore(file); stores.push(restarted);
+    const pending = restarted.list().filter((record) => !restarted.hasAgyIdentityMigration(record.id));
+    expect(pending).toEqual([bad]);
+    const profile = { id: "agy", defaultModel: "default" } as unknown as AgentProfile;
+    const router = new SessionRouter({ logger: pino({ level: "silent" }) as unknown as Logger, store: restarted, profiles: [profile],
+      modelCatalog: fixtureModelCatalog([profile]), defaultAgentId: "agy", defaultModel: "default", agyMigrationErrors: errors, seamMcp: localBridgeWiring(profile) });
+    expect(() => router.planRuntimeSpawn(bad)).toThrow("Ambiguous AGY session ownership");
+    expect(router.planRuntimeSpawn(restarted.get(good.id)!).agentId).toBe("agy");
+    const repaired = planAgyIdentityMigration(pending, { ...own, packaged: new Set() }, binding);
+    restarted.applyAgyIdentityMigration(repaired);
+    expect(restarted.agyIdentityRestored()).toBe(true);
+    expect(restarted.get(bad.id)?.acpSessionId).toBe("native");
+  });
+
   it("retains recovery after failed reconstruction; successful CAS attachment consumes it once", async () => {
     const store = setup(); store.upsert(row("package"));
     store.applyAgyIdentityMigration(planAgyIdentityMigration(store.list(), ownership, binding));

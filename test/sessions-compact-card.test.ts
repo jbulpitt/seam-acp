@@ -191,6 +191,8 @@ class FakeCollector {
     const evt = {
       customId,
       user: { id: "op" },
+      channelId: "thread-1",
+      channel: { isThread: () => true, parentId: "chan-1" },
       isStringSelectMenu: () => Boolean(values),
       values: values ?? [],
       // Acking the click is itself a round trip to Discord — a window in which
@@ -213,6 +215,8 @@ class FakeCollector {
 }
 
 interface HarnessOpts {
+  participant?: boolean;
+  locked?: boolean;
   bound?: string;
   sessions?: string[];
   location?: string;
@@ -394,8 +398,9 @@ function makeHarness(opts: HarnessOpts = {}) {
       REPO_EMOJIS: new Map<string, string>(),
       CHANNEL_PRESETS_FILE: undefined,
       SEAM_CONFIG_MUTATION_TIER_C_ENABLED: false,
-      channelPresets: {},
-      threadPresets: {},
+      SEAM_PARTICIPANT_USER_IDS: opts.participant ? new Set(["op"]) : undefined,
+      channelPresets: new Map(opts.locked ? [["chan-1", { locked: true }]] : []),
+      threadPresets: new Map(),
     } as any,
     adapter: adapter as any,
     router: router as any,
@@ -587,6 +592,22 @@ async function finishCompaction(h: ReturnType<typeof makeHarness>, customId: str
   await h.settle();
   return attachment;
 }
+
+describe("read-only session browser access", () => {
+  it.each([{ participant: true }, { locked: true }])("permits navigation but not session mutation (%j)", async (opts) => {
+    const h = makeHarness(opts);
+    await h.open();
+    expect(h.manager.listSessions).toHaveBeenCalled();
+    await h.collector.click("sessions:next");
+    for (const action of ["attach", "clone", "delete_confirm", "repair_confirm", "compact", "summary", "migrate_target"]) {
+      await h.collector.click(`sessions:${action}`, action === "migrate_target" ? ["codex"] : undefined);
+    }
+    expect(h.manager.cloneSession).not.toHaveBeenCalled();
+    expect(h.manager.deleteSession).not.toHaveBeenCalled();
+    expect(h.invalidated).toHaveLength(0);
+    expect(h.upserts).toHaveLength(0);
+  });
+});
 
 describe("#706 remote session browser", () => {
   it("lists, clones, and deletes through the thread's bridge", async () => {

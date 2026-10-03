@@ -103,7 +103,7 @@ describe("#614 optional startup settings", () => {
     { DEFAULT_AGENT: "opencode" },
     { DEFAULT_AGENT: "ollama-cloud", OLLAMA_CLOUD_ENABLED: "false" },
     { DEFAULT_AGENT: "copilot", AGENT_LOCATION_DENY: "copilot@local" },
-  ].flatMap((bad) => [false, true].map((deliveryFails) => ({ bad, deliveryFails }))))("reports an unavailable default before admission, retaining its cause if delivery fails: %j", async ({ bad, deliveryFails }) => {
+  ].flatMap((bad) => [false, true].flatMap((deliveryFails) => [false, true].map((offline) => ({ bad, deliveryFails, offline })))))("reports an unavailable default before admission or parking, retaining its cause if delivery fails: %j", async ({ bad, deliveryFails, offline }) => {
     const config = loadConfig({ env: { ...env, ...bad }, warn: () => {} });
     const store = new SessionStore(":memory:"); stores.push(store);
     const catalog = fixtureModelCatalog([profile]);
@@ -116,15 +116,19 @@ describe("#614 optional startup settings", () => {
     });
     const host = new Orchestrator({ logger: silent, config, store, router, modelCatalog: catalog,
       adapter: { sendMessage } as never, renderer: {} as never });
+    const boundary = host as unknown as { bridgeHub: unknown; parkUserPrompt: (...args: unknown[]) => Promise<unknown> };
+    boundary.bridgeHub = { isBridgeReady: () => !offline };
+    const park = vi.spyOn(boundary, "parkUserPrompt");
     const logError = vi.spyOn((host as unknown as { logger: Logger }).logger, "error");
     const message: IncomingMessage = { messageId: "614", channel: { platform: "discord", id: "222" },
-      authorId: "123", authorIsBot: false, text: "never submitted" };
+      authorId: "123", authorIsBot: false, text: "never submitted", raw: {} };
     await expect((host as unknown as { handleIncomingMessage(msg: IncomingMessage): Promise<void> }).handleIncomingMessage(message))
       .rejects.toThrow(config.defaultAgentDisabledReason);
     expect(sendMessage).toHaveBeenCalledExactlyOnceWith(message.channel, `❌ Cannot start this session: ${config.defaultAgentDisabledReason}`);
     expect(store.countSessions()).toBe(0);
     expect(store.getInbound("614")).toBeNull();
     expect(store.turnAttempts.list("active")).toEqual([]);
+    expect(park).not.toHaveBeenCalled();
     if (deliveryFails) {
       expect(logError).toHaveBeenCalledWith({ err: expect.objectContaining({ message: "staging refusal transport unavailable" }),
         refusal: config.defaultAgentDisabledReason }, "failed to send default-agent refusal");

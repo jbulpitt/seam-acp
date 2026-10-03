@@ -2556,6 +2556,14 @@ export class Orchestrator {
 
   // --- message turn ---
 
+  private async reportDefaultAgentRefusal(msg: IncomingMessage, error: unknown): Promise<never> {
+    if (!(error instanceof DefaultAgentUnavailableError)) throw error;
+    await this.adapter.sendMessage(msg.channel, `❌ Cannot start this session: ${error.message}`).catch((noticeError) => {
+      this.logger.error({ err: noticeError, refusal: error.message }, "failed to send default-agent refusal");
+    });
+    throw error;
+  }
+
   private async handleIncomingMessage(msg: IncomingMessage): Promise<void> {
     const channelId = msg.channel.id;
 
@@ -2593,6 +2601,17 @@ export class Orchestrator {
       return;
     }
 
+    // A reconnect cannot repair an unavailable default. Refuse before parking.
+    if (msg.messageId && this.config.defaultAgentDisabledReason && this.wouldParkForOfflineBridge(msg)
+      && !this.store.getByChannel(msg.channel.platform, channelId)) {
+      try {
+        this.router.previewSessionRecord({ platform: msg.channel.platform, channelRef: channelId,
+          ...(msg.channel.parentId ? { parentRef: msg.channel.parentId } : {}), cwd: this.config.REPOS_ROOT });
+      } catch (error) {
+        return this.reportDefaultAgentRefusal(msg, error);
+      }
+    }
+
     // #89 D9: a live (non-park) user message supersedes any parked queue item
     // BEFORE aborting, so a turn-end fire cannot sneak the old prompt in after
     // abort completes. Offline-bridge parks skip this — they REPLACE the row.
@@ -2621,11 +2640,7 @@ export class Orchestrator {
           cwd: this.config.REPOS_ROOT,
         });
       } catch (error) {
-        if (!(error instanceof DefaultAgentUnavailableError)) throw error;
-        await this.adapter.sendMessage(msg.channel, `❌ Cannot start this session: ${error.message}`).catch((noticeError) => {
-          this.logger.error({ err: noticeError, refusal: error.message }, "failed to send default-agent refusal");
-        });
-        throw error;
+        return this.reportDefaultAgentRefusal(msg, error);
       }
       const admitted = this.store.admitInbound({
         messageId: msg.messageId,

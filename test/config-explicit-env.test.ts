@@ -15,10 +15,22 @@ describe("#495 explicit config inputs", () => {
     expect(config.DISCORD_BOT_TOKEN).toBe("fixture-token");
     expect(config.DISCORD_ALLOWED_USER_IDS).toEqual(new Set(["123"]));
     expect(config.AGENT_LOCATION_DENY).toEqual([]);
+    expect(config.DEFAULT_MODEL).toBe("gpt-6.1-sol");
+    expect(config.CODEX_DEFAULT_MODEL).toBe("gpt-6.1-sol");
     expect(config.channelPresets.size).toBe(0);
     // Compare booleans, never dump the operator's environment on assertion failure.
     expect(JSON.stringify(process.env) === before).toBe(true);
     expect(Object.keys(fixture)).toHaveLength(3);
+  });
+
+  it("preserves explicit Copilot and Codex model overrides", () => {
+    const config = loadConfig({ env: {
+      ...fixture,
+      DEFAULT_MODEL: "copilot-override",
+      CODEX_DEFAULT_MODEL: "codex-override",
+    } });
+    expect(config.DEFAULT_MODEL).toBe("copilot-override");
+    expect(config.CODEX_DEFAULT_MODEL).toBe("codex-override");
   });
 
   it.each(["DISCORD_BOT_TOKEN", "DISCORD_ALLOWED_USER_IDS", "REPOS_ROOT"] as const)(

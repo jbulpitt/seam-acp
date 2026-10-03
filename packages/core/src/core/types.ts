@@ -28,7 +28,7 @@ export interface SessionConfigState {
   role?: string;
   /** Thread-local opt-out from all automatic prefix naming. */
   disableThreadPrefix?: boolean;
-  /** ACP model id (e.g. "gpt-5.4", "claude-sonnet-4.5", "auto"). */
+  /** ACP model id (e.g. "gpt-6.1-sol", "auto"). */
   model?: string;
   /** ACP mode id (e.g. agent / plan / autopilot URI). */
   mode?: string;

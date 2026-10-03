@@ -30,7 +30,7 @@ async function connectOnce(): Promise<SessiondClient> {
     const entrypoint = fileURLToPath(new URL("./sessiond.js", import.meta.url));
     const daemon = spawn(process.execPath, [entrypoint, "--socket", paths.socketPath, "--state", paths.statePath], {
       detached: true,
-      stdio: "ignore",
+      stdio: ["ignore", "ignore", "inherit"],
       env: {
         PATH: process.env.PATH ?? "",
         // #595: the daemon resolves its durable runtime directory from HOME.
@@ -40,14 +40,15 @@ async function connectOnce(): Promise<SessiondClient> {
         ...(process.env.LANG ? { LANG: process.env.LANG } : {}),
       },
     });
-    // Refuse bridge startup if its one descriptor owner cannot start. The raw
-    // error is never logged: it may contain the executable path and argv.
-    let launchFailed = false;
-    daemon.once("error", () => { launchFailed = true; });
+    let launchError: Error | undefined;
+    daemon.once("error", (error) => {
+      launchError = error;
+      console.error(`[bridge] seam-sessiond launch failed: ${error.message}`);
+    });
     daemon.unref();
     const deadline = Date.now() + START_TIMEOUT_MS;
     let lastError: unknown;
-    while (!launchFailed && Date.now() < deadline) {
+    while (!launchError && Date.now() < deadline) {
       try {
         return await SessiondClient.connect(paths.socketPath, { requestTimeoutMs: 2_000 });
       } catch (error) {
@@ -55,6 +56,6 @@ async function connectOnce(): Promise<SessiondClient> {
         await delay(50);
       }
     }
-    throw new Error("seam-sessiond did not become ready", { cause: lastError });
+    throw new Error(`seam-sessiond did not become ready${launchError ? `: ${launchError.message}` : ""}`, { cause: launchError ?? lastError });
   }
 }

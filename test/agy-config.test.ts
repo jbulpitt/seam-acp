@@ -51,23 +51,23 @@ describe("package-backed agy configuration gates", () => {
     });
 
     enabled({ AGY_CREDENTIAL_SCOPE: "person@example.com" });
-    expect(() => loadConfig({ env })).toThrow(/semantic identifier/);
+    expect(loadConfig({ env }).agyDisabledReason).toMatch(/semantic identifier/);
 
     enabled({ AGY_VERSION: "" });
-    expect(() => loadConfig({ env })).toThrow(/AGY_VERSION/);
+    expect(loadConfig({ env })).toMatchObject({ AGY_ENABLED: false, agyDisabledReason: expect.stringContaining("AGY_VERSION") });
     enabled({ AGY_SHA256: "" });
-    expect(() => loadConfig({ env })).toThrow(/AGY_SHA256/);
+    expect(loadConfig({ env }).agyDisabledReason).toMatch(/AGY_SHA256/);
     enabled({ AGY_DEFAULT_MODEL: "" });
-    expect(() => loadConfig({ env })).toThrow(/AGY_DEFAULT_MODEL/);
+    expect(loadConfig({ env }).agyDisabledReason).toMatch(/AGY_DEFAULT_MODEL/);
   });
 
   it("does not treat missing pins as unpinned", () => {
     enabled({ AGY_SHA256: "", AGY_VERSION: "", AGY_RUNTIME_ROOT: undefined });
-    expect(() => loadConfig({ env })).toThrow(/does not unpin agy/);
-    expect(() => loadConfig({ env })).toThrow(/AGY_PIN=unpinned/);
+    expect(loadConfig({ env })).toMatchObject({ AGY_ENABLED: false, agyDisabledReason: expect.stringContaining("does not unpin agy") });
+    expect(loadConfig({ env }).agyDisabledReason).toMatch(/AGY_PIN=unpinned/);
   });
 
-  it("accepts AGY_PIN=unpinned without a digest and refuses a pin left beside it", () => {
+  it("accepts AGY_PIN=unpinned and ignores stale pins with a warning", () => {
     enabled({
       AGY_PIN: "unpinned",
       AGY_CLI_PATH: undefined,
@@ -79,13 +79,16 @@ describe("package-backed agy configuration gates", () => {
     });
     expect(loadConfig({ env })).toMatchObject({ AGY_PIN: "unpinned", AGY_ENABLED: true });
     enabled({ AGY_PIN: "unpinned", AGY_SHA256: "a".repeat(64) });
-    expect(() => loadConfig({ env })).toThrow(/AGY_SHA256/);
-    expect(() => loadConfig({ env })).toThrow(/snapshot/);
+    const warnings: string[] = [];
+    expect(loadConfig({ env, warn: (message) => warnings.push(message) })).toMatchObject({
+      AGY_ENABLED: true, AGY_PIN: "unpinned", AGY_SHA256: "", AGY_VERSION: "", AGY_CLI_PATH: undefined, AGY_RUNTIME_ROOT: undefined,
+    });
+    expect(warnings.join(" ")).toMatch(/ignoring stale pin settings.*AGY_SHA256/);
   });
 
   it("requires an explicit native path and default model", () => {
     base({ AGY_ENABLED: "true", AGY_CLI_PATH: undefined, AGY_OLD_CLI_PATH: undefined, AGY_BIN: undefined });
-    expect(() => loadConfig({ env })).toThrow(/AGY_CLI_PATH/);
+    expect(loadConfig({ env })).toMatchObject({ AGY_ENABLED: false, agyDisabledReason: expect.stringContaining("AGY_CLI_PATH") });
     base({ AGY_ENABLED: "true", AGY_CLI_PATH: "/opt/agy/runtime/" + "a".repeat(64) + "/agy", AGY_BIN: undefined, AGY_DEFAULT_MODEL: "gemini-high", AGY_VERSION: "1.1.28", AGY_SHA256: "a".repeat(64), AGY_RUNTIME_ROOT: "/opt/agy/runtime" });
     expect(loadConfig({ env })).toMatchObject({ AGY_ENABLED: true, AGY_CLI_PATH: "/opt/agy/runtime/" + "a".repeat(64) + "/agy" });
     base({ AGY_OLD_ROLLBACK_ENABLED: "true", AGY_OLD_CLI_PATH: "/opt/agy/runtime/" + "a".repeat(64) + "/agy", AGY_BIN: undefined, AGY_DEFAULT_MODEL: "gemini-high", AGY_CLI_PATH: undefined, AGY_VERSION: "1.1.28", AGY_SHA256: "a".repeat(64), AGY_RUNTIME_ROOT: "/opt/agy/runtime" });

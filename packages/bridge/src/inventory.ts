@@ -128,7 +128,7 @@ function copilotProfileForHost(
     cwd: launch.cwd,
     environment: launch.env,
     credentialProfile,
-    defaultModel: "gpt-5.4",
+    defaultModel: "gpt-6.1-sol",
     ...(catalogProbe ? { catalogProbe } : {}),
   });
 }
@@ -270,7 +270,7 @@ export function loadHostAdapters(
     {
       id: "codex",
       bin: "codex-acp",
-      make: () => makeCodexProfile({ defaultModel: "gpt-5.5" }),
+      make: () => makeCodexProfile({ defaultModel: "gpt-6.1-sol" }),
     },
     {
       id: "grok",

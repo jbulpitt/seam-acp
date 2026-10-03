@@ -12,6 +12,15 @@ import { createManagedAgyFixture } from "./helpers/agy-runtime-fixture.js";
 import { copilotProbeMcpArgs } from "../packages/adapters/src/profiles/copilot.js";
 
 describe("loadHostAdapters", () => {
+  it("uses current Copilot and Codex defaults without model overrides", () => {
+    const adapters = loadHostAdapters("copilot", {
+      env: { PATH: process.env.PATH, AGY_ENABLED: "false" },
+      exists: (bin) => bin === "copilot" || bin === "codex-acp",
+    });
+    expect(adapters.get("copilot")?.defaultModel).toBe("gpt-6.1-sol");
+    expect(adapters.get("codex")?.defaultModel).toBe("gpt-6.1-sol");
+  });
+
   it("surfaces the legacy agy-on-PATH upgrade loss while keeping other adapters", () => {
     const legacyAdvertised = ["copilot", "agy"].filter((bin) => bin === "copilot" || bin === "agy");
     const { adapters, adapterRefusals: refusals } = loadHostAdapterInventory("copilot", {

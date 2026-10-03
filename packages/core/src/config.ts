@@ -184,7 +184,7 @@ const Schema = z.object({
 
   // Copilot is a seat licence enabled per host, not a default (#622).
   DEFAULT_AGENT: z.string().default("claude"),
-  DEFAULT_MODEL: z.string().default("gpt-5.4"),
+  DEFAULT_MODEL: z.string().default("gpt-6.1-sol"),
   /** Copilot is licensed per-seat and may be entitled to one project only.
    * Set false to refuse it on EVERY host — including remote locations.
    * The narrower "not on this host" case is `AGENT_LOCATION_DENY`. */
@@ -390,8 +390,8 @@ const Schema = z.object({
     .transform((v) => v === "true"),
   /** Path to the `codex-acp` binary. Defaults to `codex-acp` on PATH. */
   CODEX_CLI_PATH: z.string().optional(),
-  /** Default model id for the Codex profile (e.g. "o3", "gpt-5.5"). */
-  CODEX_DEFAULT_MODEL: z.string().default("gpt-5.5"),
+  /** Default model id for the Codex profile. */
+  CODEX_DEFAULT_MODEL: z.string().default("gpt-6.1-sol"),
   CODEX_MODELS: ModelsListSchema,
 
   /**

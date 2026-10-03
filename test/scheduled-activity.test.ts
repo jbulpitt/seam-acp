@@ -42,7 +42,7 @@ describe("#253 scheduled metadata boundaries", () => {
     expect(self.deps.getScheduledWork).not.toHaveBeenCalled();
   });
 
-  it.each([false, true])("global diagnostics require the stamped config admin; identity enabled=%s", async enabled => {
+  it.each([false, true])("global diagnostics require the listed Discord admin; prompt stamping=%s", async enabled => {
     const registry = new ScheduledActivityRegistry(); registry.begin(meta);
     const host = Object.create(Orchestrator.prototype);
     Object.assign(host, { config: { SPEAKER_IDENTITY_ENABLED: enabled, SEAM_CONFIG_ADMIN_USER_IDS: new Set(["admin"]) },
@@ -55,11 +55,9 @@ describe("#253 scheduled metadata boundaries", () => {
     await host.cmdScheduledWork({ user: { id: "admin" }, reply });
     const payload = reply.mock.calls[0]?.[0];
     expect(payload.flags).toBe(64); // ephemeral, including refusals
-    if (enabled) {
-      expect(payload.content).toContain("occurrence occ-1");
-      expect(payload.content).toContain("1 turn accounting token(s)");
-      expect(payload.content).toContain("bounded shutdown quiesce");
-    } else expect(payload.content).toContain("admin-only");
+    expect(payload.content).toContain("occurrence occ-1");
+    expect(payload.content).toContain("1 turn accounting token(s)");
+    expect(payload.content).toContain("bounded shutdown quiesce");
   });
 
   it("registers the admin-only read surface within Discord's command budget", () => {

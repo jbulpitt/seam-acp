@@ -1,7 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
   isBridgeAdminRefused,
-  isStampedConfigAdmin,
   isThreadVoiceAdminRefused,
 } from "../packages/core/src/platforms/discord/admin-gate.js";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
@@ -17,7 +16,6 @@ describe("bridge/debug admin gate (#83)", () => {
       SEAM_CONFIG_ADMIN_USER_IDS: new Set([ADMIN]),
     };
     expect(isBridgeAdminRefused(cfg, STUDENT)).toBe(true);
-    expect(isStampedConfigAdmin(cfg, STUDENT).reason).toBe("not-admin");
   });
 
   it("refuses a non-admin operator", () => {
@@ -26,36 +24,30 @@ describe("bridge/debug admin gate (#83)", () => {
       SEAM_CONFIG_ADMIN_USER_IDS: new Set([ADMIN]),
     };
     expect(isBridgeAdminRefused(cfg, OPERATOR)).toBe(true);
-    expect(isStampedConfigAdmin(cfg, OPERATOR).allowed).toBe(false);
   });
 
-  it("allows a stamped admin", () => {
+  it("allows a Discord-authenticated admin", () => {
     const cfg = {
       SPEAKER_IDENTITY_ENABLED: true,
       SEAM_CONFIG_ADMIN_USER_IDS: new Set([ADMIN]),
     };
     expect(isBridgeAdminRefused(cfg, ADMIN)).toBe(false);
-    expect(isStampedConfigAdmin(cfg, ADMIN).allowed).toBe(true);
-    expect(isStampedConfigAdmin(cfg, ADMIN).speakerId).toBe(ADMIN);
   });
 
-  it("fails closed when SPEAKER_IDENTITY_ENABLED is false (even for an admin id)", () => {
+  it("allows a listed admin when prompt stamping is disabled", () => {
     const cfg = {
       SPEAKER_IDENTITY_ENABLED: false,
       SEAM_CONFIG_ADMIN_USER_IDS: new Set([ADMIN]),
     };
-    expect(isBridgeAdminRefused(cfg, ADMIN)).toBe(true);
-    expect(isStampedConfigAdmin(cfg, ADMIN).reason).toBe("speaker-identity-off");
-    expect(isStampedConfigAdmin(cfg, ADMIN).speakerId).toBe(ADMIN);
+    expect(isBridgeAdminRefused(cfg, ADMIN)).toBe(false);
   });
 
-  it("fails closed when there is no stamped speaker id", () => {
+  it("refuses a missing authenticated user id", () => {
     const cfg = {
       SPEAKER_IDENTITY_ENABLED: true,
       SEAM_CONFIG_ADMIN_USER_IDS: new Set([ADMIN]),
     };
     expect(isBridgeAdminRefused(cfg, undefined)).toBe(true);
-    expect(isStampedConfigAdmin(cfg, undefined).reason).toBe("no-stamped-id");
   });
 
   it("fails closed when the admin set is unset", () => {
@@ -64,7 +56,6 @@ describe("bridge/debug admin gate (#83)", () => {
       SEAM_CONFIG_ADMIN_USER_IDS: undefined,
     };
     expect(isBridgeAdminRefused(cfg, ADMIN)).toBe(true);
-    expect(isStampedConfigAdmin(cfg, ADMIN).reason).toBe("not-admin");
   });
 });
 
@@ -82,7 +73,7 @@ describe("Thread Voice v1 admin gate", () => {
   });
 });
 
-describe("bridge/debug stay out of lock-exempt and participant-allowed lists", () => {
+describe("bridge/debug mutations remain restricted", () => {
   const lockedSchool = {
     channelPresets: new Map([["channel-1", { locked: true }]]),
     threadPresets: new Map(),
@@ -94,7 +85,7 @@ describe("bridge/debug stay out of lock-exempt and participant-allowed lists", (
     SEAM_CONFIG_ADMIN_USER_IDS: new Set([ADMIN]),
   } as any;
 
-  it("LOCK_EXEMPT_SUBCOMMANDS is cancel/steer/queue", () => {
+  it("local turn controls remain lock-exempt", () => {
     expect(Orchestrator.isLockedSlashRefused(lockedSchool, "channel-1", "cancel", STUDENT)).toBe(
       false
     );
@@ -116,8 +107,8 @@ describe("bridge/debug stay out of lock-exempt and participant-allowed lists", (
     expect(Orchestrator.isLockedSlashRefused(lockedSchool, "channel-1", "exec", ADMIN)).toBe(false);
   });
 
-  it("PARTICIPANT_ALLOWED_SUBCOMMANDS is help/cancel/queue", () => {
-    expect(Orchestrator.isParticipantSlashRefused(participants, "help", STUDENT)).toBe(false);
+  it("read-only help and local cancel/queue remain participant-allowed", () => {
+    expect(Orchestrator.isParticipantSlashRefused(participants, "help", STUDENT, { group: "info" })).toBe(false);
     expect(Orchestrator.isParticipantSlashRefused(participants, "cancel", STUDENT)).toBe(false);
     expect(Orchestrator.isParticipantSlashRefused(participants, "queue", STUDENT)).toBe(false);
     expect(Orchestrator.isParticipantSlashRefused(participants, "add", STUDENT)).toBe(true);

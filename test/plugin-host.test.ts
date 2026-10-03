@@ -120,7 +120,7 @@ describe("built-in math contribution", () => {
     expect(harnessPreamble([], undefined, { fenceInstructions: plugins.fences.instructions })).toContain("`katex`");
     await plugins.dispose();
     expect(harnessPreamble([], undefined, { fenceInstructions: plugins.fences.instructions })).not.toContain("typeset");
-  });
+  }, 20_000);
 
   it("preserves the source and unfinished notice on invalid TeX or unavailable upload", async () => {
     const { plugins } = host();

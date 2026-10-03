@@ -233,7 +233,7 @@ describe("participant slash gate (#74)", () => {
 
   it("allows a participant help / cancel / queue (NOT steer)", () => {
     const c = cfg(new Set([STUDENT]));
-    expect(Orchestrator.isParticipantSlashRefused(c, "help", STUDENT)).toBe(false);
+    expect(Orchestrator.isParticipantSlashRefused(c, "help", STUDENT, { group: "info" })).toBe(false);
     expect(Orchestrator.isParticipantSlashRefused(c, "cancel", STUDENT)).toBe(false);
     expect(Orchestrator.isParticipantSlashRefused(c, "queue", STUDENT)).toBe(false);
     expect(Orchestrator.isParticipantSlashRefused(c, "steer", STUDENT)).toBe(true);
@@ -302,13 +302,6 @@ describe("option-aware cancel gates (#78)", () => {
       SEAM_CONFIG_ADMIN_USER_IDS: adminIds,
     }) as any;
 
-  it("isCancelScopeAll is true only for cancel + scope:all", () => {
-    expect(Orchestrator.isCancelScopeAll("cancel", { scope: "all" })).toBe(true);
-    expect(Orchestrator.isCancelScopeAll("cancel", { scope: null })).toBe(false);
-    expect(Orchestrator.isCancelScopeAll("cancel", undefined)).toBe(false);
-    expect(Orchestrator.isCancelScopeAll("steer", { scope: "all" })).toBe(false);
-  });
-
   it("non-admin in a locked channel is refused cancel scope:all but allowed plain cancel", () => {
     const cfg = locked(new Set([ADMIN]));
     expect(Orchestrator.isLockedSlashRefused(cfg, "channel-1", "cancel", STUDENT)).toBe(false);
@@ -355,12 +348,7 @@ describe("option-aware cancel gates (#78)", () => {
   });
 });
 
-/**
- * #80: `/seam config detach` is a config subcommand. Do NOT add `detach` to
- * LOCK_EXEMPT_SUBCOMMANDS or PARTICIPANT_ALLOWED_SUBCOMMANDS to make these
- * pass — admin immunity is the school-channel lever; kids must not mute
- * homework threads.
- */
+/** Detach mutates the thread; only listed admins bypass channel locks. */
 describe("detach slash gates (#80)", () => {
   const ADMIN = "1487094572696867019";
   const STUDENT = "1534937951044112505";
@@ -404,10 +392,7 @@ describe("detach slash gates (#80)", () => {
   });
 });
 
-/**
- * `/seam preset thread` (#93 D6): gates mirror `/seam preset apply` + `/seam new`.
- * Do NOT add `thread` to LOCK_EXEMPT_SUBCOMMANDS or PARTICIPANT_ALLOWED_SUBCOMMANDS.
- */
+/** Creating a preset thread retains the same mutation gate as apply/new. */
 describe("preset thread slash gates (#93)", () => {
   const ADMIN = "1487094572696867019";
   const STUDENT = "1534937951044112505";

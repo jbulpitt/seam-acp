@@ -311,6 +311,7 @@ function makeListCard(rows: ScheduledPrompt[]) {
     },
     scheduledManager: { runNow: vi.fn(async () => {}), armFromRow: vi.fn(), disarm: vi.fn() },
     attachListLifecycle: Orchestrator.prototype["attachListLifecycle" as never],
+    slashAccessRefusal: Orchestrator.prototype["slashAccessRefusal" as never],
     buildScheduleListMessage: Orchestrator.prototype["buildScheduleListMessage" as never],
     scheduleSummaryLine: Orchestrator.prototype["scheduleSummaryLine" as never],
   };

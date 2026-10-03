@@ -44,6 +44,13 @@ the command to anyone, so every runtime refusal stays exactly where it was:
 `SEAM_CONFIG_ADMIN_USER_IDS` for `upload` / `rebuild` / `compact-thread` / `naming`, plus
 `BRIDGE_ADMIN_REFUSAL` and `THREAD_VOICE_ADMIN_REFUSAL`.
 
+Every leaf in `commands.ts` declares read-only or mutating access. Participant
+and channel-lock gates apply to mutations, with explicit local-turn exceptions;
+admin-only handlers still require a listed Discord user id. Prompt stamping
+(`SPEAKER_IDENTITY_ENABLED`) does not authorize slash commands. Option-dependent
+leaves resolve access before dispatch (for example, workflow cancellation and
+`cancel scope:all`). Editors and pickers are mutating surfaces.
+
 **Top-level (3):** `rebuild` `compact-thread` `recover`
 
 `/seamadmin rebuild` is deterministic Discord reconstruction (no summarizer; one destination seed turn that may consume up to 60% of the destination context window). `/seamadmin compact-thread` is the former model-assisted rebuild. `Premium Compact (Discord)` remains the AGY fan-out pipeline. `/seam config reset` starts a blank session with no history.
@@ -85,4 +92,3 @@ cancels the queued prompt. Shares the `#88` parked row.
 - `/seam cancel scope:all` — kill every active session bot-wide (old `kill`). Privileged: **not** lock-exempt, **not** participant-allowed.
 
 **Removed:** `/seam image`.
-

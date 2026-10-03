@@ -35,6 +35,7 @@ import {
 import type { Renderer } from "../renderer.js";
 import { serializePanelText } from "../renderer.js";
 import { choicePickerPageCaption } from "./choice-picker.js";
+import { getSlashCommandAccess, type SlashCommandAccess } from "./commands.js";
 import {
   paginateSchedules,
   parseScheduleListCustomId,
@@ -950,13 +951,12 @@ export function modelSelectionConfirmationPanel(
 // for the optional `_(notice)_` paragraph and a tiny safety margin.
 const ORCH_INLINE_FENCE_MAX = 1900;
 
-/**
- * Resolved slash options the lock / participant gates inspect (#78).
- * Only `scope` changes privilege today: `cancel scope:all` is the old
- * `/seam kill` and must not inherit cancel's exemptions.
- */
+/** Resolved leaf access; group/command retain the full slash path. */
 export type SlashGateOptions = {
   scope?: string | null;
+  commandName?: string;
+  group?: string | null;
+  access?: SlashCommandAccess;
 };
 
 export interface VoiceConsoleVisibleTurnHandle {
@@ -5203,60 +5203,32 @@ export class Orchestrator {
 
   // --- slash commands ---
 
-  /** Subcommands still allowed in a locked channel/thread — narrow enough
-   *  that a kid can unstick a hung turn without being able to touch config.
-   *  Answers "survives a channel lock". NOT the participant allowlist
-   *  (`PARTICIPANT_ALLOWED_SUBCOMMANDS` below): this set includes `steer`.
-   *  `cancel` here is the PLAIN cancel (this thread). `cancel scope:all`
-   *  is excluded by `isCancelScopeAll` — it is the old privileged `kill`. */
-  private static readonly LOCK_EXEMPT_SUBCOMMANDS = new Set(["cancel", "steer", "queue"]);
-
-  /**
-   * Subcommands a restricted participant (#74) may still run. A NEW, SEPARATE
-   * constant from `LOCK_EXEMPT_SUBCOMMANDS` — that one includes `steer`
-   * (redirects another agent) and answers a different question (survives a
-   * channel lock). Participants get cancel (self-unstick their own wedged
-   * turn, including `force:true`) and help, plus `/seam queue` (their own next
-   * prompt, #89 D10), but NOT steer, NOT `cancel scope:all` (old kill), and
-   * no config.
-   */
-  private static readonly PARTICIPANT_ALLOWED_SUBCOMMANDS = new Set(["help", "cancel", "queue"]);
-
-  /**
-   * Options the slash gates inspect. Only `scope` changes privilege today:
-   * `cancel scope:all` is the old `/seam kill` (bot-wide) and must NOT
-   * inherit cancel's lock-exempt / participant-allowed status.
-   */
   static slashGateOptions(interaction: ChatInputCommandInteraction): SlashGateOptions {
-    return { scope: interaction.options.getString("scope") };
+    const commandName = interaction.commandName ?? "seam";
+    const group = interaction.options.getSubcommandGroup(false);
+    return {
+      commandName,
+      group,
+      scope: interaction.options.getString("scope"),
+      access: getSlashCommandAccess(
+        commandName,
+        group,
+        interaction.options.getSubcommand(true),
+        (name) => interaction.options.getString(name)
+      ),
+    };
   }
 
-  /**
-   * Option-aware predicate: `cancel scope:all` is its own privileged
-   * action (old `/seam kill`). Plain `cancel` (default scope, any force)
-   * is NOT privileged — a student may unstick their own turn.
-   */
-  static isCancelScopeAll(sub: string, options?: SlashGateOptions): boolean {
-    return sub === "cancel" && options?.scope === "all";
+  private static slashAccess(sub: string, options?: SlashGateOptions): SlashCommandAccess {
+    return options?.access ?? getSlashCommandAccess(
+      options?.commandName ?? "seam",
+      options?.group ?? null,
+      sub,
+      (name) => name === "scope" ? options?.scope : null
+    ) ?? { kind: "mutating" };
   }
 
-  /**
-   * Whether a `/seam` subcommand must be refused because the channel is locked
-   * (#58 D2). #71 admin-immunity applies HERE too, not only at the agent-facing
-   * `config_propose` tool: a config admin may change config in a locked channel
-   * WITHOUT unlocking it — otherwise routine operator work still forces the
-   * unlock/relock cycle #71 exists to remove. The invoker id is Discord-
-   * authenticated (`interaction.user.id`), so this is trustworthy regardless of
-   * SPEAKER_IDENTITY_ENABLED. `locked` itself stays unsettable through any
-   * `/seam` command, so admin immunity grants no power to flip the lock.
-   *
-   * Lives ALONGSIDE `isParticipantSlashRefused` — a different question. A
-   * participant is refused even in an UNLOCKED channel; a lock refusal is
-   * about the channel, not the invoker's tier.
-   *
-   * Gates inspect RESOLVED OPTIONS, not just the bare subcommand name (#78):
-   * `cancel scope:all` is refused here even though `cancel` is lock-exempt.
-   */
+  /** Read-only leaves pass; listed admins retain lock immunity. */
   static isLockedSlashRefused(
     config: Config,
     scopeChannelId: string | undefined,
@@ -5265,14 +5237,9 @@ export class Orchestrator {
     options?: SlashGateOptions
   ): boolean {
     if (!isChannelLocked(config, scopeChannelId)) return false;
-    if (
-      Orchestrator.LOCK_EXEMPT_SUBCOMMANDS.has(sub) &&
-      !Orchestrator.isCancelScopeAll(sub, options)
-    ) {
-      return false;
-    }
-    if (config.SEAM_CONFIG_ADMIN_USER_IDS?.has(invokerUserId)) return false;
-    return true;
+    const access = Orchestrator.slashAccess(sub, options);
+    if (access.kind === "read-only" || access.lockExempt) return false;
+    return !config.SEAM_CONFIG_ADMIN_USER_IDS?.has(invokerUserId);
   }
 
   /**
@@ -5305,16 +5272,7 @@ export class Orchestrator {
     return true;
   }
 
-  /**
-   * Whether a `/seam` subcommand must be refused because the invoker is a
-   * restricted participant (#74). Independent of lock state — this fires in
-   * LOCKED AND UNLOCKED channels. Keyed on the Discord-authenticated
-   * invoker id (`interaction.user.id`), never a display name. Admin-who-is-
-   * also-participant is NOT restricted (`isRestrictedParticipant`).
-   *
-   * Gates inspect RESOLVED OPTIONS, not just the bare subcommand name (#78):
-   * `cancel scope:all` is refused here even though `cancel` is allowed.
-   */
+  /** Participants may read and control their own turn, but not configure. */
   static isParticipantSlashRefused(
     config: Pick<Config, "SEAM_PARTICIPANT_USER_IDS" | "SEAM_CONFIG_ADMIN_USER_IDS">,
     sub: string,
@@ -5330,13 +5288,24 @@ export class Orchestrator {
     ) {
       return false;
     }
-    if (
-      Orchestrator.PARTICIPANT_ALLOWED_SUBCOMMANDS.has(sub) &&
-      !Orchestrator.isCancelScopeAll(sub, options)
-    ) {
-      return false;
+    const access = Orchestrator.slashAccess(sub, options);
+    return access.kind === "mutating" && !access.participantAllowed;
+  }
+
+  private slashAccessRefusal(
+    interaction: ChatInputCommandInteraction | MessageComponentInteraction,
+    access: SlashCommandAccess
+  ): string | undefined {
+    const channel = interaction.channel;
+    const scope = channel?.isThread() ? channel.parentId ?? undefined : interaction.channelId;
+    const options = { access };
+    if (Orchestrator.isParticipantSlashRefused(this.config, "", interaction.user.id, options)) {
+      return PARTICIPANT_CONFIG_REFUSAL;
     }
-    return true;
+    if (Orchestrator.isLockedSlashRefused(this.config, scope, "", interaction.user.id, options)) {
+      return "🔒 This channel is locked — its configuration can't be changed.";
+    }
+    return undefined;
   }
 
   /**
@@ -5378,35 +5347,10 @@ export class Orchestrator {
     const sub = interaction.options.getSubcommand(true);
     const slashGroup = interaction.options.getSubcommandGroup(false);
     const slashOpts = Orchestrator.slashGateOptions(interaction);
-    // Resolve the *locked-channel* scope id. Only a real thread's parentId
-    // points at the channel we key presets on — a plain (non-thread)
-    // channel's `parentId` is its Discord *category*, which is never in
-    // channelPresets, so that must NOT be used as a fallback here (that
-    // previously let /seam new bypass the lock when the channel sat inside
-    // a category). For a command run directly in a channel (e.g. /seam
-    // new), the scope is the channel itself.
-    const ic = interaction.channel;
-    const scopeChannelId = ic?.isThread() ? (ic.parentId ?? undefined) : interaction.channelId ?? undefined;
-    // Two independent gates, two different questions:
-    //   - participant (#74): "is this invoker allowed to configure at all?"
-    //     A restricted participant is refused even in an UNLOCKED channel.
-    //   - lock (#58 / #71): "is this channel locked for this invoker?"
-    // Participant first so config commands get the friendly refusal (not the
-    // lock copy) regardless of lock state. help/cancel pass this gate
-    // and then face the lock gate on their own terms. `cancel scope:all`
-    // is refused by BOTH gates (it is the old privileged `kill`).
-    if (Orchestrator.isParticipantSlashRefused(this.config, sub, interaction.user.id, slashOpts)) {
-      await interaction.reply({
-        content: PARTICIPANT_CONFIG_REFUSAL,
-        flags: MessageFlags.Ephemeral,
-      });
-      return;
-    }
-    if (Orchestrator.isLockedSlashRefused(this.config, scopeChannelId, sub, interaction.user.id, slashOpts)) {
-      await interaction.reply({
-        content: "🔒 This channel is locked — its configuration can't be changed.",
-        flags: MessageFlags.Ephemeral,
-      });
+    // Mutation checks precede handlers; read-only access does not bypass admin checks.
+    const refusal = this.slashAccessRefusal(interaction, slashOpts.access ?? { kind: "mutating" });
+    if (refusal) {
+      await interaction.reply({ content: refusal, flags: MessageFlags.Ephemeral });
       return;
     }
     if (interaction.options.getSubcommandGroup(false) === "upload") {
@@ -14099,6 +14043,11 @@ export class Orchestrator {
         }
         const parsed = parseScheduleListCustomId(c.customId);
         const action = parsed?.action;
+        const refusal = this.slashAccessRefusal(c, { kind: "mutating" });
+        if (refusal) {
+          await c.reply({ content: refusal, flags: MessageFlags.Ephemeral });
+          return;
+        }
         const id = parsed?.arg;
         const row = id ? this.store.getScheduled(id) : undefined;
         if (!row || !id || row.channelRef !== channel.id) {
@@ -18830,6 +18779,14 @@ export class Orchestrator {
     collector.on("collect", async (c) => {
       try {
         if (!c.isButton()) return;
+        const access: SlashCommandAccess = {
+          kind: c.customId.startsWith("wf:page:") ? "read-only" : "mutating",
+        };
+        const refusal = this.slashAccessRefusal(c, access);
+        if (refusal) {
+          await c.reply({ content: refusal, flags: MessageFlags.Ephemeral });
+          return;
+        }
         await controls.handle(c.customId, {
           ack: async () => {
             await c.deferUpdate();
@@ -20297,6 +20254,15 @@ export class Orchestrator {
 
     collector.on("collect", async (btnInteraction) => {
       const customId = btnInteraction.customId;
+      const navigation = ["prev", "next", "close", "summary_back", "delete_cancel", "repair_cancel", "migrate_cancel"];
+      const access: SlashCommandAccess = {
+        kind: navigation.some((action) => customId === `sessions:${action}`) ? "read-only" : "mutating",
+      };
+      const refusal = this.slashAccessRefusal(btnInteraction, access);
+      if (refusal) {
+        await btnInteraction.reply({ content: refusal, flags: MessageFlags.Ephemeral });
+        return;
+      }
 
       if (customId === "sessions:prev") {
         await btnInteraction.deferUpdate();
@@ -24711,6 +24677,11 @@ export class Orchestrator {
           const remaining = this.store.listPresetsForProject(projectRef);
           page = paginatePresetList(remaining, requested).page;
           await c.update(this.buildPresetListMessage(projectRef, page));
+          return;
+        }
+        const refusal = this.slashAccessRefusal(c, { kind: "mutating" });
+        if (refusal) {
+          await c.reply({ content: refusal, flags: MessageFlags.Ephemeral });
           return;
         }
         const preset = this.store.getPreset(id);

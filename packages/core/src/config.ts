@@ -834,8 +834,8 @@ const Schema = z.object({
    * Shape: `{ "channels": { "<channelId>": {...} }, "threads": { "<threadId>":
    * {...} } }`. Channel values apply to every thread under that channel;
    * thread values override the channel's per-field (rider stacks instead of
-   * overriding). A channel entry's `locked: true` disables all /seam slash
-   * commands (except cancel and steer) for that channel and its threads.
+   * overriding). A channel entry's `locked: true` blocks mutating slash
+   * commands unless the invoker is a listed admin or the leaf is lock-exempt.
    * `cancel scope:all` (bot-wide kill) is NOT exempt. Values
    * are re-resolved from this file on every runtime start — the file is the
    * source of truth regardless of what's stored in the session DB. When

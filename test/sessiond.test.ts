@@ -452,6 +452,7 @@ describe("#573 seam-sessiond control-plane restart", () => {
       cwd: "/private/missing/cwd",
       env: { SECRET: secret },
     }).catch((error) => error as SessiondClientError);
+    if (!(failed instanceof SessiondClientError)) throw new Error("Missing executable unexpectedly spawned");
     expect(failed).toMatchObject<Partial<SessiondClientError>>({
       code: "spawn_failed",
       processCode: "ENOENT",

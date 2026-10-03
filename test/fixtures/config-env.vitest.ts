@@ -6,6 +6,14 @@ import base from "../../vitest.config.js";
 export default defineConfig({
   ...base,
   root: process.cwd(),
+  plugins: [{
+    name: "assert-no-dotenv-loading",
+    configResolved(config) {
+      if (config.env.VITE_SEAM_620_OPERATOR_ONLY !== undefined) {
+        throw new Error("Vite loaded the operator .env before worker setup");
+      }
+    },
+  }],
   test: {
     ...base.test,
     include: [

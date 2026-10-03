@@ -16,6 +16,7 @@ describe("non-live config isolation under real dotenv files", () => {
     try {
       writeFileSync(path.join(cwd, ".env"), [
         "SEAM_495_DOTENV_SENTINEL=from-real-dotenv-file",
+        "VITE_SEAM_620_OPERATOR_ONLY=from-real-dotenv-file",
         "AGY_PIN=unpinned",
         ...(mode === "hostile" ? [
           "COPILOT_ENABLED=true", "AGENT_LOCATION_DENY=copilot@local", "DEFAULT_AGENT=opencode",
@@ -24,7 +25,7 @@ describe("non-live config isolation under real dotenv files", () => {
         ] : []),
       ].join("\n"));
       const report = path.join(cwd, "report.json");
-      const result = await exec(process.execPath, [
+      await exec(process.execPath, [
         path.join(root, "node_modules/vitest/vitest.mjs"), "run", "--maxWorkers=1",
         "--config", path.join(root, "test/fixtures/config-env.vitest.ts"),
         "--reporter=json", `--outputFile=${report}`,
@@ -34,11 +35,11 @@ describe("non-live config isolation under real dotenv files", () => {
         // inherited. PATH is operational only; HOME is another disposable path.
         env: { PATH: process.env.PATH, HOME: cwd, CI: "true", SEAM_495_DOTENV_SENTINEL: "inherited-wrong-value",
           SEAM_620_OPERATOR_ONLY: "shell-only", AGY_PIN: "unpinned" },
-      }).then(() => 0, (error: { code?: unknown }) => error.code);
+      });
       const summary = JSON.parse(readFileSync(report, "utf8"));
       const failures = summary.testResults.flatMap((file: any) => file.assertionResults
         .filter((test: any) => test.status === "failed").map((test: any) => test.fullName));
-      expect({ exit: result, failures }).toEqual({ exit: 0, failures: [] });
+      expect(failures).toEqual([]);
       expect(summary.numPassedTests).toBeGreaterThan(100);
       expect(summary.testResults).toHaveLength(11);
       expect(summary.numFailedTestSuites).toBe(0);

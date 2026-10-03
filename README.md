@@ -396,6 +396,11 @@ prints the non-live boundary before Vitest starts so reported file/test counts
 are comparable across hosts. `npm run test:int` is a separate, deliberately
 named opt-in and reports that its provider requests may be billable.
 
+Non-live workers ignore `.env` and inherited shell configuration, use a
+disposable home and a fixed executable path, and require explicit test fixtures
+for application environment values. Production dotenv loading is tested
+separately in a subprocess with a disposable `.env`.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

@@ -9,6 +9,7 @@ import {
 const root = path.dirname(fileURLToPath(import.meta.url));
 
 export default defineConfig({
+  envDir: false,
   test: {
     include: [...NON_LIVE_TEST_INCLUDE],
     exclude: [...NON_LIVE_TEST_EXCLUDE],

@@ -2,11 +2,18 @@ import { fileURLToPath } from "node:url";
 import { defineConfig } from "vitest/config";
 import base from "../../vitest.config.js";
 
-// Run the actual config consumers from a disposable cwd containing its own
-// real .env. Absolute includes keep source/dependencies in the sanctioned tree.
+// Run config consumers beside real .env files they must ignore.
 export default defineConfig({
   ...base,
   root: process.cwd(),
+  plugins: [{
+    name: "assert-no-dotenv-loading",
+    configResolved(config) {
+      if (config.env.VITE_SEAM_620_OPERATOR_ONLY !== undefined) {
+        throw new Error("Vite loaded the operator .env before worker setup");
+      }
+    },
+  }],
   test: {
     ...base.test,
     include: [

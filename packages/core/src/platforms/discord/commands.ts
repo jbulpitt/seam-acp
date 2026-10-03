@@ -2,15 +2,35 @@ import {
   InteractionContextType,
   PermissionFlagsBits,
   SlashCommandBuilder,
+  SlashCommandSubcommandGroupBuilder,
+  SlashCommandSubcommandBuilder,
   type ChatInputCommandInteraction,
   type RESTPostAPIApplicationCommandsJSONBody,
-  type SlashCommandSubcommandBuilder,
 } from "discord.js";
 
 /** The everyday user + agent surface. */
 export const SEAM_COMMAND_NAME = "seam";
 /** The operator surface — ManageGuild-gated, guild-only (#151). */
 export const SEAM_ADMIN_COMMAND_NAME = "seamadmin";
+
+export interface SlashCommandAccess {
+  kind: "read-only" | "mutating";
+  participantAllowed?: boolean;
+  lockExempt?: boolean;
+}
+
+type SlashOptionReader = (name: string) => string | null | undefined;
+type SlashAccessDeclaration = SlashCommandAccess | ((option: SlashOptionReader) => SlashCommandAccess);
+const accessDeclarations = new WeakMap<SlashCommandSubcommandBuilder, SlashAccessDeclaration>();
+
+/** Keep access on the leaf, without adding fields to Discord's JSON. */
+function declareAccess(
+  sub: SlashCommandSubcommandBuilder,
+  declaration: SlashAccessDeclaration
+): SlashCommandSubcommandBuilder {
+  accessDeclarations.set(sub, declaration);
+  return sub;
+}
 
 /** Keep `/seam new` and `/seam config set` on one registered option contract. */
 function addConfigSetOptions(sub: SlashCommandSubcommandBuilder): SlashCommandSubcommandBuilder {
@@ -90,7 +110,11 @@ export function buildSeamCommand(): SlashCommandBuilder {
   // --- top-level (5): cancel, steer, new, workflows, queue ------------------
 
   cmd.addSubcommand((sub) =>
-    sub
+    declareAccess(sub, (option) => ({
+      kind: "mutating",
+      participantAllowed: option("scope") !== "all",
+      lockExempt: option("scope") !== "all",
+    }))
       .setName("cancel")
       .setDescription("Cancel this turn; force escalates, scope:all stops all sessions")
       .addBooleanOption((o) =>
@@ -112,7 +136,7 @@ export function buildSeamCommand(): SlashCommandBuilder {
   );
 
   cmd.addSubcommand((sub) =>
-    sub
+    declareAccess(sub, { kind: "mutating", lockExempt: true })
       .setName("steer")
       .setDescription("Steer a node mid-task: queue a note to its inbox, or now:true to cancel-and-reprompt (history kept)")
       // Discord rejects the whole /seam PUT if a required option follows an
@@ -144,7 +168,7 @@ export function buildSeamCommand(): SlashCommandBuilder {
 
   cmd.addSubcommand((sub) =>
     addConfigSetOptions(
-      sub
+      declareAccess(sub, { kind: "mutating" })
         .setName("new")
         .setDescription("Create and optionally configure an agent thread")
         .addStringOption((o) =>
@@ -157,7 +181,10 @@ export function buildSeamCommand(): SlashCommandBuilder {
   );
 
   cmd.addSubcommand((sub) =>
-    sub
+    declareAccess(sub, (option) => ({
+      kind: ["cancel-wake", "cancel-watch", "cancel-choice", "cancel-ingest", "cancel-live"]
+        .some((name) => option(name)) ? "mutating" : "read-only",
+    }))
       .setName("workflows")
       .setDescription("View the delegation ledger + this thread's pending wakes (active + recent)")
       .addIntegerOption((o) =>
@@ -211,7 +238,7 @@ export function buildSeamCommand(): SlashCommandBuilder {
   );
 
   cmd.addSubcommand((sub) =>
-    sub
+    declareAccess(sub, { kind: "mutating", participantAllowed: true, lockExempt: true })
       .setName("queue")
       .setDescription("Queue the next live turn in this thread (waits; does not abort the current one)")
       .addStringOption((o) =>
@@ -229,7 +256,7 @@ export function buildSeamCommand(): SlashCommandBuilder {
       .setName("config")
       .setDescription("Session and bot configuration")
       .addSubcommand((sub) =>
-        sub
+        declareAccess(sub, { kind: "mutating" })
           .setName("model")
           .setDescription("Get or set the agent model for this thread")
           .addStringOption((o) =>
@@ -237,7 +264,7 @@ export function buildSeamCommand(): SlashCommandBuilder {
           )
       )
       .addSubcommand((sub) =>
-        sub
+        declareAccess(sub, { kind: "mutating" })
           .setName("effort")
           .setDescription("Set reasoning effort (or run with no level to see current)")
           .addStringOption((o) =>
@@ -249,7 +276,7 @@ export function buildSeamCommand(): SlashCommandBuilder {
           )
       )
       .addSubcommand((sub) =>
-        sub
+        declareAccess(sub, { kind: "mutating" })
           .setName("agent")
           .setDescription(
             "Get or set the agent@location for this thread (resets the session when changed)"
@@ -263,7 +290,7 @@ export function buildSeamCommand(): SlashCommandBuilder {
           )
       )
       .addSubcommand((sub) =>
-        sub
+        declareAccess(sub, (option) => ({ kind: option("value") != null ? "mutating" : "read-only" }))
           .setName("role")
           .setDescription("Set naming role")
           .addStringOption((o) =>
@@ -285,7 +312,7 @@ export function buildSeamCommand(): SlashCommandBuilder {
           )
       )
       .addSubcommand((sub) =>
-        sub
+        declareAccess(sub, { kind: "mutating" })
           .setName("mode")
           .setDescription("Set the agent operational mode")
           .addStringOption((o) =>
@@ -293,7 +320,7 @@ export function buildSeamCommand(): SlashCommandBuilder {
           )
       )
       .addSubcommand((sub) =>
-        sub
+        declareAccess(sub, { kind: "mutating" })
           .setName("repo")
           .setDescription("Set the working repo for this thread")
           .addStringOption((o) =>
@@ -316,7 +343,7 @@ export function buildSeamCommand(): SlashCommandBuilder {
           )
       )
       .addSubcommand((sub) =>
-        sub
+        declareAccess(sub, { kind: "mutating" })
           .setName("tools")
           .setDescription("Set tool allow / exclude lists")
           .addStringOption((o) =>
@@ -337,7 +364,7 @@ export function buildSeamCommand(): SlashCommandBuilder {
           )
       )
       .addSubcommand((sub) =>
-        sub
+        declareAccess(sub, (option) => ({ kind: option("style") != null ? "mutating" : "read-only" }))
           .setName("card")
           .setDescription("Get or set the status-card layout (full or simple)")
           .addStringOption((o) =>
@@ -363,7 +390,7 @@ export function buildSeamCommand(): SlashCommandBuilder {
           )
       )
       .addSubcommand((sub) =>
-        sub
+        declareAccess(sub, (option) => ({ kind: option("state") != null ? "mutating" : "read-only" }))
           .setName("gif")
           .setDescription("Random GIF thumbnail on the simple status card (on or off)")
           .addStringOption((o) =>
@@ -389,7 +416,7 @@ export function buildSeamCommand(): SlashCommandBuilder {
           )
       )
       .addSubcommand((sub) =>
-        sub
+        declareAccess(sub, { kind: "mutating" })
           .setName("approve")
           .setDescription("Set permission policy for this thread")
           .addStringOption((o) =>
@@ -405,19 +432,19 @@ export function buildSeamCommand(): SlashCommandBuilder {
           )
       )
       .addSubcommand((sub) =>
-        sub
+        declareAccess(sub, { kind: "mutating" })
           .setName("reset")
           .setDescription(
             "End the current ACP session for this thread; next message starts fresh"
           )
       )
       .addSubcommand((sub) =>
-        sub
+        declareAccess(sub, { kind: "mutating" })
           .setName("init")
           .setDescription("Bind this thread + open the config card")
       )
       .addSubcommand((sub) =>
-        sub
+        declareAccess(sub, { kind: "mutating" })
           .setName("detach")
           .setDescription(
             "Stop treating this thread as a session (no bot replies). Does not delete history."
@@ -434,7 +461,7 @@ export function buildSeamCommand(): SlashCommandBuilder {
           )
       )
       .addSubcommand((sub) =>
-        sub
+        declareAccess(sub, { kind: "mutating" })
           .setName("tts")
           .setDescription("TTS settings card (omit options), or set on/off/voice/pace/style now")
           .addStringOption((o) =>
@@ -476,22 +503,22 @@ export function buildSeamCommand(): SlashCommandBuilder {
           )
       )
       .addSubcommand((sub) =>
-        sub.setName("show").setDescription("Show current session config")
+        declareAccess(sub, { kind: "read-only" }).setName("show").setDescription("Show current session config")
       )
       .addSubcommand((sub) =>
-        sub
+        declareAccess(sub, { kind: "mutating" })
           .setName("edit")
           .setDescription("Open the visual thread config editor (draft, then Save/Cancel)")
       )
       .addSubcommand((sub) =>
         addConfigSetOptions(
-          sub
+          declareAccess(sub, { kind: "mutating" })
             .setName("set")
             .setDescription("Patch config fields together, or replace session JSON")
         )
       )
       .addSubcommand((sub) =>
-        sub
+        declareAccess(sub, { kind: "read-only" })
           .setName("audit")
           .setDescription("Show recent config mutations (who/what/when), newest first")
           .addIntegerOption((o) =>
@@ -516,22 +543,22 @@ export function buildSeamCommand(): SlashCommandBuilder {
       .setName("info")
       .setDescription("Bot & account info")
       .addSubcommand((sub) =>
-        sub.setName("whoami").setDescription("Show which account this thread's agent is signed in as")
+        declareAccess(sub, { kind: "read-only" }).setName("whoami").setDescription("Show which account this thread's agent is signed in as")
       )
       .addSubcommand((sub) =>
-        sub.setName("usage").setDescription("Show usage / credits for this thread's agent (agy, claude, copilot, grok, codex)")
+        declareAccess(sub, { kind: "read-only" }).setName("usage").setDescription("Show usage / credits for this thread's agent (agy, claude, copilot, grok, codex)")
       )
       .addSubcommand((sub) =>
-        sub.setName("avatar").setDescription("Push the bot avatar and banner to Discord (force re-upload)")
+        declareAccess(sub, { kind: "mutating" }).setName("avatar").setDescription("Push the bot avatar and banner to Discord (force re-upload)")
       )
       .addSubcommand((sub) =>
-        sub.setName("help").setDescription("Show help")
+        declareAccess(sub, { kind: "read-only" }).setName("help").setDescription("Show help")
       )
       .addSubcommand((sub) =>
-        sub.setName("sessions").setDescription("List recent sessions")
+        declareAccess(sub, { kind: "read-only" }).setName("sessions").setDescription("List recent sessions")
       )
       .addSubcommand((sub) =>
-        sub.setName("repos").setDescription("List repos under REPOS_ROOT")
+        declareAccess(sub, { kind: "read-only" }).setName("repos").setDescription("List repos under REPOS_ROOT")
       )
   );
 
@@ -544,9 +571,9 @@ export function buildSeamCommand(): SlashCommandBuilder {
     g
       .setName("preset")
       .setDescription("Manage reusable session presets")
-      .addSubcommand((sub) => sub.setName("list").setDescription("List all presets"))
+      .addSubcommand((sub) => declareAccess(sub, { kind: "read-only" }).setName("list").setDescription("List all presets"))
       .addSubcommand((sub) =>
-        sub
+        declareAccess(sub, { kind: "mutating" })
           .setName("create")
           .setDescription("Create a new preset (opens a builder card)")
           .addBooleanOption((o) =>
@@ -565,7 +592,7 @@ export function buildSeamCommand(): SlashCommandBuilder {
           )
       )
       .addSubcommand((sub) =>
-        sub
+        declareAccess(sub, { kind: "mutating" })
           .setName("apply")
           .setDescription("Apply a preset to the current thread")
           .addStringOption((o) =>
@@ -577,7 +604,7 @@ export function buildSeamCommand(): SlashCommandBuilder {
           )
       )
       .addSubcommand((sub) =>
-        sub
+        declareAccess(sub, { kind: "mutating" })
           .setName("delete")
           .setDescription("Delete a preset")
           .addStringOption((o) =>
@@ -589,7 +616,7 @@ export function buildSeamCommand(): SlashCommandBuilder {
           )
       )
       .addSubcommand((sub) =>
-        sub
+        declareAccess(sub, { kind: "read-only" })
           .setName("show")
           .setDescription("Show a preset's details")
           .addStringOption((o) =>
@@ -601,7 +628,7 @@ export function buildSeamCommand(): SlashCommandBuilder {
           )
       )
       .addSubcommand((sub) =>
-        sub
+        declareAccess(sub, { kind: "mutating" })
           .setName("edit")
           .setDescription("Edit an existing preset (reopens the builder card)")
           .addStringOption((o) =>
@@ -613,7 +640,7 @@ export function buildSeamCommand(): SlashCommandBuilder {
           )
       )
       .addSubcommand((sub) =>
-        sub
+        declareAccess(sub, { kind: "mutating" })
           .setName("thread")
           .setDescription("Create a new thread from a preset")
           .addStringOption((o) =>
@@ -662,13 +689,13 @@ export function buildSeamAdminCommand(): SlashCommandBuilder {
   // --- top-level (4): rebuild, compact-thread, recover, canary ---------------
 
   cmd.addSubcommand((sub) =>
-    sub
+    declareAccess(sub, { kind: "mutating" })
       .setName("rebuild")
       .setDescription("Deterministic Discord reconstruction (no summarizer; one seed turn, ≤60% window)")
   );
 
   cmd.addSubcommand((sub) =>
-    sub
+    declareAccess(sub, { kind: "mutating" })
       .setName("compact-thread")
       .setDescription("Model-assisted reconstruction from Discord history")
       .addStringOption((o) =>
@@ -686,7 +713,7 @@ export function buildSeamAdminCommand(): SlashCommandBuilder {
   );
 
   cmd.addSubcommand((sub) =>
-    sub
+    declareAccess(sub, { kind: "mutating" })
       .setName("recover")
       .setDescription("Diagnose and repair one channel queue without restarting the bot")
       .addStringOption((o) =>
@@ -705,7 +732,7 @@ export function buildSeamAdminCommand(): SlashCommandBuilder {
   );
 
   cmd.addSubcommand((sub) =>
-    sub
+    declareAccess(sub, { kind: "mutating" })
       .setName("canary")
       .setDescription("Run the real host and agent matrix on a deployment")
       .addStringOption((o) =>
@@ -723,11 +750,11 @@ export function buildSeamAdminCommand(): SlashCommandBuilder {
   cmd.addSubcommandGroup((group) => group
     .setName("models")
     .setDescription("Hide models from lists without banning their use")
-    .addSubcommand((sub) => sub.setName("hide").setDescription("Hide matching models")
+    .addSubcommand((sub) => declareAccess(sub, { kind: "mutating" }).setName("hide").setDescription("Hide matching models")
       .addStringOption((option) => option.setName("pattern").setDescription("[agent[@host]:]model-glob").setRequired(true)))
-    .addSubcommand((sub) => sub.setName("unhide").setDescription("Remove a hide pattern")
+    .addSubcommand((sub) => declareAccess(sub, { kind: "mutating" }).setName("unhide").setDescription("Remove a hide pattern")
       .addStringOption((option) => option.setName("pattern").setDescription("Exact hide pattern to remove").setRequired(true)))
-    .addSubcommand((sub) => sub.setName("list").setDescription("List hidden model patterns")));
+    .addSubcommand((sub) => declareAccess(sub, { kind: "read-only" }).setName("list").setDescription("List hidden model patterns")));
 
   // --- groups --------------------------------------------------------------
 
@@ -738,15 +765,15 @@ export function buildSeamAdminCommand(): SlashCommandBuilder {
       // #158: no attachment options. A scheduled prompt stands on its own; for
       // substantial instructions, commit a runbook and reference it in the prompt.
       .addSubcommand((sub) =>
-        sub
+        declareAccess(sub, { kind: "mutating" })
           .setName("add")
           .setDescription("Create a scheduled prompt (finish setup on the card)")
       )
       .addSubcommand((sub) =>
-        sub.setName("list").setDescription("List this thread's scheduled prompts")
+        declareAccess(sub, { kind: "read-only" }).setName("list").setDescription("List this thread's scheduled prompts")
       )
       .addSubcommand((sub) =>
-        sub
+        declareAccess(sub, { kind: "mutating" })
           .setName("remove")
           .setDescription("Delete a scheduled prompt")
           .addStringOption((o) =>
@@ -758,7 +785,7 @@ export function buildSeamAdminCommand(): SlashCommandBuilder {
           )
       )
       .addSubcommand((sub) =>
-        sub
+        declareAccess(sub, { kind: "mutating" })
           .setName("toggle")
           .setDescription("Enable or disable a scheduled prompt")
           .addStringOption((o) =>
@@ -766,7 +793,7 @@ export function buildSeamAdminCommand(): SlashCommandBuilder {
           )
       )
       .addSubcommand((sub) =>
-        sub
+        declareAccess(sub, { kind: "mutating" })
           .setName("edit")
           .setDescription("Edit a scheduled prompt (reopens the builder card)")
           .addStringOption((o) =>
@@ -782,7 +809,7 @@ export function buildSeamAdminCommand(): SlashCommandBuilder {
       .setName("project")
       .setDescription("Activate this channel for the bot (DB-backed, no redeploy)")
       .addSubcommand((sub) =>
-        sub
+        declareAccess(sub, { kind: "mutating" })
           .setName("new")
           .setDescription("Activate the current channel")
           .addStringOption((o) =>
@@ -793,10 +820,10 @@ export function buildSeamAdminCommand(): SlashCommandBuilder {
           )
       )
       .addSubcommand((sub) =>
-        sub.setName("list").setDescription("List active channels")
+        declareAccess(sub, { kind: "read-only" }).setName("list").setDescription("List active channels")
       )
       .addSubcommand((sub) =>
-        sub.setName("remove").setDescription("Deactivate the current channel")
+        declareAccess(sub, { kind: "mutating" }).setName("remove").setDescription("Deactivate the current channel")
       )
   );
 
@@ -806,7 +833,7 @@ export function buildSeamAdminCommand(): SlashCommandBuilder {
       .setName("upload")
       .setDescription("Admin-only: pull/push host files, or pass a temporary secret")
       .addSubcommand((sub) =>
-        sub
+        declareAccess(sub, { kind: "read-only" })
           .setName("pull")
           .setDescription("Post a host file into this thread (zips if over Discord's size cap)")
           .addStringOption((o) =>
@@ -817,7 +844,7 @@ export function buildSeamAdminCommand(): SlashCommandBuilder {
           )
       )
       .addSubcommand((sub) =>
-        sub
+        declareAccess(sub, { kind: "mutating" })
           .setName("push")
           .setDescription("Write an uploaded Discord file to a host path")
           .addAttachmentOption((o) =>
@@ -831,7 +858,7 @@ export function buildSeamAdminCommand(): SlashCommandBuilder {
           )
       )
       .addSubcommand((sub) =>
-        sub
+        declareAccess(sub, { kind: "mutating" })
           .setName("secret")
           .setDescription("Temporary secret for this thread (path-only; expires after about 1 hour)")
       )
@@ -842,7 +869,7 @@ export function buildSeamAdminCommand(): SlashCommandBuilder {
       .setName("bridge")
       .setDescription("Admin-only: pair and configure remote bridges")
       .addSubcommand((sub) =>
-        sub
+        declareAccess(sub, { kind: "mutating" })
           .setName("add")
           .setDescription("Pair a new bridge (prints a one-line bootstrap with the token once)")
           .addStringOption((o) =>
@@ -868,7 +895,7 @@ export function buildSeamAdminCommand(): SlashCommandBuilder {
           )
       )
       .addSubcommand((sub) =>
-        sub
+        declareAccess(sub, { kind: "mutating" })
           .setName("rotate")
           .setDescription("Issue a new token for a paired bridge")
           .addStringOption((o) =>
@@ -876,7 +903,7 @@ export function buildSeamAdminCommand(): SlashCommandBuilder {
           )
       )
       .addSubcommand((sub) =>
-        sub
+        declareAccess(sub, { kind: "mutating" })
           .setName("configure")
           .setDescription("Set a bridge workspace fallback for legacy hellos")
           .addStringOption((o) =>
@@ -890,10 +917,10 @@ export function buildSeamAdminCommand(): SlashCommandBuilder {
           )
       )
       .addSubcommand((sub) =>
-        sub.setName("list").setDescription("List paired bridges and connection status")
+        declareAccess(sub, { kind: "read-only" }).setName("list").setDescription("List paired bridges and connection status")
       )
       .addSubcommand((sub) =>
-        sub
+        declareAccess(sub, { kind: "mutating" })
           .setName("remove")
           .setDescription("Unpair a bridge")
           .addStringOption((o) =>
@@ -901,7 +928,7 @@ export function buildSeamAdminCommand(): SlashCommandBuilder {
           )
       )
       .addSubcommand((sub) =>
-        sub
+        declareAccess(sub, { kind: "mutating" })
           .setName("restart")
           .setDescription("Stage a controller restart")
       )
@@ -911,9 +938,9 @@ export function buildSeamAdminCommand(): SlashCommandBuilder {
     g
       .setName("debug")
       .setDescription("Admin-only: bridge status, active work, or live-help voice spike")
-      .addSubcommand((sub) => sub.setName("work").setDescription("Identify active scheduled work and restart blockers"))
+      .addSubcommand((sub) => declareAccess(sub, { kind: "read-only" }).setName("work").setDescription("Identify active scheduled work and restart blockers"))
       .addSubcommand((sub) =>
-        sub
+        declareAccess(sub, { kind: "read-only" })
           .setName("status")
           .setDescription("Show bridge connection, inventory, and ready state")
           .addStringOption((o) =>
@@ -921,17 +948,17 @@ export function buildSeamAdminCommand(): SlashCommandBuilder {
           )
       )
       .addSubcommand((sub) =>
-        sub
+        declareAccess(sub, { kind: "mutating" })
           .setName("voice-ping")
           .setDescription("Spike: join the test General VC, play a sample, leave")
       )
       .addSubcommand((sub) =>
-        sub
+        declareAccess(sub, { kind: "mutating" })
           .setName("voice-capture")
           .setDescription("Spike: join General, capture your voice to 16 kHz PCM, leave")
       )
       .addSubcommand((sub) =>
-        sub
+        declareAccess(sub, { kind: "mutating" })
           .setName("voice-live")
           .setDescription("Spike: capture in General, Gemini Live replies in the VC")
       )
@@ -942,7 +969,7 @@ export function buildSeamAdminCommand(): SlashCommandBuilder {
       .setName("voice")
       .setDescription("Shared Voice Console (admin)")
       .addSubcommand((sub) =>
-        sub
+        declareAccess(sub, { kind: "mutating" })
           .setName("start")
           .setDescription("Start a console in your self-muted VC")
           .addStringOption((o) =>
@@ -950,7 +977,7 @@ export function buildSeamAdminCommand(): SlashCommandBuilder {
           )
       )
       .addSubcommand((sub) =>
-        sub
+        declareAccess(sub, { kind: "mutating" })
           .setName("add")
           .setDescription("Add this thread to the console")
           .addStringOption((o) =>
@@ -961,7 +988,7 @@ export function buildSeamAdminCommand(): SlashCommandBuilder {
           )
       )
       .addSubcommand((sub) =>
-        sub
+        declareAccess(sub, { kind: "mutating" })
           .setName("remove")
           .setDescription("Remove this binding; preserve finalized text")
           .addBooleanOption((o) =>
@@ -969,7 +996,7 @@ export function buildSeamAdminCommand(): SlashCommandBuilder {
           )
       )
       .addSubcommand((sub) =>
-        sub
+        declareAccess(sub, { kind: "mutating" })
           .setName("configure")
           .setDescription("Set alias and speech profile for this binding")
           .addStringOption((o) =>
@@ -997,7 +1024,7 @@ export function buildSeamAdminCommand(): SlashCommandBuilder {
           )
       )
       .addSubcommand((sub) =>
-        sub
+        declareAccess(sub, { kind: "mutating" })
           .setName("console")
           .setDescription("Show or repost the VC control card")
           .addBooleanOption((o) =>
@@ -1005,12 +1032,12 @@ export function buildSeamAdminCommand(): SlashCommandBuilder {
           )
       )
       .addSubcommand((sub) =>
-        sub
+        declareAccess(sub, { kind: "read-only" })
           .setName("status")
           .setDescription("Show console diagnostics")
       )
       .addSubcommand((sub) =>
-        sub
+        declareAccess(sub, { kind: "mutating" })
           .setName("stop")
           .setDescription("Stop console; preserve finalized text")
           .addBooleanOption((o) =>
@@ -1027,7 +1054,7 @@ export function buildSeamAdminCommand(): SlashCommandBuilder {
       .setName("catalog")
       .setDescription("Refresh cached model catalogs")
       .addSubcommand((sub) =>
-        sub
+        declareAccess(sub, { kind: "mutating" })
           .setName("refresh")
           .setDescription("Refresh one agent@host or all catalogs")
           .addStringOption((o) =>
@@ -1059,7 +1086,7 @@ export function buildSeamAdminCommand(): SlashCommandBuilder {
       .setName("restrictions")
       .setDescription("Admin-only: restrict an agent to named Discord channels")
       .addSubcommand((sub) =>
-        sub
+        declareAccess(sub, { kind: "mutating" })
           .setName("set")
           .setDescription("Set one agent's complete comma-separated channel allowlist")
           .addStringOption((o) =>
@@ -1073,10 +1100,10 @@ export function buildSeamAdminCommand(): SlashCommandBuilder {
           )
       )
       .addSubcommand((sub) =>
-        sub.setName("list").setDescription("List active agent channel allowlists")
+        declareAccess(sub, { kind: "read-only" }).setName("list").setDescription("List active agent channel allowlists")
       )
       .addSubcommand((sub) =>
-        sub
+        declareAccess(sub, { kind: "mutating" })
           .setName("clear")
           .setDescription("Clear one agent's channel allowlist")
           .addStringOption((o) =>
@@ -1098,7 +1125,7 @@ export function buildSeamAdminCommand(): SlashCommandBuilder {
       .setName("naming")
       .setDescription("Admin-only: rebuild thread names, or edit the naming symbol tables")
       .addSubcommand((sub) =>
-        sub
+        declareAccess(sub, { kind: "mutating" })
           .setName("rename")
           .setDescription("Refresh/migrate names")
           .addStringOption((o) =>
@@ -1125,7 +1152,7 @@ export function buildSeamAdminCommand(): SlashCommandBuilder {
           )
       )
       .addSubcommand((sub) =>
-        sub
+        declareAccess(sub, { kind: "mutating" })
           .setName("namer")
           .setDescription("Edit naming rules")
       )
@@ -1141,6 +1168,29 @@ export function buildSeamAdminCommand(): SlashCommandBuilder {
  */
 export function buildSlashRegistrationBody(): RESTPostAPIApplicationCommandsJSONBody[] {
   return [buildSeamCommand().toJSON(), buildSeamAdminCommand().toJSON()];
+}
+
+const accessLeaves = new Map<string, SlashAccessDeclaration>();
+for (const command of [buildSeamCommand(), buildSeamAdminCommand()]) {
+  for (const option of command.options) {
+    const group = option instanceof SlashCommandSubcommandGroupBuilder ? option.name : null;
+    const leaves = option instanceof SlashCommandSubcommandGroupBuilder ? option.options : [option];
+    for (const leaf of leaves) {
+      if (!(leaf instanceof SlashCommandSubcommandBuilder)) continue;
+      const declaration = accessDeclarations.get(leaf);
+      if (declaration) accessLeaves.set([command.name, group, leaf.name].filter(Boolean).join("/"), declaration);
+    }
+  }
+}
+
+export function getSlashCommandAccess(
+  command: string,
+  group: string | null,
+  subcommand: string,
+  option: SlashOptionReader = () => null
+): SlashCommandAccess | undefined {
+  const declaration = accessLeaves.get([command, group, subcommand].filter(Boolean).join("/"));
+  return typeof declaration === "function" ? declaration(option) : declaration;
 }
 
 export type SeamSubcommand =

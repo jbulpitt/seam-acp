@@ -381,7 +381,7 @@ import {
   type CodexAsyncAnswerDelivery,
 } from "../../core/elicitation/manager.js";
 import type { InboundAdmission } from "../../core/inbound-admission/types.js";
-import { SessionRouter, resolveSessionCwd, simpleCardGifForRender, statusCardStyleForRender } from "../../core/session-router.js";
+import { DefaultAgentUnavailableError, SessionRouter, resolveSessionCwd, simpleCardGifForRender, statusCardStyleForRender } from "../../core/session-router.js";
 import {
   formatUsageAgentList,
   liveUsageAgentLabels,
@@ -2613,12 +2613,20 @@ export class Orchestrator {
       if (!/^\d+$/.test(msg.messageId)) {
         throw new Error("invalid Discord message id");
       }
-      record = this.router.ensureSessionRecord({
-        platform: msg.channel.platform,
-        channelRef: channelId,
-        ...(msg.channel.parentId ? { parentRef: msg.channel.parentId } : {}),
-        cwd: this.config.REPOS_ROOT,
-      });
+      try {
+        record = this.router.ensureSessionRecord({
+          platform: msg.channel.platform,
+          channelRef: channelId,
+          ...(msg.channel.parentId ? { parentRef: msg.channel.parentId } : {}),
+          cwd: this.config.REPOS_ROOT,
+        });
+      } catch (error) {
+        if (!(error instanceof DefaultAgentUnavailableError)) throw error;
+        await this.adapter.sendMessage(msg.channel, `❌ Cannot start this session: ${error.message}`).catch((noticeError) => {
+          this.logger.error({ err: noticeError, refusal: error.message }, "failed to send default-agent refusal");
+        });
+        throw error;
+      }
       const admitted = this.store.admitInbound({
         messageId: msg.messageId,
         platform: msg.channel.platform,

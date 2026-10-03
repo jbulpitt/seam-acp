@@ -43,6 +43,13 @@ import { matchesContextBudget, validContextUsage } from "./context-budget.js";
 import { acquireWithModelFallback, matchingModelAcquisition } from "./model-acquisition.js";
 import { executionIdentity } from "./dispatch/execution-identity.js";
 
+export class DefaultAgentUnavailableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "DefaultAgentUnavailableError";
+  }
+}
+
 /**
  * Wiring for the per-session seam-MCP surface. The token identifies the
  * Discord session, not the ACP subprocess — start reuses it (reuseToken) so
@@ -811,7 +818,7 @@ export class SessionRouter {
       opts.channelRef
     );
     if (!preset.agent && this.defaultAgentDisabledReason && isLocalLocation(location)) {
-      throw new Error(this.defaultAgentDisabledReason);
+      throw new DefaultAgentUnavailableError(this.defaultAgentDisabledReason);
     }
     const catalogDefault = this.modelCatalog.model({ agentId, location }, "default")?.id ?? "default";
     const cfg = defaultSessionConfig(preset.model?.value ?? catalogDefault, this.defaultPermissionMode);

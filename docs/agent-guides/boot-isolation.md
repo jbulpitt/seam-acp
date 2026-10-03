@@ -16,6 +16,7 @@ credentials and `REPOS_ROOT` still fail configuration validation.
   Hot reload remains strict and retains its previous good maps on failure.
 - A denied, parked or retired local `DEFAULT_AGENT` refuses new sessions that
   depend on it. Existing sessions and explicit agent presets are unaffected.
+  New message refusals report the original cause in Discord before admission.
   There is no replacement-agent fallback.
 - `SEAM_MCP_ENABLED=false` disables Seam tool injection, not the execution
   bridge. Agents still run through their host's bridge and sessiond.

@@ -81,6 +81,8 @@ function makeEditButton(customId: string, events: string[], ackGate?: Promise<vo
     isButton: () => true,
     customId,
     user: { id: "u1" },
+    channelId: "thread-1",
+    channel: { isThread: () => true, parentId: "chan-1" },
     deferred: false,
     replied: false,
     deferReply: async () => {
@@ -187,13 +189,14 @@ async function runScheduleListEdit(clicks: number, opts: RunOpts = {}) {
   const { interaction, collector, paints } = makeListInteraction(events);
   const self = {
     logger: silent,
-    config: { DATA_DIR: "/tmp" },
+    config: { DATA_DIR: "/tmp", channelPresets: new Map() },
     channelRefFromInteraction: () => ({ platform: "discord", id: "thread-1", parentId: "chan-1" }),
     store: {
       listScheduledByChannel: () => [scheduleRow],
       getScheduled: () => scheduleRow,
     },
     scheduledManager: undefined,
+    slashAccessRefusal: Orchestrator.prototype["slashAccessRefusal" as never],
     attachListLifecycle: Orchestrator.prototype["attachListLifecycle" as never],
     // The real wrapper, so a builder that throws after the freeze is surfaced
     // rather than leaving a permanently "thinking" ephemeral.
@@ -227,12 +230,14 @@ async function runPresetListEdit(clicks: number, opts: RunOpts = {}) {
   const { interaction, collector, paints } = makeListInteraction(events);
   const self = {
     logger: silent,
+    config: { channelPresets: new Map() },
     projectScopeId: () => null,
     store: {
       listPresetsForProject: () => [presetRow],
       getPreset: () => presetRow,
     },
     repoDisplay: (p: string) => p,
+    slashAccessRefusal: Orchestrator.prototype["slashAccessRefusal" as never],
     attachListLifecycle: Orchestrator.prototype["attachListLifecycle" as never],
     // The real wrapper, so a builder that throws after the freeze is surfaced
     // rather than leaving a permanently "thinking" ephemeral.

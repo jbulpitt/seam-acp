@@ -257,6 +257,11 @@ const server = http.createServer(async (request, response) => {
   }
 
   if (request.url?.endsWith("/RetrieveUserQuotaSummary")) {
+    if (process.env.SEAM_AGY_QUOTA_REJECT === "1") {
+      response.statusCode = 401;
+      response.end(JSON.stringify({ code: "unauthenticated", message: "missing CSRF token" }));
+      return;
+    }
     if (process.env.SEAM_AGY_QUOTA_DROP_CONNECTION === "1") {
       // #481: make the real quota callback fail with an unknown diagnostic so
       // the production probe boundary—not a test-local classifier call—has to
@@ -356,10 +361,7 @@ const server = http.createServer(async (request, response) => {
 server.listen(0, "127.0.0.1", () => {
   const address = server.address();
   if (!address || typeof address === "string") process.exit(2);
-  // agy >= 1.2.0 refuses every flag on the `models` SUBCOMMAND, so the catalog
-  // probe cannot pass --log-file any more and reads its rows off stdout. Only
-  // write the log when a path was actually supplied; the 1.1.27 shape this
-  // fixture was built from is no longer the only one to model.
+  // Catalog reads stdout only; quota and turn probes own a private LS log.
   if (logFile) {
     fs.writeFileSync(
       logFile,

@@ -8,8 +8,10 @@ import {
   AgentQuotaCard,
   QUOTA_REFRESH_CUSTOM_ID,
   renderAgentQuotaLayout,
+  renderAgentQuotaPanel,
 } from "../packages/core/src/core/quota/agent-quota-card.js";
-import { mapUnlimitedQuota } from "../packages/core/src/core/quota/agent-quota.js";
+import { mapGrokQuota, mapUnlimitedQuota } from "../packages/core/src/core/quota/agent-quota.js";
+import { parseGrokBilling } from "@seam/adapters";
 import { QuotaRegistry } from "../packages/core/src/core/quota/quota-registry.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import type {
@@ -59,6 +61,23 @@ describe("agent quota card", () => {
     // Must carry the "seam-quota:" prefix so the adapter classifier routes the
     // click to the component handler (not a dead button).
     expect(QUOTA_REFRESH_CUSTOM_ID.startsWith("seam-quota:")).toBe(true);
+  });
+
+  it("shows no-subscription Grok quietly without quota bars or warning color", () => {
+    const quota = mapGrokQuota({ agentId: "grok", displayName: "Grok" }, parseGrokBilling({
+      subscription_tier: "Free", config: { isUnifiedBillingUser: true },
+    }), 10);
+    const layout = renderAgentQuotaLayout([quota]);
+    const text = layout.blocks.filter(block => block.kind === "text").map(block => block.content).join("\n");
+    expect(text).toContain("Grok");
+    expect(text).toContain("No subscription");
+    expect(text).toContain("updated <t:10:R>");
+    expect(text).not.toMatch(/⚠️|rolling|weekly|░|█/);
+    expect(layout.color).toBe(0x57f287);
+    const panel = renderAgentQuotaPanel([quota]);
+    expect(panel.color).toBe(layout.color);
+    expect(panel.fields?.[0]?.value).toContain("No subscription");
+    expect(panel.fields?.[0]?.value).not.toMatch(/rolling|weekly|quota unavailable/);
   });
 
   it("omits claude-vertex without removing it from the registry", () => {

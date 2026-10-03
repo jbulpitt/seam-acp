@@ -14,6 +14,7 @@ import {
   ROLLING_WINDOW_SECONDS,
   WEEKLY_WINDOW_SECONDS,
 } from "../packages/core/src/core/quota/agent-quota.js";
+import { parseGrokBilling } from "@seam/adapters";
 import { createAgentQuotaSources } from "../packages/core/src/core/quota/quota-poller.js";
 
 const identity = { agentId: "agent", displayName: "Agent" };
@@ -92,6 +93,37 @@ describe("agent quota normalization", () => {
     }, now);
     expect(quota.weekly.usedPercent).toBe(72);
     expect(quota.rolling.resetsAt).toBe(now + ROLLING_WINDOW_SECONDS);
+  });
+
+  it("treats an explicit Grok Free response without a meter as no subscription", () => {
+    const quota = mapGrokQuota(identity, parseGrokBilling({
+      subscription_tier: "Free",
+      config: {
+        currentPeriod: { type: "USAGE_PERIOD_TYPE_WEEKLY", start: "2026-01-01T00:00:00Z", end: "2026-01-08T00:00:00Z" },
+        onDemandCap: { val: 0 },
+        onDemandUsed: { val: 0 },
+        prepaidBalance: { val: 0 },
+        isUnifiedBillingUser: true,
+        billingPeriodStart: "2026-01-01T00:00:00Z",
+        billingPeriodEnd: "2026-01-08T00:00:00Z",
+      },
+    }), now);
+    expect(quota).toMatchObject({ ok: true, noSubscription: true, plan: "Free" });
+    expect(quota.error).toBeUndefined();
+  });
+
+  it.each(["SuperGrok Heavy", null])("keeps a missing Grok meter unavailable for tier %s", (tier) => {
+    const quota = mapGrokQuota(identity, parseGrokBilling({ subscription_tier: tier }), now);
+    expect(quota.ok).toBe(false);
+    expect(quota.noSubscription).not.toBe(true);
+    expect(quota.error).toBe("Grok quota data unavailable");
+  });
+
+  it("keeps a reported Grok Free credit meter visible", () => {
+    const quota = mapGrokQuota(identity, parseGrokBilling({ subscription_tier: "Free", config: { creditUsagePercent: 12 } }), now);
+    expect(quota.ok).toBe(true);
+    expect(quota.noSubscription).not.toBe(true);
+    expect(quota.weekly.usedPercent).toBe(12);
   });
 
   it("maps Antigravity's captured quota-summary envelope to rolling and weekly", () => {

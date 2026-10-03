@@ -218,16 +218,7 @@ describe.sequential("#503 child-owned AGY CSRF authentication", () => {
     expect(requestRows.every((row) => row.csrfStatus === "match")).toBe(true);
   }, 20_000);
 
-  // SKIPPED, not deleted: this documents a capability agy removed. The quota
-  // probe reaches the language server by passing --log-file to `agy models`
-  // and scraping the port out of that file. agy >= 1.2.0 refuses every flag
-  // on that subcommand, so no log is written and no LS is discoverable.
-  // The fixture still accepts the flag, which is the only reason this ever
-  // passed. Quota needs a different LS route or it goes away — a design
-  // decision, not a test fix.
-  it.skip("keeps stdout catalog discovery independent of LS availability and authenticates the finite quota RPC", async () => {
-    // No enforce: these probes are `agy models` subcommands and can never be
-    // handed --csrf_token, so an LS demanding one is unreachable in production.
+  it("keeps catalog discovery independent and authenticates the quota RPC (AGY 1.2.16)", async () => {
     const catalog = subject({
       SEAM_AGY_MODELS_NO_LS: "1",
     });
@@ -237,10 +228,7 @@ describe.sequential("#503 child-owned AGY CSRF authentication", () => {
       "fixture-native-model-low",
     ]);
     const catalogLaunch = rows(catalog.log).find((row) => row.pid && row.args?.includes("models"));
-    // `models` is a SUBCOMMAND. Real agy (verified 1.2.0 and 1.2.9) refuses a
-    // main-command flag there with "flags provided but not defined", so the
-    // probe must not send one. The fixture used to accept it, which is why
-    // this passed while production died at "ACP initialize timed out".
+    // Catalog discovery needs stdout only, not a CSRF-authenticated LS.
     expect(catalogLaunch?.csrfFingerprint ?? null).toBeNull();
     expect(catalogLaunch?.args).not.toContain(`${AGY_CSRF_FLAG}=[redacted]`);
     expect(catalogLaunch?.args).not.toContain("-p");
@@ -255,10 +243,11 @@ describe.sequential("#503 child-owned AGY CSRF authentication", () => {
     const quotaRows = rows(quota.log);
     const quotaLaunch = quotaRows.find((row) => row.pid && row.args?.includes("models"));
     const quotaRpc = quotaRows.find((row) => row.rpc === "RetrieveUserQuotaSummary");
-    expect(quotaLaunch?.csrfFingerprint ?? null).toBeNull();
+    expect(quotaLaunch?.csrfFingerprint).toBeTruthy();
     expect(quotaLaunch?.args).not.toContain("-p");
     expect(quotaRpc).toMatchObject({
       csrfFingerprint: quotaLaunch?.csrfFingerprint ?? null,
+      csrfStatus: "match",
     });
   }, 20_000);
 

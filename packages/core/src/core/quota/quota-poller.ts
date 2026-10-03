@@ -6,6 +6,7 @@ import {
   fetchGrokUsage,
   fetchGrokUsageFromConnection,
   fetchOllamaCloudUsage,
+  redactProbeText,
   type AgentProfile,
 } from "@seam/adapters";
 import type { AgyLaunchRuntime } from "@seam/adapters";
@@ -62,6 +63,20 @@ export interface AgentQuotaRefreshSummary {
   durationMs: number;
   timeoutMs: number;
   sources: AgentQuotaRefreshResult[];
+}
+
+function quotaFailureDiagnostic(error: unknown): Record<string, unknown> {
+  const safe = (value: string): string => redactProbeText(
+    value.replace(/\b[a-z][a-z0-9+.-]*:\/\/[^\s"'<>]+/gi, "[redacted]"), process.env,
+  )
+    .replace(/(["']?(?:password|passphrase|secret|(?:access|refresh|csrf)[_-]?token|token|api[_-]?key|authorization|cookie)["']?\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s;,]+)/gi, "$1[redacted]")
+    .replace(/\s+/g, " ").slice(0, 500);
+  const code = error && typeof error === "object" && "code" in error ? error.code : undefined;
+  return {
+    name: error instanceof Error ? safe(error.name) : "Error",
+    message: safe(error instanceof Error ? error.message : String(error)),
+    ...(typeof code === "string" ? { code: safe(code) } : typeof code === "number" ? { code } : {}),
+  };
 }
 
 export function createAgentQuotaSources(
@@ -341,14 +356,13 @@ export class AgentQuotaPoller {
           }),
         ]);
       } catch (err) {
-        // Stable text only: endpoint responses, credentials and paths must not
-        // enter the card, registry or durable logs through a thrown error.
+        // Keep the card stable; retain only a sanitized cause in the journal.
         const message = timedOut
           ? `Quota refresh timed out after ${this.sourceTimeoutMs / 1000}s`
           : "Quota refresh failed";
         quota = mapUnavailableQuota(source, message);
         this.logger.warn(
-          { agentId, timeoutMs: timedOut ? this.sourceTimeoutMs : undefined },
+          { agentId, error: quotaFailureDiagnostic(err), timeoutMs: timedOut ? this.sourceTimeoutMs : undefined },
           timedOut ? "agent quota refresh timed out" : "agent quota refresh failed"
         );
       } finally {

@@ -32,6 +32,39 @@ const source: AgentQuotaSource = {
   fetch: async () => queue.shift() ?? badQuota,
 };
 
+describe("quota refresh failure diagnostics", () => {
+  afterEach(() => vi.unstubAllEnvs());
+
+  it("logs the actual exception safely while keeping the card error stable", async () => {
+    vi.stubEnv("SEAM_QUOTA_TEST_SECRET", "operator-secret-765");
+    const logs: Array<{ msg: string; error: { name: string; code?: string; message: string } }> = [];
+    const logger = pino({ level: "warn" }, { write: (line: string) => { logs.push(JSON.parse(line)); } }) as unknown as Logger;
+    const error = Object.assign(new TypeError(
+      "RetrieveUserQuotaSummary HTTP 401 (unauthenticated) missing CSRF token; " +
+      "https://user:password@example.test/quota?token=private-query " +
+      'Bearer private-bearer-token operator-secret-765 sk-private-key-123456789 ' +
+      '"password":"quoted-secret" api_key=short-key cookie="private-cookie-value"',
+    ), { code: "UNAUTHENTICATED" });
+    const poller = new AgentQuotaPoller({
+      logger, registry: new QuotaRegistry(),
+      sources: [{ ...identity, eventDriven: false, fetch: async () => { throw error; } }],
+    });
+
+    const result = await poller.refreshAll(true);
+    expect(result.sources[0]?.quota.error).toBe("Quota refresh failed");
+    expect(logs).toHaveLength(1);
+    expect(logs[0]).toMatchObject({
+      msg: "agent quota refresh failed",
+      error: { name: "TypeError", code: "UNAUTHENTICATED" },
+    });
+    expect(logs[0]?.error.message).toContain("RetrieveUserQuotaSummary HTTP 401 (unauthenticated) missing CSRF token");
+    const recorded = JSON.stringify(logs);
+    for (const secret of ["https://", "example.test", "private-query", "private-bearer-token", "operator-secret-765", "sk-private-key-123456789", "quoted-secret", "short-key", "private-cookie-value"]) {
+      expect(recorded).not.toContain(secret);
+    }
+  });
+});
+
 function makePoller(staleRetentionMs: number, onUpdate?: (q: AgentQuota) => void) {
   const registry = new QuotaRegistry();
   const poller = new AgentQuotaPoller({

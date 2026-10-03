@@ -41,6 +41,7 @@ function quotaLine(label: "rolling" | "weekly", window: QuotaWindow): string {
 }
 
 export function renderAgentQuotaRow(quota: AgentQuota): string {
+  if (quota.noSubscription) return `No subscription · updated <t:${quota.fetchedAt}:R>`;
   const details = [
     quota.plan ? `plan ${quota.plan}` : "",
     quota.credits

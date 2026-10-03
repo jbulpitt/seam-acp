@@ -22,6 +22,7 @@ export interface AgentQuota {
   ok: boolean;
   error?: string;
   plan?: string | null;
+  noSubscription?: boolean;
   rolling: QuotaWindow;
   weekly: QuotaWindow;
   credits?: { balance: string; unlimited: boolean } | null;
@@ -206,11 +207,13 @@ export function mapGrokQuota(
   data: GrokUsageData,
   fetchedAt = Math.floor(Date.now() / 1000)
 ): AgentQuota {
-  const ok = data.creditUsagePercent !== null;
+  const noSubscription = data.subscriptionTier === "Free" && data.creditUsagePercent === null;
+  const ok = data.creditUsagePercent !== null || noSubscription;
   return {
     ...identity,
     ok,
     ...(!ok ? { error: "Grok quota data unavailable" } : {}),
+    ...(noSubscription ? { noSubscription: true } : {}),
     plan: data.subscriptionTier,
     ...normalizeQuotaWindows(
       {

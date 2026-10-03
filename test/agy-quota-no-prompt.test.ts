@@ -133,11 +133,7 @@ describe("#361 the agy quota refresh issues no model turn", () => {
     expect(usage.groups[0]?.buckets[0]?.window).toBe("weekly");
   }, 30_000);
 
-  it("#481 reports an unknown prompt-free probe failure as unclassified", async () => {
-    // A closed connection becomes an otherwise-unrecognised callback failure
-    // on the real quota path. Removing the classification-before-discard step
-    // changes this to `protocol_error`; retaining the callback text leaks the
-    // transport diagnostic through a credential-adjacent boundary.
+  it("keeps an unknown prompt-free probe failure unclassified with its safe cause", async () => {
     const { runtime } = agyFixture({ SEAM_AGY_QUOTA_DROP_CONNECTION: "1" });
     const caught = await fetchAgyUserStatus(runtime).then(
       () => undefined,
@@ -149,8 +145,29 @@ describe("#361 the agy quota refresh issues no model turn", () => {
       agentId: "agy",
       errorKind: "unclassified",
     });
-    expect(String(caught)).toContain("native AGY lifecycle failed");
-    expect(String(caught)).not.toContain("fetch failed");
+    expect(String(caught)).toContain("fetch failed");
+  }, 30_000);
+
+  it("preserves the quota RPC's real 401 response", async () => {
+    const { runtime } = agyFixture({ SEAM_AGY_QUOTA_REJECT: "1" });
+    await expect(fetchAgyUserStatus(runtime)).rejects.toThrow(
+      "RetrieveUserQuotaSummary HTTP 401 (unauthenticated) missing CSRF token",
+    );
+  }, 30_000);
+
+  it("redacts the child-owned CSRF token even when the CLI echoes it", async () => {
+    const { runtime } = agyFixture({ SEAM_AGY_CSRF_FLAG_MODE: "echo-fail" });
+    const prepare = runtime.prepare.bind(runtime);
+    let token = "";
+    runtime.prepare = (args, cwd, options) => {
+      token = args.find(arg => arg.startsWith("--csrf_token="))?.slice("--csrf_token=".length) ?? "";
+      return prepare(args, cwd, options);
+    };
+    const error = await fetchAgyUserStatus(runtime).catch(error => error);
+    expect(error).toBeInstanceOf(Error);
+    expect(token.length).toBeGreaterThan(0);
+    expect(String(error)).toContain("synthetic child rejected csrf capability [redacted]");
+    expect(String(error)).not.toContain(token);
   }, 30_000);
 });
 

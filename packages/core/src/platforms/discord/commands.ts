@@ -100,8 +100,8 @@ function addConfigSetOptions(sub: SlashCommandSubcommandBuilder): SlashCommandSu
  *
  * The Discord permission is a VISIBILITY control, not the authorization model:
  * every runtime refusal (`SEAM_CONFIG_ADMIN_USER_IDS`, `BRIDGE_ADMIN_REFUSAL`,
- * `THREAD_VOICE_ADMIN_REFUSAL`, the #160 `cmdThreadRename` gate) stays exactly
- * where it was. A guild admin can still grant `/seamadmin` to anyone.
+ * `THREAD_VOICE_ADMIN_REFUSAL`, and plugin authorization) remains in dispatch.
+ * A guild admin can still grant `/seamadmin` to anyone.
  */
 export function buildSeamCommand(): SlashCommandBuilder {
   const cmd = new SlashCommandBuilder()

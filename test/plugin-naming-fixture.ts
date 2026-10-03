@@ -15,6 +15,7 @@ import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrato
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 
 const logger = pino({ level: "silent" });
+export const NAMING_PARENT = "100000000000000001";
 export function namingRegistry() {
   const plugin = createThreadNamingPlugin({ threads: {
     describeConfig: () => ({ agent: { value: "codex" }, model: { value: "gpt-6.1-sol" }, role: { value: "worker" }, disableThreadPrefix: { value: false } }),
@@ -32,11 +33,14 @@ export async function namingFixture(options: { admins?: Set<string>; locked?: bo
   const store = options.store ?? new SessionStore(path.join(directory, "seam.db"));
   const profiles = ["codex", "claude"].map(id => ({ id, displayName: id, defaultModel: id === "codex" ? "gpt-6.1-sol" : "claude-sonnet-5.5", spawn: () => { throw new Error("unit test never starts an agent"); } })) as AgentProfile[];
   const modelCatalog = fixtureModelCatalog(profiles);
+  const presetsFile = path.join(directory, "channel-presets.json");
+  fs.writeFileSync(presetsFile, JSON.stringify({ channels: { [NAMING_PARENT]: { role: "worker", locked: options.locked ?? false } } }));
   const config = {
     DATA_DIR: directory, REPOS_ROOT: directory, DEFAULT_AGENT: "codex", DEFAULT_MODEL: "gpt-6.1-sol", TURN_TIMEOUT_SECONDS: 60,
     SEAM_CONFIG_ADMIN_USER_IDS: options.admins, SEAM_PARTICIPANT_USER_IDS: options.participant ? new Set([options.participant]) : undefined,
     DISCORD_ALLOWED_USER_IDS: new Set(["admin", "other"]), REPO_EMOJIS: new Map(),
-    channelPresets: new Map([["parent", { role: { value: "worker" }, locked: options.locked ?? false }]]), threadPresets: new Map(), bridgePresets: new Map(),
+    CHANNEL_PRESETS_FILE: presetsFile,
+    channelPresets: new Map([[NAMING_PARENT, { role: { value: "worker" }, locked: options.locked ?? false }]]), threadPresets: new Map(), bridgePresets: new Map(),
   } as Config;
   const router = new SessionRouter({ logger, store, profiles, modelCatalog, defaultAgentId: "codex", defaultModel: "gpt-6.1-sol", channelPresets: config.channelPresets, threadPresets: config.threadPresets });
   const names = new Map<string, string>();
@@ -44,13 +48,13 @@ export async function namingFixture(options: { admins?: Set<string>; locked?: bo
   let componentHandler: ((event: never) => Promise<void>) | undefined;
   const renameThread = vi.fn(async (channel: { id: string }, name: string) => { events.push("rename"); names.set(channel.id, name); });
   const host = new PluginHost(logger, { slash: [buildSeamCommand().toJSON(), buildSeamAdminCommand().toJSON()] });
-  const adapter = { onMessage: () => {}, onComponent: (handler: typeof componentHandler) => { componentHandler = handler; }, getThreadName: async (channel: { id: string }) => names.get(channel.id) ?? null, getThreadLiveState: async () => ({ locked: false, archived: false }), renameThread };
+  const adapter = { onMessage: () => {}, onComponent: (handler: typeof componentHandler) => { componentHandler = handler; }, getThreadName: async (channel: { id: string }) => names.get(channel.id) ?? null, getThreadLiveState: async (channel: { id: string }) => names.has(channel.id) ? ({ locked: false, archived: false }) : undefined, renameThread };
   const orchestrator = new Orchestrator({ logger, config, router, store, modelCatalog, plugins: host, adapter: adapter as never, renderer: {} as never });
   await orchestrator.loadPlugins();
   orchestrator.install();
   const create = async (id = "thread") => {
     names.set(id, "my task");
-    const record = router.ensureSessionRecord({ platform: "discord", channelRef: id, parentRef: "parent", cwd: directory });
+    const record = router.ensureSessionRecord({ platform: "discord", channelRef: id, parentRef: NAMING_PARENT, cwd: directory });
     await orchestrator.flushIdentityEffects();
     return store.get(record.id)!;
   };
@@ -58,7 +62,7 @@ export async function namingFixture(options: { admins?: Set<string>; locked?: bo
     const reply = vi.fn(async () => { events.push("reply"); });
     const deferReply = vi.fn(async () => { events.push("defer"); });
     const editReply = vi.fn(async () => { events.push("edit"); });
-    await orchestrator.handleSlashInteraction({ commandName: "seamadmin", channelId: "thread", channel: { isThread: () => true, parentId: "parent" },
+    await orchestrator.handleSlashInteraction({ commandName: "seamadmin", channelId: "thread", channel: { isThread: () => true, parentId: NAMING_PARENT },
       user: { id: userId, username: userId, displayName: userId }, options: { getSubcommand: () => sub, getSubcommandGroup: () => "naming", getString: (name: string) => typeof values[name] === "string" ? values[name] : null, getBoolean: (name: string) => typeof values[name] === "boolean" ? values[name] : null }, reply, deferReply, editReply } as never);
     return { reply, deferReply, editReply };
   };

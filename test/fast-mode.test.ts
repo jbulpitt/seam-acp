@@ -937,7 +937,7 @@ function ctrlHarness(opts: {
         result: { ok: true, message: "ok", auditId: "a2", fields: [], warnings: [] },
       }),
     },
-    applyThreadName: vi.fn(async () => ({})),
+    identityCommitted: vi.fn(async () => {}),
   };
 
   return {
@@ -1174,8 +1174,7 @@ function saveHarness(opts: {
       applyChannelOverlay: () => ({ ok: true, message: "ok", auditId: "a2" }),
     },
     configEditor: { delete: () => {} },
-    threadNamer: { recompactChannel: async () => {} },
-    applyThreadName: async () => ({}),
+    identityEffects: { flush: async () => {} },
     logger: { warn() {}, error() {}, info() {}, debug() {} },
     adapter: {
       editPanel: async (ref: { id: string }, panel: unknown) => {

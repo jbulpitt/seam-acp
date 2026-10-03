@@ -1247,6 +1247,7 @@ export class Orchestrator {
       presetsFile: this.config.CHANNEL_PRESETS_FILE,
       tierCEnabled: this.config.SEAM_CONFIG_MUTATION_TIER_C_ENABLED,
       reloadPresets: () => {
+        const before = new Map(this.config.channelPresets);
         const result = reloadChannelPresets(
           {
             channelPresets: this.config.channelPresets,
@@ -1256,7 +1257,10 @@ export class Orchestrator {
           this.config.CHANNEL_PRESETS_FILE,
           this.logger
         );
-        if (result.ok) this.identityEffects.presetsCommitted();
+        if (result.ok) this.identityEffects.presetsCommitted(new Set(
+          [...new Set([...before.keys(), ...this.config.channelPresets.keys()])]
+            .filter(id => JSON.stringify(before.get(id)) !== JSON.stringify(this.config.channelPresets.get(id)))
+        ));
         return result;
       },
       // #69 Tier D: (re)arm the manager's croner timer after a schedule write, so

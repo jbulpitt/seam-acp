@@ -52,6 +52,7 @@ import {
   type DeadlineClock,
 } from "../packages/core/src/lib/shutdown-budget.js";
 import { SeamMcpServer } from "../packages/core/src/core/mcp/seam-mcp-server.js";
+import { PluginHost } from "../packages/core/src/plugins/host.js";
 import {
   SessionStore,
   isPlannedChainChildId,
@@ -385,6 +386,9 @@ function makeQuiesceHost(over: Record<string, unknown> = {}) {
   const self = Object.create(Orchestrator.prototype) as Record<string, unknown>;
   Object.assign(self, {
     logger: silent,
+    config: { DISCORD_ALLOWED_USER_IDS: new Set(["u1"]), channelPresets: new Map(), threadPresets: new Map() },
+    plugins: new PluginHost((over.logger ?? silent) as Logger),
+    identityEffects: { ready: Promise.resolve(), flush: async () => {} },
     intakeStopped: false,
     gatewayClosed: false,
     activeTurnSettles: new Set<Promise<void>>(),
@@ -398,6 +402,7 @@ function makeQuiesceHost(over: Record<string, unknown> = {}) {
     scheduledManager: undefined,
     ...over,
   });
+  (self.registerKernelComponents as () => void).call(self);
   return self as unknown as {
     quiesce(o?: { timeoutMs?: number; clock?: DeadlineClock }): Promise<QuiesceOutcome>;
     drainAfterDispose(o?: { timeoutMs?: number; clock?: DeadlineClock }): Promise<QuiesceOutcome>;
@@ -2890,7 +2895,7 @@ describe("#174 the component wrapper AWAITS its handlers, not just gates them", 
 
     host.install();
     const wrapper = onComponent.mock.calls[0]![0] as (e: unknown) => void;
-    wrapper({ customId: "vc:x", replyEphemeral: async () => {} });
+    wrapper({ customId: "tvc:x", kind: "button", userId: "u1", channel: { id: "c1" }, replyEphemeral: async () => {} });
     await flush();
 
     // Admitted and tracked as ONE promise covering all four handlers.
@@ -3259,7 +3264,7 @@ describe("#174 the component aggregate reports every handler's failure", () => {
     const wrapper = onComponent.mock.calls[0]![0] as (e: unknown) => Promise<void>;
     return { host, log, wrapper };
   }
-  const evt = { customId: "cfg:x", replyEphemeral: async () => {}, followUpEphemeral: async () => {} };
+  const evt = { customId: "seam-cfg-edit:x", kind: "button", userId: "u1", channel: { id: "c1" }, replyEphemeral: async () => {}, followUpEphemeral: async () => {} };
 
   it("logs a CONFIG EDITOR failure instead of discarding it", async () => {
     // The one handler with no catch of its own: `allSettled` dropped its
@@ -3273,8 +3278,8 @@ describe("#174 the component aggregate reports every handler's failure", () => {
 
     await wrapper(evt);
     const entry = log.find(/component handler failed/);
-    expect(entry?.level).toBe("warn");
-    expect(entry?.data).toMatchObject({ handler: "config editor" });
+    expect(entry?.level).toBe("error");
+    expect(entry?.data).toMatchObject({ plugin: "kernel", customId: "seam-cfg-edit:x" });
     expect(String((entry?.data as { err?: Error }).err)).toMatch(/config write failed/);
   });
 
@@ -3284,10 +3289,10 @@ describe("#174 the component aggregate reports every handler's failure", () => {
         throw new Error("quota boom");
       },
     });
-    await wrapper(evt);
+    await wrapper({ ...evt, customId: "seam-quota:x" });
     expect(log.find(/component handler failed/)?.data).toMatchObject({
-      handler: "quota card",
-      customId: "cfg:x",
+      plugin: "kernel",
+      customId: "seam-quota:x",
     });
   });
 
@@ -3297,11 +3302,11 @@ describe("#174 the component aggregate reports every handler's failure", () => {
         throw new Error("sync tts boom");
       },
     });
-    await wrapper(evt);
-    expect(log.find(/component handler failed/)?.data).toMatchObject({ handler: "tts editor" });
+    await wrapper({ ...evt, customId: "seam-tts:x" });
+    expect(log.find(/component handler failed/)?.data).toMatchObject({ customId: "seam-tts:x" });
   });
 
-  it("one failing handler does not stop the other three", async () => {
+  it("dispatches only the matching handler and preserves later actions", async () => {
     const ran: string[] = [];
     const { wrapper } = componentHost({
       handleConfigEditorComponent: async () => {
@@ -3313,6 +3318,10 @@ describe("#174 the component aggregate reports every handler's failure", () => {
     });
 
     await wrapper(evt);
+    expect(ran).toEqual([]);
+    await wrapper({ ...evt, customId: "seam-tts:x" });
+    await wrapper({ ...evt, customId: "tvc:x" });
+    await wrapper({ ...evt, customId: "seam-quota:x" });
     expect(ran.sort()).toEqual(["quota", "tts", "voice"]);
   });
 
@@ -3328,7 +3337,8 @@ describe("#174 the component aggregate reports every handler's failure", () => {
     });
 
     await wrapper({
-      customId: "vc:x",
+      ...evt,
+      customId: "tvc:x",
       replyEphemeral: async () => {
         throw new Error("reply failed");
       },
@@ -3340,7 +3350,7 @@ describe("#174 the component aggregate reports every handler's failure", () => {
     // even tell the user about it.
     expect(log.find(/voice console component failed/)).toBeDefined();
     const outer = log.find(/component handler failed/);
-    expect(outer?.data).toMatchObject({ handler: "voice console" });
+    expect(outer?.data).toMatchObject({ customId: "tvc:x" });
     expect(String((outer?.data as { err?: Error }).err)).toMatch(/follow-up failed/);
   });
 
@@ -3352,7 +3362,7 @@ describe("#174 the component aggregate reports every handler's failure", () => {
       },
     });
 
-    await wrapper({ customId: "vc:x", replyEphemeral, followUpEphemeral: async () => {} });
+    await wrapper({ ...evt, customId: "tvc:x", replyEphemeral, followUpEphemeral: async () => {} });
     expect(replyEphemeral).toHaveBeenCalledOnce();
     expect(String(replyEphemeral.mock.calls[0]![0])).toMatch(/voice boom/);
     expect(log.find(/voice console component failed/)).toBeDefined(); // still logged
@@ -3371,7 +3381,7 @@ describe("#174 the component aggregate reports every handler's failure", () => {
       },
     });
 
-    const running = wrapper(evt);
+    const running = wrapper({ ...evt, customId: "seam-quota:x" });
     expect(running).toBeInstanceOf(Promise);
     await flush();
     expect(finished).toBe(false);

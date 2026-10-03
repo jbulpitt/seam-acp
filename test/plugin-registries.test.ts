@@ -10,6 +10,7 @@ import { buildSeamCommand, buildSeamAdminCommand, buildSlashRegistrationBody } f
 import { buildSeamHelpPages } from "../packages/core/src/platforms/discord/help-text.js";
 import { harnessPreamble } from "../packages/core/src/core/agent-conventions.js";
 import { namingRegistry } from "./plugin-naming-fixture.js";
+import { installThreadNaming } from "../packages/core/src/core/thread-identity.js";
 
 function fixture() {
   const logs: any[] = [];
@@ -35,6 +36,18 @@ describe("plugin registry registration and dispatch", () => {
     expect(activate).not.toHaveBeenCalled();
     expect(h.logs.find(log => log.msg === "plugin disabled").err.message).toContain("duplicate slash path seam/new");
     expect(buildSlashRegistrationBody(h.host.slash)[0]!.options?.some(option => option.name === "hello")).toBe(true);
+    await h.host.dispose();
+  });
+
+  it("keeps naming capability setup inside the isolated plugin loader", async () => {
+    const h = fixture();
+    await h.host.loadBuiltins([{ id: "healthy", load: async () => plugin("healthy", [leaf("hello")]) }]);
+    const effects = installThreadNaming({ plugins: h.host, logger: h.logger, config: {} as never, adapter: {} as never, router: {} as never,
+      store: { countSessions: () => { throw new Error("identity capability unavailable"); } } as never });
+    await effects.ready;
+    await effects.flush();
+    expect(h.logs.find(log => log.msg === "plugin disabled").err.message).toBe("identity capability unavailable");
+    expect(h.host.slash.get("seam", null, "hello")).toBeDefined();
     await h.host.dispose();
   });
 

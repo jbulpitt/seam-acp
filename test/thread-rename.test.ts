@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { MessageFlags } from "discord.js";
 import type { IdentityEvent } from "../packages/core/src/plugins/identity-registry.js";
-import { namingCommands, namingFixture } from "./plugin-naming-fixture.js";
+import { NAMING_PARENT, namingCommands, namingFixture } from "./plugin-naming-fixture.js";
 
 describe("thread naming contributions", () => {
   it("registers the existing admin leaves and option contract", () => {
@@ -104,6 +104,32 @@ describe("thread naming contributions", () => {
       expect(h.events[0]).toBe("defer");
       expect(result.editReply.mock.calls[0]![0].content).toContain("Recomputed 2 channel thread(s)");
       expect(h.names.get("thread")).toBe("🧬🌞🛠️1️⃣ worker");
+    } finally { await h.close(); }
+  });
+
+  it("a channel preset commit compacts each role group in creation order", async () => {
+    const h = await namingFixture();
+    try {
+      await h.create(); await h.create("second"); await h.create("third");
+      h.names.delete("second");
+      const reply = vi.fn(async () => {});
+      await h.orchestrator.handleSlashInteraction({ commandName: "seam", channelId: "thread", channel: { isThread: () => true, parentId: NAMING_PARENT }, user: { id: "admin", username: "Admin" },
+        options: { getSubcommand: () => "role", getSubcommandGroup: () => "config", getString: (name: string) => name === "value" ? "analyst" : name === "scope" ? "channel" : null }, reply } as never);
+      expect(reply).toHaveBeenCalledWith(expect.objectContaining({ content: expect.stringContaining("Role set to `analyst`") }));
+      expect(h.names.get("thread")).toBe("🧬🌞🔬1️⃣ my task");
+      expect(h.names.get("third")).toBe("🧬🌞🔬2️⃣ my task");
+    } finally { await h.close(); }
+  });
+
+  it("allows a read-only plugin leaf through participant and lock gates", async () => {
+    const h = await namingFixture({ locked: true, participant: "other" });
+    try {
+      const existing = h.host.slash.get("seamadmin", "naming", "rename")!;
+      await h.host.loadBuiltins([{ id: "read-only", load: async () => ({ id: "read-only", apiVersion: 1, builtin: true, contributions: { slash: [{
+        command: "seamadmin", group: existing.group, leaf: { type: 1, name: "inspect", description: "Inspect naming" }, access: { kind: "read-only" }, authorization: "user", help: "Inspect naming", handle: async invocation => invocation.reply("read without mutation"),
+      }] } }) }]);
+      const result = await h.slash("inspect", {}, "other");
+      expect(result.reply).toHaveBeenCalledWith({ content: "read without mutation", flags: MessageFlags.Ephemeral });
     } finally { await h.close(); }
   });
 

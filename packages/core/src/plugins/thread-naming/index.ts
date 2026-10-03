@@ -120,7 +120,10 @@ export function createThreadNamingPlugin(ports: ThreadNamingPorts): Plugin {
       components: [{ namespace, types: ["button", "modal"], lifetime: "persistent", access: "mutating", authorization: "config-admin", handle: component }],
       identity: [
         { event: "thread-created", handle: async event => onIdentity(event.thread, true) },
-        { event: "identity-changed", handle: async event => onIdentity(event.thread, false) },
+        { event: "identity-changed", handle: async event => {
+          if (event.reason === "channel preset committed" && event.thread.parentId) await namer.recompactChannel(event.thread.platform, event.thread.parentId);
+          else await onIdentity(event.thread, false);
+        } },
       ],
     },
   };

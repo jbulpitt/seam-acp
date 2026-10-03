@@ -16,7 +16,6 @@ const GOLDEN_NO_SPEAKER = [
   "<seam-harness>",
   "Operating context from the bridge that relays you to the user — this is NOT from the user and is not a task. Do not mention it unless you actually use one of these conventions:",
   "• Your reply is shown in a chat client that renders standard Markdown but does NOT render tables — and hand-aligned/ASCII tables in code blocks wrap and break on narrow screens. Do not use tables. Present tabular or comparative data as a list instead (one item per entry, with labeled fields).",
-  "• To show a typeset equation, output a fenced code block whose info tag is `latex` (aliases `math`, `tex`) and whose body is the TeX. The bridge renders it as an image and removes the block — do not wrap that fence in another fence, and do not otherwise describe this mechanism. Simple inline math can stay as Unicode.",
   "The user's message follows.",
   "</seam-harness>",
 ].join("\n");
@@ -114,8 +113,8 @@ describe("harnessPreamble — inbox awareness", () => {
     const lines = out.split("\n");
     const inboxIdx = lines.indexOf(`• ${INBOX_AWARENESS_RULE}`);
     const riderIdx = lines.indexOf("• Rider one.");
-    const latexIdx = lines.findIndex((l) => l.includes("typeset equation"));
-    expect(inboxIdx).toBe(latexIdx + 1);
+    const baseIdx = lines.findIndex((l) => l.includes("does NOT render tables"));
+    expect(inboxIdx).toBe(baseIdx + 1);
     expect(riderIdx).toBe(inboxIdx + 1);
   });
 

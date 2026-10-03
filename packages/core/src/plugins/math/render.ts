@@ -1,17 +1,13 @@
 /**
- * Typeset a TeX body to a PNG for Discord (issue #79).
+ * Typeset a TeX body to a PNG for Discord.
  *
- * Isolated here so the orchestrator never imports MathJax. Engine init is a
- * lazy singleton — first equation pays the cost, not process start.
+ * Engine init is lazy: the first equation pays the cost, not process start.
  *
  * MathJax SVG uses `currentColor` and `ex` units. We pin an explicit Discord
  * dark-mode fill and a concrete font-size/viewport before resvg, otherwise
  * glyphs render invisible or black on dark backgrounds.
  */
 import { Resvg } from "@resvg/resvg-js";
-import { isMathFenceLang } from "./agent-conventions.js";
-
-export { isMathFenceLang };
 
 export const MATH_MAX_TEX_CHARS = 4000;
 export const MATH_RENDER_TIMEOUT_MS = 2000;

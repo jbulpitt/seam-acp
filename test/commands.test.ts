@@ -1,4 +1,5 @@
 import { describe, it, expect } from "vitest";
+import { namingCommands } from "./plugin-naming-fixture.js";
 import { PermissionFlagsBits, InteractionContextType } from "discord.js";
 import {
   SEAM_ADMIN_COMMAND_NAME,
@@ -34,7 +35,7 @@ type Built = {
 };
 
 const seam = (): Built => buildSeamCommand().toJSON() as Built;
-const admin = (): Built => buildSeamAdminCommand().toJSON() as Built;
+const admin = (): Built => namingCommands().find(command => command.name === "seamadmin") as Built;
 
 const slot = (cmd: Built, name: string): Opt | undefined =>
   cmd.options?.find((o) => o.name === name);

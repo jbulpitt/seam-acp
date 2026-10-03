@@ -68,6 +68,7 @@ export class AutocompleteRegistry {
     responder: AutocompleteResponder
   ): void {
     const key = autocompleteKey(group, subcommand, optionName);
+    if (this.responders.has(key)) throw new Error(`duplicate autocomplete ${key}`);
     this.responders.set(key, { key, group, subcommand, optionName, policy, responder });
   }
 

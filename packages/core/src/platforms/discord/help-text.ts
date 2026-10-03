@@ -29,7 +29,7 @@ export const HELP_PAGE_MAX = 1900;
  * packer can break between them and so a section can be re-ordered or dropped
  * without re-flowing the whole document.
  */
-export function seamHelpSections(): string[] {
+export function seamHelpSections(pluginHelp: readonly string[] = []): string[] {
   return [
     [
       "**seam-acp** — control the agent in this thread.",
@@ -78,8 +78,7 @@ export function seamHelpSections(): string[] {
       "`/seamadmin compact-thread [agent] [model]` — model-assisted reconstruction from Discord history",
       "`/seamadmin recover <thread> [mode]` — diagnose and repair one wedged channel queue",
       "`/seamadmin canary target:staging` — run the live staging host and agent matrix",
-      "`/seamadmin naming rename [scope] [migrate-legacy] [role-name]` — rebuild thread names",
-      "`/seamadmin naming namer` — edit the agent/model/role symbol tables",
+      ...pluginHelp,
       "`/seamadmin schedule` — `add` `list` `remove` `toggle` `edit` (no attachments)",
       "`/seamadmin project` — `new` `list` `remove` (activate a channel, no redeploy)",
       "`/seamadmin upload` — `pull <path>` `push <file> <path>` `secret`",
@@ -99,10 +98,10 @@ export function seamHelpSections(): string[] {
  * Guarantee: every returned page satisfies `page.length <= max`. Callers may
  * send each page as its own message content without re-checking.
  */
-export function buildSeamHelpPages(max = HELP_PAGE_MAX): string[] {
+export function buildSeamHelpPages(max = HELP_PAGE_MAX, pluginHelp: readonly string[] = []): string[] {
   const pages: string[] = [];
   let current = "";
-  for (const section of seamHelpSections()) {
+  for (const section of seamHelpSections(pluginHelp)) {
     // A section that cannot fit on a page of its own is cut at a newline.
     if (section.length > max) {
       if (current) {

@@ -119,7 +119,7 @@ function harness(opts: {
     role?: string | null;
     disableThreadPrefix?: boolean | null;
   }> = [];
-  const applyThreadName = vi.fn(async () => ({}));
+  const identityCommitted = vi.fn(async () => { const live = records.get(target.id); if (live) records.set(target.id, { ...live, namePrefix: "managed " }); });
   let nextSession = 1;
 
   const deps: ThreadSessionControlDeps = {
@@ -201,7 +201,7 @@ function harness(opts: {
       },
     },
     modelCatalog: opts.catalog ?? fixtureModelCatalog(profiles),
-    applyThreadName,
+    identityCommitted,
   };
 
   return {
@@ -213,7 +213,7 @@ function harness(opts: {
     invalidationOptions,
     mutations,
     overlays,
-    applyThreadName,
+    identityCommitted,
     service: new ThreadSessionControlService(deps),
   };
 }
@@ -414,7 +414,7 @@ describe("ThreadSessionControlService", () => {
     expect(h.invalidated).toEqual([]);
     expect(h.runtimes).toEqual([]);
     expect(h.overlays).toEqual([]);
-    expect(h.applyThreadName).toHaveBeenCalledOnce();
+    expect(h.identityCommitted).toHaveBeenCalledOnce();
   });
 
   it("changes role without starting or resetting the runtime and invokes naming once", async () => {
@@ -430,7 +430,7 @@ describe("ThreadSessionControlService", () => {
     });
     expect(h.overlays).toEqual([{ role: "analyst" }]);
     expect(h.runtimes).toEqual([]);
-    expect(h.applyThreadName).toHaveBeenCalledOnce();
+    expect(h.identityCommitted).toHaveBeenCalledOnce();
   });
 
   it("toggles the naming opt-out without touching sibling runtime state", async () => {
@@ -450,7 +450,7 @@ describe("ThreadSessionControlService", () => {
     });
     expect(h.overlays).toEqual([{ disableThreadPrefix: true }]);
     expect(h.runtimes).toEqual([]);
-    expect(h.applyThreadName).toHaveBeenCalledOnce();
+    expect(h.identityCommitted).toHaveBeenCalledOnce();
   });
 
   it("reset forges a new session while preserving effective agent and model", async () => {
@@ -468,7 +468,7 @@ describe("ThreadSessionControlService", () => {
     // Removing the intent tag leaves old-session dispatches eligible for boot warnings forever.
     expect(h.invalidationOptions).toEqual([{ operatorIntent: "replace-session" }]);
     expect(h.mutations).toEqual([]);
-    expect(h.applyThreadName).toHaveBeenCalledOnce();
+    expect(h.identityCommitted).toHaveBeenCalledOnce();
   });
 
   it("prepares and activates a self migration as a fresh session", async () => {
@@ -510,7 +510,7 @@ describe("ThreadSessionControlService", () => {
       { agent: "codex", model: "gpt-new", effort: "high" },
     ]);
     expect(h.runtimes[0]!.optionCalls).toEqual([]);
-    expect(h.applyThreadName).toHaveBeenCalledOnce();
+    expect(h.identityCommitted).toHaveBeenCalledOnce();
   });
 
   it("always forges a fresh session for migrate_self, including a Claude model switch", async () => {

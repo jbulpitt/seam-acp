@@ -1,324 +1,143 @@
 import { describe, expect, it, vi } from "vitest";
 import { MessageFlags } from "discord.js";
-import {
-  buildSeamAdminCommand,
-  buildSeamCommand,
-} from "../packages/core/src/platforms/discord/commands.js";
-import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
+import type { IdentityEvent } from "../packages/core/src/plugins/identity-registry.js";
+import { namingCommands, namingFixture } from "./plugin-naming-fixture.js";
 
-const ADMIN_ID = "admin-1";
-const ADMINS = new Set([ADMIN_ID]);
-
-describe("/seamadmin naming rename and namer surfaces", () => {
-  it("publishes thread/channel rename, explicit legacy migration, and namer editor", () => {
-    // #151 moved both leaves out of `/seam config` into `/seamadmin naming`.
-    const command = buildSeamAdminCommand().toJSON();
-    const naming = command.options?.find((option) => option.name === "naming");
-    const rename = naming?.options?.find((option) => option.name === "rename");
-    const namer = naming?.options?.find((option) => option.name === "namer");
-
-    expect(rename).toBeDefined();
-    expect(rename?.options?.find((option) => option.name === "scope")?.choices)
-      .toEqual(expect.arrayContaining([
-        expect.objectContaining({ name: "thread", value: "thread" }),
-        expect.objectContaining({ name: "channel", value: "channel" }),
-      ]));
-    expect(rename?.options?.find((option) => option.name === "migrate-legacy")?.type).toBe(5);
-    expect(rename?.options?.map((option) => option.name)).toEqual([
-      "scope",
-      "migrate-legacy",
-      "role-name",
-    ]);
-    expect(rename?.options?.find((option) => option.name === "role-name")?.type).toBe(5);
-    expect(namer).toBeDefined();
-
-    // …and are gone from `/seam config`, so a non-admin has no path to them.
-    const seamConfig = buildSeamCommand()
-      .toJSON()
-      .options?.find((option) => option.name === "config");
-    const configLeaves = (seamConfig?.options ?? []).map((option) => option.name);
-    expect(configLeaves).not.toContain("rename");
-    expect(configLeaves).not.toContain("namer");
+describe("thread naming contributions", () => {
+  it("registers the existing admin leaves and option contract", () => {
+    const naming = namingCommands().find(command => command.name === "seamadmin")?.options?.find(option => option.name === "naming") as any;
+    expect(naming.options.map((leaf: any) => leaf.name)).toEqual(["rename", "namer"]);
+    expect(naming.options[0].options.map((option: any) => option.name)).toEqual(["scope", "migrate-legacy", "role-name"]);
+    expect(naming.options[0].description).toBe("Refresh/migrate names");
   });
 
-  it("restores the descriptions #150 had to delete for the 8,000-char budget", () => {
-    const naming = buildSeamAdminCommand()
-      .toJSON()
-      .options?.find((option) => option.name === "naming");
-    const rename = naming?.options?.find((option) => option.name === "rename");
-    expect(rename?.description).toBe("Refresh/migrate names");
-    expect(rename?.options?.find((o) => o.name === "scope")?.description).toBe("Rename scope");
-    expect(rename?.options?.find((o) => o.name === "migrate-legacy")?.description).toBe(
-      "Migrate legacy prefix"
-    );
+  it("committed creation and role/model changes preserve the human base", async () => {
+    const h = await namingFixture();
+    try {
+      const record = await h.create();
+      expect(h.names.get("thread")).toBe("🧬🌞🛠️1️⃣ my task");
+      h.renameThread.mockClear();
+      h.store.upsert({ ...record, configJson: JSON.stringify({ role: "analyst", model: "gpt-6-luna" }) });
+      await h.orchestrator.flushIdentityEffects();
+      expect(h.names.get("thread")).toBe("🧬🌑🔬1️⃣ my task");
+      expect(h.renameThread).toHaveBeenCalledOnce();
+      expect(h.store.get(record.id)?.namePrefix).toBe("🧬🌑🔬1️⃣");
+    } finally { await h.close(); }
   });
 
-  it("shows naming state without reapplying after core configure already ran the funnel", async () => {
-    const target = {
-      id: "discord:thread-123",
-      platform: "discord",
-      channelRef: "thread-123",
-      parentRef: "channel-456",
-    };
-    const applyThreadName = vi.fn(async () => ({ status: "renamed" }));
-    let posted: any;
-    const mock = {
-      config: { BRAND_ICON_BASE_URL: "https://icons.example/agents" },
-      store: { get: () => target },
-      applyThreadName,
-      adapter: {
-        sendPanel: async (_channel: unknown, panel: unknown) => {
-          posted = panel;
-          return { id: "card-1", channelId: "thread-123" };
-        },
-      },
-      router: {
-        getProfile: () => ({ id: "claude", displayName: "Claude" }),
-      },
-      logger: { warn: () => {} },
-      presentThreadConfigurationChange: Orchestrator.prototype.presentThreadConfigurationChange,
-    } as any;
-
-    const result = await mock.presentThreadConfigurationChange(
-      { channelRef: "caller" },
-      target,
-      {
-        ok: true,
-        applied: {
-          agent: "claude",
-          model: "claude-opus-5",
-          effort: "high",
-          role: "orch",
-          disableThreadPrefix: false,
-          fastMode: false,
-        },
-        changes: {
-          agent: { before: "agy", after: "claude", changed: true },
-          model: { before: "gemini", after: "claude-opus-5", changed: true },
-          effort: { before: "high", after: "high", changed: false },
-          role: { before: "auto", after: "orch", changed: true },
-          disableThreadPrefix: { before: "enabled", after: "enabled", changed: false },
-          fastMode: { before: "off", after: "off", changed: false },
-        },
-        sessionReset: true,
-        resetReason: "agent-switch",
-        runtimeReloaded: false,
-        threadIdentityUpdated: true,
-        warnings: [],
-      }
-    );
-
-    expect(result).toMatchObject({ confirmationPosted: true, threadIdentityUpdated: true });
-    expect(posted.authorIconURL).toBe("https://icons.example/agents/claude.webp");
-    expect(posted.files).toBeUndefined();
-    expect(applyThreadName).not.toHaveBeenCalled();
-    expect(posted.fields).toEqual(expect.arrayContaining([
-      expect.objectContaining({ name: "Agent", value: expect.stringContaining("Changed from") }),
-      expect.objectContaining({ name: "Role", value: expect.stringContaining("orch") }),
-    ]));
+  it("awaits the rename effect and acknowledges only once", async () => {
+    const h = await namingFixture({ admins: new Set(["admin"]) });
+    try {
+      await h.create();
+      h.events.length = 0;
+      const result = await h.slash("rename", { "role-name": true });
+      expect(h.events).toEqual(["defer", "rename", "edit"]);
+      expect(result.reply).not.toHaveBeenCalled();
+      expect(result.editReply).toHaveBeenCalledWith({ content: "Rebuilt as 🧬🌞🛠️1️⃣ worker." });
+    } finally { await h.close(); }
   });
 
-  it("defers channel recompaction before work and edits a failure-aware summary", async () => {
-    const events: string[] = [];
-    const reply = vi.fn(async () => { events.push("reply"); });
-    const deferReply = vi.fn(async () => { events.push("defer"); });
-    const editReply = vi.fn(async () => { events.push("edit"); });
-    const recompactChannel = vi.fn(async () => {
-      events.push("recompact");
-      expect(deferReply).toHaveBeenCalledOnce();
-      return [
-        { status: "rebuilt" },
-        { status: "renamed" },
-        { status: "unchanged" },
-        { status: "unmanaged" },
-        { status: "gone" },
-        { status: "failed" },
-      ];
-    });
-    const mock = {
-      recordFromInteraction: () => ({
-        id: "discord:thread-123",
-        platform: "discord",
-        channelRef: "thread-123",
-        parentRef: "channel-456",
-      }),
-      threadNamer: { recompactChannel },
-      config: { SEAM_CONFIG_ADMIN_USER_IDS: ADMINS },
-    } as any;
-    const interaction = {
-      user: { id: ADMIN_ID },
-      options: {
-        getString: () => "channel",
-        getBoolean: (name: string) => name === "role-name",
-      },
-      reply,
-      deferReply,
-      editReply,
-    } as any;
-
-    await (Orchestrator.prototype as any).cmdThreadRename.call(mock, interaction);
-
-    expect(events).toEqual(["defer", "recompact", "edit"]);
-    expect(reply).not.toHaveBeenCalled();
-    expect(recompactChannel).toHaveBeenCalledWith("discord", "channel-456", {
-      migrateLegacy: false,
-      roleName: true,
-    });
-    expect(editReply).toHaveBeenCalledWith({
-      content: "Recomputed 6 channel thread(s): 1 rebuilt, 1 renamed, 1 unchanged, 1 left untouched, 1 gone, 1 failed.",
-    });
+  it("publishes one final identity after coalesced writes and none after a rollback", async () => {
+    const h = await namingFixture();
+    const facts: IdentityEvent[] = [];
+    h.host.identity.register("observer", [{ event: "thread-created", handle: async fact => { facts.push(fact); } }, { event: "identity-changed", handle: async fact => { facts.push(fact); } }], { logger: {} as never, config: undefined });
+    try {
+      const original = await h.create();
+      h.store.upsert({ ...original, configJson: JSON.stringify({ role: "analyst" }) });
+      h.store.upsert({ ...original, configJson: JSON.stringify({ role: "analyst", model: "gpt-6-luna" }) });
+      await h.orchestrator.flushIdentityEffects();
+      expect(facts.map(fact => fact.type)).toEqual(["thread-created", "identity-changed"]);
+      const changed = facts[1]!;
+      expect(changed.type === "identity-changed" && changed.before.role).toBe("worker");
+      expect(changed.thread.identity).toMatchObject({ agent: "codex", model: "gpt-6-luna", role: "analyst" });
+      expect(Object.isFrozen(changed.thread.identity)).toBe(true);
+      const snapshot = h.store.get(original.id)!;
+      h.store.upsert({ ...snapshot, configJson: JSON.stringify({ role: "worker" }) });
+      await Promise.resolve();
+      h.store.upsert(snapshot);
+      await h.orchestrator.flushIdentityEffects();
+      expect(facts).toHaveLength(2);
+    } finally { await h.close(); }
   });
 
-  it("defers the single-thread rename and edits instead of replying twice", async () => {
-    const events: string[] = [];
-    const reply = vi.fn(async () => { events.push("reply"); });
-    const deferReply = vi.fn(async () => { events.push("defer"); });
-    const editReply = vi.fn(async () => { events.push("edit"); });
-    const applyThreadName = vi.fn(async () => {
-      events.push("rename");
-      expect(deferReply).toHaveBeenCalledOnce();
-      return { status: "rebuilt", name: "🤖 worker" };
-    });
-    const mock = {
-      recordFromInteraction: () => ({
-        id: "discord:thread-123",
-        platform: "discord",
-        channelRef: "thread-123",
-        parentRef: "channel-456",
-      }),
-      applyThreadName,
-      config: { SEAM_CONFIG_ADMIN_USER_IDS: ADMINS },
-    } as any;
-    const interaction = {
-      user: { id: ADMIN_ID },
-      options: {
-        getString: () => "thread",
-        getBoolean: () => true,
-      },
-      reply,
-      deferReply,
-      editReply,
-    } as any;
-
-    await (Orchestrator.prototype as any).cmdThreadRename.call(mock, interaction);
-
-    expect(events).toEqual(["defer", "rename", "edit"]);
-    expect(reply).not.toHaveBeenCalled();
-    expect(applyThreadName).toHaveBeenCalledWith(expect.any(Object), {
-      migrateLegacy: true,
-      roleName: true,
-    });
-    expect(editReply).toHaveBeenCalledWith({ content: "Rebuilt as 🤖 worker." });
-  });
-});
-
-/**
- * `/seam config rename` shipped with NO privilege check (#151): its only guards
- * were "Use inside a thread" and "This thread has no parent channel", so any
- * user who could invoke `/seam` could trigger a channel-wide destructive rename
- * — including `migrate-legacy:true` and `role-name:true`, which rebuild every
- * thread name in the channel from scratch.
- *
- * The gate matches `cmdNamerEditor`: an UNSET `SEAM_CONFIG_ADMIN_USER_IDS` is
- * opt-out, NOT deny-all (see config-admin-ids.test.ts), and the refusal happens
- * before `deferReply` so nothing is started for a refused caller.
- *
- * The leaf now lives at `/seamadmin naming rename`, whose ManageGuild default
- * permission hides it from non-admins — but that is VISIBILITY, not authorization
- * (a guild admin can grant the command to anyone), so this handler gate stays.
- */
-describe("/seamadmin naming rename admin gate (#151/#160)", () => {
-  const RENAME_REFUSAL = "Renaming threads requires a config admin.";
-
-  function harness(opts: {
-    admins?: Set<string>;
-    userId: string;
-    scope: "thread" | "channel";
-  }) {
-    const reply = vi.fn(async () => {});
-    const deferReply = vi.fn(async () => {});
-    const editReply = vi.fn(async () => {});
-    const applyThreadName = vi.fn(async () => ({ status: "renamed", name: "🤖 worker" }));
-    const recompactChannel = vi.fn(async () => [{ status: "renamed" }]);
-    const recordFromInteraction = vi.fn(() => ({
-      id: "discord:thread-123",
-      platform: "discord",
-      channelRef: "thread-123",
-      parentRef: "channel-456",
-    }));
-    const mock = {
-      recordFromInteraction,
-      applyThreadName,
-      threadNamer: { recompactChannel },
-      config: { SEAM_CONFIG_ADMIN_USER_IDS: opts.admins },
-    } as any;
-    const interaction = {
-      user: { id: opts.userId },
-      options: {
-        getString: () => opts.scope,
-        getBoolean: () => false,
-      },
-      reply,
-      deferReply,
-      editReply,
-    } as any;
-    const run = () => (Orchestrator.prototype as any).cmdThreadRename.call(mock, interaction);
-    return { run, reply, deferReply, editReply, applyThreadName, recompactChannel, recordFromInteraction };
-  }
-
-  it("refuses a non-admin ephemerally without deferring or renaming anything", async () => {
-    const h = harness({ admins: ADMINS, userId: "rando", scope: "thread" });
-    await h.run();
-
-    expect(h.reply).toHaveBeenCalledWith({
-      content: RENAME_REFUSAL,
-      flags: MessageFlags.Ephemeral,
-    });
-    expect(h.deferReply).not.toHaveBeenCalled();
-    expect(h.editReply).not.toHaveBeenCalled();
-    expect(h.applyThreadName).not.toHaveBeenCalled();
-    expect(h.recompactChannel).not.toHaveBeenCalled();
-    // Gate runs before any state is inspected, so a refused caller learns
-    // nothing about whether this thread is even a bound session.
-    expect(h.recordFromInteraction).not.toHaveBeenCalled();
+  it("keeps the exact prefix when a later session write carries an older snapshot", async () => {
+    const h = await namingFixture();
+    try {
+      const original = await h.create();
+      const next = { ...original, configJson: JSON.stringify({ role: "analyst" }) };
+      h.store.upsert(next);
+      await h.orchestrator.flushIdentityEffects();
+      h.store.upsert({ ...next, acpSessionId: "new-session" });
+      await h.orchestrator.flushIdentityEffects();
+      expect(h.store.get(original.id)?.namePrefix).toBe("🧬🌞🔬1️⃣");
+      expect(h.names.get("thread")).toBe("🧬🌞🔬1️⃣ my task");
+    } finally { await h.close(); }
   });
 
-  it("refuses a non-admin on the channel-wide scope — the destructive one", async () => {
-    const h = harness({ admins: ADMINS, userId: "rando", scope: "channel" });
-    await h.run();
-
-    expect(h.reply).toHaveBeenCalledWith({
-      content: RENAME_REFUSAL,
-      flags: MessageFlags.Ephemeral,
-    });
-    expect(h.deferReply).not.toHaveBeenCalled();
-    expect(h.recompactChannel).not.toHaveBeenCalled();
+  it("routes an old rule-editor custom id after the plugin host is recreated", async () => {
+    const first = await namingFixture();
+    const editor = await first.slash("namer");
+    const customId = editor.reply.mock.calls[0]![0].components[0].toJSON().components[0].custom_id;
+    await first.close();
+    const next = await namingFixture();
+    try {
+      const showModal = vi.fn(async () => {});
+      const replyEphemeral = vi.fn(async () => {});
+      await next.component({ customId, kind: "button", userId: "admin", channel: { id: "thread", parentId: "parent" }, showModal, replyEphemeral });
+      expect(showModal).toHaveBeenCalledOnce();
+      expect(showModal.mock.calls[0]![0].customId).toContain("seam-namer:save:admin:");
+      expect(replyEphemeral).not.toHaveBeenCalled();
+      await next.component({ customId, kind: "button", userId: "other", channel: { id: "thread", parentId: "parent" }, showModal, replyEphemeral });
+      expect(replyEphemeral).toHaveBeenCalledWith("This editor belongs to another user.");
+      await next.component({ customId: "seam-namer:edit:admin:0", kind: "button", userId: "admin", channel: { id: "thread", parentId: "parent" }, showModal, replyEphemeral });
+      expect(replyEphemeral).toHaveBeenLastCalledWith(expect.stringContaining("expired"));
+    } finally { await next.close(); }
   });
 
-  it("allows a config admin to rename this thread", async () => {
-    const h = harness({ admins: ADMINS, userId: ADMIN_ID, scope: "thread" });
-    await h.run();
-
-    expect(h.reply).not.toHaveBeenCalled();
-    expect(h.deferReply).toHaveBeenCalledOnce();
-    expect(h.applyThreadName).toHaveBeenCalledOnce();
+  it("channel recompaction uses creation order and counts deleted threads", async () => {
+    const h = await namingFixture();
+    try {
+      await h.create(); await h.create("second");
+      h.names.delete("second");
+      h.events.length = 0;
+      const result = await h.slash("rename", { scope: "channel", "role-name": true });
+      expect(h.events[0]).toBe("defer");
+      expect(result.editReply.mock.calls[0]![0].content).toContain("Recomputed 2 channel thread(s)");
+      expect(h.names.get("thread")).toBe("🧬🌞🛠️1️⃣ worker");
+    } finally { await h.close(); }
   });
 
-  it("allows a config admin to recompact the whole channel", async () => {
-    const h = harness({ admins: ADMINS, userId: ADMIN_ID, scope: "channel" });
-    await h.run();
-
-    expect(h.reply).not.toHaveBeenCalled();
-    expect(h.deferReply).toHaveBeenCalledOnce();
-    expect(h.recompactChannel).toHaveBeenCalledOnce();
+  it.each(["thread", "channel"])("refuses non-admin %s work before invoking the plugin", async scope => {
+    const h = await namingFixture({ admins: new Set(["admin"]) });
+    try {
+      await h.create(); h.renameThread.mockClear();
+      const result = await h.slash("rename", { scope, "role-name": true }, "other");
+      expect(result.reply).toHaveBeenCalledWith({ content: "This command requires a config admin.", flags: MessageFlags.Ephemeral });
+      expect(result.deferReply).not.toHaveBeenCalled();
+      expect(h.renameThread).not.toHaveBeenCalled();
+    } finally { await h.close(); }
   });
 
-  it("unset SEAM_CONFIG_ADMIN_USER_IDS stays allowed (opt-out, not deny-all)", async () => {
-    const h = harness({ admins: undefined, userId: "anyone", scope: "channel" });
-    await h.run();
+  it.each([{ locked: true }, { participant: "other" }])("applies kernel mutation gates before naming", async options => {
+    const h = await namingFixture(options);
+    try {
+      await h.create(); h.renameThread.mockClear();
+      const result = await h.slash("rename", { "role-name": true }, "other");
+      expect(result.reply).toHaveBeenCalledOnce();
+      expect(result.deferReply).not.toHaveBeenCalled();
+      expect(h.renameThread).not.toHaveBeenCalled();
+    } finally { await h.close(); }
+  });
 
-    expect(h.reply).not.toHaveBeenCalled();
-    expect(h.deferReply).toHaveBeenCalledOnce();
-    expect(h.recompactChannel).toHaveBeenCalledOnce();
+  it("works without MCP and keeps explicit rename self-scoped", async () => {
+    const h = await namingFixture();
+    try {
+      await h.create(); await h.create("second");
+      const result = await h.slash("rename", { "role-name": true });
+      expect(result.editReply).toHaveBeenCalledOnce();
+      await h.host.mcp.dispatch("rename_thread", { threadId: "thread", args: { name: "new base", thread: "second" } });
+      expect(h.names.get("thread")).toBe("🧬🌞🛠️1️⃣ new base");
+      expect(h.names.get("second")).toBe("🧬🌞🛠️2️⃣ my task");
+    } finally { await h.close(); }
   });
 });

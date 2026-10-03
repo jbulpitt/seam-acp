@@ -7,6 +7,7 @@ import {
   type ChatInputCommandInteraction,
   type RESTPostAPIApplicationCommandsJSONBody,
 } from "discord.js";
+import type { SlashRegistry } from "../../plugins/slash-registry.js";
 
 /** The everyday user + agent surface. */
 export const SEAM_COMMAND_NAME = "seam";
@@ -1112,51 +1113,6 @@ export function buildSeamAdminCommand(): SlashCommandBuilder {
       )
   );
 
-  // Thread naming (#145), lifted out of `config` by #151. `rename` is the most
-  // destructive verb in the tree — it rebuilds every thread name in a channel —
-  // and `namer` edits the symbol tables it reads from. Both keep their handler
-  // gate on SEAM_CONFIG_ADMIN_USER_IDS (#160); the command-level ManageGuild
-  // permission is defence in depth, never a replacement for it.
-  //
-  // The descriptions here are the ones #150 had to delete for budget
-  // ("Rename", "Scope", "Legacy"). Reclaiming them is part of the point.
-  cmd.addSubcommandGroup((g) =>
-    g
-      .setName("naming")
-      .setDescription("Admin-only: rebuild thread names, or edit the naming symbol tables")
-      .addSubcommand((sub) =>
-        declareAccess(sub, { kind: "mutating" })
-          .setName("rename")
-          .setDescription("Refresh/migrate names")
-          .addStringOption((o) =>
-            o
-              .setName("scope")
-              .setDescription("Rename scope")
-              .setRequired(false)
-              .addChoices(
-                { name: "thread", value: "thread" },
-                { name: "channel", value: "channel" }
-              )
-          )
-          .addBooleanOption((o) =>
-            o
-              .setName("migrate-legacy")
-              .setDescription("Migrate legacy prefix")
-              .setRequired(false)
-          )
-          .addBooleanOption((o) =>
-            o
-              .setName("role-name")
-              .setDescription("Use role as base")
-              .setRequired(false)
-          )
-      )
-      .addSubcommand((sub) =>
-        declareAccess(sub, { kind: "mutating" })
-          .setName("namer")
-          .setDescription("Edit naming rules")
-      )
-  );
 
   return cmd;
 }
@@ -1166,8 +1122,9 @@ export function buildSeamAdminCommand(): SlashCommandBuilder {
  * registration set is testable without standing up a Client or a REST call —
  * "did we actually ship /seamadmin?" is a unit test, not a boot-time surprise.
  */
-export function buildSlashRegistrationBody(): RESTPostAPIApplicationCommandsJSONBody[] {
-  return [buildSeamCommand().toJSON(), buildSeamAdminCommand().toJSON()];
+export function buildSlashRegistrationBody(plugins?: SlashRegistry): RESTPostAPIApplicationCommandsJSONBody[] {
+  const commands = [buildSeamCommand().toJSON(), buildSeamAdminCommand().toJSON()];
+  return plugins ? plugins.assemble(commands) : commands;
 }
 
 const accessLeaves = new Map<string, SlashAccessDeclaration>();

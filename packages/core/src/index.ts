@@ -90,7 +90,7 @@ import { reconcileCompletedDoneFiles } from "./core/dispatch/done-reconcile.js";
 import { bindDoneDeliveryResolver, DoneRetention } from "./core/dispatch/done-retention.js";
 import { dispatchDirs, enqueueDispatchSpec, type DispatchSpec } from "./core/dispatch/types.js";
 import { SeamTokenRegistry } from "./core/mcp/token-registry.js";
-import { SeamMcpServer } from "./core/mcp/seam-mcp-server.js";
+import { SeamMcpServer, KERNEL_MCP_TOOL_NAMES } from "./core/mcp/seam-mcp-server.js";
 import { listSiblingThreadEntries } from "./core/mcp/thread-inventory.js";
 import { ThreadSessionControlService } from "./core/thread-session-control.js";
 import { watchChannelPresets } from "./core/config-reload.js";
@@ -137,10 +137,11 @@ import { ServiceStatusCard } from "./core/service-status-card.js";
 import { planAgyIdentityMigration, readAgyHandleOwnership } from "./core/agy-identity-migration.js";
 import { PluginHost } from "./plugins/host.js";
 import { BUILTIN_PLUGINS } from "./plugins/builtins.js";
+import { buildSeamCommand, buildSeamAdminCommand } from "./platforms/discord/commands.js";
 
 async function main(): Promise<void> {
   const config = loadConfig();
-  const plugins = new PluginHost(logger);
+  const plugins = new PluginHost(logger, { slash: [buildSeamCommand().toJSON(), buildSeamAdminCommand().toJSON()], mcp: KERNEL_MCP_TOOL_NAMES });
   await plugins.loadBuiltins(BUILTIN_PLUGINS);
   const controllerInstanceId = randomUUID();
   // Thread agent/model choices are saved in the presets file; with none
@@ -717,6 +718,7 @@ async function main(): Promise<void> {
   const adapter: DiscordAdapter = new DiscordAdapter({
     config,
     logger,
+    plugins,
     slashHandler: async (interaction) => {
       await orchestrator.handleSlashInteraction(interaction);
     },
@@ -728,6 +730,7 @@ async function main(): Promise<void> {
   const orchestrator = new Orchestrator({
     logger,
     fences: plugins.fences,
+    plugins,
     config,
     adapter,
     router,
@@ -739,6 +742,7 @@ async function main(): Promise<void> {
     refreshModelIntelligence: (forceSources) => modelIntelligenceManager.refresh({ forceSources }),
   });
 
+  await orchestrator.loadPlugins();
   orchestrator.install();
 
   const choiceResults = new ChoiceResultHub({
@@ -1109,13 +1113,14 @@ async function main(): Promise<void> {
       router,
       mutation: orchestrator.getConfigMutation(),
       modelCatalog,
-      applyThreadName: (record) => orchestrator.applyThreadName(record),
+      identityCommitted: () => orchestrator.flushIdentityEffects(),
     });
     orchestrator.setSelfMigrationHandler((target, prepared) =>
       threadSessionControl.executeSelfMigration(target, prepared)
     );
     seamMcpServer = new SeamMcpServer({
       logger,
+      pluginTools: plugins.mcp,
       ...(testerBot ? { testerBot } : {}),
       ...(testDriver ? { testDriver } : {}),
       ...(runCanary
@@ -1374,17 +1379,6 @@ async function main(): Promise<void> {
       // `/seam steer now:true`. Suppresses the aborted handoff's report-back.
       interruptRedirect: (caller, to, message, fresh) =>
         orchestrator.interruptRedirect(caller, to, message, fresh),
-      renameThread: async (record, name) => {
-        if (!adapter.renameThread) {
-          return { ok: false, error: "This platform cannot rename threads." };
-        }
-        try {
-          await orchestrator.renameThreadBase(record, name);
-          return { ok: true };
-        } catch (err) {
-          return { ok: false, error: (err as Error).message };
-        }
-      },
     });
     await seamMcpServer.start();
     mcpHttpHandle = (req, res) => seamMcpServer!.handleRequest(req, res);

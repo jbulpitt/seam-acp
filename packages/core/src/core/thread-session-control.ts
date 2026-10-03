@@ -175,8 +175,8 @@ export interface ThreadSessionControlDeps {
     }): { ok: true; message: string; auditId: string } | { ok: false; error: string };
   };
   modelCatalog: Pick<ModelCatalogService, "models" | "model" | "effortChoices" | "resolve">;
-  /** Single naming funnel, injected by the Discord integration layer. */
-  applyThreadName?: (record: SessionRecord) => Promise<unknown>;
+  /** Await effects of committed identity changes without invoking a feature. */
+  identityCommitted?: () => Promise<void>;
 }
 
 /**
@@ -357,7 +357,7 @@ export class ThreadSessionControlService {
       if (!info?.sessionId) throw new Error("Fresh runtime did not report a session id.");
       const fresh = this.deps.store.get(current.id);
       if (!fresh) throw new Error("Calling session disappeared after migration.");
-      await this.deps.applyThreadName?.(fresh);
+      await this.deps.identityCommitted?.();
       return {
         ok: true,
         record: fresh,
@@ -815,7 +815,7 @@ export class ThreadSessionControlService {
     const forged = await this.forgeFreshSession(target.id);
     const sessionId = forged.runtime.getSessionInfo()?.sessionId;
     if (!sessionId) return { ok: false, error: "Fresh runtime did not report a session id." };
-    await this.deps.applyThreadName?.(forged.record);
+    await this.deps.identityCommitted?.();
     return {
       ok: true,
       sessionReset: true,
@@ -855,13 +855,8 @@ export class ThreadSessionControlService {
   }
 
   private async applyNaming(record: SessionRecord): Promise<boolean> {
-    const result = await this.deps.applyThreadName?.(record);
-    return !(
-      result &&
-      typeof result === "object" &&
-      "status" in result &&
-      (result as { status?: unknown }).status === "unmanaged"
-    );
+    await this.deps.identityCommitted?.();
+    return this.deps.store.get(record.id)?.namePrefix != null;
   }
 }
 

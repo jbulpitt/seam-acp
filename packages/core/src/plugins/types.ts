@@ -1,5 +1,9 @@
 import type { CompletedFence } from "../core/fence-stream.js";
 import type { Logger } from "../lib/logger.js";
+import type { SlashContribution } from "./slash-registry.js";
+import type { McpContribution } from "./mcp-registry.js";
+import type { ComponentContribution } from "./component-registry.js";
+import type { IdentityContribution } from "./identity-registry.js";
 
 export const PLUGIN_API_VERSION = 1;
 
@@ -36,7 +40,13 @@ export interface Plugin {
   validateConfig?(config: unknown): unknown;
   activate?(context: PluginContext): void | Promise<void>;
   dispose?(): void | Promise<void>;
-  contributions: { fences: readonly FenceContribution[] };
+  contributions: {
+    fences?: readonly FenceContribution[];
+    slash?: readonly SlashContribution[];
+    mcp?: readonly McpContribution[];
+    components?: readonly ComponentContribution[];
+    identity?: readonly IdentityContribution[];
+  };
 }
 
 export interface BuiltinPlugin {

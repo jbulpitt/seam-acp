@@ -55,6 +55,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Logger } from "../../lib/logger.js";
+import type { SlashRegistry } from "../../plugins/slash-registry.js";
+import type { ComponentRegistry } from "../../plugins/component-registry.js";
 import { isThreadDetached, mayConfigureUserIds, type Config } from "../../config.js";
 import {
   isObfuscatedChannel,
@@ -356,6 +358,7 @@ export type DiscordInteractionRoute =
   | "config-edit"
   | "choice"
   | "elicitation"
+  | "plugin-component"
   | "none";
 
 /** Command names this bot owns. #151 split the tree in two, and BOTH halves
@@ -385,7 +388,7 @@ export function classifyDiscordInteraction(interaction: {
   isStringSelectMenu?: () => boolean;
   commandName?: string;
   customId?: string;
-}): DiscordInteractionRoute {
+}, components?: ComponentRegistry): DiscordInteractionRoute {
   if (interaction.isAutocomplete?.()) {
     return isSeamCommandName(interaction.commandName) ? "autocomplete" : "none";
   }
@@ -396,6 +399,10 @@ export function classifyDiscordInteraction(interaction: {
   const isModal = interaction.isModalSubmit();
   const isSelect = interaction.isStringSelectMenu?.() === true;
   const cid = isButton || isModal || isSelect ? (interaction.customId ?? "") : "";
+  if (components && (isButton || isModal || isSelect)) {
+    if (cid.startsWith(CHOICE_CUSTOM_ID_PREFIX)) return "choice";
+    return components.classify(cid, isModal ? "modal" : isSelect ? "select" : "button") === "persistent" ? "plugin-component" : "none";
+  }
   if (
     (isButton || isModal || isSelect) &&
     (cid.startsWith("seam-cfg-edit:") ||
@@ -478,6 +485,8 @@ export function projectDiscordStatusEmbed(
  *  - send/edit messages
  */
 export class DiscordAdapter implements ChatAdapter {
+  private readonly pluginSlash?: SlashRegistry;
+  private readonly pluginComponents?: ComponentRegistry;
   readonly platform = PLATFORM;
 
   private readonly client: Client;
@@ -503,11 +512,14 @@ export class DiscordAdapter implements ChatAdapter {
     logger: Logger;
     slashHandler: SlashHandler;
     autocompleteHandler?: AutocompleteHandler;
+    plugins?: { slash: SlashRegistry; components: ComponentRegistry };
   }) {
     this.config = opts.config;
     this.logger = opts.logger.child({ adapter: PLATFORM });
     this.slashHandler = opts.slashHandler;
     this.autocompleteHandler = opts.autocompleteHandler;
+    this.pluginSlash = opts.plugins?.slash;
+    this.pluginComponents = opts.plugins?.components;
     this.client = new Client({
       intents: [
         GatewayIntentBits.Guilds,
@@ -607,7 +619,7 @@ export class DiscordAdapter implements ChatAdapter {
     const member = guild ? await guild.members.fetch(actorId).catch(() => null) : null;
     const messageId = "messageId" in spec ? spec.messageId : undefined;
     const message = messageId ? await channel.messages.fetch(messageId) : undefined;
-    const slashTypes = spec.kind === "slash" || spec.kind === "autocomplete" ? validateSlashSpec(spec, buildSlashRegistrationBody()) : undefined;
+    const slashTypes = spec.kind === "slash" || spec.kind === "autocomplete" ? validateSlashSpec(spec, buildSlashRegistrationBody(this.pluginSlash)) : undefined;
     const interaction = new SyntheticInteraction(
       spec,
       { client: this.client, channel: channel as never, user, member, ...(message ? { message } : {}) },
@@ -2465,7 +2477,7 @@ export class DiscordAdapter implements ChatAdapter {
     this.client.on(Events.InteractionCreate, (interaction) => {
       // Autocomplete is a parallel branch — checked first so it can never
       // fall through into chat-input / button / modal routing (#93).
-      switch (classifyDiscordInteraction(interaction)) {
+      switch (classifyDiscordInteraction(interaction, this.pluginComponents)) {
         case "autocomplete":
           this.handleAutocomplete(interaction as AutocompleteInteraction).catch((err) => {
             this.logger.error({ err }, "autocomplete handler crashed");
@@ -2476,6 +2488,7 @@ export class DiscordAdapter implements ChatAdapter {
             this.logger.error({ err }, "slash handler crashed");
           });
           return;
+        case "plugin-component":
         case "config-edit":
           this.handlePersistentComponent(
             interaction as ButtonInteraction | StringSelectMenuInteraction | ModalSubmitInteraction
@@ -2880,7 +2893,7 @@ export class DiscordAdapter implements ChatAdapter {
     );
     // BOTH commands, in one PUT — Discord replaces the full set, so shipping
     // only `/seam` here would silently unregister `/seamadmin` (#151).
-    const body = buildSlashRegistrationBody();
+    const body = buildSlashRegistrationBody(this.pluginSlash);
     const guildIds = this.config.DISCORD_DEV_GUILD_ID;
     if (guildIds.length > 0) {
       // Register to each listed guild — instant, and scoped to servers we

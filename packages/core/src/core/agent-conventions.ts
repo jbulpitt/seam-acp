@@ -104,6 +104,7 @@ export interface HarnessOpts {
   seamFences?: boolean;
   /** Instructions from this output path's active fence contributions. */
   fenceInstructions?: readonly string[];
+  pluginToolInstructions?: readonly string[];
   /** Current wall-clock in the user's local zone, pre-formatted by the caller
    *  (e.g. "Aug 28, 2026, 8:47 AM CDT"). Emitted as a per-turn fact so the
    *  agent reasons about time-of-day from this, not a UTC timestamp. */
@@ -152,6 +153,7 @@ export function harnessPreamble(
     );
   }
   lines.push(...(opts?.fenceInstructions ?? []).map(instruction => `• ${instruction}`));
+  if (opts?.seamMcp) lines.push(...(opts.pluginToolInstructions ?? []).map(instruction => `• ${instruction}`));
   // poll_inbox is a seam-mcp TOOL. Advertise only when both the inbox
   // preamble flag and actual MCP attachment are on.
   if (opts?.inboxAwareness && opts?.seamMcp) {

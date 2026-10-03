@@ -8,7 +8,7 @@ import {
   type AdapterChildInput,
 } from "./adapter-child-protocol.js";
 import type { SlotSpawnConfig } from "./rpc.js";
-import { SessiondClient } from "./sessiond-client.js";
+import { SessiondClient, SessiondClientError } from "./sessiond-client.js";
 import type {
   SessiondEvent,
   SessiondListSlotsResult,
@@ -163,7 +163,13 @@ export class SupervisedSlots {
       });
       // Idle subscription: rebuilds stderr and recovery records from the
       // retained log and keeps them current, without forwarding anything.
-      await this.options.client.subscribe({ slot: health.slot, afterSeq: 0 }, (event) => this.onEvent(health.slot, event));
+      try {
+        await this.options.client.subscribe({ slot: health.slot, afterSeq: 0 }, (event) => this.onEvent(health.slot, event));
+      } catch (error) {
+        if (!(error instanceof SessiondClientError) || error.code !== "slot_not_alive") throw error;
+        this.undeliverable.set(health.slot, error.message);
+        console.error(`[bridge] slot ${health.slot} disabled: ${error.message}`);
+      }
     }
     // Read output expires from the log after a few minutes, so a long turn's
     // recovery record may no longer be there. Ask each live child for it.
@@ -217,7 +223,7 @@ export class SupervisedSlots {
       // resurrecting the dead slot"). Report it undeliverable; the binding stays
       // so the dead child's exit frame can still be replayed to settle its turn.
       if (this.bindings.get(slot)?.dead) {
-        this.undeliverable.set(slot, "the slot's process has already exited");
+        if (!this.undeliverable.has(slot)) this.undeliverable.set(slot, "the slot's process has already exited");
         return false;
       }
       await this.ensure(slot);

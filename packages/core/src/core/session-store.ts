@@ -1159,7 +1159,11 @@ export class SessionStore {
   }
 
   /** Atomic before-images + narrow updates + completion marker. Boot-only. */
-  applyAgyIdentityMigration(changes: readonly AgyIdentityChange[]): boolean {
+  hasAgyIdentityMigration(id: string): boolean {
+    return !!this.db.prepare("SELECT 1 FROM agy_identity_restore WHERE id = ?").get(id);
+  }
+
+  applyAgyIdentityMigration(changes: readonly AgyIdentityChange[], { complete = true } = {}): boolean {
     return this.db.transaction(() => {
       if (this.agyIdentityRestored()) return false;
       for (const change of changes) {
@@ -1169,7 +1173,7 @@ export class SessionStore {
         this.db.prepare("UPDATE sessions SET agent_id = ?, acp_session_id = ? WHERE id = ?").run(
           change.after.agentId, change.after.acpSessionId, change.before.id);
       }
-      this.db.prepare("INSERT INTO agy_identity_restore VALUES ('@complete', '{}', '{}', 0)").run();
+      if (complete) this.db.prepare("INSERT INTO agy_identity_restore VALUES ('@complete', '{}', '{}', 0)").run();
       return true;
     })();
   }

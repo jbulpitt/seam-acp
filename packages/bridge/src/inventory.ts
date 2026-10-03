@@ -171,9 +171,6 @@ export function loadHostAdapters(
   const agyMissing = agyUnpinned && agyEnabled
     ? [
         ...(!agyDefaultModel ? [AGY_NATIVE_REQUIREMENTS[2]] : []),
-        ...(standingPin.length
-          ? [`AGY_PIN=unpinned still has ${standingPin.join(", ")}`]
-          : []),
       ]
     : [
         ...(!agyEnabled ? [AGY_NATIVE_REQUIREMENTS[0]] : []),
@@ -183,6 +180,9 @@ export function loadHostAdapters(
         ...(!agySha256 ? [AGY_NATIVE_REQUIREMENTS[4]] : []),
         ...(!agyRuntimeRoot || !path.isAbsolute(agyRuntimeRoot) ? [AGY_NATIVE_REQUIREMENTS[5]] : []),
       ];
+  if (agyUnpinned && agyEnabled && standingPin.length) {
+    console.error(`[bridge] AGY_PIN=unpinned: ignoring stale pin settings ${standingPin.join(", ")}; using ordinary agy on PATH without digest verification`);
+  }
   if (!agyExplicitlyDisabled && (agyEnabled || agyExecutableAvailable)) {
     if (agyMissing.length > 0) {
       reportUnavailable(options, {

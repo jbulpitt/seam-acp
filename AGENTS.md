@@ -226,6 +226,7 @@ Use the host's worktree tooling as described in `docs/local/`. Never park a work
 - Live help (Gemini in a voice channel): `docs/agent-guides/live-help.md`
 - Thread Voice V2: `docs/agent-guides/thread-voice.md`
 - Wake events (implementation): `docs/agent-guides/wake-events.md`
+- Plugins (contributions, built-ins, internal facades): `docs/agent-guides/plugins.md`
 - The agent primer and index of all guides: `docs/agent-guides/README.md`
 
 ## Environment variables

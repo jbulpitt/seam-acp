@@ -169,6 +169,8 @@ Load only what the task needs:
   [Thread Voice V2][thread-voice].
 - "Is the provider down, or is it us?" when agent calls start failing →
   [Upstream service status][service-status].
+- Developing Seam features as plugins, or finding where a built-in feature lives →
+  [Plugins][plugins].
 
 The onboarding files are short transport prompts for persisting these links in
 another repository; they are not competing specifications:
@@ -197,5 +199,6 @@ another repository; they are not competing specifications:
 [live-help]: https://raw.githubusercontent.com/jbulpitt/seam-acp/main/docs/agent-guides/live-help.md
 [thread-voice]: https://raw.githubusercontent.com/jbulpitt/seam-acp/main/docs/agent-guides/thread-voice.md
 [service-status]: https://raw.githubusercontent.com/jbulpitt/seam-acp/main/docs/agent-guides/service-status.md
+[plugins]: https://raw.githubusercontent.com/jbulpitt/seam-acp/main/docs/agent-guides/plugins.md
 [interactive-onboarding]: https://raw.githubusercontent.com/jbulpitt/seam-acp/main/docs/agent-guides/interactive-prompts-onboarding.md
 [live-help-onboarding]: https://raw.githubusercontent.com/jbulpitt/seam-acp/main/docs/agent-guides/live-help-onboarding.md

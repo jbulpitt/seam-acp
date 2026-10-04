@@ -384,6 +384,33 @@ AgentProfile         (Copilot today, Claude Code tomorrow — adds via `src/agen
 - **`packages/adapters/src/profiles/copilot.ts`** — spawns `copilot --acp`. Sibling profiles include `agy.ts` (native Seam Antigravity), `claude.ts`, `codex.ts`, and `grok.ts`.
 - **`src/core/`** — pure utilities: text chunker, path safety, sqlite store, session router, status panel.
 
+### Plugins
+
+Seam has a built-in plugin system (`packages/core/src/plugins/`). It moves features out of `orchestrator.ts` onto one extension model, and specialized features can use it too. A plugin declares an id, API version, `activate`/`dispose` hooks and **contributions**. Each kind of contribution has one registry, and that registry feeds registration, dispatch, help and the agent instructions together:
+
+- **Fences:** handlers for fenced output blocks (for example `latex`).
+- **Slash commands:** leaves under `/seam` or `/seamadmin`, each declaring read-only or mutating access.
+- **MCP tools:** these mount only when `SEAM_MCP_ENABLED` is on. A plugin's other contributions work either way.
+- **Components:** card buttons, selects and modals, persistent across restarts or tied to one card.
+- **Identity events and turn-activity events:** read-only facts such as `thread-created`, `identity-changed`, `turn-started` and `turn-completed`.
+- **Maintenance jobs:** background work that starts after admission and is drained on shutdown.
+- **Status-card decorators and config keys.**
+- **Plugin-scoped storage.**
+
+If a plugin fails to load, validate or activate, it logs the real cause and only that plugin is disabled; boot continues. Plugins never receive the router, the stores or the live agent connection. Built-ins that need more go through narrow internal facades.
+
+The built-in plugins today:
+- `math`
+- `thread-naming`
+- `service-status`
+- `quota`
+- `card-visuals`
+
+The core turn machinery is never a plugin: the turn pipeline, dispatch, the attempt ledger, adoption and recovery, delivery, and the bridge hub.
+
+- **Plugin API and each built-in's boundaries:** [`docs/agent-guides/plugins.md`](docs/agent-guides/plugins.md).
+- **Plan and wave status:** [#752](https://github.com/jbulpitt/seam-acp/issues/752).
+
 ## Testing
 
 ```sh

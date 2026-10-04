@@ -2235,10 +2235,10 @@ export class Orchestrator {
     const bridgeRecoveryDispatchIds = remoteRecovery
       .filter(bridgeOwnedRetryInProgress)
       .map((recovery) => recovery.attemptId);
-    // This is the exact #428 blockage, reported but not repaired here: a
-    // prompted retained attempt prevents the pending pile behind it claiming.
+    // An observed recovery is executing; successors are queued, not stalled.
     const blockedByDispatchIds = pending.length > 0
-      ? retained.filter((attempt) => attempt.promptStarted).map((attempt) => attempt.id)
+      ? retained.filter((attempt) => attempt.promptStarted
+          && !bridgeRecoveryDispatchIds.includes(attempt.id)).map((attempt) => attempt.id)
       : [];
     const progressing = queue.runtimeBusy || runningDispatchIds.length > 0
       || bridgeRecoveryDispatchIds.length > 0;
@@ -15871,6 +15871,8 @@ export class Orchestrator {
             nonce: deliveryChunkNonce(baseNonce, index),
             enforceNonce: true,
           });
+          const current = this.store.get(recoveryRecord!.id);
+          if (current) this.store.upsert({ ...current, updatedUtc: new Date().toISOString() });
         },
         {
           logger: this.logger,
@@ -16090,6 +16092,8 @@ export class Orchestrator {
             target,
             delivery ?? { kind: "message", text: body }
           );
+          const record = this.store.getByChannel(PLATFORM, target.id);
+          if (record) this.store.upsert({ ...record, updatedUtc: new Date().toISOString() });
         }
         this.store.turnAttempts.markDeliveryDone(prior.id);
       } catch (err) {

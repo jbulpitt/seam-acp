@@ -238,9 +238,12 @@ describe("AGY HOME startup sweep wiring", () => {
   it("awaits recovery before controller and both bridge startup paths can construct adapters", () => {
     const core = fs.readFileSync(path.resolve("packages/core/src/index.ts"), "utf8");
     const coreSweep = core.indexOf("const agyHomeSweep = await sweepAgyMcpHomes();");
-    const coreAgyConstruction = core.indexOf("const agyRuntime =");
     expect(coreSweep).toBeGreaterThan(-1);
-    expect(coreSweep).toBeLessThan(coreAgyConstruction);
+    for (const factory of ["makeAgyUnpinnedRuntime({", "makeAgyNativeRuntime({"]) {
+      const coreAgyConstruction = core.indexOf(factory);
+      expect(coreAgyConstruction).toBeGreaterThan(-1);
+      expect(coreSweep).toBeLessThan(coreAgyConstruction);
+    }
 
     const bridge = fs.readFileSync(path.resolve("packages/bridge/src/index.ts"), "utf8");
     for (const start of ["async function runClientMode(", "async function runServerMode("]) {

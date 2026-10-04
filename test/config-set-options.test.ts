@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { PassThrough } from "node:stream";
 import { pino } from "pino";
 import { MessageFlags } from "discord.js";
 import type { AgentProfile } from "@seam/adapters";
@@ -239,6 +240,7 @@ describe("/seam config set named parameters", () => {
   it("patches only supplied fields and preserves the resumable session", async () => {
     const { orch, router, store } = makeHarness();
     const invalidate = vi.spyOn(router, "invalidate");
+    const applyPermissions = vi.spyOn(router, "applyPermissionMode");
     const { i, edits } = interaction({
       role: "analyst",
       permissions: "deny",
@@ -260,7 +262,84 @@ describe("/seam config set named parameters", () => {
     expect(cfg.simpleCardGif).toBeUndefined();
     expect(cfg.availableTools).toEqual(["read"]);
     expect(invalidate).not.toHaveBeenCalled();
+    expect(applyPermissions).toHaveBeenCalledWith(record);
     expect(edits.at(-1)).toContain("Updated `role`, `permissions`, `card`, `gif`");
+    store.close();
+  });
+
+  it("rolls a failed live permission mode change back and shows its cause", async () => {
+    const { orch, router, store } = makeHarness();
+    vi.spyOn(router, "applyPermissionMode").mockRejectedValueOnce(new Error("session/set_mode: unsupported full access"));
+    const call = interaction({ permissions: "always" });
+    await (orch as any).cmdConfigSet(call.i);
+    expect(call.edits.at(-1)).toContain("session/set_mode: unsupported full access");
+    expect(read(store).cfg.permissionPolicy).toBe("ask");
+    store.close();
+  });
+
+  it("defers approval-policy changes before applying the live mode", async () => {
+    const { orch, router, store } = makeHarness();
+    const call = interaction({ policy: "always" });
+    vi.spyOn(router, "applyPermissionMode").mockImplementation(async record => {
+      expect(call.order).toEqual(["defer"]);
+      expect(store.readConfig(store.get(record.id)!).permissionPolicy).toBe("always");
+      call.order.push("mode");
+    });
+    await (orch as any).cmdApprove(call.i);
+    expect(call.order).toEqual(["defer", "mode", "edit"]);
+    expect(call.edits.at(-1)).toContain("Approval policy set to `always`");
+    store.close();
+  });
+
+  it("does not acknowledge a rejected approval mode as successful", async () => {
+    const { orch, router, store } = makeHarness();
+    const failure = new Error("session/set_mode: agent refusal");
+    vi.spyOn(router, "applyPermissionMode").mockRejectedValueOnce(failure);
+    const call = interaction({ policy: "always" });
+    await expect((orch as any).cmdApprove(call.i)).rejects.toBe(failure);
+    expect(call.order).toEqual(["defer"]);
+    expect(call.edits).toEqual([]);
+    store.close();
+  });
+
+  it("keeps advertised modes through adoption and rereads the live resolved policy", async () => {
+    const { orch, router, store } = makeHarness();
+    await (orch as any).cmdConfigSet(interaction({ agent: "codex@local" }).i);
+    const record = read(store).record;
+    const connection = {
+      newSession: vi.fn(async () => ({ sessionId: "s1", modes: { currentModeId: "agent", availableModes: [
+        { id: "agent", name: "Auto review" }, { id: "agent-full-access", name: "Full access" },
+      ] } })),
+      setSessionMode: vi.fn(async () => ({})),
+    };
+    const runtime = (router as any).makeRuntime(record, router.planRuntimeSpawn(record), "gpt-5.6-sol", undefined);
+    Object.assign(runtime, { connection, promptCapabilities: {} });
+    await runtime.newSession({ cwd: reposRoot });
+    expect(connection.setSessionMode).not.toHaveBeenCalled();
+    expect(read(store).cfg.codexModes).toMatchObject({ sessionId: "s1", currentModeId: "agent" });
+
+    const change = (patch: Record<string, unknown>) => {
+      const fresh = read(store);
+      const { permissionPolicy: _policy, ...cfg } = fresh.cfg;
+      store.upsert({ ...fresh.record, configJson: store.writeConfig({ ...cfg, ...patch }) });
+    };
+    change({ autoApprovePermissions: true });
+    await runtime.applyPermissionMode();
+    expect(connection.setSessionMode).toHaveBeenLastCalledWith({ sessionId: "s1", modeId: "agent-full-access" });
+    expect(read(store).cfg.codexModes?.currentModeId).toBe("agent-full-access");
+
+    const child = { stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough() };
+    const adopted = router.adoptRecoveryRuntime(read(store).record, child as any, "s1");
+    Object.assign(adopted, { connection });
+    change({ permissionPolicy: "deny", autoApprovePermissions: true });
+    await router.applyPermissionMode(record);
+    expect(connection.setSessionMode).toHaveBeenLastCalledWith({ sessionId: "s1", modeId: "agent" });
+    expect(read(store).cfg.codexModes?.currentModeId).toBe("agent");
+    expect(read(store).cfg.availableTools).toEqual(["read"]);
+    adopted.releaseRecovery();
+    child.stdout.end();
+    child.stdin.end();
+    child.stderr.end();
     store.close();
   });
 

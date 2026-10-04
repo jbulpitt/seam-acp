@@ -30,20 +30,41 @@ export function createResumeRecorder(file: string | undefined, bootstrap: Adapte
     ? { cwd: bootstrap.resume.load.cwd, mcpServers: bootstrap.resume.load.mcpServers }
     : undefined;
   let recorded: string | undefined;
+  let modeId = bootstrap.resume?.modeId;
+  const modeRequests = new Map<unknown, string | undefined>();
 
   return {
     /** Remember how the controller set the session up, from its own requests. */
     observeInput(line: string): void {
       if (!file || (!line.includes("\"initialize\"") && !line.includes("\"session/"))) return;
       try {
-        const message = JSON.parse(line) as { method?: unknown; params?: Record<string, unknown> };
+        const message = JSON.parse(line) as { id?: unknown; method?: unknown; params?: Record<string, unknown> };
         if (message.method === "initialize") initialize = message.params;
         else if (message.method === "session/new" || message.method === "session/load") {
           session = { cwd: message.params?.cwd, mcpServers: message.params?.mcpServers };
+          if (bootstrap.config.agentId === "codex") modeRequests.set(message.id, undefined);
+        } else if (bootstrap.config.agentId === "codex") {
+          const selected = message.method === "session/set_mode" ? message.params?.modeId
+            : message.method === "session/set_config_option" && message.params?.configId === "mode" ? message.params.value : undefined;
+          if (typeof selected === "string") modeRequests.set(message.id, selected);
         }
       } catch {
         // Not JSON-RPC; nothing to remember.
       }
+    },
+
+    /** Persist mode changes only after the agent accepts them. */
+    observeOutput(line: string): void {
+      if (!file || !modeRequests.size) return;
+      try {
+        const message = JSON.parse(line) as { id?: unknown; error?: unknown; result?: { modes?: { currentModeId?: string } } };
+        if (!modeRequests.has(message.id)) return;
+        const selected = modeRequests.get(message.id);
+        modeRequests.delete(message.id);
+        if (message.error) return;
+        const applied = selected ?? message.result?.modes?.currentModeId;
+        if (modeId !== applied) { modeId = applied; recorded = undefined; }
+      } catch { /* Not an ACP response. */ }
     },
 
     /** Write the record for an in-flight turn, once per submission. */
@@ -52,6 +73,7 @@ export function createResumeRecorder(file: string | undefined, bootstrap: Adapte
       const resume: AdapterChildResume = {
         initialize,
         load: { sessionId: recovery.acpSessionId, cwd: session.cwd, mcpServers: session.mcpServers ?? [] },
+        ...(modeId ? { modeId } : {}),
         recovery,
       };
       const line = adapterChildLine({ ...bootstrap, v: ADAPTER_CHILD_PROTOCOL_VERSION, resume });

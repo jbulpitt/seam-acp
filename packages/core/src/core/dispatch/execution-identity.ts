@@ -69,7 +69,7 @@ function text(value: unknown): string {
 // change. Including it would strand the very attempt that recorded the cursor.
 // `sessionCwdExplicit` only says where the cwd came from; the effective cwd is
 // compared as its own field.
-const VOLATILE_CONFIG_KEYS = new Set(["lastContextUsage", "modelAcquisition", "sessionCwdExplicit"]);
+const VOLATILE_CONFIG_KEYS = new Set(["lastContextUsage", "modelAcquisition", "sessionCwdExplicit", "codexModes"]);
 
 function configIdentity(value: unknown): string {
   if (value === null || value === undefined) return "";

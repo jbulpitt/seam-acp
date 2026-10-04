@@ -24,6 +24,8 @@ export interface AdapterChildBootstrap {
 export interface AdapterChildResume {
   initialize: unknown;
   load: { sessionId: string; cwd: unknown; mcpServers: unknown };
+  /** The acknowledged Codex mode, reapplied after load. */
+  modeId?: string;
   recovery: {
     submissionId: string;
     acpSessionId: string;

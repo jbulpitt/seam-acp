@@ -10,6 +10,7 @@ import { DEFAULT_ERROR_RULES } from "../core/error-resolution-rules.js";
 import { CONTINUE_PROMPT } from "../core/dispatch/turn-resume.js";
 import { recoveryStory } from "../core/dispatch/recovery-story.js";
 import type { ModelFallbackPlan } from "../core/model-fallback.js";
+import type { PermissionPolicyMode } from "../core/types.js";
 import {
   client,
   methods,
@@ -414,6 +415,8 @@ export class AgentRuntime {
   private readonly profile: AgentProfile;
   private readonly logger: Logger;
   private readonly permissionPolicy: PermissionPolicy;
+  private readonly permissionMode?: () => PermissionPolicyMode;
+  private readonly onSessionModes?: (info: SessionInfo) => void;
   private readonly mcpServers: McpServer[];
   private readonly onDead?: () => void;
   private readonly onCatalogRefresh?: () => void | Promise<void>;
@@ -581,6 +584,8 @@ export class AgentRuntime {
     profile: AgentProfile;
     logger: Logger;
     permissionPolicy?: PermissionPolicy;
+    permissionMode?: () => PermissionPolicyMode;
+    onSessionModes?: (info: SessionInfo) => void;
     mcpServers?: McpServer[];
     /** Model-specific transport declaration from the pinned catalog generation. */
     effortDescriptor?: CatalogEffort;
@@ -614,6 +619,8 @@ export class AgentRuntime {
     claudeCredentialFacts?: () => ClaudeCredentialFacts | undefined;
   }) {
     this.profile = opts.profile;
+    this.permissionMode = opts.permissionMode;
+    this.onSessionModes = opts.onSessionModes;
     this.logger = opts.logger.child({ agent: opts.profile.id });
     this.mcpServers = opts.mcpServers ?? [];
     this.catalogEffort = opts.effortDescriptor;
@@ -651,10 +658,12 @@ export class AgentRuntime {
   }
 
   /** Reattach the application side while the bridge retains prompt ownership. */
-  attachRecovery(child: ReturnType<AgentProfile["spawn"]>, sessionId: string): void {
+  attachRecovery(child: ReturnType<AgentProfile["spawn"]>, sessionId: string,
+    modes?: Pick<SessionInfo, "availableModes" | "currentModeId">): void {
     if (this.connection || this.child) throw new Error("runtime is already attached");
     this.child = child;
     this.sessionId = sessionId;
+    if (modes) this.sessionInfo = { sessionId, availableModels: [], ...modes };
     this.promptInFlight = true;
     this.delegatedTurn = true;
 
@@ -984,6 +993,7 @@ export class AgentRuntime {
     this.sessionId = result.sessionId;
     this.sessionConfigOptions = result.configOptions ?? [];
     this.sessionInfo = this.buildSessionInfo(result);
+    await this.applyPermissionMode();
 
     // Apply model override after session creation if requested and supported.
     const wantedModel = opts.model ?? this.profile.defaultModel;
@@ -1087,6 +1097,7 @@ export class AgentRuntime {
       availableModes: this.toAvailableModes(result.modes),
       currentModeId: this.toCurrentModeId(result.modes),
     };
+    await this.applyPermissionMode();
 
     // Re-apply model preference on resume — Claude Code sessions don't persist
     // the model choice across subprocess restarts, so it would otherwise revert
@@ -1264,6 +1275,7 @@ export class AgentRuntime {
   ): Promise<PromptOutcome> {
     const conn = this.requireConnection();
     const sid = this.requireSessionId();
+    await this.applyPermissionMode();
 
     if (this.cwdFallbackPending && this.cwdFallback) {
       this.cwdFallbackPending = false;
@@ -1794,12 +1806,31 @@ export class AgentRuntime {
     };
   }
 
+  /** Codex approvals and its sandbox are separate controls. */
+  async applyPermissionMode(): Promise<void> {
+    if (this.profile.id !== "codex" || !this.permissionMode) return;
+    const policy = this.permissionMode();
+    const info = this.sessionInfo;
+    if (!info) throw new Error(`Codex session has no advertised modes for permission policy "${policy}"`);
+    const fullAccess = info.availableModes.find(mode => mode.id === "agent-full-access");
+    if (policy === "always" && !fullAccess) {
+      throw new Error(`Codex permission policy "always" cannot be applied: session advertised no full-access mode (availableModes: ${info.availableModes.map(mode => mode.id).join(", ") || "none"})`);
+    }
+    if (policy === "always" || (fullAccess && info.currentModeId === fullAccess.id)) {
+      const selected = policy === "always" ? fullAccess : info.availableModes.find(mode => mode.id === "agent");
+      if (!selected) throw new Error(`Codex session advertised no sandboxed agent mode for permission policy "${policy}"`);
+      if (info.currentModeId !== selected.id) await this.setMode(selected.id);
+    }
+    this.onSessionModes?.(this.sessionInfo!);
+  }
+
   async setMode(modeId: string): Promise<void> {
     const conn = this.requireConnection();
     const sid = this.requireSessionId();
     await conn.setSessionMode({ sessionId: sid, modeId });
     if (this.sessionInfo) {
       this.sessionInfo = { ...this.sessionInfo, currentModeId: modeId };
+      this.onSessionModes?.(this.sessionInfo);
     }
   }
 

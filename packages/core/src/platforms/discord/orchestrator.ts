@@ -17802,6 +17802,7 @@ export class Orchestrator {
         }
       }
       this.persistConfig(record, cfg);
+      if (plan.permission !== undefined) await this.router.applyPermissionMode(record);
     }
     // #37: Fast is a session-start dimension, so a change here MUST land on a
     // fresh ACP session — the overlay alone would be resumed into the existing
@@ -21420,6 +21421,9 @@ export class Orchestrator {
       }
 
       const committed = this.store.get(record.id) ?? record;
+      if (prepared.kind === "named" && request.values.permissions !== null) {
+        await this.router.applyPermissionMode(committed);
+      }
       const effective = this.router.describeConfig(committed);
       if (prepared.kind === "named") {
         const mismatch =
@@ -21974,11 +21978,13 @@ export class Orchestrator {
       | "always"
       | "ask"
       | "deny";
+    await i.deferReply({ flags: MessageFlags.Ephemeral });
     const cfg = this.store.readConfig(record);
     cfg.permissionPolicy = policy;
     // Drop the deprecated field so it can never override the new value.
     delete cfg.autoApprovePermissions;
     this.persistConfig(record, cfg);
+    await this.router.applyPermissionMode(record);
     const messages: Record<typeof policy, string> = {
       always:
         "Approval policy set to `always`. ⚠️ The agent will auto-approve every permission request (shell exec, file writes, network, etc.).",
@@ -21987,7 +21993,7 @@ export class Orchestrator {
       deny:
         "Approval policy set to `deny`. The agent will be auto-denied every permission request — useful for read-only sessions.",
     };
-    await i.reply({ content: messages[policy], flags: MessageFlags.Ephemeral });
+    await i.editReply(messages[policy]);
   }
 
   /**

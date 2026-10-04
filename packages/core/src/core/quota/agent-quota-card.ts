@@ -1,19 +1,16 @@
 import fs from "node:fs";
-import path from "node:path";
 import type { Logger } from "../../lib/logger.js";
 import type { ChatAdapter, MessageRef } from "../../platforms/chat-adapter.js";
 import type { LayoutBlock, PanelButton, StructuredLayout, StructuredPanel } from "../types.js";
 import type { AgentQuota, QuotaWindow } from "./agent-quota.js";
 
-const STATE_FILE = "agent-quota-card.json";
 const DEBOUNCE_MS = 500;
 const COLOR_OK = 0x57f287;
 const COLOR_WARN = 0xfaa61a;
 const HIDDEN_AGENT_IDS = new Set(["claude-vertex"]);
 export const AGENT_QUOTA_BUMP_AFTER_MS = 20 * 60 * 60_000;
 
-/** Custom id for the manual "Refresh" button; routed to the orchestrator's
- *  quota-card component handler, which force-refreshes every agent now. */
+/** The quota plugin routes this persistent Refresh control. */
 export const QUOTA_REFRESH_CUSTOM_ID = "seam-quota:refresh";
 const REFRESH_ACTIONS: PanelButton[][] = [
   [{ customId: QUOTA_REFRESH_CUSTOM_ID, label: "Refresh", style: "secondary", emoji: "🔄" }],
@@ -144,34 +141,36 @@ export function renderAgentQuotaPanel(
   };
 }
 
+export type AgentQuotaCardTransport = Pick<ChatAdapter, "sendLayout" | "editLayout" | "sendPanel" | "editPanel" | "pinMessage" | "deleteMessage" | "bumpThread">;
+
 export class AgentQuotaCard {
   private readonly logger: Logger;
-  private readonly adapter: ChatAdapter;
+  private readonly adapter: AgentQuotaCardTransport;
   private readonly threadId: string;
-  private readonly dataDir: string;
+  private readonly stateFile: string;
   private readonly collect: () => AgentQuota[];
   private readonly now: () => number;
   private readonly channel = { platform: "discord", id: "" };
   private message?: MessageRef;
   private debounce?: ReturnType<typeof setTimeout>;
-  private inFlight = false;
+  private pending?: Promise<void>;
   private dirty = false;
   private stopped = false;
   private pinned = false;
   private lastBumpAt = 0;
 
   constructor(opts: {
-    logger: Logger;
-    adapter: ChatAdapter;
+    logger: Pick<Logger, "child">;
+    adapter: AgentQuotaCardTransport;
     threadId: string;
-    dataDir: string;
+    stateFile: string;
     collect: () => AgentQuota[];
     now?: () => number;
   }) {
     this.logger = opts.logger.child({ comp: "agent-quota-card" });
     this.adapter = opts.adapter;
     this.threadId = opts.threadId;
-    this.dataDir = opts.dataDir;
+    this.stateFile = opts.stateFile;
     this.collect = opts.collect;
     this.now = opts.now ?? Date.now;
     this.channel.id = opts.threadId;
@@ -189,6 +188,8 @@ export class AgentQuotaCard {
     this.debounce = undefined;
   }
 
+  async drain(): Promise<void> { await this.pending; }
+
   poke(): void {
     if (this.stopped) return;
     if (this.debounce) clearTimeout(this.debounce);
@@ -199,24 +200,20 @@ export class AgentQuotaCard {
     this.debounce.unref?.();
   }
 
-  async tick(): Promise<void> {
-    if (this.stopped) return;
-    if (this.inFlight) {
+  tick(): Promise<void> {
+    if (this.stopped) return Promise.resolve();
+    if (this.pending) {
       this.dirty = true;
-      return;
+      return this.pending;
     }
-    this.inFlight = true;
-    try {
-      await this.push();
-    } catch (err) {
-      this.logger.warn({ err }, "agent quota card refresh failed");
-    } finally {
-      this.inFlight = false;
-      if (this.dirty) {
+    this.pending = (async () => {
+      do {
         this.dirty = false;
-        void this.tick();
-      }
-    }
+        try { await this.push(); }
+        catch (err) { this.logger.warn({ err }, "agent quota card refresh failed"); }
+      } while (this.dirty && !this.stopped);
+    })().finally(() => { this.pending = undefined; });
+    return this.pending;
   }
 
   private async push(): Promise<void> {
@@ -300,13 +297,9 @@ export class AgentQuotaCard {
     this.persist();
   }
 
-  private statePath(): string {
-    return path.join(this.dataDir, STATE_FILE);
-  }
-
   private loadState(): void {
     try {
-      const parsed = JSON.parse(fs.readFileSync(this.statePath(), "utf8")) as Partial<Persisted>;
+      const parsed = JSON.parse(fs.readFileSync(this.stateFile, "utf8")) as Partial<Persisted>;
       if (parsed.threadId !== this.threadId || !parsed.messageId) return;
       this.message = { channel: this.channel, id: parsed.messageId };
       this.lastBumpAt =
@@ -324,7 +317,7 @@ export class AgentQuotaCard {
         messageId: this.message.id,
         lastBumpAt: this.lastBumpAt,
       };
-      fs.writeFileSync(this.statePath(), JSON.stringify(body));
+      fs.writeFileSync(this.stateFile, JSON.stringify(body));
     } catch (err) {
       this.logger.warn({ err }, "failed to persist agent quota card state");
     }

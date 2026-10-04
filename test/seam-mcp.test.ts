@@ -185,7 +185,7 @@ async function makeHarness(opts?: {
   rebuildThread?: SeamMcpServerDeps["rebuildThread"];
   resetThreadSession?: SeamMcpServerDeps["resetThreadSession"];
   prepareSelfMigration?: SeamMcpServerDeps["prepareSelfMigration"];
-  getAgentQuotas?: SeamMcpServerDeps["getAgentQuotas"];
+  getAgentQuotas?: (agentId?: string) => import("../packages/core/src/core/quota/agent-quota.js").AgentQuota[];
   inspectImage?: SeamMcpServerDeps["inspectImage"];
   scheduleWake?: SeamMcpServerDeps["scheduleWake"];
   cancelWake?: SeamMcpServerDeps["cancelWake"];
@@ -228,6 +228,11 @@ async function makeHarness(opts?: {
   const interrupts: Harness["interrupts"] = [];
   const renames: Harness["renames"] = [];
   const plugins = new PluginHost(silent);
+  const { quotaMcp } = await import("../packages/core/src/plugins/quota/mcp.js");
+  const { QuotaRegistry } = await import("../packages/core/src/core/quota/quota-registry.js");
+  const quotas = new QuotaRegistry();
+  for (const quota of opts?.getAgentQuotas?.() ?? []) quotas.set(quota);
+  await plugins.loadBuiltins([{ id: "quota", load: async () => ({ id: "quota", builtin: true, apiVersion: 1, contributions: { mcp: quotaMcp(quotas) } }) }]);
   if (!opts?.disableRename) {
     const record = makeRecord({ parentRef: "chan-1" });
     const naming = createThreadNamingPlugin({ threads: {
@@ -305,7 +310,6 @@ async function makeHarness(opts?: {
     ...(opts?.rebuildThread ? { rebuildThread: opts.rebuildThread } : {}),
     ...(opts?.resetThreadSession ? { resetThreadSession: opts.resetThreadSession } : {}),
     ...(opts?.prepareSelfMigration ? { prepareSelfMigration: opts.prepareSelfMigration } : {}),
-    ...(opts?.getAgentQuotas ? { getAgentQuotas: opts.getAgentQuotas } : {}),
     ...(opts?.inspectImage ? { inspectImage: opts.inspectImage } : {}),
     ...(opts?.isChannelLocked ? { isChannelLocked: opts.isChannelLocked } : {}),
     ...(opts?.configAdminUserIds ? { configAdminUserIds: opts.configAdminUserIds } : {}),
@@ -421,7 +425,6 @@ describe("SeamMcpServer", () => {
     const { body } = await h.call("tools/list");
     const names = body.result.tools.map((t: { name: string }) => t.name).sort();
     expect(names).toEqual([
-      "agent_quota",
       "canary_run",
       "cancel_choice",
       "cancel_ingest",
@@ -1258,11 +1261,11 @@ describe("SeamMcpServer", () => {
       { "X-Seam-Session": "good-token" }
     );
     const allQuotas = JSON.parse(all.body.result.content[0].text);
-    expect(allQuotas).toEqual(quotas);
+    expect(allQuotas).toEqual([...quotas].sort((a, b) => a.displayName.localeCompare(b.displayName)));
     expect(allQuotas.map((quota: { agentId: string }) => quota.agentId)).toEqual([
       "claude",
-      "codex",
       "claude-vertex",
+      "codex",
       "grok",
     ]);
     const one = await h.call(

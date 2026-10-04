@@ -130,7 +130,7 @@ export interface LegacyIdentityContext {
   acpSessionId: string | null | undefined;
 }
 
-function parse(raw: string): ExecutionIdentity | null {
+export function parseExecutionIdentity(raw: string): ExecutionIdentity | null {
   try {
     const value = JSON.parse(raw) as Partial<ExecutionIdentity>;
     if (!value || typeof value !== "object" || value.version !== 2) return null;
@@ -166,8 +166,8 @@ export function compareExecutionIdentity(
   current: string,
   legacyContext?: LegacyIdentityContext,
 ): IdentityComparison {
-  const before = parse(stored);
-  const after = parse(current);
+  const before = parseExecutionIdentity(stored);
+  const after = parseExecutionIdentity(current);
   if (!before) {
     if (legacyContext?.promptStarted && legacyContext.acpSessionId) {
       return { match: true, legacy: true };

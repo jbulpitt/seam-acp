@@ -256,6 +256,26 @@ function expectJob(results: ChoiceResultHub, dispatchId: string, schema: unknown
 }
 
 describe("#224 live-thread ingest dispatch", () => {
+  it("emits one ordered pair of kernel activity facts without awaiting its observer", async () => {
+    const spec = planEndpointDispatch({ endpoint: endpoint(), payload: "activity facts" });
+    const { orch } = makeOrch(dataDir, store);
+    const events: Array<{ type: string; turnId: string; binding: { sessionId?: string; agentId: string; account: string | null } }> = [];
+    let release!: () => void;
+    const blocked = new Promise<void>(resolve => { release = resolve; });
+    const activity = (orch as any).plugins.turnActivity;
+    activity.register("observer", [
+      { event: "turn-started", handle: async event => { events.push(event); await blocked; } },
+      { event: "turn-completed", handle: async event => { events.push(event); } },
+    ], { logger: silent, config: undefined });
+    const out = await orch.dispatchInjectTurn(spec);
+    expect(out.output).toContain("answered in-thread");
+    expect(events.map(event => event.type)).toEqual(["turn-started"]);
+    release(); await activity.drain();
+    expect(events.map(event => event.type)).toEqual(["turn-started", "turn-completed"]);
+    expect(events.map(event => event.turnId)).toEqual([spec.id, spec.id]);
+    expect(events[0]?.binding).toMatchObject({ agentId: "claude", account: "claude", sessionId: `discord:${THREAD}` });
+  });
+
   // #509: ingest owns an HTTP result, not a Discord nonce; deleting settlement leaks both live and isolated receipts.
   it.each([true, false])("settles ingest disposition (live=%s) without inventing Discord delivery", async (live) => {
     const job = planEndpointDispatch({ endpoint: endpoint({ thread: live ? THREAD : null }), payload: "synthetic" });
@@ -661,10 +681,9 @@ describe("#246 isolated ingest owns every terminal transition", () => {
     let revocations = 0;
     let quotaCompletions = 0;
     (first as any).router.revokeMcpSession = () => { revocations++; };
-    (first as any).quotaPoller = {
-      recordTurnStart: () => {},
-      turnCompleted: async () => { quotaCompletions++; },
-    };
+    (first as any).plugins.turnActivity.register("observer", [
+      { event: "turn-completed", handle: async () => { quotaCompletions++; } },
+    ], { logger: silent, config: undefined });
     (first as any).injectTurn = async (
       _target: unknown,
       _prompt: string,
@@ -815,10 +834,9 @@ describe("#246 isolated ingest owns every terminal transition", () => {
     let preflightQuotaStarts = 0;
     let preflightQuotaCompletions = 0;
     (broken.orch as any).router.revokeMcpSession = () => { preflightRevocations++; };
-    (broken.orch as any).quotaPoller = {
-      recordTurnStart: () => { preflightQuotaStarts++; },
-      turnCompleted: async () => { preflightQuotaCompletions++; },
-    };
+    (broken.orch as any).plugins.turnActivity.register("observer", [{ event: "turn-started", handle: async () => { preflightQuotaStarts++; } },
+      { event: "turn-completed", handle: async () => { preflightQuotaCompletions++; } },
+    ], { logger: silent, config: undefined });
     const failedWatcher = new DispatchWatcher({ attempts: store.turnAttempts,
       dataDir,
       logger: silent,
@@ -876,8 +894,8 @@ describe("#246 isolated ingest owns every terminal transition", () => {
         status: "failed",
       });
       expect(preflightRevocations).toBe(1);
-      expect(preflightQuotaStarts).toBe(1);
-      expect(preflightQuotaCompletions).toBe(1);
+      expect(preflightQuotaStarts).toBe(0);
+      expect(preflightQuotaCompletions).toBe(0);
 
       // Same durable endpoint, no replay of the first input: a fresh synthetic
       // POST completes after catalog readiness is restored.
@@ -976,10 +994,9 @@ describe("#246 isolated ingest owns every terminal transition", () => {
       expect(id).toBe(spec.id);
       revocations++;
     };
-    (orch as any).quotaPoller = {
-      recordTurnStart: () => { quotaStarts++; },
-      turnCompleted: async () => { quotaCompletions++; },
-    };
+    (orch as any).plugins.turnActivity.register("observer", [{ event: "turn-started", handle: async () => { quotaStarts++; } },
+      { event: "turn-completed", handle: async () => { quotaCompletions++; } },
+    ], { logger: silent, config: undefined });
     (orch as any).injectTurn = run;
 
     await expect(orch.dispatchInjectTurn(spec)).rejects.toThrow(error);
@@ -991,8 +1008,8 @@ describe("#246 isolated ingest owns every terminal transition", () => {
     expect(store.getDelegation(spec.id)?.status).toBe(ledger);
     expect(orch.resolveIngestJob(spec.id)).toBeUndefined();
     expect(revocations).toBe(1);
-    expect(quotaStarts).toBe(1);
-    expect(quotaCompletions).toBe(1);
+    expect(quotaStarts).toBe(0);
+    expect(quotaCompletions).toBe(0);
   });
 
   it("preserves a submitted success when later token cleanup fails", async () => {

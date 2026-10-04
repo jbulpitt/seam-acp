@@ -35,7 +35,7 @@ const source: AgentQuotaSource = {
 describe("quota refresh failure diagnostics", () => {
   afterEach(() => vi.unstubAllEnvs());
 
-  it("logs the actual exception safely while keeping the card error stable", async () => {
+  it("surfaces the sanitized real cause in the card and journal", async () => {
     vi.stubEnv("SEAM_QUOTA_TEST_SECRET", "operator-secret-765");
     const logs: Array<{ msg: string; error: { name: string; code?: string; message: string } }> = [];
     const logger = pino({ level: "warn" }, { write: (line: string) => { logs.push(JSON.parse(line)); } }) as unknown as Logger;
@@ -51,7 +51,9 @@ describe("quota refresh failure diagnostics", () => {
     });
 
     const result = await poller.refreshAll(true);
-    expect(result.sources[0]?.quota.error).toBe("Quota refresh failed");
+    expect(result.sources[0]?.quota.error).toContain("RetrieveUserQuotaSummary HTTP 401 (unauthenticated) missing CSRF token");
+    expect(JSON.stringify(result)).not.toContain("operator-secret-765");
+    expect(JSON.stringify(result)).not.toContain("quoted-secret");
     expect(logs).toHaveLength(1);
     expect(logs[0]).toMatchObject({
       msg: "agent quota refresh failed",

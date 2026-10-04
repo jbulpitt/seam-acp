@@ -6,6 +6,7 @@ import type { ComponentContribution } from "./component-registry.js";
 import type { IdentityContribution } from "./identity-registry.js";
 import type { PluginStorage } from "./storage.js";
 import type { JobContribution } from "./job-registry.js";
+import type { TurnActivityContribution } from "./turn-activity-registry.js";
 
 export const PLUGIN_API_VERSION = 1;
 
@@ -50,6 +51,7 @@ export interface Plugin {
     components?: readonly ComponentContribution[];
     identity?: readonly IdentityContribution[];
     jobs?: readonly JobContribution[];
+    turnActivity?: readonly TurnActivityContribution[];
   };
 }
 

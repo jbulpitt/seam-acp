@@ -44,7 +44,6 @@ import type { ConfigDescription } from "../session-router.js";
 import type { ConfigMutationInput } from "../config-mutation.js";
 import { isRestrictedParticipant, PARTICIPANT_CONFIG_REFUSAL } from "../../config.js";
 import { formatHostPrefixed, parseDispatchWorker } from "../location.js";
-import type { AgentQuota } from "../quota/agent-quota.js";
 import type {
   ConfigureThreadInput,
   ConfigureThreadOutcome,
@@ -252,8 +251,6 @@ export interface SeamMcpServerDeps {
     caller: SessionRecord,
     input: MigrateSelfInput
   ) => Promise<PrepareSelfMigrationOutcome>;
-  /** Read normalized quota headroom for one configured agent or all agents. */
-  getAgentQuotas?: (agentId?: string) => AgentQuota[];
   /** Read the latest durable Copilot value snapshot. Never performs live I/O. */
   getModelValueRankings?: (options: {
     tier?: string;
@@ -832,23 +829,6 @@ const TOOLS = [
         },
       },
       required: ["manifest"],
-    },
-  },
-  {
-    name: "agent_quota",
-    description:
-      "Read normalized rolling and weekly quota for one configured agent or all agents. " +
-      "Orchestration models use this to pick workers with headroom and steer handoffs away " +
-      "from agents nearing a rolling or weekly cap.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        agentId: {
-          type: "string",
-          description: "Optional configured agent id. Omit to return every agent.",
-        },
-      },
-      required: [],
     },
   },
   {
@@ -1815,8 +1795,6 @@ const INSTRUCTIONS = [
   "  HERE for same-channel coordination; `busy` tells you",
   "  HOW to reach a teammate: busy ⇒ prefer send (pull-only, won't interrupt); idle ⇒ handoff/forward land",
   "  a turn cleanly. The entry marked isSelf is YOUR OWN thread — never hand off to it.",
-  "- agent_quota(agentId?): read normalized rolling + weekly quota for one agent or all agents",
-  "  before choosing workers; steer away from agents nearing a cap.",
   "- model_metadata_get(idOrSlug): read one model's cached metadata by id or provider slug.",
   "- model_metadata_query(filters?, sort?, limit?): query cached metadata across configured agents.",
   "- model_value_rankings(tier?, benchmark?): read cached Copilot value rankings by capability tier;",
@@ -2171,8 +2149,6 @@ export class SeamMcpServer {
           return rpcResult(id, await this.toolResetThreadSession(record, args));
         case "migrate_self":
           return rpcResult(id, await this.toolMigrateSelf(record, args));
-        case "agent_quota":
-          return rpcResult(id, this.toolAgentQuota(args));
         case "model_metadata_get":
           return rpcResult(id, this.toolModelMetadataGet(args));
         case "model_metadata_query":
@@ -3077,18 +3053,6 @@ export class SeamMcpServer {
     return textResult(lines.join("\n"));
   }
 
-  /** Read-only, bot-wide quota registry. Available to every authenticated agent. */
-  private toolAgentQuota(args: Record<string, unknown>): McpToolResult {
-    if (!this.deps.getAgentQuotas) {
-      return textResult("Agent quota data is not supported on this deployment.", true);
-    }
-    const agentId = optionalString(args, "agentId");
-    const quotas = this.deps.getAgentQuotas(agentId);
-    if (agentId && quotas.length === 0) {
-      return textResult(`Unknown configured agent: "${agentId}".`, true);
-    }
-    return textResult(JSON.stringify(quotas, null, 2));
-  }
 
   /** Fast cache-only one-model metadata lookup. */
   private toolModelMetadataGet(args: Record<string, unknown>): McpToolResult {

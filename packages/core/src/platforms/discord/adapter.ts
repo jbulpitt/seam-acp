@@ -401,8 +401,7 @@ export function classifyDiscordInteraction(interaction: {
     (isButton || isModal || isSelect) &&
     (cid.startsWith("seam-cfg-edit:") ||
       cid.startsWith("seam-tts:") ||
-      cid.startsWith("tvc:") ||
-      cid.startsWith("seam-quota:"))
+      cid.startsWith("tvc:"))
   ) {
     return "config-edit";
   }

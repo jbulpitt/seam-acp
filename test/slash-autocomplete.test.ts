@@ -139,6 +139,8 @@ function makeOrch(over?: {
     describeConfig: (record: SessionRecord) => ({
       agent: { value: record.agentId },
       model: { value: "grok-4" },
+      role: { value: null },
+      disableThreadPrefix: { value: false },
       location: { value: "local" },
     }),
     ensureSessionRecord: (opts: {

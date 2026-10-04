@@ -514,14 +514,9 @@ import {
 } from "../../core/audio/voice-replies.js";
 import { ATTACH_FENCE_LANG, WAKE_FENCE_LANG, WATCH_FENCE_LANG, CHOICE_FENCE_LANG, RESULT_FENCE_LANG, sanitizeSpeakerName, sessionHasSeamMcp, withHarnessPreamble } from "../../core/agent-conventions.js";
 
-import {
-  ThreadNamer,
-  ThreadNamerConfigStore,
-  type ApplyThreadNameOptions,
-  type ApplyThreadNameResult,
-  formatThreadNamerRules,
-  parseThreadNamerRules,
-} from "./thread-namer.js";
+import { PluginHost } from "../../plugins/host.js";
+import { installThreadNaming } from "../../core/thread-identity.js";
+import type { SlashInvocation } from "../../plugins/slash-registry.js";
 import {
   CHOICE_CUSTOM_TEXT_MAX,
   choiceAuthoringRules,
@@ -1026,8 +1021,8 @@ export class Orchestrator {
   /** Conversational config mutation engine (#58 P2/P3). Platform-agnostic; the
    *  orchestrator adds the Discord confirm card + apply/restart wiring. */
   private readonly configMutation: ConfigMutationService;
-  private readonly threadNamerConfig: ThreadNamerConfigStore;
-  private readonly threadNamer: ThreadNamer;
+  private readonly plugins: PluginHost;
+  private readonly identityEffects: ReturnType<typeof installThreadNaming>;
   /** #179: private hand-off for results whose card died before showing them. */
   private readonly cardResults: CardResultVault;
   private readonly elicitations: ElicitationManager;
@@ -1184,6 +1179,7 @@ export class Orchestrator {
     store: SessionStore;
     renderer: Renderer;
     fences?: FenceRegistry;
+    plugins?: PluginHost;
     quotaPoller?: AgentQuotaPoller;
     modelCatalog: ModelCatalogService;
     agyRuntime?: AgyLaunchRuntime;
@@ -1205,10 +1201,9 @@ export class Orchestrator {
     this.agyRuntime = opts.agyRuntime;
     this.refreshModelIntelligence = opts.refreshModelIntelligence;
     this.restartProcess = opts.restartProcess ?? restartSeamAcpProcess;
-    this.threadNamerConfig = new ThreadNamerConfigStore(
-      path.join(this.config.DATA_DIR, "thread-namer.json"),
-      this.logger
-    );
+    this.plugins = opts.plugins ?? new PluginHost(this.logger);
+    this.registerKernelComponents();
+    this.identityEffects = installThreadNaming({ config: this.config, store: this.store, router: this.router, adapter: this.adapter, logger: this.logger, plugins: this.plugins });
     this.cardResults = new CardResultVault(this.config.DATA_DIR, this.logger);
     this.elicitations = new ElicitationManager({
       store: this.store,
@@ -1236,26 +1231,6 @@ export class Orchestrator {
         await this.elicitations.cancelForSession(record.id, reason, detail);
       },
     });
-    this.threadNamer = new ThreadNamer({
-      getConfig: () => this.threadNamerConfig.get(),
-      describeConfig: (record) => this.router.describeConfig(record),
-      listSessionsByParent: (platform, parentRef) =>
-        this.store.listSessionsByParentInCreationOrder(platform, parentRef),
-      getThreadName: async (threadId) =>
-        (await this.adapter.getThreadName?.({ platform: PLATFORM, id: threadId })) ?? null,
-      getThreadLiveState: async (threadId) => {
-        if (!this.adapter.getThreadLiveState) {
-          throw new Error("thread liveness check is unavailable");
-        }
-        return this.adapter.getThreadLiveState({ platform: PLATFORM, id: threadId });
-      },
-      renameThread: async (threadId, name) => {
-        if (!this.adapter.renameThread) return;
-        await this.adapter.renameThread({ platform: PLATFORM, id: threadId }, name);
-      },
-      setNamePrefix: (sessionId, prefix) => this.store.setNamePrefix(sessionId, prefix),
-      logger: this.logger,
-    });
 
     // #58 P2/P3: the mutation engine reuses the router's precedence resolver
     // (describeConfig) and the operational catalog, and hot-reloads the LIVE preset maps
@@ -1271,8 +1246,9 @@ export class Orchestrator {
       ollamaCloudEnabled: this.config.OLLAMA_CLOUD_ENABLED,
       presetsFile: this.config.CHANNEL_PRESETS_FILE,
       tierCEnabled: this.config.SEAM_CONFIG_MUTATION_TIER_C_ENABLED,
-      reloadPresets: () =>
-        reloadChannelPresets(
+      reloadPresets: () => {
+        const before = new Map(this.config.channelPresets);
+        const result = reloadChannelPresets(
           {
             channelPresets: this.config.channelPresets,
             threadPresets: this.config.threadPresets,
@@ -1280,7 +1256,13 @@ export class Orchestrator {
           },
           this.config.CHANNEL_PRESETS_FILE,
           this.logger
-        ),
+        );
+        if (result.ok) this.identityEffects.presetsCommitted(new Set(
+          [...new Set([...before.keys(), ...this.config.channelPresets.keys()])]
+            .filter(id => JSON.stringify(before.get(id)) !== JSON.stringify(this.config.channelPresets.get(id)))
+        ));
+        return result;
+      },
       // #69 Tier D: (re)arm the manager's croner timer after a schedule write, so
       // the row and the live timer never diverge. `scheduledManager` is set by
       // index.ts after construction; the `?.` guards the pre-wire window.
@@ -1307,27 +1289,10 @@ export class Orchestrator {
     this.wireSlashAutocomplete();
   }
 
-  /** Single public naming funnel used by local commands and cross-thread control. */
-  async applyThreadName(
-    record: SessionRecord,
-    options: ApplyThreadNameOptions = {}
-  ): Promise<ApplyThreadNameResult> {
-    try {
-      return await this.threadNamer.applyThreadName(record, options);
-    } catch (err) {
-      this.logger.warn({ err, threadId: record.channelRef }, "thread namer apply failed");
-      return { status: "unchanged" };
-    }
-  }
+  /** Wait for the effects of committed identity changes. */
+  async flushIdentityEffects(sessionId?: string): Promise<void> { await this.identityEffects.flush(sessionId); }
 
-  async renameThreadBase(record: SessionRecord, base: string): Promise<ApplyThreadNameResult> {
-    try {
-      return await this.threadNamer.renameBase(record, base);
-    } catch (err) {
-      this.logger.warn({ err, threadId: record.channelRef }, "thread namer rename failed");
-      return { status: "unchanged" };
-    }
-  }
+  async loadPlugins(): Promise<void> { await this.identityEffects.ready; }
 
   /**
    * Bounded slash autocomplete responders (#slash-autocomplete). Registered
@@ -1784,6 +1749,9 @@ export class Orchestrator {
         const group = interaction.options.getSubcommandGroup(false);
         const sub = interaction.options.getSubcommand(false);
         const focused = interaction.options.getFocused(true);
+        const pluginContext = this.autocompleteContext(interaction, group, sub, focused.name, String(focused.value ?? ""));
+        const pluginResponder = this.plugins.slash.autocomplete(interaction.commandName ?? "seam", pluginContext);
+        if (pluginResponder) return pluginResponder(pluginContext);
         const responder = this.autocomplete.get(group, sub, focused.name);
         if (!responder) return [];
         return responder(
@@ -1927,12 +1895,7 @@ export class Orchestrator {
             this.logger.warn({ err, session: record.id }, "invalidate after config apply failed")
           );
         }
-        const namingRecord = this.store.get(record.id) ?? record;
-        if (proposal.tier === "channel-preset" && namingRecord.parentRef) {
-          await this.threadNamer.recompactChannel(PLATFORM, namingRecord.parentRef);
-        } else if (proposal.tier === "session" || proposal.tier === "thread-preset") {
-          await this.applyThreadName(namingRecord);
-        }
+        await this.identityEffects.flush(record.id);
         await this.adapter
           .sendMessage({ platform: PLATFORM, id: record.channelRef }, `✅ ${result.message}`)
           .catch(() => {});
@@ -1956,6 +1919,18 @@ export class Orchestrator {
     };
   }
 
+  private registerKernelComponents(): void {
+    const context = Object.freeze({ logger: this.logger, config: undefined });
+    this.plugins.components.register("kernel", [
+      ["seam-elicit:", (evt: ComponentEvent) => this.elicitations.handleComponent(evt)],
+      ["seam-cfg-edit:", (evt: ComponentEvent) => this.handleConfigEditorComponent(evt)],
+      ["seam-tts:", (evt: ComponentEvent) => this.handleTtsEditorComponent(evt)],
+      ["tvc:", (evt: ComponentEvent) => this.runVoiceConsoleComponent(evt)],
+      ["seam-quota:", (evt: ComponentEvent) => this.handleQuotaCardComponent(evt)],
+      ["seam-service-status:", (evt: ComponentEvent) => this.handleServiceStatusCardComponent(evt)],
+    ].map(([namespace, handle]) => ({ namespace: namespace as string, handle: handle as (evt: ComponentEvent) => Promise<void>, types: ["button", "select", "modal"] as const, lifetime: "persistent" as const, access: "read-only" as const, authorization: "user" as const })), context);
+  }
+
   install(): void {
     this.adapter.onMessage((msg) =>
       this.runInbound(
@@ -1970,59 +1945,24 @@ export class Orchestrator {
       )
     );
     this.adapter.onComponent?.((evt) => {
-      // #174: one gate AND one tracking point for every component handler
-      // (config editor, TTS editor, Voice Console, quota card). They all do
-      // store-backed work, and each was previously fire-and-forget — `void`
-      // with no handle — so nothing could wait for them. Awaiting them here
-      // puts them in `inboundWork`, which the shutdown barrier drains.
-      // `handlePersistentComponent` reaches these through `componentHandler`,
-      // so this wrapper covers it too.
-      // Returned, not `void`-ed: `handlePersistentComponent` awaits this and
-      // its event boundary logs a crash, so a failure that gets past the
-      // per-handler catches below is still reported rather than becoming an
-      // unhandled rejection.
+      // Admission and shutdown tracking cover every persistent contribution.
       return this.runInbound(
         "component",
         async () => {
-          // Named handlers, each with ONE catch that cannot be bypassed.
-          //
-          // This was `Promise.allSettled` over four bare calls, and the config
-          // editor had no catch of its own — so its rejection went into the
-          // settled array and was never read. A failed config edit logged
-          // exactly nothing and read as a success. `allSettled` is the wrong
-          // tool for "must not be discarded": it makes discarding the default.
-          //
-          // `Promise.all` is safe here precisely BECAUSE every element catches:
-          // nothing can reject, so nothing can short-circuit the wait, and the
-          // tracked promise still covers all four (the guarantee section 13
-          // tests). Anything that somehow escapes rejects `runInbound`, which
-          // logs it and hands it to the adapter boundary.
-          const handlers: ReadonlyArray<readonly [string, () => Promise<unknown>]> = [
-            ...(this.elicitations
-              ? [[
-                  "elicitation",
-                  () => this.elicitations.handleComponent(evt),
-                ] as const]
-              : []),
-            ["config editor", () => this.handleConfigEditorComponent(evt)],
-            ["tts editor", () => this.handleTtsEditorComponent(evt)],
-            ["voice console", () => this.runVoiceConsoleComponent(evt)],
-            ["quota card", () => this.handleQuotaCardComponent(evt)],
-            ["service status card", () => this.handleServiceStatusCardComponent(evt)],
-          ];
-          await Promise.all(
-            handlers.map(([handler, run]) =>
-              // `.then(run)` so a SYNCHRONOUS throw is caught as well.
-              Promise.resolve()
-                .then(run)
-                .catch((err) => {
-                  this.logger.warn(
-                    { err, customId: evt.customId, handler },
-                    "component handler failed"
-                  );
-                })
-            )
-          );
+          await this.loadPlugins();
+          const contribution = this.plugins.components.get(evt.customId, evt.kind);
+          if (contribution) {
+            const access = { kind: contribution.access };
+            const scope = evt.channel.parentId ?? evt.channel.id;
+            const admins = this.config.SEAM_CONFIG_ADMIN_USER_IDS;
+            const refusal = !this.config.DISCORD_ALLOWED_USER_IDS.has(evt.userId) ? "This user is not allowed to use Seam."
+              : Orchestrator.isParticipantSlashRefused(this.config, "", evt.userId, { access }) ? PARTICIPANT_CONFIG_REFUSAL
+              : Orchestrator.isLockedSlashRefused(this.config, scope, "", evt.userId, { access }) ? "🔒 This channel is locked — its configuration can't be changed."
+              : contribution.authorization === "config-admin" && admins && !admins.has(evt.userId) ? "This action requires a config admin." : undefined;
+            if (refusal) { await evt.replyEphemeral(refusal); return; }
+            await this.plugins.components.dispatch(evt);
+            return;
+          }
         },
         async () => {
           await evt
@@ -3256,7 +3196,7 @@ export class Orchestrator {
     }
     // Same reasoning for `run`: a synchronous throw must land inside the
     // tracked promise, not escape before anything has been registered.
-    const running = Promise.resolve().then(run);
+    const running = Promise.resolve().then(run).then(() => this.identityEffects.flush());
     const tracked = running
       .catch((err) => {
         this.logger.warn({ err, ingress: label }, "inbound handler failed");
@@ -4625,6 +4565,7 @@ export class Orchestrator {
         hostTools: areHostToolsEnabled(this.config, record.parentRef ?? undefined),
         seamFences,
         fenceInstructions: this.fences.instructions,
+        pluginToolInstructions: this.plugins.mcp.list({ threadId: record.channelRef, parentId: record.parentRef ?? undefined }).map(tool => tool.instruction),
         localTime: formatLocalTime(nowMs),
         timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
         ...(Number.isFinite(lastTurnMs) && nowMs - lastTurnMs > 1000
@@ -5370,11 +5311,34 @@ export class Orchestrator {
     const sub = interaction.options.getSubcommand(true);
     const slashGroup = interaction.options.getSubcommandGroup(false);
     const slashOpts = Orchestrator.slashGateOptions(interaction);
+    await this.loadPlugins();
+    const contribution = this.plugins.slash.get(interaction.commandName ?? "seam", slashGroup, sub);
+    if (contribution) slashOpts.access = typeof contribution.access === "function"
+      ? contribution.access(name => interaction.options.getString(name)) : contribution.access;
     // Mutation checks precede handlers; read-only access does not bypass admin checks.
     const refusal = this.slashAccessRefusal(interaction, slashOpts.access ?? { kind: "mutating" });
     if (refusal) {
       await interaction.reply({ content: refusal, flags: MessageFlags.Ephemeral });
       return;
+    }
+    if (contribution) {
+      const admins = this.config.SEAM_CONFIG_ADMIN_USER_IDS;
+      if (contribution.authorization === "config-admin" && admins && !admins.has(interaction.user.id)) {
+        await interaction.reply({ content: "This command requires a config admin.", flags: MessageFlags.Ephemeral });
+        return;
+      }
+      const invocation: SlashInvocation = {
+        threadId: interaction.channelId ?? "",
+        parentId: (interaction.channel as { parentId?: string } | null)?.parentId,
+        actor: Object.freeze({ id: interaction.user.id, name: interaction.user.displayName ?? interaction.user.username }),
+        string: name => interaction.options.getString(name),
+        boolean: name => interaction.options.getBoolean(name),
+        reply: async text => { await interaction.reply({ content: text, flags: MessageFlags.Ephemeral }); },
+        defer: async () => { await interaction.deferReply({ flags: MessageFlags.Ephemeral }); },
+        edit: async text => { await interaction.editReply({ content: text }); },
+        view: async view => { await interaction.reply({ ...view, flags: MessageFlags.Ephemeral } as Parameters<typeof interaction.reply>[0]); },
+      };
+      if (await this.plugins.slash.dispatch(interaction.commandName ?? "seam", slashGroup, sub, Object.freeze(invocation))) return;
     }
     if (interaction.options.getSubcommandGroup(false) === "upload") {
       const admins = this.config.SEAM_CONFIG_ADMIN_USER_IDS;
@@ -5528,17 +5492,6 @@ export class Orchestrator {
           return this.cmdConfigSet(interaction);
         case "audit":
           return this.cmdConfigAudit(interaction);
-      }
-    }
-    // #151: `rename` / `namer` moved out of `config` into `/seamadmin naming`.
-    // The handlers are unchanged and keep their own SEAM_CONFIG_ADMIN_USER_IDS
-    // gates (#160) — only the path into them moved.
-    if (slashGroup === "naming") {
-      switch (interaction.options.getSubcommand(true)) {
-        case "rename":
-          return this.cmdThreadRename(interaction);
-        case "namer":
-          return this.cmdNamerEditor(interaction);
       }
     }
     switch (sub) {
@@ -7352,7 +7305,7 @@ export class Orchestrator {
     if (!role.ok) throw new Error(role.error);
 
     configured = this.store.get(record.id) ?? configured;
-    await this.applyThreadName(configured, { fresh: true });
+    await this.identityEffects.flush(record.id);
     return thread.id;
   }
 
@@ -9857,6 +9810,7 @@ export class Orchestrator {
           hostTools: areHostToolsEnabled(this.config, record.parentRef ?? undefined),
           seamFences: true,
           fenceInstructions: this.fences.instructions,
+          pluginToolInstructions: this.plugins.mcp.list({ threadId: record.channelRef, parentId: record.parentRef ?? undefined }).map(tool => tool.instruction),
           ...(runtimePrompt.provenance ? { provenance: runtimePrompt.provenance } : {}),
         });
 
@@ -14742,7 +14696,7 @@ export class Orchestrator {
           );
           return;
         }
-        await this.applyThreadName(applied.record, { fresh: true });
+        await this.identityEffects.flush(record.id);
         await i.editReply(
           `Created and configured thread <#${thread.id}>. Effective: ` +
             `${this.configSetSummary(applied.effective)}.`
@@ -14751,7 +14705,7 @@ export class Orchestrator {
       }
 
       // No config arguments preserves #157's visual editor workflow.
-      await this.applyThreadName(record, { fresh: true });
+      await this.identityEffects.flush(record.id);
       await i.editReply(`Created thread <#${thread.id}> and initialized it.`);
       const opened = await this.openConfigEditorCard(thread, i.user.id);
       if (!opened) {
@@ -15049,7 +15003,7 @@ export class Orchestrator {
     const defaultEffort = selected.effort.selectionDefault;
     const current = describedBefore.model.value;
     if (canonicalId === current) {
-      await this.applyThreadName(this.store.get(record.id) ?? record);
+      await this.identityEffects.flush(record.id);
       const message = `🧠 Model already set to \`${canonicalId}\` (no change).`;
       await respond(message);
       return { ok: true, message };
@@ -15152,7 +15106,7 @@ export class Orchestrator {
         message = `🧠 Model will be \`${canonicalId}\` with effort \`${defaultEffort}\` on the next turn.`;
       }
 
-      await this.applyThreadName(this.store.get(verified.id) ?? verified);
+      await this.identityEffects.flush(record.id);
       await respond(message);
       return { ok: true, message };
     } catch (err) {
@@ -15220,7 +15174,7 @@ export class Orchestrator {
         await i.reply({ content: result.error, flags: MessageFlags.Ephemeral });
         return;
       }
-      await this.threadNamer.recompactChannel(PLATFORM, record.parentRef);
+      await this.identityEffects.flush();
     } else if (scope === "thread") {
       const result = this.configMutation.applyThreadOverlay({
         threadId: record.channelRef,
@@ -15232,13 +15186,13 @@ export class Orchestrator {
         await i.reply({ content: result.error, flags: MessageFlags.Ephemeral });
         return;
       }
-      await this.applyThreadName(this.store.get(record.id) ?? record);
+      await this.identityEffects.flush(record.id);
     } else {
       const cfg = this.store.readConfig(record);
       if (role) cfg.role = role;
       else delete cfg.role;
       this.persistConfig(record, cfg);
-      await this.applyThreadName(this.store.get(record.id) ?? record);
+      await this.identityEffects.flush(record.id);
     }
     const effective = this.router.describeConfig(this.store.get(record.id) ?? record).role;
     await i.reply({
@@ -15247,202 +15201,6 @@ export class Orchestrator {
     });
   }
 
-  private async cmdThreadRename(i: ChatInputCommandInteraction): Promise<void> {
-    // Admin gate (#151). `rename` is the most destructive verb in the tree:
-    // `scope:channel` rebuilds every thread name in the channel, and
-    // `migrate-legacy` / `role-name` rewrite names from scratch. It shipped
-    // with no privilege check at all. Same gate + semantics as
-    // `cmdNamerEditor`: an UNSET SEAM_CONFIG_ADMIN_USER_IDS stays allowed
-    // (opt-out, not deny-all — see test/config-admin-ids.test.ts), so hosts
-    // that never configured admins keep today's behavior. Refuse before
-    // `deferReply` so the refusal is a plain ephemeral reply and no rename
-    // work is started.
-    const admins = this.config.SEAM_CONFIG_ADMIN_USER_IDS;
-    if (admins && !admins.has(i.user.id)) {
-      await i.reply({
-        content: "Renaming threads requires a config admin.",
-        flags: MessageFlags.Ephemeral,
-      });
-      return;
-    }
-    const record = this.recordFromInteraction(i);
-    if (!record) {
-      await i.reply({ content: "Use inside a thread.", flags: MessageFlags.Ephemeral });
-      return;
-    }
-    const scope = i.options.getString("scope") ?? "thread";
-    const migrateLegacy = i.options.getBoolean("migrate-legacy") ?? false;
-    const roleName = i.options.getBoolean("role-name") ?? false;
-    if (scope === "channel") {
-      if (!record.parentRef) {
-        await i.reply({ content: "This thread has no parent channel.", flags: MessageFlags.Ephemeral });
-        return;
-      }
-      await i.deferReply({ flags: MessageFlags.Ephemeral });
-      const results = await this.threadNamer.recompactChannel(PLATFORM, record.parentRef, {
-        migrateLegacy,
-        roleName,
-      });
-      const rebuilt = results.filter((result) => result.status === "rebuilt").length;
-      const renamed = results.filter((result) => result.status === "renamed").length;
-      const unchanged = results.filter((result) => result.status === "unchanged").length;
-      const skipped = results.filter(
-        (result) =>
-          result.status === "unmanaged" ||
-          result.status === "roleless" ||
-          result.status === "opted_out"
-      ).length;
-      const gone = results.filter((result) => result.status === "gone").length;
-      const failed = results.filter((result) => result.status === "failed").length;
-      await i.editReply({
-        content: `Recomputed ${results.length} channel thread(s): ${rebuilt} rebuilt, ${renamed} renamed, ${unchanged} unchanged, ${skipped} left untouched, ${gone} gone, ${failed} failed.`,
-      });
-      return;
-    }
-    await i.deferReply({ flags: MessageFlags.Ephemeral });
-    const result = await this.applyThreadName(record, { migrateLegacy, roleName });
-    const detail = result.status === "unmanaged"
-      ? "Name left untouched because its exact stored prefix boundary is unavailable. Use migrate-legacy:true for explicit cleanup."
-      : result.status === "roleless"
-        ? "Name left untouched because this thread has no resolved role."
-        : result.status === "opted_out"
-          ? "Name left untouched because automatic naming is disabled."
-          : result.status === "renamed" || result.status === "rebuilt"
-            ? `${result.status === "rebuilt" ? "Rebuilt" : "Renamed"} as ${result.name}.`
-            : "Name already matches.";
-    await i.editReply({ content: detail });
-  }
-
-  private async cmdNamerEditor(i: ChatInputCommandInteraction): Promise<void> {
-    const admins = this.config.SEAM_CONFIG_ADMIN_USER_IDS;
-    if (admins && !admins.has(i.user.id)) {
-      await i.reply({
-        content: "The global thread-namer tables require a config admin.",
-        flags: MessageFlags.Ephemeral,
-      });
-      return;
-    }
-    const render = (error?: string) => {
-      const current = this.threadNamerConfig.get();
-      const preview = (text: string) => this.renderer.codeBlock(text || "(none)").slice(0, 1024);
-      return {
-        embeds: [
-          new EmbedBuilder()
-            .setTitle("🏷️ Thread namer")
-            .setColor(error ? 0xed4245 : 0x5865f2)
-            .setDescription(
-              error
-                ? `❌ ${error}\n\nNothing was saved.`
-                : "Ordered substring rules. First match wins; blank lines and `#` comments are ignored."
-            )
-            .addFields(
-              { name: "Agents", value: preview(formatThreadNamerRules(current.agents, "agent")) },
-              { name: "Models", value: preview(formatThreadNamerRules(current.models, "model")) },
-              { name: "Roles", value: preview(formatThreadNamerRules(current.roles, "role")) }
-            ),
-        ],
-        components: [
-          new ActionRowBuilder<ButtonBuilder>().addComponents(
-            new ButtonBuilder()
-              .setCustomId("namer:edit")
-              .setLabel("Edit match tables")
-              .setStyle(ButtonStyle.Primary)
-          ),
-        ],
-      };
-    };
-
-    await i.reply({ ...render(), flags: MessageFlags.Ephemeral });
-    const msg = await i.fetchReply();
-    const collector = msg.createMessageComponentCollector({
-      filter: (component) => component.user.id === i.user.id && component.customId === "namer:edit",
-      time: 600_000,
-    });
-    // #159: without an end handler the "Edit match tables" button stayed live
-    // past the collector's 10 minutes and answered nothing.
-    const lifecycle = this.attachListLifecycle(i, collector, () =>
-      expiredCardView("⏰ Thread namer editor expired — run `/seamadmin naming namer` again.")
-    );
-    collector.on("collect", async (component) => {
-      if (!component.isButton()) return;
-      const current = this.threadNamerConfig.get();
-      const modal = new ModalBuilder().setCustomId("namer:save").setTitle("Thread namer rules");
-      modal.addComponents(
-        new ActionRowBuilder<TextInputBuilder>().addComponents(
-          new TextInputBuilder()
-            .setCustomId("agents")
-            .setLabel("Agent rules: match=emoji")
-            .setStyle(TextInputStyle.Paragraph)
-            .setMaxLength(4000)
-            .setValue(formatThreadNamerRules(current.agents, "agent"))
-            .setRequired(false)
-        ),
-        new ActionRowBuilder<TextInputBuilder>().addComponents(
-          new TextInputBuilder()
-            .setCustomId("models")
-            .setLabel("Model rules: match=emoji @agent")
-            .setStyle(TextInputStyle.Paragraph)
-            .setMaxLength(4000)
-            .setValue(formatThreadNamerRules(current.models, "model"))
-            .setRequired(false)
-        ),
-        new ActionRowBuilder<TextInputBuilder>().addComponents(
-          new TextInputBuilder()
-            .setCustomId("roles")
-            .setLabel("Role rules: match=emoji")
-            .setStyle(TextInputStyle.Paragraph)
-            .setMaxLength(4000)
-            .setValue(formatThreadNamerRules(current.roles, "role"))
-            .setRequired(false)
-        )
-      );
-      await component.showModal(modal);
-      try {
-        const submit = await component.awaitModalSubmit({
-          time: 300_000,
-          filter: (candidate) => candidate.customId === "namer:save" && candidate.user.id === i.user.id,
-        });
-        try {
-          this.threadNamerConfig.save({
-            agents: parseThreadNamerRules(
-              submit.fields.getTextInputValue("agents"),
-              "agent"
-            ),
-            models: parseThreadNamerRules(
-              submit.fields.getTextInputValue("models"),
-              "model"
-            ),
-            roles: parseThreadNamerRules(
-              submit.fields.getTextInputValue("roles"),
-              "role"
-            ),
-          });
-          await submit.deferUpdate();
-          await this.refreshAllManagedThreadNames();
-          // Repeatable: the editor stays open, rebuilt from the saved tables.
-          await lifecycle.refresh(render());
-        } catch (err) {
-          await submit.deferUpdate().catch(() => {});
-          await lifecycle.refresh(render(err instanceof Error ? err.message : String(err)));
-        }
-      } catch {
-        /* modal timeout */
-      }
-    });
-  }
-
-  private async refreshAllManagedThreadNames(): Promise<void> {
-    const records = this.store.list(this.store.countSessions());
-    const parents = new Set(
-      records.filter((record) => record.parentRef).map((record) => record.parentRef!)
-    );
-    for (const parent of parents) {
-      await this.threadNamer.recompactChannel(PLATFORM, parent);
-    }
-    for (const record of records.filter((candidate) => !candidate.parentRef)) {
-      await this.applyThreadName(record);
-    }
-  }
 
   private async cmdEffort(i: ChatInputCommandInteraction): Promise<void> {
     const record = this.recordFromInteraction(i);
@@ -15562,7 +15320,7 @@ export class Orchestrator {
     if (this.router.hasRuntime(record.id)) {
       await this.router.invalidate(record.id, { clearAcpSession: false });
     }
-    await this.applyThreadName(this.store.get(record.id) ?? record);
+    await this.identityEffects.flush(record.id);
   }
 
   private async cmdRecover(i: ChatInputCommandInteraction): Promise<void> {
@@ -17280,7 +17038,7 @@ export class Orchestrator {
       acpSessionId: "",
       updatedUtc: new Date().toISOString(),
     });
-    await this.applyThreadName(this.store.get(record.id) ?? record);
+    await this.identityEffects.flush(record.id);
     await i.reply({
       content:
         "Session reset. Your next message will start a fresh ACP session (history is gone, but config is kept).",
@@ -17435,7 +17193,7 @@ export class Orchestrator {
     const sameAgent = describedBefore.agent.value === parsed.agentId;
     const sameLocation = currentLocation === nextLocation;
     if (sameAgent && sameLocation) {
-      await this.applyThreadName(this.store.get(record.id) ?? record);
+      await this.identityEffects.flush(record.id);
       const msg = `Agent is already \`${formatAgentAtLocation(parsed.agentId, nextLocation)}\`.`;
       await respond(msg);
       return { ok: true, message: msg };
@@ -17587,7 +17345,7 @@ export class Orchestrator {
         channel.id,
         sessionBefore.acpSessionId
       );
-      await this.applyThreadName(verified);
+      await this.identityEffects.flush(record.id);
       const at = formatAgentAtLocation(parsed.agentId, nextLocation);
       const message = `🤖 Agent switched to \`${at}\` (${profile.displayName}), model \`${intendedModel}\`. Next message will start a fresh session.`;
       await respond(message);
@@ -18271,14 +18029,7 @@ export class Orchestrator {
       }
     }
 
-    const namingRecord = this.store.getByChannel(PLATFORM, draft.threadId);
-    if (plan.channelPreset && draft.parentRef) {
-      await this.threadNamer.recompactChannel(PLATFORM, draft.parentRef).catch((err) =>
-        this.logger.warn({ err, parentRef: draft.parentRef }, "thread namer: channel editor apply failed")
-      );
-    } else if (namingRecord) {
-      await this.applyThreadName(namingRecord);
-    }
+    await this.identityEffects.flush(`discord:${draft.threadId}`);
     // D10: do NOT abort or invalidate a live turn. Overlay applies on next spawn.
     // (#37 Fast is the one exception, handled above — it MUST reset the session.)
     this.configEditor.delete(draft.id);
@@ -19298,7 +19049,7 @@ export class Orchestrator {
         acpSessionId: newSessionId,
         updatedUtc: new Date().toISOString(),
       });
-      await this.applyThreadName(this.store.get(record.id) ?? record);
+      await this.identityEffects.flush(record.id);
       return { newSessionId, summary: summaryText };
     } finally {
       if (transcriptFile) await fsp.unlink(transcriptFile).catch(() => {});
@@ -19355,7 +19106,7 @@ export class Orchestrator {
         "thread migration overlay write failed"
       );
     }
-    await this.applyThreadName(this.store.get(record.id) ?? { ...record, agentId });
+    await this.identityEffects.flush(record.id);
 
     const freshRecord = this.store.get(record.id);
     if (!freshRecord) throw new Error(`Session record \`${record.id}\` disappeared during migration.`);
@@ -21334,7 +21085,7 @@ export class Orchestrator {
                 id: record.channelRef,
                 parentId: record.parentRef || undefined,
               };
-              await this.applyThreadName(this.store.get(record.id) ?? record);
+              await this.identityEffects.flush(record.id);
 
               const successEmbed = new EmbedBuilder()
                 .setTitle("🎉 Session Migrated Successfully!")
@@ -21420,7 +21171,7 @@ export class Orchestrator {
     else if (action === "exclude") cfg.excludedTools = list;
     this.persistConfig(record, cfg);
     await this.router.invalidate(record.id);
-    await this.applyThreadName(this.store.get(record.id) ?? record);
+    await this.identityEffects.flush(record.id);
     await i.reply({
       content: `Tool ${action} list: ${list.length === 0 ? "(cleared)" : "`" + list.join(", ") + "`"}. Next turn starts a fresh runtime.`,
       flags: MessageFlags.Ephemeral,
@@ -21812,7 +21563,7 @@ export class Orchestrator {
         }
       }
       mutationStarted = false;
-      if (opts.applyName) await this.applyThreadName(committed);
+      if (opts.applyName) await this.identityEffects.flush(committed.id);
       return { ok: true, record: committed, effective, restartRequested };
     } catch (err) {
       let rollbackError = "";
@@ -22969,7 +22720,7 @@ export class Orchestrator {
    * user still sees one contiguous, private answer.
    */
   private async cmdHelp(i: ChatInputCommandInteraction): Promise<void> {
-    const [first, ...rest] = buildSeamHelpPages();
+    const [first, ...rest] = buildSeamHelpPages(undefined, this.plugins.slash.help());
     await i.reply({
       content: first ?? "No help available.",
       flags: MessageFlags.Ephemeral,
@@ -25680,7 +25431,7 @@ export class Orchestrator {
     await this.router.invalidate(record.id);
 
     const liveAfter = this.store.get(record.id) ?? record;
-    await this.applyThreadName(liveAfter, { fresh: options.fresh === true });
+    await this.identityEffects.flush(record.id);
 
     const body =
       changes.length > 0

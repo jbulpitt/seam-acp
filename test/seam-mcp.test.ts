@@ -19,6 +19,10 @@ import {
   type DispatchSpec,
 } from "../packages/core/src/core/dispatch/types.js";
 
+import { PluginHost } from "../packages/core/src/plugins/host.js";
+import { createThreadNamingPlugin } from "../packages/core/src/plugins/thread-naming/index.js";
+import { DEFAULT_THREAD_NAMER_CONFIG } from "../packages/core/src/platforms/discord/thread-namer.js";
+
 const silent = pino({ level: "silent" }) as unknown as Logger;
 
 function makeRecord(over: Partial<SessionRecord> = {}): SessionRecord {
@@ -202,7 +206,7 @@ async function makeHarness(opts?: {
   pushInbox?: SeamMcpServerDeps["pushInbox"];
   drainInbox?: SeamMcpServerDeps["drainInbox"];
   interruptRedirect?: SeamMcpServerDeps["interruptRedirect"];
-  renameThread?: SeamMcpServerDeps["renameThread"];
+  renameThread?: (record: SessionRecord, name: string) => Promise<{ ok: true } | { ok: false; error: string }>;
   /** Omit the compact dep entirely (to test the "not supported" refusal). */
   disableCompact?: boolean;
   /** Omit the renameThread dep (to test the "not supported" refusal). */
@@ -223,8 +227,19 @@ async function makeHarness(opts?: {
   const inbox: Harness["inbox"] = new Map();
   const interrupts: Harness["interrupts"] = [];
   const renames: Harness["renames"] = [];
+  const plugins = new PluginHost(silent);
+  if (!opts?.disableRename) {
+    const record = makeRecord({ parentRef: "chan-1" });
+    const naming = createThreadNamingPlugin({ threads: {
+      describeConfig: () => ({ agent: { value: "claude" }, model: { value: "claude-sonnet-5.5" }, role: { value: null }, disableThreadPrefix: { value: false } }),
+      listSessionsByParent: () => [], getThreadName: async () => null, getThreadLiveState: async () => ({ locked: false, archived: false }),
+      renameThread: async (_id, name) => { const result = opts?.renameThread ? await opts.renameThread(record, name) : (renames.push({ record, name }), { ok: true }); if (!result.ok) throw new Error(result.error); }, logger: silent,
+    }, internal: { get: id => id === record.channelRef ? record : undefined, all: () => [record], setNamePrefix: () => {}, rules: { get: () => DEFAULT_THREAD_NAMER_CONFIG, save: () => {} } } });
+    await plugins.loadBuiltins([{ id: naming.id, load: async () => naming }]);
+  }
   const server = new SeamMcpServer({
     logger: silent,
+    pluginTools: plugins.mcp,
     resolveSession:
       opts?.resolveSession ??
       ((token) => (token === "good-token" ? makeRecord({ parentRef: "chan-1" }) : undefined)),
@@ -356,16 +371,6 @@ async function makeHarness(opts?: {
               return { ok: true as const, cancelled: "cancelled" as const, fresh, dispatchId: "disp-int-1" };
             }),
         }),
-    ...(opts?.disableRename
-      ? {}
-      : {
-          renameThread:
-            opts?.renameThread ??
-            (async (record, name) => {
-              renames.push({ record, name });
-              return { ok: true as const };
-            }),
-        }),
   });
   await server.start();
   const port = server.port;
@@ -400,7 +405,7 @@ describe("SeamMcpServer", () => {
 
   it("initialize returns tools capability + instructions", async () => {
     h = await makeHarness();
-    const { body } = await h.call("initialize", { protocolVersion: "2025-06-18" });
+    const { body } = await h.call("initialize", { protocolVersion: "2025-06-18" }, { "X-Seam-Session": "good-token" });
     expect(body.result.capabilities).toEqual({ tools: {} });
     expect(body.result.serverInfo.name).toBe("seam-mcp");
     expect(typeof body.result.instructions).toBe("string");
@@ -440,7 +445,6 @@ describe("SeamMcpServer", () => {
       "peek",
       "poll_inbox",
       "read_messages",
-      "rename_thread",
       "reset_thread_session",
       "schedule_wake",
       "search_messages",
@@ -1363,7 +1367,7 @@ describe("SeamMcpServer", () => {
 
   it("handoff advertises the watchFeedback option in its input schema (#62)", async () => {
     h = await makeHarness();
-    const { body } = await h.call("tools/list");
+    const { body } = await h.call("tools/list", undefined, { "X-Seam-Session": "good-token" });
     const byName = new Map(body.result.tools.map((t: any) => [t.name, t]));
     // Adding an OPTION to handoff does NOT change the tool count; inspect_image
     // plus the standalone capabilities — inspect_image, model metadata (2),
@@ -1633,15 +1637,15 @@ describe("SeamMcpServer", () => {
     expect(h.renames).toHaveLength(0);
   });
 
-  it("rename_thread surfaces a missing dep as not supported", async () => {
+  it("rename_thread is not mounted without its plugin", async () => {
     h = await makeHarness({ disableRename: true });
     const { body } = await h.call(
       "tools/call",
       { name: "rename_thread", arguments: { name: "x" } },
       { "X-Seam-Session": "good-token" }
     );
-    expect(body.result.isError).toBe(true);
-    expect(body.result.content[0].text).toMatch(/not supported/i);
+    expect(body.error.code).toBe(-32602);
+    expect(body.error.message).toContain("unknown tool: rename_thread");
   });
 
   it("cancel_wake reports when nothing was removed (#59)", async () => {
@@ -2574,7 +2578,7 @@ describe("SeamMcpServer", () => {
 
   it("send advertises interrupt + fresh in its input schema without changing the tool count (#67)", async () => {
     h = await makeHarness();
-    const { body } = await h.call("tools/list");
+    const { body } = await h.call("tools/list", undefined, { "X-Seam-Session": "good-token" });
     // Params on `send` must NOT add a tool — the set stays at 34.
     expect(body.result.tools).toHaveLength(40);
     const byName = new Map(body.result.tools.map((t: any) => [t.name, t]));

@@ -268,6 +268,7 @@ function makeHarness(
       bridgePresets: new Map(),
       REPO_EMOJIS: new Map(),
       SEAM_CONFIG_ADMIN_USER_IDS: new Set([USER]),
+      DISCORD_ALLOWED_USER_IDS: new Set([USER, "someone-else"]),
     } as never,
     adapter,
     modelCatalog: catalog,

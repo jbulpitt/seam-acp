@@ -435,7 +435,6 @@ describe("chain MCP tool", () => {
       "peek",
       "poll_inbox",
       "read_messages",
-      "rename_thread",
       "reset_thread_session",
       "schedule_wake",
       "search_messages",

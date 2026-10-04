@@ -396,6 +396,7 @@ export function isPlannedChainChildId(id: string | null | undefined): id is stri
 
 export class SessionStore {
   private readonly db: Database.Database;
+  private readonly sessionWrites = new Set<(record: Readonly<SessionRecord>) => void>();
   readonly turnAttempts: TurnAttemptStore;
   readonly contextBudgets: ContextBudgetStore;
   readonly scheduledOccurrences: ScheduledOccurrenceStore;
@@ -1266,10 +1267,16 @@ export class SessionStore {
            acp_session_id  = excluded.acp_session_id,
            repo_path       = excluded.repo_path,
            config_json     = excluded.config_json,
-           name_prefix     = excluded.name_prefix,
            updated_utc     = excluded.updated_utc`
       )
       .run({ ...record, namePrefix: record.namePrefix ?? null });
+    for (const listener of this.sessionWrites) listener({ ...record });
+  }
+
+  /** Internal commit notification; observers never own or veto the write. */
+  onSessionWrite(listener: (record: Readonly<SessionRecord>) => void): () => void {
+    this.sessionWrites.add(listener);
+    return () => this.sessionWrites.delete(listener);
   }
 
   /** Atomically supersede every conflicting open request and publish a new one. */

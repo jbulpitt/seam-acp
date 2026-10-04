@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { pino } from "pino";
 import { buildSlashRegistrationBody, getSlashCommandAccess } from "../packages/core/src/platforms/discord/commands.js";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
+import { PluginHost } from "../packages/core/src/plugins/host.js";
 
 const ADMIN = "101";
 const PARTICIPANT = "102";
@@ -16,6 +17,8 @@ function fixture({ locked = false, participant = false, user = PARTICIPANT, iden
     channelPresets: new Map(locked ? [["parent", { locked: true }]] : []),
   };
   orch.logger = pino({ level: "silent" });
+  orch.plugins = new PluginHost(orch.logger);
+  orch.identityEffects = { ready: Promise.resolve(), flush: async () => {} };
   function interaction(commandName: string, group: string | null, sub: string, values: Record<string, string> = {}) {
     return {
       commandName,

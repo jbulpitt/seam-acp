@@ -29,6 +29,7 @@ import { randomUUID } from "node:crypto";
 import type { HttpHeader, McpServer } from "@agentclientprotocol/sdk";
 import { formatCatalogEvidence } from "../catalog-evidence-render.js";
 import type { Logger } from "../../lib/logger.js";
+import type { McpRegistry } from "../../plugins/mcp-registry.js";
 import { raceDeadline, type DeadlineClock } from "../../lib/shutdown-budget.js";
 import type { SessionRecord } from "../types.js";
 import {
@@ -313,11 +314,7 @@ export interface SeamMcpServerDeps {
   /** Cancel a pending wake owned by the calling thread (#59). Returns whether a
    *  row was removed. Undefined ⇒ wakes are unsupported on this deployment. */
   cancelWake?: (record: SessionRecord, id: string) => boolean;
-  /** Rename the CALLER'S OWN thread. Free-form name. Undefined ⇒ unsupported. */
-  renameThread?: (
-    record: SessionRecord,
-    name: string
-  ) => Promise<{ ok: true } | { ok: false; error: string }>;
+  pluginTools?: McpRegistry;
   /** Register a bridge-evaluated watch for the calling thread (#60). Returns the
    *  new watch id + expiry, or an error string surfaced verbatim. Undefined ⇒
    *  watches are unsupported on this deployment. */
@@ -1229,24 +1226,6 @@ const TOOLS = [
     },
   },
   {
-    name: "rename_thread",
-    description:
-      "Rename YOUR OWN Discord thread base. Managed prefixes are recomputed around it; unmanaged " +
-      "legacy/hand-edited threads remain unmanaged. Self-scoped: the " +
-      "target is always the calling session's thread, never another teammate. Restricted " +
-      "participants cannot rename.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        name: {
-          type: "string",
-          description: "New thread title (max 100 characters).",
-        },
-      },
-      required: ["name"],
-    },
-  },
-  {
     name: "cancel_wake",
     description:
       "Cancel a pending wake you scheduled in THIS thread, by its id (as returned by schedule_wake).",
@@ -1917,6 +1896,7 @@ const HOST_TOOLS = [
 ] as const;
 
 const HOST_TOOL_NAMES = new Set<string>(HOST_TOOLS.map((tool) => tool.name));
+export const KERNEL_MCP_TOOL_NAMES = [...TOOLS, ...HOST_TOOLS].map(tool => tool.name);
 const HOST_TOOL_INSTRUCTIONS = [
   "- host_exec(host, command, cwd?, timeoutSec?): run a bounded non-interactive command on a paired host.",
   "- host_push(host, from, to): copy a file from this agent's host to a paired host.",
@@ -1969,7 +1949,6 @@ const INSTRUCTIONS = [
   "  the woken turn to continue a loop. This is the working substrate for \"wake me in N minutes\"; the",
   "  native ScheduleWakeup / Monitor tools do NOT function here, so use this instead.",
   "- cancel_wake(wakeId): cancel a pending wake you scheduled.",
-  "- rename_thread(name): rename YOUR OWN thread (free-form title). Restricted participants cannot.",
   "- create_choice / cancel_choice / submit_result: frozen click-cards; HTTP ingest + declared JSON result. Participants cannot author. See docs/agent-guides/interactive-prompts.md.",
   "- create_ingest / cancel_ingest: headless HTTP endpoint (no Discord card). Isolated silent scoring, retries unlimited. Token once. Same POST /ingest + submit_result. `thread` instead makes each POST a live handoff into that thread (no HTTP result).",
   "- create_live_help / cancel_live_help: Gemini joins a Discord voice channel (audio↔audio). Parallel to this text session. Course participants may start and stop their own live-help session. See docs/agent-guides/live-help.md.",
@@ -2189,13 +2168,18 @@ export class SeamMcpServer {
   }
 
   private toolsForToken(token: string | undefined) {
-    return this.hostToolsAvailableForToken(token) ? [...TOOLS, ...HOST_TOOLS] : TOOLS;
+    const base = this.hostToolsAvailableForToken(token) ? [...TOOLS, ...HOST_TOOLS] : TOOLS;
+    const record = this.deps.resolveSession(token);
+    return [...base, ...(record ? this.deps.pluginTools?.list({ threadId: record.channelRef, parentId: record.parentRef ?? undefined }).map(tool => tool.descriptor) ?? [] : [])];
   }
 
   private instructionsForToken(token: string | undefined): string {
-    return this.hostToolsAvailableForToken(token)
+    const base = this.hostToolsAvailableForToken(token)
       ? `${INSTRUCTIONS}\n${HOST_TOOL_INSTRUCTIONS}`
       : INSTRUCTIONS;
+    const record = this.deps.resolveSession(token);
+    const instructions = record ? this.deps.pluginTools?.list({ threadId: record.channelRef, parentId: record.parentRef ?? undefined }).map(tool => tool.instruction) ?? [] : [];
+    return [base, ...instructions].join("\n");
   }
 
   private async dispatch(
@@ -2250,6 +2234,21 @@ export class SeamMcpServer {
     }
 
     try {
+      const invocation = { threadId: record.channelRef, parentId: record.parentRef ?? undefined, args: Object.freeze(structuredClone(args)) };
+      const pluginTool = this.deps.pluginTools?.get(name, invocation);
+      if (pluginTool) {
+        const speaker = this.deps.currentSpeakerId?.(record);
+        if (pluginTool.access === "mutating" && speaker && isRestrictedParticipant(speaker, this.deps.configParticipantUserIds, this.deps.configAdminUserIds)) {
+          return rpcResult(id, textResult(PARTICIPANT_CONFIG_REFUSAL, true));
+        }
+        if (pluginTool.access === "mutating" && this.deps.isChannelLocked?.(record) && (!speaker || !this.deps.configAdminUserIds?.has(speaker))) {
+          return rpcResult(id, textResult("🔒 This channel is locked — its configuration can't be changed.", true));
+        }
+        if (pluginTool.authorization === "config-admin" && this.deps.configAdminUserIds && (!speaker || !this.deps.configAdminUserIds.has(speaker))) {
+          return rpcResult(id, textResult("This tool requires a config admin.", true));
+        }
+        return rpcResult(id, await this.deps.pluginTools!.dispatch(name, Object.freeze(invocation)));
+      }
       switch (name) {
         case "host_exec":
           return rpcResult(id, await this.toolHostExec(record, args));
@@ -2305,8 +2304,6 @@ export class SeamMcpServer {
           return rpcResult(id, await this.toolCompact(record, args));
         case "schedule_wake":
           return rpcResult(id, this.toolScheduleWake(record, args));
-        case "rename_thread":
-          return rpcResult(id, await this.toolRenameThread(record, args));
         case "cancel_wake":
           return rpcResult(id, this.toolCancelWake(record, args));
         case "watch_create":
@@ -3314,37 +3311,6 @@ export class SeamMcpServer {
     };
   }
 
-  /** Rename the caller's own thread. Self-scoped; restricted participants refused. */
-  private async toolRenameThread(
-    caller: SessionRecord,
-    args: Record<string, unknown>
-  ): Promise<McpToolResult> {
-    if (!this.deps.renameThread) {
-      return textResult("thread rename is not supported on this deployment.", true);
-    }
-    const speakerIdForTier = this.deps.currentSpeakerId?.(caller);
-    if (
-      speakerIdForTier != null &&
-      isRestrictedParticipant(
-        speakerIdForTier,
-        this.deps.configParticipantUserIds,
-        this.deps.configAdminUserIds
-      )
-    ) {
-      this.logger.warn(
-        { session: caller.id, channel: caller.parentRef, speakerId: speakerIdForTier },
-        "seam-mcp rename_thread refused: speaker is a restricted participant"
-      );
-      return textResult(PARTICIPANT_CONFIG_REFUSAL, true);
-    }
-    const name = requireString(args, "name").slice(0, 100);
-    const result = await this.deps.renameThread(caller, name);
-    if (!result.ok) {
-      return textResult(`Could not rename this thread: ${result.error}`, true);
-    }
-    this.logger.info({ thread: caller.channelRef, name }, "seam-mcp rename_thread");
-    return textResult(`Renamed this thread to ${name}.`);
-  }
 
   /** Schedule a one-shot wake for the calling thread (#59). Self-scope by
    *  construction — the wake is armed for the token-resolved caller, never a

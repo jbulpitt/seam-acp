@@ -1,8 +1,20 @@
 import fs from "node:fs";
 import path from "node:path";
 import { z } from "zod";
-import type { ConfigDescription } from "../../core/session-router.js";
-import type { SessionRecord } from "../../core/types.js";
+export interface ThreadNamerRecord {
+  id: string;
+  platform: string;
+  channelRef: string;
+  parentRef: string | null;
+  createdUtc: string;
+  namePrefix?: string | null;
+}
+export interface ThreadNamerIdentity {
+  agent: { value: string };
+  model: { value: string };
+  role: { value: string | null };
+  disableThreadPrefix: { value: boolean };
+}
 
 export const THREAD_NAME_MAX = 100;
 export const KEYCAP_VS = "\uFE0F";
@@ -324,8 +336,8 @@ export function joinThreadName(prefix: string, base: string): string {
 
 export interface ThreadNamerDeps {
   getConfig: () => ThreadNamerConfig;
-  describeConfig: (record: SessionRecord) => ConfigDescription;
-  listSessionsByParent: (platform: string, parentRef: string) => SessionRecord[];
+  describeConfig: (record: ThreadNamerRecord) => ThreadNamerIdentity;
+  listSessionsByParent: (platform: string, parentRef: string) => ThreadNamerRecord[];
   getThreadName: (threadId: string) => Promise<string | null>;
   /** Resolves undefined only when the platform confirms the thread is gone. */
   getThreadLiveState: (
@@ -368,7 +380,7 @@ export class ThreadNamer {
   constructor(private readonly deps: ThreadNamerDeps) {}
 
   async applyThreadName(
-    record: SessionRecord,
+    record: ThreadNamerRecord,
     options: ApplyThreadNameOptions = {}
   ): Promise<ApplyThreadNameResult> {
     const description = this.deps.describeConfig(record);
@@ -433,7 +445,7 @@ export class ThreadNamer {
    * supplied base. An unmanaged/mismatched thread receives the requested name
    * verbatim and remains unmanaged; this is not an implicit legacy migration.
    */
-  async renameBase(record: SessionRecord, base: string): Promise<ApplyThreadNameResult> {
+  async renameBase(record: ThreadNamerRecord, base: string): Promise<ApplyThreadNameResult> {
     const requested = base.trim() || "seam";
     const description = this.deps.describeConfig(record);
     const current = await this.deps.getThreadName(record.channelRef);
@@ -514,7 +526,7 @@ export class ThreadNamer {
     return results;
   }
 
-  private allocateOrdinal(record: SessionRecord, roleSlot: string): number {
+  private allocateOrdinal(record: ThreadNamerRecord, roleSlot: string): number {
     const own = record.namePrefix ? parseThreadOrdinalSuffix(record.namePrefix) : null;
     const peers = this.deps.listSessionsByParent(record.platform, record.parentRef ?? "");
     const used: number[] = [];

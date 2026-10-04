@@ -1,11 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
 import { Collection } from "discord.js";
-import { brandIconUrl } from "../packages/core/src/core/agent-brand.js";
+import { brandIconUrl } from "../packages/core/src/plugins/card-visuals/agent-brand.js";
 import {
   DiscordAdapter,
   projectDiscordStatusEmbed,
 } from "../packages/core/src/platforms/discord/adapter.js";
 import { discordStatusColor } from "../packages/core/src/platforms/discord/renderer.js";
+import { visualHost } from "./plugin-card-visuals-fixture.js";
 
 describe("durable Discord status-card projection (#586)", () => {
   it("clamps adopted tool titles before editing the actual Discord message", async () => {
@@ -149,6 +150,7 @@ describe("durable Discord status-card projection (#586)", () => {
     const adapter = Object.create(DiscordAdapter.prototype) as DiscordAdapter;
     Object.defineProperties(adapter, {
       config: { value: { BRAND_ICON_BASE_URL: "https://icons.example/agents" } },
+      pluginStatusCards: { value: (await visualHost("https://icons.example/agents")).statusCards },
       fetchSendableChannel: { value: vi.fn(async () => ({ messages: {
         fetch: vi.fn(async () => ({ embeds: [{ toJSON: () => source }], attachments, edit })),
       } })) },
@@ -190,6 +192,7 @@ describe("durable Discord status-card projection (#586)", () => {
     const adapter = Object.create(DiscordAdapter.prototype) as DiscordAdapter;
     Object.defineProperties(adapter, {
       config: { value: {} },
+      pluginStatusCards: { value: (await visualHost()).statusCards },
       fetchSendableChannel: { value: vi.fn(async () => ({ messages: {
         fetch: vi.fn(async () => ({ embeds: [{ toJSON: () => source }], attachments: new Collection(), edit })),
       } })) },

@@ -5,7 +5,8 @@ import path from "node:path";
 import { z } from "zod";
 import { logger } from "./lib/logger.js";
 import { parkedAgentMessage } from "./core/parked-agents.js";
-import { DEFAULT_BRAND_ICON_BASE_URL } from "./core/agent-brand.js";
+import { DEFAULT_BRAND_ICON_BASE_URL } from "./plugins/card-visuals/agent-brand.js";
+import { DEFAULT_GIF_MANIFEST_URL } from "./plugins/card-visuals/card-gifs.js";
 import { retiredAgentConfigMessage } from "./core/retired-agents.js";
 import { parseWarmSetHosts } from "./core/warm-set/hosts.js";
 import {
@@ -928,7 +929,7 @@ const Schema = z.object({
   SIMPLE_CARD_GIF_MANIFEST_URL: z
     .string()
     .url()
-    .default("https://pub-d6ab0677dbbb4895a9db45bc6ba2ad08.r2.dev/manifest.json"),
+    .default(DEFAULT_GIF_MANIFEST_URL),
 });
 
 const PresetFieldSchema = <T extends z.ZodType>(value: T) => z.object({ value });

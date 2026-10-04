@@ -1,8 +1,8 @@
 # Built-in plugins
 
 The controller loads `plugins/builtins.ts` in order, independently of Seam MCP.
-Only known built-ins are loaded. The controller also installs thread naming
-quota and optional service status through controller-only capability bootstraps.
+Only known built-ins are loaded. The controller also installs thread naming,
+card visuals, quota and optional service status through controller-only bootstraps.
 
 A descriptor declares its id, API version, built-in/internal eligibility,
 optional config validation and activate/dispose hooks, and contributions.
@@ -102,3 +102,21 @@ Quota's internal-tier facades expose configured/thread binding snapshots,
 or live connections, including agy's verified runtime and Grok's live read.
 Provider failures retain their sanitized real cause and affect only that row.
 MCP-off deployments keep the job, card, Refresh and usage slash command.
+
+## Status-card decorations and config keys
+
+Decorators receive a frozen snapshot of status, agent and model facts, plus
+the resolved visual preferences. They return only an icon, thumbnail or style.
+The kernel retains state, action, completion and durable projection. A failed
+decoration logs its cause and leaves the plain card available.
+
+Config keys declare a schema, default and description. Defaults are validated
+at boot; changes are validated in the existing audited `ConfigMutationService`.
+Session > thread > channel > default precedence stays in the router.
+
+The card-visuals built-in owns brand icon resolution, full/simple selection,
+the GIF catalog and `/seam config card|gif`. Its internal facade reads effective
+visual settings and writes the two keys through the mutation service; it never
+receives sessions or the router. The GIF manifest refresh is an after-admission
+job, and rendering reads only its cache. `SIMPLE_CARD_GIF_MANIFEST_URL` and
+`BRAND_ICON_BASE_URL` retain their existing defaults and precedence.

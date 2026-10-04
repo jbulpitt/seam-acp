@@ -101,7 +101,6 @@ import {
   reconcileInterruptedChoiceAdmissions,
 } from "./core/choice/result.js";
 import { ChoiceIngest } from "./core/choice/ingest.js";
-import { CardGifCatalog } from "./core/card-gifs.js";
 import { resolveIngestPublicBase, resolvePublicBridgeWsUrl } from "./core/mcp-url.js";
 import fs from "node:fs";
 import { projectAttemptCompletions } from "./core/dispatch/attempt-recovery.js";
@@ -1624,13 +1623,6 @@ async function main(): Promise<void> {
   });
   warmSetManager.start();
 
-  const cardGifs = new CardGifCatalog({
-    url: config.SIMPLE_CARD_GIF_MANIFEST_URL,
-    logger: logger.child({ mod: "card-gifs" }),
-  });
-  orchestrator.setCardGifs(cardGifs);
-  cardGifs.start();
-
   // P0 (#58): hot-reload data/channel-presets.json. The watcher mutates the
   // SAME map objects the router and orchestrator hold (config.channelPresets /
   // config.threadPresets), so an edit takes effect on the next turn with no
@@ -1823,7 +1815,6 @@ async function main(): Promise<void> {
     wakeManager.stop();
     parkedManager.stop();
     warmSetManager.stop();
-    cardGifs.stop();
     watchManager.stop();
     // #174 HTTP ingress closes FIRST, and synchronously. `/mcp` and `/ingest`
     // reach tools that write the ledger and enqueue dispatch specs, and both

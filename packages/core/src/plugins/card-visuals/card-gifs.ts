@@ -1,13 +1,13 @@
 /**
  * Curated GIF catalog for the simple status-card thumbnail.
  *
- * Fetches `SIMPLE_CARD_GIF_MANIFEST_URL` at boot and on a timer. The render
+ * The plugin job refreshes `SIMPLE_CARD_GIF_MANIFEST_URL`. The render
  * path only calls {@link CardGifCatalog.randomGif} — never the network.
  *
  * Cloudflare on r2.dev returns HTTP 403 error 1010 to default/scripted
  * User-Agents, so every fetch sends a browser UA.
  */
-import type { Logger } from "../lib/logger.js";
+import type { Logger } from "../../lib/logger.js";
 
 export const DEFAULT_GIF_MANIFEST_URL =
   "https://pub-d6ab0677dbbb4895a9db45bc6ba2ad08.r2.dev/manifest.json";
@@ -20,47 +20,28 @@ export const DEFAULT_GIF_REFRESH_MS = 10 * 60 * 1000;
 
 export type FetchLike = (
   url: string,
-  init?: { headers?: Record<string, string> }
+  init?: { headers?: Record<string, string>; signal?: AbortSignal }
 ) => Promise<{ ok: boolean; status: number; json: () => Promise<unknown> }>;
 
 export interface CardGifCatalogOpts {
   url: string;
-  logger: Logger;
-  intervalMs?: number;
+  logger: Pick<Logger, "warn">;
   fetchImpl?: FetchLike;
   random?: () => number;
 }
 
 export class CardGifCatalog {
   private readonly url: string;
-  private readonly logger: Logger;
-  private readonly intervalMs: number;
+  private readonly logger: Pick<Logger, "warn">;
   private readonly fetchImpl: FetchLike;
   private readonly random: () => number;
   private urls: string[] = [];
-  private timer: ReturnType<typeof setInterval> | undefined;
 
   constructor(opts: CardGifCatalogOpts) {
     this.url = opts.url;
     this.logger = opts.logger;
-    this.intervalMs = opts.intervalMs ?? DEFAULT_GIF_REFRESH_MS;
     this.fetchImpl = opts.fetchImpl ?? defaultFetch;
     this.random = opts.random ?? Math.random;
-  }
-
-  start(): void {
-    void this.refresh();
-    this.timer = setInterval(() => {
-      void this.refresh();
-    }, this.intervalMs);
-    if (typeof this.timer === "object" && this.timer && "unref" in this.timer) {
-      this.timer.unref();
-    }
-  }
-
-  stop(): void {
-    if (this.timer) clearInterval(this.timer);
-    this.timer = undefined;
   }
 
   /** One HTTPS GIF URL, or null if the catalog is empty / never loaded. */
@@ -70,10 +51,11 @@ export class CardGifCatalog {
     return this.urls[Math.min(i, this.urls.length - 1)] ?? null;
   }
 
-  async refresh(): Promise<void> {
+  async refresh(signal?: AbortSignal): Promise<void> {
     try {
       const res = await this.fetchImpl(this.url, {
         headers: { "user-agent": CARD_GIF_BROWSER_UA, accept: "application/json" },
+        ...(signal ? { signal } : {}),
       });
       if (!res.ok) {
         this.logger.warn({ status: res.status, url: this.url }, "card-gif manifest fetch failed");
@@ -103,9 +85,9 @@ export function parseGifManifest(raw: unknown): string[] {
 
 async function defaultFetch(
   url: string,
-  init?: { headers?: Record<string, string> }
+  init?: { headers?: Record<string, string>; signal?: AbortSignal }
 ): Promise<{ ok: boolean; status: number; json: () => Promise<unknown> }> {
-  const res = await fetch(url, { headers: init?.headers });
+  const res = await fetch(url, { headers: init?.headers, signal: init?.signal });
   return {
     ok: res.ok,
     status: res.status,

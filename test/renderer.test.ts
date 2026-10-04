@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { discordRenderer } from "../packages/core/src/platforms/discord/renderer.js";
-import { brandIconUrl } from "../packages/core/src/core/agent-brand.js";
+import { brandIconUrl } from "../packages/core/src/plugins/card-visuals/agent-brand.js";
 
 describe("discordRenderer", () => {
   it("status panel uses the right icon and rows", () => {

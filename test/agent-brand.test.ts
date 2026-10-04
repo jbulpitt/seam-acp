@@ -3,7 +3,7 @@ import {
   brandIconUrl,
   DEFAULT_BRAND_ICON_BASE_URL,
   resolveAgentBrand,
-} from "../packages/core/src/core/agent-brand.js";
+} from "../packages/core/src/plugins/card-visuals/agent-brand.js";
 import { loadConfig } from "../packages/core/src/config.js";
 
 describe("resolveAgentBrand (#96)", () => {

@@ -53,7 +53,7 @@ import { DEFAULT_THREAD_NAMER_CONFIG } from "../packages/core/src/platforms/disc
 import { agentLocationPickerChoices } from "../packages/core/src/platforms/discord/location.js";
 import { ConfigMutationService } from "../packages/core/src/core/config-mutation.js";
 import { ThreadSessionControlService } from "../packages/core/src/core/thread-session-control.js";
-import { resolveAgentBrand, brandIconUrl } from "../packages/core/src/core/agent-brand.js";
+import { resolveAgentBrand, brandIconUrl } from "../packages/core/src/plugins/card-visuals/agent-brand.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import type { SessionRecord, SessionConfigState } from "../packages/core/src/core/types.js";
 import type { SessionStore } from "../packages/core/src/core/session-store.js";

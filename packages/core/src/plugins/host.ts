@@ -8,6 +8,8 @@ import { IdentityRegistry } from "./identity-registry.js";
 import { TurnActivityRegistry } from "./turn-activity-registry.js";
 import { JobRegistry } from "./job-registry.js";
 import { PluginStorage } from "./storage.js";
+import { StatusCardRegistry } from "./status-card-registry.js";
+import { ConfigKeyRegistry } from "./config-key-registry.js";
 import type { RESTPostAPIChatInputApplicationCommandsJSONBody } from "discord.js";
 
 export class PluginHost {
@@ -18,6 +20,8 @@ export class PluginHost {
   readonly identity: IdentityRegistry;
   readonly jobs: JobRegistry;
   readonly turnActivity: TurnActivityRegistry;
+  readonly statusCards: StatusCardRegistry;
+  readonly configKeys: ConfigKeyRegistry;
   private readonly active: Plugin[] = [];
   private readonly ids = new Set<string>();
 
@@ -35,6 +39,8 @@ export class PluginHost {
     this.identity = new IdentityRegistry(logger);
     this.turnActivity = new TurnActivityRegistry(logger);
     this.jobs = new JobRegistry(logger, plugin => this.disable(plugin));
+    this.statusCards = new StatusCardRegistry(logger);
+    this.configKeys = new ConfigKeyRegistry();
   }
 
   async loadBuiltins(builtins: readonly BuiltinPlugin[], configs: Readonly<Record<string, unknown>> = {}): Promise<void> {
@@ -55,6 +61,8 @@ export class PluginHost {
         this.mcp.validate(plugin.contributions.mcp ?? [], this.reserved.mcp);
         this.components.validate(plugin.contributions.components ?? [], this.reserved.components);
         this.jobs.validate(plugin.contributions.jobs ?? []);
+        this.statusCards.validate(plugin.contributions.statusCards ?? []);
+        this.configKeys.validate(plugin.contributions.configKeys ?? []);
         const config = plugin.validateConfig ? plugin.validateConfig(configs[plugin.id]) : configs[plugin.id];
         const context = Object.freeze({ logger, config, ...(this.reserved.storageRoot ? {
           storage: new PluginStorage(this.reserved.storageRoot, plugin.id, this.reserved.storageAliases?.[plugin.id]),
@@ -68,6 +76,8 @@ export class PluginHost {
         this.identity.register(plugin.id, plugin.contributions.identity ?? [], context);
         this.turnActivity.register(plugin.id, plugin.contributions.turnActivity ?? [], context);
         this.jobs.register(plugin.id, plugin.contributions.jobs ?? []);
+        this.statusCards.register(plugin.id, plugin.contributions.statusCards ?? [], context);
+        this.configKeys.register(plugin.id, plugin.contributions.configKeys ?? []);
         this.active.push(plugin);
         logger.info("plugin activated");
       } catch (err) {
@@ -91,6 +101,8 @@ export class PluginHost {
     this.components.clear();
     this.identity.clear();
     this.turnActivity.clear();
+    this.statusCards.clear();
+    this.configKeys.clear();
     for (const plugin of this.active.splice(0).reverse()) {
       try { await plugin.dispose?.(); }
       catch (err) { this.logger.warn({ err, plugin: plugin.id }, "plugin disposal failed"); }
@@ -105,6 +117,8 @@ export class PluginHost {
     this.components.remove(id);
     this.identity.remove(id);
     this.turnActivity.remove(id);
+    this.statusCards.remove(id);
+    this.configKeys.remove(id);
     const index = this.active.findIndex(plugin => plugin.id === id);
     if (index < 0) return;
     const [plugin] = this.active.splice(index, 1);

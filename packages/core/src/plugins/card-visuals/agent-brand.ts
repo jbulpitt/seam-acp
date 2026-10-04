@@ -1,5 +1,5 @@
 /**
- * Agent brand keys for status-card icons (#96).
+ * Agent brand keys for status-card icons.
  *
  * The icon names the *service*, not the harness: a Claude-code process pointed
  * at Z.ai / Ollama Cloud / Vertex shows that service's logo, not Claude's.

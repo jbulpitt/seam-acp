@@ -2,55 +2,12 @@ import { describe, it, expect } from "vitest";
 import {
   deleteSimpleCardGifMessage,
   isSimpleCardGifTerminal,
-  pickSimpleCardGifUrl,
   postSimpleCardGifMessage,
   simpleCardGifPanel,
 } from "../packages/core/src/core/simple-card-gif.js";
 import type { StructuredPanel } from "../packages/core/src/core/types.js";
 
 const URL = "https://cdn.example/a.gif";
-
-describe("pickSimpleCardGifUrl", () => {
-  it("picks when style is simple and gif is on", () => {
-    expect(
-      pickSimpleCardGifUrl({
-        style: "simple",
-        gifOn: true,
-        randomGif: () => URL,
-      })
-    ).toBe(URL);
-  });
-
-  it("does not pick when style is full", () => {
-    expect(
-      pickSimpleCardGifUrl({
-        style: "full",
-        gifOn: true,
-        randomGif: () => URL,
-      })
-    ).toBeUndefined();
-  });
-
-  it("does not pick when gif is off", () => {
-    expect(
-      pickSimpleCardGifUrl({
-        style: "simple",
-        gifOn: false,
-        randomGif: () => URL,
-      })
-    ).toBeUndefined();
-  });
-
-  it("does not pick when the catalog is empty", () => {
-    expect(
-      pickSimpleCardGifUrl({
-        style: "simple",
-        gifOn: true,
-        randomGif: () => null,
-      })
-    ).toBeUndefined();
-  });
-});
 
 describe("isSimpleCardGifTerminal", () => {
   it("Done / Failed / Timed out delete the GIF message", () => {
@@ -102,15 +59,6 @@ describe("postSimpleCardGifMessage / deleteSimpleCardGifMessage", () => {
       },
     });
     expect(deleted).toEqual(["gif-1"]);
-  });
-
-  it("does not post when pick returned undefined (caller skips)", async () => {
-    const url = pickSimpleCardGifUrl({
-      style: "simple",
-      gifOn: false,
-      randomGif: () => URL,
-    });
-    expect(url).toBeUndefined();
   });
 
   it("falls back to sendMessage(url) without sendPanel", async () => {

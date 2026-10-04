@@ -92,7 +92,11 @@ describe("large prompts reach the agent", () => {
 });
 
 describe("#777 the retained adapter child decides reconciliation", () => {
-  it.each([false, true])("settles a never-submitted arm after bridge rebind; legacy=%s", async legacy => {
+  it.each([
+    { legacy: false, unrelatedInput: false },
+    { legacy: true, unrelatedInput: false },
+    { legacy: true, unrelatedInput: true },
+  ])("settles a never-submitted arm after bridge rebind: %j", async ({ legacy, unrelatedInput }) => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "seam-777-owner-"));
     roots.push(root);
     const first = await host(root, undefined, { legacy });
@@ -101,6 +105,7 @@ describe("#777 the retained adapter child decides reconciliation", () => {
     await first.slots.writeInput(8, line({ id: 2, method: "session/new", params: { cwd: root, mcpServers: [] } }));
     await until(() => first.frames.find(f => f.data?.includes('"sessionId":"s1"')), "session/new");
     const snapshot = await first.slots.armRecovery(8, { submissionId: "never-submitted", acpSessionId: "s1", continuation: "continue" });
+    if (unrelatedInput) await first.slots.writeInput(8, line({ id: 3, method: "session/get_config", params: { sessionId: "s1" } }));
     expect(snapshot.reconcileSupported).toBe(legacy ? undefined : true);
     const before = (await first.client.listSlots()).health.find(row => row.slot === 8)!;
     expect(before.resumePending).toBe(false);

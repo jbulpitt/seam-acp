@@ -28,7 +28,7 @@ const drain = async () => {
 };
 
 async function setup(source: "inbound" | "dispatch" = "inbound", style: "full" | "simple" = "full",
-  options: { armed?: boolean; queue?: boolean } = {}) {
+  options: { armed?: boolean; queue?: boolean; disconnected?: boolean; adoptionUnavailable?: boolean } = {}) {
   const dir = mkdtempSync(path.join(tmpdir(), "seam-adopt-reconnect-"));
   cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
   let store = new SessionStore(path.join(dir, "test.db"));
@@ -104,11 +104,13 @@ async function setup(source: "inbound" | "dispatch" = "inbound", style: "full" |
   mux.attach(socket as never);
   socket.deliver({ type: "hello", instanceId: "first", capabilities: { durableSlots: true } });
   let runtime!: AgentRuntime;
+  let adoptionUnavailable = options.adoptionUnavailable ?? false;
   const router = {
     isBusy: () => runtime?.busy ?? false,
     describeConfig: () => ({ model: { value: "test" }, agent: { value: "codex" },
       location: { value: "remote" }, cwd: { value: "/synthetic" } }),
     adoptRecoveryRuntime: (_record: unknown, child: any, session: string) => {
+      if (adoptionUnavailable) throw new Error("fixture bridge catalog not ready");
       runtime = new AgentRuntime({ profile: { id: "codex" } as AgentProfile,
         logger: pino({ level: "silent" }) as any, spawnFn: () => { throw new Error("must not spawn"); } });
       runtime.attachRecovery(child, session);
@@ -132,7 +134,12 @@ async function setup(source: "inbound" | "dispatch" = "inbound", style: "full" |
     adapter: adapter as any, renderer: discordRenderer as any,
     config: { ...visualConfig, DATA_DIR: dir, REPOS_ROOT: "/synthetic", REPO_EMOJIS: new Map(),
       channelPresets: new Map(), threadPresets: new Map() } as any });
-  orch.setBridgeHub({ muxFor: () => mux, slotHealthFor: () => health } as any);
+  let connected = !options.disconnected;
+  const readyListeners = new Set<(location: string) => void>();
+  orch.setBridgeHub({ muxFor: () => connected ? mux : undefined, slotHealthFor: () => health,
+    onBridgeReady: (listener: (location: string) => void) => {
+      readyListeners.add(listener); return () => { readyListeners.delete(listener); };
+    } } as any);
   const ready = orch.loadPlugins();
   await ready;
   const run = ready.then(() => options.queue
@@ -166,11 +173,65 @@ async function setup(source: "inbound" | "dispatch" = "inbound", style: "full" |
     unknownInventory: () => { inventoryUnknown = true; },
     failInventory: () => { inventoryError = true; },
     restoreInventory: () => { inventoryUnknown = false; inventoryError = false; },
+    connectBridge: () => { connected = true; for (const listener of [...readyListeners]) listener("remote"); },
+    allowAdoption: () => { adoptionUnavailable = false; },
     replaceSubmission: () => { rows = [{ ...rows[0]!, recovery: { ...snapshot, submissionId: "other-submission" } }]; },
     runtime: () => runtime };
 }
 
 describe("#777 armed recovery queue reconciliation", () => {
+  it("keeps the existing 15-minute reconnect notice without failing unknown live work", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const h = await setup("dispatch", "full", { armed: true, queue: true, disconnected: true });
+    await h.run;
+    await drain();
+    await vi.advanceTimersByTimeAsync(15 * 60_000);
+    expect(h.visible.some(text => text.includes("Still reconnecting") && text.includes("keep trying"))).toBe(true);
+    expect(h.store.turnAttempts.get("inbound-1")).toMatchObject({ state: "suspended", outcome: null });
+    expect(h.commands.filter(command => command.type === "kill")).toEqual([]);
+    h.connectBridge();
+    await drain();
+    h.complete("reconnected after the notice");
+    await drain();
+    expect(h.store.turnAttempts.get("inbound-1")?.state).toBe("completed");
+  });
+
+  it.each(["bridge disconnected", "catalog not ready"])("keeps the queue owned while %s clears", async fault => {
+    const h = await setup("dispatch", "full", { armed: true, queue: true,
+      disconnected: fault === "bridge disconnected", adoptionUnavailable: fault === "catalog not ready" });
+    await h.run;
+    await drain();
+    let ran = false;
+    const next = (h.orch as any).queueOnChannel("thread", async () => { ran = true; });
+    await drain();
+    expect(ran).toBe(false);
+    expect(h.store.turnAttempts.get("inbound-1")).toMatchObject({ state: "suspended", stalledReason: null });
+    expect(h.commands.filter(command => command.type === "kill" || command.type === "spawn")).toEqual([]);
+    h.allowAdoption();
+    h.connectBridge();
+    await h.orch.reconcileRemoteRecoveries();
+    await drain();
+    h.losePrompt();
+    await h.orch.reconcileRemoteRecoveries();
+    await next;
+    expect(h.store.turnAttempts.get("inbound-1")).toMatchObject({ state: "completed",
+      outcome: { status: "failed", error: expect.stringContaining("never received") } });
+    expect(ran).toBe(true);
+    expect(h.commands.filter(command => command.type === "kill" || command.type === "spawn")).toEqual([]);
+  });
+
+  it("releases reconnect ownership on explicit cancellation", async () => {
+    const h = await setup("dispatch", "full", { armed: true, queue: true, disconnected: true });
+    await h.run;
+    await drain();
+    let ran = false;
+    const next = (h.orch as any).queueOnChannel("thread", async () => { ran = true; });
+    expect(h.store.turnAttempts.cancel("inbound-1", "explicit fixture cancellation")).toBe(true);
+    await next;
+    expect(ran).toBe(true);
+    expect(h.store.turnAttempts.get("inbound-1")?.state).toBe("cancelled");
+  });
+
   it.each(["legacy inventory", "bridge reconnecting"])("retains %s without killing or releasing queued work", async fault => {
     const h = await setup("dispatch", "full", { armed: true, queue: true });
     await h.run;

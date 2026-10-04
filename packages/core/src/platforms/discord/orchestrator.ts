@@ -15716,7 +15716,7 @@ export class Orchestrator {
   private async adoptRemoteRecovery(attempt: TurnAttempt): Promise<boolean> {
     if (!attempt.remoteRecovery) return false;
     if (this.adoptingRemoteResults.has(attempt.id)) return true;
-    if (!this.bridgeHub?.muxFor(attempt.remoteRecovery.location)) {
+    if (attempt.spec.session !== "live" && !this.bridgeHub?.muxFor(attempt.remoteRecovery.location)) {
       return this.adoptRemoteRecoveryOwned(attempt);
     }
 
@@ -15724,7 +15724,14 @@ export class Orchestrator {
     const run = () => this.adoptRemoteRecoveryOwned(attempt);
     if (attempt.spec.session === "live") {
       void this.queueOnChannel(attempt.spec.target, async () => {
-        await run();
+        while (!this.restartCutoff) {
+          const current = this.store.turnAttempts.get(attempt.id);
+          if (!current || current.state !== "suspended" || current.generation !== attempt.generation
+            || !current.remoteRecovery) return;
+          await this.adoptRemoteRecoveryOwned(current);
+          if (this.store.turnAttempts.get(attempt.id)?.state !== "suspended" || this.restartCutoff) return;
+          await new Promise<void>(resolve => this.deferRemoteRecoveryAdoption(current, resolve));
+        }
       }).catch((err) => {
         this.logger.warn({ err, attempt: attempt.id }, "remote recovery queue ownership failed");
       }).finally(() => {
@@ -15800,7 +15807,10 @@ export class Orchestrator {
         );
       }
     } catch (err) {
-      this.continueLostRemoteTurn(attempt, `the slot could not be re-bound (${err instanceof Error ? err.message : String(err)})`);
+      child?.detach();
+      this.deferRemoteRecoveryAdoption(attempt);
+      this.logger.warn({ err, attempt: attempt.id, location: binding.location },
+        "bridge recovery rebind unavailable; waiting without ending its work");
       return true;
     }
 
@@ -16036,7 +16046,9 @@ export class Orchestrator {
             if (result.state === "missing" && typeof result.cause === "string") cause = result.cause;
           }
           if (cause) await this.settleMissingRemoteRecovery(attempt, cause);
-          else if (snapshot && !this.adoptingRemoteResults.has(attempt.id) && !this.remoteAdoptionFinishers.has(attempt.id)) {
+          else if (snapshot && this.adoptingRemoteResults.has(attempt.id) && this.remoteAdoptionWaiters.has(attempt.id)) {
+            this.remoteAdoptionWaiters.get(attempt.id)?.();
+          } else if (snapshot && !this.adoptingRemoteResults.has(attempt.id) && !this.remoteAdoptionFinishers.has(attempt.id)) {
             void this.adoptRemoteRecovery(current).catch(err =>
               this.logger.warn({ err, attempt: attempt.id }, "bridge recovery rebind deferred"));
           }
@@ -16187,9 +16199,13 @@ export class Orchestrator {
   }
 
 
-  private deferRemoteRecoveryAdoption(attempt: TurnAttempt): void {
+  private deferRemoteRecoveryAdoption(attempt: TurnAttempt, onReady?: () => void): void {
     const binding = attempt.remoteRecovery;
-    if (!binding || !this.bridgeHub || this.remoteAdoptionWaiters.has(attempt.id)) return;
+    if (!binding || !this.bridgeHub) { onReady?.(); return; }
+    if (this.remoteAdoptionWaiters.has(attempt.id)) {
+      if (!onReady) return;
+      this.remoteAdoptionWaiters.get(attempt.id)?.();
+    }
     // Tier 3 (#631): after 15 minutes without the bridge, say so plainly and
     // keep waiting. The turn continues the moment the bridge is back.
     const target = attempt.spec?.target;
@@ -16202,12 +16218,12 @@ export class Orchestrator {
           + "I'll keep trying, and this turn continues as soon as it's back.");
     }, 15 * 60_000);
     notice.unref?.();
+    let unsubscribeSettled = () => {};
     const unsubscribe = this.bridgeHub.onBridgeReady((location) => {
       if (location !== binding.location) return;
-      unsubscribe();
-      clearTimeout(notice);
+      cleanup();
       if (told && target) void this.postResumeNotice(target, "🔌 Reconnected to session");
-      this.remoteAdoptionWaiters.delete(attempt.id);
+      if (onReady) return;
       const current = this.store.turnAttempts.get(attempt.id);
       if (!current || current.state !== "suspended"
         || current.generation !== attempt.generation
@@ -16215,10 +16231,15 @@ export class Orchestrator {
       void this.adoptRemoteRecovery(current).catch((err) =>
         this.logger.warn({ err, attempt: attempt.id }, "deferred remote recovery adoption failed"));
     });
-    this.remoteAdoptionWaiters.set(attempt.id, () => {
+    const cleanup = () => {
       clearTimeout(notice);
       unsubscribe();
-    });
+      unsubscribeSettled();
+      this.remoteAdoptionWaiters.delete(attempt.id);
+      onReady?.();
+    };
+    unsubscribeSettled = this.store.turnAttempts.onSettled(id => { if (id === attempt.id) cleanup(); });
+    this.remoteAdoptionWaiters.set(attempt.id, cleanup);
   }
 
   /**

@@ -176,6 +176,6 @@ export function isRemoteRecoveryResult(value: unknown): value is RemoteRecoveryR
     && (result.stopReason === undefined
       || (typeof result.stopReason === "string" && result.stopReason.length <= 1_024))
     && (result.errorKind === undefined || validErrorKind(result.errorKind))
-    && (result.error === undefined || (typeof result.error === "string" && result.error.length <= 1_024))
+    && (result.error === undefined || typeof result.error === "string")
     && validDate(result.finishedUtc);
 }

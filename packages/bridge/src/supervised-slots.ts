@@ -311,12 +311,18 @@ export class SupervisedSlots {
         const requestId = randomUUID();
         const response = this.waitForControl(requestId);
         try {
+          await this.writeControl(slot, { v: ADAPTER_CHILD_PROTOCOL_VERSION, type: "report_recovery" });
           await this.writeControl(slot, { v: ADAPTER_CHILD_PROTOCOL_VERSION,
             type: "disarm_recovery", requestId, submissionId: input.submissionId });
         } catch (error) { this.cancelControl(requestId); throw error; }
-        if (!(await response as { disarmed: boolean }).disarmed) return { state: "owned" };
+        const disarmed = (await response as { disarmed: boolean }).disarmed;
+        const fresh = this.recoveries.get(slot);
+        const owner = (await this.options.client.listSlots()).health.find(row => row.slot === slot);
+        if (!disarmed && !(fresh?.phase === "armed" && fresh.submissionId === input.submissionId
+          && fresh.acpSessionId === input.acpSessionId && owner?.pid === health.pid
+          && owner.alive && owner.attached && owner.resumePending === false)) return { state: "owned" };
         this.recoveries.delete(slot);
-        return { state: "missing", cause: `bridge slot ${slot} armed recovery but never received session/prompt input for this submission` };
+        return { state: "missing", cause: `bridge slot ${slot} armed recovery but never received a complete session/prompt for this submission` };
       }
       const requestId = randomUUID();
       const response = this.waitForControl(requestId);

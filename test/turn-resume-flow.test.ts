@@ -929,7 +929,7 @@ describe("#588 a message arriving during the post-turn tail is not an interrupti
   }
 
   it("queues instead of aborting when no agent prompt is in flight", async () => {
-    const { orch } = makeOrch({ isBusy: false, handleInner: async () => {} });
+    const { orch } = makeOrch({ isBusy: false, handleInner: vi.fn(async () => {}) });
     primeQueueLink(orch, "chan-tail");
     const router = (orch as unknown as { router: { abortTurn: ReturnType<typeof vi.fn> } }).router;
 
@@ -947,7 +947,7 @@ describe("#588 a message arriving during the post-turn tail is not an interrupti
 
   it("still aborts when an agent prompt really is in flight", async () => {
     // The behaviour this must not regress: a genuine mid-turn interruption.
-    const { orch } = makeOrch({ isBusy: true, handleInner: async () => {} });
+    const { orch } = makeOrch({ isBusy: true, handleInner: vi.fn(async () => {}) });
     primeQueueLink(orch, "chan-live");
     const router = (orch as unknown as { router: { abortTurn: ReturnType<typeof vi.fn> } }).router;
 

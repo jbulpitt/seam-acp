@@ -860,19 +860,13 @@ export class TurnAttemptStore {
       .run(new Date().toISOString(), id, ownerBoot).changes === 1;
   }
 
-  /**
-   * #559: attempt 65534f0d stayed `active` after its claim returned before
-   * session/prompt, while later live attempts on the same target completed.
-   * `assigned_not_started` then never resolves. Deleting this leaves that row
-   * active. `prompt_started=1` is not this predicate (#428). `owner_boot` is
-   * not read — the live owner was the current process. An isolated completion
-   * does not prove the serial queue moved. `finishedUtc` is the completion;
-   * a later touch of `updated_utc` on an older completion is not.
-   */
+  /** Settle only live-queue claims proven superseded by a later completion.
+   * Independent workers share a delivery target, not the target's session. */
   settleSupersededUnstartedAttempts(target?: string): SettledUnstartedAttempt[] {
     const settled: SettledUnstartedAttempt[] = [];
     for (const attempt of this.list("active")) {
       if (attempt.promptStarted || attempt.acpSessionId) continue;
+      if (attempt.spec.session === "isolated" || attempt.spec.preset || attempt.spec.agentId) continue;
       const key = attempt.spec?.target;
       if (!key || (target !== undefined && key !== target)) continue;
       const laterId = this.laterQueueCompletion(key, attempt.id, attempt.updatedUtc);
@@ -922,6 +916,8 @@ export class TurnAttemptStore {
         AND state = 'completed'
         AND json_extract(spec_json, '$.target') = ?
         AND COALESCE(json_extract(spec_json, '$.session'), 'live') != 'isolated'
+        AND json_extract(spec_json, '$.preset') IS NULL
+        AND json_extract(spec_json, '$.agentId') IS NULL
         AND typeof(json_extract(outcome_json, '$.finishedUtc')) = 'text'
         AND json_extract(outcome_json, '$.finishedUtc') > ?
       ORDER BY json_extract(outcome_json, '$.finishedUtc'), id

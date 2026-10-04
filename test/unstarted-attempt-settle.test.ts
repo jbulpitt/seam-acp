@@ -9,7 +9,7 @@
  * below. The watcher tick is what runs it during operation.
  */
 import { afterEach, describe, expect, it } from "vitest";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { pino } from "pino";
@@ -19,7 +19,7 @@ import {
   type TurnAttemptStore,
 } from "../packages/core/src/core/dispatch/attempt-store.js";
 import { DispatchWatcher } from "../packages/core/src/core/dispatch/watcher.js";
-import type { DispatchSpec } from "../packages/core/src/core/dispatch/types.js";
+import { dispatchDirs, enqueueDispatchSpec, type DispatchSpec } from "../packages/core/src/core/dispatch/types.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 
 const logger = pino({ level: "silent" }) as unknown as Logger;
@@ -94,6 +94,31 @@ describe("settleSupersededUnstartedAttempts", () => {
     expect(store.get("stranded")?.state).toBe("active");
   });
 
+  it.each([
+    { session: "isolated" as const },
+    { session: "live" as const, preset: "specialist" },
+    { session: "live" as const, agentId: "codex" },
+  ])("a live completion cannot settle an independent worker ($session, $preset, $agentId)", async worker => {
+    const store = await attempts();
+    const child = store.claim(store.admit({ ...spec("child", "thread-a"), ...worker }), "identity", "boot-1");
+    complete(store, "source", "thread-a", "2099-01-01T00:00:00.000Z");
+    expect(store.settleSupersededUnstartedAttempts("thread-a")).toEqual([]);
+    expect(store.isCurrent(child)).toBe(true);
+  });
+
+  it.each([{ preset: "specialist" }, { agentId: "codex" }])(
+    "a forced-isolated completion cannot settle the live queue ($preset, $agentId)", async worker => {
+      const store = await attempts();
+      const stranded = claim(store, "stranded");
+      const separate = store.claim(store.admit({ ...spec("separate", "thread-a"), ...worker }), "identity", "boot-1");
+      store.bind(separate, "acp-separate");
+      store.startPrompt(separate);
+      store.complete(separate, { id: separate.id, target: "thread-a", status: "completed", finishedUtc: "2099-01-01T00:00:00.000Z" });
+      expect(store.settleSupersededUnstartedAttempts()).toEqual([]);
+      expect(store.isCurrent(stranded)).toBe(true);
+    },
+  );
+
   it("does not cancel a prompted row, a bound session, an isolated completion, or another target", async () => {
     const store = await attempts();
     const prompted = claim(store, "prompted");
@@ -148,6 +173,60 @@ describe("watcher tick settles a stranded unstarted attempt during operation", (
     for (const watcher of watchers.splice(0)) watcher.stop();
     for (const store of stores.splice(0)) store.close();
     await Promise.all(dirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
+  });
+
+  it.each([false, true])("an isolated handoff finishes after its source completes before prompt (stream=%s)", async stream => {
+    const dir = await mkdtemp(path.join(tmpdir(), "seam-handoff-ownership-"));
+    dirs.push(dir);
+    const store = new SessionStore(path.join(dir, "t.db"));
+    stores.push(store);
+    const attempts = store.turnAttempts;
+    const source = attempts.claim(spec("inbound-source", "thread-a"), "identity", "boot", "inbound");
+    attempts.bind(source, "acp-source");
+    attempts.startPrompt(source);
+    let admitted!: () => void;
+    const childClaimed = new Promise<void>(resolve => { admitted = resolve; });
+    let release!: () => void;
+    const beforePrompt = new Promise<void>(resolve => { release = resolve; });
+    const prompted: string[] = [];
+    const published: string[] = [];
+    const watcher = new DispatchWatcher({
+      dataDir: dir, logger, attempts, pollMs: 1_000_000,
+      onDispatch: async dispatched => {
+        const child = attempts.claim(dispatched, "identity", "boot");
+        admitted();
+        await beforePrompt;
+        attempts.bind(child, "acp-child");
+        attempts.startPrompt(child);
+        prompted.push(dispatched.prompt);
+        attempts.complete(child, { id: child.id, target: dispatched.target, status: "completed",
+          output: "worker result", finishedUtc: new Date().toISOString() });
+        return { output: "worker result", stopReason: "end_turn" };
+      },
+      onResultPublished: async id => { published.push(id); },
+    });
+    watchers.push(watcher);
+    await watcher.start();
+    await enqueueDispatchSpec(dir, { ...spec("child", "thread-a", "isolated"), stream, returnTo: "thread-a" }, attempts);
+    const running = watcher.tick();
+    await childClaimed;
+    try {
+      attempts.complete(source, { id: source.id, target: "thread-a", status: "completed",
+        output: "queued", finishedUtc: "2099-01-01T00:00:00.000Z" });
+      await watcher.tick();
+      expect(attempts.get("child")).toMatchObject({ state: "active", promptStarted: false, acpSessionId: null });
+    } finally {
+      release();
+      await running;
+      watcher.stop();
+      await watcher.drain();
+    }
+    expect(prompted).toEqual(["child"]);
+    expect(published).toEqual(["child"]);
+    expect(attempts.get("child")).toMatchObject({ state: "completed", promptStarted: true,
+      outcome: { status: "completed", output: "worker result" } });
+    expect(JSON.parse(await readFile(path.join(dispatchDirs(dir).done, "child.json"), "utf8")))
+      .toMatchObject({ status: "completed", output: "worker result", returnTo: "thread-a" });
   });
 
   it("cancels the active row on a tick, without owner_boot and without running it", async () => {

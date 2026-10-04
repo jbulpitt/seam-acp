@@ -3,6 +3,8 @@ import type {
   RemoteRecoverySnapshot,
 } from "@seam/adapters";
 import type { SlotSpawnConfig } from "./rpc.js";
+import type { PermissionIdentity } from "./pending-permissions.js";
+import type { RequestPermissionResponse } from "@agentclientprotocol/sdk";
 
 /** Private, local protocol between the bridge and its supervised adapter host. */
 export const ADAPTER_CHILD_PROTOCOL_VERSION = 1;
@@ -32,6 +34,13 @@ export interface AdapterChildResume {
 
 export type AdapterChildInput =
   | AdapterChildBootstrap
+  | {
+      v: typeof ADAPTER_CHILD_PROTOCOL_VERSION;
+      type: "permission_status" | "answer_permission";
+      requestId: string;
+      permission: PermissionIdentity;
+      response?: RequestPermissionResponse;
+    }
   | {
       v: typeof ADAPTER_CHILD_PROTOCOL_VERSION;
       type: "input";

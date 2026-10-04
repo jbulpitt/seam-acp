@@ -193,6 +193,15 @@ export class DispatchSuspendedError extends Error {
 }
 
 export class TurnAttemptStore {
+  private readonly settledListeners = new Set<(id: string) => void>();
+  onSettled(listener: (id: string) => void): () => void {
+    this.settledListeners.add(listener);
+    return () => { this.settledListeners.delete(listener); };
+  }
+  private settled(id: string, changed: boolean): boolean {
+    if (changed) for (const listener of this.settledListeners) listener(id);
+    return changed;
+  }
   constructor(private readonly db: Database.Database) {
     db.exec(`CREATE TABLE IF NOT EXISTS turn_attempts (
       id TEXT PRIMARY KEY, generation INTEGER NOT NULL, owner_boot TEXT NOT NULL,
@@ -527,11 +536,11 @@ export class TurnAttemptStore {
     if (!binding || binding.submissionId !== result.submissionId
       || binding.acpSessionId !== result.acpSessionId
       || binding.generation !== a.generation) return false;
-    return this.db.prepare(`UPDATE turn_attempts SET state='completed', outcome_json=?,
+    return this.settled(a.id, this.db.prepare(`UPDATE turn_attempts SET state='completed', outcome_json=?,
       delivery_abandoned_reason=COALESCE(delivery_abandoned_reason, ?), updated_utc=?
       WHERE id=? AND generation=? AND state='suspended' AND json_extract(runtime_json,'$.remoteRecovery.submissionId')=?`)
       .run(JSON.stringify(outcome), suppressedOnwardDeliveryReason(outcome), new Date().toISOString(),
-        a.id, a.generation, binding.submissionId).changes === 1;
+        a.id, a.generation, binding.submissionId).changes === 1);
   }
 
   assertCurrent(a: TurnAttempt): void {
@@ -617,7 +626,7 @@ export class TurnAttemptStore {
     // NOT set: `delivery_done` stays 0. This is a terminal DISPOSITION, not
     // transport proof — `isDeliveryProven` must keep reading false, or retained
     // output becomes deletable on the strength of a delivery that never ran.
-    return this.db.prepare(`UPDATE turn_attempts SET state='completed', outcome_json=?,
+    return this.settled(a.id, this.db.prepare(`UPDATE turn_attempts SET state='completed', outcome_json=?,
       delivery_abandoned_reason=COALESCE(delivery_abandoned_reason, ?), updated_utc=?
       WHERE id=? AND generation=? AND owner_boot=? AND state='active'`)
       .run(
@@ -625,7 +634,7 @@ export class TurnAttemptStore {
         suppressedOnwardDeliveryReason(outcome),
         new Date().toISOString(),
         a.id, a.generation, a.ownerBoot
-      ).changes === 1;
+      ).changes === 1);
   }
 
   /**
@@ -924,7 +933,7 @@ export class TurnAttemptStore {
 
   /** Explicit cancellation may win against suspension, never against captured completion. */
   cancel(id: string, reason = "cancelled by operator"): boolean {
-    return this.db.transaction(() => {
+    return this.settled(id, this.db.transaction(() => {
       const a = this.get(id);
       if (!a || (a.state !== "pending" && a.state !== "active" && a.state !== "suspended")) return false;
       const outcome: DispatchResult = {
@@ -936,7 +945,7 @@ export class TurnAttemptStore {
       return this.db.prepare(`UPDATE turn_attempts SET state='cancelled', outcome_json=?, updated_utc=?
         WHERE id=? AND state IN ('pending','active','suspended')`)
         .run(JSON.stringify(outcome), outcome.finishedUtc, id).changes === 1;
-    }).immediate();
+    }).immediate());
   }
 
   /**

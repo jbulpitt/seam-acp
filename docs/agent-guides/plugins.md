@@ -45,8 +45,9 @@ Components declare a custom-id namespace, accepted types and persistent or
 collector lifetime. The same list classifies and dispatches interactions.
 Persistent handlers register at boot; collectors remain with their collector.
 The naming editor uses an owner and deadline in its custom id, so its handler
-survives a controller restart. Durable permission/config-proposal records are a
-separate follow-up; this registry does not own their storage or expiry policy.
+survives a controller restart. ACP permission requests and config proposals use
+persistent component routes backed by durable action-card records (#775); the
+registry routes clicks, and the records own storage and expiry.
 
 ## Thread naming
 

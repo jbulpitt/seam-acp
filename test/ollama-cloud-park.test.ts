@@ -500,11 +500,13 @@ describe("#220 DEFAULT_AGENT while parked", () => {
     } as NodeJS.ProcessEnv;
   }
 
-  it("refuses to boot when DEFAULT_AGENT names parked ollama-cloud", () => {
+  it("boots but refuses default-dependent new sessions when ollama-cloud is parked", () => {
     baseEnv({ DEFAULT_AGENT: OLLAMA_CLOUD_AGENT_ID, OLLAMA_CLOUD_ENABLED: "false" });
-    expect(() => loadConfig({ env })).toThrow(/DEFAULT_AGENT="ollama-cloud"/);
-    expect(() => loadConfig({ env })).toThrow(/parked/);
-    expect(() => loadConfig({ env })).toThrow(OLLAMA_CLOUD_ENABLE_FLAG);
-    expect(() => loadConfig({ env })).not.toThrow(/is retired:/);
+    const cfg = loadConfig({ env });
+    expect(cfg.DEFAULT_AGENT).toBe(OLLAMA_CLOUD_AGENT_ID);
+    expect(cfg.defaultAgentDisabledReason).toMatch(/DEFAULT_AGENT="ollama-cloud"/);
+    expect(cfg.defaultAgentDisabledReason).toMatch(/parked/);
+    expect(cfg.defaultAgentDisabledReason).toContain(OLLAMA_CLOUD_ENABLE_FLAG);
+    expect(cfg.defaultAgentDisabledReason).not.toMatch(/is retired:/);
   });
 });

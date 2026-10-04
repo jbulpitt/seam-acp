@@ -155,37 +155,29 @@ describe("#12 opencode surface removed", () => {
     expect(cfg.REPOS_ROOT).toBe(repoRoot);
   });
 
-  // A legacy DEFAULT_AGENT is the one env value that must NOT be quietly
-  // stripped or accepted: it is stamped onto every new session record, so
-  // accepting it would mint broken threads that only fail on their first turn.
-  it("refuses to boot when DEFAULT_AGENT names the retired agent", () => {
+  it("boots but refuses new default-dependent sessions for a retired default", () => {
     baseEnv({ DEFAULT_AGENT: "opencode" });
-    expect(() => loadConfig({ env })).toThrow(/DEFAULT_AGENT="opencode"/);
-    expect(() => loadConfig({ env })).toThrow(/retired/i);
+    expect(loadConfig({ env }).defaultAgentDisabledReason).toMatch(/DEFAULT_AGENT="opencode"/);
+    expect(loadConfig({ env }).defaultAgentDisabledReason).toMatch(/retired/i);
   });
 
   it("the DEFAULT_AGENT refusal names a supported replacement and does not substitute one", () => {
     baseEnv({ DEFAULT_AGENT: "opencode" });
-    let message = "";
-    try {
-      loadConfig({ env });
-    } catch (err) {
-      message = (err as Error).message;
-    }
+    const cfg = loadConfig({ env });
+    const message = cfg.defaultAgentDisabledReason!;
     expect(message).toContain("Set DEFAULT_AGENT to a supported agent");
     expect(message).toContain("will not substitute one for you");
     expect(message).toContain("copilot");
     // Boot-time wording must not borrow the per-thread language: nothing is
     // bound to a thread yet.
     expect(message).not.toContain("/seam config agent");
-    // It must fail, not fall back: no config object is produced at all.
-    expect(() => loadConfig({ env })).toThrow();
+    expect(cfg.DEFAULT_AGENT).toBe("opencode");
   });
 
   it("refuses a retired DEFAULT_AGENT even alongside the legacy OPENCODE_* keys", () => {
     // The exact legacy shape: OPENCODE_ENABLED=true plus a retired default.
     baseEnv({ DEFAULT_AGENT: "opencode", OPENCODE_ENABLED: "true" });
-    expect(() => loadConfig({ env })).toThrow(/retired/i);
+    expect(loadConfig({ env }).defaultAgentDisabledReason).toMatch(/retired/i);
   });
 
   it("still accepts every supported DEFAULT_AGENT", () => {

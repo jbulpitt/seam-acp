@@ -61,19 +61,25 @@ export function planAgyIdentityMigration(
   records: readonly SessionRecord[],
   ownership: { native: ReadonlySet<string>; packaged: ReadonlySet<string> },
   binding: (record: SessionRecord) => { agent: string; location: string; explicitAgent?: string },
+  onRefused?: (record: SessionRecord, error: Error) => void,
 ): AgyIdentityChange[] {
   const changes: AgyIdentityChange[] = [];
   for (const before of records) {
     const effective = binding(before);
     if (effective.location.trim() !== "local" || !["agy", "agy-old"].includes(effective.agent)) continue;
-    if (effective.explicitAgent === "agy-old") throw new Error("Native restoration requires migrating the local agy-old preset first");
-    // Refuse an overlay/row mismatch rather than touching an unrelated backend's handle.
-    if (!["agy", "agy-old"].includes(before.agentId)) throw new Error("AGY restoration found conflicting stored and effective agents");
-    const handle = before.acpSessionId;
-    if (handle && ownership.native.has(handle) && ownership.packaged.has(handle)) throw new Error("Ambiguous AGY session ownership");
-    const reason = !handle ? "unbound" : ownership.native.has(handle) ? "native" : ownership.packaged.has(handle) ? "package" : "unrecognized";
-    const rebuild = reason === "package" || reason === "unrecognized";
-    changes.push({ before, after: { ...before, agentId: "agy", acpSessionId: rebuild ? "" : handle }, rebuild, reason });
+    try {
+      if (effective.explicitAgent === "agy-old") throw new Error("Native restoration requires migrating the local agy-old preset first");
+      // Refuse an overlay/row mismatch rather than touching an unrelated backend's handle.
+      if (!["agy", "agy-old"].includes(before.agentId)) throw new Error("AGY restoration found conflicting stored and effective agents");
+      const handle = before.acpSessionId;
+      if (handle && ownership.native.has(handle) && ownership.packaged.has(handle)) throw new Error("Ambiguous AGY session ownership");
+      const reason = !handle ? "unbound" : ownership.native.has(handle) ? "native" : ownership.packaged.has(handle) ? "package" : "unrecognized";
+      const rebuild = reason === "package" || reason === "unrecognized";
+      changes.push({ before, after: { ...before, agentId: "agy", acpSessionId: rebuild ? "" : handle }, rebuild, reason });
+    } catch (error) {
+      if (!onRefused) throw error;
+      onRefused(before, error as Error);
+    }
   }
   return changes;
 }

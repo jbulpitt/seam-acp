@@ -3,6 +3,7 @@ dotenv.config({ override: true });
 import fs from "node:fs";
 import path from "node:path";
 import { z } from "zod";
+import { logger } from "./lib/logger.js";
 import { parkedAgentMessage } from "./core/parked-agents.js";
 import { DEFAULT_BRAND_ICON_BASE_URL } from "./core/agent-brand.js";
 import { retiredAgentConfigMessage } from "./core/retired-agents.js";
@@ -1063,8 +1064,8 @@ export type BridgeHostConfig = z.infer<typeof BridgeHostSchema> & { id: string }
 
 // Exported (#58 P3 / D7): the Tier-C mutation path builds a candidate presets
 // object and MUST round-trip it through this exact schema before writing the
-// file — an invalid channel-presets.json throws in loadConfig() and would fail
-// the next boot, so a bad tool call must be rejected, never persisted.
+// file. Boot drops invalid entries, but mutation must reject rather than
+// persist a setting that would disappear on restart.
 export const PresetsFileSchema = z.object({
   channels: z.record(numericId, ChannelPresetSchema).optional().default({}),
   threads: z.record(numericId, ThreadPresetSchema).optional().default({}),
@@ -1097,6 +1098,8 @@ export type ThreadPreset = PresetValues & {
 };
 
 export type Config = z.infer<typeof Schema> & {
+  agyDisabledReason?: string;
+  defaultAgentDisabledReason?: string;
   channelPresets: Map<string, ChannelPreset>;
   threadPresets: Map<string, ThreadPreset>;
   bridgePresets: Map<string, BridgeHostConfig>;
@@ -1290,10 +1293,21 @@ export function resolveThreadLocation(
  * .env (#495). Missing fixture keys must fail/default on their own; unrelated
  * deployment settings must not invalidate them. No-argument production callers
  * retain the existing import-time dotenv override and process.env semantics. */
-export function loadConfig({ env = process.env }: {
+export function loadConfig({ env = process.env, warn = (message) => logger.warn(message) }: {
   env?: Readonly<Record<string, string | undefined>>;
+  warn?: (message: string) => void;
 } = {}): Config {
-  const parsed = Schema.safeParse(env);
+  let agyDisabledReason: string | undefined;
+  const input = { ...env };
+  // Parse AGY separately so its field validation cannot disable Discord.
+  const agyKeys = Object.keys(Schema.shape).filter((key) => key.startsWith("AGY_"));
+  const agySchema = Schema.pick(Object.fromEntries(agyKeys.map((key) => [key, true])) as Record<keyof typeof Schema.shape, true>);
+  const agyParsed = agySchema.safeParse(input);
+  if (!agyParsed.success) {
+    agyDisabledReason = `Invalid configuration:\n${agyParsed.error.issues.map((i) => `  - ${i.path.join(".")}: ${i.message}`).join("\n")}`;
+    for (const key of agyKeys) delete input[key];
+  }
+  const parsed = Schema.safeParse(input);
   if (!parsed.success) {
     const issues = parsed.error.issues
       .map((i) => `  - ${i.path.join(".") || "(root)"}: ${i.message}`)
@@ -1311,76 +1325,74 @@ export function loadConfig({ env = process.env }: {
   }
   cfg.REPOS_ROOT = reposRoot;
 
-  if (cfg.AGY_ENABLED || cfg.AGY_OLD_ROLLBACK_ENABLED) {
-    if (cfg.AGY_PIN === "unpinned") {
-      const standing = [
-        ["AGY_CLI_PATH", cfg.AGY_CLI_PATH],
-        ["AGY_OLD_CLI_PATH", cfg.AGY_OLD_CLI_PATH],
-        ["AGY_BIN", cfg.AGY_BIN],
-        ["AGY_SHA256", cfg.AGY_SHA256],
-        ["AGY_VERSION", cfg.AGY_VERSION],
-        ["AGY_RUNTIME_ROOT", cfg.AGY_RUNTIME_ROOT],
-      ].filter(([, value]) => typeof value === "string" && value.trim()).map(([name]) => name);
-      if (standing.length) {
-        throw new Error(
-          "Invalid configuration: AGY_PIN=unpinned still has " +
-          `${standing.join(", ")}. Remove the standing pin, or unset AGY_PIN to keep it. ` +
-          "Unpinned runs the ordinary agy on PATH and does not check a digest. " +
-          "On Linux the pinned path executes the verified bytes from a snapshot, so a swap after verification cannot change the child. " +
-          "This mode does not: a binary that was one version when someone looked can be another by the time it runs.",
-        );
+  try {
+    if (cfg.AGY_ENABLED || cfg.AGY_OLD_ROLLBACK_ENABLED) {
+      if (cfg.AGY_PIN === "unpinned") {
+        const standing = [
+          ["AGY_CLI_PATH", cfg.AGY_CLI_PATH],
+          ["AGY_OLD_CLI_PATH", cfg.AGY_OLD_CLI_PATH],
+          ["AGY_BIN", cfg.AGY_BIN],
+          ["AGY_SHA256", cfg.AGY_SHA256],
+          ["AGY_VERSION", cfg.AGY_VERSION],
+          ["AGY_RUNTIME_ROOT", cfg.AGY_RUNTIME_ROOT],
+        ].filter(([, value]) => typeof value === "string" && value.trim()).map(([name]) => name);
+        if (standing.length) {
+          warn(`AGY_PIN=unpinned: ignoring stale pin settings ${standing.join(", ")}; using ordinary agy on PATH without digest verification`);
+          cfg.AGY_CLI_PATH = cfg.AGY_OLD_CLI_PATH = cfg.AGY_BIN = cfg.AGY_RUNTIME_ROOT = undefined;
+          cfg.AGY_SHA256 = cfg.AGY_VERSION = "";
+        }
+        if (!cfg.AGY_DEFAULT_MODEL.trim()) {
+          throw new Error("Invalid configuration: native agy requires AGY_DEFAULT_MODEL");
+        }
+        if (!/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,63}$/.test(cfg.AGY_CREDENTIAL_SCOPE)) {
+          throw new Error("Invalid configuration: AGY_CREDENTIAL_SCOPE must be a non-secret semantic identifier");
+        }
+      } else {
+        cfg.AGY_CLI_PATH = cfg.AGY_CLI_PATH?.trim() || cfg.AGY_OLD_CLI_PATH?.trim() || cfg.AGY_BIN?.trim();
+        if (!cfg.AGY_CLI_PATH || !path.isAbsolute(cfg.AGY_CLI_PATH)) {
+          throw new Error("Invalid configuration: native agy requires an absolute AGY_CLI_PATH (AGY_OLD_CLI_PATH / AGY_BIN accepted as aliases)");
+        }
+        if (!cfg.AGY_DEFAULT_MODEL.trim()) {
+          throw new Error("Invalid configuration: native agy requires AGY_DEFAULT_MODEL");
+        }
+        const missing = [
+          ["AGY_VERSION", cfg.AGY_VERSION],
+          ["AGY_SHA256", cfg.AGY_SHA256],
+          ["AGY_RUNTIME_ROOT", cfg.AGY_RUNTIME_ROOT],
+        ].filter(([, value]) => !value).map(([name]) => name);
+        if (missing.length) {
+          throw new Error(
+            `Invalid configuration: native agy requires ${missing.join(", ")}. ` +
+            "Omitting them does not unpin agy. AGY_PIN=unpinned is the mode that runs the ordinary agy on PATH with no digest check.",
+          );
+        }
+        if (!path.isAbsolute(cfg.AGY_RUNTIME_ROOT!)) {
+          throw new Error("Invalid configuration: AGY_RUNTIME_ROOT must be an absolute path");
+        }
+        if (cfg.AGY_VERSION.length > 256 || /[\r\n\0]/.test(cfg.AGY_VERSION)) {
+          throw new Error("Invalid configuration: AGY_VERSION must be the exact bounded first line from AGY_BIN --version");
+        }
+        if (!/^[a-f0-9]{64}$/.test(cfg.AGY_SHA256)) {
+          throw new Error("Invalid configuration: AGY_SHA256 must be 64 lowercase hex characters");
+        }
+        if (cfg.AGY_BIN?.trim() && path.normalize(cfg.AGY_BIN.trim()) !== path.normalize(cfg.AGY_CLI_PATH)) {
+          throw new Error("Invalid configuration: native AGY_BIN and AGY_CLI_PATH must identify the same executable");
+        }
+        if (!/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,63}$/.test(cfg.AGY_CREDENTIAL_SCOPE)) {
+          throw new Error("Invalid configuration: AGY_CREDENTIAL_SCOPE must be a non-secret semantic identifier");
+        }
       }
-      if (!cfg.AGY_DEFAULT_MODEL.trim()) {
-        throw new Error("Invalid configuration: native agy requires AGY_DEFAULT_MODEL");
-      }
-      if (!/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,63}$/.test(cfg.AGY_CREDENTIAL_SCOPE)) {
-        throw new Error("Invalid configuration: AGY_CREDENTIAL_SCOPE must be a non-secret semantic identifier");
-      }
-    } else {
-    cfg.AGY_CLI_PATH = cfg.AGY_CLI_PATH?.trim() || cfg.AGY_OLD_CLI_PATH?.trim() || cfg.AGY_BIN?.trim();
-    if (!cfg.AGY_CLI_PATH || !path.isAbsolute(cfg.AGY_CLI_PATH)) {
-      throw new Error("Invalid configuration: native agy requires an absolute AGY_CLI_PATH (AGY_OLD_CLI_PATH / AGY_BIN accepted as aliases)");
     }
-    if (!cfg.AGY_DEFAULT_MODEL.trim()) {
-      throw new Error("Invalid configuration: native agy requires AGY_DEFAULT_MODEL");
-    }
-    const missing = [
-      ["AGY_VERSION", cfg.AGY_VERSION],
-      ["AGY_SHA256", cfg.AGY_SHA256],
-      ["AGY_RUNTIME_ROOT", cfg.AGY_RUNTIME_ROOT],
-    ].filter(([, value]) => !value).map(([name]) => name);
-    if (missing.length) {
-      throw new Error(
-        `Invalid configuration: native agy requires ${missing.join(", ")}. ` +
-        "Omitting them does not unpin agy. AGY_PIN=unpinned is the mode that runs the ordinary agy on PATH with no digest check.",
-      );
-    }
-    if (!path.isAbsolute(cfg.AGY_RUNTIME_ROOT!)) {
-      throw new Error("Invalid configuration: AGY_RUNTIME_ROOT must be an absolute path");
-    }
-    if (cfg.AGY_VERSION.length > 256 || /[\r\n\0]/.test(cfg.AGY_VERSION)) {
-      throw new Error("Invalid configuration: AGY_VERSION must be the exact bounded first line from AGY_BIN --version");
-    }
-    if (!/^[a-f0-9]{64}$/.test(cfg.AGY_SHA256)) {
-      throw new Error("Invalid configuration: AGY_SHA256 must be 64 lowercase hex characters");
-    }
-    if (cfg.AGY_BIN?.trim() && path.normalize(cfg.AGY_BIN.trim()) !== path.normalize(cfg.AGY_CLI_PATH)) {
-      throw new Error("Invalid configuration: native AGY_BIN and AGY_CLI_PATH must identify the same executable");
-    }
-    if (!/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,63}$/.test(cfg.AGY_CREDENTIAL_SCOPE)) {
-      throw new Error("Invalid configuration: AGY_CREDENTIAL_SCOPE must be a non-secret semantic identifier");
-    }
-    }
+    if (cfg.AGY_NATIVE_RESTORE && !cfg.AGY_ENABLED) throw new Error("AGY_NATIVE_RESTORE requires native AGY_ENABLED");
+  } catch (error) {
+    agyDisabledReason = (error as Error).message;
   }
-  if (cfg.AGY_NATIVE_RESTORE && !cfg.AGY_ENABLED) throw new Error("AGY_NATIVE_RESTORE requires native AGY_ENABLED");
+  if (agyDisabledReason) {
+    cfg.AGY_ENABLED = cfg.AGY_OLD_ROLLBACK_ENABLED = cfg.AGY_NATIVE_RESTORE = false;
+    warn(`AGY disabled: ${agyDisabledReason}`);
+  }
 
-  // #12: DEFAULT_AGENT naming a RETIRED agent is a configuration error, refused
-  // here rather than at the first turn. This is the bot-wide default, so every
-  // thread created under it would be stamped with an agent that can never spawn
-  // — `ensureSessionRecord` writes `defaultAgentId` into the row, and the
-  // failure would only surface later, per-thread, as a turn error. Fail at boot
-  // instead, and never silently substitute another agent: which agent replaces
-  // a retired default is the operator's decision, not ours.
+  let defaultAgentDisabledReason: string | undefined;
   const parkedDefault = parkedAgentMessage(
     cfg.DEFAULT_AGENT,
     cfg.OLLAMA_CLOUD_ENABLED,
@@ -1388,43 +1400,41 @@ export function loadConfig({ env = process.env }: {
     "DEFAULT_AGENT"
   );
   if (parkedDefault) {
-    throw new Error(
+    defaultAgentDisabledReason = (
       `Invalid configuration: ${parkedDefault}\n` +
         `Supported live agents include copilot, claude, codex, grok, agy.`
     );
   }
   const retiredDefault = retiredAgentConfigMessage("DEFAULT_AGENT", cfg.DEFAULT_AGENT);
   if (retiredDefault) {
-    throw new Error(
+    defaultAgentDisabledReason = (
       `Invalid configuration: ${retiredDefault}\n` +
         `Supported agents include copilot, claude, codex, grok, agy.`
     );
   }
-  // New sessions stamp DEFAULT_AGENT onto local threads. A default that is
-  // denied at local would mint rows that only fail on their first turn —
-  // the same trap as a retired default. Fail at boot, do not substitute.
+  // Refuse new default-dependent sessions, not the bot or explicit presets.
   if (isAgentLocationDenied(cfg.DEFAULT_AGENT, LOCAL_LOCATION, cfg.AGENT_LOCATION_DENY)) {
-    throw new Error(
+    defaultAgentDisabledReason = (
       `Invalid configuration: ${deniedAgentLocationMessage(cfg.DEFAULT_AGENT, LOCAL_LOCATION, "config")}\n` +
         `Supported live agents include copilot, claude, codex, grok, agy.`
     );
   }
+  if (defaultAgentDisabledReason) warn(`DEFAULT_AGENT disabled for new sessions: ${defaultAgentDisabledReason}`);
 
   const { channelPresets, threadPresets, bridgePresets } = buildChannelPresetMaps(
-    cfg.CHANNEL_PRESETS_FILE
+    cfg.CHANNEL_PRESETS_FILE, { dropInvalidEntries: true, warn }
   );
-  return { ...cfg, channelPresets, threadPresets, bridgePresets };
+  return { ...cfg, agyDisabledReason, defaultAgentDisabledReason, channelPresets, threadPresets, bridgePresets };
 }
 
 /**
  * Parse + validate `CHANNEL_PRESETS_FILE` into fresh channel/thread preset maps.
- * Throws on read / JSON / schema failure — callers that must not crash (the P0
- * hot-reloader) catch and keep their previous good maps. Used both at boot
- * (loadConfig) and on every hot-reload swap so the two paths validate
- * identically (D7: single zod schema, never hand-rolled parsing).
+ * Boot drops invalid entries using the same schema. Strict callers throw on
+ * any failure; hot reload retains its previous good maps.
  */
 export function buildChannelPresetMaps(
-  file: string | undefined
+  file: string | undefined,
+  options: { dropInvalidEntries?: boolean; warn?: (message: string) => void } = {},
 ): {
   channelPresets: Map<string, ChannelPreset>;
   threadPresets: Map<string, ThreadPreset>;
@@ -1450,6 +1460,21 @@ export function buildChannelPresetMaps(
     throw new Error(
       `CHANNEL_PRESETS_FILE is not valid JSON: ${abs} (${(err as Error).message})`
     );
+  }
+  if (options.dropInvalidEntries && parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+    const root = parsed as Record<string, unknown>;
+    for (const section of ["channels", "threads", "bridges"] as const) {
+      const entries = root[section];
+      if (!entries || typeof entries !== "object" || Array.isArray(entries)) continue;
+      const entrySchema = PresetsFileSchema.shape[section];
+      for (const [id, value] of Object.entries(entries)) {
+        const entry = entrySchema.safeParse({ [id]: value });
+        if (entry.success) continue;
+        const cause = entry.error.issues.map((i) => `${section}.${i.path.join(".")}: ${i.message}`).join("; ");
+        options.warn?.(`CHANNEL_PRESETS_FILE entry disabled (${abs}): ${cause}`);
+        delete (entries as Record<string, unknown>)[id];
+      }
+    }
   }
   const result = PresetsFileSchema.safeParse(parsed);
   if (!result.success) {

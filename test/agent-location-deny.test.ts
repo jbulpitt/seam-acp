@@ -278,7 +278,7 @@ describe("#474 SessionRouter: copilot@remote-a still plans; copilot@local does n
 
 });
 
-describe("#474 DEFAULT_AGENT denied at local refuses boot", () => {
+describe("DEFAULT_AGENT denied at local refuses only default-dependent new sessions", () => {
   let env: Record<string, string | undefined>;
 
   function baseEnv(extra: Record<string, string | undefined>) {
@@ -292,9 +292,11 @@ describe("#474 DEFAULT_AGENT denied at local refuses boot", () => {
 
   it("refuses DEFAULT_AGENT=copilot when copilot@local is denied", () => {
     baseEnv({ DEFAULT_AGENT: "copilot", AGENT_LOCATION_DENY: "copilot@local" });
-    expect(() => loadConfig({ env })).toThrow(/AGENT_LOCATION_DENY/);
-    expect(() => loadConfig({ env })).toThrow(/will not substitute one for you/);
-    expect(() => loadConfig({ env })).not.toThrow(/\/seam config agent/);
+    const cfg = loadConfig({ env });
+    expect(cfg.DEFAULT_AGENT).toBe("copilot");
+    expect(cfg.defaultAgentDisabledReason).toMatch(/AGENT_LOCATION_DENY/);
+    expect(cfg.defaultAgentDisabledReason).toMatch(/will not substitute one for you/);
+    expect(cfg.defaultAgentDisabledReason).not.toMatch(/\/seam config agent/);
   });
 
   it("accepts DEFAULT_AGENT=claude with copilot@local denied", () => {

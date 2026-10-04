@@ -62,6 +62,7 @@ interface PersistedSlot {
 interface PersistedState {
   version: 1;
   slots: PersistedSlot[];
+  refusedSlots?: Array<{ slot: number; cause: string }>;
 }
 
 interface SlotEntry {
@@ -349,6 +350,7 @@ async function removeStaleSocket(socketPath: string): Promise<void> {
 
 export class SessiondServer {
   private readonly slots = new Map<number, SlotEntry>();
+  private readonly refusedSlots = new Map<number, string>();
   private readonly connections = new Set<ConnectionState>();
   private readonly outputLog: OutputLog;
   private readonly server: net.Server;
@@ -489,6 +491,7 @@ export class SessiondServer {
       case "replayOutput": return this.replayOutput(parseCursorParams(request.params));
       case "ack": {
         const params = parseAckParams(request.params);
+        this.assertRestorableSlot(params.slot);
         this.outputLog.ack(params.slot, params.throughSeq);
         // The holder keeps unread output across a sessiond restart; let it go.
         const entry = this.slots.get(params.slot);
@@ -516,6 +519,7 @@ export class SessiondServer {
   }
 
   private async spawnSlot(params: SessiondSpawnParams, launch: { firstSeq?: number } = {}): Promise<{ slot: number; pid: number }> {
+    this.assertRestorableSlot(params.slot);
     const existing = this.slots.get(params.slot);
     if (existing && this.entryAlive(existing)) {
       throw new SessiondError("slot_exists", "spawn refused: slot already has a live process");
@@ -779,6 +783,7 @@ export class SessiondServer {
   }
 
   private async writeSlot(params: SessiondWriteParams): Promise<{ slot: number; acceptedBytes: number; backpressured: boolean }> {
+    this.assertRestorableSlot(params.slot);
     const entry = this.slots.get(params.slot);
     if (!entry) throw new SessiondError("slot_not_found", "write refused: slot does not exist");
     if (!entry.attached || !this.entryAlive(entry)) {
@@ -804,6 +809,7 @@ export class SessiondServer {
   }
 
   private subscribe(connection: ConnectionState, params: SessiondSubscribeParams): { slot: number; subscribed: true; throughSeq: number } {
+    this.assertRestorableSlot(params.slot);
     if (!this.slots.has(params.slot)) throw new SessiondError("slot_not_found", "subscribe refused: slot does not exist");
     // Registration, replay, and acknowledgement happen in one event-loop turn.
     // A child event cannot interleave, so the consumer observes retained frames
@@ -833,6 +839,7 @@ export class SessiondServer {
   }
 
   private killSlot(params: SessiondKillParams): { slot: number; signalled: boolean; alreadyDead: boolean } {
+    this.assertRestorableSlot(params.slot);
     const entry = this.slots.get(params.slot);
     if (!entry) throw new SessiondError("slot_not_found", "kill refused: slot does not exist");
     if (!this.entryAlive(entry)) return { slot: params.slot, signalled: false, alreadyDead: true };
@@ -869,10 +876,14 @@ export class SessiondServer {
       ...(entry.signal !== undefined ? { signal: entry.signal } : {}),
       ...(entry.orphanReason ? { orphanReason: entry.orphanReason } : {}),
     }));
+    for (const slot of this.refusedSlots.keys()) {
+      health.push({ slot, alive: false, attached: false, pid: null, lastStdoutMsAgo: null, lastStdinMsAgo: null, orphanReason: "identity_unverifiable" });
+    }
     return { slots: health.map((entry) => entry.slot), health };
   }
 
   private replayOutput(params: SessiondReplayOutputParams): SessiondReplayOutputResult {
+    this.assertRestorableSlot(params.slot);
     if (!this.slots.has(params.slot)) throw new SessiondError("slot_not_found", "replay refused: slot does not exist");
     const replay = this.outputLog.since(params.slot, params.afterSeq);
     return {
@@ -892,13 +903,41 @@ export class SessiondServer {
 
   private async recoverPersistedSlots(): Promise<void> {
     let parsed: PersistedState;
+    const raw = await fs.readFile(this.options.statePath, "utf8").catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return undefined;
+      throw error;
+    });
+    if (raw === undefined) return;
     try {
-      parsed = JSON.parse(await fs.readFile(this.options.statePath, "utf8")) as PersistedState;
-      if (parsed.version !== 1 || !Array.isArray(parsed.slots)) throw new Error("invalid state");
+      parsed = JSON.parse(raw) as PersistedState;
+      if (!parsed || typeof parsed !== "object") throw new Error("state must be an object");
+      if (parsed.version !== 1) throw new Error(`unsupported state version ${typeof parsed.version === "number" ? parsed.version : "(missing or nonnumeric)"}; expected 1`);
+      if (!Array.isArray(parsed.slots)) throw new Error("state slots must be an array");
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
-      throw new Error("sessiond state file is invalid");
+      // Keep the parser's cause and position, but not quoted private state.
+      const cause = error instanceof SyntaxError
+        ? `invalid JSON (${error.name}: ${error.message.replace(/"(?:\\.|[^"\\])*"/g, '"[redacted]"')})`
+        : (error as Error).message;
+      const backup = `${this.options.statePath}.refused-${randomUUID()}`;
+      await fs.rename(this.options.statePath, backup);
+      await fs.chmod(backup, 0o600);
+      // Without identities we cannot kill or respawn existing work. Reserve
+      // only slots with surviving holder/resume artifacts; new slots can run.
+      for (const directory of [this.slotsDirectory(), this.resumeDir()]) {
+        const names = await fs.readdir(directory).catch((readError: NodeJS.ErrnoException) => {
+          if (readError.code === "ENOENT") return [];
+          throw readError;
+        });
+        for (const name of names) {
+          const match = /^(\d+)(?:-[a-f0-9]+\.sock|\.json|\.log)$/.exec(name);
+          if (match) this.refusedSlots.set(Number(match[1]), `sessiond state recovery refused: ${cause}`);
+        }
+      }
+      console.error(`[seam-sessiond] state recovery disabled: ${cause}; original retained at ${backup}; ${this.refusedSlots.size} existing slots refused, new slots remain enabled`);
+      await this.persist();
+      return;
     }
+    for (const { slot, cause } of parsed.refusedSlots ?? []) this.refusedSlots.set(slot, cause);
 
     const legacy: Array<{ entry: SlotEntry; identity: ProcessIdentity }> = [];
     const held: SlotEntry[] = [];
@@ -985,6 +1024,7 @@ export class SessiondServer {
     const names = await fs.readdir(directory).catch(() => [] as string[]);
     await Promise.all(names.filter((name) => /^\d+\.json$/.test(name)).map(async (name) => {
       const file = path.join(directory, name);
+      if (this.refusedSlots.has(Number(name.slice(0, -5)))) return;
       try {
         const record = JSON.parse(await fs.readFile(file, "utf8")) as {
           version?: unknown; slot?: unknown; initialStdinBase64?: unknown;
@@ -1009,6 +1049,7 @@ export class SessiondServer {
     this.persistQueue = this.persistQueue.then(async () => {
       const state: PersistedState = {
         version: 1,
+        ...(this.refusedSlots.size ? { refusedSlots: [...this.refusedSlots].map(([slot, cause]) => ({ slot, cause })) } : {}),
         slots: [...this.slots.values()].map((entry) => ({
           slot: entry.slot,
           pid: entry.pid,
@@ -1028,5 +1069,10 @@ export class SessiondServer {
       await fs.chmod(this.options.statePath, 0o600);
     });
     return this.persistQueue;
+  }
+
+  private assertRestorableSlot(slot: number): void {
+    const cause = this.refusedSlots.get(slot);
+    if (cause) throw new SessiondError("slot_not_alive", cause);
   }
 }

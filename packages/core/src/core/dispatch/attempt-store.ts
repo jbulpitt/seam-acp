@@ -866,9 +866,9 @@ export class TurnAttemptStore {
     const settled: SettledUnstartedAttempt[] = [];
     for (const attempt of this.list("active")) {
       if (attempt.promptStarted || attempt.acpSessionId) continue;
-      if (attempt.spec.session === "isolated" || attempt.spec.preset || attempt.spec.agentId) continue;
       const key = attempt.spec?.target;
       if (!key || (target !== undefined && key !== target)) continue;
+      if (attempt.spec.session === "isolated" || attempt.spec.preset || attempt.spec.agentId) continue;
       const laterId = this.laterQueueCompletion(key, attempt.id, attempt.updatedUtc);
       if (!laterId) continue;
       if (!this.cancelUnstarted(attempt, UNSTARTED_SUPERSEDED_REASON)) continue;

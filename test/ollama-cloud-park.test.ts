@@ -46,7 +46,7 @@ import {
   shouldIncludeLinkworksOllamaSource,
   shouldRegisterOllamaCloud,
 } from "../packages/core/src/core/parked-agents.js";
-import { createAgentQuotaSources } from "../packages/core/src/core/quota/quota-poller.js";
+import { createAgentQuotaSources } from "./quota-source-fixture.js";
 import { createDefaultServiceStatusSources } from "../packages/core/src/core/service-status/sources/registry.js";
 import { loadConfig } from "../packages/core/src/config.js";
 import { DEFAULT_THREAD_NAMER_CONFIG } from "../packages/core/src/platforms/discord/thread-namer.js";

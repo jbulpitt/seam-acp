@@ -15,7 +15,7 @@ import {
   WEEKLY_WINDOW_SECONDS,
 } from "../packages/core/src/core/quota/agent-quota.js";
 import { parseGrokBilling } from "@seam/adapters";
-import { createAgentQuotaSources } from "../packages/core/src/core/quota/quota-poller.js";
+import { createAgentQuotaSources } from "./quota-source-fixture.js";
 
 const identity = { agentId: "agent", displayName: "Agent" };
 const now = 2_000_000_000;

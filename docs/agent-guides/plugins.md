@@ -2,7 +2,7 @@
 
 The controller loads `plugins/builtins.ts` in order, independently of Seam MCP.
 Only known built-ins are loaded. The controller also installs thread naming
-and optional service status through controller-only capability bootstraps.
+quota and optional service status through controller-only capability bootstraps.
 
 A descriptor declares its id, API version, built-in/internal eligibility,
 optional config validation and activate/dispose hooks, and contributions.
@@ -83,3 +83,22 @@ existing precedence. MCP still mounts only with `SEAM_MCP_ENABLED`.
 
 Repository, HTTP, attempt and bridge contributions are not public surfaces.
 Attachment, wake, watch, choice and result fences retain their kernel handlers.
+
+## Quota and turn activity
+
+The quota built-in owns `/seam info usage`, `agent_quota`, the pinned quota
+card and `seam-quota:` Refresh. Its maintenance job retains the existing
+activity-based cadence, refresh bounds and stale-value policy.
+`DISCORD_AGENT_QUOTA_THREAD_ID` and `QUOTA_STALE_RETENTION_MS` are unchanged;
+the storage alias keeps `agent-quota-card.json` and its pinned message.
+
+The kernel emits immutable `turn-started` and `turn-completed` facts once,
+ordered per agent, with the turn id, timestamp, host binding and account id.
+Recovery adoption emits completion, not another start. Emission never waits
+for a listener; failures cannot veto a turn or prevent sibling observations.
+
+Quota's internal-tier facades expose configured/thread binding snapshots,
+`readUsage(binding)` and card transport. Only the usage facade reads profiles
+or live connections, including agy's verified runtime and Grok's live read.
+Provider failures retain their sanitized real cause and affect only that row.
+MCP-off deployments keep the job, card, Refresh and usage slash command.

@@ -1,26 +1,8 @@
-import {
-  fetchAgyUserStatus,
-  fetchClaudeUsage,
-  fetchCodexUsage,
-  fetchCopilotUsage,
-  fetchGrokUsage,
-  fetchGrokUsageFromConnection,
-  fetchOllamaCloudUsage,
-  redactProbeText,
-  type AgentProfile,
-} from "@seam/adapters";
-import type { AgyLaunchRuntime } from "@seam/adapters";
+import { redactProbeText } from "@seam/adapters";
+import type { TurnBinding } from "../../plugins/turn-activity-registry.js";
 import type { Logger } from "../../lib/logger.js";
-import { isOllamaCloudAgentId } from "../parked-agents.js";
 import {
-  mapAgyQuota,
-  mapClaudeQuota,
-  mapCodexQuota,
-  mapCopilotQuota,
-  mapGrokQuota,
-  mapOllamaCloudQuota,
   mapUnavailableQuota,
-  mapUnlimitedQuota,
   type AgentQuota,
   type QuotaAgentIdentity,
 } from "./agent-quota.js";
@@ -35,18 +17,9 @@ import {
   quotaPollIntervalMs,
 } from "./quota-registry.js";
 
-export type QuotaConnectionRequest = (
-  method: string,
-  params?: unknown
-) => Promise<unknown>;
-
 export interface AgentQuotaSource extends QuotaAgentIdentity {
   eventDriven: boolean;
-  fetch: (signal: AbortSignal) => Promise<AgentQuota>;
-  fetchFromConnection?: (
-    request: QuotaConnectionRequest,
-    signal: AbortSignal
-  ) => Promise<AgentQuota>;
+  fetch: (signal: AbortSignal, binding?: Readonly<TurnBinding>) => Promise<AgentQuota>;
 }
 
 export interface AgentQuotaRefreshResult {
@@ -65,7 +38,7 @@ export interface AgentQuotaRefreshSummary {
   sources: AgentQuotaRefreshResult[];
 }
 
-function quotaFailureDiagnostic(error: unknown): Record<string, unknown> {
+function quotaFailureDiagnostic(error: unknown): { name: string; message: string; code?: string | number } {
   const safe = (value: string): string => redactProbeText(
     value.replace(/\b[a-z][a-z0-9+.-]*:\/\/[^\s"'<>]+/gi, "[redacted]"), process.env,
   )
@@ -79,102 +52,6 @@ function quotaFailureDiagnostic(error: unknown): Record<string, unknown> {
   };
 }
 
-export function createAgentQuotaSources(
-  profiles: AgentProfile[],
-  opts: {
-    agyRuntime?: AgyLaunchRuntime;
-    grokCliPath?: string;
-    ollamaUsageCliPath?: string;
-    /**
-     * When false, never wire an ollama-cloud quota source — even if a stale
-     * profile is still in the list. `undefined` keeps historical behaviour
-     * (profile-driven) so existing tests that pass an ollama-cloud profile
-     * without the flag still exercise the CLI path.
-     */
-    ollamaCloudEnabled?: boolean;
-  }
-): AgentQuotaSource[] {
-  const live =
-    opts.ollamaCloudEnabled === false
-      ? profiles.filter((profile) => !isOllamaCloudAgentId(profile.id))
-      : profiles;
-  return live.map((profile) => {
-    const identity = { agentId: profile.id, displayName: profile.displayName };
-    if (profile.id === "agy") {
-      if (!opts.agyRuntime) {
-        throw new Error("native agy quota requires the configured verified runtime");
-      }
-      return {
-        ...identity,
-        eventDriven: false,
-        // #361: the signal reaches the spawn now. The probe itself no longer
-        // issues a prompt, so an abandoned refresh costs nothing either way —
-        // but the child still stops with the refusal rather than outliving it.
-        fetch: async (signal) =>
-          mapAgyQuota(identity, await fetchAgyUserStatus(opts.agyRuntime!, signal)),
-      };
-    }
-    if (profile.id === "ollama-cloud") {
-      return {
-        ...identity,
-        eventDriven: false,
-        // #361: the signal has to reach the spawn. Dropping it here left an
-        // `ollama-usage` child running to its own 15s timer after this poller
-        // had already reported the refusal.
-        fetch: async (signal) =>
-          mapOllamaCloudQuota(
-            identity,
-            await fetchOllamaCloudUsage(opts.ollamaUsageCliPath, signal)
-          ),
-      };
-    }
-    if (profile.id === "codex" || profile.id.startsWith("codex-")) {
-      return {
-        ...identity,
-        eventDriven: true,
-        fetch: async (signal) => mapCodexQuota(identity, await fetchCodexUsage({ signal })),
-      };
-    }
-    if (profile.id === "grok" || profile.id.startsWith("grok-")) {
-      return {
-        ...identity,
-        eventDriven: true,
-        // #349: the signal has to reach the cold path, which spawns a process
-        // and can run 50s against this poller's 30s deadline. Dropping it here
-        // is what let an aborted refresh leave a `grok agent stdio` running —
-        // the caller stopped waiting, the work did not stop.
-        fetch: async (signal) =>
-          mapGrokQuota(identity, await fetchGrokUsage(opts.grokCliPath, signal)),
-        fetchFromConnection: async (request, signal) =>
-          mapGrokQuota(identity, await fetchGrokUsageFromConnection(request, signal)),
-      };
-    }
-    if (profile.id === "copilot" || profile.id.startsWith("copilot-")) {
-      return {
-        ...identity,
-        eventDriven: false,
-        fetch: async (signal) =>
-          mapCopilotQuota(identity, await fetchCopilotUsage(profile.configDir, signal)),
-      };
-    }
-    if (
-      (profile.id === "claude" || profile.id.startsWith("claude-")) &&
-      !profile.brand
-    ) {
-      return {
-        ...identity,
-        eventDriven: false,
-        fetch: async () => mapClaudeQuota(identity, await fetchClaudeUsage(profile.configDir)),
-      };
-    }
-    return {
-      ...identity,
-      eventDriven: false,
-      fetch: async () =>
-        mapUnavailableQuota(identity, "This agent does not expose quota data"),
-    };
-  });
-}
 
 export class AgentQuotaPoller {
   private readonly logger: Logger;
@@ -186,6 +63,8 @@ export class AgentQuotaPoller {
    *  pull a refresh sooner — never push it out (which would starve the timer). */
   private readonly timerFireAt = new Map<string, number>();
   private readonly inFlight = new Map<string, Promise<AgentQuotaRefreshResult>>();
+  private readonly controllers = new Set<AbortController>();
+  private readonly owned = new Set<Promise<AgentQuota>>();
   private readonly lastRefreshAt = new Map<string, number>();
   /** When each agent last produced an `ok` snapshot (for stale retention). */
   private readonly lastGoodAt = new Map<string, number>();
@@ -197,7 +76,7 @@ export class AgentQuotaPoller {
   private started = false;
 
   constructor(opts: {
-    logger: Logger;
+    logger: Pick<Logger, "child">;
     registry: QuotaRegistry;
     sources: AgentQuotaSource[];
     onUpdate?: (quota: AgentQuota) => void;
@@ -228,7 +107,10 @@ export class AgentQuotaPoller {
     for (const timer of this.timers.values()) clearTimeout(timer);
     this.timers.clear();
     this.timerFireAt.clear();
+    for (const controller of this.controllers) controller.abort();
   }
+
+  async drain(): Promise<void> { await Promise.allSettled([...this.owned, ...this.inFlight.values()]); }
 
   setOnUpdate(onUpdate: ((quota: AgentQuota) => void) | undefined): void {
     this.onUpdate = onUpdate;
@@ -255,11 +137,11 @@ export class AgentQuotaPoller {
 
   async turnCompleted(
     agentId: string,
-    request?: QuotaConnectionRequest
+    binding?: Readonly<TurnBinding>
   ): Promise<AgentQuota | undefined> {
     const source = this.sources.get(agentId);
     if (!source?.eventDriven) return undefined;
-    const quota = await this.refresh(agentId, request);
+    const quota = await this.refresh(agentId, binding);
     if (this.started) this.schedule(agentId);
     return quota;
   }
@@ -288,15 +170,15 @@ export class AgentQuotaPoller {
 
   async refresh(
     agentId: string,
-    request?: QuotaConnectionRequest,
+    binding?: Readonly<TurnBinding>,
     force = false
   ): Promise<AgentQuota | undefined> {
-    return (await this.refreshResult(agentId, request, force))?.quota;
+    return (await this.refreshResult(agentId, binding, force))?.quota;
   }
 
   private async refreshResult(
     agentId: string,
-    request?: QuotaConnectionRequest,
+    binding?: Readonly<TurnBinding>,
     force = false
   ): Promise<AgentQuotaRefreshResult> {
     const source = this.sources.get(agentId);
@@ -306,7 +188,7 @@ export class AgentQuotaPoller {
     const now = Date.now();
     const previousAt = this.lastRefreshAt.get(agentId) ?? 0;
     if (!force && now - previousAt < QUOTA_MIN_REFRESH_MS) {
-      const quota = this.registry.get(agentId) ?? mapUnavailableQuota(source, "Quota has not been fetched yet");
+      const quota = this.registry.get(agentId) ?? mapUnavailableQuota({ agentId, displayName: source.displayName }, "Quota has not been fetched yet");
       return {
         agentId: source.agentId,
         displayName: source.displayName,
@@ -318,13 +200,12 @@ export class AgentQuotaPoller {
     }
     this.lastRefreshAt.set(agentId, now);
     const controller = new AbortController();
+    this.controllers.add(controller);
     const startedAt = Date.now();
     let timeout: ReturnType<typeof setTimeout> | undefined;
     let sourceWorkSettled = false;
     const sourceWork = (async (): Promise<AgentQuota> => {
-      return request && source.fetchFromConnection
-        ? await source.fetchFromConnection(request, controller.signal)
-        : await source.fetch(controller.signal);
+      return await source.fetch(controller.signal, binding);
     })().then(
       (quota) => {
         sourceWorkSettled = true;
@@ -335,6 +216,9 @@ export class AgentQuotaPoller {
         throw err;
       }
     );
+    this.owned.add(sourceWork);
+    const releaseWork = () => { this.owned.delete(sourceWork); this.controllers.delete(controller); };
+    void sourceWork.then(releaseWork, releaseWork);
     const task = (async (): Promise<AgentQuotaRefreshResult> => {
       let quota: AgentQuota;
       let timedOut = false;
@@ -356,13 +240,13 @@ export class AgentQuotaPoller {
           }),
         ]);
       } catch (err) {
-        // Keep the card stable; retain only a sanitized cause in the journal.
+        const diagnostic = quotaFailureDiagnostic(err);
         const message = timedOut
           ? `Quota refresh timed out after ${this.sourceTimeoutMs / 1000}s`
-          : "Quota refresh failed";
-        quota = mapUnavailableQuota(source, message);
+          : diagnostic.message;
+        quota = mapUnavailableQuota({ agentId, displayName: source.displayName }, message);
         this.logger.warn(
-          { agentId, error: quotaFailureDiagnostic(err), timeoutMs: timedOut ? this.sourceTimeoutMs : undefined },
+          { agentId, error: diagnostic, timeoutMs: timedOut ? this.sourceTimeoutMs : undefined },
           timedOut ? "agent quota refresh timed out" : "agent quota refresh failed"
         );
       } finally {

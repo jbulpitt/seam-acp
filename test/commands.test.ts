@@ -233,12 +233,11 @@ describe("/seam — everyday surface", () => {
     expect(rebuild?.description).toMatch(/Rebuild session from Discord after applying/);
   });
 
-  it("info group has 6 leaves", () => {
+  it("info group has 5 kernel leaves; usage is contributed by quota", () => {
     const json = seam();
     expect(slot(json, "info")?.type).toBe(SUB_COMMAND_GROUP);
     expect(leafNames(json, "info")).toEqual([
       "whoami",
-      "usage",
       "avatar",
       "help",
       "sessions",

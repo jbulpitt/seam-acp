@@ -5,6 +5,7 @@ import { SlashRegistry } from "./slash-registry.js";
 import { McpRegistry } from "./mcp-registry.js";
 import { ComponentRegistry } from "./component-registry.js";
 import { IdentityRegistry } from "./identity-registry.js";
+import { TurnActivityRegistry } from "./turn-activity-registry.js";
 import { JobRegistry } from "./job-registry.js";
 import { PluginStorage } from "./storage.js";
 import type { RESTPostAPIChatInputApplicationCommandsJSONBody } from "discord.js";
@@ -16,6 +17,7 @@ export class PluginHost {
   readonly components: ComponentRegistry;
   readonly identity: IdentityRegistry;
   readonly jobs: JobRegistry;
+  readonly turnActivity: TurnActivityRegistry;
   private readonly active: Plugin[] = [];
   private readonly ids = new Set<string>();
 
@@ -31,6 +33,7 @@ export class PluginHost {
     this.mcp = new McpRegistry(logger);
     this.components = new ComponentRegistry(logger);
     this.identity = new IdentityRegistry(logger);
+    this.turnActivity = new TurnActivityRegistry(logger);
     this.jobs = new JobRegistry(logger, plugin => this.disable(plugin));
   }
 
@@ -63,6 +66,7 @@ export class PluginHost {
         this.mcp.register(plugin.id, plugin.contributions.mcp ?? [], context);
         this.components.register(plugin.id, plugin.contributions.components ?? [], context);
         this.identity.register(plugin.id, plugin.contributions.identity ?? [], context);
+        this.turnActivity.register(plugin.id, plugin.contributions.turnActivity ?? [], context);
         this.jobs.register(plugin.id, plugin.contributions.jobs ?? []);
         this.active.push(plugin);
         logger.info("plugin activated");
@@ -81,10 +85,12 @@ export class PluginHost {
     await this.jobs.drain();
     await this.fences.drain();
     await this.identity.drain();
+    await this.turnActivity.drain();
     this.slash.clear();
     this.mcp.clear();
     this.components.clear();
     this.identity.clear();
+    this.turnActivity.clear();
     for (const plugin of this.active.splice(0).reverse()) {
       try { await plugin.dispose?.(); }
       catch (err) { this.logger.warn({ err, plugin: plugin.id }, "plugin disposal failed"); }
@@ -98,6 +104,7 @@ export class PluginHost {
     this.mcp.remove(id);
     this.components.remove(id);
     this.identity.remove(id);
+    this.turnActivity.remove(id);
     const index = this.active.findIndex(plugin => plugin.id === id);
     if (index < 0) return;
     const [plugin] = this.active.splice(index, 1);

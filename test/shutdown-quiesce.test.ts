@@ -2885,7 +2885,6 @@ describe("#174 the component wrapper AWAITS its handlers, not just gates them", 
       watchSentinel: () => {},
       handleConfigEditorComponent: async () => {},
       handleTtsEditorComponent: async () => {},
-      handleQuotaCardComponent: async () => {},
       // One slow handler stands for any real store-backed component action.
       handleVoiceConsoleComponent: async () => {
         await slow.promise;
@@ -3244,7 +3243,7 @@ describe("#174 runInbound tracks without swallowing", () => {
 });
 
 describe("#174 the component aggregate reports every handler's failure", () => {
-  /** Build the real `install()` wrapper with all four handlers controllable. */
+  /** Build the real `install()` wrapper with kernel handlers controllable. */
   function componentHost(over: Record<string, unknown>) {
     const log = makeCapturingLogger();
     const onComponent = vi.fn();
@@ -3257,7 +3256,6 @@ describe("#174 the component aggregate reports every handler's failure", () => {
       handleConfigEditorComponent: async () => {},
       handleTtsEditorComponent: async () => {},
       handleVoiceConsoleComponent: async () => {},
-      handleQuotaCardComponent: async () => {},
       ...over,
     }) as unknown as ReturnType<typeof makeQuiesceHost> & { install(): void };
     host.install();
@@ -3283,16 +3281,16 @@ describe("#174 the component aggregate reports every handler's failure", () => {
     expect(String((entry?.data as { err?: Error }).err)).toMatch(/config write failed/);
   });
 
-  it("names the handler that failed, so the log points at one of four", async () => {
+  it("names the matching handler that failed", async () => {
     const { log, wrapper } = componentHost({
-      handleQuotaCardComponent: async () => {
-        throw new Error("quota boom");
+      handleTtsEditorComponent: async () => {
+        throw new Error("tts boom");
       },
     });
-    await wrapper({ ...evt, customId: "seam-quota:x" });
+    await wrapper({ ...evt, customId: "seam-tts:x" });
     expect(log.find(/component handler failed/)?.data).toMatchObject({
       plugin: "kernel",
-      customId: "seam-quota:x",
+      customId: "seam-tts:x",
     });
   });
 
@@ -3314,15 +3312,13 @@ describe("#174 the component aggregate reports every handler's failure", () => {
       },
       handleTtsEditorComponent: async () => void ran.push("tts"),
       handleVoiceConsoleComponent: async () => void ran.push("voice"),
-      handleQuotaCardComponent: async () => void ran.push("quota"),
     });
 
     await wrapper(evt);
     expect(ran).toEqual([]);
     await wrapper({ ...evt, customId: "seam-tts:x" });
     await wrapper({ ...evt, customId: "tvc:x" });
-    await wrapper({ ...evt, customId: "seam-quota:x" });
-    expect(ran.sort()).toEqual(["quota", "tts", "voice"]);
+    expect(ran.sort()).toEqual(["tts", "voice"]);
   });
 
   it("reports a RECOVERY that itself fails, instead of swallowing it", async () => {
@@ -3375,13 +3371,13 @@ describe("#174 the component aggregate reports every handler's failure", () => {
     const gate = deferred();
     let finished = false;
     const { wrapper } = componentHost({
-      handleQuotaCardComponent: async () => {
+      handleTtsEditorComponent: async () => {
         await gate.promise;
         finished = true;
       },
     });
 
-    const running = wrapper({ ...evt, customId: "seam-quota:x" });
+    const running = wrapper({ ...evt, customId: "seam-tts:x" });
     expect(running).toBeInstanceOf(Promise);
     await flush();
     expect(finished).toBe(false);

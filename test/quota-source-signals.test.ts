@@ -13,6 +13,7 @@
  * #349; this file adds the timeline sweep that #359 could not target.
  */
 import { afterEach, describe, expect, it } from "vitest";
+import { createAgentQuotaSources } from "./quota-source-fixture.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -20,7 +21,6 @@ import { fileURLToPath } from "node:url";
 import pino from "pino";
 import {
   AgentQuotaPoller,
-  createAgentQuotaSources,
   type AgentQuotaSource,
 } from "../packages/core/src/core/quota/quota-poller.js";
 import { QuotaRegistry } from "../packages/core/src/core/quota/quota-registry.js";

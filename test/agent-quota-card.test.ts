@@ -130,7 +130,7 @@ describe("agent quota card", () => {
       logger: silent,
       adapter,
       threadId: "123",
-      dataDir: dir,
+      stateFile: path.join(dir, "agent-quota-card.json"),
       collect: () => [mapUnlimitedQuota({ agentId: "local", displayName: "Local" })],
       now: () => now,
     });

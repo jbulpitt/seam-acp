@@ -3,6 +3,7 @@ import { pino } from "pino";
 import { buildSlashRegistrationBody, getSlashCommandAccess } from "../packages/core/src/platforms/discord/commands.js";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
 import { PluginHost } from "../packages/core/src/plugins/host.js";
+import { createQuotaPlugin } from "../packages/core/src/plugins/quota/index.js";
 
 const ADMIN = "101";
 const PARTICIPANT = "102";
@@ -79,7 +80,6 @@ describe.each([
 ])("read-only versus mutation dispatch $participant/$locked", (config) => {
   it.each([
     ["info", "whoami", "cmdWhoami"],
-    ["info", "usage", "cmdUsage"],
     ["info", "help", "cmdHelp"],
     ["info", "sessions", "cmdSessions"],
     ["config", "show", "cmdConfig"],
@@ -91,6 +91,23 @@ describe.each([
     await orch.handleSlashInteractionInner(i);
     expect(orch[handler]).toHaveBeenCalledWith(i);
     expect(i.reply).not.toHaveBeenCalled();
+  });
+
+  it("allows plugin-owned usage through the real slash gate", async () => {
+    const { orch, interaction } = fixture(config);
+    const binding = { agentId: "grok", displayName: "Grok", location: "local", account: "grok", provider: "grok" as const, quotaAvailable: true };
+    const readUsage = vi.fn(async () => ({ provider: "grok" as const, data: { subscriptionTier: "Free", creditUsagePercent: null, periodType: null, periodEnd: null } }));
+    await orch.plugins.loadBuiltins([{ id: "quota", load: async () => createQuotaPlugin({
+      usage: { readUsage }, bindings: () => [binding], resolve: () => binding, card: {},
+    }) }], { quota: { QUOTA_STALE_RETENTION_MS: 0, OLLAMA_CLOUD_ENABLED: false } });
+    const i = Object.assign(interaction("seam", "info", "usage"), {
+      deferReply: vi.fn(async () => {}), editReply: vi.fn(async () => {}),
+    });
+    await orch.handleSlashInteractionInner(i);
+    expect(readUsage).toHaveBeenCalledWith(binding);
+    expect(i.editReply).toHaveBeenCalledWith({ content: "**Grok usage** — Free\nNo billing data available." });
+    expect(i.reply).not.toHaveBeenCalled();
+    await orch.plugins.dispose();
   });
 
   it("refuses mutation before invoking its handler", async () => {

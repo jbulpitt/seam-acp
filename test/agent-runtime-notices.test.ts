@@ -9,6 +9,7 @@ import { DispatchStatusPanel } from "../packages/core/src/core/dispatch-status-p
 import { TurnStatus } from "../packages/core/src/core/status-panel.js";
 import type { SessionRecord, StructuredPanel } from "../packages/core/src/core/types.js";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
+import { PluginHost } from "../packages/core/src/plugins/host.js";
 import { discordRenderer } from "../packages/core/src/platforms/discord/renderer.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 
@@ -58,7 +59,8 @@ function injectedTurn(rt: AgentRuntime, logger: Logger, onEvent: (event: AgentEv
     agentId: "test", acpSessionId: "wire-session", repoPath: "/tmp", configJson: "{}", createdUtc: now, updatedUtc: now };
   const orch = Object.create(Orchestrator.prototype) as Orchestrator;
   Object.assign(orch, { logger, config: { REPOS_ROOT: "/tmp" },
-    router: { getOrStartRuntime: async () => rt },
+    plugins: new PluginHost(logger),
+    router: { getOrStartRuntime: async () => rt, describeConfig: () => ({ location: { value: "local" } }) },
     adapter: { sendMessage: async (_channel: unknown, text: string) => { messages.push(text); } },
     ensureOwnSession: async () => {}, contextBudgetIdentity: () => undefined,
   });

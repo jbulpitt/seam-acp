@@ -5,6 +5,7 @@ import path from "node:path";
 import { pino } from "pino";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
+import { PluginHost } from "../packages/core/src/plugins/host.js";
 import { AgentRuntime, type AgentEvent, type AgentEventHandler } from "../packages/core/src/agents/agent-runtime.js";
 import { resolveContextWindow } from "../packages/core/src/core/context-window.js";
 import { matchesContextBudget, type ContextBudgetIdentity } from "../packages/core/src/core/context-budget.js";
@@ -147,6 +148,7 @@ function injectionFixture() {
   const orch = Object.create(Orchestrator.prototype) as Orchestrator;
   Object.assign(orch, {
     store, logger: pino({ level: "silent" }), adapter: {}, config: { REPOS_ROOT: dir },
+    plugins: new PluginHost(pino({ level: "silent" })),
     modelCatalog: fixtureModelCatalog([profile as never]),
     router: {
       describeConfig: (rec: SessionRecord) => ({

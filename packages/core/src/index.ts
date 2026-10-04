@@ -106,12 +106,6 @@ import { resolveIngestPublicBase, resolvePublicBridgeWsUrl } from "./core/mcp-ur
 import fs from "node:fs";
 import { projectAttemptCompletions } from "./core/dispatch/attempt-recovery.js";
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { QuotaRegistry } from "./core/quota/quota-registry.js";
-import {
-  AgentQuotaPoller,
-  createAgentQuotaSources,
-} from "./core/quota/quota-poller.js";
-import { AgentQuotaCard } from "./core/quota/agent-quota-card.js";
 import { loadOrCreateLocalBridgeCredential } from "./core/local-bridge-credential.js";
 import { ModelValueStore } from "./core/model-value/store.js";
 import { ModelMetadataStore } from "./core/model-metadata/store.js";
@@ -139,7 +133,7 @@ async function main(): Promise<void> {
     storageAliases: { "service-status": {
       "service-status.sqlite": path.join(config.DATA_DIR, "service-status.sqlite"),
       "service-status-card.json": path.join(config.DATA_DIR, "service-status-card.json"),
-    } },
+    }, quota: { "agent-quota-card.json": path.join(config.DATA_DIR, "agent-quota-card.json") } },
   });
   await plugins.loadBuiltins(BUILTIN_PLUGINS);
   const controllerInstanceId = randomUUID();
@@ -689,18 +683,6 @@ async function main(): Promise<void> {
     modelIntelligenceManager.refreshForCatalogGeneration();
   });
 
-  const quotaRegistry = new QuotaRegistry();
-  const quotaPoller = new AgentQuotaPoller({
-    logger,
-    registry: quotaRegistry,
-    sources: createAgentQuotaSources(router.listProfiles(), {
-      agyRuntime,
-      grokCliPath: config.GROK_CLI_PATH,
-      ollamaUsageCliPath: config.OLLAMA_USAGE_CLI_PATH,
-      ollamaCloudEnabled: config.OLLAMA_CLOUD_ENABLED,
-    }),
-    staleRetentionMs: config.QUOTA_STALE_RETENTION_MS,
-  });
 
   const renderer = discordRenderer;
   const testerBot = config.SEAM_TEST_BOT_TOKEN
@@ -737,6 +719,21 @@ async function main(): Promise<void> {
     } }], { "service-status": config });
   }
 
+  await plugins.loadBuiltins([{ id: "quota", load: async () => {
+    const { createUsageProviderPort } = await import("./core/quota/usage-provider.js");
+    const { createQuotaPlugin } = await import("./plugins/quota/index.js");
+    const usage = createUsageProviderPort({ profiles: router.listProfiles(), agyRuntime, grokCliPath: config.GROK_CLI_PATH,
+      ollamaUsageCliPath: config.OLLAMA_USAGE_CLI_PATH, ollamaCloudEnabled: config.OLLAMA_CLOUD_ENABLED,
+      liveRequest: id => { const runtime = router.getRuntime(id); return runtime ? (method, params) => runtime.request(method, params) : undefined; } });
+    return createQuotaPlugin({ usage, bindings: usage.bindings, resolve: (threadId, parentId) => {
+      if (!parentId) return undefined;
+      const record = router.ensureSessionRecord({ platform: "discord", channelRef: threadId, parentRef: parentId, cwd: config.REPOS_ROOT });
+      return usage.binding(record.agentId, record.id, router.describeConfig(record).location.value);
+    }, card: { sendLayout: adapter.sendLayout.bind(adapter), editLayout: adapter.editLayout.bind(adapter),
+      sendPanel: adapter.sendPanel.bind(adapter), editPanel: adapter.editPanel.bind(adapter),
+      pinMessage: adapter.pinMessage.bind(adapter), deleteMessage: adapter.deleteMessage.bind(adapter), bumpThread: adapter.bumpThread.bind(adapter) } });
+  } }], { quota: config });
+
   const orchestrator = new Orchestrator({
     logger,
     fences: plugins.fences,
@@ -746,7 +743,6 @@ async function main(): Promise<void> {
     router,
     store,
     renderer,
-    quotaPoller,
     modelCatalog,
     agyRuntime,
     refreshModelIntelligence: (forceSources) => modelIntelligenceManager.refresh({ forceSources }),
@@ -938,9 +934,6 @@ async function main(): Promise<void> {
   void orchestrator.catchUpAfterRestart().catch((err) => {
     logger.warn({ err }, "restart message catch-up failed");
   });
-  // Seed one normalized snapshot per configured agent before MCP/card startup,
-  // then let each agent's own recent turn rate drive its recursive poll timer.
-  await quotaPoller.start();
   // Reads were available from SQLite before Discord connected. Provider/CLI
   // work begins only now and is deliberately not awaited.
   modelCatalog.start();
@@ -1136,11 +1129,6 @@ async function main(): Promise<void> {
             searchMessages: (input) => messageSearch!.search(input),
           }
         : {}),
-      getAgentQuotas: (agentId) => {
-        if (!agentId) return quotaRegistry.all();
-        const quota = quotaRegistry.get(agentId);
-        return quota ? [quota] : [];
-      },
       getModelValueRankings: (options, caller) => {
         const current = caller ? router.describeConfig(caller) : undefined;
         return visibleModelRankings(modelCatalog, modelValueStore.getRankings(options), current ? {
@@ -1672,26 +1660,6 @@ async function main(): Promise<void> {
   // Best-effort startup notification to a configured channel.
   void orchestrator.postNotification("✅ Seam online.");
 
-  // One pinned quota card for every configured agent. Poller refreshes poke it;
-  // the controller edits in place and silently self-bumps its thread every 20h.
-  let stopQuotaCard: (() => void) | undefined;
-  if (config.DISCORD_AGENT_QUOTA_THREAD_ID) {
-    const quotaCard = new AgentQuotaCard({
-      logger,
-      adapter,
-      threadId: config.DISCORD_AGENT_QUOTA_THREAD_ID,
-      dataDir: config.DATA_DIR,
-      collect: () => quotaRegistry.all(),
-    });
-    quotaPoller.setOnUpdate(() => quotaCard.poke());
-    stopQuotaCard = () => {
-      quotaPoller.setOnUpdate(undefined);
-      quotaCard.stop();
-    };
-    void quotaCard.start().catch((err) =>
-      logger.warn({ err }, "agent quota card failed to start")
-    );
-  }
 
   // One pinned, cache-only model-value card. A successful #130 persistence
   // pokes it immediately; start() also renders the latest durable snapshot on
@@ -1842,13 +1810,11 @@ async function main(): Promise<void> {
     const verdicts: DrainVerdict[] = [];
     orchestrator.stopSentinelWatcher();
     delegationReconciler.stop();
-    quotaPoller.stop();
     modelIntelligenceManager.stop();
     stopCatalogEnrichmentRefresh?.();
     modelCatalog.stop();
     stopCatalogBridgeRefresh?.();
     stopPermissionBridgeRecovery?.();
-    stopQuotaCard?.();
     stopRankingsCard?.();
     stopStatusCard?.();
     plugins.jobs.stop();

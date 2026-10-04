@@ -14,7 +14,7 @@ import {
   type TurnAttempt,
 } from "../../core/dispatch/attempt-store.js";
 import { BootAcquisitionExhaustedError, DispatchAcquisitionPhase, isRetryableBootAcquisitionError } from "../../core/dispatch/acquisition-phase.js";
-import { compareExecutionIdentity, executionIdentity } from "../../core/dispatch/execution-identity.js";
+import { compareExecutionIdentity, executionIdentity, parseExecutionIdentity } from "../../core/dispatch/execution-identity.js";
 import { projectAttemptCard } from "../../core/attempt-card-projection.js";
 import { MessageFlags, EmbedBuilder, ButtonBuilder, ActionRowBuilder, ButtonStyle, StringSelectMenuBuilder, ModalBuilder, TextInputBuilder, TextInputStyle, AttachmentBuilder, type ChatInputCommandInteraction, type AutocompleteInteraction, type MessageComponentInteraction, type Message, type InteractionEditReplyOptions } from "discord.js";
 import type { Logger } from "../../lib/logger.js";
@@ -385,8 +385,6 @@ import {
 import type { InboundAdmission } from "../../core/inbound-admission/types.js";
 import { DefaultAgentUnavailableError, SessionRouter, resolveSessionCwd, simpleCardGifForRender, statusCardStyleForRender } from "../../core/session-router.js";
 import {
-  formatUsageAgentList,
-  liveUsageAgentLabels,
   parkedAgentMessage,
 } from "../../core/parked-agents.js";
 import {
@@ -604,10 +602,7 @@ import {
   resolveAgentBrand,
 } from "../../core/agent-brand.js";
 import { resolveDiscordSpeakerName } from "./adapter.js";
-import type {
-  AgentQuotaPoller,
-  QuotaConnectionRequest,
-} from "../../core/quota/quota-poller.js";
+import type { TurnBinding } from "../../plugins/turn-activity-registry.js";
 import {
   loadThreadMigrationPlan,
   runThreadMigrationPool,
@@ -1007,7 +1002,6 @@ export class Orchestrator {
     for (const phase of this.dispatchAcquisitions) phase.shutdown();
   }
   private readonly renderer: Renderer;
-  private readonly quotaPoller?: AgentQuotaPoller;
   private readonly modelCatalog: ModelCatalogService;
   private readonly refreshModelIntelligence?: (forceSources: boolean) => Promise<ModelIntelligenceRefreshResult>;
   /** Installed by index.ts only while the upstream-status subsystem is active. */
@@ -1015,9 +1009,6 @@ export class Orchestrator {
   private canaryRunner?: (target: CanaryTarget) => Promise<CanaryRunResult>;
   /** Injected only by deterministic restart tests; production uses detached PM2. */
   private readonly restartProcess: () => Promise<void>;
-  /** Debounce for the quota-card "Refresh" button: the force-refresh bypasses
-   *  the cadence floor, so guard against click-mashing hammering the endpoints. */
-  private lastQuotaRefreshClickAt = 0;
   /** Conversational config mutation engine (#58 P2/P3). Platform-agnostic; the
    *  orchestrator adds the Discord confirm card + apply/restart wiring. */
   private readonly configMutation: ConfigMutationService;
@@ -1181,7 +1172,6 @@ export class Orchestrator {
     renderer: Renderer;
     fences?: FenceRegistry;
     plugins?: PluginHost;
-    quotaPoller?: AgentQuotaPoller;
     modelCatalog: ModelCatalogService;
     agyRuntime?: AgyLaunchRuntime;
     refreshModelIntelligence?: (forceSources: boolean) => Promise<ModelIntelligenceRefreshResult>;
@@ -1197,7 +1187,6 @@ export class Orchestrator {
     this.renderer = opts.renderer;
     this.fences = opts.fences ?? new FenceRegistry(this.logger);
     this.recoverySleep = opts.recoverySleep ?? ((ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
-    this.quotaPoller = opts.quotaPoller;
     this.modelCatalog = opts.modelCatalog;
     this.agyRuntime = opts.agyRuntime;
     this.refreshModelIntelligence = opts.refreshModelIntelligence;
@@ -1910,7 +1899,6 @@ export class Orchestrator {
       ["seam-cfg-edit:", (evt: ComponentEvent) => this.handleConfigEditorComponent(evt)],
       ["seam-tts:", (evt: ComponentEvent) => this.handleTtsEditorComponent(evt)],
       ["tvc:", (evt: ComponentEvent) => this.runVoiceConsoleComponent(evt)],
-      ["seam-quota:", (evt: ComponentEvent) => this.handleQuotaCardComponent(evt)],
     ].map(([namespace, handle]) => ({ namespace: namespace as string, handle: handle as (evt: ComponentEvent) => Promise<void>, types: ["button", "select", "modal"] as const, lifetime: "persistent" as const, access: "read-only" as const, authorization: "user" as const })), context);
     this.plugins.components.register("kernel-actions", [
       { namespace: "seam-perm:", types: ["button"], lifetime: "persistent", access: "read-only", authorization: "user",
@@ -3580,6 +3568,7 @@ export class Orchestrator {
     let humanOutcomeOwned = false;
     let humanDelivered = false;
     let humanPromptSubmitted = false;
+    let humanActivitySubmitted = false;
     let humanOutput = "";
     const priorHuman = scheduledAttempt ?? (admission ? this.store.turnAttempts.get(inboundAttemptId(admission.messageId)) : null);
     const humanResume = priorHuman?.promptStarted === true;
@@ -3693,7 +3682,6 @@ export class Orchestrator {
       }
       if (scheduledAttempt) this.scheduledActivity?.phase(scheduledAttempt.id, "output");
     };
-    this.quotaPoller?.recordTurnStart(record.agentId);
 
     const voiceConsoleBound = this.voiceConsole?.hasActiveBinding(channel.id) ?? false;
     let voiceConsoleSpeech: VoiceConsoleVisibleTurnHandle | null = null;
@@ -4132,7 +4120,6 @@ export class Orchestrator {
       const msg = e instanceof Error ? e.message : String(e);
       return msg.includes("ACP connection closed");
     };
-    let quotaRequest: QuotaConnectionRequest | undefined;
 
     // Available during session/new as well as session/prompt so request-scoped
     // elicitation during agent setup can still be safely attributed. The
@@ -4169,9 +4156,6 @@ export class Orchestrator {
       // requested — the runtime only records `on` once the session accepted it.
       const fastState = describeFastModeOutcome(activeRuntime.getFastModeOutcome());
       if (fastState) status.fastMode = fastState;
-      if (record.agentId === "grok" || record.agentId.startsWith("grok-")) {
-        quotaRequest = (method, params) => activeRuntime.request(method, params);
-      }
       if (record.acpSessionId) {
         await patchLiveMarker(this.config.DATA_DIR, liveMarkerId, {
           acpSessionId: record.acpSessionId,
@@ -4672,6 +4656,9 @@ export class Orchestrator {
           const afterPromptRefusal = humanRefusal();
           if (afterPromptRefusal) throw afterPromptRefusal;
         }
+        humanActivitySubmitted = true;
+        if (!humanResume) this.plugins.turnActivity.emit({ type: "turn-started", turnId: liveMarkerId, timestampMs: Date.now(),
+          binding: { agentId: record.agentId, location: described.location.value, account: record.agentId, sessionId: record.id } });
         result = await raceWithTimeout(
           activeRuntime.prompt(promptText, promptAttachments, {
             submissionEvidence,
@@ -5138,7 +5125,10 @@ export class Orchestrator {
         this.logger.warn({ err, id: liveMarkerId }, "live-turn marker finish failed")
       ));
       if (humanAttempt && humanOutcomeOwned && humanDelivered) this.store.turnAttempts.markDeliveryDone(humanAttempt.id);
-      void this.quotaPoller?.turnCompleted(record.agentId, quotaRequest);
+      if (humanActivitySubmitted && (!humanAttempt || humanOutcomeOwned || this.store.turnAttempts.get(humanAttempt.id)?.state === "cancelled")) {
+        this.plugins.turnActivity.emit({ type: "turn-completed", turnId: liveMarkerId, timestampMs: Date.now(),
+          binding: { agentId: record.agentId, location: described.location.value, account: record.agentId, sessionId: record.id } });
+      }
       if (wrapUpStartedAt !== undefined) {
         this.logger.info(
           { session: record.id, totalMs: Date.now() - wrapUpStartedAt, released: queueReleased, steps: wrapUpMs },
@@ -5437,8 +5427,6 @@ export class Orchestrator {
       switch (interaction.options.getSubcommand(true)) {
         case "whoami":
           return this.cmdWhoami(interaction);
-        case "usage":
-          return this.cmdUsage(interaction);
         case "avatar":
           return this.cmdAvatar(interaction);
         case "help":
@@ -5833,7 +5821,12 @@ export class Orchestrator {
 
     const attachments =
       opts.attachments && opts.attachments.length > 0 ? opts.attachments : undefined;
+    const activityTurnId = typeof opts.logContext?.dispatch === "string" ? opts.logContext.dispatch : randomUUID();
+    let activityBinding: TurnBinding | undefined;
+    let activitySubmitted = false;
     const settle = (result: InjectTurnResult): InjectTurnResult => {
+      if (activitySubmitted && activityBinding) this.plugins.turnActivity.emit({ type: "turn-completed", turnId: activityTurnId, timestampMs: Date.now(), binding: activityBinding });
+      activitySubmitted = false;
       opts.lifecycle?.onOutcome(result);
       return result;
     };
@@ -5841,6 +5834,8 @@ export class Orchestrator {
       opts.lifecycle?.acquire ? opts.lifecycle.acquire(operation) : operation();
     const runPrompt = async (rt: AgentRuntime): Promise<PromptOutcome | "timeout"> => {
       const submissionEvidence = opts.lifecycle?.beforePrompt();
+      activitySubmitted = true;
+      if (activityBinding && !opts.resumeSessionId) this.plugins.turnActivity.emit({ type: "turn-started", turnId: activityTurnId, timestampMs: Date.now(), binding: activityBinding });
       // ACP ids for isolated runtimes are provider-generated, not necessarily
       // `dispatch:` prefixed. Carry isolation explicitly: refuse automatic
       // outward-effect replay while live transcript continuations keep working.
@@ -5897,6 +5892,7 @@ export class Orchestrator {
             ?? resolveThreadLocation(this.config, target.channelRef)
           : LOCAL_LOCATION);
       const binding = { agentId: profile.id, location };
+      activityBinding = { ...binding, account: profile.id };
       const requestedModel = opts.model
         ?? this.modelCatalog.model(binding, "default")?.id
         ?? "default";
@@ -6076,6 +6072,7 @@ export class Orchestrator {
       opts.lifecycle?.onRuntime?.(rt.getProcessId?.(), rt.getProviderIdentity?.());
       const liveSessionId = record.acpSessionId || rt.getSessionInfo()?.sessionId;
       budgetRecord = record;
+      activityBinding = { agentId: record.agentId, location: this.router.describeConfig(record).location?.value ?? resolveThreadLocation(this.config, record.channelRef), account: record.agentId, sessionId: record.id };
       budgetIdentity = this.contextBudgetIdentity(record, rt.getSessionInfo()?.sessionId ?? liveSessionId);
       if (liveSessionId) {
         try {
@@ -8246,48 +8243,6 @@ export class Orchestrator {
     this.logger.info({ channelRef, id: parked.id }, "thread deleted; dropping parked prompt");
   }
 
-  /**
-   * `/seam queue` (#89) — park the next live turn instead of aborting.
-   * Idle + host ready → run now (no parked row left sitting). Busy or
-   * offline → park, do not abort, do not bump generation.
-   */
-  /**
-   * "Refresh" button on the agent-quota card: force-refresh every agent now.
-   * Ack first (Discord expires the interaction after 3s), debounce mashing, then
-   * refresh — the card re-renders itself via quotaPoller.setOnUpdate → poke().
-   */
-  private async handleQuotaCardComponent(evt: ComponentEvent): Promise<void> {
-    if (!evt.customId.startsWith("seam-quota:")) return;
-    await evt.deferUpdate().catch(() => {});
-    if (!this.quotaPoller) {
-      await evt.followUpEphemeral("Usage refresh is unavailable during startup or shutdown.");
-      return;
-    }
-    const now = Date.now();
-    if (now - this.lastQuotaRefreshClickAt < 10_000) {
-      await evt.followUpEphemeral("Usage was refreshed recently; try again in a few seconds.");
-      return;
-    }
-    this.lastQuotaRefreshClickAt = now;
-    const result = await this.quotaPoller.refreshAll(true);
-    const timedOut = result.sources.filter((source) => source.outcome === "timed_out");
-    const unavailable = result.sources.filter((source) => source.outcome === "unavailable");
-    if (timedOut.length > 0) {
-      await evt.followUpEphemeral(
-        `Usage refresh timed out after ${result.timeoutMs / 1000}s for ${timedOut.map((source) => source.displayName).join(", ")}. ` +
-        "Other agents refreshed normally; any last-known-good values were retained."
-      );
-    } else if (unavailable.length > 0) {
-      await evt.followUpEphemeral(
-        `Usage refreshed with ${unavailable.length} unavailable source${unavailable.length === 1 ? "" : "s"}; ` +
-        "other agents and retained values remain available."
-      );
-    } else {
-      await evt.followUpEphemeral(`Usage refreshed (${result.sources.length} agents).`);
-    }
-  }
-
-
   private async handleVoiceConsoleComponent(evt: ComponentEvent): Promise<void> {
     if (!evt.customId.startsWith("tvc:")) return;
     const parsed = parseVoiceConsoleInteraction({
@@ -9696,7 +9651,6 @@ export class Orchestrator {
     const isolatedWorkerCwd = effectiveSession === "isolated"
       ? this.isolatedDispatchCwd({ spec, preset, record, workerLocation })
       : undefined;
-    let quotaAgentId = presetProfile?.id ?? record.agentId;
     // #76: a resume is the SAME spec with two substitutions — prompt →
     // "continue", session acquisition → loadSession(recorded id). Everything
     // else (returnTo / correlationId / kind / chainId) rides along untouched
@@ -9972,7 +9926,6 @@ export class Orchestrator {
           throw new Error(migrated.error);
         }
         record = migrated.record;
-        quotaAgentId = migrated.agent;
         if (spec.rebuild === true) {
           try {
             const rebuilt = await this.reconstructSessionFromDiscord({
@@ -10015,7 +9968,6 @@ export class Orchestrator {
           );
         }
       }
-      this.quotaPoller?.recordTurnStart(quotaAgentId);
       // Isolated: do not mark `running` here — wait for newSession() so the
       // status transition carries the ACP session id (#75). Live: the thread's
       // session id is already on the record, so we can stamp both now.
@@ -10362,15 +10314,6 @@ export class Orchestrator {
               : undefined
           );
         }
-        const liveRuntime =
-          effectiveSession === "live" && typeof this.router.getRuntime === "function"
-            ? this.router.getRuntime(record.id)
-            : undefined;
-        const quotaRequest: QuotaConnectionRequest | undefined =
-          liveRuntime && (quotaAgentId === "grok" || quotaAgentId.startsWith("grok-"))
-            ? (method, params) => liveRuntime.request(method, params)
-            : undefined;
-        void this.quotaPoller?.turnCompleted(quotaAgentId, quotaRequest);
         if (dispatchSpeech && !this.queueFenceCurrent(queueFence)) {
           await this.voiceConsole?.cancelVisibleTurn(dispatchSpeech).catch(() => {});
           if (this.voiceConsoleSpeechByChannel.get(spec.target) === dispatchSpeech) {
@@ -10712,7 +10655,6 @@ export class Orchestrator {
     // synchronous preflight above injectTurn as well.
     const endTurn = this.beginTurn();
     let agentId: string | undefined;
-    let quotaStarted = false;
     let result: InjectTurnResult | undefined;
     let completed: { output: string; stopReason: string } | undefined;
     let failure: unknown;
@@ -10771,8 +10713,6 @@ export class Orchestrator {
           `dispatch ${spec.id}: ${this.refuseUnregisteredAgent(agentId, `unknown agent "${agentId}" at "${location}"`)}`
         );
       }
-      this.quotaPoller?.recordTurnStart(agentId);
-      quotaStarted = true;
       const cwd = preset?.repoPath ?? spec.cwd ?? this.config.REPOS_ROOT;
       const model = preset?.model ?? spec.model;
       const effort = preset?.effort ?? spec.effort;
@@ -11025,11 +10965,6 @@ export class Orchestrator {
           resultSettlementFailed = true;
           failure ??= err;
         }
-      }
-      if (!suspended && quotaStarted && agentId) {
-        void this.quotaPoller?.turnCompleted(agentId).catch((err) =>
-          this.logger.warn({ err, agentId, dispatch: spec.id }, "ingest: quota completion failed")
-        );
       }
       if (!suspended) {
         try {
@@ -15974,6 +15909,9 @@ export class Orchestrator {
         finishedUtc: result.finishedUtc,
       };
       if (!this.store.turnAttempts.adoptRemoteResult(current, result, outcome)) return;
+      const identity = parseExecutionIdentity(current.identity);
+      if (identity) this.plugins.turnActivity.emit({ type: "turn-completed", turnId: current.id, timestampMs: Date.now(),
+        binding: { agentId: identity.agent, location: identity.location, account: identity.agent, ...(recoveryRecord ? { sessionId: recoveryRecord.id } : {}) } });
 
       const completed = this.store.turnAttempts.get(current.id);
       if (!completed?.outcome) return;
@@ -22556,83 +22494,6 @@ export class Orchestrator {
     });
   }
 
-  private async cmdUsage(i: ChatInputCommandInteraction): Promise<void> {
-    await i.deferReply({ flags: MessageFlags.Ephemeral });
-    const channel = this.channelRefFromInteraction(i);
-    if (!channel) {
-      await i.editReply({ content: "Use inside a thread." });
-      return;
-    }
-    const record = this.router.ensureSessionRecord({
-      platform: channel.platform,
-      channelRef: channel.id,
-      ...(channel.parentId ? { parentRef: channel.parentId } : {}),
-      cwd: this.config.REPOS_ROOT,
-    });
-    const isAgy = record.agentId === "agy";
-    const isOllamaCloud =
-      record.agentId === "ollama-cloud" || record.agentId.startsWith("ollama-cloud-");
-    const isClaude = record.agentId === "claude" || record.agentId.startsWith("claude-");
-    const isCopilot =
-      record.agentId === "copilot" || record.agentId.startsWith("copilot-");
-    const isGrok = record.agentId === "grok" || record.agentId.startsWith("grok-");
-    const isCodex = record.agentId === "codex" || record.agentId.startsWith("codex-");
-    if (isOllamaCloud && !this.config.OLLAMA_CLOUD_ENABLED) {
-      await i.editReply({
-        content:
-          parkedAgentMessage(record.agentId, false, "session") ??
-          `\`/seam usage\` is not available for parked agent \`${record.agentId}\`.`,
-      });
-      return;
-    }
-    const usageLabels = liveUsageAgentLabels(this.router.listProfiles().map((p) => p.id));
-    if (!isAgy && !isOllamaCloud && !isClaude && !isCopilot && !isGrok && !isCodex) {
-      await i.editReply({
-        content: `\`/seam usage\` is only available for the ${formatUsageAgentList(usageLabels) || "currently live"} agents. This thread uses \`${record.agentId}\`.`,
-      });
-      return;
-    }
-    try {
-      const profile = this.router.getProfile(record.agentId);
-      const configDir = profile?.configDir;
-      if (isAgy) {
-        if (!this.agyRuntime) throw new Error("native agy runtime is unavailable");
-        const { fetchAgyUserStatus } = await import("@seam/adapters");
-        const data = await fetchAgyUserStatus(this.agyRuntime);
-        await i.editReply({ content: formatAgyUsage(data) });
-      } else if (isOllamaCloud) {
-        const { fetchOllamaCloudUsage } = await import("@seam/adapters");
-        const data = await fetchOllamaCloudUsage(this.config.OLLAMA_USAGE_CLI_PATH);
-        await i.editReply({ content: formatOllamaCloudUsage(data) });
-      } else if (isClaude) {
-        const { fetchClaudeUsage } = await import("@seam/adapters");
-        const data = await fetchClaudeUsage(configDir);
-        await i.editReply({ content: formatClaudeUsage(data) });
-      } else if (isGrok) {
-        const {
-          fetchGrokUsage,
-          fetchGrokUsageFromConnection,
-        } = await import("@seam/adapters");
-        const live = this.router.getRuntime(record.id);
-        const data = live
-          ? await fetchGrokUsageFromConnection((method, params) => live.request(method, params))
-          : await fetchGrokUsage(this.config.GROK_CLI_PATH);
-        await i.editReply({ content: formatGrokUsage(data) });
-      } else if (isCodex) {
-        const { fetchCodexUsage } = await import("@seam/adapters");
-        const data = await fetchCodexUsage();
-        await i.editReply({ content: formatCodexUsage(data) });
-      } else {
-        const { fetchCopilotUsage } = await import("@seam/adapters");
-        const data = await fetchCopilotUsage(configDir);
-        await i.editReply({ content: formatCopilotUsage(data) });
-      }
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      this.logger.warn({ err }, "/seam usage failed");
-      await i.editReply({ content: `Couldn't fetch usage: ${msg}` });
-    }
-  }
 
   private async cmdAvatar(i: ChatInputCommandInteraction): Promise<void> {
     await i.deferReply({ flags: MessageFlags.Ephemeral });
@@ -25568,16 +25429,6 @@ function parseCsv(s: string): string[] {
     .filter((x) => x.length > 0);
 }
 
-function usageBar(pct: number): string {
-  const filled = Math.min(20, Math.round(pct / 5));
-  return "█".repeat(filled) + "░".repeat(20 - filled);
-}
-
-function usageLine(pct: number | null, label: string): string {
-  const bar = pct !== null ? usageBar(pct) : "░░░░░░░░░░░░░░░░░░░░";
-  const pctStr = pct !== null ? `${Math.round(pct)}%`.padStart(4) : "  — ";
-  return `\`${bar}\`  ${pctStr}  ${label}`;
-}
 
 /** Trim a sanitized transcript so that `template + transcript` fits within
  *  ~80% of the summarizer model's window (leaving headroom for the response).
@@ -25600,196 +25451,6 @@ function fitTranscriptToWindow(
   );
 }
 
-function formatAgyUsage(d: import("@seam/adapters").AgyUsage): string {
-  const lines = ["**Antigravity usage**", "", "**Models & Quota**"];
-  const windows = [
-    { window: "weekly", label: "Weekly" },
-    { window: "5h", label: "Five-Hour" },
-  ] as const;
-  for (const group of d.groups) {
-    lines.push("", `**${group.displayName}**`);
-    for (const { window, label } of windows) {
-      const bucket = group.buckets.find((candidate) => candidate.window === window);
-      if (!bucket) continue;
-      const usedPercent = (1 - bucket.remainingFraction) * 100;
-      const reset = bucket.resetTime
-        ? ` · resets ${formatResetTime(bucket.resetTime)}`
-        : "";
-      lines.push(usageLine(usedPercent, `${label}${reset}`));
-    }
-  }
-  return lines.join("\n");
-}
-
-function formatOllamaCloudUsage(
-  d: import("@seam/adapters").OllamaCloudUsageData
-): string {
-  if (!d.ok) {
-    return `Couldn't read Ollama Cloud usage: ${d.error ?? "no data"}`;
-  }
-  const lines = ["**Ollama Cloud usage**", "", "**Rate limits**"];
-  const windows = [
-    { data: d.fiveHour, label: "5h" },
-    { data: d.weekly, label: "Weekly" },
-  ] as const;
-  for (const { data, label } of windows) {
-    if (!data) continue;
-    const reset = data.resetAt
-      ? ` · resets ${formatResetTime(data.resetAt)}`
-      : "";
-    lines.push(usageLine(data.pctUsed, `${label} limit${reset}`));
-  }
-  const topModels = [...(d.weekly?.models ?? [])]
-    .sort((a, b) => b.requests - a.requests)
-    .slice(0, 5);
-  if (topModels.length > 0) {
-    lines.push(
-      "",
-      "**Top models (weekly)**",
-      ...topModels.map(
-        (model) => `• \`${model.model}\` — ${model.requests.toLocaleString("en-US")} requests`
-      )
-    );
-  }
-  return lines.join("\n");
-}
-
-function formatCopilotUsage(
-  d: import("@seam/adapters").CopilotUsageData
-): string {
-  const lines: string[] = [];
-  const who = [d.login, d.org ? `(${d.org})` : null].filter(Boolean).join(" ");
-  lines.push(`**GitHub Copilot usage**${who ? ` — ${who}` : ""}`);
-  if (d.plan) lines.push(`Plan: \`${d.plan}\``);
-  const fmtQuota = (
-    label: string,
-    q: import("@seam/adapters").CopilotQuotaSnapshot | null
-  ): string | null => {
-    if (!q) return null;
-    if (q.unlimited) return `${label}: unlimited`;
-    const used = q.entitlement - q.remaining;
-    const pct = q.entitlement > 0 ? (used / q.entitlement) * 100 : 0;
-    const over = q.overageCount > 0 ? ` (+${q.overageCount} overage)` : "";
-    return usageLine(pct, `${label} — ${used} / ${q.entitlement}${over}`);
-  };
-  const quotas = [
-    fmtQuota("Premium interactions", d.premiumInteractions),
-    fmtQuota("Chat", d.chat),
-    fmtQuota("Completions", d.completions),
-  ].filter((s): s is string => s !== null);
-  if (quotas.length > 0) {
-    lines.push("", "**Quotas**", ...quotas);
-    if (d.quotaResetAt) lines.push(`Resets ${formatResetTime(d.quotaResetAt)}`);
-  }
-  return lines.join("\n");
-}
-
-function formatGrokUsage(
-  d: import("@seam/adapters").GrokUsageData
-): string {
-  const lines: string[] = [];
-  lines.push(`**Grok usage**${d.subscriptionTier ? ` — ${d.subscriptionTier}` : ""}`);
-  const period = d.periodType ? d.periodType : "period";
-  const reset = d.periodEnd ? ` · resets ${formatResetTime(d.periodEnd)}` : "";
-  if (d.creditUsagePercent !== null) {
-    lines.push(
-      "",
-      `**${period.charAt(0).toUpperCase() + period.slice(1)} allowance**`,
-      usageLine(d.creditUsagePercent, `used${reset}`)
-    );
-  } else {
-    lines.push("No billing data available.");
-  }
-  return lines.join("\n");
-}
-
-function formatCodexUsage(
-  d: import("@seam/adapters").CodexUsageData
-): string {
-  if (!d.ok) return `Couldn't read codex usage: ${d.error ?? "no data"}`;
-  const lines: string[] = [
-    `**OpenAI Codex usage**${d.plan ? ` — plan \`${d.plan}\`` : ""}`,
-  ];
-  const windowLabel = (min: number): string => {
-    if (min >= 9000) return "Weekly";
-    if (min >= 240 && min <= 360) return "5h";
-    if (min % 1440 === 0) return `${min / 1440}d`;
-    if (min % 60 === 0) return `${min / 60}h`;
-    return `${min}m`;
-  };
-  const fmtWin = (
-    w: import("@seam/adapters").CodexRateWindow | null
-  ): string | null => {
-    if (!w) return null;
-    const reset =
-      w.resetsAt != null
-        ? ` · resets ${formatResetTime(new Date(w.resetsAt * 1000).toISOString())}`
-        : "";
-    return usageLine(w.usedPercent, `${windowLabel(w.windowMinutes)} limit${reset}`);
-  };
-  const rows = [fmtWin(d.primary), fmtWin(d.secondary)].filter(
-    (s): s is string => s !== null
-  );
-  if (rows.length > 0) {
-    lines.push("", "**Rate limits**", ...rows);
-  } else {
-    lines.push("", "_No rate-limit data yet — run a codex turn first._");
-  }
-  if (d.credits) {
-    lines.push(
-      d.credits.unlimited ? "Credits: unlimited" : `Credits: ${d.credits.balance}`
-    );
-  }
-  return lines.join("\n");
-}
-
-function formatClaudeUsage(
-  d: import("@seam/adapters").ClaudeUsageData
-): string {
-  const lines: string[] = [];
-  lines.push(`**Claude Code usage**${d.login ? ` — ${d.login}` : ""}`);
-  if (d.subscriptionType) {
-    const tier = d.rateLimitTier ? ` (${d.rateLimitTier})` : "";
-    lines.push(`Subscription: \`${d.subscriptionType}${tier}\``);
-  }
-  const fmtBucket = (
-    label: string,
-    b: import("@seam/adapters").ClaudeUsageBucket | null
-  ): string | null => {
-    if (!b) return null;
-    const reset = b.resetsAt ? ` · resets ${formatResetTime(b.resetsAt)}` : "";
-    return usageLine(b.utilization, `${label}${reset}`);
-  };
-  const buckets = [
-    fmtBucket("Current 5h session", d.fiveHour),
-    fmtBucket("Current week (all models)", d.sevenDay),
-    fmtBucket("Current week (Sonnet)", d.sevenDaySonnet),
-    fmtBucket("Current week (Opus)", d.sevenDayOpus),
-  ].filter((s): s is string => s !== null);
-  if (buckets.length > 0) {
-    lines.push("", "**Rate-limit utilization**", ...buckets);
-  }
-  if (d.extraUsage && d.extraUsage.enabled) {
-    const dollars = (n: number): string => `$${(n / 100).toFixed(2)}`;
-    const pct = d.extraUsage.utilization;
-    lines.push(
-      "",
-      "**Usage credits**",
-      usageLine(d.extraUsage.utilization, `${dollars(d.extraUsage.used)} / ${dollars(d.extraUsage.limit)}`),
-    );
-  }
-  return lines.join("\n");
-}
-
-function formatResetTime(iso: string): string {
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return iso;
-  const secs = Math.round((d.getTime() - Date.now()) / 1000);
-  if (secs <= 0) return "now";
-  if (secs < 3600) return `in ${Math.round(secs / 60)}m`;
-  if (secs < 86400) return `in ${Math.round(secs / 3600)}h`;
-  return `in ${Math.round(secs / 86400)}d`;
-}
 
 function voiceConsoleEmbed(panel: VoiceConsolePanelSpec): EmbedBuilder {
   const embed = new EmbedBuilder()

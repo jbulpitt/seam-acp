@@ -14,6 +14,7 @@
  * first thing asserted here.
  */
 import { afterEach, describe, expect, it } from "vitest";
+import { createAgentQuotaSources } from "./quota-source-fixture.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -26,7 +27,6 @@ import {
 } from "@seam/adapters";
 import {
   AgentQuotaPoller,
-  createAgentQuotaSources,
   type AgentQuotaSource,
 } from "../packages/core/src/core/quota/quota-poller.js";
 import {

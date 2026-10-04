@@ -4,13 +4,13 @@
  * a test-only formatter.
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { createAgentQuotaSources } from "./quota-source-fixture.js";
 import pino from "pino";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
   AgentQuotaPoller,
-  createAgentQuotaSources,
   type AgentQuotaRefreshSummary,
   type AgentQuotaSource,
 } from "../packages/core/src/core/quota/quota-poller.js";
@@ -18,7 +18,8 @@ import { QuotaRegistry } from "../packages/core/src/core/quota/quota-registry.js
 import type { AgentQuota } from "../packages/core/src/core/quota/agent-quota.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import type { ComponentEvent } from "../packages/core/src/platforms/chat-adapter.js";
-import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
+import { PluginHost } from "../packages/core/src/plugins/host.js";
+import { createQuotaPlugin } from "../packages/core/src/plugins/quota/index.js";
 import type { AgentProfile } from "@seam/adapters";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
@@ -210,11 +211,13 @@ describe("usage-card production interaction", () => {
           quota: quota("claude", "Claude"), error: null },
       ],
     };
-    const host = Object.assign(Object.create(Orchestrator.prototype) as object, {
-      quotaPoller: { refreshAll: vi.fn(async () => result) },
-      lastQuotaRefreshClickAt: 0,
-    }) as { handleQuotaCardComponent(evt: ComponentEvent): Promise<void> };
-    await host.handleQuotaCardComponent({
+    const spy = vi.spyOn(AgentQuotaPoller.prototype, "refreshAll").mockResolvedValue(result);
+    const host = new PluginHost(silent);
+    const plugin = createQuotaPlugin({ bindings: () => [], resolve: () => undefined, usage: { readUsage: async () => { throw new Error("not called"); } }, card: {} });
+    await host.loadBuiltins([{ id: "quota", load: async () => plugin }], { quota: { QUOTA_STALE_RETENTION_MS: 0, OLLAMA_CLOUD_ENABLED: false } });
+    await host.jobs.startAfterAdmission(Promise.resolve());
+    await host.components.dispatch({
+      kind: "button",
       customId: "seam-quota:refresh",
       deferUpdate: async () => {},
       followUpEphemeral: async (text) => { followUps.push(text); },
@@ -222,5 +225,6 @@ describe("usage-card production interaction", () => {
     expect(followUps).toEqual([
       "Usage refresh timed out after 30s for Copilot. Other agents refreshed normally; any last-known-good values were retained.",
     ]);
+    await host.dispose(); spy.mockRestore();
   });
 });

@@ -547,9 +547,6 @@ export function buildSeamCommand(): SlashCommandBuilder {
         declareAccess(sub, { kind: "read-only" }).setName("whoami").setDescription("Show which account this thread's agent is signed in as")
       )
       .addSubcommand((sub) =>
-        declareAccess(sub, { kind: "read-only" }).setName("usage").setDescription("Show usage / credits for this thread's agent (agy, claude, copilot, grok, codex)")
-      )
-      .addSubcommand((sub) =>
         declareAccess(sub, { kind: "mutating" }).setName("avatar").setDescription("Push the bot avatar and banner to Discord (force re-upload)")
       )
       .addSubcommand((sub) =>

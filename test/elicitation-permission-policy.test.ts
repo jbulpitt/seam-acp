@@ -16,6 +16,7 @@ import {
 import type { AgentProfile } from "@seam/adapters";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 import { localBridgeWiring } from "./local-bridge-fixture.js";
+import { CODEX_ACP_2_0_1_MODES } from "./fixtures/codex-acp-modes.js";
 import { SessionRouter } from "../packages/core/src/core/session-router.js";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
 import {
@@ -276,8 +277,9 @@ describe("SessionRouter permission vs elicitation wiring", () => {
         protocolVersion: PROTOCOL_VERSION,
         agentCapabilities: { loadSession: false },
       }))
-      .onRequest(methods.agent.session.new, () => ({ sessionId: "wire-session" }))
-      .onRequest(methods.agent.session.load, ({ params }) => ({ sessionId: params.sessionId }))
+      .onRequest(methods.agent.session.new, () => ({ sessionId: "wire-session", modes: structuredClone(CODEX_ACP_2_0_1_MODES) }))
+      .onRequest(methods.agent.session.load, ({ params }) => ({ sessionId: params.sessionId, modes: structuredClone(CODEX_ACP_2_0_1_MODES) }))
+      .onRequest(methods.agent.session.setMode, () => ({}))
       .onRequest(methods.agent.session.prompt, async ({ client, params }) => {
         const text = params.prompt.map((block) => "text" in block ? block.text : "").join("");
         if (text.includes("permission")) {

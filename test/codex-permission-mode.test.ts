@@ -4,17 +4,7 @@ import type { AgentProfile } from "@seam/adapters";
 import { AgentRuntime } from "../packages/core/src/agents/agent-runtime.js";
 import type { PermissionPolicyMode } from "../packages/core/src/core/types.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
-
-// session/new from codex-acp 2.0.1, without model/account fields.
-const advertised = {
-  currentModeId: "agent",
-  availableModes: [
-    { id: "read-only", name: "Read-only" },
-    { id: "workspace-write", name: "Workspace access" },
-    { id: "agent", name: "Auto review" },
-    { id: "agent-full-access", name: "Full access" },
-  ],
-};
+import { CODEX_ACP_2_0_1_MODES as advertised } from "./fixtures/codex-acp-modes.js";
 
 function harness(initial: PermissionPolicyMode = "always", agentId = "codex") {
   let policy = initial;

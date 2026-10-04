@@ -8,7 +8,7 @@
  *
  * Mid-turn bot restart may orphan the message — acceptable.
  */
-import type { StatusCardStyle, StructuredPanel, TurnState } from "./types.js";
+import type { StructuredPanel, TurnState } from "./types.js";
 
 /** Same set #103 used to hide the GIF on the card. Monitoring/Waiting keep it. */
 export const SIMPLE_CARD_GIF_TERMINAL: ReadonlySet<TurnState> = new Set([
@@ -19,16 +19,6 @@ export const SIMPLE_CARD_GIF_TERMINAL: ReadonlySet<TurnState> = new Set([
 
 export function isSimpleCardGifTerminal(state: TurnState): boolean {
   return SIMPLE_CARD_GIF_TERMINAL.has(state);
-}
-
-/** Pick one GIF URL at turn start, or undefined when the card should not have one. */
-export function pickSimpleCardGifUrl(opts: {
-  style: StatusCardStyle;
-  gifOn: boolean;
-  randomGif: () => string | null;
-}): string | undefined {
-  if (opts.style !== "simple" || !opts.gifOn) return undefined;
-  return opts.randomGif() ?? undefined;
 }
 
 /** Minimal embed: just the animated GIF. Posted once, never edited. */

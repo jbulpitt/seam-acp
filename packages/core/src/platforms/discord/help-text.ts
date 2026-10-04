@@ -51,7 +51,6 @@ export function seamHelpSections(pluginHelp: readonly string[] = []): string[] {
       "`role [value] [scope]` — naming role for this thread",
       "`mode <id>` · `repo [path] [scope]` · `tools <allow|exclude> [list]`",
       "`approve <always|ask|deny>` — permission policy",
-      "`card [full|simple] [scope]` · `gif [on|off] [scope]` — status-card layout",
       "`reset` — end this thread's ACP session; next message starts fresh",
       "`init` — bind this thread + open the config card",
       "`detach <detached|attached>` — no bot replies (history is kept)",

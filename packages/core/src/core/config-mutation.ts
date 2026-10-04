@@ -37,6 +37,7 @@ import type { Logger } from "../lib/logger.js";
 import { parkedAgentMessage } from "./parked-agents.js";
 import type { ConfigDescription } from "./session-router.js";
 import { assessModelSelection, type ModelCatalogService, type ModelVerification } from "./model-catalog/service.js";
+import type { ConfigKeyRegistry } from "../plugins/config-key-registry.js";
 import { normalizeModelPattern, type ModelHideList } from "./model-catalog/hide-list.js";
 import { validateCron, describeCron } from "./scheduled-prompts/cron.js";
 import { legacyAttachmentQuarantine } from "./scheduled-prompts/quarantine.js";
@@ -335,6 +336,7 @@ export interface ConfigMutationStore {
 }
 
 export interface ConfigMutationDeps {
+  configKeys?: ConfigKeyRegistry;
   store: ConfigMutationStore;
   /** Re-derives effective config + which layer won (Trap 1). */
   describeConfig: (record: SessionRecord) => ConfigDescription;
@@ -1054,6 +1056,8 @@ export class ConfigMutationService {
     changes: SessionConfigChanges,
     opts: { effortValues?: ReadonlyArray<string> } = {}
   ): BuildProposalResult {
+    try { changes = this.deps.configKeys?.parseChanges(changes) ?? changes; }
+    catch (err) { return { ok: false, error: err instanceof Error ? err.message : String(err) }; }
     let verification: ModelVerification | undefined;
     const before = this.deps.describeConfig(record);
     const fields: ProposedField[] = [];
@@ -1382,6 +1386,8 @@ export class ConfigMutationService {
     record: SessionRecord,
     changes: PresetChanges
   ): BuildProposalResult {
+    try { changes = this.deps.configKeys?.parseChanges(changes) ?? changes; }
+    catch (err) { return { ok: false, error: err instanceof Error ? err.message : String(err) }; }
     let verification: ModelVerification | undefined;
     const name = changes.name?.trim();
     if (!name) return { ok: false, error: "`preset.name` is required." };
@@ -1695,6 +1701,8 @@ export class ConfigMutationService {
     changes: ChannelPresetChanges,
     opts: { requireTierC?: boolean } = {}
   ): BuildProposalResult {
+    try { changes = this.deps.configKeys?.parseChanges(changes) ?? changes; }
+    catch (err) { return { ok: false, error: err instanceof Error ? err.message : String(err) }; }
     let verification: ModelVerification | undefined;
     const requireTierC = opts.requireTierC ?? true;
     if (requireTierC && !this.deps.tierCEnabled) {
@@ -1922,6 +1930,8 @@ export class ConfigMutationService {
     changes: ThreadPresetChanges,
     opts: { requireTierC?: boolean } = {}
   ): BuildProposalResult {
+    try { changes = this.deps.configKeys?.parseChanges(changes) ?? changes; }
+    catch (err) { return { ok: false, error: err instanceof Error ? err.message : String(err) }; }
     let verification: ModelVerification | undefined;
     const requireTierC = opts.requireTierC ?? true;
     if (requireTierC && !this.deps.tierCEnabled) {

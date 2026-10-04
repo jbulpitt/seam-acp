@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { namingCommands } from "./plugin-naming-fixture.js";
+import { visualCommands } from "./plugin-card-visuals-fixture.js";
 import { PermissionFlagsBits, InteractionContextType } from "discord.js";
 import {
   SEAM_ADMIN_COMMAND_NAME,
@@ -34,7 +35,7 @@ type Built = {
   dm_permission?: boolean;
 };
 
-const seam = (): Built => buildSeamCommand().toJSON() as Built;
+const seam = (): Built => visualCommands().find(command => command.name === "seam") as Built;
 const admin = (): Built => namingCommands().find(command => command.name === "seamadmin") as Built;
 
 const slot = (cmd: Built, name: string): Opt | undefined =>
@@ -170,8 +171,6 @@ describe("/seam — everyday surface", () => {
       "mode",
       "repo",
       "tools",
-      "card",
-      "gif",
       "approve",
       "reset",
       "init",
@@ -181,6 +180,8 @@ describe("/seam — everyday surface", () => {
       "edit",
       "set",
       "audit",
+      "card",
+      "gif",
     ]);
     expect(names).toHaveLength(18);
     expect(names).not.toContain("rename");

@@ -7,6 +7,8 @@ import type { IdentityContribution } from "./identity-registry.js";
 import type { PluginStorage } from "./storage.js";
 import type { JobContribution } from "./job-registry.js";
 import type { TurnActivityContribution } from "./turn-activity-registry.js";
+import type { StatusCardContribution } from "./status-card-registry.js";
+import type { ConfigKeyContribution } from "./config-key-registry.js";
 
 export const PLUGIN_API_VERSION = 1;
 
@@ -52,6 +54,8 @@ export interface Plugin {
     identity?: readonly IdentityContribution[];
     jobs?: readonly JobContribution[];
     turnActivity?: readonly TurnActivityContribution[];
+    statusCards?: readonly StatusCardContribution[];
+    configKeys?: readonly ConfigKeyContribution[];
   };
 }
 

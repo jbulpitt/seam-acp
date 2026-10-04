@@ -4,6 +4,7 @@ import { buildSlashRegistrationBody, getSlashCommandAccess } from "../packages/c
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
 import { PluginHost } from "../packages/core/src/plugins/host.js";
 import { createQuotaPlugin } from "../packages/core/src/plugins/quota/index.js";
+import { createCardVisualsPlugin } from "../packages/core/src/plugins/card-visuals/index.js";
 
 const ADMIN = "101";
 const PARTICIPANT = "102";
@@ -61,9 +62,15 @@ describe("slash leaf access", () => {
   });
 
   it("classifies read/write options and local versus global cancellation", () => {
-    for (const [sub, option] of [["role", "value"], ["card", "style"], ["gif", "state"]]) {
+    for (const [sub, option] of [["role", "value"]]) {
       expect(getSlashCommandAccess("seam", "config", sub)?.kind).toBe("read-only");
       expect(getSlashCommandAccess("seam", "config", sub, (name) => name === option ? "new" : null)?.kind).toBe("mutating");
+    }
+    const visuals = createCardVisualsPlugin({ read: () => undefined, write: () => ({ ok: true }) });
+    for (const contribution of visuals.contributions.slash!) {
+      const access = contribution.access as (get: (name: string) => string | null) => { kind: string };
+      expect(access(() => null).kind).toBe("read-only");
+      expect(access(name => name === (contribution.leaf.name === "card" ? "style" : "state") ? "new" : null).kind).toBe("mutating");
     }
     expect(getSlashCommandAccess("seam", null, "cancel")).toMatchObject({ participantAllowed: true, lockExempt: true });
     expect(getSlashCommandAccess("seam", null, "cancel", () => "all")).toMatchObject({ participantAllowed: false, lockExempt: false });

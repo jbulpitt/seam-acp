@@ -398,11 +398,10 @@ import {
   isFastModeDisabledByEnv,
   settleFastMode,
 } from "../../core/fast-mode.js";
-import type { CardGifCatalog } from "../../core/card-gifs.js";
+import { installCardVisuals } from "../../core/card-visuals.js";
 import {
   deleteSimpleCardGifMessage,
   isSimpleCardGifTerminal,
-  pickSimpleCardGifUrl,
   postSimpleCardGifMessage,
 } from "../../core/simple-card-gif.js";
 import { ConfigMutationService, type ConfigMutationInput } from "../../core/config-mutation.js";
@@ -597,10 +596,6 @@ import {
   type StructuredPanel,
   type TurnState,
 } from "../../core/types.js";
-import {
-  brandIconUrl,
-  resolveAgentBrand,
-} from "../../core/agent-brand.js";
 import { resolveDiscordSpeakerName } from "./adapter.js";
 import type { TurnBinding } from "../../plugins/turn-activity-registry.js";
 import {
@@ -1083,8 +1078,8 @@ export class Orchestrator {
     target: SessionRecord,
     prepared: PreparedSelfMigration
   ) => Promise<ExecuteSelfMigrationOutcome>;
-  /** Simple-card GIF catalog. Random pick is sync; fetch is off the render path. */
-  private cardGifs?: CardGifCatalog;
+  /** The visual plugin loads independently of MCP. */
+  private readonly cardVisualsReady: Promise<void>;
   /** Status-card poke after park/cancel so `📥 N waiting` updates immediately. */
   private onParkedChange?: () => void;
   /**
@@ -1230,6 +1225,7 @@ export class Orchestrator {
     // change takes effect on the next turn with no redeploy (P0).
     this.configMutation = new ConfigMutationService({
       store: this.store,
+      configKeys: this.plugins.configKeys,
       describeConfig: (record) => this.router.describeConfig(record),
       modelCatalog: this.modelCatalog,
       modelHideList: this.modelCatalog?.hideList,
@@ -1261,6 +1257,8 @@ export class Orchestrator {
       defaultTimezone: SCHEDULE_DEFAULT_TZ,
       logger: this.logger,
     });
+
+    this.cardVisualsReady = installCardVisuals({ plugins: this.plugins, config: this.config, store: this.store, router: this.router, mutation: this.configMutation });
 
     this.actionCards = new ActionCardManager({
       store: this.store.actionCards, adapter: this.adapter, logger: this.logger,
@@ -1323,7 +1321,7 @@ export class Orchestrator {
   /** Wait for the effects of committed identity changes. */
   async flushIdentityEffects(sessionId?: string): Promise<void> { await this.identityEffects.flush(sessionId); }
 
-  async loadPlugins(): Promise<void> { await this.identityEffects.ready; }
+  async loadPlugins(): Promise<void> { await Promise.all([this.identityEffects.ready, this.cardVisualsReady]); }
 
   /**
    * Bounded slash autocomplete responders (#slash-autocomplete). Registered
@@ -3735,14 +3733,9 @@ export class Orchestrator {
     const effectiveCwd = described.cwd.value;
     const repoDisplay = this.repoDisplay(effectiveCwd);
     const turnProfile = this.router.getProfile(described.agent.value, described.location.value);
-    const brand = resolveAgentBrand(described.agent.value, turnProfile?.brand);
-    const brandIconURL = brandIconUrl(brand, this.config.BRAND_ICON_BASE_URL);
-    const cardStyle = statusCardStyleForRender(described);
-    const gifUrl = pickSimpleCardGifUrl({
-      style: cardStyle,
-      gifOn: simpleCardGifForRender(described),
-      randomGif: () => this.cardGifs?.randomGif() ?? null,
-    });
+    const visuals = this.plugins.statusCards.decorate({ state: "Working", agentId: described.agent.value, profileBrand: turnProfile?.brand,
+      model: described.model.value, style: statusCardStyleForRender(described), gifOn: simpleCardGifForRender(described) });
+    const gifUrl = visuals.thumbnail;
     const status = new TurnStatus({
       model: described.model.value,
       repoDisplay,
@@ -3756,9 +3749,9 @@ export class Orchestrator {
         ? { modelEvidence: renderCatalogEvidenceLines(described.catalog.model.evidence) }
         : {}),
       ...(described.effort.value ? { effort: described.effort.value } : {}),
-      style: cardStyle,
-      ...(brandIconURL ? { brandIconURL } : {}),
-      authorName: turnProfile?.displayName ?? brand,
+      style: visuals.style,
+      brandIconURL: visuals.icon,
+      authorName: turnProfile?.displayName ?? described.agent.value,
     });
 
     // Seed only a matching execution's observation, not legacy bare-model usage.
@@ -5455,10 +5448,6 @@ export class Orchestrator {
           return this.cmdTools(interaction);
         case "approve":
           return this.cmdApprove(interaction);
-        case "card":
-          return this.cmdStatusCard(interaction);
-        case "gif":
-          return this.cmdSimpleCardGif(interaction);
         case "reset":
           return this.cmdReset(interaction);
         case "init":
@@ -7177,8 +7166,8 @@ export class Orchestrator {
         ? "Runtime reloaded; ACP session and context preserved"
         : "Runtime kept";
     const profile = this.router.getProfile(outcome.applied.agent);
-    const brand = resolveAgentBrand(outcome.applied.agent, profile?.brand);
-    const brandIconURL = brandIconUrl(brand, this.config.BRAND_ICON_BASE_URL);
+    const brandIconURL = this.plugins.statusCards.decorate({ state: "Done", agentId: outcome.applied.agent, profileBrand: profile?.brand,
+      model: outcome.applied.model, style: "full", gifOn: false }).icon;
     const panel: StructuredPanel = {
       color: 0x57f287,
       title: "✅ Thread configuration confirmed",
@@ -7258,10 +7247,6 @@ export class Orchestrator {
     ) => Promise<ExecuteSelfMigrationOutcome>
   ): void {
     this.selfMigrationHandler = handler;
-  }
-
-  setCardGifs(catalog: CardGifCatalog): void {
-    this.cardGifs = catalog;
   }
 
   setOnParkedChange(fn: () => void): void {
@@ -11819,17 +11804,10 @@ export class Orchestrator {
           resolved.model
         )?.context.effective ?? 0
       : 0;
-    const destStyle: StatusCardStyle = destDescribed
-      ? statusCardStyleForRender(destDescribed)
-      : "full";
-    const dispatchGifUrl = pickSimpleCardGifUrl({
-      style: destStyle,
-      gifOn: destDescribed ? simpleCardGifForRender(destDescribed) : false,
-      randomGif: () => this.cardGifs?.randomGif() ?? null,
-    });
-    const dispatchAgentId = resolved.profile?.id ?? destRecord?.agentId ?? "";
-    const dispatchBrand = resolveAgentBrand(dispatchAgentId, resolved.profile?.brand);
-    const brandIconURL = brandIconUrl(dispatchBrand, this.config.BRAND_ICON_BASE_URL);
+    const visuals = this.plugins.statusCards.decorate({ state: "Working", agentId: resolved.profile?.id ?? destRecord?.agentId ?? "",
+      profileBrand: resolved.profile?.brand, model: resolved.model,
+      style: destDescribed ? statusCardStyleForRender(destDescribed) : "full", gifOn: destDescribed ? simpleCardGifForRender(destDescribed) : false });
+    const dispatchGifUrl = visuals.thumbnail;
     const origin = await this.resolveDispatchOrigin(spec, target);
     const status = new TurnStatus({
       model: resolved.model,
@@ -11837,9 +11815,9 @@ export class Orchestrator {
       ...(resolved.effort ? { effort: resolved.effort } : {}),
       titlePrefix: this.dispatchPanelTitle(spec.kind, !!spec.chainId),
       ...(origin ? { origin } : {}),
-      style: destStyle,
-      ...(brandIconURL ? { brandIconURL } : {}),
-      authorName: resolved.profile?.displayName ?? dispatchBrand,
+      style: visuals.style,
+      brandIconURL: visuals.icon,
+      authorName: resolved.profile?.displayName ?? resolved.profile?.id,
     });
     status.setAction("Thinking…");
     // Seed context (live only). Invalidate on model mismatch, exactly like the
@@ -19105,7 +19083,8 @@ export class Orchestrator {
     const described = this.router.describeConfig(record);
     const agentId = described.agent.value;
     const destinationModel = described.model.value;
-    const cardStyle = statusCardStyleForRender(described);
+    const cardStyle = this.plugins.statusCards.decorate({ state: "Working", agentId, model: destinationModel,
+      style: statusCardStyleForRender(described), gifOn: false }).style ?? "full";
     const card = new RebuildCardSession<MessageRef>(cardStyle, {
       post: (panel) => this.postRebuildPanel(channel, panel),
       edit: (ref, panel) => this.editRebuildPanel(ref, panel),
@@ -22009,167 +21988,6 @@ export class Orchestrator {
         "Approval policy set to `deny`. The agent will be auto-denied every permission request — useful for read-only sessions.",
     };
     await i.reply({ content: messages[policy], flags: MessageFlags.Ephemeral });
-  }
-
-  private async cmdStatusCard(i: ChatInputCommandInteraction): Promise<void> {
-    const record = this.recordFromInteraction(i);
-    if (!record) {
-      await i.reply({ content: "Use inside a thread.", flags: MessageFlags.Ephemeral });
-      return;
-    }
-    const resolved = this.router.describeConfig(record).statusCardStyle;
-    const style = i.options.getString("style");
-    const scope = (i.options.getString("scope") ?? "session") as "session" | "thread" | "channel";
-    if (!style) {
-      await i.reply({
-        content:
-          `Status card: \`${resolved.value}\` (from ${resolved.source}). ` +
-          `Set with \`/seam config card style:full|simple [scope:session|thread|channel]\`.` +
-          (resolved.value === "simple"
-            ? " Simple cards drop repo/model/action/effort and show the agent brand icon."
-            : ""),
-        flags: MessageFlags.Ephemeral,
-      });
-      return;
-    }
-    if (style !== "full" && style !== "simple") {
-      await i.reply({
-        content: "Style must be `full` or `simple`.",
-        flags: MessageFlags.Ephemeral,
-      });
-      return;
-    }
-    const actor = { id: i.user.id, name: i.user.username };
-    if (scope === "channel") {
-      if (!record.parentRef) {
-        await i.reply({
-          content: "This thread has no parent channel to pin a channel-wide card style on.",
-          flags: MessageFlags.Ephemeral,
-        });
-        return;
-      }
-      const written = this.configMutation.applyChannelOverlay({
-        channelId: record.parentRef,
-        changes: { statusCardStyle: style },
-        actor,
-      });
-      if (!written.ok) {
-        await i.reply({ content: written.error, flags: MessageFlags.Ephemeral });
-        return;
-      }
-      await i.reply({
-        content:
-          `Channel status card set to \`${style}\` — every thread in this channel inherits it unless it has its own overlay. Applies on the next turn.`,
-        flags: MessageFlags.Ephemeral,
-      });
-      return;
-    }
-    if (scope === "thread") {
-      const written = this.configMutation.applyThreadOverlay({
-        threadId: record.channelRef,
-        ...(record.parentRef ? { parentRef: record.parentRef } : {}),
-        changes: { statusCardStyle: style },
-        actor,
-      });
-      if (!written.ok) {
-        await i.reply({ content: written.error, flags: MessageFlags.Ephemeral });
-        return;
-      }
-      await i.reply({
-        content: `Thread-preset status card set to \`${style}\`. Applies on the next turn.`,
-        flags: MessageFlags.Ephemeral,
-      });
-      return;
-    }
-    const cfg = this.store.readConfig(record);
-    cfg.statusCardStyle = style;
-    this.persistConfig(record, cfg);
-    await i.reply({
-      content:
-        style === "simple"
-          ? "Status card set to `simple` for this thread (overrides channel/thread presets). Applies on the next turn."
-          : "Status card set to `full` for this thread (overrides channel/thread presets). Applies on the next turn.",
-      flags: MessageFlags.Ephemeral,
-    });
-  }
-
-  private async cmdSimpleCardGif(i: ChatInputCommandInteraction): Promise<void> {
-    const record = this.recordFromInteraction(i);
-    if (!record) {
-      await i.reply({ content: "Use inside a thread.", flags: MessageFlags.Ephemeral });
-      return;
-    }
-    const resolved = this.router.describeConfig(record).simpleCardGif;
-    const state = i.options.getString("state");
-    const scope = (i.options.getString("scope") ?? "session") as "session" | "thread" | "channel";
-    const onLabel = resolved.value ? "on" : "off";
-    if (!state) {
-      await i.reply({
-        content:
-          `Simple-card GIF: \`${onLabel}\` (from ${resolved.source}). ` +
-          `Set with \`/seam config gif state:on|off [scope:session|thread|channel]\`. ` +
-          `Only the simple status card shows a thumbnail.`,
-        flags: MessageFlags.Ephemeral,
-      });
-      return;
-    }
-    if (state !== "on" && state !== "off") {
-      await i.reply({
-        content: "State must be `on` or `off`.",
-        flags: MessageFlags.Ephemeral,
-      });
-      return;
-    }
-    const on = state === "on";
-    const actor = { id: i.user.id, name: i.user.username };
-    if (scope === "channel") {
-      if (!record.parentRef) {
-        await i.reply({
-          content: "This thread has no parent channel to pin a channel-wide GIF toggle on.",
-          flags: MessageFlags.Ephemeral,
-        });
-        return;
-      }
-      const written = this.configMutation.applyChannelOverlay({
-        channelId: record.parentRef,
-        changes: { simpleCardGif: on },
-        actor,
-      });
-      if (!written.ok) {
-        await i.reply({ content: written.error, flags: MessageFlags.Ephemeral });
-        return;
-      }
-      await i.reply({
-        content:
-          `Channel simple-card GIF set to \`${state}\` — every thread in this channel inherits it unless it has its own overlay. Applies on the next turn.`,
-        flags: MessageFlags.Ephemeral,
-      });
-      return;
-    }
-    if (scope === "thread") {
-      const written = this.configMutation.applyThreadOverlay({
-        threadId: record.channelRef,
-        ...(record.parentRef ? { parentRef: record.parentRef } : {}),
-        changes: { simpleCardGif: on },
-        actor,
-      });
-      if (!written.ok) {
-        await i.reply({ content: written.error, flags: MessageFlags.Ephemeral });
-        return;
-      }
-      await i.reply({
-        content: `Thread-preset simple-card GIF set to \`${state}\`. Applies on the next turn.`,
-        flags: MessageFlags.Ephemeral,
-      });
-      return;
-    }
-    const cfg = this.store.readConfig(record);
-    cfg.simpleCardGif = on;
-    this.persistConfig(record, cfg);
-    await i.reply({
-      content: `Simple-card GIF set to \`${state}\` for this thread (overrides channel/thread presets). Applies on the next turn.`,
-      flags: MessageFlags.Ephemeral,
-    });
   }
 
   /**

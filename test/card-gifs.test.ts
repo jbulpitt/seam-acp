@@ -4,7 +4,7 @@ import {
   CARD_GIF_BROWSER_UA,
   CardGifCatalog,
   parseGifManifest,
-} from "../packages/core/src/core/card-gifs.js";
+} from "../packages/core/src/plugins/card-visuals/card-gifs.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;

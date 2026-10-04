@@ -53,6 +53,7 @@ import { fileURLToPath } from "node:url";
 import type { Logger } from "../../lib/logger.js";
 import type { SlashRegistry } from "../../plugins/slash-registry.js";
 import type { ComponentRegistry } from "../../plugins/component-registry.js";
+import type { StatusCardRegistry } from "../../plugins/status-card-registry.js";
 import { isThreadDetached, type Config } from "../../config.js";
 import {
   isObfuscatedChannel,
@@ -75,7 +76,6 @@ import type {
 import type { PanelButton, StructuredPanel, TurnState } from "../../core/types.js";
 import { clampPanelForDiscord } from "../../core/panel-limits.js";
 import { discordStatusColor } from "./renderer.js";
-import { brandIconUrl } from "../../core/agent-brand.js";
 import {
   CHOICE_CUSTOM_ID_PREFIX,
   CHOICE_CUSTOM_TEXT_MAX,
@@ -479,6 +479,7 @@ export function projectDiscordStatusEmbed(
 export class DiscordAdapter implements ChatAdapter {
   private readonly pluginSlash?: SlashRegistry;
   private readonly pluginComponents?: ComponentRegistry;
+  private readonly pluginStatusCards?: StatusCardRegistry;
   readonly platform = PLATFORM;
 
   private readonly client: Client;
@@ -504,7 +505,7 @@ export class DiscordAdapter implements ChatAdapter {
     logger: Logger;
     slashHandler: SlashHandler;
     autocompleteHandler?: AutocompleteHandler;
-    plugins?: { slash: SlashRegistry; components: ComponentRegistry };
+    plugins?: { slash: SlashRegistry; components: ComponentRegistry; statusCards?: StatusCardRegistry };
   }) {
     this.config = opts.config;
     this.logger = opts.logger.child({ adapter: PLATFORM });
@@ -512,6 +513,7 @@ export class DiscordAdapter implements ChatAdapter {
     this.autocompleteHandler = opts.autocompleteHandler;
     this.pluginSlash = opts.plugins?.slash;
     this.pluginComponents = opts.plugins?.components;
+    this.pluginStatusCards = opts.plugins?.statusCards;
     this.client = new Client({
       intents: [
         GatewayIntentBits.Guilds,
@@ -1962,9 +1964,8 @@ export class DiscordAdapter implements ChatAdapter {
       /^https:\/\/(?:cdn\.discordapp\.com|media\.discordapp\.net)\/attachments\/([^/]+)\/[^/]+\/([^?/#]+)/
     );
     const filename = logo?.name ?? (ownIcon?.[1] === message.channel.id ? ownIcon[2] : undefined);
-    const hostedIcon = filename && brandIconUrl(
-      filename.replace(/\.(webp|png|jpe?g|gif)$/i, ""), this.config.BRAND_ICON_BASE_URL
-    );
+    const hostedIcon = filename && this.pluginStatusCards?.decorate({ state: projection.state,
+      agentId: filename.replace(/\.(webp|png|jpe?g|gif)$/i, ""), model: source.author?.name ?? "", style: "full", gifOn: false }).icon;
     if (hostedIcon && embed.author) {
       embed.author = { ...embed.author, icon_url: hostedIcon };
       delete embed.author.proxy_icon_url;

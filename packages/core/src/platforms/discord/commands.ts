@@ -365,58 +365,6 @@ export function buildSeamCommand(): SlashCommandBuilder {
           )
       )
       .addSubcommand((sub) =>
-        declareAccess(sub, (option) => ({ kind: option("style") != null ? "mutating" : "read-only" }))
-          .setName("card")
-          .setDescription("Get or set the status-card layout (full or simple)")
-          .addStringOption((o) =>
-            o
-              .setName("style")
-              .setDescription("full (default) | simple (compact, brand icon)")
-              .setRequired(false)
-              .addChoices(
-                { name: "full", value: "full" },
-                { name: "simple", value: "simple" }
-              )
-          )
-          .addStringOption((o) =>
-            o
-              .setName("scope")
-              .setDescription("session (this thread, default) | thread preset | channel (all threads)")
-              .setRequired(false)
-              .addChoices(
-                { name: "session (this thread override)", value: "session" },
-                { name: "thread preset", value: "thread" },
-                { name: "channel (all threads inherit)", value: "channel" }
-              )
-          )
-      )
-      .addSubcommand((sub) =>
-        declareAccess(sub, (option) => ({ kind: option("state") != null ? "mutating" : "read-only" }))
-          .setName("gif")
-          .setDescription("Random GIF thumbnail on the simple status card (on or off)")
-          .addStringOption((o) =>
-            o
-              .setName("state")
-              .setDescription("on | off")
-              .setRequired(false)
-              .addChoices(
-                { name: "on", value: "on" },
-                { name: "off", value: "off" }
-              )
-          )
-          .addStringOption((o) =>
-            o
-              .setName("scope")
-              .setDescription("session (this thread, default) | thread preset | channel (all threads)")
-              .setRequired(false)
-              .addChoices(
-                { name: "session (this thread override)", value: "session" },
-                { name: "thread preset", value: "thread" },
-                { name: "channel (all threads inherit)", value: "channel" }
-              )
-          )
-      )
-      .addSubcommand((sub) =>
         declareAccess(sub, { kind: "mutating" })
           .setName("approve")
           .setDescription("Set permission policy for this thread")

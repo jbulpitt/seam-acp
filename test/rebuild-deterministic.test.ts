@@ -5,6 +5,7 @@ import type { Logger } from "../packages/core/src/lib/logger.js";
 import type { SessionRecord } from "../packages/core/src/core/types.js";
 import type { MessagePage, MessagePageItem, MessagePageRequest } from "../packages/core/src/core/message-reader.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
+import { visualConfig } from "./plugin-card-visuals-fixture.js";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
 const SEAM = "seam-bot";
@@ -101,6 +102,7 @@ function makeOrch(over?: {
   const orch = new Orchestrator({
     logger: silent,
     config: {
+      ...visualConfig,
       DATA_DIR: "/tmp/none",
       REPOS_ROOT: "/repo",
       DEFAULT_MODEL: "default",
@@ -833,6 +835,7 @@ describe("reconstructSessionFromDiscord", () => {
         statusCardStyle: { value: "simple", source: "session config" },
       }),
     });
+    await t.orch.loadPlugins();
     await (t.orch as any).reconstructSessionFromDiscord({
       record: t.rec,
       channel: { platform: "discord", id: "thread-r" },

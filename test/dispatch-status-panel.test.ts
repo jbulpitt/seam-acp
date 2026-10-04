@@ -8,6 +8,7 @@ import { DispatchStatusPanel } from "../packages/core/src/core/dispatch-status-p
 import { TurnStatus, formatContextUsage } from "../packages/core/src/core/status-panel.js";
 import { discordRenderer } from "../packages/core/src/platforms/discord/renderer.js";
 import { serializePanelText } from "../packages/core/src/platforms/renderer.js";
+import { visualConfig } from "./plugin-card-visuals-fixture.js";
 import type { DispatchSpec } from "../packages/core/src/core/dispatch/types.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import type { SessionRecord, StructuredPanel } from "../packages/core/src/core/types.js";
@@ -299,6 +300,7 @@ function makeOrch(opts: {
     ...opts.storeOverrides,
   };
   const config = {
+    ...visualConfig,
     DATA_DIR: opts.dataDir,
     REPOS_ROOT: "/repo",
     TURN_TIMEOUT_SECONDS: opts.timeoutSeconds ?? 60,
@@ -598,6 +600,7 @@ describe("dispatchInjectTurn: status panel ON (default)", () => {
     const { adapter, calls } = spyAdapter();
     const orch = makeOrch({ dataDir, rt, adapter });
 
+    await orch.loadPlugins();
     const res = await orch.dispatchCanaryTurn(baseSpec());
 
     // The status panel is a REAL embed card via sendPanel (the SAME path a normal

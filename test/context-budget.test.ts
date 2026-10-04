@@ -12,6 +12,7 @@ import { matchesContextBudget, type ContextBudgetIdentity } from "../packages/co
 import { copilotRequestedContextTier, makeCopilotProfile } from "../packages/adapters/src/profiles/copilot.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 import { attachLocalBridge } from "./local-bridge-fixture.js";
+import { visualConfig } from "./plugin-card-visuals-fixture.js";
 import type { SessionRecord } from "../packages/core/src/core/types.js";
 import { discordRenderer } from "../packages/core/src/platforms/discord/renderer.js";
 
@@ -185,7 +186,7 @@ describe("real injection recording, offline runtime only", () => {
       logger: pino({ level: "debug" }, { write: (line: string) => { logs.push(line); } }) as never,
       store, modelCatalog: fixtureModelCatalog([profile as never]),
       renderer: discordRenderer,
-      config: { DATA_DIR: dir, REPOS_ROOT: dir, TURN_TIMEOUT_SECONDS: 60, REPO_EMOJIS: new Map(),
+      config: { ...visualConfig, DATA_DIR: dir, REPOS_ROOT: dir, TURN_TIMEOUT_SECONDS: 60, REPO_EMOJIS: new Map(),
         DEFAULT_MODEL: identity.model, channelPresets: new Map(), threadPresets: new Map() } as never,
       router: {
         listProfiles: () => [profile], ensureSessionRecord: () => store.get(record.id)!, getProfile: () => profile,
@@ -205,6 +206,7 @@ describe("real injection recording, offline runtime only", () => {
       } as never,
     });
     attachLocalBridge(orch, [profile as never], dir);
+    await orch.loadPlugins();
     await (orch as any).handleIncomingMessageInner({
       messageId: "synthetic-message", channel: { platform: "discord", id: record.channelRef },
       authorId: "synthetic-user", authorIsBot: false, text: "offline fixture",

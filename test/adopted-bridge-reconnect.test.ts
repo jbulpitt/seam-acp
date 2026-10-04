@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { pino } from "pino";
-import { makeMux, type AgentProfile } from "@seam/adapters";
+import { makeMux, type AgentProfile, type BridgeSlotHealth } from "@seam/adapters";
 import { AgentRuntime } from "../packages/core/src/agents/agent-runtime.js";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
@@ -21,12 +21,12 @@ const drain = async () => {
   for (let i = 0; i < 20; i++) await new Promise<void>(resolve => setImmediate(resolve));
 };
 
-function setup() {
+function setup(source: "inbound" | "dispatch" = "inbound") {
   const dir = mkdtempSync(path.join(tmpdir(), "seam-adopt-reconnect-"));
   cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
   const store = new SessionStore(path.join(dir, "test.db"));
   cleanups.push(() => store.close());
-  const now = new Date().toISOString();
+  const now = new Date(Date.now() - 60_000).toISOString();
   const record = { id: "discord:thread", platform: "discord", channelRef: "thread",
     parentRef: null, agentId: "codex", acpSessionId: "acp", repoPath: "/synthetic",
     configJson: "{}", createdUtc: now, updatedUtc: now };
@@ -34,7 +34,7 @@ function setup() {
   store.turnAttempts.registerOwner("old-controller");
   const attempt = store.turnAttempts.claim({ id: "inbound-1", target: "thread",
     prompt: "work", session: "live", kind: "parked", createdUtc: now },
-  "identity", "old-controller", "inbound");
+  "identity", "old-controller", source);
   store.turnAttempts.bind(attempt, "acp");
   store.turnAttempts.bindStatusCard(attempt, { channelId: "thread", messageId: "card" });
   store.turnAttempts.startPrompt(attempt);
@@ -66,11 +66,13 @@ function setup() {
     }
   }
   let socket = new Socket();
-  const mux = makeMux({ id: "remote" });
+  let health: BridgeSlotHealth[] = [];
+  const mux = makeMux({ id: "remote", onSlotHealth: rows => { health = [...rows]; } });
   mux.attach(socket as never);
   socket.deliver({ type: "hello", instanceId: "first", capabilities: { durableSlots: true } });
   let runtime!: AgentRuntime;
   const router = {
+    isBusy: () => runtime?.busy ?? false,
     describeConfig: () => ({ model: { value: "test" }, agent: { value: "codex" },
       location: { value: "remote" }, cwd: { value: "/synthetic" } }),
     adoptRecoveryRuntime: (_record: unknown, child: any, session: string) => {
@@ -96,7 +98,7 @@ function setup() {
     adapter: adapter as any, renderer: discordRenderer as any,
     config: { DATA_DIR: dir, REPOS_ROOT: "/synthetic", REPO_EMOJIS: new Map(),
       channelPresets: new Map(), threadPresets: new Map() } as any });
-  orch.setBridgeHub({ muxFor: () => mux } as any);
+  orch.setBridgeHub({ muxFor: () => mux, slotHealthFor: () => health } as any);
   const run = (orch as any).adoptRemoteRecoveryOwned(store.turnAttempts.get(attempt.id)) as Promise<boolean>;
   const frame = (payload: Record<string, unknown>, live = true) => {
     const entry = { slot: 6, seq: ++seq, ...payload };
@@ -125,6 +127,59 @@ function setup() {
 }
 
 describe("adopted turns across a bridge reconnect", () => {
+  it("observes the boot snapshot even when its recovery frame was already acknowledged", async () => {
+    const h = setup("dispatch");
+    await drain();
+    h.store.turnAttempts.admit({ id: "queued", target: "thread", prompt: "next",
+      session: "live", createdUtc: new Date().toISOString() });
+    expect(h.orch.inspectThreadWorkProgress("thread")).toMatchObject({
+      remoteRecovery: [{ observed: true, phase: "executing", retry: 0, remaining: 3 }],
+      queuedDispatchIds: ["queued"],
+      retainedDispatchIds: ["inbound-1"],
+      blockedByDispatchIds: [],
+    });
+    await h.reconnect();
+    expect(h.orch.inspectThreadWorkProgress("thread").remoteRecovery[0]).toMatchObject({
+      observed: true, phase: "executing",
+    });
+    h.complete("finished");
+    await h.run;
+  });
+
+  it("records adopted narration reaching Discord without overwriting newer session config", async () => {
+    const h = setup();
+    await drain();
+    const record = h.store.get("discord:thread")!;
+    h.store.upsert({ ...record, configJson: '{"newer":true}' });
+    h.text("visible after adoption\n\n");
+    h.update({ sessionUpdate: "tool_call", toolCallId: "flush", title: "next", kind: "execute" });
+    await drain();
+    expect(h.visible).toContain("visible after adoption");
+    expect(h.store.get(record.id)).toMatchObject({ configJson: '{"newer":true}' });
+    expect(Date.parse(h.store.get(record.id)!.updatedUtc)).toBeGreaterThan(Date.parse(record.updatedUtc));
+    h.complete("visible after adoption\n\nfinished");
+    await h.run;
+  });
+
+  it("records terminal-only delivery as activity, but not a failed send", async () => {
+    const delivered = setup();
+    await drain();
+    const before = delivered.store.get("discord:thread")!.updatedUtc;
+    delivered.complete("terminal-only reply");
+    await delivered.run;
+    expect(delivered.visible).toEqual(["terminal-only reply"]);
+    expect(Date.parse(delivered.store.get("discord:thread")!.updatedUtc)).toBeGreaterThan(Date.parse(before));
+
+    const failed = setup();
+    await drain();
+    const unchanged = failed.store.get("discord:thread")!.updatedUtc;
+    failed.adapter.sendMessage.mockRejectedValue(new Error("Discord unavailable"));
+    failed.complete("not delivered");
+    await failed.run;
+    expect(failed.store.get("discord:thread")!.updatedUtc).toBe(unchanged);
+    expect(failed.store.turnAttempts.get("inbound-1")!.deliveryDone).toBe(false);
+  });
+
   it("does not replay directive-only output after already rendering its choice", async () => {
     const h = setup();
     await drain();

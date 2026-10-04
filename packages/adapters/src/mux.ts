@@ -619,7 +619,6 @@ export function makeMux(opts: {
             const liveOnBridge = new Set<number>(
               reply.slots.filter((slot) => !deadOnBridge.has(slot))
             );
-            if (health.length) opts.onSlotHealth?.(health);
             // #444: catch up on output produced while the socket was down.
             // Runs after eviction so a slot the bridge no longer has is not
             // asked to replay. Fire-and-forget per slot: an OLD bridge rejects
@@ -940,7 +939,7 @@ export function makeMux(opts: {
       );
     }
     const cmdId = Math.random().toString(36).substring(2, 15);
-    return new Promise((resolve, reject) => {
+    return new Promise<any>((resolve, reject) => {
       pendingCmds.set(cmdId, { resolve, reject });
       const timeout = setTimeout(() => {
         if (pendingCmds.has(cmdId)) {
@@ -951,6 +950,9 @@ export function makeMux(opts: {
       if (typeof timeout.unref === "function") timeout.unref();
 
       send({ type: "cmd", cmdId, action, payload });
+    }).then((reply) => {
+      if (action === "listSlots" && Array.isArray(reply?.health)) opts.onSlotHealth?.(reply.health);
+      return reply;
     });
   }
 

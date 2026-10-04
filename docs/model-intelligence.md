@@ -83,6 +83,11 @@ selected benchmark effort, generation, and degradation. MCP reads and card
 renders are cache-only. Per-turn status cards deliberately contain no model
 intelligence.
 
+The card shows each model id once, using its highest-value variant and counting
+distinct host bindings. It trims the lowest ranks within tiers to fit Discord's
+message-wide text limit, with per-tier omission counts pointing to
+`model_value_rankings`. MCP retains the full per-binding rankings.
+
 ## Migration and rollback
 
 Migration only adds `model_intelligence_*` tables. Existing `model_metadata`

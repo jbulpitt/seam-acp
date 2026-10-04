@@ -15,6 +15,8 @@ import type {
   ModelValueSnapshotRow,
 } from "../packages/core/src/core/model-value/types.js";
 import type { StructuredLayout } from "../packages/core/src/core/types.js";
+import { rankSnapshotRows } from "../packages/core/src/core/model-value/ranking.js";
+import { twoBindingCopilotRankings } from "./fixtures/two-binding-copilot-rankings.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import type {
   ChannelRef,
@@ -59,6 +61,62 @@ function layoutText(layout: StructuredLayout): string {
 }
 
 describe("model value rankings rendering", () => {
+  it("collapses model IDs across distinct bindings without changing the MCP ranking rows", () => {
+    const binding = (location: string) => ({ agent: "copilot", location, scope: location, generation: 1, state: "ready" as const });
+    const rows = [
+      ranking({ copilotModel: "same-model", variantId: "b::same", valueScore: 10, bindings: [binding("host-b")] }),
+      ranking({ copilotModel: "same-model", variantId: "a::same", valueScore: 20, bindings: [binding("host-a")] }),
+      ranking({ copilotModel: "same-model", variantId: "older::same", valueScore: 5, bindings: [binding("host-a")] }),
+    ];
+    const before = structuredClone(rows);
+    const mcpBefore = rankSnapshotRows(rows);
+    for (const text of [layoutText(renderModelValueRankingsLayout(rows)), JSON.stringify(renderModelValueRankingsPanel(rows))]) {
+      expect(text.match(/\*\*same-model\*\*/g)).toHaveLength(1);
+      expect(text).toContain("value 20");
+      expect(text).toContain("2 bindings");
+    }
+    expect(rows).toEqual(before);
+    expect(rankSnapshotRows(rows)).toEqual(mcpBefore);
+    expect(mcpBefore).toHaveLength(3);
+  });
+
+  it("keeps the real two-binding Copilot catalog within the aggregate component text limit", () => {
+    const rows = twoBindingCopilotRankings();
+    expect(rows).toHaveLength(58);
+    const layout = renderModelValueRankingsLayout(rows);
+    const text = layoutText(layout);
+    const total = layout.blocks.reduce((sum, block) => sum + (block.kind === "text" ? block.content.length : 0), 0);
+    expect(total).toBeLessThanOrEqual(4_000);
+    const displayed = [...text.matchAll(/\*\*([^*\n]+)\*\* · value/g)].map(match => match[1]);
+    expect(new Set(displayed).size).toBe(displayed.length);
+    expect(displayed.length).toBeGreaterThan(0);
+    expect(text.match(/2 bindings/g)).toHaveLength(displayed.length);
+    const omitted = [...text.matchAll(/\+(\d+) more \(see `model_value_rankings` MCP\)/g)]
+      .reduce((sum, match) => sum + Number(match[1]), 0);
+    expect(omitted + displayed.length).toBe(29);
+    expect(text).toContain("see `model_value_rankings` MCP");
+    expect(rankSnapshotRows(rows)).toHaveLength(58);
+  });
+
+  it("trims only the lowest ranks in each tier and counts all omitted models", () => {
+    const tiers = ["flagship", "balanced", "flash", null] as const;
+    const rows = tiers.flatMap(tier => Array.from({ length: 30 }, (_, index) => ranking({
+      copilotModel: `${tier ?? "unranked"}-${index.toString().padStart(2, "0")}`,
+      tier,
+      valueScore: tier === null ? null : 30 - index,
+    })));
+    const layout = renderModelValueRankingsLayout(rows);
+    const texts = layout.blocks.filter(block => block.kind === "text").map(block => block.content);
+    expect(texts.reduce((sum, text) => sum + text.length, 0)).toBeLessThanOrEqual(4_000);
+    for (const [index, tier] of tiers.entries()) {
+      const text = texts[index + 2]!;
+      const displayed = [...text.matchAll(/\*\*([^*\n]+)\*\* · value/g)].map(match => match[1]);
+      expect(displayed.length).toBeGreaterThan(0);
+      expect(displayed).toEqual(rows.filter(row => row.tier === tier).slice(0, displayed.length).map(row => row.copilotModel));
+      expect(text).toContain(`+${30 - displayed.length} more (see \`model_value_rankings\` MCP)`);
+    }
+  });
+
   it("groups tiers, ranks by value, retains uncovered models, and uses snapshot time", () => {
     const result = snapshot([
       ranking({ copilotModel: "flagship-low", tier: "flagship", valueScore: 10 }),
@@ -111,6 +169,8 @@ describe("model value rankings rendering", () => {
     for (const block of layout.blocks) {
       if (block.kind === "text") expect(block.content.length).toBeLessThanOrEqual(4_000);
     }
+    expect(layout.blocks.reduce((total, block) => total + (block.kind === "text" ? block.content.length : 0), 0))
+      .toBeLessThanOrEqual(4_000);
 
     const panel = renderModelValueRankingsPanel(snapshot(rows));
     const title = panel.title ?? "";

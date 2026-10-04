@@ -11,7 +11,7 @@ import {
 const STATE_FILE = "model-value-rankings-card.json";
 const DEBOUNCE_MS = 500;
 const COLOR = 0x5865f2;
-const LAYOUT_TEXT_LIMIT = 3_800;
+const LAYOUT_TEXT_LIMIT = 4_000;
 const PANEL_FIELD_LIMIT = 1_024;
 const PANEL_TOTAL_LIMIT = 6_000;
 export const MODEL_VALUE_RANKINGS_BUMP_AFTER_MS = 20 * 60 * 60_000;
@@ -102,18 +102,37 @@ function rankingLine(row: ModelValueSnapshotRow, rank: number | null): string {
   );
 }
 
+function compareRows(a: ModelValueSnapshotRow, b: ModelValueSnapshotRow): number {
+  if (a.valueScore === null && b.valueScore !== null) return 1;
+  if (a.valueScore !== null && b.valueScore === null) return -1;
+  return (b.valueScore ?? 0) - (a.valueScore ?? 0) || a.copilotModel.localeCompare(b.copilotModel) ||
+    (a.variantId ?? a.copilotModel).localeCompare(b.variantId ?? b.copilotModel);
+}
+
+function collapseBindings(rows: readonly ModelValueSnapshotRow[]): ModelValueSnapshotRow[] {
+  const groups = new Map<string, ModelValueSnapshotRow[]>();
+  for (const row of rows) {
+    const group = groups.get(row.copilotModel) ?? [];
+    group.push(row);
+    groups.set(row.copilotModel, group);
+  }
+  return [...groups.values()].map(group => {
+    // Show the highest-value variant, counting distinct host bindings.
+    const best = group.sort(compareRows)[0]!;
+    const bindings = new Map(group.flatMap(row => (row.bindings ?? []).map(binding =>
+      [`${binding.agent}\u0000${binding.location}`, binding] as const
+    )));
+    return { ...best, bindings: [...bindings.values()] };
+  });
+}
+
 function sortedSectionRows(
   rows: readonly ModelValueSnapshotRow[],
   tier: ModelValueTier | null
 ): ModelValueSnapshotRow[] {
   return rows
     .filter((row) => row.tier === tier)
-    .sort((a, b) => {
-      if (a.valueScore === null && b.valueScore !== null) return 1;
-      if (a.valueScore !== null && b.valueScore === null) return -1;
-      return (b.valueScore ?? 0) - (a.valueScore ?? 0) || a.copilotModel.localeCompare(b.copilotModel) ||
-        (a.variantId ?? a.copilotModel).localeCompare(b.variantId ?? b.copilotModel);
-    });
+    .sort(compareRows);
 }
 
 function snapshotDescription(rows: readonly ModelValueSnapshotRow[]): string {
@@ -170,19 +189,41 @@ function sectionLines(
 export function renderModelValueRankingsLayout(
   rows: readonly ModelValueSnapshotRow[]
 ): StructuredLayout {
+  const collapsed = collapseBindings(rows);
+  const sections = TIER_SECTIONS.map(section => ({
+    ...section,
+    lines: sortedSectionRows(collapsed, section.tier).map((row, index) =>
+      rankingLine(row, section.tier === null ? null : index + 1)
+    ),
+    omitted: 0,
+  }));
+  const sectionText = (section: typeof sections[number]): string => {
+    const lines = [...section.lines];
+    if (section.omitted) lines.push(`+${section.omitted} more (see \`model_value_rankings\` MCP)`);
+    if (!lines.length) lines.push("_No models in this tier._");
+    return `**${section.label}**\n${lines.join("\n")}`;
+  };
+  const title = "**📊 Model value rankings**";
+  const reserve = sections.reduce((sum, section) => sum + sectionText({
+    ...section, lines: [], omitted: section.lines.length,
+  }).length, 0);
+  const description = truncateUtf16(snapshotDescription(rows), LAYOUT_TEXT_LIMIT - title.length - reserve);
+  const textLength = () => title.length + description.length +
+    sections.reduce((sum, section) => sum + sectionText(section).length, 0);
+  // Discord budgets all Text Displays together, including omission notices.
+  while (textLength() > LAYOUT_TEXT_LIMIT) {
+    const largest = sections.filter(section => section.lines.length)
+      .sort((a, b) => sectionText(b).length - sectionText(a).length)[0]!;
+    largest.lines.pop();
+    largest.omitted += 1;
+  }
   const blocks: LayoutBlock[] = [
-    { kind: "text", content: "**📊 Model value rankings**" },
-    { kind: "text", content: snapshotDescription(rows) },
+    { kind: "text", content: title },
+    { kind: "text", content: description },
   ];
-  for (const section of TIER_SECTIONS) {
-    const chunks = chunkLines(sectionLines(rows, section.tier), LAYOUT_TEXT_LIMIT - 80);
-    chunks.forEach((chunk, index) => {
-      blocks.push({ kind: "separator", divider: true, spacing: index === 0 ? "large" : "small" });
-      blocks.push({
-        kind: "text",
-        content: `**${section.label}${index === 0 ? "" : " (continued)"}**\n${chunk}`,
-      });
-    });
+  for (const section of sections) {
+    blocks.push({ kind: "separator", divider: true, spacing: "large" });
+    blocks.push({ kind: "text", content: sectionText(section) });
   }
   return { color: COLOR, blocks };
 }
@@ -192,11 +233,12 @@ export function renderModelValueRankingsPanel(
 ): StructuredPanel {
   const title = "📊 Model value rankings";
   const description = snapshotDescription(rows);
+  const collapsed = collapseBindings(rows);
   const fields: NonNullable<StructuredPanel["fields"]> = [];
   let used = title.length + description.length;
   let omitted = false;
   for (const section of TIER_SECTIONS) {
-    const chunks = chunkLines(sectionLines(rows, section.tier), PANEL_FIELD_LIMIT);
+    const chunks = chunkLines(sectionLines(collapsed, section.tier), PANEL_FIELD_LIMIT);
     for (const [index, value] of chunks.entries()) {
       const name = `${section.label}${index === 0 ? "" : " (continued)"}`;
       if (fields.length >= 25 || used + name.length + value.length > PANEL_TOTAL_LIMIT) {

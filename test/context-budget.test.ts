@@ -192,6 +192,7 @@ describe("real injection recording, offline runtime only", () => {
         describeConfig: () => ({
           agent: { value: identity.agentId }, location: { value: "local" }, model: { value: identity.model },
           effort: { value: null }, cwd: { value: dir }, fastMode: { value: false },
+          role: { value: null }, disableThreadPrefix: { value: false },
         }),
       } as never,
       adapter: {

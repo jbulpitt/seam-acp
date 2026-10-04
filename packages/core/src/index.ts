@@ -1113,7 +1113,7 @@ async function main(): Promise<void> {
       router,
       mutation: orchestrator.getConfigMutation(),
       modelCatalog,
-      identityCommitted: () => orchestrator.flushIdentityEffects(),
+      identityCommitted: (sessionId) => orchestrator.flushIdentityEffects(sessionId),
     });
     orchestrator.setSelfMigrationHandler((target, prepared) =>
       threadSessionControl.executeSelfMigration(target, prepared)

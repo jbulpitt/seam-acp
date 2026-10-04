@@ -149,8 +149,9 @@ function makeHarness(opts?: { channelPreset?: ChannelPreset }) {
     renderer: { codeBlock: (value: string) => value } as any,
   });
   orch.setBridgeHub(localBridgeHub(profiles, reposRoot));
-  const applyThreadName = vi.fn(async () => ({ status: "unchanged" }));
-  (orch as any).applyThreadName = applyThreadName;
+  const identityEffects = (orch as any).identityEffects;
+  const realFlush = identityEffects.flush.bind(identityEffects);
+  const flushIdentity = vi.spyOn(identityEffects, "flush").mockImplementation(realFlush);
   const cfg: SessionConfigState = {
     model: "claude-opus-5",
     reasoningEffort: "low",
@@ -179,7 +180,7 @@ function makeHarness(opts?: { channelPreset?: ChannelPreset }) {
     updatedUtc: "2026-09-04T00:00:00.000Z",
   };
   store.upsert(record);
-  return { orch, router, store, threadPresets, created, addedMembers, applyThreadName };
+  return { orch, router, store, threadPresets, created, addedMembers, flushIdentity };
 }
 
 function read(store: SessionStore) {
@@ -366,7 +367,7 @@ describe("/seam config set named parameters", () => {
       };
     });
     (orch as any).reconstructSessionFromDiscord = rebuild;
-    const applyThreadName = (orch as any).applyThreadName as ReturnType<typeof vi.fn>;
+    const flushIdentity = (orch as any).identityEffects.flush as ReturnType<typeof vi.fn>;
 
     const call = interaction({ model: "gpt-5.4", repo: "alpha" }, { rebuild: true });
     await (orch as any).cmdConfigSet(call.i);
@@ -378,7 +379,7 @@ describe("/seam config set named parameters", () => {
     expect(call.edits.at(-1)).toMatch(/window 200000/);
     expect(read(store).cfg.model).toBe("gpt-5.4");
     expect(read(store).record.repoPath).toBe(path.join(reposRoot, "alpha"));
-    expect(applyThreadName).toHaveBeenCalled();
+    expect(flushIdentity).toHaveBeenCalled();
     store.close();
   });
 
@@ -463,16 +464,17 @@ describe("configured /seam new (#294)", () => {
   });
 
   it("applies every named field before one final naming pass without starting or invalidating a runtime", async () => {
-    const { orch, router, store, created, addedMembers, applyThreadName } = makeHarness();
+    const { orch, router, store, created, addedMembers, flushIdentity } = makeHarness();
     const invalidate = vi.spyOn(router, "invalidate");
     const getOrStart = vi.spyOn(router, "getOrStartRuntime");
-    applyThreadName.mockImplementationOnce(async (record: SessionRecord) => {
-      const effective = router.describeConfig(store.get(record.id) ?? record);
+    const realFlush = flushIdentity.getMockImplementation()!;
+    flushIdentity.mockImplementationOnce(async (sessionId: string) => {
+      const effective = router.describeConfig(store.get(sessionId)!);
       expect(effective.agent.value).toBe("codex");
       expect(effective.model.value).toBe("gpt-5.4");
       expect(effective.effort.value).toBe("high");
       expect(effective.role.value).toBe("qa");
-      return { status: "renamed" };
+      await realFlush(sessionId);
     });
     const call = interaction({
       name: "investigation",
@@ -510,7 +512,7 @@ describe("configured /seam new (#294)", () => {
     });
     expect(invalidate).not.toHaveBeenCalled();
     expect(getOrStart).not.toHaveBeenCalled();
-    expect(applyThreadName).toHaveBeenCalledTimes(1);
+    expect(flushIdentity).toHaveBeenCalledTimes(1);
     expect(call.edits.at(-1)).toContain(`Created and configured thread <#${NEW_THREAD}>`);
     expect(call.edits.at(-1)).toContain("agent `codex`, model `gpt-5.4`, effort `high`");
     store.close();
@@ -605,7 +607,7 @@ describe("configured /seam new (#294)", () => {
   });
 
   it("retains a created thread but rolls back and reports actual state on a mid-apply failure", async () => {
-    const { orch, router, store, created, applyThreadName } = makeHarness();
+    const { orch, router, store, created, flushIdentity } = makeHarness();
     (orch as any).configMutation.applyThreadOverlay = () => ({
       ok: false,
       error: "injected overlay failure",
@@ -623,7 +625,7 @@ describe("configured /seam new (#294)", () => {
     expect(call.edits.at(-1)).toMatch(
       /Created thread <#444444444444444444>, but configuration was not applied: injected overlay failure.*Actual: agent `claude`/
     );
-    expect(applyThreadName).not.toHaveBeenCalled();
+    expect(flushIdentity).not.toHaveBeenCalled();
     store.close();
   });
 

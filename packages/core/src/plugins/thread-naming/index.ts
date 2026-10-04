@@ -29,6 +29,16 @@ function editorId(action: string, userId: string, deadline: number): string {
 export function createThreadNamingPlugin(ports: ThreadNamingPorts): Plugin {
   const namer = new ThreadNamer({ ...ports.threads, getConfig: () => ports.internal.rules.get(), setNamePrefix: ports.internal.setNamePrefix });
   const current = (threadId: string) => ports.internal.get(threadId);
+  const recompactions = new Map<string, Promise<unknown>>();
+  const recompact = async (platform: string, parent: string) => {
+    let running = recompactions.get(parent);
+    if (!running) {
+      running = namer.recompactChannel(platform, parent);
+      recompactions.set(parent, running);
+    }
+    try { await running; }
+    finally { if (recompactions.get(parent) === running) recompactions.delete(parent); }
+  };
   const render = (owner: string, deadline: number, error?: string) => {
     const rules = ports.internal.rules.get();
     const preview = (text: string) => `\`\`\`\n${text || "(none)"}\n\`\`\``.slice(0, 1024);
@@ -121,7 +131,7 @@ export function createThreadNamingPlugin(ports: ThreadNamingPorts): Plugin {
       identity: [
         { event: "thread-created", handle: async event => onIdentity(event.thread, true) },
         { event: "identity-changed", handle: async event => {
-          if (event.reason === "channel preset committed" && event.thread.parentId) await namer.recompactChannel(event.thread.platform, event.thread.parentId);
+          if (event.reason === "channel preset committed" && event.thread.parentId) await recompact(event.thread.platform, event.thread.parentId);
           else await onIdentity(event.thread, false);
         } },
       ],

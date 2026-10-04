@@ -1290,7 +1290,7 @@ export class Orchestrator {
   }
 
   /** Wait for the effects of committed identity changes. */
-  async flushIdentityEffects(): Promise<void> { await this.identityEffects.flush(); }
+  async flushIdentityEffects(sessionId?: string): Promise<void> { await this.identityEffects.flush(sessionId); }
 
   async loadPlugins(): Promise<void> { await this.identityEffects.ready; }
 
@@ -1895,7 +1895,7 @@ export class Orchestrator {
             this.logger.warn({ err, session: record.id }, "invalidate after config apply failed")
           );
         }
-        await this.identityEffects.flush();
+        await this.identityEffects.flush(record.id);
         await this.adapter
           .sendMessage({ platform: PLATFORM, id: record.channelRef }, `✅ ${result.message}`)
           .catch(() => {});
@@ -7305,7 +7305,7 @@ export class Orchestrator {
     if (!role.ok) throw new Error(role.error);
 
     configured = this.store.get(record.id) ?? configured;
-    await this.identityEffects.flush();
+    await this.identityEffects.flush(record.id);
     return thread.id;
   }
 
@@ -14696,7 +14696,7 @@ export class Orchestrator {
           );
           return;
         }
-        await this.identityEffects.flush();
+        await this.identityEffects.flush(record.id);
         await i.editReply(
           `Created and configured thread <#${thread.id}>. Effective: ` +
             `${this.configSetSummary(applied.effective)}.`
@@ -14705,7 +14705,7 @@ export class Orchestrator {
       }
 
       // No config arguments preserves #157's visual editor workflow.
-      await this.identityEffects.flush();
+      await this.identityEffects.flush(record.id);
       await i.editReply(`Created thread <#${thread.id}> and initialized it.`);
       const opened = await this.openConfigEditorCard(thread, i.user.id);
       if (!opened) {
@@ -15003,7 +15003,7 @@ export class Orchestrator {
     const defaultEffort = selected.effort.selectionDefault;
     const current = describedBefore.model.value;
     if (canonicalId === current) {
-      await this.identityEffects.flush();
+      await this.identityEffects.flush(record.id);
       const message = `🧠 Model already set to \`${canonicalId}\` (no change).`;
       await respond(message);
       return { ok: true, message };
@@ -15106,7 +15106,7 @@ export class Orchestrator {
         message = `🧠 Model will be \`${canonicalId}\` with effort \`${defaultEffort}\` on the next turn.`;
       }
 
-      await this.identityEffects.flush();
+      await this.identityEffects.flush(record.id);
       await respond(message);
       return { ok: true, message };
     } catch (err) {
@@ -15186,13 +15186,13 @@ export class Orchestrator {
         await i.reply({ content: result.error, flags: MessageFlags.Ephemeral });
         return;
       }
-      await this.identityEffects.flush();
+      await this.identityEffects.flush(record.id);
     } else {
       const cfg = this.store.readConfig(record);
       if (role) cfg.role = role;
       else delete cfg.role;
       this.persistConfig(record, cfg);
-      await this.identityEffects.flush();
+      await this.identityEffects.flush(record.id);
     }
     const effective = this.router.describeConfig(this.store.get(record.id) ?? record).role;
     await i.reply({
@@ -15320,7 +15320,7 @@ export class Orchestrator {
     if (this.router.hasRuntime(record.id)) {
       await this.router.invalidate(record.id, { clearAcpSession: false });
     }
-    await this.identityEffects.flush();
+    await this.identityEffects.flush(record.id);
   }
 
   private async cmdRecover(i: ChatInputCommandInteraction): Promise<void> {
@@ -17038,7 +17038,7 @@ export class Orchestrator {
       acpSessionId: "",
       updatedUtc: new Date().toISOString(),
     });
-    await this.identityEffects.flush();
+    await this.identityEffects.flush(record.id);
     await i.reply({
       content:
         "Session reset. Your next message will start a fresh ACP session (history is gone, but config is kept).",
@@ -17193,7 +17193,7 @@ export class Orchestrator {
     const sameAgent = describedBefore.agent.value === parsed.agentId;
     const sameLocation = currentLocation === nextLocation;
     if (sameAgent && sameLocation) {
-      await this.identityEffects.flush();
+      await this.identityEffects.flush(record.id);
       const msg = `Agent is already \`${formatAgentAtLocation(parsed.agentId, nextLocation)}\`.`;
       await respond(msg);
       return { ok: true, message: msg };
@@ -17345,7 +17345,7 @@ export class Orchestrator {
         channel.id,
         sessionBefore.acpSessionId
       );
-      await this.identityEffects.flush();
+      await this.identityEffects.flush(record.id);
       const at = formatAgentAtLocation(parsed.agentId, nextLocation);
       const message = `🤖 Agent switched to \`${at}\` (${profile.displayName}), model \`${intendedModel}\`. Next message will start a fresh session.`;
       await respond(message);
@@ -18029,7 +18029,7 @@ export class Orchestrator {
       }
     }
 
-    await this.identityEffects.flush();
+    await this.identityEffects.flush(`discord:${draft.threadId}`);
     // D10: do NOT abort or invalidate a live turn. Overlay applies on next spawn.
     // (#37 Fast is the one exception, handled above — it MUST reset the session.)
     this.configEditor.delete(draft.id);
@@ -19049,7 +19049,7 @@ export class Orchestrator {
         acpSessionId: newSessionId,
         updatedUtc: new Date().toISOString(),
       });
-      await this.identityEffects.flush();
+      await this.identityEffects.flush(record.id);
       return { newSessionId, summary: summaryText };
     } finally {
       if (transcriptFile) await fsp.unlink(transcriptFile).catch(() => {});
@@ -19106,7 +19106,7 @@ export class Orchestrator {
         "thread migration overlay write failed"
       );
     }
-    await this.identityEffects.flush();
+    await this.identityEffects.flush(record.id);
 
     const freshRecord = this.store.get(record.id);
     if (!freshRecord) throw new Error(`Session record \`${record.id}\` disappeared during migration.`);
@@ -21085,7 +21085,7 @@ export class Orchestrator {
                 id: record.channelRef,
                 parentId: record.parentRef || undefined,
               };
-              await this.identityEffects.flush();
+              await this.identityEffects.flush(record.id);
 
               const successEmbed = new EmbedBuilder()
                 .setTitle("🎉 Session Migrated Successfully!")
@@ -21171,7 +21171,7 @@ export class Orchestrator {
     else if (action === "exclude") cfg.excludedTools = list;
     this.persistConfig(record, cfg);
     await this.router.invalidate(record.id);
-    await this.identityEffects.flush();
+    await this.identityEffects.flush(record.id);
     await i.reply({
       content: `Tool ${action} list: ${list.length === 0 ? "(cleared)" : "`" + list.join(", ") + "`"}. Next turn starts a fresh runtime.`,
       flags: MessageFlags.Ephemeral,
@@ -21563,7 +21563,7 @@ export class Orchestrator {
         }
       }
       mutationStarted = false;
-      if (opts.applyName) await this.identityEffects.flush();
+      if (opts.applyName) await this.identityEffects.flush(committed.id);
       return { ok: true, record: committed, effective, restartRequested };
     } catch (err) {
       let rollbackError = "";
@@ -25431,7 +25431,7 @@ export class Orchestrator {
     await this.router.invalidate(record.id);
 
     const liveAfter = this.store.get(record.id) ?? record;
-    await this.identityEffects.flush();
+    await this.identityEffects.flush(record.id);
 
     const body =
       changes.length > 0

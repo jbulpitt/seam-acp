@@ -50,11 +50,12 @@ separate follow-up; this registry does not own their storage or expiry policy.
 
 ## Thread naming
 
-The trusted identity registry publishes ordered, immutable `thread-created` and
+The trusted identity registry publishes per-thread ordered, immutable `thread-created` and
 `identity-changed` facts. Internal session-write notifications mark dirty
 identities; successful operation boundaries publish the final resolved snapshot
 and await naming. Coalesced writes do not publish intermediate candidate names.
 Identity handlers log their own failures without preventing other listeners.
+A pending Discord rename does not hold another thread's identity effects.
 
 The built-in naming plugin owns automatic naming, `/seamadmin naming rename`,
 the rule editor and `rename_thread`. It receives title/liveness/rename operations,

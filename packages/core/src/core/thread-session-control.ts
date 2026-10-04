@@ -176,7 +176,7 @@ export interface ThreadSessionControlDeps {
   };
   modelCatalog: Pick<ModelCatalogService, "models" | "model" | "effortChoices" | "resolve">;
   /** Await effects of committed identity changes without invoking a feature. */
-  identityCommitted?: () => Promise<void>;
+  identityCommitted?: (sessionId: string) => Promise<void>;
 }
 
 /**
@@ -357,7 +357,7 @@ export class ThreadSessionControlService {
       if (!info?.sessionId) throw new Error("Fresh runtime did not report a session id.");
       const fresh = this.deps.store.get(current.id);
       if (!fresh) throw new Error("Calling session disappeared after migration.");
-      await this.deps.identityCommitted?.();
+      await this.deps.identityCommitted?.(fresh.id);
       return {
         ok: true,
         record: fresh,
@@ -815,7 +815,7 @@ export class ThreadSessionControlService {
     const forged = await this.forgeFreshSession(target.id);
     const sessionId = forged.runtime.getSessionInfo()?.sessionId;
     if (!sessionId) return { ok: false, error: "Fresh runtime did not report a session id." };
-    await this.deps.identityCommitted?.();
+    await this.deps.identityCommitted?.(target.id);
     return {
       ok: true,
       sessionReset: true,
@@ -855,7 +855,7 @@ export class ThreadSessionControlService {
   }
 
   private async applyNaming(record: SessionRecord): Promise<boolean> {
-    await this.deps.identityCommitted?.();
+    await this.deps.identityCommitted?.(record.id);
     return this.deps.store.get(record.id)?.namePrefix != null;
   }
 }

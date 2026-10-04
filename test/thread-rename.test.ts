@@ -37,6 +37,24 @@ describe("thread naming contributions", () => {
     } finally { await h.close(); }
   });
 
+  it("a blocked rename does not hold another thread's identity effect", async () => {
+    const h = await namingFixture();
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let entered!: () => void;
+    const blocked = new Promise<void>(resolve => { entered = resolve; });
+    h.renameThread.mockImplementationOnce(async () => { entered(); await gate; });
+    h.names.set("blocked", "my task");
+    h.router.ensureSessionRecord({ platform: "discord", channelRef: "blocked", parentRef: NAMING_PARENT, cwd: h.directory });
+    const first = h.orchestrator.flushIdentityEffects("discord:blocked");
+    await blocked;
+    try {
+      await h.create("other");
+      expect(h.names.get("other")).toContain("my task");
+      expect(h.names.get("other")).not.toBe("my task");
+    } finally { release(); await first; await h.close(); }
+  });
+
   it("publishes one final identity after coalesced writes and none after a rollback", async () => {
     const h = await namingFixture();
     const facts: IdentityEvent[] = [];

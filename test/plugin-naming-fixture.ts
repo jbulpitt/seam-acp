@@ -55,7 +55,7 @@ export async function namingFixture(options: { admins?: Set<string>; locked?: bo
   const create = async (id = "thread") => {
     names.set(id, "my task");
     const record = router.ensureSessionRecord({ platform: "discord", channelRef: id, parentRef: NAMING_PARENT, cwd: directory });
-    await orchestrator.flushIdentityEffects();
+    await orchestrator.flushIdentityEffects(record.id);
     return store.get(record.id)!;
   };
   const slash = async (sub = "rename", values: Record<string, string | boolean> = {}, userId = "admin") => {

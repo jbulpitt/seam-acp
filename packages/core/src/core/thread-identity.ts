@@ -13,12 +13,12 @@ import type { NamingThread, ThreadIdentity } from "../plugins/identity-registry.
 /** Controller-only projection of successful commits into ordered plugin facts. */
 export function installThreadNaming(deps: {
   config: Config; store: SessionStore; router: SessionRouter; adapter: ChatAdapter; logger: Logger; plugins: PluginHost;
-}): { ready: Promise<void>; flush(): Promise<void>; presetsCommitted(channels: ReadonlySet<string>): void } {
+}): { ready: Promise<void>; flush(sessionId?: string): Promise<void>; presetsCommitted(channels: ReadonlySet<string>): void } {
   const { store, router, adapter, plugins, logger } = deps;
   const known = new Map<string, ThreadIdentity>();
   const dirty = new Map<string, string>();
   let closed = false;
-  let pending = Promise.resolve();
+  const pending = new Map<string, Promise<void>>();
   const project = (record: SessionRecord): NamingThread => {
     const config = router.describeConfig(record);
     return { id: record.channelRef, platform: record.platform, parentId: record.parentRef, createdUtc: record.createdUtc,
@@ -58,34 +58,42 @@ export function installThreadNaming(deps: {
     plugin.dispose = () => { closed = true; unsubscribe(); };
     return plugin;
   } }]);
-  const changed = async () => {
-    await ready;
-    for (const [id, reason] of [...dirty]) {
-      dirty.delete(id);
+  const changed = async (id: string, reason: string) => {
       const record = store.get(id);
-      if (!record) { known.delete(id); continue; }
+      if (!record) { known.delete(id); return; }
       try {
         const thread = project(record);
         const before = known.get(id);
+        known.set(id, thread.identity);
         if (!before) await plugins.identity.emit({ type: "thread-created", thread, reason: "session created" });
         else if (JSON.stringify(before) !== JSON.stringify(thread.identity)) {
           await plugins.identity.emit({ type: "identity-changed", thread, before, reason });
         }
         const after = store.get(id);
-        if (after) known.set(id, project(after).identity);
+        if (after) known.set(id, { ...thread.identity, prefix: after.namePrefix ?? null });
       } catch (err) { logger.error({ err, session: id }, "thread identity publication failed"); }
-    }
   };
   const mark = (id: string, reason?: string) => {
     if (closed) return;
-    dirty.set(id, reason ?? dirty.get(id) ?? "configuration committed");
+    const record = store.get(id);
+    if (!record || JSON.stringify(known.get(id)) !== JSON.stringify(project(record).identity)) {
+      dirty.set(id, reason ?? dirty.get(id) ?? "configuration committed");
+    }
   };
   return {
     ready,
-    async flush() {
-      pending = pending.then(changed);
-      await pending;
-      await plugins.identity.drain();
+    async flush(sessionId) {
+      await ready;
+      const started = new Map<string, Promise<void>>();
+      for (const [id, reason] of dirty) {
+        const run = (pending.get(id) ?? Promise.resolve()).then(() => changed(id, reason));
+        pending.set(id, run);
+        started.set(id, run);
+        void run.then(() => { if (pending.get(id) === run) pending.delete(id); });
+      }
+      dirty.clear();
+      if (sessionId) await pending.get(sessionId);
+      else await Promise.all(started.values());
     },
     presetsCommitted(channels) {
       for (const record of records().sort((a, b) => a.createdUtc.localeCompare(b.createdUtc) || a.id.localeCompare(b.id))) {

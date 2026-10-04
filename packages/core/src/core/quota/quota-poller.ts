@@ -188,7 +188,7 @@ export class AgentQuotaPoller {
     const now = Date.now();
     const previousAt = this.lastRefreshAt.get(agentId) ?? 0;
     if (!force && now - previousAt < QUOTA_MIN_REFRESH_MS) {
-      const quota = this.registry.get(agentId) ?? mapUnavailableQuota(source, "Quota has not been fetched yet");
+      const quota = this.registry.get(agentId) ?? mapUnavailableQuota({ agentId, displayName: source.displayName }, "Quota has not been fetched yet");
       return {
         agentId: source.agentId,
         displayName: source.displayName,
@@ -244,7 +244,7 @@ export class AgentQuotaPoller {
         const message = timedOut
           ? `Quota refresh timed out after ${this.sourceTimeoutMs / 1000}s`
           : diagnostic.message;
-        quota = mapUnavailableQuota(source, message);
+        quota = mapUnavailableQuota({ agentId, displayName: source.displayName }, message);
         this.logger.warn(
           { agentId, error: diagnostic, timeoutMs: timedOut ? this.sourceTimeoutMs : undefined },
           timedOut ? "agent quota refresh timed out" : "agent quota refresh failed"

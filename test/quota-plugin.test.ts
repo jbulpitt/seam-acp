@@ -83,6 +83,7 @@ describe("quota built-in", () => {
     await host.jobs.startAfterAdmission(Promise.resolve());
     const rows = JSON.parse((await host.mcp.dispatch("agent_quota", invocation)).content[0]!.text);
     expect(rows.find(row => row.agentId === "grok")).toMatchObject({ ok: false, error: "provider socket refused" });
+    expect(rows.find(row => row.agentId === "grok")).not.toHaveProperty("eventDriven");
     expect(rows.find(row => row.agentId === "grok-other")).toMatchObject({ ok: true, noSubscription: true });
   });
 

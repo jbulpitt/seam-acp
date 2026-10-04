@@ -95,7 +95,7 @@ export class ActionCardManager {
     await this.reconcilePermission(row);
     const current = this.deps.store.getPermission(row.id)!;
     if (current.status !== "open") {
-      await evt.followUpEphemeral(current.detail ?? "This permission request was already answered."); return;
+      await evt.followUpEphemeral(`This permission request is ${current.status}. ${current.detail ?? ""}`); return;
     }
     const option = /^\d+$/.test(index ?? "") ? current.request.options[Number(index)] : undefined;
     if (!option || Number(index) >= 5) { await evt.followUpEphemeral("That option was not offered by this permission card."); return; }
@@ -117,11 +117,12 @@ export class ActionCardManager {
     const current = decided ?? this.deps.store.getProposal(row.id)!;
     this.disarm(row.id);
     await this.edit(current);
-    await evt.followUpEphemeral(current.detail ?? "This proposal was already handled.");
+    await evt.followUpEphemeral(decided ? current.detail! : `This proposal was already ${current.status}. ${current.detail ?? ""}`);
     if (decided?.status === "applied") await this.deps.afterApply(decided);
   }
 
   async recover(location?: string): Promise<void> {
+    if (this.detached) return;
     for (const row of this.deps.store.permissions()) {
       if (location && row.location !== location) continue;
       if (row.status !== "open" && row.delivered) continue;

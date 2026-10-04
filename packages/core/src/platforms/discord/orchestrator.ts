@@ -6951,10 +6951,11 @@ export class Orchestrator {
 
   setBridgeHub(hub: BridgeHub): void {
     this.bridgeHub = hub;
-    hub.onBridgeReady(location => {
-      this.trackContinuation(this.actionCards.recover(location).catch(err =>
-        this.logger.warn({ err, location }, "permission recovery failed")));
-    });
+  }
+
+  recoverPermissionCards(location: string): void {
+    this.trackContinuation(this.actionCards.recover(location).catch(err =>
+      this.logger.warn({ err, location }, "permission recovery failed")));
   }
 
   setChoiceResults(hub: ChoiceResultHub): void {

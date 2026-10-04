@@ -558,6 +558,7 @@ async function main(): Promise<void> {
   let serviceStatusCard: ServiceStatusCard | undefined;
   let stopServiceStatus: (() => void) | undefined;
   let stopCatalogBridgeRefresh: (() => void) | undefined;
+  let stopPermissionBridgeRecovery: (() => void) | undefined;
   let stopCatalogEnrichmentRefresh: (() => void) | undefined;
   let serviceStatusSources: ReturnType<typeof createDefaultServiceStatusSources> | undefined;
 
@@ -806,6 +807,7 @@ async function main(): Promise<void> {
     localBridgeTokenHash: localBridgeCredential.tokenHash,
   });
   orchestrator.setBridgeHub(bridgeHub);
+  stopPermissionBridgeRecovery = bridgeHub.onBridgeReady(location => orchestrator.recoverPermissionCards(location));
   // #631: slots outlive controllers; stop the ones no turn owns.
   bridgeHub.onBridgeReady((location) => orchestrator.sweepUnownedSlots(location));
   stopCatalogBridgeRefresh = bridgeHub.onBridgeReady((location) => {
@@ -1904,6 +1906,7 @@ async function main(): Promise<void> {
     stopCatalogEnrichmentRefresh?.();
     modelCatalog.stop();
     stopCatalogBridgeRefresh?.();
+    stopPermissionBridgeRecovery?.();
     stopQuotaCard?.();
     stopRankingsCard?.();
     stopStatusCard?.();

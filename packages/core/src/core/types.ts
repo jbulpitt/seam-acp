@@ -32,6 +32,8 @@ export interface SessionConfigState {
   model?: string;
   /** ACP mode id (e.g. agent / plan / autopilot URI). */
   mode?: string;
+  /** Runtime-advertised Codex modes survive controller adoption. */
+  codexModes?: { sessionId: string; availableModes: ReadonlyArray<{ id: string; name: string }>; currentModeId?: string };
   /** Reasoning effort for models that support it ("low" | "medium" | "high"). */
   reasoningEffort?: string;
   /** Allowlist of tool names; empty = all allowed. */

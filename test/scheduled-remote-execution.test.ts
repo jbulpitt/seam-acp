@@ -86,7 +86,7 @@ function setup(location = REMOTE) {
   const seam = { type: "http", name: "seam-mcp", url: "http://127.0.0.1:1234/mcp", headers: [{ name: "X-Seam-Session", value: "author-token" }] };
   const globalMcp = { name: "global-tool", command: "host-tool", args: [], env: [] };
   const remoteSeam = { ...seam, url: "https://seam.example/mcp" };
-  const router = { ensureSessionRecord: () => ({ ...record }), getProfile: () => profile, listProfiles: () => [profile],
+  const router = { permissionOptions: () => ({}), ensureSessionRecord: () => ({ ...record }), getProfile: () => profile, listProfiles: () => [profile],
     resolveProfileForChannel: () => profile, assertAgentAllowedForChannel() {}, assertAgentAllowedForRecord() {},
     reuseMcpServers: vi.fn(() => [globalMcp, seam]), isBusy: () => false,
     revokeMcpSession: vi.fn(),

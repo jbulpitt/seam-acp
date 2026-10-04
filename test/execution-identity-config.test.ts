@@ -81,6 +81,13 @@ describe("execution identity treats an unchanged configuration as unchanged", ()
     expect(identityWith(reordered)).toBe(identityWith(parsed));
   });
 
+  it("ignores runtime-advertised Codex mode observations", () => {
+    expect(identityWith({ ...LIVE_CONFIG, codexModes: {
+      sessionId: "s1", availableModes: [{ id: "agent-full-access", name: "Full access" }],
+      currentModeId: "agent-full-access",
+    } })).toBe(identityWith(LIVE_CONFIG));
+  });
+
   it("still refuses a configuration that genuinely changed, and names the field", () => {
     // The load-bearing negative: normalising must remove false refusals only.
     // Deleting the normaliser makes the first test fail; weakening the check

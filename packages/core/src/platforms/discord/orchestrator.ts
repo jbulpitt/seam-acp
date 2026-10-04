@@ -5925,6 +5925,9 @@ export class Orchestrator {
         rt = new AgentRuntime({
           profile,
           logger,
+          ...this.router.permissionOptions(target
+            ? isSessionRecord(target) ? target : this.store.get(makeSessionId(target.platform, target.id)) ?? undefined
+            : undefined),
           mcpServers,
           // #487: isolated schedules/dispatches bypass SessionRouter's runtime
           // construction, but must consult the same child-owning bridge too.
@@ -6690,6 +6693,7 @@ export class Orchestrator {
       rt = new AgentRuntime({
         profile,
         logger: this.logger.child({ compaction: "seed" }),
+        ...this.router.permissionOptions(args.sessionId ? this.store.get(args.sessionId) ?? undefined : undefined),
         mcpServers: launch.mcpServers,
         spawnFn: launch.spawnFn,
       });
@@ -17802,6 +17806,7 @@ export class Orchestrator {
         }
       }
       this.persistConfig(record, cfg);
+      if (plan.permission !== undefined) await this.router.applyPermissionMode(record);
     }
     // #37: Fast is a session-start dimension, so a change here MUST land on a
     // fresh ACP session — the overlay alone would be resumed into the existing
@@ -18885,6 +18890,7 @@ export class Orchestrator {
         tempRuntime = new AgentRuntime({
           profile,
           logger: this.logger.child({ session: `temp-compact-thread-${channelRef.id}` }),
+          ...this.router.permissionOptions(record),
           mcpServers: launch.mcpServers,
           spawnFn: launch.spawnFn,
         });
@@ -20338,6 +20344,7 @@ export class Orchestrator {
               tempRuntime = new AgentRuntime({
                 profile,
                 logger: this.logger.child({ session: `temp-summary-${session.sessionId}` }),
+                ...this.router.permissionOptions(record),
                 mcpServers: launch.mcpServers,
                 ...(summarySelection.model ? { effortDescriptor: summarySelection.model.effort } : {}),
                 spawnFn: launch.spawnFn,
@@ -20687,6 +20694,7 @@ export class Orchestrator {
             tempRuntime = new AgentRuntime({
               profile,
               logger: this.logger.child({ session: `temp-import-${session.sessionId}` }),
+              ...this.router.permissionOptions(record),
               mcpServers: launch.mcpServers,
               spawnFn: launch.spawnFn,
             });
@@ -20902,6 +20910,7 @@ export class Orchestrator {
               tempRuntime = new AgentRuntime({
                 profile,
                 logger: this.logger.child({ session: `temp-migrate-${session.sessionId}` }),
+                ...this.router.permissionOptions(record),
                 mcpServers: launch.mcpServers,
                 spawnFn: launch.spawnFn,
               });
@@ -21420,6 +21429,9 @@ export class Orchestrator {
       }
 
       const committed = this.store.get(record.id) ?? record;
+      if (prepared.kind === "named" && request.values.permissions !== null) {
+        await this.router.applyPermissionMode(committed);
+      }
       const effective = this.router.describeConfig(committed);
       if (prepared.kind === "named") {
         const mismatch =
@@ -21974,11 +21986,13 @@ export class Orchestrator {
       | "always"
       | "ask"
       | "deny";
+    await i.deferReply({ flags: MessageFlags.Ephemeral });
     const cfg = this.store.readConfig(record);
     cfg.permissionPolicy = policy;
     // Drop the deprecated field so it can never override the new value.
     delete cfg.autoApprovePermissions;
     this.persistConfig(record, cfg);
+    await this.router.applyPermissionMode(record);
     const messages: Record<typeof policy, string> = {
       always:
         "Approval policy set to `always`. ⚠️ The agent will auto-approve every permission request (shell exec, file writes, network, etc.).",
@@ -21987,7 +22001,7 @@ export class Orchestrator {
       deny:
         "Approval policy set to `deny`. The agent will be auto-denied every permission request — useful for read-only sessions.",
     };
-    await i.reply({ content: messages[policy], flags: MessageFlags.Ephemeral });
+    await i.editReply(messages[policy]);
   }
 
   /**

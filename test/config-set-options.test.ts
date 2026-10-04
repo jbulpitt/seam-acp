@@ -2,11 +2,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { PassThrough } from "node:stream";
 import { pino } from "pino";
 import { MessageFlags } from "discord.js";
 import type { AgentProfile } from "@seam/adapters";
 import type { ChannelPreset, ThreadPreset } from "../packages/core/src/config.js";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
+import { AgentRuntime } from "../packages/core/src/agents/agent-runtime.js";
+import { CODEX_ACP_2_0_1_MODES } from "./fixtures/codex-acp-modes.js";
 import { SessionRouter } from "../packages/core/src/core/session-router.js";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
@@ -239,6 +242,7 @@ describe("/seam config set named parameters", () => {
   it("patches only supplied fields and preserves the resumable session", async () => {
     const { orch, router, store } = makeHarness();
     const invalidate = vi.spyOn(router, "invalidate");
+    const applyPermissions = vi.spyOn(router, "applyPermissionMode");
     const { i, edits } = interaction({
       role: "analyst",
       permissions: "deny",
@@ -260,8 +264,118 @@ describe("/seam config set named parameters", () => {
     expect(cfg.simpleCardGif).toBeUndefined();
     expect(cfg.availableTools).toEqual(["read"]);
     expect(invalidate).not.toHaveBeenCalled();
+    expect(applyPermissions).toHaveBeenCalledWith(record);
     expect(edits.at(-1)).toContain("Updated `role`, `permissions`, `card`, `gif`");
     store.close();
+  });
+
+  it("rolls a failed live permission mode change back and shows its cause", async () => {
+    const { orch, router, store } = makeHarness();
+    vi.spyOn(router, "applyPermissionMode").mockRejectedValueOnce(new Error("session/set_mode: unsupported full access"));
+    const call = interaction({ permissions: "always" });
+    await (orch as any).cmdConfigSet(call.i);
+    expect(call.edits.at(-1)).toContain("session/set_mode: unsupported full access");
+    expect(read(store).cfg.permissionPolicy).toBe("ask");
+    store.close();
+  });
+
+  it("defers approval-policy changes before applying the live mode", async () => {
+    const { orch, router, store } = makeHarness();
+    const call = interaction({ policy: "always" });
+    vi.spyOn(router, "applyPermissionMode").mockImplementation(async record => {
+      expect(call.order).toEqual(["defer"]);
+      expect(store.readConfig(store.get(record.id)!).permissionPolicy).toBe("always");
+      call.order.push("mode");
+    });
+    await (orch as any).cmdApprove(call.i);
+    expect(call.order).toEqual(["defer", "mode", "edit"]);
+    expect(call.edits.at(-1)).toContain("Approval policy set to `always`");
+    store.close();
+  });
+
+  it("does not acknowledge a rejected approval mode as successful", async () => {
+    const { orch, router, store } = makeHarness();
+    const failure = new Error("session/set_mode: agent refusal");
+    vi.spyOn(router, "applyPermissionMode").mockRejectedValueOnce(failure);
+    const call = interaction({ policy: "always" });
+    await expect((orch as any).cmdApprove(call.i)).rejects.toBe(failure);
+    expect(call.order).toEqual(["defer"]);
+    expect(call.edits).toEqual([]);
+    store.close();
+  });
+
+  it("keeps advertised modes through adoption and rereads the live resolved policy", async () => {
+    const { orch, router, store } = makeHarness();
+    await (orch as any).cmdConfigSet(interaction({ agent: "codex@local" }).i);
+    const record = read(store).record;
+    const connection = {
+      newSession: vi.fn(async () => ({ sessionId: "s1", modes: { currentModeId: "agent", availableModes: [
+        { id: "agent", name: "Auto review" }, { id: "agent-full-access", name: "Full access" },
+      ] } })),
+      setSessionMode: vi.fn(async () => ({})),
+    };
+    const runtime = (router as any).makeRuntime(record, router.planRuntimeSpawn(record), "gpt-5.6-sol", undefined);
+    Object.assign(runtime, { connection, promptCapabilities: {} });
+    await runtime.newSession({ cwd: reposRoot });
+    expect(connection.setSessionMode).not.toHaveBeenCalled();
+    expect(read(store).cfg.codexModes).toMatchObject({ sessionId: "s1", currentModeId: "agent" });
+
+    const change = (patch: Record<string, unknown>) => {
+      const fresh = read(store);
+      const { permissionPolicy: _policy, ...cfg } = fresh.cfg;
+      store.upsert({ ...fresh.record, configJson: store.writeConfig({ ...cfg, ...patch }) });
+    };
+    change({ autoApprovePermissions: true });
+    await runtime.applyPermissionMode();
+    expect(connection.setSessionMode).toHaveBeenLastCalledWith({ sessionId: "s1", modeId: "agent-full-access" });
+    expect(read(store).cfg.codexModes?.currentModeId).toBe("agent-full-access");
+
+    const child = { stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough() };
+    const adopted = router.adoptRecoveryRuntime(read(store).record, child as any, "s1");
+    Object.assign(adopted, { connection });
+    change({ permissionPolicy: "deny", autoApprovePermissions: true });
+    await router.applyPermissionMode(record);
+    expect(connection.setSessionMode).toHaveBeenLastCalledWith({ sessionId: "s1", modeId: "agent" });
+    expect(read(store).cfg.codexModes?.currentModeId).toBe("agent");
+    expect(read(store).cfg.availableTools).toEqual(["read"]);
+    adopted.releaseRecovery();
+    child.stdout.end();
+    child.stdin.end();
+    child.stderr.end();
+    store.close();
+  });
+
+  it.each(["always", "ask"] as const)("uses the resolved %s policy for a fresh isolated Codex turn", async policy => {
+    const { orch, store } = makeHarness();
+    await (orch as any).cmdConfigSet(interaction({ agent: "codex@local", permissions: policy }).i);
+    const bound = read(store);
+    const modes = { sessionId: "bound-s1", ...structuredClone(CODEX_ACP_2_0_1_MODES) };
+    store.upsert({ ...bound.record, acpSessionId: modes.sessionId,
+      configJson: store.writeConfig({ ...bound.cfg, codexModes: modes }) });
+    const connection = {
+      newSession: vi.fn(async () => ({ sessionId: "isolated-s1", modes: structuredClone(CODEX_ACP_2_0_1_MODES),
+        models: { currentModelId: "gpt-5.6-sol", availableModels: [] } })),
+      setSessionMode: vi.fn(async () => ({})),
+      prompt: vi.fn(async () => ({ stopReason: "end_turn" })),
+    };
+    const start = vi.spyOn(AgentRuntime.prototype, "start").mockImplementation(async function () {
+      Object.assign(this, { connection, promptCapabilities: {} });
+    });
+    const dispose = vi.spyOn(AgentRuntime.prototype, "dispose").mockResolvedValue(undefined);
+    try {
+      const result = await orch.injectTurn(read(store).record, "isolated check", {
+        session: "isolated", profile: profiles[1], model: "gpt-5.6-sol", cwd: reposRoot,
+      });
+      expect(result.error).toBeUndefined();
+      expect(connection.prompt).toHaveBeenCalledTimes(1);
+      expect(connection.setSessionMode.mock.calls).toEqual(policy === "always"
+        ? [[{ sessionId: "isolated-s1", modeId: "agent-full-access" }]] : []);
+      expect(read(store).cfg.codexModes).toEqual(modes);
+    } finally {
+      start.mockRestore();
+      dispose.mockRestore();
+      store.close();
+    }
   });
 
   it("uses the selected agent default model when model is omitted", async () => {

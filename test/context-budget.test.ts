@@ -152,6 +152,7 @@ function injectionFixture() {
     plugins: new PluginHost(pino({ level: "silent" })),
     modelCatalog: fixtureModelCatalog([profile as never]),
     router: {
+      permissionOptions: () => ({}),
       describeConfig: (rec: SessionRecord) => ({
         agent: { value: rec.agentId }, location: { value: "local" },
         model: { value: identity.model },

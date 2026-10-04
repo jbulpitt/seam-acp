@@ -48,7 +48,7 @@ function setup(mode: "live" | "isolated" = "isolated", agentId = "codex") {
     lastRunUtc: null, lastStatus: null, nextRunUtc: null, pinnedSessionId: null };
   store.upsertScheduled(row);
   const profile = { id: agentId, defaultModel: "test", displayName: agentId, sessionManager: { deleteSession: transport.delete } } as any;
-  const router = { ensureSessionRecord: () => ({ ...record }), listProfiles: () => [profile], getProfile: () => profile,
+  const router = { permissionOptions: () => ({}), ensureSessionRecord: () => ({ ...record }), listProfiles: () => [profile], getProfile: () => profile,
     resolveProfileForChannel: () => profile,
     assertAgentAllowedForChannel: () => {},
     assertAgentAllowedForRecord: () => {},

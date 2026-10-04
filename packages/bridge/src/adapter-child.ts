@@ -121,9 +121,10 @@ function start(config: AdapterChildBootstrap): void {
 
   // #631: relaunched after a host restart. Bring the agent back to the same
   // session, then continue the interrupted turn under its original request id.
-  let resuming: { resume: AdapterChildResume; phase: "initialize" | "load" } | undefined;
+  let resuming: { resume: AdapterChildResume; phase: "initialize" | "load" | "mode" } | undefined;
   const RESUME_INITIALIZE = "seam-resume-initialize";
   const RESUME_LOAD = "seam-resume-load";
+  const RESUME_MODE = "seam-resume-mode";
   const resumeOutput = (line: string): boolean => {
     if (!resuming) return false;
     let message: { id?: unknown; method?: unknown; error?: { message?: unknown } };
@@ -143,9 +144,16 @@ function start(config: AdapterChildBootstrap): void {
       writeAgent(`${JSON.stringify({ jsonrpc: "2.0", id: RESUME_LOAD, method: "session/load", params: resuming.resume.load })}\n`);
       return true;
     }
-    if (resuming.phase === "load" && message.id === RESUME_LOAD) {
+    if ((resuming.phase === "load" && message.id === RESUME_LOAD)
+      || (resuming.phase === "mode" && message.id === RESUME_MODE)) {
       if (message.error) {
-        exitWithRefusal(`resume after restart: session/load failed (${String(message.error.message ?? "error")})`);
+        exitWithRefusal(`resume after restart: ${resuming.phase === "load" ? "session/load" : "session/set_mode"} failed (${String(message.error.message ?? "error")})`);
+        return true;
+      }
+      if (resuming.phase === "load" && resuming.resume.modeId) {
+        resuming.phase = "mode";
+        writeAgent(`${JSON.stringify({ jsonrpc: "2.0", id: RESUME_MODE, method: "session/set_mode",
+          params: { sessionId: resuming.resume.load.sessionId, modeId: resuming.resume.modeId } })}\n`);
         return true;
       }
       const { recovery: turn } = resuming.resume;
@@ -165,8 +173,10 @@ function start(config: AdapterChildBootstrap): void {
   child.stdout?.on("data", (chunk: Buffer | string) => {
     for (const line of agentOutput.push(chunk.toString())) {
       if (resumeOutput(line)) continue;
+      resumeRecord.observeOutput(line);
       permissions.observeOutput(line);
       const decision = recovery.observeOutput(config.slot, line);
+      resumeRecord.record(recovery.resumable(config.slot));
       if (decision.forward !== null) publish({
         v: ADAPTER_CHILD_PROTOCOL_VERSION,
         type: "data",

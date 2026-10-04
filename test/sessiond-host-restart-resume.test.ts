@@ -12,7 +12,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { DEFAULT_REMOTE_RUNG1_POLICY } from "../packages/core/src/core/remote-spawn.js";
 import { SessiondClient } from "../packages/bridge/src/sessiond-client.js";
-import { SessiondServer } from "../packages/bridge/src/sessiond-server.js";
+import { SessiondServer, readSessiondProcessIdentity } from "../packages/bridge/src/sessiond-server.js";
 import { SupervisedSlots, type SupervisedBridgeFrame } from "../packages/bridge/src/supervised-slots.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -40,7 +40,12 @@ async function until<T>(read: () => T | undefined | Promise<T | undefined>, what
 
 const line = (message: Record<string, unknown>) => `${JSON.stringify({ jsonrpc: "2.0", ...message })}\n`;
 
-async function host(root: string) {
+async function host(root: string, modeId?: string) {
+  const bin = path.join(root, "bin");
+  if (modeId) {
+    await fs.mkdir(bin, { recursive: true });
+    if (!existsSync(path.join(bin, "codex-acp"))) await fs.symlink(fakeAgent, path.join(bin, "codex-acp"));
+  }
   const socketPath = path.join(root, "control.sock");
   const server = new SessiondServer({ socketPath, statePath: path.join(root, "slots.json"), resumeDir: path.join(root, "resume") });
   servers.push(server);
@@ -55,8 +60,9 @@ async function host(root: string) {
     adapterChildPath: adapterChild,
     environment: {
       HOME: root,
-      PATH: `${path.dirname(process.execPath)}:/usr/bin:/bin`,
+      PATH: `${bin}:${path.dirname(process.execPath)}:/usr/bin:/bin`,
       FAKE_AGENT_PIDS: path.join(root, "agent.pids"),
+      ...(modeId ? { FAKE_AGENT_REQUIRE_MODE: modeId } : {}),
     },
     onStderr: () => undefined,
     onFrame: (frame) => frames.push(frame),
@@ -85,34 +91,44 @@ describe("large prompts reach the agent", () => {
 });
 
 describe("#631 host restart mid-turn", () => {
-  it("relaunches the slot, reloads the session and finishes the turn under its original id", async () => {
+  it.each([undefined, "agent-full-access"])("reloads and continues under the original id with mode %s", async modeId => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "seam-631r-"));
     roots.push(root);
     await fs.chmod(root, 0o700);
-    const first = await host(root);
-    first.slots.configure(5, { agentId: "copilot", cwd: root, rung1Recovery: DEFAULT_REMOTE_RUNG1_POLICY });
+    const first = await host(root, modeId);
+    first.slots.configure(5, { agentId: modeId ? "codex" : "copilot", cwd: root, rung1Recovery: DEFAULT_REMOTE_RUNG1_POLICY });
     await first.slots.writeInput(5, line({ id: 1, method: "initialize", params: { protocolVersion: 1 } }));
     await first.slots.writeInput(5, line({ id: 2, method: "session/new", params: { cwd: root, mcpServers: [] } }));
     await until(() => first.frames.find((f) => f.data?.includes("\"sessionId\":\"s1\"")), "session/new");
+    if (modeId) {
+      await first.slots.writeInput(5, line({ id: 3, method: "session/set_mode", params: { sessionId: "s1", modeId } }));
+      await until(() => first.frames.find(f => f.data?.includes('"id":3') && f.data.includes('"result"')), "the mode acknowledgement");
+    }
     await first.slots.armRecovery(5, { submissionId: "sub-5", acpSessionId: "s1", continuation: "continue" });
     await first.slots.writeInput(5, line({ id: 7, method: "session/prompt",
       params: { sessionId: "s1", prompt: [{ type: "text", text: "long job" }] } }));
     await until(() => first.frames.find((f) => f.data?.includes("working on it")), "the turn to start");
     const record = path.join(root, "resume", "5.json");
     await until(() => existsSync(record) ? true : undefined, "the resume record");
+    const saved = JSON.parse(await fs.readFile(record, "utf8"));
+    expect(JSON.parse(Buffer.from(saved.initialStdinBase64, "base64").toString()).resume.modeId).toBe(modeId);
 
     // Host shutdown: sessiond stops, then every remaining process is killed.
     await first.server.close();
     servers.splice(servers.indexOf(first.server), 1);
     first.client.close();
-    const state = JSON.parse(await fs.readFile(path.join(root, "slots.json"), "utf8")) as { slots: Array<{ identity: { pgid: number } }> };
+    const state = JSON.parse(await fs.readFile(path.join(root, "slots.json"), "utf8")) as { slots: Array<{ identity: { pid: number; pgid: number } }> };
     for (const slot of state.slots) try { process.kill(-slot.identity.pgid, "SIGKILL"); } catch { /* gone */ }
-    for (const pid of (await fs.readFile(path.join(root, "agent.pids"), "utf8")).trim().split("\n")) {
-      try { process.kill(Number(pid), "SIGKILL"); } catch { /* gone */ }
+    const agentPids = (await fs.readFile(path.join(root, "agent.pids"), "utf8")).trim().split("\n").map(Number);
+    for (const pid of agentPids) {
+      try { process.kill(pid, "SIGKILL"); } catch { /* gone */ }
     }
+    // A new host cannot still observe processes from the previous boot.
+    await until(() => [...state.slots.map(slot => slot.identity.pid), ...agentPids]
+      .every(pid => !readSessiondProcessIdentity(pid)) ? true : undefined, "shutdown to finish");
     expect(existsSync(record)).toBe(true);
 
-    const second = await host(root);
+    const second = await host(root, modeId);
     await second.slots.rebind();
     const replay = await second.slots.replay(5, 0);
     replay.activate();

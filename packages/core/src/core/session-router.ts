@@ -1175,6 +1175,10 @@ export class SessionRouter {
     return this.runtimes.get(sessionId);
   }
 
+  async applyPermissionMode(record: SessionRecord): Promise<void> {
+    await this.runtimes.get(record.id)?.applyPermissionMode();
+  }
+
   /** Whether a live turn is CURRENTLY running for this session (#73) — a DERIVED
    *  read over the runtime's internal `busy` flag, not new tracked state. False
    *  when no runtime is alive (nothing can be mid-turn without one), so a
@@ -1292,7 +1296,8 @@ export class SessionRouter {
     }
     const plan = this.planRuntimeSpawn(record);
     const runtime = this.makeRuntime(record, plan, plan.model, plan.effort);
-    runtime.attachRecovery(child, acpSessionId);
+    const modes = this.store.readConfig(this.store.get(record.id) ?? record).codexModes;
+    runtime.attachRecovery(child, acpSessionId, modes?.sessionId === acpSessionId ? modes : undefined);
     this.runtimes.set(record.id, runtime);
     return runtime;
   }
@@ -1466,6 +1471,13 @@ export class SessionRouter {
     return resolvePermissionMode(this.store.readConfig(live), this.defaultPermissionMode);
   }
 
+  /** Isolated and helper sessions use the same live policy. */
+  permissionOptions(record?: SessionRecord): Pick<ConstructorParameters<typeof AgentRuntime>[0], "permissionMode"> {
+    return {
+      permissionMode: () => record ? this.livePermissionMode(record) : this.defaultPermissionMode,
+    };
+  }
+
   private async startRuntime(record: SessionRecord, recovery?: { resumeSessionId: string }): Promise<AgentRuntime> {
     const plan = this.planRuntimeSpawn(record);
     const identity = { agentId: plan.agentId, location: plan.location, requestedModel: plan.model,
@@ -1557,6 +1569,15 @@ export class SessionRouter {
       },
       onCatalogRefresh: async () => {
         await this.modelCatalog.refresh({ agentId, location }, "session");
+      },
+      ...this.permissionOptions(record),
+      onSessionModes: info => {
+        if (profile.id !== "codex") return;
+        const live = this.store.get(record.id) ?? record;
+        const cfg = this.store.readConfig(live);
+        const modes = { sessionId: info.sessionId, availableModes: info.availableModes, currentModeId: info.currentModeId };
+        if (JSON.stringify(cfg.codexModes) === JSON.stringify(modes)) return;
+        this.store.upsert({ ...live, configJson: this.store.writeConfig({ ...cfg, codexModes: modes }) });
       },
       permissionPolicy: async (req, context) => {
         const mode = this.livePermissionMode(record);

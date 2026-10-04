@@ -99,7 +99,7 @@ describe("injectTurn isolated resumeSessionId", () => {
     const profile = { id: "codex", defaultModel: "m", sessionManager: { deleteSession } } as any;
     const orch = new Orchestrator({ logger: silent, store, config: { REPOS_ROOT: dir, DATA_DIR: dir } as any,
       adapter: {} as any, renderer: {} as any, modelCatalog: fixtureModelCatalog([profile]),
-      router: { listProfiles: () => [], describeConfig: () => ({ location: { value: "local" } }),
+      router: { permissionOptions: () => ({}), listProfiles: () => [], describeConfig: () => ({ location: { value: "local" } }),
         assertAgentAllowedForChannel: () => {} } as any });
     attachLocalBridge(orch, [profile], dir);
     acquisitionFailure = stage;
@@ -135,7 +135,7 @@ describe("injectTurn isolated resumeSessionId", () => {
     const profile = { id: "codex", defaultModel: "m", sessionManager: { deleteSession } } as any;
     const orch = new Orchestrator({ logger: silent, store, config: { REPOS_ROOT: dir, DATA_DIR: dir } as any,
       adapter: {} as any, renderer: {} as any, modelCatalog: fixtureModelCatalog([profile]),
-      router: { listProfiles: () => [], describeConfig: () => ({ location: { value: "local" } }),
+      router: { permissionOptions: () => ({}), listProfiles: () => [], describeConfig: () => ({ location: { value: "local" } }),
         assertAgentAllowedForChannel: () => {} } as any });
     attachLocalBridge(orch, [profile], dir);
     let completed = false;
@@ -154,7 +154,7 @@ describe("injectTurn isolated resumeSessionId", () => {
       logger: silent, store, config: { REPOS_ROOT: dir, DATA_DIR: dir } as any,
       adapter: {} as any, renderer: {} as any,
       modelCatalog: fixtureModelCatalog([profile]),
-      router: { listProfiles: () => [], describeConfig: () => ({ location: { value: "local" } }),
+      router: { permissionOptions: () => ({}), listProfiles: () => [], describeConfig: () => ({ location: { value: "local" } }),
         assertAgentAllowedForChannel: () => {} } as any,
     });
     attachLocalBridge(orch, [profile], dir);
@@ -184,7 +184,7 @@ describe("injectTurn isolated resumeSessionId", () => {
     const orch = new Orchestrator({
       logger: silent, store, config: { REPOS_ROOT: dir, DATA_DIR: dir } as any,
       adapter: {} as any, renderer: {} as any, modelCatalog: fixtureModelCatalog([profile]),
-      router: { listProfiles: () => [], describeConfig: () => ({ location: { value: "local" } }),
+      router: { permissionOptions: () => ({}), listProfiles: () => [], describeConfig: () => ({ location: { value: "local" } }),
         assertAgentAllowedForChannel: () => {} } as any,
     });
     attachLocalBridge(orch, [profile], dir);
@@ -211,6 +211,7 @@ describe("injectTurn isolated resumeSessionId", () => {
       adapter: {} as any,
       modelCatalog: fixtureModelCatalog([catalogProfile]),
       router: {
+        permissionOptions: () => ({}),
         listProfiles: () => [],
         describeConfig: () => ({ location: { value: "local" } }),
         ensureSessionRecord: () => record(),

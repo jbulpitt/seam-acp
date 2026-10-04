@@ -47,17 +47,13 @@ import {
   type DiscordGatewayAdapterCreator,
   type VoiceConnection,
 } from "@discordjs/voice";
-import type {
-  RequestPermissionRequest,
-  RequestPermissionResponse,
-} from "@agentclientprotocol/sdk";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Logger } from "../../lib/logger.js";
 import type { SlashRegistry } from "../../plugins/slash-registry.js";
 import type { ComponentRegistry } from "../../plugins/component-registry.js";
-import { isThreadDetached, mayConfigureUserIds, type Config } from "../../config.js";
+import { isThreadDetached, type Config } from "../../config.js";
 import {
   isObfuscatedChannel,
   visibleDiscordChannelName,
@@ -72,8 +68,6 @@ import type {
   DeliveryNonceLookup,
   DeliveryNonceOptions,
   ElicitationCardPost,
-  ConfirmationCard,
-  ConfirmationDecision,
   IncomingMessage,
   MessageAttachment,
   MessageRef,
@@ -2695,178 +2689,7 @@ export class DiscordAdapter implements ChatAdapter {
     }
   }
 
-  /**
-   * Post an approval prompt with one button per ACP option and wait for a
-   * click. Defaults to "cancelled" on timeout. Only an allowed user can
-   * answer.
-   */
-  async requestApproval(
-    channel: ChannelRef,
-    req: RequestPermissionRequest,
-    opts: { timeoutMs?: number } = {}
-  ): Promise<RequestPermissionResponse> {
-    const timeoutMs = opts.timeoutMs ?? 5 * 60 * 1000;
-    const ch = await this.fetchSendableChannel(channel.id);
 
-    const tool = req.toolCall;
-    const title = tool?.title ?? `Tool: ${tool?.kind ?? tool?.toolCallId ?? "unknown"}`;
-    const embed = new EmbedBuilder()
-      .setTitle("🔐 Permission requested")
-      .setDescription(`The agent wants to run **${title}**.`)
-      .setColor(0xfaa61a)
-      .setFooter({
-        text: `Auto-denies in ${Math.round(timeoutMs / 1000)}s.`,
-      });
-
-    if (tool?.kind) embed.addFields({ name: "Tool kind", value: tool.kind, inline: true });
-    if (tool?.toolCallId)
-      embed.addFields({ name: "Call ID", value: `\`${tool.toolCallId}\``, inline: true });
-
-    // Discord allows up to 5 buttons per row. Most agents send 2–4 options.
-    const buttons = req.options.slice(0, 5).map((opt, idx) =>
-      new ButtonBuilder()
-        .setCustomId(`seam-perm:${idx}:${opt.optionId.slice(0, 80)}`)
-        .setLabel(opt.name.slice(0, 80))
-        .setStyle(buttonStyleForKind(opt.kind))
-        .setEmoji(buttonEmojiForKind(opt.kind))
-    );
-    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(buttons);
-
-    const msg = await ch.send({ embeds: [embed], components: [row] });
-
-    try {
-      const interaction = await msg.awaitMessageComponent({
-        componentType: ComponentType.Button,
-        filter: (i) => {
-          if (!this.config.DISCORD_ALLOWED_USER_IDS.has(i.user.id)) {
-            i.reply({
-              content: "This bot is not available to you.",
-              flags: MessageFlags.Ephemeral,
-            }).catch(() => {});
-            return false;
-          }
-          return true;
-        },
-        time: timeoutMs,
-      });
-
-      const idxStr = interaction.customId.split(":")[1] ?? "";
-      const idx = Number.parseInt(idxStr, 10);
-      const chosen = req.options[idx];
-      if (!chosen) {
-        await msg.edit({ embeds: [embed.setFooter({ text: "❓ Invalid choice." })], components: [] });
-        return { outcome: { outcome: "cancelled" } };
-      }
-
-      await msg.edit({
-        embeds: [
-          embed.setFooter({
-            text: `${decisionEmoji(chosen.kind)} ${interaction.user.username} chose: ${chosen.name}`,
-          }),
-        ],
-        components: [],
-      });
-      try {
-        await interaction.deferUpdate();
-      } catch {
-        /* ignore */
-      }
-      return { outcome: { outcome: "selected", optionId: chosen.optionId } };
-    } catch {
-      // timeout / collector ended
-      try {
-        await msg.edit({
-          embeds: [embed.setFooter({ text: "⏱️ Timed out — auto-denied." })],
-          components: [],
-        });
-      } catch {
-        /* ignore */
-      }
-      return { outcome: { outcome: "cancelled" } };
-    }
-  }
-
-  /**
-   * Post a propose-then-confirm card (#58 D5) and resolve when a human clicks
-   * Apply / Reject. The card message is sent BEFORE this returns; the returned
-   * `decision` promise settles later so the MCP tool can ack "card posted"
-   * immediately and the change is applied only on a real human confirmation.
-   * Only an allowed user can act on it, and the click carries that user's id —
-   * the audit actor (the #57 trust anchor).
-   */
-  async postConfirmation(
-    channel: ChannelRef,
-    card: ConfirmationCard,
-    opts: { timeoutMs?: number; authorizedUserIds?: ReadonlySet<string> } = {}
-  ): Promise<{ decision: Promise<ConfirmationDecision> }> {
-    const timeoutMs = opts.timeoutMs ?? 10 * 60 * 1000;
-    // #74: the DISCORD_ALLOWED_USER_IDS fallback must still exclude restricted
-    // participants (admin-set unset). mayConfigureUserIds returns the same
-    // DISCORD_ALLOWED_USER_IDS reference when the participant set is unset.
-    const allowed = opts.authorizedUserIds ?? mayConfigureUserIds(this.config);
-    const ch = await this.fetchSendableChannel(channel.id);
-
-    const embed = new EmbedBuilder()
-      .setTitle(`🧩 ${card.title}`)
-      .setColor(0x5865f2)
-      .setFooter({ text: `Nothing changes until you click Apply · expires in ${Math.round(timeoutMs / 60000)}m.` });
-    if (card.description) embed.setDescription(card.description);
-    for (const f of card.fields.slice(0, 20)) {
-      embed.addFields({ name: f.label, value: `\`${f.before}\` → \`${f.after}\``.slice(0, 1024) });
-    }
-    if (card.warnings && card.warnings.length > 0) {
-      embed.addFields({ name: "⚠ Notes", value: card.warnings.map((w) => `• ${w}`).join("\n").slice(0, 1024) });
-    }
-
-    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-      new ButtonBuilder().setCustomId("seam-cfg:apply").setLabel("Apply").setStyle(ButtonStyle.Success).setEmoji("✅"),
-      new ButtonBuilder().setCustomId("seam-cfg:reject").setLabel("Reject").setStyle(ButtonStyle.Secondary).setEmoji("✖️")
-    );
-
-    const msg = await ch.send({ embeds: [embed], components: [row] });
-
-    const decision: Promise<ConfirmationDecision> = (async () => {
-      try {
-        const interaction = await msg.awaitMessageComponent({
-          componentType: ComponentType.Button,
-          filter: (i) => {
-            if (!allowed.has(i.user.id)) {
-              i.reply({ content: "This confirmation is not available to you.", flags: MessageFlags.Ephemeral }).catch(
-                () => {}
-              );
-              return false;
-            }
-            return true;
-          },
-          time: timeoutMs,
-        });
-        const confirmed = interaction.customId === "seam-cfg:apply";
-        await msg
-          .edit({
-            embeds: [
-              embed.setFooter({
-                text: `${confirmed ? "✅ Applied" : "✖️ Rejected"} by ${interaction.user.username}.`,
-              }),
-            ],
-            components: [],
-          })
-          .catch(() => {});
-        try {
-          await interaction.deferUpdate();
-        } catch {
-          /* ignore */
-        }
-        return { confirmed, userId: interaction.user.id, userName: interaction.user.username };
-      } catch {
-        await msg
-          .edit({ embeds: [embed.setFooter({ text: "⏱️ Timed out — not applied." })], components: [] })
-          .catch(() => {});
-        return { confirmed: false };
-      }
-    })();
-
-    return { decision };
-  }
 
   private async fetchSendableChannel(
     channelId: string
@@ -2922,36 +2745,4 @@ export class DiscordAdapter implements ChatAdapter {
       this.logger.info("registered global slash commands");
     }
   }
-}
-
-function buttonStyleForKind(kind: string): ButtonStyle {
-  switch (kind) {
-    case "allow_always":
-      return ButtonStyle.Success;
-    case "allow_once":
-      return ButtonStyle.Primary;
-    case "reject_always":
-      return ButtonStyle.Danger;
-    case "reject_once":
-    default:
-      return ButtonStyle.Secondary;
-  }
-}
-
-function buttonEmojiForKind(kind: string): string {
-  switch (kind) {
-    case "allow_always":
-      return "✅";
-    case "allow_once":
-      return "👍";
-    case "reject_always":
-      return "🛑";
-    case "reject_once":
-    default:
-      return "✋";
-  }
-}
-
-function decisionEmoji(kind: string): string {
-  return kind.startsWith("allow_") ? "✅" : "🚫";
 }

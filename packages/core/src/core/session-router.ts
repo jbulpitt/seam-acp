@@ -107,7 +107,8 @@ export interface RuntimeSpawnPlan {
 
 export type AskUserFn = (
   record: SessionRecord,
-  req: RequestPermissionRequest
+  req: RequestPermissionRequest,
+  context: { requestId: string | number | null; signal: AbortSignal }
 ) => Promise<RequestPermissionResponse>;
 export type ElicitUserFn = (
   record: SessionRecord,
@@ -1557,7 +1558,7 @@ export class SessionRouter {
       onCatalogRefresh: async () => {
         await this.modelCatalog.refresh({ agentId, location }, "session");
       },
-      permissionPolicy: async (req) => {
+      permissionPolicy: async (req, context) => {
         const mode = this.livePermissionMode(record);
         if (mode === "always") {
           const opt = req.options.find((o) => o.kind?.startsWith("allow_")) ?? req.options[0];
@@ -1566,7 +1567,7 @@ export class SessionRouter {
         }
         if (mode === "ask" && this.askUser) {
           try {
-            return await this.askUser(record, req);
+            return await this.askUser(record, req, context);
           } catch (err) {
             this.logger.warn({ err, sessionId: record.id }, "askUser failed; denying");
             return { outcome: { outcome: "cancelled" } };

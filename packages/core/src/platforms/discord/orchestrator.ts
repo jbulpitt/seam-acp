@@ -5,6 +5,8 @@ import { promises as fsp } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { randomUUID } from "node:crypto";
+import { ActionCardManager } from "../../core/action-cards/manager.js";
+import type { RequestPermissionRequest, RequestPermissionResponse } from "@agentclientprotocol/sdk";
 import {
   DispatchSuspendedError,
   inboundAttemptId,
@@ -1000,6 +1002,7 @@ export class Orchestrator {
    * Synchronous durable winner before teardown is allowed to reject prompts. */
   suspendForRestart(): void {
     this.restartCutoff = true;
+    this.actionCards.detach();
     for (const unsubscribe of this.remoteAdoptionWaiters.values()) unsubscribe();
     this.remoteAdoptionWaiters.clear();
     this.store.turnAttempts.suspendBoot(this.attemptBoot);
@@ -1026,6 +1029,7 @@ export class Orchestrator {
   /** #179: private hand-off for results whose card died before showing them. */
   private readonly cardResults: CardResultVault;
   private readonly elicitations: ElicitationManager;
+  private readonly actionCards: ActionCardManager;
 
   /**
    * #174: one settle-promise per in-flight turn.
@@ -1229,6 +1233,7 @@ export class Orchestrator {
       },
       cancel: async (record, reason, detail) => {
         await this.elicitations.cancelForSession(record.id, reason, detail);
+        await this.actionCards.cancelForSession(record.id, detail ?? "This permission request was interrupted.");
       },
     });
 
@@ -1269,6 +1274,46 @@ export class Orchestrator {
       reschedule: (id) => this.scheduledManager?.reschedule(id),
       defaultTimezone: SCHEDULE_DEFAULT_TZ,
       logger: this.logger,
+    });
+
+    this.actionCards = new ActionCardManager({
+      store: this.store.actionCards, adapter: this.adapter, logger: this.logger,
+      binding: (record, acpSessionId) => {
+        const attempt = [...this.store.turnAttempts.list("active"), ...this.store.turnAttempts.list("suspended")]
+          .find(row => row.spec.target === record.channelRef && row.remoteRecovery?.acpSessionId === acpSessionId);
+        if (!attempt?.remoteRecovery) throw new Error("The pending permission has no recorded bridge-owned turn.");
+        return { attemptId: attempt.id, location: attempt.remoteRecovery.location, slot: attempt.remoteRecovery.slot };
+      },
+      owner: async (row, response) => {
+        const mux = this.bridgeHub?.muxFor(row.location);
+        if (!mux) throw new Error(`bridge ${JSON.stringify(row.location)} is not connected`);
+        return await mux.sendCmd(response ? "answerPermission" : "permissionStatus", {
+          slot: row.slot, permission: { requestId: row.requestId, sessionId: row.acpSessionId,
+            toolCallId: row.request.toolCall.toolCallId, ...(row.ownerPid ? { ownerPid: row.ownerPid } : {}) },
+          ...(response ? { response } : {}),
+        }) as { state: "pending" | "answered" | "gone"; pid: number };
+      },
+      isAttemptOpen: id => {
+        const state = this.store.turnAttempts.get(id)?.state;
+        return state === "active" || state === "suspended";
+      },
+      apply: (row, actor) => {
+        const record = this.store.get(row.sessionId);
+        if (!record) throw new Error("This proposal's session no longer exists.");
+        const built = this.configMutation.buildProposal(record, row.input);
+        if (!built.ok) throw new Error(built.error);
+        const result = built.proposal.apply(actor);
+        return { auditId: result.auditId, message: result.message };
+      },
+      afterApply: async row => {
+        if (row.proposal.restartsSession) await this.router.invalidate(row.sessionId);
+        await this.identityEffects.flush(row.sessionId);
+        await this.adapter.sendMessage(row.channel, `✅ ${row.detail}`);
+      },
+    });
+    this.store.turnAttempts?.onSettled?.(id => {
+      this.trackContinuation(this.actionCards.finishAttempt(id).catch(err =>
+        this.logger.warn({ err, attemptId: id }, "permission cleanup after turn failed")));
     });
 
     const presetNameResponder: AutocompleteResponder = (ctx) => {
@@ -1846,69 +1891,11 @@ export class Orchestrator {
     if (!built.ok) return { ok: false, error: built.error };
     const proposal = built.proposal;
 
-    // Post the confirm card into the calling thread. If the adapter can't render
-    // one, refuse rather than silently apply — the human-in-the-loop gate is the
-    // prompt-injection backstop (no auto-apply).
-    if (!this.adapter.postConfirmation) {
-      return { ok: false, error: "This platform cannot render a confirmation card, so no change can be proposed." };
-    }
-    // #71 APPLY gate: when config admins are configured, ONLY they may click
-    // Apply — in locked AND unlocked channels — instead of the whole
-    // DISCORD_ALLOWED_USER_IDS allowlist (which includes student accounts).
-    // #74: when the admin set is UNSET, still exclude restricted participants
-    // from the fallback (pass the may-configure set). Both unset ⇒ pass
-    // nothing so postConfirmation falls back exactly as today.
-    const adminIds = this.config.SEAM_CONFIG_ADMIN_USER_IDS;
-    if (proposal.tier === "model-hide" && !adminIds?.size) {
+    if (proposal.tier === "model-hide" && !this.config.SEAM_CONFIG_ADMIN_USER_IDS?.size) {
       return { ok: false, error: "Model hiding requires a configured config admin to confirm." };
     }
-    const applyAuthorized = adminIds
-      ? { authorizedUserIds: adminIds }
-      : this.config.SEAM_PARTICIPANT_USER_IDS
-        ? { authorizedUserIds: mayConfigureUserIds(this.config) }
-        : {};
-    const { decision } = await this.adapter.postConfirmation(
-      { platform: PLATFORM, id: record.channelRef },
-      {
-        title: proposal.title,
-        description: proposal.restartsSession
-          ? "Applying this restarts the session so the change takes effect."
-          : undefined,
-        fields: proposal.fields,
-        warnings: proposal.warnings,
-      },
-      applyAuthorized
-    );
-
-    // Apply in the background on confirmation; the tool has already returned.
-    void decision.then(async (d) => {
-      if (!d.confirmed) {
-        this.logger.info({ scope: proposal.scope, tier: proposal.tier }, "config proposal rejected/expired");
-        return;
-      }
-      try {
-        const result = proposal.apply({ id: d.userId ?? null, name: d.userName ?? null });
-        // Restart the session so model/agent/cwd/effort/Tier-C changes take
-        // effect (Trap 3) — stated on the card, so this is expected, not a bug.
-        if (proposal.restartsSession) {
-          await this.router.invalidate(record.id).catch((err) =>
-            this.logger.warn({ err, session: record.id }, "invalidate after config apply failed")
-          );
-        }
-        await this.identityEffects.flush(record.id);
-        await this.adapter
-          .sendMessage({ platform: PLATFORM, id: record.channelRef }, `✅ ${result.message}`)
-          .catch(() => {});
-      } catch (err) {
-        this.logger.error({ err, scope: proposal.scope, tier: proposal.tier }, "config apply failed");
-        await this.adapter
-          .sendMessage(
-            { platform: PLATFORM, id: record.channelRef },
-            `⚠️ Applying the config change failed: ${(err as Error).message}`
-          )
-          .catch(() => {});
-      }
-    });
+    try { await this.actionCards.propose(record, input, proposal); }
+    catch (error) { return { ok: false, error: error instanceof Error ? error.message : String(error) }; }
 
     return {
       ok: true,
@@ -1929,6 +1916,12 @@ export class Orchestrator {
       ["seam-quota:", (evt: ComponentEvent) => this.handleQuotaCardComponent(evt)],
       ["seam-service-status:", (evt: ComponentEvent) => this.handleServiceStatusCardComponent(evt)],
     ].map(([namespace, handle]) => ({ namespace: namespace as string, handle: handle as (evt: ComponentEvent) => Promise<void>, types: ["button", "select", "modal"] as const, lifetime: "persistent" as const, access: "read-only" as const, authorization: "user" as const })), context);
+    this.plugins.components.register("kernel-actions", [
+      { namespace: "seam-perm:", types: ["button"], lifetime: "persistent", access: "read-only", authorization: "user",
+        handle: evt => this.actionCards.handlePermission(evt) },
+      { namespace: "seam-cfg:", types: ["button"], lifetime: "persistent", access: "mutating", authorization: "config-admin",
+        handle: evt => this.actionCards.handleProposal(evt) },
+    ], context);
   }
 
   install(): void {
@@ -1992,7 +1985,12 @@ export class Orchestrator {
 
   /** Freeze any card whose ACP request disappeared with the prior process. */
   async recoverElicitations(): Promise<number> {
+    await this.actionCards.recover();
     return this.elicitations.recoverOpen();
+  }
+
+  requestPermission(record: SessionRecord, req: RequestPermissionRequest, requestId: string | number | null): Promise<RequestPermissionResponse> {
+    return this.actionCards.requestPermission(record, req, requestId);
   }
 
   /**
@@ -2523,6 +2521,7 @@ export class Orchestrator {
           "superseded",
           "A newer user message superseded this request."
         );
+        supersededElicitation += await this.actionCards.cancelForSession(existing.id, "A newer user message superseded this request.");
       }
     }
 
@@ -6952,6 +6951,10 @@ export class Orchestrator {
 
   setBridgeHub(hub: BridgeHub): void {
     this.bridgeHub = hub;
+    hub.onBridgeReady(location => {
+      this.trackContinuation(this.actionCards.recover(location).catch(err =>
+        this.logger.warn({ err, location }, "permission recovery failed")));
+    });
   }
 
   setChoiceResults(hub: ChoiceResultHub): void {

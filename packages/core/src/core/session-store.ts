@@ -1,5 +1,6 @@
 import Database from "better-sqlite3";
 import { ContextBudgetStore } from "./context-budget-store.js";
+import { ActionCardStore } from "./action-cards/store.js";
 import { TurnAttemptStore, inboundAttemptId } from "./dispatch/attempt-store.js";
 import { ScheduledOccurrenceStore } from "./scheduled-prompts/occurrence-store.js";
 import fs from "node:fs";
@@ -399,6 +400,7 @@ export class SessionStore {
   private readonly sessionWrites = new Set<(record: Readonly<SessionRecord>) => void>();
   readonly turnAttempts: TurnAttemptStore;
   readonly contextBudgets: ContextBudgetStore;
+  readonly actionCards: ActionCardStore;
   readonly scheduledOccurrences: ScheduledOccurrenceStore;
 
   constructor(dbPath: string) {
@@ -406,6 +408,7 @@ export class SessionStore {
     this.db = new Database(dbPath);
     this.db.pragma("journal_mode = WAL");
     this.contextBudgets = new ContextBudgetStore(this.db);
+    this.actionCards = new ActionCardStore(this.db);
     this.turnAttempts = new TurnAttemptStore(this.db);
     this.scheduledOccurrences = new ScheduledOccurrenceStore(this.db);
     this.db.exec(SCHEMA);

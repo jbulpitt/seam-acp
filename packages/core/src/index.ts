@@ -817,17 +817,7 @@ async function main(): Promise<void> {
 
   // Wire the ask-the-user callback now that both the router and the adapter
   // exist. Router calls this when a session's policy is "ask".
-  router.setAskUser(async (record, req) => {
-    if (!adapter.requestApproval) {
-      return { outcome: { outcome: "cancelled" } };
-    }
-    const channel = {
-      platform: record.platform,
-      id: record.channelRef,
-      ...(record.parentRef ? { parentId: record.parentRef } : {}),
-    };
-    return adapter.requestApproval(channel, req);
-  });
+  router.setAskUser((record, req, context) => orchestrator.requestPermission(record, req, context.requestId));
 
   await adapter.start();
   if (config.SEAM_TEST_DRIVER_KEY && config.SEAM_TEST_DRIVER_ACTOR_ID) {

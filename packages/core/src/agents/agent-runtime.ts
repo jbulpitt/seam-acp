@@ -143,7 +143,8 @@ export type AgentEvent =
 
 export type AgentEventHandler = (event: AgentEvent) => void | Promise<void>;
 export type PermissionPolicy = (
-  req: RequestPermissionRequest
+  req: RequestPermissionRequest,
+  context: { requestId: string | number | null; signal: AbortSignal }
 ) => Promise<RequestPermissionResponse>;
 
 export interface NewSessionOptions {
@@ -694,8 +695,8 @@ export class AgentRuntime {
         if (evidence && this.profile.submissionSignals === "claude_sdk"
           && observeClaudeSubmission(evidence, params)) await this.publishSubmission(evidence);
       })
-      .onRequest(methods.client.session.requestPermission, ({ params }) =>
-        this.permissionPolicy(params)
+      .onRequest(methods.client.session.requestPermission, ({ params, requestId, signal }) =>
+        this.permissionPolicy(params, { requestId, signal })
       )
       .onNotification(methods.client.session.update, async ({ params }) => {
         await this.handleSessionUpdate(params.update);

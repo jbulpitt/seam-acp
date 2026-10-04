@@ -18,6 +18,7 @@ import { createRung1Recovery } from "./rung1-recovery.js";
 import { spawnSupervisedAdapter } from "./spawn-agent.js";
 import { spawnRefusalFrame } from "./resolve-adapter.js";
 import { createResumeRecorder } from "./adapter-child-resume.js";
+import { PendingPermissions } from "./pending-permissions.js";
 import {
   ADAPTER_CHILD_PROTOCOL_VERSION,
   adapterChildLine,
@@ -86,6 +87,7 @@ function start(config: AdapterChildBootstrap): void {
     return;
   }
   child = spawned;
+  const permissions = new PendingPermissions(writeAgent);
   const resumeRecord = createResumeRecorder(process.env.SEAM_SESSIOND_RESUME_FILE, config);
   clearResumeRecord = () => resumeRecord.clear();
   const recovery = createRung1Recovery({
@@ -163,6 +165,7 @@ function start(config: AdapterChildBootstrap): void {
   child.stdout?.on("data", (chunk: Buffer | string) => {
     for (const line of agentOutput.push(chunk.toString())) {
       if (resumeOutput(line)) continue;
+      permissions.observeOutput(line);
       const decision = recovery.observeOutput(config.slot, line);
       if (decision.forward !== null) publish({
         v: ADAPTER_CHILD_PROTOCOL_VERSION,
@@ -205,6 +208,16 @@ function start(config: AdapterChildBootstrap): void {
     }
     if (message.type === "input") {
       deliverInput(Buffer.from(message.dataBase64, "base64"));
+    } else if (message.type === "permission_status" || message.type === "answer_permission") {
+      try {
+        const result = message.type === "permission_status"
+          ? permissions.status(message.permission)
+          : permissions.answer(message.permission, message.response!);
+        publish({ v: ADAPTER_CHILD_PROTOCOL_VERSION, type: "control_result", requestId: message.requestId, ok: true, result });
+      } catch (error) {
+        publish({ v: ADAPTER_CHILD_PROTOCOL_VERSION, type: "control_result", requestId: message.requestId,
+          ok: false, error: error instanceof Error ? error.message : String(error) });
+      }
     } else if (message.type === "arm_recovery") {
       try {
         publish({
@@ -241,11 +254,12 @@ function start(config: AdapterChildBootstrap): void {
   function deliverInput(bytes: Buffer): void {
     recovery.observeInputBytes(config.slot);
     for (const line of agentInput.push(bytes.toString())) {
+      if (!permissions.observeInput(line)) continue;
       recovery.observeInput(config.slot, line);
       resumeRecord.observeInput(line);
       resumeRecord.record(recovery.resumable(config.slot));
+      if (!writeAgent(line)) exitWithRefusal("agent stdin is closed; input could not be delivered");
     }
-    if (!writeAgent(bytes)) exitWithRefusal("agent stdin is closed; input could not be delivered");
   }
 
   consume = handle;

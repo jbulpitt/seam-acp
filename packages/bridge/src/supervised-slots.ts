@@ -8,6 +8,8 @@ import {
   type AdapterChildInput,
 } from "./adapter-child-protocol.js";
 import type { SlotSpawnConfig } from "./rpc.js";
+import type { PermissionIdentity, PermissionSnapshot } from "./pending-permissions.js";
+import type { RequestPermissionResponse } from "@agentclientprotocol/sdk";
 import { SessiondClient, SessiondClientError } from "./sessiond-client.js";
 import type {
   SessiondEvent,
@@ -291,6 +293,23 @@ export class SupervisedSlots {
       }
       return await response as { disarmed: boolean };
     }) as Promise<{ disarmed: boolean }>;
+  }
+
+  async permissionControl(slot: number, type: "permission_status" | "answer_permission",
+    permission: PermissionIdentity, answer?: RequestPermissionResponse): Promise<PermissionSnapshot> {
+    return this.serial(slot, async () => {
+      if (!this.bindings.get(slot) || this.bindings.get(slot)?.dead) return { state: "gone", pid: 0 };
+      const requestId = randomUUID();
+      const response = this.waitForControl(requestId);
+      try {
+        await this.writeControl(slot, { v: ADAPTER_CHILD_PROTOCOL_VERSION, type, requestId, permission,
+          ...(answer ? { response: answer } : {}) });
+      } catch (error) {
+        this.cancelControl(requestId);
+        throw error;
+      }
+      return await response as PermissionSnapshot;
+    }) as Promise<PermissionSnapshot>;
   }
 
   /** Why the last write to this slot could not be delivered. */

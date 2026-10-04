@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { MessageFlags } from "discord.js";
+import { validateSlashSpec } from "../packages/core/src/platforms/discord/synthetic-interaction.js";
 import type { IdentityEvent } from "../packages/core/src/plugins/identity-registry.js";
 import { NAMING_PARENT, namingCommands, namingFixture } from "./plugin-naming-fixture.js";
 
@@ -9,6 +10,7 @@ describe("thread naming contributions", () => {
     expect(naming.options.map((leaf: any) => leaf.name)).toEqual(["rename", "namer"]);
     expect(naming.options[0].options.map((option: any) => option.name)).toEqual(["scope", "migrate-legacy", "role-name"]);
     expect(naming.options[0].description).toBe("Refresh/migrate names");
+    expect(validateSlashSpec({ kind: "slash", channel: NAMING_PARENT, command: "seamadmin", subcommandGroup: "naming", subcommand: "namer" }, namingCommands())).toEqual(new Map());
   });
 
   it("committed creation and role/model changes preserve the human base", async () => {

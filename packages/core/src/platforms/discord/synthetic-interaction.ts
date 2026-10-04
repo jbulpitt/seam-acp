@@ -176,7 +176,7 @@ export function validateSlashSpec(
   }
   if (spec.subcommand) {
     const sub = level.find((o) => o.name === spec.subcommand && o.type === ApplicationCommandOptionType.Subcommand);
-    if (!sub || !("options" in sub)) throw new Error(`/${spec.command}${spec.subcommandGroup ? ` ${spec.subcommandGroup}` : ""} has no subcommand "${spec.subcommand}"`);
+    if (!sub) throw new Error(`/${spec.command}${spec.subcommandGroup ? ` ${spec.subcommandGroup}` : ""} has no subcommand "${spec.subcommand}"`);
     level = (sub.options ?? []) as APIApplicationCommandOption[];
   } else if (level.some((o) => o.type === ApplicationCommandOptionType.Subcommand || o.type === ApplicationCommandOptionType.SubcommandGroup)) {
     throw new Error(`/${spec.command} needs a subcommand`);

@@ -42,6 +42,41 @@ afterEach(() => {
 });
 
 describe("#467 bridge-owned rung 1", () => {
+  it("settles a rebound arm that never received a prompt with its actual cause", () => {
+    const h = harness();
+    const input = { submissionId: "submission-missing", acpSessionId: "session-missing", continuation: "continue" };
+    h.recovery.arm(6, input);
+    expect(h.recovery.reconcile(6, input, false)).toEqual({ state: "owned" });
+    expect(h.results).toEqual([expect.objectContaining({ status: "failed", stopReason: "prompt_not_received",
+      error: expect.stringContaining("never received a complete session/prompt") })]);
+    expect(h.writes).toEqual([]);
+    expect(h.recovery.snapshot(6)).toMatchObject({ phase: "exhausted", terminalReason: "prompt_not_received" });
+  });
+
+  it("does not settle restoration, executing input, or another submission", () => {
+    const h = harness();
+    const input = { submissionId: "submission-live", acpSessionId: "session-live", continuation: "continue" };
+    h.recovery.arm(6, input);
+    expect(h.recovery.reconcile(6, input, true)).toEqual({ state: "owned" });
+    expect(h.recovery.reconcile(6, { ...input, submissionId: "other" }, false)).toMatchObject({ state: "missing" });
+    expect(h.results).toEqual([]);
+    h.recovery.observeInput(6, line({ id: 7, method: "session/prompt", params: { sessionId: input.acpSessionId, prompt: [] } }));
+    expect(h.recovery.reconcile(6, input, false)).toEqual({ state: "owned" });
+    expect(h.recovery.snapshot(6)).toMatchObject({ phase: "executing" });
+    expect(h.results).toEqual([]);
+    expect(h.writes).toEqual([]);
+  });
+
+  it("names incomplete input without pretending it was submitted", () => {
+    const h = harness();
+    const input = { submissionId: "submission-partial", acpSessionId: "session-partial", continuation: "continue" };
+    h.recovery.arm(6, input);
+    h.recovery.observeInputBytes(6);
+    expect(h.recovery.disarm(6, input.submissionId)).toBe(false);
+    h.recovery.reconcile(6, input, false);
+    expect(h.results[0]).toMatchObject({ status: "failed", error: expect.stringContaining("never received a complete") });
+  });
+
   it("continues the same session without retaining or resending the original prompt", async () => {
     vi.useFakeTimers();
     const h = harness();

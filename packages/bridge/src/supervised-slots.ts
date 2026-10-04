@@ -295,6 +295,42 @@ export class SupervisedSlots {
     }) as Promise<{ disarmed: boolean }>;
   }
 
+  async reconcileRecovery(slot: number, input: { submissionId: unknown; acpSessionId: unknown }):
+    Promise<{ state: "owned" } | { state: "missing"; cause: string }> {
+    return this.serial(slot, async () => {
+      const health = (await this.options.client.listSlots()).health.find(row => row.slot === slot);
+      if (!health || !health.alive || !health.attached) {
+        return { state: "missing", cause: `bridge slot ${slot} has no attached live process` };
+      }
+      const snapshot = this.recoveries.get(slot);
+      if (!snapshot?.reconcileSupported) {
+        // Retained pre-rollout children already acknowledge an arm with no input.
+        // A host-restart record keeps this away from their initialize/load path.
+        if (snapshot?.phase !== "armed" || snapshot.submissionId !== input.submissionId
+          || snapshot.acpSessionId !== input.acpSessionId || health.resumePending !== false) return { state: "owned" };
+        const requestId = randomUUID();
+        const response = this.waitForControl(requestId);
+        try {
+          await this.writeControl(slot, { v: ADAPTER_CHILD_PROTOCOL_VERSION,
+            type: "disarm_recovery", requestId, submissionId: input.submissionId });
+        } catch (error) { this.cancelControl(requestId); throw error; }
+        if (!(await response as { disarmed: boolean }).disarmed) return { state: "owned" };
+        this.recoveries.delete(slot);
+        return { state: "missing", cause: `bridge slot ${slot} armed recovery but never received session/prompt input for this submission` };
+      }
+      const requestId = randomUUID();
+      const response = this.waitForControl(requestId);
+      try {
+        await this.writeControl(slot, { v: ADAPTER_CHILD_PROTOCOL_VERSION,
+          type: "reconcile_recovery", requestId, ...input });
+      } catch (error) {
+        this.cancelControl(requestId);
+        throw error;
+      }
+      return await response as { state: "owned" } | { state: "missing"; cause: string };
+    });
+  }
+
   async permissionControl(slot: number, type: "permission_status" | "answer_permission",
     permission: PermissionIdentity, answer?: RequestPermissionResponse): Promise<PermissionSnapshot> {
     return this.serial(slot, async () => {

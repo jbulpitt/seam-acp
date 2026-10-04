@@ -40,7 +40,7 @@ async function until<T>(read: () => T | undefined | Promise<T | undefined>, what
 
 const line = (message: Record<string, unknown>) => `${JSON.stringify({ jsonrpc: "2.0", ...message })}\n`;
 
-async function host(root: string, modeId?: string) {
+async function host(root: string, modeId?: string, options: { legacy?: boolean; loadGate?: string } = {}) {
   const bin = path.join(root, "bin");
   if (modeId) {
     await fs.mkdir(bin, { recursive: true });
@@ -57,12 +57,13 @@ async function host(root: string, modeId?: string) {
     client,
     copilotCmd: fakeAgent,
     localCwd: root,
-    adapterChildPath: adapterChild,
+    adapterChildPath: options.legacy ? path.join(here, "helpers/adapter-child-legacy.mjs") : adapterChild,
     environment: {
       HOME: root,
       PATH: `${bin}:${path.dirname(process.execPath)}:/usr/bin:/bin`,
       FAKE_AGENT_PIDS: path.join(root, "agent.pids"),
       ...(modeId ? { FAKE_AGENT_REQUIRE_MODE: modeId } : {}),
+      ...(options.loadGate ? { FAKE_AGENT_LOAD_GATE: options.loadGate } : {}),
     },
     onStderr: () => undefined,
     onFrame: (frame) => frames.push(frame),
@@ -90,12 +91,74 @@ describe("large prompts reach the agent", () => {
   }, 90_000);
 });
 
+describe("#777 the retained adapter child decides reconciliation", () => {
+  it.each([false, true])("settles a never-submitted arm after bridge rebind; legacy=%s", async legacy => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "seam-777-owner-"));
+    roots.push(root);
+    const first = await host(root, undefined, { legacy });
+    first.slots.configure(8, { agentId: "copilot", cwd: root, rung1Recovery: DEFAULT_REMOTE_RUNG1_POLICY });
+    await first.slots.writeInput(8, line({ id: 1, method: "initialize", params: { protocolVersion: 1 } }));
+    await first.slots.writeInput(8, line({ id: 2, method: "session/new", params: { cwd: root, mcpServers: [] } }));
+    await until(() => first.frames.find(f => f.data?.includes('"sessionId":"s1"')), "session/new");
+    const snapshot = await first.slots.armRecovery(8, { submissionId: "never-submitted", acpSessionId: "s1", continuation: "continue" });
+    expect(snapshot.reconcileSupported).toBe(legacy ? undefined : true);
+    const before = (await first.client.listSlots()).health.find(row => row.slot === 8)!;
+    expect(before.resumePending).toBe(false);
+    first.client.close();
+    const client = await SessiondClient.connect(path.join(root, "control.sock"));
+    clients.push(client);
+    const frames: SupervisedBridgeFrame[] = [];
+    const rebound = new SupervisedSlots({ client, copilotCmd: fakeAgent, localCwd: root,
+      onFrame: frame => frames.push(frame), onStderr: () => undefined });
+    await rebound.rebind();
+    const replay = await rebound.replay(8, 0);
+    replay.activate();
+    const result = await rebound.reconcileRecovery(8, { submissionId: "never-submitted", acpSessionId: "s1" });
+    if (legacy) expect(result).toMatchObject({ state: "missing", cause: expect.stringContaining("never received") });
+    else {
+      expect(result).toEqual({ state: "owned" });
+      const terminal = await until(() => frames.find(frame => frame.recoveryResult), "owner failure result");
+      expect(terminal.recoveryResult).toMatchObject({ status: "failed", stopReason: "prompt_not_received",
+        error: expect.stringContaining("never received") });
+    }
+    const after = (await client.listSlots()).health.find(row => row.slot === 8)!;
+    expect(after).toMatchObject({ pid: before.pid, alive: true, attached: true });
+    expect(frames.some(frame => frame.type === "exit")).toBe(false);
+    expect(frames.some(frame => frame.data?.includes("working on it"))).toBe(false);
+  }, 20_000);
+
+  it.each([false, true])("leaves executing work owned; legacy=%s", async legacy => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "seam-777-running-"));
+    roots.push(root);
+    const one = await host(root, undefined, { legacy });
+    one.slots.configure(8, { agentId: "copilot", cwd: root, rung1Recovery: DEFAULT_REMOTE_RUNG1_POLICY });
+    await one.slots.writeInput(8, line({ id: 1, method: "initialize", params: { protocolVersion: 1 } }));
+    await one.slots.writeInput(8, line({ id: 2, method: "session/new", params: { cwd: root, mcpServers: [] } }));
+    await until(() => one.frames.find(f => f.data?.includes('"sessionId":"s1"')), "session/new");
+    await one.slots.armRecovery(8, { submissionId: "running", acpSessionId: "s1", continuation: "continue" });
+    await one.slots.writeInput(8, line({ id: 7, method: "session/prompt", params: {
+      sessionId: "s1", prompt: [{ type: "text", text: "long job" }],
+    } }));
+    await until(() => one.frames.find(f => f.data?.includes("working on it")), "prompt acceptance");
+    const before = (await one.client.listSlots()).health.find(row => row.slot === 8)!;
+    expect(before.resumePending).toBe(true);
+    expect(await one.slots.reconcileRecovery(8, { submissionId: "running", acpSessionId: "s1" })).toEqual({ state: "owned" });
+    expect((await one.client.listSlots()).health.find(row => row.slot === 8)?.pid).toBe(before.pid);
+    expect(one.frames.some(frame => frame.recoveryResult)).toBe(false);
+  }, 20_000);
+});
+
 describe("#631 host restart mid-turn", () => {
-  it.each([undefined, "agent-full-access"])("reloads and continues under the original id with mode %s", async modeId => {
+  it.each([
+    { modeId: undefined, legacy: false },
+    { modeId: "agent-full-access", legacy: false },
+    { modeId: undefined, legacy: true },
+  ])("reloads and continues under the original id: %j", async ({ modeId, legacy }) => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "seam-631r-"));
     roots.push(root);
     await fs.chmod(root, 0o700);
-    const first = await host(root, modeId);
+    const loadGate = path.join(root, "load.ready");
+    const first = await host(root, modeId, { legacy, loadGate });
     first.slots.configure(5, { agentId: modeId ? "codex" : "copilot", cwd: root, rung1Recovery: DEFAULT_REMOTE_RUNG1_POLICY });
     await first.slots.writeInput(5, line({ id: 1, method: "initialize", params: { protocolVersion: 1 } }));
     await first.slots.writeInput(5, line({ id: 2, method: "session/new", params: { cwd: root, mcpServers: [] } }));
@@ -128,11 +191,15 @@ describe("#631 host restart mid-turn", () => {
       .every(pid => !readSessiondProcessIdentity(pid)) ? true : undefined, "shutdown to finish");
     expect(existsSync(record)).toBe(true);
 
-    const second = await host(root, modeId);
+    const second = await host(root, modeId, { legacy, loadGate });
     await second.slots.rebind();
     const replay = await second.slots.replay(5, 0);
     replay.activate();
     const seen = () => [...replay.result.frames, ...second.frames];
+    expect((await second.client.listSlots()).health.find(row => row.slot === 5)?.resumePending).toBe(true);
+    expect(await second.slots.reconcileRecovery(5, { submissionId: "sub-5", acpSessionId: "s1" })).toEqual({ state: "owned" });
+    expect(seen().some(frame => frame.recoveryResult?.status === "failed")).toBe(false);
+    await fs.writeFile(loadGate, "ready");
     const answer = await until(() => seen().find((f) => f.data?.includes("\"id\":7") && f.data.includes("end_turn")), "the original prompt's answer");
     expect(answer.data).toContain("\"id\":7");
     const result = await until(() => seen().find((f) => f.type === "recovery_result"), "the recovery result");

@@ -131,6 +131,7 @@ export function createRung1Recovery(hooks: Rung1RecoveryHooks) {
     patch: Pick<RemoteRecoverySnapshot, "phase" | "terminalReason"> &
       Partial<Pick<RemoteRecoverySnapshot, "errorKind">>,
     reason?: string,
+    error?: string,
   ): void => {
     if (state.timer) clearTimeout(state.timer);
     publish(slot, state, { ...patch, disposition: "none" });
@@ -142,6 +143,7 @@ export function createRung1Recovery(hooks: Rung1RecoveryHooks) {
       text: state.text,
       ...(reason ? { stopReason: reason } : {}),
       ...(patch.errorKind ? { errorKind: patch.errorKind } : {}),
+      ...(error ? { error } : {}),
       finishedUtc: new Date(now()).toISOString(),
     };
     state.terminal = true;
@@ -227,6 +229,7 @@ export function createRung1Recovery(hooks: Rung1RecoveryHooks) {
         budget: policy.retryCount,
         remaining: policy.retryCount,
         disposition: "none",
+        reconcileSupported: true,
         updatedUtc: new Date(now()).toISOString(),
       };
       const state: ArmedRecovery = {
@@ -340,6 +343,20 @@ export function createRung1Recovery(hooks: Rung1RecoveryHooks) {
     snapshot(slot: number): RemoteRecoverySnapshot | undefined {
       const value = armed.get(slot)?.snapshot;
       return value ? { ...value } : undefined;
+    },
+
+    reconcile(slot: number, input: { submissionId: unknown; acpSessionId: unknown }, restoring: boolean):
+      { state: "owned" } | { state: "missing"; cause: string } {
+      const state = armed.get(slot);
+      if (!state || state.submissionId !== input.submissionId || state.acpSessionId !== input.acpSessionId) {
+        return { state: "missing", cause: `bridge slot ${slot} no longer owns the recorded submission` };
+      }
+      if (!state.terminal && state.snapshot.phase === "armed" && !restoring && state.originalRequestId === undefined) {
+        finish(slot, state, "failed", {
+          phase: "exhausted", terminalReason: "prompt_not_received", errorKind: "protocol_error",
+        }, "prompt_not_received", `bridge slot ${slot} armed recovery but never received a complete session/prompt for this submission`);
+      }
+      return { state: "owned" };
     },
 
     /** What a relaunched child needs to continue this turn after a host restart. */

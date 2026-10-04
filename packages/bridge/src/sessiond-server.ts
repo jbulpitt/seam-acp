@@ -1,6 +1,6 @@
 import { spawn, execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { promises as fs, openSync, closeSync, readFileSync } from "node:fs";
+import { promises as fs, openSync, closeSync, readFileSync, statSync } from "node:fs";
 import net, { type Socket } from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -872,6 +872,7 @@ export class SessiondServer {
       lastStdinMsAgo: entry.lastStdinAt === undefined ? null : Math.max(0, now - entry.lastStdinAt),
       attached: entry.attached,
       outputAckedThrough: this.outputLog.acknowledgedThrough(entry.slot),
+      resumePending: this.resumePending(entry.slot),
       ...(entry.exitCode !== undefined ? { exitCode: entry.exitCode } : {}),
       ...(entry.signal !== undefined ? { signal: entry.signal } : {}),
       ...(entry.orphanReason ? { orphanReason: entry.orphanReason } : {}),
@@ -880,6 +881,11 @@ export class SessiondServer {
       health.push({ slot, alive: false, attached: false, pid: null, lastStdoutMsAgo: null, lastStdinMsAgo: null, orphanReason: "identity_unverifiable" });
     }
     return { slots: health.map((entry) => entry.slot), health };
+  }
+
+  private resumePending(slot: number): boolean | undefined {
+    try { statSync(this.resumeFile(slot)); return true; }
+    catch (error) { return (error as NodeJS.ErrnoException).code === "ENOENT" ? false : undefined; }
   }
 
   private replayOutput(params: SessiondReplayOutputParams): SessiondReplayOutputResult {

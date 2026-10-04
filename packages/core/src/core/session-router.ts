@@ -1471,18 +1471,10 @@ export class SessionRouter {
     return resolvePermissionMode(this.store.readConfig(live), this.defaultPermissionMode);
   }
 
-  /** Share policy and advertised-mode facts with isolated and helper sessions. */
-  permissionOptions(profile: AgentProfile, record?: SessionRecord): Pick<ConstructorParameters<typeof AgentRuntime>[0], "permissionMode" | "onSessionModes"> {
+  /** Isolated and helper sessions use the same live policy. */
+  permissionOptions(record?: SessionRecord): Pick<ConstructorParameters<typeof AgentRuntime>[0], "permissionMode"> {
     return {
       permissionMode: () => record ? this.livePermissionMode(record) : this.defaultPermissionMode,
-      onSessionModes: info => {
-        if (profile.id !== "codex" || !record) return;
-        const live = this.store.get(record.id) ?? record;
-        const cfg = this.store.readConfig(live);
-        const modes = { sessionId: info.sessionId, availableModes: info.availableModes, currentModeId: info.currentModeId };
-        if (JSON.stringify(cfg.codexModes) === JSON.stringify(modes)) return;
-        this.store.upsert({ ...live, configJson: this.store.writeConfig({ ...cfg, codexModes: modes }) });
-      },
     };
   }
 
@@ -1578,7 +1570,15 @@ export class SessionRouter {
       onCatalogRefresh: async () => {
         await this.modelCatalog.refresh({ agentId, location }, "session");
       },
-      ...this.permissionOptions(profile, record),
+      ...this.permissionOptions(record),
+      onSessionModes: info => {
+        if (profile.id !== "codex") return;
+        const live = this.store.get(record.id) ?? record;
+        const cfg = this.store.readConfig(live);
+        const modes = { sessionId: info.sessionId, availableModes: info.availableModes, currentModeId: info.currentModeId };
+        if (JSON.stringify(cfg.codexModes) === JSON.stringify(modes)) return;
+        this.store.upsert({ ...live, configJson: this.store.writeConfig({ ...cfg, codexModes: modes }) });
+      },
       permissionPolicy: async (req, context) => {
         const mode = this.livePermissionMode(record);
         if (mode === "always") {

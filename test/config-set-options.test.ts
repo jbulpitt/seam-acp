@@ -348,6 +348,10 @@ describe("/seam config set named parameters", () => {
   it.each(["always", "ask"] as const)("uses the resolved %s policy for a fresh isolated Codex turn", async policy => {
     const { orch, store } = makeHarness();
     await (orch as any).cmdConfigSet(interaction({ agent: "codex@local", permissions: policy }).i);
+    const bound = read(store);
+    const modes = { sessionId: "bound-s1", ...structuredClone(CODEX_ACP_2_0_1_MODES) };
+    store.upsert({ ...bound.record, acpSessionId: modes.sessionId,
+      configJson: store.writeConfig({ ...bound.cfg, codexModes: modes }) });
     const connection = {
       newSession: vi.fn(async () => ({ sessionId: "isolated-s1", modes: structuredClone(CODEX_ACP_2_0_1_MODES),
         models: { currentModelId: "gpt-5.6-sol", availableModels: [] } })),
@@ -366,7 +370,7 @@ describe("/seam config set named parameters", () => {
       expect(connection.prompt).toHaveBeenCalledTimes(1);
       expect(connection.setSessionMode.mock.calls).toEqual(policy === "always"
         ? [[{ sessionId: "isolated-s1", modeId: "agent-full-access" }]] : []);
-      expect(read(store).cfg.codexModes?.sessionId).toBe("isolated-s1");
+      expect(read(store).cfg.codexModes).toEqual(modes);
     } finally {
       start.mockRestore();
       dispose.mockRestore();

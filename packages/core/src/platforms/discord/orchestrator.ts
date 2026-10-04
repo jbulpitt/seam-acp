@@ -5925,7 +5925,7 @@ export class Orchestrator {
         rt = new AgentRuntime({
           profile,
           logger,
-          ...this.router.permissionOptions(profile, target
+          ...this.router.permissionOptions(target
             ? isSessionRecord(target) ? target : this.store.get(makeSessionId(target.platform, target.id)) ?? undefined
             : undefined),
           mcpServers,
@@ -6693,7 +6693,7 @@ export class Orchestrator {
       rt = new AgentRuntime({
         profile,
         logger: this.logger.child({ compaction: "seed" }),
-        ...this.router.permissionOptions(profile, args.sessionId ? this.store.get(args.sessionId) ?? undefined : undefined),
+        ...this.router.permissionOptions(args.sessionId ? this.store.get(args.sessionId) ?? undefined : undefined),
         mcpServers: launch.mcpServers,
         spawnFn: launch.spawnFn,
       });
@@ -18890,7 +18890,7 @@ export class Orchestrator {
         tempRuntime = new AgentRuntime({
           profile,
           logger: this.logger.child({ session: `temp-compact-thread-${channelRef.id}` }),
-          ...this.router.permissionOptions(profile, record),
+          ...this.router.permissionOptions(record),
           mcpServers: launch.mcpServers,
           spawnFn: launch.spawnFn,
         });
@@ -20344,7 +20344,7 @@ export class Orchestrator {
               tempRuntime = new AgentRuntime({
                 profile,
                 logger: this.logger.child({ session: `temp-summary-${session.sessionId}` }),
-                ...this.router.permissionOptions(profile, record),
+                ...this.router.permissionOptions(record),
                 mcpServers: launch.mcpServers,
                 ...(summarySelection.model ? { effortDescriptor: summarySelection.model.effort } : {}),
                 spawnFn: launch.spawnFn,
@@ -20694,7 +20694,7 @@ export class Orchestrator {
             tempRuntime = new AgentRuntime({
               profile,
               logger: this.logger.child({ session: `temp-import-${session.sessionId}` }),
-              ...this.router.permissionOptions(profile, record),
+              ...this.router.permissionOptions(record),
               mcpServers: launch.mcpServers,
               spawnFn: launch.spawnFn,
             });
@@ -20910,7 +20910,7 @@ export class Orchestrator {
               tempRuntime = new AgentRuntime({
                 profile,
                 logger: this.logger.child({ session: `temp-migrate-${session.sessionId}` }),
-                ...this.router.permissionOptions(profile, record),
+                ...this.router.permissionOptions(record),
                 mcpServers: launch.mcpServers,
                 spawnFn: launch.spawnFn,
               });

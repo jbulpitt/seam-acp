@@ -12,7 +12,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { DEFAULT_REMOTE_RUNG1_POLICY } from "../packages/core/src/core/remote-spawn.js";
 import { SessiondClient } from "../packages/bridge/src/sessiond-client.js";
-import { SessiondServer } from "../packages/bridge/src/sessiond-server.js";
+import { SessiondServer, readSessiondProcessIdentity } from "../packages/bridge/src/sessiond-server.js";
 import { SupervisedSlots, type SupervisedBridgeFrame } from "../packages/bridge/src/supervised-slots.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -117,11 +117,15 @@ describe("#631 host restart mid-turn", () => {
     await first.server.close();
     servers.splice(servers.indexOf(first.server), 1);
     first.client.close();
-    const state = JSON.parse(await fs.readFile(path.join(root, "slots.json"), "utf8")) as { slots: Array<{ identity: { pgid: number } }> };
+    const state = JSON.parse(await fs.readFile(path.join(root, "slots.json"), "utf8")) as { slots: Array<{ identity: { pid: number; pgid: number } }> };
     for (const slot of state.slots) try { process.kill(-slot.identity.pgid, "SIGKILL"); } catch { /* gone */ }
-    for (const pid of (await fs.readFile(path.join(root, "agent.pids"), "utf8")).trim().split("\n")) {
-      try { process.kill(Number(pid), "SIGKILL"); } catch { /* gone */ }
+    const agentPids = (await fs.readFile(path.join(root, "agent.pids"), "utf8")).trim().split("\n").map(Number);
+    for (const pid of agentPids) {
+      try { process.kill(pid, "SIGKILL"); } catch { /* gone */ }
     }
+    // A new host cannot still observe processes from the previous boot.
+    await until(() => [...state.slots.map(slot => slot.identity.pid), ...agentPids]
+      .every(pid => !readSessiondProcessIdentity(pid)) ? true : undefined, "shutdown to finish");
     expect(existsSync(record)).toBe(true);
 
     const second = await host(root, modeId);

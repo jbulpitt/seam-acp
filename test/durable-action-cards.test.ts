@@ -10,6 +10,7 @@ import { SupervisedSlots, type SupervisedBridgeFrame } from "../packages/bridge/
 import { ActionCardManager } from "../packages/core/src/core/action-cards/manager.js";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
 import { namingFixture } from "./plugin-naming-fixture.js";
+import { PendingPermissions } from "../packages/bridge/src/pending-permissions.js";
 import type { ComponentEvent, ElicitationCardPost } from "../packages/core/src/platforms/chat-adapter.js";
 
 const logger = pino({ level: "silent" });
@@ -82,6 +83,18 @@ describe("durable action cards", () => {
     await new Promise(resolve => setTimeout(resolve, 50));
     expect(frames.filter(frame => frame.data?.includes('"sessionUpdate":"agent_message_chunk"'))).toHaveLength(1);
     expect(edit.mock.calls.at(-1)?.[1].buttons).toEqual([]);
+    if (mode === "selected") {
+      await input({ id: 4, method: "session/prompt", params: { sessionId: "retained-session", prompt: [] } });
+      await until(() => frames.filter(frame => frame.data?.includes("session/request_permission")).length === 2);
+      const next = JSON.parse(frames.filter(frame => frame.data?.includes("session/request_permission")).at(-1)!.data!).params;
+      const nextDecision = restarted.requestPermission(session, next, "original-request");
+      await until(() => cards.length === 2);
+      expect(store.actionCards.permissions().filter(row => row.status === "open")).toHaveLength(1);
+      expect(next.toolCall.toolCallId).not.toBe(request.toolCall.toolCallId);
+      await restarted.cancelForSession("discord:thread", "A newer prompt supersedes this request.");
+      await input({ id: "original-request", result: await nextDecision });
+      await until(() => frames.filter(frame => frame.data?.includes('"stopReason":"end_turn"')).length === 2);
+    }
     await expect(slots.permissionControl(999, "permission_status", { requestId: 1, sessionId: "none", toolCallId: "none" })).resolves.toMatchObject({ state: "gone" });
   }, 20_000);
 
@@ -146,5 +159,17 @@ describe("durable action cards", () => {
       expect(click.replyEphemeral).toHaveBeenCalledWith(expect.stringContaining("no longer available"));
       expect(edit.mock.calls.at(-1)?.[1].buttons).toEqual([]);
     }
+  });
+
+  it("does not suppress an unrelated ACP response that reuses an answered permission id", () => {
+    const pending = new PendingPermissions(() => true, 42);
+    pending.observeOutput(JSON.stringify({ id: 0, method: "session/request_permission", params: {
+      sessionId: "session", toolCall: { toolCallId: "tool" }, options: [],
+    } }));
+    pending.answer({ requestId: 0, sessionId: "session", toolCallId: "tool" }, { outcome: { outcome: "cancelled" } });
+    expect(pending.observeInput(JSON.stringify({ id: 0, result: { outcome: { outcome: "cancelled" } } }))).toBe(false);
+    pending.observeOutput(JSON.stringify({ id: 0, method: "fs/read_text_file", params: { path: "file" } }));
+    expect(pending.observeInput(JSON.stringify({ id: 0, result: { content: "file contents" } }))).toBe(true);
+    expect(pending.status({ requestId: 0, sessionId: "session", toolCallId: "tool" }).state).toBe("gone");
   });
 });

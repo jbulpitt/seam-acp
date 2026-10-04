@@ -35,7 +35,7 @@ export class ActionCardManager {
     const probe = { ...binding, requestId, acpSessionId: request.sessionId, ownerPid: 0, request };
     const owner = await this.deps.owner(probe);
     if (owner.state !== "pending") return denied;
-    const identity = JSON.stringify([binding.location, binding.slot, owner.pid, request.sessionId, requestId]);
+    const identity = JSON.stringify([binding.location, binding.slot, owner.pid, request.sessionId, requestId, request.toolCall.toolCallId]);
     let row = this.deps.store.findPermission(identity);
     if (!row) {
       row = {

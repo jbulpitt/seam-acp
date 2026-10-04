@@ -28,8 +28,11 @@ export class PendingPermissions {
   observeOutput(line: string): void {
     const frame = this.frame(line);
     if (!frame) return;
-    if (frame.method === "session/request_permission" && this.isId(frame.id)) {
+    if (frame.method && this.isId(frame.id)) {
       this.answered.delete(this.key(frame.id));
+      this.requests.delete(this.key(frame.id));
+    }
+    if (frame.method === "session/request_permission" && this.isId(frame.id)) {
       const request = frame.params as RequestPermissionRequest;
       this.requests.set(this.key(frame.id), {
         requestId: frame.id, sessionId: request.sessionId,

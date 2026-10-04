@@ -12,12 +12,12 @@ const logger = pino({ level: "silent" }); const hosts: PluginHost[] = []; const 
 afterEach(async () => { for (const host of hosts.splice(0)) await host.dispose(); vi.restoreAllMocks(); vi.useRealTimers(); for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true }); });
 const binding: UsageBinding = { agentId: "grok", displayName: "Grok", location: "local", account: "grok", provider: "grok", quotaAvailable: true };
 const result = (): ProviderUsage => ({ provider: "grok", data: { subscriptionTier: "Free", creditUsagePercent: null, periodType: null, periodEnd: null } });
-function fixture(read: (binding: Readonly<UsageBinding>, signal?: AbortSignal) => Promise<ProviderUsage> = async () => result()) {
+function fixture(read: (binding: Readonly<UsageBinding>, signal?: AbortSignal) => Promise<ProviderUsage> = async () => result(), bindings = [binding]) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "quota-plugin-")); dirs.push(root);
   const file = path.join(root, "agent-quota-card.json"); fs.writeFileSync(file, JSON.stringify({ threadId: "quota-thread", messageId: "legacy", lastBumpAt: Date.now() }));
   const card = { sendLayout: vi.fn(async channel => ({ channel, id: "new" })), editLayout: vi.fn(async () => {}), pinMessage: vi.fn(async () => {}) };
   const usage = { readUsage: vi.fn(read) };
-  const plugin = createQuotaPlugin({ usage, bindings: () => [binding], resolve: () => ({ ...binding, sessionId: "session" }), card });
+  const plugin = createQuotaPlugin({ usage, bindings: () => bindings, resolve: () => ({ ...binding, sessionId: "session" }), card });
   const host = new PluginHost(logger, { storageRoot: root, storageAliases: { quota: { "agent-quota-card.json": file } } }); hosts.push(host);
   const load = () => host.loadBuiltins([{ id: "quota", load: async () => plugin }], { quota: { DISCORD_AGENT_QUOTA_THREAD_ID: "quota-thread", QUOTA_STALE_RETENTION_MS: 0, OLLAMA_CLOUD_ENABLED: false } });
   return { host, plugin, card, usage, load };
@@ -53,6 +53,22 @@ describe("quota built-in", () => {
     await vi.advanceTimersByTimeAsync(5 * 60_000); expect(f.usage.readUsage).toHaveBeenCalledTimes(4);
     await vi.advanceTimersByTimeAsync(59 * 60_000); expect(f.usage.readUsage).toHaveBeenCalledTimes(4);
     await vi.advanceTimersByTimeAsync(60_000); expect(f.usage.readUsage).toHaveBeenCalledTimes(5);
+  });
+
+  it("loads the legacy card before a slow startup refresh can poke it", async () => {
+    vi.useFakeTimers();
+    let finish!: (value: ProviderUsage) => void;
+    const slow = { ...binding, agentId: "grok-slow" };
+    const f = fixture(async target => target.agentId === slow.agentId
+      ? new Promise(resolve => { finish = resolve; }) : result(), [binding, slow]);
+    await f.load();
+    const start = f.host.jobs.startAfterAdmission(Promise.resolve());
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(f.card.sendLayout).not.toHaveBeenCalled();
+    finish(result()); await start;
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(f.card.sendLayout).not.toHaveBeenCalled();
+    expect(f.card.editLayout.mock.calls[0]?.[0].id).toBe("legacy");
   });
 
   it("a throwing provider exposes its real cause without affecting another row", async () => {

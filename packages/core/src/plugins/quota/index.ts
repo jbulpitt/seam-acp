@@ -61,7 +61,7 @@ export function createQuotaPlugin(ports: QuotaPorts): Plugin {
       threadId = config.DISCORD_AGENT_QUOTA_THREAD_ID;
       ollamaEnabled = config.OLLAMA_CLOUD_ENABLED;
       poller = new AgentQuotaPoller({ logger: context.logger, registry, sources: createQuotaSources(ports.bindings(), ports.usage),
-        staleRetentionMs: config.QUOTA_STALE_RETENTION_MS, onUpdate: () => card?.poke() });
+        staleRetentionMs: config.QUOTA_STALE_RETENTION_MS, onUpdate: () => { if (ready) card?.poke(); } });
       if (threadId) {
         if (!context.storage) throw new Error("Quota card requires plugin storage.");
         card = new AgentQuotaCard({ logger: context.logger, adapter: ports.card, threadId,

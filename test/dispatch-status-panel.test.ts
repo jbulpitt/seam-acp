@@ -472,6 +472,7 @@ describe("dispatchInjectTurn: status panel ON (default)", () => {
         claim: () => attempt,
         isCurrent: () => true,
         bindStatusCard: () => true,
+        saveStatusCardState: () => {},
         bind: () => true,
         bindRuntime: () => true,
         startPrompt: () => true,

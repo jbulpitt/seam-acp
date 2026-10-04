@@ -6,7 +6,7 @@
  * many per-turn edits made it loop from frame 1. The GIF is now a separate
  * message that is never edited, then deleted on a terminal turn state.
  *
- * Mid-turn bot restart may orphan the message — acceptable.
+ * The attempt stores the message reference for restart recovery.
  */
 import type { StructuredPanel, TurnState } from "./types.js";
 

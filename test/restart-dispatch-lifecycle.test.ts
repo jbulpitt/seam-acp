@@ -40,7 +40,8 @@ function setup() {
     idle: async () => {},
   };
   const router = {
-    listProfiles: () => [], describeConfig: () => ({}),
+    listProfiles: () => [], describeConfig: () => ({ agent: { value: "codex" }, model: { value: "default" },
+      location: { value: "local" }, cwd: { value: "/synthetic" }, effort: { value: null } }),
     ensureSessionRecord: () => ({ ...record }), getProfile: () => undefined,
     adoptRecoveryRuntime: vi.fn(),
     releaseRecoveryRuntime: vi.fn(),
@@ -48,8 +49,8 @@ function setup() {
   };
   const adapter = { sendPanel: async (channel: any) => ({ channel, id: "panel" }),
     sendMessage: vi.fn(async (channel: any, _text?: string) => ({ channel, id: "message" })),
-    editPanel: async () => {}, editMessage: async () => {},
-    editStatusPanelProjection: vi.fn(async () => {}) };
+    editMessage: async () => {},
+    editPanel: vi.fn(async () => {}) };
   const config = { DATA_DIR: dataDir, REPOS_ROOT: "/synthetic", TURN_TIMEOUT_SECONDS: 60,
     SEAM_TURN_RESUME_ENABLED: true,
     DEFAULT_MODEL: "default", SEAM_DISPATCH_STATUS_PANEL: false,
@@ -592,9 +593,9 @@ describe("#250 production dispatch lifecycle (synthetic transport, no providers)
       "recovered wake output",
       expect.anything(),
     );
-    expect(h.adapter.editStatusPanelProjection).toHaveBeenCalledWith(
+    expect(h.adapter.editPanel).toHaveBeenCalledWith(
       { channel: { platform: "discord", id: "worker" }, id: "wake-card" },
-      { state: "Done", action: "end_turn" },
+      expect.objectContaining({ title: expect.stringContaining("Done"), fields: expect.arrayContaining([{ name: "Action", value: "end_turn", inline: true }]) }),
     );
   });
 
@@ -605,7 +606,7 @@ describe("#250 production dispatch lifecycle (synthetic transport, no providers)
     const attempt = h.store.turnAttempts.claim(
       { ...h.spec, id: "dead-wake", kind: "wake", returnTo: undefined },
       executionIdentity({ agentId: "codex", location: "local", session: "live",
-        cwd: "/synthetic", config: "{}" }),
+        model: "default", cwd: "/synthetic", config: "{}" }),
       "controller-before-restart",
       "dispatch",
     );

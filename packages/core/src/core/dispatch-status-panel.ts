@@ -55,6 +55,8 @@ export interface DispatchStatusPanelOptions {
   debounceMs?: number;
   /** How often the elapsed clock ticks while nothing else changes. Default 5000ms. */
   heartbeatMs?: number;
+  observe?: (status: TurnStatus) => void;
+  onError?: (error: unknown) => void;
 }
 
 export class DispatchStatusPanel<TRef = unknown> {
@@ -73,6 +75,7 @@ export class DispatchStatusPanel<TRef = unknown> {
   private started = false;
   private renders = 0;
   private editSucceeded = false;
+  private finishedAt?: number;
 
   constructor(
     private readonly renderer: Renderer,
@@ -108,9 +111,15 @@ export class DispatchStatusPanel<TRef = unknown> {
   /** Post the one panel. Returns true when it is live; false when the post
    *  failed (the panel then no-ops every event). Best-effort — never throws.
    *  A second start does not post again. */
-  async start(): Promise<boolean> {
+  async start(existingRef?: TRef): Promise<boolean> {
     if (this.started) return this.isLive;
     this.started = true;
+    if (existingRef !== undefined) {
+      this.ref = existingRef;
+      this.armHeartbeat();
+      await this.enqueueRender();
+      return true;
+    }
     const viewed = observationFromTurn(this.status);
     this.card.publish(viewed.observation, viewed.contextWindow, Date.now());
     const panel = this.renderPanel();
@@ -123,9 +132,24 @@ export class DispatchStatusPanel<TRef = unknown> {
     }
     if (this.ref === undefined) return false;
     this.card.bind();
-    this.heartbeat = setInterval(() => void this.refresh(), this.opts.heartbeatMs ?? 5000);
-    this.heartbeat.unref?.();
+    this.armHeartbeat();
     return true;
+  }
+
+  private armHeartbeat(): void {
+    this.heartbeat = setInterval(() => this.requestRefresh(), this.opts.heartbeatMs ?? 5000);
+    this.heartbeat.unref?.();
+  }
+
+  private requestRefresh(): void {
+    void this.refresh().catch(error => this.opts.onError?.(error));
+  }
+
+  stop(): void {
+    this.finalized = true;
+    if (this.heartbeat) clearInterval(this.heartbeat);
+    if (this.pending) clearTimeout(this.pending);
+    this.pending = undefined;
   }
 
   /**
@@ -191,7 +215,7 @@ export class DispatchStatusPanel<TRef = unknown> {
         // agent-text / agent-file / mode-changed / config-options / error
         return;
     }
-    void this.refresh();
+    this.requestRefresh();
   }
 
   /**
@@ -199,17 +223,13 @@ export class DispatchStatusPanel<TRef = unknown> {
    * serialized render when that state is actually new. Idempotent — a second
    * call just awaits the queue. Best-effort — never throws.
    */
-  async finalize(state: TurnState, action?: string): Promise<void> {
+  async finalize(state: TurnState, action?: string, finishedAt = Date.now()): Promise<void> {
     if (this.finalized) {
       await this.queue.idle();
       return;
     }
-    this.finalized = true;
-    if (this.heartbeat) clearInterval(this.heartbeat);
-    if (this.pending) {
-      clearTimeout(this.pending);
-      this.pending = undefined;
-    }
+    this.stop();
+    this.finishedAt = finishedAt;
     this.status.setState(state);
     if (action !== undefined) this.status.setAction(action);
     if (this.isLive) await this.enqueueRender();
@@ -241,7 +261,7 @@ export class DispatchStatusPanel<TRef = unknown> {
         const remaining = debounce - (now - this.lastEditAt);
         this.pending = setTimeout(() => {
           this.pending = undefined;
-          void this.refresh();
+          this.requestRefresh();
         }, remaining);
         if (typeof this.pending.unref === "function") this.pending.unref();
       }
@@ -261,9 +281,11 @@ export class DispatchStatusPanel<TRef = unknown> {
     if (ref === undefined) return Promise.resolve();
     return this.queue.run(async () => {
       // Read the latest state when the write runs, including terminal state.
+      this.opts.observe?.(this.status);
       const viewed = observationFromTurn(this.status);
-      this.card.publish(viewed.observation, viewed.contextWindow, Date.now());
-      if (this.card.plan().action === "skip") return;
+      this.card.publish(viewed.observation, viewed.contextWindow, this.finishedAt ?? Date.now());
+      if (!this.lastRendered) this.card.bind();
+      if (this.lastRendered && this.card.plan().action === "skip") return;
       const panel = this.renderPanel();
       const fingerprint = JSON.stringify(panel);
       if (fingerprint === this.lastRendered) {

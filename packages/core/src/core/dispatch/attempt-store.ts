@@ -2,6 +2,7 @@ import type Database from "better-sqlite3";
 import type { SubmissionEvidence } from "../../agents/submission-evidence.js";
 import type { RemoteRecoveryBinding, RemoteRecoveryResult } from "@seam/adapters";
 import type { DispatchResult, DispatchSpec } from "./types.js";
+import type { TurnStatusSnapshot } from "../status-panel.js";
 import { compareExecutionIdentity } from "./execution-identity.js";
 import { deliveryNonce, type DurableDeliveryPayload } from "./delivery-proof.js";
 import { isProcessOwner, processOwner, provenDead, type ProcessOwner } from "./process-owner.js";
@@ -88,6 +89,7 @@ export interface TurnAttempt {
    * generation changes so restart recovery edits the admission artifact
    * instead of posting a second card. */
   statusCard: { channelId: string; messageId: string } | null;
+  statusCardState?: { status: TurnStatusSnapshot; gifMessageId?: string } | null;
   deliveryDone: boolean;
   deliveryProtocol: boolean;
   deliveryNonce: string | null;
@@ -230,6 +232,7 @@ export class TurnAttemptStore {
       "ALTER TABLE turn_attempts ADD COLUMN stall_notice_reason TEXT",
       "ALTER TABLE turn_attempts ADD COLUMN status_card_channel TEXT",
       "ALTER TABLE turn_attempts ADD COLUMN status_card_message TEXT",
+      "ALTER TABLE turn_attempts ADD COLUMN status_card_state_json TEXT",
     ]) {
       try { db.exec(ddl); } catch (err) {
         if (!(err instanceof Error) || !err.message.includes("duplicate column name")) throw err;
@@ -283,7 +286,8 @@ export class TurnAttemptStore {
         delivery_uncertain_reason: string | null;
         stalled_utc: string | null; stalled_reason: string | null;
         stall_notice_utc: string | null; stall_notice_reason: string | null;
-        status_card_channel: string | null; status_card_message: string | null } | undefined;
+        status_card_channel: string | null; status_card_message: string | null;
+        status_card_state_json: string | null } | undefined;
     const runtime = row?.runtime_json ? JSON.parse(row.runtime_json) : null;
     // Remote runtimes can have telemetry but no local process owner. Recognize
     // only that new exact shape; do not turn malformed legacy ownership into
@@ -305,6 +309,7 @@ export class TurnAttemptStore {
       statusCard: row.status_card_channel && row.status_card_message
         ? { channelId: row.status_card_channel, messageId: row.status_card_message }
         : null,
+      statusCardState: row.status_card_state_json ? JSON.parse(row.status_card_state_json) : null,
       deliveryDone: row.delivery_done === 1,
       deliveryProtocol: row.delivery_protocol === 1,
       deliveryNonce: row.delivery_nonce,
@@ -429,6 +434,14 @@ export class TurnAttemptStore {
       .run(ref.channelId, ref.messageId, a.id, a.generation, a.ownerBoot).changes;
     if (n !== 1) throw this.notCurrent(a, "status card");
     a.statusCard = { ...ref };
+  }
+
+  saveStatusCardState(a: TurnAttempt, status: TurnStatusSnapshot, gifMessageId?: string): void {
+    const gifId = gifMessageId ?? this.get(a.id)?.statusCardState?.gifMessageId;
+    const state = { status, ...(gifId ? { gifMessageId: gifId } : {}) };
+    this.db.prepare(`UPDATE turn_attempts SET status_card_state_json=?
+      WHERE id=? AND generation=? AND owner_boot=? AND status_card_message IS NOT NULL`)
+      .run(JSON.stringify(state), a.id, a.generation, a.ownerBoot);
   }
 
   bindRuntime(a: TurnAttempt, pid: number | undefined, providerIdentity?: string): void {

@@ -1,4 +1,4 @@
-import type { SessionRecord, StructuredLayout, StructuredPanel, TurnState } from "../core/types.js";
+import type { SessionRecord, StructuredLayout, StructuredPanel } from "../core/types.js";
 import type { MessagePage, MessagePageRequest } from "../core/message-reader.js";
 
 /** Reference to a channel or thread on a chat platform. */
@@ -187,13 +187,6 @@ export interface ChatAdapter {
 
   /** Optional: edit a previously-sent panel. */
   editPanel?(message: MessageRef, panel: StructuredPanel): Promise<void>;
-
-  /** Project a durable terminal attempt outcome onto an existing status card
-   * without reconstructing the in-memory TurnStatus that created it. */
-  editStatusPanelProjection?(
-    message: MessageRef,
-    projection: { state: TurnState; action: string }
-  ): Promise<void>;
 
   /**
    * Optional: persistent component interactions (classic buttons / modals)

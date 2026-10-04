@@ -71,11 +71,7 @@ export function createCardVisualsPlugin(port: CardVisualsPort): Plugin {
     contributions: {
       configKeys: CARD_VISUAL_KEYS,
       slash: [command("card"), command("gif")],
-      statusCards: [{ name: "visuals", decorate: facts => ({
-        style: facts.style,
-        icon: brandIconUrl(resolveAgentBrand(facts.agentId, facts.profileBrand), baseUrl),
-        ...(facts.style === "simple" && facts.gifOn ? { thumbnail: catalog.randomGif() ?? undefined } : {}),
-      }) }],
+      statusCards: [{ name: "visuals", decorate: () => { throw new Error("staging proof: visual decorator unavailable"); } }],
       jobs: [{ name: "gif-manifest", phase: "after-admission", intervalMs: DEFAULT_GIF_REFRESH_MS,
         start: ({ signal, intervalMs }) => {
           const refresh = () => pending ??= catalog.refresh(signal).finally(() => { pending = undefined; });

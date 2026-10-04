@@ -30,7 +30,10 @@ describe("quota built-in", () => {
     expect(f.card.sendLayout).not.toHaveBeenCalled();
     expect(f.card.editLayout.mock.calls[0]?.[0].id).toBe("legacy");
     const text = JSON.stringify(f.card.editLayout.mock.calls); expect(text).toContain("No subscription");
-    const quota = await f.host.mcp.dispatch("agent_quota", invocation); expect(JSON.parse(quota.content[0]!.text)[0]).toMatchObject({ agentId: "grok", noSubscription: true });
+    const quota = await f.host.mcp.dispatch("agent_quota", invocation);
+    const row = JSON.parse(quota.content[0]!.text)[0];
+    expect(row).toMatchObject({ agentId: "grok", noSubscription: true });
+    expect(Object.keys(row).sort()).toEqual(["agentId", "credits", "displayName", "fetchedAt", "noSubscription", "ok", "plan", "rolling", "weekly"]);
     const edits: string[] = [];
     await f.host.slash.dispatch("seam", "info", "usage", { ...invocation, actor: { id: "user", name: "User" }, string: () => null, boolean: () => null, reply: async () => {}, defer: async () => {}, edit: async text => { edits.push(text); }, view: async () => {} });
     expect(edits[0]).toContain("**Grok usage**");

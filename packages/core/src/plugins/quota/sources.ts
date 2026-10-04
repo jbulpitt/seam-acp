@@ -3,20 +3,23 @@ import type { UsageBinding, UsageProviderPort } from "../../core/quota/usage-pro
 import { mapAgyQuota, mapClaudeQuota, mapCodexQuota, mapCopilotQuota, mapGrokQuota, mapOllamaCloudQuota, mapUnavailableQuota } from "../../core/quota/agent-quota.js";
 
 export function createQuotaSources(bindings: readonly Readonly<UsageBinding>[], usage: UsageProviderPort): AgentQuotaSource[] {
-  return bindings.map(binding => ({
-    agentId: binding.agentId, displayName: binding.displayName,
-    eventDriven: binding.provider === "codex" || binding.provider === "grok",
-    fetch: async (signal, active) => {
-      if (!binding.quotaAvailable) return mapUnavailableQuota(binding, "This agent does not expose quota data");
-      const result = await usage.readUsage(active ?? binding, signal);
-      switch (result.provider) {
-        case "agy": return mapAgyQuota(binding, result.data);
-        case "claude": return mapClaudeQuota(binding, result.data);
-        case "codex": return mapCodexQuota(binding, result.data);
-        case "copilot": return mapCopilotQuota(binding, result.data);
-        case "grok": return mapGrokQuota(binding, result.data);
-        case "ollama-cloud": return mapOllamaCloudQuota(binding, result.data);
-      }
-    },
-  }));
+  return bindings.map(binding => {
+    const identity = { agentId: binding.agentId, displayName: binding.displayName };
+    return {
+      agentId: identity.agentId, displayName: identity.displayName,
+      eventDriven: binding.provider === "codex" || binding.provider === "grok",
+      fetch: async (signal, active) => {
+        if (!binding.quotaAvailable) return mapUnavailableQuota(identity, "This agent does not expose quota data");
+        const result = await usage.readUsage(active ?? binding, signal);
+        switch (result.provider) {
+          case "agy": return mapAgyQuota(identity, result.data);
+          case "claude": return mapClaudeQuota(identity, result.data);
+          case "codex": return mapCodexQuota(identity, result.data);
+          case "copilot": return mapCopilotQuota(identity, result.data);
+          case "grok": return mapGrokQuota(identity, result.data);
+          case "ollama-cloud": return mapOllamaCloudQuota(identity, result.data);
+        }
+      },
+    };
+  });
 }

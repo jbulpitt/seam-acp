@@ -9,6 +9,7 @@ export interface McpInvocation {
 export interface PluginToolResult {
   content: Array<{ type: "text"; text: string }>;
   isError?: boolean;
+  structuredContent?: unknown;
 }
 export interface McpContribution {
   descriptor: { name: string; description: string; inputSchema: Record<string, unknown> };
@@ -50,5 +51,6 @@ export class McpRegistry {
       throw err;
     }
   }
+  remove(plugin: string): void { for (const [name, entry] of this.entries) if (entry.plugin === plugin) this.entries.delete(name); }
   clear(): void { this.entries.clear(); }
 }

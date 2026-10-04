@@ -1,7 +1,7 @@
 import fs from "node:fs";
-import path from "node:path";
 import type { Logger } from "../lib/logger.js";
 import type { ChatAdapter, MessageRef } from "../platforms/chat-adapter.js";
+export type ServiceStatusCardTransport = Pick<ChatAdapter, "sendLayout" | "editLayout" | "sendPanel" | "editPanel" | "pinMessage" | "deleteMessage" | "bumpThread">;
 import type { LayoutBlock, PanelButton, StructuredLayout, StructuredPanel } from "./types.js";
 import { statusRank } from "./service-status/severity.js";
 import type {
@@ -10,7 +10,6 @@ import type {
   ServiceStatusSourceDefinition,
 } from "./service-status/types.js";
 
-const STATE_FILE = "service-status-card.json";
 const DEBOUNCE_MS = 500;
 const ROW_LIMIT = 760;
 const PANEL_TOTAL_LIMIT = 6_000;
@@ -201,8 +200,8 @@ export function renderServiceStatusPanel(
 
 export class ServiceStatusCard {
   private readonly logger: Logger;
-  private readonly adapter: ChatAdapter;
-  private readonly dataDir: string;
+  private readonly adapter: ServiceStatusCardTransport;
+  private readonly stateFile: string;
   private readonly collect: () => ServiceStatusSnapshot[];
   private readonly sources: readonly ServiceStatusSourceDefinition[];
   private readonly now: () => number;
@@ -210,23 +209,24 @@ export class ServiceStatusCard {
   private message?: MessageRef;
   private debounce?: ReturnType<typeof setTimeout>;
   private inFlight = false;
+  private pending?: Promise<void>;
   private dirty = false;
   private stopped = true;
   private pinned = false;
   private lastBumpAt = 0;
 
   constructor(opts: {
-    logger: Logger;
-    adapter: ChatAdapter;
+    logger: Pick<Logger, "child">;
+    adapter: ServiceStatusCardTransport;
     threadId: string;
-    dataDir: string;
+    stateFile: string;
     collect: () => ServiceStatusSnapshot[];
     sources: readonly ServiceStatusSourceDefinition[];
     now?: () => number;
   }) {
     this.logger = opts.logger.child({ comp: "service-status-card" });
     this.adapter = opts.adapter;
-    this.dataDir = opts.dataDir;
+    this.stateFile = opts.stateFile;
     this.collect = opts.collect;
     this.sources = opts.sources;
     this.now = opts.now ?? Date.now;
@@ -246,6 +246,8 @@ export class ServiceStatusCard {
     this.dirty = false;
   }
 
+  async drain(): Promise<void> { if (this.pending) await Promise.allSettled([this.pending]); }
+
   poke(): void {
     if (this.stopped) return;
     if (this.debounce) clearTimeout(this.debounce);
@@ -264,7 +266,8 @@ export class ServiceStatusCard {
     }
     this.inFlight = true;
     try {
-      await this.push();
+      this.pending = this.push();
+      await this.pending;
     } catch (err) {
       this.logger.warn({ err }, "service status card refresh failed");
     } finally {
@@ -363,7 +366,7 @@ export class ServiceStatusCard {
   }
 
   private statePath(): string {
-    return path.join(this.dataDir, STATE_FILE);
+    return this.stateFile;
   }
 
   private loadState(): void {

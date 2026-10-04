@@ -103,5 +103,4 @@ asking at once cost one upstream fetch, not several.
   id is a clear validation error naming the registered ids, never an empty
   result.
 - Every list is explicitly bounded, so output stays small enough to reason over.
-- If a deployment has the subsystem disabled, both tools answer
-  "not enabled on this deployment" rather than failing silently.
+- If a deployment has the subsystem disabled, neither tool is advertised.

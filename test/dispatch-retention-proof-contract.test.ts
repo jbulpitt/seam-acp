@@ -125,8 +125,9 @@ describe("#316 corrected deletion contract", () => {
       const index = await readFile(new URL("../packages/core/src/index.ts", import.meta.url), "utf8");
       // Protects actual composition ordering, not merely the isolated watcher's capability.
       expect(index.indexOf("doneRetention.start();")).toBeGreaterThan(index.indexOf("await dispatchWatcher.start({ waitForInitialDispatches: false });"));
-      expect(index.indexOf("await dispatchWatcher.admissionReleased();")).toBeGreaterThan(0);
-      expect(index.indexOf("doneRetention.start();")).toBeGreaterThan(index.indexOf("await dispatchWatcher.admissionReleased();"));
+      const admission = "await plugins.jobs.startAfterAdmission(dispatchWatcher.admissionReleased());";
+      expect(index.indexOf(admission)).toBeGreaterThan(0);
+      expect(index.indexOf("doneRetention.start();")).toBeGreaterThan(index.indexOf(admission));
     } finally { release(); await started; manager.stop(); await manager.drain(); watcher.stop(); await watcher.drain(); }
   });
 });

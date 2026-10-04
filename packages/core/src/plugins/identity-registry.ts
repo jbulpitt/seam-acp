@@ -47,5 +47,6 @@ export class IdentityRegistry {
     return running;
   }
   async drain(): Promise<void> { await Promise.all(this.pending.values()); }
+  remove(plugin: string): void { for (let i = this.entries.length - 1; i >= 0; i--) if (this.entries[i]!.plugin === plugin) this.entries.splice(i, 1); }
   clear(): void { this.entries.length = 0; }
 }

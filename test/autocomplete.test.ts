@@ -22,6 +22,8 @@ import {
 } from "../packages/core/src/platforms/discord/commands.js";
 import { CHOICE_CUSTOM_ID_PREFIX } from "../packages/core/src/core/choice/types.js";
 import { SERVICE_STATUS_REFRESH_CUSTOM_ID } from "../packages/core/src/core/service-status-card.js";
+import { ComponentRegistry } from "../packages/core/src/plugins/component-registry.js";
+import { createServiceStatusPlugin } from "../packages/core/src/plugins/service-status/index.js";
 
 describe("AutocompleteRegistry", () => {
   it("keys responders by (group, subcommand, optionName)", async () => {
@@ -349,9 +351,12 @@ describe("classifyDiscordInteraction — autocomplete is a parallel branch", () 
   });
 
   it("service status Refresh routes to the persistent-component handler", () => {
+    const components = new ComponentRegistry({ error: () => {} } as never);
+    components.register("service-status", createServiceStatusPlugin({}).plugin.contributions.components!, { logger: {} as never, config: undefined });
     expect(
-      classifyDiscordInteraction(flags({ button: true, customId: SERVICE_STATUS_REFRESH_CUSTOM_ID }))
-    ).toBe("config-edit");
+      classifyDiscordInteraction(flags({ button: true, customId: SERVICE_STATUS_REFRESH_CUSTOM_ID }), components)
+    ).toBe("plugin-component");
+    expect(classifyDiscordInteraction(flags({ button: true, customId: SERVICE_STATUS_REFRESH_CUSTOM_ID }))).toBe("none");
   });
 
   it("choice cards still route to choice", () => {

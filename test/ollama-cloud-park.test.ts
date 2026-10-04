@@ -200,7 +200,8 @@ describe("#220 registration gate", () => {
     );
     expect(mcp).not.toMatch(/third-party Ollama probe/);
     const indexSrc = fs.readFileSync(path.join(repoRoot, "packages/core/src/index.ts"), "utf8");
-    expect(indexSrc).toContain("shouldIncludeLinkworksOllamaSource");
+    const pluginSrc = fs.readFileSync(path.join(repoRoot, "packages/core/src/plugins/service-status/index.ts"), "utf8");
+    expect(pluginSrc).toContain("shouldIncludeLinkworksOllamaSource(config.OLLAMA_CLOUD_ENABLED)");
     expect(indexSrc).toContain("ollamaCloudEnabled: config.OLLAMA_CLOUD_ENABLED");
   });
 

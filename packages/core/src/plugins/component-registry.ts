@@ -43,5 +43,6 @@ export class ComponentRegistry {
     }
     return true;
   }
+  remove(plugin: string): void { for (let i = this.entries.length - 1; i >= 0; i--) if (this.entries[i]!.plugin === plugin) this.entries.splice(i, 1); }
   clear(): void { this.entries.length = 0; }
 }

@@ -57,6 +57,11 @@ export class FenceRegistry {
     while (this.pending.size) await Promise.allSettled([...this.pending]);
   }
 
+  remove(plugin: string): void {
+    for (const [tag, entry] of this.tags) if (entry.plugin === plugin) this.tags.delete(tag);
+    for (let i = this.entries.length - 1; i >= 0; i--) if (this.entries[i]!.plugin === plugin) this.entries.splice(i, 1);
+  }
+
   clear(): void {
     this.tags.clear();
     this.entries.length = 0;

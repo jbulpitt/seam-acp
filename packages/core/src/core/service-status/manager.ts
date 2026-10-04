@@ -177,6 +177,7 @@ export class ServiceStatusRefreshManager {
   private timerHandle: unknown = undefined;
   private timerDueAtMs: number | null = null;
   private readonly inflight = new Map<string, Flight>();
+  private readonly pending = new Set<Promise<unknown>>();
   private readonly backoff = new Map<string, BackoffState>();
   private readonly lastForcedAtMs = new Map<string, number>();
   /**
@@ -248,6 +249,16 @@ export class ServiceStatusRefreshManager {
       // timeout behind.
       this.retireFlight(flight, "manager stopped");
     }
+  }
+
+  async drain(): Promise<void> {
+    while (this.pending.size) await Promise.allSettled([...this.pending]);
+  }
+
+  private track<T>(work: Promise<T>): Promise<T> {
+    this.pending.add(work);
+    void work.then(() => this.pending.delete(work), () => this.pending.delete(work));
+    return work;
   }
 
   /** Refresh every eligible source. One source failing never blocks another. */
@@ -334,7 +345,7 @@ export class ServiceStatusRefreshManager {
 
     // Detached on purpose: `run` never rejects, and callers wait on the
     // flight's deferred so that `stop()` can settle them independently.
-    void this.run(definition, flight);
+    void this.track(this.run(definition, flight));
     return promise;
   }
 
@@ -465,11 +476,11 @@ export class ServiceStatusRefreshManager {
     definition: ServiceStatusSourceDefinition,
     flight: Flight
   ): Promise<Awaited<ReturnType<ServiceStatusSourceDefinition["fetch"]>>> {
-    const attempt = definition.fetch({
+    const attempt = this.track(definition.fetch({
       now: this.now,
       signal: flight.controller.signal,
       fetchImpl: this.config.fetchImpl,
-    });
+    }));
     // Once the race is lost the adapter promise has no consumer, so its late
     // rejection is swallowed here rather than surfacing as an unhandled one.
     attempt.catch(() => {});

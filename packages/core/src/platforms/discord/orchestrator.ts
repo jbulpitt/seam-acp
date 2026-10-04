@@ -459,8 +459,6 @@ import { buildSeamHelpPages } from "./help-text.js";
 import { frameSteerPrompt, frameInterruptPrompt } from "../../core/steer.js";
 import { formatLocalTime } from "../../core/format-time.js";
 import { formatCoarseDuration } from "../../core/server-status.js";
-import type { RefreshResult } from "../../core/service-status/manager.js";
-import { SERVICE_STATUS_REFRESH_CUSTOM_ID } from "../../core/service-status-card.js";
 import { humanInboxFrom, scrubDiscordUrls } from "../../core/human-inject.js";
 import {
   TurnStatus,
@@ -1013,7 +1011,6 @@ export class Orchestrator {
   private readonly modelCatalog: ModelCatalogService;
   private readonly refreshModelIntelligence?: (forceSources: boolean) => Promise<ModelIntelligenceRefreshResult>;
   /** Installed by index.ts only while the upstream-status subsystem is active. */
-  private serviceStatusRefresh?: () => Promise<RefreshResult>;
   /** Installed by index.ts only when the staging test driver is configured. */
   private canaryRunner?: (target: CanaryTarget) => Promise<CanaryRunResult>;
   /** Injected only by deterministic restart tests; production uses detached PM2. */
@@ -1914,7 +1911,6 @@ export class Orchestrator {
       ["seam-tts:", (evt: ComponentEvent) => this.handleTtsEditorComponent(evt)],
       ["tvc:", (evt: ComponentEvent) => this.runVoiceConsoleComponent(evt)],
       ["seam-quota:", (evt: ComponentEvent) => this.handleQuotaCardComponent(evt)],
-      ["seam-service-status:", (evt: ComponentEvent) => this.handleServiceStatusCardComponent(evt)],
     ].map(([namespace, handle]) => ({ namespace: namespace as string, handle: handle as (evt: ComponentEvent) => Promise<void>, types: ["button", "select", "modal"] as const, lifetime: "persistent" as const, access: "read-only" as const, authorization: "user" as const })), context);
     this.plugins.components.register("kernel-actions", [
       { namespace: "seam-perm:", types: ["button"], lifetime: "persistent", access: "read-only", authorization: "user",
@@ -7275,10 +7271,6 @@ export class Orchestrator {
     this.onParkedChange = fn;
   }
 
-  setServiceStatusRefresh(refresh: (() => Promise<RefreshResult>) | undefined): void {
-    this.serviceStatusRefresh = refresh;
-  }
-
   async createCanaryThread(
     parentChannelId: string,
     host: string,
@@ -8295,50 +8287,6 @@ export class Orchestrator {
     }
   }
 
-  /** Manual refresh on the pinned upstream-status card. */
-  private async handleServiceStatusCardComponent(evt: ComponentEvent): Promise<void> {
-    if (evt.customId !== SERVICE_STATUS_REFRESH_CUSTOM_ID) return;
-    if (
-      !this.config.DISCORD_SERVICE_STATUS_THREAD_ID ||
-      evt.channel.id !== this.config.DISCORD_SERVICE_STATUS_THREAD_ID
-    ) {
-      await evt.replyEphemeral("This service-status control is not active in this thread.");
-      return;
-    }
-    const refresh = this.serviceStatusRefresh;
-    if (!refresh) {
-      await evt.replyEphemeral("Service-status refresh is unavailable during startup or shutdown.");
-      return;
-    }
-
-    await evt.replyEphemeral("Refreshing upstream service status…");
-    try {
-      const result = await refresh();
-      const attempted = result.sources.filter((source) => source.attempted).length;
-      const failed = result.sources.filter((source) => source.succeeded === false).length;
-      const rateLimited = result.sources.filter(
-        (source) => source.disposition === "rate_limited"
-      ).length;
-      let message: string;
-      if (attempted === 0 && rateLimited > 0) {
-        message = "Refresh is cooling down; no upstream source was fetched again.";
-      } else if (result.outcome === "succeeded") {
-        message = `Service status refreshed (${String(attempted)} sources).`;
-      } else if (result.outcome === "mixed") {
-        message = `Service status refreshed with ${String(failed)} source failure${failed === 1 ? "" : "s"}.`;
-      } else if (result.outcome === "failed") {
-        message = "Service-status refresh failed; the card is retaining its last known good provider data.";
-      } else {
-        message = "No service-status source was eligible to refresh yet.";
-      }
-      await evt.editReplyEphemeral(message);
-    } catch (err) {
-      this.logger.warn({ err }, "manual service status refresh failed");
-      await evt
-        .editReplyEphemeral("Service-status refresh failed; cached provider data is unchanged.")
-        .catch(() => evt.followUpEphemeral("Service-status refresh failed; cached provider data is unchanged."));
-    }
-  }
 
   private async handleVoiceConsoleComponent(evt: ComponentEvent): Promise<void> {
     if (!evt.customId.startsWith("tvc:")) return;

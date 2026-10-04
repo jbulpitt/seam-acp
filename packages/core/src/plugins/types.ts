@@ -4,12 +4,15 @@ import type { SlashContribution } from "./slash-registry.js";
 import type { McpContribution } from "./mcp-registry.js";
 import type { ComponentContribution } from "./component-registry.js";
 import type { IdentityContribution } from "./identity-registry.js";
+import type { PluginStorage } from "./storage.js";
+import type { JobContribution } from "./job-registry.js";
 
 export const PLUGIN_API_VERSION = 1;
 
 export interface PluginContext {
-  logger: Pick<Logger, "info" | "warn" | "error">;
+  logger: Pick<Logger, "info" | "warn" | "error" | "child">;
   config: unknown;
+  storage?: PluginStorage;
 }
 
 export interface FenceOutput {
@@ -46,6 +49,7 @@ export interface Plugin {
     mcp?: readonly McpContribution[];
     components?: readonly ComponentContribution[];
     identity?: readonly IdentityContribution[];
+    jobs?: readonly JobContribution[];
   };
 }
 

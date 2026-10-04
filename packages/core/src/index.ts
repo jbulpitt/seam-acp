@@ -49,7 +49,6 @@ import { DELEGATION_TERMINAL_STATUSES } from "./core/types.js";
 import { SessionRouter } from "./core/session-router.js";
 import { turnStalenessBoundMs } from "./core/turn-watchdog.js";
 import {
-  shouldIncludeLinkworksOllamaSource,
   shouldRegisterOllamaCloud,
 } from "./core/parked-agents.js";
 import { makeCopilotProfile } from "@seam/adapters";
@@ -126,14 +125,7 @@ import { visibleModelMetadata, visibleModelRankings, visibleModelValueRows } fro
 import type { AdapterCatalogCandidate, AgentProfile } from "@seam/adapters";
 import { ModelValueRankingsCard } from "./core/model-value/rankings-card.js";
 import { LiveMessageSearch, MessageReader } from "./core/message-reader.js";
-import {
-  createDefaultServiceStatusSources,
-  createServiceStatusMcpView,
-  ServiceStatusMcpView,
-  ServiceStatusRefreshManager,
-  ServiceStatusStore,
-} from "./core/service-status/index.js";
-import { ServiceStatusCard } from "./core/service-status-card.js";
+import type { ServiceStatusMcpView } from "./core/service-status/mcp-view.js";
 import { planAgyIdentityMigration, readAgyHandleOwnership } from "./core/agy-identity-migration.js";
 import { PluginHost } from "./plugins/host.js";
 import { BUILTIN_PLUGINS } from "./plugins/builtins.js";
@@ -141,7 +133,14 @@ import { buildSeamCommand, buildSeamAdminCommand } from "./platforms/discord/com
 
 async function main(): Promise<void> {
   const config = loadConfig();
-  const plugins = new PluginHost(logger, { slash: [buildSeamCommand().toJSON(), buildSeamAdminCommand().toJSON()], mcp: KERNEL_MCP_TOOL_NAMES });
+  const plugins = new PluginHost(logger, {
+    slash: [buildSeamCommand().toJSON(), buildSeamAdminCommand().toJSON()], mcp: KERNEL_MCP_TOOL_NAMES,
+    storageRoot: config.DATA_DIR,
+    storageAliases: { "service-status": {
+      "service-status.sqlite": path.join(config.DATA_DIR, "service-status.sqlite"),
+      "service-status-card.json": path.join(config.DATA_DIR, "service-status-card.json"),
+    } },
+  });
   await plugins.loadBuiltins(BUILTIN_PLUGINS);
   const controllerInstanceId = randomUUID();
   // Thread agent/model choices are saved in the presets file; with none
@@ -552,15 +551,10 @@ async function main(): Promise<void> {
   });
   let seamMcpServer: SeamMcpServer | undefined;
   let bridgeHub: BridgeHub | undefined;
-  let serviceStatusStore: ServiceStatusStore | undefined;
-  let serviceStatusManager: ServiceStatusRefreshManager | undefined;
-  let serviceStatusView: ServiceStatusMcpView | undefined;
-  let serviceStatusCard: ServiceStatusCard | undefined;
-  let stopServiceStatus: (() => void) | undefined;
+  let readServiceStatus: ServiceStatusMcpView["read"] | undefined;
   let stopCatalogBridgeRefresh: (() => void) | undefined;
   let stopPermissionBridgeRecovery: (() => void) | undefined;
   let stopCatalogEnrichmentRefresh: (() => void) | undefined;
-  let serviceStatusSources: ReturnType<typeof createDefaultServiceStatusSources> | undefined;
 
   const registered: AgentProfile[] = [...(copilotEnabled ? [copilot, ...extraCopilots] : []), claude, ...extraClaudes, ...(claudeVertex ? [claudeVertex] : []), ...(agy ? [agy] : []), ...(codex ? [codex] : []), ...(grok ? [grok] : []), ...(zai ? [zai] : []), ...(ollamaCloud ? [ollamaCloud] : [])];
   const profiles: AgentProfile[] = registered;
@@ -727,6 +721,21 @@ async function main(): Promise<void> {
       await orchestrator.handleAutocompleteInteraction(interaction);
     },
   });
+
+  const serviceStatusEnabled = config.SERVICE_STATUS_ENABLED ?? Boolean(config.DISCORD_SERVICE_STATUS_THREAD_ID);
+  if (serviceStatusEnabled) {
+    await plugins.loadBuiltins([{ id: "service-status", load: async () => {
+      const { createServiceStatusPlugin } = await import("./plugins/service-status/index.js");
+      const serviceStatus = createServiceStatusPlugin({
+        sendLayout: adapter.sendLayout.bind(adapter), editLayout: adapter.editLayout.bind(adapter),
+        sendPanel: adapter.sendPanel.bind(adapter), editPanel: adapter.editPanel.bind(adapter),
+        pinMessage: adapter.pinMessage.bind(adapter), deleteMessage: adapter.deleteMessage.bind(adapter),
+        bumpThread: adapter.bumpThread.bind(adapter),
+      });
+      readServiceStatus = serviceStatus.read;
+      return serviceStatus.plugin;
+    } }], { "service-status": config });
+  }
 
   const orchestrator = new Orchestrator({
     logger,
@@ -937,42 +946,11 @@ async function main(): Promise<void> {
   modelCatalog.start();
   modelIntelligenceManager.start();
 
-  // Upstream service-status subsystem (#182). Built here, ahead of the MCP
-  // server, because two independent consumers need it: the pinned Discord card
-  // (#183, constructed further down once the adapter is fully up) and the
-  // seam-MCP tools (#184). Construction opens the database and registers the
-  // static source list; no polling happens until `start()` below, and the card
-  // is optional — enabling the subsystem without a card is what gives an
-  // MCP-only deployment the tools.
-  const serviceStatusEnabled =
-    config.SERVICE_STATUS_ENABLED ?? Boolean(config.DISCORD_SERVICE_STATUS_THREAD_ID);
-  if (serviceStatusEnabled) {
-    const sources = createDefaultServiceStatusSources({
-      includeLinkworksOllama: shouldIncludeLinkworksOllamaSource(config.OLLAMA_CLOUD_ENABLED),
-    });
-    serviceStatusSources = sources;
-    serviceStatusStore = new ServiceStatusStore(
-      path.join(config.DATA_DIR, "service-status.sqlite")
-    );
-    serviceStatusManager = new ServiceStatusRefreshManager({
-      store: serviceStatusStore,
-      sources,
-      logger: logger.child({ mod: "service-status" }),
-      // Read at call time: the card is constructed later, or not at all.
-      onUpdate: () => serviceStatusCard?.poke(),
-    });
-    serviceStatusView = createServiceStatusMcpView({
-      store: serviceStatusStore,
-      manager: serviceStatusManager,
-      sources,
-    });
-  }
-
   const providerStatus = (agentId: string): string | undefined => {
     const sourceId = providerSourceForAgent(agentId);
-    if (!sourceId || !serviceStatusView) return undefined;
+    if (!sourceId || !readServiceStatus) return undefined;
     try {
-      const source = serviceStatusView.read({ sourceIds: [sourceId] }).sources[0];
+      const source = readServiceStatus({ sourceIds: [sourceId] }).sources[0];
       if (!source) return undefined;
       if (source.reportedStatus === "operational" && source.observation.health === "ok") {
         return undefined;
@@ -1163,12 +1141,6 @@ async function main(): Promise<void> {
         const quota = quotaRegistry.get(agentId);
         return quota ? [quota] : [];
       },
-      ...(serviceStatusView
-        ? {
-            readServiceStatus: (options) => serviceStatusView!.read(options),
-            refreshServiceStatus: (options) => serviceStatusView!.refresh(options),
-          }
-        : {}),
       getModelValueRankings: (options, caller) => {
         const current = caller ? router.describeConfig(caller) : undefined;
         return visibleModelRankings(modelCatalog, modelValueStore.getRankings(options), current ? {
@@ -1625,7 +1597,7 @@ async function main(): Promise<void> {
   await dispatchWatcher.start({ waitForInitialDispatches: false });
   // #303: false-wait start returns before recovery. Await admission separately,
   // without waiting for paid turns in initialDispatchesSettled().
-  await dispatchWatcher.admissionReleased();
+  await plugins.jobs.startAfterAdmission(dispatchWatcher.admissionReleased());
   doneRetention.start();
   // Boot-time sweepers can emit visible turns/specs immediately. Start them
   // only after Voice Console recovery and the shared visible-speech hook are
@@ -1743,37 +1715,6 @@ async function main(): Promise<void> {
     );
   }
 
-  // Pinned upstream-status card (#183), an optional consumer of the subsystem
-  // constructed above. The card paints cached/no-data rows before polling
-  // begins; polling itself starts once, below, whether or not a card exists.
-  if (serviceStatusManager && serviceStatusStore && serviceStatusSources) {
-    const statusStore = serviceStatusStore;
-    const statusManager = serviceStatusManager;
-    const sources = serviceStatusSources;
-    if (config.DISCORD_SERVICE_STATUS_THREAD_ID) {
-      serviceStatusCard = new ServiceStatusCard({
-        logger,
-        adapter,
-        threadId: config.DISCORD_SERVICE_STATUS_THREAD_ID,
-        dataDir: config.DATA_DIR,
-        sources,
-        collect: () => {
-          const allowed = new Set(sources.map((source) => source.id));
-          return statusStore.listSnapshots().filter((snap) => allowed.has(snap.sourceId));
-        },
-      });
-      orchestrator.setServiceStatusRefresh(() => statusManager.refresh({ force: true }));
-      await serviceStatusCard.start().catch((err) =>
-        logger.warn({ err }, "service status card failed to start")
-      );
-    }
-    stopServiceStatus = () => {
-      orchestrator.setServiceStatusRefresh(undefined);
-      statusManager.stop();
-      serviceStatusCard?.stop();
-    };
-    statusManager.start();
-  }
 
   // One editable server-status card (uptime / turns / bridges). Posts once,
   // then edits in place — 30s tick + immediate bump on bridge connect/drop.
@@ -1910,7 +1851,7 @@ async function main(): Promise<void> {
     stopQuotaCard?.();
     stopRankingsCard?.();
     stopStatusCard?.();
-    stopServiceStatus?.();
+    plugins.jobs.stop();
     scheduledManager.stop();
     doneRetention.stop();
     wakeManager.stop();
@@ -1975,6 +1916,7 @@ async function main(): Promise<void> {
           watch: watchManager,
           parked: parkedManager,
           modelIntelligence: modelIntelligenceManager,
+          plugins: plugins.jobs,
         },
         (label, work) => bounded(label, config.SHUTDOWN_QUIESCE_TIMEOUT_MS, work)
       ))
@@ -2105,11 +2047,6 @@ async function main(): Promise<void> {
         }
         try {
           modelCatalogStore.close();
-        } catch {
-          /* ignore */
-        }
-        try {
-          serviceStatusStore?.close();
         } catch {
           /* ignore */
         }

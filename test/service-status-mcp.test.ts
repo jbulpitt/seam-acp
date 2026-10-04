@@ -8,6 +8,8 @@ import { ServiceStatusRefreshManager } from "../packages/core/src/core/service-s
 import { createServiceStatusMcpView } from "../packages/core/src/core/service-status/mcp-view.js";
 import { createDefaultServiceStatusSources } from "../packages/core/src/core/service-status/sources/registry.js";
 import { SeamMcpServer } from "../packages/core/src/core/mcp/seam-mcp-server.js";
+import { PluginHost } from "../packages/core/src/plugins/host.js";
+import { serviceStatusMcp } from "../packages/core/src/plugins/service-status/mcp.js";
 import type { SessionRecord } from "../packages/core/src/core/types.js";
 import type {
   ServiceStatusAdapterResult,
@@ -445,11 +447,17 @@ describe("service-status MCP tools", () => {
     deps: Record<string, unknown>,
     run: (call: (name: string, args?: unknown) => Promise<any>) => Promise<void>
   ): Promise<void> {
+    const plugins = new PluginHost(logger);
+    if (deps.readServiceStatus || deps.refreshServiceStatus) await plugins.loadBuiltins([{
+      id: "service-status", load: async () => ({ id: "service-status", builtin: true, apiVersion: 1, contributions: {
+        mcp: serviceStatusMcp(() => ({ read: deps.readServiceStatus, refresh: deps.refreshServiceStatus }) as never),
+      } }),
+    }]);
     const server = new SeamMcpServer({
       logger,
       resolveSession: (token) => (token === "ok" ? ({} as SessionRecord) : undefined),
       enqueueDispatch: async () => undefined,
-      ...deps,
+      pluginTools: plugins.mcp,
     } as never);
     await server.start();
     try {
@@ -466,6 +474,7 @@ describe("service-status MCP tools", () => {
       await run(call);
     } finally {
       await server.stop();
+      await plugins.dispose();
     }
   }
 
@@ -591,12 +600,13 @@ describe("service-status MCP tools", () => {
     );
   });
 
-  it("reports both tools as unsupported when the subsystem is disabled", async () => {
+  it("does not advertise or mount either tool when the plugin is disabled", async () => {
     await withServer({}, async (call) => {
+      const listed = await call("tools/list");
+      expect(listed.result.tools.map((tool: { name: string }) => tool.name)).not.toContain("service_status");
       for (const name of ["service_status", "service_status_refresh"]) {
         const body = await call("tools/call", { name, arguments: {} });
-        expect(body.result.isError).toBe(true);
-        expect(body.result.content[0].text).toMatch(/not enabled on this deployment/);
+        expect(body.error.message).toMatch(/Unknown tool/i);
       }
     });
   });

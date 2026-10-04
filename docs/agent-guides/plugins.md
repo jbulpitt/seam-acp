@@ -2,7 +2,7 @@
 
 The controller loads `plugins/builtins.ts` in order, independently of Seam MCP.
 Only known built-ins are loaded. The controller also installs thread naming
-through a controller-only capability bootstrap.
+and optional service status through controller-only capability bootstraps.
 
 A descriptor declares its id, API version, built-in/internal eligibility,
 optional config validation and activate/dispose hooks, and contributions.
@@ -64,6 +64,22 @@ internal facades read exact prefix boundaries, write `namePrefix`, project
 session identities and read/save `thread-namer.json`. Ordinary session upserts
 preserve the stored prefix. No plugin receives a store or router.
 
-Storage, repository, job, HTTP, attempt and bridge contributions are not public
-surfaces. Attachment, wake, watch, choice and result fences retain their kernel
-handlers.
+## Maintenance jobs and storage
+
+Maintenance jobs declare a name, base interval and `after-admission` phase.
+The contribution owns its timer/cadence; the host supplies an `AbortSignal`,
+starts it after dispatch admission, and stops/drains it in the manager barrier.
+A failed start unpublishes only that plugin. These jobs cannot request turns;
+durable wakes, watches and schedules remain in the kernel.
+
+Storage paths are bound to the plugin namespace. Host-assigned aliases may
+retain legacy files; plugins cannot choose aliases or another namespace.
+Service status keeps `service-status.sqlite` and `service-status-card.json`
+unchanged, including history and the pinned message. It owns the source list,
+adaptive poller, Refresh component and both MCP tools. Its only internal facade
+is the card transport; the kernel receives a cache-only read for canary diagnostics.
+`SERVICE_STATUS_ENABLED` and `DISCORD_SERVICE_STATUS_THREAD_ID` keep their
+existing precedence. MCP still mounts only with `SEAM_MCP_ENABLED`.
+
+Repository, HTTP, attempt and bridge contributions are not public surfaces.
+Attachment, wake, watch, choice and result fences retain their kernel handlers.

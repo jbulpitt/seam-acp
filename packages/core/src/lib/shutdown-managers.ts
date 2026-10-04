@@ -20,6 +20,7 @@ export interface StoreWritingManagers {
   /** Legacy embedder compatibility; production #249 uses modelIntelligence. */
   modelMetadata?: DrainableManager;
   modelValue?: DrainableManager;
+  plugins?: DrainableManager;
 }
 
 export const MANAGER_CALLBACKS_STAGE = "manager-callbacks";
@@ -45,6 +46,7 @@ export async function drainStoreWritingManagers(
       managers.wake.drain(),
       managers.watch.drain(),
       managers.parked.drain(),
+      managers.plugins?.drain() ?? Promise.resolve(),
       managers.modelMetadata?.drain().then(() => {
         metadataOk = true;
       }) ?? Promise.resolve(),

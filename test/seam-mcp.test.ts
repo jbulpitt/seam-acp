@@ -449,8 +449,6 @@ describe("SeamMcpServer", () => {
       "schedule_wake",
       "search_messages",
       "send",
-      "service_status",
-      "service_status_refresh",
       "steer",
       "submit_result",
       "tester_interact",
@@ -1369,10 +1367,8 @@ describe("SeamMcpServer", () => {
     h = await makeHarness();
     const { body } = await h.call("tools/list", undefined, { "X-Seam-Session": "good-token" });
     const byName = new Map(body.result.tools.map((t: any) => [t.name, t]));
-    // Adding an OPTION to handoff does NOT change the tool count; inspect_image
-    // plus the standalone capabilities — inspect_image, model metadata (2),
-    // model_value_rankings, thread controls, and message search/read bring the catalog to 34.
-    expect(body.result.tools).toHaveLength(40);
+    // Options do not add tools; service status is supplied by its plugin.
+    expect(body.result.tools).toHaveLength(38);
     expect(byName.get("handoff").inputSchema.properties.watchFeedback.type).toBe("boolean");
   });
 
@@ -2579,8 +2575,8 @@ describe("SeamMcpServer", () => {
   it("send advertises interrupt + fresh in its input schema without changing the tool count (#67)", async () => {
     h = await makeHarness();
     const { body } = await h.call("tools/list", undefined, { "X-Seam-Session": "good-token" });
-    // Params on `send` must NOT add a tool — the set stays at 34.
-    expect(body.result.tools).toHaveLength(40);
+    // Params on `send` must not add a tool.
+    expect(body.result.tools).toHaveLength(38);
     const byName = new Map(body.result.tools.map((t: any) => [t.name, t]));
     expect(byName.get("send").inputSchema.properties.interrupt.type).toBe("boolean");
     expect(byName.get("send").inputSchema.properties.fresh.type).toBe("boolean");

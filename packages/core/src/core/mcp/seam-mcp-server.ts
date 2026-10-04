@@ -54,12 +54,6 @@ import type {
 } from "../thread-session-control.js";
 import type { ModelValueRankingsResult } from "../model-value/types.js";
 import type {
-  ServiceStatusReadOptions,
-  ServiceStatusReadResult,
-  ServiceStatusRefreshOptions,
-  ServiceStatusRefreshResult,
-} from "../service-status/mcp-view.js";
-import type {
   ModelMetadataGetResult,
   ModelMetadataQuery,
   ModelMetadataQueryResult,
@@ -265,20 +259,6 @@ export interface SeamMcpServerDeps {
     tier?: string;
     benchmark?: string;
   }, caller?: SessionRecord) => ModelValueRankingsResult;
-  /**
-   * Read the durable upstream service-status snapshot (#184). Cache only: it
-   * performs no network work. Undefined ⇒ the service-status subsystem is not
-   * enabled on this deployment.
-   */
-  readServiceStatus?: (options: ServiceStatusReadOptions) => ServiceStatusReadResult;
-  /**
-   * Run a bounded live refresh of the registered service-status sources (#184)
-   * and await the real attempts. The manager's per-source single-flight and
-   * forced-refresh cooldown apply. Undefined ⇒ subsystem not enabled.
-   */
-  refreshServiceStatus?: (
-    options: ServiceStatusRefreshOptions
-  ) => Promise<ServiceStatusRefreshResult>;
   /** Read one model from the durable metadata cache. Never performs live I/O. */
   getModelMetadata?: (idOrSlug: string) => ModelMetadataGetResult;
   /** Query the durable metadata cache. Never performs live I/O. */
@@ -866,81 +846,6 @@ const TOOLS = [
         agentId: {
           type: "string",
           description: "Optional configured agent id. Omit to return every agent.",
-        },
-      },
-      required: [],
-    },
-  },
-  {
-    name: "service_status",
-    description:
-      "Read the cached upstream status of the services Seam depends on (GitHub, Claude, OpenAI, xAI, " +
-      "Google AI Studio, Google Cloud). Cache only — this tool performs " +
-      "no network work and returns immediately. Each source reports `reportedStatus` (what the provider " +
-      "said) separately from `observation.health` (whether Seam can currently reach it), so a stale or " +
-      "failing poll is never mistaken for a provider outage. Use this first when an agent call fails and " +
-      "you suspect an upstream problem; use service_status_refresh only if the cached data is too old.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        sourceIds: {
-          type: "array",
-          items: { type: "string" },
-          description:
-            "Optional registered source ids. Omit for every source. Unknown ids are rejected; " +
-            "no URL or credential can be supplied.",
-        },
-        includeComponents: {
-          type: "boolean",
-          description: "Include per-component detail, worst status first. Default false.",
-        },
-        includeAllComponents: {
-          type: "boolean",
-          description:
-            "Include components outside the configured relevant selection. Default false.",
-        },
-        includeIncidents: {
-          type: "boolean",
-          description: "Include active incidents. Default true.",
-        },
-        includeResolvedIncidents: {
-          type: "boolean",
-          description: "Also include recently resolved incidents still in retention. Default false.",
-        },
-        includeHistory: {
-          type: "boolean",
-          description: "Include recent material transitions for each source. Default false.",
-        },
-        componentLimit: { type: "number", minimum: 1, maximum: 50 },
-        incidentLimit: { type: "number", minimum: 1, maximum: 25 },
-        updateLimit: {
-          type: "number",
-          minimum: 1,
-          maximum: 20,
-          description: "Advisory updates returned per incident, newest first.",
-        },
-        historyLimit: { type: "number", minimum: 1, maximum: 50 },
-      },
-      required: [],
-    },
-  },
-  {
-    name: "service_status_refresh",
-    description:
-      "Force a bounded live refresh of the registered service-status sources and WAIT for the result, " +
-      "so the returned data reflects fresh upstream attempts rather than the cached snapshot. Only " +
-      "registered source ids are accepted. Concurrent callers share one in-flight attempt per source, " +
-      "and a short hard cooldown applies — a call made too soon is reported as `rate_limited` rather " +
-      "than re-fetching. One slow or failing provider never fails the others: every source reports its " +
-      "own success, duration and error. Prefer service_status unless you specifically need fresh data.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        sourceIds: {
-          type: "array",
-          items: { type: "string" },
-          description:
-            "Optional registered source ids to refresh. Omit to refresh every registered source.",
         },
       },
       required: [],
@@ -1916,16 +1821,6 @@ const INSTRUCTIONS = [
   "- model_metadata_query(filters?, sort?, limit?): query cached metadata across configured agents.",
   "- model_value_rankings(tier?, benchmark?): read cached Copilot value rankings by capability tier;",
   "  valid effort tiers are metadata only, and the default benchmark is the AA Intelligence Index.",
-  "- service_status(sourceIds?, includeComponents?, includeIncidents?, includeHistory?, limits…): read the",
-  "  CACHED upstream status of the services Seam depends on (GitHub, Claude, OpenAI, xAI, Google AI Studio,",
-  "  Google Cloud). No network work, returns immediately. When an agent call",
-  "  starts failing, check this BEFORE debugging Seam: it tells you whether the provider is down. Each source",
-  "  separates `reportedStatus` (what the provider said) from `observation.health` (whether Seam can reach it),",
-  "  so \"we cannot currently tell\" never reads as \"the provider is fine\".",
-  "- service_status_refresh(sourceIds?): force a bounded live refresh and WAIT for it, when the cached read is",
-  "  too old to act on. Concurrent callers share one in-flight attempt per source and a short cooldown applies,",
-  "  so a repeat call reports `rate_limited` instead of re-fetching. Partial failure is normal: each source",
-  "  returns its own success, duration and error. Prefer service_status unless you specifically need fresh data.",
   "- inspect_image(path, question?): inspect a Seam-staged image through the configured vision sidecar.",
   "- tester_post(channel, text, threadName?) / tester_read(channel, after?, limit?): drive a TEST deployment as",
   "  a person through its test bot, in allowlisted test channels only; read its replies back.",
@@ -2278,10 +2173,6 @@ export class SeamMcpServer {
           return rpcResult(id, await this.toolMigrateSelf(record, args));
         case "agent_quota":
           return rpcResult(id, this.toolAgentQuota(args));
-        case "service_status":
-          return rpcResult(id, this.toolServiceStatus(args));
-        case "service_status_refresh":
-          return rpcResult(id, await this.toolServiceStatusRefresh(args));
         case "model_metadata_get":
           return rpcResult(id, this.toolModelMetadataGet(args));
         case "model_metadata_query":
@@ -3199,62 +3090,6 @@ export class SeamMcpServer {
     return textResult(JSON.stringify(quotas, null, 2));
   }
 
-  /**
-   * Cache-only upstream service status (#184).
-   *
-   * The read path is synchronous and touches no network: the refresh source is
-   * a separate dep and a separate tool, so there is no way for this call to
-   * reach a provider.
-   */
-  private toolServiceStatus(args: Record<string, unknown>): McpToolResult {
-    if (!this.deps.readServiceStatus) {
-      return textResult("Upstream service status is not enabled on this deployment.", true);
-    }
-    const options: ServiceStatusReadOptions = {
-      ...spreadIfDefined("sourceIds", optionalStringArray(args, "sourceIds")),
-      ...spreadIfDefined("includeComponents", optionalBool(args, "includeComponents")),
-      ...spreadIfDefined("includeAllComponents", optionalBool(args, "includeAllComponents")),
-      ...spreadIfDefined("includeIncidents", optionalBool(args, "includeIncidents")),
-      ...spreadIfDefined(
-        "includeResolvedIncidents",
-        optionalBool(args, "includeResolvedIncidents")
-      ),
-      ...spreadIfDefined("includeHistory", optionalBool(args, "includeHistory")),
-      ...spreadIfDefined("componentLimit", optionalNumber(args, "componentLimit")),
-      ...spreadIfDefined("incidentLimit", optionalNumber(args, "incidentLimit")),
-      ...spreadIfDefined("updateLimit", optionalNumber(args, "updateLimit")),
-      ...spreadIfDefined("historyLimit", optionalNumber(args, "historyLimit")),
-    };
-    const result = this.deps.readServiceStatus(options);
-    return {
-      content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-      structuredContent: result,
-    };
-  }
-
-  /**
-   * Bounded live service-status refresh (#184).
-   *
-   * Awaits the real upstream attempts. Single-flight, cooldown and per-source
-   * error isolation all live in the refresh manager behind this dep, so this
-   * layer only validates arguments and projects the result.
-   */
-  private async toolServiceStatusRefresh(
-    args: Record<string, unknown>
-  ): Promise<McpToolResult> {
-    if (!this.deps.refreshServiceStatus) {
-      return textResult("Upstream service status is not enabled on this deployment.", true);
-    }
-    const options: ServiceStatusRefreshOptions = {
-      ...spreadIfDefined("sourceIds", optionalStringArray(args, "sourceIds")),
-    };
-    const result = await this.deps.refreshServiceStatus(options);
-    return {
-      content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-      structuredContent: result,
-    };
-  }
-
   /** Fast cache-only one-model metadata lookup. */
   private toolModelMetadataGet(args: Record<string, unknown>): McpToolResult {
     if (!this.deps.getModelMetadata) {
@@ -4034,20 +3869,6 @@ function optionalNumber(args: Record<string, unknown>, key: string): number | un
     throw new Error(`"${key}" must be a finite number`);
   }
   return v;
-}
-/** Read an optional array-of-strings arg. An empty array means "unset". */
-function optionalStringArray(
-  args: Record<string, unknown>,
-  key: string
-): string[] | undefined {
-  const v = args[key];
-  if (v === undefined || v === null) return undefined;
-  if (!Array.isArray(v)) throw new Error(`"${key}" must be an array of strings`);
-  const out = v.map((entry) => (typeof entry === "string" ? entry.trim() : ""));
-  if (out.some((entry) => entry === "")) {
-    throw new Error(`"${key}" must contain only non-empty strings`);
-  }
-  return out.length === 0 ? undefined : out;
 }
 /** Include a key only when its value is defined, for exactOptionalPropertyTypes-safe options. */
 function spreadIfDefined<K extends string, V>(key: K, value: V | undefined): Record<K, V> | object {

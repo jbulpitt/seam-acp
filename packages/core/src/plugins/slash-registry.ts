@@ -149,5 +149,6 @@ export class SlashRegistry {
     }
     return true;
   }
+  remove(plugin: string): void { for (const [name, entry] of this.entries) if (entry.plugin === plugin) this.entries.delete(name); }
   clear(): void { this.entries.clear(); }
 }

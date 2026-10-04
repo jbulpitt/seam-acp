@@ -13,9 +13,6 @@ import {
   renderServiceStatusPanel,
 } from "../packages/core/src/core/service-status-card.js";
 import type {
-  RefreshResult,
-} from "../packages/core/src/core/service-status/manager.js";
-import type {
   ServiceObservationHealth,
   ServiceStatusLevel,
   ServiceStatusSnapshot,
@@ -25,10 +22,8 @@ import type { Logger } from "../packages/core/src/lib/logger.js";
 import type {
   ChannelRef,
   ChatAdapter,
-  ComponentEvent,
   MessageRef,
 } from "../packages/core/src/platforms/chat-adapter.js";
-import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
 import type { StructuredLayout } from "../packages/core/src/core/types.js";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
@@ -198,7 +193,7 @@ describe("service status card lifecycle", () => {
       async pinMessage() { calls.pins += 1; },
       async bumpThread() { calls.bumps += 1; },
     } as ChatAdapter;
-    const card = new ServiceStatusCard({ logger: silent, adapter, threadId: "123", dataDir: dir, sources: [source("x")], collect: () => [snapshot("x", "operational")], now: () => now });
+    const card = new ServiceStatusCard({ logger: silent, adapter, threadId: "123", stateFile: path.join(dir, "service-status-card.json"), sources: [source("x")], collect: () => [snapshot("x", "operational")], now: () => now });
     await card.start();
     expect(calls).toEqual({ edits: 1, sends: 0, pins: 1, bumps: 1 });
     card.stop();
@@ -220,7 +215,7 @@ describe("service status card lifecycle", () => {
       async deleteMessage() { deletes += 1; },
       async pinMessage() {},
     } as ChatAdapter;
-    const card = new ServiceStatusCard({ logger: silent, adapter, threadId: "123", dataDir: dir, sources: [source("x")], collect: () => [snapshot("x", "operational")] });
+    const card = new ServiceStatusCard({ logger: silent, adapter, threadId: "123", stateFile: path.join(dir, "service-status-card.json"), sources: [source("x")], collect: () => [snapshot("x", "operational")] });
     await card.start();
     expect({ sends, deletes }).toEqual({ sends: 1, deletes: 1 });
     card.poke(); card.poke(); card.poke();
@@ -230,29 +225,6 @@ describe("service status card lifecycle", () => {
   });
 });
 
-describe("service status refresh interaction", () => {
-  it("routes the configured card button to the shared forced-refresh callback", async () => {
-    const replies: string[] = [];
-    const result: RefreshResult = {
-      outcome: "succeeded", startedAt: NOW, durationMs: 20,
-      sources: [{ sourceId: "x", disposition: "executed", attempted: true, succeeded: true, durationMs: 20, error: null, reason: null, observation: null, snapshot: null }],
-    };
-    const refresh = vi.fn(async () => result);
-    const host = Object.assign(Object.create(Orchestrator.prototype) as object, {
-      config: { DISCORD_SERVICE_STATUS_THREAD_ID: "123" },
-      logger: silent,
-      serviceStatusRefresh: refresh,
-    }) as { handleServiceStatusCardComponent(evt: ComponentEvent): Promise<void> };
-    await host.handleServiceStatusCardComponent({
-      customId: SERVICE_STATUS_REFRESH_CUSTOM_ID,
-      channel: { platform: "discord", id: "123" },
-      replyEphemeral: async (text) => { replies.push(text); },
-      editReplyEphemeral: async (text) => { replies.push(text); },
-    } as ComponentEvent);
-    expect(refresh).toHaveBeenCalledOnce();
-    expect(replies).toEqual(["Refreshing upstream service status…", "Service status refreshed (1 sources)."]);
-  });
-});
 
 describe("DISCORD_SERVICE_STATUS_THREAD_ID", () => {
   let env: Record<string, string | undefined>;

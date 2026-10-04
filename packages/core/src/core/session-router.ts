@@ -1471,6 +1471,21 @@ export class SessionRouter {
     return resolvePermissionMode(this.store.readConfig(live), this.defaultPermissionMode);
   }
 
+  /** Share policy and advertised-mode facts with isolated and helper sessions. */
+  permissionOptions(profile: AgentProfile, record?: SessionRecord): Pick<ConstructorParameters<typeof AgentRuntime>[0], "permissionMode" | "onSessionModes"> {
+    return {
+      permissionMode: () => record ? this.livePermissionMode(record) : this.defaultPermissionMode,
+      onSessionModes: info => {
+        if (profile.id !== "codex" || !record) return;
+        const live = this.store.get(record.id) ?? record;
+        const cfg = this.store.readConfig(live);
+        const modes = { sessionId: info.sessionId, availableModes: info.availableModes, currentModeId: info.currentModeId };
+        if (JSON.stringify(cfg.codexModes) === JSON.stringify(modes)) return;
+        this.store.upsert({ ...live, configJson: this.store.writeConfig({ ...cfg, codexModes: modes }) });
+      },
+    };
+  }
+
   private async startRuntime(record: SessionRecord, recovery?: { resumeSessionId: string }): Promise<AgentRuntime> {
     const plan = this.planRuntimeSpawn(record);
     const identity = { agentId: plan.agentId, location: plan.location, requestedModel: plan.model,
@@ -1563,15 +1578,7 @@ export class SessionRouter {
       onCatalogRefresh: async () => {
         await this.modelCatalog.refresh({ agentId, location }, "session");
       },
-      permissionMode: () => this.livePermissionMode(record),
-      onSessionModes: info => {
-        if (profile.id !== "codex") return;
-        const live = this.store.get(record.id) ?? record;
-        const cfg = this.store.readConfig(live);
-        const modes = { sessionId: info.sessionId, availableModes: info.availableModes, currentModeId: info.currentModeId };
-        if (JSON.stringify(cfg.codexModes) === JSON.stringify(modes)) return;
-        this.store.upsert({ ...live, configJson: this.store.writeConfig({ ...cfg, codexModes: modes }) });
-      },
+      ...this.permissionOptions(profile, record),
       permissionPolicy: async (req, context) => {
         const mode = this.livePermissionMode(record);
         if (mode === "always") {

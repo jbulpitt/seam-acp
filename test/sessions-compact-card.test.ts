@@ -289,6 +289,7 @@ function makeHarness(opts: HarnessOpts = {}) {
   const invalidated: Array<{ id: string; opts: unknown }> = [];
   const upserts: SessionRecord[] = [];
   const router = {
+    permissionOptions: () => ({}),
     listProfiles: () => (agy ? [profile, target, agy] : [profile, target]),
     describeConfig: () => ({
       agent: { value: record.agentId },

@@ -69,7 +69,7 @@ function setup(location = REMOTE) {
     deleteSession: localDelete,
   };
   const remoteSeam = { type: "http", name: "seam-mcp", url: "https://seam.example/mcp", headers: [{ name: "X-Seam-Session", value: "author-token" }] };
-  const router = { ensureSessionRecord: () => ({ ...record }), getProfile: () => profile, listProfiles: () => [profile],
+  const router = { permissionOptions: () => ({}), ensureSessionRecord: () => ({ ...record }), getProfile: () => profile, listProfiles: () => [profile],
     resolveProfileForChannel: () => profile, assertAgentAllowedForChannel() {}, assertAgentAllowedForRecord() {},
     reuseMcpServers: vi.fn(() => []), isBusy: () => false,
     describeConfig: () => ({ agent: { value: profile.id }, model: { value: MODEL }, effort: { value: "high" },

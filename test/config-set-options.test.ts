@@ -8,6 +8,8 @@ import { MessageFlags } from "discord.js";
 import type { AgentProfile } from "@seam/adapters";
 import type { ChannelPreset, ThreadPreset } from "../packages/core/src/config.js";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
+import { AgentRuntime } from "../packages/core/src/agents/agent-runtime.js";
+import { CODEX_ACP_2_0_1_MODES } from "./fixtures/codex-acp-modes.js";
 import { SessionRouter } from "../packages/core/src/core/session-router.js";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
@@ -341,6 +343,35 @@ describe("/seam config set named parameters", () => {
     child.stdin.end();
     child.stderr.end();
     store.close();
+  });
+
+  it.each(["always", "ask"] as const)("uses the resolved %s policy for a fresh isolated Codex turn", async policy => {
+    const { orch, store } = makeHarness();
+    await (orch as any).cmdConfigSet(interaction({ agent: "codex@local", permissions: policy }).i);
+    const connection = {
+      newSession: vi.fn(async () => ({ sessionId: "isolated-s1", modes: structuredClone(CODEX_ACP_2_0_1_MODES),
+        models: { currentModelId: "gpt-5.6-sol", availableModels: [] } })),
+      setSessionMode: vi.fn(async () => ({})),
+      prompt: vi.fn(async () => ({ stopReason: "end_turn" })),
+    };
+    const start = vi.spyOn(AgentRuntime.prototype, "start").mockImplementation(async function () {
+      Object.assign(this, { connection, promptCapabilities: {} });
+    });
+    const dispose = vi.spyOn(AgentRuntime.prototype, "dispose").mockResolvedValue(undefined);
+    try {
+      const result = await orch.injectTurn(read(store).record, "isolated check", {
+        session: "isolated", profile: profiles[1], model: "gpt-5.6-sol", cwd: reposRoot,
+      });
+      expect(result.error).toBeUndefined();
+      expect(connection.prompt).toHaveBeenCalledTimes(1);
+      expect(connection.setSessionMode.mock.calls).toEqual(policy === "always"
+        ? [[{ sessionId: "isolated-s1", modeId: "agent-full-access" }]] : []);
+      expect(read(store).cfg.codexModes?.sessionId).toBe("isolated-s1");
+    } finally {
+      start.mockRestore();
+      dispose.mockRestore();
+      store.close();
+    }
   });
 
   it("uses the selected agent default model when model is omitted", async () => {

@@ -132,6 +132,7 @@ function makeOrch(over?: {
       },
     } as any,
     router: {
+      permissionOptions: () => ({}),
       listProfiles: () => Object.values(profiles),
       describeConfig: (session: SessionRecord) => {
         describeCalls.push(session);

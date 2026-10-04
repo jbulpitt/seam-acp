@@ -10,6 +10,8 @@ import { SessionStore } from "../packages/core/src/core/session-store.js";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
 import { discordRenderer } from "../packages/core/src/platforms/discord/renderer.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
+import { visualConfig } from "./plugin-card-visuals-fixture.js";
+import { TurnStatus } from "../packages/core/src/core/status-panel.js";
 
 const cleanups: (() => void)[] = [];
 afterEach(() => {
@@ -21,10 +23,10 @@ const drain = async () => {
   for (let i = 0; i < 20; i++) await new Promise<void>(resolve => setImmediate(resolve));
 };
 
-function setup(source: "inbound" | "dispatch" = "inbound") {
+async function setup(source: "inbound" | "dispatch" = "inbound", style: "full" | "simple" = "full") {
   const dir = mkdtempSync(path.join(tmpdir(), "seam-adopt-reconnect-"));
   cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
-  const store = new SessionStore(path.join(dir, "test.db"));
+  let store = new SessionStore(path.join(dir, "test.db"));
   cleanups.push(() => store.close());
   const now = new Date(Date.now() - 60_000).toISOString();
   const record = { id: "discord:thread", platform: "discord", channelRef: "thread",
@@ -37,10 +39,20 @@ function setup(source: "inbound" | "dispatch" = "inbound") {
   "identity", "old-controller", source);
   store.turnAttempts.bind(attempt, "acp");
   store.turnAttempts.bindStatusCard(attempt, { channelId: "thread", messageId: "card" });
+  const status = new TurnStatus({ model: "test", repoDisplay: "/synthetic", style, authorName: "Codex",
+    ...(source === "dispatch" ? { titlePrefix: "📥 Parked" } : {}) });
+  status.startedUtc = Date.parse(now);
+  status.pushThinkingChunk("before restart\n");
+  status.contextUsedHighWater = 10_000;
+  status.contextWindowSize = 200_000;
+  status.context = "10k / 200k (5%)";
+  store.turnAttempts.saveStatusCardState(attempt, status.snapshot(), style === "simple" ? "gif-before-restart" : undefined);
   store.turnAttempts.startPrompt(attempt);
   store.turnAttempts.recordRemoteRecovery(attempt, { version: 1, location: "remote",
     slot: 6, submissionId: "submission", acpSessionId: "acp", delegatedUtc: now });
   store.turnAttempts.suspendBoot("old-controller");
+  store.close();
+  store = new SessionStore(path.join(dir, "test.db"));
   const snapshot = { version: 1, owner: "bridge", submissionId: "submission",
     acpSessionId: "acp", rung: 1, phase: "executing", retry: 0, budget: 3,
     remaining: 3, disposition: "none", updatedUtc: now };
@@ -91,15 +103,18 @@ function setup(source: "inbound" | "dispatch" = "inbound") {
       if (delivery?.nonce) nonces.add(delivery.nonce);
       return { channel, id: `message-${visible.length}` };
     }),
-    editStatusPanelProjection: vi.fn(async () => {}),
+    editPanel: vi.fn(async (_ref: any, _panel: any) => {}),
+    deleteMessage: vi.fn(async () => {}),
   };
   const orch = new Orchestrator({ logger: pino({ level: "silent" }) as any,
     modelCatalog: fixtureModelCatalog([]), store, router: router as any,
     adapter: adapter as any, renderer: discordRenderer as any,
-    config: { DATA_DIR: dir, REPOS_ROOT: "/synthetic", REPO_EMOJIS: new Map(),
+    config: { ...visualConfig, DATA_DIR: dir, REPOS_ROOT: "/synthetic", REPO_EMOJIS: new Map(),
       channelPresets: new Map(), threadPresets: new Map() } as any });
   orch.setBridgeHub({ muxFor: () => mux, slotHealthFor: () => health } as any);
-  const run = (orch as any).adoptRemoteRecoveryOwned(store.turnAttempts.get(attempt.id)) as Promise<boolean>;
+  const ready = orch.loadPlugins();
+  await ready;
+  const run = ready.then(() => (orch as any).adoptRemoteRecoveryOwned(store.turnAttempts.get(attempt.id))) as Promise<boolean>;
   const frame = (payload: Record<string, unknown>, live = true) => {
     const entry = { slot: 6, seq: ++seq, ...payload };
     frames.push(entry);
@@ -122,13 +137,42 @@ function setup(source: "inbound" | "dispatch" = "inbound") {
     socket.deliver({ type: "hello", instanceId: "second", capabilities: { durableSlots: true } });
     await drain();
   };
-  return { orch, store, run, adapter, visible, commands, text, update, complete, reconnect,
+  return { orch, store, run, ready, adapter, visible, commands, text, update, complete, reconnect,
     runtime: () => runtime };
 }
 
 describe("adopted turns across a bridge reconnect", () => {
+  it.each(["full", "simple"] as const)("keeps %s telemetry ticking and finalizes the original card and GIF", async style => {
+    vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval", "setTimeout", "clearTimeout"] });
+    const h = await setup("dispatch", style);
+    await drain();
+    const first = h.adapter.editPanel.mock.calls.at(-1)![1];
+    expect(JSON.stringify(first)).toContain("before restart");
+    expect(JSON.stringify(first)).toContain("60s");
+    await vi.advanceTimersByTimeAsync(6_000);
+    expect(JSON.stringify(h.adapter.editPanel.mock.calls.at(-1)![1])).toContain("65s");
+    h.update({ sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "after restart thinking\n" } });
+    h.update({ sessionUpdate: "usage_update", used: 50_000, size: 200_000 });
+    await drain();
+    await vi.advanceTimersByTimeAsync(5_000);
+    const updated = JSON.stringify(h.adapter.editPanel.mock.calls.at(-1)![1]);
+    expect(updated).toContain("after restart thinking");
+    expect(updated).toContain(style === "simple" ? "25%" : "50k");
+    expect(h.store.turnAttempts.get("inbound-1")!.statusCardState!.status.contextUsed).toBe(50_000);
+    h.complete("finished");
+    await h.run;
+    const final = h.adapter.editPanel.mock.calls.at(-1)!;
+    expect(final[0].id).toBe("card");
+    expect(final[1].title).toContain("Done");
+    expect(final[1].author).toBe(style === "simple" ? "Done" : "test");
+    expect(final[1].authorIconURL).toMatch(/codex.webp$/);
+    if (style === "simple") expect(h.adapter.deleteMessage).toHaveBeenCalledWith({ channel: { platform: "discord", id: "thread" }, id: "gif-before-restart" });
+    const edits = h.adapter.editPanel.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(h.adapter.editPanel).toHaveBeenCalledTimes(edits);
+  });
   it("observes the boot snapshot even when its recovery frame was already acknowledged", async () => {
-    const h = setup("dispatch");
+    const h = await setup("dispatch");
     await drain();
     h.store.turnAttempts.admit({ id: "queued", target: "thread", prompt: "next",
       session: "live", createdUtc: new Date().toISOString() });
@@ -147,7 +191,7 @@ describe("adopted turns across a bridge reconnect", () => {
   });
 
   it("records adopted narration reaching Discord without overwriting newer session config", async () => {
-    const h = setup();
+    const h = await setup();
     await drain();
     const record = h.store.get("discord:thread")!;
     h.store.upsert({ ...record, configJson: '{"newer":true}' });
@@ -162,7 +206,7 @@ describe("adopted turns across a bridge reconnect", () => {
   });
 
   it("records terminal-only delivery as activity, but not a failed send", async () => {
-    const delivered = setup();
+    const delivered = await setup();
     await drain();
     const before = delivered.store.get("discord:thread")!.updatedUtc;
     delivered.complete("terminal-only reply");
@@ -170,7 +214,7 @@ describe("adopted turns across a bridge reconnect", () => {
     expect(delivered.visible).toEqual(["terminal-only reply"]);
     expect(Date.parse(delivered.store.get("discord:thread")!.updatedUtc)).toBeGreaterThan(Date.parse(before));
 
-    const failed = setup();
+    const failed = await setup();
     await drain();
     const unchanged = failed.store.get("discord:thread")!.updatedUtc;
     failed.adapter.sendMessage.mockRejectedValue(new Error("Discord unavailable"));
@@ -181,7 +225,7 @@ describe("adopted turns across a bridge reconnect", () => {
   });
 
   it("does not replay directive-only output after already rendering its choice", async () => {
-    const h = setup();
+    const h = await setup();
     await drain();
     const publish = vi.spyOn(h.orch, "createChoice").mockResolvedValue({ ok: true, choiceId: "choice", messageId: "card" });
     const fence = '```seam-choice\n{"title":"Next","options":[{"label":"Continue","kind":"prompt","payload":"continue"}]}\n```';
@@ -194,24 +238,24 @@ describe("adopted turns across a bridge reconnect", () => {
   });
 
   it("still projects Done after an intermediate adopted card edit is rejected", async () => {
-    const h = setup();
+    const h = await setup();
     await drain();
-    h.adapter.editStatusPanelProjection.mockRejectedValueOnce(new Error("DiscordAPIError 50035"));
+    h.adapter.editPanel.mockRejectedValueOnce(new Error("DiscordAPIError 50035"));
     h.update({ sessionUpdate: "tool_call", toolCallId: "long", title: "heredoc ".repeat(300),
       kind: "execute", status: "in_progress" });
     await drain();
     h.text("finished");
     h.complete("finished");
     await h.run;
-    expect(h.adapter.editStatusPanelProjection).toHaveBeenLastCalledWith(
+    expect(h.adapter.editPanel).toHaveBeenLastCalledWith(
       { channel: { platform: "discord", id: "thread" }, id: "card" },
-      { state: "Done", action: "end_turn" });
+      expect.objectContaining({ title: "Done", fields: expect.arrayContaining([{ name: "Action", value: "end_turn", inline: true }]) }));
     expect(h.store.turnAttempts.get("inbound-1")).toMatchObject({ state: "completed", deliveryDone: true });
   });
 
   it("delivers queued final text and leaves Done last when a card edit is slow", async () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
-    const h = setup();
+    const h = await setup();
     await drain();
     h.text("adopted narration\n\n");
     h.update({ sessionUpdate: "tool_call", toolCallId: "before", title: "before reconnect",
@@ -219,7 +263,7 @@ describe("adopted turns across a bridge reconnect", () => {
     await drain();
     let release!: () => void;
     const gate = new Promise<void>(resolve => { release = resolve; });
-    h.adapter.editStatusPanelProjection.mockImplementationOnce(async () => gate);
+    h.adapter.editPanel.mockImplementationOnce(async () => gate);
     h.update({ sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "thinking" } });
     await drain();
     h.text("after reconnect\n\n", false);
@@ -242,13 +286,13 @@ describe("adopted turns across a bridge reconnect", () => {
     expect(h.visible.filter(text => text.includes("FINAL"))).toHaveLength(1);
     expect(h.visible.every(text => text.length <= 1800)).toBe(true);
     expect(h.store.turnAttempts.get("inbound-1")).toMatchObject({ state: "completed", deliveryDone: true });
-    expect(h.adapter.editStatusPanelProjection).toHaveBeenLastCalledWith(
+    expect(h.adapter.editPanel).toHaveBeenLastCalledWith(
       { channel: { platform: "discord", id: "thread" }, id: "card" },
-      { state: "Done", action: "end_turn" });
+      expect.objectContaining({ title: "Done", fields: expect.arrayContaining([{ name: "Action", value: "end_turn", inline: true }]) }));
   });
 
   it("reconciles an unseen terminal suffix against the bridge result before recording delivery", async () => {
-    const h = setup();
+    const h = await setup();
     await drain();
     h.text("adopted narration\n\n");
     h.update({ sessionUpdate: "tool_call", toolCallId: "tool", title: "read",
@@ -267,7 +311,7 @@ describe("adopted turns across a bridge reconnect", () => {
   });
 
   it("retains failed terminal delivery for replay while settling the card", async () => {
-    const h = setup();
+    const h = await setup();
     await drain();
     await h.reconnect();
     h.adapter.sendMessage.mockRejectedValue(new Error("Discord transport unavailable"));
@@ -278,8 +322,8 @@ describe("adopted turns across a bridge reconnect", () => {
       state: "completed", deliveryDone: false,
       deliveryPayload: { kind: "messages", texts: ["unseen final answer"] },
     });
-    expect(h.adapter.editStatusPanelProjection).toHaveBeenLastCalledWith(
+    expect(h.adapter.editPanel).toHaveBeenLastCalledWith(
       { channel: { platform: "discord", id: "thread" }, id: "card" },
-      { state: "Done", action: "end_turn" });
+      expect.objectContaining({ title: "Done", fields: expect.arrayContaining([{ name: "Action", value: "end_turn", inline: true }]) }));
   });
 });

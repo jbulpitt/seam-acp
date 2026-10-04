@@ -62,7 +62,6 @@ function setup() {
     sendMessage: vi.fn(async (channel: any, _text: string, _delivery?: unknown) => ({ channel, id: "message" })),
     sendFile: vi.fn(async () => {}),
     findMessageByNonce: vi.fn(async (): Promise<DeliveryNonceLookup> => ({ status: "absent" })),
-    editStatusPanelProjection: vi.fn(async () => {}),
     editPanel: vi.fn(async () => {}), editMessage: vi.fn(async () => {}) };
   const config = { DATA_DIR: dir, REPOS_ROOT: "/synthetic", TURN_TIMEOUT_SECONDS: 60,
     DEFAULT_MODEL: "test", REPO_EMOJIS: new Map(), SEAM_TURN_RESUME_ENABLED: true,
@@ -179,9 +178,9 @@ describe("#250 human turn production pipeline, synthetic transport only", () => 
     expect(h.router.releaseRecoveryRuntime).toHaveBeenCalledWith(
       "discord:worker", expect.any(Object)
     );
-    expect(h.adapter.editStatusPanelProjection).toHaveBeenCalledWith(
+    expect(h.adapter.editPanel).toHaveBeenCalledWith(
       { channel: { platform: "discord", id: "worker" }, id: "persisted-panel" },
-      { state: "Done", action: "end_turn" }
+      expect.objectContaining({ title: "Done", fields: expect.arrayContaining([{ name: "Action", value: "end_turn", inline: true }]) })
     );
     // The restart path owns delivery, settlement, and the original card.
   });
@@ -294,13 +293,13 @@ describe("#250 human turn production pipeline, synthetic transport only", () => 
       deliveryPayload: { kind: "messages", texts: visible },
       outcome: { output: alreadyVisible + resumedText },
     });
-    expect(h.adapter.editStatusPanelProjection).toHaveBeenCalledWith(
+    expect(h.adapter.editPanel).toHaveBeenCalledWith(
       { channel: { platform: "discord", id: "worker" }, id: "persisted-panel" },
-      { state: "Working", action: "Tool: Read file" }
+      expect.objectContaining({ description: expect.stringContaining("Read file") })
     );
-    expect(h.adapter.editStatusPanelProjection).toHaveBeenLastCalledWith(
+    expect(h.adapter.editPanel).toHaveBeenLastCalledWith(
       { channel: { platform: "discord", id: "worker" }, id: "persisted-panel" },
-      { state: "Done", action: "end_turn" }
+      expect.objectContaining({ title: "Done", fields: expect.arrayContaining([{ name: "Action", value: "end_turn", inline: true }]) })
     );
   });
 
@@ -439,7 +438,7 @@ describe("#250 human turn production pipeline, synthetic transport only", () => 
     })).toBe(true);
     attempts.markDeliveryDone(attempt.id);
     h.adapter.sendPanel.mockClear();
-    h.adapter.editStatusPanelProjection.mockClear();
+    h.adapter.editPanel.mockClear();
 
     await h.make().recoverInterruptedTurns();
 
@@ -447,9 +446,9 @@ describe("#250 human turn production pipeline, synthetic transport only", () => 
     // TurnStatus: the new process did not create a panel, yet the exact
     // persisted Discord message received the ledger's immutable outcome.
     expect(h.adapter.sendPanel).not.toHaveBeenCalled();
-    expect(h.adapter.editStatusPanelProjection).toHaveBeenCalledWith(
+    expect(h.adapter.editPanel).toHaveBeenCalledWith(
       { channel: { platform: "discord", id: "worker" }, id: "persisted-panel" },
-      { state: "Done", action: "end_turn" }
+      expect.objectContaining({ title: "Done", fields: expect.arrayContaining([{ name: "Action", value: "end_turn", inline: true }]) })
     );
     expect(h.store.getInbound("1")?.state).toBe("completed");
   });

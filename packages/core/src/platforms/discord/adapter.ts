@@ -36,7 +36,6 @@ import {
   type MessageCreateOptions,
   type VoiceBasedChannel,
   type VoiceState,
-  type APIEmbed,
 } from "discord.js";
 import { SyntheticInteraction, validateSlashSpec, type TestInteractionSpec, type TranscriptEntry } from "./synthetic-interaction.js";
 import {
@@ -53,7 +52,6 @@ import { fileURLToPath } from "node:url";
 import type { Logger } from "../../lib/logger.js";
 import type { SlashRegistry } from "../../plugins/slash-registry.js";
 import type { ComponentRegistry } from "../../plugins/component-registry.js";
-import type { StatusCardRegistry } from "../../plugins/status-card-registry.js";
 import { isThreadDetached, type Config } from "../../config.js";
 import {
   isObfuscatedChannel,
@@ -73,9 +71,8 @@ import type {
   MessageAttachment,
   MessageRef,
 } from "../chat-adapter.js";
-import type { PanelButton, StructuredPanel, TurnState } from "../../core/types.js";
+import type { PanelButton, StructuredPanel } from "../../core/types.js";
 import { clampPanelForDiscord } from "../../core/panel-limits.js";
-import { discordStatusColor } from "./renderer.js";
 import {
   CHOICE_CUSTOM_ID_PREFIX,
   CHOICE_CUSTOM_TEXT_MAX,
@@ -410,61 +407,6 @@ export function classifyDiscordInteraction(interaction: {
   return "none";
 }
 
-const STATUS_STATES: readonly TurnState[] = [
-  "Working", "Done", "Failed", "Timed out", "Waiting", "Monitoring",
-];
-
-/** Patch only the state/action facts on the embed Discord already stores.
- * The old process's model, repo, elapsed time and observations are preserved;
- * inventing a replacement TurnStatus after restart would be less truthful.
- * Applying the same projection twice produces the same embed. */
-export function projectDiscordStatusEmbed(
-  source: APIEmbed,
-  projection: { state: TurnState; action: string }
-): APIEmbed {
-  const projected: APIEmbed = {
-    ...source,
-    color: discordStatusColor(projection.state),
-    fields: [...(source.fields ?? [])],
-  };
-  if (source.title) {
-    const suffix = STATUS_STATES.find(state => source.title === state || source.title?.endsWith(` · ${state}`));
-    projected.title = suffix && source.title.endsWith(` · ${suffix}`)
-      ? `${source.title.slice(0, -suffix.length)}${projection.state}`
-      : projection.state;
-  } else if (source.author) {
-    projected.author = { ...source.author, name: projection.state };
-  } else {
-    projected.title = projection.state;
-  }
-  const actionIndex = projected.fields!.findIndex(field => field.name === "Action");
-  const field = {
-    name: "Action",
-    value: projection.action,
-    ...(actionIndex >= 0 && projected.fields![actionIndex]!.inline !== undefined
-      ? { inline: projected.fields![actionIndex]!.inline }
-      : { inline: true }),
-  };
-  if (actionIndex >= 0) projected.fields![actionIndex] = field;
-  else projected.fields!.push(field);
-  const clamped = clampPanelForDiscord({
-    color: projected.color!,
-    title: projected.title,
-    description: projected.description,
-    author: projected.author?.name,
-    footer: projected.footer?.text,
-    fields: projected.fields!,
-  });
-  return {
-    ...projected,
-    title: clamped.title,
-    description: clamped.description,
-    fields: clamped.fields.map(field => ({ ...field, value: field.value || "\u200B" })),
-    ...(projected.author ? { author: { ...projected.author, name: clamped.author! } } : {}),
-    footer: clamped.footer ? { ...projected.footer, text: clamped.footer } : undefined,
-  };
-}
-
 /**
  * discord.js v14 chat adapter.
  *
@@ -479,7 +421,6 @@ export function projectDiscordStatusEmbed(
 export class DiscordAdapter implements ChatAdapter {
   private readonly pluginSlash?: SlashRegistry;
   private readonly pluginComponents?: ComponentRegistry;
-  private readonly pluginStatusCards?: StatusCardRegistry;
   readonly platform = PLATFORM;
 
   private readonly client: Client;
@@ -505,7 +446,7 @@ export class DiscordAdapter implements ChatAdapter {
     logger: Logger;
     slashHandler: SlashHandler;
     autocompleteHandler?: AutocompleteHandler;
-    plugins?: { slash: SlashRegistry; components: ComponentRegistry; statusCards?: StatusCardRegistry };
+    plugins?: { slash: SlashRegistry; components: ComponentRegistry };
   }) {
     this.config = opts.config;
     this.logger = opts.logger.child({ adapter: PLATFORM });
@@ -513,7 +454,6 @@ export class DiscordAdapter implements ChatAdapter {
     this.autocompleteHandler = opts.autocompleteHandler;
     this.pluginSlash = opts.plugins?.slash;
     this.pluginComponents = opts.plugins?.components;
-    this.pluginStatusCards = opts.plugins?.statusCards;
     this.client = new Client({
       intents: [
         GatewayIntentBits.Guilds,
@@ -1943,41 +1883,6 @@ export class DiscordAdapter implements ChatAdapter {
       payload.attachments = [];
     }
     await ch.messages.edit(message.id, payload);
-  }
-
-  async editStatusPanelProjection(
-    message: MessageRef,
-    projection: { state: TurnState; action: string }
-  ): Promise<void> {
-    const ch = await this.fetchSendableChannel(message.channel.id);
-    const msg = await ch.messages.fetch(message.id);
-    const source = msg.embeds[0]?.toJSON();
-    if (!source) throw new Error("persisted status card has no embed");
-    const embed = projectDiscordStatusEmbed(source, projection);
-    const icon = source.author?.icon_url;
-    const logo = icon ? msg.attachments.find((attachment) =>
-      icon === attachment.url || icon === attachment.proxyURL ||
-      icon === `attachment://${attachment.name}`
-    ) : undefined;
-    // Discord omits attachments still referenced by an embed's attachment:// icon.
-    const ownIcon = icon?.match(
-      /^https:\/\/(?:cdn\.discordapp\.com|media\.discordapp\.net)\/attachments\/([^/]+)\/[^/]+\/([^?/#]+)/
-    );
-    const filename = logo?.name ?? (ownIcon?.[1] === message.channel.id ? ownIcon[2] : undefined);
-    const hostedIcon = filename && this.pluginStatusCards?.decorate({ state: projection.state,
-      agentId: filename.replace(/\.(webp|png|jpe?g|gif)$/i, ""), model: source.author?.name ?? "", style: "full", gifOn: false }).icon;
-    if (hostedIcon && embed.author) {
-      embed.author = { ...embed.author, icon_url: hostedIcon };
-      delete embed.author.proxy_icon_url;
-      await msg.edit({
-        embeds: [embed],
-        attachments: [...msg.attachments.values()]
-          .filter((attachment) => attachment.id !== logo?.id)
-          .map((attachment) => ({ id: attachment.id })),
-      });
-    } else {
-      await msg.edit({ embeds: [embed] });
-    }
   }
 
   async sendLayout(

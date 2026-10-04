@@ -991,6 +991,8 @@ export class Orchestrator {
   suspendForRestart(): void {
     this.restartCutoff = true;
     this.actionCards.detach();
+    for (const panel of this.adoptedStatusPanels.values()) panel.stop();
+    this.adoptedStatusPanels.clear();
     for (const unsubscribe of this.remoteAdoptionWaiters.values()) unsubscribe();
     this.remoteAdoptionWaiters.clear();
     this.store.turnAttempts.suspendBoot(this.attemptBoot);
@@ -1110,6 +1112,7 @@ export class Orchestrator {
    * Boot delivery reconciliation skips them so it cannot race the adopter's
    * nonce-backed first send; every other completed attempt still recovers. */
   private readonly adoptingRemoteResults = new Set<string>();
+  private readonly adoptedStatusPanels = new Map<string, DispatchStatusPanel<MessageRef>>();
   private readonly sharedSessionAttempts = new Set<string>();
   private readonly remoteAdoptionWaiters = new Map<string, () => void>();
   /** channelRef → the harness-stamped speaker id of the human turn CURRENTLY
@@ -2825,27 +2828,93 @@ export class Orchestrator {
     return a?.state === "completed" || a?.state === "cancelled";
   }
 
-  /** Reconcile only immutable terminal ledger facts when no live status
-   * controller survived. Suspended/active rows stay with #578's serialized
-   * in-memory owner path; projecting those here could race a resumed Working
-   * edit. Failure refuses only this best-effort card repair—the completed turn,
-   * delivery recovery and unrelated cards continue. */
-  private async projectPersistedTerminalAttemptCard(attempt: TurnAttempt): Promise<void> {
+  /** Render the terminal winner with this attempt's saved observations. */
+  private async renderPersistedTerminalAttemptCard(attempt: TurnAttempt): Promise<void> {
     const latest = this.store.turnAttempts.get(attempt.id);
     if (!latest || (latest.state !== "completed" && latest.state !== "cancelled")) return;
-    if (!latest.statusCard || !this.adapter.editStatusPanelProjection) return;
+    if (!latest.statusCard) return;
     const projection = projectAttemptCard(latest, latest);
     if (!projection) return;
-    const ref = {
-      channel: { platform: PLATFORM, id: latest.statusCard.channelId },
-      id: latest.statusCard.messageId,
-    };
     try {
-      await this.adapter.editStatusPanelProjection(ref, projection);
+      const panel = this.adoptedStatusPanels.get(latest.id) ?? this.attemptStatusPanel(latest);
+      if (!panel) return;
+      await panel.finalize(projection.state, projection.action,
+        latest.outcome?.finishedUtc ? Date.parse(latest.outcome.finishedUtc) : Date.now());
     } catch (err) {
       this.logger.warn({ err, attempt: latest.id },
-        "durable terminal status-card projection failed");
+        "durable terminal status-card render failed");
     }
+  }
+
+  private attemptTurnStatus(attempt: TurnAttempt): TurnStatus {
+    const record = this.store.getByChannel(PLATFORM, attempt.spec.target);
+    const described = record ? this.router.describeConfig(record) : undefined;
+    const identity = parseExecutionIdentity(attempt.identity);
+    const agentId = identity?.agent ?? described?.agent.value ?? record?.agentId ?? "";
+    const profile = this.router.getProfile?.(agentId, identity?.location ?? described?.location.value);
+    const saved = attempt.statusCardState?.status;
+    const status = saved ? TurnStatus.restore(saved) : new TurnStatus({
+      model: identity?.model ?? described?.model.value ?? attempt.spec.model ?? "",
+      repoDisplay: this.repoDisplay(identity?.cwd ?? described?.cwd.value ?? record?.repoPath ?? ""),
+      effort: identity?.effort ?? described?.effort?.value ?? undefined,
+      ...(attempt.source === "dispatch" ? { titlePrefix: this.dispatchPanelTitle(attempt.spec.kind, !!attempt.spec.chainId) } : {}),
+    });
+    if (!saved) {
+      status.startedUtc = Date.parse(attempt.remoteRecovery?.delegatedUtc ?? attempt.spec.createdUtc);
+      const usage = record && this.store.readConfig(record).lastContextUsage;
+      if (usage) {
+        status.contextUsedHighWater = usage.used;
+        status.contextWindowSize = usage.size;
+        status.context = formatContextUsage(usage.used, usage.size);
+      }
+    }
+    const visuals = this.plugins.statusCards.decorate({ state: status.state, agentId,
+      profileBrand: profile?.brand, model: status.model, resolvedModel: status.resolvedModel,
+      style: saved?.input.style ?? (described ? statusCardStyleForRender(described) : "full"), gifOn: false });
+    status.style = visuals.style ?? "full";
+    status.brandIconURL = visuals.icon;
+    status.authorName = saved?.input.authorName ?? profile?.displayName ?? agentId;
+    return status;
+  }
+
+  private attemptStatusPanel(attempt: TurnAttempt): DispatchStatusPanel<MessageRef> | undefined {
+    if (!attempt.statusCard) return undefined;
+    const ref: MessageRef = { channel: { platform: PLATFORM, id: attempt.statusCard.channelId }, id: attempt.statusCard.messageId };
+    const status = this.attemptTurnStatus(attempt);
+    status.setState("Working");
+    status.setAction("Reconnected to session");
+    const panel = new DispatchStatusPanel(this.renderer, status, {
+      post: async () => ref,
+      edit: async (ref, rendered) => {
+        const latest = this.store.turnAttempts.get(attempt.id);
+        if (!latest || latest.generation !== attempt.generation) return false;
+        if (this.adapter.editPanel) await this.adapter.editPanel(ref, rendered);
+        else await this.adapter.editMessage(ref, serializePanelText(rendered));
+        return true;
+      },
+    }, { debounceMs: STATUS_EDIT_DEBOUNCE_MS, heartbeatMs: STATUS_HEARTBEAT_MS,
+      observe: status => {
+        const latest = this.store.turnAttempts.get(attempt.id);
+        if (latest?.state === "completed" || latest?.state === "cancelled") {
+          const projection = projectAttemptCard(latest, attempt);
+          if (projection) { status.setState(projection.state); status.setAction(projection.action); }
+        }
+        this.store.turnAttempts.saveStatusCardState(attempt, status.snapshot());
+      },
+      onError: err => this.logger.warn({ err, attempt: attempt.id }, "adopted recovery status update failed") });
+    void panel.start(ref).catch(err => this.logger.warn({ err, attempt: attempt.id }, "adopted recovery status bind failed"));
+    const finalize = panel.finalize.bind(panel);
+    panel.finalize = async (state, action, finishedAt) => {
+      try { await finalize(state, action, finishedAt); }
+      finally {
+        const gifMessageId = this.store.turnAttempts.get(attempt.id)?.statusCardState?.gifMessageId;
+        if (gifMessageId && isSimpleCardGifTerminal(state)) {
+          await deleteSimpleCardGifMessage({ ref: { channel: ref.channel, id: gifMessageId },
+            deleteMessage: this.adapter.deleteMessage ? ref => this.adapter.deleteMessage!(ref) : undefined });
+        }
+      }
+    };
+    return panel;
   }
 
   /** Enqueue an already-durable row without passing back through duplicate
@@ -3577,7 +3646,7 @@ export class Orchestrator {
     }
     if (admission || scheduledAttempt) {
       if (priorHuman?.state === "completed" || priorHuman?.state === "cancelled") {
-        await this.projectPersistedTerminalAttemptCard(priorHuman);
+        await this.renderPersistedTerminalAttemptCard(priorHuman);
         return;
       }
       if (priorHuman?.acpSessionId && record.acpSessionId && priorHuman.acpSessionId !== record.acpSessionId) {
@@ -3736,7 +3805,8 @@ export class Orchestrator {
     const visuals = this.plugins.statusCards.decorate({ state: "Working", agentId: described.agent.value, profileBrand: turnProfile?.brand,
       model: described.model.value, style: statusCardStyleForRender(described), gifOn: simpleCardGifForRender(described) });
     const gifUrl = visuals.thumbnail;
-    const status = new TurnStatus({
+    const status = humanAttempt?.statusCardState?.status
+      ? TurnStatus.restore(humanAttempt.statusCardState.status) : new TurnStatus({
       model: described.model.value,
       repoDisplay,
       // #236: the selected model's catalog provenance travels with the turn
@@ -3753,6 +3823,9 @@ export class Orchestrator {
       brandIconURL: visuals.icon,
       authorName: turnProfile?.displayName ?? described.agent.value,
     });
+    status.setState("Working");
+    status.style = visuals.style ?? "full";
+    status.brandIconURL = visuals.icon;
 
     // Seed only a matching execution's observation, not legacy bare-model usage.
     const cachedUsage = cfg.lastContextUsage;
@@ -3771,10 +3844,10 @@ export class Orchestrator {
       cachedUsage.size > 0 &&
       cachedUsage.used >= 0
     ) {
-      status.contextUsedHighWater = cachedUsage.used;
+      status.contextUsedHighWater = Math.max(status.contextUsedHighWater, cachedUsage.used);
       observedContextBudget = cachedUsage.budget;
-      status.contextWindowSize = cachedUsage.size;
-      status.context = formatContextUsage(cachedUsage.used, cachedUsage.size);
+      status.contextWindowSize ||= cachedUsage.size;
+      status.context = formatContextUsage(status.contextUsedHighWater, status.contextWindowSize);
     }
     if (!status.contextWindowSize && modelContextFloor > 0) {
       status.contextWindowSize = modelContextFloor;
@@ -3810,11 +3883,14 @@ export class Orchestrator {
         messageId: statusMsg.id,
       });
     }
+    if (humanAttempt) this.store.turnAttempts.saveStatusCardState(humanAttempt, status.snapshot());
     this.assertQueueFence(queueFence);
     // Standalone GIF: posted once, never edited (embed edits restart the
-    // animation). Deleted on Done/Failed/Timed out. Restart mid-turn may orphan.
+    // animation). Its durable reference survives controller adoption.
     let gifMsg: MessageRef | undefined;
-    if (gifUrl) {
+    const savedGifId = humanAttempt?.statusCardState?.gifMessageId;
+    if (savedGifId) gifMsg = { channel: statusMsg.channel, id: savedGifId };
+    else if (gifUrl) {
       gifMsg = await postSimpleCardGifMessage({
         url: gifUrl,
         sendPanel: this.adapter.sendPanel
@@ -3822,6 +3898,7 @@ export class Orchestrator {
           : undefined,
         sendMessage: (text) => this.adapter.sendMessage(channel, text),
       });
+      if (humanAttempt) this.store.turnAttempts.saveStatusCardState(humanAttempt, status.snapshot(), gifMsg?.id);
     }
 
     statusCard.bind();
@@ -3835,6 +3912,7 @@ export class Orchestrator {
     const editStatusSnapshot = (settlement = false): void => {
       void statusEditQueue.run(async () => {
         if (statusCardSettled && !settlement) return;
+        if (humanAttempt) this.store.turnAttempts.saveStatusCardState(humanAttempt, status.snapshot());
         const now = Date.now();
         const viewed = observationFromTurn(status);
         statusCard.publish(viewed.observation, viewed.contextWindow, now);
@@ -10011,6 +10089,7 @@ export class Orchestrator {
           channelId: statusPanel.reference.channel.id,
           messageId: statusPanel.reference.id,
         });
+        this.store.turnAttempts.saveStatusCardState(attempt, statusPanel.status.snapshot());
       }
 
       // START INDICATOR: post the slim ▶ indicator that then streams the answer.
@@ -11370,7 +11449,7 @@ export class Orchestrator {
       await this.enqueueReportBack(spec, text, workerError);
     }
     // No live panel survived to flip the worker's card; project the outcome.
-    if (attempt) await this.projectPersistedTerminalAttemptCard(attempt);
+    if (attempt) await this.renderPersistedTerminalAttemptCard(attempt);
 
     // #246: ingest's HTTP result is a completion side effect just like the
     // ledger transition. A definitive done artifact can settle a stranded
@@ -11793,6 +11872,7 @@ export class Orchestrator {
     existingCard?: { channelId: string; messageId: string }
   ): Promise<DispatchStatusPanel<MessageRef> | undefined> {
     if (!this.queueFenceCurrent(queueFence)) return undefined;
+    const statusAttempt = this.store.turnAttempts?.get(spec.id);
     const repoDisplay = this.repoDisplay(resolved.cwd);
     const destRecord =
       typeof this.store.getByChannel === "function"
@@ -11813,7 +11893,8 @@ export class Orchestrator {
       style: destDescribed ? statusCardStyleForRender(destDescribed) : "full", gifOn: destDescribed ? simpleCardGifForRender(destDescribed) : false });
     const dispatchGifUrl = visuals.thumbnail;
     const origin = await this.resolveDispatchOrigin(spec, target);
-    const status = new TurnStatus({
+    const status = statusAttempt?.statusCardState?.status
+      ? TurnStatus.restore(statusAttempt.statusCardState.status) : new TurnStatus({
       model: resolved.model,
       repoDisplay,
       ...(resolved.effort ? { effort: resolved.effort } : {}),
@@ -11823,6 +11904,9 @@ export class Orchestrator {
       brandIconURL: visuals.icon,
       authorName: resolved.profile?.displayName ?? resolved.profile?.id,
     });
+    status.setState("Working");
+    status.style = visuals.style ?? "full";
+    status.brandIconURL = visuals.icon;
     status.setAction("Thinking…");
     // Seed context (live only). Invalidate on model mismatch, exactly like the
     // user-turn seed.
@@ -11831,9 +11915,9 @@ export class Orchestrator {
       const identity = destRecord && this.contextBudgetIdentity(destRecord);
       if (identity && matchesContextBudget(u.budget, this.contextIdentityForModel(identity, resolved.model)) &&
           u.size > 0 && u.used >= 0) {
-        status.contextUsedHighWater = u.used;
-        status.contextWindowSize = u.size;
-        status.context = formatContextUsage(u.used, u.size);
+        status.contextUsedHighWater = Math.max(status.contextUsedHighWater, u.used);
+        status.contextWindowSize ||= u.size;
+        status.context = formatContextUsage(status.contextUsedHighWater, status.contextWindowSize);
       }
     }
     if (!status.contextWindowSize && modelContextFloor > 0) {
@@ -11889,19 +11973,30 @@ export class Orchestrator {
       },
       {
         debounceMs: STATUS_EDIT_DEBOUNCE_MS,
+        observe: status => {
+          if (statusAttempt) this.store.turnAttempts.saveStatusCardState(statusAttempt, status.snapshot());
+        },
+        onError: err => this.logger.warn({ err, dispatch: spec.id }, "dispatch: status panel edit failed"),
       }
     );
     await panel.start();
     if (!panel.isLive) return undefined;
-    if (dispatchGifUrl) {
-      const gifRef = await postSimpleCardGifMessage({
-        url: dispatchGifUrl,
+    const savedGifId = statusAttempt?.statusCardState?.gifMessageId;
+    if (dispatchGifUrl || savedGifId) {
+      const gifRef = savedGifId ? { channel: target, id: savedGifId } : await postSimpleCardGifMessage({
+        url: dispatchGifUrl!,
         sendPanel: this.adapter.sendPanel
           ? (p) => this.adapter.sendPanel!(target, p)
           : undefined,
         sendMessage: (text) => this.adapter.sendMessage(target, text),
       });
       if (gifRef) {
+        const attempt = statusAttempt;
+        if (attempt) {
+          if (!attempt.statusCard && panel.reference) this.store.turnAttempts.bindStatusCard(attempt, {
+            channelId: panel.reference.channel.id, messageId: panel.reference.id });
+          this.store.turnAttempts.saveStatusCardState(attempt, status.snapshot(), gifRef.id);
+        }
         const innerFinalize = panel.finalize.bind(panel);
         panel.finalize = async (state, action) => {
           try {
@@ -15725,9 +15820,9 @@ export class Orchestrator {
     const adoptedChunks: string[] = [];
     let adoptedText = "";
     let collectOnly = false;
-    let adoptedCardSettled = false;
     let adoptedRenderer: StreamingMessageRenderer | undefined;
-    let adoptedStatusQueue: SerialQueue | undefined;
+    const adoptedPanel = this.attemptStatusPanel(attempt);
+    if (adoptedPanel) this.adoptedStatusPanels.set(attempt.id, adoptedPanel);
     if (recoveryRuntime && recoveryRecord) {
       const baseNonce = deliveryNonce(attempt.id);
       let fenceCounter = 0;
@@ -15755,33 +15850,12 @@ export class Orchestrator {
           },
         }
       );
-      const cardRef = attempt.statusCard
-        ? {
-            channel: { platform: PLATFORM, id: attempt.statusCard.channelId },
-            id: attempt.statusCard.messageId,
-          }
-        : undefined;
-      adoptedStatusQueue = new SerialQueue();
-      let latestAction = "";
-      let renderedAction = "";
-      const updateCard = (action: string): void => {
-        if (adoptedCardSettled || !cardRef || !this.adapter.editStatusPanelProjection) return;
-        latestAction = action;
-        void adoptedStatusQueue!.run(async () => {
-          if (adoptedCardSettled || latestAction === renderedAction) return;
-          const action = latestAction;
-          await this.adapter.editStatusPanelProjection!(cardRef, { state: "Working", action });
-          renderedAction = action;
-        }).catch((err) => this.logger.warn(
-          { err, attempt: attempt.id }, "adopted recovery status update failed"
-        ));
-      };
       const renderer = adoptedRenderer;
       recoveryRuntime.onEvent(async (event) => {
+        adoptedPanel?.handleEvent(event);
         switch (event.kind) {
           case "notice":
-            if (event.severity === "warning") updateCard(`⚠️ ${formatAgentNotice(event)}`);
-            else if (event.severity === "error") await this.adapter.sendMessage(target, `❗ ${formatAgentNotice(event)}`);
+            if (event.severity === "error") await this.adapter.sendMessage(target, `❗ ${formatAgentNotice(event)}`);
             return;
           case "agent-text":
             adoptedText += event.text;
@@ -15789,18 +15863,6 @@ export class Orchestrator {
             return;
           case "tool-start":
             await renderer.flush();
-            updateCard(`Tool: ${event.title ?? event.kindLabel ?? "…"}`);
-            return;
-          case "tool-update":
-            updateCard(event.status === "completed" || event.status === "failed"
-              ? "Working…"
-              : `Tool: ${event.title ?? "…"}`);
-            return;
-          case "agent-thought":
-            updateCard("Thinking…");
-            return;
-          case "agent-state":
-            updateCard(event.state);
             return;
           case "agent-file":
             await renderer.flush();
@@ -15813,6 +15875,9 @@ export class Orchestrator {
             await this.elicitations.createCodexAsync(recoveryRecord!, event);
             return;
           case "cwd-fallback":
+          case "tool-update":
+          case "agent-thought":
+          case "agent-state":
           case "model-changed":
           case "mode-changed":
           case "usage-update":
@@ -15823,7 +15888,6 @@ export class Orchestrator {
             return;
         }
       });
-      updateCard("Reconnected to session");
     }
     this.remoteAdoptionWaiters.get(attempt.id)?.();
     this.remoteAdoptionWaiters.delete(attempt.id);
@@ -15833,6 +15897,8 @@ export class Orchestrator {
     const finishAdoption = (): void => {
       if (settled) return;
       settled = true;
+      adoptedPanel?.stop();
+      if (this.adoptedStatusPanels.get(attempt.id) === adoptedPanel) this.adoptedStatusPanels.delete(attempt.id);
       if (recoveryRuntime && recoveryRecord) {
         this.router.releaseRecoveryRuntime(recoveryRecord.id, recoveryRuntime);
       }
@@ -15864,8 +15930,6 @@ export class Orchestrator {
           ? `${binding.modelFallbackNotice}\n\n${unseen}` : unseen);
         collectOnly = true;
         await adoptedRenderer.finalize();
-        adoptedCardSettled = true;
-        await adoptedStatusQueue?.idle();
       }
       const failed = result.status === "failed";
       // A substitution selected before restart must still be visible when the
@@ -15986,7 +16050,7 @@ export class Orchestrator {
         ...(outcome.error ? { reason: outcome.error } : {}),
       }).catch(() => {});
     }
-    await this.projectPersistedTerminalAttemptCard(completed);
+    await this.renderPersistedTerminalAttemptCard(completed);
   }
 
   /**
@@ -16117,7 +16181,7 @@ export class Orchestrator {
     for (const row of inbound) {
       const a = this.store.turnAttempts?.get(inboundAttemptId(row.messageId));
       if (a?.state === "completed" || a?.state === "cancelled") {
-        await this.projectPersistedTerminalAttemptCard(a);
+        await this.renderPersistedTerminalAttemptCard(a);
         this.store.settleInboundExecution(row.messageId);
         continue;
       }

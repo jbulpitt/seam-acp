@@ -214,7 +214,7 @@ describe("#170 dispatchInjectTurn skips an already-ledgered spec", () => {
     await expect(orch.dispatchInjectTurn(job)).rejects.toThrow("lost to shutdown");
     onward.mockImplementation(async () => undefined);
     const card = vi.fn(async () => undefined);
-    Object.assign(orch, { projectPersistedTerminalAttemptCard: card });
+    Object.assign(orch, { renderPersistedTerminalAttemptCard: card });
     const { originPrompt: _dropped, ...outcome } = store.turnAttempts.get(job.id)!.outcome!;
     await orch.replayCompletedDispatch(outcome, { action: "report_back", returnTo: "caller" });
     expect(onward.mock.calls[1]![0].prompt).toBe(job.prompt);

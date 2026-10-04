@@ -12,7 +12,6 @@ import { SessionStore } from "../packages/core/src/core/session-store.js";
 import { SessionRouter } from "../packages/core/src/core/session-router.js";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
 import { discordRenderer } from "../packages/core/src/platforms/discord/renderer.js";
-import { projectDiscordStatusEmbed } from "../packages/core/src/platforms/discord/adapter.js";
 import { renderStatusPanel, TurnStatus } from "../packages/core/src/core/status-panel.js";
 import { DispatchStatusPanel } from "../packages/core/src/core/dispatch-status-panel.js";
 import type { StructuredPanel } from "../packages/core/src/core/types.js";
@@ -158,10 +157,6 @@ describe("card-visuals built-in", () => {
     expect(h.panels.at(-1)).toMatchObject({ title: expect.stringContaining("Done"), fields: expect.arrayContaining([{ name: "Action", value: "end_turn", inline: true }]) });
     expect(h.panels.at(-1)).not.toHaveProperty("authorIconURL");
     expect(h.logs.find(log => log.msg === "plugin status-card decorator failed").err.message).toBe("visual fixture unavailable");
-    const source = { title: "Working", fields: [{ name: "Action", value: "tool running" }], author: { name: "model", icon_url: "https://icons.example/codex.webp" } };
-    const once = projectDiscordStatusEmbed(source, { state: "Done", action: "end_turn" });
-    expect(projectDiscordStatusEmbed(once, { state: "Done", action: "end_turn" })).toEqual(once);
-    expect(once.author).toEqual(source.author);
   });
 
   it("accepts only visual output, leaving action and state in the kernel", async () => {

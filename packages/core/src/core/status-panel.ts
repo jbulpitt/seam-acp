@@ -49,6 +49,12 @@ export interface StatusPanelInput {
   authorName?: string;
 }
 
+export interface TurnStatusSnapshot {
+  input: StatusPanelInput;
+  contextUsed: number;
+  contextWindow: number;
+}
+
 export function renderStatusPanel(
   renderer: Renderer,
   input: StatusPanelInput,
@@ -204,6 +210,27 @@ export class TurnStatus {
 
   setState(state: TurnState): void {
     this.state = state;
+  }
+
+  snapshot(): TurnStatusSnapshot {
+    return { input: { ...this.toInput(), style: this.style }, contextUsed: this.contextUsedHighWater, contextWindow: this.contextWindowSize };
+  }
+
+  static restore(snapshot: TurnStatusSnapshot): TurnStatus {
+    const input = snapshot.input;
+    const status = new TurnStatus(input);
+    status.startedUtc = input.startedUtc;
+    status.state = input.state;
+    status.action = input.action;
+    status.notice = input.notice;
+    status.resolvedModel = input.resolvedModel;
+    status.fastMode = input.fastMode;
+    status.context = input.context;
+    status.contextUsedHighWater = snapshot.contextUsed;
+    status.contextWindowSize = snapshot.contextWindow;
+    for (const line of input.activity ?? []) status.pushActivity(line);
+    if (input.thinking?.length) status.pushThinkingChunk(input.thinking.join("\n") + "\n");
+    return status;
   }
 
   setAction(action: string): void {

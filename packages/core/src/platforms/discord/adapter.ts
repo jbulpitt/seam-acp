@@ -1,4 +1,5 @@
 import { replyToInteraction, acknowledgeComponentInteraction, awaitAcknowledgedInteraction, ignoreCollectorTimeout } from "./interaction-response.js";
+import { runAcknowledged } from "../interaction-response.js";
 import type { ComponentAcknowledgement } from "../interaction-response.js";
 import {
   Client,
@@ -2070,7 +2071,7 @@ export class DiscordAdapter implements ChatAdapter {
     interaction: ButtonInteraction | StringSelectMenuInteraction | ModalSubmitInteraction
   ): Promise<void> {
     if (!this.componentHandler) return;
-    await acknowledgeComponentInteraction(interaction, this.componentAcknowledgement);
+    const acknowledgement = acknowledgeComponentInteraction(interaction, this.componentAcknowledgement);
     const isButton = interaction.isButton();
     const isModal = interaction.isModalSubmit();
     const isSelect = interaction.isStringSelectMenu();
@@ -2162,7 +2163,7 @@ export class DiscordAdapter implements ChatAdapter {
       },
     };
     discordComponentInteractions.set(evt, interaction);
-    try { await this.componentHandler(evt); }
+    try { await runAcknowledged(acknowledgement, async () => { await this.componentHandler!(evt); }); }
     catch (err) {
       this.logger.error({ err, customId: interaction.customId }, "component handler failed");
       await replyToInteraction(interaction, { content: `Could not complete this action: ${err instanceof Error ? err.message : String(err)}`, flags: MessageFlags.Ephemeral });
@@ -2264,7 +2265,7 @@ export class DiscordAdapter implements ChatAdapter {
     interaction: ButtonInteraction | StringSelectMenuInteraction | ModalSubmitInteraction
   ): Promise<void> {
     if (!this.choiceHandler) return;
-    await acknowledgeComponentInteraction(interaction, this.choiceAcknowledgement);
+    const acknowledgement = acknowledgeComponentInteraction(interaction, this.choiceAcknowledgement);
     const channelId = interaction.channelId ?? "";
     const ch = interaction.channel as { parentId?: string | null } | null;
     const parentId = ch?.parentId ?? undefined;
@@ -2319,7 +2320,7 @@ export class DiscordAdapter implements ChatAdapter {
         await interaction.showModal(modal);
       },
     };
-    try { await this.choiceHandler(evt); }
+    try { await runAcknowledged(acknowledgement, async () => { await this.choiceHandler!(evt); }); }
     catch (err) {
       this.logger.error({ err, customId: interaction.customId }, "choice handler failed");
       await replyToInteraction(interaction, { content: `Could not complete this choice: ${err instanceof Error ? err.message : String(err)}`, flags: MessageFlags.Ephemeral });

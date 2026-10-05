@@ -19,6 +19,7 @@ import type { ScheduleInteraction, ScheduleClick } from "../packages/core/src/pl
 import { sessionBrowserPlugin } from "../packages/core/src/plugins/session-browser/index.js";
 import { createThreadNamingPlugin } from "../packages/core/src/plugins/thread-naming/index.js";
 import { makeCustomId, RIDER_MODAL_MAX } from "../packages/core/src/platforms/discord/config-editor.js";
+import { WorkflowInventoryController } from "../packages/core/src/platforms/discord/workflow-inventory-controls.js";
 
 const logger = pino({ level: "silent" });
 function interaction(kind: "button" | "select" | "modal" = "button", customId = "test:run", values = ["value"]) {
@@ -113,6 +114,89 @@ describe("component acknowledgement declarations", () => {
 });
 
 describe("central component acknowledgement", () => {
+  it.each(["update", "ephemeral", "public"] as const)("enters a persistent handler before the %s ACK completes, but waits to reply", async mode => {
+    const i = interaction();
+    let release!: () => void;
+    const pending = new Promise<void>(resolve => { release = resolve; });
+    const operation = mode === "update" ? "deferUpdate" : "deferReply";
+    const defer = i.native[operation].bind(i.native);
+    const ack = vi.spyOn(i.native, operation).mockImplementation(async options => { await pending; return defer(options as never); });
+    let binding = "original";
+    let observed: string | undefined;
+    const adapter = Object.assign(Object.create(DiscordAdapter.prototype), { logger, componentAcknowledgement: mode,
+      componentHandler: async (event: { cardReply: { editReply(view: unknown): Promise<void> } }) => {
+        observed = binding;
+        await event.cardReply.editReply({ content: "Completed" });
+      } });
+    const dispatched = adapter.handlePersistentComponent(i.native);
+    expect(ack).toHaveBeenCalledOnce();
+    expect(observed).toBe("original");
+    expect(i.native.transcript).toEqual([]);
+    binding = "detached";
+    release();
+    await dispatched;
+    expect(binding).toBe("detached");
+    expect(i.native.transcript.map(entry => entry.op)).toEqual([operation, "editReply"]);
+  });
+
+  it("reports a synchronous handler error privately after the ACK completes", async () => {
+    const i = interaction();
+    let release!: () => void;
+    const pending = new Promise<void>(resolve => { release = resolve; });
+    const defer = i.native.deferUpdate.bind(i.native);
+    vi.spyOn(i.native, "deferUpdate").mockImplementation(async () => { await pending; return defer(); });
+    const adapter = Object.assign(Object.create(DiscordAdapter.prototype), { logger, componentAcknowledgement: "update",
+      componentHandler: () => { throw new Error("synchronous save: database closed"); } });
+    const dispatched = adapter.handlePersistentComponent(i.native);
+    await Promise.resolve();
+    expect(i.native.transcript).toEqual([]);
+    release();
+    await dispatched;
+    expect(i.native.transcript.map(entry => entry.op)).toEqual(["deferUpdate", "followUp"]);
+    expect(i.native.transcript.at(-1)).toMatchObject({ ephemeral: true, content: "Could not complete this action: synchronous save: database closed" });
+    expect(i.card.edit).not.toHaveBeenCalled();
+  });
+
+  it("keeps the first workflow row claim even when the second click's ACK is faster", async () => {
+    const first = interaction("button", "wf:resume:row");
+    const second = interaction("button", "wf:abandon:row");
+    let releaseAck!: () => void;
+    const ackGate = new Promise<void>(resolve => { releaseAck = resolve; });
+    let releaseMutation!: () => void;
+    const mutationGate = new Promise<void>(resolve => { releaseMutation = resolve; });
+    const defer = first.native.deferUpdate.bind(first.native);
+    vi.spyOn(first.native, "deferUpdate").mockImplementation(async () => { await ackGate; return defer(); });
+    const resume = vi.fn(async () => { await mutationGate; return "Resumed"; });
+    const abandon = vi.fn(async () => "Abandoned");
+    const controller = new WorkflowInventoryController({ resume, abandon,
+      render: async () => ({ embeds: [], components: [], page: 0 }),
+      refresh: async () => true, terminal: async () => true });
+    const collector = new EventEmitter();
+    const onError = vi.fn();
+    let firstComplete!: (value: unknown) => void, secondComplete!: (value: unknown) => void;
+    const completedFirst = new Promise(resolve => { firstComplete = resolve; });
+    const completedSecond = new Promise(resolve => { secondComplete = resolve; });
+    collectAcknowledgedInteractions(collector, "update", async click => {
+      const result = await controller.handle(click.customId, {
+        followUp: text => replyToInteraction(click, { content: text, flags: MessageFlags.Ephemeral }, { followUp: true }),
+      });
+      (click === first.native ? firstComplete : secondComplete)(result);
+    }, onError);
+    collector.emit("collect", first.native);
+    expect(controller.busy).toBe(true);
+    collector.emit("collect", second.native);
+    expect(await completedSecond).toBe("dropped");
+    expect(resume).toHaveBeenCalledOnce();
+    expect(abandon).not.toHaveBeenCalled();
+    releaseMutation();
+    for (let n = 0; n < 10; n++) await Promise.resolve();
+    expect(first.native.transcript).toEqual([]);
+    releaseAck();
+    expect(await completedFirst).toBe("mutated");
+    expect(first.native.transcript.map(entry => entry.op)).toEqual(["deferUpdate", "followUp"]);
+    expect(onError).not.toHaveBeenCalled();
+  });
+
   it.each(["update", "ephemeral", "public"] as const)("acks a slow persistent handler in %s mode before dispatch", async mode => {
     const i = interaction();
     const adapter = Object.assign(Object.create(DiscordAdapter.prototype), { logger, componentAcknowledgement: mode,

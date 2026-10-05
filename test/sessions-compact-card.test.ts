@@ -31,6 +31,7 @@
  *                  timer.
  */
 import { describe, it, expect, vi, beforeEach, afterAll } from "vitest";
+import { collectAcknowledgedInteractions, waitForInteractionAcknowledgement } from "../packages/core/src/platforms/discord/interaction-response.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -192,6 +193,7 @@ class FakeCollector {
   async click(customId: string, values?: string[]): Promise<boolean> {
     if (this.stopped !== null) return false;
     const evt = {
+      deferred: false, ephemeral: null,
       customId,
       user: { id: "op" },
       channelId: "thread-1",
@@ -202,9 +204,12 @@ class FakeCollector {
       // Acking the click is itself a round trip to Discord — a window in which
       // the operator can still press another button.
       deferUpdate: async () => {
+        await Promise.resolve();
         this.onDefer();
+        evt.deferred = true;
       },
       editReply: async (payload: unknown) => {
+        await waitForInteractionAcknowledgement(evt);
         await this.edit(payload);
       },
       followUp: async () => {},
@@ -497,7 +502,7 @@ function makeHarness(opts: HarnessOpts = {}) {
       record,
       sourceId: "acp-source",
       newId,
-      observedAtStart: opts.bound ?? "acp-source",
+      observedAtStart: compactCalls[0]?.opts.observedAtStart ?? opts.bound ?? "acp-source",
       intent: "attach",
     }) as Promise<{ attached: boolean; reason: string }>;
 
@@ -524,11 +529,11 @@ function makeHarness(opts: HarnessOpts = {}) {
       }, silent);
       lifecycle = browser.lifecycle;
       collector.on("end", () => (orch as any).trackedCardWork(browser.expire()));
-      collector.on("collect", async (evt: any) => {
+      collectAcknowledgedInteractions(collector as never, evt => evt.kind === "button" && evt.customId.startsWith("sessions:import_to_cwd") ? "modal" : "update", async (evt: any) => {
         const refusal = (orch as any).slashAccessRefusal(evt, { kind: browserAccess(evt.customId) });
         if (refusal) { await evt.reply({ content: refusal, flags: MessageFlags.Ephemeral }); return; }
         await browser.handle(evt);
-      });
+      }, err => { throw err; });
       await browser.render();
       if (opts.killTokenAfterOpen) tokenDead.value = true;
     },

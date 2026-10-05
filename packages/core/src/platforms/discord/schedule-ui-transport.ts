@@ -2,7 +2,7 @@ import { MessageFlags, type Message, type ChatInputCommandInteraction, type Mess
 import type { ChannelRef } from "../chat-adapter.js";
 import type { CardLifecycle, CardView } from "./collector-lifecycle.js";
 import type { ScheduleInteraction, ScheduleClick, ScheduleCollector, ScheduleModal } from "../../plugins/schedule-ui/ports.js";
-import { replyToInteraction, collectAcknowledgedInteractions, awaitAcknowledgedInteraction, ignoreCollectorTimeout } from "./interaction-response.js";
+import { replyToInteraction, collectAcknowledgedInteractions, awaitAcknowledgedInteraction, ignoreCollectorTimeout, waitForInteractionAcknowledgement } from "./interaction-response.js";
 
 type Interaction = ChatInputCommandInteraction | MessageComponentInteraction;
 /** Wrap native interactions without exposing their client or channel objects. */
@@ -25,6 +25,7 @@ export function scheduleUiInteraction<T extends Interaction>(i: T, deps: {
     options: { getString: ((name: string, required?: boolean) => (native as ChatInputCommandInteraction).options.getString(name, required)) as ScheduleInteraction["options"]["getString"] },
     reply: view => replyToInteraction(native, view as InteractionReplyOptions),
     fetchReply: async () => {
+      await waitForInteractionAcknowledgement(native);
       const message = await native.fetchReply();
       return { id: message.id, createMessageComponentCollector: options => {
         const collector = message.createMessageComponentCollector({ time: options.time, filter: click => options.filter({ user: { id: click.user.id } }) });
@@ -63,6 +64,7 @@ export function scheduleUiInteraction<T extends Interaction>(i: T, deps: {
       let message: Message;
       const editor = Object.create(click) as MessageComponentInteraction;
       editor.editReply = async view => {
+        await waitForInteractionAcknowledgement(click);
         const payload = (typeof view === "string" ? { content: view } : view) as InteractionEditReplyOptions;
         if (!message) message = await click.followUp({ ...payload, flags: MessageFlags.Ephemeral } as InteractionReplyOptions);
         else message = await click.editReply({ ...payload, message: message.id });

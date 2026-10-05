@@ -95,9 +95,10 @@ describe("thread secrets", () => {
       });
       const writeSecret = vi.fn(async () => ({ path: remotePath }));
       orch.setBridgeHub({ writeSecret } as never);
-      const deferReply = vi.fn(async () => {});
+      const deferReply = vi.fn(async () => { submit.deferred = true; });
       const editReply = vi.fn(async () => {});
       const submit = {
+        deferred: false, ephemeral: true,
         user: { id: "user-1" },
         fields: {
           getTextInputValue: (name: string) => name === "name" ? "TOKEN" : value,

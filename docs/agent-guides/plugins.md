@@ -142,6 +142,14 @@ plugin does not migrate or reset schedule data. Occurrences, durable admission,
 cron timers, isolated launch and delivery remain kernel-owned; disabling the
 UI does not stop already admitted or scheduled work.
 
+## Session browsing
+
+The session-browser built-in defers its reply before listing backend sessions.
+Copilot listing uses ACP `session/list` and current `events.jsonl` history,
+merged by session id with the read-only legacy SQL index. Transcripts use
+event history first, then legacy turns. Unreadable sources report their real
+cause; only a successful empty list is shown as no sessions.
+
 ## Quota and turn activity
 
 The quota built-in owns `/seam info usage`, `agent_quota`, the pinned quota

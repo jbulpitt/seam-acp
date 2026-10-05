@@ -99,6 +99,7 @@ describe("Copilot Session Manager", () => {
     profile = makeCopilotProfile({
       configDir: tempDir,
       defaultModel: "gpt-4",
+      sessionList: async () => [],
     });
     manager = profile.sessionManager;
   });

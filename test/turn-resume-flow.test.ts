@@ -902,6 +902,17 @@ describe("workflows inventory", () => {
     expect((await (orch as any).collectInterruptedRows("thread-worker"))[0].actions).toEqual([]);
   });
 
+  it("retains terminal uncertain completions as inert history, not parked work", async () => {
+    const { orch } = makeOrch();
+    const spec = handoffSpec({ id: "uncertain-output" });
+    store.turnAttempts.enqueue(spec);
+    store.turnAttempts.completePending(spec.id, { id: spec.id, target: spec.target, status: "completed", output: "answer" } as any);
+    store.turnAttempts.markDeliveryUncertain(spec.id, "legacy completion has no recorded nonce or route; Discord delivery cannot be proven or replayed safely");
+    expect(store.turnAttempts.isDeliveryDispositionTerminal(spec.id)).toBe(true);
+    expect((await (orch as any).collectInterruptedRows("thread-worker"))[0].actions).toEqual([]);
+    expect(store.turnAttempts.get(spec.id)).not.toBeNull();
+  });
+
   it("lists a suspended modern dispatch from its attempt and applies the same resume admission", async () => {
     await seedInterrupted();
     const { orch } = makeOrch();

@@ -249,7 +249,7 @@ export function interruptedRowForCompletedAttempt(attempt: {
     // and this turn has already run. Abandon is the only correct remedy.
     targetRef: unsettled ? null : attempt.spec.target,
     reason,
-    actions: !attempt.deliveryDone && !attempt.deliveryAbandonedReason ? ["abandon"] : [],
+    actions: unsettled ? ["abandon"] : [],
   };
 }
 

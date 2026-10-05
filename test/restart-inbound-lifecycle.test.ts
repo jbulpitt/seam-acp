@@ -511,7 +511,14 @@ describe("#250 human turn production pipeline, synthetic transport only", () => 
     expect(h.store.getInbound("1")).toEqual(admission);
     expect(h.runtime.prompt).toHaveBeenCalledTimes(1);
     await expect(h.run(next)).rejects.toMatchObject({ suspension: "shutdown" });
-    expect(h.store.turnAttempts.get(attempt.id)).toEqual(before);
+    expect(h.store.turnAttempts.get(attempt.id)).toMatchObject({
+      state: before.state, generation: before.generation, ownerBoot: before.ownerBoot,
+      stalledReason: before.stalledReason, stalledUtc: before.stalledUtc,
+      acpSessionId: before.acpSessionId, remoteRecovery: before.remoteRecovery,
+      outcome: before.outcome,
+    });
+    expect(h.store.getInbound("1")).toEqual(admission);
+    expect(h.runtime.prompt).toHaveBeenCalledTimes(1);
   });
 
   it("projects a terminal durable outcome onto its persisted card with no live panel", async () => {

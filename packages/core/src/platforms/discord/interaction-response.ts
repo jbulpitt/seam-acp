@@ -14,11 +14,13 @@ export async function waitForInteractionAcknowledgement(interaction: object): Pr
 }
 
 /** Dispatch owns the initial acknowledgement; handlers fill its reply. */
-export async function acknowledgeInteraction(interaction: Interaction, mode: InteractionResponseMode): Promise<void> {
+export function acknowledgeInteraction(interaction: Interaction, mode: InteractionResponseMode): Promise<void> {
   const pending = acknowledgements.get(interaction);
   if (pending) return pending;
-  if (mode === "modal" || interaction.deferred || interaction.replied) return;
-  const acknowledgement = interaction.deferReply(mode === "ephemeral" ? { flags: MessageFlags.Ephemeral } : {});
+  if (mode === "modal" || interaction.deferred || interaction.replied) return Promise.resolve();
+  const acknowledgement = interaction.deferReply(mode === "ephemeral" ? { flags: MessageFlags.Ephemeral } : {}).then(() => {});
+  // Dispatch and replies retain the rejection, even when no reply is attempted.
+  void acknowledgement.catch(() => {});
   acknowledgements.set(interaction, acknowledgement);
   return acknowledgement;
 }

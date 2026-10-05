@@ -13,6 +13,7 @@ import { createQuotaPlugin } from "../packages/core/src/plugins/quota/index.js";
 import { sessionBrowserPlugin } from "../packages/core/src/plugins/session-browser/index.js";
 import { createCardVisualsPlugin } from "../packages/core/src/plugins/card-visuals/index.js";
 import { namingRegistry } from "./plugin-naming-fixture.js";
+import { planSessionAttachment } from "../packages/core/src/core/session-attach.js";
 
 const logger = pino({ level: "silent" });
 function interaction(command = "seam", group = "info", leaf = "help") {
@@ -66,6 +67,48 @@ describe("central slash acknowledgement", () => {
     await expect(runAcknowledged(acknowledgeInteraction(i.typed, "ephemeral"),
       () => replyToInteraction(i.typed, "Result"))).rejects.toBe(error);
     expect(i.native.transcript).toEqual([]);
+  });
+
+  it("keeps a Detach during rebuild's ACK out of its attachment CAS", async () => {
+    const i = interaction("seamadmin", "", "rebuild");
+    let release!: () => void;
+    const pending = new Promise<void>(resolve => { release = resolve; });
+    const defer = i.native.deferReply.bind(i.native);
+    vi.spyOn(i.native, "deferReply").mockImplementation(async options => { await pending; return defer(options); });
+    let binding = "original";
+    let captured: string | undefined;
+    const reconstruct = vi.fn(async ({ observedAtStart }: { observedAtStart: string }) => {
+      captured = observedAtStart;
+      const plan = planSessionAttachment({ current: binding, observedAtStart, sourceId: observedAtStart,
+        newId: "rebuilt", intent: "attach" });
+      if (plan.action === "cas") binding = plan.next;
+      return plan;
+    });
+    const orchestrator = Object.assign(Object.create(Orchestrator.prototype), {
+      config: {}, plugins: { slash: new SlashRegistry(logger) },
+      store: { getByChannel: () => ({ acpSessionId: binding }) },
+      channelRefFromInteraction: () => ({ platform: "discord", id: "thread" }),
+      runInbound: async (_kind: string, run: () => Promise<void>) => run(),
+      loadPlugins: async () => {}, slashAccessRefusal: () => undefined,
+      reconstructSessionFromDiscord: reconstruct,
+    });
+    const dispatched = orchestrator.handleSlashInteraction(i.typed);
+    for (let n = 0; n < 10; n++) await Promise.resolve();
+    binding = "";
+    release();
+    await dispatched;
+    expect(captured).toBe("original");
+    expect(await reconstruct.mock.results[0]!.value).toEqual({ action: "skip", attached: false, reason: "rebound-elsewhere" });
+    expect(binding).toBe("");
+  });
+
+  it("keeps an ACK failure observable even when the handler never replies", async () => {
+    const i = interaction();
+    const error = new Error("Discord acknowledgement: Unknown interaction");
+    vi.spyOn(i.native, "deferReply").mockRejectedValue(error);
+    let changed = false;
+    await expect(runAcknowledged(acknowledgeInteraction(i.typed, "ephemeral"), async () => { changed = true; })).rejects.toBe(error);
+    expect(changed).toBe(true);
   });
 
   it("requires a mode in the contribution type and declares every registered kernel/plugin leaf", () => {

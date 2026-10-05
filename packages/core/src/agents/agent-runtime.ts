@@ -35,6 +35,8 @@ import {
   SEAM_AGY_STDOUT_FALLBACK_META,
   permitsAgyStdoutFallback,
   attachErrorClassification,
+  errorData,
+  errorMessage,
   readErrorClassification,
   resolveError,
   unclassified,
@@ -1207,6 +1209,15 @@ export class AgentRuntime {
       if (original instanceof ReauthParked) throw original;
       // A prompt attempt was already classified before its recovery decision.
       if (alreadyClassified && readErrorClassification(original)) throw original;
+      const raw = original && typeof original === "object" ? original as Record<string, unknown> : {};
+      const data = errorData(original);
+      const cause = {
+        errorMessage: errorMessage(original) || String(original),
+        errorCode: raw.code ?? data?.code ?? null,
+        errorStatus: raw.status ?? raw.statusCode ?? raw.httpStatus ?? raw.http_status
+          ?? data?.status ?? data?.statusCode ?? data?.httpStatus ?? data?.http_status ?? null,
+        errorData: data,
+      };
       // ACP normally throws mutable RequestError. Primitive/frozen rejections
       // must also carry data without masking their cause with an assignment error.
       let error: object = original && typeof original === "object" && Object.isExtensible(original)
@@ -1267,7 +1278,7 @@ export class AgentRuntime {
           original instanceof Error ? original.message : String(original), { cause: original }), error);
         attachErrorClassification(error, classification);
       }
-      this.logger.warn({ agentId: this.profile.id, errorKind: classification.errorKind, operation },
+      this.logger.warn({ agentId: this.profile.id, errorKind: classification.errorKind, operation, ...cause },
         "adapter error classified");
       throw error;
     }

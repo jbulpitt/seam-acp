@@ -474,7 +474,7 @@ function makeHarness(opts: HarnessOpts = {}) {
       store.upsert({ ...rec, agentId: selection.agent, acpSessionId: selection.acpSessionId });
       Object.assign(rec, { agentId: selection.agent, acpSessionId: selection.acpSessionId });
     },
-  }) as ReturnType<InstanceType<typeof Orchestrator>["getRuntimeTransition"]>;
+  }) as unknown as ReturnType<InstanceType<typeof Orchestrator>["getRuntimeTransition"]>;
   // The runtime-backed jobs (summary / migrate / import) signal entry here.
   runtime.onStart = () => entered.resolve();
 

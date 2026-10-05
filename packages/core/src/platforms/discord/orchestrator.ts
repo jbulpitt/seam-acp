@@ -201,6 +201,7 @@ import {
   type ReauthPark,
 } from "../../core/reauth-negotiation.js";
 import { reauthAcceptAttemptId, reauthChoiceSpec } from "../../core/reauth-card.js";
+import { parkedTurnAction, parkedTurnChoiceSpec, type ParkedTurnAction } from "../../core/parked-turn-card.js";
 import { readDefaultBranchHead } from "../../core/dispatch/default-branch-head.js";
 
 import { summarizeAnomalies } from "../../core/watchdog.js";
@@ -1531,6 +1532,12 @@ export class Orchestrator {
       }
     });
 
+    this.autocomplete.register(null, "workflows", "resume", "opaque", async (ctx) => {
+      if (!ctx.channelId) return [];
+      const rows = await this.collectInterruptedRows(ctx.channelId);
+      return tokenAutocompleteChoices(rows.filter(row => interruptedRowActions(row).includes("resume"))
+        .map(row => ({ id: row.id, label: workflowActionLabel("resume", row, new Date()) })), ctx.focusedValue);
+    });
     this.autocomplete.register(null, "workflows", "cancel-wake", "opaque", (ctx) => {
       try {
         if (!ctx.channelId) return [];
@@ -2201,11 +2208,10 @@ export class Orchestrator {
     const stalled = this.store.turnAttempts.get(spec.id);
     if (!stalled?.stalledUtc || stalled.stallNoticeUtc) return;
     const requester = spec.returnTo ?? spec.originThreadRef ?? spec.target;
-    await this.adapter.sendMessage(
-      { platform: PLATFORM, id: requester },
+    await this.postParkedTurnNotice(requester, stalled,
       `⚠️ Dispatch \`${spec.id}\` to <#${spec.target}> could not resume: ${reason}. ` +
         "It remains suspended and was not replayed. " +
-        "Resolve this cause before requesting continuation in `/seam workflows`, or abandon the work there. " +
+        "Resolve this cause before requesting continuation, or abandon the work. " +
         "A resume command cannot bypass the failed safety checks."
     );
     this.store.turnAttempts.markStallNoticeDelivered(spec.id);
@@ -3485,6 +3491,9 @@ export class Orchestrator {
     } catch (err) {
       const a = scheduledAttempt ? this.store.turnAttempts.get(scheduledAttempt.id)
         : msg.messageId ? this.store.turnAttempts?.get(inboundAttemptId(msg.messageId)) : null;
+      if (a?.state === "suspended" && a.stalledUtc && !a.stallNoticeUtc && !isAwaitingReauth(a.stalledReason)) {
+        await this.notifyParkedTurn(a).catch(noticeErr => this.logger.warn({ err: noticeErr, attempt: a.id }, "parked-turn notice failed"));
+      }
       // Only this still-current invocation can prove its setup failed before
       // an execution claim (and therefore before any provider prompt). Missing
       // attempt metadata alone is never a terminal result or boot replay proof.
@@ -12383,6 +12392,8 @@ export class Orchestrator {
     if (!drift.match) {
       if (prior) this.store.turnAttempts.markStalled(prior.id, drift.reason);
       this.patchScheduledStatus(row.id, `retained: ${drift.reason}`);
+      const parked = prior ? this.store.turnAttempts.get(prior.id) : null;
+      if (parked) await this.notifyParkedTurn(parked);
       return;
     }
     if (this.restartCutoff) return;
@@ -12434,6 +12445,8 @@ export class Orchestrator {
           if (err.suspension === "defect") {
             this.store.turnAttempts.markStalled(attempt.id, err.reason);
             this.patchScheduledStatus(row.id, `retained: ${err.reason}`);
+            const parked = this.store.turnAttempts.get(attempt.id);
+            if (parked) await this.notifyParkedTurn(parked);
           } else {
             this.store.turnAttempts.suspend(attempt.id, this.attemptBoot);
             this.logger.debug({ id: attempt.id, suspension: err.suspension, reason: err.reason },
@@ -15993,6 +16006,19 @@ export class Orchestrator {
     return `No resumable turn \`${id}\`.`;
   }
 
+  private async workflowActionRefusal(action: ParkedTurnAction, id: string, channelRef?: string): Promise<string | null> {
+    const row = (await this.collectInterruptedRows(channelRef)).find(row => row.id === id);
+    if (!row) return `No parked turn \`${id}\` in this scope; it may already have finished.`;
+    return interruptedRowActions(row).includes(action) ? null
+      : `Cannot ${action} \`${id}\` — ${row.reason ?? "no action is currently available"}.`;
+  }
+
+  private async performWorkflowAction(action: ParkedTurnAction, id: string, channelRef?: string): Promise<string> {
+    const refusal = await this.workflowActionRefusal(action, id, channelRef);
+    if (refusal) return refusal;
+    return action === "resume" ? this.resumeTurnManually(id) : this.abandonTurnManually(id);
+  }
+
   /** Steer a running (or idle) node: preemptively cancel its in-flight turn,
    *  then inject a FRAMED re-prompt into that thread's LIVE session so its
    *  history/session is preserved (no new session). Works cross-thread — the
@@ -16439,6 +16465,12 @@ export class Orchestrator {
       return;
     }
     const limit = i.options.getInteger("limit") ?? 20;
+    const resumeInput = i.options.getString("resume");
+    if (resumeInput) {
+      const id = await this.normalizeAutocompleteSubmission(i, null, "workflows", "resume", resumeInput);
+      await i.editReply({ content: await this.performWorkflowAction("resume", id, i.channelId) });
+      return;
+    }
 
     // Wake cancel (#59, D6): fold into /seam workflows per #26 rather than a new
     // top-level subcommand (the /seam tree is at Discord's 25-option cap).
@@ -16587,8 +16619,8 @@ export class Orchestrator {
     );
     // Repeatable cards claim each row during mutation, then rebuild from the store.
     const controls = new WorkflowInventoryController({
-      resume: (id) => this.resumeTurnManually(id),
-      abandon: (id) => this.abandonTurnManually(id),
+      resume: (id) => this.performWorkflowAction("resume", id, allThreads ? undefined : i.channelId),
+      abandon: (id) => this.performWorkflowAction("abandon", id, allThreads ? undefined : i.channelId),
       render: (requested, category) => this.renderWorkflowInventory(i, limit, requested, category),
       refresh: (view) => lifecycle.refresh(view),
       terminal: (reason, view) => lifecycle.terminal(reason, view),
@@ -19254,6 +19286,59 @@ export class Orchestrator {
     }
   }
 
+  private async notifyParkedTurn(attempt: TurnAttempt): Promise<void> {
+    if (!attempt.stalledUtc || attempt.stallNoticeUtc || isAwaitingReauth(attempt.stalledReason)) return;
+    await this.postParkedTurnNotice(attempt.spec.target, attempt,
+      `⚠️ Turn \`${attempt.id}\` is parked: ${attempt.stalledReason}. Resolve the cause before requesting continuation, or abandon the work. The original prompt was not replayed.`);
+    this.store.turnAttempts.markStallNoticeDelivered(attempt.id);
+  }
+
+  private async postParkedTurnNotice(channelRef: string, attempt: TurnAttempt, body: string): Promise<void> {
+    if (!this.adapter.sendChoiceCard || isAwaitingReauth(attempt.stalledReason)) {
+      await this.adapter.sendMessage({ platform: PLATFORM, id: channelRef }, body);
+      return;
+    }
+    const record = this.store.getByChannel(PLATFORM, channelRef)
+      ?? this.router.ensureSessionRecord({ platform: PLATFORM, channelRef, cwd: this.config.REPOS_ROOT });
+    const row: InterruptedTurnRow = {
+      id: attempt.id, source: attempt.source === "dispatch" ? "dispatch" : "live", channelRef: attempt.spec.target,
+      correlationId: null, status: "interrupted", startedUtc: attempt.updatedUtc,
+      acpSessionId: attempt.acpSessionId, targetRef: attempt.spec.target,
+    };
+    const now = new Date();
+    const posted = await this.publishChoiceCard(record, parkedTurnChoiceSpec(attempt.id, body, {
+      resume: workflowActionLabel("resume", row, now), abandon: workflowActionLabel("abandon", row, now),
+    }));
+    if (!posted.ok) throw new Error(posted.error);
+  }
+
+  private async handleParkedTurnChoice(evt: ChoiceInteraction, card: ChoiceCard, optionIndex: number,
+    request: { action: ParkedTurnAction; attemptId: string }): Promise<void> {
+    await evt.deferUpdate();
+    const access = { kind: "mutating" as const };
+    const scope = evt.channel.parentId ?? evt.channel.id;
+    const refusal = Orchestrator.isParticipantSlashRefused(this.config, "", evt.userId, { access })
+      ? PARTICIPANT_CONFIG_REFUSAL
+      : Orchestrator.isLockedSlashRefused(this.config, scope, "", evt.userId, { access })
+        ? "🔒 This channel is locked — its configuration can't be changed." : null;
+    const attempt = this.store.turnAttempts.get(request.attemptId);
+    const unavailable = refusal ?? (!attempt ? "This parked turn is no longer available."
+      : await this.workflowActionRefusal(request.action, request.attemptId, attempt.spec.target));
+    if (unavailable) {
+      await evt.followUpEphemeral(unavailable);
+      return;
+    }
+    const claimed = this.store.claimChoiceClick({ choiceId: card.id, userId: evt.userId,
+      userName: evt.userName, optionIndex });
+    if (!claimed.ok) {
+      await evt.followUpEphemeral("This parked-turn card has already been used or closed.");
+      return;
+    }
+    const result = await this.performWorkflowAction(request.action, request.attemptId, attempt!.spec.target);
+    await this.refreshChoiceCard(this.store.getChoiceCard(card.id) ?? claimed.card);
+    await evt.followUpEphemeral(result);
+  }
+
   /** Choice card for a parked re-auth. Not an elicitation row. */
   private async postReauthCard(channelRef: string, attemptId: string, park: ReauthPark, cause?: string): Promise<void> {
     try {
@@ -19410,6 +19495,12 @@ export class Orchestrator {
     const reauthAttemptId = option.kind === "prompt" ? reauthAcceptAttemptId(option.payload) : null;
     if (reauthAttemptId) {
       await this.acceptReauthChoice(evt, card, optionIndex, reauthAttemptId);
+      return;
+    }
+
+    const parked = option.kind === "prompt" ? parkedTurnAction(option.payload) : null;
+    if (parked) {
+      await this.handleParkedTurnChoice(evt, card, optionIndex, parked);
       return;
     }
 

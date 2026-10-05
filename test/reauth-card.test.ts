@@ -37,7 +37,20 @@ const CODE = "ABCD-EFGH";
 const URL = "https://device.example.com/start";
 
 describe("reauthChoiceSpec", () => {
-  it("offers one accept button and keeps the device code out of the payload", () => {
+  it("preserves the pre-prompt authentication notice alongside both durable actions", () => {
+    const spec = reauthChoiceSpec("attempt-1", { errorKind: "auth_required" }, {
+      agentId: "codex", host: "worker-host", cause: "Authentication required", promptStarted: false,
+    });
+    expect(spec.body).toContain("Codex on worker-host");
+    expect(spec.body).toContain("codex login");
+    expect(spec.body).toContain("Cause: Authentication required");
+    expect(spec.body).toContain("The pending prompt has not been sent; it will be sent once.");
+    expect(spec.options.map(option => option.payload)).toEqual([
+      "reauth-accept:attempt-1", "parked-turn:abandon:attempt-1",
+    ]);
+  });
+
+  it("offers one accept route plus Abandon, keeping the device code out of the payload", () => {
     const decision = negotiateReauth({
       errorKind: "auth_expired",
       message: `${OAUTH} ${URL} code ${CODE} http://127.0.0.1/callback`,
@@ -45,7 +58,8 @@ describe("reauthChoiceSpec", () => {
     expect(decision.action).toBe("park");
     if (decision.action !== "park") return;
     const spec = reauthChoiceSpec("attempt-1", decision.park);
-    expect(spec.options).toHaveLength(1);
+    expect(spec.options).toHaveLength(2);
+    expect(spec.options[1]!.payload).toBe("parked-turn:abandon:attempt-1");
     expect(spec.options[0]!.label).toBe("Authentication is done — continue");
     expect(spec.options[0]!.payload).toBe("reauth-accept:attempt-1");
     expect(spec.options[0]!.payload).not.toContain(CODE);

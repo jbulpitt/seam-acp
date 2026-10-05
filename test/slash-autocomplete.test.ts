@@ -240,6 +240,22 @@ afterEach(() => {
 });
 
 describe("slash autocomplete responders", () => {
+  it("workflow resume offers only this thread's currently resumable attempts", async () => {
+    const { orch } = makeOrch();
+    (orch as any).collectInterruptedRows = async (channel: string) => {
+      expect(channel).toBe("thread-1");
+      return [
+        { id: "resumable", startedUtc: new Date().toISOString(), actions: ["resume", "abandon"] },
+        { id: "no-resume", actions: ["abandon"] },
+      ];
+    };
+    const registry = (orch as unknown as { autocomplete: AutocompleteRegistry }).autocomplete;
+    const responder = registry.get(null, "workflows", "resume")!;
+    const choices = await responder({ group: null, subcommand: "workflows", optionName: "resume",
+      focusedValue: "", projectScopeId: "chan-1", channelId: "thread-1" });
+    expect(choices.map(choice => choice.value)).toEqual(["resumable"]);
+  });
+
   it("inventory covers every registered responder and declares its round-trip policy", async () => {
     const { orch } = makeOrch();
     await orch.loadPlugins();
@@ -266,6 +282,7 @@ describe("slash autocomplete responders", () => {
       ["/workflows/cancel-live", "opaque"],
       ["/workflows/cancel-wake", "opaque"],
       ["/workflows/cancel-watch", "opaque"],
+      ["/workflows/resume", "opaque"],
       ["catalog/refresh/agent", "canonical"],
       ["config/agent/id", "canonical"],
       ["config/effort/level", "canonical"],

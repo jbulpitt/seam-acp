@@ -103,6 +103,11 @@ The bare command opens one category picker with counts for parked turns,
 wakes, watches, choices, ingests, live help and schedules. Parked controls carry
 their attempt's short id (and age for Resume); **Categories** returns to the
 picker. Existing `cancel-*` options still act directly.
+`resume:<id>` autocompletes this thread's currently resumable parked turns.
+Parked notices carry durable Resume/Abandon choices bound to the attempt id;
+the click repeats the inventory's admission checks. Authentication notices use
+their existing **Authentication is done — continue** route plus Abandon, not a
+second generic Resume button.
 
 **Cancel options** (not new keywords):
 - `/seam cancel` — this thread, graceful

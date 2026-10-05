@@ -281,9 +281,11 @@ export class SupervisedSlots {
   async disarmRecovery(slot: number, submissionId: unknown): Promise<{ disarmed: boolean }> {
     return this.serial(slot, async () => {
       if (!this.bindings.get(slot)) return { disarmed: false };
+      const previousSnapshot = this.recoveries.get(slot);
       const requestId = randomUUID();
       const response = this.waitForControl(requestId);
       try {
+        await this.writeControl(slot, { v: ADAPTER_CHILD_PROTOCOL_VERSION, type: "report_recovery" });
         await this.writeControl(slot, {
           v: ADAPTER_CHILD_PROTOCOL_VERSION,
           type: "disarm_recovery",
@@ -294,7 +296,24 @@ export class SupervisedSlots {
         this.cancelControl(requestId);
         throw error;
       }
-      return await response as { disarmed: boolean };
+      const result = await response as { disarmed: boolean };
+      if (!result.disarmed) {
+        const snapshot = this.recoveries.get(slot);
+        if (!snapshot || snapshot === previousSnapshot || snapshot.submissionId !== submissionId || snapshot.phase !== "exhausted"
+          || snapshot.errorKind !== "auth_required" || snapshot.disposition !== "none"
+          || snapshot.terminalReason !== "budget_exhausted") return result;
+        // Old children cannot disarm terminal auth failures. Retire only that ended prompt.
+        await this.options.client.kill({ slot });
+        const deadline = Date.now() + 10_000;
+        while ((await this.options.client.listSlots()).health.some(row => row.slot === slot && row.alive)) {
+          if (Date.now() >= deadline) throw new Error(`terminal auth child in slot ${slot} did not exit after disarm`);
+          await new Promise(resolve => setTimeout(resolve, 50));
+        }
+        const binding = this.bindings.get(slot);
+        if (binding) binding.dead = true;
+      }
+      this.recoveries.delete(slot);
+      return { disarmed: true };
     }) as Promise<{ disarmed: boolean }>;
   }
 

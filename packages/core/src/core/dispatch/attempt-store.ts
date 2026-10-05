@@ -524,9 +524,7 @@ export class TurnAttemptStore {
         remoteRecovery }), a.id, a.generation, a.ownerBoot).changes === 1;
   }
 
-  /** Remove only a bridge-proven pre-write arm. The bridge refuses disarm after
-   * seeing prompt bytes, so this cannot hand an accepted submission back to
-   * the controller or authorize a resend. */
+  /** Release a bridge-acknowledged pre-write arm or terminal auth failure. */
   releaseRemoteRecovery(a: TurnAttempt, binding: RemoteRecoveryBinding): boolean {
     return this.db.prepare(`UPDATE turn_attempts
       SET runtime_json=json_remove(runtime_json, '$.remoteRecovery')
@@ -540,9 +538,7 @@ export class TurnAttemptStore {
         binding.acpSessionId, binding.location, binding.slot, binding.delegatedUtc).changes === 1;
   }
 
-  /** The bridge no longer holds this suspended turn (its slot is gone or died
-   * without a result). Drop the delegation so the turn continues in its
-   * recorded session like any other interrupted turn (#631). */
+  /** Release a suspended owner after disarm or loss, preserving continuation facts. */
   releaseLostRemoteRecovery(a: TurnAttempt, binding: RemoteRecoveryBinding): boolean {
     return this.db.prepare(`UPDATE turn_attempts
       SET runtime_json=NULLIF(json_remove(runtime_json, '$.remoteRecovery'), '{}'), updated_utc=?

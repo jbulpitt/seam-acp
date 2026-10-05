@@ -9825,7 +9825,7 @@ export class Orchestrator {
         onRemoteRecoveryReleased: (binding) => {
           if (!this.store.turnAttempts.releaseRemoteRecovery(attempt, { ...binding, location: workerLocation })) {
             throw DispatchSuspendedError.superseded(spec.id,
-              "remote recovery handback lost attempt ownership after a pre-write failure");
+              "remote recovery handback lost attempt ownership after disarm");
           }
         },
         acquire: async operation => {
@@ -14860,6 +14860,7 @@ export class Orchestrator {
 
   private async adoptRemoteRecovery(attempt: TurnAttempt): Promise<boolean> {
     if (!attempt.remoteRecovery) return false;
+    if (await this.handBackReauthRecovery(attempt)) return true;
     if (this.adoptingRemoteResults.has(attempt.id)) return true;
     if (attempt.spec.session !== "live" && !this.bridgeHub?.muxFor(attempt.remoteRecovery.location)) {
       return this.adoptRemoteRecoveryOwned(attempt);
@@ -14874,7 +14875,8 @@ export class Orchestrator {
           if (!current || current.state !== "suspended" || current.generation !== attempt.generation
             || !current.remoteRecovery) return;
           await this.adoptRemoteRecoveryOwned(current);
-          if (this.store.turnAttempts.get(attempt.id)?.state !== "suspended" || this.restartCutoff) return;
+          const next = this.store.turnAttempts.get(attempt.id);
+          if (next?.state !== "suspended" || !next.remoteRecovery || this.restartCutoff) return;
           await new Promise<void>(resolve => this.deferRemoteRecoveryAdoption(current, resolve));
         }
       }).catch((err) => {
@@ -14901,6 +14903,7 @@ export class Orchestrator {
   private async adoptRemoteRecoveryOwned(attempt: TurnAttempt): Promise<boolean> {
     const binding = attempt.remoteRecovery;
     if (!binding) return false;
+    if (await this.handBackReauthRecovery(attempt)) return true;
     const mux = this.bridgeHub?.muxFor(binding.location);
     if (!mux) {
       this.deferRemoteRecoveryAdoption(attempt);
@@ -15175,6 +15178,7 @@ export class Orchestrator {
         for (const attempt of attempts.filter(row => row.remoteRecovery!.location === location)) {
           const current = this.store.turnAttempts.get(attempt.id);
           if (!current || current.state !== "suspended" || current.generation !== attempt.generation) continue;
+          if (await this.handBackReauthRecovery(current)) continue;
           const binding = attempt.remoteRecovery!;
           const row = reply.health.find(row => row.slot === binding.slot);
           const snapshot = isRemoteRecoverySnapshot(row?.recovery) ? row.recovery : undefined;
@@ -15224,6 +15228,34 @@ export class Orchestrator {
         }
       }
     }));
+  }
+
+  /** Parked auth failures release ownership, never adopt their terminal result. */
+  private async handBackReauthRecovery(attempt: TurnAttempt, resumeAccepted = true): Promise<boolean> {
+    const binding = attempt.remoteRecovery;
+    const accepted = attempt.stalledReason?.startsWith(REAUTH_COMPLETED_PREFIX) === true;
+    if (!binding || attempt.state !== "suspended" || (!accepted && !isAwaitingReauth(attempt.stalledReason))) return false;
+    const mux = this.bridgeHub?.muxFor(binding.location);
+    if (!mux) return true;
+    const listed = await mux.sendCmd("listSlots", {}) as { health?: Array<{ slot: number; alive?: boolean }> };
+    if (!Array.isArray(listed.health)) return true;
+    const row = listed.health.find(row => row.slot === binding.slot);
+    if (row && row.alive !== false) {
+      const reply = await mux.sendCmd("disarmRung1Recovery", {
+        slot: binding.slot, submissionId: binding.submissionId,
+      }) as { disarmed?: boolean };
+      if (reply.disarmed !== true) return true;
+    }
+    if (!this.store.turnAttempts.releaseLostRemoteRecovery(attempt, binding)) return true;
+    this.remoteAdoptionFinishers.get(attempt.id)?.(true);
+    this.remoteAdoptionWaiters.get(attempt.id)?.();
+    this.logger.info({ attempt: attempt.id, location: binding.location, slot: binding.slot },
+      "parked auth recovery handed back to its recorded session");
+    if (accepted && resumeAccepted) {
+      void this.continueAcceptedReauth(attempt.id).catch(err =>
+        this.logger.warn({ err, attempt: attempt.id }, "reauth continuation deferred"));
+    }
+    return true;
   }
 
   private async settleMissingRemoteRecovery(attempt: TurnAttempt, cause: string, retainChild = false): Promise<void> {
@@ -19366,8 +19398,14 @@ export class Orchestrator {
 
   /** Same executors as operator Resume, after the waiting prefix has been swapped. */
   private async continueAcceptedReauth(attemptId: string): Promise<string | null> {
-    const attempt = this.store.turnAttempts.get(attemptId);
+    let attempt = this.store.turnAttempts.get(attemptId);
     if (!attempt || attempt.state !== "suspended") return "the attempt is not suspended";
+    if (attempt.remoteRecovery) {
+      await this.handBackReauthRecovery(attempt, false);
+      attempt = this.store.turnAttempts.get(attemptId);
+      if (!attempt || attempt.state !== "suspended") return "the attempt is not suspended";
+      if (attempt.remoteRecovery) return null;
+    }
     if (attempt.source === "schedule") {
       const occurrence = this.store.scheduledOccurrences?.get(attemptId);
       if (!occurrence) return "no suspended occurrence";

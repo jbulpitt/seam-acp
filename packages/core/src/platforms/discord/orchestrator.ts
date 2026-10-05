@@ -9506,7 +9506,7 @@ export class Orchestrator {
         const workerError = err instanceof Error ? err.message : String(err);
         const outcome: DispatchResult = {
           id: spec.id, target: spec.target, kind: spec.kind,
-          returnTo: spec.returnTo, chainId: spec.chainId, correlationId: spec.correlationId,
+          returnTo: spec.returnTo, reportBack: spec.reportBack, chainId: spec.chainId, correlationId: spec.correlationId,
           status: "failed", workerStatus: "failed", error: workerError, workerError,
           output: "", finishedUtc: new Date().toISOString(),
         };
@@ -9848,7 +9848,7 @@ export class Orchestrator {
               id: spec.id, target: spec.target, status: outcome.error ? "failed" : "completed",
               output: outcome.text, stopReason: outcome.stopReason, error: outcome.error,
               workerStatus, workerError: outcome.error, kind: spec.kind,
-              returnTo: spec.returnTo, chainId: spec.chainId, correlationId: spec.correlationId,
+              returnTo: spec.returnTo, reportBack: spec.reportBack, chainId: spec.chainId, correlationId: spec.correlationId,
               inlinedReportBack: shouldInlineCardReportBack(spec), suppressedOnward: suppressed,
               finishedUtc: new Date().toISOString(),
             });
@@ -11134,7 +11134,7 @@ export class Orchestrator {
     error?: string
   ): Promise<void> {
     const returnTo = spec.returnTo;
-    if (!returnTo) return;
+    if (!returnTo || spec.reportBack === false || returnTo === spec.target) return;
     const correlation = spec.correlationId ?? spec.id;
     const body = error
       ? `The worker did not complete cleanly: ${error}\n\n--- partial output ---\n${output}`
@@ -11307,6 +11307,7 @@ export class Orchestrator {
       createdUtc: new Date().toISOString(),
       ...(result.correlationId ? { correlationId: result.correlationId } : {}),
       ...(routedReturnTo ? { returnTo: routedReturnTo } : {}),
+      ...(result.reportBack !== undefined ? { reportBack: result.reportBack } : {}),
       ...(routedChainId ? { chainId: routedChainId } : {}),
     };
 
@@ -15033,6 +15034,7 @@ export class Orchestrator {
         workerStatus: failed ? "failed" : "completed",
         kind: current.spec.kind,
         returnTo: current.spec.returnTo,
+        reportBack: current.spec.reportBack,
         chainId: current.spec.chainId,
         correlationId: current.spec.correlationId,
         finishedUtc: result.finishedUtc,
@@ -15169,7 +15171,7 @@ export class Orchestrator {
       acpSessionId: binding.acpSessionId, status: "failed", text: "", error: cause, finishedUtc };
     const outcome: DispatchResult = { id: attempt.id, target: attempt.spec.target, status: "failed",
       output: "", error: cause, workerError: cause, workerStatus: "failed", finishedUtc,
-      kind: attempt.spec.kind, returnTo: attempt.spec.returnTo, correlationId: attempt.spec.correlationId,
+      kind: attempt.spec.kind, returnTo: attempt.spec.returnTo, reportBack: attempt.spec.reportBack, correlationId: attempt.spec.correlationId,
       chainId: attempt.spec.chainId };
     if (!this.store.turnAttempts.adoptRemoteResult(attempt, result, outcome)) return;
     this.logger.warn({ attempt: attempt.id, location: binding.location, slot: binding.slot, cause },

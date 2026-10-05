@@ -1344,6 +1344,34 @@ describe("SeamMcpServer", () => {
     expect(byName.get("handoff").inputSchema.properties.outputStyle).toBeUndefined();
   });
 
+  it.each(["handoff", "forward"])("%s advertises and persists the report-back opt-out", async name => {
+    h = await makeHarness();
+    const listed = await h.call("tools/list");
+    const tool = listed.body.result.tools.find((t: any) => t.name === name);
+    expect(tool.inputSchema.properties.reportBack).toMatchObject({ type: "boolean", default: true });
+    expect(tool.description).toContain("reportBack: false");
+    const args = name === "handoff"
+      ? { worker: "123456789012345678", prompt: "do the work" }
+      : { to: "123456789012345678", content: "do the work" };
+    for (const reportBack of [false, true]) {
+      const { body } = await h.call("tools/call", { name, arguments: { ...args, reportBack } },
+        { "X-Seam-Session": "good-token" });
+      expect(body.result.isError).toBeFalsy();
+      expect(h.enqueued.at(-1)).toMatchObject({ reportBack, returnTo: "thread-caller", target: "123456789012345678" });
+      expect(body.result.content[0].text).toContain(reportBack ? "reported back into" : "No report-back turn");
+    }
+  });
+
+  it("accepts returnTo=worker without promising an echo turn", async () => {
+    h = await makeHarness();
+    const { body } = await h.call("tools/call", { name: "handoff", arguments: {
+      worker: "123456789012345678", returnTo: "123456789012345678", prompt: "do the work",
+    } }, { "X-Seam-Session": "good-token" });
+    expect(body.result.isError).toBeFalsy();
+    expect(h.enqueued[0]).toMatchObject({ target: "123456789012345678", returnTo: "123456789012345678" });
+    expect(body.result.content[0].text).toContain("No report-back turn");
+  });
+
   // --- Claude Fast mode (#37) ----------------------------------------------
 
   it("configure_thread advertises fastMode with cost, reset and non-slug guidance", async () => {

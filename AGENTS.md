@@ -47,8 +47,8 @@ hand-editing runtime state.
   `docs/agent-guides/live-help-onboarding.md`. Not TTS, not STT, not Go Live.
 - **A file they should open:** `seam-attach` fence (path only), not a path in prose.
 - **Another thread in this channel:** `threads()` first. Idle → `handoff` /
-  `forward`. Busy → `send` (inbox; they `poll_inbox`). Set `returnTo` to that
-  thread when they do not want a report-back here. Never hand off to `isSelf`.
+  `forward`. Busy → `send` (inbox; they `poll_inbox`). Set `reportBack: false`
+  when no report-back is wanted. Never hand off to `isSelf`.
 - **Find or read prior conversation:** `search_messages` searches your thread,
   selected siblings, or all threads in this channel and returns message-id
   anchors; `read_messages` loads latest / around / before / after context,

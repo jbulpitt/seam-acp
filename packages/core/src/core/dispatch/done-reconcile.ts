@@ -316,7 +316,7 @@ export function isDoneArtifactDeletable(
  * irrelevant here — it decides WHAT the replay does, not WHETHER it is owed.
  */
 export function needsCompletionReplay(
-  result: Pick<DispatchResult, "returnTo" | "chainId" | "kind" | "suppressedOnward" | "inlinedReportBack">,
+  result: Pick<DispatchResult, "returnTo" | "reportBack" | "chainId" | "kind" | "suppressedOnward" | "inlinedReportBack"> & Partial<Pick<DispatchResult, "target">>,
   row: { status: string; kind?: string; correlationId?: string | null } | null
 ): boolean {
   return completionRoute(result, row).action !== "skip";
@@ -335,6 +335,7 @@ export function needsCompletionReplay(
  *   - self-delivering kinds (compact / ingest / thread_voice) already posted
  *     their own result; they owe only the ledger row;
  *   - a chainId advances the chain;
+ *   - an opt-out or worker-self returnTo owes only the ledger row;
  *   - otherwise a returnTo enqueues the report-back;
  *   - a kind that never delivers onward owes only the ledger row.
  *
@@ -347,7 +348,7 @@ export function needsCompletionReplay(
  * route or repeating the same warning forever.
  */
 export function completionRoute(
-  result: Pick<DispatchResult, "returnTo" | "chainId" | "kind" | "suppressedOnward" | "inlinedReportBack">,
+  result: Pick<DispatchResult, "returnTo" | "reportBack" | "chainId" | "kind" | "suppressedOnward" | "inlinedReportBack"> & Partial<Pick<DispatchResult, "target">>,
   row: { status: string; kind?: string; correlationId?: string | null } | null
 ): CompletionRoute {
   if (!row) return { action: "skip", reason: "unknown-row" };
@@ -376,6 +377,7 @@ export function completionRoute(
   // `correlationId` is merely the dispatch id on a plain forward. Guessing from
   // it can terminalize the worker row without delivering its report-back.
   if (result.chainId) return { action: "chain", chainId: result.chainId };
+  if (result.reportBack === false || (result.returnTo && result.returnTo === result.target)) return { action: "terminalize" };
   if (result.returnTo) return { action: "report_back", returnTo: result.returnTo };
   if (kind && NO_ONWARD_KINDS.has(kind)) return { action: "terminalize" };
   return { action: "skip", reason: "delivery-unprovable" };

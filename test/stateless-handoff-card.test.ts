@@ -587,6 +587,25 @@ describe("stateless/preset handoff embed card", () => {
     expect(rbs[0]!.prompt).toContain("Hello world");
   });
 
+  it.each(["handoff", "forward"] as const)("%s keeps worker output without delivering an opted-out or self-target report-back", async kind => {
+    const { adapter, calls } = spyAdapter();
+    const orch = makeOrch({ dataDir, adapter, chunks: ["worker result"] });
+    for (const [index, routing] of [{ reportBack: false }, { returnTo: "thread-worker" }].entries()) {
+      await orch.dispatchInjectTurn(threadSpec({ id: `dispatch-${index}`, kind, ...routing }));
+    }
+    expect(calls.sendMessage.some(m => m.channel.id === "thread-worker" && m.text.includes("worker result"))).toBe(true);
+    assertNoLiveReportBack(dataDir);
+  });
+
+  it("reportBack:false leaves the real failure in a stateful worker thread", async () => {
+    const { adapter, calls } = spyAdapter();
+    const cause = "provider refused the requested model";
+    const orch = makeOrch({ dataDir, adapter, chunks: ["partial answer"], error: cause });
+    await expect(orch.dispatchInjectTurn(threadSpec({ reportBack: false }))).rejects.toThrow(cause);
+    expect(calls.sendMessage.some(m => m.channel.id === "thread-worker" && m.text.includes(cause))).toBe(true);
+    assertNoLiveReportBack(dataDir);
+  });
+
   it("streams the rolling window, not the full dump", async () => {
     const blob = overCapLines();
     expect(blob.length).toBeGreaterThan(DISPATCH_CARD_WINDOW_CHARS);
@@ -672,9 +691,49 @@ describe("stateless/preset handoff embed card", () => {
     expect(rbs[0]!.prompt).toContain("Full answer");
     expect(rbs[0]!.prompt).toContain("<seam-report-back");
   });
+
+  it("reportBack:false leaves the real failure on the worker's own card", async () => {
+    const { adapter, calls } = spyAdapter();
+    const cause = "provider refused the requested model";
+    const orch = makeOrch({ dataDir, adapter, chunks: ["partial answer"], error: cause });
+    await expect(orch.dispatchInjectTurn(presetSpec({ reportBack: false, returnTo: "thread-other" }))).rejects.toThrow(cause);
+    const last = calls.editPanel.at(-1)!;
+    expect(last.ref.channel.id).toBe("thread-caller");
+    expect(last.panel.title).toMatch(/^❌ handoff/);
+    expect(last.panel.fields.find(f => f.name === "Error")?.value).toBe(cause);
+    expect(last.panel.fields.find(f => f.name === "Result")?.value).toBe("partial answer");
+    assertNoLiveReportBack(dataDir);
+  });
 });
 
 describe("completion replay does not invent a live report-back for the card path", () => {
+  it.each([
+    { reportBack: false, returnTo: "thread-caller" },
+    { returnTo: "thread-worker" },
+  ])("keeps no-report-back routing through admission, settlement and boot replay: %j", async routing => {
+    const queueStore = new SessionStore(path.join(dataDir, "queue.db"));
+    const watcher = new DispatchWatcher({ attempts: queueStore.turnAttempts, dataDir, logger: silent,
+      onDispatch: async () => ({ output: "worker result", stopReason: "end_turn" }) });
+    try {
+      const spec = threadSpec({ ...routing });
+      const dirs = dispatchDirs(dataDir);
+      await mkdir(dirs.pending, { recursive: true });
+      await writeFile(path.join(dirs.pending, `${spec.id}.json`), JSON.stringify(spec));
+      await watcher.start();
+      watcher.stop();
+      const done = JSON.parse(await readFile(path.join(dirs.done, `${spec.id}.json`), "utf8"));
+      expect(done).toMatchObject({ ...routing, status: "completed", output: "worker result" });
+      expect(queueStore.turnAttempts.get(spec.id)?.outcome).toMatchObject(routing);
+      expect(completionRoute(done, { status: "running", kind: "handoff" })).toEqual({ action: "terminalize" });
+      expect(await readdir(dirs.pending)).toEqual([]);
+    } finally { watcher.stop(); queueStore.close(); }
+  });
+
+  it("report-back opt-out does not suppress chain advancement", () => {
+    expect(completionRoute({ reportBack: false, chainId: "chain-1", kind: "forward" }, { status: "running" }))
+      .toEqual({ action: "chain", chainId: "chain-1" });
+  });
+
   it("completionRoute terminalizes when inlinedReportBack is set, even with returnTo", () => {
     const route = completionRoute(
       {

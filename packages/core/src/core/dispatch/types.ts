@@ -59,6 +59,8 @@ export interface DispatchSpec {
   /** When set, after this turn completes the runtime auto-dispatches the
    *  captured output back into this thread (report-back). */
   returnTo?: string;
+  /** Skip report-back delivery only; the worker still settles and shows its result. Default true. */
+  reportBack?: boolean;
   /**
    * Card observability (#153). The thread this dispatch's work came FROM, when
    * it is not simply `returnTo`. A handoff's origin IS its `returnTo` (the
@@ -201,6 +203,7 @@ export interface DispatchResult {
    * by guesswork. See `completionRoute`.
    */
   returnTo?: string;
+  reportBack?: boolean;
   chainId?: string;
   /**
    * The spec's kind, because `returnTo` alone does NOT identify a delivery
@@ -250,6 +253,7 @@ export const DispatchSpecSchema = z.object({
   agentId: z.string().min(1).optional(),
   correlationId: z.string().min(1).optional(),
   returnTo: z.string().min(1).optional(),
+  reportBack: z.boolean().optional(),
   originThreadRef: z.string().min(1).optional(),
   originPrompt: z.string().min(1).optional(),
   harnessProvenance: z.array(z.string()).optional(),
@@ -381,6 +385,7 @@ export function parseDispatchSpec(id: string, raw: string): DispatchSpec {
     ...(d.agentId ? { agentId: d.agentId } : {}),
     ...(d.correlationId ? { correlationId: d.correlationId } : {}),
     ...(d.returnTo ? { returnTo: d.returnTo } : {}),
+    ...(d.reportBack !== undefined ? { reportBack: d.reportBack } : {}),
     ...(d.originThreadRef ? { originThreadRef: d.originThreadRef } : {}),
     ...(d.originPrompt ? { originPrompt: d.originPrompt } : {}),
     ...(d.harnessProvenance && d.harnessProvenance.length > 0

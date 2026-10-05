@@ -17,10 +17,11 @@ export function parkedTurnAction(payload: string | undefined): { action: ParkedT
 }
 
 /** Like reauth acceptance, these persisted payloads are actions, not prompts. */
-export function parkedTurnChoiceSpec(attemptId: string, body: string, labels: Record<ParkedTurnAction, string>): ChoiceSpec {
+export function parkedTurnChoiceSpec(attemptId: string, body: string, labels: Record<ParkedTurnAction, string>,
+  actions: readonly ParkedTurnAction[] = ["resume", "abandon"]): ChoiceSpec {
   return {
     title: "Parked turn", body, maxClicks: 1, defaultTarget: { type: "live" },
-    options: (["resume", "abandon"] as const).map(action => ({
+    options: actions.map(action => ({
       label: labels[action], kind: "prompt", payload: parkedTurnPayload(action, attemptId),
     })),
   };

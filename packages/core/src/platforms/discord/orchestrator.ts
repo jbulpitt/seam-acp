@@ -2211,7 +2211,7 @@ export class Orchestrator {
     await this.postParkedTurnNotice(requester, stalled,
       `⚠️ Dispatch \`${spec.id}\` to <#${spec.target}> could not resume: ${reason}. ` +
         "It remains suspended and was not replayed. " +
-        "Resolve this cause before requesting continuation, or abandon the work. " +
+        "Resolve this cause before using Resume or `/seam workflows resume:<id>`, or abandon the work. " +
         "A resume command cannot bypass the failed safety checks."
     );
     this.store.turnAttempts.markStallNoticeDelivered(spec.id);
@@ -15846,9 +15846,9 @@ export class Orchestrator {
       row.actions = ["abandon"];
       if (attempt.source === "dispatch") {
         const spec = stale.get(row.id);
-        if (spec) {
-          row.actions = await this.dispatchContinuationRefusal(spec) ? ["abandon"] : ["resume", "abandon"];
-        }
+        const refusal = await this.dispatchContinuationRefusal(spec ?? attempt.spec);
+        if (refusal) row.resumeRefusal = refusal;
+        else if (spec) row.actions = ["resume", "abandon"];
       } else {
         const inbound = attempt.source === "inbound" ? this.store.getInbound(row.id.slice("inbound-".length)) : null;
         const backed = attempt.source === "inbound"
@@ -16010,7 +16010,7 @@ export class Orchestrator {
     const row = (await this.collectInterruptedRows(channelRef)).find(row => row.id === id);
     if (!row) return `No parked turn \`${id}\` in this scope; it may already have finished.`;
     return interruptedRowActions(row).includes(action) ? null
-      : `Cannot ${action} \`${id}\` — ${row.reason ?? "no action is currently available"}.`;
+      : `Cannot ${action} \`${id}\` — ${(action === "resume" ? row.resumeRefusal : null) ?? row.reason ?? "no action is currently available"}.`;
   }
 
   private async performWorkflowAction(action: ParkedTurnAction, id: string, channelRef?: string): Promise<string> {
@@ -19306,9 +19306,18 @@ export class Orchestrator {
       acpSessionId: attempt.acpSessionId, targetRef: attempt.spec.target,
     };
     const now = new Date();
+    const current = (await this.collectInterruptedRows(attempt.spec.target)).find(item => item.id === attempt.id);
+    const actions = current ? interruptedRowActions(current) : [];
+    if (!actions.includes("resume")) {
+      body += `\nResume isn't available: ${current?.resumeRefusal ?? current?.reason ?? "no continuation is currently available"}.`;
+    }
+    if (actions.length === 0) {
+      await this.adapter.sendMessage({ platform: PLATFORM, id: channelRef }, body);
+      return;
+    }
     const posted = await this.publishChoiceCard(record, parkedTurnChoiceSpec(attempt.id, body, {
       resume: workflowActionLabel("resume", row, now), abandon: workflowActionLabel("abandon", row, now),
-    }));
+    }, actions));
     if (!posted.ok) throw new Error(posted.error);
   }
 

@@ -161,6 +161,7 @@ export interface InterruptedTurnRow {
   targetRef: string | null;
   /** Durable explanation for an explicit abandonment, when available. */
   reason?: string | null;
+  resumeRefusal?: string;
   /** Actions supported by the current backing record and admission checks. */
   actions?: readonly InterruptedRowAction[];
 }

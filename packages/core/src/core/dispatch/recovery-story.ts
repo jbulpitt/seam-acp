@@ -241,8 +241,12 @@ function situation(facts: RecoveryStoryFacts): string[] {
   }
 
   if (facts.cause === "reauthentication") {
-    lines.push("The prompt had already been submitted. Do not repeat it. The transcript in this session is the work done before the stop.");
-    lines.push(TRANSCRIPT);
+    if (facts.promptStarted) {
+      lines.push("The prompt had already been submitted. Do not repeat it. The transcript in this session is the work done before the stop.");
+      lines.push(TRANSCRIPT);
+    } else {
+      lines.push("The pending prompt has not been submitted yet.");
+    }
   } else if (facts.alreadyProducedOutput) {
     lines.push("The turn already produced output, so this is continuing the existing conversation.");
   } else if (facts.cause === "classified_retry") {

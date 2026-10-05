@@ -182,6 +182,7 @@ import {
   type ResumePrecondition,
 } from "../../core/dispatch/turn-resume.js";
 import {
+  REAUTH_COMPLETED_PREFIX,
   recoveryFactsFromAttempt,
   recoveryStory,
   type RecoveryAttemptSource,
@@ -4932,7 +4933,7 @@ export class Orchestrator {
       if (humanAttempt) {
         const refusal = humanOutcomeOwned ? null : humanRefusal();
         if (refusal) throw refusal;
-        if (err instanceof ReauthParked && humanAttempt.promptStarted) {
+        if (err instanceof ReauthParked) {
           const parked = parkReauthAttempt(this.store.turnAttempts, humanAttempt.id, err.park);
           if (parked) {
             status.setState("Waiting");
@@ -10229,7 +10230,7 @@ export class Orchestrator {
         if (lifecycle && !outcomeOwned) lifecycle.onOutcome(result);
         this.assertQueueFence(queueFence);
       } catch (err) {
-        if (err instanceof ReauthParked && attempt?.promptStarted && lifecycle && !outcomeOwned) {
+        if (err instanceof ReauthParked && attempt && lifecycle && !outcomeOwned) {
           const parked = parkReauthAttempt(this.store.turnAttempts, spec.id, err.park);
           if (parked) {
             await this.postReauthCard(spec.target, spec.id, err.park, err.message);
@@ -10887,7 +10888,7 @@ export class Orchestrator {
       completed = { output: result.text, stopReason: result.stopReason ?? "" };
     } catch (err) {
       failure = err;
-      if (err instanceof ReauthParked && attempt?.promptStarted && lifecycle && !outcomeOwned && attemptStore) {
+      if (err instanceof ReauthParked && attempt && lifecycle && !outcomeOwned && attemptStore) {
         const parked = parkReauthAttempt(attemptStore, spec.id, err.park);
         if (parked) {
           await this.postReauthCard(spec.target, spec.id, err.park, err.message);
@@ -12377,7 +12378,7 @@ export class Orchestrator {
       } catch (err) {
         if (err instanceof ReauthParked) {
           const current = this.store.turnAttempts.get(attempt.id);
-          if (current?.promptStarted && current.acpSessionId) {
+          if (current) {
             const parked = parkReauthAttempt(this.store.turnAttempts, attempt.id, err.park);
             if (parked) {
               this.patchScheduledStatus(row.id, `retained: ${parked.reason}`);
@@ -15791,7 +15792,8 @@ export class Orchestrator {
     const attempt = this.store.turnAttempts.get(spec.id);
     if (!attempt || attempt.state !== "suspended") return "no suspended SQL execution is recorded";
     if (isAwaitingReauth(attempt.stalledReason)) return attempt.stalledReason;
-    if (attempt.stalledUtc && !attempt.promptStarted) {
+    if (attempt.stalledUtc && !attempt.promptStarted &&
+        !attempt.stalledReason?.startsWith(REAUTH_COMPLETED_PREFIX)) {
       return "the stalled attempt never started a prompt; continuation cannot be distinguished from replaying its original brief";
     }
     if (attempt.promptStarted && !attempt.acpSessionId) {
@@ -19300,6 +19302,7 @@ export class Orchestrator {
         agentId: attempt?.spec.agentId ?? record.agentId,
         host: isLocalLocation(location) ? os.hostname() : location,
         cause,
+        promptStarted: attempt?.promptStarted === true,
       };
       await this.adapter.sendMessage({ platform: PLATFORM, id: channelRef }, reauthWaitNotice(park, context))
         .catch(err => this.logger.warn({ err, attemptId }, "reauth wait notice failed"));
@@ -19347,11 +19350,14 @@ export class Orchestrator {
       await this.refreshChoiceCard(fresh());
       return;
     }
+    const promptStarted = this.store.turnAttempts.get(attemptId)?.promptStarted === true;
     const refusal = await this.continueAcceptedReauth(attemptId);
     await evt.followUpEphemeral(
       refusal
         ? `Authentication was recorded. The parked turn did not continue: ${refusal}`
-        : "Continuing the parked turn. The original prompt is not sent again.",
+        : promptStarted
+          ? "Continuing the parked turn. The original prompt is not sent again."
+          : "Continuing the parked turn. Its pending prompt will be sent once.",
     ).catch(() => {});
     await this.refreshChoiceCard(fresh());
   }

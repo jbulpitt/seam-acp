@@ -1,7 +1,7 @@
 /**
  * Provider re-authentication (#454).
  *
- * The attempt row is the record. A prompt that already started is suspended
+ * The attempt row is the record. An auth failure suspends it
  * with a `reauth-waiting:` reason instead of being completed failed. Boot
  * and operator continuation stay refused until `acceptReauthWait` swaps that
  * prefix. Resume text is the existing recovery story, so the original prompt
@@ -157,6 +157,7 @@ export interface ReauthNoticeContext {
   agentId: string;
   host: string;
   cause?: string;
+  promptStarted?: boolean;
 }
 
 export function reauthWaitNotice(park: ReauthPark, context?: ReauthNoticeContext): string {
@@ -172,7 +173,9 @@ export function reauthWaitNotice(park: ReauthPark, context?: ReauthNoticeContext
     lines.push("The failure offered a loopback callback on the wrong host. That address is not the link to open.");
   }
   lines.push(context
-    ? "After signing in, use ‘Authentication is done — continue’. The original prompt will not be replayed."
+    ? `After signing in, use ‘Authentication is done — continue’. ${context.promptStarted === false
+      ? "The pending prompt has not been sent; it will be sent once."
+      : "The original prompt will not be replayed."}`
     : "The parked attempt continues only after authentication is accepted.");
   return lines.join("\n");
 }

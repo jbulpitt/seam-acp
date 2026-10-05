@@ -72,7 +72,7 @@ describe("reauth card click", () => {
     if (dir) fs.rmSync(dir, { recursive: true, force: true });
   });
 
-  it("accepts the parked attempt and does not enqueue a new prompt", async () => {
+  it.each([false, true])("accepts the parked attempt with promptStarted=%s without enqueuing a new dispatch", async promptStarted => {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), "seam-450-"));
     store = new SessionStore(path.join(dir, "seam.db"));
     const attemptId = "11111111-1111-4111-8111-111111111111";
@@ -89,7 +89,7 @@ describe("reauth card click", () => {
       agent: "claude", location: "local", session: "live", model: "m", cwd: "/repo", config: {},
     }), "boot");
     store.turnAttempts.bind(row, "acp-1");
-    store.turnAttempts.startPrompt(row);
+    if (promptStarted) store.turnAttempts.startPrompt(row);
     const decision = negotiateReauth({
       errorKind: "auth_expired",
       message: `${OAUTH} ${URL} code ${CODE}`,
@@ -185,7 +185,8 @@ describe("reauth card click", () => {
     expect(story.prompt.startsWith("continue\n")).toBe(true);
     expect(story.prompt).not.toContain("ORIGINAL-BRIEF-DO-NOT-REPLAY");
     expect(story.prompt).not.toContain(CODE);
-    expect(replies.join("\n")).toContain("original prompt is not sent again");
+    expect(replies.join("\n")).toContain(promptStarted
+      ? "original prompt is not sent again" : "pending prompt will be sent once");
     const pendingDir = dispatchDirs(dir).pending;
     const pending = fs.existsSync(pendingDir) ? fs.readdirSync(pendingDir) : [];
     expect(pending.filter((name) => name.endsWith(".json"))).toEqual([]);

@@ -166,7 +166,7 @@ function harness(location: "local" | "bridge-a", mode: AcpMode): Harness {
   return { dir, store, router, orch, calls, adapter };
 }
 
-function seedPromptedAttempt(h: Harness): string {
+function seedPromptedAttempt(h: Harness, promptStarted = true): string {
   const currentOwner = owners.processOwner();
   if (!currentOwner) throw new Error("synthetic ownership fixture requires readable process identity");
   const ownerSpy = vi.spyOn(owners, "processOwner").mockReturnValue({ ...currentOwner, start: "0" });
@@ -185,7 +185,7 @@ function seedPromptedAttempt(h: Harness): string {
     model: described.model.value, effort: described.effort.value, cwd: described.cwd.value,
     config: identityConfig }), "boot-before-restart", "inbound");
   h.store.turnAttempts.bind(claimed, RECORDED);
-  h.store.turnAttempts.startPrompt(claimed);
+  if (promptStarted) h.store.turnAttempts.startPrompt(claimed);
   h.store.turnAttempts.suspendBoot("boot-before-restart");
   ownerSpy.mockRestore();
   return id;
@@ -199,7 +199,7 @@ async function resume(h: Harness): Promise<void> {
 }
 
 describe("#302 real ACP handshake and strict session/load recovery", () => {
-  it("parks a recovered dispatch when Codex session/load requires authentication before its continuation", async () => {
+  it.each([false, true])("parks a recovered dispatch with promptStarted=%s when Codex session/load requires authentication", async promptStarted => {
     const h = harness("bridge-a", "codex-auth");
     const boot = (h.orch as unknown as { attemptBoot: string }).attemptBoot;
     const record = h.store.get(`discord:${THREAD}`)!;
@@ -213,7 +213,7 @@ describe("#302 real ACP handshake and strict session/load recovery", () => {
       effort: d.effort.value, cwd: d.cwd.value, config: record.configJson,
     }), boot);
     h.store.turnAttempts.bind(claimed, RECORDED);
-    h.store.turnAttempts.startPrompt(claimed);
+    if (promptStarted) h.store.turnAttempts.startPrompt(claimed);
     h.store.turnAttempts.suspend(spec.id, boot);
     await expect(h.orch.dispatchInjectTurn(spec)).rejects.toMatchObject({
       reason: expect.stringMatching(/^reauth-waiting:/),
@@ -221,11 +221,53 @@ describe("#302 real ACP handshake and strict session/load recovery", () => {
     expect(h.calls.loads).toEqual([RECORDED]);
     expect(h.calls.prompts).toEqual([]);
     expect(h.store.turnAttempts.get(spec.id)).toMatchObject({
-      state: "suspended", promptStarted: true, acpSessionId: RECORDED, outcome: null,
+      state: "suspended", promptStarted, acpSessionId: RECORDED, outcome: null,
       stalledReason: expect.stringMatching(/^reauth-waiting:/),
     });
     expect(h.adapter.sendMessage.mock.calls.map(call => String(call[1])).join("\n"))
       .toContain("Cause: Authentication required");
+    await expect(h.orch.dispatchInjectTurn(spec)).rejects.toMatchObject({
+      reason: expect.stringMatching(/^reauth-waiting:/),
+    });
+    expect(h.calls.loads).toEqual([RECORDED]);
+    h.calls.authRequired = false;
+    expect(acceptReauthWait(h.store.turnAttempts, spec.id)).not.toBeNull();
+    await h.orch.dispatchInjectTurn(spec);
+    expect(h.calls.loads).toEqual([RECORDED, RECORDED]);
+    expect(h.calls.prompts).toHaveLength(1);
+    if (promptStarted) {
+      expect(h.calls.prompts[0]).toMatch(/^continue\n/);
+      expect(h.calls.prompts[0]).not.toContain(ORIGINAL);
+    } else {
+      expect(h.calls.prompts[0]).toContain(ORIGINAL);
+      expect(h.calls.prompts[0]).not.toMatch(/^continue\n/);
+    }
+    expect(h.store.turnAttempts.get(spec.id)?.state).toBe("completed");
+  });
+
+  it("parks pre-prompt inbound acquisition and sends the pending prompt once after sign-in", async () => {
+    const h = harness("local", "codex-auth");
+    const id = seedPromptedAttempt(h, false);
+    await resume(h);
+    expect(h.calls.loads).toEqual([RECORDED]);
+    expect(h.calls.news).toBe(0);
+    expect(h.calls.prompts).toEqual([]);
+    expect(h.store.turnAttempts.get(id)).toMatchObject({
+      state: "suspended", promptStarted: false, outcome: null,
+      stalledReason: expect.stringMatching(/^reauth-waiting:/),
+    });
+    const notice = h.adapter.sendMessage.mock.calls.map(call => String(call[1])).join("\n");
+    expect(notice).toContain("Cause: Authentication required");
+    expect(notice).toContain("The pending prompt has not been sent; it will be sent once.");
+    expect(notice).not.toContain("will not be replayed");
+    h.calls.authRequired = false;
+    expect(acceptReauthWait(h.store.turnAttempts, id)).not.toBeNull();
+    await resume(h);
+    expect(h.calls.loads).toEqual([RECORDED, RECORDED]);
+    expect(h.calls.prompts).toHaveLength(1);
+    expect(h.calls.prompts[0]).toContain(ORIGINAL);
+    expect(h.calls.prompts[0]).not.toMatch(/^continue\n/);
+    expect(h.store.turnAttempts.get(id)?.state).toBe("completed");
   });
 
   it.each(["local", "bridge-a"] as const)("parks the exact Codex auth failure on %s session/load, then continues only after sign-in confirmation", async location => {

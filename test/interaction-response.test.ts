@@ -3,6 +3,7 @@ import { pino } from "pino";
 import { MessageFlags } from "discord.js";
 import { acknowledgeInteraction, replyToInteraction } from "../packages/core/src/platforms/discord/interaction-response.js";
 import type { InteractionResponseMode } from "../packages/core/src/platforms/interaction-response.js";
+import { runAcknowledged } from "../packages/core/src/platforms/interaction-response.js";
 import { SyntheticInteraction } from "../packages/core/src/platforms/discord/synthetic-interaction.js";
 import { getSlashAcknowledgement, buildSlashRegistrationBody } from "../packages/core/src/platforms/discord/commands.js";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
@@ -32,6 +33,41 @@ function invocation(native: SyntheticInteraction): SlashDispatchInvocation {
 }
 
 describe("central slash acknowledgement", () => {
+  it.each(["ephemeral", "public"] as const)("captures plugin admission state before the %s ACK completes, but waits to reply", async mode => {
+    const i = interaction();
+    let release!: () => void;
+    const pending = new Promise<void>(resolve => { release = resolve; });
+    const defer = i.native.deferReply.bind(i.native);
+    const ack = vi.spyOn(i.native, "deferReply").mockImplementation(async options => {
+      await pending;
+      return defer(options);
+    });
+    let binding = "original";
+    let observed: string | undefined;
+    const registry = new SlashRegistry(logger);
+    registry.register("snapshot", [{ command: "seam", leaf: { type: 1, name: "snapshot", description: "Snapshot" },
+      acknowledgement: mode, access: { kind: "read-only" }, authorization: "user", help: "Snapshot",
+      handle: async input => { observed = binding; await input.reply("Completed"); } }], { logger, config: undefined });
+    const dispatched = registry.dispatch("seam", null, "snapshot", invocation(i.native));
+    expect(ack).toHaveBeenCalledOnce();
+    expect(observed).toBe("original");
+    expect(i.native.transcript).toEqual([]);
+    binding = "detached";
+    release();
+    await dispatched;
+    expect(binding).toBe("detached");
+    expect(i.native.transcript.map(entry => entry.op)).toEqual(["deferReply", "editReply"]);
+  });
+
+  it("propagates a failed ACK without trying an undeferred reply", async () => {
+    const i = interaction();
+    const error = new Error("Discord acknowledgement: connection reset");
+    vi.spyOn(i.native, "deferReply").mockRejectedValue(error);
+    await expect(runAcknowledged(acknowledgeInteraction(i.typed, "ephemeral"),
+      () => replyToInteraction(i.typed, "Result"))).rejects.toBe(error);
+    expect(i.native.transcript).toEqual([]);
+  });
+
   it("requires a mode in the contribution type and declares every registered kernel/plugin leaf", () => {
     expectTypeOf<SlashContribution>().toMatchTypeOf<{ acknowledgement: InteractionResponseMode }>();
     const registry = namingRegistry();

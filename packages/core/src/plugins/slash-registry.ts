@@ -5,6 +5,7 @@ import { projectRoundTripChoices } from "../platforms/discord/autocomplete.js";
 import type { PluginContext } from "./types.js";
 import type { BrowserReply } from "../core/session-browser.js";
 import type { InteractionResponseMode } from "../platforms/interaction-response.js";
+import { runAcknowledged } from "../platforms/interaction-response.js";
 
 export interface SlashAccess {
   kind: "read-only" | "mutating";
@@ -149,8 +150,8 @@ export class SlashRegistry {
     const entry = this.entries.get(slashPath(command, group, leaf));
     if (!entry) return false;
     try {
-      await invocation.acknowledge(entry.contribution.acknowledgement);
-      await entry.contribution.handle(invocation, entry.context);
+      await runAcknowledged(invocation.acknowledge(entry.contribution.acknowledgement),
+        () => entry.contribution.handle(invocation, entry.context));
     }
     catch (err) {
       this.logger.error({ err, plugin: entry.plugin, path: slashPath(command, group, leaf) }, "plugin slash handler failed");

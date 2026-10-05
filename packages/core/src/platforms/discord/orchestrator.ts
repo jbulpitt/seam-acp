@@ -1,4 +1,5 @@
 import { acknowledgeInteraction, replyToInteraction } from "./interaction-response.js";
+import { runAcknowledged } from "../interaction-response.js";
 import fs from "node:fs";
 import { newSubmissionEvidence, type SubmissionEvidence } from "../../agents/submission-evidence.js";
 import { matchesContextBudget, validContextUsage, type ContextBudgetIdentity, type ContextBudgetObservation } from "../../core/context-budget.js";
@@ -5245,8 +5246,7 @@ export class Orchestrator {
     const leaf = interaction.options.getSubcommand(true);
     const mode = this.plugins.slash.get(interaction.commandName ?? "seam", group, leaf)?.acknowledgement
       ?? getSlashAcknowledgement(interaction.commandName ?? "seam", group, leaf) ?? "ephemeral";
-    await acknowledgeInteraction(interaction, mode);
-    return this.runInbound(
+    return runAcknowledged(acknowledgeInteraction(interaction, mode), () => this.runInbound(
       "slash",
       () => this.handleSlashInteractionInner(interaction),
       async () => {
@@ -5256,7 +5256,7 @@ export class Orchestrator {
           })
           .catch(() => {});
       }
-    );
+    ));
   }
 
   private async handleSlashInteractionInner(

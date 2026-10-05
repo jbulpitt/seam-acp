@@ -1,3 +1,5 @@
+import { classifySessionFailure } from "./session-failure.js";
+
 /**
  * Structured adapter error classification (#440).
  *
@@ -331,6 +333,9 @@ function kindFromHttpStatus(status: number): AdapterErrorKind | null {
  */
 export function classifySharedRuntimeError(ctx: ClassifyContext): AdapterErrorClassification | null {
   const { haystack, message, agentId, exit } = ctx;
+
+  const sessionFailureKind = classifySessionFailure(ctx);
+  if (sessionFailureKind) return classified(agentId, sessionFailureKind, { details: message });
 
   if (/\bunknown rpc method:\s*describemodelcatalog\b/.test(haystack) ||
       /\brpc 'describemodelcatalog' timed out\b/.test(haystack)) {

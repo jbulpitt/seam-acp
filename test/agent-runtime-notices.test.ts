@@ -1,7 +1,7 @@
 import { EventEmitter } from "node:events";
 import { PassThrough, Readable, Writable } from "node:stream";
-import { agent, methods, ndJsonStream, PROTOCOL_VERSION, type ClientCapabilities, type SessionUpdate } from "@agentclientprotocol/sdk";
-import type { AgentProfile } from "@seam/adapters";
+import { agent, methods, ndJsonStream, PROTOCOL_VERSION, type ClientCapabilities, type SessionUpdate, type PromptResponse } from "@agentclientprotocol/sdk";
+import { classifyCodexError, classifyClaudeError, type AgentProfile } from "@seam/adapters";
 import { pino } from "pino";
 import { afterEach, describe, expect, it } from "vitest";
 import { AgentRuntime, type AgentEvent } from "../packages/core/src/agents/agent-runtime.js";
@@ -16,24 +16,26 @@ import type { Logger } from "../packages/core/src/lib/logger.js";
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
 
-async function runtime(agentId: string, updates: SessionUpdate[]) {
+async function runtime(agentId: string, updates: SessionUpdate[], response: PromptResponse = { stopReason: "end_turn" }, typed = false) {
   const stdin = new PassThrough();
   const stdout = new PassThrough();
   const stderr = new PassThrough();
-  const child = Object.assign(new EventEmitter(), {
+  const childEvents = new EventEmitter();
+  const child = Object.assign(childEvents, {
     stdin, stdout, stderr, pid: undefined, killed: false,
-    kill() { this.killed = true; this.emit("exit", 0, null); return true; },
+    kill() { this.killed = true; childEvents.emit("exit", 0, null); return true; },
   });
   let capabilities: ClientCapabilities | undefined;
   const transport = agent({ name: "notice-test" })
     .onRequest(methods.agent.initialize, ({ params }) => {
       capabilities = params.clientCapabilities;
-      return { protocolVersion: PROTOCOL_VERSION, agentCapabilities: {} };
+      return { protocolVersion: PROTOCOL_VERSION, agentCapabilities: {}, ...(typed
+        ? { _meta: { jetbrains: { air: { version: 1, capabilities: ["sessionFailure"] } } } } : {}) };
     })
     .onRequest(methods.agent.session.new, () => ({ sessionId: "wire-session" }))
     .onRequest(methods.agent.session.prompt, async ({ client }) => {
       for (const update of updates) await client.notify(methods.client.session.update, { sessionId: "wire-session", update });
-      return { stopReason: "end_turn" };
+      return response;
     })
     .onNotification(methods.agent.session.cancel, () => {});
   const connection = transport.connect(ndJsonStream(
@@ -44,7 +46,8 @@ async function runtime(agentId: string, updates: SessionUpdate[]) {
   const logger = pino({ level: "debug" }, new Writable({ write(chunk, _encoding, callback) {
     logs.push(JSON.parse(String(chunk))); callback();
   } })) as unknown as Logger;
-  const profile = { id: agentId, defaultModel: "default" } as unknown as AgentProfile;
+  const profile = { id: agentId, defaultModel: "default",
+    classifyError: agentId === "codex" ? classifyCodexError : agentId === "claude" ? classifyClaudeError : undefined } as unknown as AgentProfile;
   const rt = new AgentRuntime({ profile, logger, spawnFn: () => child as never });
   cleanups.push(async () => { await rt.dispose(); connection.close(); stdin.destroy(); stdout.destroy(); stderr.destroy(); });
   await rt.start();
@@ -68,11 +71,78 @@ function injectedTurn(rt: AgentRuntime, logger: Logger, onEvent: (event: AgentEv
 }
 
 describe("ACP session notices", () => {
+  const rollout = JSON.stringify({ type: "error", error: { message: "model 'gpt-6.1-sol' is not enabled in rustponsesapi",
+    type: "invalid_request_error", code: null }, status: 400 });
+
+  function failedResponse(title: string, category = "service", actions = ["retry"]): PromptResponse {
+    return { stopReason: "end_turn", _meta: { jetbrains: { air: { version: 1, sessionFailure: {
+      id: "wire-turn:error", revision: 1, category, severity: "error", title, actions,
+    } } } } };
+  }
+
+  it("rejects AIR's failed end_turn through the actual SDK exchange, with no error-text answer", async () => {
+    const { rt, logs } = await runtime("codex", [], failedResponse(rollout), true);
+    const events: AgentEvent[] = [];
+    rt.onEvent(event => { events.push(event); });
+    await expect(rt.prompt("go", undefined, { recoveryScope: "ephemeral" })).rejects.toMatchObject({
+      message: rollout, data: { status: 400, errorKind: "overloaded" },
+    });
+    expect(events.filter(event => event.kind === "agent-text")).toEqual([]);
+    expect(logs.find(log => log.msg === "adapter error classified")).toMatchObject({ errorKind: "overloaded",
+      errorMessage: rollout, errorStatus: 400 });
+  });
+
+  it("splits and recognises the legacy Codex capacity answer on the actual ACP reader", async () => {
+    const title = "Selected model is at capacity. Please try a different model.";
+    const { rt } = await runtime("codex", [
+      { sessionUpdate: "agent_message_chunk", content: { type: "text", text: title.slice(0, 24) } },
+      { sessionUpdate: "agent_message_chunk", content: { type: "text", text: title.slice(24) } },
+    ]);
+    const events: AgentEvent[] = [];
+    rt.onEvent(event => { events.push(event); });
+    await expect(rt.prompt("go", undefined, { recoveryScope: "ephemeral" })).rejects.toMatchObject({ message: title,
+      data: { errorKind: "overloaded" } });
+    expect(events.filter(event => event.kind === "agent-text")).toEqual([]);
+  });
+
+  it("pauses quota with its exact notice and keeps typed auth on the existing reauth path", async () => {
+    const title = "You've hit your usage limit. Try again at 12:00.";
+    const quota = await runtime("codex", [], failedResponse(title, "limit", []));
+    const events: AgentEvent[] = [];
+    quota.rt.onEvent(event => { events.push(event); });
+    await expect(quota.rt.prompt("go", undefined, { recoveryScope: "ephemeral" })).rejects.toMatchObject({ message: title,
+      data: { errorKind: "quota_exhausted" } });
+    expect(events.find(event => event.kind === "notice")).toMatchObject({ title: "Paused — quota or balance exhausted",
+      description: expect.stringContaining(title) });
+    const auth = await runtime("codex", [], failedResponse("Please sign in", "access", ["login"]));
+    await expect(auth.rt.prompt("go", undefined, { recoveryScope: "ephemeral" })).rejects.toMatchObject({ name: "ReauthParked",
+      message: "Please sign in" });
+  });
+
+  it("leaves agents without typed failures and ordinary short JSON replies unchanged", async () => {
+    for (const [id, text] of [["grok", "Selected model is at capacity. Please try a different model."], ["codex", '{"answer":42}']]) {
+      const { rt } = await runtime(id!, [{ sessionUpdate: "agent_message_chunk", content: { type: "text", text: text! } }]);
+      const events: AgentEvent[] = [];
+      rt.onEvent(event => { events.push(event); });
+      await expect(rt.prompt("go", undefined, { recoveryScope: "ephemeral" })).resolves.toMatchObject({ stopReason: "end_turn" });
+      expect(events.filter(event => event.kind === "agent-text").map(event => event.kind === "agent-text" ? event.text : "").join("")).toBe(text);
+    }
+  });
+
+  it("does not parse replies from an agent that negotiated typed failures", async () => {
+    const title = "Selected model is at capacity. Please try a different model.";
+    const { rt } = await runtime("codex", [{ sessionUpdate: "agent_message_chunk", content: { type: "text", text: title } }], { stopReason: "end_turn" }, true);
+    const events: AgentEvent[] = [];
+    rt.onEvent(event => { events.push(event); });
+    await expect(rt.prompt("quote this provider message", undefined, { recoveryScope: "ephemeral" })).resolves.toMatchObject({ stopReason: "end_turn" });
+    expect(events.find(event => event.kind === "agent-text")).toMatchObject({ text: title });
+  });
+
   it.each(["codex", "claude", "grok"])("advertises notices on %s's actual initialize exchange", async (agentId) => {
     const { capabilities } = await runtime(agentId, []);
     expect(capabilities?.session?.notices).toEqual({});
     expect(capabilities?.fs).toEqual({ readTextFile: false, writeTextFile: false });
-    expect(capabilities?._meta).toBeUndefined();
+    expect(capabilities?._meta).toEqual({ jetbrains: { air: { version: 1, capabilities: ["sessionFailure"] } } });
   });
 
   it.each(["full", "simple"] as const)("keeps a warning off chat and on the %s status card, without changing tool state", async (style) => {
@@ -88,7 +158,7 @@ describe("ACP session notices", () => {
     const events: AgentEvent[] = [];
     const turn = injectedTurn(rt, logger, (event) => { events.push(event); panel.handleEvent(event); });
     expect(await turn.run()).toMatchObject({ text: "answer", stopReason: "end_turn" });
-    await panel.refresh();
+    await (panel as unknown as { refresh(): Promise<void> }).refresh();
     expect(JSON.stringify(edits.at(-1))).toContain(warning.title);
     expect(status.activity).toEqual([]);
     expect(status.action).toBe("Starting…");

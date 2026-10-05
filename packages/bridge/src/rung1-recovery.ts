@@ -1,6 +1,12 @@
 import { randomUUID } from "node:crypto";
 import {
   remoteRung1KindBackoff,
+  remoteRung1Budget,
+  providerRetryBackoff,
+  PROVIDER_RETRY_WINDOW_MS,
+  sessionFailureError,
+  supportsSessionFailures,
+  CodexReplyGate,
   type AdapterErrorKind,
   type RemoteRecoveryResult,
   type RemoteRecoverySnapshot,
@@ -32,17 +38,21 @@ interface ArmedRecovery {
   terminal: boolean;
   resultLimitExceeded: boolean;
   inputObserved: boolean;
+  replyGate?: CodexReplyGate;
+  failureStartedMs?: number;
   snapshot: RemoteRecoverySnapshot;
   timer?: ReturnType<typeof setTimeout>;
 }
 
 export interface Rung1RecoveryHooks {
+  agentId?: string;
   policyFor(slot: number): RemoteRung1Policy | undefined;
   classify(slot: number, error: unknown): AdapterErrorKind;
   write(slot: number, line: string): boolean;
   publishSnapshot(slot: number, snapshot: RemoteRecoverySnapshot): void;
   publishResult(slot: number, result: RemoteRecoveryResult): void;
   controllerConnected(): boolean;
+  publishOutput?(slot: number, line: string): void;
   now?: () => number;
 }
 
@@ -111,14 +121,18 @@ function validOpaqueId(value: unknown): value is string {
  */
 export function createRung1Recovery(hooks: Rung1RecoveryHooks) {
   const armed = new Map<number, ArmedRecovery>();
+  const typedFailures = new Set<number>();
   const now = hooks.now ?? Date.now;
+  const notice = (slot: number, sessionId: string, title: string, description: string) => hooks.publishOutput?.(slot,
+    `${JSON.stringify({ jsonrpc: "2.0", method: "session/update", params: { sessionId,
+      update: { sessionUpdate: "notice", severity: "warning", title, description } } })}\n`);
 
   const publish = (slot: number, state: ArmedRecovery, patch: Partial<RemoteRecoverySnapshot>): void => {
     state.snapshot = {
       ...state.snapshot,
       ...patch,
       retry: state.retry,
-      remaining: Math.max(0, state.policy.retryCount - state.retry),
+      remaining: Math.max(0, state.snapshot.budget - state.retry),
       updatedUtc: new Date(now()).toISOString(),
     };
     hooks.publishSnapshot(slot, { ...state.snapshot });
@@ -157,20 +171,35 @@ export function createRung1Recovery(hooks: Rung1RecoveryHooks) {
     slot: number,
     state: ArmedRecovery,
     kind: AdapterErrorKind,
+    error: Error,
+    terminal: JsonRpcRecord,
   ): boolean => {
     const kindSchedule = remoteRung1KindBackoff(state.policy, kind);
     const kindRetry = state.kindRetries.get(kind) ?? 0;
-    const delay = kindSchedule ? kindSchedule[kindRetry] : state.policy.backoffMs[state.retry];
+    let delay = kindSchedule ? kindSchedule[kindRetry] : state.policy.backoffMs[state.retry];
     if (delay === undefined || !state.policy.retryableErrorKinds.includes(kind)) return false;
+    state.failureStartedMs ??= now();
+    if (providerRetryBackoff(kind)) {
+      const remaining = PROVIDER_RETRY_WINDOW_MS - (now() - state.failureStartedMs);
+      if (remaining <= 0) return false;
+      delay = Math.min(delay, remaining - 1);
+    }
     state.retry += 1;
     state.kindRetries.set(kind, kindRetry + 1);
+    if (state.replyGate) state.replyGate = new CodexReplyGate();
     publish(slot, state, {
       phase: "backoff",
       disposition: "continue_same_session",
       errorKind: kind,
     });
+    notice(slot, state.acpSessionId, `Retrying provider failure — attempt ${state.retry} in ${delay / 1000}s`, error.message);
     state.timer = setTimeout(() => {
       state.timer = undefined;
+      if (providerRetryBackoff(kind) && now() - state.failureStartedMs! >= PROVIDER_RETRY_WINDOW_MS) {
+        finish(slot, state, "failed", { phase: "exhausted", terminalReason: "budget_exhausted", errorKind: kind }, undefined, error.message);
+        hooks.publishOutput?.(slot, `${JSON.stringify({ ...terminal, id: state.originalRequestId })}\n`);
+        return;
+      }
       const requestId = `seam-r1-${randomUUID()}`;
       state.activeRequestId = requestId;
       publish(slot, state, {
@@ -226,8 +255,8 @@ export function createRung1Recovery(hooks: Rung1RecoveryHooks) {
         rung: 1,
         phase: "armed",
         retry: 0,
-        budget: policy.retryCount,
-        remaining: policy.retryCount,
+        budget: remoteRung1Budget(policy),
+        remaining: remoteRung1Budget(policy),
         disposition: "none",
         reconcileSupported: true,
         updatedUtc: new Date(now()).toISOString(),
@@ -243,6 +272,7 @@ export function createRung1Recovery(hooks: Rung1RecoveryHooks) {
         terminal: false,
         resultLimitExceeded: false,
         inputObserved: false,
+        ...(hooks.agentId === "codex" && !typedFailures.has(slot) ? { replyGate: new CodexReplyGate() } : {}),
         snapshot,
       };
       armed.set(slot, state);
@@ -278,15 +308,28 @@ export function createRung1Recovery(hooks: Rung1RecoveryHooks) {
     },
 
     observeOutput(slot: number, line: string): Rung1OutputDecision {
+      let message = parseLine(line);
+      if (message && record(message.result)?.protocolVersion !== undefined && supportsSessionFailures(message.result)) {
+        typedFailures.add(slot);
+        const state = armed.get(slot);
+        if (state) state.replyGate = undefined;
+      }
       const state = armed.get(slot);
       if (!state || state.terminal) return { forward: line };
-      const message = parseLine(line);
       if (!message) return { forward: line };
 
       const chunk = textChunk(message, state.acpSessionId);
       if (chunk !== undefined) {
-        if (state.text.length + chunk.length <= MAX_RESULT_CHARS) state.text += chunk;
+        const text = state.replyGate ? state.replyGate.push(chunk) : chunk;
+        if (state.text.length + text.length <= MAX_RESULT_CHARS) state.text += text;
         else state.resultLimitExceeded = true;
+        if (state.replyGate) {
+          if (!text) return { forward: null };
+          const params = record(message.params)!;
+          const update = record(params.update)!;
+          return { forward: `${JSON.stringify({ ...message, params: { ...params,
+            update: { ...update, content: { ...record(update.content), text } } } })}\n` };
+        }
         return { forward: line };
       }
 
@@ -304,7 +347,20 @@ export function createRung1Recovery(hooks: Rung1RecoveryHooks) {
 
       if (!terminalFor(message, state.activeRequestId)) return { forward: line };
       const wasRetry = state.activeRequestId !== state.originalRequestId;
+      const failure = "result" in message
+        ? sessionFailureError(message.result) ?? state.replyGate?.failure() : undefined;
+      if (failure) {
+        message = { jsonrpc: "2.0", id: message.id, error: {
+          code: -32603, message: failure.message, ...("data" in failure ? { data: failure.data } : {}),
+        } };
+        line = `${JSON.stringify(message)}\n`;
+      }
       if ("result" in message) {
+        const tail = state.replyGate?.flush() ?? "";
+        state.text += tail;
+        const prefix = tail ? `${JSON.stringify({ jsonrpc: "2.0", method: "session/update", params: {
+          sessionId: state.acpSessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: tail } },
+        } })}\n` : "";
         if (state.resultLimitExceeded) {
           finish(slot, state, "failed", {
             phase: "exhausted",
@@ -318,21 +374,24 @@ export function createRung1Recovery(hooks: Rung1RecoveryHooks) {
           }, stopReason(message));
         }
         return {
-          forward: wasRetry
+          forward: prefix + (wasRetry
             ? `${JSON.stringify({ ...message, id: state.originalRequestId })}\n`
-            : line,
+            : line),
         };
       }
 
-      const kind = hooks.classify(slot, errorForClassification(message));
-      const shouldRetry = state.retry < state.policy.retryCount
+      const error = errorForClassification(message);
+      const kind = hooks.classify(slot, error);
+      const shouldRetry = state.retry < state.snapshot.budget
         && state.policy.retryableErrorKinds.includes(kind);
-      if (shouldRetry && scheduleContinuation(slot, state, kind)) return { forward: null };
+      if (shouldRetry && scheduleContinuation(slot, state, kind, error, message)) return { forward: null };
+      if (kind === "quota_exhausted") notice(slot, state.acpSessionId,
+        "Paused — quota or balance exhausted", `${error.message}\nRetry after the reset or top-up; no automatic retries.`);
       finish(slot, state, "failed", {
         phase: "exhausted",
         terminalReason: "budget_exhausted",
         errorKind: kind,
-      });
+      }, undefined, error.message);
       return {
         forward: wasRetry
           ? `${JSON.stringify({ ...message, id: state.originalRequestId })}\n`
@@ -413,6 +472,7 @@ export function createRung1Recovery(hooks: Rung1RecoveryHooks) {
       const state = armed.get(slot);
       if (state?.timer) clearTimeout(state.timer);
       armed.delete(slot);
+      typedFailures.delete(slot);
     },
   };
 }

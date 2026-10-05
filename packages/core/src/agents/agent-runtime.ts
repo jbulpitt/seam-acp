@@ -37,6 +37,13 @@ import {
   attachErrorClassification,
   errorData,
   errorMessage,
+  SESSION_FAILURE_CAPABILITIES,
+  readSessionFailure,
+  sessionFailureError,
+  supportsSessionFailures,
+  CodexReplyGate,
+  providerRetryBackoff,
+  PROVIDER_RETRY_WINDOW_MS,
   readErrorClassification,
   resolveError,
   unclassified,
@@ -293,6 +300,7 @@ export const ACP_CLIENT_CAPABILITIES = Object.freeze({
   fs: Object.freeze({ readTextFile: false, writeTextFile: false }),
   elicitation: Object.freeze({ form: Object.freeze({}), url: Object.freeze({}) }),
   session: Object.freeze({ notices: Object.freeze({}) }),
+  _meta: SESSION_FAILURE_CAPABILITIES,
 }) satisfies ClientCapabilities;
 
 const ASYNC_INPUT_MAX_QUESTIONS = 20;
@@ -467,6 +475,8 @@ export class AgentRuntime {
   /** True while a `session/prompt` is awaiting a response — lets the abort path
    *  tell whether a graceful cancel actually ended the turn before escalating. */
   private promptInFlight = false;
+  private providerReplyGate?: CodexReplyGate;
+  private sessionFailuresSupported = false;
   /** The bridge owns this in-flight turn's result (#467); set while it runs. */
   private delegatedTurn = false;
   private detached = false;
@@ -908,6 +918,7 @@ export class AgentRuntime {
       throw enriched;
     });
     initialized = true;
+    this.sessionFailuresSupported = supportsSessionFailures(initResult);
     this.promptCapabilities =
       initResult.agentCapabilities?.promptCapabilities ?? undefined;
     this.loadSessionSupported = initResult.agentCapabilities?.loadSession === true;
@@ -1421,6 +1432,7 @@ export class AgentRuntime {
       const sendPrompt = (): Promise<{ stopReason: string }> =>
         new Promise<{ stopReason: string }>((resolve, reject) => {
           this.rejectInFlightPrompt = reject;
+          this.providerReplyGate = this.profile.id === "codex" && !this.sessionFailuresSupported ? new CodexReplyGate() : undefined;
           const params = {
             sessionId: sid,
             // Continue the recorded transcript after any output/tool update;
@@ -1431,7 +1443,14 @@ export class AgentRuntime {
               : {}),
           };
           this.submissionRequests.set(params, receipt.submission);
-          conn.prompt(params).then(resolve, reject);
+          conn.prompt(params).then(async result => {
+            await this.sessionUpdates.idle();
+            const failure = sessionFailureError(result) ?? this.providerReplyGate?.failure();
+            if (failure) throw failure;
+            const tail = this.providerReplyGate?.flush();
+            if (tail) await this.handleContentBlock({ type: "text", text: tail }, "message");
+            return result;
+          }).then(resolve, reject);
         });
 
       // #448: one prompt owner replaces both #404's credential-file gate and
@@ -1483,6 +1502,8 @@ export class AgentRuntime {
         res = await runBoundedRecovery({
         run,
         signal: recoveryAbort.signal,
+        windowMs: error => providerRetryBackoff(readErrorClassification(error)?.errorKind ?? "unclassified")
+          ? PROVIDER_RETRY_WINDOW_MS : undefined,
         delays: error => {
           const resolution = resolveError(readErrorClassification(error) ?? unclassified(this.profile.id), DEFAULT_ERROR_RULES);
           const directive = buildRecoveryDirective(resolution,
@@ -1500,7 +1521,7 @@ export class AgentRuntime {
           retryBudget = schedule.length;
           return schedule;
         },
-        onRetry: async (_error, retry, delayMs) => {
+        onRetry: async (error, retry, delayMs) => {
           // #536/#467: unknown acceptance makes RESEND unsafe, not continue.
           // Only positive rpc_never_invoked evidence permits original replay.
           continuing = receipt.submission.acceptance.state !== "not_accepted";
@@ -1535,8 +1556,9 @@ export class AgentRuntime {
             this.resumePromptText = story.prompt;
             this.resumeEchoBuffer = "";
           }
-          this.logger.warn({ sessionId: sid, retry, delayMs, continuing }, story.note);
-          await this.emit({ kind: "recovery", message: story.note });
+          const cause = errorMessage(error);
+          this.logger.warn({ sessionId: sid, retry, delayMs, continuing, errorMessage: cause }, story.note);
+          await this.emit({ kind: "recovery", message: `${story.note}\n${cause}` });
         },
         });
       }
@@ -1547,11 +1569,16 @@ export class AgentRuntime {
         ...(rejected ? { rejectedAttachments: rejected } : {}),
       };
     } catch (error) {
+      if (readErrorClassification(error)?.errorKind === "quota_exhausted") {
+        await this.emit({ kind: "notice", agent: this.profile.id, severity: "warning",
+          title: "Paused — quota or balance exhausted", description: `${errorMessage(error)}\nRetry after the reset or top-up; no automatic retries.` });
+      }
       const parked = this.reauthPark(error, lastErrorKind);
       if (parked) throw parked;
       throw error;
     } finally {
       hangAbort.abort();
+      this.providerReplyGate = undefined;
       this.promptInFlight = false;
       this.delegatedTurn = false;
       this.recoveryAbort = undefined;
@@ -2304,6 +2331,8 @@ export class AgentRuntime {
    *  resumed first prompt that never echoes must still emit — see the flush in
    *  `prompt()`'s teardown). */
   private async dispatchSessionUpdate(update: SessionUpdate): Promise<void> {
+    const failure = readSessionFailure(update);
+    if (failure) this.logger.warn({ agentId: this.profile.id, ...failure }, "ACP session failure update");
     const fallback = objectRecord(objectRecord(update._meta)?.[SEAM_AGY_STDOUT_FALLBACK_META]);
     // Refuse only malformed/foreign telemetry. The answer and existing caveat
     // still flow; neither prose nor an unrelated adapter can assert this fact.
@@ -2331,7 +2360,10 @@ export class AgentRuntime {
           await this.emit({ kind: "async-user-input", ...asyncInput });
           return;
         }
-        await this.handleContentBlock(update.content, "message", {
+        const content = update.content.type === "text" && this.providerReplyGate
+          ? { ...update.content, text: this.providerReplyGate.push(update.content.text) } : update.content;
+        if (content.type === "text" && !content.text) return;
+        await this.handleContentBlock(content, "message", {
           messageId: update.messageId ?? undefined,
         });
         return;

@@ -1,4 +1,5 @@
 import type { ErrorVerdict, RecoveryRung } from "@seam/adapters";
+import { providerRetryBackoff } from "@seam/adapters";
 
 /** Versioned wire DATA, not closures, Error objects, or provider wording. #467
  * will attach this to a daemon slot; until then execution is process-local.
@@ -31,13 +32,14 @@ export function buildRecoveryDirective(
     ? [5] as const
     : ([1, 2, 3, 4, 5] as const).filter(rung =>
       rung === 5 || (rung >= verdict.startRung && permittedRungs.includes(rung)));
+  const backoff = providerRetryBackoff(verdict.errorKind) ?? [2_000, 5_000, 10_000];
   return {
     version: 1, scope, startRung: verdict.startRung, surface: true,
     tier: verdict.tier, optionCount: verdict.optionCount,
     steps: rungs.map(rung => ({
       rung,
-      retryCount: rung === 1 ? 3 : rung === 5 ? 0 : 1,
-      backoffMs: rung === 1 ? [2_000, 5_000, 10_000] : rung === 5 ? [] : [0],
+      retryCount: rung === 1 ? backoff.length : rung === 5 ? 0 : 1,
+      backoffMs: rung === 1 ? [...backoff] : rung === 5 ? [] : [0],
       optionIds: verdict.options.filter(option => option.rung === rung).map(option => option.id),
     })),
   };
@@ -53,18 +55,30 @@ export async function runBoundedRecovery<T>(opts: {
   onRetry?: (error: unknown, retry: number, delayMs: number) => void | Promise<void>;
   sleep?: (ms: number) => Promise<void>;
   signal?: AbortSignal;
+  windowMs?: (error: unknown) => number | undefined;
+  now?: () => number;
 }): Promise<T> {
   let budget: number | undefined;
+  let started: number | undefined;
+  let windowMs: number | undefined;
+  const now = opts.now ?? Date.now;
   for (let retry = 0; ; retry++) {
     try { return await opts.run(); }
     catch (error) {
       const delays = opts.delays(error);
       budget ??= delays.length;
+      started ??= now();
+      windowMs ??= opts.windowMs?.(error);
       // Cancellation refuses only further recovery, never destroys the session.
       // Cancel during backoff is reachable via /seam cancel and must not fire a
       // surprise paid prompt after the operator has stopped the work.
       if (retry >= budget || retry >= delays.length || opts.signal?.aborted) throw error;
-      const delay = delays[retry]!;
+      let delay = delays[retry]!;
+      if (windowMs !== undefined) {
+        const remaining = windowMs - (now() - started);
+        if (remaining <= 0) throw error;
+        delay = Math.min(delay, remaining - 1);
+      }
       await opts.onRetry?.(error, retry + 1, delay);
       if (opts.sleep) await opts.sleep(delay);
       else await new Promise<void>(resolve => {
@@ -78,6 +92,7 @@ export async function runBoundedRecovery<T>(opts: {
         if (opts.signal?.aborted) finish();
       });
       if (opts.signal?.aborted) throw error;
+      if (windowMs !== undefined && now() - started >= windowMs) throw error;
     }
   }
 }

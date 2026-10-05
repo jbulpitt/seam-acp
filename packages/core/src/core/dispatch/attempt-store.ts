@@ -151,8 +151,9 @@ export class DispatchSuspendedError extends Error {
     /** WHY, in operator terms — e.g. "thread switched from codex to claude". */
     readonly reason: string,
     readonly suspension: SuspensionClass,
+    cause?: unknown,
   ) {
-    super("dispatch attempt no longer owns execution");
+    super("dispatch attempt no longer owns execution", cause === undefined ? undefined : { cause });
     this.name = "DispatchSuspendedError";
     if (!reason.trim()) throw new Error("DispatchSuspendedError requires a non-empty reason");
   }
@@ -168,8 +169,8 @@ export class DispatchSuspendedError extends Error {
   }
 
   /** Boot recovery failed before any prompt, and may be tried again safely. */
-  static retryable(dispatchId: string, reason: string): DispatchSuspendedError {
-    return new DispatchSuspendedError(dispatchId, reason, "retryable");
+  static retryable(dispatchId: string, reason: string, cause?: unknown): DispatchSuspendedError {
+    return new DispatchSuspendedError(dispatchId, reason, "retryable", cause);
   }
 
   /** A resume cannot safely proceed and nobody else will finish it. */

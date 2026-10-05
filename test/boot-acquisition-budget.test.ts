@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { BootAcquisitionExhaustedError, DispatchAcquisitionPhase, isRetryableBootAcquisitionError } from "../packages/core/src/core/dispatch/acquisition-phase.js";
+import { BootAcquisitionExhaustedError, DispatchAcquisitionPhase, isRetryableBootAcquisitionError, bootRecoveryBackoff, bootErrorClassification } from "../packages/core/src/core/dispatch/acquisition-phase.js";
+import { attachErrorClassification, providerRetryBackoff } from "@seam/adapters";
 
 describe("#448 acquisition owner outcome", () => {
   it("a classified missing session cannot spend a load retry budget", () => {
@@ -10,6 +11,25 @@ describe("#448 acquisition owner outcome", () => {
     expect(isRetryableBootAcquisitionError(new Error("outer wrapper", { cause: gone }))).toBe(false);
     expect(isRetryableBootAcquisitionError(new Error("Internal error"))).toBe(true);
   });
+  it("keeps the adapter's provider cause through dispatch acquisition for its existing retry owner", async () => {
+    const error = new Error("Overloaded");
+    attachErrorClassification(error, { agentId: "claude", errorKind: "server_error" });
+    const wrapped = await new DispatchAcquisitionPhase("provider", "boot-recovery").acquire(async () => { throw error; }).catch(e => e);
+    expect(wrapped.cause).toBe(error);
+    expect(bootErrorClassification(wrapped)).toMatchObject({ errorKind: "server_error" });
+    expect(bootRecoveryBackoff(wrapped)).toEqual(providerRetryBackoff("server_error")!.map(delay => Math.max(30_000, delay)));
+    expect(bootRecoveryBackoff(new Error("ACP connection closed"))).toEqual([30_000, 30_000]);
+  });
+
+  it.each(["quota_exhausted", "auth_required", "auth_expired", "model_not_found", "invalid_request"] as const)(
+    "does not turn %s into boot-recovery retry loops", async kind => {
+      const error = new Error(`provider refused: ${kind}`);
+      attachErrorClassification(error, { agentId: "codex", errorKind: kind });
+      expect(isRetryableBootAcquisitionError(new Error("wrapper", { cause: error }))).toBe(false);
+      await expect(new DispatchAcquisitionPhase("provider", "boot-recovery").acquire(async () => { throw error; }))
+        .rejects.toMatchObject({ suspension: "defect", reason: `provider acquisition failed during boot-recovery: ${error.message}` });
+    });
+
   it.each([
     Object.assign(new Error("load timed out"), { code: "session_load_timeout" }),
     Object.assign(new Error("bridge socket lost"), { bridgeUnreachable: true }),

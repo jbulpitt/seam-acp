@@ -13,7 +13,8 @@ import {
   type SettledUnstartedAttempt,
   type TurnAttempt,
 } from "../../core/dispatch/attempt-store.js";
-import { BootAcquisitionExhaustedError, DispatchAcquisitionPhase, isRetryableBootAcquisitionError } from "../../core/dispatch/acquisition-phase.js";
+import { BootAcquisitionExhaustedError, DispatchAcquisitionPhase, isRetryableBootAcquisitionError, bootRecoveryBackoff, bootErrorClassification } from "../../core/dispatch/acquisition-phase.js";
+import { PROVIDER_RETRY_WINDOW_MS, providerRetryBackoff } from "@seam/adapters";
 import { compareExecutionIdentity, executionIdentity, parseExecutionIdentity } from "../../core/dispatch/execution-identity.js";
 import { projectAttemptCard } from "../../core/attempt-card-projection.js";
 import { MessageFlags, EmbedBuilder, ButtonBuilder, ActionRowBuilder, ButtonStyle, StringSelectMenuBuilder, ModalBuilder, TextInputBuilder, TextInputStyle, AttachmentBuilder, type ChatInputCommandInteraction, type AutocompleteInteraction, type MessageComponentInteraction, type Message, type InteractionEditReplyOptions } from "discord.js";
@@ -172,8 +173,6 @@ import {
 } from "../../core/session-attach.js";
 import { renderCatalogEvidenceLines } from "../../core/catalog-evidence-render.js";
 import {
-  BOOT_RECOVERY_ATTEMPTS,
-  BOOT_RECOVERY_BACKOFF_MS,
   DispatchWatcher,
   type DispatchTargetFence,
 } from "../../core/dispatch/watcher.js";
@@ -7073,7 +7072,9 @@ export class Orchestrator {
     attemptId: string,
     resumeSessionId?: string,
   ): Promise<AgentRuntime> {
-    for (let attempt = 1; attempt <= BOOT_RECOVERY_ATTEMPTS; attempt++) {
+    let budget: number | undefined;
+    let started: number | undefined;
+    for (let attempt = 1; ; attempt++) {
       try {
         return await (resumeSessionId
           ? this.router.getOrStartRuntime(record, { resumeSessionId })
@@ -7101,12 +7102,18 @@ export class Orchestrator {
         if (!isRetryableBootAcquisitionError(err)) {
           throw err;
         }
-        if (attempt === BOOT_RECOVERY_ATTEMPTS) {
+        const schedule = bootRecoveryBackoff(err);
+        budget ??= schedule.length;
+        started ??= Date.now();
+        let backoffMs = schedule[attempt - 1];
+        const provider = providerRetryBackoff(bootErrorClassification(err)?.errorKind ?? "unclassified");
+        const remaining = PROVIDER_RETRY_WINDOW_MS - (Date.now() - started);
+        if (attempt > budget || backoffMs === undefined || provider && remaining <= 0) {
           // Refuse only this exhausted resume. The binding, provider, and other
           // sessions remain available, while workflows exposes the named cause.
-          throw new BootAcquisitionExhaustedError(BOOT_RECOVERY_ATTEMPTS, err);
+          throw new BootAcquisitionExhaustedError(attempt, err);
         }
-        const backoffMs = BOOT_RECOVERY_BACKOFF_MS[attempt - 1]!;
+        if (provider) backoffMs = Math.min(backoffMs, remaining - 1);
         this.logger.warn(
           { attemptId, attempt, backoffMs, err },
           "live turn: transient boot recovery acquisition failed; retrying recorded session",
@@ -7118,9 +7125,9 @@ export class Orchestrator {
             "shutdown interrupted boot-recovery backoff; the next boot owns the turn",
           );
         }
+        if (provider && Date.now() - started >= PROVIDER_RETRY_WINDOW_MS) throw new BootAcquisitionExhaustedError(attempt, err);
       }
     }
-    throw new Error("unreachable live recovery retry state");
   }
 
   /**

@@ -9,6 +9,8 @@ export type {
 } from "./mux.js";
 export * from "./agent-profile.js";
 export * from "./error-classification.js";
+export * from "./session-failure.js";
+export * from "./provider-retry.js";
 export * from "./error-resolver.js";
 export * from "./remote-recovery.js";
 export * from "./catalog-evidence.js";

@@ -11,6 +11,8 @@
 import type { ChildProcess } from "node:child_process";
 import {
   unclassified,
+  errorMessage,
+  errorData,
 } from "@seam/adapters";
 import { createLineFramer } from "./output-log.js";
 import { loadHostAdapterInventory } from "./inventory.js";
@@ -91,15 +93,24 @@ function start(config: AdapterChildBootstrap): void {
   const resumeRecord = createResumeRecorder(process.env.SEAM_SESSIOND_RESUME_FILE, config);
   clearResumeRecord = () => resumeRecord.clear();
   const recovery = createRung1Recovery({
+    agentId: config.config.agentId,
     policyFor: () => config.config.rung1Recovery,
     classify: (_slot, error) => {
       const adapter = config.config.agentId ? adapters.get(config.config.agentId) : undefined;
+      const data = errorData(error);
+      const raw = error as { code?: unknown };
+      let kind;
       try {
-        return (adapter?.classifyError?.(error) ?? unclassified(config.config.agentId ?? "unknown")).errorKind;
+        kind = (adapter?.classifyError?.(error) ?? unclassified(config.config.agentId ?? "unknown")).errorKind;
       } catch {
-        return "unclassified";
+        kind = "unclassified" as const;
       }
+      process.stderr.write(`${JSON.stringify({ level: 40, agentId: config.config.agentId, errorKind: kind,
+        operation: "session/prompt", errorMessage: errorMessage(error), errorCode: raw.code ?? data?.code ?? null,
+        errorStatus: data?.status ?? data?.httpStatus ?? null, errorData: data, msg: "adapter error classified" })}\n`);
+      return kind;
     },
+    publishOutput: (_slot, data) => publish({ v: ADAPTER_CHILD_PROTOCOL_VERSION, type: "data", data }),
     write: (_slot, line) => writeAgent(line),
     publishSnapshot: (_slot, snapshot) => publish({
       v: ADAPTER_CHILD_PROTOCOL_VERSION,
@@ -172,10 +183,10 @@ function start(config: AdapterChildBootstrap): void {
 
   child.stdout?.on("data", (chunk: Buffer | string) => {
     for (const line of agentOutput.push(chunk.toString())) {
+      const decision = recovery.observeOutput(config.slot, line);
       if (resumeOutput(line)) continue;
       resumeRecord.observeOutput(line);
       permissions.observeOutput(line);
-      const decision = recovery.observeOutput(config.slot, line);
       resumeRecord.record(recovery.resumable(config.slot));
       if (decision.forward !== null) publish({
         v: ADAPTER_CHILD_PROTOCOL_VERSION,

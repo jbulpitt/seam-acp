@@ -6,7 +6,7 @@ export interface ComponentContribution {
   namespace: string;
   types: readonly ComponentEvent["kind"][];
   lifetime: "persistent" | "collector";
-  access: "read-only" | "mutating";
+  access: "read-only" | "mutating" | ((customId: string) => "read-only" | "mutating");
   authorization: "user" | "config-admin";
   handle(invocation: ComponentEvent, context: PluginContext): Promise<void>;
 }

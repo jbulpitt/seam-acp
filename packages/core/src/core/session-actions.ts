@@ -2,6 +2,7 @@ import type { AgentProfile, ISessionManager, SessionSummary } from "@seam/adapte
 import { promises as fsp } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 import { AgentRuntime } from "../agents/agent-runtime.js";
 import type { Logger } from "../lib/logger.js";
 import type { ChannelRef } from "../platforms/chat-adapter.js";
@@ -124,6 +125,18 @@ export class SessionActions {
     services: SessionActionServices;
   }) {}
 
+  get info() {
+    const { record, profile, cwd } = this.deps;
+    return { id: record.id, platform: record.platform, channelRef: record.channelRef,
+      parentRef: record.parentRef, agentId: record.agentId, acpSessionId: record.acpSessionId,
+      cwd, displayName: profile.displayName };
+  }
+
+  snapshot(): string {
+    const { record, binding, cwd } = this.deps;
+    return JSON.stringify({ record, binding, cwd });
+  }
+
   capabilities(): SessionBrowserCapabilities {
     const { manager, binding, services, router, record } = this.deps;
     const canCompact = services.compactionModel(binding) !== "";
@@ -210,8 +223,9 @@ export class SessionActions {
     return this.deps.manager.getTranscript(this.deps.cwd, sessionId);
   }
 
-  clone(sourceId: string, newId: string): Promise<void> {
-    return this.deps.manager.cloneSession(this.deps.cwd, sourceId, newId);
+  async clone(sourceId: string, newId: string = randomUUID()): Promise<string> {
+    await this.deps.manager.cloneSession(this.deps.cwd, sourceId, newId);
+    return newId;
   }
 
   async attach(sessionId: string): Promise<void> {

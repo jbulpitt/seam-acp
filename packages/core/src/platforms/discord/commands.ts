@@ -501,9 +501,6 @@ export function buildSeamCommand(): SlashCommandBuilder {
         declareAccess(sub, { kind: "read-only" }).setName("help").setDescription("Show help")
       )
       .addSubcommand((sub) =>
-        declareAccess(sub, { kind: "read-only" }).setName("sessions").setDescription("List recent sessions")
-      )
-      .addSubcommand((sub) =>
         declareAccess(sub, { kind: "read-only" }).setName("repos").setDescription("List repos under REPOS_ROOT")
       )
   );

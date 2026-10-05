@@ -39,6 +39,7 @@ import {
 } from "discord.js";
 import { SyntheticInteraction, validateSlashSpec, type TestInteractionSpec, type TranscriptEntry } from "./synthetic-interaction.js";
 import { discordComponentInteractions } from "./component-interactions.js";
+import { browserReply, browserReplyFromInteraction } from "./browser-reply.js";
 import {
   VoiceConnectionStatus,
   entersState,
@@ -472,6 +473,15 @@ export class DiscordAdapter implements ChatAdapter {
 
   onComponent(handler: (evt: ComponentEvent) => void | Promise<void>): void {
     this.componentHandler = handler;
+  }
+
+  restoreBrowserReply(target: string, userId: string, channelId: string) {
+    return browserReply(target, userId, channelId, async (saved) => {
+      const channel = await this.fetchSendableChannel(saved.channelId);
+      const message = await channel.messages.fetch(saved.messageId);
+      return { client: this.client, channel: channel as import("./synthetic-interaction.js").SyntheticContext["channel"],
+        user: this.client.user!, member: null, message };
+    });
   }
 
   onChoiceInteraction(handler: (evt: ChoiceInteraction) => void | Promise<void>): void {
@@ -2077,6 +2087,7 @@ export class DiscordAdapter implements ChatAdapter {
     }
 
     const evt: ComponentEvent = {
+      cardReply: browserReplyFromInteraction(interaction),
       interactionId: interaction.id,
       customId: interaction.customId,
       userId: interaction.user.id,

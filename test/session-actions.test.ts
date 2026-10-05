@@ -163,7 +163,7 @@ describe("SessionActions", () => {
     const h = fixture("remote");
     await h.actions.migrate("active", "target", async () => { h.events.push("delivery"); });
     expect(h.seed).toHaveBeenCalledWith(expect.objectContaining({ profile: expect.objectContaining({ id: "target" }), location: "remote" }));
-    expect(h.seed.mock.calls[0][0]).not.toHaveProperty("model");
+    expect(h.seed.mock.calls[0]![0]).not.toHaveProperty("model");
     expect(h.events).toEqual(["getTranscript", "seed", "invalidate", "upsert", "identity", "delivery"]);
     expect(h.record).toMatchObject({ agentId: "target", acpSessionId: "seeded" });
   });

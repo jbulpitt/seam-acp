@@ -1,3 +1,4 @@
+import { registerConfigUiCommands } from "./plugin-config-ui-fixture.js";
 import { registerScheduleCommands } from "./plugin-schedule-fixture.js";
 import fs from "node:fs";
 import os from "node:os";
@@ -26,6 +27,7 @@ export function namingRegistry() {
   const host = new PluginHost(logger);
   host.slash.register(plugin.id, plugin.contributions.slash!, { logger, config: undefined });
   registerScheduleCommands(host);
+  registerConfigUiCommands(host);
   return host.slash;
 }
 export function namingCommands() { return buildSlashRegistrationBody(namingRegistry()); }

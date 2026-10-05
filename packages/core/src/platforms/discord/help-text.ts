@@ -55,8 +55,6 @@ export function seamHelpSections(pluginHelp: readonly string[] = []): string[] {
       "`init` — bind this thread + open the config card",
       "`detach <detached|attached>` — no bot replies (history is kept)",
       "`tts [on|off] [voice] [pace] [style]` — omit options for the settings card",
-      "`show` · `set <json>` · `edit` — inspect / replace / edit session config",
-      "`audit [limit] [entry]` — recent config mutations (who/what/when)",
     ].join("\n"),
 
     [

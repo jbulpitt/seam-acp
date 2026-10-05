@@ -390,6 +390,7 @@ function makeQuiesceHost(over: Record<string, unknown> = {}) {
     plugins: new PluginHost((over.logger ?? silent) as Logger),
     identityEffects: { ready: Promise.resolve(), flush: async () => {} },
     scheduleUi: { ready: Promise.resolve() },
+    configUi: { ready: Promise.resolve() },
     intakeStopped: false,
     gatewayClosed: false,
     activeTurnSettles: new Set<Promise<void>>(),
@@ -404,6 +405,9 @@ function makeQuiesceHost(over: Record<string, unknown> = {}) {
     ...over,
   });
   (self.registerKernelComponents as () => void).call(self);
+  (self.plugins as PluginHost).components.register("config-ui", [{ namespace: "seam-cfg-edit:", types: ["button", "select", "modal"], lifetime: "persistent", access: "read-only", authorization: "user",
+    handle: evt => (self.handleConfigEditorComponent as (evt: unknown) => Promise<void>)(evt),
+  }], { logger: (over.logger ?? silent) as Logger, config: undefined });
   return self as unknown as {
     quiesce(o?: { timeoutMs?: number; clock?: DeadlineClock }): Promise<QuiesceOutcome>;
     drainAfterDispose(o?: { timeoutMs?: number; clock?: DeadlineClock }): Promise<QuiesceOutcome>;
@@ -3278,7 +3282,7 @@ describe("#174 the component aggregate reports every handler's failure", () => {
     await wrapper(evt);
     const entry = log.find(/component handler failed/);
     expect(entry?.level).toBe("error");
-    expect(entry?.data).toMatchObject({ plugin: "kernel", customId: "seam-cfg-edit:x" });
+    expect(entry?.data).toMatchObject({ plugin: "config-ui", customId: "seam-cfg-edit:x" });
     expect(String((entry?.data as { err?: Error }).err)).toMatch(/config write failed/);
   });
 

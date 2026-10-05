@@ -198,11 +198,7 @@ import {
 } from "../../core/reauth-negotiation.js";
 import { reauthAcceptAttemptId, reauthChoiceSpec } from "../../core/reauth-card.js";
 import { readDefaultBranchHead } from "../../core/dispatch/default-branch-head.js";
-import {
-  formatConfigAuditView,
-  formatConfigAuditDetail,
-  findAuditEntry,
-} from "./config-audit-view.js";
+
 import { summarizeAnomalies } from "../../core/watchdog.js";
 import type { BridgeHub } from "../../core/bridge-hub.js";
 import { remoteSessionManager } from "../../core/remote-session-manager.js";
@@ -256,30 +252,7 @@ import {
   currentHostPrefixedLabel,
   parseAgentAtLocation,
 } from "./location.js";
-import {
-  ConfigEditorStore,
-  INHERIT_VALUE,
-  RIDER_MODAL_MAX,
-  applyPickerValue,
-  authorizeDraftClick,
-  currentRiderText,
-  decodeRiderUpload,
-  editScopeOf,
-  effectiveAgentAtLocation,
-  isDirty,
-  makeCustomId,
-  parseCustomId,
-  renderCancelledHub,
-  renderExpiredHub,
-  renderHub,
-  renderSavedHub,
-  riderDownloadFilename,
-  riderTooLong,
-  snapshotFromDescribe,
-  type DraftAgentCapabilities,
-  type InheritedConfig,
-  type ThreadConfigDraft,
-} from "./config-editor.js";
+import { INHERIT_VALUE, type ThreadConfigDraft } from "./config-editor.js";
 import {
   bindSessionLocation,
   isolatedBindSessionId,
@@ -298,7 +271,6 @@ const SCHEDULED_COLOR = 0x3498db;
 /** Accent color for the read-only delegation-ledger view ("ledger teal"). */
 const WORKFLOWS_COLOR = 0x1abc9c;
 /** Accent color for the read-only config-audit view (#70). */
-const CONFIG_AUDIT_COLOR = 0x8e44ad;
 /** Operator-dispatch cards — distinct from scheduled blue so a thread's history
  *  shows at a glance which turns came from the dispatch bridge. */
 const DISPATCH_COLOR = 0x9b59b6;
@@ -350,19 +322,17 @@ import {
   type CodexAsyncAnswerDelivery,
 } from "../../core/elicitation/manager.js";
 import type { InboundAdmission } from "../../core/inbound-admission/types.js";
-import { DefaultAgentUnavailableError, SessionRouter, resolveSessionCwd, simpleCardGifForRender, statusCardStyleForRender } from "../../core/session-router.js";
+import { DefaultAgentUnavailableError, SessionRouter, simpleCardGifForRender, statusCardStyleForRender } from "../../core/session-router.js";
 import {
   parkedAgentMessage,
 } from "../../core/parked-agents.js";
 import {
-  FAST_MODE_COST_WARNING,
-  FAST_MODE_CONFIG_ID,
-  FAST_MODE_RESET_NOTICE,
   describeFastModeOutcome,
-  fastModeAgentRefusal,
-  fastModeEnvRefusal,
-  isFastModeDisabledByEnv,
 } from "../../core/fast-mode.js";
+import { catalogEffortChoices } from "./catalog-view.js";
+import { installConfigUi } from "../../core/config-ui.js";
+import { saveConfigEditorCard, configSetRequest, configSetSummary } from "../../plugins/config-ui/view.js";
+import { configUiInteraction } from "./config-ui-transport.js";
 import { installScheduleUi } from "../../core/schedule-ui.js";
 import { scheduleUiInteraction } from "./schedule-ui-transport.js";
 import { discordComponentInteractions } from "./component-interactions.js";
@@ -372,7 +342,7 @@ import {
   isSimpleCardGifTerminal,
   postSimpleCardGifMessage,
 } from "../../core/simple-card-gif.js";
-import { createConfigFacades, type ConfigApplyPlan, CONFIG_SET_FIELD_NAMES, type ConfigSetFieldName, type ConfigSetRequest, type PreparedConfigSet } from "../../core/config-apply-plan.js";
+import { createConfigFacades, type ConfigApplyPlan, type ConfigSetFieldName, type ConfigSetRequest, type PreparedConfigSet } from "../../core/config-apply-plan.js";
 import type { RuntimeTransition } from "../../core/runtime-transition.js";
 import { ConfigMutationService, type ConfigMutationInput } from "../../core/config-mutation.js";
 import type {
@@ -554,8 +524,6 @@ import {
 } from "../../core/thread-secrets.js";
 import {
   defaultSessionConfig,
-  parseSimpleCardGif,
-  parseStatusCardStyle,
   type ActiveProject,
   type DelegationKind,
   type PanelOrigin,
@@ -790,34 +758,7 @@ export interface QuiesceOutcome {
   continuations: number;
 }
 
-/** Reasoning-effort options for the `/seam effort` picker. Mirror of the SDK's
- *  EffortLevel type — keep in sync with commands.ts and the bundled SDK
- *  (docs/model-management-runbook.md §11). `ultra` is codex-only (not in the Claude SDK). */
-const EFFORT_CHOICES = [
-  { value: "low", label: "Low", description: "Fastest, least reasoning" },
-  { value: "medium", label: "Medium", description: "Light reasoning" },
-  { value: "high", label: "High", description: "Default for most models" },
-  { value: "xhigh", label: "X-High", description: "Deeper reasoning (Opus 4.7+)" },
-  { value: "max", label: "Max", description: "Maximum reasoning depth" },
-  { value: "ultra", label: "Ultra", description: "Max reasoning + auto task delegation (codex)" },
-];
-
-/** Generic labels/order only; availability always comes from the selected model. */
-export function catalogEffortChoices(supported: ReadonlyArray<string>): Array<{
-  value: string;
-  label: string;
-  description?: string;
-}> {
-  const declared = new Set(supported);
-  const known = EFFORT_CHOICES.filter((choice) => declared.delete(choice.value));
-  const fallback = [...declared].map((value) => ({
-    value,
-    label: value === "default" ? "Default" : value,
-    description: value === "default" ? "Use the catalog's provider default" : "Adapter-defined effort",
-  }));
-  return [...known, ...fallback];
-}
-
+export { catalogEffortChoices } from "./catalog-view.js";
 export function presetModelSelectOptions(
   models: ReadonlyArray<{ modelId: string; name: string }>,
   selected: string | null
@@ -1081,7 +1022,7 @@ export class Orchestrator {
   /** Set by index.ts after construction — pairing + debug + attach ferry. */
   private bridgeHub?: BridgeHub;
   /** In-memory /seam config edit drafts (#90). Idle TTL 60 min. */
-  private readonly configEditor = new ConfigEditorStore();
+  private readonly configUi: ReturnType<typeof installConfigUi>;
   /** In-memory /seam config tts drafts. Idle TTL 60 min. */
   private readonly ttsEditor = new TtsEditorStore();
   /** #92: declared HTTP result waiters for ingest-triggered choice turns. */
@@ -1222,6 +1163,23 @@ export class Orchestrator {
     });
     this.sessionBrowserReady = this.installSessionBrowser();
 
+    this.configUi = installConfigUi({
+      plugins: this.plugins, config: this.config, logger: this.logger, store: this.store,
+      router: this.router, modelCatalog: this.modelCatalog,
+      plan: () => this.getConfigApplyPlan(),
+      transport: this.adapter,
+      canEditChannelPreset: (user, parent) => Orchestrator.canEditChannelPreset(this.config, user, parent),
+      agentChoices: () => agentLocationPickerChoices(this.router.listProfiles(), {
+        bridges: this.config.bridgePresets.values(), connected: this.bridgeHub?.connectedIds(), agentsByHost: this.catalogAgentsByHost(),
+      }),
+      promptRepoPath: (channel, options) => this.promptRepoPath(channel, options),
+      rebuild: channel => this.configSetRebuildNote(this.router.ensureSessionRecord({ platform: channel.platform, channelRef: channel.id, ...(channel.parentId ? { parentRef: channel.parentId } : {}), cwd: this.config.REPOS_ROOT }), channel),
+      codeBlock: (text, language) => this.renderer.codeBlock(text, language),
+      repoDisplay: repo => this.repoDisplay(repo),
+      autocomplete: option => this.autocomplete.get("config", "set", option),
+      interaction: i => configUiInteraction(i, this.channelRefFromInteraction(i) ?? undefined),
+    });
+
     this.actionCards = new ActionCardManager({
       store: this.store.actionCards, adapter: this.adapter, logger: this.logger,
       binding: (record, acpSessionId) => {
@@ -1284,7 +1242,7 @@ export class Orchestrator {
   /** Wait for the effects of committed identity changes. */
   async flushIdentityEffects(sessionId?: string): Promise<void> { await this.identityEffects.flush(sessionId); }
 
-  async loadPlugins(): Promise<void> { await Promise.all([this.identityEffects.ready, this.cardVisualsReady, this.scheduleUi.ready, this.sessionBrowserReady]); }
+  async loadPlugins(): Promise<void> { await Promise.all([this.identityEffects.ready, this.cardVisualsReady, this.scheduleUi.ready, this.configUi.ready, this.sessionBrowserReady]); }
 
   /**
    * Bounded slash autocomplete responders (#slash-autocomplete). Registered
@@ -1842,7 +1800,6 @@ export class Orchestrator {
     const context = Object.freeze({ logger: this.logger, config: undefined });
     this.plugins.components.register("kernel", [
       ["seam-elicit:", (evt: ComponentEvent) => this.elicitations.handleComponent(evt)],
-      ["seam-cfg-edit:", (evt: ComponentEvent) => this.handleConfigEditorComponent(evt)],
       ["seam-tts:", (evt: ComponentEvent) => this.handleTtsEditorComponent(evt)],
       ["tvc:", (evt: ComponentEvent) => this.runVoiceConsoleComponent(evt)],
     ].map(([namespace, handle]) => ({ namespace: namespace as string, handle: handle as (evt: ComponentEvent) => Promise<void>, types: ["button", "select", "modal"] as const, lifetime: "persistent" as const, access: "read-only" as const, authorization: "user" as const })), context);
@@ -5340,6 +5297,7 @@ export class Orchestrator {
         view: async view => { await interaction.reply({ ...view, flags: MessageFlags.Ephemeral } as Parameters<typeof interaction.reply>[0]); },
       };
       if (slashGroup === "schedule") this.scheduleUi.bind(invocation, interaction);
+      if (slashGroup === "config") this.configUi.bind(invocation, interaction);
       if (await this.plugins.slash.dispatch(interaction.commandName ?? "seam", slashGroup, sub, Object.freeze(invocation))) return;
     }
     if (interaction.options.getSubcommandGroup(false) === "upload") {
@@ -5475,14 +5433,6 @@ export class Orchestrator {
           return this.cmdDetach(interaction);
         case "tts":
           return this.cmdTts(interaction);
-        case "show":
-          return this.cmdConfig(interaction);
-        case "edit":
-          return this.cmdConfigEdit(interaction);
-        case "set":
-          return this.cmdConfigSet(interaction);
-        case "audit":
-          return this.cmdConfigAudit(interaction);
       }
     }
     switch (sub) {
@@ -7156,6 +7106,7 @@ export class Orchestrator {
       repoDisplay: (repo: string | null) => this.repoDisplay(repo),
       unregisteredAgentMessage: (id: string, fallback: string) => this.refuseUnregisteredAgent(id, fallback),
       parkedSelectMessage: (id: string) => this.parkedSelectRefusal(id),
+      resolveRequestedRepoPath: (channel: ChannelRef, requested: string, location: string) => this.resolveRequestedRepoPath(channel, requested, location),
     }).plan; }
 
   getRuntimeTransition(): RuntimeTransition { return createConfigFacades({
@@ -7167,6 +7118,7 @@ export class Orchestrator {
       repoDisplay: (repo: string | null) => this.repoDisplay(repo),
       unregisteredAgentMessage: (id: string, fallback: string) => this.refuseUnregisteredAgent(id, fallback),
       parkedSelectMessage: (id: string) => this.parkedSelectRefusal(id),
+      resolveRequestedRepoPath: (channel: ChannelRef, requested: string, location: string) => this.resolveRequestedRepoPath(channel, requested, location),
     }).runtime; }
 
   getConfigMutation(): ConfigMutationService {
@@ -16400,864 +16352,18 @@ export class Orchestrator {
     return this.getRuntimeTransition().applyAgentChange(channel, record, id, actor, respond);
   }
 
-  private async cmdConfig(i: ChatInputCommandInteraction): Promise<void> {
-    const record = this.recordFromInteraction(i);
-    if (!record) {
-      await i.reply({ content: "Use inside a thread.", flags: MessageFlags.Ephemeral });
-      return;
-    }
-    const cfg = this.store.readConfig(record);
-    await i.reply({
-      content: this.renderer.codeBlock(JSON.stringify(cfg, null, 2), "json"),
-      flags: MessageFlags.Ephemeral,
+  private get configEditor() { return this.configUi.ui.configEditor; }
+  private async openConfigEditorCard(channel: ChannelRef, userId: string) { await this.configUi.ready; return this.configUi.open(channel, userId); }
+  private async handleConfigEditorComponent(evt: ComponentEvent) { await this.configUi.ready; return this.configUi.ui.handleConfigEditorComponent(evt); }
+  private async tryConsumeConfigEditorRiderUpload(msg: IncomingMessage) { await this.configUi.ready; return this.configUi.consumeRider(msg); }
+  private async saveConfigEditorDraft(draft: ThreadConfigDraft, evt: ComponentEvent) {
+    return saveConfigEditorCard(draft, evt, {
+      saveEditor: (d, actor) => Orchestrator.prototype.getConfigApplyPlan.call(this).saveEditor(d, actor, parent => Orchestrator.canEditChannelPreset(this.config, actor.id!, parent)),
+      deleteDraft: id => this.configEditor.delete(id),
+      editCard: (channel, message, panel) => this.editConfigEditorCard(channel, message, panel),
     });
   }
-
-  /** `/seam config edit` — visual draft-then-save hub (#90). Does not abort a live turn. */
-  private async cmdConfigEdit(i: ChatInputCommandInteraction): Promise<void> {
-    const channel = this.channelRefFromInteraction(i);
-    if (!channel || !i.channel?.isThread()) {
-      await i.reply({
-        content: "Use `/seam config edit` inside a thread.",
-        flags: MessageFlags.Ephemeral,
-      });
-      return;
-    }
-    if (!this.adapter.sendPanel) {
-      await i.reply({
-        content: "This platform cannot render the config editor card.",
-        flags: MessageFlags.Ephemeral,
-      });
-      return;
-    }
-    await i.reply({
-      content: "Opening thread config editor…",
-      flags: MessageFlags.Ephemeral,
-    });
-    await this.openConfigEditorCard(channel, i.user.id);
-  }
-
-  /**
-   * Bind `channel` as a session and post the config-editor hub card into it,
-   * owned by `userId`. The visual configuration surface (#90): `/seam config
-   * edit`, no-argument `/seam new`, and `/seam config init` (#157) all land
-   * here instead of running their own picker sequences.
-   *
-   * Returns the drafted card, or `null` when the platform cannot render panels.
-   */
-  private async openConfigEditorCard(
-    channel: ChannelRef,
-    userId: string
-  ): Promise<ThreadConfigDraft | null> {
-    if (!this.adapter.sendPanel) return null;
-    const record = this.router.ensureSessionRecord({
-      platform: channel.platform,
-      channelRef: channel.id,
-      ...(channel.parentId ? { parentRef: channel.parentId } : {}),
-      cwd: this.config.REPOS_ROOT,
-    });
-    const desc = this.router.describeConfig(record);
-    const withoutThread = this.inheritedConfigFor(record);
-    const chan = channel.parentId
-      ? this.config.channelPresets.get(channel.parentId)
-      : undefined;
-    const now = Date.now();
-    const draft: ThreadConfigDraft = {
-      id: randomUUID(),
-      threadId: channel.id,
-      ...(channel.parentId ? { parentRef: channel.parentId } : {}),
-      userId,
-      createdAt: now,
-      updatedAt: now,
-      snapshot: {
-        ...snapshotFromDescribe(desc, withoutThread),
-        channelPins: {
-          ...(chan?.agent?.value ? { agent: chan.agent.value } : {}),
-          ...(chan?.model?.value ? { model: chan.model.value } : {}),
-          ...(chan?.cwd?.value ? { cwd: chan.cwd.value } : {}),
-          ...(chan?.effort?.value ? { effort: chan.effort.value } : {}),
-          ...(chan?.role?.value ? { role: chan.role.value } : {}),
-          ...(chan?.disableThreadPrefix?.value === true ? { disableThreadPrefix: true } : {}),
-        },
-      },
-      overlay: {},
-      warnings: [],
-      editScope: "thread",
-    };
-    const evicted = this.configEditor.put(draft);
-    if (evicted?.messageId) {
-      await this.editConfigEditorCard(channel, evicted.messageId, renderExpiredHub(evicted));
-    }
-    const panel = renderHub(draft, {
-      modelHidden: this.modelCatalog.isHidden?.(this.catalogBindingForDraft(draft), this.catalogModelForDraft(draft)),
-      effortDisabled: this.effortDisabledFor(draft),
-      fastDisabled: this.fastDisabledFor(draft),
-      canEditChannel: Orchestrator.canEditChannelPreset(
-        this.config,
-        userId,
-        channel.parentId
-      ),
-    });
-    const ref = await this.adapter.sendPanel(channel, panel);
-    return this.configEditor.touch(draft.id, { messageId: ref.id }) ?? draft;
-  }
-
-  private inheritedConfigFor(
-    record: ReturnType<SessionRouter["ensureSessionRecord"]>
-  ): InheritedConfig {
-    const chan = record.parentRef
-      ? this.config.channelPresets.get(record.parentRef)
-      : undefined;
-    const cfg = this.store.readConfig(record);
-    const agent = chan?.agent?.value ?? record.agentId;
-    const location = resolveThreadLocation(this.config, record.channelRef);
-    const model = chan?.model?.value ?? cfg.model ??
-      this.modelCatalog.model({ agentId: agent, location }, "default")?.id ?? "default";
-    const chanEffort = chan?.effort?.value;
-    const effortUsable = Boolean(
-      chanEffort && this.modelCatalog.effortChoices({ agentId: agent, location: LOCAL_LOCATION }, model).includes(chanEffort)
-    );
-    const permission = (cfg.permissionPolicy ??
-      this.config.DEFAULT_PERMISSION_POLICY ??
-      "ask") as InheritedConfig["permission"];
-    return {
-      location: LOCAL_LOCATION,
-      agent,
-      model,
-      effort: effortUsable ? chanEffort! : cfg.reasoningEffort ?? null,
-      cwd: resolveSessionCwd({
-        repoPath: record.repoPath,
-        sessionCwdExplicit: cfg.sessionCwdExplicit === true,
-        channelCwd: chan?.cwd?.value,
-        defaultCwd: this.config.REPOS_ROOT,
-      }).value,
-      permission,
-      detached: false,
-      // #37: Fast is thread-preset only, so "without this thread" is always off.
-      fastMode: false,
-      statusCardStyle:
-        chan?.statusCardStyle?.value === "simple" || chan?.statusCardStyle?.value === "full"
-          ? chan.statusCardStyle.value
-          : "full",
-      simpleCardGif: typeof chan?.simpleCardGif?.value === "boolean" ? chan.simpleCardGif.value : false,
-      role: chan?.role?.value ?? null,
-      disableThreadPrefix: chan?.disableThreadPrefix?.value === true,
-    };
-  }
-
-  /**
-   * #37: hide the Fast control unless the drafted agent actually has Fast (and
-   * the deployment has not killed it). Offering a button that could only ever
-   * refuse is worse than not offering one.
-   */
-  private fastDisabledFor(draft: ThreadConfigDraft): boolean {
-    if (isFastModeDisabledByEnv()) return true;
-    const agentId =
-      draft.overlay.agent === undefined
-        ? draft.snapshot.agent.value
-        : draft.overlay.agent ?? draft.snapshot.withoutThread.agent;
-    return this.router.getProfile(agentId)?.fastMode === undefined;
-  }
-
-  private catalogBindingForDraft(draft: ThreadConfigDraft): CatalogBinding {
-    const channelScope = editScopeOf(draft) === "channel";
-    const selectedAgent = channelScope
-      ? draft.overlay.channelAgent === undefined
-        ? draft.snapshot.channelPins?.agent ?? draft.snapshot.withoutThread.agent
-        : draft.overlay.channelAgent ?? draft.snapshot.withoutThread.agent
-      : effectiveAgentAtLocation(draft);
-    const parsed = parseAgentAtLocation(selectedAgent);
-    return {
-      agentId: parsed.agentId,
-      location: parsed.explicit ? parsed.location : draft.snapshot.location.value,
-    };
-  }
-
-  private catalogModelForDraft(draft: ThreadConfigDraft): string {
-    const channelScope = editScopeOf(draft) === "channel";
-    return channelScope
-      ? draft.overlay.channelModel === undefined
-        ? draft.snapshot.channelPins?.model ?? draft.snapshot.withoutThread.model
-        : draft.overlay.channelModel ?? draft.snapshot.withoutThread.model
-      : draft.overlay.model === undefined
-        ? draft.snapshot.model.value
-        : draft.overlay.model ?? draft.snapshot.withoutThread.model;
-  }
-
-  private effortDisabledFor(draft: ThreadConfigDraft): boolean {
-    const model = this.modelCatalog.model(
-      this.catalogBindingForDraft(draft),
-      this.catalogModelForDraft(draft)
-    );
-    return !model || model.effort.mechanism === "none" ||
-      model.effort.choices.every((choice) => choice.id === "default");
-  }
-
-  private capsForAgent = (agentId: string, location = LOCAL_LOCATION): DraftAgentCapabilities | undefined => {
-    const models = this.modelCatalog.models({ agentId, location }, { includeHidden: true });
-    if (!models.length) return undefined;
-    return {
-      models: models.map((model) => ({
-        modelId: model.id,
-        effortMechanism: model.effort.mechanism,
-        effortLevels: model.effort.choices.map((choice) => choice.id),
-        effortDefault: model.effort.selectionDefault,
-      })),
-    };
-  };
-
-  private async editConfigEditorCard(
-    channel: ChannelRef,
-    messageId: string,
-    panel: ReturnType<typeof renderHub>
-  ): Promise<void> {
-    if (!this.adapter.editPanel) return;
-    try {
-      await this.adapter.editPanel({ channel, id: messageId }, panel);
-    } catch (err) {
-      this.logger.warn({ err, messageId }, "config editor hub edit failed");
-    }
-  }
-
-  private async refreshConfigEditorHub(draft: ThreadConfigDraft): Promise<void> {
-    if (!draft.messageId) return;
-    const panel = renderHub(draft, {
-      modelHidden: this.modelCatalog.isHidden?.(this.catalogBindingForDraft(draft), this.catalogModelForDraft(draft)),
-      effortDisabled: this.effortDisabledFor(draft),
-      fastDisabled: this.fastDisabledFor(draft),
-      canEditChannel: Orchestrator.canEditChannelPreset(
-        this.config,
-        draft.userId,
-        draft.parentRef
-      ),
-    });
-    await this.editConfigEditorCard(
-      { platform: "discord", id: draft.threadId, ...(draft.parentRef ? { parentId: draft.parentRef } : {}) },
-      draft.messageId,
-      panel
-    );
-  }
-
-  private async downloadConfigEditorRider(
-    draft: ThreadConfigDraft,
-    evt: ComponentEvent
-  ): Promise<void> {
-    const scope = editScopeOf(draft);
-    const text = currentRiderText(draft);
-    const noun = scope === "channel" ? "channel rider" : "thread rider";
-    if (text == null || text.length === 0) {
-      await evt
-        .followUpEphemeral(`No ${noun} to download. Use **Upload** to set one, then Save.`)
-        .catch(() => {});
-      return;
-    }
-    if (!this.adapter.sendFile) {
-      await evt.followUpEphemeral("This platform cannot send files.").catch(() => {});
-      return;
-    }
-    await this.adapter.sendFile(evt.channel, {
-      data: Buffer.from(text, "utf8"),
-      filename: riderDownloadFilename(
-        scope === "channel" ? (draft.parentRef ?? draft.threadId) : draft.threadId,
-        scope
-      ),
-      mimeType: "text/markdown",
-      caption: `${scope === "channel" ? "Channel" : "Thread"} rider (draft if you already edited). **Save** on the card to persist.`,
-    });
-  }
-
-  /**
-   * If this user has a config-editor draft waiting for a rider file in this
-   * thread, consume the message (do not start/abort a turn).
-   */
-  private async tryConsumeConfigEditorRiderUpload(msg: IncomingMessage): Promise<boolean> {
-    const draft = this.configEditor.getForUserThread(msg.authorId, msg.channel.id);
-    if (!draft?.awaitingRiderUpload) return false;
-    const atts = msg.attachments ?? [];
-    if (atts.length === 0) {
-      await this.adapter
-        .sendMessage(
-          msg.channel,
-          "📎 Need a `.md` or `.txt` attachment for the rider (or click **Cancel** on the config card)."
-        )
-        .catch(() => {});
-      return true;
-    }
-    const att = atts[0]!;
-    try {
-      const res = await fetch(att.url);
-      if (!res.ok) throw new Error(`download ${res.status}`);
-      const buf = Buffer.from(await res.arrayBuffer());
-      const decoded = decodeRiderUpload(buf, att.filename);
-      if (!decoded.ok) {
-        await this.adapter.sendMessage(msg.channel, `📎 ${decoded.error}`).catch(() => {});
-        return true;
-      }
-      const next = applyPickerValue(
-        { ...draft, awaitingRiderUpload: false },
-        "rider",
-        decoded.text ?? "",
-        this.capsForAgent
-      );
-      next.awaitingRiderUpload = false;
-      this.configEditor.put(next);
-      await this.refreshConfigEditorHub(next);
-      await this.adapter
-        .sendMessage(
-          msg.channel,
-          decoded.text == null
-            ? `📝 Rider upload is empty — draft will **inherit/clear** the ${editScopeOf(draft) === "channel" ? "channel" : "thread"} rider. Click **Save** to apply.`
-            : `📝 Rider loaded from \`${att.filename}\` (${decoded.text.length} chars). Click **Save** on the card to apply.`
-        )
-        .catch(() => {});
-    } catch (err) {
-      this.logger.warn({ err }, "config editor rider upload failed");
-      await this.adapter
-        .sendMessage(msg.channel, "📎 Could not read that file. Try again.")
-        .catch(() => {});
-    }
-    return true;
-  }
-
-  private async handleConfigEditorComponent(evt: ComponentEvent): Promise<void> {
-    const parsed = parseCustomId(evt.customId);
-    if (!parsed) return;
-    let draft = this.configEditor.get(parsed.draftId);
-    const auth = authorizeDraftClick(draft, evt.userId);
-    if (auth === "not-yours") {
-      await evt.replyEphemeral("This editor isn't yours.");
-      return;
-    }
-    if (auth === "expired" || !draft) {
-      try {
-        await evt.deferUpdate();
-      } catch {
-        await evt.replyEphemeral("This draft has expired.").catch(() => {});
-        return;
-      }
-      if (evt.messageId) {
-        await this.editConfigEditorCard(evt.channel, evt.messageId, {
-          color: 0x99aab5,
-          title: "🧩 Thread config",
-          fields: [],
-          footer: "draft expired",
-          actions: [],
-        });
-      }
-      return;
-    }
-
-    const action = parsed.action;
-    if (draft.awaitingRiderUpload && action !== "rider-put") {
-      this.configEditor.touch(draft.id, { awaitingRiderUpload: false });
-      draft = this.configEditor.get(draft.id) ?? draft;
-    }
-    if (action === "save") {
-      if (!isDirty(draft)) {
-        await evt.replyEphemeral("Nothing to save.");
-        return;
-      }
-      await evt.deferUpdate();
-      await this.saveConfigEditorDraft(draft, evt);
-      return;
-    }
-    if (action === "scope") {
-      if (
-        !Orchestrator.canEditChannelPreset(this.config, evt.userId, draft.parentRef)
-      ) {
-        await evt.replyEphemeral(
-          "Channel-preset edits need a config admin (locked channels refuse non-admins)."
-        );
-        return;
-      }
-      await evt.deferUpdate();
-      const nextScope = editScopeOf(draft) === "channel" ? "thread" : "channel";
-      this.configEditor.touch(draft.id, {
-        editScope: nextScope,
-        awaitingRiderUpload: false,
-      });
-      const next = this.configEditor.get(draft.id) ?? { ...draft, editScope: nextScope };
-      await this.refreshConfigEditorHub(next);
-      return;
-    }
-    if (action === "cancel") {
-      await evt.deferUpdate();
-      this.configEditor.delete(draft.id);
-      if (draft.messageId) {
-        await this.editConfigEditorCard(evt.channel, draft.messageId, renderCancelledHub(draft));
-      }
-      return;
-    }
-    if (action === "rider-get") {
-      await evt.deferUpdate();
-      await this.downloadConfigEditorRider(draft, evt);
-      return;
-    }
-    if (action === "rider-put") {
-      await evt.deferUpdate();
-      this.configEditor.touch(draft.id, { awaitingRiderUpload: true });
-      const waiting = this.configEditor.get(draft.id) ?? draft;
-      await this.refreshConfigEditorHub(waiting);
-      await evt
-        .followUpEphemeral(
-          `Attach a \`.md\` or \`.txt\` file in this thread. It becomes the **draft** ${editScopeOf(draft) === "channel" ? "channel" : "thread"} rider (Save still required). Empty file = inherit/clear. Cancel the editor to abort.`
-        )
-        .catch(() => {});
-      return;
-    }
-    if (action === "rider-save" || (evt.kind === "modal" && action === "rider-save")) {
-      await evt.deferUpdate();
-      const text = evt.fields?.rider ?? "";
-      const next = applyPickerValue(
-        draft,
-        "rider",
-        text,
-        this.capsForAgent
-      );
-      this.configEditor.put(next);
-      await this.refreshConfigEditorHub(next);
-      return;
-    }
-
-    if (action === "role-save" || (evt.kind === "modal" && action === "role-save")) {
-      await evt.deferUpdate();
-      const text = evt.fields?.role ?? "";
-      const next = applyPickerValue(draft, "role", text, this.capsForAgent);
-      this.configEditor.put(next);
-      await this.refreshConfigEditorHub(next);
-      return;
-    }
-
-    if (action === "role") {
-      const channelScope = editScopeOf(draft);
-      const current =
-        channelScope
-          ? (draft.overlay.channelRole === undefined
-              ? draft.snapshot.channelPins?.role ?? ""
-              : draft.overlay.channelRole ?? "")
-          : (draft.overlay.role === undefined
-              ? draft.snapshot.role.value ?? ""
-              : draft.overlay.role ?? "");
-      await evt.showModal({
-        customId: makeCustomId(draft.id, "role-save"),
-        title: channelScope ? "Channel role" : "Thread role",
-        inputs: [
-          {
-            id: "role",
-            label: channelScope
-              ? "Role (empty/auto = inherit)"
-              : "Role (empty/auto = inherit)",
-            style: "short",
-            value: String(current).slice(0, 64) || undefined,
-            maxLength: 64,
-            required: false,
-          },
-        ],
-      });
-      return;
-    }
-
-    if (action === "rider") {
-      if (riderTooLong(draft)) {
-        await evt.deferUpdate();
-        await this.pickConfigEditorField(draft, "rider", evt);
-        return;
-      }
-      const current = currentRiderText(draft) ?? "";
-      const channelScope = editScopeOf(draft) === "channel";
-      await evt.showModal({
-        customId: makeCustomId(draft.id, "rider-save"),
-        title: channelScope ? "Channel rider" : "Thread rider",
-        inputs: [
-          {
-            id: "rider",
-            label: channelScope
-              ? "Channel rider (empty = inherit)"
-              : "Thread rider (empty = inherit)",
-            style: "paragraph",
-            value: current.slice(0, RIDER_MODAL_MAX) || undefined,
-            maxLength: RIDER_MODAL_MAX,
-            required: false,
-          },
-        ],
-      });
-      return;
-    }
-
-    await evt.deferUpdate();
-    await this.pickConfigEditorField(draft, action, evt);
-  }
-
-  private async saveConfigEditorDraft(
-    // Reassigned only by the #37 Fast rollback, so the saved card renders the
-    // state the live session actually has rather than the one that was asked for.
-    draft: ThreadConfigDraft,
-    evt: ComponentEvent
-  ): Promise<void> {
-    // D10: Save does not abort a live turn; runtime changes wait for its next turn.
-    const saved = await createConfigFacades({
-      store: this.store, router: this.router, mutation: this.configMutation,
-      config: this.config, modelCatalog: this.modelCatalog, logger: this.logger,
-      bridgeHub: this.bridgeHub,
-      identityCommitted: (id?: string) => this.identityEffects.flush(id),
-      persistConfig: (record: SessionRecord, cfg: SessionConfigState) => this.persistConfig(record, cfg),
-      repoDisplay: (repo: string | null) => this.repoDisplay(repo),
-      unregisteredAgentMessage: (id: string, fallback: string) => this.refuseUnregisteredAgent(id, fallback),
-      parkedSelectMessage: (id: string) => this.parkedSelectRefusal(id),
-    }).plan.saveEditor(
-      draft, { id: evt.userId, name: evt.userName },
-      parent => Orchestrator.canEditChannelPreset(this.config, evt.userId, parent)
-    );
-    if (!saved.ok) {
-      await evt.followUpEphemeral(saved.error).catch(() => {});
-      return;
-    }
-    draft = saved.draft;
-    const { fastRefusal, fastRetireFailed } = saved;
-    this.configEditor.delete(draft.id);
-    if (draft.messageId) {
-      const savedPanel = renderSavedHub(draft);
-      await this.editConfigEditorCard(
-        evt.channel,
-        draft.messageId,
-        fastRetireFailed
-          ? {
-              ...savedPanel,
-              color: 0xed4245,
-              footer:
-                "🚨 Saved, but a session that may be serving Fast could not be " +
-                "discarded — run `/seam config reset` before the next turn.",
-            }
-          : savedPanel
-      );
-    }
-    // #37: say plainly that Fast did NOT take, right after the card that now
-    // (correctly) reads `off`. Silence here would be the false confirmation the
-    // whole feature is designed to avoid.
-    if (fastRefusal) {
-      await evt.followUpEphemeral(fastRetireFailed ? fastRefusal : `⚡ ${fastRefusal}`)
-        .catch(() => {});
-    }
-  }
-
-  private async pickConfigEditorField(
-    draft: ThreadConfigDraft,
-    action: string,
-    evt: ComponentEvent
-  ): Promise<void> {
-    const channel: ChannelRef = {
-      platform: "discord",
-      id: draft.threadId,
-      ...(draft.parentRef ? { parentId: draft.parentRef } : {}),
-    };
-    const owner = new Set([draft.userId]);
-    const channelScope = editScopeOf(draft) === "channel";
-    const inherit = {
-      value: INHERIT_VALUE,
-      label: "Inherit",
-      description: channelScope
-        ? "Clear the channel-preset pin"
-        : "Clear this thread's overlay",
-    };
-
-    if (!this.adapter.sendChoicePicker && action !== "rider") {
-      return;
-    }
-
-    let picked: { value: string; userId: string } | null = null;
-    const field = action as Parameters<typeof applyPickerValue>[1];
-
-    if (action === "agent") {
-      // #156: there is no separate Host control — an agent id encodes its host,
-      // so this picker offers every `agentId@host` the fleet actually has and
-      // is the single writer of the thread's location.
-      const choices = agentLocationPickerChoices(this.router.listProfiles(), {
-        bridges: this.config.bridgePresets.values(),
-        connected: this.bridgeHub?.connectedIds(),
-        agentsByHost: this.catalogAgentsByHost(),
-      });
-      const current = channelScope
-        ? draft.overlay.channelAgent === undefined
-          ? draft.snapshot.channelPins?.agent ?? "not set"
-          : draft.overlay.channelAgent ?? "not set"
-        : effectiveAgentAtLocation(draft);
-      picked = await this.adapter.sendChoicePicker!(channel, {
-        panel: {
-          color: 0x5865f2,
-          title: channelScope ? "🤖 Choose an agent" : "🤖 Choose an agent @ host",
-          fields: [{ name: "Current", value: `\`${current}\``, inline: true }],
-        },
-        choices: [inherit, ...choices],
-        authorizedUserIds: owner,
-      });
-    } else if (action === "model") {
-      const binding = this.catalogBindingForDraft(draft);
-      const agentId = binding.agentId;
-      const models = this.modelCatalog.models(binding, { current: this.catalogModelForDraft(draft) });
-      const choices = models.map((m) => ({
-        value: m.id,
-        label: m.displayName,
-        description: m.id,
-      }));
-      if (choices.length === 0) {
-        await this.adapter.sendMessage(
-          channel,
-          `No advertised models for \`${agentId}\` — Inherit is still available.`
-        );
-      }
-      picked = await this.adapter.sendChoicePicker!(channel, {
-        panel: {
-          color: 0x5865f2,
-          title: "🧠 Choose a model",
-          fields: [{ name: "Agent", value: `\`${agentId}\``, inline: true }],
-        },
-        choices: [inherit, ...choices],
-        authorizedUserIds: owner,
-      });
-    } else if (action === "effort") {
-      if (this.effortDisabledFor(draft)) return;
-      const supported = this.modelCatalog.effortChoices(
-        this.catalogBindingForDraft(draft),
-        this.catalogModelForDraft(draft)
-      );
-      const effortChoices = catalogEffortChoices(supported).slice(0, 24);
-      picked = await this.adapter.sendChoicePicker!(channel, {
-        panel: {
-          color: 0x5865f2,
-          title: "🧠 Choose reasoning effort",
-          fields: [],
-        },
-        choices: [inherit, ...effortChoices],
-        authorizedUserIds: owner,
-      });
-    } else if (action === "repo") {
-      const loc =
-        draft.overlay.location === undefined
-          ? draft.snapshot.location.value
-          : draft.overlay.location ?? draft.snapshot.withoutThread.location;
-      picked = await this.promptRepoPath(channel, {
-        title: "🗂️ Choose a working repo",
-        location: loc,
-        authorizedUserIds: owner,
-        includeInherit: true,
-      }).then((value) => (value ? { value, userId: draft.userId } : null));
-    } else if (action === "approve") {
-      picked = await this.adapter.sendChoicePicker!(channel, {
-        panel: {
-          color: 0x5865f2,
-          title: "🔐 Permission policy",
-          fields: [
-            { name: "Current", value: `\`${draft.snapshot.permission.value}\``, inline: true },
-          ],
-        },
-        choices: [
-          inherit,
-          { value: "always", label: "always", description: "Auto-approve every request" },
-          { value: "ask", label: "ask", description: "Prompt in Discord" },
-          { value: "deny", label: "deny", description: "Auto-deny every request" },
-        ],
-        authorizedUserIds: owner,
-      });
-    } else if (action === "card") {
-      picked = await this.adapter.sendChoicePicker!(channel, {
-        panel: {
-          color: 0x5865f2,
-          title: channelScope ? "🃏 Channel status card" : "🃏 Status card",
-          fields: [
-            {
-              name: "Current",
-              value: `\`${draft.snapshot.statusCardStyle.value}\``,
-              inline: true,
-            },
-          ],
-        },
-        choices: channelScope
-          ? [
-              inherit,
-              {
-                value: "full",
-                label: "full (channel)",
-                description: "Every thread inherits unless it overrides",
-              },
-              {
-                value: "simple",
-                label: "simple (channel)",
-                description: "Every thread inherits unless it overrides",
-              },
-            ]
-          : [
-              inherit,
-              {
-                value: "full",
-                label: "full (this thread)",
-                description: "Repo, model, action, effort — overrides channel",
-              },
-              {
-                value: "simple",
-                label: "simple (this thread)",
-                description: "State + brand icon + thought — overrides channel",
-              },
-            ],
-        authorizedUserIds: owner,
-      });
-    } else if (action === "gif") {
-      picked = await this.adapter.sendChoicePicker!(channel, {
-        panel: {
-          color: 0x5865f2,
-          title: channelScope ? "🎞 Channel simple-card GIF" : "🎞 Simple-card GIF",
-          fields: [
-            {
-              name: "Current",
-              value: `\`${draft.snapshot.simpleCardGif.value ? "on" : "off"}\``,
-              inline: true,
-            },
-          ],
-        },
-        choices: channelScope
-          ? [
-              inherit,
-              {
-                value: "on",
-                label: "on (channel)",
-                description: "Every thread inherits unless it overrides",
-              },
-              {
-                value: "off",
-                label: "off (channel)",
-                description: "Every thread inherits unless it overrides",
-              },
-            ]
-          : [
-              inherit,
-              {
-                value: "on",
-                label: "on (this thread)",
-                description: "Random GIF thumbnail on the simple card",
-              },
-              {
-                value: "off",
-                label: "off (this thread)",
-                description: "No GIF — overrides channel",
-              },
-            ],
-        authorizedUserIds: owner,
-      });
-    } else if (action === "prefix") {
-      picked = await this.adapter.sendChoicePicker!(channel, {
-        panel: {
-          color: 0x5865f2,
-          title: channelScope ? "🏷️ Channel automatic naming" : "🏷️ Thread automatic naming",
-          fields: [{
-            name: "Current",
-            value: draft.snapshot.disableThreadPrefix.value ? "`disabled`" : "`enabled`",
-            inline: true,
-          }],
-        },
-        choices: [
-          { value: "enabled", label: "Enabled", description: "Allow managed thread prefixes" },
-          { value: "disabled", label: "Disabled", description: "Leave thread names completely untouched" },
-        ],
-        authorizedUserIds: owner,
-      });
-    } else if (action === "attach") {
-      picked = await this.adapter.sendChoicePicker!(channel, {
-        panel: {
-          color: 0x5865f2,
-          title: "📌 Thread attachment",
-          fields: [
-            {
-              name: "Current",
-              value: draft.snapshot.detached.value ? "`detached`" : "`attached`",
-              inline: true,
-            },
-          ],
-        },
-        choices: [
-          inherit,
-          { value: "attached", label: "Attached", description: "Bot replies in this thread" },
-          { value: "detached", label: "Detached", description: "No bot replies" },
-        ],
-        authorizedUserIds: owner,
-      });
-    } else if (action === "fast") {
-      // #37: hard-refuse rather than render a picker whose "on" can never land.
-      if (channelScope) return;
-      if (this.fastDisabledFor(draft)) {
-        const agentId =
-          draft.overlay.agent === undefined
-            ? draft.snapshot.agent.value
-            : draft.overlay.agent ?? draft.snapshot.withoutThread.agent;
-        await evt
-          .followUpEphemeral(
-            isFastModeDisabledByEnv()
-              ? fastModeEnvRefusal()
-              : fastModeAgentRefusal(agentId)
-          )
-          .catch(() => {});
-        return;
-      }
-      picked = await this.adapter.sendChoicePicker!(channel, {
-        panel: {
-          color: 0x5865f2,
-          title: "⚡ Claude Fast mode",
-          description:
-            `${FAST_MODE_COST_WARNING} ${FAST_MODE_RESET_NOTICE} ` +
-            `Availability is decided by the fresh session's advertised \`${FAST_MODE_CONFIG_ID}\` ` +
-            `option, so a model without it is refused on Save rather than silently ignored.`,
-          fields: [
-            {
-              name: "Current",
-              value: draft.snapshot.fastMode?.value ? "`on`" : "`off`",
-              inline: true,
-            },
-          ],
-        },
-        choices: [
-          {
-            value: "off",
-            label: "Off (default)",
-            description: "Normal serving; covered by your subscription",
-          },
-          {
-            value: "on",
-            label: "On — paid usage credits",
-            description: "Lower latency, billed outside subscription limits",
-          },
-        ],
-        authorizedUserIds: owner,
-      });
-    } else if (action === "rider") {
-      picked = await this.adapter.sendChoicePicker!(channel, {
-        panel: {
-          color: 0x5865f2,
-          title: channelScope ? "📝 Channel rider" : "📝 Thread rider",
-          description:
-            "This rider is too long for a Discord modal. Use **Download** / **Upload** on the hub, or Inherit/Clear here.",
-          fields: [],
-        },
-        choices: [
-          {
-            value: INHERIT_VALUE,
-            label: "Inherit / Clear",
-            description: channelScope
-              ? "Remove the channel-preset rider"
-              : "Remove the thread rider",
-          },
-        ],
-        authorizedUserIds: owner,
-      });
-    } else {
-      return;
-    }
-
-    if (!picked) {
-      await this.refreshConfigEditorHub(draft);
-      return;
-    }
-    const next = applyPickerValue(draft, field, picked.value, this.capsForAgent);
-    this.configEditor.put(next);
-    await this.refreshConfigEditorHub(next);
-  }
+  private async editConfigEditorCard(channel: ChannelRef, messageId: string, panel: StructuredPanel) { await this.configUi.ready; return this.configUi.ui.editConfigEditorCard(channel, messageId, panel); }
 
   /** `/seam workflows` — read-only view of the delegation ledger. Renders the
    *  still-in-flight rows and a correlation-grouped recent tail as an embed; no
@@ -17712,71 +16818,6 @@ export class Orchestrator {
     }
 
     return { embeds: [embed], components, page };
-  }
-
-  /** `/seam config audit` — read the immutable config-mutation trail (#70).
-   *  Every applied config change already writes a `config_audit` row; this is
-   *  the missing read surface. Purely observability: no writes, no schema, and
-   *  intentionally slash-command-only (the trail spans every channel, so it is
-   *  never exposed as a cross-thread MCP read). With `entry:<id>` it renders the
-   *  before→after diff for a single row; long rider payloads are truncated
-   *  (`config-audit-view.ts`) so they can't break the render. Ephemeral. */
-  private async cmdConfigAudit(i: ChatInputCommandInteraction): Promise<void> {
-    const limit = i.options.getInteger("limit") ?? 20;
-    const now = new Date();
-    // Pull one page; a requested detail id must resolve within it, matching the
-    // "recent tail" framing of the view (older rows aren't a lookup surface).
-    const entries = this.store.listConfigMutations(limit);
-
-    const entryId = i.options.getString("entry");
-    if (entryId) {
-      const match = findAuditEntry(entries, entryId);
-      if (!match) {
-        await i.reply({
-          content:
-            `No config-audit entry \`${entryId}\` in the last ${limit} mutations. ` +
-            `Raise \`limit\` or copy an id from \`/seam config audit\`.`,
-          flags: MessageFlags.Ephemeral,
-        });
-        return;
-      }
-      const detail = formatConfigAuditDetail(match, now);
-      const embed = new EmbedBuilder()
-        .setTitle("📜 Config mutation")
-        .setColor(CONFIG_AUDIT_COLOR)
-        .setDescription(detail.entry.summary);
-      for (const m of detail.meta) {
-        // Same 1024 field-value clamp the confirm card uses (adapter.ts).
-        embed.addFields({ name: m.label, value: m.value.slice(0, 1024) });
-      }
-      embed.addFields(
-        { name: "before", value: this.renderer.codeBlock(detail.before, "json").slice(0, 1024) },
-        { name: "after", value: this.renderer.codeBlock(detail.after, "json").slice(0, 1024) }
-      );
-      await i.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
-      return;
-    }
-
-    const view = formatConfigAuditView(entries, now);
-    const embed = new EmbedBuilder()
-      .setTitle("📜 Config audit")
-      .setColor(CONFIG_AUDIT_COLOR);
-    if (view.empty) {
-      embed.setDescription(
-        "No config mutations recorded yet — nothing has been applied via `config_propose`."
-      );
-    } else {
-      // `clampFieldValue` keeps the list under Discord's 1024 field cap with an
-      // `…and N more` tail (shared with `/seam workflows`).
-      embed.addFields({
-        name: `🕑 Recent (${view.lines.length})`,
-        value: clampFieldValue(view.lines),
-      });
-      embed.setFooter({
-        text: `newest first · up to ${limit} rows · inspect one with entry:<id>`,
-      });
-    }
-    await i.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
   }
 
   private async compactSessionFromThread(
@@ -18536,79 +17577,8 @@ export class Orchestrator {
     }
   }
 
-  private async replyConfigSetRebuild(
-    i: ChatInputCommandInteraction,
-    record: SessionRecord,
-    channel: ChannelRef
-  ): Promise<void> {
-    const live = this.store.get(record.id) ?? record;
-    const note = await this.configSetRebuildNote(live, channel);
-    await i.editReply(note.trim() || "🏗️ Rebuild complete.");
-  }
 
-  private configSetRequest(i: ChatInputCommandInteraction): ConfigSetRequest {
-    const values = Object.fromEntries(
-      CONFIG_SET_FIELD_NAMES.map((name) => [name, i.options.getString(name)])
-    ) as Record<ConfigSetFieldName, string | null>;
-    return {
-      json: i.options.getString("json"),
-      rebuild: i.options.getBoolean("rebuild") === true,
-      values,
-      supplied: CONFIG_SET_FIELD_NAMES.filter((name) => values[name] !== null),
-    };
-  }
-
-  private configSetRequestError(request: ConfigSetRequest): string | null {
-    if (request.json !== null && request.supplied.length > 0) {
-      return "Use either `json:` or named fields, not both.";
-    }
-    if (request.json === null && request.supplied.length === 0) {
-      return "Provide `json:` or at least one named field.";
-    }
-    return null;
-  }
-
-  private validateSessionConfigJson(cfg: SessionConfigState): string | null {
-    if (cfg.model !== undefined && (typeof cfg.model !== "string" || !cfg.model.trim())) {
-      return "`model` must be a non-empty id.";
-    }
-    if (
-      cfg.reasoningEffort !== undefined &&
-      (typeof cfg.reasoningEffort !== "string" || !cfg.reasoningEffort.trim())
-    ) {
-      return "`reasoningEffort` must be a non-empty level.";
-    }
-    if (cfg.role !== undefined && (typeof cfg.role !== "string" || cfg.role.trim().length > 64)) {
-      return "`role` must be a string of at most 64 characters.";
-    }
-    if (
-      cfg.permissionPolicy !== undefined &&
-      cfg.permissionPolicy !== "always" &&
-      cfg.permissionPolicy !== "ask" &&
-      cfg.permissionPolicy !== "deny"
-    ) {
-      return "`permissionPolicy` must be `always`, `ask`, or `deny`.";
-    }
-    if (cfg.statusCardStyle !== undefined && !parseStatusCardStyle(cfg.statusCardStyle)) {
-      return "`statusCardStyle` must be `full` or `simple`.";
-    }
-    if (cfg.simpleCardGif !== undefined && typeof cfg.simpleCardGif !== "boolean") {
-      return "`simpleCardGif` must be a boolean.";
-    }
-    if (cfg.disableThreadPrefix !== undefined && typeof cfg.disableThreadPrefix !== "boolean") {
-      return "`disableThreadPrefix` must be a boolean.";
-    }
-    if (cfg.sessionCwdExplicit !== undefined && typeof cfg.sessionCwdExplicit !== "boolean") {
-      return "`sessionCwdExplicit` must be a boolean.";
-    }
-    for (const key of ["availableTools", "excludedTools"] as const) {
-      const value = cfg[key];
-      if (value !== undefined && (!Array.isArray(value) || value.some((item) => typeof item !== "string"))) {
-        return `\`${key}\` must be an array of strings.`;
-      }
-    }
-    return null;
-  }
+  private configSetRequest(i: ChatInputCommandInteraction) { return configSetRequest(i.options); }
 
   /**
    * Side-effect-free validation shared by `/seam config set` and configured
@@ -18616,174 +17586,9 @@ export class Orchestrator {
    * parent, so an invalid request refuses only that requested creation; existing
    * threads and every other agent capability remain available.
    */
-  private async prepareConfigSet(
-    record: SessionRecord,
-    channel: ChannelRef,
-    request: ConfigSetRequest
-  ): Promise<{ ok: true; prepared: PreparedConfigSet } | { ok: false; message: string }> {
-    const { json, values, supplied } = request;
-    const requestError = this.configSetRequestError(request);
-    if (requestError) return { ok: false, message: requestError };
+  private async prepareConfigSet(record: SessionRecord, channel: ChannelRef, request: ConfigSetRequest) { return this.getConfigApplyPlan().prepareConfigSet(record, channel, request); }
 
-    if (json !== null) {
-      let cfg: SessionConfigState;
-      try {
-        const parsed = JSON.parse(json) as unknown;
-        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-          throw new Error("not an object");
-        }
-        cfg = { ...(parsed as SessionConfigState) };
-      } catch (err) {
-        return { ok: false, message: `Invalid JSON: ${(err as Error).message}` };
-      }
-      const shapeError = this.validateSessionConfigJson(cfg);
-      if (shapeError) return { ok: false, message: `Invalid JSON: ${shapeError}` };
-      const description = this.router.describeConfig(record);
-      if (!cfg.model) cfg.model = description.model.value;
-      try {
-        const selected = this.modelCatalog.resolve(
-          { agentId: description.agent.value, location: description.location.value },
-          { model: cfg.model, effort: cfg.reasoningEffort }
-        );
-        cfg.model = selected.normalized.model;
-        cfg.reasoningEffort = selected.normalized.effort;
-      } catch (err) {
-        return {
-          ok: false,
-          message: `Invalid catalog selection: ${err instanceof Error ? err.message : String(err)}`,
-        };
-      }
-      return { ok: true, prepared: { kind: "json", cfg } };
-    }
-
-    const requestedAgent = values.agent?.trim();
-    if (values.agent !== null && !requestedAgent) {
-      return { ok: false, message: "`agent` must be a non-empty profile id." };
-    }
-    const parsedAgent = requestedAgent ? parseAgentAtLocation(requestedAgent) : undefined;
-    const describedBefore = this.router.describeConfig(record);
-    const nextAgentId = parsedAgent?.agentId ?? describedBefore.agent.value;
-    const currentLocation = resolveThreadLocation(this.config, channel.id);
-    const nextLocation = parsedAgent?.explicit ? parsedAgent.location : currentLocation;
-    const parkedSelect = nextLocation === LOCAL_LOCATION
-      ? this.parkedSelectRefusal(nextAgentId)
-      : null;
-    if (parkedSelect) return { ok: false, message: parkedSelect };
-    if (!this.router.getProfile(nextAgentId, nextLocation)) {
-      return {
-        ok: false,
-        message: this.refuseUnregisteredAgent(nextAgentId, `Unknown agent \`${nextAgentId}\`.`),
-      };
-    }
-
-    const requestedModel = values.model?.trim();
-    if (values.model !== null && !requestedModel) {
-      return { ok: false, message: "`model` must be a non-empty id." };
-    }
-    const requestedEffort = values.effort?.trim().toLowerCase();
-    const clearEffort = requestedEffort === "default" || requestedEffort === "auto";
-    if (values.effort !== null && !requestedEffort) {
-      return { ok: false, message: "`effort` must be a level or `default`." };
-    }
-    const requestedRole = values.role?.trim();
-    if (requestedRole && requestedRole.length > 64) {
-      return { ok: false, message: "`role` must be at most 64 characters." };
-    }
-    const permission = values.permissions?.trim().toLowerCase();
-    if (
-      values.permissions !== null &&
-      (!permission || (permission !== "always" && permission !== "ask" && permission !== "deny"))
-    ) {
-      return { ok: false, message: "`permissions` must be `always`, `ask`, or `deny`." };
-    }
-    const card = values.card?.trim().toLowerCase();
-    if (values.card !== null && (!card || (card !== "default" && !parseStatusCardStyle(card)))) {
-      return { ok: false, message: "`card` must be `full`, `simple`, or `default`." };
-    }
-    const gif = values.gif?.trim().toLowerCase();
-    if (values.gif !== null && (!gif || (gif !== "default" && parseSimpleCardGif(gif) === undefined))) {
-      return { ok: false, message: "`gif` must be `on`, `off`, or `default`." };
-    }
-
-    const candidateModel = requestedModel ??
-      (nextAgentId !== describedBefore.agent.value
-        ? this.modelCatalog.model({ agentId: nextAgentId, location: nextLocation }, "default")?.id ?? "default"
-        : describedBefore.model.value);
-    const catalogModel = this.modelCatalog.model(
-      { agentId: nextAgentId, location: nextLocation },
-      candidateModel
-    );
-    if (!catalogModel) {
-      return {
-        ok: false,
-        message:
-          `Model \`${candidateModel}\` is unavailable in the cached catalog for ` +
-          `\`${nextAgentId}@${nextLocation}\`; refresh the catalog and retry.`,
-      };
-    }
-    const effortChoices = catalogModel.effort.choices.map((choice) => choice.id);
-    const pinnedEffort = values.effort !== null
-      ? (clearEffort ? catalogModel.effort.selectionDefault : requestedEffort)
-      : (catalogModel.id !== describedBefore.model.value || nextAgentId !== describedBefore.agent.value
-          ? catalogModel.effort.selectionDefault
-          : undefined);
-    if (pinnedEffort && !effortChoices.includes(pinnedEffort)) {
-      return {
-        ok: false,
-        message:
-          `Effort \`${pinnedEffort}\` is not supported by \`${nextAgentId}/${catalogModel.id}\`. ` +
-          `Choose ${effortChoices.map((value) => `\`${value}\``).join(", ")}.`,
-      };
-    }
-    let resolvedRepo: string | undefined;
-    if (values.repo !== null) {
-      const requestedRepo = values.repo?.trim();
-      if (!requestedRepo) return { ok: false, message: "`repo` must be a non-empty path." };
-      try {
-        resolvedRepo = await this.resolveRequestedRepoPath(channel, requestedRepo, nextLocation);
-      } catch (err) {
-        return {
-          ok: false,
-          message: `Invalid repo: ${err instanceof Error ? err.message : String(err)}`,
-        };
-      }
-      if (isLocalLocation(nextLocation) && !isWithinRoot(resolvedRepo, this.config.REPOS_ROOT)) {
-        return {
-          ok: false,
-          message: `Repo \`${resolvedRepo}\` is outside REPOS_ROOT (\`${this.config.REPOS_ROOT}\`).`,
-        };
-      }
-    }
-    return {
-      ok: true,
-      prepared: {
-        kind: "named",
-        parsedAgent,
-        nextAgentId,
-        nextLocation,
-        model: catalogModel.id,
-        ...(pinnedEffort !== undefined ? { pinnedEffort } : {}),
-        ...(requestedRole !== undefined ? { requestedRole } : {}),
-        ...(permission !== undefined ? { permission } : {}),
-        ...(card !== undefined ? { card } : {}),
-        ...(gif !== undefined ? { gif } : {}),
-        ...(resolvedRepo !== undefined ? { resolvedRepo } : {}),
-        restartRequested: supplied.some((name) =>
-          name === "agent" || name === "model" || name === "effort" || name === "repo"
-        ),
-      },
-    };
-  }
-
-  private configSetSummary(effective: ReturnType<SessionRouter["describeConfig"]>): string {
-    return (
-      `agent \`${effective.agent.value}\`, model \`${effective.model.value}\`, ` +
-      `effort \`${effective.effort.value ?? "default"}\`, repo ` +
-      `\`${this.repoDisplay(effective.cwd.value)}\`, role \`${effective.role.value ?? "auto"}\`, ` +
-      `permissions \`${effective.permission.value}\`, card \`${effective.statusCardStyle.value}\`, ` +
-      `gif \`${effective.simpleCardGif.value ? "on" : "off"}\``
-    );
-  }
+  private configSetSummary(effective: ReturnType<SessionRouter["describeConfig"]>) { return configSetSummary(effective, repo => this.repoDisplay(repo)); }
 
   /** Apply a previously validated request. New threads skip retirement: no ACP runtime exists yet. */
   private async applyPreparedConfigSet(
@@ -18800,68 +17605,7 @@ export class Orchestrator {
     return this.getConfigApplyPlan().applyPreparedConfigSet(record, channel, request, prepared, actor, opts);
   }
 
-  private async cmdConfigSet(
-    i: ChatInputCommandInteraction
-  ): Promise<void> {
-    const record = this.recordFromInteraction(i);
-    const channel = this.channelRefFromInteraction(i);
-    if (!record || !channel) {
-      await i.reply({ content: "Use inside a thread.", flags: MessageFlags.Ephemeral });
-      return;
-    }
-    const request = this.configSetRequest(i);
-    const requestError = this.configSetRequestError(request);
-    if (requestError && !request.rebuild) {
-      await i.reply({
-        content: requestError,
-        flags: MessageFlags.Ephemeral,
-      });
-      return;
-    }
-
-    // A repo lookup or runtime retirement can exceed Discord's three-second
-    // interaction deadline. Acknowledge before either one starts.
-    await i.deferReply({ flags: MessageFlags.Ephemeral });
-
-    if (request.json === null && request.supplied.length === 0 && request.rebuild) {
-      await this.replyConfigSetRebuild(i, record, channel);
-      return;
-    }
-    const validated = await this.prepareConfigSet(record, channel, request);
-    if (!validated.ok) {
-      await i.editReply(validated.message);
-      return;
-    }
-    const applied = await this.applyPreparedConfigSet(
-      record,
-      channel,
-      request,
-      validated.prepared,
-      { id: i.user.id, name: i.user.displayName ?? i.user.username },
-      { retireRuntime: true, applyName: true }
-    );
-    if (!applied.ok) {
-      this.logger.warn({ sessionId: record.id, error: applied.message }, "bulk config set failed");
-      await i.editReply(
-        `${validated.prepared.kind === "json" ? "Could not replace config" : "Could not update config"}: ` +
-          `${applied.message}${applied.rollbackError}`
-      );
-      return;
-    }
-    const rebuildNote = request.rebuild
-      ? await this.configSetRebuildNote(applied.record, channel)
-      : "";
-    if (validated.prepared.kind === "json") {
-      await i.editReply("Config replaced; next turn starts a fresh runtime." + rebuildNote);
-      return;
-    }
-    const changed = request.supplied.map((name) => `\`${name}\``).join(", ");
-    await i.editReply(
-      `Updated ${changed}. Effective: ${this.configSetSummary(applied.effective)}.` +
-        (applied.restartRequested ? " Next turn uses the new runtime configuration." : "") +
-        rebuildNote
-    );
-  }
+  private async cmdConfigSet(i: ChatInputCommandInteraction) { await this.configUi.ready; return this.configUi.ui.cmdConfigSet(this.configUi.interaction(i)); }
 
   private async cmdRepos(i: ChatInputCommandInteraction): Promise<void> {
     const threadId = i.channel?.isThread() ? i.channelId : undefined;

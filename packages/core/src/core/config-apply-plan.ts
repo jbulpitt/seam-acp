@@ -9,8 +9,9 @@ import type { ModelCatalogService } from "./model-catalog/service.js";
 import type { SessionControlRuntime, ThreadSessionControlDeps } from "./runtime-transition.js";
 import { RuntimeTransition } from "./runtime-transition.js";
 import { type ConfigMutationService, type ConfigMutationInput, type ConfigProposal, type MutationActor, type ConfigMutationTier, type ProposedField } from "./config-mutation.js";
-import { parseSimpleCardGif, type SessionRecord, type SessionConfigState, type PermissionPolicyMode, type StatusCardStyle, type Preset } from "./types.js";
-import { parseAgentAtLocation } from "./location.js";
+import { parseStatusCardStyle, parseSimpleCardGif, type SessionRecord, type SessionConfigState, type PermissionPolicyMode, type StatusCardStyle, type Preset } from "./types.js";
+import { LOCAL_LOCATION, isLocalLocation, parseAgentAtLocation } from "./location.js";
+import { isWithinRoot } from "./path-utils.js";
 import { bindSessionLocation } from "./location-bind.js";
 import { buildSavePlan, fastModeWillResetSession, willVerifyFastMode, type ThreadConfigDraft } from "../platforms/discord/config-editor.js";
 import { FAST_MODE_CONFIG_ID, settleFastMode, fastModeRetirementFailure } from "./fast-mode.js";
@@ -49,6 +50,8 @@ export interface ConfigApplySettings {
   persistConfig: (record: SessionRecord, cfg: SessionConfigState) => void;
   repoDisplay: (repo: string | null) => string;
   unregisteredAgentMessage: (id: string, fallback: string) => string;
+  resolveRequestedRepoPath?: (channel: ChannelRef, requested: string, location: string) => Promise<string>;
+  parkedSelectMessage?: (id: string) => string | null;
 }
 
 export const CONFIG_SET_FIELD_NAMES = [
@@ -84,6 +87,17 @@ export type PreparedConfigSet =
       resolvedRepo?: string;
       restartRequested: boolean;
     };
+
+
+export function configSetRequestError(request: ConfigSetRequest): string | null {
+  if (request.json !== null && request.supplied.length > 0) {
+    return "Use either `json:` or named fields, not both.";
+  }
+  if (request.json === null && request.supplied.length === 0) {
+    return "Provide `json:` or at least one named field.";
+  }
+  return null;
+}
 
 
 /** Internal configuration writes and their existing runtime consequences. */
@@ -195,6 +209,207 @@ export class ConfigApplyPlan {
       updatedUtc: new Date().toISOString(),
     });
     return { ok: true };
+  }
+
+  private validateSessionConfigJson(cfg: SessionConfigState): string | null {
+    if (cfg.model !== undefined && (typeof cfg.model !== "string" || !cfg.model.trim())) {
+      return "`model` must be a non-empty id.";
+    }
+    if (
+      cfg.reasoningEffort !== undefined &&
+      (typeof cfg.reasoningEffort !== "string" || !cfg.reasoningEffort.trim())
+    ) {
+      return "`reasoningEffort` must be a non-empty level.";
+    }
+    if (cfg.role !== undefined && (typeof cfg.role !== "string" || cfg.role.trim().length > 64)) {
+      return "`role` must be a string of at most 64 characters.";
+    }
+    if (
+      cfg.permissionPolicy !== undefined &&
+      cfg.permissionPolicy !== "always" &&
+      cfg.permissionPolicy !== "ask" &&
+      cfg.permissionPolicy !== "deny"
+    ) {
+      return "`permissionPolicy` must be `always`, `ask`, or `deny`.";
+    }
+    if (cfg.statusCardStyle !== undefined && !parseStatusCardStyle(cfg.statusCardStyle)) {
+      return "`statusCardStyle` must be `full` or `simple`.";
+    }
+    if (cfg.simpleCardGif !== undefined && typeof cfg.simpleCardGif !== "boolean") {
+      return "`simpleCardGif` must be a boolean.";
+    }
+    if (cfg.disableThreadPrefix !== undefined && typeof cfg.disableThreadPrefix !== "boolean") {
+      return "`disableThreadPrefix` must be a boolean.";
+    }
+    if (cfg.sessionCwdExplicit !== undefined && typeof cfg.sessionCwdExplicit !== "boolean") {
+      return "`sessionCwdExplicit` must be a boolean.";
+    }
+    for (const key of ["availableTools", "excludedTools"] as const) {
+      const value = cfg[key];
+      if (value !== undefined && (!Array.isArray(value) || value.some((item) => typeof item !== "string"))) {
+        return `\`${key}\` must be an array of strings.`;
+      }
+    }
+    return null;
+  }
+
+  async prepareConfigSet(
+    record: SessionRecord,
+    channel: ChannelRef,
+    request: ConfigSetRequest
+  ): Promise<{ ok: true; prepared: PreparedConfigSet } | { ok: false; message: string }> {
+    const { json, values, supplied } = request;
+    const requestError = configSetRequestError(request);
+    if (requestError) return { ok: false, message: requestError };
+
+    if (json !== null) {
+      let cfg: SessionConfigState;
+      try {
+        const parsed = JSON.parse(json) as unknown;
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+          throw new Error("not an object");
+        }
+        cfg = { ...(parsed as SessionConfigState) };
+      } catch (err) {
+        return { ok: false, message: `Invalid JSON: ${(err as Error).message}` };
+      }
+      const shapeError = this.validateSessionConfigJson(cfg);
+      if (shapeError) return { ok: false, message: `Invalid JSON: ${shapeError}` };
+      const description = this.router.describeConfig(record);
+      if (!cfg.model) cfg.model = description.model.value;
+      try {
+        const selected = this.modelCatalog.resolve(
+          { agentId: description.agent.value, location: description.location.value },
+          { model: cfg.model, effort: cfg.reasoningEffort }
+        );
+        cfg.model = selected.normalized.model;
+        cfg.reasoningEffort = selected.normalized.effort;
+      } catch (err) {
+        return {
+          ok: false,
+          message: `Invalid catalog selection: ${err instanceof Error ? err.message : String(err)}`,
+        };
+      }
+      return { ok: true, prepared: { kind: "json", cfg } };
+    }
+
+    const requestedAgent = values.agent?.trim();
+    if (values.agent !== null && !requestedAgent) {
+      return { ok: false, message: "`agent` must be a non-empty profile id." };
+    }
+    const parsedAgent = requestedAgent ? parseAgentAtLocation(requestedAgent) : undefined;
+    const describedBefore = this.router.describeConfig(record);
+    const nextAgentId = parsedAgent?.agentId ?? describedBefore.agent.value;
+    const currentLocation = resolveThreadLocation(this.config, channel.id);
+    const nextLocation = parsedAgent?.explicit ? parsedAgent.location : currentLocation;
+    const parkedSelect = nextLocation === LOCAL_LOCATION
+      ? this.settings!.parkedSelectMessage!(nextAgentId)
+      : null;
+    if (parkedSelect) return { ok: false, message: parkedSelect };
+    if (!this.router.getProfile(nextAgentId, nextLocation)) {
+      return {
+        ok: false,
+        message: this.refuseUnregisteredAgent(nextAgentId, `Unknown agent \`${nextAgentId}\`.`),
+      };
+    }
+
+    const requestedModel = values.model?.trim();
+    if (values.model !== null && !requestedModel) {
+      return { ok: false, message: "`model` must be a non-empty id." };
+    }
+    const requestedEffort = values.effort?.trim().toLowerCase();
+    const clearEffort = requestedEffort === "default" || requestedEffort === "auto";
+    if (values.effort !== null && !requestedEffort) {
+      return { ok: false, message: "`effort` must be a level or `default`." };
+    }
+    const requestedRole = values.role?.trim();
+    if (requestedRole && requestedRole.length > 64) {
+      return { ok: false, message: "`role` must be at most 64 characters." };
+    }
+    const permission = values.permissions?.trim().toLowerCase();
+    if (
+      values.permissions !== null &&
+      (!permission || (permission !== "always" && permission !== "ask" && permission !== "deny"))
+    ) {
+      return { ok: false, message: "`permissions` must be `always`, `ask`, or `deny`." };
+    }
+    const card = values.card?.trim().toLowerCase();
+    if (values.card !== null && (!card || (card !== "default" && !parseStatusCardStyle(card)))) {
+      return { ok: false, message: "`card` must be `full`, `simple`, or `default`." };
+    }
+    const gif = values.gif?.trim().toLowerCase();
+    if (values.gif !== null && (!gif || (gif !== "default" && parseSimpleCardGif(gif) === undefined))) {
+      return { ok: false, message: "`gif` must be `on`, `off`, or `default`." };
+    }
+
+    const candidateModel = requestedModel ??
+      (nextAgentId !== describedBefore.agent.value
+        ? this.modelCatalog.model({ agentId: nextAgentId, location: nextLocation }, "default")?.id ?? "default"
+        : describedBefore.model.value);
+    const catalogModel = this.modelCatalog.model(
+      { agentId: nextAgentId, location: nextLocation },
+      candidateModel
+    );
+    if (!catalogModel) {
+      return {
+        ok: false,
+        message:
+          `Model \`${candidateModel}\` is unavailable in the cached catalog for ` +
+          `\`${nextAgentId}@${nextLocation}\`; refresh the catalog and retry.`,
+      };
+    }
+    const effortChoices = catalogModel.effort.choices.map((choice) => choice.id);
+    const pinnedEffort = values.effort !== null
+      ? (clearEffort ? catalogModel.effort.selectionDefault : requestedEffort)
+      : (catalogModel.id !== describedBefore.model.value || nextAgentId !== describedBefore.agent.value
+          ? catalogModel.effort.selectionDefault
+          : undefined);
+    if (pinnedEffort && !effortChoices.includes(pinnedEffort)) {
+      return {
+        ok: false,
+        message:
+          `Effort \`${pinnedEffort}\` is not supported by \`${nextAgentId}/${catalogModel.id}\`. ` +
+          `Choose ${effortChoices.map((value) => `\`${value}\``).join(", ")}.`,
+      };
+    }
+    let resolvedRepo: string | undefined;
+    if (values.repo !== null) {
+      const requestedRepo = values.repo?.trim();
+      if (!requestedRepo) return { ok: false, message: "`repo` must be a non-empty path." };
+      try {
+        resolvedRepo = await this.settings!.resolveRequestedRepoPath!(channel, requestedRepo, nextLocation);
+      } catch (err) {
+        return {
+          ok: false,
+          message: `Invalid repo: ${err instanceof Error ? err.message : String(err)}`,
+        };
+      }
+      if (isLocalLocation(nextLocation) && !isWithinRoot(resolvedRepo, this.config.REPOS_ROOT)) {
+        return {
+          ok: false,
+          message: `Repo \`${resolvedRepo}\` is outside REPOS_ROOT (\`${this.config.REPOS_ROOT}\`).`,
+        };
+      }
+    }
+    return {
+      ok: true,
+      prepared: {
+        kind: "named",
+        parsedAgent,
+        nextAgentId,
+        nextLocation,
+        model: catalogModel.id,
+        ...(pinnedEffort !== undefined ? { pinnedEffort } : {}),
+        ...(requestedRole !== undefined ? { requestedRole } : {}),
+        ...(permission !== undefined ? { permission } : {}),
+        ...(card !== undefined ? { card } : {}),
+        ...(gif !== undefined ? { gif } : {}),
+        ...(resolvedRepo !== undefined ? { resolvedRepo } : {}),
+        restartRequested: supplied.some((name) =>
+          name === "agent" || name === "model" || name === "effort" || name === "repo"
+        ),
+      },
+    };
   }
 
   async applyPreparedConfigSet(
@@ -643,9 +858,9 @@ export class ConfigApplyPlan {
 
 
 export interface ConfigFacadeEnvironment extends Omit<ConfigApplySettings, "runtime"> {
+  parkedSelectMessage: (id: string) => string | null;
   store: SessionStore;
   mutation: ConfigMutationService;
-  parkedSelectMessage: (id: string) => string | null;
 }
 
 export function createConfigFacades(environment: ConfigFacadeEnvironment): { plan: ConfigApplyPlan; runtime: RuntimeTransition } {

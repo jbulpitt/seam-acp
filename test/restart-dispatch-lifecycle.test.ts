@@ -15,7 +15,7 @@ import { projectAttemptCompletions } from "../packages/core/src/core/dispatch/at
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 import { DispatchSuspendedError } from "../packages/core/src/core/dispatch/attempt-store.js";
 import { executionIdentity } from "../packages/core/src/core/dispatch/execution-identity.js";
-import { attachLocalBridge } from "./local-bridge-fixture.js";
+import { attachLocalBridge, localBridgeHub } from "./local-bridge-fixture.js";
 import { AgentRuntime } from "../packages/core/src/agents/agent-runtime.js";
 import type { AgentProfile } from "@seam/adapters";
 
@@ -609,7 +609,7 @@ describe("#250 production dispatch lifecycle (synthetic transport, no providers)
     );
   });
 
-  it("settles a dead remote recovery with its cause before the next queued wake runs", async () => {
+  it.each(["missing", "dead"])("continues a %s remote wake in its saved session and runs the next queued wake", async fault => {
     const h = setup();
     simulateRetiredOwnerProcess();
     h.store.turnAttempts.registerOwner("controller-before-restart");
@@ -637,7 +637,7 @@ describe("#250 production dispatch lifecycle (synthetic transport, no providers)
     h.store.turnAttempts.suspendBoot("controller-before-restart");
 
     const mux = {
-      sendCmd: vi.fn(async () => ({ health: [{
+      sendCmd: vi.fn(async () => ({ health: fault === "missing" ? [] : [{
         slot: 19,
         alive: false,
         recovery: {
@@ -656,13 +656,14 @@ describe("#250 production dispatch lifecycle (synthetic transport, no providers)
       }] })),
       adopt: vi.fn(),
     };
-    h.runtime.prompt.mockImplementationOnce(async (text) => {
-      expect(h.store.turnAttempts.get("dead-wake")?.state).toBe("completed");
-      expect(String(text)).toContain("queued wake");
+    h.runtime.prompt.mockImplementation(async (text) => {
+      if (String(text).startsWith("continue\n")) expect(String(text)).not.toContain("original work");
+      else expect(String(text)).toContain("queued wake");
       return { stopReason: "end_turn" };
     });
     const restarted = h.makeOrch();
     restarted.setBridgeHub({
+      ...localBridgeHub([], h.dataDir),
       muxFor: (location: string) => location === "remote-one" ? mux : undefined,
       slotHealthFor: () => [],
     } as any);
@@ -687,21 +688,25 @@ describe("#250 production dispatch lifecycle (synthetic transport, no providers)
       prompt: "queued wake",
     });
     await watcher.start();
+    await vi.waitFor(() => expect(resume).toHaveBeenCalledTimes(1));
+    await Promise.all(resume.mock.results.map(result => result.value));
+    await watcher.tick();
+    await watcher.drain();
     await vi.waitFor(() => expect(h.store.turnAttempts.get("dead-wake")?.state).toBe("completed"));
     await vi.waitFor(() => expect(h.store.turnAttempts.get("wake-after-dead")?.state).toBe("completed"));
 
     expect(mux.adopt).not.toHaveBeenCalled();
     expect(h.store.turnAttempts.get("dead-wake")).toMatchObject({
-      state: "completed",
-      outcome: {
-        status: "failed",
-        error: "bridge slot 19 on remote-one has no attached live process",
-      },
+      state: "completed", generation: 2, acpSessionId: "recorded-acp",
+      outcome: { status: "completed" },
     });
     expect(h.store.turnAttempts.get("wake-after-dead")?.state).toBe("completed");
-    expect(resume).not.toHaveBeenCalled();
-    expect(h.runtime.prompt).toHaveBeenCalledTimes(1);
-    expect(String(h.runtime.prompt.mock.calls[0]?.[0])).toContain("queued wake");
+    expect(resume).toHaveBeenCalledTimes(1);
+    expect(h.runtime.prompt).toHaveBeenCalledTimes(2);
+    expect(h.runtime.prompt.mock.calls.filter(([text]) => String(text).startsWith("continue\n"))).toHaveLength(1);
+    expect(h.router.getOrStartRuntime).toHaveBeenCalledWith(
+      expect.objectContaining({ channelRef: "worker" }), { resumeSessionId: "recorded-acp" },
+    );
   }, 15_000);
 
   it("runs a queued report-back after a human interrupts the active dispatch", async () => {

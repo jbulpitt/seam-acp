@@ -1,9 +1,12 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { pino } from "pino";
 import type { AgentProfile } from "@seam/adapters";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import type { SessionRecord, SessionConfigState } from "../packages/core/src/core/types.js";
-import type { SessionStore } from "../packages/core/src/core/session-store.js";
+import { SessionStore } from "../packages/core/src/core/session-store.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 import { localBridgeWiring } from "./local-bridge-fixture.js";
 
@@ -16,6 +19,7 @@ const runtimeState = vi.hoisted(() => ({
     disposed: boolean;
     detached: boolean;
     delegated: boolean;
+    slot?: number;
     disposeWait?: Promise<void>;
     loadCalls: Array<{ sessionId: string }>;
     newCalls: number;
@@ -45,6 +49,8 @@ vi.mock("../packages/core/src/agents/agent-runtime.js", async (importOriginal) =
       delegated = false;
       detached = false;
       hasDelegatedTurnInFlight(): boolean { return this.delegated; }
+      slot?: number;
+      getSlot(): number | undefined { return this.slot; }
       supportsSessionFork(): boolean { return runtimeState.canFork; }
       async forkSession(opts: { sessionId: string }): Promise<string> { return `fork-of-${opts.sessionId}`; }
       async detach(): Promise<void> { this.detached = true; }
@@ -104,13 +110,14 @@ function makeStore(record: SessionRecord): SessionStore {
     needsAgyIdentityRebuild: () => false,
     lookupAgentChannelRestriction: () => ({ state: "absent" as const }),
     readConfig: (input: SessionRecord) => JSON.parse(input.configJson) as SessionConfigState,
+    turnAttempts: { list: () => [] },
   } as unknown as SessionStore;
 }
 
-function makeRouter(record: SessionRecord): SessionRouter {
+function makeRouter(record: SessionRecord, store = makeStore(record)): SessionRouter {
   return new SessionRouter({
     logger: silent,
-    store: makeStore(record),
+    store,
     profiles: [profile],
     modelCatalog: fixtureModelCatalog([profile]),
     defaultAgentId: "copilot",
@@ -169,6 +176,39 @@ describe("SessionRouter shutdown (#631)", () => {
     await router.disposeAll();
     expect(runtimeState.instances[0]).toMatchObject({ detached: true, disposed: false });
     expect(runtimeState.instances[1]).toMatchObject({ detached: false, disposed: true });
+  });
+
+  const cleanups: Array<() => void> = [];
+  afterEach(() => { for (const cleanup of cleanups.splice(0).reverse()) cleanup(); });
+
+  it.each(["active", "suspended", "completed", "cancelled"] as const)("retires an idle runtime according to its %s bridge-owned attempt", async state => {
+    const dir = mkdtempSync(path.join(tmpdir(), "seam-owned-shutdown-"));
+    cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+    const store = new SessionStore(path.join(dir, "test.db"));
+    cleanups.push(() => store.close());
+    const record = makeRecord();
+    store.upsert(record);
+    store.turnAttempts.registerOwner("controller");
+    const attempt = store.turnAttempts.claim({ id: "owned", target: record.channelRef,
+      prompt: "work", session: "live", createdUtc: record.createdUtc }, "identity", "controller");
+    store.turnAttempts.bind(attempt, record.acpSessionId!);
+    store.turnAttempts.startPrompt(attempt);
+    store.turnAttempts.recordRemoteRecovery(attempt, { version: 1, location: "local", slot: 65,
+      acpSessionId: record.acpSessionId!, submissionId: "owned-submission", delegatedUtc: record.createdUtc });
+    if (state === "suspended") store.turnAttempts.suspendBoot("controller");
+    if (state === "completed") store.turnAttempts.complete(attempt, {
+      id: attempt.id, target: record.channelRef, status: "completed", finishedUtc: record.createdUtc,
+    });
+    if (state === "cancelled") store.turnAttempts.cancel(attempt.id, "cancelled by user");
+    const router = makeRouter(record, store);
+    await router.getOrStartRuntime(record);
+    runtimeState.instances[0]!.slot = 65;
+    expect(runtimeState.instances[0]!.delegated).toBe(false);
+    await router.disposeAll();
+    const retained = state === "active" || state === "suspended";
+    expect(runtimeState.instances[0]).toMatchObject({ detached: retained, disposed: !retained });
+    expect(store.turnAttempts.get("owned")).toMatchObject({ state, generation: 1,
+      remoteRecovery: { slot: 65, submissionId: "owned-submission" } });
   });
 });
 

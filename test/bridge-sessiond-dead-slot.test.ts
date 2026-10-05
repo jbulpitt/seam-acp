@@ -12,7 +12,7 @@
  * These drive a real SessiondServer and real OS children, because the defect
  * lived in the seam between the bridge's bindings and sessiond's slot table.
  */
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -29,6 +29,7 @@ const servers: SessiondServer[] = [];
 const clients: SessiondClient[] = [];
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   for (const client of clients.splice(0)) client.close();
   for (const server of servers.splice(0)) await server.close({ terminateChildren: true });
   for (const root of roots.splice(0)) await fs.rm(root, { recursive: true, force: true });
@@ -39,7 +40,15 @@ const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 // Echoes each input line as a data frame; exits cleanly on "exit-now".
 const CHILD = `
   let buffered = "";
+  let completed = false;
   const send = (value) => process.stdout.write(JSON.stringify({ v: 1, ...value }) + "\\n");
+  const report = () => {
+    send({ type: "recovery", recovery: { submissionId: "sub-r", acpSessionId: "acp-r", phase: completed ? "succeeded" : "executing" } });
+    if (completed) send({ type: "recovery_result", recoveryResult: {
+      version: 1, submissionId: "sub-r", acpSessionId: "acp-r", status: "completed", text: "done", stopReason: "end_turn",
+      finishedUtc: "2026-10-05T20:18:21.009Z",
+    } });
+  };
   process.stdin.on("data", (chunk) => {
     buffered += chunk.toString();
     let newline;
@@ -48,12 +57,17 @@ const CHILD = `
       buffered = buffered.slice(newline + 1);
       const frame = JSON.parse(line);
       if (frame.type === "report_recovery") {
-        send({ type: "recovery", recovery: { submissionId: "sub-r", acpSessionId: "acp-r", phase: "executing" } });
+        report();
         continue;
       }
       if (frame.type !== "input") continue;
       const text = Buffer.from(frame.dataBase64, "base64").toString();
       if (text.includes("exit-now")) process.exit(0);
+      if (text.includes("complete-now")) {
+        completed = true;
+        report();
+        continue;
+      }
       if (text.includes("recover-now")) {
         send({ type: "recovery", recovery: { submissionId: "sub-1", acpSessionId: "acp-1", phase: "executing" } });
         continue;
@@ -65,17 +79,17 @@ const CHILD = `
   setInterval(() => {}, 1000);
 `;
 
-async function sessiond() {
+async function sessiond(childSource = CHILD) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "seam-606-"));
   roots.push(root);
   await fs.chmod(root, 0o700);
   const socketPath = path.join(root, "sessiond.sock");
   const childPath = path.join(root, "child.mjs");
-  await fs.writeFile(childPath, CHILD, { mode: 0o700 });
+  await fs.writeFile(childPath, childSource, { mode: 0o700 });
   const server = new SessiondServer({ socketPath, statePath: path.join(root, "slots.json") });
   servers.push(server);
   await server.start();
-  return { socketPath, childPath };
+  return { server, socketPath, childPath };
 }
 
 async function bridge(socketPath: string, childPath: string) {
@@ -122,6 +136,99 @@ describe("#631 a killed slot has no recovery to adopt", () => {
 });
 
 describe("#631 a restarted bridge recovers live slots' recovery records", () => {
+  it.each([false, true])("queries an idle child only on attachment (rebound=%s)", async rebound => {
+    const { server, socketPath, childPath } = await sessiond(`
+      process.stdin.resume();
+      process.on("SIGTERM", () => process.exit(0));
+    `);
+    const only = await bridge(socketPath, childPath);
+    only.slots.configure(20, { agentId: "fixture" });
+    await only.slots.writeInput(20, "hello\n");
+    const writes = vi.spyOn(only.client, "write");
+    if (rebound) await only.slots.rebind();
+    else await only.slots.listSlots();
+    expect(writes).toHaveBeenCalledTimes(1);
+    writes.mockClear();
+
+    await only.slots.listSlots();
+    const idle = await only.slots.listSlots();
+    expect(idle.health.find(row => row.slot === 20)).not.toHaveProperty("recovery");
+    expect(writes).not.toHaveBeenCalled();
+
+    const daemon = server as any;
+    const entry = daemon.slots.get(20);
+    const connectHolder = daemon.connectHolder.bind(server);
+    const reconnect = vi.spyOn(daemon, "connectHolder").mockResolvedValue(false);
+    entry.link.destroy();
+    await until(async () => (await health(only.client, 20))?.attached === false, "idle holder detachment");
+    await only.slots.listSlots();
+    expect(writes).not.toHaveBeenCalled();
+    reconnect.mockRestore();
+    expect(await connectHolder(entry, 0)).toBe(true);
+
+    await only.slots.listSlots();
+    expect(writes).toHaveBeenCalledExactlyOnceWith(20, expect.stringContaining('"type":"report_recovery"'));
+    writes.mockClear();
+    await only.slots.listSlots();
+    await only.slots.listSlots();
+    expect(writes).not.toHaveBeenCalled();
+  });
+
+  it("delivers a retained result on reattachment even when the previous controller acknowledged it", async () => {
+    const { socketPath, childPath } = await sessiond();
+    const only = await bridge(socketPath, childPath);
+    only.slots.configure(19, { agentId: "fixture" });
+    await only.slots.writeInput(19, "complete-now\n");
+    await until(() => only.frames.some(frame => frame.type === "recovery_result"), "the successful result");
+    const pid = (await health(only.client, 19))!.pid;
+    const throughSeq = Math.max(...only.frames.map(frame => frame.seq));
+    await only.client.ack({ slot: 19, throughSeq });
+    expect(await health(only.client, 19)).toMatchObject({ outputAckedThrough: throughSeq });
+    only.frames.length = 0;
+    const spawn = vi.spyOn(only.client, "spawn");
+    const replay = await only.slots.replay(19, throughSeq);
+    replay.activate();
+    await until(() => [...replay.result.frames, ...only.frames].some(frame => frame.type === "recovery_result"
+      && frame.recoveryResult?.text === "done"), "the retained result after the acknowledged cursor");
+    expect(await health(only.client, 19)).toMatchObject({ alive: true, attached: true, pid });
+    expect(spawn).not.toHaveBeenCalled();
+    expect([...replay.result.frames, ...only.frames].filter(frame => frame.type === "data")).toEqual([]);
+  });
+
+  it("reattaches an unattached surviving owner without replacing its process or making its binding dead", async () => {
+    const { server, socketPath, childPath } = await sessiond();
+    const first = await bridge(socketPath, childPath);
+    first.slots.configure(18, { agentId: "fixture" });
+    await first.slots.writeInput(18, "hello\n");
+    const pid = (await health(first.client, 18))!.pid;
+    const daemon = server as any;
+    const entry = daemon.slots.get(18);
+    const connectHolder = daemon.connectHolder.bind(server);
+    const reconnect = vi.spyOn(daemon, "connectHolder").mockResolvedValue(false);
+    entry.link.destroy();
+    await until(async () => (await health(first.client, 18))?.attached === false, "holder detachment");
+    first.client.close();
+
+    const second = await bridge(socketPath, childPath);
+    const spawn = vi.spyOn(second.client, "spawn");
+    await second.slots.rebind();
+    expect(await second.slots.reconcileRecovery(18, { submissionId: "sub-r", acpSessionId: "acp-r" }))
+      .toEqual({ state: "owned" });
+    expect(await health(second.client, 18)).toMatchObject({ alive: true, attached: false, pid });
+
+    reconnect.mockRestore();
+    expect(await connectHolder(entry, 0)).toBe(true);
+    await until(async () => (await second.slots.listSlots()).health.some(row => row.slot === 18
+      && (row as { recovery?: { submissionId: string } }).recovery?.submissionId === "sub-r"), "recovery after attachment");
+    expect(await second.slots.writeInput(18, "after-reattach\n")).toBe(true);
+    const replay = await second.slots.replay(18, 0);
+    replay.activate();
+    await until(() => [...replay.result.frames, ...second.frames].some(frame => frame.type === "data"
+      && frame.data?.includes("after-reattach")), "input reaching the retained child");
+    expect(await health(second.client, 18)).toMatchObject({ alive: true, attached: true, pid });
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
   it("asks each live child for its current recovery state", async () => {
     const { socketPath, childPath } = await sessiond();
     const first = await bridge(socketPath, childPath);

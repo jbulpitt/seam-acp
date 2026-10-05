@@ -28,7 +28,8 @@ const drain = async () => {
 };
 
 async function setup(source: "inbound" | "dispatch" = "inbound", style: "full" | "simple" = "full",
-  options: { armed?: boolean; queue?: boolean; disconnected?: boolean; adoptionUnavailable?: boolean } = {}) {
+  options: { armed?: boolean; queue?: boolean; disconnected?: boolean; adoptionUnavailable?: boolean;
+    attached?: boolean; terminalResult?: "completed" | "failed" } = {}) {
   const dir = mkdtempSync(path.join(tmpdir(), "seam-adopt-reconnect-"));
   cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
   let store = new SessionStore(path.join(dir, "test.db"));
@@ -59,14 +60,24 @@ async function setup(source: "inbound" | "dispatch" = "inbound", style: "full" |
   store.close();
   store = new SessionStore(path.join(dir, "test.db"));
   const snapshot = { version: 1, owner: "bridge", submissionId: "submission",
-    acpSessionId: "acp", rung: 1, phase: options.armed ? "armed" : "executing", retry: 0, budget: 3,
+    acpSessionId: "acp", rung: 1, phase: options.terminalResult
+      ? options.terminalResult === "completed" ? "succeeded" : "exhausted"
+      : options.armed ? "armed" : "executing", retry: 0, budget: 3,
     remaining: 3, disposition: "none", updatedUtc: now, ...(options.armed ? { reconcileSupported: true } : {}) };
-  let rows = [{ slot: 6, alive: true, outputAckedThrough: 10, recovery: snapshot }];
+  let rows = [{ slot: 6, alive: !options.terminalResult, attached: options.attached ?? true,
+    outputAckedThrough: 10, recovery: snapshot }];
   let promptMissing = false;
+  let ownerLostDuringProbe = false;
   let inventoryUnknown = false;
   let inventoryError = false;
   let seq = 10;
   const frames: Array<Record<string, unknown>> = [];
+  if (options.terminalResult) frames.push({ slot: 6, seq: ++seq, type: "recovery_result", recoveryResult: {
+    version: 1, submissionId: "submission", acpSessionId: "acp", status: options.terminalResult,
+    text: "provider final answer", ...(options.terminalResult === "failed"
+      ? { error: "provider rejected the request", errorKind: "protocol_error" } : {}),
+    stopReason: "end_turn", finishedUtc: new Date().toISOString(),
+  } });
   const commands: Array<Record<string, any>> = [];
   class Socket extends EventEmitter {
     readyState = 1;
@@ -76,6 +87,12 @@ async function setup(source: "inbound" | "dispatch" = "inbound", style: "full" |
       if (cmd.type !== "cmd") return;
       if (cmd.action === "listSlots" && inventoryError) {
         queueMicrotask(() => this.deliver({ type: "cmd_reply", cmdId: cmd.cmdId, error: "fixture bridge reconnecting" }));
+        return;
+      }
+      if (cmd.action === "reconcileRung1Recovery" && ownerLostDuringProbe) {
+        rows = [];
+        queueMicrotask(() => this.deliver({ type: "cmd_reply", cmdId: cmd.cmdId,
+          payload: { state: "missing", cause: "bridge slot 6 has no live process" } }));
         return;
       }
       queueMicrotask(() => this.deliver({ type: "cmd_reply", cmdId: cmd.cmdId,
@@ -175,11 +192,49 @@ async function setup(source: "inbound" | "dispatch" = "inbound", style: "full" |
     restoreInventory: () => { inventoryUnknown = false; inventoryError = false; },
     connectBridge: () => { connected = true; for (const listener of [...readyListeners]) listener("remote"); },
     allowAdoption: () => { adoptionUnavailable = false; },
+    attachOwner: () => { rows[0]!.attached = true; },
+    loseOwnerDuringProbe: () => { ownerLostDuringProbe = true; },
     replaceSubmission: () => { rows = [{ ...rows[0]!, recovery: { ...snapshot, submissionId: "other-submission" } }]; },
     runtime: () => runtime };
 }
 
 describe("#777 armed recovery queue reconciliation", () => {
+  it("waits visibly for a surviving unattached owner and adopts it without a new process", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const h = await setup("dispatch", "full", { queue: true, attached: false });
+    const resume = vi.spyOn(h.orch, "resumeTurnManually");
+    await h.run;
+    await drain();
+    await h.orch.reconcileRemoteRecoveries();
+    await vi.advanceTimersByTimeAsync(15 * 60_000);
+    expect(h.visible.some(text => text.includes("Still reconnecting") && text.includes("keep trying"))).toBe(true);
+    expect(h.store.turnAttempts.get("inbound-1")).toMatchObject({ state: "suspended", generation: 1,
+      remoteRecovery: { slot: 6, acpSessionId: "acp" }, outcome: null });
+    expect(h.runtime()).toBeUndefined();
+    h.attachOwner();
+    await h.orch.reconcileRemoteRecoveries();
+    await drain();
+    expect(h.runtime()).toBeDefined();
+    h.complete("same owner finished");
+    await drain();
+    expect(h.store.turnAttempts.get("inbound-1")).toMatchObject({ state: "completed", generation: 1,
+      outcome: { status: "completed", output: "same owner finished" } });
+    expect(resume).not.toHaveBeenCalled();
+    expect(h.commands.filter(command => command.type === "spawn")).toEqual([]);
+  });
+
+  it.each(["completed", "failed"] as const)("replays a genuine %s result from an exited child without continuing", async status => {
+    const h = await setup("dispatch", "full", { queue: true, terminalResult: status });
+    const resume = vi.spyOn(h.orch, "resumeTurnManually");
+    await h.run;
+    await drain();
+    expect(h.store.turnAttempts.get("inbound-1")).toMatchObject({ state: "completed", generation: 1,
+      outcome: { status, output: "provider final answer", ...(status === "failed"
+        ? { error: "provider rejected the request" } : {}) } });
+    expect(resume).not.toHaveBeenCalled();
+    expect(h.commands.filter(command => command.type === "spawn")).toEqual([]);
+  });
+
   it("keeps the existing 15-minute reconnect notice without failing unknown live work", async () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     const h = await setup("dispatch", "full", { armed: true, queue: true, disconnected: true });
@@ -252,12 +307,11 @@ describe("#777 armed recovery queue reconciliation", () => {
       outcome: { status: "completed", output: "reconnected and finished" } });
   });
 
-  it.each(["slot lost", "submission replaced", "prompt never received"] as const)(
+  it.each(["submission replaced", "prompt never received"] as const)(
     "settles %s with its cause and runs queued dispatches without interrupting the slot", async fault => {
       const h = await setup("dispatch", "full", { armed: true, queue: true });
       await h.run;
       await drain();
-      if (fault === "slot lost") h.loseSlot();
       if (fault === "submission replaced") h.replaceSubmission();
       if (fault === "prompt never received") h.losePrompt();
       vi.spyOn(h.orch, "recoverInterruptedTurns").mockResolvedValue(undefined);
@@ -281,7 +335,7 @@ describe("#777 armed recovery queue reconciliation", () => {
         }
         expect(h.store.turnAttempts.get("inbound-1")).toMatchObject({ state: "completed",
           outcome: { status: "failed", error: expect.stringContaining(
-            fault === "prompt never received" ? "never received" : fault === "slot lost" ? "no longer exists" : "no longer owns") } });
+            fault === "prompt never received" ? "never received" : "no longer owns") } });
         await tick;
         expect(executed).toEqual(["queued-0", "queued-1", "queued-2"]);
         for (const id of executed) expect(existsSync(path.join(dispatchDirs(h.dir).done, `${id}.json`))).toBe(true);
@@ -293,6 +347,29 @@ describe("#777 armed recovery queue reconciliation", () => {
         await watcher.drain();
       }
     });
+
+  it.each(["inventory", "reconcile"])("releases the adoption queue when %s reports a lost owner and requests exactly one continuation", async source => {
+    const h = await setup("dispatch", "full", { queue: true, armed: true });
+    await h.run;
+    await drain();
+    const resume = vi.spyOn(h.orch, "resumeTurnManually").mockResolvedValue("Continuation requested");
+    let ran = false;
+    const next = (h.orch as any).queueOnChannel("thread", async () => { ran = true; });
+    await drain();
+    expect(ran).toBe(false);
+    if (source === "inventory") h.loseSlot();
+    else h.loseOwnerDuringProbe();
+    await h.orch.reconcileRemoteRecoveries();
+    await next;
+    await drain();
+    await h.orch.reconcileRemoteRecoveries();
+    expect(resume).toHaveBeenCalledExactlyOnceWith("inbound-1");
+    expect(h.store.turnAttempts.get("inbound-1")).toMatchObject({
+      state: "suspended", acpSessionId: "acp", outcome: null,
+    });
+    expect(h.store.turnAttempts.get("inbound-1")?.remoteRecovery).toBeUndefined();
+    expect(h.commands.filter(command => command.type === "kill" || command.type === "spawn")).toEqual([]);
+  });
 });
 
 describe("adopted turns across a bridge reconnect", () => {

@@ -139,6 +139,7 @@ export class SupervisedSlots {
   private readonly configs = new Map<number, SlotSpawnConfig>();
   private readonly queues = new Map<number, Promise<unknown>>();
   private readonly recoveries = new Map<number, RemoteRecoverySnapshot>();
+  private attached = new Map<number, boolean>();
   private readonly controlWaiters = new Map<string, {
     resolve(value: unknown): void;
     reject(error: Error): void;
@@ -154,6 +155,7 @@ export class SupervisedSlots {
 
   async rebind(): Promise<SessiondListSlotsResult> {
     const listed = await this.options.client.listSlots();
+    this.attached = new Map(listed.health.map(row => [row.slot, row.alive && row.attached]));
     for (const health of listed.health) {
       // #606: sessiond keeps entries for exited children, and slot numbers
       // restart near zero on every bridge connection. Binding a dead entry as
@@ -164,7 +166,7 @@ export class SupervisedSlots {
       this.bindings.set(health.slot, {
         mode: "idle",
         buffered: new Map(),
-        ...(!health.alive || !health.attached ? { dead: true } : {}),
+        ...(!health.alive ? { dead: true } : {}),
       });
       // Idle subscription: rebuilds stderr and recovery records from the
       // retained log and keeps them current, without forwarding anything.
@@ -206,6 +208,13 @@ export class SupervisedSlots {
 
   async listSlots(): Promise<SessiondListSlotsResult> {
     const listed = await this.options.client.listSlots();
+    // Idle holders have no recovery record; query only on attachment.
+    const previous = this.attached;
+    this.attached = new Map(listed.health.map(row => [row.slot, row.alive && row.attached]));
+    await Promise.all(listed.health.filter(entry => entry.alive && entry.attached && !previous.get(entry.slot))
+      .map(entry => this.writeControl(entry.slot, {
+        v: ADAPTER_CHILD_PROTOCOL_VERSION, type: "report_recovery",
+      })));
     return {
       ...listed,
       health: listed.health.map((entry) => ({
@@ -321,9 +330,10 @@ export class SupervisedSlots {
     Promise<{ state: "owned" } | { state: "missing"; cause: string; retainChild?: true }> {
     return this.serial(slot, async () => {
       const health = (await this.options.client.listSlots()).health.find(row => row.slot === slot);
-      if (!health || !health.alive || !health.attached) {
-        return { state: "missing", cause: `bridge slot ${slot} has no attached live process` };
+      if (!health || !health.alive) {
+        return { state: "missing", cause: `bridge slot ${slot} has no live process` };
       }
+      if (!health.attached) return { state: "owned" };
       const snapshot = this.recoveries.get(slot);
       if (!snapshot?.reconcileSupported) {
         // Retained pre-rollout children already acknowledge an arm with no input.
@@ -423,6 +433,10 @@ export class SupervisedSlots {
     binding.buffered.clear();
     binding.gap = undefined;
     await this.options.client.subscribe({ slot, afterSeq }, (event) => this.onEvent(slot, event));
+    // Transport acknowledgement can precede durable turn completion.
+    if (!binding.dead) await this.writeControl(slot, {
+      v: ADAPTER_CHILD_PROTOCOL_VERSION, type: "report_recovery",
+    });
     const frames = [...binding.buffered.values()]
       .filter((frame) => frame.seq > afterSeq)
       .sort((left, right) => left.seq - right.seq);

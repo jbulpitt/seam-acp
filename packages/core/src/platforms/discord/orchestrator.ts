@@ -15791,9 +15791,9 @@ export class Orchestrator {
   private async dispatchContinuationRefusal(spec: DispatchSpec): Promise<string | null> {
     const attempt = this.store.turnAttempts.get(spec.id);
     if (!attempt || attempt.state !== "suspended") return "no suspended SQL execution is recorded";
+    const reauthenticated = attempt.stalledReason?.startsWith(REAUTH_COMPLETED_PREFIX) === true;
     if (isAwaitingReauth(attempt.stalledReason)) return attempt.stalledReason;
-    if (attempt.stalledUtc && !attempt.promptStarted &&
-        !attempt.stalledReason?.startsWith(REAUTH_COMPLETED_PREFIX)) {
+    if (attempt.stalledUtc && !attempt.promptStarted && !reauthenticated) {
       return "the stalled attempt never started a prompt; continuation cannot be distinguished from replaying its original brief";
     }
     if (attempt.promptStarted && !attempt.acpSessionId) {

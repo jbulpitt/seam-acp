@@ -136,7 +136,7 @@ async function clickReauth(h: ReturnType<typeof harness>) {
 
 function resumeOutcome(h: ReturnType<typeof harness>, failed: boolean) {
   h.prompt.mockImplementationOnce(async () => {
-    if (failed) throw new Error("provider refused the resumed turn");
+    if (failed) throw new RequestError(-32602, "provider refused the resumed turn", { errorKind: "invalid_request" });
     await (h.runtime as unknown as { emit(event: AgentEvent): Promise<void> })
       .emit({ kind: "agent-text", text: "RESUMED-ONCE" });
     return { stopReason: "end_turn" } as never;

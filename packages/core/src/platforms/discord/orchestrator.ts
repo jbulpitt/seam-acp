@@ -4932,7 +4932,7 @@ export class Orchestrator {
       if (humanAttempt) {
         const refusal = humanOutcomeOwned ? null : humanRefusal();
         if (refusal) throw refusal;
-        if (err instanceof ReauthParked && humanPromptSubmitted) {
+        if (err instanceof ReauthParked && humanAttempt.promptStarted) {
           const parked = parkReauthAttempt(this.store.turnAttempts, humanAttempt.id, err.park);
           if (parked) {
             status.setState("Waiting");
@@ -4940,10 +4940,7 @@ export class Orchestrator {
             await refresh(true).catch((noticeErr) => {
               this.logger.warn({ err: noticeErr, session: record.id }, "reauth status refresh failed");
             });
-            await this.adapter.sendMessage(channel, reauthWaitNotice(err.park)).catch((noticeErr) => {
-              this.logger.warn({ err: noticeErr, session: record.id }, "reauth wait notice failed");
-            });
-            await this.postReauthCard(channel.id, humanAttempt.id, err.park);
+            await this.postReauthCard(channel.id, humanAttempt.id, err.park, err.message);
             this.logger.warn({ session: record.id, attempt: humanAttempt.id }, "turn parked for provider authentication");
             return;
           }
@@ -10232,10 +10229,10 @@ export class Orchestrator {
         if (lifecycle && !outcomeOwned) lifecycle.onOutcome(result);
         this.assertQueueFence(queueFence);
       } catch (err) {
-        if (err instanceof ReauthParked && submittedThisAttempt && lifecycle && !outcomeOwned) {
+        if (err instanceof ReauthParked && attempt?.promptStarted && lifecycle && !outcomeOwned) {
           const parked = parkReauthAttempt(this.store.turnAttempts, spec.id, err.park);
           if (parked) {
-            await this.postReauthCard(spec.target, spec.id, err.park);
+            await this.postReauthCard(spec.target, spec.id, err.park, err.message);
             throw parked;
           }
         }
@@ -10890,10 +10887,10 @@ export class Orchestrator {
       completed = { output: result.text, stopReason: result.stopReason ?? "" };
     } catch (err) {
       failure = err;
-      if (err instanceof ReauthParked && submittedThisAttempt && lifecycle && !outcomeOwned && attemptStore) {
+      if (err instanceof ReauthParked && attempt?.promptStarted && lifecycle && !outcomeOwned && attemptStore) {
         const parked = parkReauthAttempt(attemptStore, spec.id, err.park);
         if (parked) {
-          await this.postReauthCard(spec.target, spec.id, err.park);
+          await this.postReauthCard(spec.target, spec.id, err.park, err.message);
           failure = parked;
         }
       }
@@ -12384,13 +12381,7 @@ export class Orchestrator {
             const parked = parkReauthAttempt(this.store.turnAttempts, attempt.id, err.park);
             if (parked) {
               this.patchScheduledStatus(row.id, `retained: ${parked.reason}`);
-              await this.adapter.sendMessage(
-                { platform: PLATFORM, id: row.channelRef },
-                reauthWaitNotice(err.park),
-              ).catch((noticeErr) => {
-                this.logger.warn({ err: noticeErr, id: attempt.id }, "reauth wait notice failed");
-              });
-              await this.postReauthCard(row.channelRef, attempt.id, err.park);
+              await this.postReauthCard(row.channelRef, attempt.id, err.park, err.message);
               return;
             }
           }
@@ -19294,9 +19285,8 @@ export class Orchestrator {
   }
 
   /** Choice card for a parked re-auth. Not an elicitation row. */
-  private async postReauthCard(channelRef: string, attemptId: string, park: ReauthPark): Promise<void> {
+  private async postReauthCard(channelRef: string, attemptId: string, park: ReauthPark, cause?: string): Promise<void> {
     try {
-      if (!this.adapter.sendChoiceCard) return;
       const record = this.store.getByChannel(PLATFORM, channelRef)
         ?? this.router.ensureSessionRecord?.({
           platform: PLATFORM,
@@ -19304,7 +19294,16 @@ export class Orchestrator {
           cwd: this.config.REPOS_ROOT,
         });
       if (!record) return;
-      const posted = await this.publishChoiceCard(record, reauthChoiceSpec(attemptId, park));
+      const attempt = this.store.turnAttempts.get(attemptId);
+      const context = {
+        agentId: attempt?.spec.agentId ?? record.agentId,
+        host: attempt?.spec.location ?? this.router.describeConfig(record).location.value,
+        cause,
+      };
+      await this.adapter.sendMessage({ platform: PLATFORM, id: channelRef }, reauthWaitNotice(park, context))
+        .catch(err => this.logger.warn({ err, attemptId }, "reauth wait notice failed"));
+      if (!this.adapter.sendChoiceCard) return;
+      const posted = await this.publishChoiceCard(record, reauthChoiceSpec(attemptId, park, context));
       if (!posted.ok) {
         this.logger.warn({ err: posted.error, attemptId, channelRef }, "reauth card was not posted");
       }

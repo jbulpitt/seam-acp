@@ -153,16 +153,27 @@ export function reauthStalledReason(park: ReauthPark): string {
 }
 
 /** Plain notice. Not a card, and not a second prompt. */
-export function reauthWaitNotice(park: ReauthPark): string {
+export interface ReauthNoticeContext {
+  agentId: string;
+  host: string;
+  cause?: string;
+}
+
+export function reauthWaitNotice(park: ReauthPark, context?: ReauthNoticeContext): string {
   const lines = [
-    "Provider authentication expired while this turn was in flight. The turn is parked and its prompt will not be replayed.",
+    context
+      ? `${context.agentId === "codex" ? "Codex" : context.agentId} on ${context.host} needs to sign in again${context.agentId === "codex" ? " (`codex login`)" : ""}; this turn is parked and resumes after sign-in is confirmed.`
+      : "Provider authentication expired while this turn was in flight. The turn is parked and its prompt will not be replayed.",
   ];
+  if (context?.cause) lines.push(`Cause: ${context.cause}`);
   if (park.url) lines.push(`Authenticate at ${park.url}`);
   if (park.userCode) lines.push(`Device code: ${park.userCode}`);
   if (park.loopbackRejected) {
     lines.push("The failure offered a loopback callback on the wrong host. That address is not the link to open.");
   }
-  lines.push("The parked attempt continues only after authentication is accepted.");
+  lines.push(context
+    ? "After signing in, use ‘Authentication is done — continue’. The original prompt will not be replayed."
+    : "The parked attempt continues only after authentication is accepted.");
   return lines.join("\n");
 }
 

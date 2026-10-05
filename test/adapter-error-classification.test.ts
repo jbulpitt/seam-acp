@@ -121,6 +121,22 @@ describe("#440 journal corpus — Claude", () => {
 });
 
 describe("#440 journal corpus — Codex", () => {
+  it("classifies the production session/load -32000 Authentication required response", () => {
+    // Production 2026-10-05 12:16Z: codex-acp session/load, data null.
+    const err = requestError("Authentication required", null, -32000);
+    expectKind(classifyAndAttach(err, classifyCodexError(err)), "auth_required", "codex");
+    expect(err.code).toBe(-32000);
+    expect(err.message).toBe("Authentication required");
+  });
+
+  it.each([
+    [-32603, "Authentication required"],
+    [-32000, "Authentication required for another service"],
+    [-32000, "Internal error"],
+  ])("does not infer Codex authentication from code %s and message %s", (code, message) => {
+    expectKind(classifyCodexError(requestError(message as string, null, code as number)), "unclassified", "codex");
+  });
+
   it("reads the usage-limit reason off DispatchTurnError.output, not the collapsed message", () => {
     // journal 2026-09-19: message "Internal error", data null, output held the quota text.
     const err = dispatchTurn("Internal error", {

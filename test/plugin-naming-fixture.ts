@@ -53,7 +53,7 @@ export async function namingFixture(options: { admins?: Set<string>; locked?: bo
   const events: string[] = [];
   let componentHandler: ((event: never) => Promise<void>) | undefined;
   const renameThread = vi.fn(async (channel: { id: string }, name: string) => { events.push("rename"); names.set(channel.id, name); });
-  const host = new PluginHost(logger, { slash: [buildSeamCommand().toJSON(), buildSeamAdminCommand().toJSON()] });
+  const host = new PluginHost(logger, { storageRoot: directory, slash: [buildSeamCommand().toJSON(), buildSeamAdminCommand().toJSON()] });
   const adapter = { onMessage: () => {}, onComponent: (handler: typeof componentHandler) => { componentHandler = handler; }, getThreadName: async (channel: { id: string }) => names.get(channel.id) ?? null, getThreadLiveState: async (channel: { id: string }) => names.has(channel.id) ? ({ locked: false, archived: false }) : undefined, renameThread };
   const orchestrator = new Orchestrator({ logger, config, router, store, modelCatalog, plugins: host, adapter: adapter as never, renderer: {} as never });
   await orchestrator.loadPlugins();

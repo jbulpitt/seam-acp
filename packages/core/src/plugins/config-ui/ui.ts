@@ -1,3 +1,4 @@
+import { ConfigEditorStore } from "./store.js";
 import { randomUUID } from "node:crypto";
 import { EmbedBuilder, MessageFlags } from "discord.js";
 import type { ComponentEvent, IncomingMessage, ChannelRef } from "../../platforms/chat-adapter.js";
@@ -6,7 +7,7 @@ import { LOCAL_LOCATION, parseAgentAtLocation } from "../../core/location.js";
 import { configSetRequestError } from "../../core/config-apply-plan.js";
 import { FAST_MODE_CONFIG_ID, FAST_MODE_COST_WARNING, FAST_MODE_RESET_NOTICE, isFastModeDisabledByEnv, fastModeEnvRefusal, fastModeAgentRefusal } from "../../core/fast-mode.js";
 import { catalogEffortChoices } from "../../platforms/discord/catalog-view.js";
-import { ConfigEditorStore, INHERIT_VALUE, RIDER_MODAL_MAX, applyPickerValue, authorizeDraftClick, currentRiderText, decodeRiderUpload, editScopeOf, effectiveAgentAtLocation, isDirty, makeCustomId, parseCustomId, renderCancelledHub, renderExpiredHub, renderHub, renderSavedHub, riderDownloadFilename, riderTooLong, snapshotFromDescribe, type DraftAgentCapabilities, type ThreadConfigDraft } from "../../platforms/discord/config-editor.js";
+import { INHERIT_VALUE, RIDER_MODAL_MAX, applyPickerValue, authorizeDraftClick, currentRiderText, decodeRiderUpload, editScopeOf, effectiveAgentAtLocation, isDirty, makeCustomId, parseCustomId, renderCancelledHub, renderExpiredHub, renderHub, renderSavedHub, riderDownloadFilename, riderTooLong, snapshotFromDescribe, type DraftAgentCapabilities, type ThreadConfigDraft } from "../../platforms/discord/config-editor.js";
 import { findAuditEntry, formatConfigAuditDetail, formatConfigAuditView } from "../../platforms/discord/config-audit-view.js";
 import { clampFieldValue } from "../../platforms/discord/workflows-view.js";
 import type { ConfigInteraction, ConfigUiPorts } from "./ports.js";

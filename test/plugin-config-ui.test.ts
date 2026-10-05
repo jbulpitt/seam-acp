@@ -96,16 +96,25 @@ describe("config UI built-in", () => {
     expect(h.store.listConfigMutations()).toEqual([]);
   });
 
-  it("routes pre-restart draft cards to the unchanged expired view", async () => {
+  it("resumes a pre-restart unsaved draft with its owner and the same save audit", async () => {
     const h = await fixture();
     await h.orchestrator.handleSlashInteraction(interaction("edit") as never);
     const customId = h.panels.at(-1).actions.flat().find((action: any) => action.customId?.endsWith(":save")).customId;
+    const id = parseCustomId(customId)!.draftId;
+    await h.component(component(`seam-cfg-edit:${id}:role-save`, "admin", { role: "qa" }));
+    const before = (h.orchestrator as any).configUi.ui.configEditor.get(id);
     const restarted = await fixture({ store: h.store, directory: h.directory });
-    const click = component(customId);
-    await restarted.component(click);
-    expect(click.deferUpdate).toHaveBeenCalledTimes(1);
-    expect(restarted.panels.at(-1)).toMatchObject({ footer: "draft expired", actions: [] });
-    expect(h.store.listConfigMutations()).toEqual([]);
+    expect((restarted.orchestrator as any).configUi.ui.configEditor.get(id)).toEqual(before);
+    const stranger = component(customId, "other");
+    await restarted.component(stranger);
+    expect(stranger.replyEphemeral).toHaveBeenCalledWith("This editor isn't yours.");
+    await restarted.component(component(customId));
+    expect(h.config.threadPresets.get(THREAD)?.role?.value).toBeUndefined();
+    expect(restarted.config.threadPresets.get(THREAD)?.role?.value).toBe("qa");
+    expect(h.store.listConfigMutations()).toHaveLength(1);
+    expect(h.store.listConfigMutations()[0]).toMatchObject({ actorId: "admin", actorName: "admin" });
+    expect(restarted.panels.at(-1).footer).toMatch(/saved/i);
+    expect(JSON.parse(fs.readFileSync(`${h.directory}/plugins/config-ui/drafts.json`, "utf8"))).toEqual([]);
   });
 
   it("a failed UI contribution leaves sibling plugin and kernel work available", async () => {

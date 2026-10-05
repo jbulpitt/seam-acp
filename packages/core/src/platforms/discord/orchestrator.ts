@@ -7075,7 +7075,9 @@ export class Orchestrator {
   ): Promise<AgentRuntime> {
     for (let attempt = 1; attempt <= BOOT_RECOVERY_ATTEMPTS; attempt++) {
       try {
-        return await this.router.getOrStartRuntime(record, resumeSessionId ? { resumeSessionId } : undefined);
+        return await (resumeSessionId
+          ? this.router.getOrStartRuntime(record, { resumeSessionId })
+          : this.router.getOrStartRuntime(record));
       } catch (err) {
         if (!isRetryableBootAcquisitionError(err)) {
           throw err;

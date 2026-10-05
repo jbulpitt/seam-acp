@@ -64,7 +64,8 @@ describe("pre-prompt terminal card settlement", () => {
     expect(completed).toHaveBeenCalledExactlyOnceWith(attempt.id);
     await drain();
     expect(edits.at(-1)?.title).toContain("Failed");
-    expect(edits.at(-1)?.fields.find(f => f.name === "Action")?.value).toBe("Cancelled");
+    expect(edits.at(-1)?.fields.find(f => f.name === "Action")?.value)
+      .toBe(cause === "operator" ? "Cancelled" : "Cancelled — queue ownership changed");
     expect(store.turnAttempts.cancel(attempt.id)).toBe(false);
     expect(completed).toHaveBeenCalledTimes(1);
   });
@@ -79,7 +80,7 @@ describe("pre-prompt terminal card settlement", () => {
   });
 
   it("finalizes the existing live panel so its heartbeat cannot restore Working", async () => {
-    vi.useFakeTimers();
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
     const attempt = openCard();
     const panel = await (host as any).startDispatchStatusPanel({ platform: "discord", id: spec.target }, spec,
       { model: "test", cwd: "/synthetic", isolated: true }, undefined, attempt.statusCard);

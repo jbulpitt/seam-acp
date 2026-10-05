@@ -33,6 +33,13 @@ process.stdin.on("data", (chunk) => {
       currentModeId = "agent";
       send({ id: message.id, result: { sessionId: process.env.FAKE_AGENT_NEW_SESSION_ID ?? "s1", ...modes() } });
     } else if (message.method === "session/load") {
+      if (process.env.FAKE_AGENT_MISSING_SESSION === message.params.sessionId) {
+        const details = `no rollout found for session ${message.params.sessionId}`;
+        process.stderr.write(`${details}\n`);
+        setTimeout(() => send({ id: message.id,
+          error: { code: -32603, message: "Internal error", data: { details } } }), 20);
+        continue;
+      }
       if (process.env.FAKE_AGENT_LOAD_FAILURE && fs.existsSync(process.env.FAKE_AGENT_LOAD_FAILURE)) {
         process.stderr.write("native thread/resume failed: fixture load outage\n");
         setTimeout(() => send({ id: message.id,

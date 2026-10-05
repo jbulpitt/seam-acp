@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { handoverProof, loadOutageProof, SAVED_SESSION } from "./helpers/saved-session-recovery.js";
+import { handoverProof, loadOutageProof, sessionGoneProof, SAVED_SESSION } from "./helpers/saved-session-recovery.js";
 
 afterEach(() => vi.useRealTimers());
 
@@ -23,5 +23,19 @@ describe("saved conversations survive load failures and settlement", () => {
       processes: 1, loads: 1, delegated: true, prompts: [{ session: SAVED_SESSION }] });
     expect(result.afterPid).toBe(result.beforePid);
     expect(result.newSlot).toBe(result.slot);
+  }, 20_000);
+
+  it.each([false, true])("a missing session recovers visibly without load retries and later turns keep working; recorded=%s", async recorded => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const sleep = vi.fn(async (ms: number) => { vi.setSystemTime(Date.now() + ms); });
+    const result = await sessionGoneProof(recorded, sleep);
+    expect(result).toMatchObject({ afterRecovery: "replacement-conversation", finalId: "replacement-conversation",
+      missingLoads: 1, laterLoads: 1, newSessions: 1,
+      promptSessions: ["replacement-conversation", "replacement-conversation"],
+      notices: [{ channel: { platform: "discord", id: "fixture-thread" },
+        text: expect.stringContaining(SAVED_SESSION) }] });
+    expect(result.notices[0].text).toContain("no rollout found");
+    expect(result.notices[0].text).toContain("fresh conversation");
+    expect(sleep).not.toHaveBeenCalled();
   }, 20_000);
 });

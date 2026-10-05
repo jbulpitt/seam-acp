@@ -1,3 +1,4 @@
+import { readErrorClassification } from "@seam/adapters";
 import { DispatchSuspendedError } from "./attempt-store.js";
 
 /** Outcome of the sole start/load owner, not another retryable transport error.
@@ -25,6 +26,7 @@ export function isRetryableBootAcquisitionError(err: unknown): boolean {
     // #448: a timeout/transport cause may remain inside an exhausted outcome.
     // Refuse a second budget, not a later explicit recovery or another target.
     if ((current as { acquisitionRecoveryExhausted?: unknown }).acquisitionRecoveryExhausted === true) return false;
+    if (readErrorClassification(current)?.errorKind === "session_gone") return false;
     const typed = current as { code?: unknown; name?: unknown; message?: unknown; cause?: unknown };
     if (typed.code === "session_load_timeout" || typed.name === "SessionLoadTimeoutError") return true;
     // #427: recognise the transport's own verdict structurally rather than by

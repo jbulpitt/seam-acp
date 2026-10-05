@@ -6,6 +6,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { pino } from "pino";
 import { makeMux, type AgentProfile } from "@seam/adapters";
+import { classifyCodexError } from "../../packages/adapters/src/profiles/codex.js";
 import { SessiondServer } from "../../packages/bridge/src/sessiond-server.js";
 import { SessiondClient } from "../../packages/bridge/src/sessiond-client.js";
 import { SupervisedSlots } from "../../packages/bridge/src/supervised-slots.js";
@@ -22,6 +23,7 @@ export const SAVED_SESSION = "saved-conversation";
 
 export async function savedSessionHost(options: {
   failLoad?: boolean;
+  sessionGone?: boolean;
   legacy?: boolean;
   recoverySleep?: (ms: number) => Promise<void>;
 } = {}) {
@@ -86,7 +88,8 @@ export async function savedSessionHost(options: {
     adapterChildPath: path.join(here, options.legacy ? "adapter-child-legacy.mjs" : "adapter-child-source.mjs"),
     environment: { HOME: root, PATH: `${bin}:${path.dirname(process.execPath)}:/usr/bin:/bin`,
       FAKE_AGENT_PIDS: path.join(root, "agent.pids"), FAKE_AGENT_REQUESTS: path.join(root, "requests.jsonl"),
-      FAKE_AGENT_LOAD_FAILURE: failure, FAKE_AGENT_NEW_SESSION_ID: "replacement-conversation" },
+      FAKE_AGENT_LOAD_FAILURE: failure, FAKE_AGENT_NEW_SESSION_ID: "replacement-conversation",
+      ...(options.sessionGone ? { FAKE_AGENT_MISSING_SESSION: SAVED_SESSION } : {}) },
     onFrame: frame => socket.deliver(frame), onStderr: () => {} });
   const mux = makeMux({ id: "fixture" });
   mux.attach(socket as never);
@@ -98,9 +101,11 @@ export async function savedSessionHost(options: {
     parentRef: null, agentId: "codex", acpSessionId: SAVED_SESSION, repoPath: root,
     configJson: "{}", createdUtc: now, updatedUtc: now };
   store.upsert(record);
-  const profile = { id: "codex", defaultModel: "default", spawn() { throw new Error("must use bridge"); } } as unknown as AgentProfile;
+  const profile = { id: "codex", defaultModel: "default", classifyError: classifyCodexError,
+    spawn() { throw new Error("must use bridge"); } } as unknown as AgentProfile;
   const catalog = fixtureModelCatalog([profile]);
   const routers: SessionRouter[] = [];
+  const notices: Array<{ channel: unknown; text: string }> = [];
   function makeRouter() {
     const router = new SessionRouter({ logger, store, profiles: [profile], modelCatalog: catalog,
       defaultAgentId: "codex", defaultModel: "default", threadPresets: new Map([[record.channelRef, { location: "fixture" }]]),
@@ -110,7 +115,9 @@ export async function savedSessionHost(options: {
     return router;
   }
   function makeOrchestrator(router: SessionRouter) {
-    const adapter = { sendMessage: async (channel: unknown) => ({ channel, id: "fixture-message" }),
+    const adapter = { sendMessage: async (channel: unknown, text: string) => {
+      notices.push({ channel, text }); return { channel, id: "fixture-message" };
+    },
       editPanel: async () => {}, deleteMessage: async () => {} };
     const orch = new Orchestrator({ logger, store, router, modelCatalog: catalog,
       adapter: adapter as any, renderer: discordRenderer as any,
@@ -122,7 +129,7 @@ export async function savedSessionHost(options: {
   }
   const requests = async () => (await fs.readFile(path.join(root, "requests.jsonl"), "utf8"))
     .trim().split("\n").map(line => JSON.parse(line));
-  return { root, db, record, store, mux, slots, client, commands, makeRouter, makeOrchestrator, requests,
+  return { root, db, record, store, mux, slots, client, commands, notices, makeRouter, makeOrchestrator, requests,
     repairLoad: () => fs.rm(failure, { force: true }),
     async close() {
       for (const router of routers) await router.disposeAll();
@@ -155,6 +162,30 @@ export async function loadOutageProof(recoverySleep?: (ms: number) => Promise<vo
       loadsBeforeRepair: beforeRepair.filter(r => r.method === "session/load").length,
       newSessions: requests.filter(r => r.method === "session/new").length,
       promptSession: requests.findLast(r => r.method === "session/prompt")?.params.sessionId };
+  } finally { await h.close(); }
+}
+
+export async function sessionGoneProof(recordedResume = false, recoverySleep?: (ms: number) => Promise<void>) {
+  const h = await savedSessionHost({ sessionGone: true, recoverySleep });
+  try {
+    const router = h.makeRouter();
+    const orch = h.makeOrchestrator(router);
+    const first = await orch.injectTurn(h.record, "continue first turn", { session: "live",
+      ...(recordedResume ? { resumeSessionId: SAVED_SESSION } : {}) });
+    if (first.error) throw first.cause ?? new Error(first.error);
+    const afterRecovery = h.store.get(h.record.id)!.acpSessionId;
+    await router.invalidate(h.record.id);
+    const later = await orch.injectTurn(h.store.get(h.record.id)!, "continue later turn", { session: "live" });
+    if (later.error) throw later.cause ?? new Error(later.error);
+    const reopened = new SessionStore(h.db);
+    const finalId = reopened.get(h.record.id)!.acpSessionId;
+    reopened.close();
+    const requests = await h.requests();
+    return { afterRecovery, finalId, notices: h.notices,
+      missingLoads: requests.filter(r => r.method === "session/load" && r.params.sessionId === SAVED_SESSION).length,
+      laterLoads: requests.filter(r => r.method === "session/load" && r.params.sessionId === afterRecovery).length,
+      newSessions: requests.filter(r => r.method === "session/new").length,
+      promptSessions: requests.filter(r => r.method === "session/prompt").map(r => r.params.sessionId) };
   } finally { await h.close(); }
 }
 
@@ -201,6 +232,7 @@ export async function handoverProof(legacy = false) {
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
-  const result = process.argv[2] === "load" ? await loadOutageProof() : await handoverProof(process.argv[2] === "legacy");
+  const result = process.argv[2] === "load" ? await loadOutageProof()
+    : process.argv[2] === "gone" ? await sessionGoneProof() : await handoverProof(process.argv[2] === "legacy");
   console.log(JSON.stringify(result, null, 2));
 }

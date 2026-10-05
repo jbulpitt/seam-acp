@@ -87,6 +87,31 @@ function setup() {
 }
 
 describe("#250 human turn production pipeline, synthetic transport only", () => {
+  it("a saved session reported missing recovers the ordinary human turn with a named notice", async () => {
+    const h = setup();
+    Object.assign(h.router, { invalidate: vi.fn(async () => {}) });
+    const gone = Object.assign(new Error("Internal error"), {
+      data: { errorKind: "session_gone", agentId: "codex", details: "no rollout found for recorded-acp" },
+    });
+    h.router.getOrStartRuntime.mockRejectedValueOnce(gone).mockImplementationOnce(async record => {
+      Object.assign(record as object, { acpSessionId: "fresh-acp" });
+      h.store.upsert(record as any);
+      return { ...h.runtime, getSessionInfo: () => ({ sessionId: "fresh-acp" }) };
+    });
+    h.runtime.prompt.mockImplementationOnce(async () => {
+      await h.emit("fresh answer"); return { stopReason: "end_turn" };
+    });
+    await h.run();
+    expect(h.router.getOrStartRuntime).toHaveBeenCalledTimes(2);
+    expect(h.runtime.prompt).toHaveBeenCalledTimes(1);
+    expect(h.runtime.prompt.mock.calls[0][0]).toContain("ORIGINAL DISPOSABLE WORK");
+    expect(h.store.turnAttempts.get("inbound-1")).toMatchObject({ state: "completed",
+      acpSessionId: "fresh-acp", outcome: { status: "completed" }, deliveryDone: true });
+    expect(h.adapter.sendMessage.mock.calls[0][1]).toContain("saved session `recorded-acp`");
+    expect(h.adapter.sendMessage.mock.calls[0][1]).toContain("no rollout found for recorded-acp");
+    expect(h.adapter.sendMessage.mock.calls.some(([, text]) => text === "fresh answer")).toBe(true);
+  });
+
   it.each([
     { location: "remote-one", notice: undefined },
     { location: "local", notice: "Model fallback: original → sibling; capability unknown; price unknown." },

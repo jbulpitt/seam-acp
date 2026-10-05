@@ -7079,6 +7079,25 @@ export class Orchestrator {
           ? this.router.getOrStartRuntime(record, { resumeSessionId })
           : this.router.getOrStartRuntime(record));
       } catch (err) {
+        const classification = readErrorClassification(err);
+        if (classification?.errorKind === "session_gone") {
+          const lostSessionId = resumeSessionId ?? record.acpSessionId;
+          const resolution = resolveError({ ...classification,
+            viableOptions: [{ id: "fresh-context", rung: 4 }] }, DEFAULT_ERROR_RULES);
+          this.logger.warn({ err, session: record.id, lostSessionId, resolution },
+            "saved session is gone; recovering with fresh context");
+          await this.adapter.sendMessage({ platform: record.platform, id: record.channelRef,
+            ...(record.parentRef ? { parentId: record.parentRef } : {}) },
+          `The agent reports that saved session \`${lostSessionId}\` no longer exists. Starting a fresh conversation without the earlier context.\nCause: ${classification.details ?? (err instanceof Error ? err.message : String(err))}`);
+          // No prompt was submitted. Retire the failed acquisition and clear
+          // only the conversation the adapter definitively reported missing.
+          await this.router.invalidate(record.id, { clearStartFailure: true });
+          Object.assign(record, this.store.get(record.id), {
+            acpSessionId: "", updatedUtc: new Date().toISOString(),
+          });
+          this.store.upsert(record);
+          return this.router.getOrStartRuntime(record);
+        }
         if (!isRetryableBootAcquisitionError(err)) {
           throw err;
         }

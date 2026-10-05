@@ -23,8 +23,8 @@ export class PresetUi {
     return { cardReply: reply, user: { id: card.owner }, channelRef: card.channel, channelId: card.channel?.id,
       parentId: card.channel?.parentId, projectScopeId: card.projectRef ?? undefined, deferred: true, replied: true,
       options: { getString: (() => "") as PresetInteraction["options"]["getString"], getBoolean: () => null, getInteger: () => null },
-      reply: view => reply.followUp(view as never), editReply: view => reply.editReply(typeof view === "string" ? { content: view } : view),
-      deferReply: async () => {}, fetchReply: async () => ({ id: "" }),
+      reply: view => reply.editReply(typeof view === "string" ? { content: view } : view),
+      fetchReply: async () => ({ id: "" }),
     };
   }
   private async resumeCard(card: PresetCard): Promise<PresetController> {

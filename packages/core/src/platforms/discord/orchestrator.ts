@@ -453,7 +453,7 @@ import { ATTACH_FENCE_LANG, WAKE_FENCE_LANG, WATCH_FENCE_LANG, CHOICE_FENCE_LANG
 
 import { PluginHost } from "../../plugins/host.js";
 import { installThreadNaming } from "../../core/thread-identity.js";
-import type { SlashInvocation, SlashDispatchInvocation } from "../../plugins/slash-registry.js";
+import type { SlashDispatchInvocation } from "../../plugins/slash-registry.js";
 import {
   CHOICE_CUSTOM_TEXT_MAX,
   choiceAuthoringRules,

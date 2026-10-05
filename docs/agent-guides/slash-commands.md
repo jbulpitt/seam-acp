@@ -51,6 +51,13 @@ admin-only handlers still require a listed Discord user id. Prompt stamping
 leaves resolve access before dispatch (for example, workflow cancellation and
 `cancel scope:all`). Editors and pickers are mutating surfaces.
 
+Every leaf also declares an acknowledgement mode: `ephemeral` (the default),
+`public`, or `modal` for a form shown as the first response. Dispatch defers
+before handler work, including plugin preparation. Handlers use
+`replyToInteraction` (plugin invocations use `reply`) to fill the deferred reply
+and report the actual result or underlying error; do not add handler-local
+defers. Autocomplete keeps its separate three-second response budget.
+
 **Top-level (3):** `rebuild` `compact-thread` `recover`
 
 `/seamadmin rebuild` is deterministic Discord reconstruction (no summarizer; one destination seed turn that may consume up to 60% of the destination context window). `/seamadmin compact-thread` is the former model-assisted rebuild. `Premium Compact (Discord)` remains the AGY fan-out pipeline. `/seam config reset` starts a blank session with no history.

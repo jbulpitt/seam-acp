@@ -406,12 +406,11 @@ export class TurnAttemptStore {
       .get(a.id, a.generation, a.ownerBoot));
   }
 
-  /** Bind the logical attempt's one status card before provider work starts.
-   * A resumed generation reuses this address; replacing it would orphan the
-   * pre-restart card and recreate #586. Refuse only this attempt on conflict. */
+  /** Resume reuses the card unless its edit failed and the caller replaces that address. */
   bindStatusCard(
     a: TurnAttempt,
-    ref: { channelId: string; messageId: string }
+    ref: { channelId: string; messageId: string },
+    replaces?: { channelId: string; messageId: string }
   ): void {
     if (!ref.channelId || !ref.messageId) {
       throw DispatchSuspendedError.defect(a.id, "status card reference is incomplete");
@@ -420,8 +419,19 @@ export class TurnAttemptStore {
     if (current?.statusCard) {
       if (current.statusCard.channelId !== ref.channelId ||
           current.statusCard.messageId !== ref.messageId) {
-        throw DispatchSuspendedError.defect(a.id,
-          "attempt is already bound to a different status card");
+        if (!replaces || current.statusCard.channelId !== replaces.channelId ||
+            current.statusCard.messageId !== replaces.messageId) {
+          throw DispatchSuspendedError.defect(a.id,
+            "attempt is already bound to a different status card");
+        }
+        const n = this.db.prepare(`UPDATE turn_attempts SET status_card_channel=?, status_card_message=?
+          WHERE id=? AND generation=? AND owner_boot=? AND state='active'
+            AND status_card_channel=? AND status_card_message=?`)
+          .run(ref.channelId, ref.messageId, a.id, a.generation, a.ownerBoot,
+            replaces.channelId, replaces.messageId).changes;
+        if (n !== 1) throw this.notCurrent(a, "status card");
+        a.statusCard = { ...ref };
+        return;
       }
       a.statusCard = current.statusCard;
       return;

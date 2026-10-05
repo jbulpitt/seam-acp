@@ -11,7 +11,7 @@ input.on("line", line => {
   if (request.method === "initialize") {
     result = { protocolVersion: 1, agentCapabilities: { sessionCapabilities: { list: {} } } };
   } else if (request.method === "session/list") {
-    if (process.env.FIXTURE_LIST_FAILURE) error = { code: -32000, message: "session source unavailable: permission denied" };
+    if (process.env.FIXTURE_LIST_FAILURE) error = { code: -32000, message: "session source unavailable (permission denied)" };
     else result = pages[request.params.cursor ?? "first"] ?? { sessions: [] };
   } else {
     error = { code: -32601, message: `Unexpected method: ${request.method}` };

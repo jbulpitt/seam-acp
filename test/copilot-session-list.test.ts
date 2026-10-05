@@ -150,7 +150,7 @@ describe("Copilot session listing and history", () => {
     legacy([{ id: "legacy", cwd }]);
     const p = profile([], { cliPath: process.execPath, acpArgs: [fixture], sessionList: undefined,
       environment: { ...process.env, DATA_DIR: dataDir, FIXTURE_LIST_FAILURE: "1" } });
-    await expect(p.listSessions(cwd)).rejects.toThrow("session source unavailable: permission denied");
+    await expect(p.listSessions(cwd)).rejects.toThrow("session source unavailable (permission denied)");
   });
 
   it("surfaces missing or unreadable native history with its path and cause", async () => {

@@ -538,6 +538,56 @@ describe("xAI RSS adapter", () => {
     ).toBe("unknown");
   });
 
+  it("merges per-component copies of one incident from the 2026-10-05 feed", () => {
+    const result = normalizeXaiFeed(config, fixture("xai/feed-live-2026-10-05.xml"), NOW);
+    validateAdapterResult(result);
+
+    expect(result.incidents.map((incident) => incident.externalId).sort()).toEqual([
+      "INC578e0bc8",
+      "INC5a3245c3",
+      "INC698e276c",
+      "INC72f6dd00",
+    ]);
+    const models = result.incidents.find((incident) => incident.externalId === "INC72f6dd00")!;
+    expect(models.title).toBe("Models outage");
+    expect(models.stage).toBe("resolved");
+    expect([...models.componentIds].sort()).toEqual([
+      "android-app",
+      "api-global",
+      "api-us",
+      "grok-build",
+      "grok-com",
+      "grok-in-x",
+      "ios-app",
+      "office-workspace-plugins",
+    ]);
+    // Eight identical copies contribute their two updates once.
+    expect(models.updates.map((update) => update.order)).toEqual([0, 1]);
+    expect(result.components).toHaveLength(9);
+    expect(result.components.every((component) => component.status === "operational")).toBe(true);
+  });
+
+  it("keeps a merged incident active when any copy of it is active", () => {
+    const feed = fixture("xai/feed-live-2026-10-05.xml");
+    const usStart = feed.indexOf("<link>https://status.x.ai/api-us/INC5a3245c3</link>");
+    const usEnd = feed.indexOf("</item>", usStart);
+    const usItem = feed.slice(usStart, usEnd);
+    const activeUs = usItem
+      .replace("Status: RESOLVED", "Status: INVESTIGATING")
+      .replace(/<p>Resolved: [^<]*<\/p>/, "")
+      .replace("<category>resolved</category>", "<category>investigating</category>");
+    const result = normalizeXaiFeed(config, feed.replace(usItem, activeUs), NOW);
+    validateAdapterResult(result);
+
+    const merged = result.incidents.find((incident) => incident.externalId === "INC5a3245c3")!;
+    expect(merged.stage).toBe("active");
+    expect(merged.resolvedAt).toBeNull();
+    expect([...merged.componentIds].sort()).toEqual(["api-global", "api-us"]);
+    expect(result.components.find((component) => component.id === "api-us")!.status).not.toBe(
+      "operational"
+    );
+  });
+
   it("rejects an ambiguous lifecycle and an unparseable date", () => {
     expect(() => normalizeXaiFeed(config, fixture("xai/case-ambiguous-lifecycle.xml"), NOW)).toThrow(
       /ambiguous lifecycle/i

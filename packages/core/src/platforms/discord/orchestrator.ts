@@ -3783,19 +3783,30 @@ export class Orchestrator {
       throw DispatchSuspendedError.defect(humanAttempt!.id,
         "persisted status card belongs to a different channel");
     }
-    const statusMsg = persistedStatusCard
-      ? {
-          channel: { platform: channel.platform, id: persistedStatusCard.channelId },
-          id: persistedStatusCard.messageId,
-        }
-      : this.adapter.sendPanel
+    const postStatus = async () => this.adapter.sendPanel
         ? await this.adapter.sendPanel(channel, initialRendered)
         : await this.adapter.sendMessage(channel, serializePanelText(initialRendered));
-    if (humanAttempt && !persistedStatusCard) {
+    const statusMsg = persistedStatusCard
+      ? await (async () => {
+          const ref: MessageRef = {
+            channel: { platform: channel.platform, id: persistedStatusCard.channelId },
+            id: persistedStatusCard.messageId,
+          };
+          try {
+            if (this.adapter.editPanel) await this.adapter.editPanel(ref, initialRendered);
+            else await this.adapter.editMessage(ref, serializePanelText(initialRendered));
+            return ref;
+          } catch (err) {
+            this.logger.warn({ err, attempt: humanAttempt!.id }, "resumed status card unavailable; replacing it");
+            return postStatus();
+          }
+        })()
+      : await postStatus();
+    if (humanAttempt) {
       this.store.turnAttempts.bindStatusCard(humanAttempt, {
         channelId: statusMsg.channel.id,
         messageId: statusMsg.id,
-      });
+      }, persistedStatusCard ?? undefined);
     }
     if (humanAttempt) this.store.turnAttempts.saveStatusCardState(humanAttempt, status.snapshot());
     this.assertQueueFence(queueFence);
@@ -10246,6 +10257,14 @@ export class Orchestrator {
         }
         throw err;
       } finally {
+        // A parked invocation no longer owns the card's clock. Resume reuses it.
+        if (statusPanel && !result) {
+          const projection = attempt ? projectAttemptCard(this.store.turnAttempts.get(attempt.id), attempt) : null;
+          if (projection) {
+            await this.awaitBoundedDispatchSettlement(spec.id, "status-card-settle",
+              statusPanel.finalize(projection.state, projection.action));
+          } else statusPanel.stop();
+        }
         // The turn is over — no more `schedule_wake` calls can nest under it.
         if (isWake) this.activeWakeDepth.delete(spec.target);
         // No longer interruptible — the turn has ended.
@@ -11778,7 +11797,7 @@ export class Orchestrator {
       cachedUsage?: SessionConfigState["lastContextUsage"];
     },
     queueFence?: ChannelQueueFence,
-    /** A resumed attempt's recorded card. It is edited in place, never reposted. */
+    /** Reuse a resumed attempt's card, replacing only an unavailable message. */
     existingCard?: { channelId: string; messageId: string }
   ): Promise<DispatchStatusPanel<MessageRef> | undefined> {
     if (!this.queueFenceCurrent(queueFence)) return undefined;
@@ -11854,13 +11873,21 @@ export class Orchestrator {
                 channel: { platform: target.platform, id: existingCard.channelId },
                 id: existingCard.messageId,
               };
-              if (this.adapter.editPanel) await this.adapter.editPanel(ref, panel);
-              else await this.adapter.editMessage(ref, serializePanelText(panel));
-              return ref;
+              try {
+                if (this.adapter.editPanel) await this.adapter.editPanel(ref, panel);
+                else await this.adapter.editMessage(ref, serializePanelText(panel));
+                return ref;
+              } catch (err) {
+                this.logger.warn({ err, dispatch: spec.id }, "resumed status card unavailable; replacing it");
+              }
             }
-            return this.adapter.sendPanel
+            const ref = this.adapter.sendPanel
               ? await this.adapter.sendPanel(target, panel)
               : await this.adapter.sendMessage(target, serializePanelText(panel));
+            if (statusAttempt) this.store.turnAttempts.bindStatusCard(statusAttempt, {
+              channelId: ref.channel.id, messageId: ref.id,
+            }, existingCard);
+            return ref;
           } catch (err) {
             this.logger.warn({ err, dispatch: spec.id }, "dispatch: status panel post failed");
             return undefined;
@@ -11868,6 +11895,10 @@ export class Orchestrator {
         },
         edit: async (ref, panel) => {
           if (!this.queueFenceCurrent(queueFence)) return false;
+          if (statusAttempt) {
+            const latest = this.store.turnAttempts.get(statusAttempt.id);
+            if (!latest || latest.generation !== statusAttempt.generation) return false;
+          }
           try {
             if (this.adapter.editPanel) {
               await this.adapter.editPanel(ref, panel);

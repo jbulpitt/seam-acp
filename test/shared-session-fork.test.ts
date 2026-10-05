@@ -15,12 +15,14 @@ import type { Logger } from "../packages/core/src/lib/logger.js";
 const silent = pino({ level: "silent" }) as unknown as Logger;
 let dir: string;
 let store: SessionStore;
+const hosts: Orchestrator[] = [];
 
 beforeEach(async () => {
   dir = await mkdtemp(path.join(tmpdir(), "seam-631-fork-"));
   store = new SessionStore(path.join(dir, "seam.db"));
 });
 afterEach(async () => {
+  await Promise.all(hosts.splice(0).map(host => host.loadPlugins()));
   store.close();
   await rm(dir, { recursive: true, force: true });
 });
@@ -54,6 +56,7 @@ function host(forkResult: string | undefined, rebuildAttaches = true) {
     store,
     renderer: {} as never,
   });
+  hosts.push(orchestrator);
   const rebuild = vi.fn(async (record: { id: string }) => {
     if (rebuildAttaches) store.upsert({ ...store.get(record.id)!, acpSessionId: "acp-rebuilt" });
     return { attached: rebuildAttaches, attachmentReason: rebuildAttaches ? "attached" : "thread moved on" };
@@ -124,6 +127,7 @@ describe("#631 tier 3: a bridge that stays unreachable", () => {
         store,
         renderer: {} as never,
       });
+      hosts.push(built);
       built.setBridgeHub({ onBridgeReady: (cb: (location: string) => void) => { ready.push(cb); return () => undefined; } } as never);
       Object.assign(built as never, { adoptRemoteRecovery: vi.fn(async () => true) });
       (built as unknown as { deferRemoteRecoveryAdoption(a: unknown): void }).deferRemoteRecoveryAdoption({
@@ -155,6 +159,7 @@ function orchestratorWith(mux: Record<string, unknown>) {
     store,
     renderer: {} as never,
   });
+  hosts.push(built);
   built.setBridgeHub({ muxFor: () => mux, onBridgeReady: () => () => undefined } as never);
   return { built, sent };
 }

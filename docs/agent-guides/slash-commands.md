@@ -93,6 +93,13 @@ defers. Autocomplete keeps its separate three-second response budget.
 Idle + host ready runs now. A later bare message still interrupts and
 cancels the queued prompt. Shares the `#88` parked row.
 
+**Workflows:** `/seam workflows` acknowledges before reading the inventory or
+cancelling an item. The default inventory is this thread, newest first;
+`scope:all` explicitly selects the admin all-threads view. Resume is offered
+only for a recorded continuation that passes the existing admission checks.
+Completed output can be abandoned, not rerun; consumed records remain visible
+as history with no action available.
+
 **Cancel options** (not new keywords):
 - `/seam cancel` — this thread, graceful
 - `/seam cancel force:true` — this thread, escalate (old `abort`)

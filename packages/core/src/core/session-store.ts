@@ -2060,24 +2060,25 @@ export class SessionStore {
   }
 
   /** Rows still in flight, oldest first — the order a watchdog wants. */
-  listActiveDelegations(): LedgerEntry[] {
+  listActiveDelegations(channelRef?: string): LedgerEntry[] {
     const placeholders = DELEGATION_ACTIVE_STATUSES.map(() => "?").join(", ");
     return this.db
       .prepare<string[], LedgerRow>(
         `SELECT * FROM delegation_log WHERE status IN (${placeholders})
+         ${channelRef ? "AND (target_ref = ? OR source_ref = ?)" : ""}
          ORDER BY created_utc ASC, rowid ASC`
       )
-      .all(...DELEGATION_ACTIVE_STATUSES)
+      .all(...DELEGATION_ACTIVE_STATUSES, ...(channelRef ? [channelRef, channelRef] : []))
       .map(mapLedger);
   }
 
-  listRecentDelegations(limit = 50): LedgerEntry[] {
+  listRecentDelegations(limit = 50, channelRef?: string): LedgerEntry[] {
     return this.db
-      .prepare<[number], LedgerRow>(
-        `SELECT * FROM delegation_log
+      .prepare<Array<string | number>, LedgerRow>(
+        `SELECT * FROM delegation_log ${channelRef ? "WHERE target_ref = ? OR source_ref = ?" : ""}
          ORDER BY created_utc DESC, rowid DESC LIMIT ?`
       )
-      .all(limit)
+      .all(...(channelRef ? [channelRef, channelRef] : []), limit)
       .map(mapLedger);
   }
 
@@ -2092,15 +2093,16 @@ export class SessionStore {
   }
 
   /** Ledger rows in the given statuses, oldest first — resume inventory (#76). */
-  listDelegationsByStatus(statuses: readonly DelegationStatus[]): LedgerEntry[] {
+  listDelegationsByStatus(statuses: readonly DelegationStatus[], channelRef?: string): LedgerEntry[] {
     if (statuses.length === 0) return [];
     const placeholders = statuses.map(() => "?").join(", ");
     return this.db
       .prepare<string[], LedgerRow>(
         `SELECT * FROM delegation_log WHERE status IN (${placeholders})
+         ${channelRef ? "AND target_ref = ?" : ""}
          ORDER BY updated_utc ASC, rowid ASC`
       )
-      .all(...statuses)
+      .all(...statuses, ...(channelRef ? [channelRef] : []))
       .map(mapLedger);
   }
 
@@ -2382,12 +2384,12 @@ export class SessionStore {
   }
 
   /** Pending wakes for one thread, soonest first — the D6 visibility surface. */
-  listWakesByChannel(platform: string, channelRef: string): WakeEvent[] {
+  listWakesByChannel(platform: string, channelRef?: string): WakeEvent[] {
     return this.db
-      .prepare<[string, string], WakeRow>(
-        "SELECT * FROM wake_events WHERE platform = ? AND channel_ref = ? ORDER BY fire_at_utc ASC, rowid ASC"
+      .prepare<string[], WakeRow>(
+        `SELECT * FROM wake_events WHERE platform = ? ${channelRef ? "AND channel_ref = ?" : ""} ORDER BY fire_at_utc ASC, rowid ASC`
       )
-      .all(platform, channelRef)
+      .all(platform, ...(channelRef ? [channelRef] : []))
       .map(mapWake);
   }
 
@@ -2775,12 +2777,12 @@ export class SessionStore {
     this.db.prepare("UPDATE choice_cards SET message_id = ? WHERE id = ?").run(messageId, id);
   }
 
-  listOpenChoiceCards(platform: string, channelRef: string): ChoiceCard[] {
+  listOpenChoiceCards(platform: string, channelRef?: string): ChoiceCard[] {
     return this.db
-      .prepare<[string, string], ChoiceRow>(
-        "SELECT * FROM choice_cards WHERE platform = ? AND channel_ref = ? AND status = 'open' ORDER BY created_utc ASC"
+      .prepare<string[], ChoiceRow>(
+        `SELECT * FROM choice_cards WHERE platform = ? ${channelRef ? "AND channel_ref = ?" : ""} AND status = 'open' ORDER BY created_utc ASC`
       )
-      .all(platform, channelRef)
+      .all(platform, ...(channelRef ? [channelRef] : []))
       .map(mapChoice);
   }
 
@@ -2922,14 +2924,14 @@ export class SessionStore {
     return row ? mapIngestEndpoint(row) : null;
   }
 
-  listOpenIngestEndpoints(platform: string, channelRef: string): IngestEndpoint[] {
+  listOpenIngestEndpoints(platform: string, channelRef?: string): IngestEndpoint[] {
     return this.db
-      .prepare<[string, string], IngestEndpointRow>(
+      .prepare<string[], IngestEndpointRow>(
         `SELECT * FROM ingest_endpoints
-          WHERE platform = ? AND authoring_channel_ref = ? AND status = 'open'
+          WHERE platform = ? ${channelRef ? "AND authoring_channel_ref = ?" : ""} AND status = 'open'
           ORDER BY created_utc ASC`
       )
-      .all(platform, channelRef)
+      .all(platform, ...(channelRef ? [channelRef] : []))
       .map(mapIngestEndpoint);
   }
 

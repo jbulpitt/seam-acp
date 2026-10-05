@@ -15751,10 +15751,26 @@ export class Orchestrator {
   }
 
   /** Unified interrupted/abandoned inventory for `/seam workflows`. */
-  private async collectInterruptedRows(): Promise<InterruptedTurnRow[]> {
+  private async collectInterruptedRows(channelRef?: string): Promise<InterruptedTurnRow[]> {
     const rows: InterruptedTurnRow[] = [];
     const seen = new Set<string>();
-    for (const e of this.store.listDelegationsByStatus(["interrupted", "abandoned"])) {
+    const inScope = (target: string) => !channelRef || target === channelRef;
+    for (const attempt of this.store.turnAttempts.list("completed")) {
+      if (!inScope(attempt.spec.target)) continue;
+      seen.add(attempt.id);
+      const row = interruptedRowForCompletedAttempt(attempt);
+      if (row) rows.push({ ...row, channelRef: attempt.spec.target });
+    }
+    for (const attempt of this.store.turnAttempts.list("suspended")) {
+      if (!inScope(attempt.spec.target)) continue;
+      seen.add(attempt.id);
+      rows.push({ id: attempt.id, source: attempt.source === "dispatch" ? "dispatch" : "live",
+        channelRef: attempt.spec.target, correlationId: attempt.spec.correlationId ?? null,
+        status: "interrupted", startedUtc: attempt.updatedUtc, acpSessionId: attempt.acpSessionId,
+        targetRef: attempt.spec.target, reason: attempt.stalledReason });
+    }
+    for (const e of this.store.listDelegationsByStatus(["interrupted", "abandoned"], channelRef)) {
+      if (seen.has(e.id)) continue;
       seen.add(e.id);
       rows.push({
         id: e.id,
@@ -15765,26 +15781,14 @@ export class Orchestrator {
         startedUtc: e.updatedUtc || e.createdUtc,
         acpSessionId: e.acpSessionId,
         reason: e.terminalReason,
-        // Resume re-enqueues into the ledger's own target, which `channelRef`
-        // conflates with sourceRef — carry it verbatim so the Resume button is
-        // only offered when the resume can actually run (#159).
         targetRef: e.targetRef,
+        // Legacy dispatch resumes have no identity-bound SQL execution.
+        actions: e.status === "interrupted" ? ["abandon"] : [],
       });
-    }
-    for (const attempt of this.store.turnAttempts.list("completed")) {
-      if (seen.has(attempt.id)) continue;
-      // #419: the mapping lives in workflows-view so it can be tested without
-      // building an orchestrator. Its inline predecessor skipped every attempt
-      // with no delivery reason, which is why `b27578fe` was invisible to the
-      // only control that could have cleared it.
-      const row = interruptedRowForCompletedAttempt(attempt);
-      if (!row) continue;
-      seen.add(attempt.id);
-      rows.push(row);
     }
     const live = await this.liveTurnInventory();
     for (const m of live) {
-      if (seen.has(m.id)) continue;
+      if (seen.has(m.id) || !inScope(m.channelRef) || this.store.turnAttempts.get(m.id)) continue;
       rows.push({
         id: m.id,
         source: "live",
@@ -15800,7 +15804,7 @@ export class Orchestrator {
       () => [] as Awaited<ReturnType<typeof listAbandonedLiveTurns>>
     );
     for (const r of abandonedLive) {
-      if (seen.has(r.id)) continue;
+      if (seen.has(r.id) || !inScope(r.channelRef)) continue;
       rows.push({
         id: r.id,
         source: "live",
@@ -15811,9 +15815,37 @@ export class Orchestrator {
         acpSessionId: null,
         reason: r.reason ?? null,
         targetRef: r.channelRef,
+        actions: [],
       });
     }
-    return rows;
+    const stale = new Map(((await this.dispatchWatcher?.listStaleRunning()) ?? []).map(spec => [spec.id, spec]));
+    for (const row of rows) {
+      if (row.actions) continue;
+      const attempt = this.store.turnAttempts.get(row.id);
+      if (!attempt) {
+        row.actions = row.source === "live" ? interruptedRowActions(row) : [];
+        continue;
+      }
+      row.actions = [];
+      if (attempt.state !== "suspended") continue;
+      row.actions = ["abandon"];
+      if (attempt.source === "dispatch") {
+        const spec = stale.get(row.id);
+        if (spec) {
+          row.actions = await this.dispatchContinuationRefusal(spec) ? ["abandon"] : ["resume", "abandon"];
+        }
+      } else {
+        const inbound = attempt.source === "inbound" ? this.store.getInbound(row.id.slice("inbound-".length)) : null;
+        const backed = attempt.source === "inbound"
+          ? inbound && inbound.state !== "completed"
+          : this.store.scheduledOccurrences.get(row.id)?.settled === false;
+        if (backed && !isAwaitingReauth(attempt.stalledReason)
+          && await this.checkResumePreconditions({ platform: PLATFORM, id: row.channelRef }) === "ok") {
+          row.actions = ["resume", "abandon"];
+        }
+      }
+    }
+    return rows.sort((a, b) => b.startedUtc.localeCompare(a.startedUtc) || a.id.localeCompare(b.id));
   }
 
   /** Modern live inventory is derived from SQL. Only genuinely legacy,
@@ -15922,43 +15954,18 @@ export class Orchestrator {
     }
     const ledger = this.store.getDelegation(id);
     if (ledger && (ledger.status === "interrupted" || ledger.status === "abandoned")) {
-      const target = ledger.targetRef;
-      if (!target || !ledger.acpSessionId) {
-        return `Cannot resume \`${id}\` — missing target or ACP session.`;
-      }
-      const resumeKind = ledger.kind === "inbox" ? "handoff" : ledger.kind;
-      await enqueueDispatchSpec(this.config.DATA_DIR, {
-        id: `${id}-resume`,
-        target,
-        prompt: CONTINUE_PROMPT,
-        session: "live",
-        resume: true,
-        kind: resumeKind,
-        ...(ledger.correlationId ? { correlationId: ledger.correlationId } : {}),
-        createdUtc: new Date().toISOString(),
-      }, this.store.turnAttempts);
-      // Point the new spec at the recorded session via a ledger row the
-      // dispatcher will look up — stamp the original's session on a
-      // running-shaped row so loadSession finds it. The new spec id is
-      // different, so copy the pointer onto a fresh dispatched row.
-      try {
-        this.store.recordDelegation({
-          id: `${id}-resume`,
-          kind: ledger.kind,
-          targetRef: target,
-          correlationId: ledger.correlationId,
-          acpSessionId: ledger.acpSessionId,
-          status: "dispatched",
-        });
-      } catch {
-        /* already exists */
-      }
-      return `▶️ Enqueued resume of \`${id}\` into the recorded session.`;
+      return `Cannot resume \`${id}\` — this legacy record has no identity-bound execution to continue.`;
     }
     return `No interrupted/abandoned turn \`${id}\`.`;
   }
 
   async abandonTurnManually(id: string): Promise<string> {
+    const completed = this.store.turnAttempts.get(id);
+    if (completed?.state === "completed") {
+      return this.store.turnAttempts.abandonDelivery(id, "abandoned by operator")
+        ? `🚫 Abandoned retained output for \`${id}\`; the execution record is kept.`
+        : `No retained output to abandon for \`${id}\`.`;
+    }
     const live = await this.liveTurnInventory();
     const marker = live.find((m) => m.id === id);
     if (marker) {
@@ -16415,6 +16422,20 @@ export class Orchestrator {
    *  still-in-flight rows and a correlation-grouped recent tail as an embed; no
    *  writes, no schema, purely observability. */
   private async cmdWorkflows(i: ChatInputCommandInteraction): Promise<void> {
+    try {
+      await this.cmdWorkflowsDeferred(i);
+    } catch (err) {
+      this.logger.warn({ err }, "workflows inventory failed");
+      await replyToInteraction(i, { content: err instanceof Error ? err.message : String(err), embeds: [], components: [] });
+    }
+  }
+
+  private async cmdWorkflowsDeferred(i: ChatInputCommandInteraction): Promise<void> {
+    const allThreads = i.options.getString("scope") === "all";
+    if (allThreads && !this.config.SEAM_CONFIG_ADMIN_USER_IDS?.has(i.user.id)) {
+      await replyToInteraction(i, { content: "The all-threads workflows view is admin-only." });
+      return;
+    }
     const limit = i.options.getInteger("limit") ?? 20;
 
     // Wake cancel (#59, D6): fold into /seam workflows per #26 rather than a new
@@ -16436,7 +16457,6 @@ export class Orchestrator {
         content: ok
           ? `⏰ Cancelled wake \`${cancelWakeId}\`.`
           : `No pending wake \`${cancelWakeId}\` in this thread (already fired, cancelled, or not this thread's).`,
-        flags: MessageFlags.Ephemeral,
       });
       return;
     }
@@ -16458,7 +16478,6 @@ export class Orchestrator {
       if (!record) {
         await replyToInteraction(i, {
           content: "Use `/seam workflows` inside a thread to hang up a live-help call.",
-          flags: MessageFlags.Ephemeral,
         });
         return;
       }
@@ -16467,7 +16486,6 @@ export class Orchestrator {
         content: result.ok
           ? `🎙️ Hanging up live help \`${cancelLiveId}\`.`
           : result.error,
-        flags: MessageFlags.Ephemeral,
       });
       return;
     }
@@ -16487,7 +16505,6 @@ export class Orchestrator {
       if (!record) {
         await replyToInteraction(i, {
           content: "Use `/seam workflows` inside a thread to revoke an ingest endpoint.",
-          flags: MessageFlags.Ephemeral,
         });
         return;
       }
@@ -16496,7 +16513,6 @@ export class Orchestrator {
         content: result.ok
           ? `🌐 Revoked ingest endpoint \`${cancelIngestId}\`.`
           : result.error,
-        flags: MessageFlags.Ephemeral,
       });
       return;
     }
@@ -16516,7 +16532,6 @@ export class Orchestrator {
       if (!record) {
         await replyToInteraction(i, {
           content: "Use `/seam workflows` inside a thread to cancel a choice card.",
-          flags: MessageFlags.Ephemeral,
         });
         return;
       }
@@ -16525,7 +16540,6 @@ export class Orchestrator {
         content: result.ok
           ? `🗳️ Cancelled choice card \`${cancelChoiceId}\`.`
           : result.error,
-        flags: MessageFlags.Ephemeral,
       });
       return;
     }
@@ -16547,7 +16561,6 @@ export class Orchestrator {
         content: ok
           ? `🔕 Cancelled watch \`${cancelWatchId}\`.`
           : `No pending watch \`${cancelWatchId}\` in this thread (already fired, cancelled, or not this thread's).`,
-        flags: MessageFlags.Ephemeral,
       });
       return;
     }
@@ -16558,7 +16571,6 @@ export class Orchestrator {
     await replyToInteraction(i, {
       embeds: initial.embeds,
       ...(initial.components.length ? { components: initial.components } : {}),
-      flags: MessageFlags.Ephemeral,
     });
     if (initial.components.length === 0) return;
     const msg = await i.fetchReply();
@@ -16616,15 +16628,17 @@ export class Orchestrator {
     page: number;
   }> {
     const now = new Date();
-    const active = this.store.listActiveDelegations();
+    const channelRef = i.options.getString("scope") === "all" ? undefined : i.channelId;
+    const active = this.store.listActiveDelegations(channelRef)
+      .sort((a, b) => b.createdUtc.localeCompare(a.createdUtc));
     const view = formatWorkflowsView(
       active,
-      this.store.listRecentDelegations(limit),
+      this.store.listRecentDelegations(limit, channelRef),
       now
     );
 
     const embed = new EmbedBuilder()
-      .setTitle("🔀 Workflows")
+      .setTitle(`🔀 Workflows — ${channelRef ? "this thread" : "all threads"}`)
       .setColor(WORKFLOWS_COLOR);
 
     if (view.empty) {
@@ -16653,7 +16667,7 @@ export class Orchestrator {
         ...new Map(
           [
             ...active,
-            ...this.store.listRecentDelegations(Math.max(limit, 200)),
+            ...this.store.listRecentDelegations(Math.max(limit, 200), channelRef),
           ].map((e) => [e.id, e])
         ).values(),
       ];
@@ -16671,12 +16685,10 @@ export class Orchestrator {
       embed.setFooter({ text: `showing up to ${limit} recent rows` });
     }
 
-    // Pending wakes for THIS thread (#59, D6): the agent's own deferred
-    // follow-ups, so a user can see and cancel a timer that would otherwise burn
-    // tokens invisibly. Cancel with `/seam workflows cancel-wake:<id>`.
     const record = this.recordFromInteraction(i);
-    if (record) {
-      const wakes = this.listWakes(record.platform, record.channelRef);
+    if (record || !channelRef) {
+      const newestFirst = <T extends { createdUtc: string }>(rows: T[]) => rows.sort((a, b) => b.createdUtc.localeCompare(a.createdUtc));
+      const wakes = newestFirst(this.store.listWakesByChannel(PLATFORM, channelRef));
       if (wakes.length > 0) {
         const lines = wakes
           .slice(0, 10)
@@ -16695,7 +16707,7 @@ export class Orchestrator {
 
       // Pending watches for THIS thread (#60, D7): agent-defined condition
       // triggers, listed + cancellable via `/seam workflows cancel-watch:<id>`.
-      const watches = this.listWatches(record.platform, record.channelRef);
+      const watches = newestFirst(channelRef ? this.listWatches(PLATFORM, channelRef) : this.store.listAllWatches());
       if (watches.length > 0) {
         const lines = watches
           .slice(0, 10)
@@ -16712,8 +16724,8 @@ export class Orchestrator {
         if (view.empty) embed.setDescription(null);
       }
 
-      const liveCalls = this.liveHelpManager?.listForThread(record.platform, record.channelRef) ?? [];
-      const liveActive = liveCalls.filter((s) => s.status === "starting" || s.status === "live");
+      const liveCalls = channelRef ? this.liveHelpManager?.listForThread(PLATFORM, channelRef) : this.liveHelpManager?.listActive();
+      const liveActive = newestFirst((liveCalls ?? []).filter((s) => s.status === "starting" || s.status === "live"));
       if (liveActive.length > 0) {
         const lines = liveActive.slice(0, 10).map((s) => {
           const ch = s.channelName ? `**${s.channelName}**` : s.voiceChannelId;
@@ -16727,7 +16739,7 @@ export class Orchestrator {
         if (view.empty) embed.setDescription(null);
       }
 
-      const endpoints = this.store.listOpenIngestEndpoints(record.platform, record.channelRef);
+      const endpoints = newestFirst(this.store.listOpenIngestEndpoints(PLATFORM, channelRef));
       if (endpoints.length > 0) {
         const lines = endpoints.slice(0, 10).map((e) => {
           const uniq = e.uniqueStudent ? " · unique-student" : "";
@@ -16745,7 +16757,7 @@ export class Orchestrator {
         if (view.empty) embed.setDescription(null);
       }
 
-      const choices = this.store.listOpenChoiceCards(record.platform, record.channelRef);
+      const choices = newestFirst(this.store.listOpenChoiceCards(PLATFORM, channelRef));
       if (choices.length > 0) {
         const lines = choices.slice(0, 10).map((c) => {
           const last = c.lastClickerName ? ` · last ${c.lastClickerName}` : "";
@@ -16760,7 +16772,7 @@ export class Orchestrator {
       }
     }
 
-    const interrupted = await this.collectInterruptedRows();
+    const interrupted = await this.collectInterruptedRows(channelRef);
     const components: ActionRowBuilder<ButtonBuilder>[] = [];
     const requiredFieldNames = new Set<string>();
     let page = 0;

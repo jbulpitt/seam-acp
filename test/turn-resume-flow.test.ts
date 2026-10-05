@@ -860,6 +860,59 @@ describe("live-turn re-fire + flag + preconditions", () => {
 });
 
 describe("workflows inventory", () => {
+  it("scopes before limiting recent rows and sorts parked rows newest first", async () => {
+    for (const [id, target, time] of [
+      ["old", "thread-worker", "2026-01-01T00:00:00.000Z"],
+      ["new", "thread-worker", "2026-01-02T00:00:00.000Z"],
+      ["other", "thread-other", "2026-01-03T00:00:00.000Z"],
+    ]) {
+      store.recordDelegation({ id, kind: "handoff", targetRef: target, status: "interrupted",
+        createdUtc: time, updatedUtc: time, acpSessionId: "legacy-acp" });
+    }
+    expect(store.listRecentDelegations(1, "thread-worker").map(row => row.id)).toEqual(["new"]);
+    const { orch } = makeOrch();
+    const rows = await (orch as any).collectInterruptedRows("thread-worker");
+    expect(rows.map((row: any) => row.id)).toEqual(["new", "old"]);
+    expect(rows.map((row: any) => row.actions)).toEqual([["abandon"], ["abandon"]]);
+    expect(await orch.resumeTurnManually("new")).toMatch(/no identity-bound execution/);
+    expect(store.getDelegation("new-resume")).toBeNull();
+    await orch.abandonTurnManually("new");
+    expect((await (orch as any).collectInterruptedRows("thread-worker"))[0].actions).toEqual([]);
+  });
+
+  it("does not advertise Resume or Abandon for a legacy completion already abandoned", async () => {
+    const { orch } = makeOrch();
+    const spec = handoffSpec({ id: "legacy-completion" });
+    store.turnAttempts.enqueue(spec);
+    store.turnAttempts.completePending(spec.id, { id: spec.id, target: spec.target, status: "completed", text: "old answer" } as any);
+    store.turnAttempts.abandonDelivery(spec.id, "legacy completion has no recorded nonce or route; Discord delivery cannot be proven or replayed safely");
+    const rows = await (orch as any).collectInterruptedRows("thread-worker");
+    expect(rows[0].actions).toEqual([]);
+    expect(rows[0].reason).toContain("legacy completion");
+  });
+
+  it("offers Abandon for outstanding completed output and consumes that action", async () => {
+    const { orch } = makeOrch();
+    const spec = handoffSpec({ id: "retained-output" });
+    store.turnAttempts.enqueue(spec);
+    store.turnAttempts.completePending(spec.id, { id: spec.id, target: spec.target, status: "completed", text: "answer" } as any);
+    expect((await (orch as any).collectInterruptedRows("thread-worker"))[0].actions).toEqual(["abandon"]);
+    expect(await orch.abandonTurnManually(spec.id)).toMatch(/execution record is kept/);
+    expect(store.turnAttempts.get(spec.id)?.deliveryAbandonedReason).toBe("abandoned by operator");
+    expect((await (orch as any).collectInterruptedRows("thread-worker"))[0].actions).toEqual([]);
+  });
+
+  it("lists a suspended modern dispatch from its attempt and applies the same resume admission", async () => {
+    await seedInterrupted();
+    const { orch } = makeOrch();
+    (orch as any).dispatchWatcher = { listStaleRunning: async () => [handoffSpec({ resume: true })] };
+    const rows = await (orch as any).collectInterruptedRows("thread-worker");
+    expect(rows.find((row: any) => row.id === "disp-1")?.actions).toEqual(["resume", "abandon"]);
+    const blocked = makeOrch({ getThreadLiveState: async () => ({ locked: true, archived: false }) }).orch;
+    (blocked as any).dispatchWatcher = { listStaleRunning: async () => [handoffSpec({ resume: true })] };
+    expect((await (blocked as any).collectInterruptedRows("thread-worker")).find((row: any) => row.id === "disp-1")?.actions).toEqual(["abandon"]);
+  });
+
   it("collects interrupted ledger rows and live markers", async () => {
     store.recordDelegation({
       id: "disp-int",

@@ -110,7 +110,7 @@ describe("formatWorkflowsView", () => {
     expect(view.active.lines[0]).toContain("2m");
   });
 
-  it("groups a handoff and its report-back into adjacent lines, oldest first", () => {
+  it("groups a handoff and its report-back into adjacent lines, newest first", () => {
     const recent = [
       // arrives newest-first, as listRecentDelegations returns
       entry({
@@ -129,11 +129,10 @@ describe("formatWorkflowsView", () => {
     ];
     const view = formatWorkflowsView([], recent, NOW);
     expect(view.recent.count).toBe(2);
-    // handoff (older) first, report_back as a continuation line
-    expect(view.recent.lines[0]).toContain("`out`");
-    expect(view.recent.lines[0]).toContain("handoff");
+    expect(view.recent.lines[0]).toContain("`back`");
+    expect(view.recent.lines[0]).toContain("report_back");
     expect(view.recent.lines[1]!.startsWith("↳ ")).toBe(true);
-    expect(view.recent.lines[1]).toContain("report_back");
+    expect(view.recent.lines[1]).toContain("handoff");
   });
 
   it("labels scheduler-origin rows and unresolved targets", () => {
@@ -223,12 +222,14 @@ const irow = (over: Partial<InterruptedTurnRow> = {}): InterruptedTurnRow => ({
 });
 
 describe("interruptedRowActions", () => {
-  it("an interrupted row can be resumed or abandoned", () => {
-    expect(interruptedRowActions(irow())).toEqual(["resume", "abandon"]);
+  it("uses the actions resolved from the current backing attempt", () => {
+    expect(interruptedRowActions(irow({ actions: ["resume", "abandon"] }))).toEqual(["resume", "abandon"]);
+    expect(interruptedRowActions(irow({ actions: [] }))).toEqual([]);
+    expect(interruptedRowActions(irow())).toEqual(["abandon"]);
   });
 
-  it("an already-abandoned dispatch keeps only Resume — Abandon is consumed", () => {
-    expect(interruptedRowActions(irow({ status: "abandoned" }))).toEqual(["resume"]);
+  it("an already-abandoned legacy dispatch is inert even with a target and session", () => {
+    expect(interruptedRowActions(irow({ status: "abandoned" }))).toEqual([]);
   });
 
   it("an abandoned row with no recorded session has no live action at all", () => {
@@ -236,9 +237,6 @@ describe("interruptedRowActions", () => {
     expect(isActionableInterruptedRow(irow({ status: "abandoned", acpSessionId: null }))).toBe(false);
   });
 
-  // resumeTurnManually's ledger path needs BOTH the target it re-enqueues into
-  // and the session to load; offering Resume on either alone renders a button
-  // that can only answer "missing target or ACP session".
   it("an abandoned dispatch missing targetRef offers nothing", () => {
     const row = irow({ status: "abandoned", targetRef: null });
     expect(interruptedRowActions(row)).toEqual([]);

@@ -29,7 +29,7 @@ export function createPresetPlugin(ui: PresetUi): Plugin {
       slash: PRESET_COMMAND_GROUP.options!.map(leaf => {
         const name = leaf.name as keyof typeof methods;
         return {
-          command: "seam", group: { name: PRESET_COMMAND_GROUP.name, description: PRESET_COMMAND_GROUP.description }, leaf,
+          command: "seam", group: { name: PRESET_COMMAND_GROUP.name, description: PRESET_COMMAND_GROUP.description }, acknowledgement: "ephemeral", leaf,
           access: { kind: PRESET_ACCESS[name] }, authorization: "user", help: help[name],
           ...(["thread", "apply", "delete", "show", "edit"].includes(name) ? { autocomplete: [{
             option: name === "thread" ? "preset" : "name", policy: "canonical" as const,
@@ -39,8 +39,12 @@ export function createPresetPlugin(ui: PresetUi): Plugin {
         };
       }),
       components: [
-        { namespace: "preset:", types: ["button", "select", "modal"], lifetime: "persistent", access: "read-only", authorization: "user", handle: async event => { await ui.cards.handle(ui.ports.component(event)); } },
-        { namespace: "pr:", types: ["button"], lifetime: "persistent", access: "read-only", authorization: "user", handle: async event => { await ui.cards.handle(ui.ports.component(event)); } },
+        { namespace: "preset:", types: ["button", "select", "modal"], lifetime: "persistent", access: "read-only", authorization: "user",
+          acknowledgement: evt => evt.kind === "button" && ["details", "naming", "tools", "instr"].includes(evt.customId.split(":")[1]!) ? "modal" : "update",
+          handle: async event => { await ui.cards.handle(ui.ports.component(event)); } },
+        { namespace: "pr:", types: ["button"], lifetime: "persistent", access: "read-only", authorization: "user",
+          acknowledgement: evt => ["edit", "apply"].includes(evt.customId.split(":")[1]!) ? "ephemeral" : "update",
+          handle: async event => { await ui.cards.handle(ui.ports.component(event)); } },
       ],
       jobs: [{ name: "card-expiry", phase: "after-admission", intervalMs: 600_000,
         start: () => ui.cards.start(), stop: () => ui.cards.stop(), drain: () => ui.cards.drain() }],

@@ -14,6 +14,7 @@ export function scheduleUiFixture(self: any) {
   }, () => { throw new Error("fixture invokes the UI directly"); }, () => { throw new Error("fixture invokes components directly"); });
   const ui = new ScheduleUi(ports);
   const interaction = (native: any) => scheduleUiInteraction(native, {
+    onError: error => logger.warn({ err: error }, "schedule collector failed"),
     channel: i => self.channelRefFromInteraction(i),
     mutationRefusal: i => self.slashAccessRefusal?.(i, { kind: "mutating" }),
     lifecycle: (i, collector, expired) => {

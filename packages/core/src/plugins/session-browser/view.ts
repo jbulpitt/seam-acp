@@ -226,7 +226,6 @@ export function createBrowser(ports: SessionBrowserFacade, actions: SessionActio
     };
   };
 
-
   const activeSessionId = () => actions.activeSessionId();
   const closedView = () => {
     const activeId = activeSessionId();
@@ -266,7 +265,6 @@ export function createBrowser(ports: SessionBrowserFacade, actions: SessionActio
         .setLabel("⬅ Back to Manage")
         .setStyle(ButtonStyle.Secondary)
     );
-
 
   const runBrowserCompaction = (opts: {
     session: SessionSummary;
@@ -367,24 +365,20 @@ export function createBrowser(ports: SessionBrowserFacade, actions: SessionActio
   const handle = async (btnInteraction: BrowserClick) => {
     const customId = btnInteraction.customId;
     if (customId === "sessions:prev") {
-      await btnInteraction.deferUpdate();
       if (state.currentIndex > 0) {
         state.currentIndex--;
         await btnInteraction.editReply(makeSessionMessageOptions(state.currentIndex, state.sessions, activeSessionId()));
       }
     } else if (customId === "sessions:next") {
-      await btnInteraction.deferUpdate();
       if (state.currentIndex < state.sessions.length - 1) {
         state.currentIndex++;
         await btnInteraction.editReply(makeSessionMessageOptions(state.currentIndex, state.sessions, activeSessionId()));
       }
     } else if (customId === "sessions:close") {
-      await btnInteraction.deferUpdate();
       await btnInteraction.deleteReply().catch(() => {});
       await i.deleteReply().catch(() => {});
       await lifecycle.dispose("user_closed");
     } else if (customId === "sessions:attach") {
-      await btnInteraction.deferUpdate();
       const session = state.sessions[state.currentIndex];
       if (session) {
         await actions.attach(session.sessionId);
@@ -399,7 +393,6 @@ export function createBrowser(ports: SessionBrowserFacade, actions: SessionActio
         });
       }
     } else if (customId === "sessions:clone") {
-      await btnInteraction.deferUpdate();
       const session = state.sessions[state.currentIndex];
       if (session) {
         try {
@@ -426,7 +419,6 @@ export function createBrowser(ports: SessionBrowserFacade, actions: SessionActio
         }
       }
     } else if (customId === "sessions:clone_attach") {
-      await btnInteraction.deferUpdate();
       const session = state.sessions[state.currentIndex];
       if (session) {
         try {
@@ -455,7 +447,6 @@ export function createBrowser(ports: SessionBrowserFacade, actions: SessionActio
         }
       }
     } else if (customId === "sessions:delete") {
-      await btnInteraction.deferUpdate();
       const session = state.sessions[state.currentIndex];
       if (session) {
         const confirmEmbed = new EmbedBuilder()
@@ -480,10 +471,8 @@ export function createBrowser(ports: SessionBrowserFacade, actions: SessionActio
         });
       }
     } else if (customId === "sessions:delete_cancel") {
-      await btnInteraction.deferUpdate();
       await btnInteraction.editReply(makeSessionMessageOptions(state.currentIndex, state.sessions, activeSessionId()));
     } else if (customId === "sessions:delete_confirm") {
-      await btnInteraction.deferUpdate();
       const session = state.sessions[state.currentIndex];
       if (session) {
         try {
@@ -518,7 +507,6 @@ export function createBrowser(ports: SessionBrowserFacade, actions: SessionActio
         }
       }
     } else if (customId === "sessions:repair") {
-      await btnInteraction.deferUpdate();
       const session = state.sessions[state.currentIndex];
       if (session) {
         const confirmEmbed = new EmbedBuilder()
@@ -543,10 +531,8 @@ export function createBrowser(ports: SessionBrowserFacade, actions: SessionActio
         });
       }
     } else if (customId === "sessions:repair_cancel") {
-      await btnInteraction.deferUpdate();
       await btnInteraction.editReply(makeSessionMessageOptions(state.currentIndex, state.sessions, activeSessionId()));
     } else if (customId === "sessions:repair_confirm") {
-      await btnInteraction.deferUpdate();
       const session = state.sessions[state.currentIndex];
       if (session && actions.canRepair()) {
         try {
@@ -570,7 +556,6 @@ export function createBrowser(ports: SessionBrowserFacade, actions: SessionActio
       }
     } else if (customId === "sessions:rebuild") {
       const observedAtStart = activeSessionId();
-      await btnInteraction.deferUpdate();
       await lifecycle.refresh({
         embeds: [
           new EmbedBuilder()
@@ -638,7 +623,6 @@ export function createBrowser(ports: SessionBrowserFacade, actions: SessionActio
         }
       });
     } else if (customId === "sessions:compact_thread") {
-      await btnInteraction.deferUpdate();
       await lifecycle.refresh({
         embeds: [
           new EmbedBuilder()
@@ -691,7 +675,6 @@ export function createBrowser(ports: SessionBrowserFacade, actions: SessionActio
         }
       });
     } else if (customId === "sessions:summary") {
-      await btnInteraction.deferUpdate();
       const session = state.sessions[state.currentIndex];
       if (session) {
         await btnInteraction.editReply({
@@ -751,7 +734,6 @@ export function createBrowser(ports: SessionBrowserFacade, actions: SessionActio
       customId === "sessions:premium_discord"
     ) {
       const observedAtStart = activeSessionId();
-      await btnInteraction.deferUpdate();
       const session = state.sessions[state.currentIndex];
       if (session) {
         if (customId === "sessions:compact") {
@@ -869,7 +851,6 @@ export function createBrowser(ports: SessionBrowserFacade, actions: SessionActio
         return;
       }
 
-      await submission.deferUpdate();
       await lifecycle.refresh({
         embeds: [
           new EmbedBuilder()
@@ -913,7 +894,6 @@ export function createBrowser(ports: SessionBrowserFacade, actions: SessionActio
         });
       });
     } else if (customId === "sessions:migrate") {
-      await btnInteraction.deferUpdate();
       const session = state.sessions[state.currentIndex];
       if (session) {
         const targetProfiles = actions.capabilities().migrationTargets;
@@ -953,10 +933,8 @@ export function createBrowser(ports: SessionBrowserFacade, actions: SessionActio
         });
       }
     } else if (customId === "sessions:migrate_cancel") {
-      await btnInteraction.deferUpdate();
       await btnInteraction.editReply(makeSessionMessageOptions(state.currentIndex, state.sessions, activeSessionId()));
     } else if (btnInteraction.isStringSelectMenu() && customId === "sessions:migrate_target") {
-      await btnInteraction.deferUpdate();
       const targetAgentId = btnInteraction.values[0];
       const session = state.sessions[state.currentIndex];
       if (session && targetAgentId) {
@@ -1014,7 +992,6 @@ export function createBrowser(ports: SessionBrowserFacade, actions: SessionActio
         });
       }
     } else if (customId === "sessions:summary_back") {
-      await btnInteraction.deferUpdate();
       await btnInteraction.editReply(makeSessionMessageOptions(state.currentIndex, state.sessions, activeSessionId()));
     }
   };

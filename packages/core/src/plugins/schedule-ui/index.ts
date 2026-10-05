@@ -11,6 +11,7 @@ import type { ScheduledPrompt } from "../../core/scheduled-prompts/types.js";
 import type { Plugin } from "../types.js";
 import type { SlashContribution } from "../slash-registry.js";
 import type { ScheduleInteraction, ScheduleClick, ScheduleUiPorts } from "./ports.js";
+import type { ComponentAcknowledgementContext, ComponentResponseMode } from "../../platforms/interaction-response.js";
 
 const PLATFORM = "discord";
 const SCHEDULED_COLOR = 0x3498db;
@@ -89,7 +90,6 @@ export class ScheduleUi {
     const rebuild = (requested = page) => this.buildScheduleListMessage(channel, requested);
     const wantedPage = requestedSchedulePage(c.customId);
     if (wantedPage !== null) {
-      await c.deferUpdate();
       await c.editReply(rebuild(wantedPage));
       return;
     }
@@ -102,13 +102,11 @@ export class ScheduleUi {
     const id = parsed?.arg;
     const row = id ? this.ports.repository.get(id) : undefined;
     if (!row || !id || row.channelRef !== channel.id) {
-      await c.deferUpdate();
       await c.followUp({ content: "That schedule no longer exists.", flags: MessageFlags.Ephemeral });
       await c.editReply(rebuild());
       return;
     }
     if (parsed?.action === "run") {
-      await c.deferUpdate();
       await this.ports.admin.runNow(id);
       const fresh = this.ports.repository.get(id);
       await c.followUp({ content: scheduleRunOutcome({
@@ -123,11 +121,11 @@ export class ScheduleUi {
           onError: err => this.logger.warn({ err }, "schedule list render failed") });
         this.editTransitions.set(c.messageId, lifecycle);
       }
-      // Keep the existing one-editor transition while its acknowledgement waits.
-      const claimed = await lifecycle.transitionWithAck("edit", {
+      // Only one click opens the replacement editor.
+      const claimed = await lifecycle.transition("edit", {
         content: `✏️ Editing **${row.name}** — this listing was replaced by the editor below.`, embeds: [], components: [],
-      }, () => c.deferUpdate());
-      if (!claimed) { await c.deferUpdate(); return; }
+      });
+      if (!claimed) return;
       const editor = c.openFollowUp();
       await this.cmdScheduleAdd(editor, row);
     } else if (parsed?.action === "toggle") {
@@ -135,12 +133,10 @@ export class ScheduleUi {
       this.ports.repository.save(updated);
       if (updated.enabled) this.ports.admin.arm(updated);
       else this.ports.admin.disarm(id);
-      await c.deferUpdate();
       await c.editReply(rebuild());
     } else if (parsed?.action === "del") {
       this.ports.admin.disarm(id);
       this.ports.repository.remove(id);
-      await c.deferUpdate();
       await c.editReply(rebuild());
     }
   }
@@ -260,7 +256,7 @@ export class ScheduleUi {
   async cmdScheduleAdd(i: ScheduleInteraction, existing?: ScheduledPrompt): Promise<void> {
     const channel = i.channelRef;
     if (!channel) {
-      await i.respondInitial( { content: "Use `/seamadmin schedule add` inside a thread." });
+      await i.reply( { content: "Use `/seamadmin schedule add` inside a thread." });
       return;
     }
     const { agent: inheritedAgent, registered: profile, model: sessionModel, cwd: inheritedCwd, models } = this.ports.builderDefaults(channel);
@@ -350,9 +346,10 @@ export class ScheduleUi {
       return { embeds: [embed], components: rows };
     };
 
-    await i.respondInitial( render());
+    await i.reply( render());
     const msg = await i.fetchReply();
     const collector = msg.createMessageComponentCollector({
+      acknowledgement: scheduleBuilderAcknowledgement,
       filter: (c) => c.user.id === i.user.id,
       time: 600_000,
     });
@@ -361,7 +358,6 @@ export class ScheduleUi {
         "⏰ Schedule builder timed out — nothing was saved. Run the schedule builder again to start over."
       )
     );
-
     collector.on("collect", async (c) => {
       try {
         if (c.isStringSelectMenu() && c.customId === "sched:tz") {
@@ -380,7 +376,7 @@ export class ScheduleUi {
                   .setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder("0 9 * * 1-5")
               ));
             await c.showModal(modal);
-            const sub = await c.awaitModalSubmit({ filter: (m) => m.customId === `sched:cronmodal:${msg.id}` && m.user.id === i.user.id, time: 120_000 }).catch(() => null);
+            const sub = await c.awaitModalSubmit({ acknowledgement: "update", filter: (m) => m.customId === `sched:cronmodal:${msg.id}` && m.user.id === i.user.id, time: 120_000 });
             if (sub) {
               const cron = sub.fields.getTextInputValue("cron").trim();
               const v2 = validateCron(cron, state.timezone);
@@ -388,8 +384,7 @@ export class ScheduleUi {
                 await sub.reply({ content: `❌ Invalid cron: ${v2.error}`, flags: MessageFlags.Ephemeral });
               } else {
                 state.cron = cron;
-                await sub.deferUpdate();
-                await i.editReply(render());
+                await i.reply(render());
               }
             }
           } else {
@@ -429,7 +424,7 @@ export class ScheduleUi {
           }
           const modal = new ModalBuilder().setCustomId(`sched:promptmodal:${msg.id}`).setTitle("Prompt & details").addComponents(...modalRows);
           await c.showModal(modal);
-          const sub = await c.awaitModalSubmit({ filter: (m) => m.customId === `sched:promptmodal:${msg.id}` && m.user.id === i.user.id, time: 600_000 }).catch(() => null);
+          const sub = await c.awaitModalSubmit({ acknowledgement: "update", filter: (m) => m.customId === `sched:promptmodal:${msg.id}` && m.user.id === i.user.id, time: 600_000 });
           if (sub) {
             state.name = sub.fields.getTextInputValue("name").trim();
             state.promptText = sub.fields.getTextInputValue("prompt").trim();
@@ -446,15 +441,12 @@ export class ScheduleUi {
                 else errors.push("output id must be a numeric channel/thread id");
               } else state.target = null;
             }
-            await sub.deferUpdate();
-            await i.editReply(render());
+            await i.reply(render());
             if (errors.length) await sub.followUp({ content: `⚠️ ${errors.join("; ")}`, flags: MessageFlags.Ephemeral });
           }
         } else if (c.isButton() && c.customId === "sched:cancel") {
-          await c.deferUpdate();
           await lifecycle.terminal("cancel", { content: "Cancelled.", embeds: [], components: [] });
         } else if (c.isButton() && c.customId === "sched:create") {
-          await c.deferUpdate();
           if (!state.name || !state.promptText || !state.cron) {
             const missing: string[] = [];
             if (!state.name) missing.push("a name");
@@ -525,10 +517,17 @@ export class ScheduleUi {
         }
       } catch (err) {
         this.logger.error({ err }, "schedule builder interaction failed");
+        await c.reply({ content: `Could not update the schedule: ${err instanceof Error ? err.message : String(err)}`, flags: MessageFlags.Ephemeral });
       }
     });
+
   }
 
+}
+
+export function scheduleBuilderAcknowledgement(evt: ComponentAcknowledgementContext): ComponentResponseMode {
+  return evt.kind === "button" && evt.customId === "sched:prompt" ||
+    evt.kind === "select" && evt.customId === "sched:cadence" && evt.values?.[0] === "__custom__" ? "modal" : "update";
 }
 
 export function createScheduleUiPlugin(ports: ScheduleUiPorts): Plugin {
@@ -536,7 +535,7 @@ export function createScheduleUiPlugin(ports: ScheduleUiPorts): Plugin {
   const group = { name: "schedule", description: "Recurring scheduled prompts for this thread" };
   const slash: SlashContribution[] = SCHEDULE_LEAVES.map(({ name, description, handle, id }) => ({
     command: "seamadmin", group,
-    leaf: { type: Option.Subcommand, name, description, ...(id ? { options: [
+    acknowledgement: "ephemeral", leaf: { type: Option.Subcommand, name, description, ...(id ? { options: [
       { type: Option.String, name: "id", description: name === "remove" ? "Schedule id (see /seamadmin schedule list)" : "Schedule id", required: true, autocomplete: true },
     ] } : {}) },
     access: { kind: name === "list" ? "read-only" : "mutating" }, authorization: "user",
@@ -550,9 +549,10 @@ export function createScheduleUiPlugin(ports: ScheduleUiPorts): Plugin {
     dispose: () => { ui.editTransitions.clear(); },
     contributions: { slash, components: [
       { namespace: "sl:", types: ["button"], lifetime: "persistent", access: "read-only", authorization: "user",
+        acknowledgement: "update",
         handle: async invocation => ui.handleListClick(ports.component(invocation)) },
       { namespace: "sched:", types: ["button", "select", "modal"], lifetime: "collector",
-        access: "read-only", authorization: "user", handle: async () => {} },
+        access: "read-only", authorization: "user", acknowledgement: scheduleBuilderAcknowledgement, handle: async () => {} },
     ] },
   };
 }

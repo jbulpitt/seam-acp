@@ -13,6 +13,7 @@ import type { ChannelPreset, ThreadPreset } from "../packages/core/src/config.js
 import type { SessionConfigState, SessionRecord } from "../packages/core/src/core/types.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 import { localBridgeHub, localBridgeWiring } from "./local-bridge-fixture.js";
+import { acknowledgedHandler } from "./acknowledged-handler-fixture.js";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
 const ADMIN = "1487094572696867019";
@@ -71,6 +72,7 @@ function slashI(over: {
     },
     deferred: false,
     replied: false,
+    ephemeral: true,
     reply: vi.fn(async (payload: { content?: string; flags?: number }) => {
       i.replied = true;
       replies.push(payload);
@@ -209,7 +211,7 @@ describe("/seam config agent — #178 session/overlay split-brain", () => {
     const { orch, router, store, threadPresets } = makeOrch();
     seedSession(store);
     const { i, replies } = slashI({ strings: { id: "codex@local" } });
-    await (orch as any).cmdAgent(i);
+    await acknowledgedHandler(i, () => (orch as any).cmdAgent(i));
 
     expect(replies[0]?.flags).toBe(MessageFlags.Ephemeral);
     expect(replies[0]?.content).toMatch(/Agent switched to `codex@local`/);
@@ -248,7 +250,7 @@ describe("/seam config agent — #178 session/overlay split-brain", () => {
       return invalidate(...args);
     }) as typeof router.invalidate;
 
-    await (orch as any).cmdAgent(i);
+    await acknowledgedHandler(i, () => (orch as any).cmdAgent(i));
 
     expect(i.deferReply).toHaveBeenCalledOnce();
     expect(i.deferReply).toHaveBeenCalledWith({ flags: MessageFlags.Ephemeral });
@@ -267,9 +269,9 @@ describe("/seam config agent — #178 session/overlay split-brain", () => {
       },
     });
     seedSession(store);
-    await (orch as any).cmdAgent(slashI({ strings: { id: "codex@local" } }).i);
+    await acknowledgedHandler(slashI({ strings: { id: "codex@local" } }).i, () => (orch as any).cmdAgent(slashI({ strings: { id: "codex@local" } }).i));
     const { i, edits } = slashI({ strings: {} });
-    await (orch as any).cmdModel(i);
+    await acknowledgedHandler(i, () => (orch as any).cmdModel(i));
     expect(edits.some((e) => e.includes("`gpt-5.6-sol`"))).toBe(true);
     expect(edits.some((e) => e.includes("claude-opus-5"))).toBe(false);
     expect(pickerCurrent.some((v) => v.includes("gpt-5.6-sol"))).toBe(true);
@@ -299,7 +301,7 @@ describe("/seam config agent — #178 session/overlay split-brain", () => {
     });
     seedSession(store);
     const { i, replies } = slashI({ strings: {} });
-    await (orch as any).cmdAgent(i);
+    await acknowledgedHandler(i, () => (orch as any).cmdAgent(i));
     expect(replies[0]?.content).toMatch(/Posting picker/);
     expect(order).toEqual(["picked", "commit-done", "render-success"]);
     expect(sent.some((m) => m.includes("Agent switched to `codex@local`") && m.includes("gpt-5.6-sol"))).toBe(
@@ -323,7 +325,7 @@ describe("/seam config agent — #178 session/overlay split-brain", () => {
     mutation.applyThreadOverlay = () => ({ ok: false, error: "injected overlay failure" });
 
     const { i, replies } = slashI({ strings: { id: "codex@local" } });
-    await (orch as any).cmdAgent(i);
+    await acknowledgedHandler(i, () => (orch as any).cmdAgent(i));
 
     expect(replies[0]?.content).toMatch(/Could not switch agent: injected overlay failure/);
     expect(replies[0]?.content).not.toMatch(/Agent switched/);
@@ -346,7 +348,7 @@ describe("/seam config agent — #178 session/overlay split-brain", () => {
       },
     });
     seedSession(store);
-    await (orch as any).cmdAgent(slashI({ strings: { id: "codex@local" } }).i);
+    await acknowledgedHandler(slashI({ strings: { id: "codex@local" } }).i, () => (orch as any).cmdAgent(slashI({ strings: { id: "codex@local" } }).i));
 
     const rec = store.get(`discord:${THREAD}`)!;
     expect(rec.agentId).toBe("codex");
@@ -367,7 +369,7 @@ describe("/seam config agent — #178 session/overlay split-brain", () => {
     const { orch, router, store, threadPresets } = makeOrch();
     seedSession(store);
     const { i, replies } = slashI({ strings: { id: "claude@mac" } });
-    await (orch as any).cmdAgent(i);
+    await acknowledgedHandler(i, () => (orch as any).cmdAgent(i));
 
     expect(replies[0]?.content).toMatch(/Agent switched to `claude@mac`/);
     expect(replies[0]?.content).toMatch(/model `claude-opus-5`/);
@@ -395,9 +397,9 @@ describe("/seam config agent — #178 session/overlay split-brain", () => {
   it("selecting the new default in /seam config model is a no-op after the switch", async () => {
     const { orch, store } = makeOrch();
     seedSession(store);
-    await (orch as any).cmdAgent(slashI({ strings: { id: "codex@local" } }).i);
+    await acknowledgedHandler(slashI({ strings: { id: "codex@local" } }).i, () => (orch as any).cmdAgent(slashI({ strings: { id: "codex@local" } }).i));
     const { i, replies } = slashI({ strings: { id: "gpt-5.6-sol" } });
-    await (orch as any).cmdModel(i);
+    await acknowledgedHandler(i, () => (orch as any).cmdModel(i));
     expect(replies[0]?.content).toMatch(/already set to `gpt-5\.6-sol`/);
   });
 
@@ -423,7 +425,7 @@ describe("/seam config agent — #178 session/overlay split-brain", () => {
       },
     });
     seedSession(store);
-    await (orch as any).cmdAgent(slashI({ strings: {} }).i);
+    await acknowledgedHandler(slashI({ strings: {} }).i, () => (orch as any).cmdAgent(slashI({ strings: {} }).i));
     const rec = store.get(`discord:${THREAD}`)!;
     expect(rec.agentId).toBe("codex");
     expect(rec.repoPath).toBe("/concurrent-repo");
@@ -441,7 +443,7 @@ describe("/seam config agent — #178 session/overlay split-brain", () => {
       throw new Error("injected persistence exception");
     };
     const { i, replies } = slashI({ strings: { id: "codex@local" } });
-    await (orch as any).cmdAgent(i);
+    await acknowledgedHandler(i, () => (orch as any).cmdAgent(i));
     expect(replies[0]?.content).toMatch(/Could not switch agent: injected persistence exception/);
     expect(replies[0]?.content).not.toMatch(/Agent switched/);
     const rec = store.get(`discord:${THREAD}`)!;
@@ -458,7 +460,7 @@ describe("/seam config agent — #178 session/overlay split-brain", () => {
     const mutation = (orch as any).configMutation;
     mutation.deps.reloadPresets = () => ({ ok: false, error: "injected reload failure" });
     const { i, replies } = slashI({ strings: { id: "codex@local" } });
-    await (orch as any).cmdAgent(i);
+    await acknowledgedHandler(i, () => (orch as any).cmdAgent(i));
     expect(replies[0]?.content).toMatch(/Could not switch agent: injected reload failure/);
     expect(replies[0]?.content).not.toMatch(/Agent switched/);
     const rec = store.get(`discord:${THREAD}`)!;
@@ -478,7 +480,7 @@ describe("/seam config agent — #178 session/overlay split-brain", () => {
     mutation.applyThreadLocation = (...args: unknown[]) => origLocation(...args);
     mutation.applyThreadOverlay = () => ({ ok: false, error: "injected overlay failure" });
     const { i, replies } = slashI({ strings: { id: "codex@mac" } });
-    await (orch as any).cmdAgent(i);
+    await acknowledgedHandler(i, () => (orch as any).cmdAgent(i));
     expect(replies[0]?.content).toMatch(/Could not switch agent: injected overlay failure/);
     expect(threadPresets.get(THREAD)?.location).toBeUndefined();
     const raw = JSON.parse(fs.readFileSync(presetsFile, "utf8"));
@@ -497,7 +499,7 @@ describe("/seam config agent — #178 session/overlay split-brain", () => {
       return orig(rec);
     }) as typeof orig;
     const { i, replies } = slashI({ strings: { id: "codex@local" } });
-    await (orch as any).cmdAgent(i);
+    await acknowledgedHandler(i, () => (orch as any).cmdAgent(i));
     expect(replies[0]?.content).toMatch(/Could not switch agent: injected spawn-plan failure/);
     const rec = store.get(`discord:${THREAD}`)!;
     expect(rec.agentId).toBe("claude");
@@ -522,7 +524,7 @@ describe("/seam config agent — #178 session/overlay split-brain", () => {
       return orig(rec);
     }) as typeof orig;
     const { i, replies } = slashI({ strings: { id: "codex@local" } });
-    await (orch as any).cmdAgent(i);
+    await acknowledgedHandler(i, () => (orch as any).cmdAgent(i));
     expect(replies[0]?.content).toMatch(/Could not switch agent: injected spawn-plan failure/);
     expect(replies[0]?.content).toMatch(/Previous ACP session was not restored/);
     const rec = store.get(`discord:${THREAD}`)!;

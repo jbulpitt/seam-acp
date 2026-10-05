@@ -19,7 +19,6 @@ export interface BrowserClick {
   readonly fields: { getTextInputValue(name: string): string };
   isStringSelectMenu(): boolean;
   isModalSubmit(): boolean;
-  deferUpdate(): Promise<void>;
   editReply(view: CardView): Promise<void>;
   reply(view: { content: string; flags?: number }): Promise<void>;
   followUp(view: { content: string; flags?: number }): Promise<void>;

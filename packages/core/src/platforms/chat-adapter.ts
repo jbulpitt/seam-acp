@@ -1,5 +1,6 @@
 import type { SessionRecord, StructuredLayout, StructuredPanel } from "../core/types.js";
 import type { MessagePage, MessagePageRequest } from "../core/message-reader.js";
+import type { ComponentAcknowledgement } from "./interaction-response.js";
 
 /** Reference to a channel or thread on a chat platform. */
 export interface ChannelRef {
@@ -193,7 +194,7 @@ export interface ChatAdapter {
    * whose custom_id the adapter does not consume itself. Used by the thread
    * config editor (#90) so hub buttons outlive the 15-minute slash token.
    */
-  onComponent?(handler: (evt: ComponentEvent) => void | Promise<void>): void;
+  onComponent?(handler: (evt: ComponentEvent) => void | Promise<void>, acknowledgement: ComponentAcknowledgement): void;
   restoreBrowserReply?(target: string, userId: string, channelId: string): import("../core/session-browser.js").BrowserReply;
 
   /** Optional: pin a message (status card lives as the sticky post in its thread). */
@@ -275,14 +276,12 @@ export interface ChatAdapter {
    */
   sendTyping?(channel: ChannelRef): Promise<void>;
 
-
-
   /** Post a frozen #91 choice card (embed + persistent classic action rows). */
   sendChoiceCard?(channel: ChannelRef, card: ChoiceCardPost): Promise<MessageRef>;
   /** Edit a posted choice card (counts; single-user hides buttons after pick). */
   editChoiceCard?(message: MessageRef, card: ChoiceCardPost): Promise<void>;
   /** Persistent `choice:` InteractionCreate handler (not a collector). */
-  onChoiceInteraction?(handler: (evt: ChoiceInteraction) => void | Promise<void>): void;
+  onChoiceInteraction?(handler: (evt: ChoiceInteraction) => void | Promise<void>, acknowledgement: ComponentAcknowledgement): void;
 
   /** Post/edit an ACP elicitation card with Discord-native controls. */
   sendElicitationCard?(channel: ChannelRef, card: ElicitationCardPost): Promise<MessageRef>;
@@ -336,7 +335,6 @@ export interface ChoiceInteraction {
   fields?: Record<string, string>;
   replyEphemeral: (text: string) => Promise<void>;
   followUpEphemeral: (text: string) => Promise<void>;
-  deferUpdate: () => Promise<void>;
   showModal: (opts: {
     customId: string;
     title: string;
@@ -376,7 +374,6 @@ export interface ComponentEvent {
     filename: string;
     mimeType: string;
   }) => Promise<void>;
-  deferUpdate: () => Promise<void>;
   showModal: (opts: {
     customId: string;
     title: string;
@@ -391,7 +388,6 @@ export interface ComponentEvent {
     }>;
   }) => Promise<void>;
 }
-
 
 /**
  * Convenience: the session-router wants to translate channel refs to

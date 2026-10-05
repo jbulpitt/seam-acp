@@ -40,8 +40,6 @@ export interface WorkflowInventoryPort {
 
 /** Click-scoped collaborators: one set per interaction. */
 export interface WorkflowInventoryClickPort {
-  /** Ack inside Discord's 3s window. */
-  ack(): Promise<void>;
   followUp(text: string): Promise<void>;
 }
 
@@ -93,9 +91,6 @@ export class WorkflowInventoryController {
 
     if (parsed.action === "page") {
       const requested = Number(parsed.arg);
-      // The id is ours, so it gets acked even when its payload is unusable —
-      // only a customId belonging to someone else is left unanswered.
-      await click.ack();
       if (!Number.isFinite(requested)) return "ignored";
       await this.rerender(requested, parsed.action);
       return "paged";
@@ -106,9 +101,6 @@ export class WorkflowInventoryController {
     // by action: Resume and Abandon mutate the same turn, so firing one while
     // the other is in flight is the same double-execution.
     const claimed = this.guard.claim(parsed.arg);
-    // Ack either way, and before touching the card — a click we are about to
-    // drop must still not resolve as "interaction failed".
-    await click.ack();
     if (!claimed) return "dropped";
     try {
       const result =

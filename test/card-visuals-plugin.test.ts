@@ -60,8 +60,10 @@ async function fixture() {
   cleanups.push(async () => { await host.dispose(); store.close(); fs.rmSync(directory, { recursive: true, force: true }); });
   const slash = async (leaf: "card" | "gif", values: Record<string, string> = {}) => {
     const reply = vi.fn(async () => {});
-    await orchestrator.handleSlashInteraction({ commandName: "seam", channelId: THREAD, channel: { isThread: () => true, parentId: PARENT }, user: { id: USER, username: "tester" },
-      options: { getSubcommand: () => leaf, getSubcommandGroup: () => "config", getString: name => values[name] ?? null, getBoolean: () => null }, reply } as never);
+    const native = { deferred: false, ephemeral: true, commandName: "seam", channelId: THREAD, channel: { isThread: () => true, parentId: PARENT }, user: { id: USER, username: "tester" },
+      options: { getSubcommand: () => leaf, getSubcommandGroup: () => "config", getString: (name: string) => values[name] ?? null, getBoolean: () => null }, reply, editReply: reply,
+      deferReply: async () => { native.deferred = true; } };
+    await orchestrator.handleSlashInteraction(native as never);
     return reply;
   };
   return { logs, host, router, store, record, config, panels, adapter, orchestrator, slash };

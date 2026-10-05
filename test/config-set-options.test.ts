@@ -18,6 +18,7 @@ import type { SessionConfigState, SessionRecord } from "../packages/core/src/cor
 import type { ChannelRef } from "../packages/core/src/platforms/chat-adapter.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 import { localBridgeHub, localBridgeWiring } from "./local-bridge-fixture.js";
+import { acknowledgedHandler } from "./acknowledged-handler-fixture.js";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
 const THREAD = "333333333333333333";
@@ -73,6 +74,7 @@ function interaction(
     channel: { isThread: () => true, parentId: target.parentId ?? PARENT },
     deferred: false,
     replied: false,
+    ephemeral: true,
     reply: vi.fn(async (payload: { content?: string; flags?: number }) => {
       i.replied = true;
       order.push("reply");
@@ -84,9 +86,11 @@ function interaction(
       order.push("defer");
       expect(payload.flags).toBe(MessageFlags.Ephemeral);
     }),
-    editReply: vi.fn(async (content: string) => {
+    editReply: vi.fn(async (payload: string | { content?: string }) => {
+      const content = typeof payload === "string" ? payload : payload.content ?? "";
       order.push("edit");
       edits.push(content);
+      replies.push(content);
     }),
   };
   return { i, replies, edits, order };
@@ -217,7 +221,7 @@ describe("/seam config set named parameters", () => {
       gif: "on",
     });
 
-    await (orch as any).cmdConfigSet(i);
+    await acknowledgedHandler(i, () => (orch as any).cmdConfigSet(i));
 
     expect(order[0]).toBe("defer");
     expect(edits.at(-1)).toMatch(/Updated `agent`, `model`, `effort`, `repo`, `role`, `permissions`, `card`, `gif`/);
@@ -251,7 +255,7 @@ describe("/seam config set named parameters", () => {
       gif: "default",
     });
 
-    await (orch as any).cmdConfigSet(i);
+    await acknowledgedHandler(i, () => (orch as any).cmdConfigSet(i));
 
     const { record, cfg } = read(store);
     expect(record.agentId).toBe("claude");
@@ -274,7 +278,7 @@ describe("/seam config set named parameters", () => {
     const { orch, router, store } = makeHarness();
     vi.spyOn(router, "applyPermissionMode").mockRejectedValueOnce(new Error("session/set_mode: unsupported full access"));
     const call = interaction({ permissions: "always" });
-    await (orch as any).cmdConfigSet(call.i);
+    await acknowledgedHandler(call.i, () => (orch as any).cmdConfigSet(call.i));
     expect(call.edits.at(-1)).toContain("session/set_mode: unsupported full access");
     expect(read(store).cfg.permissionPolicy).toBe("ask");
     store.close();
@@ -288,7 +292,7 @@ describe("/seam config set named parameters", () => {
       expect(store.readConfig(store.get(record.id)!).permissionPolicy).toBe("always");
       call.order.push("mode");
     });
-    await (orch as any).cmdApprove(call.i);
+    await acknowledgedHandler(call.i, () => (orch as any).cmdApprove(call.i));
     expect(call.order).toEqual(["defer", "mode", "edit"]);
     expect(call.edits.at(-1)).toContain("Approval policy set to `always`");
     store.close();
@@ -299,7 +303,7 @@ describe("/seam config set named parameters", () => {
     const failure = new Error("session/set_mode: agent refusal");
     vi.spyOn(router, "applyPermissionMode").mockRejectedValueOnce(failure);
     const call = interaction({ policy: "always" });
-    await expect((orch as any).cmdApprove(call.i)).rejects.toBe(failure);
+    await expect(acknowledgedHandler(call.i, () => (orch as any).cmdApprove(call.i))).rejects.toBe(failure);
     expect(call.order).toEqual(["defer"]);
     expect(call.edits).toEqual([]);
     store.close();
@@ -307,7 +311,7 @@ describe("/seam config set named parameters", () => {
 
   it("keeps advertised modes through adoption and rereads the live resolved policy", async () => {
     const { orch, router, store } = makeHarness();
-    await (orch as any).cmdConfigSet(interaction({ agent: "codex@local" }).i);
+    await acknowledgedHandler(interaction({ agent: "codex@local" }).i, () => (orch as any).cmdConfigSet(interaction({ agent: "codex@local" }).i));
     const record = read(store).record;
     const connection = {
       newSession: vi.fn(async () => ({ sessionId: "s1", modes: { currentModeId: "agent", availableModes: [
@@ -348,7 +352,7 @@ describe("/seam config set named parameters", () => {
 
   it.each(["always", "ask"] as const)("uses the resolved %s policy for a fresh isolated Codex turn", async policy => {
     const { orch, store } = makeHarness();
-    await (orch as any).cmdConfigSet(interaction({ agent: "codex@local", permissions: policy }).i);
+    await acknowledgedHandler(interaction({ agent: "codex@local", permissions: policy }).i, () => (orch as any).cmdConfigSet(interaction({ agent: "codex@local", permissions: policy }).i));
     const bound = read(store);
     const modes = { sessionId: "bound-s1", ...structuredClone(CODEX_ACP_2_0_1_MODES) };
     store.upsert({ ...bound.record, acpSessionId: modes.sessionId,
@@ -381,7 +385,7 @@ describe("/seam config set named parameters", () => {
 
   it("uses the selected agent default model when model is omitted", async () => {
     const { orch, store } = makeHarness();
-    await (orch as any).cmdConfigSet(interaction({ agent: "codex@local" }).i);
+    await acknowledgedHandler(interaction({ agent: "codex@local" }).i, () => (orch as any).cmdConfigSet(interaction({ agent: "codex@local" }).i));
     const { record, cfg } = read(store);
     expect(record.agentId).toBe("codex");
     expect(cfg.model).toBe("gpt-5.6-sol");
@@ -397,9 +401,9 @@ describe("/seam config set named parameters", () => {
         locked: true,
       },
     });
-    await (orch as any).cmdConfigSet(
+    await acknowledgedHandler(interaction({ agent: "codex@local", model: "gpt-5.4", effort: "high" }).i, () => (orch as any).cmdConfigSet(
       interaction({ agent: "codex@local", model: "gpt-5.4", effort: "high" }).i
-    );
+    ));
     const record = read(store).record;
     expect(threadPresets.get(THREAD)?.agent?.value).toBe("codex");
     expect(threadPresets.get(THREAD)?.model?.value).toBe("gpt-5.4");
@@ -422,7 +426,7 @@ describe("/seam config set named parameters", () => {
       permissions: "always",
     });
 
-    await (orch as any).cmdConfigSet(call.i);
+    await acknowledgedHandler(call.i, () => (orch as any).cmdConfigSet(call.i));
 
     expect(call.edits.at(-1)).toMatch(/Could not update config: injected overlay failure/);
     const { record, cfg } = read(store);
@@ -436,12 +440,12 @@ describe("/seam config set named parameters", () => {
   it("refuses mixed JSON/named mode and unsupported effort without mutating", async () => {
     const { orch, store } = makeHarness();
     const mixed = interaction({ json: '{"model":"x"}', role: "qa" });
-    await (orch as any).cmdConfigSet(mixed.i);
+    await acknowledgedHandler(mixed.i, () => (orch as any).cmdConfigSet(mixed.i));
     expect(mixed.replies[0]).toMatch(/either `json:` or named fields/);
     expect(read(store).cfg.role).toBe("worker");
 
     const unsupported = interaction({ agent: "codex@local", effort: "ultra" });
-    await (orch as any).cmdConfigSet(unsupported.i);
+    await acknowledgedHandler(unsupported.i, () => (orch as any).cmdConfigSet(unsupported.i));
     expect(unsupported.edits[0]).toMatch(/not supported by `codex\/gpt-5\.6-sol`/);
     expect(read(store).record.agentId).toBe("claude");
     store.close();
@@ -450,7 +454,7 @@ describe("/seam config set named parameters", () => {
   it("keeps JSON as full replacement mode and acknowledges before invalidation", async () => {
     const { orch, store } = makeHarness();
     const call = interaction({ json: '{"role":"planner","permissionPolicy":"deny"}' });
-    await (orch as any).cmdConfigSet(call.i);
+    await acknowledgedHandler(call.i, () => (orch as any).cmdConfigSet(call.i));
     expect(call.order[0]).toBe("defer");
     expect(call.edits.at(-1)).toMatch(/Config replaced/);
     const { record, cfg } = read(store);
@@ -462,7 +466,7 @@ describe("/seam config set named parameters", () => {
   it("applies an explicit host binding through the same agent autocomplete value", async () => {
     const { orch, store, threadPresets } = makeHarness();
     const call = interaction({ agent: "codex@mac" });
-    await (orch as any).cmdConfigSet(call.i);
+    await acknowledgedHandler(call.i, () => (orch as any).cmdConfigSet(call.i));
     expect(call.edits.at(-1)).toMatch(/Updated `agent`/);
     expect(read(store).record.agentId).toBe("codex");
     expect(read(store).record.acpSessionId).toBe("");
@@ -485,7 +489,7 @@ describe("/seam config set named parameters", () => {
     const flushIdentity = (orch as any).identityEffects.flush as ReturnType<typeof vi.fn>;
 
     const call = interaction({ model: "gpt-5.4", repo: "alpha" }, { rebuild: true });
-    await (orch as any).cmdConfigSet(call.i);
+    await acknowledgedHandler(call.i, () => (orch as any).cmdConfigSet(call.i));
 
     expect(rebuild).toHaveBeenCalledTimes(1);
     expect(call.edits.at(-1)).toMatch(/Updated `model`, `repo`/);
@@ -508,12 +512,12 @@ describe("/seam config set named parameters", () => {
     (orch as any).reconstructSessionFromDiscord = rebuild;
 
     const empty = interaction({});
-    await (orch as any).cmdConfigSet(empty.i);
+    await acknowledgedHandler(empty.i, () => (orch as any).cmdConfigSet(empty.i));
     expect(empty.replies[0]).toMatch(/at least one named field/);
     expect(rebuild).not.toHaveBeenCalled();
 
     const call = interaction({}, { rebuild: true });
-    await (orch as any).cmdConfigSet(call.i);
+    await acknowledgedHandler(call.i, () => (orch as any).cmdConfigSet(call.i));
     expect(rebuild).toHaveBeenCalledTimes(1);
     expect(call.order[0]).toBe("defer");
     expect(call.edits.at(-1)).toMatch(/Rebuilt from Discord/);
@@ -527,7 +531,7 @@ describe("/seam config set named parameters", () => {
     const rebuild = vi.fn();
     (orch as any).reconstructSessionFromDiscord = rebuild;
     const call = interaction({ agent: "nope" }, { rebuild: true });
-    await (orch as any).cmdConfigSet(call.i);
+    await acknowledgedHandler(call.i, () => (orch as any).cmdConfigSet(call.i));
     expect(call.edits.at(-1)).toMatch(/Unknown agent/);
     expect(rebuild).not.toHaveBeenCalled();
     expect(read(store).record.agentId).toBe("claude");
@@ -548,16 +552,16 @@ describe("configured /seam new (#294)", () => {
       gif: "on",
     };
     const oneCall = makeHarness();
-    await (oneCall.orch as any).cmdNew(interaction({ name: "one-call", ...fields }).i);
+    await acknowledgedHandler(interaction({ name: "one-call", ...fields }).i, () => (oneCall.orch as any).cmdNew(interaction({ name: "one-call", ...fields }).i));
     const oneRecord = oneCall.store.get(`discord:${NEW_THREAD}`)!;
     const oneOverlay = oneCall.threadPresets.get(NEW_THREAD);
 
     const twoCalls = makeHarness();
     (twoCalls.orch as any).openConfigEditorCard = vi.fn(async () => true);
-    await (twoCalls.orch as any).cmdNew(interaction({ name: "two-calls" }).i);
-    await (twoCalls.orch as any).cmdConfigSet(
+    await acknowledgedHandler(interaction({ name: "two-calls" }).i, () => (twoCalls.orch as any).cmdNew(interaction({ name: "two-calls" }).i));
+    await acknowledgedHandler(interaction(fields, {}, { channelId: NEW_THREAD }).i, () => (twoCalls.orch as any).cmdConfigSet(
       interaction(fields, {}, { channelId: NEW_THREAD }).i
-    );
+    ));
     const twoRecord = twoCalls.store.get(`discord:${NEW_THREAD}`)!;
     const twoOverlay = twoCalls.threadPresets.get(NEW_THREAD);
 
@@ -603,7 +607,7 @@ describe("configured /seam new (#294)", () => {
       gif: "on",
     });
 
-    await (orch as any).cmdNew(call.i);
+    await acknowledgedHandler(call.i, () => (orch as any).cmdNew(call.i));
 
     expect(created).toEqual([
       { parent: { platform: "discord", id: THREAD }, name: "investigation" },
@@ -643,7 +647,7 @@ describe("configured /seam new (#294)", () => {
     });
     const call = interaction({ role: "worker" });
 
-    await (orch as any).cmdNew(call.i);
+    await acknowledgedHandler(call.i, () => (orch as any).cmdNew(call.i));
 
     const record = store.get(`discord:${NEW_THREAD}`)!;
     const effective = router.describeConfig(record);
@@ -659,8 +663,8 @@ describe("configured /seam new (#294)", () => {
     const newCall = interaction({ agent: "codex@mac", effort: "ultra" });
     const setCall = interaction({ agent: "codex@mac", effort: "ultra" });
 
-    await (orch as any).cmdNew(newCall.i);
-    await (orch as any).cmdConfigSet(setCall.i);
+    await acknowledgedHandler(newCall.i, () => (orch as any).cmdNew(newCall.i));
+    await acknowledgedHandler(setCall.i, () => (orch as any).cmdConfigSet(setCall.i));
 
     expect(newCall.edits.at(-1)).toBe(setCall.edits.at(-1));
     expect(created).toEqual([]);
@@ -671,14 +675,14 @@ describe("configured /seam new (#294)", () => {
   it("rejects JSON/named mixing and invalid JSON shape before thread creation", async () => {
     const { orch, store, created } = makeHarness();
     const mixed = interaction({ json: '{"model":"gpt-5.4"}', role: "qa" });
-    await (orch as any).cmdNew(mixed.i);
+    await acknowledgedHandler(mixed.i, () => (orch as any).cmdNew(mixed.i));
     expect(mixed.edits.at(-1)).toBe("Use either `json:` or named fields, not both.");
 
     const invalid = interaction({ json: '{"permissionPolicy":"sometimes"}' });
-    await (orch as any).cmdNew(invalid.i);
+    await acknowledgedHandler(invalid.i, () => (orch as any).cmdNew(invalid.i));
     expect(invalid.edits.at(-1)).toMatch(/Invalid JSON.*permissionPolicy/);
     const invalidSet = interaction({ json: '{"permissionPolicy":"sometimes"}' });
-    await (orch as any).cmdConfigSet(invalidSet.i);
+    await acknowledgedHandler(invalidSet.i, () => (orch as any).cmdConfigSet(invalidSet.i));
     expect(invalid.edits.at(-1)).toBe(invalidSet.edits.at(-1));
     expect(created).toEqual([]);
     expect(store.get(`discord:${NEW_THREAD}`)).toBeNull();
@@ -690,7 +694,7 @@ describe("configured /seam new (#294)", () => {
     const jsonCall = interaction({
       json: '{"model":"claude-opus-5","reasoningEffort":"high","role":"planner","permissionPolicy":"deny"}',
     });
-    await (jsonHarness.orch as any).cmdNew(jsonCall.i);
+    await acknowledgedHandler(jsonCall.i, () => (jsonHarness.orch as any).cmdNew(jsonCall.i));
     const jsonRecord = jsonHarness.store.get(`discord:${NEW_THREAD}`)!;
     expect(jsonHarness.store.readConfig(jsonRecord)).toMatchObject({
       model: "claude-opus-5",
@@ -708,7 +712,7 @@ describe("configured /seam new (#294)", () => {
       },
     });
     const clearCall = interaction({ role: "auto", card: "default", gif: "default" });
-    await (clearHarness.orch as any).cmdNew(clearCall.i);
+    await acknowledgedHandler(clearCall.i, () => (clearHarness.orch as any).cmdNew(clearCall.i));
     const clearRecord = clearHarness.store.get(`discord:${NEW_THREAD}`)!;
     const clearCfg = clearHarness.store.readConfig(clearRecord);
     expect(clearCfg.role).toBeUndefined();
@@ -729,7 +733,7 @@ describe("configured /seam new (#294)", () => {
     });
     const call = interaction({ agent: "codex@local", model: "gpt-5.4", permissions: "always" });
 
-    await (orch as any).cmdNew(call.i);
+    await acknowledgedHandler(call.i, () => (orch as any).cmdNew(call.i));
 
     expect(created).toHaveLength(1);
     const record = store.get(`discord:${NEW_THREAD}`)!;
@@ -747,7 +751,7 @@ describe("configured /seam new (#294)", () => {
   it("rejects rebuild:true before creation while rebuild:false remains inert", async () => {
     const rejected = makeHarness();
     const rebuild = interaction({ name: "no-clone" }, { rebuild: true });
-    await (rejected.orch as any).cmdNew(rebuild.i);
+    await acknowledgedHandler(rebuild.i, () => (rejected.orch as any).cmdNew(rebuild.i));
     expect(rebuild.replies.at(-1)).toMatch(/requires an existing thread with Discord history/);
     expect(rejected.created).toEqual([]);
     rejected.store.close();
@@ -755,7 +759,7 @@ describe("configured /seam new (#294)", () => {
     const inert = makeHarness();
     const ordinary = interaction({ name: "ordinary" }, { rebuild: false });
     (inert.orch as any).openConfigEditorCard = vi.fn(async () => true);
-    await (inert.orch as any).cmdNew(ordinary.i);
+    await acknowledgedHandler(ordinary.i, () => (inert.orch as any).cmdNew(ordinary.i));
     expect(inert.created).toHaveLength(1);
     expect((inert.orch as any).openConfigEditorCard).toHaveBeenCalledTimes(1);
     inert.store.close();
@@ -781,7 +785,7 @@ describe("configured /seam new (#294)", () => {
     });
     const call = interaction({ agent: "codex@local" });
 
-    await (orch as any).cmdNew(call.i);
+    await acknowledgedHandler(call.i, () => (orch as any).cmdNew(call.i));
 
     expect(call.edits.at(-1)).toBe("Could not create thread: Discord unavailable");
     expect(created).toEqual([]);

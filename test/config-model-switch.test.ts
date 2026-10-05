@@ -13,6 +13,7 @@ import type { ChannelPreset, ThreadPreset } from "../packages/core/src/config.js
 import type { SessionConfigState, SessionRecord } from "../packages/core/src/core/types.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 import { localBridgeWiring } from "./local-bridge-fixture.js";
+import { acknowledgedHandler } from "./acknowledged-handler-fixture.js";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
 const ADMIN = "1487094572696867019";
@@ -54,6 +55,7 @@ function slashI(over: {
     },
     deferred: false,
     replied: false,
+    ephemeral: true,
     reply: vi.fn(async (payload: { content?: string; flags?: number }) => {
       i.replied = true;
       replies.push(payload);
@@ -200,7 +202,7 @@ describe("/seam config model — #191 failure-atomic commit", () => {
       i.deferred = true;
     });
 
-    await (orch as any).cmdModel(i);
+    await acknowledgedHandler(i, () => (orch as any).cmdModel(i));
 
     expect(order).toEqual(["defer", "invalidate"]);
     expect(edits[0]).toMatch(/Model will be `claude-sonnet-4\.6`/);
@@ -210,7 +212,7 @@ describe("/seam config model — #191 failure-atomic commit", () => {
     const { orch, router, store, threadPresets } = makeOrch();
     seedSession(store);
     const { i, replies } = slashI({ strings: { id: "claude-sonnet-4.6" } });
-    await (orch as any).cmdModel(i);
+    await acknowledgedHandler(i, () => (orch as any).cmdModel(i));
 
     expect(replies[0]?.flags).toBe(MessageFlags.Ephemeral);
     expect(replies[0]?.content).toMatch(/Model will be `claude-sonnet-4\.6`/);
@@ -256,7 +258,7 @@ describe("/seam config model — #191 failure-atomic commit", () => {
     });
     seedSession(store);
     const { i, edits } = slashI({ strings: {} });
-    await (orch as any).cmdModel(i);
+    await acknowledgedHandler(i, () => (orch as any).cmdModel(i));
     expect(edits.some((e) => e.includes("Posting picker"))).toBe(true);
     expect(order).toEqual(["picked", "commit-done", "render-success"]);
     expect(sent.some((m) => m.includes("claude-sonnet-4.6"))).toBe(true);
@@ -272,7 +274,7 @@ describe("/seam config model — #191 failure-atomic commit", () => {
     const mutation = (orch as any).configMutation;
     mutation.applyThreadOverlay = () => ({ ok: false, error: "injected overlay failure" });
     const { i, replies } = slashI({ strings: { id: "claude-sonnet-4.6" } });
-    await (orch as any).cmdModel(i);
+    await acknowledgedHandler(i, () => (orch as any).cmdModel(i));
     expect(replies[0]?.content).toMatch(/Could not set model: injected overlay failure/);
     expect(replies[0]?.content).not.toMatch(/Model will be/);
     expect(replies[0]?.content).not.toMatch(/Model set to/);
@@ -291,7 +293,7 @@ describe("/seam config model — #191 failure-atomic commit", () => {
       throw new Error("injected persistence exception");
     };
     const { i, replies } = slashI({ strings: { id: "claude-sonnet-4.6" } });
-    await (orch as any).cmdModel(i);
+    await acknowledgedHandler(i, () => (orch as any).cmdModel(i));
     expect(replies[0]?.content).toMatch(/Could not set model: injected persistence exception/);
     expect(replies[0]?.content).not.toMatch(/Model will be/);
     expect(sessionConfig(store).model).toBe("claude-opus-5");
@@ -306,7 +308,7 @@ describe("/seam config model — #191 failure-atomic commit", () => {
     const mutation = (orch as any).configMutation;
     mutation.deps.reloadPresets = () => ({ ok: false, error: "injected reload failure" });
     const { i, replies } = slashI({ strings: { id: "claude-sonnet-4.6" } });
-    await (orch as any).cmdModel(i);
+    await acknowledgedHandler(i, () => (orch as any).cmdModel(i));
     expect(replies[0]?.content).toMatch(/Could not set model: injected reload failure/);
     expect(replies[0]?.content).not.toMatch(/Model will be/);
     expect(sessionConfig(store).model).toBe("claude-opus-5");
@@ -325,7 +327,7 @@ describe("/seam config model — #191 failure-atomic commit", () => {
       return plan;
     }) as typeof orig;
     const { i, replies } = slashI({ strings: { id: "claude-sonnet-4.6" } });
-    await (orch as any).cmdModel(i);
+    await acknowledgedHandler(i, () => (orch as any).cmdModel(i));
     expect(replies[0]?.content).toMatch(/Could not set model: the effective configuration did not match/);
     expect(sessionConfig(store).model).toBe("claude-opus-5");
     expect(store.get(`discord:${THREAD}`)?.acpSessionId).toBe("acp-old");
@@ -356,7 +358,7 @@ describe("/seam config model — #191 failure-atomic commit", () => {
       },
     });
     seedSession(store);
-    await (orch as any).cmdModel(slashI({ strings: {} }).i);
+    await acknowledgedHandler(slashI({ strings: {} }).i, () => (orch as any).cmdModel(slashI({ strings: {} }).i));
     const rec = store.get(`discord:${THREAD}`)!;
     expect(rec.repoPath).toBe("/concurrent-repo");
     const cfg = sessionConfig(store);
@@ -389,7 +391,7 @@ describe("/seam config model — #191 failure-atomic commit", () => {
       },
     });
     seedSession(store);
-    await (orch as any).cmdModel(slashI({ strings: {} }).i);
+    await acknowledgedHandler(slashI({ strings: {} }).i, () => (orch as any).cmdModel(slashI({ strings: {} }).i));
     const rec = store.get(`discord:${THREAD}`)!;
     expect(rec.repoPath).toBe("/kept-repo");
     const cfg = sessionConfig(store);
@@ -410,7 +412,7 @@ describe("/seam config model — #191 failure-atomic commit", () => {
       return plan;
     }) as typeof orig;
     const { i, replies } = slashI({ strings: { id: "claude-sonnet-4.6" } });
-    await (orch as any).cmdModel(i);
+    await acknowledgedHandler(i, () => (orch as any).cmdModel(i));
     expect(replies[0]?.content).toMatch(/Could not set model: the effective configuration did not match/);
     expect(replies[0]?.content).toMatch(/Previous ACP session was not restored/);
     const rec = store.get(`discord:${THREAD}`)!;
@@ -428,7 +430,7 @@ describe("/seam config model — #191 failure-atomic commit", () => {
       },
     })) as typeof router.getOrStartRuntime;
     const { i, replies } = slashI({ strings: { id: "claude-sonnet-4.6" } });
-    await (orch as any).cmdModel(i);
+    await acknowledgedHandler(i, () => (orch as any).cmdModel(i));
     expect(replies[0]?.content).toMatch(/Model will be `claude-sonnet-4\.6` with effort `default` on the next turn \(session respawn\)/);
     expect(sessionConfig(store).model).toBe("claude-sonnet-4.6");
     expect(router.describeConfig(store.get(`discord:${THREAD}`)!).model.value).toBe("claude-sonnet-4.6");

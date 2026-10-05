@@ -3,6 +3,7 @@ import { WebhookClient, MessageFlags, type InteractionEditReplyOptions, type Int
 import type { BrowserReply, BrowserClick } from "../../core/session-browser.js";
 import type { ComponentEvent } from "../chat-adapter.js";
 import { SyntheticInteraction, type SyntheticContext, type SyntheticReplySnapshot } from "./synthetic-interaction.js";
+import { waitForInteractionAcknowledgement } from "./interaction-response.js";
 
 /** A scoped reply capability, retained only in private runtime card storage. */
 export function browserReplyFromInteraction(
@@ -14,11 +15,13 @@ export function browserReplyFromInteraction(
       : { kind: "webhook", id: interaction.applicationId, token: interaction.token }); },
     user: { id: interaction.user.id }, channelId: interaction.channelId!,
     editReply: async (view) => {
+      await waitForInteractionAcknowledgement(interaction);
       if (interaction instanceof SyntheticInteraction) await interaction.editReply(view);
       else await interaction.editReply(view as InteractionEditReplyOptions);
     },
-    deleteReply: async () => { await interaction.deleteReply(); },
+    deleteReply: async () => { await waitForInteractionAcknowledgement(interaction); await interaction.deleteReply(); },
     followUp: async (view) => {
+      await waitForInteractionAcknowledgement(interaction);
       const payload = { ...view, flags: MessageFlags.Ephemeral };
       if (interaction instanceof SyntheticInteraction) await interaction.followUp(payload);
       else await interaction.followUp(payload as InteractionReplyOptions);
@@ -56,7 +59,7 @@ export function browserClick(event: ComponentEvent): BrowserClick {
     customId: event.customId, user: { id: event.userId, name: event.userName }, values: event.values ?? [],
     fields: { getTextInputValue: (name) => event.fields?.[name] ?? "" },
     isStringSelectMenu: () => event.kind === "select", isModalSubmit: () => event.kind === "modal",
-    deferUpdate: () => event.deferUpdate(), editReply: (view) => output.editReply(view),
+    editReply: (view) => output.editReply(view),
     deleteReply: () => output.deleteReply(),
     reply: (view) => event.replyEphemeral(view.content), followUp: (view) => event.followUpEphemeral(view.content),
     showModal: async (modal) => {

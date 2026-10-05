@@ -28,12 +28,14 @@ in-flight fences and stops new contributions, and isolates disposal errors.
 ## Command and component contributions
 
 Slash leaves declare their full command/group/leaf path, read-only or mutating
-access, authorization, options, autocomplete and help. One list feeds the
+access, authorization, acknowledgement mode, options, autocomplete and help. One list feeds the
 registration JSON, dispatch, autocomplete and help. Registration checks sibling
 uniqueness, required-option order, the 25-slot limit and Discord's 8,000-character
 budget. The kernel applies participant, channel-lock and admin gates before
-invoking a plugin. Invocations expose option readers and ephemeral replies, not
-the Discord interaction or client.
+invoking a plugin. Dispatch acknowledges before invoking the handler, using its
+declared `ephemeral`, `public`, or modal-first `modal` mode. Invocations expose
+option readers and one `reply` helper for the actual result or error, not the
+Discord interaction, client or acknowledgement methods.
 
 MCP contributions keep descriptor, availability, handler and instruction text
 together. The authenticated caller determines availability for listing,
@@ -42,7 +44,15 @@ scope, authorization and JSON-RPC errors remain in the kernel. The MCP server
 mounts only with `SEAM_MCP_ENABLED`; events and slash commands do not depend on it.
 
 Components declare a custom-id namespace, accepted types and persistent or
-collector lifetime. The same list classifies and dispatches interactions.
+collector lifetime, plus a required acknowledgement mode. Use `update` to edit
+the clicked card, `ephemeral` or `public` for a separate reply, and `modal` only
+when showing a form is the first response. Mixed routes declare a synchronous
+mode resolver using the custom id, interaction kind and selected values.
+The router acknowledges before handlers and access checks. Collector transports
+and modal waits use the same helper with explicit modes; handlers never defer.
+Reply capabilities fill the acknowledged response. Private errors after an
+`update` acknowledgement follow up privately without replacing the card.
+The same list classifies and dispatches interactions.
 Persistent handlers register at boot; collectors remain with their collector.
 The naming editor uses an owner and deadline in its custom id, so its handler
 survives a controller restart. ACP permission requests and config proposals use

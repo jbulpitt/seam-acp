@@ -14,6 +14,7 @@ import { createQuotaPlugin } from "../packages/core/src/plugins/quota/index.js";
 import { createCardVisualsPlugin } from "../packages/core/src/plugins/card-visuals/index.js";
 import { sessionBrowserPlugin } from "../packages/core/src/plugins/session-browser/index.js";
 import type { SessionBrowserFacade } from "../packages/core/src/core/session-browser.js";
+import { acknowledgeComponentInteraction } from "../packages/core/src/platforms/discord/interaction-response.js";
 
 const ADMIN = "101";
 const PARTICIPANT = "102";
@@ -40,7 +41,7 @@ function fixture({ locked = false, participant = false, user = PARTICIPANT, iden
   } as unknown as ConfigUi);
   orch.plugins.slash.register(configPlugin.id, configPlugin.contributions.slash!, { logger: orch.logger, config: undefined });
   function interaction(commandName: string, group: string | null, sub: string, values: Record<string, string> = {}) {
-    return {
+    const i = {
       commandName,
       channelId: "thread",
       channel: { isThread: () => true, parentId: "parent" },
@@ -52,7 +53,11 @@ function fixture({ locked = false, participant = false, user = PARTICIPANT, iden
         getInteger: () => null,
       },
       reply: vi.fn(async () => {}),
+      deferred: false, replied: false, ephemeral: true,
+      deferReply: vi.fn(async () => { i.deferred = true; }),
+      editReply: vi.fn(async () => {}),
     };
+    return i;
   }
   return { orch, interaction };
 }
@@ -145,7 +150,7 @@ describe.each([
       usage: { readUsage }, bindings: () => [binding], resolve: () => binding, card: {},
     }) }], { quota: { QUOTA_STALE_RETENTION_MS: 0, OLLAMA_CLOUD_ENABLED: false } });
     const i = Object.assign(interaction("seam", "info", "usage"), {
-      deferReply: vi.fn(async () => {}), editReply: vi.fn(async () => {}),
+      editReply: vi.fn(async () => {}),
     });
     await orch.handleSlashInteractionInner(i);
     expect(readUsage).toHaveBeenCalledWith(binding);
@@ -196,32 +201,41 @@ describe.each([
       const fixture = scheduleUiFixture(orch);
       fixture.ui.buildScheduleListMessage = () => view;
       await fixture.ui.cmdScheduleList(fixture.interaction(i));
-      collect = async click => fixture.ui.handleListClick({
-        ...click, channelRef: { platform: "discord", id: "thread", parentId: "parent" },
-        messageId: "list", messageButtons: [], mutationRefusal: () => orch.slashAccessRefusal(click, { kind: "mutating" }),
-        editReply: async () => refresh(),
-      } as never);
+      collect = async click => {
+        await acknowledgeComponentInteraction(click, "update");
+        await fixture.ui.handleListClick({
+          ...fixture.interaction(click), channelRef: { platform: "discord", id: "thread", parentId: "parent" },
+          messageId: "list", messageButtons: [], mutationRefusal: () => orch.slashAccessRefusal(click, { kind: "mutating" }),
+          editReply: async () => refresh(),
+        } as never);
+      };
     } else if (handler === "cmdPresetList") {
       const fixture = presetUiFixture(orch);
       (fixture.ui as any).buildPresetListMessage = () => view;
       await fixture.ui.cmdPresetList(fixture.interaction(i));
       const card = [...fixture.ui.cards.states.values()][0]!;
       collect = async click => {
+        await acknowledgeComponentInteraction(click, "update");
         click.customId = `${click.customId}:${card.id}`;
         await fixture.ui.cards.handle(fixture.interaction(click));
       };
     } else await orch[handler](i);
-    const click = (customId: string) => Object.assign(interaction("seam", null, "workflows"), {
-      customId, isButton: () => true, isStringSelectMenu: () => false, isModalSubmit: () => false,
-      deferUpdate: vi.fn(async () => {}), update: vi.fn(async () => {}),
-    });
+    const click = (customId: string) => {
+      const native = Object.assign(interaction("seam", null, "workflows"), {
+        customId, isButton: () => true, isStringSelectMenu: () => false, isModalSubmit: () => false,
+        message: { id: "list", components: [] }, deferred: false, replied: false, ephemeral: null,
+        deferUpdate: vi.fn(async () => { native.deferred = true; }), update: vi.fn(async () => {}),
+        editReply: vi.fn(async () => {}), followUp: vi.fn(async () => {}),
+      });
+      return native;
+    };
     const page = click(pageId);
     await collect(page);
     expect(page.reply).not.toHaveBeenCalled();
     expect(page.deferUpdate.mock.calls.length + page.update.mock.calls.length).toBeGreaterThan(0);
     const mutation = click(mutationId);
     await collect(mutation);
-    expect(mutation.reply).toHaveBeenCalledWith(expect.objectContaining({
+    expect(mutation.followUp).toHaveBeenCalledWith(expect.objectContaining({
       content: expect.stringMatching(config.participant ? /admin setting/ : /channel is locked/),
     }));
     expect(del).not.toHaveBeenCalled();

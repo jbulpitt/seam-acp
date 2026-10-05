@@ -229,29 +229,6 @@ export class CardLifecycle {
     return this.settle("transition", reason, view);
   }
 
-  /**
-   * State 2 — transition, where an external acknowledgement must be the first
-   * request out.
-   *
-   * When the click that triggers the transition is a *component* interaction,
-   * two constraints collide. The collector has to close synchronously, before
-   * any `await`, or two concurrent clicks both open an editor. But the freeze
-   * repaint targets the *original* interaction's token — a separate REST
-   * request — and dispatching it first queues it ahead of the component's ack
-   * inside Discord's 3s budget, which under per-route backoff fails the click.
-   *
-   * Settling already happens synchronously; this orders `acknowledge` between
-   * the stop and the repaint, so the collector is closed before the first
-   * await *and* the ack is the first request on the wire.
-   */
-  transitionWithAck(
-    reason: string,
-    view: CardView,
-    acknowledge: () => Promise<void>
-  ): Promise<boolean> {
-    return this.settle("transition", reason, view, acknowledge);
-  }
-
   /** State 3 — terminal. Replace the card with a component-free result. */
   terminal(reason: string, view: CardView): Promise<boolean> {
     return this.settle("terminal", reason, view);
@@ -305,8 +282,7 @@ export class CardLifecycle {
   private async settle(
     state: CardLifecycleState,
     reason: string,
-    view: CardView,
-    acknowledge?: () => Promise<void>
+    view: CardView
   ): Promise<boolean> {
     if (this.settledState) return false;
     this.settledState = { state, reason };
@@ -316,15 +292,6 @@ export class CardLifecycle {
       this.host.stop(reason);
     } catch (err) {
       this.host.onError?.(err, state, reason);
-    }
-    // Then the caller's acknowledgement, ahead of the repaint, so it is the
-    // first request on the wire. A failed ack still leaves the card frozen.
-    if (acknowledge) {
-      try {
-        await acknowledge();
-      } catch (err) {
-        this.host.onError?.(err, state, reason);
-      }
     }
     try {
       await this.host.render(inertView(view));

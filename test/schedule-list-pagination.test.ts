@@ -25,6 +25,7 @@ import {
 } from "../packages/core/src/platforms/discord/schedule-list-view.js";
 import type { ScheduledPrompt } from "../packages/core/src/core/scheduled-prompts/types.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
+import { collectAcknowledgedInteractions } from "../packages/core/src/platforms/discord/interaction-response.js";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
 
@@ -317,11 +318,11 @@ function makeListCard(rows: ScheduledPrompt[]) {
   };
   const fixture = scheduleUiFixture(self);
   const start = fixture.ui.cmdScheduleList(fixture.interaction(interaction));
-  collector.on("collect", async c => fixture.ui.handleListClick({
+  collectAcknowledgedInteractions(collector, "update", async c => fixture.ui.handleListClick({
     ...c, channelRef: { platform: "discord", id: "thread-1", parentId: "chan-1" },
     messageButtons: (paints.at(-1)?.components ?? []).flatMap((row: any) => row.components.map((button: any) => ({ customId: button.data.custom_id, disabled: button.data.disabled ?? false }))),
-    mutationRefusal: () => undefined, editReply: async view => { paints.push(view as Painted); }, followUp: c.reply,
-  }));
+    mutationRefusal: () => undefined, editReply: async (view: Painted) => { paints.push(view); }, followUp: c.reply,
+  } as never), error => { throw error; });
   return { start, collector, paints, store };
 }
 
@@ -331,6 +332,7 @@ function click(customId: string) {
     interaction: {
       isButton: () => true,
       isStringSelectMenu: () => false,
+      isModalSubmit: () => false,
       customId,
       user: { id: "u1" },
       deferUpdate: vi.fn(async () => {}),

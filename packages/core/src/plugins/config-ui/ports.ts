@@ -19,9 +19,7 @@ export interface ConfigInteraction {
     getBoolean(name: string): boolean | null;
     getInteger(name: string): number | null;
   };
-  reply(view: CardView & { flags?: number | bigint }): Promise<void>;
-  editReply(view: string): Promise<void>;
-  deferReply(view: { flags?: number | bigint }): Promise<void>;
+  reply(view: string | (CardView & { flags?: number | bigint })): Promise<void>;
 }
 
 /** Built-in UI operations only. Session records and runtime ownership stay in the kernel. */

@@ -18,6 +18,7 @@ import { presetUiFixture } from "./plugin-presets-fixture.js";
  */
 import { describe, it, expect } from "vitest";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
+import { acknowledgeComponentInteraction } from "../packages/core/src/platforms/discord/interaction-response.js";
 
 const silent = {
   debug: () => {},
@@ -29,7 +30,9 @@ const silent = {
 /** The originating list interaction; `editReply` is deliberately slow. */
 function makeListInteraction(events: string[]) {
   const paints: Array<Record<string, unknown>> = [];
+  let opened = false;
   const interaction = {
+    deferred: true, ephemeral: true,
     user: { id: "u1" },
     reply: async () => {
       events.push("list:reply");
@@ -40,13 +43,13 @@ function makeListInteraction(events: string[]) {
     editReply: async (payload: Record<string, unknown>) => {
       // Logged at entry: the gate is invocation order, so a freeze that merely
       // *starts* before the ack must fail even though it resolves later.
-      events.push("list:freeze-invoked");
+      if (opened) events.push("list:freeze-invoked");
       await new Promise((resolve) => setTimeout(resolve, 20));
-      events.push("list:freeze-painted");
+      if (opened) events.push("list:freeze-painted");
       paints.push(payload);
     },
   };
-  return { interaction, paints };
+  return { interaction, paints, opened: () => { opened = true; } };
 }
 
 /**
@@ -64,6 +67,7 @@ function makeEditButton(customId: string, events: string[], ackGate?: Promise<vo
     channel: { isThread: () => true, parentId: "chan-1" },
     deferred: false,
     replied: false,
+    ephemeral: true,
     deferReply: async () => {
       if (button.deferred || button.replied) throw new Error("InteractionAlreadyReplied");
       // Logged at entry: the gate is invocation order.
@@ -141,7 +145,7 @@ const presetRow = {
 async function runPresetListEdit(clicks: number, opts: RunOpts = {}) {
   const { ackGate, releaseAck } = opts;
   const events: string[] = [];
-  const { interaction, paints } = makeListInteraction(events);
+  const { interaction, paints, opened } = makeListInteraction(events);
   const self = {
     logger: silent,
     config: { channelPresets: new Map() },
@@ -164,11 +168,15 @@ async function runPresetListEdit(clicks: number, opts: RunOpts = {}) {
   const fixture = presetUiFixture(self);
   fixture.ui.cmdPresetBuilder = self.cmdPresetBuilder;
   await fixture.ui.cmdPresetList(fixture.interaction(interaction));
+  opened();
 
   const card = [...fixture.ui.cards.states.values()][0]!;
   const controller = await (fixture.ui.cards as any).controllers.get(card.id);
   const collector = { get stopped() { return controller.lifecycle.reason; },
-    click: (native: unknown) => fixture.ui.cards.handle(fixture.interaction(native) as any) };
+    click: async (native: unknown) => {
+      await acknowledgeComponentInteraction(native as never, "ephemeral");
+      return fixture.ui.cards.handle(fixture.interaction(native) as any);
+    } };
   const delivered = await fireClicks(collector, clicks, (e) =>
     makeEditButton(`pr:edit:${presetRow.id}:${card.id}`, e, ackGate),
     events,
@@ -254,12 +262,10 @@ describe("concurrent Edit clicks while the ACK is still unresolved", () => {
       const { events, delivered, collector } = await surface.run(2, { ackGate, releaseAck });
 
       expect(events.filter((e) => e.startsWith("editor:opened"))).toHaveLength(1);
-      // The second click was refused at dispatch: the settle stopped the
-      // card before the first handler ever awaited its ack.
+      // Both clicks are acknowledged; only one can claim the transition.
       expect(delivered).toEqual([true, false]);
       expect(collector.stopped).toBe("edit");
-      // Exactly one ack was even attempted.
-      expect(events.filter((e) => e === "button:ack-invoked")).toHaveLength(1);
+      expect(events.filter((e) => e === "button:ack-invoked")).toHaveLength(2);
     });
 
     it(`${surface.name}: the ack is invoked before the freeze repaint is`, async () => {

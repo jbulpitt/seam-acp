@@ -74,7 +74,7 @@ export function createServiceStatusPlugin(transport: ServiceStatusCardTransport)
     dispose: async () => { stop(); await drain(); store?.close(); view = undefined; },
     contributions: {
       mcp: serviceStatusMcp(() => ({ read: options => current().read(options), refresh })),
-      components: [{ namespace: "seam-service-status:", types: ["button"], lifetime: "persistent", access: "read-only", authorization: "user", handle: component }],
+      components: [{ namespace: "seam-service-status:", types: ["button"], lifetime: "persistent", access: "read-only", authorization: "user", acknowledgement: "ephemeral", handle: component }],
       jobs: [{ name: "poll", phase: "after-admission", intervalMs: SERVICE_STATUS_DEFAULTS.normalIntervalMs,
         start: async ({ signal }) => {
           signal.addEventListener("abort", stop, { once: true });

@@ -91,7 +91,6 @@ export class ActionCardManager {
     if (!row || row.channel.id !== evt.channel.id || row.messageId !== evt.messageId) {
       await this.stale(evt, "This permission request is no longer available."); return;
     }
-    await evt.deferUpdate();
     await this.reconcilePermission(row);
     const current = this.deps.store.getPermission(row.id)!;
     if (current.status !== "open") {
@@ -111,7 +110,6 @@ export class ActionCardManager {
       await this.stale(evt, "This config proposal is no longer available."); return;
     }
     if (action !== "apply" && action !== "reject") { await evt.replyEphemeral("Unknown config proposal action."); return; }
-    await evt.deferUpdate();
     const decided = this.deps.store.decideProposal(row.id, action === "apply" ? "applied" : "rejected",
       `Rejected by ${evt.userName}.`, Date.now(), action === "apply" ? record => this.deps.apply(record, { id: evt.userId, name: evt.userName }) : undefined);
     const current = decided ?? this.deps.store.getProposal(row.id)!;

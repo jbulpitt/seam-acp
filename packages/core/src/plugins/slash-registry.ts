@@ -4,6 +4,8 @@ import type { AutocompleteContext, AutocompleteResponder, AutocompleteRoundTripP
 import { projectRoundTripChoices } from "../platforms/discord/autocomplete.js";
 import type { PluginContext } from "./types.js";
 import type { BrowserReply } from "../core/session-browser.js";
+import type { InteractionResponseMode } from "../platforms/interaction-response.js";
+import { runAcknowledged } from "../platforms/interaction-response.js";
 
 export interface SlashAccess {
   kind: "read-only" | "mutating";
@@ -19,10 +21,11 @@ export interface SlashInvocation {
   actor: Readonly<{ id: string; name: string }>;
   string(name: string): string | null;
   boolean(name: string): boolean | null;
-  reply(text: string): Promise<void>;
-  defer(): Promise<void>;
-  edit(text: string): Promise<void>;
-  view(view: { embeds: unknown[]; components?: unknown[] }): Promise<void>;
+  reply(view: string | { content?: string; embeds?: unknown[]; components?: unknown[] }): Promise<void>;
+}
+
+export interface SlashDispatchInvocation extends SlashInvocation {
+  acknowledge(mode: InteractionResponseMode): Promise<void>;
 }
 
 export interface SlashContribution {
@@ -31,6 +34,7 @@ export interface SlashContribution {
   leaf: APIApplicationCommandSubcommandOption;
   access: SlashAccess | ((option: (name: string) => string | null | undefined) => SlashAccess);
   authorization: "user" | "config-admin";
+  acknowledgement: InteractionResponseMode;
   help: string;
   autocomplete?: readonly { option: string; policy: AutocompleteRoundTripPolicy; respond: AutocompleteResponder }[];
   handle(invocation: SlashInvocation, context: PluginContext): Promise<void>;
@@ -142,10 +146,13 @@ export class SlashRegistry {
       }
     };
   }
-  async dispatch(command: string, group: string | null, leaf: string, invocation: SlashInvocation): Promise<boolean> {
+  async dispatch(command: string, group: string | null, leaf: string, invocation: SlashDispatchInvocation): Promise<boolean> {
     const entry = this.entries.get(slashPath(command, group, leaf));
     if (!entry) return false;
-    try { await entry.contribution.handle(invocation, entry.context); }
+    try {
+      await runAcknowledged(invocation.acknowledge(entry.contribution.acknowledgement),
+        () => entry.contribution.handle(invocation, entry.context));
+    }
     catch (err) {
       this.logger.error({ err, plugin: entry.plugin, path: slashPath(command, group, leaf) }, "plugin slash handler failed");
       throw err;

@@ -16,6 +16,10 @@ import { DEFAULT_THREAD_NAMER_CONFIG } from "../packages/core/src/platforms/disc
 import { buildSeamCommand, buildSeamAdminCommand, buildSlashRegistrationBody } from "../packages/core/src/platforms/discord/commands.js";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
+import { DiscordAdapter } from "../packages/core/src/platforms/discord/adapter.js";
+import { discordComponentInteractions } from "../packages/core/src/platforms/discord/component-interactions.js";
+import { acknowledgeComponentInteraction } from "../packages/core/src/platforms/discord/interaction-response.js";
+import type { ComponentAcknowledgement } from "../packages/core/src/platforms/interaction-response.js";
 
 const logger = pino({ level: "silent" });
 export const NAMING_PARENT = "100000000000000001";
@@ -52,9 +56,10 @@ export async function namingFixture(options: { admins?: Set<string>; locked?: bo
   const names = new Map<string, string>();
   const events: string[] = [];
   let componentHandler: ((event: never) => Promise<void>) | undefined;
+  let componentAcknowledgement!: ComponentAcknowledgement;
   const renameThread = vi.fn(async (channel: { id: string }, name: string) => { events.push("rename"); names.set(channel.id, name); });
   const host = new PluginHost(logger, { storageRoot: directory, slash: [buildSeamCommand().toJSON(), buildSeamAdminCommand().toJSON()] });
-  const adapter = { onMessage: () => {}, onComponent: (handler: typeof componentHandler) => { componentHandler = handler; }, getThreadName: async (channel: { id: string }) => names.get(channel.id) ?? null, getThreadLiveState: async (channel: { id: string }) => names.has(channel.id) ? ({ locked: false, archived: false }) : undefined, renameThread };
+  const adapter = { onMessage: () => {}, onComponent: (handler: typeof componentHandler, mode: ComponentAcknowledgement) => { componentHandler = handler; componentAcknowledgement = mode; }, getThreadName: async (channel: { id: string }) => names.get(channel.id) ?? null, getThreadLiveState: async (channel: { id: string }) => names.has(channel.id) ? ({ locked: false, archived: false }) : undefined, renameThread };
   const orchestrator = new Orchestrator({ logger, config, router, store, modelCatalog, plugins: host, adapter: adapter as never, renderer: {} as never });
   await orchestrator.loadPlugins();
   orchestrator.install();
@@ -65,13 +70,25 @@ export async function namingFixture(options: { admins?: Set<string>; locked?: bo
     return store.get(record.id)!;
   };
   const slash = async (sub = "rename", values: Record<string, string | boolean> = {}, userId = "admin") => {
+    let native: any;
     const reply = vi.fn(async () => { events.push("reply"); });
-    const deferReply = vi.fn(async () => { events.push("defer"); });
-    const editReply = vi.fn(async () => { events.push("edit"); });
-    await orchestrator.handleSlashInteraction({ commandName: "seamadmin", channelId: "thread", channel: { isThread: () => true, parentId: NAMING_PARENT },
-      user: { id: userId, username: userId, displayName: userId }, options: { getSubcommand: () => sub, getSubcommandGroup: () => "naming", getString: (name: string) => typeof values[name] === "string" ? values[name] : null, getBoolean: (name: string) => typeof values[name] === "boolean" ? values[name] : null }, reply, deferReply, editReply } as never);
+    const deferReply = vi.fn(async () => { native.deferred = true; events.push("defer"); });
+    const editReply = vi.fn(async () => { native.replied = true; events.push("edit"); });
+    native = { deferred: false, replied: false, ephemeral: true, commandName: "seamadmin", channelId: "thread", channel: { isThread: () => true, parentId: NAMING_PARENT },
+      user: { id: userId, username: userId, displayName: userId }, options: { getSubcommand: () => sub, getSubcommandGroup: () => "naming", getString: (name: string) => typeof values[name] === "string" ? values[name] : null, getBoolean: (name: string) => typeof values[name] === "boolean" ? values[name] : null }, reply, deferReply, editReply };
+    await orchestrator.handleSlashInteraction(native);
     return { reply, deferReply, editReply };
   };
   const close = async () => { await orchestrator.flushIdentityEffects(); await host.dispose(); if (!options.store) store.close(); if (!options.directory) fs.rmSync(directory, { recursive: true, force: true }); };
-  return { host, orchestrator, store, router, config, names, renameThread, events, create, slash, close, directory, component: (event: unknown) => componentHandler!(event as never) };
+  return { host, orchestrator, store, router, config, names, renameThread, events, create, slash, close, directory,
+    component: async (event: unknown) => {
+      const native = discordComponentInteractions.get(event as never);
+      if (native) await acknowledgeComponentInteraction(native, componentAcknowledgement);
+      await componentHandler!(event as never);
+    },
+    nativeComponent: (native: unknown) => {
+      const discord = Object.assign(Object.create(DiscordAdapter.prototype), { logger, componentHandler, componentAcknowledgement });
+      return discord.handlePersistentComponent(native);
+    },
+  };
 }

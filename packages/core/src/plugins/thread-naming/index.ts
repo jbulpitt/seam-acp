@@ -64,27 +64,27 @@ export function createThreadNamingPlugin(ports: ThreadNamingPorts): Plugin {
     const options = { migrateLegacy: invocation.boolean("migrate-legacy") ?? false, roleName: invocation.boolean("role-name") ?? false };
     if (invocation.string("scope") === "channel") {
       if (!record.parentRef) return invocation.reply("This thread has no parent channel.");
-      await invocation.defer();
+
       const results = await namer.recompactChannel(record.platform, record.parentRef, options);
       const count = (status: string) => results.filter(result => result.status === status).length;
-      await invocation.edit(`Recomputed ${results.length} channel thread(s): ${count("rebuilt")} rebuilt, ${count("renamed")} renamed, ${count("unchanged")} unchanged, ${count("unmanaged") + count("roleless") + count("opted_out")} left untouched, ${count("gone")} gone, ${count("failed")} failed.`);
+      await invocation.reply(`Recomputed ${results.length} channel thread(s): ${count("rebuilt")} rebuilt, ${count("renamed")} renamed, ${count("unchanged")} unchanged, ${count("unmanaged") + count("roleless") + count("opted_out")} left untouched, ${count("gone")} gone, ${count("failed")} failed.`);
       return;
     }
-    await invocation.defer();
+
     const result = await namer.applyThreadName(record, options);
-    await invocation.edit(renameDetail(result));
+    await invocation.reply(renameDetail(result));
   };
   const slash: SlashContribution[] = [
     { command: "seamadmin", group,
-      leaf: { type: ApplicationCommandOptionType.Subcommand, name: "rename", description: "Refresh/migrate names", options: [
+      acknowledgement: "ephemeral", leaf: { type: ApplicationCommandOptionType.Subcommand, name: "rename", description: "Refresh/migrate names", options: [
         { type: ApplicationCommandOptionType.String, name: "scope", description: "Rename scope", choices: [{ name: "thread", value: "thread" }, { name: "channel", value: "channel" }] },
         { type: ApplicationCommandOptionType.Boolean, name: "migrate-legacy", description: "Migrate legacy prefix" },
         { type: ApplicationCommandOptionType.Boolean, name: "role-name", description: "Use role as base" },
       ] }, access: { kind: "mutating" }, authorization: "config-admin", help: "`/seamadmin naming rename [scope] [migrate-legacy] [role-name]` — rebuild thread names", handle: rename },
     { command: "seamadmin", group,
-      leaf: { type: ApplicationCommandOptionType.Subcommand, name: "namer", description: "Edit naming rules" },
+      acknowledgement: "ephemeral", leaf: { type: ApplicationCommandOptionType.Subcommand, name: "namer", description: "Edit naming rules" },
       access: { kind: "mutating" }, authorization: "config-admin", help: "`/seamadmin naming namer` — edit the agent/model/role symbol tables",
-      handle: async invocation => invocation.view(render(invocation.actor.id, Date.now() + EDIT_TTL)) },
+      handle: async invocation => invocation.reply(render(invocation.actor.id, Date.now() + EDIT_TTL)) },
   ];
   const component = async (invocation: ComponentEvent) => {
     const [, action, owner, encodedDeadline] = invocation.customId.split(":");
@@ -127,7 +127,8 @@ export function createThreadNamingPlugin(ports: ThreadNamingPorts): Plugin {
           return { content: [{ type: "text", text: `Renamed this thread to ${name.slice(0, 100)}.` }] };
         },
       }],
-      components: [{ namespace, types: ["button", "modal"], lifetime: "persistent", access: "mutating", authorization: "config-admin", handle: component }],
+      components: [{ namespace, types: ["button", "modal"], lifetime: "persistent", access: "mutating", authorization: "config-admin",
+        acknowledgement: evt => evt.kind === "button" && evt.customId.startsWith(`${namespace}edit:`) ? "modal" : "ephemeral", handle: component }],
       identity: [
         { event: "thread-created", handle: async event => onIdentity(event.thread, true) },
         { event: "identity-changed", handle: async event => {

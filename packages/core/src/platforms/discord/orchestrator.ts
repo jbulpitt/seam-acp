@@ -1078,6 +1078,9 @@ export class Orchestrator {
   private readonly adoptingRemoteResults = new Set<string>();
   private readonly remoteAdoptionFinishers = new Map<string, () => void>();
   private remoteRecoveryReconciliation?: Promise<void>;
+  private readonly remoteRecoveryLogFailures = new Map<string, {
+    cause: string; err: unknown; sinceMs: number; lastLoggedMs: number;
+  }>();
   private readonly adoptedStatusPanels = new Map<string, DispatchStatusPanel<MessageRef>>();
   private readonly sharedSessionAttempts = new Set<string>();
   private readonly remoteAdoptionWaiters = new Map<string, () => void>();
@@ -15875,8 +15878,25 @@ export class Orchestrator {
               this.logger.warn({ err, attempt: attempt.id }, "bridge recovery rebind deferred"));
           }
         }
+        const failure = this.remoteRecoveryLogFailures.get(location);
+        if (failure) {
+          this.remoteRecoveryLogFailures.delete(location);
+          this.logger.info({ err: failure.err, location, unavailableMs: Date.now() - failure.sinceMs },
+            "bridge recovery reconciliation recovered");
+        }
       } catch (err) {
-        this.logger.warn({ err, location }, "bridge recovery state unavailable; waiting for reconnect");
+        const now = Date.now();
+        const cause = String(err);
+        const failure = this.remoteRecoveryLogFailures.get(location);
+        // Only logs are throttled; reconciliation still runs on every tick.
+        if (!failure || failure.cause !== cause || now - failure.lastLoggedMs >= 60_000) {
+          this.remoteRecoveryLogFailures.set(location, {
+            cause, err, sinceMs: failure?.sinceMs ?? now, lastLoggedMs: now,
+          });
+          this.logger.warn({ err, location }, "bridge recovery state unavailable; waiting for reconnect");
+        } else {
+          failure.err = err;
+        }
       }
     }));
   }

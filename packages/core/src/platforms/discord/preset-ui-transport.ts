@@ -2,6 +2,7 @@ import type { ChatInputCommandInteraction, MessageComponentInteraction, ModalSub
 import type { ChannelRef } from "../chat-adapter.js";
 import type { PresetInteraction, PresetClick } from "../../plugins/presets/ports.js";
 import { browserReplyFromInteraction } from "./browser-reply.js";
+import { replyToInteraction } from "./interaction-response.js";
 
 type Interaction = ChatInputCommandInteraction | MessageComponentInteraction | ModalSubmitInteraction;
 /** Wrap native interactions without exposing their client or channel objects. */
@@ -18,9 +19,7 @@ export function presetUiInteraction<T extends Interaction>(i: T, deps: {
     options: { getString: ((name: string, required?: boolean) => (i as ChatInputCommandInteraction).options.getString(name, required)) as PresetInteraction["options"]["getString"],
       getBoolean: name => (i as ChatInputCommandInteraction).options.getBoolean(name), getInteger: name => (i as ChatInputCommandInteraction).options.getInteger(name),
     },
-    reply: async view => { await i.reply(view as InteractionReplyOptions); },
-    editReply: async view => { await i.editReply(view as InteractionEditReplyOptions); },
-    deferReply: async view => { await i.deferReply(view as Parameters<typeof i.deferReply>[0]); },
+    reply: view => replyToInteraction(i, view as InteractionReplyOptions),
     fetchReply: async () => ({ id: (await i.fetchReply()).id }),
   };
   if (!("customId" in i)) return common as never;
@@ -31,6 +30,8 @@ export function presetUiInteraction<T extends Interaction>(i: T, deps: {
     fields: { getTextInputValue: name => (i as ModalSubmitInteraction).fields.getTextInputValue(name) },
     isButton: () => i.isButton(), isStringSelectMenu: () => i.isStringSelectMenu(), isModalSubmit: () => i.isModalSubmit(),
     mutationRefusal: () => deps.mutationRefusal(i),
+    editReply: view => replyToInteraction(i, view as InteractionReplyOptions),
+    deferReply: async view => { await i.deferReply(view as Parameters<typeof i.deferReply>[0]); },
     deferUpdate: async () => { await i.deferUpdate(); },
     update: async view => { await (i as MessageComponentInteraction).update(view as InteractionUpdateOptions); },
     showModal: async view => { await (i as MessageComponentInteraction).showModal(view); },

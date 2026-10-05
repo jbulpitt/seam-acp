@@ -260,7 +260,7 @@ export class ScheduleUi {
   async cmdScheduleAdd(i: ScheduleInteraction, existing?: ScheduledPrompt): Promise<void> {
     const channel = i.channelRef;
     if (!channel) {
-      await i.respondInitial( { content: "Use `/seamadmin schedule add` inside a thread." });
+      await i.reply( { content: "Use `/seamadmin schedule add` inside a thread." });
       return;
     }
     const { agent: inheritedAgent, registered: profile, model: sessionModel, cwd: inheritedCwd, models } = this.ports.builderDefaults(channel);
@@ -350,7 +350,7 @@ export class ScheduleUi {
       return { embeds: [embed], components: rows };
     };
 
-    await i.respondInitial( render());
+    await i.reply( render());
     const msg = await i.fetchReply();
     const collector = msg.createMessageComponentCollector({
       filter: (c) => c.user.id === i.user.id,
@@ -389,7 +389,7 @@ export class ScheduleUi {
               } else {
                 state.cron = cron;
                 await sub.deferUpdate();
-                await i.editReply(render());
+                await i.reply(render());
               }
             }
           } else {
@@ -447,7 +447,7 @@ export class ScheduleUi {
               } else state.target = null;
             }
             await sub.deferUpdate();
-            await i.editReply(render());
+            await i.reply(render());
             if (errors.length) await sub.followUp({ content: `⚠️ ${errors.join("; ")}`, flags: MessageFlags.Ephemeral });
           }
         } else if (c.isButton() && c.customId === "sched:cancel") {
@@ -536,7 +536,7 @@ export function createScheduleUiPlugin(ports: ScheduleUiPorts): Plugin {
   const group = { name: "schedule", description: "Recurring scheduled prompts for this thread" };
   const slash: SlashContribution[] = SCHEDULE_LEAVES.map(({ name, description, handle, id }) => ({
     command: "seamadmin", group,
-    leaf: { type: Option.Subcommand, name, description, ...(id ? { options: [
+    acknowledgement: "ephemeral", leaf: { type: Option.Subcommand, name, description, ...(id ? { options: [
       { type: Option.String, name: "id", description: name === "remove" ? "Schedule id (see /seamadmin schedule list)" : "Schedule id", required: true, autocomplete: true },
     ] } : {}) },
     access: { kind: name === "list" ? "read-only" : "mutating" }, authorization: "user",

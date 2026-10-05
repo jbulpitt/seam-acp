@@ -37,7 +37,7 @@ export function createCardVisualsPlugin(port: CardVisualsPort): Plugin {
     const choices = kind === "card" ? ["full", "simple"] : ["on", "off"];
     return {
       command: "seam", group,
-      leaf: { type: Option.Subcommand, name: kind, description: kind === "card" ? "Get or set the status-card layout (full or simple)" : "Random GIF thumbnail on the simple status card (on or off)",
+      acknowledgement: "ephemeral", leaf: { type: Option.Subcommand, name: kind, description: kind === "card" ? "Get or set the status-card layout (full or simple)" : "Random GIF thumbnail on the simple status card (on or off)",
         options: [{ type: Option.String, name: option, description: kind === "card" ? "full (default) | simple (compact, brand icon)" : "on | off", choices: choices.map(value => ({ name: value, value })) }, scopeOption] },
       access: get => ({ kind: get(option) != null ? "mutating" : "read-only" }), authorization: "user",
       help: `/seam config ${kind} [${option}] [scope] — ${CARD_VISUAL_KEYS.find(entry => entry.key === key)!.description}`,

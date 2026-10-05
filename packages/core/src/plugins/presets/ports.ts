@@ -24,12 +24,12 @@ export interface PresetInteraction {
     getBoolean(name: string): boolean | null;
     getInteger(name: string): number | null;
   };
-  reply(view: Reply): Promise<void>;
-  editReply(view: CardView | string): Promise<void>;
-  deferReply(view: { flags?: number | bigint }): Promise<void>;
+  reply(view: Reply | string): Promise<void>;
   fetchReply(): Promise<{ id: string }>;
 }
 export interface PresetClick extends PresetInteraction {
+  editReply(view: CardView | string): Promise<void>;
+  deferReply(view: { flags?: number | bigint }): Promise<void>;
   customId: string;
   values: string[];
   isButton(): boolean;

@@ -35,7 +35,7 @@ describe("quota built-in", () => {
     expect(row).toMatchObject({ agentId: "grok", noSubscription: true });
     expect(Object.keys(row).sort()).toEqual(["agentId", "credits", "displayName", "fetchedAt", "noSubscription", "ok", "plan", "rolling", "weekly"]);
     const edits: string[] = [];
-    await f.host.slash.dispatch("seam", "info", "usage", { ...invocation, actor: { id: "user", name: "User" }, string: () => null, boolean: () => null, reply: async () => {}, defer: async () => {}, edit: async text => { edits.push(text); }, view: async () => {} });
+    await f.host.slash.dispatch("seam", "info", "usage", { ...invocation, actor: { id: "user", name: "User" }, string: () => null, boolean: () => null, acknowledge: async () => {}, reply: async text => { edits.push(text); } });
     expect(edits[0]).toContain("**Grok usage**");
     const followups: string[] = [];
     await f.host.components.dispatch({ kind: "button", customId: "seam-quota:refresh", channel: { platform: "discord", id: "quota-thread" }, deferUpdate: async () => {}, followUpEphemeral: async text => { followups.push(text); } } as never);

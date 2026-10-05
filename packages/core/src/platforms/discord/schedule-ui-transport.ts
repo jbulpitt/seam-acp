@@ -2,6 +2,7 @@ import { MessageFlags, type Message, type ChatInputCommandInteraction, type Mess
 import type { ChannelRef } from "../chat-adapter.js";
 import type { CardLifecycle, CardView } from "./collector-lifecycle.js";
 import type { ScheduleInteraction, ScheduleClick, ScheduleCollector, ScheduleModal } from "../../plugins/schedule-ui/ports.js";
+import { replyToInteraction } from "./interaction-response.js";
 
 type Interaction = ChatInputCommandInteraction | MessageComponentInteraction;
 /** Wrap native interactions without exposing their client or channel objects. */
@@ -22,12 +23,7 @@ export function scheduleUiInteraction<T extends Interaction>(i: T, deps: {
     get deferred() { return native.deferred; },
     get replied() { return native.replied; },
     options: { getString: ((name: string, required?: boolean) => (native as ChatInputCommandInteraction).options.getString(name, required)) as ScheduleInteraction["options"]["getString"] },
-    reply: async view => { await native.reply(view as InteractionReplyOptions); },
-    editReply: async view => { await native.editReply(view as InteractionEditReplyOptions); },
-    respondInitial: async view => {
-      if (native.deferred || native.replied) await native.editReply(view as InteractionEditReplyOptions);
-      else await native.reply({ ...view, flags: MessageFlags.Ephemeral } as InteractionReplyOptions);
-    },
+    reply: view => replyToInteraction(native, view as InteractionReplyOptions),
     fetchReply: async () => {
       const message = await native.fetchReply();
       return { id: message.id, createMessageComponentCollector: options => {
@@ -55,6 +51,7 @@ export function scheduleUiInteraction<T extends Interaction>(i: T, deps: {
     values: click.isStringSelectMenu() ? [...click.values] : [],
     isButton: () => click.isButton(), isStringSelectMenu: () => click.isStringSelectMenu(),
     mutationRefusal: () => deps.mutationRefusal(click),
+    editReply: view => replyToInteraction(click, view as InteractionReplyOptions),
     deferUpdate: async () => { await click.deferUpdate(); },
     deferReply: async options => { await click.deferReply(options as Parameters<typeof click.deferReply>[0]); },
     update: async view => { await click.update(view as InteractionUpdateOptions); },

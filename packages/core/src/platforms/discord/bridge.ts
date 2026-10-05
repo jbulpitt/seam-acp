@@ -1,3 +1,4 @@
+import { replyToInteraction } from "./interaction-response.js";
 /**
  * `/seamadmin bridge` slash group (PR3 / #86). Pairing UX lives here so
  * orchestrator.ts only has a thin switch.
@@ -51,7 +52,7 @@ export async function handleBridgeSlash(
     case "remove":
       return cmdRemove(interaction, deps);
     default:
-      await interaction.reply({
+      await replyToInteraction(interaction, {
         content: `Unknown /seamadmin bridge subcommand: ${sub}`,
         flags: MessageFlags.Ephemeral,
       });
@@ -78,12 +79,12 @@ async function cmdAdd(
     actor: actorOf(i),
   });
   if (!result.ok) {
-    await i.reply({ content: result.error, flags: MessageFlags.Ephemeral });
+    await replyToInteraction(i, { content: result.error, flags: MessageFlags.Ephemeral });
     return;
   }
   const wsUrl = url ?? deps.publicWsUrl;
   const line = bootstrapLine(wsUrl, result.bridgeId, token);
-  await i.reply({
+  await replyToInteraction(i, {
     content:
       `Paired **${result.bridgeId}**. Token is shown once and is not stored in plaintext.\n\n` +
       `Mac one-liner (installs git/node if needed, clones, starts pm2 — paste the connect line when asked):\n` +
@@ -100,7 +101,7 @@ async function cmdRotate(
   const name = i.options.getString("name", true);
   const bridgeId = resolveBridgeId(deps, name);
   if (!bridgeId) {
-    await i.reply({ content: `No paired bridge named "${name}".`, flags: MessageFlags.Ephemeral });
+    await replyToInteraction(i, { content: `No paired bridge named "${name}".`, flags: MessageFlags.Ephemeral });
     return;
   }
   const token = mintBridgeToken();
@@ -110,13 +111,13 @@ async function cmdRotate(
     actor: actorOf(i),
   });
   if (!result.ok) {
-    await i.reply({ content: result.error, flags: MessageFlags.Ephemeral });
+    await replyToInteraction(i, { content: result.error, flags: MessageFlags.Ephemeral });
     return;
   }
   const host = deps.config.bridgePresets.get(bridgeId);
   const wsUrl = host?.url ?? deps.publicWsUrl;
   const line = bootstrapLine(wsUrl, bridgeId, token);
-  await i.reply({
+  await replyToInteraction(i, {
     content:
       `Rotated token for **${bridgeId}**. Re-bootstrap the host. Mac (skip clone/build, paste this when asked):\n` +
       `\`\`\`\ncurl -fsSL https://raw.githubusercontent.com/jbulpitt/seam-acp/main/scripts/install-macos-bridge.sh | bash -s -- --skip-deps\n\`\`\`\n` +
@@ -132,7 +133,7 @@ async function cmdConfigure(
   const name = i.options.getString("name", true);
   const bridgeId = resolveBridgeId(deps, name);
   if (!bridgeId) {
-    await i.reply({ content: `No paired bridge named "${name}".`, flags: MessageFlags.Ephemeral });
+    await replyToInteraction(i, { content: `No paired bridge named "${name}".`, flags: MessageFlags.Ephemeral });
     return;
   }
   const workspaceRoot = i.options.getString("workspace-root", true).trim();
@@ -142,10 +143,10 @@ async function cmdConfigure(
     actor: actorOf(i),
   });
   if (!result.ok) {
-    await i.reply({ content: result.error, flags: MessageFlags.Ephemeral });
+    await replyToInteraction(i, { content: result.error, flags: MessageFlags.Ephemeral });
     return;
   }
-  await i.reply({
+  await replyToInteraction(i, {
     content:
       `Configured **${bridgeId}** workspace fallback to \`${workspaceRoot}\`. ` +
       "A connected bridge's reported workspace still takes precedence.",
@@ -159,7 +160,7 @@ async function cmdList(
 ): Promise<void> {
   const paired = [...deps.config.bridgePresets.values()];
   if (paired.length === 0) {
-    await i.reply({
+    await replyToInteraction(i, {
       content: "No bridges paired. Use `/seamadmin bridge add` (admin).",
       flags: MessageFlags.Ephemeral,
     });
@@ -174,7 +175,7 @@ async function cmdList(
       : "offline";
     return `${emoji} **${short}** \`${b.id}\` — ${conn}`;
   });
-  await i.reply({ content: lines.join("\n"), flags: MessageFlags.Ephemeral });
+  await replyToInteraction(i, { content: lines.join("\n"), flags: MessageFlags.Ephemeral });
 }
 
 async function cmdRemove(
@@ -184,15 +185,15 @@ async function cmdRemove(
   const name = i.options.getString("name", true);
   const bridgeId = resolveBridgeId(deps, name);
   if (!bridgeId) {
-    await i.reply({ content: `No paired bridge named "${name}".`, flags: MessageFlags.Ephemeral });
+    await replyToInteraction(i, { content: `No paired bridge named "${name}".`, flags: MessageFlags.Ephemeral });
     return;
   }
   const result = deps.mutation.applyBridgeRemove({ bridgeId, actor: actorOf(i) });
   if (!result.ok) {
-    await i.reply({ content: result.error, flags: MessageFlags.Ephemeral });
+    await replyToInteraction(i, { content: result.error, flags: MessageFlags.Ephemeral });
     return;
   }
-  await i.reply({
+  await replyToInteraction(i, {
     content: `Unpaired **${bridgeId}**.`,
     flags: MessageFlags.Ephemeral,
   });

@@ -70,7 +70,7 @@ export function sessionBrowserPlugin(ports: SessionBrowserFacade): Plugin {
     contributions: {
       slash: [{
         command: "seam", group: { name: "info", description: "Bot & account info" },
-        leaf: { type: ApplicationCommandOptionType.Subcommand, name: "sessions", description: "List recent sessions" },
+        acknowledgement: "ephemeral", leaf: { type: ApplicationCommandOptionType.Subcommand, name: "sessions", description: "List recent sessions" },
         access: { kind: "read-only" }, authorization: "user", help: "`/seam info sessions` — browse & manage backend sessions.",
         handle: async invocation => {
           const opened = await ports.open(invocation);

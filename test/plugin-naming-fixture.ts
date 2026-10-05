@@ -65,11 +65,13 @@ export async function namingFixture(options: { admins?: Set<string>; locked?: bo
     return store.get(record.id)!;
   };
   const slash = async (sub = "rename", values: Record<string, string | boolean> = {}, userId = "admin") => {
+    let native: any;
     const reply = vi.fn(async () => { events.push("reply"); });
-    const deferReply = vi.fn(async () => { events.push("defer"); });
-    const editReply = vi.fn(async () => { events.push("edit"); });
-    await orchestrator.handleSlashInteraction({ commandName: "seamadmin", channelId: "thread", channel: { isThread: () => true, parentId: NAMING_PARENT },
-      user: { id: userId, username: userId, displayName: userId }, options: { getSubcommand: () => sub, getSubcommandGroup: () => "naming", getString: (name: string) => typeof values[name] === "string" ? values[name] : null, getBoolean: (name: string) => typeof values[name] === "boolean" ? values[name] : null }, reply, deferReply, editReply } as never);
+    const deferReply = vi.fn(async () => { native.deferred = true; events.push("defer"); });
+    const editReply = vi.fn(async () => { native.replied = true; events.push("edit"); });
+    native = { deferred: false, replied: false, commandName: "seamadmin", channelId: "thread", channel: { isThread: () => true, parentId: NAMING_PARENT },
+      user: { id: userId, username: userId, displayName: userId }, options: { getSubcommand: () => sub, getSubcommandGroup: () => "naming", getString: (name: string) => typeof values[name] === "string" ? values[name] : null, getBoolean: (name: string) => typeof values[name] === "boolean" ? values[name] : null }, reply, deferReply, editReply };
+    await orchestrator.handleSlashInteraction(native);
     return { reply, deferReply, editReply };
   };
   const close = async () => { await orchestrator.flushIdentityEffects(); await host.dispose(); if (!options.store) store.close(); if (!options.directory) fs.rmSync(directory, { recursive: true, force: true }); };

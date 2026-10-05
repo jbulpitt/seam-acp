@@ -13,7 +13,7 @@ export function createConfigUiPlugin(ui: ConfigUi, lifecycle: { activate(): void
     }, dispose: () => lifecycle.dispose(),
     contributions: {
       slash: CONFIG_UI_LEAVES.map(leaf => ({
-        command: "seam", group: CONFIG_UI_GROUP, leaf: leaf.leaf, access: { kind: leaf.access }, authorization: "user", help: leaf.help,
+        command: "seam", group: CONFIG_UI_GROUP, acknowledgement: "ephemeral", leaf: leaf.leaf, access: { kind: leaf.access }, authorization: "user", help: leaf.help,
         ...(leaf.name === "set" ? { autocomplete: ui.ports.autocomplete } : {}),
         handle: async invocation => { await ui[leaf.method](ui.ports.interaction(invocation)); },
       })),

@@ -1,3 +1,4 @@
+import { replyToInteraction } from "./interaction-response.js";
 import {
   Client,
   GatewayIntentBits,
@@ -1630,7 +1631,7 @@ export class DiscordAdapter implements ChatAdapter {
   ): Promise<Array<{ authorIsBot: boolean; text: string; authorName?: string }>> {
     const ch = await this.fetchSendableChannel(channel.id);
     if (!ch.isThread()) throw new Error("Channel is not a thread.");
-    
+
     const messages: Array<{ authorIsBot: boolean; text: string; authorName?: string }> = [];
     let lastId: string | undefined;
 
@@ -1662,10 +1663,10 @@ export class DiscordAdapter implements ChatAdapter {
           ...(this.isPersonAuthor(msg.author) ? { authorName: this.resolveAuthorName(msg) } : {}),
         });
       }
-      
+
       lastId = chunk.last()?.id;
     }
-    
+
     return messages.reverse();
   }
 
@@ -2515,7 +2516,7 @@ export class DiscordAdapter implements ChatAdapter {
     interaction: ChatInputCommandInteraction
   ): Promise<void> {
     if (!this.config.DISCORD_ALLOWED_USER_IDS.has(interaction.user.id)) {
-      await interaction.reply({
+      await replyToInteraction(interaction, {
         content: "This bot is not available to you.",
         flags: MessageFlags.Ephemeral,
       });
@@ -2525,13 +2526,9 @@ export class DiscordAdapter implements ChatAdapter {
       await this.slashHandler(interaction);
     } catch (err) {
       this.logger.error({ err }, "slash handler crashed");
-      const content = "That command failed unexpectedly. Please retry; if it repeats, check the bot logs.";
+      const content = `That command failed: ${err instanceof Error ? err.message : String(err)}`;
       try {
-        if (interaction.deferred || interaction.replied) {
-          await interaction.editReply({ content });
-        } else {
-          await interaction.reply({ content, flags: MessageFlags.Ephemeral });
-        }
+        await replyToInteraction(interaction, { content, flags: MessageFlags.Ephemeral });
       } catch (replyErr) {
         this.logger.warn({ err: replyErr }, "failed to report slash command error");
       }

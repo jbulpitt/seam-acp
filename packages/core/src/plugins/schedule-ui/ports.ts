@@ -25,13 +25,12 @@ export interface ScheduleInteraction {
   readonly deferred: boolean;
   readonly replied: boolean;
   options: { getString(name: string, required: true): string; getString(name: string): string | null };
-  reply(view: ScheduleReply): Promise<void>;
-  editReply(view: CardView | string): Promise<void>;
-  respondInitial(view: CardView): Promise<void>;
+  reply(view: ScheduleReply | string): Promise<void>;
   fetchReply(): Promise<{ id: string; createMessageComponentCollector(options: { filter(click: { user: { id: string } }): boolean; time: number }): ScheduleCollector }>;
   attachLifecycle(collector: ScheduleCollector, expired: (reason: string) => CardView): CardLifecycle;
 }
 export interface ScheduleClick extends ScheduleInteraction {
+  editReply(view: CardView | string): Promise<void>;
   customId: string;
   messageId: string;
   messageButtons: Array<{ customId: string; disabled: boolean }>;

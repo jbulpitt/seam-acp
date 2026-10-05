@@ -29,7 +29,7 @@ export function createPresetPlugin(ui: PresetUi): Plugin {
       slash: PRESET_COMMAND_GROUP.options!.map(leaf => {
         const name = leaf.name as keyof typeof methods;
         return {
-          command: "seam", group: { name: PRESET_COMMAND_GROUP.name, description: PRESET_COMMAND_GROUP.description }, leaf,
+          command: "seam", group: { name: PRESET_COMMAND_GROUP.name, description: PRESET_COMMAND_GROUP.description }, acknowledgement: "ephemeral", leaf,
           access: { kind: PRESET_ACCESS[name] }, authorization: "user", help: help[name],
           ...(["thread", "apply", "delete", "show", "edit"].includes(name) ? { autocomplete: [{
             option: name === "thread" ? "preset" : "name", policy: "canonical" as const,

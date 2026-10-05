@@ -10,7 +10,7 @@ import { buildSeamCommand, buildSeamAdminCommand } from "../packages/core/src/pl
 import type { BrowserClick, SessionBrowserFacade } from "../packages/core/src/core/session-browser.js";
 import type { SessionActions } from "../packages/core/src/core/session-actions.js";
 import type { ComponentEvent } from "../packages/core/src/platforms/chat-adapter.js";
-import type { SlashInvocation } from "../packages/core/src/plugins/slash-registry.js";
+import type { SlashDispatchInvocation } from "../packages/core/src/plugins/slash-registry.js";
 
 const cleanup: Array<() => Promise<void> | void> = [];
 afterEach(async () => { for (const run of cleanup.splice(0).reverse()) await run(); vi.useRealTimers(); });
@@ -48,7 +48,7 @@ function fixture() {
     return work;
   };
   const ports: SessionBrowserFacade = {
-    open: async invocation => { await invocation.defer(); return { actions, reply }; },
+    open: async () => ({ actions, reply }),
     resume: vi.fn(() => actions), reply: vi.fn(() => reply),
     collectParked: vi.fn(async () => 0), repoDisplay: cwd => cwd,
     track, runJob: work => { track(Promise.resolve().then(work)); },
@@ -69,7 +69,7 @@ function fixture() {
     return host;
   };
   const invocation = { threadId: "thread", parentId: "parent", actor: { id: "owner", name: "Owner" },
-    defer: vi.fn(async () => {}), reply: vi.fn(async () => {}) } as unknown as SlashInvocation;
+    acknowledge: vi.fn(async () => {}), reply: vi.fn(async () => {}) } as unknown as SlashDispatchInvocation;
   const event = (customId: string, kind: ComponentEvent["kind"] = "button", userId = "owner"): ComponentEvent => ({
     interactionId: "interaction", customId, userId, userName: "Owner", channel: { platform: "discord", id: "thread", parentId: "parent" },
     messageId: "message", kind, deferUpdate: vi.fn(async () => {}), replyEphemeral: vi.fn(async () => {}),

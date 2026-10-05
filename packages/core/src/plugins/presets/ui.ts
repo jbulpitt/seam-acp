@@ -149,7 +149,7 @@ export class PresetUi {
       card.target = i.cardReply.target; card.expires = Date.now() + 600_000;
       this.cards.checkpoint(card);
     }
-    return this.cards.bind(card, view => i.editReply(view), () =>
+    return this.cards.bind(card, view => i.reply(view), () =>
       expiredCardView("⏰ Preset list expired. Run `/seam preset list` again."), async (c, lifecycle) => {
       try {
         if (!c.isButton()) return;
@@ -483,8 +483,8 @@ export class PresetUi {
 
     if (!restored) {
       // Edit from a list already acknowledged the component.
-      if (!i.deferred && !i.replied) await i.deferReply({ flags: MessageFlags.Ephemeral });
-      await i.editReply(render());
+
+      await i.reply(render());
       await i.fetchReply();
       card.target = i.cardReply.target; card.expires = Date.now() + 600_000;
       this.cards.checkpoint(card);
@@ -495,7 +495,7 @@ export class PresetUi {
       this.cards.checkpoint(card);
       await c.showModal(modal.setCustomId(`${action}:${card.id}`));
     };
-    return this.cards.bind(card, view => i.editReply(view), () =>
+    return this.cards.bind(card, view => i.reply(view), () =>
       expiredCardView("⏰ Preset builder timed out — nothing was saved. Run the command again."), async (c, lifecycle) => {
       try {
         if (c.isModalSubmit() && c.customId === "preset:details-modal") {
@@ -512,7 +512,7 @@ export class PresetUi {
           const instrVal = c.fields.getTextInputValue("instr").trim();
           state.instructions = instrVal || null;
           await c.deferUpdate();
-          await i.editReply(render());
+          await i.reply(render());
           return;
         }
         if (c.isModalSubmit() && c.customId === "preset:naming-modal") {
@@ -525,7 +525,7 @@ export class PresetUi {
               ? null
               : state.disableThreadPrefix;
           await c.deferUpdate();
-          await i.editReply(render());
+          await i.reply(render());
           return;
         }
         if (c.isModalSubmit() && c.customId === "preset:tools-modal") {
@@ -534,14 +534,14 @@ export class PresetUi {
           state.toolsAllow = allow.length > 0 ? allow : null;
           state.toolsExclude = exclude.length > 0 ? exclude : null;
           await c.deferUpdate();
-          await i.editReply(render());
+          await i.reply(render());
           return;
         }
         if (c.isModalSubmit() && c.customId === "preset:instr-modal") {
           const val = c.fields.getTextInputValue("instr").trim();
           state.instructions = val || null;
           await c.deferUpdate();
-          await i.editReply(render());
+          await i.reply(render());
           return;
         }
         if (c.isStringSelectMenu() && c.customId === "preset:agent") {
@@ -581,7 +581,7 @@ export class PresetUi {
                   )?.effort.selectionDefault ?? null
                 : null;
             }
-            await i.editReply(render());
+            await i.reply(render());
             return;
           }
           const nextModel = v === "__default__" ? null : v;
@@ -619,7 +619,7 @@ export class PresetUi {
                 state.repoPath = picked;
               }
             }
-            await i.editReply(render());
+            await i.reply(render());
           } else {
             state.repoPath = v === "__default__" ? null : v;
             await c.update(render());
@@ -815,9 +815,9 @@ export class PresetUi {
       });
       return;
     }
-    await i.deferReply({ flags: MessageFlags.Ephemeral });
+
     const summary = await this.ports.apply(channel, preset);
-    await i.editReply(`✅ Applied preset **${preset.name}**.\n${summary}`);
+    await i.reply(`✅ Applied preset **${preset.name}**.\n${summary}`);
   }
 
   /**
@@ -873,10 +873,10 @@ export class PresetUi {
     // Discord requires an initial acknowledgement within three seconds. Auto-
     // naming may need to inspect many sibling threads, so acknowledge before
     // that I/O instead of letting large projects intermittently expire here.
-    await i.deferReply({ flags: MessageFlags.Ephemeral });
+
 
     if (quantity > 1 && !effectiveRole) {
-      await i.editReply("Multiple threads need a role so their prefixes can be enumerated.");
+      await i.reply("Multiple threads need a role so their prefixes can be enumerated.");
       return;
     }
 
@@ -891,14 +891,14 @@ export class PresetUi {
         created.push(thread);
       }
       if (created.length === 1 && quantity === 1) {
-        await i.editReply(
+        await i.reply(
           `🧵 Created <#${created[0]!.id}> from preset **${preset.name}**.\n${lastSummary}`
         );
         return;
       }
       const links = created.map((t) => `• <#${t.id}>`).join("\n");
       const header = `🧵 Created ${created.length} threads from preset **${preset.name}**:`;
-      await i.editReply(links ? `${header}\n${links}` : header);
+      await i.reply(links ? `${header}\n${links}` : header);
     } catch (err) {
       this.logger.warn({ err }, "/seam preset thread failed");
       try {
@@ -906,7 +906,7 @@ export class PresetUi {
         const prefix = created.length
           ? `Created ${created.length} of ${quantity} before failing: ${(err as Error).message}`
           : `Could not create the thread: ${(err as Error).message}`;
-        await i.editReply(links ? `${prefix}\n${links}` : prefix);
+        await i.reply(links ? `${prefix}\n${links}` : prefix);
       } catch {
         /* already replied */
       }

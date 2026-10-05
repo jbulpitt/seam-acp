@@ -1,5 +1,4 @@
 import { describe, expect, it, vi } from "vitest";
-import { MessageFlags } from "discord.js";
 import { validateSlashSpec } from "../packages/core/src/platforms/discord/synthetic-interaction.js";
 import type { IdentityEvent } from "../packages/core/src/plugins/identity-registry.js";
 import { NAMING_PARENT, namingCommands, namingFixture } from "./plugin-naming-fixture.js";
@@ -97,7 +96,7 @@ describe("thread naming contributions", () => {
   it("routes an old rule-editor custom id after the plugin host is recreated", async () => {
     const first = await namingFixture();
     const editor = await first.slash("namer");
-    const customId = editor.reply.mock.calls[0]![0].components[0].toJSON().components[0].custom_id;
+    const customId = editor.editReply.mock.calls[0]![0].components[0].toJSON().components[0].custom_id;
     await first.close();
     const next = await namingFixture();
     try {
@@ -133,8 +132,10 @@ describe("thread naming contributions", () => {
       await h.create(); await h.create("second"); await h.create("third");
       h.names.delete("second");
       const reply = vi.fn(async () => {});
-      await h.orchestrator.handleSlashInteraction({ commandName: "seam", channelId: "thread", channel: { isThread: () => true, parentId: NAMING_PARENT }, user: { id: "admin", username: "Admin" },
-        options: { getSubcommand: () => "role", getSubcommandGroup: () => "config", getString: (name: string) => name === "value" ? "analyst" : name === "scope" ? "channel" : null }, reply } as never);
+      const native = { deferred: false, replied: false, deferReply: async () => { native.deferred = true; }, editReply: reply,
+        commandName: "seam", channelId: "thread", channel: { isThread: () => true, parentId: NAMING_PARENT }, user: { id: "admin", username: "Admin" },
+        options: { getSubcommand: () => "role", getSubcommandGroup: () => "config", getString: (name: string) => name === "value" ? "analyst" : name === "scope" ? "channel" : null }, reply };
+      await h.orchestrator.handleSlashInteraction(native as never);
       expect(reply).toHaveBeenCalledWith(expect.objectContaining({ content: expect.stringContaining("Role set to `analyst`") }));
       expect(h.names.get("thread")).toBe("🧬🌞🔬1️⃣ my task");
       expect(h.names.get("third")).toBe("🧬🌞🔬2️⃣ my task");
@@ -146,10 +147,10 @@ describe("thread naming contributions", () => {
     try {
       const existing = h.host.slash.get("seamadmin", "naming", "rename")!;
       await h.host.loadBuiltins([{ id: "read-only", load: async () => ({ id: "read-only", apiVersion: 1, builtin: true, contributions: { slash: [{
-        command: "seamadmin", group: existing.group, leaf: { type: 1, name: "inspect", description: "Inspect naming" }, access: { kind: "read-only" }, authorization: "user", help: "Inspect naming", handle: async invocation => invocation.reply("read without mutation"),
+        command: "seamadmin", acknowledgement: "ephemeral", group: existing.group, leaf: { type: 1, name: "inspect", description: "Inspect naming" }, access: { kind: "read-only" }, authorization: "user", help: "Inspect naming", handle: async invocation => invocation.reply("read without mutation"),
       }] } }) }]);
       const result = await h.slash("inspect", {}, "other");
-      expect(result.reply).toHaveBeenCalledWith({ content: "read without mutation", flags: MessageFlags.Ephemeral });
+      expect(result.editReply).toHaveBeenCalledWith({ content: "read without mutation" });
     } finally { await h.close(); }
   });
 
@@ -158,8 +159,8 @@ describe("thread naming contributions", () => {
     try {
       await h.create(); h.renameThread.mockClear();
       const result = await h.slash("rename", { scope, "role-name": true }, "other");
-      expect(result.reply).toHaveBeenCalledWith({ content: "This command requires a config admin.", flags: MessageFlags.Ephemeral });
-      expect(result.deferReply).not.toHaveBeenCalled();
+      expect(result.editReply).toHaveBeenCalledWith({ content: "This command requires a config admin." });
+      expect(result.deferReply).toHaveBeenCalledOnce();
       expect(h.renameThread).not.toHaveBeenCalled();
     } finally { await h.close(); }
   });
@@ -169,8 +170,8 @@ describe("thread naming contributions", () => {
     try {
       await h.create(); h.renameThread.mockClear();
       const result = await h.slash("rename", { "role-name": true }, "other");
-      expect(result.reply).toHaveBeenCalledOnce();
-      expect(result.deferReply).not.toHaveBeenCalled();
+      expect(result.editReply).toHaveBeenCalledOnce();
+      expect(result.deferReply).toHaveBeenCalledOnce();
       expect(h.renameThread).not.toHaveBeenCalled();
     } finally { await h.close(); }
   });

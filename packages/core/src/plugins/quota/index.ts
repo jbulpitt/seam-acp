@@ -32,13 +32,13 @@ export function createQuotaPlugin(ports: QuotaPorts): Plugin {
   const stop = () => { ready = false; poller?.stop(); card?.stop(); };
   const drain = async () => { await Promise.all([poller?.drain(), card?.drain()]); };
   const usage = async (invocation: SlashInvocation) => {
-    await invocation.defer();
+
     const binding = ports.resolve(invocation.threadId, invocation.parentId);
-    if (!binding) return invocation.edit("Use inside a thread.");
-    if (binding.provider === "ollama-cloud" && !ollamaEnabled) return invocation.edit(parkedAgentMessage(binding.agentId, false, "session") ?? `\`/seam usage\` is not available for parked agent \`${binding.agentId}\`.`);
-    if (!binding.provider) return invocation.edit(`\`/seam usage\` is only available for the ${formatUsageAgentList(liveUsageAgentLabels(ports.bindings().map(binding => binding.agentId))) || "currently live"} agents. This thread uses \`${binding.agentId}\`.`);
-    try { await invocation.edit(formatUsage(await ports.usage.readUsage(binding))); }
-    catch (err) { await invocation.edit(`Couldn't fetch usage: ${err instanceof Error ? err.message : String(err)}`); }
+    if (!binding) return invocation.reply("Use inside a thread.");
+    if (binding.provider === "ollama-cloud" && !ollamaEnabled) return invocation.reply(parkedAgentMessage(binding.agentId, false, "session") ?? `\`/seam usage\` is not available for parked agent \`${binding.agentId}\`.`);
+    if (!binding.provider) return invocation.reply(`\`/seam usage\` is only available for the ${formatUsageAgentList(liveUsageAgentLabels(ports.bindings().map(binding => binding.agentId))) || "currently live"} agents. This thread uses \`${binding.agentId}\`.`);
+    try { await invocation.reply(formatUsage(await ports.usage.readUsage(binding))); }
+    catch (err) { await invocation.reply(`Couldn't fetch usage: ${err instanceof Error ? err.message : String(err)}`); }
   };
   const component = async (event: ComponentEvent) => {
     await event.deferUpdate();
@@ -71,7 +71,7 @@ export function createQuotaPlugin(ports: QuotaPorts): Plugin {
     dispose: async () => { stop(); await drain(); },
     contributions: {
       slash: [{ command: "seam", group: { name: "info", description: "Bot & account info" },
-        leaf: { type: ApplicationCommandOptionType.Subcommand, name: "usage", description: "Show usage / credits for this thread's agent (agy, claude, copilot, grok, codex)" },
+        acknowledgement: "ephemeral", leaf: { type: ApplicationCommandOptionType.Subcommand, name: "usage", description: "Show usage / credits for this thread's agent (agy, claude, copilot, grok, codex)" },
         access: { kind: "read-only" }, authorization: "user", help: "`/seam info usage` — show usage / credits for this thread's agent", handle: usage }],
       mcp: quotaMcp(registry),
       components: [{ namespace: "seam-quota:", types: ["button"], lifetime: "persistent", access: "read-only", authorization: "user", handle: component }],

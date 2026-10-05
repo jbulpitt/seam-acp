@@ -19,7 +19,7 @@ function fixture() {
   return { logger, logs, host: new PluginHost(logger, { slash: base, mcp: ["handoff"] }), base };
 }
 function leaf(name: string, command: "seam" | "seamadmin" = "seam"): SlashContribution {
-  return { command, leaf: { type: 1, name, description: "Test leaf" }, access: { kind: "read-only" }, authorization: "user", help: `/${command} ${name}`, handle: vi.fn(async () => {}) };
+  return { command, acknowledgement: "ephemeral", leaf: { type: 1, name, description: "Test leaf" }, access: { kind: "read-only" }, authorization: "user", help: `/${command} ${name}`, handle: vi.fn(async () => {}) };
 }
 function plugin(id: string, slash: SlashContribution[]): Plugin {
   return { id, apiVersion: 1, builtin: true, contributions: { slash } };
@@ -62,7 +62,7 @@ describe("plugin registry registration and dispatch", () => {
     const a = leaf("hello"); const b = leaf("hello", "seamadmin");
     b.handle = async () => { throw new Error("rename service unavailable"); };
     await h.host.loadBuiltins([{ id: "paths", load: async () => plugin("paths", [a, b]) }]);
-    const invocation = { threadId: "thread", actor: { id: "admin", name: "Admin" }, string: () => null, boolean: () => null, reply: vi.fn(), defer: vi.fn(), edit: vi.fn(), view: vi.fn() };
+    const invocation = { threadId: "thread", actor: { id: "admin", name: "Admin" }, string: () => null, boolean: () => null, reply: vi.fn(), acknowledge: vi.fn() };
     expect(await h.host.slash.dispatch("seam", null, "hello", invocation)).toBe(true);
     expect(a.handle).toHaveBeenCalledOnce();
     await expect(h.host.slash.dispatch("seamadmin", null, "hello", invocation)).rejects.toThrow("rename service unavailable");

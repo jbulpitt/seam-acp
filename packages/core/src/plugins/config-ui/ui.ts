@@ -852,15 +852,15 @@ export class ConfigUi {
 
     // A repo lookup or runtime retirement can exceed Discord's three-second
     // interaction deadline. Acknowledge before either one starts.
-    await i.deferReply({ flags: MessageFlags.Ephemeral });
+
 
     if (request.json === null && request.supplied.length === 0 && request.rebuild) {
-      await i.editReply((await this.ports.rebuild(channel)).trim() || "🏗️ Rebuild complete.");
+      await i.reply((await this.ports.rebuild(channel)).trim() || "🏗️ Rebuild complete.");
       return;
     }
     const validated = await this.ports.prepareSet(channel, request);
     if (!validated.ok) {
-      await i.editReply(validated.message);
+      await i.reply(validated.message);
       return;
     }
     const applied = await this.ports.applySet(
@@ -872,7 +872,7 @@ export class ConfigUi {
     );
     if (!applied.ok) {
       this.logger.warn({ sessionId: `discord:${channel.id}`, error: applied.message }, "bulk config set failed");
-      await i.editReply(
+      await i.reply(
         `${validated.prepared.kind === "json" ? "Could not replace config" : "Could not update config"}: ` +
           `${applied.message}${applied.rollbackError}`
       );
@@ -882,11 +882,11 @@ export class ConfigUi {
       ? await this.ports.rebuild(channel)
       : "";
     if (validated.prepared.kind === "json") {
-      await i.editReply("Config replaced; next turn starts a fresh runtime." + rebuildNote);
+      await i.reply("Config replaced; next turn starts a fresh runtime." + rebuildNote);
       return;
     }
     const changed = request.supplied.map((name) => `\`${name}\``).join(", ");
-    await i.editReply(
+    await i.reply(
       `Updated ${changed}. Effective: ${configSetSummary(applied.effective, this.ports.repoDisplay)}.` +
         (applied.restartRequested ? " Next turn uses the new runtime configuration." : "") +
         rebuildNote

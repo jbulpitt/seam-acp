@@ -48,7 +48,7 @@ function command(sub: string, id?: string, persistent?: (event: unknown) => Prom
       message: { id: "message", components: (paints.at(-1)?.components ?? []).map((row: any) => ({
         components: row.components.map((button: any) => ({ customId: button.data.custom_id, disabled: button.data.disabled ?? false })),
       })) },
-      isButton: () => !values, isStringSelectMenu: () => Boolean(values),
+      isButton: () => !values, isStringSelectMenu: () => Boolean(values), isModalSubmit: () => false,
       reply: vi.fn(async (view: any) => { c.replied = true; replies.push(view); }),
       editReply: vi.fn(async (view: any) => { replies.push(view); }),
       deferReply: vi.fn(async () => { c.deferred = true; }),
@@ -58,7 +58,9 @@ function command(sub: string, id?: string, persistent?: (event: unknown) => Prom
       showModal: vi.fn(async (view: any) => { shown = view.toJSON(); }),
       awaitModalSubmit: async (options: any) => {
         const m = { customId: shown.custom_id, user: native.user, fields: { getTextInputValue: (name: string) => fields[name] ?? "" },
-          reply: async (view: any) => { replies.push(view); }, followUp: async (view: any) => { replies.push(view); }, deferUpdate: async () => {} };
+          deferred: false, replied: false, ephemeral: null, isModalSubmit: () => true, isStringSelectMenu: () => false,
+          reply: async (view: any) => { replies.push(view); }, followUp: async (view: any) => { replies.push(view); },
+          editReply: async (view: any) => { replies.push(view); }, deferUpdate: async () => { m.deferred = true; } };
         expect(options.filter(m)).toBe(true);
         return m;
       },

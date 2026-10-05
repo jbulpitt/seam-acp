@@ -62,7 +62,7 @@ export class PresetCards {
     if (!card || card.owner !== click.user.id) return false;
     const controller = await this.controller(card);
     if (controller.lifecycle.settled) return false;
-    if (card.expires <= Date.now()) { await click.deferUpdate(); await controller.lifecycle.expire("time"); return false; }
+    if (card.expires <= Date.now()) {  await controller.lifecycle.expire("time"); return false; }
     const customId = click.customId.slice(0, split);
     if (click.isModalSubmit()) {
       if (card.kind !== "builder" || !card.modals[customId] || card.modals[customId]! <= Date.now()) return false;

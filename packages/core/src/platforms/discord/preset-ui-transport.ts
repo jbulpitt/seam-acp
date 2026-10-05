@@ -1,4 +1,4 @@
-import type { ChatInputCommandInteraction, MessageComponentInteraction, ModalSubmitInteraction, InteractionReplyOptions, InteractionEditReplyOptions, InteractionUpdateOptions } from "discord.js";
+import type { ChatInputCommandInteraction, MessageComponentInteraction, ModalSubmitInteraction, InteractionReplyOptions } from "discord.js";
 import type { ChannelRef } from "../chat-adapter.js";
 import type { PresetInteraction, PresetClick } from "../../plugins/presets/ports.js";
 import { browserReplyFromInteraction } from "./browser-reply.js";
@@ -31,9 +31,7 @@ export function presetUiInteraction<T extends Interaction>(i: T, deps: {
     isButton: () => i.isButton(), isStringSelectMenu: () => i.isStringSelectMenu(), isModalSubmit: () => i.isModalSubmit(),
     mutationRefusal: () => deps.mutationRefusal(i),
     editReply: view => replyToInteraction(i, view as InteractionReplyOptions),
-    deferReply: async view => { await i.deferReply(view as Parameters<typeof i.deferReply>[0]); },
-    deferUpdate: async () => { await i.deferUpdate(); },
-    update: async view => { await (i as MessageComponentInteraction).update(view as InteractionUpdateOptions); },
+    update: view => replyToInteraction(i, view as InteractionReplyOptions),
     showModal: async view => { await (i as MessageComponentInteraction).showModal(view); },
   };
   return click as never;

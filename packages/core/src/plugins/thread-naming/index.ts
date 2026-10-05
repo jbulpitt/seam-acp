@@ -127,7 +127,8 @@ export function createThreadNamingPlugin(ports: ThreadNamingPorts): Plugin {
           return { content: [{ type: "text", text: `Renamed this thread to ${name.slice(0, 100)}.` }] };
         },
       }],
-      components: [{ namespace, types: ["button", "modal"], lifetime: "persistent", access: "mutating", authorization: "config-admin", handle: component }],
+      components: [{ namespace, types: ["button", "modal"], lifetime: "persistent", access: "mutating", authorization: "config-admin",
+        acknowledgement: evt => evt.kind === "button" && evt.customId.startsWith(`${namespace}edit:`) ? "modal" : "ephemeral", handle: component }],
       identity: [
         { event: "thread-created", handle: async event => onIdentity(event.thread, true) },
         { event: "identity-changed", handle: async event => {

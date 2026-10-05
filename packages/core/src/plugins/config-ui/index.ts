@@ -18,6 +18,7 @@ export function createConfigUiPlugin(ui: ConfigUi, lifecycle: { activate(): void
         handle: async invocation => { await ui[leaf.method](ui.ports.interaction(invocation)); },
       })),
       components: [{ namespace: "seam-cfg-edit:", types: ["button", "select", "modal"], lifetime: "persistent", access: "read-only", authorization: "user",
+        acknowledgement: evt => ui.acknowledgement(evt),
         handle: evt => ui.handleConfigEditorComponent(evt) }],
     },
   };

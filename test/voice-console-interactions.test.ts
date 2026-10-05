@@ -77,7 +77,6 @@ function fixture() {
     userId: "owner",
     messageId,
     channel: { platform: "discord", id: "voice-chat" },
-    deferUpdate: vi.fn(async () => {}),
     replyEphemeral: vi.fn(async () => {}),
     followUpEphemeral: vi.fn(async () => {}),
   });
@@ -107,7 +106,6 @@ describe("Voice Console component revision and idempotency boundary", () => {
     await subject.handle(duplicate);
     expect(subject.durableApplications()).toBe(1);
     expect(subject.control.setInputTargets).toHaveBeenCalledTimes(2);
-    expect(duplicate.deferUpdate).toHaveBeenCalledOnce();
     expect(duplicate.replyEphemeral).not.toHaveBeenCalled();
   });
 
@@ -118,13 +116,11 @@ describe("Voice Console component revision and idempotency boundary", () => {
     const stale = subject.event("interaction-2");
     await subject.handle(stale);
     expect(subject.durableApplications()).toBe(1);
-    expect(stale.deferUpdate).toHaveBeenCalledOnce();
     expect(stale.followUpEphemeral).toHaveBeenCalledWith("Console changed; refresh.");
 
     const collision = subject.event("interaction-1", ["tvb_b"]);
     await subject.handle(collision);
     expect(subject.durableApplications()).toBe(1);
-    expect(collision.deferUpdate).toHaveBeenCalledOnce();
     expect(collision.followUpEphemeral).toHaveBeenCalledWith(
       "Voice Console interaction id collision."
     );

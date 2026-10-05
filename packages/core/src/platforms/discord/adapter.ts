@@ -1,4 +1,5 @@
-import { replyToInteraction } from "./interaction-response.js";
+import { replyToInteraction, acknowledgeComponentInteraction, awaitAcknowledgedInteraction, ignoreCollectorTimeout } from "./interaction-response.js";
+import type { ComponentAcknowledgement } from "../interaction-response.js";
 import {
   Client,
   GatewayIntentBits,
@@ -435,6 +436,8 @@ export class DiscordAdapter implements ChatAdapter {
   private messageHandler?: (msg: IncomingMessage) => void | Promise<void>;
   private componentHandler?: (evt: ComponentEvent) => void | Promise<void>;
   private choiceHandler?: (evt: ChoiceInteraction) => void | Promise<void>;
+  private componentAcknowledgement: ComponentAcknowledgement = "update";
+  private choiceAcknowledgement: ComponentAcknowledgement = "update";
   private threadDeleteHandler?: (channelRef: string) => void | Promise<void>;
   /** DB-backed channel activation (#22): additive to the env allowlist. */
   private activeChannelCheck?: (channelRef: string) => boolean;
@@ -472,8 +475,9 @@ export class DiscordAdapter implements ChatAdapter {
     this.messageHandler = handler;
   }
 
-  onComponent(handler: (evt: ComponentEvent) => void | Promise<void>): void {
+  onComponent(handler: (evt: ComponentEvent) => void | Promise<void>, acknowledgement: ComponentAcknowledgement): void {
     this.componentHandler = handler;
+    this.componentAcknowledgement = acknowledgement;
   }
 
   restoreBrowserReply(target: string, userId: string, channelId: string) {
@@ -485,8 +489,9 @@ export class DiscordAdapter implements ChatAdapter {
     });
   }
 
-  onChoiceInteraction(handler: (evt: ChoiceInteraction) => void | Promise<void>): void {
+  onChoiceInteraction(handler: (evt: ChoiceInteraction) => void | Promise<void>, acknowledgement: ComponentAcknowledgement): void {
     this.choiceHandler = handler;
+    this.choiceAcknowledgement = acknowledgement;
   }
 
   onThreadDelete(handler: (channelRef: string) => void | Promise<void>): void {
@@ -1351,7 +1356,6 @@ export class DiscordAdapter implements ChatAdapter {
       chosen: { value: string; label: string },
       username: string
     ): Promise<{ value: string; userId: string } | null> => {
-      await interaction.deferUpdate().catch(() => {});
       if (opts.commit) {
         const settled = await finalizeChoicePick({
           picked: chosen,
@@ -1380,7 +1384,7 @@ export class DiscordAdapter implements ChatAdapter {
 
     const filter = (i: MessageComponentInteraction) => {
       if (opts.authorizedUserIds && !opts.authorizedUserIds.has(i.user.id)) {
-        i.reply({
+        replyToInteraction(i, {
           content: "This bot is not available to you.",
           flags: MessageFlags.Ephemeral,
         }).catch(() => {});
@@ -1390,11 +1394,10 @@ export class DiscordAdapter implements ChatAdapter {
     };
 
     const rejectPick = async (
-      interaction: { reply: (opts: object) => Promise<unknown> },
+      interaction: MessageComponentInteraction | ModalSubmitInteraction,
       reason: string
     ) => {
-      await interaction
-        .reply({
+      await replyToInteraction(interaction, {
           content: `❌ ${reason}`,
           flags: MessageFlags.Ephemeral,
         })
@@ -1407,15 +1410,15 @@ export class DiscordAdapter implements ChatAdapter {
       while (true) {
         const remaining = deadline - Date.now();
         if (remaining <= 0) throw new Error("timeout");
-        const interaction = await msg.awaitMessageComponent({
+        const interaction = await awaitAcknowledgedInteraction(() => msg.awaitMessageComponent({
           filter,
           time: remaining,
-        });
+        }), evt => evt.customId === `${customId}:custom` && opts.allowCustom ? "modal" : "update");
         const cid = interaction.customId;
 
         if (cid === `${customId}:prev`) {
           page = Math.max(0, page - 1);
-          await interaction.update({
+          await replyToInteraction(interaction, {
             embeds: buildEmbeds(page),
             components: buildComponents(page),
           });
@@ -1423,14 +1426,13 @@ export class DiscordAdapter implements ChatAdapter {
         }
         if (cid === `${customId}:next`) {
           page = Math.min(layout.pageCount - 1, page + 1);
-          await interaction.update({
+          await replyToInteraction(interaction, {
             embeds: buildEmbeds(page),
             components: buildComponents(page),
           });
           continue;
         }
         if (cid === `${customId}:page`) {
-          await interaction.deferUpdate().catch(() => {});
           continue;
         }
 
@@ -1456,14 +1458,13 @@ export class DiscordAdapter implements ChatAdapter {
             Math.max(1_000, deadline - Date.now()),
             5 * 60 * 1000
           );
-          const submitted = await interaction
-            .awaitModalSubmit({
+          const submitted = await awaitAcknowledgedInteraction(() => interaction.awaitModalSubmit({
               filter: (m) =>
                 m.customId === `${customId}:modal` &&
                 m.user.id === interaction.user.id,
               time: modalMs,
-            })
-            .catch(() => null);
+            }), "update")
+            .catch(ignoreCollectorTimeout);
           if (!submitted) continue;
           const raw = submitted.fields
             .getTextInputValue(`${customId}:input`)
@@ -1492,7 +1493,6 @@ export class DiscordAdapter implements ChatAdapter {
           pickedIdx = Number.parseInt(interaction.values[0] ?? "", 10);
         }
         if (pickedIdx === undefined || Number.isNaN(pickedIdx)) {
-          await interaction.deferUpdate().catch(() => {});
           continue;
         }
         const chosen = choices[pickedIdx];
@@ -1500,13 +1500,13 @@ export class DiscordAdapter implements ChatAdapter {
           if (opts.panel) {
             const errEmbed = DiscordAdapter.buildEmbed(opts.panel).setColor(0xed4245);
             errEmbed.setDescription("_Invalid choice._");
-            await interaction.update({
+            await replyToInteraction(interaction, {
               content: opts.prompt,
               embeds: [errEmbed],
               components: [],
             });
           } else {
-            await interaction.update({
+            await replyToInteraction(interaction, {
               content: `${opts.prompt ?? ""}\n_Invalid choice._`,
               components: [],
             });
@@ -1524,14 +1524,17 @@ export class DiscordAdapter implements ChatAdapter {
           interaction.user.username
         );
       }
-    } catch {
+    } catch (err) {
+      const timedOut = (err as { code?: string })?.code === "InteractionCollectorError"
+        || (err instanceof Error && err.message === "timeout");
+      if (!timedOut) this.logger.warn({ err }, "choice picker failed");
       try {
         await msg.edit({
-          content: `${opts.prompt ?? ""}\n⏱️ _Timed out._`,
+          content: `${opts.prompt ?? ""}\n${timedOut ? "⏱️ _Timed out._" : `❌ ${err instanceof Error ? err.message : String(err)}`}`,
           components: [],
         });
-      } catch {
-        /* ignore */
+      } catch (replyError) {
+        this.logger.warn({ err: replyError }, "choice picker result failed");
       }
       return null;
     }
@@ -2067,6 +2070,7 @@ export class DiscordAdapter implements ChatAdapter {
     interaction: ButtonInteraction | StringSelectMenuInteraction | ModalSubmitInteraction
   ): Promise<void> {
     if (!this.componentHandler) return;
+    await acknowledgeComponentInteraction(interaction, this.componentAcknowledgement);
     const isButton = interaction.isButton();
     const isModal = interaction.isModalSubmit();
     const isSelect = interaction.isStringSelectMenu();
@@ -2103,23 +2107,22 @@ export class DiscordAdapter implements ChatAdapter {
       ...(isSelect ? { values: [...interaction.values] } : {}),
       ...(Object.keys(fields).length > 0 ? { fields } : {}),
       replyEphemeral: async (text: string) => {
-        await interaction.reply({ content: text, flags: MessageFlags.Ephemeral });
+        await replyToInteraction(interaction, { content: text, flags: MessageFlags.Ephemeral });
       },
       followUpEphemeral: async (text: string) => {
-        await interaction.followUp({ content: text, flags: MessageFlags.Ephemeral });
+        await replyToInteraction(interaction, { content: text, flags: MessageFlags.Ephemeral }, { followUp: true });
       },
       editReplyEphemeral: async (text: string) => {
-        await interaction.editReply({ content: text });
+        await replyToInteraction(interaction, { content: text, flags: MessageFlags.Ephemeral });
       },
       replyEphemeralView: async (view) => {
-        await interaction.reply({
+        return replyToInteraction(interaction, {
           embeds: view.embeds as EmbedBuilder[],
           ...(view.components
             ? { components: view.components as ActionRowBuilder<ButtonBuilder | StringSelectMenuBuilder>[] }
             : {}),
           flags: MessageFlags.Ephemeral,
-        });
-        return (await interaction.fetchReply()).id;
+        }, { fetchReply: true });
       },
       updateEphemeralView: async (view) => {
         if (interaction.isModalSubmit()) throw new Error("modal submit cannot update a component view");
@@ -2129,17 +2132,13 @@ export class DiscordAdapter implements ChatAdapter {
             ? { components: view.components as ActionRowBuilder<ButtonBuilder | StringSelectMenuBuilder>[] }
             : {}),
         };
-        if (interaction.deferred || interaction.replied) await interaction.editReply(payload);
-        else await interaction.update(payload);
+        await replyToInteraction(interaction, payload);
       },
       followUpEphemeralFile: async (file) => {
-        await interaction.followUp({
+        await replyToInteraction(interaction, {
           files: [new AttachmentBuilder(file.data, { name: file.filename })],
           flags: MessageFlags.Ephemeral,
-        });
-      },
-      deferUpdate: async () => {
-        await interaction.deferUpdate();
+        }, { followUp: true });
       },
       showModal: async (opts) => {
         if (!interaction.isButton() && !interaction.isStringSelectMenu()) {
@@ -2163,7 +2162,11 @@ export class DiscordAdapter implements ChatAdapter {
       },
     };
     discordComponentInteractions.set(evt, interaction);
-    await this.componentHandler(evt);
+    try { await this.componentHandler(evt); }
+    catch (err) {
+      this.logger.error({ err, customId: interaction.customId }, "component handler failed");
+      await replyToInteraction(interaction, { content: `Could not complete this action: ${err instanceof Error ? err.message : String(err)}`, flags: MessageFlags.Ephemeral });
+    }
   }
 
   async sendChoiceCard(channel: ChannelRef, card: ChoiceCardPost): Promise<MessageRef> {
@@ -2261,6 +2264,7 @@ export class DiscordAdapter implements ChatAdapter {
     interaction: ButtonInteraction | StringSelectMenuInteraction | ModalSubmitInteraction
   ): Promise<void> {
     if (!this.choiceHandler) return;
+    await acknowledgeComponentInteraction(interaction, this.choiceAcknowledgement);
     const channelId = interaction.channelId ?? "";
     const ch = interaction.channel as { parentId?: string | null } | null;
     const parentId = ch?.parentId ?? undefined;
@@ -2293,13 +2297,10 @@ export class DiscordAdapter implements ChatAdapter {
       ...(values ? { values } : {}),
       ...(Object.keys(fields).length > 0 ? { fields } : {}),
       replyEphemeral: async (text: string) => {
-        await interaction.reply({ content: text, flags: MessageFlags.Ephemeral });
+        await replyToInteraction(interaction, { content: text, flags: MessageFlags.Ephemeral });
       },
       followUpEphemeral: async (text: string) => {
-        await interaction.followUp({ content: text, flags: MessageFlags.Ephemeral });
-      },
-      deferUpdate: async () => {
-        await interaction.deferUpdate();
+        await replyToInteraction(interaction, { content: text, flags: MessageFlags.Ephemeral }, { followUp: true });
       },
       showModal: async (opts) => {
         if (!interaction.isButton() && !interaction.isStringSelectMenu()) {
@@ -2318,7 +2319,11 @@ export class DiscordAdapter implements ChatAdapter {
         await interaction.showModal(modal);
       },
     };
-    await this.choiceHandler(evt);
+    try { await this.choiceHandler(evt); }
+    catch (err) {
+      this.logger.error({ err, customId: interaction.customId }, "choice handler failed");
+      await replyToInteraction(interaction, { content: `Could not complete this choice: ${err instanceof Error ? err.message : String(err)}`, flags: MessageFlags.Ephemeral });
+    }
   }
 
   private static buildEmbed(
@@ -2602,8 +2607,6 @@ export class DiscordAdapter implements ChatAdapter {
       this.logger.warn({ err }, "failed to set bot avatar/banner (rate-limited or missing file)");
     }
   }
-
-
 
   private async fetchSendableChannel(
     channelId: string

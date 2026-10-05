@@ -83,7 +83,7 @@ describe.each(["claude", "codex"] as const)("%s effort interaction acknowledgeme
       const save = h.ports.saveEditor;
       h.ports.saveEditor = vi.fn(async (...args: unknown[]) => { entered.resolve(); await release.promise; return save(...args); });
       acknowledgement = new SyntheticInteraction({ kind: "button", channelId: THREAD, messageId: "editor", customId: `seam-cfg-edit:${id}:save` }, h.ctx);
-      operation = h.component({ ...component("save"), deferUpdate: () => acknowledgement.deferUpdate() });
+      operation = h.nativeComponent(acknowledgement);
     } else {
       if (entry === "picker") picker = h.installPicker();
       h.router.hasRuntime = () => true;
@@ -140,7 +140,7 @@ describe.each(["claude", "codex"] as const)("%s effort interaction acknowledgeme
     });
     await h.component({ ...component("effort"), deferUpdate: async () => {} });
     h.ports.saveEditor = vi.fn(async () => { h.clock.t = 4_000; throw new Error(CAUSE); });
-    await h.component(component("save"));
+    await h.nativeComponent(click);
     expect(click.transcript[0]).toMatchObject({ op: "deferUpdate", atMs: 0 });
     expect(click.transcript.at(-1)).toMatchObject({ op: "followUp", atMs: 4_000, content: `Could not save: ${CAUSE}` });
     expect(h.panels.at(-1).footer).not.toMatch(/saved/i);

@@ -1,6 +1,7 @@
 import type { Logger } from "../lib/logger.js";
 import type { ComponentEvent } from "../platforms/chat-adapter.js";
 import type { PluginContext } from "./types.js";
+import type { ComponentAcknowledgement, ComponentAcknowledgementContext, ComponentResponseMode } from "../platforms/interaction-response.js";
 
 export interface ComponentContribution {
   namespace: string;
@@ -8,6 +9,7 @@ export interface ComponentContribution {
   lifetime: "persistent" | "collector";
   access: "read-only" | "mutating" | ((customId: string) => "read-only" | "mutating");
   authorization: "user" | "config-admin";
+  acknowledgement: ComponentAcknowledgement;
   handle(invocation: ComponentEvent, context: PluginContext): Promise<void>;
 }
 type Entry = { plugin: string; contribution: ComponentContribution; context: PluginContext };
@@ -30,8 +32,13 @@ export class ComponentRegistry {
   classify(customId: string, kind: ComponentEvent["kind"]): ComponentContribution["lifetime"] | undefined {
     return this.get(customId, kind)?.lifetime;
   }
+  contributions(): readonly ComponentContribution[] { return this.entries.map(entry => entry.contribution); }
   get(customId: string, kind: ComponentEvent["kind"]): ComponentContribution | undefined {
     return this.entries.find(entry => customId.startsWith(entry.contribution.namespace) && entry.contribution.types.includes(kind))?.contribution;
+  }
+  acknowledgement(interaction: ComponentAcknowledgementContext): ComponentResponseMode | undefined {
+    const declaration = this.get(interaction.customId, interaction.kind)?.acknowledgement;
+    return typeof declaration === "function" ? declaration(interaction) : declaration;
   }
   async dispatch(invocation: ComponentEvent): Promise<boolean> {
     const entry = this.entries.find(entry => invocation.customId.startsWith(entry.contribution.namespace) && entry.contribution.types.includes(invocation.kind));

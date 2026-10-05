@@ -750,7 +750,6 @@ export class ElicitationManager {
     }
     if (action.kind === "cancel") {
       const settled = await this.cancelOne(row.id, "cancelled", "Cancelled by the user.");
-      await event.deferUpdate().catch(() => {});
       if (!settled) await event.followUpEphemeral("That request was already settled.").catch(() => {});
       return;
     }
@@ -770,7 +769,6 @@ export class ElicitationManager {
         await event.replyEphemeral("That approval is not valid.").catch(() => {});
         return;
       }
-      await event.deferUpdate().catch(() => {});
       const accepted = this.store.acceptElicitation(row.id, "Approved on the card.", this.nowUtc());
       if (accepted) {
         this.finish(accepted, { action: "accept" });
@@ -784,7 +782,6 @@ export class ElicitationManager {
         await event.replyEphemeral("That field cannot be skipped.").catch(() => {});
         return;
       }
-      await event.deferUpdate().catch(() => {});
       await this.accept(row.id, {}, "The optional decision was skipped.", event);
       return;
     }
@@ -793,7 +790,6 @@ export class ElicitationManager {
         await event.replyEphemeral("That choice is not valid.").catch(() => {});
         return;
       }
-      await event.deferUpdate().catch(() => {});
       await this.accept(row.id, { [form.fields[0].key]: action.value }, "Answered on the card.", event);
       return;
     }
@@ -803,7 +799,6 @@ export class ElicitationManager {
         await event.replyEphemeral("That choice is not valid.").catch(() => {});
         return;
       }
-      await event.deferUpdate().catch(() => {});
       await this.accept(
         row.id,
         { [direct.field.key]: direct.options[action.index]!.value },
@@ -826,7 +821,6 @@ export class ElicitationManager {
         return;
       }
       const selected = indices.map((index) => direct.options[index]!.value);
-      await event.deferUpdate().catch(() => {});
       await this.accept(
         row.id,
         { [direct.field.key]: direct.kind === "single" ? selected[0]! : selected },
@@ -839,7 +833,6 @@ export class ElicitationManager {
       const delta = action.kind === "previous" ? -1 : 1;
       const target = Math.max(0, Math.min(form.pages.length - 1, row.currentPage + delta));
       const updated = this.store.setElicitationPage(row.id, target, this.nowUtc());
-      await event.deferUpdate().catch(() => {});
       if (updated) await this.refresh(updated, form);
       return;
     }

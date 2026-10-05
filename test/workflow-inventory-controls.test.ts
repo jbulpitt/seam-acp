@@ -81,13 +81,9 @@ function makePort(initial: string[]) {
   return port satisfies WorkflowInventoryPort & Record<string, unknown>;
 }
 
-function makeClick(log?: string[]) {
-  const state = { acks: 0, followUps: [] as string[] };
+function makeClick() {
+  const state = { followUps: [] as string[] };
   const port: WorkflowInventoryClickPort = {
-    ack: async () => {
-      state.acks++;
-      log?.push("ack");
-    },
     followUp: async (text) => {
       state.followUps.push(text);
     },
@@ -149,8 +145,6 @@ describe("concurrent clicks on one row", () => {
     expect(await firstOutcome).toBe("mutated");
     expect(await secondOutcome).toBe("dropped");
     expect(port.resumeCalls).toEqual(["r1"]);
-    // The dropped click is still acknowledged — never "interaction failed".
-    expect(second.state.acks).toBe(1);
     expect(second.state.followUps).toEqual([]);
     expect(first.state.followUps).toEqual(["resumed r1"]);
   });
@@ -310,19 +304,12 @@ describe("card state after a mutation", () => {
     expect(port.applied).toEqual([{ kind: "terminal", rows: [], reason: "abandon" }]);
   });
 
-  it("acknowledges the interaction before touching the original card", async () => {
-    const log: string[] = [];
+  it("refreshes the original card before reporting the result", async () => {
     const port = makePort(["r1", "r2"]);
     port.log.length = 0;
-    const controller = new WorkflowInventoryController(port);
-    const click = makeClick(log);
-    // Share one ordered log across ack and card writes.
+    const click = makeClick();
     const merged: string[] = [];
     const ordered: WorkflowInventoryClickPort = {
-      ack: async () => {
-        merged.push("ack");
-        await click.port.ack();
-      },
       followUp: async (t) => {
         merged.push("followUp");
         await click.port.followUp(t);
@@ -341,28 +328,24 @@ describe("card state after a mutation", () => {
     };
     const spyController = new WorkflowInventoryController(spyPort);
     await spyController.handle("wf:abandon:r1", ordered);
-    expect(merged).toEqual(["ack", "render", "refresh", "followUp"]);
-    expect(merged.indexOf("ack")).toBeLessThan(merged.indexOf("refresh"));
-    void controller;
+    expect(merged).toEqual(["render", "refresh", "followUp"]);
   });
 });
 
 describe("clicks that are not ours", () => {
-  it("leaves another surface's customId unacknowledged", async () => {
+  it("ignores another surface's customId", async () => {
     const port = makePort(["r1"]);
     const controller = new WorkflowInventoryController(port);
     const click = makeClick();
     expect(await controller.handle("sl:run:sch_1", click.port)).toBe("ignored");
-    expect(click.state.acks).toBe(0);
     expect(port.applied).toEqual([]);
   });
 
-  it("acknowledges an unusable page payload rather than leaving it hanging", async () => {
+  it("ignores an unusable page payload without mutating the card", async () => {
     const port = makePort(["r1"]);
     const controller = new WorkflowInventoryController(port);
     const click = makeClick();
     expect(await controller.handle("wf:page:not-a-number", click.port)).toBe("ignored");
-    expect(click.state.acks).toBe(1);
     expect(port.applied).toEqual([]);
   });
 });

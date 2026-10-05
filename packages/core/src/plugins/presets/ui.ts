@@ -36,7 +36,7 @@ export class PresetUi {
     try { await open(); }
     catch (err) {
       this.logger.warn({ err, surface }, "editor failed to open after list freeze");
-      await c.editReply({ content: `❌ Could not open the ${surface} editor. Run \`${retryCommand}\` again.`, embeds: [], components: [] }).catch(() => {});
+      await c.editReply({ content: `❌ Could not open the ${surface} editor: ${err instanceof Error ? err.message : String(err)}. Run \`${retryCommand}\` again.`, embeds: [], components: [] }).catch(() => {});
     }
   }
   private presetSummaryLine(p: Preset): string {
@@ -194,18 +194,11 @@ export class PresetUi {
             flags: MessageFlags.Ephemeral,
           });
         } else if (action === "edit") {
-          // Close the list, acknowledge the click, then repaint before opening the editor.
-          await lifecycle.transitionWithAck(
-            "edit",
-            {
-              content: `✏️ Editing preset **${preset.name}** — this listing was replaced by the editor below.`,
-              embeds: [],
-              components: [],
-            },
-            async () => {
-              await c.deferReply({ flags: MessageFlags.Ephemeral });
-            }
-          );
+          // Freeze the list before opening its replacement editor.
+          await lifecycle.transition("edit", {
+            content: `✏️ Editing preset **${preset.name}** — this listing was replaced by the editor below.`,
+            embeds: [], components: [],
+          });
           await this.openEditorAfterFreeze(
             c,
             () => this.cmdPresetBuilder(c, preset),
@@ -221,6 +214,7 @@ export class PresetUi {
         }
       } catch (err) {
         this.logger.warn({ err }, "preset-list button handler failed");
+        await c.reply({ content: `Could not complete this preset action: ${err instanceof Error ? err.message : String(err)}`, flags: MessageFlags.Ephemeral });
       }
     });
   }
@@ -482,8 +476,6 @@ export class PresetUi {
     };
 
     if (!restored) {
-      // Edit from a list already acknowledged the component.
-
       await i.reply(render());
       await i.fetchReply();
       card.target = i.cardReply.target; card.expires = Date.now() + 600_000;
@@ -511,7 +503,6 @@ export class PresetUi {
               : null;
           const instrVal = c.fields.getTextInputValue("instr").trim();
           state.instructions = instrVal || null;
-          await c.deferUpdate();
           await i.reply(render());
           return;
         }
@@ -524,7 +515,6 @@ export class PresetUi {
             : rawDisable === "no" || rawDisable === "false" || rawDisable === ""
               ? null
               : state.disableThreadPrefix;
-          await c.deferUpdate();
           await i.reply(render());
           return;
         }
@@ -533,14 +523,12 @@ export class PresetUi {
           const exclude = parseCsv(c.fields.getTextInputValue("exclude"));
           state.toolsAllow = allow.length > 0 ? allow : null;
           state.toolsExclude = exclude.length > 0 ? exclude : null;
-          await c.deferUpdate();
           await i.reply(render());
           return;
         }
         if (c.isModalSubmit() && c.customId === "preset:instr-modal") {
           const val = c.fields.getTextInputValue("instr").trim();
           state.instructions = val || null;
-          await c.deferUpdate();
           await i.reply(render());
           return;
         }
@@ -550,13 +538,11 @@ export class PresetUi {
           // Model ids are agent-specific; a stale pick would be invalid.
           state.model = null;
           state.effort = null;
-          await c.deferUpdate();
           models = await loadModels(state.agentId);
           await c.editReply(render());
         } else if (c.isStringSelectMenu() && c.customId === "preset:model") {
           const v = c.values[0]!;
           if (v === "__more__") {
-            await c.deferUpdate();
             const channel = c.channelRef;
             if (!channel || !this.ports.transport.sendChoicePicker) return;
             const picked = await this.ports.transport.sendChoicePicker(channel, {
@@ -602,7 +588,6 @@ export class PresetUi {
         } else if (c.isStringSelectMenu() && c.customId === "preset:repo") {
           const v = c.values[0]!;
           if (v === "__more__") {
-            await c.deferUpdate();
             const channel = c.channelRef;
             if (!channel) return;
             const picked = await this.ports.promptRepoPath(channel, {
@@ -784,18 +769,17 @@ export class PresetUi {
             updatedUtc: now,
           };
           this.repository.upsertPreset(preset);
-          await c.deferUpdate();
           await lifecycle.terminal(existing ? "saved" : "created", {
             content: `${existing ? "💾 Updated" : "✅ Created"} preset **${preset.name}** (\`${preset.id}\`).`,
             embeds: [],
             components: [],
           });
         } else if (c.isButton() && c.customId === "preset:cancel") {
-          await c.deferUpdate();
           await lifecycle.terminal("cancel", { content: "Cancelled.", embeds: [], components: [] });
         }
       } catch (err) {
         this.logger.warn({ err }, "preset builder interaction failed");
+        await c.reply({ content: `Could not update the preset: ${err instanceof Error ? err.message : String(err)}`, flags: MessageFlags.Ephemeral });
       }
     });
   }
@@ -873,7 +857,6 @@ export class PresetUi {
     // Discord requires an initial acknowledgement within three seconds. Auto-
     // naming may need to inspect many sibling threads, so acknowledge before
     // that I/O instead of letting large projects intermittently expire here.
-
 
     if (quantity > 1 && !effectiveRole) {
       await i.reply("Multiple threads need a role so their prefixes can be enumerated.");

@@ -97,6 +97,7 @@ export function sessionBrowserPlugin(ports: SessionBrowserFacade): Plugin {
       components: [{
         namespace: "sessions:", types: ["button", "select", "modal"], lifetime: "persistent",
         access: browserAccess, authorization: "user",
+        acknowledgement: evt => evt.kind === "button" && evt.customId.startsWith("sessions:import_to_cwd:") ? "modal" : "update",
         handle: async event => {
           const split = event.customId.lastIndexOf(":");
           const state = states.get(event.customId.slice(split + 1));
@@ -106,7 +107,7 @@ export function sessionBrowserPlugin(ports: SessionBrowserFacade): Plugin {
           if (event.kind === "modal" && (!pending || pending.expires <= Date.now())) return;
           const browser = controller(state);
           if (event.kind !== "modal" && (state.closed || state.expires <= Date.now())) {
-            await event.deferUpdate(); await browser.expire(); return;
+             await browser.expire(); return;
           }
           const click = ports.click({ ...event, customId });
           try {

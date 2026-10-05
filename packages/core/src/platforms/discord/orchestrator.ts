@@ -1,4 +1,4 @@
-import { acknowledgeInteraction, replyToInteraction } from "./interaction-response.js";
+import { acknowledgeInteraction, replyToInteraction, collectAcknowledgedInteractions, awaitAcknowledgedInteraction, ignoreCollectorTimeout } from "./interaction-response.js";
 import { runAcknowledged } from "../interaction-response.js";
 import fs from "node:fs";
 import { newSubmissionEvidence, type SubmissionEvidence } from "../../agents/submission-evidence.js";
@@ -547,7 +547,6 @@ const STATUS_HEARTBEAT_MS = 5000;
 export const DISPATCH_SETTLEMENT_WARN_MS = 5_000;
 const PLATFORM = "discord";
 
-
 /**
  * Last resort when a quarantine has no recorded cause (#333).
  *
@@ -655,7 +654,6 @@ interface ChannelQueueMeta {
    */
   executing?: number;
 }
-
 
 export class ChannelQueueFencedError extends Error {
   constructor(readonly channelId: string, readonly epoch: number) {
@@ -1133,11 +1131,13 @@ export class Orchestrator {
         channel: interaction => this.channelRefFromInteraction(interaction) ?? undefined,
         mutationRefusal: interaction => this.slashAccessRefusal(interaction, { kind: "mutating" }),
         lifecycle: (interaction, collector, expired) => this.attachListLifecycle(interaction, collector, expired),
+        onError: err => this.logger.warn({ err }, "schedule collector failed"),
       }),
       interaction: i => scheduleUiInteraction(i, {
         channel: interaction => this.channelRefFromInteraction(interaction) ?? undefined,
         mutationRefusal: interaction => this.slashAccessRefusal(interaction, { kind: "mutating" }),
         lifecycle: (interaction, collector, expired) => this.attachListLifecycle(interaction, collector, expired),
+        onError: err => this.logger.warn({ err }, "schedule collector failed"),
       }),
     });
     this.presetsUi = installPresetUi({
@@ -1796,14 +1796,24 @@ export class Orchestrator {
   private registerKernelComponents(): void {
     const context = Object.freeze({ logger: this.logger, config: undefined });
     this.plugins.components.register("kernel", [
-      ["seam-elicit:", (evt: ComponentEvent) => this.elicitations.handleComponent(evt)],
-      ["seam-tts:", (evt: ComponentEvent) => this.handleTtsEditorComponent(evt)],
-      ["tvc:", (evt: ComponentEvent) => this.runVoiceConsoleComponent(evt)],
-    ].map(([namespace, handle]) => ({ namespace: namespace as string, handle: handle as (evt: ComponentEvent) => Promise<void>, types: ["button", "select", "modal"] as const, lifetime: "persistent" as const, access: "read-only" as const, authorization: "user" as const })), context);
+      { namespace: "seam-elicit:", types: ["button", "select", "modal"], lifetime: "persistent", access: "read-only", authorization: "user",
+        acknowledgement: evt => evt.kind === "button" && evt.customId.startsWith("seam-elicit:answer:") ? "modal" : "update",
+        handle: evt => this.elicitations.handleComponent(evt) },
+      { namespace: "seam-tts:", types: ["button", "select", "modal"], lifetime: "persistent", access: "read-only", authorization: "user",
+        acknowledgement: "update", handle: evt => this.handleTtsEditorComponent(evt) },
+      { namespace: "tvc:", types: ["button", "select", "modal"], lifetime: "persistent", access: "read-only", authorization: "user",
+        acknowledgement: evt => {
+          const parsed = parseVoiceConsoleInteraction({ customId: evt.customId, values: [...evt.values ?? []] });
+          return evt.kind === "button" && parsed.ok && parsed.id.action === "edit-alias" ? "modal" : "update";
+        },
+        handle: evt => this.runVoiceConsoleComponent(evt) },
+    ], context);
     this.plugins.components.register("kernel-actions", [
       { namespace: "seam-perm:", types: ["button"], lifetime: "persistent", access: "read-only", authorization: "user",
+        acknowledgement: "update",
         handle: evt => this.actionCards.handlePermission(evt) },
       { namespace: "seam-cfg:", types: ["button"], lifetime: "persistent", access: "mutating", authorization: "config-admin",
+        acknowledgement: "update",
         handle: evt => this.actionCards.handleProposal(evt) },
     ], context);
   }
@@ -1847,7 +1857,7 @@ export class Orchestrator {
             .catch(() => {});
         }
       );
-    });
+    }, evt => this.plugins.components.acknowledgement(evt) ?? "update");
     this.adapter.onChoiceInteraction?.((evt) =>
       this.runInbound(
         "choice",
@@ -1857,7 +1867,12 @@ export class Orchestrator {
             .replyEphemeral("♻️ Restarting — your pick was not recorded. Try again in a moment.")
             .catch(() => {});
         }
-      )
+      ), evt => {
+        const parsed = parseChoiceCustomId(evt.customId);
+        const card = parsed && this.store.getChoiceCard(parsed.choiceId);
+        const index = parsed?.kind === "select" ? Number.parseInt(evt.values?.[0] ?? "", 10) : parsed?.optionIndex;
+        return evt.kind !== "modal" && card && !card.select && index !== undefined && card.options[index]?.kind === "custom" ? "modal" : "update";
+      }
     );
     this.adapter.onThreadDelete?.((channelRef) => this.handleThreadDeleted(channelRef));
     // DB-backed channel activation (#22): let the adapter's channel gate treat
@@ -1895,7 +1910,7 @@ export class Orchestrator {
         .replyEphemeral(
           `Voice Console action failed: ${err instanceof Error ? err.message : String(err)}`
         )
-        .catch(() => evt.followUpEphemeral("Voice Console action failed."));
+        .catch(() => evt.followUpEphemeral(`Voice Console action failed: ${err instanceof Error ? err.message : String(err)}`));
     }
   }
 
@@ -8447,7 +8462,6 @@ export class Orchestrator {
           });
           return;
         }
-        await evt.deferUpdate();
         const result = await this.voiceConsoleControl.updateBindingProfile(draft.bindingId, {
           expectedRevision: parsed.id.revision,
           alias: profile.alias,
@@ -8485,7 +8499,6 @@ export class Orchestrator {
         await evt.replyEphemeral("Arm fan-out before selecting more than one input binding.");
         return;
       }
-      await evt.deferUpdate();
       const result = await this.voiceConsoleControl.setInputTargets(
         console.id,
         parsed.bindingIds,
@@ -8497,7 +8510,6 @@ export class Orchestrator {
       return;
     }
     if (action === "output") {
-      await evt.deferUpdate();
       const result = await this.voiceConsoleControl.setOutputBindings(
         console.id,
         parsed.bindingIds,
@@ -8508,7 +8520,6 @@ export class Orchestrator {
       return;
     }
     if (action === "input-off") {
-      await evt.deferUpdate();
       const runtimeResult = await this.voiceConsoleControl.setInputTargets(
         console.id, [], false, parsed.id.revision, evt.interactionId
       );
@@ -8516,7 +8527,6 @@ export class Orchestrator {
       return;
     }
     if (action === "fanout-arm") {
-      await evt.deferUpdate();
       const result = await this.voiceConsoleControl.setInputTargets(
         console.id, currentTargets, true, parsed.id.revision, evt.interactionId
       );
@@ -8558,7 +8568,6 @@ export class Orchestrator {
         });
         return;
       }
-      await evt.deferUpdate();
       const result = await this.voiceConsoleControl.setInputTargets(
         console.id, currentTargets, false, parsed.id.revision, evt.interactionId
       );
@@ -8566,7 +8575,6 @@ export class Orchestrator {
       return;
     }
     if (action === "output-all-on" || action === "output-all-off") {
-      await evt.deferUpdate();
       const result = await this.voiceConsoleControl.setOutputBindings(
         console.id,
         action === "output-all-on" ? bindings.map((row) => row.id) : [],
@@ -8577,7 +8585,6 @@ export class Orchestrator {
       return;
     }
     if (action === "page-prev" || action === "page-next") {
-      await evt.deferUpdate();
       const result = this.store.updateVoiceConsoleCard(console.id, {
         expectedRevision: parsed.id.revision,
         cardPage: Math.max(0, console.cardPage + (action === "page-next" ? 1 : -1)),
@@ -8588,7 +8595,6 @@ export class Orchestrator {
       return;
     }
     if (action === "refresh") {
-      await evt.deferUpdate();
       await this.voiceConsoleControl.refreshCard(console.id, true);
       return;
     }
@@ -8597,7 +8603,6 @@ export class Orchestrator {
         await evt.replyEphemeral("Choose one of the input targets shown in this confirmation.");
         return;
       }
-      await evt.deferUpdate();
       const keptId = parsed.bindingIds[0]!;
       const kept = bindings.find((binding) => binding.id === keptId);
       const result = await this.voiceConsoleControl.setInputTargets(
@@ -8624,7 +8629,6 @@ export class Orchestrator {
     }
     if (action === "fanout-cancel" || action === "end-cancel") {
       this.voiceConsoleEphemeralViews.delete(evt.messageId);
-      await evt.deferUpdate();
       await this.settleVoiceConsoleConfirmation(evt, action === "end-cancel"
         ? {
             title: "Shared Voice Console kept running",
@@ -8664,7 +8668,6 @@ export class Orchestrator {
       return;
     }
     if (action === "end-preserve" || action === "end-discard") {
-      await evt.deferUpdate();
       const result = await this.voiceConsoleManager.stopConsole(console.id, {
         expectedRevision: parsed.id.revision,
         discardPending: action === "end-discard",
@@ -9011,8 +9014,6 @@ export class Orchestrator {
       id: channelId,
       ...(record.parentRef ? { parentId: record.parentRef } : {}),
     };
-
-
 
     if (!busy && ready) {
       // D2/D4: a sitting #88/#89 row must not survive this run-now, or it
@@ -13861,7 +13862,6 @@ export class Orchestrator {
       return;
     }
 
-
     let validated: { ok: true; prepared: PreparedConfigSet } | undefined;
     if (configured) {
       const invokingChannel = i.channel as
@@ -14299,7 +14299,6 @@ export class Orchestrator {
       flags: MessageFlags.Ephemeral,
     });
   }
-
 
   private async cmdEffort(i: ChatInputCommandInteraction): Promise<void> {
     const record = this.recordFromInteraction(i);
@@ -15335,7 +15334,6 @@ export class Orchestrator {
     }
   }
 
-
   private deferRemoteRecoveryAdoption(attempt: TurnAttempt, onReady?: () => void): void {
     const binding = attempt.remoteRecovery;
     if (!binding || !this.bridgeHub) { onReady?.(); return; }
@@ -15984,7 +15982,6 @@ export class Orchestrator {
       return;
     }
 
-
     const parentId = !explicit ? here?.parentId : undefined;
     const record = this.router.ensureSessionRecord({
       platform: PLATFORM,
@@ -16310,7 +16307,6 @@ export class Orchestrator {
       return;
     }
 
-
     await this.applyAgentChange(channel, record, id, i);
   }
 
@@ -16512,12 +16508,7 @@ export class Orchestrator {
     const lifecycle = this.attachListLifecycle(i, collector, () =>
       expiredCardView("\u23f0 Workflow inventory expired \u2014 run `/seam workflows` again.")
     );
-    // Ack, mutate, then rebuild the originating card from the store so the
-    // consumed row's controls disappear atomically with the action — the old
-    // code replied separately and left the acted-on row clickable. This card
-    // stays live on purpose (the other rows are still actionable), so the
-    // controller claims each row for the duration of its mutation: the
-    // collector cannot be the guard for a repeatable card.
+    // Repeatable cards claim each row during mutation, then rebuild from the store.
     const controls = new WorkflowInventoryController({
       resume: (id) => this.resumeTurnManually(id),
       abandon: (id) => this.abandonTurnManually(id),
@@ -16525,29 +16516,22 @@ export class Orchestrator {
       refresh: (view) => lifecycle.refresh(view),
       terminal: (reason, view) => lifecycle.terminal(reason, view),
     });
-    collector.on("collect", async (c) => {
-      try {
-        if (!c.isButton()) return;
-        const access: SlashCommandAccess = {
-          kind: c.customId.startsWith("wf:page:") ? "read-only" : "mutating",
-        };
-        const refusal = this.slashAccessRefusal(c, access);
-        if (refusal) {
-          await c.reply({ content: refusal, flags: MessageFlags.Ephemeral });
-          return;
-        }
-        await controls.handle(c.customId, {
-          ack: async () => {
-            await c.deferUpdate();
-          },
-          followUp: async (text) => {
-            await c.followUp({ content: text, flags: MessageFlags.Ephemeral });
-          },
-        });
-      } catch (err) {
-        this.logger.warn({ err }, "workflows resume/abandon button failed");
+    collectAcknowledgedInteractions(collector, "update", async (c) => {
+      if (!c.isButton()) return;
+      const access: SlashCommandAccess = {
+        kind: c.customId.startsWith("wf:page:") ? "read-only" : "mutating",
+      };
+      const refusal = this.slashAccessRefusal(c, access);
+      if (refusal) {
+        await replyToInteraction(c, { content: refusal, flags: MessageFlags.Ephemeral });
+        return;
       }
-    });
+      await controls.handle(c.customId, {
+        followUp: async (text) => {
+          await replyToInteraction(c, { content: text, flags: MessageFlags.Ephemeral }, { followUp: true });
+        },
+      });
+    }, err => this.logger.warn({ err }, "workflows resume/abandon button failed"));
   }
 
   /**
@@ -17564,7 +17548,6 @@ export class Orchestrator {
     }
   }
 
-
   private configSetRequest(i: ChatInputCommandInteraction) { return configSetRequest(i.options); }
 
   /**
@@ -17873,12 +17856,6 @@ export class Orchestrator {
       return;
     }
     if (auth === "expired" || !draft) {
-      try {
-        await evt.deferUpdate();
-      } catch {
-        await evt.replyEphemeral("This draft has expired.").catch(() => {});
-        return;
-      }
       if (evt.messageId) {
         await this.editTtsEditorCard(evt.channel, evt.messageId, {
           color: 0x99aab5,
@@ -17893,12 +17870,6 @@ export class Orchestrator {
     }
 
     const action = parsed.action;
-    try {
-      await evt.deferUpdate();
-    } catch (err) {
-      this.logger.warn({ err, customId: evt.customId }, "tts editor deferUpdate failed");
-      return;
-    }
 
     if (action === "cancel") {
       this.ttsEditor.delete(draft.id);
@@ -18150,7 +18121,6 @@ export class Orchestrator {
 
     const requested = i.options.getString("path", true);
 
-
     let abs: string;
     try {
       abs = resolveHostPath(requested);
@@ -18213,7 +18183,6 @@ export class Orchestrator {
   private async cmdUploadPush(i: ChatInputCommandInteraction): Promise<void> {
     const destIn = i.options.getString("path", true);
     const file = i.options.getAttachment("file", true);
-
 
     let dest: string;
     try {
@@ -18293,14 +18262,12 @@ export class Orchestrator {
         )
       );
     await i.showModal(modal);
-    const sub = await i
-      .awaitModalSubmit({
+    const sub = await awaitAcknowledgedInteraction(() => i.awaitModalSubmit({
         filter: (m) => m.customId === `upload:secret:${i.id}` && m.user.id === i.user.id,
         time: 300_000,
-      })
-      .catch(() => null);
+      }), "ephemeral")
+      .catch(ignoreCollectorTimeout);
     if (!sub) return;
-    await sub.deferReply({ flags: MessageFlags.Ephemeral });
     const name = sub.fields.getTextInputValue("name");
     const value = sub.fields.getTextInputValue("value");
     try {
@@ -18332,13 +18299,13 @@ export class Orchestrator {
           valueBytes.byteLength
         );
       }
-      await sub.editReply({
+      await replyToInteraction(sub, {
         content:
           `🔐 Secret \`${written.name}\` stored for this thread at \`${written.absPath}\`.\n` +
           `Agent turns will see the path (not the value). It is deleted about 1 hour after upload.`,
       });
     } catch (err) {
-      await sub.editReply({
+      await replyToInteraction(sub, {
         content: `Could not store secret: ${(err as Error).message}`,
       });
     }
@@ -18384,7 +18351,6 @@ export class Orchestrator {
       content: `Agent \`${profile.id}\` (${profile.displayName}) is signed in as **${id.login}**${hostNote}.`,
     });
   }
-
 
   private async cmdAvatar(i: ChatInputCommandInteraction): Promise<void> {
 
@@ -19332,7 +19298,6 @@ export class Orchestrator {
     optionIndex: number,
     attemptId: string,
   ): Promise<void> {
-    await evt.deferUpdate();
     const claimed = this.store.claimChoiceClick({
       choiceId: card.id,
       userId: evt.userId,
@@ -19472,7 +19437,6 @@ export class Orchestrator {
       return;
     }
 
-    await evt.deferUpdate();
     const claimed = this.store.claimChoiceClick({
       choiceId: card.id,
       userId: evt.userId,
@@ -19527,7 +19491,6 @@ export class Orchestrator {
     if (parsed.kind === "select") {
       const indices = parseChoiceSelectValues(evt.values, card.options.length);
       this.choicePending.set(choicePendingKey(card.id, evt.userId), indices);
-      await evt.deferUpdate();
       await this.refreshChoiceCard(card, { pendingSelection: indices });
       return;
     }
@@ -19564,7 +19527,6 @@ export class Orchestrator {
         return;
       }
     }
-    await evt.deferUpdate();
     const claimed = this.store.claimChoiceClick({
       choiceId: card.id,
       userId: evt.userId,
@@ -20267,9 +20229,6 @@ function parseCsv(s: string): string[] {
     .map((x) => x.trim())
     .filter((x) => x.length > 0);
 }
-
-
-
 
 function voiceConsoleEmbed(panel: VoiceConsolePanelSpec): EmbedBuilder {
   const embed = new EmbedBuilder()

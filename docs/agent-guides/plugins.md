@@ -44,7 +44,15 @@ scope, authorization and JSON-RPC errors remain in the kernel. The MCP server
 mounts only with `SEAM_MCP_ENABLED`; events and slash commands do not depend on it.
 
 Components declare a custom-id namespace, accepted types and persistent or
-collector lifetime. The same list classifies and dispatches interactions.
+collector lifetime, plus a required acknowledgement mode. Use `update` to edit
+the clicked card, `ephemeral` or `public` for a separate reply, and `modal` only
+when showing a form is the first response. Mixed routes declare a synchronous
+mode resolver using the custom id, interaction kind and selected values.
+The router acknowledges before handlers and access checks. Collector transports
+and modal waits use the same helper with explicit modes; handlers never defer.
+Reply capabilities fill the acknowledged response. Private errors after an
+`update` acknowledgement follow up privately without replacing the card.
+The same list classifies and dispatches interactions.
 Persistent handlers register at boot; collectors remain with their collector.
 The naming editor uses an owner and deadline in its custom id, so its handler
 survives a controller restart. ACP permission requests and config proposals use

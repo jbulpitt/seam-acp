@@ -29,7 +29,6 @@ export interface PresetInteraction {
 }
 export interface PresetClick extends PresetInteraction {
   editReply(view: CardView | string): Promise<void>;
-  deferReply(view: { flags?: number | bigint }): Promise<void>;
   customId: string;
   values: string[];
   isButton(): boolean;
@@ -37,7 +36,6 @@ export interface PresetClick extends PresetInteraction {
   isModalSubmit(): boolean;
   fields: { getTextInputValue(name: string): string };
   mutationRefusal(): string | undefined;
-  deferUpdate(): Promise<void>;
   update(view: CardView): Promise<void>;
   showModal(modal: ModalBuilder): Promise<void>;
 }

@@ -109,8 +109,8 @@ describe("plugin registry registration and dispatch", () => {
   it("drives persistent classification and dispatch from the same namespace, leaving collectors alone", async () => {
     const h = fixture(); const handle = vi.fn(async () => {});
     await h.host.loadBuiltins([{ id: "cards", load: async () => ({ id: "cards", apiVersion: 1, builtin: true, contributions: { components: [
-      { namespace: "durable:", types: ["button", "modal"], lifetime: "persistent", access: "read-only", authorization: "user", handle },
-      { namespace: "local:", types: ["select"], lifetime: "collector", access: "read-only", authorization: "user", handle },
+      { namespace: "durable:", types: ["button", "modal"], lifetime: "persistent", access: "read-only", authorization: "user", acknowledgement: "update", handle },
+      { namespace: "local:", types: ["select"], lifetime: "collector", access: "read-only", authorization: "user", acknowledgement: "update", handle },
     ] } }) }]);
     const interaction = { isChatInputCommand: () => false, isButton: () => true, isModalSubmit: () => false, customId: "durable:record-before-restart" };
     expect(classifyDiscordInteraction(interaction, h.host.components)).toBe("plugin-component");

@@ -4,6 +4,7 @@ import type { ChannelRef, ComponentEvent } from "../../platforms/chat-adapter.js
 import type { CardLifecycle, CardView, StoppableCollector } from "../../platforms/discord/collector-lifecycle.js";
 import type { ScheduledPrompt } from "../../core/scheduled-prompts/types.js";
 import type { SlashInvocation } from "../slash-registry.js";
+import type { ComponentAcknowledgement } from "../../platforms/interaction-response.js";
 
 export type ScheduleReply = CardView & { flags?: number | bigint };
 export interface ScheduleModal {
@@ -12,7 +13,6 @@ export interface ScheduleModal {
   fields: { getTextInputValue(name: string): string };
   reply(view: ScheduleReply): Promise<void>;
   followUp(view: ScheduleReply): Promise<void>;
-  deferUpdate(): Promise<void>;
 }
 export interface ScheduleCollector extends StoppableCollector {
   on(event: "collect", handle: (click: ScheduleClick) => Promise<void>): unknown;
@@ -26,7 +26,7 @@ export interface ScheduleInteraction {
   readonly replied: boolean;
   options: { getString(name: string, required: true): string; getString(name: string): string | null };
   reply(view: ScheduleReply | string): Promise<void>;
-  fetchReply(): Promise<{ id: string; createMessageComponentCollector(options: { filter(click: { user: { id: string } }): boolean; time: number }): ScheduleCollector }>;
+  fetchReply(): Promise<{ id: string; createMessageComponentCollector(options: { filter(click: { user: { id: string } }): boolean; time: number; acknowledgement: ComponentAcknowledgement }): ScheduleCollector }>;
   attachLifecycle(collector: ScheduleCollector, expired: (reason: string) => CardView): CardLifecycle;
 }
 export interface ScheduleClick extends ScheduleInteraction {
@@ -38,12 +38,10 @@ export interface ScheduleClick extends ScheduleInteraction {
   isButton(): boolean;
   isStringSelectMenu(): boolean;
   mutationRefusal(): string | undefined;
-  deferUpdate(): Promise<void>;
-  deferReply(options: { flags: number | bigint }): Promise<void>;
   update(view: CardView): Promise<void>;
   followUp(view: ScheduleReply): Promise<void>;
   showModal(modal: ModalBuilder): Promise<void>;
-  awaitModalSubmit(options: { filter(modal: ScheduleModal): boolean; time: number }): Promise<ScheduleModal>;
+  awaitModalSubmit(options: { filter(modal: ScheduleModal): boolean; time: number; acknowledgement: ComponentAcknowledgement }): Promise<ScheduleModal | null>;
   openFollowUp(): ScheduleInteraction;
 }
 

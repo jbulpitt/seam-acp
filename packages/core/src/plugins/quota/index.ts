@@ -41,7 +41,6 @@ export function createQuotaPlugin(ports: QuotaPorts): Plugin {
     catch (err) { await invocation.reply(`Couldn't fetch usage: ${err instanceof Error ? err.message : String(err)}`); }
   };
   const component = async (event: ComponentEvent) => {
-    await event.deferUpdate();
     if (!ready) return event.followUpEphemeral("Usage refresh is unavailable during startup or shutdown.");
     if (Date.now() - lastClick < 10_000) return event.followUpEphemeral("Usage was refreshed recently; try again in a few seconds.");
     lastClick = Date.now();
@@ -74,7 +73,7 @@ export function createQuotaPlugin(ports: QuotaPorts): Plugin {
         acknowledgement: "ephemeral", leaf: { type: ApplicationCommandOptionType.Subcommand, name: "usage", description: "Show usage / credits for this thread's agent (agy, claude, copilot, grok, codex)" },
         access: { kind: "read-only" }, authorization: "user", help: "`/seam info usage` — show usage / credits for this thread's agent", handle: usage }],
       mcp: quotaMcp(registry),
-      components: [{ namespace: "seam-quota:", types: ["button"], lifetime: "persistent", access: "read-only", authorization: "user", handle: component }],
+      components: [{ namespace: "seam-quota:", types: ["button"], lifetime: "persistent", access: "read-only", authorization: "user", acknowledgement: "update", handle: component }],
       turnActivity: [
         { event: "turn-started", handle: event => { poller.recordTurnStart(event.binding.agentId, event.timestampMs); } },
         { event: "turn-completed", handle: async event => { if (ready) await poller.turnCompleted(event.binding.agentId, event.binding); } },

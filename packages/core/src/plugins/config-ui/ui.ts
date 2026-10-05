@@ -8,6 +8,7 @@ import { configSetRequestError } from "../../core/config-apply-plan.js";
 import { FAST_MODE_CONFIG_ID, FAST_MODE_COST_WARNING, FAST_MODE_RESET_NOTICE, isFastModeDisabledByEnv, fastModeEnvRefusal, fastModeAgentRefusal } from "../../core/fast-mode.js";
 import { catalogEffortChoices } from "../../platforms/discord/catalog-view.js";
 import { INHERIT_VALUE, RIDER_MODAL_MAX, applyPickerValue, authorizeDraftClick, currentRiderText, decodeRiderUpload, editScopeOf, effectiveAgentAtLocation, isDirty, makeCustomId, parseCustomId, renderCancelledHub, renderExpiredHub, renderHub, renderSavedHub, riderDownloadFilename, riderTooLong, snapshotFromDescribe, type DraftAgentCapabilities, type ThreadConfigDraft } from "../../platforms/discord/config-editor.js";
+import type { ComponentAcknowledgementContext, ComponentResponseMode } from "../../platforms/interaction-response.js";
 import { findAuditEntry, formatConfigAuditDetail, formatConfigAuditView } from "../../platforms/discord/config-audit-view.js";
 import { clampFieldValue } from "../../platforms/discord/workflows-view.js";
 import type { ConfigInteraction, ConfigUiPorts } from "./ports.js";
@@ -274,6 +275,14 @@ export class ConfigUi {
     return true;
   }
 
+  acknowledgement(evt: ComponentAcknowledgementContext): ComponentResponseMode {
+    const parsed = parseCustomId(evt.customId);
+    if (evt.kind !== "button" || !parsed) return "update";
+    if (parsed.action === "role") return "modal";
+    const draft = this.configEditor.get(parsed.draftId);
+    return parsed.action === "rider" && draft && !riderTooLong(draft) ? "modal" : "update";
+  }
+
   async handleConfigEditorComponent(evt: ComponentEvent): Promise<void> {
     const parsed = parseCustomId(evt.customId);
     if (!parsed) return;
@@ -284,12 +293,6 @@ export class ConfigUi {
       return;
     }
     if (auth === "expired" || !draft) {
-      try {
-        await evt.deferUpdate();
-      } catch {
-        await evt.replyEphemeral("This draft has expired.").catch(() => {});
-        return;
-      }
       if (evt.messageId) {
         await this.editConfigEditorCard(evt.channel, evt.messageId, {
           color: 0x99aab5,
@@ -312,7 +315,6 @@ export class ConfigUi {
         await evt.replyEphemeral("Nothing to save.");
         return;
       }
-      await evt.deferUpdate();
       await this.saveConfigEditorDraft(draft, evt);
       return;
     }
@@ -325,7 +327,6 @@ export class ConfigUi {
         );
         return;
       }
-      await evt.deferUpdate();
       const nextScope = editScopeOf(draft) === "channel" ? "thread" : "channel";
       this.configEditor.touch(draft.id, {
         editScope: nextScope,
@@ -336,7 +337,6 @@ export class ConfigUi {
       return;
     }
     if (action === "cancel") {
-      await evt.deferUpdate();
       this.configEditor.delete(draft.id);
       if (draft.messageId) {
         await this.editConfigEditorCard(evt.channel, draft.messageId, renderCancelledHub(draft));
@@ -344,12 +344,10 @@ export class ConfigUi {
       return;
     }
     if (action === "rider-get") {
-      await evt.deferUpdate();
       await this.downloadConfigEditorRider(draft, evt);
       return;
     }
     if (action === "rider-put") {
-      await evt.deferUpdate();
       this.configEditor.touch(draft.id, { awaitingRiderUpload: true });
       const waiting = this.configEditor.get(draft.id) ?? draft;
       await this.refreshConfigEditorHub(waiting);
@@ -361,7 +359,6 @@ export class ConfigUi {
       return;
     }
     if (action === "rider-save" || (evt.kind === "modal" && action === "rider-save")) {
-      await evt.deferUpdate();
       const text = evt.fields?.rider ?? "";
       const next = applyPickerValue(
         draft,
@@ -375,7 +372,6 @@ export class ConfigUi {
     }
 
     if (action === "role-save" || (evt.kind === "modal" && action === "role-save")) {
-      await evt.deferUpdate();
       const text = evt.fields?.role ?? "";
       const next = applyPickerValue(draft, "role", text, this.capsForAgent);
       this.configEditor.put(next);
@@ -414,7 +410,6 @@ export class ConfigUi {
 
     if (action === "rider") {
       if (riderTooLong(draft)) {
-        await evt.deferUpdate();
         await this.pickConfigEditorField(draft, "rider", evt);
         return;
       }
@@ -439,7 +434,6 @@ export class ConfigUi {
       return;
     }
 
-    await evt.deferUpdate();
     await this.pickConfigEditorField(draft, action, evt);
   }
 
@@ -772,7 +766,6 @@ export class ConfigUi {
     await this.refreshConfigEditorHub(next);
   }
 
-
   async cmdConfigAudit(i: ConfigInteraction): Promise<void> {
     const limit = i.options.getInteger("limit") ?? 20;
     const now = new Date();
@@ -852,7 +845,6 @@ export class ConfigUi {
 
     // A repo lookup or runtime retirement can exceed Discord's three-second
     // interaction deadline. Acknowledge before either one starts.
-
 
     if (request.json === null && request.supplied.length === 0 && request.rebuild) {
       await i.reply((await this.ports.rebuild(channel)).trim() || "🏗️ Rebuild complete.");

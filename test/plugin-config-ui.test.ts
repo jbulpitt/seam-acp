@@ -127,7 +127,6 @@ describe("config UI built-in", () => {
     try {
       const restarted = await fixture({ store: h.store, directory: h.directory });
       const click = component(customId); await restarted.component(click);
-      expect(click.deferUpdate).toHaveBeenCalledTimes(1);
       expect(restarted.panels.at(-1)).toMatchObject({ footer: "draft expired", actions: [] });
       expect(h.store.listConfigMutations()).toEqual([]);
       expect(JSON.parse(fs.readFileSync(`${h.directory}/plugins/config-ui/drafts.json`, "utf8"))).toEqual([]);

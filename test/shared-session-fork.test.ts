@@ -134,7 +134,7 @@ describe("#631 tier 3: a bridge that stays unreachable", () => {
       expect(sent).toEqual([]);
       vi.advanceTimersByTime(60_000);
       await Promise.resolve();
-      expect(sent).toEqual([{ channel: "thread-9", text: expect.stringContaining("Still reconnecting to `remote-a`") }]);
+      expect(sent).toEqual([{ channel: "thread-9", text: expect.stringContaining("`remote-a` (slot 1)") }]);
       for (const listener of ready) listener("remote-a");
       await Promise.resolve();
       expect(sent.at(-1)).toEqual({ channel: "thread-9", text: "🔌 Reconnected to session" });

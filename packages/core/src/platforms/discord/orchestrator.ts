@@ -19295,9 +19295,10 @@ export class Orchestrator {
         });
       if (!record) return;
       const attempt = this.store.turnAttempts.get(attemptId);
+      const location = attempt?.spec.location ?? this.router.describeConfig(record).location.value;
       const context = {
         agentId: attempt?.spec.agentId ?? record.agentId,
-        host: attempt?.spec.location ?? this.router.describeConfig(record).location.value,
+        host: isLocalLocation(location) ? os.hostname() : location,
         cause,
       };
       await this.adapter.sendMessage({ platform: PLATFORM, id: channelRef }, reauthWaitNotice(park, context))

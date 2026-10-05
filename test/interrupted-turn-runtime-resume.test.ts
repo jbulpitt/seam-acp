@@ -228,8 +228,8 @@ describe("#302 real ACP handshake and strict session/load recovery", () => {
       .toContain("Cause: Authentication required");
   });
 
-  it("parks the exact Codex auth failure during adopted session/load, then continues only after sign-in confirmation", async () => {
-    const h = harness("bridge-a", "codex-auth");
+  it.each(["local", "bridge-a"] as const)("parks the exact Codex auth failure on %s session/load, then continues only after sign-in confirmation", async location => {
+    const h = harness(location, "codex-auth");
     const id = seedPromptedAttempt(h);
     await resume(h);
     expect(h.calls.loads).toEqual([RECORDED]);
@@ -240,7 +240,7 @@ describe("#302 real ACP handshake and strict session/load recovery", () => {
       stalledReason: expect.stringMatching(/^reauth-waiting:/),
     });
     const notice = h.adapter.sendMessage.mock.calls.map(call => String(call[1])).join("\n");
-    expect(notice).toContain("Codex on bridge-a needs to sign in again (`codex login`)");
+    expect(notice).toContain(`Codex on ${location === "local" ? os.hostname() : location} needs to sign in again (\`codex login\`)`);
     expect(notice).toContain("Cause: Authentication required");
     expect(notice).toContain("Authentication is done — continue");
     expect(notice).not.toContain("safety checks");

@@ -45,7 +45,7 @@ function setup() {
 }
 
 describe("choice availability follows the requesting turn", () => {
-  it.each(["handoff", "forward", "report_back"] as const)("%s returns the real caller in the MCP error and publishes nothing", async kind => {
+  it.each(["handoff", "forward"] as const)("%s returns the real caller in the MCP error and publishes nothing", async kind => {
     const h = setup();
     h.start(h.spec(kind));
     const server = new SeamMcpServer({ logger: pino({ level: "silent" }) as any,
@@ -63,10 +63,11 @@ describe("choice availability follows the requesting turn", () => {
     expect(h.adapter.sendChoiceCard).not.toHaveBeenCalled();
   });
 
-  it.each(["wake", "scheduled", "watch", "parked", "choice", undefined] as const)("%s preserves card publication", async kind => {
+  it.each(["report_back", "wake", "scheduled", "watch", "parked", "choice", undefined] as const)("%s preserves card publication", async kind => {
     const h = setup();
     if (kind) h.start(h.spec(kind));
     else (h.orch as any).currentAuthorIds.set("worker", "user");
+    expect(agentChoiceRefusal(h.spec(kind))).toBeUndefined();
     expect((await h.orch.createChoice(h.record, choice)).ok).toBe(true);
     expect(h.adapter.sendChoiceCard).toHaveBeenCalledOnce();
   });
@@ -118,7 +119,7 @@ describe("choice availability follows the requesting turn", () => {
     expect(output).not.toContain('"payload"');
   });
 
-  it("report-back capture keeps prose and other fences and converts closed or unclosed choice fences", () => {
+  it("worker capture keeps prose and other fences and converts closed or unclosed choice fences", () => {
     const h = setup();
     const text = "Before\n```js\nconst answer = 42;\n```\n" + fence + "\nAfter";
     const output = agentChoiceOutput(text, h.spec("forward"));
@@ -128,5 +129,6 @@ describe("choice availability follows the requesting turn", () => {
     expect(output).not.toContain("seam-choice");
     expect(agentChoiceOutput(fence.slice(0, -3), h.spec("forward"))).not.toContain("seam-choice");
     expect(agentChoiceOutput(text, h.spec("wake"))).toBe(text);
+    expect(agentChoiceOutput(text, h.spec("report_back"))).toBe(text);
   });
 });

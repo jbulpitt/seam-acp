@@ -33,10 +33,10 @@ function command(sub: string, id?: string, persistent?: (event: unknown) => Prom
   const collector = Object.assign(new EventEmitter(), { stop: vi.fn((reason?: string) => collector.emit("end", undefined, reason)) });
   const native = {
     commandName: "seamadmin", channelId: "thread", channel: { isThread: () => true, parentId: NAMING_PARENT },
-    user: { id: "admin", username: "admin" }, deferred: false, replied: false,
+    user: { id: "admin", username: "admin" }, deferred: false, replied: false, ephemeral: true,
     options: { getSubcommandGroup: () => "schedule", getSubcommand: () => sub, getString: () => id ?? null, getBoolean: () => null, data: [] },
     reply: vi.fn(async (view: any) => { native.replied = true; paints.push(view); }),
-    editReply: vi.fn(async (view: any) => { paints.push(view); }),
+    editReply: vi.fn(async (view: any) => { paints.push(view); return { id: "message", createMessageComponentCollector: () => collector }; }),
     deferReply: vi.fn(async () => { native.deferred = true; }),
     fetchReply: async () => ({ id: "message", createMessageComponentCollector: () => collector }),
   };
@@ -44,13 +44,13 @@ function command(sub: string, id?: string, persistent?: (event: unknown) => Prom
     let shown: any;
     const replies: any[] = [];
     const c = {
-      ...native, customId, values: values ?? [], deferred: false, replied: false,
+      ...native, customId, values: values ?? [], deferred: false, replied: false, ephemeral: null,
       message: { id: "message", components: (paints.at(-1)?.components ?? []).map((row: any) => ({
         components: row.components.map((button: any) => ({ customId: button.data.custom_id, disabled: button.data.disabled ?? false })),
       })) },
       isButton: () => !values, isStringSelectMenu: () => Boolean(values), isModalSubmit: () => false,
       reply: vi.fn(async (view: any) => { c.replied = true; replies.push(view); }),
-      editReply: vi.fn(async (view: any) => { replies.push(view); }),
+      editReply: vi.fn(async (view: any) => { replies.push(view); paints.push(view); return { id: "message" }; }),
       deferReply: vi.fn(async () => { c.deferred = true; }),
       deferUpdate: vi.fn(async () => { c.deferred = true; }),
       update: vi.fn(async (view: any) => { paints.push(view); }),

@@ -41,7 +41,7 @@ function fixture({ locked = false, participant = false, user = PARTICIPANT, iden
   } as unknown as ConfigUi);
   orch.plugins.slash.register(configPlugin.id, configPlugin.contributions.slash!, { logger: orch.logger, config: undefined });
   function interaction(commandName: string, group: string | null, sub: string, values: Record<string, string> = {}) {
-    return {
+    const i = {
       commandName,
       channelId: "thread",
       channel: { isThread: () => true, parentId: "parent" },
@@ -53,7 +53,11 @@ function fixture({ locked = false, participant = false, user = PARTICIPANT, iden
         getInteger: () => null,
       },
       reply: vi.fn(async () => {}),
+      deferred: false, replied: false, ephemeral: true,
+      deferReply: vi.fn(async () => { i.deferred = true; }),
+      editReply: vi.fn(async () => {}),
     };
+    return i;
   }
   return { orch, interaction };
 }
@@ -146,7 +150,7 @@ describe.each([
       usage: { readUsage }, bindings: () => [binding], resolve: () => binding, card: {},
     }) }], { quota: { QUOTA_STALE_RETENTION_MS: 0, OLLAMA_CLOUD_ENABLED: false } });
     const i = Object.assign(interaction("seam", "info", "usage"), {
-      deferReply: vi.fn(async () => {}), editReply: vi.fn(async () => {}),
+      editReply: vi.fn(async () => {}),
     });
     await orch.handleSlashInteractionInner(i);
     expect(readUsage).toHaveBeenCalledWith(binding);
@@ -219,7 +223,7 @@ describe.each([
     const click = (customId: string) => {
       const native = Object.assign(interaction("seam", null, "workflows"), {
         customId, isButton: () => true, isStringSelectMenu: () => false, isModalSubmit: () => false,
-        message: { id: "list", components: [] }, deferred: false, replied: false,
+        message: { id: "list", components: [] }, deferred: false, replied: false, ephemeral: null,
         deferUpdate: vi.fn(async () => { native.deferred = true; }), update: vi.fn(async () => {}),
         editReply: vi.fn(async () => {}), followUp: vi.fn(async () => {}),
       });

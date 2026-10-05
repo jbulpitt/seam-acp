@@ -27,7 +27,8 @@ function interaction(sub: string, values: Record<string, string | number | boole
     commandName: "seam", channelId: THREAD, channel: { isThread: () => true, parentId: NAMING_PARENT }, user: { id: user, username: user, displayName: user },
     options: { getSubcommand: () => sub, getSubcommandGroup: () => "config", getString: (name: string) => typeof values[name] === "string" ? values[name] : null,
       getBoolean: (name: string) => typeof values[name] === "boolean" ? values[name] : null, getInteger: (name: string) => typeof values[name] === "number" ? values[name] : null },
-    reply: vi.fn(async (_payload: unknown) => {}), deferReply: vi.fn(async () => {}), editReply: vi.fn(async (_payload: unknown) => {}),
+    deferred: false, replied: false, ephemeral: true,
+    reply: vi.fn(async (_payload: unknown) => {}), deferReply: vi.fn(async () => { i.deferred = true; }), editReply: vi.fn(async (_payload: unknown) => {}),
   };
   return i;
 }
@@ -75,23 +76,23 @@ describe("config UI built-in", () => {
     const set = interaction("set", { agent: "codex@local", role: "qa" });
     await h.orchestrator.handleSlashInteraction(set as never);
     expect(set.deferReply).toHaveBeenCalledTimes(1);
-    expect(set.editReply.mock.calls.at(-1)?.[0]).toContain("Updated `agent`, `role`. Effective: agent `codex`, model `gpt-6.1-sol`");
+    expect((set.editReply.mock.calls.at(-1)?.[0] as any).content).toContain("Updated `agent`, `role`. Effective: agent `codex`, model `gpt-6.1-sol`");
     const show = interaction("show");
     await h.orchestrator.handleSlashInteraction(show as never);
-    expect((show.reply.mock.calls[0]![0] as any).content).toContain('"role": "qa"');
+    expect((show.editReply.mock.calls[0]![0] as any).content).toContain('"role": "qa"');
     const audit = interaction("audit");
     await h.orchestrator.handleSlashInteraction(audit as never);
-    expect((audit.reply.mock.calls[0]![0] as any).embeds[0].toJSON().title).toBe("📜 Config audit");
+    expect((audit.editReply.mock.calls[0]![0] as any).embeds[0].toJSON().title).toBe("📜 Config audit");
     const detail = interaction("audit", { entry: h.store.listConfigMutations()[0]!.id });
     await h.orchestrator.handleSlashInteraction(detail as never);
-    expect((detail.reply.mock.calls[0]![0] as any).embeds[0].toJSON().title).toBe("📜 Config mutation");
+    expect((detail.editReply.mock.calls[0]![0] as any).embeds[0].toJSON().title).toBe("📜 Config mutation");
   });
 
   it("keeps kernel lock/participant gates ahead of plugin commands", async () => {
     const h = await fixture({ admins: new Set(["admin"]), locked: true, participant: "other" });
     const edit = interaction("edit", {}, "other");
     await h.orchestrator.handleSlashInteraction(edit as never);
-    expect(edit.reply).toHaveBeenCalledTimes(1);
+    expect(edit.editReply).toHaveBeenCalledTimes(1);
     expect(h.ports.transport.sendPanel).not.toHaveBeenCalled();
     expect(h.store.listConfigMutations()).toEqual([]);
   });
@@ -145,6 +146,6 @@ describe("config UI built-in", () => {
     expect(naming.editReply).toHaveBeenCalled();
     const audit = interaction("audit");
     await h.orchestrator.handleSlashInteraction(audit as never);
-    expect(audit.reply).toHaveBeenCalledTimes(1);
+    expect(audit.editReply).toHaveBeenCalledTimes(1);
   });
 });

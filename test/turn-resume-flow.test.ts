@@ -875,7 +875,7 @@ describe("workflows inventory", () => {
     expect(hidden.fields ?? []).toEqual([]);
     expect(hidden.footer.text).toContain("older inert record(s) hidden");
     const included = (await render(true)).embeds[0].toJSON();
-    expect(included.fields.some((field: any) => field.name.includes("No action available"))).toBe(true);
+    expect(included.fields.some((field: any) => field.name.includes("no action available"))).toBe(true);
     expect(included.fields.some((field: any) => field.name.includes("Recent"))).toBe(true);
     expect(store.turnAttempts.get(spec.id)).toEqual(before);
     expect(store.getDelegation("old-inert-ledger")?.status).toBe("abandoned");

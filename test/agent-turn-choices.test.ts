@@ -93,6 +93,18 @@ describe("choice availability follows the requesting turn", () => {
     expect((await h.orch.createChoice(h.record, choice)).ok).toBe(true);
   });
 
+  it("an adopted handoff keeps its recorded caller, and an ordinary human turn stays eligible", async () => {
+    const h = setup();
+    const attempt = h.start(h.spec("handoff"));
+    h.store.turnAttempts.recordRemoteRecovery(attempt, { version: 1, location: "remote", slot: 6,
+      submissionId: "submission", acpSessionId: "acp", delegatedUtc: attempt.spec.createdUtc });
+    h.store.turnAttempts.suspendBoot("boot");
+    (h.orch as any).activeLiveDispatch.clear();
+    expect(await h.orch.createChoice(h.record, choice)).toEqual({ ok: false, error: agentChoiceRefusal(h.spec("handoff")) });
+    (h.orch as any).currentAuthorIds.set("worker", "user");
+    expect((await h.orch.createChoice(h.record, choice)).ok).toBe(true);
+  });
+
   it("durable recovery renders the question and options rather than publishing or leaking fence JSON", async () => {
     const h = setup();
     await (h.orch as any).sendDeliveryPayload({ platform: "discord", id: "worker" }, { kind: "message", text: fence }, "nonce", h.spec("handoff"));

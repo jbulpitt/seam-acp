@@ -30,6 +30,29 @@ describe("workflow acknowledgement", () => {
     expect(getSlashAcknowledgement("seam", null, "workflows")).toBe("ephemeral");
   });
 
+  it("starts inventory reads before the ACK round trip, but waits to send the result", async () => {
+    const { orch, interaction, order } = fixture();
+    let release!: () => void;
+    const pending = new Promise<void>(resolve => { release = resolve; });
+    interaction.deferReply.mockImplementation(async () => {
+      order.push("defer");
+      await pending;
+      interaction.deferred = true;
+    });
+    orch.renderWorkflowInventory = vi.fn(async () => {
+      order.push("inventory");
+      return { embeds: [], components: [], page: 0 };
+    });
+    const result = orch.handleSlashInteraction(interaction);
+    await Promise.resolve();
+    expect(order).toEqual(["defer", "inventory"]);
+    expect(interaction.editReply).not.toHaveBeenCalled();
+    release();
+    await result;
+    expect(order).toEqual(["defer", "inventory", "edit"]);
+    expect(interaction.deferReply).toHaveBeenCalledOnce();
+  });
+
   it("acknowledges before awaiting a slow inventory and edits the deferred response", async () => {
     const { orch, interaction, order } = fixture();
     let release!: () => void;

@@ -177,7 +177,7 @@ describe("#250 human turn production pipeline, synthetic transport only", () => 
     expect(h.store.getInbound("1")?.state).toBe("completed");
     await vi.waitFor(() => expect(adopted.kill).toHaveBeenCalledTimes(1));
     expect(h.router.releaseRecoveryRuntime).toHaveBeenCalledWith(
-      "discord:worker", expect.any(Object)
+      "discord:worker", expect.any(Object), false
     );
     expect(h.adapter.editPanel).toHaveBeenCalledWith(
       { channel: { platform: "discord", id: "worker" }, id: "persisted-panel" },

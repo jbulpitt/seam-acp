@@ -1,8 +1,7 @@
 import path from "node:path";
-import { AgentRuntime, SessionLoadTimeoutError, type BridgeHealthSource } from "../agents/agent-runtime.js";
+import { AgentRuntime, type BridgeHealthSource } from "../agents/agent-runtime.js";
 import {
   asRemoteCatalogAdapter,
-  readErrorClassification,
   type AgentProfile,
   type CatalogModelEvidence,
 } from "@seam/adapters";
@@ -1302,9 +1301,15 @@ export class SessionRouter {
     return runtime;
   }
 
-  releaseRecoveryRuntime(recordId: string, runtime: AgentRuntime): void {
-    if (this.runtimes.get(recordId) === runtime) this.runtimes.delete(recordId);
+  releaseRecoveryRuntime(recordId: string, runtime: AgentRuntime, retainChild = false): boolean {
+    const owned = this.runtimes.get(recordId) === runtime;
+    if (owned && retainChild) {
+      runtime.releaseRecovery(true);
+      return true;
+    }
+    if (owned) this.runtimes.delete(recordId);
     runtime.releaseRecovery();
+    return false;
   }
 
   /**
@@ -1643,71 +1648,34 @@ export class SessionRouter {
       }
 
       if (record.acpSessionId || recovery?.resumeSessionId) {
-        // Resume with a couple short retries. Right after a redeploy the agent
-        // subprocess can still be spinning up when the first message lands, so
-        // the first loadSession can fail transiently — and falling straight
-        // through to newSession would overwrite the (good) acpSessionId and
-        // detach the thread from its conversation. A brief escalating backoff
-        // lets the agent finish starting before we give up.
-        // #448: strict recovery delegates the complete start/load budget to
-        // its caller. Nesting local retries multiplied three acquisitions into
-        // nine loads. Refuse only this failed acquisition; ordinary attachment
-        // retains its short retries and all identity checks below remain active.
-        const RESUME_ATTEMPTS = 3; // Ordinary attachment only; strict failures escape below.
-        const RESUME_RETRY_MS = 400;
-        for (let attempt = 1; attempt <= RESUME_ATTEMPTS; attempt++) {
-          try {
-            await runtime.loadSession({
-              sessionId: recovery?.resumeSessionId ?? record.acpSessionId,
-              cwd,
-              model,
-              acquisitionModelFallback: true,
-              ...(effort ? { effort } : {}),
-              // #37: the persisted REQUEST, for reporting only. loadSession
-              // never applies Fast — re-enabling it on a session that already
-              // has history is the repricing case the design forbids.
-              ...(fastMode ? { fastMode: true } : {}),
-              ...(preserveSession ? { strictModel: true } : {}),
-            });
-            if (preserveSession && runtime.getSessionInfo()?.sessionId !== preserveSession.resumeSessionId) {
-              throw new Error("Strict resume refused: loaded runtime has a different ACP session");
-            }
-            if (recovery) {
-              const current = this.store.get(record.id);
-              if (current?.acpSessionId && current.acpSessionId !== recovery.resumeSessionId) {
-                throw new Error("Strict resume refused: thread session changed during acquisition");
-              }
-            }
-            this.logger.debug(
-              { sessionId: record.id, acpSessionId: record.acpSessionId, attempt },
-              "resumed acp session"
-            );
-            return { runtime, sessionId: recovery?.resumeSessionId ?? record.acpSessionId };
-          } catch (err) {
-            // Preserve the typed failure: the acquisition owner decides whether
-            // to retry. Calling a transient load failure an integrity refusal
-            // hid its cause; replay/newSession is still forbidden on this path.
-            if (preserveSession || readErrorClassification(err)?.errorKind === "model_not_found") throw err;
-            // #307: this check keeps the configured deadline global to one resume;
-            // deleting it silently multiplies the outage across three retries.
-            // A deadline is not a transient adapter-start race. Retrying it
-            // would multiply the configured bound and keep this worker silent;
-            // refuse only this resume and let the caller expose/retry it.
-            if (err instanceof SessionLoadTimeoutError) {
-              throw err;
-            }
-            const lastAttempt = attempt === RESUME_ATTEMPTS;
-            this.logger.warn(
-              { err, sessionId: record.id, attempt, lastAttempt },
-              lastAttempt
-                ? "session/load failed after retries, creating new session"
-                : "session/load failed; retrying after short delay"
-            );
-            if (!lastAttempt) {
-              await new Promise((r) => setTimeout(r, RESUME_RETRY_MS * attempt));
-            }
+        // The acquisition owner retries failures; a saved conversation never
+        // falls through to session/new.
+        await runtime.loadSession({
+          sessionId: recovery?.resumeSessionId ?? record.acpSessionId,
+          cwd,
+          model,
+          acquisitionModelFallback: true,
+          ...(effort ? { effort } : {}),
+          // #37: the persisted REQUEST, for reporting only. loadSession
+          // never applies Fast — re-enabling it on a session that already
+          // has history is the repricing case the design forbids.
+          ...(fastMode ? { fastMode: true } : {}),
+          ...(preserveSession ? { strictModel: true } : {}),
+        });
+        if (preserveSession && runtime.getSessionInfo()?.sessionId !== preserveSession.resumeSessionId) {
+          throw new Error("Strict resume refused: loaded runtime has a different ACP session");
+        }
+        if (recovery) {
+          const current = this.store.get(record.id);
+          if (current?.acpSessionId && current.acpSessionId !== recovery.resumeSessionId) {
+            throw new Error("Strict resume refused: thread session changed during acquisition");
           }
         }
+        this.logger.debug(
+          { sessionId: record.id, acpSessionId: record.acpSessionId },
+          "resumed acp session"
+        );
+        return { runtime, sessionId: recovery?.resumeSessionId ?? record.acpSessionId };
       }
 
       const info = await runtime.newSession({

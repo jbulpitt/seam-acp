@@ -1076,7 +1076,7 @@ export class Orchestrator {
    * Boot delivery reconciliation skips them so it cannot race the adopter's
    * nonce-backed first send; every other completed attempt still recovers. */
   private readonly adoptingRemoteResults = new Set<string>();
-  private readonly remoteAdoptionFinishers = new Map<string, () => void>();
+  private readonly remoteAdoptionFinishers = new Map<string, (retainChild?: boolean) => void>();
   private remoteRecoveryReconciliation?: Promise<void>;
   private readonly remoteRecoveryLogFailures = new Map<string, {
     cause: string; err: unknown; sinceMs: number; lastLoggedMs: number;
@@ -4179,11 +4179,10 @@ export class Orchestrator {
         await this.ensureOwnSession(record, channel);
         this.assertQueueFence(queueFence);
       }
-      let activeRuntime = humanResume && priorHuman?.acpSessionId
-        ? await this.acquireRecordedRuntime(record, priorHuman.id, priorHuman.acpSessionId)
-        : priorHuman?.acpSessionId
-          ? await this.router.getOrStartRuntime(record, { resumeSessionId: priorHuman.acpSessionId })
-          : await this.router.getOrStartRuntime(record);
+      const resumeSessionId = priorHuman?.acpSessionId || record.acpSessionId;
+      let activeRuntime = resumeSessionId
+        ? await this.acquireRecordedRuntime(record, priorHuman?.id ?? liveMarkerId, priorHuman?.acpSessionId ?? undefined)
+        : await this.router.getOrStartRuntime(record);
       contextIdentity = this.contextBudgetIdentity(record, activeRuntime.getSessionInfo()?.sessionId);
       if (!contextIdentity || !matchesContextBudget(observedContextBudget, contextIdentity)) observedContextBudget = undefined;
       this.assertQueueFence(queueFence);
@@ -6104,7 +6103,8 @@ export class Orchestrator {
         });
     try {
       if (!opts.resumeSessionId) await this.ensureOwnSession(record, target);
-      const rt = await acquire(() => opts.resumeSessionId
+      const resumeSessionId = opts.resumeSessionId || record.acpSessionId;
+      const rt = await acquire(() => resumeSessionId
         // The same owner serves human and live-dispatch continuations. The
         // enclosing phase sees its exhausted outcome, never a fresh budget.
         ? this.acquireRecordedRuntime(record, opts.logContext?.dispatch as string ?? record.id, opts.resumeSessionId)
@@ -7071,11 +7071,11 @@ export class Orchestrator {
   private async acquireRecordedRuntime(
     record: SessionRecord,
     attemptId: string,
-    resumeSessionId: string,
+    resumeSessionId?: string,
   ): Promise<AgentRuntime> {
     for (let attempt = 1; attempt <= BOOT_RECOVERY_ATTEMPTS; attempt++) {
       try {
-        return await this.router.getOrStartRuntime(record, { resumeSessionId });
+        return await this.router.getOrStartRuntime(record, resumeSessionId ? { resumeSessionId } : undefined);
       } catch (err) {
         if (!isRetryableBootAcquisitionError(err)) {
           throw err;
@@ -15717,16 +15717,15 @@ export class Orchestrator {
     let settle!: () => void;
     let settled = false;
     const completion = new Promise<void>((resolve) => { settle = resolve; });
-    const finishAdoption = (): void => {
+    const finishAdoption = (retainChild = false): void => {
       if (settled) return;
       settled = true;
       adoptedPanel?.stop();
       if (this.adoptedStatusPanels.get(attempt.id) === adoptedPanel) this.adoptedStatusPanels.delete(attempt.id);
-      if (recoveryRuntime && recoveryRecord) {
-        this.router.releaseRecoveryRuntime(recoveryRecord.id, recoveryRuntime);
-      }
+      const retained = recoveryRuntime && recoveryRecord
+        && this.router.releaseRecoveryRuntime(recoveryRecord.id, recoveryRuntime, retainChild);
       this.remoteAdoptionFinishers.delete(attempt.id);
-      child.detach();
+      if (!retained) child.detach();
       settle();
     };
     this.remoteAdoptionFinishers.set(attempt.id, finishAdoption);
@@ -15808,7 +15807,7 @@ export class Orchestrator {
         || result.acpSessionId !== binding.acpSessionId) return;
       void finalize(result).catch((err) =>
         this.logger.warn({ err, attempt: attempt.id }, "remote recovery result adoption failed"))
-        .finally(finishAdoption);
+        .finally(() => finishAdoption(result.stopReason === "prompt_not_received"));
     });
     child.on("error", (err) => {
       this.continueLostRemoteTurn(attempt, `replay from the bridge failed (${err instanceof Error ? err.message : String(err)})`);
@@ -15858,6 +15857,7 @@ export class Orchestrator {
           const row = reply.health.find(row => row.slot === binding.slot);
           const snapshot = isRemoteRecoverySnapshot(row?.recovery) ? row.recovery : undefined;
           let cause: string | undefined;
+          let retainChild = false;
           if (!row) cause = `bridge slot ${binding.slot} on ${location} no longer exists`;
           else if (row.alive === false || row.attached === false) {
             cause = `bridge slot ${binding.slot} on ${location} has no attached live process${row.orphanReason ? ` (${row.orphanReason})` : ""}`;
@@ -15867,10 +15867,13 @@ export class Orchestrator {
             && this.remoteAdoptionFinishers.has(attempt.id)) {
             const result = await mux.sendCmd("reconcileRung1Recovery", {
               slot: binding.slot, submissionId: binding.submissionId, acpSessionId: binding.acpSessionId,
-            }) as { state?: string; cause?: unknown };
-            if (result.state === "missing" && typeof result.cause === "string") cause = result.cause;
+            }) as { state?: string; cause?: unknown; retainChild?: boolean };
+            if (result.state === "missing" && typeof result.cause === "string") {
+              cause = result.cause;
+              retainChild = result.retainChild === true;
+            }
           }
-          if (cause) await this.settleMissingRemoteRecovery(attempt, cause);
+          if (cause) await this.settleMissingRemoteRecovery(attempt, cause, retainChild);
           else if (snapshot && this.adoptingRemoteResults.has(attempt.id) && this.remoteAdoptionWaiters.has(attempt.id)) {
             this.remoteAdoptionWaiters.get(attempt.id)?.();
           } else if (snapshot && !this.adoptingRemoteResults.has(attempt.id) && !this.remoteAdoptionFinishers.has(attempt.id)) {
@@ -15901,7 +15904,7 @@ export class Orchestrator {
     }));
   }
 
-  private async settleMissingRemoteRecovery(attempt: TurnAttempt, cause: string): Promise<void> {
+  private async settleMissingRemoteRecovery(attempt: TurnAttempt, cause: string, retainChild = false): Promise<void> {
     const binding = attempt.remoteRecovery!;
     const finishedUtc = new Date().toISOString();
     const result: RemoteRecoveryResult = { version: 1, submissionId: binding.submissionId,
@@ -15916,7 +15919,7 @@ export class Orchestrator {
     try {
       await this.finishRemoteRecoveryCompletion(attempt, this.store.turnAttempts.get(attempt.id)!);
     } finally {
-      this.remoteAdoptionFinishers.get(attempt.id)?.();
+      this.remoteAdoptionFinishers.get(attempt.id)?.(retainChild);
     }
   }
 

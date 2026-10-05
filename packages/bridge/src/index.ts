@@ -215,6 +215,10 @@ async function makeSlotManager(opts: {
   }
 
   const sendSupervisedFrame = (frame: SupervisedBridgeFrame & { slot: number }): void => {
+    if (frame.type === "stderr" && frame.data !== undefined) {
+      wsSend({ slot: frame.slot, type: "stderr", data: frame.data, seq: frame.seq });
+      return;
+    }
     if (frame.type === "data" && frame.data !== undefined) {
       if (!probes.absorb(frame.slot, frame.data)) {
         wsSend({ slot: frame.slot, type: "data", data: frame.data, seq: frame.seq });

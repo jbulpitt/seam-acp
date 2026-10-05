@@ -353,21 +353,30 @@ describe("#250 production dispatch lifecycle (synthetic transport, no providers)
     expect(h.store.turnAttempts.get(h.spec.id)).toMatchObject({ state: "suspended", acpSessionId: "recorded-acp", stalledUtc: null });
   });
 
-  it.each([false, true])("#336 ordinary acquisition failure remains defect with ambient cutoff=%s", async ambientCutoff => {
+  it("retries an ordinary saved-session acquisition without changing its conversation", async () => {
     const h = setup();
-    h.router.getOrStartRuntime.mockImplementationOnce(async () => {
-      // No shutdown event cancelled this acquisition. A window flag alone
-      // must never turn its independent failure into a shutdown handoff.
-      (h.orch as any).restartCutoff = ambientCutoff;
-      throw new Error("ACP connection closed");
-    });
+    h.router.getOrStartRuntime.mockRejectedValueOnce(new Error("Internal error"));
+    h.runtime.prompt.mockResolvedValueOnce({ stopReason: "end_turn" });
     await h.watcher.start(); await enqueueDispatchSpec(h.dataDir, h.spec);
     await h.watcher.tick(); await h.watcher.drain();
-    expect(h.refusals).toMatchObject([{ suspension: "defect", reason: "provider acquisition failed during execution: ACP connection closed" }]);
-    expect(h.notices).toHaveBeenCalledTimes(1);
-    expect(h.store.turnAttempts.get(h.spec.id)).toMatchObject({ state: "suspended",
-      stalledReason: "provider acquisition failed during execution: ACP connection closed",
-      stallNoticeUtc: expect.any(String) });
+    expect(h.refusals).toEqual([]);
+    expect(h.notices).not.toHaveBeenCalled();
+    expect(h.acquisitionSleep).toHaveBeenCalledExactlyOnceWith(30_000);
+    expect(h.router.getOrStartRuntime).toHaveBeenCalledTimes(2);
+    expect(h.runtime.prompt).toHaveBeenCalledExactlyOnceWith(expect.stringContaining(h.spec.prompt), undefined, expect.any(Object));
+    expect(h.store.turnAttempts.get(h.spec.id)).toMatchObject({ state: "completed", acpSessionId: "recorded-acp" });
+  });
+
+  it("preserves the last load cause when an ordinary acquisition exhausts the existing budget", async () => {
+    const h = setup();
+    h.router.getOrStartRuntime.mockRejectedValue(new Error("Internal error: native resume failed"));
+    await h.watcher.start(); await enqueueDispatchSpec(h.dataDir, h.spec);
+    await h.watcher.tick(); await h.watcher.drain();
+    expect(h.router.getOrStartRuntime).toHaveBeenCalledTimes(3);
+    expect(h.acquisitionSleep.mock.calls).toEqual([[30_000], [30_000]]);
+    expect(h.runtime.prompt).not.toHaveBeenCalled();
+    expect(h.store.get("discord:worker")?.acpSessionId).toBe("recorded-acp");
+    expect(h.store.turnAttempts.get(h.spec.id)?.stalledReason).toContain("Internal error: native resume failed");
   });
 
   it("#336 a classified defect survives a real shutdown during non-acquisition setup", async () => {

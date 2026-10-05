@@ -19,6 +19,9 @@ process.stdin.on("data", (chunk) => {
     buffer = buffer.slice(newline + 1);
     if (!line.trim()) continue;
     const message = JSON.parse(line);
+    if (message.method && process.env.FAKE_AGENT_REQUESTS) {
+      fs.appendFileSync(process.env.FAKE_AGENT_REQUESTS, `${JSON.stringify({ pid: process.pid, method: message.method, params: message.params })}\n`);
+    }
     if (message.id === "fixture-client-reply" && "result" in message && clientReply) {
       clientReply(); clientReply = undefined; continue;
     }
@@ -28,8 +31,14 @@ process.stdin.on("data", (chunk) => {
       send({ id: message.id, result: { protocolVersion: 1, agentCapabilities: { loadSession: true } } });
     } else if (message.method === "session/new") {
       currentModeId = "agent";
-      send({ id: message.id, result: { sessionId: "s1", ...modes() } });
+      send({ id: message.id, result: { sessionId: process.env.FAKE_AGENT_NEW_SESSION_ID ?? "s1", ...modes() } });
     } else if (message.method === "session/load") {
+      if (process.env.FAKE_AGENT_LOAD_FAILURE && fs.existsSync(process.env.FAKE_AGENT_LOAD_FAILURE)) {
+        process.stderr.write("native thread/resume failed: fixture load outage\n");
+        setTimeout(() => send({ id: message.id,
+          error: { code: -32603, message: "Internal error", data: { trace: "fixture-resume" } } }), 20);
+        continue;
+      }
       currentModeId = "agent";
       update("replayed history");
       const reply = () => send({ id: message.id, result: modes() });
@@ -41,6 +50,8 @@ process.stdin.on("data", (chunk) => {
     } else if (message.method === "session/set_mode") {
       currentModeId = message.params.modeId;
       send({ id: message.id, result: {} });
+    } else if (message.method === "session/set_config_option") {
+      send({ id: message.id, result: { configOptions: [] } });
     } else if (message.method === "session/prompt") {
       const text = message.params.prompt.map((part) => part.text ?? "").join("");
       if (text.includes("continue")) {

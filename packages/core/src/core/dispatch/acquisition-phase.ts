@@ -40,7 +40,7 @@ export function isRetryableBootAcquisitionError(err: unknown): boolean {
     current = typed.cause;
   }
   const message = err instanceof Error ? err.message : String(err);
-  if (/Strict resume refused:/i.test(message) || /cwd does not exist/i.test(message)) return false;
+  if (/Strict resume refused:|^Refused: agent /i.test(message) || /cwd does not exist/i.test(message)) return false;
   // Unknown pre-prompt transport failures get bounded retries. Exhaustion is
   // visible; this never permits prompt replay or an unbounded loop.
   return true;

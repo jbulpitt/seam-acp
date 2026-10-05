@@ -154,6 +154,7 @@ interface MuxMsg {
   seq?: number;
   type:
     | "data"
+    | "stderr"
     | "kill"
     | "exit"
     | "cmd"
@@ -652,6 +653,9 @@ export function makeMux(opts: {
                   if (frame.type === "data" && typeof frame.data === "string") {
                     if (typeof frame.seq === "number") outputCursor.set(slot, frame.seq);
                     live.stdout.push(frame.data);
+                  } else if (frame.type === "stderr" && frame.data !== undefined) {
+                    if (typeof frame.seq === "number") outputCursor.set(slot, frame.seq);
+                    live.fake.stderr.push(frame.data);
                   } else if (frame.type === "recovery" && isRemoteRecoverySnapshot(frame.recovery)) {
                     if (typeof frame.seq === "number") outputCursor.set(slot, frame.seq);
                     opts.onRemoteRecovery?.(slot, frame.recovery);
@@ -737,6 +741,9 @@ export function makeMux(opts: {
         // replay" — today's behaviour exactly.
         if (typeof msg.seq === "number") outputCursor.set(msg.slot, msg.seq);
         entry.stdout.push(msg.data);
+      } else if (msg.type === "stderr" && msg.data !== undefined) {
+        if (typeof msg.seq === "number") outputCursor.set(msg.slot, msg.seq);
+        entry.fake.stderr.push(msg.data);
       } else if (msg.type === "recovery" && isRemoteRecoverySnapshot(msg.recovery)) {
         if (typeof msg.seq === "number") outputCursor.set(msg.slot, msg.seq);
         opts.onRemoteRecovery?.(msg.slot, msg.recovery);

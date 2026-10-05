@@ -101,8 +101,9 @@ describe("captured agent output uses live fence handlers", () => {
     const h = setup();
     await h.orch.publishStatelessHandoffCard(h.channel, h.spec, undefined, "▶ Handoff", Date.now(), { text: fence });
     expect(h.adapter.sendChoiceCard).not.toHaveBeenCalled();
-    expect(h.visible.join("")).toContain("Question for you: Choose next");
-    expect(h.visible.join("")).not.toContain("seam-choice");
+    const output = JSON.stringify(h.adapter.sendPanel.mock.calls[0]![1]);
+    expect(output).toContain("Question for you: Choose next");
+    expect(output).not.toContain("seam-choice");
   });
 
   it("processes slash-steer completion output", async () => {

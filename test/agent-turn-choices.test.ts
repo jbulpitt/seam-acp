@@ -28,7 +28,7 @@ function setup() {
     sendMessage: vi.fn(async (channel, _text, _delivery?: unknown) => ({ channel, id: "text" })),
   };
   const orch = new Orchestrator({ logger: pino({ level: "silent" }) as any, store,
-    config: { DATA_DIR: dir, REPOS_ROOT: "/repo", SEAM_PARTICIPANT_USER_IDS: [], SEAM_CONFIG_ADMIN_USER_IDS: [] } as any,
+    config: { DATA_DIR: dir, REPOS_ROOT: "/repo", SEAM_PARTICIPANT_USER_IDS: new Set(), SEAM_CONFIG_ADMIN_USER_IDS: new Set() } as any,
     router: {} as any, adapter: adapter as any, renderer: {} as any });
   const spec = (kind: DispatchSpec["kind"], over: Partial<DispatchSpec> = {}): DispatchSpec => ({
     id: "attempt", target: "worker", session: "live", kind, originThreadRef: "caller", returnTo: "delivery-thread",

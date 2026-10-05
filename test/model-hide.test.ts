@@ -16,6 +16,8 @@ import { SessionStore } from "../packages/core/src/core/session-store.js";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
 import { AutocompleteRegistry } from "../packages/core/src/platforms/discord/autocomplete.js";
 import { buildSlashRegistrationBody } from "../packages/core/src/platforms/discord/commands.js";
+import { PluginHost } from "../packages/core/src/plugins/host.js";
+import { registerConfigUiCommands } from "./plugin-config-ui-fixture.js";
 import { SyntheticInteraction, validateSlashSpec } from "../packages/core/src/platforms/discord/synthetic-interaction.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
@@ -139,7 +141,9 @@ describe("model hiding", () => {
 
   it("injects a real autocomplete-shaped interaction and records returned choices", async () => {
     const spec = { kind: "autocomplete" as const, channelId: "123", command: "seam", subcommandGroup: "config", subcommand: "set", focused: "model", options: { model: "" } };
-    const types = validateSlashSpec(spec, buildSlashRegistrationBody());
+    const plugins = new PluginHost(logger);
+    registerConfigUiCommands(plugins);
+    const types = validateSlashSpec(spec, buildSlashRegistrationBody(plugins.slash));
     const interaction = new SyntheticInteraction(spec, { client: {} as never, channel: { id: "123" } as never, user: {} as never, member: null }, types);
     expect(interaction.isAutocomplete()).toBe(true);
     expect(interaction.options?.getFocused(true)).toMatchObject({ name: "model", value: "" });

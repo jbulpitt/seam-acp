@@ -6,6 +6,7 @@ import path from "node:path";
 import os from "node:os";
 import { randomUUID } from "node:crypto";
 import { ActionCardManager } from "../../core/action-cards/manager.js";
+import { SessionActions, attachCompactedSession, fitTranscriptToWindow } from "../../core/session-actions.js";
 import type { RequestPermissionRequest, RequestPermissionResponse } from "@agentclientprotocol/sdk";
 import {
   DispatchSuspendedError,
@@ -81,7 +82,6 @@ import {
   DISCORD_COMPACTION_EXECUTOR_LABEL,
   DISCORD_COMPACTION_MODEL,
   discordCompactionExecutor,
-  isDiscordPremiumCompactAvailable,
   requireExactCatalogModel,
   resolveDiscordCompactionProfile,
 } from "../../core/compaction/discord-executor.js";
@@ -157,7 +157,6 @@ import {
 } from "./collector-lifecycle.js";
 import {
   describeAttachOutcome,
-  planSessionAttachment,
   type AttachIntent,
   type AttachOutcome,
 } from "../../core/session-attach.js";
@@ -6910,43 +6909,7 @@ export class Orchestrator {
     observedAtStart: string;
     intent: AttachIntent;
   }): Promise<AttachOutcome> {
-    const { record, sourceId, newId, observedAtStart, intent } = opts;
-    const fresh = this.store.get(record.id);
-    const plan = planSessionAttachment({
-      current: fresh ? fresh.acpSessionId : null,
-      observedAtStart,
-      sourceId,
-      newId,
-      intent,
-    });
-
-    let outcome: AttachOutcome;
-    if (plan.action === "cas") {
-      if (this.store.compareAndSwapAcpSession(record.id, plan.expect, plan.next)) {
-        outcome = { attached: true, reason: plan.reason };
-        // Drop the warm runtime so the next turn resumes the seeded session.
-        // `clearAcpSession: false` — the binding we just wrote must survive.
-        await this.router.invalidate(record.id, { clearAcpSession: false });
-      } else {
-        // Lost the race between the read above and the UPDATE. Someone bound
-        // the thread in that gap; theirs is the newer deliberate choice.
-        outcome = { attached: false, reason: "rebound-elsewhere" };
-      }
-    } else if (plan.action === "noop") {
-      outcome = { attached: true, reason: plan.reason };
-    } else {
-      outcome = { attached: false, reason: plan.reason };
-    }
-
-    // Re-sync the caller's snapshot from the store either way: the value it
-    // holds is stale whether or not WE were the one who changed it.
-    const settled = this.store.get(record.id);
-    if (settled) record.acpSessionId = settled.acpSessionId;
-    this.logger.info(
-      { recordId: record.id, sourceId, newId, intent, outcome },
-      "compaction attachment decided"
-    );
-    return outcome;
+    return attachCompactedSession({ store: this.store, router: this.router, logger: this.logger }, opts);
   }
 
   setDispatchWatcher(watcher: DispatchWatcher): void {
@@ -18512,9 +18475,26 @@ export class Orchestrator {
     await i.deferReply({ flags: MessageFlags.Ephemeral });
 
     const cwd = this.effectiveCwd(record);
+    const actions = new SessionActions({
+      record, manager, cwd, profile, binding: sessionBinding,
+      store: this.store, router: this.router, logger: this.logger,
+      services: {
+        modelCatalog: this.modelCatalog, reposRoot: this.config.REPOS_ROOT,
+        compactionModel: (b) => this.compactionModelFor(b.agentId, b.location),
+        compactionWindow: (b, model) => this.compactionWindowFor(b.agentId, b.location, model),
+        launch: (args) => this.launchForLocation(args),
+        cleanup: (args) => this.deleteThrowawaySession(args),
+        seed: (args) => this.seedNewSession(args),
+        buildSeed: (args) => this.buildDefaultCompactionSeed(args),
+        rebuild: (args) => this.reconstructSessionFromDiscord(args),
+        compactFromThread: (channel, record) => this.compactSessionFromThread(channel, record),
+        premium: (record, opts) => this.compactThread(record, opts),
+        flushIdentity: (id) => this.identityEffects.flush(id),
+      },
+    });
     let sessions: SessionSummary[];
     try {
-      sessions = await manager.listSessions(cwd);
+      sessions = await actions.list();
     } catch (err: any) {
       await i.editReply({
         content: `Failed to list sessions: ${err.message}`,
@@ -18645,21 +18625,10 @@ export class Orchestrator {
         .setLabel("🪄 AI Summary")
         .setStyle(ButtonStyle.Primary);
 
-      // "Can compact" now means: there's a configured summarizer model for this
-      // agent. (The write-back is a seedNewSession turn, which any agent with a
-      // runtime supports — no special manager method required.)
-      const canCompact = this.compactionModelFor(
-        sessionBinding.agentId,
-        sessionBinding.location
-      ) !== "";
-      const canDiscordPremium = isDiscordPremiumCompactAvailable((id) =>
-        this.router.getProfile(id)
-      );
-      // Any agent with a session manager can receive a migrated session (the
-      // summary is seeded into a fresh session under that agent).
-      const targetProfiles = this.router.listProfiles().filter(p =>
-        p.id !== record.agentId && !!p.sessionManager
-      );
+      const capabilities = actions.capabilities();
+      const canCompact = capabilities.canCompact;
+      const canDiscordPremium = capabilities.canPremiumDiscord;
+      const targetProfiles = capabilities.migrationTargets;
 
       const row1 = new ActionRowBuilder<ButtonBuilder>().addComponents(prevBtn, nextBtn, closeBtn);
       const row2 = new ActionRowBuilder<ButtonBuilder>().addComponents(attachBtn, cloneBtn, cloneAttachBtn, deleteBtn);
@@ -18675,7 +18644,7 @@ export class Orchestrator {
         );
       }
 
-      if (typeof mgr.repairSession === "function") {
+      if (capabilities.canRepair) {
         row3Buttons.push(
           new ButtonBuilder()
             .setCustomId("sessions:repair")
@@ -18714,7 +18683,7 @@ export class Orchestrator {
         );
       }
       // Premium (session JSONL based) — needs a raw-history reader (Claude/agy).
-      if (canCompact && typeof mgr.getHistoryPath === "function") {
+      if (capabilities.canPremiumSession) {
         row4Buttons.push(
           new ButtonBuilder()
             .setCustomId("sessions:premium")
@@ -18753,11 +18722,7 @@ export class Orchestrator {
      * captured value is what made a just-compacted session still show as
      * "⚪ Inactive". Every render below asks this instead.
      */
-    const activeSessionId = (): string => {
-      const fresh = this.store.get(record.id);
-      if (fresh) record.acpSessionId = fresh.acpSessionId;
-      return record.acpSessionId;
-    };
+    const activeSessionId = () => actions.activeSessionId();
 
     // #179: anything a previous run parked for THIS operator on THIS thread is
     // handed back here — an authenticated moment (they ran the command) with an
@@ -18890,7 +18855,7 @@ export class Orchestrator {
           // Re-list so the browser can position on the seeded session; its
           // Attach button is then one click away when the binding was left
           // deliberately alone.
-          sessions = await manager.listSessions(cwd);
+          sessions = await actions.list();
           const newIndex = sessions.findIndex((s) => s.sessionId === res.newId);
           if (newIndex !== -1) currentIndex = newIndex;
 
@@ -18978,16 +18943,7 @@ export class Orchestrator {
         await btnInteraction.deferUpdate();
         const session = sessions[currentIndex];
         if (session) {
-          await this.router.invalidate(record.id);
-          this.store.upsert({
-            ...record,
-            acpSessionId: session.sessionId,
-            updatedUtc: new Date().toISOString(),
-          });
-          const fresh = this.store.get(record.id);
-          if (fresh) {
-            record.acpSessionId = fresh.acpSessionId;
-          }
+          await actions.attach(session.sessionId);
           await lifecycle.terminal("attached", {
             embeds: [
               new EmbedBuilder()
@@ -19004,8 +18960,8 @@ export class Orchestrator {
         if (session) {
           const newSessionId = randomUUID();
           try {
-            await manager.cloneSession(cwd, session.sessionId, newSessionId);
-            sessions = await manager.listSessions(cwd);
+            await actions.clone(session.sessionId, newSessionId);
+            sessions = await actions.list();
             const newIndex = sessions.findIndex(s => s.sessionId === newSessionId);
             if (newIndex !== -1) {
               currentIndex = newIndex;
@@ -19032,19 +18988,10 @@ export class Orchestrator {
         if (session) {
           const newSessionId = randomUUID();
           try {
-            await manager.cloneSession(cwd, session.sessionId, newSessionId);
-            sessions = await manager.listSessions(cwd);
+            await actions.clone(session.sessionId, newSessionId);
+            sessions = await actions.list();
 
-            await this.router.invalidate(record.id);
-            this.store.upsert({
-              ...record,
-              acpSessionId: newSessionId,
-              updatedUtc: new Date().toISOString(),
-            });
-            const fresh = this.store.get(record.id);
-            if (fresh) {
-              record.acpSessionId = fresh.acpSessionId;
-            }
+            await actions.attach(newSessionId);
 
             await lifecycle.terminal("cloned_attached", {
               embeds: [
@@ -19098,20 +19045,8 @@ export class Orchestrator {
         const session = sessions[currentIndex];
         if (session) {
           try {
-            await manager.deleteSession(cwd, session.sessionId);
-            if (record.acpSessionId === session.sessionId) {
-              await this.router.invalidate(record.id, {
-                clearAcpSession: true,
-                operatorIntent: "replace-session",
-              });
-              const fresh = this.store.get(record.id);
-              if (fresh) {
-                record.acpSessionId = fresh.acpSessionId;
-              } else {
-                record.acpSessionId = "";
-              }
-            }
-            sessions = await manager.listSessions(cwd);
+            await actions.delete(session.sessionId);
+            sessions = await actions.list();
             if (sessions.length === 0) {
               await btnInteraction.editReply({
                 embeds: [
@@ -19171,13 +19106,10 @@ export class Orchestrator {
       } else if (customId === "sessions:repair_confirm") {
         await btnInteraction.deferUpdate();
         const session = sessions[currentIndex];
-        if (session && typeof manager.repairSession === "function") {
+        if (session && actions.canRepair()) {
           try {
-            await manager.repairSession(cwd, session.sessionId);
-            if (record.acpSessionId === session.sessionId) {
-              await this.router.invalidate(record.id);
-            }
-            sessions = await manager.listSessions(cwd);
+            await actions.repair(session.sessionId);
+            sessions = await actions.list();
             const opts = makeSessionMessageOptions(currentIndex, sessions, activeSessionId(), manager);
             const embed = opts.embeds?.[0];
             if (embed) {
@@ -19214,13 +19146,8 @@ export class Orchestrator {
               id: i.channelId,
               ...(record.parentRef ? { parentId: record.parentRef } : {}),
             };
-            const { newSessionId, attachment, seed, destination } = await this.reconstructSessionFromDiscord({
-              record,
-              channel: channelRef,
-              observedAtStart,
-              attachIntent: "attach",
-            });
-            sessions = await manager.listSessions(cwd);
+            const { newSessionId, attachment, seed, destination } = await actions.rebuild(channelRef, observedAtStart);
+            sessions = await actions.list();
             const newIndex = sessions.findIndex((s) => s.sessionId === newSessionId);
             if (newIndex !== -1) currentIndex = newIndex;
             const attachLine = describeAttachOutcome(attachment, {
@@ -19283,11 +19210,8 @@ export class Orchestrator {
         this.runCardJob(async () => {
           try {
             const channelRef = { platform: "discord", id: i.channelId };
-            const { newSessionId, summary } = await this.compactSessionFromThread(
-              channelRef,
-              record
-            );
-            sessions = await manager.listSessions(cwd);
+            const { newSessionId, summary } = await actions.compactFromThread(channelRef);
+            sessions = await actions.list();
             const newIndex = sessions.findIndex(s => s.sessionId === newSessionId);
             if (newIndex !== -1) currentIndex = newIndex;
             const successEmbed = new EmbedBuilder()
@@ -19339,86 +19263,7 @@ export class Orchestrator {
           });
 
           this.runCardJob(async () => {
-            let tempRuntime: AgentRuntime | undefined;
-            try {
-              const transcript = await manager.getTranscript(cwd, session.sessionId);
-              if (!transcript.trim()) {
-                throw new Error("The session transcript is empty.");
-              }
-
-              let sanitizedTranscript = transcript
-                .split("\n")
-                .map((line) => {
-                  if (line.length > 1000) {
-                    return line.substring(0, 1000) + " ... [Line truncated]";
-                  }
-                  return line;
-                })
-                .join("\n");
-
-              const summarySelection = this.modelCatalog.resolve(sessionBinding, {
-                model: "default",
-              });
-              const maxTranscriptLength = 50000;
-              if (sanitizedTranscript.length > maxTranscriptLength) {
-                const keepHead = Math.floor(maxTranscriptLength * 0.3);
-                const keepTail = Math.floor(maxTranscriptLength * 0.6);
-                sanitizedTranscript =
-                  sanitizedTranscript.substring(0, keepHead) +
-                  "\n\n... [Transcript truncated due to length limits] ...\n\n" +
-                  sanitizedTranscript.substring(sanitizedTranscript.length - keepTail);
-              }
-
-              // #308: protects the session-summary helper; deleting it allows
-              // its direct temporary runtime to bypass the channel rule.
-              this.router.assertAgentAllowedForRecord(record, profile.id);
-              const launch = this.launchForLocation({
-                profile,
-                location: sessionBinding.location,
-                cwd,
-                model: summarySelection.raw.model,
-                ...(summarySelection.raw.effort ? { effort: summarySelection.raw.effort } : {}),
-                sessionId: record.id,
-              });
-              tempRuntime = new AgentRuntime({
-                profile,
-                logger: this.logger.child({ session: `temp-summary-${session.sessionId}` }),
-                ...this.router.permissionOptions(record),
-                mcpServers: launch.mcpServers,
-                ...(summarySelection.model ? { effortDescriptor: summarySelection.model.effort } : {}),
-                spawnFn: launch.spawnFn,
-              });
-
-              await tempRuntime.start();
-
-              await tempRuntime.newSession({
-                cwd,
-                model: summarySelection.raw.model,
-                ...(summarySelection.raw.effort ? { effort: summarySelection.raw.effort } : {}),
-                strictModel: true,
-              });
-
-              let summaryText = "";
-              tempRuntime.onEvent((event) => {
-                if (event.kind === "agent-text") {
-                  summaryText += event.text;
-                }
-              });
-
-              const summaryPrompt =
-                `Please summarize the following conversation session. Highlight:\n` +
-                `1. The primary goal of the session.\n` +
-                `2. What key changes, debugging steps, or features were implemented.\n` +
-                `3. The current status or remaining tasks.\n\n` +
-                `Conversation Transcript:\n` +
-                `${sanitizedTranscript}`;
-
-              const outcome = await tempRuntime.prompt(summaryPrompt);
-
-              if (!summaryText.trim()) {
-                throw new Error("Agent completed but returned an empty summary.");
-              }
-
+            await actions.summary(session.sessionId, async (summaryText) => {
               const displaySummary = summaryText.length > 4000 ? summaryText.substring(0, 3997) + "..." : summaryText;
 
               const summaryEmbed = new EmbedBuilder()
@@ -19446,7 +19291,7 @@ export class Orchestrator {
                 // channel. Parked for private collection instead.
                 fallbackFile: { filename: "session-summary.md", body: summaryText },
               });
-            } catch (err: any) {
+            }, async (err: any) => {
               this.logger.error({ err, sessionId: session.sessionId }, "failed to generate AI summary");
 
               const errorEmbed = new EmbedBuilder()
@@ -19460,22 +19305,7 @@ export class Orchestrator {
                 channel: browserChannel ?? null,
                 fallback: { kind: "summary", outcome: "failed" },
               });
-            } finally {
-              if (tempRuntime) {
-                const tempSessionId = tempRuntime.getSessionInfo()?.sessionId;
-                await tempRuntime.dispose().catch(() => {});
-                if (tempSessionId) {
-                  await this.deleteThrowawaySession({
-                    location: sessionBinding.location,
-                    profile,
-                    manager,
-                    cwd,
-                    sessionId: tempSessionId,
-                    label: "failed to clean up temporary summary session",
-                  });
-                }
-              }
-            }
+            });
           });
         }
       } else if (
@@ -19516,47 +19346,15 @@ export class Orchestrator {
               successTitle: "🗳️ Session Compacted",
               failureTitle: "❌ Compaction Failed",
               run: async () => {
-                if (!this.compactionModelFor(sessionBinding.agentId, sessionBinding.location)) {
-                  throw new Error(
-                    `Compaction is not supported for agent profile \`${record.agentId}\` (no summarizer model).`
-                  );
-                }
-                const built = await this.buildDefaultCompactionSeed({
-                  profile,
-                  manager,
-                  agentId: record.agentId,
-                  location: sessionBinding.location,
-                  cwd,
-                  sessionId: session.sessionId,
-                  restrictionChannelId: record.parentRef ?? record.channelRef,
-                });
-                if (!built) throw new Error("Nothing to compact (empty transcript or no summarizer model).");
-
-                // Non-destructive: seed a NEW session with the summary
-                // (resumable) and leave the original intact.
-                const cfg = this.store.readConfig(record);
-                const newId = await this.seedNewSession({
-                  profile, restrictionChannelId: record.parentRef ?? record.channelRef, cwd,
-                  location: sessionBinding.location,
-                  sessionId: record.id,
-                  ...(cfg.model ? { model: cfg.model } : {}),
-                  ...(cfg.reasoningEffort ? { effort: cfg.reasoningEffort } : {}),
-                  summary: built.seed,
-                });
-                const attachment = await this.attachCompactedSession({
-                  record,
-                  sourceId: session.sessionId,
-                  newId,
-                  observedAtStart,
-                  intent: "attach",
-                });
+                const result = await actions.compact(session.sessionId, observedAtStart);
+                const { newId, attachment } = result;
                 return {
                   newId,
                   attachment,
                   detail:
                     `Compacted into a **new session** \`${newId}\` ` +
-                    `(summarized ${built.summarizedTurns} older turn(s), kept ${built.keptTurns} verbatim, ` +
-                    `pinned ${built.pinnedCount} fact(s)).`,
+                    `(summarized ${result.summarizedTurns} older turn(s), kept ${result.keptTurns} verbatim, ` +
+                    `pinned ${result.pinnedCount} fact(s)).`,
                 };
               },
             });
@@ -19581,41 +19379,22 @@ export class Orchestrator {
                 : "✨ Premium Compaction Complete",
               failureTitle: "❌ Premium Compaction Failed",
               run: async (onProgress) => {
-                // The shared primitive owns run+seed+compare-and-swap; this
-                // handler owns only the card. `attachIntent: "attach"` is what
-                // makes the BUTTON compact-and-attach: a thread left unbound by
-                // an agent switch is bound to the result instead of being left
-                // silently disconnected. It still never steals a binding that
-                // points somewhere else.
-                const res = await this.compactThread(record, {
-                  ...(fromDiscord ? { source: "discord" as const } : {}),
-                  sessionId: session.sessionId,
-                  ...(browserChannel ? { channel: browserChannel } : {}),
-                  attachIntent: "attach",
-                  // Admission-time, from the click handler — see above.
-                  observedAtStart,
-                  onProgress,
+                const res = await actions.premium(session.sessionId, observedAtStart, {
+                  fromDiscord, ...(browserChannel ? { channel: browserChannel } : {}), onProgress,
                 });
-                const reportName =
-                  `premium-compaction${fromDiscord ? "-discord" : ""}-${session.sessionId}.md`;
-                const reportPath = path.join(os.tmpdir(), reportName);
-                const wrote = await fsp
-                  .writeFile(reportPath, res.reportMarkdown, "utf8")
-                  .then(() => true)
-                  .catch(() => false);
                 return {
-                  newId: res.newSessionId,
+                  newId: res.newId,
                   attachment: res.attachment,
                   detail:
                     (fromDiscord
-                      ? `Compacted from Discord thread history into a **new session** \`${res.newSessionId}\``
-                      : `Compacted into a **new session** \`${res.newSessionId}\``) +
+                      ? `Compacted from Discord thread history into a **new session** \`${res.newId}\``
+                      : `Compacted into a **new session** \`${res.newId}\``) +
                     ` with the multi-agent pipeline (${res.stats.chunks} chunk(s)` +
                     (res.analysisExecutor
                       ? `, analysis ${res.analysisExecutor.displayName} · ${res.analysisExecutor.model}`
                       : "") +
                     `).`,
-                  ...(wrote ? { report: { path: reportPath, name: reportName } } : {}),
+                  ...(res.report ? { report: res.report } : {}),
                 };
               },
             });
@@ -19624,10 +19403,7 @@ export class Orchestrator {
       } else if (customId === "sessions:import_to_cwd") {
         const session = sessions[currentIndex];
         if (!session) return;
-        const compactionModel = this.compactionModelFor(
-          sessionBinding.agentId,
-          sessionBinding.location
-        );
+        const compactionModel = actions.compactionModel();
         if (!compactionModel) {
           await btnInteraction.reply({
             content: `❌ Import is not supported for this agent.`,
@@ -19664,7 +19440,7 @@ export class Orchestrator {
         const rawCwd = submission.fields.getTextInputValue("target_cwd").trim();
         let targetCwd: string;
         try {
-          targetCwd = resolveRepoPath(this.config.REPOS_ROOT, rawCwd);
+          targetCwd = actions.resolveImportCwd(rawCwd);
         } catch (err) {
           await submission.reply({
             content: `❌ Invalid cwd: ${(err as Error).message}`,
@@ -19691,94 +19467,7 @@ export class Orchestrator {
         });
 
         this.runCardJob(async () => {
-          let tempRuntime: AgentRuntime | undefined;
-          try {
-            const transcript = await manager.getTranscript(cwd, session.sessionId);
-            if (!transcript.trim()) {
-              throw new Error("The session transcript is empty.");
-            }
-
-            let sanitizedTranscript = transcript
-              .split("\n")
-              .map((line) =>
-                line.length > 1000
-                  ? line.substring(0, 1000) + " ... [Line truncated]"
-                  : line
-              )
-              .join("\n");
-
-            const promptTemplate = await fsp.readFile(path.join(this.config.REPOS_ROOT, "compact.md"), "utf8");
-            const templateOverhead = promptTemplate.length + "\n\nConversation Transcript:\n".length;
-            sanitizedTranscript = fitTranscriptToWindow(
-              sanitizedTranscript,
-              templateOverhead,
-              this.compactionWindowFor(
-                sessionBinding.agentId,
-                sessionBinding.location,
-                compactionModel
-              )
-            );
-            const compactionPrompt = `${promptTemplate}\n\nConversation Transcript:\n${sanitizedTranscript}`;
-
-            // #308: protects the import summarizer; deleting it allows this
-            // direct temporary runtime to bypass the channel rule.
-            this.router.assertAgentAllowedForRecord(record, profile.id);
-            const launch = this.launchForLocation({
-              profile,
-              location: sessionBinding.location,
-              cwd: targetCwd,
-              model: compactionModel,
-              sessionId: record.id,
-            });
-            tempRuntime = new AgentRuntime({
-              profile,
-              logger: this.logger.child({ session: `temp-import-${session.sessionId}` }),
-              ...this.router.permissionOptions(record),
-              mcpServers: launch.mcpServers,
-              spawnFn: launch.spawnFn,
-            });
-
-            await tempRuntime.start();
-            await tempRuntime.newSession({
-              cwd: targetCwd,
-              model: compactionModel,
-              meta: { reasoningEffort: "low" },
-            });
-
-            let summaryText = "";
-            tempRuntime.onEvent((event) => {
-              if (event.kind === "agent-text") summaryText += event.text;
-            });
-
-            await tempRuntime.prompt(compactionPrompt);
-
-            if (!summaryText.trim()) {
-              throw new Error("Agent completed but returned an empty summary.");
-            }
-
-            // Seed a NEW resumable session (in the target cwd) with the summary.
-            const imCfg = this.store.readConfig(record);
-            const newSessionId = await this.seedNewSession({
-              profile, restrictionChannelId: record.parentRef ?? record.channelRef, cwd: targetCwd,
-              location: sessionBinding.location,
-              sessionId: record.id,
-              ...(imCfg.model ? { model: imCfg.model } : {}),
-              ...(imCfg.reasoningEffort ? { effort: imCfg.reasoningEffort } : {}),
-              summary: summaryText,
-            });
-
-            // Re-anchor the current thread to the new cwd + new session.
-            await this.router.invalidate(record.id);
-            const importedCfg = this.store.readConfig(record);
-            importedCfg.sessionCwdExplicit = true;
-            this.store.upsert({
-              ...record,
-              repoPath: targetCwd,
-              acpSessionId: newSessionId,
-              configJson: this.store.writeConfig(importedCfg),
-              updatedUtc: new Date().toISOString(),
-            });
-
+          await actions.import(session.sessionId, targetCwd, compactionModel, async (newSessionId) => {
             const successEmbed = new EmbedBuilder()
               .setTitle("📤 Session Imported Successfully!")
               .setDescription(
@@ -19798,7 +19487,7 @@ export class Orchestrator {
               channel: browserChannel ?? null,
               fallback: { kind: "import", outcome: "ok" },
             });
-          } catch (err: any) {
+          }, async (err: any) => {
             this.logger.error({ err, sessionId: session.sessionId }, "failed to import session");
             const errorEmbed = new EmbedBuilder()
               .setTitle("❌ Import Failed")
@@ -19810,31 +19499,13 @@ export class Orchestrator {
               channel: browserChannel ?? null,
               fallback: { kind: "import", outcome: "failed" },
             });
-          } finally {
-            if (tempRuntime) {
-              const tempSessionId = tempRuntime.getSessionInfo()?.sessionId;
-              await tempRuntime.dispose().catch(() => {});
-              if (tempSessionId) {
-                await this.deleteThrowawaySession({
-                  location: sessionBinding.location,
-                  profile,
-                  manager,
-                  cwd: targetCwd,
-                  sessionId: tempSessionId,
-                  label: "failed to clean up temporary import session",
-                });
-              }
-            }
-          }
+          });
         });
       } else if (customId === "sessions:migrate") {
         await btnInteraction.deferUpdate();
         const session = sessions[currentIndex];
         if (session) {
-          const targetProfiles = this.router.listProfiles().filter(p =>
-            p.id !== record.agentId &&
-            !!p.sessionManager
-          );
+          const targetProfiles = actions.capabilities().migrationTargets;
 
           const embed = new EmbedBuilder()
             .setTitle(`Migrate Session — ${profile.displayName}`)
@@ -19878,9 +19549,8 @@ export class Orchestrator {
         const targetAgentId = btnInteraction.values[0];
         const session = sessions[currentIndex];
         if (session && targetAgentId) {
-          const targetProfile = this.router.getProfile(targetAgentId);
-          const targetManager = targetProfile?.sessionManager;
-          if (!targetProfile || !targetManager) {
+          const targetProfile = actions.migrationTarget(targetAgentId);
+          if (!targetProfile) {
             await btnInteraction.followUp({
               content: `❌ Target agent \`${targetAgentId}\` is not compatible or does not support session management.`,
               flags: MessageFlags.Ephemeral,
@@ -19899,115 +19569,7 @@ export class Orchestrator {
           });
 
           this.runCardJob(async () => {
-            let tempRuntime: AgentRuntime | undefined;
-            try {
-              const transcript = await manager.getTranscript(cwd, session.sessionId);
-              if (!transcript.trim()) {
-                throw new Error("The session transcript is empty.");
-              }
-
-              let sanitizedTranscript = transcript
-                .split("\n")
-                .map((line) => {
-                  if (line.length > 1000) {
-                    return line.substring(0, 1000) + " ... [Line truncated]";
-                  }
-                  return line;
-                })
-                .join("\n");
-
-              const compactionModel = this.compactionModelFor(
-                sessionBinding.agentId,
-                sessionBinding.location
-              );
-              if (!compactionModel) {
-                throw new Error(`Migration compaction is not supported for source agent profile \`${record.agentId}\``);
-              }
-              const promptTemplate = await fsp.readFile(path.join(this.config.REPOS_ROOT, "compact.md"), "utf8");
-              const templateOverhead = promptTemplate.length + "\n\nConversation Transcript:\n".length;
-              sanitizedTranscript = fitTranscriptToWindow(
-                sanitizedTranscript,
-                templateOverhead,
-                this.compactionWindowFor(
-                  sessionBinding.agentId,
-                  sessionBinding.location,
-                  compactionModel
-                )
-              );
-              const compactionPrompt = `${promptTemplate}\n\nConversation Transcript:\n${sanitizedTranscript}`;
-
-              // #308: protects the migration summarizer; deleting it allows
-              // this direct temporary runtime to bypass the channel rule.
-              this.router.assertAgentAllowedForRecord(record, profile.id);
-              const launch = this.launchForLocation({
-                profile,
-                location: sessionBinding.location,
-                cwd,
-                model: compactionModel,
-                sessionId: record.id,
-              });
-              tempRuntime = new AgentRuntime({
-                profile,
-                logger: this.logger.child({ session: `temp-migrate-${session.sessionId}` }),
-                ...this.router.permissionOptions(record),
-                mcpServers: launch.mcpServers,
-                spawnFn: launch.spawnFn,
-              });
-
-              await tempRuntime.start();
-
-              await tempRuntime.newSession({
-                cwd,
-                model: compactionModel,
-                meta: { reasoningEffort: "low" },
-              });
-
-              let summaryText = "";
-              tempRuntime.onEvent((event) => {
-                if (event.kind === "agent-text") {
-                  summaryText += event.text;
-                }
-              });
-
-              const outcome = await tempRuntime.prompt(compactionPrompt);
-
-              if (!summaryText.trim()) {
-                throw new Error("Agent completed but returned an empty summary.");
-              }
-
-              // Seed a NEW resumable session under the TARGET agent (its own
-              // default model/effort) with the summary.
-              const newSessionId = await this.seedNewSession({
-                profile: targetProfile,
-                restrictionChannelId: record.parentRef ?? record.channelRef,
-                cwd,
-                location: sessionBinding.location,
-                sessionId: record.id,
-                summary: summaryText,
-              });
-
-              // Update active session record
-              await this.router.invalidate(record.id);
-              this.store.upsert({
-                ...record,
-                agentId: targetAgentId,
-                acpSessionId: newSessionId,
-                updatedUtc: new Date().toISOString(),
-              });
-
-              const fresh = this.store.get(record.id);
-              if (fresh) {
-                record.agentId = fresh.agentId;
-                record.acpSessionId = fresh.acpSessionId;
-              }
-
-              const channel = {
-                platform: record.platform,
-                id: record.channelRef,
-                parentId: record.parentRef || undefined,
-              };
-              await this.identityEffects.flush(record.id);
-
+            await targetProfile.migrate(session.sessionId, async (newSessionId) => {
               const successEmbed = new EmbedBuilder()
                 .setTitle("🎉 Session Migrated Successfully!")
                 .setDescription(
@@ -20036,7 +19598,7 @@ export class Orchestrator {
                 channel: browserChannel ?? null,
                 fallback: { kind: "migration", outcome: "ok" },
               });
-            } catch (err: any) {
+            }, async (err: any) => {
               this.logger.error({ err, sessionId: session.sessionId }, "failed to migrate session");
 
               const errorEmbed = new EmbedBuilder()
@@ -20053,22 +19615,7 @@ export class Orchestrator {
                 channel: browserChannel ?? null,
                 fallback: { kind: "migration", outcome: "failed" },
               });
-            } finally {
-              if (tempRuntime) {
-                const tempSessionId = tempRuntime.getSessionInfo()?.sessionId;
-                await tempRuntime.dispose().catch(() => {});
-                if (tempSessionId) {
-                  await this.deleteThrowawaySession({
-                    location: sessionBinding.location,
-                    profile,
-                    manager,
-                    cwd,
-                    sessionId: tempSessionId,
-                    label: "failed to clean up temporary migration session",
-                  });
-                }
-              }
-            }
+            });
           });
         }
       } else if (customId === "sessions:summary_back") {
@@ -24025,26 +23572,6 @@ function parseCsv(s: string): string[] {
 }
 
 
-/** Trim a sanitized transcript so that `template + transcript` fits within
- *  ~80% of the summarizer model's window (leaving headroom for the response).
- *  Drops middle content with a marker; keeps 30% head + 60% tail of the
- *  budget. ~4 chars/token is conservative — real tokenizers pack denser. */
-function fitTranscriptToWindow(
-  transcript: string,
-  templateOverhead: number,
-  modelWindowTokens: number
-): string {
-  const maxChars = Math.floor(modelWindowTokens * 4 * 0.8);
-  const targetLen = Math.max(0, maxChars - templateOverhead);
-  if (transcript.length <= targetLen) return transcript;
-  const keepHead = Math.floor(targetLen * 0.3);
-  const keepTail = Math.floor(targetLen * 0.6);
-  return (
-    transcript.substring(0, keepHead) +
-    "\n\n... [Transcript truncated to fit context window] ...\n\n" +
-    transcript.substring(transcript.length - keepTail)
-  );
-}
 
 
 function voiceConsoleEmbed(panel: VoiceConsolePanelSpec): EmbedBuilder {

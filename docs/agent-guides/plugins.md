@@ -82,6 +82,20 @@ mode, while effort changes preserve ACP context. Permission changes await the
 existing Codex mode application. Committed identity effects still drive naming.
 `thread-session-control.ts` retains the previous class and type import names.
 
+## Session actions
+
+`core/session-actions.ts` is the internal operation boundary for the session
+browser. It binds reads, clone/delete/repair, summary, compaction, import and
+migration to the browser's original host and cwd. It owns temporary runtime
+cleanup and delegates rebuild and premium compaction to the existing kernel
+operations. Compaction attachment retains the admission-time compare-and-swap
+decision; another action's binding is never overwritten.
+
+The browser receives capability and migration-target snapshots rather than
+profiles, and long-job completion callbacks retain private result delivery
+before temporary-session cleanup. This facade does not introduce a public
+plugin API or change configuration/runtime-transition rules.
+
 ## Maintenance jobs and storage
 
 Maintenance jobs declare a name, base interval and `after-admission` phase.

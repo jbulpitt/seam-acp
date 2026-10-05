@@ -42,7 +42,6 @@ import type { Renderer } from "../renderer.js";
 import { serializePanelText } from "../renderer.js";
 import { choicePickerPageCaption } from "./choice-picker.js";
 import { getSlashCommandAccess, type SlashCommandAccess } from "./commands.js";
-import { paginatePresetList, PRESET_LIST_PAGE_SIZE } from "./preset-list.js";
 import type {
   ChatAdapter,
   ChannelRef,
@@ -215,7 +214,6 @@ import {
   collectStringOptionValues,
   DISCORD_AUTOCOMPLETE_MAX,
   labeledAutocompleteChoices,
-  presetAutocompleteChoices,
   safeAutocompleteRespond,
   toAutocompleteChoices,
   tokenAutocompleteChoices,
@@ -287,9 +285,6 @@ const DISPATCH_STREAM_DESC_MAX = 3800;
  *  exceed it finalizes as fresh plain messages (or a file) instead of truncating. */
 const DISCORD_MESSAGE_MAX = 2000;
 
-/** Accent color for preset cards ("preset purple"). */
-const PRESET_COLOR = 0x9b59b6;
-
 /** Accent color for wake-event cards (#59) — warm "alarm amber" so a
  *  self-scheduled resumption reads distinctly from cron blue / dispatch purple. */
 const WAKE_COLOR = 0xf59e0b;
@@ -335,6 +330,8 @@ import { saveConfigEditorCard, configSetRequest, configSetSummary } from "../../
 import { configUiInteraction } from "./config-ui-transport.js";
 import { installScheduleUi } from "../../core/schedule-ui.js";
 import { scheduleUiInteraction } from "./schedule-ui-transport.js";
+import { presetUiInteraction } from "./preset-ui-transport.js";
+import { installPresetUi } from "../../core/preset-ui.js";
 import { discordComponentInteractions } from "./component-interactions.js";
 import { installCardVisuals } from "../../core/card-visuals.js";
 import {
@@ -759,30 +756,7 @@ export interface QuiesceOutcome {
 }
 
 export { catalogEffortChoices } from "./catalog-view.js";
-export function presetModelSelectOptions(
-  models: ReadonlyArray<{ modelId: string; name: string }>,
-  selected: string | null
-): Array<{ label: string; value: string; description?: string; default?: boolean }> {
-  const limit = models.length > 24 ? 23 : 24;
-  const visible = models.slice(0, limit);
-  if (selected && !visible.some((model) => model.modelId === selected)) {
-    const selectedModel = models.find((model) => model.modelId === selected);
-    if (selectedModel) visible.splice(Math.max(0, visible.length - 1), 1, selectedModel);
-  }
-  return [
-    { label: "Default", value: "__default__", default: selected === null },
-    ...visible.map((model) => ({
-      label: model.name.slice(0, 100),
-      value: model.modelId,
-      default: model.modelId === selected,
-    })),
-    ...(models.length > 24 ? [{
-      label: "More… (full picker)",
-      value: "__more__",
-      description: `Browse all ${models.length} cached models`,
-    }] : []),
-  ];
-}
+export { presetModelSelectOptions } from "../../plugins/presets/view.js";
 
 export function modelSelectionConfirmationPanel(
   current: string,
@@ -1023,6 +997,7 @@ export class Orchestrator {
   private bridgeHub?: BridgeHub;
   /** In-memory /seam config edit drafts (#90). Idle TTL 60 min. */
   private readonly configUi: ReturnType<typeof installConfigUi>;
+  private readonly presetsUi: ReturnType<typeof installPresetUi>;
   /** In-memory /seam config tts drafts. Idle TTL 60 min. */
   private readonly ttsEditor = new TtsEditorStore();
   /** #92: declared HTTP result waiters for ingest-triggered choice turns. */
@@ -1074,7 +1049,7 @@ export class Orchestrator {
     this.agyRuntime = opts.agyRuntime;
     this.refreshModelIntelligence = opts.refreshModelIntelligence;
     this.restartProcess = opts.restartProcess ?? restartSeamAcpProcess;
-    this.plugins = opts.plugins ?? new PluginHost(this.logger, { storageRoot: this.config.DATA_DIR });
+    this.plugins = opts.plugins ?? new PluginHost(this.logger, { storageRoot: this.config.DATA_DIR, storageAliases: { presets: { "presets.sqlite": this.store.dbPath } } });
     this.registerKernelComponents();
     this.identityEffects = installThreadNaming({ config: this.config, store: this.store, router: this.router, adapter: this.adapter, logger: this.logger, plugins: this.plugins });
     this.cardResults = new CardResultVault(this.config.DATA_DIR, this.logger);
@@ -1161,6 +1136,22 @@ export class Orchestrator {
         lifecycle: (interaction, collector, expired) => this.attachListLifecycle(interaction, collector, expired),
       }),
     });
+    this.presetsUi = installPresetUi({
+      plugins: this.plugins, config: this.config, logger: this.logger, store: this.store, router: this.router, modelCatalog: this.modelCatalog,
+      plan: () => this.getConfigApplyPlan(), agentsByHost: () => this.catalogAgentsByHost(),
+      listWorkspace: channel => this.listHostWorkspacePaths(channel?.id), transport: this.adapter,
+      promptRepoPath: (channel, options) => this.promptRepoPath(channel, options),
+      resolveRequestedRepoPath: (channel, requested) => this.resolveRequestedRepoPath(channel, requested), repoDisplay: repo => this.repoDisplay(repo),
+      canCreateThread: !!this.adapter.createThread,
+      createThread: (channel, name, author) => this.createChildThread(channel, name, author), bindThread: channel => this.bindSessionToThread(channel),
+      openTurn: (channel, record, preset, author) => this.startPresetOpeningTurn(channel, record, preset, author),
+      interaction: i => presetUiInteraction(i, {
+        channel: interaction => this.channelRefFromInteraction(interaction),
+        projectScopeId: interaction => this.projectScopeId(interaction),
+        mutationRefusal: interaction => this.slashAccessRefusal(interaction, { kind: "mutating" }),
+        lifecycle: (interaction, collector, expired) => this.attachListLifecycle(interaction, collector, expired),
+      }),
+    });
     this.sessionBrowserReady = this.installSessionBrowser();
 
     this.configUi = installConfigUi({
@@ -1221,15 +1212,6 @@ export class Orchestrator {
         this.logger.warn({ err, attemptId: id }, "permission cleanup after turn failed")));
     });
 
-    const presetNameResponder: AutocompleteResponder = (ctx) => {
-      if (!ctx.projectScopeId) return [];
-      const presets = this.store.listPresetsForProject(ctx.projectScopeId);
-      return presetAutocompleteChoices(presets, ctx.focusedValue, ctx.projectScopeId);
-    };
-    this.autocomplete.register("preset", "thread", "preset", "canonical", presetNameResponder);
-    for (const sub of ["apply", "delete", "show", "edit"] as const) {
-      this.autocomplete.register("preset", sub, "name", "canonical", presetNameResponder);
-    }
     this.autocomplete.register("config", "tts", "voice", "canonical", (ctx) =>
       toAutocompleteChoices(geminiTtsVoiceChoices(ctx.focusedValue))
     );
@@ -1242,7 +1224,7 @@ export class Orchestrator {
   /** Wait for the effects of committed identity changes. */
   async flushIdentityEffects(sessionId?: string): Promise<void> { await this.identityEffects.flush(sessionId); }
 
-  async loadPlugins(): Promise<void> { await Promise.all([this.identityEffects.ready, this.cardVisualsReady, this.scheduleUi.ready, this.configUi.ready, this.sessionBrowserReady]); }
+  async loadPlugins(): Promise<void> { await Promise.all([this.identityEffects.ready, this.cardVisualsReady, this.scheduleUi.ready, this.configUi.ready, this.presetsUi.ready, this.sessionBrowserReady]); }
 
   /**
    * Bounded slash autocomplete responders (#slash-autocomplete). Registered
@@ -5298,6 +5280,7 @@ export class Orchestrator {
       };
       if (slashGroup === "schedule") this.scheduleUi.bind(invocation, interaction);
       if (slashGroup === "config") this.configUi.bind(invocation, interaction);
+      if (slashGroup === "preset") this.presetsUi.bind(invocation, interaction);
       if (await this.plugins.slash.dispatch(interaction.commandName ?? "seam", slashGroup, sub, Object.freeze(invocation))) return;
     }
     if (interaction.options.getSubcommandGroup(false) === "upload") {
@@ -5339,9 +5322,6 @@ export class Orchestrator {
     if (slashGroup === "models") return this.cmdModels(interaction);
     if (slashGroup === "restrictions") {
       return this.cmdAgentChannelRestrictions(interaction);
-    }
-    if (interaction.options.getSubcommandGroup(false) === "preset") {
-      return this.cmdPreset(interaction);
     }
     if (interaction.options.getSubcommandGroup(false) === "project") {
       return this.cmdProject(interaction);
@@ -13591,36 +13571,6 @@ export class Orchestrator {
     await i.reply({ ...payload, flags: MessageFlags.Ephemeral } as never);
   }
 
-  /**
-   * Open an editor whose originating listing has already been frozen.
-   *
-   * By this point the button is deferred and the list is inert, so a throw
-   * would leave the operator staring at a permanently "thinking" ephemeral
-   * next to a dead listing. Surface it instead of only logging.
-   */
-  private async openEditorAfterFreeze(
-    c: MessageComponentInteraction,
-    open: () => Promise<void>,
-    surface: string,
-    // #151 split the tree, so the retry path is no longer `/seam <surface>`:
-    // `schedule` moved to /seamadmin while `preset` stayed on /seam. Pass the
-    // real invocation rather than deriving a path that may not exist.
-    retryCommand: string
-  ): Promise<void> {
-    try {
-      await open();
-    } catch (err) {
-      this.logger.warn({ err, surface }, "editor failed to open after list freeze");
-      await c
-        .editReply({
-          content: `❌ Could not open the ${surface} editor. Run \`${retryCommand}\` again.`,
-          embeds: [],
-          components: [],
-        })
-        .catch(() => {});
-    }
-  }
-
   private async cmdModels(i: ChatInputCommandInteraction): Promise<void> {
     if (!this.config.SEAM_CONFIG_ADMIN_USER_IDS?.has(i.user.id)) {
       await i.reply({ content: "🔒 `/seamadmin models` is config-admin-only.", flags: MessageFlags.Ephemeral });
@@ -19917,24 +19867,6 @@ export class Orchestrator {
 
   // --- /seam preset … -------------------------------------------------------
 
-  private async cmdPreset(i: ChatInputCommandInteraction): Promise<void> {
-    const sub = i.options.getSubcommand(true);
-    switch (sub) {
-      case "list": return this.cmdPresetList(i);
-      case "create": return this.cmdPresetCreate(i);
-      case "apply": return this.cmdPresetApply(i);
-      case "delete": return this.cmdPresetDelete(i);
-      case "show": return this.cmdPresetShow(i);
-      case "edit": return this.cmdPresetEdit(i);
-      case "thread": return this.cmdPresetThread(i);
-      default:
-        await i.reply({
-          content: `Unknown preset subcommand: ${sub}`,
-          flags: MessageFlags.Ephemeral,
-        });
-    }
-  }
-
   // --- projects: DB-backed channel activation (#22) -------------------------
 
   private async cmdProject(i: ChatInputCommandInteraction): Promise<void> {
@@ -20051,918 +19983,39 @@ export class Orchestrator {
     });
   }
 
-  private presetSummaryLine(p: Preset): string {
-    const parts: string[] = [];
-    if (p.agentId) parts.push(`Agent: ${p.agentId}`);
-    if (p.model) parts.push(`Model: ${p.model}`);
-    if (p.effort) parts.push(`Effort: ${p.effort}`);
-    if (p.repoPath) parts.push(`Repo: ${this.repoDisplay(p.repoPath)}`);
-    if (p.role) parts.push(`Role: ${p.role}`);
-    if (p.disableThreadPrefix) parts.push("Auto-name: disabled");
-    if (p.permission) parts.push(`Policy: ${p.permission}`);
-    if (p.statusCardStyle) parts.push(`Card: ${p.statusCardStyle}`);
-    if (p.toolsAllow?.length) parts.push(`Allow: ${p.toolsAllow.join(", ")}`);
-    if (p.toolsExclude?.length) parts.push(`Exclude: ${p.toolsExclude.join(", ")}`);
-    if (p.instructions) parts.push("📝 Has instructions");
-    const scope = p.projectRef ? "📁" : "🌐";
-    const desc = p.description ? ` — ${p.description}` : "";
-    const config = parts.length > 0 ? `\n   ${parts.join(" · ")}` : "";
-    return `${scope} **${p.name}**${desc}${config}`;
-  }
-
-  private buildPresetListMessage(
-    projectRef: string | null,
-    page = 0
-  ): {
-    embeds: EmbedBuilder[];
-    components: ActionRowBuilder<ButtonBuilder>[];
-  } {
-    const presets = this.store.listPresetsForProject(projectRef);
-    const slice = paginatePresetList(presets, page);
-    const caption = choicePickerPageCaption(
-      presets.length,
-      slice.page,
-      PRESET_LIST_PAGE_SIZE
-    );
-    const body = slice.items.length
-      ? slice.items.map((p) => this.presetSummaryLine(p)).join("\n\n")
-      : "_No presets in this project yet._";
-    const embed = new EmbedBuilder()
-      .setTitle("🎛️ Presets")
-      .setColor(PRESET_COLOR)
-      .setDescription(
-        [body, caption, "_📁 this project · 🌐 global_"].filter(Boolean).join("\n\n")
-      );
-    const components: ActionRowBuilder<ButtonBuilder>[] = [];
-    // Discord caps a message at 5 action rows. Four preset rows leave room
-    // for Prev / Page X/Y / Next when there is more than one page.
-    for (const p of slice.items) {
-      components.push(
-        new ActionRowBuilder<ButtonBuilder>().addComponents(
-          new ButtonBuilder()
-            .setCustomId(`pr:apply:${p.id}`)
-            .setLabel(`▶️ ${p.name}`.slice(0, 80))
-            .setStyle(ButtonStyle.Success),
-          new ButtonBuilder()
-            .setCustomId(`pr:edit:${p.id}`)
-            .setLabel("✏️ Edit")
-            .setStyle(ButtonStyle.Primary),
-          new ButtonBuilder()
-            .setCustomId(`pr:del:${p.id}`)
-            .setLabel("🗑️ Delete")
-            .setStyle(ButtonStyle.Danger)
-        )
-      );
-    }
-    if (slice.pageCount > 1) {
-      components.push(
-        new ActionRowBuilder<ButtonBuilder>().addComponents(
-          new ButtonBuilder()
-            .setCustomId(`pr:page:${slice.page - 1}`)
-            .setLabel("◀ Prev")
-            .setStyle(ButtonStyle.Secondary)
-            .setDisabled(slice.page === 0),
-          new ButtonBuilder()
-            .setCustomId(`pr:page:${slice.page}`)
-            .setLabel(`Page ${slice.page + 1}/${slice.pageCount}`)
-            .setStyle(ButtonStyle.Secondary)
-            .setDisabled(true),
-          new ButtonBuilder()
-            .setCustomId(`pr:page:${slice.page + 1}`)
-            .setLabel("Next ▶")
-            .setStyle(ButtonStyle.Secondary)
-            .setDisabled(slice.page >= slice.pageCount - 1)
-        )
-      );
-    }
-    return { embeds: [embed], components };
-  }
-
   private async cmdPresetList(i: ChatInputCommandInteraction): Promise<void> {
-    const projectRef = this.projectScopeId(i) ?? null;
-    const presets = this.store.listPresetsForProject(projectRef);
-    if (presets.length === 0) {
-      await i.reply({
-        content: "No presets here yet. Create one with `/seam preset create`.",
-        flags: MessageFlags.Ephemeral,
-      });
-      return;
-    }
-    let page = 0;
-    await i.reply({
-      ...this.buildPresetListMessage(projectRef, page),
-      flags: MessageFlags.Ephemeral,
-    });
-    const msg = await i.fetchReply();
-    const collector = msg.createMessageComponentCollector({
-      filter: (c) => c.user.id === i.user.id,
-      time: 600_000,
-    });
-    const lifecycle = this.attachListLifecycle(i, collector, () =>
-      expiredCardView("⏰ Preset list expired. Run `/seam preset list` again.")
-    );
-    collector.on("collect", async (c) => {
-      try {
-        if (!c.isButton()) return;
-        const [, action, id] = c.customId.split(":");
-        if (!id) return;
-        if (action === "page") {
-          const requested = Number(id);
-          if (!Number.isFinite(requested)) return;
-          const remaining = this.store.listPresetsForProject(projectRef);
-          page = paginatePresetList(remaining, requested).page;
-          await c.update(this.buildPresetListMessage(projectRef, page));
-          return;
-        }
-        const refusal = this.slashAccessRefusal(c, { kind: "mutating" });
-        if (refusal) {
-          await c.reply({ content: refusal, flags: MessageFlags.Ephemeral });
-          return;
-        }
-        const preset = this.store.getPreset(id);
-        if (!preset) {
-          await c.reply({
-            content: "That preset no longer exists.",
-            flags: MessageFlags.Ephemeral,
-          });
-          // Repeatable: rebuild from the store so the vanished row's controls go.
-          await lifecycle.refresh(this.buildPresetListMessage(projectRef, page));
-          return;
-        }
-        if (action === "apply") {
-          const channel = this.channelRefFromInteraction(c);
-          if (!channel) {
-            await c.reply({
-              content: "Use inside a thread to apply a preset.",
-              flags: MessageFlags.Ephemeral,
-            });
-            return;
-          }
-          const record = this.router.ensureSessionRecord({
-            platform: channel.platform,
-            channelRef: channel.id,
-            ...(channel.parentId ? { parentRef: channel.parentId } : {}),
-            cwd: this.config.REPOS_ROOT,
-          });
-          const summary = await this.applyPresetToSession(channel, record, preset);
-          await c.reply({
-            content: `✅ Applied preset **${preset.name}**.\n${summary}`,
-            flags: MessageFlags.Ephemeral,
-          });
-        } else if (action === "edit") {
-          // Same ordering as the schedule list above: synchronous stop, then
-          // the ack, then the freeze repaint.
-          await lifecycle.transitionWithAck(
-            "edit",
-            {
-              content: `✏️ Editing preset **${preset.name}** — this listing was replaced by the editor below.`,
-              embeds: [],
-              components: [],
-            },
-            async () => {
-              await c.deferReply({ flags: MessageFlags.Ephemeral });
-            }
-          );
-          await this.openEditorAfterFreeze(
-            c,
-            () => this.cmdPresetBuilder(c, preset),
-            "preset",
-            "/seam preset edit"
-          );
-        } else if (action === "del") {
-          this.store.deletePreset(id);
-          const remaining = this.store.listPresetsForProject(projectRef);
-          page = paginatePresetList(remaining, page).page;
-          await c.update(this.buildPresetListMessage(projectRef, page));
-        }
-      } catch (err) {
-        this.logger.warn({ err }, "preset-list button handler failed");
-      }
-    });
+    await this.presetsUi.ready;
+    return this.presetsUi.ui.cmdPresetList(this.presetsUi.interaction(i));
   }
-
   private async cmdPresetCreate(i: ChatInputCommandInteraction): Promise<void> {
-    // A new preset is stamped with the current project by default; `--global`
-    // makes it a global preset visible in every project.
-    const global = i.options.getBoolean("global") ?? false;
-    const createScope = global ? null : this.projectScopeId(i) ?? null;
-    const seedRole = i.options.getString("role");
-    await this.cmdPresetBuilder(i, undefined, createScope, seedRole);
+    await this.presetsUi.ready;
+    return this.presetsUi.ui.cmdPresetCreate(this.presetsUi.interaction(i));
   }
-
   private async cmdPresetEdit(i: ChatInputCommandInteraction): Promise<void> {
-    const name = i.options.getString("name", true);
-    const preset = this.store.getPresetByNameScoped(name, this.projectScopeId(i) ?? null);
-    if (!preset) {
-      await i.reply({ content: `No preset named \`${name}\`.`, flags: MessageFlags.Ephemeral });
-      return;
-    }
-    await this.cmdPresetBuilder(i, preset);
+    await this.presetsUi.ready;
+    return this.presetsUi.ui.cmdPresetEdit(this.presetsUi.interaction(i));
   }
-
-  /**
-   * Interactive preset builder card: selects for agent/model/effort, modals for
-   * the free-text fields, and a save button. Shared by `create` and `edit`.
-   */
-  private async cmdPresetBuilder(
-    i: ChatInputCommandInteraction | MessageComponentInteraction,
-    existing?: Preset,
-    createScope?: string | null,
-    seedRole?: string | null
-  ): Promise<void> {
-    const presetLocation = resolveThreadLocation(this.config, i.channelId);
-    const localProfiles = this.router.listProfiles();
-    const profiles = presetLocation === LOCAL_LOCATION
-      ? localProfiles
-      : [...(this.catalogAgentsByHost().get(presetLocation) ?? new Set<string>())]
-          .sort()
-          .map((id) => localProfiles.find((profile) => profile.id === id) ?? {
-            id,
-            displayName: id,
-          });
-
-    // Scope is fixed at creation: editing preserves the preset's scope, while a
-    // new preset takes `createScope` (the current project, or null for global).
-    const projectRef: string | null = existing
-      ? existing.projectRef ?? null
-      : createScope ?? null;
-
-    const state: {
-      name: string;
-      description: string;
-      agentId: string | null;
-      model: string | null;
-      effort: string | null;
-      repoPath: string | null;
-      permission: PermissionPolicyMode | null;
-      toolsAllow: string[] | null;
-      toolsExclude: string[] | null;
-      instructions: string | null;
-      statusCardStyle: StatusCardStyle | null;
-      role: string | null;
-      disableThreadPrefix: boolean | null;
-    } = {
-      name: existing?.name ?? "",
-      description: existing?.description ?? "",
-      agentId: existing?.agentId ?? null,
-      model: existing?.model ?? null,
-      effort: existing?.effort ?? null,
-      repoPath: existing?.repoPath ?? null,
-      permission: existing?.permission ?? null,
-      toolsAllow: existing?.toolsAllow ?? null,
-      toolsExclude: existing?.toolsExclude ?? null,
-      instructions: existing?.instructions ?? null,
-      statusCardStyle: existing?.statusCardStyle ?? null,
-      role: existing?.role ?? (seedRole?.trim() || null),
-      disableThreadPrefix: existing?.disableThreadPrefix ?? null,
-    };
-
-    // Preset editing uses only the controller's cache for this thread's host;
-    // it never starts an ACP session or reads an adapter source. Presets remain
-    // locationless, so applying one elsewhere revalidates against that host.
-    const loadModels = async (
-      agentId: string | null
-    ): Promise<ReadonlyArray<{ modelId: string; name: string }>> => {
-      if (!agentId) return [];
-      return this.modelCatalog.models({ agentId, location: presetLocation }, { current: state.model ?? undefined })
-        .map((model) => ({ modelId: model.id, name: model.displayName }));
-    };
-    let models = await loadModels(state.agentId);
-    const repoDirs = (await this.listHostWorkspacePaths(i.channelId)) ?? [];
-
-    const render = () => {
-      const agentDisplay = state.agentId ? `\`${state.agentId}\`` : "*(default)*";
-      const modelDisplay = state.model ? `\`${state.model}\`` : "*(default)*";
-      const effortDisplay = state.effort ?? "*(default)*";
-      const repoDisplay = state.repoPath
-        ? `\`${this.repoDisplay(state.repoPath)}\``
-        : "*(default)*";
-      const permDisplay = state.permission ?? "*(default)*";
-      const cardDisplay = state.statusCardStyle ? `\`${state.statusCardStyle}\`` : "*(default)*";
-      const toolsDisplay = (() => {
-        const parts: string[] = [];
-        if (state.toolsAllow?.length) parts.push(`Allow: ${state.toolsAllow.join(", ")}`);
-        if (state.toolsExclude?.length) parts.push(`Exclude: ${state.toolsExclude.join(", ")}`);
-        return parts.length > 0 ? parts.join("\n") : "*(default)*";
-      })();
-      const instrDisplay = state.instructions
-        ? "```\n" + state.instructions.slice(0, 500) + "\n```"
-        : "*(none)*";
-
-      const embed = new EmbedBuilder()
-        .setTitle(existing ? `✏️ Edit preset \`${existing.name}\`` : "🎛️ New preset")
-        .setColor(PRESET_COLOR)
-        .setDescription(
-          "A preset is a reusable bundle of session settings. " +
-          "When applied, it overrides only the fields it specifies — everything else keeps its default."
-        )
-        .addFields(
-          { name: "🏷️ Name", value: state.name || "*(not set)*" },
-          { name: "🗂️ Scope", value: projectRef ? `<#${projectRef}>` : "🌐 Global" },
-          { name: "📝 Description", value: state.description || "*(none)*" },
-          { name: "🤖 Agent", value: agentDisplay, inline: true },
-          { name: "🧠 Model", value: modelDisplay, inline: true },
-          { name: "⚡ Effort", value: effortDisplay, inline: true },
-          { name: "📂 Repo", value: repoDisplay, inline: true },
-          { name: "🎭 Role", value: state.role ? `\`${state.role}\`` : "*(none)*", inline: true },
-          { name: "🏷️ Auto-name", value: state.disableThreadPrefix ? "disabled" : "enabled", inline: true },
-          { name: "🔒 Permission", value: permDisplay, inline: true },
-          { name: "🃏 Status card", value: cardDisplay, inline: true },
-          { name: "🔧 Tools", value: toolsDisplay },
-          { name: "📋 Instructions", value: instrDisplay }
-        );
-
-      const agentSelect = new StringSelectMenuBuilder()
-        .setCustomId("preset:agent")
-        .setPlaceholder("🤖 Agent")
-        .addOptions(
-          { label: "Default", value: "__default__", default: state.agentId === null },
-          ...profiles.slice(0, 24).map((p) => ({
-            label: p.displayName.slice(0, 100),
-            value: p.id,
-            description: p.id.slice(0, 100),
-            default: p.id === state.agentId,
-          }))
-        );
-
-      const modelSelect = new StringSelectMenuBuilder()
-        .setCustomId("preset:model")
-        .setPlaceholder("🧠 Model");
-      if (models.length > 0) {
-        modelSelect.addOptions(presetModelSelectOptions(models, state.model));
-      } else {
-        modelSelect.addOptions({
-          label: state.agentId
-            ? "Default (no models advertised for this agent)"
-            : "Default (select an agent first for model list)",
-          value: "__default__",
-          default: true,
-        });
-      }
-
-      const effortLevels = state.agentId
-        ? this.modelCatalog.model(
-            { agentId: state.agentId, location: presetLocation },
-            state.model ?? "default"
-          )?.effort.choices.map((choice) => choice.id) ?? []
-        : [];
-      const effortSelect = new StringSelectMenuBuilder()
-        .setCustomId("preset:effort")
-        .setPlaceholder("⚡ Effort")
-        .addOptions(
-          { label: "Default", value: "__default__", default: state.effort === null },
-          ...catalogEffortChoices(effortLevels.filter((value) => value !== "default")).slice(0, 24).map((e) => ({
-            label: e.label,
-            value: e.value,
-            description: e.description,
-            default: e.value === state.effort,
-          }))
-        );
-
-      const repoSelect = new StringSelectMenuBuilder()
-        .setCustomId("preset:repo")
-        .setPlaceholder("📂 Repo");
-      const repoOpts: Array<{
-        label: string;
-        value: string;
-        description?: string;
-        default?: boolean;
-      }> = [
-        {
-          label: "Inherit / clear (no pin)",
-          value: "__default__",
-          description: "Don't pin a repo on this preset",
-          default: state.repoPath === null,
-        },
-      ];
-      const fit = repoDirs.filter((p) => p.length <= 100);
-      for (const p of fit.slice(0, 23)) {
-        repoOpts.push({
-          label: path.basename(p).slice(0, 100) || p.slice(0, 100),
-          value: p,
-          description: p.slice(0, 100),
-          default: p === state.repoPath,
-        });
-      }
-      if (
-        state.repoPath &&
-        state.repoPath.length <= 100 &&
-        !repoOpts.some((o) => o.value === state.repoPath)
-      ) {
-        repoOpts.splice(1, 0, {
-          label: path.basename(state.repoPath).slice(0, 100),
-          value: state.repoPath,
-          description: state.repoPath.slice(0, 100),
-          default: true,
-        });
-      }
-      if (fit.length > 23 || fit.length < repoDirs.length) {
-        repoOpts.push({
-          label: "More… (full picker)",
-          value: "__more__",
-          description: "Open the paginated repo picker",
-        });
-      }
-      repoSelect.addOptions(repoOpts);
-
-      const buttons = new ActionRowBuilder<ButtonBuilder>().addComponents(
-        new ButtonBuilder()
-          .setCustomId("preset:details")
-          .setLabel("✏️ Name & details")
-          .setStyle(ButtonStyle.Primary),
-        new ButtonBuilder()
-          .setCustomId("preset:tools")
-          .setLabel("🔧 Tools")
-          .setStyle(ButtonStyle.Secondary),
-        new ButtonBuilder()
-          .setCustomId("preset:card")
-          .setLabel(state.statusCardStyle ? `🃏 ${state.statusCardStyle}` : "🃏 Card")
-          .setStyle(ButtonStyle.Secondary),
-        new ButtonBuilder()
-          .setCustomId("preset:naming")
-          .setLabel("🏷️ Naming")
-          .setStyle(ButtonStyle.Secondary),
-        new ButtonBuilder()
-          .setCustomId("preset:save")
-          .setLabel(existing ? "💾 Save" : "✅ Create")
-          .setStyle(ButtonStyle.Success)
-          .setDisabled(!state.name),
-      );
-
-      return {
-        embeds: [embed],
-        components: [
-          new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(agentSelect),
-          new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(modelSelect),
-          new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(effortSelect),
-          new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(repoSelect),
-          buttons,
-        ],
-      };
-    };
-
-    // Already deferred when opened from the list's Edit button (#159).
-    if (!i.deferred && !i.replied) await i.deferReply({ flags: MessageFlags.Ephemeral });
-    await i.editReply(render());
-    const msg = await i.fetchReply();
-    const collector = msg.createMessageComponentCollector({
-      filter: (c) => c.user.id === i.user.id,
-      time: 600_000,
-    });
-
-    // "created"/"saved"/"cancel" settle the card themselves; the lifecycle
-    // expires everything else, including any stop reason added later (#159).
-    const lifecycle = this.attachListLifecycle(i, collector, () =>
-      expiredCardView("⏰ Preset builder timed out — nothing was saved. Run the command again.")
-    );
-
-    collector.on("collect", async (c) => {
-      try {
-        if (c.isStringSelectMenu() && c.customId === "preset:agent") {
-          const v = c.values[0]!;
-          state.agentId = v === "__default__" ? null : v;
-          // Model ids are agent-specific; a stale pick would be invalid.
-          state.model = null;
-          state.effort = null;
-          await c.deferUpdate();
-          models = await loadModels(state.agentId);
-          await c.editReply(render());
-        } else if (c.isStringSelectMenu() && c.customId === "preset:model") {
-          const v = c.values[0]!;
-          if (v === "__more__") {
-            await c.deferUpdate();
-            const channel = this.channelRefFromInteraction(c);
-            if (!channel || !this.adapter.sendChoicePicker) return;
-            const picked = await this.adapter.sendChoicePicker(channel, {
-              panel: {
-                color: PRESET_COLOR,
-                title: "🧠 Choose a preset model",
-                fields: [{ name: "Current", value: state.model ? `\`${state.model}\`` : "Default" }],
-              },
-              choices: models.map((model) => ({
-                value: model.modelId,
-                label: model.name,
-                description: model.modelId,
-              })),
-              authorizedUserIds: new Set([i.user.id]),
-            });
-            if (picked && picked.value !== state.model) {
-              state.model = picked.value;
-              state.effort = state.agentId
-                ? this.modelCatalog.model(
-                    { agentId: state.agentId, location: presetLocation },
-                    picked.value
-                  )?.effort.selectionDefault ?? null
-                : null;
-            }
-            await i.editReply(render());
-            return;
-          }
-          const nextModel = v === "__default__" ? null : v;
-          if (nextModel !== state.model) {
-            state.model = nextModel;
-            state.effort = nextModel && state.agentId
-              ? this.modelCatalog.model(
-                  { agentId: state.agentId, location: presetLocation },
-                  nextModel
-                )?.effort.selectionDefault ?? null
-              : null;
-          }
-          await c.update(render());
-        } else if (c.isStringSelectMenu() && c.customId === "preset:effort") {
-          const v = c.values[0]!;
-          state.effort = v === "__default__" ? null : v;
-          await c.update(render());
-        } else if (c.isStringSelectMenu() && c.customId === "preset:repo") {
-          const v = c.values[0]!;
-          if (v === "__more__") {
-            await c.deferUpdate();
-            const channel = this.channelRefFromInteraction(c);
-            if (!channel) return;
-            const picked = await this.promptRepoPath(channel, {
-              title: "📂 Preset repo",
-              includeInherit: true,
-              authorizedUserIds: new Set([i.user.id]),
-            });
-            if (picked === INHERIT_VALUE) {
-              state.repoPath = null;
-            } else if (picked) {
-              try {
-                state.repoPath = await this.resolveRequestedRepoPath(channel, picked);
-              } catch {
-                state.repoPath = picked;
-              }
-            }
-            await i.editReply(render());
-          } else {
-            state.repoPath = v === "__default__" ? null : v;
-            await c.update(render());
-          }
-        } else if (c.isButton() && c.customId === "preset:card") {
-          state.statusCardStyle =
-            state.statusCardStyle === null
-              ? "full"
-              : state.statusCardStyle === "full"
-                ? "simple"
-                : null;
-          await c.update(render());
-        } else if (c.isButton() && c.customId === "preset:details") {
-          const modal = new ModalBuilder()
-            .setCustomId("preset:details-modal")
-            .setTitle("Preset details");
-          modal.addComponents(
-            new ActionRowBuilder<TextInputBuilder>().addComponents(
-              new TextInputBuilder()
-                .setCustomId("name")
-                .setLabel("Name (required)")
-                .setStyle(TextInputStyle.Short)
-                .setMaxLength(80)
-                .setValue(state.name)
-                .setRequired(true)
-            ),
-            new ActionRowBuilder<TextInputBuilder>().addComponents(
-              new TextInputBuilder()
-                .setCustomId("desc")
-                .setLabel("Description")
-                .setStyle(TextInputStyle.Short)
-                .setMaxLength(200)
-                .setValue(state.description)
-                .setRequired(false)
-            ),
-            new ActionRowBuilder<TextInputBuilder>().addComponents(
-              new TextInputBuilder()
-                .setCustomId("permission")
-                .setLabel("Permission: always / ask / deny")
-                .setStyle(TextInputStyle.Short)
-                .setMaxLength(10)
-                .setValue(state.permission ?? "")
-                .setRequired(false)
-            ),
-            new ActionRowBuilder<TextInputBuilder>().addComponents(
-              new TextInputBuilder()
-                .setCustomId("instr")
-                .setLabel("Instructions (worker identity)")
-                .setStyle(TextInputStyle.Paragraph)
-                .setMaxLength(4000)
-                .setValue(state.instructions ?? "")
-                .setRequired(false)
-            ),
-          );
-          await c.showModal(modal);
-          try {
-            const submit = await c.awaitModalSubmit({
-              time: 300_000,
-              filter: (m) => m.customId === "preset:details-modal",
-            });
-            state.name = submit.fields.getTextInputValue("name").trim();
-            state.description = submit.fields.getTextInputValue("desc").trim();
-            const permVal = submit.fields
-              .getTextInputValue("permission")
-              .trim()
-              .toLowerCase();
-            state.permission =
-              permVal === "always" || permVal === "ask" || permVal === "deny"
-                ? permVal
-                : null;
-            const instrVal = submit.fields.getTextInputValue("instr").trim();
-            state.instructions = instrVal || null;
-            await submit.deferUpdate();
-            await i.editReply(render());
-          } catch { /* modal timeout */ }
-        } else if (c.isButton() && c.customId === "preset:naming") {
-          const modal = new ModalBuilder()
-            .setCustomId("preset:naming-modal")
-            .setTitle("Preset naming");
-          modal.addComponents(
-            new ActionRowBuilder<TextInputBuilder>().addComponents(
-              new TextInputBuilder()
-                .setCustomId("role")
-                .setLabel("Role (empty / auto = none)")
-                .setStyle(TextInputStyle.Short)
-                .setMaxLength(64)
-                .setValue(state.role ?? "")
-                .setRequired(false)
-            ),
-            new ActionRowBuilder<TextInputBuilder>().addComponents(
-              new TextInputBuilder()
-                .setCustomId("disable")
-                .setLabel("Disable auto-name? yes / no")
-                .setStyle(TextInputStyle.Short)
-                .setMaxLength(3)
-                .setValue(state.disableThreadPrefix ? "yes" : "no")
-                .setRequired(false)
-            )
-          );
-          await c.showModal(modal);
-          try {
-            const submit = await c.awaitModalSubmit({
-              time: 300_000,
-              filter: (m) => m.customId === "preset:naming-modal",
-            });
-            const rawRole = submit.fields.getTextInputValue("role").trim();
-            state.role = !rawRole || rawRole.toLowerCase() === "auto" ? null : rawRole;
-            const rawDisable = submit.fields.getTextInputValue("disable").trim().toLowerCase();
-            state.disableThreadPrefix = rawDisable === "yes" || rawDisable === "true"
-              ? true
-              : rawDisable === "no" || rawDisable === "false" || rawDisable === ""
-                ? null
-                : state.disableThreadPrefix;
-            await submit.deferUpdate();
-            await i.editReply(render());
-          } catch { /* modal timeout */ }
-        } else if (c.isButton() && c.customId === "preset:tools") {
-          const modal = new ModalBuilder()
-            .setCustomId("preset:tools-modal")
-            .setTitle("Tool lists");
-          modal.addComponents(
-            new ActionRowBuilder<TextInputBuilder>().addComponents(
-              new TextInputBuilder()
-                .setCustomId("allow")
-                .setLabel("Allow list (comma-separated, blank = all)")
-                .setStyle(TextInputStyle.Paragraph)
-                .setMaxLength(1000)
-                .setValue(state.toolsAllow?.join(", ") ?? "")
-                .setRequired(false)
-            ),
-            new ActionRowBuilder<TextInputBuilder>().addComponents(
-              new TextInputBuilder()
-                .setCustomId("exclude")
-                .setLabel("Exclude list (comma-separated)")
-                .setStyle(TextInputStyle.Paragraph)
-                .setMaxLength(1000)
-                .setValue(state.toolsExclude?.join(", ") ?? "")
-                .setRequired(false)
-            )
-          );
-          await c.showModal(modal);
-          try {
-            const submit = await c.awaitModalSubmit({
-              time: 300_000,
-              filter: (m) => m.customId === "preset:tools-modal",
-            });
-            const allow = parseCsv(submit.fields.getTextInputValue("allow"));
-            const exclude = parseCsv(submit.fields.getTextInputValue("exclude"));
-            state.toolsAllow = allow.length > 0 ? allow : null;
-            state.toolsExclude = exclude.length > 0 ? exclude : null;
-            await submit.deferUpdate();
-            await i.editReply(render());
-          } catch { /* modal timeout */ }
-        } else if (c.isButton() && c.customId === "preset:instr") {
-          const modal = new ModalBuilder()
-            .setCustomId("preset:instr-modal")
-            .setTitle("Custom instructions");
-          modal.addComponents(
-            new ActionRowBuilder<TextInputBuilder>().addComponents(
-              new TextInputBuilder()
-                .setCustomId("instr")
-                .setLabel("Instructions (worker identity)")
-                .setStyle(TextInputStyle.Paragraph)
-                .setMaxLength(4000)
-                .setValue(state.instructions ?? "")
-                .setRequired(false)
-            )
-          );
-          await c.showModal(modal);
-          try {
-            const submit = await c.awaitModalSubmit({
-              time: 300_000,
-              filter: (m) => m.customId === "preset:instr-modal",
-            });
-            const val = submit.fields.getTextInputValue("instr").trim();
-            state.instructions = val || null;
-            await submit.deferUpdate();
-            await i.editReply(render());
-          } catch { /* modal timeout */ }
-        } else if (c.isButton() && c.customId === "preset:save") {
-          if (!state.name) {
-            await c.reply({ content: "Name is required.", flags: MessageFlags.Ephemeral });
-            return;
-          }
-          // Names are matched case-insensitively, so guard against a collision
-          // that differs only in case — but only WITHIN the same scope, so a
-          // project preset may reuse a name that exists globally or elsewhere.
-          if (!existing || existing.name.toLowerCase() !== state.name.toLowerCase()) {
-            const found = this.store.getPresetByNameScoped(state.name, projectRef);
-            const collision = found && (found.projectRef ?? null) === projectRef;
-            if (collision) {
-              await c.reply({
-                content:
-                  `A ${projectRef ? "project" : "global"} preset named ` +
-                  `\`${state.name}\` already exists.`,
-                flags: MessageFlags.Ephemeral,
-              });
-              return;
-            }
-          }
-          const now = new Date().toISOString();
-          const preset: Preset = {
-            id: existing?.id ?? `pre_${randomUUID().slice(0, 8)}`,
-            name: state.name,
-            projectRef,
-            description: state.description || null,
-            agentId: state.agentId,
-            model: state.model,
-            effort: state.effort,
-            repoPath: state.repoPath,
-            permission: state.permission,
-            toolsAllow: state.toolsAllow,
-            toolsExclude: state.toolsExclude,
-            instructions: state.instructions,
-            statusCardStyle: state.statusCardStyle,
-            role: state.role,
-            disableThreadPrefix: state.disableThreadPrefix,
-            createdBy: existing?.createdBy ?? i.user.id,
-            createdUtc: existing?.createdUtc ?? now,
-            updatedUtc: now,
-          };
-          this.store.upsertPreset(preset);
-          await c.deferUpdate();
-          await lifecycle.terminal(existing ? "saved" : "created", {
-            content: `${existing ? "💾 Updated" : "✅ Created"} preset **${preset.name}** (\`${preset.id}\`).`,
-            embeds: [],
-            components: [],
-          });
-        } else if (c.isButton() && c.customId === "preset:cancel") {
-          await c.deferUpdate();
-          await lifecycle.terminal("cancel", { content: "Cancelled.", embeds: [], components: [] });
-        }
-      } catch (err) {
-        this.logger.warn({ err }, "preset builder interaction failed");
-      }
-    });
-  }
-
   private async cmdPresetApply(i: ChatInputCommandInteraction): Promise<void> {
-    const name = i.options.getString("name", true);
-    const preset = this.store.getPresetByNameScoped(name, this.projectScopeId(i) ?? null);
-    if (!preset) {
-      await i.reply({ content: `No preset named \`${name}\`.`, flags: MessageFlags.Ephemeral });
-      return;
-    }
-    const channel = this.channelRefFromInteraction(i);
-    if (!channel) {
-      await i.reply({
-        content: "Use `/seam preset apply` inside a thread.",
-        flags: MessageFlags.Ephemeral,
-      });
-      return;
-    }
-    const record = this.router.ensureSessionRecord({
-      platform: channel.platform,
-      channelRef: channel.id,
-      ...(channel.parentId ? { parentRef: channel.parentId } : {}),
-      cwd: this.config.REPOS_ROOT,
-    });
-    await i.deferReply({ flags: MessageFlags.Ephemeral });
-    const summary = await this.applyPresetToSession(channel, record, preset);
-    await i.editReply(`✅ Applied preset **${preset.name}**.\n${summary}`);
+    await this.presetsUi.ready;
+    return this.presetsUi.ui.cmdPresetApply(this.presetsUi.interaction(i));
   }
-
-  /**
-   * `/seam preset thread` (#93): create NEW thread(s) under the parent channel
-   * (sibling if invoked inside a thread — same path as `/seam new`) and bind
-   * the picked preset's full config onto each session. `quantity` > 1 allocates
-   * stable role-group numbers without colliding in-loop.
-   */
   private async cmdPresetThread(i: ChatInputCommandInteraction): Promise<void> {
-    const rawName = i.options.getString("name") ?? "";
-    const presetName = (i.options.getString("preset", true) ?? "").trim();
-    if (!presetName) {
-      await i.reply({
-        content: "Pick a preset from the list — that field can't be blank.",
-        flags: MessageFlags.Ephemeral,
-      });
-      return;
-    }
-    const preset = this.store.getPresetByNameScoped(
-      presetName,
-      this.projectScopeId(i) ?? null
-    );
-    if (!preset) {
-      await i.reply({
-        content:
-          `No preset named \`${presetName}\` in this project. Use \`/seam preset list\` to see what's available.`,
-        flags: MessageFlags.Ephemeral,
-      });
-      return;
-    }
-    if (!this.adapter.createThread) {
-      await i.reply({
-        content: "This platform does not support creating threads.",
-        flags: MessageFlags.Ephemeral,
-      });
-      return;
-    }
-    if (!i.channelId) {
-      await i.reply({ content: "No channel.", flags: MessageFlags.Ephemeral });
-      return;
-    }
-    const quantityRaw = i.options.getInteger("quantity");
-    const quantity =
-      typeof quantityRaw === "number" && Number.isInteger(quantityRaw)
-        ? Math.max(1, quantityRaw)
-        : 1;
-    // `name` is only honored for a single spawn.
-    const name = quantity === 1 ? rawName.trim() : "";
-    const parentId =
-      i.channel && "isThread" in i.channel && typeof i.channel.isThread === "function" && i.channel.isThread()
-        ? (typeof i.channel.parentId === "string" ? i.channel.parentId : i.channelId)
-        : i.channelId;
-    const effectiveRole = preset.role ?? this.config.channelPresets.get(parentId)?.role?.value ?? null;
-
-    // Discord requires an initial acknowledgement within three seconds. Auto-
-    // naming may need to inspect many sibling threads, so acknowledge before
-    // that I/O instead of letting large projects intermittently expire here.
-    await i.deferReply({ flags: MessageFlags.Ephemeral });
-
-    if (quantity > 1 && !effectiveRole) {
-      await i.editReply("Multiple threads need a role so their prefixes can be enumerated.");
-      return;
-    }
-
-    const baseName = name || preset.name || "seam";
-
-    const created: ChannelRef[] = [];
-    let lastSummary = "";
-    try {
-      for (let index = 0; index < quantity; index += 1) {
-        const thread = await this.createChildThread(i.channelId, baseName, i.user.id);
-        const record = this.bindSessionToThread(thread);
-        lastSummary = await this.applyPresetToSession(thread, record, preset, { fresh: true });
-        this.startPresetOpeningTurn(thread, record, preset, i.user.id);
-        created.push(thread);
-      }
-      if (created.length === 1 && quantity === 1) {
-        await i.editReply(
-          `🧵 Created <#${created[0]!.id}> from preset **${preset.name}**.\n${lastSummary}`
-        );
-        return;
-      }
-      const links = created.map((t) => `• <#${t.id}>`).join("\n");
-      const header = `🧵 Created ${created.length} threads from preset **${preset.name}**:`;
-      await i.editReply(links ? `${header}\n${links}` : header);
-    } catch (err) {
-      this.logger.warn({ err }, "/seam preset thread failed");
-      try {
-        const links = created.map((t) => `• <#${t.id}>`).join("\n");
-        const prefix = created.length
-          ? `Created ${created.length} of ${quantity} before failing: ${(err as Error).message}`
-          : `Could not create the thread: ${(err as Error).message}`;
-        await i.editReply(links ? `${prefix}\n${links}` : prefix);
-      } catch {
-        /* already replied */
-      }
-    }
+    await this.presetsUi.ready;
+    return this.presetsUi.ui.cmdPresetThread(this.presetsUi.interaction(i));
+  }
+  private async cmdPresetShow(i: ChatInputCommandInteraction): Promise<void> {
+    await this.presetsUi.ready;
+    return this.presetsUi.ui.cmdPresetShow(this.presetsUi.interaction(i));
+  }
+  private async cmdPresetDelete(i: ChatInputCommandInteraction): Promise<void> {
+    await this.presetsUi.ready;
+    return this.presetsUi.ui.cmdPresetDelete(this.presetsUi.interaction(i));
+  }
+  private async cmdPresetBuilder(i: ChatInputCommandInteraction | MessageComponentInteraction, existing?: Preset, createScope?: string | null, seedRole?: string | null): Promise<void> {
+    await this.presetsUi.ready;
+    return this.presetsUi.ui.cmdPresetBuilder(this.presetsUi.interaction(i), existing, createScope, seedRole);
   }
 
-  /**
-   * After `/seam preset thread` spawn + apply: if the preset has instructions,
-   * kick off a real first turn in the NEW thread. Raw `injectTurn(session:"live")`
-   * captures text and does not stream a status card; the synthetic IncomingMessage
-   * path is the equivalent user-turn pipeline (panel, streaming, permissions).
-   * Fire-and-forget so the slash reply is not held for the whole agent turn.
-   * Not used by `/seam preset apply`.
-   */
   private startPresetOpeningTurn(
     thread: ChannelRef,
     _record: SessionRecord,
@@ -21010,56 +20063,6 @@ export class Orchestrator {
     options: { fresh?: boolean } = {}
   ): Promise<string> {
     return this.getConfigApplyPlan().applyPresetToSession(channel, record, preset, options);
-  }
-
-  private async cmdPresetShow(i: ChatInputCommandInteraction): Promise<void> {
-    const name = i.options.getString("name", true);
-    const preset = this.store.getPresetByNameScoped(name, this.projectScopeId(i) ?? null);
-    if (!preset) {
-      await i.reply({ content: `No preset named \`${name}\`.`, flags: MessageFlags.Ephemeral });
-      return;
-    }
-    const embed = new EmbedBuilder()
-      .setTitle(`🎛️ Preset: ${preset.name}`)
-      .setColor(PRESET_COLOR)
-      .setDescription(preset.description || "*(no description)*")
-      .addFields(
-        { name: "🗂️ Scope", value: preset.projectRef ? `<#${preset.projectRef}>` : "🌐 Global", inline: true },
-        { name: "🤖 Agent", value: preset.agentId ? `\`${preset.agentId}\`` : "*(default)*", inline: true },
-        { name: "🧠 Model", value: preset.model ? `\`${preset.model}\`` : "*(default)*", inline: true },
-        { name: "⚡ Effort", value: preset.effort ?? "*(default)*", inline: true },
-        { name: "📂 Repo", value: preset.repoPath ? `\`${this.repoDisplay(preset.repoPath)}\`` : "*(default)*", inline: true },
-        { name: "🎭 Role", value: preset.role ? `\`${preset.role}\`` : "*(none)*", inline: true },
-        { name: "🏷️ Auto-name", value: preset.disableThreadPrefix ? "disabled" : "enabled", inline: true },
-        { name: "🔒 Permission", value: preset.permission ?? "*(default)*", inline: true },
-        { name: "🃏 Status card", value: preset.statusCardStyle ?? "*(default)*", inline: true },
-        { name: "🔧 Tools allow", value: preset.toolsAllow?.join(", ") || "*(all)*" },
-        { name: "🔧 Tools exclude", value: preset.toolsExclude?.join(", ") || "*(none)*" },
-        {
-          name: "📋 Instructions",
-          value: preset.instructions
-            ? "```\n" + preset.instructions.slice(0, 1000) + "\n```"
-            : "*(none)*",
-        }
-      )
-      .setFooter({
-        text: `ID: ${preset.id} · Created by ${preset.createdBy} · ${preset.createdUtc}`,
-      });
-    await i.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
-  }
-
-  private async cmdPresetDelete(i: ChatInputCommandInteraction): Promise<void> {
-    const name = i.options.getString("name", true);
-    const preset = this.store.getPresetByNameScoped(name, this.projectScopeId(i) ?? null);
-    if (!preset) {
-      await i.reply({ content: `No preset named \`${name}\`.`, flags: MessageFlags.Ephemeral });
-      return;
-    }
-    this.store.deletePreset(preset.id);
-    await i.reply({
-      content: `🗑️ Deleted preset **${preset.name}** (\`${preset.id}\`).`,
-      flags: MessageFlags.Ephemeral,
-    });
   }
 
   // --- helpers ---

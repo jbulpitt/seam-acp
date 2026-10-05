@@ -131,7 +131,8 @@ async function main(): Promise<void> {
     storageAliases: { "service-status": {
       "service-status.sqlite": path.join(config.DATA_DIR, "service-status.sqlite"),
       "service-status-card.json": path.join(config.DATA_DIR, "service-status-card.json"),
-    }, quota: { "agent-quota-card.json": path.join(config.DATA_DIR, "agent-quota-card.json") } },
+    }, quota: { "agent-quota-card.json": path.join(config.DATA_DIR, "agent-quota-card.json") },
+      presets: { "presets.sqlite": path.join(config.DATA_DIR, "seam.db") } },
   });
   await plugins.loadBuiltins(BUILTIN_PLUGINS);
   const controllerInstanceId = randomUUID();

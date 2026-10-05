@@ -1,3 +1,4 @@
+import { PRESET_COMMAND_GROUP, PRESET_ACCESS } from "../../plugins/presets/commands.js";
 import {
   InteractionContextType,
   PermissionFlagsBits,
@@ -216,7 +217,7 @@ export function buildSeamCommand(): SlashCommandBuilder {
       )
   );
 
-  // --- groups (3): config, info, preset -------------------------------------
+  // --- core groups: config, info -------------------------------------------
 
   cmd.addSubcommandGroup((g) =>
     g
@@ -438,109 +439,6 @@ export function buildSeamCommand(): SlashCommandBuilder {
       )
   );
 
-  // Presets: reusable bundles of session config (agent/model/effort/repo/
-  // permission/tools/instructions). Existing-preset name options
-  // (`thread.preset`, `apply`/`delete`/`show`/`edit` `name`) autocomplete via
-  // the bot-wide AutocompleteRegistry (#93). `create` takes a NEW name and
-  // stays free-form.
-  cmd.addSubcommandGroup((g) =>
-    g
-      .setName("preset")
-      .setDescription("Manage reusable session presets")
-      .addSubcommand((sub) => declareAccess(sub, { kind: "read-only" }).setName("list").setDescription("List all presets"))
-      .addSubcommand((sub) =>
-        declareAccess(sub, { kind: "mutating" })
-          .setName("create")
-          .setDescription("Create a new preset (opens a builder card)")
-          .addBooleanOption((o) =>
-            o
-              .setName("global")
-              .setDescription(
-                "Make a global preset (visible in every project). Default: scoped to this project."
-              )
-              .setRequired(false)
-          )
-          .addStringOption((o) =>
-            o
-              .setName("role")
-              .setDescription("Role on apply")
-              .setRequired(false)
-          )
-      )
-      .addSubcommand((sub) =>
-        declareAccess(sub, { kind: "mutating" })
-          .setName("apply")
-          .setDescription("Apply a preset to the current thread")
-          .addStringOption((o) =>
-            o
-              .setName("name")
-              .setDescription("Preset name")
-              .setRequired(true)
-              .setAutocomplete(true)
-          )
-      )
-      .addSubcommand((sub) =>
-        declareAccess(sub, { kind: "mutating" })
-          .setName("delete")
-          .setDescription("Delete a preset")
-          .addStringOption((o) =>
-            o
-              .setName("name")
-              .setDescription("Preset name")
-              .setRequired(true)
-              .setAutocomplete(true)
-          )
-      )
-      .addSubcommand((sub) =>
-        declareAccess(sub, { kind: "read-only" })
-          .setName("show")
-          .setDescription("Show a preset's details")
-          .addStringOption((o) =>
-            o
-              .setName("name")
-              .setDescription("Preset name")
-              .setRequired(true)
-              .setAutocomplete(true)
-          )
-      )
-      .addSubcommand((sub) =>
-        declareAccess(sub, { kind: "mutating" })
-          .setName("edit")
-          .setDescription("Edit an existing preset (reopens the builder card)")
-          .addStringOption((o) =>
-            o
-              .setName("name")
-              .setDescription("Preset name")
-              .setRequired(true)
-              .setAutocomplete(true)
-          )
-      )
-      .addSubcommand((sub) =>
-        declareAccess(sub, { kind: "mutating" })
-          .setName("thread")
-          .setDescription("Create a new thread from a preset")
-          .addStringOption((o) =>
-            o
-              .setName("preset")
-              .setDescription("Preset to apply to the new thread")
-              .setRequired(true)
-              .setAutocomplete(true)
-          )
-          .addStringOption((o) =>
-            o
-              .setName("name")
-              .setDescription("Base name")
-              .setRequired(false)
-          )
-          .addIntegerOption((o) =>
-            o
-              .setName("quantity")
-              .setDescription("Thread count")
-              .setRequired(false)
-              .setMinValue(1)
-          )
-      )
-  );
 
   return cmd;
 }
@@ -973,6 +871,8 @@ for (const command of [buildSeamCommand(), buildSeamAdminCommand()]) {
 }
 
 for (const leaf of CONFIG_UI_LEAVES) accessLeaves.set(`seam/${CONFIG_UI_GROUP.name}/${leaf.name}`, { kind: leaf.access });
+
+for (const leaf of PRESET_COMMAND_GROUP.options!) accessLeaves.set(`seam/preset/${leaf.name}`, { kind: PRESET_ACCESS[leaf.name as keyof typeof PRESET_ACCESS] });
 
 export function getSlashCommandAccess(
   command: string,

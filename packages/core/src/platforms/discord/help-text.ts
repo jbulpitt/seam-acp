@@ -63,10 +63,6 @@ export function seamHelpSections(pluginHelp: readonly string[] = []): string[] {
       "`usage` — usage / credits for this thread's agent",
       "`avatar` — re-push the bot avatar and banner",
       "`help` — this list · `sessions` — recent sessions · `repos` — repos under REPOS_ROOT",
-      "",
-      "**`/seam preset`**",
-      "`list` · `create [global] [role]` · `apply <name>` · `delete <name>`",
-      "`show <name>` · `edit <name>` · `thread <preset> [name] [quantity]`",
     ].join("\n"),
 
     [

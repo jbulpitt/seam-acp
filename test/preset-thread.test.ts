@@ -292,7 +292,7 @@ function makeOrch(over?: {
     store: over?.listPresetsForProject
       ? new Proxy(store, {
           get(target, prop, receiver) {
-            if (prop === "listPresetsForProject") return over.listPresetsForProject;
+            if (prop === "presets") return new Proxy(target.presets, { get(repo, field) { return field === "listPresetsForProject" ? over.listPresetsForProject : Reflect.get(repo, field); } });
             return Reflect.get(target, prop, receiver);
           },
         })
@@ -472,17 +472,19 @@ describe("/seam preset thread slash routing + gates (#93)", () => {
 
   it("existing preset list/apply routing is unaffected", async () => {
     const { orch } = makeOrch();
+    await orch.loadPlugins();
+    const ui = (orch as any).presetsUi.ui;
     const seen: string[] = [];
-    (orch as any).cmdPresetList = async () => {
+    ui.cmdPresetList = async () => {
       seen.push("list");
     };
-    (orch as any).cmdPresetApply = async () => {
+    ui.cmdPresetApply = async () => {
       seen.push("apply");
     };
-    (orch as any).cmdPresetDelete = async () => {
+    ui.cmdPresetDelete = async () => {
       seen.push("delete");
     };
-    (orch as any).cmdPresetCreate = async () => {
+    ui.cmdPresetCreate = async () => {
       seen.push("create");
     };
     for (const sub of ["list", "create", "apply", "delete"]) {

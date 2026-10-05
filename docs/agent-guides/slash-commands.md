@@ -108,6 +108,12 @@ Parked notices carry durable Resume/Abandon choices bound to the attempt id;
 the click repeats the inventory's admission checks. Authentication notices use
 their existing **Authentication is done — continue** route plus Abandon, not a
 second generic Resume button.
+Inert history older than seven days is hidden by default, not deleted;
+`history:true` includes it. Actionable parked work remains visible at any age.
+Admins can explicitly clear old parked work and retained output with
+`abandon-older-than:7` (a positive whole number of days). It defaults to this
+thread; add `scope:all` for all threads. Records stay in the database, and the
+reply reports how many were abandoned and any real failures.
 
 **Cancel options** (not new keywords):
 - `/seam cancel` — this thread, graceful

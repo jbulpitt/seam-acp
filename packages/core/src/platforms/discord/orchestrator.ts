@@ -45,6 +45,7 @@ import { serializePanelText } from "../renderer.js";
 import { choicePickerPageCaption } from "./choice-picker.js";
 import { workflowLanding, workflowNavigation, workflowCategoryList, WORKFLOW_CATEGORIES, type WorkflowCategory } from "./workflow-category-view.js";
 import { workflowActionLabel } from "./workflows-view.js";
+import { visibleWorkflowHistory, visibleWorkflowLedger, DAY_MS } from "./workflow-retention.js";
 import { getSlashCommandAccess, getSlashAcknowledgement, type SlashCommandAccess } from "./commands.js";
 import type {
   ChatAdapter,
@@ -15995,11 +15996,7 @@ export class Orchestrator {
     }
     const ledger = this.store.getDelegation(id);
     if (ledger && (ledger.status === "interrupted" || ledger.status === "running")) {
-      try {
-        this.store.updateDelegationStatus(id, "abandoned");
-      } catch {
-        /* best-effort */
-      }
+      this.store.updateDelegationStatus(id, "abandoned");
       await this.dispatchWatcher?.abandonRunning(id, "abandoned by operator");
       return `🚫 Abandoned \`${id}\`.`;
     }
@@ -16017,6 +16014,29 @@ export class Orchestrator {
     const refusal = await this.workflowActionRefusal(action, id, channelRef);
     if (refusal) return refusal;
     return action === "resume" ? this.resumeTurnManually(id) : this.abandonTurnManually(id);
+  }
+
+  private async abandonOldWorkflows(days: number, channelRef?: string): Promise<string> {
+    const cutoff = Date.now() - days * DAY_MS;
+    const rows = (await this.collectInterruptedRows(channelRef)).filter(row => Date.parse(row.startedUtc) < cutoff);
+    let abandoned = 0;
+    const failures: string[] = [];
+    for (const row of rows) {
+      const attempt = this.store.turnAttempts.get(row.id);
+      const retainedOutput = attempt?.state === "completed" && !attempt.deliveryDone && !attempt.deliveryAbandonedReason;
+      if (!interruptedRowActions(row).includes("abandon") && !retainedOutput) continue;
+      try {
+        const result = await this.abandonTurnManually(row.id);
+        if (result.startsWith("🚫 Abandoned")) abandoned++;
+        else failures.push(result);
+      } catch (err) {
+        const cause = err instanceof Error ? err.message : String(err);
+        this.logger.error({ err, attempt: row.id }, "bulk workflow abandon failed");
+        failures.push(`${row.id}: ${cause}`);
+      }
+    }
+    const failureNote = failures.length ? ` ${failures.length} failed: ${failures.slice(0, 3).join("; ")}` : "";
+    return (`Abandoned ${abandoned} item(s) older than ${days} days in ${channelRef ? "this thread" : "all threads"}. All database records were kept.${failureNote}`).slice(0, 1900);
   }
 
   /** Steer a running (or idle) node: preemptively cancel its in-flight turn,
@@ -16465,6 +16485,20 @@ export class Orchestrator {
       return;
     }
     const limit = i.options.getInteger("limit") ?? 20;
+    const olderThan = i.options.getString("abandon-older-than");
+    if (olderThan !== null) {
+      if (!this.config.SEAM_CONFIG_ADMIN_USER_IDS?.has(i.user.id)) {
+        await replyToInteraction(i, { content: "Bulk workflow abandonment is admin-only." });
+        return;
+      }
+      const days = Number(olderThan);
+      if (!Number.isInteger(days) || days < 1) {
+        await replyToInteraction(i, { content: "Pass a positive whole number of days for `abandon-older-than`." });
+        return;
+      }
+      await replyToInteraction(i, { content: await this.abandonOldWorkflows(days, allThreads ? undefined : i.channelId) });
+      return;
+    }
     const resumeInput = i.options.getString("resume");
     if (resumeInput) {
       const id = await this.normalizeAutocompleteSubmission(i, null, "workflows", "resume", resumeInput);
@@ -16667,7 +16701,11 @@ export class Orchestrator {
     const channelRef = i.options.getString("scope") === "all" ? undefined : i.channelId;
     const scope = channelRef ? "this thread" : "all threads";
     const newestFirst = <T extends { createdUtc: string }>(rows: T[]) => rows.sort((a, b) => b.createdUtc.localeCompare(a.createdUtc));
-    const interrupted = await this.collectInterruptedRows(channelRef);
+    const includeHistory = i.options.getBoolean("history") ?? false;
+    const history = visibleWorkflowHistory(await this.collectInterruptedRows(channelRef), now, includeHistory);
+    const interrupted = history.rows;
+    const actionableIds = new Set(interrupted.filter(row => interruptedRowActions(row).length > 0).map(row => row.id));
+    const recentRows = (limit: number) => visibleWorkflowLedger(this.store.listRecentDelegations(limit, channelRef), now, includeHistory, actionableIds);
     const wakes = newestFirst(this.store.listWakesByChannel(PLATFORM, channelRef));
     const watches = newestFirst(channelRef ? this.listWatches(PLATFORM, channelRef) : this.store.listAllWatches());
     const choices = newestFirst(this.store.listOpenChoiceCards(PLATFORM, channelRef));
@@ -16680,7 +16718,7 @@ export class Orchestrator {
       parked: interrupted.filter(row => interruptedRowActions(row).length > 0).length,
       wakes: wakes.length, watches: watches.length, choices: choices.length,
       ingests: ingests.length, live: live.length, schedules: schedules.length,
-    }, scope);
+    }, scope, history.hidden);
     if (category !== "parked") {
       const lines: Record<Exclude<WorkflowCategory, "parked">, string[]> = {
         wakes: wakes.map(w => `⏰ \`${w.id}\` → ${w.fireAtUtc}${w.reason ? ` — ${w.reason.slice(0, 160)}` : ""}`),
@@ -16696,13 +16734,14 @@ export class Orchestrator {
       .sort((a, b) => b.createdUtc.localeCompare(a.createdUtc));
     const view = formatWorkflowsView(
       active,
-      this.store.listRecentDelegations(limit, channelRef),
+      recentRows(limit),
       now
     );
 
     const embed = new EmbedBuilder()
       .setTitle(`🔀 Parked turns — ${scope}`)
       .setColor(WORKFLOWS_COLOR);
+    if (history.hidden) embed.setFooter({ text: `${history.hidden} older inert record(s) hidden; history:true includes them` });
 
     if (view.empty) {
       embed.setDescription(
@@ -16730,7 +16769,7 @@ export class Orchestrator {
         ...new Map(
           [
             ...active,
-            ...this.store.listRecentDelegations(Math.max(limit, 200), channelRef),
+            ...recentRows(Math.max(limit, 200)),
           ].map((e) => [e.id, e])
         ).values(),
       ];
@@ -16745,7 +16784,8 @@ export class Orchestrator {
         });
       }
 
-      embed.setFooter({ text: `showing up to ${limit} recent rows` });
+      embed.setFooter({ text: `showing up to ${limit} recent rows`
+        + (history.hidden ? `; ${history.hidden} older inert record(s) hidden; history:true includes them` : "") });
     }
 
     const components: ActionRowBuilder<ButtonBuilder>[] = [];

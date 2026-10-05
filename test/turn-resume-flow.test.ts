@@ -860,6 +860,67 @@ describe("live-turn re-fire + flag + preconditions", () => {
 });
 
 describe("workflows inventory", () => {
+  it("hides older inert records in the rendered default view but keeps them in SQL and explicit history", async () => {
+    const { orch } = makeOrch();
+    const spec = handoffSpec({ id: "old-inert-output" });
+    store.turnAttempts.enqueue(spec);
+    store.turnAttempts.completePending(spec.id, { id: spec.id, target: spec.target, status: "completed", output: "retained answer" } as any);
+    store.turnAttempts.markDeliveryUncertain(spec.id, "delivery could not be proven", "2026-01-01T00:00:00.000Z");
+    store.recordDelegation({ id: "old-inert-ledger", kind: "handoff", targetRef: "thread-worker", status: "abandoned",
+      createdUtc: "2026-01-01T00:00:00.000Z", updatedUtc: "2026-01-01T00:00:00.000Z" });
+    const before = store.turnAttempts.get(spec.id);
+    const render = async (history: boolean) => (orch as any).renderWorkflowInventory({ channelId: "thread-worker",
+      options: { getString: () => null, getBoolean: () => history } }, 20, 0, "parked");
+    const hidden = (await render(false)).embeds[0].toJSON();
+    expect(hidden.fields ?? []).toEqual([]);
+    expect(hidden.footer.text).toContain("older inert record(s) hidden");
+    const included = (await render(true)).embeds[0].toJSON();
+    expect(included.fields.some((field: any) => field.name.includes("No action available"))).toBe(true);
+    expect(included.fields.some((field: any) => field.name.includes("Recent"))).toBe(true);
+    expect(store.turnAttempts.get(spec.id)).toEqual(before);
+    expect(store.getDelegation("old-inert-ledger")?.status).toBe("abandoned");
+  });
+
+  it("explicitly abandons old work and uncertain output only in scope, retaining every SQL record", async () => {
+    const { orch } = makeOrch();
+    const old = "2026-01-01T00:00:00.000Z";
+    for (const [id, target, time, status] of [
+      ["old-parked", "thread-worker", old, "interrupted"],
+      ["fresh-parked", "thread-worker", new Date().toISOString(), "interrupted"],
+      ["other-parked", "thread-other", old, "interrupted"],
+      ["already-abandoned", "thread-worker", old, "abandoned"],
+    ] as const) store.recordDelegation({ id, targetRef: target, kind: "handoff", status, createdUtc: time, updatedUtc: time });
+    const spec = handoffSpec({ id: "old-uncertain" });
+    store.turnAttempts.enqueue(spec);
+    store.turnAttempts.completePending(spec.id, { id: spec.id, target: spec.target, status: "completed", output: "retained answer" } as any);
+    store.turnAttempts.markDeliveryUncertain(spec.id, "no receipt", old);
+
+    expect(await (orch as any).abandonOldWorkflows(7, "thread-worker")).toContain("Abandoned 2 item(s)");
+    expect(store.getDelegation("old-parked")?.status).toBe("abandoned");
+    expect(store.getDelegation("fresh-parked")?.status).toBe("interrupted");
+    expect(store.getDelegation("other-parked")?.status).toBe("interrupted");
+    expect(store.getDelegation("already-abandoned")?.status).toBe("abandoned");
+    expect(store.turnAttempts.get(spec.id)?.deliveryAbandonedReason).toBe("abandoned by operator");
+    expect(store.turnAttempts.get(spec.id)?.result?.output).toBe("retained answer");
+    expect(await (orch as any).abandonOldWorkflows(7)).toContain("Abandoned 1 item(s)");
+    expect(store.getDelegation("other-parked")?.status).toBe("abandoned");
+    expect(store.listRecentDelegations(20)).toHaveLength(4);
+    expect(store.turnAttempts.list("completed")).toHaveLength(1);
+  });
+
+  it("reports real bulk-abandon failures and does not count a disappeared item as abandoned", async () => {
+    const { orch } = makeOrch();
+    store.recordDelegation({ id: "bad-update", kind: "handoff", targetRef: "thread-worker", status: "interrupted",
+      createdUtc: "2026-01-01T00:00:00.000Z", updatedUtc: "2026-01-01T00:00:00.000Z" });
+    vi.spyOn(store, "updateDelegationStatus").mockImplementation(() => { throw new Error("SQLITE_BUSY: database is locked"); });
+    expect(await (orch as any).abandonOldWorkflows(7, "thread-worker"))
+      .toMatch(/Abandoned 0 item\(s\).*SQLITE_BUSY: database is locked/);
+    expect(store.getDelegation("bad-update")?.status).toBe("interrupted");
+    vi.spyOn(orch, "abandonTurnManually").mockResolvedValue("No resumable turn `bad-update`.");
+    expect(await (orch as any).abandonOldWorkflows(7, "thread-worker"))
+      .toMatch(/Abandoned 0 item\(s\).*No resumable turn/);
+  });
+
   it("scopes before limiting recent rows and sorts parked rows newest first", async () => {
     for (const [id, target, time] of [
       ["old", "thread-worker", "2026-01-01T00:00:00.000Z"],

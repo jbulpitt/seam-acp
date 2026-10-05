@@ -9,10 +9,11 @@ export const WORKFLOW_CATEGORIES = [
 export type WorkflowCategory = typeof WORKFLOW_CATEGORIES[number][0];
 export type WorkflowCategoryCounts = Record<WorkflowCategory, number>;
 
-export function workflowLanding(counts: WorkflowCategoryCounts, scope: string) {
+export function workflowLanding(counts: WorkflowCategoryCounts, scope: string, hidden = 0) {
   return {
     embeds: [new EmbedBuilder().setTitle(`🔀 Workflows — ${scope}`).setColor(0x5865f2)
-      .setDescription("Pick a category. Counts and lists are for the selected scope, newest first.")],
+      .setDescription("Pick a category. Counts and lists are for the selected scope, newest first."
+        + (hidden ? `\n${hidden} older inert record(s) hidden; use \`history:true\` to include them.` : ""))],
     components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
       new StringSelectMenuBuilder().setCustomId("wf:category").setPlaceholder("Choose a workflow category")
         .addOptions(WORKFLOW_CATEGORIES.map(([value, label]) => ({ label: `${label} (${counts[value]})`, value }))),

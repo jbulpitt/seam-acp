@@ -105,4 +105,37 @@ describe("workflow acknowledgement", () => {
     expect(interaction.editReply).toHaveBeenCalledWith({ content: "The all-threads workflows view is admin-only." });
     expect(orch.renderWorkflowInventory).not.toHaveBeenCalled();
   });
+
+  it("defers before explicit admin bulk abandonment and uses the selected scope", async () => {
+    const { orch, interaction, order } = fixture({ "abandon-older-than": "7", scope: "all" });
+    orch.abandonOldWorkflows = vi.fn(async () => { order.push("abandon"); return "Abandoned 2; records kept"; });
+    await orch.handleSlashInteraction(interaction);
+    expect(order).toEqual(["defer", "abandon", "edit"]);
+    expect(orch.abandonOldWorkflows).toHaveBeenCalledWith(7, undefined);
+    expect(interaction.editReply).toHaveBeenCalledWith({ content: "Abandoned 2; records kept" });
+  });
+
+  it("defaults bulk abandonment to this thread", async () => {
+    const { orch, interaction } = fixture({ "abandon-older-than": "14" });
+    orch.abandonOldWorkflows = vi.fn(async () => "kept");
+    await orch.handleSlashInteraction(interaction);
+    expect(orch.abandonOldWorkflows).toHaveBeenCalledWith(14, "thread");
+  });
+
+  it("keeps bulk abandonment admin-only", async () => {
+    const { orch, interaction } = fixture({ "abandon-older-than": "7" });
+    interaction.user.id = "not-admin";
+    orch.abandonOldWorkflows = vi.fn();
+    await orch.handleSlashInteraction(interaction);
+    expect(interaction.editReply).toHaveBeenCalledWith({ content: "Bulk workflow abandonment is admin-only." });
+    expect(orch.abandonOldWorkflows).not.toHaveBeenCalled();
+  });
+
+  it.each(["0", "-1", "1.5", "not-days"])("rejects invalid day input %s without mutating", async days => {
+    const { orch, interaction } = fixture({ "abandon-older-than": days });
+    orch.abandonOldWorkflows = vi.fn();
+    await orch.handleSlashInteraction(interaction);
+    expect(interaction.editReply).toHaveBeenCalledWith({ content: "Pass a positive whole number of days for `abandon-older-than`." });
+    expect(orch.abandonOldWorkflows).not.toHaveBeenCalled();
+  });
 });

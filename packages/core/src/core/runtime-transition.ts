@@ -229,7 +229,18 @@ export class RuntimeTransition {
     await this.settings!.router.applyPermissionMode(record);
   }
 
+  async setPermission(record: SessionRecord, policy: "always" | "ask" | "deny"): Promise<void> {
+    const cfg = this.store.readConfig(record);
+    cfg.permissionPolicy = policy;
+    delete cfg.autoApprovePermissions;
+    this.persistConfig(record, cfg);
+    await this.applyPermissionMode(record);
+  }
+
   async setMode(record: SessionRecord, id: string): Promise<void> {
+    const cfg = this.store.readConfig(record);
+    cfg.mode = id;
+    this.persistConfig(record, cfg);
     if (this.settings!.router.hasRuntime(record.id)) {
       try {
         const runtime = await this.settings!.router.getOrStartRuntime(record);

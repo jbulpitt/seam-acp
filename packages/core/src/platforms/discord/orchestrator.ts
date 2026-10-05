@@ -14948,9 +14948,6 @@ export class Orchestrator {
       return;
     }
     const id = i.options.getString("id", true);
-    const cfg = this.store.readConfig(record);
-    cfg.mode = id;
-    this.persistConfig(record, cfg);
     await this.getRuntimeTransition().setMode(record, id);
     await i.reply({ content: `Mode set to \`${id}\`.`, flags: MessageFlags.Ephemeral });
   }
@@ -21495,12 +21492,7 @@ export class Orchestrator {
       | "ask"
       | "deny";
     await i.deferReply({ flags: MessageFlags.Ephemeral });
-    const cfg = this.store.readConfig(record);
-    cfg.permissionPolicy = policy;
-    // Drop the deprecated field so it can never override the new value.
-    delete cfg.autoApprovePermissions;
-    this.persistConfig(record, cfg);
-    await this.getRuntimeTransition().applyPermissionMode(record);
+    await this.getRuntimeTransition().setPermission(record, policy);
     const messages: Record<typeof policy, string> = {
       always:
         "Approval policy set to `always`. ⚠️ The agent will auto-approve every permission request (shell exec, file writes, network, etc.).",

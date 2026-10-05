@@ -225,6 +225,42 @@ describe("reauth resume status-card settlement", () => {
     expect(h.messages.filter(text => text === "RESUMED-ONCE")).toHaveLength(1);
     h.store.close();
   });
+
+  it.each(["wake", "handoff", "message"] as const)("stops a %s card after re-parking and later resumes it to Done", async kind => {
+    vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
+    const h = harness(() => ({ refreshTokenExpiresAt: 1 }), true);
+    const spec: DispatchSpec = { id: "reauth-dispatch", target: h.record.channelRef,
+      prompt: "ORIGINAL-ONCE", session: "live", kind: kind === "message" ? "wake" : kind,
+      createdUtc: h.record.createdUtc, stream: false };
+    const id = kind === "message" ? await parkMessage(h) : spec.id;
+    if (kind !== "message") await expect(h.orch.dispatchInjectTurn(spec)).rejects.toMatchObject({ name: "DispatchSuspendedError" });
+    const original = h.store.turnAttempts.get(id)!;
+    const resume = async () => {
+      await clickReauth(h);
+      if (kind !== "message") { await h.watcher.start(); await h.watcher.drain(); h.watcher.stop(); }
+    };
+    // Authentication still fails after the first confirmation.
+    await resume();
+    expect(h.store.turnAttempts.get(id)).toMatchObject({ state: "suspended", generation: 2,
+      acpSessionId: "fixture-acp", statusCard: original.statusCard });
+    expect(h.cards.get(original.statusCard!.messageId)?.title).toContain("Waiting");
+    const parkedEdits = h.edits.length;
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(h.edits).toHaveLength(parkedEdits);
+    resumeOutcome(h, false);
+    await resume();
+    expect(h.store.turnAttempts.get(id)).toMatchObject({ state: "completed", generation: 3,
+      acpSessionId: "fixture-acp", statusCard: original.statusCard });
+    expect(h.prompt).toHaveBeenCalledTimes(3);
+    expect(JSON.stringify(h.prompt.mock.calls).match(/ORIGINAL-ONCE/g)).toHaveLength(1);
+    expect(h.cards.size).toBe(1);
+    expect(h.cards.get(original.statusCard!.messageId)?.title).toContain("Done");
+    const settledEdits = h.edits.length;
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(h.edits).toHaveLength(settledEdits);
+    expect(h.messages.filter(text => text === "RESUMED-ONCE")).toHaveLength(1);
+    h.store.close();
+  });
 });
 
 describe("#454 prompt park", () => {

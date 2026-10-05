@@ -391,6 +391,7 @@ function makeQuiesceHost(over: Record<string, unknown> = {}) {
     identityEffects: { ready: Promise.resolve(), flush: async () => {} },
     scheduleUi: { ready: Promise.resolve() },
     configUi: { ready: Promise.resolve() },
+    presetsUi: { ready: Promise.resolve() },
     intakeStopped: false,
     gatewayClosed: false,
     activeTurnSettles: new Set<Promise<void>>(),

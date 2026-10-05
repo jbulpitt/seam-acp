@@ -1,3 +1,4 @@
+import { presetUiFixture } from "./plugin-presets-fixture.js";
 /**
  * Call-site behaviour for the preset-list Edit button (#159).
  *
@@ -177,20 +178,15 @@ async function runPresetListEdit(clicks: number, opts: RunOpts = {}) {
     attachListLifecycle: Orchestrator.prototype["attachListLifecycle" as never],
     // The real wrapper, so a builder that throws after the freeze is surfaced
     // rather than leaving a permanently "thinking" ephemeral.
-    openEditorAfterFreeze: Orchestrator.prototype["openEditorAfterFreeze" as never],
-    buildPresetListMessage: Orchestrator.prototype["buildPresetListMessage" as never],
-    presetSummaryLine: Orchestrator.prototype["presetSummaryLine" as never],
     cmdPresetBuilder: async (c: { deferred: boolean; replied: boolean; editReply: () => Promise<void>; deferReply: () => Promise<void> }) => {
       events.push(`editor:opened:deferred=${c.deferred}`);
       if (!c.deferred && !c.replied) await c.deferReply();
       await c.editReply();
     },
   };
-  await (
-    Orchestrator.prototype as unknown as {
-      cmdPresetList(this: unknown, i: unknown): Promise<void>;
-    }
-  ).cmdPresetList.call(self, interaction);
+  const fixture = presetUiFixture(self);
+  fixture.ui.cmdPresetBuilder = self.cmdPresetBuilder;
+  await fixture.ui.cmdPresetList(fixture.interaction(interaction));
 
   const delivered = await fireClicks(collector, clicks, (e) =>
     makeEditButton(`pr:edit:${presetRow.id}`, e, ackGate),

@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { scheduleUiFixture } from "./plugin-schedule-fixture.js";
+import { PresetUi, createPresetPlugin } from "../packages/core/src/plugins/presets/index.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -243,7 +244,10 @@ describe("slash autocomplete responders", () => {
     const { orch } = makeOrch();
     await orch.loadPlugins();
     const registry = (orch as unknown as { autocomplete: AutocompleteRegistry }).autocomplete;
-    const inventory = [...registry.inventory(), ...scheduleUiFixture(orch).ui.autocomplete.inventory()].sort((a, b) => a.key.localeCompare(b.key));
+    const presetResponders = createPresetPlugin(new PresetUi({} as never)).contributions.slash!.flatMap(leaf =>
+      (leaf.autocomplete ?? []).map(option => ({ key: autocompleteKey(leaf.group?.name, leaf.leaf.name, option.option), policy: option.policy }))
+    );
+    const inventory = [...registry.inventory(), ...scheduleUiFixture(orch).ui.autocomplete.inventory(), ...presetResponders].sort((a, b) => a.key.localeCompare(b.key));
     expect(inventory.map((entry) => entry.key)).toEqual(registeredAutocompleteKeys((orch as any).plugins.slash));
 
     const expected = new Map<string, AutocompleteRoundTripPolicy>([

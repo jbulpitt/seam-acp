@@ -2,7 +2,7 @@
 
 The controller loads `plugins/builtins.ts` in order, independently of Seam MCP.
 Only known built-ins are loaded. The controller also installs thread naming,
-card visuals, quota, schedule UI, config UI, the session browser and optional service status through controller-only bootstraps.
+card visuals, quota, schedule UI, config UI, presets, the session browser and optional service status through controller-only bootstraps.
 
 A descriptor declares its id, API version, built-in/internal eligibility,
 optional config validation and activate/dispose hooks, and contributions.
@@ -193,3 +193,24 @@ Authentication, channel gates, thread creation and reconstruction remain in the
 kernel. Save retains D10: a running turn finishes before its saved runtime
 selection is applied at the next acquisition. The existing draft lifetime and
 expiry behavior are unchanged; component routing registers at boot.
+
+## Presets
+
+The presets built-in owns `/seam preset` list/create/apply/delete/show/edit/thread,
+autocomplete, the builder's selects and modals, and the paginated list. It uses
+the same catalog and repository pickers as the config editor. Its `preset:` and
+`pr:` routes retain their ten-minute collectors; an old card stops responding
+after a controller restart, as before. Drafts and list state are not persisted.
+
+The plugin owns the preset schema, migrations and CRUD. The host aliases its
+storage to the existing `seam.db` table, retaining ids, scopes, timestamps and
+all fields without copying data. Kernel readers delegate to that repository;
+the shared connection still follows the session store's lifetime.
+UI activation failure logs its original cause and removes only its contributions;
+kernel consumers retain the initialized repository.
+
+Internal ports apply presets through `ConfigApplyPlan` and create/bind threads
+before submitting an opening prompt through the existing kernel admission path.
+The plugin receives catalog snapshots and UI operations, never a session store,
+router, native Discord interaction or agent runtime. Admission and thread naming
+remain in the kernel.

@@ -1,3 +1,4 @@
+import { presetUiFixture } from "./plugin-presets-fixture.js";
 import { describe, expect, it, vi } from "vitest";
 import { pino } from "pino";
 import fs from "node:fs";
@@ -30,6 +31,7 @@ function fixture({ locked = false, participant = false, user = PARTICIPANT, iden
   orch.plugins = new PluginHost(orch.logger);
   orch.identityEffects = { ready: Promise.resolve(), flush: async () => {} };
   orch.scheduleUi = { ready: Promise.resolve() };
+  orch.presetsUi = { ready: Promise.resolve() };
   const configInteractions = new WeakMap<object, unknown>();
   orch.configUi = { ready: Promise.resolve(), bind: (invocation: object, native: unknown) => configInteractions.set(invocation, native) };
   const configPlugin = createConfigUiPlugin({
@@ -198,6 +200,10 @@ describe.each([
         messageId: "list", messageButtons: [], mutationRefusal: () => orch.slashAccessRefusal(click, { kind: "mutating" }),
         editReply: async () => refresh(),
       } as never);
+    } else if (handler === "cmdPresetList") {
+      const fixture = presetUiFixture(orch);
+      (fixture.ui as any).buildPresetListMessage = () => view;
+      await fixture.ui.cmdPresetList(fixture.interaction(i));
     } else await orch[handler](i);
     const click = (customId: string) => Object.assign(interaction("seam", null, "workflows"), {
       customId, isButton: () => true, isStringSelectMenu: () => false, deferUpdate: vi.fn(async () => {}), update: vi.fn(async () => {}),

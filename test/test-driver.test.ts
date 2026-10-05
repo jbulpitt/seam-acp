@@ -87,6 +87,19 @@ describe("SyntheticInteraction keeps Discord's interaction rules", () => {
     expect(() => m.fields!.getTextInputValue("missing")).toThrow();
   });
 
+  it("edits a named follow-up without replacing the component's original reply", async () => {
+    const now = { t: 0 };
+    const { ctx, message } = context(now);
+    const target = { id: "editor", content: "👁️ *ephemeral — only the tester would see this*\nold", edit: vi.fn(async () => ({ id: "editor" })) };
+    Object.assign(ctx.channel, { messages: { fetch: vi.fn(async () => target) } });
+    const i = new SyntheticInteraction({ kind: "button", channelId: "c1", messageId: "m1", customId: "sl:edit:test" }, ctx);
+    await i.deferUpdate();
+    await i.editReply({ content: "updated", message: "editor" });
+    expect(target.edit).toHaveBeenCalledWith(expect.objectContaining({ content: expect.stringContaining("updated") }));
+    expect(message.edit).not.toHaveBeenCalled();
+    expect(i.transcript.at(-1)).toMatchObject({ op: "editReply", ephemeral: true, messageId: "editor" });
+  });
+
   it("resolves a slash command's modal waiter from a later submission", async () => {
     const now = { t: 0 };
     const { ctx } = context(now);

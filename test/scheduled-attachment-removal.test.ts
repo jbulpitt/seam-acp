@@ -1,3 +1,5 @@
+import { scheduleUiFixture } from "./plugin-schedule-fixture.js";
+import { namingCommands } from "./plugin-naming-fixture.js";
 /**
  * #158 — scheduled prompts no longer carry file attachments.
  *
@@ -65,7 +67,7 @@ function schedule(over: Partial<ScheduledPrompt> = {}): ScheduledPrompt {
 
 describe("#158 command surface", () => {
   // #151 moved the schedule group to the operator command.
-  const json = buildSeamAdminCommand().toJSON() as {
+  const json = namingCommands().find(command => command.name === "seamadmin") as {
     options?: Array<{ name: string; options?: Array<{ name: string; type?: number; options?: Array<{ name: string; type?: number }> }> }>;
   };
   const group = json.options?.find((o) => o.name === "schedule");
@@ -499,11 +501,8 @@ async function renderBuilderCard(existing?: ScheduledPrompt): Promise<RenderedCa
       handleEnd: async () => {},
     }),
   };
-  await (
-    Orchestrator.prototype as unknown as {
-      cmdScheduleAdd(this: unknown, i: unknown, existing?: ScheduledPrompt): Promise<void>;
-    }
-  ).cmdScheduleAdd.call(self, interaction, existing);
+  const fixture = scheduleUiFixture(self);
+  await fixture.ui.cmdScheduleAdd(fixture.interaction(interaction), existing);
   if (!card) throw new Error("builder card was never rendered");
   return card;
 }

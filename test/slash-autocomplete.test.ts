@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { scheduleUiFixture } from "./plugin-schedule-fixture.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -59,6 +60,7 @@ function autocompleteI(over: {
 }) {
   const responded: unknown[][] = [];
   const i = {
+    commandName: over.group === "schedule" ? "seamadmin" : "seam",
     options: {
       getSubcommandGroup: (_req?: boolean) =>
         over.group !== undefined ? over.group : "config",
@@ -85,7 +87,7 @@ function autocompleteI(over: {
 }
 
 /** Extract the actual autocomplete surface Discord receives from both trees. */
-function registeredAutocompleteKeys(): string[] {
+function registeredAutocompleteKeys(registry: Parameters<typeof buildSlashRegistrationBody>[0]): string[] {
   type Option = {
     name: string;
     type: number;
@@ -93,7 +95,7 @@ function registeredAutocompleteKeys(): string[] {
     options?: Option[];
   };
   const keys: string[] = [];
-  for (const command of buildSlashRegistrationBody()) {
+  for (const command of buildSlashRegistrationBody(registry)) {
     for (const first of (command.options ?? []) as Option[]) {
       if (first.type === 1) {
         for (const option of first.options ?? []) {
@@ -237,11 +239,12 @@ afterEach(() => {
 });
 
 describe("slash autocomplete responders", () => {
-  it("inventory covers every registered responder and declares its round-trip policy", () => {
+  it("inventory covers every registered responder and declares its round-trip policy", async () => {
     const { orch } = makeOrch();
+    await orch.loadPlugins();
     const registry = (orch as unknown as { autocomplete: AutocompleteRegistry }).autocomplete;
-    const inventory = registry.inventory();
-    expect(inventory.map((entry) => entry.key)).toEqual(registeredAutocompleteKeys());
+    const inventory = [...registry.inventory(), ...scheduleUiFixture(orch).ui.autocomplete.inventory()].sort((a, b) => a.key.localeCompare(b.key));
+    expect(inventory.map((entry) => entry.key)).toEqual(registeredAutocompleteKeys((orch as any).plugins.slash));
 
     const expected = new Map<string, AutocompleteRoundTripPolicy>([
       ["/new/agent", "canonical"],
@@ -825,6 +828,7 @@ describe("slash autocomplete responders", () => {
       listForThread: () => [{ id: "lh_round", status: "live", channelName: "Tutor room" }],
     };
     const registry = (orch as unknown as { autocomplete: AutocompleteRegistry }).autocomplete;
+    const scheduleRegistry = scheduleUiFixture(orch).ui.autocomplete;
     const families = [
       ...(["remove", "toggle", "edit"] as const).map((subcommand) => ({
         group: "schedule", subcommand, optionName: "id", focusedValue: "Morning", value: "sch_round",
@@ -845,17 +849,18 @@ describe("slash autocomplete responders", () => {
         channelId: "thread-1",
         parentId: "chan-1",
       };
-      const responder = registry.get(family.group, family.subcommand, family.optionName);
+      const owner = family.group === "schedule" ? scheduleRegistry : registry;
+      const responder = owner.get(family.group, family.subcommand, family.optionName);
       expect(responder, autocompleteKey(family.group, family.subcommand, family.optionName)).toBeDefined();
       const choices = await responder!(ctx);
       const choice = choices.find((candidate) => candidate.value === family.value);
       expect(choice, autocompleteKey(family.group, family.subcommand, family.optionName)).toBeDefined();
 
-      const fromLabel = await registry.normalizeSubmission(
+      const fromLabel = await owner.normalizeSubmission(
         family.group, family.subcommand, family.optionName, choice!.name,
         { ...ctx, focusedValue: choice!.name }
       );
-      const fromCanonical = await registry.normalizeSubmission(
+      const fromCanonical = await owner.normalizeSubmission(
         family.group, family.subcommand, family.optionName, family.value,
         { ...ctx, focusedValue: family.value }
       );
@@ -863,7 +868,7 @@ describe("slash autocomplete responders", () => {
       expect(fromCanonical).toBe(family.value);
 
       const altered = `${choice!.name} altered`;
-      await expect(registry.normalizeSubmission(
+      await expect(owner.normalizeSubmission(
         family.group, family.subcommand, family.optionName, altered,
         { ...ctx, focusedValue: altered }
       )).resolves.toBe(altered);
@@ -874,26 +879,28 @@ describe("slash autocomplete responders", () => {
     const row = schedule({ id: "sch_submit", name: "Morning brief" });
     store.upsertScheduled(row);
     const { orch } = makeOrch();
+    const fixture = scheduleUiFixture(orch);
     const replies: string[] = [];
     const command = (input: string) => ({
+      user: { id: "admin" },
       options: { getString: () => input, data: [] },
       channelId: "thread-1",
       channel: { isThread: () => true, parentId: "chan-1" },
       reply: vi.fn(async (payload: { content: string }) => { replies.push(payload.content); }),
     });
 
-    await (orch as any).cmdScheduleRemove(command("Morning brief (sch_submit)"));
+    await fixture.ui.cmdScheduleRemove(fixture.interaction(command("Morning brief (sch_submit)")));
     expect(store.getScheduled("sch_submit")).toBeNull();
     expect(replies.at(-1)).toContain("Deleted scheduled prompt");
 
     for (const alias of ["Morning brief (sch_submit) altered", "Morning bri"]) {
       store.upsertScheduled(row);
-      await (orch as any).cmdScheduleRemove(command(alias));
+      await fixture.ui.cmdScheduleRemove(fixture.interaction(command(alias)));
       expect(store.getScheduled("sch_submit"), alias).not.toBeNull();
       expect(replies.at(-1), alias).toContain("No schedule");
     }
 
-    await (orch as any).cmdScheduleRemove(command("sch_submit"));
+    await fixture.ui.cmdScheduleRemove(fixture.interaction(command("sch_submit")));
     expect(store.getScheduled("sch_submit")).toBeNull();
   });
 });

@@ -349,9 +349,11 @@ describe("render failures never take the action down", () => {
 describe("orchestrator lifecycle invariant", () => {
   it("every component collector is paired with the shared lifecycle", () => {
     const collectors = ORCHESTRATOR.match(/\.createMessageComponentCollector\(/g) ?? [];
-    const attached = ORCHESTRATOR.match(/this\.attachListLifecycle\(/g) ?? [];
+    const attached = ORCHESTRATOR.match(/this\.attachListLifecycle\(i,/g) ?? [];
     expect(collectors.length).toBeGreaterThan(0);
     expect(attached.length).toBe(collectors.length);
+    const scheduleUi = readFileSync(path.join(REPO_ROOT, "packages/core/src/plugins/schedule-ui/index.ts"), "utf8");
+    expect(scheduleUi.match(/\.attachLifecycle\(/g)?.length).toBe(scheduleUi.match(/\.createMessageComponentCollector\(/g)?.length);
   });
 
   it("no collector stops or end handlers are hand-rolled outside the lifecycle", () => {

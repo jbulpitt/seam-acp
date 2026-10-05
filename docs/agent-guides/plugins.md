@@ -2,7 +2,7 @@
 
 The controller loads `plugins/builtins.ts` in order, independently of Seam MCP.
 Only known built-ins are loaded. The controller also installs thread naming,
-card visuals, quota and optional service status through controller-only bootstraps.
+card visuals, quota, schedule UI and optional service status through controller-only bootstraps.
 
 A descriptor declares its id, API version, built-in/internal eligibility,
 optional config validation and activate/dispose hooks, and contributions.
@@ -101,6 +101,23 @@ existing precedence. MCP still mounts only with `SEAM_MCP_ENABLED`.
 
 Repository, HTTP, attempt and bridge contributions are not public surfaces.
 Attachment, wake, watch, choice and result fences retain their kernel handlers.
+
+## Schedule administration
+
+The schedule UI built-in owns `/seamadmin schedule` add/list/remove/toggle/edit,
+its autocomplete, paginated list, builder, modals and Run now buttons.
+Builders use `sched:` collector routes, with the same owner, expiry and ordered
+card lifecycle. List buttons use persistent `sl:` routing and
+read their page from the message, so pre-restart lists keep working. The
+internal UI transport exposes replies, collectors and modals, not the Discord
+client or native interaction objects.
+
+Its controller-only schedule repository/admin facade exposes existing rows,
+CRUD, timer re-arming and run-now, plus effective builder defaults. It never
+passes the router, session store or agent runtime to the plugin. Loading the
+plugin does not migrate or reset schedule data. Occurrences, durable admission,
+cron timers, isolated launch and delivery remain kernel-owned; disabling the
+UI does not stop already admitted or scheduled work.
 
 ## Quota and turn activity
 

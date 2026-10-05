@@ -38,6 +38,7 @@ import {
   type VoiceState,
 } from "discord.js";
 import { SyntheticInteraction, validateSlashSpec, type TestInteractionSpec, type TranscriptEntry } from "./synthetic-interaction.js";
+import { discordComponentInteractions } from "./component-interactions.js";
 import {
   VoiceConnectionStatus,
   entersState,
@@ -2149,6 +2150,7 @@ export class DiscordAdapter implements ChatAdapter {
         await interaction.showModal(modal);
       },
     };
+    discordComponentInteractions.set(evt, interaction);
     await this.componentHandler(evt);
   }
 

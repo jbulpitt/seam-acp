@@ -4,7 +4,8 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { pino } from "pino";
-import { makeMux, type AgentProfile, type BridgeSlotHealth } from "@seam/adapters";
+import { makeMux, type AgentProfile } from "@seam/adapters";
+import type { BridgeSlotHealth } from "../packages/adapters/src/mux.js";
 import { AgentRuntime } from "../packages/core/src/agents/agent-runtime.js";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
@@ -12,6 +13,9 @@ import { discordRenderer } from "../packages/core/src/platforms/discord/renderer
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 import { visualConfig } from "./plugin-card-visuals-fixture.js";
 import { TurnStatus } from "../packages/core/src/core/status-panel.js";
+import { createRuntimeDispatchWatcher } from "../packages/core/src/core/dispatch/watcher.js";
+import { enqueueDispatchSpec, dispatchDirs } from "../packages/core/src/core/dispatch/types.js";
+import { existsSync } from "node:fs";
 
 const cleanups: (() => void)[] = [];
 afterEach(() => {
@@ -23,7 +27,8 @@ const drain = async () => {
   for (let i = 0; i < 20; i++) await new Promise<void>(resolve => setImmediate(resolve));
 };
 
-async function setup(source: "inbound" | "dispatch" = "inbound", style: "full" | "simple" = "full") {
+async function setup(source: "inbound" | "dispatch" = "inbound", style: "full" | "simple" = "full",
+  options: { armed?: boolean; queue?: boolean; disconnected?: boolean; adoptionUnavailable?: boolean } = {}) {
   const dir = mkdtempSync(path.join(tmpdir(), "seam-adopt-reconnect-"));
   cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
   let store = new SessionStore(path.join(dir, "test.db"));
@@ -54,8 +59,12 @@ async function setup(source: "inbound" | "dispatch" = "inbound", style: "full" |
   store.close();
   store = new SessionStore(path.join(dir, "test.db"));
   const snapshot = { version: 1, owner: "bridge", submissionId: "submission",
-    acpSessionId: "acp", rung: 1, phase: "executing", retry: 0, budget: 3,
-    remaining: 3, disposition: "none", updatedUtc: now };
+    acpSessionId: "acp", rung: 1, phase: options.armed ? "armed" : "executing", retry: 0, budget: 3,
+    remaining: 3, disposition: "none", updatedUtc: now, ...(options.armed ? { reconcileSupported: true } : {}) };
+  let rows = [{ slot: 6, alive: true, outputAckedThrough: 10, recovery: snapshot }];
+  let promptMissing = false;
+  let inventoryUnknown = false;
+  let inventoryError = false;
   let seq = 10;
   const frames: Array<Record<string, unknown>> = [];
   const commands: Array<Record<string, any>> = [];
@@ -65,12 +74,24 @@ async function setup(source: "inbound" | "dispatch" = "inbound", style: "full" |
       const cmd = JSON.parse(raw);
       commands.push(cmd);
       if (cmd.type !== "cmd") return;
+      if (cmd.action === "listSlots" && inventoryError) {
+        queueMicrotask(() => this.deliver({ type: "cmd_reply", cmdId: cmd.cmdId, error: "fixture bridge reconnecting" }));
+        return;
+      }
       queueMicrotask(() => this.deliver({ type: "cmd_reply", cmdId: cmd.cmdId,
         payload: cmd.action === "listSlots"
-          ? { slots: [6], health: [{ slot: 6, alive: true, outputAckedThrough: 10, recovery: snapshot }] }
+          ? { slots: rows.map(row => row.slot), ...(inventoryUnknown ? {} : { health: rows }) }
           : cmd.action === "replayOutput"
             ? { frames: frames.filter(frame => Number(frame.seq) > cmd.payload.afterSeq) }
-            : null }));
+            : { state: "owned" } }));
+      if (cmd.action === "reconcileRung1Recovery" && promptMissing) queueMicrotask(() => frame({
+        type: "recovery_result", recoveryResult: {
+          version: 1, submissionId: "submission", acpSessionId: "acp", status: "failed",
+          text: "", errorKind: "protocol_error", stopReason: "prompt_not_received",
+          error: "bridge slot 6 armed recovery but never received a complete session/prompt for this submission",
+          finishedUtc: new Date().toISOString(),
+        },
+      }));
     }
     close() {}
     deliver(frame: Record<string, unknown>) {
@@ -83,11 +104,13 @@ async function setup(source: "inbound" | "dispatch" = "inbound", style: "full" |
   mux.attach(socket as never);
   socket.deliver({ type: "hello", instanceId: "first", capabilities: { durableSlots: true } });
   let runtime!: AgentRuntime;
+  let adoptionUnavailable = options.adoptionUnavailable ?? false;
   const router = {
     isBusy: () => runtime?.busy ?? false,
     describeConfig: () => ({ model: { value: "test" }, agent: { value: "codex" },
       location: { value: "remote" }, cwd: { value: "/synthetic" } }),
     adoptRecoveryRuntime: (_record: unknown, child: any, session: string) => {
+      if (adoptionUnavailable) throw new Error("fixture bridge catalog not ready");
       runtime = new AgentRuntime({ profile: { id: "codex" } as AgentProfile,
         logger: pino({ level: "silent" }) as any, spawnFn: () => { throw new Error("must not spawn"); } });
       runtime.attachRecovery(child, session);
@@ -111,10 +134,17 @@ async function setup(source: "inbound" | "dispatch" = "inbound", style: "full" |
     adapter: adapter as any, renderer: discordRenderer as any,
     config: { ...visualConfig, DATA_DIR: dir, REPOS_ROOT: "/synthetic", REPO_EMOJIS: new Map(),
       channelPresets: new Map(), threadPresets: new Map() } as any });
-  orch.setBridgeHub({ muxFor: () => mux, slotHealthFor: () => health } as any);
+  let connected = !options.disconnected;
+  const readyListeners = new Set<(location: string) => void>();
+  orch.setBridgeHub({ muxFor: () => connected ? mux : undefined, slotHealthFor: () => health,
+    onBridgeReady: (listener: (location: string) => void) => {
+      readyListeners.add(listener); return () => { readyListeners.delete(listener); };
+    } } as any);
   const ready = orch.loadPlugins();
   await ready;
-  const run = ready.then(() => (orch as any).adoptRemoteRecoveryOwned(store.turnAttempts.get(attempt.id))) as Promise<boolean>;
+  const run = ready.then(() => options.queue
+    ? (orch as any).adoptRemoteRecovery(store.turnAttempts.get(attempt.id))
+    : (orch as any).adoptRemoteRecoveryOwned(store.turnAttempts.get(attempt.id))) as Promise<boolean>;
   const frame = (payload: Record<string, unknown>, live = true) => {
     const entry = { slot: 6, seq: ++seq, ...payload };
     frames.push(entry);
@@ -138,8 +168,132 @@ async function setup(source: "inbound" | "dispatch" = "inbound", style: "full" |
     await drain();
   };
   return { orch, store, run, ready, adapter, visible, commands, text, update, complete, reconnect,
+    dir, snapshot, loseSlot: () => { rows = []; },
+    losePrompt: () => { promptMissing = true; },
+    unknownInventory: () => { inventoryUnknown = true; },
+    failInventory: () => { inventoryError = true; },
+    restoreInventory: () => { inventoryUnknown = false; inventoryError = false; },
+    connectBridge: () => { connected = true; for (const listener of [...readyListeners]) listener("remote"); },
+    allowAdoption: () => { adoptionUnavailable = false; },
+    replaceSubmission: () => { rows = [{ ...rows[0]!, recovery: { ...snapshot, submissionId: "other-submission" } }]; },
     runtime: () => runtime };
 }
+
+describe("#777 armed recovery queue reconciliation", () => {
+  it("keeps the existing 15-minute reconnect notice without failing unknown live work", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const h = await setup("dispatch", "full", { armed: true, queue: true, disconnected: true });
+    await h.run;
+    await drain();
+    await vi.advanceTimersByTimeAsync(15 * 60_000);
+    expect(h.visible.some(text => text.includes("Still reconnecting") && text.includes("keep trying"))).toBe(true);
+    expect(h.store.turnAttempts.get("inbound-1")).toMatchObject({ state: "suspended", outcome: null });
+    expect(h.commands.filter(command => command.type === "kill")).toEqual([]);
+    h.connectBridge();
+    await drain();
+    h.complete("reconnected after the notice");
+    await drain();
+    expect(h.store.turnAttempts.get("inbound-1")?.state).toBe("completed");
+  });
+
+  it.each(["bridge disconnected", "catalog not ready"])("keeps the queue owned while %s clears", async fault => {
+    const h = await setup("dispatch", "full", { armed: true, queue: true,
+      disconnected: fault === "bridge disconnected", adoptionUnavailable: fault === "catalog not ready" });
+    await h.run;
+    await drain();
+    let ran = false;
+    const next = (h.orch as any).queueOnChannel("thread", async () => { ran = true; });
+    await drain();
+    expect(ran).toBe(false);
+    expect(h.store.turnAttempts.get("inbound-1")).toMatchObject({ state: "suspended", stalledReason: null });
+    expect(h.commands.filter(command => command.type === "kill" || command.type === "spawn")).toEqual([]);
+    h.allowAdoption();
+    h.connectBridge();
+    await h.orch.reconcileRemoteRecoveries();
+    await drain();
+    h.losePrompt();
+    await h.orch.reconcileRemoteRecoveries();
+    await next;
+    expect(h.store.turnAttempts.get("inbound-1")).toMatchObject({ state: "completed",
+      outcome: { status: "failed", error: expect.stringContaining("never received") } });
+    expect(ran).toBe(true);
+    expect(h.commands.filter(command => command.type === "kill" || command.type === "spawn")).toEqual([]);
+  });
+
+  it("releases reconnect ownership on explicit cancellation", async () => {
+    const h = await setup("dispatch", "full", { armed: true, queue: true, disconnected: true });
+    await h.run;
+    await drain();
+    let ran = false;
+    const next = (h.orch as any).queueOnChannel("thread", async () => { ran = true; });
+    expect(h.store.turnAttempts.cancel("inbound-1", "explicit fixture cancellation")).toBe(true);
+    await next;
+    expect(ran).toBe(true);
+    expect(h.store.turnAttempts.get("inbound-1")?.state).toBe("cancelled");
+  });
+
+  it.each(["legacy inventory", "bridge reconnecting"])("retains %s without killing or releasing queued work", async fault => {
+    const h = await setup("dispatch", "full", { armed: true, queue: true });
+    await h.run;
+    await drain();
+    if (fault === "legacy inventory") h.unknownInventory();
+    else h.failInventory();
+    let ran = false;
+    const next = (h.orch as any).queueOnChannel("thread", async () => { ran = true; });
+    await h.orch.reconcileRemoteRecoveries();
+    expect(h.store.turnAttempts.get("inbound-1")).toMatchObject({ state: "suspended", outcome: null });
+    expect(ran).toBe(false);
+    expect(h.commands.filter(command => command.type === "kill" || command.type === "spawn")).toEqual([]);
+    h.restoreInventory();
+    h.complete("reconnected and finished");
+    await next;
+    expect(ran).toBe(true);
+    expect(h.store.turnAttempts.get("inbound-1")).toMatchObject({ state: "completed",
+      outcome: { status: "completed", output: "reconnected and finished" } });
+  });
+
+  it.each(["slot lost", "submission replaced", "prompt never received"] as const)(
+    "settles %s with its cause and runs queued dispatches without interrupting the slot", async fault => {
+      const h = await setup("dispatch", "full", { armed: true, queue: true });
+      await h.run;
+      await drain();
+      if (fault === "slot lost") h.loseSlot();
+      if (fault === "submission replaced") h.replaceSubmission();
+      if (fault === "prompt never received") h.losePrompt();
+      vi.spyOn(h.orch, "recoverInterruptedTurns").mockResolvedValue(undefined);
+      const executed: string[] = [];
+      vi.spyOn(h.orch, "dispatchInjectTurn").mockImplementation(spec =>
+        (h.orch as any).queueOnChannel(spec.target, async () => {
+          executed.push(spec.id);
+          return { output: spec.id, stopReason: "end_turn" };
+        }));
+      const watcher = createRuntimeDispatchWatcher({ runtime: h.orch, attempts: h.store.turnAttempts,
+        dataDir: h.dir, logger: pino({ level: "silent" }) as any, pollMs: 1_000_000 });
+      try {
+        await watcher.start();
+        for (let index = 0; index < 3; index++) await enqueueDispatchSpec(h.dir, {
+          id: `queued-${index}`, target: "thread", prompt: "next", session: "live",
+          createdUtc: new Date(Date.now() + index).toISOString(),
+        });
+        const tick = watcher.tick();
+        for (let check = 0; check < 50 && h.store.turnAttempts.get("inbound-1")?.state !== "completed"; check++) {
+          await new Promise(resolve => setTimeout(resolve, 20));
+        }
+        expect(h.store.turnAttempts.get("inbound-1")).toMatchObject({ state: "completed",
+          outcome: { status: "failed", error: expect.stringContaining(
+            fault === "prompt never received" ? "never received" : fault === "slot lost" ? "no longer exists" : "no longer owns") } });
+        await tick;
+        expect(executed).toEqual(["queued-0", "queued-1", "queued-2"]);
+        for (const id of executed) expect(existsSync(path.join(dispatchDirs(h.dir).done, `${id}.json`))).toBe(true);
+        expect(h.commands.filter(command => command.type === "kill" || command.type === "spawn")).toEqual([]);
+        expect(h.commands.filter(command => command.type === "data" && command.data?.includes("session/cancel"))).toEqual([]);
+      } finally {
+        watcher.stop();
+        h.complete("fixture cleanup");
+        await watcher.drain();
+      }
+    });
+});
 
 describe("adopted turns across a bridge reconnect", () => {
   it.each(["full", "simple"] as const)("keeps %s telemetry ticking and finalizes the original card and GIF", async style => {

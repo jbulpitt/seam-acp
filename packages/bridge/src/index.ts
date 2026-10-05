@@ -515,6 +515,10 @@ async function makeSlotManager(opts: {
           acpSessionId: payload?.acpSessionId,
           continuation: payload?.continuation,
         });
+      } else if (action === "reconcileRung1Recovery") {
+        result = await supervised.reconcileRecovery(Number(payload.slot), {
+          submissionId: payload.submissionId, acpSessionId: payload.acpSessionId,
+        });
       } else if (action === "disarmRung1Recovery") {
         const slot = Number(payload?.slot);
         result = Number.isInteger(slot)
@@ -625,7 +629,6 @@ async function makeSlotManager(opts: {
     }
 
     if (msg.type === "data" && msg.data !== undefined) {
-      if (draining) return;
       let rewriter = slotInputRewriters.get(msg.slot);
       if (!rewriter) {
         const config = slotConfigs.get(msg.slot);

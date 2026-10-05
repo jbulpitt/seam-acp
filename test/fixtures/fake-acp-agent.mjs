@@ -6,6 +6,7 @@ import fs from "node:fs";
 if (process.env.FAKE_AGENT_PIDS) fs.appendFileSync(process.env.FAKE_AGENT_PIDS, `${process.pid}\n`);
 const send = (message) => process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", ...message })}\n`);
 let buffer = "";
+let clientReply;
 let currentModeId = "agent";
 const modes = () => process.env.FAKE_AGENT_REQUIRE_MODE ? { modes: { currentModeId, availableModes: [
   { id: "agent", name: "Auto review" }, { id: "agent-full-access", name: "Full access" },
@@ -18,6 +19,9 @@ process.stdin.on("data", (chunk) => {
     buffer = buffer.slice(newline + 1);
     if (!line.trim()) continue;
     const message = JSON.parse(line);
+    if (message.id === "fixture-client-reply" && "result" in message && clientReply) {
+      clientReply(); clientReply = undefined; continue;
+    }
     const update = (text) => send({ method: "session/update", params: { sessionId: message.params.sessionId,
       update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text } } } });
     if (message.method === "initialize") {
@@ -28,7 +32,12 @@ process.stdin.on("data", (chunk) => {
     } else if (message.method === "session/load") {
       currentModeId = "agent";
       update("replayed history");
-      send({ id: message.id, result: modes() });
+      const reply = () => send({ id: message.id, result: modes() });
+      if (process.env.FAKE_AGENT_LOAD_GATE && !fs.existsSync(process.env.FAKE_AGENT_LOAD_GATE)) {
+        const timer = setInterval(() => {
+          if (fs.existsSync(process.env.FAKE_AGENT_LOAD_GATE)) { clearInterval(timer); reply(); }
+        }, 20);
+      } else reply();
     } else if (message.method === "session/set_mode") {
       currentModeId = message.params.modeId;
       send({ id: message.id, result: {} });
@@ -39,8 +48,17 @@ process.stdin.on("data", (chunk) => {
           send({ id: message.id, error: { code: -32000, message: "Codex mode lost on resume" } });
           continue;
         }
-        update("resumed ok");
-        send({ id: message.id, result: { stopReason: "end_turn" } });
+        const finish = () => {
+          update("resumed ok");
+          send({ id: message.id, result: { stopReason: "end_turn" } });
+        };
+        if (text.includes("client reply")) {
+          clientReply = finish;
+          send({ id: "fixture-client-reply", method: "session/request_permission", params: {
+            sessionId: message.params.sessionId, toolCall: { toolCallId: "fixture-call", title: "Fixture" },
+            options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }],
+          } });
+        } else finish();
       } else {
         update("working on it");
       }

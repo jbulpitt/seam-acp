@@ -53,6 +53,8 @@ export interface RemoteRecoverySnapshot {
   budget: number;
   remaining: number;
   disposition: "continue_same_session" | "none";
+  /** The retained adapter child supports exact-submission reconciliation. */
+  reconcileSupported?: true;
   errorKind?: AdapterErrorKind;
   terminalReason?:
     | "completed"
@@ -60,7 +62,8 @@ export interface RemoteRecoverySnapshot {
     | "client_request_requires_app"
     | "child_exited"
     | "result_limit_exceeded"
-    | "cancelled";
+    | "cancelled"
+    | "prompt_not_received";
   updatedUtc: string;
 }
 
@@ -73,6 +76,7 @@ export interface RemoteRecoveryResult {
   text: string;
   stopReason?: string;
   errorKind?: AdapterErrorKind;
+  error?: string;
   finishedUtc: string;
 }
 
@@ -84,6 +88,7 @@ const TERMINAL_REASONS = [
   "child_exited",
   "result_limit_exceeded",
   "cancelled",
+  "prompt_not_received",
 ] as const;
 
 function validSessionId(value: unknown): value is string {
@@ -153,6 +158,7 @@ export function isRemoteRecoverySnapshot(value: unknown): value is RemoteRecover
     && (snapshot.retry ?? 0) <= (snapshot.budget ?? -1)
     && (snapshot.remaining ?? 0) <= (snapshot.budget ?? -1)
     && (snapshot.disposition === "continue_same_session" || snapshot.disposition === "none")
+    && (snapshot.reconcileSupported === undefined || snapshot.reconcileSupported === true)
     && (snapshot.errorKind === undefined || validErrorKind(snapshot.errorKind))
     && (snapshot.terminalReason === undefined
       || (TERMINAL_REASONS as readonly string[]).includes(snapshot.terminalReason))
@@ -170,5 +176,6 @@ export function isRemoteRecoveryResult(value: unknown): value is RemoteRecoveryR
     && (result.stopReason === undefined
       || (typeof result.stopReason === "string" && result.stopReason.length <= 1_024))
     && (result.errorKind === undefined || validErrorKind(result.errorKind))
+    && (result.error === undefined || typeof result.error === "string")
     && validDate(result.finishedUtc);
 }

@@ -59,7 +59,7 @@ function setup() {
     releaseRecoveryRuntime: vi.fn(),
   };
   const adapter = { sendPanel: vi.fn(async (channel: any) => ({ channel, id: "panel" })),
-    sendMessage: vi.fn(async (channel: any, _text: string, _delivery?: unknown) => ({ channel, id: "message" })),
+    sendMessage: vi.fn(async (channel: any, _text: string, _delivery?: { nonce?: string }) => ({ channel, id: "message" })),
     sendFile: vi.fn(async () => {}),
     findMessageByNonce: vi.fn(async (): Promise<DeliveryNonceLookup> => ({ status: "absent" })),
     editPanel: vi.fn(async () => {}), editMessage: vi.fn(async () => {}) };
@@ -119,8 +119,9 @@ describe("#250 human turn production pipeline, synthetic transport only", () => 
     })).toBe(true);
     expect(attempts.suspendBoot("pre-restart-owner")).toBe(1);
 
-    const adopted = new EventEmitter() as EventEmitter & { kill: ReturnType<typeof vi.fn> };
+    const adopted = new EventEmitter() as EventEmitter & { kill: ReturnType<typeof vi.fn>; detach: ReturnType<typeof vi.fn> };
     adopted.kill = vi.fn();
+    adopted.detach = vi.fn();
     const mux = {
       sendCmd: vi.fn(async () => ({ health: [{
         slot: 6,
@@ -214,8 +215,9 @@ describe("#250 human turn production pipeline, synthetic transport only", () => 
     const resumedFirst = `${"A".repeat(2100)}\n\n`;
     const resumedLast = `${"B".repeat(2200)} done`;
     const resumedText = resumedFirst + resumedLast;
-    const adopted = new EventEmitter() as EventEmitter & { kill: ReturnType<typeof vi.fn> };
+    const adopted = new EventEmitter() as EventEmitter & { kill: ReturnType<typeof vi.fn>; detach: ReturnType<typeof vi.fn> };
     adopted.kill = vi.fn();
+    adopted.detach = vi.fn();
     const mux = {
       sendCmd: vi.fn(async () => ({ health: [{
         slot: 6,

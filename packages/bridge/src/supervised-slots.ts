@@ -295,6 +295,48 @@ export class SupervisedSlots {
     }) as Promise<{ disarmed: boolean }>;
   }
 
+  async reconcileRecovery(slot: number, input: { submissionId: unknown; acpSessionId: unknown }):
+    Promise<{ state: "owned" } | { state: "missing"; cause: string }> {
+    return this.serial(slot, async () => {
+      const health = (await this.options.client.listSlots()).health.find(row => row.slot === slot);
+      if (!health || !health.alive || !health.attached) {
+        return { state: "missing", cause: `bridge slot ${slot} has no attached live process` };
+      }
+      const snapshot = this.recoveries.get(slot);
+      if (!snapshot?.reconcileSupported) {
+        // Retained pre-rollout children already acknowledge an arm with no input.
+        // A host-restart record keeps this away from their initialize/load path.
+        if (snapshot?.phase !== "armed" || snapshot.submissionId !== input.submissionId
+          || snapshot.acpSessionId !== input.acpSessionId || health.resumePending !== false) return { state: "owned" };
+        const requestId = randomUUID();
+        const response = this.waitForControl(requestId);
+        try {
+          await this.writeControl(slot, { v: ADAPTER_CHILD_PROTOCOL_VERSION, type: "report_recovery" });
+          await this.writeControl(slot, { v: ADAPTER_CHILD_PROTOCOL_VERSION,
+            type: "disarm_recovery", requestId, submissionId: input.submissionId });
+        } catch (error) { this.cancelControl(requestId); throw error; }
+        const disarmed = (await response as { disarmed: boolean }).disarmed;
+        const fresh = this.recoveries.get(slot);
+        const owner = (await this.options.client.listSlots()).health.find(row => row.slot === slot);
+        if (!disarmed && !(fresh?.phase === "armed" && fresh.submissionId === input.submissionId
+          && fresh.acpSessionId === input.acpSessionId && owner?.pid === health.pid
+          && owner.alive && owner.attached && owner.resumePending === false)) return { state: "owned" };
+        this.recoveries.delete(slot);
+        return { state: "missing", cause: `bridge slot ${slot} armed recovery but never received a complete session/prompt for this submission` };
+      }
+      const requestId = randomUUID();
+      const response = this.waitForControl(requestId);
+      try {
+        await this.writeControl(slot, { v: ADAPTER_CHILD_PROTOCOL_VERSION,
+          type: "reconcile_recovery", requestId, ...input });
+      } catch (error) {
+        this.cancelControl(requestId);
+        throw error;
+      }
+      return await response as { state: "owned" } | { state: "missing"; cause: string };
+    });
+  }
+
   async permissionControl(slot: number, type: "permission_status" | "answer_permission",
     permission: PermissionIdentity, answer?: RequestPermissionResponse): Promise<PermissionSnapshot> {
     return this.serial(slot, async () => {

@@ -53,6 +53,7 @@ export const BOOT_RECOVERY_BACKOFF_MS = [30_000, 30_000] as const;
 export const DONE_ORIGIN_PROMPT_MAX = 4000;
 
 export interface DispatchWatcherOpts {
+  reconcileRecovery?: () => Promise<void>;
   /** `config.DATA_DIR` — the queue lives at `<dataDir>/dispatch/`. */
   dataDir: string;
   logger: Logger;
@@ -138,6 +139,7 @@ export function createRuntimeDispatchWatcher(
       dispatchInjectTurn(spec: DispatchSpec): Promise<{ output: string; stopReason: string }>;
       observeRetainedDispatch(spec: DispatchSpec, err?: DispatchSuspendedError): Promise<void>;
       recoverInterruptedTurns(): Promise<void>;
+      reconcileRemoteRecoveries?(): Promise<void>;
     };
   }
 ): DispatchWatcher {
@@ -149,6 +151,7 @@ export function createRuntimeDispatchWatcher(
     // #307: protects the production recovery barrier; deleting this wire lets
     // the runtime watcher admit pending work before interrupted turns requeue.
     beforeAdmission: () => runtime.recoverInterruptedTurns(),
+    reconcileRecovery: () => runtime.reconcileRemoteRecoveries?.() ?? Promise.resolve(),
   });
 }
 
@@ -236,11 +239,13 @@ export class DispatchWatcher {
    * dependencies that are being torn down. Draining must await these too.
    */
   private readonly activeTicks = new Set<Promise<void>>();
+  private readonly reconcileRecovery?: DispatchWatcherOpts["reconcileRecovery"];
 
   constructor(opts: DispatchWatcherOpts) {
     this.dirs = dispatchDirs(opts.dataDir);
     this.logger = opts.logger.child({ comp: "dispatch-watcher" });
     this.onDispatch = opts.onDispatch;
+    this.reconcileRecovery = opts.reconcileRecovery;
     this.onRetained = opts.onRetained;
     this.pollMs = opts.pollMs ?? 1000;
     this.mayRecover = opts.mayRecover ?? (() => true);
@@ -471,6 +476,9 @@ export class DispatchWatcher {
     // row that never reached session/prompt (#559). Boot recovery alone
     // never sees it.
     this.settleSupersededUnstarted();
+    // Observe bridge ownership independently of work waiting in its queue.
+    const reconciliation = this.reconcileRecovery?.().catch(err =>
+      this.logger.warn({ err }, "bridge recovery reconciliation deferred"));
     const ids = [...new Set([...names
       .filter((name) => name.endsWith(".json"))
       .map((name) => name.slice(0, -".json".length)),
@@ -514,7 +522,7 @@ export class DispatchWatcher {
           if (this.inFlight.get(id) === owner) this.inFlight.delete(id);
         })
     );
-    await Promise.all(jobs);
+    await Promise.all([...jobs, reconciliation]);
   }
 
   // --- internals ------------------------------------------------------------

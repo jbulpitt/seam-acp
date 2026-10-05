@@ -63,6 +63,13 @@ export type AdapterChildInput =
       submissionId: unknown;
     }
   | {
+      v: typeof ADAPTER_CHILD_PROTOCOL_VERSION;
+      type: "reconcile_recovery";
+      requestId: string;
+      submissionId: unknown;
+      acpSessionId: unknown;
+    }
+  | {
       /** Re-publish the current recovery state; a restarted bridge asks. */
       v: typeof ADAPTER_CHILD_PROTOCOL_VERSION;
       type: "report_recovery";

@@ -21,7 +21,7 @@ export function namingRegistry() {
     describeConfig: () => ({ agent: { value: "codex" }, model: { value: "gpt-6.1-sol" }, role: { value: "worker" }, disableThreadPrefix: { value: false } }),
     listSessionsByParent: () => [], getThreadName: async () => null, getThreadLiveState: async () => undefined,
     renameThread: async () => {}, logger,
-  }, internal: { setNamePrefix: () => {}, get: () => undefined, all: () => [], rules: { get: () => DEFAULT_THREAD_NAMER_CONFIG, save: () => {} } } });
+  }, internal: { setNamePrefix: () => {}, get: () => undefined, all: () => [], rules: { get: () => DEFAULT_THREAD_NAMER_CONFIG, save: next => next } } });
   const host = new PluginHost(logger);
   host.slash.register(plugin.id, plugin.contributions.slash!, { logger, config: undefined });
   return host.slash;
@@ -31,7 +31,7 @@ export function namingCommands() { return buildSlashRegistrationBody(namingRegis
 export async function namingFixture(options: { admins?: Set<string>; locked?: boolean; participant?: string; directory?: string; store?: SessionStore } = {}) {
   const directory = options.directory ?? fs.mkdtempSync(path.join(os.tmpdir(), "seam-naming-"));
   const store = options.store ?? new SessionStore(path.join(directory, "seam.db"));
-  const profiles = ["codex", "claude"].map(id => ({ id, displayName: id, defaultModel: id === "codex" ? "gpt-6.1-sol" : "claude-sonnet-5.5", spawn: () => { throw new Error("unit test never starts an agent"); } })) as AgentProfile[];
+  const profiles = ["codex", "claude"].map(id => ({ id, displayName: id, defaultModel: id === "codex" ? "gpt-6.1-sol" : "claude-sonnet-5.5", spawn: () => { throw new Error("unit test never starts an agent"); } } satisfies Partial<AgentProfile>)) as unknown as AgentProfile[];
   const modelCatalog = fixtureModelCatalog(profiles);
   const presetsFile = path.join(directory, "channel-presets.json");
   fs.writeFileSync(presetsFile, JSON.stringify({ channels: { [NAMING_PARENT]: { role: "worker", locked: options.locked ?? false } } }));

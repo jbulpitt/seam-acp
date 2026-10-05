@@ -22,6 +22,7 @@ function fixture({ locked = false, participant = false, user = PARTICIPANT, iden
   orch.logger = pino({ level: "silent" });
   orch.plugins = new PluginHost(orch.logger);
   orch.identityEffects = { ready: Promise.resolve(), flush: async () => {} };
+  orch.scheduleUi = { ready: Promise.resolve() };
   function interaction(commandName: string, group: string | null, sub: string, values: Record<string, string> = {}) {
     return {
       commandName,

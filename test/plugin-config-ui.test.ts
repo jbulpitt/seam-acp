@@ -123,9 +123,9 @@ describe("config UI built-in", () => {
     const customId = h.panels.at(-1).actions.flat().find((action: any) => action.customId?.endsWith(":save")).customId;
     const id = parseCustomId(customId)!.draftId;
     const draft = (h.orchestrator as any).configUi.ui.configEditor.get(id);
-    const restarted = await fixture({ store: h.store, directory: h.directory });
     const clock = vi.spyOn(Date, "now").mockReturnValue(draft.updatedAt + DRAFT_IDLE_TTL_MS + 1);
     try {
+      const restarted = await fixture({ store: h.store, directory: h.directory });
       const click = component(customId); await restarted.component(click);
       expect(click.deferUpdate).toHaveBeenCalledTimes(1);
       expect(restarted.panels.at(-1)).toMatchObject({ footer: "draft expired", actions: [] });

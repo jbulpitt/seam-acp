@@ -39,16 +39,6 @@ import type { Renderer } from "../renderer.js";
 import { serializePanelText } from "../renderer.js";
 import { choicePickerPageCaption } from "./choice-picker.js";
 import { getSlashCommandAccess, type SlashCommandAccess } from "./commands.js";
-import {
-  paginateSchedules,
-  parseScheduleListCustomId,
-  requestedSchedulePage,
-  scheduleListDescription,
-  scheduleNavState,
-  schedulePageCaption,
-  schedulePageCustomId,
-  scheduleRunOutcome,
-} from "./schedule-list-view.js";
 import { paginatePresetList, PRESET_LIST_PAGE_SIZE } from "./preset-list.js";
 import type {
   ChatAdapter,
@@ -144,7 +134,7 @@ import {
   WATCH_DEFAULT_MAX_FIRES,
   WATCH_MAX_FIRES_CEILING,
 } from "../../core/watch/types.js";
-import { describeCron, validateCron, nextRun as cronNextRun } from "../../core/scheduled-prompts/cron.js";
+import { describeCron } from "../../core/scheduled-prompts/cron.js";
 import { legacyAttachmentQuarantine } from "../../core/scheduled-prompts/quarantine.js";
 import {
   formatWorkflowsView,
@@ -339,26 +329,6 @@ const WATCH_COLOR = 0x22c55e;
 const PARKED_COLOR = 0x3498db;
 
 const SCHEDULE_DEFAULT_TZ = "America/Chicago";
-const SCHEDULE_TIMEZONES = [
-  "America/Chicago",
-  "America/New_York",
-  "America/Denver",
-  "America/Los_Angeles",
-  "UTC",
-  "Europe/London",
-  "Europe/Berlin",
-  "Asia/Tokyo",
-];
-/** Common-cadence presets for the builder card; value is a full cron or the
- *  sentinel for the custom-cron modal. */
-const SCHEDULE_PRESETS: Array<{ label: string; value: string }> = [
-  { label: "Every day at 9:00 AM", value: "0 9 * * *" },
-  { label: "Weekdays at 9:00 AM", value: "0 9 * * 1-5" },
-  { label: "Every Monday at 9:00 AM", value: "0 9 * * 1" },
-  { label: "Every hour", value: "0 * * * *" },
-  { label: "Every 15 minutes", value: "*/15 * * * *" },
-  { label: "Custom cron…", value: "__custom__" },
-];
 const VOICE_CONSOLE_EDITOR_ACTIONS: ReadonlySet<string> = new Set([
   "edit-alias", "edit-voice", "edit-pace", "edit-style", "edit-save", "edit-cancel",
   "voice-prev", "voice-next", "voice-preview", "voice-use", "voice-back",
@@ -392,6 +362,8 @@ import {
   fastModeEnvRefusal,
   isFastModeDisabledByEnv,
 } from "../../core/fast-mode.js";
+import { installScheduleUi } from "../../core/schedule-ui.js";
+import { scheduleUiInteraction } from "./schedule-ui-transport.js";
 import { installCardVisuals } from "../../core/card-visuals.js";
 import {
   deleteSimpleCardGifMessage,
@@ -1045,6 +1017,7 @@ export class Orchestrator {
   ) => Promise<ExecuteSelfMigrationOutcome>;
   /** The visual plugin loads independently of MCP. */
   private readonly cardVisualsReady: Promise<void>;
+  private readonly scheduleUi: ReturnType<typeof installScheduleUi>;
   /** Status-card poke after park/cancel so `📥 N waiting` updates immediately. */
   private onParkedChange?: () => void;
   /**
@@ -1230,6 +1203,15 @@ export class Orchestrator {
     });
 
     this.cardVisualsReady = installCardVisuals({ plugins: this.plugins, config: this.config, store: this.store, router: this.router, mutation: this.configMutation });
+    this.scheduleUi = installScheduleUi({
+      plugins: this.plugins, config: this.config, logger: this.logger, store: this.store, router: this.router, modelCatalog: this.modelCatalog,
+      manager: () => this.scheduledManager, runNow: id => this.runScheduledPrompt(id),
+      interaction: i => scheduleUiInteraction(i, {
+        channel: interaction => this.channelRefFromInteraction(interaction) ?? undefined,
+        mutationRefusal: interaction => this.slashAccessRefusal(interaction, { kind: "mutating" }),
+        lifecycle: (interaction, collector, expired) => this.attachListLifecycle(interaction, collector, expired),
+      }),
+    });
 
     this.actionCards = new ActionCardManager({
       store: this.store.actionCards, adapter: this.adapter, logger: this.logger,
@@ -1293,7 +1275,7 @@ export class Orchestrator {
   /** Wait for the effects of committed identity changes. */
   async flushIdentityEffects(sessionId?: string): Promise<void> { await this.identityEffects.flush(sessionId); }
 
-  async loadPlugins(): Promise<void> { await Promise.all([this.identityEffects.ready, this.cardVisualsReady]); }
+  async loadPlugins(): Promise<void> { await Promise.all([this.identityEffects.ready, this.cardVisualsReady, this.scheduleUi.ready]); }
 
   /**
    * Bounded slash autocomplete responders (#slash-autocomplete). Registered
@@ -1583,22 +1565,6 @@ export class Orchestrator {
       }
     });
 
-    const scheduleIdResponder: AutocompleteResponder = (ctx) => {
-      try {
-        if (!ctx.channelId) return [];
-        const rows = this.store.listScheduledByChannel(PLATFORM, ctx.channelId);
-        return tokenAutocompleteChoices(
-          rows.map((r) => ({ id: r.id, label: r.name })),
-          ctx.focusedValue
-        );
-      } catch {
-        return [];
-      }
-    };
-    for (const sub of ["remove", "toggle", "edit"] as const) {
-      this.autocomplete.register("schedule", sub, "id", "opaque", scheduleIdResponder);
-    }
-
     this.autocomplete.register(null, "workflows", "cancel-wake", "opaque", (ctx) => {
       try {
         if (!ctx.channelId) return [];
@@ -1744,6 +1710,7 @@ export class Orchestrator {
   private async handleAutocompleteInteractionInner(
     interaction: AutocompleteInteraction
   ): Promise<void> {
+    await this.loadPlugins();
     await safeAutocompleteRespond(
       (choices) => interaction.respond(choices),
       async () => {
@@ -5362,6 +5329,7 @@ export class Orchestrator {
         edit: async text => { await interaction.editReply({ content: text }); },
         view: async view => { await interaction.reply({ ...view, flags: MessageFlags.Ephemeral } as Parameters<typeof interaction.reply>[0]); },
       };
+      if (slashGroup === "schedule") this.scheduleUi.bind(invocation, interaction);
       if (await this.plugins.slash.dispatch(interaction.commandName ?? "seam", slashGroup, sub, Object.freeze(invocation))) return;
     }
     if (interaction.options.getSubcommandGroup(false) === "upload") {
@@ -5396,9 +5364,6 @@ export class Orchestrator {
         return;
       }
       return this.cmdThreadVoice(interaction);
-    }
-    if (interaction.options.getSubcommandGroup(false) === "schedule") {
-      return this.cmdSchedule(interaction);
     }
     if (slashGroup === "catalog") {
       return this.cmdCatalogRefresh(interaction);
@@ -13920,621 +13885,12 @@ export class Orchestrator {
     });
   }
 
-  // --- /seamadmin schedule … ------------------------------------------------
-
-  private async cmdSchedule(i: ChatInputCommandInteraction): Promise<void> {
-    const sub = i.options.getSubcommand(true);
-    switch (sub) {
-      case "add": return this.cmdScheduleAdd(i);
-      case "edit": return this.cmdScheduleEdit(i);
-      case "list": return this.cmdScheduleList(i);
-      case "remove": return this.cmdScheduleRemove(i);
-      case "toggle": return this.cmdScheduleToggle(i);
-      default:
-        await i.reply({ content: `Unknown schedule subcommand: ${sub}`, flags: MessageFlags.Ephemeral });
-    }
-  }
-
   /** Download a Discord attachment's bytes (the CDN URL is valid now and
    *  expires in ~24h, so anything we keep has to be fetched immediately). */
   private async downloadAttachmentBytes(url: string): Promise<Buffer> {
     const res = await fetch(url);
     if (!res.ok) throw new Error(`download failed (${res.status})`);
     return Buffer.from(await res.arrayBuffer());
-  }
-
-  private scheduleSummaryLine(s: ScheduledPrompt): string {
-    const state = s.enabled ? "🟢" : "⏸️";
-    const last = s.lastStatus ? ` · last: ${s.lastStatus}` : "";
-    const next = s.enabled && s.nextRunUtc ? ` · next: <t:${Math.floor(Date.parse(s.nextRunUtc) / 1000)}:R>` : "";
-    // #158: a row that still carries legacy attachments is quarantined — it is
-    // never armed, so say so where the operator is already looking.
-    const quarantined = legacyAttachmentQuarantine(s) ? " · ⚠️ legacy files — edit to re-arm" : "";
-    // Model is only meaningful for isolated schedules (live uses the thread's).
-    const model = s.sessionMode !== "live" && s.model ? ` · 🤖${s.model}` : "";
-    const mode = s.sessionMode === "live" ? " · 🧠live" : "";
-    return `${state} **${s.name}** \`${s.id}\`\n   ${describeCron(s.cron)} (${s.timezone})${mode}${model}${quarantined}${next}${last}`;
-  }
-
-  private async cmdScheduleList(i: ChatInputCommandInteraction): Promise<void> {
-    const channel = this.channelRefFromInteraction(i);
-    if (!channel) {
-      await i.reply({ content: "Use this inside a thread.", flags: MessageFlags.Ephemeral });
-      return;
-    }
-    const rows = this.store.listScheduledByChannel(PLATFORM, channel.id);
-    if (rows.length === 0) {
-      await i.reply({ content: "No scheduled prompts for this thread. Create one with `/seamadmin schedule add`.", flags: MessageFlags.Ephemeral });
-      return;
-    }
-    // #152: the page the card is currently showing. Every rebuild threads it
-    // back through `buildScheduleListMessage`, which re-clamps it against the
-    // live row count and returns where it actually landed — so a delete that
-    // empties the last page walks the operator back rather than stranding them.
-    let page = 0;
-    const rebuild = (requested: number = page) => {
-      const built = this.buildScheduleListMessage(channel, requested);
-      page = built.page;
-      return { embeds: built.embeds, components: built.components };
-    };
-    await i.reply({ ...rebuild(), flags: MessageFlags.Ephemeral });
-    const msg = await i.fetchReply();
-    const collector = msg.createMessageComponentCollector({
-      filter: (c) => c.user.id === i.user.id,
-      time: 600_000,
-    });
-    // #159: the listing had no end handler, so an expired collector left every
-    // Run/Edit/Toggle/Delete button looking live. Expiry now strips them.
-    const lifecycle = this.attachListLifecycle(i, collector, () =>
-      expiredCardView("⏰ Schedule list expired — run `/seamadmin schedule list` again.")
-    );
-    collector.on("collect", async (c) => {
-      try {
-        if (!c.isButton()) return;
-        // #152: a page click rides the same `sl:<action>:<arg>` grammar, so it
-        // MUST be answered before `arg` is looked up as a schedule id —
-        // otherwise "sl:page:1" falls into the unknown-schedule branch and the
-        // operator is told their schedule no longer exists. Paging is
-        // read-only, so the card stays repeatable.
-        const wantedPage = requestedSchedulePage(c.customId);
-        if (wantedPage !== null) {
-          await c.deferUpdate();
-          await lifecycle.refresh(rebuild(wantedPage));
-          return;
-        }
-        const parsed = parseScheduleListCustomId(c.customId);
-        const action = parsed?.action;
-        const refusal = this.slashAccessRefusal(c, { kind: "mutating" });
-        if (refusal) {
-          await c.reply({ content: refusal, flags: MessageFlags.Ephemeral });
-          return;
-        }
-        const id = parsed?.arg;
-        const row = id ? this.store.getScheduled(id) : undefined;
-        if (!row || !id || row.channelRef !== channel.id) {
-          await c.reply({ content: "That schedule no longer exists.", flags: MessageFlags.Ephemeral });
-          // Repeatable: rebuild from the store so the vanished row's controls go.
-          await lifecycle.refresh(rebuild());
-          return;
-        }
-        if (action === "run") {
-          await c.deferReply({ flags: MessageFlags.Ephemeral });
-          if (this.scheduledManager) await this.scheduledManager.runNow(id);
-          else await this.runScheduledPrompt(id);
-          const fresh = this.store.getScheduled(id);
-          // #163 follow-up: a quarantined schedule is refused at the fire
-          // boundary and never runs, so "finished" would be a plain lie.
-          await c.editReply(
-            scheduleRunOutcome({
-              name: row.name,
-              status: fresh?.lastStatus,
-              quarantined: !!legacyAttachmentQuarantine(fresh ?? row),
-            })
-          );
-          // Run is repeatable; rebuild so the card shows the new last-status.
-          await lifecycle.refresh(rebuild());
-        } else if (action === "edit") {
-          // Freeze the listing BEFORE the builder opens, or the user is left
-          // holding two live-looking cards for one schedule. The collector is
-          // closed synchronously inside the settle — so a concurrent second
-          // click is never collected — and the button's ack is ordered ahead
-          // of the freeze repaint, which targets the original slash token.
-          await lifecycle.transitionWithAck(
-            "edit",
-            {
-              content: `✏️ Editing **${row.name}** — this listing was replaced by the editor below.`,
-              embeds: [],
-              components: [],
-            },
-            async () => {
-              await c.deferReply({ flags: MessageFlags.Ephemeral });
-            }
-          );
-          await this.openEditorAfterFreeze(
-            c,
-            () => this.cmdScheduleAdd(c, row),
-            "schedule",
-            "/seamadmin schedule edit"
-          );
-        } else if (action === "toggle") {
-          const updated: ScheduledPrompt = { ...row, enabled: !row.enabled, updatedUtc: new Date().toISOString() };
-          this.store.upsertScheduled(updated);
-          if (updated.enabled) this.scheduledManager?.armFromRow(updated);
-          else this.scheduledManager?.disarm(id);
-          // Ack the click, then rebuild through the lifecycle so a settled card
-          // can never regain controls. Both stay on the current page; a toggle
-          // does not change the row count, so the clamp is a no-op here.
-          await c.deferUpdate();
-          await lifecycle.refresh(rebuild());
-        } else if (action === "del") {
-          this.scheduledManager?.disarm(id);
-          this.store.deleteScheduled(id);
-          // Re-clamp: deleting the last row on the last page shrinks pageCount,
-          // so `rebuild()` resolves the now-out-of-range page down to the new
-          // last one instead of painting an empty page with a live Prev.
-          await c.deferUpdate();
-          await lifecycle.refresh(rebuild());
-        }
-      } catch (err) {
-        this.logger.warn({ err }, "schedule-list button handler failed");
-      }
-    });
-  }
-
-  /**
-   * `/seamadmin schedule list` message: one PAGE of schedules (#152).
-   *
-   * Before pagination this described every schedule but gave controls to only
-   * the first five — so a long list both risked Discord's 4096-char embed cap
-   * and advertised rows the operator could not act on. Now the description
-   * carries only the current page and every described row on it has its own
-   * action row: four rows plus one nav row is exactly Discord's five-row cap.
-   *
-   * `page` is a REQUEST, not a fact. It is clamped against the live row count,
-   * and the resolved page is returned so the caller can thread it back through
-   * the next refresh — which is what re-clamps the view after a delete empties
-   * the last page.
-   */
-  private buildScheduleListMessage(
-    channel: ChannelRef,
-    page = 0
-  ): {
-    embeds: EmbedBuilder[];
-    components: ActionRowBuilder<ButtonBuilder>[];
-    page: number;
-  } {
-    const rows = this.store.listScheduledByChannel(PLATFORM, channel.id);
-    const slice = paginateSchedules(rows, page);
-    const embed = new EmbedBuilder()
-      .setTitle("⏰ Scheduled prompts")
-      .setColor(SCHEDULED_COLOR)
-      .setDescription(
-        scheduleListDescription(
-          slice.items.map((r) => this.scheduleSummaryLine(r)),
-          schedulePageCaption(slice)
-        )
-      );
-    const components: ActionRowBuilder<ButtonBuilder>[] = [];
-    for (const r of slice.items) {
-      components.push(
-        new ActionRowBuilder<ButtonBuilder>().addComponents(
-          new ButtonBuilder().setCustomId(`sl:run:${r.id}`).setLabel("▶️ Run now").setStyle(ButtonStyle.Success),
-          new ButtonBuilder().setCustomId(`sl:edit:${r.id}`).setLabel(`✏️ ${r.name}`.slice(0, 80)).setStyle(ButtonStyle.Primary),
-          new ButtonBuilder().setCustomId(`sl:toggle:${r.id}`).setLabel(r.enabled ? "⏸️ Disable" : "🟢 Enable").setStyle(ButtonStyle.Secondary),
-          new ButtonBuilder().setCustomId(`sl:del:${r.id}`).setLabel("🗑️ Delete").setStyle(ButtonStyle.Danger),
-        )
-      );
-    }
-    const nav = scheduleNavState(slice.page, slice.pageCount);
-    if (nav.show) {
-      components.push(
-        new ActionRowBuilder<ButtonBuilder>().addComponents(
-          new ButtonBuilder()
-            .setCustomId(schedulePageCustomId(nav.prevPage))
-            .setLabel("◀ Prev")
-            .setStyle(ButtonStyle.Secondary)
-            .setDisabled(nav.prevDisabled),
-          new ButtonBuilder()
-            .setCustomId(schedulePageCustomId(slice.page))
-            .setLabel(nav.label)
-            .setStyle(ButtonStyle.Secondary)
-            .setDisabled(true),
-          new ButtonBuilder()
-            .setCustomId(schedulePageCustomId(nav.nextPage))
-            .setLabel("Next ▶")
-            .setStyle(ButtonStyle.Secondary)
-            .setDisabled(nav.nextDisabled),
-        )
-      );
-    }
-    return { embeds: [embed], components, page: slice.page };
-  }
-
-  private async cmdScheduleRemove(i: ChatInputCommandInteraction): Promise<void> {
-    const id = await this.normalizeAutocompleteSubmission(
-      i,
-      "schedule",
-      "remove",
-      "id",
-      i.options.getString("id", true)
-    );
-    const row = this.store.getScheduled(id);
-    const channel = this.channelRefFromInteraction(i);
-    if (!row || !channel || row.channelRef !== channel.id) {
-      await i.reply({ content: `No schedule \`${id}\` in this thread.`, flags: MessageFlags.Ephemeral });
-      return;
-    }
-    this.scheduledManager?.disarm(id);
-    this.store.deleteScheduled(id);
-    await i.reply({ content: `🗑️ Deleted scheduled prompt **${row.name}** (\`${id}\`).`, flags: MessageFlags.Ephemeral });
-  }
-
-  private async cmdScheduleToggle(i: ChatInputCommandInteraction): Promise<void> {
-    const id = await this.normalizeAutocompleteSubmission(
-      i,
-      "schedule",
-      "toggle",
-      "id",
-      i.options.getString("id", true)
-    );
-    const row = this.store.getScheduled(id);
-    const channel = this.channelRefFromInteraction(i);
-    if (!row || !channel || row.channelRef !== channel.id) {
-      await i.reply({ content: `No schedule \`${id}\` in this thread.`, flags: MessageFlags.Ephemeral });
-      return;
-    }
-    const updated: ScheduledPrompt = { ...row, enabled: !row.enabled, updatedUtc: new Date().toISOString() };
-    this.store.upsertScheduled(updated);
-    if (updated.enabled) this.scheduledManager?.armFromRow(updated);
-    else this.scheduledManager?.disarm(id);
-    await i.reply({
-      content: `${updated.enabled ? "🟢 Enabled" : "⏸️ Disabled"} **${row.name}** (\`${id}\`).`,
-      flags: MessageFlags.Ephemeral,
-    });
-  }
-
-  private async cmdScheduleEdit(i: ChatInputCommandInteraction): Promise<void> {
-    const id = await this.normalizeAutocompleteSubmission(
-      i,
-      "schedule",
-      "edit",
-      "id",
-      i.options.getString("id", true)
-    );
-    const row = this.store.getScheduled(id);
-    const channel = this.channelRefFromInteraction(i);
-    if (!row || !channel || row.channelRef !== channel.id) {
-      await i.reply({ content: `No schedule \`${id}\` in this thread.`, flags: MessageFlags.Ephemeral });
-      return;
-    }
-    return this.cmdScheduleAdd(i, row);
-  }
-
-  /** Shared builder card for create (existing undefined) and edit (existing set).
-   *  The card edits prompt/schedule/model/cwd/output. Schedules carry no files
-   *  (#158) — saving an edit also clears any legacy attachment manifest, which
-   *  is what lifts the quarantine on a pre-removal row. */
-  private async cmdScheduleAdd(i: ChatInputCommandInteraction | MessageComponentInteraction, existing?: ScheduledPrompt): Promise<void> {
-    const channel = this.channelRefFromInteraction(i);
-    if (!channel) {
-      await this.respondInitial(i, { content: "Use `/seamadmin schedule add` inside a thread." });
-      return;
-    }
-    // Bind the thread to a session record if it isn't already (so the job has a
-    // repo/agent to run under). Inherited agent/model/effort/cwd come from the
-    // live effective-config snapshot, not the durable session columns — those
-    // can lag a thread-preset overlay (#208).
-    const record = this.router.ensureSessionRecord({
-      platform: PLATFORM,
-      channelRef: channel.id,
-      ...(channel.parentId ? { parentRef: channel.parentId } : {}),
-      cwd: this.config.REPOS_ROOT,
-    });
-    const described = this.router.describeConfig(record);
-    const inheritedAgent = described.agent.value;
-    const profile = this.router.getProfile(inheritedAgent);
-    const sessionModel = described.model.value;
-    const inheritedCwd = described.cwd.value;
-    const models = this.modelCatalog.models({
-      agentId: inheritedAgent,
-      location: described.location.value,
-    }, { current: sessionModel }).map((model) => ({ modelId: model.id, name: model.displayName })).slice(0, 24);
-
-    const state = {
-      name: existing?.name ?? "",
-      promptText: existing?.promptText ?? "",
-      cron: (existing?.cron ?? null) as string | null,
-      timezone: existing?.timezone ?? SCHEDULE_DEFAULT_TZ,
-      model: existing?.model ?? null, // null = inherit effective thread model at fire time
-      cwd: existing?.cwd ?? null, // null = inherit effective thread cwd at fire time
-      target: existing?.targetChannel ?? null, // null = this thread
-      outputType: (existing?.outputType ?? "card") as "card" | "messages",
-      // "isolated" = throwaway clean session (default); "live" = a real turn in
-      // this thread, sharing its session context (M4/D1). In live mode
-      // model/cwd/target/output are meaningless and hidden below.
-      sessionMode: (existing?.sessionMode ?? "isolated") as "isolated" | "live",
-    };
-    // #158: a pre-removal row still recorded reference files. Saving this card
-    // is the deliberate revision that clears them and re-arms the schedule; the
-    // stored bytes on disk are left alone.
-    const quarantine = existing ? legacyAttachmentQuarantine(existing) : null;
-
-    const render = () => {
-      const cronLine = state.cron
-        ? `${describeCron(state.cron)} \`${state.cron}\``
-        : "*(not set)*";
-      const next = state.cron ? cronNextRun(state.cron, state.timezone) : null;
-      const isLive = state.sessionMode === "live";
-      const embed = new EmbedBuilder()
-        .setTitle(existing ? `✏️ Edit scheduled prompt \`${existing.id}\`` : "⏰ New scheduled prompt")
-        .setColor(SCHEDULED_COLOR)
-        .setDescription(
-          (isLive
-            ? "This runs **in this thread**, as a real turn on this conversation's session. " +
-              "It streams like a normal message, shares and remembers this thread's context, and " +
-              "waits its turn if the thread is busy."
-            : "This runs **on its own, on a clean session** — it won't remember this conversation. " +
-              "Write the prompt so it stands alone.") +
-            " Schedules don't carry files: for anything substantial, commit a runbook to the repo and " +
-            "have the prompt ask the agent to read it." +
-            (profile
-              ? ""
-              : `\n\n⚠️ Effective agent \`${inheritedAgent}\` is not registered on this bot — isolated fires will fail closed.`) +
-            (quarantine ? `\n\n⚠️ ${quarantine}` : "")
-        )
-        .addFields(
-          { name: "🏷️ Name", value: state.name || "*(not set)*" },
-          { name: "✏️ Prompt", value: state.promptText ? "```\n" + state.promptText.slice(0, 1000) + "\n```" : "*(not set — click ✏️ Prompt & name)*" },
-          { name: "🕐 Runs", value: cronLine + (next ? `\nNext: <t:${Math.floor(next.getTime() / 1000)}:F>` : ""), inline: true },
-          { name: "🌍 Timezone", value: state.timezone, inline: true },
-          { name: "🧠 Session", value: isLive ? "live (in this thread)" : "isolated (clean session)", inline: true },
-          // model/cwd/target/output are meaningless in live mode (D1) — hide them.
-          // Isolated inherits the thread's *effective* agent/model/cwd (describeConfig),
-          // not the durable session row. There is no schedule-level agent override.
-          ...(isLive ? [] : [
-            { name: "Agent", value: `\`${inheritedAgent}\``, inline: true },
-            { name: "🤖 Model", value: state.model ? `\`${state.model}\`` : `Thread default (\`${sessionModel}\`)`, inline: true },
-            { name: "📂 Working dir", value: state.cwd ? `\`${state.cwd}\`` : `\`${inheritedCwd}\``, inline: true },
-            { name: "📮 Output to", value: state.target ? `<#${state.target}>` : "*(this thread)*", inline: true },
-            { name: "🖼️ Output as", value: state.outputType === "messages" ? "plain messages" : "status cards", inline: true },
-          ])
-        );
-      const cadence = new StringSelectMenuBuilder()
-        .setCustomId("sched:cadence")
-        .setPlaceholder("🕐 How often?")
-        .addOptions(SCHEDULE_PRESETS.map((p) => ({ label: p.label, value: p.value })));
-      const tz = new StringSelectMenuBuilder()
-        .setCustomId("sched:tz")
-        .setPlaceholder("🌍 Timezone")
-        .addOptions(SCHEDULE_TIMEZONES.map((z) => ({ label: z, value: z, default: z === state.timezone })));
-      // Buttons row (max 5). The mode toggle takes the one previously-free slot;
-      // in live mode the now-meaningless output toggle is dropped so we stay ≤5.
-      const buttons = new ActionRowBuilder<ButtonBuilder>().addComponents(
-        new ButtonBuilder().setCustomId("sched:prompt").setLabel("✏️ Prompt & details").setStyle(ButtonStyle.Primary),
-        ...(isLive ? [] : [
-          new ButtonBuilder().setCustomId("sched:output").setLabel(state.outputType === "messages" ? "🖼️ Output: messages" : "🖼️ Output: cards").setStyle(ButtonStyle.Secondary),
-        ]),
-        new ButtonBuilder().setCustomId("sched:mode").setLabel(isLive ? "🧠 Session: live" : "🧵 Session: isolated").setStyle(ButtonStyle.Secondary),
-        new ButtonBuilder().setCustomId("sched:create").setLabel(existing ? "💾 Save" : "✅ Create").setStyle(ButtonStyle.Success).setDisabled(!state.cron || !state.promptText || !state.name),
-        new ButtonBuilder().setCustomId("sched:cancel").setLabel("Cancel").setStyle(ButtonStyle.Secondary)
-      );
-      const rows: ActionRowBuilder<StringSelectMenuBuilder | ButtonBuilder>[] = [
-        new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(cadence),
-        new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(tz),
-      ];
-      if (models.length > 0 && !isLive) {
-        const modelSelect = new StringSelectMenuBuilder()
-          .setCustomId("sched:model")
-          .setPlaceholder("🤖 Model")
-          .addOptions(
-            { label: `Thread default (${sessionModel})`.slice(0, 100), value: "__default__", default: state.model === null },
-            ...models.map((m) => ({ label: m.name.slice(0, 100), value: m.modelId, default: m.modelId === state.model }))
-          );
-        rows.push(new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(modelSelect));
-      }
-      rows.push(buttons);
-      return { embeds: [embed], components: rows };
-    };
-
-    await this.respondInitial(i, render());
-    const msg = await i.fetchReply();
-    const collector = msg.createMessageComponentCollector({
-      filter: (c) => c.user.id === i.user.id,
-      time: 600_000,
-    });
-
-    // If the builder times out with nothing saved, clear the (now-inert) buttons
-    // and say so. Otherwise the card sits there looking clickable but dead — a
-    // second silent-failure path on top of the Create no-op: the user keeps
-    // clicking a timed-out builder and nothing happens or persists.
-    // "created"/"saved"/"cancel" settle the card themselves; the lifecycle skips
-    // those and expires everything else (#159).
-    const lifecycle = this.attachListLifecycle(i, collector, () =>
-      expiredCardView(
-        "⏰ Schedule builder timed out — nothing was saved. Run the schedule builder again to start over."
-      )
-    );
-
-    collector.on("collect", async (c) => {
-      try {
-        if (c.isStringSelectMenu() && c.customId === "sched:tz") {
-          state.timezone = c.values[0]!;
-          await c.update(render());
-        } else if (c.isStringSelectMenu() && c.customId === "sched:model") {
-          const v = c.values[0]!;
-          state.model = v === "__default__" ? null : v;
-          await c.update(render());
-        } else if (c.isStringSelectMenu() && c.customId === "sched:cadence") {
-          const v = c.values[0]!;
-          if (v === "__custom__") {
-            const modal = new ModalBuilder().setCustomId(`sched:cronmodal:${msg.id}`).setTitle("Custom schedule")
-              .addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(
-                new TextInputBuilder().setCustomId("cron").setLabel("Cron expression (min hour dom mon dow)")
-                  .setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder("0 9 * * 1-5")
-              ));
-            await c.showModal(modal);
-            const sub = await c.awaitModalSubmit({ filter: (m) => m.customId === `sched:cronmodal:${msg.id}` && m.user.id === i.user.id, time: 120_000 }).catch(() => null);
-            if (sub) {
-              const cron = sub.fields.getTextInputValue("cron").trim();
-              const v2 = validateCron(cron, state.timezone);
-              if (!v2.ok) {
-                await sub.reply({ content: `❌ Invalid cron: ${v2.error}`, flags: MessageFlags.Ephemeral });
-              } else {
-                state.cron = cron;
-                await sub.deferUpdate();
-                await i.editReply(render());
-              }
-            }
-          } else {
-            state.cron = v;
-            await c.update(render());
-          }
-        } else if (c.isButton() && c.customId === "sched:output") {
-          state.outputType = state.outputType === "messages" ? "card" : "messages";
-          await c.update(render());
-        } else if (c.isButton() && c.customId === "sched:mode") {
-          state.sessionMode = state.sessionMode === "live" ? "isolated" : "live";
-          await c.update(render());
-        } else if (c.isButton() && c.customId === "sched:prompt") {
-          const modalLive = state.sessionMode === "live";
-          const modalRows: ActionRowBuilder<TextInputBuilder>[] = [
-            new ActionRowBuilder<TextInputBuilder>().addComponents(
-              new TextInputBuilder().setCustomId("name").setLabel("Name").setStyle(TextInputStyle.Short).setRequired(true).setValue(state.name).setMaxLength(80)
-            ),
-            new ActionRowBuilder<TextInputBuilder>().addComponents(
-              new TextInputBuilder().setCustomId("prompt")
-                .setLabel(modalLive ? "Prompt (runs in this thread, with context)" : "Prompt (stands on its own — no prior context)")
-                .setStyle(TextInputStyle.Paragraph).setRequired(true).setValue(state.promptText)
-                .setPlaceholder("e.g. Run `npm test`, then post any failures as file:line with a one-line fix.")
-            ),
-          ];
-          // Live mode ignores cwd/target (D1) — drop those inputs entirely.
-          if (!modalLive) {
-            modalRows.push(
-              new ActionRowBuilder<TextInputBuilder>().addComponents(
-                new TextInputBuilder().setCustomId("cwd").setLabel("Working dir (optional)").setStyle(TextInputStyle.Short).setRequired(false).setValue(state.cwd ?? "")
-                  .setPlaceholder("blank = this thread's repo; or a path under REPOS_ROOT")
-              ),
-              new ActionRowBuilder<TextInputBuilder>().addComponents(
-                new TextInputBuilder().setCustomId("target").setLabel("Output channel/thread id (optional)").setStyle(TextInputStyle.Short).setRequired(false).setValue(state.target ?? "")
-                  .setPlaceholder("blank = post here; or a numeric channel/thread id")
-              )
-            );
-          }
-          const modal = new ModalBuilder().setCustomId(`sched:promptmodal:${msg.id}`).setTitle("Prompt & details").addComponents(...modalRows);
-          await c.showModal(modal);
-          const sub = await c.awaitModalSubmit({ filter: (m) => m.customId === `sched:promptmodal:${msg.id}` && m.user.id === i.user.id, time: 600_000 }).catch(() => null);
-          if (sub) {
-            state.name = sub.fields.getTextInputValue("name").trim();
-            state.promptText = sub.fields.getTextInputValue("prompt").trim();
-            const errors: string[] = [];
-            // cwd/target only exist as modal inputs in isolated mode.
-            if (!modalLive) {
-              const rawCwd = sub.fields.getTextInputValue("cwd").trim();
-              if (rawCwd) {
-                try { state.cwd = resolveRepoPath(this.config.REPOS_ROOT, rawCwd); }
-                catch (e) { errors.push(`cwd: ${(e as Error).message}`); }
-              } else state.cwd = null;
-              const rawTarget = sub.fields.getTextInputValue("target").trim();
-              if (rawTarget) {
-                if (/^\d+$/.test(rawTarget)) state.target = rawTarget;
-                else errors.push("output id must be a numeric channel/thread id");
-              } else state.target = null;
-            }
-            await sub.deferUpdate();
-            await i.editReply(render());
-            if (errors.length) await sub.followUp({ content: `⚠️ ${errors.join("; ")}`, flags: MessageFlags.Ephemeral });
-          }
-        } else if (c.isButton() && c.customId === "sched:cancel") {
-          await c.deferUpdate();
-          await lifecycle.terminal("cancel", { content: "Cancelled.", embeds: [], components: [] });
-        } else if (c.isButton() && c.customId === "sched:create") {
-          await c.deferUpdate();
-          // Don't silently no-op on a half-filled form. Clicking Create with an
-          // unset name/prompt/cadence previously just vanished (deferUpdate ack'd
-          // the click, then `return`), so a schedule the user believed they had
-          // created was never persisted and never ran. Tell them what's missing
-          // and keep the builder open. (Single combined guard so TS narrows the
-          // three fields to non-null for the row construction below.)
-          if (!state.name || !state.promptText || !state.cron) {
-            const missing: string[] = [];
-            if (!state.name) missing.push("a name");
-            if (!state.promptText) missing.push("a prompt");
-            if (!state.cron) missing.push("a cadence/schedule");
-            await c.followUp({
-              content: `⚠️ Not created yet — still need ${missing.join(", ")}. Use **Prompt & details** to set the name + prompt and pick a cadence, then click Create.`,
-              flags: MessageFlags.Ephemeral,
-            });
-            return;
-          }
-          const now = new Date().toISOString();
-          const next = cronNextRun(state.cron, state.timezone);
-          const live = state.sessionMode === "live";
-          // In live mode model/cwd/target/output are meaningless (D1) — null them
-          // (output back to "card" default) so a mode flip during editing can't
-          // leave stale values behind, and isolated stays valid on flip-back.
-          const persistedModel = live ? null : state.model;
-          const persistedCwd = live ? null : state.cwd;
-          const persistedTarget = live ? null : state.target;
-          const persistedOutput: "card" | "messages" = live ? "card" : state.outputType;
-          let row: ScheduledPrompt;
-          if (existing) {
-            // Edit: preserve id, created*, enabled, last-run. `legacyAttachmentCount: 0`
-            // is the deliberate revision (#158): it clears a pre-removal row's
-            // attachment manifest so the manager will arm it again. The bytes on
-            // disk are left where they are.
-            row = {
-              ...existing,
-              name: state.name, promptText: state.promptText, cron: state.cron, timezone: state.timezone,
-              model: persistedModel, cwd: persistedCwd, targetChannel: persistedTarget, outputType: persistedOutput,
-              sessionMode: state.sessionMode,
-              legacyAttachmentCount: 0,
-              updatedUtc: now, nextRunUtc: next ? next.toISOString() : null,
-            };
-            this.store.upsertScheduled(row);
-            this.scheduledManager?.reschedule(existing.id);
-          } else {
-            const id = `sch_${randomUUID().slice(0, 8)}`;
-            row = {
-              id, platform: PLATFORM, channelRef: channel.id, parentRef: channel.parentId ?? null,
-              name: state.name, promptText: state.promptText, cron: state.cron, timezone: state.timezone,
-              model: persistedModel, cwd: persistedCwd, targetChannel: persistedTarget, outputType: persistedOutput,
-              sessionMode: state.sessionMode,
-              catchupSeconds: 7200, enabled: true, legacyAttachmentCount: 0, createdBy: i.user.id,
-              createdUtc: now, updatedUtc: now, lastRunUtc: null, lastStatus: null,
-              nextRunUtc: next ? next.toISOString() : null, pinnedSessionId: null,
-            };
-            this.store.upsertScheduled(row);
-            this.scheduledManager?.armFromRow(row);
-          }
-          const confirm = new EmbedBuilder()
-            .setTitle(existing ? "✏️ Scheduled prompt updated" : "⏰ Scheduled prompt created")
-            .setColor(0x2ecc71)
-            .setDescription(
-              `**${state.name}** \`${row.id}\`\nRuns ${describeCron(state.cron)} (${state.timezone})` +
-              `\nSession: ${live ? "🧠 live (in this thread)" : "🧵 isolated (clean session)"}` +
-              (live ? "" :
-                (state.model ? `\nModel: \`${state.model}\`` : "") +
-                (state.cwd ? `\nWorking dir: \`${state.cwd}\`` : "") +
-                (state.target ? `\nOutput to: <#${state.target}>` : "") +
-                `\nOutput as: ${state.outputType === "messages" ? "plain messages" : "status cards"}`) +
-              (next ? `\nNext run: <t:${Math.floor(next.getTime() / 1000)}:F>` : "") +
-              (quarantine
-                ? `\n\n📎 Cleared this schedule's legacy reference files (#158) — it can run again. ` +
-                  `The stored bytes were left on disk under \`data/scheduled-attachments/${row.id}/\`.`
-                : "") +
-              (existing && !row.enabled ? `\n\n⏸️ This schedule is currently disabled — enable it with \`/seamadmin schedule toggle\`.` : "") +
-              `\n\nManage it with \`/seamadmin schedule list\`.`
-            );
-          await lifecycle.terminal(existing ? "saved" : "created", {
-            embeds: [confirm],
-            components: [],
-          });
-        }
-      } catch (err) {
-        this.logger.error({ err }, "schedule builder interaction failed");
-      }
-    });
   }
 
   /**

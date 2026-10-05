@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { pino } from "pino";
 import { buildSlashRegistrationBody, getSlashCommandAccess } from "../packages/core/src/platforms/discord/commands.js";
+import { scheduleUiFixture } from "./plugin-schedule-fixture.js";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
 import { PluginHost } from "../packages/core/src/plugins/host.js";
 import { createQuotaPlugin } from "../packages/core/src/plugins/quota/index.js";
@@ -149,15 +150,18 @@ describe.each([
     orch.channelRefFromInteraction = () => ({ platform: "discord", id: "thread", parentId: "parent" });
     const view = { embeds: [], components: [], page: 0 };
     orch.buildPresetListMessage = vi.fn(() => view);
-    orch.buildScheduleListMessage = vi.fn(() => view);
     orch.renderWorkflowInventory = vi.fn(async () => ({ ...view, components: [{}] }));
     const refresh = vi.fn(async () => true);
     orch.attachListLifecycle = () => ({ refresh, terminal: vi.fn() });
     orch.resumeTurnManually = vi.fn();
     orch.abandonTurnManually = vi.fn();
-    await orch[handler](i);
+    if (handler === "cmdScheduleList") {
+      const fixture = scheduleUiFixture(orch);
+      fixture.ui.buildScheduleListMessage = () => view;
+      await fixture.ui.cmdScheduleList(fixture.interaction(i));
+    } else await orch[handler](i);
     const click = (customId: string) => Object.assign(interaction("seam", null, "workflows"), {
-      customId, isButton: () => true, deferUpdate: vi.fn(async () => {}), update: vi.fn(async () => {}),
+      customId, isButton: () => true, isStringSelectMenu: () => false, deferUpdate: vi.fn(async () => {}), update: vi.fn(async () => {}),
     });
     const page = click(pageId);
     await collect(page);

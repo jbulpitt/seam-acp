@@ -704,49 +704,6 @@ export function buildSeamAdminCommand(): SlashCommandBuilder {
 
   // --- groups --------------------------------------------------------------
 
-  cmd.addSubcommandGroup((g) =>
-    g
-      .setName("schedule")
-      .setDescription("Recurring scheduled prompts for this thread")
-      // #158: no attachment options. A scheduled prompt stands on its own; for
-      // substantial instructions, commit a runbook and reference it in the prompt.
-      .addSubcommand((sub) =>
-        declareAccess(sub, { kind: "mutating" })
-          .setName("add")
-          .setDescription("Create a scheduled prompt (finish setup on the card)")
-      )
-      .addSubcommand((sub) =>
-        declareAccess(sub, { kind: "read-only" }).setName("list").setDescription("List this thread's scheduled prompts")
-      )
-      .addSubcommand((sub) =>
-        declareAccess(sub, { kind: "mutating" })
-          .setName("remove")
-          .setDescription("Delete a scheduled prompt")
-          .addStringOption((o) =>
-            o
-              .setName("id")
-              .setDescription("Schedule id (see /seamadmin schedule list)")
-              .setRequired(true)
-              .setAutocomplete(true)
-          )
-      )
-      .addSubcommand((sub) =>
-        declareAccess(sub, { kind: "mutating" })
-          .setName("toggle")
-          .setDescription("Enable or disable a scheduled prompt")
-          .addStringOption((o) =>
-            o.setName("id").setDescription("Schedule id").setRequired(true).setAutocomplete(true)
-          )
-      )
-      .addSubcommand((sub) =>
-        declareAccess(sub, { kind: "mutating" })
-          .setName("edit")
-          .setDescription("Edit a scheduled prompt (reopens the builder card)")
-          .addStringOption((o) =>
-            o.setName("id").setDescription("Schedule id").setRequired(true).setAutocomplete(true)
-          )
-      )
-  );
 
   // Projects: DB-backed channel activation (#22). Activating a channel makes it
   // respond at runtime — additive to the static env allowlist, no redeploy.

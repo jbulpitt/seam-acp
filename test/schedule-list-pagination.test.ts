@@ -1,3 +1,4 @@
+import { scheduleUiFixture } from "./plugin-schedule-fixture.js";
 /**
  * #152 — `/seamadmin schedule list` pagination.
  *
@@ -312,14 +313,10 @@ function makeListCard(rows: ScheduledPrompt[]) {
     scheduledManager: { runNow: vi.fn(async () => {}), armFromRow: vi.fn(), disarm: vi.fn() },
     attachListLifecycle: Orchestrator.prototype["attachListLifecycle" as never],
     slashAccessRefusal: Orchestrator.prototype["slashAccessRefusal" as never],
-    buildScheduleListMessage: Orchestrator.prototype["buildScheduleListMessage" as never],
-    scheduleSummaryLine: Orchestrator.prototype["scheduleSummaryLine" as never],
+
   };
-  const start = (
-    Orchestrator.prototype as unknown as {
-      cmdScheduleList(this: unknown, i: unknown): Promise<void>;
-    }
-  ).cmdScheduleList.call(self, interaction);
+  const fixture = scheduleUiFixture(self);
+  const start = fixture.ui.cmdScheduleList(fixture.interaction(interaction));
   return { start, collector, paints, store };
 }
 
@@ -328,6 +325,7 @@ function click(customId: string) {
   return {
     interaction: {
       isButton: () => true,
+      isStringSelectMenu: () => false,
       customId,
       user: { id: "u1" },
       deferUpdate: vi.fn(async () => {}),

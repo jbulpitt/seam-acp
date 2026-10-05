@@ -1,3 +1,4 @@
+import { scheduleUiFixture } from "./plugin-schedule-fixture.js";
 /**
  * #208 — scheduled builder + isolated fire must inherit the binding thread's
  * *effective* agent/model/cwd (`describeConfig`), not stale session columns.
@@ -270,11 +271,8 @@ async function renderBuilder(
     logger: silent,
     attachListLifecycle: () => noopLifecycle(),
   });
-  await (
-    Orchestrator.prototype as unknown as {
-      cmdScheduleAdd(this: unknown, i: unknown, existing?: ScheduledPrompt): Promise<void>;
-    }
-  ).cmdScheduleAdd.call(self, interaction, existing);
+  const fixture = scheduleUiFixture(self);
+  await fixture.ui.cmdScheduleAdd(fixture.interaction(interaction), existing);
   if (!card) throw new Error("builder card was never rendered");
   return { card, getProfile };
 }

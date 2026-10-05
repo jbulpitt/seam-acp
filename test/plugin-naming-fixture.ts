@@ -1,3 +1,4 @@
+import { registerScheduleCommands } from "./plugin-schedule-fixture.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -24,6 +25,7 @@ export function namingRegistry() {
   }, internal: { setNamePrefix: () => {}, get: () => undefined, all: () => [], rules: { get: () => DEFAULT_THREAD_NAMER_CONFIG, save: next => next } } });
   const host = new PluginHost(logger);
   host.slash.register(plugin.id, plugin.contributions.slash!, { logger, config: undefined });
+  registerScheduleCommands(host);
   return host.slash;
 }
 export function namingCommands() { return buildSlashRegistrationBody(namingRegistry()); }

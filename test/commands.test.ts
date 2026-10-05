@@ -360,7 +360,6 @@ describe("/seamadmin — operator surface (#151)", () => {
       "recover",
       "canary",
       "models",
-      "schedule",
       "project",
       "upload",
       "bridge",
@@ -369,6 +368,7 @@ describe("/seamadmin — operator surface (#151)", () => {
       "catalog",
       "restrictions",
       "naming",
+      "schedule",
     ]);
   });
 

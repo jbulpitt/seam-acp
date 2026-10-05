@@ -1,3 +1,4 @@
+import { scheduleUiFixture } from "./plugin-schedule-fixture.js";
 /**
  * Call-site behaviour for the schedule-list and preset-list Edit buttons (#159).
  *
@@ -79,6 +80,7 @@ function makeListInteraction(events: string[]) {
 function makeEditButton(customId: string, events: string[], ackGate?: Promise<void>) {
   const button = {
     isButton: () => true,
+    isStringSelectMenu: () => false,
     customId,
     user: { id: "u1" },
     channelId: "thread-1",
@@ -198,23 +200,13 @@ async function runScheduleListEdit(clicks: number, opts: RunOpts = {}) {
     scheduledManager: undefined,
     slashAccessRefusal: Orchestrator.prototype["slashAccessRefusal" as never],
     attachListLifecycle: Orchestrator.prototype["attachListLifecycle" as never],
-    // The real wrapper, so a builder that throws after the freeze is surfaced
-    // rather than leaving a permanently "thinking" ephemeral.
-    openEditorAfterFreeze: Orchestrator.prototype["openEditorAfterFreeze" as never],
-    buildScheduleListMessage: Orchestrator.prototype["buildScheduleListMessage" as never],
-    scheduleSummaryLine: Orchestrator.prototype["scheduleSummaryLine" as never],
-    cmdScheduleAdd: async (c: { deferred: boolean; replied: boolean; editReply: () => Promise<void>; reply: () => Promise<void> }) => {
-      events.push(`editor:opened:deferred=${c.deferred}`);
-      // Mirrors Orchestrator.respondInitial.
-      if (c.deferred || c.replied) await c.editReply();
-      else await c.reply();
-    },
   };
-  await (
-    Orchestrator.prototype as unknown as {
-      cmdScheduleList(this: unknown, i: unknown): Promise<void>;
-    }
-  ).cmdScheduleList.call(self, interaction);
+  const fixture = scheduleUiFixture(self);
+  fixture.ui.cmdScheduleAdd = async c => {
+    events.push(`editor:opened:deferred=${c.deferred}`);
+    await c.respondInitial({});
+  };
+  await fixture.ui.cmdScheduleList(fixture.interaction(interaction));
 
   const delivered = await fireClicks(collector, clicks, (e) =>
     makeEditButton(`sl:edit:${scheduleRow.id}`, e, ackGate),

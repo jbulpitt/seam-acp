@@ -174,7 +174,8 @@ describe.each([
     let collect!: (click: any) => Promise<void>;
     const collector = { on: (_event: string, callback: typeof collect) => { collect = callback; } };
     const i = Object.assign(interaction("seam", null, "workflows"), {
-      fetchReply: async () => ({ createMessageComponentCollector: () => collector }),
+      fetchReply: async () => ({ id: "list", createMessageComponentCollector: () => collector }),
+      editReply: vi.fn(async () => {}),
     });
     const row = { id: "p1", channelRef: "thread", name: "fixture" };
     const del = vi.fn();
@@ -204,9 +205,15 @@ describe.each([
       const fixture = presetUiFixture(orch);
       (fixture.ui as any).buildPresetListMessage = () => view;
       await fixture.ui.cmdPresetList(fixture.interaction(i));
+      const card = [...fixture.ui.cards.states.values()][0]!;
+      collect = async click => {
+        click.customId = `${click.customId}:${card.id}`;
+        await fixture.ui.cards.handle(fixture.interaction(click));
+      };
     } else await orch[handler](i);
     const click = (customId: string) => Object.assign(interaction("seam", null, "workflows"), {
-      customId, isButton: () => true, isStringSelectMenu: () => false, deferUpdate: vi.fn(async () => {}), update: vi.fn(async () => {}),
+      customId, isButton: () => true, isStringSelectMenu: () => false, isModalSubmit: () => false,
+      deferUpdate: vi.fn(async () => {}), update: vi.fn(async () => {}),
     });
     const page = click(pageId);
     await collect(page);

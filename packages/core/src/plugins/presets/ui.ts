@@ -1,3 +1,4 @@
+import { PresetCards, routePresetView, type PresetCard, type PresetBuilderCard, type PresetListCard, type PresetController } from "./cards.js";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { MessageFlags, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, StringSelectMenuBuilder, ModalBuilder, TextInputBuilder, TextInputStyle } from "discord.js";
@@ -13,9 +14,25 @@ import { presetModelSelectOptions } from "./view.js";
 const PRESET_COLOR = 0x9b59b6;
 export class PresetUi {
   get repository() { return this.ports.repository; }
-  constructor(readonly ports: PresetUiPorts) {}
+  readonly cards: PresetCards;
+  constructor(readonly ports: PresetUiPorts) {
+    this.cards = new PresetCards(ports, card => this.resumeCard(card));
+  }
+  private restoredInteraction(card: PresetCard): PresetInteraction {
+    const reply = this.ports.reply(card.target, card.owner, card.channel?.id ?? "");
+    return { cardReply: reply, user: { id: card.owner }, channelRef: card.channel, channelId: card.channel?.id,
+      parentId: card.channel?.parentId, projectScopeId: card.projectRef ?? undefined, deferred: true, replied: true,
+      options: { getString: (() => "") as PresetInteraction["options"]["getString"], getBoolean: () => null, getInteger: () => null },
+      reply: view => reply.followUp(view as never), editReply: view => reply.editReply(typeof view === "string" ? { content: view } : view),
+      deferReply: async () => {}, fetchReply: async () => ({ id: "" }),
+    };
+  }
+  private async resumeCard(card: PresetCard): Promise<PresetController> {
+    const i = this.restoredInteraction(card);
+    return card.kind === "list" ? this.openPresetList(i, card, true) : this.cmdPresetBuilder(i, card.existing, card.projectRef, undefined, card);
+  }
   get logger() { return this.ports.logger; }
-  private async openEditorAfterFreeze(c: PresetClick, open: () => Promise<void>, surface: string, retryCommand: string): Promise<void> {
+  private async openEditorAfterFreeze(c: PresetClick, open: () => Promise<unknown>, surface: string, retryCommand: string): Promise<void> {
     try { await open(); }
     catch (err) {
       this.logger.warn({ err, surface }, "editor failed to open after list freeze");
@@ -119,20 +136,21 @@ export class PresetUi {
       });
       return;
     }
-    let page = 0;
-    await i.reply({
-      ...this.buildPresetListMessage(projectRef, page),
-      flags: MessageFlags.Ephemeral,
-    });
-    const msg = await i.fetchReply();
-    const collector = msg.createMessageComponentCollector({
-      filter: (c) => c.user.id === i.user.id,
-      time: 600_000,
-    });
-    const lifecycle = i.attachLifecycle(collector, () =>
-      expiredCardView("⏰ Preset list expired. Run `/seam preset list` again.")
-    );
-    collector.on("collect", async (c) => {
+    const card: PresetListCard = { kind: "list", id: randomUUID(), owner: i.user.id, channel: i.channelRef,
+      projectRef, target: "", expires: 0, page: 0 };
+    await this.openPresetList(i, card);
+  }
+
+  private async openPresetList(i: PresetInteraction, card: PresetListCard, restored = false): Promise<PresetController> {
+    const projectRef = card.projectRef;
+    if (!restored) {
+      await i.reply({ ...routePresetView(this.buildPresetListMessage(projectRef, card.page), card.id), flags: MessageFlags.Ephemeral });
+      await i.fetchReply();
+      card.target = i.cardReply.target; card.expires = Date.now() + 600_000;
+      this.cards.checkpoint(card);
+    }
+    return this.cards.bind(card, view => i.editReply(view), () =>
+      expiredCardView("⏰ Preset list expired. Run `/seam preset list` again."), async (c, lifecycle) => {
       try {
         if (!c.isButton()) return;
         const [, action, id] = c.customId.split(":");
@@ -141,8 +159,9 @@ export class PresetUi {
           const requested = Number(id);
           if (!Number.isFinite(requested)) return;
           const remaining = this.repository.listPresetsForProject(projectRef);
-          page = paginatePresetList(remaining, requested).page;
-          await c.update(this.buildPresetListMessage(projectRef, page));
+          card.page = paginatePresetList(remaining, requested).page;
+          this.cards.checkpoint(card);
+          await c.update(routePresetView(this.buildPresetListMessage(projectRef, card.page), card.id));
           return;
         }
         const refusal = c.mutationRefusal();
@@ -157,7 +176,7 @@ export class PresetUi {
             flags: MessageFlags.Ephemeral,
           });
           // Repeatable: rebuild from the store so the vanished row's controls go.
-          await lifecycle.refresh(this.buildPresetListMessage(projectRef, page));
+          await lifecycle.refresh(this.buildPresetListMessage(projectRef, card.page));
           return;
         }
         if (action === "apply") {
@@ -175,8 +194,7 @@ export class PresetUi {
             flags: MessageFlags.Ephemeral,
           });
         } else if (action === "edit") {
-          // Same ordering as the schedule list above: synchronous stop, then
-          // the ack, then the freeze repaint.
+          // Close the list, acknowledge the click, then repaint before opening the editor.
           await lifecycle.transitionWithAck(
             "edit",
             {
@@ -197,8 +215,9 @@ export class PresetUi {
         } else if (action === "del") {
           this.repository.deletePreset(id);
           const remaining = this.repository.listPresetsForProject(projectRef);
-          page = paginatePresetList(remaining, page).page;
-          await c.update(this.buildPresetListMessage(projectRef, page));
+          card.page = paginatePresetList(remaining, card.page).page;
+          this.cards.checkpoint(card);
+          await c.update(routePresetView(this.buildPresetListMessage(projectRef, card.page), card.id));
         }
       } catch (err) {
         this.logger.warn({ err }, "preset-list button handler failed");
@@ -233,9 +252,10 @@ export class PresetUi {
     i: PresetInteraction,
     existing?: Preset,
     createScope?: string | null,
-    seedRole?: string | null
-  ): Promise<void> {
-    const { location: presetLocation, profiles } = this.ports.builderDefaults(i.channelRef);
+    seedRole?: string | null,
+    restored?: PresetBuilderCard
+  ): Promise<PresetController> {
+    const { location: presetLocation, profiles } = restored ?? this.ports.builderDefaults(i.channelRef);
 
     // Scope is fixed at creation: editing preserves the preset's scope, while a
     // new preset takes `createScope` (the current project, or null for global).
@@ -257,7 +277,7 @@ export class PresetUi {
       statusCardStyle: StatusCardStyle | null;
       role: string | null;
       disableThreadPrefix: boolean | null;
-    } = {
+    } = restored?.draft ?? {
       name: existing?.name ?? "",
       description: existing?.description ?? "",
       agentId: existing?.agentId ?? null,
@@ -284,9 +304,13 @@ export class PresetUi {
         .map((model) => ({ modelId: model.id, name: model.displayName }));
     };
     let models = await loadModels(state.agentId);
-    const repoDirs = (await this.ports.listWorkspace(i.channelRef)) ?? [];
+    const repoDirs = restored?.repoDirs ?? (await this.ports.listWorkspace(i.channelRef)) ?? [];
+    const card: PresetBuilderCard = restored ?? { kind: "builder", id: randomUUID(), owner: i.user.id, channel: i.channelRef,
+      projectRef, existing, draft: state, location: presetLocation, profiles, repoDirs, target: "", expires: 0, modals: {} };
+    if (!restored) this.cards.states.set(card.id, card);
 
     const render = () => {
+      if (card.target && this.cards.states.has(card.id)) this.cards.checkpoint(card);
       const agentDisplay = state.agentId ? `\`${state.agentId}\`` : "*(default)*";
       const modelDisplay = state.model ? `\`${state.model}\`` : "*(default)*";
       const effortDisplay = state.effort ?? "*(default)*";
@@ -445,7 +469,7 @@ export class PresetUi {
           .setDisabled(!state.name),
       );
 
-      return {
+      return routePresetView({
         embeds: [embed],
         components: [
           new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(agentSelect),
@@ -454,26 +478,72 @@ export class PresetUi {
           new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(repoSelect),
           buttons,
         ],
-      };
+      }, card.id);
     };
 
-    // Already deferred when opened from the list's Edit button (#159).
-    if (!i.deferred && !i.replied) await i.deferReply({ flags: MessageFlags.Ephemeral });
-    await i.editReply(render());
-    const msg = await i.fetchReply();
-    const collector = msg.createMessageComponentCollector({
-      filter: (c) => c.user.id === i.user.id,
-      time: 600_000,
-    });
-
-    // "created"/"saved"/"cancel" settle the card themselves; the lifecycle
-    // expires everything else, including any stop reason added later (#159).
-    const lifecycle = i.attachLifecycle(collector, () =>
-      expiredCardView("⏰ Preset builder timed out — nothing was saved. Run the command again.")
-    );
-
-    collector.on("collect", async (c) => {
+    if (!restored) {
+      // Edit from a list already acknowledged the component.
+      if (!i.deferred && !i.replied) await i.deferReply({ flags: MessageFlags.Ephemeral });
+      await i.editReply(render());
+      await i.fetchReply();
+      card.target = i.cardReply.target; card.expires = Date.now() + 600_000;
+      this.cards.checkpoint(card);
+    }
+    const showModal = async (c: PresetClick, modal: ModalBuilder) => {
+      const action = modal.data.custom_id!;
+      card.modals[action] = Date.now() + 300_000;
+      this.cards.checkpoint(card);
+      await c.showModal(modal.setCustomId(`${action}:${card.id}`));
+    };
+    return this.cards.bind(card, view => i.editReply(view), () =>
+      expiredCardView("⏰ Preset builder timed out — nothing was saved. Run the command again."), async (c, lifecycle) => {
       try {
+        if (c.isModalSubmit() && c.customId === "preset:details-modal") {
+          state.name = c.fields.getTextInputValue("name").trim();
+          state.description = c.fields.getTextInputValue("desc").trim();
+          const permVal = c.fields
+            .getTextInputValue("permission")
+            .trim()
+            .toLowerCase();
+          state.permission =
+            permVal === "always" || permVal === "ask" || permVal === "deny"
+              ? permVal
+              : null;
+          const instrVal = c.fields.getTextInputValue("instr").trim();
+          state.instructions = instrVal || null;
+          await c.deferUpdate();
+          await i.editReply(render());
+          return;
+        }
+        if (c.isModalSubmit() && c.customId === "preset:naming-modal") {
+          const rawRole = c.fields.getTextInputValue("role").trim();
+          state.role = !rawRole || rawRole.toLowerCase() === "auto" ? null : rawRole;
+          const rawDisable = c.fields.getTextInputValue("disable").trim().toLowerCase();
+          state.disableThreadPrefix = rawDisable === "yes" || rawDisable === "true"
+            ? true
+            : rawDisable === "no" || rawDisable === "false" || rawDisable === ""
+              ? null
+              : state.disableThreadPrefix;
+          await c.deferUpdate();
+          await i.editReply(render());
+          return;
+        }
+        if (c.isModalSubmit() && c.customId === "preset:tools-modal") {
+          const allow = parseCsv(c.fields.getTextInputValue("allow"));
+          const exclude = parseCsv(c.fields.getTextInputValue("exclude"));
+          state.toolsAllow = allow.length > 0 ? allow : null;
+          state.toolsExclude = exclude.length > 0 ? exclude : null;
+          await c.deferUpdate();
+          await i.editReply(render());
+          return;
+        }
+        if (c.isModalSubmit() && c.customId === "preset:instr-modal") {
+          const val = c.fields.getTextInputValue("instr").trim();
+          state.instructions = val || null;
+          await c.deferUpdate();
+          await i.editReply(render());
+          return;
+        }
         if (c.isStringSelectMenu() && c.customId === "preset:agent") {
           const v = c.values[0]!;
           state.agentId = v === "__default__" ? null : v;
@@ -604,27 +674,7 @@ export class PresetUi {
                 .setRequired(false)
             ),
           );
-          await c.showModal(modal);
-          try {
-            const submit = await c.awaitModalSubmit({
-              time: 300_000,
-              filter: (m) => m.customId === "preset:details-modal",
-            });
-            state.name = submit.fields.getTextInputValue("name").trim();
-            state.description = submit.fields.getTextInputValue("desc").trim();
-            const permVal = submit.fields
-              .getTextInputValue("permission")
-              .trim()
-              .toLowerCase();
-            state.permission =
-              permVal === "always" || permVal === "ask" || permVal === "deny"
-                ? permVal
-                : null;
-            const instrVal = submit.fields.getTextInputValue("instr").trim();
-            state.instructions = instrVal || null;
-            await submit.deferUpdate();
-            await i.editReply(render());
-          } catch { /* modal timeout */ }
+          await showModal(c, modal);
         } else if (c.isButton() && c.customId === "preset:naming") {
           const modal = new ModalBuilder()
             .setCustomId("preset:naming-modal")
@@ -649,23 +699,7 @@ export class PresetUi {
                 .setRequired(false)
             )
           );
-          await c.showModal(modal);
-          try {
-            const submit = await c.awaitModalSubmit({
-              time: 300_000,
-              filter: (m) => m.customId === "preset:naming-modal",
-            });
-            const rawRole = submit.fields.getTextInputValue("role").trim();
-            state.role = !rawRole || rawRole.toLowerCase() === "auto" ? null : rawRole;
-            const rawDisable = submit.fields.getTextInputValue("disable").trim().toLowerCase();
-            state.disableThreadPrefix = rawDisable === "yes" || rawDisable === "true"
-              ? true
-              : rawDisable === "no" || rawDisable === "false" || rawDisable === ""
-                ? null
-                : state.disableThreadPrefix;
-            await submit.deferUpdate();
-            await i.editReply(render());
-          } catch { /* modal timeout */ }
+          await showModal(c, modal);
         } else if (c.isButton() && c.customId === "preset:tools") {
           const modal = new ModalBuilder()
             .setCustomId("preset:tools-modal")
@@ -690,19 +724,7 @@ export class PresetUi {
                 .setRequired(false)
             )
           );
-          await c.showModal(modal);
-          try {
-            const submit = await c.awaitModalSubmit({
-              time: 300_000,
-              filter: (m) => m.customId === "preset:tools-modal",
-            });
-            const allow = parseCsv(submit.fields.getTextInputValue("allow"));
-            const exclude = parseCsv(submit.fields.getTextInputValue("exclude"));
-            state.toolsAllow = allow.length > 0 ? allow : null;
-            state.toolsExclude = exclude.length > 0 ? exclude : null;
-            await submit.deferUpdate();
-            await i.editReply(render());
-          } catch { /* modal timeout */ }
+          await showModal(c, modal);
         } else if (c.isButton() && c.customId === "preset:instr") {
           const modal = new ModalBuilder()
             .setCustomId("preset:instr-modal")
@@ -718,17 +740,7 @@ export class PresetUi {
                 .setRequired(false)
             )
           );
-          await c.showModal(modal);
-          try {
-            const submit = await c.awaitModalSubmit({
-              time: 300_000,
-              filter: (m) => m.customId === "preset:instr-modal",
-            });
-            const val = submit.fields.getTextInputValue("instr").trim();
-            state.instructions = val || null;
-            await submit.deferUpdate();
-            await i.editReply(render());
-          } catch { /* modal timeout */ }
+          await showModal(c, modal);
         } else if (c.isButton() && c.customId === "preset:save") {
           if (!state.name) {
             await c.reply({ content: "Name is required.", flags: MessageFlags.Ephemeral });

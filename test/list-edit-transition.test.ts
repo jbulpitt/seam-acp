@@ -13,7 +13,7 @@ import { presetUiFixture } from "./plugin-presets-fixture.js";
  *    "This interaction failed" with no editor at all. The builder therefore
  *    inherits an already-deferred interaction and must render through
  *    `editReply` rather than replying or deferring a second time.
- * 2. Exactly one editor opens, because the freeze closes the collector
+ * 2. Exactly one editor opens, because the freeze closes the card
  *    synchronously — so a second click is never delivered.
  */
 import { describe, it, expect } from "vitest";
@@ -26,31 +26,8 @@ const silent = {
   error: () => {},
 } as never;
 
-/** A collector with the one semantic that matters: `stop()` is final. */
-class FakeCollector {
-  stopped: string | null = null;
-  private collectFn: ((c: unknown) => Promise<void>) | undefined;
-
-  on(event: string, fn: (...args: never[]) => unknown): this {
-    if (event === "collect") this.collectFn = fn as (c: unknown) => Promise<void>;
-    return this;
-  }
-
-  stop(reason = "user"): void {
-    if (this.stopped === null) this.stopped = reason;
-  }
-
-  /** `false` mirrors Discord: a stopped collector never delivers a click. */
-  async click(interaction: unknown): Promise<boolean> {
-    if (this.stopped !== null) return false;
-    await this.collectFn?.(interaction);
-    return true;
-  }
-}
-
 /** The originating list interaction; `editReply` is deliberately slow. */
 function makeListInteraction(events: string[]) {
-  const collector = new FakeCollector();
   const paints: Array<Record<string, unknown>> = [];
   const interaction = {
     user: { id: "u1" },
@@ -59,7 +36,6 @@ function makeListInteraction(events: string[]) {
     },
     fetchReply: async () => ({
       id: "msg-1",
-      createMessageComponentCollector: () => collector,
     }),
     editReply: async (payload: Record<string, unknown>) => {
       // Logged at entry: the gate is invocation order, so a freeze that merely
@@ -70,7 +46,7 @@ function makeListInteraction(events: string[]) {
       paints.push(payload);
     },
   };
-  return { interaction, collector, paints };
+  return { interaction, paints };
 }
 
 /**
@@ -81,6 +57,7 @@ function makeEditButton(customId: string, events: string[], ackGate?: Promise<vo
   const button = {
     isButton: () => true,
     isStringSelectMenu: () => false,
+    isModalSubmit: () => false,
     customId,
     user: { id: "u1" },
     channelId: "thread-1",
@@ -123,7 +100,7 @@ interface RunOpts {
  * the window a settle that stops only after awaiting would leave open.
  */
 async function fireClicks(
-  collector: FakeCollector,
+  collector: { click(interaction: unknown): Promise<boolean> },
   count: number,
   makeButton: (events: string[]) => unknown,
   events: string[],
@@ -164,7 +141,7 @@ const presetRow = {
 async function runPresetListEdit(clicks: number, opts: RunOpts = {}) {
   const { ackGate, releaseAck } = opts;
   const events: string[] = [];
-  const { interaction, collector, paints } = makeListInteraction(events);
+  const { interaction, paints } = makeListInteraction(events);
   const self = {
     logger: silent,
     config: { channelPresets: new Map() },
@@ -188,8 +165,12 @@ async function runPresetListEdit(clicks: number, opts: RunOpts = {}) {
   fixture.ui.cmdPresetBuilder = self.cmdPresetBuilder;
   await fixture.ui.cmdPresetList(fixture.interaction(interaction));
 
+  const card = [...fixture.ui.cards.states.values()][0]!;
+  const controller = await (fixture.ui.cards as any).controllers.get(card.id);
+  const collector = { get stopped() { return controller.lifecycle.reason; },
+    click: (native: unknown) => fixture.ui.cards.handle(fixture.interaction(native) as any) };
   const delivered = await fireClicks(collector, clicks, (e) =>
-    makeEditButton(`pr:edit:${presetRow.id}`, e, ackGate),
+    makeEditButton(`pr:edit:${presetRow.id}:${card.id}`, e, ackGate),
     events,
     releaseAck
   );
@@ -229,11 +210,11 @@ for (const surface of SURFACES) {
       const { events, delivered } = await surface.run(2);
       expect(events.filter((e) => e.startsWith("editor:opened"))).toHaveLength(1);
       // The second click is never delivered: the transition closed the
-      // collector synchronously, before its repaint was even sent.
+      // card synchronously, before its repaint was even sent.
       expect(delivered).toEqual([true, false]);
     });
 
-    it("closes the collector with the edit reason", async () => {
+    it("closes the card with the edit reason", async () => {
       const { collector } = await surface.run(1);
       expect(collector.stopped).toBe("edit");
     });
@@ -258,7 +239,7 @@ for (const surface of SURFACES) {
 // QA gate: a sequential second click proves nothing about the window between
 // the handler starting and its ack resolving. These launch both clicks with the
 // ack deliberately unresolved, so the only thing that can prevent a second
-// editor is a collector that was stopped SYNCHRONOUSLY, before any await.
+// editor is a card that was closed SYNCHRONOUSLY, before any await.
 describe("concurrent Edit clicks while the ACK is still unresolved", () => {
   const SURFACE_RUNNERS = [
     { name: "preset list", run: runPresetListEdit },
@@ -274,7 +255,7 @@ describe("concurrent Edit clicks while the ACK is still unresolved", () => {
 
       expect(events.filter((e) => e.startsWith("editor:opened"))).toHaveLength(1);
       // The second click was refused at dispatch: the settle stopped the
-      // collector before the first handler ever awaited its ack.
+      // card before the first handler ever awaited its ack.
       expect(delivered).toEqual([true, false]);
       expect(collector.stopped).toBe("edit");
       // Exactly one ack was even attempted.

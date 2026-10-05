@@ -39,6 +39,7 @@ function harness(facts: () => { refreshTokenExpiresAt: number | null } | undefin
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "seam-454-park-"));
   dirs.push(dir);
   const store = new SessionStore(path.join(dir, "fixture.db"));
+  const observations = vi.spyOn(store.turnAttempts, "saveStatusCardState");
   const profile = {
     id: "claude", defaultModel: "fixture-model", classifyError: classifyClaudeError,
     spawn() { throw new Error("provider spawn forbidden"); },
@@ -118,7 +119,7 @@ function harness(facts: () => { refreshTokenExpiresAt: number | null } | undefin
     attempts: store.turnAttempts, onDispatch: spec => orch.dispatchInjectTurn(spec), pollMs: 1_000_000 });
   orch.setDispatchWatcher(watcher);
   cleanups.push(() => watcher.stop());
-  return { dir, store, orch, runtime, prompt, messages, record, described, cards, edits, watcher,
+  return { dir, store, orch, runtime, prompt, messages, record, described, cards, edits, observations, watcher,
     removeCard: (id: string) => { unavailableCard = id; cards.delete(id); } };
 }
 
@@ -180,8 +181,10 @@ describe("reauth resume status-card settlement", () => {
     expect(h.cards.size).toBe(1);
     expect(h.cards.get(cardId)?.title).toContain(failed ? "Failed" : "Done");
     const settledEdits = h.edits.length;
+    const settledObservations = h.observations.mock.calls.length;
     await vi.advanceTimersByTimeAsync(15_000);
     expect(h.edits).toHaveLength(settledEdits);
+    expect(h.observations).toHaveBeenCalledTimes(settledObservations);
     expect(h.cards.get(cardId)?.title).toContain(failed ? "Failed" : "Done");
     if (!failed) expect(h.messages.filter(text => text === "RESUMED-ONCE")).toHaveLength(1);
     h.store.close();
@@ -199,7 +202,11 @@ describe("reauth resume status-card settlement", () => {
       acpSessionId: "fixture-acp", statusCard: original.statusCard });
     expect(h.prompt).toHaveBeenCalledTimes(2);
     expect(JSON.stringify(h.prompt.mock.calls).match(/ORIGINAL-ONCE/g)).toHaveLength(1);
+    const settledEdits = h.edits.length;
+    const settledObservations = h.observations.mock.calls.length;
     await vi.advanceTimersByTimeAsync(15_000);
+    expect(h.edits).toHaveLength(settledEdits);
+    expect(h.observations).toHaveBeenCalledTimes(settledObservations);
     expect(h.cards.size).toBe(1);
     expect(h.cards.get(original.statusCard!.messageId)?.title).toContain(failed ? "Failed" : "Done");
     if (!failed) expect(h.messages.filter(text => text === "RESUMED-ONCE")).toHaveLength(1);
@@ -245,8 +252,10 @@ describe("reauth resume status-card settlement", () => {
       acpSessionId: "fixture-acp", statusCard: original.statusCard });
     expect(h.cards.get(original.statusCard!.messageId)?.title).toContain("Waiting");
     const parkedEdits = h.edits.length;
+    const parkedObservations = h.observations.mock.calls.length;
     await vi.advanceTimersByTimeAsync(15_000);
     expect(h.edits).toHaveLength(parkedEdits);
+    expect(h.observations).toHaveBeenCalledTimes(parkedObservations);
     resumeOutcome(h, false);
     await resume();
     expect(h.store.turnAttempts.get(id)).toMatchObject({ state: "completed", generation: 3,
@@ -256,8 +265,10 @@ describe("reauth resume status-card settlement", () => {
     expect(h.cards.size).toBe(1);
     expect(h.cards.get(original.statusCard!.messageId)?.title).toContain("Done");
     const settledEdits = h.edits.length;
+    const settledObservations = h.observations.mock.calls.length;
     await vi.advanceTimersByTimeAsync(15_000);
     expect(h.edits).toHaveLength(settledEdits);
+    expect(h.observations).toHaveBeenCalledTimes(settledObservations);
     expect(h.messages.filter(text => text === "RESUMED-ONCE")).toHaveLength(1);
     h.store.close();
   });

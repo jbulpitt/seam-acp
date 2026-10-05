@@ -1,9 +1,26 @@
 import { describe, expect, it, vi } from "vitest";
-import { resolveError } from "@seam/adapters";
+import { resolveError, providerRetryBackoff, PROVIDER_RETRY_WINDOW_MS } from "@seam/adapters";
 import { DEFAULT_ERROR_RULES } from "../packages/core/src/core/error-resolution-rules.js";
 import { buildRecoveryDirective, runBoundedRecovery } from "../packages/core/src/core/recovery-directive.js";
 
 describe("#448 wire directive and mechanical bounded owner", () => {
+  it.each(["overloaded", "server_error"] as const)("extends only %s using the existing rung-1 directive", kind => {
+    const directive = buildRecoveryDirective(resolveError({ errorKind: kind, agentId: "codex" }, DEFAULT_ERROR_RULES), "conversation");
+    expect(directive.steps[0]).toMatchObject({ rung: 1, retryCount: 5, backoffMs: providerRetryBackoff(kind) });
+  });
+
+  it("does not retry again when provider time has consumed the horizon", async () => {
+    let time = 0;
+    let calls = 0;
+    const cause = new Error("Overloaded");
+    const run = vi.fn(async () => { if (++calls > 1) time += PROVIDER_RETRY_WINDOW_MS; throw cause; });
+    const sleep = vi.fn(async (delay: number) => { time += delay; });
+    await expect(runBoundedRecovery({ run, delays: () => providerRetryBackoff("overloaded")!, sleep,
+      now: () => time, windowMs: () => PROVIDER_RETRY_WINDOW_MS })).rejects.toBe(cause);
+    expect(run).toHaveBeenCalledTimes(2);
+    expect(sleep).toHaveBeenCalledExactlyOnceWith(10_000);
+  });
+
   it("round-trips the permitted ladder, counts, backoff and precomputed options as JSON", () => {
     const verdict = resolveError({ errorKind: "rate_limit", agentId: "claude", viableOptions: [
       { id: "model:precomputed-fallback", rung: 2 }, { id: "session:reattach", rung: 3 },

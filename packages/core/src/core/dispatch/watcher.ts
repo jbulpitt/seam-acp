@@ -14,6 +14,8 @@ import { access, mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs
 import { renameSync, rmSync } from "node:fs";
 import * as path from "node:path";
 import { SerialQueue } from "../serial-queue.js";
+import { bootRecoveryBackoff, bootErrorClassification, DEFAULT_BOOT_RECOVERY_BACKOFF_MS } from "./acquisition-phase.js";
+import { PROVIDER_RETRY_WINDOW_MS, providerRetryBackoff } from "@seam/adapters";
 import {
   DispatchSuspendedError,
   type TurnAttemptStore,
@@ -44,10 +46,10 @@ export const ADMISSION_BARRIER_TIMEOUT_MS = 60_000;
 
 /** Boot recovery gets two retries after its first pre-prompt acquisition.
  * Exhaustion is quarantined visibly rather than spinning until another boot. */
-export const BOOT_RECOVERY_ATTEMPTS = 3;
+export const BOOT_RECOVERY_ATTEMPTS = DEFAULT_BOOT_RECOVERY_BACKOFF_MS.length + 1;
 // SessionRouter deliberately cools a failed runtime for 30s. Shorter retry
 // delays would only hit that guard and consume the bounded attempt budget.
-export const BOOT_RECOVERY_BACKOFF_MS = [30_000, 30_000] as const;
+export const BOOT_RECOVERY_BACKOFF_MS = DEFAULT_BOOT_RECOVERY_BACKOFF_MS;
 
 /** Clamp on the originating prompt copied into a done-file (#174). */
 export const DONE_ORIGIN_PROMPT_MAX = 4000;
@@ -894,21 +896,29 @@ export class DispatchWatcher {
     spec: DispatchSpec,
     owner: ClaimOwnership,
   ): Promise<{ output: string; stopReason: string }> {
-    for (let attempt = 1; attempt <= BOOT_RECOVERY_ATTEMPTS; attempt++) {
+    let budget: number | undefined;
+    let started: number | undefined;
+    for (let attempt = 1; ; attempt++) {
       try {
         return await this.onDispatch(spec);
       } catch (err) {
         if (!(err instanceof DispatchSuspendedError) || err.suspension !== "retryable") throw err;
-        if (attempt === BOOT_RECOVERY_ATTEMPTS) {
+        const schedule = bootRecoveryBackoff(err);
+        budget ??= schedule.length;
+        started ??= Date.now();
+        let backoffMs = schedule[attempt - 1];
+        const provider = providerRetryBackoff(bootErrorClassification(err)?.errorKind ?? "unclassified");
+        const remaining = PROVIDER_RETRY_WINDOW_MS - (Date.now() - started);
+        if (attempt > budget || backoffMs === undefined || provider && remaining <= 0) {
           // #421: refuse only this exhausted continuation. Other targets keep
           // running, and this one becomes a named `/seam workflows` quarantine
           // instead of spinning forever or silently waiting for another boot.
           throw DispatchSuspendedError.defect(
             spec.id,
-            `boot recovery exhausted ${BOOT_RECOVERY_ATTEMPTS} pre-prompt acquisition attempts: ${err.reason}`,
+            `boot recovery exhausted ${attempt} pre-prompt acquisition attempts: ${err.reason}`,
           );
         }
-        const backoffMs = BOOT_RECOVERY_BACKOFF_MS[attempt - 1]!;
+        if (provider) backoffMs = Math.min(backoffMs, remaining - 1);
         this.logger.warn(
           { id: spec.id, target: spec.target, attempt, backoffMs, reason: err.reason },
           "dispatch: transient boot recovery acquisition failed; retrying recorded session",
@@ -920,9 +930,10 @@ export class DispatchWatcher {
             "shutdown interrupted boot-recovery backoff; the next boot owns the dispatch",
           );
         }
+        if (provider && Date.now() - started >= PROVIDER_RETRY_WINDOW_MS) throw DispatchSuspendedError.defect(spec.id,
+          `boot recovery exhausted ${attempt} pre-prompt acquisition attempts: ${err.reason}`);
       }
     }
-    throw new Error("unreachable boot recovery retry state");
   }
 
   private async runSpec(id: string, spec: DispatchSpec, owner: ClaimOwnership): Promise<void> {

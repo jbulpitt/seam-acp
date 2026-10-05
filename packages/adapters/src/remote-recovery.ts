@@ -1,4 +1,5 @@
 import { ADAPTER_ERROR_KINDS, type AdapterErrorKind } from "./error-classification.js";
+import { PROVIDER_RETRY_WINDOW_MS } from "./provider-retry.js";
 
 /**
  * Versioned policy Seam supplies before a remote slot accepts stdin (#467).
@@ -135,9 +136,14 @@ export function remoteRung1KindBackoff(
   const schedule: unknown = (byKind as Record<string, unknown>)[kind];
   return Array.isArray(schedule)
     && schedule.length <= 10
-    && schedule.every((delay) => Number.isSafeInteger(delay) && delay >= 0 && delay <= 60_000)
+    && schedule.every((delay) => Number.isSafeInteger(delay) && delay >= 0 && delay <= PROVIDER_RETRY_WINDOW_MS)
+    && schedule.reduce((total, delay) => total + delay, 0) <= PROVIDER_RETRY_WINDOW_MS
     ? schedule as number[]
     : undefined;
+}
+
+export function remoteRung1Budget(policy: RemoteRung1Policy): number {
+  return Math.max(policy.retryCount, ...policy.retryableErrorKinds.map(kind => remoteRung1KindBackoff(policy, kind)?.length ?? 0));
 }
 
 export function isRemoteRecoverySnapshot(value: unknown): value is RemoteRecoverySnapshot {

@@ -33,7 +33,9 @@ describe("#441 real runtime boundary to pure resolver (no providers)", () => {
     expect(resolveError(readErrorClassification(thrown)!, DEFAULT_ERROR_RULES))
       .toMatchObject({ errorKind: "rate_limit", transience: "transient", startRung: 1 });
     expect(logger.warn).toHaveBeenCalledWith(
-      { agentId: "claude", errorKind: "rate_limit", operation: "session/prompt" }, "adapter error classified");
+      expect.objectContaining({ agentId: "claude", errorKind: "rate_limit", operation: "session/prompt",
+        errorMessage: original.message, errorCode: -32603, errorStatus: null, errorData: { trace: "retained" } }),
+      "adapter error classified");
     expect(prompt).toHaveBeenCalledTimes(1); // #426 ephemeral work does not retry.
   });
 
@@ -48,17 +50,35 @@ describe("#441 real runtime boundary to pure resolver (no providers)", () => {
     expect(resolveError(readErrorClassification(thrown)!, DEFAULT_ERROR_RULES))
       .toMatchObject({ ruleId: null, startRung: 1, action: "recover", surface: true });
     expect(logger.warn).toHaveBeenCalledWith(
-      { agentId: "fixture", errorKind: "unclassified", operation: "session/prompt" }, "adapter error classified");
+      expect.objectContaining({ agentId: "fixture", errorKind: "unclassified", operation: "session/prompt",
+        errorMessage: original.message, errorCode: null, errorStatus: null }), "adapter error classified");
+  });
+
+  it.each([
+    { status: 529, code: "overloaded_error", message: "Overloaded" },
+    { httpStatus: 400, code: "unknown_provider_code", message: "provider rejected request" },
+  ])("logs the original provider payload before classification replaces its data", async (data) => {
+    const original = new RequestError(-32603, "Internal error", data);
+    const { runtime, logger } = fixture(original, () => { throw new Error("classifier bug"); }, "fixture");
+    await expect(runtime.prompt("fixture")).rejects.toBe(original);
+    expect(logger.warn).toHaveBeenCalledWith(expect.objectContaining({
+      agentId: "fixture", errorKind: "unclassified", errorMessage: "Internal error", errorCode: -32603,
+      errorStatus: "status" in data ? data.status : data.httpStatus, errorData: data,
+    }), "adapter error classified");
+    expect(data).not.toHaveProperty("errorKind");
   });
 
   it.each(["primitive", "frozen", "readonly-data"] as const)("preserves %s failures instead of throwing a classification assignment error", async (shape) => {
     const original = shape === "primitive" ? "provider failure" : shape === "frozen" ? Object.freeze(new Error("provider failure"))
       : Object.defineProperty(new Error("provider failure"), "data", { value: { trace: 1 }, writable: false, enumerable: true });
-    const { runtime } = fixture(original);
+    const { runtime, logger } = fixture(original);
     const thrown = await runtime.prompt("fixture").catch((error: unknown) => error);
     expect(thrown).toBeInstanceOf(Error);
     expect((thrown as Error).message).toBe("provider failure");
     expect(readErrorClassification(thrown)).toMatchObject({ errorKind: "unclassified", agentId: "claude" });
+    expect(logger.warn).toHaveBeenCalledWith(expect.objectContaining({
+      errorMessage: "provider failure", errorCode: null, errorStatus: null,
+    }), "adapter error classified");
   });
 
   it.each(["start", "session/new", "session/load"] as const)("classifies %s failures as well as prompts", async (operation) => {
@@ -70,7 +90,8 @@ describe("#441 real runtime boundary to pure resolver (no providers)", () => {
       ? runtime.newSession({ cwd: "/fixture" }) : runtime.loadSession({ sessionId: "fixture-session", cwd: "/fixture" });
     await expect(call).rejects.toBe(original);
     expect(readErrorClassification(original)).toMatchObject({ errorKind: "auth_expired", agentId: "claude" });
-    expect(logger.warn).toHaveBeenCalledWith({ agentId: "claude", errorKind: "auth_expired", operation }, "adapter error classified");
+    expect(logger.warn).toHaveBeenCalledWith(expect.objectContaining({ agentId: "claude", errorKind: "auth_expired", operation,
+      errorMessage: original.message, errorCode: -32603, errorData: { errorKind: "authentication_failed" } }), "adapter error classified");
   });
 
   it("parks a prompt when the refresh token is dead and does not park when it is still valid or unreadable", async () => {

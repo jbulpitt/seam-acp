@@ -30,6 +30,7 @@ import {
   classifyWith,
   classified,
   isAdapterErrorKind,
+  httpStatusOf,
   type AdapterErrorClassification,
   type AdapterErrorKind,
   type ClassifyContext,
@@ -97,6 +98,7 @@ function matchClaudeError(ctx: ClassifyContext): AdapterErrorClassification | Ad
   }
 
   const acpKind = typeof data?.errorKind === "string" ? data.errorKind : null;
+  if (httpStatusOf(ctx) === 529) return classified(agentId, "overloaded", { details: message, sourceKind: acpKind ?? "529" });
   if (acpKind && CLAUDE_ACP_KIND[acpKind]) {
     const mapped = CLAUDE_ACP_KIND[acpKind]!;
     return classified(agentId, mapped, { details: message, sourceKind: acpKind });

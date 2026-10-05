@@ -5,7 +5,7 @@ import type {
   RemoteRecoverySnapshot,
   RemoteRung1Policy,
 } from "@seam/adapters";
-import { isRemoteRung1Policy } from "@seam/adapters";
+import { isRemoteRung1Policy, classifyCodexError, providerRetryBackoff, PROVIDER_RETRY_WINDOW_MS } from "@seam/adapters";
 import { createRung1Recovery } from "../packages/bridge/src/rung1-recovery.js";
 import { DEFAULT_REMOTE_RUNG1_POLICY } from "../packages/core/src/core/remote-spawn.js";
 
@@ -20,20 +20,23 @@ function line(value: unknown): string {
   return `${JSON.stringify(value)}\n`;
 }
 
-function harness(opts: { connected?: boolean; kind?: AdapterErrorKind; policy?: RemoteRung1Policy } = {}) {
+function harness(opts: { connected?: boolean; kind?: AdapterErrorKind; policy?: RemoteRung1Policy; codex?: boolean; clock?: () => number } = {}) {
   const writes: string[] = [];
   const snapshots: RemoteRecoverySnapshot[] = [];
   const results: RemoteRecoveryResult[] = [];
+  const output: string[] = [];
   const recovery = createRung1Recovery({
     policyFor: () => opts.policy ?? policy,
-    classify: () => opts.kind ?? "timeout",
+    agentId: opts.codex ? "codex" : undefined,
+    classify: (_slot, error) => opts.codex ? classifyCodexError(error).errorKind : opts.kind ?? "timeout",
     write: (_slot, value) => { writes.push(value); return true; },
     publishSnapshot: (_slot, value) => snapshots.push(value),
     publishResult: (_slot, value) => results.push(value),
+    publishOutput: (_slot, value) => output.push(value),
     controllerConnected: () => opts.connected ?? false,
-    now: () => Date.parse("2026-09-22T12:00:00.000Z"),
+    now: opts.clock ?? (() => Date.parse("2026-09-22T12:00:00.000Z")),
   });
-  return { recovery, writes, snapshots, results };
+  return { recovery, writes, snapshots, results, output };
 }
 
 afterEach(() => {
@@ -42,6 +45,122 @@ afterEach(() => {
 });
 
 describe("#467 bridge-owned rung 1", () => {
+  const rollout = JSON.stringify({ type: "error", error: { message: "model 'gpt-6.1-sol' is not enabled in rustponsesapi",
+    type: "invalid_request_error", param: null, code: null }, status: 400 });
+  function typedFailure(id: string | number, title = rollout) {
+    return line({ jsonrpc: "2.0", id, result: { stopReason: "end_turn", _meta: { jetbrains: { air: { version: 1,
+      sessionFailure: { id: "turn:error", revision: 1, category: "service", severity: "error", title, actions: ["retry"] },
+    } } } } });
+  }
+  function sendCodex(h: ReturnType<typeof harness>) {
+    h.recovery.arm(4, { submissionId: "provider-submission", acpSessionId: "provider-session", continuation: "continue" });
+    h.recovery.observeInput(4, line({ jsonrpc: "2.0", id: 17, method: "session/prompt", params: {
+      sessionId: "provider-session", prompt: [{ type: "text", text: "real brief" }],
+    } }));
+  }
+
+  it("retries a typed end_turn failure through the real adapter classifier, keeping its session", async () => {
+    vi.useFakeTimers();
+    const h = harness({ codex: true, policy: DEFAULT_REMOTE_RUNG1_POLICY });
+    sendCodex(h);
+    expect(h.recovery.observeOutput(4, typedFailure(17))).toEqual({ forward: null });
+    expect(h.results).toEqual([]);
+    await vi.advanceTimersByTimeAsync(10_000);
+    const retry = JSON.parse(h.writes[0]!);
+    expect(retry.params).toEqual({ sessionId: "provider-session", prompt: [{ type: "text", text: "continue" }] });
+    expect(h.recovery.observeOutput(4, line({ method: "session/update", params: { sessionId: "provider-session",
+      update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "answer" } } } })).forward).toContain("answer");
+    expect(JSON.parse(h.recovery.observeOutput(4, line({ id: retry.id, result: { stopReason: "end_turn" } })).forward!)).toMatchObject({ id: 17 });
+    expect(h.results).toEqual([expect.objectContaining({ status: "completed", text: "answer" })]);
+    expect(h.results[0]).not.toHaveProperty("error");
+  });
+
+  it("retains the raw provider cause and fails after the bounded overload schedule", async () => {
+    vi.useFakeTimers();
+    const h = harness({ codex: true, policy: DEFAULT_REMOTE_RUNG1_POLICY, clock: Date.now });
+    sendCodex(h);
+    let id: string | number = 17;
+    for (const delay of providerRetryBackoff("overloaded")!) {
+      expect(h.recovery.observeOutput(4, typedFailure(id))).toEqual({ forward: null });
+      await vi.advanceTimersByTimeAsync(delay);
+      id = JSON.parse(h.writes.at(-1)!).id;
+    }
+    const forwarded = JSON.parse(h.recovery.observeOutput(4, typedFailure(id)).forward!);
+    expect(forwarded).toMatchObject({ id: 17, error: { message: rollout, data: { status: 400 } } });
+    expect(h.results).toEqual([expect.objectContaining({ status: "failed", error: rollout, errorKind: "overloaded", text: "" })]);
+    expect(h.recovery.terminalResult(4)).toEqual(h.results[0]);
+    expect(h.recovery.snapshot(4)).toMatchObject({ phase: "exhausted", retry: 5, budget: 5, remaining: 0 });
+    await vi.advanceTimersByTimeAsync(PROVIDER_RETRY_WINDOW_MS);
+    expect(h.writes).toHaveLength(5);
+  });
+
+  it("counts time spent failing, not just sleeps, against the provider horizon", async () => {
+    vi.useFakeTimers();
+    const h = harness({ codex: true, policy: DEFAULT_REMOTE_RUNG1_POLICY, clock: Date.now });
+    sendCodex(h);
+    h.recovery.observeOutput(4, typedFailure(17));
+    await vi.advanceTimersByTimeAsync(PROVIDER_RETRY_WINDOW_MS);
+    const id = JSON.parse(h.writes[0]!).id;
+    expect(JSON.parse(h.recovery.observeOutput(4, typedFailure(id)).forward!).error.message).toBe(rollout);
+    expect(h.results[0]).toMatchObject({ status: "failed", error: rollout });
+    expect(h.writes).toHaveLength(1);
+  });
+
+  it("does not send a paid retry if a backoff callback runs after its horizon", async () => {
+    vi.useFakeTimers();
+    let time = 0;
+    const h = harness({ codex: true, policy: DEFAULT_REMOTE_RUNG1_POLICY, clock: () => time });
+    sendCodex(h);
+    h.recovery.observeOutput(4, typedFailure(17));
+    time = PROVIDER_RETRY_WINDOW_MS;
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(h.writes).toEqual([]);
+    expect(h.results[0]).toMatchObject({ status: "failed", error: rollout });
+    expect(JSON.parse(h.output.at(-1)!)).toMatchObject({ id: 17, error: { message: rollout } });
+  });
+
+  it("consumes a split legacy failure without posting it as the answer", async () => {
+    vi.useFakeTimers();
+    const h = harness({ codex: true, policy: DEFAULT_REMOTE_RUNG1_POLICY });
+    sendCodex(h);
+    for (const text of ["Selected model is at ", "capacity. Please try a different model."]) {
+      expect(h.recovery.observeOutput(4, line({ method: "session/update", params: { sessionId: "provider-session",
+        update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text } } } }))).toEqual({ forward: null });
+    }
+    expect(h.recovery.observeOutput(4, line({ id: 17, result: { stopReason: "end_turn" } }))).toEqual({ forward: null });
+    expect(h.results).toEqual([]);
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(h.writes).toHaveLength(1);
+  });
+
+  it.each(["initialize-before-arm", "initialize-during-resume"])("does not inspect replies with negotiated AIR support: %s", order => {
+    const h = harness({ codex: true, policy: DEFAULT_REMOTE_RUNG1_POLICY });
+    const initialize = () => h.recovery.observeOutput(4, line({ id: "initialize", result: { protocolVersion: 1,
+      _meta: { jetbrains: { air: { version: 1, capabilities: ["sessionFailure"] } } } } }));
+    if (order === "initialize-before-arm") initialize();
+    sendCodex(h);
+    if (order === "initialize-during-resume") initialize();
+    const text = "Selected model is at capacity. Please try a different model.";
+    expect(h.recovery.observeOutput(4, line({ method: "session/update", params: { sessionId: "provider-session",
+      update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text } } } })).forward).toContain(text);
+    h.recovery.observeOutput(4, line({ id: 17, result: { stopReason: "end_turn" } }));
+    expect(h.results[0]).toMatchObject({ status: "completed", text });
+    expect(h.writes).toEqual([]);
+  });
+
+  it.each([
+    ["quota_exhausted", "limit", [], "You've hit your usage limit"],
+    ["auth_required", "access", ["login"], "provider authentication expired"],
+  ] as const)("does not retry typed %s", (kind, category, actions, title) => {
+    const h = harness({ codex: true, policy: DEFAULT_REMOTE_RUNG1_POLICY });
+    sendCodex(h);
+    h.recovery.observeOutput(4, line({ id: 17, result: { stopReason: "end_turn", _meta: { jetbrains: { air: {
+      version: 1, sessionFailure: { id: "failure", category, severity: "error", title, actions },
+    } } } } }));
+    expect(h.results[0]).toMatchObject({ status: "failed", errorKind: kind, error: title });
+    expect(h.writes).toEqual([]);
+  });
+
   it("settles a rebound arm that never received a prompt with its actual cause", () => {
     const h = harness();
     const input = { submissionId: "submission-missing", acpSessionId: "session-missing", continuation: "continue" };
@@ -234,9 +353,9 @@ describe("#626 auth_contention waits out Claude's stale refresh lock", () => {
     expect(h.recovery.snapshot(5)).toMatchObject({ phase: "exhausted", errorKind: "auth_contention", retry: 1 });
   });
 
-  it("leaves every other kind on the existing 2s/5s/10s schedule", async () => {
+  it("leaves unrelated kinds on the existing 2s/5s/10s schedule", async () => {
     vi.useFakeTimers();
-    const h = harness({ kind: "server_error", policy: DEFAULT_REMOTE_RUNG1_POLICY });
+    const h = harness({ kind: "protocol_error", policy: DEFAULT_REMOTE_RUNG1_POLICY });
     armAndSend(h, 6);
     expect(failPrompt(h, 6, 17)).toEqual({ forward: null });
     await vi.advanceTimersByTimeAsync(2_000);
@@ -255,7 +374,7 @@ describe("#626 auth_contention waits out Claude's stale refresh lock", () => {
     vi.useFakeTimers();
     const h = harness({ kind: "auth_contention", policy: {
       ...DEFAULT_REMOTE_RUNG1_POLICY,
-      backoffMsByKind: { auth_contention: [120_000] },
+      backoffMsByKind: { auth_contention: [PROVIDER_RETRY_WINDOW_MS + 1] },
     } });
     armAndSend(h, 7);
     expect(failPrompt(h, 7, 17)).toEqual({ forward: null });

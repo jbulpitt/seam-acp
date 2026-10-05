@@ -173,6 +173,7 @@ describe("ACP v1 elicitation validation and capability", () => {
       fs: { readTextFile: false, writeTextFile: false },
       elicitation: { form: {}, url: {} },
       session: { notices: {} },
+      _meta: { jetbrains: { air: { version: 1, capabilities: ["sessionFailure"] } } },
     });
   });
 

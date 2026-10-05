@@ -30,6 +30,7 @@ import {
   type AdapterErrorKind,
   type ClassifyContext,
 } from "../error-classification.js";
+import { providerResponse } from "../session-failure.js";
 
 /**
  * Codex ACP collapses provider reasons to `Internal error` with `data: null`.
@@ -43,6 +44,18 @@ export function classifyCodexError(error: unknown, agentId = "codex"): AdapterEr
 
 function matchCodexError(ctx: ClassifyContext): AdapterErrorClassification | AdapterErrorKind | null {
   const { haystack, agentId, message, data } = ctx;
+  const response = data?.providerResponse ?? providerResponse(message) ?? (data?.type === "error" ? data : undefined);
+  const provider = response && typeof response === "object"
+    ? (response as { error?: { type?: unknown; message?: unknown; code?: unknown }; status?: unknown }) : undefined;
+  if (provider?.error?.code === "model_not_found") return classified(agentId, "model_not_found", { details: message });
+  if (provider?.status === 400 && provider.error?.type === "invalid_request_error"
+    && typeof provider.error.message === "string"
+    && /^model '[^']+' is not enabled in [a-z][a-z0-9_.-]*$/i.test(provider.error.message)) {
+    return classified(agentId, "overloaded", { details: message, sourceKind: "invalid_request_error" });
+  }
+  if (message.trim() === "Selected model is at capacity. Please try a different model.") {
+    return classified(agentId, "overloaded", { details: message });
+  }
   if (/\byou've hit your usage limit\b/.test(haystack) ||
       /\bpurchase more credits or try again at\b/.test(haystack) ||
       /\binsufficient_quota\b/.test(haystack)) {

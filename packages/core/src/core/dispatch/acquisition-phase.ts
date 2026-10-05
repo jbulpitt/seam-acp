@@ -1,5 +1,22 @@
-import { readErrorClassification } from "@seam/adapters";
 import { DispatchSuspendedError } from "./attempt-store.js";
+import { providerRetryBackoff, readErrorClassification, type AdapterErrorClassification } from "@seam/adapters";
+
+export function bootErrorClassification(err: unknown): AdapterErrorClassification | undefined {
+  const seen = new Set<unknown>();
+  for (let current = err; current && typeof current === "object" && !seen.has(current); current = (current as { cause?: unknown }).cause) {
+    seen.add(current);
+    const classification = readErrorClassification(current);
+    if (classification) return classification;
+  }
+  return undefined;
+}
+
+export function bootRecoveryBackoff(err: unknown): readonly number[] {
+  const provider = providerRetryBackoff(bootErrorClassification(err)?.errorKind ?? "unclassified");
+  return provider ? provider.map(delay => Math.max(30_000, delay)) : DEFAULT_BOOT_RECOVERY_BACKOFF_MS;
+}
+
+export const DEFAULT_BOOT_RECOVERY_BACKOFF_MS = [30_000, 30_000] as const;
 
 /** Outcome of the sole start/load owner, not another retryable transport error.
  * Keep the cause for inspection without letting an outer watcher replenish the
@@ -26,7 +43,9 @@ export function isRetryableBootAcquisitionError(err: unknown): boolean {
     // #448: a timeout/transport cause may remain inside an exhausted outcome.
     // Refuse a second budget, not a later explicit recovery or another target.
     if ((current as { acquisitionRecoveryExhausted?: unknown }).acquisitionRecoveryExhausted === true) return false;
-    if (readErrorClassification(current)?.errorKind === "session_gone") return false;
+    const classification = readErrorClassification(current);
+    if (classification && ["quota_exhausted", "auth_required", "auth_expired", "model_not_found",
+      "invalid_request", "permission_denied", "context_length", "capability_absent", "cancelled", "session_gone"].includes(classification.errorKind)) return false;
     const typed = current as { code?: unknown; name?: unknown; message?: unknown; cause?: unknown };
     if (typed.code === "session_load_timeout" || typed.name === "SessionLoadTimeoutError") return true;
     // #427: recognise the transport's own verdict structurally rather than by
@@ -84,7 +103,7 @@ export class DispatchAcquisitionPhase {
       // they cannot start a second budget here (#448). A real shutdown arrives
       // through DispatchSuspendedError above and is left for the next boot.
       throw this.phase === "boot-recovery" && isRetryableBootAcquisitionError(err)
-        ? DispatchSuspendedError.retryable(this.dispatchId, reason)
+        ? DispatchSuspendedError.retryable(this.dispatchId, reason, err)
         : DispatchSuspendedError.defect(this.dispatchId, reason);
     } finally {
       this.pending.delete(cancel);

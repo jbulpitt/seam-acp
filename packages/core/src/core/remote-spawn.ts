@@ -12,6 +12,7 @@ import type { ChildProcessByStdio } from "node:child_process";
 import type { Readable, Writable } from "node:stream";
 import type { McpServer } from "@agentclientprotocol/sdk";
 import type { RemoteRung1Policy } from "@seam/adapters";
+import { providerRetryBackoff } from "@seam/adapters";
 import { buildSeamMcpServerEntry } from "./mcp/seam-mcp-server.js";
 import { resolveReachableMcpUrl } from "./mcp-url.js";
 import type { SeamTokenRegistry } from "./mcp/token-registry.js";
@@ -49,7 +50,8 @@ export const DEFAULT_REMOTE_RUNG1_POLICY: RemoteRung1Policy = Object.freeze<Remo
   // four times in 46s and was dropped. One retry at 60s lands past it. The
   // delay stays within the v1 validator's 60s cap, and old bridges ignore
   // this field and keep `backoffMs`.
-  backoffMsByKind: { auth_contention: [60_000] },
+  backoffMsByKind: { auth_contention: [60_000],
+    overloaded: [...providerRetryBackoff("overloaded")!], server_error: [...providerRetryBackoff("server_error")!] },
 });
 
 export type MuxSpawnedProcess = ChildProcessByStdio<Writable, Readable, Readable> & {

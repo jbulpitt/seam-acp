@@ -609,7 +609,7 @@ describe("#250 production dispatch lifecycle (synthetic transport, no providers)
     );
   });
 
-  it("settles a dead remote recovery with its cause before the next queued wake runs", async () => {
+  it.each(["missing", "dead"])("continues a %s remote wake in its saved session and runs the next queued wake", async fault => {
     const h = setup();
     simulateRetiredOwnerProcess();
     h.store.turnAttempts.registerOwner("controller-before-restart");
@@ -637,7 +637,7 @@ describe("#250 production dispatch lifecycle (synthetic transport, no providers)
     h.store.turnAttempts.suspendBoot("controller-before-restart");
 
     const mux = {
-      sendCmd: vi.fn(async () => ({ health: [{
+      sendCmd: vi.fn(async () => ({ health: fault === "missing" ? [] : [{
         slot: 19,
         alive: false,
         recovery: {
@@ -657,7 +657,10 @@ describe("#250 production dispatch lifecycle (synthetic transport, no providers)
       adopt: vi.fn(),
     };
     h.runtime.prompt.mockImplementationOnce(async (text) => {
-      expect(h.store.turnAttempts.get("dead-wake")?.state).toBe("completed");
+      expect(String(text)).toMatch(/^continue\n/);
+      expect(String(text)).not.toContain("original work");
+      return { stopReason: "end_turn" };
+    }).mockImplementationOnce(async (text) => {
       expect(String(text)).toContain("queued wake");
       return { stopReason: "end_turn" };
     });
@@ -692,16 +695,13 @@ describe("#250 production dispatch lifecycle (synthetic transport, no providers)
 
     expect(mux.adopt).not.toHaveBeenCalled();
     expect(h.store.turnAttempts.get("dead-wake")).toMatchObject({
-      state: "completed",
-      outcome: {
-        status: "failed",
-        error: "bridge slot 19 on remote-one has no attached live process",
-      },
+      state: "completed", generation: 2, acpSessionId: "recorded-acp",
+      outcome: { status: "completed" },
     });
     expect(h.store.turnAttempts.get("wake-after-dead")?.state).toBe("completed");
-    expect(resume).not.toHaveBeenCalled();
-    expect(h.runtime.prompt).toHaveBeenCalledTimes(1);
-    expect(String(h.runtime.prompt.mock.calls[0]?.[0])).toContain("queued wake");
+    expect(resume).toHaveBeenCalledTimes(1);
+    expect(h.runtime.prompt).toHaveBeenCalledTimes(2);
+    expect(h.router.getOrStartRuntime.mock.calls[0]?.[1]).toEqual({ resumeSessionId: "recorded-acp" });
   }, 15_000);
 
   it("runs a queued report-back after a human interrupts the active dispatch", async () => {

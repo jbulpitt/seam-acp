@@ -96,6 +96,7 @@ function makeStore(record: SessionRecord): SessionStore {
     needsAgyIdentityRebuild: () => false,
     lookupAgentChannelRestriction: () => ({ state: "absent" as const }),
     readConfig: (input: SessionRecord) => JSON.parse(input.configJson) as SessionConfigState,
+    turnAttempts: { list: () => [] },
   } as unknown as SessionStore;
 }
 

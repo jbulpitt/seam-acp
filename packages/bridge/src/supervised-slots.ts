@@ -164,7 +164,7 @@ export class SupervisedSlots {
       this.bindings.set(health.slot, {
         mode: "idle",
         buffered: new Map(),
-        ...(!health.alive || !health.attached ? { dead: true } : {}),
+        ...(!health.alive ? { dead: true } : {}),
       });
       // Idle subscription: rebuilds stderr and recovery records from the
       // retained log and keeps them current, without forwarding anything.
@@ -206,6 +206,11 @@ export class SupervisedSlots {
 
   async listSlots(): Promise<SessiondListSlotsResult> {
     const listed = await this.options.client.listSlots();
+    // A holder may have reattached since rebind's recovery query.
+    await Promise.all(listed.health.filter(entry => entry.alive && entry.attached && !this.recoveries.has(entry.slot))
+      .map(entry => this.writeControl(entry.slot, {
+        v: ADAPTER_CHILD_PROTOCOL_VERSION, type: "report_recovery",
+      })));
     return {
       ...listed,
       health: listed.health.map((entry) => ({
@@ -321,9 +326,10 @@ export class SupervisedSlots {
     Promise<{ state: "owned" } | { state: "missing"; cause: string; retainChild?: true }> {
     return this.serial(slot, async () => {
       const health = (await this.options.client.listSlots()).health.find(row => row.slot === slot);
-      if (!health || !health.alive || !health.attached) {
-        return { state: "missing", cause: `bridge slot ${slot} has no attached live process` };
+      if (!health || !health.alive) {
+        return { state: "missing", cause: `bridge slot ${slot} has no live process` };
       }
+      if (!health.attached) return { state: "owned" };
       const snapshot = this.recoveries.get(slot);
       if (!snapshot?.reconcileSupported) {
         // Retained pre-rollout children already acknowledge an arm with no input.

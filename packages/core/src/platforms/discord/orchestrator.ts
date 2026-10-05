@@ -2601,6 +2601,7 @@ export class Orchestrator {
     }
 
     const turn = this.queueOnChannel(channelId, async (fence) => {
+      if (this.restartCutoff) return;
       if (
         admissionId &&
         !this.store.claimInbound(admissionId, fence.epoch, new Date().toISOString())
@@ -2850,6 +2851,7 @@ export class Orchestrator {
     const msg = this.inboundMessage(row);
     return this.queueOnChannel(row.channelRef, async (fence) => {
       if (row.preemptive && (this.channelGenerations.get(row.channelRef) ?? 0) > myGen) return;
+      if (this.restartCutoff) return;
       if (!this.store.claimInbound(row.messageId, fence.epoch, new Date().toISOString())) return;
       try {
         const current = this.store.get(row.sessionRecordId);
@@ -3571,6 +3573,10 @@ export class Orchestrator {
       throw DispatchSuspendedError.defect(priorHuman.id, priorHuman.stalledReason);
     }
     if (admission || scheduledAttempt) {
+      if (this.restartCutoff) {
+        throw DispatchSuspendedError.shutdown(scheduledAttempt?.id ?? inboundAttemptId(admission!.messageId),
+          "restart cutoff reached before the prompt was submitted");
+      }
       if (priorHuman?.state === "completed" || priorHuman?.state === "cancelled") {
         await this.renderPersistedTerminalAttemptCard(priorHuman);
         return;
@@ -3610,11 +3616,6 @@ export class Orchestrator {
         prompt: admission.text, session: "live", kind: "parked",
         createdUtc: admission.createdUtc,
         }, identity, this.attemptBoot, "inbound");
-      }
-      if (this.restartCutoff) {
-        this.store.turnAttempts.suspendBoot(this.attemptBoot);
-        throw DispatchSuspendedError.shutdown(humanAttempt!.id,
-          "restart cutoff reached before the prompt was submitted");
       }
       // Never restage old attachments, re-transcribe voice or rebuild the
       // original brief while resuming a submitted human turn. The model gets
@@ -14893,7 +14894,7 @@ export class Orchestrator {
           await this.adoptRemoteRecoveryOwned(current);
           const next = this.store.turnAttempts.get(attempt.id);
           if (next?.state !== "suspended" || !next.remoteRecovery || this.restartCutoff) return;
-          await new Promise<void>(resolve => this.deferRemoteRecoveryAdoption(current, resolve));
+          await new Promise<void>(resolve => this.deferRemoteRecoveryAdoption(next, resolve));
         }
       }).catch((err) => {
         this.logger.warn({ err, attempt: attempt.id }, "remote recovery queue ownership failed");
@@ -14930,13 +14931,16 @@ export class Orchestrator {
     let snapshot;
     try {
       const reply = await mux.sendCmd("listSlots", {}) as { health?: Array<{
-        slot?: unknown; alive?: unknown; recovery?: unknown; outputAckedThrough?: number;
+        slot?: unknown; alive?: unknown; attached?: unknown; recovery?: unknown; outputAckedThrough?: number;
       }> };
-      snapshot = reply.health?.find(row => row.slot === binding.slot && row.alive === true
+      snapshot = reply.health?.find(row => row.slot === binding.slot
         && isRemoteRecoverySnapshot(row.recovery)
         && row.recovery.submissionId === binding.submissionId
-        && row.recovery.acpSessionId === binding.acpSessionId) as {
+        && row.recovery.acpSessionId === binding.acpSessionId
+        && (row.alive === true || row.recovery.phase === "succeeded" || row.recovery.phase === "exhausted")) as {
           recovery: import("@seam/adapters").RemoteRecoverySnapshot;
+          alive?: boolean;
+          attached?: boolean;
           outputAckedThrough?: number;
         } | undefined;
     } catch (err) {
@@ -14947,7 +14951,12 @@ export class Orchestrator {
     }
     if (!snapshot) {
       await this.reconcileRemoteRecoveries();
-      if (this.store.turnAttempts.get(attempt.id)?.state === "suspended") this.deferRemoteRecoveryAdoption(attempt);
+      const retained = this.store.turnAttempts.get(attempt.id);
+      if (retained?.state === "suspended" && retained.remoteRecovery) this.deferRemoteRecoveryAdoption(retained);
+      return true;
+    }
+    if (snapshot.alive === true && snapshot.attached === false) {
+      this.deferRemoteRecoveryAdoption(attempt);
       return true;
     }
 
@@ -15198,25 +15207,36 @@ export class Orchestrator {
           const binding = attempt.remoteRecovery!;
           const row = reply.health.find(row => row.slot === binding.slot);
           const snapshot = isRemoteRecoverySnapshot(row?.recovery) ? row.recovery : undefined;
-          let cause: string | undefined;
-          let retainChild = false;
-          if (!row) cause = `bridge slot ${binding.slot} on ${location} no longer exists`;
-          else if (row.alive === false || row.attached === false) {
-            cause = `bridge slot ${binding.slot} on ${location} has no attached live process${row.orphanReason ? ` (${row.orphanReason})` : ""}`;
-          } else if (snapshot && (snapshot.submissionId !== binding.submissionId || snapshot.acpSessionId !== binding.acpSessionId)) {
-            cause = `bridge slot ${binding.slot} on ${location} no longer owns the recorded submission`;
-          } else if (snapshot?.phase === "armed"
+          const terminal = snapshot && snapshot.submissionId === binding.submissionId
+            && snapshot.acpSessionId === binding.acpSessionId
+            && (snapshot.phase === "succeeded" || snapshot.phase === "exhausted");
+          if ((!row || row.alive === false) && !terminal) {
+            this.continueLostRemoteTurn(current, !row
+              ? `bridge slot ${binding.slot} on ${location} no longer exists`
+              : `bridge slot ${binding.slot} on ${location} has no live process${row.orphanReason ? ` (${row.orphanReason})` : ""}`);
+            continue;
+          }
+          if (row?.alive === true && row.attached === false) {
+            this.deferRemoteRecoveryAdoption(current);
+            continue;
+          }
+          if (snapshot && (snapshot.submissionId !== binding.submissionId || snapshot.acpSessionId !== binding.acpSessionId)) {
+            await this.settleMissingRemoteRecovery(current,
+              `bridge slot ${binding.slot} on ${location} no longer owns the recorded submission`);
+            continue;
+          }
+          if (snapshot?.phase === "armed"
             && this.remoteAdoptionFinishers.has(attempt.id)) {
             const result = await mux.sendCmd("reconcileRung1Recovery", {
               slot: binding.slot, submissionId: binding.submissionId, acpSessionId: binding.acpSessionId,
             }) as { state?: string; cause?: unknown; retainChild?: boolean };
             if (result.state === "missing" && typeof result.cause === "string") {
-              cause = result.cause;
-              retainChild = result.retainChild === true;
+              if (result.retainChild === true) await this.settleMissingRemoteRecovery(current, result.cause, true);
+              else this.continueLostRemoteTurn(current, result.cause);
+              continue;
             }
           }
-          if (cause) await this.settleMissingRemoteRecovery(attempt, cause, retainChild);
-          else if (snapshot && this.adoptingRemoteResults.has(attempt.id) && this.remoteAdoptionWaiters.has(attempt.id)) {
+          if (snapshot && this.adoptingRemoteResults.has(attempt.id) && this.remoteAdoptionWaiters.has(attempt.id)) {
             this.remoteAdoptionWaiters.get(attempt.id)?.();
           } else if (snapshot && !this.adoptingRemoteResults.has(attempt.id) && !this.remoteAdoptionFinishers.has(attempt.id)) {
             void this.adoptRemoteRecovery(current).catch(err =>
@@ -15351,8 +15371,11 @@ export class Orchestrator {
    */
   private continueLostRemoteTurn(attempt: TurnAttempt, cause: string): void {
     const binding = attempt.remoteRecovery;
+    if (isAwaitingReauth(attempt.stalledReason)) return;
     // The SQL release is the single gate: exactly one caller gets past it.
     if (!binding || !this.store.turnAttempts.releaseLostRemoteRecovery(attempt, binding)) return;
+    this.remoteAdoptionFinishers.get(attempt.id)?.();
+    this.remoteAdoptionWaiters.get(attempt.id)?.();
     this.logger.warn({ attempt: attempt.id, location: binding.location, slot: binding.slot, cause },
       "delegated turn lost its bridge owner; continuing it in its recorded session");
     void (async () => {
@@ -15428,7 +15451,7 @@ export class Orchestrator {
       if (!target) return;
       told = true;
       void this.postResumeNotice(target,
-        `🔌 Still reconnecting to \`${binding.location}\`: its bridge has been unreachable for 15 minutes. `
+        `🔌 Still reconnecting to session on \`${binding.location}\` (slot ${binding.slot}) after 15 minutes. `
           + "I'll keep trying, and this turn continues as soon as it's back.");
     }, 15 * 60_000);
     notice.unref?.();

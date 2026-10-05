@@ -8,6 +8,7 @@ import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrato
 import { SessionStore } from "../packages/core/src/core/session-store.js";
 import { discordRenderer } from "../packages/core/src/platforms/discord/renderer.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
+import { acceptReauthWait, REAUTH_WAITING_TEXT, REAUTH_COMPLETED_TEXT } from "../packages/core/src/core/reauth-negotiation.js";
 import { listLiveMarkers } from "../packages/core/src/core/dispatch/turn-resume.js";
 import type { DeliveryNonceLookup } from "../packages/core/src/platforms/chat-adapter.js";
 import { EventEmitter } from "node:events";
@@ -439,6 +440,78 @@ describe("#250 human turn production pipeline, synthetic transport only", () => 
     // after restart and leaves the original admission card permanently amber.
     expect(h.adapter.sendPanel).toHaveBeenCalledTimes(1);
     expect(await listLiveMarkers(h.dir)).toEqual([]);
+  });
+
+  it.each([false, true])("a missing retained auth owner continues only after acceptance (accepted at boot=%s)", async accepted => {
+    const h = setup();
+    simulateRetiredOwnerProcess();
+    const first = h.run();
+    await h.started;
+    const attempt = h.store.turnAttempts.get("inbound-1")!;
+    h.store.turnAttempts.recordRemoteRecovery(attempt, { version: 1, location: "local", slot: 19,
+      submissionId: "auth-submission", acpSessionId: "recorded-acp", delegatedUtc: attempt.createdUtc });
+    h.orch.suspendForRestart();
+    h.release();
+    await first;
+    h.store.turnAttempts.markStalled(attempt.id, accepted ? REAUTH_COMPLETED_TEXT : REAUTH_WAITING_TEXT);
+    h.runtime.prompt.mockClear();
+    h.router.getOrStartRuntime.mockClear();
+    h.runtime.prompt.mockImplementationOnce(async () => ({ stopReason: "end_turn" }));
+    const mux = { sendCmd: vi.fn(async () => ({ health: [] })), sendFrame: vi.fn() };
+    const next = h.make({ muxFor: () => mux, slotHealthFor: () => [], onBridgeReady: () => () => {} });
+    const resume = vi.spyOn(next, "resumeTurnManually");
+    await next.recoverInterruptedTurns();
+    await next.reconcileRemoteRecoveries();
+    for (let i = 0; i < 20; i++) await new Promise<void>(resolve => setImmediate(resolve));
+    if (!accepted) {
+      expect(h.store.turnAttempts.get(attempt.id)).toMatchObject({ state: "suspended", generation: 1,
+        stalledReason: REAUTH_WAITING_TEXT, acpSessionId: "recorded-acp", outcome: null });
+      expect(h.runtime.prompt).not.toHaveBeenCalled();
+      expect(h.router.getOrStartRuntime).not.toHaveBeenCalled();
+      expect(resume).not.toHaveBeenCalled();
+      expect(acceptReauthWait(h.store.turnAttempts, attempt.id)).not.toBeNull();
+      await (next as any).continueAcceptedReauth(attempt.id);
+    }
+    await vi.waitFor(() => expect(h.store.turnAttempts.get(attempt.id)?.state).toBe("completed"));
+    await next.reconcileRemoteRecoveries();
+    expect(h.runtime.prompt).toHaveBeenCalledTimes(1);
+    expect(h.runtime.prompt.mock.calls[0]?.[0]).toMatch(/^continue\n/);
+    expect(h.runtime.prompt.mock.calls[0]?.[0]).not.toContain("ORIGINAL DISPOSABLE WORK");
+    expect(h.router.getOrStartRuntime.mock.calls[0]?.[1]).toEqual({ resumeSessionId: "recorded-acp" });
+    expect(h.store.turnAttempts.get(attempt.id)).toMatchObject({ generation: 2, acpSessionId: "recorded-acp",
+      outcome: { status: "completed" } });
+    expect(mux.sendFrame).not.toHaveBeenCalled();
+    next.suspendForRestart();
+  });
+
+  it("a queued accepted continuation released at cutoff leaves admission, generation and cause unchanged", async () => {
+    const h = setup();
+    const first = h.run();
+    await h.started;
+    const attempt = h.store.turnAttempts.get("inbound-1")!;
+    h.store.turnAttempts.recordRemoteRecovery(attempt, { version: 1, location: "local", slot: 19,
+      submissionId: "auth-submission", acpSessionId: "recorded-acp", delegatedUtc: attempt.createdUtc });
+    h.orch.suspendForRestart();
+    h.release();
+    await first;
+    h.store.turnAttempts.markStalled(attempt.id, REAUTH_COMPLETED_TEXT);
+    const next = h.make();
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const adoption = (next as any).queueOnChannel("worker", () => held);
+    (next as any).remoteAdoptionWaiters.set(attempt.id, release);
+    const pending = h.store.recoverInboundChannel("worker", new Date().toISOString())!;
+    const before = h.store.turnAttempts.get(attempt.id)!;
+    const admission = h.store.getInbound("1");
+    const queued = (next as any).startRecoveredInbound(pending);
+    next.suspendForRestart();
+    await adoption;
+    await queued;
+    expect(h.store.turnAttempts.get(attempt.id)).toEqual(before);
+    expect(h.store.getInbound("1")).toEqual(admission);
+    expect(h.runtime.prompt).toHaveBeenCalledTimes(1);
+    await expect(h.run(next)).rejects.toMatchObject({ suspension: "shutdown" });
+    expect(h.store.turnAttempts.get(attempt.id)).toEqual(before);
   });
 
   it("projects a terminal durable outcome onto its persisted card with no live panel", async () => {

@@ -1206,6 +1206,15 @@ describe("SeamMcpServer", () => {
     // returnTo defaults to the caller's thread.
     expect(spec.returnTo).toBe("thread-caller");
     expect(spec.kind).toBe("handoff");
+    expect(spec.originThreadRef).toBe("thread-caller");
+  });
+
+  it("handoff records the caller even when result delivery goes to a different thread", async () => {
+    h = await makeHarness();
+    await h.call("tools/call", { name: "handoff", arguments: {
+      worker: "reviewer", prompt: "review PR 42", returnTo: "other-thread",
+    } }, { "X-Seam-Session": "good-token" });
+    expect(h.enqueued[0]).toMatchObject({ originThreadRef: "thread-caller", returnTo: "other-thread" });
   });
 
   it("agent_quota returns normalized JSON for all agents or one agent", async () => {
@@ -1331,6 +1340,7 @@ describe("SeamMcpServer", () => {
     expect(spec.prompt).toBe("relay this");
     expect(spec.session).toBe("live");
     expect(spec.returnTo).toBe("thread-caller");
+    expect(spec.originThreadRef).toBe("thread-caller");
   });
 
   it("handoff/forward advertise the stream option in their input schema", async () => {
@@ -1495,6 +1505,7 @@ describe("SeamMcpServer", () => {
     expect(spec.prompt).toContain("<seam-steer>");
     expect(spec.prompt).toContain("focus on the failing test first");
     expect(spec.prompt).toContain("steering you mid-task");
+    expect(spec.originThreadRef).toBe("thread-caller");
   });
 
   it("compact with no `thread` arg enqueues a kind:compact dispatch scoped to the caller", async () => {

@@ -64,7 +64,7 @@ export interface DispatchSpec {
   /**
    * Card observability (#153). The thread this dispatch's work came FROM, when
    * it is not simply `returnTo`. A handoff's origin IS its `returnTo` (the
-   * delegator), so handoffs leave this unset; a **report-back** sets it to the
+   * delegator) unless returnTo overrides delivery; a **report-back** sets it to the
    * worker thread whose output is being delivered, which `returnTo` cannot
    * express (a report-back has no returnTo — it IS the return).
    */

@@ -16928,6 +16928,7 @@ export class Orchestrator {
     draft: ThreadConfigDraft,
     evt: ComponentEvent
   ): Promise<void> {
+    // D10: Save does not abort a live turn; runtime changes wait for its next turn.
     const saved = await createConfigFacades({
       store: this.store, router: this.router, mutation: this.configMutation,
       config: this.config, modelCatalog: this.modelCatalog, logger: this.logger,
@@ -16947,8 +16948,6 @@ export class Orchestrator {
     }
     draft = saved.draft;
     const { fastRefusal, fastRetireFailed } = saved;
-    // D10: do NOT abort or invalidate a live turn. Overlay applies on next spawn.
-    // (#37 Fast is the one exception, handled above — it MUST reset the session.)
     this.configEditor.delete(draft.id);
     if (draft.messageId) {
       const savedPanel = renderSavedHub(draft);

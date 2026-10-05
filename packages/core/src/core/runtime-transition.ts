@@ -229,6 +229,62 @@ export class RuntimeTransition {
     await this.settings!.router.applyPermissionMode(record);
   }
 
+  /** Apply an editor's already-audited selection to the retained runtime. */
+  async applySavedSelection(record: SessionRecord, before: ConfigDescription): Promise<void> {
+    // D10: Save never aborts a live turn. Transition before its next acquisition.
+    await this.router.transitionWhenIdle(record.id, () =>
+      this.applySavedSelectionNow(this.deps.store.get(record.id) ?? record, before)
+    );
+  }
+
+  private async applySavedSelectionNow(record: SessionRecord, before: ConfigDescription): Promise<void> {
+    const after = this.deps.router.describeConfig(record);
+    const agentChanged = before.agent.value !== after.agent.value;
+    const modelChanged = before.model.value !== after.model.value;
+    const effortChanged = before.effort.value !== after.effort.value;
+    if (!agentChanged && !modelChanged && !effortChanged) return;
+
+    const binding = { agentId: after.agent.value, location: after.location.value };
+    const model = this.deps.modelCatalog.model(binding, after.model.value);
+    const reset = detectSessionReset({
+      previousAgentId: before.agent.value,
+      nextAgentId: after.agent.value,
+      modelChanged,
+      modelApplicationMode: model?.applicationMode ?? "reload",
+    });
+    if (reset.sessionReset) {
+      await this.retire(record.id, {
+        clearAcpSession: true,
+        clearStartFailure: true,
+        operatorIntent: "replace-session",
+      });
+      const current = this.deps.store.get(record.id) ?? record;
+      this.deps.store.upsert({ ...current, acpSessionId: "", updatedUtc: new Date().toISOString() });
+      return;
+    }
+
+    const mechanism = model?.effort.mechanism;
+    if (
+      (modelChanged && (model?.applicationMode ?? "reload") === "reload") ||
+      (effortChanged && (!model || mechanism === "meta" || mechanism === "spawnArgs" || after.effort.value === null))
+    ) {
+      await this.retire(record.id, { clearAcpSession: false });
+      return;
+    }
+
+    const runtime = this.router.getRuntime(record.id);
+    if (runtime) {
+      const selection = this.deps.modelCatalog.resolve(binding, {
+        model: after.model.value,
+        effort: after.effort.value ?? undefined,
+      });
+      if (modelChanged) await runtime.setModel(selection.raw.model, { effort: selection.raw.effort });
+      if ((modelChanged || effortChanged) && mechanism === "configOption" && selection.raw.effort) {
+        await runtime.setConfigOption(model!.effort.configId!, selection.raw.effort);
+      }
+    }
+  }
+
   async setPermission(record: SessionRecord, policy: "always" | "ask" | "deny"): Promise<void> {
     const cfg = this.store.readConfig(record);
     cfg.permissionPolicy = policy;

@@ -185,7 +185,6 @@ describe("reauth card click", () => {
       kind: "button",
       async replyEphemeral(text) { replies.push(text); },
       async followUpEphemeral(text) { replies.push(text); },
-      async deferUpdate() {},
       async showModal() {},
     };
     await (orch as unknown as { handleChoiceCardInteraction(evt: ChoiceInteraction): Promise<void> })

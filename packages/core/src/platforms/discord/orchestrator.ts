@@ -16468,7 +16468,7 @@ export class Orchestrator {
     const resumeInput = i.options.getString("resume");
     if (resumeInput) {
       const id = await this.normalizeAutocompleteSubmission(i, null, "workflows", "resume", resumeInput);
-      await i.editReply({ content: await this.performWorkflowAction("resume", id, i.channelId) });
+      await replyToInteraction(i, { content: await this.performWorkflowAction("resume", id, i.channelId) });
       return;
     }
 
@@ -19314,7 +19314,6 @@ export class Orchestrator {
 
   private async handleParkedTurnChoice(evt: ChoiceInteraction, card: ChoiceCard, optionIndex: number,
     request: { action: ParkedTurnAction; attemptId: string }): Promise<void> {
-    await evt.deferUpdate();
     const access = { kind: "mutating" as const };
     const scope = evt.channel.parentId ?? evt.channel.id;
     const refusal = Orchestrator.isParticipantSlashRefused(this.config, "", evt.userId, { access })

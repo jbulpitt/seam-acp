@@ -9,6 +9,8 @@ import { DispatchWatcher } from "../packages/core/src/core/dispatch/watcher.js";
 import { executionIdentity } from "../packages/core/src/core/dispatch/execution-identity.js";
 import { parkedTurnAction, parkedTurnChoiceSpec } from "../packages/core/src/core/parked-turn-card.js";
 import { makeChoiceCustomId } from "../packages/core/src/core/choice/types.js";
+import { DiscordAdapter } from "../packages/core/src/platforms/discord/adapter.js";
+import { SyntheticInteraction } from "../packages/core/src/platforms/discord/synthetic-interaction.js";
 
 let dir: string;
 let store: SessionStore;
@@ -39,7 +41,7 @@ function click(choiceId: string, index: number) {
   return {
     customId: makeChoiceCustomId(choiceId, index), userId: "user", userName: "Ada",
     channel: { platform: "discord", id: "worker", parentId: "parent" }, messageId: "notice", kind: "button",
-    deferUpdate: vi.fn(async () => {}), replyEphemeral: vi.fn(async () => {}),
+    replyEphemeral: vi.fn(async () => {}),
     followUpEphemeral: vi.fn(async () => {}), showModal: vi.fn(),
   };
 }
@@ -58,6 +60,36 @@ beforeEach(() => {
 afterEach(() => { for (const watcher of watchers.splice(0)) watcher.stop(); store.close(); fs.rmSync(dir, { recursive: true, force: true }); });
 
 describe("durable parked-turn notice actions", () => {
+  it("claims and settles Abandon while the central ACK is pending, then replies privately", async () => {
+    const orch = controller();
+    await orch.postParkedTurnNotice("worker", store.turnAttempts.get(id), "connection unavailable");
+    const card = store.listOpenChoiceCards("discord", "worker")[0]!;
+    const native = new SyntheticInteraction({ kind: "button", channelId: "worker", messageId: "notice",
+      customId: makeChoiceCustomId(card.id, 1) }, {
+      client: {} as never, channel: { id: "worker", parentId: "parent",
+        send: vi.fn(async () => ({ id: "private-reply" })) } as never,
+      user: { id: "user", username: "Ada" } as never, member: null, message: { id: "notice" } as never,
+    });
+    let release!: () => void;
+    const pending = new Promise<void>(resolve => { release = resolve; });
+    const defer = native.deferUpdate.bind(native);
+    vi.spyOn(native, "deferUpdate").mockImplementation(async () => { await pending; return defer(); });
+    const adapter = Object.assign(Object.create(DiscordAdapter.prototype), {
+      logger, choiceAcknowledgement: "update", choiceHandler: (event: unknown) => orch.handleChoiceCardInteraction(event),
+    });
+    const dispatched = adapter.handleChoiceInteraction(native);
+    try {
+      await vi.waitFor(() => expect(store.turnAttempts.get(id)?.state).toBe("cancelled"));
+      expect(store.getChoiceCard(card.id)?.clickCount).toBe(1);
+      expect(native.transcript).toEqual([]);
+    } finally {
+      release();
+      await dispatched;
+    }
+    expect(native.transcript.map(entry => entry.op)).toEqual(["deferUpdate", "followUp"]);
+    expect(native.transcript.at(-1)?.ephemeral).toBe(true);
+  });
+
   it("persists attempt-bound actions, then Abandon works after a controller/store replacement", async () => {
     const first = controller();
     await first.postParkedTurnNotice("worker", store.turnAttempts.get(id), "real cause: connection unavailable");
@@ -68,7 +100,6 @@ describe("durable parked-turn notice actions", () => {
     const recovered = controller();
     const interaction = click(card.id, 1);
     await recovered.handleChoiceCardInteraction(interaction);
-    expect(interaction.deferUpdate).toHaveBeenCalledOnce();
     expect(store.turnAttempts.get(id)?.state).toBe("cancelled");
     expect(store.turnAttempts.get(id)?.spec.prompt).toBe("ORIGINAL-BRIEF-DO-NOT-REPLAY");
     expect(store.getChoiceCard(card.id)?.status).not.toBe("open");

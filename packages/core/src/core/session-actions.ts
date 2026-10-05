@@ -14,6 +14,8 @@ import { resolveRepoPath } from "./path-utils.js";
 import type { SessionRecord } from "./types.js";
 import type { SessionRouter } from "./session-router.js";
 import type { SessionStore } from "./session-store.js";
+import type { RuntimeTransition } from "./runtime-transition.js";
+import type { MutationActor } from "./config-mutation.js";
 import { planSessionAttachment, type AttachIntent, type AttachOutcome } from "./session-attach.js";
 
 interface BindingDeps {
@@ -61,7 +63,7 @@ interface SessionActionServices {
     newSessionId: string; attachment: AttachOutcome; reportMarkdown: string;
     stats: PremiumCompactionResult["stats"]; analysisExecutor: PremiumCompactionResult["analysisExecutor"];
   }>;
-  flushIdentity(recordId: string): Promise<void>;
+  adoptMigration: RuntimeTransition["adoptMigratedSession"];
 }
 
 export interface SessionBrowserCapabilities {
@@ -155,8 +157,8 @@ export class SessionActions {
     const profile = this.deps.router.getProfile(agentId);
     return profile?.sessionManager ? {
       id: profile.id, displayName: profile.displayName,
-      migrate: (sessionId: string, complete: (newSessionId: string) => Promise<void>,
-        failed?: (error: unknown) => Promise<void>) => this.migrateTo(sessionId, profile, complete, failed),
+      migrate: (sessionId: string, actor: MutationActor, complete: (newSessionId: string) => Promise<void>,
+        failed?: (error: unknown) => Promise<void>) => this.migrateTo(sessionId, profile, actor, complete, failed),
     } : undefined;
   }
 
@@ -282,27 +284,23 @@ export class SessionActions {
     }, failed, compactionModel);
   }
 
-  migrate(sessionId: string, targetAgentId: string, complete: (newSessionId: string) => Promise<void>,
+  migrate(sessionId: string, targetAgentId: string, actor: MutationActor, complete: (newSessionId: string) => Promise<void>,
     failed?: (error: unknown) => Promise<void>): Promise<void> {
-    return this.migrateTo(sessionId, this.deps.router.getProfile(targetAgentId)!, complete, failed);
+    return this.migrateTo(sessionId, this.deps.router.getProfile(targetAgentId)!, actor, complete, failed);
   }
 
-  private migrateTo(sessionId: string, targetProfile: AgentProfile, complete: (newSessionId: string) => Promise<void>,
+  private migrateTo(sessionId: string, targetProfile: AgentProfile, actor: MutationActor, complete: (newSessionId: string) => Promise<void>,
     failed?: (error: unknown) => Promise<void>): Promise<void> {
-    const { record, binding, services, store, router, cwd } = this.deps;
+    const { record, binding, services, cwd } = this.deps;
     return this.summarize(sessionId, "migrate", cwd, async (summary) => {
+      const selection = services.modelCatalog.resolve({ agentId: targetProfile.id, location: binding.location }, { model: "default" });
       const newSessionId = await services.seed({
         profile: targetProfile, restrictionChannelId: record.parentRef ?? record.channelRef, cwd,
-        location: binding.location, sessionId: record.id, summary,
+        location: binding.location, sessionId: record.id, summary, model: selection.raw.model,
+        ...(selection.raw.effort ? { effort: selection.raw.effort } : {}),
       });
-      await router.invalidate(record.id);
-      store.upsert({ ...record, agentId: targetProfile.id, acpSessionId: newSessionId, updatedUtc: new Date().toISOString() });
-      const fresh = store.get(record.id);
-      if (fresh) {
-        record.agentId = fresh.agentId;
-        record.acpSessionId = fresh.acpSessionId;
-      }
-      await services.flushIdentity(record.id);
+      await services.adoptMigration(record, { agent: targetProfile.id, model: selection.normalized.model,
+        effort: selection.normalized.effort, acpSessionId: newSessionId }, actor);
       await complete(newSessionId);
     }, failed);
   }

@@ -53,7 +53,7 @@ export function browserReply(target: string, userId: string, channelId: string,
 export function browserClick(event: ComponentEvent): BrowserClick {
   const output = event.cardReply!;
   return {
-    customId: event.customId, user: { id: event.userId }, values: event.values ?? [],
+    customId: event.customId, user: { id: event.userId, name: event.userName }, values: event.values ?? [],
     fields: { getTextInputValue: (name) => event.fields?.[name] ?? "" },
     isStringSelectMenu: () => event.kind === "select", isModalSubmit: () => event.kind === "modal",
     deferUpdate: () => event.deferUpdate(), editReply: (view) => output.editReply(view),

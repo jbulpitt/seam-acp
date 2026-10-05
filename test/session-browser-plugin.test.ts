@@ -27,12 +27,15 @@ function fixture() {
   const list = vi.fn(async () => ["first", "second"].map(sessionId => ({ sessionId, createdAt: 1, lastActivityAt: 2, previewLines: [] })));
   const attach = vi.fn(async (sessionId: string) => { active = sessionId; });
   const imported = vi.fn(async (_sessionId: string, _cwd: string, _model: string, complete: (id: string) => Promise<void>) => complete("imported"));
+  const migrated = vi.fn(async (_sessionId: string, _actor: { id: string; name: string }, complete: (id: string) => Promise<void>) => complete("migrated"));
   const actions = {
     info: { id: "discord:thread", platform: "discord", channelRef: "thread", parentRef: "parent",
       agentId: "source", displayName: "Source", cwd: "/srv/repos/project", acpSessionId: "first" },
     snapshot: () => "original-host-and-cwd",
     list, attach, activeSessionId: () => active,
-    capabilities: () => ({ canCompact: true, canRepair: false, canPremiumSession: false, canPremiumDiscord: false, migrationTargets: [] }),
+    capabilities: () => ({ canCompact: true, canRepair: false, canPremiumSession: false, canPremiumDiscord: false,
+      migrationTargets: [{ id: "target", displayName: "Target" }] }),
+    migrationTarget: () => ({ id: "target", displayName: "Target", migrate: migrated }),
     compactionModel: () => summarizer,
     resolveImportCwd: (cwd: string) => cwd,
     import: imported,
@@ -50,7 +53,7 @@ function fixture() {
     collectParked: vi.fn(async () => 0), repoDisplay: cwd => cwd,
     track, runJob: work => { track(Promise.resolve().then(work)); },
     settle: async input => { await input.lifecycle.refresh(input.view); return "live"; },
-    click: event => ({ customId: event.customId, user: { id: event.userId }, values: event.values ?? [],
+    click: event => ({ customId: event.customId, user: { id: event.userId, name: event.userName }, values: event.values ?? [],
       fields: { getTextInputValue: name => event.fields?.[name] ?? "" },
       isStringSelectMenu: () => event.kind === "select", isModalSubmit: () => event.kind === "modal",
       deferUpdate: event.deferUpdate, editReply: reply.editReply, deleteReply: reply.deleteReply,
@@ -73,12 +76,24 @@ function fixture() {
   } as unknown as ComponentEvent);
   const ids = () => (views.at(-1).components ?? []).flatMap((row: any) => row.components.map((button: any) => button.custom_id)) as string[];
   const control = (action: string) => ids().find(id => id.startsWith(`sessions:${action}:`))!;
-  return { boot, invocation, event, ports, views, modals, list, attach, imported, control, reply,
+  return { boot, invocation, event, ports, views, modals, list, attach, imported, migrated, control, reply,
     changeSummarizer: () => { summarizer = "updated-model"; },
     drain: async () => { while (jobs.size) await Promise.all([...jobs]); } };
 }
 
 describe("session browser contribution", () => {
+  it("passes the selecting actor to the migration facade", async () => {
+    const h = fixture(), host = await h.boot();
+    await host.slash.dispatch("seam", "info", "sessions", h.invocation);
+    await host.components.dispatch(h.event(h.control("migrate")));
+    const event = h.event(h.control("migrate_target"), "select");
+    event.values = ["target"];
+    await host.components.dispatch(event);
+    await h.drain();
+    expect(h.migrated).toHaveBeenCalledWith("first", { id: "owner", name: "Owner" }, expect.any(Function), expect.any(Function));
+    expect(h.views.at(-1).embeds[0].data.title).toContain("Migrated Successfully");
+  });
+
   it("registers once and classifies buttons, selects and modals through the adapter", async () => {
     const h = fixture(), host = await h.boot();
     const assembled = host.slash.assemble([buildSeamCommand().toJSON(), buildSeamAdminCommand().toJSON()]);

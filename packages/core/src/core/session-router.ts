@@ -947,11 +947,11 @@ export class SessionRouter {
   }
 
   /** Keep a busy runtime's selection until its prompt ends; apply before reuse. */
-  async transitionWhenIdle(sessionId: string, apply: () => Promise<void>): Promise<void> {
+  async transitionWhenIdle(sessionId: string, apply: () => Promise<void>, opts?: { replacePending?: boolean }): Promise<void> {
     const applying = this.pendingRuntimeTransitions.get(sessionId)?.applying;
     if (applying) await applying;
-    // Retain the first comparison point; its callback reads the latest saved selection.
-    if (!this.pendingRuntimeTransitions.has(sessionId)) {
+    // Coalesce saves; a seeded attachment supersedes an earlier reset.
+    if (opts?.replacePending || !this.pendingRuntimeTransitions.has(sessionId)) {
       this.pendingRuntimeTransitions.set(sessionId, { apply });
     }
     if (!this.runtimes.get(sessionId)?.busy) await this.applyPendingRuntimeTransition(sessionId);

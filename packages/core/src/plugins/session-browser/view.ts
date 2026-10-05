@@ -980,7 +980,7 @@ export function createBrowser(ports: SessionBrowserFacade, actions: SessionActio
         });
 
         ports.runJob(async () => {
-          await targetProfile.migrate(session.sessionId, async (newSessionId) => {
+          await targetProfile.migrate(session.sessionId, { id: btnInteraction.user.id, name: btnInteraction.user.name ?? null }, async (newSessionId) => {
             const successEmbed = new EmbedBuilder()
               .setTitle("🎉 Session Migrated Successfully!")
               .setDescription(

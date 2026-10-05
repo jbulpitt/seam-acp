@@ -14,7 +14,7 @@ export interface BrowserReply {
 
 export interface BrowserClick {
   readonly customId: string;
-  readonly user: { id: string };
+  readonly user: { id: string; name?: string };
   readonly values: string[];
   readonly fields: { getTextInputValue(name: string): string };
   isStringSelectMenu(): boolean;

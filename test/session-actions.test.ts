@@ -56,7 +56,14 @@ function fixture(location = "local") {
   const seed = vi.fn(async (_args: unknown) => { events.push("seed"); return "seeded"; });
   const cleanup = vi.fn(async () => { runtime.events.push("cleanup"); });
   const launch = vi.fn(() => ({ spawnFn: vi.fn(), mcpServers: [] }));
-  const resolve = vi.fn(() => ({ raw: { model: "advertised-model", effort: "high" } }));
+  const resolve = vi.fn(() => ({ raw: { model: "advertised-model", effort: "high" },
+    normalized: { model: "catalog-model", effort: "high" } }));
+  const adoptMigration = vi.fn(async (targetRecord: SessionRecord, selection: { agent: string; acpSessionId: string }) => {
+    events.push("adopt");
+    stored = { ...stored, agentId: selection.agent, acpSessionId: selection.acpSessionId };
+    Object.assign(targetRecord, stored);
+    events.push("identity");
+  });
   const deps = {
     record, manager: location === "local" ? manager : remoteSessionManager({ rpc } as never, location, "source"),
     cwd: record.repoPath!, profile: source, binding: { agentId: "source", location },
@@ -80,10 +87,10 @@ function fixture(location = "local") {
       compactionWindow: () => 100000, launch, cleanup, seed,
       buildSeed: vi.fn(async () => ({ seed: "SEED", keptTurns: 2, summarizedTurns: 3, pinnedCount: 1 })),
       rebuild: vi.fn(), compactFromThread: vi.fn(), premium: vi.fn(),
-      flushIdentity: vi.fn(async () => { events.push("identity"); }),
+      adoptMigration,
     },
   } as unknown as ConstructorParameters<typeof SessionActions>[0];
-  return { actions: new SessionActions(deps), deps, record, manager, rpc, events, invalidate, seed, cleanup, launch, resolve,
+  return { actions: new SessionActions(deps), deps, record, manager, rpc, events, invalidate, seed, cleanup, launch, resolve, adoptMigration,
     current: () => stored, rebind: (id: string) => { stored.acpSessionId = id; } };
 }
 
@@ -159,12 +166,26 @@ describe("SessionActions", () => {
     expect(JSON.parse(h.current().configJson).sessionCwdExplicit).toBe(true);
   });
 
-  it("migrates with target defaults and flushes identity before delivery", async () => {
+  it("migrates with the target binding's default selection and actor before delivery", async () => {
     const h = fixture("remote");
-    await h.actions.migrate("active", "target", async () => { h.events.push("delivery"); });
-    expect(h.seed).toHaveBeenCalledWith(expect.objectContaining({ profile: expect.objectContaining({ id: "target" }), location: "remote" }));
-    expect(h.seed.mock.calls[0]![0]).not.toHaveProperty("model");
-    expect(h.events).toEqual(["getTranscript", "seed", "invalidate", "upsert", "identity", "delivery"]);
+    const actor = { id: "operator", name: "Operator" };
+    await h.actions.migrate("active", "target", actor, async () => { h.events.push("delivery"); });
+    expect(h.resolve).toHaveBeenCalledWith({ agentId: "target", location: "remote" }, { model: "default" });
+    expect(h.seed).toHaveBeenCalledWith(expect.objectContaining({ profile: expect.objectContaining({ id: "target" }),
+      location: "remote", model: "advertised-model", effort: "high" }));
+    expect(h.adoptMigration).toHaveBeenCalledWith(h.record,
+      { agent: "target", model: "catalog-model", effort: "high", acpSessionId: "seeded" }, actor);
+    expect(h.events).toEqual(["getTranscript", "seed", "adopt", "identity", "delivery"]);
+    expect(h.invalidate).not.toHaveBeenCalled();
     expect(h.record).toMatchObject({ agentId: "target", acpSessionId: "seeded" });
+  });
+
+  it("leaves the thread selection alone when seeding the target fails", async () => {
+    const h = fixture();
+    const failure = new Error("target provider failed");
+    h.seed.mockRejectedValueOnce(failure);
+    await expect(h.actions.migrate("active", "target", { id: "operator", name: "Operator" }, vi.fn())).rejects.toBe(failure);
+    expect(h.adoptMigration).not.toHaveBeenCalled();
+    expect(h.current()).toMatchObject({ agentId: "source", acpSessionId: "active" });
   });
 });

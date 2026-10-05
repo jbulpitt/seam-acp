@@ -17445,7 +17445,7 @@ export class Orchestrator {
         rebuild: (args) => this.reconstructSessionFromDiscord(args),
         compactFromThread: (channel, record) => this.compactSessionFromThread(channel, record),
         premium: (record, opts) => this.compactThread(record, opts),
-        flushIdentity: (id) => this.identityEffects.flush(id),
+        adoptMigration: (record, selection, actor) => this.getRuntimeTransition().adoptMigratedSession(record, selection, actor),
       },
     });
   }

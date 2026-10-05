@@ -237,6 +237,26 @@ export class RuntimeTransition {
     );
   }
 
+  /** Adopt a seeded migration without replacing its context or interrupting a turn. */
+  async adoptMigratedSession(target: SessionRecord, selection: {
+    agent: string; model: string; effort: string; acpSessionId: string;
+  }, actor: MutationActor): Promise<void> {
+    const applied = this.applyTargetIdentity(target, {
+      agent: selection.agent, model: selection.model, effort: selection.effort || null,
+    }, actor);
+    if (!applied.ok) throw new Error(applied.error);
+    const current = this.deps.store.get(target.id) ?? target;
+    this.deps.store.upsert({ ...current, acpSessionId: selection.acpSessionId, updatedUtc: new Date().toISOString() });
+    Object.assign(target, this.deps.store.get(target.id) ?? current);
+    const migrated = this.deps.router.describeConfig(target);
+    // D10: retire the source only after its prompt; load the seeded target next.
+    await this.router.transitionWhenIdle(target.id, async () => {
+      await this.retire(target.id, { clearAcpSession: false, clearStartFailure: true });
+      await this.applySavedSelectionNow(this.deps.store.get(target.id) ?? target, migrated);
+    }, { replacePending: true });
+    await this.deps.identityCommitted?.(target.id);
+  }
+
   private async applySavedSelectionNow(record: SessionRecord, before: ConfigDescription): Promise<void> {
     const after = this.deps.router.describeConfig(record);
     const agentChanged = before.agent.value !== after.agent.value;

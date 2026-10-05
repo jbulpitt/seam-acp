@@ -468,6 +468,13 @@ function makeHarness(opts: HarnessOpts = {}) {
     return "acp-new";
   };
   (orch as any).applyThreadName = async () => {};
+  orch.getRuntimeTransition = () => ({
+    adoptMigratedSession: async (rec: SessionRecord, selection: { agent: string; acpSessionId: string }) => {
+      await router.invalidate(rec.id, { clearAcpSession: false });
+      store.upsert({ ...rec, agentId: selection.agent, acpSessionId: selection.acpSessionId });
+      Object.assign(rec, { agentId: selection.agent, acpSessionId: selection.acpSessionId });
+    },
+  }) as ReturnType<Orchestrator["getRuntimeTransition"]>;
   // The runtime-backed jobs (summary / migrate / import) signal entry here.
   runtime.onStart = () => entered.resolve();
 

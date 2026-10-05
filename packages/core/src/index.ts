@@ -91,7 +91,6 @@ import { dispatchDirs, enqueueDispatchSpec, type DispatchSpec } from "./core/dis
 import { SeamTokenRegistry } from "./core/mcp/token-registry.js";
 import { SeamMcpServer, KERNEL_MCP_TOOL_NAMES } from "./core/mcp/seam-mcp-server.js";
 import { listSiblingThreadEntries } from "./core/mcp/thread-inventory.js";
-import { ThreadSessionControlService } from "./core/thread-session-control.js";
 import { watchChannelPresets } from "./core/config-reload.js";
 import { BridgeHub } from "./core/bridge-hub.js";
 import { ServerStatusCard } from "./core/server-status-card.js";
@@ -1070,13 +1069,7 @@ async function main(): Promise<void> {
         )
       : undefined;
     const messageSearch = messageReader ? new LiveMessageSearch(messageReader) : undefined;
-    const threadSessionControl = new ThreadSessionControlService({
-      store,
-      router,
-      mutation: orchestrator.getConfigMutation(),
-      modelCatalog,
-      identityCommitted: (sessionId) => orchestrator.flushIdentityEffects(sessionId),
-    });
+    const threadSessionControl = orchestrator.getRuntimeTransition();
     orchestrator.setSelfMigrationHandler((target, prepared) =>
       threadSessionControl.executeSelfMigration(target, prepared)
     );

@@ -65,6 +65,23 @@ internal facades read exact prefix boundaries, write `namePrefix`, project
 session identities and read/save `thread-namer.json`. Ordinary session upserts
 preserve the stored prefix. No plugin receives a store or router.
 
+## Configuration and runtime transitions
+
+`core/config-apply-plan.ts` and `core/runtime-transition.ts` are internal kernel
+modules. The editor, slash config, preset application and MCP configuration use
+them; no configuration plugin or public plugin API is introduced here.
+
+`ConfigApplyPlan.prepare` returns the existing validated proposal diff, its
+target, confirming actor and audit correlation, and runtime consequence. It
+writes nothing until `apply` delegates to the audited mutation engine. Editor,
+bulk config and preset application retain their existing write and rollback order.
+
+`RuntimeTransition` owns live configuration and process retirement. Agent
+changes replace the session; model replacement follows the catalog's application
+mode, while effort changes preserve ACP context. Permission changes await the
+existing Codex mode application. Committed identity effects still drive naming.
+`thread-session-control.ts` retains the previous class and type import names.
+
 ## Maintenance jobs and storage
 
 Maintenance jobs declare a name, base interval and `after-admission` phase.

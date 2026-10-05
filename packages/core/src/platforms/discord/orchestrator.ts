@@ -272,7 +272,6 @@ import {
   RIDER_MODAL_MAX,
   applyPickerValue,
   authorizeDraftClick,
-  buildSavePlan,
   currentRiderText,
   decodeRiderUpload,
   editScopeOf,
@@ -284,8 +283,6 @@ import {
   renderExpiredHub,
   renderHub,
   renderSavedHub,
-  fastModeWillResetSession,
-  willVerifyFastMode,
   riderDownloadFilename,
   riderTooLong,
   snapshotFromDescribe,
@@ -394,9 +391,7 @@ import {
   describeFastModeOutcome,
   fastModeAgentRefusal,
   fastModeEnvRefusal,
-  fastModeRetirementFailure,
   isFastModeDisabledByEnv,
-  settleFastMode,
 } from "../../core/fast-mode.js";
 import { installCardVisuals } from "../../core/card-visuals.js";
 import {
@@ -404,6 +399,8 @@ import {
   isSimpleCardGifTerminal,
   postSimpleCardGifMessage,
 } from "../../core/simple-card-gif.js";
+import { createConfigFacades, type ConfigApplyPlan, CONFIG_SET_FIELD_NAMES, type ConfigSetFieldName, type ConfigSetRequest, type PreparedConfigSet } from "../../core/config-apply-plan.js";
+import type { RuntimeTransition } from "../../core/runtime-transition.js";
 import { ConfigMutationService, type ConfigMutationInput } from "../../core/config-mutation.js";
 import type {
   ConfigureThreadSuccess,
@@ -608,39 +605,6 @@ const STATUS_HEARTBEAT_MS = 5000;
 export const DISPATCH_SETTLEMENT_WARN_MS = 5_000;
 const PLATFORM = "discord";
 
-const CONFIG_SET_FIELD_NAMES = [
-  "agent",
-  "model",
-  "effort",
-  "repo",
-  "role",
-  "permissions",
-  "card",
-  "gif",
-] as const;
-type ConfigSetFieldName = (typeof CONFIG_SET_FIELD_NAMES)[number];
-type ConfigSetRequest = {
-  json: string | null;
-  rebuild: boolean;
-  values: Record<ConfigSetFieldName, string | null>;
-  supplied: ConfigSetFieldName[];
-};
-type PreparedConfigSet =
-  | { kind: "json"; cfg: SessionConfigState }
-  | {
-      kind: "named";
-      parsedAgent?: ReturnType<typeof parseAgentAtLocation>;
-      nextAgentId: string;
-      nextLocation: string;
-      model: string;
-      pinnedEffort?: string;
-      requestedRole?: string;
-      permission?: string;
-      card?: string;
-      gif?: string;
-      resolvedRepo?: string;
-      restartRequested: boolean;
-    };
 
 /**
  * Last resort when a quarantine has no recorded cause (#333).
@@ -1289,13 +1253,14 @@ export class Orchestrator {
       apply: (row, actor) => {
         const record = this.store.get(row.sessionId);
         if (!record) throw new Error("This proposal's session no longer exists.");
-        const built = this.configMutation.buildProposal(record, row.input);
+        const service = this.getConfigApplyPlan();
+        const built = service.prepare(record, row.input, actor);
         if (!built.ok) throw new Error(built.error);
-        const result = built.proposal.apply(actor);
+        const result = service.apply(built.plan);
         return { auditId: result.auditId, message: result.message };
       },
       afterApply: async row => {
-        if (row.proposal.restartsSession) await this.router.invalidate(row.sessionId);
+        if (row.proposal.restartsSession) await this.getRuntimeTransition().retire(row.sessionId);
         await this.identityEffects.flush(row.sessionId);
         await this.adapter.sendMessage(row.channel, `✅ ${row.detail}`);
       },
@@ -1876,7 +1841,7 @@ export class Orchestrator {
     record: SessionRecord,
     input: ConfigMutationInput
   ): Promise<ConfigProposeOutcome> {
-    const built = this.configMutation.buildProposal(record, input);
+    const built = this.getConfigApplyPlan().buildProposal(record, input);
     if (!built.ok) return { ok: false, error: built.error };
     const proposal = built.proposal;
 
@@ -7214,6 +7179,28 @@ export class Orchestrator {
   }
 
   /** Exposed so index.ts can wire BridgeHub audit writes without growing this file. */
+  getConfigApplyPlan(): ConfigApplyPlan { return createConfigFacades({
+      store: this.store, router: this.router, mutation: this.configMutation,
+      config: this.config, modelCatalog: this.modelCatalog, logger: this.logger,
+      bridgeHub: this.bridgeHub,
+      identityCommitted: (id?: string) => this.identityEffects.flush(id),
+      persistConfig: (record: SessionRecord, cfg: SessionConfigState) => this.persistConfig(record, cfg),
+      repoDisplay: (repo: string | null) => this.repoDisplay(repo),
+      unregisteredAgentMessage: (id: string, fallback: string) => this.refuseUnregisteredAgent(id, fallback),
+      parkedSelectMessage: (id: string) => this.parkedSelectRefusal(id),
+    }).plan; }
+
+  getRuntimeTransition(): RuntimeTransition { return createConfigFacades({
+      store: this.store, router: this.router, mutation: this.configMutation,
+      config: this.config, modelCatalog: this.modelCatalog, logger: this.logger,
+      bridgeHub: this.bridgeHub,
+      identityCommitted: (id?: string) => this.identityEffects.flush(id),
+      persistConfig: (record: SessionRecord, cfg: SessionConfigState) => this.persistConfig(record, cfg),
+      repoDisplay: (repo: string | null) => this.repoDisplay(repo),
+      unregisteredAgentMessage: (id: string, fallback: string) => this.refuseUnregisteredAgent(id, fallback),
+      parkedSelectMessage: (id: string) => this.parkedSelectRefusal(id),
+    }).runtime; }
+
   getConfigMutation(): ConfigMutationService {
     return this.configMutation;
   }
@@ -14948,139 +14935,10 @@ export class Orchestrator {
         await this.adapter.sendMessage(channel, msg);
       }
     };
-    const fail = async (error: string): Promise<{ ok: false; error: string }> => {
-      await respond(error.startsWith("Could not") ? error : `Could not set model: ${error}`);
-      return { ok: false, error };
-    };
-
-    record = this.store.get(record.id) ?? record;
-    const describedBefore = this.router.describeConfig(record);
-    const binding = {
-      agentId: describedBefore.agent.value,
-      location: describedBefore.location.value,
-    };
-    const selected = this.modelCatalog.model(binding, id);
-    if (!selected) {
-      return fail(
-        `model ${JSON.stringify(id)} is not available in the cached catalog for ${binding.agentId}@${binding.location}`
-      );
-    }
-    const canonicalId = selected.id;
-    const defaultEffort = selected.effort.selectionDefault;
-    const current = describedBefore.model.value;
-    if (canonicalId === current) {
-      await this.identityEffects.flush(record.id);
-      const message = `🧠 Model already set to \`${canonicalId}\` (no change).`;
-      await respond(message);
-      return { ok: true, message };
-    }
-
     const actor = interaction
       ? { id: interaction.user.id, name: interaction.user.displayName ?? interaction.user.username }
       : { id: null, name: null };
-    const sessionBefore = { ...(this.store.get(record.id) ?? record) };
-    const overlayBefore = this.configMutation.readThreadPresetEntry(channel.id);
-    const originalEffective = {
-      agent: describedBefore.agent.value,
-      model: describedBefore.model.value,
-      location: describedBefore.location.value,
-    };
-
-    const rollback = (): { acpRestored: boolean } => {
-      const overlayRestored = this.configMutation.restoreThreadPresetEntry(
-        channel.id,
-        overlayBefore
-      );
-      this.store.upsert({
-        ...sessionBefore,
-        acpSessionId: "",
-        updatedUtc: new Date().toISOString(),
-      });
-      const now = this.store.get(sessionBefore.id) ?? sessionBefore;
-      const described = this.router.describeConfig(now);
-      const canRestoreAcp =
-        Boolean(sessionBefore.acpSessionId) &&
-        described.agent.value === originalEffective.agent &&
-        described.model.value === originalEffective.model &&
-        described.location.value === originalEffective.location;
-      if (canRestoreAcp) {
-        this.store.upsert({
-          ...now,
-          acpSessionId: sessionBefore.acpSessionId,
-          updatedUtc: new Date().toISOString(),
-        });
-        return { acpRestored: true };
-      }
-      if (!overlayRestored.ok) {
-        this.logger.warn(
-          { err: overlayRestored.error, threadId: channel.id },
-          "model-switch overlay rollback failed; ACP id left cleared"
-        );
-      }
-      return { acpRestored: false };
-    };
-
-    const mismatchSuffix = (rolled: { acpRestored: boolean }): string =>
-      rolled.acpRestored
-        ? ""
-        : " Previous ACP session was not restored because the effective model no longer matches.";
-
-    try {
-      const live = this.store.get(record.id) ?? record;
-      const cfg = this.store.readConfig(live);
-      cfg.model = canonicalId;
-      cfg.reasoningEffort = defaultEffort;
-      delete cfg.lastContextUsage;
-      this.store.upsert({
-        ...live,
-        configJson: this.store.writeConfig(cfg),
-        updatedUtc: new Date().toISOString(),
-      });
-
-      const overlay = this.configMutation.applyThreadOverlay({
-        threadId: channel.id,
-        ...(channel.parentId ? { parentRef: channel.parentId } : {}),
-        changes: { model: canonicalId, effort: defaultEffort },
-        actor,
-      });
-      if (!overlay.ok) {
-        const rolled = rollback();
-        this.logger.warn(
-          { err: overlay.error, threadId: channel.id },
-          "thread model overlay write failed; mutation rolled back"
-        );
-        return fail(`${overlay.error}${mismatchSuffix(rolled)}`);
-      }
-
-      const verified = this.store.get(live.id) ?? live;
-      const described = this.router.describeConfig(verified);
-      const spawn = this.router.planRuntimeSpawn(verified);
-      if (described.model.value !== canonicalId || spawn.model !== selected.runtimeId) {
-        const rolled = rollback();
-        return fail(
-          `the effective configuration did not match the requested model.${mismatchSuffix(rolled)}`
-        );
-      }
-
-      let message: string;
-      if (this.router.hasRuntime(verified.id)) {
-        // Model and its discovered default effort are one transaction. Retire
-        // the warm runtime so no live model switch can leave the old effort.
-        await this.router.invalidate(verified.id);
-        message = `🧠 Model will be \`${canonicalId}\` with effort \`${defaultEffort}\` on the next turn (session respawn).`;
-      } else {
-        message = `🧠 Model will be \`${canonicalId}\` with effort \`${defaultEffort}\` on the next turn.`;
-      }
-
-      await this.identityEffects.flush(record.id);
-      await respond(message);
-      return { ok: true, message };
-    } catch (err) {
-      const rolled = rollback();
-      const detail = err instanceof Error ? err.message : String(err);
-      this.logger.warn({ err, threadId: channel.id }, "model switch threw; mutation rolled back");
-      return fail(`${detail}${mismatchSuffix(rolled)}`);
-    }
+    return this.getRuntimeTransition().applyModelChange(channel, record, id, actor, respond);
   }
 
   private async cmdMode(i: ChatInputCommandInteraction): Promise<void> {
@@ -15090,17 +14948,7 @@ export class Orchestrator {
       return;
     }
     const id = i.options.getString("id", true);
-    const cfg = this.store.readConfig(record);
-    cfg.mode = id;
-    this.persistConfig(record, cfg);
-    if (this.router.hasRuntime(record.id)) {
-      try {
-        const rt = await this.router.getOrStartRuntime(record);
-        await rt.setMode(id);
-      } catch (err) {
-        this.logger.warn({ err }, "live mode set failed");
-      }
-    }
+    await this.getRuntimeTransition().setMode(record, id);
     await i.reply({ content: `Mode set to \`${id}\`.`, flags: MessageFlags.Ephemeral });
   }
 
@@ -15259,34 +15107,8 @@ export class Orchestrator {
 
   /** Persist the effort and invalidate the live runtime so the next turn
    *  recreates/resumes the session with the new effort applied. */
-  private async applyEffortChange(
-    record: SessionRecord,
-    level: string
-  ): Promise<void> {
-    const cfg = this.store.readConfig(record);
-    cfg.reasoningEffort = level;
-    this.persistConfig(record, cfg);
-    const overlay = this.configMutation.applyThreadOverlay({
-      threadId: record.channelRef,
-      ...(record.parentRef ? { parentRef: record.parentRef } : {}),
-      changes: { effort: level },
-      actor: { id: null, name: null },
-    });
-    if (!overlay.ok) {
-      this.logger.warn(
-        { err: overlay.error, threadId: record.channelRef },
-        "thread effort overlay write failed"
-      );
-    }
-    // Effort is applied when the session is (re)built, per the agent's
-    // mechanism: Claude via `_meta.claudeCode.options.effort` (set_config_option
-    // for "effort" errors there); Copilot via the `reasoning_effort` config
-    // option (AgentRuntime.applyConfigOptionEffort). Invalidate so the next turn
-    // rebuilds with the new effort; preserve the ACP session id for context.
-    if (this.router.hasRuntime(record.id)) {
-      await this.router.invalidate(record.id, { clearAcpSession: false });
-    }
-    await this.identityEffects.flush(record.id);
+  private async applyEffortChange(record: SessionRecord, level: string): Promise<void> {
+    await this.getRuntimeTransition().applyEffortChange(record, level);
   }
 
   private async cmdRecover(i: ChatInputCommandInteraction): Promise<void> {
@@ -17180,7 +17002,6 @@ export class Orchestrator {
     id: string,
     interaction?: ChatInputCommandInteraction
   ): Promise<{ ok: true; message: string } | { ok: false; error: string }> {
-    const parsed = parseAgentAtLocation(id);
     const respond = async (msg: string): Promise<void> => {
       if (interaction) {
         if (interaction.deferred) {
@@ -17194,196 +17015,10 @@ export class Orchestrator {
         await this.adapter.sendMessage(channel, msg);
       }
     };
-    const fail = async (error: string): Promise<{ ok: false; error: string }> => {
-      await respond(error.startsWith("Could not") ? error : `Could not switch agent: ${error}`);
-      return { ok: false, error };
-    };
-    // Re-read after picker latency (or any concurrent command) so the write is
-    // constructed from the live row, not the pre-picker snapshot.
-    record = this.store.get(record.id) ?? record;
-    const describedBefore = this.router.describeConfig(record);
-    const currentLocation = resolveThreadLocation(this.config, channel.id);
-    const nextLocation = parsed.explicit ? parsed.location : currentLocation;
-    const profile = this.router.getProfile(parsed.agentId, nextLocation);
-    if (!profile) {
-      return fail(
-        this.refuseUnregisteredAgent(parsed.agentId, `Unknown agent \`${parsed.agentId}\` at \`${nextLocation}\`.`)
-      );
-    }
-    const parkedSelect = nextLocation === LOCAL_LOCATION
-      ? this.parkedSelectRefusal(parsed.agentId)
-      : null;
-    if (parkedSelect) return fail(parkedSelect);
-
-    const sameAgent = describedBefore.agent.value === parsed.agentId;
-    const sameLocation = currentLocation === nextLocation;
-    if (sameAgent && sameLocation) {
-      await this.identityEffects.flush(record.id);
-      const msg = `Agent is already \`${formatAgentAtLocation(parsed.agentId, nextLocation)}\`.`;
-      await respond(msg);
-      return { ok: true, message: msg };
-    }
-
     const actor = interaction
       ? { id: interaction.user.id, name: interaction.user.displayName ?? interaction.user.username }
       : { id: null, name: null };
-    const sessionBefore = { ...(this.store.get(record.id) ?? record) };
-    const overlayBefore = this.configMutation.readThreadPresetEntry(channel.id);
-    const originalEffective = {
-      agent: describedBefore.agent.value,
-      model: describedBefore.model.value,
-      location: describedBefore.location.value,
-    };
-
-    const rollback = (): { acpRestored: boolean } => {
-      const overlayRestored = this.configMutation.restoreThreadPresetEntry(
-        channel.id,
-        overlayBefore
-      );
-      this.store.upsert({
-        ...sessionBefore,
-        acpSessionId: "",
-        updatedUtc: new Date().toISOString(),
-      });
-      const now = this.store.get(sessionBefore.id) ?? sessionBefore;
-      const described = this.router.describeConfig(now);
-      const canRestoreAcp =
-        Boolean(sessionBefore.acpSessionId) &&
-        described.agent.value === originalEffective.agent &&
-        described.model.value === originalEffective.model &&
-        described.location.value === originalEffective.location;
-      if (canRestoreAcp) {
-        this.store.upsert({
-          ...now,
-          acpSessionId: sessionBefore.acpSessionId,
-          updatedUtc: new Date().toISOString(),
-        });
-        return { acpRestored: true };
-      }
-      if (!overlayRestored.ok) {
-        this.logger.warn(
-          { err: overlayRestored.error, threadId: channel.id },
-          "agent-switch overlay rollback failed; ACP id left cleared"
-        );
-      }
-      return { acpRestored: false };
-    };
-
-    try {
-      await this.router.invalidate(record.id);
-      const live = this.store.get(record.id) ?? record;
-      const cfg = this.store.readConfig(live);
-      const nextBinding = { agentId: parsed.agentId, location: nextLocation };
-      const catalogDefault = this.modelCatalog.models(nextBinding, { includeHidden: true }).find((model) => model.default);
-      if (!catalogDefault) {
-        throw new Error(`model catalog for ${parsed.agentId}@${nextLocation} is warming/unavailable`);
-      }
-      if (!sameAgent) {
-        cfg.model = catalogDefault.id;
-        cfg.reasoningEffort = catalogDefault.effort.selectionDefault;
-        delete cfg.lastContextUsage;
-      }
-      const intendedModel = cfg.model ?? catalogDefault.id;
-      const intendedEntry = this.modelCatalog.model(nextBinding, intendedModel);
-      if (!intendedEntry) {
-        throw new Error(`model ${intendedModel} is unavailable in the cached catalog for ${parsed.agentId}@${nextLocation}`);
-      }
-      if (!sameAgent && cfg.reasoningEffort === undefined) {
-        cfg.reasoningEffort = intendedEntry.effort.selectionDefault;
-      }
-      const intendedSelection = this.modelCatalog.resolve(nextBinding, {
-        model: intendedModel,
-        effort: cfg.reasoningEffort,
-      });
-      this.store.upsert({
-        ...live,
-        agentId: parsed.agentId,
-        acpSessionId: "",
-        configJson: this.store.writeConfig(cfg),
-        updatedUtc: new Date().toISOString(),
-      });
-
-      if (!sameLocation) {
-        const written = this.configMutation.applyThreadLocation({
-          threadId: channel.id,
-          ...(channel.parentId ? { parentRef: channel.parentId } : {}),
-          location: nextLocation,
-          actor,
-        });
-        if (!written.ok) {
-          const rolled = rollback();
-          const suffix = rolled.acpRestored
-            ? ""
-            : " Previous ACP session was not restored because the effective agent/model/location no longer match.";
-          return fail(`${written.error}${suffix}`);
-        }
-      }
-
-      const overlay = this.configMutation.applyThreadOverlay({
-        threadId: channel.id,
-        ...(channel.parentId ? { parentRef: channel.parentId } : {}),
-        changes: {
-          agent: parsed.agentId,
-          ...(!sameAgent ? { model: intendedModel } : {}),
-          ...(!sameAgent ? { effort: intendedEntry.effort.selectionDefault } : {}),
-        },
-        actor,
-      });
-      if (!overlay.ok) {
-        const rolled = rollback();
-        const suffix = rolled.acpRestored
-          ? ""
-          : " Previous ACP session was not restored because the effective agent/model/location no longer match.";
-        this.logger.warn(
-          { err: overlay.error, threadId: channel.id },
-          "thread agent overlay write failed; mutation rolled back"
-        );
-        return fail(`${overlay.error}${suffix}`);
-      }
-
-      const verified = this.store.get(live.id) ?? live;
-      const described = this.router.describeConfig(verified);
-      const spawn = this.router.planRuntimeSpawn(verified);
-      if (
-        described.agent.value !== parsed.agentId ||
-        described.model.value !== intendedModel ||
-        spawn.agentId !== parsed.agentId ||
-        spawn.model !== intendedSelection.raw.model ||
-        spawn.effort !== intendedSelection.raw.effort
-      ) {
-        const rolled = rollback();
-        const suffix = rolled.acpRestored
-          ? ""
-          : " Previous ACP session was not restored because the effective agent/model/location no longer match.";
-        return fail(
-          `the effective configuration did not match the requested selection ` +
-          `(wanted ${parsed.agentId}@${nextLocation}/${intendedModel}/${intendedSelection.normalized.effort}; ` +
-          `got ${described.agent.value}@${described.location.value}/${described.model.value}/` +
-          `${described.effort.value ?? "default"}, runtime ${spawn.agentId}/${spawn.model}/${spawn.effort ?? "default"}).${suffix}`
-        );
-      }
-
-      bindSessionLocation(this.bridgeHub, verified.id, nextLocation);
-      // The switch is now committed. Settling earlier would cancel old-session
-      // work even when validation failed and rollback restored that session.
-      this.store.turnAttempts.settleOperatorSessionReplacement(
-        channel.id,
-        sessionBefore.acpSessionId
-      );
-      await this.identityEffects.flush(record.id);
-      const at = formatAgentAtLocation(parsed.agentId, nextLocation);
-      const message = `🤖 Agent switched to \`${at}\` (${profile.displayName}), model \`${intendedModel}\`. Next message will start a fresh session.`;
-      await respond(message);
-      return { ok: true, message };
-    } catch (err) {
-      const rolled = rollback();
-      const detail = err instanceof Error ? err.message : String(err);
-      const suffix = rolled.acpRestored
-        ? ""
-        : " Previous ACP session was not restored because the effective agent/model/location no longer match.";
-      this.logger.warn({ err, threadId: channel.id }, "agent switch threw; mutation rolled back");
-      return fail(`${detail}${suffix}`);
-    }
+    return this.getRuntimeTransition().applyAgentChange(channel, record, id, actor, respond);
   }
 
   private async cmdConfig(i: ChatInputCommandInteraction): Promise<void> {
@@ -17880,182 +17515,25 @@ export class Orchestrator {
     draft: ThreadConfigDraft,
     evt: ComponentEvent
   ): Promise<void> {
-    const plan = buildSavePlan(draft);
-    const actor = { id: evt.userId, name: evt.userName };
-    const hasPreset = Object.keys(plan.threadPreset).length > 0;
-    if (hasPreset) {
-      const written = this.configMutation.applyThreadOverlay({
-        threadId: draft.threadId,
-        ...(draft.parentRef ? { parentRef: draft.parentRef } : {}),
-        changes: plan.threadPreset,
-        actor,
-      });
-      if (!written.ok) {
-        await evt.followUpEphemeral(`Could not save: ${written.error}`).catch(() => {});
-        return;
-      }
+    const saved = await createConfigFacades({
+      store: this.store, router: this.router, mutation: this.configMutation,
+      config: this.config, modelCatalog: this.modelCatalog, logger: this.logger,
+      bridgeHub: this.bridgeHub,
+      identityCommitted: (id?: string) => this.identityEffects.flush(id),
+      persistConfig: (record: SessionRecord, cfg: SessionConfigState) => this.persistConfig(record, cfg),
+      repoDisplay: (repo: string | null) => this.repoDisplay(repo),
+      unregisteredAgentMessage: (id: string, fallback: string) => this.refuseUnregisteredAgent(id, fallback),
+      parkedSelectMessage: (id: string) => this.parkedSelectRefusal(id),
+    }).plan.saveEditor(
+      draft, { id: evt.userId, name: evt.userName },
+      parent => Orchestrator.canEditChannelPreset(this.config, evt.userId, parent)
+    );
+    if (!saved.ok) {
+      await evt.followUpEphemeral(saved.error).catch(() => {});
+      return;
     }
-    if (plan.channelPreset && Object.keys(plan.channelPreset).length > 0) {
-      if (!draft.parentRef) {
-        await evt
-          .followUpEphemeral(
-            "Could not save: this thread has no parent channel to pin a channel-wide setting on."
-          )
-          .catch(() => {});
-        return;
-      }
-      if (
-        !Orchestrator.canEditChannelPreset(this.config, evt.userId, draft.parentRef)
-      ) {
-        await evt
-          .followUpEphemeral(
-            "Could not save: channel-preset edits need a config admin (locked channels refuse non-admins)."
-          )
-          .catch(() => {});
-        return;
-      }
-      const written = this.configMutation.applyChannelOverlay({
-        channelId: draft.parentRef,
-        changes: plan.channelPreset,
-        actor,
-      });
-      if (!written.ok) {
-        await evt.followUpEphemeral(`Could not save: ${written.error}`).catch(() => {});
-        return;
-      }
-    }
-    if (plan.permission !== undefined || plan.statusCardStyle !== undefined || plan.simpleCardGif !== undefined) {
-      const record = this.router.ensureSessionRecord({
-        platform: "discord",
-        channelRef: draft.threadId,
-        ...(draft.parentRef ? { parentRef: draft.parentRef } : {}),
-        cwd: this.config.REPOS_ROOT,
-      });
-      const cfg = this.store.readConfig(record);
-      if (plan.permission !== undefined) {
-        if (plan.permission === null) {
-          delete cfg.permissionPolicy;
-        } else {
-          cfg.permissionPolicy = plan.permission;
-        }
-        delete cfg.autoApprovePermissions;
-      }
-      if (plan.statusCardStyle !== undefined) {
-        if (plan.statusCardStyle === null) {
-          delete cfg.statusCardStyle;
-        } else {
-          cfg.statusCardStyle = plan.statusCardStyle;
-        }
-      }
-      if (plan.simpleCardGif !== undefined) {
-        if (plan.simpleCardGif === null) {
-          delete cfg.simpleCardGif;
-        } else {
-          cfg.simpleCardGif = plan.simpleCardGif;
-        }
-      }
-      this.persistConfig(record, cfg);
-      if (plan.permission !== undefined) await this.router.applyPermissionMode(record);
-    }
-    // #37: Fast is a session-start dimension, so a change here MUST land on a
-    // fresh ACP session — the overlay alone would be resumed into the existing
-    // one and never applied. Clearing the stored session id (and retiring the
-    // warm runtime) is exactly the "reset the Claude session" requirement.
-    //
-    // Turning it ON is then VERIFIED against that fresh session, the same way
-    // `configure_thread` does: the card's own picker promises "a model without
-    // it is refused on Save rather than silently ignored", so the two mutation
-    // surfaces must not disagree. A refusal rolls the flag straight back.
-    //
-    // The gate is NOT "the Fast toggle moved": Fast is advertised per model, and
-    // a Claude model switch is live-config on the SAME session, so changing the
-    // model with Fast already on would otherwise leave `fastMode: true`
-    // persisted against a session that never offered it.
-    let fastRefusal: string | undefined;
-    let retireUnverifiedSession = false;
-    // Set when a possibly-Fast session could NOT be discarded — the card must
-    // not read like an ordinary successful save.
-    let fastRetireFailed = false;
-    const fastNeedsFreshSession = fastModeWillResetSession(draft);
-    if (fastNeedsFreshSession) {
-      const bound = this.store.getByChannel(PLATFORM, draft.threadId);
-      if (bound) {
-        await this.router
-          .invalidate(bound.id, {
-            clearAcpSession: true,
-            clearStartFailure: true,
-            operatorIntent: "replace-session",
-          })
-          .catch((err) =>
-            this.logger.warn({ err, threadId: draft.threadId }, "fast-mode session reset failed")
-          );
-        if (willVerifyFastMode(draft)) {
-          try {
-            const fresh = this.store.get(bound.id) ?? bound;
-            const runtime = await this.router.getOrStartRuntime(fresh);
-            const described = this.router.describeConfig(fresh);
-            // Same decision `configure_thread` makes — one rule, two surfaces.
-            const settled = settleFastMode({
-              outcome: runtime.getFastModeOutcome(),
-              agentId: described.agent.value,
-              model: described.model.value,
-              advertised: runtime.getConfigSelectValues(FAST_MODE_CONFIG_ID),
-            });
-            if (!settled.ok) {
-              fastRefusal = settled.refusal;
-              retireUnverifiedSession = settled.retireSession;
-            }
-          } catch (err) {
-            fastRefusal =
-              `Fast mode could not be verified — the replacement session failed to start: ` +
-              `${err instanceof Error ? err.message : String(err)}`;
-            this.logger.warn({ err, threadId: draft.threadId }, "fast-mode verification failed");
-          }
-          if (fastRefusal) {
-            // Roll the persisted flag back so nothing reports a state the live
-            // session does not have, and correct the draft so the saved card
-            // renders `off` instead of the requested `on`.
-            const reverted = this.configMutation.applyThreadOverlay({
-              threadId: draft.threadId,
-              ...(draft.parentRef ? { parentRef: draft.parentRef } : {}),
-              changes: { fastMode: false },
-              actor,
-            });
-            if (!reverted.ok) {
-              this.logger.error(
-                { err: reverted.error, threadId: draft.threadId },
-                "fast-mode rollback failed; persisted flag may be stale"
-              );
-            }
-            draft = { ...draft, overlay: { ...draft.overlay, fastMode: false } };
-            if (retireUnverifiedSession) {
-              // Never observed landing on `off`, so this session may actually be
-              // serving (and billing) Fast. Throw it away — it was just forged
-              // and holds no user context; the next turn starts clean.
-              try {
-                await this.router.invalidate(bound.id, {
-                  clearAcpSession: true,
-                  clearStartFailure: true,
-                });
-              } catch (err) {
-                // Log-only here would render a calm "Saved · Fast off" card over
-                // a session that may still be billing. Escalate it instead.
-                this.logger.error(
-                  { err, threadId: draft.threadId },
-                  "could not retire unverified fast-mode session"
-                );
-                fastRefusal = fastModeRetirementFailure(
-                  err instanceof Error ? err.message : String(err)
-                );
-                fastRetireFailed = true;
-              }
-            }
-          }
-        }
-      }
-    }
-
-    await this.identityEffects.flush(`discord:${draft.threadId}`);
+    draft = saved.draft;
+    const { fastRefusal, fastRetireFailed } = saved;
     // D10: do NOT abort or invalidate a live turn. Overlay applies on next spawn.
     // (#37 Fast is the one exception, handled above — it MUST reset the session.)
     this.configEditor.delete(draft.id);
@@ -21491,129 +20969,7 @@ export class Orchestrator {
     | { ok: true; record: SessionRecord; effective: ReturnType<SessionRouter["describeConfig"]>; restartRequested: boolean }
     | { ok: false; message: string; rollbackError: string }
   > {
-    let sessionBefore: SessionRecord | undefined;
-    let overlayBefore: unknown | undefined;
-    let mutationStarted = false;
-    const rollback = (): string => {
-      if (!mutationStarted || !sessionBefore) return "";
-      const restored = this.configMutation.restoreThreadPresetEntry(channel.id, overlayBefore);
-      this.store.upsert(sessionBefore);
-      return restored.ok ? "" : ` Overlay rollback also failed: ${restored.error}`;
-    };
-    try {
-      const restartRequested = prepared.kind === "json" || prepared.restartRequested;
-      if (opts.retireRuntime && restartRequested) {
-        if (prepared.kind === "named") {
-          await this.router.invalidate(record.id, { clearAcpSession: false });
-        } else {
-          await this.router.invalidate(record.id);
-        }
-      }
-      const live = this.store.get(record.id) ?? record;
-      sessionBefore = { ...live };
-      overlayBefore = this.configMutation.readThreadPresetEntry(channel.id);
-
-      if (prepared.kind === "json") {
-        mutationStarted = true;
-        this.persistConfig(live, prepared.cfg);
-      } else {
-        const liveDescription = this.router.describeConfig(live);
-        const appliedAgentId = prepared.parsedAgent?.agentId ?? liveDescription.agent.value;
-        const storedAgentId = prepared.parsedAgent?.agentId ?? live.agentId;
-        if (!this.router.getProfile(appliedAgentId, prepared.nextLocation)) {
-          throw new Error(this.refuseUnregisteredAgent(appliedAgentId, `Unknown agent \`${appliedAgentId}\`.`));
-        }
-        const cfg = this.store.readConfig(live);
-        const agentChanged = appliedAgentId !== liveDescription.agent.value;
-        const locationChanged = prepared.nextLocation !== liveDescription.location.value;
-        cfg.model = prepared.model;
-        if (request.values.model !== null || agentChanged) delete cfg.lastContextUsage;
-        if (prepared.pinnedEffort !== undefined) cfg.reasoningEffort = prepared.pinnedEffort;
-        if (request.values.role !== null) {
-          if (!prepared.requestedRole || prepared.requestedRole.toLowerCase() === "auto") delete cfg.role;
-          else cfg.role = prepared.requestedRole;
-        }
-        if (request.values.permissions !== null) {
-          cfg.permissionPolicy = prepared.permission as PermissionPolicyMode;
-          delete cfg.autoApprovePermissions;
-        }
-        if (request.values.card !== null) {
-          if (!prepared.card || prepared.card === "default") delete cfg.statusCardStyle;
-          else cfg.statusCardStyle = prepared.card as StatusCardStyle;
-        }
-        if (request.values.gif !== null) {
-          if (!prepared.gif || prepared.gif === "default") delete cfg.simpleCardGif;
-          else cfg.simpleCardGif = parseSimpleCardGif(prepared.gif);
-        }
-        if (prepared.resolvedRepo !== undefined) cfg.sessionCwdExplicit = true;
-        const updated: SessionRecord = {
-          ...live,
-          agentId: storedAgentId,
-          ...(prepared.resolvedRepo !== undefined ? { repoPath: prepared.resolvedRepo } : {}),
-          ...(agentChanged || locationChanged ? { acpSessionId: "" } : {}),
-          configJson: this.store.writeConfig(cfg),
-          updatedUtc: new Date().toISOString(),
-        };
-        mutationStarted = true;
-        this.store.upsert(updated);
-
-        const overlayChanges: { agent?: string; model?: string; effort?: string | null; location?: string } = {};
-        if (request.values.agent !== null) {
-          overlayChanges.agent = appliedAgentId;
-          overlayChanges.model = prepared.model;
-          if (prepared.parsedAgent?.explicit) overlayChanges.location = prepared.nextLocation;
-        } else if (request.values.model !== null) {
-          overlayChanges.model = prepared.model;
-        }
-        if (prepared.pinnedEffort !== undefined) overlayChanges.effort = prepared.pinnedEffort;
-        if (Object.keys(overlayChanges).length > 0) {
-          const overlaid = this.configMutation.applyThreadOverlay({
-            threadId: channel.id,
-            ...(channel.parentId ? { parentRef: channel.parentId } : {}),
-            changes: overlayChanges,
-            actor,
-          });
-          if (!overlaid.ok) throw new Error(overlaid.error);
-        }
-      }
-
-      const committed = this.store.get(record.id) ?? record;
-      if (prepared.kind === "named" && request.values.permissions !== null) {
-        await this.router.applyPermissionMode(committed);
-      }
-      const effective = this.router.describeConfig(committed);
-      if (prepared.kind === "named") {
-        const mismatch =
-          (request.values.agent !== null && effective.agent.value !== prepared.nextAgentId) ||
-          ((request.values.model !== null || prepared.nextAgentId !== this.router.describeConfig(sessionBefore).agent.value) &&
-            effective.model.value !== prepared.model) ||
-          (prepared.pinnedEffort !== undefined && effective.effort.value !== prepared.pinnedEffort) ||
-          (prepared.parsedAgent?.explicit === true && effective.location.value !== prepared.nextLocation);
-        if (mismatch) {
-          throw new Error("the effective agent/model/effort/location did not match the requested values");
-        }
-        if (prepared.parsedAgent?.explicit) {
-          bindSessionLocation(this.bridgeHub, committed.id, prepared.nextLocation);
-        }
-      }
-      mutationStarted = false;
-      if (opts.applyName) await this.identityEffects.flush(committed.id);
-      return { ok: true, record: committed, effective, restartRequested };
-    } catch (err) {
-      let rollbackError = "";
-      try {
-        rollbackError = rollback();
-      } catch (rollbackFailure) {
-        rollbackError = ` Rollback failed: ${
-          rollbackFailure instanceof Error ? rollbackFailure.message : String(rollbackFailure)
-        }`;
-      }
-      return {
-        ok: false,
-        message: err instanceof Error ? err.message : String(err),
-        rollbackError,
-      };
-    }
+    return this.getConfigApplyPlan().applyPreparedConfigSet(record, channel, request, prepared, actor, opts);
   }
 
   private async cmdConfigSet(
@@ -22136,12 +21492,7 @@ export class Orchestrator {
       | "ask"
       | "deny";
     await i.deferReply({ flags: MessageFlags.Ephemeral });
-    const cfg = this.store.readConfig(record);
-    cfg.permissionPolicy = policy;
-    // Drop the deprecated field so it can never override the new value.
-    delete cfg.autoApprovePermissions;
-    this.persistConfig(record, cfg);
-    await this.router.applyPermissionMode(record);
+    await this.getRuntimeTransition().setPermission(record, policy);
     const messages: Record<typeof policy, string> = {
       always:
         "Approval policy set to `always`. ⚠️ The agent will auto-approve every permission request (shell exec, file writes, network, etc.).",
@@ -25086,156 +24437,7 @@ export class Orchestrator {
     preset: Preset,
     options: { fresh?: boolean } = {}
   ): Promise<string> {
-    const changes: string[] = [];
-    const notes: string[] = [];
-
-    // Agent change first — mirrors applyAgentChange(): kill the runtime, reset
-    // the model to the new agent's default, and clear the ACP session id so the
-    // next message starts fresh against the new backend.
-    if (preset.agentId && preset.agentId !== record.agentId) {
-      const binding = {
-        agentId: preset.agentId,
-        location: resolveThreadLocation(this.config, channel.id),
-      };
-      const profile = this.router.getProfile(preset.agentId, binding.location);
-      if (!profile) {
-        notes.push(
-          `⚠️ ${this.refuseUnregisteredAgent(preset.agentId, `Unknown agent \`${preset.agentId}\``)} — agent left unchanged.`
-        );
-      } else {
-        const catalogDefault = this.modelCatalog.models(binding, { includeHidden: true }).find((model) => model.default);
-        if (!catalogDefault) {
-          notes.push(`⚠️ Catalog for \`${preset.agentId}@${binding.location}\` is warming/unavailable — agent left unchanged.`);
-        } else {
-          await this.router.invalidate(record.id);
-          const cfg = this.store.readConfig(record);
-          cfg.model = catalogDefault.id;
-          cfg.reasoningEffort = catalogDefault.effort.selectionDefault;
-          // Different agent → different context window; cached usage is invalid.
-          cfg.lastContextUsage = undefined;
-          this.store.upsert({
-            ...record,
-            agentId: preset.agentId,
-            acpSessionId: "",
-            configJson: this.store.writeConfig(cfg),
-            updatedUtc: new Date().toISOString(),
-          });
-          record = this.store.get(record.id) ?? record;
-          changes.push(
-            `Agent → \`${preset.agentId}\` (model \`${catalogDefault.id}\`, effort \`${catalogDefault.effort.selectionDefault}\`)`
-          );
-        }
-      }
-    }
-
-    const cfg = this.store.readConfig(record);
-    const binding = {
-      agentId: record.agentId,
-      location: resolveThreadLocation(this.config, channel.id),
-    };
-
-    if (preset.model) {
-      const catalogModel = this.modelCatalog.model(binding, preset.model);
-      if (!catalogModel) {
-        notes.push(`⚠️ Model \`${preset.model}\` skipped — unavailable in the cached catalog.`);
-      } else {
-      cfg.model = catalogModel.id;
-      if (!preset.effort) cfg.reasoningEffort = catalogModel.effort.selectionDefault;
-      // Usage was measured under the previous model — don't seed the panel with
-      // mismatched numbers. The runtime invalidation below makes the new model
-      // take effect on respawn (covers backends where setModel() is rejected).
-      cfg.lastContextUsage = undefined;
-      changes.push(`Model → \`${catalogModel.id}\``);
-      if (!preset.effort) changes.push(`Effort → ${catalogModel.effort.selectionDefault}`);
-      }
-    }
-
-    if (preset.effort) {
-      // Gate on the *effective* agent's capability, exactly like /seam effort —
-      // otherwise the summary would claim a change that silently does nothing.
-      const selectedModel = this.modelCatalog.model(binding, cfg.model ?? "default");
-      const supported = selectedModel?.effort.choices.map((choice) => choice.id) ?? [];
-      if (supported.includes(preset.effort)) {
-        cfg.reasoningEffort = preset.effort;
-        changes.push(`Effort → ${preset.effort}`);
-      } else if (selectedModel?.effort.mechanism === "modelBaked") {
-        notes.push(
-          `⚠️ Effort \`${preset.effort}\` skipped — \`${record.agentId}\` bakes effort into the model choice.`
-        );
-      } else {
-        notes.push(
-          `⚠️ Effort \`${preset.effort}\` skipped — \`${record.agentId}\` has no settable reasoning effort.`
-        );
-      }
-    }
-
-    if (preset.role) {
-      cfg.role = preset.role;
-      changes.push(`Role → \`${preset.role}\``);
-    }
-    if (preset.disableThreadPrefix !== null) {
-      if (preset.disableThreadPrefix) cfg.disableThreadPrefix = true;
-      else delete cfg.disableThreadPrefix;
-      changes.push(`Auto-name → ${preset.disableThreadPrefix ? "disabled" : "enabled"}`);
-    }
-
-    if (preset.permission) {
-      cfg.permissionPolicy = preset.permission;
-      // Drop the deprecated flag so it can't win the legacy fallback.
-      delete cfg.autoApprovePermissions;
-      changes.push(`Permission → ${preset.permission}`);
-    }
-    if (preset.toolsAllow) {
-      cfg.availableTools = preset.toolsAllow;
-      changes.push(`Tools allow → ${preset.toolsAllow.join(", ")}`);
-    }
-    if (preset.toolsExclude) {
-      cfg.excludedTools = preset.toolsExclude;
-      changes.push(`Tools exclude → ${preset.toolsExclude.join(", ")}`);
-    }
-    if (preset.statusCardStyle === "full" || preset.statusCardStyle === "simple") {
-      if (preset.statusCardStyle === "full") {
-        delete cfg.statusCardStyle;
-      } else {
-        cfg.statusCardStyle = "simple";
-      }
-      changes.push(`Status card → ${preset.statusCardStyle}`);
-    }
-
-    // One write for config + repo. `acp_session_id` is assigned out-of-band, so
-    // re-read the authoritative value rather than trusting the in-memory record
-    // (see persistConfig) — unless the agent switch above deliberately cleared it.
-    if (preset.repoPath) cfg.sessionCwdExplicit = true;
-    const live = this.store.get(record.id)?.acpSessionId;
-    this.store.upsert({
-      ...record,
-      ...(live ? { acpSessionId: live } : {}),
-      ...(preset.repoPath ? { repoPath: preset.repoPath } : {}),
-      configJson: this.store.writeConfig(cfg),
-      updatedUtc: new Date().toISOString(),
-    });
-    if (preset.repoPath) {
-      changes.push(`Repo → \`${this.repoDisplay(preset.repoPath)}\``);
-    }
-
-    if (preset.instructions) {
-      notes.push(
-        "ℹ️ Instructions are injected as the worker's `<seam-worker-identity>` when this preset " +
-          "runs as a handoff/dispatch worker."
-      );
-    }
-
-    // Drop the runtime so the next message picks up every change above.
-    await this.router.invalidate(record.id);
-
-    const liveAfter = this.store.get(record.id) ?? record;
-    await this.identityEffects.flush(record.id);
-
-    const body =
-      changes.length > 0
-        ? changes.map((c) => `• ${c}`).join("\n")
-        : "_(no overrides — all fields use defaults)_";
-    return notes.length > 0 ? `${body}\n${notes.join("\n")}` : body;
+    return this.getConfigApplyPlan().applyPresetToSession(channel, record, preset, options);
   }
 
   private async cmdPresetShow(i: ChatInputCommandInteraction): Promise<void> {

@@ -3,6 +3,7 @@ import { worstStatus } from "../severity.js";
 import {
   maskRegions,
   maxTimestamp,
+  minTimestamp,
   orderUpdates,
   stableHash,
   withUniqueIds,
@@ -101,17 +102,8 @@ export function normalizeXaiFeed(
   }
 
   const notes: string[] = [];
-  const parsed: ParsedItem[] = [];
-  const seen = new Set<string>();
-  for (const raw of rawItems) {
-    const item = parseItem(label, raw, notes);
-    if (seen.has(item.incident.externalId)) {
-      failSchema(label, `duplicate incident id ${JSON.stringify(item.incident.externalId)}`);
-    }
-    seen.add(item.incident.externalId);
-    parsed.push(item);
-  }
-  const incidents = parsed.map((item) => item.incident);
+  const parsed = rawItems.map((raw) => parseItem(label, raw, notes));
+  const incidents = mergeByIncidentId(label, parsed);
 
   return {
     sourceId: config.sourceId,
@@ -235,6 +227,42 @@ function parseItem(label: string, raw: string, notes: string[]): ParsedItem {
       updates,
     },
   };
+}
+
+/**
+ * The feed lists a multi-component incident once per component, every copy
+ * carrying the same `<guid>`. Collapse them into one incident spanning those
+ * components. If copies ever disagree, the incident is active when any copy is.
+ */
+function mergeByIncidentId(label: string, items: readonly ParsedItem[]): NormalizedIncident[] {
+  const groups = new Map<string, ParsedItem[]>();
+  for (const item of items) {
+    const group = groups.get(item.incident.externalId) ?? [];
+    group.push(item);
+    groups.set(item.incident.externalId, group);
+  }
+  return [...groups.values()].map((group) => {
+    const first = group[0]!.incident;
+    if (group.length === 1) return first;
+    const copies = group.map((item) => item.incident);
+    const active = copies.find((copy) => copy.stage === "active");
+    const updates = new Map<string, RawIncidentUpdate>();
+    for (const update of copies.flatMap((copy) => copy.updates)) {
+      if (!updates.has(update.id)) updates.set(update.id, update);
+    }
+    return {
+      ...first,
+      title: first.title.replace(/^\s*\[[^\]]*\]\s*/, "") || first.title,
+      stage: active ? "active" : "resolved",
+      lifecycle: (active ?? first).lifecycle,
+      impact: worstStatus(copies.map((copy) => copy.impact)),
+      startedAt: minTimestamp(copies.map((copy) => copy.startedAt)) ?? first.startedAt,
+      updatedAt: maxTimestamp(copies.map((copy) => copy.updatedAt)) ?? first.updatedAt,
+      resolvedAt: active ? null : maxTimestamp(copies.map((copy) => copy.resolvedAt)),
+      componentIds: [...new Set(group.map((item) => item.scope.componentId))],
+      updates: orderUpdates([...updates.values()], `${label} incident ${first.externalId}`),
+    };
+  });
 }
 
 function parseUpdates(label: string, externalId: string, description: string) {

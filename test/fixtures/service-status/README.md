@@ -70,6 +70,11 @@ tests over invented payloads are what sank the previous attempt.
   and newer in the history. The history record must win regardless of read
   order. The history copy also contains two updates sharing one `display_at`,
   listed in reverse id order, to pin tie-breaking.
+- `xai/feed-live-2026-10-05.xml` — `status.x.ai/feed.xml` as served on
+  2026-10-05, all 17 items. xAI now lists a multi-component incident once per
+  component: every copy has the same `<guid>` and description, and only the
+  link path and bracketed title prefix differ (`INC72f6dd00` appears 8 times).
+  Recorded byte-for-byte.
 - `xai/case-active.xml` — an unresolved item with two updates.
 - `xai/case-ambiguous-lifecycle.xml` — `Status: RESOLVED` contradicted by the
   item's own category tags.

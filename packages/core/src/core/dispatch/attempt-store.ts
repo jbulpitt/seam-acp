@@ -257,10 +257,10 @@ export class TurnAttemptStore {
   /** A non-provider callback/setup failure can settle an admitted job before
    * execution claims it. Never overwrite a provider-owned generation. */
   completePending(id: string, outcome: DispatchResult): boolean {
-    return this.db.prepare(`UPDATE turn_attempts SET state='completed', outcome_json=?,
+    return this.settled(id, this.db.prepare(`UPDATE turn_attempts SET state='completed', outcome_json=?,
       delivery_abandoned_reason=COALESCE(delivery_abandoned_reason, ?), updated_utc=?
       WHERE id=? AND state='pending'`)
-      .run(JSON.stringify(outcome), suppressedOnwardDeliveryReason(outcome), new Date().toISOString(), id).changes === 1;
+      .run(JSON.stringify(outcome), suppressedOnwardDeliveryReason(outcome), new Date().toISOString(), id).changes === 1);
   }
 
   retireDeadOwners(): number {
@@ -934,9 +934,9 @@ export class TurnAttemptStore {
       kind: attempt.spec.kind, correlationId: attempt.spec.correlationId,
       returnTo: attempt.spec.returnTo, reportBack: attempt.spec.reportBack, chainId: attempt.spec.chainId, finishedUtc,
     };
-    return this.db.prepare(`UPDATE turn_attempts SET state='cancelled', outcome_json=?, updated_utc=?
+    return this.settled(attempt.id, this.db.prepare(`UPDATE turn_attempts SET state='cancelled', outcome_json=?, updated_utc=?
       WHERE id=? AND generation=? AND state='active' AND prompt_started=0 AND acp_session_id IS NULL`)
-      .run(JSON.stringify(outcome), finishedUtc, attempt.id, attempt.generation).changes === 1;
+      .run(JSON.stringify(outcome), finishedUtc, attempt.id, attempt.generation).changes === 1);
   }
 
   /** Explicit cancellation may win against suspension, never against captured completion. */

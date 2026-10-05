@@ -2,6 +2,14 @@ import { describe, expect, it } from "vitest";
 import { BootAcquisitionExhaustedError, DispatchAcquisitionPhase, isRetryableBootAcquisitionError } from "../packages/core/src/core/dispatch/acquisition-phase.js";
 
 describe("#448 acquisition owner outcome", () => {
+  it("a classified missing session cannot spend a load retry budget", () => {
+    const gone = Object.assign(new Error("Internal error"), {
+      data: { errorKind: "session_gone", agentId: "codex", details: "no rollout found for lost-session" },
+    });
+    expect(isRetryableBootAcquisitionError(gone)).toBe(false);
+    expect(isRetryableBootAcquisitionError(new Error("outer wrapper", { cause: gone }))).toBe(false);
+    expect(isRetryableBootAcquisitionError(new Error("Internal error"))).toBe(true);
+  });
   it.each([
     Object.assign(new Error("load timed out"), { code: "session_load_timeout" }),
     Object.assign(new Error("bridge socket lost"), { bridgeUnreachable: true }),

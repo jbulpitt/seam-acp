@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
+import { EventEmitter } from "node:events";
 import { pino } from "pino";
 import { MessageFlags } from "discord.js";
 import type { AgentProfile } from "@seam/adapters";
@@ -330,7 +331,7 @@ describe("/seam config set named parameters", () => {
     expect(connection.setSessionMode).toHaveBeenLastCalledWith({ sessionId: "s1", modeId: "agent-full-access" });
     expect(read(store).cfg.codexModes?.currentModeId).toBe("agent-full-access");
 
-    const child = { stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough() };
+    const child = Object.assign(new EventEmitter(), { stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough() });
     const adopted = router.adoptRecoveryRuntime(read(store).record, child as any, "s1");
     Object.assign(adopted, { connection });
     change({ permissionPolicy: "deny", autoApprovePermissions: true });

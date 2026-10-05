@@ -19,7 +19,7 @@ import type {
 
 export interface SupervisedBridgeFrame {
   seq: number;
-  type: "data" | "recovery" | "recovery_result" | "exit";
+  type: "data" | "stderr" | "recovery" | "recovery_result" | "exit";
   data?: string;
   recovery?: RemoteRecoverySnapshot;
   recoveryResult?: RemoteRecoveryResult;
@@ -71,6 +71,9 @@ function outputFrame(frame: SessiondOutputFrame, parsedOutput?: ReturnType<typeo
       code: frame.code ?? null,
       signal: frame.signal ?? null,
     };
+  }
+  if (frame.stream === "stderr" && typeof frame.dataBase64 === "string") {
+    return { seq: frame.seq, type: "stderr", data: Buffer.from(frame.dataBase64, "base64").toString("utf8") };
   }
   if (frame.stream !== "stdout" || typeof frame.dataBase64 !== "string") return undefined;
   const parsed = parsedOutput ?? parseAdapterChildOutput(Buffer.from(frame.dataBase64, "base64").toString("utf8"));
@@ -296,7 +299,7 @@ export class SupervisedSlots {
   }
 
   async reconcileRecovery(slot: number, input: { submissionId: unknown; acpSessionId: unknown }):
-    Promise<{ state: "owned" } | { state: "missing"; cause: string }> {
+    Promise<{ state: "owned" } | { state: "missing"; cause: string; retainChild?: true }> {
     return this.serial(slot, async () => {
       const health = (await this.options.client.listSlots()).health.find(row => row.slot === slot);
       if (!health || !health.alive || !health.attached) {
@@ -322,7 +325,8 @@ export class SupervisedSlots {
           && fresh.acpSessionId === input.acpSessionId && owner?.pid === health.pid
           && owner.alive && owner.attached && owner.resumePending === false)) return { state: "owned" };
         this.recoveries.delete(slot);
-        return { state: "missing", cause: `bridge slot ${slot} armed recovery but never received a complete session/prompt for this submission` };
+        return { state: "missing", cause: `bridge slot ${slot} armed recovery but never received a complete session/prompt for this submission`,
+          retainChild: true };
       }
       const requestId = randomUUID();
       const response = this.waitForControl(requestId);
@@ -467,7 +471,6 @@ export class SupervisedSlots {
     }
     if (event.frame.stream === "stderr" && event.frame.dataBase64) {
       this.options.onStderr(slot, Buffer.from(event.frame.dataBase64, "base64"));
-      return;
     }
     const parsed = event.frame.stream === "stdout" && event.frame.dataBase64
       ? parseAdapterChildOutput(Buffer.from(event.frame.dataBase64, "base64").toString("utf8"))

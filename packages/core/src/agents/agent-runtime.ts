@@ -252,7 +252,8 @@ export function withRetainedStderr(error: unknown, lines: readonly string[]): un
   if (!(error instanceof Error)) return error;
   const tail = lines.slice(-40).join("\n").slice(-4000).trim();
   if (!tail) return error;
-  return new Error(`${error.message}\nagent stderr (last lines):\n${tail}`, { cause: error });
+  return Object.assign(new Error(`${error.message}\nagent stderr (last lines):\n${tail}`, { cause: error }),
+    error, { name: error.name });
 }
 const NEW_SESSION_TIMEOUT_MS = 45_000;
 /**
@@ -441,6 +442,8 @@ export class AgentRuntime {
   private cwdFallback?: { requested: string; used: string };
   private cwdFallbackPending = false;
   private readonly loadSessionTimeoutMs: number;
+  private readonly stderrRing: string[] = [];
+  private remoteStderrRetained = false;
   /** Quiet time before asking the bridge whether a remote turn is hung.
    *  Production is one minute. Tests pass a few milliseconds. */
   private readonly hangSilenceMs: number;
@@ -663,17 +666,19 @@ export class AgentRuntime {
     if (this.connection || this.child) throw new Error("runtime is already attached");
     this.child = child;
     this.sessionId = sessionId;
-    if (modes) this.sessionInfo = { sessionId, availableModels: [], ...modes };
+    this.sessionInfo = { sessionId, availableModels: [], availableModes: [], ...modes };
     this.promptInFlight = true;
     this.delegatedTurn = true;
 
-    this.connectClient(child, false);
+    Object.assign(child, { remoteRung1Recovery: true });
+    this.connectClient(child, true);
   }
 
   /** Release a completed adopted prompt without sending cancel or killing twice. */
-  releaseRecovery(): void {
+  releaseRecovery(retainChild = false): void {
     this.promptInFlight = false;
     this.delegatedTurn = false;
+    if (retainChild) return;
     this.transportConnection?.close();
     this.transportConnection = undefined;
     this.connection = undefined;
@@ -681,10 +686,93 @@ export class AgentRuntime {
     this.child = undefined;
   }
 
+  private processExitError(
+    child: ReturnType<AgentProfile["spawn"]>,
+    code: number | null,
+    signal: NodeJS.Signals | null,
+    phase: "before initialize" | "mid-turn",
+  ): Error {
+    const remoteExit = (child as { remoteExit?: RemoteExitEvidence }).remoteExit;
+    if (remoteExit?.hostOom) {
+      const scope = remoteExit.hostOom.scope === "unknown" ? "" : ` (${remoteExit.hostOom.scope})`;
+      const error = new Error(
+        `remote agent process tree was killed by memory exhaustion on host '${remoteExit.bridgeId}'${scope}; `
+        + `kernel killed pid ${remoteExit.hostOom.killedPid}, supervisor exited (code=${code}, signal=${signal})`
+      );
+      attachErrorClassification(error, {
+        errorKind: "host_oom",
+        agentId: this.profile.id,
+        exitCode: code,
+        signal,
+        sourceKind: "kernel_oom",
+        details: `bridge '${remoteExit.bridgeId}' matched kernel OOM evidence to this slot's process tree`,
+      });
+      return error;
+    }
+    if (remoteExit) {
+      if (remoteExit.stderrTail && !this.remoteStderrRetained) {
+        this.remoteStderrRetained = true;
+        this.stderrRing.push(...remoteExit.stderrTail.split("\n").filter(Boolean));
+      }
+      // A remote code=1/signal=null describes the ACP supervisor, not
+      // necessarily the descendant that failed (#516). When the bridge says
+      // why, that reason is the cause; without one, say only what is known.
+      const error = new Error(
+        `remote agent supervisor exited ${phase} on host '${remoteExit.bridgeId}' `
+        + `(code=${code}, signal=${signal})`
+        + (remoteExit.reason ? `: ${remoteExit.reason}` : "; the bridge reported no reason")
+      );
+      attachErrorClassification(error, {
+        errorKind: "agent_exit",
+        agentId: this.profile.id,
+        exitCode: code,
+        signal,
+        sourceKind: "remote_supervisor_exit",
+        details: remoteExit.reason
+          ?? `bridge '${remoteExit.bridgeId}' observed the supervisor exit; descendant cause was not proven`,
+      });
+      return error;
+    }
+    return new Error(`agent process exited ${phase} (code=${code}, signal=${signal})`);
+  }
+
   private connectClient(
     child: ReturnType<AgentProfile["spawn"]>,
     observeWrites: boolean,
   ): ClientSideConnection {
+    child.on("exit", (code, signal) => {
+      // 130 = SIGINT, 143 = SIGTERM, etc. Surface the agent's own stderr tail on
+      // any abnormal exit so we can tell a self-interrupt/timeout from a crash.
+      const abnormal = (code !== 0 && code !== null) || signal != null;
+      const stderrTail = this.stderrRing.slice(-40).join("\n").slice(-4000);
+      this.logger.warn(
+        { code, signal, ...(abnormal && stderrTail ? { stderrTail } : {}) },
+        abnormal ? "agent process exited abnormally" : "agent process exited"
+      );
+      // Reject any in-flight prompt FIRST so a turn awaiting it unblocks
+      // immediately. Without this, an abnormal child exit leaves the
+      // orchestrator's `await prompt()` pending forever (the SDK doesn't
+      // reliably reject pending RPCs on a hard exit): the runtime gets evicted
+      // but the channel queue wedges — card stuck "working", activeTurns never
+      // decrements, no new turn starts, and `/seam cancel` reports "no active
+      // turn" (the runtime is already gone). Previously only a restart cleared it.
+      this.rejectInFlightPrompt?.(this.processExitError(child, code, signal, "mid-turn"));
+      // If initialize already completed, notify the router so it can evict
+      // this runtime and attempt session/load on the next incoming message.
+      if (this.connection !== undefined) {
+        this.onDead?.();
+      }
+    });
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk: string) => {
+      const line = chunk.trimEnd();
+      if (line) {
+        this.logger.debug({ stderr: line }, "agent stderr");
+        this.stderrRing.push(line);
+        if (this.stderrRing.length > 100) this.stderrRing.splice(0, this.stderrRing.length - 100);
+      }
+    });
+
     const writable = Writable.toWeb(child.stdin) as unknown as WritableStream<Uint8Array>;
     const readable = Readable.toWeb(child.stdout) as unknown as ReadableStream<Uint8Array>;
     const wire = ndJsonStream(writable, readable);
@@ -763,63 +851,13 @@ export class AgentRuntime {
       if (typeof hostNotice === "string") this.pendingModelNotices.push(hostNotice);
     }
 
-    const processExitError = (
-      code: number | null,
-      signal: NodeJS.Signals | null,
-      phase: "before initialize" | "mid-turn",
-    ): Error => {
-      const remoteExit = (child as { remoteExit?: RemoteExitEvidence }).remoteExit;
-      if (remoteExit?.hostOom) {
-        const scope = remoteExit.hostOom.scope === "unknown" ? "" : ` (${remoteExit.hostOom.scope})`;
-        const error = new Error(
-          `remote agent process tree was killed by memory exhaustion on host '${remoteExit.bridgeId}'${scope}; `
-          + `kernel killed pid ${remoteExit.hostOom.killedPid}, supervisor exited (code=${code}, signal=${signal})`
-        );
-        attachErrorClassification(error, {
-          errorKind: "host_oom",
-          agentId: this.profile.id,
-          exitCode: code,
-          signal,
-          sourceKind: "kernel_oom",
-          details: `bridge '${remoteExit.bridgeId}' matched kernel OOM evidence to this slot's process tree`,
-        });
-        return error;
-      }
-      if (remoteExit) {
-        if (remoteExit.stderrTail && !remoteStderrRetained) {
-          remoteStderrRetained = true;
-          stderrRing.push(...remoteExit.stderrTail.split("\n").filter(Boolean));
-        }
-        // A remote code=1/signal=null describes the ACP supervisor, not
-        // necessarily the descendant that failed (#516). When the bridge says
-        // why, that reason is the cause; without one, say only what is known.
-        const error = new Error(
-          `remote agent supervisor exited ${phase} on host '${remoteExit.bridgeId}' `
-          + `(code=${code}, signal=${signal})`
-          + (remoteExit.reason ? `: ${remoteExit.reason}` : "; the bridge reported no reason")
-        );
-        attachErrorClassification(error, {
-          errorKind: "agent_exit",
-          agentId: this.profile.id,
-          exitCode: code,
-          signal,
-          sourceKind: "remote_supervisor_exit",
-          details: remoteExit.reason
-            ?? `bridge '${remoteExit.bridgeId}' observed the supervisor exit; descendant cause was not proven`,
-        });
-        return error;
-      }
-      return new Error(`agent process exited ${phase} (code=${code}, signal=${signal})`);
-    };
-
     // Capture spawn errors (ENOENT, EACCES, etc.) so they surface as a
     // rejected start() promise instead of letting the ACP handshake hang
     // indefinitely on a stdout that will never produce data.
     // Ring buffer of the agent's recent stderr so an abnormal exit can report
     // WHY it died (agent stderr is otherwise debug-only, dropped at info level).
     // Bounded to the last ~100 lines.
-    const stderrRing: string[] = [];
-    let remoteStderrRetained = false;
+    const stderrRing = this.stderrRing;
     // `this.connection` is assigned synchronously below, before any exit can
     // be observed, so it cannot tell "initialize not done yet" (#610).
     let initialized = false;
@@ -837,42 +875,9 @@ export class AgentRuntime {
       child.once("exit", (code, signal) => {
         if (!spawnError && !initialized) {
           // Process died before initialize completed.
-          reject(processExitError(code, signal, "before initialize"));
+          reject(this.processExitError(child, code, signal, "before initialize"));
         }
       });
-    });
-
-    child.on("exit", (code, signal) => {
-      // 130 = SIGINT, 143 = SIGTERM, etc. Surface the agent's own stderr tail on
-      // any abnormal exit so we can tell a self-interrupt/timeout from a crash.
-      const abnormal = (code !== 0 && code !== null) || signal != null;
-      const stderrTail = stderrRing.slice(-40).join("\n").slice(-4000);
-      this.logger.warn(
-        { code, signal, ...(abnormal && stderrTail ? { stderrTail } : {}) },
-        abnormal ? "agent process exited abnormally" : "agent process exited"
-      );
-      // Reject any in-flight prompt FIRST so a turn awaiting it unblocks
-      // immediately. Without this, an abnormal child exit leaves the
-      // orchestrator's `await prompt()` pending forever (the SDK doesn't
-      // reliably reject pending RPCs on a hard exit): the runtime gets evicted
-      // but the channel queue wedges — card stuck "working", activeTurns never
-      // decrements, no new turn starts, and `/seam cancel` reports "no active
-      // turn" (the runtime is already gone). Previously only a restart cleared it.
-      this.rejectInFlightPrompt?.(processExitError(code, signal, "mid-turn"));
-      // If initialize already completed, notify the router so it can evict
-      // this runtime and attempt session/load on the next incoming message.
-      if (this.connection !== undefined) {
-        this.onDead?.();
-      }
-    });
-    child.stderr.setEncoding("utf8");
-    child.stderr.on("data", (chunk: string) => {
-      const line = chunk.trimEnd();
-      if (line) {
-        this.logger.debug({ stderr: line }, "agent stderr");
-        stderrRing.push(line);
-        if (stderrRing.length > 100) stderrRing.splice(0, stderrRing.length - 100);
-      }
     });
 
     const connection = this.connectClient(child, true);
@@ -1045,7 +1050,8 @@ export class AgentRuntime {
     /** Isolated ingest: fail the load instead of warning on setModel. */
     strictModel?: boolean;
   }): Promise<SessionInfo> {
-    return this.withClassifiedErrors("session/load", () => this.loadSessionUnclassified(opts));
+    return this.withClassifiedErrors("session/load", () => this.loadSessionUnclassified(opts)
+      .catch(error => { throw withRetainedStderr(error, this.stderrRing); }));
   }
 
   private async loadSessionUnclassified(opts: Parameters<AgentRuntime["loadSession"]>[0]): Promise<SessionInfo> {

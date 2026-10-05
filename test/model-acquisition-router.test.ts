@@ -57,6 +57,18 @@ function setup(location: string, existing = true, failAt: "spawn" | "selection" 
 }
 
 describe("production acquisition with persisted model selection", () => {
+  it("keeps an ordinary saved session when all quick load attempts would fail", async () => {
+    const h = setup("local", true, "selection");
+    h.select.mockResolvedValue({ configOptions: [] });
+    const cause = Object.assign(new Error("Internal error"), { code: -32603, data: { trace: "resume" } });
+    h.load.mockRejectedValue(cause);
+    await expect(h.make().getOrStartRuntime(h.store.get("discord:worker")!)).rejects.toBe(cause);
+    expect(h.load).toHaveBeenCalledTimes(1);
+    expect(h.create).not.toHaveBeenCalled();
+    h.reopen();
+    expect(h.store.get("discord:worker")?.acpSessionId).toBe("history");
+  });
+
   it.each(["local", "remote-one"])("reopens SQL and loads the same conversation on %s, with notice and no original replay", async location => {
     const h = setup(location);
     const rt = await h.make().getOrStartRuntime(h.store.get("discord:worker")!, { resumeSessionId: "history" });

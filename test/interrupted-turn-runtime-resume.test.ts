@@ -310,13 +310,14 @@ describe("#302 real ACP handshake and strict session/load recovery", () => {
     expect(h.store.get(record.id)?.acpSessionId).toBe(RECORDED);
   });
 
-  it("#448 ordinary attachment retains its local load retries", async () => {
+  it("ordinary attachment leaves a failed load to its recovery owner and retains the session", async () => {
     const h = harness("local", "reject-load-once");
     const record = h.store.get(`discord:${THREAD}`)!;
-    await h.router.getOrStartRuntime(record);
-    expect(h.calls.loads).toEqual([RECORDED, RECORDED]);
+    await expect(h.router.getOrStartRuntime(record)).rejects.toThrow("Internal error");
+    expect(h.calls.loads).toEqual([RECORDED]);
     expect(h.calls.initialized).toBe(1);
     expect(h.calls.news).toBe(0);
+    expect(h.calls.children[0]?.killed).toBe(true);
     expect(h.store.get(record.id)?.acpSessionId).toBe(RECORDED);
   });
 });

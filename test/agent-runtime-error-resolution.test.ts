@@ -97,6 +97,18 @@ describe("#441 real runtime boundary to pure resolver (no providers)", () => {
     await expect(rejected.runtime.prompt("fixture")).rejects.toBe(bridge);
   });
 
+  it("keeps the load RPC cause and stderr through error classification", async () => {
+    const original = new RequestError(-32603, "Internal error", { trace: "native-resume" });
+    const { runtime } = fixture(original, undefined, "codex");
+    Object.assign(runtime, { stderrRing: ["native thread/resume failed: session is busy"] });
+    const thrown = await runtime.loadSession({ sessionId: "fixture-session", cwd: "/fixture" })
+      .catch(error => error);
+    expect(thrown.message).toContain("Internal error");
+    expect(thrown.message).toContain("native thread/resume failed: session is busy");
+    expect(thrown).toMatchObject({ code: -32603, cause: original,
+      data: { trace: "native-resume", agentId: "codex", errorKind: "unclassified" } });
+  });
+
   it("leaves a successful prompt unchanged and emits no failure metric", async () => {
     const classify = vi.fn(classifyClaudeError);
     const { runtime, logger, prompt } = fixture(new Error("unused"), classify);

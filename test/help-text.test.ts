@@ -1,4 +1,5 @@
 import { describe, it, expect } from "vitest";
+import { namingRegistry } from "./plugin-naming-fixture.js";
 import {
   DISCORD_MESSAGE_CONTENT_MAX,
   HELP_PAGE_MAX,
@@ -6,9 +7,12 @@ import {
   seamHelpSections,
 } from "../packages/core/src/platforms/discord/help-text.js";
 import {
-  buildSeamAdminCommand,
-  buildSeamCommand,
+  buildSlashRegistrationBody,
 } from "../packages/core/src/platforms/discord/commands.js";
+
+const registry = namingRegistry();
+const pluginHelp = registry.help();
+const commands = buildSlashRegistrationBody(registry);
 
 /**
  * `/seam info help` was a single 2,554-character `reply({ content })` against
@@ -20,7 +24,7 @@ import {
  */
 describe("/seam info help length (#151)", () => {
   it("emits pages that every fit Discord's 2,000-character content limit", () => {
-    const pages = buildSeamHelpPages();
+    const pages = buildSeamHelpPages(undefined, pluginHelp);
     expect(pages.length).toBeGreaterThan(0);
     for (const [i, page] of pages.entries()) {
       expect(page.length, `page ${i + 1} is ${page.length} chars`).toBeLessThanOrEqual(
@@ -35,21 +39,21 @@ describe("/seam info help length (#151)", () => {
     // Guards the packer itself, not just today's text: a section that cannot
     // fit on a page of its own must still be cut, never emitted whole.
     for (const budget of [80, 200, 500, 1000]) {
-      for (const page of buildSeamHelpPages(budget)) {
+      for (const page of buildSeamHelpPages(budget, pluginHelp)) {
         expect(page.length, `budget ${budget}`).toBeLessThanOrEqual(budget);
       }
     }
   });
 
   it("would NOT fit as one message — the paging is load-bearing, not cosmetic", () => {
-    const whole = seamHelpSections().join("\n\n");
+    const whole = seamHelpSections(pluginHelp).join("\n\n");
     expect(whole.length).toBeGreaterThan(DISCORD_MESSAGE_CONTENT_MAX);
-    expect(buildSeamHelpPages().length).toBeGreaterThan(1);
+    expect(buildSeamHelpPages(undefined, pluginHelp).length).toBeGreaterThan(1);
   });
 
   it("loses no content when split into pages", () => {
-    const pages = buildSeamHelpPages();
-    for (const section of seamHelpSections()) {
+    const pages = buildSeamHelpPages(undefined, pluginHelp);
+    for (const section of seamHelpSections(pluginHelp)) {
       for (const line of section.split("\n")) {
         if (!line.trim()) continue;
         expect(pages.some((p) => p.includes(line)), line).toBe(true);
@@ -58,22 +62,22 @@ describe("/seam info help length (#151)", () => {
   });
 
   it("documents both commands, and every top-level slot of each", () => {
-    const whole = seamHelpSections().join("\n");
+    const whole = seamHelpSections(pluginHelp).join("\n");
     expect(whole).toContain("/seam");
     expect(whole).toContain("/seamadmin");
-    for (const opt of buildSeamCommand().toJSON().options ?? []) {
+    for (const opt of commands.find(command => command.name === "seam")!.options ?? []) {
       expect(whole, `/seam ${opt.name}`).toContain(opt.name);
     }
-    for (const opt of buildSeamAdminCommand().toJSON().options ?? []) {
+    for (const opt of commands.find(command => command.name === "seamadmin")!.options ?? []) {
       expect(whole, `/seamadmin ${opt.name}`).toContain(opt.name);
     }
   });
 
   it("names no command path that the builders do not publish", () => {
     // Catches help text left behind by a move (e.g. `/seam debug` after #151).
-    const seamTop = new Set((buildSeamCommand().toJSON().options ?? []).map((o) => o.name));
-    const adminTop = new Set((buildSeamAdminCommand().toJSON().options ?? []).map((o) => o.name));
-    const whole = seamHelpSections().join("\n");
+    const seamTop = new Set((commands.find(command => command.name === "seam")!.options ?? []).map((o) => o.name));
+    const adminTop = new Set((commands.find(command => command.name === "seamadmin")!.options ?? []).map((o) => o.name));
+    const whole = seamHelpSections(pluginHelp).join("\n");
     for (const match of whole.matchAll(/\/seam(admin)?\s+([a-z-]+)/g)) {
       const isAdmin = match[1] === "admin";
       const slot = match[2]!;

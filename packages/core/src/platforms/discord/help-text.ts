@@ -78,7 +78,6 @@ export function seamHelpSections(pluginHelp: readonly string[] = []): string[] {
       "`/seamadmin recover <thread> [mode]` — diagnose and repair one wedged channel queue",
       "`/seamadmin canary target:staging` — run the live staging host and agent matrix",
       ...pluginHelp,
-      "`/seamadmin schedule` — `add` `list` `remove` `toggle` `edit` (no attachments)",
       "`/seamadmin project` — `new` `list` `remove` (activate a channel, no redeploy)",
       "`/seamadmin upload` — `pull <path>` `push <file> <path>` `secret`",
       "`/seamadmin bridge` — `add` `rotate` `configure` `list` `remove` `restart` (remote hosts + safe restart)",

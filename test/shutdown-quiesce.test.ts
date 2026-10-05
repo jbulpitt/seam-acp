@@ -389,6 +389,7 @@ function makeQuiesceHost(over: Record<string, unknown> = {}) {
     config: { DISCORD_ALLOWED_USER_IDS: new Set(["u1"]), channelPresets: new Map(), threadPresets: new Map() },
     plugins: new PluginHost((over.logger ?? silent) as Logger),
     identityEffects: { ready: Promise.resolve(), flush: async () => {} },
+    scheduleUi: { ready: Promise.resolve() },
     intakeStopped: false,
     gatewayClosed: false,
     activeTurnSettles: new Set<Promise<void>>(),

@@ -184,8 +184,10 @@ function seedPromptedAttempt(h: Harness, promptStarted = true): string {
   executionIdentity({ agent: described.agent.value, location: described.location.value,
     model: described.model.value, effort: described.effort.value, cwd: described.cwd.value,
     config: identityConfig }), "boot-before-restart", "inbound");
-  h.store.turnAttempts.bind(claimed, RECORDED);
-  if (promptStarted) h.store.turnAttempts.startPrompt(claimed);
+  if (promptStarted) {
+    h.store.turnAttempts.bind(claimed, RECORDED);
+    h.store.turnAttempts.startPrompt(claimed);
+  }
   h.store.turnAttempts.suspendBoot("boot-before-restart");
   ownerSpy.mockRestore();
   return id;
@@ -212,8 +214,10 @@ describe("#302 real ACP handshake and strict session/load recovery", () => {
       agentId: "codex", location: "bridge-a", session: "live", model: d.model.value,
       effort: d.effort.value, cwd: d.cwd.value, config: record.configJson,
     }), boot);
-    h.store.turnAttempts.bind(claimed, RECORDED);
-    if (promptStarted) h.store.turnAttempts.startPrompt(claimed);
+    if (promptStarted) {
+      h.store.turnAttempts.bind(claimed, RECORDED);
+      h.store.turnAttempts.startPrompt(claimed);
+    }
     h.store.turnAttempts.suspend(spec.id, boot);
     await expect(h.orch.dispatchInjectTurn(spec)).rejects.toMatchObject({
       reason: expect.stringMatching(/^reauth-waiting:/),
@@ -221,7 +225,7 @@ describe("#302 real ACP handshake and strict session/load recovery", () => {
     expect(h.calls.loads).toEqual([RECORDED]);
     expect(h.calls.prompts).toEqual([]);
     expect(h.store.turnAttempts.get(spec.id)).toMatchObject({
-      state: "suspended", promptStarted, acpSessionId: RECORDED, outcome: null,
+      state: "suspended", promptStarted, acpSessionId: promptStarted ? RECORDED : null, outcome: null,
       stalledReason: expect.stringMatching(/^reauth-waiting:/),
     });
     expect(h.adapter.sendMessage.mock.calls.map(call => String(call[1])).join("\n"))
@@ -253,7 +257,7 @@ describe("#302 real ACP handshake and strict session/load recovery", () => {
     expect(h.calls.news).toBe(0);
     expect(h.calls.prompts).toEqual([]);
     expect(h.store.turnAttempts.get(id)).toMatchObject({
-      state: "suspended", promptStarted: false, outcome: null,
+      state: "suspended", promptStarted: false, acpSessionId: null, outcome: null,
       stalledReason: expect.stringMatching(/^reauth-waiting:/),
     });
     const notice = h.adapter.sendMessage.mock.calls.map(call => String(call[1])).join("\n");

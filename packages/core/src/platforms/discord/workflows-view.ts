@@ -28,8 +28,14 @@ const STATUS_ICON: Record<DelegationStatus, string> = {
 
 /** Trailing, human-sized slice of an id (drops a `del-`/`corr-` style prefix). */
 export function shortId(id: string): string {
+  const uuid = id.match(/(?:^|-)([0-9a-f]{8})-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
+  if (uuid) return uuid[1]!;
   const tail = id.includes("-") ? id.slice(id.lastIndexOf("-") + 1) : id;
   return tail.length > 8 ? tail.slice(0, 8) : tail;
+}
+
+export function workflowActionLabel(action: "resume" | "abandon", row: InterruptedTurnRow, now: Date): string {
+  return action === "resume" ? `Resume ${shortId(row.id)} (${formatAge(row.startedUtc, now)})` : `Abandon ${shortId(row.id)}`;
 }
 
 /** A thread/session ref without its platform prefix, clamped for one line. */

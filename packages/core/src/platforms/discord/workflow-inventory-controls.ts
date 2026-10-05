@@ -17,7 +17,7 @@
 import { SerialQueue } from "../../core/serial-queue.js";
 import { ActionGuard, type CardView } from "./collector-lifecycle.js";
 
-export type WorkflowInventoryAction = "resume" | "abandon" | "page";
+export type WorkflowInventoryAction = "resume" | "abandon" | "page" | "category";
 
 /** What one `handle` call did, for logging and tests. */
 export type WorkflowInventoryOutcome =
@@ -31,7 +31,7 @@ export interface WorkflowInventoryPort {
   resume(id: string): Promise<string>;
   abandon(id: string): Promise<string>;
   /** Rebuild the card from authoritative state. */
-  render(page: number): Promise<{ embeds: unknown[]; components: unknown[]; page: number }>;
+  render(page: number, category?: string): Promise<{ embeds: unknown[]; components: unknown[]; page: number }>;
   /** Repeatable re-render — the card stays live. */
   refresh(view: CardView): Promise<boolean>;
   /** Terminal replace — nothing actionable is left. */
@@ -51,7 +51,7 @@ export function parseWorkflowInventoryClick(
   if (ns !== "wf") return null;
   const arg = rest.join(":");
   if (!arg) return null;
-  if (action === "resume" || action === "abandon" || action === "page") {
+  if (action === "resume" || action === "abandon" || action === "page" || action === "category") {
     return { action, arg };
   }
   return null;
@@ -69,6 +69,7 @@ export class WorkflowInventoryController {
    */
   private readonly renders = new SerialQueue();
   private page = 0;
+  private category?: string;
 
   constructor(private readonly port: WorkflowInventoryPort) {}
 
@@ -88,6 +89,11 @@ export class WorkflowInventoryController {
   ): Promise<WorkflowInventoryOutcome> {
     const parsed = parseWorkflowInventoryClick(customId);
     if (!parsed) return "ignored";
+
+    if (parsed.action === "category") {
+      await this.rerender(0, parsed.action, parsed.arg === "home" ? undefined : parsed.arg);
+      return "paged";
+    }
 
     if (parsed.action === "page") {
       const requested = Number(parsed.arg);
@@ -121,9 +127,10 @@ export class WorkflowInventoryController {
    * a separate reply. `"current"` resolves *inside* the critical section, so a
    * page change queued ahead is honoured rather than overwritten.
    */
-  private rerender(page: number | "current", reason: string): Promise<void> {
+  private rerender(page: number | "current", reason: string, category?: string): Promise<void> {
     return this.renders.run(async () => {
-      const rebuilt = await this.port.render(page === "current" ? this.page : page);
+      if (reason === "category") this.category = category;
+      const rebuilt = await this.port.render(page === "current" ? this.page : page, this.category);
       this.page = rebuilt.page;
       if (rebuilt.components.length === 0) {
         // Nothing actionable left: terminal state, no components at all.

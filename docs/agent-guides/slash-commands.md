@@ -99,6 +99,10 @@ cancelling an item. The default inventory is this thread, newest first;
 only for a recorded continuation that passes the existing admission checks.
 Completed output can be abandoned, not rerun; consumed records remain visible
 as history with no action available.
+The bare command opens one category picker with counts for parked turns,
+wakes, watches, choices, ingests, live help and schedules. Parked controls carry
+their attempt's short id (and age for Resume); **Categories** returns to the
+picker. Existing `cancel-*` options still act directly.
 
 **Cancel options** (not new keywords):
 - `/seam cancel` — this thread, graceful

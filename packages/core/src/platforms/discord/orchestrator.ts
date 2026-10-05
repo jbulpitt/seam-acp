@@ -43,6 +43,8 @@ import {
 import type { Renderer } from "../renderer.js";
 import { serializePanelText } from "../renderer.js";
 import { choicePickerPageCaption } from "./choice-picker.js";
+import { workflowLanding, workflowNavigation, workflowCategoryList, WORKFLOW_CATEGORIES, type WorkflowCategory } from "./workflow-category-view.js";
+import { workflowActionLabel } from "./workflows-view.js";
 import { getSlashCommandAccess, getSlashAcknowledgement, type SlashCommandAccess } from "./commands.js";
 import type {
   ChatAdapter,
@@ -16587,21 +16589,22 @@ export class Orchestrator {
     const controls = new WorkflowInventoryController({
       resume: (id) => this.resumeTurnManually(id),
       abandon: (id) => this.abandonTurnManually(id),
-      render: (requested) => this.renderWorkflowInventory(i, limit, requested),
+      render: (requested, category) => this.renderWorkflowInventory(i, limit, requested, category),
       refresh: (view) => lifecycle.refresh(view),
       terminal: (reason, view) => lifecycle.terminal(reason, view),
     });
     collectAcknowledgedInteractions(collector, "update", async (c) => {
-      if (!c.isButton()) return;
+      if (!c.isButton() && !c.isStringSelectMenu()) return;
+      const customId = c.isStringSelectMenu() && c.customId === "wf:category" ? `wf:category:${c.values[0]}` : c.customId;
       const access: SlashCommandAccess = {
-        kind: c.customId.startsWith("wf:page:") ? "read-only" : "mutating",
+        kind: customId.startsWith("wf:page:") || customId.startsWith("wf:category:") ? "read-only" : "mutating",
       };
       const refusal = this.slashAccessRefusal(c, access);
       if (refusal) {
         await replyToInteraction(c, { content: refusal, flags: MessageFlags.Ephemeral });
         return;
       }
-      await controls.handle(c.customId, {
+      await controls.handle(customId, {
         followUp: async (text) => {
           await replyToInteraction(c, { content: text, flags: MessageFlags.Ephemeral }, { followUp: true });
         },
@@ -16621,14 +16624,42 @@ export class Orchestrator {
   private async renderWorkflowInventory(
     i: ChatInputCommandInteraction,
     limit: number,
-    requestedPage: number
+    requestedPage: number,
+    selectedCategory?: string
   ): Promise<{
     embeds: EmbedBuilder[];
-    components: ActionRowBuilder<ButtonBuilder>[];
+    components: (ActionRowBuilder<ButtonBuilder> | ActionRowBuilder<StringSelectMenuBuilder>)[];
     page: number;
   }> {
     const now = new Date();
     const channelRef = i.options.getString("scope") === "all" ? undefined : i.channelId;
+    const scope = channelRef ? "this thread" : "all threads";
+    const newestFirst = <T extends { createdUtc: string }>(rows: T[]) => rows.sort((a, b) => b.createdUtc.localeCompare(a.createdUtc));
+    const interrupted = await this.collectInterruptedRows(channelRef);
+    const wakes = newestFirst(this.store.listWakesByChannel(PLATFORM, channelRef));
+    const watches = newestFirst(channelRef ? this.listWatches(PLATFORM, channelRef) : this.store.listAllWatches());
+    const choices = newestFirst(this.store.listOpenChoiceCards(PLATFORM, channelRef));
+    const ingests = newestFirst(this.store.listOpenIngestEndpoints(PLATFORM, channelRef));
+    const calls = channelRef ? this.liveHelpManager?.listForThread(PLATFORM, channelRef) : this.liveHelpManager?.listActive();
+    const live = newestFirst((calls ?? []).filter(s => s.status === "starting" || s.status === "live"));
+    const schedules = newestFirst(channelRef ? this.store.listScheduledByChannel(PLATFORM, channelRef) : this.store.listAllScheduled());
+    const category = WORKFLOW_CATEGORIES.find(([id]) => id === selectedCategory)?.[0];
+    if (!category) return workflowLanding({
+      parked: interrupted.filter(row => interruptedRowActions(row).length > 0).length,
+      wakes: wakes.length, watches: watches.length, choices: choices.length,
+      ingests: ingests.length, live: live.length, schedules: schedules.length,
+    }, scope);
+    if (category !== "parked") {
+      const lines: Record<Exclude<WorkflowCategory, "parked">, string[]> = {
+        wakes: wakes.map(w => `⏰ \`${w.id}\` → ${w.fireAtUtc}${w.reason ? ` — ${w.reason.slice(0, 160)}` : ""}`),
+        watches: watches.map(w => `🔔 \`${w.id}\` ${w.kind}:${w.spec.slice(0, 160)} · expires ${w.expiresAtUtc}`),
+        choices: choices.map(c => `🗳️ \`${c.id}\` ${c.title.slice(0, 160)} (${c.clickCount}/${c.maxClicks})`),
+        ingests: ingests.map(e => `🌐 \`${e.id}\` ${e.name.slice(0, 160)}${e.thread ? ` → <#${e.thread}>` : ""}`),
+        live: live.map(s => `🎙️ \`${s.id}\` ${s.channelName ?? s.voiceChannelId} · ${s.status}`),
+        schedules: schedules.map(s => `📅 \`${s.id}\` ${s.name} · ${s.enabled ? "enabled" : "disabled"}`),
+      };
+      return workflowCategoryList(category, lines[category], scope, requestedPage, limit);
+    }
     const active = this.store.listActiveDelegations(channelRef)
       .sort((a, b) => b.createdUtc.localeCompare(a.createdUtc));
     const view = formatWorkflowsView(
@@ -16638,7 +16669,7 @@ export class Orchestrator {
     );
 
     const embed = new EmbedBuilder()
-      .setTitle(`🔀 Workflows — ${channelRef ? "this thread" : "all threads"}`)
+      .setTitle(`🔀 Parked turns — ${scope}`)
       .setColor(WORKFLOWS_COLOR);
 
     if (view.empty) {
@@ -16685,97 +16716,10 @@ export class Orchestrator {
       embed.setFooter({ text: `showing up to ${limit} recent rows` });
     }
 
-    const record = this.recordFromInteraction(i);
-    if (record || !channelRef) {
-      const newestFirst = <T extends { createdUtc: string }>(rows: T[]) => rows.sort((a, b) => b.createdUtc.localeCompare(a.createdUtc));
-      const wakes = newestFirst(this.store.listWakesByChannel(PLATFORM, channelRef));
-      if (wakes.length > 0) {
-        const lines = wakes
-          .slice(0, 10)
-          .map((w) => {
-            const reason = w.reason ? ` — ${w.reason}` : "";
-            const depth = w.chainDepth > 0 ? ` (chain-depth ${w.chainDepth})` : "";
-            return `⏰ \`${w.id}\` → ${w.fireAtUtc}${reason}${depth}`;
-          });
-        if (wakes.length > 10) lines.push(`…and ${wakes.length - 10} more`);
-        embed.addFields({
-          name: `⏰ Pending wakes (${wakes.length})`,
-          value: clampFieldValue(lines),
-        });
-        if (view.empty) embed.setDescription(null);
-      }
-
-      // Pending watches for THIS thread (#60, D7): agent-defined condition
-      // triggers, listed + cancellable via `/seam workflows cancel-watch:<id>`.
-      const watches = newestFirst(channelRef ? this.listWatches(PLATFORM, channelRef) : this.store.listAllWatches());
-      if (watches.length > 0) {
-        const lines = watches
-          .slice(0, 10)
-          .map((w) => {
-            const reason = w.reason ? ` — ${w.reason}` : "";
-            const fires = w.mode === "each" ? ` (${w.fireCount}/${w.maxFires} fires)` : "";
-            return `🔔 \`${w.id}\` → ${w.kind}:${w.spec} every ${w.intervalSeconds}s, expires ${w.expiresAtUtc}${fires}${reason}`;
-          });
-        if (watches.length > 10) lines.push(`…and ${watches.length - 10} more`);
-        embed.addFields({
-          name: `🔔 Pending watches (${watches.length})`,
-          value: clampFieldValue(lines),
-        });
-        if (view.empty) embed.setDescription(null);
-      }
-
-      const liveCalls = channelRef ? this.liveHelpManager?.listForThread(PLATFORM, channelRef) : this.liveHelpManager?.listActive();
-      const liveActive = newestFirst((liveCalls ?? []).filter((s) => s.status === "starting" || s.status === "live"));
-      if (liveActive.length > 0) {
-        const lines = liveActive.slice(0, 10).map((s) => {
-          const ch = s.channelName ? `**${s.channelName}**` : s.voiceChannelId;
-          return `🎙️ \`${s.id}\` ${ch} · ${s.status}`;
-        });
-        if (liveActive.length > 10) lines.push(`…and ${liveActive.length - 10} more`);
-        embed.addFields({
-          name: `🎙️ Live help (${liveActive.length})`,
-          value: clampFieldValue(lines),
-        });
-        if (view.empty) embed.setDescription(null);
-      }
-
-      const endpoints = newestFirst(this.store.listOpenIngestEndpoints(PLATFORM, channelRef));
-      if (endpoints.length > 0) {
-        const lines = endpoints.slice(0, 10).map((e) => {
-          const uniq = e.uniqueStudent ? " · unique-student" : "";
-          const notify = e.notifyThread ? ` · notify ${e.notifyThread}` : "";
-          const live = e.thread ? ` · live → ${e.thread}` : "";
-          const preset = e.preset ? ` · preset ${e.preset}` : "";
-          const model = e.model ? ` · ${e.model}` : "";
-          return `🌐 \`${e.id}\` ${e.name}${preset}${model}${uniq}${notify}${live}`;
-        });
-        if (endpoints.length > 10) lines.push(`…and ${endpoints.length - 10} more`);
-        embed.addFields({
-          name: `🌐 Ingest endpoints (${endpoints.length})`,
-          value: clampFieldValue(lines),
-        });
-        if (view.empty) embed.setDescription(null);
-      }
-
-      const choices = newestFirst(this.store.listOpenChoiceCards(PLATFORM, channelRef));
-      if (choices.length > 0) {
-        const lines = choices.slice(0, 10).map((c) => {
-          const last = c.lastClickerName ? ` · last ${c.lastClickerName}` : "";
-          return `🗳️ \`${c.id}\` ${c.title} (${c.clickCount}/${c.maxClicks})${last}`;
-        });
-        if (choices.length > 10) lines.push(`…and ${choices.length - 10} more`);
-        embed.addFields({
-          name: `🗳️ Open choice cards (${choices.length})`,
-          value: clampFieldValue(lines),
-        });
-        if (view.empty) embed.setDescription(null);
-      }
-    }
-
-    const interrupted = await this.collectInterruptedRows(channelRef);
     const components: ActionRowBuilder<ButtonBuilder>[] = [];
     const requiredFieldNames = new Set<string>();
     let page = 0;
+    let pageCount = 1;
     if (interrupted.length > 0) {
       // Controls exist only for rows a click can still act on, and the visible
       // lines are exactly those rows in button order. An abandoned row keeping
@@ -16783,6 +16727,7 @@ export class Orchestrator {
       // backing operation was already consumed.
       const slice = buildInterruptedInventory(interrupted, requestedPage, now);
       page = slice.page;
+      pageCount = slice.pageCount;
       if (slice.actionable) {
         embed.addFields(slice.actionable);
         // Never dropped by the embed budget below: these are the rows the
@@ -16790,7 +16735,6 @@ export class Orchestrator {
         requiredFieldNames.add(slice.actionable.name);
       }
       if (slice.inert) embed.addFields(slice.inert);
-      if (view.empty) embed.setDescription(null);
       // Per-entry Resume / Abandon \u2014 same pattern as schedule-list cards.
       // Zero extra command slots. Four rows leave the fifth for pagination.
       for (const row of slice.items) {
@@ -16800,7 +16744,7 @@ export class Orchestrator {
           buttons.push(
             new ButtonBuilder()
               .setCustomId(`wf:resume:${row.id}`)
-              .setLabel(`\u25b6\ufe0f Resume ${row.source}`.slice(0, 80))
+              .setLabel(workflowActionLabel("resume", row, now))
               .setStyle(ButtonStyle.Primary)
           );
         }
@@ -16808,7 +16752,7 @@ export class Orchestrator {
           buttons.push(
             new ButtonBuilder()
               .setCustomId(`wf:abandon:${row.id}`)
-              .setLabel("\U0001f6ab Abandon")
+              .setLabel(workflowActionLabel("abandon", row, now))
               .setStyle(ButtonStyle.Danger)
           );
         }
@@ -16816,28 +16760,8 @@ export class Orchestrator {
           components.push(new ActionRowBuilder<ButtonBuilder>().addComponents(...buttons));
         }
       }
-      if (slice.pageCount > 1) {
-        components.push(
-          new ActionRowBuilder<ButtonBuilder>().addComponents(
-            new ButtonBuilder()
-              .setCustomId(`wf:page:${slice.page - 1}`)
-              .setLabel("\u25c0 Prev")
-              .setStyle(ButtonStyle.Secondary)
-              .setDisabled(slice.page === 0),
-            new ButtonBuilder()
-              .setCustomId(`wf:page:${slice.page}`)
-              .setLabel(`Page ${slice.page + 1}/${slice.pageCount}`)
-              .setStyle(ButtonStyle.Secondary)
-              .setDisabled(true),
-            new ButtonBuilder()
-              .setCustomId(`wf:page:${slice.page + 1}`)
-              .setLabel("Next \u25b6")
-              .setStyle(ButtonStyle.Secondary)
-              .setDisabled(slice.page >= slice.pageCount - 1)
-          )
-        );
-      }
     }
+    components.push(workflowNavigation(page, pageCount));
 
     // Discord caps the WHOLE embed at 6000 chars across title/description/
     // fields/footer, independently of the 1024 per-field cap — and this card

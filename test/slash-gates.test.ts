@@ -1,11 +1,16 @@
 import { describe, expect, it, vi } from "vitest";
 import { pino } from "pino";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { buildSlashRegistrationBody, getSlashCommandAccess } from "../packages/core/src/platforms/discord/commands.js";
 import { scheduleUiFixture } from "./plugin-schedule-fixture.js";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
 import { PluginHost } from "../packages/core/src/plugins/host.js";
 import { createQuotaPlugin } from "../packages/core/src/plugins/quota/index.js";
 import { createCardVisualsPlugin } from "../packages/core/src/plugins/card-visuals/index.js";
+import { sessionBrowserPlugin } from "../packages/core/src/plugins/session-browser/index.js";
+import type { SessionBrowserFacade } from "../packages/core/src/core/session-browser.js";
 
 const ADMIN = "101";
 const PARTICIPANT = "102";
@@ -90,7 +95,6 @@ describe.each([
   it.each([
     ["info", "whoami", "cmdWhoami"],
     ["info", "help", "cmdHelp"],
-    ["info", "sessions", "cmdSessions"],
     ["config", "show", "cmdConfig"],
     ["config", "audit", "cmdConfigAudit"],
   ])("allows %s %s through the real slash handler", async (group, sub, handler) => {
@@ -100,6 +104,26 @@ describe.each([
     await orch.handleSlashInteractionInner(i);
     expect(orch[handler]).toHaveBeenCalledWith(i);
     expect(i.reply).not.toHaveBeenCalled();
+  });
+
+  it("allows plugin-owned sessions through the real slash gate", async () => {
+    const { orch, interaction } = fixture(config);
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "seam-sessions-gate-"));
+    orch.plugins = new PluginHost(orch.logger, { storageRoot: root });
+    const open = vi.fn(async () => undefined);
+    try {
+      await orch.plugins.loadBuiltins([{ id: "session-browser", load: async () =>
+        sessionBrowserPlugin({ open } as unknown as SessionBrowserFacade) }]);
+      const i = interaction("seam", "info", "sessions");
+      await orch.handleSlashInteractionInner(i);
+      expect(open).toHaveBeenCalledWith(expect.objectContaining({
+        threadId: "thread", parentId: "parent", actor: expect.objectContaining({ id: config.user }),
+      }));
+      expect(i.reply).not.toHaveBeenCalled();
+    } finally {
+      await orch.plugins.dispose();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it("allows plugin-owned usage through the real slash gate", async () => {

@@ -11,24 +11,22 @@ import { isProcessOwner, processOwner, provenDead, type ProcessOwner } from "./p
  * The truthful terminal reason for a completion whose onward delivery was
  * INTENTIONALLY skipped, or `null` when delivery is still owed (#419).
  *
- * Deliberately narrow. It fires only on the two flags that mean "the live path
- * already decided this owes nothing onward" — the same two `completionRoute`
- * terminalizes on. Anything broader would settle an attempt whose report-back
- * is genuinely still in flight, which silently drops the answer: the opposite
- * failure, and a worse one than a blocked thread, because a blocked thread is
- * at least visible.
- *
- * The reason text names transport explicitly, because an operator reading this
- * row later has to be able to tell "we chose not to send it" from "we sent it".
+ * Matches completionRoute's intentional no-delivery cases, not transport proof.
  */
 export function suppressedOnwardDeliveryReason(
-  outcome: Pick<DispatchResult, "suppressedOnward" | "inlinedReportBack">
+  outcome: Pick<DispatchResult, "suppressedOnward" | "inlinedReportBack" | "reportBack" | "returnTo" | "chainId"> & Partial<Pick<DispatchResult, "target">>
 ): string | null {
   if (outcome.inlinedReportBack) {
     return "onward delivery suppressed: report-back was inlined onto the card; transport never started";
   }
   if (outcome.suppressedOnward) {
     return "onward delivery suppressed: completion superseded before transport started";
+  }
+  if (!outcome.chainId && outcome.reportBack === false) {
+    return "onward delivery suppressed: reportBack=false; transport never started";
+  }
+  if (!outcome.chainId && outcome.returnTo && outcome.returnTo === outcome.target) {
+    return "onward delivery suppressed: output is already in the worker thread; transport never started";
   }
   return null;
 }
@@ -259,10 +257,10 @@ export class TurnAttemptStore {
   /** A non-provider callback/setup failure can settle an admitted job before
    * execution claims it. Never overwrite a provider-owned generation. */
   completePending(id: string, outcome: DispatchResult): boolean {
-    return this.db.prepare(`UPDATE turn_attempts SET state='completed', outcome_json=?,
+    return this.settled(id, this.db.prepare(`UPDATE turn_attempts SET state='completed', outcome_json=?,
       delivery_abandoned_reason=COALESCE(delivery_abandoned_reason, ?), updated_utc=?
       WHERE id=? AND state='pending'`)
-      .run(JSON.stringify(outcome), suppressedOnwardDeliveryReason(outcome), new Date().toISOString(), id).changes === 1;
+      .run(JSON.stringify(outcome), suppressedOnwardDeliveryReason(outcome), new Date().toISOString(), id).changes === 1);
   }
 
   retireDeadOwners(): number {
@@ -934,11 +932,11 @@ export class TurnAttemptStore {
       id: attempt.id, target: attempt.spec.target, status: "failed", workerStatus: "failed",
       error: reason, suppressedOnward: true,
       kind: attempt.spec.kind, correlationId: attempt.spec.correlationId,
-      returnTo: attempt.spec.returnTo, chainId: attempt.spec.chainId, finishedUtc,
+      returnTo: attempt.spec.returnTo, reportBack: attempt.spec.reportBack, chainId: attempt.spec.chainId, finishedUtc,
     };
-    return this.db.prepare(`UPDATE turn_attempts SET state='cancelled', outcome_json=?, updated_utc=?
+    return this.settled(attempt.id, this.db.prepare(`UPDATE turn_attempts SET state='cancelled', outcome_json=?, updated_utc=?
       WHERE id=? AND generation=? AND state='active' AND prompt_started=0 AND acp_session_id IS NULL`)
-      .run(JSON.stringify(outcome), finishedUtc, attempt.id, attempt.generation).changes === 1;
+      .run(JSON.stringify(outcome), finishedUtc, attempt.id, attempt.generation).changes === 1);
   }
 
   /** Explicit cancellation may win against suspension, never against captured completion. */
@@ -950,7 +948,7 @@ export class TurnAttemptStore {
         id, target: a.spec.target, status: "failed", workerStatus: "failed",
         error: reason, suppressedOnward: true,
         kind: a.spec.kind, correlationId: a.spec.correlationId,
-        returnTo: a.spec.returnTo, chainId: a.spec.chainId, finishedUtc: new Date().toISOString(),
+        returnTo: a.spec.returnTo, reportBack: a.spec.reportBack, chainId: a.spec.chainId, finishedUtc: new Date().toISOString(),
       };
       return this.db.prepare(`UPDATE turn_attempts SET state='cancelled', outcome_json=?, updated_utc=?
         WHERE id=? AND state IN ('pending','active','suspended')`)

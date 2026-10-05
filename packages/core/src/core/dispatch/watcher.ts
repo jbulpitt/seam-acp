@@ -988,6 +988,7 @@ export class DispatchWatcher {
         // it is the ACTOR, not a report-back address.
         ...(spec.kind ? { kind: spec.kind } : {}),
         ...(spec.returnTo ? { returnTo: spec.returnTo } : {}),
+        ...(spec.reportBack !== undefined ? { reportBack: spec.reportBack } : {}),
         ...(spec.chainId ? { chainId: spec.chainId } : {}),
         ...(shouldInlineCardReportBack(spec) ? { inlinedReportBack: true } : {}),
         ...(spec.prompt

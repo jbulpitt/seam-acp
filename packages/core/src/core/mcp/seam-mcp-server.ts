@@ -560,7 +560,8 @@ const TOOLS = [
       "Hand a task to a worker and (by default) get its result reported back to you. " +
       "`worker` is EITHER a thread id (a stateful teammate — the task runs in that thread's own session) " +
       "OR a preset name / `agentId@location` (a stateless specialist spun up cold for this one task). " +
-      "A thread-id worker's output is delivered back into your thread as a live turn when it finishes. " +
+      "Set `reportBack: false` when no report-back is wanted; worker output and errors remain visible in its own thread. " +
+      "Otherwise a thread-id worker's output is delivered back into your thread as a live turn when it finishes, unless `returnTo` is that worker itself. " +
       "A preset worker posts a live embed card in your thread and writes the result onto that same card when it finishes — you do not wait inline.",
     inputSchema: {
       type: "object",
@@ -572,14 +573,19 @@ const TOOLS = [
         prompt: { type: "string", description: "The task to hand off." },
         returnTo: {
           type: "string",
-          description: "Thread id to report the result back into. Defaults to YOUR thread.",
+          description: "Thread id to report the result back into. Defaults to YOUR thread. Use reportBack:false to opt out instead.",
+        },
+        reportBack: {
+          type: "boolean",
+          default: true,
+          description: "Report the result back when finished (default true). False skips only delivery; worker output and failures remain visible.",
         },
         stream: {
           type: "boolean",
           description:
             "Live-stream the worker's output into its thread as it runs, behind a start indicator (default true). " +
             "Set false for a quiet run that posts one clean artifact at the end (the indicator still shows). " +
-            "A thread-id worker's report-back always gets the full result either way. " +
+            "When enabled, a thread-id worker's report-back gets the full result either way. " +
             "A preset worker's card still posts at the end with the result on it.",
         },
         watchFeedback: {
@@ -598,12 +604,18 @@ const TOOLS = [
     name: "forward",
     description:
       "Forward a message straight into another thread — a thin handoff with no specialist framing. " +
-      "Use to relay context or nudge another teammate. The reply is reported back to you by default.",
+      "Use to relay context or nudge another teammate. The reply is reported back to you by default. " +
+      "Set `reportBack: false` when no report-back is wanted; worker output and errors remain visible in its own thread.",
     inputSchema: {
       type: "object",
       properties: {
         to: { type: "string", description: "Destination thread id." },
         content: { type: "string", description: "The message to deliver into that thread." },
+        reportBack: {
+          type: "boolean",
+          default: true,
+          description: "Report the reply back (default true). False skips only delivery; worker output and failures remain visible.",
+        },
         stream: {
           type: "boolean",
           description:
@@ -1804,10 +1816,10 @@ const INSTRUCTIONS = [
   "  a person through its test bot, in allowlisted test channels only; read its replies back.",
   "- tester_interact(kind, channel, ...): click, pick, submit a form, or run a slash command in a TEST deployment.",
   "- canary_run(target, durability?): run staging or this deployment through Discord and post one result card; durability is staging-only.",
-  "- handoff(worker, prompt, returnTo?): delegate a task. `worker` is a thread id (a stateful",
+  "- handoff(worker, prompt, returnTo?, reportBack?): delegate a task. `worker` is a thread id (a stateful",
   "  teammate) or a preset name (a fresh stateless specialist). You do NOT block — the worker's",
-  "  result is dispatched back into your thread when it completes.",
-  "- forward(to, content): relay a message into another thread (thin handoff, no specialist framing).",
+  "  result is dispatched back when it completes; use reportBack:false to skip the report-back.",
+  "- forward(to, content, reportBack?): relay a message into another thread (thin handoff, no specialist framing). Use reportBack:false to skip the report-back.",
   "- steer(thread, prompt): redirect a teammate mid-task — inject a new instruction into its live session.",
   "- configure_thread(thread, agent?, model?, effort?, role?, disableThreadPrefix?, fastMode?, rebuild?): reconfigure a teammate in YOUR channel; returns exact changed/no-change identity and posts a target confirmation card. rebuild:true then runs deterministic Discord reconstruction with a durable card in the target (and may be used alone). Agent switches reset context. `fastMode` is Claude-only, defaults off, always forges a fresh session, and spends paid usage credits.",
   "- reset_thread_session(thread): deliberately drop a teammate's context and forge a fresh session with its current agent/model.",
@@ -2609,6 +2621,7 @@ export class SeamMcpServer {
     const worker = requireString(args, "worker");
     const prompt = requireString(args, "prompt");
     const returnTo = optionalString(args, "returnTo") ?? caller.channelRef;
+    const reportBack = optionalBool(args, "reportBack");
     const stream = optionalBool(args, "stream");
     const watchFeedback = optionalBool(args, "watchFeedback");
     const parsed = parseDispatchWorker(worker);
@@ -2631,6 +2644,7 @@ export class SeamMcpServer {
       ...(toThread ? {} : { preset: parsed.name }),
       ...(parsed.kind === "named" && parsed.location ? { location: parsed.location } : {}),
       returnTo,
+      ...(reportBack !== undefined ? { reportBack } : {}),
       kind: "handoff",
       responderUserId: this.deps.dispatchResponderUserId?.(caller),
       correlationId: dispatchId,
@@ -2640,12 +2654,15 @@ export class SeamMcpServer {
     };
     await this.deps.enqueueDispatch(spec);
     this.logger.info(
-      { dispatchId, from: caller.channelRef, worker, toThread, returnTo, watchFeedback },
+      { dispatchId, from: caller.channelRef, worker, toThread, returnTo, reportBack, watchFeedback },
       "seam-mcp handoff enqueued"
     );
     return textResult(
       `Handed off to ${toThread ? `thread ${worker}` : `preset "${worker}"`} ` +
-        `(dispatch ${dispatchId}). Its result will be reported back into thread ${returnTo}.` +
+        `(dispatch ${dispatchId}). ` +
+        (reportBack === false || returnTo === spec.target
+          ? "No report-back turn will be enqueued; its result stays in the worker thread."
+          : `Its result will be reported back into thread ${returnTo}.`) +
         (watchFeedback
           ? ` It will poll its inbox for your feedback — push mid-task steering with send(to: "${spec.target}", …).`
           : "")
@@ -2658,6 +2675,7 @@ export class SeamMcpServer {
   ): Promise<McpToolResult> {
     const to = requireString(args, "to");
     const content = requireString(args, "content");
+    const reportBack = optionalBool(args, "reportBack");
     const stream = optionalBool(args, "stream");
     const dispatchId = randomUUID();
     const spec: DispatchSpec = {
@@ -2666,6 +2684,7 @@ export class SeamMcpServer {
       prompt: content,
       session: "live",
       returnTo: caller.channelRef,
+      ...(reportBack !== undefined ? { reportBack } : {}),
       kind: "forward",
       correlationId: dispatchId,
       responderUserId: this.deps.dispatchResponderUserId?.(caller),
@@ -2674,12 +2693,14 @@ export class SeamMcpServer {
     };
     await this.deps.enqueueDispatch(spec);
     this.logger.info(
-      { dispatchId, from: caller.channelRef, to },
+      { dispatchId, from: caller.channelRef, to, reportBack },
       "seam-mcp forward enqueued"
     );
     return textResult(
       `Forwarded into thread ${to} (dispatch ${dispatchId}). ` +
-        `Any reply will be reported back into thread ${caller.channelRef}.`
+        (reportBack === false || to === caller.channelRef
+          ? "No report-back turn will be enqueued; its reply stays in the worker thread."
+          : `Any reply will be reported back into thread ${caller.channelRef}.`)
     );
   }
 

@@ -110,6 +110,19 @@ describe("#419 the trigger: suppressing delivery settles the disposition", () =>
     expect(store.isDeliveryDispositionTerminal("ordinary")).toBe(false);
   });
 
+  it.each([
+    { reportBack: false, returnTo: "caller-thread" },
+    { returnTo: TARGET },
+  ])("settles intentionally skipped report-back without claiming delivery: %j", routing => {
+    completeWith("no-report-back", routing);
+    const row = store.get("no-report-back")!;
+    expect(row.state).toBe("completed");
+    expect(store.isDeliveryDispositionTerminal(row.id)).toBe(true);
+    expect(store.isDeliveryProven(row.id)).toBe(false);
+    expect(row.deliveryAbandonedReason).toMatch(/transport never started/);
+    expect(store.listUnsettledCompletions(TARGET)).toEqual([]);
+  });
+
   it("settles in the same write as the completion, leaving no window", () => {
     // A follow-up call would be the same hole, just narrower: a crash between
     // the two writes reproduces exactly the row this fixes. One statement means

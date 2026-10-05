@@ -843,8 +843,8 @@ export class Orchestrator {
   suspendForRestart(): void {
     this.restartCutoff = true;
     this.actionCards.detach();
-    for (const panel of this.adoptedStatusPanels.values()) panel.stop();
-    this.adoptedStatusPanels.clear();
+    for (const panel of this.attemptStatusPanels.values()) panel.stop();
+    this.attemptStatusPanels.clear();
     for (const unsubscribe of this.remoteAdoptionWaiters.values()) unsubscribe();
     this.remoteAdoptionWaiters.clear();
     this.store.turnAttempts.suspendBoot(this.attemptBoot);
@@ -971,7 +971,7 @@ export class Orchestrator {
   private readonly remoteRecoveryLogFailures = new Map<string, {
     cause: string; err: unknown; sinceMs: number; lastLoggedMs: number;
   }>();
-  private readonly adoptedStatusPanels = new Map<string, DispatchStatusPanel<MessageRef>>();
+  private readonly attemptStatusPanels = new Map<string, DispatchStatusPanel<MessageRef>>();
   private readonly sharedSessionAttempts = new Set<string>();
   private readonly remoteAdoptionWaiters = new Map<string, () => void>();
   /** channelRef → the harness-stamped speaker id of the human turn CURRENTLY
@@ -1210,6 +1210,11 @@ export class Orchestrator {
     this.store.turnAttempts?.onSettled?.(id => {
       this.trackContinuation(this.actionCards.finishAttempt(id).catch(err =>
         this.logger.warn({ err, attemptId: id }, "permission cleanup after turn failed")));
+      // Prompted turns finalize after output; early settlements have no live finalizer.
+      this.trackContinuation(Promise.resolve().then(async () => {
+        const attempt = this.store.turnAttempts.get(id);
+        if (attempt && !attempt.promptStarted) await this.renderPersistedTerminalAttemptCard(attempt);
+      }).catch(err => this.logger.warn({ err, attempt: id }, "terminal status-card settlement failed")));
     });
 
     this.autocomplete.register("config", "tts", "voice", "canonical", (ctx) =>
@@ -2720,7 +2725,7 @@ export class Orchestrator {
     const projection = projectAttemptCard(latest, latest);
     if (!projection) return;
     try {
-      const panel = this.adoptedStatusPanels.get(latest.id) ?? this.attemptStatusPanel(latest);
+      const panel = this.attemptStatusPanels.get(latest.id) ?? this.attemptStatusPanel(latest);
       if (!panel) return;
       await panel.finalize(projection.state, projection.action,
         latest.outcome?.finishedUtc ? Date.parse(latest.outcome.finishedUtc) : Date.now());
@@ -9506,7 +9511,7 @@ export class Orchestrator {
         const workerError = err instanceof Error ? err.message : String(err);
         const outcome: DispatchResult = {
           id: spec.id, target: spec.target, kind: spec.kind,
-          returnTo: spec.returnTo, chainId: spec.chainId, correlationId: spec.correlationId,
+          returnTo: spec.returnTo, reportBack: spec.reportBack, chainId: spec.chainId, correlationId: spec.correlationId,
           status: "failed", workerStatus: "failed", error: workerError, workerError,
           output: "", finishedUtc: new Date().toISOString(),
         };
@@ -9848,7 +9853,7 @@ export class Orchestrator {
               id: spec.id, target: spec.target, status: outcome.error ? "failed" : "completed",
               output: outcome.text, stopReason: outcome.stopReason, error: outcome.error,
               workerStatus, workerError: outcome.error, kind: spec.kind,
-              returnTo: spec.returnTo, chainId: spec.chainId, correlationId: spec.correlationId,
+              returnTo: spec.returnTo, reportBack: spec.reportBack, chainId: spec.chainId, correlationId: spec.correlationId,
               inlinedReportBack: shouldInlineCardReportBack(spec), suppressedOnward: suppressed,
               finishedUtc: new Date().toISOString(),
             });
@@ -11134,7 +11139,7 @@ export class Orchestrator {
     error?: string
   ): Promise<void> {
     const returnTo = spec.returnTo;
-    if (!returnTo) return;
+    if (!returnTo || spec.reportBack === false || returnTo === spec.target) return;
     const correlation = spec.correlationId ?? spec.id;
     const body = error
       ? `The worker did not complete cleanly: ${error}\n\n--- partial output ---\n${output}`
@@ -11307,6 +11312,7 @@ export class Orchestrator {
       createdUtc: new Date().toISOString(),
       ...(result.correlationId ? { correlationId: result.correlationId } : {}),
       ...(routedReturnTo ? { returnTo: routedReturnTo } : {}),
+      ...(result.reportBack !== undefined ? { reportBack: result.reportBack } : {}),
       ...(routedChainId ? { chainId: routedChainId } : {}),
     };
 
@@ -11902,6 +11908,16 @@ export class Orchestrator {
           }
         };
       }
+    }
+    if (statusAttempt) {
+      this.attemptStatusPanels.set(statusAttempt.id, panel);
+      const finalize = panel.finalize.bind(panel);
+      panel.finalize = async (...args) => {
+        try { await finalize(...args); }
+        finally {
+          if (this.attemptStatusPanels.get(statusAttempt.id) === panel) this.attemptStatusPanels.delete(statusAttempt.id);
+        }
+      };
     }
     return panel;
   }
@@ -14903,7 +14919,7 @@ export class Orchestrator {
     let collectOnly = false;
     let adoptedRenderer: StreamingMessageRenderer | undefined;
     const adoptedPanel = this.attemptStatusPanel(attempt);
-    if (adoptedPanel) this.adoptedStatusPanels.set(attempt.id, adoptedPanel);
+    if (adoptedPanel) this.attemptStatusPanels.set(attempt.id, adoptedPanel);
     if (recoveryRuntime && recoveryRecord) {
       const baseNonce = deliveryNonce(attempt.id);
       let fenceCounter = 0;
@@ -14979,7 +14995,7 @@ export class Orchestrator {
       if (settled) return;
       settled = true;
       adoptedPanel?.stop();
-      if (this.adoptedStatusPanels.get(attempt.id) === adoptedPanel) this.adoptedStatusPanels.delete(attempt.id);
+      if (this.attemptStatusPanels.get(attempt.id) === adoptedPanel) this.attemptStatusPanels.delete(attempt.id);
       const retained = recoveryRuntime && recoveryRecord
         && this.router.releaseRecoveryRuntime(recoveryRecord.id, recoveryRuntime, retainChild);
       this.remoteAdoptionFinishers.delete(attempt.id);
@@ -15033,6 +15049,7 @@ export class Orchestrator {
         workerStatus: failed ? "failed" : "completed",
         kind: current.spec.kind,
         returnTo: current.spec.returnTo,
+        reportBack: current.spec.reportBack,
         chainId: current.spec.chainId,
         correlationId: current.spec.correlationId,
         finishedUtc: result.finishedUtc,
@@ -15169,7 +15186,7 @@ export class Orchestrator {
       acpSessionId: binding.acpSessionId, status: "failed", text: "", error: cause, finishedUtc };
     const outcome: DispatchResult = { id: attempt.id, target: attempt.spec.target, status: "failed",
       output: "", error: cause, workerError: cause, workerStatus: "failed", finishedUtc,
-      kind: attempt.spec.kind, returnTo: attempt.spec.returnTo, correlationId: attempt.spec.correlationId,
+      kind: attempt.spec.kind, returnTo: attempt.spec.returnTo, reportBack: attempt.spec.reportBack, correlationId: attempt.spec.correlationId,
       chainId: attempt.spec.chainId };
     if (!this.store.turnAttempts.adoptRemoteResult(attempt, result, outcome)) return;
     this.logger.warn({ attempt: attempt.id, location: binding.location, slot: binding.slot, cause },

@@ -62,7 +62,7 @@ async function fixture(location = "local") {
   cleanup.push(() => store.close());
   const modelCatalog = fixtureModelCatalog(profiles);
   const threadPresets = new Map<string, ThreadPreset>([[threadId, {
-    agent: "claude", model: "claude-other", effort: "high", location,
+    agent: { value: "claude" }, model: { value: "claude-other" }, effort: { value: "high" }, location,
   }]]);
   const presetsFile = path.join(dir, "presets.json");
   fs.writeFileSync(presetsFile, JSON.stringify({ channels: {}, threads: Object.fromEntries(threadPresets) }));
@@ -73,6 +73,7 @@ async function fixture(location = "local") {
   Object.assign(record, store.get(record.id));
   const warm = await router.getOrStartRuntime(record);
   const mutation = new ConfigMutationService({ store, logger, modelCatalog,
+    tierCEnabled: false, reschedule: () => {}, defaultTimezone: "UTC",
     describeConfig: record => router.describeConfig(record), presetsFile,
     isAgentAvailable: id => Boolean(router.getProfile(id)), ollamaCloudEnabled: true,
     reloadPresets: () => {

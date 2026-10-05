@@ -16947,8 +16947,6 @@ export class Orchestrator {
     }
     draft = saved.draft;
     const { fastRefusal, fastRetireFailed } = saved;
-    // D10: do NOT abort or invalidate a live turn. Overlay applies on next spawn.
-    // (#37 Fast is the one exception, handled above — it MUST reset the session.)
     this.configEditor.delete(draft.id);
     if (draft.messageId) {
       const savedPanel = renderSavedHub(draft);

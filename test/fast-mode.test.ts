@@ -1134,6 +1134,10 @@ function saveHarness(opts: {
       get: () => rec,
       readConfig: () => ({}),
     },
+    modelCatalog: fixtureModelCatalog([{
+      id: "claude", defaultModel: "claude-opus-5",
+      effort: { mechanism: "meta", levels: ["low", "medium", "high"] },
+    } as unknown as AgentProfile]),
     router: {
       invalidate: async (id: string, o: unknown) => {
         invalidated.push({ id, opts: o });
@@ -1161,6 +1165,8 @@ function saveHarness(opts: {
       describeConfig: () => ({
         agent: { value: "claude", source: "session config" },
         model: { value: model, source: "session config" },
+        effort: { value: "medium", source: "session config" },
+        location: { value: "local", source: "default" },
       }),
       ensureSessionRecord: () => rec,
     },
@@ -1271,14 +1277,14 @@ describe("#37 — /seam config edit Save transaction", () => {
     expect(h.ephemerals.join(" ")).toMatch(/does not advertise config id "fast"/);
   });
 
-  it("a model-only change with Fast OFF does not reset or start anything", async () => {
+  it("a model-only change with Fast OFF reloads the runtime without resetting context or verifying Fast", async () => {
     const plain: ThreadConfigDraft = { ...draft(), overlay: { model: "claude-sonnet-5" } };
     expect(willResetSession(plain)).toBe(false);
     expect(willVerifyFastMode(plain)).toBe(false);
 
     const h = saveHarness();
     await h.run(plain);
-    expect(h.invalidated).toEqual([]);
+    expect(h.invalidated).toEqual([{ id: "discord:t1", opts: { clearAcpSession: false } }]);
     expect(h.started).toEqual([]);
     expect(h.ephemerals).toEqual([]);
   });

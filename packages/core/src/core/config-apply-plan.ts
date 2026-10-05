@@ -489,7 +489,8 @@ export class ConfigApplyPlan {
     return notes.length > 0 ? `${body}\n${notes.join("\n")}` : body;
   }
   async saveEditor(draft: ThreadConfigDraft, actor: MutationActor, canEditChannelPreset: (parent: string) => boolean) {
-
+    const bound = this.settings!.store.getByChannel("discord", draft.threadId);
+    const before = bound ? this.router.describeConfig(bound) : undefined;
     const plan = buildSavePlan(draft);
     const hasPreset = Object.keys(plan.threadPreset).length > 0;
     if (hasPreset) {
@@ -563,7 +564,6 @@ export class ConfigApplyPlan {
     let fastRetireFailed = false;
     const fastNeedsFreshSession = fastModeWillResetSession(draft);
     if (fastNeedsFreshSession) {
-      const bound = this.settings!.store.getByChannel("discord", draft.threadId);
       if (bound) {
         await this.runtime
           .retire(bound.id, {
@@ -632,6 +632,8 @@ export class ConfigApplyPlan {
           }
         }
       }
+    } else if (bound && before) {
+      await this.runtime.applySavedSelection(this.store.get(bound.id) ?? bound, before);
     }
 
     await this.identityEffects.flush(`discord:${draft.threadId}`);

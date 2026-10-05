@@ -61,6 +61,11 @@ process.stdin.on("data", (chunk) => {
       send({ id: message.id, result: { configOptions: [] } });
     } else if (message.method === "session/prompt") {
       const text = message.params.prompt.map((part) => part.text ?? "").join("");
+      if (process.env.FAKE_AGENT_AUTH_FAILURE && fs.existsSync(process.env.FAKE_AGENT_AUTH_FAILURE)) {
+        fs.unlinkSync(process.env.FAKE_AGENT_AUTH_FAILURE);
+        send({ id: message.id, error: { code: -32000, message: "Authentication required" } });
+        continue;
+      }
       if (text.includes("continue")) {
         if (process.env.FAKE_AGENT_REQUIRE_MODE && currentModeId !== process.env.FAKE_AGENT_REQUIRE_MODE) {
           send({ id: message.id, error: { code: -32000, message: "Codex mode lost on resume" } });

@@ -44,6 +44,12 @@ running processes keep the old code until they restart.
   controller host, because it checks the controller's bridge registry. See
   [`../bridge-rollout.md`](../bridge-rollout.md).
 
+Retained adapter children keep their old code until they exit. A terminal
+`auth_required` rejection can hand back recovery ownership without replaying
+the original prompt. If an old child cannot acknowledge that disarm, the
+updated bridge retires only that terminal child and confirms its exit. The
+durable authentication button then loads the recorded session and continues.
+
 ## Staging
 
 A second, independent deployment with its own bot, guild, checkout, `data/`

@@ -196,6 +196,40 @@ describe("#467 bridge-owned rung 1", () => {
     expect(h.results[0]).toMatchObject({ status: "failed", error: expect.stringContaining("never received a complete") });
   });
 
+  it("disarms only the exact terminal auth-required rejection after prompt bytes", () => {
+    const h = harness({ codex: true, policy: DEFAULT_REMOTE_RUNG1_POLICY });
+    sendCodex(h);
+    expect(h.recovery.disarm(4, "provider-submission")).toBe(false);
+    h.recovery.observeOutput(4, line({ id: 17, error: { code: -32000, message: "Authentication required" } }));
+    expect(h.recovery.terminalResult(4)).toMatchObject({ status: "failed", errorKind: "auth_required" });
+    expect(h.recovery.disarm(4, "wrong-submission")).toBe(false);
+    expect(h.recovery.disarm(4, "provider-submission")).toBe(true);
+    expect(h.recovery.snapshot(4)).toBeUndefined();
+    expect(h.recovery.terminalResult(4)).toBeUndefined();
+    expect(h.writes).toEqual([]);
+  });
+
+  it.each(["auth_expired", "quota_exhausted", "protocol_error"] as const)("does not disarm another terminal failure: %s", kind => {
+    const h = harness({ kind });
+    sendCodex(h);
+    h.recovery.observeOutput(4, line({ id: 17, error: { code: -32000, message: "fixture failure" } }));
+    expect(h.recovery.terminalResult(4)).toMatchObject({ status: "failed", errorKind: kind });
+    expect(h.recovery.disarm(4, "provider-submission")).toBe(false);
+  });
+
+  it("does not disarm a backoff or a completed submission", () => {
+    vi.useFakeTimers();
+    const h = harness();
+    sendCodex(h);
+    h.recovery.observeOutput(4, line({ id: 17, error: { message: "fixture timeout" } }));
+    expect(h.recovery.snapshot(4)).toMatchObject({ phase: "backoff" });
+    expect(h.recovery.disarm(4, "provider-submission")).toBe(false);
+    const done = harness();
+    sendCodex(done);
+    done.recovery.observeOutput(4, line({ id: 17, result: { stopReason: "end_turn" } }));
+    expect(done.recovery.disarm(4, "provider-submission")).toBe(false);
+  });
+
   it("continues the same session without retaining or resending the original prompt", async () => {
     vi.useFakeTimers();
     const h = harness();

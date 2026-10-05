@@ -459,10 +459,11 @@ export function createRung1Recovery(hooks: Rung1RecoveryHooks) {
 
     disarm(slot: number, submissionId: unknown): boolean {
       const state = armed.get(slot);
-      // Once bytes were observed this bridge is the sole owner. A controller
-      // may undo only an arm whose durable ledger write failed before send.
-      if (!state || state.terminal || state.submissionId !== submissionId
-        || state.inputObserved) return false;
+      if (!state || state.submissionId !== submissionId) return false;
+      // A terminal auth rejection hands ownership back for the durable park.
+      const authFailed = state.terminal && state.result?.status === "failed"
+        && state.result.errorKind === "auth_required";
+      if (!authFailed && (state.terminal || state.inputObserved)) return false;
       if (state.timer) clearTimeout(state.timer);
       armed.delete(slot);
       return true;

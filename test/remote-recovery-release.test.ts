@@ -41,11 +41,24 @@ async function delegated() {
 }
 
 describe("remote recovery release", () => {
-  it("releases only the exact bridge-proven pre-write owner", async () => {
+  it("releases only the exact bridge-acknowledged owner without erasing continuation facts", async () => {
     const { attempts, claimed } = await delegated();
     expect(attempts.releaseRemoteRecovery(claimed, { ...binding, submissionId: "different" })).toBe(false);
     expect(attempts.releaseRemoteRecovery(claimed, binding)).toBe(true);
     expect(attempts.get("turn")?.remoteRecovery).toBeUndefined();
+    expect(attempts.get("turn")).toMatchObject({ promptStarted: true, acpSessionId: "acp-1" });
+  });
+
+  it("cannot release an earlier suspended generation after continuation was claimed", async () => {
+    const { attempts, claimed } = await delegated();
+    attempts.registerOwner("boot-1");
+    attempts.markStalled(claimed.id, "reauth-completed: fixture accepted");
+    const suspended = attempts.get(claimed.id)!;
+    const resumed = attempts.claim(spec("turn"), "identity", "boot-1");
+    expect(resumed.generation).toBe(suspended.generation + 1);
+    expect(attempts.releaseLostRemoteRecovery(suspended, binding)).toBe(false);
+    expect(attempts.releaseRemoteRecovery(claimed, binding)).toBe(false);
+    expect(attempts.get("turn")?.remoteRecovery).toBeDefined();
   });
 
   it("hands a suspended turn whose bridge owner is gone back to ordinary continuation (#631)", async () => {

@@ -25,11 +25,15 @@ export async function savedSessionHost(options: {
   failLoad?: boolean;
   sessionGone?: boolean;
   legacy?: boolean;
+  oldAuthDisarm?: boolean;
+  authFailure?: boolean;
   recoverySleep?: (ms: number) => Promise<void>;
 } = {}) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "seam-797-"));
   const failure = path.join(root, "load.failure");
   if (options.failLoad) await fs.writeFile(failure, "fixture outage");
+  const authFailure = path.join(root, "auth.failure");
+  if (options.authFailure) await fs.writeFile(authFailure, "fixture authentication required");
   const bin = path.join(root, "bin");
   await fs.mkdir(bin);
   await fs.symlink(fakeAgent, path.join(bin, "codex-acp"));
@@ -85,10 +89,12 @@ export async function savedSessionHost(options: {
   }
   const socket = new Socket();
   slots = new SupervisedSlots({ client, copilotCmd: fakeAgent, localCwd: root,
-    adapterChildPath: path.join(here, options.legacy ? "adapter-child-legacy.mjs" : "adapter-child-source.mjs"),
+    adapterChildPath: path.join(here, options.oldAuthDisarm ? "adapter-child-old-auth-disarm.mjs"
+      : options.legacy ? "adapter-child-legacy.mjs" : "adapter-child-source.mjs"),
     environment: { HOME: root, PATH: `${bin}:${path.dirname(process.execPath)}:/usr/bin:/bin`,
       FAKE_AGENT_PIDS: path.join(root, "agent.pids"), FAKE_AGENT_REQUESTS: path.join(root, "requests.jsonl"),
       FAKE_AGENT_LOAD_FAILURE: failure, FAKE_AGENT_NEW_SESSION_ID: "replacement-conversation",
+      FAKE_AGENT_AUTH_FAILURE: authFailure,
       ...(options.sessionGone ? { FAKE_AGENT_MISSING_SESSION: SAVED_SESSION } : {}) },
     onFrame: frame => socket.deliver(frame), onStderr: () => {} });
   const mux = makeMux({ id: "fixture" });
@@ -123,6 +129,7 @@ export async function savedSessionHost(options: {
       adapter: adapter as any, renderer: discordRenderer as any,
       ...(options.recoverySleep ? { recoverySleep: options.recoverySleep } : {}),
       config: { ...visualConfig, DATA_DIR: root, REPOS_ROOT: root, REPO_EMOJIS: new Map(),
+        DISCORD_ALLOWED_USER_IDS: new Set(["fixture-user"]),
         channelPresets: new Map(), threadPresets: new Map() } as any });
     orch.setBridgeHub({ muxFor: () => mux, onBridgeReady: () => () => {} } as any);
     return orch;

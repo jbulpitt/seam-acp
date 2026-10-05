@@ -1408,9 +1408,7 @@ export class AgentRuntime {
       try {
         await opts.onRemoteRecovery(binding);
       } catch (error) {
-        // The bridge has not observed prompt bytes yet, so this is the one safe
-        // point to undo delegation. A failed durable bind refuses this prompt;
-        // it never creates two retry owners.
+        // Undo the unsent arm when its durable binding failed.
         await this.bridgeHealth.sendCmd("disarmRung1Recovery", {
           slot,
           submissionId: receipt.submission.id,
@@ -1475,11 +1473,8 @@ export class AgentRuntime {
         try {
           res = await run();
         } catch (error) {
-          // A rejected write is not proof that the bridge missed the bytes.
-          // Ask the bridge that observed the stream. Only its positive disarm
-          // acknowledgement permits removal of the durable owner, and even
-          // then this operation fails rather than falling back to local retry.
-          // A detached runtime left the turn running on the bridge on purpose.
+          // Only a positive bridge disarm releases ownership before error handling.
+          // Detached runtimes leave running work on the bridge.
           if (this.detached) throw error;
           const release = remoteRecoveryBinding && opts?.onRemoteRecoveryReleased;
           let disarmed: unknown;

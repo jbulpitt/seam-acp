@@ -3,6 +3,7 @@ import type { Logger } from "../lib/logger.js";
 import type { AutocompleteContext, AutocompleteResponder, AutocompleteRoundTripPolicy } from "../platforms/discord/autocomplete.js";
 import { projectRoundTripChoices } from "../platforms/discord/autocomplete.js";
 import type { PluginContext } from "./types.js";
+import type { BrowserReply } from "../core/session-browser.js";
 
 export interface SlashAccess {
   kind: "read-only" | "mutating";
@@ -13,6 +14,8 @@ export interface SlashAccess {
 export interface SlashInvocation {
   threadId: string;
   parentId?: string;
+  /** Scoped reply capability for internal persistent cards. */
+  cardReply?: BrowserReply;
   actor: Readonly<{ id: string; name: string }>;
   string(name: string): string | null;
   boolean(name: string): boolean | null;

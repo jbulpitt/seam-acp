@@ -194,6 +194,7 @@ export interface ChatAdapter {
    * config editor (#90) so hub buttons outlive the 15-minute slash token.
    */
   onComponent?(handler: (evt: ComponentEvent) => void | Promise<void>): void;
+  restoreBrowserReply?(target: string, userId: string, channelId: string): import("../core/session-browser.js").BrowserReply;
 
   /** Optional: pin a message (status card lives as the sticky post in its thread). */
   pinMessage?(message: MessageRef): Promise<void>;
@@ -353,6 +354,8 @@ export interface ComponentEvent {
   userName: string;
   channel: ChannelRef;
   messageId: string;
+  /** Scoped reply capability for internal persistent cards. */
+  cardReply?: import("../core/session-browser.js").BrowserReply;
   kind: "button" | "select" | "modal";
   values?: string[];
   fields?: Record<string, string>;

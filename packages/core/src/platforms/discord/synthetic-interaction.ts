@@ -219,6 +219,14 @@ export interface SyntheticContext {
   member: GuildMember | null;
   message?: Message;
   now?: () => number;
+  replyCreatedTimestamp?: number;
+}
+
+export interface SyntheticReplySnapshot {
+  channelId: string;
+  messageId: string;
+  createdTimestamp: number;
+  ephemeral: boolean | null;
 }
 
 export class SyntheticInteraction {
@@ -248,7 +256,7 @@ export class SyntheticInteraction {
 
   constructor(spec: TestInteractionSpec, ctx: SyntheticContext, slashTypes?: Map<string, number>) {
     this.now = ctx.now ?? Date.now;
-    this.createdTimestamp = this.now();
+    this.createdTimestamp = ctx.replyCreatedTimestamp ?? this.now();
     this.client = ctx.client;
     this.channel = ctx.channel;
     this.channelId = ctx.channel.id;
@@ -281,6 +289,21 @@ export class SyntheticInteraction {
         this.options = new SyntheticOptions(spec.subcommandGroup ?? null, spec.subcommand ?? null, spec.options ?? {}, slashTypes ?? new Map(), spec.focused);
         break;
     }
+  }
+
+  replySnapshot(): SyntheticReplySnapshot {
+    return { channelId: this.channelId, messageId: (this.replyMessage ?? this.message)!.id,
+      createdTimestamp: this.createdTimestamp, ephemeral: this.ephemeral };
+  }
+
+  static restoreReply(saved: SyntheticReplySnapshot, ctx: SyntheticContext): SyntheticInteraction {
+    const interaction = new SyntheticInteraction({ kind: "slash", channelId: saved.channelId,
+      command: "seam", subcommandGroup: "info", subcommand: "sessions" },
+      { ...ctx, replyCreatedTimestamp: saved.createdTimestamp });
+    interaction.deferred = true;
+    interaction.ephemeral = saved.ephemeral;
+    interaction.replyMessage = ctx.message;
+    return interaction;
   }
 
   get createdAt(): Date { return new Date(this.createdTimestamp); }

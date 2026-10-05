@@ -15,8 +15,8 @@
  *     already-expired card — one whose only possible answer is Discord's
  *     interaction error (#159's invariant, broken from the late-writer side).
  *
- * These tests drive the REAL `cmdSessions` collector: the real handler, the
- * real `CardLifecycle`, the real attach decision, the real settle path.
+ * These tests drive the real browser view and SessionActions facade, with the
+ * real CardLifecycle, attachment decision and kernel settle path.
  *
  * DETERMINISM. There are no timers and no `setTimeout(0)` flushes here. Two
  * explicit gates do all the sequencing:
@@ -108,8 +108,11 @@ const { describeAttachOutcome, planSessionAttachment } = await import(
   "../packages/core/src/core/session-attach.js"
 );
 const { MessageFlags } = await import("discord.js");
+const { createBrowser } = await import("../packages/core/src/plugins/session-browser/view.js");
+const { browserAccess } = await import("../packages/core/src/plugins/session-browser/index.js");
 type SessionRecord = import("../packages/core/src/core/types.js").SessionRecord;
 type Logger = import("../packages/core/src/lib/logger.js").Logger;
+type SessionBrowserFacade = import("../packages/core/src/core/session-browser.js").SessionBrowserFacade;
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
 
@@ -194,6 +197,7 @@ class FakeCollector {
       channelId: "thread-1",
       channel: { isThread: () => true, parentId: "chan-1" },
       isStringSelectMenu: () => Boolean(values),
+      isModalSubmit: () => false,
       values: values ?? [],
       // Acking the click is itself a round trip to Discord — a window in which
       // the operator can still press another button.
@@ -206,8 +210,12 @@ class FakeCollector {
       followUp: async () => {},
       reply: async () => {},
       deleteReply: async () => {},
-      showModal: async () => {},
-      awaitModalSubmit: async () => this.modal(),
+      showModal: async (modal: { toJSON(): { custom_id: string } }) => {
+        const submission = { ...evt, ...this.modal() as object,
+          customId: modal.toJSON().custom_id.replace(/:browser-1$/, ""),
+          isStringSelectMenu: () => false, isModalSubmit: () => true };
+        for (const listener of this.collectListeners) await listener(submission);
+      },
     };
     for (const l of this.collectListeners) await l(evt);
     return true;
@@ -318,6 +326,7 @@ function makeHarness(opts: HarnessOpts = {}) {
       return ok;
     },
     readConfig: () => ({ model: "opus", reasoningEffort: "high" }),
+    writeConfig: (cfg: unknown) => JSON.stringify(cfg),
     upsert: (r: SessionRecord) => {
       upserts.push(r);
       bound.value = r.acpSessionId;
@@ -355,7 +364,7 @@ function makeHarness(opts: HarnessOpts = {}) {
   const collector = new FakeCollector(paint, () => modalSubmission, () =>
     opts.onDeferUpdate?.(bound)
   );
-  /** The card's real `CardLifecycle`, captured as `cmdSessions` builds it. */
+  /** The card's real lifecycle, built by the plugin view. */
   let lifecycle!: import("../packages/core/src/platforms/discord/collector-lifecycle.js").CardLifecycle;
   const msg = { createMessageComponentCollector: () => collector };
 
@@ -459,13 +468,6 @@ function makeHarness(opts: HarnessOpts = {}) {
     return "acp-new";
   };
   (orch as any).applyThreadName = async () => {};
-  // Capture the REAL lifecycle `cmdSessions` builds — not a stand-in — so a
-  // test can issue a render through exactly the path production uses.
-  const attachReal = (orch as any).attachListLifecycle.bind(orch);
-  (orch as any).attachListLifecycle = (...args: unknown[]) => {
-    lifecycle = attachReal(...args);
-    return lifecycle;
-  };
   // The runtime-backed jobs (summary / migrate / import) signal entry here.
   runtime.onStart = () => entered.resolve();
 
@@ -495,7 +497,32 @@ function makeHarness(opts: HarnessOpts = {}) {
   return {
     orch,
     open: async () => {
-      await (orch as any).cmdSessions(interaction);
+      const binding = { agentId: record.agentId, location: opts.location ?? "local" };
+      const selectedManager = (orch as any).sessionManagerFor(profile, binding.agentId, binding.location);
+      const actions = (orch as any).makeSessionActions(record, profile, selectedManager, binding, "/repo");
+      let sessions;
+      try { sessions = await actions.list(); }
+      catch (err) { await interaction.editReply({ content: `Failed to list sessions: ${(err as Error).message}` }); return; }
+      await (orch as any).deliverParkedCardResults(interaction, record.id);
+      const active = sessions.findIndex((session: { sessionId: string }) => session.sessionId === record.acpSessionId);
+      const state = { id: "browser-1", owner: interaction.user.id, channelId: interaction.channelId,
+        expires: Date.now() + 600_000, closed: false, target: "test-reply", context: actions.snapshot(),
+        sessions, currentIndex: Math.max(0, active), imports: {} };
+      const browser = createBrowser({
+        runJob: work => (orch as any).runCardJob(work), track: work => (orch as any).trackedCardWork(work),
+        settle: input => (orch as any).settleLongJobCard(input), repoDisplay: cwd => (orch as any).repoDisplay(cwd),
+      } as Pick<SessionBrowserFacade, "runJob" | "track" | "settle" | "repoDisplay"> as SessionBrowserFacade,
+      actions, state, { ...interaction, target: "test-reply" } as any, () => {
+        if (state.closed) collector.stop("settled");
+      }, silent);
+      lifecycle = browser.lifecycle;
+      collector.on("end", () => (orch as any).trackedCardWork(browser.expire()));
+      collector.on("collect", async (evt: any) => {
+        const refusal = (orch as any).slashAccessRefusal(evt, { kind: browserAccess(evt.customId) });
+        if (refusal) { await evt.reply({ content: refusal, flags: MessageFlags.Ephemeral }); return; }
+        await browser.handle(evt);
+      });
+      await browser.render();
       if (opts.killTokenAfterOpen) tokenDead.value = true;
     },
     /** Resolves once the launched job has entered its (stubbed) pipeline. */
@@ -550,7 +577,7 @@ function customIds(payload: any): string[] {
       return;
     }
     const id = node.data?.custom_id ?? node.customId ?? node.custom_id;
-    if (typeof id === "string") ids.push(id);
+    if (typeof id === "string") ids.push(id.replace(/:browser-1$/, ""));
     if (node.components) walk(node.components);
     if (node.data?.components) walk(node.data.components);
   };

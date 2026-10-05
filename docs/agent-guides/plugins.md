@@ -2,7 +2,7 @@
 
 The controller loads `plugins/builtins.ts` in order, independently of Seam MCP.
 Only known built-ins are loaded. The controller also installs thread naming,
-card visuals, quota, schedule UI and optional service status through controller-only bootstraps.
+card visuals, quota, schedule UI, the session browser and optional service status through controller-only bootstraps.
 
 A descriptor declares its id, API version, built-in/internal eligibility,
 optional config validation and activate/dispose hooks, and contributions.
@@ -81,6 +81,28 @@ changes replace the session; model replacement follows the catalog's application
 mode, while effort changes preserve ACP context. Permission changes await the
 existing Codex mode application. Committed identity effects still drive naming.
 `thread-session-control.ts` retains the previous class and type import names.
+
+## Session actions
+
+`core/session-actions.ts` is the internal operation boundary for the session
+browser. It binds reads, clone/delete/repair, summary, compaction, import and
+migration to the browser's original host and cwd. It owns temporary runtime
+cleanup and delegates rebuild and premium compaction to the existing kernel
+operations. Compaction attachment retains the admission-time compare-and-swap
+decision; another action's binding is never overwritten.
+
+The browser receives capability and migration-target snapshots rather than
+profiles, and long-job completion callbacks retain private result delivery
+before temporary-session cleanup. This facade does not introduce a public
+plugin API or change configuration/runtime-transition rules.
+
+The session-browser built-in owns `/seam info sessions` and the persistent
+`sessions:` component route. Its scoped storage retains the browser selection,
+original host/cwd context and private reply capability across controller
+restarts. The existing owner, ten-minute browser lifetime and two-minute import
+modal lifetime remain unchanged. Navigation stays read-only; operation clicks
+use the kernel's existing mutation gates. Jobs and leaf renders still drain
+through kernel card-work tracking, with the same private result-vault fallback.
 
 ## Maintenance jobs and storage
 

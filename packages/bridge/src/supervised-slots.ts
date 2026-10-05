@@ -139,6 +139,7 @@ export class SupervisedSlots {
   private readonly configs = new Map<number, SlotSpawnConfig>();
   private readonly queues = new Map<number, Promise<unknown>>();
   private readonly recoveries = new Map<number, RemoteRecoverySnapshot>();
+  private attached = new Map<number, boolean>();
   private readonly controlWaiters = new Map<string, {
     resolve(value: unknown): void;
     reject(error: Error): void;
@@ -154,6 +155,7 @@ export class SupervisedSlots {
 
   async rebind(): Promise<SessiondListSlotsResult> {
     const listed = await this.options.client.listSlots();
+    this.attached = new Map(listed.health.map(row => [row.slot, row.alive && row.attached]));
     for (const health of listed.health) {
       // #606: sessiond keeps entries for exited children, and slot numbers
       // restart near zero on every bridge connection. Binding a dead entry as
@@ -206,8 +208,10 @@ export class SupervisedSlots {
 
   async listSlots(): Promise<SessiondListSlotsResult> {
     const listed = await this.options.client.listSlots();
-    // A holder may have reattached since rebind's recovery query.
-    await Promise.all(listed.health.filter(entry => entry.alive && entry.attached && !this.recoveries.has(entry.slot))
+    // Idle holders have no recovery record; query only on attachment.
+    const previous = this.attached;
+    this.attached = new Map(listed.health.map(row => [row.slot, row.alive && row.attached]));
+    await Promise.all(listed.health.filter(entry => entry.alive && entry.attached && !previous.get(entry.slot))
       .map(entry => this.writeControl(entry.slot, {
         v: ADAPTER_CHILD_PROTOCOL_VERSION, type: "report_recovery",
       })));

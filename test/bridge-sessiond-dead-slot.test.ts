@@ -79,13 +79,13 @@ const CHILD = `
   setInterval(() => {}, 1000);
 `;
 
-async function sessiond() {
+async function sessiond(childSource = CHILD) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "seam-606-"));
   roots.push(root);
   await fs.chmod(root, 0o700);
   const socketPath = path.join(root, "sessiond.sock");
   const childPath = path.join(root, "child.mjs");
-  await fs.writeFile(childPath, CHILD, { mode: 0o700 });
+  await fs.writeFile(childPath, childSource, { mode: 0o700 });
   const server = new SessiondServer({ socketPath, statePath: path.join(root, "slots.json") });
   servers.push(server);
   await server.start();
@@ -136,6 +136,44 @@ describe("#631 a killed slot has no recovery to adopt", () => {
 });
 
 describe("#631 a restarted bridge recovers live slots' recovery records", () => {
+  it.each([false, true])("queries an idle child only on attachment (rebound=%s)", async rebound => {
+    const { server, socketPath, childPath } = await sessiond(`
+      process.stdin.resume();
+      process.on("SIGTERM", () => process.exit(0));
+    `);
+    const only = await bridge(socketPath, childPath);
+    only.slots.configure(20, { agentId: "fixture" });
+    await only.slots.writeInput(20, "hello\n");
+    const writes = vi.spyOn(only.client, "write");
+    if (rebound) await only.slots.rebind();
+    else await only.slots.listSlots();
+    expect(writes).toHaveBeenCalledTimes(1);
+    writes.mockClear();
+
+    await only.slots.listSlots();
+    const idle = await only.slots.listSlots();
+    expect(idle.health.find(row => row.slot === 20)).not.toHaveProperty("recovery");
+    expect(writes).not.toHaveBeenCalled();
+
+    const daemon = server as any;
+    const entry = daemon.slots.get(20);
+    const connectHolder = daemon.connectHolder.bind(server);
+    const reconnect = vi.spyOn(daemon, "connectHolder").mockResolvedValue(false);
+    entry.link.destroy();
+    await until(async () => (await health(only.client, 20))?.attached === false, "idle holder detachment");
+    await only.slots.listSlots();
+    expect(writes).not.toHaveBeenCalled();
+    reconnect.mockRestore();
+    expect(await connectHolder(entry, 0)).toBe(true);
+
+    await only.slots.listSlots();
+    expect(writes).toHaveBeenCalledExactlyOnceWith(20, expect.stringContaining('"type":"report_recovery"'));
+    writes.mockClear();
+    await only.slots.listSlots();
+    await only.slots.listSlots();
+    expect(writes).not.toHaveBeenCalled();
+  });
+
   it("delivers a retained result on reattachment even when the previous controller acknowledged it", async () => {
     const { socketPath, childPath } = await sessiond();
     const only = await bridge(socketPath, childPath);

@@ -391,6 +391,7 @@ import {
 import { promptExcerpt } from "../../core/prompt-excerpt.js";
 import { buildSeamHelpPages } from "./help-text.js";
 import { frameSteerPrompt, frameInterruptPrompt } from "../../core/steer.js";
+import { agentChoiceRefusal, agentChoiceQuestion, agentChoiceOutput } from "../../core/choice/turn-origin.js";
 import { formatLocalTime } from "../../core/format-time.js";
 import { formatCoarseDuration } from "../../core/server-status.js";
 import { humanInboxFrom, scrubDiscordUrls } from "../../core/human-inject.js";
@@ -7503,6 +7504,7 @@ export class Orchestrator {
       prompt: frameInterruptPrompt(body, fresh),
       session: "live",
       returnTo: caller.channelRef,
+      originThreadRef: caller.channelRef,
       kind: "handoff",
       correlationId: dispatchId,
       createdUtc: new Date().toISOString(),
@@ -9666,13 +9668,14 @@ export class Orchestrator {
       applyPresetIdentity(runtimePrompt.prompt, preset),
       Boolean(spec.watchFeedback && seamMcp)
     );
+    const choiceRefusal = agentChoiceRefusal(spec);
     // #250: a dispatch resume stays quiet in the thread. The situation goes
     // to the model only. The note exists so a live resume can post the same
     // sentences; posting it here would be the intermediate restart message
     // that path refuses.
     const effectivePrompt = isResume
       ? (await this.processRestartRender(previousAttempt!)).prompt
-      : withHarnessPreamble(tasked, choiceAuthoringRules({ fence: true, mcp: seamMcp }), undefined, {
+      : withHarnessPreamble(tasked, choiceRefusal ? [choiceRefusal] : choiceAuthoringRules({ fence: true, mcp: seamMcp }), undefined, {
           seamMcp,
           hostTools: areHostToolsEnabled(this.config, record.parentRef ?? undefined),
           seamFences: true,
@@ -9837,6 +9840,7 @@ export class Orchestrator {
           } catch (promptErr) { throw DispatchSuspendedError.from(promptErr, spec.id, "recording prompt submission failed"); }
         },
         onOutcome: (outcome) => {
+          outcome.text = agentChoiceOutput(outcome.text, spec);
           if (this.restartCutoff) {
             throw DispatchSuspendedError.shutdown(spec.id, "restart cutoff reached before the outcome was recorded");
           }
@@ -10058,6 +10062,7 @@ export class Orchestrator {
             handleFence: async (fence, notice) => {
               if (!this.queueFenceCurrent(queueFence)) return true;
               await this.emitClosedFence(target, fence, ++streamFenceCounter, {
+                turnOrigin: spec,
                 notice,
                 preferredRoot: isolatedWorkerCwd ?? this.effectiveCwd(record),
               });
@@ -10097,6 +10102,7 @@ export class Orchestrator {
           handleFence: async (fence, notice) => {
             if (!this.queueFenceCurrent(queueFence)) return true;
             await this.emitClosedFence(target, fence, ++fenceCounter, {
+              turnOrigin: spec,
               notice,
               preferredRoot: isolatedWorkerCwd ?? this.effectiveCwd(record),
             });
@@ -10216,6 +10222,7 @@ export class Orchestrator {
           awaitIdle: true,
           logContext: { dispatch: spec.id },
         });
+        result.text = agentChoiceOutput(result.text, spec);
         if (lifecycle && !outcomeOwned) lifecycle.onOutcome(result);
         this.assertQueueFence(queueFence);
       } catch (err) {
@@ -11488,7 +11495,7 @@ export class Orchestrator {
     if (error) await this.postDispatchProse(channel, spec, "", error);
     await this.renderCapturedAgentText(channel, text,
       (prose) => prose.trim() || !error
-        ? this.postDispatchProse(channel, spec, prose) : Promise.resolve());
+        ? this.postDispatchProse(channel, spec, prose) : Promise.resolve(), spec);
   }
 
   private async postDispatchProse(
@@ -12171,7 +12178,7 @@ export class Orchestrator {
     result: InjectTurnResult
   ): Promise<void> {
     let text = "";
-    await this.renderCapturedAgentText(target, result.text ?? "", async (prose) => { text += prose; });
+    await this.renderCapturedAgentText(target, result.text ?? "", async (prose) => { text += prose; }, spec);
     const panel = this.dispatchStreamPanel({
       header,
       text,
@@ -14940,6 +14947,7 @@ export class Orchestrator {
           handleFence: async (fence, notice) => {
             fenceCounter += 1;
             await this.emitClosedFence(target, fence, fenceCounter, {
+              turnOrigin: attempt.spec,
               notice,
               preferredRoot: this.effectiveCwd(recoveryRecord!),
             });
@@ -15034,8 +15042,8 @@ export class Orchestrator {
       // A substitution selected before restart must still be visible when the
       // result is adopted without an AgentRuntime/event handler. Use the notice
       // bound before prompt bytes, not today's possibly changed thread config.
-      const output = binding.modelFallbackNotice
-        ? `${binding.modelFallbackNotice}\n\n${result.text}` : result.text;
+      const output = agentChoiceOutput(binding.modelFallbackNotice
+        ? `${binding.modelFallbackNotice}\n\n${result.text}` : result.text, current.spec);
       const error = failed
         ? result.error ?? `remote rung-1 recovery exhausted (${result.errorKind ?? "unclassified"})`
         : undefined;
@@ -15503,19 +15511,20 @@ export class Orchestrator {
   private async sendDeliveryPart(
     channel: ChannelRef,
     payload: Exclude<DurableDeliveryPayload, { kind: "messages" }>,
-    nonce: string
+    nonce: string,
+    turnOrigin?: DispatchSpec
   ): Promise<void> {
     const delivery = { nonce, enforceNonce: true as const };
     if (payload.kind === "message") {
       await this.renderCapturedAgentText(channel, payload.text, async (text) => {
         await this.adapter.sendMessage(channel, text, delivery);
-      });
+      }, turnOrigin);
       return;
     }
     if (payload.kind === "panel") {
       let description = "";
       const body = payload.panel.description ?? "";
-      await this.renderCapturedAgentText(channel, body, async (part) => { description += part; });
+      await this.renderCapturedAgentText(channel, body, async (part) => { description += part; }, turnOrigin);
       if (description.trim() || !body.trim()) {
         const panel = { ...payload.panel, description };
         if (this.adapter.sendPanel) await this.adapter.sendPanel(channel, panel, delivery);
@@ -15539,11 +15548,12 @@ export class Orchestrator {
   private async sendDeliveryPayload(
     channel: ChannelRef,
     payload: DurableDeliveryPayload,
-    nonce: string
+    nonce: string,
+    turnOrigin?: DispatchSpec
   ): Promise<void> {
     const parts = await this.deliveryParts(payload, nonce);
     for (const part of parts) {
-      await this.sendDeliveryPart(channel, part.payload, part.nonce);
+      await this.sendDeliveryPart(channel, part.payload, part.nonce, turnOrigin);
     }
   }
 
@@ -15554,7 +15564,7 @@ export class Orchestrator {
     payload: DurableDeliveryPayload
   ): Promise<void> {
     const receipt = this.store.turnAttempts.prepareDelivery(attemptId, channel.id, payload);
-    return this.sendDeliveryPayload(channel, payload, receipt.nonce);
+    return this.sendDeliveryPayload(channel, payload, receipt.nonce, this.store.turnAttempts.get(attemptId)?.spec);
   }
 
   private async recoverRecordedDelivery(
@@ -15623,7 +15633,7 @@ export class Orchestrator {
       try {
         // The same enforced nonce closes the lookup/send race at Discord: if a
         // concurrent create won, Discord returns it rather than creating another.
-        await this.sendDeliveryPart(channel, part.payload, part.nonce);
+        await this.sendDeliveryPart(channel, part.payload, part.nonce, attempt.spec);
       } catch (err) {
         this.logger.warn({ err, id: attempt.id }, "nonce-backed delivery replay deferred");
         return "deferred";
@@ -18564,12 +18574,14 @@ export class Orchestrator {
   private async renderCapturedAgentText(
     channel: ChannelRef,
     text: string,
-    postProse: (text: string) => Promise<void>
+    postProse: (text: string) => Promise<void>,
+    turnOrigin?: DispatchSpec
   ): Promise<void> {
+    text = agentChoiceOutput(text, turnOrigin);
     const parts = this.capturedAgentTextParts(text);
     let counter = 0;
     for (const part of parts) {
-      if ("fence" in part) await this.emitClosedFence(channel, part.fence, ++counter, { notice: part.notice });
+      if ("fence" in part) await this.emitClosedFence(channel, part.fence, ++counter, { notice: part.notice, turnOrigin });
       else if (part.text.trim()) await postProse(part.text);
     }
     if (!text.trim()) await postProse(text);
@@ -18580,7 +18592,7 @@ export class Orchestrator {
     channel: ChannelRef,
     fence: CompletedFence,
     counter: number,
-    opts: { notice?: string; preferredRoot?: string | null } = {}
+    opts: { notice?: string; preferredRoot?: string | null; turnOrigin?: DispatchSpec } = {}
   ): Promise<void> {
     // Explicit file-attach signal: a fence tagged `seam-attach` whose body is a
     // workspace file path. Upload the real file (resolved against the thread's
@@ -18610,7 +18622,7 @@ export class Orchestrator {
     }
 
     if (fence.lang === CHOICE_FENCE_LANG) {
-      await this.emitChoiceFence(channel, fence);
+      await this.emitChoiceFence(channel, fence, opts.turnOrigin);
       return;
     }
 
@@ -18795,6 +18807,19 @@ export class Orchestrator {
     return this.currentAuthorIds.get(channelRef);
   }
 
+  private choiceTurnOrigin(record: SessionRecord): DispatchSpec | undefined {
+    if (record.id.startsWith("dispatch:")) {
+      return this.store.turnAttempts?.get(record.id.slice("dispatch:".length))?.spec;
+    }
+    const active = this.activeLiveDispatch.get(record.channelRef);
+    if (active) return this.store.turnAttempts?.get(active)?.spec;
+    if (this.currentAuthorId(record.channelRef)) return undefined;
+    // Adopted bridge turns keep their origin in the frozen attempt.
+    return this.store.turnAttempts?.list("suspended").find(attempt =>
+      attempt.spec.session === "live" && attempt.spec.target === record.channelRef
+      && attempt.remoteRecovery?.acpSessionId === record.acpSessionId)?.spec;
+  }
+
   /** Snapshot only the requesting conversation's trusted human. No inference
    * from target membership, thread creator, returnTo, or model-authored text. */
   dispatchResponderUserId(caller: SessionRecord): string | undefined {
@@ -18812,7 +18837,7 @@ export class Orchestrator {
 
   /**
    * Publish a frozen choice card (#91). Shared by MCP `create_choice` and the
-   * `seam-choice` fence. Participant authors are refused (injected turns allowed).
+   * `seam-choice` fence. Availability follows the requesting turn's origin.
    */
   async createChoice(
     record: SessionRecord,
@@ -18827,6 +18852,8 @@ export class Orchestrator {
       }
     | { ok: false; error: string }
   > {
+    const refusal = agentChoiceRefusal(this.choiceTurnOrigin(record));
+    if (refusal) return { ok: false, error: refusal };
     const authorId = this.currentAuthorId(record.channelRef);
     if (
       isChoiceAuthoringRefused(
@@ -18899,7 +18926,13 @@ export class Orchestrator {
   }
 
   resolveIngestJob(sessionId: string): SessionRecord | undefined {
-    return this.ingestJobs.get(sessionId);
+    const job = this.ingestJobs.get(sessionId);
+    if (job) return job;
+    if (!sessionId.startsWith("dispatch:")) return undefined;
+    const attempt = this.store.turnAttempts.get(sessionId.slice("dispatch:".length));
+    if (!attempt || (attempt.state !== "active" && attempt.state !== "suspended")) return undefined;
+    const record = this.store.getByChannel(PLATFORM, attempt.spec.target);
+    return record ? { ...record, id: sessionId, acpSessionId: attempt.acpSessionId ?? "" } : undefined;
   }
 
   async createIngest(
@@ -19158,8 +19191,13 @@ export class Orchestrator {
     }
   }
 
-  private async emitChoiceFence(channel: ChannelRef, fence: CompletedFence): Promise<void> {
+  private async emitChoiceFence(channel: ChannelRef, fence: CompletedFence, turnOrigin?: DispatchSpec): Promise<void> {
     const record = this.store.getByChannel(PLATFORM, channel.id);
+    const refusal = agentChoiceRefusal(turnOrigin ?? (record ? this.choiceTurnOrigin(record) : undefined));
+    if (refusal) {
+      await this.adapter.sendMessage(channel, agentChoiceQuestion(fence.content, refusal));
+      return;
+    }
     if (!record) {
       await this.adapter
         .sendMessage(channel, "_(Couldn't publish a choice card — this thread has no bound session.)_")

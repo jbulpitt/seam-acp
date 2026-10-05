@@ -172,7 +172,7 @@ describe('dispatchInjectTurn: start indicator + live streaming ("card" style)', 
     { style: "card" as const, stream: true },
     { style: "messages" as const, stream: false },
     { style: "card" as const, stream: false },
-  ])("processes a forward choice fence for $style / stream=$stream", async ({ style, stream }) => {
+  ])("returns a forward choice question to its caller for $style / stream=$stream", async ({ style, stream }) => {
     const log: string[] = [];
     const rt = fakeRuntime(["Before\n\n```seam-", 'choice\n{"title":"Pick","options":[{"label":"Continue","kind":"prompt","payload":"continue"}]}\n', "```\n\nAfter"], log);
     const { adapter, calls } = spyAdapter(log);
@@ -180,14 +180,36 @@ describe('dispatchInjectTurn: start indicator + live streaming ("card" style)', 
     (orch as any).store.getByChannel = () => record();
     (orch as any).effectiveCwd = () => "/repo";
     const publish = vi.spyOn(orch, "createChoice").mockResolvedValue({ ok: true, choiceId: "choice", messageId: "card" });
-    await orch.dispatchInjectTurn(baseSpec({ kind: "forward", stream }));
-    expect(publish).toHaveBeenCalledOnce();
-    expect(publish).toHaveBeenCalledWith(expect.any(Object), expect.objectContaining({ title: "Pick" }));
+    const prompt = vi.spyOn(rt, "prompt");
+    const result = await orch.dispatchInjectTurn(baseSpec({ kind: "forward", originThreadRef: "caller", stream }));
+    expect(publish).not.toHaveBeenCalled();
+    expect(result.output).toContain("Question for you: Pick");
+    expect(result.output).toContain("- Continue");
+    expect(result.output).not.toContain("seam-choice");
+    expect(prompt).toHaveBeenCalledOnce();
+    const harness = String(prompt.mock.calls[0]?.[0]);
+    expect(harness).toContain("thread caller (an agent)");
+    expect(harness).not.toContain("To publish a frozen click-card");
     const displayed = [...calls.sendMessage.map(m => m.text), ...calls.sendPanel.map(m => m.panel.description),
       ...calls.editPanel.map(m => m.panel.description)].join("");
     expect(displayed).not.toContain("seam-choice");
     expect(displayed).toContain("Before");
     expect(displayed).toContain("After");
+  });
+
+  it.each(["wake", "scheduled"] as const)("a %s still advertises and publishes choice fences", async kind => {
+    const log: string[] = [];
+    const rt = fakeRuntime(['```seam-choice\n{"title":"Pick","options":[{"label":"Continue","kind":"prompt","payload":"continue"}]}\n```'], log);
+    const { adapter } = spyAdapter(log);
+    const orch = makeOrch({ dataDir, rt, adapter });
+    (orch as any).store.getByChannel = () => record();
+    (orch as any).effectiveCwd = () => "/repo";
+    const publish = vi.spyOn(orch, "createChoice").mockResolvedValue({ ok: true, choiceId: "choice", messageId: "card" });
+    const prompt = vi.spyOn(rt, "prompt");
+    const result = await orch.dispatchInjectTurn(baseSpec({ kind }));
+    expect(publish).toHaveBeenCalledOnce();
+    expect(String(prompt.mock.calls[0]?.[0])).toContain("To publish a frozen click-card");
+    expect(result.output).toContain("seam-choice");
   });
 
   it("publishes visible generic-dispatch prose exactly once and awaits source-local drain", async () => {

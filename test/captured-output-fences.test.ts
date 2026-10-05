@@ -34,7 +34,7 @@ function setup(style = "messages", fences?: FenceRegistry) {
       SEAM_PARTICIPANT_USER_IDS: [], SEAM_CONFIG_ADMIN_USER_IDS: [] } as any,
     router: {} as any, adapter: adapter as any, renderer: {} as any, fences });
   const channel = { platform: "discord", id: "thread" };
-  const spec = { id: "dispatch", target: "thread", session: "live", kind: "forward", prompt: "work", createdUtc: now };
+  const spec = { id: "dispatch", target: "thread", session: "live", kind: "forward", originThreadRef: "caller", prompt: "work", createdUtc: now };
   return { orch: orch as any, adapter, visible, channel, spec, store };
 }
 
@@ -78,13 +78,15 @@ describe("one math registry across captured and streamed output", () => {
 });
 
 describe("captured agent output uses live fence handlers", () => {
-  it.each(["messages", "card"])("renders a quiet %s forward as a real choice in prose order", async style => {
+  it.each(["messages", "card"])("renders a quiet %s forward as a question for its caller in prose order", async style => {
     const h = setup(style);
     await h.orch.postDispatchOutput(h.channel, h.spec, `Before\n\n${fence}\n\nAfter`);
-    expect(h.adapter.sendChoiceCard).toHaveBeenCalledOnce();
-    expect(h.visible).toEqual(["Before", "CHOICE:🗳️ Choose next", "After"]);
+    expect(h.adapter.sendChoiceCard).not.toHaveBeenCalled();
+    const output = h.visible.join("");
+    expect(output).toMatch(/Before[\s\S]*Question for you: Choose next[\s\S]*After/);
+    expect(output).toContain("- Continue");
+    expect(output).toContain("thread caller (an agent)");
     expect(h.visible.join("")).not.toContain("seam-choice");
-    expect(h.store.getChoiceCard(h.adapter.sendChoiceCard.mock.calls[0]![1].choiceId)?.messageId).toBe("choice");
   });
 
   it.each(["messages", "card"])("processes isolated scheduled %s output", async style => {
@@ -98,7 +100,8 @@ describe("captured agent output uses live fence handlers", () => {
   it("processes the quiet stateless handoff card without embedding directive JSON", async () => {
     const h = setup();
     await h.orch.publishStatelessHandoffCard(h.channel, h.spec, undefined, "▶ Handoff", Date.now(), { text: fence });
-    expect(h.adapter.sendChoiceCard).toHaveBeenCalledOnce();
+    expect(h.adapter.sendChoiceCard).not.toHaveBeenCalled();
+    expect(h.visible.join("")).toContain("Question for you: Choose next");
     expect(h.visible.join("")).not.toContain("seam-choice");
   });
 

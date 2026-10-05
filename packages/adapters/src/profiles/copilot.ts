@@ -14,12 +14,19 @@ import {
   type SessionConfigSelectGroup,
   type SessionConfigSelectOption,
   type SessionConfigSelectOptions,
+  type SessionInfo,
 } from "@agentclientprotocol/sdk";
 import { asLocalAdapter, type AgentIdentity, type AgentProfile } from "../agent-profile.js";
 import { AGENT_ADAPTER_VERSION } from "../agent-profile.js";
 import { manifestCatalogScope, manifestCatalogSource, readCliVersion } from "../model-catalog.js";
 import { ProbeError, redactProbeText, runBoundedProbe } from "../probe-process.js";
-import type { SessionSummary, SessionSummaryLine } from "../session-manager.js";
+import type { SessionSummary } from "../session-manager.js";
+import {
+  readCopilotSessionSummaries,
+  readCopilotTranscript,
+  type CopilotSessionRow,
+  type CopilotTurnRow,
+} from "./copilot-session-store.js";
 import {
   classifyAndAttach,
   classifyWith,
@@ -53,28 +60,6 @@ export function copilotNoModelConfigError(agentId = "copilot"): Error & { data: 
   };
   classifyAndAttach(err, classified(agentId, "capability_absent", { details: err.message }));
   return err;
-}
-
-interface SeamAcpSessionIdRow {
-  acp_session_id?: string | null;
-}
-
-interface CopilotSessionRow {
-  id?: string;
-  cwd?: string | null;
-  created_at?: string;
-  updated_at?: string;
-  repository?: string | null;
-  host_type?: string | null;
-  branch?: string | null;
-  summary?: string | null;
-}
-
-interface CopilotTurnRow {
-  turn_index?: number;
-  user_message?: string | null;
-  assistant_response?: string | null;
-  timestamp?: string | number | null;
 }
 
 export interface CopilotCatalogProbeModel {
@@ -214,18 +199,20 @@ async function waitForProbeRetry(delayMs: number, signal: AbortSignal): Promise<
   });
 }
 
-async function runCopilotAcpProbeSession<T>(opts: {
+async function runCopilotAcpConnection<T>(opts: {
   cliPath: string;
   args: string[];
   cwd: string;
   env: NodeJS.ProcessEnv;
   timeoutMs: number;
   cleanupTimeoutMs: number;
-  signal: AbortSignal;
+  signal?: AbortSignal;
+  label: string;
   spawnProcess?: CopilotAcpSpawn;
   inspect: (
-    session: CopilotAcpProbeSession,
-    run: <R>(work: Promise<R>, message: string) => Promise<R>
+    connection: ClientSideConnection,
+    run: <R>(work: Promise<R>, message: string) => Promise<R>,
+    closeSessionOnExit: (sessionId: string) => void,
   ) => Promise<T>;
 }): Promise<T> {
   const launch = copilotAcpLaunchSpec(opts.cliPath, opts.args, opts.cwd, opts.env);
@@ -238,7 +225,7 @@ async function runCopilotAcpProbeSession<T>(opts: {
     signal: opts.signal,
     killGraceMs: opts.cleanupTimeoutMs,
     finalizeDeadlineMs: opts.cleanupTimeoutMs,
-    label: "copilot ACP catalog probe",
+    label: opts.label,
     ...(opts.spawnProcess
       ? { spawnOverride: () => opts.spawnProcess!(launch.executable, launch.args, launch.options) }
       : {}),
@@ -278,16 +265,60 @@ async function runCopilotAcpProbeSession<T>(opts: {
         }),
         "copilot ACP initialize timed out"
       );
+      return await opts.inspect(connection, run, id => { sessionId = id; });
+    },
+  });
+}
+
+async function runCopilotAcpProbeSession<T>(opts: Omit<
+  Parameters<typeof runCopilotAcpConnection<T>>[0], "inspect" | "label"
+> & {
+  inspect: (
+    session: CopilotAcpProbeSession,
+    run: <R>(work: Promise<R>, message: string) => Promise<R>
+  ) => Promise<T>;
+}): Promise<T> {
+  return runCopilotAcpConnection({
+    ...opts,
+    label: "copilot ACP catalog probe",
+    inspect: async (connection, run, closeSessionOnExit) => {
       const session = await run(
         connection.newSession({ cwd: opts.cwd, mcpServers: [] }),
         "copilot ACP session/new timed out"
       );
-      sessionId = session.sessionId;
-      return await opts.inspect({
+      closeSessionOnExit(session.sessionId);
+      return opts.inspect({
         connection,
-        sessionId,
+        sessionId: session.sessionId,
         configOptions: catalogConfigOptions(session.configOptions),
       }, run);
+    },
+  });
+}
+
+/** Enumerate persisted sessions without creating a session or prompting a model. */
+export async function listCopilotAcpSessions(options: CopilotCatalogLaunch & {
+  timeoutMs?: number;
+  cleanupTimeoutMs?: number;
+  spawnProcess?: CopilotAcpSpawn;
+}): Promise<SessionInfo[]> {
+  return runCopilotAcpConnection({
+    ...options,
+    timeoutMs: options.timeoutMs ?? 45_000,
+    cleanupTimeoutMs: options.cleanupTimeoutMs ?? 1_000,
+    label: "copilot ACP session list",
+    inspect: async (connection, run) => {
+      const sessions: SessionInfo[] = [];
+      let cursor: string | undefined;
+      do {
+        const page = await run(
+          connection.listSessions({ cwd: options.cwd, ...(cursor ? { cursor } : {}) }),
+          "copilot ACP session/list timed out"
+        );
+        sessions.push(...page.sessions);
+        cursor = page.nextCursor ?? undefined;
+      } while (cursor);
+      return sessions;
     },
   });
 }
@@ -517,6 +548,8 @@ export function makeCopilotProfile(opts: {
   configDir?: string;
   /** Test/embedding seam; production probes the profile's ACP process. */
   catalogProbe?: (launch: CopilotCatalogLaunch) => Promise<CopilotCatalogProbe>;
+  /** Test/embedding seam; production lists through the profile's ACP process. */
+  sessionList?: (launch: CopilotCatalogLaunch) => Promise<SessionInfo[]>;
 }): AgentProfile {
   const cli = opts.cliPath?.trim() || "copilot";
   const acpArgs = opts.acpArgs ? [...opts.acpArgs] : [...COPILOT_ACP_BASE_ARGS];
@@ -633,100 +666,11 @@ export function makeCopilotProfile(opts: {
     },
     sessionManager: {
       async listSessions(cwd: string): Promise<SessionSummary[]> {
-        const dir = configDir ?? path.join(process.env.HOME ?? "", ".copilot");
-        const dbPath = path.join(dir, "session-store.db");
-        try {
-          await fsp.access(dbPath);
-          const db = new Database(dbPath);
-          try {
-            // Query seam.db as a source of truth for session IDs associated with this repo path.
-            const seamDbSessions = new Set<string>();
-            try {
-              const dataDir = process.env.DATA_DIR ?? "./data";
-              const seamDbPath = path.resolve(dataDir, "seam.db");
-              const seamDb = new Database(seamDbPath);
-              try {
-                // Find all sessions in seam.db that have this repo path
-                const rows = seamDb.prepare("SELECT acp_session_id FROM sessions WHERE repo_path = ?").all(cwd) as SeamAcpSessionIdRow[];
-                for (const row of rows) {
-                  if (row.acp_session_id) {
-                    seamDbSessions.add(row.acp_session_id);
-                  }
-                }
-              } finally {
-                seamDb.close();
-              }
-            } catch (err) {
-              // ignore seamDb query failures
-            }
-
-            // Fetch all sessions from the copilot DB.
-            const allSessions = db.prepare("SELECT * FROM sessions ORDER BY updated_at DESC").all() as CopilotSessionRow[];
-            const sessions: CopilotSessionRow[] = [];
-            for (const s of allSessions) {
-              const matchesCwd = s.cwd === cwd;
-              const matchesSeamDb = s.id && seamDbSessions.has(s.id);
-
-              if (matchesCwd || (matchesSeamDb && !s.cwd)) {
-                sessions.push(s);
-              }
-            }
-
-            const summaries: SessionSummary[] = [];
-
-            for (const sess of sessions) {
-              const sessionId = sess.id;
-              if (!sessionId) continue;
-              const createdAt = sess.created_at ? Date.parse(sess.created_at) : Date.now();
-              const lastActivityAt = sess.updated_at ? Date.parse(sess.updated_at) : Date.now();
-
-              const turns = db.prepare("SELECT * FROM turns WHERE session_id = ? ORDER BY turn_index ASC").all(sessionId) as CopilotTurnRow[];
-              
-              const allMessages: Array<{ sender: "human" | "agent"; text: string }> = [];
-              for (const turn of turns) {
-                if (turn.user_message) {
-                  allMessages.push({ sender: "human", text: turn.user_message });
-                }
-                if (turn.assistant_response) {
-                  allMessages.push({ sender: "agent", text: turn.assistant_response });
-                }
-              }
-
-              const transcriptLines: string[] = [];
-              for (const turn of turns) {
-                if (turn.user_message?.trim()) {
-                  transcriptLines.push(`### User\n${turn.user_message.trim()}`);
-                }
-                if (turn.assistant_response?.trim()) {
-                  transcriptLines.push(`### Assistant\n${turn.assistant_response.trim()}`);
-                }
-              }
-              const estimatedTokens = Math.ceil(transcriptLines.join("\n\n").length / 4);
-
-              let previewLines: SessionSummaryLine[] = [];
-              if (allMessages.length <= 16) {
-                previewLines = allMessages;
-              } else {
-                const firstSix = allMessages.slice(0, 6);
-                const lastTen = allMessages.slice(-10);
-                previewLines = [...firstSix, ...lastTen];
-              }
-
-              summaries.push({
-                sessionId,
-                createdAt,
-                lastActivityAt,
-                previewLines,
-                estimatedTokens,
-              });
-            }
-            return summaries;
-          } finally {
-            db.close();
-          }
-        } catch {
-          return [];
-        }
+        const env = probeEnvironment();
+        const launch = { cliPath: cli, args: [...acpArgs, ...copilotProbeMcpArgs(configDir, env)], cwd, env };
+        const sessions = await (opts.sessionList ?? listCopilotAcpSessions)(launch);
+        const dir = configDir ?? path.join(env.HOME || os.homedir(), ".copilot");
+        return readCopilotSessionSummaries(dir, cwd, sessions, path.resolve(env.DATA_DIR ?? "./data", "seam.db"));
       },
 
       async cloneSession(cwd: string, oldSessionId: string, newSessionId: string): Promise<void> {
@@ -812,24 +756,9 @@ export function makeCopilotProfile(opts: {
       },
 
       async getTranscript(cwd: string, sessionId: string): Promise<string> {
-        const dir = configDir ?? path.join(process.env.HOME ?? "", ".copilot");
-        const dbPath = path.join(dir, "session-store.db");
-        const db = new Database(dbPath);
-        try {
-          const turns = db.prepare("SELECT * FROM turns WHERE session_id = ? ORDER BY turn_index ASC").all(sessionId) as CopilotTurnRow[];
-          const transcriptLines: string[] = [];
-          for (const turn of turns) {
-            if (turn.user_message?.trim()) {
-              transcriptLines.push(`### User\n${turn.user_message.trim()}`);
-            }
-            if (turn.assistant_response?.trim()) {
-              transcriptLines.push(`### Assistant\n${turn.assistant_response.trim()}`);
-            }
-          }
-          return transcriptLines.join("\n\n");
-        } finally {
-          db.close();
-        }
+        const env = probeEnvironment();
+        const dir = configDir ?? path.join(env.HOME || os.homedir(), ".copilot");
+        return readCopilotTranscript(dir, sessionId);
       }
     },
   });

@@ -737,8 +737,8 @@ const TOOLS = [
       "the same deterministic Discord-history reconstruction as /seamadmin rebuild; rebuild:true " +
       "is also valid by itself. The durable Rebuild card is posted in the target thread. " +
       "An agent switch ALWAYS creates a fresh session and drops that thread's conversation context. " +
-      "Model switches reset only on session-pinned backends (codex, and ollama-cloud when enabled); live-config " +
-      "backends such as Claude preserve context. Effort never resets the ACP session: config-option " +
+      "Model switches follow the adapter-owned catalog: live and reload preserve context, while " +
+      "freshSession creates a new ACP session. Read the reported outcome. Effort never resets the ACP session: config-option " +
       "agents update live, while meta/spawn-argument agents (including Claude) reload their runtime " +
       "with context preserved. Changing fastMode ALWAYS forges a fresh session (Fast is a " +
       "session-start dimension) and Fast spends paid usage credits outside subscription limits. " +

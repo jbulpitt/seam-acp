@@ -58,8 +58,8 @@ hand-editing runtime state.
 - **Reconfigure or reset another thread's session** (not just message it):
   `configure_thread(thread, { agent?, model?, effort?, role?, disableThreadPrefix?, fastMode?, rebuild? })`
   changes its agent / model / effort / naming role and reports what actually
-  reset (agent switch always resets; model switch resets on codex, and on
-  ollama-cloud when that agent is enabled, not claude; effort never does);
+  reset (agent switch always resets; model switches follow the adapter-owned
+  catalog's live/reload/fresh-session rule; effort never resets);
   `rebuild: true` then performs deterministic Discord reconstruction in the
   target thread and may be used without another config change;
   `reset_thread_session(thread)` clears its context

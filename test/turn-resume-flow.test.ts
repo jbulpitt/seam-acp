@@ -883,7 +883,7 @@ describe("workflows inventory", () => {
   it("does not advertise Resume or Abandon for a legacy completion already abandoned", async () => {
     const { orch } = makeOrch();
     const spec = handoffSpec({ id: "legacy-completion" });
-    store.turnAttempts.enqueue(spec);
+    store.turnAttempts.admit(spec);
     store.turnAttempts.completePending(spec.id, { id: spec.id, target: spec.target, status: "completed", text: "old answer" } as any);
     store.turnAttempts.abandonDelivery(spec.id, "legacy completion has no recorded nonce or route; Discord delivery cannot be proven or replayed safely");
     const rows = await (orch as any).collectInterruptedRows("thread-worker");
@@ -894,7 +894,7 @@ describe("workflows inventory", () => {
   it("offers Abandon for outstanding completed output and consumes that action", async () => {
     const { orch } = makeOrch();
     const spec = handoffSpec({ id: "retained-output" });
-    store.turnAttempts.enqueue(spec);
+    store.turnAttempts.admit(spec);
     store.turnAttempts.completePending(spec.id, { id: spec.id, target: spec.target, status: "completed", text: "answer" } as any);
     expect((await (orch as any).collectInterruptedRows("thread-worker"))[0].actions).toEqual(["abandon"]);
     expect(await orch.abandonTurnManually(spec.id)).toMatch(/execution record is kept/);
@@ -905,7 +905,7 @@ describe("workflows inventory", () => {
   it("retains terminal uncertain completions as inert history, not parked work", async () => {
     const { orch } = makeOrch();
     const spec = handoffSpec({ id: "uncertain-output" });
-    store.turnAttempts.enqueue(spec);
+    store.turnAttempts.admit(spec);
     store.turnAttempts.completePending(spec.id, { id: spec.id, target: spec.target, status: "completed", output: "answer" } as any);
     store.turnAttempts.markDeliveryUncertain(spec.id, "legacy completion has no recorded nonce or route; Discord delivery cannot be proven or replayed safely");
     expect(store.turnAttempts.isDeliveryDispositionTerminal(spec.id)).toBe(true);

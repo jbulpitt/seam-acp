@@ -863,7 +863,7 @@ describe("workflows inventory", () => {
   it("hides older inert records in the rendered default view but keeps them in SQL and explicit history", async () => {
     const { orch } = makeOrch();
     const spec = handoffSpec({ id: "old-inert-output" });
-    store.turnAttempts.enqueue(spec);
+    store.turnAttempts.admit(spec);
     store.turnAttempts.completePending(spec.id, { id: spec.id, target: spec.target, status: "completed", output: "retained answer" } as any);
     store.turnAttempts.markDeliveryUncertain(spec.id, "delivery could not be proven", "2026-01-01T00:00:00.000Z");
     store.recordDelegation({ id: "old-inert-ledger", kind: "handoff", targetRef: "thread-worker", status: "abandoned",
@@ -891,7 +891,7 @@ describe("workflows inventory", () => {
       ["already-abandoned", "thread-worker", old, "abandoned"],
     ] as const) store.recordDelegation({ id, targetRef: target, kind: "handoff", status, createdUtc: time, updatedUtc: time });
     const spec = handoffSpec({ id: "old-uncertain" });
-    store.turnAttempts.enqueue(spec);
+    store.turnAttempts.admit(spec);
     store.turnAttempts.completePending(spec.id, { id: spec.id, target: spec.target, status: "completed", output: "retained answer" } as any);
     store.turnAttempts.markDeliveryUncertain(spec.id, "no receipt", old);
 
@@ -901,7 +901,7 @@ describe("workflows inventory", () => {
     expect(store.getDelegation("other-parked")?.status).toBe("interrupted");
     expect(store.getDelegation("already-abandoned")?.status).toBe("abandoned");
     expect(store.turnAttempts.get(spec.id)?.deliveryAbandonedReason).toBe("abandoned by operator");
-    expect(store.turnAttempts.get(spec.id)?.result?.output).toBe("retained answer");
+    expect(store.turnAttempts.get(spec.id)?.outcome?.output).toBe("retained answer");
     expect(await (orch as any).abandonOldWorkflows(7)).toContain("Abandoned 1 item(s)");
     expect(store.getDelegation("other-parked")?.status).toBe("abandoned");
     expect(store.listRecentDelegations(20)).toHaveLength(4);

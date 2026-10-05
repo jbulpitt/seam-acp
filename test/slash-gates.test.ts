@@ -7,6 +7,8 @@ import { buildSlashRegistrationBody, getSlashCommandAccess } from "../packages/c
 import { scheduleUiFixture } from "./plugin-schedule-fixture.js";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
 import { PluginHost } from "../packages/core/src/plugins/host.js";
+import { createConfigUiPlugin, type ConfigUi } from "../packages/core/src/plugins/config-ui/index.js";
+import { CONFIG_UI_LEAVES } from "../packages/core/src/plugins/config-ui/commands.js";
 import { createQuotaPlugin } from "../packages/core/src/plugins/quota/index.js";
 import { createCardVisualsPlugin } from "../packages/core/src/plugins/card-visuals/index.js";
 import { sessionBrowserPlugin } from "../packages/core/src/plugins/session-browser/index.js";
@@ -28,6 +30,13 @@ function fixture({ locked = false, participant = false, user = PARTICIPANT, iden
   orch.plugins = new PluginHost(orch.logger);
   orch.identityEffects = { ready: Promise.resolve(), flush: async () => {} };
   orch.scheduleUi = { ready: Promise.resolve() };
+  const configInteractions = new WeakMap<object, unknown>();
+  orch.configUi = { ready: Promise.resolve(), bind: (invocation: object, native: unknown) => configInteractions.set(invocation, native) };
+  const configPlugin = createConfigUiPlugin({
+    ports: { autocomplete: [], interaction: (invocation: object) => configInteractions.get(invocation) },
+    ...Object.fromEntries(CONFIG_UI_LEAVES.map(leaf => [leaf.method, (native: unknown) => orch[leaf.method](native)])),
+  } as unknown as ConfigUi);
+  orch.plugins.slash.register(configPlugin.id, configPlugin.contributions.slash!, { logger: orch.logger, config: undefined });
   function interaction(commandName: string, group: string | null, sub: string, values: Record<string, string> = {}) {
     return {
       commandName,

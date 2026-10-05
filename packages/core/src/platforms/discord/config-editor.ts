@@ -1,7 +1,7 @@
 /**
  * Visual thread-config editor (#90): in-memory draft, hub render, dirty-field
- * Save plan. Persistence, pickers, and Discord interactions live in the
- * orchestrator — this module is side-effect free besides the draft map.
+ * Save plan. Pickers and Discord interactions live in the built-in
+ * config UI; persistence stays in the kernel — this module is side-effect free besides the draft map.
  */
 import type { PermissionPolicyMode, StatusCardStyle, StructuredPanel } from "../../core/types.js";
 import type { ChannelPresetChanges, ThreadPresetChanges } from "../../core/config-mutation.js";

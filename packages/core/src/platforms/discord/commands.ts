@@ -7,6 +7,7 @@ import {
   type ChatInputCommandInteraction,
   type RESTPostAPIApplicationCommandsJSONBody,
 } from "discord.js";
+import { addConfigSetOptions, CONFIG_UI_GROUP, CONFIG_UI_LEAVES } from "../../plugins/config-ui/commands.js";
 import type { SlashRegistry } from "../../plugins/slash-registry.js";
 
 /** The everyday user + agent surface. */
@@ -31,41 +32,6 @@ function declareAccess(
 ): SlashCommandSubcommandBuilder {
   accessDeclarations.set(sub, declaration);
   return sub;
-}
-
-/** Keep `/seam new` and `/seam config set` on one registered option contract. */
-function addConfigSetOptions(sub: SlashCommandSubcommandBuilder): SlashCommandSubcommandBuilder {
-  return sub
-    .addStringOption((o) =>
-      o.setName("json").setDescription("Full config JSON; cannot mix with fields").setRequired(false)
-    )
-    .addStringOption((o) =>
-      o.setName("agent").setDescription("Agent id or agent@host").setRequired(false).setAutocomplete(true)
-    )
-    .addStringOption((o) =>
-      o.setName("model").setDescription("Model id").setRequired(false).setAutocomplete(true)
-    )
-    .addStringOption((o) =>
-      o.setName("effort").setDescription("Reasoning effort; default clears").setRequired(false).setAutocomplete(true)
-    )
-    .addStringOption((o) =>
-      o.setName("repo").setDescription("Working repo path").setRequired(false).setAutocomplete(true)
-    )
-    .addStringOption((o) =>
-      o.setName("role").setDescription("Naming role; auto clears").setRequired(false).setAutocomplete(true)
-    )
-    .addStringOption((o) =>
-      o.setName("permissions").setDescription("always, ask, or deny").setRequired(false).setAutocomplete(true)
-    )
-    .addStringOption((o) =>
-      o.setName("card").setDescription("full, simple, or default").setRequired(false).setAutocomplete(true)
-    )
-    .addStringOption((o) =>
-      o.setName("gif").setDescription("on, off, or default").setRequired(false).setAutocomplete(true)
-    )
-    .addBooleanOption((o) =>
-      o.setName("rebuild").setDescription("Rebuild session from Discord after applying").setRequired(false)
-    );
 }
 
 /**
@@ -451,40 +417,7 @@ export function buildSeamCommand(): SlashCommandBuilder {
               )
           )
       )
-      .addSubcommand((sub) =>
-        declareAccess(sub, { kind: "read-only" }).setName("show").setDescription("Show current session config")
-      )
-      .addSubcommand((sub) =>
-        declareAccess(sub, { kind: "mutating" })
-          .setName("edit")
-          .setDescription("Open the visual thread config editor (draft, then Save/Cancel)")
-      )
-      .addSubcommand((sub) =>
-        addConfigSetOptions(
-          declareAccess(sub, { kind: "mutating" })
-            .setName("set")
-            .setDescription("Patch config fields together, or replace session JSON")
-        )
-      )
-      .addSubcommand((sub) =>
-        declareAccess(sub, { kind: "read-only" })
-          .setName("audit")
-          .setDescription("Show recent config mutations (who/what/when), newest first")
-          .addIntegerOption((o) =>
-            o
-              .setName("limit")
-              .setDescription("How many recent mutations to show (default 20)")
-              .setRequired(false)
-              .setMinValue(1)
-              .setMaxValue(100)
-          )
-          .addStringOption((o) =>
-            o
-              .setName("entry")
-              .setDescription("Show the before→after diff for one entry id")
-              .setRequired(false)
-          )
-      )
+
   );
 
   cmd.addSubcommandGroup((g) =>
@@ -1038,6 +971,8 @@ for (const command of [buildSeamCommand(), buildSeamAdminCommand()]) {
     }
   }
 }
+
+for (const leaf of CONFIG_UI_LEAVES) accessLeaves.set(`seam/${CONFIG_UI_GROUP.name}/${leaf.name}`, { kind: leaf.access });
 
 export function getSlashCommandAccess(
   command: string,

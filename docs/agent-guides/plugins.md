@@ -2,7 +2,7 @@
 
 The controller loads `plugins/builtins.ts` in order, independently of Seam MCP.
 Only known built-ins are loaded. The controller also installs thread naming,
-card visuals, quota, schedule UI, the session browser and optional service status through controller-only bootstraps.
+card visuals, quota, schedule UI, config UI, the session browser and optional service status through controller-only bootstraps.
 
 A descriptor declares its id, API version, built-in/internal eligibility,
 optional config validation and activate/dispose hooks, and contributions.
@@ -69,7 +69,8 @@ preserve the stored prefix. No plugin receives a store or router.
 
 `core/config-apply-plan.ts` and `core/runtime-transition.ts` are internal kernel
 modules. The editor, slash config, preset application and MCP configuration use
-them; no configuration plugin or public plugin API is introduced here.
+them. The built-in config UI uses controller-only ports to those modules;
+these are internal facades, not a public plugin API.
 
 `ConfigApplyPlan.prepare` returns the existing validated proposal diff, its
 target, confirming actor and audit correlation, and runtime consequence. It
@@ -177,3 +178,18 @@ visual settings and writes the two keys through the mutation service; it never
 receives sessions or the router. The GIF manifest refresh is an after-admission
 job, and rendering reads only its cache. `SIMPLE_CARD_GIF_MANIFEST_URL` and
 `BRAND_ICON_BASE_URL` retain their existing defaults and precedence.
+
+## Config editor and audit
+
+The config UI built-in owns `/seam config show|edit|set|audit`, their help and
+autocomplete, the `seam-cfg-edit:` hub, pickers, modals and rider files. New-thread
+and init commands ask it to open the same editor. Visual field descriptions
+come from the existing config-key contributions.
+
+Its internal ports project configuration and catalog snapshots, apply editor
+and bulk changes through `ConfigApplyPlan`, and read the existing audit tail.
+It never receives session records, the router, a store or an agent runtime.
+Authentication, channel gates, thread creation and reconstruction remain in the
+kernel. Save retains D10: a running turn finishes before its saved runtime
+selection is applied at the next acquisition. The existing draft lifetime and
+expiry behavior are unchanged; component routing registers at boot.

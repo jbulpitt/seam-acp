@@ -10136,6 +10136,10 @@ export class Orchestrator {
       if (dispatchSpeech) this.voiceConsoleSpeechByChannel.set(spec.target, dispatchSpeech);
       let result: InjectTurnResult | undefined;
       try {
+        if (effectivePrompt.includes("SEAM793_CANCEL_BEFORE_PROMPT")) {
+          this.logger.info({ dispatch: spec.id }, "staging proof: cancel before prompt");
+          throw DispatchSuspendedError.superseded(spec.id, "staging proof cancellation before prompt");
+        }
         result = await this.injectTurn(record, effectivePrompt, {
           session: effectiveSession,
           ...(preset?.model ? { model: preset.model } : spec.model ? { model: spec.model } : {}),

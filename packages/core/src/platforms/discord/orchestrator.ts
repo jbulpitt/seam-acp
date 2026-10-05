@@ -19305,11 +19305,14 @@ export class Orchestrator {
         promptStarted: attempt?.promptStarted === true,
       };
       await this.adapter.sendMessage({ platform: PLATFORM, id: channelRef }, reauthWaitNotice(park, context))
+        .then(() => this.store.turnAttempts.markStallNoticeDelivered(attemptId))
         .catch(err => this.logger.warn({ err, attemptId }, "reauth wait notice failed"));
       if (!this.adapter.sendChoiceCard) return;
       const posted = await this.publishChoiceCard(record, reauthChoiceSpec(attemptId, park, context));
       if (!posted.ok) {
         this.logger.warn({ err: posted.error, attemptId, channelRef }, "reauth card was not posted");
+      } else {
+        this.store.turnAttempts.markStallNoticeDelivered(attemptId);
       }
     } catch (err) {
       this.logger.warn({ err, attemptId, channelRef }, "reauth card was not posted");

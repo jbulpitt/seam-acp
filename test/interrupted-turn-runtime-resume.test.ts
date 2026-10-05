@@ -230,6 +230,10 @@ describe("#302 real ACP handshake and strict session/load recovery", () => {
     });
     expect(h.adapter.sendMessage.mock.calls.map(call => String(call[1])).join("\n"))
       .toContain("Cause: Authentication required");
+    expect(h.store.turnAttempts.get(spec.id)?.stallNoticeUtc).not.toBeNull();
+    const noticeCount = h.adapter.sendMessage.mock.calls.length;
+    await h.orch.observeRetainedDispatch(spec);
+    expect(h.adapter.sendMessage.mock.calls).toHaveLength(noticeCount);
     await expect(h.orch.dispatchInjectTurn(spec)).rejects.toMatchObject({
       reason: expect.stringMatching(/^reauth-waiting:/),
     });

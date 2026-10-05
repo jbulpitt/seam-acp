@@ -1,4 +1,4 @@
-import type { ChatInputCommandInteraction, MessageComponentInteraction } from "discord.js";
+import type { ChatInputCommandInteraction, MessageComponentInteraction, ModalSubmitInteraction } from "discord.js";
 import { resolveThreadLocation, type Config } from "../config.js";
 import type { Logger } from "../lib/logger.js";
 import type { ChannelRef } from "../platforms/chat-adapter.js";
@@ -26,7 +26,10 @@ interface PresetDependencies {
   bindThread(channel: ChannelRef): SessionRecord;
   openTurn(channel: ChannelRef, record: SessionRecord, preset: Preset, author: string): void;
   canCreateThread: boolean;
-  interaction(i: ChatInputCommandInteraction | MessageComponentInteraction): PresetInteraction;
+  interaction(i: ChatInputCommandInteraction | MessageComponentInteraction | ModalSubmitInteraction): PresetInteraction;
+  component: PresetUiPorts["component"];
+  reply: PresetUiPorts["reply"];
+  track: PresetUiPorts["track"];
 }
 
 /** Thread creation, preset application and the existing opening-turn admission path. */
@@ -56,7 +59,7 @@ export function installPresetUi(deps: PresetDependencies) {
       deps.openTurn(thread, record, preset, author);
       return { thread, summary };
     },
-    interaction: invocation => interactions.get(invocation)!,
+    interaction: invocation => interactions.get(invocation)!, component: deps.component, reply: deps.reply, track: deps.track,
   };
   let ui: PresetUi;
   const ready = deps.plugins.loadBuiltins([{ id: "presets", load: async () => {

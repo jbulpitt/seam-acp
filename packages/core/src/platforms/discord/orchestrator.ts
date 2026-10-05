@@ -20,7 +20,7 @@ import { BootAcquisitionExhaustedError, DispatchAcquisitionPhase, isRetryableBoo
 import { PROVIDER_RETRY_WINDOW_MS, providerRetryBackoff } from "@seam/adapters";
 import { compareExecutionIdentity, executionIdentity, parseExecutionIdentity } from "../../core/dispatch/execution-identity.js";
 import { projectAttemptCard } from "../../core/attempt-card-projection.js";
-import { MessageFlags, EmbedBuilder, ButtonBuilder, ActionRowBuilder, ButtonStyle, StringSelectMenuBuilder, ModalBuilder, TextInputBuilder, TextInputStyle, AttachmentBuilder, type ChatInputCommandInteraction, type AutocompleteInteraction, type MessageComponentInteraction, type Message, type InteractionEditReplyOptions } from "discord.js";
+import { MessageFlags, EmbedBuilder, ButtonBuilder, ActionRowBuilder, ButtonStyle, StringSelectMenuBuilder, ModalBuilder, TextInputBuilder, TextInputStyle, AttachmentBuilder, type ChatInputCommandInteraction, type AutocompleteInteraction, type MessageComponentInteraction, type ModalSubmitInteraction, type Message, type InteractionEditReplyOptions } from "discord.js";
 import type { Logger } from "../../lib/logger.js";
 import { raceDeadline, type DeadlineClock } from "../../lib/shutdown-budget.js";
 import type { Config } from "../../config.js";
@@ -1146,11 +1146,17 @@ export class Orchestrator {
       canCreateThread: !!this.adapter.createThread,
       createThread: (channel, name, author) => this.createChildThread(channel, name, author), bindThread: channel => this.bindSessionToThread(channel),
       openTurn: (channel, record, preset, author) => this.startPresetOpeningTurn(channel, record, preset, author),
+      reply: (target, user, channel) => this.adapter.restoreBrowserReply!(target, user, channel),
+      track: work => this.trackedCardWork(work),
+      component: evt => presetUiInteraction(discordComponentInteractions.get(evt) as MessageComponentInteraction | ModalSubmitInteraction, {
+        channel: interaction => this.channelRefFromInteraction(interaction),
+        projectScopeId: interaction => this.projectScopeId(interaction),
+        mutationRefusal: interaction => this.slashAccessRefusal(interaction, { kind: "mutating" }),
+      }),
       interaction: i => presetUiInteraction(i, {
         channel: interaction => this.channelRefFromInteraction(interaction),
         projectScopeId: interaction => this.projectScopeId(interaction),
         mutationRefusal: interaction => this.slashAccessRefusal(interaction, { kind: "mutating" }),
-        lifecycle: (interaction, collector, expired) => this.attachListLifecycle(interaction, collector, expired),
       }),
     });
     this.sessionBrowserReady = this.installSessionBrowser();
@@ -5202,11 +5208,11 @@ export class Orchestrator {
   }
 
   private slashAccessRefusal(
-    interaction: ChatInputCommandInteraction | MessageComponentInteraction,
+    interaction: ChatInputCommandInteraction | MessageComponentInteraction | ModalSubmitInteraction,
     access: SlashCommandAccess
   ): string | undefined {
     const channel = interaction.channel;
-    const scope = channel?.isThread() ? channel.parentId ?? undefined : interaction.channelId;
+    const scope = channel?.isThread() ? channel.parentId ?? undefined : interaction.channelId ?? undefined;
     const options = { access };
     if (Orchestrator.isParticipantSlashRefused(this.config, "", interaction.user.id, options)) {
       return PARTICIPANT_CONFIG_REFUSAL;
@@ -19945,7 +19951,7 @@ export class Orchestrator {
    * the channel itself. Mirrors the scope resolution in handleSlashInteraction.
    */
   private projectScopeId(
-    i: ChatInputCommandInteraction | MessageComponentInteraction | AutocompleteInteraction
+    i: ChatInputCommandInteraction | MessageComponentInteraction | ModalSubmitInteraction | AutocompleteInteraction
   ): string | undefined {
     const ch = i.channel;
     return ch?.isThread() ? (ch.parentId ?? undefined) : i.channelId ?? undefined;
@@ -20068,7 +20074,7 @@ export class Orchestrator {
   }
   private async cmdPresetBuilder(i: ChatInputCommandInteraction | MessageComponentInteraction, existing?: Preset, createScope?: string | null, seedRole?: string | null): Promise<void> {
     await this.presetsUi.ready;
-    return this.presetsUi.ui.cmdPresetBuilder(this.presetsUi.interaction(i), existing, createScope, seedRole);
+    await this.presetsUi.ui.cmdPresetBuilder(this.presetsUi.interaction(i), existing, createScope, seedRole);
   }
 
   private startPresetOpeningTurn(
@@ -20123,7 +20129,7 @@ export class Orchestrator {
   // --- helpers ---
 
   private channelRefFromInteraction(
-    i: ChatInputCommandInteraction | MessageComponentInteraction
+    i: ChatInputCommandInteraction | MessageComponentInteraction | ModalSubmitInteraction
   ): ChannelRef | undefined {
     if (!i.channelId) return undefined;
     const ch = i.channel;

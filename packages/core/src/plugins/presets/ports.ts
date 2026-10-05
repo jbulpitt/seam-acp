@@ -1,26 +1,16 @@
+import type { BrowserReply } from "../../core/session-browser.js";
 import type { ModalBuilder } from "discord.js";
 import type { Logger } from "../../lib/logger.js";
-import type { ChannelRef, ChatAdapter } from "../../platforms/chat-adapter.js";
-import type { CardLifecycle, CardView, StoppableCollector } from "../../platforms/discord/collector-lifecycle.js";
+import type { ComponentEvent, ChannelRef, ChatAdapter } from "../../platforms/chat-adapter.js";
+import type { CardView } from "../../platforms/discord/collector-lifecycle.js";
 import type { ModelCatalogService } from "../../core/model-catalog/service.js";
 import type { Preset } from "../../core/types.js";
 import type { SlashInvocation } from "../slash-registry.js";
 import type { PresetRepository } from "./repository.js";
 
 type Reply = CardView & { flags?: number | bigint };
-export interface PresetModal {
-  customId: string;
-  user: { id: string };
-  fields: { getTextInputValue(name: string): string };
-  reply(view: Reply): Promise<void>;
-  followUp(view: Reply): Promise<void>;
-  deferUpdate(): Promise<void>;
-}
-export interface PresetCollector extends StoppableCollector {
-  on(event: "collect", handle: (click: PresetClick) => Promise<void>): unknown;
-  on(event: "end", handle: (collected: unknown, reason: string) => void): unknown;
-}
 export interface PresetInteraction {
+  readonly cardReply: BrowserReply;
   channelRef?: ChannelRef;
   channelId?: string;
   parentId?: string;
@@ -37,19 +27,19 @@ export interface PresetInteraction {
   reply(view: Reply): Promise<void>;
   editReply(view: CardView | string): Promise<void>;
   deferReply(view: { flags?: number | bigint }): Promise<void>;
-  fetchReply(): Promise<{ id: string; createMessageComponentCollector(options: { filter(click: { user: { id: string } }): boolean; time: number }): PresetCollector }>;
-  attachLifecycle(collector: PresetCollector, expired: (reason: string) => CardView): CardLifecycle;
+  fetchReply(): Promise<{ id: string }>;
 }
 export interface PresetClick extends PresetInteraction {
   customId: string;
   values: string[];
   isButton(): boolean;
   isStringSelectMenu(): boolean;
+  isModalSubmit(): boolean;
+  fields: { getTextInputValue(name: string): string };
   mutationRefusal(): string | undefined;
   deferUpdate(): Promise<void>;
   update(view: CardView): Promise<void>;
   showModal(modal: ModalBuilder): Promise<void>;
-  awaitModalSubmit(options: { filter(modal: PresetModal): boolean; time: number }): Promise<PresetModal>;
 }
 
 /** Preset UI data and operations; admission and runtime ownership stay in the kernel. */
@@ -68,4 +58,7 @@ export interface PresetUiPorts {
   apply(channel: ChannelRef, preset: Preset): Promise<string>;
   createFromPreset(channelId: string, name: string, author: string, preset: Preset): Promise<{ thread: ChannelRef; summary: string }>;
   interaction(invocation: SlashInvocation): PresetInteraction;
+  component(event: ComponentEvent): PresetClick;
+  reply(target: string, user: string, channel: string): BrowserReply;
+  track(work: Promise<void>): Promise<void>;
 }

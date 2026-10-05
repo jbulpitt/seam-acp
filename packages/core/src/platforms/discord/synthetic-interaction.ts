@@ -70,6 +70,7 @@ type ReplyOptions = string | {
   embeds?: unknown[];
   components?: unknown[];
   files?: unknown[];
+  message?: string;
   flags?: number | number[];
   ephemeral?: boolean;
   fetchReply?: boolean;
@@ -107,6 +108,7 @@ function sendable(opts: ReplyOptions, ephemeral: boolean): Record<string, unknow
   delete (base as Record<string, unknown>).fetchReply;
   delete (base as Record<string, unknown>).withResponse;
   delete (base as Record<string, unknown>).flags;
+  delete (base as Record<string, unknown>).message;
   if (ephemeral) base.content = `${EPHEMERAL_MARKER}\n${(base as { content?: string }).content ?? ""}`.trim();
   return base;
 }
@@ -346,6 +348,13 @@ export class SyntheticInteraction {
   async editReply(opts: ReplyOptions): Promise<Message> {
     this.followOn("editReply");
     const ephemeral = this.ephemeral === true;
+    if (typeof opts !== "string" && opts.message && opts.message !== "@original") {
+      const target = await this.channel.messages.fetch(opts.message);
+      const targetEphemeral = target.content.startsWith(EPHEMERAL_MARKER);
+      const message = await target.edit(sendable(opts, targetEphemeral) as never);
+      this.record({ op: "editReply", ephemeral: targetEphemeral, ...summarize(opts), messageId: message.id });
+      return message;
+    }
     if (this.replyMessage) {
       const message = await this.replyMessage.edit(sendable(opts, ephemeral) as never);
       this.record({ op: "editReply", ephemeral, ...summarize(opts), messageId: message.id });

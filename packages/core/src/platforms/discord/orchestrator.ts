@@ -364,6 +364,7 @@ import {
 } from "../../core/fast-mode.js";
 import { installScheduleUi } from "../../core/schedule-ui.js";
 import { scheduleUiInteraction } from "./schedule-ui-transport.js";
+import { discordComponentInteractions } from "./component-interactions.js";
 import { installCardVisuals } from "../../core/card-visuals.js";
 import {
   deleteSimpleCardGifMessage,
@@ -1206,6 +1207,11 @@ export class Orchestrator {
     this.scheduleUi = installScheduleUi({
       plugins: this.plugins, config: this.config, logger: this.logger, store: this.store, router: this.router, modelCatalog: this.modelCatalog,
       manager: () => this.scheduledManager, runNow: id => this.runScheduledPrompt(id),
+      component: evt => scheduleUiInteraction(discordComponentInteractions.get(evt) as MessageComponentInteraction, {
+        channel: interaction => this.channelRefFromInteraction(interaction) ?? undefined,
+        mutationRefusal: interaction => this.slashAccessRefusal(interaction, { kind: "mutating" }),
+        lifecycle: (interaction, collector, expired) => this.attachListLifecycle(interaction, collector, expired),
+      }),
       interaction: i => scheduleUiInteraction(i, {
         channel: interaction => this.channelRefFromInteraction(interaction) ?? undefined,
         mutationRefusal: interaction => this.slashAccessRefusal(interaction, { kind: "mutating" }),

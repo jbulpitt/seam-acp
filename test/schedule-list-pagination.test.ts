@@ -317,6 +317,11 @@ function makeListCard(rows: ScheduledPrompt[]) {
   };
   const fixture = scheduleUiFixture(self);
   const start = fixture.ui.cmdScheduleList(fixture.interaction(interaction));
+  collector.on("collect", async c => fixture.ui.handleListClick({
+    ...c, channelRef: { platform: "discord", id: "thread-1", parentId: "chan-1" },
+    messageButtons: (paints.at(-1)?.components ?? []).flatMap((row: any) => row.components.map((button: any) => ({ customId: button.data.custom_id, disabled: button.data.disabled ?? false }))),
+    mutationRefusal: () => undefined, editReply: async view => { paints.push(view as Painted); }, followUp: c.reply,
+  }));
   return { start, collector, paints, store };
 }
 

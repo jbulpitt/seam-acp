@@ -1,6 +1,5 @@
-import { scheduleUiFixture } from "./plugin-schedule-fixture.js";
 /**
- * Call-site behaviour for the schedule-list and preset-list Edit buttons (#159).
+ * Call-site behaviour for the preset-list Edit button (#159).
  *
  * Edit is a *transition*: the listing must be frozen before the editor opens,
  * or the operator is left holding two live-looking cards for one object. Two
@@ -138,31 +137,6 @@ async function fireClicks(
   return delivered;
 }
 
-const scheduleRow = {
-  id: "sch_1",
-  platform: "discord",
-  channelRef: "thread-1",
-  parentRef: "chan-1",
-  name: "nightly",
-  promptText: "run tests",
-  cron: "0 9 * * *",
-  timezone: "UTC",
-  model: null,
-  cwd: null,
-  targetChannel: null,
-  outputType: "card",
-  sessionMode: "isolated",
-  catchupSeconds: 7200,
-  enabled: true,
-  attachments: [],
-  createdBy: "u1",
-  createdUtc: "2026-09-01T00:00:00.000Z",
-  updatedUtc: "2026-09-01T00:00:00.000Z",
-  lastRunUtc: null,
-  lastStatus: null,
-  nextRunUtc: null,
-  pinnedSessionId: null,
-};
 
 const presetRow = {
   id: "pre_1",
@@ -185,36 +159,6 @@ const presetRow = {
   updatedUtc: "2026-09-01T00:00:00.000Z",
 };
 
-async function runScheduleListEdit(clicks: number, opts: RunOpts = {}) {
-  const { ackGate, releaseAck } = opts;
-  const events: string[] = [];
-  const { interaction, collector, paints } = makeListInteraction(events);
-  const self = {
-    logger: silent,
-    config: { DATA_DIR: "/tmp", channelPresets: new Map() },
-    channelRefFromInteraction: () => ({ platform: "discord", id: "thread-1", parentId: "chan-1" }),
-    store: {
-      listScheduledByChannel: () => [scheduleRow],
-      getScheduled: () => scheduleRow,
-    },
-    scheduledManager: undefined,
-    slashAccessRefusal: Orchestrator.prototype["slashAccessRefusal" as never],
-    attachListLifecycle: Orchestrator.prototype["attachListLifecycle" as never],
-  };
-  const fixture = scheduleUiFixture(self);
-  fixture.ui.cmdScheduleAdd = async c => {
-    events.push(`editor:opened:deferred=${c.deferred}`);
-    await c.respondInitial({});
-  };
-  await fixture.ui.cmdScheduleList(fixture.interaction(interaction));
-
-  const delivered = await fireClicks(collector, clicks, (e) =>
-    makeEditButton(`sl:edit:${scheduleRow.id}`, e, ackGate),
-    events,
-    releaseAck
-  );
-  return { events, collector, paints, delivered };
-}
 
 async function runPresetListEdit(clicks: number, opts: RunOpts = {}) {
   const { ackGate, releaseAck } = opts;
@@ -257,7 +201,6 @@ async function runPresetListEdit(clicks: number, opts: RunOpts = {}) {
 }
 
 const SURFACES = [
-  { name: "schedule list", run: runScheduleListEdit },
   { name: "preset list", run: runPresetListEdit },
 ];
 
@@ -322,7 +265,6 @@ for (const surface of SURFACES) {
 // editor is a collector that was stopped SYNCHRONOUSLY, before any await.
 describe("concurrent Edit clicks while the ACK is still unresolved", () => {
   const SURFACE_RUNNERS = [
-    { name: "schedule list", run: runScheduleListEdit },
     { name: "preset list", run: runPresetListEdit },
   ];
 

@@ -1,6 +1,6 @@
 import type { ModalBuilder } from "discord.js";
 import type { Logger } from "../../lib/logger.js";
-import type { ChannelRef } from "../../platforms/chat-adapter.js";
+import type { ChannelRef, ComponentEvent } from "../../platforms/chat-adapter.js";
 import type { CardLifecycle, CardView, StoppableCollector } from "../../platforms/discord/collector-lifecycle.js";
 import type { ScheduledPrompt } from "../../core/scheduled-prompts/types.js";
 import type { SlashInvocation } from "../slash-registry.js";
@@ -33,6 +33,8 @@ export interface ScheduleInteraction {
 }
 export interface ScheduleClick extends ScheduleInteraction {
   customId: string;
+  messageId: string;
+  messageButtons: Array<{ customId: string; disabled: boolean }>;
   values: string[];
   isButton(): boolean;
   isStringSelectMenu(): boolean;
@@ -43,6 +45,7 @@ export interface ScheduleClick extends ScheduleInteraction {
   followUp(view: ScheduleReply): Promise<void>;
   showModal(modal: ModalBuilder): Promise<void>;
   awaitModalSubmit(options: { filter(modal: ScheduleModal): boolean; time: number }): Promise<ScheduleModal>;
+  openFollowUp(): ScheduleInteraction;
 }
 
 export interface ScheduleUiPorts {
@@ -65,4 +68,5 @@ export interface ScheduleUiPorts {
     models: Array<{ modelId: string; name: string }>;
   };
   interaction(invocation: SlashInvocation): ScheduleInteraction;
+  component(invocation: ComponentEvent): ScheduleClick;
 }

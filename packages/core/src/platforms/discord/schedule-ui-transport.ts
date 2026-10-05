@@ -1,15 +1,15 @@
-import { MessageFlags, type ChatInputCommandInteraction, type MessageComponentInteraction, type ModalSubmitInteraction, type InteractionReplyOptions, type InteractionEditReplyOptions, type InteractionUpdateOptions } from "discord.js";
+import { MessageFlags, type Message, type ChatInputCommandInteraction, type MessageComponentInteraction, type ModalSubmitInteraction, type InteractionReplyOptions, type InteractionEditReplyOptions, type InteractionUpdateOptions } from "discord.js";
 import type { ChannelRef } from "../chat-adapter.js";
 import type { CardLifecycle, CardView } from "./collector-lifecycle.js";
 import type { ScheduleInteraction, ScheduleClick, ScheduleCollector, ScheduleModal } from "../../plugins/schedule-ui/ports.js";
 
 type Interaction = ChatInputCommandInteraction | MessageComponentInteraction;
 /** Wrap native interactions without exposing their client or channel objects. */
-export function scheduleUiInteraction(i: Interaction, deps: {
+export function scheduleUiInteraction<T extends Interaction>(i: T, deps: {
   channel(interaction: Interaction): ChannelRef | undefined;
   mutationRefusal(interaction: Interaction): string | undefined;
   lifecycle(interaction: Interaction, collector: ScheduleCollector, expired: (reason: string) => CardView): CardLifecycle;
-}): ScheduleInteraction {
+}): T extends MessageComponentInteraction ? ScheduleClick : ScheduleInteraction {
   const modal = (m: ModalSubmitInteraction): ScheduleModal => ({
     customId: m.customId, user: { id: m.user.id },
     fields: { getTextInputValue: name => m.fields.getTextInputValue(name) },
@@ -44,6 +44,12 @@ export function scheduleUiInteraction(i: Interaction, deps: {
   });
   const wrapClick = (click: MessageComponentInteraction): ScheduleClick => ({
     ...wrap(click), customId: click.customId,
+    get messageId() { return click.message.id; },
+    get messageButtons() {
+      return click.message.components.flatMap(row => "components" in row
+        ? row.components.flatMap(component => "customId" in component && component.customId
+          ? [{ customId: component.customId, disabled: "disabled" in component && component.disabled }] : []) : []);
+    },
     get deferred() { return click.deferred; },
     get replied() { return click.replied; },
     values: click.isStringSelectMenu() ? [...click.values] : [],
@@ -55,6 +61,18 @@ export function scheduleUiInteraction(i: Interaction, deps: {
     followUp: async view => { await click.followUp(view as InteractionReplyOptions); },
     showModal: async view => { await click.showModal(view); },
     awaitModalSubmit: async options => modal(await click.awaitModalSubmit({ time: options.time, filter: m => options.filter(modal(m)) })),
+    openFollowUp: () => {
+      let message: Message;
+      const editor = Object.create(click) as MessageComponentInteraction;
+      editor.editReply = async view => {
+        const payload = (typeof view === "string" ? { content: view } : view) as InteractionEditReplyOptions;
+        if (!message) message = await click.followUp({ ...payload, flags: MessageFlags.Ephemeral } as InteractionReplyOptions);
+        else message = await click.editReply({ ...payload, message: message.id });
+        return message;
+      };
+      editor.fetchReply = async () => message;
+      return wrap(editor);
+    },
   });
-  return wrap(i);
+  return ("customId" in i ? wrapClick(i) : wrap(i)) as T extends MessageComponentInteraction ? ScheduleClick : ScheduleInteraction;
 }

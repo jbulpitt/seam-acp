@@ -4,6 +4,7 @@ import type { ScheduledPrompt } from "../packages/core/src/core/scheduled-prompt
 import { buildSlashRegistrationBody } from "../packages/core/src/platforms/discord/commands.js";
 import { classifyDiscordInteraction } from "../packages/core/src/platforms/discord/adapter.js";
 import { namingFixture, NAMING_PARENT } from "./plugin-naming-fixture.js";
+import { discordComponentInteractions } from "../packages/core/src/platforms/discord/component-interactions.js";
 
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
@@ -27,7 +28,7 @@ async function fixture() {
   return { ...h, manager };
 }
 
-function command(sub: string, id?: string) {
+function command(sub: string, id?: string, persistent?: (event: unknown) => Promise<void>) {
   const paints: any[] = [];
   const collector = Object.assign(new EventEmitter(), { stop: vi.fn((reason?: string) => collector.emit("end", undefined, reason)) });
   const native = {
@@ -44,13 +45,16 @@ function command(sub: string, id?: string) {
     const replies: any[] = [];
     const c = {
       ...native, customId, values: values ?? [], deferred: false, replied: false,
+      message: { id: "message", components: (paints.at(-1)?.components ?? []).map((row: any) => ({
+        components: row.components.map((button: any) => ({ customId: button.data.custom_id, disabled: button.data.disabled ?? false })),
+      })) },
       isButton: () => !values, isStringSelectMenu: () => Boolean(values),
       reply: vi.fn(async (view: any) => { c.replied = true; replies.push(view); }),
       editReply: vi.fn(async (view: any) => { replies.push(view); }),
       deferReply: vi.fn(async () => { c.deferred = true; }),
       deferUpdate: vi.fn(async () => { c.deferred = true; }),
       update: vi.fn(async (view: any) => { paints.push(view); }),
-      followUp: vi.fn(async (view: any) => { replies.push(view); }),
+      followUp: vi.fn(async (view: any) => { replies.push(view); return { id: "editor", createMessageComponentCollector: () => collector }; }),
       showModal: vi.fn(async (view: any) => { shown = view.toJSON(); }),
       awaitModalSubmit: async (options: any) => {
         const m = { customId: shown.custom_id, user: native.user, fields: { getTextInputValue: (name: string) => fields[name] ?? "" },
@@ -59,14 +63,21 @@ function command(sub: string, id?: string) {
         return m;
       },
     };
-    for (const listener of collector.listeners("collect")) await listener(c);
+    if (customId.startsWith("sl:") && persistent) {
+      const event = { interactionId: "click", customId, userId: "admin", userName: "admin", kind: "button",
+        channel: { platform: "discord", id: "thread", parentId: NAMING_PARENT }, messageId: "message",
+        replyEphemeral: async (text: string) => c.reply({ content: text }),
+      };
+      discordComponentInteractions.set(event as never, c as never);
+      await persistent(event);
+    } else for (const listener of collector.listeners("collect")) await listener(c);
     return { c, replies, shown };
   };
   return { native, paints, collector, click };
 }
 
 describe("schedule UI built-in", () => {
-  it("registers the unchanged slash leaves and collector component routes", async () => {
+  it("registers the unchanged slash leaves, persistent list and collector builder routes", async () => {
     const h = await fixture();
     const group = buildSlashRegistrationBody(h.host.slash).find(c => c.name === "seamadmin")!.options!.find(g => g.name === "schedule")!;
     expect((group as any).options.map((leaf: any) => leaf.name)).toEqual(["add", "list", "remove", "toggle", "edit"]);
@@ -77,8 +88,9 @@ describe("schedule UI built-in", () => {
     }
     for (const customId of ["sl:run:test", "sched:prompt", "sched:promptmodal:message"]) {
       const modal = customId.includes("modal");
-      expect(h.host.components.classify(customId, modal ? "modal" : "button")).toBe("collector");
-      expect(classifyDiscordInteraction({ isChatInputCommand: () => false, isButton: () => !modal, isModalSubmit: () => modal, customId }, h.host.components)).toBe("none");
+      const list = customId.startsWith("sl:");
+      expect(h.host.components.classify(customId, modal ? "modal" : "button")).toBe(list ? "persistent" : "collector");
+      expect(classifyDiscordInteraction({ isChatInputCommand: () => false, isButton: () => !modal, isModalSubmit: () => modal, customId }, h.host.components)).toBe(list ? "plugin-component" : "none");
     }
   });
 
@@ -114,18 +126,59 @@ describe("schedule UI built-in", () => {
     for (const mode of ["live", "isolated"] as const) {
       const row = { ...existing(`sch_${mode}`), sessionMode: mode, enabled: true };
       h.store.upsertScheduled(row);
-      const list = command("list");
+      const list = command("list", undefined, h.component);
       await h.orchestrator.handleSlashInteraction(list.native as never);
       await list.click(`sl:run:${row.id}`);
       expect(h.manager.runNow).toHaveBeenCalledWith(row.id);
     }
     h.orchestrator.setScheduledManager(undefined as never);
     const run = vi.spyOn(h.orchestrator, "runScheduledPrompt").mockResolvedValue(undefined);
-    const list = command("list");
+    const list = command("list", undefined, h.component);
     await h.orchestrator.handleSlashInteraction(list.native as never);
     await list.click("sl:run:sch_live");
     expect(run).toHaveBeenCalledWith("sch_live");
     run.mockRestore();
+  });
+
+  it("runs a pre-restart list button through the new host without its original collector", async () => {
+    const before = await fixture();
+    const rows = before.store.listScheduledByChannel("discord", "thread");
+    const old = command("list");
+    await before.orchestrator.handleSlashInteraction(old.native as never);
+    expect(old.collector.listenerCount("collect")).toBe(0);
+    await before.host.dispose();
+    const after = await namingFixture({ store: before.store, directory: before.directory });
+    cleanups.push(after.close);
+    after.orchestrator.setScheduledManager(before.manager as never);
+    const click = command("list", undefined, after.component);
+    click.paints.push(old.paints[0]);
+    const { c, replies } = await click.click("sl:run:sch_11a221c3");
+    expect(c.deferUpdate).toHaveBeenCalledOnce();
+    expect(before.manager.runNow).toHaveBeenCalledExactlyOnceWith("sch_11a221c3");
+    expect(replies.some(view => view.content?.includes("existing"))).toBe(true);
+    expect(before.store.listScheduledByChannel("discord", "thread")).toEqual(rows);
+  });
+
+  it("freezes a persistent listing before opening its separate builder and saving its modal", async () => {
+    const h = await fixture();
+    const list = command("list", undefined, h.component);
+    await h.orchestrator.handleSlashInteraction(list.native as never);
+    const opened = await list.click("sl:edit:sch_11a221c3");
+    expect(opened.c.deferUpdate).toHaveBeenCalledOnce();
+    expect(opened.c.editReply).toHaveBeenCalledWith(expect.objectContaining({ components: [] }));
+    expect(opened.c.followUp).toHaveBeenCalledWith(expect.objectContaining({ flags: 64 }));
+    await list.click("sched:prompt", undefined, { name: "changed", prompt: "edited via button" });
+    await list.click("sched:create");
+    expect(h.store.getScheduled("sch_11a221c3")).toMatchObject({ name: "changed", promptText: "edited via button", enabled: false });
+  });
+
+  it("keeps the existing one-editor claim for two concurrent persistent Edit clicks", async () => {
+    const h = await fixture();
+    const list = command("list", undefined, h.component);
+    await h.orchestrator.handleSlashInteraction(list.native as never);
+    const clicks = await Promise.all([list.click("sl:edit:sch_11a221c3"), list.click("sl:edit:sch_11a221c3")]);
+    expect(clicks.reduce((n, click) => n + click.c.followUp.mock.calls.length, 0)).toBe(1);
+    expect(list.collector.listenerCount("collect")).toBe(1);
   });
 
   it("plugin load and disposal do not alter existing schedules or stop the kernel manager", async () => {

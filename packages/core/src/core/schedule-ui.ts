@@ -16,7 +16,7 @@ interface ScheduleUiDependencies {
 }
 
 /** Controller-only schedule repository and administration facade. */
-export function scheduleUiPorts(deps: ScheduleUiDependencies, interaction: ScheduleUiPorts["interaction"]): ScheduleUiPorts {
+export function scheduleUiPorts(deps: ScheduleUiDependencies, interaction: ScheduleUiPorts["interaction"], component: ScheduleUiPorts["component"]): ScheduleUiPorts {
   return {
     logger: deps.logger.child({ plugin: "schedule-ui" }), reposRoot: deps.config.REPOS_ROOT,
     repository: {
@@ -37,16 +37,17 @@ export function scheduleUiPorts(deps: ScheduleUiDependencies, interaction: Sched
           .map(model => ({ modelId: model.id, name: model.displayName })).slice(0, 24),
       };
     },
-    interaction,
+    interaction, component,
   };
 }
 
 export function installScheduleUi(deps: ScheduleUiDependencies & {
   plugins: PluginHost;
   interaction(i: ChatInputCommandInteraction): ScheduleInteraction;
+  component: ScheduleUiPorts["component"];
 }) {
   const interactions = new WeakMap<SlashInvocation, ScheduleInteraction>();
-  const ports = scheduleUiPorts(deps, invocation => interactions.get(invocation)!);
+  const ports = scheduleUiPorts(deps, invocation => interactions.get(invocation)!, deps.component);
   return {
     ready: deps.plugins.loadBuiltins([{ id: "schedule-ui", load: async () => (await import("../plugins/schedule-ui/index.js")).createScheduleUiPlugin(ports) }]),
     bind: (invocation: SlashInvocation, interaction: ChatInputCommandInteraction) => { interactions.set(invocation, deps.interaction(interaction)); },

@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { ApplicationCommandOptionType as Option, MessageFlags, EmbedBuilder, ButtonBuilder, ActionRowBuilder, ButtonStyle, StringSelectMenuBuilder, ModalBuilder, TextInputBuilder, TextInputStyle } from "discord.js";
 import type { ChannelRef } from "../../platforms/chat-adapter.js";
-import { expiredCardView } from "../../platforms/discord/collector-lifecycle.js";
+import { CardLifecycle, expiredCardView } from "../../platforms/discord/collector-lifecycle.js";
 import { paginateSchedules, parseScheduleListCustomId, requestedSchedulePage, scheduleListDescription, scheduleNavState, schedulePageCaption, schedulePageCustomId, scheduleRunOutcome } from "../../platforms/discord/schedule-list-view.js";
 import { AutocompleteRegistry, tokenAutocompleteChoices } from "../../platforms/discord/autocomplete.js";
 import { describeCron, validateCron, nextRun as cronNextRun } from "../../core/scheduled-prompts/cron.js";
@@ -43,6 +43,7 @@ const SCHEDULE_LEAVES = [
 
 export class ScheduleUi {
   readonly autocomplete = new AutocompleteRegistry();
+  readonly editTransitions = new Map<string, CardLifecycle>();
   logger: ScheduleUiPorts["logger"];
   constructor(readonly ports: ScheduleUiPorts) {
     this.logger = ports.logger;
@@ -58,13 +59,6 @@ export class ScheduleUi {
       group: "schedule", subcommand: sub, optionName: option, focusedValue: input,
       channelId: i.channelRef?.id, parentId: i.channelRef?.parentId, projectScopeId: i.channelRef?.parentId,
     });
-  }
-  private async openEditorAfterFreeze(c: ScheduleClick, open: () => Promise<void>, surface: string, retryCommand: string): Promise<void> {
-    try { await open(); }
-    catch (err) {
-      this.logger.warn({ err, surface }, "editor failed to open after list freeze");
-      await c.editReply({ content: `❌ Could not open the ${surface} editor. Run \`${retryCommand}\` again.`, embeds: [], components: [] }).catch(() => {});
-    }
   }
   private scheduleSummaryLine(s: ScheduledPrompt): string {
     const state = s.enabled ? "🟢" : "⏸️";
@@ -82,96 +76,73 @@ export class ScheduleUi {
       await i.reply({ content: "Use this inside a thread.", flags: MessageFlags.Ephemeral });
       return;
     }
-    const rows = this.ports.repository.list(channel.id);
-    if (rows.length === 0) {
+    if (this.ports.repository.list(channel.id).length === 0) {
       await i.reply({ content: "No scheduled prompts for this thread. Create one with `/seamadmin schedule add`.", flags: MessageFlags.Ephemeral });
       return;
     }
-    let page = 0;
-    const rebuild = (requested: number = page) => {
-      const built = this.buildScheduleListMessage(channel, requested);
-      page = built.page;
-      return { embeds: built.embeds, components: built.components };
-    };
-    await i.reply({ ...rebuild(), flags: MessageFlags.Ephemeral });
-    const msg = await i.fetchReply();
-    const collector = msg.createMessageComponentCollector({
-      filter: (c) => c.user.id === i.user.id,
-      time: 600_000,
-    });
-    const lifecycle = i.attachLifecycle(collector, () =>
-      expiredCardView("⏰ Schedule list expired — run `/seamadmin schedule list` again.")
-    );
-    collector.on("collect", async (c) => {
-      try {
-        if (!c.isButton()) return;
-        const wantedPage = requestedSchedulePage(c.customId);
-        if (wantedPage !== null) {
-          await c.deferUpdate();
-          await lifecycle.refresh(rebuild(wantedPage));
-          return;
-        }
-        const parsed = parseScheduleListCustomId(c.customId);
-        const action = parsed?.action;
-        const refusal = c.mutationRefusal();
-        if (refusal) {
-          await c.reply({ content: refusal, flags: MessageFlags.Ephemeral });
-          return;
-        }
-        const id = parsed?.arg;
-        const row = id ? this.ports.repository.get(id) : undefined;
-        if (!row || !id || row.channelRef !== channel.id) {
-          await c.reply({ content: "That schedule no longer exists.", flags: MessageFlags.Ephemeral });
-          await lifecycle.refresh(rebuild());
-          return;
-        }
-        if (action === "run") {
-          await c.deferReply({ flags: MessageFlags.Ephemeral });
-          await this.ports.admin.runNow(id);
-          const fresh = this.ports.repository.get(id);
-          await c.editReply(
-            scheduleRunOutcome({
-              name: row.name,
-              status: fresh?.lastStatus,
-              quarantined: !!legacyAttachmentQuarantine(fresh ?? row),
-            })
-          );
-          await lifecycle.refresh(rebuild());
-        } else if (action === "edit") {
-          await lifecycle.transitionWithAck(
-            "edit",
-            {
-              content: `✏️ Editing **${row.name}** — this listing was replaced by the editor below.`,
-              embeds: [],
-              components: [],
-            },
-            async () => {
-              await c.deferReply({ flags: MessageFlags.Ephemeral });
-            }
-          );
-          await this.openEditorAfterFreeze(
-            c,
-            () => this.cmdScheduleAdd(c, row),
-            "schedule",
-            "/seamadmin schedule edit"
-          );
-        } else if (action === "toggle") {
-          const updated: ScheduledPrompt = { ...row, enabled: !row.enabled, updatedUtc: new Date().toISOString() };
-          this.ports.repository.save(updated);
-          if (updated.enabled) this.ports.admin.arm(updated);
-          else this.ports.admin.disarm(id);
-          await c.deferUpdate();
-          await lifecycle.refresh(rebuild());
-        } else if (action === "del") {
-          this.ports.admin.disarm(id);
-          this.ports.repository.remove(id);
-          await c.deferUpdate();
-          await lifecycle.refresh(rebuild());
-        }
-      } catch (err) {
-        this.logger.warn({ err }, "schedule-list button handler failed");
+    await i.reply({ ...this.buildScheduleListMessage(channel), flags: MessageFlags.Ephemeral });
+  }
+
+  async handleListClick(c: ScheduleClick): Promise<void> {
+    const channel = c.channelRef!;
+    const page = requestedSchedulePage(c.messageButtons.find(button => button.disabled && button.customId.startsWith("sl:page:"))?.customId ?? "") ?? 0;
+    const rebuild = (requested = page) => this.buildScheduleListMessage(channel, requested);
+    const wantedPage = requestedSchedulePage(c.customId);
+    if (wantedPage !== null) {
+      await c.deferUpdate();
+      await c.editReply(rebuild(wantedPage));
+      return;
+    }
+    const parsed = parseScheduleListCustomId(c.customId);
+    const refusal = c.mutationRefusal();
+    if (refusal) {
+      await c.reply({ content: refusal, flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const id = parsed?.arg;
+    const row = id ? this.ports.repository.get(id) : undefined;
+    if (!row || !id || row.channelRef !== channel.id) {
+      await c.deferUpdate();
+      await c.followUp({ content: "That schedule no longer exists.", flags: MessageFlags.Ephemeral });
+      await c.editReply(rebuild());
+      return;
+    }
+    if (parsed?.action === "run") {
+      await c.deferUpdate();
+      await this.ports.admin.runNow(id);
+      const fresh = this.ports.repository.get(id);
+      await c.followUp({ content: scheduleRunOutcome({
+        name: row.name, status: fresh?.lastStatus,
+        quarantined: !!legacyAttachmentQuarantine(fresh ?? row),
+      }), flags: MessageFlags.Ephemeral });
+      await c.editReply(rebuild());
+    } else if (parsed?.action === "edit") {
+      let lifecycle = this.editTransitions.get(c.messageId);
+      if (!lifecycle) {
+        lifecycle = new CardLifecycle({ render: view => c.editReply(view), stop: () => {}, expired: () => expiredCardView("Schedule editor closed."),
+          onError: err => this.logger.warn({ err }, "schedule list render failed") });
+        this.editTransitions.set(c.messageId, lifecycle);
       }
-    });
+      // Keep the existing one-editor transition while its acknowledgement waits.
+      const claimed = await lifecycle.transitionWithAck("edit", {
+        content: `✏️ Editing **${row.name}** — this listing was replaced by the editor below.`, embeds: [], components: [],
+      }, () => c.deferUpdate());
+      if (!claimed) { await c.deferUpdate(); return; }
+      const editor = c.openFollowUp();
+      await this.cmdScheduleAdd(editor, row);
+    } else if (parsed?.action === "toggle") {
+      const updated: ScheduledPrompt = { ...row, enabled: !row.enabled, updatedUtc: new Date().toISOString() };
+      this.ports.repository.save(updated);
+      if (updated.enabled) this.ports.admin.arm(updated);
+      else this.ports.admin.disarm(id);
+      await c.deferUpdate();
+      await c.editReply(rebuild());
+    } else if (parsed?.action === "del") {
+      this.ports.admin.disarm(id);
+      this.ports.repository.remove(id);
+      await c.deferUpdate();
+      await c.editReply(rebuild());
+    }
   }
 
   buildScheduleListMessage(
@@ -576,9 +547,12 @@ export function createScheduleUiPlugin(ports: ScheduleUiPorts): Plugin {
   return {
     id: "schedule-ui", apiVersion: 1, builtin: true, internal: true,
     activate: context => { ui.logger = context.logger; },
-    contributions: { slash, components: ["sl:", "sched:"].map(namespace => ({
-      namespace, types: ["button", "select", "modal"] as const, lifetime: "collector" as const,
-      access: "read-only" as const, authorization: "user" as const, handle: async () => {},
-    })) },
+    dispose: () => { ui.editTransitions.clear(); },
+    contributions: { slash, components: [
+      { namespace: "sl:", types: ["button"], lifetime: "persistent", access: "read-only", authorization: "user",
+        handle: async invocation => ui.handleListClick(ports.component(invocation)) },
+      { namespace: "sched:", types: ["button", "select", "modal"], lifetime: "collector",
+        access: "read-only", authorization: "user", handle: async () => {} },
+    ] },
   };
 }

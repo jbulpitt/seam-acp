@@ -105,10 +105,12 @@ Attachment, wake, watch, choice and result fences retain their kernel handlers.
 ## Schedule administration
 
 The schedule UI built-in owns `/seamadmin schedule` add/list/remove/toggle/edit,
-its autocomplete, paginated list, builder, modals and Run now buttons. `sl:`
-and `sched:` remain collector routes, with the same owner, expiry and ordered
-card lifecycle. The internal UI transport exposes replies, collectors and
-modals, not the Discord client or native interaction objects.
+its autocomplete, paginated list, builder, modals and Run now buttons.
+Builders use `sched:` collector routes, with the same owner, expiry and ordered
+card lifecycle. List buttons use persistent `sl:` routing and
+read their page from the message, so pre-restart lists keep working. The
+internal UI transport exposes replies, collectors and modals, not the Discord
+client or native interaction objects.
 
 Its controller-only schedule repository/admin facade exposes existing rows,
 CRUD, timer re-arming and run-now, plus effective builder defaults. It never

@@ -159,6 +159,11 @@ describe.each([
       const fixture = scheduleUiFixture(orch);
       fixture.ui.buildScheduleListMessage = () => view;
       await fixture.ui.cmdScheduleList(fixture.interaction(i));
+      collect = async click => fixture.ui.handleListClick({
+        ...click, channelRef: { platform: "discord", id: "thread", parentId: "parent" },
+        messageId: "list", messageButtons: [], mutationRefusal: () => orch.slashAccessRefusal(click, { kind: "mutating" }),
+        editReply: async () => refresh(),
+      } as never);
     } else await orch[handler](i);
     const click = (customId: string) => Object.assign(interaction("seam", null, "workflows"), {
       customId, isButton: () => true, isStringSelectMenu: () => false, deferUpdate: vi.fn(async () => {}), update: vi.fn(async () => {}),

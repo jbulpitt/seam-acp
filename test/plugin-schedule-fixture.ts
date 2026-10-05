@@ -11,7 +11,7 @@ export function scheduleUiFixture(self: any) {
   const ports = scheduleUiPorts({
     config: self.config ?? {}, logger, store: self.store, router: self.router, modelCatalog: self.modelCatalog,
     manager: () => self.scheduledManager, runNow: id => self.runScheduledPrompt(id),
-  }, () => { throw new Error("fixture invokes the UI directly"); });
+  }, () => { throw new Error("fixture invokes the UI directly"); }, () => { throw new Error("fixture invokes components directly"); });
   const ui = new ScheduleUi(ports);
   const interaction = (native: any) => scheduleUiInteraction(native, {
     channel: i => self.channelRefFromInteraction(i),

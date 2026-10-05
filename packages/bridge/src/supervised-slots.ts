@@ -429,6 +429,10 @@ export class SupervisedSlots {
     binding.buffered.clear();
     binding.gap = undefined;
     await this.options.client.subscribe({ slot, afterSeq }, (event) => this.onEvent(slot, event));
+    // Transport acknowledgement can precede durable turn completion.
+    if (!binding.dead) await this.writeControl(slot, {
+      v: ADAPTER_CHILD_PROTOCOL_VERSION, type: "report_recovery",
+    });
     const frames = [...binding.buffered.values()]
       .filter((frame) => frame.seq > afterSeq)
       .sort((left, right) => left.seq - right.seq);

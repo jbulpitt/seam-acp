@@ -40,7 +40,15 @@ const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 // Echoes each input line as a data frame; exits cleanly on "exit-now".
 const CHILD = `
   let buffered = "";
+  let completed = false;
   const send = (value) => process.stdout.write(JSON.stringify({ v: 1, ...value }) + "\\n");
+  const report = () => {
+    send({ type: "recovery", recovery: { submissionId: "sub-r", acpSessionId: "acp-r", phase: completed ? "succeeded" : "executing" } });
+    if (completed) send({ type: "recovery_result", recoveryResult: {
+      version: 1, submissionId: "sub-r", acpSessionId: "acp-r", status: "completed", text: "done", stopReason: "end_turn",
+      finishedUtc: "2026-10-05T20:18:21.009Z",
+    } });
+  };
   process.stdin.on("data", (chunk) => {
     buffered += chunk.toString();
     let newline;
@@ -49,12 +57,17 @@ const CHILD = `
       buffered = buffered.slice(newline + 1);
       const frame = JSON.parse(line);
       if (frame.type === "report_recovery") {
-        send({ type: "recovery", recovery: { submissionId: "sub-r", acpSessionId: "acp-r", phase: "executing" } });
+        report();
         continue;
       }
       if (frame.type !== "input") continue;
       const text = Buffer.from(frame.dataBase64, "base64").toString();
       if (text.includes("exit-now")) process.exit(0);
+      if (text.includes("complete-now")) {
+        completed = true;
+        report();
+        continue;
+      }
       if (text.includes("recover-now")) {
         send({ type: "recovery", recovery: { submissionId: "sub-1", acpSessionId: "acp-1", phase: "executing" } });
         continue;
@@ -123,6 +136,27 @@ describe("#631 a killed slot has no recovery to adopt", () => {
 });
 
 describe("#631 a restarted bridge recovers live slots' recovery records", () => {
+  it("delivers a retained result on reattachment even when the previous controller acknowledged it", async () => {
+    const { socketPath, childPath } = await sessiond();
+    const only = await bridge(socketPath, childPath);
+    only.slots.configure(19, { agentId: "fixture" });
+    await only.slots.writeInput(19, "complete-now\n");
+    await until(() => only.frames.some(frame => frame.type === "recovery_result"), "the successful result");
+    const pid = (await health(only.client, 19))!.pid;
+    const throughSeq = Math.max(...only.frames.map(frame => frame.seq));
+    await only.client.ack({ slot: 19, throughSeq });
+    expect(await health(only.client, 19)).toMatchObject({ outputAckedThrough: throughSeq });
+    only.frames.length = 0;
+    const spawn = vi.spyOn(only.client, "spawn");
+    const replay = await only.slots.replay(19, throughSeq);
+    replay.activate();
+    await until(() => [...replay.result.frames, ...only.frames].some(frame => frame.type === "recovery_result"
+      && frame.recoveryResult?.text === "done"), "the retained result after the acknowledged cursor");
+    expect(await health(only.client, 19)).toMatchObject({ alive: true, attached: true, pid });
+    expect(spawn).not.toHaveBeenCalled();
+    expect([...replay.result.frames, ...only.frames].filter(frame => frame.type === "data")).toEqual([]);
+  });
+
   it("reattaches an unattached surviving owner without replacing its process or making its binding dead", async () => {
     const { server, socketPath, childPath } = await sessiond();
     const first = await bridge(socketPath, childPath);

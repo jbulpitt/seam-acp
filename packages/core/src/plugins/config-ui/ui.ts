@@ -444,10 +444,15 @@ export class ConfigUi {
   }
 
   async saveConfigEditorDraft(draft: ThreadConfigDraft, evt: ComponentEvent): Promise<void> {
-    return saveConfigEditorCard(draft, evt, {
-      saveEditor: this.ports.saveEditor, deleteDraft: id => this.configEditor.delete(id),
-      editCard: (channel, message, panel) => this.editConfigEditorCard(channel, message, panel),
-    });
+    try {
+      await saveConfigEditorCard(draft, evt, {
+        saveEditor: this.ports.saveEditor, deleteDraft: id => this.configEditor.delete(id),
+        editCard: (channel, message, panel) => this.editConfigEditorCard(channel, message, panel),
+      });
+    } catch (err) {
+      this.logger.warn({ err, threadId: draft.threadId }, "config editor Save failed");
+      await evt.followUpEphemeral(`Could not save: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   private async pickConfigEditorField(

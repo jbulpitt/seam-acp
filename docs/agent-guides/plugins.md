@@ -198,9 +198,11 @@ expiry behavior are unchanged; component routing registers at boot.
 
 The presets built-in owns `/seam preset` list/create/apply/delete/show/edit/thread,
 autocomplete, the builder's selects and modals, and the paginated list. It uses
-the same catalog and repository pickers as the config editor. Its `preset:` and
-`pr:` routes retain their ten-minute collectors; an old card stops responding
-after a controller restart, as before. Drafts and list state are not persisted.
+the same catalog and repository pickers as the config editor. Its persistent `preset:` and
+`pr:` routes resume builder drafts and list pages from scoped `cards.json` storage
+after a controller restart. The original owner, fixed ten-minute card deadline
+and five-minute modal deadline remain unchanged; restore does not extend them.
+Scoped reply capabilities stay in private runtime storage, as in the session browser.
 
 The plugin owns the preset schema, migrations and CRUD. The host aliases its
 storage to the existing `seam.db` table, retaining ids, scopes, timestamps and

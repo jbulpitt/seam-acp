@@ -19,7 +19,12 @@ export function createPresetPlugin(ui: PresetUi): Plugin {
   return {
     id: "presets", apiVersion: 1, builtin: true, internal: true,
     // The host aliases this namespace to the legacy table's shared database.
-    activate: context => { context.storage?.path("presets.sqlite"); },
+    activate: context => {
+      context.storage?.path("presets.sqlite");
+      const file = context.storage?.path("cards.json");
+      if (file) ui.cards.load(file);
+    },
+    dispose: () => ui.cards.stop(),
     contributions: {
       slash: PRESET_COMMAND_GROUP.options!.map(leaf => {
         const name = leaf.name as keyof typeof methods;
@@ -34,9 +39,11 @@ export function createPresetPlugin(ui: PresetUi): Plugin {
         };
       }),
       components: [
-        { namespace: "preset:", types: ["button", "select", "modal"], lifetime: "collector", access: "read-only", authorization: "user", handle: async () => {} },
-        { namespace: "pr:", types: ["button"], lifetime: "collector", access: "read-only", authorization: "user", handle: async () => {} },
+        { namespace: "preset:", types: ["button", "select", "modal"], lifetime: "persistent", access: "read-only", authorization: "user", handle: async event => { await ui.cards.handle(ui.ports.component(event)); } },
+        { namespace: "pr:", types: ["button"], lifetime: "persistent", access: "read-only", authorization: "user", handle: async event => { await ui.cards.handle(ui.ports.component(event)); } },
       ],
+      jobs: [{ name: "card-expiry", phase: "after-admission", intervalMs: 600_000,
+        start: () => ui.cards.start(), stop: () => ui.cards.stop(), drain: () => ui.cards.drain() }],
     },
   };
 }

@@ -2,7 +2,7 @@ import fs from "node:fs";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { buildSlashRegistrationBody } from "../packages/core/src/platforms/discord/commands.js";
 import { classifyDiscordInteraction } from "../packages/core/src/platforms/discord/adapter.js";
-import { parseCustomId } from "../packages/core/src/platforms/discord/config-editor.js";
+import { DRAFT_IDLE_TTL_MS, parseCustomId } from "../packages/core/src/platforms/discord/config-editor.js";
 import { namingFixture, NAMING_PARENT } from "./plugin-naming-fixture.js";
 
 const THREAD = "100000000000000002";
@@ -115,6 +115,23 @@ describe("config UI built-in", () => {
     expect(h.store.listConfigMutations()[0]).toMatchObject({ actorId: "admin", actorName: "admin" });
     expect(restarted.panels.at(-1).footer).toMatch(/saved/i);
     expect(JSON.parse(fs.readFileSync(`${h.directory}/plugins/config-ui/drafts.json`, "utf8"))).toEqual([]);
+  });
+
+  it("still expires an idle restored draft through the same persistent card route", async () => {
+    const h = await fixture();
+    await h.orchestrator.handleSlashInteraction(interaction("edit") as never);
+    const customId = h.panels.at(-1).actions.flat().find((action: any) => action.customId?.endsWith(":save")).customId;
+    const id = parseCustomId(customId)!.draftId;
+    const draft = (h.orchestrator as any).configUi.ui.configEditor.get(id);
+    const restarted = await fixture({ store: h.store, directory: h.directory });
+    const clock = vi.spyOn(Date, "now").mockReturnValue(draft.updatedAt + DRAFT_IDLE_TTL_MS + 1);
+    try {
+      const click = component(customId); await restarted.component(click);
+      expect(click.deferUpdate).toHaveBeenCalledTimes(1);
+      expect(restarted.panels.at(-1)).toMatchObject({ footer: "draft expired", actions: [] });
+      expect(h.store.listConfigMutations()).toEqual([]);
+      expect(JSON.parse(fs.readFileSync(`${h.directory}/plugins/config-ui/drafts.json`, "utf8"))).toEqual([]);
+    } finally { clock.mockRestore(); }
   });
 
   it("a failed UI contribution leaves sibling plugin and kernel work available", async () => {

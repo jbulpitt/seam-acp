@@ -162,11 +162,11 @@ Do not use `parked_prompts` for this.
 
 - Click: `DISCORD_ALLOWED_USER_IDS` (includes restricted participants), unless
   `targetUserId` is set.
-- Author / cancel: **not** restricted participants. User turns, wakes and
-  schedules may author. Turns requested by another agent (`handoff`, `forward`,
-  `steer`, report-back) cannot publish cards: put questions in the result for
-  the caller to decide or ask the user. `create_choice` returns the requesting
-  origin and this explanation; a `seam-choice` fence becomes a plain-text
+- Author / cancel: **not** restricted participants. User turns, report-backs,
+  wakes and schedules may author. Worker turns requested by another agent
+  (`handoff`, `forward`, `steer`) cannot publish cards: put questions in the
+  result for the caller to decide or ask the user. `create_choice` returns the
+  requesting origin and this explanation; a `seam-choice` fence becomes a plain-text
   question and option labels in the result instead of a card.
 - Cancel: MCP `cancel_choice({ choiceId })` or `/seam workflows cancel-choice:<id>`.
 

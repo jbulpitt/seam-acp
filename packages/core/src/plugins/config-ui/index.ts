@@ -6,7 +6,11 @@ import { CONFIG_UI_GROUP, CONFIG_UI_LEAVES } from "./commands.js";
 export function createConfigUiPlugin(ui: ConfigUi, lifecycle: { activate(): void; dispose(): void } = { activate() {}, dispose() {} }): Plugin {
   return {
     id: "config-ui", apiVersion: 1, builtin: true, internal: true,
-    activate: () => lifecycle.activate(), dispose: () => lifecycle.dispose(),
+    activate: context => {
+      const file = context.storage?.path("drafts.json");
+      if (file) ui.configEditor.load(file);
+      lifecycle.activate();
+    }, dispose: () => lifecycle.dispose(),
     contributions: {
       slash: CONFIG_UI_LEAVES.map(leaf => ({
         command: "seam", group: CONFIG_UI_GROUP, leaf: leaf.leaf, access: { kind: leaf.access }, authorization: "user", help: leaf.help,

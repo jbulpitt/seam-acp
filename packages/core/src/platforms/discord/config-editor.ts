@@ -1,7 +1,6 @@
 /**
- * Visual thread-config editor (#90): in-memory draft, hub render, dirty-field
- * Save plan. Pickers and Discord interactions live in the built-in
- * config UI; persistence stays in the kernel — this module is side-effect free besides the draft map.
+ * Visual thread-config editor: draft values, hub render and dirty-field Save
+ * plan. Draft storage, pickers and interactions live in the config UI plugin.
  */
 import type { PermissionPolicyMode, StatusCardStyle, StructuredPanel } from "../../core/types.js";
 import type { ChannelPresetChanges, ThreadPresetChanges } from "../../core/config-mutation.js";
@@ -1414,78 +1413,4 @@ export function buildSavePlan(draft: ThreadConfigDraft): ConfigEditorSavePlan {
   return plan;
 }
 
-export class ConfigEditorStore {
-  private readonly byId = new Map<string, ThreadConfigDraft>();
-  private readonly byUserThread = new Map<string, string>();
-  private readonly ttlMs: number;
-  private readonly now: () => number;
-
-  constructor(opts?: { ttlMs?: number; now?: () => number }) {
-    this.ttlMs = opts?.ttlMs ?? DRAFT_IDLE_TTL_MS;
-    this.now = opts?.now ?? Date.now;
-  }
-
-  private userThreadKey(userId: string, threadId: string): string {
-    return `${userId}:${threadId}`;
-  }
-
-  private isExpired(draft: ThreadConfigDraft, now: number): boolean {
-    return now - draft.updatedAt > this.ttlMs;
-  }
-
-  get(id: string): ThreadConfigDraft | undefined {
-    const draft = this.byId.get(id);
-    if (!draft) return undefined;
-    if (this.isExpired(draft, this.now())) {
-      this.delete(id);
-      return undefined;
-    }
-    return draft;
-  }
-
-  getForUserThread(userId: string, threadId: string): ThreadConfigDraft | undefined {
-    const id = this.byUserThread.get(this.userThreadKey(userId, threadId));
-    return id ? this.get(id) : undefined;
-  }
-
-  /**
-   * Insert `draft`. If this user already has a draft in the same thread,
-   * the previous draft is removed and returned so the caller can expire
-   * its card.
-   */
-  put(draft: ThreadConfigDraft): ThreadConfigDraft | undefined {
-    const key = this.userThreadKey(draft.userId, draft.threadId);
-    const prevId = this.byUserThread.get(key);
-    let evicted: ThreadConfigDraft | undefined;
-    if (prevId && prevId !== draft.id) {
-      evicted = this.byId.get(prevId);
-      this.byId.delete(prevId);
-    }
-    this.byId.set(draft.id, draft);
-    this.byUserThread.set(key, draft.id);
-    return evicted;
-  }
-
-  touch(id: string, patch: Partial<ThreadConfigDraft>): ThreadConfigDraft | undefined {
-    const cur = this.get(id);
-    if (!cur) return undefined;
-    const next: ThreadConfigDraft = {
-      ...cur,
-      ...patch,
-      overlay: patch.overlay ?? cur.overlay,
-      warnings: patch.warnings ?? cur.warnings,
-      updatedAt: this.now(),
-    };
-    this.byId.set(id, next);
-    return next;
-  }
-
-  delete(id: string): ThreadConfigDraft | undefined {
-    const draft = this.byId.get(id);
-    if (!draft) return undefined;
-    this.byId.delete(id);
-    const key = this.userThreadKey(draft.userId, draft.threadId);
-    if (this.byUserThread.get(key) === id) this.byUserThread.delete(key);
-    return draft;
-  }
-}
+export { ConfigEditorStore } from "../../plugins/config-ui/store.js";

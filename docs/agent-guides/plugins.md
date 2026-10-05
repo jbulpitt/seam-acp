@@ -191,8 +191,10 @@ and bulk changes through `ConfigApplyPlan`, and read the existing audit tail.
 It never receives session records, the router, a store or an agent runtime.
 Authentication, channel gates, thread creation and reconstruction remain in the
 kernel. Save retains D10: a running turn finishes before its saved runtime
-selection is applied at the next acquisition. The existing draft lifetime and
-expiry behavior are unchanged; component routing registers at boot.
+selection is applied at the next acquisition. Unsaved drafts live in its scoped `drafts.json` storage, so an old editor
+card resumes after a controller restart. The same owner, one-hour idle lifetime,
+replacement and Save/Cancel rules apply; loading does not refresh the timestamp.
+Component routing registers at boot.
 
 ## Presets
 

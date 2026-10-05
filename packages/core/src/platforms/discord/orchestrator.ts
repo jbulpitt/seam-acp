@@ -14334,6 +14334,18 @@ export class Orchestrator {
     }
     const effortChoices = catalogEffortChoices(supported).slice(0, 25);
     const supportedList = supported.map((l) => `\`${l}\``).join(", ");
+    const applyAndReport = async (nextLevel: string): Promise<{ ok: true } | { ok: false; error: string }> => {
+      try {
+        await this.applyEffortChange(record, nextLevel);
+      } catch (err) {
+        const error = err instanceof Error ? err.message : String(err);
+        this.logger.warn({ err, threadId: record.channelRef }, "effort change failed");
+        await i.editReply(`Could not set reasoning effort: ${error}`);
+        return { ok: false, error };
+      }
+      await i.editReply(`Reasoning effort set to \`${nextLevel}\` — applies on your next message.`);
+      return { ok: true };
+    };
 
     // No argument → interactive picker (falling back to a text report when the
     // adapter has no picker support).
@@ -14349,7 +14361,7 @@ export class Orchestrator {
       }
       await i.deferReply({ flags: MessageFlags.Ephemeral });
       await i.editReply(`Current effort: \`${current}\`. Posting picker…`);
-      const picked = await this.adapter.sendChoicePicker(channel, {
+      await this.adapter.sendChoicePicker(channel, {
         panel: {
           color: 0x5865f2,
           title: "🧠 Choose reasoning effort",
@@ -14357,6 +14369,7 @@ export class Orchestrator {
         },
         choices: effortChoices,
         authorizedUserIds: mayConfigureUserIds(this.config),
+        commit: (pickedChoice) => applyAndReport(pickedChoice.value),
         successPanel: (pickedChoice, username) => ({
           color: 0x57f287,
           title: "✅ Effort changed",
@@ -14367,8 +14380,6 @@ export class Orchestrator {
           footer: `Changed by ${username} — applies on the next message`,
         }),
       });
-      if (!picked) return;
-      await this.applyEffortChange(record, picked.value);
       return;
     }
 
@@ -14382,11 +14393,8 @@ export class Orchestrator {
       });
       return;
     }
-    await this.applyEffortChange(record, level);
-    await i.reply({
-      content: `Reasoning effort set to \`${level}\` — applies on your next message.`,
-      flags: MessageFlags.Ephemeral,
-    });
+    await i.deferReply({ flags: MessageFlags.Ephemeral });
+    await applyAndReport(level);
   }
 
   /** Persist the effort and invalidate the live runtime so the next turn

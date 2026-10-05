@@ -12,6 +12,7 @@
  * rather than raced.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { acknowledgedHandler } from "./acknowledged-handler-fixture.js";
 import { scheduledAdmissionFixture } from "./scheduled-admission-fixture.js";
 import type { ScheduledPrompt } from "../packages/core/src/core/scheduled-prompts/types.js";
 import type { ScheduledOccurrenceKey } from "../packages/core/src/core/scheduled-prompts/occurrence-store.js";
@@ -1187,14 +1188,14 @@ describe("#174 admission gates", () => {
       editReply,
     };
 
-    await make(true).cmdSteer(interaction);
+    await acknowledgedHandler(interaction, acknowledged => make(true).cmdSteer(acknowledged));
     expect(abortTurn).not.toHaveBeenCalled(); // no live turn was killed…
     expect(queueOnChannel).not.toHaveBeenCalled(); // …and none was admitted
-    expect(String(editReply.mock.calls[0]![0])).toMatch(/Restarting/i);
-    expect(String(editReply.mock.calls[0]![0])).toMatch(/again/i);
+    expect(editReply.mock.calls[0]![0].content).toMatch(/Restarting/i);
+    expect(editReply.mock.calls[0]![0].content).toMatch(/again/i);
 
     // Positive control: open intake still cancels and steers.
-    await make(false).cmdSteer(interaction);
+    await acknowledgedHandler(interaction, acknowledged => make(false).cmdSteer(acknowledged));
     expect(abortTurn).toHaveBeenCalledOnce();
     expect(queueOnChannel).toHaveBeenCalledOnce();
   });
@@ -1207,26 +1208,27 @@ describe("#174 admission gates", () => {
    * still be mid-await when `store.close()` lands.
    */
   it("refuses a slash command before it can touch the store", async () => {
-    const reply = vi.fn(async (..._args: any[]) => {});
+    const editReply = vi.fn(async (..._args: any[]) => {});
     const self = makeIngressHost<{ handleSlashInteraction(i: unknown): Promise<void> }>({
       store: new Proxy({}, { get() { throw new Error("store touched by a refused slash"); } }),
+      plugins: { slash: { get: () => undefined } },
     });
 
-    await self.handleSlashInteraction({
+    const interaction = {
       user: { id: "u1" },
-      reply,
-      // Any read of these would mean the gate ran too late.
+      deferred: false, ephemeral: true,
+      deferReply: async () => { interaction.deferred = true; },
+      editReply,
+      // Routing determines the ACK mode; admission still precedes store work.
       options: {
-        getSubcommand: () => {
-          throw new Error("parsed the command after intake closed");
-        },
-        getSubcommandGroup: () => {
-          throw new Error("parsed the command after intake closed");
-        },
+        getSubcommand: () => "show",
+        getSubcommandGroup: () => "config",
       },
-    });
-    expect(String(reply.mock.calls[0]![0].content)).toMatch(/Restarting/i);
-    expect(String(reply.mock.calls[0]![0].content)).toMatch(/again/i);
+    };
+    await self.handleSlashInteraction(interaction);
+    expect(interaction.deferred).toBe(true);
+    expect(editReply.mock.calls[0]![0].content).toMatch(/Restarting/i);
+    expect(editReply.mock.calls[0]![0].content).toMatch(/again/i);
   });
 
   it("answers autocomplete with an empty list instead of reading the store", async () => {

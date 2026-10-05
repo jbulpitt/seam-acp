@@ -132,7 +132,7 @@ describe("thread naming contributions", () => {
       await h.create(); await h.create("second"); await h.create("third");
       h.names.delete("second");
       const reply = vi.fn(async () => {});
-      const native = { deferred: false, replied: false, deferReply: async () => { native.deferred = true; }, editReply: reply,
+      const native = { deferred: false, replied: false, ephemeral: true, deferReply: async () => { native.deferred = true; }, editReply: reply,
         commandName: "seam", channelId: "thread", channel: { isThread: () => true, parentId: NAMING_PARENT }, user: { id: "admin", username: "Admin" },
         options: { getSubcommand: () => "role", getSubcommandGroup: () => "config", getString: (name: string) => name === "value" ? "analyst" : name === "scope" ? "channel" : null }, reply };
       await h.orchestrator.handleSlashInteraction(native as never);

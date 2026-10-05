@@ -69,7 +69,7 @@ export async function namingFixture(options: { admins?: Set<string>; locked?: bo
     const reply = vi.fn(async () => { events.push("reply"); });
     const deferReply = vi.fn(async () => { native.deferred = true; events.push("defer"); });
     const editReply = vi.fn(async () => { native.replied = true; events.push("edit"); });
-    native = { deferred: false, replied: false, commandName: "seamadmin", channelId: "thread", channel: { isThread: () => true, parentId: NAMING_PARENT },
+    native = { deferred: false, replied: false, ephemeral: true, commandName: "seamadmin", channelId: "thread", channel: { isThread: () => true, parentId: NAMING_PARENT },
       user: { id: userId, username: userId, displayName: userId }, options: { getSubcommand: () => sub, getSubcommandGroup: () => "naming", getString: (name: string) => typeof values[name] === "string" ? values[name] : null, getBoolean: (name: string) => typeof values[name] === "boolean" ? values[name] : null }, reply, deferReply, editReply };
     await orchestrator.handleSlashInteraction(native);
     return { reply, deferReply, editReply };

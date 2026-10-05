@@ -1,3 +1,4 @@
+import { acknowledgedHandler } from "./acknowledged-handler-fixture.js";
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
@@ -76,6 +77,8 @@ function slashI(over: {
   const replies: Array<{ content?: string; flags?: number }> = [];
   const edits: string[] = [];
   const i = {
+    deferred: false,
+    ephemeral: true,
     options: {
       getSubcommand: () => over.sub,
       getSubcommandGroup: (_req?: boolean) => over.group ?? null,
@@ -91,9 +94,11 @@ function slashI(over: {
     reply: vi.fn(async (payload: { content?: string; flags?: number }) => {
       replies.push(payload);
     }),
-    deferReply: vi.fn(async () => {}),
-    editReply: vi.fn(async (content: string) => {
+    deferReply: vi.fn(async () => { i.deferred = true; }),
+    editReply: vi.fn(async (input: string | { content?: string }) => {
+      const content = typeof input === "string" ? input : input.content ?? "";
       edits.push(content);
+      replies.push({ content, flags: MessageFlags.Ephemeral });
     }),
   };
   return { i, replies, edits };
@@ -341,7 +346,7 @@ describe("/seam preset thread handler (#93)", () => {
       sub: "thread",
       strings: { name: "review-pr", preset: "reviewer" },
     });
-    await (orch as any).cmdPresetThread(i);
+    await acknowledgedHandler(i, acknowledged => (orch as any).cmdPresetThread(acknowledged));
 
     expect(created).toHaveLength(1);
     expect(created[0]!.name).toBe("review-pr");
@@ -374,7 +379,7 @@ describe("/seam preset thread handler (#93)", () => {
       sub: "thread",
       strings: { name: "quiet", preset: "quiet-card" },
     });
-    await (orch as any).cmdPresetThread(i);
+    await acknowledgedHandler(i, acknowledged => (orch as any).cmdPresetThread(acknowledged));
     const rec = store.get("discord:thread-new");
     expect(store.readConfig(rec!).statusCardStyle).toBe("simple");
   });
@@ -386,7 +391,7 @@ describe("/seam preset thread handler (#93)", () => {
       sub: "thread",
       strings: { name: "review-pr", preset: "ghost" },
     });
-    await (orch as any).cmdPresetThread(i);
+    await acknowledgedHandler(i, acknowledged => (orch as any).cmdPresetThread(acknowledged));
     expect(created).toHaveLength(0);
     expect(replies[0]?.flags).toBe(MessageFlags.Ephemeral);
     expect(replies[0]?.content).toMatch(/No preset named `ghost`/i);
@@ -399,7 +404,7 @@ describe("/seam preset thread handler (#93)", () => {
       sub: "thread",
       strings: { name: "review-pr", preset: "   " },
     });
-    await (orch as any).cmdPresetThread(i);
+    await acknowledgedHandler(i, acknowledged => (orch as any).cmdPresetThread(acknowledged));
     expect(created).toHaveLength(0);
     expect(replies[0]?.flags).toBe(MessageFlags.Ephemeral);
     expect(replies[0]?.content).toMatch(/can't be blank/i);
@@ -416,7 +421,7 @@ describe("/seam preset thread handler (#93)", () => {
       parentId: "chan-1",
       strings: { name: "sib", preset: "reviewer" },
     });
-    await (orch as any).cmdPresetThread(i);
+    await acknowledgedHandler(i, acknowledged => (orch as any).cmdPresetThread(acknowledged));
     expect(created[0]!.parent.id).toBe("thread-old");
   });
 });
@@ -596,7 +601,7 @@ describe("/seam preset thread data-driven auto-name", () => {
       sub: "thread",
       strings: { preset: "reviewer" },
     });
-    await (orch as any).cmdPresetThread(i);
+    await acknowledgedHandler(i, acknowledged => (orch as any).cmdPresetThread(acknowledged));
     expect(created).toHaveLength(1);
     expect(created[0]!.name).toBe("reviewer");
     expect(threadNames.get("thread-new")).toBe(`🪐🌀🔬${formatKeycap(1)} reviewer`);
@@ -616,7 +621,7 @@ describe("/seam preset thread data-driven auto-name", () => {
       sub: "thread",
       strings: { preset: "reviewer" },
     });
-    await (orch as any).cmdPresetThread(i);
+    await acknowledgedHandler(i, acknowledged => (orch as any).cmdPresetThread(acknowledged));
     expect(threadNames.get("thread-new")).toBe(`🪐🌀🔬${formatKeycap(5)} reviewer`);
   });
 
@@ -632,7 +637,7 @@ describe("/seam preset thread data-driven auto-name", () => {
       sub: "thread",
       strings: { preset: "reviewer" },
     });
-    await (orch as any).cmdPresetThread(i);
+    await acknowledgedHandler(i, acknowledged => (orch as any).cmdPresetThread(acknowledged));
     expect(created).toHaveLength(1);
     expect(names.get("thread-new")).toBe("🪐🌀🔬🔟 reviewer");
     expect(edits[0]).not.toMatch(/limit/i);
@@ -646,7 +651,7 @@ describe("/seam preset thread data-driven auto-name", () => {
       sub: "thread",
       strings: { preset: "reviewer" },
     });
-    await (orch as any).cmdPresetThread(i);
+    await acknowledgedHandler(i, acknowledged => (orch as any).cmdPresetThread(acknowledged));
     expect(created).toHaveLength(1);
     expect(threadNames.get("thread-new")).toBe("🪐🌀 reviewer");
     expect(edits[0]).toMatch(/Created <#thread-new>/);
@@ -667,7 +672,7 @@ describe("/seam preset thread data-driven auto-name", () => {
       strings: { preset: "reviewer" },
     });
 
-    const run = (orch as any).cmdPresetThread(i);
+    const run = acknowledgedHandler(i, acknowledged => (orch as any).cmdPresetThread(acknowledged));
     await vi.waitFor(() => expect(getThreadName).toHaveBeenCalledOnce());
     expect(i.deferReply).toHaveBeenCalledOnce();
     releaseLookup(undefined);
@@ -684,7 +689,7 @@ describe("/seam preset thread data-driven auto-name", () => {
       sub: "thread",
       strings: { preset: "reviewer" },
     });
-    await (orch as any).cmdPresetThread(i);
+    await acknowledgedHandler(i, acknowledged => (orch as any).cmdPresetThread(acknowledged));
     expect(threadNames.get("thread-new")).toBe(`🪐🌀🧪${formatKeycap(1)} reviewer`);
   });
 
@@ -698,7 +703,7 @@ describe("/seam preset thread data-driven auto-name", () => {
       sub: "thread",
       strings: { preset: "reviewer" },
     });
-    await (orch as any).cmdPresetThread(i);
+    await acknowledgedHandler(i, acknowledged => (orch as any).cmdPresetThread(acknowledged));
     expect(threadNames.get("thread-new")).toBe(`🪐🌀🔬${formatKeycap(1)} reviewer`);
   });
 
@@ -710,7 +715,7 @@ describe("/seam preset thread data-driven auto-name", () => {
       sub: "thread",
       strings: { name: "review-pr", preset: "reviewer" },
     });
-    await (orch as any).cmdPresetThread(i);
+    await acknowledgedHandler(i, acknowledged => (orch as any).cmdPresetThread(acknowledged));
     expect(created[0]!.name).toBe("review-pr");
     expect(threadNames.get("thread-new")).toBe(`🪐🌀🔬${formatKeycap(1)} review-pr`);
     expect(renamed).toEqual([{ id: "thread-new", name: `🪐🌀🔬${formatKeycap(1)} review-pr` }]);
@@ -808,7 +813,7 @@ describe("/seam preset thread quantity", () => {
       strings: { preset: "reviewer" },
       ints: { quantity: 3 },
     });
-    await (orch as any).cmdPresetThread(i);
+    await acknowledgedHandler(i, acknowledged => (orch as any).cmdPresetThread(acknowledged));
     expect(["thread-new", "thread-new-2", "thread-new-3"].map((id) => threadNames.get(id))).toEqual([
       `🪐🌀🔬${formatKeycap(3)} reviewer`,
       `🪐🌀🔬${formatKeycap(4)} reviewer`,
@@ -835,7 +840,7 @@ describe("/seam preset thread quantity", () => {
       strings: { preset: "reviewer" },
       ints: { quantity: 3 },
     });
-    await (orch as any).cmdPresetThread(i);
+    await acknowledgedHandler(i, acknowledged => (orch as any).cmdPresetThread(acknowledged));
     expect(created).toHaveLength(3);
     expect(threadNames.get("thread-new")).toBe(`🪐🌀🔬${formatKeycap(9)} reviewer`);
     expect(threadNames.get("thread-new-2")).toBe("🪐🌀🔬🔟 reviewer");
@@ -852,7 +857,7 @@ describe("/seam preset thread quantity", () => {
       strings: { preset: "reviewer", name: "ignored" },
       ints: { quantity: 3 },
     });
-    await (orch as any).cmdPresetThread(i);
+    await acknowledgedHandler(i, acknowledged => (orch as any).cmdPresetThread(acknowledged));
     expect(created).toHaveLength(0);
     expect(edits[0]).toMatch(/multiple threads need a role/i);
   });
@@ -866,7 +871,7 @@ describe("/seam preset thread quantity", () => {
       strings: { preset: "reviewer" },
       ints: { quantity: 9 },
     });
-    await (orch as any).cmdPresetThread(i);
+    await acknowledgedHandler(i, acknowledged => (orch as any).cmdPresetThread(acknowledged));
     expect(created).toHaveLength(9);
     expect(["thread-new", ...Array.from({ length: 8 }, (_, i) => `thread-new-${i + 2}`)].map((id) => threadNames.get(id))).toEqual(
       [1, 2, 3, 4, 5, 6, 7, 8, 9].map((n) => `🪐🌀🔬${formatKeycap(n)} reviewer`)
@@ -884,7 +889,7 @@ describe("/seam preset thread quantity", () => {
       strings: { preset: "reviewer" },
       ints: { quantity: 11 },
     });
-    await (orch as any).cmdPresetThread(i);
+    await acknowledgedHandler(i, acknowledged => (orch as any).cmdPresetThread(acknowledged));
     expect(created).toHaveLength(11);
     expect(threadNames.get("thread-new-10")).toBe("🪐🌀🔬🔟 reviewer");
     expect(threadNames.get("thread-new-11")).toBe(`🪐🌀🔬${formatKeycap(11)} reviewer`);
@@ -899,7 +904,7 @@ describe("/seam preset thread quantity", () => {
       strings: { preset: "reviewer", name: "custom-title" },
       ints: { quantity: 2 },
     });
-    await (orch as any).cmdPresetThread(i);
+    await acknowledgedHandler(i, acknowledged => (orch as any).cmdPresetThread(acknowledged));
     expect([threadNames.get("thread-new"), threadNames.get("thread-new-2")]).toEqual([
       `🪐🌀🔬${formatKeycap(1)} reviewer`,
       `🪐🌀🔬${formatKeycap(2)} reviewer`,
@@ -919,7 +924,7 @@ describe("preset thread opening turn from instructions", () => {
       userId: ADMIN,
       strings: { preset: "reviewer" },
     });
-    await (orch as any).cmdPresetThread(i);
+    await acknowledgedHandler(i, acknowledged => (orch as any).cmdPresetThread(acknowledged));
     expect(openingTurns).toEqual([
       { id: "thread-new", prompt: "Start the lab.", authorId: ADMIN },
     ]);
@@ -935,7 +940,7 @@ describe("preset thread opening turn from instructions", () => {
       sub: "thread",
       strings: { preset: "reviewer" },
     });
-    await (orch as any).cmdPresetThread(i);
+    await acknowledgedHandler(i, acknowledged => (orch as any).cmdPresetThread(acknowledged));
     expect(openingTurns).toEqual([]);
   });
 
@@ -965,7 +970,7 @@ describe("createChildThread adds the invoking user", () => {
       userId: ADMIN,
       strings: { preset: "reviewer" },
     });
-    await (orch as any).cmdPresetThread(i);
+    await acknowledgedHandler(i, acknowledged => (orch as any).cmdPresetThread(acknowledged));
     expect(addedMembers).toEqual([{ id: "thread-new", userId: ADMIN }]);
     expect(sent).toEqual([]);
   });
@@ -980,7 +985,7 @@ describe("createChildThread adds the invoking user", () => {
       strings: { preset: "reviewer" },
       ints: { quantity: 3 },
     });
-    await (orch as any).cmdPresetThread(i);
+    await acknowledgedHandler(i, acknowledged => (orch as any).cmdPresetThread(acknowledged));
     expect(addedMembers).toEqual([
       { id: "thread-new", userId: ADMIN },
       { id: "thread-new-2", userId: ADMIN },
@@ -1002,7 +1007,7 @@ describe("createChildThread adds the invoking user", () => {
       userId: ADMIN,
       strings: { preset: "reviewer" },
     });
-    await (orch as any).cmdPresetThread(i);
+    await acknowledgedHandler(i, acknowledged => (orch as any).cmdPresetThread(acknowledged));
     expect(created).toHaveLength(1);
     expect(addedMembers).toEqual([]);
     expect(sent).toEqual([{ id: "thread-new", text: `<@${ADMIN}>` }]);

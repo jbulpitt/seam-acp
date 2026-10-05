@@ -1,3 +1,4 @@
+import { acknowledgedHandler } from "./acknowledged-handler-fixture.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -577,11 +578,11 @@ describe("#180 dispatch and restart recovery", () => {
     host.setDispatchWatcher(watcher);
     (host as any).recordFromInteraction = () => record;
     const replies: string[] = [];
-    const cancelling = (host as any).cmdCancel({
+    const cancelling = acknowledgedHandler({
       options: { getString: () => null, getBoolean: () => false },
       deferReply: async () => undefined,
-      editReply: async (text: string) => void replies.push(text),
-    });
+      editReply: async (text: string | { content?: string }) => void replies.push(typeof text === "string" ? text : text.content ?? ""),
+    }, acknowledged => (host as any).cmdCancel(acknowledged));
     await vi.waitFor(() => expect((watcher as any).targetEpoch("100")).toBeGreaterThan(0));
     releaseFinalization.resolve();
     await cancelling;

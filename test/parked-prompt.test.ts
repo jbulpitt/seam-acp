@@ -1,3 +1,4 @@
+import { acknowledgedHandler } from "./acknowledged-handler-fixture.js";
 /**
  * #88: park one prompt per thread while its remote bridge is offline.
  */
@@ -246,16 +247,16 @@ describe("park while remote bridge offline (#88)", () => {
     await (orch as any).handleIncomingMessage(userMsg());
     expect(store.getParkedByChannel("discord", "thread-1")).not.toBeNull();
     let reply = "";
-    await (orch as any).cmdCancel({
+    await acknowledgedHandler({
       options: { getString: () => null, getBoolean: () => false },
       deferReply: async () => {},
-      editReply: async (text: string) => {
-        reply = text;
+      editReply: async (text: string | { content?: string }) => {
+        reply = typeof text === "string" ? text : text.content ?? "";
       },
       reply: async () => {},
       channelId: "thread-1",
       channel: { parentId: "channel-1" },
-    });
+    }, acknowledged => (orch as any).cmdCancel(acknowledged));
     expect(store.getParkedByChannel("discord", "thread-1")).toBeNull();
     expect(reply).toMatch(/Cancelled the parked prompt/);
     expect(reply).toMatch(/\*\*mac\*\*/);
@@ -310,12 +311,12 @@ describe("park while remote bridge offline (#88)", () => {
     });
     const { orch } = makeOrch({ ready: false });
     let reply = "";
-    await (orch as any).cmdKill({
+    await acknowledgedHandler({
       deferReply: async () => {},
-      editReply: async (text: string) => {
-        reply = text;
+      editReply: async (text: string | { content?: string }) => {
+        reply = typeof text === "string" ? text : text.content ?? "";
       },
-    });
+    }, acknowledged => (orch as any).cmdKill(acknowledged));
     expect(store.listParked()).toEqual([]);
     expect(reply).toMatch(/Cleared 2 parked prompts/);
   });
@@ -535,7 +536,7 @@ describe("Voice Console cancel coexistence", () => {
     const cancelBindingSpeech = vi.fn(async () => {});
     orch.setVoiceConsoleManager({} as any, { cancelBindingSpeech } as any);
 
-    await (orch as any).cmdCancel(cancelIx());
+    await acknowledgedHandler(cancelIx(), acknowledged => (orch as any).cmdCancel(acknowledged));
 
     expect(abortTurn).toHaveBeenCalledWith("discord:thread-1", { force: false });
     expect(cancelBindingSpeech).not.toHaveBeenCalled();
@@ -586,7 +587,7 @@ describe("Voice Console cancel coexistence", () => {
       stopAllForGlobalCancel,
     } as any);
 
-    await (orch as any).cmdKill(cancelIx());
+    await acknowledgedHandler(cancelIx(), acknowledged => (orch as any).cmdKill(acknowledged));
 
     expect(cancelVisibleTurn).toHaveBeenCalledOnce();
     expect(stopAllForGlobalCancel).toHaveBeenCalledWith("global cancel");
@@ -836,16 +837,16 @@ describe("/seam queue (#89)", () => {
     (orch as any).channelQueues.set("thread-1", new Promise(() => {}));
     await (orch as any).cmdQueue(queueIx("should not fire").ix);
     let reply = "";
-    await (orch as any).cmdCancel({
+    await acknowledgedHandler({
       options: { getString: () => null, getBoolean: () => false },
       deferReply: async () => {},
-      editReply: async (text: string) => {
-        reply = text;
+      editReply: async (text: string | { content?: string }) => {
+        reply = typeof text === "string" ? text : text.content ?? "";
       },
       reply: async () => {},
       channelId: "thread-1",
       channel: { parentId: "channel-1" },
-    });
+    }, acknowledged => (orch as any).cmdCancel(acknowledged));
     expect(store.getParkedByChannel("discord", "thread-1")).toBeNull();
     expect(abortTurn).toHaveBeenCalled();
     expect(reply).toMatch(/queued prompt|Cancel sent/i);

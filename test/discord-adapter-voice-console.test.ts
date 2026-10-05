@@ -33,6 +33,7 @@ describe("Discord Voice Console adapter boundary", () => {
       user: { id: "owner" },
       deferred: true,
       replied: false,
+      ephemeral: true,
       editReply: vi.fn(async () => undefined),
       reply: vi.fn(async () => undefined),
     };
@@ -40,7 +41,7 @@ describe("Discord Voice Console adapter boundary", () => {
     await (adapter as any).handleSlash(interaction);
 
     expect(interaction.editReply).toHaveBeenCalledWith({
-      content: "That command failed unexpectedly. Please retry; if it repeats, check the bot logs.",
+      content: "That command failed: boom",
     });
     expect(interaction.reply).not.toHaveBeenCalled();
     expect(logger.error).toHaveBeenCalledWith(

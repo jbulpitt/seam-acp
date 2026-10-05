@@ -1,3 +1,4 @@
+import { acknowledgedHandler } from "./acknowledged-handler-fixture.js";
 /**
  * `/seam new` + `/seam config init` post the `/seam config edit` card (#157).
  *
@@ -49,6 +50,8 @@ function slashI(over: {
   const replies: Array<{ content?: string; flags?: number }> = [];
   const edits: string[] = [];
   const i = {
+    deferred: false,
+    ephemeral: true,
     options: {
       getSubcommand: () => over.sub,
       getSubcommandGroup: (_req?: boolean) => over.group ?? null,
@@ -65,9 +68,11 @@ function slashI(over: {
     reply: vi.fn(async (payload: { content?: string; flags?: number }) => {
       replies.push(payload);
     }),
-    deferReply: vi.fn(async () => {}),
-    editReply: vi.fn(async (content: string) => {
+    deferReply: vi.fn(async () => { i.deferred = true; }),
+    editReply: vi.fn(async (input: string | { content?: string }) => {
+      const content = typeof input === "string" ? input : input.content ?? "";
       edits.push(content);
+      replies.push({ content, flags: MessageFlags.Ephemeral });
     }),
   };
   return { i, replies, edits };
@@ -250,7 +255,7 @@ describe("/seam new membership (#157)", () => {
   it("adds the invoking user to the thread it creates", async () => {
     const { orch, created, addedMembers, sent } = makeOrch();
     const { i } = slashI({ sub: "new", userId: ADMIN, strings: { name: "hello" } });
-    await (orch as any).cmdNew(i);
+    await acknowledgedHandler(i, acknowledged => (orch as any).cmdNew(acknowledged));
     expect(created).toEqual([
       { parent: { platform: "discord", id: "chan-1" }, name: "hello" },
     ]);
@@ -266,7 +271,7 @@ describe("/seam new membership (#157)", () => {
       },
     });
     const { i } = slashI({ sub: "new", userId: ADMIN, strings: { name: "hello" } });
-    await (orch as any).cmdNew(i);
+    await acknowledgedHandler(i, acknowledged => (orch as any).cmdNew(acknowledged));
     expect(addedMembers).toEqual([]);
     expect(sent).toEqual([{ id: "thread-new", text: `<@${ADMIN}>` }]);
     // Membership failure must not cost the user their config card.
@@ -280,7 +285,7 @@ describe("/seam new membership (#157)", () => {
       },
     });
     const { i, edits } = slashI({ sub: "new", userId: ADMIN, strings: { name: "hello" } });
-    await (orch as any).cmdNew(i);
+    await acknowledgedHandler(i, acknowledged => (orch as any).cmdNew(acknowledged));
     expect(addedMembers).toEqual([{ id: "thread-new", userId: ADMIN }]);
     expect(panels).toEqual([]);
     expect(edits.at(-1)).toMatch(/Run `\/seam config init`/);
@@ -291,7 +296,7 @@ describe("/seam new configuration surface (#157)", () => {
   it("posts the config-edit card into the new thread instead of a wizard", async () => {
     const { orch, panels, pickers } = makeOrch();
     const { i, edits } = slashI({ sub: "new", userId: ADMIN, strings: { name: "hello" } });
-    await (orch as any).cmdNew(i);
+    await acknowledgedHandler(i, acknowledged => (orch as any).cmdNew(acknowledged));
 
     expect(edits[0]).toMatch(/Created thread <#thread-new> and initialized it\./);
     expect(panels).toHaveLength(1);
@@ -304,7 +309,7 @@ describe("/seam new configuration surface (#157)", () => {
   it("the card is a live draft owned by the invoker", async () => {
     const { orch, panels } = makeOrch();
     const { i } = slashI({ sub: "new", userId: ADMIN, strings: { name: "hello" } });
-    await (orch as any).cmdNew(i);
+    await acknowledgedHandler(i, acknowledged => (orch as any).cmdNew(acknowledged));
 
     const save = panels[0]!.panel.actions!.flat().find((b) => b.label === "Save")!;
     const parsed = parseCustomId(save.customId)!;
@@ -322,7 +327,7 @@ describe("/seam new configuration surface (#157)", () => {
   it("the card carries no Host button — agent ids encode the host (#156)", async () => {
     const { orch, panels } = makeOrch();
     const { i } = slashI({ sub: "new", userId: ADMIN, strings: { name: "hello" } });
-    await (orch as any).cmdNew(i);
+    await acknowledgedHandler(i, acknowledged => (orch as any).cmdNew(acknowledged));
     const labels = panels[0]!.panel.actions!.flat().map((b) => b.label);
     expect(labels).toContain("Agent");
     expect(labels).not.toContain("Host");
@@ -331,7 +336,7 @@ describe("/seam new configuration surface (#157)", () => {
   it("falls back to a plain instruction when the platform cannot render panels", async () => {
     const { orch, sent, panels } = makeOrch({ sendPanel: null });
     const { i } = slashI({ sub: "new", userId: ADMIN, strings: { name: "hello" } });
-    await (orch as any).cmdNew(i);
+    await acknowledgedHandler(i, acknowledged => (orch as any).cmdNew(acknowledged));
     expect(panels).toEqual([]);
     expect(sent).toEqual([
       { id: "thread-new", text: expect.stringMatching(/\/seam config repo/) },
@@ -343,7 +348,7 @@ describe("/seam new lifecycle (#157)", () => {
   it("binds a session record to the new thread and names it", async () => {
     const { orch, threadNames } = makeOrch();
     const { i } = slashI({ sub: "new", userId: ADMIN, strings: { name: "hello" } });
-    await (orch as any).cmdNew(i);
+    await acknowledgedHandler(i, acknowledged => (orch as any).cmdNew(acknowledged));
 
     const rec = store.get("discord:thread-new");
     expect(rec).not.toBeNull();
@@ -356,7 +361,7 @@ describe("/seam new lifecycle (#157)", () => {
   it("defaults the thread name to `seam` and reuses the bound record for the draft", async () => {
     const { orch, created, panels } = makeOrch();
     const { i } = slashI({ sub: "new", userId: ADMIN });
-    await (orch as any).cmdNew(i);
+    await acknowledgedHandler(i, acknowledged => (orch as any).cmdNew(acknowledged));
     expect(created[0]!.name).toBe("seam");
     expect(panels).toHaveLength(1);
     // ensureSessionRecord is idempotent — the card did not fork a second row.
@@ -367,7 +372,7 @@ describe("/seam new lifecycle (#157)", () => {
     const { orch, panels } = makeOrch();
     for (const name of ["one", "two"]) {
       const { i } = slashI({ sub: "new", userId: ADMIN, strings: { name } });
-      await (orch as any).cmdNew(i);
+      await acknowledgedHandler(i, acknowledged => (orch as any).cmdNew(acknowledged));
     }
     expect(panels.map((p) => p.id)).toEqual(["thread-new", "thread-new-2"]);
     const ids = panels.map(
@@ -382,7 +387,7 @@ describe("/seam new lifecycle (#157)", () => {
   it("the posted card answers its owner's clicks and refuses everyone else", async () => {
     const { orch, panels, editedPanels } = makeOrch();
     const { i } = slashI({ sub: "new", userId: ADMIN, strings: { name: "hello" } });
-    await (orch as any).cmdNew(i);
+    await acknowledgedHandler(i, acknowledged => (orch as any).cmdNew(acknowledged));
     const cancel = panels[0]!.panel.actions!.flat().find((b) => b.label === "Cancel")!;
     const draftId = parseCustomId(cancel.customId)!.draftId;
 
@@ -402,7 +407,7 @@ describe("/seam new lifecycle (#157)", () => {
     const { orch, created } = makeOrch();
     const { i, replies } = slashI({ sub: "new", userId: ADMIN });
     (i as any).channelId = undefined;
-    await (orch as any).cmdNew(i);
+    await acknowledgedHandler(i, acknowledged => (orch as any).cmdNew(acknowledged));
     expect(created).toEqual([]);
     expect(replies[0]?.content).toBe("No channel.");
     expect(replies[0]?.flags).toBe(MessageFlags.Ephemeral);
@@ -420,7 +425,7 @@ describe("/seam config init shares the card (#157)", () => {
       isThread: true,
       parentId: "chan-1",
     });
-    await (orch as any).cmdInit(i);
+    await acknowledgedHandler(i, acknowledged => (orch as any).cmdInit(acknowledged));
 
     expect(store.get("discord:thread-x")).not.toBeNull();
     expect(replies[0]?.content).toMatch(/Opening the config editor/);
@@ -441,7 +446,7 @@ describe("/seam config init shares the card (#157)", () => {
       isThread: true,
       parentId: "chan-1",
     });
-    await (orch as any).cmdInit(i);
+    await acknowledgedHandler(i, acknowledged => (orch as any).cmdInit(acknowledged));
     expect(store.get("discord:thread-x")).not.toBeNull();
     expect(panels).toEqual([]);
     expect(edits.at(-1)).toMatch(/\/seam config repo/);
@@ -459,7 +464,7 @@ describe("/seam config init shares the card (#157)", () => {
       isThread: true,
       parentId: "chan-1",
     });
-    await (orch as any).cmdInit(i);
+    await acknowledgedHandler(i, acknowledged => (orch as any).cmdInit(acknowledged));
     expect(replies[0]?.content).toMatch(/detached/);
     expect(panels).toEqual([]);
     expect(store.get("discord:thread-x")).toBeNull();

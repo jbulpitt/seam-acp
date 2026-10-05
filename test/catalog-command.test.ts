@@ -33,6 +33,7 @@ describe("/seamadmin catalog refresh", () => {
       modelCatalog: { refresh, refreshAll: vi.fn() },
     });
     const interaction = {
+      deferred: true, ephemeral: false,
       user: { id: "admin" },
       options: { getString: () => "fake@remote-a", getBoolean: () => null },
       reply: vi.fn(async ({ content }: { content: string }) => { replies.push(content); }),
@@ -41,21 +42,21 @@ describe("/seamadmin catalog refresh", () => {
     await (Orchestrator.prototype as unknown as {
       cmdCatalogRefresh(this: unknown, i: unknown): Promise<void>;
     }).cmdCatalogRefresh.call(self, interaction);
-    expect(replies[0]).toContain("Refreshing model catalog");
+    expect(edits[0]).toContain("Refreshing model catalog");
     expect(refresh).toHaveBeenCalledWith(
       { agentId: "fake", location: "remote-a" },
       "manual",
       { acceptReduction: false, actor: "admin" }
     );
-    expect(edits[0]).toContain("generation 4 → 4");
-    expect(edits[0]).toContain("fake-adapter-probe");
-    expect(edits[0]).toContain("catalog/v17 / fake-cli 9");
-    expect(edits[0]).toContain(`scope scope:${"f".repeat(64)}`);
-    expect(edits[0]).toContain("runtime/catalog drift");
+    expect(edits[1]).toContain("generation 4 → 4");
+    expect(edits[1]).toContain("fake-adapter-probe");
+    expect(edits[1]).toContain("catalog/v17 / fake-cli 9");
+    expect(edits[1]).toContain(`scope scope:${"f".repeat(64)}`);
+    expect(edits[1]).toContain("runtime/catalog drift");
     // #236: a quarantined reduction must say what it held and how to admit it,
     // otherwise the operator cannot act on it.
-    expect(edits[0]).toContain("held back: small-catalog rule — removes gone-1");
-    expect(edits[0]).toContain("accept-reduction:true");
+    expect(edits[1]).toContain("held back: small-catalog rule — removes gone-1");
+    expect(edits[1]).toContain("accept-reduction:true");
   });
 
   it("passes bounded operator acceptance through to the service", async () => {
@@ -76,10 +77,11 @@ describe("/seamadmin catalog refresh", () => {
     });
     const replies: string[] = [];
     const interaction = {
+      deferred: true, ephemeral: false,
       user: { id: "admin" },
       options: { getString: () => "fake@remote-a", getBoolean: () => true },
       reply: vi.fn(async ({ content }: { content: string }) => { replies.push(content); }),
-      editReply: vi.fn(async () => {}),
+      editReply: vi.fn(async ({ content }: { content: string }) => { replies.push(content); }),
     };
     await (Orchestrator.prototype as unknown as {
       cmdCatalogRefresh(this: unknown, i: unknown): Promise<void>;
@@ -104,9 +106,12 @@ describe("/seamadmin catalog refresh", () => {
       modelCatalog: { refresh, refreshAll },
     });
     const interaction = {
+      deferred: true, ephemeral: false,
       user: { id: "admin" },
       options: { getString: () => "all", getBoolean: () => true },
       reply: vi.fn(async ({ content }: { content: string }) => { replies.push(content); }),
+      followUp: vi.fn(async ({ content }: { content: string }) => { replies.push(content); }),
+      deleteReply: vi.fn(async () => {}),
       editReply: vi.fn(async () => {}),
     };
     await (Orchestrator.prototype as unknown as {
@@ -143,6 +148,7 @@ describe("/seamadmin catalog refresh", () => {
       modelCatalog: { refresh, refreshAll: vi.fn() },
     });
     const interaction = {
+      deferred: true, ephemeral: false,
       user: { id: "admin" },
       options: { getString: () => "fake@remote-a", getBoolean: () => true },
       reply: vi.fn(async () => {}),
@@ -151,8 +157,8 @@ describe("/seamadmin catalog refresh", () => {
     await (Orchestrator.prototype as unknown as {
       cmdCatalogRefresh(this: unknown, i: unknown): Promise<void>;
     }).cmdCatalogRefresh.call(self, interaction);
-    expect(edits[0]).toContain("operator-accepted reduction");
-    expect(edits[0]).toContain("gone-1");
-    expect(edits[0]).toContain("accepted by <@admin>");
+    expect(edits[1]).toContain("operator-accepted reduction");
+    expect(edits[1]).toContain("gone-1");
+    expect(edits[1]).toContain("accepted by <@admin>");
   });
 });

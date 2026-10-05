@@ -361,6 +361,10 @@ export class SessionRouter {
   /** A retiring runtime stays here until its process tree is fully gone. New
    * turns wait on this barrier before respawning the same durable session. */
   private readonly retirements = new Map<string, Promise<void>>();
+  private readonly pendingRuntimeTransitions = new Map<string, {
+    apply: () => Promise<void>;
+    applying?: Promise<void>;
+  }>();
   private readonly runtimeIdleTtlMs: number;
   private readonly turnStalenessBoundMs: number;
   private readonly runtimeIdleSweepMs: number;
@@ -862,6 +866,10 @@ export class SessionRouter {
    * lock and the post-failure cooldown.
    */
   async getOrStartRuntime(record: SessionRecord, recovery?: { resumeSessionId: string }): Promise<AgentRuntime> {
+    if (this.pendingRuntimeTransitions.has(record.id) && !this.runtimes.get(record.id)?.busy) {
+      await this.applyPendingRuntimeTransition(record.id);
+      Object.assign(record, this.store.get(record.id) ?? record);
+    }
     const verify = (rt: AgentRuntime): AgentRuntime => {
       // #442: this checked IDENTITY only — is this the right ACP session —
       // and never whether the runtime could still answer. A cached runtime
@@ -936,6 +944,26 @@ export class SessionRouter {
     );
     this.creationLocks.set(record.id, promise);
     return promise;
+  }
+
+  /** Keep a busy runtime's selection until its prompt ends; apply before reuse. */
+  async transitionWhenIdle(sessionId: string, apply: () => Promise<void>): Promise<void> {
+    const applying = this.pendingRuntimeTransitions.get(sessionId)?.applying;
+    if (applying) await applying;
+    // Retain the first comparison point; its callback reads the latest saved selection.
+    if (!this.pendingRuntimeTransitions.has(sessionId)) {
+      this.pendingRuntimeTransitions.set(sessionId, { apply });
+    }
+    if (!this.runtimes.get(sessionId)?.busy) await this.applyPendingRuntimeTransition(sessionId);
+  }
+
+  private async applyPendingRuntimeTransition(sessionId: string): Promise<void> {
+    const pending = this.pendingRuntimeTransitions.get(sessionId);
+    if (!pending) return;
+    pending.applying ??= Promise.resolve().then(pending.apply).finally(() => {
+      this.pendingRuntimeTransitions.delete(sessionId);
+    });
+    await pending.applying;
   }
 
   /** Drop a runtime from the cache (e.g. on session/not-found).

@@ -231,6 +231,13 @@ export class RuntimeTransition {
 
   /** Apply an editor's already-audited selection to the retained runtime. */
   async applySavedSelection(record: SessionRecord, before: ConfigDescription): Promise<void> {
+    // D10: Save never aborts a live turn. Transition before its next acquisition.
+    await this.router.transitionWhenIdle(record.id, () =>
+      this.applySavedSelectionNow(this.deps.store.get(record.id) ?? record, before)
+    );
+  }
+
+  private async applySavedSelectionNow(record: SessionRecord, before: ConfigDescription): Promise<void> {
     const after = this.deps.router.describeConfig(record);
     const agentChanged = before.agent.value !== after.agent.value;
     const modelChanged = before.model.value !== after.model.value;

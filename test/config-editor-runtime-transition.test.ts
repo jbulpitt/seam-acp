@@ -24,13 +24,34 @@ vi.mock("../packages/core/src/agents/agent-runtime.js", async importOriginal => 
     busy = false;
     lastActivityAtMs = Date.now();
     sessionId = "";
+    finishPrompt?: () => void;
+    rejectPrompt?: (err: Error) => void;
     constructor(readonly options: { profile: AgentProfile }) {}
     async start() {}
     markActivity() { this.lastActivityAtMs = Date.now(); }
     async loadSession(input: { sessionId: string }) { this.sessionId = input.sessionId; }
     async newSession() { this.sessionId = `fresh-${this.options.profile.id}`; return { sessionId: this.sessionId }; }
     getSessionInfo() { return { sessionId: this.sessionId, currentModelId: this.modelOverride }; }
-    async dispose() { this.disposed = true; }
+    async dispose() {
+      this.disposed = true;
+      this.rejectPrompt?.(new Error("provider disposed during prompt"));
+    }
+    async prompt() {
+      this.busy = true;
+      try {
+        await new Promise<void>((resolve, reject) => {
+          this.finishPrompt = resolve;
+          this.rejectPrompt = reject;
+        });
+        return {
+          stopReason: "end_turn", cancelled: false,
+          agent: this.options.profile.id, model: this.modelOverride, effort: this.effortOverride,
+        };
+      } finally {
+        this.busy = false;
+        this.finishPrompt = this.rejectPrompt = undefined;
+      }
+    }
     async setModel(model: string) { this.modelOverride = model; }
     async setConfigOption(_id: string, value: string) { this.effortOverride = value; }
   } };
@@ -105,6 +126,58 @@ async function fixture(agent = "claude") {
 }
 
 describe("warm config editor Save", () => {
+  it.each([
+    ["claude", { agent: "codex", model: "new", effort: "high" }, "codex", "new", "high", "fresh-codex"],
+    ["codex", { model: "new" }, "codex", "new", "low", "fresh-codex"],
+    ["claude", { model: "new" }, "claude", "new", "low", "existing-context"],
+    ["copilot", { model: "new" }, "copilot", "new", "low", "existing-context"],
+    ["claude", { effort: "high" }, "claude", "old", "high", "existing-context"],
+    ["codex", { effort: "high" }, "codex", "old", "high", "existing-context"],
+  ] as const)("keeps an in-flight %s turn alive when saving %j, then applies the next selection", async (agent, overlay, nextAgent, model, effort, sessionId) => {
+    const h = await fixture(agent);
+    const running = h.warm.prompt("old turn");
+    expect(h.warm.busy).toBe(true);
+    expect((await h.save(overlay)).ok).toBe(true);
+    expect((h.warm as any).disposed).toBe(false);
+    expect(store.get(h.record.id)?.acpSessionId).toBe("existing-context");
+    expect(await h.next()).toBe(h.warm);
+
+    (h.warm as any).finishPrompt();
+    expect(await running).toMatchObject({ stopReason: "end_turn", cancelled: false, agent, model: "old", effort: "low" });
+    const acquiredRecord = store.get(h.record.id)!;
+    const next = await h.router.getOrStartRuntime(acquiredRecord);
+    expect(next.getSessionInfo()?.sessionId).toBe(sessionId);
+    expect(acquiredRecord.acpSessionId).toBe(sessionId);
+    const following = next.prompt("next turn");
+    (next as any).finishPrompt();
+    expect(await following).toMatchObject({ stopReason: "end_turn", cancelled: false, agent: nextAgent, model, effort });
+    expect(store.listConfigMutations()).toHaveLength(1);
+  });
+
+  it("coalesces in-flight saves against the original runtime and uses the latest selection", async () => {
+    const h = await fixture();
+    const running = h.warm.prompt("old turn");
+    expect((await h.save({ agent: "codex", model: "old" })).ok).toBe(true);
+    expect((await h.save({ agent: "codex", model: "new", effort: "high" })).ok).toBe(true);
+    (h.warm as any).finishPrompt();
+    expect(await running).toMatchObject({ agent: "claude", model: "old" });
+    const next = await h.next();
+    expect(next.getSessionInfo()).toMatchObject({ sessionId: "fresh-codex", currentModelId: "new" });
+    expect(next.effortOverride).toBe("high");
+    expect(store.listConfigMutations()).toHaveLength(2);
+  });
+
+  it("keeps the original runtime when in-flight saves return to its selection", async () => {
+    const h = await fixture();
+    const running = h.warm.prompt("old turn");
+    expect((await h.save({ agent: "codex", model: "new" })).ok).toBe(true);
+    expect((await h.save({ agent: "claude", model: "old", effort: "low" })).ok).toBe(true);
+    (h.warm as any).finishPrompt();
+    expect(await running).toMatchObject({ agent: "claude", model: "old" });
+    expect(await h.next()).toBe(h.warm);
+    expect((h.warm as any).disposed).toBe(false);
+  });
+
   it.each(["claude", "agy"])("switches a warm %s runtime to Codex on the next acquisition, with one audit row", async agent => {
     const h = await fixture(agent);
     expect((await h.save({ agent: "codex", model: "new", effort: "high" })).ok).toBe(true);

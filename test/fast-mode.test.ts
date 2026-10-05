@@ -1146,6 +1146,7 @@ function saveHarness(opts: {
         }
         rec.acpSessionId = "";
       },
+      transitionWhenIdle: async (_id: string, apply: () => Promise<void>) => apply(),
       getOrStartRuntime: async () => {
         if (opts.failFreshStart) throw new Error("replacement unavailable");
         started.push("start");

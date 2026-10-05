@@ -43,6 +43,9 @@ import {
 import type { Renderer } from "../renderer.js";
 import { serializePanelText } from "../renderer.js";
 import { choicePickerPageCaption } from "./choice-picker.js";
+import { workflowLanding, workflowNavigation, workflowCategoryList, WORKFLOW_CATEGORIES, type WorkflowCategory } from "./workflow-category-view.js";
+import { workflowActionLabel } from "./workflows-view.js";
+import { visibleWorkflowHistory, visibleWorkflowLedger, DAY_MS } from "./workflow-retention.js";
 import { getSlashCommandAccess, getSlashAcknowledgement, type SlashCommandAccess } from "./commands.js";
 import type {
   ChatAdapter,
@@ -199,6 +202,7 @@ import {
   type ReauthPark,
 } from "../../core/reauth-negotiation.js";
 import { reauthAcceptAttemptId, reauthChoiceSpec } from "../../core/reauth-card.js";
+import { parkedTurnAction, parkedTurnChoiceSpec, type ParkedTurnAction } from "../../core/parked-turn-card.js";
 import { readDefaultBranchHead } from "../../core/dispatch/default-branch-head.js";
 
 import { summarizeAnomalies } from "../../core/watchdog.js";
@@ -1529,6 +1533,12 @@ export class Orchestrator {
       }
     });
 
+    this.autocomplete.register(null, "workflows", "resume", "opaque", async (ctx) => {
+      if (!ctx.channelId) return [];
+      const rows = await this.collectInterruptedRows(ctx.channelId);
+      return tokenAutocompleteChoices(rows.filter(row => interruptedRowActions(row).includes("resume"))
+        .map(row => ({ id: row.id, label: workflowActionLabel("resume", row, new Date()) })), ctx.focusedValue);
+    });
     this.autocomplete.register(null, "workflows", "cancel-wake", "opaque", (ctx) => {
       try {
         if (!ctx.channelId) return [];
@@ -2199,11 +2209,10 @@ export class Orchestrator {
     const stalled = this.store.turnAttempts.get(spec.id);
     if (!stalled?.stalledUtc || stalled.stallNoticeUtc) return;
     const requester = spec.returnTo ?? spec.originThreadRef ?? spec.target;
-    await this.adapter.sendMessage(
-      { platform: PLATFORM, id: requester },
+    await this.postParkedTurnNotice(requester, stalled,
       `⚠️ Dispatch \`${spec.id}\` to <#${spec.target}> could not resume: ${reason}. ` +
         "It remains suspended and was not replayed. " +
-        "Resolve this cause before requesting continuation in `/seam workflows`, or abandon the work there. " +
+        "Resolve this cause before using Resume or `/seam workflows resume:<id>`, or abandon the work. " +
         "A resume command cannot bypass the failed safety checks."
     );
     this.store.turnAttempts.markStallNoticeDelivered(spec.id);
@@ -3483,6 +3492,9 @@ export class Orchestrator {
     } catch (err) {
       const a = scheduledAttempt ? this.store.turnAttempts.get(scheduledAttempt.id)
         : msg.messageId ? this.store.turnAttempts?.get(inboundAttemptId(msg.messageId)) : null;
+      if (a?.state === "suspended" && a.stalledUtc && !a.stallNoticeUtc && !isAwaitingReauth(a.stalledReason)) {
+        await this.notifyParkedTurn(a).catch(noticeErr => this.logger.warn({ err: noticeErr, attempt: a.id }, "parked-turn notice failed"));
+      }
       // Only this still-current invocation can prove its setup failed before
       // an execution claim (and therefore before any provider prompt). Missing
       // attempt metadata alone is never a terminal result or boot replay proof.
@@ -12381,6 +12393,8 @@ export class Orchestrator {
     if (!drift.match) {
       if (prior) this.store.turnAttempts.markStalled(prior.id, drift.reason);
       this.patchScheduledStatus(row.id, `retained: ${drift.reason}`);
+      const parked = prior ? this.store.turnAttempts.get(prior.id) : null;
+      if (parked) await this.notifyParkedTurn(parked);
       return;
     }
     if (this.restartCutoff) return;
@@ -12432,6 +12446,8 @@ export class Orchestrator {
           if (err.suspension === "defect") {
             this.store.turnAttempts.markStalled(attempt.id, err.reason);
             this.patchScheduledStatus(row.id, `retained: ${err.reason}`);
+            const parked = this.store.turnAttempts.get(attempt.id);
+            if (parked) await this.notifyParkedTurn(parked);
           } else {
             this.store.turnAttempts.suspend(attempt.id, this.attemptBoot);
             this.logger.debug({ id: attempt.id, suspension: err.suspension, reason: err.reason },
@@ -15751,10 +15767,26 @@ export class Orchestrator {
   }
 
   /** Unified interrupted/abandoned inventory for `/seam workflows`. */
-  private async collectInterruptedRows(): Promise<InterruptedTurnRow[]> {
+  private async collectInterruptedRows(channelRef?: string): Promise<InterruptedTurnRow[]> {
     const rows: InterruptedTurnRow[] = [];
     const seen = new Set<string>();
-    for (const e of this.store.listDelegationsByStatus(["interrupted", "abandoned"])) {
+    const inScope = (target: string) => !channelRef || target === channelRef;
+    for (const attempt of this.store.turnAttempts.list("completed")) {
+      if (!inScope(attempt.spec.target)) continue;
+      seen.add(attempt.id);
+      const row = interruptedRowForCompletedAttempt(attempt);
+      if (row) rows.push({ ...row, channelRef: attempt.spec.target });
+    }
+    for (const attempt of this.store.turnAttempts.list("suspended")) {
+      if (!inScope(attempt.spec.target)) continue;
+      seen.add(attempt.id);
+      rows.push({ id: attempt.id, source: attempt.source === "dispatch" ? "dispatch" : "live",
+        channelRef: attempt.spec.target, correlationId: attempt.spec.correlationId ?? null,
+        status: "interrupted", startedUtc: attempt.updatedUtc, acpSessionId: attempt.acpSessionId,
+        targetRef: attempt.spec.target, reason: attempt.stalledReason });
+    }
+    for (const e of this.store.listDelegationsByStatus(["interrupted", "abandoned"], channelRef)) {
+      if (seen.has(e.id)) continue;
       seen.add(e.id);
       rows.push({
         id: e.id,
@@ -15765,26 +15797,14 @@ export class Orchestrator {
         startedUtc: e.updatedUtc || e.createdUtc,
         acpSessionId: e.acpSessionId,
         reason: e.terminalReason,
-        // Resume re-enqueues into the ledger's own target, which `channelRef`
-        // conflates with sourceRef — carry it verbatim so the Resume button is
-        // only offered when the resume can actually run (#159).
         targetRef: e.targetRef,
+        // Legacy dispatch resumes have no identity-bound SQL execution.
+        actions: e.status === "interrupted" ? ["abandon"] : [],
       });
-    }
-    for (const attempt of this.store.turnAttempts.list("completed")) {
-      if (seen.has(attempt.id)) continue;
-      // #419: the mapping lives in workflows-view so it can be tested without
-      // building an orchestrator. Its inline predecessor skipped every attempt
-      // with no delivery reason, which is why `b27578fe` was invisible to the
-      // only control that could have cleared it.
-      const row = interruptedRowForCompletedAttempt(attempt);
-      if (!row) continue;
-      seen.add(attempt.id);
-      rows.push(row);
     }
     const live = await this.liveTurnInventory();
     for (const m of live) {
-      if (seen.has(m.id)) continue;
+      if (seen.has(m.id) || !inScope(m.channelRef) || this.store.turnAttempts.get(m.id)) continue;
       rows.push({
         id: m.id,
         source: "live",
@@ -15800,7 +15820,7 @@ export class Orchestrator {
       () => [] as Awaited<ReturnType<typeof listAbandonedLiveTurns>>
     );
     for (const r of abandonedLive) {
-      if (seen.has(r.id)) continue;
+      if (seen.has(r.id) || !inScope(r.channelRef)) continue;
       rows.push({
         id: r.id,
         source: "live",
@@ -15811,9 +15831,37 @@ export class Orchestrator {
         acpSessionId: null,
         reason: r.reason ?? null,
         targetRef: r.channelRef,
+        actions: [],
       });
     }
-    return rows;
+    const stale = new Map(((await this.dispatchWatcher?.listStaleRunning()) ?? []).map(spec => [spec.id, spec]));
+    for (const row of rows) {
+      if (row.actions) continue;
+      const attempt = this.store.turnAttempts.get(row.id);
+      if (!attempt) {
+        row.actions = row.source === "live" ? interruptedRowActions(row) : [];
+        continue;
+      }
+      row.actions = [];
+      if (attempt.state !== "suspended") continue;
+      row.actions = ["abandon"];
+      if (attempt.source === "dispatch") {
+        const spec = stale.get(row.id);
+        const refusal = await this.dispatchContinuationRefusal(spec ?? attempt.spec);
+        if (refusal) row.resumeRefusal = refusal;
+        else if (spec) row.actions = ["resume", "abandon"];
+      } else {
+        const inbound = attempt.source === "inbound" ? this.store.getInbound(row.id.slice("inbound-".length)) : null;
+        const backed = attempt.source === "inbound"
+          ? inbound && inbound.state !== "completed"
+          : this.store.scheduledOccurrences.get(row.id)?.settled === false;
+        if (backed && !isAwaitingReauth(attempt.stalledReason)
+          && await this.checkResumePreconditions({ platform: PLATFORM, id: row.channelRef }) === "ok") {
+          row.actions = ["resume", "abandon"];
+        }
+      }
+    }
+    return rows.sort((a, b) => b.startedUtc.localeCompare(a.startedUtc) || a.id.localeCompare(b.id));
   }
 
   /** Modern live inventory is derived from SQL. Only genuinely legacy,
@@ -15922,43 +15970,18 @@ export class Orchestrator {
     }
     const ledger = this.store.getDelegation(id);
     if (ledger && (ledger.status === "interrupted" || ledger.status === "abandoned")) {
-      const target = ledger.targetRef;
-      if (!target || !ledger.acpSessionId) {
-        return `Cannot resume \`${id}\` — missing target or ACP session.`;
-      }
-      const resumeKind = ledger.kind === "inbox" ? "handoff" : ledger.kind;
-      await enqueueDispatchSpec(this.config.DATA_DIR, {
-        id: `${id}-resume`,
-        target,
-        prompt: CONTINUE_PROMPT,
-        session: "live",
-        resume: true,
-        kind: resumeKind,
-        ...(ledger.correlationId ? { correlationId: ledger.correlationId } : {}),
-        createdUtc: new Date().toISOString(),
-      }, this.store.turnAttempts);
-      // Point the new spec at the recorded session via a ledger row the
-      // dispatcher will look up — stamp the original's session on a
-      // running-shaped row so loadSession finds it. The new spec id is
-      // different, so copy the pointer onto a fresh dispatched row.
-      try {
-        this.store.recordDelegation({
-          id: `${id}-resume`,
-          kind: ledger.kind,
-          targetRef: target,
-          correlationId: ledger.correlationId,
-          acpSessionId: ledger.acpSessionId,
-          status: "dispatched",
-        });
-      } catch {
-        /* already exists */
-      }
-      return `▶️ Enqueued resume of \`${id}\` into the recorded session.`;
+      return `Cannot resume \`${id}\` — this legacy record has no identity-bound execution to continue.`;
     }
     return `No interrupted/abandoned turn \`${id}\`.`;
   }
 
   async abandonTurnManually(id: string): Promise<string> {
+    const completed = this.store.turnAttempts.get(id);
+    if (completed?.state === "completed") {
+      return this.store.turnAttempts.abandonDelivery(id, "abandoned by operator")
+        ? `🚫 Abandoned retained output for \`${id}\`; the execution record is kept.`
+        : `No retained output to abandon for \`${id}\`.`;
+    }
     const live = await this.liveTurnInventory();
     const marker = live.find((m) => m.id === id);
     if (marker) {
@@ -15973,15 +15996,47 @@ export class Orchestrator {
     }
     const ledger = this.store.getDelegation(id);
     if (ledger && (ledger.status === "interrupted" || ledger.status === "running")) {
-      try {
-        this.store.updateDelegationStatus(id, "abandoned");
-      } catch {
-        /* best-effort */
-      }
+      this.store.updateDelegationStatus(id, "abandoned");
       await this.dispatchWatcher?.abandonRunning(id, "abandoned by operator");
       return `🚫 Abandoned \`${id}\`.`;
     }
     return `No resumable turn \`${id}\`.`;
+  }
+
+  private async workflowActionRefusal(action: ParkedTurnAction, id: string, channelRef?: string): Promise<string | null> {
+    const row = (await this.collectInterruptedRows(channelRef)).find(row => row.id === id);
+    if (!row) return `No parked turn \`${id}\` in this scope; it may already have finished.`;
+    return interruptedRowActions(row).includes(action) ? null
+      : `Cannot ${action} \`${id}\` — ${(action === "resume" ? row.resumeRefusal : null) ?? row.reason ?? "no action is currently available"}.`;
+  }
+
+  private async performWorkflowAction(action: ParkedTurnAction, id: string, channelRef?: string): Promise<string> {
+    const refusal = await this.workflowActionRefusal(action, id, channelRef);
+    if (refusal) return refusal;
+    return action === "resume" ? this.resumeTurnManually(id) : this.abandonTurnManually(id);
+  }
+
+  private async abandonOldWorkflows(days: number, channelRef?: string): Promise<string> {
+    const cutoff = Date.now() - days * DAY_MS;
+    const rows = (await this.collectInterruptedRows(channelRef)).filter(row => Date.parse(row.startedUtc) < cutoff);
+    let abandoned = 0;
+    const failures: string[] = [];
+    for (const row of rows) {
+      const attempt = this.store.turnAttempts.get(row.id);
+      const retainedOutput = attempt?.state === "completed" && !attempt.deliveryDone && !attempt.deliveryAbandonedReason;
+      if (!interruptedRowActions(row).includes("abandon") && !retainedOutput) continue;
+      try {
+        const result = await this.abandonTurnManually(row.id);
+        if (result.startsWith("🚫 Abandoned")) abandoned++;
+        else failures.push(result);
+      } catch (err) {
+        const cause = err instanceof Error ? err.message : String(err);
+        this.logger.error({ err, attempt: row.id }, "bulk workflow abandon failed");
+        failures.push(`${row.id}: ${cause}`);
+      }
+    }
+    const failureNote = failures.length ? ` ${failures.length} failed: ${failures.slice(0, 3).join("; ")}` : "";
+    return (`Abandoned ${abandoned} item(s) older than ${days} days in ${channelRef ? "this thread" : "all threads"}. All database records were kept.${failureNote}`).slice(0, 1900);
   }
 
   /** Steer a running (or idle) node: preemptively cancel its in-flight turn,
@@ -16415,7 +16470,41 @@ export class Orchestrator {
    *  still-in-flight rows and a correlation-grouped recent tail as an embed; no
    *  writes, no schema, purely observability. */
   private async cmdWorkflows(i: ChatInputCommandInteraction): Promise<void> {
+    try {
+      await this.cmdWorkflowsDeferred(i);
+    } catch (err) {
+      this.logger.warn({ err }, "workflows inventory failed");
+      await replyToInteraction(i, { content: err instanceof Error ? err.message : String(err), embeds: [], components: [] });
+    }
+  }
+
+  private async cmdWorkflowsDeferred(i: ChatInputCommandInteraction): Promise<void> {
+    const allThreads = i.options.getString("scope") === "all";
+    if (allThreads && !this.config.SEAM_CONFIG_ADMIN_USER_IDS?.has(i.user.id)) {
+      await replyToInteraction(i, { content: "The all-threads workflows view is admin-only." });
+      return;
+    }
     const limit = i.options.getInteger("limit") ?? 20;
+    const olderThan = i.options.getString("abandon-older-than");
+    if (olderThan !== null) {
+      if (!this.config.SEAM_CONFIG_ADMIN_USER_IDS?.has(i.user.id)) {
+        await replyToInteraction(i, { content: "Bulk workflow abandonment is admin-only." });
+        return;
+      }
+      const days = Number(olderThan);
+      if (!Number.isInteger(days) || days < 1) {
+        await replyToInteraction(i, { content: "Pass a positive whole number of days for `abandon-older-than`." });
+        return;
+      }
+      await replyToInteraction(i, { content: await this.abandonOldWorkflows(days, allThreads ? undefined : i.channelId) });
+      return;
+    }
+    const resumeInput = i.options.getString("resume");
+    if (resumeInput) {
+      const id = await this.normalizeAutocompleteSubmission(i, null, "workflows", "resume", resumeInput);
+      await replyToInteraction(i, { content: await this.performWorkflowAction("resume", id, i.channelId) });
+      return;
+    }
 
     // Wake cancel (#59, D6): fold into /seam workflows per #26 rather than a new
     // top-level subcommand (the /seam tree is at Discord's 25-option cap).
@@ -16436,7 +16525,6 @@ export class Orchestrator {
         content: ok
           ? `⏰ Cancelled wake \`${cancelWakeId}\`.`
           : `No pending wake \`${cancelWakeId}\` in this thread (already fired, cancelled, or not this thread's).`,
-        flags: MessageFlags.Ephemeral,
       });
       return;
     }
@@ -16458,7 +16546,6 @@ export class Orchestrator {
       if (!record) {
         await replyToInteraction(i, {
           content: "Use `/seam workflows` inside a thread to hang up a live-help call.",
-          flags: MessageFlags.Ephemeral,
         });
         return;
       }
@@ -16467,7 +16554,6 @@ export class Orchestrator {
         content: result.ok
           ? `🎙️ Hanging up live help \`${cancelLiveId}\`.`
           : result.error,
-        flags: MessageFlags.Ephemeral,
       });
       return;
     }
@@ -16487,7 +16573,6 @@ export class Orchestrator {
       if (!record) {
         await replyToInteraction(i, {
           content: "Use `/seam workflows` inside a thread to revoke an ingest endpoint.",
-          flags: MessageFlags.Ephemeral,
         });
         return;
       }
@@ -16496,7 +16581,6 @@ export class Orchestrator {
         content: result.ok
           ? `🌐 Revoked ingest endpoint \`${cancelIngestId}\`.`
           : result.error,
-        flags: MessageFlags.Ephemeral,
       });
       return;
     }
@@ -16516,7 +16600,6 @@ export class Orchestrator {
       if (!record) {
         await replyToInteraction(i, {
           content: "Use `/seam workflows` inside a thread to cancel a choice card.",
-          flags: MessageFlags.Ephemeral,
         });
         return;
       }
@@ -16525,7 +16608,6 @@ export class Orchestrator {
         content: result.ok
           ? `🗳️ Cancelled choice card \`${cancelChoiceId}\`.`
           : result.error,
-        flags: MessageFlags.Ephemeral,
       });
       return;
     }
@@ -16547,7 +16629,6 @@ export class Orchestrator {
         content: ok
           ? `🔕 Cancelled watch \`${cancelWatchId}\`.`
           : `No pending watch \`${cancelWatchId}\` in this thread (already fired, cancelled, or not this thread's).`,
-        flags: MessageFlags.Ephemeral,
       });
       return;
     }
@@ -16558,7 +16639,6 @@ export class Orchestrator {
     await replyToInteraction(i, {
       embeds: initial.embeds,
       ...(initial.components.length ? { components: initial.components } : {}),
-      flags: MessageFlags.Ephemeral,
     });
     if (initial.components.length === 0) return;
     const msg = await i.fetchReply();
@@ -16573,23 +16653,24 @@ export class Orchestrator {
     );
     // Repeatable cards claim each row during mutation, then rebuild from the store.
     const controls = new WorkflowInventoryController({
-      resume: (id) => this.resumeTurnManually(id),
-      abandon: (id) => this.abandonTurnManually(id),
-      render: (requested) => this.renderWorkflowInventory(i, limit, requested),
+      resume: (id) => this.performWorkflowAction("resume", id, allThreads ? undefined : i.channelId),
+      abandon: (id) => this.performWorkflowAction("abandon", id, allThreads ? undefined : i.channelId),
+      render: (requested, category) => this.renderWorkflowInventory(i, limit, requested, category),
       refresh: (view) => lifecycle.refresh(view),
       terminal: (reason, view) => lifecycle.terminal(reason, view),
     });
     collectAcknowledgedInteractions(collector, "update", async (c) => {
-      if (!c.isButton()) return;
+      if (!c.isButton() && !c.isStringSelectMenu()) return;
+      const customId = c.isStringSelectMenu() && c.customId === "wf:category" ? `wf:category:${c.values[0]}` : c.customId;
       const access: SlashCommandAccess = {
-        kind: c.customId.startsWith("wf:page:") ? "read-only" : "mutating",
+        kind: customId.startsWith("wf:page:") || customId.startsWith("wf:category:") ? "read-only" : "mutating",
       };
       const refusal = this.slashAccessRefusal(c, access);
       if (refusal) {
         await replyToInteraction(c, { content: refusal, flags: MessageFlags.Ephemeral });
         return;
       }
-      await controls.handle(c.customId, {
+      await controls.handle(customId, {
         followUp: async (text) => {
           await replyToInteraction(c, { content: text, flags: MessageFlags.Ephemeral }, { followUp: true });
         },
@@ -16609,23 +16690,58 @@ export class Orchestrator {
   private async renderWorkflowInventory(
     i: ChatInputCommandInteraction,
     limit: number,
-    requestedPage: number
+    requestedPage: number,
+    selectedCategory?: string
   ): Promise<{
     embeds: EmbedBuilder[];
-    components: ActionRowBuilder<ButtonBuilder>[];
+    components: (ActionRowBuilder<ButtonBuilder> | ActionRowBuilder<StringSelectMenuBuilder>)[];
     page: number;
   }> {
     const now = new Date();
-    const active = this.store.listActiveDelegations();
+    const channelRef = i.options.getString("scope") === "all" ? undefined : i.channelId;
+    const scope = channelRef ? "this thread" : "all threads";
+    const newestFirst = <T extends { createdUtc: string }>(rows: T[]) => rows.sort((a, b) => b.createdUtc.localeCompare(a.createdUtc));
+    const includeHistory = i.options.getBoolean("history") ?? false;
+    const history = visibleWorkflowHistory(await this.collectInterruptedRows(channelRef), now, includeHistory);
+    const interrupted = history.rows;
+    const actionableIds = new Set(interrupted.filter(row => interruptedRowActions(row).length > 0).map(row => row.id));
+    const recentRows = (limit: number) => visibleWorkflowLedger(this.store.listRecentDelegations(limit, channelRef), now, includeHistory, actionableIds);
+    const wakes = newestFirst(this.store.listWakesByChannel(PLATFORM, channelRef));
+    const watches = newestFirst(channelRef ? this.listWatches(PLATFORM, channelRef) : this.store.listAllWatches());
+    const choices = newestFirst(this.store.listOpenChoiceCards(PLATFORM, channelRef));
+    const ingests = newestFirst(this.store.listOpenIngestEndpoints(PLATFORM, channelRef));
+    const calls = channelRef ? this.liveHelpManager?.listForThread(PLATFORM, channelRef) : this.liveHelpManager?.listActive();
+    const live = newestFirst((calls ?? []).filter(s => s.status === "starting" || s.status === "live"));
+    const schedules = newestFirst(channelRef ? this.store.listScheduledByChannel(PLATFORM, channelRef) : this.store.listAllScheduled());
+    const category = WORKFLOW_CATEGORIES.find(([id]) => id === selectedCategory)?.[0];
+    if (!category) return workflowLanding({
+      parked: interrupted.filter(row => interruptedRowActions(row).length > 0).length,
+      wakes: wakes.length, watches: watches.length, choices: choices.length,
+      ingests: ingests.length, live: live.length, schedules: schedules.length,
+    }, scope, history.hidden);
+    if (category !== "parked") {
+      const lines: Record<Exclude<WorkflowCategory, "parked">, string[]> = {
+        wakes: wakes.map(w => `⏰ \`${w.id}\` → ${w.fireAtUtc}${w.reason ? ` — ${w.reason.slice(0, 160)}` : ""}`),
+        watches: watches.map(w => `🔔 \`${w.id}\` ${w.kind}:${w.spec.slice(0, 160)} · expires ${w.expiresAtUtc}`),
+        choices: choices.map(c => `🗳️ \`${c.id}\` ${c.title.slice(0, 160)} (${c.clickCount}/${c.maxClicks})`),
+        ingests: ingests.map(e => `🌐 \`${e.id}\` ${e.name.slice(0, 160)}${e.thread ? ` → <#${e.thread}>` : ""}`),
+        live: live.map(s => `🎙️ \`${s.id}\` ${s.channelName ?? s.voiceChannelId} · ${s.status}`),
+        schedules: schedules.map(s => `📅 \`${s.id}\` ${s.name} · ${s.enabled ? "enabled" : "disabled"}`),
+      };
+      return workflowCategoryList(category, lines[category], scope, requestedPage, limit);
+    }
+    const active = this.store.listActiveDelegations(channelRef)
+      .sort((a, b) => b.createdUtc.localeCompare(a.createdUtc));
     const view = formatWorkflowsView(
       active,
-      this.store.listRecentDelegations(limit),
+      recentRows(limit),
       now
     );
 
     const embed = new EmbedBuilder()
-      .setTitle("🔀 Workflows")
+      .setTitle(`🔀 Parked turns — ${scope}`)
       .setColor(WORKFLOWS_COLOR);
+    if (history.hidden) embed.setFooter({ text: `${history.hidden} older inert record(s) hidden; history:true includes them` });
 
     if (view.empty) {
       embed.setDescription(
@@ -16653,7 +16769,7 @@ export class Orchestrator {
         ...new Map(
           [
             ...active,
-            ...this.store.listRecentDelegations(Math.max(limit, 200)),
+            ...recentRows(Math.max(limit, 200)),
           ].map((e) => [e.id, e])
         ).values(),
       ];
@@ -16668,102 +16784,14 @@ export class Orchestrator {
         });
       }
 
-      embed.setFooter({ text: `showing up to ${limit} recent rows` });
+      embed.setFooter({ text: `showing up to ${limit} recent rows`
+        + (history.hidden ? `; ${history.hidden} older inert record(s) hidden; history:true includes them` : "") });
     }
 
-    // Pending wakes for THIS thread (#59, D6): the agent's own deferred
-    // follow-ups, so a user can see and cancel a timer that would otherwise burn
-    // tokens invisibly. Cancel with `/seam workflows cancel-wake:<id>`.
-    const record = this.recordFromInteraction(i);
-    if (record) {
-      const wakes = this.listWakes(record.platform, record.channelRef);
-      if (wakes.length > 0) {
-        const lines = wakes
-          .slice(0, 10)
-          .map((w) => {
-            const reason = w.reason ? ` — ${w.reason}` : "";
-            const depth = w.chainDepth > 0 ? ` (chain-depth ${w.chainDepth})` : "";
-            return `⏰ \`${w.id}\` → ${w.fireAtUtc}${reason}${depth}`;
-          });
-        if (wakes.length > 10) lines.push(`…and ${wakes.length - 10} more`);
-        embed.addFields({
-          name: `⏰ Pending wakes (${wakes.length})`,
-          value: clampFieldValue(lines),
-        });
-        if (view.empty) embed.setDescription(null);
-      }
-
-      // Pending watches for THIS thread (#60, D7): agent-defined condition
-      // triggers, listed + cancellable via `/seam workflows cancel-watch:<id>`.
-      const watches = this.listWatches(record.platform, record.channelRef);
-      if (watches.length > 0) {
-        const lines = watches
-          .slice(0, 10)
-          .map((w) => {
-            const reason = w.reason ? ` — ${w.reason}` : "";
-            const fires = w.mode === "each" ? ` (${w.fireCount}/${w.maxFires} fires)` : "";
-            return `🔔 \`${w.id}\` → ${w.kind}:${w.spec} every ${w.intervalSeconds}s, expires ${w.expiresAtUtc}${fires}${reason}`;
-          });
-        if (watches.length > 10) lines.push(`…and ${watches.length - 10} more`);
-        embed.addFields({
-          name: `🔔 Pending watches (${watches.length})`,
-          value: clampFieldValue(lines),
-        });
-        if (view.empty) embed.setDescription(null);
-      }
-
-      const liveCalls = this.liveHelpManager?.listForThread(record.platform, record.channelRef) ?? [];
-      const liveActive = liveCalls.filter((s) => s.status === "starting" || s.status === "live");
-      if (liveActive.length > 0) {
-        const lines = liveActive.slice(0, 10).map((s) => {
-          const ch = s.channelName ? `**${s.channelName}**` : s.voiceChannelId;
-          return `🎙️ \`${s.id}\` ${ch} · ${s.status}`;
-        });
-        if (liveActive.length > 10) lines.push(`…and ${liveActive.length - 10} more`);
-        embed.addFields({
-          name: `🎙️ Live help (${liveActive.length})`,
-          value: clampFieldValue(lines),
-        });
-        if (view.empty) embed.setDescription(null);
-      }
-
-      const endpoints = this.store.listOpenIngestEndpoints(record.platform, record.channelRef);
-      if (endpoints.length > 0) {
-        const lines = endpoints.slice(0, 10).map((e) => {
-          const uniq = e.uniqueStudent ? " · unique-student" : "";
-          const notify = e.notifyThread ? ` · notify ${e.notifyThread}` : "";
-          const live = e.thread ? ` · live → ${e.thread}` : "";
-          const preset = e.preset ? ` · preset ${e.preset}` : "";
-          const model = e.model ? ` · ${e.model}` : "";
-          return `🌐 \`${e.id}\` ${e.name}${preset}${model}${uniq}${notify}${live}`;
-        });
-        if (endpoints.length > 10) lines.push(`…and ${endpoints.length - 10} more`);
-        embed.addFields({
-          name: `🌐 Ingest endpoints (${endpoints.length})`,
-          value: clampFieldValue(lines),
-        });
-        if (view.empty) embed.setDescription(null);
-      }
-
-      const choices = this.store.listOpenChoiceCards(record.platform, record.channelRef);
-      if (choices.length > 0) {
-        const lines = choices.slice(0, 10).map((c) => {
-          const last = c.lastClickerName ? ` · last ${c.lastClickerName}` : "";
-          return `🗳️ \`${c.id}\` ${c.title} (${c.clickCount}/${c.maxClicks})${last}`;
-        });
-        if (choices.length > 10) lines.push(`…and ${choices.length - 10} more`);
-        embed.addFields({
-          name: `🗳️ Open choice cards (${choices.length})`,
-          value: clampFieldValue(lines),
-        });
-        if (view.empty) embed.setDescription(null);
-      }
-    }
-
-    const interrupted = await this.collectInterruptedRows();
     const components: ActionRowBuilder<ButtonBuilder>[] = [];
     const requiredFieldNames = new Set<string>();
     let page = 0;
+    let pageCount = 1;
     if (interrupted.length > 0) {
       // Controls exist only for rows a click can still act on, and the visible
       // lines are exactly those rows in button order. An abandoned row keeping
@@ -16771,6 +16799,7 @@ export class Orchestrator {
       // backing operation was already consumed.
       const slice = buildInterruptedInventory(interrupted, requestedPage, now);
       page = slice.page;
+      pageCount = slice.pageCount;
       if (slice.actionable) {
         embed.addFields(slice.actionable);
         // Never dropped by the embed budget below: these are the rows the
@@ -16778,7 +16807,6 @@ export class Orchestrator {
         requiredFieldNames.add(slice.actionable.name);
       }
       if (slice.inert) embed.addFields(slice.inert);
-      if (view.empty) embed.setDescription(null);
       // Per-entry Resume / Abandon \u2014 same pattern as schedule-list cards.
       // Zero extra command slots. Four rows leave the fifth for pagination.
       for (const row of slice.items) {
@@ -16788,7 +16816,7 @@ export class Orchestrator {
           buttons.push(
             new ButtonBuilder()
               .setCustomId(`wf:resume:${row.id}`)
-              .setLabel(`\u25b6\ufe0f Resume ${row.source}`.slice(0, 80))
+              .setLabel(workflowActionLabel("resume", row, now))
               .setStyle(ButtonStyle.Primary)
           );
         }
@@ -16796,7 +16824,7 @@ export class Orchestrator {
           buttons.push(
             new ButtonBuilder()
               .setCustomId(`wf:abandon:${row.id}`)
-              .setLabel("\U0001f6ab Abandon")
+              .setLabel(workflowActionLabel("abandon", row, now))
               .setStyle(ButtonStyle.Danger)
           );
         }
@@ -16804,28 +16832,8 @@ export class Orchestrator {
           components.push(new ActionRowBuilder<ButtonBuilder>().addComponents(...buttons));
         }
       }
-      if (slice.pageCount > 1) {
-        components.push(
-          new ActionRowBuilder<ButtonBuilder>().addComponents(
-            new ButtonBuilder()
-              .setCustomId(`wf:page:${slice.page - 1}`)
-              .setLabel("\u25c0 Prev")
-              .setStyle(ButtonStyle.Secondary)
-              .setDisabled(slice.page === 0),
-            new ButtonBuilder()
-              .setCustomId(`wf:page:${slice.page}`)
-              .setLabel(`Page ${slice.page + 1}/${slice.pageCount}`)
-              .setStyle(ButtonStyle.Secondary)
-              .setDisabled(true),
-            new ButtonBuilder()
-              .setCustomId(`wf:page:${slice.page + 1}`)
-              .setLabel("Next \u25b6")
-              .setStyle(ButtonStyle.Secondary)
-              .setDisabled(slice.page >= slice.pageCount - 1)
-          )
-        );
-      }
     }
+    components.push(workflowNavigation(page, pageCount));
 
     // Discord caps the WHOLE embed at 6000 chars across title/description/
     // fields/footer, independently of the 1024 per-field cap — and this card
@@ -19318,6 +19326,67 @@ export class Orchestrator {
     }
   }
 
+  private async notifyParkedTurn(attempt: TurnAttempt): Promise<void> {
+    if (!attempt.stalledUtc || attempt.stallNoticeUtc || isAwaitingReauth(attempt.stalledReason)) return;
+    await this.postParkedTurnNotice(attempt.spec.target, attempt,
+      `⚠️ Turn \`${attempt.id}\` is parked: ${attempt.stalledReason}. Resolve the cause before requesting continuation, or abandon the work. The original prompt was not replayed.`);
+    this.store.turnAttempts.markStallNoticeDelivered(attempt.id);
+  }
+
+  private async postParkedTurnNotice(channelRef: string, attempt: TurnAttempt, body: string): Promise<void> {
+    if (!this.adapter.sendChoiceCard || isAwaitingReauth(attempt.stalledReason)) {
+      await this.adapter.sendMessage({ platform: PLATFORM, id: channelRef }, body);
+      return;
+    }
+    const record = this.store.getByChannel(PLATFORM, channelRef)
+      ?? this.router.ensureSessionRecord({ platform: PLATFORM, channelRef, cwd: this.config.REPOS_ROOT });
+    const row: InterruptedTurnRow = {
+      id: attempt.id, source: attempt.source === "dispatch" ? "dispatch" : "live", channelRef: attempt.spec.target,
+      correlationId: null, status: "interrupted", startedUtc: attempt.updatedUtc,
+      acpSessionId: attempt.acpSessionId, targetRef: attempt.spec.target,
+    };
+    const now = new Date();
+    const current = (await this.collectInterruptedRows(attempt.spec.target)).find(item => item.id === attempt.id);
+    const actions = current ? interruptedRowActions(current) : [];
+    if (!actions.includes("resume")) {
+      body += `\nResume isn't available: ${current?.resumeRefusal ?? current?.reason ?? "no continuation is currently available"}.`;
+    }
+    if (actions.length === 0) {
+      await this.adapter.sendMessage({ platform: PLATFORM, id: channelRef }, body);
+      return;
+    }
+    const posted = await this.publishChoiceCard(record, parkedTurnChoiceSpec(attempt.id, body, {
+      resume: workflowActionLabel("resume", row, now), abandon: workflowActionLabel("abandon", row, now),
+    }, actions));
+    if (!posted.ok) throw new Error(posted.error);
+  }
+
+  private async handleParkedTurnChoice(evt: ChoiceInteraction, card: ChoiceCard, optionIndex: number,
+    request: { action: ParkedTurnAction; attemptId: string }): Promise<void> {
+    const access = { kind: "mutating" as const };
+    const scope = evt.channel.parentId ?? evt.channel.id;
+    const refusal = Orchestrator.isParticipantSlashRefused(this.config, "", evt.userId, { access })
+      ? PARTICIPANT_CONFIG_REFUSAL
+      : Orchestrator.isLockedSlashRefused(this.config, scope, "", evt.userId, { access })
+        ? "🔒 This channel is locked — its configuration can't be changed." : null;
+    const attempt = this.store.turnAttempts.get(request.attemptId);
+    const unavailable = refusal ?? (!attempt ? "This parked turn is no longer available."
+      : await this.workflowActionRefusal(request.action, request.attemptId, attempt.spec.target));
+    if (unavailable) {
+      await evt.followUpEphemeral(unavailable);
+      return;
+    }
+    const claimed = this.store.claimChoiceClick({ choiceId: card.id, userId: evt.userId,
+      userName: evt.userName, optionIndex });
+    if (!claimed.ok) {
+      await evt.followUpEphemeral("This parked-turn card has already been used or closed.");
+      return;
+    }
+    const result = await this.performWorkflowAction(request.action, request.attemptId, attempt!.spec.target);
+    await this.refreshChoiceCard(this.store.getChoiceCard(card.id) ?? claimed.card);
+    await evt.followUpEphemeral(result);
+  }
+
   /** Choice card for a parked re-auth. Not an elicitation row. */
   private async postReauthCard(channelRef: string, attemptId: string, park: ReauthPark, cause?: string): Promise<void> {
     try {
@@ -19474,6 +19543,12 @@ export class Orchestrator {
     const reauthAttemptId = option.kind === "prompt" ? reauthAcceptAttemptId(option.payload) : null;
     if (reauthAttemptId) {
       await this.acceptReauthChoice(evt, card, optionIndex, reauthAttemptId);
+      return;
+    }
+
+    const parked = option.kind === "prompt" ? parkedTurnAction(option.payload) : null;
+    if (parked) {
+      await this.handleParkedTurnChoice(evt, card, optionIndex, parked);
       return;
     }
 

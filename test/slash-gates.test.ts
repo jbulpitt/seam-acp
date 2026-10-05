@@ -98,7 +98,7 @@ describe("slash leaf access", () => {
     expect(getSlashCommandAccess("seam", null, "cancel")).toMatchObject({ participantAllowed: true, lockExempt: true });
     expect(getSlashCommandAccess("seam", null, "cancel", () => "all")).toMatchObject({ participantAllowed: false, lockExempt: false });
     expect(getSlashCommandAccess("seam", null, "workflows")?.kind).toBe("read-only");
-    for (const option of ["cancel-wake", "cancel-watch", "cancel-choice", "cancel-ingest", "cancel-live"]) {
+    for (const option of ["abandon-older-than", "resume", "cancel-wake", "cancel-watch", "cancel-choice", "cancel-ingest", "cancel-live"]) {
       expect(getSlashCommandAccess("seam", null, "workflows", (name) => name === option ? "id" : null)?.kind).toBe("mutating");
     }
   });

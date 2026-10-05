@@ -12,6 +12,7 @@
  * would continue the turn on a timer.
  */
 import type { ChoiceSpec } from "./choice/types.js";
+import { parkedTurnPayload } from "./parked-turn-card.js";
 import { reauthWaitNotice, type ReauthPark, type ReauthNoticeContext } from "./reauth-negotiation.js";
 
 export const REAUTH_ACCEPT_PREFIX = "reauth-accept:";
@@ -32,7 +33,7 @@ export function reauthAcceptAttemptId(payload: string | undefined): string | nul
   return ATTEMPT_ID.test(id) ? id : null;
 }
 
-/** One button. Accept calls `acceptReauthWait`. Cancel is not this button. */
+/** Accept calls `acceptReauthWait`; Abandon uses the existing turn action. */
 export function reauthChoiceSpec(attemptId: string, park: ReauthPark, context?: ReauthNoticeContext): ChoiceSpec {
   return {
     title: "Provider authentication",
@@ -43,6 +44,8 @@ export function reauthChoiceSpec(attemptId: string, park: ReauthPark, context?: 
       label: "Authentication is done — continue",
       kind: "prompt",
       payload: reauthAcceptPayload(attemptId),
+    }, {
+      label: "Abandon parked turn", kind: "prompt", payload: parkedTurnPayload("abandon", attemptId),
     }],
   };
 }

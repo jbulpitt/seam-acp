@@ -154,11 +154,17 @@ export function buildSeamCommand(): SlashCommandBuilder {
 
   cmd.addSubcommand((sub) =>
     declareAccess(sub, (option) => ({
-      kind: ["cancel-wake", "cancel-watch", "cancel-choice", "cancel-ingest", "cancel-live"]
+      kind: ["abandon-older-than", "resume", "cancel-wake", "cancel-watch", "cancel-choice", "cancel-ingest", "cancel-live"]
         .some((name) => option(name)) ? "mutating" : "read-only",
     }), "ephemeral")
       .setName("workflows")
-      .setDescription("View the delegation ledger + this thread's pending wakes (active + recent)")
+      .setDescription("View this thread's workflows and parked turns, newest first")
+      .addStringOption(o => o.setName("scope").setDescription("This thread (default), or all threads for admins")
+        .addChoices({ name: "This thread", value: "thread" }, { name: "All threads (admin)", value: "all" }))
+      .addStringOption(o => o.setName("resume").setDescription("Continue a parked turn in this thread")
+        .setAutocomplete(true))
+      .addBooleanOption(o => o.setName("history").setDescription("Include old inert history (records are kept)"))
+      .addStringOption(o => o.setName("abandon-older-than").setDescription("Admin: abandon all parked items in this scope older than N days"))
       .addIntegerOption((o) =>
         o
           .setName("limit")

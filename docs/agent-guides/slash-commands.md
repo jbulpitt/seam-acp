@@ -93,6 +93,28 @@ defers. Autocomplete keeps its separate three-second response budget.
 Idle + host ready runs now. A later bare message still interrupts and
 cancels the queued prompt. Shares the `#88` parked row.
 
+**Workflows:** `/seam workflows` acknowledges before reading the inventory or
+cancelling an item. The default inventory is this thread, newest first;
+`scope:all` explicitly selects the admin all-threads view. Resume is offered
+only for a recorded continuation that passes the existing admission checks.
+Completed output can be abandoned, not rerun; consumed records remain visible
+as history with no action available.
+The bare command opens one category picker with counts for parked turns,
+wakes, watches, choices, ingests, live help and schedules. Parked controls carry
+their attempt's short id (and age for Resume); **Categories** returns to the
+picker. Existing `cancel-*` options still act directly.
+`resume:<id>` autocompletes this thread's currently resumable parked turns.
+Parked notices carry durable Resume/Abandon choices bound to the attempt id;
+the click repeats the inventory's admission checks. Authentication notices use
+their existing **Authentication is done — continue** route plus Abandon, not a
+second generic Resume button.
+Inert history older than seven days is hidden by default, not deleted;
+`history:true` includes it. Actionable parked work remains visible at any age.
+Admins can explicitly clear old parked work and retained output with
+`abandon-older-than:7` (a positive whole number of days). It defaults to this
+thread; add `scope:all` for all threads. Records stay in the database, and the
+reply reports how many were abandoned and any real failures.
+
 **Cancel options** (not new keywords):
 - `/seam cancel` — this thread, graceful
 - `/seam cancel force:true` — this thread, escalate (old `abort`)

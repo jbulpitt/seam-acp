@@ -28,8 +28,14 @@ const STATUS_ICON: Record<DelegationStatus, string> = {
 
 /** Trailing, human-sized slice of an id (drops a `del-`/`corr-` style prefix). */
 export function shortId(id: string): string {
+  const uuid = id.match(/(?:^|-)([0-9a-f]{8})-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
+  if (uuid) return uuid[1]!;
   const tail = id.includes("-") ? id.slice(id.lastIndexOf("-") + 1) : id;
   return tail.length > 8 ? tail.slice(0, 8) : tail;
+}
+
+export function workflowActionLabel(action: "resume" | "abandon", row: InterruptedTurnRow, now: Date): string {
+  return action === "resume" ? `Resume ${shortId(row.id)} (${formatAge(row.startedUtc, now)})` : `Abandon ${shortId(row.id)}`;
 }
 
 /** A thread/session ref without its platform prefix, clamped for one line. */
@@ -86,23 +92,19 @@ export function groupByCorrelation(entries: LedgerEntry[]): LedgerEntry[][] {
 }
 
 /**
- * Build the read-only view. `active` (oldest-first, still in flight) renders one
- * line per row; `recent` (newest-first) is grouped by correlation with each
- * group ordered oldest-first so a handoff reads above its report-back.
+ * Build the read-only view, newest first. Correlated rows stay adjacent.
  */
 export function formatWorkflowsView(
   active: LedgerEntry[],
   recent: LedgerEntry[],
   now: Date
 ): WorkflowsView {
-  const activeLines = active.map((e) => entryLine(e, now, false));
+  const newestFirst = (a: LedgerEntry, b: LedgerEntry) => b.createdUtc.localeCompare(a.createdUtc);
+  const activeLines = [...active].sort(newestFirst).map((e) => entryLine(e, now, false));
 
   const recentLines: string[] = [];
-  for (const group of groupByCorrelation(recent)) {
-    const chronological = [...group].sort((a, b) =>
-      a.createdUtc.localeCompare(b.createdUtc)
-    );
-    chronological.forEach((e, idx) => recentLines.push(entryLine(e, now, idx > 0)));
+  for (const group of groupByCorrelation([...recent].sort(newestFirst))) {
+    [...group].sort(newestFirst).forEach((e, idx) => recentLines.push(entryLine(e, now, idx > 0)));
   }
 
   return {
@@ -159,6 +161,9 @@ export interface InterruptedTurnRow {
   targetRef: string | null;
   /** Durable explanation for an explicit abandonment, when available. */
   reason?: string | null;
+  resumeRefusal?: string;
+  /** Actions supported by the current backing record and admission checks. */
+  actions?: readonly InterruptedRowAction[];
 }
 
 /** One inventory line: thread, age, correlation — what the operator needs
@@ -189,13 +194,13 @@ export type InterruptedRowAction = "resume" | "abandon";
  * - A **live** marker resumes from its recorded ACP session and is abandoned
  *   by dropping the marker itself (no ledger row involved). Once abandoned the
  *   marker is gone, so neither action can reach anything.
- * - A **dispatch** row resumes through the ledger, which re-enqueues into
- *   `targetRef` *and* loads `acpSessionId` — it needs both. Abandoning only
- *   means something while the row is still interrupted.
+ * - A **dispatch** requires actions resolved from its current SQL attempt.
+ *   A ledger pointer alone is not a continuation identity.
  */
 export function interruptedRowActions(
   row: InterruptedTurnRow
 ): readonly InterruptedRowAction[] {
+  if (row.actions) return row.actions;
   const actions: InterruptedRowAction[] = [];
   if (row.source === "live") {
     if (row.status === "abandoned") return actions;
@@ -203,7 +208,6 @@ export function interruptedRowActions(
     actions.push("abandon");
     return actions;
   }
-  if (row.targetRef && row.acpSessionId) actions.push("resume");
   if (row.status === "interrupted") actions.push("abandon");
   return actions;
 }
@@ -252,6 +256,7 @@ export function interruptedRowForCompletedAttempt(attempt: {
     // and this turn has already run. Abandon is the only correct remedy.
     targetRef: unsettled ? null : attempt.spec.target,
     reason,
+    actions: unsettled ? ["abandon"] : [],
   };
 }
 

@@ -8,9 +8,9 @@ import os from "node:os";
 import path from "node:path";
 import { EventEmitter } from "node:events";
 import { PassThrough, Readable, Writable } from "node:stream";
-import { agent, methods, ndJsonStream, PROTOCOL_VERSION } from "@agentclientprotocol/sdk";
+import { agent, methods, ndJsonStream, PROTOCOL_VERSION, RequestError } from "@agentclientprotocol/sdk";
 import { pino } from "pino";
-import type { AgentProfile } from "@seam/adapters";
+import { classifyCodexError, type AgentProfile } from "@seam/adapters";
 import { SessionRouter } from "../packages/core/src/core/session-router.js";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
@@ -22,6 +22,7 @@ import type { IncomingMessage } from "../packages/core/src/platforms/chat-adapte
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 import { localBridgeWiring } from "./local-bridge-fixture.js";
 import * as owners from "../packages/core/src/core/dispatch/process-owner.js";
+import { acceptReauthWait } from "../packages/core/src/core/reauth-negotiation.js";
 
 const silent = pino({ level: "silent" }) as any;
 const THREAD = "thread-302-runtime";
@@ -31,6 +32,7 @@ const RECORDED = "acp-recorded-302";
 const ORIGINAL = "finish the interrupted task";
 
 interface AcpCalls {
+  authRequired: boolean;
   initialized: number;
   loads: string[];
   news: number;
@@ -43,7 +45,7 @@ function modelOptions() {
     options: [{ value: MODEL, name: "Opus" }] }];
 }
 
-type AcpMode = "ok" | "no-load" | "reject-load" | "reject-load-once" | "hang-load" | "hang-load-once";
+type AcpMode = "ok" | "no-load" | "reject-load" | "reject-load-once" | "hang-load" | "hang-load-once" | "codex-auth";
 function syntheticAcp(calls: AcpCalls, mode: AcpMode) {
   return () => {
     const stdin = new PassThrough();
@@ -73,6 +75,10 @@ function syntheticAcp(calls: AcpCalls, mode: AcpMode) {
       })
       .onRequest(methods.agent.session.load, ({ params }) => {
         calls.loads.push(params.sessionId);
+        if (mode === "codex-auth" && calls.authRequired) {
+          stderr.write("codex-acp: recorded session/load diagnostic\n");
+          throw new RequestError(-32000, "Authentication required", null);
+        }
         if (mode === "reject-load" || (mode === "reject-load-once" && calls.loads.length === 1)) throw new Error("synthetic remote session/load refusal");
         if (mode === "hang-load" || (mode === "hang-load-once" && calls.loads.length === 1)) return new Promise(() => {});
         return { sessionId: params.sessionId, configOptions: modelOptions() };
@@ -99,6 +105,7 @@ interface Harness {
   router: SessionRouter;
   orch: Orchestrator;
   calls: AcpCalls;
+  adapter: { sendMessage: ReturnType<typeof vi.fn> };
 }
 
 const cleanups: Array<() => Promise<void> | void> = [];
@@ -110,9 +117,11 @@ afterEach(async () => {
 function harness(location: "local" | "bridge-a", mode: AcpMode): Harness {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "seam-302-runtime-"));
   const store = new SessionStore(path.join(dir, "seam.db"));
-  const calls: AcpCalls = { initialized: 0, loads: [], news: 0, prompts: [], children: [] };
+  const calls: AcpCalls = { authRequired: true, initialized: 0, loads: [], news: 0, prompts: [], children: [] };
+  const agentId = mode === "codex-auth" ? "codex" : "claude";
   const profile = {
-    id: "claude",
+    id: agentId,
+    ...(agentId === "codex" ? { classifyError: classifyCodexError } : {}),
     displayName: "Synthetic Claude",
     defaultModel: MODEL,
     staticModels: [{ modelId: MODEL, name: "Opus" }],
@@ -125,10 +134,10 @@ function harness(location: "local" | "bridge-a", mode: AcpMode): Harness {
   const catalog = fixtureModelCatalog([profile]);
   const now = new Date().toISOString();
   store.upsert({ id: `discord:${THREAD}`, platform: "discord", channelRef: THREAD, parentRef: PARENT,
-    agentId: "claude", acpSessionId: RECORDED, repoPath: dir, configJson: JSON.stringify({ model: MODEL }),
+    agentId, acpSessionId: RECORDED, repoPath: dir, configJson: JSON.stringify({ model: MODEL }),
     createdUtc: now, updatedUtc: now });
   const router = new SessionRouter({ logger: silent, store, profiles: [profile], modelCatalog: catalog,
-    defaultAgentId: "claude", defaultModel: MODEL, defaultPermissionMode: "deny",
+    defaultAgentId: agentId, defaultModel: MODEL, defaultPermissionMode: "deny",
     threadPresets, defaultCwd: dir, seamMcp: localBridgeWiring(profile),
     ...(mode === "hang-load" || mode === "hang-load-once" ? { sessionLoadTimeoutMs: 25 } : {}) });
   (router as any).startFailureCooldownMs = 0;
@@ -154,10 +163,10 @@ function harness(location: "local" | "bridge-a", mode: AcpMode): Harness {
       SEAM_DISPATCH_STATUS_PANEL: false, channelPresets: new Map(), threadPresets,
       bridgePresets: new Map(), REPO_EMOJIS: new Map() } as any });
   cleanups.push(async () => { await router.disposeAll(); store.close(); fs.rmSync(dir, { recursive: true, force: true }); });
-  return { dir, store, router, orch, calls };
+  return { dir, store, router, orch, calls, adapter };
 }
 
-function seedPromptedAttempt(h: Harness): string {
+function seedPromptedAttempt(h: Harness, promptStarted = true): string {
   const currentOwner = owners.processOwner();
   if (!currentOwner) throw new Error("synthetic ownership fixture requires readable process identity");
   const ownerSpy = vi.spyOn(owners, "processOwner").mockReturnValue({ ...currentOwner, start: "0" });
@@ -175,8 +184,10 @@ function seedPromptedAttempt(h: Harness): string {
   executionIdentity({ agent: described.agent.value, location: described.location.value,
     model: described.model.value, effort: described.effort.value, cwd: described.cwd.value,
     config: identityConfig }), "boot-before-restart", "inbound");
-  h.store.turnAttempts.bind(claimed, RECORDED);
-  h.store.turnAttempts.startPrompt(claimed);
+  if (promptStarted) {
+    h.store.turnAttempts.bind(claimed, RECORDED);
+    h.store.turnAttempts.startPrompt(claimed);
+  }
   h.store.turnAttempts.suspendBoot("boot-before-restart");
   ownerSpy.mockRestore();
   return id;
@@ -190,6 +201,112 @@ async function resume(h: Harness): Promise<void> {
 }
 
 describe("#302 real ACP handshake and strict session/load recovery", () => {
+  it.each([false, true])("parks a recovered dispatch with promptStarted=%s when Codex session/load requires authentication", async promptStarted => {
+    const h = harness("bridge-a", "codex-auth");
+    const boot = (h.orch as unknown as { attemptBoot: string }).attemptBoot;
+    const record = h.store.get(`discord:${THREAD}`)!;
+    const d = h.router.describeConfig(record);
+    const spec = { id: "codex-load-auth-dispatch", target: THREAD, prompt: ORIGINAL,
+      session: "live" as const, kind: "handoff" as const,
+      createdUtc: record.createdUtc, stream: false, reportBack: false };
+    h.store.turnAttempts.registerOwner(boot);
+    const claimed = h.store.turnAttempts.claim(spec, executionIdentity({
+      agentId: "codex", location: "bridge-a", session: "live", model: d.model.value,
+      effort: d.effort.value, cwd: d.cwd.value, config: record.configJson,
+    }), boot);
+    if (promptStarted) {
+      h.store.turnAttempts.bind(claimed, RECORDED);
+      h.store.turnAttempts.startPrompt(claimed);
+    }
+    h.store.turnAttempts.suspend(spec.id, boot);
+    await expect(h.orch.dispatchInjectTurn(spec)).rejects.toMatchObject({
+      reason: expect.stringMatching(/^reauth-waiting:/),
+    });
+    expect(h.calls.loads).toEqual([RECORDED]);
+    expect(h.calls.prompts).toEqual([]);
+    expect(h.store.turnAttempts.get(spec.id)).toMatchObject({
+      state: "suspended", promptStarted, acpSessionId: promptStarted ? RECORDED : null, outcome: null,
+      stalledReason: expect.stringMatching(/^reauth-waiting:/),
+    });
+    expect(h.adapter.sendMessage.mock.calls.map(call => String(call[1])).join("\n"))
+      .toContain("Cause: Authentication required");
+    expect(h.store.turnAttempts.get(spec.id)?.stallNoticeUtc).not.toBeNull();
+    const noticeCount = h.adapter.sendMessage.mock.calls.length;
+    await h.orch.observeRetainedDispatch(spec);
+    expect(h.adapter.sendMessage.mock.calls).toHaveLength(noticeCount);
+    await expect(h.orch.dispatchInjectTurn(spec)).rejects.toMatchObject({
+      reason: expect.stringMatching(/^reauth-waiting:/),
+    });
+    expect(h.calls.loads).toEqual([RECORDED]);
+    h.calls.authRequired = false;
+    expect(acceptReauthWait(h.store.turnAttempts, spec.id)).not.toBeNull();
+    await h.orch.dispatchInjectTurn(spec);
+    expect(h.calls.loads).toEqual([RECORDED, RECORDED]);
+    expect(h.calls.prompts).toHaveLength(1);
+    if (promptStarted) {
+      expect(h.calls.prompts[0]).toMatch(/^continue\n/);
+      expect(h.calls.prompts[0]).not.toContain(ORIGINAL);
+    } else {
+      expect(h.calls.prompts[0]).toContain(ORIGINAL);
+      expect(h.calls.prompts[0]).not.toMatch(/^continue\n/);
+    }
+    expect(h.store.turnAttempts.get(spec.id)?.state).toBe("completed");
+  });
+
+  it("parks pre-prompt inbound acquisition and sends the pending prompt once after sign-in", async () => {
+    const h = harness("local", "codex-auth");
+    const id = seedPromptedAttempt(h, false);
+    await resume(h);
+    expect(h.calls.loads).toEqual([RECORDED]);
+    expect(h.calls.news).toBe(0);
+    expect(h.calls.prompts).toEqual([]);
+    expect(h.store.turnAttempts.get(id)).toMatchObject({
+      state: "suspended", promptStarted: false, acpSessionId: null, outcome: null,
+      stalledReason: expect.stringMatching(/^reauth-waiting:/),
+    });
+    const notice = h.adapter.sendMessage.mock.calls.map(call => String(call[1])).join("\n");
+    expect(notice).toContain("Cause: Authentication required");
+    expect(notice).toContain("The pending prompt has not been sent; it will be sent once.");
+    expect(notice).not.toContain("will not be replayed");
+    h.calls.authRequired = false;
+    expect(acceptReauthWait(h.store.turnAttempts, id)).not.toBeNull();
+    await resume(h);
+    expect(h.calls.loads).toEqual([RECORDED, RECORDED]);
+    expect(h.calls.prompts).toHaveLength(1);
+    expect(h.calls.prompts[0]).toContain(ORIGINAL);
+    expect(h.calls.prompts[0]).not.toMatch(/^continue\n/);
+    expect(h.store.turnAttempts.get(id)?.state).toBe("completed");
+  });
+
+  it.each(["local", "bridge-a"] as const)("parks the exact Codex auth failure on %s session/load, then continues only after sign-in confirmation", async location => {
+    const h = harness(location, "codex-auth");
+    const id = seedPromptedAttempt(h);
+    await resume(h);
+    expect(h.calls.loads).toEqual([RECORDED]);
+    expect(h.calls.news).toBe(0);
+    expect(h.calls.prompts).toEqual([]);
+    expect(h.store.turnAttempts.get(id)).toMatchObject({
+      state: "suspended", acpSessionId: RECORDED, promptStarted: true, outcome: null,
+      stalledReason: expect.stringMatching(/^reauth-waiting:/),
+    });
+    const notice = h.adapter.sendMessage.mock.calls.map(call => String(call[1])).join("\n");
+    expect(notice).toContain(`Codex on ${location === "local" ? os.hostname() : location} needs to sign in again (\`codex login\`)`);
+    expect(notice).toContain("Cause: Authentication required");
+    expect(notice).toContain("Authentication is done — continue");
+    expect(notice).not.toContain("safety checks");
+    expect(notice).not.toContain("boot recovery exhausted");
+    await expect(resume(h)).rejects.toMatchObject({ reason: expect.stringMatching(/^reauth-waiting:/) });
+    expect(h.calls.loads).toEqual([RECORDED]);
+    h.calls.authRequired = false;
+    expect(acceptReauthWait(h.store.turnAttempts, id)).not.toBeNull();
+    await resume(h);
+    expect(h.calls.loads).toEqual([RECORDED, RECORDED]);
+    expect(h.calls.prompts).toHaveLength(1);
+    expect(h.calls.prompts[0]).toMatch(/^continue\n/);
+    expect(h.calls.prompts[0]).not.toContain(ORIGINAL);
+    expect(h.store.turnAttempts.get(id)?.state).toBe("completed");
+  });
+
   it("loads the recorded Claude session and sends one continuation without replaying the brief", async () => {
     const h = harness("local", "ok"); const id = seedPromptedAttempt(h);
     const startedAt = performance.now();

@@ -88,7 +88,14 @@ describe("#441 real runtime boundary to pure resolver (no providers)", () => {
     if (operation === "start") Object.assign(runtime, { connection: undefined });
     const call = operation === "start" ? runtime.start() : operation === "session/new"
       ? runtime.newSession({ cwd: "/fixture" }) : runtime.loadSession({ sessionId: "fixture-session", cwd: "/fixture" });
-    await expect(call).rejects.toBe(original);
+    const thrown = await call.catch(error => error);
+    if (operation === "session/load") {
+      expect(thrown).toBeInstanceOf(ReauthParked);
+      expect(thrown.cause).toBe(original);
+      expect(readErrorClassification(thrown)).toMatchObject({ errorKind: "auth_expired", agentId: "claude" });
+    } else {
+      expect(thrown).toBe(original);
+    }
     expect(readErrorClassification(original)).toMatchObject({ errorKind: "auth_expired", agentId: "claude" });
     expect(logger.warn).toHaveBeenCalledWith(expect.objectContaining({ agentId: "claude", errorKind: "auth_expired", operation,
       errorMessage: original.message, errorCode: -32603, errorData: { errorKind: "authentication_failed" } }), "adapter error classified");

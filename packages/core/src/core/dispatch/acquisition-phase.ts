@@ -1,4 +1,5 @@
 import { DispatchSuspendedError } from "./attempt-store.js";
+import { ReauthParked } from "../reauth-negotiation.js";
 import { providerRetryBackoff, readErrorClassification, type AdapterErrorClassification } from "@seam/adapters";
 
 export function bootErrorClassification(err: unknown): AdapterErrorClassification | undefined {
@@ -94,6 +95,7 @@ export class DispatchAcquisitionPhase {
       try { await work; }
       catch (cause) { if (cause instanceof DispatchSuspendedError) throw cause; }
       if (err instanceof DispatchSuspendedError) throw err;
+      if (err instanceof ReauthParked) throw err;
       const reason = `provider acquisition failed during ${this.phase}: ${err instanceof Error ? err.message : String(err)}`;
       // #421: a boot-time spawn/load failure happens before prompt submission,
       // so retrying this recorded session cannot replay the original brief. It

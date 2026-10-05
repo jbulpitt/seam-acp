@@ -44,6 +44,9 @@ export function classifyCodexError(error: unknown, agentId = "codex"): AdapterEr
 
 function matchCodexError(ctx: ClassifyContext): AdapterErrorClassification | AdapterErrorKind | null {
   const { haystack, agentId, message, data } = ctx;
+  if (ctx.errorCode === -32000 && message === "Authentication required") {
+    return classified(agentId, "auth_required", { details: message });
+  }
   const response = data?.providerResponse ?? providerResponse(message) ?? (data?.type === "error" ? data : undefined);
   const provider = response && typeof response === "object"
     ? (response as { error?: { type?: unknown; message?: unknown; code?: unknown }; status?: unknown }) : undefined;

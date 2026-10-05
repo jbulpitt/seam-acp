@@ -1,8 +1,24 @@
 import { describe, expect, it } from "vitest";
 import { BootAcquisitionExhaustedError, DispatchAcquisitionPhase, isRetryableBootAcquisitionError, bootRecoveryBackoff, bootErrorClassification } from "../packages/core/src/core/dispatch/acquisition-phase.js";
 import { attachErrorClassification, providerRetryBackoff } from "@seam/adapters";
+import { RequestError } from "@agentclientprotocol/sdk";
+import { classifyAndAttach, classifyCodexError } from "@seam/adapters";
+import { negotiateReauth, ReauthParked } from "../packages/core/src/core/reauth-negotiation.js";
 
 describe("#448 acquisition owner outcome", () => {
+  it("does not retry or replace Codex's exact production auth error with an acquisition defect", async () => {
+    const error = new RequestError(-32000, "Authentication required", null);
+    classifyAndAttach(error, classifyCodexError(error));
+    expect(isRetryableBootAcquisitionError(error)).toBe(false);
+    expect(isRetryableBootAcquisitionError(new Error("wrapper", { cause: error }))).toBe(false);
+    const decision = negotiateReauth({ errorKind: "auth_required", message: error.message });
+    if (decision.action !== "park") throw new Error("expected the existing reauth decision");
+    const parked = new ReauthParked(decision, error);
+    expect(isRetryableBootAcquisitionError(parked)).toBe(false);
+    await expect(new DispatchAcquisitionPhase("codex-auth", "boot-recovery").acquire(async () => { throw parked; }))
+      .rejects.toBe(parked);
+    expect(parked.cause).toBe(error);
+  });
   it("a classified missing session cannot spend a load retry budget", () => {
     const gone = Object.assign(new Error("Internal error"), {
       data: { errorKind: "session_gone", agentId: "codex", details: "no rollout found for lost-session" },

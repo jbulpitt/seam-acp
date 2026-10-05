@@ -134,6 +134,14 @@ describe("recoveryStory", () => {
     expect(note).not.toContain("resuming after restart");
   });
 
+  it("does not claim a pre-prompt reauth wait had already submitted its prompt", () => {
+    const { prompt, note } = recoveryStory({ cause: "reauthentication", promptStarted: false });
+    expect(prompt).toContain("The pending prompt has not been submitted yet.");
+    expect(note).toContain("Authentication was completed outside this turn.");
+    expect(prompt).not.toContain("had already been submitted");
+    expect(prompt).not.toContain("Do not repeat it.");
+  });
+
   it("a classified retry with no output says it is retrying the request", () => {
     const { prompt } = recoveryStory({
       cause: "classified_retry",

@@ -1063,8 +1063,11 @@ export class AgentRuntime {
     /** Isolated ingest: fail the load instead of warning on setModel. */
     strictModel?: boolean;
   }): Promise<SessionInfo> {
-    return this.withClassifiedErrors("session/load", () => this.loadSessionUnclassified(opts)
-      .catch(error => { throw withRetainedStderr(error, this.stderrRing); }));
+    return this.withClassifiedErrors("session/load", () => this.loadSessionUnclassified(opts))
+      .catch(error => {
+        const retained = withRetainedStderr(error, this.stderrRing);
+        throw this.reauthPark(retained, undefined) ?? retained;
+      });
   }
 
   private async loadSessionUnclassified(opts: Parameters<AgentRuntime["loadSession"]>[0]): Promise<SessionInfo> {

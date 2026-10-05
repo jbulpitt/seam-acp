@@ -40,11 +40,11 @@ describe("terminal auth recovery handback", () => {
     try {
       await watcher.start();
       await enqueueDispatchSpec(h.root, { id, target: h.record.channelRef, session: "live",
-        location: "fixture", agentId: "codex", prompt: "ORIGINAL-DO-NOT-REPLAY",
+        location: "fixture", prompt: "ORIGINAL-DO-NOT-REPLAY",
         createdUtc: new Date().toISOString(), kind: "wake", reportBack: false }, h.store.turnAttempts);
       await watcher.tick();
       const parked = h.store.turnAttempts.get(id)!;
-      expect(parked).toMatchObject({ state: "suspended", promptStarted: true, acpSessionId: SAVED_SESSION });
+      expect(parked, JSON.stringify(parked.outcome)).toMatchObject({ state: "suspended", promptStarted: true, acpSessionId: SAVED_SESSION });
       expect(parked.stalledReason).toMatch(/^reauth-waiting:/);
       expect(Boolean(parked.remoteRecovery)).toBe(retained);
       const oldSlot = router.getRuntime(h.record.id)!.getSlot()!;

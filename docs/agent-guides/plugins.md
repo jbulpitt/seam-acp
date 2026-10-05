@@ -206,6 +206,8 @@ The plugin owns the preset schema, migrations and CRUD. The host aliases its
 storage to the existing `seam.db` table, retaining ids, scopes, timestamps and
 all fields without copying data. Kernel readers delegate to that repository;
 the shared connection still follows the session store's lifetime.
+UI activation failure logs its original cause and removes only its contributions;
+kernel consumers retain the initialized repository.
 
 Internal ports apply presets through `ConfigApplyPlan` and create/bind threads
 before submitting an opening prompt through the existing kernel admission path.

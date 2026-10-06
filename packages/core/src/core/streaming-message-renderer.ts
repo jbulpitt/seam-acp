@@ -143,7 +143,12 @@ export class StreamingMessageRenderer {
    *  commits the preceding prose, a fence-close re-emits the fence as its own
    *  message. No-op once finalized. */
   feed(chunk: string): void {
-    if (this.finalized || !chunk) return;
+    if (!chunk) return;
+    if (this.finalized) {
+      this.logger?.warn({ chars: chunk.length, reason: "the output renderer is finalized" },
+        "assistant output skipped");
+      return;
+    }
     const result = this.fenceStream.feed(chunk, this.now());
     for (const seg of result.segments) {
       if (seg.kind === "prose") {
@@ -255,8 +260,7 @@ export class StreamingMessageRenderer {
       const next = split?.send ?? rest.slice(0, this.hardMax);
       rest = split?.send ? split.keep : rest.slice(next.length);
       if (!next) break;
-      await this.send(next);
-      this.sent += 1;
+      await this.sendText(next);
     }
   }
 
@@ -282,8 +286,7 @@ export class StreamingMessageRenderer {
       if (!split) return;
       this.textBuffer = split.keep;
       if (split.send) {
-        await this.send(split.send);
-        this.sent += 1;
+        await this.sendText(split.send);
       }
       if (!force) return;
     }
@@ -306,11 +309,21 @@ export class StreamingMessageRenderer {
         const send = split?.send ?? rest;
         rest = split?.send ? split.keep : "";
         if (send) {
-          await this.send(send);
-          this.sent += 1;
+          await this.sendText(send);
         }
       }
     });
+  }
+
+  private async sendText(text: string): Promise<void> {
+    try {
+      await this.send(text);
+      this.sent += 1;
+    } catch (err) {
+      this.logger?.warn({ err, operation: "send", chars: text.length },
+        "assistant output delivery failed");
+      throw err;
+    }
   }
 
   private drainBuffer(force: boolean, allowUnsafeCut = false): Promise<void> {

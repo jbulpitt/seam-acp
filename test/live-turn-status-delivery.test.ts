@@ -42,7 +42,8 @@ function setup(mode: "held-status" | "failed-status" | "held-file" | "fast" = "f
   let statusReleased = false;
   let run: Promise<void> | undefined;
   const pending: Promise<void>[] = [];
-  const logger = pino({ level: "silent" });
+  const logLines: Array<Record<string, any>> = [];
+  const logger = pino({ level: "info" }, { write: line => { logLines.push(JSON.parse(line)); } });
   const profile = { id: "claude", defaultModel: "fixture-model" } as AgentProfile;
   const runtime = new AgentRuntime({ profile, logger: logger as never,
     spawnFn: () => { throw new Error("provider spawning forbidden"); } });
@@ -127,7 +128,7 @@ function setup(mode: "held-status" | "failed-status" | "held-file" | "fast" = "f
     orch.stopSentinelWatcher();
     store.close(); rmSync(dir, { recursive: true, force: true });
   });
-  return { store, runtime, router, adapter, orch, prompt, messages, edits, feed, fileGate, releaseStatus,
+  return { store, runtime, router, adapter, orch, prompt, messages, edits, feed, fileGate, releaseStatus, logLines,
     statusStarted: statusStarted.promise, fileStarted: fileStarted.promise,
     heldStatus: () => heldStatus,
     run: () => {
@@ -143,6 +144,42 @@ function setup(mode: "held-status" | "failed-status" | "held-file" | "fast" = "f
 }
 
 describe("live-turn status and answer delivery", () => {
+  it("accounts for provider thoughts separately from the answer delivered to Discord", async () => {
+    const h = setup();
+    await h.run();
+
+    expect(h.messages).toEqual([ANSWER]);
+    expect(h.logLines.find(line => line.msg === "assistant output summary")).toMatchObject({
+      thread: "100", session: "discord:100", turn: "inbound-1",
+      textChars: ANSWER.length, thoughtChars: "thinkingfinal thinking".length,
+      deliveredSegments: 1, deliveredChars: ANSWER.length, failedSegments: 0,
+      thoughtDestination: "thinking excerpt",
+    });
+    expect(h.logLines.find(line => line.msg === "assistant output routed to thinking excerpt"))
+      .toMatchObject({ thread: "100", turn: "inbound-1",
+        reason: "agent-thought is status output, not assistant text" });
+  });
+
+  it("logs a failed answer send with its Discord cause and turn, without counting it as delivered", async () => {
+    const h = setup();
+    const failure = Object.assign(new Error("Missing Access"), { code: 50001 });
+    const send = h.adapter.sendMessage.getMockImplementation()!;
+    h.adapter.sendMessage.mockImplementation(async (channel, text) => {
+      if (text === ANSWER) throw failure;
+      return send(channel, text);
+    });
+    await h.run();
+
+    expect(h.messages).not.toContain(ANSWER);
+    expect(h.logLines.find(line => line.msg === "assistant output delivery failed")).toMatchObject({
+      level: 40, thread: "100", turn: "inbound-1", operation: "send", chars: ANSWER.length,
+      err: { message: "Missing Access", code: 50001 },
+    });
+    expect(h.logLines.find(line => line.msg === "assistant output summary")).toMatchObject({
+      textChars: ANSWER.length, deliveredSegments: 0, failedSegments: 1, failedChars: ANSWER.length,
+    });
+  });
+
   it("delivers and releases the turn while a >5 s status edit remains held, then survives queue recovery", async () => {
     const h = setup("held-status");
     let finished = false;

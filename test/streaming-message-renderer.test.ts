@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { pino } from "pino";
 import { PluginHost } from "../packages/core/src/plugins/host.js";
 import { BUILTIN_PLUGINS } from "../packages/core/src/plugins/builtins.js";
@@ -137,6 +137,32 @@ describe("StreamingMessageRenderer (real FenceStream + splitForFlush + SerialQue
     await r.finalize();
     expect(sent.length).toBe(after);
     expect(sent).toEqual(["hello world"]);
+  });
+
+  it("logs the real send error while preserving the rejected flush and the undelivered count", async () => {
+    const failure = Object.assign(new Error("Missing Access"), { code: 50001 });
+    const warn = vi.fn();
+    const r = new StreamingMessageRenderer(async () => { throw failure; }, { logger: { warn } });
+    r.feed("answer");
+    await r.whenIdle();
+    const drain = (r as unknown as { drainBuffer(force: boolean): Promise<void> }).drainBuffer(true);
+    await expect(drain).rejects.toBe(failure);
+    expect(r.sentCount).toBe(0);
+    expect(warn).toHaveBeenCalledWith({ err: failure, operation: "send", chars: 6 },
+      "assistant output delivery failed");
+    await r.finalize();
+  });
+
+  it("logs nonempty text discarded after finalization without publishing it", async () => {
+    const { sent, send } = collector();
+    const warn = vi.fn();
+    const r = new StreamingMessageRenderer(send, { logger: { warn } });
+    r.feed("answer");
+    await r.finalize();
+    r.feed("late answer");
+    expect(sent).toEqual(["answer"]);
+    expect(warn).toHaveBeenCalledWith({ chars: 11, reason: "the output renderer is finalized" },
+      "assistant output skipped");
   });
 
   it("force-closes a fence that blows past the size ceiling", async () => {

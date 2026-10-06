@@ -509,6 +509,7 @@ import {
 import { splitForFlush } from "../../core/stream-flush.js";
 import { FenceStream, type CompletedFence } from "../../core/fence-stream.js";
 import { SerialQueue } from "../../core/serial-queue.js";
+import { AssistantOutputLog } from "../../core/assistant-output-log.js";
 import { CardResultVault, type ClaimedCardResult } from "../../core/card-result-vault.js";
 import { StreamingPanel } from "../../core/streaming-panel.js";
 import {
@@ -3946,6 +3947,14 @@ export class Orchestrator {
     };
 
     let textBuffer = "";
+    const outputLog = new AssistantOutputLog(this.logger, {
+      thread: channel.id, session: record.id, turn: humanAttempt?.id ?? liveMarkerId,
+    });
+    const emitOutputFence = (fence: CompletedFence, counter: number,
+      opts: { preferredRoot?: string | null; notice?: string }) => {
+      outputLog.route(fence.content, `fence handler: ${fence.lang || "code"}`);
+      return outputLog.deliver(fence.content, "render-fence", () => this.emitClosedFence(channel, fence, counter, opts));
+    };
     let textSent = false;
     let spokenProse = "";
     let spokenAfterLastTool = "";
@@ -3985,7 +3994,10 @@ export class Orchestrator {
     ) => {
       this.assertQueueFence(queueFence);
       while (textBuffer) {
-        if (!humanOutcomeOwned && !humanCurrent()) return;
+        if (!humanOutcomeOwned && !humanCurrent()) {
+          outputLog.skip(textBuffer, humanRefusal()?.message ?? "the attempt no longer owns this turn");
+          return;
+        }
         const split = splitForFlush(textBuffer, {
           maxLen: HARD_MAX,
           softMin: SOFT_MIN,
@@ -3996,14 +4008,16 @@ export class Orchestrator {
         textBuffer = split.keep;
         if (split.send) {
           this.assertQueueFence(queueFence);
-          if (terminalProof && textBuffer.length === 0 && humanAttempt && humanOutcomeOwned) {
-            await this.sendTerminalAttemptDelivery(humanAttempt.id, channel, {
-              kind: "message",
-              text: split.send,
-            });
-          } else {
-            await this.adapter.sendMessage(channel, split.send);
-          }
+          await outputLog.deliver(split.send, "send", async () => {
+            if (terminalProof && textBuffer.length === 0 && humanAttempt && humanOutcomeOwned) {
+              await this.sendTerminalAttemptDelivery(humanAttempt.id, channel, {
+                kind: "message",
+                text: split.send,
+              });
+            } else {
+              await this.adapter.sendMessage(channel, split.send);
+            }
+          });
           this.assertQueueFence(queueFence);
           spokenProse += split.send;
           spokenAfterLastTool += split.send;
@@ -4175,8 +4189,15 @@ export class Orchestrator {
         }).catch(() => {});
       }
       const eventHandler = async (event: Parameters<Parameters<typeof activeRuntime.onEvent>[0]>[0]) => {
-        if (!this.queueFenceCurrent(queueFence)) return;
-        if (!humanOutcomeOwned && !humanCurrent()) return;
+        outputLog.receive(event);
+        if (!this.queueFenceCurrent(queueFence)) {
+          if (event.kind === "agent-text") outputLog.skip(event.text, "the channel queue was fenced to a newer epoch");
+          return;
+        }
+        if (!humanOutcomeOwned && !humanCurrent()) {
+          if (event.kind === "agent-text") outputLog.skip(event.text, humanRefusal()?.message ?? "the attempt no longer owns this turn");
+          return;
+        }
         if (event.kind === "submission-evidence") {
           if (humanAttempt) this.recordSubmissionEvidence(humanAttempt, event.evidence);
           return; // Evidence is not progress, model output, or timeout activity.
@@ -4316,6 +4337,7 @@ export class Orchestrator {
                 } catch (err) {
                   this.logger.warn({ err }, "loop notice send failed");
                 }
+                outputLog.skip(event.text, `runaway output cancellation: ${reason}`);
                 return;
               }
             }
@@ -4347,7 +4369,7 @@ export class Orchestrator {
               } else {
                 // fence-close: emit as inline message or attachment.
                 fenceCounter += 1;
-                await this.emitClosedFence(channel, seg.fence, fenceCounter, {
+                await emitOutputFence(seg.fence, fenceCounter, {
                   preferredRoot: effectiveCwd,
                 });
                 textSent = true;
@@ -4370,7 +4392,7 @@ export class Orchestrator {
               const snap = fenceStream.forceClose();
               if (snap) {
                 fenceCounter += 1;
-                await this.emitClosedFence(channel, snap, fenceCounter, {
+                await emitOutputFence(snap, fenceCounter, {
                   preferredRoot: effectiveCwd,
                   notice:
                     "_(fence exceeded the watchdog timeout and was closed early)_",
@@ -4773,7 +4795,7 @@ export class Orchestrator {
           await drainBuffer(true, true);
         } else {
           fenceCounter += 1;
-          await this.emitClosedFence(channel, seg.fence, fenceCounter, {
+          await emitOutputFence(seg.fence, fenceCounter, {
             preferredRoot: effectiveCwd,
           });
           textSent = true;
@@ -4791,7 +4813,7 @@ export class Orchestrator {
         // Drain any prose preceding the unclosed fence first.
         await drainBuffer(true, true);
         fenceCounter += 1;
-        await this.emitClosedFence(channel, tail.unclosed, fenceCounter, {
+        await emitOutputFence(tail.unclosed, fenceCounter, {
           preferredRoot: effectiveCwd,
           notice: "_(fence was not closed by the agent)_",
         });
@@ -5067,6 +5089,7 @@ export class Orchestrator {
         humanDelivered = this.store.turnAttempts.get(humanAttempt.id)?.outcome?.status === "failed";
       }
     } finally {
+      outputLog.summary(textBuffer.length);
       if (scheduledAttempt) this.scheduledActivity?.phase(scheduledAttempt.id, "cleanup");
       if (!this.queueFenceCurrent(queueFence) || (humanAttempt && !humanOutcomeOwned)) {
         turnFinalized = true;
@@ -9798,6 +9821,7 @@ export class Orchestrator {
     const activity = { at: Date.now() };
     // Set only after claim(). A throw before that did not make this row active.
     let unstartedClaim: TurnAttempt | undefined;
+    let dispatchOutputLog: AssistantOutputLog | undefined;
 
     const run = async (queueFence?: ChannelQueueFence): Promise<DispatchInjectTurnResult> => {
       this.assertQueueFence(queueFence);
@@ -9982,6 +10006,10 @@ export class Orchestrator {
       }
       const startedAt = Date.now();
       let deliveredOutput = "";
+      const outputLog = new AssistantOutputLog(this.logger, {
+        thread: spec.target, session: record.id, dispatch: spec.id,
+      });
+      dispatchOutputLog = outputLog;
       let toolSeen = false;
       let statusCardDone = false;
 
@@ -10085,24 +10113,29 @@ export class Orchestrator {
       if (streaming && style === "messages") {
         msgRenderer = new StreamingMessageRenderer(
           async (text) => {
-            if (!this.queueFenceCurrent(queueFence)) return;
-            try {
-              await this.adapter.sendMessage(target, text);
-              deliveredOutput += text;
-            } catch (err) {
-              this.logger.warn({ err, dispatch: spec.id }, "dispatch: stream message send failed");
+            if (!this.queueFenceCurrent(queueFence)) {
+              outputLog.skip(text, "the channel queue was fenced to a newer epoch");
+              return;
             }
+            try {
+              await outputLog.deliver(text, "send", () => this.adapter.sendMessage(target, text));
+              deliveredOutput += text;
+            } catch { /* Best-effort display; deliver logged the underlying error. */ }
           },
           {
-            logger: this.logger,
+            logger: outputLog.logger,
             // Every fence uses the live turn's handler.
             handleFence: async (fence, notice) => {
-              if (!this.queueFenceCurrent(queueFence)) return true;
-              await this.emitClosedFence(target, fence, ++streamFenceCounter, {
+              if (!this.queueFenceCurrent(queueFence)) {
+                outputLog.skip(fence.content, "the channel queue was fenced to a newer epoch");
+                return true;
+              }
+              outputLog.route(fence.content, `fence handler: ${fence.lang || "code"}`);
+              await outputLog.deliver(fence.content, "render-fence", () => this.emitClosedFence(target, fence, ++streamFenceCounter, {
                 turnOrigin: spec,
                 notice,
                 preferredRoot: isolatedWorkerCwd ?? this.effectiveCwd(record),
-              });
+              }));
               return true;
             },
           }
@@ -10110,7 +10143,10 @@ export class Orchestrator {
       } else if (streaming && panelRef) {
         const ref = panelRef;
         streamPanel = new StreamingPanel(async (text, done) => {
-          if (!this.queueFenceCurrent(queueFence)) return;
+          if (!this.queueFenceCurrent(queueFence)) {
+            outputLog.skip(text, "the channel queue was fenced to a newer epoch");
+            return;
+          }
           const panel = this.dispatchStreamPanel({
             header,
             text: done ? (streamState.fullText ?? text) : text,
@@ -10122,27 +10158,38 @@ export class Orchestrator {
               ? { rollingMaxChars: streamState.rollingMaxChars }
               : {}),
           });
+          const body = (done ? (streamState.fullText ?? text) : text).trim();
+          const visible = streamState.rollingMaxChars != null
+            ? rollingLineWindow(body, streamState.rollingMaxChars) : this.tailForPanel(body);
+          if (visible !== body) outputLog.route(body,
+            "the card shows a tail window; full output is retained");
           try {
-            if (this.adapter.editPanel) await this.adapter.editPanel(ref, panel);
-            else await this.adapter.editMessage(ref, serializePanelText(panel));
+            await outputLog.deliver(text, "edit", async () => {
+              if (this.adapter.editPanel) await this.adapter.editPanel(ref, panel);
+              else await this.adapter.editMessage(ref, serializePanelText(panel));
+            });
+            if (deliveredOutput) outputLog.route(deliveredOutput,
+              "the card view was replaced by a later edit; full output is retained");
             deliveredOutput = done ? (streamState.fullText ?? text) : text;
-          } catch (err) {
-            this.logger.warn({ err, dispatch: spec.id }, "dispatch: stream edit failed");
-          }
+          } catch { /* Best-effort display; deliver logged the underlying error. */ }
         });
         let fenceCounter = 0;
         cardRenderer = new StreamingMessageRenderer(async (text) => {
           cardText += text;
           streamPanel!.append(text);
         }, {
-          logger: this.logger,
+          logger: outputLog.logger,
           handleFence: async (fence, notice) => {
-            if (!this.queueFenceCurrent(queueFence)) return true;
-            await this.emitClosedFence(target, fence, ++fenceCounter, {
+            if (!this.queueFenceCurrent(queueFence)) {
+              outputLog.skip(fence.content, "the channel queue was fenced to a newer epoch");
+              return true;
+            }
+            outputLog.route(fence.content, `fence handler: ${fence.lang || "code"}`);
+            await outputLog.deliver(fence.content, "render-fence", () => this.emitClosedFence(target, fence, ++fenceCounter, {
               turnOrigin: spec,
               notice,
               preferredRoot: isolatedWorkerCwd ?? this.effectiveCwd(record),
-            });
+            }));
             return true;
           },
         });
@@ -10224,7 +10271,11 @@ export class Orchestrator {
           // parallel, so streaming stays lossless — report-back / done-file get
           // the whole answer regardless.
           onEvent: async (event) => {
-            if (!this.queueFenceCurrent(queueFence)) return;
+            outputLog.receive(event);
+            if (!this.queueFenceCurrent(queueFence)) {
+              if (event.kind === "agent-text") outputLog.skip(event.text, "the channel queue was fenced to a newer epoch");
+              return;
+            }
             if (event.kind === "recovery") {
               await this.adapter.sendMessage(target, event.message);
               return;
@@ -10385,7 +10436,7 @@ export class Orchestrator {
           } else if (statelessCard) {
             await this.publishStatelessHandoffCard(target, spec, panelRef, header, startedAt, result!);
           } else {
-            await this.postDispatchOutput(target, spec, result!.text, result!.error);
+            await this.postDispatchOutput(target, spec, result!.text, result!.error, outputLog);
           }
         }
       ).then(
@@ -10481,6 +10532,8 @@ export class Orchestrator {
         this.store.turnAttempts.releaseUnstartedClaim(unstartedClaim, err.suspension, err.reason);
       }
       throw err;
+    } finally {
+      dispatchOutputLog?.summary();
     }
   }
 
@@ -11535,19 +11588,29 @@ export class Orchestrator {
     channel: ChannelRef,
     spec: DispatchSpec,
     text: string,
-    error?: string
+    error?: string,
+    outputLog?: AssistantOutputLog
   ): Promise<void> {
-    if (error) await this.postDispatchProse(channel, spec, "", error);
-    await this.renderCapturedAgentText(channel, text,
-      (prose) => prose.trim() || !error
-        ? this.postDispatchProse(channel, spec, prose) : Promise.resolve(), spec);
+    const log = outputLog ?? new AssistantOutputLog(this.logger, {
+      thread: channel.id, session: `discord:${channel.id}`, dispatch: spec.id,
+    });
+    if (!outputLog) log.receive({ kind: "agent-text", text });
+    try {
+      if (error) await this.postDispatchProse(channel, spec, "", error, log);
+      await this.renderCapturedAgentText(channel, text,
+        (prose) => prose.trim() || !error
+          ? this.postDispatchProse(channel, spec, prose, undefined, log) : Promise.resolve(), spec);
+    } finally {
+      if (!outputLog) log.summary();
+    }
   }
 
   private async postDispatchProse(
     channel: ChannelRef,
     spec: DispatchSpec,
     text: string,
-    error?: string
+    error?: string,
+    outputLog?: AssistantOutputLog
   ): Promise<void> {
     const label = spec.correlationId ? `${spec.id} · ${spec.correlationId}` : spec.id;
     const style = this.config.SEAM_DISPATCH_OUTPUT_STYLE ?? "messages";
@@ -11568,7 +11631,9 @@ export class Orchestrator {
           body,
           label,
           "dispatch",
-          `✅ Done — full output attached (${body.length} chars).`
+          `✅ Done — full output attached (${body.length} chars).`,
+          undefined,
+          outputLog
         );
         return;
       }
@@ -11593,7 +11658,9 @@ export class Orchestrator {
       if (chunks.length <= 3) {
         for (let j = 0; j < chunks.length; j++) {
           const suffix = chunks.length > 1 ? ` (${j + 1}/${chunks.length})` : "";
-          await this.sendResultCard(channel, `📨 Dispatch${suffix}`, chunks[j]!, DISPATCH_COLOR);
+          const send = () => this.sendResultCard(channel, `📨 Dispatch${suffix}`, chunks[j]!, DISPATCH_COLOR);
+          if (outputLog) await outputLog.deliver(chunks[j]!, "send-card", send);
+          else await send();
         }
       } else {
         await this.sendResultCard(
@@ -11602,10 +11669,13 @@ export class Orchestrator {
           `✅ Done — full output attached (${body.length} chars).`,
           DISPATCH_COLOR
         );
-        await this.sendResultFile(channel, label, body, "dispatch");
+        const send = () => this.sendResultFile(channel, label, body, "dispatch");
+        if (outputLog) await outputLog.deliver(body, "send-file", send);
+        else await send();
       }
     } catch (err) {
-      this.logger.warn({ err, dispatch: spec.id }, "dispatch: posting output to thread failed");
+      this.logger.warn({ err, dispatch: spec.id, thread: channel.id, chars: text.length },
+        "dispatch: posting output to thread failed");
     }
   }
 
@@ -13129,24 +13199,31 @@ export class Orchestrator {
     fileName: string,
     filePrefix: string,
     overflowNote: string,
-    deliveryAttemptId?: string
+    deliveryAttemptId?: string,
+    outputLog?: AssistantOutputLog
   ): Promise<void> {
     const chunks = this.chunkString(body, 1900);
     if (chunks.length <= 8) {
       for (let index = 0; index < chunks.length; index += 1) {
         const text = chunks[index]!;
-        if (index === chunks.length - 1 && deliveryAttemptId) {
-          await this.sendTerminalAttemptDelivery(deliveryAttemptId, channel, {
-            kind: "message",
-            text,
-          });
-        } else {
-          await this.adapter.sendMessage(channel, text);
-        }
+        const send = async () => {
+          if (index === chunks.length - 1 && deliveryAttemptId) {
+            await this.sendTerminalAttemptDelivery(deliveryAttemptId, channel, {
+              kind: "message",
+              text,
+            });
+          } else {
+            await this.adapter.sendMessage(channel, text);
+          }
+        };
+        if (outputLog) await outputLog.deliver(text, "send", send);
+        else await send();
       }
     } else {
       await this.adapter.sendMessage(channel, overflowNote);
-      await this.sendResultFile(channel, fileName, body, filePrefix, deliveryAttemptId);
+      const send = () => this.sendResultFile(channel, fileName, body, filePrefix, deliveryAttemptId);
+      if (outputLog) await outputLog.deliver(body, "send-file", send);
+      else await send();
     }
   }
 
@@ -15015,7 +15092,7 @@ export class Orchestrator {
           if (current) this.store.upsert({ ...current, updatedUtc: new Date().toISOString() });
         },
         {
-          logger: this.logger,
+          logger: this.logger.child({ thread: target.id, session: recoveryRecord.id, turn: attempt.id }),
           handleFence: async (fence, notice) => {
             fenceCounter += 1;
             await this.emitClosedFence(target, fence, fenceCounter, {

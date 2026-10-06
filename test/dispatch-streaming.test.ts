@@ -96,6 +96,7 @@ function makeOrch(opts: {
   adapter: ReturnType<typeof spyAdapter>["adapter"];
   style?: "messages" | "card";
   voiceConsole?: any;
+  logger?: Logger;
 }): Orchestrator {
   const router = {
     listProfiles: () => [],
@@ -134,7 +135,7 @@ function makeOrch(opts: {
     threadPresets: {},
   };
   const orchestrator = new Orchestrator({
-    logger: silent,
+    logger: opts.logger ?? silent,
     config: config as any,
     adapter: opts.adapter as any,
     router: router as any,
@@ -167,6 +168,47 @@ afterEach(() => {
 });
 
 describe('dispatchInjectTurn: start indicator + live streaming ("card" style)', () => {
+  it.each([true, false])("records actual delivery for a dispatch (stream=%s)", async (stream) => {
+    const events: string[] = [];
+    const lines: Array<Record<string, any>> = [];
+    const logger = pino({ level: "info" }, { write: line => { lines.push(JSON.parse(line)); } });
+    const rt = fakeRuntime(["Visible answer."], events);
+    const { adapter, calls } = spyAdapter(events);
+    const orch = makeOrch({ dataDir, rt, adapter, logger: logger as Logger });
+    await orch.dispatchInjectTurn(baseSpec({ stream }));
+
+    expect(calls.sendMessage.filter(call => call.text === "Visible answer.")).toHaveLength(1);
+    expect(lines.find(line => line.msg === "assistant output summary")).toMatchObject({
+      thread: "thread-w", dispatch: "disp-1", textChars: 15,
+      deliveredSegments: 1, deliveredChars: 15, failedSegments: 0,
+    });
+  });
+
+  it("records the Discord cause of a failed stream while preserving its captured output", async () => {
+    const events: string[] = [];
+    const lines: Array<Record<string, any>> = [];
+    const logger = pino({ level: "info" }, { write: line => { lines.push(JSON.parse(line)); } });
+    const rt = fakeRuntime(["Visible answer."], events);
+    const { adapter } = spyAdapter(events);
+    const send = adapter.sendMessage.bind(adapter);
+    adapter.sendMessage = async (channel, text) => {
+      if (text === "Visible answer.") throw Object.assign(new Error("Missing Access"), { code: 50001 });
+      return send(channel, text);
+    };
+    const orch = makeOrch({ dataDir, rt, adapter, logger: logger as Logger });
+    const result = await orch.dispatchInjectTurn(baseSpec());
+
+    expect(result.output).toBe("Visible answer.");
+    expect(result.deliveredOutput).toBe("");
+    expect(lines.find(line => line.msg === "assistant output delivery failed")).toMatchObject({
+      level: 40, thread: "thread-w", dispatch: "disp-1", operation: "send", chars: 15,
+      err: { message: "Missing Access", code: 50001 },
+    });
+    expect(lines.find(line => line.msg === "assistant output summary")).toMatchObject({
+      textChars: 15, deliveredSegments: 0, failedSegments: 1, failedChars: 15,
+    });
+  });
+
   it.each([
     { style: "messages" as const, stream: true },
     { style: "card" as const, stream: true },

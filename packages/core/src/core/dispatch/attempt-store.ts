@@ -326,7 +326,7 @@ export class TurnAttemptStore {
     } : null;
   }
 
-  claim(spec: DispatchSpec, identity: string, ownerBoot: string, source: TurnAttempt["source"] = "dispatch"): TurnAttempt {
+  claim(spec: DispatchSpec, identity: string, ownerBoot: string, source: TurnAttempt["source"] = "dispatch", operatorResume = false): TurnAttempt {
     return this.db.transaction(() => {
       const old = this.get(spec.id);
       if (old && old.generation === 0 && (old.state === "pending" || old.state === "suspended") && old.source === source) {
@@ -356,7 +356,7 @@ export class TurnAttemptStore {
           promptStarted: old.promptStarted,
           acpSessionId: old.acpSessionId,
         });
-        if (!drift.match) throw DispatchSuspendedError.defect(spec.id, drift.reason);
+        if (!operatorResume && !drift.match) throw DispatchSuspendedError.defect(spec.id, drift.reason);
         // `startPrompt` only sets prompt_started when a session id is already
         // recorded, so this pairing cannot occur. If it ever does we recorded
         // that we prompted without recording where the work went, and replaying
@@ -386,11 +386,12 @@ export class TurnAttemptStore {
             "the previous provider process for this attempt is still running");
         }
         this.db.prepare(`UPDATE turn_attempts SET generation=generation+1,
-          owner_boot=?, state='active', stalled_reason=NULL,
+          owner_boot=?, identity=?, spec_json=?, state='active', stalled_reason=NULL,
           stall_notice_reason=CASE WHEN stall_notice_utc IS NOT NULL
             THEN COALESCE(stall_notice_reason, stalled_reason) ELSE stall_notice_reason END,
           updated_utc=? WHERE id=? AND state='suspended'`)
-          .run(ownerBoot, new Date().toISOString(), spec.id);
+          .run(ownerBoot, operatorResume ? identity : old.identity,
+            JSON.stringify(operatorResume ? spec : old.spec), new Date().toISOString(), spec.id);
       } else {
         this.db.prepare(`INSERT INTO turn_attempts
           (id,generation,owner_boot,state,identity,spec_json,updated_utc,source,delivery_protocol)
@@ -801,7 +802,7 @@ export class TurnAttemptStore {
     return this.db.prepare(`UPDATE turn_attempts
       SET state='suspended',
           stalled_utc=COALESCE(stalled_utc,?),
-          stall_notice_utc=CASE WHEN stall_notice_reason IS ? THEN stall_notice_utc ELSE NULL END,
+          stall_notice_utc=CASE WHEN COALESCE(stall_notice_reason, stalled_reason) IS ? THEN stall_notice_utc ELSE NULL END,
           stalled_reason=?, updated_utc=?
       WHERE id=? AND state IN ('pending','active','suspended')
         AND (state != 'suspended' OR stalled_utc IS NULL OR stalled_reason IS NOT ?)`)
@@ -947,15 +948,16 @@ export class TurnAttemptStore {
   }
 
   /** Explicit cancellation may win against suspension, never against captured completion. */
-  cancel(id: string, reason = "cancelled by operator"): boolean {
+  cancel(id: string, reason = "cancelled by operator", suppressedOnward = true): boolean {
     return this.settled(id, this.db.transaction(() => {
       const a = this.get(id);
       if (!a || (a.state !== "pending" && a.state !== "active" && a.state !== "suspended")) return false;
       const outcome: DispatchResult = {
         id, target: a.spec.target, status: "failed", workerStatus: "failed",
-        error: reason, suppressedOnward: true,
+        error: reason, suppressedOnward,
         kind: a.spec.kind, correlationId: a.spec.correlationId,
-        returnTo: a.spec.returnTo, reportBack: a.spec.reportBack, chainId: a.spec.chainId, finishedUtc: new Date().toISOString(),
+        returnTo: suppressedOnward ? a.spec.returnTo : a.spec.returnTo ?? a.spec.originThreadRef ?? a.spec.target,
+        reportBack: suppressedOnward ? a.spec.reportBack : true, chainId: a.spec.chainId, finishedUtc: new Date().toISOString(),
       };
       return this.db.prepare(`UPDATE turn_attempts SET state='cancelled', outcome_json=?, updated_utc=?
         WHERE id=? AND state IN ('pending','active','suspended')`)

@@ -33,7 +33,7 @@ export function reauthAcceptAttemptId(payload: string | undefined): string | nul
   return ATTEMPT_ID.test(id) ? id : null;
 }
 
-/** Accept calls `acceptReauthWait`; Abandon uses the existing turn action. */
+/** Accept calls `acceptReauthWait`; Cancel uses the existing turn action. */
 export function reauthChoiceSpec(attemptId: string, park: ReauthPark, context?: ReauthNoticeContext): ChoiceSpec {
   return {
     title: "Provider authentication",
@@ -45,7 +45,7 @@ export function reauthChoiceSpec(attemptId: string, park: ReauthPark, context?: 
       kind: "prompt",
       payload: reauthAcceptPayload(attemptId),
     }, {
-      label: "Abandon parked turn", kind: "prompt", payload: parkedTurnPayload("abandon", attemptId),
+      label: "Cancel parked turn", kind: "prompt", payload: parkedTurnPayload("cancel", attemptId),
     }],
   };
 }

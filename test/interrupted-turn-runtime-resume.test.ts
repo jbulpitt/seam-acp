@@ -15,6 +15,7 @@ import { SessionRouter } from "../packages/core/src/core/session-router.js";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
 import { discordRenderer } from "../packages/core/src/platforms/discord/renderer.js";
+import { DispatchWatcher } from "../packages/core/src/core/dispatch/watcher.js";
 import { inboundAttemptId } from "../packages/core/src/core/dispatch/attempt-store.js";
 import { executionIdentity } from "../packages/core/src/core/dispatch/execution-identity.js";
 import type { ThreadPreset } from "../packages/core/src/config.js";
@@ -203,6 +204,79 @@ async function resume(h: Harness): Promise<void> {
     channel: { platform: "discord", id: THREAD, parentId: PARENT }, attachments: [] };
   await (h.orch as any).executeIncomingMessage(message);
 }
+
+describe("explicit operator continuation after identity drift", () => {
+  function dispatchAttempt(h: Harness, promptStarted: boolean) {
+    const boot = (h.orch as any).attemptBoot;
+    const spec = { id: "operator-drift-dispatch", target: THREAD, prompt: ORIGINAL,
+      kind: "handoff" as const, session: "live" as const, stream: false, reportBack: false };
+    const record = h.store.get(`discord:${THREAD}`)!;
+    const current = h.router.describeConfig(record);
+    h.store.turnAttempts.registerOwner(boot);
+    const claimed = h.store.turnAttempts.claim(spec, executionIdentity({
+      agentId: record.agentId, location: "before-move", session: "live", model: current.model.value,
+      effort: current.effort.value, cwd: current.cwd.value, config: record.configJson,
+    }), boot);
+    if (promptStarted) {
+      h.store.turnAttempts.bind(claimed, RECORDED);
+      h.store.turnAttempts.startPrompt(claimed);
+    }
+    h.store.turnAttempts.markStalled(spec.id, "thread moved from before-move to local");
+    return spec;
+  }
+
+  it("the durable Resume button sends a never-started brief once under current configuration", async () => {
+    const h = harness("local", "ok");
+    const spec = dispatchAttempt(h, false);
+    await expect(h.orch.dispatchInjectTurn(spec)).rejects.toMatchObject({ reason: expect.stringContaining("moved") });
+    expect(h.calls.prompts).toEqual([]);
+    const watcher = new DispatchWatcher({ dataDir: h.dir, logger: silent, attempts: h.store.turnAttempts,
+      onDispatch: (spec, operatorResume) => h.orch.dispatchInjectTurn(spec, operatorResume) });
+    (h.orch as any).dispatchWatcher = watcher;
+    cleanups.push(() => watcher.stop());
+    await h.orch.observeRetainedDispatch(spec);
+    const card = h.store.listOpenChoiceCards("discord", THREAD)[0]!;
+    expect(card.body).toContain("Use Resume");
+    expect(card.options[0]!.label).toMatch(/^Resume /);
+    const click = { customId: makeChoiceCustomId(card.id, 0), userId: "human", userName: "Human",
+      channel: { platform: "discord", id: THREAD, parentId: PARENT }, messageId: card.messageId, kind: "button",
+      replyEphemeral: vi.fn(async () => {}), followUpEphemeral: vi.fn(async () => {}), showModal: vi.fn() };
+    await (h.orch as any).handleChoiceCardInteraction(click);
+    await (h.orch as any).handleChoiceCardInteraction(click);
+    await watcher.start();
+    expect(h.calls.prompts).toHaveLength(1);
+    expect(h.calls.prompts[0]).toContain(ORIGINAL);
+    expect(h.calls.prompts[0]).not.toMatch(/^continue\n/);
+    expect(h.store.turnAttempts.get(spec.id)).toMatchObject({ state: "completed", generation: 2 });
+    expect(JSON.parse(h.store.turnAttempts.get(spec.id)!.identity).location).toBe("local");
+  });
+
+  it("a started drifted dispatch reaches the actual provider session/load refusal", async () => {
+    const h = harness("local", "reject-load");
+    const spec = dispatchAttempt(h, true);
+    await expect(h.orch.dispatchInjectTurn(spec)).rejects.toMatchObject({ reason: expect.stringContaining("moved") });
+    expect(h.calls.loads).toEqual([]);
+    await expect(h.orch.dispatchInjectTurn(spec, true)).rejects.toMatchObject({ message: expect.stringContaining("synthetic remote session/load refusal") });
+    expect(h.calls.loads).toEqual([RECORDED]);
+    expect(h.calls.prompts).toEqual([]);
+    expect(h.calls.news).toBe(0);
+  });
+
+  it("explicit inbound continuation also bypasses drift while boot retains it", async () => {
+    const h = harness("local", "ok");
+    const id = seedPromptedAttempt(h, false);
+    const record = h.store.get(`discord:${THREAD}`)!;
+    h.store.upsert({ ...record, configJson: JSON.stringify({ model: MODEL, role: "current-role" }) });
+    await expect(resume(h)).rejects.toMatchObject({ reason: expect.stringContaining("config") });
+    expect(h.calls.prompts).toEqual([]);
+    await (h.orch as any).executeIncomingMessage({ messageId: "msg-302", text: ORIGINAL,
+      authorId: "human", authorName: "Human", authorIsBot: false,
+      channel: { platform: "discord", id: THREAD, parentId: PARENT }, attachments: [] }, undefined, undefined, true);
+    expect(h.calls.prompts).toHaveLength(1);
+    expect(h.calls.prompts[0]).toContain(ORIGINAL);
+    expect(h.store.turnAttempts.get(id)?.state).toBe("completed");
+  });
+});
 
 describe("#302 real ACP handshake and strict session/load recovery", () => {
   it.each([false, true])("keeps an auth park through repeated sweeps, then resumes once on acceptance (promptStarted=%s)", async promptStarted => {

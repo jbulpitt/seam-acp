@@ -10,7 +10,7 @@ import { SyntheticInteraction } from "../packages/core/src/platforms/discord/syn
 const row: InterruptedTurnRow = {
   id: "d4a166f6-2222-3333-4444-555555555555", source: "dispatch", channelRef: "thread",
   correlationId: null, status: "interrupted", startedUtc: "2026-10-05T12:00:00.000Z",
-  acpSessionId: "acp", targetRef: "thread", actions: ["resume", "abandon"],
+  acpSessionId: "acp", targetRef: "thread", actions: ["resume", "cancel"],
 };
 
 describe("workflow landing and labels", () => {
@@ -40,7 +40,7 @@ describe("workflow landing and labels", () => {
   it("labels actions with the same recognizable ID and the resume age", () => {
     const now = new Date("2026-10-05T12:05:00.000Z");
     expect(workflowActionLabel("resume", row, now)).toBe("Resume d4a166f6 (5m)");
-    expect(workflowActionLabel("abandon", row, now)).toBe("Abandon d4a166f6");
+    expect(workflowActionLabel("cancel", row, now)).toBe("Cancel d4a166f6");
   });
 
   it("links every open card using its own channel, including reauth and parked notices", async () => {
@@ -81,7 +81,7 @@ describe("workflow category navigation", () => {
   it("keeps the selected category for pagination and resets it on Home", async () => {
     const calls: Array<[number, string | undefined]> = [];
     const controls = new WorkflowInventoryController({
-      resume: async () => "", abandon: async () => "",
+      resume: async () => "", cancel: async () => "",
       render: async (page, category) => {
         calls.push([page, category]);
         return { embeds: [], components: [{}], page };
@@ -112,7 +112,7 @@ describe("workflow category navigation", () => {
       return true;
     };
     const controls = new WorkflowInventoryController({
-      resume: async () => "", abandon: async () => "", render,
+      resume: async () => "", cancel: async () => "", render,
       refresh: repaint, terminal: (_reason, view) => repaint(view),
     });
     const collector = new EventEmitter();

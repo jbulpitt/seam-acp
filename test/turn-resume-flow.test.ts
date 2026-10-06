@@ -797,7 +797,7 @@ describe("live-turn re-fire + flag + preconditions", () => {
     await orch.recoverInterruptedTurns();
     expect(inner).not.toHaveBeenCalled();
     expect(await listLiveMarkers(dir)).toEqual([]);
-    expect(announced.some((t) => /abandoned/i.test(t))).toBe(true);
+    expect(announced.some((t) => /cancelled/i.test(t))).toBe(true);
   });
 
   it("a turn whose thread was deleted is abandoned cleanly (no notice post)", async () => {
@@ -852,8 +852,8 @@ describe("live-turn re-fire + flag + preconditions", () => {
       acpSessionId: "acp-recorded",
       startedUtc: new Date().toISOString(),
     });
-    const msg = await orch.abandonTurnManually("live-ab");
-    expect(msg).toMatch(/Abandoned/);
+    const msg = await orch.cancelTurnManually("live-ab");
+    expect(msg).toMatch(/Cancelled/);
     expect(await listLiveMarkers(dir)).toEqual([]);
     expect(inner).not.toHaveBeenCalled();
   });
@@ -895,14 +895,14 @@ describe("workflows inventory", () => {
     store.turnAttempts.completePending(spec.id, { id: spec.id, target: spec.target, status: "completed", output: "retained answer" } as any);
     store.turnAttempts.markDeliveryUncertain(spec.id, "no receipt", old);
 
-    expect(await (orch as any).abandonOldWorkflows(7, "thread-worker")).toContain("Abandoned 2 item(s)");
+    expect(await (orch as any).cancelOldWorkflows(7, "thread-worker")).toContain("Cancelled 2 item(s)");
     expect(store.getDelegation("old-parked")?.status).toBe("abandoned");
     expect(store.getDelegation("fresh-parked")?.status).toBe("interrupted");
     expect(store.getDelegation("other-parked")?.status).toBe("interrupted");
     expect(store.getDelegation("already-abandoned")?.status).toBe("abandoned");
-    expect(store.turnAttempts.get(spec.id)?.deliveryAbandonedReason).toBe("abandoned by operator");
+    expect(store.turnAttempts.get(spec.id)?.deliveryAbandonedReason).toBe("cancelled by operator");
     expect(store.turnAttempts.get(spec.id)?.outcome?.output).toBe("retained answer");
-    expect(await (orch as any).abandonOldWorkflows(7)).toContain("Abandoned 1 item(s)");
+    expect(await (orch as any).cancelOldWorkflows(7)).toContain("Cancelled 1 item(s)");
     expect(store.getDelegation("other-parked")?.status).toBe("abandoned");
     expect(store.listRecentDelegations(20)).toHaveLength(4);
     expect(store.turnAttempts.list("completed")).toHaveLength(1);
@@ -913,12 +913,12 @@ describe("workflows inventory", () => {
     store.recordDelegation({ id: "bad-update", kind: "handoff", targetRef: "thread-worker", status: "interrupted",
       createdUtc: "2026-01-01T00:00:00.000Z", updatedUtc: "2026-01-01T00:00:00.000Z" });
     vi.spyOn(store, "updateDelegationStatus").mockImplementation(() => { throw new Error("SQLITE_BUSY: database is locked"); });
-    expect(await (orch as any).abandonOldWorkflows(7, "thread-worker"))
-      .toMatch(/Abandoned 0 item\(s\).*SQLITE_BUSY: database is locked/);
+    expect(await (orch as any).cancelOldWorkflows(7, "thread-worker"))
+      .toMatch(/Cancelled 0 item\(s\).*SQLITE_BUSY: database is locked/);
     expect(store.getDelegation("bad-update")?.status).toBe("interrupted");
-    vi.spyOn(orch, "abandonTurnManually").mockResolvedValue("No resumable turn `bad-update`.");
-    expect(await (orch as any).abandonOldWorkflows(7, "thread-worker"))
-      .toMatch(/Abandoned 0 item\(s\).*No resumable turn/);
+    vi.spyOn(orch, "cancelTurnManually").mockResolvedValue("No resumable turn `bad-update`.");
+    expect(await (orch as any).cancelOldWorkflows(7, "thread-worker"))
+      .toMatch(/Cancelled 0 item\(s\).*No resumable turn/);
   });
 
   it("scopes before limiting recent rows and sorts parked rows newest first", async () => {
@@ -934,14 +934,14 @@ describe("workflows inventory", () => {
     const { orch } = makeOrch();
     const rows = await (orch as any).collectInterruptedRows("thread-worker");
     expect(rows.map((row: any) => row.id)).toEqual(["new", "old"]);
-    expect(rows.map((row: any) => row.actions)).toEqual([["abandon"], ["abandon"]]);
+    expect(rows.map((row: any) => row.actions)).toEqual([["cancel"], ["cancel"]]);
     expect(await orch.resumeTurnManually("new")).toMatch(/no recorded execution/);
     expect(store.getDelegation("new-resume")).toBeNull();
-    await orch.abandonTurnManually("new");
+    await orch.cancelTurnManually("new");
     expect((await (orch as any).collectInterruptedRows("thread-worker"))[0].actions).toEqual([]);
   });
 
-  it("does not advertise Resume or Abandon for a legacy completion already abandoned", async () => {
+  it("does not advertise Resume or Cancel for a legacy completion already abandoned", async () => {
     const { orch } = makeOrch();
     const spec = handoffSpec({ id: "legacy-completion" });
     store.turnAttempts.admit(spec);
@@ -952,14 +952,14 @@ describe("workflows inventory", () => {
     expect(rows[0].reason).toContain("legacy completion");
   });
 
-  it("offers Abandon for outstanding completed output and consumes that action", async () => {
+  it("offers Cancel for outstanding completed output and consumes that action", async () => {
     const { orch } = makeOrch();
     const spec = handoffSpec({ id: "retained-output" });
     store.turnAttempts.admit(spec);
     store.turnAttempts.completePending(spec.id, { id: spec.id, target: spec.target, status: "completed", text: "answer" } as any);
-    expect((await (orch as any).collectInterruptedRows("thread-worker"))[0].actions).toEqual(["abandon"]);
-    expect(await orch.abandonTurnManually(spec.id)).toMatch(/execution record is kept/);
-    expect(store.turnAttempts.get(spec.id)?.deliveryAbandonedReason).toBe("abandoned by operator");
+    expect((await (orch as any).collectInterruptedRows("thread-worker"))[0].actions).toEqual(["cancel"]);
+    expect(await orch.cancelTurnManually(spec.id)).toMatch(/execution record is kept/);
+    expect(store.turnAttempts.get(spec.id)?.deliveryAbandonedReason).toBe("cancelled by operator");
     expect((await (orch as any).collectInterruptedRows("thread-worker"))[0].actions).toEqual([]);
   });
 
@@ -979,10 +979,10 @@ describe("workflows inventory", () => {
     const { orch } = makeOrch();
     (orch as any).dispatchWatcher = { listStaleRunning: async () => [handoffSpec({ resume: true })] };
     const rows = await (orch as any).collectInterruptedRows("thread-worker");
-    expect(rows.find((row: any) => row.id === "disp-1")?.actions).toEqual(["resume", "abandon"]);
+    expect(rows.find((row: any) => row.id === "disp-1")?.actions).toEqual(["resume", "cancel"]);
     const blocked = makeOrch({ getThreadLiveState: async () => ({ locked: true, archived: false }) }).orch;
     (blocked as any).dispatchWatcher = { listStaleRunning: async () => [handoffSpec({ resume: true })] };
-    expect((await (blocked as any).collectInterruptedRows("thread-worker")).find((row: any) => row.id === "disp-1")?.actions).toEqual(["abandon"]);
+    expect((await (blocked as any).collectInterruptedRows("thread-worker")).find((row: any) => row.id === "disp-1")?.actions).toEqual(["cancel"]);
   });
 
   it("collects interrupted ledger rows and live markers", async () => {

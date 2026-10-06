@@ -147,6 +147,38 @@ describe("#250 durable attempt winner", () => {
     expect(() => attempts.claim(spec, "different-account", "boot-B")).toThrow();
     expect(attempts.get(a.id)?.state).toBe("suspended");
   });
+  it.each(["agent", "location", "model", "effort", "cwd", "config"] as const)(
+    "operator Resume permits %s drift while boot retains the check", field => {
+      const attempts = database().open().turnAttempts;
+      attempts.registerOwner("operator-boot");
+      const original = attempts.claim(spec, identity, "operator-boot");
+      attempts.bind(original, "recorded-session");
+      attempts.startPrompt(original);
+      attempts.suspendBoot("operator-boot");
+      const selection = JSON.parse(identity);
+      const changed = executionIdentity({ ...selection, [field]: field === "config" ? { role: "current" } : "current-selection" });
+      expect(() => attempts.claim(spec, changed, "operator-boot")).toThrow();
+      const resumed = attempts.claim(spec, changed, "operator-boot", "dispatch", true);
+      expect(resumed).toMatchObject({ identity: changed, acpSessionId: "recorded-session", promptStarted: true,
+        state: "active", generation: original.generation + 1 });
+      expect(resumed.spec.prompt).toBe(spec.prompt);
+    });
+
+  it("keeps an older notice timestamp when its nullable reason still matches", () => {
+    const db = database(), attempts = db.open().turnAttempts;
+    attempts.claim(spec, identity, "legacy-boot");
+    attempts.markStalled(spec.id, "model changed from default to selected");
+    attempts.markStallNoticeDelivered(spec.id, "2026-09-27T00:00:00Z");
+    const raw = new Database(db.file);
+    try {
+      raw.prepare("UPDATE turn_attempts SET state='active', stall_notice_reason=NULL WHERE id=?").run(spec.id);
+    } finally { raw.close(); }
+    attempts.markStalled(spec.id, "model changed from default to selected");
+    expect(attempts.get(spec.id)?.stallNoticeUtc).toBe("2026-09-27T00:00:00Z");
+    attempts.markStalled(spec.id, "the provider now rejects session/load");
+    expect(attempts.get(spec.id)?.stallNoticeUtc).toBeNull();
+  });
+
   it("intentional cancellation beats restart and cannot resurrect or deliver", () => {
     const attempts = database().open().turnAttempts;
     const a = attempts.claim(spec, identity, "boot-A");

@@ -305,12 +305,12 @@ export function abandonedNotice(reason: string, maxAgeSeconds: number): string {
   if (reason === "past max-age") {
     const hours = Math.round(maxAgeSeconds / 3600);
     const age = hours >= 48 ? `${Math.round(hours / 24)} days` : `${hours}h`;
-    return `⏸️ abandoned interrupted turn (older than ${age}) — not resuming`;
+    return `⏸️ cancelled interrupted turn (older than ${age}) — not resuming`;
   }
   if (reason === "thread deleted") {
-    return "⏸️ abandoned interrupted turn (thread deleted)";
+    return "⏸️ cancelled interrupted turn (thread deleted)";
   }
-  return `⏸️ abandoned interrupted turn (${reason})`;
+  return `⏸️ cancelled interrupted turn (${reason})`;
 }
 
 /**

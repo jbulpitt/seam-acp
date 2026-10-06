@@ -167,8 +167,8 @@ describe("central component acknowledgement", () => {
     const defer = first.native.deferUpdate.bind(first.native);
     vi.spyOn(first.native, "deferUpdate").mockImplementation(async () => { await ackGate; return defer(); });
     const resume = vi.fn(async () => { await mutationGate; return "Resumed"; });
-    const abandon = vi.fn(async () => "Abandoned");
-    const controller = new WorkflowInventoryController({ resume, abandon,
+    const cancel = vi.fn(async () => "Cancelled");
+    const controller = new WorkflowInventoryController({ resume, cancel,
       render: async () => ({ embeds: [], components: [], page: 0 }),
       refresh: async () => true, terminal: async () => true });
     const collector = new EventEmitter();
@@ -187,7 +187,7 @@ describe("central component acknowledgement", () => {
     collector.emit("collect", second.native);
     expect(await completedSecond).toBe("dropped");
     expect(resume).toHaveBeenCalledOnce();
-    expect(abandon).not.toHaveBeenCalled();
+    expect(cancel).not.toHaveBeenCalled();
     releaseMutation();
     for (let n = 0; n < 10; n++) await Promise.resolve();
     expect(first.native.transcript).toEqual([]);

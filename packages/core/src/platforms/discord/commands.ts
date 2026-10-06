@@ -154,7 +154,7 @@ export function buildSeamCommand(): SlashCommandBuilder {
 
   cmd.addSubcommand((sub) =>
     declareAccess(sub, (option) => ({
-      kind: ["abandon-older-than", "resume", "cancel-wake", "cancel-watch", "cancel-choice", "cancel-ingest", "cancel-live"]
+      kind: ["cancel-older-than", "abandon-older-than", "resume", "cancel", "abandon", "cancel-wake", "cancel-watch", "cancel-choice", "cancel-ingest", "cancel-live"]
         .some((name) => option(name)) ? "mutating" : "read-only",
     }), "ephemeral")
       .setName("workflows")
@@ -163,8 +163,11 @@ export function buildSeamCommand(): SlashCommandBuilder {
         .addChoices({ name: "This thread", value: "thread" }, { name: "All threads (admin)", value: "all" }))
       .addStringOption(o => o.setName("resume").setDescription("Continue a parked turn in this thread")
         .setAutocomplete(true))
+      .addStringOption(o => o.setName("cancel").setDescription("Cancel a parked turn in this thread"))
+      .addStringOption(o => o.setName("abandon").setDescription("Alias for cancel"))
       .addBooleanOption(o => o.setName("history").setDescription("Include old inert history (records are kept)"))
-      .addStringOption(o => o.setName("abandon-older-than").setDescription("Admin: abandon all parked items in this scope older than N days"))
+      .addStringOption(o => o.setName("cancel-older-than").setDescription("Admin: cancel all parked items in this scope older than N days"))
+      .addStringOption(o => o.setName("abandon-older-than").setDescription("Alias for cancel-older-than"))
       .addIntegerOption((o) =>
         o
           .setName("limit")

@@ -62,6 +62,7 @@ function injectedTurn(rt: AgentRuntime, logger: Logger, onEvent: (event: AgentEv
     agentId: "test", acpSessionId: "wire-session", repoPath: "/tmp", configJson: "{}", createdUtc: now, updatedUtc: now };
   const orch = Object.create(Orchestrator.prototype) as Orchestrator;
   Object.assign(orch, { logger, config: { REPOS_ROOT: "/tmp" },
+    store: { turnAttempts: { get: () => undefined } },
     plugins: new PluginHost(logger),
     router: { getOrStartRuntime: async () => rt, describeConfig: () => ({ location: { value: "local" } }) },
     adapter: { sendMessage: async (_channel: unknown, text: string) => { messages.push(text); } },

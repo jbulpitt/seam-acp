@@ -31,7 +31,12 @@ process.stdin.on("data", (chunk) => {
       send({ id: message.id, result: { protocolVersion: 1, agentCapabilities: { loadSession: true } } });
     } else if (message.method === "session/new") {
       currentModeId = "agent";
-      send({ id: message.id, result: { sessionId: process.env.FAKE_AGENT_NEW_SESSION_ID ?? "s1", ...modes() } });
+      const reply = () => send({ id: message.id, result: { sessionId: process.env.FAKE_AGENT_NEW_SESSION_ID ?? "s1", ...modes() } });
+      if (process.env.FAKE_AGENT_NEW_GATE && !fs.existsSync(process.env.FAKE_AGENT_NEW_GATE)) {
+        const timer = setInterval(() => {
+          if (fs.existsSync(process.env.FAKE_AGENT_NEW_GATE)) { clearInterval(timer); reply(); }
+        }, 20);
+      } else reply();
     } else if (message.method === "session/load") {
       if (process.env.FAKE_AGENT_MISSING_SESSION === message.params.sessionId) {
         const details = `no rollout found for session ${message.params.sessionId}`;

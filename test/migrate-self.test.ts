@@ -179,7 +179,7 @@ describe("migrate_self staged dispatch", () => {
     await expect(dispatched).resolves.toMatchObject({ output: "Manifest accepted." });
 
     expect(migrate).toHaveBeenCalledWith(h.oldRecord, migrationSpec().migration);
-    expect(h.router.getOrStartRuntime).toHaveBeenCalledWith(h.newRecord);
+    expect(h.router.getOrStartRuntime).toHaveBeenCalledWith(h.newRecord, undefined, expect.any(Function));
     expect(h.log.indexOf("caller:end")).toBeLessThan(h.log.indexOf("migration:activate"));
     const promptIndex = h.log.findIndex(
       (entry) => entry.startsWith("prompt:") && entry.includes(migrationSpec().prompt)
@@ -265,7 +265,7 @@ describe("migrate_self staged dispatch", () => {
     expect(h.log.indexOf("rebuild:acp-new")).toBeLessThan(promptIndex);
     expect(h.sent.some((text) => text.includes("rebuilt from Discord"))).toBe(true);
     expect(h.router.getOrStartRuntime).toHaveBeenCalledWith(
-      expect.objectContaining({ acpSessionId: "acp-rebuilt" })
+      expect.objectContaining({ acpSessionId: "acp-rebuilt" }), undefined, expect.any(Function)
     );
   });
 

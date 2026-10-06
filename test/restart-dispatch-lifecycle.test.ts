@@ -110,7 +110,7 @@ describe("#250 production dispatch lifecycle (synthetic transport, no providers)
       "execution failed before the provider took the turn and the attempt is suspended");
     expect(String(h.runtime.prompt.mock.calls.at(-1)?.[0])).not.toContain("original work");
     expect(h.router.getOrStartRuntime.mock.calls.at(-1)).toMatchObject([
-      { channelRef: "worker" }, { resumeSessionId: "recorded-acp" },
+      { channelRef: "worker" }, { resumeSessionId: "recorded-acp" }, expect.any(Function),
     ]);
     expect(h.store.turnAttempts.get(h.spec.id)?.state).toBe("completed");
     expect(notice).not.toHaveBeenCalled();
@@ -227,7 +227,7 @@ describe("#250 production dispatch lifecycle (synthetic transport, no providers)
     expect(String(h.runtime.prompt.mock.calls.at(-1)?.[0])).not.toContain("original work");
     expect(h.runtime.prompt).toHaveBeenCalledTimes(2);
     expect(h.router.getOrStartRuntime.mock.calls.at(-1)).toMatchObject([
-      { channelRef: "worker" }, { resumeSessionId: "recorded-acp" },
+      { channelRef: "worker" }, { resumeSessionId: "recorded-acp" }, expect.any(Function),
     ]);
     expect(h.store.turnAttempts.get(h.spec.id)).toMatchObject({ state: "completed", generation: 2,
       acpSessionId: "recorded-acp", stalledUtc: null });
@@ -300,7 +300,7 @@ describe("#250 production dispatch lifecycle (synthetic transport, no providers)
     expect(String(h.runtime.prompt.mock.calls.at(-1)?.[0]).startsWith("continue\n")).toBe(true);
     expect(String(h.runtime.prompt.mock.calls.at(-1)?.[0])).toContain("The process restarted while the turn was in flight.");
     expect(String(h.runtime.prompt.mock.calls.at(-1)?.[0])).not.toContain("original work");
-    expect(h.router.getOrStartRuntime.mock.calls.at(-1)).toMatchObject([{}, { resumeSessionId: "recorded-acp" }]);
+    expect(h.router.getOrStartRuntime.mock.calls.at(-1)).toMatchObject([{}, { resumeSessionId: "recorded-acp" }, expect.any(Function)]);
     expect(h.notices).not.toHaveBeenCalled();
   });
 
@@ -597,7 +597,7 @@ describe("#250 production dispatch lifecycle (synthetic transport, no providers)
     expect(input).toContain('"id":81');
     expect(input).toContain('"optionId":"allow_once"');
     expect(adoptedRuntime).toBeDefined();
-    expect(h.router.releaseRecoveryRuntime).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(h.router.releaseRecoveryRuntime).toHaveBeenCalledTimes(1));
     expect(h.adapter.sendMessage).toHaveBeenCalledWith(
       expect.objectContaining({ id: "worker" }),
       "recovered wake output",
@@ -705,7 +705,7 @@ describe("#250 production dispatch lifecycle (synthetic transport, no providers)
     expect(h.runtime.prompt).toHaveBeenCalledTimes(2);
     expect(h.runtime.prompt.mock.calls.filter(([text]) => String(text).startsWith("continue\n"))).toHaveLength(1);
     expect(h.router.getOrStartRuntime).toHaveBeenCalledWith(
-      expect.objectContaining({ channelRef: "worker" }), { resumeSessionId: "recorded-acp" },
+      expect.objectContaining({ channelRef: "worker" }), { resumeSessionId: "recorded-acp" }, expect.any(Function),
     );
   }, 15_000);
 

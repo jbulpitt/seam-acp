@@ -34,6 +34,7 @@ import {
   isThreadDetached,
   isThreadTtsEnabled,
   resolveThreadTtsVoice,
+  threadTtsDisabledReason,
   resolveThreadTtsPace,
   resolveThreadTtsStyle,
   isRestrictedParticipant,
@@ -8864,6 +8865,11 @@ export class Orchestrator {
       return;
     }
     const sub = i.options.getSubcommand(true);
+    const speechCause = threadTtsDisabledReason(this.config, record.channelRef);
+    if ((sub === "start" || sub === "add") && speechCause) {
+      await replyToInteraction(i, { content: `Voice Console cannot use its default voice: ${speechCause}. Set a thread voice with /seam config tts voice:…`, flags: MessageFlags.Ephemeral });
+      return;
+    }
     const binding = this.store.getActiveVoiceConsoleBindingForThread(PLATFORM, record.channelRef);
     const owned = this.store.getActiveVoiceConsoleForOwner(i.guildId, i.user.id);
     // This slash group is already admin-gated. A configured admin may operate
@@ -17956,6 +17962,11 @@ export class Orchestrator {
     const voiceRaw = i.options.getString("voice")?.trim();
     const paceRaw = i.options.getString("pace");
     const styleRaw = i.options.getString("style");
+    const speechCause = threadTtsDisabledReason(this.config, i.channelId);
+    if (stateRaw === "on" && !voiceRaw && speechCause) {
+      await replyToInteraction(i, { content: `Default TTS voice is disabled: ${speechCause}. Set a thread voice with /seam config tts voice:…`, flags: MessageFlags.Ephemeral });
+      return;
+    }
     if (!stateRaw && !voiceRaw && !paceRaw && !styleRaw) {
       await this.openTtsEditor(i);
       return;
@@ -18022,6 +18033,11 @@ export class Orchestrator {
         content: "Run this inside the thread.",
         flags: MessageFlags.Ephemeral,
       });
+      return;
+    }
+    const cause = threadTtsDisabledReason(this.config, i.channelId);
+    if (cause) {
+      await replyToInteraction(i, { content: `Default TTS voice is disabled: ${cause}. Set a thread voice with /seam config tts voice:…`, flags: MessageFlags.Ephemeral });
       return;
     }
     if (!this.adapter.sendPanel) {
@@ -18744,6 +18760,11 @@ export class Orchestrator {
     alreadyHadAudio: boolean;
   }): Promise<void> {
     const enabled = isThreadTtsEnabled(this.config, opts.threadId);
+    const cause = threadTtsDisabledReason(this.config, opts.threadId);
+    if (enabled && cause) {
+      this.logger.warn({ cause, threadId: opts.threadId }, "outbound TTS disabled");
+      return;
+    }
     const clip = clipSpokenText(opts.prose);
     const decision = shouldSpeakReply({
       enabled,

@@ -21,7 +21,7 @@ import {
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { writeRestartSentinel } from "./core/restart-sentinel.js";
-import { loadConfig, buildChannelPresetMaps, areHostToolsEnabled, isChannelLocked, resolveThreadLocation, resolveThreadTtsVoice, resolveThreadTtsPace, resolveThreadTtsStyle, adminParticipantOverlapIds, GROK_STATIC_MODELS, ZAI_STATIC_MODELS, OLLAMA_CLOUD_STATIC_MODELS } from "./config.js";
+import { loadConfig, loadBootChannelPresets, configDisabledFeatures, disabledFeatureReason, areHostToolsEnabled, isChannelLocked, resolveThreadLocation, resolveThreadTtsVoice, resolveThreadTtsPace, resolveThreadTtsStyle, adminParticipantOverlapIds, GROK_STATIC_MODELS, ZAI_STATIC_MODELS, OLLAMA_CLOUD_STATIC_MODELS } from "./config.js";
 import { enrichModelListWithKnownLimits } from "./core/context-window.js";
 import {
   hostEmoji,
@@ -144,9 +144,7 @@ async function main(): Promise<void> {
       fs.mkdirSync(config.DATA_DIR, { recursive: true });
       fs.writeFileSync(file, `${JSON.stringify({ channels: {}, threads: {}, bridges: {} }, null, 2)}\n`);
     }
-    Object.assign(config, { CHANNEL_PRESETS_FILE: file }, buildChannelPresetMaps(file, {
-      dropInvalidEntries: true, warn: (message) => logger.warn(message),
-    }));
+    Object.assign(config, { CHANNEL_PRESETS_FILE: file }, loadBootChannelPresets(file));
   }
   const localBridgeCredential = await loadOrCreateLocalBridgeCredential(config.DATA_DIR);
   setAgentLocationDeny(config.AGENT_LOCATION_DENY);
@@ -199,6 +197,7 @@ async function main(): Promise<void> {
     | ((req: IncomingMessage, res: ServerResponse) => void | Promise<void>)
     | undefined;
   const health = startHealthServer(config.HEALTH_PORT, logger, {
+    disabledFeatures: () => configDisabledFeatures(config),
     onMcp: (req, res) => {
       if (!mcpHttpHandle) {
         res.writeHead(503, { "Content-Type": "application/json" });
@@ -602,7 +601,9 @@ async function main(): Promise<void> {
     ollamaCloudEnabled: config.OLLAMA_CLOUD_ENABLED,
     defaultAgentId: config.DEFAULT_AGENT,
     defaultAgentDisabledReason: config.defaultAgentDisabledReason,
-    localAgentErrors: config.agyDisabledReason ? new Map([["agy", config.agyDisabledReason]]) : undefined,
+    localAgentErrors: new Map(configDisabledFeatures(config)
+      .filter(({ feature }) => feature === "agy" || feature === "codex")
+      .map(({ feature, cause }) => [feature, cause])),
     agyMigrationErrors,
     defaultModel: config.DEFAULT_MODEL,
     // Legacy DEFAULT_AUTO_APPROVE=true overrides the policy default to "always".
@@ -1444,6 +1445,7 @@ async function main(): Promise<void> {
     vertexProjectId: () => config.SEAM_GEMINI_VERTEX_PROJECT_ID,
     vertexLocation: () => config.SEAM_GEMINI_VERTEX_LOCATION,
     ttsModel: () => config.SEAM_GEMINI_TTS_MODEL,
+    ttsDisabledReason: (voice) => voice ? undefined : disabledFeatureReason(config, "tts-default-voice"),
     isAllowedUser: (userId) => config.DISCORD_ALLOWED_USER_IDS.has(userId),
     isBindingBusy: (channelRef) => orchestrator.isChannelBusy(channelRef),
   });
@@ -1626,11 +1628,7 @@ async function main(): Promise<void> {
   if (config.CHANNEL_PRESETS_FILE) {
     stopPresetsWatch = watchChannelPresets(
       config.CHANNEL_PRESETS_FILE,
-      {
-        channelPresets: config.channelPresets,
-        threadPresets: config.threadPresets,
-        bridgePresets: config.bridgePresets,
-      },
+      config,
       logger
     );
   }

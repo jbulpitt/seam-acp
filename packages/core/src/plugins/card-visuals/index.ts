@@ -19,15 +19,15 @@ export interface CardVisualsPort {
   write(threadId: string, scope: Scope, key: Key, value: unknown, actor: SlashInvocation["actor"]): { ok: true } | { ok: false; error: string };
 }
 
-const schema = z.object({ SIMPLE_CARD_GIF_MANIFEST_URL: z.string().url(), BRAND_ICON_BASE_URL: z.string().url() });
+const schema = z.object({ SIMPLE_CARD_GIF_MANIFEST_URL: z.string().url().optional(), BRAND_ICON_BASE_URL: z.string().url().optional() });
 const group = { name: "config", description: "Session and bot configuration" };
 const scopeOption = { type: Option.String as const, name: "scope", description: "session (this thread, default) | thread preset | channel (all threads)",
   choices: [{ name: "session (this thread override)", value: "session" }, { name: "thread preset", value: "thread" }, { name: "channel (all threads inherit)", value: "channel" }] };
 
 /** Built-in-only config facade. It never receives sessions or the router. */
 export function createCardVisualsPlugin(port: CardVisualsPort): Plugin {
-  let catalog: CardGifCatalog;
-  let baseUrl: string;
+  let catalog: CardGifCatalog | undefined;
+  let baseUrl: string | undefined;
   let timer: ReturnType<typeof setInterval> | undefined;
   let pending: Promise<void> | undefined;
   const stop = () => { if (timer) clearInterval(timer); timer = undefined; };
@@ -65,7 +65,7 @@ export function createCardVisualsPlugin(port: CardVisualsPort): Plugin {
     activate: context => {
       const config = schema.parse(context.config);
       baseUrl = config.BRAND_ICON_BASE_URL;
-      catalog = new CardGifCatalog({ url: config.SIMPLE_CARD_GIF_MANIFEST_URL, logger: context.logger });
+      if (config.SIMPLE_CARD_GIF_MANIFEST_URL) catalog = new CardGifCatalog({ url: config.SIMPLE_CARD_GIF_MANIFEST_URL, logger: context.logger });
     },
     dispose: async () => { stop(); await pending; },
     contributions: {
@@ -73,12 +73,14 @@ export function createCardVisualsPlugin(port: CardVisualsPort): Plugin {
       slash: [command("card"), command("gif")],
       statusCards: [{ name: "visuals", decorate: facts => ({
         style: facts.style,
-        icon: brandIconUrl(resolveAgentBrand(facts.agentId, facts.profileBrand), baseUrl),
-        ...(facts.style === "simple" && facts.gifOn ? { thumbnail: catalog.randomGif() ?? undefined } : {}),
+        ...(baseUrl ? { icon: brandIconUrl(resolveAgentBrand(facts.agentId, facts.profileBrand), baseUrl) } : {}),
+        ...(facts.style === "simple" && facts.gifOn ? { thumbnail: catalog?.randomGif() ?? undefined } : {}),
       }) }],
       jobs: [{ name: "gif-manifest", phase: "after-admission", intervalMs: DEFAULT_GIF_REFRESH_MS,
         start: ({ signal, intervalMs }) => {
-          const refresh = () => pending ??= catalog.refresh(signal).finally(() => { pending = undefined; });
+          if (!catalog) return;
+          const gifs = catalog;
+          const refresh = () => pending ??= gifs.refresh(signal).finally(() => { pending = undefined; });
           void refresh();
           timer = setInterval(() => void refresh(), intervalMs);
           timer.unref?.();

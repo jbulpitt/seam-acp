@@ -121,6 +121,7 @@ export class VoiceConsoleController
   private readonly vertexProjectId: () => string;
   private readonly vertexLocation: () => string;
   private readonly ttsModel: () => string;
+  private readonly ttsDisabledReason?: (voice: string) => string | undefined;
   private readonly isAllowedUser: (userId: string) => boolean;
   private readonly isBindingBusy: (channelRef: string) => boolean;
   private readonly cardRetryDelaysMs: readonly number[];
@@ -138,6 +139,7 @@ export class VoiceConsoleController
     vertexProjectId: () => string;
     vertexLocation: () => string;
     ttsModel: () => string;
+    ttsDisabledReason?: (voice: string) => string | undefined;
     isAllowedUser: (userId: string) => boolean;
     isBindingBusy: (channelRef: string) => boolean;
     cardRetryDelaysMs?: readonly number[];
@@ -150,6 +152,7 @@ export class VoiceConsoleController
     this.vertexProjectId = opts.vertexProjectId;
     this.vertexLocation = opts.vertexLocation;
     this.ttsModel = opts.ttsModel;
+    this.ttsDisabledReason = opts.ttsDisabledReason;
     this.isAllowedUser = opts.isAllowedUser;
     this.isBindingBusy = opts.isBindingBusy;
     this.cardRetryDelaysMs = opts.cardRetryDelaysMs ?? [0, 250, 750];
@@ -756,19 +759,23 @@ export class VoiceConsoleController
       scheduler = new VoiceConsoleSpeechScheduler({
         consoleId: console.id,
         playback: transport.playback,
-        synthesize: async ({ chunk, profile, signal, onAudioDelta }) => streamSpeechWithGemini({
-          provider: this.speechProvider(),
-          apiKey: this.apiKey(),
-          vertexProjectId: this.vertexProjectId(),
-          vertexLocation: this.vertexLocation(),
-          model: this.ttsModel(),
-          text: chunk.text,
-          voice: profile.voice,
-          pace: profile.pace,
-          style: profile.style,
-          signal,
-          onAudioDelta,
-        }),
+        synthesize: async ({ chunk, profile, signal, onAudioDelta }) => {
+          const cause = this.ttsDisabledReason?.(profile.voice);
+          if (cause) return { ok: false, error: cause };
+          return streamSpeechWithGemini({
+            provider: this.speechProvider(),
+            apiKey: this.apiKey(),
+            vertexProjectId: this.vertexProjectId(),
+            vertexLocation: this.vertexLocation(),
+            model: this.ttsModel(),
+            text: chunk.text,
+            voice: profile.voice,
+            pace: profile.pace,
+            style: profile.style,
+            signal,
+            onAudioDelta,
+          });
+        },
         onFailure: (failure) => {
           this.logger.warn({ consoleId: console.id, failure }, "voice console speech source failed");
           const failedBinding = this.store.getVoiceConsoleBinding(failure.source.bindingId);

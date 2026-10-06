@@ -6070,7 +6070,8 @@ export class Orchestrator {
         // The same owner serves human and live-dispatch continuations. The
         // enclosing phase sees its exhausted outcome, never a fresh budget.
         ? this.acquireRecordedRuntime(record, opts.logContext?.dispatch as string ?? record.id, opts.resumeSessionId)
-        : this.router.getOrStartRuntime(record));
+        : this.router.getOrStartRuntime(record, undefined,
+            this.runtimeAcquisitionFence(opts.logContext?.dispatch as string ?? record.id)));
       opts.lifecycle?.onRuntime?.(rt.getProcessId?.(), rt.getProviderIdentity?.());
       const liveSessionId = record.acpSessionId || rt.getSessionInfo()?.sessionId;
       budgetRecord = record;
@@ -6988,6 +6989,23 @@ export class Orchestrator {
     return result === "timeout" ? "abandon" : "ok";
   }
 
+  private runtimeAcquisitionFence(attemptId: string): () => void {
+    const owner = this.store.turnAttempts?.get(attemptId);
+    return (): void => {
+      if (this.restartCutoff) {
+        throw DispatchSuspendedError.shutdown(attemptId, "shutdown interrupted provider acquisition; the next boot owns the turn");
+      }
+      if (owner && !this.store.turnAttempts.isCurrent(owner)) {
+        const latest = this.store.turnAttempts.get(attemptId);
+        if (latest?.state === "suspended" && latest.generation === owner.generation && latest.ownerBoot === owner.ownerBoot) {
+          throw DispatchSuspendedError.shutdown(attemptId, "shutdown interrupted provider acquisition; the next boot owns the turn");
+        }
+        throw DispatchSuspendedError.superseded(attemptId,
+          latest?.state === "cancelled" ? latest.outcome?.error ?? "cancelled by operator" : "another attempt generation owns this turn");
+      }
+    };
+  }
+
   /**
    * Reacquire one recorded live session during recovery. Each failure happens
    * before `continue` is submitted, so a fresh runtime retry cannot replay the
@@ -7001,20 +7019,7 @@ export class Orchestrator {
   ): Promise<AgentRuntime> {
     let budget: number | undefined;
     let started: number | undefined;
-    const owner = this.store.turnAttempts?.get(attemptId);
-    const assertCurrent = (): void => {
-      if (this.restartCutoff) {
-        throw DispatchSuspendedError.shutdown(attemptId, "shutdown interrupted provider acquisition; the next boot owns the turn");
-      }
-      if (owner && !this.store.turnAttempts.isCurrent(owner)) {
-        const latest = this.store.turnAttempts.get(attemptId);
-        if (latest?.state === "suspended" && latest.generation === owner.generation && latest.ownerBoot === owner.ownerBoot) {
-          throw DispatchSuspendedError.shutdown(attemptId, "shutdown interrupted provider acquisition; the next boot owns the turn");
-        }
-        throw DispatchSuspendedError.superseded(attemptId,
-          latest?.state === "cancelled" ? latest.outcome?.error ?? "cancelled by operator" : "another attempt generation owns this turn");
-      }
-    };
+    const assertCurrent = this.runtimeAcquisitionFence(attemptId);
     for (let attempt = 1; ; attempt++) {
       assertCurrent();
       try {

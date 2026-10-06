@@ -24,6 +24,7 @@ export const SAVED_SESSION = "saved-conversation";
 export async function savedSessionHost(options: {
   failLoad?: boolean;
   loadGate?: boolean;
+  newGate?: boolean;
   sessionGone?: boolean;
   legacy?: boolean;
   oldAuthDisarm?: boolean;
@@ -96,6 +97,7 @@ export async function savedSessionHost(options: {
       FAKE_AGENT_PIDS: path.join(root, "agent.pids"), FAKE_AGENT_REQUESTS: path.join(root, "requests.jsonl"),
       FAKE_AGENT_LOAD_FAILURE: failure, FAKE_AGENT_NEW_SESSION_ID: "replacement-conversation",
       ...(options.loadGate ? { FAKE_AGENT_LOAD_GATE: path.join(root, "load.release") } : {}),
+      ...(options.newGate ? { FAKE_AGENT_NEW_GATE: path.join(root, "new.release") } : {}),
       FAKE_AGENT_AUTH_FAILURE: authFailure,
       ...(options.sessionGone ? { FAKE_AGENT_MISSING_SESSION: SAVED_SESSION } : {}) },
     onFrame: frame => socket.deliver(frame), onStderr: () => {} });
@@ -141,6 +143,7 @@ export async function savedSessionHost(options: {
   return { root, db, record, store, mux, slots, client, commands, notices, makeRouter, makeOrchestrator, requests,
     repairLoad: () => fs.rm(failure, { force: true }),
     releaseLoad: () => fs.writeFile(path.join(root, "load.release"), "released"),
+    releaseNew: () => fs.writeFile(path.join(root, "new.release"), "released"),
     async close() {
       for (const router of routers) await router.disposeAll();
       socket.close();

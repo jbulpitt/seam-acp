@@ -104,6 +104,30 @@ describe("cancel the acquisition owner", () => {
     expect(h.host.commands.filter(frame => frame.type === "rpc" && frame.method === "spawn")).toEqual([]);
   });
 
+  it("does not cache a fresh live-dispatch runtime that starts after cancellation", async () => {
+    const h = await setup({ newGate: true });
+    h.host.record.acpSessionId = "";
+    h.host.store.upsert(h.host.record);
+    vi.spyOn(h.internal, "ensureOwnSession").mockResolvedValue(undefined);
+    const acquisition = h.orch.injectTurn(h.host.record, "continue fresh dispatch", {
+      session: "live", logContext: { dispatch: h.attempt.id },
+    }).catch((error: unknown) => error);
+    await vi.waitFor(async () => expect((await h.host.requests())
+      .filter(frame => frame.method === "session/new")).toHaveLength(1), { timeout: 10_000 });
+    const interaction = cancelInteraction(h.host.record.channelRef);
+    await h.orch.handleSlashInteraction(interaction as never);
+    expect(h.host.store.turnAttempts.get(h.attempt.id)?.state).toBe("cancelled");
+    await h.host.releaseNew();
+    expect(await acquisition).toMatchObject({ suspension: "superseded", reason: "cancelled by operator" });
+    expect(h.router.hasRuntime(h.host.record.id)).toBe(false);
+    await vi.waitFor(async () => expect((await h.host.client.listSlots()).health.filter(slot => slot.alive)).toEqual([]));
+    expect((await h.host.requests()).filter(frame => frame.method === "session/new")).toHaveLength(1);
+    expect((await h.host.requests()).filter(frame => frame.method === "session/prompt")).toEqual([]);
+    expect(interaction.editReply).toHaveBeenCalledWith(expect.objectContaining({
+      content: "🛑 Cancelled the turn while it was still starting.",
+    }));
+  }, 20_000);
+
   it("keeps the existing cancel signal and reply for a prompted live turn", async () => {
     const h = await setup();
     h.host.store.turnAttempts.bind(h.attempt, SAVED_SESSION);

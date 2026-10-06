@@ -162,7 +162,7 @@ describe("#487 production remote construction paths", () => {
     expect(h.calls.prompts).toHaveLength(4);
     expect(h.calls.prompts.every(prompt => prompt.sessionId === "scheduled-acp")).toBe(true);
     expect(h.calls.prompts.slice(1).every(prompt => prompt.prompt[0].text.startsWith("continue\n"))).toBe(true);
-    expect(h.mux.sendCmd).toHaveBeenCalledExactlyOnceWith("listSlots", {});
+    expect(h.mux.sendCmd.mock.calls).toEqual(Array.from({ length: 4 }, () => ["listSlots", {}]));
     expect(h.logs).toContainEqual(expect.objectContaining({ msg: "bridge slot health consulted before exit classification", slot: 0, alive: true }));
     expect(h.logs).toContainEqual(expect.objectContaining({ msg: "adapter error classified", errorKind: "protocol_error" }));
     expect(h.logs).not.toContainEqual(expect.objectContaining({ msg: "adapter error classified", errorKind: "agent_exit" }));
@@ -185,7 +185,7 @@ describe("#487 production remote construction paths", () => {
       muxForSession.mockReturnValue(other);
       const error = await runtime.prompt("fixture", undefined, { recoveryScope: "ephemeral" }).catch(error => error);
       expect(readErrorClassification(error)?.errorKind).toBe("protocol_error");
-      expect(h.mux.sendCmd).toHaveBeenCalledExactlyOnceWith("listSlots", {});
+      expect(h.mux.sendCmd.mock.calls).toEqual(Array.from({ length: 4 }, () => ["listSlots", {}]));
       expect(other.sendCmd).not.toHaveBeenCalled();
       expect(h.calls.children[0].killed).toBe(false);
     } finally { await router.disposeAll(); }

@@ -23,10 +23,8 @@ export interface RecoveryDirective {
 export function buildRecoveryDirective(
   verdict: ErrorVerdict,
   scope: RecoveryDirective["scope"],
-  permittedRungs: readonly RecoveryRung[] = scope === "ephemeral" ? [5] : [1, 5],
+  permittedRungs: readonly RecoveryRung[] = [1, 5],
 ): RecoveryDirective {
-  // Ephemeral callers may permit retries before any update. Conversations
-  // can continue their recorded transcript even after output or tool results.
   const rungs = verdict.action === "stop"
     ? [5] as const
     : ([1, 2, 3, 4, 5] as const).filter(rung =>

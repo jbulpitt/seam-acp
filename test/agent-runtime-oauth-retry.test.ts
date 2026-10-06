@@ -66,13 +66,6 @@ describe("#448 one bounded prompt owner", () => {
     }));
   });
 
-  it.each(["text", "tool"])("does not retry an ephemeral turn after %s", async kind => {
-    const { runtime, prompt } = fixture({ sessionId: "dispatch:outward-effect",
-      output: kind === "text", tool: kind === "tool" });
-    await expect(runtime.prompt("send email")).rejects.toThrow(/another Claude Code process/);
-    expect(prompt).toHaveBeenCalledTimes(1);
-  });
-
   it.each(["prefixed", "isolated"])("retries %s pre-update auth contention with the existing schedule", async kind => {
     const { runtime, prompt, events } = fixture({ sessionId: kind === "prefixed" ? "dispatch:fixture" : "s1", failures: 2 });
     await expect(runtime.prompt("original brief", undefined, { recoveryScope: "ephemeral" }))
@@ -100,51 +93,42 @@ describe("#448 one bounded prompt owner", () => {
   });
 
   it.each([
+    { sessionUpdate: "available_commands_update", availableCommands: [] },
+    { sessionUpdate: "session_info_update", title: "scheduled task" },
+    { sessionUpdate: "tool_call", toolCallId: "mcp_startup.failed", title: "mcp__playwright__startup", status: "failed" },
     { sessionUpdate: "user_message_chunk", content: { type: "text", text: "brief" } },
     { sessionUpdate: "usage_update", used: 1, size: 1_000_000 },
-  ] satisfies SessionUpdate[])("does not retry after a $sessionUpdate even without visible text", async update => {
+  ] satisfies SessionUpdate[])("continues the isolated transcript after $sessionUpdate", async update => {
     const { runtime, prompt } = fixture({ update });
-    await expect(runtime.prompt("brief", undefined, { recoveryScope: "ephemeral" })).rejects.toThrow(/another Claude Code process/);
-    expect(prompt).toHaveBeenCalledTimes(1);
-  });
-
-  it("does not retry after a suppressed update", async () => {
-    const { runtime, prompt, events } = fixture({ output: true });
-    Object.assign(runtime, { loadReplayInProgress: true });
-    await expect(runtime.prompt("brief", undefined, { recoveryScope: "ephemeral" })).rejects.toThrow(/another Claude Code process/);
-    expect(prompt).toHaveBeenCalledTimes(1);
-    expect(events.filter(event => event.kind === "agent-text")).toHaveLength(0);
-  });
-
-  it("stops ephemeral recovery when the next attempt produces an update", async () => {
-    const { runtime, prompt } = fixture();
-    prompt.mockImplementation(async () => {
-      if (prompt.mock.calls.length === 2) await (runtime as any).handleSessionUpdate({
-        sessionUpdate: "agent_message_chunk", content: { type: "text", text: "started" },
-      });
-      throw new Error(CONTENTION);
-    });
-    await expect(runtime.prompt("brief", undefined, { recoveryScope: "ephemeral" })).rejects.toThrow(/another Claude Code process/);
+    await expect(runtime.prompt("brief", undefined, { recoveryScope: "ephemeral" }))
+      .resolves.toMatchObject({ stopReason: "end_turn" });
     expect(prompt).toHaveBeenCalledTimes(2);
+    expect((prompt.mock.calls[1]![0] as { sessionId: string; prompt: Array<{ text: string }> }))
+      .toEqual({ sessionId: "s1", prompt: [{ type: "text", text: expect.stringMatching(/^continue\n/) }] });
   });
 
-  it("preserves the last provider cause when pre-update retries run out", async () => {
+  it.each(["text", "tool"])("continues isolated work after %s without replaying the brief or completed effect", async kind => {
+    const { runtime, prompt } = fixture({ output: kind === "text", tool: kind === "tool" });
+    const effect = vi.fn();
+    const nativePrompt = prompt.getMockImplementation()!;
+    prompt.mockImplementation(async request => {
+      if (JSON.stringify(request).includes("send the email")) effect();
+      return nativePrompt(request);
+    });
+    await expect(runtime.prompt("send the email", undefined, { recoveryScope: "ephemeral" }))
+      .resolves.toMatchObject({ stopReason: "end_turn" });
+    expect(effect).toHaveBeenCalledOnce();
+    expect(prompt).toHaveBeenCalledTimes(2);
+    expect((prompt.mock.calls[1]![0] as { sessionId: string; prompt: Array<{ text: string }> }))
+      .toEqual({ sessionId: "s1", prompt: [{ type: "text", text: expect.stringMatching(/^continue\n/) }] });
+  });
+
+  it("preserves the last provider cause when isolated retries run out", async () => {
     const cause = new Error(CONTENTION);
-    const { runtime, prompt } = fixture({ error: cause, failures: 99 });
+    const { runtime, prompt } = fixture({ error: cause, failures: 99, output: true });
     await expect(runtime.prompt("brief", undefined, { recoveryScope: "ephemeral" })).rejects.toBe(cause);
     expect(prompt).toHaveBeenCalledTimes(4);
-  });
-
-  it("also protects an isolated dispatch whose provider gave it an ordinary session id", async () => {
-    const { runtime, prompt } = fixture({ output: true });
-    await expect(runtime.prompt("send email", undefined, { recoveryScope: "ephemeral" })).rejects.toThrow(/another Claude Code process/);
-    expect(prompt).toHaveBeenCalledTimes(1);
-  });
-
-  it("a conversation hint cannot override a dispatch-prefixed session", async () => {
-    const { runtime, prompt } = fixture({ sessionId: "dispatch:outward-effect", tool: true });
-    await expect(runtime.prompt("send email", undefined, { recoveryScope: "conversation" })).rejects.toThrow(/another Claude Code process/);
-    expect(prompt).toHaveBeenCalledTimes(1);
+    expect(JSON.stringify(prompt.mock.calls.slice(1))).not.toContain('"text":"brief"');
   });
 
   it("moves the cold-resume echo boundary to continue so the recovered answer is visible", async () => {
@@ -155,7 +139,8 @@ describe("#448 one bounded prompt owner", () => {
       await feed("user_message_chunk", "original brief");
       await feed("agent_message_chunk", "partial answer");
       throw new Error(CONTENTION);
-    }).mockImplementationOnce(async (request: { prompt: Array<{ text: string }> }) => {
+    }).mockImplementationOnce(async raw => {
+      const request = raw as { prompt: Array<{ text: string }> };
       await feed("user_message_chunk", request.prompt[0]!.text);
       await feed("agent_message_chunk", "recovered answer");
       return { stopReason: "end_turn" };

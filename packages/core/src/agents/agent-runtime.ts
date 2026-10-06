@@ -480,8 +480,6 @@ export class AgentRuntime {
   /** The bridge owns this in-flight turn's result (#467); set while it runs. */
   private delegatedTurn = false;
   private detached = false;
-  /** #404: has the in-flight turn produced any session update yet? */
-  private sawUpdateThisTurn = false;
   private receivingSubmission?: SubmissionEvidence;
   private readonly submissionSinks = new WeakMap<SubmissionEvidence, AgentEventHandler>();
   private readonly submissionRequests = new WeakMap<object, SubmissionEvidence>();
@@ -1363,7 +1361,6 @@ export class AgentRuntime {
 
     this.touchActivity();
     this.promptInFlight = true;
-    this.sawUpdateThisTurn = false;
     const recoveryAbort = this.recoveryAbort = new AbortController();
     // #443/#575: every production child belongs to a bridge slot. The watch
     // asks that child owner; it does not
@@ -1436,8 +1433,7 @@ export class AgentRuntime {
           this.providerReplyGate = this.profile.id === "codex" && !this.sessionFailuresSupported ? new CodexReplyGate() : undefined;
           const params = {
             sessionId: sid,
-            // Continue the recorded transcript after any output/tool update;
-            // never resend the original brief or attachments for that shape.
+            // Unknown acceptance continues the same transcript, never the brief.
             prompt: continuing ? [{ type: "text" as const, text: this.continuationText }] : prompt,
             ...(opts?.jsonSchema
               ? { _meta: { [SEAM_AGY_JSON_SCHEMA_META]: opts.jsonSchema } }
@@ -1504,10 +1500,8 @@ export class AgentRuntime {
           ? PROVIDER_RETRY_WINDOW_MS : undefined,
         delays: error => {
           const resolution = resolveError(readErrorClassification(error) ?? unclassified(this.profile.id), DEFAULT_ERROR_RULES);
-          const scope = sid.startsWith("dispatch:") || opts?.recoveryScope === "ephemeral"
-            ? "ephemeral" : "conversation";
-          const directive = buildRecoveryDirective(resolution, scope,
-            scope === "ephemeral" && this.sawUpdateThisTurn ? [5] : [1, 5]);
+          const directive = buildRecoveryDirective(resolution,
+            sid.startsWith("dispatch:") || opts?.recoveryScope === "ephemeral" ? "ephemeral" : "conversation");
           this.logger.warn({ sessionId: sid, resolution, directive }, "turn recovery resolved");
           lastErrorKind = resolution.errorKind;
           const evidence = receipt.submission;
@@ -2252,9 +2246,6 @@ export class AgentRuntime {
   }
 
   private handleSessionUpdate(update: SessionUpdate): Promise<void> {
-    // #448: receipt of an update selects transcript continuation, NOT refusal.
-    // Count suppressed/filtered output too: what ran matters, not what we show.
-    this.sawUpdateThisTurn = true;
     const evidence = this.receivingSubmission;
     if (evidence && !evidence.observedUpdateTypes.includes(update.sessionUpdate)) {
       evidence.observedUpdateTypes.push(update.sessionUpdate);

@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { RequestError } from "@agentclientprotocol/sdk";
 import { classifyAgyError, classifyClaudeError, readErrorClassification, resolveError, type AgentProfile } from "@seam/adapters";
 import { AgentRuntime } from "../packages/core/src/agents/agent-runtime.js";
@@ -7,19 +7,18 @@ import type { ClaudeCredentialFacts } from "../packages/core/src/core/claude-oau
 import { DEFAULT_ERROR_RULES } from "../packages/core/src/core/error-resolution-rules.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 
+afterEach(() => vi.restoreAllMocks());
+
 function fixture(error: unknown, classifyError?: AgentProfile["classifyError"], agentId = "claude",
   bridgeHealth?: ConstructorParameters<typeof AgentRuntime>[0]["bridgeHealth"],
   claudeCredentialFacts?: () => ClaudeCredentialFacts | undefined) {
   const logger = { warn: vi.fn(), info: vi.fn(), error: vi.fn(), debug: vi.fn(), child() { return this; } };
   const profile = { id: agentId, classifyError, spawn: () => { throw error; } } as unknown as AgentProfile;
   const runtime = new AgentRuntime({ profile, logger: logger as unknown as Logger, bridgeHealth, claudeCredentialFacts, spawnFn: () => { throw error; } });
-  const prompt = vi.fn(async () => {
-    await (runtime as any).handleSessionUpdate({ sessionUpdate: "agent_message_chunk",
-      content: { type: "text", text: "partial response" } });
-    throw error;
-  });
-  // This suite isolates classification; prompt recovery has its own behavioral
-  // suite. Ephemeral work with an observed update is the one-attempt path.
+  const prompt = vi.fn().mockRejectedValue(error);
+  const timeout = globalThis.setTimeout;
+  vi.spyOn(globalThis, "setTimeout").mockImplementation(((fn: () => void, ms?: number) =>
+    timeout(fn, [2000, 5000, 10000].includes(ms ?? 0) ? 0 : ms)) as typeof setTimeout);
   Object.assign(runtime, { connection: { prompt, newSession: prompt, loadSession: prompt }, sessionId: "dispatch:fixture-session", promptCapabilities: {} });
   return { runtime, logger, prompt };
 }
@@ -40,7 +39,7 @@ describe("#441 real runtime boundary to pure resolver (no providers)", () => {
       expect.objectContaining({ agentId: "claude", errorKind: "rate_limit", operation: "session/prompt",
         errorMessage: original.message, errorCode: -32603, errorStatus: null, errorData: { trace: "retained" } }),
       "adapter error classified");
-    expect(prompt).toHaveBeenCalledTimes(1);
+    expect(prompt).toHaveBeenCalledTimes(4);
   });
 
   it.each(["missing", "unrecognized", "throws"] as const)("%s classifier is attributable unclassified, not invisible", async (mode) => {

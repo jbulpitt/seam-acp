@@ -5860,9 +5860,8 @@ export class Orchestrator {
       const submissionEvidence = opts.lifecycle?.beforePrompt();
       activitySubmitted = true;
       if (activityBinding && !opts.resumeSessionId) this.plugins.turnActivity.emit({ type: "turn-started", turnId: activityTurnId, timestampMs: Date.now(), binding: activityBinding });
-      // ACP ids for isolated runtimes are provider-generated, not necessarily
-      // `dispatch:` prefixed. Carry isolation explicitly: refuse automatic
-      // outward-effect replay while live transcript continuations keep working.
+      // Provider-generated ACP ids do not encode isolation; retain its scope
+      // in the recovery directive. Rung 1 continues the same live session.
       const promptOptions = { ...(opts.jsonSchema ? { jsonSchema: opts.jsonSchema } : {}),
         ...(submissionEvidence ? { submissionEvidence } : {}),
         ...(opts.lifecycle?.onRemoteRecovery

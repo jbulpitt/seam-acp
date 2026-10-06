@@ -5,8 +5,7 @@
  * fire every parked row for that host. On start, fire any row whose host is
  * already ready (boot rehydrate after `npm run redeploy`).
  *
- * Delete-before-fire (same as wakes): a crash mid-inject loses the park
- * rather than running it twice.
+ * Dispatch admission consumes the row atomically; delivery belongs to the queue.
  */
 import type { SessionStore } from "../session-store.js";
 import type { ParkedPrompt } from "./types.js";
@@ -20,7 +19,7 @@ export interface ParkedBridgeHub {
 export interface ParkedPromptManagerOpts {
   store: SessionStore;
   hub: ParkedBridgeHub;
-  onFire: (parked: ParkedPrompt) => Promise<void>;
+  onFire: (parked: ParkedPrompt, consume: () => void) => Promise<void>;
   logger: Logger;
   /**
    * #89: skip (do not delete) a row whose thread still has a live turn.
@@ -35,7 +34,7 @@ export interface ParkedPromptManagerOpts {
 export class ParkedPromptManager {
   private readonly store: SessionStore;
   private readonly hub: ParkedBridgeHub;
-  private readonly onFire: (parked: ParkedPrompt) => Promise<void>;
+  private readonly onFire: ParkedPromptManagerOpts["onFire"];
   private readonly logger: Logger;
   private readonly isChannelBusy?: (channelRef: string) => boolean;
   private offReady?: () => void;
@@ -123,9 +122,8 @@ export class ParkedPromptManager {
           );
           continue;
         }
-        this.store.deleteParked(parked.id);
         try {
-          await this.onFire(parked);
+          await this.onFire(parked, () => this.store.deleteParked(parked.id));
         } catch (err) {
           this.logger.error({ id: parked.id, err }, "parked-prompt fire failed");
         }

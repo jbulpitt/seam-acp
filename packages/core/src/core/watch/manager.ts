@@ -8,7 +8,7 @@
  * (D1 — the model is never invoked to check; the cheap poll runs here).
  *
  * Per swept watch:
- *  1. EXPIRY (D4) — past `expiresAtUtc`: delete, then `onExpire` injects a turn
+ *  1. EXPIRY (D4) — past `expiresAtUtc`: admit an expiry turn, then delete
  *     saying so. A watch that quietly evaporates is the worst outcome (the agent
  *     believes it is still waiting), so expiry is loud, not silent.
  *  2. DUE-CHECK — skip if `lastCheckedUtc + intervalSeconds` has not passed.
@@ -17,9 +17,8 @@
  *     A privileged-source refusal (command disabled/not allowlisted) stops the
  *     watch with a notice (D8 backstop).
  *  4. FIRE — on a tripped predicate: enforce the per-thread hourly rate cap
- *     (D5), then deliver. `once` (D3 default) deletes BEFORE firing (mirroring
- *     #59 D1 — a crash mid-turn can never re-fire). `each` increments and stops
- *     with a notice once `maxFires` is reached.
+ *     (D5), then admit delivery and advance watch state in one transaction.
+ *     `each` stops with a notice once `maxFires` is reached.
  *
  * BATCHING (D5): one evaluation yields at most one event whose `eventText`
  * carries everything the check saw (all of stdout, the whole matched body), so a
@@ -46,12 +45,10 @@ export interface WatchManagerOpts {
   store: WatchManagerStore;
   /** Run one watch's predicate (the cheap bridge-side check). */
   evaluate: (watch: WatchEvent) => Promise<WatchEvalResult>;
-  /** Deliver a fired watch (enqueue its dispatch). The row is already handled
-   *  (deleted for `once`, incremented for `each`) when this is called. */
-  onFire: (watch: WatchEvent, eventText: string) => Promise<void>;
-  /** A watch reached its expiry — inject a turn saying so (D4). The row is
-   *  already deleted. */
-  onExpire: (watch: WatchEvent) => Promise<void>;
+  /** Consume the observation and fire count in the dispatch admission transaction. */
+  onFire: (watch: WatchEvent, eventText: string, consume: () => void) => Promise<void>;
+  /** Consume an expired watch in the dispatch admission transaction. */
+  onExpire: (watch: WatchEvent, consume: () => void) => Promise<void>;
   /** A watch was stopped early (rate cap, maxFires, refusal) — post a visible
    *  notice saying why (D5, never silently). The row is already deleted. */
   onStopped: (watch: WatchEvent, reason: string) => Promise<void>;
@@ -62,8 +59,8 @@ export interface WatchManagerOpts {
 export class WatchManager {
   private readonly store: WatchManagerStore;
   private readonly evaluate: (watch: WatchEvent) => Promise<WatchEvalResult>;
-  private readonly onFire: (watch: WatchEvent, eventText: string) => Promise<void>;
-  private readonly onExpire: (watch: WatchEvent) => Promise<void>;
+  private readonly onFire: WatchManagerOpts["onFire"];
+  private readonly onExpire: WatchManagerOpts["onExpire"];
   private readonly onStopped: (watch: WatchEvent, reason: string) => Promise<void>;
   private readonly logger: Logger;
   private readonly sweepMs: number;
@@ -147,12 +144,11 @@ export class WatchManager {
     // 1. Expiry (D4) — loud, never silent.
     const expiresAt = Date.parse(watch.expiresAtUtc);
     if (!isNaN(expiresAt) && expiresAt <= now) {
-      this.store.deleteWatch(watch.id);
+      await this.onExpire(watch, () => this.store.deleteWatch(watch.id));
       this.logger.info(
         { id: watch.id, channel: watch.channelRef, fireCount: watch.fireCount },
         "watch: expired; injecting notice turn"
       );
-      await this.onExpire(watch);
       return;
     }
 
@@ -177,8 +173,10 @@ export class WatchManager {
       return;
     }
 
-    // Persist the check time + snapshot regardless of outcome.
-    this.store.markWatchChecked(watch.id, nowIso, result.observed);
+    // A fired observation belongs to its admitted dispatch, not the next check.
+    if (result.error || !result.fired) {
+      this.store.markWatchChecked(watch.id, nowIso, result.observed);
+    }
 
     if (result.error) {
       // Transient — the watch survives and retries next interval.
@@ -199,37 +197,35 @@ export class WatchManager {
       await this.onStopped(watch, reason);
       return;
     }
+    const nextCount = watch.fireCount + 1;
+    const terminal = watch.mode === "once" || nextCount >= watch.maxFires;
+    const consume = () => {
+      if (terminal) this.store.deleteWatch(watch.id);
+      else {
+        this.store.markWatchChecked(watch.id, nowIso, result.observed);
+        this.store.incrementWatchFire(watch.id, nowIso);
+      }
+    };
+    await this.onFire(watch, result.eventText, consume);
     this.recordFire(watch.channelRef, now);
 
-    // `once` (D3): delete BEFORE firing so a crash mid-turn can't re-fire it.
     if (watch.mode === "once") {
-      this.store.deleteWatch(watch.id);
       this.logger.info(
         { id: watch.id, channel: watch.channelRef, kind: watch.kind },
         "watch: fired (once); deleted"
       );
-      await this.onFire(watch, result.eventText);
-      return;
-    }
-
-    // `each`: stop after `maxFires` with a notice; otherwise increment and stay armed.
-    const nextCount = watch.fireCount + 1;
-    if (nextCount >= watch.maxFires) {
-      this.store.deleteWatch(watch.id);
+    } else if (terminal) {
       this.logger.info(
         { id: watch.id, channel: watch.channelRef, fires: nextCount, maxFires: watch.maxFires },
         "watch: reached maxFires; firing final + stopping"
       );
-      await this.onFire(watch, result.eventText);
       await this.onStopped(watch, `reached maxFires (${watch.maxFires})`);
-      return;
+    } else {
+      this.logger.info(
+        { id: watch.id, channel: watch.channelRef, fires: nextCount, maxFires: watch.maxFires },
+        "watch: fired (each)"
+      );
     }
-    this.store.incrementWatchFire(watch.id, nowIso);
-    this.logger.info(
-      { id: watch.id, channel: watch.channelRef, fires: nextCount, maxFires: watch.maxFires },
-      "watch: fired (each)"
-    );
-    await this.onFire(watch, result.eventText);
   }
 
   /** Would one more fire for this thread breach the rolling-hour cap? Prunes

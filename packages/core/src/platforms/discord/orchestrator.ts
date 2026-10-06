@@ -7738,20 +7738,19 @@ export class Orchestrator {
   }
 
   /**
-   * WakeManager `onFire` handler (#59): a wake has come due and its row is
-   * already deleted (D1). Deliver it by enqueuing a dispatch spec through the
+   * WakeManager `onFire` handler (#59): a wake has come due. Admit it through the
    * shipped queue — the sweeper decides *when*, the dispatch queue owns *how*.
    * The DispatchWatcher runs the spec via `dispatchInjectTurn`, which records
    * the ledger row (kind "wake", D7) and posts the captured output.
    *
    * Preconditions before enqueuing (mirroring the scheduled-prompt checks):
-   *  - thread deleted → drop cleanly (the row is already gone);
+   *  - thread deleted → drop cleanly;
    *  - Discord-native locked thread → drop with a logged reason — a one-shot
    *    wake cannot meaningfully "skip and retry later" (D12).
    *  A preset-locked channel is NOT blocked (D12): that lock gates slash-command
    *  reconfiguration, never a wake.
    */
-  async fireWake(wake: WakeEvent): Promise<void> {
+  async fireWake(wake: WakeEvent, consume = () => this.store.deleteWake(wake.id)): Promise<void> {
     const target: ChannelRef = {
       platform: PLATFORM,
       id: wake.channelRef,
@@ -7761,23 +7760,24 @@ export class Orchestrator {
     // Preconditions: is the thread postable? (deleted → drop; Discord-locked → drop.)
     if (typeof this.adapter.getThreadLiveState === "function") {
       let state: { locked: boolean; archived: boolean } | undefined;
+      let lookupFailed = false;
       try {
         state = await this.adapter.getThreadLiveState(target);
       } catch (err) {
-        // Transient lookup failure — the row is already deleted, so we can't
-        // retry. Log and drop rather than risk a wrong-state fire.
-        this.logger.warn({ id: wake.id, err }, "wake: thread state check failed; dropping");
-        return;
+        lookupFailed = true;
+        this.logger.warn({ id: wake.id, err }, "wake: thread state check failed; handing off to dispatch");
       }
-      if (state === undefined) {
+      if (state === undefined && !lookupFailed) {
         this.logger.info({ id: wake.id, channel: wake.channelRef }, "wake: thread deleted; dropping");
+        consume();
         return;
       }
-      if (state.locked) {
+      if (state?.locked) {
         this.logger.info(
           { id: wake.id, channel: wake.channelRef },
           "wake: thread is Discord-locked; dropping (a one-shot wake cannot retry later)"
         );
+        consume();
         return;
       }
     }
@@ -7800,7 +7800,7 @@ export class Orchestrator {
     // structured context that dispatchInjectTurn folds into the one runtime
     // preamble. originPrompt is the card/excerpt text.
     const spec: DispatchSpec = {
-      id: randomUUID(),
+      id: `wake-${wake.id}`,
       target: wake.channelRef,
       prompt: wake.prompt,
       originPrompt: wake.prompt,
@@ -7811,11 +7811,21 @@ export class Orchestrator {
       correlationId: wake.id,
       createdUtc: new Date().toISOString(),
     };
-    await enqueueDispatchSpec(this.config.DATA_DIR, spec, this.store.turnAttempts);
+    await this.admitTriggeredDispatch(spec, consume);
     this.logger.info(
       { id: wake.id, dispatch: spec.id, channel: wake.channelRef, chainDepth: wake.chainDepth },
       "wake: fired (dispatch enqueued)"
     );
+  }
+
+  private async admitTriggeredDispatch(spec: DispatchSpec, consume: () => void): Promise<void> {
+    const recorded = this.store.admitTriggeredDispatch(spec, consume);
+    try {
+      await enqueueDispatchSpec(this.config.DATA_DIR, recorded);
+    } catch (err) {
+      // SQL admission survives a missing ingress file; the watcher reads both.
+      this.logger.warn({ id: spec.id, err }, "trigger dispatch admitted; ingress publication failed");
+    }
   }
 
   /** Wake provenance lines folded into the single runtime harness (#203). */
@@ -8075,15 +8085,14 @@ export class Orchestrator {
   /**
    * ParkedPromptManager `onFire`: thread still postable, ferry staged files
    * onto the host via `writeAttachment`, announce, then enqueue a live turn
-   * on the same host. The row is already deleted (delete-before-fire).
+   * on the same host. Admission consumes the row, then releases staged files.
    */
-  async fireParked(parked: ParkedPrompt): Promise<void> {
-    // onBridgeReady / a racy tryFireParked may reach here while a turn is
-    // still running. Put the row back (unless a newer user message already
-    // cancelled it) so D8/D9 can still drop it — do not enqueue a dispatch
-    // that those paths cannot see.
+  async fireParked(
+    parked: ParkedPrompt,
+    consume = () => this.store.deleteParked(parked.id)
+  ): Promise<void> {
+    // Leave the row cancellable while the thread is busy.
     if (this.channelQueues.has(parked.channelRef)) {
-      this.restoreParkedIfCurrent(parked);
       this.logger.info(
         { id: parked.id, channel: parked.channelRef },
         "parked: thread still busy; not firing"
@@ -8097,22 +8106,23 @@ export class Orchestrator {
     };
     if (typeof this.adapter.getThreadLiveState === "function") {
       let state: { locked: boolean; archived: boolean } | undefined;
+      let lookupFailed = false;
       try {
         state = await this.adapter.getThreadLiveState(target);
       } catch (err) {
-        this.logger.warn({ id: parked.id, err }, "parked: thread state check failed; dropping");
-        await deleteParkedAttachmentDir(this.config.DATA_DIR, parked.id).catch(() => {});
-        this.onParkedChange?.();
-        return;
+        lookupFailed = true;
+        this.logger.warn({ id: parked.id, err }, "parked: thread state check failed; handing off to dispatch");
       }
-      if (state === undefined) {
+      if (state === undefined && !lookupFailed) {
         this.logger.info({ id: parked.id, channel: parked.channelRef }, "parked: thread deleted; dropping");
+        consume();
         await deleteParkedAttachmentDir(this.config.DATA_DIR, parked.id).catch(() => {});
         this.onParkedChange?.();
         return;
       }
-      if (state.locked) {
+      if (state?.locked) {
         this.logger.info({ id: parked.id, channel: parked.channelRef }, "parked: thread is Discord-locked; dropping");
+        consume();
         await deleteParkedAttachmentDir(this.config.DATA_DIR, parked.id).catch(() => {});
         this.onParkedChange?.();
         return;
@@ -8124,10 +8134,12 @@ export class Orchestrator {
         { id: parked.id, channel: parked.channelRef },
         "parked: superseded by a newer user message; dropping"
       );
+      consume();
       await deleteParkedAttachmentDir(this.config.DATA_DIR, parked.id).catch(() => {});
       this.onParkedChange?.();
       return;
     }
+    if (this.store.getParkedByChannel(PLATFORM, parked.channelRef)?.id !== parked.id) return;
 
     const record = this.router.ensureSessionRecord({
       platform: PLATFORM,
@@ -8166,8 +8178,6 @@ export class Orchestrator {
         pathLines.push(`- \`${a.filename}\` — could not be transferred to the agent host`);
       }
     }
-    await deleteParkedAttachmentDir(this.config.DATA_DIR, parked.id).catch(() => {});
-
     let prompt = parked.prompt;
     if (pathLines.length > 0) {
       const hint =
@@ -8175,6 +8185,8 @@ export class Orchestrator {
         `uploaded and saved to the agent's filesystem:_\n${pathLines.join("\n")}`;
       prompt = prompt ? `${prompt}${hint}` : hint.trimStart();
     }
+
+    if (this.store.getParkedByChannel(PLATFORM, parked.channelRef)?.id !== parked.id) return;
 
     const queued = parked.kind === "user_queue";
     const runningText = queued
@@ -8202,11 +8214,14 @@ export class Orchestrator {
         { id: parked.id, channel: parked.channelRef },
         "parked: superseded before enqueue; dropping"
       );
+      consume();
+      await deleteParkedAttachmentDir(this.config.DATA_DIR, parked.id).catch(() => {});
       this.onParkedChange?.();
       return;
     }
+    // Cancellation or replacement during attachment transfer must still win.
+    if (this.store.getParkedByChannel(PLATFORM, parked.channelRef)?.id !== parked.id) return;
     if (this.channelQueues.has(parked.channelRef)) {
-      this.restoreParkedIfCurrent(parked);
       this.logger.info(
         { id: parked.id, channel: parked.channelRef },
         "parked: thread became busy before enqueue; not firing"
@@ -8215,7 +8230,7 @@ export class Orchestrator {
     }
 
     const spec: DispatchSpec = {
-      id: randomUUID(),
+      id: `parked-${parked.id}`,
       target: parked.channelRef,
       prompt,
       session: "live",
@@ -8224,7 +8239,8 @@ export class Orchestrator {
       correlationId: parked.id,
       createdUtc: new Date().toISOString(),
     };
-    await enqueueDispatchSpec(this.config.DATA_DIR, spec, this.store.turnAttempts);
+    await this.admitTriggeredDispatch(spec, consume);
+    await deleteParkedAttachmentDir(this.config.DATA_DIR, parked.id).catch(() => {});
     this.logger.info(
       { id: parked.id, dispatch: spec.id, channel: parked.channelRef, location: parked.location },
       "parked: fired (dispatch enqueued)"
@@ -8243,23 +8259,10 @@ export class Orchestrator {
   }
 
   /**
-   * Re-insert a parked row that was delete-before-fire'd but must not run
-   * yet (thread still busy). Never overwrite a newer park (D2) or revive a
-   * row D9 already cancelled.
-   */
-  private restoreParkedIfCurrent(parked: ParkedPrompt): void {
-    if (this.parkedSupersededByNewerUser(parked)) return;
-    const existing = this.store.getParkedByChannel(PLATFORM, parked.channelRef);
-    if (existing) return;
-    this.store.upsertParked(parked);
-    this.onParkedChange?.();
-  }
-
-  /**
    * #89 D7: if this thread has a parked row and the host is ready, fire it
    * as a live turn. No-op when the channel is still busy, the host is down
    * (wait for `onBridgeReady`), or a newer user message already took over.
-   * Delete-before-fire — same as the manager's location sweep.
+   * Admission consumes the row, as in the manager's location sweep.
    */
   async tryFireParked(channelRef: string): Promise<void> {
     if (this.channelQueues.has(channelRef)) return;
@@ -8284,7 +8287,6 @@ export class Orchestrator {
     if (!this.bridgeHub?.isBridgeReady(parked.location)) {
       return;
     }
-    this.store.deleteParked(parked.id);
     try {
       await this.fireParked(parked);
     } catch (err) {
@@ -9340,8 +9342,7 @@ export class Orchestrator {
   }
 
   /**
-   * WatchManager `onFire` handler (#60): a watch's predicate tripped and its row
-   * is already handled (deleted for `once`, incremented for `each`). Deliver it
+   * WatchManager `onFire` handler (#60): a watch's predicate tripped. Deliver it
    * exactly as a wake is delivered — announce a card, then enqueue a live turn
    * via the shipped dispatch queue (kind "watch", so the ledger attributes it as
    * a condition-triggered re-entry). The captured event text rides in the prompt.
@@ -9349,13 +9350,16 @@ export class Orchestrator {
    * Preconditions mirror `fireWake`: a deleted thread drops cleanly; a
    * Discord-locked thread drops with a logged reason.
    */
-  async fireWatch(watch: WatchEvent, eventText: string): Promise<void> {
+  async fireWatch(watch: WatchEvent, eventText: string, consume: () => void = () => {}): Promise<void> {
     const target: ChannelRef = {
       platform: PLATFORM,
       id: watch.channelRef,
       ...(watch.parentRef ? { parentId: watch.parentRef } : {}),
     };
-    if (!(await this.watchThreadPostable(watch, target))) return;
+    if (!(await this.watchThreadPostable(watch, target))) {
+      consume();
+      return;
+    }
 
     try {
       const detail = watch.reason ? ` — ${watch.reason}` : "";
@@ -9370,7 +9374,7 @@ export class Orchestrator {
     }
 
     const spec: DispatchSpec = {
-      id: randomUUID(),
+      id: `watch-${watch.id}-fire-${watch.fireCount + 1}`,
       target: watch.channelRef,
       prompt: watch.prompt,
       originPrompt: watch.prompt,
@@ -9380,7 +9384,7 @@ export class Orchestrator {
       correlationId: watch.id,
       createdUtc: new Date().toISOString(),
     };
-    await enqueueDispatchSpec(this.config.DATA_DIR, spec, this.store.turnAttempts);
+    await this.admitTriggeredDispatch(spec, consume);
     this.logger.info(
       { id: watch.id, dispatch: spec.id, channel: watch.channelRef, kind: watch.kind },
       "watch: fired (dispatch enqueued)"
@@ -9392,18 +9396,21 @@ export class Orchestrator {
    * a turn saying so — a watch that quietly evaporates is the worst outcome (the
    * agent believes it is still waiting). Delivered as a live turn (not just a
    * card) so the agent actually re-enters and can react (retry, give up, tell the
-   * user). The row is already deleted.
+   * user). Admission consumes the expired row.
    */
-  async fireWatchExpiry(watch: WatchEvent): Promise<void> {
+  async fireWatchExpiry(watch: WatchEvent, consume = () => this.store.deleteWatch(watch.id)): Promise<void> {
     const target: ChannelRef = {
       platform: PLATFORM,
       id: watch.channelRef,
       ...(watch.parentRef ? { parentId: watch.parentRef } : {}),
     };
-    if (!(await this.watchThreadPostable(watch, target))) return;
+    if (!(await this.watchThreadPostable(watch, target))) {
+      consume();
+      return;
+    }
 
     const spec: DispatchSpec = {
-      id: randomUUID(),
+      id: `watch-${watch.id}-expiry`,
       target: watch.channelRef,
       prompt: watch.prompt,
       originPrompt: watch.prompt,
@@ -9413,7 +9420,7 @@ export class Orchestrator {
       correlationId: watch.id,
       createdUtc: new Date().toISOString(),
     };
-    await enqueueDispatchSpec(this.config.DATA_DIR, spec, this.store.turnAttempts);
+    await this.admitTriggeredDispatch(spec, consume);
     this.logger.info(
       { id: watch.id, dispatch: spec.id, channel: watch.channelRef, fireCount: watch.fireCount },
       "watch: expiry turn enqueued"
@@ -9453,11 +9460,12 @@ export class Orchestrator {
     try {
       state = await this.adapter.getThreadLiveState(target);
     } catch (err) {
-      this.logger.warn({ id: watch.id, err }, "watch: thread state check failed; dropping");
-      return false;
+      this.logger.warn({ id: watch.id, err }, "watch: thread state check failed; handing off to dispatch");
+      return true;
     }
     if (state === undefined) {
       this.logger.info({ id: watch.id, channel: watch.channelRef }, "watch: thread deleted; dropping");
+      this.store.deleteWatch(watch.id);
       return false;
     }
     if (state.locked) {

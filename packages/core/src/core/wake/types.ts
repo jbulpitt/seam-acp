@@ -7,7 +7,7 @@
  * primitive — inject a live turn into a thread without a chat message.
  *
  * Lifecycle (D1): written at schedule time, rehydrated on boot, fired once, and
- * deleted after firing (success or failure). No accumulating history in this
+ * deleted when its dispatch is durably admitted. No accumulating history in this
  * table — the audit trail lives in the delegation ledger (D7). Unlike
  * `ScheduledPrompt`, a wake carries no cron, no schedule config, and no timers:
  * it stores *when* to fire and *what* to say, and the DB sweep (D11) decides

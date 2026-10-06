@@ -1774,7 +1774,10 @@ export class DiscordAdapter implements ChatAdapter {
     } catch (err) {
       // 10003 = Unknown Channel → confirmed deleted. Anything else is transient;
       // rethrow so the caller skips this run rather than dropping the schedule.
-      if ((err as { code?: number })?.code === 10003) return undefined;
+      if ((err as { code?: number })?.code === 10003) {
+        this.logger.warn({ err, channel: channel.id }, "Discord thread lookup: Unknown Channel");
+        return undefined;
+      }
       throw err;
     }
   }

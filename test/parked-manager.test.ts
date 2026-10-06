@@ -82,10 +82,12 @@ describe("ParkedPromptManager (#88)", () => {
     expect(drained).toBe(true);
   });
 
-  it("deletes the row before onFire (no double delivery)", async () => {
+  it("retains the row until the handoff consumes it", async () => {
     const parked = makeParked();
     const { store, rows, deletes } = makeStore([parked]);
-    const onFire = vi.fn(async (p: ParkedPrompt) => {
+    const onFire = vi.fn(async (p: ParkedPrompt, consume: () => void) => {
+      expect(rows.has(p.id)).toBe(true);
+      consume();
       expect(rows.has(p.id)).toBe(false);
     });
     const m = new ParkedPromptManager({
@@ -97,6 +99,27 @@ describe("ParkedPromptManager (#88)", () => {
     await m.fireLocation("mac");
     expect(onFire).toHaveBeenCalledTimes(1);
     expect(deletes).toEqual(["park-1"]);
+  });
+
+  it("keeps a failed admission for the next ready event", async () => {
+    const { store, rows } = makeStore([makeParked()]);
+    const onFire = vi.fn().mockRejectedValueOnce(new Error("SQL unavailable"))
+      .mockImplementation(async (_parked, consume) => consume());
+    const m = new ParkedPromptManager({ store, hub: makeHub({ ready: new Set(["mac"]) }), onFire, logger: silentLogger });
+    await m.fireLocation("mac");
+    expect(rows.has("park-1")).toBe(true);
+    await m.fireLocation("mac");
+    expect(rows.size).toBe(0);
+    expect(onFire).toHaveBeenCalledTimes(2);
+  });
+
+  it("retains a handoff deferred because its thread became busy", async () => {
+    const { store, rows } = makeStore([makeParked()]);
+    const m = new ParkedPromptManager({
+      store, hub: makeHub({ ready: new Set(["mac"]) }), onFire: async () => {}, logger: silentLogger,
+    });
+    await m.fireLocation("mac");
+    expect(rows.has("park-1")).toBe(true);
   });
 
   it("does not fire when the host is not ready", async () => {
@@ -122,8 +145,9 @@ describe("ParkedPromptManager (#88)", () => {
     const m = new ParkedPromptManager({
       store,
       hub: makeHub({ ready: new Set(["mac"]) }),
-      onFire: async (p) => {
+      onFire: async (p, consume) => {
         fired.push(p.id);
+        consume();
       },
       logger: silentLogger,
     });
@@ -147,8 +171,9 @@ describe("ParkedPromptManager (#88)", () => {
         isBridgeReady: (id) => id === "mac",
         onBridgeReady: hub.onBridgeReady,
       },
-      onFire: async (p) => {
+      onFire: async (p, consume) => {
         fired.push(p.id);
+        consume();
       },
       logger: silentLogger,
     });
@@ -184,8 +209,9 @@ describe("ParkedPromptManager (#88)", () => {
     const m = new ParkedPromptManager({
       store,
       hub: makeHub({ ready: new Set(["mac"]) }),
-      onFire: async (p) => {
+      onFire: async (p, consume) => {
         fired.push(p.id);
+        consume();
       },
       logger: silentLogger,
       isChannelBusy: (id) => busy.has(id),

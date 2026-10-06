@@ -3,6 +3,7 @@ import { PresetRepository } from "../plugins/presets/repository.js";
 import { ContextBudgetStore } from "./context-budget-store.js";
 import { ActionCardStore } from "./action-cards/store.js";
 import { TurnAttemptStore, inboundAttemptId } from "./dispatch/attempt-store.js";
+import type { DispatchSpec } from "./dispatch/types.js";
 import { ScheduledOccurrenceStore } from "./scheduled-prompts/occurrence-store.js";
 import fs from "node:fs";
 import path from "node:path";
@@ -2412,6 +2413,17 @@ export class SessionStore {
 
   deleteWake(id: string): void {
     this.db.prepare("DELETE FROM wake_events WHERE id = ?").run(id);
+  }
+
+  /** Transfer a trigger to SQL dispatch ownership in one commit. */
+  admitTriggeredDispatch(spec: DispatchSpec, consume: () => void): DispatchSpec {
+    return this.db.transaction(() => {
+      const existing = this.turnAttempts.get(spec.id);
+      if (existing) return existing.spec;
+      const attempt = this.turnAttempts.admit(spec);
+      consume();
+      return attempt.spec;
+    })();
   }
 
   // --- parked prompts (#88) -------------------------------------------------

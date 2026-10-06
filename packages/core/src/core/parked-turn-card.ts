@@ -45,7 +45,9 @@ export function parkedTurnContext(attempt: TurnAttempt, source: ParkedTurnSource
   if (where.length) lines.push(where.join(" · "));
   const starts = (attempt.submissions ?? []).map(s => recordedTime(s.rpcInvokedUtc)).filter(t => t !== undefined);
   const started = recordedTime(attempt.statusCardState?.status.input.startedUtc) ?? (starts.length ? Math.min(...starts) : undefined);
-  const activity = [attempt.updatedUtc, attempt.stdoutFallback?.lastUtc, ...(attempt.submissions ?? []).map(s => s.finishedUtc)]
+  // Notice bookkeeping also changes updatedUtc; it is not execution activity.
+  const activity = [started, attempt.stalledUtc, attempt.stdoutFallback?.lastUtc,
+    ...(attempt.submissions ?? []).flatMap(s => [s.rpcInvokedUtc, s.localWriteStartedUtc, s.localWriteCompletedUtc, s.finishedUtc])]
     .map(recordedTime).filter(t => t !== undefined);
   const times = [
     ["Started", started],

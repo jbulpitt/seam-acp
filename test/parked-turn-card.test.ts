@@ -116,7 +116,7 @@ describe("recorded parked-turn context", () => {
     expect(context.join("\n")).not.toContain("<#worker>");
   });
 
-  it("shows wake provenance and takes last activity from the latest recorded output or update", () => {
+  it("shows wake provenance and takes last activity from the latest recorded output", () => {
     const attempt = { ...store.turnAttempts.get(id)!, updatedUtc: "2026-10-06T15:30:22Z",
       stalledUtc: "2026-10-06T15:30:20Z", stdoutFallback: { count: 1, reasons: {}, lastUtc: "2026-10-06T15:30:30Z" },
       spec: { ...store.turnAttempts.get(id)!.spec, kind: "wake" as const, originPrompt: "Wake\n and check the build" } };
@@ -124,6 +124,21 @@ describe("recorded parked-turn context", () => {
     expect(context[0]).toBe("Wake — Wake and check the build");
     expect(context.at(-1)).toContain("Last active <t:1791300630:R>");
     expect(context.at(-1)).toContain("Parked <t:1791300620:R>");
+  });
+
+  it("keeps the existing card when only notice bookkeeping advances the attempt update", async () => {
+    const orch = controller();
+    await orch.postParkedTurnNotice("worker", store.turnAttempts.get(id), "connection unavailable");
+    const original = store.listOpenChoiceCards("discord", "worker")[0]!;
+    expect(store.turnAttempts.markStallNoticeDelivered(id, "2030-01-01T00:00:00Z")).toBe(true);
+    expect(store.turnAttempts.get(id)!.updatedUtc).toBe("2030-01-01T00:00:00Z");
+    await orch.postParkedTurnNotice("worker", store.turnAttempts.get(id), "connection unavailable");
+    const notices = store.listOpenChoiceCards("discord", "worker");
+    expect(notices).toHaveLength(1);
+    expect(notices[0]!.id).toBe(original.id);
+    expect(notices[0]!.body).toBe(original.body);
+    expect(orch.adapter.sendChoiceCard).toHaveBeenCalledTimes(1);
+    expect(orch.adapter.editChoiceCard).not.toHaveBeenCalled();
   });
 
   it("omits unavailable names, identities and timestamps instead of substituting creation time", () => {

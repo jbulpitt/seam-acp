@@ -42,7 +42,7 @@ function setup() {
   const router = {
     listProfiles: () => [], describeConfig: () => ({ agent: { value: "codex" }, model: { value: "default" },
       location: { value: "local" }, cwd: { value: "/synthetic" }, effort: { value: null } }),
-    ensureSessionRecord: () => ({ ...record }), getProfile: () => undefined,
+    ensureSessionRecord: ({ channelRef }: { channelRef: string }) => ({ ...record, id: `discord:${channelRef}`, channelRef }), getProfile: () => undefined,
     adoptRecoveryRuntime: vi.fn(),
     releaseRecoveryRuntime: vi.fn(),
     getOrStartRuntime: vi.fn(async (_record: unknown, _opts?: { resumeSessionId: string }) => runtime),
@@ -183,7 +183,7 @@ describe("#250 production dispatch lifecycle (synthetic transport, no providers)
     await h.watcher.tick();
     expect(h.runtime.prompt).toHaveBeenCalledOnce();
     expect(h.store.turnAttempts.get(attempt.id)).toMatchObject({ state: "completed", promptStarted: true, generation: 2 });
-    expect(await h.orch.resumeTurnManually(attempt.id)).toContain("No interrupted/abandoned turn");
+    expect(await h.orch.resumeTurnManually(attempt.id)).toContain("No interrupted/cancelled turn");
     expect(h.runtime.prompt).toHaveBeenCalledOnce();
   });
 
@@ -225,7 +225,7 @@ describe("#250 production dispatch lifecycle (synthetic transport, no providers)
   });
 
   it.each(["legacy-unclaimed", "missing-session", "identity-drift", "unreadable-owner"] as const)(
-    "#355 unresolved %s stays quarantined and names the uncertainty", async fault => {
+    "#355 unresolved %s keeps its cause without replaying the worker prompt", async fault => {
       const h = setup();
       simulateRetiredOwnerProcess();
       if (fault === "legacy-unclaimed") {
@@ -248,23 +248,44 @@ describe("#250 production dispatch lifecycle (synthetic transport, no providers)
       if (fault === "unreadable-owner") (h.store as any).db.prepare(
         "UPDATE turn_attempt_owners SET process_json='{}' WHERE id=?").run(before.ownerBoot);
       h.adapter.sendMessage.mockClear(); h.runtime.prompt.mockClear();
+      const reportRuntime = { ...h.runtime, getSessionInfo: () => ({ sessionId: "origin-acp" }),
+        prompt: vi.fn(async (_text: string) => ({ stopReason: "end_turn" })) };
+      h.router.getOrStartRuntime.mockImplementation(async record =>
+        (record as { channelRef: string }).channelRef === "origin" ? reportRuntime : h.runtime);
       const next = h.makeOrch();
       const watcher = createRuntimeDispatchWatcher({ attempts: h.store.turnAttempts,
         dataDir: h.dataDir, logger: pino({ level: "silent" }) as any, runtime: next });
       next.setDispatchWatcher(watcher); cleanups.push(() => watcher.stop());
       await watcher.start();
+      await watcher.drain();
       expect(h.runtime.prompt).not.toHaveBeenCalled();
-      expect(h.store.turnAttempts.get(h.spec.id)).toMatchObject({ state: "suspended",
-        generation: before.generation, stalledUtc: before.stalledUtc, stallNoticeUtc: expect.any(String) });
-      const reason = { "legacy-unclaimed": "this legacy turn has no recorded execution", "missing-session": "no ACP session id",
+      const reason = { "legacy-unclaimed": "this legacy turn has no recorded execution, so Seam can't tell whether its prompt was sent",
+        "missing-session": "the attempt recorded a started prompt but no ACP session id; the conversation to continue cannot be determined",
         "identity-drift": "thread switched from codex to claude", "unreadable-owner": "owner registration is missing or unreadable" }[fault];
       expect(h.store.turnAttempts.get(h.spec.id)?.stalledReason).toContain(reason);
       const notices = h.adapter.sendMessage.mock.calls.filter(([, text]) => text?.includes("is parked:"));
-      expect(notices).toHaveLength(1);
-      expect(notices[0]?.[1]).toContain(reason);
-      expect(notices[0]?.[1]).not.toContain("Use `/seam workflows` to resume or abandon");
       if (fault === "legacy-unclaimed" || fault === "missing-session") {
-        expect(await next.resumeTurnManually(h.spec.id)).toContain(reason);
+        const cancellation = `🚫 Cancelled dispatch \`held\`: ${reason}.${before.promptStarted ? "" : " The prompt was never sent."}`;
+        expect(h.store.turnAttempts.get(h.spec.id)).toMatchObject({ state: "cancelled",
+          generation: before.generation, stalledReason: reason, outcome: { status: "failed", error: cancellation } });
+        expect(notices).toHaveLength(0);
+        expect(reportRuntime.prompt).toHaveBeenCalledOnce();
+        expect(reportRuntime.prompt.mock.calls[0]?.[0]).toContain([
+          '<seam-report-back correlation="logical" from-thread="worker">',
+          `The worker did not complete cleanly: ${cancellation}`,
+          "", "--- partial output ---", "", "</seam-report-back>",
+        ].join("\n"));
+        const reports = h.store.listRecentDelegations(20).filter(row => row.kind === "report_back");
+        expect(reports).toHaveLength(1);
+        expect(reports[0]).toMatchObject({ targetRef: "origin", status: "completed" });
+        expect(await next.resumeTurnManually(h.spec.id)).toContain("No interrupted/cancelled turn");
+      } else {
+        expect(h.store.turnAttempts.get(h.spec.id)).toMatchObject({ state: "suspended",
+          generation: before.generation, stalledUtc: before.stalledUtc, stallNoticeUtc: expect.any(String) });
+        expect(notices).toHaveLength(1);
+        expect(notices[0]?.[1]).toContain(reason);
+        expect(notices[0]?.[1]).not.toContain("Use `/seam workflows` to resume or abandon");
+        expect(reportRuntime.prompt).not.toHaveBeenCalled();
       }
     });
 

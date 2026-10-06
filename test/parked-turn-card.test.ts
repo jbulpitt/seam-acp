@@ -302,9 +302,19 @@ describe("durable parked-turn notice actions", () => {
 
   it.each(["cancel", "abandon", "workflow action"])("closes persisted notices when cancelled through %s", async route => {
     const orch = controller();
-    await orch.postParkedTurnNotice("worker", store.turnAttempts.get(id), "connection unavailable");
-    await orch.postParkedTurnNotice("requester", store.turnAttempts.get(id), "connection unavailable");
-    const cards = store.listOpenChoiceCards("discord");
+    const otherId = "other-parked-attempt";
+    const other = store.turnAttempts.claim({ ...store.turnAttempts.get(id)!.spec, id: otherId },
+      executionIdentity({ agent: "codex", location: "local" }), "boot");
+    store.turnAttempts.bind(other, "other-acp");
+    store.turnAttempts.startPrompt(other);
+    store.turnAttempts.markStalled(otherId, "another connection unavailable");
+    const otherNotice = await orch.publishChoiceCard(orch.router.ensureSessionRecord({ channelRef: "worker" }),
+      parkedTurnChoiceSpec(otherId, "another connection unavailable", { resume: "Resume", cancel: "Cancel" }));
+    for (const channelRef of ["worker", "requester"]) {
+      await orch.publishChoiceCard(orch.router.ensureSessionRecord({ channelRef }),
+        parkedTurnChoiceSpec(id, "connection unavailable", { resume: "Resume old notice", cancel: "Cancel old notice" }));
+    }
+    const cards = store.listOpenChoiceCards("discord").filter(card => card.id !== otherNotice.choiceId);
     expect(cards).toHaveLength(2);
 
     if (route === "workflow action") {
@@ -318,13 +328,14 @@ describe("durable parked-turn notice actions", () => {
     }
 
     expect(store.turnAttempts.get(id)?.state).toBe("cancelled");
-    expect(store.listOpenChoiceCards("discord")).toEqual([]);
+    expect(store.listOpenChoiceCards("discord").map(card => card.id)).toEqual([otherNotice.choiceId]);
+    expect(store.turnAttempts.get(otherId)?.state).toBe("suspended");
     for (const card of cards) expect(store.getChoiceCard(card.id)?.status).toBe("cancelled");
     expect(orch.adapter.editChoiceCard).toHaveBeenCalledTimes(2);
     const staleClick = click(cards[0]!.id, 1);
     await orch.handleChoiceCardInteraction(staleClick);
     expect(staleClick.replyEphemeral).toHaveBeenCalledWith("This card is closed.");
-    expect(orch.adapter.sendChoiceCard).toHaveBeenCalledTimes(2);
+    expect(orch.adapter.sendChoiceCard).toHaveBeenCalledTimes(3);
   });
 
   it.each([false, true])("cancels an unavailable user turn with one plain cause and no buttons (already notified: %s)", async alreadyNotified => {

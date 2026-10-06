@@ -125,6 +125,7 @@ describe("#580 operator session replacement", () => {
       store,
       adapter: { sendMessage },
       logger,
+      config: { DATA_DIR: dir },
     });
     await observer.observeRetainedDispatch(
       spec("runtime-failure"),

@@ -2130,8 +2130,7 @@ describe("SeamMcpServer", () => {
   // answer to "can I dispatch here" — the inventory deliberately excludes it from
   // `busy` — and printing it as a third state took the whole worker pool out of
   // service, because agents read the flag as "unusable" and routed around it.
-  // The queue inspector no longer emits queue state `stalled` (#541); the attempt
-  // still surfaces as retained work.
+  // A retained dispatch alone leaves the queue idle; its attempt still surfaces.
   it("threads reports a retained dispatch as still dispatchable, keeping its detail (#508)", async () => {
     h = await makeHarness({
       listThreads: async () => [{

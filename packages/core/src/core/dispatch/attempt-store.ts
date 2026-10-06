@@ -151,7 +151,8 @@ export class DispatchSuspendedError extends Error {
     readonly suspension: SuspensionClass,
     cause?: unknown,
   ) {
-    super("dispatch attempt no longer owns execution", cause === undefined ? undefined : { cause });
+    super(suspension === "defect" ? reason : "dispatch attempt no longer owns execution",
+      cause === undefined ? undefined : { cause });
     this.name = "DispatchSuspendedError";
     if (!reason.trim()) throw new Error("DispatchSuspendedError requires a non-empty reason");
   }

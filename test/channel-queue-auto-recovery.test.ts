@@ -22,6 +22,8 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { pino } from "pino";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
+import { inboundAttemptId } from "../packages/core/src/core/dispatch/attempt-store.js";
+import { REAUTH_WAITING_TEXT } from "../packages/core/src/core/reauth-negotiation.js";
 import {
   AUTO_RECOVERY_ACTOR,
   Orchestrator,
@@ -42,6 +44,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   store.close();
   await rm(dir, { recursive: true, force: true });
 });
@@ -101,6 +104,64 @@ function admitStale(messageId: string, createdUtc = "2026-09-19T00:00:00.000Z"):
 }
 
 describe("#423 a wedged thread self-heals without an operator", () => {
+  it.each([
+    [false, false], [false, true], [true, false], [true, true],
+  ])("leaves a reauth-waiting inbound parked across sweeps (promptStarted=%s, queueMeta=%s)", async (promptStarted, queueMeta) => {
+    const { host, router } = makeHost();
+    admitStale("auth-wait");
+    store.claimInbound("auth-wait", 0, "2026-09-19T00:00:00.000Z");
+    const id = inboundAttemptId("auth-wait");
+    const attempt = store.turnAttempts.claim({ id, target: CHANNEL, prompt: "pending prompt",
+      session: "live", createdUtc: "2026-09-19T00:00:00.000Z" }, "identity", "boot", "inbound");
+    if (promptStarted) {
+      store.turnAttempts.bind(attempt, "acp-1");
+      store.turnAttempts.startPrompt(attempt);
+    }
+    store.turnAttempts.markStalled(id, REAUTH_WAITING_TEXT);
+    store.turnAttempts.markStallNoticeDelivered(id);
+    if (queueMeta) (host as unknown as { channelQueueMeta: Map<string, unknown> }).channelQueueMeta
+      .set(CHANNEL, { epoch: 0, queued: 1, admittedAtMs: 0, lastProgressAtMs: 0 });
+    const admission = store.getInbound("auth-wait");
+    const parked = store.turnAttempts.get(id);
+    const claim = vi.spyOn(store, "claimInbound");
+    const recover = vi.spyOn(host, "recoverChannel");
+    const reclaim = vi.spyOn(store.turnAttempts, "claim");
+    const warnings = vi.spyOn(silent, "warn");
+    const errors = vi.spyOn(silent, "error");
+    let now = Date.now();
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    for (let tick = 0; tick < 35; tick++) {
+      now += 60_000;
+      expect(host.inspectChannelQueue(CHANNEL)).toMatchObject({
+        state: "stalled", epoch: 0, queued: 1, runtimeBusy: false, stalledDispatchIds: [id],
+      });
+      expect(await host.sweepWedgedQueues()).toEqual([]);
+    }
+    expect(claim).not.toHaveBeenCalled();
+    expect(reclaim).not.toHaveBeenCalled();
+    expect(recover).not.toHaveBeenCalled();
+    expect(router.abortTurn).not.toHaveBeenCalled();
+    expect(router.invalidate).not.toHaveBeenCalled();
+    expect(warnings).not.toHaveBeenCalled();
+    expect(errors).not.toHaveBeenCalled();
+    expect(store.listConfigMutations()).toEqual([]);
+    expect(store.getInbound("auth-wait")).toEqual(admission);
+    expect(store.turnAttempts.get(id)).toEqual(parked);
+  });
+
+  it("recovers a replacement inbound instead of inheriting the old authentication wait", async () => {
+    const { host } = makeHost();
+    admitStale("old-auth");
+    const id = inboundAttemptId("old-auth");
+    store.turnAttempts.claim({ id, target: CHANNEL, prompt: "old prompt", session: "live" },
+      "identity", "boot", "inbound");
+    store.turnAttempts.markStalled(id, REAUTH_WAITING_TEXT);
+    admitStale("replacement", "2026-09-19T00:01:00.000Z");
+    expect(store.turnAttempts.get(id)?.state).toBe("cancelled");
+    expect(host.inspectChannelQueue(CHANNEL).state).toBe("wedged");
+    expect(await host.sweepWedgedQueues()).toEqual([CHANNEL]);
+  });
+
   // #509: deleting idle fallthrough poisons an empty queue; deleting diagnostics hides genuine non-retryable defects.
   it("reports idle with stale completion receipts and retained defects, without retrying either", async () => {
     const { host } = makeHost();

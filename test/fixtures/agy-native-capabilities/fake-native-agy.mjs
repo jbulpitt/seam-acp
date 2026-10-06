@@ -18,7 +18,8 @@ const argValue = (flag) => {
   const index = args.indexOf(flag);
   return index >= 0 ? args[index + 1] : undefined;
 };
-const prompt = argValue("-p") ?? "";
+const submittedPrompt = argValue("-p") ?? "";
+let prompt = submittedPrompt;
 /**
  * #260: the catalog is now discovered with `agy models`, which takes no prompt.
  * Row shape is the observed one from agy 1.1.27 — `<modelId>\t<displayName>`,
@@ -60,6 +61,15 @@ if (argValue("--model") === "__seam_probe_invalid__") {
   process.exit(Number(process.env.SEAM_AGY_VALIDATOR_EXIT ?? 1));
 }
 
+const isContinuation = /^continue(?:\s|$)/.test(prompt);
+if (isContinuation && resumedConversation && invocationLog) {
+  const previous = fs.readFileSync(invocationLog, "utf8").trim().split("\n")
+    .map(line => JSON.parse(line)).findLast(row => row.conversationId === resumedConversation
+      && row.prompt && !/^continue(?:\s|$)/.test(row.prompt));
+  prompt = previous?.prompt === "r5-turn-unknown-exit-once"
+    ? "capability-turn-two" : previous?.prompt ?? prompt;
+}
+
 const scenarioFile = prompt === "ok" || isModelsCommand
   ? undefined
   : prompt.includes("capability-model-") && prompt.includes("-resume")
@@ -80,17 +90,19 @@ const scenarioFile = prompt === "ok" || isModelsCommand
           ? "interrupted-turn.json"
           : undefined;
 
-if (prompt !== "ok" && !isModelsCommand && !scenarioFile) {
-  process.stderr.write("unknown sanitized fixture prompt\n");
-  process.exit(2);
-}
-
 const trace = scenarioFile ? readJson(path.join(fixtureDir, scenarioFile)) : undefined;
 if (trace?.scenario === "turn-generated-image") {
   const imagePath = path.join(process.cwd(), "generated.png");
   fs.writeFileSync(imagePath, Buffer.from("89504e470d0a1a0a", "hex"));
   trace.updates[1].mainTrajectoryUpdate.stepsUpdate.steps[0].content =
     `Generated image is saved at ${imagePath}.`;
+}
+if (isContinuation && prompt === "capability-turn-two") {
+  // The interrupted fixture already emitted step 7; resumed work follows it.
+  for (const update of trace.updates) {
+    const steps = update.mainTrajectoryUpdate?.stepsUpdate;
+    if (steps) steps.indices = steps.indices.map(index => index >= 5 ? index + 3 : index);
+  }
 }
 const conversationId = resumedConversation ?? trace?.conversationId ??
   "22222222-2222-4222-8222-222222222222";
@@ -108,7 +120,7 @@ if (schemaFile) {
 appendInvocation({
   pid: process.pid,
   scenario: trace?.scenario ?? "catalog",
-  prompt,
+  prompt: submittedPrompt,
   conversationId,
   resumedConversation: resumedConversation ?? null,
   home: process.env.HOME ?? null,
@@ -118,6 +130,11 @@ appendInvocation({
   csrfFingerprint,
   cwd: process.cwd(),
 });
+
+if (prompt !== "ok" && !isModelsCommand && !scenarioFile) {
+  process.stderr.write("unknown sanitized fixture prompt\n");
+  process.exit(2);
+}
 
 if (process.env.SEAM_AGY_CSRF_FLAG_MODE === "unsupported" && csrfToken) {
   fs.writeSync(2, `unknown flag: --csrf_token=${csrfToken}\n`);
@@ -298,7 +315,7 @@ const server = http.createServer(async (request, response) => {
   if (request.url?.endsWith("/StreamAgentStateUpdates") && trace) {
     response.statusCode = 200;
     response.setHeader("content-type", "application/connect+json");
-    if (prompt === "r5-turn-auth-exit" || prompt === "r5-turn-unknown-exit") {
+    if (prompt === "r5-turn-auth-exit" || prompt === "r5-turn-unknown-exit" || prompt === "r5-turn-unknown-exit-once") {
       // #491: the real incident emitted a message before the nested `agy -p`
       // child exited. Keep the stream open after one real update so the child
       // exit—not a synthetic response error—is what ends the production path.

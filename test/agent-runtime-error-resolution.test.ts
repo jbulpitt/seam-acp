@@ -26,6 +26,34 @@ function fixture(error: unknown, classifyError?: AgentProfile["classifyError"], 
 }
 
 describe("#441 real runtime boundary to pure resolver (no providers)", () => {
+  it("keeps an unbound AGY failure and its reason without sending continue or replay", async () => {
+    const reason = "AGY never bound a native conversation for this prompt, so it can't be continued.";
+    const original = new RequestError(-32603, `native AGY exited_early\n${reason}`, {
+      errorKind: "unclassified", agentId: "agy", code: "exited_early", continuationUnavailable: reason,
+    });
+    const { runtime, prompt } = fixture(original, classifyAgyError, "agy");
+    await expect(runtime.prompt("original isolated brief", undefined, { recoveryScope: "ephemeral" }))
+      .rejects.toBe(original);
+    expect(prompt).toHaveBeenCalledTimes(1);
+    expect(original.message).toContain("native AGY exited_early");
+    expect(original.data).toMatchObject({ continuationUnavailable: reason });
+  });
+
+  it("continues a bound AGY session through the same runtime and ACP identity", async () => {
+    const original = new RequestError(-32603, "native AGY exited_early: unclassified", {
+      errorKind: "unclassified", agentId: "agy", exitCode: 52,
+    });
+    const { runtime, prompt } = fixture(original, classifyAgyError, "agy");
+    prompt.mockRejectedValueOnce(original).mockResolvedValue({ stopReason: "end_turn" });
+    await expect(runtime.prompt("original isolated brief", undefined, { recoveryScope: "ephemeral" }))
+      .resolves.toMatchObject({ stopReason: "end_turn" });
+    expect(prompt).toHaveBeenCalledTimes(2);
+    expect(prompt.mock.calls[1]?.[0]).toMatchObject({
+      sessionId: "dispatch:fixture-session", prompt: [{ type: "text", text: expect.stringMatching(/^continue\n/) }],
+    });
+    expect(prompt.mock.calls[1]?.[0].prompt[0].text).not.toContain("original isolated brief");
+  });
+
   it("calls the adapter and makes rate_limit a field on the thrown ACP error", async () => {
     const original = new RequestError(-32603,
       "Internal error: Server is temporarily limiting requests (not your usage limit) · Rate limited", { trace: "retained" });

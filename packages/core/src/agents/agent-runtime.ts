@@ -1519,6 +1519,7 @@ export class AgentRuntime {
           // #536/#467: unknown acceptance makes RESEND unsafe, not continue.
           // Only positive rpc_never_invoked evidence permits original replay.
           continuing = receipt.submission.acceptance.state !== "not_accepted";
+          if (continuing && errorData(error)?.continuationUnavailable) throw error;
           await this.publishSubmission(receipt.submission);
           const previousSubmissionId = receipt.submission.id;
           const sink = this.submissionSinks.get(receipt.submission);

@@ -4,6 +4,7 @@ import {
   remoteRung1Budget,
   providerRetryBackoff,
   PROVIDER_RETRY_WINDOW_MS,
+  errorData,
   sessionFailureError,
   supportsSessionFailures,
   CodexReplyGate,
@@ -383,7 +384,8 @@ export function createRung1Recovery(hooks: Rung1RecoveryHooks) {
       const error = errorForClassification(message);
       const kind = hooks.classify(slot, error);
       const shouldRetry = state.retry < state.snapshot.budget
-        && state.policy.retryableErrorKinds.includes(kind);
+        && state.policy.retryableErrorKinds.includes(kind)
+        && !errorData(error)?.continuationUnavailable;
       if (shouldRetry && scheduleContinuation(slot, state, kind, error, message)) return { forward: null };
       if (kind === "quota_exhausted") notice(slot, state.acpSessionId,
         "Paused — quota or balance exhausted", `${error.message}\nRetry after the reset or top-up; no automatic retries.`);

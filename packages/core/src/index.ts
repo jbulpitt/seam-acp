@@ -728,7 +728,8 @@ async function main(): Promise<void> {
     return createQuotaPlugin({ usage, bindings: usage.bindings, resolve: (threadId, parentId) => {
       if (!parentId) return undefined;
       const record = router.ensureSessionRecord({ platform: "discord", channelRef: threadId, parentRef: parentId, cwd: config.REPOS_ROOT });
-      return usage.binding(record.agentId, record.id, router.describeConfig(record).location.value);
+      const resolved = router.describeConfig(record);
+      return usage.binding(resolved.agent.value, record.id, resolved.location.value);
     }, card: { sendLayout: adapter.sendLayout.bind(adapter), editLayout: adapter.editLayout.bind(adapter),
       sendPanel: adapter.sendPanel.bind(adapter), editPanel: adapter.editPanel.bind(adapter),
       pinMessage: adapter.pinMessage.bind(adapter), deleteMessage: adapter.deleteMessage.bind(adapter), bumpThread: adapter.bumpThread.bind(adapter) } });

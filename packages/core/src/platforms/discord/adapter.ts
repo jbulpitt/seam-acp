@@ -1629,9 +1629,15 @@ export class DiscordAdapter implements ChatAdapter {
     }
   }
 
-  /** Display name of ANY channel (thread or parent). #52: an obfuscated
-   *  channel has no real name, so we return undefined rather than the
-   *  `___hidden___` sentinel. Never throws — the caller just omits the label. */
+  /** Resolve a thread's parent without treating a channel's category as one. */
+  async resolveChannel(channel: ChannelRef): Promise<ChannelRef> {
+    const ch = await this.client.channels.fetch(channel.id);
+    if (!ch) throw new Error(`Discord channel ${channel.id} was not found`);
+    return { platform: this.platform, id: ch.id,
+      ...(ch.isThread() && ch.parentId ? { parentId: ch.parentId } : {}) };
+  }
+
+  /** Hidden channel names and failed lookups omit the display label. */
   async getChannelName(channelId: string): Promise<string | undefined> {
     try {
       const ch = await this.client.channels.fetch(channelId);

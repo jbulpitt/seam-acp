@@ -5,6 +5,7 @@ import path from "node:path";
 import { readdir, readFile } from "node:fs/promises";
 import { pino } from "pino";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
+import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 import { dispatchDirs, type DispatchSpec } from "../packages/core/src/core/dispatch/types.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import type { SessionRecord, StructuredPanel } from "../packages/core/src/core/types.js";
@@ -100,13 +101,20 @@ function makeOrch(opts: {
 }): Orchestrator {
   const router = {
     listProfiles: () => [],
-    describeConfig: () => ({}),
+    describeConfig: (row: SessionRecord) => ({
+      agent: { value: row.agentId, source: "session config" },
+      model: { value: "default", source: "default" },
+      effort: { value: null, source: "default" },
+      location: { value: "local", source: "default" },
+      cwd: { value: row.repoPath, source: "default" },
+    }),
     ensureSessionRecord: ({ channelRef }: { channelRef: string }) =>
       record({ id: `discord:${channelRef}`, channelRef }),
     getProfile: () => undefined,
     getOrStartRuntime: async () => opts.rt,
   };
   const store = {
+    getByChannel: () => null,
     getPresetByName: () => null,
     recordDelegation: () => {},
     // #170: dispatchInjectTurn now looks the spec up by exact id before
@@ -141,6 +149,7 @@ function makeOrch(opts: {
     router: router as any,
     store: store as any,
     renderer: {} as any,
+    modelCatalog: fixtureModelCatalog([]),
   });
   if (opts.voiceConsole) orchestrator.setVoiceConsoleController(opts.voiceConsole);
   return orchestrator;

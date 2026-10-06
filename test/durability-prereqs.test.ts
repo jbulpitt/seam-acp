@@ -98,7 +98,13 @@ function makeOrch(store: SessionStore, dataDir: string): Orchestrator {
   const catalogProfile = { id: "claude", defaultModel: "claude-opus-4.8" } as any;
   const router = {
     listProfiles: () => [],
-    describeConfig: () => ({}),
+    describeConfig: (r: SessionRecord, selection: any = {}) => ({
+      agent: { value: selection.agent ?? r.agentId, source: "session config" },
+      model: { value: selection.model ?? "claude-opus-4.8", source: "default" },
+      effort: { value: selection.effort ?? null, source: "default" },
+      location: { value: selection.location ?? "local", source: "default" },
+      cwd: { value: r.repoPath ?? dataDir, source: "default" },
+    }),
     permissionOptions: () => ({}),
     reuseMcpServers: () => [],
     ensureSessionRecord: ({ channelRef }: { channelRef: string }) =>

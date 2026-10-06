@@ -207,8 +207,8 @@ describe("/seam config repo scope", () => {
 });
 
 describe("DB preset repoPath applies as cwd", () => {
-  it("upsertPreset stores repoPath and apply writes it onto the session", async () => {
-    const { orch, store } = makeOrch();
+  it("upsertPreset stores repoPath and apply pins it as the thread cwd", async () => {
+    const { orch, store, router, threadPresets } = makeOrch();
     store.upsertPreset({
       id: "p-reviewer",
       name: "reviewer",
@@ -228,10 +228,10 @@ describe("DB preset repoPath applies as cwd", () => {
       updatedUtc: "2026-01-01T00:00:00Z",
     });
     const record = {
-      id: "discord:thread-1",
+      id: `discord:${THREAD}`,
       platform: "discord",
-      channelRef: "thread-1",
-      parentRef: "chan-1",
+      channelRef: THREAD,
+      parentRef: PARENT,
       agentId: "copilot",
       acpSessionId: "old",
       repoPath: path.join(dir, "other"),
@@ -241,12 +241,15 @@ describe("DB preset repoPath applies as cwd", () => {
     };
     store.upsert(record);
     await (orch as any).applyPresetToSession(
-      { platform: "discord", id: "thread-1", parentId: "chan-1" },
+      { platform: "discord", id: THREAD, parentId: PARENT },
       record,
       store.getPreset("p-reviewer")!
     );
-    expect(store.get("discord:thread-1")?.repoPath).toBe(path.join(dir, "special"));
-    expect(store.readConfig(store.get("discord:thread-1")!).sessionCwdExplicit).toBe(true);
+    const updated = store.get(`discord:${THREAD}`)!;
+    expect(updated.repoPath).toBeNull();
+    expect(store.readConfig(updated).sessionCwdExplicit).toBeUndefined();
+    expect(threadPresets.get(THREAD)?.cwd?.value).toBe(path.join(dir, "special"));
+    expect(router.describeConfig(updated).cwd).toEqual({ value: path.join(dir, "special"), source: "thread preset" });
   });
 });
 

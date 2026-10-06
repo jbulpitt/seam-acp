@@ -25,6 +25,7 @@ import type { DispatchSpec } from "../packages/core/src/core/dispatch/types.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import type { SessionRecord } from "../packages/core/src/core/types.js";
 import type { ChannelRef, MessageRef } from "../packages/core/src/platforms/chat-adapter.js";
+import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 
 interface LogRecord {
   level: "debug" | "info" | "warn" | "error";
@@ -111,7 +112,13 @@ function makeOrch(dataDir: string, store: SessionStore, logger: Logger, fallback
   const rt = fakeRuntime(fallbackCode);
   const router = {
     listProfiles: () => [],
-    describeConfig: () => ({}),
+    describeConfig: (r: SessionRecord) => ({
+      agent: { value: r.agentId, source: "session config" },
+      model: { value: "default", source: "default" },
+      effort: { value: null, source: "default" },
+      location: { value: "local", source: "default" },
+      cwd: { value: r.repoPath, source: "session config" },
+    }),
     ensureSessionRecord: ({ channelRef }: { channelRef: string }) =>
       sessionRecord({ id: `discord:${channelRef}`, channelRef }),
     getProfile: () => undefined,
@@ -134,6 +141,7 @@ function makeOrch(dataDir: string, store: SessionStore, logger: Logger, fallback
     logger,
     config: config as never,
     adapter: spyAdapter() as never,
+    modelCatalog: fixtureModelCatalog([]),
     router: router as never,
     store: store as never,
     renderer: discordRenderer as never,

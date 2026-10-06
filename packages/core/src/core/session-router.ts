@@ -7,7 +7,7 @@ import {
 } from "@seam/adapters";
 import type { Logger } from "../lib/logger.js";
 import type { SessionStore } from "./session-store.js";
-import type { SessionRecord, PermissionPolicyMode, StatusCardStyle } from "./types.js";
+import type { SessionRecord, SessionConfigState, PermissionPolicyMode, StatusCardStyle } from "./types.js";
 import { defaultSessionConfig, resolvePermissionMode } from "./types.js";
 import { makeSessionId } from "./session-store.js";
 import { resolveChannelPreset, resolveThreadLocation } from "../config.js";
@@ -35,7 +35,7 @@ import {
   type MuxHandle,
 } from "./remote-spawn.js";
 import { bindingKey } from "./model-catalog/service.js";
-import { isLocalLocation } from "./location.js";
+import { isLocalLocation, LOCAL_LOCATION } from "./location.js";
 import { planModelFallbacks, type ModelFallbackPlan } from "./model-fallback.js";
 import type { ModelMetadataStore } from "./model-metadata/store.js";
 import { matchesContextBudget, validContextUsage } from "./context-budget.js";
@@ -290,6 +290,15 @@ export interface ConfigDescription {
    * — the live session must advertise ACP config id `fast`.
    */
   fastMode: ResolvedSetting<boolean>;
+}
+
+/** Preview inherited or explicitly selected values through the same resolver. */
+export interface ConfigResolution {
+  inherit?: boolean;
+  agent?: string;
+  model?: string;
+  effort?: string | null;
+  location?: string;
 }
 
 /** Layout the status card should render. Always `"full"` or `"simple"`. */
@@ -571,43 +580,51 @@ export class SessionRouter {
     );
   }
 
-  /**
-   * Compute the EFFECTIVE agent/model/effort/cwd/permission for a session and,
-   * for each, which layer won (channel preset vs thread preset vs session config
-   * vs bot default). Read-only. This deliberately re-derives the exact same
-   * precedence `startRuntime` applies, so the description can never drift from
-   * what actually runs — it is the single source of truth for #58 P1's
-   * `config_describe` and for the silent-no-op traps a mutation surface needs.
-   */
-  describeConfig(record: SessionRecord): ConfigDescription {
+  /** Read-only resolution shared by runtime spawning, config views and previews. */
+  describeConfig(record: SessionRecord, selection: ConfigResolution = {}): ConfigDescription {
     const chan = record.parentRef
       ? this.channelPresets.get(record.parentRef)
       : undefined;
-    const thread = this.threadPresets.get(record.channelRef);
-    const cfg = this.store.readConfig(record);
+    const thread = selection.inherit ? undefined : this.threadPresets.get(record.channelRef);
+    const preset = resolveChannelPreset(
+      { channelPresets: this.channelPresets, threadPresets: this.threadPresets },
+      record.parentRef ?? undefined,
+      selection.inherit ? undefined : record.channelRef
+    );
+    const cfg: SessionConfigState = selection.inherit ? {} : this.store.readConfig(record);
+    const previousAgent = preset.agent?.value ?? (selection.inherit ? this.defaultAgentId : record.agentId);
+    const agentChanged = selection.agent !== undefined && selection.agent !== previousAgent;
 
     // agent — preset.agent ?? record.agentId (startRuntime).
-    const agent: ResolvedSetting<string> = thread?.agent
+    const agent: ResolvedSetting<string> = selection.agent !== undefined
+      ? { value: selection.agent, source: "thread preset" }
+      : thread?.agent
       ? { value: thread.agent.value, source: "thread preset" }
       : chan?.agent
         ? { value: chan.agent.value, source: "channel preset" }
-        : { value: record.agentId, source: "session config" };
+        : selection.inherit
+          ? { value: this.defaultAgentId, source: "default" }
+          : { value: record.agentId, source: "session config" };
 
-    const locationValue = resolveThreadLocation(
+    const locationValue = selection.location ?? (selection.inherit ? LOCAL_LOCATION : resolveThreadLocation(
       { threadPresets: this.threadPresets },
       record.channelRef
-    );
+    ));
+    const channelMatchesAgent = (chan?.agent?.value ?? this.defaultAgentId) === agent.value;
+    const sessionMatchesAgent = !agentChanged && agent.value === record.agentId;
     const catalogDefault = this.modelCatalog.model(
       { agentId: agent.value, location: locationValue },
       "default"
     )?.id ?? "default";
 
     // model — preset.model ?? cfg.model ?? catalog-designated default.
-    const model: ResolvedSetting<string> = thread?.model
+    const model: ResolvedSetting<string> = selection.model !== undefined
+      ? { value: selection.model, source: "thread preset" }
+      : !agentChanged && thread?.model
       ? { value: thread.model.value, source: "thread preset" }
-      : chan?.model
+      : channelMatchesAgent && chan?.model
         ? { value: chan.model.value, source: "channel preset" }
-        : cfg.model
+        : sessionMatchesAgent && cfg.model
           ? { value: cfg.model, source: "session config" }
           : { value: catalogDefault, source: "default" };
 
@@ -622,17 +639,17 @@ export class SessionRouter {
           ? { value: channelRole, source: "channel preset" }
           : { value: null, source: "default" };
 
-    // effort — a preset effort only wins if the RESOLVED agent supports that
-    // exact level; otherwise it is dropped and cfg.reasoningEffort applies
-    // (Trap 2). Mirrors startRuntime's `presetEffortUsable` gate exactly.
+    // Unsupported preset effort falls back to the matching session or default.
     const catalogEfforts = this.modelCatalog.effortChoices(
       { agentId: agent.value, location: locationValue },
       model.value
     );
-    const presetEffort = thread?.effort ?? chan?.effort;
-    const presetEffortSource: ConfigLayer | undefined = thread?.effort
+    const presetEffort = selection.effort !== undefined
+      ? { value: selection.effort ?? "auto" }
+      : (!agentChanged ? thread?.effort : undefined) ?? (channelMatchesAgent ? chan?.effort : undefined);
+    const presetEffortSource: ConfigLayer | undefined = selection.effort !== undefined || (!agentChanged && thread?.effort)
       ? "thread preset"
-      : chan?.effort
+      : channelMatchesAgent && chan?.effort
         ? "channel preset"
         : undefined;
     const presetEffortAuto = presetEffort?.value === "auto";
@@ -651,7 +668,7 @@ export class SessionRouter {
     } else if (presetEffortUsable && presetEffort && presetEffortSource) {
       effort = { value: presetEffort.value, source: presetEffortSource };
     } else {
-      effort = cfg.reasoningEffort
+      effort = sessionMatchesAgent && cfg.reasoningEffort
         ? { value: cfg.reasoningEffort, source: "session config" }
         : { value: null, source: "default" };
       if (presetEffort?.value && !presetEffortAuto && !presetEffortUsable) {
@@ -665,7 +682,7 @@ export class SessionRouter {
     // cwd — explicit session overlay > thread preset > channel preset >
     // defaultCwd. See resolveSessionCwd (#207).
     const cwd = resolveSessionCwd({
-      repoPath: record.repoPath,
+      repoPath: selection.inherit ? null : record.repoPath,
       sessionCwdExplicit: cfg.sessionCwdExplicit === true,
       threadCwd: thread?.cwd?.value,
       channelCwd: chan?.cwd?.value,
@@ -708,7 +725,7 @@ export class SessionRouter {
         ? { value: thread.ttsStyle, source: "thread preset" }
         : { value: "neutral", source: "default" };
 
-    const location: ResolvedSetting<string> = thread?.location
+    const location: ResolvedSetting<string> = selection.location !== undefined || thread?.location
       ? { value: locationValue, source: "thread preset" }
       : { value: locationValue, source: "default" };
     const catalogLookup = this.modelCatalog.lookup({
@@ -855,7 +872,14 @@ export class SessionRouter {
   }): SessionRecord {
     const id = makeSessionId(opts.platform, opts.channelRef);
     const existing = this.store.get(id);
-    if (existing) return existing;
+    if (existing) {
+      if (!existing.parentRef && opts.parentRef) {
+        const linked = { ...existing, parentRef: opts.parentRef, updatedUtc: new Date().toISOString() };
+        this.store.upsert(linked);
+        return linked;
+      }
+      return existing;
+    }
     const record = this.previewSessionRecord(opts);
     this.store.upsert(record);
     return record;
@@ -1363,13 +1387,8 @@ export class SessionRouter {
       throw new Error("Native restoration requires Discord reconstruction before this session can run");
     }
     const location = this.bindRecordLocation(record);
-    const preset = resolveChannelPreset(
-      { channelPresets: this.channelPresets, threadPresets: this.threadPresets },
-      record.parentRef ?? undefined,
-      record.channelRef
-    );
-
-    const agentId = preset.agent?.value ?? record.agentId;
+    const described = this.describeConfig(record);
+    const agentId = described.agent.value;
     const migrationError = this.agyMigrationErrors.get(record.id);
     if (migrationError && isLocalLocation(location) && ["agy", "agy-old"].includes(agentId)) {
       throw new Error(migrationError);
@@ -1390,29 +1409,9 @@ export class SessionRouter {
       );
     }
     const cfg = this.store.readConfig(record);
-    const selectedModel = preset.model?.value ?? cfg.model ??
-      this.modelCatalog.model({ agentId, location }, "default")?.id ?? "default";
-    const catalogEfforts = this.modelCatalog.effortChoices(
-      { agentId, location },
-      selectedModel
-    );
-    // Only honor a preset effort if this agent actually supports that level —
-    // e.g. a channel preset might set "medium" but the locked agent has no
-    // effort concept at all, in which case we silently fall back instead of
-    // erroring.
-    const presetEffortAuto = preset.effort?.value === "auto";
-    const presetEffortUsable =
-      preset.effort?.value &&
-      !presetEffortAuto &&
-      catalogEfforts.includes(preset.effort.value);
-    const selectedEffort = presetEffortAuto
-      ? undefined
-      : presetEffortUsable
-        ? preset.effort!.value
-        : cfg.reasoningEffort;
     const catalogSelection = this.modelCatalog.resolve(
       { agentId, location },
-      { model: selectedModel, effort: selectedEffort }
+      { model: described.model.value, effort: described.effort.value ?? undefined }
     );
     const model = catalogSelection.raw.model;
     // Until this runtime observes usage, preserve capacity rather than guess
@@ -1431,7 +1430,6 @@ export class SessionRouter {
     // treats an absent descriptor as "this agent advertises no effort control",
     // which is the same thing we would say about an agent that has none.
     const effortDescriptor = catalogSelection.model?.effort;
-    const described = this.describeConfig(record);
     const cwd = described.cwd.value;
     // #37: never request Fast from an agent that has no such concept — that
     // would be an un-actionable refusal on every single turn. Whether the live

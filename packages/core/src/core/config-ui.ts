@@ -1,16 +1,13 @@
 import type { ChatInputCommandInteraction } from "discord.js";
-import { resolveThreadLocation, type Config } from "../config.js";
+import type { Config } from "../config.js";
 import type { Logger } from "../lib/logger.js";
 import type { ChannelRef, IncomingMessage } from "../platforms/chat-adapter.js";
-import { LOCAL_LOCATION } from "./location.js";
-import type { SessionRecord } from "./types.js";
 import type { SessionStore } from "./session-store.js";
-import { resolveSessionCwd, type SessionRouter } from "./session-router.js";
+import type { SessionRouter } from "./session-router.js";
 import type { ModelCatalogService } from "./model-catalog/service.js";
 import { CONFIG_SET_FIELD_NAMES, type ConfigApplyPlan } from "./config-apply-plan.js";
 import type { PluginHost } from "../plugins/host.js";
 import type { SlashInvocation } from "../plugins/slash-registry.js";
-import type { InheritedConfig } from "../platforms/discord/config-editor.js";
 import type { ConfigInteraction, ConfigUiPorts } from "../plugins/config-ui/ports.js";
 import type { ConfigUi } from "../plugins/config-ui/ui.js";
 
@@ -26,27 +23,6 @@ interface ConfigUiDependencies {
   repoDisplay: ConfigUiPorts["repoDisplay"];
   autocomplete(option: string): ConfigUiPorts["autocomplete"][number]["respond"] | undefined;
   interaction(i: ChatInputCommandInteraction): ConfigInteraction;
-}
-
-/** Read-only configuration projection, without a thread overlay. */
-function inheritedConfigFor(deps: ConfigUiDependencies, record: SessionRecord): InheritedConfig {
-  const { config, store, modelCatalog } = deps;
-  const chan = record.parentRef ? config.channelPresets.get(record.parentRef) : undefined;
-  const cfg = store.readConfig(record);
-  const agent = chan?.agent?.value ?? record.agentId;
-  const location = resolveThreadLocation(config, record.channelRef);
-  const model = chan?.model?.value ?? cfg.model ?? modelCatalog.model({ agentId: agent, location }, "default")?.id ?? "default";
-  const chanEffort = chan?.effort?.value;
-  const effortUsable = Boolean(chanEffort && modelCatalog.effortChoices({ agentId: agent, location: LOCAL_LOCATION }, model).includes(chanEffort));
-  return {
-    location: LOCAL_LOCATION, agent, model, effort: effortUsable ? chanEffort! : cfg.reasoningEffort ?? null,
-    cwd: resolveSessionCwd({ repoPath: record.repoPath, sessionCwdExplicit: cfg.sessionCwdExplicit === true, channelCwd: chan?.cwd?.value, defaultCwd: config.REPOS_ROOT }).value,
-    permission: (cfg.permissionPolicy ?? config.DEFAULT_PERMISSION_POLICY ?? "ask") as InheritedConfig["permission"],
-    detached: false, fastMode: false,
-    statusCardStyle: chan?.statusCardStyle?.value === "simple" || chan?.statusCardStyle?.value === "full" ? chan.statusCardStyle.value : "full",
-    simpleCardGif: typeof chan?.simpleCardGif?.value === "boolean" ? chan.simpleCardGif.value : false,
-    role: chan?.role?.value ?? null, disableThreadPrefix: chan?.disableThreadPrefix?.value === true,
-  };
 }
 
 /** Controller-only facade: expose UI snapshots and audited operations, never stores or runtimes. */
@@ -72,7 +48,14 @@ export function installConfigUi(deps: ConfigUiDependencies) {
     snapshot: channel => {
       const record = ensure(channel);
       const chan = channel.parentId ? deps.config.channelPresets.get(channel.parentId) : undefined;
-      return { desc: deps.router.describeConfig(record), withoutThread: inheritedConfigFor(deps, record), channelPins: {
+      const inherited = deps.router.describeConfig(record, { inherit: true });
+      return { desc: deps.router.describeConfig(record), withoutThread: {
+        location: inherited.location.value, agent: inherited.agent.value, model: inherited.model.value,
+        effort: inherited.effort.value, cwd: inherited.cwd.value, permission: inherited.permission.value,
+        detached: inherited.detached.value, fastMode: inherited.fastMode.value,
+        statusCardStyle: inherited.statusCardStyle.value, simpleCardGif: inherited.simpleCardGif.value,
+        role: inherited.role.value, disableThreadPrefix: inherited.disableThreadPrefix.value,
+      }, channelPins: {
         ...(chan?.agent?.value ? { agent: chan.agent.value } : {}), ...(chan?.model?.value ? { model: chan.model.value } : {}),
         ...(chan?.cwd?.value ? { cwd: chan.cwd.value } : {}), ...(chan?.effort?.value ? { effort: chan.effort.value } : {}),
         ...(chan?.role?.value ? { role: chan.role.value } : {}), ...(chan?.disableThreadPrefix?.value === true ? { disableThreadPrefix: true } : {}),

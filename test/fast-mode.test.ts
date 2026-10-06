@@ -1133,6 +1133,8 @@ function saveHarness(opts: {
       getByChannel: () => rec,
       get: () => rec,
       readConfig: () => ({}),
+      writeConfig: (value: SessionConfigState) => JSON.stringify(value),
+      upsert: (value: SessionRecord) => { Object.assign(rec, value); },
     },
     modelCatalog: fixtureModelCatalog([{
       id: "claude", defaultModel: "claude-opus-5",

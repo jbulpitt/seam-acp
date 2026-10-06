@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { pino } from "pino";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
+import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 import {
   dispatchDisplayPrompt,
   parseDispatchSpec,
@@ -79,7 +80,16 @@ function harness(dir: string) {
   const rows = new Map<string, SessionRecord>([[oldRecord.id, oldRecord]]);
   const router = {
     listProfiles: () => [],
-    describeConfig: () => ({}),
+    describeConfig: (row: SessionRecord) => {
+      const cfg = JSON.parse(row.configJson);
+      return {
+        agent: { value: row.agentId, source: "session config" },
+        model: { value: cfg.model ?? "default", source: "session config" },
+        effort: { value: cfg.reasoningEffort ?? null, source: "session config" },
+        location: { value: "local", source: "default" },
+        cwd: { value: row.repoPath, source: "default" },
+      };
+    },
     ensureSessionRecord: () => oldRecord,
     getProfile: () => undefined,
     invalidate: vi.fn(async () => {
@@ -91,6 +101,8 @@ function harness(dir: string) {
     }),
   };
   const store = {
+    getByChannel: (platform: string, channelRef: string) =>
+      [...rows.values()].find(row => row.platform === platform && row.channelRef === channelRef) ?? null,
     get: (id: string) => rows.get(id) ?? null,
     upsert: (rec: SessionRecord) => {
       rows.set(rec.id, { ...rec });
@@ -132,6 +144,7 @@ function harness(dir: string) {
     router: router as any,
     store: store as any,
     renderer: {} as any,
+    modelCatalog: fixtureModelCatalog([]),
   });
   return { orchestrator, oldRecord, newRecord, router, store, sent, log, rows };
 }

@@ -93,6 +93,9 @@ export interface ChatAdapter {
   /** Resolve a stored message's link from its actual channel. */
   getMessageLink?(channel: ChannelRef, messageId: string | null): Promise<MessageLink>;
 
+  /** Resolve a bare channel id, including its thread parent. */
+  resolveChannel?(channel: ChannelRef): Promise<ChannelRef>;
+
   /**
    * Optional: upload a file to the channel. Required for the agent → Discord
    * file path. Implementations may also send caption text alongside the file.

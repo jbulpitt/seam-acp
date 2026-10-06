@@ -75,6 +75,10 @@ function makeOrch(opts: {
   const abortTurn = opts.abortTurn ?? vi.fn(async () => "cancelled");
   const router = {
     listProfiles: () => [],
+    describeConfig: (r: SessionRecord) => ({
+      agent: { value: r.agentId, source: "session config" },
+      location: { value: "local", source: "default" },
+    }),
     ensureSessionRecord: (o: { channelRef: string; parentRef?: string }) =>
       record({
         id: `discord:${o.channelRef}`,

@@ -7008,6 +7008,9 @@ export class Orchestrator {
       }
       if (owner && !this.store.turnAttempts.isCurrent(owner)) {
         const latest = this.store.turnAttempts.get(attemptId);
+        if (latest?.state === "suspended" && latest.generation === owner.generation && latest.ownerBoot === owner.ownerBoot) {
+          throw DispatchSuspendedError.shutdown(attemptId, "shutdown interrupted provider acquisition; the next boot owns the turn");
+        }
         throw DispatchSuspendedError.superseded(attemptId,
           latest?.state === "cancelled" ? latest.outcome?.error ?? "cancelled by operator" : "another attempt generation owns this turn");
       }

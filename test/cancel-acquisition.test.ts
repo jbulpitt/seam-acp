@@ -37,9 +37,9 @@ function cancelInteraction(channelId: string, force = false, ack = Promise.resol
     commandName: "seam", channelId, user: { id: "fixture-user" },
     options: { getString: () => null, getBoolean: (name: string) => name === "force" ? force : null,
       getSubcommand: () => "cancel", getSubcommandGroup: () => null },
-    deferred: false, replied: false,
+    deferred: false, replied: false, ephemeral: false,
     deferReply: vi.fn(async () => { await ack; interaction.deferred = true; }),
-    editReply: vi.fn(async () => {}), reply: vi.fn(),
+    editReply: vi.fn(async () => {}), followUp: vi.fn(async () => {}), deleteReply: vi.fn(async () => {}), reply: vi.fn(),
   };
   return interaction;
 }
@@ -61,11 +61,12 @@ describe("cancel the acquisition owner", () => {
     await vi.waitFor(() => expect(h.host.store.turnAttempts.get(h.attempt.id)?.state).toBe("cancelled"));
     expect(interaction.deferReply).toHaveBeenCalledOnce();
     expect(interaction.editReply).not.toHaveBeenCalled();
+    expect(interaction.followUp).not.toHaveBeenCalled();
     expect(await acquisition).toMatchObject({ suspension: "superseded", reason: "cancelled by operator" });
     await vi.waitFor(() => expect(JSON.stringify(h.edits.mock.calls)).toMatch(/Failed.*Cancelled/s));
     ack.resolve();
     await cancel;
-    expect(interaction.editReply).toHaveBeenCalledWith(expect.objectContaining({
+    expect(force ? interaction.followUp : interaction.editReply).toHaveBeenCalledWith(expect.objectContaining({
       content: "🛑 Cancelled the turn while it was still starting.",
     }));
     expect(interaction.reply).not.toHaveBeenCalled();
@@ -80,7 +81,7 @@ describe("cancel the acquisition owner", () => {
     const h = await setup({ loadGate: true });
     const acquisition = h.internal.acquireRecordedRuntime(h.host.record, h.attempt.id, SAVED_SESSION)
       .catch((error: unknown) => error);
-    await vi.waitFor(async () => expect(await h.loads()).toHaveLength(1));
+    await vi.waitFor(async () => expect(await h.loads()).toHaveLength(1), { timeout: 10_000 });
     const interaction = cancelInteraction(h.host.record.channelRef);
     await h.orch.handleSlashInteraction(interaction as never);
     expect(h.host.store.turnAttempts.get(h.attempt.id)?.state).toBe("cancelled");
@@ -122,6 +123,7 @@ describe("cancel the acquisition owner", () => {
     const h = await setup();
     h.host.store.turnAttempts.cancel(h.attempt.id);
     h.internal.liveTurnByChannel.clear();
+    await vi.waitFor(() => expect(h.host.store.turnAttempts.get(h.attempt.id)?.statusCardState?.status.input.action).toBe("Cancelled"));
     const before = h.host.store.turnAttempts.get(h.attempt.id);
     const interaction = cancelInteraction(h.host.record.channelRef);
     await h.orch.handleSlashInteraction(interaction as never);

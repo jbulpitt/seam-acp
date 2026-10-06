@@ -12729,12 +12729,11 @@ export class Orchestrator {
     const target: ChannelRef = row.sessionMode !== "live" && row.targetChannel
       ? { platform: PLATFORM, id: row.targetChannel }
       : bindingThread;
-    const skip = (): void => {
+    const skip = (cause: string): void => {
       if (!owned) return;
       const a = owned.attempt;
       if (a.promptStarted) {
-        throw DispatchSuspendedError.defect(a.id,
-          "the occurrence was skipped after its prompt had already been submitted");
+        throw DispatchSuspendedError.defect(a.id, cause);
       }
       if (!this.store.turnAttempts.complete(a, { id: a.id, target: row.channelRef,
         status: "completed", output: "", finishedUtc: new Date().toISOString() })) {
@@ -12752,7 +12751,7 @@ export class Orchestrator {
       } catch (err) {
         this.logger.warn({ id, err }, "scheduled: target state check failed (transient); skipping");
         this.patchScheduledStatus(id, "skipped: target unreachable");
-        skip();
+        skip(err instanceof Error ? err.message : String(err));
         return;
       }
       if (state === undefined) {
@@ -12764,12 +12763,12 @@ export class Orchestrator {
         } else {
           this.patchScheduledStatus(id, "skipped: target deleted");
         }
-        skip();
+        skip(`target thread ${target.id} was deleted`);
         return;
       }
       if (state.locked) {
         this.patchScheduledStatus(id, "skipped: target locked");
-        skip();
+        skip(`target thread ${target.id} is locked`);
         return;
       }
     }
@@ -12857,7 +12856,7 @@ export class Orchestrator {
     });
     if (!identity.ok) {
       this.patchScheduledStatus(id, `error: ${identity.error}`);
-      skip();
+      skip(identity.error);
       return;
     }
     const { profile, agentId, cwd, model, effort } = identity;

@@ -4,7 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { pino } from "pino";
 import { describe, it, expect, vi } from "vitest";
-import { makeAgyProfile, readErrorClassification } from "@seam/adapters";
+import { classifyAndAttach, makeAgyProfile, readErrorClassification } from "@seam/adapters";
 import { AgentRuntime, type AgentEvent } from "../packages/core/src/agents/agent-runtime.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import { createManagedAgyFixture } from "./helpers/agy-runtime-fixture.js";
@@ -13,10 +13,24 @@ import { ModelCatalogStore } from "../packages/core/src/core/model-catalog/store
 
 const fixtures = fileURLToPath(new URL("./fixtures/agy-native-capabilities/", import.meta.url));
 const logger = pino({ level: "silent" }) as unknown as Logger;
-type Row = { scenario?: string; pid?: number; prompt?: string; args?: string[]; home?: string; signal?: string; mcpConfig?: unknown };
+type Row = { scenario?: string; pid?: number; prompt?: string; conversationId?: string; resumedConversation?: string | null; args?: string[]; home?: string; signal?: string; mcpConfig?: unknown };
 const alive = (pid: number): boolean => { try { process.kill(pid, 0); return true; } catch { return false; } };
 
-async function fixture(timeoutSeconds = 10, fixtureLogger: Logger = logger) {
+vi.mock("../packages/core/src/core/recovery-directive.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("../packages/core/src/core/recovery-directive.js")>();
+  return { ...actual, runBoundedRecovery: (opts: Parameters<typeof actual.runBoundedRecovery>[0]) =>
+    actual.runBoundedRecovery({ ...opts, sleep: async ms => {
+      // Advance only backoff; native process deadlines and IO stay real.
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      try {
+        const sleep = new Promise<void>(resolve => setTimeout(resolve, ms));
+        await vi.advanceTimersByTimeAsync(ms);
+        await sleep;
+      } finally { vi.useRealTimers(); }
+    } }) };
+});
+
+async function fixture(timeoutSeconds = 10, fixtureLogger: Logger = logger, terminalFailures = false) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "seam-agy-r5-"));
   const log = path.join(root, "invocations");
   const managed = createManagedAgyFixture({
@@ -28,6 +42,10 @@ async function fixture(timeoutSeconds = 10, fixtureLogger: Logger = logger) {
     printTimeoutSeconds: timeoutSeconds, exposeGlobalStaging: false,
     mcpServers: [{ type: "http", name: "must-not-inherit", url: "http://127.0.0.1:9", headers: [] }],
   });
+  if (terminalFailures) {
+    const classify = profile.classifyError!.bind(profile);
+    profile.classifyError = error => classifyAndAttach(error, { ...classify(error), errorKind: "invalid_request" });
+  }
   const runtime = new AgentRuntime({ logger: fixtureLogger, profile, spawnFn: profile.spawn.bind(profile) });
   const events: AgentEvent[] = [];
   runtime.onEvent(event => { events.push(event); });
@@ -46,6 +64,43 @@ async function fixture(timeoutSeconds = 10, fixtureLogger: Logger = logger) {
 }
 
 describe.sequential("R5 native production lifecycle", () => {
+  it("reports an unbound cold-start failure without spawning a context-free continuation", async () => {
+    const f = await fixture();
+    try {
+      const error = await f.runtime.prompt("r5-exit", undefined, { recoveryScope: "ephemeral" }).catch(error => error);
+      const turns = f.rows().filter(row => row.args?.includes("-p"));
+      expect(turns).toHaveLength(1);
+      expect(turns[0]).toMatchObject({ prompt: "r5-exit", resumedConversation: null });
+      expect(error).toMatchObject({ data: {
+        code: "exited_early",
+        continuationUnavailable: "AGY never bound a native conversation for this prompt, so it can't be continued.",
+      } });
+      expect(error.message).toContain("native AGY exited_early");
+      expect(error.message).toContain("AGY never bound a native conversation");
+      expect(f.events.some(event => event.kind === "recovery")).toBe(false);
+    } finally { await f.close(); }
+  }, 15_000);
+
+  it("continues a bound cascade in an isolated turn without replaying its brief", async () => {
+    const f = await fixture();
+    try {
+      const before = fs.readFileSync(path.join(f.root, "agy-sessions.json"), "utf8");
+      await expect(f.runtime.prompt("r5-turn-unknown-exit-once", undefined, { recoveryScope: "ephemeral" }))
+        .resolves.toMatchObject({ stopReason: "end_turn" });
+      const turns = f.rows().filter(row => row.args?.includes("-p"));
+      expect(turns).toHaveLength(2);
+      expect(turns[0]).toMatchObject({ prompt: "r5-turn-unknown-exit-once", resumedConversation: null });
+      expect(turns[1]?.prompt).toMatch(/^continue\n/);
+      expect(turns[1]?.prompt).not.toContain("r5-turn-unknown-exit-once");
+      expect(turns[1]?.resumedConversation).toBe(turns[0]?.conversationId);
+      const after = fs.readFileSync(path.join(f.root, "agy-sessions.json"), "utf8");
+      expect(Object.keys(JSON.parse(after).sessions)).toEqual(Object.keys(JSON.parse(before).sessions));
+      expect(f.events.flatMap(event => event.kind === "agent-text" ? [event.text] : []).join(""))
+        .toContain("Second result.");
+      expect(f.events.filter(event => event.kind === "recovery")).toHaveLength(1);
+    } finally { await f.close(); }
+  }, 15_000);
+
   it("#371 completes from stdout after an unauthenticated subscription and labels degradation", async () => {
     const f = await fixture();
     const log = vi.spyOn(console, "error").mockImplementation(() => {});
@@ -128,7 +183,6 @@ describe.sequential("R5 native production lifecycle", () => {
     const f = await fixture();
     const log = vi.spyOn(console, "error").mockImplementation(() => {});
     try {
-      // Assert the adapter attempt, not #448's surrounding recovery budget.
       await expect(f.runtime.prompt("r5-stream-partial", undefined, { recoveryScope: "ephemeral" })).rejects.toThrow("unauthenticated: missing CSRF token");
       const emitted = JSON.stringify(f.events);
       expect(emitted).toContain("PARTIAL STREAM");
@@ -141,7 +195,7 @@ describe.sequential("R5 native production lifecycle", () => {
 
   it.each([["r5-stream-exit", "exited_early"], ["r5-stream-overflow", "output_overflow"], ["r5-stream-hang", "timeout"]])(
     "#371 fallback retains lifecycle bounds for %s", async (prompt, code) => {
-      const f = await fixture(3);
+      const f = await fixture(3, logger, true);
       try { await expect(f.runtime.prompt(prompt, undefined, { recoveryScope: "ephemeral" })).rejects.toThrow(code); }
       finally { await f.close(); }
     }, 15_000,
@@ -331,11 +385,9 @@ describe.sequential("R5 native production lifecycle", () => {
     ["r5-oversized-frame", "output_overflow"],
     ["r5-no-ls", "timeout"],
   ])("bounds %s and keeps diagnostics out of the ACP consumer", async (prompt, code) => {
-    const f = await fixture(prompt === "r5-no-ls" ? 2 : 10);
+    const f = await fixture(prompt === "r5-no-ls" ? 2 : 10, logger, true);
     try {
       const start = Date.now();
-      // Per-attempt lifecycle bounds also protect isolated dispatches. A live
-      // conversation may now recover; its total budget is tested in #448.
       const error = await f.runtime.prompt(prompt, undefined, { recoveryScope: "ephemeral" }).then(() => "unexpected success", error => String(error));
       expect(error).toContain(code);
       expect(f.events.some(event => event.kind === "agy-stdout-fallback")).toBe(false);
@@ -468,7 +520,7 @@ describe.sequential("R5 native production lifecycle", () => {
   }, 15_000);
 
   it("bounds structured stdout before retaining it as a result", async () => {
-    const f = await fixture();
+    const f = await fixture(10, logger, true);
     try {
       await expect(f.runtime.prompt("r5-stdout", undefined, { jsonSchema: { type: "object" }, recoveryScope: "ephemeral" })).rejects.toThrow("output_overflow");
       const row = f.rows().find(row => row.prompt === "r5-stdout")!;

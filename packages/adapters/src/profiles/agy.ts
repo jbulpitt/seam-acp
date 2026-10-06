@@ -69,6 +69,7 @@ import {
   classifyWith,
   classified,
   classifiedErrorData,
+  errorData,
   readErrorClassification,
   type AdapterErrorClassification,
   type AdapterErrorKind,
@@ -1599,15 +1600,24 @@ class AgyAgent implements Agent {
     // Concurrent ACP requests must not both replace the same finished owner.
     this.active?.cancel();
     const next = this.promptTail.then(() => this.executePrompt(params)).catch((error) => {
-      if (error instanceof RequestError) throw error;
-      if (error instanceof AgySessionStoreError) {
-        throw RequestError.internalError(
+      let failure: RequestError;
+      if (error instanceof RequestError) failure = error;
+      else if (error instanceof AgySessionStoreError) {
+        failure = RequestError.internalError(
           agyData("protocol_error", { code: `session_store_${error.code}` }),
           error.message,
         );
+      } else {
+        const code = error instanceof ProbeError ? error.code : "protocol_error";
+        failure = RequestError.internalError(agyData(agyKindFromCode(code), { code }), `native AGY ${code}`);
       }
-      const code = error instanceof ProbeError ? error.code : "protocol_error";
-      throw RequestError.internalError(agyData(agyKindFromCode(code), { code }), `native AGY ${code}`);
+      const session = this.sessions.get(params.sessionId);
+      if (session && !session.cascadeId) {
+        const reason = "AGY never bound a native conversation for this prompt, so it can't be continued.";
+        failure.data = { ...errorData(failure), continuationUnavailable: reason };
+        failure.message += `\n${reason}`;
+      }
+      throw failure;
     });
     this.promptTail = next.catch(() => {});
     return next;

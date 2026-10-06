@@ -26,6 +26,19 @@ const fixtures = fileURLToPath(new URL("./fixtures/agy-native-capabilities/", im
 const logger = pino({ level: "silent" }) as unknown as Logger;
 const storeWriter = fileURLToPath(new URL("./fixtures/agy-session-store-writer.mjs", import.meta.url));
 
+vi.mock("../packages/core/src/core/recovery-directive.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("../packages/core/src/core/recovery-directive.js")>();
+  return { ...actual, runBoundedRecovery: (opts: Parameters<typeof actual.runBoundedRecovery>[0]) =>
+    actual.runBoundedRecovery({ ...opts, sleep: async ms => {
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      try {
+        const sleep = new Promise<void>(resolve => setTimeout(resolve, ms));
+        await vi.advanceTimersByTimeAsync(ms);
+        await sleep;
+      } finally { vi.useRealTimers(); }
+    } }) };
+});
+
 interface Harness {
   root: string;
   managed: ManagedAgyFixture;
@@ -333,12 +346,9 @@ describe.sequential("AGY R7 session persistence", () => {
       throw new Error("synthetic crash before atomic rename");
     });
 
-    // #448's conversation owner can make one follow-up attempt, but the
-    // adapter has retired this identity. It must NOT start another native turn.
-    // Ephemeral work reports the first failure without attempting recovery.
+    // Recovery sees the retired ACP identity; it cannot spawn another native turn.
     const failure = await failing.prompt("capability-turn-one", undefined, { recoveryScope }).catch(error => error);
-    if (recoveryScope === "ephemeral") expect(failure.message).toContain("AGY session persistence failed");
-    else expect(failure).toMatchObject({ data: { errorKind: "session_gone", details: expect.stringMatching(/unknown.*session/i) } });
+    expect(failure).toMatchObject({ data: { errorKind: "session_gone", details: expect.stringMatching(/unknown.*session/i) } });
     // The provider conversation id is committed before stream subscription;
     // if that commit fails, this one session is refused before any output can
     // be exposed while independent sessions remain available below.

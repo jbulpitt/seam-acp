@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { RequestError } from "@agentclientprotocol/sdk";
 import { classifyAgyError, classifyClaudeError, readErrorClassification, resolveError, type AgentProfile } from "@seam/adapters";
 import { AgentRuntime } from "../packages/core/src/agents/agent-runtime.js";
@@ -7,6 +7,13 @@ import type { ClaudeCredentialFacts } from "../packages/core/src/core/claude-oau
 import { DEFAULT_ERROR_RULES } from "../packages/core/src/core/error-resolution-rules.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 
+beforeEach(() => {
+  const timeout = globalThis.setTimeout;
+  vi.spyOn(globalThis, "setTimeout").mockImplementation(((fn: () => void, ms?: number) =>
+    timeout(fn, [2000, 5000, 10000].includes(ms ?? 0) ? 0 : ms)) as typeof setTimeout);
+});
+afterEach(() => vi.restoreAllMocks());
+
 function fixture(error: unknown, classifyError?: AgentProfile["classifyError"], agentId = "claude",
   bridgeHealth?: ConstructorParameters<typeof AgentRuntime>[0]["bridgeHealth"],
   claudeCredentialFacts?: () => ClaudeCredentialFacts | undefined) {
@@ -14,13 +21,39 @@ function fixture(error: unknown, classifyError?: AgentProfile["classifyError"], 
   const profile = { id: agentId, classifyError, spawn: () => { throw error; } } as unknown as AgentProfile;
   const runtime = new AgentRuntime({ profile, logger: logger as unknown as Logger, bridgeHealth, claudeCredentialFacts, spawnFn: () => { throw error; } });
   const prompt = vi.fn().mockRejectedValue(error);
-  // This suite isolates classification; prompt recovery has its own behavioral
-  // suite. Ephemeral work is the production one-attempt path, not a mock gate.
   Object.assign(runtime, { connection: { prompt, newSession: prompt, loadSession: prompt }, sessionId: "dispatch:fixture-session", promptCapabilities: {} });
   return { runtime, logger, prompt };
 }
 
 describe("#441 real runtime boundary to pure resolver (no providers)", () => {
+  it("keeps an unbound AGY failure and its reason without sending continue or replay", async () => {
+    const reason = "AGY never bound a native conversation for this prompt, so it can't be continued.";
+    const original = new RequestError(-32603, `native AGY exited_early\n${reason}`, {
+      errorKind: "unclassified", agentId: "agy", code: "exited_early", continuationUnavailable: reason,
+    });
+    const { runtime, prompt } = fixture(original, classifyAgyError, "agy");
+    await expect(runtime.prompt("original isolated brief", undefined, { recoveryScope: "ephemeral" }))
+      .rejects.toBe(original);
+    expect(prompt).toHaveBeenCalledTimes(1);
+    expect(original.message).toContain("native AGY exited_early");
+    expect(original.data).toMatchObject({ continuationUnavailable: reason });
+  });
+
+  it("continues a bound AGY session through the same runtime and ACP identity", async () => {
+    const original = new RequestError(-32603, "native AGY exited_early: unclassified", {
+      errorKind: "unclassified", agentId: "agy", exitCode: 52,
+    });
+    const { runtime, prompt } = fixture(original, classifyAgyError, "agy");
+    prompt.mockRejectedValueOnce(original).mockResolvedValue({ stopReason: "end_turn" });
+    await expect(runtime.prompt("original isolated brief", undefined, { recoveryScope: "ephemeral" }))
+      .resolves.toMatchObject({ stopReason: "end_turn" });
+    expect(prompt).toHaveBeenCalledTimes(2);
+    expect(prompt.mock.calls[1]?.[0]).toMatchObject({
+      sessionId: "dispatch:fixture-session", prompt: [{ type: "text", text: expect.stringMatching(/^continue\n/) }],
+    });
+    expect(prompt.mock.calls[1]?.[0].prompt[0].text).not.toContain("original isolated brief");
+  });
+
   it("calls the adapter and makes rate_limit a field on the thrown ACP error", async () => {
     const original = new RequestError(-32603,
       "Internal error: Server is temporarily limiting requests (not your usage limit) · Rate limited", { trace: "retained" });
@@ -36,7 +69,7 @@ describe("#441 real runtime boundary to pure resolver (no providers)", () => {
       expect.objectContaining({ agentId: "claude", errorKind: "rate_limit", operation: "session/prompt",
         errorMessage: original.message, errorCode: -32603, errorStatus: null, errorData: { trace: "retained" } }),
       "adapter error classified");
-    expect(prompt).toHaveBeenCalledTimes(1); // #426 ephemeral work does not retry.
+    expect(prompt).toHaveBeenCalledTimes(4);
   });
 
   it.each(["missing", "unrecognized", "throws"] as const)("%s classifier is attributable unclassified, not invisible", async (mode) => {
@@ -165,7 +198,7 @@ describe("#487 child-owner health precedes the recovery verdict", () => {
     expect(thrown.data.details).toContain("bridge slot 7 is alive");
     expect(resolveError(readErrorClassification(thrown)!, DEFAULT_ERROR_RULES).errorKind).toBe("protocol_error");
     expect(h.sendCmd).toHaveBeenCalledExactlyOnceWith("listSlots", {});
-    expect(h.prompt).toHaveBeenCalledTimes(1); // Ephemeral scope still never replays.
+    expect(h.prompt).toHaveBeenCalledTimes(4);
     expect(h.logger.warn).toHaveBeenCalledWith(expect.objectContaining({ errorKind: "protocol_error", operation: "session/prompt" }), "adapter error classified");
     expect(h.logger.warn).not.toHaveBeenCalledWith(expect.objectContaining({ errorKind: "agent_exit" }), "adapter error classified");
   });

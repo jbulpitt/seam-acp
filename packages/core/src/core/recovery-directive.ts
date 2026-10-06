@@ -25,10 +25,7 @@ export function buildRecoveryDirective(
   scope: RecoveryDirective["scope"],
   permittedRungs: readonly RecoveryRung[] = [1, 5],
 ): RecoveryDirective {
-  // #426/#448: refuse aggressive retries of ephemeral outward-effect work;
-  // delivery proof owns that decision. Persistent conversations keep their
-  // transcript (including tool results), so output is NOT a refusal predicate.
-  const rungs = verdict.action === "stop" || scope === "ephemeral"
+  const rungs = verdict.action === "stop"
     ? [5] as const
     : ([1, 2, 3, 4, 5] as const).filter(rung =>
       rung === 5 || (rung >= verdict.startRung && permittedRungs.includes(rung)));

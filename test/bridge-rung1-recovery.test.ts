@@ -45,6 +45,36 @@ afterEach(() => {
 });
 
 describe("#467 bridge-owned rung 1", () => {
+  it.each([false, true])("honours the adapter's bound AGY continuation result: bound=%s", async bound => {
+    vi.useFakeTimers();
+    const h = harness({ kind: "unclassified", policy: { ...policy, retryableErrorKinds: ["unclassified"] } });
+    const reason = "AGY never bound a native conversation for this prompt, so it can't be continued.";
+    const message = `native AGY exited_early${bound ? "" : `\n${reason}`}`;
+    h.recovery.arm(4, { submissionId: "agy-submission", acpSessionId: "agy-session", continuation: "continue" });
+    h.recovery.observeInput(4, line({ id: 17, method: "session/prompt", params: {
+      sessionId: "agy-session", prompt: [{ type: "text", text: "original isolated brief" }],
+    } }));
+    const error = line({ id: 17, error: { code: -32603, message, data: {
+      errorKind: "unclassified", agentId: "agy", code: "exited_early",
+      ...(!bound ? { continuationUnavailable: reason } : {}),
+    } } });
+    const decision = h.recovery.observeOutput(4, error);
+    await vi.advanceTimersByTimeAsync(25);
+    if (!bound) {
+      expect(decision.forward).toBe(error);
+      expect(h.writes).toEqual([]);
+      expect(h.results).toEqual([expect.objectContaining({ status: "failed", error: message, errorKind: "unclassified" })]);
+      expect(h.recovery.snapshot(4)?.retry).toBe(0);
+    } else {
+      expect(decision.forward).toBeNull();
+      expect(h.writes).toHaveLength(1);
+      const retry = JSON.parse(h.writes[0]!);
+      expect(retry.params).toEqual({ sessionId: "agy-session", prompt: [{ type: "text", text: "continue" }] });
+      h.recovery.observeOutput(4, line({ id: retry.id, result: { stopReason: "end_turn" } }));
+      expect(h.results).toEqual([expect.objectContaining({ status: "completed" })]);
+    }
+  });
+
   const rollout = JSON.stringify({ type: "error", error: { message: "model 'gpt-6.1-sol' is not enabled in rustponsesapi",
     type: "invalid_request_error", param: null, code: null }, status: 400 });
   function typedFailure(id: string | number, title = rollout) {

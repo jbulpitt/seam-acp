@@ -1,9 +1,9 @@
 import { EventEmitter } from "node:events";
 import { PassThrough, Readable, Writable } from "node:stream";
 import { agent, methods, ndJsonStream, PROTOCOL_VERSION, type ClientCapabilities, type SessionUpdate, type PromptResponse } from "@agentclientprotocol/sdk";
-import { classifyCodexError, classifyClaudeError, type AgentProfile } from "@seam/adapters";
+import { classifyCodexError, classifyClaudeError, providerRetryBackoff, type AgentProfile } from "@seam/adapters";
 import { pino } from "pino";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentRuntime, type AgentEvent } from "../packages/core/src/agents/agent-runtime.js";
 import { DispatchStatusPanel } from "../packages/core/src/core/dispatch-status-panel.js";
 import { TurnStatus } from "../packages/core/src/core/status-panel.js";
@@ -14,7 +14,13 @@ import { discordRenderer } from "../packages/core/src/platforms/discord/renderer
 import type { Logger } from "../packages/core/src/lib/logger.js";
 
 const cleanups: Array<() => Promise<void>> = [];
-afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
+beforeEach(() => {
+  const timeout = globalThis.setTimeout;
+  const backoff = providerRetryBackoff("overloaded")!;
+  vi.spyOn(globalThis, "setTimeout").mockImplementation(((fn: () => void, ms?: number) =>
+    timeout(fn, backoff.includes(ms ?? 0) ? 0 : ms)) as typeof setTimeout);
+});
+afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); vi.restoreAllMocks(); });
 
 async function runtime(agentId: string, updates: SessionUpdate[], response: PromptResponse = { stopReason: "end_turn" }, typed = false) {
   const stdin = new PassThrough();
@@ -26,6 +32,7 @@ async function runtime(agentId: string, updates: SessionUpdate[], response: Prom
     kill() { this.killed = true; childEvents.emit("exit", 0, null); return true; },
   });
   let capabilities: ClientCapabilities | undefined;
+  const prompts: unknown[] = [];
   const transport = agent({ name: "notice-test" })
     .onRequest(methods.agent.initialize, ({ params }) => {
       capabilities = params.clientCapabilities;
@@ -33,7 +40,8 @@ async function runtime(agentId: string, updates: SessionUpdate[], response: Prom
         ? { _meta: { jetbrains: { air: { version: 1, capabilities: ["sessionFailure"] } } } } : {}) };
     })
     .onRequest(methods.agent.session.new, () => ({ sessionId: "wire-session" }))
-    .onRequest(methods.agent.session.prompt, async ({ client }) => {
+    .onRequest(methods.agent.session.prompt, async ({ client, params }) => {
+      prompts.push(params);
       for (const update of updates) await client.notify(methods.client.session.update, { sessionId: "wire-session", update });
       return response;
     })
@@ -52,7 +60,7 @@ async function runtime(agentId: string, updates: SessionUpdate[], response: Prom
   cleanups.push(async () => { await rt.dispose(); connection.close(); stdin.destroy(); stdout.destroy(); stderr.destroy(); });
   await rt.start();
   await rt.newSession({ cwd: "/tmp" });
-  return { rt, logger, logs, capabilities };
+  return { rt, logger, logs, capabilities, prompts };
 }
 
 function injectedTurn(rt: AgentRuntime, logger: Logger, onEvent: (event: AgentEvent) => Promise<void> | void) {
@@ -81,21 +89,23 @@ describe("ACP session notices", () => {
     } } } } };
   }
 
-  it("rejects AIR's failed end_turn through the actual SDK exchange, with no error-text answer", async () => {
-    const { rt, logs } = await runtime("codex", [], failedResponse(rollout), true);
+  it("exhausts pre-update AIR retries through the actual SDK exchange, preserving the provider cause", async () => {
+    const backoff = providerRetryBackoff("overloaded")!;
+    const { rt, logs, prompts } = await runtime("codex", [], failedResponse(rollout), true);
     const events: AgentEvent[] = [];
     rt.onEvent(event => { events.push(event); });
     await expect(rt.prompt("go", undefined, { recoveryScope: "ephemeral" })).rejects.toMatchObject({
       message: rollout, data: { status: 400, errorKind: "overloaded" },
     });
     expect(events.filter(event => event.kind === "agent-text")).toEqual([]);
+    expect(prompts).toHaveLength(1 + backoff.length);
     expect(logs.find(log => log.msg === "adapter error classified")).toMatchObject({ errorKind: "overloaded",
       errorMessage: rollout, errorStatus: 400 });
   });
 
   it("splits and recognises the legacy Codex capacity answer on the actual ACP reader", async () => {
     const title = "Selected model is at capacity. Please try a different model.";
-    const { rt } = await runtime("codex", [
+    const { rt, prompts } = await runtime("codex", [
       { sessionUpdate: "agent_message_chunk", content: { type: "text", text: title.slice(0, 24) } },
       { sessionUpdate: "agent_message_chunk", content: { type: "text", text: title.slice(24) } },
     ]);
@@ -104,6 +114,7 @@ describe("ACP session notices", () => {
     await expect(rt.prompt("go", undefined, { recoveryScope: "ephemeral" })).rejects.toMatchObject({ message: title,
       data: { errorKind: "overloaded" } });
     expect(events.filter(event => event.kind === "agent-text")).toEqual([]);
+    expect(prompts).toHaveLength(1 + providerRetryBackoff("overloaded")!.length);
   });
 
   it("pauses quota with its exact notice and keeps typed auth on the existing reauth path", async () => {

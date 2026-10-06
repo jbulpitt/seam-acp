@@ -1,6 +1,7 @@
 /** #404/#448: actual prompt owner, journal-derived failures, no provider calls. */
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { classifyClaudeError, type AgentProfile } from "@seam/adapters";
+import { RequestError, type SessionUpdate } from "@agentclientprotocol/sdk";
+import { classifyClaudeError, classifyCodexError, type AgentProfile } from "@seam/adapters";
 import { AgentRuntime, type AgentEvent } from "../packages/core/src/agents/agent-runtime.js";
 import { logger } from "../packages/core/src/lib/logger.js";
 
@@ -8,14 +9,18 @@ const CONTENTION = "Failed to refresh OAuth token: another Claude Code process i
 const profile = { id: "claude", classifyError: classifyClaudeError } as unknown as AgentProfile;
 afterEach(() => vi.restoreAllMocks());
 
-function fixture(options: { output?: boolean; tool?: boolean; failures?: number; sessionId?: string; error?: Error } = {}) {
-  const runtime = new AgentRuntime({ profile, logger, spawnFn: () => { throw new Error("unused"); } });
+function fixture(options: { output?: boolean; tool?: boolean; update?: SessionUpdate; failures?: number;
+  sessionId?: string; error?: Error; codex?: boolean } = {}) {
+  const runtime = new AgentRuntime({ profile: options.codex
+    ? { id: "codex", classifyError: classifyCodexError } as unknown as AgentProfile : profile,
+    logger, spawnFn: () => { throw new Error("unused"); } });
   const events: AgentEvent[] = [];
   runtime.onEvent(event => { events.push(event); });
   let attempts = 0;
   const prompt = vi.fn(async (_request: unknown) => {
     attempts++;
     if (attempts <= (options.failures ?? 1)) {
+      if (options.update) await (runtime as any).handleSessionUpdate(options.update);
       if (options.output || options.tool) await (runtime as any).handleSessionUpdate(options.tool
         ? { sessionUpdate: "tool_call_update", toolCallId: "sent-email", status: "completed" }
         : { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "partial answer" } });
@@ -26,7 +31,7 @@ function fixture(options: { output?: boolean; tool?: boolean; failures?: number;
   Object.assign(runtime, { connection: { prompt, cancel: vi.fn() }, sessionId: options.sessionId ?? "s1", promptCapabilities: {} });
   const timeout = globalThis.setTimeout;
   vi.spyOn(globalThis, "setTimeout").mockImplementation(((fn: () => void, ms?: number) =>
-    timeout(fn, [2000, 5000, 10000].includes(ms ?? 0) ? 0 : ms)) as typeof setTimeout);
+    timeout(fn, [2000, 5000, 10000, 30000, 120000, 300000, 420000].includes(ms ?? 0) ? 0 : ms)) as typeof setTimeout);
   return { runtime, prompt, events };
 }
 
@@ -61,22 +66,69 @@ describe("#448 one bounded prompt owner", () => {
     }));
   });
 
-  it.each([false, true])("preserves the dispatch exception (output=%s)", async output => {
-    const { runtime, prompt } = fixture({ sessionId: "dispatch:outward-effect", output });
-    await expect(runtime.prompt("send email")).rejects.toThrow(/another Claude Code process/);
-    expect(prompt).toHaveBeenCalledTimes(1);
+  it.each(["prefixed", "isolated"])("retries %s pre-update auth contention with the existing schedule", async kind => {
+    const { runtime, prompt, events } = fixture({ sessionId: kind === "prefixed" ? "dispatch:fixture" : "s1", failures: 2 });
+    await expect(runtime.prompt("original brief", undefined, { recoveryScope: "ephemeral" }))
+      .resolves.toMatchObject({ stopReason: "end_turn" });
+    expect(prompt).toHaveBeenCalledTimes(3);
+    const retried = prompt.mock.calls.slice(1).map(([request]) => request as { sessionId: string; prompt: Array<{ text: string }> });
+    expect(retried.map(request => request.sessionId)).toEqual([kind === "prefixed" ? "dispatch:fixture" : "s1", kind === "prefixed" ? "dispatch:fixture" : "s1"]);
+    expect(retried.map(request => request.prompt[0]!.text)).toEqual([
+      expect.stringMatching(/^continue\n[\s\S]*retry 1 of 3/), expect.stringMatching(/^continue\n[\s\S]*retry 2 of 3/),
+    ]);
+    expect(JSON.stringify(retried)).not.toContain("original brief");
+    expect(events.filter(event => event.kind === "recovery")).toHaveLength(2);
   });
 
-  it("also protects an isolated dispatch whose provider gave it an ordinary session id", async () => {
-    const { runtime, prompt } = fixture({ output: true });
-    await expect(runtime.prompt("send email", undefined, { recoveryScope: "ephemeral" })).rejects.toThrow(/another Claude Code process/);
-    expect(prompt).toHaveBeenCalledTimes(1);
+  it("retries the measured Codex pre-update model rejection", async () => {
+    const error = new RequestError(-32603, "model 'fixture-model' is not enabled in rustponsesapi", {
+      providerResponse: { status: 400, error: { type: "invalid_request_error", message: "model 'fixture-model' is not enabled in rustponsesapi" } },
+    });
+    const { runtime, prompt } = fixture({ error, codex: true });
+    await expect(runtime.prompt("brief", undefined, { recoveryScope: "ephemeral" }))
+      .resolves.toMatchObject({ stopReason: "end_turn" });
+    expect(prompt).toHaveBeenCalledTimes(2);
+    expect((prompt.mock.calls[1]![0] as { prompt: Array<{ text: string }> }).prompt[0]!.text)
+      .toMatch(/^continue\n[\s\S]*retry 1 of 5/);
   });
 
-  it("a conversation hint cannot override a dispatch-prefixed session", async () => {
-    const { runtime, prompt } = fixture({ sessionId: "dispatch:outward-effect" });
-    await expect(runtime.prompt("send email", undefined, { recoveryScope: "conversation" })).rejects.toThrow(/another Claude Code process/);
-    expect(prompt).toHaveBeenCalledTimes(1);
+  it.each([
+    { sessionUpdate: "available_commands_update", availableCommands: [] },
+    { sessionUpdate: "session_info_update", title: "scheduled task" },
+    { sessionUpdate: "tool_call", toolCallId: "mcp_startup.failed", title: "mcp__playwright__startup", status: "failed" },
+    { sessionUpdate: "user_message_chunk", content: { type: "text", text: "brief" } },
+    { sessionUpdate: "usage_update", used: 1, size: 1_000_000 },
+  ] satisfies SessionUpdate[])("continues the isolated transcript after $sessionUpdate", async update => {
+    const { runtime, prompt } = fixture({ update });
+    await expect(runtime.prompt("brief", undefined, { recoveryScope: "ephemeral" }))
+      .resolves.toMatchObject({ stopReason: "end_turn" });
+    expect(prompt).toHaveBeenCalledTimes(2);
+    expect((prompt.mock.calls[1]![0] as { sessionId: string; prompt: Array<{ text: string }> }))
+      .toEqual({ sessionId: "s1", prompt: [{ type: "text", text: expect.stringMatching(/^continue\n/) }] });
+  });
+
+  it.each(["text", "tool"])("continues isolated work after %s without replaying the brief or completed effect", async kind => {
+    const { runtime, prompt } = fixture({ output: kind === "text", tool: kind === "tool" });
+    const effect = vi.fn();
+    const nativePrompt = prompt.getMockImplementation()!;
+    prompt.mockImplementation(async request => {
+      if (JSON.stringify(request).includes("send the email")) effect();
+      return nativePrompt(request);
+    });
+    await expect(runtime.prompt("send the email", undefined, { recoveryScope: "ephemeral" }))
+      .resolves.toMatchObject({ stopReason: "end_turn" });
+    expect(effect).toHaveBeenCalledOnce();
+    expect(prompt).toHaveBeenCalledTimes(2);
+    expect((prompt.mock.calls[1]![0] as { sessionId: string; prompt: Array<{ text: string }> }))
+      .toEqual({ sessionId: "s1", prompt: [{ type: "text", text: expect.stringMatching(/^continue\n/) }] });
+  });
+
+  it("preserves the last provider cause when isolated retries run out", async () => {
+    const cause = new Error(CONTENTION);
+    const { runtime, prompt } = fixture({ error: cause, failures: 99, output: true });
+    await expect(runtime.prompt("brief", undefined, { recoveryScope: "ephemeral" })).rejects.toBe(cause);
+    expect(prompt).toHaveBeenCalledTimes(4);
+    expect(JSON.stringify(prompt.mock.calls.slice(1))).not.toContain('"text":"brief"');
   });
 
   it("moves the cold-resume echo boundary to continue so the recovered answer is visible", async () => {
@@ -87,7 +139,8 @@ describe("#448 one bounded prompt owner", () => {
       await feed("user_message_chunk", "original brief");
       await feed("agent_message_chunk", "partial answer");
       throw new Error(CONTENTION);
-    }).mockImplementationOnce(async (request: { prompt: Array<{ text: string }> }) => {
+    }).mockImplementationOnce(async raw => {
+      const request = raw as { prompt: Array<{ text: string }> };
       await feed("user_message_chunk", request.prompt[0]!.text);
       await feed("agent_message_chunk", "recovered answer");
       return { stopReason: "end_turn" };

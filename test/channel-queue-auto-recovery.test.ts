@@ -37,6 +37,7 @@ const CHANNEL = "1543325326166196264"; // one of the three threads named in #423
 
 let dir: string;
 let store: SessionStore;
+const hosts: Orchestrator[] = [];
 
 beforeEach(async () => {
   dir = await mkdtemp(path.join(tmpdir(), "seam-423-"));
@@ -44,6 +45,8 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  // Activation creates plugin storage directories after the constructor returns.
+  await Promise.all(hosts.splice(0).map(host => host.loadPlugins()));
   vi.restoreAllMocks();
   store.close();
   await rm(dir, { recursive: true, force: true });
@@ -82,6 +85,7 @@ function makeHost(config: Record<string, unknown> = {}) {
     } as never,
     adapter: {} as never, router: router as never, store, renderer: {} as never,
   });
+  hosts.push(host);
   Object.assign(host as never, {
     tryConsumeConfigEditorRiderUpload: async () => false,
     wouldParkForOfflineBridge: () => false,

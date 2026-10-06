@@ -705,7 +705,7 @@ describe("Copilot isolated catalog probing (#234)", () => {
   it("surfaces a models.list failure and cleans up without returning a partial catalog", async () => {
     const harness = fakeCopilotSpawner({ models: modelFixtures(1), sdkError: "provider catalog unavailable" });
     await expect(probeCopilotCatalog({ spawnProcess: harness.spawnProcess,
-      timeoutMs: 1_000, cleanupTimeoutMs: 50 })).rejects.toThrow("provider catalog unavailable");
+      env: {}, timeoutMs: 1_000, cleanupTimeoutMs: 50 })).rejects.toThrow("provider catalog unavailable");
     expect(harness.active).toBe(0);
     expect(harness.closedSessions).toEqual(harness.openedSessions);
     expect(harness.listenersRemoved).toBe(true);

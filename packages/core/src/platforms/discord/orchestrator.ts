@@ -2199,25 +2199,14 @@ export class Orchestrator {
     };
   }
 
-  /**
-   * Production observer wired into DispatchWatcher. A retained recovery is not
-   * a terminal failure, but it is an explicit durable quarantine with a
-   * requester-facing notice and operator-owned resume/abandon controls.
-   *
-   * #333: only `defect` refusals arrive here now, and the refusal carries the
-   * reason. The old text — "is stalled after restart" — described WHERE
-   * execution stopped, which was the same sentence for all 65 throw sites and
-   * told the operator nothing they could act on. `stalled_reason` now records
-   * the specific cause, which is also what makes the Phase 4 distribution
-   * measurable at all.
-   */
+  /** Publish the retained cause with current actions, or settle Cancel-only work. */
   async observeRetainedDispatch(spec: DispatchSpec, err?: DispatchSuspendedError): Promise<void> {
     const reason = err?.reason
       ?? this.store.turnAttempts.get(spec.id)?.stalledReason
       ?? RETAINED_WITHOUT_REASON;
     this.store.turnAttempts.markStalled(spec.id, reason);
     const stalled = this.store.turnAttempts.get(spec.id);
-    if (stalled?.state !== "suspended" || !stalled.stalledUtc || stalled.stallNoticeUtc) return;
+    if (stalled?.state !== "suspended" || !stalled.stalledUtc) return;
     const requester = spec.returnTo ?? spec.originThreadRef ?? spec.target;
     await this.postParkedTurnNotice(requester, stalled,
       `⚠️ Dispatch \`${spec.id}\` to <#${spec.target}> is parked: ${reason}.`
@@ -3502,7 +3491,7 @@ export class Orchestrator {
     } catch (err) {
       const a = scheduledAttempt ? this.store.turnAttempts.get(scheduledAttempt.id)
         : msg.messageId ? this.store.turnAttempts?.get(inboundAttemptId(msg.messageId)) : null;
-      if (a?.state === "suspended" && a.stalledUtc && !a.stallNoticeUtc && !isAwaitingReauth(a.stalledReason)) {
+      if (a?.state === "suspended" && a.stalledUtc && !isAwaitingReauth(a.stalledReason)) {
         await this.notifyParkedTurn(a).catch(noticeErr => this.logger.warn({ err: noticeErr, attempt: a.id }, "parked-turn notice failed"));
       }
       // Only this still-current invocation can prove its setup failed before
@@ -19573,7 +19562,7 @@ export class Orchestrator {
   }
 
   private async notifyParkedTurn(attempt: TurnAttempt): Promise<void> {
-    if (attempt.state !== "suspended" || !attempt.stalledUtc || attempt.stallNoticeUtc || isAwaitingReauth(attempt.stalledReason)) return;
+    if (attempt.state !== "suspended" || !attempt.stalledUtc || isAwaitingReauth(attempt.stalledReason)) return;
     await this.postParkedTurnNotice(attempt.spec.target, attempt,
       `⚠️ Turn \`${attempt.id}\` is parked: ${attempt.stalledReason}.`);
     this.store.turnAttempts.markStallNoticeDelivered(attempt.id);
@@ -19582,10 +19571,17 @@ export class Orchestrator {
   private async postParkedTurnNotice(channelRef: string, attempt: TurnAttempt, body: string): Promise<(MessageLink & { messageId: string }) | undefined> {
     const current = (await this.collectInterruptedRows(attempt.spec.target)).find(item => item.id === attempt.id);
     const actions = current ? interruptedRowActions(current) : [];
+    const notices = this.store.listOpenChoiceCards(PLATFORM, channelRef).filter(card =>
+      card.options.some(option => parkedTurnAction(option.payload)?.attemptId === attempt.id));
     if (actions.length === 1 && actions[0] === "cancel" && !isAwaitingReauth(attempt.stalledReason)) {
       const cause = [attempt.stalledReason, current?.resumeRefusal].filter((value, index, values) => value && values.indexOf(value) === index).join("; ");
       const message = `🚫 Cancelled ${attempt.source === "dispatch" ? "dispatch" : "turn"} \`${attempt.id}\`: ${cause}.${attempt.promptStarted ? "" : " The prompt was never sent."}`;
       if (!this.store.turnAttempts.cancel(attempt.id, message, attempt.source !== "dispatch")) return;
+      for (const notice of notices) {
+        if (this.store.cancelChoiceCard(notice.id, channelRef)) {
+          await this.refreshChoiceCard(this.store.getChoiceCard(notice.id)!);
+        }
+      }
       if (attempt.source === "dispatch") {
         const cancelled = this.store.turnAttempts.get(attempt.id)!;
         await this.dispatchWatcher?.publishAdoptedResult(attempt.id, cancelled.outcome!);
@@ -19608,15 +19604,26 @@ export class Orchestrator {
       body += "\nUse Resume or `/seam workflows resume:<id>` to continue under the thread's current configuration, or Cancel.";
     }
     if (!this.adapter.sendChoiceCard || !actions.length || isAwaitingReauth(attempt.stalledReason)) {
+      if (attempt.stallNoticeUtc) return;
       const { id: messageId, ...ref } = await this.adapter.sendMessage({ platform: PLATFORM, id: channelRef }, body);
       return { ...ref, messageId };
     }
+    const spec = parkedTurnChoiceSpec(attempt.id, body, {
+      resume: workflowActionLabel("resume", current!, new Date()), cancel: workflowActionLabel("cancel", current!, new Date()),
+    }, actions);
+    // A notice timestamp cannot deduplicate a card whose availability changed.
+    if (notices.some(card => card.body === body && card.options.length === actions.length
+      && card.options.every((option, index) => option.kind === "prompt"
+        && option.payload === spec.options[index]!.payload
+        && option.label.startsWith(actions[index] === "resume" ? "Resume " : "Cancel ")))) return;
+    for (const notice of notices) {
+      if (this.store.cancelChoiceCard(notice.id, channelRef)) {
+        await this.refreshChoiceCard(this.store.getChoiceCard(notice.id)!);
+      }
+    }
     const record = this.store.getByChannel(PLATFORM, channelRef)
       ?? this.router.ensureSessionRecord({ platform: PLATFORM, channelRef, cwd: this.config.REPOS_ROOT });
-    const now = new Date();
-    const posted = await this.publishChoiceCard(record, parkedTurnChoiceSpec(attempt.id, body, {
-      resume: workflowActionLabel("resume", current!, now), cancel: workflowActionLabel("cancel", current!, now),
-    }, actions));
+    const posted = await this.publishChoiceCard(record, spec);
     if (!posted.ok) throw new Error(posted.error);
     return posted;
   }

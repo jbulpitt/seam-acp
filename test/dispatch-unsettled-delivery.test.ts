@@ -235,7 +235,7 @@ describe("#419 the trap: unsettled completions are reachable by an operator", ()
     expect(row.status).toBe("interrupted");
     expect(row.targetRef).toBeNull();
     expect(row.reason).toMatch(/output retained, ages out after one hour without claiming delivery/);
-    expect(interruptedRowActions(row)).toEqual(["abandon"]);
+    expect(interruptedRowActions(row)).toEqual(["cancel"]);
   });
 
   it("maps a settled attempt the way it always did, and a delivered one not at all", async () => {
@@ -253,7 +253,7 @@ describe("#419 the trap: unsettled completions are reachable by an operator", ()
     expect(interruptedRowForCompletedAttempt(store.get("done")!)).toBeNull();
   });
 
-  it("an unsettled row is offered Abandon and NOT Resume", async () => {
+  it("an unsettled row is offered Cancel and NOT Resume", async () => {
     // The `/seam workflows` inventory decides controls from `status` and
     // `targetRef` (#159). An unsettled completion must be "interrupted"
     // (actionable) with a null targetRef (no Resume) — marking it "abandoned"
@@ -268,8 +268,8 @@ describe("#419 the trap: unsettled completions are reachable by an operator", ()
       targetRef: null,
       reason: "completed without a delivery disposition; output retained, ages out after one hour without claiming delivery",
     };
-    // Abandon offered, Resume withheld — the precise control set.
-    expect(interruptedRowActions(row)).toEqual(["abandon"]);
+    // Cancel offered, Resume withheld — the precise control set.
+    expect(interruptedRowActions(row)).toEqual(["cancel"]);
 
     // And it lands in the ACTIONABLE section, not the inert one. Listing it as
     // inert would show the trap and still give no way out.

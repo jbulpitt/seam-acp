@@ -94,10 +94,10 @@ async function blockChannelRename(h: Awaited<ReturnType<typeof fixture>>) {
 }
 
 describe("configuration scope through the real dispatcher", () => {
-  it("renders a parent command result while a sibling rename is still pending", async () => {
+  it.each([false, true])("renders a role command result before naming (thread scope:channel = %s)", async isThread => {
     const h = await fixture();
     const naming = await blockChannelRename(h);
-    const i = h.native("role", { value: "qa" });
+    const i = h.native("role", { value: "qa", ...(isThread ? { scope: "channel" } : {}) }, isThread);
     const running = h.orchestrator.handleSlashInteraction(i as never);
     try {
       await vi.waitFor(() => {
@@ -111,7 +111,7 @@ describe("configuration scope through the real dispatcher", () => {
     } finally {
       naming.release();
       await running;
-      await h.orchestrator.flushIdentityEffects();
+      await h.orchestrator.flushIdentityEffects(`discord:${THREAD}`);
     }
     expect(naming.finished()).toBe(true);
   });
@@ -139,7 +139,7 @@ describe("configuration scope through the real dispatcher", () => {
     } finally {
       naming.release();
       await running;
-      await h.orchestrator.flushIdentityEffects();
+      await h.orchestrator.flushIdentityEffects(`discord:${THREAD}`);
     }
     expect(naming.finished()).toBe(true);
   });
@@ -157,7 +157,7 @@ describe("configuration scope through the real dispatcher", () => {
     ));
     expect(JSON.stringify(i.editReply.mock.calls)).toContain("Channel default updated");
     expect(h.config.channelPresets.get(PARENT)?.role?.value).toBe("qa");
-    await h.orchestrator.flushIdentityEffects();
+    await h.orchestrator.flushIdentityEffects(`discord:${THREAD}`);
   });
 
   const direct = [

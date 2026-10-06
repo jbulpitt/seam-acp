@@ -399,9 +399,7 @@ export async function probeCodexAccountRateLimits(
       if (!usage || (!usage.primary && !usage.secondary && !usage.credits)) {
         throw new Error("Codex account/rateLimits/read returned no rate-limit data");
       }
-      const accountId = nonEmptyString(result?.accountId);
       return { ...usage,
-        ...(accountId ? { credentialProfile: credentialDigest("account", accountId) } : {}),
         source: { kind: "live", host: os.hostname(), observedAt: new Date().toISOString() },
       };
     },
@@ -784,19 +782,15 @@ export function makeCodexProfile(opts: {
     id: profileId,
     displayName: opts.displayName ?? "OpenAI Codex",
     defaultModel: opts.defaultModel,
-    ...(directCodex ? { async accountUsage(mode: "live" | "snapshot", signal?: AbortSignal): Promise<CodexUsageData> {
-      const account = codexCredentialProfile(codexHome, runtime.env);
-      if (mode === "snapshot") {
-        return { ...await fetchCodexUsage({ sessionsRoot, signal }), credentialProfile: account };
-      }
+    ...(directCodex ? { async accountUsage(signal?: AbortSignal): Promise<CodexUsageData> {
       try {
-        const data = await probeCodexAccountRateLimits(runtime, signal);
-        return { ...data, credentialProfile: data.credentialProfile ?? account };
+        return await probeCodexAccountRateLimits(runtime, signal);
       } catch (error) {
         if (signal?.aborted || (error instanceof ProbeError && error.code === "cancelled")) throw error;
-        return { ok: false, plan: null, primary: null, secondary: null, credits: null,
-          credentialProfile: account, error: redactProbeText(errorText(error), runtime.env),
-          source: { kind: "live", host: os.hostname(), observedAt: null },
+        const liveError = redactProbeText(errorText(error), runtime.env);
+        const snapshot = await fetchCodexUsage({ sessionsRoot, signal });
+        return { ...snapshot, liveError,
+          ...(!snapshot.ok ? { error: `${liveError}; ${snapshot.error}` } : {}),
         };
       }
     } } : {}),

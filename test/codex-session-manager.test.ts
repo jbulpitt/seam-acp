@@ -416,7 +416,7 @@ describe("fetchCodexUsage", () => {
     expect(d.error).toBeTruthy();
   });
 
-  it("uses the observation timestamp even when an older snapshot's file was touched more recently", async () => {
+  it("keeps the local snapshot's event timestamp when its file was touched more recently", async () => {
     const write = (filename: string, timestamp: string, usedPercent: number) => {
       const file = path.join(root, filename);
       fs.writeFileSync(file, JSON.stringify({timestamp, payload: {type: "token_count", rate_limits: {
@@ -429,7 +429,7 @@ describe("fetchCodexUsage", () => {
     fs.utimesSync(stale, 2000000000, 2000000000);
     fs.utimesSync(fresh, 1900000000, 1900000000);
     const data = await fetchCodexUsage({sessionsRoot: root});
-    expect(data.primary?.usedPercent).toBe(1);
-    expect(data.source?.observedAt).toBe("2026-10-06T00:05:00.000Z");
+    expect(data.primary?.usedPercent).toBe(100);
+    expect(data.source?.observedAt).toBe("2026-10-05T23:04:00.000Z");
   });
 });

@@ -27,7 +27,6 @@ import {
   hostEmoji,
   installAgentLocationDeny,
   isAgentLocationDenied,
-  isLocalLocation,
   withoutDeniedBindings,
   LOCAL_LOCATION,
   setAgentLocationDeny,
@@ -724,18 +723,6 @@ async function main(): Promise<void> {
     const { createQuotaPlugin } = await import("./plugins/quota/index.js");
     const usage = createUsageProviderPort({ profiles: router.listProfiles(), agyRuntime, grokCliPath: config.GROK_CLI_PATH,
       ollamaUsageCliPath: config.OLLAMA_USAGE_CLI_PATH, ollamaCloudEnabled: config.OLLAMA_CLOUD_ENABLED,
-      codexLocations: () => ["local", ...(bridgeHub?.listConnected() ?? [])
-        .filter(bridge => bridge.agents.get("codex")?.installed).map(bridge => bridge.bridgeId)],
-      codexAccount: location => modelCatalog.lookup({ agentId: "codex", location }).snapshot?.candidate.scope.credentialProfile,
-      readCodexHost: async (location, mode, signal) => {
-        if (signal?.aborted) throw signal.reason;
-        if (isLocalLocation(location)) {
-          if (!codex?.accountUsage) throw new Error("Codex account usage is unavailable on the controller host");
-          return codex.accountUsage(mode, signal);
-        }
-        if (!bridgeHub) throw new Error("bridge hub is not ready");
-        return await bridgeHub.rpc(location, "accountUsage", { mode }, "codex", { timeoutMs: mode === "live" ? 20_000 : 10_000 }) as import("@seam/adapters").CodexUsageData;
-      },
       liveRequest: id => { const runtime = router.getRuntime(id); return runtime ? (method, params) => runtime.request(method, params) : undefined; } });
     return createQuotaPlugin({ usage, bindings: usage.bindings, resolve: (threadId, parentId) => {
       if (!parentId) return undefined;

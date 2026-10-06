@@ -287,8 +287,8 @@ export interface AgentAdapter {
     newerThanMs?: number
   ): Promise<ContextUsage | null>;
 
-  /** Host-owned account quota, independent of session context usage. */
-  accountUsage?(mode: "live" | "snapshot", signal?: AbortSignal): Promise<CodexUsageData>;
+  /** Account quota, independent of session context usage. */
+  accountUsage?(signal?: AbortSignal): Promise<CodexUsageData>;
 
   /**
    * Host → control-plane file ferry for `seam-attach` (§4.2). Local stub:

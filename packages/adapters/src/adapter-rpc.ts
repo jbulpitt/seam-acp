@@ -90,9 +90,6 @@ export async function invokeAdapterRpc(
         str(p.sessionId),
         typeof p.newerThanMs === "number" ? p.newerThanMs : undefined
       );
-    case "accountUsage":
-      if (!adapter?.accountUsage) throw new Error(`Agent '${adapter?.id}' does not expose account usage`);
-      return adapter.accountUsage(p.mode === "snapshot" ? "snapshot" : "live");
     case "cloneSession": {
       if (!adapter) throw new Error("no adapter for cloneSession");
       const oldSessionId = str(p.oldSessionId);

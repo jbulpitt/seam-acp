@@ -450,7 +450,6 @@ export interface CodexUsageData {
   secondary: CodexRateWindow | null;
   credits: { hasCredits: boolean; unlimited: boolean; balance: string } | null;
   error?: string;
-  credentialProfile?: string;
   source?: { kind: "live" | "rollout"; host: string; observedAt: string | null };
   liveError?: string;
 }
@@ -547,15 +546,11 @@ async function readLastCodexRateLimits(
       const mapped = mapCodexRateLimits(payload.rate_limits);
       if (mapped) {
         const timestamp = parseMs(entry.timestamp);
-        const candidate = {
+        found = {
           ...mapped,
           source: { kind: "rollout" as const, host: os.hostname(),
             observedAt: timestamp === undefined ? null : new Date(timestamp).toISOString() },
         };
-        const previousAt = Date.parse(found?.source?.observedAt ?? "");
-        if (!found || !Number.isFinite(previousAt) || (timestamp !== undefined && timestamp >= previousAt)) {
-          found = candidate;
-        }
       }
     }
     rl.close();
@@ -615,10 +610,8 @@ async function collectCodexUsageFiles(
 }
 
 /**
- * Read codex's account rate limits — the same data the codex CLI `/status`
- * shows (plan, primary/secondary windows with used% + reset, credits). Rate
- * File mtime bounds the candidate set; the rate-limit event timestamp chooses
- * the newest observation. Reading a file does not make its snapshot current.
+ * Read the final account rate-limit event from the first recent rollout with data.
+ * Reading a file does not make its snapshot current.
  */
 export async function fetchCodexUsage(opts?: {
   sessionsRoot?: string;
@@ -657,16 +650,11 @@ export async function fetchCodexUsage(opts?: {
     withMtime.sort((a, b) => b.m - a.m);
 
     // Bound the scan: the newest handful almost always has fresh limits.
-    let newest: CodexUsageData | null = null;
     for (const { f } of withMtime.slice(0, CODEX_USAGE_RECENT_FILE_LIMIT)) {
       throwIfCodexUsageAborted(opts?.signal);
       const usage = await readLastCodexRateLimits(f, opts?.signal);
-      if (!usage) continue;
-      const at = Date.parse(usage.source?.observedAt ?? "");
-      const previousAt = Date.parse(newest?.source?.observedAt ?? "");
-      if (!newest || (!Number.isFinite(previousAt) && Number.isFinite(at)) || at > previousAt) newest = usage;
+      if (usage) return usage;
     }
-    if (newest) return newest;
     return empty("no rate-limit data in recent codex sessions");
   } catch (err) {
     if (opts?.signal?.aborted) throwIfCodexUsageAborted(opts.signal);

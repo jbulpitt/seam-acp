@@ -3,8 +3,6 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { makeCodexProfile, probeCodexAccountRateLimits } from "../packages/adapters/src/profiles/codex.js";
-import { dispatchBridgeRpc } from "../packages/bridge/src/rpc.js";
-import type { CodexUsageData } from "../packages/adapters/src/profiles/codex-session-manager.js";
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
@@ -57,7 +55,6 @@ describe("Codex prompt-free live account usage", () => {
     expect(data).toMatchObject({ ok: true, plan: "pro", primary: {usedPercent: 7, windowMinutes: 10080, resetsAt: 456}, secondary: null,
       source: {kind: "live", host: os.hostname()} });
     expect(Date.parse(data.source!.observedAt!)).toBeGreaterThan(0);
-    expect(data.credentialProfile).toMatch(/^account-[a-f0-9]{24}$/);
     expect(f.events().filter(event => event.event === "request").map(event => event.method))
       .toEqual(["initialize", "initialized", "account/rateLimits/read"]);
     expect(f.events()[0].args).toEqual(["cli", "app-server"]);
@@ -88,11 +85,10 @@ describe("Codex prompt-free live account usage", () => {
     expect(() => process.kill(f.events()[0].pid, 0)).toThrow();
   });
 
-  it("routes account reads independently of session context usage and preserves configured account state", async () => {
+  it("reads live limits through the configured profile instead of its stale local rollout", async () => {
     const f = fixture();
     const home = path.join(f.root, "state");
     fs.mkdirSync(path.join(home, "sessions"), {recursive: true});
-    fs.writeFileSync(path.join(home, "auth.json"), JSON.stringify({tokens: {account_id: "fixture-account"}}));
     fs.writeFileSync(path.join(home, "sessions", "fixture.jsonl"), JSON.stringify({timestamp: "2026-10-06T00:00:00Z", payload: {
       type: "token_count", rate_limits: {plan_type: "pro", primary: {used_percent: 100, window_minutes: 10080, resets_at: 456}},
     }}) + "\n");
@@ -100,13 +96,50 @@ describe("Codex prompt-free live account usage", () => {
       CODEX_HOME: home, OPENAI_API_KEY: "", CODEX_API_KEY: "", QUOTA_CALLS: f.runtime.env.QUOTA_CALLS, QUOTA_MODE: "ok",
     }});
     const contextUsage = vi.spyOn(profile.sessionManager!, "getUsage");
-    const context = {adapters: new Map([["codex", profile]]), workspaceRoot: f.root, cwd: f.root};
-    const live = await dispatchBridgeRpc("accountUsage", {}, "codex", context) as CodexUsageData;
-    const snapshot = await dispatchBridgeRpc("accountUsage", {mode: "snapshot"}, "codex", context) as typeof live;
+    const live = await profile.accountUsage!();
     expect(live.primary?.usedPercent).toBe(7);
-    expect(snapshot.primary?.usedPercent).toBe(100);
-    expect(snapshot.source).toMatchObject({kind: "rollout", observedAt: "2026-10-06T00:00:00.000Z"});
-    expect(snapshot.credentialProfile).toBe(live.credentialProfile);
+    expect(live.source).toMatchObject({kind: "live", host: os.hostname()});
     expect(contextUsage).not.toHaveBeenCalled();
+  });
+
+  it("falls back to the existing local snapshot with its original time and the live failure cause", async () => {
+    const f = fixture("error");
+    const home = path.join(f.root, "state");
+    fs.mkdirSync(path.join(home, "sessions"), {recursive: true});
+    fs.writeFileSync(path.join(home, "sessions", "fixture.jsonl"), JSON.stringify({timestamp: "2026-10-06T00:00:00Z", payload: {
+      type: "token_count", rate_limits: {plan_type: "pro", primary: {used_percent: 100, window_minutes: 10080, resets_at: 456}},
+    }}) + "\n");
+    const profile = makeCodexProfile({defaultModel: "fixture", cliPath: f.runtime.executable, extraEnv: {
+      CODEX_HOME: home, OPENAI_API_KEY: "", CODEX_API_KEY: "", QUOTA_CALLS: f.runtime.env.QUOTA_CALLS, QUOTA_MODE: "error",
+    }});
+    const snapshot = await profile.accountUsage!();
+    expect(snapshot.ok).toBe(true);
+    expect(snapshot.primary?.usedPercent).toBe(100);
+    expect(snapshot.source).toEqual({kind: "rollout", host: os.hostname(), observedAt: "2026-10-06T00:00:00.000Z"});
+    expect(snapshot.liveError).toContain("provider: Authentication required");
+    expect(f.events().at(-1).event).toBe("exit");
+  });
+
+  it("reports both live and local snapshot causes when neither read succeeds", async () => {
+    const f = fixture("error");
+    const profile = makeCodexProfile({defaultModel: "fixture", cliPath: f.runtime.executable, extraEnv: {
+      CODEX_HOME: path.join(f.root, "empty"), OPENAI_API_KEY: "", CODEX_API_KEY: "",
+      QUOTA_CALLS: f.runtime.env.QUOTA_CALLS, QUOTA_MODE: "error",
+    }});
+    const data = await profile.accountUsage!();
+    expect(data.ok).toBe(false);
+    expect(data.error).toContain("provider: Authentication required");
+    expect(data.error).toContain("no rate-limit data in recent codex sessions");
+  });
+
+  it("propagates owner cancellation instead of returning a fallback", async () => {
+    const f = fixture();
+    const profile = makeCodexProfile({defaultModel: "fixture", cliPath: f.runtime.executable, extraEnv: {
+      CODEX_HOME: f.root, OPENAI_API_KEY: "", CODEX_API_KEY: "", QUOTA_CALLS: f.runtime.env.QUOTA_CALLS, QUOTA_MODE: "ok",
+    }});
+    const controller = new AbortController();
+    controller.abort(new Error("owner cancelled"));
+    await expect(profile.accountUsage!(controller.signal)).rejects.toThrow("owner cancelled");
+    expect(fs.existsSync(path.join(f.root, "calls.jsonl"))).toBe(false);
   });
 });

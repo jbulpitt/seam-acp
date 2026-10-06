@@ -865,7 +865,11 @@ export class SessionRouter {
    * Get (or start) the runtime for a session. Honors the per-session creation
    * lock and the post-failure cooldown.
    */
-  async getOrStartRuntime(record: SessionRecord, recovery?: { resumeSessionId: string }): Promise<AgentRuntime> {
+  async getOrStartRuntime(
+    record: SessionRecord,
+    recovery?: { resumeSessionId: string },
+    beforeCache?: () => void,
+  ): Promise<AgentRuntime> {
     if (this.pendingRuntimeTransitions.has(record.id) && !this.runtimes.get(record.id)?.busy) {
       await this.applyPendingRuntimeTransition(record.id);
       Object.assign(record, this.store.get(record.id) ?? record);
@@ -898,7 +902,7 @@ export class SessionRouter {
     const retiring = this.retirements.get(record.id);
     if (retiring) {
       await retiring;
-      return this.getOrStartRuntime(record, recovery);
+      return this.getOrStartRuntime(record, recovery, beforeCache);
     }
 
     const cached = this.runtimes.get(record.id);
@@ -926,11 +930,19 @@ export class SessionRouter {
     }
 
     const promise = this.startRuntime(record, recovery).then(
-      (rt) => {
-        this.runtimes.set(record.id, rt);
-        this.creationLocks.delete(record.id);
-        this.lastStartFailure.delete(record.id);
-        return rt;
+      async (rt) => {
+        try {
+          // A cancelled acquisition may finish loading, but must not become a warm runtime.
+          beforeCache?.();
+          this.runtimes.set(record.id, rt);
+          this.lastStartFailure.delete(record.id);
+          return rt;
+        } catch (err) {
+          await rt.dispose();
+          throw err;
+        } finally {
+          this.creationLocks.delete(record.id);
+        }
       },
       (err) => {
         this.creationLocks.delete(record.id);

@@ -4155,7 +4155,10 @@ export class Orchestrator {
       const resumeSessionId = priorHuman?.acpSessionId || record.acpSessionId;
       let activeRuntime = resumeSessionId
         ? await this.acquireRecordedRuntime(record, priorHuman?.id ?? liveMarkerId, priorHuman?.acpSessionId ?? undefined)
-        : await this.router.getOrStartRuntime(record);
+        : await this.router.getOrStartRuntime(record, undefined, () => {
+            const refusal = humanRefusal();
+            if (refusal) throw refusal;
+          });
       contextIdentity = this.contextBudgetIdentity(record, activeRuntime.getSessionInfo()?.sessionId);
       if (!contextIdentity || !matchesContextBudget(observedContextBudget, contextIdentity)) observedContextBudget = undefined;
       this.assertQueueFence(queueFence);
@@ -6998,12 +7001,27 @@ export class Orchestrator {
   ): Promise<AgentRuntime> {
     let budget: number | undefined;
     let started: number | undefined;
+    const owner = this.store.turnAttempts?.get(attemptId);
+    const assertCurrent = (): void => {
+      if (this.restartCutoff) {
+        throw DispatchSuspendedError.shutdown(attemptId, "shutdown interrupted provider acquisition; the next boot owns the turn");
+      }
+      if (owner && !this.store.turnAttempts.isCurrent(owner)) {
+        const latest = this.store.turnAttempts.get(attemptId);
+        throw DispatchSuspendedError.superseded(attemptId,
+          latest?.state === "cancelled" ? latest.outcome?.error ?? "cancelled by operator" : "another attempt generation owns this turn");
+      }
+    };
     for (let attempt = 1; ; attempt++) {
+      assertCurrent();
       try {
-        return await (resumeSessionId
-          ? this.router.getOrStartRuntime(record, { resumeSessionId })
-          : this.router.getOrStartRuntime(record));
+        const runtime = await (resumeSessionId
+          ? this.router.getOrStartRuntime(record, { resumeSessionId }, assertCurrent)
+          : this.router.getOrStartRuntime(record, undefined, assertCurrent));
+        assertCurrent();
+        return runtime;
       } catch (err) {
+        assertCurrent();
         const classification = readErrorClassification(err);
         if (classification?.errorKind === "session_gone") {
           const lostSessionId = resumeSessionId ?? record.acpSessionId;
@@ -7021,7 +7039,8 @@ export class Orchestrator {
             acpSessionId: "", updatedUtc: new Date().toISOString(),
           });
           this.store.upsert(record);
-          return this.router.getOrStartRuntime(record);
+          assertCurrent();
+          return this.router.getOrStartRuntime(record, undefined, assertCurrent);
         }
         if (!isRetryableBootAcquisitionError(err)) {
           throw err;
@@ -7042,12 +7061,18 @@ export class Orchestrator {
           { attemptId, attempt, backoffMs, err },
           "live turn: transient boot recovery acquisition failed; retrying recorded session",
         );
-        await this.recoverySleep(backoffMs);
-        if (this.restartCutoff) {
-          throw DispatchSuspendedError.shutdown(
-            attemptId,
-            "shutdown interrupted boot-recovery backoff; the next boot owns the turn",
-          );
+        let unsubscribe: (() => void) | undefined;
+        const cancelled = new Promise<void>(resolve => {
+          unsubscribe = this.store.turnAttempts?.onSettled?.(id => {
+            if (id === attemptId && this.store.turnAttempts.get(id)?.state === "cancelled") resolve();
+          });
+        });
+        try {
+          assertCurrent();
+          await Promise.race([this.recoverySleep(backoffMs), cancelled]);
+          assertCurrent();
+        } finally {
+          unsubscribe?.();
         }
         if (provider && Date.now() - started >= PROVIDER_RETRY_WINDOW_MS) throw new BootAcquisitionExhaustedError(attempt, err);
       }
@@ -14569,12 +14594,14 @@ export class Orchestrator {
     // unambiguous. dispose()/invalidate() MUST leave them intact — SIGTERM
     // also converges on dispose, and wiping there would make resume a
     // silent no-op on every graceful reboot.
-    await this.clearTurnMarkersForChannel(record.channelRef, "cancelled");
+    const cancelled = await this.clearTurnMarkersForChannel(record.channelRef, "cancelled");
     const outcome = await this.router.abortTurn(record.id, { force: false });
     const queue = this.inspectChannelQueue(record.channelRef);
     await replyToInteraction(i,
       outcome === "idle"
-        ? parked
+        ? cancelled.cancelled
+          ? `🛑 ${cancelled.starting ? "Cancelled the turn while it was still starting." : "Turn cancelled."}${parked ? " Also cancelled the queued prompt." : ""}`
+          : parked
           ? this.parkedCancelMessage(parked)
           : queue.state === "wedged"
             ? `No ACP turn is active, but the channel queue is wedged with ${queue.queued} durable item(s). An admin can run \`/seamadmin recover thread:${record.channelRef} mode:auto\`.`
@@ -14601,11 +14628,14 @@ export class Orchestrator {
     await this.voiceConsoleControl?.cancelBindingSpeech(record.channelRef).catch((err) =>
       this.logger.warn({ err, channelRef: record.channelRef }, "force cancel binding speech failed")
     );
+    const parked = await this.clearParkedForChannel(record.channelRef);
+    const cancelled = await this.clearTurnMarkersForChannel(record.channelRef, "cancelled");
     if (!this.router.hasRuntime(record.id)) {
-      const parked = await this.clearParkedForChannel(record.channelRef);
       const queue = this.inspectChannelQueue(record.channelRef);
       await replyToInteraction(i, {
-        content: parked
+        content: cancelled.cancelled
+          ? `🛑 ${cancelled.starting ? "Cancelled the turn while it was still starting." : "Turn cancelled."}${parked ? " Also cancelled the queued prompt." : ""}`
+          : parked
           ? this.parkedCancelMessage(parked)
           : queue.state === "wedged"
             ? `No ACP runtime is active, but the channel queue is wedged with ${queue.queued} durable item(s). Force-cancel cannot discard them; use \`/seamadmin recover thread:${record.channelRef} mode:auto\`.`
@@ -14617,16 +14647,13 @@ export class Orchestrator {
       return;
     }
 
-    // #89 D8: drop the parked row BEFORE abort so turn-end fire cannot run it.
-    const parked = await this.clearParkedForChannel(record.channelRef);
-    // #76: command-layer clear — see cmdCancel. abortTurn may invalidate →
-    // dispose; markers must already be terminal before that runs.
-    await this.clearTurnMarkersForChannel(record.channelRef, "cancelled");
     const outcome = await this.router.abortTurn(record.id, { force: true });
     const parkedNote = parked ? ` ${this.parkedCancelMessage(parked)}` : "";
     await replyToInteraction(i,
       outcome === "idle"
-        ? parked
+        ? cancelled.cancelled
+          ? `🛑 ${cancelled.starting ? "Cancelled the turn while it was still starting." : "Turn cancelled."}${parkedNote}`
+          : parked
           ? this.parkedCancelMessage(parked)
           : "No active turn."
         : outcome === "killed"
@@ -14676,19 +14703,28 @@ export class Orchestrator {
     channelRef: string,
     status: "cancelled",
     opts?: { preserveDispatch?: boolean; cancelLiveOnly?: boolean }
-  ): Promise<void> {
+  ): Promise<{ cancelled: boolean; starting: boolean }> {
+    let cancelled = false;
+    let starting = false;
     const liveId = this.liveTurnByChannel.get(channelRef);
     const liveDispatchId = this.activeLiveDispatch.get(channelRef);
     if (opts?.cancelLiveOnly) {
       const attemptId = liveDispatchId ?? liveId;
-      if (attemptId) this.store.turnAttempts.cancel(attemptId);
+      if (attemptId) {
+        const attempt = this.store.turnAttempts.get(attemptId);
+        cancelled = this.store.turnAttempts.cancel(attemptId);
+        starting = cancelled && attempt?.promptStarted === false;
+      }
     } else if (!opts?.preserveDispatch) {
       for (const state of ["active", "suspended"] as const) {
         for (const a of this.store.turnAttempts?.list(state) ?? []) {
           // A normal user turn replaces the active live schedule, not an
           // independent isolated occurrence or a schedule still queued behind it.
           if (a.source === "schedule" && (a.spec.session === "isolated" || this.liveTurnByChannel.get(channelRef) !== a.id)) continue;
-          if (a.spec.target === channelRef) this.store.turnAttempts.cancel(a.id);
+          if (a.spec.target === channelRef && this.store.turnAttempts.cancel(a.id)) {
+            cancelled = true;
+            starting ||= !a.promptStarted;
+          }
         }
       }
     }
@@ -14707,20 +14743,24 @@ export class Orchestrator {
       }).catch((err) =>
         this.logger.warn({ err, id: m.id }, "live-turn marker cancel failed")
       );
+      if (!this.store.turnAttempts?.get(m.id)) cancelled = true;
     }
     if (opts?.cancelLiveOnly && liveDispatchId) {
-      await this.dispatchWatcher
+      const settled = await this.dispatchWatcher
         ?.cancelRunning({ id: liveDispatchId })
         .catch((err) =>
           this.logger.warn({ err, channelRef, dispatch: liveDispatchId }, "active dispatch cancellation failed")
         );
+      cancelled = Boolean(settled?.length) || cancelled;
     } else if (!opts?.preserveDispatch) {
-      await this.dispatchWatcher
+      const settled = await this.dispatchWatcher
         ?.cancelRunning({ target: channelRef })
         .catch((err) =>
           this.logger.warn({ err, channelRef }, "dispatch cancelRunning failed")
         );
+      cancelled = Boolean(settled?.length) || cancelled;
     }
+    return { cancelled, starting };
   }
 
   /** `/seam cancel scope:all` — finalize every live marker and running spec. */

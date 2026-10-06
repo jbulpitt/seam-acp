@@ -82,7 +82,7 @@ export async function probeCopilotModelContexts(options: {
           buffer = buffer.subarray(length);
           length = undefined;
           if (response.id !== 1) continue;
-          if (response.error) throw new Error(`Copilot models.list: ${response.error.message ?? JSON.stringify(response.error)}`);
+          if (response.error) throw new Error(response.error.message ?? JSON.stringify(response.error));
           return copilotModelContexts(response.result, options.requestedTier);
         }
       }

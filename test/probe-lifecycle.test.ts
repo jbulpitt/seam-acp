@@ -438,6 +438,7 @@ describe("#236 bounded probe lifecycle", () => {
       leaky,
       `process.stderr.write("dumping env: SUPER_SECRET_TOKEN=" + process.env.SUPER_SECRET_TOKEN + "\\n");\n` +
       `process.stderr.write("also sk-live_abcdefghijklmnop and alex@example.com\\n");\n` +
+      `process.stderr.write("models.list: provider catalog unavailable; transport=disconnected\\n");\n` +
       `process.exit(7);\n`
     );
     let seen = "";
@@ -460,6 +461,7 @@ describe("#236 bounded probe lifecycle", () => {
       expect(text).not.toContain("sk-live_abcdefghijklmnop");
       expect(text).not.toContain("alex@example.com");
       expect(text).toContain("[redacted]");
+      expect(text).toContain("models.list: provider catalog unavailable; transport=disconnected");
     }
   });
 

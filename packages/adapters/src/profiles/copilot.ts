@@ -24,6 +24,7 @@ import type { SessionSummary } from "../session-manager.js";
 import {
   readCopilotSessionSummaries,
   readCopilotTranscript,
+  rewriteCopilotClone,
   type CopilotSessionRow,
   type CopilotTurnRow,
 } from "./copilot-session-store.js";
@@ -715,14 +716,17 @@ export function makeCopilotProfile(opts: {
 
           const oldSubDir = path.join(sessionStateDir, oldSessionId);
           const newSubDir = path.join(sessionStateDir, newSessionId);
+          let stat: fs.Stats;
           try {
-            const stat = await fsp.stat(oldSubDir);
-            if (stat.isDirectory()) {
-              await fsp.mkdir(newSubDir, { recursive: true });
-              await fsp.cp(oldSubDir, newSubDir, { recursive: true });
-            }
-          } catch {
-            // ignore
+            stat = await fsp.stat(oldSubDir);
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+            throw error;
+          }
+          if (stat.isDirectory()) {
+            await fsp.mkdir(newSubDir, { recursive: true });
+            await fsp.cp(oldSubDir, newSubDir, { recursive: true });
+            await rewriteCopilotClone(oldSubDir, newSubDir, newSessionId, cwd);
           }
         } finally {
           db.close();

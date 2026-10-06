@@ -133,4 +133,45 @@ describe("Copilot Session Manager", () => {
       { sender: "agent", text: "hi there" }
     ]);
   });
+
+  it.each([true, false])("clones native identity and cwd without changing history; indexed=%s", async indexed => {
+    const source = path.join(tempDir, "session-state", "session-123");
+    const target = path.join(tempDir, "session-state", "session-456");
+    const cwd = '/workspace/repo $&: "cloned"';
+    const workspace = 'id: session-123\ncwd: /workspace/repo\nname: |-\n  Source context\nclient_name: github/acp\n';
+    const messages = [
+      JSON.stringify({ id: "start", parentId: null, type: "session.start",
+        data: { sessionId: "session-123", context: { cwd: "/workspace/repo", branch: "main" } } }),
+      JSON.stringify({ id: "user", parentId: "start", type: "user.message",
+        data: { content: "Remember session-123 and /workspace/repo exactly." } }),
+      JSON.stringify({ id: "agent", parentId: "user", type: "assistant.message", data: { content: "Remembered." } }),
+      JSON.stringify({ id: "checkpoint", parentId: "agent", type: "session.compaction_complete",
+        data: { checkpointPath: path.join(source, "checkpoints", "1.md"), success: true } }),
+    ];
+    fs.mkdirSync(path.join(source, "checkpoints"), { recursive: true });
+    fs.writeFileSync(path.join(source, "workspace.yaml"), workspace);
+    fs.writeFileSync(path.join(source, "events.jsonl"), messages.join("\n") + "\n");
+    fs.writeFileSync(path.join(source, "checkpoints", "1.md"), "Retained source context");
+    if (!indexed) {
+      const db = new Database(path.join(tempDir, "session-store.db"));
+      db.prepare("DELETE FROM turns WHERE session_id = ?").run("session-123");
+      db.prepare("DELETE FROM sessions WHERE id = ?").run("session-123");
+      db.close();
+    }
+
+    await manager.cloneSession(cwd, "session-123", "session-456");
+
+    expect(fs.readFileSync(path.join(target, "workspace.yaml"), "utf8")).toBe(
+      `id: "session-456"\ncwd: ${JSON.stringify(cwd)}\nname: |-\n  Source context\nclient_name: github/acp\n`
+    );
+    const clonedLines = fs.readFileSync(path.join(target, "events.jsonl"), "utf8").trimEnd().split("\n");
+    expect(JSON.parse(clonedLines[0]!)).toEqual({ id: "start", parentId: null, type: "session.start",
+      data: { sessionId: "session-456", context: { cwd, branch: "main" } } });
+    expect(clonedLines.slice(1, 3)).toEqual(messages.slice(1, 3));
+    expect(JSON.parse(clonedLines[3]!)).toMatchObject({ id: "checkpoint", parentId: "agent",
+      data: { checkpointPath: path.join(target, "checkpoints", "1.md") } });
+    expect(fs.readFileSync(path.join(target, "checkpoints", "1.md"), "utf8")).toBe("Retained source context");
+    expect(fs.readFileSync(path.join(source, "workspace.yaml"), "utf8")).toBe(workspace);
+    expect(fs.readFileSync(path.join(source, "events.jsonl"), "utf8")).toBe(messages.join("\n") + "\n");
+  });
 });

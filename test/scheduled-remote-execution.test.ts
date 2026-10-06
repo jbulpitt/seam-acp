@@ -1,5 +1,5 @@
 /** #466: real scheduled runner + injectTurn + ACP, synthetic execution boundaries only. */
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -24,6 +24,11 @@ const MODEL = "synthetic-exact-model";
 const OVERRIDE_MODEL = "synthetic-override-model";
 const silent = pino({ level: "silent" }) as any;
 const cleanups: Array<() => void> = [];
+beforeEach(() => {
+  const timeout = globalThis.setTimeout;
+  vi.spyOn(globalThis, "setTimeout").mockImplementation(((fn: () => void, ms?: number) =>
+    timeout(fn, [2000, 5000, 10000].includes(ms ?? 0) ? 0 : ms)) as typeof setTimeout);
+});
 afterEach(() => { for (const cleanup of cleanups.splice(0).reverse()) cleanup(); vi.restoreAllMocks(); });
 
 function setup(location = REMOTE) {
@@ -154,7 +159,9 @@ describe("#487 production remote construction paths", () => {
   it("consults the live bridge before scheduled occurrence recovery and only then cleans up", async () => {
     const h = setup(); h.afterText.mockImplementation(failAfterText);
     await h.make().runScheduledPrompt(h.row.id);
-    expect(h.calls.prompts).toHaveLength(1); // The ladder's ephemeral exception is unchanged.
+    expect(h.calls.prompts).toHaveLength(4);
+    expect(h.calls.prompts.every(prompt => prompt.sessionId === "scheduled-acp")).toBe(true);
+    expect(h.calls.prompts.slice(1).every(prompt => prompt.prompt[0].text.startsWith("continue\n"))).toBe(true);
     expect(h.mux.sendCmd).toHaveBeenCalledExactlyOnceWith("listSlots", {});
     expect(h.logs).toContainEqual(expect.objectContaining({ msg: "bridge slot health consulted before exit classification", slot: 0, alive: true }));
     expect(h.logs).toContainEqual(expect.objectContaining({ msg: "adapter error classified", errorKind: "protocol_error" }));
@@ -335,7 +342,14 @@ describe("#466 scheduled execution boundary", () => {
   it("recovers the same remote occurrence and recorded session with continue, never replacement work", async () => {
     const h = setup(); simulateRetiredOwnerProcess();
     const first = h.make(), key = scheduledOccurrenceKey(h.row.id);
-    h.onPrompt.mockImplementationOnce(async () => { first.suspendForRestart(); throw new Error("interrupted"); });
+    h.onPrompt.mockImplementationOnce(async () => {
+      first.suspendForRestart();
+      const child = h.calls.children[0];
+      child.killed = true;
+      child.exitCode = 1;
+      child.emit("exit", 1, null);
+      await new Promise(resolve => setTimeout(resolve, 10));
+    });
     await first.runScheduledPrompt(h.row.id, key);
     expect(h.store.turnAttempts.get(key.id)).toMatchObject({ state: "suspended", acpSessionId: "scheduled-acp", promptStarted: true });
     expect(h.hub.rpc).not.toHaveBeenCalled();

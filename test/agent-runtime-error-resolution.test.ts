@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { RequestError } from "@agentclientprotocol/sdk";
 import { classifyAgyError, classifyClaudeError, readErrorClassification, resolveError, type AgentProfile } from "@seam/adapters";
 import { AgentRuntime } from "../packages/core/src/agents/agent-runtime.js";
@@ -7,6 +7,11 @@ import type { ClaudeCredentialFacts } from "../packages/core/src/core/claude-oau
 import { DEFAULT_ERROR_RULES } from "../packages/core/src/core/error-resolution-rules.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 
+beforeEach(() => {
+  const timeout = globalThis.setTimeout;
+  vi.spyOn(globalThis, "setTimeout").mockImplementation(((fn: () => void, ms?: number) =>
+    timeout(fn, [2000, 5000, 10000].includes(ms ?? 0) ? 0 : ms)) as typeof setTimeout);
+});
 afterEach(() => vi.restoreAllMocks());
 
 function fixture(error: unknown, classifyError?: AgentProfile["classifyError"], agentId = "claude",
@@ -16,9 +21,6 @@ function fixture(error: unknown, classifyError?: AgentProfile["classifyError"], 
   const profile = { id: agentId, classifyError, spawn: () => { throw error; } } as unknown as AgentProfile;
   const runtime = new AgentRuntime({ profile, logger: logger as unknown as Logger, bridgeHealth, claudeCredentialFacts, spawnFn: () => { throw error; } });
   const prompt = vi.fn().mockRejectedValue(error);
-  const timeout = globalThis.setTimeout;
-  vi.spyOn(globalThis, "setTimeout").mockImplementation(((fn: () => void, ms?: number) =>
-    timeout(fn, [2000, 5000, 10000].includes(ms ?? 0) ? 0 : ms)) as typeof setTimeout);
   Object.assign(runtime, { connection: { prompt, newSession: prompt, loadSession: prompt }, sessionId: "dispatch:fixture-session", promptCapabilities: {} });
   return { runtime, logger, prompt };
 }
@@ -168,7 +170,7 @@ describe("#487 child-owner health precedes the recovery verdict", () => {
     expect(thrown.data.details).toContain("bridge slot 7 is alive");
     expect(resolveError(readErrorClassification(thrown)!, DEFAULT_ERROR_RULES).errorKind).toBe("protocol_error");
     expect(h.sendCmd).toHaveBeenCalledExactlyOnceWith("listSlots", {});
-    expect(h.prompt).toHaveBeenCalledTimes(1);
+    expect(h.prompt).toHaveBeenCalledTimes(4);
     expect(h.logger.warn).toHaveBeenCalledWith(expect.objectContaining({ errorKind: "protocol_error", operation: "session/prompt" }), "adapter error classified");
     expect(h.logger.warn).not.toHaveBeenCalledWith(expect.objectContaining({ errorKind: "agent_exit" }), "adapter error classified");
   });

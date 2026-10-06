@@ -3,7 +3,7 @@ import { PassThrough, Readable, Writable } from "node:stream";
 import { agent, methods, ndJsonStream, PROTOCOL_VERSION, type ClientCapabilities, type SessionUpdate, type PromptResponse } from "@agentclientprotocol/sdk";
 import { classifyCodexError, classifyClaudeError, providerRetryBackoff, type AgentProfile } from "@seam/adapters";
 import { pino } from "pino";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentRuntime, type AgentEvent } from "../packages/core/src/agents/agent-runtime.js";
 import { DispatchStatusPanel } from "../packages/core/src/core/dispatch-status-panel.js";
 import { TurnStatus } from "../packages/core/src/core/status-panel.js";
@@ -14,6 +14,12 @@ import { discordRenderer } from "../packages/core/src/platforms/discord/renderer
 import type { Logger } from "../packages/core/src/lib/logger.js";
 
 const cleanups: Array<() => Promise<void>> = [];
+beforeEach(() => {
+  const timeout = globalThis.setTimeout;
+  const backoff = providerRetryBackoff("overloaded")!;
+  vi.spyOn(globalThis, "setTimeout").mockImplementation(((fn: () => void, ms?: number) =>
+    timeout(fn, backoff.includes(ms ?? 0) ? 0 : ms)) as typeof setTimeout);
+});
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); vi.restoreAllMocks(); });
 
 async function runtime(agentId: string, updates: SessionUpdate[], response: PromptResponse = { stopReason: "end_turn" }, typed = false) {
@@ -84,10 +90,7 @@ describe("ACP session notices", () => {
   }
 
   it("exhausts pre-update AIR retries through the actual SDK exchange, preserving the provider cause", async () => {
-    const timeout = globalThis.setTimeout;
     const backoff = providerRetryBackoff("overloaded")!;
-    vi.spyOn(globalThis, "setTimeout").mockImplementation(((fn: () => void, ms?: number) =>
-      timeout(fn, backoff.includes(ms ?? 0) ? 0 : ms)) as typeof setTimeout);
     const { rt, logs, prompts } = await runtime("codex", [], failedResponse(rollout), true);
     const events: AgentEvent[] = [];
     rt.onEvent(event => { events.push(event); });
@@ -102,7 +105,7 @@ describe("ACP session notices", () => {
 
   it("splits and recognises the legacy Codex capacity answer on the actual ACP reader", async () => {
     const title = "Selected model is at capacity. Please try a different model.";
-    const { rt } = await runtime("codex", [
+    const { rt, prompts } = await runtime("codex", [
       { sessionUpdate: "agent_message_chunk", content: { type: "text", text: title.slice(0, 24) } },
       { sessionUpdate: "agent_message_chunk", content: { type: "text", text: title.slice(24) } },
     ]);
@@ -111,6 +114,7 @@ describe("ACP session notices", () => {
     await expect(rt.prompt("go", undefined, { recoveryScope: "ephemeral" })).rejects.toMatchObject({ message: title,
       data: { errorKind: "overloaded" } });
     expect(events.filter(event => event.kind === "agent-text")).toEqual([]);
+    expect(prompts).toHaveLength(1 + providerRetryBackoff("overloaded")!.length);
   });
 
   it("pauses quota with its exact notice and keeps typed auth on the existing reauth path", async () => {

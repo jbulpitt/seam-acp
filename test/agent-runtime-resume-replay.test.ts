@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { AgentRuntime, type AgentEvent } from "../packages/core/src/agents/agent-runtime.js";
 import type { AgentProfile } from "@seam/adapters";
 import { logger } from "../packages/core/src/lib/logger.js";
@@ -93,6 +93,7 @@ describe("AgentRuntime resume-replay suppression", () => {
   beforeEach(() => {
     h = makeRuntime();
   });
+  afterEach(() => vi.restoreAllMocks());
 
   it("variant B (replay as prompt preamble): emits ONLY the live turn", async () => {
     // loadSession itself emits nothing — this wrapper replays on the first prompt.
@@ -255,11 +256,15 @@ describe("AgentRuntime resume-replay suppression", () => {
   });
 
   it("cold resume whose turn ERRORS (RPC rejects) also drops the held buffer (#64/#67)", async () => {
+    const timeout = globalThis.setTimeout;
+    vi.spyOn(globalThis, "setTimeout").mockImplementation(((fn: () => void, ms?: number) =>
+      timeout(fn, [2000, 5000, 10000].includes(ms ?? 0) ? 0 : ms)) as typeof setTimeout);
+    const prompt = vi.spyOn(h.conn, "prompt");
     await h.rt.loadSession({ sessionId: "s9", cwd: "/tmp" });
     h.conn.promptShouldReject = true;
     h.conn.promptUpdates = [agentChunk("STALE held content before the crash.")];
-    // Exercise abnormal teardown of one attempt, not the #448 retry budget.
     await expect(h.rt.prompt(PROMPT, undefined, { recoveryScope: "ephemeral" })).rejects.toBeTruthy();
+    expect(prompt).toHaveBeenCalledTimes(4);
     // No stopReason ever resolved ⇒ treated as abnormal ⇒ buffer dropped.
     expect(h.agentText()).toEqual([]);
   });

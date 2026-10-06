@@ -80,7 +80,7 @@ describe("Codex prompt-free live account usage", () => {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(new Error("fixture quota cancelled")), 250);
     try {
-      await expect(probeCodexAccountRateLimits(f.runtime, controller.signal)).rejects.toThrow(/fixture quota cancelled/);
+      await expect(probeCodexAccountRateLimits(f.runtime, controller.signal)).rejects.toMatchObject({name: "ProbeError", code: "cancelled"});
     } finally { clearTimeout(timer); }
     expect(() => process.kill(f.events()[0].pid, 0)).toThrow();
   });
@@ -139,7 +139,7 @@ describe("Codex prompt-free live account usage", () => {
     }});
     const controller = new AbortController();
     controller.abort(new Error("owner cancelled"));
-    await expect(profile.accountUsage!(controller.signal)).rejects.toThrow("owner cancelled");
+    await expect(profile.accountUsage!(controller.signal)).rejects.toMatchObject({name: "ProbeError", code: "cancelled"});
     expect(fs.existsSync(path.join(f.root, "calls.jsonl"))).toBe(false);
   });
 });

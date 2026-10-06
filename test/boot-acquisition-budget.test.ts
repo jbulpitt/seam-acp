@@ -6,6 +6,20 @@ import { classifyAndAttach, classifyCodexError } from "@seam/adapters";
 import { negotiateReauth, ReauthParked } from "../packages/core/src/core/reauth-negotiation.js";
 
 describe("#448 acquisition owner outcome", () => {
+  it("gives the observed writer collision the long retry schedule and a plain parked cause", async () => {
+    const error = new RequestError(-32603, "Internal error", {
+      details: "thread 01a0e0f0-6fe1-7f70-9c3f-db1325e4a455 already has an active writer",
+    });
+    classifyAndAttach(error, classifyCodexError(error));
+    const stderr = Object.assign(new Error(`${error.message}\nagent stderr (last lines):\n[bridge] adapter agy loaded`, { cause: error }), { data: error.data });
+    expect(isRetryableBootAcquisitionError(stderr)).toBe(true);
+    expect(bootRecoveryBackoff(stderr)).toEqual(providerRetryBackoff("overloaded")!.map(delay => Math.max(30_000, delay)));
+    expect(bootRecoveryBackoff(stderr)).toHaveLength(5);
+    const exhausted = new BootAcquisitionExhaustedError(6, stderr);
+    await expect(new DispatchAcquisitionPhase("writer", "execution").acquire(async () => { throw exhausted; }))
+      .rejects.toMatchObject({ suspension: "defect", reason: "Codex was still attached to this session from the previous turn" });
+  });
+
   it("does not retry or replace Codex's exact production auth error with an acquisition defect", async () => {
     const error = new RequestError(-32000, "Authentication required", null);
     classifyAndAttach(error, classifyCodexError(error));

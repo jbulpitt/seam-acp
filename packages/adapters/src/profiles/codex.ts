@@ -51,6 +51,11 @@ function matchCodexError(ctx: ClassifyContext): AdapterErrorClassification | Ada
   if (ctx.errorCode === -32000 && message === "Authentication required") {
     return classified(agentId, "auth_required", { details: message });
   }
+  if (ctx.errorCode === -32603 && message === "Internal error"
+    && typeof data?.details === "string"
+    && /^thread [a-z0-9-]+ already has an active writer$/i.test(data.details)) {
+    return classified(agentId, "overloaded", { sourceKind: "active_writer", details: data.details });
+  }
   const response = data?.providerResponse ?? providerResponse(message) ?? (data?.type === "error" ? data : undefined);
   const provider = response && typeof response === "object"
     ? (response as { error?: { type?: unknown; message?: unknown; code?: unknown }; status?: unknown }) : undefined;

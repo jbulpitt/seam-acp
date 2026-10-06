@@ -121,6 +121,24 @@ describe("#440 journal corpus — Claude", () => {
 });
 
 describe("#440 journal corpus — Codex", () => {
+  it("classifies the production session/load writer collision for same-session retry", () => {
+    const details = "thread 01a0e0f0-6fe1-7f70-9c3f-db1325e4a455 already has an active writer";
+    const err = requestError("Internal error", { details });
+    expect(classifyAndAttach(err, classifyCodexError(err))).toMatchObject({
+      agentId: "codex", errorKind: "overloaded", sourceKind: "active_writer", details,
+    });
+    expect(err.code).toBe(-32603);
+    expect(err.message).toBe("Internal error");
+  });
+
+  it.each([
+    [-32000, "Internal error", "thread saved-session already has an active writer"],
+    [-32603, "Other error", "thread saved-session already has an active writer"],
+    [-32603, "Internal error", "a tool mentioned already has an active writer"],
+  ])("does not infer a writer collision from another response: %s, %s", (code, message, details) => {
+    expectKind(classifyCodexError(requestError(message as string, { details }, code as number)), "unclassified", "codex");
+  });
+
   it("classifies the production session/load -32000 Authentication required response", () => {
     // Production 2026-10-05 12:16Z: codex-acp session/load, data null.
     const err = requestError("Authentication required", null, -32000);

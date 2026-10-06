@@ -38,6 +38,21 @@ process.stdin.on("data", (chunk) => {
         }, 20);
       } else reply();
     } else if (message.method === "session/load") {
+      if (process.env.FAKE_AGENT_WRITER_LOCK) {
+        let writer;
+        try { writer = JSON.parse(fs.readFileSync(process.env.FAKE_AGENT_WRITER_LOCK, "utf8")); } catch {}
+        let alive = false;
+        if (writer && writer.pid !== process.pid) {
+          try { process.kill(writer.pid, 0); alive = true; } catch {}
+        }
+        if (alive && writer.session === message.params.sessionId) {
+          send({ id: message.id, error: { code: -32603, message: "Internal error", data: {
+            details: `thread ${message.params.sessionId} already has an active writer`,
+          } } });
+          continue;
+        }
+        fs.writeFileSync(process.env.FAKE_AGENT_WRITER_LOCK, JSON.stringify({ pid: process.pid, session: message.params.sessionId }));
+      }
       if (process.env.FAKE_AGENT_MISSING_SESSION === message.params.sessionId) {
         const details = `no rollout found for session ${message.params.sessionId}`;
         process.stderr.write(`${details}\n`);

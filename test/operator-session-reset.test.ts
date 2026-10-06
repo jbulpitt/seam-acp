@@ -133,7 +133,7 @@ describe("#580 operator session replacement", () => {
     // Removing the warning projection would turn a preserved failure into silent limbo.
     expect(sendMessage).toHaveBeenCalledWith(
       { platform: "discord", id: "worker" },
-      expect.stringContaining("could not resume: runtime disappeared")
+      expect.stringContaining("is parked: runtime disappeared")
     );
   });
 

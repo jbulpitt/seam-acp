@@ -82,6 +82,45 @@ function rewriteAsLegacy(store: SessionStore, id: string, legacy = "a".repeat(64
 }
 
 describe("#252 actual isolated scheduler + injectTurn, synthetic transport", () => {
+  it("detaches a bridge-owned live schedule at restart cutoff without posting a parked notice", async () => {
+    const h = setup("live"); const orch = h.make();
+    const key = scheduledOccurrenceKey(h.row.id);
+    const notice = vi.spyOn(orch as any, "notifyParkedTurn");
+    const binding = { version: 1 as const, location: "local", slot: 19,
+      submissionId: "scheduled-submission", acpSessionId: "live-session", delegatedUtc: new Date().toISOString() };
+    transport.prompt.mockImplementationOnce(async () => {
+      const attempt = h.store.turnAttempts.get(key.id)!;
+      expect(attempt.promptStarted).toBe(true);
+      expect(h.store.turnAttempts.recordRemoteRecovery(attempt, binding)).toBe(true);
+      orch.suspendForRestart();
+      throw new Error("ACP connection closed");
+    });
+    await orch.runScheduledPrompt(h.row.id, key);
+    expect(h.store.turnAttempts.get(key.id)).toMatchObject({ state: "suspended", generation: 1,
+      stalledUtc: null, stalledReason: null, stallNoticeUtc: null,
+      remoteRecovery: { submissionId: binding.submissionId, acpSessionId: binding.acpSessionId } });
+    expect(notice).not.toHaveBeenCalled();
+    expect(h.store.listOpenChoiceCards("discord")).toEqual([]);
+    expect(h.adapter.sendMessage.mock.calls.some(call => call[1].includes("parked"))).toBe(false);
+    expect(h.store.scheduledOccurrences.get(key.id)?.settled).toBe(false);
+    expect(transport.prompt).toHaveBeenCalledOnce();
+  });
+
+  it("still parks a suspended-return defect when no restart cutoff occurred", async () => {
+    const h = setup("live"); const orch = h.make();
+    const key = scheduledOccurrenceKey(h.row.id);
+    const notice = vi.spyOn(orch as any, "notifyParkedTurn").mockResolvedValue(undefined);
+    vi.spyOn(orch as any, "handleIncomingMessageInner").mockImplementation(async () => {
+      const attempt = h.store.turnAttempts.get(key.id)!;
+      h.store.turnAttempts.suspend(attempt.id, attempt.ownerBoot);
+    });
+    await orch.runScheduledPrompt(h.row.id, key);
+    expect(h.store.turnAttempts.get(key.id)).toMatchObject({ state: "suspended",
+      stalledReason: "the scheduled turn returned without settling its attempt" });
+    expect(notice).toHaveBeenCalledOnce();
+    expect(transport.prompt).not.toHaveBeenCalled();
+  });
+
   it.each((['live', 'isolated'] as const).flatMap(mode => (['manual', 'cron'] as const)
     .flatMap(trigger => (['record', 'config', 'read-config'] as const).map(stage => ({ mode, trigger, stage })))))
     ("admits $mode $trigger intent before $stage failure and recovers only its first submission", async ({ mode, trigger, stage }) => {

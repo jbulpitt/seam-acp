@@ -9,11 +9,13 @@ import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrato
 import { discordRenderer } from "../packages/core/src/platforms/discord/renderer.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 import type { StructuredPanel } from "../packages/core/src/core/types.js";
+import { parkedTurnChoiceSpec } from "../packages/core/src/core/parked-turn-card.js";
 
 let dir: string;
 let store: SessionStore;
 let host: Orchestrator;
 let edits: StructuredPanel[];
+let choiceEdits: ReturnType<typeof vi.fn>;
 const spec = { id: "child", target: "worker", prompt: "work", session: "isolated" as const,
   kind: "handoff" as const, stream: false, createdUtc: "2026-10-04T22:59:31.000Z" };
 
@@ -21,6 +23,8 @@ beforeEach(() => {
   dir = mkdtempSync(path.join(tmpdir(), "seam-terminal-card-"));
   store = new SessionStore(path.join(dir, "test.db"));
   edits = [];
+  choiceEdits = vi.fn(async () => {});
+  let choicePosts = 0;
   host = new Orchestrator({ logger: pino({ level: "silent" }) as any,
     config: { DATA_DIR: dir, REPOS_ROOT: "/synthetic", TURN_TIMEOUT_SECONDS: 60,
       channelPresets: new Map(), threadPresets: new Map(), bridgePresets: new Map() } as any,
@@ -29,6 +33,8 @@ beforeEach(() => {
     adapter: {
       sendPanel: async (channel: unknown) => ({ channel, id: "card" }),
       editPanel: async (_ref: unknown, panel: StructuredPanel) => { edits.push(panel); },
+      sendChoiceCard: async (channel: { id: string }) => ({ channel, id: `notice-${channel.id}-${++choicePosts}` }),
+      editChoiceCard: choiceEdits,
     } as any,
   });
 });
@@ -53,7 +59,53 @@ function openCard() {
   return attempt;
 }
 
-describe("pre-prompt terminal card settlement", () => {
+describe("terminal card settlement", () => {
+  it.each(["completed", "failed", "cancelled"] as const)("retires a parked turn's notices when it later settles %s without a status panel", async status => {
+    const attempt = store.turnAttempts.claim(spec, "identity", "boot");
+    store.turnAttempts.bind(attempt, "acp");
+    store.turnAttempts.startPrompt(attempt);
+    const binding = { version: 1 as const, location: "local", slot: 19,
+      submissionId: "parked-submission", acpSessionId: "acp", delegatedUtc: new Date().toISOString() };
+    expect(store.turnAttempts.recordRemoteRecovery(attempt, binding)).toBe(true);
+    store.turnAttempts.markStalled(attempt.id, "connection unavailable");
+    for (const channelRef of ["worker", "requester"]) {
+      const card = parkedTurnChoiceSpec(attempt.id, "connection unavailable", { resume: "Resume", cancel: "Cancel" });
+      if (channelRef === "requester") card.options[1] = { label: "Abandon", kind: "prompt", payload: `parked-turn:abandon:${attempt.id}` };
+      await (host as any).publishChoiceCard({ id: `discord:${channelRef}`, platform: "discord", channelRef, parentRef: null },
+        card);
+    }
+    const notices = store.listOpenChoiceCards("discord");
+    expect(notices).toHaveLength(2);
+    const unrelated = await (host as any).publishChoiceCard({ id: "discord:worker", platform: "discord", channelRef: "worker", parentRef: null },
+      parkedTurnChoiceSpec("other-turn", "another cause", { resume: "Resume", cancel: "Cancel" }));
+    expect(unrelated.ok).toBe(true);
+    expect(attempt.statusCard).toBeNull();
+    await drain();
+    expect(choiceEdits).not.toHaveBeenCalled();
+    expect(store.listOpenChoiceCards("discord")).toHaveLength(3);
+
+    if (status === "cancelled") expect(store.turnAttempts.cancel(attempt.id)).toBe(true);
+    else expect(store.turnAttempts.adoptRemoteResult(store.turnAttempts.get(attempt.id)!, { version: 1,
+      submissionId: binding.submissionId, acpSessionId: binding.acpSessionId, status,
+      text: "captured output", ...(status === "failed" ? { error: "real provider cause" } : {}),
+      finishedUtc: new Date().toISOString() }, {
+      id: attempt.id, target: spec.target, status, output: "captured output", finishedUtc: new Date().toISOString(),
+    })).toBe(true);
+    await drain();
+    for (const card of notices) expect(store.getChoiceCard(card.id)?.status).toBe("cancelled");
+    expect(store.listOpenChoiceCards("discord").map(card => card.id)).toEqual([unrelated.choiceId]);
+    expect(choiceEdits).toHaveBeenCalledTimes(2);
+    for (const card of notices) expect(choiceEdits).toHaveBeenCalledWith(
+      { id: card.messageId, channel: { platform: "discord", id: card.channelRef } },
+      expect.objectContaining({ disabled: true, hideButtons: true }));
+    expect(store.turnAttempts.get(attempt.id)?.deliveryDone).toBe(false);
+    expect(edits).toEqual([]);
+    // Duplicate terminal signals cannot retire an unrelated notice or re-edit these.
+    expect(store.turnAttempts.cancel(attempt.id)).toBe(false);
+    await drain();
+    expect(choiceEdits).toHaveBeenCalledTimes(2);
+  });
+
   it.each(["operator", "superseded"])("renders %s cancellation without another boot", async cause => {
     const attempt = openCard();
     const completed = vi.fn();

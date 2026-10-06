@@ -41,8 +41,6 @@ export function localBridgeWiring(
       return child;
     },
     rpc: async () => ({ projectMcpInjection: true, rung1RecoveryVersion: 1 }),
-    sendCmd: async () => ({ health: [] }),
-    isBound: () => false,
     releaseStdin: () => {},
   };
   return {
@@ -78,7 +76,6 @@ export function localBridgeHub(
       ? workspacePaths().map((workspacePath) => ({ path: workspacePath, name: path.basename(workspacePath) }))
       : [],
     get: (location: string) => location === "local" && mux ? { mux } : undefined,
-    muxFor: (location: string) => location === "local" ? mux : undefined,
     markSessionBridge: () => {},
     mcpServersForBridgeSpawn: () => undefined,
     rpc: async (_location: string, method: string, params: unknown, agentId?: string) => {

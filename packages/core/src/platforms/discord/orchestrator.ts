@@ -7055,10 +7055,11 @@ export class Orchestrator {
     for (let attempt = 1; ; attempt++) {
       assertCurrent();
       try {
-        if (!this.router.hasRuntime?.(record.id)) {
+        const savedSessionId = resumeSessionId ?? record.acpSessionId;
+        if (savedSessionId && this.bridgeHub?.muxFor && this.router.hasRuntime?.(record.id) === false) {
           const described = this.router.describeConfig(record);
           await this.retireUnownedSessionSlots(described.location.value,
-            resumeSessionId ?? record.acpSessionId, described.agent.value, assertCurrent);
+            savedSessionId, described.agent.value, assertCurrent);
           assertCurrent();
         }
         const runtime = await (resumeSessionId
@@ -15534,7 +15535,7 @@ export class Orchestrator {
   private async retireUnownedSessionSlots(location: string, sessionId: string, agentId: string,
     assertCurrent: () => void): Promise<void> {
     if (!sessionId) return;
-    const mux = this.bridgeHub?.muxFor(location);
+    const mux = this.bridgeHub?.muxFor?.(location);
     if (!mux) return;
     const reply = await mux.sendCmd("listSlots", {}) as { health?: Array<{
       slot: number; alive?: boolean; recovery?: unknown;

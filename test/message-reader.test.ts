@@ -49,6 +49,25 @@ function pageOf(rows: readonly MessagePageItem[], over: Partial<MessagePage> = {
 }
 
 describe("MessageReader", () => {
+  it("preserves links and unavailability reasons for conversation and cards", async () => {
+    const rows = [
+      message(1, "hello", { jumpUrl: "https://discord.com/channels/g/thread/1" }),
+      message(2, "Pick one", { authorType: "bot", hasComponents: true, jumpUrl: "https://discord.com/channels/g/thread/2" }),
+      message(3, "unknown guild", { jumpLinkUnavailableReason: "The Discord guild is unavailable." }),
+    ];
+    const reader = new MessageReader({ fetchMessagePage: async () => pageOf(rows) });
+    const read = await reader.readMessages("thread", { limit: 3 });
+    expect(read.messages).toEqual([
+      expect.objectContaining({ messageId: rows[0]!.messageId, jumpUrl: rows[0]!.jumpUrl, isCard: false }),
+      expect.objectContaining({ messageId: rows[1]!.messageId, jumpUrl: rows[1]!.jumpUrl, isCard: true }),
+      expect.objectContaining({ messageId: rows[2]!.messageId, jumpLinkUnavailableReason: rows[2]!.jumpLinkUnavailableReason }),
+    ]);
+    const search = await new LiveMessageSearch(reader).search({ query: "hello", threads: [{ id: "thread", name: "Test" }] });
+    expect(search.hits[0]).toMatchObject({ messageId: rows[0]!.messageId, jumpUrl: rows[0]!.jumpUrl });
+    const unknown = await new LiveMessageSearch(reader).search({ query: "unknown", threads: [{ id: "thread", name: "Test" }] });
+    expect(unknown.hits[0]).toHaveProperty("jumpLinkUnavailableReason", rows[2]!.jumpLinkUnavailableReason);
+  });
+
   it("uses cursor pagination and returns chronological messages", async () => {
     const all = Array.from({ length: 205 }, (_, index) => message(index + 1, `message ${index + 1}`));
     const requests: MessagePageRequest[] = [];

@@ -12,8 +12,14 @@ export interface ChannelRef {
   parentId?: string;
 }
 
+/** Navigation metadata; a missing link retains its real reason. */
+export interface MessageLink {
+  jumpUrl?: string;
+  jumpLinkUnavailableReason?: string;
+}
+
 /** Reference to a previously-sent message; used for `editMessage`. */
-export interface MessageRef {
+export interface MessageRef extends MessageLink {
   channel: ChannelRef;
   id: string;
 }
@@ -83,6 +89,9 @@ export interface ChatAdapter {
     delivery?: DeliveryNonceOptions
   ): Promise<MessageRef>;
   editMessage(message: MessageRef, text: string): Promise<void>;
+
+  /** Resolve a stored message's link from its actual channel. */
+  getMessageLink?(channel: ChannelRef, messageId: string | null): Promise<MessageLink>;
 
   /**
    * Optional: upload a file to the channel. Required for the agent → Discord

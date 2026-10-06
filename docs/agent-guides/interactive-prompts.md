@@ -18,6 +18,8 @@ A choice card is a **structured question in the same live thread**: Approve /
 Reject, pick a plan, pick a topic. Someone clicks; **this thread** gets one
 prompt; the card **shows what they picked and the buttons go away**.
 
+When referring to an earlier card or message, use its returned jump link instead of saying 'above'.
+
 That is the default. Use it constantly for student feedback and for
 build-workflow check-ins. Cross-thread routing and isolated runs are later in
 this file; HTTP submissions have a separate guide. Skip them until needed.

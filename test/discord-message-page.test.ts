@@ -45,6 +45,8 @@ describe("DiscordAdapter.fetchMessagePage", () => {
     ]));
     (adapter as any).fetchSendableChannel = vi.fn(async () => ({
       isThread: () => true,
+      guildId: "guild-1",
+      parentId: "parent-1",
       messages: { fetch },
     }));
 
@@ -59,6 +61,7 @@ describe("DiscordAdapter.fetchMessagePage", () => {
     expect(page.messages).toEqual([
       expect.objectContaining({
         messageId: "m2",
+        jumpUrl: "https://discord.com/channels/guild-1/thread-1/m2",
         authorType: "bot",
         authorId: "bot",
         authorName: "Seam",
@@ -69,6 +72,7 @@ describe("DiscordAdapter.fetchMessagePage", () => {
       }),
       expect.objectContaining({
         messageId: "m1",
+        jumpUrl: "https://discord.com/channels/guild-1/thread-1/m1",
         authorType: "human",
         authorId: "human",
         authorName: "Alex M",

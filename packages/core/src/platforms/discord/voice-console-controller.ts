@@ -31,6 +31,7 @@ import {
   type TtsStyle,
 } from "../../core/audio/gemini-tts.js";
 import type { MessageRef } from "../chat-adapter.js";
+import { discordMessageLink } from "./message-link.js";
 import type {
   VoiceConsoleOrchestratorPort,
   VoiceConsoleVisibleTurnHandle,
@@ -974,9 +975,7 @@ export class VoiceConsoleController
       schedulerQueueDepth: snapshot?.queueDepth ?? 0,
       schedulerSource: current ? { alias: current.alias, voice: current.ttsVoice } : null,
       leaseHolder: { kind: "thread_voice", sessionId: console.id },
-      cardJumpUrl: console.cardMessageId
-        ? `https://discord.com/channels/${console.guildId}/${console.voiceChannelId}/${console.cardMessageId}`
-        : null,
+      cardJumpUrl: discordMessageLink(console.guildId, console.voiceChannelId, console.cardMessageId).jumpUrl ?? null,
     };
   }
 
@@ -1127,7 +1126,7 @@ export class VoiceConsoleController
       id: binding.channelRef,
       ...(binding.parentRef ? { parentId: binding.parentRef } : {}),
     };
-    const cardUrl = `https://discord.com/channels/${console.guildId}/${console.voiceChannelId}/${console.cardMessageId}`;
+    const cardUrl = discordMessageLink(console.guildId, console.voiceChannelId, console.cardMessageId).jumpUrl;
     const text =
       `🎛️ **Shared Voice Console · ${inertVoiceConsoleAlias(binding.alias)}**\n` +
       `State: ${console.status} · [Open canonical controls](${cardUrl})`;

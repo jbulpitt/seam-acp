@@ -182,7 +182,7 @@ describe("VoiceConsoleController startup transaction", () => {
     });
     expect(adapter.sendMessage).toHaveBeenCalledWith(
       { platform: "discord", id: "thread-1", parentId: "parent-1" },
-      expect.stringContaining("Open canonical controls")
+      expect.stringContaining("[Open canonical controls](https://discord.com/channels/guild-1/vc-1/card-1)")
     );
     expect(controller.statusPages(result.console.id)[0]?.fields).toEqual(
       expect.arrayContaining([

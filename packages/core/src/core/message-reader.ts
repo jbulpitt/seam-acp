@@ -7,9 +7,11 @@
  * a future FTS implementation can replace the live walk without changing MCP.
  */
 
+import type { MessageLink } from "../platforms/chat-adapter.js";
+
 export type MessageAuthorType = "human" | "bot";
 
-export interface MessagePageItem {
+export interface MessagePageItem extends MessageLink {
   messageId: string;
   timestampMs: number;
   authorId: string;
@@ -63,7 +65,7 @@ export interface ReadMessagesInput {
   limit?: number;
 }
 
-export interface ReadMessage {
+export interface ReadMessage extends MessageLink {
   messageId: string;
   timestamp: string;
   author: string;
@@ -93,7 +95,7 @@ export interface SearchMessagesInput {
   limit?: number;
 }
 
-export interface SearchMessageHit {
+export interface SearchMessageHit extends MessageLink {
   threadId: string;
   threadName: string | null;
   messageId: string;
@@ -272,6 +274,8 @@ export class MessageReader {
     // here and around/before/after semantics are unchanged.
     const messages = ordered(page.messages).map((message): ReadMessage => ({
       messageId: message.messageId,
+      ...(message.jumpUrl ? { jumpUrl: message.jumpUrl } : {}),
+      ...(message.jumpLinkUnavailableReason ? { jumpLinkUnavailableReason: message.jumpLinkUnavailableReason } : {}),
       timestamp: new Date(message.timestampMs).toISOString(),
       author: message.authorName,
       authorId: message.authorId,
@@ -479,6 +483,8 @@ export class LiveMessageSearch implements MessageSearchBackend {
           threadId: thread.id,
           threadName: thread.name,
           messageId: message.messageId,
+          ...(message.jumpUrl ? { jumpUrl: message.jumpUrl } : {}),
+          ...(message.jumpLinkUnavailableReason ? { jumpLinkUnavailableReason: message.jumpLinkUnavailableReason } : {}),
           timestamp: new Date(message.timestampMs).toISOString(),
           author: message.authorName,
           authorId: message.authorId,

@@ -891,7 +891,10 @@ describe("multi-select lifecycle (#94)", () => {
 });
 
 describe("MCP create_choice / cancel_choice", () => {
-  it("create_choice publishes via the dep", async () => {
+  it.each([
+    { jumpUrl: "https://discord.com/channels/g/thread-1/m1" },
+    { jumpLinkUnavailableReason: "The Discord guild is unavailable." },
+  ])("create_choice publishes with navigation metadata %j", async link => {
     let seen: unknown;
     const server = new SeamMcpServer({
       logger: silent,
@@ -899,7 +902,7 @@ describe("MCP create_choice / cancel_choice", () => {
       enqueueDispatch: async () => {},
       createChoice: async (_r, spec) => {
         seen = spec;
-        return { ok: true, choiceId: "c1", messageId: "m1" };
+        return { ok: true, choiceId: "c1", messageId: "m1", ...link };
       },
     });
     await server.start();
@@ -913,8 +916,11 @@ describe("MCP create_choice / cancel_choice", () => {
         params: { name: "create_choice", arguments: validSpec },
       }),
     });
-    const body = (await res.json()) as { result: { content: Array<{ text: string }> } };
+    const body = (await res.json()) as { result: { content: Array<{ text: string }>; structuredContent: object } };
     expect(body.result.content[0]!.text).toMatch(/Choice card c1/);
+    expect(body.result.content[0]!.text).toContain(link.jumpUrl
+      ? `[Open message](${link.jumpUrl})` : `Jump link unavailable: ${link.jumpLinkUnavailableReason}`);
+    expect(body.result.structuredContent).toMatchObject({ messageId: "m1", ...link });
     expect(seen).toMatchObject({ title: "Ship this?" });
     await server.stop();
   });

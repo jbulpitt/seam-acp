@@ -13,6 +13,7 @@ import { configTarget } from "../packages/core/src/core/config-target.js";
 import { applyPickerValue, buildSavePlan, INHERIT_VALUE, type ThreadConfigDraft } from "../packages/core/src/platforms/discord/config-editor.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 import { visualConfig } from "./plugin-card-visuals-fixture.js";
+import { localBridgeHub, localBridgeWiring } from "./local-bridge-fixture.js";
 
 const PARENT = "100000000000000001";
 const THREAD = "100000000000000002";
@@ -41,12 +42,14 @@ async function fixture() {
     DEFAULT_AGENT: "claude", DEFAULT_MODEL: "claude-default", DISCORD_ALLOWED_USER_IDS: new Set([actor.id]),
     SEAM_CONFIG_ADMIN_USER_IDS: new Set([actor.id]), REPO_EMOJIS: new Map(), TURN_TIMEOUT_SECONDS: 60 } as Config;
   const router = new SessionRouter({ store, logger, profiles, modelCatalog: catalog, ...maps,
-    defaultAgentId: "claude", defaultModel: "claude-default", defaultCwd: dir });
+    defaultAgentId: "claude", defaultModel: "claude-default", defaultCwd: dir,
+    seamMcp: localBridgeWiring(profiles) });
   const adapter = { sendMessage: vi.fn(async (channel, _text) => ({ channel, id: "notice" })),
     sendPanel: vi.fn(async (channel, _panel) => ({ channel, id: "hub" })), editPanel: vi.fn(async () => {}),
     sendChoicePicker: vi.fn(async (_channel: unknown, _options: any): Promise<{ value: string; userId: string } | null> => null), configParentChannels: async () => [{ id: PARENT, name: "project", guildId: "guild", guildName: "Guild" }] };
   const orchestrator = new Orchestrator({ config, logger, store, router, modelCatalog: catalog,
     adapter: adapter as never, renderer: { codeBlock: (value: string) => value } as never });
+  orchestrator.setBridgeHub(localBridgeHub(profiles, dir));
   await orchestrator.loadPlugins();
   const ui = (orchestrator as any).configUi.ui;
   const plan = orchestrator.getConfigApplyPlan();

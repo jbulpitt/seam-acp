@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { cleanTextForPreview } from "@seam/adapters";
 import { makeCopilotProfile } from "@seam/adapters";
 import Database from "better-sqlite3";
@@ -105,6 +105,7 @@ describe("Copilot Session Manager", () => {
   });
 
   afterEach(async () => {
+    vi.restoreAllMocks();
     fs.rmSync(tempDir, { recursive: true, force: true });
   });
 
@@ -145,7 +146,9 @@ describe("Copilot Session Manager", () => {
       JSON.stringify({ id: "user", parentId: "start", type: "user.message",
         data: { content: "Remember session-123 and /workspace/repo exactly." } }),
       JSON.stringify({ id: "agent", parentId: "user", type: "assistant.message", data: { content: "Remembered." } }),
-      JSON.stringify({ id: "checkpoint", parentId: "agent", type: "session.compaction_complete",
+      JSON.stringify({ id: "subagent-start", parentId: "agent", agentId: "task-1", type: "session.start",
+        data: { sessionId: "subagent-conversation", context: { cwd: "/workspace/repo" } } }),
+      JSON.stringify({ id: "checkpoint", parentId: "subagent-start", type: "session.compaction_complete",
         data: { checkpointPath: path.join(source, "checkpoints", "1.md"), success: true } }),
     ];
     fs.mkdirSync(path.join(source, "checkpoints"), { recursive: true });
@@ -167,11 +170,27 @@ describe("Copilot Session Manager", () => {
     const clonedLines = fs.readFileSync(path.join(target, "events.jsonl"), "utf8").trimEnd().split("\n");
     expect(JSON.parse(clonedLines[0]!)).toEqual({ id: "start", parentId: null, type: "session.start",
       data: { sessionId: "session-456", context: { cwd, branch: "main" } } });
-    expect(clonedLines.slice(1, 3)).toEqual(messages.slice(1, 3));
-    expect(JSON.parse(clonedLines[3]!)).toMatchObject({ id: "checkpoint", parentId: "agent",
+    expect(clonedLines.slice(1, 4)).toEqual(messages.slice(1, 4));
+    expect(JSON.parse(clonedLines[4]!)).toMatchObject({ id: "checkpoint", parentId: "subagent-start",
       data: { checkpointPath: path.join(target, "checkpoints", "1.md") } });
     expect(fs.readFileSync(path.join(target, "checkpoints", "1.md"), "utf8")).toBe("Retained source context");
     expect(fs.readFileSync(path.join(source, "workspace.yaml"), "utf8")).toBe(workspace);
     expect(fs.readFileSync(path.join(source, "events.jsonl"), "utf8")).toBe(messages.join("\n") + "\n");
+    expect(await manager.getTranscript(cwd, "session-456")).toContain("Remember session-123 and /workspace/repo exactly.");
+  });
+
+  it("surfaces the real native copy error instead of reporting clone success", async () => {
+    fs.mkdirSync(path.join(tempDir, "session-state", "session-123"), { recursive: true });
+    const cause = Object.assign(new Error("EACCES: permission denied while copying source events"), { code: "EACCES" });
+    vi.spyOn(fs.promises, "cp").mockRejectedValue(cause);
+    await expect(manager.cloneSession("/workspace/repo", "session-123", "session-456")).rejects.toBe(cause);
+  });
+
+  it("reports the path and line of malformed cloned history", async () => {
+    const source = path.join(tempDir, "session-state", "session-123");
+    fs.mkdirSync(source, { recursive: true });
+    fs.writeFileSync(path.join(source, "events.jsonl"), "not JSON\n");
+    await expect(manager.cloneSession("/workspace/repo", "session-123", "session-456"))
+      .rejects.toThrow(`Copilot parse cloned session history line 1 (${path.join(tempDir, "session-state", "session-456", "events.jsonl")}):`);
   });
 });

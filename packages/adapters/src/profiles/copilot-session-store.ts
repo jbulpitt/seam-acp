@@ -60,6 +60,7 @@ export async function rewriteCopilotClone(
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
     throw sourceError("read cloned session history", eventsFile, error);
   }
+  let firstEvent = true;
   const lines = events.split("\n").map((line, index) => {
     if (!line.trim()) return line;
     let event: { type?: string; data?: { sessionId?: string; context?: Record<string, unknown>; checkpointPath?: string } };
@@ -67,11 +68,12 @@ export async function rewriteCopilotClone(
     catch (error) { throw sourceError(`parse cloned session history line ${index + 1}`, eventsFile, error); }
     let changed = false;
     // Copilot restores the session identity from the start event, not its directory.
-    if (event.type === "session.start" && event.data) {
+    if (firstEvent && event.type === "session.start" && event.data) {
       event.data.sessionId = sessionId;
       event.data.context = { ...event.data.context, cwd };
       changed = true;
     }
+    firstEvent = false;
     const checkpoint = event.data?.checkpointPath;
     if (checkpoint?.startsWith(`${source}${path.sep}`)) {
       event.data!.checkpointPath = target + checkpoint.slice(source.length);

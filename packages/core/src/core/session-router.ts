@@ -320,7 +320,7 @@ export function simpleCardGifForRender(d: ConfigDescription): boolean {
  * at 2s since it was written; this matches it so abortTurn can always reach
  * its escalation.
  */
-const CANCEL_SIGNAL_TIMEOUT_MS = 2000;
+export const CANCEL_SIGNAL_TIMEOUT_MS = 2000;
 
 export class SessionRouter {
   private readonly logger: Logger;
@@ -1093,27 +1093,26 @@ export class SessionRouter {
     // returned, and the thread answered nothing further. Every later message
     // repeated it. The force-kill that would have recovered the thread sits
     // ten lines below and was never reached.
-    const signalled = await Promise.race([
-      rt.cancel().then(() => true, () => true),
-      new Promise<boolean>((resolve) =>
-        setTimeout(() => resolve(false), CANCEL_SIGNAL_TIMEOUT_MS).unref?.()
+    const signal = await Promise.race([
+      rt.cancel().then(() => ({ sent: true as const }), err => ({ sent: false as const, err })),
+      new Promise<{ sent: false }>((resolve) =>
+        setTimeout(() => resolve({ sent: false }), CANCEL_SIGNAL_TIMEOUT_MS).unref?.()
       ),
     ]);
-    if (signalled) {
+    if (signal.sent) {
       this.logger.info({ sessionId }, "sent cancel signal to agent runtime");
     } else {
-      // Not a failure to report upward: the turn may still be cancellable by
-      // force. Say plainly that the signal did not complete rather than
-      // logging "sent", which is what made this invisible.
+      // A failed write is not a sent signal; force callers can still escalate.
       this.logger.warn(
-        { sessionId, timeoutMs: CANCEL_SIGNAL_TIMEOUT_MS },
-        "cancel signal did not complete; proceeding to escalation"
+        { sessionId, ...("err" in signal ? { err: signal.err } : { timeoutMs: CANCEL_SIGNAL_TIMEOUT_MS }) },
+        opts?.force ? "cancel signal did not complete; proceeding to escalation" : "cancel signal did not complete"
       );
     }
+    if (!opts?.force && "err" in signal) throw signal.err;
     if (!wasBusy) return "idle";
     // A graceful caller cannot claim the turn stopped when the signal never
     // landed. Report the honest outcome so the caller can decide to force.
-    if (!opts?.force) return signalled ? "cancelled" : "unacknowledged";
+    if (!opts?.force) return signal.sent ? "cancelled" : "unacknowledged";
 
     // Escalation: give the graceful cancel a moment to actually end the turn.
     const graceMs = opts.graceMs ?? 3000;

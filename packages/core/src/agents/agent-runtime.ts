@@ -2106,11 +2106,7 @@ export class AgentRuntime {
       this.logger.warn({ err }, "elicitation cancellation failed");
     });
     if (!this.connection || !this.sessionId) return;
-    try {
-      await this.connection.cancel({ sessionId: this.sessionId });
-    } catch (err) {
-      this.logger.warn({ err }, "cancel failed");
-    }
+    await this.connection.cancel({ sessionId: this.sessionId });
   }
 
   /** True while a prompt runs whose result the bridge will capture (#467). */

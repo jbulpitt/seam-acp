@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { pino } from "pino";
 import type { AgentProfile } from "@seam/adapters";
 import type { Logger } from "../packages/core/src/lib/logger.js";
@@ -117,6 +117,7 @@ beforeEach(() => {
   runtimeState.instances.length = 0;
   runtimeState.failLoad = false;
 });
+afterEach(() => vi.restoreAllMocks());
 
 describe("SessionRouter idle runtime reaping", () => {
   it("strict recovery never replaces a different nonempty thread session", async () => {
@@ -324,6 +325,28 @@ describe("#442 one owner for the mid-turn fact", () => {
 });
 
 describe("#581 abortTurn must be bounded so it can reach its own escalation", () => {
+  it.each([false, true])("does not record a rejected cancel signal as sent (force=%s)", async force => {
+    const record = makeRecord();
+    const router = makeRouter(record);
+    await router.getOrStartRuntime(record);
+    const rt = runtimeState.instances.at(-1)!;
+    rt.busy = true;
+    const failure = new Error("synthetic cancel transport EPIPE");
+    (rt as unknown as { cancel: () => Promise<void> }).cancel = async () => { throw failure; };
+    const info = vi.spyOn((router as any).logger, "info");
+    const warn = vi.spyOn((router as any).logger, "warn");
+    if (force) {
+      await expect(router.abortTurn(record.id, { force: true, graceMs: 0 })).resolves.toBe("killed");
+      expect(rt.disposed).toBe(true);
+    } else {
+      await expect(router.abortTurn(record.id)).rejects.toBe(failure);
+      expect(rt.disposed).toBe(false);
+    }
+    expect(info.mock.calls.some(call => (call as unknown[])[1] === "sent cancel signal to agent runtime")).toBe(false);
+    expect(warn).toHaveBeenCalledWith(expect.objectContaining({ err: failure }), expect.any(String));
+    info.mockRestore(); warn.mockRestore();
+  });
+
   /**
    * Observed live 2026-09-23 on an orchestrator thread. A message arrived while
    * a turn was active; the handler called `abortTurn(force: true)` to make room

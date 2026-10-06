@@ -10,6 +10,7 @@ import type { PluginHost } from "../plugins/host.js";
 import type { SlashInvocation } from "../plugins/slash-registry.js";
 import type { ConfigInteraction, ConfigUiPorts } from "../plugins/config-ui/ports.js";
 import type { ConfigUi } from "../plugins/config-ui/ui.js";
+import { ParentConfigCleanup, type ConfigParentChannel } from "./channel-config-cleanup.js";
 
 interface ConfigUiDependencies {
   plugins: PluginHost; config: Config; logger: Logger; store: SessionStore; router: SessionRouter; modelCatalog: ModelCatalogService;
@@ -23,10 +24,12 @@ interface ConfigUiDependencies {
   repoDisplay: ConfigUiPorts["repoDisplay"];
   autocomplete(option: string): ConfigUiPorts["autocomplete"][number]["respond"] | undefined;
   interaction(i: ChatInputCommandInteraction): ConfigInteraction;
+  parentChannels(): Promise<ConfigParentChannel[]>;
 }
 
 /** Controller-only facade: expose UI snapshots and audited operations, never stores or runtimes. */
 export function installConfigUi(deps: ConfigUiDependencies) {
+  const cleanup = new ParentConfigCleanup({ config: deps.config, store: deps.store, plan: deps.plan, parents: deps.parentChannels });
   const interactions = new WeakMap<SlashInvocation, ConfigInteraction>();
   const ensure = (channel: ChannelRef) => deps.router.ensureSessionRecord({ platform: channel.platform, channelRef: channel.id,
     ...(channel.parentId ? { parentRef: channel.parentId } : {}), cwd: deps.config.REPOS_ROOT });
@@ -43,24 +46,9 @@ export function installConfigUi(deps: ConfigUiDependencies) {
       models: (binding, view) => deps.modelCatalog.models(binding, view), model: (binding, model) => deps.modelCatalog.model(binding, model),
       effortChoices: (binding, model) => deps.modelCatalog.effortChoices(binding, model), isHidden: (binding, model) => deps.modelCatalog.isHidden?.(binding, model) ?? false,
     },
-    bind: channel => { ensure(channel); },
-    readConfig: channel => deps.store.readConfig(ensure(channel)),
-    snapshot: channel => {
-      const record = ensure(channel);
-      const chan = channel.parentId ? deps.config.channelPresets.get(channel.parentId) : undefined;
-      const inherited = deps.router.describeConfig(record, { inherit: true });
-      return { desc: deps.router.describeConfig(record), withoutThread: {
-        location: inherited.location.value, agent: inherited.agent.value, model: inherited.model.value,
-        effort: inherited.effort.value, cwd: inherited.cwd.value, permission: inherited.permission.value,
-        detached: inherited.detached.value, fastMode: inherited.fastMode.value,
-        statusCardStyle: inherited.statusCardStyle.value, simpleCardGif: inherited.simpleCardGif.value,
-        role: inherited.role.value, disableThreadPrefix: inherited.disableThreadPrefix.value,
-      }, channelPins: {
-        ...(chan?.agent?.value ? { agent: chan.agent.value } : {}), ...(chan?.model?.value ? { model: chan.model.value } : {}),
-        ...(chan?.cwd?.value ? { cwd: chan.cwd.value } : {}), ...(chan?.effort?.value ? { effort: chan.effort.value } : {}),
-        ...(chan?.role?.value ? { role: chan.role.value } : {}), ...(chan?.disableThreadPrefix?.value === true ? { disableThreadPrefix: true } : {}),
-      } };
-    },
+    bind: channel => { if (channel.parentId) ensure(channel); },
+    readConfig: channel => channel.parentId ? deps.store.readConfig(ensure(channel)) : deps.plan().describeTarget(channel),
+    snapshot: channel => deps.plan().snapshot(channel),
     canEditChannelPreset: deps.canEditChannelPreset, hasFastMode: agent => deps.router.getProfile(agent)?.fastMode !== undefined,
     agentChoices: deps.agentChoices, promptRepoPath: deps.promptRepoPath,
     saveEditor: (draft, actor) => deps.plan().saveEditor(draft, actor, parent => deps.canEditChannelPreset(actor.id!, parent)),
@@ -69,6 +57,12 @@ export function installConfigUi(deps: ConfigUiDependencies) {
       const result = await deps.plan().applyPreparedConfigSet(ensure(channel), channel, request, prepared, actor, options);
       return result.ok ? { ok: true, effective: result.effective, restartRequested: result.restartRequested } : result;
     },
+    prepareChannelSet: (channel, request) => deps.plan().prepareChannelSet(channel, request),
+    applyChannelSet: (channel, prepared, actor) => deps.plan().applyChannelSet(channel, prepared, actor),
+    overrideCounts: (id, fields) => deps.plan().overrideCounts(id, fields),
+    followChannel: (id, fields, actor) => deps.plan().followChannel(id, fields, actor),
+    clearThreadOverrides: (channel, fields, actor) => deps.plan().clearThreadOverrides(channel, fields, actor),
+    cleanup,
     rebuild: deps.rebuild, auditEntries: limit => deps.store.listConfigMutations(limit), codeBlock: deps.codeBlock, repoDisplay: deps.repoDisplay,
     description: key => deps.plugins.configKeys.list().find(entry => entry.key === key)?.description,
     autocomplete: CONFIG_SET_FIELD_NAMES.map(option => ({ option, policy: "canonical", respond: ctx => deps.autocomplete(option)?.(ctx) ?? [] })),

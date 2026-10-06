@@ -1,7 +1,7 @@
 import type { ComponentEvent, ChannelRef } from "../../platforms/chat-adapter.js";
 import type { ConfigDescription } from "../../core/session-router.js";
 import { CONFIG_SET_FIELD_NAMES, type ConfigSetFieldName, type ConfigSetRequest } from "../../core/config-apply-plan.js";
-import { renderHub, renderSavedHub, type ThreadConfigDraft } from "../../platforms/discord/config-editor.js";
+import { renderHub, renderSavedHub, snapshotFromDescribe, type ThreadConfigDraft } from "../../platforms/discord/config-editor.js";
 import type { ConfigInteraction, ConfigUiPorts } from "./ports.js";
 
 export function configSetRequest(options: ConfigInteraction["options"]): ConfigSetRequest {
@@ -9,6 +9,7 @@ export function configSetRequest(options: ConfigInteraction["options"]): ConfigS
     CONFIG_SET_FIELD_NAMES.map((name) => [name, options.getString(name)])
   ) as Record<ConfigSetFieldName, string | null>;
   return {
+    scope: options.getString("scope"),
     json: options.getString("json"),
     rebuild: options.getBoolean("rebuild") === true,
     values,
@@ -31,6 +32,7 @@ export async function saveConfigEditorCard(draft: ThreadConfigDraft, evt: Compon
   saveEditor: ConfigUiPorts["saveEditor"];
   deleteDraft(id: string): unknown;
   editCard(channel: ChannelRef, message: string, panel: ReturnType<typeof renderHub>): Promise<void>;
+  channelSaved?(draft: ThreadConfigDraft): Promise<void>;
 }): Promise<void> {
   // D10: Save does not abort a live turn; runtime changes wait for its next turn.
   const saved = await ports.saveEditor(draft, { id: evt.userId, name: evt.userName });
@@ -42,7 +44,11 @@ export async function saveConfigEditorCard(draft: ThreadConfigDraft, evt: Compon
   const { fastRefusal, fastRetireFailed } = saved;
   ports.deleteDraft(draft.id);
   if (draft.messageId) {
-    const savedPanel = renderSavedHub(draft);
+    const committed = saved.snapshot;
+    const savedPanel = renderSavedHub(draft, {
+      ...snapshotFromDescribe(committed.desc, committed.withoutThread),
+      channelPins: committed.channelPins, threadOverrides: committed.threadOverrides,
+    });
     await ports.editCard(
       evt.channel,
       draft.messageId,
@@ -64,4 +70,5 @@ export async function saveConfigEditorCard(draft: ThreadConfigDraft, evt: Compon
     await evt.followUpEphemeral(fastRetireFailed ? fastRefusal : `⚡ ${fastRefusal}`)
       .catch(() => {});
   }
+  await ports.channelSaved?.(draft);
 }

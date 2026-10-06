@@ -546,6 +546,19 @@ export class DiscordAdapter implements ChatAdapter {
     return missed.length;
   }
 
+  async configParentChannels() {
+    const parents: Array<{ id: string; name: string; guildId: string; guildName: string }> = [];
+    for (const guild of this.client.guilds.cache.values()) {
+      const channels = await guild.channels.fetch();
+      for (const channel of channels.values()) {
+        if (channel && !channel.isThread() && channel.type !== ChannelType.GuildCategory) {
+          parents.push({ id: channel.id, name: channel.name, guildId: guild.id, guildName: guild.name });
+        }
+      }
+    }
+    return parents;
+  }
+
   /** A person, or a bot listed in DISCORD_ALLOWED_BOT_IDS; never this bot. */
   private isPersonAuthor(author: { id: string; bot?: boolean | null }): boolean {
     if (author.id === this.getBotUserId()) return false;

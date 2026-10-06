@@ -337,6 +337,7 @@ import {
 } from "../../core/fast-mode.js";
 import { catalogEffortChoices } from "./catalog-view.js";
 import { installConfigUi } from "../../core/config-ui.js";
+import { configTarget } from "../../core/config-target.js";
 import { saveConfigEditorCard, configSetRequest, configSetSummary } from "../../plugins/config-ui/view.js";
 import { configUiInteraction } from "./config-ui-transport.js";
 import { installScheduleUi } from "../../core/schedule-ui.js";
@@ -1132,7 +1133,11 @@ export class Orchestrator {
       logger: this.logger,
     });
 
-    this.cardVisualsReady = installCardVisuals({ plugins: this.plugins, config: this.config, store: this.store, router: this.router, mutation: this.configMutation });
+    this.cardVisualsReady = installCardVisuals({ plugins: this.plugins, config: this.config, store: this.store, router: this.router, mutation: this.configMutation,
+      plan: () => this.getConfigApplyPlan(), offer: async (channel, actor, key) => {
+        await this.configUi.ready;
+        await this.configUi.ui.offerFollowChannel(channel, { id: actor.id, username: actor.name }, [key]);
+      } });
     this.scheduleUi = installScheduleUi({
       plugins: this.plugins, config: this.config, logger: this.logger, store: this.store, router: this.router, modelCatalog: this.modelCatalog,
       manager: () => this.scheduledManager, runNow: id => this.runScheduledPrompt(id),
@@ -1188,6 +1193,10 @@ export class Orchestrator {
       repoDisplay: repo => this.repoDisplay(repo),
       autocomplete: option => this.autocomplete.get("config", "set", option),
       interaction: i => configUiInteraction(i, this.channelRefFromInteraction(i) ?? undefined),
+      parentChannels: async () => {
+        if (!this.adapter.configParentChannels) throw new Error("This platform cannot enumerate parent channels.");
+        return this.adapter.configParentChannels();
+      },
     });
 
     this.actionCards = new ActionCardManager({
@@ -5347,7 +5356,7 @@ export class Orchestrator {
       const invocation: SlashDispatchInvocation = {
         cardReply: browserReplyFromInteraction(interaction),
         threadId: interaction.channelId ?? "",
-        parentId: (interaction.channel as { parentId?: string } | null)?.parentId,
+        parentId: this.channelRefFromInteraction(interaction)?.parentId,
         actor: Object.freeze({ id: interaction.user.id, name: interaction.user.displayName ?? interaction.user.username }),
         string: name => interaction.options.getString(name),
         boolean: name => interaction.options.getBoolean(name),
@@ -14114,7 +14123,17 @@ export class Orchestrator {
     }
   }
 
+  private async tryScopedConfigField(i: ChatInputCommandInteraction, field: ConfigSetFieldName, option: string): Promise<boolean> {
+    const channel = this.channelRefFromInteraction(i);
+    if (!channel) return false;
+    const value = i.options.getString(option);
+    if (configTarget(channel, i.options.getString("scope")).kind === "thread" && value !== INHERIT_VALUE && value !== "inherit") return false;
+    await this.configUi.ready;
+    return this.configUi.ui.cmdScopedField(this.configUi.interaction(i), field, option);
+  }
+
   private async cmdRepo(i: ChatInputCommandInteraction): Promise<void> {
+    if (await this.tryScopedConfigField(i, "repo", "path")) return;
     const record = this.recordFromInteraction(i);
     const channel = this.channelRefFromInteraction(i);
     if (!record || !channel) {
@@ -14124,7 +14143,7 @@ export class Orchestrator {
       });
       return;
     }
-    const scope = (i.options.getString("scope") ?? "session") as "session" | "thread" | "channel";
+    const scope = (i.options.getString("scope") ?? "thread") as "session" | "thread" | "channel";
     const requested = i.options.getString("path");
     const reply = async (content: string, ephemeral = true) => {
       if (i.deferred || i.replied) await replyToInteraction(i, content);
@@ -14165,11 +14184,7 @@ export class Orchestrator {
     await reply(applied.message);
   }
 
-  /**
-   * Write a resolved repo path to session / thread-preset / channel-preset.
-   * Channel scope always targets `record.parentRef` (this thread's parent).
-   * `INHERIT_VALUE` clears a thread/channel overlay.
-   */
+  /** Thread repo edits; channel defaults use the shared config UI facade. */
   private async applyRepoAtScope(
     record: SessionRecord,
     channel: ChannelRef,
@@ -14181,21 +14196,6 @@ export class Orchestrator {
       if (scope === "session") {
         return { ok: false, error: "Session scope has no inherit — pass a path." };
       }
-      if (scope === "channel") {
-        if (!record.parentRef) {
-          return { ok: false, error: "This thread has no parent channel to pin a channel-wide repo on." };
-        }
-        const written = this.configMutation.applyChannelOverlay({
-          channelId: record.parentRef,
-          changes: { cwd: null },
-          actor,
-        });
-        if (!written.ok) return written;
-        return {
-          ok: true,
-          message: "Channel repo overlay cleared — threads inherit unless they have their own overlay.",
-        };
-      }
       const written = this.configMutation.applyThreadOverlay({
         threadId: record.channelRef,
         ...(record.parentRef ? { parentRef: record.parentRef } : {}),
@@ -14203,6 +14203,7 @@ export class Orchestrator {
         actor,
       });
       if (!written.ok) return written;
+      this.getConfigApplyPlan().clearLegacyOverrides(record, { cwd: null });
       return { ok: true, message: "Thread-preset repo overlay cleared." };
     }
 
@@ -14221,22 +14222,6 @@ export class Orchestrator {
     }
 
     const display = this.repoDisplay(resolved);
-    if (scope === "channel") {
-      if (!record.parentRef) {
-        return { ok: false, error: "This thread has no parent channel to pin a channel-wide repo on." };
-      }
-      const written = this.configMutation.applyChannelOverlay({
-        channelId: record.parentRef,
-        changes: { cwd: resolved },
-        actor,
-      });
-      if (!written.ok) return written;
-      return {
-        ok: true,
-        message:
-          `Channel repo set to \`${display}\` — every thread in this channel inherits it unless it has its own overlay. Applies on the next turn.`,
-      };
-    }
     if (scope === "thread") {
       const written = this.configMutation.applyThreadOverlay({
         threadId: record.channelRef,
@@ -14260,6 +14245,7 @@ export class Orchestrator {
   }
 
   private async cmdModel(i: ChatInputCommandInteraction): Promise<void> {
+    if (await this.tryScopedConfigField(i, "model", "id")) return;
     const channel = this.channelRefFromInteraction(i);
     if (!channel) {
       await replyToInteraction(i, { content: "Use inside a thread.", flags: MessageFlags.Ephemeral });
@@ -14304,11 +14290,11 @@ export class Orchestrator {
           title: "🧠 Choose a model",
           fields: [{ name: "Current", value: displayCurrent, inline: true }],
         },
-        choices: models.map((m) => ({
+        choices: [{ value: INHERIT_VALUE, label: "Use channel default" }, ...models.map((m) => ({
           value: m.id,
           label: m.displayName,
           description: m.id,
-        })),
+        }))],
         authorizedUserIds: mayConfigureUserIds(this.config),
         commit: async (pickedChoice, username) => {
           const result = await this.applyModelChange(channel, record, pickedChoice.value);
@@ -14330,7 +14316,7 @@ export class Orchestrator {
           }
           return {
             ok: true,
-            successPanel: modelSelectionConfirmationPanel(current, pickedChoice.value, username),
+            successPanel: modelSelectionConfirmationPanel(current, pickedChoice.value === INHERIT_VALUE ? this.router.describeConfig(this.store.get(record.id) ?? record).model.value : pickedChoice.value, username),
           };
         },
       });
@@ -14368,6 +14354,12 @@ export class Orchestrator {
     const actor = interaction
       ? { id: interaction.user.id, name: interaction.user.displayName ?? interaction.user.username }
       : { id: null, name: null };
+    if (id === INHERIT_VALUE) {
+      const effective = await this.getConfigApplyPlan().clearThreadOverrides(channel, ["model", "effort"], actor);
+      const message = `Using channel model: ${effective.model.value} (from ${effective.model.source}).`;
+      await respond(message);
+      return { ok: true, message };
+    }
     return this.getRuntimeTransition().applyModelChange(channel, record, id, actor, respond);
   }
 
@@ -14383,6 +14375,7 @@ export class Orchestrator {
   }
 
   private async cmdRole(i: ChatInputCommandInteraction): Promise<void> {
+    if (await this.tryScopedConfigField(i, "role", "value")) return;
     const record = this.recordFromInteraction(i);
     if (!record) {
       await replyToInteraction(i, { content: "Use inside a thread.", flags: MessageFlags.Ephemeral });
@@ -14398,28 +14391,9 @@ export class Orchestrator {
       return;
     }
     const role = raw.trim() && raw.trim().toLowerCase() !== "auto" ? raw.trim() : null;
-    const scope = (i.options.getString("scope") ?? "session") as "session" | "thread" | "channel";
+    const scope = (i.options.getString("scope") ?? "thread") as "session" | "thread" | "channel";
     const actor = { id: i.user.id, name: i.user.displayName ?? i.user.username };
-    if (scope === "channel") {
-      if (!record.parentRef) {
-        await replyToInteraction(i, { content: "This thread has no parent channel.", flags: MessageFlags.Ephemeral });
-        return;
-      }
-      if (!Orchestrator.canEditChannelPreset(this.config, i.user.id, record.parentRef)) {
-        await replyToInteraction(i, { content: "Channel-preset edits require a config admin.", flags: MessageFlags.Ephemeral });
-        return;
-      }
-      const result = this.configMutation.applyChannelOverlay({
-        channelId: record.parentRef,
-        changes: { role },
-        actor,
-      });
-      if (!result.ok) {
-        await replyToInteraction(i, { content: result.error, flags: MessageFlags.Ephemeral });
-        return;
-      }
-      await this.identityEffects.flush();
-    } else if (scope === "thread") {
+    if (scope === "thread") {
       const result = this.configMutation.applyThreadOverlay({
         threadId: record.channelRef,
         ...(record.parentRef ? { parentRef: record.parentRef } : {}),
@@ -14430,6 +14404,9 @@ export class Orchestrator {
         await replyToInteraction(i, { content: result.error, flags: MessageFlags.Ephemeral });
         return;
       }
+      const cfg = this.store.readConfig(record);
+      delete cfg.role;
+      this.persistConfig(record, cfg);
       await this.identityEffects.flush(record.id);
     } else {
       const cfg = this.store.readConfig(record);
@@ -14446,6 +14423,7 @@ export class Orchestrator {
   }
 
   private async cmdEffort(i: ChatInputCommandInteraction): Promise<void> {
+    if (await this.tryScopedConfigField(i, "effort", "level")) return;
     const record = this.recordFromInteraction(i);
     if (!record) {
       await replyToInteraction(i, { content: "Use inside a thread.", flags: MessageFlags.Ephemeral });
@@ -14479,14 +14457,18 @@ export class Orchestrator {
     const supportedList = supported.map((l) => `\`${l}\``).join(", ");
     const applyAndReport = async (nextLevel: string): Promise<{ ok: true } | { ok: false; error: string }> => {
       try {
-        await this.applyEffortChange(record, nextLevel);
+        if (nextLevel === INHERIT_VALUE) await this.getConfigApplyPlan().clearThreadOverrides(this.channelRefFromInteraction(i)!, ["effort"], { id: i.user.id, name: i.user.username });
+        else await this.applyEffortChange(record, nextLevel);
       } catch (err) {
         const error = err instanceof Error ? err.message : String(err);
         this.logger.warn({ err, threadId: record.channelRef }, "effort change failed");
         await replyToInteraction(i, `Could not set reasoning effort: ${error}`);
         return { ok: false, error };
       }
-      await replyToInteraction(i, `Reasoning effort set to \`${nextLevel}\` — applies on your next message.`);
+      const applied = nextLevel === INHERIT_VALUE ? this.router.describeConfig(this.store.get(record.id) ?? record).effort : null;
+      await replyToInteraction(i, applied
+        ? `Reasoning effort: \`${applied.value ?? "default"}\` (from ${applied.source}) — applies on your next message.`
+        : `Reasoning effort set to \`${nextLevel}\` — applies on your next message.`);
       return { ok: true };
     };
 
@@ -14510,7 +14492,7 @@ export class Orchestrator {
           title: "🧠 Choose reasoning effort",
           fields: [{ name: "Current", value: `\`${current}\``, inline: true }],
         },
-        choices: effortChoices,
+        choices: [{ value: INHERIT_VALUE, label: "Use channel default" }, ...effortChoices],
         authorizedUserIds: mayConfigureUserIds(this.config),
         commit: (pickedChoice) => applyAndReport(pickedChoice.value),
         successPanel: (pickedChoice, username) => ({
@@ -14518,7 +14500,7 @@ export class Orchestrator {
           title: "✅ Effort changed",
           fields: [
             { name: "Previous", value: `\`${current}\``, inline: true },
-            { name: "New", value: `\`${pickedChoice.value}\``, inline: true },
+            { name: "New", value: `\`${pickedChoice.value === INHERIT_VALUE ? this.router.describeConfig(this.store.get(record.id) ?? record).effort.value ?? "default" : pickedChoice.value}\``, inline: true },
           ],
           footer: `Changed by ${username} — applies on the next message`,
         }),
@@ -16529,6 +16511,7 @@ export class Orchestrator {
    * to the session config so the first turn uses something sensible.
    */
   private async cmdAgent(i: ChatInputCommandInteraction): Promise<void> {
+    if (await this.tryScopedConfigField(i, "agent", "id")) return;
     const channel = this.channelRefFromInteraction(i);
     if (!channel) {
       await replyToInteraction(i, {
@@ -16581,7 +16564,7 @@ export class Orchestrator {
           title: "🤖 Choose an agent @ host",
           fields: [{ name: "Current", value: currentLabel, inline: true }],
         },
-        choices,
+        choices: [{ value: INHERIT_VALUE, label: "Use channel default" }, ...choices],
         authorizedUserIds: mayConfigureUserIds(this.config),
         commit: async (pickedChoice, username) => {
           const result = await this.applyAgentChange(channel, record, pickedChoice.value);
@@ -16608,7 +16591,7 @@ export class Orchestrator {
               title: "✅ Agent changed",
               fields: [
                 { name: "Previous", value: `\`${currentAt}\``, inline: true },
-                { name: "New", value: `\`${pickedChoice.value}\``, inline: true },
+                { name: "New", value: `\`${pickedChoice.value === INHERIT_VALUE ? this.router.describeConfig(this.store.get(record.id) ?? record).agent.value : pickedChoice.value}\``, inline: true },
               ],
               footer: `Changed by ${username}`,
             },
@@ -16643,6 +16626,12 @@ export class Orchestrator {
     const actor = interaction
       ? { id: interaction.user.id, name: interaction.user.displayName ?? interaction.user.username }
       : { id: null, name: null };
+    if (id === INHERIT_VALUE) {
+      const effective = await this.getConfigApplyPlan().clearThreadOverrides(channel, ["agent", "model", "effort"], actor);
+      const message = `Using channel agent: ${effective.agent.value} (from ${effective.agent.source}).`;
+      await respond(message);
+      return { ok: true, message };
+    }
     return this.getRuntimeTransition().applyAgentChange(channel, record, id, actor, respond);
   }
 
@@ -20524,7 +20513,7 @@ export class Orchestrator {
     if (!i.channelId) return undefined;
     const ch = i.channel;
     const parentId =
-      ch && "parentId" in ch && typeof ch.parentId === "string"
+      ch?.isThread() && "parentId" in ch && typeof ch.parentId === "string"
         ? ch.parentId
         : undefined;
     return {

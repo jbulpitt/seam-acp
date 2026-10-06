@@ -9,6 +9,8 @@ import type { ThreadConfigDraft, InheritedConfig, ChannelPresetPins } from "../.
 import type { CardView } from "../../platforms/discord/collector-lifecycle.js";
 import type { SlashInvocation } from "../slash-registry.js";
 import type { AutocompleteResponder } from "../../platforms/discord/autocomplete.js";
+import type { ConfigDefaultField, OverrideCounts } from "../../core/config-target.js";
+import type { ParentConfigCleanup } from "../../core/channel-config-cleanup.js";
 
 export interface ConfigInteraction {
   channelRef?: ChannelRef;
@@ -29,7 +31,7 @@ export interface ConfigUiPorts {
   catalog: Pick<ModelCatalogService, "models" | "model" | "effortChoices" | "isHidden">;
   bind(channel: ChannelRef): void;
   readConfig(channel: ChannelRef): unknown;
-  snapshot(channel: ChannelRef): { desc: ConfigDescription; withoutThread: InheritedConfig; channelPins: ChannelPresetPins };
+  snapshot(channel: ChannelRef): { desc: ConfigDescription; withoutThread: InheritedConfig; channelPins: ChannelPresetPins; threadOverrides?: readonly ConfigDefaultField[] };
   canEditChannelPreset(user: string, parent?: string): boolean;
   hasFastMode(agent: string): boolean;
   agentChoices(): Array<{ value: string; label: string; description?: string }>;
@@ -38,6 +40,12 @@ export interface ConfigUiPorts {
   prepareSet(channel: ChannelRef, request: ConfigSetRequest): ReturnType<ConfigApplyPlan["prepareConfigSet"]>;
   applySet(channel: ChannelRef, request: ConfigSetRequest, prepared: PreparedConfigSet, actor: { id: string; name: string }, options: { retireRuntime: boolean; applyName: boolean }): Promise<
     { ok: true; effective: ConfigDescription; restartRequested: boolean } | { ok: false; message: string; rollbackError: string }>;
+  prepareChannelSet: ConfigApplyPlan["prepareChannelSet"];
+  applyChannelSet: ConfigApplyPlan["applyChannelSet"];
+  overrideCounts(channelId: string, fields?: readonly ConfigDefaultField[]): OverrideCounts;
+  followChannel: ConfigApplyPlan["followChannel"];
+  clearThreadOverrides: ConfigApplyPlan["clearThreadOverrides"];
+  cleanup: Pick<ParentConfigCleanup, "preview" | "apply">;
   rebuild(channel: ChannelRef): Promise<string>;
   auditEntries(limit: number): ConfigAuditEntry[];
   codeBlock(text: string, language: string): string;

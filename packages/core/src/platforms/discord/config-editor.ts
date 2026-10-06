@@ -96,6 +96,8 @@ export interface ThreadConfigSnapshot {
   locked: boolean;
   /** Raw channel-preset pins (unset = that field is not on the channel entry). */
   channelPins: ChannelPresetPins;
+  /** Actual pins/mirrors, including those hidden by the effective source. */
+  threadOverrides?: readonly (keyof ChannelPresetPins | "rider")[];
   /** Values that apply if the thread overlay is removed (inherit). */
   withoutThread: InheritedConfig;
   effortIgnoredNote?: string;
@@ -109,6 +111,8 @@ export interface ChannelPresetPins {
   effort?: string | null;
   role?: string;
   disableThreadPrefix?: boolean;
+  statusCardStyle?: StatusCardStyle;
+  simpleCardGif?: boolean;
 }
 
 /** Draft overlay. `null` means inherit (remove the thread overlay / session policy). */
@@ -141,6 +145,7 @@ export interface DraftOverlay {
 }
 
 export interface ThreadConfigDraft {
+  channelOnly?: boolean;
   id: string;
   threadId: string;
   parentRef?: string;
@@ -231,7 +236,7 @@ export function snapshotFromDescribe(
 }
 
 export function editScopeOf(draft: ThreadConfigDraft): ConfigEditorScope {
-  return draft.editScope === "channel" ? "channel" : "thread";
+  return draft.channelOnly || draft.editScope === "channel" ? "channel" : "thread";
 }
 
 export function effectiveAfterDraft(draft: ThreadConfigDraft): {
@@ -285,7 +290,6 @@ function effectiveCardStyle(draft: ThreadConfigDraft): StatusCardStyle {
   const w = s.withoutThread;
   if (o.statusCardStyle != null) return o.statusCardStyle;
   if (o.statusCardStyle === null) {
-    if (s.statusCardStyle.source === "thread preset") return s.statusCardStyle.value;
     return o.channelStatusCardStyle ?? w.statusCardStyle;
   }
   if (
@@ -303,7 +307,6 @@ function effectiveGif(draft: ThreadConfigDraft): boolean {
   const w = s.withoutThread;
   if (o.simpleCardGif != null) return o.simpleCardGif;
   if (o.simpleCardGif === null) {
-    if (s.simpleCardGif.source === "thread preset") return s.simpleCardGif.value;
     return o.channelSimpleCardGif ?? w.simpleCardGif;
   }
   if (
@@ -414,7 +417,7 @@ export function riderTooLong(draft: ThreadConfigDraft): boolean {
 }
 
 function threadOverlayValue<T>(setting: ResolvedSetting<T>): T | undefined {
-  return setting.source === "thread preset" ? setting.value : undefined;
+  return setting.source === "thread preset" || setting.source === "session config" ? setting.value : undefined;
 }
 
 export function dirtyThreadPresetChanges(draft: ThreadConfigDraft): ThreadPresetChanges {
@@ -434,22 +437,22 @@ export function dirtyThreadPresetChanges(draft: ThreadConfigDraft): ThreadPreset
   if (o.agent !== undefined) {
     const current = threadOverlayValue(s.agent) ?? null;
     const next = o.agent;
-    if (next !== current) changes.agent = next;
+    if (next !== current || (next === null && s.threadOverrides?.includes("agent"))) changes.agent = next;
   }
   if (o.model !== undefined) {
     const current = threadOverlayValue(s.model) ?? null;
     const next = o.model;
-    if (next !== current) changes.model = next;
+    if (next !== current || (next === null && s.threadOverrides?.includes("model"))) changes.model = next;
   }
   if (o.effort !== undefined) {
     const current = threadOverlayValue(s.effort) ?? null;
     const next = o.effort;
-    if (next !== current) changes.effort = next;
+    if (next !== current || (next === null && s.threadOverrides?.includes("effort"))) changes.effort = next;
   }
   if (o.cwd !== undefined) {
     const current = threadOverlayValue(s.cwd) ?? null;
     const next = o.cwd;
-    if (next !== current) changes.cwd = next;
+    if (next !== current || (next === null && s.threadOverrides?.includes("cwd"))) changes.cwd = next;
   }
   if (o.rider !== undefined) {
     const current = s.rider.thread ?? null;
@@ -459,12 +462,12 @@ export function dirtyThreadPresetChanges(draft: ThreadConfigDraft): ThreadPreset
   if (o.role !== undefined) {
     const current = threadOverlayValue(s.role) ?? null;
     const next = o.role;
-    if (next !== current) changes.role = next;
+    if (next !== current || (next === null && s.threadOverrides?.includes("role"))) changes.role = next;
   }
   if (o.disableThreadPrefix !== undefined) {
-    const current = threadOverlayValue(s.disableThreadPrefix) === true;
-    const next = o.disableThreadPrefix === true;
-    if (next !== current) changes.disableThreadPrefix = next;
+    const current = threadOverlayValue(s.disableThreadPrefix) ?? null;
+    const next = o.disableThreadPrefix;
+    if (next !== current || (next === null && s.threadOverrides?.includes("disableThreadPrefix"))) changes.disableThreadPrefix = next;
   }
   if (o.detached !== undefined) {
     const current = s.detached.value === true;
@@ -497,11 +500,11 @@ export function dirtyStatusCardStyle(
 ): StatusCardStyle | null | undefined {
   if (draft.overlay.statusCardStyle === undefined) return undefined;
   const current =
-    draft.snapshot.statusCardStyle.source === "session config"
+    draft.snapshot.statusCardStyle.source === "session config" || draft.snapshot.statusCardStyle.source === "thread preset"
       ? draft.snapshot.statusCardStyle.value
       : null;
   const next = draft.overlay.statusCardStyle;
-  if (next === current) return undefined;
+  if (next === current && !(next === null && draft.snapshot.threadOverrides?.includes("statusCardStyle"))) return undefined;
   return next;
 }
 
@@ -510,7 +513,7 @@ export function dirtyChannelStatusCardStyle(
   draft: ThreadConfigDraft
 ): StatusCardStyle | null | undefined {
   if (draft.overlay.channelStatusCardStyle === undefined) return undefined;
-  const current = draft.snapshot.withoutThread.statusCardStyle;
+  const current = draft.snapshot.channelPins.statusCardStyle ?? null;
   const next = draft.overlay.channelStatusCardStyle;
   if (next === current) return undefined;
   return next;
@@ -521,11 +524,11 @@ export function dirtySimpleCardGif(
 ): boolean | null | undefined {
   if (draft.overlay.simpleCardGif === undefined) return undefined;
   const current =
-    draft.snapshot.simpleCardGif.source === "session config"
+    draft.snapshot.simpleCardGif.source === "session config" || draft.snapshot.simpleCardGif.source === "thread preset"
       ? draft.snapshot.simpleCardGif.value
       : null;
   const next = draft.overlay.simpleCardGif;
-  if (next === current) return undefined;
+  if (next === current && !(next === null && draft.snapshot.threadOverrides?.includes("simpleCardGif"))) return undefined;
   return next;
 }
 
@@ -533,7 +536,7 @@ export function dirtyChannelSimpleCardGif(
   draft: ThreadConfigDraft
 ): boolean | null | undefined {
   if (draft.overlay.channelSimpleCardGif === undefined) return undefined;
-  const current = draft.snapshot.withoutThread.simpleCardGif;
+  const current = draft.snapshot.channelPins.simpleCardGif ?? null;
   const next = draft.overlay.channelSimpleCardGif;
   if (next === current) return undefined;
   return next;
@@ -681,7 +684,7 @@ export function renderHub(
 
   const scope = editScopeOf(draft);
   const channelScope = scope === "channel";
-  const showScope = ctx.canEditChannel !== false && !!draft.parentRef;
+  const showScope = !draft.channelOnly && ctx.canEditChannel !== false && !!draft.parentRef;
   const pins = s.channelPins ?? {};
   const threadOnlyDisabled = channelScope;
 
@@ -1049,122 +1052,18 @@ export function renderCancelledHub(draft: ThreadConfigDraft): StructuredPanel {
   };
 }
 
-/** Fold a saved overlay into the snapshot so the card shows committed values, not "will be". */
-export function draftAfterSave(draft: ThreadConfigDraft): ThreadConfigDraft {
-  const next = effectiveAfterDraft(draft);
-  const s = draft.snapshot;
-  const o = draft.overlay;
-  const layer = (over: unknown, fallback: ConfigLayer): ConfigLayer =>
-    over === undefined ? fallback : over === null ? "default" : "thread preset";
-  return {
-    ...draft,
-    overlay: {},
-    warnings: [],
-    snapshot: {
-      ...s,
-      location: { value: next.location, source: layer(o.location, s.location.source) },
-      agent: { value: next.agent, source: layer(o.agent, s.agent.source) },
-      model: { value: next.model, source: layer(o.model, s.model.source) },
-      role: { value: next.role, source: layer(o.role, s.role.source) },
-      disableThreadPrefix: {
-        value: next.disableThreadPrefix,
-        source: next.disableThreadPrefix
-          ? (o.disableThreadPrefix === true ? "thread preset" : s.disableThreadPrefix.source)
-          : "default",
-      },
-      effort: { value: next.effort, source: layer(o.effort, s.effort.source) },
-      cwd: { value: next.cwd, source: layer(o.cwd, s.cwd.source) },
-      permission: {
-        value: next.permission,
-        source: o.permission === undefined ? s.permission.source : o.permission === null ? "default" : "session config",
-      },
-      detached: {
-        value: next.detached,
-        source: next.detached ? "thread preset" : "default",
-      },
-      fastMode: {
-        value: next.fastMode,
-        source: next.fastMode ? "thread preset" : "default",
-      },
-      statusCardStyle: {
-        value: next.statusCardStyle,
-        source: cardSourceAfterSave(o, s),
-      },
-      simpleCardGif: {
-        value: next.simpleCardGif,
-        source: gifSourceAfterSave(o, s),
-      },
-      rider: {
-        ...(next.riderChannel ? { channel: next.riderChannel } : {}),
-        ...(next.riderThread ? { thread: next.riderThread } : {}),
-      },
-      channelPins: {
-        ...s.channelPins,
-        ...(o.channelAgent ? { agent: o.channelAgent } : {}),
-        ...(o.channelModel ? { model: o.channelModel } : {}),
-        ...(o.channelCwd ? { cwd: o.channelCwd } : {}),
-        ...(o.channelEffort ? { effort: o.channelEffort } : {}),
-        ...(o.channelRole !== undefined ? { role: o.channelRole ?? undefined } : {}),
-        ...(o.channelDisableThreadPrefix !== undefined
-          ? { disableThreadPrefix: o.channelDisableThreadPrefix === true ? true : undefined }
-          : {}),
-      },
-      withoutThread: {
-        ...s.withoutThread,
-        ...(o.channelStatusCardStyle ? { statusCardStyle: o.channelStatusCardStyle } : {}),
-        ...(o.channelSimpleCardGif != null ? { simpleCardGif: o.channelSimpleCardGif } : {}),
-        ...(o.channelAgent ? { agent: o.channelAgent } : {}),
-        ...(o.channelModel ? { model: o.channelModel } : {}),
-        ...(o.channelCwd ? { cwd: o.channelCwd } : {}),
-        ...(o.channelEffort !== undefined ? { effort: o.channelEffort } : {}),
-        ...(o.channelRole !== undefined ? { role: o.channelRole } : {}),
-        ...(o.channelDisableThreadPrefix !== undefined
-          ? { disableThreadPrefix: o.channelDisableThreadPrefix === true }
-          : {}),
-      },
-    },
-  };
-}
-
-function cardSourceAfterSave(o: DraftOverlay, s: ThreadConfigSnapshot): ConfigLayer {
-  if (o.statusCardStyle != null) return "session config";
-  if (o.statusCardStyle === null) {
-    if (s.statusCardStyle.source === "thread preset") return "thread preset";
-    if (o.channelStatusCardStyle) return "channel preset";
-    return s.statusCardStyle.source === "session config" ? "default" : s.statusCardStyle.source;
-  }
-  if (
-    s.statusCardStyle.source === "session config" ||
-    s.statusCardStyle.source === "thread preset"
-  ) {
-    return s.statusCardStyle.source;
-  }
-  if (o.channelStatusCardStyle) return "channel preset";
-  return s.statusCardStyle.source;
-}
-
-function gifSourceAfterSave(o: DraftOverlay, s: ThreadConfigSnapshot): ConfigLayer {
-  if (o.simpleCardGif != null) return "session config";
-  if (o.simpleCardGif === null) {
-    if (s.simpleCardGif.source === "thread preset") return "thread preset";
-    if (o.channelSimpleCardGif != null) return "channel preset";
-    return s.simpleCardGif.source === "session config" ? "default" : s.simpleCardGif.source;
-  }
-  if (
-    s.simpleCardGif.source === "session config" ||
-    s.simpleCardGif.source === "thread preset"
-  ) {
-    return s.simpleCardGif.source;
-  }
-  if (o.channelSimpleCardGif != null) return "channel preset";
-  return s.simpleCardGif.source;
-}
-
-export function renderSavedHub(draft: ThreadConfigDraft): StructuredPanel {
+export function renderSavedHub(draft: ThreadConfigDraft, committed: ThreadConfigSnapshot): StructuredPanel {
   const reset = willResetSession(draft)
     ? " ACP session will reset on the next spawn."
     : "";
-  const panel = renderHub(draftAfterSave(draft));
+  const panel = renderHub({ ...draft, snapshot: committed, overlay: {}, warnings: [] });
+  const channelFields = { Agent: "agent", Model: "model", Effort: "effort", Repo: "cwd" } as const;
+  if (editScopeOf(draft) === "channel") {
+    panel.fields = panel.fields.map(field => {
+      const pin = channelFields[field.name as keyof typeof channelFields];
+      return pin && !committed.channelPins[pin] ? { ...field, value: "`channel default` · default" } : field;
+    });
+  }
   return {
     ...panel,
     color: 0x57f287,
@@ -1242,11 +1141,17 @@ export function applyPickerValue(
       if (channelScope) {
         // Channel presets pin an agent id only; location stays per-thread.
         overlay.channelAgent = inherit ? null : value.includes("@") ? value.slice(0, value.lastIndexOf("@")) : value;
+        if (inherit || overlay.channelAgent !== (draft.snapshot.channelPins.agent ?? draft.snapshot.withoutThread.agent)) {
+          overlay.channelModel = null;
+          overlay.channelEffort = null;
+        }
         break;
       }
       if (inherit) {
         overlay.agent = null;
         overlay.location = null;
+        overlay.model = null;
+        overlay.effort = null;
         break;
       }
       const at = value.lastIndexOf("@");
@@ -1293,7 +1198,7 @@ export function applyPickerValue(
       break;
     }
     case "prefix": {
-      const disabled = value === "disabled";
+      const disabled = inherit ? null : value === "disabled";
       if (channelScope) overlay.channelDisableThreadPrefix = disabled;
       else overlay.disableThreadPrefix = disabled;
       break;
@@ -1373,9 +1278,15 @@ export function buildSavePlan(draft: ThreadConfigDraft): ConfigEditorSavePlan {
   const perm = dirtyPermission(draft);
   if (perm !== undefined) plan.permission = perm;
   const card = dirtyStatusCardStyle(draft);
-  if (card !== undefined) plan.statusCardStyle = card;
+  if (card !== undefined) {
+    plan.statusCardStyle = card;
+    if (card === null) plan.threadPreset.statusCardStyle = null;
+  }
   const gif = dirtySimpleCardGif(draft);
-  if (gif !== undefined) plan.simpleCardGif = gif;
+  if (gif !== undefined) {
+    plan.simpleCardGif = gif;
+    if (gif === null) plan.threadPreset.simpleCardGif = null;
+  }
   const channelCard = dirtyChannelStatusCardStyle(draft);
   const channelGif = dirtyChannelSimpleCardGif(draft);
   const channelRider = dirtyChannelRider(draft);

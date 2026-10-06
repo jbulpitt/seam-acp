@@ -8,7 +8,7 @@ import {
   type ChatInputCommandInteraction,
   type RESTPostAPIApplicationCommandsJSONBody,
 } from "discord.js";
-import { addConfigSetOptions, CONFIG_UI_GROUP, CONFIG_UI_LEAVES } from "../../plugins/config-ui/commands.js";
+import { addConfigSetOptions, addConfigScope, CONFIG_UI_GROUP, CONFIG_UI_LEAVES } from "../../plugins/config-ui/commands.js";
 import type { SlashRegistry } from "../../plugins/slash-registry.js";
 import type { InteractionResponseMode } from "../interaction-response.js";
 
@@ -237,7 +237,7 @@ export function buildSeamCommand(): SlashCommandBuilder {
       .setName("config")
       .setDescription("Session and bot configuration")
       .addSubcommand((sub) =>
-        declareAccess(sub, { kind: "mutating" }, "ephemeral")
+        addConfigScope(declareAccess(sub, { kind: "mutating" }, "ephemeral"))
           .setName("model")
           .setDescription("Get or set the agent model for this thread")
           .addStringOption((o) =>
@@ -245,7 +245,7 @@ export function buildSeamCommand(): SlashCommandBuilder {
           )
       )
       .addSubcommand((sub) =>
-        declareAccess(sub, { kind: "mutating" }, "ephemeral")
+        addConfigScope(declareAccess(sub, { kind: "mutating" }, "ephemeral"))
           .setName("effort")
           .setDescription("Set reasoning effort (or run with no level to see current)")
           .addStringOption((o) =>
@@ -257,7 +257,7 @@ export function buildSeamCommand(): SlashCommandBuilder {
           )
       )
       .addSubcommand((sub) =>
-        declareAccess(sub, { kind: "mutating" }, "ephemeral")
+        addConfigScope(declareAccess(sub, { kind: "mutating" }, "ephemeral"))
           .setName("agent")
           .setDescription(
             "Get or set the agent@location for this thread (resets the session when changed)"
@@ -271,7 +271,7 @@ export function buildSeamCommand(): SlashCommandBuilder {
           )
       )
       .addSubcommand((sub) =>
-        declareAccess(sub, (option) => ({ kind: option("value") != null ? "mutating" : "read-only" }), "ephemeral")
+        addConfigScope(declareAccess(sub, (option) => ({ kind: option("value") != null ? "mutating" : "read-only" }), "ephemeral"))
           .setName("role")
           .setDescription("Set naming role")
           .addStringOption((o) =>
@@ -279,17 +279,6 @@ export function buildSeamCommand(): SlashCommandBuilder {
               .setName("value")
               .setDescription("Role; auto clears")
               .setRequired(false)
-          )
-          .addStringOption((o) =>
-            o
-              .setName("scope")
-              .setDescription("Save scope")
-              .setRequired(false)
-              .addChoices(
-                { name: "session", value: "session" },
-                { name: "thread", value: "thread" },
-                { name: "channel", value: "channel" }
-              )
           )
       )
       .addSubcommand((sub) =>
@@ -301,7 +290,7 @@ export function buildSeamCommand(): SlashCommandBuilder {
           )
       )
       .addSubcommand((sub) =>
-        declareAccess(sub, { kind: "mutating" }, "ephemeral")
+        addConfigScope(declareAccess(sub, { kind: "mutating" }, "ephemeral")
           .setName("repo")
           .setDescription("Set the working repo for this thread")
           .addStringOption((o) =>
@@ -310,18 +299,7 @@ export function buildSeamCommand(): SlashCommandBuilder {
               .setDescription("Path under REPOS_ROOT (or absolute). Omit to open a picker.")
               .setRequired(false)
               .setAutocomplete(true)
-          )
-          .addStringOption((o) =>
-            o
-              .setName("scope")
-              .setDescription("session (this thread, default) | thread preset | channel (all threads)")
-              .setRequired(false)
-              .addChoices(
-                { name: "session (this thread override)", value: "session" },
-                { name: "thread preset", value: "thread" },
-                { name: "channel (all threads inherit)", value: "channel" }
-              )
-          )
+          ))
       )
       .addSubcommand((sub) =>
         declareAccess(sub, { kind: "mutating" }, "ephemeral")

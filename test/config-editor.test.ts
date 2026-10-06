@@ -11,7 +11,6 @@ import {
   currentChannelRiderText,
   currentThreadRiderText,
   decodeRiderUpload,
-  draftAfterSave,
   effectiveAgentAtLocation,
   dirtyChannelRider,
   dirtyChannelAgent,
@@ -281,7 +280,8 @@ describe("hub render (#90)", () => {
   });
 
   it("saved hub shows committed values, not will-be notes, and clears buttons", () => {
-    const panel = renderSavedHub(draft({ overlay: { model: "gpt-5.5" } }));
+    const panel = renderSavedHub(draft({ overlay: { model: "gpt-5.5" } }),
+      snapshot({ model: setting("gpt-5.5", "thread preset") }));
     const model = panel.fields.find((f) => f.name === "Model")!.value;
     expect(model).toMatch(/gpt-5\.5/);
     expect(model).not.toMatch(/will be/);
@@ -357,28 +357,17 @@ describe("Save writes only dirty fields; Cancel writes nothing", () => {
     expect(buildSavePlan(ch).channelPreset?.role).toBe("qa");
   });
 
-  it("saved channel cards reflect cleared role and re-enabled automatic naming", () => {
-    const saved = draftAfterSave(draft({
-      editScope: "channel",
-      snapshot: snapshot({
-        channelPins: { role: "qa", disableThreadPrefix: true },
-        withoutThread: { ...WITHOUT, role: "qa", disableThreadPrefix: true },
-      }),
-      overlay: { channelRole: null, channelDisableThreadPrefix: false },
-    }));
-
-    expect(saved.snapshot.channelPins.role).toBeUndefined();
-    expect(saved.snapshot.channelPins.disableThreadPrefix).toBeUndefined();
-    expect(saved.snapshot.withoutThread.role).toBeNull();
-    expect(saved.snapshot.withoutThread.disableThreadPrefix).toBe(false);
-    const panel = renderHub(saved);
-    expect(panel.fields.find((field) => field.name === "Role")!.value).toMatch(/not set/);
-    expect(panel.fields.find((field) => field.name === "Auto-name")!.value).toMatch(/enabled/);
+  it("inherit of an already-unset thread field is not dirty", () => {
+    const d = draft({ snapshot: snapshot({ model: setting("gpt-5.4", "default") }), overlay: { model: null } });
+    expect(dirtyThreadPresetChanges(d)).toEqual({});
   });
 
-  it("inherit of an already-unset thread field is not dirty", () => {
-    const d = draft({ overlay: { model: null } });
-    expect(dirtyThreadPresetChanges(d)).toEqual({});
+  it("inherit clears real legacy mirrors even when the channel masks their values", () => {
+    const d = draft({ snapshot: snapshot({
+      model: setting("gpt-5.4", "channel preset"), effort: setting("high", "channel preset"),
+      role: setting("worker", "channel preset"), threadOverrides: ["model", "effort", "role"],
+    }), overlay: { model: null, effort: null, role: null } });
+    expect(dirtyThreadPresetChanges(d)).toEqual({ model: null, effort: null, role: null });
   });
 
   it("permission inherit writes null (clears session policy)", () => {
@@ -434,6 +423,7 @@ describe("Save writes only dirty fields; Cancel writes nothing", () => {
         snapshot: snapshot({
           withoutThread: { ...WITHOUT, statusCardStyle: "simple" },
           statusCardStyle: setting("simple", "channel preset"),
+          channelPins: { statusCardStyle: "simple" },
         }),
       }),
       "card",
@@ -462,6 +452,7 @@ describe("Save writes only dirty fields; Cancel writes nothing", () => {
     expect(next.overlay.simpleCardGif).toBe(true);
     expect(dirtySimpleCardGif(next)).toBe(true);
     expect(buildSavePlan(next).simpleCardGif).toBe(true);
+    expect(buildSavePlan(next).threadPreset).toEqual({});
 
     const channel = applyPickerValue(draft(), "gif", "channel:on", caps);
     expect(channel.overlay.channelSimpleCardGif).toBe(true);
@@ -702,11 +693,23 @@ describe("agent id is the only host control (#156)", () => {
   });
 
   it("inheriting the agent inherits its host — no orphaned host pin", () => {
-    const next = applyPickerValue(remote(), "agent", INHERIT_VALUE, caps);
+    const initial = remote();
+    const next = applyPickerValue({ ...initial, snapshot: {
+      ...initial.snapshot, model: setting("claude-opus-4.6", "default"),
+    } }, "agent", INHERIT_VALUE, caps);
     expect(next.overlay.agent).toBeNull();
     expect(next.overlay.location).toBeNull();
     expect(effectiveAgentAtLocation(next)).toBe(`${WITHOUT.agent}@${WITHOUT.location}`);
     expect(dirtyThreadPresetChanges(next)).toEqual({ agent: null, location: null });
+  });
+
+  it("inheriting the agent also clears actual model and effort pins", () => {
+    const initial = remote();
+    const next = applyPickerValue({ ...initial, snapshot: {
+      ...initial.snapshot, model: setting("claude-opus-4.6", "thread preset"),
+      effort: setting("low", "thread preset"),
+    } }, "agent", INHERIT_VALUE, caps);
+    expect(dirtyThreadPresetChanges(next)).toEqual({ agent: null, location: null, model: null, effort: null });
   });
 
   it("a bare agent id lands on local rather than stranding the old host", () => {

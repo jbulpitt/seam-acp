@@ -2,6 +2,8 @@ import type { Plugin } from "../types.js";
 import type { ConfigUi } from "./ui.js";
 export { ConfigUi } from "./ui.js";
 import { CONFIG_UI_GROUP, CONFIG_UI_LEAVES } from "./commands.js";
+import { SlashCommandSubcommandBuilder } from "discord.js";
+import type { SlashContribution } from "../slash-registry.js";
 
 export function createConfigUiPlugin(ui: ConfigUi, lifecycle: { activate(): void; dispose(): void } = { activate() {}, dispose() {} }): Plugin {
   return {
@@ -12,11 +14,16 @@ export function createConfigUiPlugin(ui: ConfigUi, lifecycle: { activate(): void
       lifecycle.activate();
     }, dispose: () => lifecycle.dispose(),
     contributions: {
-      slash: CONFIG_UI_LEAVES.map(leaf => ({
+      slash: [...CONFIG_UI_LEAVES.map<SlashContribution>(leaf => ({
         command: "seam", group: CONFIG_UI_GROUP, acknowledgement: "ephemeral", leaf: leaf.leaf, access: { kind: leaf.access }, authorization: "user", help: leaf.help,
         ...(leaf.name === "set" ? { autocomplete: ui.ports.autocomplete } : {}),
         handle: async invocation => { await ui[leaf.method](ui.ports.interaction(invocation)); },
-      })),
+      })), {
+        command: "seamadmin", acknowledgement: "ephemeral", authorization: "config-admin", access: { kind: "mutating" },
+        leaf: new SlashCommandSubcommandBuilder().setName("config-cleanup").setDescription("Dry-run misfiled parent config; apply only after confirmation").toJSON(),
+        help: "`/seamadmin config-cleanup` — preview parent config cleanup, then explicitly confirm or keep",
+        handle: invocation => ui.cmdConfigCleanup(invocation),
+      }],
       components: [{ namespace: "seam-cfg-edit:", types: ["button", "select", "modal"], lifetime: "persistent", access: "read-only", authorization: "user",
         acknowledgement: evt => ui.acknowledgement(evt),
         handle: evt => ui.handleConfigEditorComponent(evt) }],

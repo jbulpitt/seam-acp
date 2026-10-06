@@ -4,7 +4,8 @@ import { EmbedBuilder, MessageFlags } from "discord.js";
 import type { ComponentEvent, IncomingMessage, ChannelRef } from "../../platforms/chat-adapter.js";
 import type { CatalogBinding } from "../../core/model-catalog/service.js";
 import { LOCAL_LOCATION, parseAgentAtLocation } from "../../core/location.js";
-import { configSetRequestError } from "../../core/config-apply-plan.js";
+import { configSetRequestError, CONFIG_SET_FIELD_NAMES, type ConfigSetFieldName, type ConfigSetRequest } from "../../core/config-apply-plan.js";
+import { configTarget, formatOverrideCounts, type ConfigDefaultField } from "../../core/config-target.js";
 import { FAST_MODE_CONFIG_ID, FAST_MODE_COST_WARNING, FAST_MODE_RESET_NOTICE, isFastModeDisabledByEnv, fastModeEnvRefusal, fastModeAgentRefusal } from "../../core/fast-mode.js";
 import { catalogEffortChoices } from "../../platforms/discord/catalog-view.js";
 import { INHERIT_VALUE, RIDER_MODAL_MAX, applyPickerValue, authorizeDraftClick, currentRiderText, decodeRiderUpload, editScopeOf, effectiveAgentAtLocation, isDirty, makeCustomId, parseCustomId, renderCancelledHub, renderExpiredHub, renderHub, renderSavedHub, riderDownloadFilename, riderTooLong, snapshotFromDescribe, type DraftAgentCapabilities, type ThreadConfigDraft } from "../../platforms/discord/config-editor.js";
@@ -13,6 +14,8 @@ import { findAuditEntry, formatConfigAuditDetail, formatConfigAuditView } from "
 import { clampFieldValue } from "../../platforms/discord/workflows-view.js";
 import type { ConfigInteraction, ConfigUiPorts } from "./ports.js";
 import { configSetRequest, configSetSummary, saveConfigEditorCard } from "./view.js";
+import { buildSavePlan } from "../../platforms/discord/config-editor.js";
+import type { SlashInvocation } from "../slash-registry.js";
 
 const CONFIG_AUDIT_COLOR = 0x8e44ad;
 
@@ -20,6 +23,119 @@ export class ConfigUi {
   readonly configEditor = new ConfigEditorStore();
   constructor(readonly ports: ConfigUiPorts) {}
   private get logger() { return this.ports.logger; }
+
+  async cmdConfigCleanup(i: SlashInvocation): Promise<void> {
+    const preview = await this.ports.cleanup.preview();
+    const rows = preview.entries.filter(entry => entry.sessionId).length;
+    const pins = preview.entries.filter(entry => entry.threadEntry).length;
+    await i.reply(`Dry-run only: ${rows} misfiled parent session rows, ${pins} parent thread entries. Nothing applied.`);
+    if (!preview.entries.length) return;
+    const channel: ChannelRef = { platform: "discord", id: i.threadId, ...(i.parentId ? { parentId: i.parentId } : {}) };
+    const details = preview.entries.map(entry => `${entry.guildName} / ${entry.name} (${entry.id}):\n` +
+      `Move: ${JSON.stringify(entry.changes)}. Preserve existing channel fields: ${entry.preserved.join(", ") || "none"}. ` +
+      `Thread overrides: ${formatOverrideCounts(entry.overrides)}.`).join("\n\n");
+    await this.ports.transport.sendMessage(channel, details);
+    await this.ports.transport.sendChoicePicker?.(channel, {
+      panel: { title: "Confirm parent configuration cleanup", description: "Preserves existing channel defaults and thread overrides. Deletes only the listed misfiled parent rows and entries.", color: 0x5865f2, fields: [] },
+      choices: [{ value: "keep", label: "Leave unchanged" }, { value: "apply", label: "Confirm: apply this preview" }],
+      authorizedUserIds: new Set([i.actor.id]),
+      commit: async picked => {
+        if (picked.value === "apply") {
+          const count = await this.ports.cleanup.apply(preview, i.actor);
+          this.logger.warn({ count, actor: i.actor }, "confirmed parent configuration cleanup applied");
+          await i.reply(`Applied cleanup to ${count} parent channels. Existing channel defaults and thread overrides preserved.`);
+        }
+        return { ok: true };
+      },
+    });
+  }
+
+  async offerFollowChannel(channel: ChannelRef, user: ConfigInteraction["user"], fields: readonly ConfigDefaultField[]): Promise<void> {
+    const id = configTarget(channel, "channel").id;
+    const counts = this.ports.overrideCounts(id, fields);
+    if (!Object.values(counts).some(count => count! > 0) || !this.ports.transport.sendChoicePicker) return;
+    await this.ports.transport.sendChoicePicker(channel, {
+      panel: { title: "Apply channel defaults to existing threads?", color: 0x5865f2,
+        fields: [],
+        description: `Thread overrides (${formatOverrideCounts(counts)}) stay unchanged unless you confirm. Only these fields will be cleared.` },
+      choices: [{ value: "keep", label: "Keep thread overrides" }, { value: "apply", label: "Confirm: use channel defaults" }],
+      authorizedUserIds: new Set([user.id]),
+      commit: async picked => {
+        if (picked.value === "apply") await this.ports.followChannel(id, fields, { id: user.id, name: user.displayName ?? user.username });
+        return { ok: true };
+      },
+    });
+  }
+
+  async setChannel(i: ConfigInteraction, request: ConfigSetRequest): Promise<void> {
+    const channel = i.channelRef!;
+    const target = configTarget(channel, "channel");
+    if (!this.ports.canEditChannelPreset(i.user.id, target.id)) {
+      await i.reply("Channel-preset edits require a config admin.");
+      return;
+    }
+    const prepared = await this.ports.prepareChannelSet(channel, request);
+    if (!prepared.ok) { await i.reply(prepared.message); return; }
+    const applied = await this.ports.applyChannelSet(channel, prepared.prepared, { id: i.user.id, name: i.user.displayName ?? i.user.username });
+    if (!applied.ok) { await i.reply(applied.message); return; }
+    const fields = Object.keys(prepared.prepared.changes) as ConfigDefaultField[];
+    const heading = request.supplied.length === 1 && request.supplied[0] === "repo"
+      ? prepared.prepared.changes.cwd === null ? "Channel repo overlay cleared" : `Channel repo set to \`${this.ports.repoDisplay(applied.effective.cwd.value)}\``
+      : request.supplied.length === 1 && request.supplied[0] === "role"
+        ? `${prepared.prepared.changes.role ? `Role set to \`${prepared.prepared.changes.role}\`` : "Role cleared"}. Channel default updated`
+      : "Channel default updated";
+    await i.reply(`${heading}. Effective: ${configSetSummary(applied.effective, this.ports.repoDisplay)}. Thread overrides: ${formatOverrideCounts(this.ports.overrideCounts(target.id, fields))}.`);
+    await this.offerFollowChannel(channel, i.user, fields);
+  }
+
+  /** Direct commands and their pickers share the same scope as bulk set and Save. */
+  async cmdScopedField(i: ConfigInteraction, field: ConfigSetFieldName, option: string): Promise<boolean> {
+    const channel = i.channelRef;
+    if (!channel) return false;
+    const value = i.options.getString(option);
+    const target = configTarget(channel, i.options.getString("scope"));
+    if (target.kind === "thread") {
+      if (value !== INHERIT_VALUE && value !== "inherit") return false;
+      const key = field === "repo" ? "cwd" : field === "card" ? "statusCardStyle" : field === "gif" ? "simpleCardGif" : field;
+      const fields: ConfigDefaultField[] = field === "agent" ? ["agent", "model", "effort"] : field === "model" ? ["model", "effort"] : [key as ConfigDefaultField];
+      const effective = await this.ports.clearThreadOverrides(channel, fields, { id: i.user.id, name: i.user.username });
+      await i.reply(`Thread override cleared. Effective: ${configSetSummary(effective, this.ports.repoDisplay)}.`);
+      return true;
+    }
+    const requestFor = (next: string): ConfigSetRequest => ({ json: null, rebuild: false, scope: "channel",
+      supplied: [field], values: { ...Object.fromEntries(CONFIG_SET_FIELD_NAMES.map(key => [key, null])), [field]: next } as ConfigSetRequest["values"] });
+    if (value !== null) { await this.setChannel(i, requestFor(value)); return true; }
+    const snapshot = this.ports.snapshot({ platform: channel.platform, id: target.id }).desc;
+    if (field === "role") { await i.reply(`Channel role: ${snapshot.role.value ?? "none"} (from ${snapshot.role.source}).`); return true; }
+    if (!this.ports.canEditChannelPreset(i.user.id, target.id)) { await i.reply("Channel-preset edits require a config admin."); return true; }
+    await i.reply("Posting channel-default picker…");
+    if (field === "repo") {
+      const picked = await this.ports.promptRepoPath(channel, { title: "Choose channel repo", location: LOCAL_LOCATION, authorizedUserIds: new Set([i.user.id]), includeInherit: true });
+      if (picked !== null) await this.setChannel(i, requestFor(picked));
+      return true;
+    }
+    const binding = { agentId: snapshot.agent.value, location: LOCAL_LOCATION };
+    const choices = field === "agent" ? this.ports.agentChoices().filter(choice => !parseAgentAtLocation(choice.value).explicit || parseAgentAtLocation(choice.value).location === LOCAL_LOCATION)
+      .map(choice => ({ ...choice, value: parseAgentAtLocation(choice.value).agentId }))
+      : field === "model" ? this.ports.catalog.models(binding, { includeHidden: false }).map(model => ({ value: model.id, label: model.displayName }))
+      : catalogEffortChoices(this.ports.catalog.effortChoices(binding, snapshot.model.value));
+    let changedFields: ConfigDefaultField[] = [];
+    const picked = await this.ports.transport.sendChoicePicker?.(channel, {
+      panel: { title: `Choose channel ${field}`, color: 0x5865f2, fields: [] },
+      choices: [{ value: INHERIT_VALUE, label: "Use global default" }, ...choices], authorizedUserIds: new Set([i.user.id]),
+      commit: async selected => {
+        const prepared = await this.ports.prepareChannelSet(channel, requestFor(selected.value));
+        if (!prepared.ok) return { ok: false, error: prepared.message };
+        const applied = await this.ports.applyChannelSet(channel, prepared.prepared, { id: i.user.id, name: i.user.username });
+        if (!applied.ok) return { ok: false, error: applied.message };
+        changedFields = Object.keys(prepared.prepared.changes) as ConfigDefaultField[];
+        await i.reply(`Channel default updated. Effective: ${configSetSummary(applied.effective, this.ports.repoDisplay)}. Thread overrides: ${formatOverrideCounts(this.ports.overrideCounts(target.id))}.`);
+        return { ok: true };
+      },
+    });
+    if (picked) await this.offerFollowChannel(channel, i.user, changedFields);
+    return true;
+  }
   async cmdConfig(i: ConfigInteraction): Promise<void> {
     const record = i.channelRef;
     if (!record) {
@@ -36,9 +152,9 @@ export class ConfigUi {
   /** `/seam config edit` — visual draft-then-save hub (#90). Does not abort a live turn. */
   async cmdConfigEdit(i: ConfigInteraction): Promise<void> {
     const channel = i.channelRef;
-    if (!channel || !i.isThread) {
+    if (!channel) {
       await i.reply({
-        content: "Use `/seam config edit` inside a thread.",
+        content: "Use `/seam config edit` in a channel or thread.",
         flags: MessageFlags.Ephemeral,
       });
       return;
@@ -51,41 +167,37 @@ export class ConfigUi {
       return;
     }
     await i.reply({
-      content: "Opening thread config editor…",
+      content: "Opening config editor…",
       flags: MessageFlags.Ephemeral,
     });
-    await this.openConfigEditorCard(channel, i.user.id);
+    await this.openConfigEditorCard(channel, i.user.id, i.options.getString("scope"));
   }
 
-  /**
-   * Bind `channel` as a session and post the config-editor hub card into it,
-   * owned by `userId`. The visual configuration surface (#90): `/seam config
-   * edit`, no-argument `/seam new`, and `/seam config init` (#157) all land
-   * here instead of running their own picker sequences.
-   *
-   * Returns the drafted card, or `null` when the platform cannot render panels.
-   */
+  /** Post an owned editor draft; parent-channel drafts never bind a session. */
   async openConfigEditorCard(
     channel: ChannelRef,
-    userId: string
+    userId: string,
+    scope?: string | null
   ): Promise<ThreadConfigDraft | null> {
     if (!this.ports.transport.sendPanel) return null;
-    const { desc, withoutThread, channelPins } = this.ports.snapshot(channel);
+    const { desc, withoutThread, channelPins, threadOverrides } = this.ports.snapshot(channel);
     const now = Date.now();
     const draft: ThreadConfigDraft = {
       id: randomUUID(),
       threadId: channel.id,
-      ...(channel.parentId ? { parentRef: channel.parentId } : {}),
+      parentRef: channel.parentId ?? channel.id,
+      channelOnly: !channel.parentId,
       userId,
       createdAt: now,
       updatedAt: now,
       snapshot: {
         ...snapshotFromDescribe(desc, withoutThread),
         channelPins,
+        threadOverrides,
       },
       overlay: {},
       warnings: [],
-      editScope: "thread",
+      editScope: configTarget(channel, scope).kind,
     };
     const evicted = this.configEditor.put(draft);
     if (evicted?.messageId) {
@@ -127,7 +239,7 @@ export class ConfigUi {
     const parsed = parseAgentAtLocation(selectedAgent);
     return {
       agentId: parsed.agentId,
-      location: parsed.explicit ? parsed.location : draft.snapshot.location.value,
+      location: channelScope ? LOCAL_LOCATION : parsed.explicit ? parsed.location : draft.snapshot.location.value,
     };
   }
 
@@ -442,6 +554,12 @@ export class ConfigUi {
       await saveConfigEditorCard(draft, evt, {
         saveEditor: this.ports.saveEditor, deleteDraft: id => this.configEditor.delete(id),
         editCard: (channel, message, panel) => this.editConfigEditorCard(channel, message, panel),
+        channelSaved: async saved => {
+          const fields = Object.keys(buildSavePlan(saved).channelPreset ?? {}) as ConfigDefaultField[];
+          if (!fields.length || !saved.parentRef) return;
+          await evt.followUpEphemeral(`Channel default saved. Thread overrides: ${formatOverrideCounts(this.ports.overrideCounts(saved.parentRef, fields))}.`);
+          await this.offerFollowChannel(evt.channel, { id: evt.userId, username: evt.userName }, fields);
+        },
       });
     } catch (err) {
       this.logger.warn({ err, threadId: draft.threadId }, "config editor Save failed");
@@ -661,6 +779,7 @@ export class ConfigUi {
           }],
         },
         choices: [
+          inherit,
           { value: "enabled", label: "Enabled", description: "Allow managed thread prefixes" },
           { value: "disabled", label: "Disabled", description: "Leave thread names completely untouched" },
         ],
@@ -832,8 +951,12 @@ export class ConfigUi {
       await i.reply({ content: "Use inside a thread.", flags: MessageFlags.Ephemeral });
       return;
     }
-    this.ports.bind(channel);
     const request = configSetRequest(i.options);
+    if (configTarget(channel, request.scope).kind === "channel") {
+      await this.setChannel(i, request);
+      return;
+    }
+    this.ports.bind(channel);
     const requestError = configSetRequestError(request);
     if (requestError && !request.rebuild) {
       await i.reply({

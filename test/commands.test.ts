@@ -199,15 +199,13 @@ describe("/seam — everyday surface", () => {
     expect(ttsVoice?.autocomplete).toBe(true);
     const repo = config?.options?.find((o) => o.name === "repo");
     expect((repo?.options ?? []).map((o) => o.name)).toEqual(["path", "scope"]);
-    expect(repo?.options?.find((o) => o.name === "scope")?.choices?.map((c) => c.value)).toEqual([
-      "session",
+    expect(repo?.options?.find((o) => o.name === "scope")?.choices?.map((c) => c.value)).toEqual([ // #762 §2: common declared scopes.
       "thread",
       "channel",
     ]);
     const card = config?.options?.find((o) => o.name === "card");
     expect((card?.options ?? []).map((o) => o.name)).toEqual(["style", "scope"]);
-    expect(card?.options?.find((o) => o.name === "scope")?.choices?.map((c) => c.value)).toEqual([
-      "session",
+    expect(card?.options?.find((o) => o.name === "scope")?.choices?.map((c) => c.value)).toEqual([ // #762 §2 includes plugin config leaves.
       "thread",
       "channel",
     ]);
@@ -223,6 +221,7 @@ describe("/seam — everyday surface", () => {
       "card",
       "gif",
       "rebuild",
+      "scope",
     ]);
     expect(set?.options?.find((o) => o.name === "json")?.required ?? false).toBe(false);
     for (const name of ["agent", "model", "effort", "repo", "role", "permissions", "card", "gif"]) {
@@ -232,6 +231,17 @@ describe("/seam — everyday surface", () => {
     expect(rebuild?.type).toBe(BOOLEAN);
     expect(rebuild?.required ?? false).toBe(false);
     expect(rebuild?.description).toMatch(/Rebuild session from Discord after applying/);
+  });
+
+  it("config targets share the declared thread/channel choices (#762 §2)", () => {
+    const config = slot(seam(), "config");
+    for (const name of ["agent", "model", "effort", "repo", "role", "edit", "set", "card", "gif"]) {
+      const leaf = config?.options?.find((option) => option.name === name);
+      expect(leaf?.options?.find((option) => option.name === "scope")?.choices, name).toEqual([
+        { name: "This thread", value: "thread" },
+        { name: "Channel default", value: "channel" },
+      ]);
+    }
   });
 
   it("info group has 4 kernel leaves; usage and sessions are plugin contributions", () => {
@@ -342,9 +352,9 @@ describe("/seamadmin — operator surface (#151)", () => {
     expect(() => buildSeamAdminCommand().toJSON()).not.toThrow();
   });
 
-  it("registers exactly 14 top-level slots (4 subcommands + 10 groups)", () => {
+  it("registers exactly 15 top-level slots (5 subcommands + 10 groups)", () => {
     const json = admin();
-    expect(json.options?.length ?? 0).toBe(14);
+    expect(json.options?.length ?? 0).toBe(15);
     expect(json.options?.length ?? 0).toBeLessThanOrEqual(25);
   });
 
@@ -368,6 +378,7 @@ describe("/seamadmin — operator surface (#151)", () => {
       "restrictions",
       "naming",
       "schedule",
+      "config-cleanup",
     ]);
   });
 

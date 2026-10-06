@@ -1,5 +1,10 @@
 import { SlashCommandSubcommandBuilder } from "discord.js";
 
+export function addConfigScope(sub: SlashCommandSubcommandBuilder): SlashCommandSubcommandBuilder {
+  return sub.addStringOption(o => o.setName("scope").setDescription("This thread or channel default; parent commands use channel default")
+    .addChoices({ name: "This thread", value: "thread" }, { name: "Channel default", value: "channel" }));
+}
+
 /** Keep `/seam new` and `/seam config set` on one registered option contract. */
 export function addConfigSetOptions(sub: SlashCommandSubcommandBuilder): SlashCommandSubcommandBuilder {
   return sub
@@ -38,8 +43,8 @@ export function addConfigSetOptions(sub: SlashCommandSubcommandBuilder): SlashCo
 export const CONFIG_UI_GROUP = { name: "config", description: "Session and bot configuration" };
 export const CONFIG_UI_LEAVES = [
   { name: "show", method: "cmdConfig", access: "read-only", help: "`/seam config show` — inspect session config", leaf: new SlashCommandSubcommandBuilder().setName("show").setDescription("Show current session config").toJSON() },
-  { name: "edit", method: "cmdConfigEdit", access: "mutating", help: "`/seam config edit` — edit session config, then Save/Cancel", leaf: new SlashCommandSubcommandBuilder().setName("edit").setDescription("Open the visual thread config editor (draft, then Save/Cancel)").toJSON() },
-  { name: "set", method: "cmdConfigSet", access: "mutating", help: "`/seam config set [json|fields] [rebuild]` — update configuration", leaf: addConfigSetOptions(new SlashCommandSubcommandBuilder().setName("set").setDescription("Patch config fields together, or replace session JSON")).toJSON() },
+  { name: "edit", method: "cmdConfigEdit", access: "mutating", help: "`/seam config edit [scope]` — edit config, then Save/Cancel", leaf: addConfigScope(new SlashCommandSubcommandBuilder().setName("edit").setDescription("Open the config editor (draft, then Save/Cancel)")).toJSON() },
+  { name: "set", method: "cmdConfigSet", access: "mutating", help: "`/seam config set [json|fields] [scope]` — update configuration", leaf: addConfigScope(addConfigSetOptions(new SlashCommandSubcommandBuilder().setName("set").setDescription("Patch config fields together, or replace session JSON"))).toJSON() },
   { name: "audit", method: "cmdConfigAudit", access: "read-only", help: "`/seam config audit [limit] [entry]` — recent config mutations (who/what/when)", leaf: new SlashCommandSubcommandBuilder().setName("audit").setDescription("Show recent config mutations (who/what/when), newest first")
     .addIntegerOption(o => o.setName("limit").setDescription("How many recent mutations to show (default 20)").setRequired(false).setMinValue(1).setMaxValue(100))
     .addStringOption(o => o.setName("entry").setDescription("Show the before→after diff for one entry id").setRequired(false)).toJSON() },

@@ -7,15 +7,19 @@ import { buildSlashRegistrationBody } from "../packages/core/src/platforms/disco
 import { namingRegistry } from "./plugin-naming-fixture.js";
 
 export const visualConfig = { BRAND_ICON_BASE_URL: DEFAULT_BRAND_ICON_BASE_URL, SIMPLE_CARD_GIF_MANIFEST_URL: DEFAULT_GIF_MANIFEST_URL };
+export const visualPort = {
+  read: () => ({ style: { value: "full" as const, source: "default" }, gif: { value: false, source: "default" } }),
+  write: () => ({ ok: true as const }), overrides: () => ({}), offer: async () => {},
+};
 export function visualCommands() {
   const registry = namingRegistry();
-  const plugin = createCardVisualsPlugin({ read: () => undefined, write: () => ({ ok: true }) });
+  const plugin = createCardVisualsPlugin(visualPort);
   registry.register(plugin.id, plugin.contributions.slash!, { logger: pino({ level: "silent" }), config: visualConfig });
   return buildSlashRegistrationBody(registry);
 }
 export async function visualHost(base = DEFAULT_BRAND_ICON_BASE_URL) {
   const host = new PluginHost(pino({ level: "silent" }));
-  await host.loadBuiltins([{ id: "card-visuals", load: async () => createCardVisualsPlugin({ read: () => undefined, write: () => ({ ok: true }) }) }],
+  await host.loadBuiltins([{ id: "card-visuals", load: async () => createCardVisualsPlugin(visualPort) }],
     { "card-visuals": { ...visualConfig, BRAND_ICON_BASE_URL: base } });
   return host;
 }

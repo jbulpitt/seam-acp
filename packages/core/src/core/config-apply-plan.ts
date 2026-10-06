@@ -8,12 +8,13 @@ import type { BridgeHub } from "./bridge-hub.js";
 import type { ModelCatalogService } from "./model-catalog/service.js";
 import type { SessionControlRuntime, ThreadSessionControlDeps } from "./runtime-transition.js";
 import { RuntimeTransition } from "./runtime-transition.js";
-import { type ConfigMutationService, type ConfigMutationInput, type ConfigProposal, type MutationActor, type ConfigMutationTier, type ProposedField } from "./config-mutation.js";
+import { type ConfigMutationService, type ConfigMutationInput, type ConfigProposal, type MutationActor, type ConfigMutationTier, type ProposedField, type ChannelPresetChanges, type ThreadPresetChanges } from "./config-mutation.js";
+import { configTarget, CONFIG_DEFAULT_FIELDS, type ConfigDefaultField, type OverrideCounts } from "./config-target.js";
 import { parseStatusCardStyle, parseSimpleCardGif, type SessionRecord, type SessionConfigState, type PermissionPolicyMode, type StatusCardStyle, type Preset } from "./types.js";
 import { LOCAL_LOCATION, isLocalLocation, parseAgentAtLocation } from "./location.js";
 import { isWithinRoot } from "./path-utils.js";
 import { bindSessionLocation } from "./location-bind.js";
-import { buildSavePlan, fastModeWillResetSession, willVerifyFastMode, type ThreadConfigDraft } from "../platforms/discord/config-editor.js";
+import { buildSavePlan, snapshotFromDescribe, fastModeWillResetSession, willVerifyFastMode, type ThreadConfigDraft } from "../platforms/discord/config-editor.js";
 import { FAST_MODE_CONFIG_ID, settleFastMode, fastModeRetirementFailure } from "./fast-mode.js";
 
 export interface TargetIdentityChanges {
@@ -68,12 +69,14 @@ export const CONFIG_SET_FIELD_NAMES = [
 ] as const;
 export type ConfigSetFieldName = (typeof CONFIG_SET_FIELD_NAMES)[number];
 export type ConfigSetRequest = {
+  scope?: string | null;
   json: string | null;
   rebuild: boolean;
   values: Record<ConfigSetFieldName, string | null>;
   supplied: ConfigSetFieldName[];
 };
 export type PreparedConfigSet =
+  | { kind: "overlay"; changes: ThreadPresetChanges; permission?: PermissionPolicyMode }
   | { kind: "json"; cfg: SessionConfigState }
   | {
       kind: "named";
@@ -116,6 +119,10 @@ export class ConfigApplyPlan {
   private get modelCatalog() { return this.settings!.modelCatalog; }
   private get bridgeHub() { return this.settings!.bridgeHub; }
   private get identityEffects() { return { flush: this.settings!.identityCommitted }; }
+  private publishChannelIdentity() {
+    // Channel naming can wait on Discord; the configuration is already committed.
+    void this.identityEffects.flush().catch(err => this.logger.error({ err }, "channel identity publication failed"));
+  }
   private persistConfig(record: SessionRecord, cfg: SessionConfigState) { this.settings!.persistConfig(record, cfg); }
   private repoDisplay(repo: string | null) { return this.settings!.repoDisplay(repo); }
   private refuseUnregisteredAgent(id: string, fallback: string) { return this.settings!.unregisteredAgentMessage(id, fallback); }
@@ -157,7 +164,138 @@ export class ConfigApplyPlan {
   applyChannelOverlay(...args: Parameters<ConfigMutationService["applyChannelOverlay"]>) { return this.configMutation.applyChannelOverlay(...args); }
   applyThreadLocation(...args: Parameters<ConfigMutationService["applyThreadLocation"]>) { return this.configMutation.applyThreadLocation(...args); }
   readThreadPresetEntry(...args: Parameters<ConfigMutationService["readThreadPresetEntry"]>) { return this.configMutation.readThreadPresetEntry(...args); }
+  readPresetsSnapshot() { return this.configMutation.readPresetsSnapshot(); }
   restoreThreadPresetEntry(...args: Parameters<ConfigMutationService["restoreThreadPresetEntry"]>) { return this.configMutation.restoreThreadPresetEntry(...args); }
+
+  describeTarget(channel: ChannelRef, scope?: string | null) {
+    const target = configTarget(channel, scope);
+    const record = target.kind === "channel"
+      ? this.router.previewSessionRecord({ platform: channel.platform, channelRef: channel.id, parentRef: target.id, cwd: this.config.REPOS_ROOT })
+      : this.router.ensureSessionRecord({ platform: channel.platform, channelRef: channel.id, parentRef: channel.parentId, cwd: this.config.REPOS_ROOT });
+    return this.router.describeConfig(record, target.kind === "channel" ? { inherit: true } : {});
+  }
+
+  snapshot(channel: ChannelRef) {
+    const target = configTarget(channel);
+    const record = target.kind === "thread"
+      ? this.router.ensureSessionRecord({ platform: channel.platform, channelRef: channel.id,
+          ...(channel.parentId ? { parentRef: channel.parentId } : {}), cwd: this.config.REPOS_ROOT })
+      : this.router.previewSessionRecord({ platform: channel.platform, channelRef: channel.id, cwd: this.config.REPOS_ROOT });
+    const chan = this.config.channelPresets.get(target.kind === "channel" ? target.id : target.parentRef!);
+    const inherited = this.router.describeConfig(record, { inherit: true });
+    return { desc: this.describeTarget(channel), withoutThread: {
+      location: inherited.location.value, agent: inherited.agent.value, model: inherited.model.value,
+      effort: inherited.effort.value, cwd: inherited.cwd.value, permission: inherited.permission.value,
+      detached: inherited.detached.value, fastMode: inherited.fastMode.value,
+      statusCardStyle: inherited.statusCardStyle.value, simpleCardGif: inherited.simpleCardGif.value,
+      role: inherited.role.value, disableThreadPrefix: inherited.disableThreadPrefix.value,
+    }, threadOverrides: target.kind === "thread" ? this.threadOverrideFields(record) : [], channelPins: {
+      ...(chan?.agent?.value ? { agent: chan.agent.value } : {}), ...(chan?.model?.value ? { model: chan.model.value } : {}),
+      ...(chan?.cwd?.value ? { cwd: chan.cwd.value } : {}), ...(chan?.effort?.value ? { effort: chan.effort.value } : {}),
+      ...(chan?.role?.value ? { role: chan.role.value } : {}), ...(chan?.disableThreadPrefix ? { disableThreadPrefix: chan.disableThreadPrefix.value } : {}),
+      ...(chan?.statusCardStyle ? { statusCardStyle: chan.statusCardStyle.value } : {}), ...(chan?.simpleCardGif ? { simpleCardGif: chan.simpleCardGif.value } : {}),
+    } };
+  }
+
+  overrideCounts(channelId: string, fields: readonly ConfigDefaultField[] = CONFIG_DEFAULT_FIELDS): OverrideCounts {
+    const records = this.settings!.store.listSessionsByParentInCreationOrder("discord", channelId);
+    const overrides = records.map(record => this.threadOverrideFields(record));
+    const counts: OverrideCounts = {};
+    for (const field of fields) {
+      counts[field] = overrides.filter(entry => entry.includes(field)).length;
+    }
+    return counts;
+  }
+
+  /** Persisted overrides include legacy mirrors hidden by a channel default. */
+  threadOverrideFields(record: SessionRecord): ConfigDefaultField[] {
+    const cfg = this.store.readConfig(record);
+    const pins = this.config.threadPresets.get(record.channelRef);
+    return CONFIG_DEFAULT_FIELDS.filter(field => {
+      if (pins?.[field] !== undefined) return true;
+      if (field === "agent") return record.agentId !== this.router.describeConfig(record, { inherit: true }).agent.value;
+      if (field === "cwd") return cfg.sessionCwdExplicit === true && record.repoPath !== null;
+      return (field === "effort" ? "reasoningEffort" : field) in cfg;
+    });
+  }
+
+  clearLegacyOverrides(record: SessionRecord, changes: ChannelPresetChanges): SessionRecord {
+    const cfg = this.store.readConfig(record);
+    const next = { ...record };
+    for (const [field, value] of Object.entries(changes)) {
+      if (field === "agent") next.agentId = value as string ?? this.router.describeConfig(record, { inherit: true }).agent.value;
+      else if (value === null) {
+        if (field === "cwd") { next.repoPath = null; delete cfg.sessionCwdExplicit; }
+        else delete (cfg as Record<string, unknown>)[field === "effort" ? "reasoningEffort" : field];
+      }
+    }
+    next.configJson = this.store.writeConfig(cfg);
+    this.store.upsert(next);
+    return next;
+  }
+
+  async followChannel(channelId: string, fields: readonly ConfigDefaultField[], actor: MutationActor) {
+    const records = this.settings!.store.listSessionsByParentInCreationOrder("discord", channelId);
+    const ids = new Set(records.map(row => row.channelRef));
+    const changes = Object.fromEntries(fields.map(field => [field, null])) as ChannelPresetChanges;
+    for (const id of ids) {
+      const row = records.find(record => record.channelRef === id);
+      const before = row ? this.router.describeConfig(row) : undefined;
+      const result = this.applyThreadOverlay({ threadId: id, parentRef: channelId, changes, actor });
+      if (!result.ok && !result.error.includes("No effective change")) throw new Error(result.error);
+      if (row && before) await this.runtime.applySavedSelection(this.clearLegacyOverrides(row, changes), before);
+    }
+    await this.identityEffects.flush();
+    return ids.size;
+  }
+
+  async clearThreadOverrides(channel: ChannelRef, fields: readonly ConfigDefaultField[], actor: MutationActor) {
+    const record = this.router.ensureSessionRecord({ platform: channel.platform, channelRef: channel.id, parentRef: channel.parentId, cwd: this.config.REPOS_ROOT });
+    const before = this.router.describeConfig(record);
+    const changes = Object.fromEntries(fields.map(field => [field, null])) as ChannelPresetChanges;
+    const result = this.applyThreadOverlay({ threadId: channel.id, parentRef: channel.parentId, changes, actor });
+    if (!result.ok && !result.error.includes("No effective change")) throw new Error(result.error);
+    const current = this.clearLegacyOverrides(record, changes);
+    await this.runtime.applySavedSelection(current, before);
+    await this.identityEffects.flush(record.id);
+    return this.router.describeConfig(this.settings!.store.get(record.id) ?? current);
+  }
+
+  async prepareChannelSet(channel: ChannelRef, request: ConfigSetRequest) {
+    const requestError = configSetRequestError(request);
+    if (requestError) return { ok: false as const, message: requestError };
+    if (request.json !== null || request.rebuild || request.values.permissions !== null) {
+      return { ok: false as const, message: "Session JSON, permissions and rebuild belong to a thread, not channel defaults." };
+    }
+    const changes: ChannelPresetChanges = {};
+    for (const field of request.supplied) {
+      const value = request.values[field]!.trim();
+      const clear = value === "__inherit__" || value === "inherit" || (["effort", "card", "gif"].includes(field) && value === "default") || (field === "role" && value === "auto");
+      if (field === "repo") {
+        changes.cwd = clear ? null : await this.settings!.resolveRequestedRepoPath!(channel, value, LOCAL_LOCATION);
+        if (changes.cwd && !isWithinRoot(changes.cwd, this.config.REPOS_ROOT)) return { ok: false as const, message: `Repo \`${changes.cwd}\` is outside REPOS_ROOT (\`${this.config.REPOS_ROOT}\`).` };
+      }
+      else if (field === "card") {
+        if (!clear && value !== "full" && value !== "simple") return { ok: false as const, message: "`card` must be full, simple or default." };
+        changes.statusCardStyle = clear ? null : value as StatusCardStyle;
+      } else if (field === "gif") {
+        if (!clear && value !== "on" && value !== "off") return { ok: false as const, message: "`gif` must be on, off or default." };
+        changes.simpleCardGif = clear ? null : value === "on";
+      } else if (field !== "permissions") Object.assign(changes, { [field]: clear ? null : field === "agent" ? parseAgentAtLocation(value).agentId : value });
+    }
+    if (changes.agent !== undefined && (changes.agent === null || changes.agent !== this.describeTarget(channel, "channel").agent.value)) {
+      if (!request.supplied.includes("model")) changes.model = null;
+      if (!request.supplied.includes("effort")) changes.effort = null;
+    }
+    return { ok: true as const, prepared: { kind: "channel" as const, channelId: configTarget(channel, "channel").id, changes } };
+  }
+
+  async applyChannelSet(channel: ChannelRef, prepared: { channelId: string; changes: ChannelPresetChanges }, actor: MutationActor) {
+    const result = this.applyChannelOverlay({ channelId: prepared.channelId, changes: prepared.changes, actor });
+    if (!result.ok && !result.error.includes("No effective change")) return { ok: false as const, message: result.error, rollbackError: "" };
+    this.publishChannelIdentity();
+    return { ok: true as const, effective: this.describeTarget(channel, "channel"), restartRequested: false };
+  }
 
   applyTargetIdentity(
     target: SessionRecord,
@@ -270,6 +408,36 @@ export class ConfigApplyPlan {
     const { json, values, supplied } = request;
     const requestError = configSetRequestError(request);
     if (requestError) return { ok: false, message: requestError };
+
+    if (json === null && supplied.some(field => values[field] === "inherit" || values[field] === "__inherit__" ||
+      (["effort", "card", "gif"].includes(field) && values[field] === "default") || (field === "role" && values[field] === "auto"))) {
+      const changes: ThreadPresetChanges = {};
+      let permission: PermissionPolicyMode | undefined;
+      for (const field of supplied) {
+        const value = values[field]!.trim();
+        const clear = value === "inherit" || value === "__inherit__" || (["effort", "card", "gif"].includes(field) && value === "default") || (field === "role" && value === "auto");
+        if (field === "agent") {
+          const parsed = parseAgentAtLocation(value);
+          changes.agent = clear ? null : parsed.agentId;
+          changes.location = clear ? null : parsed.explicit ? parsed.location : null;
+          if (!supplied.includes("model")) changes.model = null;
+          if (!supplied.includes("effort")) changes.effort = null;
+        } else if (field === "repo") {
+          changes.cwd = clear ? null : await this.settings!.resolveRequestedRepoPath!(channel, value, resolveThreadLocation(this.config, channel.id));
+          if (changes.cwd && isLocalLocation(resolveThreadLocation(this.config, channel.id)) && !isWithinRoot(changes.cwd, this.config.REPOS_ROOT)) return { ok: false, message: `Repo \`${changes.cwd}\` is outside REPOS_ROOT (\`${this.config.REPOS_ROOT}\`).` };
+        } else if (field === "card") {
+          if (!clear && value !== "full" && value !== "simple") return { ok: false, message: "`card` must be full, simple or default." };
+          changes.statusCardStyle = clear ? null : value as StatusCardStyle;
+        } else if (field === "gif") {
+          if (!clear && value !== "on" && value !== "off") return { ok: false, message: "`gif` must be on, off or default." };
+          changes.simpleCardGif = clear ? null : value === "on";
+        } else if (field === "permissions") {
+          if (!["always", "ask", "deny"].includes(value)) return { ok: false, message: "`permissions` must be always, ask or deny." };
+          permission = value as PermissionPolicyMode;
+        } else Object.assign(changes, { [field]: clear ? null : value });
+      }
+      return { ok: true, prepared: { kind: "overlay", changes, permission } };
+    }
 
     if (json !== null) {
       let cfg: SessionConfigState;
@@ -433,6 +601,38 @@ export class ConfigApplyPlan {
     | { ok: true; record: SessionRecord; effective: ReturnType<SessionRouter["describeConfig"]>; restartRequested: boolean }
     | { ok: false; message: string; rollbackError: string }
   > {
+    if (prepared.kind === "overlay") {
+      const before = this.router.describeConfig(record);
+      const source = { ...(this.store.get(record.id) ?? record) };
+      const overlay = this.readThreadPresetEntry(channel.id);
+      try {
+        const result = this.applyThreadOverlay({ threadId: channel.id, parentRef: channel.parentId, changes: prepared.changes, actor });
+        if (!result.ok && !result.error.includes("No effective change")) throw new Error(result.error);
+        let current = this.clearLegacyOverrides(source, prepared.changes);
+        const changes = prepared.changes;
+        if (prepared.permission || changes.role != null || changes.statusCardStyle != null || changes.simpleCardGif != null) {
+          const cfg = this.store.readConfig(current);
+          if (changes.role != null) cfg.role = changes.role;
+          if (changes.statusCardStyle != null) cfg.statusCardStyle = changes.statusCardStyle;
+          if (changes.simpleCardGif != null) cfg.simpleCardGif = changes.simpleCardGif;
+          if (prepared.permission) {
+            cfg.permissionPolicy = prepared.permission;
+            delete cfg.autoApprovePermissions;
+          }
+          this.persistConfig(current, cfg);
+          current = this.store.get(record.id) ?? current;
+        }
+        if (prepared.permission) await this.runtime.applyPermissionMode(current);
+        await this.runtime.applySavedSelection(current, before);
+        if (opts.applyName) await this.identityEffects.flush(record.id);
+        const committed = this.store.get(record.id) ?? current;
+        return { ok: true, record: committed, effective: this.router.describeConfig(committed), restartRequested: false };
+      } catch (err) {
+        const restored = this.restoreThreadPresetEntry(channel.id, overlay);
+        this.store.upsert(source);
+        return { ok: false, message: err instanceof Error ? err.message : String(err), rollbackError: restored.ok ? "" : ` Overlay rollback failed: ${restored.error}` };
+      }
+    }
     let sessionBefore: SessionRecord | undefined;
     let overlayBefore: unknown | undefined;
     let mutationStarted = false;
@@ -736,9 +936,15 @@ export class ConfigApplyPlan {
     return notes.length > 0 ? `${body}\n${notes.join("\n")}` : body;
   }
   async saveEditor(draft: ThreadConfigDraft, actor: MutationActor, canEditChannelPreset: (parent: string) => boolean) {
-    const bound = this.settings!.store.getByChannel("discord", draft.threadId);
+    const channel: ChannelRef = { platform: "discord", id: draft.threadId,
+      ...(!draft.channelOnly && draft.parentRef ? { parentId: draft.parentRef } : {}) };
+    const bound = draft.channelOnly ? null : this.settings!.store.getByChannel("discord", draft.threadId);
     const before = bound ? this.router.describeConfig(bound) : undefined;
-    const plan = buildSavePlan(draft);
+    // Compare touched fields with the latest save, so a revert cancels a pending selection.
+    const plan = buildSavePlan(before ? { ...draft, snapshot: {
+      ...snapshotFromDescribe(before, draft.snapshot.withoutThread), channelPins: draft.snapshot.channelPins,
+      threadOverrides: this.threadOverrideFields(bound!),
+    } } : draft);
     const hasPreset = Object.keys(plan.threadPreset).length > 0;
     if (hasPreset) {
       const written = this.configMutation.applyThreadOverlay({
@@ -747,9 +953,10 @@ export class ConfigApplyPlan {
         changes: plan.threadPreset,
         actor,
       });
-      if (!written.ok) {
+      if (!written.ok && !written.error.includes("No effective change")) {
         return { ok: false as const, error: `Could not save: ${written.error}` };
       }
+      if (bound) this.clearLegacyOverrides(bound, plan.threadPreset);
     }
     if (plan.channelPreset && Object.keys(plan.channelPreset).length > 0) {
       if (!draft.parentRef) {
@@ -768,6 +975,10 @@ export class ConfigApplyPlan {
       if (!written.ok) {
         return { ok: false as const, error: `Could not save: ${written.error}` };
       }
+    }
+    if (draft.channelOnly) {
+      this.publishChannelIdentity();
+      return { ok: true as const, draft, snapshot: this.snapshot(channel), fastRefusal: undefined, fastRetireFailed: false };
     }
     if (plan.permission !== undefined || plan.statusCardStyle !== undefined || plan.simpleCardGif !== undefined) {
       const record = this.router.ensureSessionRecord({
@@ -884,7 +1095,7 @@ export class ConfigApplyPlan {
     }
 
     await this.identityEffects.flush(`discord:${draft.threadId}`);
-    return { ok: true as const, draft, fastRefusal, fastRetireFailed };
+    return { ok: true as const, draft, snapshot: this.snapshot(channel), fastRefusal, fastRetireFailed };
   }
 }
 

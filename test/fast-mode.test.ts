@@ -1129,6 +1129,7 @@ function saveHarness(opts: {
   };
 
   const orch = {
+    config: { REPOS_ROOT: "/repo", channelPresets: new Map(), threadPresets: new Map() },
     store: {
       getByChannel: () => rec,
       get: () => rec,
@@ -1166,6 +1167,7 @@ function saveHarness(opts: {
         };
       },
       describeConfig: () => ({
+        ...snapshot({ fastMode: setting(fastPreset, fastPreset ? "thread preset" : "default") }),
         agent: { value: "claude", source: "session config" },
         model: { value: model, source: "session config" },
         effort: { value: "medium", source: "session config" },

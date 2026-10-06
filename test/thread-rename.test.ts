@@ -137,6 +137,7 @@ describe("thread naming contributions", () => {
         options: { getSubcommand: () => "role", getSubcommandGroup: () => "config", getString: (name: string) => name === "value" ? "analyst" : name === "scope" ? "channel" : null }, reply };
       await h.orchestrator.handleSlashInteraction(native as never);
       expect(reply).toHaveBeenCalledWith(expect.objectContaining({ content: expect.stringContaining("Role set to `analyst`") }));
+      await h.host.identity.drain();
       expect(h.names.get("thread")).toBe("🧬🌞🔬1️⃣ my task");
       expect(h.names.get("third")).toBe("🧬🌞🔬2️⃣ my task");
     } finally { await h.close(); }

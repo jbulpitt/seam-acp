@@ -13,6 +13,7 @@ import { CONFIG_UI_LEAVES } from "../packages/core/src/plugins/config-ui/command
 import { createQuotaPlugin } from "../packages/core/src/plugins/quota/index.js";
 import { createCardVisualsPlugin } from "../packages/core/src/plugins/card-visuals/index.js";
 import { sessionBrowserPlugin } from "../packages/core/src/plugins/session-browser/index.js";
+import { visualPort } from "./plugin-card-visuals-fixture.js";
 import type { SessionBrowserFacade } from "../packages/core/src/core/session-browser.js";
 import { acknowledgeComponentInteraction } from "../packages/core/src/platforms/discord/interaction-response.js";
 
@@ -89,7 +90,7 @@ describe("slash leaf access", () => {
       expect(getSlashCommandAccess("seam", "config", sub)?.kind).toBe("read-only");
       expect(getSlashCommandAccess("seam", "config", sub, (name) => name === option ? "new" : null)?.kind).toBe("mutating");
     }
-    const visuals = createCardVisualsPlugin({ read: () => undefined, write: () => ({ ok: true }) });
+    const visuals = createCardVisualsPlugin(visualPort);
     for (const contribution of visuals.contributions.slash!) {
       const access = contribution.access as (get: (name: string) => string | null) => { kind: string };
       expect(access(() => null).kind).toBe("read-only");

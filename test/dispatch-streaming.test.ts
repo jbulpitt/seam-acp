@@ -5,6 +5,7 @@ import path from "node:path";
 import { readdir, readFile } from "node:fs/promises";
 import { pino } from "pino";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
+import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 import { dispatchDirs, type DispatchSpec } from "../packages/core/src/core/dispatch/types.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import type { SessionRecord, StructuredPanel } from "../packages/core/src/core/types.js";
@@ -148,6 +149,7 @@ function makeOrch(opts: {
     router: router as any,
     store: store as any,
     renderer: {} as any,
+    modelCatalog: fixtureModelCatalog([]),
   });
   if (opts.voiceConsole) orchestrator.setVoiceConsoleController(opts.voiceConsole);
   return orchestrator;

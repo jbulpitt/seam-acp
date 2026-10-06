@@ -1004,7 +1004,7 @@ export class ConfigMutationService {
     }
     return this.persistPresetsCandidate({
       file: loaded.file,
-      candidate: parsed.data,
+      candidate,
       tmpId: randomUUID(),
     });
   }

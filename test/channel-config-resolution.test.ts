@@ -58,7 +58,8 @@ function fixture() {
     identityCommitted: async () => {}, persistConfig: (row, cfg) => store.upsert({ ...row, configJson: JSON.stringify(cfg) }),
     repoDisplay: repo => repo ?? "", unregisteredAgentMessage: (_id, message) => message,
     parkedSelectMessage: () => null });
-  const record = router.ensureSessionRecord({ platform: "discord", channelRef: channel.id, parentRef: channel.parentId, cwd: dir });
+  const created = router.ensureSessionRecord({ platform: "discord", channelRef: channel.id, parentRef: channel.parentId, cwd: dir });
+  const record = store.get(created.id)!;
   const bare = Object.assign(Object.create(Orchestrator.prototype), { store, router, config, logger,
     adapter: { resolveChannel: vi.fn(async (ref: typeof channel) => ({ ...ref, parentId: "111111111111111111" })) } });
   return { maps, catalog, router, mutation, plan, runtime, config, record, bare };
@@ -145,8 +146,8 @@ describe("one channel configuration resolution", () => {
         case "reauth": return h.bare.postReauthCard(target, "attempt", {});
         case "steer":
           h.bare.normalizeAutocompleteSubmission = async () => target;
-          return h.bare.cmdSteer({ channelId: channel.id, channel: { parentId: channel.parentId },
-            options: { getString: (key: string) => key === "333333333333333333" ? target : "steer", getBoolean: () => false } });
+          return h.bare.cmdSteer({ channelId: channel.id, channel: { parentId: channel.parentId, isThread: () => true },
+            options: { getString: (key: string) => key === "thread" ? target : "steer", getBoolean: () => false } });
       }
     };
     if (entry === "reauth") expect(await invoke()).toBeUndefined();
@@ -196,7 +197,8 @@ describe("one channel configuration resolution", () => {
     const prepared = await h.plan.prepareConfigSet(row, channel, { ...request, supplied: ["agent"] });
     expect(prepared).toMatchObject({ ok: true, prepared: { model: "codex-channel", pinnedEffort: "high", inheritSelection: true } });
     if (!prepared.ok) throw new Error(prepared.message);
-    expect(await h.plan.applyPreparedConfigSet(row, channel, { ...request, supplied: ["agent"] }, prepared.prepared, actor)).toMatchObject({ ok: true });
+    expect(await h.plan.applyPreparedConfigSet(row, channel, { ...request, supplied: ["agent"] }, prepared.prepared, actor,
+      { retireRuntime: true, applyName: true })).toMatchObject({ ok: true });
     expect(h.maps.threadPresets.get(channel.id)?.model).toBeUndefined();
     expect(h.maps.threadPresets.get(channel.id)?.effort).toBeUndefined();
   });

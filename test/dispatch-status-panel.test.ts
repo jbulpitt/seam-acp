@@ -9,6 +9,7 @@ import { TurnStatus, formatContextUsage } from "../packages/core/src/core/status
 import { discordRenderer } from "../packages/core/src/platforms/discord/renderer.js";
 import { serializePanelText } from "../packages/core/src/platforms/renderer.js";
 import { visualConfig } from "./plugin-card-visuals-fixture.js";
+import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 import type { DispatchSpec } from "../packages/core/src/core/dispatch/types.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import type { SessionRecord, StructuredPanel } from "../packages/core/src/core/types.js";
@@ -326,6 +327,7 @@ function makeOrch(opts: {
     router: router as any,
     store: store as any,
     renderer: discordRenderer as any,
+    modelCatalog: fixtureModelCatalog([]),
   });
 }
 

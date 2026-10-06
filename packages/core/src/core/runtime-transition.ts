@@ -870,7 +870,8 @@ export class RuntimeTransition {
     const current = this.deps.store.get(target.id);
     if (!current) return { ok: false, error: "Target session disappeared after configuration." };
     const threadIdentityUpdated = await this.applyNaming(current);
-    const effectiveIdentity = identityFromDescription(this.deps.router.describeConfig(current));
+    const effectiveIdentity = identityFromDescription(this.deps.router.describeConfig(current),
+      inheritSelection ? catalogModel?.effort.selectionDefault : undefined);
     const changes = diffIdentity(beforeIdentity, effectiveIdentity);
     return {
       ok: true,
@@ -1275,11 +1276,11 @@ function normalizeStoredEffort(value: string | undefined): string | undefined {
   return !value || value === "default" || value === "auto" ? undefined : value;
 }
 
-function identityFromDescription(value: ConfigDescription): ThreadConfigurationIdentity {
+function identityFromDescription(value: ConfigDescription, defaultEffort = "auto"): ThreadConfigurationIdentity {
   return {
     agent: value.agent.value,
     model: value.model.value,
-    effort: value.effort.value ?? "auto",
+    effort: value.effort.value ?? defaultEffort,
     role: value.role?.value ?? "auto",
     disableThreadPrefix: value.disableThreadPrefix?.value ?? false,
     fastMode: value.fastMode?.value ?? false,

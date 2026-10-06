@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { pino } from "pino";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
+import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 import {
   dispatchDisplayPrompt,
   parseDispatchSpec,
@@ -143,6 +144,7 @@ function harness(dir: string) {
     router: router as any,
     store: store as any,
     renderer: {} as any,
+    modelCatalog: fixtureModelCatalog([]),
   });
   return { orchestrator, oldRecord, newRecord, router, store, sent, log, rows };
 }

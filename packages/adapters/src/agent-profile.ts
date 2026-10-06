@@ -5,6 +5,7 @@ import type { ContextUsage, ISessionManager, SessionSummary } from "./session-ma
 import type { FastModeDescriptor } from "./fast-mode.js";
 import type { AdapterCatalogCandidate, AdapterCatalogSource } from "./model-catalog.js";
 import type { AdapterErrorClassification } from "./error-classification.js";
+import type { CodexUsageData } from "./profiles/codex-session-manager.js";
 
 /**
  * Adapter contract version advertised by in-process local agents via
@@ -285,6 +286,9 @@ export interface AgentAdapter {
     sessionId?: string,
     newerThanMs?: number
   ): Promise<ContextUsage | null>;
+
+  /** Host-owned account quota, independent of session context usage. */
+  accountUsage?(mode: "live" | "snapshot", signal?: AbortSignal): Promise<CodexUsageData>;
 
   /**
    * Host → control-plane file ferry for `seam-attach` (§4.2). Local stub:

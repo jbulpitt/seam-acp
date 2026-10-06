@@ -3,6 +3,7 @@ import type { Logger } from "../../lib/logger.js";
 import type { ChatAdapter, MessageRef } from "../../platforms/chat-adapter.js";
 import type { LayoutBlock, PanelButton, StructuredLayout, StructuredPanel } from "../types.js";
 import type { AgentQuota, QuotaWindow } from "./agent-quota.js";
+import { formatUsageObservation } from "./usage-observation.js";
 
 const DEBOUNCE_MS = 500;
 const COLOR_OK = 0x57f287;
@@ -34,6 +35,7 @@ function resetLabel(window: QuotaWindow): string {
 
 function quotaLine(label: "rolling" | "weekly", window: QuotaWindow): string {
   if (window.label === "unlimited") return `**${label}** unlimited`;
+  if (window.usedPercent === null) return `**${label}** not reported`;
   return `**${label}** \`${usageBar(window.usedPercent)}\` ${Math.round(window.usedPercent)}% · ${resetLabel(window)}`;
 }
 
@@ -53,12 +55,12 @@ export function renderAgentQuotaRow(quota: AgentQuota): string {
   // the card-level header only reflects the last *render*, not each agent's fetch.
   const meta = [
     details.join(" · ") || "plan/credits unavailable",
-    `updated <t:${quota.fetchedAt}:R>`,
+    quota.source ? formatUsageObservation(quota.source) : `updated <t:${quota.fetchedAt}:R>`,
   ].join(" · ");
   return [
     `${quotaLine("rolling", quota.rolling)}`,
     `${quotaLine("weekly", quota.weekly)}`,
-    `${meta}${warning}`,
+    `${meta}${warning}${quota.liveError ? `\nLive read unavailable: ${quota.liveError}` : ""}`,
   ].join("\n");
 }
 
@@ -67,17 +69,23 @@ export function renderAgentQuotaRow(quota: AgentQuota): string {
  * snapshot among visible agents, so the header states the card's worst-case
  * staleness honestly instead of re-claiming "just now" on every re-render.
  */
-function oldestFetchedAt(quotas: AgentQuota[], nowMs: number): number {
+function oldestFetchedAt(quotas: AgentQuota[], nowMs: number): number | null {
+  if (quotas.some(quota => quota.fetchedAt === null)) return null;
   const stamps = quotas
     .map((quota) => quota.fetchedAt)
     .filter((stamp): stamp is number => Number.isFinite(stamp));
   return stamps.length ? Math.min(...stamps) : Math.floor(nowMs / 1000);
 }
 
+function oldestReadingLabel(quotas: AgentQuota[], nowMs: number): string {
+  const at = oldestFetchedAt(quotas, nowMs);
+  return `Oldest reading ${at === null ? "age unknown" : `<t:${at}:R>`} · per-agent times below`;
+}
+
 function isWarning(quotas: AgentQuota[]): boolean {
   return quotas.some(
     (quota) =>
-      !quota.ok || quota.rolling.usedPercent >= 90 || quota.weekly.usedPercent >= 90
+      !quota.ok || (quota.rolling.usedPercent ?? 0) >= 90 || (quota.weekly.usedPercent ?? 0) >= 90
   );
 }
 
@@ -95,7 +103,7 @@ export function renderAgentQuotaLayout(
     { kind: "text", content: `**${warn ? "🟡" : "🟢"} Agent quota**` },
     {
       kind: "text",
-      content: `Oldest reading <t:${oldestFetchedAt(visibleQuotas, nowMs)}:R> · per-agent times below`,
+      content: oldestReadingLabel(visibleQuotas, nowMs),
     },
   ];
   if (visibleQuotas.length === 0) {
@@ -128,7 +136,7 @@ export function renderAgentQuotaPanel(
   return {
     color: warn ? COLOR_WARN : COLOR_OK,
     title: `${warn ? "🟡" : "🟢"} Agent quota`,
-    description: `Oldest reading <t:${oldestFetchedAt(visibleQuotas, nowMs)}:R> · per-agent times below`,
+    description: oldestReadingLabel(visibleQuotas, nowMs),
     fields:
       visibleQuotas.length === 0
         ? [{ name: "Agents", value: "_No configured agents._" }]

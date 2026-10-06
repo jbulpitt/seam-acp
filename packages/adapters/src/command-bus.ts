@@ -23,6 +23,7 @@ export const ADAPTER_RPC_METHODS = [
   "deleteSession",
   "whoami",
   "usage",
+  "accountUsage",
   "writeAttachment",
   "readAttachment",
 ] as const;

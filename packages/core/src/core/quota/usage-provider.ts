@@ -1,10 +1,11 @@
 import {
   fetchAgyUserStatus, fetchClaudeUsage, fetchCodexUsage, fetchCopilotUsage,
   fetchGrokUsage, fetchGrokUsageFromConnection, fetchOllamaCloudUsage,
-  type AgentProfile, type AgyLaunchRuntime,
+  type AgentProfile, type AgyLaunchRuntime, type CodexUsageData,
 } from "@seam/adapters";
 import type { TurnBinding } from "../../plugins/turn-activity-registry.js";
 import { isOllamaCloudAgentId } from "../parked-agents.js";
+import { readCodexAccountUsage } from "./codex-account-usage.js";
 
 export type ProviderUsage =
   | { provider: "agy"; data: Awaited<ReturnType<typeof fetchAgyUserStatus>> }
@@ -30,6 +31,9 @@ export function createUsageProviderPort(options: {
   ollamaUsageCliPath?: string;
   ollamaCloudEnabled?: boolean;
   liveRequest?: (sessionId: string) => ((method: string, params?: unknown) => Promise<unknown>) | undefined;
+  codexLocations?: () => readonly string[];
+  codexAccount?: (location: string) => string | undefined;
+  readCodexHost?: (location: string, mode: "live" | "snapshot", signal?: AbortSignal) => Promise<CodexUsageData>;
 }): UsageProviderPort & { bindings(): readonly Readonly<UsageBinding>[]; binding(agentId: string, sessionId?: string, location?: string): Readonly<UsageBinding> } {
   const profiles = new Map(options.profiles.map(profile => [profile.id, profile]));
   const binding = (agentId: string, sessionId?: string, location = "local"): Readonly<UsageBinding> => {
@@ -55,7 +59,15 @@ export function createUsageProviderPort(options: {
         case "ollama-cloud":
           return { provider: "ollama-cloud", data: await fetchOllamaCloudUsage(options.ollamaUsageCliPath, signal) };
         case "claude": return { provider: "claude", data: await fetchClaudeUsage(profile?.configDir) };
-        case "codex": return { provider: "codex", data: await fetchCodexUsage({ signal }) };
+        case "codex": {
+          const read = options.readCodexHost ?? (profile?.accountUsage
+            ? (_location: string, mode: "live" | "snapshot", signal?: AbortSignal) => profile.accountUsage!(mode, signal)
+            : undefined);
+          return { provider: "codex", data: read ? await readCodexAccountUsage({
+            location: target.location, locations: options.codexLocations?.() ?? [],
+            credentialProfile: options.codexAccount?.(target.location), read, signal,
+          }) : await fetchCodexUsage({ signal }) };
+        }
         case "copilot": return { provider: "copilot", data: await fetchCopilotUsage(profile?.configDir, signal) };
         case "grok": {
           const request = target.sessionId ? options.liveRequest?.(target.sessionId) : undefined;

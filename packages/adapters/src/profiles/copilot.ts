@@ -331,6 +331,7 @@ export async function probeCopilotCatalog(options: {
   args?: string[];
   cwd?: string;
   env?: NodeJS.ProcessEnv;
+  cliVersion?: string;
   timeoutMs?: number;
   overallTimeoutMs?: number;
   cleanupTimeoutMs?: number;
@@ -463,10 +464,21 @@ export async function probeCopilotCatalog(options: {
     if (rows.some((row) => !row)) {
       throw new Error("copilot ACP catalog probe ended with partial model results");
     }
-    const contexts = await probeCopilotModelContexts({
-      cliPath, args, cwd, env, timeoutMs, cleanupTimeoutMs, signal: controller.signal,
-      requestedTier: copilotRequestedContextTier(args), spawnProcess,
-    });
+    let contexts = new Map<string, CopilotModelContext>();
+    try {
+      contexts = await probeCopilotModelContexts({
+        cliPath, args, cwd, env, timeoutMs, cleanupTimeoutMs, signal: controller.signal,
+        requestedTier: copilotRequestedContextTier(args), spawnProcess,
+      });
+    } catch (error) {
+      if (controller.signal.aborted || (error instanceof ProbeError && error.code === "cancelled") ||
+          (error instanceof Error && error.name === "AbortError")) throw error;
+      console.warn(JSON.stringify({
+        level: 40, host: os.hostname(), cliVersion: options.cliVersion ?? "unknown",
+        error: redactProbeText(error instanceof Error ? error.message : String(error), env),
+        msg: "Copilot model limits unavailable; keeping ACP catalog",
+      }));
+    }
     return {
       defaultModel: discovery.defaultModel,
       models: (rows as CopilotCatalogProbeModel[]).map(model => ({
@@ -596,9 +608,10 @@ export function makeCopilotProfile(opts: {
           cwd: runtimeCwd,
           env,
         };
+        const cliVersion = await readCliVersion(cli, ["--version"], { cwd: runtimeCwd, env });
         const probe = opts.catalogProbe
           ? await opts.catalogProbe(catalogLaunch)
-          : await probeCopilotCatalog(catalogLaunch);
+          : await probeCopilotCatalog({ ...catalogLaunch, cliVersion });
         const candidate = await manifestCatalogSource({
           provider: "github-copilot",
           credentialProfile,
@@ -627,7 +640,7 @@ export function makeCopilotProfile(opts: {
           applicationMode: "live",
           source: "copilot-acp-config-options",
         }).fetch();
-        candidate.cliVersion = await readCliVersion(cli);
+        candidate.cliVersion = cliVersion;
         candidate.sourceVersion = `acp/${PROTOCOL_VERSION}`;
         return candidate;
       },

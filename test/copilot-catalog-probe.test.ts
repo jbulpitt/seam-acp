@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
+import os from "node:os";
 import { PassThrough, Readable, Writable } from "node:stream";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   agent,
   ClientSideConnection,
@@ -702,24 +703,51 @@ describe("Copilot isolated catalog probing (#234)", () => {
     expect(harness.active).toBe(0);
   });
 
-  it("surfaces a models.list failure and cleans up without returning a partial catalog", async () => {
-    const harness = fakeCopilotSpawner({ models: modelFixtures(1), sdkError: "provider catalog unavailable" });
-    await expect(probeCopilotCatalog({ spawnProcess: harness.spawnProcess,
-      env: {}, timeoutMs: 1_000, cleanupTimeoutMs: 50 })).rejects.toThrow("provider catalog unavailable");
-    expect(harness.active).toBe(0);
-    expect(harness.closedSessions).toEqual(harness.openedSessions);
-    expect(harness.listenersRemoved).toBe(true);
-    expect(harness.transportsDestroyed).toBe(true);
+  it.each([
+    { label: "fails", sdkError: "provider catalog unavailable", cause: "provider catalog unavailable" },
+    { label: "times out", hangSdk: true, cause: "timed out" },
+  ])("keeps ACP models and efforts when models.list $label, with one cause warning", async ({ cause, ...failure }) => {
+    const models = modelFixtures(5);
+    const harness = fakeCopilotSpawner({ models, ...failure });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const result = await probeCopilotCatalog({ spawnProcess: harness.spawnProcess,
+        env: {}, cliVersion: "Copilot fixture 1.0.80", timeoutMs: 250,
+        overallTimeoutMs: 2_000, cleanupTimeoutMs: 50 });
+      expect(result.defaultModel).toBe(models[0]!.id);
+      expect(result.models).toEqual(models.map(model => ({
+        modelId: model.id, displayName: model.name, effortChoices: model.choices,
+        effortDefault: model.defaultEffort, priceCategory: model.priceCategory,
+      })));
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(JSON.parse(warn.mock.calls[0]![0])).toMatchObject({
+        level: 40, host: os.hostname(), cliVersion: "Copilot fixture 1.0.80",
+        error: expect.stringContaining(cause),
+        msg: "Copilot model limits unavailable; keeping ACP catalog",
+      });
+      expect(harness.sdkRequests).toEqual(["models.list"]);
+      expect(harness.active).toBe(0);
+      expect(harness.closedSessions).toEqual(harness.openedSessions);
+      expect(harness.listenersRemoved).toBe(true);
+      expect(harness.transportsDestroyed).toBe(true);
+    } finally {
+      warn.mockRestore();
+    }
   });
 
-  it("bounds a stalled models.list using the existing probe lifecycle", async () => {
+  it("propagates an overall abort during models.list instead of returning the ACP catalog", async () => {
     const harness = fakeCopilotSpawner({ models: modelFixtures(1), hangSdk: true });
-    await expect(probeCopilotCatalog({ spawnProcess: harness.spawnProcess,
-      timeoutMs: 100, overallTimeoutMs: 2_000, cleanupTimeoutMs: 50 })).rejects.toThrow(/timed out/);
-    expect(harness.sdkRequests).toEqual(["models.list"]);
-    expect(harness.active).toBe(0);
-    expect(harness.closedSessions).toEqual(harness.openedSessions);
-    expect(harness.listenersRemoved).toBe(true);
-    expect(harness.transportsDestroyed).toBe(true);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await expect(probeCopilotCatalog({ spawnProcess: harness.spawnProcess,
+        timeoutMs: 1_000, overallTimeoutMs: 500, cleanupTimeoutMs: 50 }))
+        .rejects.toThrow("catalog probe timed out after 500ms");
+      expect(warn).not.toHaveBeenCalled();
+      expect(harness.sdkRequests).toEqual(["models.list"]);
+      expect(harness.active).toBe(0);
+      expect(harness.closedSessions).toEqual(harness.openedSessions);
+    } finally {
+      warn.mockRestore();
+    }
   });
 });

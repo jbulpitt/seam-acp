@@ -1,6 +1,7 @@
 import { execFile, spawn, type ChildProcessByStdio } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import type { Readable, Writable } from "node:stream";
 import { AGENT_ADAPTER_VERSION, asLocalAdapter, type AgentProfile } from "../agent-profile.js";
@@ -21,6 +22,9 @@ import {
 import {
   CodexSessionManager,
   defaultCodexSessionsRoot,
+  fetchCodexUsage,
+  mapCodexRateLimits,
+  type CodexUsageData,
 } from "./codex-session-manager.js";
 import {
   classifyAndAttach,
@@ -219,7 +223,7 @@ class CodexAppServerJsonRpc {
   private readonly onStdoutError = (error: Error): void => this.fail(error);
   private readonly onStdinError = (error: Error): void => this.fail(error);
   private readonly onAbort = (): void => this.fail(
-    new ProbeError("cancelled", "Codex ACP app-server model/list cancelled")
+    new ProbeError("cancelled", "Codex ACP app-server request cancelled")
   );
 
   constructor(private readonly handle: ProbeHandle) {
@@ -367,6 +371,37 @@ async function probeCodexAppServer(
         cursor = nextCursor;
       }
       throw new Error(`configured Codex ACP app-server model/list exceeded ${CODEX_CATALOG_MAX_PAGES} pages`);
+    },
+  });
+}
+
+/** Read account limits without starting a thread or prompting a model. */
+export async function probeCodexAccountRateLimits(
+  runtime: CodexRuntimeCommand,
+  signal?: AbortSignal,
+  timeoutMs = CODEX_CATALOG_TIMEOUT_MS,
+): Promise<CodexUsageData> {
+  return runBoundedProbe({
+    executable: runtime.executable, args: [...runtime.baseArgs, "cli", "app-server"],
+    cwd: runtime.cwd, env: runtime.env, timeoutMs, signal,
+    maxStdoutBytes: CODEX_CATALOG_MAX_BYTES,
+    label: "Codex account/rateLimits/read",
+    async run(handle) {
+      const connection = new CodexAppServerJsonRpc(handle);
+      await connection.request("initialize", {
+        clientInfo: { name: "seam-quota-collector", title: "Seam Quota Collector", version: String(AGENT_ADAPTER_VERSION) },
+        capabilities: null,
+      });
+      handle.stdin.write(`${JSON.stringify({ method: "initialized" })}\n`);
+      const result = record(await connection.request("account/rateLimits/read", {}));
+      const buckets = record(result?.rateLimitsByLimitId);
+      const usage = mapCodexRateLimits(buckets?.codex ?? result?.rateLimits);
+      if (!usage || (!usage.primary && !usage.secondary && !usage.credits)) {
+        throw new Error("Codex account/rateLimits/read returned no rate-limit data");
+      }
+      return { ...usage,
+        source: { kind: "live", host: os.hostname(), observedAt: new Date().toISOString() },
+      };
     },
   });
 }
@@ -747,6 +782,18 @@ export function makeCodexProfile(opts: {
     id: profileId,
     displayName: opts.displayName ?? "OpenAI Codex",
     defaultModel: opts.defaultModel,
+    ...(directCodex ? { async accountUsage(signal?: AbortSignal): Promise<CodexUsageData> {
+      try {
+        return await probeCodexAccountRateLimits(runtime, signal);
+      } catch (error) {
+        if (signal?.aborted || (error instanceof ProbeError && error.code === "cancelled")) throw error;
+        const liveError = redactProbeText(errorText(error), runtime.env);
+        const snapshot = await fetchCodexUsage({ sessionsRoot, signal });
+        return { ...snapshot, liveError,
+          ...(!snapshot.ok ? { error: `${liveError}; ${snapshot.error}` } : {}),
+        };
+      }
+    } } : {}),
     catalog: {
       scope: () => scope,
       async fetch() {

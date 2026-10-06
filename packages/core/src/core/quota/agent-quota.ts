@@ -10,7 +10,7 @@ import type {
 } from "@seam/adapters";
 
 export interface QuotaWindow {
-  usedPercent: number;
+  usedPercent: number | null;
   /** Unix seconds, or null when the window has no reset. */
   resetsAt: number | null;
   label: string;
@@ -26,8 +26,10 @@ export interface AgentQuota {
   rolling: QuotaWindow;
   weekly: QuotaWindow;
   credits?: { balance: string; unlimited: boolean } | null;
-  /** Unix seconds when this snapshot was fetched. */
-  fetchedAt: number;
+  /** Unix seconds of the observation; null when its timestamp is unknown. */
+  fetchedAt: number | null;
+  source?: CodexUsageData["source"];
+  liveError?: string;
 }
 
 export interface QuotaAgentIdentity {
@@ -125,11 +127,14 @@ export function mapCodexQuota(
     ok: data.ok,
     ...(data.error ? { error: data.error } : {}),
     plan: data.plan,
-    ...normalizeQuotaWindows({ rolling, weekly }, fetchedAt),
+    rolling: rolling ?? { usedPercent: null, resetsAt: null, label: "rolling" },
+    weekly: weekly ?? { usedPercent: null, resetsAt: null, label: "weekly" },
     credits: data.credits
       ? { balance: data.credits.balance, unlimited: data.credits.unlimited }
       : null,
-    fetchedAt,
+    fetchedAt: data.source ? unixSeconds(data.source.observedAt) : fetchedAt,
+    ...(data.source ? { source: data.source } : {}),
+    ...(data.liveError ? { liveError: data.liveError } : {}),
   };
 }
 

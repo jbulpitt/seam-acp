@@ -55,7 +55,8 @@ export function createUsageProviderPort(options: {
         case "ollama-cloud":
           return { provider: "ollama-cloud", data: await fetchOllamaCloudUsage(options.ollamaUsageCliPath, signal) };
         case "claude": return { provider: "claude", data: await fetchClaudeUsage(profile?.configDir) };
-        case "codex": return { provider: "codex", data: await fetchCodexUsage({ signal }) };
+        case "codex": return { provider: "codex", data: await (profile?.accountUsage
+          ? profile.accountUsage(signal) : fetchCodexUsage({ signal })) };
         case "copilot": return { provider: "copilot", data: await fetchCopilotUsage(profile?.configDir, signal) };
         case "grok": {
           const request = target.sessionId ? options.liveRequest?.(target.sessionId) : undefined;

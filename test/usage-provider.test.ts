@@ -44,4 +44,16 @@ describe("internal usage-provider port", () => {
     await expect(port.readUsage(port.binding("gemini"))).rejects.toThrow("Agent 'gemini' does not expose usage data");
     await expect(port.readUsage(port.binding("agy"))).rejects.toThrow("configured verified runtime");
   });
+
+  it("uses the configured Codex account reader without a session or host RPC", async () => {
+    const signal = new AbortController().signal;
+    const data = {ok: true, plan: "pro", primary: {usedPercent: 7, windowMinutes: 10080, resetsAt: 123},
+      secondary: null, credits: null, source: {kind: "live" as const, host: "controller", observedAt: "2026-10-06T00:05:00Z"}};
+    const read = vi.fn(async () => data);
+    const port = createUsageProviderPort({profiles: [{...profiles.find(profile => profile.id === "codex")!, accountUsage: read}]});
+    const result = await port.readUsage(port.binding("codex", undefined, "worker"), signal);
+    expect(read).toHaveBeenCalledExactlyOnceWith(signal);
+    expect(adapters.fetchCodexUsage).not.toHaveBeenCalled();
+    expect(result).toEqual({provider: "codex", data});
+  });
 });

@@ -1,4 +1,5 @@
 import type { ProviderUsage } from "../../core/quota/usage-provider.js";
+import { formatUsageObservation } from "../../core/quota/usage-observation.js";
 
 export function formatUsage(usage: ProviderUsage): string {
   switch (usage.provider) {
@@ -162,6 +163,8 @@ function formatCodexUsage(
       d.credits.unlimited ? "Credits: unlimited" : `Credits: ${d.credits.balance}`
     );
   }
+  if (d.source) lines.push("", formatUsageObservation(d.source));
+  if (d.liveError) lines.push(`Live read unavailable: ${d.liveError}`);
   return lines.join("\n");
 }
 

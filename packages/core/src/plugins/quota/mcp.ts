@@ -15,7 +15,12 @@ export function quotaMcp(registry: QuotaRegistry): McpContribution[] {
     handle: async ({ args }) => {
       const agentId = typeof args.agentId === "string" ? args.agentId.trim() || undefined : undefined;
       const quotas = agentId ? [registry.get(agentId)].filter(quota => quota !== undefined) : registry.all();
-      return { content: [{ type: "text", text: agentId && quotas.length === 0 ? `Unknown configured agent: "${agentId}".` : JSON.stringify(quotas, null, 2) }],
+      const readings = quotas.map(quota => {
+        if (!quota.source) return quota;
+        const at = Date.parse(quota.source.observedAt ?? "");
+        return { ...quota, ageSeconds: Number.isFinite(at) ? Math.max(0, Math.floor((Date.now() - at) / 1000)) : null };
+      });
+      return { content: [{ type: "text", text: agentId && quotas.length === 0 ? `Unknown configured agent: "${agentId}".` : JSON.stringify(readings, null, 2) }],
         ...(agentId && quotas.length === 0 ? { isError: true } : {}),
       };
     },

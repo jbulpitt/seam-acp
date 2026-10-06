@@ -450,6 +450,8 @@ export interface CodexUsageData {
   secondary: CodexRateWindow | null;
   credits: { hasCredits: boolean; unlimited: boolean; balance: string } | null;
   error?: string;
+  source?: { kind: "live" | "rollout"; host: string; observedAt: string | null };
+  liveError?: string;
 }
 
 /**
@@ -478,30 +480,35 @@ function throwIfCodexUsageAborted(signal?: AbortSignal): void {
     : new Error("Codex usage traversal was cancelled");
 }
 
-function mapCodexRateLimits(raw: unknown): CodexUsageData | null {
+export function mapCodexRateLimits(raw: unknown): CodexUsageData | null {
   if (!raw || typeof raw !== "object") return null;
   const r = raw as Record<string, unknown>;
   const win = (w: unknown): CodexRateWindow | null => {
     if (!w || typeof w !== "object") return null;
     const o = w as Record<string, unknown>;
+    const usedPercent = o.used_percent ?? o.usedPercent;
+    const windowMinutes = o.window_minutes ?? o.windowDurationMins;
+    const resetsAt = o.resets_at ?? o.resetsAt;
+    if (typeof usedPercent !== "number" || !Number.isFinite(usedPercent) ||
+        typeof windowMinutes !== "number" || !Number.isFinite(windowMinutes)) return null;
     return {
-      usedPercent: typeof o.used_percent === "number" ? o.used_percent : 0,
-      windowMinutes: typeof o.window_minutes === "number" ? o.window_minutes : 0,
-      resetsAt: typeof o.resets_at === "number" ? o.resets_at : null,
+      usedPercent,
+      windowMinutes,
+      resetsAt: typeof resetsAt === "number" ? resetsAt : null,
     };
   };
   const c = r.credits as Record<string, unknown> | undefined;
   const credits =
     c && typeof c === "object"
       ? {
-          hasCredits: Boolean(c.has_credits),
+          hasCredits: Boolean(c.has_credits ?? c.hasCredits),
           unlimited: Boolean(c.unlimited),
           balance: String(c.balance ?? "0"),
         }
       : null;
   return {
     ok: true,
-    plan: typeof r.plan_type === "string" ? r.plan_type : null,
+    plan: typeof (r.plan_type ?? r.planType) === "string" ? (r.plan_type ?? r.planType) as string : null,
     primary: win(r.primary),
     secondary: win(r.secondary),
     credits,
@@ -537,7 +544,14 @@ async function readLastCodexRateLimits(
         | undefined;
       if (payload?.type !== "token_count" || !payload.rate_limits) continue;
       const mapped = mapCodexRateLimits(payload.rate_limits);
-      if (mapped) found = mapped; // keep the LAST one in the file
+      if (mapped) {
+        const timestamp = parseMs(entry.timestamp);
+        found = {
+          ...mapped,
+          source: { kind: "rollout" as const, host: os.hostname(),
+            observedAt: timestamp === undefined ? null : new Date(timestamp).toISOString() },
+        };
+      }
     }
     rl.close();
   } catch (err) {
@@ -596,11 +610,8 @@ async function collectCodexUsageFiles(
 }
 
 /**
- * Read codex's account rate limits — the same data the codex CLI `/status`
- * shows (plan, primary/secondary windows with used% + reset, credits). Rate
- * limits are ACCOUNT-global, so the freshest snapshot from any recent session
- * is current: scan rollouts newest-first (by mtime) and return the first one
- * that carries a `rate_limits` block.
+ * Read the final account rate-limit event from the first recent rollout with data.
+ * Reading a file does not make its snapshot current.
  */
 export async function fetchCodexUsage(opts?: {
   sessionsRoot?: string;
@@ -648,6 +659,6 @@ export async function fetchCodexUsage(opts?: {
   } catch (err) {
     if (opts?.signal?.aborted) throwIfCodexUsageAborted(opts.signal);
     if (err instanceof CodexUsageTraversalLimitError) return empty(err.message);
-    return empty("Codex usage read failed");
+    return empty(`Codex usage read failed: ${err instanceof Error ? err.message : String(err)}`);
   }
 }

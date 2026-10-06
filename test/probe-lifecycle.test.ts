@@ -438,6 +438,9 @@ describe("#236 bounded probe lifecycle", () => {
       leaky,
       `process.stderr.write("dumping env: SUPER_SECRET_TOKEN=" + process.env.SUPER_SECRET_TOKEN + "\\n");\n` +
       `process.stderr.write("also sk-live_abcdefghijklmnop and alex@example.com\\n");\n` +
+      `process.stderr.write("models.list: provider catalog unavailable; transport=disconnected\\n");\n` +
+      `process.stderr.write("provider: catalogue unavailable; transport: disconnected; status: unavailable; model: claude-sonnet-5\\n");\n` +
+      `process.stderr.write("token=abc12345 password: hunter22 api_key=xyzzy123 Authorization: auth8765 session=9f8e7d6c\\n");\n` +
       `process.exit(7);\n`
     );
     let seen = "";
@@ -460,6 +463,12 @@ describe("#236 bounded probe lifecycle", () => {
       expect(text).not.toContain("sk-live_abcdefghijklmnop");
       expect(text).not.toContain("alex@example.com");
       expect(text).toContain("[redacted]");
+      expect(text).toContain("models.list: provider catalog unavailable; transport=disconnected");
+      expect(text).toContain("provider: catalogue unavailable; transport: disconnected; status: unavailable; model: claude-sonnet-5");
+      for (const secret of ["abc12345", "hunter22", "xyzzy123", "auth8765", "9f8e7d6c"]) {
+        expect(text).not.toContain(secret);
+      }
+      expect(text).toContain("token=[redacted] password: [redacted] api_key=[redacted] Authorization: [redacted] session=[redacted]");
     }
   });
 

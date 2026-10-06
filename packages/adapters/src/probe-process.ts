@@ -192,7 +192,7 @@ const CREDENTIAL_PATTERNS: ReadonlyArray<RegExp> = [
   /\b(?:sk|pk|rk|ghp|gho|ghu|ghs|ghr|xox[abprs]|AKIA|ASIA|AIza|glpat)[-_][A-Za-z0-9_-]{8,}/g,
   /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*/g,
   /\bbearer\s+\S+/gi,
-  /(?<=[A-Za-z0-9_.-]{2,}\s*[=:]\s*)\S{6,}/g,
+  /(?<=\b[A-Za-z0-9_.-]*(?:token|secret|passw(?:or)?d|api[_-]?key|apikey|auth(?:orization)?|cookie|session|credential|private[_-]?key)[A-Za-z0-9_.-]*\s*[=:]\s*)\S{6,}/gi,
   /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g,
   /(?:\/home\/|\/Users\/)[^\s:,]*/g,
   /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g,

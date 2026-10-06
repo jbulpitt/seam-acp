@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
+import os from "node:os";
 import { PassThrough, Readable, Writable } from "node:stream";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   agent,
   ClientSideConnection,
@@ -19,6 +20,7 @@ import {
   normalizeCatalogCandidate,
 } from "../packages/adapters/src/catalog-evidence.js";
 import { dispatchBridgeRpc } from "../packages/bridge/src/rpc.js";
+import { resolveContextWindow } from "../packages/core/src/core/context-window.js";
 
 interface ModelFixture {
   id: string;
@@ -130,6 +132,9 @@ function fakeCopilotSpawner(opts: {
   emitChildError?: boolean;
   exitWithStderr?: string;
   ignoreKillModel?: string;
+  sdkModels?: unknown[];
+  sdkError?: string;
+  hangSdk?: boolean;
 } = {}) {
   const models = opts.models ?? modelFixtures();
   const calls: Array<{
@@ -144,6 +149,7 @@ function fakeCopilotSpawner(opts: {
   const children: EventEmitter[] = [];
   const transports: PassThrough[][] = [];
   const forceStops: Array<() => void> = [];
+  const sdkRequests: string[] = [];
   let active = 0;
   let maxActive = 0;
   let mismatches = 0;
@@ -203,6 +209,29 @@ function fakeCopilotSpawner(opts: {
     forceStops.push(() => forceStop("SIGKILL"));
     children.push(child);
     transports.push([stdin, stdout, stderr]);
+    if (args.includes("--headless")) {
+      let input = Buffer.alloc(0);
+      stdin.on("data", chunk => {
+        input = Buffer.concat([input, chunk]);
+        const end = input.indexOf("\r\n\r\n");
+        if (end < 0) return;
+        const length = Number(/Content-Length: (\d+)/.exec(input.subarray(0, end).toString())![1]);
+        if (input.length < end + 4 + length) return;
+        const request = JSON.parse(input.subarray(end + 4, end + 4 + length).toString());
+        sdkRequests.push(request.method);
+        if (opts.hangSdk) return;
+        const response = Buffer.from(JSON.stringify({
+          jsonrpc: "2.0", id: request.id,
+          ...(opts.sdkError ? { error: { code: -32000, message: opts.sdkError } }
+            : { result: { models: opts.sdkModels ?? [] } }),
+        }));
+        const frame = Buffer.concat([Buffer.from(`Content-Length: ${response.length}\r\n\r\n`), response]);
+        stdout.write(frame.subarray(0, 7));
+        setImmediate(() => stdout.write(frame.subarray(7)));
+      });
+      queueMicrotask(() => child.emit("spawn"));
+      return child as unknown as import("node:child_process").ChildProcessWithoutNullStreams;
+    }
     serverConnection = agent({ name: "fake-copilot-acp" })
       .onRequest(methods.agent.initialize, () => ({
         protocolVersion: PROTOCOL_VERSION,
@@ -265,6 +294,7 @@ function fakeCopilotSpawner(opts: {
     models,
     spawnProcess,
     calls,
+    sdkRequests,
     openedSessions,
     closedSessions,
     get active() { return active; },
@@ -425,7 +455,7 @@ describe("Copilot isolated catalog probing (#234)", () => {
     });
 
     for (const harness of [forwardHarness, reverseHarness]) {
-      expect(harness.calls).toHaveLength(31);
+      expect(harness.calls).toHaveLength(32);
       expect(harness.maxActive).toBe(1);
       expect(harness.active).toBe(0);
       expect(harness.closedSessions).toEqual(harness.openedSessions);
@@ -433,7 +463,9 @@ describe("Copilot isolated catalog probing (#234)", () => {
       expect(harness.transportsDestroyed).toBe(true);
       expect(harness.stderrListenersRemoved).toBe(true);
       expect(harness.calls.every((call) => call.executable === "/configured/bin/copilot")).toBe(true);
-      expect(harness.calls.every((call) => call.args.join(" ") === "--acp")).toBe(true);
+      expect(harness.calls.slice(0, -1).every((call) => call.args.join(" ") === "--acp")).toBe(true);
+      expect(harness.calls.at(-1)?.args).toEqual(["--headless", "--stdio"]);
+      expect(harness.sdkRequests).toEqual(["models.list"]);
       expect(harness.calls.every((call) => call.cwd === "/credential/scope")).toBe(true);
       expect(harness.calls.every((call) => call.env.COPILOT_GITHUB_TOKEN === "credential-scope-token")).toBe(true);
       expect(harness.calls.every((call) => call.signals.includes("SIGTERM"))).toBe(true);
@@ -485,7 +517,7 @@ describe("Copilot isolated catalog probing (#234)", () => {
       cleanupTimeoutMs: 50,
     });
     expect(probe.models).toHaveLength(8);
-    expect(harness.calls).toHaveLength(10);
+    expect(harness.calls).toHaveLength(11);
     expect(harness.maxActive).toBe(1);
     expect(harness.active).toBe(0);
     expect(harness.closedSessions).toEqual(harness.openedSessions);
@@ -612,6 +644,7 @@ describe("Copilot isolated catalog probing (#234)", () => {
         effortChoices: model.choices,
         effortDefault: model.defaultEffort,
         priceCategory: model.priceCategory,
+        context: { native: 1_000_000, maximum: 1_000_000, effective: 200_000 },
       })),
     };
     const profile = makeCopilotProfile({
@@ -635,5 +668,86 @@ describe("Copilot isolated catalog probing (#234)", () => {
     expect(local.cliVersion).toMatch(/^v?\d+/);
     expect(Number.isFinite(Date.parse(local.fetchedAt))).toBe(true);
     expect(local.models.find((model) => model.id === "gpt-6-astra")?.pricingCategory).toBe("premium");
+    expect(remote.models[0]?.context.effective).toBe(200_000);
+    expect(remote.models[0]?.evidence).toContainEqual(expect.objectContaining({
+      kind: "live-observation", source: "copilot-sdk-models-list",
+      context: expect.objectContaining({ effective: 200_000, method: "provider-reported-default" }),
+    }));
+  });
+
+  it("resolves fresh-session Rebuild budgets from per-model provider input limits", async () => {
+    const ids = ["gpt-6.1-sol", "claude-sonnet-5"];
+    const harness = fakeCopilotSpawner({
+      models: modelFixtures(2).map((model, index) => ({ ...model, id: ids[index]! })),
+      sdkModels: ids.map((id, index) => ({
+        id,
+        capabilities: { limits: { max_context_window_tokens: 1_000_000, max_prompt_tokens: 900_000 } },
+        billing: { tokenPrices: { maxPromptTokens: index === 0 ? 272_000 : 200_000,
+          longContext: { maxPromptTokens: 900_000 } } },
+      })),
+    });
+    const probe = await probeCopilotCatalog({
+      spawnProcess: harness.spawnProcess, timeoutMs: 1_000, cleanupTimeoutMs: 50,
+    });
+    const profile = makeCopilotProfile({ defaultModel: ids[0]!, cliPath: process.execPath,
+      catalogProbe: async () => probe });
+    const candidate = normalizeCatalogCandidate(await profile.catalog.fetch());
+    for (const [index, model] of candidate.models.entries()) {
+      expect(resolveContextWindow({ agentId: "copilot", model: model.id,
+        catalogModels: candidate.models.map(row => ({ modelId: row.id, contextLimit: row.context.effective })) }))
+        .toMatchObject({ window: index === 0 ? 272_000 : 200_000, source: "operational-catalog" });
+    }
+    expect(harness.sdkRequests).toEqual(["models.list"]);
+    expect(harness.openedSessions.size).toBe(3);
+    expect(harness.closedSessions).toEqual(harness.openedSessions);
+    expect(harness.active).toBe(0);
+  });
+
+  it.each([
+    { label: "fails", sdkError: "provider catalog unavailable", cause: "provider catalog unavailable" },
+    { label: "times out", hangSdk: true, cause: "timed out" },
+  ])("keeps ACP models and efforts when models.list $label, with one cause warning", async ({ cause, ...failure }) => {
+    const models = modelFixtures(5);
+    const harness = fakeCopilotSpawner({ models, ...failure });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const result = await probeCopilotCatalog({ spawnProcess: harness.spawnProcess,
+        env: {}, cliVersion: "Copilot fixture 1.0.80", timeoutMs: 250,
+        overallTimeoutMs: 2_000, cleanupTimeoutMs: 50 });
+      expect(result.defaultModel).toBe(models[0]!.id);
+      expect(result.models).toEqual(models.map(model => ({
+        modelId: model.id, displayName: model.name, effortChoices: model.choices,
+        effortDefault: model.defaultEffort, priceCategory: model.priceCategory,
+      })));
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(JSON.parse(warn.mock.calls[0]![0])).toMatchObject({
+        level: 40, host: os.hostname(), cliVersion: "Copilot fixture 1.0.80",
+        error: expect.stringContaining(cause),
+        msg: "Copilot model limits unavailable; keeping ACP catalog",
+      });
+      expect(harness.sdkRequests).toEqual(["models.list"]);
+      expect(harness.active).toBe(0);
+      expect(harness.closedSessions).toEqual(harness.openedSessions);
+      expect(harness.listenersRemoved).toBe(true);
+      expect(harness.transportsDestroyed).toBe(true);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("propagates an overall abort during models.list instead of returning the ACP catalog", async () => {
+    const harness = fakeCopilotSpawner({ models: modelFixtures(1), hangSdk: true });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await expect(probeCopilotCatalog({ spawnProcess: harness.spawnProcess,
+        timeoutMs: 1_000, overallTimeoutMs: 500, cleanupTimeoutMs: 50 }))
+        .rejects.toThrow("catalog probe timed out after 500ms");
+      expect(warn).not.toHaveBeenCalled();
+      expect(harness.sdkRequests).toEqual(["models.list"]);
+      expect(harness.active).toBe(0);
+      expect(harness.closedSessions).toEqual(harness.openedSessions);
+    } finally {
+      warn.mockRestore();
+    }
   });
 });

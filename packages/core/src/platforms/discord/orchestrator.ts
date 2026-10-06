@@ -16182,7 +16182,9 @@ export class Orchestrator {
   async cancelTurnManually(id: string): Promise<string> {
     const completed = this.store.turnAttempts.get(id);
     if (completed?.state === "completed") {
-      return this.store.turnAttempts.abandonDelivery(id, "cancelled by operator")
+      const cancelled = this.store.turnAttempts.abandonDelivery(id, "cancelled by operator");
+      if (cancelled) await this.retireParkedTurnCards(id);
+      return cancelled
         ? `🚫 Cancelled retained output for \`${id}\`; the execution record is kept.`
         : `No retained output to cancel for \`${id}\`.`;
     }
@@ -16190,18 +16192,21 @@ export class Orchestrator {
     const marker = live.find((m) => m.id === id);
     if (marker) {
       await this.abandonLiveMarker(marker, "cancelled by operator");
+      await this.retireParkedTurnCards(id);
       return `🚫 Cancelled live turn \`${id}\`.`;
     }
     const stale = (await this.dispatchWatcher?.listStaleRunning()) ?? [];
     const spec = stale.find((s) => s.id === id);
     if (spec) {
       await this.abandonDispatchSpec(spec, "cancelled by operator");
+      await this.retireParkedTurnCards(id);
       return `🚫 Cancelled dispatch \`${id}\`.`;
     }
     const ledger = this.store.getDelegation(id);
     if (ledger && (ledger.status === "interrupted" || ledger.status === "running")) {
       this.store.updateDelegationStatus(id, "abandoned");
       await this.dispatchWatcher?.abandonRunning(id, "cancelled by operator");
+      await this.retireParkedTurnCards(id);
       return `🚫 Cancelled \`${id}\`.`;
     }
     return `No resumable turn \`${id}\`.`;
@@ -19561,6 +19566,15 @@ export class Orchestrator {
     }
   }
 
+  private async retireParkedTurnCards(attemptId: string): Promise<void> {
+    for (const card of this.store.listOpenChoiceCards(PLATFORM)) {
+      if (card.options.some(option => parkedTurnAction(option.payload)?.attemptId === attemptId)
+        && this.store.cancelChoiceCard(card.id, card.channelRef)) {
+        await this.refreshChoiceCard(this.store.getChoiceCard(card.id)!);
+      }
+    }
+  }
+
   private async notifyParkedTurn(attempt: TurnAttempt): Promise<void> {
     if (attempt.state !== "suspended" || !attempt.stalledUtc || isAwaitingReauth(attempt.stalledReason)) return;
     await this.postParkedTurnNotice(attempt.spec.target, attempt,
@@ -19577,11 +19591,7 @@ export class Orchestrator {
       const cause = [attempt.stalledReason, current?.resumeRefusal].filter((value, index, values) => value && values.indexOf(value) === index).join("; ");
       const message = `🚫 Cancelled ${attempt.source === "dispatch" ? "dispatch" : "turn"} \`${attempt.id}\`: ${cause}.${attempt.promptStarted ? "" : " The prompt was never sent."}`;
       if (!this.store.turnAttempts.cancel(attempt.id, message, attempt.source !== "dispatch")) return;
-      for (const notice of notices) {
-        if (this.store.cancelChoiceCard(notice.id, channelRef)) {
-          await this.refreshChoiceCard(this.store.getChoiceCard(notice.id)!);
-        }
-      }
+      await this.retireParkedTurnCards(attempt.id);
       if (attempt.source === "dispatch") {
         const cancelled = this.store.turnAttempts.get(attempt.id)!;
         await this.dispatchWatcher?.publishAdoptedResult(attempt.id, cancelled.outcome!);
@@ -19616,11 +19626,7 @@ export class Orchestrator {
       && card.options.every((option, index) => option.kind === "prompt"
         && option.payload === spec.options[index]!.payload
         && option.label.startsWith(actions[index] === "resume" ? "Resume " : "Cancel ")))) return;
-    for (const notice of notices) {
-      if (this.store.cancelChoiceCard(notice.id, channelRef)) {
-        await this.refreshChoiceCard(this.store.getChoiceCard(notice.id)!);
-      }
-    }
+    await this.retireParkedTurnCards(attempt.id);
     const record = this.store.getByChannel(PLATFORM, channelRef)
       ?? this.router.ensureSessionRecord({ platform: PLATFORM, channelRef, cwd: this.config.REPOS_ROOT });
     const posted = await this.publishChoiceCard(record, spec);

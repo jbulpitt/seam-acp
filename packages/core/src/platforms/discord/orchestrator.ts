@@ -15441,10 +15441,11 @@ export class Orchestrator {
       await this.dispatchWatcher?.publishAdoptedResult(prior.id, outcome);
     }
 
-    if (prior.source === "schedule") {
-      const occurrence = this.store.scheduledOccurrences.get(prior.id);
-      if (occurrence) await this.deliverScheduledCompletion(occurrence, completed);
-    } else {
+    const occurrence = prior.source === "schedule"
+      ? this.store.scheduledOccurrences.get(prior.id) : null;
+    // Live adoption supplies the nonce-backed chunks, not a replay of the full answer.
+    if (prior.source !== "schedule"
+      || (occurrence?.row.sessionMode === "live" && delivery !== undefined)) {
       const target: ChannelRef = { platform: PLATFORM, id: prior.spec.target };
       const output = outcome.output ?? "";
       const body = outcome.status === "failed"
@@ -15464,6 +15465,9 @@ export class Orchestrator {
       } catch (err) {
         this.logger.warn({ err, attempt: prior.id }, "adopted remote result delivery deferred");
       }
+    }
+    if (occurrence) {
+      await this.deliverScheduledCompletion(occurrence, this.store.turnAttempts.get(prior.id)!);
     }
 
     if (prior.source === "dispatch") {

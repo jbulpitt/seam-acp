@@ -16,6 +16,7 @@ import { TurnStatus } from "../packages/core/src/core/status-panel.js";
 import { createRuntimeDispatchWatcher } from "../packages/core/src/core/dispatch/watcher.js";
 import { enqueueDispatchSpec, dispatchDirs } from "../packages/core/src/core/dispatch/types.js";
 import { existsSync } from "node:fs";
+import type { ScheduledPrompt } from "../packages/core/src/core/scheduled-prompts/types.js";
 
 const cleanups: (() => void)[] = [];
 afterEach(() => {
@@ -27,7 +28,7 @@ const drain = async () => {
   for (let i = 0; i < 20; i++) await new Promise<void>(resolve => setImmediate(resolve));
 };
 
-async function setup(source: "inbound" | "dispatch" = "inbound", style: "full" | "simple" = "full",
+async function setup(source: "inbound" | "dispatch" | "schedule" = "inbound", style: "full" | "simple" = "full",
   options: { armed?: boolean; queue?: boolean; disconnected?: boolean; adoptionUnavailable?: boolean;
     attached?: boolean; terminalResult?: "completed" | "failed" } = {}) {
   const dir = mkdtempSync(path.join(tmpdir(), "seam-adopt-reconnect-"));
@@ -39,9 +40,19 @@ async function setup(source: "inbound" | "dispatch" = "inbound", style: "full" |
     parentRef: null, agentId: "codex", acpSessionId: "acp", repoPath: "/synthetic",
     configJson: "{}", createdUtc: now, updatedUtc: now };
   store.upsert(record);
+  if (source === "schedule") {
+    const row: ScheduledPrompt = { id: "schedule", platform: "discord", channelRef: "thread", parentRef: null,
+      name: "Live adoption", promptText: "work", cron: "0 9 * * *", timezone: "UTC", model: null,
+      cwd: null, targetChannel: null, outputType: "messages", sessionMode: "live", catchupSeconds: 0,
+      enabled: false, legacyAttachmentCount: 0, createdBy: "user", createdUtc: now, updatedUtc: now,
+      lastRunUtc: null, lastStatus: null, nextRunUtc: null, pinnedSessionId: null };
+    store.upsertScheduled(row);
+    store.scheduledOccurrences.reserve({ id: "inbound-1", scheduledFor: null }, row,
+      { agentId: "codex", location: "remote", model: "test", effort: null, cwd: "/synthetic", fingerprint: "identity" });
+  }
   store.turnAttempts.registerOwner("old-controller");
   const attempt = store.turnAttempts.claim({ id: "inbound-1", target: "thread",
-    prompt: "work", session: "live", kind: "parked", createdUtc: now },
+    prompt: "work", session: "live", kind: source === "schedule" ? "scheduled" : "parked", createdUtc: now },
   "identity", "old-controller", source);
   store.turnAttempts.bind(attempt, "acp");
   store.turnAttempts.bindStatusCard(attempt, { channelId: "thread", messageId: "card" });
@@ -145,6 +156,9 @@ async function setup(source: "inbound" | "dispatch" = "inbound", style: "full" |
     }),
     editPanel: vi.fn(async (_ref: any, _panel: any) => {}),
     deleteMessage: vi.fn(async () => {}),
+    findMessageByNonce: vi.fn(async (_channel: any, nonce: string) => nonces.has(nonce)
+      ? { status: "found", message: { channel: _channel, id: "found" } }
+      : { status: "absent" }),
   };
   const orch = new Orchestrator({ logger: pino({ level: "silent" }) as any,
     modelCatalog: fixtureModelCatalog([]), store, router: router as any,
@@ -197,6 +211,67 @@ async function setup(source: "inbound" | "dispatch" = "inbound", style: "full" |
     replaceSubmission: () => { rows = [{ ...rows[0]!, recovery: { ...snapshot, submissionId: "other-submission" } }]; },
     runtime: () => runtime };
 }
+
+describe("scheduled live adoption delivery", () => {
+  it("delivers the adopted scheduled final once before projecting Done", async () => {
+    const h = await setup("schedule");
+    await drain();
+    const send = h.adapter.sendMessage.getMockImplementation()!;
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    h.adapter.sendMessage.mockImplementation(async (...args) => { await gate; return send(...args); });
+    h.complete("SEAM875_FINAL");
+    await drain();
+    try {
+      expect(h.store.turnAttempts.get("inbound-1")).toMatchObject({ state: "completed", deliveryDone: false,
+        deliveryPayload: { kind: "messages", texts: ["SEAM875_FINAL"] } });
+      expect(h.visible).toEqual([]);
+      expect(h.store.scheduledOccurrences.get("inbound-1")?.settled).toBe(false);
+      expect(h.adapter.editPanel.mock.calls.at(-1)?.[1].title).not.toBe("Done");
+    } finally { release(); await h.run; }
+    expect(h.visible).toEqual(["SEAM875_FINAL"]);
+    expect(h.store.turnAttempts.get("inbound-1")).toMatchObject({ deliveryDone: true, deliveryAbandonedReason: null });
+    expect(h.store.scheduledOccurrences.get("inbound-1")?.settled).toBe(true);
+    expect(h.adapter.editPanel.mock.calls.at(-1)?.[1].title).toBe("Done");
+    await h.orch.runScheduledPrompt("schedule", { id: "inbound-1", scheduledFor: null });
+    expect(h.visible).toEqual(["SEAM875_FINAL"]);
+    expect(h.commands.filter(command => command.type === "spawn")).toEqual([]);
+  });
+
+  it("uses the adopted stream nonces without replaying pre-adoption scheduled text", async () => {
+    const h = await setup("schedule");
+    await drain();
+    h.text("adopted narration\n\n");
+    h.update({ sessionUpdate: "tool_call", toolCallId: "flush", title: "read", kind: "read" });
+    await drain();
+    expect(h.visible).toEqual(["adopted narration"]);
+    h.complete("before adoption\n\nadopted narration\n\nSEAM875_FINAL");
+    await h.run;
+    expect(h.visible).toEqual(["adopted narration", "SEAM875_FINAL"]);
+    expect(h.store.turnAttempts.get("inbound-1")).toMatchObject({ deliveryDone: true,
+      deliveryPayload: { kind: "messages", texts: h.visible } });
+  });
+
+  it("retains the adopted scheduled payload after a failed send and recovers delivery only", async () => {
+    const h = await setup("schedule");
+    await drain();
+    const send = h.adapter.sendMessage.getMockImplementation()!;
+    h.adapter.sendMessage.mockRejectedValue(new Error("Discord transport unavailable"));
+    h.complete("SEAM875_FINAL");
+    await h.run;
+    expect(h.visible).toEqual([]);
+    expect(h.store.turnAttempts.get("inbound-1")).toMatchObject({ state: "completed", deliveryDone: false,
+      deliveryNonce: expect.any(String), deliveryPayload: { kind: "messages", texts: ["SEAM875_FINAL"] },
+      deliveryAbandonedReason: null });
+    expect(h.store.scheduledOccurrences.get("inbound-1")?.settled).toBe(false);
+    h.adapter.sendMessage.mockImplementation(send);
+    await h.orch.runScheduledPrompt("schedule", { id: "inbound-1", scheduledFor: null });
+    expect(h.visible).toEqual(["SEAM875_FINAL"]);
+    expect(h.store.turnAttempts.get("inbound-1")?.deliveryDone).toBe(true);
+    expect(h.store.scheduledOccurrences.get("inbound-1")?.settled).toBe(true);
+    expect(h.commands.filter(command => command.type === "spawn")).toEqual([]);
+  });
+});
 
 describe("#777 armed recovery queue reconciliation", () => {
   it("waits visibly for a surviving unattached owner and adopts it without a new process", async () => {

@@ -6,6 +6,7 @@
 import type { LedgerEntry, DelegationStatus } from "../../core/types.js";
 import type { AnomalySummary } from "../../core/watchdog.js";
 import { choicePickerPageCaption, sliceChoicePage } from "./choice-picker.js";
+import { truncateGraphemes } from "../../core/prompt-excerpt.js";
 
 /** Rendered, embed-ready view of the ledger. */
 export interface WorkflowsView {
@@ -164,6 +165,8 @@ export interface InterruptedTurnRow {
   resumeRefusal?: string;
   /** Actions supported by the current backing record and admission checks. */
   actions?: readonly InterruptedRowAction[];
+  /** Recorded attempt context, shared with its parked-turn card. */
+  context?: string[];
 }
 
 /** One inventory line: thread, age, correlation — what the operator needs
@@ -171,6 +174,11 @@ export interface InterruptedTurnRow {
 export function formatInterruptedLine(row: InterruptedTurnRow, now: Date): string {
   const icon = row.status === "abandoned" ? "🚫" : "⚠️";
   const corr = row.correlationId ? ` · corr \`${shortId(row.correlationId)}\`` : "";
+  if (row.context) return [
+    `${icon} \`${shortId(row.id)}\` · ${row.status === "abandoned" ? "cancelled" : row.status}${corr}`,
+    ...row.context,
+    ...(row.reason ? [`Cause: ${row.reason}`] : []),
+  ].join("\n");
   const reason = row.reason ? ` · ${row.reason.slice(0, 160)}` : "";
   return `${icon} \`${shortId(row.id)}\` ${row.source} · ${shortRef(row.channelRef, "?")} · ${row.status === "abandoned" ? "cancelled" : row.status} · ${formatAge(row.startedUtc, now)}${corr}${reason}`;
 }
@@ -346,8 +354,10 @@ export interface InterruptedInventorySection {
   total: number;
   /** The rows this page's controls act on, in button order. */
   items: InterruptedTurnRow[];
-  /** One line per control row, same order — or `null` when nothing is actionable. */
+  /** Compact rows or a caption for their detail fields; null when none are actionable. */
   actionable: { name: string; value: string } | null;
+  /** Rich rows each get a field so four rows cannot crowd out one another. */
+  details?: { name: string; value: string }[];
   /** Compact summary of everything with no live action left. */
   inert: { name: string; value: string } | null;
 }
@@ -372,6 +382,7 @@ export function buildInterruptedInventory(
   const slice = paginateInterruptedRows(rows, page, pageSize);
   const caption = choicePickerPageCaption(slice.total, slice.page, pageSize);
   const lines = formatInterruptedLines(slice.items, now);
+  const rich = slice.items.some(row => row.context);
   const inertRows = rows.filter((row) => !isActionableInterruptedRow(row));
   return {
     page: slice.page,
@@ -381,11 +392,13 @@ export function buildInterruptedInventory(
     actionable: slice.items.length
       ? {
           name: `⚠️ Interrupted / cancelled — actionable (${slice.total})`,
-          // Caption last: if anything must be dropped it is the caption, never
-          // a row that has a button under it.
-          value: clampFieldValue(caption ? [...lines, `_${caption}_`] : lines),
+          // Rich rows get separate fields; legacy rows share this value.
+          value: rich ? caption || `${slice.total} turn(s)` : clampFieldValue(caption ? [...lines, `_${caption}_`] : lines),
         }
       : null,
+    ...(rich ? { details: slice.items.map((row, index) => ({
+      name: `Turn \`${shortId(row.id)}\``, value: truncateGraphemes(lines[index]!, 1024),
+    })) } : {}),
     inert: inertRows.length
       ? {
           name: `🗄️ Interrupted / cancelled — no action available (${inertRows.length})`,

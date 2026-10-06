@@ -322,6 +322,23 @@ describe("paginateInterruptedRows", () => {
 });
 
 describe("buildInterruptedInventory — text matches the buttons", () => {
+  it("keeps all four enriched rows visible in separate fields with their recorded causes", () => {
+    const contextRows = Array.from({ length: 4 }, (_, index) => irow({ id: `rich-${index}`,
+      context: ["Scheduled: recorded schedule — " + "prompt ".repeat(20),
+        "<#target> · `codex@recorded-host` · `recorded-model`",
+        "Started <t:1791300600:R> · Parked <t:1791300622:R> · Last active <t:1791300630:R>"],
+      reason: `Recorded cause ${index}: ` + "cause ".repeat(30),
+    }));
+    const section = buildInterruptedInventory(contextRows, 0, NOW);
+    expect(section.items).toEqual(contextRows);
+    expect(section.details).toHaveLength(4);
+    for (const [index, field] of section.details!.entries()) {
+      expect(field.value).toContain(`Cause: ${contextRows[index]!.reason}`);
+      for (const fact of contextRows[index]!.context!) expect(field.value).toContain(fact);
+      expect(field.value.length).toBeLessThanOrEqual(1024);
+    }
+  });
+
   // 9 actionable rows: three pages of controls.
   const rows = Array.from({ length: 9 }, (_, i) =>
     irow({ id: `del-actionable-${i}`, channelRef: `discord:thread-${i}` })

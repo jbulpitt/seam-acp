@@ -206,7 +206,7 @@ import {
   type ReauthPark,
 } from "../../core/reauth-negotiation.js";
 import { reauthAcceptAttemptId, reauthChoiceSpec } from "../../core/reauth-card.js";
-import { parkedTurnAction, parkedTurnChoiceSpec, type ParkedTurnAction } from "../../core/parked-turn-card.js";
+import { parkedTurnAction, parkedTurnChoiceSpec, parkedTurnContext, type ParkedTurnAction } from "../../core/parked-turn-card.js";
 import { readDefaultBranchHead } from "../../core/dispatch/default-branch-head.js";
 
 import { summarizeAnomalies } from "../../core/watchdog.js";
@@ -15948,7 +15948,7 @@ export class Orchestrator {
   }
 
   /** Unified interrupted/abandoned inventory for `/seam workflows`. */
-  private async collectInterruptedRows(channelRef?: string): Promise<InterruptedTurnRow[]> {
+  private async collectInterruptedRows(channelRef?: string, displayChannelRef = channelRef): Promise<InterruptedTurnRow[]> {
     const rows: InterruptedTurnRow[] = [];
     const seen = new Set<string>();
     const inScope = (target: string) => !channelRef || target === channelRef;
@@ -15964,7 +15964,8 @@ export class Orchestrator {
       rows.push({ id: attempt.id, source: attempt.source === "dispatch" ? "dispatch" : "live",
         channelRef: attempt.spec.target, correlationId: attempt.spec.correlationId ?? null,
         status: "interrupted", startedUtc: attempt.updatedUtc, acpSessionId: attempt.acpSessionId,
-        targetRef: attempt.spec.target, reason: attempt.stalledReason });
+        targetRef: attempt.spec.target, reason: attempt.stalledReason,
+        context: this.parkedAttemptContext(attempt, displayChannelRef) });
     }
     for (const e of this.store.listDelegationsByStatus(["interrupted", "abandoned"], channelRef)) {
       if (seen.has(e.id)) continue;
@@ -16899,7 +16900,7 @@ export class Orchestrator {
     const scope = channelRef ? "this thread" : "all threads";
     const newestFirst = <T extends { createdUtc: string }>(rows: T[]) => rows.sort((a, b) => b.createdUtc.localeCompare(a.createdUtc));
     const includeHistory = i.options.getBoolean("history") ?? false;
-    const history = visibleWorkflowHistory(await this.collectInterruptedRows(channelRef), now, includeHistory);
+    const history = visibleWorkflowHistory(await this.collectInterruptedRows(channelRef, i.channelId), now, includeHistory);
     const interrupted = history.rows;
     const actionableIds = new Set(interrupted.filter(row => interruptedRowActions(row).length > 0).map(row => row.id));
     const recentRows = (limit: number) => visibleWorkflowLedger(this.store.listRecentDelegations(limit, channelRef), now, includeHistory, actionableIds);
@@ -17009,6 +17010,10 @@ export class Orchestrator {
         // Never dropped by the embed budget below: these are the rows the
         // buttons act on.
         requiredFieldNames.add(slice.actionable.name);
+      }
+      for (const field of slice.details ?? []) {
+        embed.addFields(field);
+        requiredFieldNames.add(field.name);
       }
       if (slice.inert) embed.addFields(slice.inert);
       // Per-entry Resume / Cancel \u2014 same pattern as schedule-list cards.
@@ -19566,7 +19571,15 @@ export class Orchestrator {
     this.store.turnAttempts.markStallNoticeDelivered(attempt.id);
   }
 
+  private parkedAttemptContext(attempt: TurnAttempt, channelRef?: string): string[] {
+    return parkedTurnContext(attempt, {
+      schedule: attempt.source === "schedule" ? this.store.scheduledOccurrences.get(attempt.id) : null,
+      inbound: attempt.source === "inbound" ? this.store.getInbound(attempt.id.slice("inbound-".length)) : null,
+    }, channelRef);
+  }
+
   private async postParkedTurnNotice(channelRef: string, attempt: TurnAttempt, body: string): Promise<(MessageLink & { messageId: string }) | undefined> {
+    body = [...this.parkedAttemptContext(attempt, channelRef), body].join("\n");
     const current = (await this.collectInterruptedRows(attempt.spec.target)).find(item => item.id === attempt.id);
     const actions = current ? interruptedRowActions(current) : [];
     const notices = this.store.listOpenChoiceCards(PLATFORM, channelRef).filter(card =>

@@ -1098,13 +1098,38 @@ export type ThreadPreset = PresetValues & {
   ttsStyle?: "neutral" | "warm" | "clear";
 };
 
-export type Config = z.infer<typeof Schema> & {
+export interface DisabledFeature {
+  feature: string;
+  cause: string;
+}
+
+export type Config = Omit<z.infer<typeof Schema>, "BRAND_ICON_BASE_URL" | "SIMPLE_CARD_GIF_MANIFEST_URL"> & {
+  BRAND_ICON_BASE_URL?: string;
+  SIMPLE_CARD_GIF_MANIFEST_URL?: string;
+  disabledFeatures?: DisabledFeature[];
   agyDisabledReason?: string;
   defaultAgentDisabledReason?: string;
+  presetsDisabledReason?: string;
   channelPresets: Map<string, ChannelPreset>;
   threadPresets: Map<string, ThreadPreset>;
   bridgePresets: Map<string, BridgeHostConfig>;
 };
+
+export function disabledFeatureReason(config: Pick<Config, "disabledFeatures">, feature: string): string | undefined {
+  return config.disabledFeatures?.find((entry) => entry.feature === feature)?.cause;
+}
+
+/** Read the current reasons: AGY construction and preset reload happen after parsing. */
+export function configDisabledFeatures(config: Pick<Config,
+  "disabledFeatures" | "agyDisabledReason" | "defaultAgentDisabledReason" | "presetsDisabledReason"
+>): DisabledFeature[] {
+  return [
+    ...(config.disabledFeatures ?? []),
+    ...(config.agyDisabledReason ? [{ feature: "agy", cause: config.agyDisabledReason }] : []),
+    ...(config.defaultAgentDisabledReason ? [{ feature: "default-agent", cause: config.defaultAgentDisabledReason }] : []),
+    ...(config.presetsDisabledReason ? [{ feature: "channel-presets", cause: config.presetsDisabledReason }] : []),
+  ];
+}
 
 /**
  * Friendly participant-tier refusal (#74). Ephemeral on the slash surface;
@@ -1256,6 +1281,11 @@ export function resolveThreadTtsVoice(
   return v || undefined;
 }
 
+/** An explicit thread voice does not depend on the unavailable env voice. */
+export function threadTtsDisabledReason(config: Pick<Config, "threadPresets" | "disabledFeatures">, threadId: string): string | undefined {
+  return resolveThreadTtsVoice(config, threadId) ? undefined : disabledFeatureReason(config, "tts-default-voice");
+}
+
 export function resolveThreadTtsPace(
   config: Pick<Config, "threadPresets">,
   threadId: string | undefined
@@ -1299,7 +1329,43 @@ export function loadConfig({ env = process.env, warn = (message) => logger.warn(
   warn?: (message: string) => void;
 } = {}): Config {
   let agyDisabledReason: string | undefined;
+  const disabledFeatures: DisabledFeature[] = [];
+  const disable = (feature: string, cause: string) => {
+    disabledFeatures.push({ feature, cause });
+    warn(`${feature} disabled: ${cause}`);
+  };
   const input = { ...env };
+  // Extra credentials are independent profiles; keep the valid siblings.
+  for (const key of ["CLAUDE_PROFILES", "COPILOT_PROFILES"] as const) {
+    const valid: string[] = [];
+    for (const [index, entry] of (input[key] ?? "").split(",").map((value) => value.trim()).filter(Boolean).entries()) {
+      try {
+        Schema.shape[key].parse(entry);
+        valid.push(entry);
+      } catch (error) {
+        disable(`${key}[${index + 1}]`, (error as Error).message);
+      }
+    }
+    input[key] = valid.join(",");
+  }
+  const optionalSchema = Schema.pick({ BRAND_ICON_BASE_URL: true, SIMPLE_CARD_GIF_MANIFEST_URL: true,
+    DISCORD_STATUS_THREAD_ID: true, CODEX_ENABLED: true, SEAM_GEMINI_TTS_VOICE: true, SEAM_TEST_DRIVER_URL: true });
+  const optional = <K extends keyof typeof optionalSchema.shape>(key: K, feature: string): z.output<typeof optionalSchema.shape[K]> | undefined => {
+    const result = optionalSchema.shape[key].safeParse(input[key]);
+    if (result.success) return result.data;
+    disable(feature, `${key}: ${result.error.issues.map((issue) => issue.message).join("; ")}`);
+    return undefined;
+  };
+  const optionalConfig = {
+    BRAND_ICON_BASE_URL: optional("BRAND_ICON_BASE_URL", "brand-icons"),
+    SIMPLE_CARD_GIF_MANIFEST_URL: optional("SIMPLE_CARD_GIF_MANIFEST_URL", "card-gifs"),
+    DISCORD_STATUS_THREAD_ID: optional("DISCORD_STATUS_THREAD_ID", "server-status-card"),
+    CODEX_ENABLED: optional("CODEX_ENABLED", "codex") ?? false,
+    // Keep an invalid configured voice, never replace it with Kore. Dependent
+    // speech paths refuse it; threads with an explicit voice remain usable.
+    SEAM_GEMINI_TTS_VOICE: optional("SEAM_GEMINI_TTS_VOICE", "tts-default-voice") ?? env.SEAM_GEMINI_TTS_VOICE!,
+    SEAM_TEST_DRIVER_URL: optional("SEAM_TEST_DRIVER_URL", "test-driver"),
+  };
   // Parse AGY separately so its field validation cannot disable Discord.
   const agyKeys = Object.keys(Schema.shape).filter((key) => key.startsWith("AGY_"));
   const agySchema = Schema.pick(Object.fromEntries(agyKeys.map((key) => [key, true])) as Record<keyof typeof Schema.shape, true>);
@@ -1308,14 +1374,15 @@ export function loadConfig({ env = process.env, warn = (message) => logger.warn(
     agyDisabledReason = `Invalid configuration:\n${agyParsed.error.issues.map((i) => `  - ${i.path.join(".")}: ${i.message}`).join("\n")}`;
     for (const key of agyKeys) delete input[key];
   }
-  const parsed = Schema.safeParse(input);
+  const parsed = Schema.omit({ BRAND_ICON_BASE_URL: true, SIMPLE_CARD_GIF_MANIFEST_URL: true,
+    DISCORD_STATUS_THREAD_ID: true, CODEX_ENABLED: true, SEAM_GEMINI_TTS_VOICE: true, SEAM_TEST_DRIVER_URL: true }).safeParse(input);
   if (!parsed.success) {
     const issues = parsed.error.issues
       .map((i) => `  - ${i.path.join(".") || "(root)"}: ${i.message}`)
       .join("\n");
     throw new Error(`Invalid configuration:\n${issues}`);
   }
-  const cfg = parsed.data;
+  const cfg = { ...parsed.data, ...optionalConfig };
   const reposRoot = path.resolve(cfg.REPOS_ROOT);
   if (!fs.existsSync(reposRoot) || !fs.statSync(reposRoot).isDirectory()) {
     throw new Error(
@@ -1422,10 +1489,20 @@ export function loadConfig({ env = process.env, warn = (message) => logger.warn(
   }
   if (defaultAgentDisabledReason) warn(`DEFAULT_AGENT disabled for new sessions: ${defaultAgentDisabledReason}`);
 
-  const { channelPresets, threadPresets, bridgePresets } = buildChannelPresetMaps(
-    cfg.CHANNEL_PRESETS_FILE, { dropInvalidEntries: true, warn }
-  );
-  return { ...cfg, agyDisabledReason, defaultAgentDisabledReason, channelPresets, threadPresets, bridgePresets };
+  const presets = loadBootChannelPresets(cfg.CHANNEL_PRESETS_FILE, warn);
+  return { ...cfg, disabledFeatures, agyDisabledReason, defaultAgentDisabledReason, ...presets };
+}
+
+/** Boot has no last-good maps; retain a bad file for repair, not replacement. */
+export function loadBootChannelPresets(file: string | undefined, warn: (message: string) => void = (message) => logger.warn(message)) {
+  try {
+    return { ...buildChannelPresetMaps(file, { dropInvalidEntries: true, warn }), presetsDisabledReason: undefined as string | undefined };
+  } catch (error) {
+    const cause = (error as Error).message;
+    warn(`channel-presets disabled: ${cause}`);
+    return { channelPresets: new Map<string, ChannelPreset>(), threadPresets: new Map<string, ThreadPreset>(),
+      bridgePresets: new Map<string, BridgeHostConfig>(), presetsDisabledReason: cause };
+  }
 }
 
 /**

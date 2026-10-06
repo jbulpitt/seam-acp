@@ -1,6 +1,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { Logger } from "./logger.js";
 import { raceDeadline, type DeadlineClock } from "./shutdown-budget.js";
+import type { DisabledFeature } from "../config.js";
 
 /**
  * The health server, plus the two controls shutdown needs (#174).
@@ -30,6 +31,7 @@ export function startHealthServer(
   port: number,
   logger: Logger,
   opts?: {
+    disabledFeatures?: () => readonly DisabledFeature[];
     onMcp?: (req: IncomingMessage, res: ServerResponse) => void | Promise<void>;
     onIngest?: (req: IncomingMessage, res: ServerResponse) => void | Promise<void>;
     /** Test deployments only (SEAM_TEST_DRIVER_KEY). */
@@ -81,7 +83,9 @@ export function startHealthServer(
     const url = (req.url ?? "").split("?")[0] ?? "";
     if (url === "/health") {
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ status: "ok", utc: new Date().toISOString() }));
+      res.end(JSON.stringify({ status: "ok", utc: new Date().toISOString(),
+        ...(opts?.disabledFeatures ? { disabledFeatures: opts.disabledFeatures() } : {}),
+      }));
       return;
     }
     if ((url === "/mcp" || url === "/mcp/") && opts?.onMcp) {

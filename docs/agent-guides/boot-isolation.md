@@ -20,6 +20,21 @@ credentials and `REPOS_ROOT` still fail configuration validation.
   There is no replacement-agent fallback.
 - `SEAM_MCP_ENABLED=false` disables Seam tool injection, not the execution
   bridge. Agents still run through their host's bridge and sessiond.
+- Invalid GIF/brand URLs disable those decorations separately. Invalid
+  `DISCORD_STATUS_THREAD_ID`, `CODEX_ENABLED`, or `SEAM_TEST_DRIVER_URL`
+  disables that optional card, agent, or test client. Invalid extra Claude or
+  Copilot profile entries are skipped individually. Valid siblings remain.
+- An invalid `SEAM_GEMINI_TTS_VOICE` disables speech that depends on the env
+  voice, without substituting Kore. A valid explicit thread voice still works.
+- An unreadable, malformed, or schema-invalid whole preset file is retained
+  unchanged and unavailable at boot. A later valid hot reload activates it;
+  after that, invalid edits keep the last-good maps as before.
+
+`/health` keeps its liveness response and adds `disabledFeatures`, an array of
+`{ feature, cause }` records. This includes the original AGY/default-agent
+causes and unavailable preset files; a successful preset reload clears its
+boot refusal. Required credentials, repository validation and access-policy
+validation remain fatal. Other settings keep their existing validation.
 
 ## AGY identity migration
 

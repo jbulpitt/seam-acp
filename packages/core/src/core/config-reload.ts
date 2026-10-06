@@ -36,6 +36,7 @@ export interface PresetMaps {
   channelPresets: Map<string, ChannelPreset>;
   threadPresets: Map<string, ThreadPreset>;
   bridgePresets: Map<string, BridgeHostConfig>;
+  presetsDisabledReason?: string;
 }
 
 export interface ReloadResult {
@@ -79,6 +80,7 @@ export function reloadChannelPresets(
     (target as PresetMaps).bridgePresets = new Map();
   }
   applyInPlace(target.bridgePresets, next.bridgePresets);
+  target.presetsDisabledReason = undefined;
   logger.info(
     {
       file,

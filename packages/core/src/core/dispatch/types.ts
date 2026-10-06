@@ -22,6 +22,7 @@ export interface SelfMigrationDispatchTarget {
   previousAgent: string;
   previousModel: string;
   previousSessionId: string;
+  inheritSelection?: boolean;
 }
 
 /** How the dispatched turn acquires its ACP session — see `InjectTurnOptions`. */
@@ -266,6 +267,7 @@ export const DispatchSpecSchema = z.object({
     previousAgent: z.string().min(1),
     previousModel: z.string().min(1),
     previousSessionId: z.string(),
+    inheritSelection: z.boolean().optional(),
   }).optional(),
   authorId: z.string().min(1).optional(),
   authorName: z.string().min(1).optional(),

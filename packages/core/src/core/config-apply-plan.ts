@@ -23,6 +23,8 @@ export interface TargetIdentityChanges {
   role?: string | null;
   disableThreadPrefix?: boolean;
   fastMode?: boolean;
+  /** Agent-only changes discard old-agent pins rather than creating new ones. */
+  inheritSelection?: boolean;
 }
 
 export type RuntimeConsequence = "none" | "live-apply" | "reset" | "rebuild";
@@ -86,6 +88,7 @@ export type PreparedConfigSet =
       gif?: string;
       resolvedRepo?: string;
       restartRequested: boolean;
+      inheritSelection: boolean;
     };
 
 
@@ -166,6 +169,7 @@ export class ConfigApplyPlan {
       ...(target.parentRef ? { parentRef: target.parentRef } : {}),
       changes: {
         ...(changes.agent !== undefined ? { agent: changes.agent } : {}),
+        ...(changes.inheritSelection ? { model: null, effort: null } : {}),
         ...(changes.model !== undefined ? { model: changes.model } : {}),
         // `auto` is an explicit thread-level sentinel: it shadows a channel
         // effort pin while telling the router to use the backend default.
@@ -186,6 +190,11 @@ export class ConfigApplyPlan {
 
     const current = this.store.get(target.id) ?? target;
     const cfg = this.store.readConfig(current);
+    if (changes.inheritSelection) {
+      delete cfg.model;
+      delete cfg.reasoningEffort;
+      delete cfg.lastContextUsage;
+    }
     if (changes.model !== undefined) {
       cfg.model = changes.model;
       cfg.lastContextUsage = undefined;
@@ -342,10 +351,10 @@ export class ConfigApplyPlan {
       return { ok: false, message: "`gif` must be `on`, `off`, or `default`." };
     }
 
-    const candidateModel = requestedModel ??
-      (nextAgentId !== describedBefore.agent.value
-        ? this.modelCatalog.model({ agentId: nextAgentId, location: nextLocation }, "default")?.id ?? "default"
-        : describedBefore.model.value);
+    const agentChanged = nextAgentId !== describedBefore.agent.value;
+    const inheritSelection = agentChanged && values.model === null && values.effort === null;
+    const inherited = this.router.describeConfig(record, { inherit: true, agent: nextAgentId, location: nextLocation });
+    const candidateModel = requestedModel ?? (agentChanged ? inherited.model.value : describedBefore.model.value);
     const catalogModel = this.modelCatalog.model(
       { agentId: nextAgentId, location: nextLocation },
       candidateModel
@@ -361,7 +370,7 @@ export class ConfigApplyPlan {
     const effortChoices = catalogModel.effort.choices.map((choice) => choice.id);
     const pinnedEffort = values.effort !== null
       ? (clearEffort ? catalogModel.effort.selectionDefault : requestedEffort)
-      : (catalogModel.id !== describedBefore.model.value || nextAgentId !== describedBefore.agent.value
+      : (inheritSelection ? inherited.effort.value ?? undefined : catalogModel.id !== describedBefore.model.value || agentChanged
           ? catalogModel.effort.selectionDefault
           : undefined);
     if (pinnedEffort && !effortChoices.includes(pinnedEffort)) {
@@ -399,6 +408,7 @@ export class ConfigApplyPlan {
         nextAgentId,
         nextLocation,
         model: catalogModel.id,
+        inheritSelection,
         ...(pinnedEffort !== undefined ? { pinnedEffort } : {}),
         ...(requestedRole !== undefined ? { requestedRole } : {}),
         ...(permission !== undefined ? { permission } : {}),
@@ -458,9 +468,12 @@ export class ConfigApplyPlan {
         const cfg = this.store.readConfig(live);
         const agentChanged = appliedAgentId !== liveDescription.agent.value;
         const locationChanged = prepared.nextLocation !== liveDescription.location.value;
-        cfg.model = prepared.model;
+        if (prepared.inheritSelection) {
+          delete cfg.model;
+          delete cfg.reasoningEffort;
+        } else cfg.model = prepared.model;
         if (request.values.model !== null || agentChanged) delete cfg.lastContextUsage;
-        if (prepared.pinnedEffort !== undefined) cfg.reasoningEffort = prepared.pinnedEffort;
+        if (!prepared.inheritSelection && prepared.pinnedEffort !== undefined) cfg.reasoningEffort = prepared.pinnedEffort;
         if (request.values.role !== null) {
           if (!prepared.requestedRole || prepared.requestedRole.toLowerCase() === "auto") delete cfg.role;
           else cfg.role = prepared.requestedRole;
@@ -489,15 +502,16 @@ export class ConfigApplyPlan {
         mutationStarted = true;
         this.store.upsert(updated);
 
-        const overlayChanges: { agent?: string; model?: string; effort?: string | null; location?: string } = {};
+        const overlayChanges: { agent?: string; model?: string | null; effort?: string | null; location?: string } = {};
         if (request.values.agent !== null) {
           overlayChanges.agent = appliedAgentId;
-          overlayChanges.model = prepared.model;
+          overlayChanges.model = prepared.inheritSelection ? null : prepared.model;
           if (prepared.parsedAgent?.explicit) overlayChanges.location = prepared.nextLocation;
         } else if (request.values.model !== null) {
           overlayChanges.model = prepared.model;
         }
-        if (prepared.pinnedEffort !== undefined) overlayChanges.effort = prepared.pinnedEffort;
+        if (prepared.inheritSelection) overlayChanges.effort = null;
+        else if (prepared.pinnedEffort !== undefined) overlayChanges.effort = prepared.pinnedEffort;
         if (Object.keys(overlayChanges).length > 0) {
           const overlaid = this.configMutation.applyThreadOverlay({
             threadId: channel.id,
@@ -555,14 +569,14 @@ export class ConfigApplyPlan {
   ): Promise<string> {
     const changes: string[] = [];
     const notes: string[] = [];
+    const before = this.router.describeConfig(record);
+    const identityChanges: { agent?: string; model?: string | null; effort?: string | null; cwd?: string } = {};
 
-    // Agent change first — mirrors applyAgentChange(): kill the runtime, reset
-    // the model to the new agent's default, and clear the ACP session id so the
-    // next message starts fresh against the new backend.
-    if (preset.agentId && preset.agentId !== record.agentId) {
+    // Explicit preset fields belong to the thread, above inherited defaults.
+    if (preset.agentId) {
       const binding = {
         agentId: preset.agentId,
-        location: resolveThreadLocation(this.config, channel.id),
+        location: before.location.value,
       };
       const profile = this.router.getProfile(preset.agentId, binding.location);
       if (!profile) {
@@ -570,35 +584,40 @@ export class ConfigApplyPlan {
           `⚠️ ${this.refuseUnregisteredAgent(preset.agentId, `Unknown agent \`${preset.agentId}\``)} — agent left unchanged.`
         );
       } else {
-        const catalogDefault = this.modelCatalog.models(binding, { includeHidden: true }).find((model) => model.default);
-        if (!catalogDefault) {
+        const inherited = this.router.describeConfig(record, { inherit: true, agent: preset.agentId, location: binding.location });
+        const inheritedModel = this.modelCatalog.model(binding, inherited.model.value);
+        if (!inheritedModel) {
           notes.push(`⚠️ Catalog for \`${preset.agentId}@${binding.location}\` is warming/unavailable — agent left unchanged.`);
         } else {
-          await this.runtime.retire(record.id);
-          const cfg = this.store.readConfig(record);
-          cfg.model = catalogDefault.id;
-          cfg.reasoningEffort = catalogDefault.effort.selectionDefault;
-          // Different agent → different context window; cached usage is invalid.
-          cfg.lastContextUsage = undefined;
-          this.store.upsert({
-            ...record,
-            agentId: preset.agentId,
-            acpSessionId: "",
-            configJson: this.store.writeConfig(cfg),
-            updatedUtc: new Date().toISOString(),
-          });
-          record = this.store.get(record.id) ?? record;
-          changes.push(
-            `Agent → \`${preset.agentId}\` (model \`${catalogDefault.id}\`, effort \`${catalogDefault.effort.selectionDefault}\`)`
-          );
+          identityChanges.agent = preset.agentId;
+          if (preset.agentId !== before.agent.value) {
+            await this.runtime.retire(record.id);
+            const cfg = this.store.readConfig(record);
+            delete cfg.model;
+            delete cfg.reasoningEffort;
+            identityChanges.model = null;
+            identityChanges.effort = null;
+            cfg.lastContextUsage = undefined;
+            this.store.upsert({
+              ...record,
+              agentId: preset.agentId,
+              acpSessionId: "",
+              configJson: this.store.writeConfig(cfg),
+              updatedUtc: new Date().toISOString(),
+            });
+            record = this.store.get(record.id) ?? record;
+            changes.push(
+              `Agent → \`${preset.agentId}\` (model \`${inheritedModel.id}\`, effort \`${inherited.effort.value ?? inheritedModel.effort.selectionDefault}\`)`
+            );
+          }
         }
       }
     }
 
     const cfg = this.store.readConfig(record);
     const binding = {
-      agentId: record.agentId,
-      location: resolveThreadLocation(this.config, channel.id),
+      agentId: identityChanges.agent ?? before.agent.value,
+      location: before.location.value,
     };
 
     if (preset.model) {
@@ -606,32 +625,35 @@ export class ConfigApplyPlan {
       if (!catalogModel) {
         notes.push(`⚠️ Model \`${preset.model}\` skipped — unavailable in the cached catalog.`);
       } else {
-      cfg.model = catalogModel.id;
-      if (!preset.effort) cfg.reasoningEffort = catalogModel.effort.selectionDefault;
-      // Usage was measured under the previous model — don't seed the panel with
-      // mismatched numbers. The runtime invalidation below makes the new model
-      // take effect on respawn (covers backends where setModel() is rejected).
-      cfg.lastContextUsage = undefined;
-      changes.push(`Model → \`${catalogModel.id}\``);
-      if (!preset.effort) changes.push(`Effort → ${catalogModel.effort.selectionDefault}`);
+        cfg.model = catalogModel.id;
+        identityChanges.model = catalogModel.id;
+        if (!preset.effort) {
+          cfg.reasoningEffort = catalogModel.effort.selectionDefault;
+          identityChanges.effort = catalogModel.effort.selectionDefault;
+        }
+        cfg.lastContextUsage = undefined;
+        changes.push(`Model → \`${catalogModel.id}\``);
+        if (!preset.effort) changes.push(`Effort → ${catalogModel.effort.selectionDefault}`);
       }
     }
 
     if (preset.effort) {
       // Gate on the *effective* agent's capability, exactly like /seam effort —
       // otherwise the summary would claim a change that silently does nothing.
-      const selectedModel = this.modelCatalog.model(binding, cfg.model ?? "default");
+      const selected = this.router.describeConfig(record, { agent: binding.agentId, model: preset.model ?? undefined });
+      const selectedModel = this.modelCatalog.model(binding, selected.model.value);
       const supported = selectedModel?.effort.choices.map((choice) => choice.id) ?? [];
       if (supported.includes(preset.effort)) {
         cfg.reasoningEffort = preset.effort;
+        identityChanges.effort = preset.effort;
         changes.push(`Effort → ${preset.effort}`);
       } else if (selectedModel?.effort.mechanism === "modelBaked") {
         notes.push(
-          `⚠️ Effort \`${preset.effort}\` skipped — \`${record.agentId}\` bakes effort into the model choice.`
+          `⚠️ Effort \`${preset.effort}\` skipped — \`${binding.agentId}\` bakes effort into the model choice.`
         );
       } else {
         notes.push(
-          `⚠️ Effort \`${preset.effort}\` skipped — \`${record.agentId}\` has no settable reasoning effort.`
+          `⚠️ Effort \`${preset.effort}\` skipped — \`${binding.agentId}\` has no settable reasoning effort.`
         );
       }
     }
@@ -672,15 +694,25 @@ export class ConfigApplyPlan {
     // One write for config + repo. `acp_session_id` is assigned out-of-band, so
     // re-read the authoritative value rather than trusting the in-memory record
     // (see persistConfig) — unless the agent switch above deliberately cleared it.
-    if (preset.repoPath) cfg.sessionCwdExplicit = true;
+    if (preset.repoPath) {
+      identityChanges.cwd = preset.repoPath;
+      delete cfg.sessionCwdExplicit;
+    }
     const live = this.store.get(record.id)?.acpSessionId;
     this.store.upsert({
       ...record,
       ...(live ? { acpSessionId: live } : {}),
-      ...(preset.repoPath ? { repoPath: preset.repoPath } : {}),
+      ...(identityChanges.agent ? { agentId: identityChanges.agent } : {}),
+      ...(preset.repoPath ? { repoPath: null } : {}),
       configJson: this.store.writeConfig(cfg),
       updatedUtc: new Date().toISOString(),
     });
+    if (Object.keys(identityChanges).length) {
+      const written = this.configMutation.applyThreadOverlay({ threadId: channel.id,
+        ...(record.parentRef ? { parentRef: record.parentRef } : {}), changes: identityChanges,
+        actor: { id: null, name: "preset-apply" } });
+      if (!written.ok) throw new Error(written.error);
+    }
     if (preset.repoPath) {
       changes.push(`Repo → \`${this.repoDisplay(preset.repoPath)}\``);
     }

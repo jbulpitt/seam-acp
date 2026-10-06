@@ -13,10 +13,11 @@ import { parseAgentAtLocation, formatAgentAtLocation, LOCAL_LOCATION } from "./l
 import type { AgentProfile } from "@seam/adapters";
 import {
   detectSessionReset,
+  type ConfigMutationService,
   type AppliedSessionConfig,
   type SessionConfigChanges,
 } from "./config-mutation.js";
-import type { ConfigDescription, SessionInvalidationOptions } from "./session-router.js";
+import type { ConfigDescription, ConfigResolution, SessionInvalidationOptions } from "./session-router.js";
 import {
   FAST_MODE_COST_WARNING,
   FAST_MODE_CONFIG_ID,
@@ -59,6 +60,7 @@ export interface PreparedSelfMigration {
   previousAgent: string;
   previousModel: string;
   previousSessionId: string;
+  inheritSelection?: boolean;
 }
 
 export type PrepareSelfMigrationOutcome =
@@ -160,7 +162,7 @@ export interface ThreadSessionControlDeps {
     upsert(record: SessionRecord): void;
   };
   router: {
-    describeConfig(record: SessionRecord): ConfigDescription;
+    describeConfig(record: SessionRecord, selection?: ConfigResolution): ConfigDescription;
     getProfile(agentId: string, location?: string): AgentProfile | undefined;
     assertAgentAllowedForRecord(record: SessionRecord, agentId: string): void;
     parkedSelectMessage?(agentId: string): string | null;
@@ -172,6 +174,8 @@ export interface ThreadSessionControlDeps {
     ): Promise<void>;
   };
   mutation: SessionConfigMutation & {
+    readThreadPresetEntry: ConfigMutationService["readThreadPresetEntry"];
+    restoreThreadPresetEntry: ConfigMutationService["restoreThreadPresetEntry"];
     applyThreadOverlay(opts: {
       threadId: string;
       parentRef?: string;
@@ -390,11 +394,9 @@ export class RuntimeTransition {
     if (input.model !== undefined && !requestedModel) {
       return { ok: false, error: "`model` must be a non-empty string." };
     }
-    const catalogDefault = this.deps.modelCatalog.models({
-      agentId: nextAgent,
-      location,
-    }, { includeHidden: true }).find((model) => model.default);
-    const requestedTargetModel = requestedModel ?? (agentChanged ? catalogDefault?.id : before.model.value);
+    const inherited = this.deps.router.describeConfig(target, { inherit: true, agent: nextAgent, location });
+    const inheritSelection = agentChanged && input.model === undefined && input.effort === undefined;
+    const requestedTargetModel = requestedModel ?? (agentChanged ? inherited.model.value : before.model.value);
     if (!requestedTargetModel) {
       return {
         ok: false,
@@ -438,7 +440,7 @@ export class RuntimeTransition {
 
     const desiredEffort = requestedEffort === "auto"
       ? catalogModel.effort.selectionDefault
-      : requestedEffort ?? catalogModel.effort.selectionDefault;
+      : requestedEffort ?? (inheritSelection ? inherited.effort.value ?? catalogModel.effort.selectionDefault : catalogModel.effort.selectionDefault);
     if (!catalogModel.effort.choices.some((choice) => choice.id === desiredEffort)) {
       return {
         ok: false,
@@ -454,6 +456,7 @@ export class RuntimeTransition {
         previousAgent: before.agent.value,
         previousModel: before.model.value,
         previousSessionId: target.acpSessionId,
+        ...(inheritSelection ? { inheritSelection: true } : {}),
       },
     };
   }
@@ -482,21 +485,22 @@ export class RuntimeTransition {
     }
 
     const snapshot: SessionRecord = { ...current };
+    const overlayBefore = this.deps.mutation.readThreadPresetEntry(current.channelRef);
     const desiredEffort = prepared.effort;
     const warnings: string[] = [];
 
     try {
-      const staged = this.deps.mutation.applySessionConfig(
+      const staged = this.applyTargetIdentity(
         current,
         {
           ...(prepared.agent !== before.agent.value ? { agent: prepared.agent } : {}),
-          model: prepared.model,
-          effort: desiredEffort ?? null,
+          ...(prepared.inheritSelection ? { inheritSelection: true } : {
+            model: prepared.model, effort: desiredEffort ?? null,
+          }),
         },
         { id: null, name: `seam-mcp:self:${current.channelRef}` }
       );
-      if (!staged.ok) return staged;
-      warnings.push(...staged.result.warnings);
+      if (!staged.ok) throw new Error(staged.error);
 
       const effective = this.deps.router.describeConfig(
         this.deps.store.get(current.id) ?? current
@@ -526,10 +530,11 @@ export class RuntimeTransition {
       // A candidate runtime may already exist. Retire it before restoring the
       // old durable session so no process can keep writing stale target state.
       await this.retire(current.id, { clearStartFailure: true }).catch(() => {});
+      const restored = this.deps.mutation.restoreThreadPresetEntry(current.channelRef, overlayBefore);
       this.deps.store.upsert(snapshot);
       return {
         ok: false,
-        error: err instanceof Error ? err.message : String(err),
+        error: `${err instanceof Error ? err.message : String(err)}${restored.ok ? "" : ` Overlay rollback failed: ${restored.error}`}`,
       };
     }
   }
@@ -575,11 +580,9 @@ export class RuntimeTransition {
     if (input.model !== undefined && !requestedModel) {
       return { ok: false, error: "`model` must be a non-empty string." };
     }
-    const catalogDefault = this.deps.modelCatalog.models({
-      agentId: nextAgentId,
-      location,
-    }, { includeHidden: true }).find((model) => model.default);
-    const requestedTargetModel = requestedModel ?? (agentChanged ? catalogDefault?.id ?? "default" : before.model.value);
+    const inherited = this.deps.router.describeConfig(target, { inherit: true, agent: nextAgentId, location });
+    const inheritSelection = agentChanged && input.model === undefined && input.effort === undefined;
+    const requestedTargetModel = requestedModel ?? (agentChanged ? inherited.model.value : before.model.value);
     if (!requestedTargetModel) {
       return {
         ok: false,
@@ -611,7 +614,7 @@ export class RuntimeTransition {
     let desiredEffort = requestedEffort === "auto"
       ? catalogModel?.effort.selectionDefault
       : requestedEffort ??
-        ((modelChanged || agentChanged)
+        (inheritSelection ? inherited.effort.value ?? catalogModel?.effort.selectionDefault : (modelChanged || agentChanged)
           ? catalogModel?.effort.selectionDefault
           : normalizeStoredEffort(before.effort.value ?? undefined));
     const requestedRole = input.role?.trim();
@@ -715,8 +718,10 @@ export class RuntimeTransition {
       target,
       {
         ...(agentChanged ? { agent: nextAgentId } : {}),
-        ...(modelChanged || agentChanged ? { model: nextModel } : {}),
-        ...(effortTouched ? { effort: desiredEffort ?? null } : {}),
+        ...(inheritSelection ? { inheritSelection: true } : {
+          ...(modelChanged || agentChanged ? { model: nextModel } : {}),
+          ...(effortTouched ? { effort: desiredEffort ?? null } : {}),
+        }),
         ...(input.role !== undefined ? { role: nextRole } : {}),
         ...(input.disableThreadPrefix !== undefined
           ? { disableThreadPrefix: input.disableThreadPrefix }
@@ -1075,26 +1080,20 @@ export class RuntimeTransition {
       const live = this.store.get(record.id) ?? record;
       const cfg = this.store.readConfig(live);
       const nextBinding = { agentId: parsed.agentId, location: nextLocation };
-      const catalogDefault = this.modelCatalog.models(nextBinding, { includeHidden: true }).find((model) => model.default);
-      if (!catalogDefault) {
-        throw new Error(`model catalog for ${parsed.agentId}@${nextLocation} is warming/unavailable`);
-      }
+      const inherited = this.router.describeConfig(record, { inherit: true, agent: parsed.agentId, location: nextLocation });
       if (!sameAgent) {
-        cfg.model = catalogDefault.id;
-        cfg.reasoningEffort = catalogDefault.effort.selectionDefault;
+        delete cfg.model;
+        delete cfg.reasoningEffort;
         delete cfg.lastContextUsage;
       }
-      const intendedModel = cfg.model ?? catalogDefault.id;
+      const intendedModel = sameAgent ? describedBefore.model.value : inherited.model.value;
       const intendedEntry = this.modelCatalog.model(nextBinding, intendedModel);
       if (!intendedEntry) {
         throw new Error(`model ${intendedModel} is unavailable in the cached catalog for ${parsed.agentId}@${nextLocation}`);
       }
-      if (!sameAgent && cfg.reasoningEffort === undefined) {
-        cfg.reasoningEffort = intendedEntry.effort.selectionDefault;
-      }
       const intendedSelection = this.modelCatalog.resolve(nextBinding, {
         model: intendedModel,
-        effort: cfg.reasoningEffort,
+        effort: (sameAgent ? describedBefore.effort.value : inherited.effort.value) ?? undefined,
       });
       this.store.upsert({
         ...live,
@@ -1125,8 +1124,7 @@ export class RuntimeTransition {
         ...(channel.parentId ? { parentRef: channel.parentId } : {}),
         changes: {
           agent: parsed.agentId,
-          ...(!sameAgent ? { model: intendedModel } : {}),
-          ...(!sameAgent ? { effort: intendedEntry.effort.selectionDefault } : {}),
+          ...(!sameAgent ? { model: null, effort: null } : {}),
         },
         actor,
       });

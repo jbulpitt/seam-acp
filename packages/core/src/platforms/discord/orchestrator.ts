@@ -4266,7 +4266,7 @@ export class Orchestrator {
             // as a retry for Copilot, else every post-tool continuation posts a
             // spurious "retried" notice.
             const isNewMessage =
-              record.agentId.startsWith("copilot") &&
+              described.agent.value.startsWith("copilot") &&
               event.messageId !== undefined &&
               currentMessageId !== undefined &&
               event.messageId !== currentMessageId;
@@ -4485,7 +4485,7 @@ export class Orchestrator {
             // end-of-turn /compact when usage crosses the configured threshold.
             if (
               this.config.AGY_AUTO_COMPACT_THRESHOLD > 0 &&
-              record.agentId.startsWith("agy") &&
+              described.agent.value.startsWith("agy") &&
               used / size >= this.config.AGY_AUTO_COMPACT_THRESHOLD
             ) {
               agyAutoCompactNeeded = true;
@@ -4690,7 +4690,7 @@ export class Orchestrator {
         }
         humanActivitySubmitted = true;
         if (!humanResume) this.plugins.turnActivity.emit({ type: "turn-started", turnId: liveMarkerId, timestampMs: Date.now(),
-          binding: { agentId: record.agentId, location: described.location.value, account: record.agentId, sessionId: record.id } });
+          binding: { agentId: described.agent.value, location: described.location.value, account: described.agent.value, sessionId: record.id } });
         result = await raceWithTimeout(
           activeRuntime.prompt(promptText, promptAttachments, {
             submissionEvidence,
@@ -4721,7 +4721,7 @@ export class Orchestrator {
         this.assertQueueFence(queueFence);
       } catch (promptErr) {
         const resolution = resolveError(
-          readErrorClassification(promptErr) ?? unclassified(record.agentId), DEFAULT_ERROR_RULES);
+          readErrorClassification(promptErr) ?? unclassified(described.agent.value), DEFAULT_ERROR_RULES);
         this.logger.warn({ session: record.id, resolution }, "turn recovery resolved");
         // Same-session recovery has already run inside AgentRuntime. No output
         // is not proof that no tools ran: owned input must not now be replayed
@@ -4904,7 +4904,7 @@ export class Orchestrator {
       //      the CLI handles client-side (no LLM call).
       if (result !== "timeout" && !result.cancelled) {
         const location = described.location.value;
-        const profile = this.router.getProfile(record.agentId, location);
+        const profile = this.router.getProfile(described.agent.value, location);
         const usageReader = profile?.sessionManager?.getUsage;
         // A bridged session's transcript lives on its own host, so ask it there.
         const remoteUsage = !isLocalLocation(location) && this.bridgeHub;
@@ -4917,7 +4917,7 @@ export class Orchestrator {
                   cwd,
                   sessionId: record.acpSessionId || undefined,
                   newerThanMs: turnStartedAt || undefined,
-                }, record.agentId, { timeoutMs: 15_000 })) as Awaited<ReturnType<NonNullable<typeof usageReader>>> | null
+                }, described.agent.value, { timeoutMs: 15_000 })) as Awaited<ReturnType<NonNullable<typeof usageReader>>> | null
               : await usageReader!.call(
                   profile!.sessionManager,
                   cwd,
@@ -4959,7 +4959,7 @@ export class Orchestrator {
             this.logger.debug({ err }, "getUsage side-channel unavailable");
           }
         }
-        if (!sideChannelEmitted && record.agentId.startsWith("copilot")) {
+        if (!sideChannelEmitted && described.agent.value.startsWith("copilot")) {
           await wrapUpStep("copilot-context-probe", () => this.probeCopilotContext(activeRuntime, eventHandler, refresh));
         }
 
@@ -4972,7 +4972,7 @@ export class Orchestrator {
       if (agyAutoCompactNeeded && result !== "timeout" && !result.cancelled) {
         try {
           await wrapUpStep("agy-auto-compact", () =>
-            this.runAgyAutoCompact(record, channel, status, refresh, status.contextUsedHighWater));
+            this.runAgyAutoCompact(record, channel, status, refresh, status.contextUsedHighWater, described));
         } catch (err) {
           this.logger.warn({ err, session: record.id }, "agy auto-compact failed");
         }
@@ -5038,10 +5038,10 @@ export class Orchestrator {
         await this.router.invalidate(record.id, { clearAcpSession: !needsRepair });
 
         if (needsRepair) {
-          const location = this.router.describeConfig(record).location.value;
-          const profile = this.router.getProfile(record.agentId, location);
+          const location = described.location.value;
+          const profile = this.router.getProfile(described.agent.value, location);
           const manager = profile
-            ? this.sessionManagerFor(profile, record.agentId, location)
+            ? this.sessionManagerFor(profile, described.agent.value, location)
             : undefined;
           const cwd = effectiveCwd;
           let repaired = false;
@@ -5156,7 +5156,7 @@ export class Orchestrator {
       if (humanAttempt && humanOutcomeOwned && humanDelivered) this.store.turnAttempts.markDeliveryDone(humanAttempt.id);
       if (humanActivitySubmitted && (!humanAttempt || humanOutcomeOwned || this.store.turnAttempts.get(humanAttempt.id)?.state === "cancelled")) {
         this.plugins.turnActivity.emit({ type: "turn-completed", turnId: liveMarkerId, timestampMs: Date.now(),
-          binding: { agentId: record.agentId, location: described.location.value, account: record.agentId, sessionId: record.id } });
+          binding: { agentId: described.agent.value, location: described.location.value, account: described.agent.value, sessionId: record.id } });
       }
       if (wrapUpStartedAt !== undefined) {
         this.logger.info(
@@ -5618,15 +5618,17 @@ export class Orchestrator {
     channel: ChannelRef,
     status: TurnStatus,
     refresh: (force?: boolean) => Promise<void>,
-    tokensBefore: number
+    tokensBefore: number,
+    described = this.router.describeConfig(record)
   ): Promise<void> {
-    const location = this.router.describeConfig(record).location.value;
-    const profile = this.router.getProfile(record.agentId, location);
+    const { value: agentId } = described.agent;
+    const location = described.location.value;
+    const profile = this.router.getProfile(agentId, location);
     const manager = profile
-      ? this.sessionManagerFor(profile, record.agentId, location)
+      ? this.sessionManagerFor(profile, agentId, location)
       : undefined;
     if (!profile || !manager?.getTranscript) {
-      this.logger.debug({ agent: record.agentId }, "auto-compact skipped: missing manager methods");
+      this.logger.debug({ agent: agentId }, "auto-compact skipped: missing manager methods");
       return;
     }
     // #308: protects unattended auto-compaction from reusing a barred agent;
@@ -5659,9 +5661,9 @@ export class Orchestrator {
       }
     } catch { /* best-effort — don't block compaction on a failed card send */ }
 
-    const cwd = this.effectiveCwd(record);
-    if (!this.compactionModelFor(record.agentId, location)) {
-      this.logger.warn({ agent: record.agentId }, "auto-compact: no compaction model configured");
+    const cwd = described.cwd.value;
+    if (!this.compactionModelFor(agentId, location)) {
+      this.logger.warn({ agent: agentId }, "auto-compact: no compaction model configured");
       return;
     }
 
@@ -5670,7 +5672,7 @@ export class Orchestrator {
       built = await this.buildDefaultCompactionSeed({
         profile,
         manager,
-        agentId: record.agentId,
+        agentId,
         location,
         cwd,
         sessionId: record.acpSessionId,
@@ -5687,13 +5689,12 @@ export class Orchestrator {
 
     // Non-destructive: seed a new resumable session and bind the thread to it
     // (the original session is preserved on disk).
-    const acCfg = this.store.readConfig(record);
     const acNewId = await this.seedNewSession({
       profile, restrictionChannelId: record.parentRef ?? record.channelRef, cwd,
       location,
       sessionId: record.id,
-      ...(acCfg.model ? { model: acCfg.model } : {}),
-      ...(acCfg.reasoningEffort ? { effort: acCfg.reasoningEffort } : {}),
+      model: described.model.value,
+      ...(described.effort.value ? { effort: described.effort.value } : {}),
       summary: built.seed,
     });
     record.acpSessionId = acNewId; // keep the in-memory record in sync (see getOrStartRuntime)
@@ -6087,6 +6088,7 @@ export class Orchestrator {
         });
     try {
       if (!opts.resumeSessionId) await this.ensureOwnSession(record, target);
+      const liveConfig = this.router.describeConfig(record);
       const resumeSessionId = opts.resumeSessionId || record.acpSessionId;
       const rt = await acquire(() => resumeSessionId
         // The same owner serves human and live-dispatch continuations. The
@@ -6097,7 +6099,7 @@ export class Orchestrator {
       opts.lifecycle?.onRuntime?.(rt.getProcessId?.(), rt.getProviderIdentity?.());
       const liveSessionId = record.acpSessionId || rt.getSessionInfo()?.sessionId;
       budgetRecord = record;
-      activityBinding = { agentId: record.agentId, location: this.router.describeConfig(record).location?.value ?? resolveThreadLocation(this.config, record.channelRef), account: record.agentId, sessionId: record.id };
+      activityBinding = { agentId: liveConfig.agent.value, location: liveConfig.location.value, account: liveConfig.agent.value, sessionId: record.id };
       budgetIdentity = this.contextBudgetIdentity(record, rt.getSessionInfo()?.sessionId ?? liveSessionId);
       if (liveSessionId) {
         try {
@@ -6818,14 +6820,15 @@ export class Orchestrator {
     const source = opts?.source ?? "session";
     const described = this.router.describeConfig(record);
     const location = described.location?.value ?? LOCAL_LOCATION;
-    const profile = this.router.getProfile(record.agentId, location) ?? this.router.getProfile(record.agentId);
+    const agentId = described.agent.value;
+    const profile = this.router.getProfile(agentId, location);
     if (!profile) {
-      throw new Error(`Agent profile "${record.agentId}" not found, so this thread has no compactable session.`);
+      throw new Error(`Agent profile "${agentId}" not found, so this thread has no compactable session.`);
     }
-    const manager = this.sessionManagerFor(profile, record.agentId, location);
+    const manager = this.sessionManagerFor(profile, agentId, location);
     if (!manager) {
       throw new Error(
-        `Agent \`${record.agentId}\` (${profile.displayName}) does not support session management, ` +
+        `Agent \`${agentId}\` (${profile.displayName}) does not support session management, ` +
           `so it has no compactable session.`
       );
     }
@@ -6872,15 +6875,14 @@ export class Orchestrator {
     // Non-destructive: seed a NEW resumable session with the summary, decide
     // the binding from AUTHORITATIVE state below, and leave the original intact
     // (recoverable / deletable from the session manager).
-    const cfg = this.store.readConfig(record);
     const newSessionId = await this.seedNewSession({
       profile,
       restrictionChannelId: record.parentRef ?? record.channelRef,
       cwd,
       location,
       sessionId: record.id,
-      ...(cfg.model ? { model: cfg.model } : {}),
-      ...(cfg.reasoningEffort ? { effort: cfg.reasoningEffort } : {}),
+      model: described.model.value,
+      ...(described.effort.value ? { effort: described.effort.value } : {}),
       summary: result.assembledSeed,
     });
     const attachment = await this.attachCompactedSession({
@@ -7159,7 +7161,7 @@ export class Orchestrator {
     if (opts.effectiveSession !== "isolated") return {};
     // Local isolated used to spawn with mcpServers: [] — ingest scoring then
     // had no submit_result. Reuse the authoring thread's token (do not mint).
-    const agentId = opts.profile?.id ?? opts.record.agentId;
+    const agentId = opts.profile?.id ?? this.router.describeConfig(opts.record).agent.value;
     const binding = { agentId, location: opts.workerLocation };
     // An omitted model is deliberately resolved against the binding's current
     // published default at fire time. AgentProfile.defaultModel is bootstrap
@@ -7574,11 +7576,7 @@ export class Orchestrator {
     const target = (to ?? "").trim();
     if (!target) return { ok: false, error: "to (a target thread id) is required." };
 
-    const record = this.router.ensureSessionRecord({
-      platform: caller.platform,
-      channelRef: target,
-      cwd: this.config.REPOS_ROOT,
-    });
+    const record = await this.bindThreadRecord({ platform: caller.platform, id: target });
 
     // (b) Mark the in-flight LIVE handoff interrupted BEFORE the cancel, so its
     // cancelled run() is guaranteed to find the flag set when it reaches the
@@ -7642,7 +7640,8 @@ export class Orchestrator {
    * ledger row (kind "inbox") is best-effort, same as the agent push above.
    */
   pushHumanInbox(record: SessionRecord, from: string, message: string): { queued: number } {
-    const activeProfile = this.router.getProfile(record.agentId);
+    const resolved = this.router.describeConfig(record);
+    const activeProfile = this.router.getProfile(resolved.agent.value, resolved.location.value);
     const body = activeProfile?.restrictDiscordAccess ? scrubDiscordUrls(message) : message;
     const stored = this.store.pushInbox(record.id, from, body);
     try {
@@ -9689,11 +9688,7 @@ export class Orchestrator {
     };
 
     const target: ChannelRef = { platform: PLATFORM, id: spec.target };
-    let record = this.router.ensureSessionRecord({
-      platform: PLATFORM,
-      channelRef: spec.target,
-      cwd: spec.cwd ?? this.config.REPOS_ROOT,
-    });
+    let record = await this.bindThreadRecord(target, spec.cwd);
 
     // Preset worker (#23): dispatch to a reusable stateless identity instead of
     // the target thread's own session. Resolve the preset, force an isolated run
@@ -9732,6 +9727,13 @@ export class Orchestrator {
     const isolatedWorkerCwd = effectiveSession === "isolated"
       ? this.isolatedDispatchCwd({ spec, preset, record, workerLocation })
       : undefined;
+    const isolatedConfig = effectiveSession === "isolated"
+      ? this.router.describeConfig(record, { agent: requestedAgentId, location: workerLocation,
+          model: preset?.model ?? spec.model, effort: preset?.effort ?? spec.effort })
+      : undefined;
+    const workerProfile = isolatedConfig
+      ? this.router.resolveProfileForChannel(isolatedConfig.agent.value, restrictionChannelId, workerLocation)
+      : presetProfile;
     // #76: a resume is the SAME spec with two substitutions — prompt →
     // "continue", session acquisition → loadSession(recorded id). Everything
     // else (returnTo / correlationId / kind / chainId) rides along untouched
@@ -9772,10 +9774,10 @@ export class Orchestrator {
             record,
             effectiveSession,
             workerLocation,
-            profile: presetProfile,
+            profile: workerProfile,
             cwd: isolatedWorkerCwd!,
-            model: preset?.model ?? spec.model,
-            effort: preset?.effort ?? spec.effort,
+            model: isolatedConfig!.model.value,
+            effort: isolatedConfig!.effort.value ?? undefined,
           })
         : {};
     const seamMcp = sessionHasSeamMcp(
@@ -9885,13 +9887,13 @@ export class Orchestrator {
       if (this.restartCutoff) {
         throw DispatchSuspendedError.shutdown(spec.id, "restart cutoff reached before the turn started");
       }
-      const described = this.router.describeConfig?.(record);
-      const selectedProfile = presetProfile ?? this.router.getProfile?.(described?.agent?.value ?? record.agentId, workerLocation);
+      const described = isolatedConfig ?? this.router.describeConfig(record);
+      const selectedProfile = workerProfile ?? this.router.getProfile(described.agent.value, workerLocation);
       const identity = executionIdentity({
-        agentId: presetProfile?.id ?? described?.agent?.value ?? record.agentId,
+        agentId: described.agent.value,
         location: workerLocation, session: effectiveSession,
-        model: preset?.model ?? (effectiveSession === "isolated" ? spec.model : described?.model?.value),
-        effort: preset?.effort ?? (effectiveSession === "isolated" ? spec.effort : described?.effort?.value),
+        model: described.model.value,
+        effort: described.effort.value ?? undefined,
         cwd: effectiveSession === "live"
           ? described?.cwd?.value ?? record.repoPath
           : isolatedWorkerCwd!,
@@ -10076,16 +10078,11 @@ export class Orchestrator {
         ? await (async () => {
             const cfg = this.store.readConfig(record);
             const isolated = effectiveSession === "isolated";
-            const described = this.router.describeConfig(record);
-            const describedModel = described.model?.value ?? cfg.model ?? this.choiceDefaultModel(record);
-            const panelModel = isolated
-              ? (preset?.model ?? spec.model ?? describedModel)
-              : describedModel;
-            const panelEffort = isolated
-              ? (preset?.effort ?? spec.effort ?? cfg.reasoningEffort)
-              : cfg.reasoningEffort;
+            const described = isolatedConfig ?? this.router.describeConfig(record);
+            const panelModel = described.model.value;
+            const panelEffort = described.effort.value;
             const panelCwd = isolated ? isolatedWorkerCwd! : this.effectiveCwd(record);
-            const panelProfile = presetProfile ?? this.router.getProfile(record.agentId);
+            const panelProfile = workerProfile ?? this.router.getProfile(described.agent.value, described.location.value);
             return this.startDispatchStatusPanel(target, spec, {
               model: panelModel,
               ...(panelEffort ? { effort: panelEffort } : {}),
@@ -10275,10 +10272,9 @@ export class Orchestrator {
       try {
         result = await this.injectTurn(record, effectivePrompt, {
           session: effectiveSession,
-          ...(preset?.model ? { model: preset.model } : spec.model ? { model: spec.model } : {}),
-          ...(preset?.effort ? { effort: preset.effort } : spec.effort ? { effort: spec.effort } : {}),
+          ...(isolatedConfig ? { model: isolatedConfig.model.value, effort: isolatedConfig.effort.value ?? undefined } : {}),
           ...(effectiveSession === "isolated" ? { cwd: isolatedWorkerCwd! } : {}),
-          ...(presetProfile ? { profile: presetProfile } : {}),
+          ...(workerProfile ? { profile: workerProfile } : {}),
           ...((isResume || previousAttempt?.acpSessionId) && resumeSessionId
             ? { resumeSessionId }
             : {}),
@@ -11133,11 +11129,7 @@ export class Orchestrator {
    */
   private async dispatchCompact(spec: DispatchSpec): Promise<{ output: string; stopReason: string }> {
     const target: ChannelRef = { platform: PLATFORM, id: spec.target };
-    const record = this.router.ensureSessionRecord({
-      platform: PLATFORM,
-      channelRef: spec.target,
-      cwd: spec.cwd ?? this.config.REPOS_ROOT,
-    });
+    const record = await this.bindThreadRecord(target, spec.cwd);
     const actor = spec.returnTo ?? spec.target;
 
     // Ledger the actor→target compaction (best-effort — never break the run).
@@ -11172,10 +11164,10 @@ export class Orchestrator {
       ? await (async () => {
           const cfg = this.store.readConfig(record);
           const described = this.router.describeConfig(record);
-          const compactProfile = this.router.getProfile(record.agentId);
+          const compactProfile = this.router.getProfile(described.agent.value, described.location.value);
           return this.startDispatchStatusPanel(target, spec, {
             model: described.model?.value ?? cfg.model ?? this.choiceDefaultModel(record),
-            ...(cfg.reasoningEffort ? { effort: cfg.reasoningEffort } : {}),
+            ...(described.effort.value ? { effort: described.effort.value } : {}),
             cwd: this.effectiveCwd(record),
             ...(compactProfile ? { profile: compactProfile } : {}),
             isolated: false,
@@ -14460,11 +14452,9 @@ export class Orchestrator {
       return;
     }
     const level = i.options.getString("level");
-    const cfg = this.store.readConfig(record);
-    const current = cfg.reasoningEffort ?? "default";
-
     // Capability is model-specific and comes only from the operational catalog.
     const described = this.router.describeConfig(record);
+    const current = described.effort.value ?? "default";
     const catalogModel = this.modelCatalog.model(
       { agentId: described.agent.value, location: described.location.value },
       described.model.value
@@ -14480,8 +14470,8 @@ export class Orchestrator {
     if (catalogModel.effort.mechanism === "none" || catalogModel.effort.mechanism === "modelBaked") {
       const msg =
         catalogModel.effort.mechanism === "modelBaked"
-          ? `Effort for \`${record.agentId}\` is part of the **model** choice — pick a high/med/low model variant with \`/seam config model\`.`
-          : `The active agent (\`${record.agentId}\`) doesn't support a reasoning-effort setting.`;
+          ? `Effort for \`${described.agent.value}\` is part of the **model** choice — pick a high/med/low model variant with \`/seam config model\`.`
+          : `The active agent (\`${described.agent.value}\`) doesn't support a reasoning-effort setting.`;
       await replyToInteraction(i, { content: msg, flags: MessageFlags.Ephemeral });
       return;
     }
@@ -14506,8 +14496,8 @@ export class Orchestrator {
       const channel = this.channelRefFromInteraction(i);
       if (!channel || !this.adapter.sendChoicePicker) {
         const body =
-          cfg.reasoningEffort
-            ? `Reasoning effort: \`${cfg.reasoningEffort}\`.`
+          described.effort.value
+            ? `Reasoning effort: \`${described.effort.value}\`.`
             : `Reasoning effort is **unset** — the agent uses its own default. Set with \`/seam config effort level:<${supported.join("|")}>\`.`;
         await replyToInteraction(i, { content: body, flags: MessageFlags.Ephemeral });
         return;
@@ -14541,7 +14531,7 @@ export class Orchestrator {
     // narrower range (e.g. Codex: low/medium/high) must reject xhigh/max here.
     if (!supported.includes(level)) {
       await replyToInteraction(i, {
-        content: `\`${level}\` isn't supported by \`${record.agentId}\` — choose one of: ${supportedList}.`,
+        content: `\`${level}\` isn't supported by \`${described.agent.value}\` — choose one of: ${supportedList}.`,
         flags: MessageFlags.Ephemeral,
       });
       return;
@@ -16309,17 +16299,12 @@ export class Orchestrator {
     }
 
     const parentId = !explicit ? here?.parentId : undefined;
-    const record = this.router.ensureSessionRecord({
-      platform: PLATFORM,
-      channelRef: threadId,
-      ...(parentId ? { parentRef: parentId } : {}),
-      cwd: this.config.REPOS_ROOT,
-    });
     const target: ChannelRef = {
       platform: PLATFORM,
       id: threadId,
       ...(parentId ? { parentId } : {}),
     };
+    const record = await this.bindThreadRecord(target);
 
     const operator = this.interactionSpeakerName(i);
     const source = here;
@@ -17091,14 +17076,14 @@ export class Orchestrator {
     const compactAgentId = compactBinding.agent.value;
     const compactLocation = compactBinding.location.value;
     const profile = this.router.getProfile(compactAgentId, compactLocation);
-    if (!profile) throw new Error(`Agent profile "${record.agentId}" not found.`);
+    if (!profile) throw new Error(`Agent profile "${compactAgentId}" not found.`);
     // #308: protects the direct Discord-history compactor; deleting it makes
     // this temporary AgentRuntime a bypass around normal turn resolution.
     this.router.assertAgentAllowedForRecord(record, profile.id);
     const manager = this.sessionManagerFor(profile, compactAgentId, compactLocation);
     if (!manager) {
       throw new Error(
-        `Agent profile \`${record.agentId}\` (${profile.displayName}) does not support session management.`
+        `Agent profile \`${compactAgentId}\` (${profile.displayName}) does not support session management.`
       );
     }
     if (typeof this.adapter.fetchThreadMessages !== "function") {
@@ -17130,7 +17115,7 @@ export class Orchestrator {
 
       const compactionModel = this.compactionModelFor(compactAgentId, compactLocation);
       if (!compactionModel) {
-        throw new Error(`Compact from Thread is not supported for agent profile \`${record.agentId}\``);
+        throw new Error(`Compact from Thread is not supported for agent profile \`${compactAgentId}\``);
       }
       const promptTemplate = await fsp.readFile(path.join(this.config.REPOS_ROOT, "compact.md"), "utf8");
       const compactAddendum =
@@ -17635,7 +17620,8 @@ export class Orchestrator {
     try {
       let result: { newSessionId: string; summary: string };
       if (agentOption !== null || modelOption !== null) {
-        const agentId = agentOption?.trim() || record.agentId;
+        const resolved = this.router.describeConfig(record);
+        const agentId = agentOption?.trim() || resolved.agent.value;
         const profile = this.router.getProfile(agentId);
         if (!profile) {
           throw new Error(
@@ -17768,7 +17754,7 @@ export class Orchestrator {
       const profile = this.router.getProfile(binding.agentId, binding.location);
       if (!profile) throw new Error(`Agent profile "${binding.agentId}" at "${binding.location}" not found.`);
       const manager = this.sessionManagerFor(profile, binding.agentId, binding.location);
-      if (!manager) throw new Error(`Agent profile \`${record.agentId}\` (${profile.displayName}) does not support session management.`);
+      if (!manager) throw new Error(`Agent profile \`${binding.agentId}\` (${profile.displayName}) does not support session management.`);
       return { profile, manager };
     };
     const facade: SessionBrowserFacade = {
@@ -18626,10 +18612,11 @@ export class Orchestrator {
       ...(channel.parentId ? { parentRef: channel.parentId } : {}),
       cwd: this.config.REPOS_ROOT,
     });
-    const profile = this.router.getProfile(record.agentId);
+    const resolved = this.router.describeConfig(record);
+    const profile = this.router.getProfile(resolved.agent.value, resolved.location.value);
     if (!profile) {
       await replyToInteraction(i, {
-        content: `Agent \`${record.agentId}\` is not registered on this bot.`,
+        content: `Agent \`${resolved.agent.value}\` is not registered on this bot.`,
       });
       return;
     }
@@ -19626,8 +19613,7 @@ export class Orchestrator {
         && option.payload === spec.options[index]!.payload
         && option.label.startsWith(actions[index] === "resume" ? "Resume " : "Cancel ")))) return;
     await this.retireParkedTurnCards(attempt.id);
-    const record = this.store.getByChannel(PLATFORM, channelRef)
-      ?? this.router.ensureSessionRecord({ platform: PLATFORM, channelRef, cwd: this.config.REPOS_ROOT });
+    const record = await this.bindThreadRecord({ platform: PLATFORM, id: channelRef });
     const posted = await this.publishChoiceCard(record, spec);
     if (!posted.ok) throw new Error(posted.error);
     return posted;
@@ -19662,17 +19648,12 @@ export class Orchestrator {
   /** Choice card for a parked re-auth. Not an elicitation row. */
   private async postReauthCard(channelRef: string, attemptId: string, park: ReauthPark, cause?: string): Promise<(MessageLink & { messageId: string }) | undefined> {
     try {
-      const record = this.store.getByChannel(PLATFORM, channelRef)
-        ?? this.router.ensureSessionRecord?.({
-          platform: PLATFORM,
-          channelRef,
-          cwd: this.config.REPOS_ROOT,
-        });
-      if (!record) return;
+      const record = await this.bindThreadRecord({ platform: PLATFORM, id: channelRef });
       const attempt = this.store.turnAttempts.get(attemptId);
-      const location = attempt?.spec.location ?? this.router.describeConfig(record).location.value;
+      const resolved = this.router.describeConfig(record);
+      const location = attempt?.spec.location ?? resolved.location.value;
       const context = {
-        agentId: attempt?.spec.agentId ?? record.agentId,
+        agentId: attempt?.spec.agentId ?? resolved.agent.value,
         host: isLocalLocation(location) ? os.hostname() : location,
         cause,
         promptStarted: attempt?.promptStarted === true,
@@ -20526,6 +20507,16 @@ export class Orchestrator {
   }
 
   // --- helpers ---
+
+  private async bindThreadRecord(channel: ChannelRef, cwd = this.config.REPOS_ROOT): Promise<SessionRecord> {
+    const existing = this.store.getByChannel(channel.platform, channel.id);
+    const parentId = channel.parentId ?? existing?.parentRef;
+    const resolved = parentId
+      ? { ...channel, parentId }
+      : await this.adapter.resolveChannel?.(channel) ?? channel;
+    return this.router.ensureSessionRecord({ platform: resolved.platform, channelRef: resolved.id,
+      ...(resolved.parentId ? { parentRef: resolved.parentId } : {}), cwd });
+  }
 
   private channelRefFromInteraction(
     i: ChatInputCommandInteraction | MessageComponentInteraction | ModalSubmitInteraction

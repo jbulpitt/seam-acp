@@ -710,13 +710,14 @@ describe("watcher recoverStale vs resumeEnabled", () => {
     expect(after.stallNoticeUtc).toEqual(expect.any(String));
     expect(sent).toContainEqual(expect.objectContaining({
       channel: "thread-boss",
-      text: expect.stringContaining(`/seam workflows`),
+      text: expect.stringContaining("execution failed before the provider took the turn"),
     }));
     // #333: the notice carries the specific cause. The old sentence was the
     // same for all 65 throw sites, so an operator could not tell a transient
     // condition from a permanent one without reading the source.
     const notice = sent.find((message) => message.channel === "thread-boss")!.text;
     expect(notice).toContain("execution failed before the provider took the turn");
+    expect(notice).not.toContain("/seam workflows resume:");
     expect(notice).not.toContain("is stalled after restart");
     // #426: quarantine remains explicit below and is never auto-retried, but
     // deleting idle classification would mislabel the otherwise empty queue.

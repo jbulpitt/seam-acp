@@ -12501,9 +12501,7 @@ export class Orchestrator {
     if (occurrence.settled) return;
     if (prior?.state === "completed") { await this.deliverScheduledCompletion(occurrence, prior); return; }
     if (prior?.state === "cancelled") { await this.settleScheduleCancellation(occurrence); return; }
-    const executionRow = manualResume ? { ...occurrence.row, model: null, cwd: null }
-      : prior ? { ...occurrence.row, model: prior.spec.model ?? occurrence.row.model, cwd: prior.spec.cwd ?? occurrence.row.cwd }
-        : occurrence.row;
+    const executionRow = manualResume ? { ...occurrence.row, model: null, cwd: null } : occurrence.row;
     const execution = this.scheduleExecution(executionRow);
     const drift = compareExecutionIdentity(prior?.identity ?? occurrence.execution.fingerprint, execution.fingerprint, prior ? {
       promptStarted: prior.promptStarted,

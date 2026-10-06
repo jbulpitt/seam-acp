@@ -168,7 +168,7 @@ describe("formatInterruptedLine", () => {
     expect(line).toContain("10m");
   });
 
-  it("uses the abandoned icon", () => {
+  it("displays legacy abandoned rows as cancelled", () => {
     const lines = formatInterruptedLines(
       [
         {
@@ -185,7 +185,8 @@ describe("formatInterruptedLine", () => {
       NOW
     );
     expect(lines[0]).toContain("🚫");
-    expect(lines[0]).toContain("abandoned");
+    expect(lines[0]).toContain("cancelled");
+    expect(lines[0]).not.toContain("abandoned");
     expect(lines[0]).toContain("live");
   });
 });

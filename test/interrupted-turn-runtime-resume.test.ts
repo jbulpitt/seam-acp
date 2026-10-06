@@ -47,7 +47,7 @@ function modelOptions() {
     options: [{ value: MODEL, name: "Opus" }] }];
 }
 
-type AcpMode = "ok" | "no-load" | "reject-load" | "reject-load-once" | "hang-load" | "hang-load-once" | "codex-auth";
+type AcpMode = "ok" | "no-load" | "reject-load" | "reject-load-with-cause" | "reject-load-once" | "hang-load" | "hang-load-once" | "codex-auth";
 function syntheticAcp(calls: AcpCalls, mode: AcpMode) {
   return () => {
     const stdin = new PassThrough();
@@ -81,6 +81,7 @@ function syntheticAcp(calls: AcpCalls, mode: AcpMode) {
           stderr.write("codex-acp: recorded session/load diagnostic\n");
           throw new RequestError(-32000, "Authentication required", null);
         }
+        if (mode === "reject-load-with-cause") throw new RequestError(-32000, "synthetic remote session/load refusal", null);
         if (mode === "reject-load" || (mode === "reject-load-once" && calls.loads.length === 1)) throw new Error("synthetic remote session/load refusal");
         if (mode === "hang-load" || (mode === "hang-load-once" && calls.loads.length === 1)) return new Promise(() => {});
         return { sessionId: params.sessionId, configOptions: modelOptions() };
@@ -252,12 +253,12 @@ describe("explicit operator continuation after identity drift", () => {
   });
 
   it("a started drifted dispatch reaches the actual provider session/load refusal", async () => {
-    const h = harness("local", "reject-load");
+    const h = harness("local", "reject-load-with-cause");
     const spec = dispatchAttempt(h, true);
     await expect(h.orch.dispatchInjectTurn(spec)).rejects.toMatchObject({ reason: expect.stringContaining("moved") });
     expect(h.calls.loads).toEqual([]);
     await expect(h.orch.dispatchInjectTurn(spec, true)).rejects.toMatchObject({ message: expect.stringContaining("synthetic remote session/load refusal") });
-    expect(h.calls.loads).toEqual([RECORDED]);
+    expect(h.calls.loads).toEqual([RECORDED, RECORDED, RECORDED]);
     expect(h.calls.prompts).toEqual([]);
     expect(h.calls.news).toBe(0);
   });

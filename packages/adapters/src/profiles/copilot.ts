@@ -24,6 +24,7 @@ import type { SessionSummary } from "../session-manager.js";
 import {
   readCopilotSessionSummaries,
   readCopilotTranscript,
+  rewriteCopilotClone,
   type CopilotSessionRow,
   type CopilotTurnRow,
 } from "./copilot-session-store.js";
@@ -677,6 +678,10 @@ export function makeCopilotProfile(opts: {
         const dir = configDir ?? path.join(process.env.HOME ?? "", ".copilot");
         const dbPath = path.join(dir, "session-store.db");
         const sessionStateDir = path.join(dir, "session-state");
+        const newSubDir = path.join(sessionStateDir, newSessionId);
+        let insertedSession = false;
+        let insertedTurns = false;
+        let copyingNative = false;
 
         const db = new Database(dbPath);
         try {
@@ -696,6 +701,7 @@ export function makeCopilotProfile(opts: {
               nowIso,
               nowIso
             );
+            insertedSession = true;
           }
 
           const turns = db.prepare("SELECT * FROM turns WHERE session_id = ? ORDER BY turn_index ASC").all(oldSessionId) as CopilotTurnRow[];
@@ -711,19 +717,41 @@ export function makeCopilotProfile(opts: {
               turn.assistant_response,
               turn.timestamp
             );
+            insertedTurns = true;
           }
 
           const oldSubDir = path.join(sessionStateDir, oldSessionId);
-          const newSubDir = path.join(sessionStateDir, newSessionId);
+          let stat: fs.Stats;
           try {
-            const stat = await fsp.stat(oldSubDir);
-            if (stat.isDirectory()) {
-              await fsp.mkdir(newSubDir, { recursive: true });
-              await fsp.cp(oldSubDir, newSubDir, { recursive: true });
-            }
-          } catch {
-            // ignore
+            stat = await fsp.stat(oldSubDir);
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+            throw error;
           }
+          if (stat.isDirectory()) {
+            copyingNative = true;
+            await fsp.mkdir(newSubDir, { recursive: true });
+            await fsp.cp(oldSubDir, newSubDir, { recursive: true });
+            await rewriteCopilotClone(oldSubDir, newSubDir, newSessionId, cwd);
+          }
+        } catch (error) {
+          const cleanupErrors: unknown[] = [];
+          if (copyingNative) {
+            try { await fsp.rm(newSubDir, { recursive: true, force: true }); }
+            catch (cleanupError) { cleanupErrors.push(cleanupError); }
+          }
+          if (insertedSession || insertedTurns) {
+            try {
+              db.transaction(() => {
+                if (insertedTurns) db.prepare("DELETE FROM turns WHERE session_id = ?").run(newSessionId);
+                if (insertedSession) db.prepare("DELETE FROM sessions WHERE id = ?").run(newSessionId);
+              })();
+            } catch (cleanupError) { cleanupErrors.push(cleanupError); }
+          }
+          if (cleanupErrors.length) {
+            throw new AggregateError([error, ...cleanupErrors], error instanceof Error ? error.message : String(error), { cause: error });
+          }
+          throw error;
         } finally {
           db.close();
         }

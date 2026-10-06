@@ -32,6 +32,58 @@ function sourceError(operation: string, source: string, cause: unknown): Error {
   return new Error(`Copilot ${operation} (${source}): ${cause instanceof Error ? cause.message : String(cause)}`, { cause });
 }
 
+export async function rewriteCopilotClone(
+  source: string,
+  target: string,
+  sessionId: string,
+  cwd: string,
+): Promise<void> {
+  const workspaceFile = path.join(target, "workspace.yaml");
+  let workspace: string;
+  try { workspace = await fs.readFile(workspaceFile, "utf8"); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw sourceError("read cloned workspace", workspaceFile, error);
+    workspace = "";
+  }
+  for (const [key, value] of [["id", sessionId], ["cwd", cwd]]) {
+    const field = `${key}: ${JSON.stringify(value)}`;
+    const pattern = new RegExp(`^${key}:[^\\r\\n]*`, "m");
+    workspace = pattern.test(workspace) ? workspace.replace(pattern, () => field)
+      : `${workspace}${workspace.endsWith("\n") || !workspace ? "" : "\n"}${field}\n`;
+  }
+  await fs.writeFile(workspaceFile, workspace, "utf8");
+
+  const eventsFile = path.join(target, "events.jsonl");
+  let events: string;
+  try { events = await fs.readFile(eventsFile, "utf8"); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw sourceError("read cloned session history", eventsFile, error);
+  }
+  let firstEvent = true;
+  const lines = events.split("\n").map((line, index) => {
+    if (!line.trim()) return line;
+    let event: { type?: string; data?: { sessionId?: string; context?: Record<string, unknown>; checkpointPath?: string } };
+    try { event = JSON.parse(line); }
+    catch (error) { throw sourceError(`parse cloned session history line ${index + 1}`, eventsFile, error); }
+    let changed = false;
+    // Copilot restores the session identity from the start event, not its directory.
+    if (firstEvent && event.type === "session.start" && event.data) {
+      event.data.sessionId = sessionId;
+      event.data.context = { ...event.data.context, cwd };
+      changed = true;
+    }
+    firstEvent = false;
+    const checkpoint = event.data?.checkpointPath;
+    if (checkpoint?.startsWith(`${source}${path.sep}`)) {
+      event.data!.checkpointPath = target + checkpoint.slice(source.length);
+      changed = true;
+    }
+    return changed ? JSON.stringify(event) : line;
+  });
+  await fs.writeFile(eventsFile, lines.join("\n"), "utf8");
+}
+
 async function optionalDatabase<T>(file: string, read: (db: Database.Database) => T | Promise<T>): Promise<T | undefined> {
   try { await fs.access(file); }
   catch (error) {

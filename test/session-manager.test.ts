@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { cleanTextForPreview } from "@seam/adapters";
 import { makeCopilotProfile } from "@seam/adapters";
 import Database from "better-sqlite3";
@@ -105,6 +105,7 @@ describe("Copilot Session Manager", () => {
   });
 
   afterEach(async () => {
+    vi.restoreAllMocks();
     fs.rmSync(tempDir, { recursive: true, force: true });
   });
 
@@ -132,5 +133,117 @@ describe("Copilot Session Manager", () => {
       { sender: "human", text: "hello" },
       { sender: "agent", text: "hi there" }
     ]);
+  });
+
+  it.each([true, false])("clones native identity and cwd without changing history; indexed=%s", async indexed => {
+    const source = path.join(tempDir, "session-state", "session-123");
+    const target = path.join(tempDir, "session-state", "session-456");
+    const cwd = '/workspace/repo $&: "cloned"';
+    const workspace = 'id: session-123\ncwd: /workspace/repo\nname: |-\n  Source context\nclient_name: github/acp\n';
+    const messages = [
+      JSON.stringify({ id: "start", parentId: null, type: "session.start",
+        data: { sessionId: "session-123", context: { cwd: "/workspace/repo", branch: "main" } } }),
+      JSON.stringify({ id: "user", parentId: "start", type: "user.message",
+        data: { content: "Remember session-123 and /workspace/repo exactly." } }),
+      JSON.stringify({ id: "agent", parentId: "user", type: "assistant.message", data: { content: "Remembered." } }),
+      JSON.stringify({ id: "subagent-start", parentId: "agent", agentId: "task-1", type: "session.start",
+        data: { sessionId: "subagent-conversation", context: { cwd: "/workspace/repo" } } }),
+      JSON.stringify({ id: "checkpoint", parentId: "subagent-start", type: "session.compaction_complete",
+        data: { checkpointPath: path.join(source, "checkpoints", "1.md"), success: true } }),
+    ];
+    fs.mkdirSync(path.join(source, "checkpoints"), { recursive: true });
+    fs.writeFileSync(path.join(source, "workspace.yaml"), workspace);
+    fs.writeFileSync(path.join(source, "events.jsonl"), messages.join("\n") + "\n");
+    fs.writeFileSync(path.join(source, "checkpoints", "1.md"), "Retained source context");
+    if (!indexed) {
+      const db = new Database(path.join(tempDir, "session-store.db"));
+      db.prepare("DELETE FROM turns WHERE session_id = ?").run("session-123");
+      db.prepare("DELETE FROM sessions WHERE id = ?").run("session-123");
+      db.close();
+    }
+
+    await manager.cloneSession(cwd, "session-123", "session-456");
+
+    expect(fs.readFileSync(path.join(target, "workspace.yaml"), "utf8")).toBe(
+      `id: "session-456"\ncwd: ${JSON.stringify(cwd)}\nname: |-\n  Source context\nclient_name: github/acp\n`
+    );
+    const clonedLines = fs.readFileSync(path.join(target, "events.jsonl"), "utf8").trimEnd().split("\n");
+    expect(JSON.parse(clonedLines[0]!)).toEqual({ id: "start", parentId: null, type: "session.start",
+      data: { sessionId: "session-456", context: { cwd, branch: "main" } } });
+    expect(clonedLines.slice(1, 4)).toEqual(messages.slice(1, 4));
+    expect(JSON.parse(clonedLines[4]!)).toMatchObject({ id: "checkpoint", parentId: "subagent-start",
+      data: { checkpointPath: path.join(target, "checkpoints", "1.md") } });
+    expect(fs.readFileSync(path.join(target, "checkpoints", "1.md"), "utf8")).toBe("Retained source context");
+    expect(fs.readFileSync(path.join(source, "workspace.yaml"), "utf8")).toBe(workspace);
+    expect(fs.readFileSync(path.join(source, "events.jsonl"), "utf8")).toBe(messages.join("\n") + "\n");
+    expect(await manager.getTranscript(cwd, "session-456")).toContain("Remember session-123 and /workspace/repo exactly.");
+  });
+
+  it.each(["cp", "writeFile"] as const)("rolls back a failed native %s and rethrows its error", async operation => {
+    fs.mkdirSync(path.join(tempDir, "session-state", "session-123"), { recursive: true });
+    const cause = Object.assign(new Error(`EACCES: permission denied during ${operation}`), { code: "EACCES" });
+    vi.spyOn(fs.promises, operation).mockRejectedValue(cause);
+    await expect(manager.cloneSession("/workspace/repo", "session-123", "session-456")).rejects.toBe(cause);
+    expect(fs.existsSync(path.join(tempDir, "session-state", "session-456"))).toBe(false);
+    const db = new Database(path.join(tempDir, "session-store.db"), { readonly: true });
+    expect(db.prepare("SELECT id FROM sessions WHERE id = ?").get("session-456")).toBeUndefined();
+    expect(db.prepare("SELECT * FROM turns WHERE session_id = ?").all("session-456")).toEqual([]);
+    db.close();
+  });
+
+  it.each([true, false])("rolls back malformed cloned history and leaves the source unchanged; indexed=%s", async indexed => {
+    const source = path.join(tempDir, "session-state", "session-123");
+    const target = path.join(tempDir, "session-state", "session-456");
+    const workspace = "id: session-123\ncwd: /workspace/repo\n";
+    const events = "not JSON\n";
+    fs.mkdirSync(source, { recursive: true });
+    fs.writeFileSync(path.join(source, "workspace.yaml"), workspace);
+    fs.writeFileSync(path.join(source, "events.jsonl"), events);
+    const db = new Database(path.join(tempDir, "session-store.db"));
+    if (!indexed) {
+      db.prepare("DELETE FROM turns WHERE session_id = ?").run("session-123");
+      db.prepare("DELETE FROM sessions WHERE id = ?").run("session-123");
+    }
+    const sessions = db.prepare("SELECT * FROM sessions").all();
+    const turns = db.prepare("SELECT * FROM turns").all();
+
+    const error = await manager.cloneSession("/workspace/repo", "session-123", "session-456")
+      .catch((error: Error) => error);
+    expect(error).toBeInstanceOf(Error);
+    expect(error.message).toContain(`Copilot parse cloned session history line 1 (${path.join(target, "events.jsonl")}):`);
+    expect(error.cause).toBeInstanceOf(SyntaxError);
+    expect(fs.existsSync(target)).toBe(false);
+    expect(db.prepare("SELECT * FROM sessions").all()).toEqual(sessions);
+    expect(db.prepare("SELECT * FROM turns").all()).toEqual(turns);
+    db.close();
+    expect(fs.readdirSync(source).sort()).toEqual(["events.jsonl", "workspace.yaml"]);
+    expect(fs.readFileSync(path.join(source, "workspace.yaml"), "utf8")).toBe(workspace);
+    expect(fs.readFileSync(path.join(source, "events.jsonl"), "utf8")).toBe(events);
+  });
+
+  it.each(["directory", "SQL"])("attaches %s cleanup failures to the original parse error", async cleanup => {
+    const source = path.join(tempDir, "session-state", "session-123");
+    const target = path.join(tempDir, "session-state", "session-456");
+    fs.mkdirSync(source, { recursive: true });
+    fs.writeFileSync(path.join(source, "events.jsonl"), "not JSON\n");
+    const cleanupMessage = `Failed to remove cloned ${cleanup}`;
+    const db = new Database(path.join(tempDir, "session-store.db"));
+    if (cleanup === "directory") {
+      vi.spyOn(fs.promises, "rm").mockRejectedValue(new Error(cleanupMessage));
+    } else {
+      db.exec(`CREATE TRIGGER fail_clone_cleanup BEFORE DELETE ON sessions
+        WHEN OLD.id = 'session-456' BEGIN SELECT RAISE(ABORT, 'Failed to remove cloned SQL'); END;`);
+    }
+
+    const error = await manager.cloneSession("/workspace/repo", "session-123", "session-456")
+      .catch((error: AggregateError) => error);
+    expect(error).toBeInstanceOf(AggregateError);
+    expect(error.message).toContain("Copilot parse cloned session history line 1");
+    expect(error.cause).toBe(error.errors[0]);
+    expect(error.errors[1]).toMatchObject({ message: cleanupMessage });
+    expect(fs.existsSync(target)).toBe(cleanup === "directory");
+    expect(Boolean(db.prepare("SELECT id FROM sessions WHERE id = ?").get("session-456"))).toBe(cleanup === "SQL");
+    db.close();
+    expect(fs.readFileSync(path.join(source, "events.jsonl"), "utf8")).toBe("not JSON\n");
   });
 });

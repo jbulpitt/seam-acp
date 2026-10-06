@@ -1,5 +1,6 @@
 import { replyToInteraction, acknowledgeComponentInteraction, awaitAcknowledgedInteraction, ignoreCollectorTimeout } from "./interaction-response.js";
 import { runAcknowledged } from "../interaction-response.js";
+import { discordMessageLink } from "./message-link.js";
 import type { ComponentAcknowledgement } from "../interaction-response.js";
 import {
   Client,
@@ -75,6 +76,7 @@ import type {
   IncomingMessage,
   MessageAttachment,
   MessageRef,
+  MessageLink,
 } from "../chat-adapter.js";
 import type { PanelButton, StructuredPanel } from "../../core/types.js";
 import { clampPanelForDiscord } from "../../core/panel-limits.js";
@@ -1090,7 +1092,17 @@ export class DiscordAdapter implements ChatAdapter {
       allowedMentions: { parse: [] },
       ...(delivery ?? {}),
     });
-    return { channel, id: sent.id };
+    return { channel, id: sent.id, ...discordMessageLink(ch.guildId, channel.id, sent.id) };
+  }
+
+  async getMessageLink(channel: ChannelRef, messageId: string | null): Promise<MessageLink> {
+    if (!messageId) return discordMessageLink(undefined, channel.id, messageId);
+    try {
+      const ch = await this.fetchSendableChannel(channel.id);
+      return discordMessageLink(ch.guildId, channel.id, messageId);
+    } catch (err) {
+      return { jumpLinkUnavailableReason: err instanceof Error ? err.message : String(err) };
+    }
   }
 
   async editMessage(message: MessageRef, text: string): Promise<void> {
@@ -1116,7 +1128,7 @@ export class DiscordAdapter implements ChatAdapter {
       ...buildDiscordFileSendPayload(file),
       ...(delivery ?? {}),
     });
-    return { channel, id: sent.id };
+    return { channel, id: sent.id, ...discordMessageLink(ch.guildId, channel.id, sent.id) };
   }
 
   async findMessageByNonce(
@@ -1728,6 +1740,7 @@ export class DiscordAdapter implements ChatAdapter {
         .trim();
       messages.push({
         messageId: msg.id,
+        ...discordMessageLink(ch.guildId, threadId, msg.id),
         timestampMs: msg.createdTimestamp,
         authorId: msg.author.id,
         authorName: this.resolveAuthorName(msg),
@@ -1832,7 +1845,7 @@ export class DiscordAdapter implements ChatAdapter {
       ...(files.length > 0 ? { files } : {}),
       ...(delivery ?? {}),
     });
-    return { channel, id: sent.id };
+    return { channel, id: sent.id, ...discordMessageLink(ch.guildId, channel.id, sent.id) };
   }
 
   async sendVoiceConsolePanel(
@@ -1846,7 +1859,7 @@ export class DiscordAdapter implements ChatAdapter {
       components: DiscordAdapter.buildVoiceConsoleRows(panel.components),
       allowedMentions: { parse: [] },
     });
-    return { channel, id: sent.id };
+    return { channel, id: sent.id, ...discordMessageLink(ch.guildId, channel.id, sent.id) };
   }
 
   async editVoiceConsolePanel(
@@ -1913,7 +1926,7 @@ export class DiscordAdapter implements ChatAdapter {
         ...DiscordAdapter.buildActionRows(layout.actions),
       ],
     });
-    return { channel, id: sent.id };
+    return { channel, id: sent.id, ...discordMessageLink(ch.guildId, channel.id, sent.id) };
   }
 
   async editLayout(
@@ -2175,7 +2188,7 @@ export class DiscordAdapter implements ChatAdapter {
     const embed = DiscordAdapter.buildEmbed(card.panel);
     const components = DiscordAdapter.buildChoiceComponents(card);
     const sent = await ch.send({ embeds: [embed], components });
-    return { channel, id: sent.id };
+    return { channel, id: sent.id, ...discordMessageLink(ch.guildId, channel.id, sent.id) };
   }
 
   async editChoiceCard(message: MessageRef, card: ChoiceCardPost): Promise<void> {
@@ -2196,7 +2209,7 @@ export class DiscordAdapter implements ChatAdapter {
       components: DiscordAdapter.buildElicitationComponents(card),
       allowedMentions: { parse: [] },
     });
-    return { channel, id: sent.id };
+    return { channel, id: sent.id, ...discordMessageLink(ch.guildId, channel.id, sent.id) };
   }
 
   async editElicitationCard(message: MessageRef, card: ElicitationCardPost): Promise<void> {

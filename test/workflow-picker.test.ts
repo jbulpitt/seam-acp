@@ -43,6 +43,32 @@ describe("workflow landing and labels", () => {
     expect(workflowActionLabel("abandon", row, now)).toBe("Abandon d4a166f6");
   });
 
+  it("links every open card using its own channel, including reauth and parked notices", async () => {
+    const orch = Object.create(Orchestrator.prototype) as any;
+    orch.collectInterruptedRows = vi.fn(async () => []);
+    orch.store = Object.fromEntries(["listWakesByChannel", "listAllWatches", "listOpenChoiceCards", "listOpenIngestEndpoints", "listAllScheduled"]
+      .map(name => [name, vi.fn(() => [])]));
+    orch.store.listOpenChoiceCards.mockReturnValue([
+      { id: "choice", title: "Choose", platform: "discord", channelRef: "thread-a", messageId: "m1", clickCount: 0, maxClicks: 1, createdUtc: "2026-10-05T12:00:03Z" },
+      { id: "reauth", title: "Authentication", platform: "discord", channelRef: "thread-b", messageId: "m2", clickCount: 0, maxClicks: 1, createdUtc: "2026-10-05T12:00:02Z" },
+      { id: "parked", title: "Parked turn", platform: "discord", channelRef: "thread-c", messageId: "m3", clickCount: 0, maxClicks: 1, createdUtc: "2026-10-05T12:00:01Z" },
+      { id: "missing", title: "Gone", platform: "discord", channelRef: "deleted", messageId: "m4", clickCount: 0, maxClicks: 1, createdUtc: "2026-10-05T12:00:00Z" },
+    ]);
+    orch.listWatches = vi.fn(() => []);
+    orch.adapter = { getMessageLink: vi.fn(async (channel: { id: string }, messageId: string) => channel.id === "deleted"
+      ? { jumpLinkUnavailableReason: "Unknown Channel" }
+      : { jumpUrl: `https://discord.com/channels/g-${channel.id}/${channel.id}/${messageId}` }) };
+    const view = await orch.renderWorkflowInventory({ channelId: "caller-thread", guildId: "caller-guild",
+      options: { getString: () => "all", getBoolean: () => false } }, 20, 0, "choices");
+    const text = view.embeds[0].data.description;
+    expect(text).toContain("[Open card](https://discord.com/channels/g-thread-a/thread-a/m1)");
+    expect(text).toContain("[Open card](https://discord.com/channels/g-thread-b/thread-b/m2)");
+    expect(text).toContain("[Open card](https://discord.com/channels/g-thread-c/thread-c/m3)");
+    expect(text).toContain("message m4 — Unknown Channel");
+    expect(text).not.toContain("caller-guild");
+    expect(orch.adapter.getMessageLink).toHaveBeenCalledWith({ platform: "discord", id: "thread-b" }, "m2");
+  });
+
   it("paginates a selected category and always offers a route back to the picker", () => {
     const view = workflowCategoryList("wakes", ["newest", "second", "third", "fourth", "oldest"], "this thread", 1, 20);
     expect(view.embeds[0]!.data.description).toBe("oldest");

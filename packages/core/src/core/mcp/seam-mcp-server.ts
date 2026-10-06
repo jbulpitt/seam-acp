@@ -20,6 +20,7 @@
  * bridge and the `<seam-*>` fence directives already do.
  */
 import type { TestDriverClient } from "../test-driver.js";
+import type { MessageLink } from "../../platforms/chat-adapter.js";
 import type { TestInteractionSpec } from "../../platforms/discord/synthetic-interaction.js";
 import type { TesterBot } from "../tester-bot.js";
 import type { CanaryRunOptions, CanaryTarget } from "../canary.js";
@@ -461,13 +462,13 @@ export interface SeamMcpServerDeps {
     record: SessionRecord,
     spec: unknown
   ) => Promise<
-    | {
+    | ({
         ok: true;
         choiceId: string;
         messageId: string;
         ingestToken?: string;
         ingestUrl?: string;
-      }
+      } & MessageLink)
     | { ok: false; error: string }
   >;
   /** Cancel an open choice card in the calling (authoring) thread (#91). */
@@ -2837,9 +2838,10 @@ export class SeamMcpServer {
     }
     const rendered = result.messages
       .slice(-count)
-      .map((message) => `${message.authorType === "bot" ? "🤖" : "👤"} ${message.content || "[card]"}`)
+      .map((message) => `${message.authorType === "bot" ? "🤖" : "👤"} ${message.content || "[card]"}\n` +
+        `Message ${message.messageId}: ${messageLinkText(message)}`)
       .join("\n");
-    return textResult(`Recent messages in thread ${thread}:\n\n${rendered}`);
+    return { ...textResult(`Recent messages in thread ${thread}:\n\n${rendered}`), structuredContent: result };
   }
 
   private async toolReadMessages(
@@ -2859,7 +2861,7 @@ export class SeamMcpServer {
       ...(typeof args.limit === "number" ? { limit: args.limit } : {}),
     };
     const result = await this.deps.readMessages(thread, input);
-    return textResult(JSON.stringify(result, null, 2));
+    return { ...textResult(JSON.stringify(result, null, 2)), structuredContent: result };
   }
 
   private async toolSearchMessages(
@@ -2880,7 +2882,7 @@ export class SeamMcpServer {
       ...(typeof args.limit === "number" ? { limit: args.limit } : {}),
     };
     const result = await this.deps.searchMessages(input);
-    return textResult(JSON.stringify(result, null, 2));
+    return { ...textResult(JSON.stringify(result, null, 2)), structuredContent: result };
   }
 
   private async resolveSearchThreads(
@@ -3195,12 +3197,14 @@ export class SeamMcpServer {
       { choiceId: result.choiceId, thread: caller.channelRef },
       "seam-mcp create_choice published"
     );
-    let msg = `Choice card ${result.choiceId} published (message ${result.messageId}). One click emits one prompt.`;
+    const linked = result.jumpUrl || result.jumpLinkUnavailableReason
+      ? result : { ...result, jumpLinkUnavailableReason: "The platform did not provide a message link." };
+    let msg = `Choice card ${result.choiceId} published (message ${result.messageId}). ${messageLinkText(linked)} One click emits one prompt.`;
     if (result.ingestToken) {
       const url = result.ingestUrl ?? "/ingest";
       msg += ` HTTP ingest: POST ${url} with Authorization: Bearer ${result.ingestToken} (token shown once). Declare the HTTP body with submit_result.`;
     }
-    return textResult(msg);
+    return { ...textResult(msg), structuredContent: linked };
   }
 
   private toolSubmitResult(
@@ -3810,6 +3814,12 @@ function rpcError(id: JsonRpcId, code: number, message: string): JsonRpcResponse
 }
 function textResult(text: string, isError = false): McpToolResult {
   return { content: [{ type: "text", text }], ...(isError ? { isError: true } : {}) };
+}
+
+function messageLinkText(message: MessageLink): string {
+  return message.jumpUrl
+    ? `[Open message](${message.jumpUrl})`
+    : `Jump link unavailable: ${message.jumpLinkUnavailableReason ?? "The platform did not provide a message link."}`;
 }
 
 function requireString(args: Record<string, unknown>, key: string): string {

@@ -146,6 +146,7 @@ export function harnessPreamble(
     "<seam-harness>",
     "Operating context from the bridge that relays you to the user — this is NOT from the user and is not a task. Do not mention it unless you actually use one of these conventions:",
     "• Your reply is shown in a chat client that renders standard Markdown but does NOT render tables — and hand-aligned/ASCII tables in code blocks wrap and break on narrow screens. Do not use tables. Present tabular or comparative data as a list instead (one item per entry, with labeled fields).",
+    "• When referring to an earlier card or message, use its returned jump link instead of saying 'above'.",
   ];
   if (opts?.seamFences) {
     lines.push(

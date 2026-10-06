@@ -1845,6 +1845,7 @@ describe("SeamMcpServer", () => {
       messages: [
         {
           messageId: "1",
+          jumpUrl: "https://discord.com/channels/g/thread-x/1",
           timestamp: "2026-08-01T00:00:00.000Z",
           author: "Alex",
           authorId: "human",
@@ -1855,6 +1856,7 @@ describe("SeamMcpServer", () => {
         },
         {
           messageId: "2",
+          jumpUrl: "https://discord.com/channels/g/thread-x/2",
           timestamp: "2026-08-01T00:00:01.000Z",
           author: "Seam",
           authorId: "bot",
@@ -1877,6 +1879,9 @@ describe("SeamMcpServer", () => {
     const text = body.result.content[0].text;
     expect(text).toContain("hello");
     expect(text).toContain("hi there");
+    expect(text).toContain("[Open message](https://discord.com/channels/g/thread-x/1)");
+    expect(text).toContain("[Open message](https://discord.com/channels/g/thread-x/2)");
+    expect(body.result.structuredContent.messages).toEqual((await readMessages("thread-x", {})).messages);
     expect(readMessages).toHaveBeenCalledWith("thread-x", { limit: 5 });
   });
 
@@ -1889,7 +1894,9 @@ describe("SeamMcpServer", () => {
     const readMessages = vi.fn(async (threadId: string) => ({
       threadId,
       truncated: false,
-      messages: [],
+      messages: [{ messageId: "message-hit", timestamp: "2026-08-01T00:00:00.000Z",
+        author: "Seam", authorId: "bot", authorType: "bot" as const, content: "Pick one",
+        isCard: true, attachments: [], jumpUrl: "https://discord.com/channels/g/thread-target/message-hit" }],
     }));
     h = await makeHarness({
       resolveThread: (id) => id === target.channelRef ? target : undefined,
@@ -1909,6 +1916,20 @@ describe("SeamMcpServer", () => {
       around: "message-hit",
       limit: 75,
     });
+    expect(JSON.parse(body.result.content[0].text).messages[0].jumpUrl).toBe("https://discord.com/channels/g/thread-target/message-hit");
+    expect(body.result.structuredContent.messages[0].jumpUrl).toBe("https://discord.com/channels/g/thread-target/message-hit");
+  });
+
+  it("peek preserves IDs and the reason when a message has no jump link", async () => {
+    h = await makeHarness({ readMessages: async threadId => ({ threadId, truncated: false,
+      messages: [{ messageId: "card-id", timestamp: "2026-08-01T00:00:00.000Z",
+        author: "Seam", authorId: "bot", authorType: "bot", content: "", isCard: true, attachments: [],
+        jumpLinkUnavailableReason: "The Discord guild is unavailable." }] }) });
+    const { body } = await h.call("tools/call", { name: "peek", arguments: { thread: "thread-x" } },
+      { "X-Seam-Session": "good-token" });
+    expect(body.result.content[0].text).toContain("Message card-id: Jump link unavailable: The Discord guild is unavailable.");
+    expect(body.result.structuredContent.messages[0]).toMatchObject({ messageId: "card-id", jumpLinkUnavailableReason: "The Discord guild is unavailable." });
+    expect(body.result.content[0].text).not.toContain("/channels/@me/");
   });
 
   it("search_messages resolves channel and named-thread scopes without crossing channels", async () => {
@@ -1924,7 +1945,9 @@ describe("SeamMcpServer", () => {
     });
     const searchMessages = vi.fn(async (input) => ({
       query: input.query,
-      hits: [],
+      hits: [{ threadId: sibling.channelRef, threadName: "Sibling", messageId: "message-hit",
+        timestamp: "2026-08-01T00:00:00.000Z", author: "Alex", authorId: "human", authorType: "human" as const,
+        snippet: "needle", jumpUrl: "https://discord.com/channels/g/thread-sibling/message-hit" }],
       truncated: false,
       pagesFetched: 1,
     }));
@@ -1963,6 +1986,8 @@ describe("SeamMcpServer", () => {
       { "X-Seam-Session": "good-token" }
     );
     expect(channel.body.result.isError).toBeFalsy();
+    expect(JSON.parse(channel.body.result.content[0].text).hits[0].jumpUrl).toBe("https://discord.com/channels/g/thread-sibling/message-hit");
+    expect(channel.body.result.structuredContent.hits[0].jumpUrl).toBe("https://discord.com/channels/g/thread-sibling/message-hit");
     expect(searchMessages).toHaveBeenLastCalledWith(expect.objectContaining({
       threads: [
         { id: "thread-caller", name: "Caller" },

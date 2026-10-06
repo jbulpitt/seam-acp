@@ -45,6 +45,7 @@ import { serializePanelText } from "../renderer.js";
 import { choicePickerPageCaption } from "./choice-picker.js";
 import { workflowLanding, workflowNavigation, workflowCategoryList, WORKFLOW_CATEGORIES, type WorkflowCategory } from "./workflow-category-view.js";
 import { workflowActionLabel } from "./workflows-view.js";
+import { discordMessageLink } from "./message-link.js";
 import { visibleWorkflowHistory, visibleWorkflowLedger, DAY_MS } from "./workflow-retention.js";
 import { getSlashCommandAccess, getSlashAcknowledgement, type SlashCommandAccess } from "./commands.js";
 import type {
@@ -54,6 +55,7 @@ import type {
   ChoiceInteraction,
   IncomingMessage,
   MessageRef,
+  MessageLink,
   MessageAttachment,
   SessionRecord,
 } from "../chat-adapter.js";
@@ -9034,7 +9036,7 @@ export class Orchestrator {
       } else {
         await replyToInteraction(i, {
           content: active.cardMessageId
-            ? `Canonical card: https://discord.com/channels/${active.guildId}/${active.voiceChannelId}/${active.cardMessageId}`
+            ? `Canonical card: ${discordMessageLink(active.guildId, active.voiceChannelId, active.cardMessageId).jumpUrl}`
             : "The canonical card is missing; use `repost:true`.",
           flags: MessageFlags.Ephemeral,
         });
@@ -16839,10 +16841,19 @@ export class Orchestrator {
       ingests: ingests.length, live: live.length, schedules: schedules.length,
     }, scope, history.hidden);
     if (category !== "parked") {
+      const choiceLines = category === "choices" ? await Promise.all(choices.map(async card => {
+        const link = this.adapter.getMessageLink
+          ? await this.adapter.getMessageLink({ platform: card.platform, id: card.channelRef }, card.messageId)
+          : { jumpLinkUnavailableReason: "The platform cannot resolve message links." };
+        const message = link.jumpUrl
+          ? `[Open card](${link.jumpUrl})`
+          : `message ${card.messageId ?? "not posted"} — ${link.jumpLinkUnavailableReason}`;
+        return `🗳️ \`${card.id}\` ${card.title.slice(0, 160)} (${card.clickCount}/${card.maxClicks}) · ${message}`;
+      })) : [];
       const lines: Record<Exclude<WorkflowCategory, "parked">, string[]> = {
         wakes: wakes.map(w => `⏰ \`${w.id}\` → ${w.fireAtUtc}${w.reason ? ` — ${w.reason.slice(0, 160)}` : ""}`),
         watches: watches.map(w => `🔔 \`${w.id}\` ${w.kind}:${w.spec.slice(0, 160)} · expires ${w.expiresAtUtc}`),
-        choices: choices.map(c => `🗳️ \`${c.id}\` ${c.title.slice(0, 160)} (${c.clickCount}/${c.maxClicks})`),
+        choices: choiceLines,
         ingests: ingests.map(e => `🌐 \`${e.id}\` ${e.name.slice(0, 160)}${e.thread ? ` → <#${e.thread}>` : ""}`),
         live: live.map(s => `🎙️ \`${s.id}\` ${s.channelName ?? s.voiceChannelId} · ${s.status}`),
         schedules: schedules.map(s => `📅 \`${s.id}\` ${s.name} · ${s.enabled ? "enabled" : "disabled"}`),
@@ -19009,13 +19020,13 @@ export class Orchestrator {
     record: SessionRecord,
     specInput: unknown
   ): Promise<
-    | {
+    | ({
         ok: true;
         choiceId: string;
         messageId: string;
         ingestToken?: string;
         ingestUrl?: string;
-      }
+      } & MessageLink)
     | { ok: false; error: string }
   > {
     const refusal = agentChoiceRefusal(this.choiceTurnOrigin(record));
@@ -19282,13 +19293,13 @@ export class Orchestrator {
     record: SessionRecord,
     spec: ChoiceSpec
   ): Promise<
-    | {
+    | ({
         ok: true;
         choiceId: string;
         messageId: string;
         ingestToken?: string;
         ingestUrl?: string;
-      }
+      } & MessageLink)
     | { ok: false; error: string }
   > {
     if (!this.adapter.sendChoiceCard) {
@@ -19348,6 +19359,9 @@ export class Orchestrator {
         ok: true,
         choiceId: card.id,
         messageId: ref.id,
+        ...(ref.jumpUrl ? { jumpUrl: ref.jumpUrl } : {
+          jumpLinkUnavailableReason: ref.jumpLinkUnavailableReason ?? "The platform did not provide a message link.",
+        }),
         ...(ingestToken ? { ingestToken } : {}),
         ...(ingestUrl ? { ingestUrl } : {}),
       };
@@ -19452,10 +19466,10 @@ export class Orchestrator {
     this.store.turnAttempts.markStallNoticeDelivered(attempt.id);
   }
 
-  private async postParkedTurnNotice(channelRef: string, attempt: TurnAttempt, body: string): Promise<void> {
+  private async postParkedTurnNotice(channelRef: string, attempt: TurnAttempt, body: string): Promise<MessageLink & { messageId: string }> {
     if (!this.adapter.sendChoiceCard || isAwaitingReauth(attempt.stalledReason)) {
-      await this.adapter.sendMessage({ platform: PLATFORM, id: channelRef }, body);
-      return;
+      const { id: messageId, ...ref } = await this.adapter.sendMessage({ platform: PLATFORM, id: channelRef }, body);
+      return { ...ref, messageId };
     }
     const record = this.store.getByChannel(PLATFORM, channelRef)
       ?? this.router.ensureSessionRecord({ platform: PLATFORM, channelRef, cwd: this.config.REPOS_ROOT });
@@ -19471,13 +19485,14 @@ export class Orchestrator {
       body += `\nResume isn't available: ${current?.resumeRefusal ?? current?.reason ?? "no continuation is currently available"}.`;
     }
     if (actions.length === 0) {
-      await this.adapter.sendMessage({ platform: PLATFORM, id: channelRef }, body);
-      return;
+      const { id: messageId, ...ref } = await this.adapter.sendMessage({ platform: PLATFORM, id: channelRef }, body);
+      return { ...ref, messageId };
     }
     const posted = await this.publishChoiceCard(record, parkedTurnChoiceSpec(attempt.id, body, {
       resume: workflowActionLabel("resume", row, now), abandon: workflowActionLabel("abandon", row, now),
     }, actions));
     if (!posted.ok) throw new Error(posted.error);
+    return posted;
   }
 
   private async handleParkedTurnChoice(evt: ChoiceInteraction, card: ChoiceCard, optionIndex: number,
@@ -19507,7 +19522,7 @@ export class Orchestrator {
   }
 
   /** Choice card for a parked re-auth. Not an elicitation row. */
-  private async postReauthCard(channelRef: string, attemptId: string, park: ReauthPark, cause?: string): Promise<void> {
+  private async postReauthCard(channelRef: string, attemptId: string, park: ReauthPark, cause?: string): Promise<(MessageLink & { messageId: string }) | undefined> {
     try {
       const record = this.store.getByChannel(PLATFORM, channelRef)
         ?? this.router.ensureSessionRecord?.({
@@ -19533,6 +19548,7 @@ export class Orchestrator {
         this.logger.warn({ err: posted.error, attemptId, channelRef }, "reauth card was not posted");
       } else {
         this.store.turnAttempts.markStallNoticeDelivered(attemptId);
+        return posted;
       }
     } catch (err) {
       this.logger.warn({ err, attemptId, channelRef }, "reauth card was not posted");

@@ -62,7 +62,9 @@ afterEach(() => { for (const watcher of watchers.splice(0)) watcher.stop(); stor
 describe("durable parked-turn notice actions", () => {
   it("claims and settles Abandon while the central ACK is pending, then replies privately", async () => {
     const orch = controller();
-    await orch.postParkedTurnNotice("worker", store.turnAttempts.get(id), "connection unavailable");
+    orch.adapter.sendChoiceCard.mockResolvedValueOnce({ id: "notice", jumpUrl: "https://discord.com/channels/g/worker/notice" });
+    const posted = await orch.postParkedTurnNotice("worker", store.turnAttempts.get(id), "connection unavailable");
+    expect(posted).toMatchObject({ messageId: "notice", jumpUrl: "https://discord.com/channels/g/worker/notice" });
     const card = store.listOpenChoiceCards("discord", "worker")[0]!;
     const native = new SyntheticInteraction({ kind: "button", channelId: "worker", messageId: "notice",
       customId: makeChoiceCustomId(card.id, 1) }, {

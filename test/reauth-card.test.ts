@@ -139,7 +139,7 @@ describe("reauth card click", () => {
       } as never,
       adapter: {
         async sendMessage() { return { channel: { platform: "discord", id: "thread-1" }, id: "m" }; },
-        async sendChoiceCard() { return { channel: { platform: "discord", id: "thread-1" }, id: "card-msg" }; },
+        async sendChoiceCard() { return { channel: { platform: "discord", id: "thread-1" }, id: "card-msg", jumpUrl: "https://discord.com/channels/g/thread-1/card-msg" }; },
       } as never,
       modelCatalog: fixtureModelCatalog([{ id: "claude", defaultModel: "default" } as never]),
       router: {
@@ -164,9 +164,10 @@ describe("reauth card click", () => {
     watchers.push(watcher);
     orch.setDispatchWatcher(watcher);
 
-    await (orch as unknown as {
-      postReauthCard(channelRef: string, attemptId: string, park: typeof decision.park): Promise<void>;
+    const posted = await (orch as unknown as {
+      postReauthCard(channelRef: string, attemptId: string, park: typeof decision.park): Promise<{ messageId: string; jumpUrl?: string }>;
     }).postReauthCard("thread-1", attemptId, decision.park);
+    expect(posted).toMatchObject({ messageId: "card-msg", jumpUrl: "https://discord.com/channels/g/thread-1/card-msg" });
 
     const cards = store.listOpenChoiceCards("discord", "thread-1");
     expect(cards).toHaveLength(1);

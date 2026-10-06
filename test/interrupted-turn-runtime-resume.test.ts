@@ -213,6 +213,7 @@ describe("#302 real ACP handshake and strict session/load recovery", () => {
     const admission = h.store.getInbound("msg-302");
     const parked = h.store.turnAttempts.get(id)!;
     const card = h.store.listOpenChoiceCards("discord", THREAD)[0]!;
+    const noticeCount = h.adapter.sendMessage.mock.calls.length;
     expect(card).toBeDefined();
     expect(parked).toMatchObject({ state: "suspended", promptStarted,
       stalledReason: expect.stringMatching(/^reauth-waiting:/) });
@@ -229,7 +230,9 @@ describe("#302 real ACP handshake and strict session/load recovery", () => {
     expect(h.store.listConfigMutations()).toEqual([]);
     expect(h.calls.loads).toEqual([RECORDED]);
     expect(h.calls.prompts).toEqual([]);
-    expect(h.adapter.sendMessage).toHaveBeenCalledTimes(1);
+    expect(h.adapter.sendMessage).toHaveBeenCalledTimes(noticeCount);
+    expect(h.adapter.sendMessage.mock.calls.filter(call => String(call[1]).includes("Cause: Authentication required")))
+      .toHaveLength(1);
     expect(h.store.listOpenChoiceCards("discord", THREAD)).toHaveLength(1);
     await expect(resume(h)).rejects.toMatchObject({ message: parked.stalledReason });
 

@@ -119,6 +119,10 @@ export class ConfigApplyPlan {
   private get modelCatalog() { return this.settings!.modelCatalog; }
   private get bridgeHub() { return this.settings!.bridgeHub; }
   private get identityEffects() { return { flush: this.settings!.identityCommitted }; }
+  private publishChannelIdentity() {
+    // Channel naming can wait on Discord; the configuration is already committed.
+    void this.identityEffects.flush().catch(err => this.logger.error({ err }, "channel identity publication failed"));
+  }
   private persistConfig(record: SessionRecord, cfg: SessionConfigState) { this.settings!.persistConfig(record, cfg); }
   private repoDisplay(repo: string | null) { return this.settings!.repoDisplay(repo); }
   private refuseUnregisteredAgent(id: string, fallback: string) { return this.settings!.unregisteredAgentMessage(id, fallback); }
@@ -267,7 +271,7 @@ export class ConfigApplyPlan {
   async applyChannelSet(channel: ChannelRef, prepared: { channelId: string; changes: ChannelPresetChanges }, actor: MutationActor) {
     const result = this.applyChannelOverlay({ channelId: prepared.channelId, changes: prepared.changes, actor });
     if (!result.ok && !result.error.includes("No effective change")) return { ok: false as const, message: result.error, rollbackError: "" };
-    await this.identityEffects.flush();
+    this.publishChannelIdentity();
     return { ok: true as const, effective: this.describeTarget(channel, "channel"), restartRequested: false };
   }
 
@@ -949,7 +953,7 @@ export class ConfigApplyPlan {
       }
     }
     if (draft.channelOnly) {
-      await this.identityEffects.flush();
+      this.publishChannelIdentity();
       return { ok: true as const, draft, fastRefusal: undefined, fastRetireFailed: false };
     }
     if (plan.permission !== undefined || plan.statusCardStyle !== undefined || plan.simpleCardGif !== undefined) {

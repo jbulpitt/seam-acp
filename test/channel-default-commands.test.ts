@@ -46,6 +46,9 @@ async function fixture() {
     seamMcp: localBridgeWiring(profiles) });
   const adapter = { sendMessage: vi.fn(async (channel, _text) => ({ channel, id: "notice" })),
     sendPanel: vi.fn(async (channel, _panel) => ({ channel, id: "hub" })), editPanel: vi.fn(async () => {}),
+    getThreadName: vi.fn(async (_channel: { id: string }): Promise<string | null> => null),
+    getThreadLiveState: vi.fn(async () => undefined),
+    renameThread: vi.fn(async (_channel: { id: string }, _name: string) => {}),
     sendChoicePicker: vi.fn(async (_channel: unknown, _options: any): Promise<{ value: string; userId: string } | null> => null), configParentChannels: async () => [{ id: PARENT, name: "project", guildId: "guild", guildName: "Guild" }] };
   const orchestrator = new Orchestrator({ config, logger, store, router, modelCatalog: catalog,
     adapter: adapter as never, renderer: { codeBlock: (value: string) => value } as never });
@@ -69,10 +72,94 @@ async function fixture() {
   };
   const row = () => router.ensureSessionRecord({ platform: "discord", channelRef: THREAD, parentRef: PARENT, cwd: dir });
   const cleanup = new ParentConfigCleanup({ config, store, plan: () => plan, parents: adapter.configParentChannels });
-  return { dir, file, config, store, router, plan, adapter, orchestrator, ui, native, slash, row, cleanup };
+  return { dir, file, config, store, router, plan, adapter, orchestrator, ui, native, slash, row, cleanup, logger };
+}
+
+async function blockChannelRename(h: Awaited<ReturnType<typeof fixture>>) {
+  let name = "proof thread";
+  h.adapter.getThreadName.mockImplementation(async () => name);
+  h.adapter.renameThread.mockImplementation(async (_channel, next) => { name = next; });
+  const row = h.row();
+  await h.orchestrator.flushIdentityEffects(row.id);
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  let finished = false;
+  h.adapter.renameThread.mockClear();
+  h.adapter.renameThread.mockImplementationOnce(async (_channel, next) => {
+    await gate;
+    name = next;
+    finished = true;
+  });
+  return { release, finished: () => finished };
 }
 
 describe("configuration scope through the real dispatcher", () => {
+  it("renders a parent command result while a sibling rename is still pending", async () => {
+    const h = await fixture();
+    const naming = await blockChannelRename(h);
+    const i = h.native("role", { value: "qa" });
+    const running = h.orchestrator.handleSlashInteraction(i as never);
+    try {
+      await vi.waitFor(() => {
+        expect(h.adapter.renameThread).toHaveBeenCalled();
+        expect(i.editReply).toHaveBeenCalled();
+      }, { timeout: 500 });
+      expect(naming.finished()).toBe(false);
+      expect(h.config.channelPresets.get(PARENT)?.role?.value).toBe("qa");
+      expect(JSON.stringify(i.editReply.mock.calls)).toContain("Channel default updated");
+      expect(i.deferReply).toHaveBeenCalledTimes(1);
+    } finally {
+      naming.release();
+      await running;
+      await h.orchestrator.flushIdentityEffects();
+    }
+    expect(naming.finished()).toBe(true);
+  });
+
+  it("renders parent editor Save while a sibling rename is still pending", async () => {
+    const h = await fixture();
+    const naming = await blockChannelRename(h);
+    const draft = await h.ui.openConfigEditorCard({ platform: "discord", id: PARENT }, actor.id) as ThreadConfigDraft;
+    h.ui.configEditor.put(applyPickerValue(draft, "role", "qa", () => undefined));
+    h.adapter.editPanel.mockClear();
+    const evt = { kind: "button", customId: `seam-cfg-edit:${draft.id}:save`,
+      channel: { platform: "discord", id: PARENT }, messageId: draft.messageId,
+      userId: actor.id, userName: actor.name, followUpEphemeral: vi.fn(async () => {}) };
+    const running = h.ui.handleConfigEditorComponent(evt as never);
+    try {
+      await vi.waitFor(() => {
+        expect(h.adapter.renameThread).toHaveBeenCalled();
+        expect(h.adapter.editPanel).toHaveBeenCalled();
+        expect(h.ui.configEditor.get(draft.id)).toBeUndefined();
+      }, { timeout: 500 });
+      expect(naming.finished()).toBe(false);
+      expect(h.config.channelPresets.get(PARENT)?.role?.value).toBe("qa");
+      expect(JSON.stringify(h.adapter.editPanel.mock.calls)).toContain("✅ Saved");
+      expect(JSON.stringify(evt.followUpEphemeral.mock.calls)).toContain("Channel default saved");
+    } finally {
+      naming.release();
+      await running;
+      await h.orchestrator.flushIdentityEffects();
+    }
+    expect(naming.finished()).toBe(true);
+  });
+
+  it("logs the real sibling rename error after committing a channel result", async () => {
+    const h = await fixture();
+    const naming = await blockChannelRename(h);
+    naming.release();
+    const err = new Error("Discord HTTP 502 Bad Gateway");
+    h.adapter.renameThread.mockReset().mockRejectedValue(err);
+    const warn = vi.spyOn(h.logger, "warn");
+    const i = await h.slash("role", { value: "qa" });
+    await vi.waitFor(() => expect(warn).toHaveBeenCalledWith(
+      expect.objectContaining({ err, parentRef: PARENT, threadId: THREAD }), "thread name recompaction failed",
+    ));
+    expect(JSON.stringify(i.editReply.mock.calls)).toContain("Channel default updated");
+    expect(h.config.channelPresets.get(PARENT)?.role?.value).toBe("qa");
+    await h.orchestrator.flushIdentityEffects();
+  });
+
   const direct = [
     ["agent", "id", "codex", "agent"], ["model", "id", "claude-pin", "model"],
     ["effort", "level", "low", "effort"], ["role", "value", "qa", "role"],

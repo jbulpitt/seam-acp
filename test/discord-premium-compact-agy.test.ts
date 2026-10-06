@@ -98,7 +98,13 @@ function makePolicyOrch(opts: {
 
   const router = {
     listProfiles: () => (agy ? [dest, agy] : [dest]),
-    describeConfig: () => ({}),
+    describeConfig: () => ({
+      agent: { value: opts.destId, source: "session config" },
+      model: { value: opts.destModel, source: "session config" },
+      effort: { value: opts.destEffort, source: "session config" },
+      location: { value: "local", source: "default" },
+      cwd: { value: record.repoPath, source: "session config" },
+    }),
     getProfile: (id?: string) => (id === "agy" ? agy : dest),
     invalidate: async () => {},
   };

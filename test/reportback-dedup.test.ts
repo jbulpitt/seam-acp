@@ -41,11 +41,18 @@ function makeOrch(): Orchestrator {
   const catalogProfile = { id: "claude", defaultModel: "default" } as any;
   const router = {
     listProfiles: () => [],
-    describeConfig: () => ({}),
+    describeConfig: (r: SessionRecord, selection: any = {}) => ({
+      agent: { value: selection.agent ?? r.agentId, source: "session config" },
+      model: { value: selection.model ?? "default", source: "default" },
+      effort: { value: selection.effort ?? null, source: "default" },
+      location: { value: selection.location ?? "local", source: "default" },
+      cwd: { value: r.repoPath, source: "session config" },
+    }),
     reuseMcpServers: () => [],
     ensureSessionRecord: (o: { channelRef: string }) =>
       record({ id: `discord:${o.channelRef}`, channelRef: o.channelRef }),
     getProfile: () => ({ id: "claude" }),
+    resolveProfileForChannel: () => router.getProfile(),
     getOrStartRuntime: async () => ({
       onEvent() {},
       async prompt() {

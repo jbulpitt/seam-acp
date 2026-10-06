@@ -72,7 +72,13 @@ function injectedTurn(rt: AgentRuntime, logger: Logger, onEvent: (event: AgentEv
   Object.assign(orch, { logger, config: { REPOS_ROOT: "/tmp" },
     store: { turnAttempts: { get: () => undefined } },
     plugins: new PluginHost(logger),
-    router: { getOrStartRuntime: async () => rt, describeConfig: () => ({ location: { value: "local" } }) },
+    router: { getOrStartRuntime: async () => rt, describeConfig: () => ({
+      agent: { value: record.agentId, source: "session config" },
+      model: { value: "default", source: "default" },
+      effort: { value: null, source: "default" },
+      cwd: { value: "/tmp", source: "default" },
+      location: { value: "local", source: "default" },
+    }) },
     adapter: { sendMessage: async (_channel: unknown, text: string) => { messages.push(text); } },
     ensureOwnSession: async () => {}, contextBudgetIdentity: () => undefined,
   });

@@ -65,7 +65,13 @@ function makeOrch(over?: {
 
   const router = {
     listProfiles: () => [],
-    describeConfig: () => ({}),
+    describeConfig: (r: SessionRecord) => ({
+      agent: { value: r.agentId, source: "session config" },
+      model: { value: (over?.cfg ?? { model: "opus" }).model ?? "default", source: "session config" },
+      effort: { value: (over?.cfg ?? { reasoningEffort: "high" }).reasoningEffort ?? null, source: "session config" },
+      location: { value: "local", source: "default" },
+      cwd: { value: r.repoPath, source: "session config" },
+    }),
     getProfile: () => profile,
     invalidate: async (id: string, opts: unknown) => {
       invalidated.push({ id, opts });
@@ -443,6 +449,7 @@ describe("Orchestrator.dispatchInjectTurn — compact branch", () => {
         record({ id: `discord:${channelRef}`, channelRef }),
     };
     const store = {
+      getByChannel: () => null,
       recordDelegation: (e: any) => ledger.push(e),
       updateDelegationStatus: (_id: string, s: string) => statuses.push(s),
     };

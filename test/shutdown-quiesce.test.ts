@@ -1169,6 +1169,7 @@ describe("#174 admission gates", () => {
         intakeStopped,
         config: { TURN_TIMEOUT_SECONDS: 900, REPOS_ROOT: "/tmp" },
         router: { ensureSessionRecord: () => ({ id: "s1" }), abortTurn },
+        bindThreadRecord: async () => ({ id: "s1" }),
         queueOnChannel,
         injectTurn: async () => ({ text: "ok" }),
         postSteerCard: async () => {},

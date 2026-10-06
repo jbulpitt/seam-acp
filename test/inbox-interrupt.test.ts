@@ -45,7 +45,13 @@ function makeOrch(opts?: {
   const invalidate = opts?.invalidate ?? vi.fn(async () => {});
   const router = {
     listProfiles: () => [],
-    describeConfig: () => ({}),
+    describeConfig: (r: SessionRecord) => ({
+      agent: { value: r.agentId, source: "session config" },
+      model: { value: "claude-opus-4.8", source: "default" },
+      effort: { value: null, source: "default" },
+      location: { value: "local", source: "default" },
+      cwd: { value: r.repoPath, source: "session config" },
+    }),
     ensureSessionRecord: (o: { channelRef: string; parentRef?: string }) =>
       record({
         id: `discord:${o.channelRef}`,

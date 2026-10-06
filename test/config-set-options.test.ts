@@ -384,11 +384,15 @@ describe("/seam config set named parameters", () => {
   });
 
   it("uses the selected agent default model when model is omitted", async () => {
-    const { orch, store } = makeHarness();
+    const { orch, router, store, threadPresets } = makeHarness();
     await acknowledgedHandler(interaction({ agent: "codex@local" }).i, () => (orch as any).cmdConfigSet(interaction({ agent: "codex@local" }).i));
     const { record, cfg } = read(store);
     expect(record.agentId).toBe("codex");
-    expect(cfg.model).toBe("gpt-5.6-sol");
+    expect(cfg.model).toBeUndefined();
+    expect(cfg.reasoningEffort).toBeUndefined();
+    expect(threadPresets.get(THREAD)?.model).toBeUndefined();
+    expect(threadPresets.get(THREAD)?.effort).toBeUndefined();
+    expect(router.describeConfig(record).model.value).toBe("gpt-5.6-sol");
     expect(cfg.lastContextUsage).toBeUndefined();
     store.close();
   });

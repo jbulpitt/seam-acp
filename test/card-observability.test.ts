@@ -32,6 +32,7 @@ import type {
   StructuredPanel,
 } from "../packages/core/src/core/types.js";
 import type { ChannelRef, MessageRef } from "../packages/core/src/platforms/chat-adapter.js";
+import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
 
@@ -402,7 +403,13 @@ function makeOrch(opts: {
 }): Orchestrator {
   const router = {
     listProfiles: () => [],
-    describeConfig: () => ({}),
+    describeConfig: (r: SessionRecord) => ({
+      agent: { value: r.agentId, source: "session config" },
+      model: { value: "opus", source: "session config" },
+      effort: { value: "high", source: "session config" },
+      location: { value: "local", source: "default" },
+      cwd: { value: r.repoPath, source: "session config" },
+    }),
     ensureSessionRecord: ({ channelRef }: { channelRef: string }) =>
       record({
         id: `discord:${channelRef}`,
@@ -453,6 +460,7 @@ function makeOrch(opts: {
     logger: silent,
     config: config as never,
     adapter: opts.adapter as never,
+    modelCatalog: fixtureModelCatalog([]),
     router: router as never,
     store: store as never,
     renderer: discordRenderer as never,

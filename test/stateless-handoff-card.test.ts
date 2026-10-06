@@ -24,6 +24,7 @@ import type { Logger } from "../packages/core/src/lib/logger.js";
 import type { Preset, SessionRecord, StructuredPanel } from "../packages/core/src/core/types.js";
 import type { ChannelRef, MessageRef } from "../packages/core/src/platforms/chat-adapter.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
+import { resolveThreadLocation } from "../packages/core/src/config.js";
 import { BridgeHub } from "../packages/core/src/core/bridge-hub.js";
 import { attachLocalBridge } from "./local-bridge-fixture.js";
 
@@ -109,7 +110,13 @@ function makeOrch(opts: {
   const chunks = opts.chunks ?? ["Hello ", "world"];
   const router = {
     listProfiles: () => [],
-    describeConfig: () => ({}),
+    describeConfig: (r: SessionRecord, selection: any = {}) => ({
+      agent: { value: selection.agent ?? r.agentId, source: "session config" },
+      model: { value: selection.model ?? "default", source: "default" },
+      effort: { value: selection.effort ?? null, source: "default" },
+      location: { value: selection.location ?? resolveThreadLocation((orchestrator as any).config, r.channelRef), source: "default" },
+      cwd: { value: r.repoPath, source: "session config" },
+    }),
     ensureSessionRecord: ({ channelRef }: { channelRef: string }) =>
       record({ id: `discord:${channelRef}`, channelRef }),
     getProfile: () => ({ id: "claude" }),
@@ -121,6 +128,7 @@ function makeOrch(opts: {
     reuseMcpServers: () => [],
   };
   const store = {
+    getByChannel: () => null,
     getPresetByName: (name: string) => fakePreset(name),
     recordDelegation: () => {},
     getDelegation: () => null,

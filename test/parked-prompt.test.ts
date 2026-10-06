@@ -255,7 +255,7 @@ describe("park while remote bridge offline (#88)", () => {
       },
       reply: async () => {},
       channelId: "thread-1",
-      channel: { parentId: "channel-1" },
+      channel: { parentId: "channel-1", isThread: () => true },
     }, acknowledged => (orch as any).cmdCancel(acknowledged));
     expect(store.getParkedByChannel("discord", "thread-1")).toBeNull();
     expect(reply).toMatch(/Cancelled the parked prompt/);
@@ -274,7 +274,7 @@ describe("park while remote bridge offline (#88)", () => {
       deferReply: async () => {},
       editReply: async () => {},
       channelId: "thread-1",
-      channel: { parentId: "channel-1" },
+      channel: { parentId: "channel-1", isThread: () => true },
     });
     expect(store.getParkedByChannel("discord", "thread-1")).toBeNull();
     expect(reply).toMatch(/Cancelled the parked prompt/);
@@ -471,7 +471,7 @@ function queueIx(prompt: string, over: Record<string, unknown> = {}) {
       reply = typeof opts === "string" ? opts : (opts.content ?? "");
     },
     channelId: "thread-1",
-    channel: { parentId: "channel-1" },
+    channel: { parentId: "channel-1", isThread: () => true },
     user: { id: "user-1", username: "Alex", globalName: null },
     ...over,
   };
@@ -525,7 +525,7 @@ function cancelIx() {
     editReply: async () => {},
     reply: async () => {},
     channelId: "thread-1",
-    channel: { parentId: "channel-1" },
+    channel: { parentId: "channel-1", isThread: () => true },
   };
 }
 
@@ -845,7 +845,7 @@ describe("/seam queue (#89)", () => {
       },
       reply: async () => {},
       channelId: "thread-1",
-      channel: { parentId: "channel-1" },
+      channel: { parentId: "channel-1", isThread: () => true },
     }, acknowledged => (orch as any).cmdCancel(acknowledged));
     expect(store.getParkedByChannel("discord", "thread-1")).toBeNull();
     expect(abortTurn).toHaveBeenCalled();

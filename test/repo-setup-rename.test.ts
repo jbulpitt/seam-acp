@@ -387,7 +387,7 @@ describe("#206 repo-selection/setup paths do not derive the thread base from a r
   });
 
   it("applying a preset with a repoPath does not rename the thread after the repo", async () => {
-    const { orch, renamed, threadNames } = makeOrch();
+    const { orch, router, renamed, threadNames, threadPresets } = makeOrch();
     const { i: newI } = slashI({ sub: "new", strings: { name: "review-pr" } });
     await (orch as any).cmdNew(newI);
     const afterCreate = [...renamed];
@@ -420,7 +420,12 @@ describe("#206 repo-selection/setup paths do not derive the thread base from a r
       preset
     );
 
-    expect(store.get(`discord:${THREAD}`)?.repoPath).toBe(path.join(reposRoot, "seam-acp"));
+    const updated = store.get(`discord:${THREAD}`)!;
+    expect(updated.repoPath).toBeNull();
+    expect(threadPresets.get(THREAD)?.cwd?.value).toBe(path.join(reposRoot, "seam-acp"));
+    expect(router.describeConfig(updated).cwd).toEqual({
+      value: path.join(reposRoot, "seam-acp"), source: "thread preset",
+    });
     expect(renamed.slice(afterCreate.length)).toEqual([]);
     expect(threadNames.get(THREAD)).toBe(nameBefore);
     expect(threadBase(store, THREAD, threadNames.get(THREAD))).toBe("review-pr");

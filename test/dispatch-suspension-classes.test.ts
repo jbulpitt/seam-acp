@@ -95,6 +95,17 @@ async function runRefusal(opts: {
 }
 
 describe("#333 suspension classes", () => {
+  it.each([
+    "reauth-waiting: provider authentication expired",
+    "owner registration is missing or unreadable; the previous owner cannot be proven exited",
+  ])("puts the real defect cause in the error headline: %s", reason => {
+    const error = DispatchSuspendedError.defect("parked", reason);
+    expect(error.message).toBe(reason);
+    expect(error.stack).toContain(`DispatchSuspendedError: ${reason}`);
+    expect(error).toMatchObject({ dispatchId: "parked", reason, suspension: "defect" });
+    expect(error.message).not.toContain("no longer owns execution");
+  });
+
   it("raises no operator notice for a restart's shutdown and superseded refusals", async () => {
     // The restart shape from the incident: several dispatches in flight, some
     // handed to the next boot, some already owned by a newer generation. Before
@@ -124,6 +135,7 @@ describe("#333 suspension classes", () => {
     });
     expect(notices).toHaveLength(1);
     expect(notices[0]?.err.reason).toBe(reason);
+    expect(notices[0]?.err.message).toBe(reason);
     expect(notices[0]?.err.suspension).toBe("defect");
     // The notice text is built from `err.reason` in observeRetainedDispatch;
     // what the watcher must guarantee is that the reason survives the hop at
@@ -189,6 +201,7 @@ describe("#333 suspension classes", () => {
     const foreign = DispatchSuspendedError.from(new Error("SQLITE_BUSY"), "job", "binding failed");
     expect(foreign.suspension).toBe("defect");
     expect(foreign.reason).toBe("binding failed: SQLITE_BUSY");
+    expect(foreign.message).toBe("binding failed: SQLITE_BUSY");
   });
 
   it("cannot construct a refusal without a reason", async () => {

@@ -18,7 +18,8 @@ import { discordRenderer } from "../packages/core/src/platforms/discord/renderer
 import { inboundAttemptId } from "../packages/core/src/core/dispatch/attempt-store.js";
 import { executionIdentity } from "../packages/core/src/core/dispatch/execution-identity.js";
 import type { ThreadPreset } from "../packages/core/src/config.js";
-import type { IncomingMessage } from "../packages/core/src/platforms/chat-adapter.js";
+import type { ChoiceInteraction, IncomingMessage } from "../packages/core/src/platforms/chat-adapter.js";
+import { makeChoiceCustomId } from "../packages/core/src/core/choice/types.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 import { localBridgeWiring } from "./local-bridge-fixture.js";
 import * as owners from "../packages/core/src/core/dispatch/process-owner.js";
@@ -154,12 +155,15 @@ function harness(location: "local" | "bridge-a", mode: AcpMode): Harness {
     editPanel: vi.fn(async () => {}),
     sendMessage: vi.fn(async (channel: any) => ({ channel, id: "message" })),
     editMessage: vi.fn(async () => {}),
+    sendChoiceCard: vi.fn(async (channel: any) => ({ channel, id: "reauth-choice" })),
+    editChoiceCard: vi.fn(async () => {}),
   };
   const orch = new Orchestrator({ logger: silent, store, router, adapter: adapter as any,
     renderer: discordRenderer, modelCatalog: catalog,
     recoverySleep: async () => {},
     config: { DATA_DIR: dir, REPOS_ROOT: dir, TURN_TIMEOUT_SECONDS: 15,
       DEFAULT_AGENT: "claude", DEFAULT_MODEL: MODEL, SEAM_TURN_RESUME_ENABLED: true,
+      DISCORD_ALLOWED_USER_IDS: new Set(["human"]),
       SEAM_DISPATCH_STATUS_PANEL: false, channelPresets: new Map(), threadPresets,
       bridgePresets: new Map(), REPO_EMOJIS: new Map() } as any });
   cleanups.push(async () => { await router.disposeAll(); store.close(); fs.rmSync(dir, { recursive: true, force: true }); });
@@ -201,6 +205,66 @@ async function resume(h: Harness): Promise<void> {
 }
 
 describe("#302 real ACP handshake and strict session/load recovery", () => {
+  it.each([false, true])("keeps an auth park through repeated sweeps, then resumes once on acceptance (promptStarted=%s)", async promptStarted => {
+    const h = harness("local", "codex-auth");
+    const id = seedPromptedAttempt(h, promptStarted);
+    h.store.claimInbound("msg-302", 0, new Date(Date.now() - 60_000).toISOString());
+    await resume(h);
+    const admission = h.store.getInbound("msg-302");
+    const parked = h.store.turnAttempts.get(id)!;
+    const card = h.store.listOpenChoiceCards("discord", THREAD)[0]!;
+    const noticeCount = h.adapter.sendMessage.mock.calls.length;
+    expect(card).toBeDefined();
+    expect(parked).toMatchObject({ state: "suspended", promptStarted,
+      stalledReason: expect.stringMatching(/^reauth-waiting:/) });
+    let now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+    for (let tick = 0; tick < 35; tick++) {
+      now += 60_000;
+      expect(h.orch.inspectChannelQueue(THREAD)).toMatchObject({ state: "stalled", epoch: 0 });
+      expect(await h.orch.sweepWedgedQueues()).toEqual([]);
+    }
+    clock.mockRestore();
+    expect(h.store.getInbound("msg-302")).toEqual(admission);
+    expect(h.store.turnAttempts.get(id)).toEqual(parked);
+    expect(h.store.listConfigMutations()).toEqual([]);
+    expect(h.calls.loads).toEqual([RECORDED]);
+    expect(h.calls.prompts).toEqual([]);
+    expect(h.adapter.sendMessage).toHaveBeenCalledTimes(noticeCount);
+    expect(h.adapter.sendMessage.mock.calls.filter(call => String(call[1]).includes("Cause: Authentication required")))
+      .toHaveLength(1);
+    expect(h.store.listOpenChoiceCards("discord", THREAD)).toHaveLength(1);
+    await expect(resume(h)).rejects.toMatchObject({ message: parked.stalledReason });
+
+    h.calls.authRequired = false;
+    const event: ChoiceInteraction = {
+      customId: makeChoiceCustomId(card.id, 0), kind: "button", userId: "human", userName: "Human",
+      channel: { platform: "discord", id: THREAD }, messageId: "reauth-choice",
+      deferUpdate: vi.fn(async () => {}), followUpEphemeral: vi.fn(async () => {}),
+      replyEphemeral: vi.fn(async () => {}), showModal: vi.fn(async () => {}),
+    };
+    const click = () => (h.orch as unknown as {
+      handleChoiceCardInteraction(event: ChoiceInteraction): Promise<void>;
+    }).handleChoiceCardInteraction(event);
+    await click();
+    await click();
+    expect(h.store.getChoiceCard(card.id)?.clickCount).toBe(1);
+    expect(event.replyEphemeral).toHaveBeenCalledWith("This card is closed.");
+    expect(h.store.getInbound("msg-302")).toMatchObject({ state: "completed", queueEpoch: 0 });
+    expect(h.store.turnAttempts.get(id)).toMatchObject({ state: "completed",
+      generation: parked.generation + 1, deliveryDone: true });
+    expect(h.calls.loads).toEqual([RECORDED, RECORDED]);
+    expect(h.calls.news).toBe(0);
+    expect(h.calls.prompts).toHaveLength(1);
+    if (promptStarted) {
+      expect(h.calls.prompts[0]).toMatch(/^continue\n/);
+      expect(h.calls.prompts[0]).not.toContain(ORIGINAL);
+    } else {
+      expect(h.calls.prompts[0]).toContain(ORIGINAL);
+      expect(h.calls.prompts[0]).not.toMatch(/^continue\n/);
+    }
+  });
+
   it.each([false, true])("parks a recovered dispatch with promptStarted=%s when Codex session/load requires authentication", async promptStarted => {
     const h = harness("bridge-a", "codex-auth");
     const boot = (h.orch as unknown as { attemptBoot: string }).attemptBoot;

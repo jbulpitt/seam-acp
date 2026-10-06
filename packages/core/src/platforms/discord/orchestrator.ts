@@ -2049,6 +2049,9 @@ export class Orchestrator {
     const listInbound = (this.store as Partial<SessionStore>).listInboundNonterminal;
     const durable = listInbound ? listInbound.call(this.store, channelRef) : [];
     const stalled = this.store.turnAttempts.listStalled(channelRef);
+    const newestInbound = durable.at(-1);
+    const awaitingReauth = newestInbound && stalled.some(attempt =>
+      attempt.id === inboundAttemptId(newestInbound.messageId) && isAwaitingReauth(attempt.stalledReason));
     const listUnsettled = this.store.turnAttempts.listUnsettledCompletions?.bind(this.store.turnAttempts);
     const unsettled = listUnsettled ? listUnsettled(channelRef) : [];
     const durableSince = durable.length > 0 ? Date.parse(durable[0]!.updatedUtc) : Number.NaN;
@@ -2063,15 +2066,17 @@ export class Orchestrator {
     const graceMs = (this.config.CHANNEL_QUEUE_WEDGE_GRACE_SECONDS ?? 30) * 1000;
     const state: ChannelQueueState = runtimeBusy
       ? "runtime_busy"
-      : (meta || durable.length > 0) && ageMs >= graceMs
-        ? "wedged"
-        : meta || durable.length > 0
-          ? "queued"
-          // #509: retained defects and completed receipts describe attempts,
-          // not a channel queue. With no admitted/running work the channel is
-          // idle, even if diagnostic history exists. Defects remain quarantined
-          // and visible below; this does not retry or abandon them.
-          : "idle";
+      : awaitingReauth
+        ? "stalled"
+        : (meta || durable.length > 0) && ageMs >= graceMs
+          ? "wedged"
+          : meta || durable.length > 0
+            ? "queued"
+            // #509: retained defects and completed receipts describe attempts,
+            // not a channel queue. With no admitted/running work the channel is
+            // idle, even if diagnostic history exists. Defects remain quarantined
+            // and visible below; this does not retry or abandon them.
+            : "idle";
     return {
       state,
       epoch: meta?.epoch ?? this.queueEpoch(channelRef),

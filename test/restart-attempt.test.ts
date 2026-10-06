@@ -101,7 +101,8 @@ describe("#250 durable attempt winner", () => {
         }
       } finally { raw.close(); }
       for (const boot of ["boot-B", "boot-A"]) {
-        expect(() => attempts.claim(spec, identity, boot)).toThrow("dispatch attempt no longer owns execution");
+        expect(() => attempts.claim(spec, identity, boot))
+          .toThrow("owner registration is missing or unreadable; the previous owner cannot be proven exited");
         expect(attempts.get(spec.id)).toMatchObject({ state: "suspended", generation: original.generation, ownerBoot: "boot-A" });
       }
     },

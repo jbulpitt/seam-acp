@@ -60,7 +60,7 @@ export function installConfigUi(deps: ConfigUiDependencies) {
         detached: inherited.detached.value, fastMode: inherited.fastMode.value,
         statusCardStyle: inherited.statusCardStyle.value, simpleCardGif: inherited.simpleCardGif.value,
         role: inherited.role.value, disableThreadPrefix: inherited.disableThreadPrefix.value,
-      }, channelPins: {
+      }, threadOverrides: target.kind === "thread" ? deps.plan().threadOverrideFields(record) : [], channelPins: {
         ...(chan?.agent?.value ? { agent: chan.agent.value } : {}), ...(chan?.model?.value ? { model: chan.model.value } : {}),
         ...(chan?.cwd?.value ? { cwd: chan.cwd.value } : {}), ...(chan?.effort?.value ? { effort: chan.effort.value } : {}),
         ...(chan?.role?.value ? { role: chan.role.value } : {}), ...(chan?.disableThreadPrefix ? { disableThreadPrefix: chan.disableThreadPrefix.value } : {}),

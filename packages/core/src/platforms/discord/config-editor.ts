@@ -96,6 +96,8 @@ export interface ThreadConfigSnapshot {
   locked: boolean;
   /** Raw channel-preset pins (unset = that field is not on the channel entry). */
   channelPins: ChannelPresetPins;
+  /** Actual pins/mirrors, including those hidden by the effective source. */
+  threadOverrides?: readonly (keyof ChannelPresetPins | "rider")[];
   /** Values that apply if the thread overlay is removed (inherit). */
   withoutThread: InheritedConfig;
   effortIgnoredNote?: string;
@@ -435,22 +437,22 @@ export function dirtyThreadPresetChanges(draft: ThreadConfigDraft): ThreadPreset
   if (o.agent !== undefined) {
     const current = threadOverlayValue(s.agent) ?? null;
     const next = o.agent;
-    if (next === null || next !== current) changes.agent = next;
+    if (next !== current || (next === null && s.threadOverrides?.includes("agent"))) changes.agent = next;
   }
   if (o.model !== undefined) {
     const current = threadOverlayValue(s.model) ?? null;
     const next = o.model;
-    if (next === null || next !== current) changes.model = next;
+    if (next !== current || (next === null && s.threadOverrides?.includes("model"))) changes.model = next;
   }
   if (o.effort !== undefined) {
     const current = threadOverlayValue(s.effort) ?? null;
     const next = o.effort;
-    if (next === null || next !== current) changes.effort = next;
+    if (next !== current || (next === null && s.threadOverrides?.includes("effort"))) changes.effort = next;
   }
   if (o.cwd !== undefined) {
     const current = threadOverlayValue(s.cwd) ?? null;
     const next = o.cwd;
-    if (next === null || next !== current) changes.cwd = next;
+    if (next !== current || (next === null && s.threadOverrides?.includes("cwd"))) changes.cwd = next;
   }
   if (o.rider !== undefined) {
     const current = s.rider.thread ?? null;
@@ -460,12 +462,12 @@ export function dirtyThreadPresetChanges(draft: ThreadConfigDraft): ThreadPreset
   if (o.role !== undefined) {
     const current = threadOverlayValue(s.role) ?? null;
     const next = o.role;
-    if (next === null || next !== current) changes.role = next;
+    if (next !== current || (next === null && s.threadOverrides?.includes("role"))) changes.role = next;
   }
   if (o.disableThreadPrefix !== undefined) {
     const current = threadOverlayValue(s.disableThreadPrefix) ?? null;
     const next = o.disableThreadPrefix;
-    if (next === null || next !== current) changes.disableThreadPrefix = next;
+    if (next !== current || (next === null && s.threadOverrides?.includes("disableThreadPrefix"))) changes.disableThreadPrefix = next;
   }
   if (o.detached !== undefined) {
     const current = s.detached.value === true;
@@ -502,7 +504,7 @@ export function dirtyStatusCardStyle(
       ? draft.snapshot.statusCardStyle.value
       : null;
   const next = draft.overlay.statusCardStyle;
-  if (next !== null && next === current) return undefined;
+  if (next === current && !(next === null && draft.snapshot.threadOverrides?.includes("statusCardStyle"))) return undefined;
   return next;
 }
 
@@ -526,7 +528,7 @@ export function dirtySimpleCardGif(
       ? draft.snapshot.simpleCardGif.value
       : null;
   const next = draft.overlay.simpleCardGif;
-  if (next !== null && next === current) return undefined;
+  if (next === current && !(next === null && draft.snapshot.threadOverrides?.includes("simpleCardGif"))) return undefined;
   return next;
 }
 
@@ -1380,9 +1382,15 @@ export function buildSavePlan(draft: ThreadConfigDraft): ConfigEditorSavePlan {
   const perm = dirtyPermission(draft);
   if (perm !== undefined) plan.permission = perm;
   const card = dirtyStatusCardStyle(draft);
-  if (card !== undefined) { plan.statusCardStyle = card; plan.threadPreset.statusCardStyle = card; }
+  if (card !== undefined) {
+    plan.statusCardStyle = card;
+    if (card === null) plan.threadPreset.statusCardStyle = null;
+  }
   const gif = dirtySimpleCardGif(draft);
-  if (gif !== undefined) { plan.simpleCardGif = gif; plan.threadPreset.simpleCardGif = gif; }
+  if (gif !== undefined) {
+    plan.simpleCardGif = gif;
+    if (gif === null) plan.threadPreset.simpleCardGif = null;
+  }
   const channelCard = dirtyChannelStatusCardStyle(draft);
   const channelGif = dirtyChannelSimpleCardGif(draft);
   const channelRider = dirtyChannelRider(draft);

@@ -79,7 +79,10 @@ export class ConfigUi {
     const applied = await this.ports.applyChannelSet(channel, prepared.prepared, { id: i.user.id, name: i.user.displayName ?? i.user.username });
     if (!applied.ok) { await i.reply(applied.message); return; }
     const fields = Object.keys(prepared.prepared.changes) as ConfigDefaultField[];
-    await i.reply(`Channel default updated. Effective: ${configSetSummary(applied.effective, this.ports.repoDisplay)}. Thread overrides: ${formatOverrideCounts(this.ports.overrideCounts(target.id, fields))}.`);
+    const heading = request.supplied.length === 1 && request.supplied[0] === "repo"
+      ? prepared.prepared.changes.cwd === null ? "Channel repo overlay cleared" : `Channel repo set to \`${this.ports.repoDisplay(applied.effective.cwd.value)}\``
+      : "Channel default updated";
+    await i.reply(`${heading}. Effective: ${configSetSummary(applied.effective, this.ports.repoDisplay)}. Thread overrides: ${formatOverrideCounts(this.ports.overrideCounts(target.id, fields))}.`);
     await this.offerFollowChannel(channel, i.user, fields);
   }
 
@@ -175,7 +178,7 @@ export class ConfigUi {
     scope?: string | null
   ): Promise<ThreadConfigDraft | null> {
     if (!this.ports.transport.sendPanel) return null;
-    const { desc, withoutThread, channelPins } = this.ports.snapshot(channel);
+    const { desc, withoutThread, channelPins, threadOverrides } = this.ports.snapshot(channel);
     const now = Date.now();
     const draft: ThreadConfigDraft = {
       id: randomUUID(),
@@ -188,6 +191,7 @@ export class ConfigUi {
       snapshot: {
         ...snapshotFromDescribe(desc, withoutThread),
         channelPins,
+        threadOverrides,
       },
       overlay: {},
       warnings: [],

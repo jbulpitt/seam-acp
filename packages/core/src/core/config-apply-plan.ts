@@ -14,7 +14,7 @@ import { parseStatusCardStyle, parseSimpleCardGif, type SessionRecord, type Sess
 import { LOCAL_LOCATION, isLocalLocation, parseAgentAtLocation } from "./location.js";
 import { isWithinRoot } from "./path-utils.js";
 import { bindSessionLocation } from "./location-bind.js";
-import { buildSavePlan, fastModeWillResetSession, willVerifyFastMode, type ThreadConfigDraft } from "../platforms/discord/config-editor.js";
+import { buildSavePlan, snapshotFromDescribe, fastModeWillResetSession, willVerifyFastMode, type ThreadConfigDraft } from "../platforms/discord/config-editor.js";
 import { FAST_MODE_CONFIG_ID, settleFastMode, fastModeRetirementFailure } from "./fast-mode.js";
 
 export interface TargetIdentityChanges {
@@ -173,21 +173,24 @@ export class ConfigApplyPlan {
 
   overrideCounts(channelId: string, fields: readonly ConfigDefaultField[] = CONFIG_DEFAULT_FIELDS): OverrideCounts {
     const records = this.settings!.store.listSessionsByParentInCreationOrder("discord", channelId);
-    const ids = new Set(records.map(row => row.channelRef));
+    const overrides = records.map(record => this.threadOverrideFields(record));
     const counts: OverrideCounts = {};
     for (const field of fields) {
-      counts[field] = [...ids].filter(id => {
-        if (this.config.threadPresets.get(id)?.[field] !== undefined) return true;
-        const record = records.find(row => row.channelRef === id);
-        if (!record) return false;
-        const cfg = this.store.readConfig(record);
-        if (field === "agent") return record.agentId !== this.router.describeConfig(record, { inherit: true }).agent.value;
-        if (field === "cwd") return cfg.sessionCwdExplicit === true && record.repoPath !== null;
-        const key = field === "effort" ? "reasoningEffort" : field;
-        return key in cfg;
-      }).length;
+      counts[field] = overrides.filter(entry => entry.includes(field)).length;
     }
     return counts;
+  }
+
+  /** Persisted overrides include legacy mirrors hidden by a channel default. */
+  threadOverrideFields(record: SessionRecord): ConfigDefaultField[] {
+    const cfg = this.store.readConfig(record);
+    const pins = this.config.threadPresets.get(record.channelRef);
+    return CONFIG_DEFAULT_FIELDS.filter(field => {
+      if (pins?.[field] !== undefined) return true;
+      if (field === "agent") return record.agentId !== this.router.describeConfig(record, { inherit: true }).agent.value;
+      if (field === "cwd") return cfg.sessionCwdExplicit === true && record.repoPath !== null;
+      return (field === "effort" ? "reasoningEffort" : field) in cfg;
+    });
   }
 
   clearLegacyOverrides(record: SessionRecord, changes: ChannelPresetChanges): SessionRecord {
@@ -195,8 +198,10 @@ export class ConfigApplyPlan {
     const next = { ...record };
     for (const [field, value] of Object.entries(changes)) {
       if (field === "agent") next.agentId = value as string ?? this.router.describeConfig(record, { inherit: true }).agent.value;
-      else if (field === "cwd") { next.repoPath = null; delete cfg.sessionCwdExplicit; }
-      else delete (cfg as Record<string, unknown>)[field === "effort" ? "reasoningEffort" : field];
+      else if (value === null) {
+        if (field === "cwd") { next.repoPath = null; delete cfg.sessionCwdExplicit; }
+        else delete (cfg as Record<string, unknown>)[field === "effort" ? "reasoningEffort" : field];
+      }
     }
     next.configJson = this.store.writeConfig(cfg);
     this.store.upsert(next);
@@ -901,7 +906,11 @@ export class ConfigApplyPlan {
   async saveEditor(draft: ThreadConfigDraft, actor: MutationActor, canEditChannelPreset: (parent: string) => boolean) {
     const bound = draft.channelOnly ? null : this.settings!.store.getByChannel("discord", draft.threadId);
     const before = bound ? this.router.describeConfig(bound) : undefined;
-    const plan = buildSavePlan(draft);
+    // Compare touched fields with the latest save, so a revert cancels a pending selection.
+    const plan = buildSavePlan(before ? { ...draft, snapshot: {
+      ...snapshotFromDescribe(before, draft.snapshot.withoutThread), channelPins: draft.snapshot.channelPins,
+      threadOverrides: this.threadOverrideFields(bound!),
+    } } : draft);
     const hasPreset = Object.keys(plan.threadPreset).length > 0;
     if (hasPreset) {
       const written = this.configMutation.applyThreadOverlay({

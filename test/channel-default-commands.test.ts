@@ -210,6 +210,9 @@ describe("configuration scope through the real dispatcher", () => {
     h.store.upsert({ ...row, repoPath: h.dir, configJson: JSON.stringify({ model: "claude-pin", reasoningEffort: "low", role: "legacy", sessionCwdExplicit: true, statusCardStyle: "full", simpleCardGif: false }) });
     const draft = await h.ui.openConfigEditorCard({ platform: "discord", id: THREAD, parentId: PARENT }, actor.id) as ThreadConfigDraft;
     draft.overlay = { model: null, effort: null, role: null, cwd: null, statusCardStyle: null, simpleCardGif: null };
+    expect(draft.snapshot.model.source).toBe("channel preset");
+    expect(draft.snapshot.threadOverrides).toEqual(expect.arrayContaining(["model", "effort", "role", "cwd", "statusCardStyle", "simpleCardGif"]));
+    expect(buildSavePlan(draft).threadPreset).toMatchObject({ model: null, effort: null, role: null, cwd: null });
     expect(await h.plan.saveEditor(draft, actor, () => true)).toMatchObject({ ok: true });
     const saved = h.store.get(row.id)!;
     expect(h.store.readConfig(saved)).not.toHaveProperty("role");

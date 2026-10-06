@@ -14230,7 +14230,6 @@ export class Orchestrator {
         actor,
       });
       if (!written.ok) return written;
-      this.getConfigApplyPlan().clearLegacyOverrides(record, { cwd: resolved });
       return {
         ok: true,
         message: `Thread-preset repo set to \`${display}\`. Applies on the next turn.`,

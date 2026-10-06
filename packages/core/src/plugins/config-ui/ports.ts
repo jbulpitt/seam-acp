@@ -31,7 +31,7 @@ export interface ConfigUiPorts {
   catalog: Pick<ModelCatalogService, "models" | "model" | "effortChoices" | "isHidden">;
   bind(channel: ChannelRef): void;
   readConfig(channel: ChannelRef): unknown;
-  snapshot(channel: ChannelRef): { desc: ConfigDescription; withoutThread: InheritedConfig; channelPins: ChannelPresetPins };
+  snapshot(channel: ChannelRef): { desc: ConfigDescription; withoutThread: InheritedConfig; channelPins: ChannelPresetPins; threadOverrides?: readonly ConfigDefaultField[] };
   canEditChannelPreset(user: string, parent?: string): boolean;
   hasFastMode(agent: string): boolean;
   agentChoices(): Array<{ value: string; label: string; description?: string }>;

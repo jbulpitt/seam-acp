@@ -242,11 +242,70 @@ describe("durable parked-turn notice actions", () => {
     expect(orch.adapter.sendMessage).not.toHaveBeenCalled();
   });
 
-  it("cancels an unavailable user turn with one plain cause and no buttons", async () => {
+  it("cancels an already-notified dispatch when only Cancel remains available", async () => {
+    const orch = controller();
+    const spec = { id: "already-notified-deleted-target", target: "deleted-worker", returnTo: "requester", reportBack: true,
+      kind: "handoff" as const, session: "live" as const, prompt: "UNSENT" };
+    const reason = "target thread is deleted; continuation cannot currently be admitted";
+    store.recordDelegation({ id: spec.id, kind: "handoff", sourceRef: "requester", targetRef: spec.target,
+      worker: null, promptPreview: spec.prompt, correlationId: null, status: "interrupted" });
+    store.turnAttempts.claim(spec, executionIdentity({ agent: "codex", location: "local" }), "boot");
+    store.turnAttempts.markStalled(spec.id, reason);
+    const posted = await orch.publishChoiceCard(orch.router.ensureSessionRecord({ channelRef: "requester" }), {
+      title: "Parked turn", body: `Dispatch is parked: ${reason}. Use Resume to continue.`,
+      options: [{ label: "Abandon", kind: "prompt", payload: `parked-turn:abandon:${spec.id}` }],
+    });
+    store.turnAttempts.markStallNoticeDelivered(spec.id);
+    orch.adapter.getThreadLiveState = async () => undefined;
+    orch.adapter.sendChoiceCard.mockClear();
+
+    await orch.observeRetainedDispatch(spec, { reason });
+    await orch.observeRetainedDispatch(spec, { reason });
+
+    expect(store.turnAttempts.get(spec.id)).toMatchObject({ state: "cancelled", promptStarted: false });
+    const report = store.getReportBackByCorrelation(spec.id)!;
+    expect(report).toMatchObject({ kind: "report_back", targetRef: "requester" });
+    expect(store.turnAttempts.get(report.id)!.spec.prompt).toContain(reason);
+    expect(store.turnAttempts.get(report.id)!.spec.prompt).toContain("The prompt was never sent");
+    expect(store.listRecentDelegations(20).filter(row => row.kind === "report_back")).toHaveLength(1);
+    expect(store.getChoiceCard(posted.choiceId)?.status).toBe("cancelled");
+    expect(orch.adapter.sendChoiceCard).not.toHaveBeenCalled();
+    expect(orch.adapter.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("replaces an already-notified Abandon-only card once when Resume becomes available", async () => {
+    const orch = controller();
+    const spec = store.turnAttempts.get(id)!.spec;
+    const posted = await orch.publishChoiceCard(orch.router.ensureSessionRecord({ channelRef: "worker" }), {
+      title: "Parked turn", body: "Dispatch is parked: execution identity changed. Use Resume to continue.",
+      options: [{ label: "Abandon", kind: "prompt", payload: `parked-turn:abandon:${id}` }],
+    });
+    store.turnAttempts.markStallNoticeDelivered(id);
+    orch.adapter.sendChoiceCard.mockClear();
+
+    await orch.observeRetainedDispatch(spec);
+    const recovered = store.listOpenChoiceCards("discord", "worker");
+    expect(recovered).toHaveLength(1);
+    expect(recovered[0]!.id).not.toBe(posted.choiceId);
+    expect(recovered[0]!.options.map(option => parkedTurnAction(option.payload)?.action)).toEqual(["resume", "cancel"]);
+    expect(recovered[0]!.options.map(option => option.label)).toEqual([expect.stringMatching(/^Resume /), expect.stringMatching(/^Cancel /)]);
+    expect(recovered[0]!.body).toContain("continue under the thread's current configuration, or Cancel");
+    expect(store.getChoiceCard(posted.choiceId)?.status).toBe("cancelled");
+    expect(orch.adapter.sendChoiceCard).toHaveBeenCalledTimes(1);
+    expect(orch.adapter.editChoiceCard).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ disabled: true, hideButtons: true }));
+
+    await orch.observeRetainedDispatch(spec);
+    expect(orch.adapter.sendChoiceCard).toHaveBeenCalledTimes(1);
+    expect(orch.adapter.editChoiceCard).toHaveBeenCalledTimes(1);
+    expect(store.turnAttempts.get(id)?.state).toBe("suspended");
+  });
+
+  it.each([false, true])("cancels an unavailable user turn with one plain cause and no buttons (already notified: %s)", async alreadyNotified => {
     const orch = controller();
     const spec = { id: "inbound-orphan", target: "worker", kind: "parked" as const, session: "live" as const, prompt: "UNSENT" };
     store.turnAttempts.claim(spec, executionIdentity({ agent: "codex", location: "local" }), "boot", "inbound");
     store.turnAttempts.markStalled(spec.id, "the provider lost the conversation");
+    if (alreadyNotified) store.turnAttempts.markStallNoticeDelivered(spec.id);
     await orch.notifyParkedTurn(store.turnAttempts.get(spec.id));
     await orch.notifyParkedTurn(store.turnAttempts.get(spec.id));
     expect(store.turnAttempts.get(spec.id)?.state).toBe("cancelled");

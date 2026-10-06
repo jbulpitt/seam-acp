@@ -20,7 +20,7 @@ import { AgentRuntime } from "../packages/core/src/agents/agent-runtime.js";
 import type { AgentProfile } from "@seam/adapters";
 
 const cleanups: (() => void)[] = [];
-afterEach(() => { for (const f of cleanups.splice(0).reverse()) f(); vi.restoreAllMocks(); });
+afterEach(() => { for (const f of cleanups.splice(0).reverse()) f(); vi.restoreAllMocks(); vi.useRealTimers(); });
 function setup() {
   const dataDir = mkdtempSync(path.join(tmpdir(), "seam-250-dispatch-"));
   cleanups.push(() => rmSync(dataDir, { force: true, recursive: true }));
@@ -78,6 +78,90 @@ function setup() {
     createdUtc: new Date().toISOString() };
   return { orch, store, watcher, dataDir, spec, reports, runtime, router, adapter, config, notices, refusals, started, release, makeOrch, acquisitionSleep };
 }
+
+async function adoptedCard() {
+  const h = setup();
+  h.spec.id = "adopted-status";
+  h.spec.kind = "wake";
+  h.spec.returnTo = undefined;
+  h.store.turnAttempts.registerOwner("old-controller");
+  const attempt = h.store.turnAttempts.claim(h.spec, "synthetic-identity", "old-controller");
+  h.store.turnAttempts.bind(attempt, "recorded-acp");
+  h.store.turnAttempts.bindStatusCard(attempt, { channelId: "worker", messageId: "original-card" });
+  h.store.turnAttempts.startPrompt(attempt);
+  h.store.turnAttempts.recordRemoteRecovery(attempt, { version: 1, location: "remote-one", slot: 19,
+    submissionId: "adopted-submission", acpSessionId: "recorded-acp", delegatedUtc: new Date().toISOString() });
+  h.store.turnAttempts.suspendBoot("old-controller");
+  const child = Object.assign(new EventEmitter(), { stdin: new PassThrough(), stdout: new PassThrough(),
+    stderr: new PassThrough(), killed: false, kill: vi.fn(() => true), detach: vi.fn() });
+  h.router.adoptRecoveryRuntime.mockImplementation((_record, adoptedChild, sessionId) => {
+    const runtime = new AgentRuntime({ profile: { id: "codex" } as AgentProfile,
+      logger: pino({ level: "silent" }) as any,
+      spawnFn: () => { throw new Error("recovery must not spawn"); } });
+    runtime.attachRecovery(adoptedChild, sessionId);
+    return runtime;
+  });
+  h.router.releaseRecoveryRuntime.mockImplementation((_record, runtime) => runtime.releaseRecovery());
+  const mux = { adopt: vi.fn(() => child), sendCmd: vi.fn(async () => ({ health: [{ slot: 19, alive: true,
+    recovery: { version: 1, owner: "bridge", submissionId: "adopted-submission", acpSessionId: "recorded-acp",
+      rung: 1, phase: "executing", retry: 0, budget: 3, remaining: 3, disposition: "none",
+      updatedUtc: new Date().toISOString() } }] })) };
+  const restarted = h.makeOrch();
+  cleanups.push(() => restarted.stopSentinelWatcher());
+  restarted.setBridgeHub({ muxFor: () => mux, slotHealthFor: () => [] } as any);
+  const adoption = (restarted as any).adoptRemoteRecoveryOwned(h.store.turnAttempts.get(attempt.id)) as Promise<boolean>;
+  await vi.waitFor(() => expect(mux.adopt).toHaveBeenCalledOnce());
+  await vi.waitFor(() => expect(h.adapter.editPanel).toHaveBeenCalled());
+  const finish = (cancelled = false) => child.emit("remoteRecoveryResult", { version: 1,
+    submissionId: "adopted-submission", acpSessionId: "recorded-acp", status: "completed",
+    text: cancelled ? "" : "recovered answer", stopReason: cancelled ? "cancelled" : "end_turn",
+    finishedUtc: new Date().toISOString() });
+  const panels = () => h.adapter.editPanel.mock.calls.map(call => (call as any[])[1]);
+  return { ...h, restarted, attempt, adoption, finish, panels };
+}
+
+describe("#576 adopted status-card diagnosis", () => {
+  it("finalizes the original card when an adopted turn is cancelled before its next heartbeat", async () => {
+    const h = await adoptedCard();
+    expect(h.panels().at(-1).title).toContain("Working");
+    expect(h.store.turnAttempts.cancel(h.attempt.id)).toBe(true);
+    h.finish(true);
+    await h.adoption;
+    await (h.restarted as any).settleTrackedContinuations();
+    expect(h.store.turnAttempts.get(h.attempt.id)).toMatchObject({ state: "cancelled", deliveryDone: false });
+    expect(h.adapter.sendMessage).not.toHaveBeenCalled();
+    expect(h.panels().at(-1)).toMatchObject({ title: "⏰ Wake · Failed",
+      fields: expect.arrayContaining([expect.objectContaining({ name: "Action", value: "Cancelled" })]) });
+    expect(h.router.releaseRecoveryRuntime).toHaveBeenCalledOnce();
+  });
+
+  it("keeps an adopted completion Working while its terminal result delivery is held", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
+    const h = await adoptedCard();
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let entered!: () => void;
+    const sending = new Promise<void>(resolve => { entered = resolve; });
+    h.adapter.sendMessage.mockImplementationOnce(async channel => {
+      entered(); await gate; return { channel, id: "answer" };
+    });
+    try {
+      h.finish();
+      await sending;
+      expect(h.store.turnAttempts.get(h.attempt.id)).toMatchObject({ state: "completed", deliveryDone: false,
+        outcome: { output: "recovered answer" } });
+      await vi.advanceTimersByTimeAsync(6_000);
+      expect(h.panels().some(panel => panel.title.includes("Done"))).toBe(false);
+    } finally {
+      release();
+      await h.adoption;
+      vi.useRealTimers();
+    }
+    expect(h.store.turnAttempts.get(h.attempt.id)?.deliveryDone).toBe(true);
+    expect(h.panels().at(-1).title).toBe("⏰ Wake · Done");
+    expect(h.adapter.sendMessage).toHaveBeenCalledOnce();
+  });
+});
 
 describe("#250 production dispatch lifecycle (synthetic transport, no providers)", () => {
   it("manually resumes an owned unstarted dispatch with the original brief exactly once", async () => {

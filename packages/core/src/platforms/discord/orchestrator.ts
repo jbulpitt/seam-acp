@@ -327,7 +327,7 @@ import {
   type CodexAsyncAnswerDelivery,
 } from "../../core/elicitation/manager.js";
 import type { InboundAdmission } from "../../core/inbound-admission/types.js";
-import { DefaultAgentUnavailableError, SessionRouter, simpleCardGifForRender, statusCardStyleForRender } from "../../core/session-router.js";
+import { CANCEL_SIGNAL_TIMEOUT_MS, DefaultAgentUnavailableError, SessionRouter, simpleCardGifForRender, statusCardStyleForRender } from "../../core/session-router.js";
 import {
   parkedAgentMessage,
 } from "../../core/parked-agents.js";
@@ -2826,7 +2826,7 @@ export class Orchestrator {
     }, { debounceMs: STATUS_EDIT_DEBOUNCE_MS, heartbeatMs: STATUS_HEARTBEAT_MS,
       observe: status => {
         const latest = this.store.turnAttempts.get(attempt.id);
-        if (latest?.state === "completed" || latest?.state === "cancelled") {
+        if ((latest?.state === "completed" && latest.deliveryDone) || latest?.state === "cancelled") {
           const projection = projectAttemptCard(latest, attempt);
           if (projection) { status.setState(projection.state); status.setAction(projection.action); }
         }
@@ -14659,7 +14659,15 @@ export class Orchestrator {
     // also converges on dispose, and wiping there would make resume a
     // silent no-op on every graceful reboot.
     const cancelled = await this.clearTurnMarkersForChannel(record.channelRef, "cancelled");
-    const outcome = await this.router.abortTurn(record.id, { force: false });
+    let outcome: Awaited<ReturnType<SessionRouter["abortTurn"]>>;
+    try {
+      outcome = await this.router.abortTurn(record.id, { force: false });
+    } catch (err) {
+      await replyToInteraction(i,
+        `🟡 Cancel requested, but not confirmed: ${err instanceof Error ? err.message : String(err)}. ` +
+        "Work may still be running. Use `/seam cancel force:true` to force it.");
+      return;
+    }
     const queue = this.inspectChannelQueue(record.channelRef);
     await replyToInteraction(i,
       outcome === "idle"
@@ -14672,6 +14680,8 @@ export class Orchestrator {
             : queue.state === "queued"
               ? `No ACP turn is active, but ${queue.queued} durable item(s) remain queued. Nothing was discarded.`
               : "No active turn."
+        : outcome === "unacknowledged"
+          ? `🟡 Cancel requested, but not confirmed: the cancel signal did not complete within ${CANCEL_SIGNAL_TIMEOUT_MS / 1000}s. Work may still be running. Use \`/seam cancel force:true\` to force it.${parked ? " Also cancelled the queued prompt." : ""}`
         : `🟡 Cancel sent. If the turn doesn't stop shortly, use \`/seam cancel force:true\` to force it.${
             parked ? " Also cancelled the queued prompt." : ""
           }`
@@ -15180,13 +15190,22 @@ export class Orchestrator {
     const finishAdoption = (retainChild = false): void => {
       if (settled) return;
       settled = true;
+      const latest = this.store.turnAttempts.get(attempt.id);
+      const projection = latest?.state === "cancelled" && latest.generation === attempt.generation
+        ? projectAttemptCard(latest, attempt) : null;
+      // Cancellation wins before result adoption; settle this generation's card.
+      const cardSettlement = adoptedPanel && projection
+        ? this.awaitBoundedDispatchSettlement(attempt.id, "status-card-settle",
+            adoptedPanel.finalize(projection.state, projection.action))
+        : undefined;
       adoptedPanel?.stop();
       if (this.attemptStatusPanels.get(attempt.id) === adoptedPanel) this.attemptStatusPanels.delete(attempt.id);
       const retained = recoveryRuntime && recoveryRecord
         && this.router.releaseRecoveryRuntime(recoveryRecord.id, recoveryRuntime, retainChild);
       this.remoteAdoptionFinishers.delete(attempt.id);
       if (!retained) child.detach();
-      settle();
+      if (cardSettlement) this.trackContinuation(cardSettlement.then(() => settle()));
+      else settle();
     };
     this.remoteAdoptionFinishers.set(attempt.id, finishAdoption);
 

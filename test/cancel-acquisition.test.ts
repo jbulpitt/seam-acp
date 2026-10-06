@@ -1,5 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { savedSessionHost, SAVED_SESSION } from "./helpers/saved-session-recovery.js";
+import { AgentRuntime } from "../packages/core/src/agents/agent-runtime.js";
+import { pino } from "pino";
+import type { AgentProfile } from "@seam/adapters";
 
 const cleanups: (() => Promise<void>)[] = [];
 afterEach(async () => {
@@ -45,6 +48,45 @@ function cancelInteraction(channelId: string, force = false, ack = Promise.resol
 }
 
 describe("cancel the acquisition owner", () => {
+  it("reports an unconfirmed cancel with its timeout cause instead of saying Cancel sent", async () => {
+    const h = await setup();
+    h.host.store.turnAttempts.bind(h.attempt, SAVED_SESSION);
+    h.host.store.turnAttempts.startPrompt(h.attempt);
+    vi.spyOn(h.router, "abortTurn").mockResolvedValue("unacknowledged");
+    const interaction = cancelInteraction(h.host.record.channelRef);
+    await h.orch.handleSlashInteraction(interaction as never);
+    const reply = String((interaction.editReply.mock.calls as any[]).at(-1)?.[0]?.content);
+    expect(reply).toMatch(/not confirmed/i);
+    expect(reply).toMatch(/(?:2000ms|2s|2 seconds)/);
+    expect(reply).not.toContain("Cancel sent.");
+    expect(reply).toContain("/seam cancel force:true");
+  });
+
+  it("propagates the actual cancel send failure and reports its cause", async () => {
+    const h = await setup();
+    h.host.store.turnAttempts.bind(h.attempt, SAVED_SESSION);
+    h.host.store.turnAttempts.startPrompt(h.attempt);
+    const failure = Object.assign(new Error("synthetic cancel pipe closed"), { code: "EPIPE" });
+    const runtime = new AgentRuntime({ profile: { id: "codex" } as AgentProfile,
+      logger: pino({ level: "silent" }) as any,
+      spawnFn: () => { throw new Error("provider spawning forbidden"); } });
+    Object.assign(runtime, { sessionId: SAVED_SESSION, promptInFlight: true,
+      connection: { cancel: vi.fn(async () => { throw failure; }) } });
+    (h.router as any).runtimes.set(h.host.record.id, runtime);
+    try {
+      await expect(runtime.cancel()).rejects.toBe(failure);
+      const interaction = cancelInteraction(h.host.record.channelRef);
+      await h.orch.handleSlashInteraction(interaction as never);
+      const reply = String((interaction.editReply.mock.calls as any[]).at(-1)?.[0]?.content);
+      expect(reply).toContain(failure.message);
+      expect(reply).toMatch(/not confirmed/i);
+      expect(reply).not.toContain("Cancel sent.");
+      expect(reply).toContain("/seam cancel force:true");
+    } finally {
+      (h.router as any).runtimes.delete(h.host.record.id);
+    }
+  });
+
   it.each([false, true])("cancels backoff with no later loads (force=%s), before the ACK round trip", async force => {
     const backoff = deferred();
     const entered = deferred();

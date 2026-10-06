@@ -22,7 +22,7 @@ import { DEFAULT_GIF_REFRESH_MS } from "../packages/core/src/plugins/card-visual
 import { buildSlashRegistrationBody } from "../packages/core/src/platforms/discord/commands.js";
 import { buildSeamHelpPages } from "../packages/core/src/platforms/discord/help-text.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
-import { visualConfig } from "./plugin-card-visuals-fixture.js";
+import { visualConfig, visualPort } from "./plugin-card-visuals-fixture.js";
 
 const THREAD = "333333333333333333";
 const PARENT = "111111111111111111";
@@ -194,7 +194,7 @@ describe("card-visuals built-in", () => {
     const host = new PluginHost(logger);
     cleanups.push(() => host.dispose());
     const bad: Plugin = { id: "bad-key", apiVersion: 1, builtin: true, contributions: { configKeys: [{ key: "bad", schema: z.boolean(), defaultValue: "wrong", description: "Bad default" }] } };
-    await host.loadBuiltins([{ id: "bad-key", load: async () => bad }, { id: "card-visuals", load: async () => createCardVisualsPlugin({ read: () => undefined, write: () => ({ ok: true }) }) },
+    await host.loadBuiltins([{ id: "bad-key", load: async () => bad }, { id: "card-visuals", load: async () => createCardVisualsPlugin(visualPort) },
       { id: "healthy", load: async () => ({ id: "healthy", apiVersion: 1, builtin: true, contributions: { fences: [{ tag: "healthy", instruction: "still available", handle: async () => {} }] } }) }], { "card-visuals": { ...visualConfig, BRAND_ICON_BASE_URL: "not a URL" } });
     expect(host.configKeys.list()).toEqual([]);
     expect(host.statusCards.decorate({ state: "Working", model: "test", agentId: "codex", style: "simple", gifOn: true })).toEqual({});

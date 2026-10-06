@@ -109,6 +109,8 @@ export interface ChannelPresetPins {
   effort?: string | null;
   role?: string;
   disableThreadPrefix?: boolean;
+  statusCardStyle?: StatusCardStyle;
+  simpleCardGif?: boolean;
 }
 
 /** Draft overlay. `null` means inherit (remove the thread overlay / session policy). */
@@ -141,6 +143,7 @@ export interface DraftOverlay {
 }
 
 export interface ThreadConfigDraft {
+  channelOnly?: boolean;
   id: string;
   threadId: string;
   parentRef?: string;
@@ -231,7 +234,7 @@ export function snapshotFromDescribe(
 }
 
 export function editScopeOf(draft: ThreadConfigDraft): ConfigEditorScope {
-  return draft.editScope === "channel" ? "channel" : "thread";
+  return draft.channelOnly || draft.editScope === "channel" ? "channel" : "thread";
 }
 
 export function effectiveAfterDraft(draft: ThreadConfigDraft): {
@@ -285,7 +288,6 @@ function effectiveCardStyle(draft: ThreadConfigDraft): StatusCardStyle {
   const w = s.withoutThread;
   if (o.statusCardStyle != null) return o.statusCardStyle;
   if (o.statusCardStyle === null) {
-    if (s.statusCardStyle.source === "thread preset") return s.statusCardStyle.value;
     return o.channelStatusCardStyle ?? w.statusCardStyle;
   }
   if (
@@ -303,7 +305,6 @@ function effectiveGif(draft: ThreadConfigDraft): boolean {
   const w = s.withoutThread;
   if (o.simpleCardGif != null) return o.simpleCardGif;
   if (o.simpleCardGif === null) {
-    if (s.simpleCardGif.source === "thread preset") return s.simpleCardGif.value;
     return o.channelSimpleCardGif ?? w.simpleCardGif;
   }
   if (
@@ -414,7 +415,7 @@ export function riderTooLong(draft: ThreadConfigDraft): boolean {
 }
 
 function threadOverlayValue<T>(setting: ResolvedSetting<T>): T | undefined {
-  return setting.source === "thread preset" ? setting.value : undefined;
+  return setting.source === "thread preset" || setting.source === "session config" ? setting.value : undefined;
 }
 
 export function dirtyThreadPresetChanges(draft: ThreadConfigDraft): ThreadPresetChanges {
@@ -434,22 +435,22 @@ export function dirtyThreadPresetChanges(draft: ThreadConfigDraft): ThreadPreset
   if (o.agent !== undefined) {
     const current = threadOverlayValue(s.agent) ?? null;
     const next = o.agent;
-    if (next !== current) changes.agent = next;
+    if (next === null || next !== current) changes.agent = next;
   }
   if (o.model !== undefined) {
     const current = threadOverlayValue(s.model) ?? null;
     const next = o.model;
-    if (next !== current) changes.model = next;
+    if (next === null || next !== current) changes.model = next;
   }
   if (o.effort !== undefined) {
     const current = threadOverlayValue(s.effort) ?? null;
     const next = o.effort;
-    if (next !== current) changes.effort = next;
+    if (next === null || next !== current) changes.effort = next;
   }
   if (o.cwd !== undefined) {
     const current = threadOverlayValue(s.cwd) ?? null;
     const next = o.cwd;
-    if (next !== current) changes.cwd = next;
+    if (next === null || next !== current) changes.cwd = next;
   }
   if (o.rider !== undefined) {
     const current = s.rider.thread ?? null;
@@ -459,12 +460,12 @@ export function dirtyThreadPresetChanges(draft: ThreadConfigDraft): ThreadPreset
   if (o.role !== undefined) {
     const current = threadOverlayValue(s.role) ?? null;
     const next = o.role;
-    if (next !== current) changes.role = next;
+    if (next === null || next !== current) changes.role = next;
   }
   if (o.disableThreadPrefix !== undefined) {
-    const current = threadOverlayValue(s.disableThreadPrefix) === true;
-    const next = o.disableThreadPrefix === true;
-    if (next !== current) changes.disableThreadPrefix = next;
+    const current = threadOverlayValue(s.disableThreadPrefix) ?? null;
+    const next = o.disableThreadPrefix;
+    if (next === null || next !== current) changes.disableThreadPrefix = next;
   }
   if (o.detached !== undefined) {
     const current = s.detached.value === true;
@@ -497,11 +498,11 @@ export function dirtyStatusCardStyle(
 ): StatusCardStyle | null | undefined {
   if (draft.overlay.statusCardStyle === undefined) return undefined;
   const current =
-    draft.snapshot.statusCardStyle.source === "session config"
+    draft.snapshot.statusCardStyle.source === "session config" || draft.snapshot.statusCardStyle.source === "thread preset"
       ? draft.snapshot.statusCardStyle.value
       : null;
   const next = draft.overlay.statusCardStyle;
-  if (next === current) return undefined;
+  if (next !== null && next === current) return undefined;
   return next;
 }
 
@@ -510,7 +511,7 @@ export function dirtyChannelStatusCardStyle(
   draft: ThreadConfigDraft
 ): StatusCardStyle | null | undefined {
   if (draft.overlay.channelStatusCardStyle === undefined) return undefined;
-  const current = draft.snapshot.withoutThread.statusCardStyle;
+  const current = draft.snapshot.channelPins.statusCardStyle ?? null;
   const next = draft.overlay.channelStatusCardStyle;
   if (next === current) return undefined;
   return next;
@@ -521,11 +522,11 @@ export function dirtySimpleCardGif(
 ): boolean | null | undefined {
   if (draft.overlay.simpleCardGif === undefined) return undefined;
   const current =
-    draft.snapshot.simpleCardGif.source === "session config"
+    draft.snapshot.simpleCardGif.source === "session config" || draft.snapshot.simpleCardGif.source === "thread preset"
       ? draft.snapshot.simpleCardGif.value
       : null;
   const next = draft.overlay.simpleCardGif;
-  if (next === current) return undefined;
+  if (next !== null && next === current) return undefined;
   return next;
 }
 
@@ -533,7 +534,7 @@ export function dirtyChannelSimpleCardGif(
   draft: ThreadConfigDraft
 ): boolean | null | undefined {
   if (draft.overlay.channelSimpleCardGif === undefined) return undefined;
-  const current = draft.snapshot.withoutThread.simpleCardGif;
+  const current = draft.snapshot.channelPins.simpleCardGif ?? null;
   const next = draft.overlay.channelSimpleCardGif;
   if (next === current) return undefined;
   return next;
@@ -681,7 +682,7 @@ export function renderHub(
 
   const scope = editScopeOf(draft);
   const channelScope = scope === "channel";
-  const showScope = ctx.canEditChannel !== false && !!draft.parentRef;
+  const showScope = !draft.channelOnly && ctx.canEditChannel !== false && !!draft.parentRef;
   const pins = s.channelPins ?? {};
   const threadOnlyDisabled = channelScope;
 
@@ -1242,11 +1243,17 @@ export function applyPickerValue(
       if (channelScope) {
         // Channel presets pin an agent id only; location stays per-thread.
         overlay.channelAgent = inherit ? null : value.includes("@") ? value.slice(0, value.lastIndexOf("@")) : value;
+        if (inherit || overlay.channelAgent !== (draft.snapshot.channelPins.agent ?? draft.snapshot.withoutThread.agent)) {
+          overlay.channelModel = null;
+          overlay.channelEffort = null;
+        }
         break;
       }
       if (inherit) {
         overlay.agent = null;
         overlay.location = null;
+        overlay.model = null;
+        overlay.effort = null;
         break;
       }
       const at = value.lastIndexOf("@");
@@ -1293,7 +1300,7 @@ export function applyPickerValue(
       break;
     }
     case "prefix": {
-      const disabled = value === "disabled";
+      const disabled = inherit ? null : value === "disabled";
       if (channelScope) overlay.channelDisableThreadPrefix = disabled;
       else overlay.disableThreadPrefix = disabled;
       break;
@@ -1373,9 +1380,9 @@ export function buildSavePlan(draft: ThreadConfigDraft): ConfigEditorSavePlan {
   const perm = dirtyPermission(draft);
   if (perm !== undefined) plan.permission = perm;
   const card = dirtyStatusCardStyle(draft);
-  if (card !== undefined) plan.statusCardStyle = card;
+  if (card !== undefined) { plan.statusCardStyle = card; plan.threadPreset.statusCardStyle = card; }
   const gif = dirtySimpleCardGif(draft);
-  if (gif !== undefined) plan.simpleCardGif = gif;
+  if (gif !== undefined) { plan.simpleCardGif = gif; plan.threadPreset.simpleCardGif = gif; }
   const channelCard = dirtyChannelStatusCardStyle(draft);
   const channelGif = dirtyChannelSimpleCardGif(draft);
   const channelRider = dirtyChannelRider(draft);

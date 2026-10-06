@@ -9,6 +9,7 @@ export function configSetRequest(options: ConfigInteraction["options"]): ConfigS
     CONFIG_SET_FIELD_NAMES.map((name) => [name, options.getString(name)])
   ) as Record<ConfigSetFieldName, string | null>;
   return {
+    scope: options.getString("scope"),
     json: options.getString("json"),
     rebuild: options.getBoolean("rebuild") === true,
     values,
@@ -31,6 +32,7 @@ export async function saveConfigEditorCard(draft: ThreadConfigDraft, evt: Compon
   saveEditor: ConfigUiPorts["saveEditor"];
   deleteDraft(id: string): unknown;
   editCard(channel: ChannelRef, message: string, panel: ReturnType<typeof renderHub>): Promise<void>;
+  channelSaved?(draft: ThreadConfigDraft): Promise<void>;
 }): Promise<void> {
   // D10: Save does not abort a live turn; runtime changes wait for its next turn.
   const saved = await ports.saveEditor(draft, { id: evt.userId, name: evt.userName });
@@ -64,4 +66,5 @@ export async function saveConfigEditorCard(draft: ThreadConfigDraft, evt: Compon
     await evt.followUpEphemeral(fastRetireFailed ? fastRefusal : `⚡ ${fastRefusal}`)
       .catch(() => {});
   }
+  await ports.channelSaved?.(draft);
 }

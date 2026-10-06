@@ -96,6 +96,9 @@ export interface ChatAdapter {
   /** Resolve a bare channel id, including its thread parent. */
   resolveChannel?(channel: ChannelRef): Promise<ChannelRef>;
 
+  /** Explicit admin cleanup inventory, never used at boot or for admission. */
+  configParentChannels?(): Promise<Array<{ id: string; name: string; guildId: string; guildName: string }>>;
+
   /**
    * Optional: upload a file to the channel. Required for the agent → Discord
    * file path. Implementations may also send caption text alongside the file.

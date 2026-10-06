@@ -998,6 +998,14 @@ export class SessionStore {
       .map(mapRow);
   }
 
+  /** Explicit parent-config cleanup only; does not touch provider processes. */
+  removeMisfiledSession(id: string, audit: ConfigAuditInput): void {
+    this.db.transaction(() => {
+      this.db.prepare("DELETE FROM sessions WHERE id = ?").run(id);
+      this.recordConfigMutation(audit);
+    })();
+  }
+
   agyIdentityRestored(): boolean {
     return !!this.db.prepare("SELECT 1 FROM agy_identity_restore WHERE id = '@complete'").get();
   }

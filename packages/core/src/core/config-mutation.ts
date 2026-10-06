@@ -972,7 +972,14 @@ export class ConfigMutationService {
     }
   }
 
-  /** Snapshot one thread's persisted overlay entry (file JSON, not live defaults). */
+  /** Read the persisted document, preserving lookup failures. */
+  readPresetsSnapshot(): { channels?: Record<string, unknown>; threads?: Record<string, unknown> } {
+    const loaded = this.readPresetsDoc();
+    if (!loaded.ok) throw new Error(loaded.error);
+    return JSON.parse(JSON.stringify(loaded.doc));
+  }
+
+  /** Snapshot a thread overlay, without materializing boot defaults. */
   readThreadPresetEntry(threadId: string): unknown | undefined {
     const loaded = this.readPresetsDoc();
     if (!loaded.ok) return undefined;

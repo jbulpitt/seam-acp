@@ -342,9 +342,9 @@ describe("/seamadmin — operator surface (#151)", () => {
     expect(() => buildSeamAdminCommand().toJSON()).not.toThrow();
   });
 
-  it("registers exactly 14 top-level slots (4 subcommands + 10 groups)", () => {
+  it("registers exactly 15 top-level slots (5 subcommands + 10 groups)", () => {
     const json = admin();
-    expect(json.options?.length ?? 0).toBe(14);
+    expect(json.options?.length ?? 0).toBe(15);
     expect(json.options?.length ?? 0).toBeLessThanOrEqual(25);
   });
 
@@ -368,6 +368,7 @@ describe("/seamadmin — operator surface (#151)", () => {
       "restrictions",
       "naming",
       "schedule",
+      "config-cleanup",
     ]);
   });
 

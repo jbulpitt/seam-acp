@@ -58,6 +58,31 @@ before handler work, including plugin preparation. Handlers use
 and report the actual result or underlying error; do not add handler-local
 defers. Autocomplete keeps its separate three-second response budget.
 
+### Channel defaults and thread overrides
+
+`agent`, `model`, `effort`, `repo`, `role`, `card`, `gif`, `set` and `edit`
+offer `scope:thread` (this thread) and `scope:channel` (channel default).
+In a parent channel they always target that channel's defaults, not its category,
+and do not create a session. Session JSON, permissions and rebuild are not
+channel-default settings. Resolution is the router's existing thread override →
+channel default → global default, with provenance shown in the editor and replies.
+
+Agent/model/effort pickers offer **Use channel default**. `inherit` clears a
+named thread override; bulk `effort:default`, `role:auto`, `card:default` and
+`gif:default` do the same. Clearing also removes its legacy session mirror.
+Channel-default edits report counts of overrides on bound threads. Existing
+overrides remain untouched unless the user confirms **Use channel defaults**;
+that action clears only the edited fields and transitions at the next acquisition.
+
+`/seamadmin config-cleanup` is an explicit dry-run of misfiled parent session
+rows and `threads` entries. It lists their guild/channel, fields to move,
+existing channel fields to preserve and override counts. **Leave unchanged**
+does nothing; **Confirm: apply this preview** moves only missing channel fields
+and removes the listed misfiled rows/entries, with an audit before-image.
+A changed preview requires a new confirmation. Re-running after cleanup reports
+zero affected rows. Nothing runs at boot, and ordinary thread overrides are
+never removed by cleanup.
+
 **Top-level (3):** `rebuild` `compact-thread` `recover`
 
 `/seamadmin rebuild` is deterministic Discord reconstruction (no summarizer; one destination seed turn that may consume up to 60% of the destination context window). `/seamadmin compact-thread` is the former model-assisted rebuild. `Premium Compact (Discord)` remains the AGY fan-out pipeline. `/seam config reset` starts a blank session with no history.

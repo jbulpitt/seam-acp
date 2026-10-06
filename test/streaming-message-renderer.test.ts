@@ -14,6 +14,71 @@ function collector() {
 }
 
 describe("StreamingMessageRenderer (real FenceStream + splitForFlush + SerialQueue)", () => {
+  it("logs a failed progressive send once and retains it for the terminal drain", async () => {
+    const { sent, send } = collector();
+    const error = Object.assign(new Error("Missing Access"), { code: 50001 });
+    const sink = vi.fn(send).mockRejectedValueOnce(error);
+    const logger = { warn: vi.fn() };
+    const r = new StreamingMessageRenderer(sink, { logger });
+    const paragraph = "a".repeat(900);
+    r.feed(`${paragraph}\n\n`);
+    await r.whenIdle();
+    expect(sent).toEqual([]);
+    expect(r.sentCount).toBe(0);
+    expect(logger.warn).toHaveBeenCalledExactlyOnceWith({ err: error, chars: paragraph.length },
+      "assistant text send failed");
+    r.feed("Closing reply.");
+    await r.finalize();
+    expect(sent).toEqual([paragraph, "Closing reply."]);
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+  });
+
+  it("retains a failed snapshot across flush without consuming it or the next feed", async () => {
+    const { sent, send } = collector();
+    const logger = { warn: vi.fn() };
+    const sink = vi.fn(send).mockRejectedValueOnce(new Error("Missing Permissions"));
+    const r = new StreamingMessageRenderer(sink, { logger });
+    r.feed("Before.");
+    await r.flush();
+    expect(sent).toEqual([]);
+    r.feed(" After.");
+    await r.finalize();
+    expect(sent).toEqual(["Before. After."]);
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not duplicate pending prose when a fence and more text arrive during its send", async () => {
+    const sent: string[] = [];
+    let release!: () => void;
+    let started!: () => void;
+    const pending = new Promise<void>(resolve => { release = resolve; });
+    const sending = new Promise<void>(resolve => { started = resolve; });
+    const r = new StreamingMessageRenderer(async text => {
+      if (sent.length === 0) { started(); await pending; }
+      sent.push(text);
+    });
+    const paragraph = "a".repeat(900);
+    r.feed(`${paragraph}\n\n`);
+    await sending;
+    r.feed("```ts\nconst x = 1;\n```\n\nAfter.");
+    release();
+    await r.finalize();
+    expect(sent.map(text => text.trim())).toEqual([paragraph, "```ts\nconst x = 1;\n```", "After."]);
+  });
+
+  it("logs nonempty text skipped after finalize with the existing reason", async () => {
+    const { sent, send } = collector();
+    const logger = { warn: vi.fn() };
+    const r = new StreamingMessageRenderer(send, { logger });
+    r.feed("First.");
+    await r.finalize();
+    r.feed("Late reply.");
+    r.feed("");
+    expect(sent).toEqual(["First."]);
+    expect(logger.warn).toHaveBeenCalledExactlyOnceWith({ chars: 11, reason: "the renderer was already finalized" },
+      "assistant text skipped");
+  });
+
   it("emits MULTIPLE messages at clean paragraph boundaries with linebreaks preserved", async () => {
     const { sent, send } = collector();
     const r = new StreamingMessageRenderer(send);
@@ -137,32 +202,6 @@ describe("StreamingMessageRenderer (real FenceStream + splitForFlush + SerialQue
     await r.finalize();
     expect(sent.length).toBe(after);
     expect(sent).toEqual(["hello world"]);
-  });
-
-  it("logs the real send error while preserving the rejected flush and the undelivered count", async () => {
-    const failure = Object.assign(new Error("Missing Access"), { code: 50001 });
-    const warn = vi.fn();
-    const r = new StreamingMessageRenderer(async () => { throw failure; }, { logger: { warn } });
-    r.feed("answer");
-    await r.whenIdle();
-    const drain = (r as unknown as { drainBuffer(force: boolean): Promise<void> }).drainBuffer(true);
-    await expect(drain).rejects.toBe(failure);
-    expect(r.sentCount).toBe(0);
-    expect(warn).toHaveBeenCalledWith({ err: failure, operation: "send", chars: 6 },
-      "assistant output delivery failed");
-    await r.finalize();
-  });
-
-  it("logs nonempty text discarded after finalization without publishing it", async () => {
-    const { sent, send } = collector();
-    const warn = vi.fn();
-    const r = new StreamingMessageRenderer(send, { logger: { warn } });
-    r.feed("answer");
-    await r.finalize();
-    r.feed("late answer");
-    expect(sent).toEqual(["answer"]);
-    expect(warn).toHaveBeenCalledWith({ chars: 11, reason: "the output renderer is finalized" },
-      "assistant output skipped");
   });
 
   it("force-closes a fence that blows past the size ceiling", async () => {

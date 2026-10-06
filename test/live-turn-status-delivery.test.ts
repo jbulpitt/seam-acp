@@ -29,7 +29,8 @@ afterEach(async () => {
   vi.restoreAllMocks();
 });
 
-function setup(mode: "held-status" | "failed-status" | "held-file" | "fast" = "fast") {
+function setup(mode: "held-status" | "failed-status" | "held-file" | "fast" = "fast",
+  logger = pino({ level: "silent" })) {
   vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
   const dir = mkdtempSync(path.join(tmpdir(), "seam-live-delivery-"));
   const store = new SessionStore(path.join(dir, "test.db"));
@@ -42,8 +43,6 @@ function setup(mode: "held-status" | "failed-status" | "held-file" | "fast" = "f
   let statusReleased = false;
   let run: Promise<void> | undefined;
   const pending: Promise<void>[] = [];
-  const logLines: Array<Record<string, any>> = [];
-  const logger = pino({ level: "info" }, { write: line => { logLines.push(JSON.parse(line)); } });
   const profile = { id: "claude", defaultModel: "fixture-model" } as AgentProfile;
   const runtime = new AgentRuntime({ profile, logger: logger as never,
     spawnFn: () => { throw new Error("provider spawning forbidden"); } });
@@ -128,7 +127,7 @@ function setup(mode: "held-status" | "failed-status" | "held-file" | "fast" = "f
     orch.stopSentinelWatcher();
     store.close(); rmSync(dir, { recursive: true, force: true });
   });
-  return { store, runtime, router, adapter, orch, prompt, messages, edits, feed, fileGate, releaseStatus, logLines,
+  return { store, runtime, router, adapter, orch, prompt, messages, edits, feed, fileGate, releaseStatus,
     statusStarted: statusStarted.promise, fileStarted: fileStarted.promise,
     heldStatus: () => heldStatus,
     run: () => {
@@ -144,40 +143,30 @@ function setup(mode: "held-status" | "failed-status" | "held-file" | "fast" = "f
 }
 
 describe("live-turn status and answer delivery", () => {
-  it("accounts for provider thoughts separately from the answer delivered to Discord", async () => {
-    const h = setup();
-    await h.run();
-
-    expect(h.messages).toEqual([ANSWER]);
-    expect(h.logLines.find(line => line.msg === "assistant output summary")).toMatchObject({
-      thread: "100", session: "discord:100", turn: "inbound-1",
-      textChars: ANSWER.length, thoughtChars: "thinkingfinal thinking".length,
-      deliveredSegments: 1, deliveredChars: ANSWER.length, failedSegments: 0,
-      thoughtDestination: "thinking excerpt",
-    });
-    expect(h.logLines.find(line => line.msg === "assistant output routed to thinking excerpt"))
-      .toMatchObject({ thread: "100", turn: "inbound-1",
-        reason: "agent-thought is status output, not assistant text" });
-  });
-
-  it("logs a failed answer send with its Discord cause and turn, without counting it as delivered", async () => {
-    const h = setup();
-    const failure = Object.assign(new Error("Missing Access"), { code: 50001 });
-    const send = h.adapter.sendMessage.getMockImplementation()!;
-    h.adapter.sendMessage.mockImplementation(async (channel, text) => {
-      if (text === ANSWER) throw failure;
-      return send(channel, text);
+  it("logs a failed background text send once and delivers its retained source at the end", async () => {
+    const logs: Array<Record<string, any>> = [];
+    const logger = pino({ level: "warn" }, { write: line => { logs.push(JSON.parse(line)); } });
+    const h = setup("fast", logger);
+    const paragraph = "a".repeat(900);
+    const error = Object.assign(new Error("Missing Access"), { code: 50001 });
+    h.adapter.sendMessage.mockRejectedValueOnce(error);
+    h.prompt.mockImplementationOnce(async () => {
+      await h.feed({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: `${paragraph}\n\n` } });
+      await flush();
+      expect(h.messages).toEqual([]);
+      await h.feed({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Closing reply." } });
+      return { stopReason: "end_turn" };
     });
     await h.run();
-
-    expect(h.messages).not.toContain(ANSWER);
-    expect(h.logLines.find(line => line.msg === "assistant output delivery failed")).toMatchObject({
-      level: 40, thread: "100", turn: "inbound-1", operation: "send", chars: ANSWER.length,
-      err: { message: "Missing Access", code: 50001 },
+    expect(h.messages).toEqual([paragraph, "Closing reply."]);
+    expect(h.store.turnAttempts.get("inbound-1")?.outcome).toMatchObject({
+      output: `${paragraph}\n\nClosing reply.`, status: "completed",
     });
-    expect(h.logLines.find(line => line.msg === "assistant output summary")).toMatchObject({
-      textChars: ANSWER.length, deliveredSegments: 0, failedSegments: 1, failedChars: ANSWER.length,
-    });
+    expect(logs.filter(log => log.msg === "assistant text send failed")).toEqual([
+      expect.objectContaining({ thread: "100", turn: "inbound-1", chars: paragraph.length,
+        err: expect.objectContaining({ message: "Missing Access", code: 50001 }) }),
+    ]);
+    expect(logs.filter(log => log.err?.message === error.message)).toHaveLength(1);
   });
 
   it("delivers and releases the turn while a >5 s status edit remains held, then survives queue recovery", async () => {

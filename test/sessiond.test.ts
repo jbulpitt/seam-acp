@@ -407,10 +407,18 @@ describe("#573 seam-sessiond control-plane restart", () => {
   });
 
   it("forgets slots that ended more than a day ago (#631)", async () => {
-    const { server, client } = await harness();
+    const { server, client, statePath } = await harness();
     await client.spawn({ slot: 33, executable: process.execPath, args: ["-e", "process.exit(0)"],
       cwd: process.cwd(), env: { PATH: process.env.PATH ?? "" } });
     await waitForAsync(async () => (await listedDead(client, 33)) || undefined);
+    const state = JSON.parse(await fs.readFile(statePath, "utf8")) as { slots: Array<{ slot: number; identity: { pid: number } }> };
+    const holderPid = state.slots.find(row => row.slot === 33)!.identity.pid;
+    const replay = await client.replayOutput({ slot: 33, afterSeq: 0 });
+    const exit = replay.frames.find(frame => frame.stream === "exit");
+    expect(exit).toBeDefined();
+    // Deliver the exit before artificially ageing its retained entry.
+    await client.ack({ slot: 33, throughSeq: exit!.seq });
+    await waitFor(() => readSessiondProcessIdentity(holderPid) ? undefined : true);
     const internals = server as unknown as { pruneExited(now: number): void };
     internals.pruneExited(Date.now());
     expect((await client.listSlots()).slots).toEqual([33]);

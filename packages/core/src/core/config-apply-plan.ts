@@ -583,14 +583,20 @@ export class ConfigApplyPlan {
         const result = this.applyThreadOverlay({ threadId: channel.id, parentRef: channel.parentId, changes: prepared.changes, actor });
         if (!result.ok && !result.error.includes("No effective change")) throw new Error(result.error);
         let current = this.clearLegacyOverrides(source, prepared.changes);
-        if (prepared.permission) {
+        const changes = prepared.changes;
+        if (prepared.permission || changes.role != null || changes.statusCardStyle != null || changes.simpleCardGif != null) {
           const cfg = this.store.readConfig(current);
-          cfg.permissionPolicy = prepared.permission;
-          delete cfg.autoApprovePermissions;
+          if (changes.role != null) cfg.role = changes.role;
+          if (changes.statusCardStyle != null) cfg.statusCardStyle = changes.statusCardStyle;
+          if (changes.simpleCardGif != null) cfg.simpleCardGif = changes.simpleCardGif;
+          if (prepared.permission) {
+            cfg.permissionPolicy = prepared.permission;
+            delete cfg.autoApprovePermissions;
+          }
           this.persistConfig(current, cfg);
           current = this.store.get(record.id) ?? current;
-          await this.runtime.applyPermissionMode(current);
         }
+        if (prepared.permission) await this.runtime.applyPermissionMode(current);
         await this.runtime.applySavedSelection(current, before);
         if (opts.applyName) await this.identityEffects.flush(record.id);
         const committed = this.store.get(record.id) ?? current;

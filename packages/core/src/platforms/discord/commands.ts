@@ -290,7 +290,7 @@ export function buildSeamCommand(): SlashCommandBuilder {
           )
       )
       .addSubcommand((sub) =>
-        addConfigScope(declareAccess(sub, { kind: "mutating" }, "ephemeral"))
+        addConfigScope(declareAccess(sub, { kind: "mutating" }, "ephemeral")
           .setName("repo")
           .setDescription("Set the working repo for this thread")
           .addStringOption((o) =>
@@ -299,7 +299,7 @@ export function buildSeamCommand(): SlashCommandBuilder {
               .setDescription("Path under REPOS_ROOT (or absolute). Omit to open a picker.")
               .setRequired(false)
               .setAutocomplete(true)
-          )
+          ))
       )
       .addSubcommand((sub) =>
         declareAccess(sub, { kind: "mutating" }, "ephemeral")

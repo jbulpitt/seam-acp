@@ -1129,6 +1129,7 @@ function saveHarness(opts: {
   };
 
   const orch = {
+    config: { REPOS_ROOT: "/repo", channelPresets: new Map(), threadPresets: new Map() },
     store: {
       getByChannel: () => rec,
       get: () => rec,

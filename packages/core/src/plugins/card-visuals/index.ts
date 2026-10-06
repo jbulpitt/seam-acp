@@ -26,7 +26,7 @@ export interface CardVisualsPort {
 const schema = z.object({ SIMPLE_CARD_GIF_MANIFEST_URL: z.string().url().optional(), BRAND_ICON_BASE_URL: z.string().url().optional() });
 const group = { name: "config", description: "Session and bot configuration" };
 const scopeOption = { type: Option.String as const, name: "scope", description: "This thread or channel default; parent commands use channel default",
-  choices: [{ name: "This thread", value: "thread" }, { name: "Channel default", value: "channel" }] };
+  choices: [{ name: "This thread", value: "thread" }, { name: "Session override", value: "session" }, { name: "Channel default", value: "channel" }] };
 
 /** Built-in-only config facade. It never receives sessions or the router. */
 export function createCardVisualsPlugin(port: CardVisualsPort): Plugin {
@@ -47,20 +47,21 @@ export function createCardVisualsPlugin(port: CardVisualsPort): Plugin {
       help: `/seam config ${kind} [${option}] [scope] — ${CARD_VISUAL_KEYS.find(entry => entry.key === key)!.description}`,
       handle: async invocation => {
         const channel: ChannelRef = { platform: "discord", id: invocation.threadId, ...(invocation.parentId ? { parentId: invocation.parentId } : {}) };
-        const target = configTarget(channel, invocation.string("scope"));
-        const scope = target.kind;
+        const requestedScope = invocation.string("scope");
+        const target = configTarget(channel, requestedScope);
+        const scope: Scope = target.kind === "thread" && requestedScope === "session" ? "session" : target.kind;
         const current = port.read(channel, scope);
         const value = invocation.string(option);
         const resolved = kind === "card" ? current.style : current.gif;
         const label = kind === "card" ? "Status card" : "Simple-card GIF";
         const display = (v: unknown) => typeof v === "boolean" ? v ? "on" : "off" : String(v);
-        if (value == null) return invocation.reply(`${label}: \`${display(resolved.value)}\` (from ${resolved.source}). Set with \`/seam config ${kind} ${option}:${choices.join("|")} [scope:thread|channel]\`.`);
+        if (value == null) return invocation.reply(`${label}: \`${display(resolved.value)}\` (from ${resolved.source}). Set with \`/seam config ${kind} ${option}:${choices.join("|")} [scope:session|thread|channel]\`.`);
         if (!choices.includes(value)) return invocation.reply(kind === "card" ? "Style must be `full` or `simple`." : "State must be `on` or `off`.");
         const written = port.write(channel, scope, key, value === "default" ? null : kind === "card" ? value : value === "on", invocation.actor);
         if (!written.ok) return invocation.reply(written.error);
         const effective = port.read(channel, scope);
         const after = kind === "card" ? effective.style : effective.gif;
-        await invocation.reply(`${scope === "channel" ? "Channel default" : "Thread"} ${label.toLowerCase()}: \`${display(after.value)}\` (from ${after.source}). Applies on the next turn.` +
+        await invocation.reply(`${scope === "channel" ? "Channel default" : scope === "session" ? "Session" : "Thread"} ${label.toLowerCase()}: \`${display(after.value)}\` (from ${after.source}). Applies on the next turn.` +
           (scope === "channel" ? ` Thread overrides: ${formatOverrideCounts(port.overrides(target.id))}.` : ""));
         if (scope === "channel") await port.offer(channel, invocation.actor, key);
       },

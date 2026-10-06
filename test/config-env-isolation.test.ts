@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { mkdtempSync, writeFileSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -35,6 +35,15 @@ describe("non-live config isolation under real dotenv files", () => {
         // inherited. PATH is operational only; HOME is another disposable path.
         env: { PATH: process.env.PATH, HOME: cwd, CI: "true", SEAM_495_DOTENV_SENTINEL: "inherited-wrong-value",
           SEAM_620_OPERATOR_ONLY: "shell-only", AGY_PIN: "unpinned" },
+      }).catch(err => {
+        // Keep child failures visible before its report is removed.
+        if (existsSync(report)) {
+          const summary = JSON.parse(readFileSync(report, "utf8"));
+          console.error(summary.testResults.flatMap((file: any) => file.assertionResults
+            .filter((test: any) => test.status === "failed")
+            .map((test: any) => ({ name: test.fullName, errors: test.failureMessages }))));
+        } else console.error(err.stderr);
+        throw err;
       });
       const summary = JSON.parse(readFileSync(report, "utf8"));
       const failures = summary.testResults.flatMap((file: any) => file.assertionResults

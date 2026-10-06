@@ -23,6 +23,12 @@ export function installCardVisuals(deps: {
       write: (channel, scope, key, value, actor) => {
         const target = configTarget(channel, scope);
         const changes = { [key]: value };
+        if (target.kind === "thread" && scope === "session") {
+          const record = deps.router.ensureSessionRecord({ platform: channel.platform, channelRef: channel.id,
+            parentRef: target.parentRef, cwd: deps.config.REPOS_ROOT });
+          const result = deps.mutation.applySessionConfig(record, changes, actor);
+          return !result.ok && !result.error.includes("No effective change") ? result : { ok: true };
+        }
         const result = target.kind === "channel"
           ? deps.mutation.applyChannelOverlay({ channelId: target.id, changes, actor })
           : deps.mutation.applyThreadOverlay({ threadId: target.id, parentRef: target.parentRef, changes, actor });

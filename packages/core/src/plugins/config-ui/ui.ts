@@ -81,6 +81,8 @@ export class ConfigUi {
     const fields = Object.keys(prepared.prepared.changes) as ConfigDefaultField[];
     const heading = request.supplied.length === 1 && request.supplied[0] === "repo"
       ? prepared.prepared.changes.cwd === null ? "Channel repo overlay cleared" : `Channel repo set to \`${this.ports.repoDisplay(applied.effective.cwd.value)}\``
+      : request.supplied.length === 1 && request.supplied[0] === "role"
+        ? `${prepared.prepared.changes.role ? `Role set to \`${prepared.prepared.changes.role}\`` : "Role cleared"}. Channel default updated`
       : "Channel default updated";
     await i.reply(`${heading}. Effective: ${configSetSummary(applied.effective, this.ports.repoDisplay)}. Thread overrides: ${formatOverrideCounts(this.ports.overrideCounts(target.id, fields))}.`);
     await this.offerFollowChannel(channel, i.user, fields);

@@ -187,6 +187,17 @@ describe("configuration scope through the real dispatcher", () => {
     expect(h.store.get(row.id)).toEqual(before);
   });
 
+  it.each([["card", "style", "full", "statusCardStyle", "full"], ["gif", "state", "off", "simpleCardGif", false]] as const)
+    ("parent %s with legacy session scope still writes only channel defaults", async (sub, option, value, field, expected) => {
+      const h = await fixture();
+      const i = await h.slash(sub, { [option]: value, scope: "session" }, false, CATEGORY);
+      expect(i.deferReply).toHaveBeenCalledTimes(1);
+      expect(h.config.channelPresets.get(PARENT)?.[field]?.value).toBe(expected);
+      expect(h.config.channelPresets.has(CATEGORY)).toBe(false);
+      expect(h.store.listSessionsUncapped()).toEqual([]);
+      expect(h.config.threadPresets.size).toBe(0);
+    });
+
   it("confirmed apply clears just the requested pins and legacy mirrors", async () => {
     const h = await fixture();
     const row = h.row();

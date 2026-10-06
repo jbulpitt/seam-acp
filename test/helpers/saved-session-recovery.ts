@@ -29,6 +29,7 @@ export async function savedSessionHost(options: {
   legacy?: boolean;
   oldAuthDisarm?: boolean;
   authFailure?: boolean;
+  writerLock?: boolean;
   recoverySleep?: (ms: number) => Promise<void>;
 } = {}) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "seam-797-"));
@@ -99,6 +100,7 @@ export async function savedSessionHost(options: {
       ...(options.loadGate ? { FAKE_AGENT_LOAD_GATE: path.join(root, "load.release") } : {}),
       ...(options.newGate ? { FAKE_AGENT_NEW_GATE: path.join(root, "new.release") } : {}),
       FAKE_AGENT_AUTH_FAILURE: authFailure,
+      ...(options.writerLock ? { FAKE_AGENT_WRITER_LOCK: path.join(root, "session.writer") } : {}),
       ...(options.sessionGone ? { FAKE_AGENT_MISSING_SESSION: SAVED_SESSION } : {}) },
     onFrame: frame => socket.deliver(frame), onStderr: () => {} });
   const mux = makeMux({ id: "fixture" });

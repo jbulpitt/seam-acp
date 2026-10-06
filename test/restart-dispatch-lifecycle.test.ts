@@ -80,6 +80,29 @@ function setup() {
 }
 
 describe("#250 production dispatch lifecycle (synthetic transport, no providers)", () => {
+  it("manually resumes an owned unstarted dispatch with the original brief exactly once", async () => {
+    const h = setup();
+    const boot = (h.orch as any).attemptBoot;
+    h.store.turnAttempts.registerOwner(boot);
+    const attempt = h.store.turnAttempts.claim(h.spec, executionIdentity({ agentId: "codex",
+      location: "local", session: "live", model: "default", effort: null, cwd: "/synthetic", config: "{}" }), boot);
+    h.store.turnAttempts.markStalled(attempt.id, "session load temporarily unavailable");
+    h.runtime.prompt.mockImplementation(async text => {
+      expect(text).toContain("original work");
+      expect(text).not.toMatch(/^continue\n/);
+      expect(h.store.turnAttempts.get(attempt.id)).toMatchObject({ promptStarted: true, acpSessionId: "recorded-acp" });
+      return { stopReason: "end_turn" };
+    });
+    expect(await h.orch.resumeTurnManually(attempt.id)).toContain("Continuation requested");
+    await h.watcher.start();
+    await h.watcher.drain();
+    await h.watcher.tick();
+    expect(h.runtime.prompt).toHaveBeenCalledOnce();
+    expect(h.store.turnAttempts.get(attempt.id)).toMatchObject({ state: "completed", promptStarted: true, generation: 2 });
+    expect(await h.orch.resumeTurnManually(attempt.id)).toContain("No interrupted/abandoned turn");
+    expect(h.runtime.prompt).toHaveBeenCalledOnce();
+  });
+
   it.each([false, true])("#355 stalled recorded conversation auto-continues without a notice (old notice delivered=%s)", async delivered => {
     const h = setup();
     h.spec.id = delivered ? "11ac5c69-7785-4e84-bee5-110a86e8af76" : "0a98091b-00e8-44f7-8515-8b3c2c6d71d0";
@@ -114,14 +137,14 @@ describe("#250 production dispatch lifecycle (synthetic transport, no providers)
     ]);
     expect(h.store.turnAttempts.get(h.spec.id)?.state).toBe("completed");
     expect(notice).not.toHaveBeenCalled();
-    expect(h.adapter.sendMessage.mock.calls.some(([, text]) => text?.includes("could not resume"))).toBe(false);
+    expect(h.adapter.sendMessage.mock.calls.some(([, text]) => text?.includes("is parked:"))).toBe(false);
   });
 
-  it.each(["never-prompted", "missing-session", "identity-drift", "unreadable-owner"] as const)(
+  it.each(["legacy-unclaimed", "missing-session", "identity-drift", "unreadable-owner"] as const)(
     "#355 unresolved %s stays quarantined and names the uncertainty", async fault => {
       const h = setup();
       simulateRetiredOwnerProcess();
-      if (fault === "never-prompted") {
+      if (fault === "legacy-unclaimed") {
         // Unsafe evidence must stay quarantined even when its host is absent;
         // the host wait/expiry path must not silently abandon it first.
         h.spec.location = "unavailable-bridge";
@@ -149,14 +172,14 @@ describe("#250 production dispatch lifecycle (synthetic transport, no providers)
       expect(h.runtime.prompt).not.toHaveBeenCalled();
       expect(h.store.turnAttempts.get(h.spec.id)).toMatchObject({ state: "suspended",
         generation: before.generation, stalledUtc: before.stalledUtc, stallNoticeUtc: expect.any(String) });
-      const reason = { "never-prompted": "never started a prompt", "missing-session": "no ACP session id",
+      const reason = { "legacy-unclaimed": "this legacy turn has no recorded execution", "missing-session": "no ACP session id",
         "identity-drift": "thread switched from codex to claude", "unreadable-owner": "owner registration is missing or unreadable" }[fault];
       expect(h.store.turnAttempts.get(h.spec.id)?.stalledReason).toContain(reason);
-      const notices = h.adapter.sendMessage.mock.calls.filter(([, text]) => text?.includes("could not resume"));
+      const notices = h.adapter.sendMessage.mock.calls.filter(([, text]) => text?.includes("is parked:"));
       expect(notices).toHaveLength(1);
       expect(notices[0]?.[1]).toContain(reason);
       expect(notices[0]?.[1]).not.toContain("Use `/seam workflows` to resume or abandon");
-      if (fault === "never-prompted" || fault === "missing-session") {
+      if (fault === "legacy-unclaimed" || fault === "missing-session") {
         expect(await next.resumeTurnManually(h.spec.id)).toContain(reason);
       }
     });

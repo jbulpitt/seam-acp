@@ -935,7 +935,7 @@ describe("workflows inventory", () => {
     const rows = await (orch as any).collectInterruptedRows("thread-worker");
     expect(rows.map((row: any) => row.id)).toEqual(["new", "old"]);
     expect(rows.map((row: any) => row.actions)).toEqual([["abandon"], ["abandon"]]);
-    expect(await orch.resumeTurnManually("new")).toMatch(/no identity-bound execution/);
+    expect(await orch.resumeTurnManually("new")).toMatch(/no recorded execution/);
     expect(store.getDelegation("new-resume")).toBeNull();
     await orch.abandonTurnManually("new");
     expect((await (orch as any).collectInterruptedRows("thread-worker"))[0].actions).toEqual([]);

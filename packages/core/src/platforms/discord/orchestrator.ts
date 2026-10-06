@@ -62,6 +62,7 @@ import type {
 import { AgentRuntime, type AgentEventHandler, type PromptOutcome } from "../../agents/agent-runtime.js";
 import {
   isRemoteRecoverySnapshot,
+  attachErrorClassification,
   readErrorClassification,
   resolveError,
   unclassified,
@@ -2218,10 +2219,8 @@ export class Orchestrator {
     if (!stalled?.stalledUtc || stalled.stallNoticeUtc) return;
     const requester = spec.returnTo ?? spec.originThreadRef ?? spec.target;
     await this.postParkedTurnNotice(requester, stalled,
-      `⚠️ Dispatch \`${spec.id}\` to <#${spec.target}> could not resume: ${reason}. ` +
-        "It remains suspended and was not replayed. " +
-        "Resolve this cause before using Resume or `/seam workflows resume:<id>`, or abandon the work. " +
-        "A resume command cannot bypass the failed safety checks."
+      `⚠️ Dispatch \`${spec.id}\` to <#${spec.target}> is parked: ${reason}. ` +
+        "Use Resume or `/seam workflows resume:<id>` to try again, or abandon the work."
     );
     this.store.turnAttempts.markStallNoticeDelivered(spec.id);
     this.logger.warn(
@@ -5979,6 +5978,13 @@ export class Orchestrator {
               "the provider does not support session/load, so this turn cannot be reattached");
           }
           // #76: resume against the recorded session, never newSession().
+          await acquire(() => this.retireUnownedSessionSlots(location,
+            recordedSessionId, profile.id, () => {
+              if (opts.lifecycle?.isCurrent && !opts.lifecycle.isCurrent()) {
+                throw DispatchSuspendedError.superseded(opts.logContext?.dispatch as string ?? recordedSessionId,
+                  "another attempt owns this acquisition");
+              }
+            }));
           await acquire(() => rt!.loadSession({
             sessionId: recordedSessionId,
             cwd,
@@ -7049,6 +7055,12 @@ export class Orchestrator {
     for (let attempt = 1; ; attempt++) {
       assertCurrent();
       try {
+        if (!this.router.hasRuntime?.(record.id)) {
+          const described = this.router.describeConfig(record);
+          await this.retireUnownedSessionSlots(described.location.value,
+            resumeSessionId ?? record.acpSessionId, described.agent.value, assertCurrent);
+          assertCurrent();
+        }
         const runtime = await (resumeSessionId
           ? this.router.getOrStartRuntime(record, { resumeSessionId }, assertCurrent)
           : this.router.getOrStartRuntime(record, undefined, assertCurrent));
@@ -15502,12 +15514,9 @@ export class Orchestrator {
       if (!mux) return;
       void (async () => {
         const reply = await mux.sendCmd("listSlots", {}) as { health?: Array<{ slot?: unknown; alive?: unknown }> };
-        const owned = new Set(this.store.turnAttempts.list("suspended")
-          .filter((attempt) => attempt.remoteRecovery?.location === location)
-          .map((attempt) => attempt.remoteRecovery!.slot));
         for (const row of reply.health ?? []) {
           if (row.alive !== true || typeof row.slot !== "number") continue;
-          if (mux.isBound(row.slot) || owned.has(row.slot)) continue;
+          if (this.slotHasTurnOwner(location, row.slot)) continue;
           this.logger.warn({ location, slot: row.slot }, "stopping a slot no turn owns");
           mux.sendFrame({ slot: row.slot, type: "kill" });
         }
@@ -15515,23 +15524,62 @@ export class Orchestrator {
     }, 90_000).unref?.();
   }
 
-  /** Stop a slot this controller no longer owns, and wait until it is gone. */
-  private async stopLingeringSlot(location: string, slot: number): Promise<void> {
+  private slotHasTurnOwner(location: string, slot: number): boolean {
+    if (this.bridgeHub?.muxFor(location)?.isBound(slot)) return true;
+    return (["active", "suspended"] as const).some(state => this.store.turnAttempts.list(state)
+      .some(attempt => attempt.remoteRecovery?.location === location && attempt.remoteRecovery.slot === slot));
+  }
+
+  /** Retire a finished, unowned writer before loading its conversation again. */
+  private async retireUnownedSessionSlots(location: string, sessionId: string, agentId: string,
+    assertCurrent: () => void): Promise<void> {
+    if (!sessionId) return;
     const mux = this.bridgeHub?.muxFor(location);
     if (!mux) return;
+    const reply = await mux.sendCmd("listSlots", {}) as { health?: Array<{
+      slot: number; alive?: boolean; recovery?: unknown;
+    }> };
+    assertCurrent();
+    for (const row of reply.health ?? []) {
+      if (row.alive !== true || !isRemoteRecoverySnapshot(row.recovery)
+        || row.recovery.acpSessionId !== sessionId
+        || !["succeeded", "exhausted"].includes(row.recovery.phase)
+        || this.slotHasTurnOwner(location, row.slot)) continue;
+      this.logger.info({ location, slot: row.slot, sessionId }, "retiring an unowned session writer before load");
+      const stopped = await this.stopLingeringSlot(location, row.slot, () => {
+        assertCurrent();
+        return !this.slotHasTurnOwner(location, row.slot);
+      });
+      assertCurrent();
+      if (!stopped) {
+        const error = new Error("Could not confirm the previous session writer stopped");
+        attachErrorClassification(error, { agentId, errorKind: "overloaded", sourceKind: "active_writer" });
+        throw error;
+      }
+    }
+  }
+
+  /** Stop a slot this controller no longer owns, and wait until it is gone. */
+  private async stopLingeringSlot(location: string, slot: number,
+    mayStop: () => boolean = () => true): Promise<boolean> {
+    const mux = this.bridgeHub?.muxFor(location);
+    if (!mux) return false;
     const alive = async () => ((await mux.sendCmd("listSlots", {}) as { health?: Array<{ slot?: unknown; alive?: unknown }> })
       .health ?? []).some((row) => row.slot === slot && row.alive === true);
     try {
-      if (!await alive()) return;
+      if (!await alive()) return true;
+      if (!mayStop()) return false;
       mux.sendFrame({ slot, type: "kill" });
       for (let check = 0; check < 20; check += 1) {
         await new Promise((resolve) => setTimeout(resolve, 500));
-        if (!await alive()) return;
+        if (!await alive()) return true;
       }
       this.logger.warn({ location, slot }, "a lingering slot did not stop within 10s");
     } catch (err) {
+      if (err instanceof DispatchSuspendedError) throw err;
       this.logger.warn({ err, location, slot }, "could not confirm a lingering slot stopped");
     }
+    return false;
   }
 
   private deferRemoteRecoveryAdoption(attempt: TurnAttempt, onReady?: () => void): void {
@@ -16022,13 +16070,18 @@ export class Orchestrator {
    * Success authorizes the existing executor, never bypasses its identity,
    * owner-generation, or strict session/load guards. */
   private async dispatchContinuationRefusal(spec: DispatchSpec): Promise<string | null> {
-    const attempt = this.store.turnAttempts.get(spec.id);
-    if (!attempt || attempt.state !== "suspended") return "no suspended SQL execution is recorded";
-    const reauthenticated = attempt.stalledReason?.startsWith(REAUTH_COMPLETED_PREFIX) === true;
-    if (isAwaitingReauth(attempt.stalledReason)) return attempt.stalledReason;
-    if (attempt.stalledUtc && !attempt.promptStarted && !reauthenticated) {
-      return "the stalled attempt never started a prompt; continuation cannot be distinguished from replaying its original brief";
+    if (spec.kind === "thread_voice") {
+      return "this voice turn has no recorded execution, so Seam can't tell whether its prompt was sent";
     }
+    if (spec.kind === "compact") {
+      return "this compaction has no recorded execution, so Seam can't tell whether its prompts were sent";
+    }
+    const attempt = this.store.turnAttempts.get(spec.id);
+    if (!attempt || !attempt.generation || !attempt.identity || !attempt.ownerBoot) {
+      return "this legacy turn has no recorded execution, so Seam can't tell whether its prompt was sent";
+    }
+    if (attempt.state !== "suspended") return "no suspended SQL execution is recorded";
+    if (isAwaitingReauth(attempt.stalledReason)) return attempt.stalledReason;
     if (attempt.promptStarted && !attempt.acpSessionId) {
       return "the attempt recorded a started prompt but no ACP session id; the conversation to continue cannot be determined";
     }
@@ -16091,7 +16144,7 @@ export class Orchestrator {
     }
     const ledger = this.store.getDelegation(id);
     if (ledger && (ledger.status === "interrupted" || ledger.status === "abandoned")) {
-      return `Cannot resume \`${id}\` — this legacy record has no identity-bound execution to continue.`;
+      return `Cannot resume \`${id}\` — this legacy turn has no recorded execution, so Seam can't tell whether its prompt was sent.`;
     }
     return `No interrupted/abandoned turn \`${id}\`.`;
   }

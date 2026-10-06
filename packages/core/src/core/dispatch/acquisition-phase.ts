@@ -19,6 +19,15 @@ export function bootRecoveryBackoff(err: unknown): readonly number[] {
 
 export const DEFAULT_BOOT_RECOVERY_BACKOFF_MS = [30_000, 30_000] as const;
 
+export function bootAcquisitionCause(err: unknown): string {
+  const classification = bootErrorClassification(err);
+  if (classification?.sourceKind === "active_writer") {
+    const agent = classification.agentId === "codex" ? "Codex" : classification.agentId;
+    return `${agent} was still attached to this session from the previous turn`;
+  }
+  return err instanceof Error ? err.message : String(err);
+}
+
 /** Outcome of the sole start/load owner, not another retryable transport error.
  * Keep the cause for inspection without letting an outer watcher replenish the
  * spent budget. Only this acquisition stops; its transcript and other work live. */
@@ -96,7 +105,9 @@ export class DispatchAcquisitionPhase {
       catch (cause) { if (cause instanceof DispatchSuspendedError) throw cause; }
       if (err instanceof DispatchSuspendedError) throw err;
       if (err instanceof ReauthParked) throw err;
-      const reason = `provider acquisition failed during ${this.phase}: ${err instanceof Error ? err.message : String(err)}`;
+      const cause = bootAcquisitionCause(err);
+      const reason = bootErrorClassification(err)?.sourceKind === "active_writer"
+        ? cause : `provider acquisition failed during ${this.phase}: ${cause}`;
       // #421: a boot-time spawn/load failure happens before prompt submission,
       // so retrying this recorded session cannot replay the original brief. It
       // refuses only this acquisition while other dispatches keep running. The

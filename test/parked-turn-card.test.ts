@@ -150,22 +150,14 @@ describe("durable parked-turn notice actions", () => {
       store.turnAttempts.startPrompt(attempt);
     }
     store.turnAttempts.markStalled(probeId, "fixture load failure");
-    const expected = promptStarted ? ["resume", "abandon"] : ["abandon"];
+    const expected = ["resume", "abandon"];
     expect((await orch.collectInterruptedRows("worker")).find((row: any) => row.id === probeId).actions).toEqual(expected);
     await orch.postParkedTurnNotice("worker", store.turnAttempts.get(probeId), "fixture load failure");
     const card = store.listOpenChoiceCards("discord", "worker")[0]!;
     expect(card.options.map((option: any) => parkedTurnAction(option.payload)?.action)).toEqual(expected);
     const refusal = await orch.workflowActionRefusal("resume", probeId, "worker");
-    if (promptStarted) expect(refusal).toBeNull();
-    else {
-      expect(refusal).toContain("never started a prompt");
-      expect(card.body).toContain("Resume isn't available:");
-      expect(card.body).toContain("never started a prompt");
-      expect(await orch.performWorkflowAction("resume", probeId, "worker")).toBe(refusal);
-      expect(store.turnAttempts.get(probeId)?.generation).toBe(1);
-      expect(store.turnAttempts.get(probeId)?.state).toBe("suspended");
-      expect(store.getChoiceCard(card.id)?.clickCount).toBe(0);
-    }
+    expect(refusal).toBeNull();
+    expect(card.body).not.toContain("Resume isn't available:");
   });
 
   it("internal actions remain separate from ordinary prompts and reauth acceptance", () => {
@@ -175,7 +167,7 @@ describe("durable parked-turn notice actions", () => {
     expect(parkedTurnAction(`reauth-accept:${id}`)).toBeNull();
   });
 
-  it("preserves the exact pre-prompt refusal while the retained callback still owns its watcher claim", async () => {
+  it("does not invent a replay refusal while the old watcher claim is being released", async () => {
     const orch = controller();
     const probeId = "7e7ac718-e7b4-444a-a67e-7721b52762d6";
     const spec = { id: probeId, target: "worker", kind: "wake" as const, session: "live" as const, prompt: "PENDING" };
@@ -186,7 +178,34 @@ describe("durable parked-turn notice actions", () => {
     await orch.postParkedTurnNotice("worker", store.turnAttempts.get(probeId), "fixture load failure");
     const card = store.listOpenChoiceCards("discord", "worker")[0]!;
     expect(card.options.map((option: any) => parkedTurnAction(option.payload)?.action)).toEqual(["abandon"]);
-    expect(card.body).toContain("never started a prompt");
-    expect(await orch.workflowActionRefusal("resume", probeId, "worker")).toContain("never started a prompt");
+    expect(await orch.dispatchContinuationRefusal(spec)).toBeNull();
+    expect(card.body).not.toContain("continuation cannot be distinguished from replaying");
+  });
+
+  it.each(["thread_voice", "compact"] as const)("keeps an accurate refusal for the untracked %s path", async kind => {
+    const orch = controller();
+    const spec = { id: `untracked-${kind}`, target: "worker", kind, session: "live" as const, prompt: "PENDING" };
+    store.turnAttempts.admit(spec);
+    store.turnAttempts.markStalled(spec.id, "fixture interruption");
+    const reason = await orch.dispatchContinuationRefusal(spec);
+    expect(reason).toContain(kind === "thread_voice" ? "this voice turn has no recorded execution" : "this compaction has no recorded execution");
+    expect(reason).toContain("can't tell whether");
+    expect(reason).not.toContain("replay");
+    await orch.postParkedTurnNotice("worker", store.turnAttempts.get(spec.id), "fixture interruption");
+    const card = store.listOpenChoiceCards("discord", "worker")[0]!;
+    expect(card.options.map(option => parkedTurnAction(option.payload)?.action)).toEqual(["abandon"]);
+    expect(card.body).toContain(reason);
+  });
+
+  it("does not treat a legacy admission without an execution claim as first-send proof", async () => {
+    const orch = controller();
+    const spec = { id: "legacy-unclaimed", target: "worker", kind: "handoff" as const, session: "live" as const, prompt: "PENDING" };
+    store.turnAttempts.admit(spec);
+    store.turnAttempts.markStalled(spec.id, "fixture interruption");
+    expect(await orch.dispatchContinuationRefusal(spec)).toBe("this legacy turn has no recorded execution, so Seam can't tell whether its prompt was sent");
+    expect(await orch.dispatchContinuationRefusal({ ...spec, id: "no-row" })).toBe("this legacy turn has no recorded execution, so Seam can't tell whether its prompt was sent");
+    store.recordDelegation({ id: "no-row", kind: "handoff", sourceRef: null, targetRef: "worker", worker: null,
+      promptPreview: "PENDING", correlationId: null, status: "interrupted" });
+    expect(await orch.resumeTurnManually("no-row")).toContain("this legacy turn has no recorded execution");
   });
 });

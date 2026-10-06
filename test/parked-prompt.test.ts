@@ -429,10 +429,11 @@ describe("park while remote bridge offline (#88)", () => {
         store,
         hub,
         logger: silent,
-        onFire: async (p) => {
+        onFire: async (p, consume) => {
           try {
-            await orch.fireParked(p);
+            const result = await orch.fireParked(p, consume);
             resolve();
+            return result;
           } catch (err) {
             reject(err);
           }
@@ -765,7 +766,7 @@ describe("/seam queue (#89)", () => {
     expect(spec.kind).toBe("parked");
   });
 
-  it("fireParked while the thread is busy restores the row and does not enqueue", async () => {
+  it("fireParked while the thread is busy retains the row and does not enqueue", async () => {
     const { orch } = makeOrch({ ready: true });
     (orch as any).channelQueues.set("thread-1", new Promise(() => {}));
     store.upsertParked({
@@ -783,7 +784,6 @@ describe("/seam queue (#89)", () => {
       createdUtc: new Date().toISOString(),
     });
     const parked = store.getParked("park-busy")!;
-    store.deleteParked(parked.id);
     await orch.fireParked(parked);
     expect(store.getParkedByChannel("discord", "thread-1")?.id).toBe("park-busy");
     const pending = await readdir(dispatchDirs(dir).pending).catch(() => []);

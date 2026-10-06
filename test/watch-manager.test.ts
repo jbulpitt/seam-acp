@@ -86,8 +86,8 @@ function makeManager(
   return new WatchManager({
     store,
     evaluate,
-    onFire: cbs.onFire ?? (async () => {}),
-    onExpire: cbs.onExpire ?? (async () => {}),
+    onFire: async (row, event, consume) => { await cbs.onFire?.(row, event); consume(); },
+    onExpire: async (row, consume) => { await cbs.onExpire?.(row); consume(); },
     onStopped: cbs.onStopped ?? (async () => {}),
     logger: silentLogger,
   });
@@ -131,10 +131,10 @@ describe("WatchManager sweeper (#60)", () => {
     expect(deletes).toEqual([]);
   });
 
-  it("a 'once' watch is deleted before firing and cannot fire twice", async () => {
+  it("a 'once' watch survives until admission and cannot fire twice", async () => {
     const { store, deletes, rows } = makeStore([makeWatch({ mode: "once" })]);
     const onFire = vi.fn(async (w: WatchEvent) => {
-      expect(rows.has(w.id)).toBe(false); // delete-before-fire
+      expect(rows.has(w.id)).toBe(true);
     });
     const m = makeManager(store, fires(), { onFire });
     await m.sweep();

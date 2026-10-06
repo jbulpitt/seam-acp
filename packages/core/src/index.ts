@@ -1341,13 +1341,13 @@ async function main(): Promise<void> {
   orchestrator.setScheduledManager(scheduledManager);
 
   // Agent-scheduled wake events (#59): a DB sweeper polls for due one-shot
-  // wakes and fires each via the dispatch queue (delete-before-fire, D1). No
+  // wakes and hands each to the durable dispatch queue. No
   // rehydrate/re-arm — restart-safe by construction (D11). Started after the
   // adapter so a due-at-boot wake can post immediately.
   const wakeManager = new WakeManager({
     store,
     logger: logger.child({ mod: "wake" }),
-    onFire: (wake) => orchestrator.fireWake(wake),
+    onFire: (wake, consume) => orchestrator.fireWake(wake, consume),
   });
   orchestrator.setWakeManager(wakeManager);
 
@@ -1365,8 +1365,8 @@ async function main(): Promise<void> {
         enabled: config.WATCH_COMMAND_ENABLED,
         allowlist: config.WATCH_COMMAND_ALLOWLIST,
       }),
-    onFire: (watch, eventText) => orchestrator.fireWatch(watch, eventText),
-    onExpire: (watch) => orchestrator.fireWatchExpiry(watch),
+    onFire: (watch, eventText, consume) => orchestrator.fireWatch(watch, eventText, consume),
+    onExpire: (watch, consume) => orchestrator.fireWatchExpiry(watch, consume),
     onStopped: (watch, reason) => orchestrator.postWatchStopped(watch, reason),
   });
   orchestrator.setWatchManager(watchManager);
@@ -1594,7 +1594,7 @@ async function main(): Promise<void> {
     store,
     hub: bridgeHub!,
     logger: logger.child({ mod: "parked" }),
-    onFire: (parked) => orchestrator.fireParked(parked),
+    onFire: (parked, consume) => orchestrator.fireParked(parked, consume),
     // #89: a reconnect must not fire a `/seam queue` row while that thread's
     // current turn is still running (D5/D9 — park stays cancellable).
     isChannelBusy: (channelRef) => orchestrator.isChannelBusy(channelRef),

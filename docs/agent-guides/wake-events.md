@@ -28,3 +28,7 @@ the shipped dispatch queue (`fireWake` → `enqueueDispatchSpec` → `DispatchWa
 → `dispatchInjectTurn`, ledgered as `kind: "wake"`). Pending wakes are visible
 and cancellable via `/seam workflows` (and `/seam workflows cancel-wake:<id>`).
 
+Firing admits a deterministic dispatch ID and deletes the wake in one SQLite
+transaction. The dispatch watcher then owns delivery, even without the ingress
+file. Transient Discord lookups do not discard the wake; confirmed Unknown
+Channel (10003), Discord locks and the existing catch-up policy still stop it.

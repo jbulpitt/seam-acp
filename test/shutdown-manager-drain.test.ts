@@ -466,7 +466,7 @@ describe("#192 manager admission after stop", () => {
   it("NEGATIVE CONTROL: skipping the wake admission gate deletes after stop", async () => {
     const wake = makeWake();
     const { store, deletes } = makeWakeStore([wake]);
-    const onFire = vi.fn(async () => {});
+    const onFire = vi.fn(async (_wake, consume) => consume());
     const manager = new WakeManager({ store, onFire, logger: silentLogger });
     manager.stop();
     await (manager as unknown as { sweepInner(): Promise<void> }).sweepInner();
@@ -586,6 +586,7 @@ function makeWakeStore(initial: WakeEvent[]) {
         .filter((w) => w.fireAtUtc <= nowIso && !w.fireOnStartup)
         .sort((a, b) => a.fireAtUtc.localeCompare(b.fireAtUtc)),
     listStartupWakes: () => [...rows.values()].filter((w) => w.fireOnStartup),
+    getWake: (id: string) => rows.get(id) ?? null,
     deleteWake: (id: string) => {
       deletes.push(id);
       rows.delete(id);

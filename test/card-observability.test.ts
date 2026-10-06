@@ -414,6 +414,9 @@ function makeOrch(opts: {
     abortTurn: async () => "cancelled",
   };
   const store = {
+    admitTriggeredDispatch: (spec: DispatchSpec, consume: () => void) => { consume(); return spec; },
+    deleteWake: () => {},
+    deleteWatch: () => {},
     getPresetByName: () => null,
     recordDelegation: (row: { promptPreview?: string; kind?: string }) => {
       opts.ledger?.push(row);

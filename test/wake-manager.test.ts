@@ -45,6 +45,7 @@ function makeStore(initial: WakeEvent[]) {
       [...rows.values()]
         .filter((w) => w.fireOnStartup)
         .sort((a, b) => a.createdUtc.localeCompare(b.createdUtc)),
+    getWake: (id: string) => rows.get(id) ?? null,
     deleteWake: (id: string) => {
       deletes.push(id);
       rows.delete(id);
@@ -71,13 +72,14 @@ describe("WakeManager sweeper (#59)", () => {
     expect(drained).toBe(true);
   });
 
-  it("fires a due wake and deletes it before firing (D1)", async () => {
+  it("retains a due wake until the handoff consumes it", async () => {
     const wake = makeWake();
     const { store, deletes, rows } = makeStore([wake]);
     const order: string[] = [];
-    const onFire = vi.fn(async (w: WakeEvent) => {
-      // Delete must have already happened when onFire runs (delete-before-fire).
+    const onFire = vi.fn(async (w: WakeEvent, consume: () => void) => {
       order.push("fire");
+      expect(rows.has(w.id)).toBe(true);
+      consume();
       expect(rows.has(w.id)).toBe(false);
     });
     const m = new WakeManager({ store, onFire, logger: silentLogger });
@@ -90,7 +92,7 @@ describe("WakeManager sweeper (#59)", () => {
   it("does not fire a wake that is not yet due", async () => {
     const future = makeWake({ fireAtUtc: new Date(Date.now() + 60_000).toISOString() });
     const { store, deletes } = makeStore([future]);
-    const onFire = vi.fn(async () => {});
+    const onFire = vi.fn(async (_wake, consume) => consume());
     const m = new WakeManager({ store, onFire, logger: silentLogger });
     await m.sweep();
     expect(onFire).not.toHaveBeenCalled();
@@ -103,7 +105,7 @@ describe("WakeManager sweeper (#59)", () => {
       catchupSeconds: 900,
     });
     const { store, deletes } = makeStore([stale]);
-    const onFire = vi.fn(async () => {});
+    const onFire = vi.fn(async (_wake, consume) => consume());
     const m = new WakeManager({ store, onFire, logger: silentLogger });
     await m.sweep();
     expect(onFire).not.toHaveBeenCalled();
@@ -116,7 +118,7 @@ describe("WakeManager sweeper (#59)", () => {
       catchupSeconds: 900,
     });
     const { store } = makeStore([recent]);
-    const onFire = vi.fn(async () => {});
+    const onFire = vi.fn(async (_wake, consume) => consume());
     const m = new WakeManager({ store, onFire, logger: silentLogger });
     await m.sweep();
     expect(onFire).toHaveBeenCalledTimes(1);
@@ -125,21 +127,21 @@ describe("WakeManager sweeper (#59)", () => {
   it("never fires the same wake twice across sweeps (row is gone after firing)", async () => {
     const wake = makeWake();
     const { store } = makeStore([wake]);
-    const onFire = vi.fn(async () => {});
+    const onFire = vi.fn(async (_wake, consume) => consume());
     const m = new WakeManager({ store, onFire, logger: silentLogger });
     await m.sweep();
     await m.sweep();
     expect(onFire).toHaveBeenCalledTimes(1);
   });
 
-  it("fireStartupWakes fires a boot-triggered wake, deleting it BEFORE onFire (D1)", async () => {
+  it("retains a startup wake until the handoff consumes it", async () => {
     const wake = makeWake({ fireOnStartup: true });
     const { store, deletes, rows } = makeStore([wake]);
     const order: string[] = [];
-    const onFire = vi.fn(async (w: WakeEvent) => {
-      // The row must already be gone when onFire runs — a crash during the
-      // woken turn must not re-fire it on the next reboot (no boot-loop).
+    const onFire = vi.fn(async (w: WakeEvent, consume: () => void) => {
       order.push("fire");
+      expect(rows.has(w.id)).toBe(true);
+      consume();
       expect(rows.has(w.id)).toBe(false);
     });
     const m = new WakeManager({ store, onFire, logger: silentLogger });
@@ -152,7 +154,7 @@ describe("WakeManager sweeper (#59)", () => {
   it("a startup wake never fires twice across two boots (start passes)", async () => {
     const wake = makeWake({ fireOnStartup: true });
     const { store } = makeStore([wake]);
-    const onFire = vi.fn(async () => {});
+    const onFire = vi.fn(async (_wake, consume) => consume());
     const m = new WakeManager({ store, onFire, logger: silentLogger });
     await m.fireStartupWakes(); // boot #1
     await m.fireStartupWakes(); // boot #2 — row is already gone
@@ -164,7 +166,7 @@ describe("WakeManager sweeper (#59)", () => {
     // sweep must leave it for the boot pass, not fire or drop it.
     const wake = makeWake({ fireOnStartup: true });
     const { store, deletes } = makeStore([wake]);
-    const onFire = vi.fn(async () => {});
+    const onFire = vi.fn(async (_wake, consume) => consume());
     const m = new WakeManager({ store, onFire, logger: silentLogger });
     await m.sweep();
     expect(onFire).not.toHaveBeenCalled();
@@ -174,7 +176,7 @@ describe("WakeManager sweeper (#59)", () => {
   it("start() fires boot-triggered wakes once, then stops the interval", async () => {
     const wake = makeWake({ fireOnStartup: true });
     const { store } = makeStore([wake]);
-    const onFire = vi.fn(async () => {});
+    const onFire = vi.fn(async (_wake, consume) => consume());
     const m = new WakeManager({ store, onFire, logger: silentLogger, sweepMs: 10_000 });
     m.start();
     // start() kicks the startup pass off non-blocking; let microtasks settle.
@@ -188,13 +190,38 @@ describe("WakeManager sweeper (#59)", () => {
     const b = makeWake({ id: "b", fireAtUtc: new Date(Date.now() - 2000).toISOString() });
     const { store, deletes } = makeStore([a, b]);
     const onFire = vi
-      .fn<[WakeEvent], Promise<void>>()
+      .fn<(wake: WakeEvent, consume: () => void) => Promise<void>>()
       .mockRejectedValueOnce(new Error("boom"))
-      .mockResolvedValueOnce(undefined);
+      .mockImplementationOnce(async (_wake, consume) => consume());
     const m = new WakeManager({ store, onFire, logger: silentLogger });
     await m.sweep();
     expect(onFire).toHaveBeenCalledTimes(2);
-    // Both deleted (delete-before-fire), even the one whose fire threw.
-    expect(deletes.sort()).toEqual(["a", "b"]);
+    expect(deletes).toEqual(["b"]);
+    onFire.mockImplementation(async (_wake, consume) => consume());
+    await m.sweep();
+    expect(deletes).toEqual(["b", "a"]);
+  });
+
+  it("retries a failed startup admission in the same sweep, but leaves newly armed startup wakes for next boot", async () => {
+    const { store, rows } = makeStore([makeWake({ fireOnStartup: true })]);
+    const onFire = vi.fn().mockRejectedValueOnce(new Error("SQL unavailable"))
+      .mockImplementation(async (_wake, consume) => consume());
+    const m = new WakeManager({ store, onFire, logger: silentLogger });
+    await m.fireStartupWakes();
+    expect(rows.has("wake-1")).toBe(true);
+    rows.set("next-boot", makeWake({ id: "next-boot", fireOnStartup: true }));
+    await m.sweep();
+    expect(onFire).toHaveBeenCalledTimes(2);
+    expect([...rows.keys()]).toEqual(["next-boot"]);
+  });
+
+  it("does not revive a cancelled startup wake after failed admission", async () => {
+    const { store, rows } = makeStore([makeWake({ fireOnStartup: true })]);
+    const onFire = vi.fn().mockRejectedValue(new Error("SQL unavailable"));
+    const m = new WakeManager({ store, onFire, logger: silentLogger });
+    await m.fireStartupWakes();
+    rows.delete("wake-1");
+    await m.sweep();
+    expect(onFire).toHaveBeenCalledTimes(1);
   });
 });

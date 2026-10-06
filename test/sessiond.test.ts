@@ -7,6 +7,7 @@
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { spawn, type ChildProcess } from "node:child_process";
+import assert from "node:assert/strict";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -18,7 +19,6 @@ import type { SessiondEvent, SessiondOutputFrame } from "../packages/bridge/src/
 const roots: string[] = [];
 const servers: SessiondServer[] = [];
 const clients: SessiondClient[] = [];
-const daemons: ChildProcess[] = [];
 
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -56,6 +56,49 @@ async function harness(outputLog?: { maxBytes?: number; maxAgeMs?: number; maxFr
   return { root, socketPath, statePath, server, client };
 }
 
+async function withSessiondCli<T>(
+  root: string,
+  run: (fixture: { client: SessiondClient; daemon: ChildProcess; emitted(): string; statePath: string }) => Promise<T>,
+  options: { env?: NodeJS.ProcessEnv; resumeDir?: string } = {},
+): Promise<T> {
+  const socketPath = path.join(root, "control.sock");
+  const statePath = path.join(root, "slots.json");
+  const resumeDir = path.resolve(options.resumeDir ?? path.join(root, "resume"));
+  const relative = path.relative(path.resolve(root), resumeDir);
+  // Never scan an operator's recorded turns from this CLI fixture.
+  assert(relative && relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative),
+    `fixture resume directory must be under its temp root: ${resumeDir}`);
+  const daemon = spawn(process.execPath, [
+    "--import", "tsx", path.resolve("packages/bridge/src/sessiond.ts"),
+    "--socket", socketPath, "--state", statePath, "--resume-dir", resumeDir,
+  ], { cwd: process.cwd(), env: { ...process.env, ...options.env }, stdio: ["ignore", "ignore", "pipe"] });
+  let emitted = "";
+  daemon.stderr?.on("data", chunk => { emitted += chunk.toString(); });
+  let client: SessiondClient | undefined;
+  try {
+    client = await waitForAsync(async () => {
+      try { return await SessiondClient.connect(socketPath, { requestTimeoutMs: 1_000 }); }
+      catch { return undefined; }
+    });
+    return await run({ client, daemon, emitted: () => emitted, statePath });
+  } finally {
+    client?.close();
+    if (daemon.exitCode === null && daemon.signalCode === null) {
+      const exited = new Promise<void>(resolve => daemon.once("exit", () => resolve()));
+      daemon.kill("SIGTERM");
+      await Promise.race([exited, delay(1_000)]);
+      if (daemon.exitCode === null && daemon.signalCode === null) {
+        daemon.kill("SIGKILL");
+        await exited;
+      }
+    }
+    // CLI shutdown retains holders; reclaim only this fixture's private state.
+    const cleanup = new SessiondServer({ socketPath, statePath, resumeDir });
+    try { await cleanup.start(); }
+    finally { await cleanup.close({ terminateChildren: true }); }
+  }
+}
+
 async function listedDead(client: SessiondClient, slot: number): Promise<boolean> {
   return (await client.listSlots()).health.some((entry) => entry.slot === slot && !entry.alive);
 }
@@ -72,16 +115,6 @@ afterEach(async () => {
   vi.restoreAllMocks();
   for (const client of clients.splice(0)) client.close();
   for (const server of servers.splice(0)) await server.close({ terminateChildren: true });
-  for (const daemon of daemons.splice(0)) {
-    if (daemon.exitCode !== null || daemon.signalCode !== null) continue;
-    const exited = new Promise<void>((resolve) => daemon.once("exit", () => resolve()));
-    daemon.kill("SIGTERM");
-    await Promise.race([exited, delay(1_000)]);
-    if (daemon.exitCode === null && daemon.signalCode === null) {
-      daemon.kill("SIGKILL");
-      await exited;
-    }
-  }
   for (const root of roots.splice(0)) await fs.rm(root, { recursive: true, force: true });
 });
 
@@ -374,10 +407,18 @@ describe("#573 seam-sessiond control-plane restart", () => {
   });
 
   it("forgets slots that ended more than a day ago (#631)", async () => {
-    const { server, client } = await harness();
+    const { server, client, statePath } = await harness();
     await client.spawn({ slot: 33, executable: process.execPath, args: ["-e", "process.exit(0)"],
       cwd: process.cwd(), env: { PATH: process.env.PATH ?? "" } });
     await waitForAsync(async () => (await listedDead(client, 33)) || undefined);
+    const state = JSON.parse(await fs.readFile(statePath, "utf8")) as { slots: Array<{ slot: number; identity: { pid: number } }> };
+    const holderPid = state.slots.find(row => row.slot === 33)!.identity.pid;
+    const replay = await client.replayOutput({ slot: 33, afterSeq: 0 });
+    const exit = replay.frames.find(frame => frame.stream === "exit");
+    expect(exit).toBeDefined();
+    // Deliver the exit before artificially ageing its retained entry.
+    await client.ack({ slot: 33, throughSeq: exit!.seq });
+    await waitFor(() => readSessiondProcessIdentity(holderPid) ? undefined : true);
     const internals = server as unknown as { pruneExited(now: number): void };
     internals.pruneExited(Date.now());
     expect((await client.listSlots()).slots).toEqual([33]);
@@ -483,39 +524,21 @@ describe("#573 seam-sessiond control-plane restart", () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "seam-sessiond-cli-test-"));
     await fs.chmod(root, 0o700);
     roots.push(root);
-    const socketPath = path.join(root, "control.sock");
-    const statePath = path.join(root, "slots.json");
     const secret = "TOKEN_SHAPED_VALUE_573";
-    const daemon = spawn(process.execPath, [
-      "--import", "tsx",
-      path.resolve("packages/bridge/src/sessiond.ts"),
-      "--socket", socketPath,
-      "--state", statePath,
-    ], { cwd: process.cwd(), stdio: ["ignore", "ignore", "pipe"] });
-    daemons.push(daemon);
-    let emitted = "";
-    daemon.stderr?.on("data", (chunk) => { emitted += chunk.toString(); });
-    const client = await waitForAsync(async () => {
-      try {
-        return await SessiondClient.connect(socketPath, { requestTimeoutMs: 1_000 });
-      } catch {
-        return undefined;
-      }
+    await withSessiondCli(root, async ({ client, daemon, emitted }) => {
+      await expect(client.spawn({
+        slot: 19,
+        executable: "/missing/private/sessiond-agent",
+        args: [secret],
+        cwd: "/missing/private/cwd",
+        env: { PRIVATE_TOKEN: secret },
+      })).rejects.toMatchObject({ code: "spawn_failed", processCode: "ENOENT", syscall: "spawn" });
+      await delay(50);
+
+      expect(daemon.exitCode).toBeNull();
+      expect(emitted()).not.toContain(secret);
+      expect(emitted()).not.toContain("/missing/private");
     });
-    clients.push(client);
-
-    await expect(client.spawn({
-      slot: 19,
-      executable: "/missing/private/sessiond-agent",
-      args: [secret],
-      cwd: "/missing/private/cwd",
-      env: { PRIVATE_TOKEN: secret },
-    })).rejects.toMatchObject({ code: "spawn_failed", processCode: "ENOENT", syscall: "spawn" });
-    await delay(50);
-
-    expect(daemon.exitCode).toBeNull();
-    expect(emitted).not.toContain(secret);
-    expect(emitted).not.toContain("/missing/private");
   });
 
   it("creates a private socket and state file", async () => {
@@ -529,6 +552,63 @@ describe("#573 seam-sessiond control-plane restart", () => {
     });
     expect((await fs.stat(socketPath)).mode & 0o777).toBe(0o600);
     expect((await fs.stat(statePath)).mode & 0o777).toBe(0o600);
+  });
+});
+
+describe("sessiond CLI fixture ownership", () => {
+  async function fixtureRoot() {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "seam-sessiond-cli-test-"));
+    roots.push(root);
+    await fs.chmod(root, 0o700);
+    return root;
+  }
+
+  it("ignores a foreign resume directory and leaves its recorded turns untouched", async () => {
+    const root = await fixtureRoot();
+    const foreign = await fixtureRoot();
+    const marker = path.join(foreign, "relaunched");
+    const recordPath = path.join(foreign, "123.json");
+    const record = JSON.stringify({ version: 1, slot: 123, launch: {
+      executable: process.execPath,
+      args: ["-e", `require("fs").writeFileSync(${JSON.stringify(marker)}, "started"); setInterval(() => {}, 1000)`],
+      cwd: foreign, env: {},
+    } });
+    await fs.writeFile(recordPath, record);
+    await withSessiondCli(root, async ({ client }) => {
+      expect((await client.listSlots()).slots).toEqual([]);
+      await expect(fs.stat(marker)).rejects.toMatchObject({ code: "ENOENT" });
+    }, { env: { SEAM_SESSIOND_RESUME_DIR: foreign } });
+    expect(await fs.readFile(recordPath, "utf8")).toBe(record);
+    await expect(fs.stat(marker)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("refuses a resume directory outside its temp root before launching the CLI", async () => {
+    const root = await fixtureRoot();
+    const run = vi.fn();
+    await expect(withSessiondCli(root, run, { resumeDir: path.join(root, "..", "foreign-resume") }))
+      .rejects.toThrow("fixture resume directory must be under its temp root");
+    expect(run).not.toHaveBeenCalled();
+    expect(await fs.readdir(root)).toEqual([]);
+  });
+
+  it("reclaims its own holder and child when the test body throws", async () => {
+    const root = await fixtureRoot();
+    const failure = new Error("fixture body failed");
+    let holderPid = 0;
+    let childPid = 0;
+    await expect(withSessiondCli(root, async ({ client, statePath }) => {
+      childPid = (await client.spawn({ slot: 321, executable: process.execPath,
+        args: ["-e", "setInterval(() => {}, 1000)"], cwd: root, env: {} })).pid;
+      const state = JSON.parse(await fs.readFile(statePath, "utf8")) as { slots: Array<{ identity: { pid: number } }> };
+      holderPid = state.slots[0]!.identity.pid;
+      expect(readSessiondProcessIdentity(holderPid)).toBeDefined();
+      expect(readSessiondProcessIdentity(childPid)).toBeDefined();
+      throw failure;
+    })).rejects.toBe(failure);
+    expect(holderPid).toBeGreaterThan(0);
+    expect(childPid).toBeGreaterThan(0);
+    expect(readSessiondProcessIdentity(holderPid)).toBeUndefined();
+    expect(readSessiondProcessIdentity(childPid)).toBeUndefined();
   });
 });
 

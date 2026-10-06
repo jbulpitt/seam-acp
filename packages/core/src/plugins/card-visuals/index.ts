@@ -26,7 +26,7 @@ export interface CardVisualsPort {
 const schema = z.object({ SIMPLE_CARD_GIF_MANIFEST_URL: z.string().url().optional(), BRAND_ICON_BASE_URL: z.string().url().optional() });
 const group = { name: "config", description: "Session and bot configuration" };
 const scopeOption = { type: Option.String as const, name: "scope", description: "This thread or channel default; parent commands use channel default",
-  choices: [{ name: "This thread", value: "thread" }, { name: "Session override", value: "session" }, { name: "Channel default", value: "channel" }] };
+  choices: [{ name: "This thread", value: "thread" }, { name: "Channel default", value: "channel" }] };
 
 /** Built-in-only config facade. It never receives sessions or the router. */
 export function createCardVisualsPlugin(port: CardVisualsPort): Plugin {
@@ -55,7 +55,7 @@ export function createCardVisualsPlugin(port: CardVisualsPort): Plugin {
         const resolved = kind === "card" ? current.style : current.gif;
         const label = kind === "card" ? "Status card" : "Simple-card GIF";
         const display = (v: unknown) => typeof v === "boolean" ? v ? "on" : "off" : String(v);
-        if (value == null) return invocation.reply(`${label}: \`${display(resolved.value)}\` (from ${resolved.source}). Set with \`/seam config ${kind} ${option}:${choices.join("|")} [scope:session|thread|channel]\`.`);
+        if (value == null) return invocation.reply(`${label}: \`${display(resolved.value)}\` (from ${resolved.source}). Set with \`/seam config ${kind} ${option}:${choices.join("|")} [scope:thread|channel]\`.`);
         if (!choices.includes(value)) return invocation.reply(kind === "card" ? "Style must be `full` or `simple`." : "State must be `on` or `off`.");
         const written = port.write(channel, scope, key, value === "default" ? null : kind === "card" ? value : value === "on", invocation.actor);
         if (!written.ok) return invocation.reply(written.error);

@@ -21,6 +21,7 @@ import { AGENT_ADAPTER_VERSION } from "../agent-profile.js";
 import { manifestCatalogScope, manifestCatalogSource, readCliVersion } from "../model-catalog.js";
 import { ProbeError, redactProbeText, runBoundedProbe } from "../probe-process.js";
 import type { SessionSummary } from "../session-manager.js";
+import { probeCopilotModelContexts, type CopilotModelContext } from "./copilot-model-limits.js";
 import {
   readCopilotSessionSummaries,
   readCopilotTranscript,
@@ -68,6 +69,7 @@ export interface CopilotCatalogProbeModel {
   effortChoices: string[];
   effortDefault: string;
   priceCategory: string | null;
+  context?: CopilotModelContext;
 }
 
 export interface CopilotCatalogProbe {
@@ -461,9 +463,15 @@ export async function probeCopilotCatalog(options: {
     if (rows.some((row) => !row)) {
       throw new Error("copilot ACP catalog probe ended with partial model results");
     }
+    const contexts = await probeCopilotModelContexts({
+      cliPath, args, cwd, env, timeoutMs, cleanupTimeoutMs, signal: controller.signal,
+      requestedTier: copilotRequestedContextTier(args), spawnProcess,
+    });
     return {
       defaultModel: discovery.defaultModel,
-      models: rows as CopilotCatalogProbeModel[],
+      models: (rows as CopilotCatalogProbeModel[]).map(model => ({
+        ...model, ...(contexts.has(model.modelId) ? { context: contexts.get(model.modelId)! } : {}),
+      })),
     };
   } catch (error) {
     if (controller.signal.aborted && (!(error instanceof ProbeError) || error.code === "cancelled")) {
@@ -599,6 +607,15 @@ export function makeCopilotProfile(opts: {
             modelId: model.modelId,
             name: model.displayName,
             pricingCategory: model.priceCategory,
+            ...(model.context ? {
+              context: model.context,
+              evidence: [{
+                kind: "live-observation" as const,
+                source: "copilot-sdk-models-list",
+                resolvedModel: model.modelId,
+                context: { ...model.context, method: `provider-reported-${copilotRequestedContextTier(acpArgs) ?? "default"}` },
+              }],
+            } : {}),
             effort: {
               mechanism: model.effortChoices.length ? "configOption" : "none",
               ...(model.effortChoices.length ? { configId: "reasoning_effort" } : {}),

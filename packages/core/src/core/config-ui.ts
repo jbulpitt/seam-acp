@@ -10,7 +10,6 @@ import type { PluginHost } from "../plugins/host.js";
 import type { SlashInvocation } from "../plugins/slash-registry.js";
 import type { ConfigInteraction, ConfigUiPorts } from "../plugins/config-ui/ports.js";
 import type { ConfigUi } from "../plugins/config-ui/ui.js";
-import { configTarget } from "./config-target.js";
 import { ParentConfigCleanup, type ConfigParentChannel } from "./channel-config-cleanup.js";
 
 interface ConfigUiDependencies {
@@ -49,24 +48,7 @@ export function installConfigUi(deps: ConfigUiDependencies) {
     },
     bind: channel => { if (channel.parentId) ensure(channel); },
     readConfig: channel => channel.parentId ? deps.store.readConfig(ensure(channel)) : deps.plan().describeTarget(channel),
-    snapshot: channel => {
-      const target = configTarget(channel);
-      const record = target.kind === "thread" ? ensure(channel) : deps.router.previewSessionRecord({ platform: channel.platform, channelRef: channel.id, cwd: deps.config.REPOS_ROOT });
-      const chan = deps.config.channelPresets.get(target.kind === "channel" ? target.id : target.parentRef!);
-      const inherited = deps.router.describeConfig(record, { inherit: true });
-      return { desc: deps.plan().describeTarget(channel), withoutThread: {
-        location: inherited.location.value, agent: inherited.agent.value, model: inherited.model.value,
-        effort: inherited.effort.value, cwd: inherited.cwd.value, permission: inherited.permission.value,
-        detached: inherited.detached.value, fastMode: inherited.fastMode.value,
-        statusCardStyle: inherited.statusCardStyle.value, simpleCardGif: inherited.simpleCardGif.value,
-        role: inherited.role.value, disableThreadPrefix: inherited.disableThreadPrefix.value,
-      }, threadOverrides: target.kind === "thread" ? deps.plan().threadOverrideFields(record) : [], channelPins: {
-        ...(chan?.agent?.value ? { agent: chan.agent.value } : {}), ...(chan?.model?.value ? { model: chan.model.value } : {}),
-        ...(chan?.cwd?.value ? { cwd: chan.cwd.value } : {}), ...(chan?.effort?.value ? { effort: chan.effort.value } : {}),
-        ...(chan?.role?.value ? { role: chan.role.value } : {}), ...(chan?.disableThreadPrefix ? { disableThreadPrefix: chan.disableThreadPrefix.value } : {}),
-        ...(chan?.statusCardStyle ? { statusCardStyle: chan.statusCardStyle.value } : {}), ...(chan?.simpleCardGif ? { simpleCardGif: chan.simpleCardGif.value } : {}),
-      } };
-    },
+    snapshot: channel => deps.plan().snapshot(channel),
     canEditChannelPreset: deps.canEditChannelPreset, hasFastMode: agent => deps.router.getProfile(agent)?.fastMode !== undefined,
     agentChoices: deps.agentChoices, promptRepoPath: deps.promptRepoPath,
     saveEditor: (draft, actor) => deps.plan().saveEditor(draft, actor, parent => deps.canEditChannelPreset(actor.id!, parent)),

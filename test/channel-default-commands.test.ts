@@ -45,7 +45,7 @@ async function fixture() {
     defaultAgentId: "claude", defaultModel: "claude-default", defaultCwd: dir,
     seamMcp: localBridgeWiring(profiles) });
   const adapter = { sendMessage: vi.fn(async (channel, _text) => ({ channel, id: "notice" })),
-    sendPanel: vi.fn(async (channel, _panel) => ({ channel, id: "hub" })), editPanel: vi.fn(async () => {}),
+    sendPanel: vi.fn(async (channel, _panel) => ({ channel, id: "hub" })), editPanel: vi.fn(async (_message: unknown, _panel: any) => {}),
     getThreadName: vi.fn(async (_channel: { id: string }): Promise<string | null> => null),
     getThreadLiveState: vi.fn(async () => ({ locked: false, archived: false })),
     renameThread: vi.fn(async (_channel: { id: string }, _name: string) => {}),
@@ -94,6 +94,59 @@ async function blockChannelRename(h: Awaited<ReturnType<typeof fixture>>) {
 }
 
 describe("configuration scope through the real dispatcher", () => {
+  it.each([false, true])("renders committed channel defaults after Inherit (thread editor = %s)", async isThread => {
+    const h = await fixture();
+    // #762 §3: Saved must describe the committed result, not fold the old draft.
+    expect(h.plan.applyChannelOverlay({ channelId: PARENT,
+      changes: { role: "qa", disableThreadPrefix: true }, actor }).ok).toBe(true);
+    const channel = { platform: "discord", id: isThread ? THREAD : PARENT,
+      ...(isThread ? { parentId: PARENT } : {}) };
+    const draft = await h.ui.openConfigEditorCard(channel, actor.id, "channel") as ThreadConfigDraft;
+    expect(draft.snapshot.channelPins).toMatchObject({ agent: "claude", model: "claude-channel", effort: "high", role: "qa", disableThreadPrefix: true });
+    let next = applyPickerValue(draft, "agent", INHERIT_VALUE, () => undefined);
+    next = applyPickerValue(next, "role", INHERIT_VALUE, () => undefined);
+    next = applyPickerValue(next, "prefix", INHERIT_VALUE, () => undefined);
+    h.ui.configEditor.put(next);
+    await h.ui.handleConfigEditorComponent({ kind: "button", customId: `seam-cfg-edit:${draft.id}:save`,
+      channel, messageId: draft.messageId, userId: actor.id, userName: actor.name,
+      followUpEphemeral: vi.fn(async () => {}) });
+    const committed = h.ui.ports.snapshot(channel);
+    for (const field of ["agent", "model", "effort", "role", "disableThreadPrefix"] as const) {
+      expect(committed.channelPins[field]).toBeUndefined();
+    }
+    expect(committed.withoutThread.role).toBeNull();
+    expect(committed.withoutThread.disableThreadPrefix).toBe(false);
+    const panel = h.adapter.editPanel.mock.calls.at(-1)![1];
+    const fields = Object.fromEntries(panel.fields.map((field: { name: string; value: string }) => [field.name, field.value]));
+    expect(fields.Agent).toBe("`channel default` · default");
+    expect(fields.Model).toBe("`channel default` · default");
+    expect(fields.Effort).toBe("`channel default` · default");
+    expect(fields.Role).toBe("`not set` · default");
+    expect(fields["Auto-name"]).toBe("`enabled` · default");
+    expect(panel.footer).toContain("✅ Saved");
+    expect(panel.actions).toEqual([]);
+    expect(h.store.getByChannel("discord", PARENT)).toBeUndefined();
+    expect(h.ui.configEditor.get(draft.id)).toBeUndefined();
+  });
+
+  it("renders the channel's committed values and sources after thread Inherit", async () => {
+    const h = await fixture();
+    h.row();
+    expect(h.plan.applyThreadOverlay({ threadId: THREAD, parentRef: PARENT,
+      changes: { model: "claude-pin", effort: "low" }, actor }).ok).toBe(true);
+    const channel = { platform: "discord", id: THREAD, parentId: PARENT };
+    const draft = await h.ui.openConfigEditorCard(channel, actor.id) as ThreadConfigDraft;
+    h.ui.configEditor.put({ ...draft, overlay: { model: null, effort: null } });
+    await h.ui.handleConfigEditorComponent({ kind: "button", customId: `seam-cfg-edit:${draft.id}:save`,
+      channel, messageId: draft.messageId, userId: actor.id, userName: actor.name,
+      followUpEphemeral: vi.fn(async () => {}) });
+    const panel = h.adapter.editPanel.mock.calls.at(-1)![1];
+    const fields = Object.fromEntries(panel.fields.map((field: { name: string; value: string }) => [field.name, field.value]));
+    expect(fields.Model).toBe("`claude-channel` · channel");
+    expect(fields.Effort).toBe("`high` · channel");
+    expect(panel.footer).toContain("✅ Saved");
+  });
+
   it.each([false, true])("renders a role command result before naming (thread scope:channel = %s)", async isThread => {
     const h = await fixture();
     const naming = await blockChannelRename(h);

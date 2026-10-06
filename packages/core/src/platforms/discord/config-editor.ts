@@ -1052,122 +1052,18 @@ export function renderCancelledHub(draft: ThreadConfigDraft): StructuredPanel {
   };
 }
 
-/** Fold a saved overlay into the snapshot so the card shows committed values, not "will be". */
-export function draftAfterSave(draft: ThreadConfigDraft): ThreadConfigDraft {
-  const next = effectiveAfterDraft(draft);
-  const s = draft.snapshot;
-  const o = draft.overlay;
-  const layer = (over: unknown, fallback: ConfigLayer): ConfigLayer =>
-    over === undefined ? fallback : over === null ? "default" : "thread preset";
-  return {
-    ...draft,
-    overlay: {},
-    warnings: [],
-    snapshot: {
-      ...s,
-      location: { value: next.location, source: layer(o.location, s.location.source) },
-      agent: { value: next.agent, source: layer(o.agent, s.agent.source) },
-      model: { value: next.model, source: layer(o.model, s.model.source) },
-      role: { value: next.role, source: layer(o.role, s.role.source) },
-      disableThreadPrefix: {
-        value: next.disableThreadPrefix,
-        source: next.disableThreadPrefix
-          ? (o.disableThreadPrefix === true ? "thread preset" : s.disableThreadPrefix.source)
-          : "default",
-      },
-      effort: { value: next.effort, source: layer(o.effort, s.effort.source) },
-      cwd: { value: next.cwd, source: layer(o.cwd, s.cwd.source) },
-      permission: {
-        value: next.permission,
-        source: o.permission === undefined ? s.permission.source : o.permission === null ? "default" : "session config",
-      },
-      detached: {
-        value: next.detached,
-        source: next.detached ? "thread preset" : "default",
-      },
-      fastMode: {
-        value: next.fastMode,
-        source: next.fastMode ? "thread preset" : "default",
-      },
-      statusCardStyle: {
-        value: next.statusCardStyle,
-        source: cardSourceAfterSave(o, s),
-      },
-      simpleCardGif: {
-        value: next.simpleCardGif,
-        source: gifSourceAfterSave(o, s),
-      },
-      rider: {
-        ...(next.riderChannel ? { channel: next.riderChannel } : {}),
-        ...(next.riderThread ? { thread: next.riderThread } : {}),
-      },
-      channelPins: {
-        ...s.channelPins,
-        ...(o.channelAgent ? { agent: o.channelAgent } : {}),
-        ...(o.channelModel ? { model: o.channelModel } : {}),
-        ...(o.channelCwd ? { cwd: o.channelCwd } : {}),
-        ...(o.channelEffort ? { effort: o.channelEffort } : {}),
-        ...(o.channelRole !== undefined ? { role: o.channelRole ?? undefined } : {}),
-        ...(o.channelDisableThreadPrefix !== undefined
-          ? { disableThreadPrefix: o.channelDisableThreadPrefix === true ? true : undefined }
-          : {}),
-      },
-      withoutThread: {
-        ...s.withoutThread,
-        ...(o.channelStatusCardStyle ? { statusCardStyle: o.channelStatusCardStyle } : {}),
-        ...(o.channelSimpleCardGif != null ? { simpleCardGif: o.channelSimpleCardGif } : {}),
-        ...(o.channelAgent ? { agent: o.channelAgent } : {}),
-        ...(o.channelModel ? { model: o.channelModel } : {}),
-        ...(o.channelCwd ? { cwd: o.channelCwd } : {}),
-        ...(o.channelEffort !== undefined ? { effort: o.channelEffort } : {}),
-        ...(o.channelRole !== undefined ? { role: o.channelRole } : {}),
-        ...(o.channelDisableThreadPrefix !== undefined
-          ? { disableThreadPrefix: o.channelDisableThreadPrefix === true }
-          : {}),
-      },
-    },
-  };
-}
-
-function cardSourceAfterSave(o: DraftOverlay, s: ThreadConfigSnapshot): ConfigLayer {
-  if (o.statusCardStyle != null) return "session config";
-  if (o.statusCardStyle === null) {
-    if (s.statusCardStyle.source === "thread preset") return "thread preset";
-    if (o.channelStatusCardStyle) return "channel preset";
-    return s.statusCardStyle.source === "session config" ? "default" : s.statusCardStyle.source;
-  }
-  if (
-    s.statusCardStyle.source === "session config" ||
-    s.statusCardStyle.source === "thread preset"
-  ) {
-    return s.statusCardStyle.source;
-  }
-  if (o.channelStatusCardStyle) return "channel preset";
-  return s.statusCardStyle.source;
-}
-
-function gifSourceAfterSave(o: DraftOverlay, s: ThreadConfigSnapshot): ConfigLayer {
-  if (o.simpleCardGif != null) return "session config";
-  if (o.simpleCardGif === null) {
-    if (s.simpleCardGif.source === "thread preset") return "thread preset";
-    if (o.channelSimpleCardGif != null) return "channel preset";
-    return s.simpleCardGif.source === "session config" ? "default" : s.simpleCardGif.source;
-  }
-  if (
-    s.simpleCardGif.source === "session config" ||
-    s.simpleCardGif.source === "thread preset"
-  ) {
-    return s.simpleCardGif.source;
-  }
-  if (o.channelSimpleCardGif != null) return "channel preset";
-  return s.simpleCardGif.source;
-}
-
-export function renderSavedHub(draft: ThreadConfigDraft): StructuredPanel {
+export function renderSavedHub(draft: ThreadConfigDraft, committed: ThreadConfigSnapshot): StructuredPanel {
   const reset = willResetSession(draft)
     ? " ACP session will reset on the next spawn."
     : "";
-  const panel = renderHub(draftAfterSave(draft));
+  const panel = renderHub({ ...draft, snapshot: committed, overlay: {}, warnings: [] });
+  const channelFields = { Agent: "agent", Model: "model", Effort: "effort", Repo: "cwd" } as const;
+  if (editScopeOf(draft) === "channel") {
+    panel.fields = panel.fields.map(field => {
+      const pin = channelFields[field.name as keyof typeof channelFields];
+      return pin && !committed.channelPins[pin] ? { ...field, value: "`channel default` · default" } : field;
+    });
+  }
   return {
     ...panel,
     color: 0x57f287,

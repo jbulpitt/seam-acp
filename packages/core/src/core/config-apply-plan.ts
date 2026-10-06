@@ -175,6 +175,28 @@ export class ConfigApplyPlan {
     return this.router.describeConfig(record, target.kind === "channel" ? { inherit: true } : {});
   }
 
+  snapshot(channel: ChannelRef) {
+    const target = configTarget(channel);
+    const record = target.kind === "thread"
+      ? this.router.ensureSessionRecord({ platform: channel.platform, channelRef: channel.id,
+          ...(channel.parentId ? { parentRef: channel.parentId } : {}), cwd: this.config.REPOS_ROOT })
+      : this.router.previewSessionRecord({ platform: channel.platform, channelRef: channel.id, cwd: this.config.REPOS_ROOT });
+    const chan = this.config.channelPresets.get(target.kind === "channel" ? target.id : target.parentRef!);
+    const inherited = this.router.describeConfig(record, { inherit: true });
+    return { desc: this.describeTarget(channel), withoutThread: {
+      location: inherited.location.value, agent: inherited.agent.value, model: inherited.model.value,
+      effort: inherited.effort.value, cwd: inherited.cwd.value, permission: inherited.permission.value,
+      detached: inherited.detached.value, fastMode: inherited.fastMode.value,
+      statusCardStyle: inherited.statusCardStyle.value, simpleCardGif: inherited.simpleCardGif.value,
+      role: inherited.role.value, disableThreadPrefix: inherited.disableThreadPrefix.value,
+    }, threadOverrides: target.kind === "thread" ? this.threadOverrideFields(record) : [], channelPins: {
+      ...(chan?.agent?.value ? { agent: chan.agent.value } : {}), ...(chan?.model?.value ? { model: chan.model.value } : {}),
+      ...(chan?.cwd?.value ? { cwd: chan.cwd.value } : {}), ...(chan?.effort?.value ? { effort: chan.effort.value } : {}),
+      ...(chan?.role?.value ? { role: chan.role.value } : {}), ...(chan?.disableThreadPrefix ? { disableThreadPrefix: chan.disableThreadPrefix.value } : {}),
+      ...(chan?.statusCardStyle ? { statusCardStyle: chan.statusCardStyle.value } : {}), ...(chan?.simpleCardGif ? { simpleCardGif: chan.simpleCardGif.value } : {}),
+    } };
+  }
+
   overrideCounts(channelId: string, fields: readonly ConfigDefaultField[] = CONFIG_DEFAULT_FIELDS): OverrideCounts {
     const records = this.settings!.store.listSessionsByParentInCreationOrder("discord", channelId);
     const overrides = records.map(record => this.threadOverrideFields(record));
@@ -914,6 +936,8 @@ export class ConfigApplyPlan {
     return notes.length > 0 ? `${body}\n${notes.join("\n")}` : body;
   }
   async saveEditor(draft: ThreadConfigDraft, actor: MutationActor, canEditChannelPreset: (parent: string) => boolean) {
+    const channel: ChannelRef = { platform: "discord", id: draft.threadId,
+      ...(!draft.channelOnly && draft.parentRef ? { parentId: draft.parentRef } : {}) };
     const bound = draft.channelOnly ? null : this.settings!.store.getByChannel("discord", draft.threadId);
     const before = bound ? this.router.describeConfig(bound) : undefined;
     // Compare touched fields with the latest save, so a revert cancels a pending selection.
@@ -954,7 +978,7 @@ export class ConfigApplyPlan {
     }
     if (draft.channelOnly) {
       this.publishChannelIdentity();
-      return { ok: true as const, draft, fastRefusal: undefined, fastRetireFailed: false };
+      return { ok: true as const, draft, snapshot: this.snapshot(channel), fastRefusal: undefined, fastRetireFailed: false };
     }
     if (plan.permission !== undefined || plan.statusCardStyle !== undefined || plan.simpleCardGif !== undefined) {
       const record = this.router.ensureSessionRecord({
@@ -1071,7 +1095,7 @@ export class ConfigApplyPlan {
     }
 
     await this.identityEffects.flush(`discord:${draft.threadId}`);
-    return { ok: true as const, draft, fastRefusal, fastRetireFailed };
+    return { ok: true as const, draft, snapshot: this.snapshot(channel), fastRefusal, fastRetireFailed };
   }
 }
 

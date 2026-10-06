@@ -11,7 +11,6 @@ import {
   currentChannelRiderText,
   currentThreadRiderText,
   decodeRiderUpload,
-  draftAfterSave,
   effectiveAgentAtLocation,
   dirtyChannelRider,
   dirtyChannelAgent,
@@ -281,7 +280,8 @@ describe("hub render (#90)", () => {
   });
 
   it("saved hub shows committed values, not will-be notes, and clears buttons", () => {
-    const panel = renderSavedHub(draft({ overlay: { model: "gpt-5.5" } }));
+    const panel = renderSavedHub(draft({ overlay: { model: "gpt-5.5" } }),
+      snapshot({ model: setting("gpt-5.5", "thread preset") }));
     const model = panel.fields.find((f) => f.name === "Model")!.value;
     expect(model).toMatch(/gpt-5\.5/);
     expect(model).not.toMatch(/will be/);
@@ -355,25 +355,6 @@ describe("Save writes only dirty fields; Cancel writes nothing", () => {
     );
     expect(ch.overlay.channelRole).toBe("qa");
     expect(buildSavePlan(ch).channelPreset?.role).toBe("qa");
-  });
-
-  it("saved channel cards reflect cleared role and re-enabled automatic naming", () => {
-    const saved = draftAfterSave(draft({
-      editScope: "channel",
-      snapshot: snapshot({
-        channelPins: { role: "qa", disableThreadPrefix: true },
-        withoutThread: { ...WITHOUT, role: "qa", disableThreadPrefix: true },
-      }),
-      overlay: { channelRole: null, channelDisableThreadPrefix: false },
-    }));
-
-    expect(saved.snapshot.channelPins.role).toBeUndefined();
-    expect(saved.snapshot.channelPins.disableThreadPrefix).toBeUndefined();
-    expect(saved.snapshot.withoutThread.role).toBeNull();
-    expect(saved.snapshot.withoutThread.disableThreadPrefix).toBe(false);
-    const panel = renderHub(saved);
-    expect(panel.fields.find((field) => field.name === "Role")!.value).toMatch(/not set/);
-    expect(panel.fields.find((field) => field.name === "Auto-name")!.value).toMatch(/enabled/);
   });
 
   it("inherit of an already-unset thread field is not dirty", () => {

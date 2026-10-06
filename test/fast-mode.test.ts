@@ -1167,6 +1167,7 @@ function saveHarness(opts: {
         };
       },
       describeConfig: () => ({
+        ...snapshot({ fastMode: setting(fastPreset, fastPreset ? "thread preset" : "default") }),
         agent: { value: "claude", source: "session config" },
         model: { value: model, source: "session config" },
         effort: { value: "medium", source: "session config" },

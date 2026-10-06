@@ -1,7 +1,7 @@
 import type { ComponentEvent, ChannelRef } from "../../platforms/chat-adapter.js";
 import type { ConfigDescription } from "../../core/session-router.js";
 import { CONFIG_SET_FIELD_NAMES, type ConfigSetFieldName, type ConfigSetRequest } from "../../core/config-apply-plan.js";
-import { renderHub, renderSavedHub, type ThreadConfigDraft } from "../../platforms/discord/config-editor.js";
+import { renderHub, renderSavedHub, snapshotFromDescribe, type ThreadConfigDraft } from "../../platforms/discord/config-editor.js";
 import type { ConfigInteraction, ConfigUiPorts } from "./ports.js";
 
 export function configSetRequest(options: ConfigInteraction["options"]): ConfigSetRequest {
@@ -44,7 +44,11 @@ export async function saveConfigEditorCard(draft: ThreadConfigDraft, evt: Compon
   const { fastRefusal, fastRetireFailed } = saved;
   ports.deleteDraft(draft.id);
   if (draft.messageId) {
-    const savedPanel = renderSavedHub(draft);
+    const committed = saved.snapshot;
+    const savedPanel = renderSavedHub(draft, {
+      ...snapshotFromDescribe(committed.desc, committed.withoutThread),
+      channelPins: committed.channelPins, threadOverrides: committed.threadOverrides,
+    });
     await ports.editCard(
       evt.channel,
       draft.messageId,

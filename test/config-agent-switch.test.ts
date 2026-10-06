@@ -207,7 +207,7 @@ afterEach(() => {
 });
 
 describe("/seam config agent — #178 session/overlay split-brain", () => {
-  it("explicit-id Claude → Codex persists the Codex default in session and overlay", async () => {
+  it("explicit-id Claude → Codex inherits the Codex default without manufacturing pins", async () => {
     const { orch, router, store, threadPresets } = makeOrch();
     seedSession(store);
     const { i, replies } = slashI({ strings: { id: "codex@local" } });
@@ -221,21 +221,22 @@ describe("/seam config agent — #178 session/overlay split-brain", () => {
     expect(rec.agentId).toBe("codex");
     expect(rec.acpSessionId).toBe("");
     const cfg = sessionConfig(store);
-    // Mutation check: persistConfig then upsert({...staleRecord}) restored
-    // configJson.model to claude-opus-5. This dies if that overwrite returns.
-    expect(cfg.model).toBe("gpt-5.6-sol");
+    expect(cfg.model).toBeUndefined();
     expect(cfg.lastContextUsage).toBeUndefined();
-    expect(cfg.reasoningEffort).toBe("default");
+    expect(cfg.reasoningEffort).toBeUndefined();
     expect(cfg.role).toBe("worker");
     expect(cfg.permissionPolicy).toBe("ask");
 
     expect(threadPresets.get(THREAD)?.agent?.value).toBe("codex");
-    expect(threadPresets.get(THREAD)?.model?.value).toBe("gpt-5.6-sol");
+    expect(threadPresets.get(THREAD)?.model).toBeUndefined();
+    expect(threadPresets.get(THREAD)?.effort).toBeUndefined();
 
     const described = router.describeConfig(rec);
     const spawn = router.planRuntimeSpawn(rec);
     expect(described.agent.value).toBe("codex");
     expect(described.model.value).toBe("gpt-5.6-sol");
+    expect(described.model.source).toBe("default");
+    expect(described.effort.value).toBeNull();
     expect(spawn.agentId).toBe("codex");
     expect(spawn.model).toBe("gpt-5.6-sol");
   });
@@ -311,7 +312,7 @@ describe("/seam config agent — #178 session/overlay split-brain", () => {
     const rec = store.get(`discord:${THREAD}`)!;
     expect(rec.agentId).toBe("codex");
     expect(rec.acpSessionId).toBe("");
-    expect(sessionConfig(store).model).toBe("gpt-5.6-sol");
+    expect(sessionConfig(store).model).toBeUndefined();
     const described = router.describeConfig(rec);
     const spawn = router.planRuntimeSpawn(rec);
     expect(described.model.value).toBe("gpt-5.6-sol");
@@ -352,9 +353,10 @@ describe("/seam config agent — #178 session/overlay split-brain", () => {
 
     const rec = store.get(`discord:${THREAD}`)!;
     expect(rec.agentId).toBe("codex");
-    expect(sessionConfig(store).model).toBe("gpt-5.6-sol");
+    expect(sessionConfig(store).model).toBeUndefined();
     expect(threadPresets.get(THREAD)?.agent?.value).toBe("codex");
-    expect(threadPresets.get(THREAD)?.model?.value).toBe("gpt-5.6-sol");
+    expect(threadPresets.get(THREAD)?.model).toBeUndefined();
+    expect(threadPresets.get(THREAD)?.effort).toBeUndefined();
 
     const described = router.describeConfig(rec);
     const spawn = router.planRuntimeSpawn(rec);
@@ -404,7 +406,7 @@ describe("/seam config agent — #178 session/overlay split-brain", () => {
   });
 
   it("re-reads the live row after picker latency so concurrent repo/role/permission survive", async () => {
-    const { orch, store } = makeOrch({
+    const { orch, store, router } = makeOrch({
       sendChoicePicker: async (_ch, opts: any) => {
         const rec = store.get(`discord:${THREAD}`)!;
         const cfg = JSON.parse(rec.configJson) as SessionConfigState;
@@ -430,7 +432,9 @@ describe("/seam config agent — #178 session/overlay split-brain", () => {
     expect(rec.agentId).toBe("codex");
     expect(rec.repoPath).toBe("/concurrent-repo");
     const cfg = sessionConfig(store);
-    expect(cfg.model).toBe("gpt-5.6-sol");
+    expect(cfg.model).toBeUndefined();
+    expect(router.describeConfig(rec).model.value).toBe("gpt-5.6-sol");
+    expect(router.planRuntimeSpawn(rec).model).toBe("gpt-5.6-sol");
     expect(cfg.role).toBe("concurrent-role");
     expect(cfg.permissionPolicy).toBe("always");
   });

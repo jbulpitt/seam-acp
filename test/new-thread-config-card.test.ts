@@ -137,6 +137,7 @@ function makeOrch(over?: {
       cwd: setting(record.repoPath ?? "/repo", "session config"),
       permission: setting("ask"),
       detached: setting(false),
+      fastMode: setting(false),
       statusCardStyle: setting("full"),
       simpleCardGif: setting(false),
       role: setting(null),

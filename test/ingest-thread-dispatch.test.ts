@@ -152,7 +152,16 @@ function makeOrch(
   const rt = fakeRuntime(opts.answer ?? "answered in-thread", opts.mode ?? "ok");
   const router = {
     listProfiles: () => (opts.profile ? [opts.profile] : []),
-    describeConfig: () => ({}),
+    describeConfig: (row: SessionRecord) => {
+      const cfg = store.readConfig(row);
+      return {
+        agent: { value: row.agentId, source: "session config" },
+        model: { value: cfg.model ?? opts.profile?.defaultModel ?? "default", source: "session config" },
+        effort: { value: cfg.reasoningEffort ?? null, source: "session config" },
+        location: { value: opts.profileLocation ?? "local", source: "default" },
+        cwd: { value: row.repoPath, source: "default" },
+      };
+    },
     ensureSessionRecord: ({ channelRef }: { channelRef: string }) => {
       ensured.push(channelRef);
       return sessionRecord({ id: `discord:${channelRef}`, channelRef });

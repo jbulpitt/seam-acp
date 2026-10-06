@@ -275,7 +275,13 @@ function makeOrch(opts: {
 }): Orchestrator {
   const router = {
     listProfiles: () => [],
-    describeConfig: () => ({}),
+    describeConfig: (row: SessionRecord) => ({
+      agent: { value: row.agentId, source: "session config" },
+      model: { value: opts.cfg?.model ?? "opus", source: "session config" },
+      effort: { value: opts.cfg?.reasoningEffort ?? "high", source: "session config" },
+      location: { value: "local", source: "default" },
+      cwd: { value: row.repoPath, source: "default" },
+    }),
     ensureSessionRecord: ({ channelRef }: { channelRef: string }) =>
       record({ id: `discord:${channelRef}`, channelRef }),
     getProfile: () => undefined,

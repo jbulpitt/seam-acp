@@ -9,7 +9,11 @@ import {
   type SessionControlRuntime,
   type ThreadSessionControlDeps,
 } from "../packages/core/src/core/thread-session-control.js";
-import type { ConfigDescription } from "../packages/core/src/core/session-router.js";
+import { SessionRouter } from "../packages/core/src/core/session-router.js";
+import type { SessionStore } from "../packages/core/src/core/session-store.js";
+import type { ModelCatalogService } from "../packages/core/src/core/model-catalog/service.js";
+import type { ThreadPreset } from "../packages/core/src/config.js";
+import { pino } from "pino";
 import type { SessionConfigState, SessionRecord } from "../packages/core/src/core/types.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 import { passthroughCases, passthroughCatalog } from "./catalog-passthrough-fixture.js";
@@ -39,27 +43,6 @@ function profile(id: string, defaultModel: string, models: string[]): AgentProfi
       ? { mechanism: "meta", levels: ["low", "high"] }
       : { mechanism: "configOption", configId: "reasoning_effort", levels: ["low", "high"] },
   } as AgentProfile;
-}
-
-function description(value: SessionRecord, defaults: Map<string, string>): ConfigDescription {
-  const cfg = JSON.parse(value.configJson || "{}") as SessionConfigState;
-  return {
-    sessionId: value.id,
-    channelRef: value.channelRef,
-    parentRef: value.parentRef,
-    agent: { value: value.agentId, source: "session config" },
-    model: {
-      value: cfg.model ?? defaults.get(value.agentId) ?? "unknown",
-      source: cfg.model ? "session config" : "default",
-    },
-    effort: { value: cfg.reasoningEffort ?? null, source: "session config" },
-    role: { value: cfg.role ?? null, source: cfg.role ? "session config" : "default" },
-    disableThreadPrefix: {
-      value: cfg.disableThreadPrefix === true,
-      source: cfg.disableThreadPrefix === true ? "session config" : "default",
-    },
-    location: { value: "local", source: "default" },
-  } as ConfigDescription;
 }
 
 function makeRuntime(
@@ -101,7 +84,6 @@ function harness(opts: {
     profile("codex", "gpt-old", ["gpt-old", "gpt-new"]),
     profile("ollama-cloud", "qwen-old", ["qwen-old", "qwen-new"]),
   ];
-  const defaults = new Map(profiles.map((entry) => [entry.id, entry.defaultModel]));
   const byProfile = new Map(profiles.map((entry) => [entry.id, entry]));
   const records = new Map<string, SessionRecord>([[target.id, target], [caller.id, caller]]);
   const runtimes: SessionControlRuntime[] = [];
@@ -119,6 +101,8 @@ function harness(opts: {
     role?: string | null;
     disableThreadPrefix?: boolean | null;
   }> = [];
+  const threadPresets = new Map<string, ThreadPreset>();
+  const catalog = opts.catalog ?? fixtureModelCatalog(profiles);
   const identityCommitted = vi.fn(async () => { const live = records.get(target.id); if (live) records.set(target.id, { ...live, namePrefix: "managed " }); });
   let nextSession = 1;
 
@@ -130,8 +114,8 @@ function harness(opts: {
       upsert: (value) => { records.set(value.id, value); },
     },
     router: {
-      describeConfig: (value) => ({ ...description(records.get(value.id) ?? value, defaults),
-        location: { value: opts.location ?? "local", source: "default" } }),
+      describeConfig: (value, selection) => resolution.describeConfig(records.get(value.id) ?? value,
+        { location: opts.location ?? "local", ...selection }),
       getProfile: (id) => byProfile.get(id),
       assertAgentAllowedForRecord: (_value, agentId) => {
         if (opts.restrictionError && agentId === "copilot") throw new Error(opts.restrictionError);
@@ -163,8 +147,23 @@ function harness(opts: {
       },
     },
     mutation: {
-      applyThreadOverlay: ({ changes }) => {
+      readThreadPresetEntry: threadId => {
+        const entry = threadPresets.get(threadId);
+        return entry === undefined ? undefined : structuredClone(entry);
+      },
+      restoreThreadPresetEntry: (threadId, previous) => {
+        if (previous === undefined) threadPresets.delete(threadId);
+        else threadPresets.set(threadId, structuredClone(previous) as ThreadPreset);
+        return { ok: true };
+      },
+      applyThreadOverlay: ({ threadId, changes }) => {
         overlays.push(changes);
+        const entry = { ...threadPresets.get(threadId) } as Record<string, unknown>;
+        for (const [key, value] of Object.entries(changes)) {
+          if (value === null) delete entry[key];
+          else entry[key] = key === "fastMode" ? value : { value };
+        }
+        threadPresets.set(threadId, entry as ThreadPreset);
         return { ok: true, message: "updated", auditId: "audit-overlay-1" };
       },
       applySessionConfig: (value, changes) => {
@@ -200,9 +199,14 @@ function harness(opts: {
         };
       },
     },
-    modelCatalog: opts.catalog ?? fixtureModelCatalog(profiles),
+    modelCatalog: catalog,
     identityCommitted,
   };
+  const resolution = new SessionRouter({
+    logger: pino({ level: "silent" }), store: deps.store as SessionStore, profiles,
+    modelCatalog: catalog as ModelCatalogService, defaultAgentId: "claude",
+    defaultModel: "claude-old", defaultCwd: "/repo", threadPresets,
+  });
 
   return {
     caller,
@@ -213,6 +217,7 @@ function harness(opts: {
     invalidationOptions,
     mutations,
     overlays,
+    threadPresets,
     identityCommitted,
     service: new ThreadSessionControlService(deps),
   };
@@ -376,7 +381,9 @@ describe("ThreadSessionControlService", () => {
     });
     // Removing the intent tag makes agent switches strand the outgoing session's work.
     expect(h.invalidationOptions).toEqual([{ operatorIntent: "replace-session" }]);
-    expect(h.overlays[0]).toEqual({ agent: "codex", model: "gpt-old", effort: "default" });
+    expect(h.overlays[0]).toEqual({ agent: "codex", model: null, effort: null });
+    expect(JSON.parse(h.records.get(h.target.id)!.configJson)).not.toHaveProperty("model");
+    expect(JSON.parse(h.records.get(h.target.id)!.configJson)).not.toHaveProperty("reasoningEffort");
   });
 
   it("returns an exact no-change identity without touching the runtime", async () => {
@@ -506,9 +513,10 @@ describe("ThreadSessionControlService", () => {
       },
     });
     expect(h.invalidated).toEqual([h.target.id]);
-    expect(h.mutations).toEqual([
+    expect(h.overlays).toEqual([
       { agent: "codex", model: "gpt-new", effort: "high" },
     ]);
+    expect(JSON.parse(h.records.get(h.target.id)!.configJson)).toMatchObject({ model: "gpt-new", reasoningEffort: "high" });
     expect(h.runtimes[0]!.optionCalls).toEqual([]);
     expect(h.identityCommitted).toHaveBeenCalledOnce();
   });
@@ -546,6 +554,7 @@ describe("ThreadSessionControlService", () => {
 
     expect(result).toEqual({ ok: false, error: "replacement unavailable" });
     expect(h.records.get(h.target.id)).toEqual(h.target);
+    expect(h.threadPresets.has(h.target.channelRef)).toBe(false);
     expect(h.invalidated).toEqual([h.target.id, h.target.id]);
     expect(h.invalidationOptions[1]).toEqual({ clearStartFailure: true });
   });

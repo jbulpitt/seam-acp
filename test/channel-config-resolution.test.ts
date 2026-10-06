@@ -22,7 +22,7 @@ import { visualConfig } from "./plugin-card-visuals-fixture.js";
 
 const logger = pino({ level: "silent" }) as Logger;
 const actor = { id: "operator", name: "Operator" };
-const channel = { platform: "discord", id: "thread", parentId: "parent" };
+const channel = { platform: "discord", id: "333333333333333333", parentId: "111111111111111111" };
 const profiles = ["claude", "codex"].map(id => ({
   id, defaultModel: `${id}-default`,
   staticModels: ["default", "channel", "explicit"].map(kind => ({ modelId: `${id}-${kind}`, name: `${id}-${kind}` })),
@@ -38,7 +38,7 @@ afterEach(() => { store.close(); fs.rmSync(dir, { recursive: true, force: true }
 
 function fixture() {
   const file = path.join(dir, "presets.json");
-  fs.writeFileSync(file, JSON.stringify({ channels: { parent: {
+  fs.writeFileSync(file, JSON.stringify({ channels: { "111111111111111111": {
     agent: { value: "codex" }, model: { value: "codex-channel" },
     effort: { value: "high" }, cwd: { value: dir },
   } }, threads: {} }));
@@ -60,7 +60,7 @@ function fixture() {
     parkedSelectMessage: () => null });
   const record = router.ensureSessionRecord({ platform: "discord", channelRef: channel.id, parentRef: channel.parentId, cwd: dir });
   const bare = Object.assign(Object.create(Orchestrator.prototype), { store, router, config, logger,
-    adapter: { resolveChannel: vi.fn(async (ref: typeof channel) => ({ ...ref, parentId: "parent" })) } });
+    adapter: { resolveChannel: vi.fn(async (ref: typeof channel) => ({ ...ref, parentId: "111111111111111111" })) } });
   return { maps, catalog, router, mutation, plan, runtime, config, record, bare };
 }
 
@@ -108,27 +108,27 @@ describe("one channel configuration resolution", () => {
     const h = fixture();
     store.upsert({ ...h.record, parentRef: null, acpSessionId: "kept-context", agentId: "claude", configJson: '{"model":"claude-explicit"}' });
     const before = store.get(h.record.id)!;
-    const linked = h.router.ensureSessionRecord({ platform: "discord", channelRef: channel.id, parentRef: "parent", cwd: dir });
-    expect(linked).toMatchObject({ ...before, parentRef: "parent", updatedUtc: expect.any(String) });
+    const linked = h.router.ensureSessionRecord({ platform: "discord", channelRef: channel.id, parentRef: "111111111111111111", cwd: dir });
+    expect(linked).toMatchObject({ ...before, parentRef: "111111111111111111", updatedUtc: expect.any(String) });
     expect(h.router.describeConfig(linked).model.value).toBe("codex-channel");
-    expect(h.router.ensureSessionRecord({ platform: "discord", channelRef: channel.id, parentRef: "different", cwd: dir }).parentRef).toBe("parent");
+    expect(h.router.ensureSessionRecord({ platform: "discord", channelRef: channel.id, parentRef: "111111111111111112", cwd: dir }).parentRef).toBe("111111111111111111");
   });
 
   it("first-touch binding resolves the real Discord parent, not the caller's channel", async () => {
     const h = fixture();
-    const linked = await h.bare.bindThreadRecord({ platform: "discord", id: "first-touch" });
-    expect(h.bare.adapter.resolveChannel).toHaveBeenCalledWith({ platform: "discord", id: "first-touch" });
-    expect(linked.parentRef).toBe("parent");
+    const linked = await h.bare.bindThreadRecord({ platform: "discord", id: "333333333333333334" });
+    expect(h.bare.adapter.resolveChannel).toHaveBeenCalledWith({ platform: "discord", id: "333333333333333334" });
+    expect(linked.parentRef).toBe("111111111111111111");
     expect(h.router.describeConfig(linked).agent.value).toBe("codex");
-    await h.bare.bindThreadRecord({ platform: "discord", id: "first-touch" });
+    await h.bare.bindThreadRecord({ platform: "discord", id: "333333333333333334" });
     expect(h.bare.adapter.resolveChannel).toHaveBeenCalledTimes(1);
   });
 
   it("a real lookup error is not converted into an unlinked session", async () => {
     const h = fixture();
     h.bare.adapter.resolveChannel.mockRejectedValue(new Error("Discord lookup failed: 503"));
-    await expect(h.bare.bindThreadRecord({ platform: "discord", id: "unavailable" })).rejects.toThrow("Discord lookup failed: 503");
-    expect(store.getByChannel("discord", "unavailable")).toBeNull();
+    await expect(h.bare.bindThreadRecord({ platform: "discord", id: "333333333333333335" })).rejects.toThrow("Discord lookup failed: 503");
+    expect(store.getByChannel("discord", "333333333333333335")).toBeNull();
   });
 
   it.each(["dispatch", "interrupt", "compact", "steer", "reauth"])("%s resolves the parent on first touch", async entry => {
@@ -136,7 +136,7 @@ describe("one channel configuration resolution", () => {
     const target = "1111";
     const lookupError = new Error("first-touch lookup");
     h.bare.adapter.resolveChannel.mockRejectedValue(lookupError);
-    const spec = { id: "first-touch", kind: "handoff", target, session: "live", prompt: "work", createdUtc: new Date().toISOString() };
+    const spec = { id: "333333333333333334", kind: "handoff", target, session: "live", prompt: "work", createdUtc: new Date().toISOString() };
     const invoke = async () => {
       switch (entry) {
         case "dispatch": return h.bare.dispatchInjectTurnOwned(spec, {});
@@ -146,7 +146,7 @@ describe("one channel configuration resolution", () => {
         case "steer":
           h.bare.normalizeAutocompleteSubmission = async () => target;
           return h.bare.cmdSteer({ channelId: channel.id, channel: { parentId: channel.parentId },
-            options: { getString: (key: string) => key === "thread" ? target : "steer", getBoolean: () => false } });
+            options: { getString: (key: string) => key === "333333333333333333" ? target : "steer", getBoolean: () => false } });
       }
     };
     if (entry === "reauth") expect(await invoke()).toBeUndefined();
@@ -156,10 +156,10 @@ describe("one channel configuration resolution", () => {
   });
 
   it.each([true, false])("Discord parent resolution distinguishes a thread from a category (%s)", async isThread => {
-    const ref = { platform: "discord", id: "resolved" };
+    const ref = { platform: "discord", id: "333333333333333336" };
     const adapter = Object.assign(Object.create(DiscordAdapter.prototype), { platform: "discord",
-      client: { channels: { fetch: async () => ({ id: ref.id, parentId: "parent-or-category", isThread: () => isThread }) } } });
-    expect(await adapter.resolveChannel(ref)).toEqual({ ...ref, ...(isThread ? { parentId: "parent-or-category" } : {}) });
+      client: { channels: { fetch: async () => ({ id: ref.id, parentId: "111111111111111113", isThread: () => isThread }) } } });
+    expect(await adapter.resolveChannel(ref)).toEqual({ ...ref, ...(isThread ? { parentId: "111111111111111113" } : {}) });
   });
 
   it("preset agent, model, effort and repo become authoritative thread overrides", async () => {
@@ -183,7 +183,7 @@ describe("one channel configuration resolution", () => {
     expect(h.maps.threadPresets.get(channel.id)?.model).toBeUndefined();
     expect(h.maps.threadPresets.get(channel.id)?.effort).toBeUndefined();
     expect(store.readConfig(store.get(h.record.id)!)).not.toHaveProperty("model");
-    h.mutation.applyChannelOverlay({ channelId: "parent", actor, changes: { model: "codex-explicit", effort: "low" } });
+    h.mutation.applyChannelOverlay({ channelId: "111111111111111111", actor, changes: { model: "codex-explicit", effort: "low" } });
     expect(h.router.planRuntimeSpawn(store.get(h.record.id)!)).toMatchObject({ agentId: "codex", model: "codex-explicit", effort: "low" });
   });
 
@@ -261,7 +261,7 @@ describe("one channel configuration resolution", () => {
     const mux = { spawn: vi.fn(() => ({ slot: 1 })),
       rpc: vi.fn(async () => ({ projectMcpInjection: true })), releaseStdin: vi.fn() };
     const adapter = { sendPanel: vi.fn(async () => ({ channel, id: "status-card" })), editPanel: vi.fn(async () => {}),
-      sendMessage: vi.fn(async () => ({ channel, id: "answer" })), resolveChannel: vi.fn(async ref => ({ ...ref, parentId: "parent" })) };
+      sendMessage: vi.fn(async () => ({ channel, id: "answer" })), resolveChannel: vi.fn(async ref => ({ ...ref, parentId: "111111111111111111" })) };
     const orch = new Orchestrator({ logger, config: h.config, store, router: h.router,
       modelCatalog: h.catalog, renderer: discordRenderer, adapter: adapter as any });
     (orch as any).bridgeHub = { markSessionBridge: vi.fn(), get: () => ({ mux }), mcpServersForBridgeSpawn: () => undefined };
@@ -272,7 +272,7 @@ describe("one channel configuration resolution", () => {
       await opts.onSession?.("isolated-context");
       opts.lifecycle!.beforePrompt();
       // Editing defaults mid-turn must not rewrite this attempt's identity.
-      h.mutation.applyChannelOverlay({ channelId: "parent", actor, changes: { model: "codex-explicit", effort: "low" } });
+      h.mutation.applyChannelOverlay({ channelId: "111111111111111111", actor, changes: { model: "codex-explicit", effort: "low" } });
       const result = { text: "done", stopReason: "end_turn" };
       opts.lifecycle!.onOutcome(result);
       return result;

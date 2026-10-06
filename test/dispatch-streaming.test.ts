@@ -100,13 +100,20 @@ function makeOrch(opts: {
 }): Orchestrator {
   const router = {
     listProfiles: () => [],
-    describeConfig: () => ({}),
+    describeConfig: (row: SessionRecord) => ({
+      agent: { value: row.agentId, source: "session config" },
+      model: { value: "default", source: "default" },
+      effort: { value: null, source: "default" },
+      location: { value: "local", source: "default" },
+      cwd: { value: row.repoPath, source: "default" },
+    }),
     ensureSessionRecord: ({ channelRef }: { channelRef: string }) =>
       record({ id: `discord:${channelRef}`, channelRef }),
     getProfile: () => undefined,
     getOrStartRuntime: async () => opts.rt,
   };
   const store = {
+    getByChannel: () => null,
     getPresetByName: () => null,
     recordDelegation: () => {},
     // #170: dispatchInjectTurn now looks the spec up by exact id before

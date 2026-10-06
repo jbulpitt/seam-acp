@@ -13,9 +13,13 @@ function fixture(error: unknown, classifyError?: AgentProfile["classifyError"], 
   const logger = { warn: vi.fn(), info: vi.fn(), error: vi.fn(), debug: vi.fn(), child() { return this; } };
   const profile = { id: agentId, classifyError, spawn: () => { throw error; } } as unknown as AgentProfile;
   const runtime = new AgentRuntime({ profile, logger: logger as unknown as Logger, bridgeHealth, claudeCredentialFacts, spawnFn: () => { throw error; } });
-  const prompt = vi.fn().mockRejectedValue(error);
+  const prompt = vi.fn(async () => {
+    await (runtime as any).handleSessionUpdate({ sessionUpdate: "agent_message_chunk",
+      content: { type: "text", text: "partial response" } });
+    throw error;
+  });
   // This suite isolates classification; prompt recovery has its own behavioral
-  // suite. Ephemeral work is the production one-attempt path, not a mock gate.
+  // suite. Ephemeral work with an observed update is the one-attempt path.
   Object.assign(runtime, { connection: { prompt, newSession: prompt, loadSession: prompt }, sessionId: "dispatch:fixture-session", promptCapabilities: {} });
   return { runtime, logger, prompt };
 }
@@ -36,7 +40,7 @@ describe("#441 real runtime boundary to pure resolver (no providers)", () => {
       expect.objectContaining({ agentId: "claude", errorKind: "rate_limit", operation: "session/prompt",
         errorMessage: original.message, errorCode: -32603, errorStatus: null, errorData: { trace: "retained" } }),
       "adapter error classified");
-    expect(prompt).toHaveBeenCalledTimes(1); // #426 ephemeral work does not retry.
+    expect(prompt).toHaveBeenCalledTimes(1);
   });
 
   it.each(["missing", "unrecognized", "throws"] as const)("%s classifier is attributable unclassified, not invisible", async (mode) => {
@@ -165,7 +169,7 @@ describe("#487 child-owner health precedes the recovery verdict", () => {
     expect(thrown.data.details).toContain("bridge slot 7 is alive");
     expect(resolveError(readErrorClassification(thrown)!, DEFAULT_ERROR_RULES).errorKind).toBe("protocol_error");
     expect(h.sendCmd).toHaveBeenCalledExactlyOnceWith("listSlots", {});
-    expect(h.prompt).toHaveBeenCalledTimes(1); // Ephemeral scope still never replays.
+    expect(h.prompt).toHaveBeenCalledTimes(1);
     expect(h.logger.warn).toHaveBeenCalledWith(expect.objectContaining({ errorKind: "protocol_error", operation: "session/prompt" }), "adapter error classified");
     expect(h.logger.warn).not.toHaveBeenCalledWith(expect.objectContaining({ errorKind: "agent_exit" }), "adapter error classified");
   });

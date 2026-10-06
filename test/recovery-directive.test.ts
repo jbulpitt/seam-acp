@@ -43,12 +43,20 @@ describe("#448 wire directive and mechanical bounded owner", () => {
     expect(directive.surface).toBe(true);
   });
 
-  it("ephemeral work and cancellation only surface, without provider retries", () => {
+  it("ephemeral work defaults to report-only and cancellation cannot be overridden", () => {
     const rate = resolveError({ errorKind: "rate_limit", agentId: "fixture" }, DEFAULT_ERROR_RULES);
     const cancelled = resolveError({ errorKind: "cancelled", agentId: "fixture" }, DEFAULT_ERROR_RULES);
-    for (const directive of [buildRecoveryDirective(rate, "ephemeral"), buildRecoveryDirective(cancelled, "conversation")]) {
+    for (const directive of [buildRecoveryDirective(rate, "ephemeral"),
+      buildRecoveryDirective(cancelled, "conversation"), buildRecoveryDirective(cancelled, "ephemeral", [1, 5])]) {
       expect(directive.steps).toEqual([{ rung: 5, retryCount: 0, backoffMs: [], optionIds: [] }]);
     }
+  });
+
+  it.each(["overloaded", "auth_contention"] as const)("uses the existing %s schedule when the ephemeral caller permits rung 1", kind => {
+    const verdict = resolveError({ errorKind: kind, agentId: kind === "overloaded" ? "codex" : "claude" }, DEFAULT_ERROR_RULES);
+    const directive = buildRecoveryDirective(verdict, "ephemeral", [1, 5]);
+    expect(directive.scope).toBe("ephemeral");
+    expect(directive.steps).toEqual(buildRecoveryDirective(verdict, "conversation").steps);
   });
 
   it("a changed failure cannot replenish the first budget", async () => {

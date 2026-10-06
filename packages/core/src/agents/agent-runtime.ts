@@ -1504,8 +1504,10 @@ export class AgentRuntime {
           ? PROVIDER_RETRY_WINDOW_MS : undefined,
         delays: error => {
           const resolution = resolveError(readErrorClassification(error) ?? unclassified(this.profile.id), DEFAULT_ERROR_RULES);
-          const directive = buildRecoveryDirective(resolution,
-            sid.startsWith("dispatch:") || opts?.recoveryScope === "ephemeral" ? "ephemeral" : "conversation");
+          const scope = sid.startsWith("dispatch:") || opts?.recoveryScope === "ephemeral"
+            ? "ephemeral" : "conversation";
+          const directive = buildRecoveryDirective(resolution, scope,
+            scope === "ephemeral" && this.sawUpdateThisTurn ? [5] : [1, 5]);
           this.logger.warn({ sessionId: sid, resolution, directive }, "turn recovery resolved");
           lastErrorKind = resolution.errorKind;
           const evidence = receipt.submission;

@@ -32,13 +32,13 @@ function makePort(initial: string[]) {
     state,
     log,
     resumeCalls: [] as string[],
-    abandonCalls: [] as string[],
+    cancelCalls: [] as string[],
     renderCalls: [] as number[],
     /** Every card write, in the order it landed. */
     applied: [] as Array<{ kind: "refresh" | "terminal"; rows: string[]; reason?: string }>,
     hooks: {} as {
       resume?: (id: string) => Promise<void>;
-      abandon?: (id: string) => Promise<void>;
+      cancel?: (id: string) => Promise<void>;
       render?: (page: number) => Promise<void>;
     },
     async resume(id: string) {
@@ -48,12 +48,12 @@ function makePort(initial: string[]) {
       state.delete(id);
       return `resumed ${id}`;
     },
-    async abandon(id: string) {
-      port.abandonCalls.push(id);
-      log.push(`abandon:${id}`);
-      await port.hooks.abandon?.(id);
+    async cancel(id: string) {
+      port.cancelCalls.push(id);
+      log.push(`cancel:${id}`);
+      await port.hooks.cancel?.(id);
       state.delete(id);
-      return `abandoned ${id}`;
+      return `canceled ${id}`;
     },
     async render(page: number) {
       port.renderCalls.push(page);
@@ -94,7 +94,7 @@ function makeClick() {
 describe("parseWorkflowInventoryClick", () => {
   it("reads the wf:<action>:<arg> shape with no revision segment", () => {
     expect(parseWorkflowInventoryClick("wf:resume:del-1")).toEqual({ action: "resume", arg: "del-1" });
-    expect(parseWorkflowInventoryClick("wf:abandon:del-1")).toEqual({ action: "abandon", arg: "del-1" });
+    expect(parseWorkflowInventoryClick("wf:cancel:del-1")).toEqual({ action: "cancel", arg: "del-1" });
     expect(parseWorkflowInventoryClick("wf:page:2")).toEqual({ action: "page", arg: "2" });
   });
 
@@ -164,19 +164,19 @@ describe("concurrent clicks on one row", () => {
     expect(port.resumeCalls).toEqual(["r1"]);
   });
 
-  it("Resume and Abandon race on the same row — the turn mutates once", async () => {
+  it("Resume and Cancel race on the same row — the turn mutates once", async () => {
     const port = makePort(["r1", "r2"]);
     const controller = new WorkflowInventoryController(port);
     const gate = deferred();
     port.hooks.resume = () => gate.promise;
 
     const a = controller.handle("wf:resume:r1", makeClick().port);
-    const b = controller.handle("wf:abandon:r1", makeClick().port);
+    const b = controller.handle("wf:cancel:r1", makeClick().port);
     gate.resolve();
 
     expect(await a).toBe("mutated");
     expect(await b).toBe("dropped");
-    expect(port.abandonCalls).toEqual([]);
+    expect(port.cancelCalls).toEqual([]);
   });
 
   it("different rows are not serialised behind each other", async () => {
@@ -186,13 +186,13 @@ describe("concurrent clicks on one row", () => {
     port.hooks.resume = () => gate.promise;
 
     const a = controller.handle("wf:resume:r1", makeClick().port);
-    const b = controller.handle("wf:abandon:r2", makeClick().port);
+    const b = controller.handle("wf:cancel:r2", makeClick().port);
     gate.resolve();
 
     expect(await a).toBe("mutated");
     expect(await b).toBe("mutated");
     expect(port.resumeCalls).toEqual(["r1"]);
-    expect(port.abandonCalls).toEqual(["r2"]);
+    expect(port.cancelCalls).toEqual(["r2"]);
   });
 
   it("the claim is released so the row can be acted on again later", async () => {
@@ -233,7 +233,7 @@ describe("render ordering across keys", () => {
     };
 
     const paging = controller.handle("wf:page:1", makeClick().port);
-    const mutating = controller.handle("wf:abandon:r1", makeClick().port);
+    const mutating = controller.handle("wf:cancel:r1", makeClick().port);
     // Let the mutation run as far as it can while the page rebuild is parked.
     // Without card-level serialization it finishes and paints here, so the
     // parked older rebuild would repaint over it below.
@@ -259,11 +259,11 @@ describe("render ordering across keys", () => {
       await gate.promise;
     };
 
-    const a = controller.handle("wf:abandon:r1", makeClick().port);
+    const a = controller.handle("wf:cancel:r1", makeClick().port);
     // r1 is consumed and its rebuild has already snapshotted [r2, r3]; it is
     // now parked mid-paint.
     await flush();
-    const b = controller.handle("wf:abandon:r2", makeClick().port);
+    const b = controller.handle("wf:cancel:r2", makeClick().port);
     // Without card-level serialization r2's rebuild paints [r3] here, and the
     // parked older paint below would put r2's controls straight back.
     await flush();
@@ -279,7 +279,7 @@ describe("render ordering across keys", () => {
     const controller = new WorkflowInventoryController(port);
     await controller.handle("wf:page:2", makeClick().port);
     expect(controller.currentPage).toBe(2);
-    await controller.handle("wf:abandon:r1", makeClick().port);
+    await controller.handle("wf:cancel:r1", makeClick().port);
     // The mutation rebuilt the page the card was actually showing.
     expect(port.renderCalls).toEqual([2, 2]);
   });
@@ -291,17 +291,17 @@ describe("card state after a mutation", () => {
     const controller = new WorkflowInventoryController(port);
     const click = makeClick();
 
-    expect(await controller.handle("wf:abandon:r1", click.port)).toBe("mutated");
+    expect(await controller.handle("wf:cancel:r1", click.port)).toBe("mutated");
     expect(port.applied).toEqual([{ kind: "refresh", rows: ["r2"] }]);
-    expect(click.state.followUps).toEqual(["abandoned r1"]);
+    expect(click.state.followUps).toEqual(["canceled r1"]);
   });
 
   it("goes terminal — no components at all — when the last row is consumed", async () => {
     const port = makePort(["r1"]);
     const controller = new WorkflowInventoryController(port);
 
-    expect(await controller.handle("wf:abandon:r1", makeClick().port)).toBe("mutated");
-    expect(port.applied).toEqual([{ kind: "terminal", rows: [], reason: "abandon" }]);
+    expect(await controller.handle("wf:cancel:r1", makeClick().port)).toBe("mutated");
+    expect(port.applied).toEqual([{ kind: "terminal", rows: [], reason: "cancel" }]);
   });
 
   it("refreshes the original card before reporting the result", async () => {
@@ -327,7 +327,7 @@ describe("card state after a mutation", () => {
       },
     };
     const spyController = new WorkflowInventoryController(spyPort);
-    await spyController.handle("wf:abandon:r1", ordered);
+    await spyController.handle("wf:cancel:r1", ordered);
     expect(merged).toEqual(["render", "refresh", "followUp"]);
   });
 });
@@ -348,4 +348,8 @@ describe("clicks that are not ours", () => {
     expect(await controller.handle("wf:page:not-a-number", click.port)).toBe("ignored");
     expect(port.applied).toEqual([]);
   });
+  it("keeps old inventory custom ids as Cancel aliases", () => {
+    expect(parseWorkflowInventoryClick("wf:abandon:old-row")).toEqual({ action: "cancel", arg: "old-row" });
+  });
+
 });

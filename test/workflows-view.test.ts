@@ -146,7 +146,7 @@ describe("formatWorkflowsView", () => {
 });
 
 describe("formatInterruptedLine", () => {
-  it("renders thread, age, and correlation for Resume/Abandon inventory", () => {
+  it("renders thread, age, and correlation for Resume/Cancel inventory", () => {
     const line = formatInterruptedLine(
       {
         id: "disp-abc12345",
@@ -168,7 +168,7 @@ describe("formatInterruptedLine", () => {
     expect(line).toContain("10m");
   });
 
-  it("uses the abandoned icon", () => {
+  it("displays legacy abandoned rows as cancelled", () => {
     const lines = formatInterruptedLines(
       [
         {
@@ -185,7 +185,8 @@ describe("formatInterruptedLine", () => {
       NOW
     );
     expect(lines[0]).toContain("🚫");
-    expect(lines[0]).toContain("abandoned");
+    expect(lines[0]).toContain("cancelled");
+    expect(lines[0]).not.toContain("abandoned");
     expect(lines[0]).toContain("live");
   });
 });
@@ -223,9 +224,9 @@ const irow = (over: Partial<InterruptedTurnRow> = {}): InterruptedTurnRow => ({
 
 describe("interruptedRowActions", () => {
   it("uses the actions resolved from the current backing attempt", () => {
-    expect(interruptedRowActions(irow({ actions: ["resume", "abandon"] }))).toEqual(["resume", "abandon"]);
+    expect(interruptedRowActions(irow({ actions: ["resume", "cancel"] }))).toEqual(["resume", "cancel"]);
     expect(interruptedRowActions(irow({ actions: [] }))).toEqual([]);
-    expect(interruptedRowActions(irow())).toEqual(["abandon"]);
+    expect(interruptedRowActions(irow())).toEqual(["cancel"]);
   });
 
   it("an already-abandoned legacy dispatch is inert even with a target and session", () => {
@@ -243,12 +244,12 @@ describe("interruptedRowActions", () => {
     expect(isActionableInterruptedRow(row)).toBe(false);
   });
 
-  it("an interrupted dispatch missing targetRef keeps Abandon but drops Resume", () => {
-    expect(interruptedRowActions(irow({ targetRef: null }))).toEqual(["abandon"]);
+  it("an interrupted dispatch missing targetRef keeps Cancel but drops Resume", () => {
+    expect(interruptedRowActions(irow({ targetRef: null }))).toEqual(["cancel"]);
   });
 
-  it("an interrupted dispatch missing its session keeps Abandon but drops Resume", () => {
-    expect(interruptedRowActions(irow({ acpSessionId: null }))).toEqual(["abandon"]);
+  it("an interrupted dispatch missing its session keeps Cancel but drops Resume", () => {
+    expect(interruptedRowActions(irow({ acpSessionId: null }))).toEqual(["cancel"]);
   });
 
   it("an abandoned live turn has nothing left to click", () => {
@@ -258,8 +259,8 @@ describe("interruptedRowActions", () => {
   });
 
   it("a live marker is always abandonable, and resumable only with a session", () => {
-    expect(interruptedRowActions(irow({ source: "live" }))).toEqual(["resume", "abandon"]);
-    expect(interruptedRowActions(irow({ source: "live", acpSessionId: null }))).toEqual(["abandon"]);
+    expect(interruptedRowActions(irow({ source: "live" }))).toEqual(["resume", "cancel"]);
+    expect(interruptedRowActions(irow({ source: "live", acpSessionId: null }))).toEqual(["cancel"]);
   });
 });
 
@@ -293,7 +294,7 @@ describe("paginateInterruptedRows", () => {
     expect(paginateInterruptedRows(rows, -4).page).toBe(0);
   });
 
-  it("a Resume/Abandon rebuild drops the consumed row's controls", () => {
+  it("a Resume/Cancel rebuild drops the consumed row's controls", () => {
     // Page 1 of a two-page inventory, then the acted-on row leaves the set.
     const before = Array.from({ length: 5 }, (_, i) => irow({ id: `del-${i}` }));
     expect(paginateInterruptedRows(before, 1).items.map((r) => r.id)).toEqual(["del-4"]);

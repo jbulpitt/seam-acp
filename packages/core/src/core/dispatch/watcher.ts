@@ -65,7 +65,7 @@ export interface DispatchWatcherOpts {
    * Run one dispatched turn. Resolve ⇒ `done/` gets `status: "completed"`;
    * reject ⇒ `status: "failed"` with the error message.
    */
-  onDispatch: (spec: DispatchSpec) => Promise<{ output: string; stopReason: string }>;
+  onDispatch: (spec: DispatchSpec, operatorResume?: boolean) => Promise<{ output: string; stopReason: string }>;
   /**
    * Observe a retained callback that no other actor will finish — i.e. a
    * `defect` refusal. Shutdown and superseded retentions never reach here:
@@ -138,7 +138,7 @@ export interface DispatchWatcherStartOpts {
 export function createRuntimeDispatchWatcher(
   opts: Omit<DispatchWatcherOpts, "onDispatch" | "onRetained" | "beforeAdmission"> & {
     runtime: {
-      dispatchInjectTurn(spec: DispatchSpec): Promise<{ output: string; stopReason: string }>;
+      dispatchInjectTurn(spec: DispatchSpec, operatorResume?: boolean): Promise<{ output: string; stopReason: string }>;
       observeRetainedDispatch(spec: DispatchSpec, err?: DispatchSuspendedError): Promise<void>;
       recoverInterruptedTurns(): Promise<void>;
       reconcileRemoteRecoveries?(): Promise<void>;
@@ -148,7 +148,7 @@ export function createRuntimeDispatchWatcher(
   const { runtime, ...watcherOpts } = opts;
   return new DispatchWatcher({
     ...watcherOpts,
-    onDispatch: (spec) => runtime.dispatchInjectTurn(spec),
+    onDispatch: (spec, operatorResume) => operatorResume ? runtime.dispatchInjectTurn(spec, true) : runtime.dispatchInjectTurn(spec),
     onRetained: (spec, err) => runtime.observeRetainedDispatch(spec, err),
     // #307: protects the production recovery barrier; deleting this wire lets
     // the runtime watcher admit pending work before interrupted turns requeue.
@@ -162,6 +162,7 @@ interface ClaimOwnership {
   readonly spec: DispatchSpec;
   readonly targetEpoch: number;
   readonly globalEpoch: number;
+  readonly operatorResume: boolean;
 }
 
 /** Opaque synchronous fence handed from the orchestrator to async recovery. */
@@ -182,7 +183,7 @@ export class DispatchWatcher {
   private readonly attempts: TurnAttemptStore;
   /** Boot/operator preconditions authorize an existing suspended row, not a
    * second durable queue. A new boot recomputes this transient permission. */
-  private readonly recoveryReady = new Set<string>();
+  private readonly recoveryReady = new Map<string, boolean>();
   private readonly deferred = new Set<string>();
   private readonly beforeAdmission?: () => Promise<void>;
   private admissionRelease: Promise<void> = Promise.resolve();
@@ -485,7 +486,7 @@ export class DispatchWatcher {
       .filter((name) => name.endsWith(".json"))
       .map((name) => name.slice(0, -".json".length)),
       ...this.attempts.list("pending").filter(a => a.source === "dispatch").map(a => a.id),
-      ...this.recoveryReady])]
+      ...this.recoveryReady.keys()])]
       .filter((id) => !this.inFlight.has(id) && !this.claiming.has(id) && !this.deferred.has(id));
     const claimFenceSequence = this.fenceSequence;
     const claimGlobalEpoch = this.globalEpoch;
@@ -552,14 +553,14 @@ export class DispatchWatcher {
   }
 
   /** Authorize an existing SQL attempt after boot/operator preconditions. */
-  async requeueStale(id: string): Promise<boolean> {
+  async requeueStale(id: string, operatorResume = false): Promise<boolean> {
     return this.withArtifact(id, async () => {
       if (this.beforeRecoveryPublish) await this.beforeRecoveryPublish(id);
       const a = this.attempts.get(id);
       if (!a || a.source !== "dispatch" || a.state !== "suspended") return false;
       // Refuse only a terminal execution. A stale delegation projection cannot
       // strand nonterminal SQL-owned work; the owning dispatcher repairs it.
-      this.recoveryReady.add(id);
+      this.recoveryReady.set(id, operatorResume);
       this.deferred.delete(id);
       return true;
     });
@@ -625,7 +626,7 @@ export class DispatchWatcher {
           if (a.outcome) await this.finishLocked(a.id, a.outcome);
           return;
         }
-        if (a.state === "suspended") this.recoveryReady.add(a.id);
+        if (a.state === "suspended") this.recoveryReady.set(a.id, this.recoveryReady.get(a.id) ?? false);
         this.deferred.delete(a.id);
         recovered.push(a.id);
       });
@@ -681,7 +682,7 @@ export class DispatchWatcher {
     if (recorded) {
       target = recorded.spec.target;
       correlationId = recorded.spec.correlationId;
-      this.attempts.cancel(id, `abandoned: ${reason}`);
+      this.attempts.cancel(id, `cancelled: ${reason}`);
     }
     for (const dir of recorded ? [] : [this.dirs.pending]) {
       try {
@@ -697,7 +698,7 @@ export class DispatchWatcher {
       this.finishLocked(id, {
         id,
         status: "failed",
-        error: `abandoned: ${reason}`,
+        error: `cancelled: ${reason}`,
         target,
         ...(correlationId ? { correlationId } : {}),
         finishedUtc: new Date().toISOString(),
@@ -869,12 +870,13 @@ export class DispatchWatcher {
       // this commit is recoverable with SQL alone.
       recorded = this.attempts.admit(spec);
       spec = { ...recorded.spec, resume: recorded.promptStarted };
-      if (incoming && recorded.state === "suspended" && !recorded.stalledUtc) this.recoveryReady.add(id);
+      if (incoming && recorded.state === "suspended" && !recorded.stalledUtc) this.recoveryReady.set(id, this.recoveryReady.get(id) ?? false);
       await rm(pendingPath, { force: true }).catch(err =>
         this.logger.warn({ id, err }, "dispatch: admitted ingress cleanup failed; SQL owns the duplicate"));
       if (recorded.state !== "pending" && !this.recoveryReady.has(id)) return null;
       const owner: ClaimOwnership = Object.freeze({
         token, spec, targetEpoch: this.targetEpoch(spec.target), globalEpoch: this.globalEpoch,
+        operatorResume: this.recoveryReady.get(id) === true,
       });
       // Intake/fencing may change during best-effort ingress cleanup.
       if (!this.ready || this.globalEpoch !== startedGlobalEpoch ||
@@ -900,7 +902,7 @@ export class DispatchWatcher {
     let started: number | undefined;
     for (let attempt = 1; ; attempt++) {
       try {
-        return await this.onDispatch(spec);
+        return await (owner.operatorResume ? this.onDispatch(spec, true) : this.onDispatch(spec));
       } catch (err) {
         if (!(err instanceof DispatchSuspendedError) || err.suspension !== "retryable") throw err;
         const schedule = bootRecoveryBackoff(err);

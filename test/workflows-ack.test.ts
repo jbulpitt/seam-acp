@@ -108,34 +108,42 @@ describe("workflow acknowledgement", () => {
 
   it("defers before explicit admin bulk abandonment and uses the selected scope", async () => {
     const { orch, interaction, order } = fixture({ "abandon-older-than": "7", scope: "all" });
-    orch.abandonOldWorkflows = vi.fn(async () => { order.push("abandon"); return "Abandoned 2; records kept"; });
+    orch.cancelOldWorkflows = vi.fn(async () => { order.push("abandon"); return "Cancelled 2; records kept"; });
     await orch.handleSlashInteraction(interaction);
     expect(order).toEqual(["defer", "abandon", "edit"]);
-    expect(orch.abandonOldWorkflows).toHaveBeenCalledWith(7, undefined);
-    expect(interaction.editReply).toHaveBeenCalledWith({ content: "Abandoned 2; records kept" });
+    expect(orch.cancelOldWorkflows).toHaveBeenCalledWith(7, undefined);
+    expect(interaction.editReply).toHaveBeenCalledWith({ content: "Cancelled 2; records kept" });
   });
 
   it("defaults bulk abandonment to this thread", async () => {
     const { orch, interaction } = fixture({ "abandon-older-than": "14" });
-    orch.abandonOldWorkflows = vi.fn(async () => "kept");
+    orch.cancelOldWorkflows = vi.fn(async () => "kept");
     await orch.handleSlashInteraction(interaction);
-    expect(orch.abandonOldWorkflows).toHaveBeenCalledWith(14, "thread");
+    expect(orch.cancelOldWorkflows).toHaveBeenCalledWith(14, "thread");
   });
 
   it("keeps bulk abandonment admin-only", async () => {
     const { orch, interaction } = fixture({ "abandon-older-than": "7" });
     interaction.user.id = "not-admin";
-    orch.abandonOldWorkflows = vi.fn();
+    orch.cancelOldWorkflows = vi.fn();
     await orch.handleSlashInteraction(interaction);
-    expect(interaction.editReply).toHaveBeenCalledWith({ content: "Bulk workflow abandonment is admin-only." });
-    expect(orch.abandonOldWorkflows).not.toHaveBeenCalled();
+    expect(interaction.editReply).toHaveBeenCalledWith({ content: "Bulk workflow cancellation is admin-only." });
+    expect(orch.cancelOldWorkflows).not.toHaveBeenCalled();
   });
 
   it.each(["0", "-1", "1.5", "not-days"])("rejects invalid day input %s without mutating", async days => {
     const { orch, interaction } = fixture({ "abandon-older-than": days });
-    orch.abandonOldWorkflows = vi.fn();
+    orch.cancelOldWorkflows = vi.fn();
     await orch.handleSlashInteraction(interaction);
-    expect(interaction.editReply).toHaveBeenCalledWith({ content: "Pass a positive whole number of days for `abandon-older-than`." });
-    expect(orch.abandonOldWorkflows).not.toHaveBeenCalled();
+    expect(interaction.editReply).toHaveBeenCalledWith({ content: "Pass a positive whole number of days for `cancel-older-than`." });
+    expect(orch.cancelOldWorkflows).not.toHaveBeenCalled();
   });
+  it.each(["cancel", "abandon"])("accepts the %s slash spelling as Cancel", async option => {
+    const { orch, interaction } = fixture({ [option]: "parked-id" });
+    orch.performWorkflowAction = vi.fn(async () => "Cancelled parked-id");
+    await orch.handleSlashInteraction(interaction);
+    expect(orch.performWorkflowAction).toHaveBeenCalledWith("cancel", "parked-id", "thread");
+    expect(interaction.editReply).toHaveBeenCalledWith({ content: "Cancelled parked-id" });
+  });
+
 });

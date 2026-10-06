@@ -34,8 +34,8 @@ export function shortId(id: string): string {
   return tail.length > 8 ? tail.slice(0, 8) : tail;
 }
 
-export function workflowActionLabel(action: "resume" | "abandon", row: InterruptedTurnRow, now: Date): string {
-  return action === "resume" ? `Resume ${shortId(row.id)} (${formatAge(row.startedUtc, now)})` : `Abandon ${shortId(row.id)}`;
+export function workflowActionLabel(action: "resume" | "cancel", row: InterruptedTurnRow, now: Date): string {
+  return action === "resume" ? `Resume ${shortId(row.id)} (${formatAge(row.startedUtc, now)})` : `Cancel ${shortId(row.id)}`;
 }
 
 /** A thread/session ref without its platform prefix, clamped for one line. */
@@ -64,7 +64,7 @@ function entryLine(e: LedgerEntry, now: Date, continuation: boolean): string {
   const icon = STATUS_ICON[e.status] ?? "•";
   const route = `${shortRef(e.sourceRef, "scheduler")}→${shortRef(e.targetRef, "…")}`;
   const prefix = continuation ? "↳ " : "";
-  return `${prefix}${icon} \`${shortId(e.id)}\` ${e.kind} · ${route} · ${e.status} · ${formatAge(e.createdUtc, now)}`;
+  return `${prefix}${icon} \`${shortId(e.id)}\` ${e.kind} · ${route} · ${e.status === "abandoned" ? "cancelled" : e.status} · ${formatAge(e.createdUtc, now)}`;
 }
 
 /**
@@ -167,12 +167,12 @@ export interface InterruptedTurnRow {
 }
 
 /** One inventory line: thread, age, correlation — what the operator needs
- *  to decide Resume vs Abandon. */
+ *  to decide Resume vs Cancel. */
 export function formatInterruptedLine(row: InterruptedTurnRow, now: Date): string {
   const icon = row.status === "abandoned" ? "🚫" : "⚠️";
   const corr = row.correlationId ? ` · corr \`${shortId(row.correlationId)}\`` : "";
   const reason = row.reason ? ` · ${row.reason.slice(0, 160)}` : "";
-  return `${icon} \`${shortId(row.id)}\` ${row.source} · ${shortRef(row.channelRef, "?")} · ${row.status} · ${formatAge(row.startedUtc, now)}${corr}${reason}`;
+  return `${icon} \`${shortId(row.id)}\` ${row.source} · ${shortRef(row.channelRef, "?")} · ${row.status === "abandoned" ? "cancelled" : row.status} · ${formatAge(row.startedUtc, now)}${corr}${reason}`;
 }
 
 export function formatInterruptedLines(rows: InterruptedTurnRow[], now: Date): string[] {
@@ -180,16 +180,16 @@ export function formatInterruptedLines(rows: InterruptedTurnRow[], now: Date): s
 }
 
 /** The buttons `/seam workflows` may offer for one inventory row. */
-export type InterruptedRowAction = "resume" | "abandon";
+export type InterruptedRowAction = "resume" | "cancel";
 
 /**
  * Which actions are still *live* for a row (#159).
  *
  * A control whose backing operation has already been consumed is exactly the
- * bug this inventory used to have: an abandoned turn kept an "Abandon" button
+ * bug this inventory used to have: an abandoned turn kept a "Cancel" button
  * that could only answer "No resumable turn". A rendered button must not be
  * able to fail deterministically, so this mirrors every precondition
- * `resumeTurnManually` / `abandonTurnManually` actually check:
+ * `resumeTurnManually` / `cancelTurnManually` actually check:
  *
  * - A **live** marker resumes from its recorded ACP session and is abandoned
  *   by dropping the marker itself (no ledger row involved). Once abandoned the
@@ -205,10 +205,10 @@ export function interruptedRowActions(
   if (row.source === "live") {
     if (row.status === "abandoned") return actions;
     if (row.acpSessionId) actions.push("resume");
-    actions.push("abandon");
+    actions.push("cancel");
     return actions;
   }
-  if (row.status === "interrupted") actions.push("abandon");
+  if (row.status === "interrupted") actions.push("cancel");
   return actions;
 }
 
@@ -253,10 +253,10 @@ export function interruptedRowForCompletedAttempt(attempt: {
     startedUtc: attempt.updatedUtc,
     acpSessionId: attempt.acpSessionId,
     // Withheld when unsettled: #159 offers Resume only when a target exists,
-    // and this turn has already run. Abandon is the only correct remedy.
+    // and this turn has already run. Cancel is the only correct remedy.
     targetRef: unsettled ? null : attempt.spec.target,
     reason,
-    actions: unsettled ? ["abandon"] : [],
+    actions: unsettled ? ["cancel"] : [],
   };
 }
 
@@ -380,7 +380,7 @@ export function buildInterruptedInventory(
     items: slice.items,
     actionable: slice.items.length
       ? {
-          name: `⚠️ Interrupted / abandoned — actionable (${slice.total})`,
+          name: `⚠️ Interrupted / cancelled — actionable (${slice.total})`,
           // Caption last: if anything must be dropped it is the caption, never
           // a row that has a button under it.
           value: clampFieldValue(caption ? [...lines, `_${caption}_`] : lines),
@@ -388,7 +388,7 @@ export function buildInterruptedInventory(
       : null,
     inert: inertRows.length
       ? {
-          name: `🗄️ Interrupted / abandoned — no action available (${inertRows.length})`,
+          name: `🗄️ Interrupted / cancelled — no action available (${inertRows.length})`,
           value: clampFieldValue(formatInterruptedLines(inertRows, now)),
         }
       : null,

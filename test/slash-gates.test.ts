@@ -196,7 +196,7 @@ describe.each([
     const refresh = vi.fn(async () => true);
     orch.attachListLifecycle = () => ({ refresh, terminal: vi.fn() });
     orch.resumeTurnManually = vi.fn();
-    orch.abandonTurnManually = vi.fn();
+    orch.cancelTurnManually = vi.fn();
     if (handler === "cmdScheduleList") {
       const fixture = scheduleUiFixture(orch);
       fixture.ui.buildScheduleListMessage = () => view;
@@ -239,7 +239,7 @@ describe.each([
       content: expect.stringMatching(config.participant ? /admin setting/ : /channel is locked/),
     }));
     expect(del).not.toHaveBeenCalled();
-    expect(orch.abandonTurnManually).not.toHaveBeenCalled();
+    expect(orch.cancelTurnManually).not.toHaveBeenCalled();
   });
 });
 

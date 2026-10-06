@@ -46,11 +46,11 @@ describe("reauthChoiceSpec", () => {
     expect(spec.body).toContain("Cause: Authentication required");
     expect(spec.body).toContain("The pending prompt has not been sent; it will be sent once.");
     expect(spec.options.map(option => option.payload)).toEqual([
-      "reauth-accept:attempt-1", "parked-turn:abandon:attempt-1",
+      "reauth-accept:attempt-1", "parked-turn:cancel:attempt-1",
     ]);
   });
 
-  it("offers one accept route plus Abandon, keeping the device code out of the payload", () => {
+  it("offers one accept route plus Cancel, keeping the device code out of the payload", () => {
     const decision = negotiateReauth({
       errorKind: "auth_expired",
       message: `${OAUTH} ${URL} code ${CODE} http://127.0.0.1/callback`,
@@ -59,7 +59,7 @@ describe("reauthChoiceSpec", () => {
     if (decision.action !== "park") return;
     const spec = reauthChoiceSpec("attempt-1", decision.park);
     expect(spec.options).toHaveLength(2);
-    expect(spec.options[1]!.payload).toBe("parked-turn:abandon:attempt-1");
+    expect(spec.options[1]!.payload).toBe("parked-turn:cancel:attempt-1");
     expect(spec.options[0]!.label).toBe("Authentication is done — continue");
     expect(spec.options[0]!.payload).toBe("reauth-accept:attempt-1");
     expect(spec.options[0]!.payload).not.toContain(CODE);

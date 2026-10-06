@@ -5,7 +5,7 @@
  * layout — is testable: what a click does, how the card is rebuilt afterwards,
  * and what happens when two clicks land at once.
  *
- * The inventory is a **repeatable** card: Resume/Abandon acts on one row and
+ * The inventory is a **repeatable** card: Resume/Cancel acts on one row and
  * the list stays live for the rest. That is exactly why the collector cannot
  * be the concurrency guard here — it is still collecting, on purpose — so this
  * controller adds the two guarantees the collector no longer provides:
@@ -17,19 +17,19 @@
 import { SerialQueue } from "../../core/serial-queue.js";
 import { ActionGuard, type CardView } from "./collector-lifecycle.js";
 
-export type WorkflowInventoryAction = "resume" | "abandon" | "page" | "category";
+export type WorkflowInventoryAction = "resume" | "cancel" | "page" | "category";
 
 /** What one `handle` call did, for logging and tests. */
 export type WorkflowInventoryOutcome =
   | "ignored" // not one of ours, or a malformed id
   | "paged" // read-only page change
-  | "mutated" // the row's Resume/Abandon ran
+  | "mutated" // the row's Resume/Cancel ran
   | "dropped"; // a concurrent click on a row already being mutated
 
 /** Card-scoped collaborators: one set per rendered inventory. */
 export interface WorkflowInventoryPort {
   resume(id: string): Promise<string>;
-  abandon(id: string): Promise<string>;
+  cancel(id: string): Promise<string>;
   /** Rebuild the card from authoritative state. */
   render(page: number, category?: string): Promise<{ embeds: unknown[]; components: unknown[]; page: number }>;
   /** Repeatable re-render — the card stays live. */
@@ -47,11 +47,12 @@ export interface WorkflowInventoryClickPort {
 export function parseWorkflowInventoryClick(
   customId: string
 ): { action: WorkflowInventoryAction; arg: string } | null {
-  const [ns, action, ...rest] = customId.split(":");
+  const [ns, rawAction, ...rest] = customId.split(":");
+  const action = rawAction === "abandon" ? "cancel" : rawAction;
   if (ns !== "wf") return null;
   const arg = rest.join(":");
   if (!arg) return null;
-  if (action === "resume" || action === "abandon" || action === "page" || action === "category") {
+  if (action === "resume" || action === "cancel" || action === "page" || action === "category") {
     return { action, arg };
   }
   return null;
@@ -104,7 +105,7 @@ export class WorkflowInventoryController {
 
     // Claim BEFORE the first await, so the claim is synchronous with respect
     // to any other click already queued on this row. Keyed by row rather than
-    // by action: Resume and Abandon mutate the same turn, so firing one while
+    // by action: Resume and Cancel mutate the same turn, so firing one while
     // the other is in flight is the same double-execution.
     const claimed = this.guard.claim(parsed.arg);
     if (!claimed) return "dropped";
@@ -112,7 +113,7 @@ export class WorkflowInventoryController {
       const result =
         parsed.action === "resume"
           ? await this.port.resume(parsed.arg)
-          : await this.port.abandon(parsed.arg);
+          : await this.port.cancel(parsed.arg);
       await this.rerender("current", parsed.action);
       await click.followUp(result);
       return "mutated";

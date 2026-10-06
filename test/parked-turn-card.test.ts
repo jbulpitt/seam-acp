@@ -60,7 +60,7 @@ beforeEach(() => {
 afterEach(() => { for (const watcher of watchers.splice(0)) watcher.stop(); store.close(); fs.rmSync(dir, { recursive: true, force: true }); });
 
 describe("durable parked-turn notice actions", () => {
-  it("claims and settles Abandon while the central ACK is pending, then replies privately", async () => {
+  it("claims and settles Cancel while the central ACK is pending, then replies privately", async () => {
     const orch = controller();
     orch.adapter.sendChoiceCard.mockResolvedValueOnce({ id: "notice", jumpUrl: "https://discord.com/channels/g/worker/notice" });
     const posted = await orch.postParkedTurnNotice("worker", store.turnAttempts.get(id), "connection unavailable");
@@ -92,11 +92,11 @@ describe("durable parked-turn notice actions", () => {
     expect(native.transcript.at(-1)?.ephemeral).toBe(true);
   });
 
-  it("persists attempt-bound actions, then Abandon works after a controller/store replacement", async () => {
+  it("persists attempt-bound actions, then Cancel works after a controller/store replacement", async () => {
     const first = controller();
     await first.postParkedTurnNotice("worker", store.turnAttempts.get(id), "real cause: connection unavailable");
     const card = store.listOpenChoiceCards("discord", "worker")[0]!;
-    expect(parkedTurnAction(card.options[1]!.payload)).toEqual({ action: "abandon", attemptId: id });
+    expect(parkedTurnAction(card.options[1]!.payload)).toEqual({ action: "cancel", attemptId: id });
     store.close();
     store = new SessionStore(path.join(dir, "seam.db"));
     const recovered = controller();
@@ -150,7 +150,7 @@ describe("durable parked-turn notice actions", () => {
       store.turnAttempts.startPrompt(attempt);
     }
     store.turnAttempts.markStalled(probeId, "fixture load failure");
-    const expected = ["resume", "abandon"];
+    const expected = ["resume", "cancel"];
     expect((await orch.collectInterruptedRows("worker")).find((row: any) => row.id === probeId).actions).toEqual(expected);
     await orch.postParkedTurnNotice("worker", store.turnAttempts.get(probeId), "fixture load failure");
     const card = store.listOpenChoiceCards("discord", "worker")[0]!;
@@ -161,7 +161,7 @@ describe("durable parked-turn notice actions", () => {
   });
 
   it("internal actions remain separate from ordinary prompts and reauth acceptance", () => {
-    const spec = parkedTurnChoiceSpec(id, "cause", { resume: "Resume", abandon: "Abandon" });
+    const spec = parkedTurnChoiceSpec(id, "cause", { resume: "Resume", cancel: "Cancel" });
     expect(spec.options).toHaveLength(2);
     expect(parkedTurnAction("ordinary prompt")).toBeNull();
     expect(parkedTurnAction(`reauth-accept:${id}`)).toBeNull();
@@ -177,7 +177,7 @@ describe("durable parked-turn notice actions", () => {
     orch.dispatchWatcher = { listStaleRunning: async () => [] };
     await orch.postParkedTurnNotice("worker", store.turnAttempts.get(probeId), "fixture load failure");
     const card = store.listOpenChoiceCards("discord", "worker")[0]!;
-    expect(card.options.map((option: any) => parkedTurnAction(option.payload)?.action)).toEqual(["abandon"]);
+    expect(card.options.map((option: any) => parkedTurnAction(option.payload)?.action)).toEqual(["resume", "cancel"]);
     expect(await orch.dispatchContinuationRefusal(spec)).toBeNull();
     expect(card.body).not.toContain("continuation cannot be distinguished from replaying");
   });
@@ -192,9 +192,11 @@ describe("durable parked-turn notice actions", () => {
     expect(reason).toContain("can't tell whether");
     expect(reason).not.toContain("replay");
     await orch.postParkedTurnNotice("worker", store.turnAttempts.get(spec.id), "fixture interruption");
-    const card = store.listOpenChoiceCards("discord", "worker")[0]!;
-    expect(card.options.map(option => parkedTurnAction(option.payload)?.action)).toEqual(["abandon"]);
-    expect(card.body).toContain(reason);
+    expect(store.listOpenChoiceCards("discord", "worker")).toEqual([]);
+    expect(orch.adapter.sendChoiceCard).not.toHaveBeenCalled();
+    expect(store.turnAttempts.get(spec.id)?.state).toBe("cancelled");
+    expect(orch.adapter.sendMessage).toHaveBeenCalledWith(expect.anything(), expect.stringContaining(reason));
+    expect(orch.adapter.sendMessage).toHaveBeenCalledWith(expect.anything(), expect.stringContaining("The prompt was never sent"));
   });
 
   it("does not treat a legacy admission without an execution claim as first-send proof", async () => {
@@ -208,4 +210,147 @@ describe("durable parked-turn notice actions", () => {
       promptPreview: "PENDING", correlationId: null, status: "interrupted" });
     expect(await orch.resumeTurnManually("no-row")).toContain("this legacy turn has no recorded execution");
   });
+  it("normalizes old Abandon card payloads to Cancel", () => {
+    expect(parkedTurnAction(`parked-turn:abandon:${id}`)).toEqual({ action: "cancel", attemptId: id });
+  });
+
+  it("never invites Resume when the adapter cannot offer its button", async () => {
+    const orch = controller();
+    delete orch.adapter.sendChoiceCard;
+    await orch.observeRetainedDispatch(store.turnAttempts.get(id)!.spec);
+    expect(orch.adapter.sendMessage.mock.calls.map((call: any[]) => call[1]).join("\n")).not.toMatch(/Resume|workflows resume:/);
+  });
+
+  it("cancels an unavailable dispatch with one durable failure report-back and no card", async () => {
+    const orch = controller();
+    const spec = { id: "cancel-only-dispatch", target: "worker", returnTo: "requester", reportBack: true,
+      kind: "handoff" as const, session: "live" as const, prompt: "UNSENT" };
+    store.recordDelegation({ id: spec.id, kind: "handoff", sourceRef: "requester", targetRef: "worker",
+      worker: null, promptPreview: "UNSENT", correlationId: null, status: "interrupted" });
+    store.turnAttempts.admit(spec);
+    await orch.observeRetainedDispatch(spec, { reason: "provider acquisition failed: missing conversation" });
+    const report = store.getReportBackByCorrelation(spec.id)!;
+    expect(report).toMatchObject({ kind: "report_back", targetRef: "requester" });
+    const queued = store.turnAttempts.get(report.id)!;
+    expect(queued.spec.prompt).toContain("provider acquisition failed: missing conversation");
+    expect(queued.spec.prompt).toContain("The prompt was never sent");
+    expect(store.turnAttempts.get(spec.id)).toMatchObject({ state: "cancelled", promptStarted: false });
+    expect(orch.adapter.sendChoiceCard).not.toHaveBeenCalled();
+    expect(orch.adapter.sendMessage).not.toHaveBeenCalled();
+    await orch.observeRetainedDispatch(spec, { reason: "provider acquisition failed: missing conversation" });
+    expect(store.listRecentDelegations(20).filter(row => row.kind === "report_back")).toHaveLength(1);
+    expect(orch.adapter.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("cancels an already-notified dispatch when only Cancel remains available", async () => {
+    const orch = controller();
+    const spec = { id: "already-notified-deleted-target", target: "deleted-worker", returnTo: "requester", reportBack: true,
+      kind: "handoff" as const, session: "live" as const, prompt: "UNSENT" };
+    const reason = "target thread is deleted; continuation cannot currently be admitted";
+    store.recordDelegation({ id: spec.id, kind: "handoff", sourceRef: "requester", targetRef: spec.target,
+      worker: null, promptPreview: spec.prompt, correlationId: null, status: "interrupted" });
+    store.turnAttempts.claim(spec, executionIdentity({ agent: "codex", location: "local" }), "boot");
+    store.turnAttempts.markStalled(spec.id, reason);
+    const posted = await orch.publishChoiceCard(orch.router.ensureSessionRecord({ channelRef: "requester" }), {
+      title: "Parked turn", body: `Dispatch is parked: ${reason}. Use Resume to continue.`,
+      options: [{ label: "Abandon", kind: "prompt", payload: `parked-turn:abandon:${spec.id}` }],
+    });
+    store.turnAttempts.markStallNoticeDelivered(spec.id);
+    orch.adapter.getThreadLiveState = async () => undefined;
+    orch.adapter.sendChoiceCard.mockClear();
+
+    await orch.observeRetainedDispatch(spec, { reason });
+    await orch.observeRetainedDispatch(spec, { reason });
+
+    expect(store.turnAttempts.get(spec.id)).toMatchObject({ state: "cancelled", promptStarted: false });
+    const report = store.getReportBackByCorrelation(spec.id)!;
+    expect(report).toMatchObject({ kind: "report_back", targetRef: "requester" });
+    expect(store.turnAttempts.get(report.id)!.spec.prompt).toContain(reason);
+    expect(store.turnAttempts.get(report.id)!.spec.prompt).toContain("The prompt was never sent");
+    expect(store.listRecentDelegations(20).filter(row => row.kind === "report_back")).toHaveLength(1);
+    expect(store.getChoiceCard(posted.choiceId)?.status).toBe("cancelled");
+    expect(orch.adapter.sendChoiceCard).not.toHaveBeenCalled();
+    expect(orch.adapter.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("replaces an already-notified Abandon-only card once when Resume becomes available", async () => {
+    const orch = controller();
+    const spec = store.turnAttempts.get(id)!.spec;
+    const posted = await orch.publishChoiceCard(orch.router.ensureSessionRecord({ channelRef: "worker" }), {
+      title: "Parked turn", body: "Dispatch is parked: execution identity changed. Use Resume to continue.",
+      options: [{ label: "Abandon", kind: "prompt", payload: `parked-turn:abandon:${id}` }],
+    });
+    store.turnAttempts.markStallNoticeDelivered(id);
+    orch.adapter.sendChoiceCard.mockClear();
+
+    await orch.observeRetainedDispatch(spec);
+    const recovered = store.listOpenChoiceCards("discord", "worker");
+    expect(recovered).toHaveLength(1);
+    expect(recovered[0]!.id).not.toBe(posted.choiceId);
+    expect(recovered[0]!.options.map(option => parkedTurnAction(option.payload)?.action)).toEqual(["resume", "cancel"]);
+    expect(recovered[0]!.options.map(option => option.label)).toEqual([expect.stringMatching(/^Resume /), expect.stringMatching(/^Cancel /)]);
+    expect(recovered[0]!.body).toContain("continue under the thread's current configuration, or Cancel");
+    expect(store.getChoiceCard(posted.choiceId)?.status).toBe("cancelled");
+    expect(orch.adapter.sendChoiceCard).toHaveBeenCalledTimes(1);
+    expect(orch.adapter.editChoiceCard).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ disabled: true, hideButtons: true }));
+
+    await orch.observeRetainedDispatch(spec);
+    expect(orch.adapter.sendChoiceCard).toHaveBeenCalledTimes(1);
+    expect(orch.adapter.editChoiceCard).toHaveBeenCalledTimes(1);
+    expect(store.turnAttempts.get(id)?.state).toBe("suspended");
+  });
+
+  it.each(["cancel", "abandon", "workflow action"])("closes persisted notices when cancelled through %s", async route => {
+    const orch = controller();
+    const otherId = "other-parked-attempt";
+    const other = store.turnAttempts.claim({ ...store.turnAttempts.get(id)!.spec, id: otherId },
+      executionIdentity({ agent: "codex", location: "local" }), "boot");
+    store.turnAttempts.bind(other, "other-acp");
+    store.turnAttempts.startPrompt(other);
+    store.turnAttempts.markStalled(otherId, "another connection unavailable");
+    const otherNotice = await orch.publishChoiceCard(orch.router.ensureSessionRecord({ channelRef: "worker" }),
+      parkedTurnChoiceSpec(otherId, "another connection unavailable", { resume: "Resume", cancel: "Cancel" }));
+    for (const channelRef of ["worker", "requester"]) {
+      await orch.publishChoiceCard(orch.router.ensureSessionRecord({ channelRef }),
+        parkedTurnChoiceSpec(id, "connection unavailable", { resume: "Resume old notice", cancel: "Cancel old notice" }));
+    }
+    const cards = store.listOpenChoiceCards("discord").filter(card => card.id !== otherNotice.choiceId);
+    expect(cards).toHaveLength(2);
+
+    if (route === "workflow action") {
+      expect(await orch.performWorkflowAction("cancel", id, "worker")).toContain("Cancelled dispatch");
+    } else {
+      const interaction = { channelId: "worker", user: { id: "user" }, deferred: true, replied: false,
+        options: { getString: (name: string) => name === route ? id : null, getInteger: () => null },
+        editReply: vi.fn(async () => {}) };
+      await orch.cmdWorkflows(interaction);
+      expect(interaction.editReply).toHaveBeenCalledWith({ content: expect.stringContaining("Cancelled dispatch") });
+    }
+
+    expect(store.turnAttempts.get(id)?.state).toBe("cancelled");
+    expect(store.listOpenChoiceCards("discord").map(card => card.id)).toEqual([otherNotice.choiceId]);
+    expect(store.turnAttempts.get(otherId)?.state).toBe("suspended");
+    for (const card of cards) expect(store.getChoiceCard(card.id)?.status).toBe("cancelled");
+    expect(orch.adapter.editChoiceCard).toHaveBeenCalledTimes(2);
+    const staleClick = click(cards[0]!.id, 1);
+    await orch.handleChoiceCardInteraction(staleClick);
+    expect(staleClick.replyEphemeral).toHaveBeenCalledWith("This card is closed.");
+    expect(orch.adapter.sendChoiceCard).toHaveBeenCalledTimes(3);
+  });
+
+  it.each([false, true])("cancels an unavailable user turn with one plain cause and no buttons (already notified: %s)", async alreadyNotified => {
+    const orch = controller();
+    const spec = { id: "inbound-orphan", target: "worker", kind: "parked" as const, session: "live" as const, prompt: "UNSENT" };
+    store.turnAttempts.claim(spec, executionIdentity({ agent: "codex", location: "local" }), "boot", "inbound");
+    store.turnAttempts.markStalled(spec.id, "the provider lost the conversation");
+    if (alreadyNotified) store.turnAttempts.markStallNoticeDelivered(spec.id);
+    await orch.notifyParkedTurn(store.turnAttempts.get(spec.id));
+    await orch.notifyParkedTurn(store.turnAttempts.get(spec.id));
+    expect(store.turnAttempts.get(spec.id)?.state).toBe("cancelled");
+    expect(orch.adapter.sendChoiceCard).not.toHaveBeenCalled();
+    expect(orch.adapter.sendMessage).toHaveBeenCalledExactlyOnceWith(expect.anything(), expect.stringContaining("the provider lost the conversation"));
+    expect(orch.adapter.sendMessage.mock.calls[0][1]).toContain("The prompt was never sent");
+    expect(orch.adapter.sendMessage.mock.calls[0][1]).not.toMatch(/Resume|workflows resume:/);
+  });
+
 });

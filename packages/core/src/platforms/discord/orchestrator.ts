@@ -2199,29 +2199,17 @@ export class Orchestrator {
     };
   }
 
-  /**
-   * Production observer wired into DispatchWatcher. A retained recovery is not
-   * a terminal failure, but it is an explicit durable quarantine with a
-   * requester-facing notice and operator-owned resume/abandon controls.
-   *
-   * #333: only `defect` refusals arrive here now, and the refusal carries the
-   * reason. The old text — "is stalled after restart" — described WHERE
-   * execution stopped, which was the same sentence for all 65 throw sites and
-   * told the operator nothing they could act on. `stalled_reason` now records
-   * the specific cause, which is also what makes the Phase 4 distribution
-   * measurable at all.
-   */
+  /** Publish the retained cause with current actions, or settle Cancel-only work. */
   async observeRetainedDispatch(spec: DispatchSpec, err?: DispatchSuspendedError): Promise<void> {
     const reason = err?.reason
       ?? this.store.turnAttempts.get(spec.id)?.stalledReason
       ?? RETAINED_WITHOUT_REASON;
     this.store.turnAttempts.markStalled(spec.id, reason);
     const stalled = this.store.turnAttempts.get(spec.id);
-    if (!stalled?.stalledUtc || stalled.stallNoticeUtc) return;
+    if (stalled?.state !== "suspended" || !stalled.stalledUtc) return;
     const requester = spec.returnTo ?? spec.originThreadRef ?? spec.target;
     await this.postParkedTurnNotice(requester, stalled,
-      `⚠️ Dispatch \`${spec.id}\` to <#${spec.target}> is parked: ${reason}. ` +
-        "Use Resume or `/seam workflows resume:<id>` to try again, or abandon the work."
+      `⚠️ Dispatch \`${spec.id}\` to <#${spec.target}> is parked: ${reason}.`
     );
     this.store.turnAttempts.markStallNoticeDelivered(spec.id);
     this.logger.warn(
@@ -2851,7 +2839,7 @@ export class Orchestrator {
 
   /** Enqueue an already-durable row without passing back through duplicate
    * admission. Used at boot and by localized recovery. */
-  private startRecoveredInbound(row: InboundAdmission): Promise<void> {
+  private startRecoveredInbound(row: InboundAdmission, operatorResume = false): Promise<void> {
     const myGen = row.preemptive
       ? (this.channelGenerations.get(row.channelRef) ?? 0) + 1
       : this.channelGenerations.get(row.channelRef) ?? 0;
@@ -2863,7 +2851,7 @@ export class Orchestrator {
       if (!this.store.claimInbound(row.messageId, fence.epoch, new Date().toISOString())) return;
       try {
         const current = this.store.get(row.sessionRecordId);
-        if (row.expectedAcpSessionId &&
+        if (!operatorResume && row.expectedAcpSessionId &&
             (!current || current.acpSessionId !== row.expectedAcpSessionId)) {
           this.logger.info(
             { sessionId: row.sessionRecordId, messageId: row.messageId },
@@ -2872,7 +2860,7 @@ export class Orchestrator {
           this.store.completeInbound(row.messageId, fence.epoch, new Date().toISOString());
           return;
         }
-        await this.handleIncomingMessageInner(msg, fence);
+        await this.handleIncomingMessageInner(msg, fence, undefined, operatorResume);
       } finally {
         if (this.queueFenceCurrent(fence) && this.inboundExecutionTerminal(row.messageId)) {
           this.store.completeInbound(row.messageId, fence.epoch, new Date().toISOString());
@@ -3495,14 +3483,15 @@ export class Orchestrator {
   private async handleIncomingMessageInner(
     msg: IncomingMessage,
     queueFence?: ChannelQueueFence,
-    scheduledAttempt?: TurnAttempt
+    scheduledAttempt?: TurnAttempt,
+    operatorResume = false
   ): Promise<void> {
     try {
-      await this.executeIncomingMessage(msg, queueFence, scheduledAttempt);
+      await this.executeIncomingMessage(msg, queueFence, scheduledAttempt, operatorResume);
     } catch (err) {
       const a = scheduledAttempt ? this.store.turnAttempts.get(scheduledAttempt.id)
         : msg.messageId ? this.store.turnAttempts?.get(inboundAttemptId(msg.messageId)) : null;
-      if (a?.state === "suspended" && a.stalledUtc && !a.stallNoticeUtc && !isAwaitingReauth(a.stalledReason)) {
+      if (a?.state === "suspended" && a.stalledUtc && !isAwaitingReauth(a.stalledReason)) {
         await this.notifyParkedTurn(a).catch(noticeErr => this.logger.warn({ err: noticeErr, attempt: a.id }, "parked-turn notice failed"));
       }
       // Only this still-current invocation can prove its setup failed before
@@ -3526,7 +3515,8 @@ export class Orchestrator {
   private async executeIncomingMessage(
     msg: IncomingMessage,
     queueFence?: ChannelQueueFence,
-    scheduledAttempt?: TurnAttempt
+    scheduledAttempt?: TurnAttempt,
+    operatorResume = false
   ): Promise<void> {
     this.assertQueueFence(queueFence);
     // Wrap-up after the answer is timed step by step; a step still running
@@ -3589,7 +3579,7 @@ export class Orchestrator {
         await this.renderPersistedTerminalAttemptCard(priorHuman);
         return;
       }
-      if (priorHuman?.acpSessionId && record.acpSessionId && priorHuman.acpSessionId !== record.acpSessionId) {
+      if (!operatorResume && priorHuman?.acpSessionId && record.acpSessionId && priorHuman.acpSessionId !== record.acpSessionId) {
         throw DispatchSuspendedError.defect(priorHuman.id,
           "the thread moved to a different ACP session since this turn was recorded");
       }
@@ -3616,14 +3606,14 @@ export class Orchestrator {
           promptStarted: scheduledAttempt.promptStarted,
           acpSessionId: scheduledAttempt.acpSessionId,
         });
-        if (!drift.match) throw DispatchSuspendedError.defect(scheduledAttempt.id, drift.reason);
+        if (!operatorResume && !drift.match) throw DispatchSuspendedError.defect(scheduledAttempt.id, drift.reason);
       } else if (admission) {
         this.store.turnAttempts.registerOwner(this.attemptBoot);
         humanAttempt = this.store.turnAttempts.claim({
         id: inboundAttemptId(admission.messageId), target: admission.channelRef,
         prompt: admission.text, session: "live", kind: "parked",
         createdUtc: admission.createdUtc,
-        }, identity, this.attemptBoot, "inbound");
+        }, identity, this.attemptBoot, "inbound", operatorResume);
       }
       // Never restage old attachments, re-transcribe voice or rebuild the
       // original brief while resuming a submitted human turn. The model gets
@@ -9533,8 +9523,8 @@ export class Orchestrator {
    * only routes agent-emitted *files*; text is captured, not streamed — the
    * scheduled-prompt runner posts it afterwards for the same reason.)
    */
-  async dispatchInjectTurn(spec: DispatchSpec): Promise<{ output: string; stopReason: string }> {
-    const { output, stopReason } = await this.dispatchInjectTurnWithEvidence(spec);
+  async dispatchInjectTurn(spec: DispatchSpec, operatorResume = false): Promise<{ output: string; stopReason: string }> {
+    const { output, stopReason } = await this.dispatchInjectTurnWithEvidence(spec, operatorResume);
     return { output, stopReason };
   }
 
@@ -9561,7 +9551,7 @@ export class Orchestrator {
     }
   }
 
-  private async dispatchInjectTurnWithEvidence(spec: DispatchSpec): Promise<DispatchInjectTurnResult> {
+  private async dispatchInjectTurnWithEvidence(spec: DispatchSpec, operatorResume = false): Promise<DispatchInjectTurnResult> {
     const prior = this.store.turnAttempts?.get(spec.id);
     if (prior?.state === "completed") {
       // Completed-output ownership never re-enters a provider. Boot projection
@@ -9595,10 +9585,14 @@ export class Orchestrator {
       prior?.state === "suspended" && prior.promptStarted ? "boot-recovery" : "execution");
     this.dispatchAcquisitions.add(phase);
     try {
-      const run = () => this.dispatchInjectTurnOwned(
-        prior ? { ...prior.spec, resume: prior.promptStarted } : spec,
-        phase,
-      );
+      let executionSpec = prior ? { ...prior.spec, resume: prior.promptStarted } : spec;
+      if (operatorResume) {
+        const record = this.router.ensureSessionRecord({ platform: PLATFORM, channelRef: spec.target, cwd: this.config.REPOS_ROOT });
+        const current = this.router.describeConfig(record);
+        executionSpec = { ...executionSpec, preset: undefined, agentId: undefined,
+          location: current.location.value, model: current.model.value, effort: current.effort.value ?? undefined, cwd: current.cwd.value };
+      }
+      const run = () => this.dispatchInjectTurnOwned(executionSpec, phase, operatorResume);
       // #421: stagger the provider acquisition itself, after target FIFO and
       // readiness checks. Staggering only the earlier SQL requeue looked safe
       // but the watcher admitted every recovered target together once the boot
@@ -9668,7 +9662,7 @@ export class Orchestrator {
     }
   }
 
-  private async dispatchInjectTurnOwned(spec: DispatchSpec, phase: DispatchAcquisitionPhase): Promise<DispatchInjectTurnResult> {
+  private async dispatchInjectTurnOwned(spec: DispatchSpec, phase: DispatchAcquisitionPhase, operatorResume = false): Promise<DispatchInjectTurnResult> {
     // Compact dispatches don't inject a turn — they run the compaction pipeline
     // on the target thread and post a result card there. Same start-indicator +
     // ledger + done-file plumbing, different body (see dispatchCompact).
@@ -9730,7 +9724,9 @@ export class Orchestrator {
     const requestedAgentId = preset?.agentId ?? agentOverride;
     const presetProfile = requestedAgentId
       ? this.router.resolveProfileForChannel(requestedAgentId, restrictionChannelId, workerLocation)
-      : undefined;
+      : operatorResume && effectiveSession === "isolated"
+        ? this.router.getProfile(this.router.describeConfig(record).agent.value, workerLocation)
+        : undefined;
     if (requestedAgentId && !presetProfile) {
       throw new Error(`dispatch: unknown agent "${requestedAgentId}" at ${workerLocation}`);
     }
@@ -9912,7 +9908,7 @@ export class Orchestrator {
         // on token refresh and strand in-flight work — the defect this fixes.
       });
       this.store.turnAttempts?.registerOwner(this.attemptBoot);
-      const attempt = this.store.turnAttempts?.claim(spec, identity, this.attemptBoot);
+      const attempt = this.store.turnAttempts?.claim(spec, identity, this.attemptBoot, "dispatch", operatorResume);
       unstartedClaim = attempt;
       let outcomeOwned = false;
       let submittedThisAttempt = false;
@@ -12494,12 +12490,13 @@ export class Orchestrator {
     if (occurrence.settled) return;
     if (prior?.state === "completed") { await this.deliverScheduledCompletion(occurrence, prior); return; }
     if (prior?.state === "cancelled") { await this.settleScheduleCancellation(occurrence); return; }
-    const execution = this.scheduleExecution(occurrence.row);
-    const drift = compareExecutionIdentity(occurrence.execution.fingerprint, execution.fingerprint, prior ? {
+    const executionRow = manualResume ? { ...occurrence.row, model: null, cwd: null } : occurrence.row;
+    const execution = this.scheduleExecution(executionRow);
+    const drift = compareExecutionIdentity(prior?.identity ?? occurrence.execution.fingerprint, execution.fingerprint, prior ? {
       promptStarted: prior.promptStarted,
       acpSessionId: prior.acpSessionId,
     } : undefined);
-    if (!drift.match) {
+    if (!manualResume && !drift.match) {
       if (prior) this.store.turnAttempts.markStalled(prior.id, drift.reason);
       this.patchScheduledStatus(row.id, `retained: ${drift.reason}`);
       const parked = prior ? this.store.turnAttempts.get(prior.id) : null;
@@ -12521,11 +12518,12 @@ export class Orchestrator {
         prompt: row.promptText, session: row.sessionMode, kind: "scheduled", createdUtc: new Date().toISOString(),
         agentId: execution.agentId, location: execution.location, model: execution.model,
         cwd: execution.cwd, ...(execution.effort ? { effort: execution.effort } : {}),
-      }, execution.fingerprint, this.attemptBoot, "schedule");
+      }, execution.fingerprint, this.attemptBoot, "schedule", manualResume);
       try {
-        const execute = () => this.runScheduledPromptInner(occurrence.row, {
-          occurrence,
+        const execute = () => this.runScheduledPromptInner(executionRow, {
+          occurrence: { ...occurrence, row: executionRow, execution },
           attempt,
+          operatorResume: manualResume,
           // claim() rewrites updatedUtc and clears the stall reason. The
           // situation has to be read from the pre-claim row.
           ...(prior?.promptStarted ? { stopped: prior } : {}),
@@ -12690,6 +12688,7 @@ export class Orchestrator {
     occurrence: PreparedScheduledOccurrence;
     attempt: TurnAttempt;
     stopped?: RecoveryAttemptSource;
+    operatorResume?: boolean;
   }): Promise<void> {
     const assertOwned = (): void => {
       if (!owned) return;
@@ -12706,7 +12705,7 @@ export class Orchestrator {
           promptStarted: owned.attempt.promptStarted,
           acpSessionId: owned.attempt.acpSessionId,
         });
-      if (!drift.match) throw DispatchSuspendedError.defect(owned.attempt.id, drift.reason);
+      if (!owned.operatorResume && !drift.match) throw DispatchSuspendedError.defect(owned.attempt.id, drift.reason);
     };
     assertOwned();
     const id = row.id;
@@ -12719,12 +12718,11 @@ export class Orchestrator {
     const target: ChannelRef = row.sessionMode !== "live" && row.targetChannel
       ? { platform: PLATFORM, id: row.targetChannel }
       : bindingThread;
-    const skip = (): void => {
+    const skip = (cause: string): void => {
       if (!owned) return;
       const a = owned.attempt;
       if (a.promptStarted) {
-        throw DispatchSuspendedError.defect(a.id,
-          "the occurrence was skipped after its prompt had already been submitted");
+        throw DispatchSuspendedError.defect(a.id, cause);
       }
       if (!this.store.turnAttempts.complete(a, { id: a.id, target: row.channelRef,
         status: "completed", output: "", finishedUtc: new Date().toISOString() })) {
@@ -12742,7 +12740,7 @@ export class Orchestrator {
       } catch (err) {
         this.logger.warn({ id, err }, "scheduled: target state check failed (transient); skipping");
         this.patchScheduledStatus(id, "skipped: target unreachable");
-        skip();
+        skip(err instanceof Error ? err.message : String(err));
         return;
       }
       if (state === undefined) {
@@ -12754,12 +12752,12 @@ export class Orchestrator {
         } else {
           this.patchScheduledStatus(id, "skipped: target deleted");
         }
-        skip();
+        skip(`target thread ${target.id} was deleted`);
         return;
       }
       if (state.locked) {
         this.patchScheduledStatus(id, "skipped: target locked");
-        skip();
+        skip(`target thread ${target.id} is locked`);
         return;
       }
     }
@@ -12796,7 +12794,7 @@ export class Orchestrator {
           // cancellation and returns void (D5), so detect the abort by comparing
           // the generation across the turn rather than from a return value.
           const genAtStart = this.channelGenerations.get(row.channelRef) ?? 0;
-          if (owned) await this.handleIncomingMessageInner(synthetic, fence, owned.attempt);
+          if (owned) await this.handleIncomingMessageInner(synthetic, fence, owned.attempt, owned.operatorResume);
           else await this.handleIncomingMessageInner(synthetic, fence);
           aborted = (this.channelGenerations.get(row.channelRef) ?? 0) > genAtStart;
         });
@@ -12847,7 +12845,7 @@ export class Orchestrator {
     });
     if (!identity.ok) {
       this.patchScheduledStatus(id, `error: ${identity.error}`);
-      skip();
+      skip(identity.error);
       return;
     }
     const { profile, agentId, cwd, model, effort } = identity;
@@ -14901,10 +14899,10 @@ export class Orchestrator {
 
   private async abandonLiveMarker(marker: LiveTurnMarker, reason: string): Promise<void> {
     if (marker.scheduleOccurrenceId) {
-      if (this.store.turnAttempts.cancel(marker.scheduleOccurrenceId)) this.store.scheduledOccurrences.settle(marker.scheduleOccurrenceId);
+      if (this.store.turnAttempts.cancel(marker.scheduleOccurrenceId, reason)) this.store.scheduledOccurrences.settle(marker.scheduleOccurrenceId);
     }
     if (marker.inboundMessageId) {
-      this.store.turnAttempts.cancel(marker.id);
+      this.store.turnAttempts.cancel(marker.id, reason);
       this.store.settleInboundExecution(marker.inboundMessageId);
     }
     const maxAge =
@@ -16002,7 +16000,7 @@ export class Orchestrator {
         reason: e.terminalReason,
         targetRef: e.targetRef,
         // Legacy dispatch resumes have no identity-bound SQL execution.
-        actions: e.status === "interrupted" ? ["abandon"] : [],
+        actions: e.status === "interrupted" ? ["cancel"] : [],
       });
     }
     const live = await this.liveTurnInventory();
@@ -16047,12 +16045,12 @@ export class Orchestrator {
       }
       row.actions = [];
       if (attempt.state !== "suspended") continue;
-      row.actions = ["abandon"];
+      row.actions = ["cancel"];
       if (attempt.source === "dispatch") {
         const spec = stale.get(row.id);
         const refusal = await this.dispatchContinuationRefusal(spec ?? attempt.spec);
         if (refusal) row.resumeRefusal = refusal;
-        else if (spec) row.actions = ["resume", "abandon"];
+        else row.actions = ["resume", "cancel"];
       } else {
         const inbound = attempt.source === "inbound" ? this.store.getInbound(row.id.slice("inbound-".length)) : null;
         const backed = attempt.source === "inbound"
@@ -16060,7 +16058,7 @@ export class Orchestrator {
           : this.store.scheduledOccurrences.get(row.id)?.settled === false;
         if (backed && !isAwaitingReauth(attempt.stalledReason)
           && await this.checkResumePreconditions({ platform: PLATFORM, id: row.channelRef }) === "ok") {
-          row.actions = ["resume", "abandon"];
+          row.actions = ["resume", "cancel"];
         }
       }
     }
@@ -16099,10 +16097,8 @@ export class Orchestrator {
     }
   }
 
-  /** One admission decision for boot and operator dispatch continuation.
-   * Refuse only the unsafe attempt; other suspended conversations continue.
-   * Success authorizes the existing executor, never bypasses its identity,
-   * owner-generation, or strict session/load guards. */
+  /** Availability shared by notices, inventory and explicit continuation.
+   * Ownership and session/load still belong to the executor. */
   private async dispatchContinuationRefusal(spec: DispatchSpec): Promise<string | null> {
     if (spec.kind === "thread_voice") {
       return "this voice turn has no recorded execution, so Seam can't tell whether its prompt was sent";
@@ -16124,12 +16120,12 @@ export class Orchestrator {
     return null;
   }
 
-  private async requestDispatchContinuation(spec: DispatchSpec): Promise<string | null> {
+  private async requestDispatchContinuation(spec: DispatchSpec, operatorResume = false): Promise<string | null> {
     // Recheck after any boot host-readiness wait, just as operator admission
     // does. A change during that wait cannot authorize an unsafe continuation.
     const refusal = await this.dispatchContinuationRefusal(spec);
     if (refusal) return refusal;
-    return await this.dispatchWatcher?.requeueStale(spec.id)
+    return await this.dispatchWatcher?.requeueStale(spec.id, operatorResume)
       ? null : "the suspended execution could not be authorized for continuation";
   }
 
@@ -16159,7 +16155,7 @@ export class Orchestrator {
         if (isAwaitingReauth(a.stalledReason)) return `Cannot resume \`${id}\` — ${a.stalledReason}.`;
         const pending = this.store.recoverInboundChannel(row.channelRef, new Date().toISOString());
         if (!pending) return `Cannot resume \`${id}\` — admission is terminal.`;
-        this.startRecoveredInbound(pending);
+        this.startRecoveredInbound(pending, true);
         return `Continuation requested for \`${id}\`; provider and ownership guards still apply.`;
       }
       if (!marker.acpSessionId) {
@@ -16171,42 +16167,47 @@ export class Orchestrator {
     const stale = (await this.dispatchWatcher?.listStaleRunning()) ?? [];
     const spec = stale.find((s) => s.id === id);
     if (spec) {
-      const refusal = await this.requestDispatchContinuation(spec);
+      const refusal = await this.requestDispatchContinuation(spec, true);
       return refusal
         ? `Cannot resume \`${id}\` — ${refusal}.`
-        : `▶️ Continuation requested for dispatch \`${id}\`; identity, ownership and session/load checks still apply.`;
+        : `▶️ Continuation requested for dispatch \`${id}\`; ownership and session/load checks still apply.`;
     }
     const ledger = this.store.getDelegation(id);
     if (ledger && (ledger.status === "interrupted" || ledger.status === "abandoned")) {
       return `Cannot resume \`${id}\` — this legacy turn has no recorded execution, so Seam can't tell whether its prompt was sent.`;
     }
-    return `No interrupted/abandoned turn \`${id}\`.`;
+    return `No interrupted/cancelled turn \`${id}\`.`;
   }
 
-  async abandonTurnManually(id: string): Promise<string> {
+  async cancelTurnManually(id: string): Promise<string> {
     const completed = this.store.turnAttempts.get(id);
     if (completed?.state === "completed") {
-      return this.store.turnAttempts.abandonDelivery(id, "abandoned by operator")
-        ? `🚫 Abandoned retained output for \`${id}\`; the execution record is kept.`
-        : `No retained output to abandon for \`${id}\`.`;
+      const cancelled = this.store.turnAttempts.abandonDelivery(id, "cancelled by operator");
+      if (cancelled) await this.retireParkedTurnCards(id);
+      return cancelled
+        ? `🚫 Cancelled retained output for \`${id}\`; the execution record is kept.`
+        : `No retained output to cancel for \`${id}\`.`;
     }
     const live = await this.liveTurnInventory();
     const marker = live.find((m) => m.id === id);
     if (marker) {
-      await this.abandonLiveMarker(marker, "abandoned by operator");
-      return `🚫 Abandoned live turn \`${id}\`.`;
+      await this.abandonLiveMarker(marker, "cancelled by operator");
+      await this.retireParkedTurnCards(id);
+      return `🚫 Cancelled live turn \`${id}\`.`;
     }
     const stale = (await this.dispatchWatcher?.listStaleRunning()) ?? [];
     const spec = stale.find((s) => s.id === id);
     if (spec) {
-      await this.abandonDispatchSpec(spec, "abandoned by operator");
-      return `🚫 Abandoned dispatch \`${id}\`.`;
+      await this.abandonDispatchSpec(spec, "cancelled by operator");
+      await this.retireParkedTurnCards(id);
+      return `🚫 Cancelled dispatch \`${id}\`.`;
     }
     const ledger = this.store.getDelegation(id);
     if (ledger && (ledger.status === "interrupted" || ledger.status === "running")) {
       this.store.updateDelegationStatus(id, "abandoned");
-      await this.dispatchWatcher?.abandonRunning(id, "abandoned by operator");
-      return `🚫 Abandoned \`${id}\`.`;
+      await this.dispatchWatcher?.abandonRunning(id, "cancelled by operator");
+      await this.retireParkedTurnCards(id);
+      return `🚫 Cancelled \`${id}\`.`;
     }
     return `No resumable turn \`${id}\`.`;
   }
@@ -16221,10 +16222,10 @@ export class Orchestrator {
   private async performWorkflowAction(action: ParkedTurnAction, id: string, channelRef?: string): Promise<string> {
     const refusal = await this.workflowActionRefusal(action, id, channelRef);
     if (refusal) return refusal;
-    return action === "resume" ? this.resumeTurnManually(id) : this.abandonTurnManually(id);
+    return action === "resume" ? this.resumeTurnManually(id) : this.cancelTurnManually(id);
   }
 
-  private async abandonOldWorkflows(days: number, channelRef?: string): Promise<string> {
+  private async cancelOldWorkflows(days: number, channelRef?: string): Promise<string> {
     const cutoff = Date.now() - days * DAY_MS;
     const rows = (await this.collectInterruptedRows(channelRef)).filter(row => Date.parse(row.startedUtc) < cutoff);
     let abandoned = 0;
@@ -16232,10 +16233,10 @@ export class Orchestrator {
     for (const row of rows) {
       const attempt = this.store.turnAttempts.get(row.id);
       const retainedOutput = attempt?.state === "completed" && !attempt.deliveryDone && !attempt.deliveryAbandonedReason;
-      if (!interruptedRowActions(row).includes("abandon") && !retainedOutput) continue;
+      if (!interruptedRowActions(row).includes("cancel") && !retainedOutput) continue;
       try {
-        const result = await this.abandonTurnManually(row.id);
-        if (result.startsWith("🚫 Abandoned")) abandoned++;
+        const result = await this.cancelTurnManually(row.id);
+        if (result.startsWith("🚫 Cancelled")) abandoned++;
         else failures.push(result);
       } catch (err) {
         const cause = err instanceof Error ? err.message : String(err);
@@ -16244,7 +16245,7 @@ export class Orchestrator {
       }
     }
     const failureNote = failures.length ? ` ${failures.length} failed: ${failures.slice(0, 3).join("; ")}` : "";
-    return (`Abandoned ${abandoned} item(s) older than ${days} days in ${channelRef ? "this thread" : "all threads"}. All database records were kept.${failureNote}`).slice(0, 1900);
+    return (`Cancelled ${abandoned} item(s) older than ${days} days in ${channelRef ? "this thread" : "all threads"}. All database records were kept.${failureNote}`).slice(0, 1900);
   }
 
   /** Steer a running (or idle) node: preemptively cancel its in-flight turn,
@@ -16693,24 +16694,30 @@ export class Orchestrator {
       return;
     }
     const limit = i.options.getInteger("limit") ?? 20;
-    const olderThan = i.options.getString("abandon-older-than");
+    const olderThan = i.options.getString("cancel-older-than") ?? i.options.getString("abandon-older-than");
     if (olderThan !== null) {
       if (!this.config.SEAM_CONFIG_ADMIN_USER_IDS?.has(i.user.id)) {
-        await replyToInteraction(i, { content: "Bulk workflow abandonment is admin-only." });
+        await replyToInteraction(i, { content: "Bulk workflow cancellation is admin-only." });
         return;
       }
       const days = Number(olderThan);
       if (!Number.isInteger(days) || days < 1) {
-        await replyToInteraction(i, { content: "Pass a positive whole number of days for `abandon-older-than`." });
+        await replyToInteraction(i, { content: "Pass a positive whole number of days for `cancel-older-than`." });
         return;
       }
-      await replyToInteraction(i, { content: await this.abandonOldWorkflows(days, allThreads ? undefined : i.channelId) });
+      await replyToInteraction(i, { content: await this.cancelOldWorkflows(days, allThreads ? undefined : i.channelId) });
       return;
     }
     const resumeInput = i.options.getString("resume");
     if (resumeInput) {
       const id = await this.normalizeAutocompleteSubmission(i, null, "workflows", "resume", resumeInput);
       await replyToInteraction(i, { content: await this.performWorkflowAction("resume", id, i.channelId) });
+      return;
+    }
+
+    const cancelInput = i.options.getString("cancel") ?? i.options.getString("abandon");
+    if (cancelInput) {
+      await replyToInteraction(i, { content: await this.performWorkflowAction("cancel", cancelInput, i.channelId) });
       return;
     }
 
@@ -16841,7 +16848,7 @@ export class Orchestrator {
       return;
     }
 
-    // #159: Resume/Abandon rebuilds this card from authoritative state, so the
+    // #159: Resume/Cancel rebuilds this card from authoritative state, so the
     // inventory is a re-runnable render rather than a one-shot build.
     const initial = await this.renderWorkflowInventory(i, limit, 0);
     await replyToInteraction(i, {
@@ -16854,7 +16861,7 @@ export class Orchestrator {
       filter: (c) => c.user.id === i.user.id,
       time: 600_000,
     });
-    // #159: the inventory had no end handler, so Resume/Abandon stayed
+    // #159: the inventory had no end handler, so Resume/Cancel stayed
     // clickable long after the collector expired.
     const lifecycle = this.attachListLifecycle(i, collector, () =>
       expiredCardView("\u23f0 Workflow inventory expired \u2014 run `/seam workflows` again.")
@@ -16862,7 +16869,7 @@ export class Orchestrator {
     // Repeatable cards claim each row during mutation, then rebuild from the store.
     const controls = new WorkflowInventoryController({
       resume: (id) => this.performWorkflowAction("resume", id, allThreads ? undefined : i.channelId),
-      abandon: (id) => this.performWorkflowAction("abandon", id, allThreads ? undefined : i.channelId),
+      cancel: (id) => this.performWorkflowAction("cancel", id, allThreads ? undefined : i.channelId),
       render: (requested, category) => this.renderWorkflowInventory(i, limit, requested, category),
       refresh: (view) => lifecycle.refresh(view),
       terminal: (reason, view) => lifecycle.terminal(reason, view),
@@ -16883,7 +16890,7 @@ export class Orchestrator {
           await replyToInteraction(c, { content: text, flags: MessageFlags.Ephemeral }, { followUp: true });
         },
       });
-    }, err => this.logger.warn({ err }, "workflows resume/abandon button failed"));
+    }, err => this.logger.warn({ err }, "workflows resume/cancel button failed"));
   }
 
   /**
@@ -16892,7 +16899,7 @@ export class Orchestrator {
    * `/seam workflows` is rarely used, so this stays deliberately compact: one
    * summary page of ledger/wake/watch/ingest/choice state, plus controls (and
    * pagination) only for the interrupted rows that still have a live action.
-   * Rebuilt after every Resume/Abandon so a consumed row cannot be clicked
+   * Rebuilt after every Resume/Cancel so a consumed row cannot be clicked
    * twice (#159).
    */
   private async renderWorkflowInventory(
@@ -17011,9 +17018,7 @@ export class Orchestrator {
     let pageCount = 1;
     if (interrupted.length > 0) {
       // Controls exist only for rows a click can still act on, and the visible
-      // lines are exactly those rows in button order. An abandoned row keeping
-      // an "Abandon" button was the #159 bug in miniature: a control whose
-      // backing operation was already consumed.
+      // Lines and controls use the same rows and available actions.
       const slice = buildInterruptedInventory(interrupted, requestedPage, now);
       page = slice.page;
       pageCount = slice.pageCount;
@@ -17024,7 +17029,7 @@ export class Orchestrator {
         requiredFieldNames.add(slice.actionable.name);
       }
       if (slice.inert) embed.addFields(slice.inert);
-      // Per-entry Resume / Abandon \u2014 same pattern as schedule-list cards.
+      // Per-entry Resume / Cancel \u2014 same pattern as schedule-list cards.
       // Zero extra command slots. Four rows leave the fifth for pagination.
       for (const row of slice.items) {
         const actions = interruptedRowActions(row);
@@ -17037,11 +17042,11 @@ export class Orchestrator {
               .setStyle(ButtonStyle.Primary)
           );
         }
-        if (actions.includes("abandon")) {
+        if (actions.includes("cancel")) {
           buttons.push(
             new ButtonBuilder()
-              .setCustomId(`wf:abandon:${row.id}`)
-              .setLabel(workflowActionLabel("abandon", row, now))
+              .setCustomId(`wf:cancel:${row.id}`)
+              .setLabel(workflowActionLabel("cancel", row, now))
               .setStyle(ButtonStyle.Danger)
           );
         }
@@ -19561,38 +19566,70 @@ export class Orchestrator {
     }
   }
 
+  private async retireParkedTurnCards(attemptId: string): Promise<void> {
+    for (const card of this.store.listOpenChoiceCards(PLATFORM)) {
+      if (card.options.some(option => parkedTurnAction(option.payload)?.attemptId === attemptId)
+        && this.store.cancelChoiceCard(card.id, card.channelRef)) {
+        await this.refreshChoiceCard(this.store.getChoiceCard(card.id)!);
+      }
+    }
+  }
+
   private async notifyParkedTurn(attempt: TurnAttempt): Promise<void> {
-    if (!attempt.stalledUtc || attempt.stallNoticeUtc || isAwaitingReauth(attempt.stalledReason)) return;
+    if (attempt.state !== "suspended" || !attempt.stalledUtc || isAwaitingReauth(attempt.stalledReason)) return;
     await this.postParkedTurnNotice(attempt.spec.target, attempt,
-      `⚠️ Turn \`${attempt.id}\` is parked: ${attempt.stalledReason}. Resolve the cause before requesting continuation, or abandon the work. The original prompt was not replayed.`);
+      `⚠️ Turn \`${attempt.id}\` is parked: ${attempt.stalledReason}.`);
     this.store.turnAttempts.markStallNoticeDelivered(attempt.id);
   }
 
-  private async postParkedTurnNotice(channelRef: string, attempt: TurnAttempt, body: string): Promise<MessageLink & { messageId: string }> {
-    if (!this.adapter.sendChoiceCard || isAwaitingReauth(attempt.stalledReason)) {
-      const { id: messageId, ...ref } = await this.adapter.sendMessage({ platform: PLATFORM, id: channelRef }, body);
-      return { ...ref, messageId };
-    }
-    const record = this.store.getByChannel(PLATFORM, channelRef)
-      ?? this.router.ensureSessionRecord({ platform: PLATFORM, channelRef, cwd: this.config.REPOS_ROOT });
-    const row: InterruptedTurnRow = {
-      id: attempt.id, source: attempt.source === "dispatch" ? "dispatch" : "live", channelRef: attempt.spec.target,
-      correlationId: null, status: "interrupted", startedUtc: attempt.updatedUtc,
-      acpSessionId: attempt.acpSessionId, targetRef: attempt.spec.target,
-    };
-    const now = new Date();
+  private async postParkedTurnNotice(channelRef: string, attempt: TurnAttempt, body: string): Promise<(MessageLink & { messageId: string }) | undefined> {
     const current = (await this.collectInterruptedRows(attempt.spec.target)).find(item => item.id === attempt.id);
     const actions = current ? interruptedRowActions(current) : [];
-    if (!actions.includes("resume")) {
-      body += `\nResume isn't available: ${current?.resumeRefusal ?? current?.reason ?? "no continuation is currently available"}.`;
+    const notices = this.store.listOpenChoiceCards(PLATFORM, channelRef).filter(card =>
+      card.options.some(option => parkedTurnAction(option.payload)?.attemptId === attempt.id));
+    if (actions.length === 1 && actions[0] === "cancel" && !isAwaitingReauth(attempt.stalledReason)) {
+      const cause = [attempt.stalledReason, current?.resumeRefusal].filter((value, index, values) => value && values.indexOf(value) === index).join("; ");
+      const message = `🚫 Cancelled ${attempt.source === "dispatch" ? "dispatch" : "turn"} \`${attempt.id}\`: ${cause}.${attempt.promptStarted ? "" : " The prompt was never sent."}`;
+      if (!this.store.turnAttempts.cancel(attempt.id, message, attempt.source !== "dispatch")) return;
+      await this.retireParkedTurnCards(attempt.id);
+      if (attempt.source === "dispatch") {
+        const cancelled = this.store.turnAttempts.get(attempt.id)!;
+        await this.dispatchWatcher?.publishAdoptedResult(attempt.id, cancelled.outcome!);
+        if (channelRef !== attempt.spec.target) {
+          await this.replayCompletedDispatch(cancelled.outcome!, { action: "report_back", returnTo: channelRef });
+        } else {
+          await this.adapter.sendMessage({ platform: PLATFORM, id: channelRef }, message);
+          this.store.updateDelegationStatus(attempt.id, "failed");
+        }
+      } else {
+        if (attempt.source === "inbound") this.store.settleInboundExecution(attempt.id.slice("inbound-".length));
+        if (attempt.source === "schedule") this.store.scheduledOccurrences.settle(attempt.id);
+        await finishLiveTurn(this.config.DATA_DIR, { id: attempt.id, status: "cancelled",
+          channelRef: attempt.spec.target, finishedUtc: new Date().toISOString(), reason: message });
+        await this.adapter.sendMessage({ platform: PLATFORM, id: channelRef }, message);
+      }
+      return;
     }
-    if (actions.length === 0) {
+    if (this.adapter.sendChoiceCard && actions.includes("resume") && !isAwaitingReauth(attempt.stalledReason)) {
+      body += "\nUse Resume or `/seam workflows resume:<id>` to continue under the thread's current configuration, or Cancel.";
+    }
+    if (!this.adapter.sendChoiceCard || !actions.length || isAwaitingReauth(attempt.stalledReason)) {
+      if (attempt.stallNoticeUtc) return;
       const { id: messageId, ...ref } = await this.adapter.sendMessage({ platform: PLATFORM, id: channelRef }, body);
       return { ...ref, messageId };
     }
-    const posted = await this.publishChoiceCard(record, parkedTurnChoiceSpec(attempt.id, body, {
-      resume: workflowActionLabel("resume", row, now), abandon: workflowActionLabel("abandon", row, now),
-    }, actions));
+    const spec = parkedTurnChoiceSpec(attempt.id, body, {
+      resume: workflowActionLabel("resume", current!, new Date()), cancel: workflowActionLabel("cancel", current!, new Date()),
+    }, actions);
+    // A notice timestamp cannot deduplicate a card whose availability changed.
+    if (notices.some(card => card.body === body && card.options.length === actions.length
+      && card.options.every((option, index) => option.kind === "prompt"
+        && option.payload === spec.options[index]!.payload
+        && option.label.startsWith(actions[index] === "resume" ? "Resume " : "Cancel ")))) return;
+    await this.retireParkedTurnCards(attempt.id);
+    const record = this.store.getByChannel(PLATFORM, channelRef)
+      ?? this.router.ensureSessionRecord({ platform: PLATFORM, channelRef, cwd: this.config.REPOS_ROOT });
+    const posted = await this.publishChoiceCard(record, spec);
     if (!posted.ok) throw new Error(posted.error);
     return posted;
   }

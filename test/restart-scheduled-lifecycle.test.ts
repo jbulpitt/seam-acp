@@ -125,23 +125,25 @@ describe("#252 actual isolated scheduler + injectTurn, synthetic transport", () 
       expect(transport.prompt).toHaveBeenCalledTimes(1);
     });
 
-  it.each(['live', 'isolated'] as const)("retains submitted %s work through resumed precondition failure without replay", async mode => {
+  it.each(['live', 'isolated'] as const)("cancels submitted %s work when target preconditions leave only Cancel", async mode => {
     const h = setup(mode); simulateRetiredOwnerProcess();
     const first = h.make(); const key = scheduledOccurrenceKey(h.row.id);
     transport.prompt.mockImplementationOnce(async () => { first.suspendForRestart(); throw new Error('cutoff'); });
     await first.runScheduledPrompt(h.row.id, key);
     Object.assign(h.adapter, { getThreadLiveState: async () => { throw new Error('synthetic precondition outage'); } });
     await h.make().runScheduledPrompt(h.row.id, key);
-    expect(h.store.turnAttempts.get(key.id)).toMatchObject({ state: 'suspended', promptStarted: true });
-    expect(h.store.scheduledOccurrences.get(key.id)?.settled).toBe(false);
+    expect(h.store.turnAttempts.get(key.id)).toMatchObject({ state: 'cancelled', promptStarted: true });
+    expect(h.store.scheduledOccurrences.get(key.id)?.settled).toBe(true);
     expect(transport.prompt).toHaveBeenCalledTimes(1);
+    const causes = h.adapter.sendMessage.mock.calls.filter(call => call[1].includes('Cancelled turn'));
+    expect(causes).toHaveLength(1);
+    expect(causes[0]?.[1]).toContain('synthetic precondition outage');
+    expect(causes[0]?.[1]).not.toContain('prompt was never sent');
     Object.assign(h.adapter, { getThreadLiveState: async () => ({ locked: false, archived: false }) });
     transport.prompt.mockResolvedValue({ stopReason: 'end_turn' });
     await h.make().runScheduledPrompt(h.row.id, key);
-    const resumed = String(transport.prompt.mock.calls[1]?.[0]);
-    expect(resumed.startsWith("continue\n")).toBe(true);
-    expect(resumed).toContain("The turn stopped and this session is being resumed in place.");
-    expect(resumed).not.toContain("ORIGINAL DISPOSABLE SCHEDULE");
+    expect(transport.prompt).toHaveBeenCalledTimes(1);
+    expect(h.adapter.sendMessage.mock.calls.filter(call => call[1].includes('Cancelled turn'))).toHaveLength(1);
   });
 
   it("freezes identity before publication even if the later runner setup fails", async () => {
@@ -357,8 +359,8 @@ describe("#252 actual isolated scheduler + injectTurn, synthetic transport", () 
     expect(h.store.turnAttempts.get(key.id)).toMatchObject({ generation: 2, state: "completed" });
   });
 
-  it("does not allow a later slot to overlap a suspended occurrence, or inherit its updated configuration", async () => {
-    const h = setup(); simulateRetiredOwnerProcess();
+  it.each(['live', 'isolated'] as const)("blocks automatic %s drift recovery until an operator resumes under current configuration", async mode => {
+    const h = setup(mode); simulateRetiredOwnerProcess();
     const orch = h.make(); const key = scheduledOccurrenceKey(h.row.id);
     transport.prompt.mockImplementationOnce(async () => { orch.suspendForRestart(); throw new Error("cutoff"); });
     await orch.runScheduledPrompt(h.row.id, key);
@@ -370,6 +372,12 @@ describe("#252 actual isolated scheduler + injectTurn, synthetic transport", () 
     await fresh.runScheduledPrompt(h.row.id, key);
     expect(transport.prompt).toHaveBeenCalledTimes(1);
     expect(h.store.turnAttempts.get(key.id)?.state).toBe("suspended");
+    expect(h.store.turnAttempts.get(key.id)?.stalledReason).toContain("model");
+    transport.prompt.mockResolvedValue({ stopReason: "end_turn" });
+    await fresh.runScheduledPrompt(h.row.id, key, true);
+    expect(transport.prompt).toHaveBeenCalledTimes(2);
+    expect(String(transport.prompt.mock.calls[1]?.[0])).toMatch(/^continue\n/);
+    expect(h.store.turnAttempts.get(key.id)).toMatchObject({ state: "completed", generation: 2, spec: { model: "changed" } });
   });
 
   it("strict session-load refusal retains provider material and never falls back to a new original turn", async () => {

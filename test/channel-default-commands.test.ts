@@ -125,7 +125,7 @@ describe("configuration scope through the real dispatcher", () => {
     expect(fields["Auto-name"]).toBe("`enabled` · default");
     expect(panel.footer).toContain("✅ Saved");
     expect(panel.actions).toEqual([]);
-    expect(h.store.getByChannel("discord", PARENT)).toBeUndefined();
+    expect(h.store.getByChannel("discord", PARENT)).toBeNull();
     expect(h.ui.configEditor.get(draft.id)).toBeUndefined();
   });
 

@@ -7,7 +7,10 @@ import { SessionStore } from "../packages/core/src/core/session-store.js";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
 import { DispatchWatcher } from "../packages/core/src/core/dispatch/watcher.js";
 import { executionIdentity } from "../packages/core/src/core/dispatch/execution-identity.js";
-import { parkedTurnAction, parkedTurnChoiceSpec } from "../packages/core/src/core/parked-turn-card.js";
+import { parkedTurnAction, parkedTurnChoiceSpec, parkedTurnContext } from "../packages/core/src/core/parked-turn-card.js";
+import type { TurnAttempt } from "../packages/core/src/core/dispatch/attempt-store.js";
+import type { ScheduledPrompt } from "../packages/core/src/core/scheduled-prompts/types.js";
+import { TurnStatus } from "../packages/core/src/core/status-panel.js";
 import { makeChoiceCustomId } from "../packages/core/src/core/choice/types.js";
 import { DiscordAdapter } from "../packages/core/src/platforms/discord/adapter.js";
 import { SyntheticInteraction } from "../packages/core/src/platforms/discord/synthetic-interaction.js";
@@ -58,6 +61,93 @@ beforeEach(() => {
   store.turnAttempts.markStalled(id, "connection unavailable");
 });
 afterEach(() => { for (const watcher of watchers.splice(0)) watcher.stop(); store.close(); fs.rmSync(dir, { recursive: true, force: true }); });
+
+describe("recorded parked-turn context", () => {
+  it("reads a frozen schedule and identity for both the actual card and workflows row", async () => {
+    const scheduledId = "scheduled-recorded-context";
+    const row: ScheduledPrompt = {
+      id: "sch_original", name: "original wake", promptText: "Read and follow:\n wake-runbook.md",
+      platform: "discord", channelRef: "worker", parentRef: "parent", cron: "0 * * * *", timezone: "UTC",
+      model: null, cwd: null, targetChannel: null, outputType: "messages", sessionMode: "live",
+      catchupSeconds: 0, enabled: true, legacyAttachmentCount: 0, createdBy: "user",
+      createdUtc: "2026-10-06T15:00:00Z", updatedUtc: "2026-10-06T15:00:00Z",
+      lastRunUtc: null, lastStatus: null, nextRunUtc: null, pinnedSessionId: null,
+    };
+    store.scheduledOccurrences.reserve({ id: scheduledId, scheduledFor: "2026-10-06T15:30:00Z" }, row);
+    const attempt = store.turnAttempts.claim({ id: scheduledId, target: "worker", kind: "scheduled", session: "live",
+      prompt: row.promptText, createdUtc: "2026-10-06T15:29:00Z" },
+    executionIdentity({ agent: "codex", location: "recorded-host", model: "recorded-model" }), "boot", "schedule");
+    const status = new TurnStatus({ model: "recorded-model", repoDisplay: "/repo" });
+    status.startedUtc = Date.parse("2026-10-06T15:30:00Z");
+    store.turnAttempts.bindStatusCard(attempt, { channelId: "worker", messageId: "original-status" });
+    store.turnAttempts.saveStatusCardState(attempt, status.snapshot());
+    store.turnAttempts.markStalled(scheduledId, "actual scheduled cause", "2026-10-06T15:30:22Z");
+    row.name = "changed name after admission";
+    row.promptText = "changed prompt after admission";
+    const orch = controller();
+    const inventory = (await orch.collectInterruptedRows("worker")).find((r: any) => r.id === scheduledId);
+    await orch.notifyParkedTurn(store.turnAttempts.get(scheduledId));
+    const card = store.listOpenChoiceCards("discord", "worker")[0]!;
+    for (const line of inventory.context) expect(card.body).toContain(line);
+    expect(card.body).toContain("Scheduled: original wake (`sch_original`) — Read and follow: wake-runbook.md");
+    expect(card.body).toContain("`codex@recorded-host` · `recorded-model`");
+    expect(card.body).toContain("Started <t:1791300600:R>");
+    expect(card.body).toContain("Parked <t:1791300622:R>");
+    expect(card.body).toContain("actual scheduled cause");
+    expect(card.body).not.toMatch(/changed name|changed prompt|<#worker>/);
+    expect(card.options.map(option => parkedTurnAction(option.payload)?.action)).toEqual(["resume", "cancel"]);
+  });
+
+  it("shows handoff requester, target and original prompt without generated provenance", () => {
+    const attempt = store.turnAttempts.get(id)!;
+    const context = parkedTurnContext({ ...attempt, spec: { ...attempt.spec, originThreadRef: "requester",
+      returnTo: "delivery", originPrompt: "Review\n the original change", prompt: "GENERATED HARNESS" } }, {}, "requester");
+    expect(context[0]).toBe("Handoff from <#requester> — Review the original change");
+    expect(context[1]).toBe("<#worker> · `codex@local` · `m`");
+    expect(context.join("\n")).not.toContain("GENERATED HARNESS");
+  });
+
+  it("shows the recorded inbound author and text rather than the responder or synthetic prompt", () => {
+    store.admitInbound({ messageId: "message", platform: "discord", channelRef: "worker",
+      sessionRecordId: "discord:worker", authorId: "author", text: "Original user\n question", createdUtc: "2026-10-06T15:00:00Z" });
+    const attempt = { ...store.turnAttempts.get(id)!, source: "inbound" as const };
+    const context = parkedTurnContext(attempt, { inbound: store.getInbound("message") }, "worker");
+    expect(context[0]).toBe("Message from <@author> — Original user question");
+    expect(context.join("\n")).not.toContain("<#worker>");
+  });
+
+  it("shows wake provenance and takes last activity from the latest recorded output", () => {
+    const attempt = { ...store.turnAttempts.get(id)!, updatedUtc: "2026-10-06T15:30:22Z",
+      stalledUtc: "2026-10-06T15:30:20Z", stdoutFallback: { count: 1, reasons: {}, lastUtc: "2026-10-06T15:30:30Z" },
+      spec: { ...store.turnAttempts.get(id)!.spec, kind: "wake" as const, originPrompt: "Wake\n and check the build" } };
+    const context = parkedTurnContext(attempt, {}, "worker");
+    expect(context[0]).toBe("Wake — Wake and check the build");
+    expect(context.at(-1)).toContain("Last active <t:1791300630:R>");
+    expect(context.at(-1)).toContain("Parked <t:1791300620:R>");
+  });
+
+  it("keeps the existing card when only notice bookkeeping advances the attempt update", async () => {
+    const orch = controller();
+    await orch.postParkedTurnNotice("worker", store.turnAttempts.get(id), "connection unavailable");
+    const original = store.listOpenChoiceCards("discord", "worker")[0]!;
+    expect(store.turnAttempts.markStallNoticeDelivered(id, "2030-01-01T00:00:00Z")).toBe(true);
+    expect(store.turnAttempts.get(id)!.updatedUtc).toBe("2030-01-01T00:00:00Z");
+    await orch.postParkedTurnNotice("worker", store.turnAttempts.get(id), "connection unavailable");
+    const notices = store.listOpenChoiceCards("discord", "worker");
+    expect(notices).toHaveLength(1);
+    expect(notices[0]!.id).toBe(original.id);
+    expect(notices[0]!.body).toBe(original.body);
+    expect(orch.adapter.sendChoiceCard).toHaveBeenCalledTimes(1);
+    expect(orch.adapter.editChoiceCard).not.toHaveBeenCalled();
+  });
+
+  it("omits unavailable names, identities and timestamps instead of substituting creation time", () => {
+    const attempt = { ...store.turnAttempts.get(id)!, identity: "legacy-opaque-digest", statusCardState: null,
+      source: "schedule", stalledUtc: null, updatedUtc: "not recorded", spec: { ...store.turnAttempts.get(id)!.spec, prompt: "" },
+    } as TurnAttempt;
+    expect(parkedTurnContext(attempt, {}, "worker")).toEqual(["Scheduled"]);
+  });
+});
 
 describe("durable parked-turn notice actions", () => {
   it("claims and settles Cancel while the central ACK is pending, then replies privately", async () => {

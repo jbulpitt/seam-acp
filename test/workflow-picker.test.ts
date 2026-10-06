@@ -31,7 +31,7 @@ describe("workflow landing and labels", () => {
       .map(name => [name, vi.fn(() => [])]));
     orch.listWatches = vi.fn(() => []);
     const view = await orch.renderWorkflowInventory({ channelId: "thread", options: { getString: () => null, getBoolean: () => false } }, 20, 0);
-    expect(orch.collectInterruptedRows).toHaveBeenCalledWith("thread");
+    expect(orch.collectInterruptedRows).toHaveBeenCalledWith("thread", "thread");
     expect(orch.store.listScheduledByChannel).toHaveBeenCalledWith("discord", "thread");
     const menu = view.components[0].toJSON().components[0];
     expect(menu.options[0].label).toBe("Parked turns (1)");

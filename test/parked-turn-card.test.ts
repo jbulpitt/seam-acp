@@ -300,6 +300,33 @@ describe("durable parked-turn notice actions", () => {
     expect(store.turnAttempts.get(id)?.state).toBe("suspended");
   });
 
+  it.each(["cancel", "abandon", "workflow action"])("closes persisted notices when cancelled through %s", async route => {
+    const orch = controller();
+    await orch.postParkedTurnNotice("worker", store.turnAttempts.get(id), "connection unavailable");
+    await orch.postParkedTurnNotice("requester", store.turnAttempts.get(id), "connection unavailable");
+    const cards = store.listOpenChoiceCards("discord");
+    expect(cards).toHaveLength(2);
+
+    if (route === "workflow action") {
+      expect(await orch.performWorkflowAction("cancel", id, "worker")).toContain("Cancelled dispatch");
+    } else {
+      const interaction = { channelId: "worker", user: { id: "user" }, deferred: true, replied: false,
+        options: { getString: (name: string) => name === route ? id : null, getInteger: () => null },
+        editReply: vi.fn(async () => {}) };
+      await orch.cmdWorkflows(interaction);
+      expect(interaction.editReply).toHaveBeenCalledWith({ content: expect.stringContaining("Cancelled dispatch") });
+    }
+
+    expect(store.turnAttempts.get(id)?.state).toBe("cancelled");
+    expect(store.listOpenChoiceCards("discord")).toEqual([]);
+    for (const card of cards) expect(store.getChoiceCard(card.id)?.status).toBe("cancelled");
+    expect(orch.adapter.editChoiceCard).toHaveBeenCalledTimes(2);
+    const staleClick = click(cards[0]!.id, 1);
+    await orch.handleChoiceCardInteraction(staleClick);
+    expect(staleClick.replyEphemeral).toHaveBeenCalledWith("This card is closed.");
+    expect(orch.adapter.sendChoiceCard).toHaveBeenCalledTimes(2);
+  });
+
   it.each([false, true])("cancels an unavailable user turn with one plain cause and no buttons (already notified: %s)", async alreadyNotified => {
     const orch = controller();
     const spec = { id: "inbound-orphan", target: "worker", kind: "parked" as const, session: "live" as const, prompt: "UNSENT" };

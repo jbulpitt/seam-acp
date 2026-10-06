@@ -47,7 +47,7 @@ async function fixture() {
   const adapter = { sendMessage: vi.fn(async (channel, _text) => ({ channel, id: "notice" })),
     sendPanel: vi.fn(async (channel, _panel) => ({ channel, id: "hub" })), editPanel: vi.fn(async () => {}),
     getThreadName: vi.fn(async (_channel: { id: string }): Promise<string | null> => null),
-    getThreadLiveState: vi.fn(async () => undefined),
+    getThreadLiveState: vi.fn(async () => ({ locked: false, archived: false })),
     renameThread: vi.fn(async (_channel: { id: string }, _name: string) => {}),
     sendChoicePicker: vi.fn(async (_channel: unknown, _options: any): Promise<{ value: string; userId: string } | null> => null), configParentChannels: async () => [{ id: PARENT, name: "project", guildId: "guild", guildName: "Guild" }] };
   const orchestrator = new Orchestrator({ config, logger, store, router, modelCatalog: catalog,
@@ -72,7 +72,7 @@ async function fixture() {
   };
   const row = () => router.ensureSessionRecord({ platform: "discord", channelRef: THREAD, parentRef: PARENT, cwd: dir });
   const cleanup = new ParentConfigCleanup({ config, store, plan: () => plan, parents: adapter.configParentChannels });
-  return { dir, file, config, store, router, plan, adapter, orchestrator, ui, native, slash, row, cleanup, logger };
+  return { dir, file, config, store, router, plan, adapter, orchestrator, ui, native, slash, row, cleanup, logger: (orchestrator as any).logger };
 }
 
 async function blockChannelRename(h: Awaited<ReturnType<typeof fixture>>) {

@@ -96,6 +96,7 @@ function makeOrch(opts: {
   adapter: ReturnType<typeof spyAdapter>["adapter"];
   style?: "messages" | "card";
   voiceConsole?: any;
+  logger?: Logger;
 }): Orchestrator {
   const router = {
     listProfiles: () => [],
@@ -134,7 +135,7 @@ function makeOrch(opts: {
     threadPresets: {},
   };
   const orchestrator = new Orchestrator({
-    logger: silent,
+    logger: opts.logger ?? silent,
     config: config as any,
     adapter: opts.adapter as any,
     router: router as any,
@@ -167,6 +168,73 @@ afterEach(() => {
 });
 
 describe('dispatchInjectTurn: start indicator + live streaming ("card" style)', () => {
+  it("drops a permanent 50035 rejection without resending the rejected segment", async () => {
+    const logs: Array<Record<string, any>> = [];
+    const logger = pino({ level: "warn" }, { write: line => { logs.push(JSON.parse(line)); } });
+    const log: string[] = [];
+    const paragraph = "a".repeat(900);
+    const rt = fakeRuntime([`${paragraph}\n\n`, "Closing reply."], log);
+    const { adapter, calls } = spyAdapter(log);
+    const send = adapter.sendMessage.bind(adapter);
+    const error = Object.assign(new Error("Invalid Form Body"), { code: 50035, status: 400 });
+    const rejected: string[] = [];
+    vi.spyOn(adapter, "sendMessage").mockImplementation(async (channel, text) => {
+      if (text.includes(paragraph)) { rejected.push(text); throw error; }
+      return send(channel, text);
+    });
+    const orch = makeOrch({ dataDir, rt, adapter, logger });
+    await orch.dispatchInjectTurn(baseSpec());
+    expect(rejected).toEqual([paragraph]);
+    expect(calls.sendMessage.slice(1).map(call => call.text)).toEqual(["Closing reply."]);
+    expect(logs.filter(line => line.err?.message === error.message)).toEqual([
+      expect.objectContaining({ msg: "assistant text send failed", thread: "thread-w", dispatch: "disp-1",
+        chars: paragraph.length, err: expect.objectContaining({ code: 50035 }) }),
+    ]);
+  });
+
+  it("logs a rejected message once with its Discord cause and retains it for the final drain", async () => {
+    const logs: Array<Record<string, any>> = [];
+    const logger = pino({ level: "warn" }, { write: line => { logs.push(JSON.parse(line)); } });
+    const log: string[] = [];
+    const paragraph = "a".repeat(900);
+    const rt = fakeRuntime([`${paragraph}\n\n`, "Closing reply."], log);
+    const { adapter, calls } = spyAdapter(log);
+    const send = adapter.sendMessage.bind(adapter);
+    const error = Object.assign(new Error("Missing Access"), { code: 50001 });
+    let rejected = false;
+    vi.spyOn(adapter, "sendMessage").mockImplementation(async (channel, text) => {
+      if (text === paragraph && !rejected) { rejected = true; throw error; }
+      return send(channel, text);
+    });
+    const orch = makeOrch({ dataDir, rt, adapter, logger });
+    const result = await orch.dispatchInjectTurn(baseSpec());
+    expect(result.output).toBe(`${paragraph}\n\nClosing reply.`);
+    expect(calls.sendMessage.slice(1).map(call => call.text))
+      .toEqual([paragraph, "Closing reply."]);
+    expect(logs.filter(line => line.err?.message === error.message)).toEqual([
+      expect.objectContaining({ msg: "assistant text send failed", thread: "thread-w", dispatch: "disp-1",
+        chars: paragraph.length, err: expect.objectContaining({ code: 50001 }) }),
+    ]);
+  });
+
+  it("adds thread and character count to the existing failed-edit warning", async () => {
+    const logs: Array<Record<string, any>> = [];
+    const logger = pino({ level: "warn" }, { write: line => { logs.push(JSON.parse(line)); } });
+    const log: string[] = [];
+    const paragraph = "a".repeat(900);
+    const rt = fakeRuntime([`${paragraph}\n\n`, "Closing reply."], log);
+    const { adapter } = spyAdapter(log);
+    const error = Object.assign(new Error("Unknown Message"), { code: 10008 });
+    vi.spyOn(adapter, "editPanel").mockRejectedValueOnce(error);
+    const orch = makeOrch({ dataDir, rt, adapter, logger, style: "card" });
+    const result = await orch.dispatchInjectTurn(baseSpec());
+    expect(result.output).toBe(`${paragraph}\n\nClosing reply.`);
+    expect(logs.filter(line => line.err?.message === error.message)).toEqual([
+      expect.objectContaining({ msg: "dispatch: stream edit failed", thread: "thread-w", dispatch: "disp-1",
+        chars: paragraph.length, err: expect.objectContaining({ code: 10008 }) }),
+    ]);
+  });
+
   it.each([
     { style: "messages" as const, stream: true },
     { style: "card" as const, stream: true },

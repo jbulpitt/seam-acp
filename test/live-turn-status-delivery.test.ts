@@ -29,7 +29,8 @@ afterEach(async () => {
   vi.restoreAllMocks();
 });
 
-function setup(mode: "held-status" | "failed-status" | "held-file" | "fast" = "fast") {
+function setup(mode: "held-status" | "failed-status" | "held-file" | "fast" = "fast",
+  logger = pino({ level: "silent" })) {
   vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
   const dir = mkdtempSync(path.join(tmpdir(), "seam-live-delivery-"));
   const store = new SessionStore(path.join(dir, "test.db"));
@@ -42,7 +43,6 @@ function setup(mode: "held-status" | "failed-status" | "held-file" | "fast" = "f
   let statusReleased = false;
   let run: Promise<void> | undefined;
   const pending: Promise<void>[] = [];
-  const logger = pino({ level: "silent" });
   const profile = { id: "claude", defaultModel: "fixture-model" } as AgentProfile;
   const runtime = new AgentRuntime({ profile, logger: logger as never,
     spawnFn: () => { throw new Error("provider spawning forbidden"); } });
@@ -143,6 +143,59 @@ function setup(mode: "held-status" | "failed-status" | "held-file" | "fast" = "f
 }
 
 describe("live-turn status and answer delivery", () => {
+  it("drops a permanent 50035 rejection without resending it or logging it again", async () => {
+    const logs: Array<Record<string, any>> = [];
+    const logger = pino({ level: "warn" }, { write: line => { logs.push(JSON.parse(line)); } });
+    const h = setup("fast", logger);
+    const paragraph = "a".repeat(900);
+    const error = Object.assign(new Error("Invalid Form Body"), { code: 50035, status: 400 });
+    const send = h.adapter.sendMessage.getMockImplementation()!;
+    const rejected: string[] = [];
+    h.adapter.sendMessage.mockImplementation(async (channel, text) => {
+      if (text.includes(paragraph)) { rejected.push(text); throw error; }
+      return send(channel, text);
+    });
+    h.prompt.mockImplementationOnce(async () => {
+      await h.feed({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: `${paragraph}\n\n` } });
+      await flush();
+      await h.feed({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Closing reply." } });
+      return { stopReason: "end_turn" };
+    });
+    await h.run();
+    expect(rejected).toEqual([paragraph]);
+    expect(h.messages).toEqual(["Closing reply."]);
+    expect(logs.filter(log => log.err?.message === error.message)).toEqual([
+      expect.objectContaining({ msg: "assistant text send failed", thread: "100", turn: "inbound-1",
+        chars: paragraph.length, err: expect.objectContaining({ code: 50035 }) }),
+    ]);
+  });
+
+  it("logs a failed background text send once and delivers its retained source at the end", async () => {
+    const logs: Array<Record<string, any>> = [];
+    const logger = pino({ level: "warn" }, { write: line => { logs.push(JSON.parse(line)); } });
+    const h = setup("fast", logger);
+    const paragraph = "a".repeat(900);
+    const error = Object.assign(new Error("Missing Access"), { code: 50001 });
+    h.adapter.sendMessage.mockRejectedValueOnce(error);
+    h.prompt.mockImplementationOnce(async () => {
+      await h.feed({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: `${paragraph}\n\n` } });
+      await flush();
+      expect(h.messages).toEqual([]);
+      await h.feed({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Closing reply." } });
+      return { stopReason: "end_turn" };
+    });
+    await h.run();
+    expect(h.messages).toEqual([paragraph, "Closing reply."]);
+    expect(h.store.turnAttempts.get("inbound-1")?.outcome).toMatchObject({
+      output: `${paragraph}\n\nClosing reply.`, status: "completed",
+    });
+    expect(logs.filter(log => log.msg === "assistant text send failed")).toEqual([
+      expect.objectContaining({ thread: "100", turn: "inbound-1", chars: paragraph.length,
+        err: expect.objectContaining({ message: "Missing Access", code: 50001 }) }),
+    ]);
+    expect(logs.filter(log => log.err?.message === error.message)).toHaveLength(1);
+  });
+
   it("delivers and releases the turn while a >5 s status edit remains held, then survives queue recovery", async () => {
     const h = setup("held-status");
     let finished = false;

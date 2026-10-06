@@ -34,9 +34,13 @@ import { splitForFlush } from "./stream-flush.js";
 import { SerialQueue } from "./serial-queue.js";
 import type { FenceRegistry } from "../plugins/fence-registry.js";
 
-/** Posts one flushed message. The renderer serializes calls so they never
- *  overlap; a rejection is the caller's to swallow (best-effort display). */
+/** Posts one flushed message. The renderer serializes calls and logs failures. */
 export type SendMessage = (text: string) => Promise<void>;
+
+/** Discord's invalid payload cannot succeed unchanged on another flush. */
+export function isInvalidMessagePayloadError(err: unknown): boolean {
+  return err !== null && typeof err === "object" && "code" in err && err.code === 50035;
+}
 
 export interface StreamingMessageRendererOptions {
   /** Hard upper bound for a single sent message. Default 1800 (Discord headroom). */
@@ -51,7 +55,7 @@ export interface StreamingMessageRendererOptions {
   fenceBufferCeiling?: number;
   /** Clock injection point (fence timing). Default {@link Date.now}. */
   now?: () => number;
-  /** Optional structured logger for watchdog trips (best-effort). */
+  /** Structured logger for failed sends, skipped text and watchdog trips. */
   logger?: { warn: (obj: unknown, msg?: string) => void };
   /** Ordered file output for registered fence contributions. */
   sendFile?: (file: { data: Buffer; filename: string; mimeType: string }) => Promise<void>;
@@ -143,7 +147,12 @@ export class StreamingMessageRenderer {
    *  commits the preceding prose, a fence-close re-emits the fence as its own
    *  message. No-op once finalized. */
   feed(chunk: string): void {
-    if (this.finalized || !chunk) return;
+    if (!chunk) return;
+    if (this.finalized) {
+      this.logger?.warn({ chars: chunk.length, reason: "the renderer was already finalized" },
+        "assistant text skipped");
+      return;
+    }
     const result = this.fenceStream.feed(chunk, this.now());
     for (const seg of result.segments) {
       if (seg.kind === "prose") {
@@ -245,18 +254,32 @@ export class StreamingMessageRenderer {
 
   private async sendBounded(text: string): Promise<void> {
     let rest = text;
-    while (rest) {
-      const split = splitForFlush(rest, {
-        maxLen: this.hardMax,
-        softMin: this.softMin,
-        force: true,
-        allowUnsafeCut: true,
-      });
-      const next = split?.send ?? rest.slice(0, this.hardMax);
-      rest = split?.send ? split.keep : rest.slice(next.length);
-      if (!next) break;
-      await this.send(next);
+    try {
+      while (rest) {
+        const split = splitForFlush(rest, {
+          maxLen: this.hardMax,
+          softMin: this.softMin,
+          force: true,
+          allowUnsafeCut: true,
+        });
+        const next = split?.send ?? rest.slice(0, this.hardMax);
+        if (!next) break;
+        await this.sendText(next);
+        rest = split?.send ? split.keep : rest.slice(next.length);
+      }
+    } catch (err) {
+      this.textBuffer = rest + this.textBuffer;
+      throw err;
+    }
+  }
+
+  private async sendText(text: string): Promise<void> {
+    try {
+      await this.send(text);
       this.sent += 1;
+    } catch (err) {
+      this.logger?.warn({ err, chars: text.length }, "assistant text send failed");
+      if (!isInvalidMessagePayloadError(err)) throw err;
     }
   }
 
@@ -273,17 +296,24 @@ export class StreamingMessageRenderer {
 
   private async drainBufferInner(force: boolean, allowUnsafeCut = false): Promise<void> {
     while (this.textBuffer) {
-      const split = splitForFlush(this.textBuffer, {
+      const buffered = this.textBuffer;
+      const split = splitForFlush(buffered, {
         maxLen: this.hardMax,
         softMin: this.softMin,
         force,
         allowUnsafeCut,
       });
       if (!split) return;
+      // Keep the pending prefix locally so a fence commit cannot send it twice.
+      const pending = buffered.slice(0, buffered.length - split.keep.length);
       this.textBuffer = split.keep;
       if (split.send) {
-        await this.send(split.send);
-        this.sent += 1;
+        try {
+          await this.sendText(split.send);
+        } catch (err) {
+          this.textBuffer = pending + this.textBuffer;
+          throw err;
+        }
       }
       if (!force) return;
     }
@@ -293,24 +323,9 @@ export class StreamingMessageRenderer {
    *  reaches it: prose fed after this call (e.g. after the fence) must not
    *  join it. */
   private commitBuffer(): Promise<void> {
-    let rest = this.textBuffer;
+    const text = this.textBuffer;
     this.textBuffer = "";
-    return this.flushQueue.run(async () => {
-      while (rest) {
-        const split = splitForFlush(rest, {
-          maxLen: this.hardMax,
-          softMin: this.softMin,
-          force: true,
-          allowUnsafeCut: true,
-        });
-        const send = split?.send ?? rest;
-        rest = split?.send ? split.keep : "";
-        if (send) {
-          await this.send(send);
-          this.sent += 1;
-        }
-      }
-    });
+    return this.flushQueue.run(() => this.sendBounded(text));
   }
 
   private drainBuffer(force: boolean, allowUnsafeCut = false): Promise<void> {

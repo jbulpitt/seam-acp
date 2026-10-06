@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { pino } from "pino";
 import { PluginHost } from "../packages/core/src/plugins/host.js";
 import { BUILTIN_PLUGINS } from "../packages/core/src/plugins/builtins.js";
@@ -14,6 +14,93 @@ function collector() {
 }
 
 describe("StreamingMessageRenderer (real FenceStream + splitForFlush + SerialQueue)", () => {
+  it.each(["progressive", "snapshot"])("drops a permanent 50035 rejection once during a %s send", async mode => {
+    const paragraph = "a".repeat(900);
+    const error = Object.assign(new Error("Invalid Form Body"), { code: 50035, status: 400 });
+    const rejected: string[] = [];
+    const sent: string[] = [];
+    const logger = { warn: vi.fn() };
+    const r = new StreamingMessageRenderer(async text => {
+      if (text.includes(paragraph)) { rejected.push(text); throw error; }
+      sent.push(text);
+    }, { logger });
+    r.feed(mode === "progressive" ? `${paragraph}\n\n` : paragraph);
+    if (mode === "snapshot") await r.flush();
+    else await r.whenIdle();
+    r.feed("Closing reply.");
+    await r.flush();
+    await r.finalize();
+    expect(rejected).toEqual([paragraph]);
+    expect(sent).toEqual(["Closing reply."]);
+    expect(logger.warn).toHaveBeenCalledExactlyOnceWith({ err: error, chars: paragraph.length },
+      "assistant text send failed");
+  });
+
+  it("logs a failed progressive send once and retains it for the terminal drain", async () => {
+    const { sent, send } = collector();
+    const error = Object.assign(new Error("Missing Access"), { code: 50001 });
+    const sink = vi.fn(send).mockRejectedValueOnce(error);
+    const logger = { warn: vi.fn() };
+    const r = new StreamingMessageRenderer(sink, { logger });
+    const paragraph = "a".repeat(900);
+    r.feed(`${paragraph}\n\n`);
+    await r.whenIdle();
+    expect(sent).toEqual([]);
+    expect(r.sentCount).toBe(0);
+    expect(logger.warn).toHaveBeenCalledExactlyOnceWith({ err: error, chars: paragraph.length },
+      "assistant text send failed");
+    r.feed("Closing reply.");
+    await r.finalize();
+    expect(sent).toEqual([paragraph, "Closing reply."]);
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+  });
+
+  it("retains a failed snapshot across flush without consuming it or the next feed", async () => {
+    const { sent, send } = collector();
+    const logger = { warn: vi.fn() };
+    const sink = vi.fn(send).mockRejectedValueOnce(new Error("Missing Permissions"));
+    const r = new StreamingMessageRenderer(sink, { logger });
+    r.feed("Before.");
+    await r.flush();
+    expect(sent).toEqual([]);
+    r.feed(" After.");
+    await r.finalize();
+    expect(sent).toEqual(["Before. After."]);
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not duplicate pending prose when a fence and more text arrive during its send", async () => {
+    const sent: string[] = [];
+    let release!: () => void;
+    let started!: () => void;
+    const pending = new Promise<void>(resolve => { release = resolve; });
+    const sending = new Promise<void>(resolve => { started = resolve; });
+    const r = new StreamingMessageRenderer(async text => {
+      if (sent.length === 0) { started(); await pending; }
+      sent.push(text);
+    });
+    const paragraph = "a".repeat(900);
+    r.feed(`${paragraph}\n\n`);
+    await sending;
+    r.feed("```ts\nconst x = 1;\n```\n\nAfter.");
+    release();
+    await r.finalize();
+    expect(sent.map(text => text.trim())).toEqual([paragraph, "```ts\nconst x = 1;\n```", "After."]);
+  });
+
+  it("logs nonempty text skipped after finalize with the existing reason", async () => {
+    const { sent, send } = collector();
+    const logger = { warn: vi.fn() };
+    const r = new StreamingMessageRenderer(send, { logger });
+    r.feed("First.");
+    await r.finalize();
+    r.feed("Late reply.");
+    r.feed("");
+    expect(sent).toEqual(["First."]);
+    expect(logger.warn).toHaveBeenCalledExactlyOnceWith({ chars: 11, reason: "the renderer was already finalized" },
+      "assistant text skipped");
+  });
+
   it("emits MULTIPLE messages at clean paragraph boundaries with linebreaks preserved", async () => {
     const { sent, send } = collector();
     const r = new StreamingMessageRenderer(send);

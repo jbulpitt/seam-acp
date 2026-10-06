@@ -514,6 +514,7 @@ import { StreamingPanel } from "../../core/streaming-panel.js";
 import {
   StreamingMessageRenderer,
   streamingMessageChunks,
+  isInvalidMessagePayloadError,
 } from "../../core/streaming-message-renderer.js";
 import { mimeTypeForFilename } from "../../core/fence-mime.js";
 import { resolveHostPath } from "../../core/host-path.js";
@@ -3946,6 +3947,7 @@ export class Orchestrator {
     };
 
     let textBuffer = "";
+    const outputLogger = this.logger.child({ thread: channel.id, turn: humanAttempt?.id ?? liveMarkerId });
     let textSent = false;
     let spokenProse = "";
     let spokenAfterLastTool = "";
@@ -3985,31 +3987,45 @@ export class Orchestrator {
     ) => {
       this.assertQueueFence(queueFence);
       while (textBuffer) {
-        if (!humanOutcomeOwned && !humanCurrent()) return;
-        const split = splitForFlush(textBuffer, {
+        if (!humanOutcomeOwned && !humanCurrent()) {
+          outputLogger.warn({ chars: textBuffer.length, reason: humanRefusal()?.message }, "assistant text skipped");
+          return;
+        }
+        const buffered = textBuffer;
+        const split = splitForFlush(buffered, {
           maxLen: HARD_MAX,
           softMin: SOFT_MIN,
           force,
           allowUnsafeCut,
         });
         if (!split) return;
-        textBuffer = split.keep;
         if (split.send) {
           this.assertQueueFence(queueFence);
-          if (terminalProof && textBuffer.length === 0 && humanAttempt && humanOutcomeOwned) {
-            await this.sendTerminalAttemptDelivery(humanAttempt.id, channel, {
-              kind: "message",
-              text: split.send,
-            });
-          } else {
-            await this.adapter.sendMessage(channel, split.send);
+          try {
+            if (terminalProof && split.keep.length === 0 && humanAttempt && humanOutcomeOwned) {
+              await this.sendTerminalAttemptDelivery(humanAttempt.id, channel, {
+                kind: "message",
+                text: split.send,
+              });
+            } else {
+              await this.adapter.sendMessage(channel, split.send);
+            }
+          } catch (err) {
+            outputLogger.warn({ err, chars: split.send.length }, "assistant text send failed");
+            if (isInvalidMessagePayloadError(err)) {
+              textBuffer = split.keep + textBuffer.slice(buffered.length);
+              if (!force) return;
+              continue;
+            }
+            throw err;
           }
+          textBuffer = split.keep + textBuffer.slice(buffered.length);
           this.assertQueueFence(queueFence);
           spokenProse += split.send;
           spokenAfterLastTool += split.send;
           textSent = true;
           typingDone = true;
-        }
+        } else textBuffer = split.keep + textBuffer.slice(buffered.length);
         if (!force) return;
       }
     };
@@ -4175,8 +4191,16 @@ export class Orchestrator {
         }).catch(() => {});
       }
       const eventHandler = async (event: Parameters<Parameters<typeof activeRuntime.onEvent>[0]>[0]) => {
-        if (!this.queueFenceCurrent(queueFence)) return;
-        if (!humanOutcomeOwned && !humanCurrent()) return;
+        if (!this.queueFenceCurrent(queueFence)) {
+          if (event.kind === "agent-text") outputLogger.warn({ chars: event.text.length,
+            reason: "the channel queue was fenced to a newer epoch" }, "assistant text skipped");
+          return;
+        }
+        if (!humanOutcomeOwned && !humanCurrent()) {
+          if (event.kind === "agent-text") outputLogger.warn({ chars: event.text.length,
+            reason: humanRefusal()?.message }, "assistant text skipped");
+          return;
+        }
         if (event.kind === "submission-evidence") {
           if (humanAttempt) this.recordSubmissionEvidence(humanAttempt, event.evidence);
           return; // Evidence is not progress, model output, or timeout activity.
@@ -10085,19 +10109,23 @@ export class Orchestrator {
       if (streaming && style === "messages") {
         msgRenderer = new StreamingMessageRenderer(
           async (text) => {
-            if (!this.queueFenceCurrent(queueFence)) return;
-            try {
-              await this.adapter.sendMessage(target, text);
-              deliveredOutput += text;
-            } catch (err) {
-              this.logger.warn({ err, dispatch: spec.id }, "dispatch: stream message send failed");
+            if (!this.queueFenceCurrent(queueFence)) {
+              this.logger.warn({ thread: target.id, dispatch: spec.id, chars: text.length,
+                reason: "the channel queue was fenced to a newer epoch" }, "assistant text skipped");
+              return;
             }
+            await this.adapter.sendMessage(target, text);
+            deliveredOutput += text;
           },
           {
-            logger: this.logger,
+            logger: this.logger.child({ thread: target.id, dispatch: spec.id }),
             // Every fence uses the live turn's handler.
             handleFence: async (fence, notice) => {
-              if (!this.queueFenceCurrent(queueFence)) return true;
+              if (!this.queueFenceCurrent(queueFence)) {
+                this.logger.warn({ thread: target.id, dispatch: spec.id, chars: fence.content.length,
+                  reason: "the channel queue was fenced to a newer epoch" }, "assistant fence skipped");
+                return true;
+              }
               await this.emitClosedFence(target, fence, ++streamFenceCounter, {
                 turnOrigin: spec,
                 notice,
@@ -10110,7 +10138,11 @@ export class Orchestrator {
       } else if (streaming && panelRef) {
         const ref = panelRef;
         streamPanel = new StreamingPanel(async (text, done) => {
-          if (!this.queueFenceCurrent(queueFence)) return;
+          if (!this.queueFenceCurrent(queueFence)) {
+            this.logger.warn({ thread: target.id, dispatch: spec.id, chars: text.length,
+              reason: "the channel queue was fenced to a newer epoch" }, "assistant text skipped");
+            return;
+          }
           const panel = this.dispatchStreamPanel({
             header,
             text: done ? (streamState.fullText ?? text) : text,
@@ -10127,7 +10159,8 @@ export class Orchestrator {
             else await this.adapter.editMessage(ref, serializePanelText(panel));
             deliveredOutput = done ? (streamState.fullText ?? text) : text;
           } catch (err) {
-            this.logger.warn({ err, dispatch: spec.id }, "dispatch: stream edit failed");
+            this.logger.warn({ err, thread: target.id, dispatch: spec.id,
+              chars: done ? (streamState.fullText ?? text).length : text.length }, "dispatch: stream edit failed");
           }
         });
         let fenceCounter = 0;
@@ -10135,9 +10168,13 @@ export class Orchestrator {
           cardText += text;
           streamPanel!.append(text);
         }, {
-          logger: this.logger,
+          logger: this.logger.child({ thread: target.id, dispatch: spec.id }),
           handleFence: async (fence, notice) => {
-            if (!this.queueFenceCurrent(queueFence)) return true;
+            if (!this.queueFenceCurrent(queueFence)) {
+              this.logger.warn({ thread: target.id, dispatch: spec.id, chars: fence.content.length,
+                reason: "the channel queue was fenced to a newer epoch" }, "assistant fence skipped");
+              return true;
+            }
             await this.emitClosedFence(target, fence, ++fenceCounter, {
               turnOrigin: spec,
               notice,
@@ -10224,7 +10261,11 @@ export class Orchestrator {
           // parallel, so streaming stays lossless — report-back / done-file get
           // the whole answer regardless.
           onEvent: async (event) => {
-            if (!this.queueFenceCurrent(queueFence)) return;
+            if (!this.queueFenceCurrent(queueFence)) {
+              if (event.kind === "agent-text") this.logger.warn({ thread: target.id, dispatch: spec.id,
+                chars: event.text.length, reason: "the channel queue was fenced to a newer epoch" }, "assistant text skipped");
+              return;
+            }
             if (event.kind === "recovery") {
               await this.adapter.sendMessage(target, event.message);
               return;
@@ -15005,17 +15046,19 @@ export class Orchestrator {
       adoptedRenderer = new StreamingMessageRenderer(
         async (text) => {
           const index = adoptedChunks.length;
+          if (!collectOnly) {
+            await this.adapter.sendMessage(target, text, {
+              nonce: deliveryChunkNonce(baseNonce, index),
+              enforceNonce: true,
+            });
+          }
           adoptedChunks.push(text);
           if (collectOnly) return;
-          await this.adapter.sendMessage(target, text, {
-            nonce: deliveryChunkNonce(baseNonce, index),
-            enforceNonce: true,
-          });
           const current = this.store.get(recoveryRecord!.id);
           if (current) this.store.upsert({ ...current, updatedUtc: new Date().toISOString() });
         },
         {
-          logger: this.logger,
+          logger: this.logger.child({ thread: target.id, turn: attempt.id }),
           handleFence: async (fence, notice) => {
             fenceCounter += 1;
             await this.emitClosedFence(target, fence, fenceCounter, {

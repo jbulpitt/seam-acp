@@ -143,6 +143,33 @@ function setup(mode: "held-status" | "failed-status" | "held-file" | "fast" = "f
 }
 
 describe("live-turn status and answer delivery", () => {
+  it("drops a permanent 50035 rejection without resending it or logging it again", async () => {
+    const logs: Array<Record<string, any>> = [];
+    const logger = pino({ level: "warn" }, { write: line => { logs.push(JSON.parse(line)); } });
+    const h = setup("fast", logger);
+    const paragraph = "a".repeat(900);
+    const error = Object.assign(new Error("Invalid Form Body"), { code: 50035, status: 400 });
+    const send = h.adapter.sendMessage.getMockImplementation()!;
+    const rejected: string[] = [];
+    h.adapter.sendMessage.mockImplementation(async (channel, text) => {
+      if (text.includes(paragraph)) { rejected.push(text); throw error; }
+      return send(channel, text);
+    });
+    h.prompt.mockImplementationOnce(async () => {
+      await h.feed({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: `${paragraph}\n\n` } });
+      await flush();
+      await h.feed({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Closing reply." } });
+      return { stopReason: "end_turn" };
+    });
+    await h.run();
+    expect(rejected).toEqual([paragraph]);
+    expect(h.messages).toEqual(["Closing reply."]);
+    expect(logs.filter(log => log.err?.message === error.message)).toEqual([
+      expect.objectContaining({ msg: "assistant text send failed", thread: "100", turn: "inbound-1",
+        chars: paragraph.length, err: expect.objectContaining({ code: 50035 }) }),
+    ]);
+  });
+
   it("logs a failed background text send once and delivers its retained source at the end", async () => {
     const logs: Array<Record<string, any>> = [];
     const logger = pino({ level: "warn" }, { write: line => { logs.push(JSON.parse(line)); } });

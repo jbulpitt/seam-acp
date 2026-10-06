@@ -37,6 +37,11 @@ import type { FenceRegistry } from "../plugins/fence-registry.js";
 /** Posts one flushed message. The renderer serializes calls and logs failures. */
 export type SendMessage = (text: string) => Promise<void>;
 
+/** Discord's invalid payload cannot succeed unchanged on another flush. */
+export function isInvalidMessagePayloadError(err: unknown): boolean {
+  return err !== null && typeof err === "object" && "code" in err && err.code === 50035;
+}
+
 export interface StreamingMessageRendererOptions {
   /** Hard upper bound for a single sent message. Default 1800 (Discord headroom). */
   hardMax?: number;
@@ -274,7 +279,7 @@ export class StreamingMessageRenderer {
       this.sent += 1;
     } catch (err) {
       this.logger?.warn({ err, chars: text.length }, "assistant text send failed");
-      throw err;
+      if (!isInvalidMessagePayloadError(err)) throw err;
     }
   }
 

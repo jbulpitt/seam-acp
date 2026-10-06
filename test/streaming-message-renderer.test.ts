@@ -14,6 +14,28 @@ function collector() {
 }
 
 describe("StreamingMessageRenderer (real FenceStream + splitForFlush + SerialQueue)", () => {
+  it.each(["progressive", "snapshot"])("drops a permanent 50035 rejection once during a %s send", async mode => {
+    const paragraph = "a".repeat(900);
+    const error = Object.assign(new Error("Invalid Form Body"), { code: 50035, status: 400 });
+    const rejected: string[] = [];
+    const sent: string[] = [];
+    const logger = { warn: vi.fn() };
+    const r = new StreamingMessageRenderer(async text => {
+      if (text.includes(paragraph)) { rejected.push(text); throw error; }
+      sent.push(text);
+    }, { logger });
+    r.feed(mode === "progressive" ? `${paragraph}\n\n` : paragraph);
+    if (mode === "snapshot") await r.flush();
+    else await r.whenIdle();
+    r.feed("Closing reply.");
+    await r.flush();
+    await r.finalize();
+    expect(rejected).toEqual([paragraph]);
+    expect(sent).toEqual(["Closing reply."]);
+    expect(logger.warn).toHaveBeenCalledExactlyOnceWith({ err: error, chars: paragraph.length },
+      "assistant text send failed");
+  });
+
   it("logs a failed progressive send once and retains it for the terminal drain", async () => {
     const { sent, send } = collector();
     const error = Object.assign(new Error("Missing Access"), { code: 50001 });

@@ -514,6 +514,7 @@ import { StreamingPanel } from "../../core/streaming-panel.js";
 import {
   StreamingMessageRenderer,
   streamingMessageChunks,
+  isInvalidMessagePayloadError,
 } from "../../core/streaming-message-renderer.js";
 import { mimeTypeForFilename } from "../../core/fence-mime.js";
 import { resolveHostPath } from "../../core/host-path.js";
@@ -4011,6 +4012,11 @@ export class Orchestrator {
             }
           } catch (err) {
             outputLogger.warn({ err, chars: split.send.length }, "assistant text send failed");
+            if (isInvalidMessagePayloadError(err)) {
+              textBuffer = split.keep + textBuffer.slice(buffered.length);
+              if (!force) return;
+              continue;
+            }
             throw err;
           }
           textBuffer = split.keep + textBuffer.slice(buffered.length);

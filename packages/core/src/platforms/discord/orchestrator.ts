@@ -1236,6 +1236,8 @@ export class Orchestrator {
       },
     });
     this.store.turnAttempts?.onSettled?.(id => {
+      this.trackContinuation(this.retireParkedTurnCards(id).catch(err =>
+        this.logger.warn({ err, attemptId: id }, "parked-turn card retirement failed")));
       this.trackContinuation(this.actionCards.finishAttempt(id).catch(err =>
         this.logger.warn({ err, attemptId: id }, "permission cleanup after turn failed")));
       // Prompted turns finalize after output; early settlements have no live finalizer.
@@ -12802,6 +12804,9 @@ export class Orchestrator {
         // D5: otherwise we can only record "ok" — the inner path owns its own
         // turn-level error reporting and does not surface it here.
         if (owned) {
+          // The inner finalizer can return after shutdown detached its runtime.
+          if (this.restartCutoff) throw DispatchSuspendedError.shutdown(owned.attempt.id,
+            "restart cutoff reached before the scheduled turn finished");
           const done = this.store.turnAttempts.get(owned.attempt.id)!;
           if (done.state === "active") {
             throw DispatchSuspendedError.superseded(done.id,
@@ -15436,10 +15441,11 @@ export class Orchestrator {
       await this.dispatchWatcher?.publishAdoptedResult(prior.id, outcome);
     }
 
-    if (prior.source === "schedule") {
-      const occurrence = this.store.scheduledOccurrences.get(prior.id);
-      if (occurrence) await this.deliverScheduledCompletion(occurrence, completed);
-    } else {
+    const occurrence = prior.source === "schedule"
+      ? this.store.scheduledOccurrences.get(prior.id) : null;
+    // Live adoption supplies the nonce-backed chunks, not a replay of the full answer.
+    if (prior.source !== "schedule"
+      || (occurrence?.row.sessionMode === "live" && delivery !== undefined)) {
       const target: ChannelRef = { platform: PLATFORM, id: prior.spec.target };
       const output = outcome.output ?? "";
       const body = outcome.status === "failed"
@@ -15459,6 +15465,9 @@ export class Orchestrator {
       } catch (err) {
         this.logger.warn({ err, attempt: prior.id }, "adopted remote result delivery deferred");
       }
+    }
+    if (occurrence) {
+      await this.deliverScheduledCompletion(occurrence, this.store.turnAttempts.get(prior.id)!);
     }
 
     if (prior.source === "dispatch") {

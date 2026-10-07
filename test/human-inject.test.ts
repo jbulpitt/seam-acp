@@ -183,6 +183,7 @@ function steerInteraction(opts: { now: boolean; prompt?: string; thread?: string
   const deferReply = vi.fn(async () => {});
   const reply = vi.fn(async () => {});
   const i = {
+    id: "638000000000000002",
     options: {
       getString: (name: string, _req?: boolean) =>
         name === "thread" ? (opts.thread ?? "1007") : (opts.prompt ?? "do the thing"),
@@ -217,17 +218,19 @@ describe("Orchestrator.cmdSteer now: option (#63)", () => {
   it("now:true → preemptive cancel-and-reprompt (existing behavior), no inbox push", async () => {
     const abortTurn = vi.fn(async () => "cancelled");
     const { orch } = makeOrch({ abortTurn });
-    // Stub the injection/output plumbing so the preemptive branch runs without a
-    // real runtime — we only assert it cancels + does NOT push to the inbox.
-    (orch as any).queueOnChannel = (_id: string, task: () => Promise<unknown>) => task();
-    (orch as any).injectTurn = async () => ({ text: "done", error: undefined });
-    (orch as any).postSteerOutput = async () => {};
+    const start = vi.fn(async () => {});
+    (orch as any).startRecoveredInbound = start;
 
     const { i } = steerInteraction({ now: true, prompt: "redirect now", thread: "1007" });
     await (orch as any).cmdSteer(i);
 
     expect(abortTurn).toHaveBeenCalledWith("discord:1007", { force: false });
     expect(store.countInbox("discord:1007")).toBe(0);
+    expect(start).toHaveBeenCalledWith(expect.objectContaining({
+      messageId: i.id, channelRef: "1007", sessionRecordId: "discord:1007",
+      authorId: i.user.id, authorName: "Alex", preemptive: true,
+      text: expect.stringContaining("<seam-steer>\nredirect now\n</seam-steer>"),
+    }));
   });
 
   it("accepts the exact current thread label and rejects a modified alias", async () => {

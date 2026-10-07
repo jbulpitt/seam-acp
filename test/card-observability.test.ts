@@ -685,6 +685,7 @@ function steerInteraction(opts: {
   const editReply = vi.fn(async () => {});
   return {
     i: {
+      id: "638000000000000002",
       options: {
         getString: (name: string) =>
           name === "thread" ? (opts.thread ?? null) : opts.prompt,
@@ -733,15 +734,13 @@ describe("slash steer card (#155)", () => {
     const { adapter, calls } = spyAdapter();
     const orch = makeOrch({ dataDir, adapter });
     const seenBeforeTurn: number[] = [];
-    (orch as never as Record<string, unknown>).queueOnChannel = (
-      _id: string,
-      task: () => Promise<unknown>
-    ) => {
+    const internal = orch as any;
+    internal.store.admitInbound = () => true;
+    internal.store.getInbound = () => ({ messageId: "638000000000000002" });
+    internal.store.turnAttempts = { get: () => null };
+    internal.startRecoveredInbound = async () => {
       seenBeforeTurn.push(calls.sendPanel.length);
-      return task();
     };
-    (orch as never as Record<string, unknown>).injectTurn = async () => ({ text: "ok" });
-    (orch as never as Record<string, unknown>).postSteerOutput = async () => {};
 
     const { i } = steerInteraction({
       now: true,

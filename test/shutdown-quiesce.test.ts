@@ -1161,7 +1161,8 @@ describe("#174 admission gates", () => {
 
   it("refuses a preemptive steer once intake is closed, without cancelling", async () => {
     const abortTurn = vi.fn(async () => "cancelled");
-    const queueOnChannel = vi.fn(async () => ({ text: "ok" }));
+    const startRecoveredInbound = vi.fn(async () => {});
+    const admitInbound = vi.fn(() => true);
     const editReply = vi.fn(async (..._args: any[]) => {});
     const make = (intakeStopped: boolean) =>
       ({
@@ -1170,16 +1171,17 @@ describe("#174 admission gates", () => {
         config: { TURN_TIMEOUT_SECONDS: 900, REPOS_ROOT: "/tmp" },
         router: { ensureSessionRecord: () => ({ id: "s1" }), abortTurn },
         bindThreadRecord: async () => ({ id: "s1" }),
-        queueOnChannel,
-        injectTurn: async () => ({ text: "ok" }),
+        startRecoveredInbound,
+        store: { admitInbound, getInbound: () => ({ messageId: "638000000000000002" }),
+          turnAttempts: { get: () => null } },
         postSteerCard: async () => {},
-        postSteerOutput: async () => {},
         pushHumanInbox: () => ({ queued: 1 }),
         channelRefFromInteraction: () => ({ platform: "discord", id: "t1" }),
         interactionSpeakerName: () => "op",
         cmdSteer: Orchestrator.prototype["cmdSteer" as never],
       }) as unknown as { cmdSteer(i: unknown): Promise<void> };
     const interaction = {
+      id: "638000000000000002",
       options: {
         getString: (name: string) => (name === "prompt" ? "do it" : undefined),
         getBoolean: () => true, // now:true — the mode that opens a turn
@@ -1191,14 +1193,16 @@ describe("#174 admission gates", () => {
 
     await acknowledgedHandler(interaction, acknowledged => make(true).cmdSteer(acknowledged));
     expect(abortTurn).not.toHaveBeenCalled(); // no live turn was killed…
-    expect(queueOnChannel).not.toHaveBeenCalled(); // …and none was admitted
+    expect(admitInbound).not.toHaveBeenCalled(); // …and none was admitted
+    expect(startRecoveredInbound).not.toHaveBeenCalled();
     expect(editReply.mock.calls[0]![0].content).toMatch(/Restarting/i);
     expect(editReply.mock.calls[0]![0].content).toMatch(/again/i);
 
     // Positive control: open intake still cancels and steers.
     await acknowledgedHandler(interaction, acknowledged => make(false).cmdSteer(acknowledged));
     expect(abortTurn).toHaveBeenCalledOnce();
-    expect(queueOnChannel).toHaveBeenCalledOnce();
+    expect(admitInbound).toHaveBeenCalledOnce();
+    expect(startRecoveredInbound).toHaveBeenCalledOnce();
   });
 
   /**

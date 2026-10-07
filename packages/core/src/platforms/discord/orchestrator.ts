@@ -16454,6 +16454,22 @@ export class Orchestrator {
       return;
     }
 
+    // A slash interaction owns a human turn just like a Discord message.
+    // Admit it before cancellation or card delivery can yield to shutdown.
+    this.store.admitInbound({
+      messageId: i.id,
+      platform: target.platform,
+      channelRef: threadId,
+      parentRef: record.parentRef,
+      sessionRecordId: record.id,
+      authorId: i.user.id,
+      authorName: operator,
+      text: frameSteerPrompt(prompt),
+      attachments: [],
+      preemptive: true,
+      createdUtc: new Date().toISOString(),
+    });
+
     // Preemptive cancel — identical to `/seam cancel` (graceful ACP cancel).
     const cancelOutcome = await this.router.abortTurn(record.id, { force: false });
 
@@ -16468,29 +16484,15 @@ export class Orchestrator {
       ...(source ? { source } : {}),
     });
 
-    const framed = frameSteerPrompt(prompt);
-    const result = await this.queueOnChannel(threadId, () =>
-      this.injectTurn(record, framed, {
-        session: "live",
-        outputTo: target,
-        timeoutMs: this.config.TURN_TIMEOUT_SECONDS * 1000,
-        // Drain trailing text that lands after the prompt RPC resolves so the
-        // posted response holds the whole answer, not a truncated one.
-        awaitIdle: true,
-        logContext: { steer: record.id },
-      })
-    );
-
-    // Post the steered response into the target thread so it's visible there,
-    // then confirm to the operator (ephemerally).
-    await this.postSteerOutput(target, result.text, result.error);
+    await this.startRecoveredInbound(this.store.getInbound(i.id)!);
+    const error = this.store.turnAttempts.get(inboundAttemptId(i.id))?.outcome?.error;
     const lead =
       cancelOutcome === "cancelled"
         ? "🧭 Cancelled the running turn and steered"
         : "🧭 Steered";
     await replyToInteraction(i,
-      result.error
-        ? `${lead} thread ${threadId}, but it did not complete cleanly: ${result.error.slice(0, 300)}`
+      error
+        ? `${lead} thread ${threadId}, but it did not complete cleanly: ${error.slice(0, 300)}`
         : `${lead} thread ${threadId}.`
     );
   }
@@ -16548,60 +16550,6 @@ export class Orchestrator {
       await this.sendResultCard(opts.target, title, description, DISPATCH_COLOR, fields);
     } catch (err) {
       this.logger.warn({ err, channel: opts.target.id }, "steer: durable card post failed");
-    }
-  }
-
-  /** Post a steered node's captured response into its thread. Mirrors
-   *  `postDispatchOutput` (chunk to cards, overflow to a file) with a steer
-   *  label. Best-effort — a posting failure must not break the steer. */
-  private async postSteerOutput(
-    channel: ChannelRef,
-    text: string,
-    error?: string
-  ): Promise<void> {
-    if (error) await this.postSteerProse(channel, "", error);
-    await this.renderCapturedAgentText(channel, text, (prose) => prose.trim() || !error
-      ? this.postSteerProse(channel, prose) : Promise.resolve());
-  }
-
-  private async postSteerProse(
-    channel: ChannelRef,
-    text: string,
-    error?: string
-  ): Promise<void> {
-    try {
-      if (error) {
-        await this.sendResultCard(
-          channel,
-          "🧭 Steer failed",
-          `❌ ${error.slice(0, 1500)}`,
-          0xe74c3c
-        );
-      }
-      const body = text.trim();
-      if (!body) {
-        if (!error) {
-          await this.sendResultCard(channel, "🧭 Steered", "✅ Done — no output.", DISPATCH_COLOR);
-        }
-        return;
-      }
-      const chunks = this.chunkString(body, 3900);
-      if (chunks.length <= 3) {
-        for (let j = 0; j < chunks.length; j++) {
-          const suffix = chunks.length > 1 ? ` (${j + 1}/${chunks.length})` : "";
-          await this.sendResultCard(channel, `🧭 Steered${suffix}`, chunks[j]!, DISPATCH_COLOR);
-        }
-      } else {
-        await this.sendResultCard(
-          channel,
-          "🧭 Steered",
-          `✅ Done — full output attached (${body.length} chars).`,
-          DISPATCH_COLOR
-        );
-        await this.sendResultFile(channel, "steer", body, "steer");
-      }
-    } catch (err) {
-      this.logger.warn({ err, channel: channel.id }, "steer: posting output to thread failed");
     }
   }
 

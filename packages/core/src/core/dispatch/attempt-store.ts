@@ -752,11 +752,11 @@ export class TurnAttemptStore {
   /** A permanent invalid-payload rejection did not consume the planned nonce. */
   discardStreamDelivery(a: TurnAttempt, index: number): void {
     this.db.prepare(`UPDATE turn_attempts
-      SET delivery_payload_json=json_remove(delivery_payload_json, '$.texts[' || ? || ']')
+      SET delivery_payload_json=json_remove(delivery_payload_json, ?)
       WHERE id=? AND generation=? AND owner_boot=?
         AND json_array_length(delivery_payload_json, '$.texts')=?
         AND json_extract(delivery_payload_json, '$.stream.delivered')=?`)
-      .run(index, a.id, a.generation, a.ownerBoot, index + 1, index);
+      .run(`$.texts[${index}]`, a.id, a.generation, a.ownerBoot, index + 1, index);
     this.db.prepare(`UPDATE turn_attempts SET delivery_nonce=NULL, delivery_channel=NULL,
       delivery_payload_json=NULL, delivery_started_utc=NULL
       WHERE id=? AND generation=? AND owner_boot=?

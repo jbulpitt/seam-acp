@@ -742,12 +742,13 @@ describe("#250 human turn production pipeline, synthetic transport only", () => 
     expect(h.runtime.prompt).not.toHaveBeenCalled();
   });
 
-  it("confirms a Discord-accepted nonce after crashing before delivery_done", async () => {
+  it("confirms a Discord-accepted nonce after crashing before delivery acknowledgments", async () => {
     const h = setup();
     h.runtime.prompt.mockImplementationOnce(async () => {
       await h.emit("accepted exactly once");
       return { stopReason: "end_turn" };
     });
+    vi.spyOn(h.store.turnAttempts, "acknowledgeStreamDelivery").mockImplementationOnce(() => {});
     const realMark = h.store.turnAttempts.markDeliveryDone.bind(h.store.turnAttempts);
     vi.spyOn(h.store.turnAttempts, "markDeliveryDone")
       .mockImplementationOnce(() => { throw new Error("synthetic crash after Discord accept"); })
@@ -758,7 +759,7 @@ describe("#250 human turn production pipeline, synthetic transport only", () => 
     expect(receipt).toMatchObject({
       state: "completed",
       deliveryDone: false,
-      deliveryPayload: { kind: "message", text: "accepted exactly once" },
+      deliveryPayload: { kind: "messages", texts: ["accepted exactly once"], stream: { delivered: 0 } },
     });
     h.adapter.findMessageByNonce.mockResolvedValueOnce({
       status: "found",
@@ -814,6 +815,7 @@ describe("#250 human turn production pipeline, synthetic transport only", () => 
       await h.emit("accepted but too old to scan");
       return { stopReason: "end_turn" };
     });
+    vi.spyOn(h.store.turnAttempts, "acknowledgeStreamDelivery").mockImplementationOnce(() => {});
     const realMark = h.store.turnAttempts.markDeliveryDone.bind(h.store.turnAttempts);
     vi.spyOn(h.store.turnAttempts, "markDeliveryDone")
       .mockImplementationOnce(() => { throw new Error("synthetic post-send crash"); })

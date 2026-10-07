@@ -147,13 +147,15 @@ describe("live-turn status and answer delivery", () => {
   it("records successful incremental text before the ACP terminal response", async () => {
     const h = setup();
     const terminal = deferred();
+    const received = deferred();
     h.prompt.mockImplementationOnce(async () => {
       await h.feed({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: ANSWER } });
+      received.resolve();
       await terminal.promise;
       return { stopReason: "end_turn" };
     });
     const running = h.run();
-    await flush();
+    await received.promise;
     await vi.advanceTimersByTimeAsync(4_001);
     try {
       expect(h.messages).toEqual([ANSWER]);

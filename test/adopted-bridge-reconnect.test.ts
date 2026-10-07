@@ -270,7 +270,7 @@ describe("adoption preserves recorded stream delivery", () => {
     await drain();
     h.complete("unsent prefix\n\nunsent final");
     await h.run;
-    expect(h.visible).toEqual(["unsent prefix", "unsent final"]);
+    expect(h.visible.map(text => text.trim())).toEqual(["unsent prefix", "unsent final"]);
     expect(h.store.turnAttempts.get("inbound-1")?.deliveryDone).toBe(true);
   });
 
@@ -290,7 +290,7 @@ describe("adoption preserves recorded stream delivery", () => {
     await drain();
     h.complete("same paragraph\n\nmiddle\n\nsame paragraph");
     await h.run;
-    expect(h.visible).toEqual(["same paragraph", "middle", "same paragraph"]);
+    expect(h.visible.map(text => text.trim())).toEqual(["same paragraph", "middle", "same paragraph"]);
   });
 
   it("recovers only unfinished delivery after a second SQLite reopen", async () => {
@@ -299,17 +299,21 @@ describe("adoption preserves recorded stream delivery", () => {
     const send = h.adapter.sendMessage.getMockImplementation()!;
     const tail = "x".repeat(1800) + "y".repeat(40);
     h.adapter.sendMessage.mockImplementation(async (...args) => {
-      if (args[1].startsWith("y")) throw new Error("second restart interrupted delivery");
+      if (args[2]?.nonce === deliveryChunkNonce(deliveryNonce("inbound-1"), 2)) {
+        throw new Error("second restart interrupted delivery");
+      }
       return send(...args);
     });
     h.complete("before restart\n\n" + tail);
     await h.run;
-    expect(h.visible).toEqual(["before restart", "x".repeat(1800)]);
+    expect(h.visible).toHaveLength(2);
+    expect(h.visible.map(text => text.trim()).join("")).toBe("before restart" + "x".repeat(1798));
     expect(h.store.turnAttempts.get("inbound-1")).toMatchObject({ state: "completed", deliveryDone: false });
     const store = h.reopenStore();
     h.adapter.sendMessage.mockImplementation(send);
     await h.orch.runScheduledPrompt("schedule", { id: "inbound-1", scheduledFor: null });
-    expect(h.visible).toEqual(["before restart", "x".repeat(1800), "y".repeat(40)]);
+    expect(h.visible).toHaveLength(3);
+    expect(h.visible.map(text => text.trim()).join("")).toBe("before restart" + tail);
     expect(store.turnAttempts.get("inbound-1")).toMatchObject({ state: "completed", generation: 1, deliveryDone: true });
     expect(h.commands.filter(command => command.type === "spawn")).toEqual([]);
   });

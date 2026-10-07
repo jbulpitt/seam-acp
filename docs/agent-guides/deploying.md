@@ -53,12 +53,20 @@ running processes keep the old code until they restart.
 
 - **Local bridge:** `systemctl restart` it. That's safe, because running turns
   stay with sessiond.
-- **sessiond:** a restart interrupts running agents, and sessiond resumes each
-  session afterwards. Do it only when sessiond code changed.
+- **sessiond:** with detached holders and `KillMode=process`, a normal
+  sessiond-only restart closes connections without terminating slots. The new
+  daemon [reconnects surviving holders](../../packages/bridge/src/sessiond-server.ts#L926-L935).
+  Resume/relaunch applies only when holders actually died, such as after a
+  host reboot. Restart it only when sessiond code changed.
 - **Remote bridges:** `npm run bridge:rollout -- --target <host>` is a
   read-only preflight; add `--rollout --apply` to apply. It runs on the
   controller host, because it checks the controller's bridge registry. See
   [`../bridge-rollout.md`](../bridge-rollout.md).
+
+sessiond loads `slot-holder.js` [beside its own module](../../packages/bridge/src/sessiond-server.ts#L107-L110).
+Holder changes apply to new slots after a sessiond restart, or after an
+in-place checkout rebuild on checkout-run hosts. Already-running holders
+are never hot-patched.
 
 Retained adapter children keep their old code until they exit. A terminal
 `auth_required` rejection can hand back recovery ownership without replaying

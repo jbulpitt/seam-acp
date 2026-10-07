@@ -4742,9 +4742,9 @@ export class Orchestrator {
         const resolution = resolveError(
           readErrorClassification(promptErr) ?? unclassified(described.agent.value), DEFAULT_ERROR_RULES);
         this.logger.warn({ session: record.id, resolution }, "turn recovery resolved");
-        // Same-session recovery has already run inside AgentRuntime. No output
-        // is not proof that no tools ran: owned input must not now be replayed
-        // on a replacement session. Report this outcome, without another owner.
+        // A lost owned child uses adoption's recorded-session continuation,
+        // never the unowned path below that replays the original input.
+        if (humanAttempt && this.recoverActiveRemoteTurn(humanAttempt, promptErr)) return;
         if (humanAttempt) throw promptErr;
         this.assertQueueFence(queueFence);
         if (isSessionGoneError(promptErr)) {
@@ -9961,6 +9961,9 @@ export class Orchestrator {
           if (this.restartCutoff) {
             throw DispatchSuspendedError.shutdown(spec.id, "restart cutoff reached before the outcome was recorded");
           }
+          if (outcome.cause && this.recoverActiveRemoteTurn(attempt, outcome.cause)) {
+            throw DispatchSuspendedError.superseded(attempt.id, "the bridge owner is being recovered in its recorded session");
+          }
           if (isResume && !submittedThisAttempt) {
             throw DispatchSuspendedError.defect(spec.id,
               "a resumed turn produced an outcome without this attempt submitting a prompt");
@@ -13007,6 +13010,9 @@ export class Orchestrator {
               throw DispatchSuspendedError.shutdown(attempt!.id,
                 "restart cutoff reached before the outcome was recorded");
             }
+            if (outcome.cause && this.recoverActiveRemoteTurn(attempt!, outcome.cause)) {
+              throw DispatchSuspendedError.superseded(attempt!.id, "the bridge owner is being recovered in its recorded session");
+            }
             if (!this.store.turnAttempts.isCurrent(attempt!)) {
               throw DispatchSuspendedError.superseded(attempt!.id,
                 "a newer attempt generation owns this scheduled occurrence");
@@ -14971,6 +14977,21 @@ export class Orchestrator {
       if (head) facts.defaultBranch = head;
     }
     return recoveryStory(facts);
+  }
+
+  /** Give a failed live invocation to the existing retained-owner recovery. */
+  private recoverActiveRemoteTurn(attempt: TurnAttempt, error: unknown): boolean {
+    const kind = readErrorClassification(error)?.errorKind;
+    if (kind !== "agent_exit" && kind !== "host_oom" && kind !== "connection_closed") return false;
+    const current = this.store.turnAttempts.get(attempt.id);
+    if (this.restartCutoff || !current?.promptStarted || !current.remoteRecovery
+      || !this.store.turnAttempts.isCurrent(attempt)) return false;
+    if (!this.store.turnAttempts.suspend(attempt.id, this.attemptBoot)) return false;
+    this.logger.warn({ err: error, attempt: attempt.id, location: current.remoteRecovery.location,
+      slot: current.remoteRecovery.slot }, "active turn lost its child; recovering the recorded session");
+    void this.adoptRemoteRecovery(this.store.turnAttempts.get(attempt.id)!).catch(err =>
+      this.logger.warn({ err, attempt: attempt.id }, "active remote recovery adoption deferred"));
+    return true;
   }
 
   private async adoptRemoteRecovery(attempt: TurnAttempt): Promise<boolean> {

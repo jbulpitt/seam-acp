@@ -14,6 +14,8 @@ import type { SessionConfigState, SessionRecord } from "../packages/core/src/cor
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 import { localBridgeWiring } from "./local-bridge-fixture.js";
 import { acknowledgedHandler } from "./acknowledged-handler-fixture.js";
+import { passthroughCatalog } from "./catalog-passthrough-fixture.js";
+import type { ModelCatalogService } from "../packages/core/src/core/model-catalog/service.js";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
 const ADMIN = "1487094572696867019";
@@ -109,6 +111,7 @@ function seedSession(
 }
 
 function makeOrch(opts?: {
+  modelCatalog?: ModelCatalogService;
   channelPresetsFile?: unknown;
   sendChoicePicker?: (channel: unknown, picker: unknown) => Promise<{ value: string; label: string } | null>;
 }) {
@@ -133,7 +136,7 @@ function makeOrch(opts?: {
     logger: silent,
     store,
     profiles,
-    modelCatalog: fixtureModelCatalog(profiles),
+    modelCatalog: opts?.modelCatalog ?? fixtureModelCatalog(profiles),
     defaultAgentId: "claude",
     defaultModel: "claude-opus-5",
     defaultPermissionMode: "ask",
@@ -166,7 +169,7 @@ function makeOrch(opts?: {
         ? vi.fn(opts.sendChoicePicker)
         : undefined,
     } as any,
-    modelCatalog: fixtureModelCatalog(profiles),
+    modelCatalog: opts?.modelCatalog ?? fixtureModelCatalog(profiles),
     router,
     store,
     renderer: {} as any,
@@ -188,19 +191,22 @@ afterEach(() => {
 });
 
 describe("/seam config model — #191 failure-atomic commit", () => {
-  it("passes an unlisted typed id through to the next runtime with an unverified warning", async () => {
-    const { orch, router, store, threadPresets } = makeOrch();
-    seedSession(store);
-    const { i, replies } = slashI({ strings: { id: "My-Typed-Model" } });
-    await acknowledgedHandler(i, () => (orch as any).cmdModel(i));
+  it.each([false, true])("passes an unlisted typed id through with an unverified warning (warm=%s)", async warm => {
+    const cache = await passthroughCatalog(warm, "local");
+    const { orch, router, store, threadPresets } = makeOrch({ modelCatalog: cache.catalog });
+    try {
+      seedSession(store);
+      const { i, replies } = slashI({ strings: { id: "My-Typed-Model" } });
+      await acknowledgedHandler(i, () => (orch as any).cmdModel(i));
 
-    expect(replies[0]?.content).toContain("Model will be `My-Typed-Model`");
-    expect(replies[0]?.content).toContain("unverified");
-    expect(replies[0]?.content).not.toContain("`undefined`");
-    expect(sessionConfig(store).model).toBe("My-Typed-Model");
-    expect(sessionConfig(store).reasoningEffort).toBeUndefined();
-    expect(threadPresets.get(THREAD)?.model?.value).toBe("My-Typed-Model");
-    expect(router.planRuntimeSpawn(store.get(`discord:${THREAD}`)!).model).toBe("My-Typed-Model");
+      expect(replies[0]?.content).toContain("Model will be `My-Typed-Model`");
+      expect(replies[0]?.content).toContain("unverified");
+      expect(replies[0]?.content).not.toContain("`undefined`");
+      expect(sessionConfig(store).model).toBe("My-Typed-Model");
+      expect(sessionConfig(store).reasoningEffort).toBeUndefined();
+      expect(threadPresets.get(THREAD)?.model?.value).toBe("My-Typed-Model");
+      expect(router.planRuntimeSpawn(store.get(`discord:${THREAD}`)!).model).toBe("My-Typed-Model");
+    } finally { store.close(); cache.close(); }
   });
 
   it("explicit-id defers before invalidating a live runtime", async () => {

@@ -6965,8 +6965,8 @@ export class Orchestrator {
     if (!channel) return;
     await this.postResumeNotice(channel,
       `⚠️ Agent output was lost before this controller read it from bridge \`${bridgeId}\`, slot \`${slot}\`. `
-      + `Replay requested output after cursor ${afterSeq}, but the first retained frame is frame ${firstAvailableSeq}; `
-      + `the output log reports ${droppedFrames} dropped frames. The lost contents are unavailable.`);
+      + `Replay requested output after cursor ${afterSeq}, but the first available frame is frame ${firstAvailableSeq}; `
+      + `the output log reports ${droppedFrames} dropped frames. Those frames are no longer available for replay.`);
   }
 
   recoverPermissionCards(location: string): void {

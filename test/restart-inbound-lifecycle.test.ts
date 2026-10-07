@@ -89,6 +89,84 @@ function setup() {
 }
 
 describe("#250 human turn production pipeline, synthetic transport only", () => {
+  it.each(["inventory", "exit", "error", "connection result"].flatMap(loss =>
+    ["before loss", "during retirement"].map(arrival => ({ loss, arrival }))))(
+    "lost owner FIFO ($loss) continues before a successor queued $arrival", async ({ loss, arrival }) => {
+    const h = setup();
+    simulateRetiredOwnerProcess();
+    const first = h.run();
+    await h.started;
+    const attempt = h.store.turnAttempts.get("inbound-1")!;
+    h.store.turnAttempts.recordRemoteRecovery(attempt, { version: 1, location: "local", slot: 6,
+      submissionId: "submission-6", acpSessionId: "recorded-acp", delegatedUtc: attempt.createdUtc });
+    h.orch.suspendForRestart();
+    h.release();
+    await expect(first).rejects.toMatchObject({ name: "DispatchSuspendedError", suspension: "shutdown" });
+    const adopted = Object.assign(new EventEmitter(), { kill: vi.fn(), detach: vi.fn() });
+    let ownerAlive = true;
+    const mux = {
+      sendCmd: vi.fn(async () => ({ health: ownerAlive ? [{ slot: 6, alive: true, attached: true,
+        recovery: { version: 1, owner: "bridge", submissionId: "submission-6", acpSessionId: "recorded-acp",
+          rung: 1, phase: "executing", retry: 0, budget: 3, remaining: 3, disposition: "none",
+          updatedUtc: new Date().toISOString() } }] : [] })),
+      adopt: vi.fn(() => adopted),
+    };
+    const restarted = h.make({ muxFor: () => mux, slotHealthFor: () => [] });
+    await restarted.recoverInterruptedTurns();
+    await vi.waitFor(() => expect(mux.adopt).toHaveBeenCalledOnce());
+    await restarted.reconcileRemoteRecoveries();
+    let retire!: () => void;
+    const retiring = new Promise<boolean>(resolve => { retire = () => resolve(true); });
+    vi.spyOn(restarted as any, "stopLingeringSlot").mockReturnValue(retiring);
+    let finishContinuation!: () => void;
+    const continued = new Promise<void>(resolve => { finishContinuation = resolve; });
+    const prompts: string[] = [];
+    h.runtime.prompt.mockImplementation(async text => {
+      prompts.push(text);
+      if (text.startsWith("continue\n")) await continued;
+      return { stopReason: "end_turn" };
+    });
+    const successorRow = { messageId: "2", platform: "discord", channelRef: "worker", parentRef: null,
+      sessionRecordId: "discord:worker", authorId: "user", authorName: "User", text: "FIFO_SUCCESSOR",
+      attachments: [], preemptive: false, createdUtc: new Date().toISOString() };
+    h.store.admitInbound(successorRow);
+    let successor: Promise<void> | undefined;
+    const queueSuccessor = () => { successor = (restarted as any).startRecoveredInbound(h.store.getInbound("2")); };
+    try {
+      if (arrival === "before loss") queueSuccessor();
+      ownerAlive = false;
+      if (loss === "inventory") await restarted.reconcileRemoteRecoveries();
+      else if (loss === "exit") adopted.emit("exit", 1, null);
+      else if (loss === "error") adopted.emit("error", new Error("bridge replay disconnected"));
+      else adopted.emit("remoteRecoveryResult", { version: 1, submissionId: "submission-6",
+        acpSessionId: "recorded-acp", status: "failed", text: "", errorKind: "connection_closed",
+        error: "agent child exited", finishedUtc: new Date().toISOString() });
+      if (arrival === "during retirement") queueSuccessor();
+      for (let i = 0; i < 20; i++) await new Promise<void>(resolve => setImmediate(resolve));
+      expect(prompts).toEqual([]);
+      retire();
+      await vi.waitFor(() => expect(prompts).toHaveLength(1));
+      expect(prompts[0]).toMatch(/^continue\n/);
+      expect(prompts[0]).not.toContain("ORIGINAL DISPOSABLE WORK");
+      expect(h.router.getOrStartRuntime.mock.calls.at(-1)?.[1]).toEqual({ resumeSessionId: "recorded-acp" });
+      expect(h.store.turnAttempts.get("inbound-1")).toMatchObject({ state: "active", generation: 2,
+        acpSessionId: "recorded-acp" });
+      finishContinuation();
+      await successor;
+      expect(prompts).toHaveLength(2);
+      expect(prompts[1]).toContain("FIFO_SUCCESSOR");
+      expect(h.store.turnAttempts.get("inbound-1")).toMatchObject({ state: "completed", generation: 2 });
+      expect(h.store.turnAttempts.get("inbound-2")).toMatchObject({ state: "completed", generation: 1 });
+    } finally {
+      retire();
+      finishContinuation();
+      await successor;
+      for (let i = 0; i < 20; i++) await new Promise<void>(resolve => setImmediate(resolve));
+      await (restarted as any).channelQueues.get("worker");
+      restarted.suspendForRestart();
+    }
+  });
+
   it("keeps a pre-shutdown streamed final visible once when the surviving owner settles after adoption", async () => {
     const h = setup();
     const final = "SEAM880_FINAL_" + "x".repeat(900);

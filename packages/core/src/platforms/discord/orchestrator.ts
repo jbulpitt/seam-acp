@@ -2867,13 +2867,14 @@ export class Orchestrator {
 
   /** Enqueue an already-durable row without passing back through duplicate
    * admission. Used at boot and by localized recovery. */
-  private startRecoveredInbound(row: InboundAdmission, operatorResume = false): Promise<void> {
+  private startRecoveredInbound(row: InboundAdmission, operatorResume = false,
+    queueFence?: ChannelQueueFence): Promise<void> {
     const myGen = row.preemptive
       ? (this.channelGenerations.get(row.channelRef) ?? 0) + 1
       : this.channelGenerations.get(row.channelRef) ?? 0;
     if (row.preemptive) this.channelGenerations.set(row.channelRef, myGen);
     const msg = this.inboundMessage(row);
-    return this.queueOnChannel(row.channelRef, async (fence) => {
+    const run = async (fence: ChannelQueueFence) => {
       if (row.preemptive && (this.channelGenerations.get(row.channelRef) ?? 0) > myGen) return;
       if (this.restartCutoff) return;
       if (!this.store.claimInbound(row.messageId, fence.epoch, new Date().toISOString())) return;
@@ -2894,7 +2895,8 @@ export class Orchestrator {
           this.store.completeInbound(row.messageId, fence.epoch, new Date().toISOString());
         }
       }
-    }).catch((err) => {
+    };
+    return (queueFence ? run(queueFence) : this.queueOnChannel(row.channelRef, run)).catch((err) => {
       if (!(err instanceof ChannelQueueFencedError)) {
         this.logger.error(
           { err, channelRef: row.channelRef, messageId: row.messageId },
@@ -9553,8 +9555,9 @@ export class Orchestrator {
    * only routes agent-emitted *files*; text is captured, not streamed — the
    * scheduled-prompt runner posts it afterwards for the same reason.)
    */
-  async dispatchInjectTurn(spec: DispatchSpec, operatorResume = false): Promise<{ output: string; stopReason: string }> {
-    const { output, stopReason } = await this.dispatchInjectTurnWithEvidence(spec, operatorResume);
+  async dispatchInjectTurn(spec: DispatchSpec, operatorResume = false,
+    queueFence?: ChannelQueueFence): Promise<{ output: string; stopReason: string }> {
+    const { output, stopReason } = await this.dispatchInjectTurnWithEvidence(spec, operatorResume, queueFence);
     return { output, stopReason };
   }
 
@@ -9581,7 +9584,8 @@ export class Orchestrator {
     }
   }
 
-  private async dispatchInjectTurnWithEvidence(spec: DispatchSpec, operatorResume = false): Promise<DispatchInjectTurnResult> {
+  private async dispatchInjectTurnWithEvidence(spec: DispatchSpec, operatorResume = false,
+    queueFence?: ChannelQueueFence): Promise<DispatchInjectTurnResult> {
     const prior = this.store.turnAttempts?.get(spec.id);
     if (prior?.state === "completed") {
       // Completed-output ownership never re-enters a provider. Boot projection
@@ -9622,7 +9626,7 @@ export class Orchestrator {
         executionSpec = { ...executionSpec, preset: undefined, agentId: undefined,
           location: current.location.value, model: current.model.value, effort: current.effort.value ?? undefined, cwd: current.cwd.value };
       }
-      const run = () => this.dispatchInjectTurnOwned(executionSpec, phase, operatorResume);
+      const run = () => this.dispatchInjectTurnOwned(executionSpec, phase, operatorResume, queueFence);
       // #421: stagger the provider acquisition itself, after target FIFO and
       // readiness checks. Staggering only the earlier SQL requeue looked safe
       // but the watcher admitted every recovered target together once the boot
@@ -9692,7 +9696,8 @@ export class Orchestrator {
     }
   }
 
-  private async dispatchInjectTurnOwned(spec: DispatchSpec, phase: DispatchAcquisitionPhase, operatorResume = false): Promise<DispatchInjectTurnResult> {
+  private async dispatchInjectTurnOwned(spec: DispatchSpec, phase: DispatchAcquisitionPhase, operatorResume = false,
+    inheritedFence?: ChannelQueueFence): Promise<DispatchInjectTurnResult> {
     // Compact dispatches don't inject a turn — they run the compaction pipeline
     // on the target thread and post a result card there. Same start-indicator +
     // ledger + done-file plumbing, different body (see dispatchCompact).
@@ -10582,7 +10587,7 @@ export class Orchestrator {
     try {
       if (effectiveSession === "live") {
         // Share the thread's persistent session ⇒ must not overlap a user turn.
-        return await this.queueOnChannel(spec.target, gatedRun);
+        return await (inheritedFence ? gatedRun(inheritedFence) : this.queueOnChannel(spec.target, gatedRun));
       }
       // Isolated: own throwaway runtime, so it cannot collide with the thread's
       // live session and needn't queue. It therefore appears in NO channel queue
@@ -12478,7 +12483,8 @@ export class Orchestrator {
    *  per-schedule model/cwd overrides) and post the output to the thread as
    *  blue cards. Owns last_run/last_status only — the manager owns next_run.
    *  Read-only w.r.t. the thread's live session. */
-  async runScheduledPrompt(id: string, key = scheduledOccurrenceKey(id), manualResume = false): Promise<void> {
+  async runScheduledPrompt(id: string, key = scheduledOccurrenceKey(id), manualResume = false,
+    queueFence?: ChannelQueueFence): Promise<void> {
     const row = this.store.scheduledOccurrences?.get(key.id)?.row ?? this.store.getScheduled(id);
     if (!row) return;
     // Direct/manual recovery callers have the same durable admission boundary
@@ -12496,7 +12502,7 @@ export class Orchestrator {
         occurrenceId: key.id, scheduleId: row.id, name: row.name, platform: row.platform,
         channelRef: row.channelRef, parentRef: row.parentRef, mode: row.sessionMode,
       });
-      await this.runDurableScheduledPrompt(row, key, manualResume);
+      await this.runDurableScheduledPrompt(row, key, manualResume, queueFence);
     } finally {
       try { endActivity(); } finally { endTurn(); }
     }
@@ -12515,7 +12521,8 @@ export class Orchestrator {
     return { agentId: d.agent.value, location: d.location.value, model, effort: d.effort.value, cwd, fingerprint };
   }
 
-  private async runDurableScheduledPrompt(row: ScheduledPrompt, key: ScheduledOccurrenceKey, manualResume = false): Promise<void> {
+  private async runDurableScheduledPrompt(row: ScheduledPrompt, key: ScheduledOccurrenceKey, manualResume = false,
+    queueFence?: ChannelQueueFence): Promise<void> {
     const saved = this.store.scheduledOccurrences.get(key.id);
     const prior = this.store.turnAttempts.get(key.id);
     if (saved?.settled) return;
@@ -12564,6 +12571,7 @@ export class Orchestrator {
           occurrence: { ...occurrence, row: executionRow, execution },
           attempt,
           operatorResume: manualResume,
+          queueFence,
           // claim() rewrites updatedUtc and clears the stall reason. The
           // situation has to be read from the pre-claim row.
           ...(prior?.promptStarted ? { stopped: prior } : {}),
@@ -12729,6 +12737,7 @@ export class Orchestrator {
     attempt: TurnAttempt;
     stopped?: RecoveryAttemptSource;
     operatorResume?: boolean;
+    queueFence?: ChannelQueueFence;
   }): Promise<void> {
     const assertOwned = (): void => {
       if (!owned) return;
@@ -12827,7 +12836,7 @@ export class Orchestrator {
         // D2: queue behind user turns / other schedules on this channel; never
         // pre-empt. `queueOnChannel` (not `handleIncomingMessage`) — the latter
         // would bump the generation and abort whatever is running.
-        await this.queueOnChannel(row.channelRef, async (fence) => {
+        const run = async (fence: ChannelQueueFence) => {
           if (owned) this.scheduledActivity?.phase(owned.attempt.id, "startup");
           // D4: a user message arriving mid-turn bumps this channel's generation
           // and force-aborts our turn. `handleIncomingMessageInner` swallows the
@@ -12837,7 +12846,8 @@ export class Orchestrator {
           if (owned) await this.handleIncomingMessageInner(synthetic, fence, owned.attempt, owned.operatorResume);
           else await this.handleIncomingMessageInner(synthetic, fence);
           aborted = (this.channelGenerations.get(row.channelRef) ?? 0) > genAtStart;
-        });
+        };
+        await (owned?.queueFence ? run(owned.queueFence) : this.queueOnChannel(row.channelRef, run));
         // D4: record the abort; do NOT auto-retry (it would fight the user).
         // D5: otherwise we can only record "ok" — the inner path owns its own
         // turn-level error reporting and does not surface it here.
@@ -15055,14 +15065,24 @@ export class Orchestrator {
     this.adoptingRemoteResults.add(attempt.id);
     const run = () => this.adoptRemoteRecoveryOwned(attempt);
     if (attempt.spec.session === "live") {
-      void this.queueOnChannel(attempt.spec.target, async () => {
+      void this.queueOnChannel(attempt.spec.target, async (fence) => {
         while (!this.restartCutoff) {
           const current = this.store.turnAttempts.get(attempt.id);
-          if (!current || current.state !== "suspended" || current.generation !== attempt.generation
-            || !current.remoteRecovery) return;
+          if (!current || current.state !== "suspended" || current.generation !== attempt.generation) return;
+          if (!current.remoteRecovery) {
+            if (current.stalledReason?.startsWith(REAUTH_COMPLETED_PREFIX)
+              || isAwaitingReauth(current.stalledReason)) return;
+            // Continue at the admission already held, ahead of queued successors.
+            await this.requestLostRemoteContinuation(current, attempt.remoteRecovery!, fence);
+            const next = this.store.turnAttempts.get(attempt.id);
+            if (next?.state !== "suspended" || !next.remoteRecovery) return;
+            attempt = next;
+            continue;
+          }
           await this.adoptRemoteRecoveryOwned(current);
           const next = this.store.turnAttempts.get(attempt.id);
-          if (next?.state !== "suspended" || !next.remoteRecovery || this.restartCutoff) return;
+          if (next?.state !== "suspended" || this.restartCutoff) return;
+          if (!next.remoteRecovery) continue;
           await new Promise<void>(resolve => this.deferRemoteRecoveryAdoption(next, resolve));
         }
       }, {
@@ -15686,16 +15706,23 @@ export class Orchestrator {
     this.remoteAdoptionWaiters.get(attempt.id)?.();
     this.logger.warn({ attempt: attempt.id, location: binding.location, slot: binding.slot, cause },
       "delegated turn lost its bridge owner; continuing it in its recorded session");
-    void (async () => {
-      // Never run two processes on one session: the old slot is gone first.
-      await this.stopLingeringSlot(binding.location, binding.slot);
-      const message = await this.resumeTurnManually(attempt.id);
-      this.logger.info({ attempt: attempt.id, message }, "lost remote turn continuation requested");
-      if (/^(Cannot resume|No interrupted)/.test(message) && attempt.spec?.target) {
-        await this.postResumeNotice(attempt.spec.target,
-          `⚠️ An interrupted turn could not continue on its own: ${message}`);
-      }
-    })().catch((err) => this.logger.error({ err, attempt: attempt.id }, "lost remote turn continuation failed"));
+    if (attempt.spec.session === "live" && this.adoptingRemoteResults.has(attempt.id)) return;
+    void this.requestLostRemoteContinuation(attempt, binding).catch((err) =>
+      this.logger.error({ err, attempt: attempt.id }, "lost remote turn continuation failed"));
+  }
+
+  private async requestLostRemoteContinuation(attempt: TurnAttempt,
+    binding: NonNullable<TurnAttempt["remoteRecovery"]>, queueFence?: ChannelQueueFence): Promise<void> {
+    // Never run two processes on one session: the old slot is gone first.
+    await this.stopLingeringSlot(binding.location, binding.slot);
+    if (this.restartCutoff) return;
+    this.assertQueueFence(queueFence);
+    const message = await this.resumeTurnManually(attempt.id, queueFence);
+    this.logger.info({ attempt: attempt.id, message }, "lost remote turn continuation requested");
+    if (/^(Cannot resume|No interrupted)/.test(message) && attempt.spec?.target) {
+      await this.postResumeNotice(attempt.spec.target,
+        `⚠️ An interrupted turn could not continue on its own: ${message}`);
+    }
   }
 
   /**
@@ -16339,7 +16366,7 @@ export class Orchestrator {
 
   /** Operator-initiated resume from `/seam workflows` — bypasses max-age
    *  and the auto-resume flag (the operator clicked Resume). */
-  async resumeTurnManually(id: string): Promise<string> {
+  async resumeTurnManually(id: string, queueFence?: ChannelQueueFence): Promise<string> {
     const delegated = this.store.turnAttempts.get(id);
     if (delegated?.state === "suspended" && delegated.remoteRecovery) {
       await this.adoptRemoteRecovery(delegated);
@@ -16352,8 +16379,9 @@ export class Orchestrator {
         const occurrence = this.store.scheduledOccurrences.get(marker.scheduleOccurrenceId);
         const attempt = this.store.turnAttempts.get(marker.scheduleOccurrenceId);
         if (!occurrence || attempt?.state !== "suspended") return `Cannot resume \`${id}\` — no suspended occurrence.`;
-        void this.runScheduledPrompt(occurrence.scheduleId, occurrence, true).catch(err =>
-          this.logger.warn({ id, err }, "manual scheduled continuation deferred"));
+        const run = this.runScheduledPrompt(occurrence.scheduleId, occurrence, true, queueFence);
+        if (queueFence) await run;
+        else void run.catch(err => this.logger.warn({ id, err }, "manual scheduled continuation deferred"));
         return `Continuation requested for \`${id}\`; ownership and provider guards still apply.`;
       }
       if (marker.inboundMessageId) {
@@ -16361,9 +16389,11 @@ export class Orchestrator {
         const row = this.store.getInbound(marker.inboundMessageId);
         if (!a || a.state !== "suspended" || !row) return `Cannot resume \`${id}\` — no suspended, identity-bound execution.`;
         if (isAwaitingReauth(a.stalledReason)) return `Cannot resume \`${id}\` — ${a.stalledReason}.`;
-        const pending = this.store.recoverInboundChannel(row.channelRef, new Date().toISOString());
+        const pending = this.store.recoverInboundChannel(row.channelRef, new Date().toISOString(),
+          queueFence ? row.messageId : undefined);
         if (!pending) return `Cannot resume \`${id}\` — admission is terminal.`;
-        this.startRecoveredInbound(pending, true);
+        const run = this.startRecoveredInbound(pending, true, queueFence);
+        if (queueFence) await run;
         return `Continuation requested for \`${id}\`; provider and ownership guards still apply.`;
       }
       if (!marker.acpSessionId) {
@@ -16375,6 +16405,14 @@ export class Orchestrator {
     const stale = (await this.dispatchWatcher?.listStaleRunning()) ?? [];
     const spec = stale.find((s) => s.id === id);
     if (spec) {
+      if (queueFence) {
+        const refusal = await this.dispatchContinuationRefusal(spec);
+        if (refusal) return `Cannot resume \`${id}\` — ${refusal}.`;
+        const admitted = await this.dispatchWatcher?.requeueStale(id, true,
+          (spec, operatorResume) => this.dispatchInjectTurn(spec, operatorResume, queueFence));
+        return admitted ? `Continuation requested for dispatch \`${id}\`; ownership and session/load checks still apply.`
+          : `Cannot resume \`${id}\` — the suspended execution could not be authorized for continuation.`;
+      }
       const refusal = await this.requestDispatchContinuation(spec, true);
       return refusal
         ? `Cannot resume \`${id}\` — ${refusal}.`

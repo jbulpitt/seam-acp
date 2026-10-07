@@ -83,6 +83,19 @@ describe("#180 durable inbound admission", () => {
       expect.objectContaining({ messageId: "2", text: "replacement", state: "pending" }),
     ]);
   });
+
+  it("recovers the recorded inbound admission without superseding it with its queued successor", () => {
+    admit("1", "interrupted");
+    store.claimInbound("1", 0, "2026-09-03T00:00:10.000Z");
+    store.admitInbound({ messageId: "2", platform: "discord", channelRef: "100", parentRef: "10",
+      sessionRecordId: "discord:100", authorId: "200", authorName: "Alex", text: "queued successor",
+      attachments: [], preemptive: false, createdUtc: "2026-09-03T00:00:11.000Z" });
+    expect(store.getInbound("1")?.state).toBe("running");
+    expect(store.recoverInboundChannel("100", "2026-09-03T00:00:12.000Z", "1"))
+      .toMatchObject({ messageId: "1", state: "pending", queueEpoch: null });
+    expect(store.getInbound("2")).toMatchObject({ state: "pending", text: "queued successor" });
+    expect(store.listInboundNonterminal("100").map(row => row.messageId)).toEqual(["1", "2"]);
+  });
 });
 
 describe("#180 channel queue fencing", () => {

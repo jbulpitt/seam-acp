@@ -12,6 +12,7 @@ import type { IncomingMessage } from "../packages/core/src/platforms/chat-adapte
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
 import { discordRenderer } from "../packages/core/src/platforms/discord/renderer.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
+import { deliveryChunkNonce, deliveryNonce } from "../packages/core/src/core/dispatch/delivery-proof.js";
 
 const ANSWER = "synthetic answer";
 const deferred = () => {
@@ -100,7 +101,7 @@ function setup(mode: "held-status" | "failed-status" | "held-file" | "fast" = "f
         await statusGate.promise;
       }
     }),
-    sendMessage: vi.fn(async (channel: IncomingMessage["channel"], text: string) => {
+    sendMessage: vi.fn(async (channel: IncomingMessage["channel"], text: string, _delivery?: { nonce?: string; enforceNonce?: boolean }) => {
       messages.push(text); return { channel, id: `message-${messages.length}` };
     }),
     sendFile: vi.fn(async () => {
@@ -143,6 +144,29 @@ function setup(mode: "held-status" | "failed-status" | "held-file" | "fast" = "f
 }
 
 describe("live-turn status and answer delivery", () => {
+  it("records successful incremental text before the ACP terminal response", async () => {
+    const h = setup();
+    const terminal = deferred();
+    h.prompt.mockImplementationOnce(async () => {
+      await h.feed({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: ANSWER } });
+      await terminal.promise;
+      return { stopReason: "end_turn" };
+    });
+    const running = h.run();
+    await flush();
+    await vi.advanceTimersByTimeAsync(4_001);
+    try {
+      expect(h.messages).toEqual([ANSWER]);
+      expect(h.store.turnAttempts.get("inbound-1")).toMatchObject({ state: "active", deliveryDone: false,
+        deliveryNonce: deliveryNonce("inbound-1"), deliveryChannel: "100",
+        deliveryPayload: { kind: "messages", texts: [ANSWER], stream: { delivered: 1 } } });
+      expect(h.adapter.sendMessage.mock.calls[0]?.[2]).toEqual({
+        nonce: deliveryChunkNonce(deliveryNonce("inbound-1"), 0), enforceNonce: true,
+      });
+    } finally { terminal.resolve(); await running; }
+    expect(h.messages).toEqual([ANSWER]);
+    expect(h.store.turnAttempts.get("inbound-1")?.deliveryDone).toBe(true);
+  });
   it("drops a permanent 50035 rejection without resending it or logging it again", async () => {
     const logs: Array<Record<string, any>> = [];
     const logger = pino({ level: "warn" }, { write: line => { logs.push(JSON.parse(line)); } });

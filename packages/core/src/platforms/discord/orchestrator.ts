@@ -3997,6 +3997,8 @@ export class Orchestrator {
     // would be its own message).
     const HARD_MAX = 1800;
     const SOFT_MIN = 800;
+    let humanStreamIndex = humanAttempt?.deliveryPayload?.kind === "messages"
+      ? humanAttempt.deliveryPayload.texts.length : 0;
     const drainBufferInner = async (
       force: boolean,
       allowUnsafeCut = false,
@@ -4019,7 +4021,10 @@ export class Orchestrator {
         if (split.send) {
           this.assertQueueFence(queueFence);
           try {
-            if (terminalProof && split.keep.length === 0 && humanAttempt && humanOutcomeOwned) {
+            if (humanAttempt && !turnFinalized) {
+              await this.sendStreamAttemptText(humanAttempt, channel, split.send, humanStreamIndex);
+              humanStreamIndex += 1;
+            } else if (terminalProof && split.keep.length === 0 && humanAttempt && humanOutcomeOwned) {
               await this.sendTerminalAttemptDelivery(humanAttempt.id, channel, {
                 kind: "message",
                 text: split.send,
@@ -10186,6 +10191,7 @@ export class Orchestrator {
         ...(statelessCard ? { rollingMaxChars: DISPATCH_CARD_WINDOW_CHARS } : {}),
       };
       if (streaming && style === "messages") {
+        let streamIndex = attempt?.deliveryPayload?.kind === "messages" ? attempt.deliveryPayload.texts.length : 0;
         msgRenderer = new StreamingMessageRenderer(
           async (text) => {
             if (!this.queueFenceCurrent(queueFence)) {
@@ -10193,7 +10199,10 @@ export class Orchestrator {
                 reason: "the channel queue was fenced to a newer epoch" }, "assistant text skipped");
               return;
             }
-            await this.adapter.sendMessage(target, text);
+            if (attempt && effectiveSession === "live") {
+              await this.sendStreamAttemptText(attempt, target, text, streamIndex);
+              streamIndex += 1;
+            } else await this.adapter.sendMessage(target, text);
             deliveredOutput += text;
           },
           {
@@ -15151,25 +15160,23 @@ export class Orchestrator {
     }
 
     const target: ChannelRef = { platform: PLATFORM, id: attempt.spec.target };
-    const adoptedChunks: string[] = [];
+    const recordedStream = attempt.deliveryPayload?.kind === "messages" && attempt.deliveryPayload.stream
+      ? attempt.deliveryPayload : undefined;
+    const adoptedChunks: string[] = [...(recordedStream?.texts ?? [])];
+    const recordedChunks = [...adoptedChunks];
     let adoptedText = "";
     let collectOnly = false;
     let adoptedRenderer: StreamingMessageRenderer | undefined;
     const adoptedPanel = this.attemptStatusPanel(attempt);
     if (adoptedPanel) this.attemptStatusPanels.set(attempt.id, adoptedPanel);
     if (recoveryRuntime && recoveryRecord) {
-      const baseNonce = deliveryNonce(attempt.id);
       let fenceCounter = 0;
       adoptedRenderer = new StreamingMessageRenderer(
         async (text) => {
-          const index = adoptedChunks.length;
-          if (!collectOnly) {
-            await this.adapter.sendMessage(target, text, {
-              nonce: deliveryChunkNonce(baseNonce, index),
-              enforceNonce: true,
-            });
-          }
-          adoptedChunks.push(text);
+          if (collectOnly) this.store.turnAttempts.prepareStreamDelivery(attempt, target.id, text, adoptedChunks.length);
+          else await this.sendStreamAttemptText(attempt, target, text, adoptedChunks.length);
+          const payload = this.store.turnAttempts.get(attempt.id)?.deliveryPayload;
+          if (payload?.kind === "messages") adoptedChunks.splice(0, adoptedChunks.length, ...payload.texts);
           if (collectOnly) return;
           const current = this.store.get(recoveryRecord!.id);
           if (current) this.store.upsert({ ...current, updatedUtc: new Date().toISOString() });
@@ -15281,10 +15288,16 @@ export class Orchestrator {
         await new Promise<void>((resolve) => setImmediate(resolve));
         await recoveryRuntime.idle();
         await adoptedRenderer.whenIdle();
-        const start = adoptedText ? result.text.lastIndexOf(adoptedText) : 0;
-        const through = start < 0 ? 0 : start + adoptedText.length;
+        let through = 0;
+        for (const text of recordedChunks) {
+          const start = result.text.indexOf(text, through);
+          if (start < 0) break;
+          through = start + text.length;
+        }
+        const start = adoptedText ? result.text.indexOf(adoptedText, through) : through;
+        if (start >= 0) through = start + adoptedText.length;
         const unseen = result.text.slice(through);
-        if (unseen) adoptedRenderer.feed(!adoptedText && binding.modelFallbackNotice
+        if (unseen) adoptedRenderer.feed(!adoptedText && recordedChunks.length === 0 && binding.modelFallbackNotice
           ? `${binding.modelFallbackNotice}\n\n${unseen}` : unseen);
         collectOnly = true;
         await adoptedRenderer.finalize();
@@ -15323,13 +15336,18 @@ export class Orchestrator {
       let delivery: DurableDeliveryPayload | null | undefined;
       if (adoptedRenderer) {
         const texts = [...adoptedChunks];
-        if (failed) texts.push(`❌ ${error}`);
-        else if (texts.length === 0 && output.trim() && adoptedRenderer.sentCount === 0) {
+        if (failed) {
+          const text = `❌ ${error}`;
+          this.store.turnAttempts.prepareStreamDelivery(current, target.id, text);
+          texts.push(text);
+        } else if (texts.length === 0 && output.trim() && adoptedRenderer.sentCount === 0) {
           texts.push(...await streamingMessageChunks(output));
         } else if (texts.length === 0 && !output.trim()) {
           texts.push("✅ Done — no output.");
         }
-        delivery = texts.length > 0 ? { kind: "messages", texts } : null;
+        const payload = this.store.turnAttempts.get(current.id)?.deliveryPayload;
+        delivery = texts.length > 0 ? { kind: "messages", texts,
+          ...(payload?.kind === "messages" && payload.stream ? { stream: payload.stream } : {}) } : null;
       }
       await this.finishRemoteRecoveryCompletion(current, completed, delivery);
       if (result.stopReason !== "prompt_not_received") {
@@ -15840,6 +15858,11 @@ export class Orchestrator {
     payload: DurableDeliveryPayload,
     nonce: string
   ): Promise<Array<{ payload: Exclude<DurableDeliveryPayload, { kind: "messages" }>; nonce: string }>> {
+    if (payload.kind === "messages" && payload.stream) {
+      return payload.texts.map((text, index) => ({
+        payload: { kind: "message", text }, nonce: deliveryChunkNonce(nonce, index),
+      }));
+    }
     if (payload.kind === "message" || payload.kind === "messages") {
       const texts = payload.kind === "messages" ? payload.texts : [payload.text];
       const chunks: string[] = [];
@@ -15908,6 +15931,17 @@ export class Orchestrator {
     }
   }
 
+  private async sendStreamAttemptText(attempt: TurnAttempt, channel: ChannelRef, text: string, index: number): Promise<void> {
+    const receipt = this.store.turnAttempts.prepareStreamDelivery(attempt, channel.id, text, index);
+    try {
+      await this.adapter.sendMessage(channel, text, { nonce: receipt.nonce, enforceNonce: true });
+      this.store.turnAttempts.acknowledgeStreamDelivery(attempt, receipt.index);
+    } catch (err) {
+      if (isInvalidMessagePayloadError(err)) this.store.turnAttempts.discardStreamDelivery(attempt, receipt.index);
+      throw err;
+    }
+  }
+
   /** Persist-before-send terminal delivery used by normal and recovery paths. */
   private async sendTerminalAttemptDelivery(
     attemptId: string,
@@ -15915,12 +15949,21 @@ export class Orchestrator {
     payload: DurableDeliveryPayload
   ): Promise<void> {
     const receipt = this.store.turnAttempts.prepareDelivery(attemptId, channel.id, payload);
+    if (payload.kind === "messages" && payload.stream) {
+      const resolution = await this.recoverRecordedDelivery(this.store.turnAttempts.get(attemptId)!, channel, true);
+      if (resolution !== "delivered") {
+        const current = this.store.turnAttempts.get(attemptId)!;
+        throw new Error(current.deliveryUncertainReason ?? current.deliveryAbandonedReason ?? resolution);
+      }
+      return;
+    }
     return this.sendDeliveryPayload(channel, payload, receipt.nonce, this.store.turnAttempts.get(attemptId)?.spec);
   }
 
   private async recoverRecordedDelivery(
     attempt: TurnAttempt,
-    channel: ChannelRef
+    channel: ChannelRef,
+    propagateError = false,
   ): Promise<"delivered" | "abandoned" | "uncertain" | "deferred"> {
     // Protects bounded uncertainty from being re-queried on every boot;
     // deleting this check recreates noisy retries without creating proof.
@@ -15957,7 +16000,9 @@ export class Orchestrator {
     }
     // The production Discord adapter implements this evidence lookup. A test or
     // future adapter without it must fail closed instead of claiming dedup.
-    if (!this.adapter.findMessageByNonce) {
+    const parts = await this.deliveryParts(attempt.deliveryPayload, attempt.deliveryNonce);
+    const delivered = attempt.deliveryPayload.kind === "messages" ? attempt.deliveryPayload.stream?.delivered ?? 0 : 0;
+    if (delivered < parts.length && !this.adapter.findMessageByNonce) {
       this.store.turnAttempts.abandonDelivery(
         attempt.id,
         "platform cannot query nonce-backed delivery evidence"
@@ -15965,12 +16010,13 @@ export class Orchestrator {
       return "abandoned";
     }
 
-    const parts = await this.deliveryParts(attempt.deliveryPayload, attempt.deliveryNonce);
-    for (const part of parts) {
+    for (const [index, part] of parts.entries()) {
+      if (index < delivered) continue;
       let observed;
       try {
-        observed = await this.adapter.findMessageByNonce(channel, part.nonce, sinceMs);
+        observed = await this.adapter.findMessageByNonce!(channel, part.nonce, sinceMs);
       } catch (err) {
+        if (propagateError) throw err;
         this.logger.warn({ err, id: attempt.id }, "Discord nonce lookup deferred");
         return "deferred";
       }
@@ -15986,6 +16032,7 @@ export class Orchestrator {
         // concurrent create won, Discord returns it rather than creating another.
         await this.sendDeliveryPart(channel, part.payload, part.nonce, attempt.spec);
       } catch (err) {
+        if (propagateError) throw err;
         this.logger.warn({ err, id: attempt.id }, "nonce-backed delivery replay deferred");
         return "deferred";
       }

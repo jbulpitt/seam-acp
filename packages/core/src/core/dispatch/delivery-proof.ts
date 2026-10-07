@@ -34,7 +34,9 @@ export function deliveryChunkNonce(baseNonce: string, index: number): string {
 /** The exact final Discord create-message payload retained across a crash. */
 export type DurableDeliveryPayload =
   | { kind: "message"; text: string }
-  | { kind: "messages"; texts: string[] }
+  | { kind: "messages"; texts: string[];
+      /** Exact progressive chunks; only the acknowledged prefix may be skipped. */
+      stream?: { delivered: number } }
   | { kind: "panel"; panel: StructuredPanel }
   | {
       kind: "file";

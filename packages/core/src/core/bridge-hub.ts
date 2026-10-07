@@ -225,7 +225,7 @@ export class BridgeHub {
   }
 
   /**
-   * True only after this host's bridge has finished hello + prepare(). Local
+   * True after hello + prepare() settles; one failed agent does not block the host. Local
    * is deliberately not special: if its separate process is down, local work
    * is unavailable while every other connected host keeps working (#575).
    */
@@ -235,7 +235,7 @@ export class BridgeHub {
     if (!conn) return false;
     const installed = [...conn.agents.values()].filter((a) => a.installed);
     if (installed.length === 0) return true;
-    return installed.every((a) => a.ready);
+    return installed.every((a) => a.ready || a.reason !== undefined);
   }
 
   /** Subscribe to post-reconcile "bridge ready". Returns an unsubscribe. */
@@ -595,6 +595,7 @@ export class BridgeHub {
         version: a.version,
         installed: a.installed,
         ready: false,
+        ...(a.reason !== undefined ? { reason: a.reason } : {}),
         ...(a.runtime ? { runtime: a.runtime } : {}),
         ...(a.metadata ? { metadata: a.metadata } : {}),
       });
@@ -620,7 +621,7 @@ export class BridgeHub {
     this.connections.set(expectedId, conn);
 
     for (const [agentId, state] of agents) {
-      if (!state.installed) continue;
+      if (!state.installed || state.reason !== undefined) continue;
       try {
         await mux.rpc("prepare", {}, { agentId });
         state.ready = true;

@@ -347,11 +347,15 @@ async function main(): Promise<void> {
     profileIds: location => bridgeHub?.installedAgentsByHost().get(location)
       ?? modelCatalog.knownBindings().filter(binding => binding.location === location).map(binding => binding.agentId),
     profileCatalog: (id, location) => {
-      const metadata = bridgeHub?.get(location)?.agents.get(id)?.metadata;
-      return metadata ? {
-        scope: () => metadata.catalogScope,
+      return {
+        scope: () => {
+          const scope = bridgeHub?.get(location)?.agents.get(id)?.metadata?.catalogScope
+            ?? modelCatalog.lookup({ agentId: id, location }).snapshot?.candidate.scope;
+          if (!scope) throw new Error(`catalog scope for ${id}@${location} is not available yet`);
+          return scope;
+        },
         fetch: async () => await bridgeHub!.fetchModelCatalog(location, id) as AdapterCatalogCandidate,
-      } : undefined;
+      };
     },
     profileSessions: (id, location) => {
       const capabilities = bridgeHub?.get(location)?.agents.get(id)?.metadata?.sessionManagement;

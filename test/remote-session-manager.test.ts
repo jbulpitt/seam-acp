@@ -3,10 +3,58 @@ import { remoteSessionManager } from "../packages/core/src/core/remote-session-m
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { asLocalAdapter } from "@seam/adapters";
+import { asLocalAdapter, invokeAdapterRpc, SESSION_HISTORY_CHUNK_BYTES, type SessionHistoryChunk } from "@seam/adapters";
 import { dispatchBridgeRpc } from "../packages/bridge/src/rpc.js";
 
 describe("remoteSessionManager", () => {
+  it.each(["local", "remote-host"])("reassembles %s's multi-chunk history without splitting Unicode", async location => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "seam-history-chunks-"));
+    const history = path.join(cwd, "history.jsonl");
+    const content = "x".repeat(SESSION_HISTORY_CHUNK_BYTES - 1) + "🧪" + "y".repeat(SESSION_HISTORY_CHUNK_BYTES);
+    fs.writeFileSync(history, content);
+    const adapter = asLocalAdapter({
+      id: "claude", displayName: "Claude fixture", defaultModel: "default",
+      spawn: () => { throw new Error("no process needed for file operations"); },
+      sessionManager: {
+        listSessions: async () => [], getTranscript: async () => "", cloneSession: async () => {}, deleteSession: async () => {},
+        getHistoryPath: async () => history,
+      },
+    });
+    const chunks: SessionHistoryChunk[] = [];
+    const rpc = vi.fn(async (_location, method, params, agentId) => {
+      const chunk = await dispatchBridgeRpc(method, params, agentId, {
+        adapters: new Map([["claude", adapter]]), workspaceRoot: cwd, cwd,
+      }) as SessionHistoryChunk;
+      chunks.push(chunk);
+      return chunk;
+    });
+    try {
+      const manager = remoteSessionManager({ rpc } as any, location, "claude", { history: true, repair: false });
+      await expect(manager.getHistory!(cwd, "session")).resolves.toBe(content);
+      expect(chunks).toHaveLength(3);
+      expect(chunks.map(chunk => Buffer.from(chunk.bytesBase64, "base64").length))
+        .toEqual([SESSION_HISTORY_CHUNK_BYTES, SESSION_HISTORY_CHUNK_BYTES, 3]);
+      expect(rpc.mock.calls.map(call => call[2].offset))
+        .toEqual([0, SESSION_HISTORY_CHUNK_BYTES, SESSION_HISTORY_CHUNK_BYTES * 2]);
+      expect(chunks.map(chunk => chunk.eof)).toEqual([false, false, true]);
+      const capped = await invokeAdapterRpc("getHistory", {
+        sessionId: "session", offset: 0, length: SESSION_HISTORY_CHUNK_BYTES * 3,
+      }, { adapter, workspaceRoot: cwd }) as SessionHistoryChunk;
+      expect(Buffer.from(capped.bytesBase64, "base64")).toHaveLength(SESSION_HISTORY_CHUNK_BYTES);
+    } finally { fs.rmSync(cwd, { recursive: true, force: true }); }
+  });
+
+  it.each(["getHistory", "repairSession"])("%s reports the missing adapter or session manager by name", async method => {
+    const adapter = asLocalAdapter({
+      id: "claude", displayName: "Claude fixture", defaultModel: "default",
+      spawn: () => { throw new Error("unused spawn"); },
+    });
+    await expect(invokeAdapterRpc(method, { sessionId: "session" }, { workspaceRoot: "/repo" }))
+      .rejects.toThrow(`no adapter for ${method}`);
+    await expect(invokeAdapterRpc(method, { sessionId: "session" }, { adapter, workspaceRoot: "/repo" }))
+      .rejects.toThrow(`no session manager for ${method}`);
+  });
+
   it.each(["local", "remote-host"])("reads and repairs session history through %s's host RPC", async location => {
     const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "seam-host-history-"));
     const history = path.join(cwd, "history.jsonl");

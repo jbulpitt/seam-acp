@@ -381,9 +381,16 @@ export function inventoryFromAdapters(
       /* keep default */
     }
     const runtime = adapter.describe().runtime;
-    const scope = adapter.catalog.scope();
+    let scope: ReturnType<AgentAdapter["catalog"]["scope"]> | undefined;
+    let reason: string | undefined;
+    try {
+      scope = adapter.catalog.scope();
+    } catch (error) {
+      reason = error instanceof Error ? error.message : String(error);
+      console.error(`[bridge] adapter ${id} catalog scope failed: ${reason}`);
+    }
     const metadata = {
-      catalogScope: { fingerprint: scope.fingerprint, provider: scope.provider, sharing: scope.sharing },
+      ...(scope ? { catalogScope: { fingerprint: scope.fingerprint, provider: scope.provider, sharing: scope.sharing } } : {}),
       sessionManagement: adapter.sessionManager ? {
         history: !!adapter.sessionManager.getHistoryPath,
         repair: !!adapter.sessionManager.repairSession,
@@ -395,7 +402,7 @@ export function inventoryFromAdapters(
       mcpServersAtSpawn: adapter.mcpServersAtSpawn, submissionSignals: adapter.submissionSignals,
       claudeSessionOptions: adapter.claudeSessionOptions,
     };
-    rows.push({ agentId: id, version, installed, ready: false, metadata, ...(runtime ? { runtime } : {}) });
+    rows.push({ agentId: id, version, installed, ready: false, ...(reason !== undefined ? { reason } : {}), metadata, ...(runtime ? { runtime } : {}) });
   }
   return rows;
 }

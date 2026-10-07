@@ -8,6 +8,7 @@ import { normalizeCatalogCandidate } from "./catalog-evidence.js";
 import { scanWorkspaces } from "./workspace-scan.js";
 import { readAttachmentWithinRoot } from "./read-attachment.js";
 import type { AgentAdapter } from "./agent-profile.js";
+import { SESSION_HISTORY_CHUNK_BYTES, type SessionHistoryChunk } from "./session-manager.js";
 
 export interface AdapterRpcCtx {
   adapter?: AgentAdapter;
@@ -73,12 +74,34 @@ export async function invokeAdapterRpc(
       if (!adapter) throw new Error("no adapter for listSessions");
       return adapter.listSessions(cwd);
     case "getHistory": {
-      const history = await adapter!.sessionManager!.getHistoryPath!(cwd, str(p.sessionId)!);
-      return history ? fsp.readFile(history, "utf8") : null;
+      if (!adapter) throw new Error("no adapter for getHistory");
+      if (!adapter.sessionManager?.getHistoryPath) throw new Error("no session manager for getHistory");
+      const sessionId = str(p.sessionId);
+      if (!sessionId) throw new Error("sessionId required");
+      const history = await adapter.sessionManager.getHistoryPath(cwd, sessionId);
+      if (!history) return null;
+      const offset = typeof p.offset === "number" ? p.offset : 0;
+      const length = Math.min(typeof p.length === "number" ? p.length : SESSION_HISTORY_CHUNK_BYTES, SESSION_HISTORY_CHUNK_BYTES);
+      const file = await fsp.open(history, "r");
+      try {
+        const bytes = Buffer.alloc(length);
+        const { bytesRead } = await file.read(bytes, 0, length, offset);
+        return {
+          bytesBase64: bytes.subarray(0, bytesRead).toString("base64"),
+          nextOffset: offset + bytesRead, eof: bytesRead < length,
+        } satisfies SessionHistoryChunk;
+      } finally {
+        await file.close();
+      }
     }
-    case "repairSession":
-      await adapter!.sessionManager!.repairSession!(cwd, str(p.sessionId)!);
+    case "repairSession": {
+      if (!adapter) throw new Error("no adapter for repairSession");
+      if (!adapter.sessionManager?.repairSession) throw new Error("no session manager for repairSession");
+      const sessionId = str(p.sessionId);
+      if (!sessionId) throw new Error("sessionId required");
+      await adapter.sessionManager.repairSession(cwd, sessionId);
       return null;
+    }
     case "getTranscript": {
       if (!adapter) throw new Error("no adapter for getTranscript");
       const sessionId = str(p.sessionId);
@@ -111,7 +134,9 @@ export async function invokeAdapterRpc(
       return null;
     }
     case "whoami":
-      return adapter?.whoami?.() ?? null;
+      if (!adapter) throw new Error("no adapter for whoami");
+      if (!adapter.whoami) throw new Error(`Agent \`${adapter.id}\` (${adapter.displayName}) does not expose account info.`);
+      return adapter.whoami();
     case "writeAttachment": {
       if (!adapter) throw new Error("no adapter for writeAttachment");
       const filename = str(p.filename);

@@ -18632,10 +18632,18 @@ export class Orchestrator {
       });
       return;
     }
-    const id = await this.bridgeHub!.rpc(resolved.location.value, "whoami", {}, profile.id) as import("@seam/adapters").AgentIdentity | null;
+    let id: import("@seam/adapters").AgentIdentity | null;
+    try {
+      id = await this.bridgeHub!.rpc(resolved.location.value, "whoami", {}, profile.id) as typeof id;
+    } catch (error) {
+      await replyToInteraction(i, { content: error instanceof Error ? error.message : String(error) });
+      return;
+    }
     if (!id) {
       await replyToInteraction(i, {
-        content:
+        content: ["codex", "agy", "grok"].includes(profile.id)
+          ? `Agent \`${profile.id}\` (${profile.displayName}) does not expose account info.`
+          :
           `Agent \`${profile.id}\` (${profile.displayName}) — no logged-in account found. ` +
           `Run \`copilot login\` (set \`COPILOT_HOME\` for non-default profiles) on the host.`,
       });

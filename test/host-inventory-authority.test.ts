@@ -7,6 +7,7 @@ import { agentLocationPickerChoices } from "../packages/core/src/platforms/disco
 import { spawnRemoteSlot } from "../packages/core/src/core/remote-spawn.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 import { localBridgeWiring } from "./local-bridge-fixture.js";
+import { asLocalAdapter, CLAUDE_FAST_MODE } from "@seam/adapters";
 
 describe("the bridge is authoritative on every host", () => {
   it("a controller Copilot opt-out does not remove another host's offering or catalog", async () => {
@@ -94,5 +95,53 @@ describe("the bridge is authoritative on every host", () => {
         effort: "high", thinking: { type: "adaptive", display: "summarized" },
         compactionControl: { enabled: true, contextTokenThreshold: 800_000 },
       } } });
+  });
+
+  it.each(["local", "remote-645"])("retains client policy on %s with a metadata-free hello, cold and cached", location => {
+    const hello = { agents: [
+      { agentId: "claude", version: 4, installed: true, ready: false },
+      { agentId: "copilot", version: 4, installed: true, ready: false },
+    ] };
+    const profiles = hello.agents.map(row => asLocalAdapter({
+      id: row.agentId, displayName: row.agentId,
+      defaultModel: row.agentId === "claude" ? "claude-opus-5-5" : "gpt-6.1-sol",
+      spawn: () => { throw new Error("controller must not spawn"); },
+    }));
+    for (const modelCatalog of [{ lookup: () => ({ snapshot: null }) }, fixtureModelCatalog(profiles)]) {
+      const router = new SessionRouter({
+        logger: pino({ level: "silent" }) as any, store: {} as any, profiles: [],
+        modelCatalog: modelCatalog as any,
+        defaultAgentId: "claude", defaultModel: "default",
+        profileIds: () => hello.agents.map(row => row.agentId),
+        profileMetadata: () => undefined,
+        profileCatalog: () => ({
+          scope: () => ({ fingerprint: "f".repeat(64), provider: "fixture" }),
+          fetch: async () => { throw new Error("unused catalog fetch"); },
+        }),
+        claudeSessionOptions: { thinkingDisplay: "summarized", compactionTokenThreshold: 0.8 },
+      });
+      expect(router.listProfiles(location).map(profile => profile.id)).toEqual(["claude", "copilot"]);
+      const claude = router.getProfile("claude", location)!;
+      expect(claude.newSessionMeta!("claude-opus-5-5", "high")).toEqual({
+        claudeCode: {
+          options: {
+            effort: "high", thinking: { type: "adaptive", display: "summarized" },
+            compactionControl: { enabled: true, contextTokenThreshold: 800_000 },
+          },
+          emitRawSDKMessages: [{ type: "command_lifecycle" }, { type: "stream_event" }],
+        },
+      });
+      expect(claude.effort).toMatchObject({ mechanism: "meta", levels: expect.arrayContaining(["high"]) });
+      expect(claude.fastMode).toEqual(CLAUDE_FAST_MODE);
+      expect(claude.submissionSignals).toBe("claude_sdk");
+      expect(claude.classifyError!(Object.assign(new Error("Authentication required"), {
+        data: { errorKind: "authentication_failed" },
+      }))).toMatchObject({ errorKind: "auth_required", agentId: "claude" });
+      const copilot = router.getProfile("copilot", location)!;
+      expect(copilot.mcpServersAtSpawn).toBe(true);
+      expect(copilot.effort).toMatchObject({ mechanism: "configOption", configId: "reasoning_effort" });
+      expect(copilot.classifyError!(new Error("copilot ACP advertised no model config options")))
+        .toMatchObject({ errorKind: "capability_absent", agentId: "copilot" });
+    }
   });
 });

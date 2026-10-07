@@ -1,3 +1,11 @@
+export const SESSION_HISTORY_CHUNK_BYTES = 1024 * 1024;
+
+export interface SessionHistoryChunk {
+  bytesBase64: string;
+  nextOffset: number;
+  eof: boolean;
+}
+
 export interface SessionSummaryLine {
   sender: "human" | "agent";
   text: string;

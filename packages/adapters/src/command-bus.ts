@@ -55,6 +55,8 @@ export interface HelloAgentInventory {
   version: number;
   installed: boolean;
   ready: boolean;
+  /** Cause of this agent's inventory/prepare failure; other agents stay usable. */
+  reason?: string;
   /** Optional non-secret resolved runtime/provenance inventory. */
   runtime?: import("./agent-profile.js").AdapterRuntimeDescriptor;
   metadata?: import("./agent-profile.js").AgentClientMetadata;

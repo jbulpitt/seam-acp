@@ -495,7 +495,7 @@ export class SessionRouter {
     const snapshot = this.modelCatalog.lookup({ agentId: id, location }).snapshot;
     const cached = !known && !metadata && snapshot ? asRemoteCatalogAdapter(id, snapshot.candidate) : undefined;
     const catalog = this.profileCatalog?.(id, location) ?? cached?.catalog ?? known?.catalog;
-    if (!known && !metadata && !cached) return undefined;
+    if (!known && !metadata && !cached && !catalog) return undefined;
     const profile = metadata || !known
       ? controllerMetadataAdapter(known ?? cached ?? { id, catalog: catalog! }, metadata, catalog, this.claudeSessionOptions)
       : known;

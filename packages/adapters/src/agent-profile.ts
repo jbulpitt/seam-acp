@@ -124,7 +124,7 @@ export type AgentClientMetadata = Pick<AgentAdapter,
   "effort" | "fastMode" | "restrictDiscordAccess" | "mcpServersAtSpawn" |
   "submissionSignals" | "claudeSessionOptions"
 > & {
-  catalogScope: import("./model-catalog.js").CatalogScope;
+  catalogScope?: import("./model-catalog.js").CatalogScope;
   sessionManagement: { history: boolean; repair: boolean } | null;
 };
 

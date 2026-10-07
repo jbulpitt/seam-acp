@@ -210,7 +210,7 @@ import { parkedTurnAction, parkedTurnChoiceSpec, parkedTurnContext, type ParkedT
 import { readDefaultBranchHead } from "../../core/dispatch/default-branch-head.js";
 
 import { summarizeAnomalies } from "../../core/watchdog.js";
-import type { BridgeHub } from "../../core/bridge-hub.js";
+import type { BridgeHub, BridgeOutputGap } from "../../core/bridge-hub.js";
 import { remoteSessionManager } from "../../core/remote-session-manager.js";
 import { handleBridgeSlash } from "./bridge.js";
 import { handleDebugSlash } from "./debug.js";
@@ -271,6 +271,7 @@ import { remainingMaxAgeMs, waitUntilBridgeReady } from "../../core/bridge-resum
 import {
   isLocalLocation,
   LOCAL_LOCATION,
+  normalizeLocation,
   formatAgentAtLocation,
   hostShortName,
 } from "../../core/location.js";
@@ -6949,6 +6950,23 @@ export class Orchestrator {
 
   setBridgeHub(hub: BridgeHub): void {
     this.bridgeHub = hub;
+    hub.onOutputGap?.(gap => this.trackContinuation(this.notifyBridgeOutputGap(gap)));
+  }
+
+  private async notifyBridgeOutputGap(gap: BridgeOutputGap): Promise<void> {
+    const { bridgeId, slot, afterSeq, firstAvailableSeq, droppedFrames } = gap;
+    const attempt = (["active", "suspended"] as const).flatMap(state =>
+      this.store.turnAttempts.list(state)).find(row =>
+      row.remoteRecovery?.slot === slot && normalizeLocation(row.remoteRecovery.location) === bridgeId);
+    // Live runtimes can receive replay before prompt ownership is delegated.
+    const channel = attempt?.spec.target ?? this.store.listSessionsUncapped().find(record =>
+      this.bridgeHub?.sessionBridgeId(record.id) === bridgeId
+      && this.router.getRuntime(record.id)?.getSlot() === slot)?.channelRef;
+    if (!channel) return;
+    await this.postResumeNotice(channel,
+      `⚠️ Agent output was lost before this controller read it from bridge \`${bridgeId}\`, slot \`${slot}\`. `
+      + `Replay requested output after cursor ${afterSeq}, but the first retained frame is frame ${firstAvailableSeq}; `
+      + `the output log reports ${droppedFrames} dropped frames. The lost contents are unavailable.`);
   }
 
   recoverPermissionCards(location: string): void {

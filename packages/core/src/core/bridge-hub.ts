@@ -121,6 +121,14 @@ export interface BridgeHubOpts {
   localBridgeTokenHash: string;
 }
 
+export interface BridgeOutputGap {
+  bridgeId: string;
+  slot: number;
+  afterSeq: number;
+  firstAvailableSeq: number;
+  droppedFrames: number;
+}
+
 function bearerToken(req: IncomingMessage): string | undefined {
   const auth = req.headers.authorization;
   if (typeof auth === "string" && auth.toLowerCase().startsWith("bearer ")) {
@@ -252,6 +260,11 @@ export class BridgeHub {
     return () => {
       this.readyEvents.off("disconnect", listener);
     };
+  }
+
+  onOutputGap(listener: (gap: BridgeOutputGap) => void): () => void {
+    this.readyEvents.on("output-gap", listener);
+    return () => { this.readyEvents.off("output-gap", listener); };
   }
 
   get(bridgeId: string): ConnectedBridge | undefined {
@@ -540,6 +553,7 @@ export class BridgeHub {
       onOutputGap: (slot, gap) => {
         this.logger.error({ bridgeId, slot, ...gap },
           "bridge output was lost before this controller read it; the slot's stream has a gap");
+        this.readyEvents.emit("output-gap", { bridgeId, slot, ...gap });
       },
       onRemoteRecovery: (slot, recovery) => {
         const health = [...(this.slotHealth.get(bridgeId) ?? [])];

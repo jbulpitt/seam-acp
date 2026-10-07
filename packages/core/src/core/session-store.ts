@@ -2683,17 +2683,18 @@ export class SessionStore {
   /**
    * Reconcile one thread after a crash or an operator fence. Ordinary user
    * messages are replacement semantics, so only the newest nonterminal row is
-   * recoverable; older rows are durably superseded in the same transaction.
+   * recoverable; a recorded continuation selects only its own admission.
    */
-  recoverInboundChannel(channelRef: string, updatedUtc: string): InboundAdmission | null {
+  recoverInboundChannel(channelRef: string, updatedUtc: string, messageId?: string): InboundAdmission | null {
     const recover = this.db.transaction(() => {
       const rows = this.db
-        .prepare<[string], InboundAdmissionRow>(
+        .prepare<[string, string | null, string | null], InboundAdmissionRow>(
           `SELECT * FROM inbound_admissions
            WHERE channel_ref = ? AND state IN ('pending','running')
+           AND (? IS NULL OR message_id = ?)
            ORDER BY created_utc ASC, rowid ASC`
         )
-        .all(channelRef);
+        .all(channelRef, messageId ?? null, messageId ?? null);
       const newest = rows.at(-1);
       if (!newest) return null;
       for (const old of rows) {
@@ -2702,9 +2703,10 @@ export class SessionStore {
       this.db
         .prepare(
           `UPDATE inbound_admissions SET state = 'completed', updated_utc = ?
-           WHERE channel_ref = ? AND state IN ('pending','running') AND message_id <> ?`
+           WHERE channel_ref = ? AND state IN ('pending','running') AND message_id <> ?
+           AND (? IS NULL OR message_id = ?)`
         )
-        .run(updatedUtc, channelRef, newest.message_id);
+        .run(updatedUtc, channelRef, newest.message_id, messageId ?? null, messageId ?? null);
       this.db
         .prepare(
           `UPDATE inbound_admissions SET state = 'pending', queue_epoch = NULL, updated_utc = ?

@@ -553,17 +553,35 @@ export class DispatchWatcher {
   }
 
   /** Authorize an existing SQL attempt after boot/operator preconditions. */
-  async requeueStale(id: string, operatorResume = false): Promise<boolean> {
-    return this.withArtifact(id, async () => {
+  async requeueStale(id: string, operatorResume = false,
+    atAdmission?: DispatchWatcherOpts["onDispatch"]): Promise<boolean> {
+    const admitted = await this.withArtifact(id, async (): Promise<boolean | ClaimOwnership> => {
       if (this.beforeRecoveryPublish) await this.beforeRecoveryPublish(id);
       const a = this.attempts.get(id);
       if (!a || a.source !== "dispatch" || a.state !== "suspended") return false;
+      if (atAdmission) {
+        if (this.inFlight.has(id) || this.targetFences.has(a.spec.target) || this.globalFence) return false;
+        const owner: ClaimOwnership = Object.freeze({ token: Symbol(id),
+          spec: { ...a.spec, resume: a.promptStarted }, operatorResume,
+          targetEpoch: this.targetEpoch(a.spec.target), globalEpoch: this.globalEpoch });
+        this.inFlight.set(id, owner);
+        this.recoveryReady.delete(id);
+        this.deferred.delete(id);
+        return owner;
+      }
       // Refuse only a terminal execution. A stale delegation projection cannot
       // strand nonterminal SQL-owned work; the owning dispatcher repairs it.
       this.recoveryReady.set(id, operatorResume);
       this.deferred.delete(id);
       return true;
     });
+    if (typeof admitted === "boolean") return admitted;
+    try {
+      await this.runSpec(id, admitted.spec, admitted, atAdmission);
+      return true;
+    } finally {
+      if (this.inFlight.get(id) === admitted) this.inFlight.delete(id);
+    }
   }
 
   /** Publish an adopted bridge result without entering the provider again.
@@ -897,12 +915,13 @@ export class DispatchWatcher {
   private async dispatchWithBootRecoveryRetries(
     spec: DispatchSpec,
     owner: ClaimOwnership,
+    execute = this.onDispatch,
   ): Promise<{ output: string; stopReason: string }> {
     let budget: number | undefined;
     let started: number | undefined;
     for (let attempt = 1; ; attempt++) {
       try {
-        return await (owner.operatorResume ? this.onDispatch(spec, true) : this.onDispatch(spec));
+        return await (owner.operatorResume ? execute(spec, true) : execute(spec));
       } catch (err) {
         if (!(err instanceof DispatchSuspendedError) || err.suspension !== "retryable") throw err;
         const schedule = bootRecoveryBackoff(err);
@@ -938,7 +957,8 @@ export class DispatchWatcher {
     }
   }
 
-  private async runSpec(id: string, spec: DispatchSpec, owner: ClaimOwnership): Promise<void> {
+  private async runSpec(id: string, spec: DispatchSpec, owner: ClaimOwnership,
+    atAdmission?: DispatchWatcherOpts["onDispatch"]): Promise<void> {
     // #409: this is SELECTION, not execution. The turn is about to be enqueued
     // on its target's SerialQueue and may sit there for minutes behind another
     // turn — `294ba576` waited 13.5 of them. `turn_attempts` reports it
@@ -952,7 +972,7 @@ export class DispatchWatcher {
       "dispatch: admitted"
     );
 
-    await this.queueFor(spec.target).run(async () => {
+    const run = async () => {
       if (!this.owns(owner)) return;
       // Another queued callback may have completed this id since claim time.
       // Keep the winning SQL outcome instead of writing a replacement failure.
@@ -1016,7 +1036,7 @@ export class DispatchWatcher {
         "dispatch: running"
       );
       try {
-        const { output, stopReason } = await this.dispatchWithBootRecoveryRetries(spec, owner);
+        const { output, stopReason } = await this.dispatchWithBootRecoveryRetries(spec, owner, atAdmission);
         const committed = await this.finishOwned(owner, {
           ...base,
           status: "completed",
@@ -1110,7 +1130,9 @@ export class DispatchWatcher {
         });
         if (committed) this.logger.warn({ id, target: spec.target, err }, "dispatch: failed");
       }
-    });
+    };
+    // An adopted live turn already holds its target FIFO position.
+    await (atAdmission ? run() : this.queueFor(spec.target).run(run));
   }
 
   /** Write the done-file (atomically, so `--wait` never reads a half-file),

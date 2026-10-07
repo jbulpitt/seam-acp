@@ -700,7 +700,7 @@ describe("#777 armed recovery queue reconciliation", () => {
     await next;
     await drain();
     await h.orch.reconcileRemoteRecoveries();
-    expect(resume).toHaveBeenCalledExactlyOnceWith("inbound-1");
+    expect(resume).toHaveBeenCalledExactlyOnceWith("inbound-1", expect.objectContaining({ channelId: "thread", epoch: 0 }));
     expect(h.store.turnAttempts.get("inbound-1")).toMatchObject({
       state: "suspended", acpSessionId: "acp", outcome: null,
     });

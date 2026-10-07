@@ -66,6 +66,62 @@ async function readDone(id: string): Promise<Record<string, unknown>> {
 }
 
 describe("DispatchWatcher", () => {
+  it("continues an already-admitted suspended dispatch through acquisition retry and normal publication", async () => {
+    const spec: DispatchSpec = { id: "adopted", target: "thread-1", prompt: "original brief", session: "live" };
+    queueStore.turnAttempts.registerOwner("old-controller");
+    const old = queueStore.turnAttempts.claim(spec, "identity", "old-controller");
+    queueStore.turnAttempts.bind(old, "same-acp");
+    queueStore.turnAttempts.startPrompt(old);
+    queueStore.turnAttempts.suspendBoot("old-controller");
+    const onDispatch = vi.fn(async () => ({ output: "must not append", stopReason: "end_turn" }));
+    const recoverySleep = vi.fn(async () => {});
+    const watcher = makeWatcher({ attempts: queueStore.turnAttempts, dataDir, logger: silent,
+      onDispatch, recoverySleep });
+    await watcher.start();
+    let calls = 0;
+    const atAdmission = vi.fn(async (resumed: DispatchSpec, operatorResume?: boolean) => {
+      expect(resumed).toMatchObject({ id: "adopted", resume: true });
+      expect(operatorResume).toBe(true);
+      if (++calls === 1) throw DispatchSuspendedError.retryable(spec.id, "bridge connection reset before load");
+      queueStore.turnAttempts.registerOwner("new-controller");
+      const next = queueStore.turnAttempts.claim(resumed, "identity", "new-controller", "dispatch", true);
+      queueStore.turnAttempts.bind(next, "same-acp");
+      queueStore.turnAttempts.startPrompt(next);
+      queueStore.turnAttempts.complete(next, { id: spec.id, target: spec.target,
+        status: "completed", output: "continued once", stopReason: "end_turn", finishedUtc: new Date().toISOString() });
+      return { output: "continued once", stopReason: "end_turn" };
+    });
+    await expect(watcher.requeueStale(spec.id, true, atAdmission)).resolves.toBe(true);
+    expect(atAdmission).toHaveBeenCalledTimes(2);
+    expect(recoverySleep).toHaveBeenCalledOnce();
+    expect(onDispatch).not.toHaveBeenCalled();
+    expect(watcher.inFlightCount).toBe(0);
+    expect(queueStore.turnAttempts.get(spec.id)).toMatchObject({ state: "completed", generation: 2,
+      acpSessionId: "same-acp" });
+    expect(await readDone(spec.id)).toMatchObject({ status: "completed", output: "continued once" });
+  });
+
+  it("surfaces a retained cause through the existing observer during an admitted continuation", async () => {
+    const spec: DispatchSpec = { id: "adopted", target: "thread-1", prompt: "original brief", session: "live" };
+    queueStore.turnAttempts.registerOwner("old-controller");
+    const old = queueStore.turnAttempts.claim(spec, "identity", "old-controller");
+    queueStore.turnAttempts.bind(old, "same-acp");
+    queueStore.turnAttempts.startPrompt(old);
+    queueStore.turnAttempts.suspendBoot("old-controller");
+    const cause = DispatchSuspendedError.defect(spec.id, "session/load rejected the recorded conversation");
+    const onRetained = vi.fn(async () => {});
+    const watcher = makeWatcher({ attempts: queueStore.turnAttempts, dataDir, logger: silent,
+      onDispatch: async () => ({ output: "must not append", stopReason: "end_turn" }), onRetained });
+    await watcher.start();
+    const atAdmission = vi.fn(async () => { throw cause; });
+    await expect(watcher.requeueStale(spec.id, true, atAdmission)).resolves.toBe(true);
+    expect(atAdmission).toHaveBeenCalledOnce();
+    expect(onRetained).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ id: spec.id }), cause);
+    expect(queueStore.turnAttempts.get(spec.id)).toMatchObject({ state: "suspended", generation: 1, outcome: null });
+    expect(watcher.inFlightCount).toBe(0);
+    expect(await readdir(dirs.done)).toEqual([]);
+  });
+
   it("#304 unavailable filesystem ingress cannot block admitted SQL work", async () => {
     queueStore.turnAttempts.admit({ id: "sql-only", target: "thread-1", prompt: "already admitted", session: "live" });
     await mkdir(dirs.root, { recursive: true });

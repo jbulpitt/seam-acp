@@ -269,8 +269,10 @@ describe("explicit operator continuation after identity drift", () => {
     const h = harness("local", "ok");
     const id = seedPromptedAttempt(h, false);
     const record = h.store.get(`discord:${THREAD}`)!;
-    h.store.upsert({ ...record, configJson: JSON.stringify({ model: MODEL, role: "current-role" }) });
-    await expect(resume(h)).rejects.toMatchObject({ reason: expect.stringContaining("config") });
+    const cwd = path.join(h.dir, "current-project");
+    fs.mkdirSync(cwd);
+    h.store.upsert({ ...record, repoPath: cwd });
+    await expect(resume(h)).rejects.toMatchObject({ reason: expect.stringContaining("working directory changed") });
     expect(h.calls.prompts).toEqual([]);
     await (h.orch as any).executeIncomingMessage({ messageId: "msg-302", text: ORIGINAL,
       authorId: "human", authorName: "Human", authorIsBot: false,

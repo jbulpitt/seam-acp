@@ -488,7 +488,7 @@ export function choiceCardHideButtons(card: ChoiceCard): boolean {
   return isChoiceSingleUser(card) && card.status !== "open";
 }
 
-export function renderChoicePanel(card: ChoiceCard): StructuredPanel {
+export function renderChoicePanel(card: ChoiceCard, statusLabel?: string): StructuredPanel {
   const title = `🗳️ ${card.title}`.slice(0, 256);
   const description = card.body ? card.body.slice(0, 4096) : undefined;
   const color = card.status === "open" ? 0x5865f2 : 0x99aab5;
@@ -502,23 +502,22 @@ export function renderChoicePanel(card: ChoiceCard): StructuredPanel {
         name: "Selected",
         value: who ? `**${selected}** · ${who}` : `**${selected}**`,
       });
-    } else if (card.status === "cancelled") {
-      fields.push({ name: "Status", value: "Cancelled" });
+    }
+    if (card.status !== "open" && (statusLabel || card.status === "cancelled")) {
+      fields.push({ name: "Status", value: statusLabel ?? "Cancelled" });
     }
     const footer =
       card.status === "open"
         ? isChoiceMultiSelect(card)
           ? "Select one or more"
           : "Pick one"
-        : card.status === "exhausted"
-          ? "Done"
-          : "Cancelled";
+        : statusLabel ?? (card.status === "exhausted" ? "Done" : "Cancelled");
     return { color, title, ...(description ? { description } : {}), fields, footer };
   }
 
   const last = who ? ` · last: ${who}` : "";
   const status =
-    card.status === "open" ? "open" : card.status === "exhausted" ? "closed" : "cancelled";
+    card.status === "open" ? "open" : statusLabel?.toLowerCase() ?? (card.status === "exhausted" ? "closed" : "cancelled");
   return {
     color,
     title,

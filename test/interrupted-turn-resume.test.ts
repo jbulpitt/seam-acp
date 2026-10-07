@@ -95,7 +95,6 @@ describe("#302 execution identity", () => {
       [{ model: "claude-sonnet-5" }, /model changed from claude-opus-5 to claude-sonnet-5/],
       [{ effort: "low" }, /effort changed from high to low/],
       [{ cwd: "/other" }, /working directory changed from \/repo to \/other/],
-      [{ config: { rider: "new rule" } }, /thread configuration changed/],
     ];
     for (const [over, expected] of cases) {
       const result = compareExecutionIdentity(base, selection(over));

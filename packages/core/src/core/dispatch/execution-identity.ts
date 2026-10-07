@@ -31,7 +31,7 @@ export interface ExecutionIdentity {
   model: string;
   effort: string;
   cwd: string;
-  /** Thread configuration that selects routing, canonicalised. */
+  /** Recorded configuration; recovery compares the named routing fields above. */
   config: string;
 }
 
@@ -140,14 +140,13 @@ export function parseExecutionIdentity(raw: string): ExecutionIdentity | null {
   }
 }
 
-const LABEL: Record<Exclude<keyof ExecutionIdentity, "version">, (a: string, b: string) => string> = {
+const LABEL: Record<Exclude<keyof ExecutionIdentity, "version" | "config">, (a: string, b: string) => string> = {
   agent: (a, b) => `thread switched from ${a || "(unset)"} to ${b || "(unset)"}`,
   location: (a, b) => `thread moved from ${a || "(unset)"} to ${b || "(unset)"}`,
   session: (a, b) => `session kind changed from ${a || "(unset)"} to ${b || "(unset)"}`,
   model: (a, b) => `model changed from ${a || "(unset)"} to ${b || "(unset)"}`,
   effort: (a, b) => `effort changed from ${a || "(unset)"} to ${b || "(unset)"}`,
   cwd: (a, b) => `working directory changed from ${a || "(unset)"} to ${b || "(unset)"}`,
-  config: () => "thread configuration changed",
 };
 
 /**
@@ -181,14 +180,8 @@ export function compareExecutionIdentity(
     return { match: false, field: "version", reason: "current execution identity is not a version-2 record" };
   }
   if (stored === current) return { match: true, legacy: false };
-  for (const field of Object.keys(LABEL) as Array<Exclude<keyof ExecutionIdentity, "version">>) {
-    // Rows written before the spelling was settled hold the raw pretty-printed
-    // configJson. Normalising BOTH sides here means those attempts resume on
-    // their own rather than needing a migration to rewrite history, and a
-    // configuration that genuinely differs still differs after normalising.
-    const [a, b] = field === "config"
-      ? [configIdentity(before[field]), configIdentity(after[field])]
-      : [before[field], after[field]];
+  for (const field of Object.keys(LABEL) as Array<Exclude<keyof ExecutionIdentity, "version" | "config">>) {
+    const [a, b] = [before[field], after[field]];
     if (a !== b) return { match: false, field, reason: LABEL[field](a, b) };
   }
   return { match: true, legacy: false };

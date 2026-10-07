@@ -457,10 +457,6 @@ export class TurnAttemptStore {
 
   bindRuntime(a: TurnAttempt, pid: number | undefined, providerIdentity?: string): void {
     this.assertCurrent(a);
-    if (a.providerIdentity && a.providerIdentity !== providerIdentity) {
-      throw DispatchSuspendedError.defect(a.id,
-        `runtime reports provider identity ${providerIdentity ?? "(none)"} but the attempt recorded ${a.providerIdentity}`);
-    }
     const owner = pid ? processOwner(pid) : null;
     const { stdoutFallback, submissions, remoteRecovery } = this.get(a.id)!;
     this.db.prepare("UPDATE turn_attempts SET runtime_json=?, provider_identity=? WHERE id=? AND generation=? AND owner_boot=? AND state='active'")

@@ -167,7 +167,7 @@ describe("#250 durable attempt winner", () => {
       status: "completed", output: "continued", finishedUtc: spec.createdUtc })).toBe(true);
   });
 
-  it("automatically resumes the same ACP session after an adapter version change", () => {
+  it.each([false, true])("resumes the same ACP session after an adapter version change; operator=%s", operator => {
     simulateRetiredOwnerProcess();
     const db = database(), first = db.open().turnAttempts;
     first.registerOwner("boot-A");
@@ -177,7 +177,7 @@ describe("#250 durable attempt winner", () => {
     first.startPrompt(original);
     first.suspendBoot("boot-A");
     const afterRestart = db.open().turnAttempts;
-    const resumed = afterRestart.claim(spec, identity, "boot-B");
+    const resumed = afterRestart.claim(spec, identity, "boot-B", "dispatch", operator);
     afterRestart.bindRuntime(resumed, undefined, JSON.stringify({ name: "synthetic-provider", version: "1.1.0" }));
     afterRestart.bind(resumed, "recorded-session");
     expect(afterRestart.get(spec.id)).toMatchObject({ state: "active", acpSessionId: "recorded-session",
@@ -186,7 +186,7 @@ describe("#250 durable attempt winner", () => {
       status: "completed", output: "continued", finishedUtc: spec.createdUtc })).toBe(true);
   });
 
-  it.each(["agent", "location", "model", "effort", "cwd", "config"] as const)(
+  it.each(["agent", "location", "session", "model", "effort", "cwd"] as const)(
     "operator Resume permits %s drift while boot retains the check", field => {
       const attempts = database().open().turnAttempts;
       attempts.registerOwner("operator-boot");
@@ -195,7 +195,7 @@ describe("#250 durable attempt winner", () => {
       attempts.startPrompt(original);
       attempts.suspendBoot("operator-boot");
       const selection = JSON.parse(identity);
-      const changed = executionIdentity({ ...selection, [field]: field === "config" ? { role: "current" } : "current-selection" });
+      const changed = executionIdentity({ ...selection, [field]: "current-selection" });
       expect(() => attempts.claim(spec, changed, "operator-boot")).toThrow();
       const resumed = attempts.claim(spec, changed, "operator-boot", "dispatch", true);
       expect(resumed).toMatchObject({ identity: changed, acpSessionId: "recorded-session", promptStarted: true,
@@ -280,7 +280,7 @@ describe("#250 durable attempt winner", () => {
     expect(provenDead({ ...owner!, host: "different-synthetic-host" })).toBe(false);
   });
 
-  it("rejects provider build identity drift before a resumed prompt", () => {
+  it("refuses a different ACP session after an adapter upgrade with the recorded cause", () => {
     simulateRetiredOwnerProcess();
     const attempts = database().open().turnAttempts;
     attempts.registerOwner("boot-A");
@@ -288,7 +288,9 @@ describe("#250 durable attempt winner", () => {
     attempts.bindRuntime(a, undefined, "provider-v1");
     attempts.bind(a, "acp"); attempts.startPrompt(a); attempts.suspendBoot("boot-A");
     const b = attempts.claim(spec, identity, "boot-B");
-    expect(() => attempts.bindRuntime(b, undefined, "provider-v2")).toThrow();
-    expect(attempts.get(spec.id)?.providerIdentity).toBe("provider-v1");
+    attempts.bindRuntime(b, undefined, "provider-v2");
+    expect(() => attempts.bind(b, "other-session"))
+      .toThrow("attempt is already bound to a different ACP session");
+    expect(attempts.get(spec.id)?.acpSessionId).toBe("acp");
   });
 });

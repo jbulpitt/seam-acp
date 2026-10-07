@@ -69,6 +69,7 @@ function syntheticAcp(calls: AcpCalls, mode: AcpMode) {
       .onRequest(methods.agent.initialize, () => {
         calls.initialized++;
         return { protocolVersion: PROTOCOL_VERSION,
+          agentInfo: { name: "synthetic-302-agent", version: "2.0.0" },
           agentCapabilities: { loadSession: mode !== "no-load" } };
       })
       .onRequest(methods.agent.session.new, () => {
@@ -172,7 +173,7 @@ function harness(location: "local" | "bridge-a", mode: AcpMode): Harness {
   return { dir, store, router, orch, calls, adapter };
 }
 
-function seedPromptedAttempt(h: Harness, promptStarted = true): string {
+function seedPromptedAttempt(h: Harness, promptStarted = true, providerIdentity?: string): string {
   const currentOwner = owners.processOwner();
   if (!currentOwner) throw new Error("synthetic ownership fixture requires readable process identity");
   const ownerSpy = vi.spyOn(owners, "processOwner").mockReturnValue({ ...currentOwner, start: "0" });
@@ -190,6 +191,7 @@ function seedPromptedAttempt(h: Harness, promptStarted = true): string {
   executionIdentity({ agent: described.agent.value, location: described.location.value,
     model: described.model.value, effort: described.effort.value, cwd: described.cwd.value,
     config: identityConfig }), "boot-before-restart", "inbound");
+  if (providerIdentity) h.store.turnAttempts.bindRuntime(claimed, undefined, providerIdentity);
   if (promptStarted) {
     h.store.turnAttempts.bind(claimed, RECORDED);
     h.store.turnAttempts.startPrompt(claimed);
@@ -459,6 +461,25 @@ describe("#302 real ACP handshake and strict session/load recovery", () => {
     expect(h.calls.prompts[0]).toContain("The process restarted while the turn was in flight.");
     expect(h.calls.prompts[0]).not.toContain(ORIGINAL);
     expect(h.store.turnAttempts.get(id)).toMatchObject({ state: "completed", generation: 2 });
+  });
+
+  it.each(["cosmetic edit", "adapter upgrade"])("automatic recovery loads the same session after a %s", async change => {
+    const h = harness("local", "ok");
+    const id = seedPromptedAttempt(h, true, JSON.stringify({ name: "synthetic-302-agent",
+      version: change === "adapter upgrade" ? "1.0.0" : "2.0.0" }));
+    if (change === "cosmetic edit") {
+      const record = h.store.get(`discord:${THREAD}`)!;
+      h.store.upsert({ ...record, configJson: JSON.stringify({ ...h.store.readConfig(record),
+        role: "reviewer", disableThreadPrefix: true, statusCardStyle: "simple", simpleCardGif: false }) });
+    }
+    await resume(h);
+    expect(h.calls.loads).toEqual([RECORDED]);
+    expect(h.calls.news).toBe(0);
+    expect(h.calls.prompts).toHaveLength(1);
+    expect(h.calls.prompts[0]).toMatch(/^continue(?:\n|$)/);
+    expect(h.calls.prompts[0]).not.toContain(ORIGINAL);
+    expect(h.store.turnAttempts.get(id)).toMatchObject({ state: "completed", acpSessionId: RECORDED,
+      generation: 2, providerIdentity: JSON.stringify({ name: "synthetic-302-agent", version: "2.0.0" }) });
   });
 
   it("lands an initialize capability refusal suspended with its actionable reason", async () => {

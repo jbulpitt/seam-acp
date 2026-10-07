@@ -2649,7 +2649,8 @@ export class Orchestrator {
    */
   private queueOnChannel<T>(
     channelId: string,
-    task: (fence: ChannelQueueFence) => Promise<T>
+    task: (fence: ChannelQueueFence) => Promise<T>,
+    recovery?: { lastActivityAt: () => number; onWatchdog: (error: TurnWatchdogTimeoutError) => Promise<void> },
   ): Promise<T> {
     this.channelQueueMeta ??= new Map<string, ChannelQueueMeta>();
     const epoch = this.queueEpoch(channelId);
@@ -2680,18 +2681,20 @@ export class Orchestrator {
       // on every path including the watchdog and a fence thrown after the turn.
       const executingMeta = this.channelQueueMeta.get(channelId);
       if (executingMeta) executingMeta.executing = (executingMeta.executing ?? 0) + 1;
+      const work = Promise.resolve().then(() => task(fence));
       try {
         const timeoutMs = turnWatchdogTimeoutMs(
           this.config.TURN_TIMEOUT_SECONDS ?? 900
         );
         const startedAt = Date.now();
         const sessionId = makeSessionId(PLATFORM, channelId);
-        const value = await settleWithTurnWatchdog(() => task(fence), {
+        const value = await settleWithTurnWatchdog(() => work, {
           timeoutMs,
           label: `channel turn ${channelId}`,
           // Same last-output mark as the prompt deadline. Before a runtime
           // exists, the clock is this task's start so a hung boot still ends.
           lastActivityAt: () => {
+            if (recovery) return recovery.lastActivityAt();
             const read = this.router.getRuntime;
             if (typeof read !== "function") return startedAt;
             const at = read.call(this.router, sessionId)?.lastActivityAtMs;
@@ -2702,11 +2705,22 @@ export class Orchestrator {
         return value;
       } catch (err) {
         if (err instanceof TurnWatchdogTimeoutError) {
-          this.logger.error(
-            { err, channelId, timeoutMs: err.timeoutMs },
-            "channel turn watchdog expired; releasing the turn and force-aborting runtime"
-          );
-          this.abortWatchdogTurn(channelId);
+          if (recovery) {
+            try { await recovery.onWatchdog(err); }
+            catch (noticeError) {
+              this.logger.error({ err: noticeError, channelId }, "adopted turn recovery notice failed");
+            }
+            // An unknown outcome still owns the FIFO until a result or user action.
+            const value = await work;
+            this.assertQueueFence(fence);
+            return value;
+          } else {
+            this.logger.error(
+              { err, channelId, timeoutMs: err.timeoutMs },
+              "channel turn watchdog expired; releasing the turn and force-aborting runtime"
+            );
+            this.abortWatchdogTurn(channelId);
+          }
         }
         throw err;
       } finally {
@@ -15003,6 +15017,34 @@ export class Orchestrator {
           if (next?.state !== "suspended" || !next.remoteRecovery || this.restartCutoff) return;
           await new Promise<void>(resolve => this.deferRemoteRecoveryAdoption(next, resolve));
         }
+      }, {
+        lastActivityAt: () => {
+          const record = this.store.getByChannel(PLATFORM, attempt.spec.target);
+          const runtime = record && this.router.getRuntime?.(record.id);
+          const observed = this.bridgeHub?.slotHealthFor?.(attempt.remoteRecovery!.location)
+            ?.find(row => row.slot === attempt.remoteRecovery!.slot)?.recovery;
+          return Math.max(...[
+            Date.parse(attempt.remoteRecovery!.delegatedUtc),
+            record ? Date.parse(record.updatedUtc) : NaN,
+            runtime?.lastActivityAtMs ?? NaN,
+            isRemoteRecoverySnapshot(observed) && observed.submissionId === attempt.remoteRecovery!.submissionId
+              ? Date.parse(observed.updatedUtc) : NaN,
+          ].filter(Number.isFinite));
+        },
+        onWatchdog: async error => {
+          let cause = `${error.message}; the bridge owner has not reported a terminal result. `
+            + "The outcome is unknown; the session and its owner are retained.";
+          const binding = attempt.remoteRecovery!;
+          const mux = this.bridgeHub?.muxFor(binding.location);
+          try {
+            if (mux) await mux.sendCmd("reconcileRung1Recovery", {
+              slot: binding.slot, submissionId: binding.submissionId, acpSessionId: binding.acpSessionId,
+            });
+          } catch (err) {
+            cause += ` Checking the owner failed: ${err instanceof Error ? err.message : String(err)}`;
+          }
+          await this.observeRemoteRecoveryStall(attempt, cause);
+        },
       }).catch((err) => {
         this.logger.warn({ err, attempt: attempt.id }, "remote recovery queue ownership failed");
       }).finally(() => {
@@ -15015,6 +15057,20 @@ export class Orchestrator {
     } finally {
       this.adoptingRemoteResults.delete(attempt.id);
     }
+  }
+
+  private async observeRemoteRecoveryStall(attempt: TurnAttempt, cause: string): Promise<void> {
+    if (this.restartCutoff) return;
+    const current = this.store.turnAttempts.get(attempt.id);
+    if (!current || current.state !== "suspended" || current.generation !== attempt.generation
+      || current.remoteRecovery?.submissionId !== attempt.remoteRecovery?.submissionId
+      || !current.remoteRecovery || isAwaitingReauth(current.stalledReason)) return;
+    const changed = this.store.turnAttempts.markStalled(current.id, cause);
+    const stalled = this.store.turnAttempts.get(current.id)!;
+    if (!changed && stalled.stallNoticeUtc) return;
+    this.logger.warn({ attempt: current.id, location: current.remoteRecovery.location,
+      slot: current.remoteRecovery.slot, cause }, "bridge-owned turn has an unknown outcome; posting retained actions");
+    await this.notifyParkedTurn(stalled);
   }
 
   /**
@@ -15174,10 +15230,14 @@ export class Orchestrator {
     this.remoteAdoptionWaiters.delete(attempt.id);
     let settle!: () => void;
     let settled = false;
+    const hangAbort = new AbortController();
+    let unsubscribeSettled = () => {};
     const completion = new Promise<void>((resolve) => { settle = resolve; });
     const finishAdoption = (retainChild = false): void => {
       if (settled) return;
       settled = true;
+      hangAbort.abort();
+      unsubscribeSettled();
       const latest = this.store.turnAttempts.get(attempt.id);
       const projection = latest?.state === "cancelled" && latest.generation === attempt.generation
         ? projectAttemptCard(latest, attempt) : null;
@@ -15196,6 +15256,12 @@ export class Orchestrator {
       else settle();
     };
     this.remoteAdoptionFinishers.set(attempt.id, finishAdoption);
+    unsubscribeSettled = this.store.turnAttempts.onSettled(id => {
+      const current = id === attempt.id ? this.store.turnAttempts.get(id) : undefined;
+      if (current?.state !== "cancelled" || current.generation !== attempt.generation) return;
+      // Explicit cancellation ends the owned slot and releases this FIFO waiter.
+      void this.stopLingeringSlot(binding.location, binding.slot).finally(() => finishAdoption());
+    });
 
     const finalize = async (result: RemoteRecoveryResult): Promise<void> => {
       if (result.submissionId !== binding.submissionId
@@ -15293,6 +15359,24 @@ export class Orchestrator {
     this.logger.info({ attempt: attempt.id, location: binding.location, slot: binding.slot,
       phase: snapshot.recovery.phase, retry: snapshot.recovery.retry },
     "rebound controller to bridge-owned rung-1 recovery");
+    if (recoveryRuntime) {
+      void recoveryRuntime.watchInFlightHang(hangAbort.signal, async (error, action) => {
+        // Reconcile a cached terminal result before acting on a measured hang.
+        try {
+          await mux.sendCmd("reconcileRung1Recovery", {
+            slot: binding.slot, submissionId: binding.submissionId, acpSessionId: binding.acpSessionId,
+          });
+        } catch (err) {
+          await this.observeRemoteRecoveryStall(attempt,
+            `${error.message}; checking the bridge owner failed: ${err instanceof Error ? err.message : String(err)}`);
+          return;
+        }
+        await new Promise<void>(resolve => setImmediate(resolve));
+        if (settled || this.restartCutoff) return;
+        if (action === "restart") this.continueLostRemoteTurn(attempt, error.message);
+        else await this.observeRemoteRecoveryStall(attempt, error.message);
+      }).catch(err => this.logger.warn({ err, attempt: attempt.id }, "adopted recovery hang observation unavailable"));
+    }
     void this.reconcileRemoteRecoveries().catch(err =>
       this.logger.warn({ err, attempt: attempt.id }, "bridge recovery reconciliation deferred"));
     await completion;

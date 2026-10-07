@@ -50,6 +50,7 @@ function setup() {
   const recoveryRuntime = {
     onEvent(f: typeof onRecoveryEvent) { onRecoveryEvent = f; },
     idle: async () => {},
+    watchInFlightHang: vi.fn(async () => {}),
   };
   const router = { listProfiles: () => [],
     describeConfig: () => ({ agent: { value: "codex" }, model: { value: "test" },

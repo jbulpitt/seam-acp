@@ -30,12 +30,13 @@ const drain = async () => {
 
 async function setup(source: "inbound" | "dispatch" | "schedule" = "inbound", style: "full" | "simple" = "full",
   options: { armed?: boolean; queue?: boolean; disconnected?: boolean; adoptionUnavailable?: boolean;
-    attached?: boolean; terminalResult?: "completed" | "failed" } = {}) {
+    attached?: boolean; terminalResult?: "completed" | "failed"; activityAgeMs?: number;
+    watchdogSeconds?: number; hangProbe?: () => unknown } = {}) {
   const dir = mkdtempSync(path.join(tmpdir(), "seam-adopt-reconnect-"));
   cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
   let store = new SessionStore(path.join(dir, "test.db"));
   cleanups.push(() => store.close());
-  const now = new Date(Date.now() - 60_000).toISOString();
+  const now = new Date(Date.now() - (options.activityAgeMs ?? 60_000)).toISOString();
   const record = { id: "discord:thread", platform: "discord", channelRef: "thread",
     parentRef: null, agentId: "codex", acpSessionId: "acp", repoPath: "/synthetic",
     configJson: "{}", createdUtc: now, updatedUtc: now };
@@ -95,9 +96,18 @@ async function setup(source: "inbound" | "dispatch" | "schedule" = "inbound", st
     send(raw: string) {
       const cmd = JSON.parse(raw);
       commands.push(cmd);
+      if (cmd.type === "kill") {
+        rows = [];
+        queueMicrotask(() => frame({ type: "exit", code: 0, signal: "SIGTERM" }));
+        return;
+      }
       if (cmd.type !== "cmd") return;
       if (cmd.action === "listSlots" && inventoryError) {
         queueMicrotask(() => this.deliver({ type: "cmd_reply", cmdId: cmd.cmdId, error: "fixture bridge reconnecting" }));
+        return;
+      }
+      if (cmd.action === "probeHang") {
+        queueMicrotask(() => this.deliver({ type: "cmd_reply", cmdId: cmd.cmdId, payload: options.hangProbe?.() }));
         return;
       }
       if (cmd.action === "reconcileRung1Recovery" && ownerLostDuringProbe) {
@@ -135,13 +145,16 @@ async function setup(source: "inbound" | "dispatch" | "schedule" = "inbound", st
   let adoptionUnavailable = options.adoptionUnavailable ?? false;
   const router = {
     isBusy: () => runtime?.busy ?? false,
+    getRuntime: () => runtime,
     describeConfig: () => ({ model: { value: "test" }, agent: { value: "codex" },
       location: { value: "remote" }, cwd: { value: "/synthetic" } }),
     adoptRecoveryRuntime: (_record: unknown, child: any, session: string) => {
       if (adoptionUnavailable) throw new Error("fixture bridge catalog not ready");
       runtime = new AgentRuntime({ profile: { id: "codex" } as AgentProfile,
-        logger: pino({ level: "silent" }) as any, spawnFn: () => { throw new Error("must not spawn"); } });
-      runtime.attachRecovery(child, session);
+        logger: pino({ level: "silent" }) as any, spawnFn: () => { throw new Error("must not spawn"); },
+        ...(options.hangProbe ? { bridgeHealth: { sendCmd: mux.sendCmd }, hangSilenceMs: 20 } : {}),
+      });
+      runtime.attachRecovery(child, session, undefined, Date.parse(record.updatedUtc));
       return runtime;
     },
     releaseRecoveryRuntime: (_id: string, rt: AgentRuntime) => rt.releaseRecovery(),
@@ -163,7 +176,7 @@ async function setup(source: "inbound" | "dispatch" | "schedule" = "inbound", st
   const orch = new Orchestrator({ logger: pino({ level: "silent" }) as any,
     modelCatalog: fixtureModelCatalog([]), store, router: router as any,
     adapter: adapter as any, renderer: discordRenderer as any,
-    config: { ...visualConfig, DATA_DIR: dir, REPOS_ROOT: "/synthetic", REPO_EMOJIS: new Map(),
+    config: { ...visualConfig, ...(options.watchdogSeconds ? { TURN_TIMEOUT_SECONDS: options.watchdogSeconds } : {}), DATA_DIR: dir, REPOS_ROOT: "/synthetic", REPO_EMOJIS: new Map(),
       channelPresets: new Map(), threadPresets: new Map() } as any });
   let connected = !options.disconnected;
   const readyListeners = new Set<(location: string) => void>();
@@ -631,5 +644,98 @@ describe("adopted turns across a bridge reconnect", () => {
     expect(h.adapter.editPanel).toHaveBeenLastCalledWith(
       { channel: { platform: "discord", id: "thread" }, id: "card" },
       expect.objectContaining({ title: "Done", fields: expect.arrayContaining([{ name: "Action", value: "end_turn", inline: true }]) }));
+  });
+});
+
+
+describe("adopted owner progress recovery", () => {
+  it("releases the adopted FIFO only after an explicit cancel and lets its successor run", async () => {
+    const h = await setup("dispatch", "full", { queue: true, activityAgeMs: 0 });
+    await h.run;
+    await drain();
+    let ran = false;
+    const next = (h.orch as any).queueOnChannel("thread", async () => { ran = true; });
+    await drain();
+    expect(ran).toBe(false);
+    h.store.turnAttempts.cancel("inbound-1", "cancelled by operator");
+    await next;
+    expect(h.store.turnAttempts.get("inbound-1")).toMatchObject({ state: "cancelled", generation: 1 });
+    expect(ran).toBe(true);
+    expect(h.commands.filter(cmd => cmd.type === "kill")).toHaveLength(1);
+    expect(h.commands.filter(cmd => cmd.type === "spawn" || cmd.type === "data")).toEqual([]);
+  });
+
+  it("posts the missing-terminal cause without killing the owner, then adopts a late result once", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    const h = await setup("dispatch", "full", { queue: true, activityAgeMs: 0, watchdogSeconds: 10 });
+    vi.spyOn(h.orch as any, "dispatchContinuationRefusal").mockResolvedValue(null);
+    await h.run;
+    await drain();
+    await vi.advanceTimersByTimeAsync(40_001);
+    await drain();
+    const parked = h.store.turnAttempts.get("inbound-1")!;
+    expect(parked).toMatchObject({ state: "suspended", generation: 1, outcome: null,
+      remoteRecovery: { submissionId: "submission", acpSessionId: "acp" }, stallNoticeUtc: expect.any(String) });
+    expect(parked.stalledReason).toContain("bridge owner has not reported a terminal result");
+    expect(h.visible.filter(text => text.includes("outcome is unknown"))).toHaveLength(1);
+    expect(h.commands.filter(cmd => cmd.type === "kill" || cmd.type === "spawn" || cmd.type === "data")).toEqual([]);
+    const adoptionCount = h.commands.filter(cmd => cmd.action === "replayOutput").length;
+    await h.orch.resumeTurnManually("inbound-1");
+    expect(h.commands.filter(cmd => cmd.action === "replayOutput")).toHaveLength(adoptionCount);
+    h.complete("the matching owner finally completed");
+    await drain();
+    expect(h.store.turnAttempts.get("inbound-1")).toMatchObject({ state: "completed", generation: 1,
+      outcome: { status: "completed", output: "the matching owner finally completed" }, deliveryDone: true });
+    expect(h.visible.filter(text => text === "the matching owner finally completed")).toHaveLength(1);
+  });
+
+  it("keeps the recorded progress clock across adoption instead of granting a fresh watchdog on boot", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    const h = await setup("dispatch", "full", { queue: true, activityAgeMs: 39_000, watchdogSeconds: 10 });
+    vi.spyOn(h.orch as any, "dispatchContinuationRefusal").mockResolvedValue(null);
+    await h.run;
+    await drain();
+    await vi.advanceTimersByTimeAsync(1_001);
+    await drain();
+    expect(h.store.turnAttempts.get("inbound-1")?.stalledReason).toContain("bridge owner has not reported a terminal result");
+    expect(h.commands.filter(cmd => cmd.type === "kill" || cmd.type === "spawn")).toEqual([]);
+    h.complete("late terminal");
+    await drain();
+  });
+
+  it("rearms the existing watchdog on real adopted output", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    const h = await setup("dispatch", "full", { queue: true, activityAgeMs: 0, watchdogSeconds: 10 });
+    await h.run;
+    await drain();
+    await vi.advanceTimersByTimeAsync(30_000);
+    h.text("still working");
+    await drain();
+    await vi.advanceTimersByTimeAsync(30_000);
+    await drain();
+    expect(h.store.turnAttempts.get("inbound-1")).toMatchObject({ state: "suspended", stalledReason: null });
+    h.complete("still working — completed");
+    await drain();
+    expect(h.store.turnAttempts.get("inbound-1")?.outcome?.status).toBe("completed");
+  });
+
+  it("passes a measured provider hang to the retained notice and keeps watching for a terminal result", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    const h = await setup("dispatch", "full", { activityAgeMs: 0,
+      hangProbe: () => ({ probe: "answered", providerSocket: "not_progressing" }) });
+    vi.spyOn(h.orch as any, "dispatchContinuationRefusal").mockResolvedValue(null);
+    await drain();
+    await vi.advanceTimersByTimeAsync(25);
+    await drain();
+    expect(h.store.turnAttempts.get("inbound-1")?.stalledReason).toBe(
+      "provider socket stopped progressing while the agent event loop answered seam/hangProbe");
+    expect(h.commands.some(cmd => cmd.action === "reconcileRung1Recovery")).toBe(true);
+    expect(h.commands.filter(cmd => cmd.type === "kill" || cmd.type === "spawn" || cmd.type === "data")).toEqual([]);
+    await vi.advanceTimersByTimeAsync(25);
+    await drain();
+    expect(h.visible.filter(text => text.includes("provider socket stopped progressing"))).toHaveLength(1);
+    h.complete("same owner recovered");
+    await h.run;
+    expect(h.store.turnAttempts.get("inbound-1")?.outcome?.status).toBe("completed");
   });
 });

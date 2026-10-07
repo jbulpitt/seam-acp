@@ -92,6 +92,29 @@ describe("large prompts reach the agent", () => {
 });
 
 describe("#777 the retained adapter child decides reconciliation", () => {
+  it("reconciles the same owner's cached terminal result without another prompt", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "seam-terminal-owner-"));
+    roots.push(root);
+    const one = await host(root);
+    one.slots.configure(9, { agentId: "copilot", cwd: root, rung1Recovery: DEFAULT_REMOTE_RUNG1_POLICY });
+    await one.slots.writeInput(9, line({ id: 1, method: "initialize", params: { protocolVersion: 1 } }));
+    await one.slots.writeInput(9, line({ id: 2, method: "session/new", params: { cwd: root, mcpServers: [] } }));
+    await until(() => one.frames.find(f => f.data?.includes('"sessionId":"s1"')), "session/new");
+    await one.slots.armRecovery(9, { submissionId: "terminal", acpSessionId: "s1", continuation: "continue" });
+    await one.slots.writeInput(9, line({ id: 3, method: "session/prompt", params: {
+      sessionId: "s1", prompt: [{ type: "text", text: "continue" }],
+    } }));
+    const terminal = await until(() => one.frames.find(f => f.type === "recovery_result"), "terminal result");
+    const before = (await one.client.listSlots()).health.find(row => row.slot === 9)!;
+    one.frames.length = 0;
+    expect(await one.slots.reconcileRecovery(9, { submissionId: "terminal", acpSessionId: "s1" }))
+      .toEqual({ state: "owned" });
+    const reconciled = await until(() => one.frames.find(f => f.type === "recovery_result"), "cached terminal result");
+    expect(reconciled.recoveryResult).toEqual(terminal.recoveryResult);
+    expect((await one.client.listSlots()).health.find(row => row.slot === 9)).toMatchObject({ alive: true, pid: before.pid });
+    expect((await fs.readFile(path.join(root, "agent.pids"), "utf8")).trim().split("\n")).toHaveLength(1);
+  }, 30_000);
+
   it.each([
     { legacy: false, unrelatedInput: false },
     { legacy: true, unrelatedInput: false },

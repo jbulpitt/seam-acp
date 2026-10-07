@@ -77,28 +77,29 @@ async function fixture() {
       catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw error; }
     }, `slot ${slot} native/tool PIDs`);
     trees.push(tree);
-    const holder = (await client!.listSlots()).health.find(health => health.slot === slot)!;
-    return { tree, holder };
+    const health = (await client!.listSlots()).health.find(health => health.slot === slot)!;
+    return { tree, adapterPid: health.pid! };
   }
   return { root, client, server, slots, frames, start };
 }
 
 describe("dead ACP wrapper process ownership", () => {
-  it("stops native/tool descendants before sessiond reports exit, without touching another slot", async () => {
+  it.each(["wrapper", "adapter-child"] as const)("stops native/tool descendants after %s death before reporting exit, without touching another slot", async target => {
     const { client, frames, start } = await fixture();
     const first = await start(8911);
     const control = await start(8912);
     expect(readSessiondProcessIdentity(first.tree.native)?.pgid).toBe(first.tree.wrapper);
     expect(readSessiondProcessIdentity(first.tree.tool)?.pgid).toBe(first.tree.wrapper);
-    expect(first.holder.pid).not.toBe(first.tree.wrapper);
-    process.kill(first.tree.wrapper, "SIGKILL");
+    expect(first.adapterPid).not.toBe(first.tree.wrapper);
+    process.kill(target === "wrapper" ? first.tree.wrapper : first.adapterPid, "SIGKILL");
     await until(() => frames.find(frame => frame.slot === 8911 && frame.type === "exit"), "slot exit");
     expect((await client!.listSlots()).health.find(health => health.slot === 8911)?.alive).toBe(false);
-    expect(readSessiondProcessIdentity(first.tree.native), "native must stop before replacement admission").toBeUndefined();
-    expect(readSessiondProcessIdentity(first.tree.tool), "tool must stop before replacement admission").toBeUndefined();
     expect((await client!.listSlots()).health.find(health => health.slot === 8912)?.alive).toBe(true);
-    for (const pid of [control.holder.pid!, control.tree.wrapper, control.tree.native, control.tree.tool]) {
+    for (const pid of [control.adapterPid, control.tree.wrapper, control.tree.native, control.tree.tool]) {
       expect(readSessiondProcessIdentity(pid), `control PID ${pid} must remain running`).toBeDefined();
     }
+    expect(readSessiondProcessIdentity(first.tree.native), "native must stop before replacement admission").toBeUndefined();
+    expect(readSessiondProcessIdentity(first.tree.tool), "tool must stop before replacement admission").toBeUndefined();
+    expect(readSessiondProcessIdentity(first.tree.wrapper), "wrapper must stop after adapter-child crash").toBeUndefined();
   }, 60_000);
 });

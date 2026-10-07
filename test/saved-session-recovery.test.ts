@@ -1,5 +1,5 @@
-import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
-import { handoverProof, loadOutageProof, sessionGoneProof, SAVED_SESSION } from "./helpers/saved-session-recovery.js";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { handoverProof, loadOutageProof, savedSessionHost, sessionGoneProof, SAVED_SESSION } from "./helpers/saved-session-recovery.js";
 import { prepareSessionExecutables } from "./helpers/saved-session-executables.js";
 
 const executables = await prepareSessionExecutables();
@@ -29,17 +29,38 @@ describe("saved conversations survive load failures and settlement", () => {
     expect(result.newSlot).toBe(result.slot);
   }, 20_000);
 
-  it.each([false, true])("a missing session recovers visibly without load retries and later turns keep working; recorded=%s", async recorded => {
-    vi.useFakeTimers({ toFake: ["Date"] });
+  describe("missing sessions", () => {
+    let host: Awaited<ReturnType<typeof savedSessionHost>>;
+    let router: ReturnType<typeof host.makeRouter>;
     const sleep = vi.fn(async (ms: number) => { vi.setSystemTime(Date.now() + ms); });
-    const result = await sessionGoneProof(recorded, sleep, executables);
-    expect(result).toMatchObject({ afterRecovery: "replacement-conversation", finalId: "replacement-conversation",
-      missingLoads: 1, laterLoads: 1, newSessions: 1,
-      promptSessions: ["replacement-conversation", "replacement-conversation"],
-      notices: [{ channel: { platform: "discord", id: "fixture-thread" },
-        text: expect.stringContaining(SAVED_SESSION) }] });
-    expect(result.notices[0].text).toContain("no rollout found");
-    expect(result.notices[0].text).toContain("fresh conversation");
-    expect(sleep).not.toHaveBeenCalled();
-  }, 20_000);
+
+    beforeEach(async () => {
+      sleep.mockClear();
+      host = await savedSessionHost({ ...executables, sessionGone: true, recoverySleep: sleep });
+      router = host.makeRouter();
+      const plan = router.planRuntimeSpawn(host.record);
+      const runtime = (router as any).makeRuntime(host.record, plan, plan.model, plan.effort);
+      // Await native ACP initialization only; session/load still runs in the test.
+      await runtime.start();
+      vi.spyOn(router as any, "makeRuntime").mockReturnValueOnce(runtime);
+    });
+
+    afterEach(async () => {
+      await host.close();
+      vi.restoreAllMocks();
+    });
+
+    it.each([false, true])("a missing session recovers visibly without load retries and later turns keep working; recorded=%s", async recorded => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      const result = await sessionGoneProof(host, router, recorded);
+      expect(result).toMatchObject({ afterRecovery: "replacement-conversation", finalId: "replacement-conversation",
+        missingLoads: 1, laterLoads: 1, newSessions: 1,
+        promptSessions: ["replacement-conversation", "replacement-conversation"],
+        notices: [{ channel: { platform: "discord", id: "fixture-thread" },
+          text: expect.stringContaining(SAVED_SESSION) }] });
+      expect(result.notices[0].text).toContain("no rollout found");
+      expect(result.notices[0].text).toContain("fresh conversation");
+      expect(sleep).not.toHaveBeenCalled();
+    }, 20_000);
+  });
 });

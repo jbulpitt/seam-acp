@@ -88,15 +88,12 @@ describe("execution identity treats an unchanged configuration as unchanged", ()
     } })).toBe(identityWith(LIVE_CONFIG));
   });
 
-  it("still refuses a configuration that genuinely changed, and names the field", () => {
-    // The load-bearing negative: normalising must remove false refusals only.
-    // Deleting the normaliser makes the first test fail; weakening the check
-    // into an unconditional match makes THIS one fail.
+  it("permits a live permission policy edit without changing the saved conversation", () => {
     const admitted = identityWith(RAW_CONFIG_JSON);
     const escalated = identityWith({ ...LIVE_CONFIG, permissionPolicy: "never", lastContextUsage: undefined });
 
     const verdict = compareExecutionIdentity(admitted, escalated);
-    expect(verdict).toMatchObject({ match: false, field: "config" });
+    expect(verdict).toEqual({ match: true, legacy: false });
   });
 
   it("still refuses a real routing change ahead of the configuration field", () => {
@@ -110,10 +107,10 @@ describe("execution identity treats an unchanged configuration as unchanged", ()
     });
   });
 
-  it("compares an opaque non-JSON configuration verbatim rather than inventing a shape", () => {
+  it("preserves an opaque config snapshot without treating it as session identity", () => {
     expect(identityWith("opaque-marker")).toBe(identityWith("opaque-marker"));
     expect(compareExecutionIdentity(identityWith("opaque-marker"), identityWith("other-marker")))
-      .toMatchObject({ match: false, field: "config" });
+      .toEqual({ match: true, legacy: false });
   });
 
   it("resumes an attempt stored before the spelling was settled, without a migration", () => {

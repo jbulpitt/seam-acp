@@ -7,6 +7,7 @@ import { SessionStore } from "../packages/core/src/core/session-store.js";
 import { projectAttemptCompletions } from "../packages/core/src/core/dispatch/attempt-recovery.js";
 import { DispatchWatcher } from "../packages/core/src/core/dispatch/watcher.js";
 import { DispatchSuspendedError } from "../packages/core/src/core/dispatch/attempt-store.js";
+import { simulateRetiredOwnerProcess } from "./restart-process-fixture.js";
 import { dispatchDirs, type DispatchSpec } from "../packages/core/src/core/dispatch/types.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 
@@ -34,6 +35,7 @@ afterEach(async () => {
   queueWatchers.clear();
   queueStore.close();
   await rm(dataDir, { recursive: true, force: true });
+  vi.restoreAllMocks();
 });
 
 /** Drop a pending spec, returning its id. */
@@ -67,6 +69,7 @@ async function readDone(id: string): Promise<Record<string, unknown>> {
 
 describe("DispatchWatcher", () => {
   it("continues an already-admitted suspended dispatch through acquisition retry and normal publication", async () => {
+    simulateRetiredOwnerProcess();
     const spec: DispatchSpec = { id: "adopted", target: "thread-1", prompt: "original brief", session: "live" };
     queueStore.turnAttempts.registerOwner("old-controller");
     const old = queueStore.turnAttempts.claim(spec, "identity", "old-controller");

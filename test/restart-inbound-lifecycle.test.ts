@@ -114,6 +114,7 @@ describe("#250 human turn production pipeline, synthetic transport only", () => 
     const restarted = h.make({ muxFor: () => mux, slotHealthFor: () => [] });
     await restarted.recoverInterruptedTurns();
     await vi.waitFor(() => expect(mux.adopt).toHaveBeenCalledOnce());
+    await restarted.reconcileRemoteRecoveries();
     let retire!: () => void;
     const retiring = new Promise<boolean>(resolve => { retire = () => resolve(true); });
     vi.spyOn(restarted as any, "stopLingeringSlot").mockReturnValue(retiring);

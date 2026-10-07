@@ -1,3 +1,11 @@
+export const SESSION_HISTORY_CHUNK_BYTES = 1024 * 1024;
+
+export interface SessionHistoryChunk {
+  bytesBase64: string;
+  nextOffset: number;
+  eof: boolean;
+}
+
 export interface SessionSummaryLine {
   sender: "human" | "agent";
   text: string;
@@ -40,6 +48,8 @@ export interface ISessionManager {
    *  text-only `getTranscript`. Returns undefined when the file doesn't exist or
    *  the backend has no raw-history file. */
   getHistoryPath?(cwd: string, sessionId: string): Promise<string | undefined>;
+  /** Raw history read on the process-owning host. */
+  getHistory?(cwd: string, sessionId: string): Promise<string | undefined>;
   /** Optional side-channel readout of the most recent context-window usage
    *  (e.g. parsed from session transcripts on disk). Used by profiles where
    *  the ACP path doesn't surface live `usage_update` notifications. */

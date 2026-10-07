@@ -3,8 +3,7 @@
  *
  * Contrast #12 (opencode deletion): the profile factory, env schema, brand,
  * namer glyph, tests, and `~/.codex-ollama-cloud` layout stay. `OLLAMA_CLOUD_ENABLED`
- * is the complete reversible switch for catalog, quota, provider-status, and
- * leftover sessions.
+ * remains the reversible switch for host inventory, quota and provider status.
  */
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
@@ -37,7 +36,6 @@ import {
   LINKWORKS_OLLAMA_SOURCE_ID,
   OLLAMA_CLOUD_AGENT_ID,
   OLLAMA_CLOUD_ENABLE_FLAG,
-  PARKED_OLLAMA_CLOUD_SELECT_MESSAGE,
   PARKED_OLLAMA_CLOUD_SESSION_MESSAGE,
   formatUsageAgentList,
   isOllamaCloudAgentId,
@@ -51,13 +49,10 @@ import { createDefaultServiceStatusSources } from "../packages/core/src/core/ser
 import { loadConfig } from "../packages/core/src/config.js";
 import { DEFAULT_THREAD_NAMER_CONFIG } from "../packages/core/src/platforms/discord/thread-namer.js";
 import { agentLocationPickerChoices } from "../packages/core/src/platforms/discord/location.js";
-import { ConfigMutationService } from "../packages/core/src/core/config-mutation.js";
-import { ThreadSessionControlService } from "../packages/core/src/core/thread-session-control.js";
 import { resolveAgentBrand, brandIconUrl } from "../packages/core/src/plugins/card-visuals/agent-brand.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import type { SessionRecord, SessionConfigState } from "../packages/core/src/core/types.js";
 import type { SessionStore } from "../packages/core/src/core/session-store.js";
-import type { ConfigDescription } from "../packages/core/src/core/session-router.js";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -110,7 +105,6 @@ function makeRecord(over: Partial<SessionRecord> = {}): SessionRecord {
 
 function makeRouter(opts: {
   profiles?: AgentProfile[];
-  ollamaCloudEnabled?: boolean;
 } = {}): SessionRouter {
   const profiles = opts.profiles ?? [stubProfile("claude")];
   return new SessionRouter({
@@ -121,7 +115,6 @@ function makeRouter(opts: {
     defaultAgentId: "claude",
     defaultModel: "opus",
     threadPresets: new Map(),
-    ollamaCloudEnabled: opts.ollamaCloudEnabled,
     seamMcp: localBridgeWiring(profiles),
   });
 }
@@ -205,21 +198,7 @@ describe("#220 registration gate", () => {
     expect(indexSrc).toContain("ollamaCloudEnabled: config.OLLAMA_CLOUD_ENABLED");
   });
 
-  it("production boot constructs ollama-cloud only via shouldRegisterOllamaCloud", () => {
-    const src = fs.readFileSync(path.join(repoRoot, "packages/core/src/index.ts"), "utf8");
-    expect(src).toContain("shouldRegisterOllamaCloud(config)");
-    const start = src.indexOf("Optional Ollama Cloud agent");
-    const end = src.indexOf("Agent-facing seam-MCP surface");
-    expect(start).toBeGreaterThan(-1);
-    expect(end).toBeGreaterThan(start);
-    const block = src.slice(start, end);
-    expect(block).toContain('id: "ollama-cloud"');
-    expect(block).toContain("makeCodexProfile");
-    expect(block).toContain("ollamaCloudLive");
-    expect(block).not.toMatch(/OLLAMA_CLOUD_ENABLED && config\.OLLAMA_CLOUD_API_KEY/);
-  });
-
-  it("flag off: live catalog and picker cannot select ollama-cloud", () => {
+  it("flag off: an inventory without ollama-cloud omits it from the picker", () => {
     const live = shouldRegisterOllamaCloud({
       OLLAMA_CLOUD_ENABLED: false,
       OLLAMA_CLOUD_API_KEY: "dummy-test-key",
@@ -227,7 +206,7 @@ describe("#220 registration gate", () => {
     const profiles = live
       ? [stubProfile("claude"), stubProfile(OLLAMA_CLOUD_AGENT_ID)]
       : [stubProfile("claude")];
-    const router = makeRouter({ profiles, ollamaCloudEnabled: false });
+    const router = makeRouter({ profiles });
     expect(router.listProfiles().map((p) => p.id)).not.toContain(OLLAMA_CLOUD_AGENT_ID);
     expect(router.getProfile(OLLAMA_CLOUD_AGENT_ID)).toBeUndefined();
     const choices = agentLocationPickerChoices(router.listProfiles(), {
@@ -239,14 +218,14 @@ describe("#220 registration gate", () => {
     expect(choices.some((c) => c.value.includes("claude"))).toBe(true);
   });
 
-  it("flag on with a dummy key: profile is in the live catalog and picker", () => {
+  it("an inventory advertising ollama-cloud includes it in the picker", () => {
     const live = shouldRegisterOllamaCloud({
       OLLAMA_CLOUD_ENABLED: true,
       OLLAMA_CLOUD_API_KEY: "dummy-test-key",
     });
     expect(live).toBe(true);
     const profiles = [stubProfile("claude"), stubProfile(OLLAMA_CLOUD_AGENT_ID)];
-    const router = makeRouter({ profiles, ollamaCloudEnabled: true });
+    const router = makeRouter({ profiles });
     expect(router.listProfiles().map((p) => p.id)).toContain(OLLAMA_CLOUD_AGENT_ID);
     const choices = agentLocationPickerChoices(router.listProfiles(), {
       bridges: [],
@@ -284,136 +263,23 @@ describe("#220 leftover sessions fail closed", () => {
     );
   });
 
-  it("fails a persisted ollama-cloud session with the parked message, not unknown-agent or substitution", () => {
-    const router = makeRouter({
-      profiles: [stubProfile("claude")],
-      ollamaCloudEnabled: false,
-    });
-    const record = makeRecord({ agentId: OLLAMA_CLOUD_AGENT_ID });
-    expect(() => router.planRuntimeSpawn(record)).toThrow(PARKED_OLLAMA_CLOUD_SESSION_MESSAGE);
-    expect(() => router.planRuntimeSpawn(record)).not.toThrow(/Unknown agent profile/);
-    expect(() => router.planRuntimeSpawn(record)).not.toThrow(/is retired:/);
-    expect(router.planRuntimeSpawn(makeRecord()).profile.id).toBe("claude");
-  });
-
   it("does NOT silently reroute a parked session to the default agent", () => {
-    const router = makeRouter({ ollamaCloudEnabled: false });
+    const router = makeRouter();
     expect(() => router.planRuntimeSpawn(makeRecord({ agentId: OLLAMA_CLOUD_AGENT_ID }))).toThrow();
     expect(router.planRuntimeSpawn(makeRecord()).profile.id).toBe("claude");
   });
 
   it("keeps the generic unknown-agent error for a genuine typo", () => {
-    const router = makeRouter({ ollamaCloudEnabled: false });
+    const router = makeRouter();
     expect(() => router.planRuntimeSpawn(makeRecord({ agentId: "cluade" }))).toThrow(
       /Unknown agent profile "cluade"/
     );
   });
 
   it("describeConfig still reports a parked session's stored agent", () => {
-    const router = makeRouter({ ollamaCloudEnabled: false });
+    const router = makeRouter();
     const d = router.describeConfig(makeRecord({ agentId: OLLAMA_CLOUD_AGENT_ID }));
     expect(d.agent).toEqual({ value: OLLAMA_CLOUD_AGENT_ID, source: "session config" });
-  });
-});
-
-describe("#220 picker / configure refuse parked ollama-cloud", () => {
-  it("configure_thread cannot select ollama-cloud while parked", async () => {
-    const target = makeRecord();
-    const caller = makeRecord({ id: "discord:caller", channelRef: "caller" });
-    const profiles = new Map([["claude", stubProfile("claude")]]);
-    const router = makeRouter({ profiles: [...profiles.values()], ollamaCloudEnabled: false });
-    const service = new ThreadSessionControlService({
-      store: {
-        get: (id) => (id === target.id ? target : id === caller.id ? caller : null),
-        readConfig: () => ({}),
-        writeConfig: (cfg) => JSON.stringify(cfg),
-        upsert: () => {},
-      },
-      router: {
-        describeConfig: (record) =>
-          ({
-            agent: { value: record.agentId, source: "session config" },
-            model: { value: "opus", source: "session config" },
-            effort: { value: null, source: "default" },
-            role: { value: null, source: "default" },
-            disableThreadPrefix: { value: false, source: "default" },
-          }) as ConfigDescription,
-        getProfile: (id) => profiles.get(id),
-        parkedSelectMessage: (id) => router.parkedSelectMessage(id),
-        unregisteredAgentMessage: (id, fallback) => router.unregisteredAgentMessage(id, fallback),
-        assertAgentAllowedForRecord: () => {},
-        getOrStartRuntime: async () => {
-          throw new Error("should not start");
-        },
-        invalidate: async () => {},
-      },
-      mutation: {
-        applySessionConfig: () => ({ ok: false, error: "unused" }),
-        applyThreadOverlay: () => ({ ok: false, error: "unused" }),
-      },
-    });
-    const result = await service.configure(caller, target, { agent: OLLAMA_CLOUD_AGENT_ID });
-    expect(result.ok).toBe(false);
-    if (result.ok) return;
-    expect(result.error).toBe(PARKED_OLLAMA_CLOUD_SELECT_MESSAGE);
-    expect(result.error).not.toMatch(/is retired:/);
-  });
-
-  it("config mutation cannot select ollama-cloud while parked, even if a stale profile is present", () => {
-    const profiles = new Map<string, AgentProfile>([
-      ["claude", stubProfile("claude")],
-      [OLLAMA_CLOUD_AGENT_ID, stubProfile(OLLAMA_CLOUD_AGENT_ID)],
-    ]);
-    const svc = new ConfigMutationService({
-      store: {
-        readConfig: () => ({}),
-        writeConfig: (cfg) => JSON.stringify(cfg),
-        upsert: () => {},
-        getPresetByNameScoped: () => null,
-        upsertPreset: () => {},
-        deletePreset: () => {},
-        recordConfigMutation: () => ({ id: "audit" }) as never,
-        getScheduled: () => null,
-        listScheduledByChannel: () => [],
-        upsertScheduled: () => {},
-        deleteScheduled: () => {},
-      },
-      describeConfig: (record) =>
-        ({
-          sessionId: record.id,
-          channelRef: record.channelRef,
-          parentRef: record.parentRef,
-          agent: { value: record.agentId, source: "session config" },
-          model: { value: "opus", source: "session config" },
-          effort: { value: null, source: "default" },
-          role: { value: null, source: "default" },
-          cwd: { value: "/repo", source: "session config" },
-          permission: { value: "ask", source: "default" },
-          locked: false,
-          detached: { value: false, source: "default" },
-          tts: { value: false, source: "default" },
-          ttsVoice: { value: null, source: "default" },
-          ttsPace: { value: "natural", source: "default" },
-          ttsStyle: { value: "neutral", source: "default" },
-          location: { value: "local", source: "default" },
-          statusCardStyle: { value: "full", source: "default" },
-          simpleCardGif: { value: false, source: "default" },
-          fastMode: { value: false, source: "default" },
-        }) as ConfigDescription,
-      profiles,
-      defaultModel: "opus",
-      presetsFile: undefined,
-      tierCEnabled: false,
-      reloadPresets: () => ({ ok: true }),
-      reschedule: () => {},
-      defaultTimezone: "America/Chicago",
-      logger: silent,
-      ollamaCloudEnabled: false,
-    });
-    const built = svc.buildProposal(makeRecord(), { session: { agent: OLLAMA_CLOUD_AGENT_ID } });
-    expect(built.ok).toBe(false);
-    if (built.ok) return;
-    expect(built.error).toBe(PARKED_OLLAMA_CLOUD_SELECT_MESSAGE);
   });
 });
 
@@ -488,26 +354,13 @@ describe("#220 linkworks-ollama is gated on the same flag", () => {
   });
 });
 
-describe("#220 DEFAULT_AGENT while parked", () => {
-  let env: Record<string, string | undefined>;
-
-  function baseEnv(extra: Record<string, string | undefined>) {
-    env = {
-      DISCORD_BOT_TOKEN: "test-token",
-      DISCORD_ALLOWED_USER_IDS: "123",
-      REPOS_ROOT: repoRoot,
-      CHANNEL_PRESETS_FILE: undefined,
-      ...extra,
-    } as NodeJS.ProcessEnv;
-  }
-
-  it("boots but refuses default-dependent new sessions when ollama-cloud is parked", () => {
-    baseEnv({ DEFAULT_AGENT: OLLAMA_CLOUD_AGENT_ID, OLLAMA_CLOUD_ENABLED: "false" });
-    const cfg = loadConfig({ env });
+describe("controller defaults do not decide host availability", () => {
+  it("leaves ollama-cloud selection to the chosen bridge", () => {
+    const cfg = loadConfig({ env: {
+      DISCORD_BOT_TOKEN: "test-token", DISCORD_ALLOWED_USER_IDS: "123",
+      REPOS_ROOT: repoRoot, DEFAULT_AGENT: OLLAMA_CLOUD_AGENT_ID, OLLAMA_CLOUD_ENABLED: "false",
+    } });
     expect(cfg.DEFAULT_AGENT).toBe(OLLAMA_CLOUD_AGENT_ID);
-    expect(cfg.defaultAgentDisabledReason).toMatch(/DEFAULT_AGENT="ollama-cloud"/);
-    expect(cfg.defaultAgentDisabledReason).toMatch(/parked/);
-    expect(cfg.defaultAgentDisabledReason).toContain(OLLAMA_CLOUD_ENABLE_FLAG);
-    expect(cfg.defaultAgentDisabledReason).not.toMatch(/is retired:/);
+    expect(cfg.defaultAgentDisabledReason).toBeUndefined();
   });
 });

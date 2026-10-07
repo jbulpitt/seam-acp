@@ -1,16 +1,14 @@
 /**
- * In-process adapter RPC dispatcher (D9).
- *
- * The remote-bridge and the local loopback host share this switch so
- * `listWorkspaces` / `describe` / session verbs / attachment ferry take
- * one code path. `spawn` is intentionally omitted: ACP stdio is the mux
- * slot path (remote: rpc spawn after mux.spawn; local: unbound profile.spawn).
+ * Host-side adapter RPC dispatcher, shared by every bridge.
+ * Spawn uses the mux slot path; the remaining adapter verbs use this switch.
  */
+import { promises as fsp } from "node:fs";
 import { isAdapterRpcMethod } from "./command-bus.js";
 import { normalizeCatalogCandidate } from "./catalog-evidence.js";
 import { scanWorkspaces } from "./workspace-scan.js";
 import { readAttachmentWithinRoot } from "./read-attachment.js";
 import type { AgentAdapter } from "./agent-profile.js";
+import { SESSION_HISTORY_CHUNK_BYTES, type SessionHistoryChunk } from "./session-manager.js";
 
 export interface AdapterRpcCtx {
   adapter?: AgentAdapter;
@@ -43,8 +41,7 @@ export async function invokeAdapterRpc(
   switch (method) {
     case "listWorkspaces":
       // D11: host enumerates under its single workspace root. Adapter
-      // stubs stay empty; this is the host-side scan both loopback and
-      // the remote bridge use.
+      // stubs stay empty; every bridge uses this host-side scan.
       return scanWorkspaces(ctx.workspaceRoot);
     case "describe":
       if (!adapter) throw new Error("no adapter for describe");
@@ -76,6 +73,35 @@ export async function invokeAdapterRpc(
     case "listSessions":
       if (!adapter) throw new Error("no adapter for listSessions");
       return adapter.listSessions(cwd);
+    case "getHistory": {
+      if (!adapter) throw new Error("no adapter for getHistory");
+      if (!adapter.sessionManager?.getHistoryPath) throw new Error("no session manager for getHistory");
+      const sessionId = str(p.sessionId);
+      if (!sessionId) throw new Error("sessionId required");
+      const history = await adapter.sessionManager.getHistoryPath(cwd, sessionId);
+      if (!history) return null;
+      const offset = typeof p.offset === "number" ? p.offset : 0;
+      const length = Math.min(typeof p.length === "number" ? p.length : SESSION_HISTORY_CHUNK_BYTES, SESSION_HISTORY_CHUNK_BYTES);
+      const file = await fsp.open(history, "r");
+      try {
+        const bytes = Buffer.alloc(length);
+        const { bytesRead } = await file.read(bytes, 0, length, offset);
+        return {
+          bytesBase64: bytes.subarray(0, bytesRead).toString("base64"),
+          nextOffset: offset + bytesRead, eof: bytesRead < length,
+        } satisfies SessionHistoryChunk;
+      } finally {
+        await file.close();
+      }
+    }
+    case "repairSession": {
+      if (!adapter) throw new Error("no adapter for repairSession");
+      if (!adapter.sessionManager?.repairSession) throw new Error("no session manager for repairSession");
+      const sessionId = str(p.sessionId);
+      if (!sessionId) throw new Error("sessionId required");
+      await adapter.sessionManager.repairSession(cwd, sessionId);
+      return null;
+    }
     case "getTranscript": {
       if (!adapter) throw new Error("no adapter for getTranscript");
       const sessionId = str(p.sessionId);
@@ -108,7 +134,9 @@ export async function invokeAdapterRpc(
       return null;
     }
     case "whoami":
-      return adapter?.whoami?.() ?? null;
+      if (!adapter) throw new Error("no adapter for whoami");
+      if (!adapter.whoami) throw new Error(`Agent \`${adapter.id}\` (${adapter.displayName}) does not expose account info.`);
+      return adapter.whoami();
     case "writeAttachment": {
       if (!adapter) throw new Error("no adapter for writeAttachment");
       const filename = str(p.filename);

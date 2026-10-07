@@ -128,9 +128,11 @@ describe("production router and ACP MCP delivery", () => {
   it("delivers resolved headers on new and resumed sessions; missing server does not prevent either", async () => {
     write({ sentry, broken: { url: "https://example.invalid", headers: { Authorization: "${SEAM_TEST_MCP_MISSING}" } } });
     const seen: Array<{ mode: string; servers: McpServer[] }> = [];
+    const launches: McpServer[][] = [];
     const profile = {
       id: "codex", defaultModel: "default", effort: { mechanism: "none", levels: [] },
-      spawn() {
+      spawn(_model, _effort, servers) {
+        launches.push(servers ?? []);
         const stdin = new PassThrough(); const stdout = new PassThrough(); const stderr = new PassThrough();
         const child = Object.assign(new EventEmitter(), {
           stdin, stdout, stderr, pid: undefined, killed: false,
@@ -154,9 +156,17 @@ describe("production router and ACP MCP delivery", () => {
       const saved = store.get(record.id)!;
       expect(saved.acpSessionId).toBe("kept-conversation");
       await router.getOrStartRuntime(saved);
-      // #575: project MCP is resolved by the execution bridge, even for
-      // local. The controller deliberately sends no same-named local file.
-      expect(seen).toEqual([{ mode: "new", servers: [] }, { mode: "load", servers: [] }]);
+      // The bridge resolves project MCP; the router injects a callable Seam endpoint.
+      expect(seen.map(entry => entry.mode)).toEqual(["new", "load"]);
+      for (const entry of seen) {
+        expect(entry.servers).toEqual([expect.objectContaining({ name: "seam-mcp", url: expect.stringMatching(/^http:\/\/127\.0\.0\.1:\d+\/mcp$/) })]);
+      }
+      expect(launches).toHaveLength(2);
+      for (const servers of launches) {
+        expect(servers).toContainEqual(expectedSentry);
+        expect(servers).toContainEqual(expect.objectContaining({ name: "seam-mcp", url: expect.stringMatching(/^http:\/\/127\.0\.0\.1:\d+\/mcp$/) }));
+        expect(servers.some(server => server.name === "broken")).toBe(false);
+      }
       expect(store.get(record.id)!.acpSessionId).toBe("kept-conversation");
     } finally { await router.disposeAll(); store.close(); }
   });

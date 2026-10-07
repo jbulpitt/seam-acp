@@ -197,8 +197,6 @@ export class ModelCatalogService {
     hideList?: ModelHideList;
     logger: Logger;
     bindings: () => ReadonlyArray<CatalogBinding>;
-    /** Exact locally configured profiles; never inferred from remote presence. */
-    configuredLocalAgentIds?: () => ReadonlyArray<string>;
     /** Adapter-owned semantic scope; no provider work is allowed here. */
     scope?: (binding: CatalogBinding) => CatalogScope | Promise<CatalogScope>;
     /**
@@ -227,15 +225,6 @@ export class ModelCatalogService {
     reductionPolicy?: CatalogReductionPolicy;
   }) {
     this.reductionPolicy = options.reductionPolicy ?? DEFAULT_CATALOG_REDUCTION_POLICY;
-    if (options.configuredLocalAgentIds) {
-      const reconciliation = options.store.reconcileConfiguredLocalAgents(
-        new Set(options.configuredLocalAgentIds()),
-        (options.now?.() ?? new Date()).toISOString(),
-      );
-      if (reconciliation.retired.length || reconciliation.restored.length) {
-        options.logger.info(reconciliation, "model catalog local observation lifecycle reconciled");
-      }
-    }
     for (const snapshot of options.store.loadActive()) {
       try {
         // Normalize forward before validating so a snapshot written by an older

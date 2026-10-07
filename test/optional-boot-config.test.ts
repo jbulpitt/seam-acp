@@ -1,6 +1,8 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { pino } from "pino";
 import type { AgentProfile } from "@seam/adapters";
@@ -70,8 +72,6 @@ describe("#614 optional startup settings", () => {
 
   it.each([
     { DEFAULT_AGENT: "opencode" },
-    { DEFAULT_AGENT: "ollama-cloud", OLLAMA_CLOUD_ENABLED: "false" },
-    { DEFAULT_AGENT: "copilot", AGENT_LOCATION_DENY: "copilot@local" },
   ])("refuses only new sessions depending on bad DEFAULT_AGENT: %j", (bad) => {
     const warnings: string[] = [];
     const config = loadConfig({ env: { ...env, ...bad }, warn: (message) => warnings.push(message) });
@@ -89,20 +89,9 @@ describe("#614 optional startup settings", () => {
     expect(warnings.join(" ")).toContain(config.defaultAgentDisabledReason);
   });
 
-  it("retains AGY's real refusal without disabling another agent", () => {
-    const store = new SessionStore(":memory:"); stores.push(store);
-    const router = new SessionRouter({ logger: silent, store, profiles: [profile], modelCatalog: fixtureModelCatalog([profile]),
-      defaultAgentId: "claude", defaultModel: "default", localAgentErrors: new Map([["agy", "Invalid configuration: native agy requires AGY_SHA256"]]),
-      seamMcp: localBridgeWiring(profile) });
-    const record = router.ensureSessionRecord({ platform: "discord", channelRef: "222", cwd: os.tmpdir() });
-    expect(router.planRuntimeSpawn(record).agentId).toBe("claude");
-    expect(() => router.planRuntimeSpawn({ ...record, agentId: "agy" })).toThrow("native agy requires AGY_SHA256");
-  });
 
   it.each([
     { DEFAULT_AGENT: "opencode" },
-    { DEFAULT_AGENT: "ollama-cloud", OLLAMA_CLOUD_ENABLED: "false" },
-    { DEFAULT_AGENT: "copilot", AGENT_LOCATION_DENY: "copilot@local" },
   ].flatMap((bad) => [false, true].flatMap((deliveryFails) => [false, true].map((offline) => ({ bad, deliveryFails, offline })))))("reports an unavailable default before admission or parking, retaining its cause if delivery fails: %j", async ({ bad, deliveryFails, offline }) => {
     const config = loadConfig({ env: { ...env, ...bad }, warn: () => {} });
     const store = new SessionStore(":memory:"); stores.push(store);
@@ -139,19 +128,22 @@ describe("#614 optional startup settings", () => {
 
   it("MCP-off still binds and spawns through the execution bridge, with no Seam tool injection", async () => {
     const store = new SessionStore(":memory:"); stores.push(store);
-    const wire = localBridgeWiring(profile);
-    const child = { fixture: "remote child" };
-    const spawn = vi.fn(() => child);
+    const hostSpawn = vi.fn(() => Object.assign(new EventEmitter(), {
+      stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(), kill: () => true,
+    }) as any);
+    const wire = localBridgeWiring(hostSpawn);
     const mux = wire.muxForSession!("fixture")!;
-    mux.spawn = spawn as unknown as typeof mux.spawn;
+    const spawn = vi.spyOn(mux, "spawn");
     const router = new SessionRouter({ logger: silent, store, profiles: [profile], modelCatalog: fixtureModelCatalog([profile]),
       defaultAgentId: "claude", defaultModel: "default", executionBridge: { isBridgeSession: wire.isBridgeSession!, muxForSession: () => mux },
       bindSessionLocation: wire.bindSessionLocation });
     const record = router.ensureSessionRecord({ platform: "discord", channelRef: "222", cwd: os.tmpdir() });
     const plan = router.planRuntimeSpawn(record);
     expect(plan.mcpServers).toEqual([]);
-    expect(await plan.spawnChild()).toBe(child);
-    expect(spawn).toHaveBeenCalledWith(expect.objectContaining({ launch: expect.objectContaining({ agentId: "claude", mcpServers: [] }) }));
+    const child = await plan.spawnChild();
+    expect(child).toBe(spawn.mock.results[0]!.value);
+    expect(hostSpawn).toHaveBeenCalledWith(expect.objectContaining({ agentId: "claude", mcpServers: [] }));
+    expect(spawn).toHaveBeenCalledWith({ holdStdinUntilReady: true });
     expect(profile.spawn).not.toHaveBeenCalled();
   });
 });

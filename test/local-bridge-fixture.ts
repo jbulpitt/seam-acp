@@ -8,6 +8,32 @@ import type { Orchestrator } from "../packages/core/src/platforms/discord/orches
 import { SeamTokenRegistry } from "../packages/core/src/core/mcp/token-registry.js";
 import fs from "node:fs";
 import path from "node:path";
+import { spawnSupervisedAdapter } from "../packages/bridge/src/spawn-agent.js";
+import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
+import { dispatchBridgeRpc, type SlotSpawnConfig } from "../packages/bridge/src/rpc.js";
+import type { RemoteSlotSpawnParams } from "../packages/core/src/core/remote-spawn.js";
+import { SeamMcpServer, buildSeamMcpServerEntry } from "../packages/core/src/core/mcp/seam-mcp-server.js";
+
+import { afterAll } from "vitest";
+import { pino } from "pino";
+import type { Logger } from "../packages/core/src/lib/logger.js";
+
+const registry = new SeamTokenRegistry();
+const mcp = new SeamMcpServer({
+  logger: pino({ level: "silent" }) as unknown as Logger,
+  resolveSession: token => {
+    const id = registry.resolve(token);
+    return id ? {
+      id, platform: "discord", channelRef: id, parentRef: null,
+      agentId: "fixture", acpSessionId: "", repoPath: process.cwd(),
+      configJson: "{}", createdUtc: "", updatedUtc: "",
+    } : undefined;
+  },
+  enqueueDispatch: async () => {},
+});
+await mcp.start();
+afterAll(() => mcp.stop());
 
 type SpawnedChild = ChildProcessByStdio<Writable, Readable, Readable>;
 
@@ -21,31 +47,59 @@ type SpawnedChild = ChildProcessByStdio<Writable, Readable, Readable>;
  * local-only implementation #575 removes.
  */
 export function localBridgeWiring(
-  spawn: (() => SpawnedChild) | AgentProfile | readonly AgentProfile[] = () => {
+  spawn: ((params: RemoteSlotSpawnParams) => SpawnedChild) | AgentProfile | readonly AgentProfile[] = () => {
     throw new Error("synthetic local bridge spawn was not configured");
   },
 ): SeamMcpWiring {
   let nextSlot = 0;
   const profiles = Array.isArray(spawn) ? spawn : typeof spawn === "function" ? null : [spawn];
   const spawnChild = typeof spawn === "function" ? spawn : undefined;
+  const slots = new Map<number, { child: MuxSpawnedProcess; process?: SpawnedChild }>();
   const mux = {
-    spawn: (opts?: { launch?: { agentId: string; model?: string; effort?: string; mcpServers: Parameters<AgentProfile["spawn"]>[2]; cwd?: string } }): MuxSpawnedProcess => {
-      const profile = profiles?.find((candidate) => candidate.id === opts?.launch?.agentId) ?? profiles?.[0];
-      const child = (spawnChild?.() ?? profile!.spawn(
-        opts?.launch?.model,
-        opts?.launch?.effort,
-        opts?.launch?.mcpServers,
-        { cwd: opts?.launch?.cwd },
-      )) as MuxSpawnedProcess;
-      Object.defineProperty(child, "slot", { value: nextSlot++, configurable: true });
+    spawn: (): MuxSpawnedProcess => {
+      const slot = nextSlot++;
+      const child = Object.assign(new EventEmitter(), {
+        slot,
+        stdin: new PassThrough(),
+        stdout: new PassThrough(),
+        stderr: new PassThrough(),
+        kill: (signal?: NodeJS.Signals) => slots.get(slot)?.process?.kill(signal) ?? false,
+      }) as unknown as MuxSpawnedProcess;
+      Object.defineProperty(child, "pid", { get: () => slots.get(slot)?.process?.pid });
+      Object.defineProperty(child, "killed", { get: () => slots.get(slot)?.process?.killed ?? false });
+      slots.set(slot, { child });
       return child;
     },
-    rpc: async () => ({ projectMcpInjection: true, rung1RecoveryVersion: 1 }),
-    releaseStdin: () => {},
+    rpc: async (method: string, params: unknown) => {
+      const input = params as RemoteSlotSpawnParams & { slot: number };
+      return dispatchBridgeRpc(method, params, input.agentId, {
+        adapters: new Map((profiles ?? []).map(profile => [profile.id, profile])),
+        workspaceRoot: input.cwd ?? process.cwd(), cwd: input.cwd ?? process.cwd(),
+        configureSlot: (slot: number, config: SlotSpawnConfig) => {
+          const state = slots.get(slot)!;
+          const launch = { ...input, ...config, mcpServers: config.mcpServers ?? [] } as RemoteSlotSpawnParams;
+          const process = spawnChild ? spawnChild(launch) : spawnSupervisedAdapter(
+            new Map(profiles!.map(profile => [profile.id, profile])), config,
+          ) as SpawnedChild;
+          state.process = process;
+          process.stdout.pipe(state.child.stdout as PassThrough);
+          process.stderr.pipe(state.child.stderr as PassThrough);
+          process.on("error", error => state.child.emit("error", error));
+          process.on("exit", (code, signal) => state.child.emit("exit", code, signal));
+          process.on("close", (code, signal) => state.child.emit("close", code, signal));
+        },
+      });
+    },
+    releaseStdin: (slot: number) => {
+      const state = slots.get(slot)!;
+      if (state.process) state.child.stdin.pipe(state.process.stdin);
+    },
   };
+  const port = mcp.port;
   return {
-    registry: new SeamTokenRegistry(),
-    getPort: () => undefined,
+    registry,
+    getPort: () => port,
+    mcpServersForBridgeSpawn: sessionId => buildSeamMcpServerEntry(port, registry.peek(sessionId) ?? registry.mint(sessionId)),
     isBridgeSession: () => true,
     muxForSession: () => mux,
     bindSessionLocation: () => {},
@@ -75,18 +129,28 @@ export function localBridgeHub(
     listWorkspaces: async (location: string) => location === "local"
       ? workspacePaths().map((workspacePath) => ({ path: workspacePath, name: path.basename(workspacePath) }))
       : [],
-    get: (location: string) => location === "local" && mux ? { mux } : undefined,
+    get: (location: string) => location === "local" && mux ? { mux, host: { workspaceRoot } } : undefined,
+    defaultCwdForLocation: () => workspaceRoot,
     markSessionBridge: () => {},
-    mcpServersForBridgeSpawn: () => undefined,
+    mcpServersForBridgeSpawn: wiring.mcpServersForBridgeSpawn,
     rpc: async (_location: string, method: string, params: unknown, agentId?: string) => {
-      if (method === "deleteSession") {
-        const profile = profiles.find((candidate) => candidate.id === agentId) ?? profiles[0];
-        const input = params as { cwd?: string; sessionId?: string };
-        if (profile?.sessionManager?.deleteSession && input.cwd && input.sessionId) {
-          await profile.sessionManager.deleteSession(input.cwd, input.sessionId);
+      const profile = profiles.find(candidate => candidate.id === agentId);
+      const manager = profile?.sessionManager;
+      const input = params as { cwd: string; sessionId: string; oldSessionId: string; newSessionId: string; newerThanMs?: number };
+      switch (method) {
+        case "listSessions": return manager?.listSessions(input.cwd) ?? [];
+        case "getHistory": {
+          const file = await manager?.getHistoryPath?.(input.cwd, input.sessionId);
+          return file ? fs.promises.readFile(file, "utf8") : null;
         }
+        case "repairSession": return manager?.repairSession?.(input.cwd, input.sessionId);
+        case "getTranscript": return manager?.getTranscript(input.cwd, input.sessionId);
+        case "cloneSession": return manager?.cloneSession(input.cwd, input.oldSessionId, input.newSessionId);
+        case "deleteSession": return manager?.deleteSession(input.cwd, input.sessionId);
+        case "getUsage": return manager?.getUsage?.(input.cwd, input.sessionId, input.newerThanMs) ?? null;
+        case "whoami": return profile?.whoami?.() ?? null;
+        default: return { ok: true };
       }
-      return { ok: true };
     },
     publicWsUrl: () => "ws://127.0.0.1/bridge",
   } as unknown as BridgeHub;

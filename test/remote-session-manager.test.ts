@@ -1,7 +1,112 @@
 import { describe, expect, it, vi } from "vitest";
 import { remoteSessionManager } from "../packages/core/src/core/remote-session-manager.js";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { asLocalAdapter, invokeAdapterRpc, SESSION_HISTORY_CHUNK_BYTES, type SessionHistoryChunk } from "@seam/adapters";
+import { dispatchBridgeRpc } from "../packages/bridge/src/rpc.js";
 
 describe("remoteSessionManager", () => {
+  it.each(["local", "remote-host"])("reassembles %s's multi-chunk history without splitting Unicode", async location => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "seam-history-chunks-"));
+    const history = path.join(cwd, "history.jsonl");
+    const content = "x".repeat(SESSION_HISTORY_CHUNK_BYTES - 1) + "🧪" + "y".repeat(SESSION_HISTORY_CHUNK_BYTES);
+    fs.writeFileSync(history, content);
+    const adapter = asLocalAdapter({
+      id: "claude", displayName: "Claude fixture", defaultModel: "default",
+      spawn: () => { throw new Error("no process needed for file operations"); },
+      sessionManager: {
+        listSessions: async () => [], getTranscript: async () => "", cloneSession: async () => {}, deleteSession: async () => {},
+        getHistoryPath: async () => history,
+      },
+    });
+    const chunks: SessionHistoryChunk[] = [];
+    const rpc = vi.fn(async (_location, method, params, agentId) => {
+      const chunk = await dispatchBridgeRpc(method, params, agentId, {
+        adapters: new Map([["claude", adapter]]), workspaceRoot: cwd, cwd,
+      }) as SessionHistoryChunk;
+      chunks.push(chunk);
+      return chunk;
+    });
+    try {
+      const manager = remoteSessionManager({ rpc } as any, location, "claude", { history: true, repair: false });
+      await expect(manager.getHistory!(cwd, "session")).resolves.toBe(content);
+      expect(chunks).toHaveLength(3);
+      expect(chunks.map(chunk => Buffer.from(chunk.bytesBase64, "base64").length))
+        .toEqual([SESSION_HISTORY_CHUNK_BYTES, SESSION_HISTORY_CHUNK_BYTES, 3]);
+      expect(rpc.mock.calls.map(call => call[2].offset))
+        .toEqual([0, SESSION_HISTORY_CHUNK_BYTES, SESSION_HISTORY_CHUNK_BYTES * 2]);
+      expect(chunks.map(chunk => chunk.eof)).toEqual([false, false, true]);
+      const capped = await invokeAdapterRpc("getHistory", {
+        sessionId: "session", offset: 0, length: SESSION_HISTORY_CHUNK_BYTES * 3,
+      }, { adapter, workspaceRoot: cwd }) as SessionHistoryChunk;
+      expect(Buffer.from(capped.bytesBase64, "base64")).toHaveLength(SESSION_HISTORY_CHUNK_BYTES);
+    } finally { fs.rmSync(cwd, { recursive: true, force: true }); }
+  });
+
+  it.each(["getHistory", "repairSession"])("%s reports the missing adapter or session manager by name", async method => {
+    const adapter = asLocalAdapter({
+      id: "claude", displayName: "Claude fixture", defaultModel: "default",
+      spawn: () => { throw new Error("unused spawn"); },
+    });
+    await expect(invokeAdapterRpc(method, { sessionId: "session" }, { workspaceRoot: "/repo" }))
+      .rejects.toThrow(`no adapter for ${method}`);
+    await expect(invokeAdapterRpc(method, { sessionId: "session" }, { adapter, workspaceRoot: "/repo" }))
+      .rejects.toThrow(`no session manager for ${method}`);
+  });
+
+  it.each(["local", "remote-host"])("reads and repairs session history through %s's host RPC", async location => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "seam-host-history-"));
+    const history = path.join(cwd, "history.jsonl");
+    fs.writeFileSync(history, "original host history");
+    const repair = vi.fn(async () => { fs.writeFileSync(history, "repaired host history"); });
+    const adapter = asLocalAdapter({
+      id: "claude", displayName: "Claude fixture", defaultModel: "default",
+      spawn: () => { throw new Error("no process needed for file operations"); },
+      sessionManager: {
+        listSessions: async () => [], getTranscript: async () => "", cloneSession: async () => {}, deleteSession: async () => {},
+        getHistoryPath: async () => history, repairSession: repair,
+      },
+    });
+    const rpc = vi.fn(async (_location, method, params, agentId) => dispatchBridgeRpc(method, params, agentId, {
+      adapters: new Map([["claude", adapter]]), workspaceRoot: cwd, cwd,
+    }));
+    const manager = remoteSessionManager({ rpc } as any, location, "claude", { history: true, repair: true });
+    try {
+      await expect(manager.getHistory!(cwd, "session")).resolves.toBe("original host history");
+      await manager.repairSession!(cwd, "session");
+      await expect(manager.getHistory!(cwd, "session")).resolves.toBe("repaired host history");
+      expect(repair).toHaveBeenCalledWith(cwd, "session");
+      expect(rpc.mock.calls.map(call => [call[0], call[1], call[3]])).toEqual([
+        [location, "getHistory", "claude"], [location, "repairSession", "claude"], [location, "getHistory", "claude"],
+      ]);
+    } finally { fs.rmSync(cwd, { recursive: true, force: true }); }
+  });
+
+  it.each(["local", "remote-host"])("preserves %s's unreadable history error", async location => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "seam-host-history-error-"));
+    const missing = path.join(cwd, "missing.jsonl");
+    const adapter = asLocalAdapter({
+      id: "claude", displayName: "Claude fixture", defaultModel: "default",
+      spawn: () => { throw new Error("no process needed for file operations"); },
+      sessionManager: {
+        listSessions: async () => [], getTranscript: async () => "", cloneSession: async () => {}, deleteSession: async () => {},
+        getHistoryPath: async () => missing,
+      },
+    });
+    const rpc = async (_location, method, params, agentId) => dispatchBridgeRpc(method, params, agentId, {
+      adapters: new Map([["claude", adapter]]), workspaceRoot: cwd, cwd,
+    });
+    try {
+      const manager = remoteSessionManager({ rpc } as any, location, "claude", { history: true, repair: false });
+      await expect(manager.getHistory!(cwd, "session")).rejects.toMatchObject({
+        message: expect.stringContaining(`Session host "${location}" could not answer getHistory: ENOENT`),
+        cause: expect.objectContaining({ code: "ENOENT", path: missing }),
+      });
+      expect(manager.repairSession).toBeUndefined();
+    } finally { fs.rmSync(cwd, { recursive: true, force: true }); }
+  });
+
   it("forwards every session operation with the remote agent binding", async () => {
     const rpc = vi.fn(async (_location: string, method: string) => {
       if (method === "listSessions") return [{ sessionId: "remote-session", previewLines: [] }];

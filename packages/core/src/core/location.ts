@@ -186,9 +186,9 @@ export function parseDispatchWorker(worker: string): DispatchWorkerTarget {
 /**
  * Host-scoped availability (#474).
  *
- * Registration and availability are different facts. `COPILOT_ENABLED=false`
- * removes the profile everywhere, including `copilot@remote-host`. A deny list
- * withholds one `agentId@location` while the profile stays registered.
+ * Each bridge advertises its installed agents. `COPILOT_ENABLED=false`
+ * withholds Copilot only on the host reading it. A controller deny list
+ * independently withholds one `agentId@location`.
  *
  * #468 (bridge) asks "does this host hold this adapter?" and refuses a stated
  * id it cannot serve rather than substituting. This module asks the adjacent
@@ -221,7 +221,7 @@ export class DeniedAgentLocationError extends Error {
 /**
  * Parse `AGENT_LOCATION_DENY`. Empty = nobody is withheld.
  * Each entry MUST be explicit `agentId@location` — a bare id would be a
- * global ban, which is `COPILOT_ENABLED=false`, not this list.
+ * global ban. Each entry names the host whose binding is withheld.
  */
 export function parseAgentLocationDeny(raw: string): AgentLocationDeny[] {
   const out: AgentLocationDeny[] = [];
@@ -231,7 +231,7 @@ export function parseAgentLocationDeny(raw: string): AgentLocationDeny[] {
     if (!parsed.explicit) {
       throw new Error(
         `Invalid configuration: AGENT_LOCATION_DENY entry "${part}" must be agentId@location ` +
-          `(a bare id is a global ban — use COPILOT_ENABLED=false for that). ` +
+          `(a bare id does not name a host). ` +
           `seam-acp will not guess the location.`
       );
     }

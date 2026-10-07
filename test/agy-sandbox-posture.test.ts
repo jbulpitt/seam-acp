@@ -63,7 +63,6 @@ describe("the documented AGY execution posture is the one production uses (#324/
   });
 
   it.each([
-    ["core startup", "packages/core/src/index.ts"],
     ["bridge inventory", "packages/bridge/src/inventory.ts"],
   ])("keeps the removed option out of the %s production construction site", (_label, relative) => {
     const source = fs.readFileSync(path.join(import.meta.dirname, "..", relative), "utf8");

@@ -1,9 +1,8 @@
 /**
  * Reachable seam-MCP URL for a spawn destination (#84).
  *
- * Local agents keep `http://127.0.0.1:<port>/mcp`. Remote (bridge) agents
- * must not be handed 127.0.0.1 when that only works on the control-plane
- * host. Prefer an explicit public base; otherwise a non-loopback address
+ * A bridge on another host cannot use the controller's loopback.
+ * Prefer an explicit public base; otherwise a non-loopback address
  * on the health port (where `/mcp` is proxied).
  */
 import os from "node:os";
@@ -49,11 +48,7 @@ export function resolveReachableMcpUrl(opts: {
   port: number;
   healthPort?: number;
   publicBaseUrl?: string | null;
-  remote: boolean;
 }): string {
-  if (!opts.remote) {
-    return `http://127.0.0.1:${opts.port}/mcp`;
-  }
   const configured = (opts.publicBaseUrl ?? "").trim().replace(/\/+$/, "");
   // #264: refuse the CONFIGURED base only when it is loopback, and fall
   // through to discovery below. The rule "remote agents must not be handed

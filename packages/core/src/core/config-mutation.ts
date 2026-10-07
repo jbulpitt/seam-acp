@@ -34,7 +34,6 @@ import { PresetsFileSchema } from "../config.js";
 import { renderCatalogEvidenceLines } from "./catalog-evidence-render.js";
 import { uniqueBridgeId } from "./bridge-pairing.js";
 import type { Logger } from "../lib/logger.js";
-import { parkedAgentMessage } from "./parked-agents.js";
 import type { ConfigDescription } from "./session-router.js";
 import { assessModelSelection, type ModelCatalogService, type ModelVerification } from "./model-catalog/service.js";
 import type { ConfigKeyRegistry } from "../plugins/config-key-registry.js";
@@ -158,7 +157,7 @@ export interface ChannelPresetChanges {
  *  `detached` (#80) is a RAW boolean (not `{value:true}`): true = this thread
  *  is not a session (no bot replies); false omits the key (re-attach).
  *  `location` (#86 / D10) is a RAW string (not `{value}`): omit / `"local"`
- *  means the loopback host; a bridge id pins the thread to that host.
+ *  names the local bridge; any bridge id pins the thread to that host.
  *  `tts` is a RAW boolean: true = speak each completed turn; false omits the key. */
 export interface ThreadPresetChanges {
   agent?: string | null;
@@ -345,11 +344,6 @@ export interface ConfigMutationDeps {
   modelHideList?: ModelHideList;
   /** Agent registration is independent of whether its model cache is warm. */
   isAgentAvailable?: (agentId: string, location: string) => boolean;
-  /**
-   * #220: when false, refuse ollama-cloud as parked even if a stale profile
-   * is still in `profiles`. Undefined keeps historical unknown-agent wording.
-   */
-  ollamaCloudEnabled?: boolean;
   /** CHANNEL_PRESETS_FILE — undefined ⇒ Tier C has no file to write. */
   presetsFile: string | undefined;
   /** SEAM_CONFIG_MUTATION_TIER_C_ENABLED. */
@@ -595,9 +589,10 @@ export class ConfigMutationService {
     channelId: string;
     changes: ChannelPresetChanges;
     actor: MutationActor;
+    location?: string;
   }): { ok: true; message: string; auditId: string } | { ok: false; error: string } {
     const built = this.buildChannelPresetProposalFor(opts.channelId, opts.changes, {
-      requireTierC: false,
+      requireTierC: false, location: opts.location,
     });
     if (!built.ok) {
       if (built.error.includes("No effective change")) {
@@ -1073,12 +1068,6 @@ export class ConfigMutationService {
     // Agent availability comes from the host-aware operational catalog.
     let nextAgentId = record.agentId;
     if (changes.agent !== undefined) {
-      const parked = before.location.value === "local"
-        ? parkedAgentMessage(changes.agent, this.deps.ollamaCloudEnabled, "select")
-        : null;
-      if (parked) {
-        return { ok: false, error: parked };
-      }
       // Refuse only a known-unregistered agent; registered agents keep working
       // with a cold model cache. A model snapshot is not agent registration.
       if (this.deps.isAgentAvailable?.(changes.agent, before.location.value) === false) {
@@ -1409,10 +1398,6 @@ export class ConfigMutationService {
     }
 
     if (changes.agent !== undefined) {
-      const parked = before.location.value === "local"
-        ? parkedAgentMessage(changes.agent, this.deps.ollamaCloudEnabled, "select")
-        : null;
-      if (parked) return { ok: false, error: parked };
       // Refuse only an unregistered agent; a cold catalog leaves it usable.
       if (this.deps.isAgentAvailable?.(changes.agent, before.location.value) === false) {
         return { ok: false, error: `Unknown agent "${changes.agent}" at ${before.location.value}.` };
@@ -1700,13 +1685,13 @@ export class ConfigMutationService {
           "(channel presets are keyed on the parent channel id).",
       };
     }
-    return this.buildChannelPresetProposalFor(channelId, changes, { requireTierC: true });
+    return this.buildChannelPresetProposalFor(channelId, changes, { requireTierC: true, location: this.deps.describeConfig(record).location.value });
   }
 
   private buildChannelPresetProposalFor(
     channelId: string,
     changes: ChannelPresetChanges,
-    opts: { requireTierC?: boolean } = {}
+    opts: { requireTierC?: boolean; location?: string } = {}
   ): BuildProposalResult {
     try { changes = this.deps.configKeys?.parseChanges(changes) ?? changes; }
     catch (err) { return { ok: false, error: err instanceof Error ? err.message : String(err) }; }
@@ -1760,11 +1745,11 @@ export class ConfigMutationService {
       const agentId = changes.agent ?? ((current.agent as { value?: string } | undefined)?.value);
       if (agentId) {
         const selection = assessModelSelection(this.deps.modelCatalog,
-          { agentId, location: "local" }, changes.model);
+          { agentId, location: opts.location ?? "local" }, changes.model);
         // Refuse only retired/unavailable choices; a missing entry leaves
         // manually typed models available to this channel.
         if (!selection.allowed) {
-          return { ok: false, error: `Model "${changes.model}" is unavailable in the cached catalog for ${agentId}@local.` };
+          return { ok: false, error: `Model "${changes.model}" is unavailable in the cached catalog for ${agentId}@${opts.location ?? "local"}.` };
         }
         verification = selection.verification;
         const discovered = selection.model;

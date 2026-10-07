@@ -21,14 +21,12 @@ import {
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { writeRestartSentinel } from "./core/restart-sentinel.js";
-import { loadConfig, loadBootChannelPresets, configDisabledFeatures, disabledFeatureReason, areHostToolsEnabled, isChannelLocked, resolveThreadLocation, resolveThreadTtsVoice, resolveThreadTtsPace, resolveThreadTtsStyle, adminParticipantOverlapIds, GROK_STATIC_MODELS, ZAI_STATIC_MODELS, OLLAMA_CLOUD_STATIC_MODELS } from "./config.js";
-import { enrichModelListWithKnownLimits } from "./core/context-window.js";
+import { loadConfig, loadBootChannelPresets, configDisabledFeatures, disabledFeatureReason, areHostToolsEnabled, isChannelLocked, resolveThreadLocation, resolveThreadTtsVoice, resolveThreadTtsPace, resolveThreadTtsStyle, adminParticipantOverlapIds } from "./config.js";
 import {
   hostEmoji,
   installAgentLocationDeny,
   isAgentLocationDenied,
   withoutDeniedBindings,
-  LOCAL_LOCATION,
   setAgentLocationDeny,
 } from "./core/location.js";
 import { logger } from "./lib/logger.js";
@@ -49,21 +47,10 @@ import { DELEGATION_TERMINAL_STATUSES } from "./core/types.js";
 import { SessionRouter } from "./core/session-router.js";
 import { turnStalenessBoundMs } from "./core/turn-watchdog.js";
 import {
-  shouldRegisterOllamaCloud,
-} from "./core/parked-agents.js";
-import { makeCopilotProfile } from "@seam/adapters";
-import { makeClaudeProfile } from "@seam/adapters";
-import {
-  makeAgyNativeRuntime,
-  makeAgyUnpinnedRuntime,
-  makeAgyProfile,
-  scrubStaleGlobalSeamStdio,
   sweepAgyMcpHomes,
 } from "@seam/adapters";
-import { makeCodexProfile } from "@seam/adapters";
-import { mainClaudeCatalogSource } from "./agents/claude-catalog-source.js";
-import { buildOllamaCodexCatalog } from "./agents/ollama-codex-catalog.js";
-import { makeGrokProfile, fetchXaiModels } from "@seam/adapters";
+import { remoteSessionManager } from "./core/remote-session-manager.js";
+import { controllerQuotaProfiles } from "./core/quota/controller-profiles.js";
 import { discordRenderer } from "./platforms/discord/renderer.js";
 import { DiscordAdapter } from "./platforms/discord/adapter.js";
 import { Orchestrator } from "./platforms/discord/orchestrator.js";
@@ -298,243 +285,7 @@ async function main(): Promise<void> {
     dataDir: config.DATA_DIR,
   });
 
-  // #439 / #474: COPILOT_ENABLED=false is the global "not entitled at all"
-  // switch — it drops the profile, so copilot@remote-host dies with it.
-  // Host-scoped withholding is AGENT_LOCATION_DENY (profile stays registered).
-  const copilotEnabled = config.COPILOT_ENABLED !== false;
-
-  const copilot = makeCopilotProfile({
-    ...(config.COPILOT_CLI_PATH ? { cliPath: config.COPILOT_CLI_PATH } : {}),
-    defaultModel: config.DEFAULT_MODEL,
-    mcpServers,
-  });
-
-  const extraCopilots = config.COPILOT_PROFILES.map((p) =>
-    makeCopilotProfile({
-      id: `copilot-${p.id}`,
-      displayName: `GitHub Copilot (${p.id})`,
-      configDir: p.configDir,
-      ...(config.COPILOT_CLI_PATH ? { cliPath: config.COPILOT_CLI_PATH } : {}),
-      defaultModel: config.DEFAULT_MODEL,
-      mcpServers,
-    })
-  );
-
-  const claude = makeClaudeProfile({
-    ...(config.CLAUDE_CLI_PATH ? { cliPath: config.CLAUDE_CLI_PATH } : {}),
-    // Direct api.anthropic.com — the only backend Fast mode (#37) exists on.
-    directAnthropic: true,
-    defaultModel: config.CLAUDE_DEFAULT_MODEL,
-    staticModels: config.CLAUDE_MODELS,
-    maxThinkingTokens: config.CLAUDE_MAX_THINKING_TOKENS,
-    thinkingDisplay: config.CLAUDE_THINKING_DISPLAY,
-    compactionTokenThreshold: config.CLAUDE_COMPACTION_TOKEN_THRESHOLD,
-    mcpServers,
-  });
-
-  const extraClaudes = config.CLAUDE_PROFILES.map((p) =>
-    makeClaudeProfile({
-      id: `claude-${p.id}`,
-      displayName: `Anthropic Claude (${p.id})`,
-      configDir: p.configDir,
-      ...(config.CLAUDE_CLI_PATH ? { cliPath: config.CLAUDE_CLI_PATH } : {}),
-      // Alternate credentials, same direct Anthropic endpoint (#37).
-      directAnthropic: true,
-      defaultModel: config.CLAUDE_DEFAULT_MODEL,
-      staticModels: config.CLAUDE_MODELS,
-      maxThinkingTokens: config.CLAUDE_MAX_THINKING_TOKENS,
-      thinkingDisplay: config.CLAUDE_THINKING_DISPLAY,
-      compactionTokenThreshold: config.CLAUDE_COMPACTION_TOKEN_THRESHOLD,
-      mcpServers,
-    })
-  );
-
-  // Optional Vertex AI Claude profile: same claude-agent-acp binary, but with
-  // CLAUDE_CODE_USE_VERTEX=1 and GCP project/region injected per-spawn so the
-  // standard `claude` profile stays on the direct Anthropic API.
-  const claudeVertex = config.CLAUDE_VERTEX_PROJECT_ID
-    ? makeClaudeProfile({
-        id: "claude-vertex",
-        displayName: "Claude (Vertex AI)",
-        brand: "vertex",
-        ...(config.CLAUDE_CLI_PATH ? { cliPath: config.CLAUDE_CLI_PATH } : {}),
-        defaultModel: config.CLAUDE_DEFAULT_MODEL,
-        staticModels: config.CLAUDE_MODELS,
-        maxThinkingTokens: config.CLAUDE_MAX_THINKING_TOKENS,
-        thinkingDisplay: config.CLAUDE_THINKING_DISPLAY,
-        compactionTokenThreshold: config.CLAUDE_COMPACTION_TOKEN_THRESHOLD,
-        mcpServers,
-        extraEnv: {
-          CLAUDE_CODE_USE_VERTEX: "1",
-          ANTHROPIC_VERTEX_PROJECT_ID: config.CLAUDE_VERTEX_PROJECT_ID,
-          CLOUD_ML_REGION: config.CLAUDE_VERTEX_REGION,
-        },
-      })
-    : undefined;
-
-  let agyRuntime: ReturnType<typeof makeAgyNativeRuntime> | ReturnType<typeof makeAgyUnpinnedRuntime> | undefined;
-  try {
-    agyRuntime = !(config.AGY_ENABLED || config.AGY_OLD_ROLLBACK_ENABLED)
-      ? undefined
-      : config.AGY_PIN === "unpinned"
-        ? makeAgyUnpinnedRuntime({
-            credentialScope: config.AGY_CREDENTIAL_SCOPE,
-            cwd: process.cwd(),
-            baseEnv: process.env,
-          })
-        : makeAgyNativeRuntime({
-            executable: config.AGY_CLI_PATH!,
-            runtimeRoot: config.AGY_RUNTIME_ROOT!,
-            version: config.AGY_VERSION,
-            sha256: config.AGY_SHA256,
-            credentialScope: config.AGY_CREDENTIAL_SCOPE,
-            cwd: process.cwd(),
-            baseEnv: process.env,
-          });
-  } catch (error) {
-    config.agyDisabledReason = (error as Error).message;
-    logger.error({ err: error }, "AGY disabled; unrelated agents remain enabled");
-  }
-  const agy = agyRuntime
-    ? makeAgyProfile({
-        runtime: agyRuntime,
-        defaultModel: config.AGY_DEFAULT_MODEL,
-        staticModels: config.AGY_MODELS,
-        dataDir: config.DATA_DIR,
-        printTimeoutSeconds: config.TURN_TIMEOUT_SECONDS,
-        mcpServers,
-      })
-    : undefined;
-  if (agy) scrubStaleGlobalSeamStdio();
-
-  // Optional OpenAI Codex agent via @agentclientprotocol/codex-acp.
-  const codex = config.CODEX_ENABLED
-    ? makeCodexProfile({
-        ...(config.CODEX_CLI_PATH ? { cliPath: config.CODEX_CLI_PATH } : {}),
-        defaultModel: config.CODEX_DEFAULT_MODEL,
-        // The background catalog collector reads Codex's bounded host-local
-        // model cache. CODEX_MODELS pins a validated operator manifest instead.
-        staticModels: config.CODEX_MODELS,
-      })
-    : undefined;
-
-  // Optional xAI Grok Build agent — provider discovery belongs to the adapter
-  // catalog collector and runs only during background/manual refresh.
-  const grok = config.GROK_ENABLED
-    ? makeGrokProfile({
-        ...(config.GROK_CLI_PATH ? { cliPath: config.GROK_CLI_PATH } : {}),
-        defaultModel: config.GROK_DEFAULT_MODEL,
-        staticModels: enrichModelListWithKnownLimits(config.GROK_MODELS, GROK_STATIC_MODELS)
-          ?? GROK_STATIC_MODELS,
-        catalogMode: config.GROK_CATALOG_MODE,
-        ...(config.GROK_CATALOG_MODE === "api-key" && config.GROK_API_KEY
-          ? { discoverModels: () => fetchXaiModels(config.GROK_API_KEY!) }
-          : {}),
-        ...(config.GROK_CATALOG_MODE === "api-key" && config.GROK_API_KEY
-          ? { apiKey: config.GROK_API_KEY }
-          : {}),
-      })
-    : undefined;
-
-  // Optional Z.ai (Zhipu) agent: Claude Code (claude-agent-acp) pointed at Z.ai's
-  // Anthropic-compatible endpoint.  Uses GLM models (glm-5.2 flagship, 1M context).
-  // Only registered when ZAI_ENABLED and ZAI_API_KEY are set.
-  const zai = config.ZAI_ENABLED && config.ZAI_API_KEY
-    ? makeClaudeProfile({
-        id: "zai",
-        displayName: "Z.ai (Zhipu GLM)",
-        brand: "z-ai",
-        defaultModel: config.ZAI_DEFAULT_MODEL,
-        staticModels: enrichModelListWithKnownLimits(config.ZAI_MODELS, ZAI_STATIC_MODELS)
-          ?? ZAI_STATIC_MODELS,
-        // GLM models don't support Anthropic's effort mechanism.
-        effort: { mechanism: "none" as const, levels: [] },
-        extraEnv: {
-          ANTHROPIC_BASE_URL: "https://api.z.ai/api/anthropic",
-          ANTHROPIC_API_KEY: config.ZAI_API_KEY,
-        },
-      })
-    : undefined;
-
-  // Optional Ollama Cloud agent: OpenAI Codex (codex-acp) pointed at Ollama's
-  // OpenAI-compatible endpoint (https://ollama.com/v1) via a dedicated CODEX_HOME
-  // whose config.toml declares an "ollama-cloud" model_provider. This gives the
-  // agent codex's picker, reasoning_effort tiers, session management, and usage —
-  // cleaner than the prior claude-agent-acp-over-Anthropic-compat shim.
-  //   - wire_api MUST be "responses": codex 0.149 dropped "chat", and Ollama's
-  //     /v1/responses (non-stateful) is sufficient for codex.
-  //   - The provider's env_key supplies the key, so NO OpenAI login is needed in
-  //     this CODEX_HOME (verified: codex exec ran a turn against ollama-cloud with
-  //     an empty home).
-  //   - Brand ("ollama-cloud") is derived from the agent id in agent-brand.ts and
-  //     the quota card scrapes ollama.com — both unaffected by the backend swap.
-  //   - Existing threads self-heal: their stale claude acp_session_id fails
-  //     session/load and SessionRouter falls through to a fresh codex session;
-  //     :cloud-suffixed model pins still resolve on the OpenAI endpoint.
-  // Only registered when OLLAMA_CLOUD_ENABLED and OLLAMA_CLOUD_API_KEY are set
-  // (`shouldRegisterOllamaCloud`). The flag is also the park switch (#220).
-  const ollamaCloudCodexHome = path.join(process.env.HOME ?? "", ".codex-ollama-cloud");
-  const ollamaCloudLive = shouldRegisterOllamaCloud(config);
-  if (ollamaCloudLive) {
-    fs.mkdirSync(ollamaCloudCodexHome, { recursive: true });
-    // Per-model catalog (context windows + system prompt) for the curated model
-    // list, so codex uses each model's real context window instead of falling
-    // back to capped unknown-model metadata. See ollama-codex-catalog.ts.
-    const ollamaCatalogPath = path.join(ollamaCloudCodexHome, "models.json");
-    fs.writeFileSync(
-      ollamaCatalogPath,
-      JSON.stringify(
-        buildOllamaCodexCatalog(
-          enrichModelListWithKnownLimits(config.OLLAMA_CLOUD_MODELS, OLLAMA_CLOUD_STATIC_MODELS)
-            ?? OLLAMA_CLOUD_STATIC_MODELS
-        ),
-        null,
-        2,
-      ),
-      "utf8",
-    );
-    fs.writeFileSync(
-      path.join(ollamaCloudCodexHome, "config.toml"),
-      [
-        'model_provider = "ollama-cloud"',
-        `model_catalog_json = ${JSON.stringify(ollamaCatalogPath)}`,
-        "",
-        "[model_providers.ollama-cloud]",
-        'name = "Ollama Cloud"',
-        `base_url = ${JSON.stringify(config.OLLAMA_CLOUD_CODEX_BASE_URL)}`,
-        'env_key = "OLLAMA_CLOUD_API_KEY"',
-        'wire_api = "responses"',
-        "",
-      ].join("\n"),
-      "utf8",
-    );
-  }
-  const ollamaCloudApiKey = config.OLLAMA_CLOUD_API_KEY?.trim() ?? "";
-  const ollamaCloud = ollamaCloudLive && ollamaCloudApiKey
-    ? makeCodexProfile({
-        id: "ollama-cloud",
-        displayName: "Ollama Cloud",
-        defaultModel: config.OLLAMA_CLOUD_DEFAULT_MODEL,
-        staticModels: enrichModelListWithKnownLimits(config.OLLAMA_CLOUD_MODELS, OLLAMA_CLOUD_STATIC_MODELS)
-          ?? OLLAMA_CLOUD_STATIC_MODELS,
-        // Restrict to reasoning_effort values codex-acp advertises AND Ollama's
-        // OpenAI endpoint accepts, so every offered tier works on both sides.
-        // (codex also advertises xhigh/ultra; Ollama also accepts medium/none —
-        // low/high/max is the safe intersection.)
-        effort: {
-          mechanism: "configOption",
-          configId: "reasoning_effort",
-          levels: ["low", "high", "max"],
-        },
-        extraEnv: {
-          CODEX_HOME: ollamaCloudCodexHome,
-          OLLAMA_CLOUD_API_KEY: ollamaCloudApiKey,
-        },
-        sessionsRoot: path.join(ollamaCloudCodexHome, "sessions"),
-      })
-    : undefined;
-
-
+  const quotaProfiles = controllerQuotaProfiles(config, logger);
   // Agent-facing seam-MCP surface (#24). The shared HTTP server binds its port
   // later (after the adapter is up), so the router gets the token registry now
   // and a late-bound port getter; per-session injection happens at runtime start.
@@ -548,25 +299,17 @@ async function main(): Promise<void> {
   let stopPermissionBridgeRecovery: (() => void) | undefined;
   let stopCatalogEnrichmentRefresh: (() => void) | undefined;
 
-  const registered: AgentProfile[] = [...(copilotEnabled ? [copilot, ...extraCopilots] : []), claude, ...extraClaudes, ...(claudeVertex ? [claudeVertex] : []), ...(agy ? [agy] : []), ...(codex ? [codex] : []), ...(grok ? [grok] : []), ...(zai ? [zai] : []), ...(ollamaCloud ? [ollamaCloud] : [])];
-  const profiles: AgentProfile[] = registered;
-  const localCatalogProfiles = () =>
-    profiles.filter((profile) => !isAgentLocationDenied(profile.id, LOCAL_LOCATION, config.AGENT_LOCATION_DENY));
-  const mainClaudeApiCatalogEnabled = Boolean(
-    process.env.CLAUDE_CATALOG_API_KEY?.trim() &&
-    localCatalogProfiles().some((profile) => profile.id === "claude")
-  );
   const modelCatalog = new ModelCatalogService({
     store: modelCatalogStore,
     hideList: new ModelHideList(path.join(config.DATA_DIR, "model-hide.json"), logger),
     logger: logger.child({ mod: "model-catalog" }),
-    configuredLocalAgentIds: () => localCatalogProfiles().map((profile) => profile.id),
     bindings: () => {
-      const bindings = localCatalogProfiles().map((profile) => ({ agentId: profile.id, location: "local" }));
+      const bindings: Array<{ agentId: string; location: string }> = [];
       // Re-read durable observations on each orchestration pass so a
       // remote-only adapter first seen during this process remains part of
       // manual/scheduled refresh-all after its bridge disconnects.
       bindings.push(...modelCatalogStore.loadCurrentObservations()
+        .filter(({ location }) => !bridgeHub?.get(location))
         .map(({ agentId, location }) => ({ agentId, location })));
       for (const bridge of bridgeHub?.listConnected() ?? []) {
         for (const [agentId, info] of bridge.agents) {
@@ -581,7 +324,6 @@ async function main(): Promise<void> {
     isOnline: ({ location }) => Boolean(bridgeHub?.isBridgeReady(location)),
     withheld: ({ agentId, location }) =>
       isAgentLocationDenied(agentId, location, config.AGENT_LOCATION_DENY) ? "is withheld by AGENT_LOCATION_DENY" : null,
-    source: (binding) => mainClaudeCatalogSource(binding, mainClaudeApiCatalogEnabled),
     scope: async ({ agentId, location }) => {
       if (!bridgeHub) throw new Error("bridge hub is not ready");
       return await bridgeHub.rpc(location, "describeModelCatalog", {}, agentId) as ReturnType<AgentProfile["catalog"]["scope"]>;
@@ -595,15 +337,33 @@ async function main(): Promise<void> {
   const router = new SessionRouter({
     logger,
     store,
-    profiles,
+    profiles: [],
     modelCatalog,
+    claudeSessionOptions: {
+      thinkingDisplay: config.CLAUDE_THINKING_DISPLAY,
+      compactionTokenThreshold: config.CLAUDE_COMPACTION_TOKEN_THRESHOLD,
+    },
+    profileMetadata: (id, location) => bridgeHub?.get(location)?.agents.get(id)?.metadata,
+    profileIds: location => bridgeHub?.installedAgentsByHost().get(location)
+      ?? modelCatalog.knownBindings().filter(binding => binding.location === location).map(binding => binding.agentId),
+    profileCatalog: (id, location) => {
+      return {
+        scope: () => {
+          const scope = bridgeHub?.get(location)?.agents.get(id)?.metadata?.catalogScope
+            ?? modelCatalog.lookup({ agentId: id, location }).snapshot?.candidate.scope;
+          if (!scope) throw new Error(`catalog scope for ${id}@${location} is not available yet`);
+          return scope;
+        },
+        fetch: async () => await bridgeHub!.fetchModelCatalog(location, id) as AdapterCatalogCandidate,
+      };
+    },
+    profileSessions: (id, location) => {
+      const capabilities = bridgeHub?.get(location)?.agents.get(id)?.metadata?.sessionManagement;
+      return capabilities ? remoteSessionManager(bridgeHub, location, id, capabilities) : undefined;
+    },
     modelMetadata: modelMetadataStore,
-    ollamaCloudEnabled: config.OLLAMA_CLOUD_ENABLED,
     defaultAgentId: config.DEFAULT_AGENT,
     defaultAgentDisabledReason: config.defaultAgentDisabledReason,
-    localAgentErrors: new Map(configDisabledFeatures(config)
-      .filter(({ feature }) => feature === "agy" || feature === "codex")
-      .map(({ feature, cause }) => [feature, cause])),
     agyMigrationErrors,
     defaultModel: config.DEFAULT_MODEL,
     // Legacy DEFAULT_AUTO_APPROVE=true overrides the policy default to "always".
@@ -631,7 +391,6 @@ async function main(): Promise<void> {
                 return undefined;
               }
             },
-            getLoopbackUrl: () => `http://127.0.0.1:${config.HEALTH_PORT}/mcp`,
             getPublicUrl: () => bridgeHub?.mcpUrlForRemote(),
             isBridgeSession: (sessionId) => !!bridgeHub?.sessionBridgeId(sessionId),
             mcpServersForBridgeSpawn: (sessionId) =>
@@ -722,7 +481,7 @@ async function main(): Promise<void> {
   await plugins.loadBuiltins([{ id: "quota", load: async () => {
     const { createUsageProviderPort } = await import("./core/quota/usage-provider.js");
     const { createQuotaPlugin } = await import("./plugins/quota/index.js");
-    const usage = createUsageProviderPort({ profiles: router.listProfiles(), agyRuntime, grokCliPath: config.GROK_CLI_PATH,
+    const usage = createUsageProviderPort({ profiles: quotaProfiles.profiles, agyRuntime: quotaProfiles.agyRuntime, grokCliPath: config.GROK_CLI_PATH,
       ollamaUsageCliPath: config.OLLAMA_USAGE_CLI_PATH, ollamaCloudEnabled: config.OLLAMA_CLOUD_ENABLED,
       liveRequest: id => { const runtime = router.getRuntime(id); return runtime ? (method, params) => runtime.request(method, params) : undefined; } });
     return createQuotaPlugin({ usage, bindings: usage.bindings, resolve: (threadId, parentId) => {
@@ -745,7 +504,6 @@ async function main(): Promise<void> {
     store,
     renderer,
     modelCatalog,
-    agyRuntime,
     refreshModelIntelligence: (forceSources) => modelIntelligenceManager.refresh({ forceSources }),
   });
 
@@ -888,7 +646,7 @@ async function main(): Promise<void> {
       key: config.SEAM_TEST_DRIVER_KEY,
       inventory: () => {
         const identity = readGitIdentity();
-        const configured = router.listProfiles().map((profile) => profile.id).sort();
+        const configured = [...new Set((bridgeHub?.listConnected() ?? []).flatMap(bridge => [...bridge.agents.keys()]))].sort();
         return {
           controllerInstanceId,
           ...identity,
@@ -969,7 +727,7 @@ async function main(): Promise<void> {
     ? new SelfCanaryRunner({
         dataDir: config.DATA_DIR,
         inventory: () => {
-          const configured = router.listProfiles().map((profile) => profile.id).sort();
+          const configured = [...new Set(bridgeHub!.listConnected().flatMap(bridge => [...bridge.agents.keys()]))].sort();
           return {
             bridges: bridgeHub!.listConnected().map((bridge) => ({
               host: bridge.bridgeId,

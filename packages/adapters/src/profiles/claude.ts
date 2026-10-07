@@ -462,49 +462,9 @@ export function makeClaudeProfile(opts: {
       });
     },
     submissionSignals: "claude_sdk",
+    claudeSessionOptions: { compactionTokenThreshold: opts.compactionTokenThreshold, thinkingDisplay },
     newSessionMeta(modelId?: string, effort?: string) {
-      const model = modelId || opts.defaultModel;
-      const options: Record<string, unknown> = {};
-
-      let threshold = opts.compactionTokenThreshold;
-      if (threshold && threshold > 0) {
-        if (threshold <= 1.0) {
-          const cw = getClaudeContextWindow(model);
-          threshold = Math.round(cw * threshold);
-        }
-        options.compactionControl = {
-          enabled: true,
-          contextTokenThreshold: threshold,
-        };
-      }
-
-      // Reasoning effort is injected via _meta.claudeCode.options.effort, which
-      // claude-agent-acp spreads straight into the SDK query Options.effort.
-      // Seam uses this path for both new and resumed sessions. The 0.73.0
-      // wrapper also exposes an ACP effort config option, but the query option
-      // keeps stored thread configuration independent of wrapper UI state.
-      // Verify applied values from the assistant JSONL entry's top-level
-      // `effort` field; session/new no longer rejects arbitrary strings.
-      if (effort && effort !== "default") {
-        options.effort = effort;
-      }
-
-      // Thinking display: adaptive-thinking models (Opus 4.6+) default to
-      // "omitted" — their reasoning never surfaces. Forwarding an adaptive
-      // ThinkingConfig with display lets us show a summary. Verified end-to-end:
-      // `thinking:{type:'adaptive',display:'summarized'}` flips Opus 4.8 from
-      // empty thought chunks to readable summarized reasoning. Only applied to
-      // adaptive models — Sonnet/Haiku stream thinking via the budget path.
-      if (thinkingDisplay && isAdaptiveThinkingModel(model)) {
-        options.thinking = { type: "adaptive", display: thinkingDisplay };
-      }
-
-      // #536: use the supported feed, not a wrapper patch. The receiver retains
-      // only lifecycle enums and message IDs; never raw SDK content. These
-      // events do not count as output or change the existing retry heuristic.
-      return { claudeCode: { options,
-        emitRawSDKMessages: [{ type: "command_lifecycle" }, { type: "stream_event" }],
-      } };
+      return claudeSessionMetadata(opts, modelId, effort);
     },
     async whoami() {
       if (identityCache !== undefined) return identityCache;
@@ -1195,12 +1155,57 @@ function withClaudeContextLimits<T extends { modelId: string; name: string; cont
   });
 }
 
-/** Whether a model uses ADAPTIVE thinking (the SDK's ThinkingConfig marks this
- *  "Opus 4.6+"), which is the family whose thinking display defaults to
- *  "omitted". Only these take a `thinking:{type:'adaptive',display}` override;
- *  Sonnet/Haiku stream thinking via the budget path and are left untouched.
- *   - `default` → latest Opus on Max → adaptive.
- *   - claude-opus-4-6 and newer (4-6, 4-7, 4-8, … 4-10+, 5, …); 4-5 and older are not. */
+/** Same portable session metadata on a host adapter and its controller client. */
+export function claudeSessionMetadata(
+  opts: { defaultModel: string; compactionTokenThreshold?: number; thinkingDisplay?: "summarized" | "omitted" },
+  modelId?: string, effort?: string,
+): Record<string, unknown> {
+  const model = modelId || opts.defaultModel;
+  const thinkingDisplay = opts.thinkingDisplay;
+  const options: Record<string, unknown> = {};
+
+  let threshold = opts.compactionTokenThreshold;
+  if (threshold && threshold > 0) {
+    if (threshold <= 1.0) {
+      const cw = getClaudeContextWindow(model);
+      threshold = Math.round(cw * threshold);
+    }
+    options.compactionControl = {
+      enabled: true,
+      contextTokenThreshold: threshold,
+    };
+  }
+
+  // Reasoning effort is injected via _meta.claudeCode.options.effort, which
+  // claude-agent-acp spreads straight into the SDK query Options.effort.
+  // Seam uses this path for both new and resumed sessions. The 0.73.0
+  // wrapper also exposes an ACP effort config option, but the query option
+  // keeps stored thread configuration independent of wrapper UI state.
+  // Verify applied values from the assistant JSONL entry's top-level
+  // `effort` field; session/new no longer rejects arbitrary strings.
+  if (effort && effort !== "default") {
+    options.effort = effort;
+  }
+
+  // Thinking display: adaptive-thinking models (Opus 4.6+) default to
+  // "omitted" — their reasoning never surfaces. Forwarding an adaptive
+  // ThinkingConfig with display lets us show a summary. Verified end-to-end:
+  // `thinking:{type:'adaptive',display:'summarized'}` flips Opus 4.8 from
+  // empty thought chunks to readable summarized reasoning. Only applied to
+  // adaptive models — Sonnet/Haiku stream thinking via the budget path.
+  if (thinkingDisplay && isAdaptiveThinkingModel(model)) {
+    options.thinking = { type: "adaptive", display: thinkingDisplay };
+  }
+
+  // #536: use the supported feed, not a wrapper patch. The receiver retains
+  // only lifecycle enums and message IDs; never raw SDK content. These
+  // events do not count as output or change the existing retry heuristic.
+  return { claudeCode: { options,
+    emitRawSDKMessages: [{ type: "command_lifecycle" }, { type: "stream_event" }],
+  } };
+}
+
+/** Whether the model takes an adaptive thinking display override. */
 function isAdaptiveThinkingModel(modelId?: string): boolean {
   if (!modelId) return false;
   const m = modelId.toLowerCase().trim();

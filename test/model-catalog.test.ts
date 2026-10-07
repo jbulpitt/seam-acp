@@ -18,8 +18,6 @@ import { SessionRouter } from "../packages/core/src/core/session-router.js";
 import { catalogEffortChoices } from "../packages/core/src/platforms/discord/orchestrator.js";
 import type { AgentProfile } from "@seam/adapters";
 import { localBridgeWiring } from "./local-bridge-fixture.js";
-import { mainClaudeCatalogSource } from "../packages/core/src/agents/claude-catalog-source.js";
-
 const logger = pino({ level: "silent" }) as unknown as Logger;
 const dirs: string[] = [];
 
@@ -146,59 +144,6 @@ describe("ModelCatalogService", () => {
     expect(fetched.sort()).toEqual(["claude@local", "copilot@remote-a"]);
     expect(all.find((r) => r.binding.location === "remote-a")?.result).toBe("published");
     expect(catalog.lookup(withheld).snapshot).toBeNull();
-  });
-
-  it("uses the main Anthropic API catalog for every ordinary Claude bridge binding", async () => {
-    const opened = db();
-    const local = { agentId: "claude", location: "local" };
-    const remote = { agentId: "claude", location: "macos-b" };
-    const vertex = { agentId: "claude-vertex", location: "macos-b" };
-    const fetched: string[] = [];
-    let claudeIds = ["default", "claude-opus-5-5"];
-    const catalog = service({
-      store: opened.store,
-      bindings: [local, remote, vertex],
-      source: (binding) => mainClaudeCatalogSource(binding, true),
-      online: (binding) => binding.location === "local" || binding.agentId === "claude-vertex",
-      scope: (binding) => shared(
-        binding.agentId === "claude" ? claudeIds : ["vertex-model"],
-        binding.agentId,
-      ).scope,
-      fetch: async (binding) => {
-        fetched.push(`${binding.agentId}@${binding.location}`);
-        return shared(
-          binding.agentId === "claude" ? claudeIds : ["vertex-model"],
-          binding.agentId,
-        );
-      },
-    });
-
-    await catalog.refresh(local);
-    const remoteRefresh = await catalog.refresh(remote);
-    await catalog.refresh(vertex);
-
-    expect(remoteRefresh.mode).toBe("shared");
-    expect(catalog.models(remote).map((entry) => entry.id)).toEqual([
-      "default",
-      "claude-opus-5-5",
-    ]);
-    expect(catalog.lookup(remote).state).toBe("stale");
-    // Once attached, the bridge reads the same generation. It does not need
-    // another bridge refresh when the controller's API catalog advances.
-    claudeIds = [...claudeIds, "claude-sonnet-5-5"];
-    await catalog.refresh(local);
-    expect(catalog.models(remote).map((entry) => entry.id)).toEqual([
-      "default",
-      "claude-opus-5-5",
-      "claude-sonnet-5-5",
-    ]);
-    expect(fetched).toEqual([
-      "claude@local",
-      "claude@local",
-      "claude-vertex@macos-b",
-      "claude@local",
-    ]);
-    expect(catalog.models(vertex).map((entry) => entry.id)).toEqual(["vertex-model"]);
   });
 
   it("recovers quarantined Claude bindings independently without replacing default or effort", async () => {
@@ -684,78 +629,19 @@ describe("ModelCatalogService", () => {
     opened.store.close();
   });
 
-  it("retires only a positively removed local adapter and preserves an offline remote observation", async () => {
+  it("preserves offline observations for every host without controller profile retirement", async () => {
     const opened = db();
-    const removedLocal = { agentId: "agy-package", location: "local" };
-    const offlineRemote = { agentId: "agy", location: "portable-d" };
-    const seeded = service({
-      store: opened.store,
-      bindings: [removedLocal, offlineRemote],
-      fetch: async (binding) => candidate([binding.location === "local" ? "legacy" : "remote-live"]),
+    const bindings = [{ agentId: "agy-package", location: "local" }, { agentId: "agy", location: "portable-d" }];
+    const seeded = service({ store: opened.store, bindings, fetch: async () => candidate(["legacy"]) });
+    for (const binding of bindings) await seeded.refresh(binding);
+    const restarted = new ModelCatalogService({
+      store: opened.store, logger, bindings: () => bindings, isOnline: () => false,
+      fetch: async () => { throw new Error("offline fixture"); },
     });
-    expect((await seeded.refresh(removedLocal)).result).toBe("published");
-    expect((await seeded.refresh(offlineRemote)).result).toBe("published");
-    const remoteGeneration = seeded.lookup(offlineRemote).snapshot!.generation;
-
-    const currentBindings = () => opened.store.loadCurrentObservations()
-      .map(({ agentId, location }) => ({ agentId, location }));
-    const afterRemoval = new ModelCatalogService({
-      store: opened.store,
-      logger,
-      configuredLocalAgentIds: () => [],
-      bindings: currentBindings,
-      fetch: async () => { throw new Error("offline fixtures must remain cache-only"); },
-      isOnline: () => false,
-      now: () => new Date("2026-09-12T12:34:56.000Z"),
-      refreshCron: "0 0 1 1 *",
-    });
-    const observations = new Map(opened.store.loadObservations()
-      .map((row) => [row.bindingKey, row]));
-
-    // The removed local adapter is the only uncertain capability. Its row is
-    // retained for audit, but it no longer participates in the live fleet.
-    expect(observations.get("agy-package@local")).toMatchObject({
-      retiredAt: "2026-09-12T12:34:56.000Z",
-      retirementReason: "local adapter no longer configured",
-    });
-    expect(afterRemoval.knownBindings()).not.toContainEqual(removedLocal);
-    expect(afterRemoval.fleetSnapshot()).toContainEqual({
-      binding: removedLocal,
-      state: "retired",
-      snapshot: null,
-    });
-    expect(afterRemoval.availableModels().some(({ binding }) =>
-      binding.agentId === "agy-package" && binding.location === "local"
-    )).toBe(false);
-
-    // A remote host's absence from this server's local profiles proves
-    // nothing. Even after arbitrary downtime its durable fleet evidence stays
-    // current and serves as a stale last-known-good snapshot.
-    expect(observations.get("agy@portable-d")).toMatchObject({
-      retiredAt: null,
-      retirementReason: null,
-    });
-    expect(afterRemoval.knownBindings()).toContainEqual(offlineRemote);
-    expect(afterRemoval.lookup(offlineRemote)).toMatchObject({
-      state: "stale",
-      snapshot: { generation: remoteGeneration },
-    });
-    expect(afterRemoval.models(offlineRemote).map((entry) => entry.id)).toEqual(["remote-live"]);
-
-    // Marking is reversible: a later explicit local configuration is positive
-    // evidence that this binding is current again; no catalog bytes were lost.
-    const restored = new ModelCatalogService({
-      store: opened.store,
-      logger,
-      configuredLocalAgentIds: () => ["agy-package"],
-      bindings: currentBindings,
-      fetch: async () => { throw new Error("restore must remain cache-only"); },
-      refreshCron: "0 0 1 1 *",
-    });
-    expect(opened.store.loadObservations().find((row) => row.bindingKey === "agy-package@local"))
-      .toMatchObject({ retiredAt: null, retirementReason: null });
-    expect(restored.knownBindings()).toContainEqual(removedLocal);
-    expect(restored.models(removedLocal).map((entry) => entry.id)).toEqual(["legacy"]);
+    for (const binding of bindings) {
+      expect(restarted.knownBindings()).toContainEqual(binding);
+      expect(restarted.lookup(binding)).toMatchObject({ state: "stale", snapshot: { candidate: { models: [{ id: "legacy" }] } } });
+    }
     opened.store.close();
   });
 

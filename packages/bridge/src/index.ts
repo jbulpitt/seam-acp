@@ -290,7 +290,9 @@ async function makeSlotManager(opts: {
             ...(releaseReceipt ? { release: releaseReceipt.helloMetadata() } : {}),
           }))
         );
-      } catch { /* ws may not be open yet — best effort */ }
+      } catch (error) {
+        console.error("[bridge] hello failed:", error);
+      }
     }
   }
 

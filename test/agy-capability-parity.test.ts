@@ -97,20 +97,17 @@ describe("#264 MCP: a remote agent is never handed the controller's loopback", (
     ["ws://127.0.0.53:8787", "a non-.1 address in 127.0.0.0/8"],
     ["http://[::1]:8787", "IPv6 loopback"],
   ])("refuses a configured %s base and still returns a usable URL", (base) => {
-    const url = resolveReachableMcpUrl({ port: 8787, healthPort: 8080, publicBaseUrl: base, remote: true });
+    const url = resolveReachableMcpUrl({ port: 8787, healthPort: 8080, publicBaseUrl: base });
     expect(isLoopbackHost(new URL(url).hostname)).toBe(false);
     // Blast radius: the bad URL is refused, the capability is not. The agent
     // still gets an MCP entry from discovery rather than losing its tools.
     expect(url).toMatch(/\/mcp$/);
   });
 
-  it("still uses a legitimate configured base, and still uses loopback locally", () => {
+  it("uses a legitimate configured base", () => {
     expect(
-      resolveReachableMcpUrl({ port: 8787, publicBaseUrl: "https://hub.example", remote: true })
+      resolveReachableMcpUrl({ port: 8787, publicBaseUrl: "https://hub.example" })
     ).toBe("https://hub.example/mcp");
-    // Local spawns are on the same host, where 127.0.0.1 is the correct answer.
-    expect(resolveReachableMcpUrl({ port: 8787, publicBaseUrl: "http://localhost:1", remote: false }))
-      .toBe("http://127.0.0.1:8787/mcp");
   });
 
   it("classifies loopback hosts without over-reaching", () => {

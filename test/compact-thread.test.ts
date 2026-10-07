@@ -377,12 +377,6 @@ describe("Orchestrator.compactThread", () => {
     expect(t.sessionCalls).toHaveLength(0);
   });
 
-  it("refuses when the agent profile has no session manager", async () => {
-    const t = makeOrch({ profile: { id: "x", displayName: "NoMgr", sessionManager: undefined } });
-    await expect(t.orch.compactThread(record())).rejects.toThrow(/does not support session management/);
-    expect(t.seedCalls).toHaveLength(0);
-  });
-
   it("refuses when the thread has no active session and none is given", async () => {
     const t = makeOrch();
     await expect(t.orch.compactThread(record({ acpSessionId: "" }))).rejects.toThrow(/no active session/);

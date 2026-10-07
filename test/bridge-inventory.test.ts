@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import {
   inventoryFromAdapters,
   loadHostAdapterInventory,
@@ -10,8 +10,58 @@ import {
 } from "../packages/bridge/src/inventory.js";
 import { createManagedAgyFixture } from "./helpers/agy-runtime-fixture.js";
 import { copilotProbeMcpArgs } from "../packages/adapters/src/profiles/copilot.js";
+import { EventEmitter } from "node:events";
+import { pino } from "pino";
+import { BridgeHub } from "../packages/core/src/core/bridge-hub.js";
+import { bridgeHello } from "../packages/bridge/src/hello.js";
+import { dispatchBridgeRpc } from "../packages/bridge/src/rpc.js";
+import { PROTOCOL_VERSION } from "@seam/adapters";
 
 describe("loadHostAdapters", () => {
+  it("keeps the host and its other agents ready when Grok's subscription scope throws", async () => {
+    const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "seam-inventory-scope-"));
+    const errorLog = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const env = {
+        HOME: temporary, PATH: process.env.PATH, AGY_ENABLED: "false",
+        CLAUDE_CLI_PATH: process.execPath, GROK_CLI_PATH: process.execPath,
+        GROK_CATALOG_MODE: "subscription",
+      };
+      const adapters = loadHostAdapters(process.execPath, { env, exists: bin => bin === process.execPath });
+      const agents = inventoryFromAdapters(adapters, process.execPath, env);
+      const cause = "Grok subscription account identity is unavailable";
+      expect(agents.map(row => row.agentId)).toEqual(["copilot", "claude", "grok"]);
+      expect(agents.find(row => row.agentId === "grok")).toMatchObject({
+        installed: true, ready: false, reason: cause,
+      });
+      expect(agents.find(row => row.agentId === "grok")!.metadata).not.toHaveProperty("catalogScope");
+      expect(errorLog).toHaveBeenCalledWith(`[bridge] adapter grok catalog scope failed: ${cause}`);
+
+      const mux = {
+        helloAck: vi.fn(),
+        rpc: vi.fn(async (method, params, options) => dispatchBridgeRpc(method, params, options.agentId, {
+          adapters, workspaceRoot: temporary, cwd: temporary,
+        })),
+      };
+      const hub = Object.assign(Object.create(BridgeHub.prototype), {
+        connections: new Map(), readyEvents: new EventEmitter(), logger: pino({ level: "silent" }),
+      });
+      await hub.onHello("local", mux, bridgeHello({
+        bridgeId: "local", instanceId: "scope-fixture", protocolVersion: PROTOCOL_VERSION,
+        host: { os: "linux", arch: "x64" }, agents,
+      }));
+      expect(mux.helloAck).toHaveBeenCalledWith(true);
+      expect(mux.rpc.mock.calls.map(call => call[2].agentId)).toEqual(["copilot", "claude"]);
+      expect(hub.listConnected()[0].agents.get("grok")).toMatchObject({ ready: false, reason: cause });
+      expect(hub.listConnected()[0].agents.get("claude")).toMatchObject({ ready: true });
+      expect(hub.listConnected()[0].agents.get("copilot")).toMatchObject({ ready: true });
+      expect(hub.isBridgeReady("local")).toBe(true);
+    } finally {
+      errorLog.mockRestore();
+      fs.rmSync(temporary, { recursive: true, force: true });
+    }
+  });
+
   it("uses current Copilot and Codex defaults without model overrides", () => {
     const adapters = loadHostAdapters("copilot", {
       env: { PATH: process.env.PATH, AGY_ENABLED: "false" },

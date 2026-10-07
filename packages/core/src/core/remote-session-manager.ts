@@ -1,4 +1,4 @@
-import type { ISessionManager, SessionSummary } from "@seam/adapters";
+import { SESSION_HISTORY_CHUNK_BYTES, type SessionHistoryChunk, type ISessionManager, type SessionSummary } from "@seam/adapters";
 import type { BridgeHub } from "./bridge-hub.js";
 
 type SessionRpc = Pick<BridgeHub, "rpc">;
@@ -7,7 +7,8 @@ type SessionRpc = Pick<BridgeHub, "rpc">;
 export function remoteSessionManager(
   hub: SessionRpc | undefined,
   location: string,
-  agentId: string
+  agentId: string,
+  capabilities?: { history: boolean; repair: boolean },
 ): ISessionManager {
   const call = async <T>(method: string, params: unknown): Promise<T> => {
     try {
@@ -22,6 +23,21 @@ export function remoteSessionManager(
   };
 
   return {
+    ...(capabilities?.history ? {
+      getHistory: async (cwd: string, sessionId: string) => {
+        const chunks: Buffer[] = [];
+        let offset = 0;
+        for (;;) {
+          const chunk = await call<SessionHistoryChunk | null>("getHistory", { cwd, sessionId, offset, length: SESSION_HISTORY_CHUNK_BYTES });
+          if (!chunk) return undefined;
+          chunks.push(Buffer.from(chunk.bytesBase64, "base64"));
+          if (chunk.eof) return Buffer.concat(chunks).toString("utf8");
+          offset = chunk.nextOffset;
+        }
+      },
+    } : {}),
+    ...(capabilities?.repair ? { repairSession: async (cwd: string, sessionId: string) => { await call("repairSession", { cwd, sessionId }); } } : {}),
+    getUsage: (cwd, sessionId, newerThanMs) => call("getUsage", { cwd, sessionId, newerThanMs }),
     listSessions: (cwd) => call<SessionSummary[]>("listSessions", { cwd }),
     getTranscript: (cwd, sessionId) =>
       call<string>("getTranscript", { cwd, sessionId }),

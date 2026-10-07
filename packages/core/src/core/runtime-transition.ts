@@ -8,7 +8,7 @@ import type { Logger } from "../lib/logger.js";
 import type { MutationActor } from "./config-mutation.js";
 import { ConfigApplyPlan, type TargetIdentityChanges } from "./config-apply-plan.js";
 import { bindSessionLocation } from "./location-bind.js";
-import { parseAgentAtLocation, formatAgentAtLocation, LOCAL_LOCATION } from "./location.js";
+import { parseAgentAtLocation, formatAgentAtLocation } from "./location.js";
 
 import type { AgentProfile } from "@seam/adapters";
 import {
@@ -30,7 +30,6 @@ import {
 } from "./fast-mode.js";
 import type { SessionConfigState, SessionRecord } from "./types.js";
 import { assessModelSelection, type CatalogBinding, type ModelCatalogService, type ModelVerification } from "./model-catalog/service.js";
-import { isLocalLocation } from "./location.js";
 
 export interface ConfigureThreadInput {
   agent?: string;
@@ -165,7 +164,6 @@ export interface ThreadSessionControlDeps {
     describeConfig(record: SessionRecord, selection?: ConfigResolution): ConfigDescription;
     getProfile(agentId: string, location?: string): AgentProfile | undefined;
     assertAgentAllowedForRecord(record: SessionRecord, agentId: string): void;
-    parkedSelectMessage?(agentId: string): string | null;
     unregisteredAgentMessage?(agentId: string, fallback: string): string;
     getOrStartRuntime(record: SessionRecord): Promise<SessionControlRuntime>;
     invalidate(
@@ -205,7 +203,6 @@ export interface RuntimeSettingsDeps {
   bridgeHub?: BridgeHub;
   identityCommitted: (sessionId?: string) => Promise<void>;
   unregisteredAgentMessage: (id: string, fallback: string) => string;
-  parkedSelectMessage: (id: string) => string | null;
   persistConfig: (record: SessionRecord, cfg: SessionConfigState) => void;
 }
 
@@ -340,7 +337,6 @@ export class RuntimeTransition {
   private get bridgeHub() { return this.settings!.bridgeHub; }
   private get identityEffects() { return { flush: this.settings!.identityCommitted }; }
   private refuseUnregisteredAgent(id: string, fallback: string) { return this.settings!.unregisteredAgentMessage(id, fallback); }
-  private parkedSelectRefusal(id: string) { return this.settings!.parkedSelectMessage(id); }
   private persistConfig(record: SessionRecord, cfg: SessionConfigState): void {
     this.settings!.persistConfig(record, cfg);
   }
@@ -376,10 +372,6 @@ export class RuntimeTransition {
     } catch (err) {
       return { ok: false, error: err instanceof Error ? err.message : String(err) };
     }
-    const parked = isLocalLocation(location)
-      ? this.deps.router.parkedSelectMessage?.(nextAgent)
-      : null;
-    if (parked) return { ok: false, error: parked };
     const profile = this.deps.router.getProfile(nextAgent, location);
     if (!profile) {
       const fallback = `Unknown agent "${nextAgent}".`;
@@ -562,10 +554,6 @@ export class RuntimeTransition {
     } catch (err) {
       return { ok: false, error: err instanceof Error ? err.message : String(err) };
     }
-    const parked = isLocalLocation(location)
-      ? this.deps.router.parkedSelectMessage?.(nextAgentId)
-      : null;
-    if (parked) return { ok: false, error: parked };
     const profile = this.deps.router.getProfile(nextAgentId, location);
     if (!profile) {
       const fallback = `Unknown agent "${nextAgentId}".`;
@@ -1060,11 +1048,6 @@ export class RuntimeTransition {
         this.refuseUnregisteredAgent(parsed.agentId, `Unknown agent \`${parsed.agentId}\` at \`${nextLocation}\`.`)
       );
     }
-    const parkedSelect = nextLocation === LOCAL_LOCATION
-      ? this.parkedSelectRefusal(parsed.agentId)
-      : null;
-    if (parkedSelect) return fail(parkedSelect);
-
     const sameAgent = describedBefore.agent.value === parsed.agentId;
     const sameLocation = currentLocation === nextLocation;
     if (sameAgent && sameLocation) {

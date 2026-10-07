@@ -35,11 +35,6 @@ export interface CatalogObservationRow {
   retirementReason?: string | null;
 }
 
-export interface CatalogObservationReconciliation {
-  retired: string[];
-  restored: string[];
-}
-
 export interface CatalogRefreshStatusRow {
   bindingKey: string;
   attemptedAt: string;
@@ -235,51 +230,6 @@ export class ModelCatalogStore {
   /** Observations that still describe a configured binding or a remote host. */
   loadCurrentObservations(): CatalogObservationRow[] {
     return this.loadObservations().filter((row) => row.retiredAt == null);
-  }
-
-  /**
-   * Reconcile only the local configuration boundary we can prove.
-   *
-   * A missing `@local` profile means that one local adapter was removed, as
-   * happened to `agy-package` in #377. We mark that observation so it stops
-   * participating in refresh and fleet selection while its audit evidence
-   * remains intact. Every non-local observation keeps working regardless of
-   * age or connectivity: absence from this server's profile list says nothing
-   * about an offline bridge, and deleting or retiring it would silently blind
-   * the fleet view (#381).
-   */
-  reconcileConfiguredLocalAgents(
-    configuredAgentIds: ReadonlySet<string>,
-    now = new Date().toISOString(),
-  ): CatalogObservationReconciliation {
-    return this.db.transaction(() => {
-      const rows = this.db.prepare(`
-        SELECT binding_key, agent_id, retired_at
-        FROM model_catalog_observations
-        WHERE location = 'local'
-        ORDER BY binding_key
-      `).all() as Array<{ binding_key: string; agent_id: string; retired_at: string | null }>;
-      const retired: string[] = [];
-      const restored: string[] = [];
-      const retire = this.db.prepare(`
-        UPDATE model_catalog_observations
-        SET retired_at = ?, retirement_reason = 'local adapter no longer configured'
-        WHERE binding_key = ? AND retired_at IS NULL
-      `);
-      const restore = this.db.prepare(`
-        UPDATE model_catalog_observations
-        SET retired_at = NULL, retirement_reason = NULL
-        WHERE binding_key = ? AND retired_at IS NOT NULL
-      `);
-      for (const row of rows) {
-        if (configuredAgentIds.has(row.agent_id)) {
-          if (restore.run(row.binding_key).changes === 1) restored.push(row.binding_key);
-        } else if (retire.run(now, row.binding_key).changes === 1) {
-          retired.push(row.binding_key);
-        }
-      }
-      return { retired, restored };
-    })();
   }
 
   getRefreshStatus(bindingKey: string): CatalogRefreshStatusRow | null {

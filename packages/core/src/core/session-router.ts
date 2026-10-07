@@ -3,6 +3,7 @@ import { AgentRuntime, type BridgeHealthSource } from "../agents/agent-runtime.j
 import {
   asRemoteCatalogAdapter,
   type AgentProfile,
+  type AgentClientMetadata,
   type CatalogModelEvidence,
 } from "@seam/adapters";
 import type { Logger } from "../lib/logger.js";
@@ -12,9 +13,9 @@ import { defaultSessionConfig, resolvePermissionMode } from "./types.js";
 import { makeSessionId } from "./session-store.js";
 import { resolveChannelPreset, resolveThreadLocation } from "../config.js";
 import type { ChannelPreset, ThreadPreset } from "../config.js";
-import { parkedAgentMessage } from "./parked-agents.js";
 import { retiredAgentMessage } from "./retired-agents.js";
 import type { ModelCatalogService } from "./model-catalog/service.js";
+import { controllerMetadataAdapter } from "../agents/controller-metadata.js";
 import type { CatalogEffort } from "@seam/adapters";
 
 import type { SeamTokenRegistry } from "./mcp/token-registry.js";
@@ -34,8 +35,6 @@ import {
   DEFAULT_REMOTE_RUNG1_POLICY,
   type MuxHandle,
 } from "./remote-spawn.js";
-import { bindingKey } from "./model-catalog/service.js";
-import { isLocalLocation, LOCAL_LOCATION } from "./location.js";
 import { planModelFallbacks, type ModelFallbackPlan } from "./model-fallback.js";
 import type { ModelMetadataStore } from "./model-metadata/store.js";
 import { matchesContextBudget, validContextUsage } from "./context-budget.js";
@@ -54,13 +53,10 @@ export class DefaultAgentUnavailableError extends Error {
  * Discord session, not the ACP subprocess — start reuses it (reuseToken) so
  * Grok HTTP MCP reconnects after redeploy still resolve. `getPort` is
  * late-bound because the shared server binds after the router is constructed.
- * Prefer `getLoopbackUrl` (health `/mcp` proxy) over the ephemeral bind port.
  */
 export interface SeamMcpWiring {
   registry: SeamTokenRegistry;
   getPort: () => number | undefined;
-  /** Stable loopback MCP URL (health `/mcp` proxy). Prefer over the ephemeral bind port. */
-  getLoopbackUrl?: () => string | undefined;
   /** Full MCP URL for a non-local bridge spawn; never 127.0.0.1 when that is local-only. */
   getPublicUrl?: () => string | undefined;
   /** True when this session's agent process runs on a bridge (#84/#575). */
@@ -335,8 +331,12 @@ export class SessionRouter {
   private readonly logger: Logger;
   private readonly store: SessionStore;
   private readonly profileById: Map<string, AgentProfile>;
-  private readonly remoteProfiles = new Map<string, { generation: number; profile: AgentProfile }>();
+  private readonly profileIds?: (location: string) => Iterable<string>;
+  private readonly profileCatalog?: (id: string, location: string) => AgentProfile["catalog"] | undefined;
+  private readonly profileSessions?: (id: string, location: string) => AgentProfile["sessionManager"];
   private readonly modelCatalog: ModelCatalogService;
+  private readonly profileMetadata?: (id: string, location: string) => AgentClientMetadata | undefined;
+  private readonly claudeSessionOptions?: AgentClientMetadata["claudeSessionOptions"];
   private readonly modelMetadata?: Pick<ModelMetadataStore, "getAll">;
   private readonly defaultAgentId: string;
   private readonly defaultPermissionMode: PermissionPolicyMode;
@@ -344,7 +344,6 @@ export class SessionRouter {
   private readonly seamMcp?: SeamMcpWiring;
   private readonly executionBridge?: ExecutionBridgeWiring;
   private readonly defaultAgentDisabledReason?: string;
-  private readonly localAgentErrors: ReadonlyMap<string, string>;
   private readonly agyMigrationErrors: ReadonlyMap<string, string>;
   private readonly bindSessionLocationFn?: (sessionId: string, location: string) => void;
   private readonly channelPresets: Map<string, ChannelPreset>;
@@ -352,12 +351,6 @@ export class SessionRouter {
   /** Fallback cwd when no session/thread/channel overlay applies. Production
    *  supplies REPOS_ROOT so a missing overlay is not `process.cwd()`. */
   private readonly defaultCwd: string;
-  /**
-   * #220: when false, leftover ollama-cloud sessions fail closed with a parked
-   * message instead of a bare unknown-agent error. Undefined means "not
-   * parked" so existing tests that omit the flag keep their prior wording.
-   */
-  private readonly ollamaCloudEnabled: boolean | undefined;
   private askUser?: AskUserFn;
   private elicitUser?: ElicitUserFn;
   private completeElicitation?: CompleteElicitationFn;
@@ -386,10 +379,14 @@ export class SessionRouter {
     store: SessionStore;
     profiles: AgentProfile[];
     modelCatalog: ModelCatalogService;
+    profileMetadata?: (id: string, location: string) => AgentClientMetadata | undefined;
+    claudeSessionOptions?: AgentClientMetadata["claudeSessionOptions"];
+    profileIds?: (location: string) => Iterable<string>;
+    profileCatalog?: (id: string, location: string) => AgentProfile["catalog"] | undefined;
+    profileSessions?: (id: string, location: string) => AgentProfile["sessionManager"];
     modelMetadata?: Pick<ModelMetadataStore, "getAll">;
     defaultAgentId: string;
     defaultAgentDisabledReason?: string;
-    localAgentErrors?: ReadonlyMap<string, string>;
     agyMigrationErrors?: ReadonlyMap<string, string>;
     defaultModel: string;
     defaultPermissionMode?: PermissionPolicyMode;
@@ -414,21 +411,19 @@ export class SessionRouter {
     /** #442: silence past this means a `busy` belief is stale. Derived from
      *  TURN_TIMEOUT_SECONDS by the caller; 0 disables the staleness verdict. */
     turnStalenessBoundMs?: number;
-    /**
-     * Production passes `OLLAMA_CLOUD_ENABLED`. When false, a leftover
-     * ollama-cloud session fails with the parked message rather than
-     * `Unknown agent profile`.
-     */
-    ollamaCloudEnabled?: boolean;
   }) {
     this.logger = opts.logger.child({ comp: "session-router" });
     this.store = opts.store;
     this.profileById = new Map(opts.profiles.map((p) => [p.id, p]));
     this.modelCatalog = opts.modelCatalog;
+    this.profileMetadata = opts.profileMetadata;
+    this.claudeSessionOptions = opts.claudeSessionOptions;
+    this.profileIds = opts.profileIds;
+    this.profileCatalog = opts.profileCatalog;
+    this.profileSessions = opts.profileSessions;
     this.modelMetadata = opts.modelMetadata;
     this.defaultAgentId = opts.defaultAgentId;
     this.defaultAgentDisabledReason = opts.defaultAgentDisabledReason;
-    this.localAgentErrors = opts.localAgentErrors ?? new Map();
     this.agyMigrationErrors = opts.agyMigrationErrors ?? new Map();
     this.defaultPermissionMode = opts.defaultPermissionMode ?? "ask";
     this.mcpServers = opts.mcpServers ?? [];
@@ -439,7 +434,6 @@ export class SessionRouter {
     this.channelPresets = opts.channelPresets ?? new Map();
     this.threadPresets = opts.threadPresets ?? new Map();
     this.defaultCwd = opts.defaultCwd ?? process.cwd();
-    this.ollamaCloudEnabled = opts.ollamaCloudEnabled;
     this.runtimeIdleTtlMs = Math.max(0, opts.runtimeIdleTtlMs ?? 0);
     this.turnStalenessBoundMs = Math.max(0, opts.turnStalenessBoundMs ?? 0);
     this.runtimeIdleSweepMs = Math.max(
@@ -488,29 +482,25 @@ export class SessionRouter {
     this.cancelElicitations = handlers.cancel;
   }
 
-  /** List the registered agent profiles. */
-  listProfiles(): AgentProfile[] {
-    return [...this.profileById.values()];
+  /** Host-advertised profiles; the registry supplies metadata, not availability. */
+  listProfiles(location = "local"): AgentProfile[] {
+    const ids = this.profileIds?.(location) ?? this.profileById.keys();
+    return [...ids].map(id => this.getProfile(id, location)).filter((p): p is AgentProfile => !!p);
   }
 
-  /** Look up a local profile or synthesize a cache-backed remote-only one. */
+  /** Client metadata from the host and its cache-backed catalog. */
   getProfile(id: string, location = "local"): AgentProfile | undefined {
-    if (isLocalLocation(location) && this.localAgentErrors.has(id)) return undefined;
-    const local = this.profileById.get(id);
-    if (local || isLocalLocation(location)) return local;
-    const binding = { agentId: id, location };
-    const lookup = this.modelCatalog.lookup(binding);
-    // A remote-only profile is synthesized FROM a candidate, so without one
-    // there is nothing to build. That is narrower than it looks: only remote
-    // agents with no local profile are affected, and #339 rule 15 keeps the
-    // turn itself startable.
-    if (!lookup.snapshot) return undefined;
-    const key = bindingKey(binding);
-    const cached = this.remoteProfiles.get(key);
-    if (cached?.generation === lookup.snapshot.generation) return cached.profile;
-    const profile = asRemoteCatalogAdapter(id, lookup.snapshot.candidate);
-    this.remoteProfiles.set(key, { generation: lookup.snapshot.generation, profile });
-    return profile;
+    const known = this.profileById.get(id);
+    const metadata = this.profileMetadata?.(id, location);
+    const snapshot = this.modelCatalog.lookup({ agentId: id, location }).snapshot;
+    const cached = !known && !metadata && snapshot ? asRemoteCatalogAdapter(id, snapshot.candidate) : undefined;
+    const catalog = this.profileCatalog?.(id, location) ?? cached?.catalog ?? known?.catalog;
+    if (!known && !metadata && !cached && !catalog) return undefined;
+    const profile = metadata || !known
+      ? controllerMetadataAdapter(known ?? cached ?? { id, catalog: catalog! }, metadata, catalog, this.claudeSessionOptions)
+      : known;
+    const manager = this.profileSessions?.(id, location);
+    return Object.assign(profile, { sessionManager: manager ?? known?.sessionManager });
   }
 
   /** #308: resolves only after enforcing the runtime channel allowlist; deleting
@@ -551,33 +541,13 @@ export class SessionRouter {
     this.assertAgentAllowedForChannel(agentId, record.parentRef ?? record.channelRef);
   }
 
-  /** Parked-select copy when ollama-cloud is disabled, else null. */
-  parkedSelectMessage(agentId: string): string | null {
-    return parkedAgentMessage(agentId, this.ollamaCloudEnabled, "select");
-  }
-
-  /**
-   * Actionable refusal for a missing / parked / retired agent id. Callers that
-   * previously inlined `Unknown agent "…"` should go through here so leftover
-   * ollama-cloud sessions name the re-enable switch.
-   */
+  /** Missing or retired ids are reported without controller-local availability rules. */
   unregisteredAgentMessage(agentId: string, fallback: string): string {
-    return (
-      this.localAgentErrors.get(agentId) ??
-      parkedAgentMessage(agentId, this.ollamaCloudEnabled, "select") ??
-      retiredAgentMessage(agentId) ??
-      fallback
-    );
+    return retiredAgentMessage(agentId) ?? fallback;
   }
 
-  /** Leftover-session wording (parked, not "gone forever"). */
   unregisteredAgentSessionMessage(agentId: string, fallback: string): string {
-    return (
-      this.localAgentErrors.get(agentId) ??
-      parkedAgentMessage(agentId, this.ollamaCloudEnabled, "session") ??
-      retiredAgentMessage(agentId) ??
-      fallback
-    );
+    return retiredAgentMessage(agentId) ?? fallback;
   }
 
   /** Read-only resolution shared by runtime spawning, config views and previews. */
@@ -606,10 +576,10 @@ export class SessionRouter {
           ? { value: this.defaultAgentId, source: "default" }
           : { value: record.agentId, source: "session config" };
 
-    const locationValue = selection.location ?? (selection.inherit ? LOCAL_LOCATION : resolveThreadLocation(
+    const locationValue = selection.location ?? resolveThreadLocation(
       { threadPresets: this.threadPresets },
       record.channelRef
-    ));
+    );
     const channelMatchesAgent = (chan?.agent?.value ?? this.defaultAgentId) === agent.value;
     const sessionMatchesAgent = !agentChanged && agent.value === record.agentId;
     const catalogDefault = this.modelCatalog.model(
@@ -833,14 +803,12 @@ export class SessionRouter {
       opts.parentRef ?? undefined,
       opts.channelRef
     );
+    if (!preset.agent && this.defaultAgentDisabledReason) throw new DefaultAgentUnavailableError(this.defaultAgentDisabledReason);
     const agentId = preset.agent?.value ?? this.defaultAgentId;
     const location = resolveThreadLocation(
       { threadPresets: this.threadPresets },
       opts.channelRef
     );
-    if (!preset.agent && this.defaultAgentDisabledReason && isLocalLocation(location)) {
-      throw new DefaultAgentUnavailableError(this.defaultAgentDisabledReason);
-    }
     const catalogDefault = this.modelCatalog.model({ agentId, location }, "default")?.id ?? "default";
     const cfg = defaultSessionConfig(preset.model?.value ?? catalogDefault, this.defaultPermissionMode);
     const now = new Date().toISOString();
@@ -1391,7 +1359,7 @@ export class SessionRouter {
     const described = this.describeConfig(record);
     const agentId = described.agent.value;
     const migrationError = this.agyMigrationErrors.get(record.id);
-    if (migrationError && isLocalLocation(location) && ["agy", "agy-old"].includes(agentId)) {
+    if (migrationError && ["agy", "agy-old"].includes(agentId)) {
       throw new Error(migrationError);
     }
     // #308: protects normal live turns, queued prompts, wakes, and interrupt

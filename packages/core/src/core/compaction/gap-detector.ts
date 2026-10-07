@@ -61,7 +61,10 @@ const INTERNAL_GAP_FLAG_MS = 6 * 60 * 60 * 1000; // 6h
 
 /** Analyze the session JSONL for coverage + compaction boundaries. Pure read. */
 export async function analyzeSessionCoverage(jsonlPath: string): Promise<SessionCoverage> {
-  const content = await fsp.readFile(jsonlPath, "utf8");
+  return parseSessionCoverage(await fsp.readFile(jsonlPath, "utf8"));
+}
+
+export function parseSessionCoverage(content: string): SessionCoverage {
   const lines = content.split("\n").filter((l) => l.trim().length > 0);
 
   let firstTs: string | undefined;

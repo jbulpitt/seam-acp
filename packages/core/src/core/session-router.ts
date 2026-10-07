@@ -1359,7 +1359,8 @@ export class SessionRouter {
     const plan = this.planRuntimeSpawn(record);
     const runtime = this.makeRuntime(record, plan, plan.model, plan.effort);
     const modes = this.store.readConfig(this.store.get(record.id) ?? record).codexModes;
-    runtime.attachRecovery(child, acpSessionId, modes?.sessionId === acpSessionId ? modes : undefined);
+    runtime.attachRecovery(child, acpSessionId, modes?.sessionId === acpSessionId ? modes : undefined,
+      Date.parse(record.updatedUtc));
     this.runtimes.set(record.id, runtime);
     return runtime;
   }

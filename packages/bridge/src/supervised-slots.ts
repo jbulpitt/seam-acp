@@ -334,6 +334,8 @@ export class SupervisedSlots {
         return { state: "missing", cause: `bridge slot ${slot} has no live process` };
       }
       if (!health.attached) return { state: "owned" };
+      // Ask the surviving owner for a cached terminal result before reconciling.
+      await this.writeControl(slot, { v: ADAPTER_CHILD_PROTOCOL_VERSION, type: "report_recovery" });
       const snapshot = this.recoveries.get(slot);
       if (!snapshot?.reconcileSupported) {
         // Retained pre-rollout children already acknowledge an arm with no input.
@@ -343,7 +345,6 @@ export class SupervisedSlots {
         const requestId = randomUUID();
         const response = this.waitForControl(requestId);
         try {
-          await this.writeControl(slot, { v: ADAPTER_CHILD_PROTOCOL_VERSION, type: "report_recovery" });
           await this.writeControl(slot, { v: ADAPTER_CHILD_PROTOCOL_VERSION,
             type: "disarm_recovery", requestId, submissionId: input.submissionId });
         } catch (error) { this.cancelControl(requestId); throw error; }

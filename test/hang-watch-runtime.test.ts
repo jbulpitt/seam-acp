@@ -38,6 +38,29 @@ function runtime(opts: {
 }
 
 describe("#443 remote hang watch", () => {
+  it("hands a measured adopted-slot failure to its recovery owner without killing or re-prompting", async () => {
+    const kill = vi.fn();
+    let probes = 0;
+    const prompt = vi.fn();
+    const h = runtime({ kill, prompt, sendCmd: async () => ++probes === 1
+      ? { probe: "answered", providerSocket: "progressing" }
+      : { probe: "unanswered", providerSocket: "unavailable" } });
+    Object.assign(h.rt, { promptInFlight: true, delegatedTurn: true });
+    const abort = new AbortController();
+    const failure = vi.fn((error: Error, action: string) => {
+      expect(action).toBe("restart");
+      expect(readErrorClassification(error)?.errorKind).toBe("connection_closed");
+      expect(error.message).toContain("did not answer seam/hangProbe");
+      abort.abort();
+    });
+    await h.rt.watchInFlightHang(abort.signal, failure);
+    expect(probes).toBe(3);
+    expect(failure).toHaveBeenCalledOnce();
+    expect(kill).not.toHaveBeenCalled();
+    expect(prompt).not.toHaveBeenCalled();
+    h.rt.releaseRecovery(true);
+  });
+
   it("restarts only the silent slot whose event loop missed twice after answering once", async () => {
     const kill = vi.fn();
     const onDead = vi.fn();

@@ -672,13 +672,14 @@ export class AgentRuntime {
 
   /** Reattach the application side while the bridge retains prompt ownership. */
   attachRecovery(child: ReturnType<AgentProfile["spawn"]>, sessionId: string,
-    modes?: Pick<SessionInfo, "availableModes" | "currentModeId">): void {
+    modes?: Pick<SessionInfo, "availableModes" | "currentModeId">, lastActivityAtMs?: number): void {
     if (this.connection || this.child) throw new Error("runtime is already attached");
     this.child = child;
     this.sessionId = sessionId;
     this.sessionInfo = { sessionId, availableModels: [], availableModes: [], ...modes };
     this.promptInFlight = true;
     this.delegatedTurn = true;
+    if (lastActivityAtMs !== undefined && Number.isFinite(lastActivityAtMs)) this.lastActivityMs = lastActivityAtMs;
 
     Object.assign(child, { remoteRung1Recovery: true });
     this.connectClient(child, true);
@@ -1666,14 +1667,15 @@ export class AgentRuntime {
    * the child is hung. Other slots and a bridge that does
    * not know `probeHang` are unchanged.
    */
-  private watchInFlightHang(signal: AbortSignal): Promise<void> {
+  watchInFlightHang(signal: AbortSignal,
+    onFailure?: (error: Error, action: "retry" | "restart") => void | Promise<void>): Promise<void> {
     const slot = this.getSlot();
     let notedUnavailable = false;
     return watchRemoteHang({
       silenceMs: this.hangSilenceMs,
       signal,
       lastActivityAt: () => this.lastActivityMs,
-      inFlight: () => this.promptInFlight,
+      inFlight: () => this.promptInFlight && !this.detached,
       probe: async () => {
         try {
           return readHangProbeReport(await this.bridgeHealth?.sendCmd?.("probeHang", { slot }));
@@ -1686,19 +1688,21 @@ export class AgentRuntime {
         }
       },
       onAction: (action) => {
-        if (signal.aborted || !this.promptInFlight) return;
-        this.applyHangAction(action);
+        if (signal.aborted || !this.promptInFlight || this.detached) return;
+        return this.applyHangAction(action, onFailure);
       },
     });
   }
 
-  private applyHangAction(action: HangAction): void {
+  private applyHangAction(action: HangAction,
+    onFailure?: (error: Error, action: "retry" | "restart") => void | Promise<void>): void | Promise<void> {
     if (action === "leave") return;
     const agentId = this.profile.id;
     if (action === "restart") {
       const err = new Error("agent event loop did not answer seam/hangProbe; restarting this slot");
       attachErrorClassification(err, { errorKind: "connection_closed", agentId, details: err.message });
       this.logger.warn({ slot: this.getSlot(), action }, err.message);
+      if (onFailure) return onFailure(err, action);
       this.rejectInFlightPrompt?.(err);
       try { this.child?.kill(); } catch { /* the process is already gone */ }
       // Mux kill does not emit exit, so the router would keep this runtime
@@ -1709,6 +1713,7 @@ export class AgentRuntime {
     const err = new Error("provider socket stopped progressing while the agent event loop answered seam/hangProbe");
     attachErrorClassification(err, { errorKind: "timeout", agentId, details: err.message });
     this.logger.warn({ slot: this.getSlot(), action }, err.message);
+    if (onFailure) return onFailure(err, action);
     this.rejectInFlightPrompt?.(err);
   }
 

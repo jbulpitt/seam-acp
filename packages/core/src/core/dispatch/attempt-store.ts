@@ -685,11 +685,12 @@ export class TurnAttemptStore {
    * produce nonce-backed receipts. Record that uncertainty, not delivery proof.
    * Non-provider callbacks terminalize the ledger before completePending, so
    * retain the disposition on their pending row too; execution is not changed.
-   * Active/suspended owners and inbound/scheduled delivery keep their protocols.
+   * Owners and nonce-backed adopted delivery keep their protocols.
    */
   settleDispatchCompletion(id: string): void {
     this.db.prepare(`UPDATE turn_attempts SET delivery_uncertain_reason=?, updated_utc=?
       WHERE id=? AND source='dispatch' AND state IN ('pending','completed')
+        AND (delivery_nonce IS NULL OR json_extract(runtime_json, '$.remoteRecovery') IS NULL)
         AND delivery_done=0 AND delivery_abandoned_reason IS NULL AND delivery_uncertain_reason IS NULL`)
       .run("dispatch completion effects finalized without a nonce-backed transport receipt; output retained",
         new Date().toISOString(), id);
@@ -698,12 +699,12 @@ export class TurnAttemptStore {
   /** #509: a missed settlement must not live forever (1,403 observed receipts).
    * Age settles only the diagnostic disposition: it does not assert transport,
    * delete output, alter the delegation ledger, or resume quarantined defects.
-   * Fresh completions keep their delivery window; late receipts may still prove
-   * delivery and durable onward recovery remains independently ledger-owned.
+   * Adopted receipts keep retrying; onward recovery remains ledger-owned.
    */
   reapUnsettledCompletions(nowMs = Date.now()): number {
     return this.db.prepare(`UPDATE turn_attempts SET delivery_uncertain_reason=?, updated_utc=?
       WHERE state='completed' AND delivery_done=0
+        AND (delivery_nonce IS NULL OR json_extract(runtime_json, '$.remoteRecovery') IS NULL)
         AND delivery_abandoned_reason IS NULL AND delivery_uncertain_reason IS NULL
         AND updated_utc <= ?`)
       .run("completion disposition timed out after one hour without delivery proof; output retained",

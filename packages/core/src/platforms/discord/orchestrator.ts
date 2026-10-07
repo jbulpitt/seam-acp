@@ -975,6 +975,7 @@ export class Orchestrator {
   private readonly adoptingRemoteResults = new Set<string>();
   private readonly remoteAdoptionFinishers = new Map<string, (retainChild?: boolean) => void>();
   private remoteRecoveryReconciliation?: Promise<void>;
+  private readonly adoptedDeliveryRetryAfter = new Map<string, number>();
   private readonly remoteRecoveryLogFailures = new Map<string, {
     cause: string; err: unknown; sinceMs: number; lastLoggedMs: number;
   }>();
@@ -15393,10 +15394,11 @@ export class Orchestrator {
     return true;
   }
 
-  /** The existing dispatch tick asks the bridge, never decides from silence. */
+  /** The dispatch tick reconciles owners and retries their recorded deliveries. */
   reconcileRemoteRecoveries(): Promise<void> {
     if (this.remoteRecoveryReconciliation) return this.remoteRecoveryReconciliation;
-    const run = this.reconcileRemoteRecoveriesInner().finally(() => { this.remoteRecoveryReconciliation = undefined; });
+    const run = this.reconcileRemoteRecoveriesInner().then(() => this.retryAdoptedDeliveries())
+      .finally(() => { this.remoteRecoveryReconciliation = undefined; });
     this.remoteRecoveryReconciliation = run;
     return run;
   }
@@ -15478,6 +15480,42 @@ export class Orchestrator {
     }));
   }
 
+  private async retryAdoptedDeliveries(): Promise<void> {
+    if (this.restartCutoff) return;
+    const pending = this.store.turnAttempts.listUnsettledCompletions();
+    const ids = new Set(pending.map(attempt => attempt.id));
+    for (const id of this.adoptedDeliveryRetryAfter.keys()) {
+      if (!ids.has(id)) this.adoptedDeliveryRetryAfter.delete(id);
+    }
+    for (const attempt of pending) {
+      if (!attempt.remoteRecovery || !attempt.deliveryNonce
+        || this.adoptingRemoteResults.has(attempt.id) || this.remoteAdoptionFinishers.has(attempt.id)) continue;
+      if (Date.now() < (this.adoptedDeliveryRetryAfter.get(attempt.id) ?? 0)) continue;
+      // Back off on the existing tick; the receipt survives a controller restart.
+      this.adoptedDeliveryRetryAfter.set(attempt.id, Date.now() + 30_000);
+      try {
+        const occurrence = attempt.source === "schedule" ? this.store.scheduledOccurrences.get(attempt.id) : null;
+        if (occurrence) {
+          await this.deliverScheduledCompletion(occurrence, attempt);
+        } else {
+          const target: ChannelRef = { platform: PLATFORM, id: attempt.spec.target };
+          if (await this.checkResumePreconditions(target) !== "ok") continue;
+          const resolution = await this.recoverRecordedDelivery(attempt, target);
+          if (resolution === "deferred") continue;
+          if (resolution === "delivered") {
+            const record = this.store.getByChannel(PLATFORM, target.id);
+            if (record) this.store.upsert({ ...record, updatedUtc: new Date().toISOString() });
+          }
+        }
+        if (this.store.turnAttempts.isDeliveryDispositionTerminal(attempt.id)) {
+          this.adoptedDeliveryRetryAfter.delete(attempt.id);
+        }
+      } catch (err) {
+        this.logger.warn({ err, attempt: attempt.id }, "adopted remote result delivery deferred");
+      }
+    }
+  }
+
   /** Parked auth failures release ownership, never adopt their terminal result. */
   private async handBackReauthRecovery(attempt: TurnAttempt, resumeAccepted = true): Promise<boolean> {
     const binding = attempt.remoteRecovery;
@@ -15557,10 +15595,18 @@ export class Orchestrator {
         }
         this.store.turnAttempts.markDeliveryDone(prior.id);
       } catch (err) {
-        this.logger.warn({ err, attempt: prior.id }, "adopted remote result delivery deferred");
+        if (isInvalidMessagePayloadError(err)) {
+          this.store.turnAttempts.abandonDelivery(prior.id,
+            `Discord rejected recorded delivery (50035): ${err instanceof Error ? err.message : String(err)}`);
+          this.logger.warn({ err, attempt: prior.id }, "adopted remote result delivery rejected permanently");
+        } else {
+          this.adoptedDeliveryRetryAfter.set(prior.id, Date.now() + 30_000);
+          this.logger.warn({ err, attempt: prior.id }, "adopted remote result delivery deferred");
+        }
       }
     }
     if (occurrence) {
+      this.adoptedDeliveryRetryAfter.set(prior.id, Date.now() + 30_000);
       await this.deliverScheduledCompletion(occurrence, this.store.turnAttempts.get(prior.id)!);
     }
 
@@ -16024,6 +16070,13 @@ export class Orchestrator {
         // concurrent create won, Discord returns it rather than creating another.
         await this.sendDeliveryPart(channel, part.payload, part.nonce, attempt.spec);
       } catch (err) {
+        if (isInvalidMessagePayloadError(err)) {
+          if (propagateError) throw err;
+          this.store.turnAttempts.abandonDelivery(attempt.id,
+            `Discord rejected recorded delivery (50035): ${err instanceof Error ? err.message : String(err)}`);
+          this.logger.warn({ err, id: attempt.id }, "recorded delivery rejected permanently");
+          return "abandoned";
+        }
         if (propagateError) throw err;
         this.logger.warn({ err, id: attempt.id }, "nonce-backed delivery replay deferred");
         return "deferred";

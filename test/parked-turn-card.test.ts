@@ -195,6 +195,10 @@ describe("durable parked-turn notice actions", () => {
     expect(store.turnAttempts.get(id)?.state).toBe("cancelled");
     expect(store.turnAttempts.get(id)?.spec.prompt).toBe("ORIGINAL-BRIEF-DO-NOT-REPLAY");
     expect(store.getChoiceCard(card.id)?.status).not.toBe("open");
+    expect(recovered.adapter.editChoiceCard.mock.calls.at(-1)?.[1]).toMatchObject({
+      disabled: true, hideButtons: true, panel: { footer: "Cancelled",
+        fields: expect.arrayContaining([{ name: "Status", value: "Cancelled" }]) },
+    });
     const secondClick = click(card.id, 1);
     await recovered.handleChoiceCardInteraction(secondClick);
     expect(secondClick.replyEphemeral).toHaveBeenCalledWith("This card is closed.");

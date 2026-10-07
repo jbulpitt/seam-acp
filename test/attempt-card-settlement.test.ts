@@ -24,8 +24,12 @@ beforeEach(() => {
   store = new SessionStore(path.join(dir, "test.db"));
   edits = [];
   choiceEdits = vi.fn(async () => {});
+  host = makeHost();
+});
+
+function makeHost() {
   let choicePosts = 0;
-  host = new Orchestrator({ logger: pino({ level: "silent" }) as any,
+  return new Orchestrator({ logger: pino({ level: "silent" }) as any,
     config: { DATA_DIR: dir, REPOS_ROOT: "/synthetic", TURN_TIMEOUT_SECONDS: 60,
       channelPresets: new Map(), threadPresets: new Map(), bridgePresets: new Map() } as any,
     modelCatalog: fixtureModelCatalog([]), store, renderer: discordRenderer,
@@ -37,7 +41,7 @@ beforeEach(() => {
       editChoiceCard: choiceEdits,
     } as any,
   });
-});
+}
 
 async function drain() {
   await (host as any).settleTrackedContinuations();
@@ -60,7 +64,8 @@ function openCard() {
 }
 
 describe("terminal card settlement", () => {
-  it.each(["completed", "failed", "cancelled"] as const)("retires a parked turn's notices when it later settles %s without a status panel", async status => {
+  it.each((["completed", "failed", "cancelled"] as const).flatMap(status =>
+    [false, true].map(restart => ({ status, restart }))))("retires notices with the recorded $status label (restart: $restart)", async ({ status, restart }) => {
     const attempt = store.turnAttempts.claim(spec, "identity", "boot");
     store.turnAttempts.bind(attempt, "acp");
     store.turnAttempts.startPrompt(attempt);
@@ -84,6 +89,11 @@ describe("terminal card settlement", () => {
     expect(choiceEdits).not.toHaveBeenCalled();
     expect(store.listOpenChoiceCards("discord")).toHaveLength(3);
 
+    if (restart) {
+      store.close();
+      store = new SessionStore(path.join(dir, "test.db"));
+      host = makeHost();
+    }
     if (status === "cancelled") expect(store.turnAttempts.cancel(attempt.id)).toBe(true);
     else expect(store.turnAttempts.adoptRemoteResult(store.turnAttempts.get(attempt.id)!, { version: 1,
       submissionId: binding.submissionId, acpSessionId: binding.acpSessionId, status,
@@ -95,15 +105,38 @@ describe("terminal card settlement", () => {
     for (const card of notices) expect(store.getChoiceCard(card.id)?.status).toBe("cancelled");
     expect(store.listOpenChoiceCards("discord").map(card => card.id)).toEqual([unrelated.choiceId]);
     expect(choiceEdits).toHaveBeenCalledTimes(2);
+    const label = status.charAt(0).toUpperCase() + status.slice(1);
     for (const card of notices) expect(choiceEdits).toHaveBeenCalledWith(
       { id: card.messageId, channel: { platform: "discord", id: card.channelRef } },
-      expect.objectContaining({ disabled: true, hideButtons: true }));
+      expect.objectContaining({ disabled: true, hideButtons: true, panel: expect.objectContaining({
+        fields: [{ name: "Status", value: label }], footer: label,
+      }) }));
     expect(store.turnAttempts.get(attempt.id)?.deliveryDone).toBe(false);
     expect(edits).toEqual([]);
     // Duplicate terminal signals cannot retire an unrelated notice or re-edit these.
     expect(store.turnAttempts.cancel(attempt.id)).toBe(false);
     await drain();
     expect(choiceEdits).toHaveBeenCalledTimes(2);
+
+    // Re-rendering the persisted closed notice still reads the attempt's result.
+    store.close();
+    store = new SessionStore(path.join(dir, "test.db"));
+    host = makeHost();
+    await (host as any).refreshChoiceCard(store.getChoiceCard(notices[0]!.id));
+    expect(choiceEdits.mock.calls.at(-1)?.[1].panel).toMatchObject({
+      fields: [{ name: "Status", value: label }], footer: label,
+    });
+  });
+
+  it("keeps explicit cancellation of an ordinary choice card labelled Cancelled", async () => {
+    const posted = await (host as any).publishChoiceCard({ id: "discord:worker", platform: "discord",
+      channelRef: "worker", parentRef: null }, { title: "Pick one", options: [{ label: "Continue",
+      kind: "prompt", payload: "continue" }] });
+    expect(posted.ok).toBe(true);
+    expect(store.cancelChoiceCard(posted.choiceId, "worker")).toBe(true);
+    await (host as any).refreshChoiceCard(store.getChoiceCard(posted.choiceId));
+    expect(choiceEdits.mock.calls.at(-1)?.[1]).toMatchObject({ disabled: true, hideButtons: true,
+      panel: { fields: [{ name: "Status", value: "Cancelled" }], footer: "Cancelled" } });
   });
 
   it.each(["operator", "superseded"])("renders %s cancellation without another boot", async cause => {

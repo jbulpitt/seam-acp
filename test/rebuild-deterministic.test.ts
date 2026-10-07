@@ -674,6 +674,22 @@ describe("reconstructSessionFromDiscord", () => {
     expect(t.compactCalls).toEqual([]);
   });
 
+  it("uses the stored parent for riders when the rebuild channel omits it", async () => {
+    const t = makeOrch({
+      channelPresets: new Map([["parent-r", { rider: { value: "channel rule" } }]]),
+      threadPresets: new Map([["thread-r", { rider: { value: "thread rule" } }]]),
+    });
+    await (t.orch as any).reconstructSessionFromDiscord({
+      record: t.rec,
+      channel: { platform: "discord", id: "thread-r" },
+      observedAtStart: "acp-active",
+      attachIntent: "attach",
+    });
+    const prompt = t.seedCalls[0].summary as string;
+    expect(prompt).toContain("channel rule");
+    expect(prompt.indexOf("thread rule")).toBeGreaterThan(prompt.indexOf("channel rule"));
+  });
+
   it("resolves grok-4.6 at 500K on first use when the env list has only a cosmetic (500k) label", async () => {
     const t = makeOrch({
       recordOver: { agentId: "grok" },

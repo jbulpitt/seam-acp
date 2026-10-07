@@ -5021,7 +5021,10 @@ export class Orchestrator {
             return;
           }
         }
-        if (err instanceof DispatchSuspendedError) throw err;
+        if (err instanceof DispatchSuspendedError) {
+          if (err.suspension === "defect") this.store.turnAttempts.markStalled(humanAttempt.id, err.reason);
+          throw err;
+        }
         completeHuman(err instanceof Error ? err.message : String(err));
       }
       this.logger.error({ err, session: record.id }, "turn failed");
@@ -5111,68 +5114,68 @@ export class Orchestrator {
             this.voiceConsoleSpeechByChannel.delete(channel.id);
           }
         }
-        return;
-      }
-      if (voiceConsoleSpeech) {
-        await wrapUpStep("voice-console-settle", () => this.voiceConsole?.finishVisibleTurn(voiceConsoleSpeech!).catch((err) =>
-          this.logger.warn(
-            { err, bindingId: voiceConsoleSpeech?.bindingId, turnId: voiceConsoleSpeech?.turnId },
-            "voice console visible speech settlement failed"
-          )
-        ) ?? Promise.resolve());
-        if (this.voiceConsoleSpeechByChannel.get(channel.id) === voiceConsoleSpeech) {
-          this.voiceConsoleSpeechByChannel.delete(channel.id);
+      } else {
+        if (voiceConsoleSpeech) {
+          await wrapUpStep("voice-console-settle", () => this.voiceConsole?.finishVisibleTurn(voiceConsoleSpeech!).catch((err) =>
+            this.logger.warn(
+              { err, bindingId: voiceConsoleSpeech?.bindingId, turnId: voiceConsoleSpeech?.turnId },
+              "voice console visible speech settlement failed"
+            )
+          ) ?? Promise.resolve());
+          if (this.voiceConsoleSpeechByChannel.get(channel.id) === voiceConsoleSpeech) {
+            this.voiceConsoleSpeechByChannel.delete(channel.id);
+          }
         }
-      }
-      // The main turn is fully finalized: any further generative activity on
-      // this runtime is an agent-initiated woken turn (handled in eventHandler),
-      // not the in-turn backlog already drained above.
-      turnFinalized = true;
-      clearInterval(heartbeat);
-      if (pendingRefresh) {
-        clearTimeout(pendingRefresh);
-        pendingRefresh = undefined;
-      }
-      // #71: drop the current-turn speaker id so it can never authorize a
-      // config_propose on a later dispatched/scheduled turn (no human speaker).
-      // Once released, the next turn may already own these channel keys.
-      if (!queueReleased) {
-        this.currentSpeakerIds.delete(record.channelRef);
-        this.currentAuthorIds.delete(record.channelRef);
-      }
-      void refresh(true);
-      if (isSimpleCardGifTerminal(status.state)) {
-        await wrapUpStep("status-gif-delete", () => deleteSimpleCardGifMessage({
-          ref: gifMsg,
-          deleteMessage: this.adapter.deleteMessage
-            ? (ref) => this.adapter.deleteMessage!(ref)
-            : undefined,
-        }));
-        gifMsg = undefined;
-      }
-      // #76: write the terminal state BEFORE removing the marker (writeDone
-      // ordering). Skip if the command layer already finalized it as cancelled.
-      if (this.liveTurnByChannel.get(channel.id) === liveMarkerId) {
-        this.liveTurnByChannel.delete(channel.id);
-      }
-      await wrapUpStep("live-marker-finish", () => finishLiveTurn(this.config.DATA_DIR, {
-        id: liveMarkerId,
-        status: "completed",
-        channelRef: channel.id,
-        finishedUtc: new Date().toISOString(),
-      }).catch((err) =>
-        this.logger.warn({ err, id: liveMarkerId }, "live-turn marker finish failed")
-      ));
-      if (humanAttempt && humanOutcomeOwned && humanDelivered) this.store.turnAttempts.markDeliveryDone(humanAttempt.id);
-      if (humanActivitySubmitted && (!humanAttempt || humanOutcomeOwned || this.store.turnAttempts.get(humanAttempt.id)?.state === "cancelled")) {
-        this.plugins.turnActivity.emit({ type: "turn-completed", turnId: liveMarkerId, timestampMs: Date.now(),
-          binding: { agentId: described.agent.value, location: described.location.value, account: described.agent.value, sessionId: record.id } });
-      }
-      if (wrapUpStartedAt !== undefined) {
-        this.logger.info(
-          { session: record.id, totalMs: Date.now() - wrapUpStartedAt, released: queueReleased, steps: wrapUpMs },
-          "turn wrap-up"
-        );
+        // The main turn is fully finalized: any further generative activity on
+        // this runtime is an agent-initiated woken turn (handled in eventHandler),
+        // not the in-turn backlog already drained above.
+        turnFinalized = true;
+        clearInterval(heartbeat);
+        if (pendingRefresh) {
+          clearTimeout(pendingRefresh);
+          pendingRefresh = undefined;
+        }
+        // #71: drop the current-turn speaker id so it can never authorize a
+        // config_propose on a later dispatched/scheduled turn (no human speaker).
+        // Once released, the next turn may already own these channel keys.
+        if (!queueReleased) {
+          this.currentSpeakerIds.delete(record.channelRef);
+          this.currentAuthorIds.delete(record.channelRef);
+        }
+        void refresh(true);
+        if (isSimpleCardGifTerminal(status.state)) {
+          await wrapUpStep("status-gif-delete", () => deleteSimpleCardGifMessage({
+            ref: gifMsg,
+            deleteMessage: this.adapter.deleteMessage
+              ? (ref) => this.adapter.deleteMessage!(ref)
+              : undefined,
+          }));
+          gifMsg = undefined;
+        }
+        // #76: write the terminal state BEFORE removing the marker (writeDone
+        // ordering). Skip if the command layer already finalized it as cancelled.
+        if (this.liveTurnByChannel.get(channel.id) === liveMarkerId) {
+          this.liveTurnByChannel.delete(channel.id);
+        }
+        await wrapUpStep("live-marker-finish", () => finishLiveTurn(this.config.DATA_DIR, {
+          id: liveMarkerId,
+          status: "completed",
+          channelRef: channel.id,
+          finishedUtc: new Date().toISOString(),
+        }).catch((err) =>
+          this.logger.warn({ err, id: liveMarkerId }, "live-turn marker finish failed")
+        ));
+        if (humanAttempt && humanOutcomeOwned && humanDelivered) this.store.turnAttempts.markDeliveryDone(humanAttempt.id);
+        if (humanActivitySubmitted && (!humanAttempt || humanOutcomeOwned || this.store.turnAttempts.get(humanAttempt.id)?.state === "cancelled")) {
+          this.plugins.turnActivity.emit({ type: "turn-completed", turnId: liveMarkerId, timestampMs: Date.now(),
+            binding: { agentId: described.agent.value, location: described.location.value, account: described.agent.value, sessionId: record.id } });
+        }
+        if (wrapUpStartedAt !== undefined) {
+          this.logger.info(
+            { session: record.id, totalMs: Date.now() - wrapUpStartedAt, released: queueReleased, steps: wrapUpMs },
+            "turn wrap-up"
+          );
+        }
       }
     }
   }

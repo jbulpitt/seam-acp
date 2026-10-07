@@ -16,7 +16,7 @@ import { SessionStore } from "../packages/core/src/core/session-store.js";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
 import { discordRenderer } from "../packages/core/src/platforms/discord/renderer.js";
 import { DispatchWatcher } from "../packages/core/src/core/dispatch/watcher.js";
-import { inboundAttemptId } from "../packages/core/src/core/dispatch/attempt-store.js";
+import { DispatchSuspendedError, inboundAttemptId } from "../packages/core/src/core/dispatch/attempt-store.js";
 import { executionIdentity } from "../packages/core/src/core/dispatch/execution-identity.js";
 import type { ThreadPreset } from "../packages/core/src/config.js";
 import type { ChoiceInteraction, IncomingMessage } from "../packages/core/src/platforms/chat-adapter.js";
@@ -118,7 +118,7 @@ afterEach(async () => {
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
 });
 
-function harness(location: "local" | "bridge-a", mode: AcpMode): Harness {
+function harness(location: "local" | "bridge-a", mode: AcpMode, logger = silent): Harness {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "seam-302-runtime-"));
   const store = new SessionStore(path.join(dir, "seam.db"));
   const calls: AcpCalls = { authRequired: true, initialized: 0, loads: [], news: 0, prompts: [], children: [] };
@@ -161,7 +161,7 @@ function harness(location: "local" | "bridge-a", mode: AcpMode): Harness {
     sendChoiceCard: vi.fn(async (channel: any) => ({ channel, id: "reauth-choice" })),
     editChoiceCard: vi.fn(async () => {}),
   };
-  const orch = new Orchestrator({ logger: silent, store, router, adapter: adapter as any,
+  const orch = new Orchestrator({ logger, store, router, adapter: adapter as any,
     renderer: discordRenderer, modelCatalog: catalog,
     recoverySleep: async () => {},
     config: { DATA_DIR: dir, REPOS_ROOT: dir, TURN_TIMEOUT_SECONDS: 15,
@@ -207,6 +207,63 @@ async function resume(h: Harness): Promise<void> {
     channel: { platform: "discord", id: THREAD, parentId: PARENT }, attachments: [] };
   await (h.orch as any).executeIncomingMessage(message);
 }
+
+describe("post-load suspension settlement", () => {
+  it("records and logs an inbound suspension after the recorded session loads", async () => {
+    const logs: Array<{ msg?: string; err?: { message?: string } }> = [];
+    const logger = pino({ level: "info" }, { write: (line: string) => logs.push(JSON.parse(line)) } as any);
+    const h = harness("local", "ok", logger);
+    const id = seedPromptedAttempt(h);
+    const reason = "recorded runtime binding refused after successful session/load";
+    vi.spyOn(h.store.turnAttempts, "bindRuntime").mockImplementationOnce(() => {
+      expect(h.calls.loads).toEqual([RECORDED]);
+      throw DispatchSuspendedError.defect(id, reason);
+    });
+
+    await (h.orch as any).startRecoveredInbound(h.store.getInbound("msg-302"));
+
+    expect(h.calls.loads).toEqual([RECORDED]);
+    expect(h.calls.news).toBe(0);
+    expect(h.calls.prompts).toEqual([]);
+    expect.soft(h.store.turnAttempts.get(id)).toMatchObject({
+      state: "suspended", acpSessionId: RECORDED, promptStarted: true, generation: 2,
+      stalledReason: reason, stallNoticeUtc: expect.any(String), outcome: null,
+    });
+    expect.soft(logs.find(log => log.msg === "recovered inbound turn failed")?.err?.message).toBe(reason);
+    expect.soft(h.store.listOpenChoiceCards("discord", THREAD).map(card => card.body).join("\n")).toContain(reason);
+    expect(h.orch.inspectChannelQueue(THREAD).state).not.toBe("wedged");
+  });
+
+  it("propagates a dispatch suspension after the recorded session loads", async () => {
+    const h = harness("local", "ok");
+    const spec = { id: "post-load-dispatch", target: THREAD, prompt: ORIGINAL,
+      session: "live" as const, kind: "handoff" as const, stream: false, reportBack: false };
+    const record = h.store.get(`discord:${THREAD}`)!;
+    const described = h.router.describeConfig(record);
+    const boot = (h.orch as any).attemptBoot;
+    h.store.turnAttempts.registerOwner(boot);
+    const attempt = h.store.turnAttempts.claim(spec, executionIdentity({
+      agentId: record.agentId, location: described.location.value, session: "live",
+      model: described.model.value, effort: described.effort.value,
+      cwd: described.cwd.value, config: record.configJson,
+    }), boot);
+    h.store.turnAttempts.bind(attempt, RECORDED);
+    h.store.turnAttempts.startPrompt(attempt);
+    h.store.turnAttempts.suspend(spec.id, boot);
+    const reason = "dispatch runtime binding refused after successful session/load";
+    const refusal = DispatchSuspendedError.defect(spec.id, reason);
+    vi.spyOn(h.store.turnAttempts, "bindRuntime").mockImplementationOnce(() => {
+      expect(h.calls.loads).toEqual([RECORDED]);
+      throw refusal;
+    });
+
+    await expect(h.orch.dispatchInjectTurn(spec)).rejects.toBe(refusal);
+    expect(h.calls.loads).toEqual([RECORDED]);
+    expect(h.calls.prompts).toEqual([]);
+    await h.orch.observeRetainedDispatch(spec, refusal);
+    expect(h.store.turnAttempts.get(spec.id)).toMatchObject({ state: "suspended", stalledReason: reason });
+  });
+});
 
 describe("explicit operator continuation after identity drift", () => {
   function dispatchAttempt(h: Harness, promptStarted: boolean) {
@@ -486,7 +543,8 @@ describe("#302 real ACP handshake and strict session/load recovery", () => {
 
   it("lands an initialize capability refusal suspended with its actionable reason", async () => {
     const h = harness("local", "no-load"); const id = seedPromptedAttempt(h);
-    await resume(h);
+    await expect(resume(h)).rejects.toMatchObject({ name: "DispatchSuspendedError",
+      reason: "Strict resume refused: provider does not advertise session/load" });
     expect(h.calls.loads).toEqual([]);
     expect(h.calls.news).toBe(0);
     expect(h.calls.prompts).toEqual([]);
@@ -514,7 +572,10 @@ describe("#302 real ACP handshake and strict session/load recovery", () => {
     "keeps a synthetic remote %s refusal recoverably suspended with zero prompts",
     async (mode) => {
       const h = harness("bridge-a", mode); const id = seedPromptedAttempt(h);
-      await resume(h);
+      await expect(resume(h)).rejects.toMatchObject({ name: "DispatchSuspendedError",
+        reason: expect.stringMatching(mode === "no-load"
+          ? /does not advertise session\/load/
+          : /boot recovery exhausted 3 pre-prompt acquisition attempts/) });
       expect(h.calls.news).toBe(0);
       expect(h.calls.prompts).toEqual([]);
       expect(h.store.turnAttempts.get(id)).toMatchObject({
@@ -537,7 +598,8 @@ describe("#302 real ACP handshake and strict session/load recovery", () => {
   it("bounds a silent session/load and records the named refusal as recoverably suspended", async () => {
     const h = harness("local", "hang-load"); const id = seedPromptedAttempt(h);
     const startedAt = performance.now();
-    await resume(h);
+    await expect(resume(h)).rejects.toMatchObject({ name: "DispatchSuspendedError",
+      reason: expect.stringContaining("boot recovery exhausted 3 pre-prompt acquisition attempts") });
     const elapsedMs = performance.now() - startedAt;
     expect(elapsedMs).toBeGreaterThanOrEqual(15);
     expect(elapsedMs).toBeLessThan(500);

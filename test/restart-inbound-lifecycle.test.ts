@@ -105,7 +105,8 @@ describe("#250 human turn production pipeline, synthetic transport only", () => 
     for (let i = 0; i < 20; i++) await new Promise<void>(resolve => setImmediate(resolve));
     expect(visible).toEqual([final]);
     expect(h.store.turnAttempts.get(attempt.id)?.state).toBe("active");
-    h.orch.suspendForRestart(); h.release(); await first;
+    h.orch.suspendForRestart(); h.release();
+    await expect(first).rejects.toMatchObject({ name: "DispatchSuspendedError", suspension: "shutdown" });
     const adopted = Object.assign(new EventEmitter(), { kill: vi.fn(), detach: vi.fn() });
     const mux = {
       sendCmd: vi.fn(async () => ({ health: [{ slot: 6, alive: true, attached: true, outputAckedThrough: 41,
@@ -468,7 +469,8 @@ describe("#250 human turn production pipeline, synthetic transport only", () => 
     // In-process boot simulation; real PID retirement has separate offline tests.
     simulateRetiredOwnerProcess();
     const first = h.run(); await h.started;
-    h.orch.suspendForRestart(); h.release(); await first;
+    h.orch.suspendForRestart(); h.release();
+    await expect(first).rejects.toMatchObject({ name: "DispatchSuspendedError", suspension: "shutdown" });
     expect(h.store.turnAttempts.get("inbound-1")).toMatchObject({ state: "suspended", promptStarted: true, acpSessionId: "recorded-acp" });
     expect((await listLiveMarkers(h.dir))[0]).toMatchObject({ inboundMessageId: "1", promptStarted: true });
     expect(h.adapter.sendMessage).not.toHaveBeenCalled();
@@ -495,7 +497,7 @@ describe("#250 human turn production pipeline, synthetic transport only", () => 
       submissionId: "auth-submission", acpSessionId: "recorded-acp", delegatedUtc: attempt.createdUtc });
     h.orch.suspendForRestart();
     h.release();
-    await first;
+    await expect(first).rejects.toMatchObject({ name: "DispatchSuspendedError", suspension: "shutdown" });
     h.store.turnAttempts.markStalled(attempt.id, accepted ? REAUTH_COMPLETED_TEXT : REAUTH_WAITING_TEXT);
     h.runtime.prompt.mockClear();
     h.router.getOrStartRuntime.mockClear();
@@ -536,7 +538,7 @@ describe("#250 human turn production pipeline, synthetic transport only", () => 
       submissionId: "auth-submission", acpSessionId: "recorded-acp", delegatedUtc: attempt.createdUtc });
     h.orch.suspendForRestart();
     h.release();
-    await first;
+    await expect(first).rejects.toMatchObject({ name: "DispatchSuspendedError", suspension: "shutdown" });
     h.store.turnAttempts.markStalled(attempt.id, REAUTH_COMPLETED_TEXT);
     const next = h.make();
     let release!: () => void;
@@ -852,7 +854,8 @@ describe("#250 human turn production pipeline, synthetic transport only", () => 
     const h = setup(); const first = h.run(); await h.started;
     const old = h.store.getInbound("1")!;
     h.store.admitInbound({ ...old, messageId: "2", text: "replacement", createdUtc: new Date().toISOString() });
-    h.release(); await first;
+    h.release();
+    await expect(first).rejects.toMatchObject({ name: "DispatchSuspendedError", suspension: "superseded" });
     expect(h.store.turnAttempts.get("inbound-1")?.state).toBe("cancelled");
     expect(h.adapter.sendMessage).not.toHaveBeenCalled();
     expect(h.store.getInbound("1")?.state).toBe("completed");
@@ -861,7 +864,8 @@ describe("#250 human turn production pipeline, synthetic transport only", () => 
   it("retains a suspended turn when its current thread ACP differs, without a prompt or load", async () => {
     const h = setup();
     simulateRetiredOwnerProcess();
-    const first = h.run(); await h.started; h.orch.suspendForRestart(); h.release(); await first;
+    const first = h.run(); await h.started; h.orch.suspendForRestart(); h.release();
+    await expect(first).rejects.toMatchObject({ name: "DispatchSuspendedError", suspension: "shutdown" });
     const current = h.router.ensureSessionRecord();
     h.router.ensureSessionRecord = () => ({ ...current, acpSessionId: "different-session" });
     await expect(h.run(h.make())).rejects.toMatchObject({ name: "DispatchSuspendedError" });
@@ -882,7 +886,7 @@ describe("#250 human turn production pipeline, synthetic transport only", () => 
     const h = setup();
     h.runtime.prompt.mockImplementationOnce(async () => { await h.emit("must remain recoverable"); return { stopReason: "end_turn" }; });
     vi.spyOn(h.store.turnAttempts, "complete").mockImplementation(() => { throw new Error("synthetic SQLite failure"); });
-    await h.run();
+    await expect(h.run()).rejects.toThrow("synthetic SQLite failure");
     expect(h.store.turnAttempts.get("inbound-1")?.state).toBe("active");
     expect(h.adapter.sendMessage).not.toHaveBeenCalled();
     expect(await listLiveMarkers(h.dir)).toHaveLength(1);

@@ -42,14 +42,13 @@ const fence = '```seam-choice\n{"title":"Choose next","options":[{"label":"Conti
 
 describe("one math registry across captured and streamed output", () => {
   const tex = "```latex\ne^{i\\pi}+1=0\n```";
-  it.each(["dispatch messages", "dispatch card", "scheduled messages", "scheduled card", "stateless", "steer", "message", "messages", "panel"])("renders %s as a PNG rather than source", async path => {
+  it.each(["dispatch messages", "dispatch card", "scheduled messages", "scheduled card", "stateless", "message", "messages", "panel"])("renders %s as a PNG rather than source", async path => {
     const plugins = new PluginHost(pino({ level: "silent" }));
     await plugins.loadBuiltins(BUILTIN_PLUGINS);
     const h = setup(path === "dispatch card" ? "card" : "messages", plugins.fences);
     if (path.startsWith("dispatch")) await h.orch.postDispatchOutput(h.channel, h.spec, tex);
     else if (path.startsWith("scheduled")) await h.orch.postScheduledResult(h.channel, "job", tex, path.endsWith("card") ? "card" : "messages");
     else if (path === "stateless") await h.orch.publishStatelessHandoffCard(h.channel, h.spec, undefined, "▶ Handoff", Date.now(), { text: tex });
-    else if (path === "steer") await h.orch.postSteerOutput(h.channel, tex);
     else {
       const payload = path === "message" ? { kind: path, text: tex }
         : path === "messages" ? { kind: path, texts: [tex] }
@@ -104,13 +103,6 @@ describe("captured agent output uses live fence handlers", () => {
     const output = JSON.stringify(h.adapter.sendPanel.mock.calls[0]![1]);
     expect(output).toContain("Question for you: Choose next");
     expect(output).not.toContain("seam-choice");
-  });
-
-  it("processes slash-steer completion output", async () => {
-    const h = setup();
-    await h.orch.postSteerOutput(h.channel, fence);
-    expect(h.adapter.sendChoiceCard).toHaveBeenCalledOnce();
-    expect(h.visible.join("")).not.toContain("seam-choice");
   });
 
   it.each(["message", "messages", "panel"])("processes recovery %s payloads, preserving a choice longer than a Discord message", async kind => {

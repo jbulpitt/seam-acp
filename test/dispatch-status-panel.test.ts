@@ -317,8 +317,8 @@ function makeOrch(opts: {
     SEAM_DISPATCH_OUTPUT_STYLE: "messages",
     SEAM_DISPATCH_STATUS_PANEL: opts.panel ?? true,
     REPO_EMOJIS: new Map<string, string>(),
-    channelPresets: {},
-    threadPresets: {},
+    channelPresets: new Map(),
+    threadPresets: new Map(),
   };
   return new Orchestrator({
     logger: silent,

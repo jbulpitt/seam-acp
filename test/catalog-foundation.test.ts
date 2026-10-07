@@ -904,7 +904,7 @@ describe("#236 description/evidence reach real production output paths", () => {
       logger,
       store: { readConfig: () => ({ model: "nebula", agentId: "fake" }) } as never,
       profiles: [{ id: "fake", defaultModel: "nebula", effort: { mechanism: "none", levels: [] } }] as never,
-      config: { REPOS_ROOT: "/repo", channelPresets: {}, threadPresets: {} } as never,
+      config: { REPOS_ROOT: "/repo", channelPresets: new Map(), threadPresets: new Map() } as never,
       modelCatalog: service as never,
     } as never);
     const d = router.describeConfig({

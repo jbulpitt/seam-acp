@@ -356,7 +356,9 @@ describe("configuration scope through the real dispatcher", () => {
     const rider = h.config.threadPresets.get(THREAD)?.rider;
     const channel = { platform: "discord", id: THREAD, parentId: PARENT };
     const draft = await h.ui.openConfigEditorCard(channel, actor.id, "channel") as ThreadConfigDraft;
-    h.ui.configEditor.put({ ...draft, overlay: { channelRider: "Channel rule", model: "claude-default" } });
+    let next = applyPickerValue(draft, "model", "claude-default", () => undefined);
+    next = applyPickerValue(next, "rider", "Channel rule", () => undefined);
+    h.ui.configEditor.put(next);
     await h.ui.handleConfigEditorComponent({ kind: "button", customId: `seam-cfg-edit:${draft.id}:save`,
       channel, messageId: draft.messageId, userId: actor.id, userName: actor.name,
       followUpEphemeral: vi.fn(async () => {}) });
@@ -553,7 +555,7 @@ describe("explicit parent configuration cleanup", () => {
     const childRider = h.config.threadPresets.get(THREAD)?.rider;
     const preview = await h.cleanup.preview();
     expect(await h.cleanup.apply(preview, actor)).toBe(1);
-    expect(h.config.threadPresets.get(PARENT)).toEqual({ rider: parentRider });
+    expect(JSON.parse(fs.readFileSync(h.file, "utf8")).threads[PARENT]).toEqual({ rider: parentRider });
     expect(h.config.threadPresets.get(THREAD)?.rider).toEqual(childRider);
     expect(h.config.channelPresets.get(PARENT)?.rider).toBeUndefined();
     expect(preview.entries[0]?.overrides).not.toHaveProperty("rider");

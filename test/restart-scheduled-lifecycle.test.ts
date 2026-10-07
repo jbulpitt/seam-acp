@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { pino } from "pino";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
+import { withHarnessPreamble } from "../packages/core/src/core/agent-conventions.js";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
 import { discordRenderer } from "../packages/core/src/platforms/discord/renderer.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
@@ -16,6 +17,7 @@ import { attachLocalBridge } from "./local-bridge-fixture.js";
 import { DispatchSuspendedError } from "../packages/core/src/core/dispatch/attempt-store.js";
 
 const transport = vi.hoisted(() => ({ prompt: vi.fn(), load: vi.fn(), fresh: vi.fn(), delete: vi.fn(), dispose: vi.fn() }));
+const RIDERS = ["SCHEDULE_CHANNEL_RIDER", "SCHEDULE_THREAD_RIDER"];
 vi.mock("../packages/core/src/agents/agent-runtime.js", async importOriginal => {
   const actual = await importOriginal<typeof import("../packages/core/src/agents/agent-runtime.js")>();
   return { ...actual, AgentRuntime: class {
@@ -69,7 +71,9 @@ function setup(mode: "live" | "isolated" = "isolated", agentId = "codex") {
   const make = () => attachLocalBridge(new Orchestrator({ logger: pino({ level: "silent" }) as any, store, router: router as any,
     adapter: adapter as any, renderer: discordRenderer as any, modelCatalog: fixtureModelCatalog([profile]),
     config: { DATA_DIR: dir, REPOS_ROOT: "/synthetic", REPO_EMOJIS: new Map(), TURN_TIMEOUT_SECONDS: 60,
-      SEAM_TURN_RESUME_ENABLED: true, channelPresets: new Map(), threadPresets: new Map() } as any }), [profile], dir);
+      SEAM_TURN_RESUME_ENABLED: true,
+      channelPresets: new Map([["parent", { rider: { value: RIDERS[0] } }]]),
+      threadPresets: new Map([["worker", { rider: { value: RIDERS[1] } }]]) } as any }), [profile], dir);
   return { dir, store, make, adapter, row, router };
 }
 
@@ -415,7 +419,9 @@ describe("#252 actual isolated scheduler + injectTurn, synthetic transport", () 
     expect(transport.fresh).not.toHaveBeenCalled(); expect(transport.prompt).not.toHaveBeenCalled();
     transport.prompt.mockResolvedValue({ stopReason: "end_turn" });
     await h.make().runScheduledPrompt(h.row.id, key);
-    expect(transport.prompt.mock.calls[0]?.[0]).toBe(h.row.promptText);
+    expect(transport.prompt.mock.calls[0]?.[0]).toBe(withHarnessPreamble(h.row.promptText, RIDERS));
+    const submitted = String(transport.prompt.mock.calls[0]?.[0]);
+    expect(submitted.indexOf(RIDERS[0]!)).toBeLessThan(submitted.indexOf(RIDERS[1]!));
     expect(h.store.turnAttempts.get(key.id)).toMatchObject({ generation: 2, state: "completed" });
   });
 

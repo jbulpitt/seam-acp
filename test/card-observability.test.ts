@@ -453,8 +453,8 @@ function makeOrch(opts: {
     SEAM_DISPATCH_STATUS_PANEL: opts.statusPanel !== false,
     REPO_EMOJIS: new Map<string, string>(),
     DISCORD_USER_NAMES: new Map<string, string>(),
-    channelPresets: {},
-    threadPresets: {},
+    channelPresets: new Map(),
+    threadPresets: new Map(),
   };
   return new Orchestrator({
     logger: silent,

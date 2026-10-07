@@ -1188,10 +1188,14 @@ export function resolveChannelPreset(
   config: Pick<Config, "channelPresets" | "threadPresets">,
   parentId: string | undefined,
   threadId: string | undefined
-): PresetValues & { riders: string[] } {
+): PresetValues & { riders: string[]; ridersByScope: { channel?: string; thread?: string } } {
   const chan = (parentId && config.channelPresets.get(parentId)) || undefined;
   const thread = (threadId && config.threadPresets.get(threadId)) || undefined;
-  const riders = [chan?.rider?.value, thread?.rider?.value].filter(
+  const ridersByScope = {
+    ...(chan?.rider?.value ? { channel: chan.rider.value } : {}),
+    ...(thread?.rider?.value ? { thread: thread.rider.value } : {}),
+  };
+  const riders = [ridersByScope.channel, ridersByScope.thread].filter(
     (v): v is string => !!v
   );
   return {
@@ -1201,6 +1205,7 @@ export function resolveChannelPreset(
     cwd: thread?.cwd ?? chan?.cwd,
     effort: thread?.effort ?? chan?.effort,
     riders,
+    ridersByScope,
     disableThreadPrefix:
       thread?.disableThreadPrefix?.value === true || chan?.disableThreadPrefix?.value === true
         ? { value: true }

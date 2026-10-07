@@ -139,8 +139,8 @@ function makeOrch(opts: {
     // restores the ▶ line". Panel-on behavior is covered in
     // dispatch-status-panel.test.ts.
     SEAM_DISPATCH_STATUS_PANEL: false,
-    channelPresets: {},
-    threadPresets: {},
+    channelPresets: new Map(),
+    threadPresets: new Map(),
   };
   const orchestrator = new Orchestrator({
     logger: opts.logger ?? silent,

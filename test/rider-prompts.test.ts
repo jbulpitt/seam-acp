@@ -104,6 +104,15 @@ function setup(parentRef: string | null = PARENT) {
 }
 
 describe("current channel and thread riders at the ACP prompt boundary", () => {
+  it("keeps channel then thread riders on the ordinary live-turn pipeline", async () => {
+    const h = setup();
+    await (h.orch as any).executeIncomingMessage({ messageId: "1550000000000000011",
+      channel: { platform: "discord", id: THREAD }, authorId: "user", authorIsBot: false, text: "Ordinary task." });
+    expect(h.prompts).toHaveLength(1);
+    expectRiders(h.prompts[0]!);
+    expect(h.prompts[0]).toContain("Ordinary task.");
+  });
+
   it.each([
     ["handoff", "live"], ["handoff", "isolated"], ["forward", "live"],
     ["wake", "live"], ["choice", "live"], ["choice", "isolated"],
@@ -145,19 +154,25 @@ describe("current channel and thread riders at the ACP prompt boundary", () => {
     expect(h.prompts[0]).toContain(row.promptText);
   });
 
-  it("uses authoring riders for headless ingest, not the notification thread", async () => {
+  it.each([null, "1550000000000000003"])("uses authoring riders for headless ingest with notification %s", async notifyThread => {
     const h = setup();
+    if (notifyThread) {
+      h.config.threadPresets.set(notifyThread, { rider: { value: "NOTIFICATION_ONLY_RIDER" } });
+      h.router.ensureSessionRecord({ platform: "discord", channelRef: notifyThread,
+        parentRef: "1550000000000000004", cwd: h.cwd });
+    }
     h.store.insertIngestEndpoint({ id: "ie_riders", tokenHash: "fixture", name: "Rider ingest",
       cwd: h.cwd, location: "local", agentId: h.profile.id, model: MODEL, effort: null,
-      wrapper: null, resultSchema: null, corsOrigins: null, uniqueStudent: false, notifyThread: null,
+      wrapper: null, resultSchema: null, corsOrigins: null, uniqueStudent: false, notifyThread,
       thread: null, preset: null, status: "open", createdBy: h.record.id, createdUtc: new Date().toISOString(),
       authoringChannelRef: THREAD, authoringParentRef: PARENT, platform: "discord" });
-    const result = await h.orch.dispatchInjectTurn({ id: "rider-ingest", target: "ingest:ie_riders",
+    const result = await h.orch.dispatchInjectTurn({ id: "rider-ingest", target: notifyThread ?? "ingest:ie_riders",
       prompt: "Ingest task.", kind: "ingest", session: "isolated", correlationId: "ie_riders",
       createdUtc: new Date().toISOString() });
     expect(result.output).toBe("Fixture completed.");
     expect(h.prompts).toHaveLength(1);
     expectRiders(h.prompts[0]!);
+    expect(h.prompts[0]).not.toContain("NOTIFICATION_ONLY_RIDER");
     expect(h.prompts[0]).toContain("Ingest task.");
   });
 

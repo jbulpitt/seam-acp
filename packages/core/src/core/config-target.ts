@@ -9,9 +9,14 @@ export function configTarget(channel: ChannelRef, scope?: string | null): Config
     : { kind: "thread", id: channel.id, parentRef: channel.parentId };
 }
 
-export const CONFIG_DEFAULT_FIELDS = ["agent", "model", "effort", "cwd", "role", "disableThreadPrefix", "statusCardStyle", "simpleCardGif", "rider"] as const;
+/** Thread overrides replace these channel defaults. Riders are additive. */
+export const CONFIG_DEFAULT_FIELDS = ["agent", "model", "effort", "cwd", "role", "disableThreadPrefix", "statusCardStyle", "simpleCardGif"] as const;
 export type ConfigDefaultField = typeof CONFIG_DEFAULT_FIELDS[number];
 export type OverrideCounts = Partial<Record<ConfigDefaultField, number>>;
+
+export function configOverrideFields(fields: readonly string[]): ConfigDefaultField[] {
+  return CONFIG_DEFAULT_FIELDS.filter(field => fields.includes(field));
+}
 
 export function formatOverrideCounts(counts: OverrideCounts): string {
   return Object.entries(counts).map(([key, count]) => `${key}: ${count}`).join(", ") || "none";

@@ -720,11 +720,6 @@ export class SessionRouter {
         : null,
     };
 
-    const rider: { channel?: string; thread?: string } = {
-      ...(chan?.rider?.value ? { channel: chan.rider.value } : {}),
-      ...(thread?.rider?.value ? { thread: thread.rider.value } : {}),
-    };
-
     const statusCardStyle: ResolvedSetting<StatusCardStyle> =
       cfg.statusCardStyle === "simple" || cfg.statusCardStyle === "full"
         ? { value: cfg.statusCardStyle, source: "session config" }
@@ -769,7 +764,7 @@ export class SessionRouter {
       ttsStyle,
       location,
       catalog,
-      rider,
+      rider: preset.ridersByScope,
       statusCardStyle,
       simpleCardGif,
       disableThreadPrefix,

@@ -12,6 +12,7 @@ import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrato
 import { SessionStore } from "../packages/core/src/core/session-store.js";
 import { SessionRouter } from "../packages/core/src/core/session-router.js";
 import { SeamTokenRegistry } from "../packages/core/src/core/mcp/token-registry.js";
+import { withHarnessPreamble } from "../packages/core/src/core/agent-conventions.js";
 import { discordRenderer } from "../packages/core/src/platforms/discord/renderer.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 import type { ScheduledPrompt } from "../packages/core/src/core/scheduled-prompts/types.js";
@@ -21,6 +22,7 @@ import { simulateRetiredOwnerProcess } from "./restart-process-fixture.js";
 
 const REMOTE = "remote-synthetic";
 const MODEL = "synthetic-exact-model";
+const RIDERS = ["SCHEDULE_CHANNEL_RIDER", "SCHEDULE_THREAD_RIDER"];
 const OVERRIDE_MODEL = "synthetic-override-model";
 const silent = pino({ level: "silent" }) as any;
 const cleanups: Array<() => void> = [];
@@ -109,7 +111,9 @@ function setup(location = REMOTE) {
     const orch = new Orchestrator({ logger, store, router: router as any, adapter: adapter as any,
       renderer: discordRenderer, modelCatalog: fixtureModelCatalog([profile]),
       config: { DATA_DIR: cwd, REPOS_ROOT: cwd, TURN_TIMEOUT_SECONDS: 15, SEAM_TURN_RESUME_ENABLED: true,
-        REPO_EMOJIS: new Map(), channelPresets: new Map(), threadPresets: new Map() } as any });
+        REPO_EMOJIS: new Map(),
+        channelPresets: new Map([["parent", { rider: { value: RIDERS[0] } }]]),
+        threadPresets: new Map([["author", { rider: { value: RIDERS[1] } }]]) } as any });
     orch.setBridgeHub(hub as any);
     return orch;
   };
@@ -281,7 +285,9 @@ describe("#466 scheduled execution boundary", () => {
     expect(h.calls.news).toEqual([expect.objectContaining({ cwd: h.cwd, mcpServers: [h.globalMcp, h.remoteSeam] })]);
     expect(h.calls.configs).toEqual([]); // The advertised model is already exact.
     expect(h.calls.prompts).toHaveLength(1);
-    expect(h.calls.prompts[0].prompt).toEqual([{ type: "text", text: h.row.promptText }]);
+    expect(h.calls.prompts[0].prompt).toEqual([{ type: "text", text: withHarnessPreamble(h.row.promptText, RIDERS) }]);
+    const submitted = h.calls.prompts[0].prompt[0].text as string;
+    expect(submitted.indexOf(RIDERS[0]!)).toBeLessThan(submitted.indexOf(RIDERS[1]!));
     expect(h.adapter.sendPanel).toHaveBeenLastCalledWith(expect.objectContaining({ id: "output" }),
       expect.objectContaining({ description: "synthetic result", fields: expect.arrayContaining([{ name: "Host", value: `\`${REMOTE}\``, inline: true }]) }), expect.anything());
     expect(h.store.get(h.record.id)?.acpSessionId).toBe("live-session-untouched");
@@ -360,7 +366,8 @@ describe("#466 scheduled execution boundary", () => {
     expect(h.calls.news).toHaveLength(1);
     expect(h.calls.loads).toEqual([expect.objectContaining({ sessionId: "scheduled-acp", cwd: h.cwd })]);
     const sent = h.calls.prompts.map(p => p.prompt[0].text as string);
-    expect(sent[0]).toBe(h.row.promptText);
+    expect(sent[0]).toBe(withHarnessPreamble(h.row.promptText, RIDERS));
+    expect(sent[0]!.indexOf(RIDERS[0]!)).toBeLessThan(sent[0]!.indexOf(RIDERS[1]!));
     expect(sent[1]?.startsWith("continue\n")).toBe(true);
     expect(sent[1]).toContain("The process restarted while the turn was in flight.");
     expect(sent[1]).toContain(`The session runs on ${REMOTE}. This resume does not include that host's git state.`);

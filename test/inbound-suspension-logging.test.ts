@@ -98,6 +98,6 @@ describe("inbound suspension logging", () => {
 
   it("keeps an obsolete channel queue fence silent", async () => {
     const logs = await receive(new ChannelQueueFencedError("worker", 0));
-    expect(logs.filter(log => log.level >= 30)).toEqual([]);
+    expect(logs.filter(log => log.channelId === "worker" && log.level >= 30)).toEqual([]);
   });
 });

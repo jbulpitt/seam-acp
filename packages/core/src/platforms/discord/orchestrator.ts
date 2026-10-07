@@ -19621,11 +19621,16 @@ export class Orchestrator {
     opts?: { pendingSelection?: number[] }
   ): Promise<void> {
     if (!card.messageId || !this.adapter.editChoiceCard) return;
+    const parked = card.options.map(option => parkedTurnAction(option.payload)).find(Boolean);
+    const attempt = parked ? this.store.turnAttempts.get(parked.attemptId) : null;
+    const statusLabel = attempt?.state === "cancelled" ? "Cancelled"
+      : attempt?.state === "completed" ? attempt.outcome?.status === "failed" ? "Failed" : "Completed"
+      : undefined;
     try {
       await this.adapter.editChoiceCard(
         { channel: { platform: PLATFORM, id: card.channelRef }, id: card.messageId },
         {
-          panel: renderChoicePanel(card),
+          panel: renderChoicePanel(card, statusLabel),
           choiceId: card.id,
           options: card.options.map((o) => ({ label: o.label, kind: o.kind })),
           disabled: card.status !== "open",

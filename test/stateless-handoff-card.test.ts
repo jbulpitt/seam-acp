@@ -511,6 +511,7 @@ describe("stateless/preset handoff embed card", () => {
     (orch as any).store.getPresetByName = () => null;
     const remote = fakeRemoteHub({});
     const hub = Object.create(BridgeHub.prototype) as any;
+    hub.readyEvents = new EventEmitter();
     hub.connections = new Map([["legacy-mac", {
       host: { os: "darwin", arch: "arm64" },
       mux: remote.hub.get().mux,

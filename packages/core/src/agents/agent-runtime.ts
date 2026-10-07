@@ -1032,6 +1032,7 @@ export class AgentRuntime {
             throw new Error(`failed to set initial model "${wantedModel}": ${detail}`);
           }
           this.logger.warn({ err, wantedModel }, "failed to set initial model");
+          this.queueRejectedModelNotice(wantedModel, err);
         }
       }
     }
@@ -1145,6 +1146,7 @@ export class AgentRuntime {
             );
           }
           this.logger.warn({ err, wantedModel }, "failed to re-apply model on session load");
+          this.queueRejectedModelNotice(wantedModel, err);
         }
       }
     }
@@ -1746,6 +1748,16 @@ export class AgentRuntime {
   queueModelFallbackNotice(notice: string): void {
     this.lastModelFallbackNotice = notice;
     this.pendingModelNotices.push(notice);
+  }
+
+  private queueRejectedModelNotice(modelId: string, error: unknown): void {
+    const code = error && typeof error === "object" && "code" in error ? error.code : undefined;
+    const codeDetail = typeof code === "number" || typeof code === "string" ? ` (code ${code})` : "";
+    const selected = this.sessionInfo?.currentModelId;
+    this.pendingModelNotices.push(
+      `⚠️ Could not apply requested model \`${modelId}\`: ${errorMessage(error) || String(error)}${codeDetail}. ` +
+      `Continuing with ${selected ? `the provider-selected model \`${selected}\`` : "the provider's current model"}.`
+    );
   }
 
   async setModel(modelId: string, opts?: { allowFallback?: boolean; effort?: string }): Promise<void> {

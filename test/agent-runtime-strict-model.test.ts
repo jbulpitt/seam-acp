@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
+import { RequestError } from "@agentclientprotocol/sdk";
 import { AgentRuntime } from "../packages/core/src/agents/agent-runtime.js";
-import type { AgentProfile } from "@seam/adapters";
+import { classifyCodexError, type AgentProfile } from "@seam/adapters";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 
 const fakeProfile = { id: "claude" } as unknown as AgentProfile;
@@ -25,6 +26,7 @@ function makeLogger() {
 
 class FakeConn {
   setModelShouldReject = false;
+  setModelError?: Error;
   setModelCalls = 0;
   initialConfigOptions: unknown = null;
   nextConfigOptions: unknown = null;
@@ -33,7 +35,7 @@ class FakeConn {
     return { sessionId: "fresh-session", configOptions: this.initialConfigOptions, modes: null };
   }
   async loadSession(params: { sessionId: string }) {
-    return { sessionId: params.sessionId, configOptions: null, modes: null };
+    return { sessionId: params.sessionId, configOptions: this.initialConfigOptions, modes: null };
   }
   async prompt() {
     return { stopReason: "end_turn" };
@@ -42,6 +44,7 @@ class FakeConn {
   async setSessionMode() {}
   async setSessionConfigOption() {
     this.setModelCalls += 1;
+    if (this.setModelError) throw this.setModelError;
     if (this.setModelShouldReject) {
       throw new Error("Invalid value for config option model: claude-opus-5");
     }
@@ -49,9 +52,9 @@ class FakeConn {
   }
 }
 
-function makeRuntime() {
+function makeRuntime(profile = fakeProfile) {
   const { logger, warns } = makeLogger();
-  const rt = new AgentRuntime({ profile: fakeProfile, logger, spawnFn: () => { throw new Error("unused"); } });
+  const rt = new AgentRuntime({ profile, logger, spawnFn: () => { throw new Error("unused"); } });
   const conn = new FakeConn();
   (rt as unknown as { connection: unknown }).connection = conn;
   (rt as unknown as { promptCapabilities: unknown }).promptCapabilities = {};
@@ -59,6 +62,31 @@ function makeRuntime() {
 }
 
 describe("AgentRuntime strictModel", () => {
+  it.each(["newSession", "loadSession"] as const)("surfaces the real Codex model rejection and continued selection once from %s", async method => {
+    const { rt, conn } = makeRuntime({ ...fakeProfile, id: "codex", classifyError: classifyCodexError });
+    conn.setModelError = new RequestError(-32602, "Invalid params", null);
+    conn.initialConfigOptions = [{
+      id: "model", name: "Model", category: "model", type: "select",
+      currentValue: "gpt-6-astra", options: [{ name: "GPT 6", value: "gpt-6-astra" }],
+    }];
+    const events: Array<{ kind: string; message?: string }> = [];
+    rt.onEvent(event => { events.push(event); });
+    const input = { cwd: "/tmp", model: "seam-629-not-a-model" };
+    const info = method === "newSession" ? await rt.newSession(input)
+      : await rt.loadSession({ ...input, sessionId: "existing-session" });
+    expect(info.currentModelId).toBe("gpt-6-astra");
+    expect(conn.setModelCalls).toBe(1);
+    expect(events).toEqual([]);
+    await rt.prompt("first prompt");
+    await rt.prompt("second prompt");
+    const notices = events.filter(event => event.kind === "recovery");
+    expect(notices).toHaveLength(1);
+    expect(notices[0]!.message).toContain("seam-629-not-a-model");
+    expect(notices[0]!.message).toContain("Invalid params");
+    expect(notices[0]!.message).toContain("-32602");
+    expect(notices[0]!.message).toContain("gpt-6-astra");
+  });
+
   it("throws from newSession when strictModel is true and setModel rejects", async () => {
     const { rt, conn } = makeRuntime();
     conn.setModelShouldReject = true;

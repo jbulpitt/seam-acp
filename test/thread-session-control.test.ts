@@ -521,6 +521,25 @@ describe("ThreadSessionControlService", () => {
     expect(h.identityCommitted).toHaveBeenCalledOnce();
   });
 
+  it.each([false, true])("stages an unlisted migration without requiring a catalog (warm=%s)", async warm => {
+    const cache = await passthroughCatalog(warm);
+    try {
+      const h = harness({ catalog: cache.catalog, location: "macos-a" });
+      const prepared = await h.service.prepareSelfMigration(h.target, {
+        model: "My-Typed-Model", manifest: "Continue on the typed provider model.",
+      });
+      expect(prepared).toMatchObject({ ok: true, migration: { agent: "claude", model: "My-Typed-Model" } });
+      if (!prepared.ok) throw new Error(prepared.error);
+      expect(prepared.warnings).toEqual([expect.stringContaining("the provider will validate the typed id")]);
+      expect(prepared.migration.effort).toBeUndefined();
+      expect(h.mutations).toEqual([]);
+      expect(h.invalidated).toEqual([]);
+      expect(await h.service.executeSelfMigration(h.target, prepared.migration)).toMatchObject({
+        ok: true, model: "My-Typed-Model", effort: "auto", newSessionId: "session-new-1",
+      });
+    } finally { cache.close(); }
+  });
+
   it("always forges a fresh session for migrate_self, including a Claude model switch", async () => {
     const h = harness();
     const prepared = await h.service.prepareSelfMigration(h.target, {

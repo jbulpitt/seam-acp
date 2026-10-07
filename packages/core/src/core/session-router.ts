@@ -336,6 +336,7 @@ export class SessionRouter {
   private readonly profileSessions?: (id: string, location: string) => AgentProfile["sessionManager"];
   private readonly modelCatalog: ModelCatalogService;
   private readonly profileMetadata?: (id: string, location: string) => AgentClientMetadata | undefined;
+  private readonly claudeSessionOptions?: AgentClientMetadata["claudeSessionOptions"];
   private readonly modelMetadata?: Pick<ModelMetadataStore, "getAll">;
   private readonly defaultAgentId: string;
   private readonly defaultPermissionMode: PermissionPolicyMode;
@@ -379,6 +380,7 @@ export class SessionRouter {
     profiles: AgentProfile[];
     modelCatalog: ModelCatalogService;
     profileMetadata?: (id: string, location: string) => AgentClientMetadata | undefined;
+    claudeSessionOptions?: AgentClientMetadata["claudeSessionOptions"];
     profileIds?: (location: string) => Iterable<string>;
     profileCatalog?: (id: string, location: string) => AgentProfile["catalog"] | undefined;
     profileSessions?: (id: string, location: string) => AgentProfile["sessionManager"];
@@ -415,6 +417,7 @@ export class SessionRouter {
     this.profileById = new Map(opts.profiles.map((p) => [p.id, p]));
     this.modelCatalog = opts.modelCatalog;
     this.profileMetadata = opts.profileMetadata;
+    this.claudeSessionOptions = opts.claudeSessionOptions;
     this.profileIds = opts.profileIds;
     this.profileCatalog = opts.profileCatalog;
     this.profileSessions = opts.profileSessions;
@@ -494,7 +497,7 @@ export class SessionRouter {
     const catalog = this.profileCatalog?.(id, location) ?? cached?.catalog ?? known?.catalog;
     if (!known && !metadata && !cached) return undefined;
     const profile = metadata || !known
-      ? controllerMetadataAdapter(known ?? cached ?? { id, catalog: catalog! }, metadata, catalog)
+      ? controllerMetadataAdapter(known ?? cached ?? { id, catalog: catalog! }, metadata, catalog, this.claudeSessionOptions)
       : known;
     const manager = this.profileSessions?.(id, location);
     return Object.assign(profile, { sessionManager: manager ?? known?.sessionManager });

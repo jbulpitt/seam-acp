@@ -339,6 +339,10 @@ async function main(): Promise<void> {
     store,
     profiles: [],
     modelCatalog,
+    claudeSessionOptions: {
+      thinkingDisplay: config.CLAUDE_THINKING_DISPLAY,
+      compactionTokenThreshold: config.CLAUDE_COMPACTION_TOKEN_THRESHOLD,
+    },
     profileMetadata: (id, location) => bridgeHub?.get(location)?.agents.get(id)?.metadata,
     profileIds: location => bridgeHub?.installedAgentsByHost().get(location)
       ?? modelCatalog.knownBindings().filter(binding => binding.location === location).map(binding => binding.agentId),

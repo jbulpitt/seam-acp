@@ -239,10 +239,11 @@ describe("AGY HOME startup sweep wiring", () => {
     const core = fs.readFileSync(path.resolve("packages/core/src/index.ts"), "utf8");
     const coreSweep = core.indexOf("const agyHomeSweep = await sweepAgyMcpHomes();");
     expect(coreSweep).toBeGreaterThan(-1);
+    const quotaConstruction = core.indexOf("const quotaProfiles = controllerQuotaProfiles(config, logger);");
+    expect(quotaConstruction).toBeGreaterThan(coreSweep);
+    const quota = fs.readFileSync(path.resolve("packages/core/src/core/quota/controller-profiles.ts"), "utf8");
     for (const factory of ["makeAgyUnpinnedRuntime({", "makeAgyNativeRuntime({"]) {
-      const coreAgyConstruction = core.indexOf(factory);
-      expect(coreAgyConstruction).toBeGreaterThan(-1);
-      expect(coreSweep).toBeLessThan(coreAgyConstruction);
+      expect(quota.indexOf(factory)).toBeGreaterThan(-1);
     }
 
     const bridge = fs.readFileSync(path.resolve("packages/bridge/src/index.ts"), "utf8");

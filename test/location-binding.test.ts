@@ -122,6 +122,11 @@ describe("markSessionBridge is called on start when location is a bridge id (#84
   it("plans a remote-only advertised agent without a controller-local profile", () => {
     const remote = stubProfile("remote-grok", []);
     const catalog = fixtureModelCatalog([remote]);
+    const lookup = catalog.lookup.bind(catalog);
+    catalog.lookup = binding => {
+      const found = lookup(binding);
+      return binding.location === "mac" ? found : { ...found, state: "warming", snapshot: null };
+    };
     const threadPresets = new Map<string, ThreadPreset>([["thread-1", { location: "mac" }]]);
     const router = new SessionRouter({
       logger: silent,

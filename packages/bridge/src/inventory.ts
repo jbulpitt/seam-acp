@@ -381,8 +381,9 @@ export function inventoryFromAdapters(
       /* keep default */
     }
     const runtime = adapter.describe().runtime;
+    const scope = adapter.catalog.scope();
     const metadata = {
-      catalogScope: adapter.catalog.scope(),
+      catalogScope: { fingerprint: scope.fingerprint, provider: scope.provider, sharing: scope.sharing },
       sessionManagement: adapter.sessionManager ? {
         history: !!adapter.sessionManager.getHistoryPath,
         repair: !!adapter.sessionManager.repairSession,

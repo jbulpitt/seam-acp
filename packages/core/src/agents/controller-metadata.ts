@@ -5,6 +5,7 @@ export function controllerMetadataAdapter(
   profile: Pick<AgentProfile, "id" | "catalog"> & Partial<AgentProfile>,
   metadata?: AgentClientMetadata,
   catalog: AdapterCatalogSource = profile.catalog,
+  claudeSessionOptions?: AgentClientMetadata["claudeSessionOptions"],
 ): AgentProfile {
   return asLocalAdapter({
     id: profile.id, displayName: metadata?.displayName ?? profile.displayName!, defaultModel: metadata?.defaultModel ?? profile.defaultModel!,
@@ -30,6 +31,7 @@ export function controllerMetadataAdapter(
     ...(metadata?.claudeSessionOptions ? {
       newSessionMeta: (model?: string, effort?: string) => claudeSessionMetadata({
         defaultModel: metadata.defaultModel, ...metadata.claudeSessionOptions,
+        ...claudeSessionOptions,
       }, model, effort),
     } : {}),
     spawn(): never { throw new Error(`agent ${profile.id} cannot be spawned on the controller`); },

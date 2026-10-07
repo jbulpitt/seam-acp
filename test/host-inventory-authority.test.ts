@@ -74,4 +74,25 @@ describe("the bridge is authoritative on every host", () => {
     expect(router.getProfile("copilot")!.classifyError!(new Error("copilot ACP advertised no model config options")))
       .toMatchObject({ errorKind: "capability_absent", agentId: "copilot" });
   });
+
+  it.each(["local", "remote-645"])("keeps Claude ACP client policy on %s without a launch profile", location => {
+    const metadata = {
+      displayName: "Claude", defaultModel: "claude-opus-5-5",
+      claudeSessionOptions: {}, sessionManagement: null,
+      catalogScope: { fingerprint: "c".repeat(64), provider: "anthropic" },
+    };
+    const catalog = { scope: () => metadata.catalogScope, fetch: async () => { throw new Error("unused catalog fetch"); } };
+    const router = new SessionRouter({
+      logger: pino({ level: "silent" }) as any, store: {} as any, profiles: [],
+      modelCatalog: { lookup: () => ({ snapshot: null }) } as any,
+      defaultAgentId: "claude", defaultModel: metadata.defaultModel,
+      profileMetadata: () => metadata, profileCatalog: () => catalog,
+      claudeSessionOptions: { thinkingDisplay: "summarized", compactionTokenThreshold: 0.8 },
+    });
+    expect(router.getProfile("claude", location)!.newSessionMeta!(metadata.defaultModel, "high"))
+      .toMatchObject({ claudeCode: { options: {
+        effort: "high", thinking: { type: "adaptive", display: "summarized" },
+        compactionControl: { enabled: true, contextTokenThreshold: 800_000 },
+      } } });
+  });
 });

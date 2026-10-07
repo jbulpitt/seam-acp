@@ -5582,7 +5582,7 @@ export class Orchestrator {
     profile: AgentProfile,
     agentId: string,
     location: string
-  ): ISessionManager | undefined {
+  ): ISessionManager {
     return remoteSessionManager(this.bridgeHub, location, agentId, {
       history: !!profile.sessionManager?.getHistory || !!profile.sessionManager?.getHistoryPath,
       repair: !!profile.sessionManager?.repairSession,
@@ -6832,12 +6832,6 @@ export class Orchestrator {
       throw new Error(`Agent profile "${agentId}" not found, so this thread has no compactable session.`);
     }
     const manager = this.sessionManagerFor(profile, agentId, location);
-    if (!manager) {
-      throw new Error(
-        `Agent \`${agentId}\` (${profile.displayName}) does not support session management, ` +
-          `so it has no compactable session.`
-      );
-    }
     const sessionId = opts?.sessionId ?? record.acpSessionId;
     if (!sessionId) {
       throw new Error("This thread has no active session to compact yet.");
@@ -17189,11 +17183,6 @@ export class Orchestrator {
     // this temporary AgentRuntime a bypass around normal turn resolution.
     this.router.assertAgentAllowedForRecord(record, profile.id);
     const manager = this.sessionManagerFor(profile, compactAgentId, compactLocation);
-    if (!manager) {
-      throw new Error(
-        `Agent profile \`${compactAgentId}\` (${profile.displayName}) does not support session management.`
-      );
-    }
     if (typeof this.adapter.fetchThreadMessages !== "function") {
       throw new Error("Chat adapter does not support fetching thread messages.");
     }
@@ -17799,7 +17788,6 @@ export class Orchestrator {
       const profile = this.router.getProfile(binding.agentId, binding.location);
       if (!profile) throw new Error(`Agent profile "${binding.agentId}" at "${binding.location}" not found.`);
       const manager = this.sessionManagerFor(profile, binding.agentId, binding.location);
-      if (!manager) throw new Error(`Agent profile \`${binding.agentId}\` (${profile.displayName}) does not support session management.`);
       return { profile, manager };
     };
     const facade: SessionBrowserFacade = {

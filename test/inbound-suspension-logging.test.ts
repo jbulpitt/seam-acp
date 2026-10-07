@@ -23,7 +23,11 @@ async function receive(error: Error) {
   const host = new Orchestrator({ logger, store, modelCatalog: fixtureModelCatalog([]),
     config: { DATA_DIR: dir, REPOS_ROOT: dir, TURN_TIMEOUT_SECONDS: 60,
       channelPresets: new Map(), threadPresets: new Map(), bridgePresets: new Map() } as never,
-    router: { listProfiles: () => [], ensureSessionRecord: () => record } as never,
+    router: { listProfiles: () => [], ensureSessionRecord: () => record,
+      describeConfig: () => ({ agent: { value: "codex" }, model: { value: "fixture-model" },
+        role: { value: null }, disableThreadPrefix: { value: false },
+        effort: { value: null }, location: { value: "local" }, cwd: { value: dir } }),
+    } as never,
     adapter: {} as never, renderer: {} as never,
   });
   const message: IncomingMessage = { messageId: "901", channel: { platform: "discord", id: "worker" },

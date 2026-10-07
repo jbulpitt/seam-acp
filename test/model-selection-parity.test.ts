@@ -42,6 +42,8 @@ vi.mock("../packages/core/src/agents/agent-runtime.js", async importOriginal => 
 
 const logger = pino({ level: "silent" });
 const typed = "My-Typed-Model";
+const worker = "111111111111111111";
+const parent = "222222222222222222";
 const paths = ["command", "configure_thread", "migrate_self"] as const;
 const cleanup: Array<() => Promise<void> | void> = [];
 let dir: string;
@@ -62,14 +64,14 @@ async function fixture(warm: boolean) {
   cleanup.push(() => store.close());
   const profile = { id: "claude", defaultModel: "known", effort: { mechanism: "meta", levels: ["low", "high"] } } as AgentProfile;
   const previousPreset: ThreadPreset = { effort: { value: "low" } };
-  const threadPresets = new Map<string, ThreadPreset>([["worker", previousPreset]]);
+  const threadPresets = new Map<string, ThreadPreset>([[worker, previousPreset]]);
   const presetsFile = path.join(dir, "presets.json");
-  fs.writeFileSync(presetsFile, JSON.stringify({ channels: {}, threads: { worker: previousPreset } }));
+  fs.writeFileSync(presetsFile, JSON.stringify({ channels: {}, threads: { [worker]: previousPreset } }));
   const router = new SessionRouter({
     logger, store, profiles: [profile], modelCatalog: cache.catalog, threadPresets,
     defaultAgentId: "claude", defaultModel: "known", seamMcp: localBridgeWiring(profile),
   });
-  const initial = router.ensureSessionRecord({ platform: "discord", channelRef: "worker", parentRef: "parent", cwd: dir });
+  const initial = router.ensureSessionRecord({ platform: "discord", channelRef: worker, parentRef: parent, cwd: dir });
   store.upsert({ ...initial, acpSessionId: "existing-provider-session", configJson: JSON.stringify({ model: "known", reasoningEffort: "low" }) });
   const mutation = new ConfigMutationService({
     logger, store, modelCatalog: cache.catalog, describeConfig: row => router.describeConfig(row), presetsFile,
@@ -94,7 +96,7 @@ async function fixture(warm: boolean) {
   const replies: string[] = [];
   const apply = async (route: typeof paths[number], model = typed, effort?: string) => {
     if (route === "command") {
-      const selected = await runtime.applyModelChange({ platform: "discord", id: initial.channelRef, parentId: "parent" }, record(), model,
+      const selected = await runtime.applyModelChange({ platform: "discord", id: initial.channelRef, parentId: parent }, record(), model,
         { id: "operator", name: "Operator" }, async text => { replies.push(text); });
       expect(selected).toMatchObject({ ok: true });
       return router.getOrStartRuntime(record());
@@ -115,7 +117,7 @@ describe.each([false, true])("unlisted model path parity (warm catalog=%s)", war
     expect(boundary.attempts).toEqual([{ model: typed, effort: undefined }]);
     expect(h.store.readConfig(h.record()).model).toBe(typed);
     expect(h.store.readConfig(h.record()).reasoningEffort).toBeUndefined();
-    expect(h.threadPresets.get("worker")?.model?.value).toBe(typed);
+    expect(h.threadPresets.get(worker)?.model?.value).toBe(typed);
     if (route === "command") expect(h.replies[0]).toContain("unverified");
     if (route === "configure_thread") expect(result).toMatchObject({ ok: true, verification: "unverified" });
     if (route === "migrate_self") expect(result).toMatchObject({ ok: true, model: typed, warnings: [expect.stringContaining("unverified")] });
@@ -129,7 +131,7 @@ describe.each([false, true])("unlisted model path parity (warm catalog=%s)", war
     if (route === "migrate_self") {
       expect(await h.apply(route)).toEqual({ ok: false, error: cause.message });
       expect(h.record()).toEqual(previous);
-      expect(h.threadPresets.get("worker")).toEqual({ effort: { value: "low" } });
+      expect(h.threadPresets.get(worker)).toEqual({ effort: { value: "low" } });
     } else {
       await expect(h.apply(route)).rejects.toBe(cause);
     }
@@ -144,7 +146,7 @@ describe("listed model behavior and explicit unlisted effort", () => {
     await h.apply(route, "Known-Alias");
     expect(boundary.attempts).toEqual([{ model: "known", effort: undefined }]);
     expect(h.store.readConfig(h.record())).toMatchObject({ model: "known", reasoningEffort: "default" });
-    expect(h.threadPresets.get("worker")?.effort?.value).toBe("default");
+    expect(h.threadPresets.get(worker)?.effort?.value).toBe("default");
   });
 
   it.each(["configure_thread", "migrate_self"] as const)("%s forwards explicit effort for an unlisted model", async route => {

@@ -9,10 +9,13 @@
  * credentials and per-slot environment values.
  */
 import type { ChildProcess } from "node:child_process";
+import { writeSync } from "node:fs";
 import {
   unclassified,
   errorMessage,
   errorData,
+  observeOwnedProcessGroups,
+  registerOwnedProcessGroup,
 } from "@seam/adapters";
 import { createLineFramer } from "./output-log.js";
 import { loadHostAdapterInventory } from "./inventory.js";
@@ -36,6 +39,11 @@ const agentOutput = createLineFramer();
 let child: ChildProcess | undefined;
 let bootstrap: AdapterChildBootstrap | undefined;
 let stopping = false;
+
+// This descriptor belongs to the holder, not to the agent's ACP streams.
+if (process.env.SEAM_SLOT_GROUP_FD === "3") {
+  observeOwnedProcessGroups(message => writeSync(3, `${JSON.stringify(message)}\n`));
+}
 
 function publish(message: AdapterChildOutput): void {
   process.stdout.write(adapterChildLine(message));
@@ -89,6 +97,7 @@ function start(config: AdapterChildBootstrap): void {
     return;
   }
   child = spawned;
+  registerOwnedProcessGroup(spawned);
   const permissions = new PendingPermissions(writeAgent);
   const resumeRecord = createResumeRecorder(process.env.SEAM_SESSIOND_RESUME_FILE, config);
   clearResumeRecord = () => resumeRecord.clear();

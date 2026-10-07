@@ -47,6 +47,12 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { PassThrough, type Readable, type Writable } from "node:stream";
 import { setTimeout as delay } from "node:timers/promises";
+import {
+  terminateProcessGroup,
+  PROCESS_GROUP_KILL_GRACE_MS,
+  PROCESS_GROUP_REAP_MS,
+} from "./process-group.js";
+export { terminateProcessGroup } from "./process-group.js";
 
 /** Trailing bytes of stderr retained for (redacted) diagnostics. */
 export const PROBE_STDERR_CAPTURE_BYTES = 4_000;
@@ -55,8 +61,8 @@ export const PROBE_STDOUT_LIMIT_BYTES = 1_000_000;
 /** Hard ceiling on total stderr bytes a probe may receive. */
 export const PROBE_STDERR_LIMIT_BYTES = 256_000;
 export const PROBE_DEFAULT_TIMEOUT_MS = 45_000;
-export const PROBE_DEFAULT_KILL_GRACE_MS = 2_000;
-export const PROBE_DEFAULT_REAP_MS = 2_000;
+export const PROBE_DEFAULT_KILL_GRACE_MS = PROCESS_GROUP_KILL_GRACE_MS;
+export const PROBE_DEFAULT_REAP_MS = PROCESS_GROUP_REAP_MS;
 /**
  * Separate, bounded deadline for FINALIZATION: after cancellation, how long the
  * provider run has to settle so its close registrations are complete. This is
@@ -619,29 +625,6 @@ export async function terminate(
     // Whether or not it fired, this listener is ours to remove.
     if (onExit) child.removeListener("exit", onExit);
   }
-}
-
-/** Own detached process groups only. A leader's exit does not reap its tools. */
-export async function terminateProcessGroup(
-  child: import("node:child_process").ChildProcess,
-  graceMs = PROBE_DEFAULT_KILL_GRACE_MS,
-): Promise<boolean> {
-  const pid = child.pid;
-  if (pid === undefined) return true;
-  const alive = (): boolean => {
-    try { process.kill(-pid, 0); return true; }
-    catch (error) { return (error as NodeJS.ErrnoException).code !== "ESRCH"; }
-  };
-  const wait = async (ms: number): Promise<boolean> => {
-    const until = Date.now() + ms;
-    while (alive() && Date.now() < until) await delay(20);
-    return !alive() && (child.exitCode !== null || child.signalCode !== null);
-  };
-  for (const [signal, ms] of [["SIGTERM", graceMs], ["SIGKILL", PROBE_DEFAULT_REAP_MS]] as const) {
-    try { process.kill(-pid, signal); } catch { /* Verify absence even if signalling failed. */ }
-    if (await wait(ms)) return true;
-  }
-  return false;
 }
 
 function settledWithin(promise: Promise<void>, ms: number): Promise<boolean> {

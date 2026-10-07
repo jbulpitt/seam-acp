@@ -13,6 +13,8 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import fs from "node:fs";
 import net from "node:net";
+import type { Readable } from "node:stream";
+import { terminateProcessGroup, type ProcessGroupOwnership, type ProcessIdentity } from "@seam/adapters/process-group";
 import { createLineFramer } from "./output-log.js";
 import { createNdjsonReader } from "./ndjson-reader.js";
 import {
@@ -38,6 +40,8 @@ let connection: net.Socket | undefined;
 let exitSeq: number | undefined;
 let lingerTimer: ReturnType<typeof setTimeout> | undefined;
 const stdoutFramer = createLineFramer();
+const groups = new Map<number, ProcessIdentity>();
+let finalizing: Promise<void> | undefined;
 
 function send(socket: net.Socket | undefined, message: SlotHolderOutput): boolean {
   if (!socket || socket.destroyed || !socket.writable) return false;
@@ -75,9 +79,9 @@ function startChild(message: Extract<SlotHolderInput, { type: "spawn" }>, socket
   try {
     spawned = spawn(message.executable, message.args ?? [], {
       cwd: message.cwd,
-      env: message.env,
+      env: { ...message.env, SEAM_SLOT_GROUP_FD: "3" },
       shell: false,
-      stdio: ["pipe", "pipe", "pipe"],
+      stdio: ["pipe", "pipe", "pipe", "pipe"],
     });
   } catch (error) {
     send(socket, { v: SLOT_HOLDER_PROTOCOL_VERSION, type: "spawn_result", ok: false,
@@ -100,12 +104,40 @@ function startChild(message: Extract<SlotHolderInput, { type: "spawn" }>, socket
   });
   spawned.stderr.on("data", (chunk: Buffer) => emit({ stream: "stderr", dataBase64: chunk.toString("base64") }));
   spawned.stdin.on("error", () => undefined);
+  const ownershipPipe = spawned.stdio[3] as Readable;
+  const ownershipReader = createNdjsonReader(line => {
+    const message = JSON.parse(line.toString("utf8")) as ProcessGroupOwnership;
+    if (message.type === "own_group") groups.set(message.identity.pgid, message.identity);
+    else if (message.type === "release_group" && groups.get(message.identity.pgid)?.started === message.identity.started) {
+      groups.delete(message.identity.pgid);
+    }
+  }, MAX_BUFFER_BYTES);
+  const ownershipDrained = new Promise<void>(resolve => ownershipPipe.once("end", resolve));
+  ownershipPipe.on("data", (chunk: Buffer) => ownershipReader.push(chunk));
   spawned.on("exit", (code, signal) => {
-    const tail = stdoutFramer.flush();
-    if (tail) emit({ stream: "stdout", dataBase64: Buffer.from(tail).toString("base64") });
-    emit({ stream: "exit", code, signal });
-    exitSeq = seq;
-    lingerTimer = setTimeout(finish, EXIT_LINGER_MS);
+    finalizing ??= (async () => {
+      // Registration bytes can still be buffered when the direct child exits.
+      await ownershipDrained;
+      for (const identity of groups.values()) {
+        for (;;) {
+          try {
+            if (await terminateProcessGroup(identity, 1_000)) break;
+            process.stderr.write(`[slot-holder] process group ${identity.pgid} has not stopped after SIGKILL; waiting before reporting exit\n`);
+          } catch (error) {
+            process.stderr.write(`[slot-holder] process group ${identity.pgid} cleanup failed: ${error instanceof Error ? error.message : String(error)}\n`);
+          }
+          await new Promise(resolve => setTimeout(resolve, 1_000));
+        }
+      }
+      groups.clear();
+      const tail = stdoutFramer.flush();
+      if (tail) emit({ stream: "stdout", dataBase64: Buffer.from(tail).toString("base64") });
+      emit({ stream: "exit", code, signal });
+      exitSeq = seq;
+      lingerTimer = setTimeout(finish, EXIT_LINGER_MS);
+    })().catch(error => {
+      process.stderr.write(`[slot-holder] native group cleanup failed: ${error instanceof Error ? error.message : String(error)}\n`);
+    });
   });
 }
 
@@ -175,5 +207,5 @@ setTimeout(() => { if (!child) finish(); }, 60_000).unref();
 // SIGTERM to the holder is an explicit stop of this slot: pass it to the child.
 process.on("SIGTERM", () => {
   if (child && child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
-  else finish();
+  else if (!finalizing || exitSeq !== undefined) finish();
 });

@@ -17,6 +17,7 @@ export * from "./catalog-evidence.js";
 export * from "./model-catalog.js";
 export * from "./model-fallback.js";
 export * from "./probe-process.js";
+export * from "./process-group.js";
 export * from "./fast-mode.js";
 export * from "./session-manager.js";
 export * from "./attachment-staging.js";

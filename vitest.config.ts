@@ -19,6 +19,7 @@ export default defineConfig({
   },
   resolve: {
     alias: {
+      "@seam/adapters/process-group": path.join(root, "packages/adapters/src/process-group.ts"),
       "@seam/adapters": path.join(root, "packages/adapters/src/index.ts"),
     },
   },

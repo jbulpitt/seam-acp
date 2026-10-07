@@ -9,6 +9,7 @@ import os from "node:os";
 import path from "node:path";
 import type { AdapterRuntimeDescriptor } from "./agent-profile.js";
 import { AGY_MANAGED_EXECUTABLE_LABEL } from "./agy-pin-mode.js";
+import { registerOwnedProcessGroup } from "./process-group.js";
 
 const SAFE_ENV_KEYS = [
   "HOME", "USERPROFILE", "PATH", "TMPDIR", "TMP", "TEMP",
@@ -609,6 +610,7 @@ export class AgyNativeRuntime implements AgyLaunchRuntime {
           // libuv has duplicated fd 3 into the child before spawn() returns.
           // The parent retains no descriptor or named snapshot afterward.
           snapshot.close();
+          if (options.detached) registerOwnedProcessGroup(proc);
           return proc;
         },
         close(): void {

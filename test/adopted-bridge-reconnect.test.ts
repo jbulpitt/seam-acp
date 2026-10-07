@@ -491,22 +491,46 @@ describe("adopted delivery retry", () => {
     expect(h.store.turnAttempts.get("inbound-1")?.deliveryDone).toBe(true);
   });
 
-  it("records a permanent Discord rejection once without retrying the unchanged payload", async () => {
+  it.each([
+    { message: "Invalid Form Body: content rejected", code: 50035, status: 400 },
+    { message: "Missing Access", code: 50001, status: 403 },
+    { message: "Unknown Channel", code: 10003, status: 404 },
+  ])("records permanent Discord $code ($message) once without retrying the unchanged payload", async rejection => {
     const h = await deliveryCase("inbound");
     const warn = vi.spyOn((h.orch as any).logger, "warn");
-    const error = Object.assign(new Error("Invalid Form Body: content rejected"), { code: 50035, status: 400 });
+    const error = Object.assign(new Error(rejection.message), { code: rejection.code, status: rejection.status });
     h.adapter.sendMessage.mockRejectedValue(error);
     h.complete("rejected final answer");
     await h.run;
-    expect(h.store.turnAttempts.get("inbound-1")).toMatchObject({ state: "completed", deliveryDone: false,
-      deliveryAbandonedReason: expect.stringContaining("Invalid Form Body: content rejected"),
-      deliveryPayload: { kind: "messages", texts: ["rejected final answer"] } });
-    expect(warn).toHaveBeenCalledWith(expect.objectContaining({ err: error, attempt: "inbound-1" }),
-      "adopted remote result delivery rejected permanently");
     vi.setSystemTime(Date.now() + 90_000);
     await h.watcher.tick();
     expect(h.adapter.sendMessage).toHaveBeenCalledTimes(1);
+    expect(h.store.turnAttempts.get("inbound-1")).toMatchObject({ state: "completed", deliveryDone: false,
+      deliveryAbandonedReason: `Discord rejected recorded delivery (${rejection.code}): ${rejection.message}`,
+      deliveryPayload: { kind: "messages", texts: ["rejected final answer"] } });
+    expect(warn).toHaveBeenCalledWith(expect.objectContaining({ err: error, attempt: "inbound-1" }),
+      "adopted remote result delivery rejected permanently");
     expect(warn).toHaveBeenCalledTimes(1);
+    expect(h.commands.filter(command => command.type === "spawn" || command.type === "data")).toEqual([]);
+  });
+
+  it("stops retrying when nonce lookup reports permanent Discord Missing Access", async () => {
+    const h = await deliveryCase("inbound");
+    h.adapter.sendMessage.mockRejectedValue(new Error("Discord transport unavailable"));
+    h.complete("retained until the permission rejection");
+    await h.run;
+    const error = Object.assign(new Error("Missing Access"), { code: 50001, status: 403 });
+    h.adapter.findMessageByNonce.mockRejectedValue(error);
+    vi.setSystemTime(Date.now() + 30_000);
+    await h.watcher.tick();
+    const lookups = h.adapter.findMessageByNonce.mock.calls.length;
+    vi.setSystemTime(Date.now() + 30_000);
+    await h.watcher.tick();
+    expect(h.adapter.findMessageByNonce).toHaveBeenCalledTimes(lookups);
+    expect(h.store.turnAttempts.get("inbound-1")).toMatchObject({ state: "completed", deliveryDone: false,
+      deliveryAbandonedReason: "Discord rejected recorded delivery (50001): Missing Access",
+      outcome: { output: "retained until the permission rejection" } });
+    expect(h.adapter.sendMessage).toHaveBeenCalledTimes(1);
     expect(h.commands.filter(command => command.type === "spawn" || command.type === "data")).toEqual([]);
   });
 });

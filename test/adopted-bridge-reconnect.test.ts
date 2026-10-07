@@ -77,6 +77,22 @@ async function setup(source: "inbound" | "dispatch" | "schedule" = "inbound", st
   store.turnAttempts.suspendBoot("old-controller");
   store.close();
   store = new SessionStore(path.join(dir, "test.db"));
+  // Await the durable writes without advancing the watchdog's fake clock.
+  let resolveNotice!: () => void;
+  const noticeDelivered = new Promise<void>(resolve => { resolveNotice = resolve; });
+  const markNotice = store.turnAttempts.markStallNoticeDelivered.bind(store.turnAttempts);
+  vi.spyOn(store.turnAttempts, "markStallNoticeDelivered").mockImplementation((...args) => {
+    const changed = markNotice(...args);
+    resolveNotice();
+    return changed;
+  });
+  let resolveDelivery!: () => void;
+  const deliveryDone = new Promise<void>(resolve => { resolveDelivery = resolve; });
+  const markDelivery = store.turnAttempts.markDeliveryDone.bind(store.turnAttempts);
+  vi.spyOn(store.turnAttempts, "markDeliveryDone").mockImplementation((...args) => {
+    markDelivery(...args);
+    resolveDelivery();
+  });
   const snapshot = { version: 1, owner: "bridge", submissionId: "submission",
     acpSessionId: "acp", rung: 1, phase: options.terminalResult
       ? options.terminalResult === "completed" ? "succeeded" : "exhausted"
@@ -217,7 +233,7 @@ async function setup(source: "inbound" | "dispatch" | "schedule" = "inbound", st
     socket.deliver({ type: "hello", instanceId: "second", capabilities: { durableSlots: true } });
     await drain();
   };
-  return { orch, store, run, ready, adapter, visible, commands, text, update, complete, reconnect,
+  return { orch, store, run, ready, noticeDelivered, deliveryDone, adapter, visible, commands, text, update, complete, reconnect,
     reopenStore: () => {
       store.close();
       store = new SessionStore(path.join(dir, "test.db"));
@@ -921,7 +937,7 @@ describe("adopted owner progress recovery", () => {
     await h.run;
     await drain();
     await vi.advanceTimersByTimeAsync(40_001);
-    await drain();
+    await h.noticeDelivered;
     const parked = h.store.turnAttempts.get("inbound-1")!;
     expect(parked).toMatchObject({ state: "suspended", generation: 1, outcome: null,
       remoteRecovery: { submissionId: "submission", acpSessionId: "acp" }, stallNoticeUtc: expect.any(String) });
@@ -932,7 +948,7 @@ describe("adopted owner progress recovery", () => {
     await h.orch.resumeTurnManually("inbound-1");
     expect(h.commands.filter(cmd => cmd.action === "replayOutput")).toHaveLength(adoptionCount);
     h.complete("the matching owner finally completed");
-    await drain();
+    await h.deliveryDone;
     expect(h.store.turnAttempts.get("inbound-1")).toMatchObject({ state: "completed", generation: 1,
       outcome: { status: "completed", output: "the matching owner finally completed" }, deliveryDone: true });
     expect(h.visible.filter(text => text === "the matching owner finally completed")).toHaveLength(1);
@@ -945,11 +961,11 @@ describe("adopted owner progress recovery", () => {
     await h.run;
     await drain();
     await vi.advanceTimersByTimeAsync(1_001);
-    await drain();
+    await h.noticeDelivered;
     expect(h.store.turnAttempts.get("inbound-1")?.stalledReason).toContain("bridge owner has not reported a terminal result");
     expect(h.commands.filter(cmd => cmd.type === "kill" || cmd.type === "spawn")).toEqual([]);
     h.complete("late terminal");
-    await drain();
+    await h.deliveryDone;
   });
 
   it("rearms the existing watchdog on real adopted output", async () => {
@@ -964,7 +980,7 @@ describe("adopted owner progress recovery", () => {
     await drain();
     expect(h.store.turnAttempts.get("inbound-1")).toMatchObject({ state: "suspended", stalledReason: null });
     h.complete("still working — completed");
-    await drain();
+    await h.deliveryDone;
     expect(h.store.turnAttempts.get("inbound-1")?.outcome?.status).toBe("completed");
   });
 
@@ -975,13 +991,11 @@ describe("adopted owner progress recovery", () => {
     vi.spyOn(h.orch as any, "dispatchContinuationRefusal").mockResolvedValue(null);
     await drain();
     await vi.advanceTimersByTimeAsync(25);
-    await drain();
+    await h.noticeDelivered;
     expect(h.store.turnAttempts.get("inbound-1")?.stalledReason).toBe(
       "provider socket stopped progressing while the agent event loop answered seam/hangProbe");
     expect(h.commands.some(cmd => cmd.action === "reconcileRung1Recovery")).toBe(true);
     expect(h.commands.filter(cmd => cmd.type === "kill" || cmd.type === "spawn" || cmd.type === "data")).toEqual([]);
-    await vi.advanceTimersByTimeAsync(25);
-    await drain();
     expect(h.visible.filter(text => text.includes("provider socket stopped progressing"))).toHaveLength(1);
     h.complete("same owner recovered");
     await h.run;

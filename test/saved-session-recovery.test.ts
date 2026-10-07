@@ -1,7 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { handoverProof, loadOutageProof, sessionGoneProof, SAVED_SESSION } from "./helpers/saved-session-recovery.js";
+import { handoverProof, loadOutageProof, savedSessionHost, sessionGoneProof, SAVED_SESSION } from "./helpers/saved-session-recovery.js";
 
-afterEach(() => vi.useRealTimers());
+const hosts: Awaited<ReturnType<typeof savedSessionHost>>[] = [];
+afterEach(async () => {
+  vi.useRealTimers();
+  for (const host of hosts.splice(0).reverse()) await host.close();
+});
 
 describe("saved conversations survive load failures and settlement", () => {
   it("keeps the SQL binding through a load outage and resumes through the existing recovery owner", async () => {
@@ -28,7 +32,9 @@ describe("saved conversations survive load failures and settlement", () => {
   it.each([false, true])("a missing session recovers visibly without load retries and later turns keep working; recorded=%s", async recorded => {
     vi.useFakeTimers({ toFake: ["Date"] });
     const sleep = vi.fn(async (ms: number) => { vi.setSystemTime(Date.now() + ms); });
-    const result = await sessionGoneProof(recorded, sleep);
+    const host = await savedSessionHost({ sessionGone: true, recoverySleep: sleep });
+    hosts.push(host);
+    const result = await sessionGoneProof(host, recorded);
     expect(result).toMatchObject({ afterRecovery: "replacement-conversation", finalId: "replacement-conversation",
       missingLoads: 1, laterLoads: 1, newSessions: 1,
       promptSessions: ["replacement-conversation", "replacement-conversation"],

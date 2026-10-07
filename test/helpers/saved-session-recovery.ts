@@ -180,28 +180,25 @@ export async function loadOutageProof(recoverySleep?: (ms: number) => Promise<vo
   } finally { await h.close(); }
 }
 
-export async function sessionGoneProof(recordedResume = false, recoverySleep?: (ms: number) => Promise<void>) {
-  const h = await savedSessionHost({ sessionGone: true, recoverySleep });
-  try {
-    const router = h.makeRouter();
-    const orch = h.makeOrchestrator(router);
-    const first = await orch.injectTurn(h.record, "continue first turn", { session: "live",
-      ...(recordedResume ? { resumeSessionId: SAVED_SESSION } : {}) });
-    if (first.error) throw first.cause ?? new Error(first.error);
-    const afterRecovery = h.store.get(h.record.id)!.acpSessionId;
-    await router.invalidate(h.record.id);
-    const later = await orch.injectTurn(h.store.get(h.record.id)!, "continue later turn", { session: "live" });
-    if (later.error) throw later.cause ?? new Error(later.error);
-    const reopened = new SessionStore(h.db);
-    const finalId = reopened.get(h.record.id)!.acpSessionId;
-    reopened.close();
-    const requests = await h.requests();
-    return { afterRecovery, finalId, notices: h.notices,
-      missingLoads: requests.filter(r => r.method === "session/load" && r.params.sessionId === SAVED_SESSION).length,
-      laterLoads: requests.filter(r => r.method === "session/load" && r.params.sessionId === afterRecovery).length,
-      newSessions: requests.filter(r => r.method === "session/new").length,
-      promptSessions: requests.filter(r => r.method === "session/prompt").map(r => r.params.sessionId) };
-  } finally { await h.close(); }
+export async function sessionGoneProof(h: Awaited<ReturnType<typeof savedSessionHost>>, recordedResume = false) {
+  const router = h.makeRouter();
+  const orch = h.makeOrchestrator(router);
+  const first = await orch.injectTurn(h.record, "continue first turn", { session: "live",
+    ...(recordedResume ? { resumeSessionId: SAVED_SESSION } : {}) });
+  if (first.error) throw first.cause ?? new Error(first.error);
+  const afterRecovery = h.store.get(h.record.id)!.acpSessionId;
+  await router.invalidate(h.record.id);
+  const later = await orch.injectTurn(h.store.get(h.record.id)!, "continue later turn", { session: "live" });
+  if (later.error) throw later.cause ?? new Error(later.error);
+  const reopened = new SessionStore(h.db);
+  const finalId = reopened.get(h.record.id)!.acpSessionId;
+  reopened.close();
+  const requests = await h.requests();
+  return { afterRecovery, finalId, notices: h.notices,
+    missingLoads: requests.filter(r => r.method === "session/load" && r.params.sessionId === SAVED_SESSION).length,
+    laterLoads: requests.filter(r => r.method === "session/load" && r.params.sessionId === afterRecovery).length,
+    newSessions: requests.filter(r => r.method === "session/new").length,
+    promptSessions: requests.filter(r => r.method === "session/prompt").map(r => r.params.sessionId) };
 }
 
 export async function handoverProof(legacy = false) {
@@ -247,7 +244,12 @@ export async function handoverProof(legacy = false) {
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
-  const result = process.argv[2] === "load" ? await loadOutageProof()
-    : process.argv[2] === "gone" ? await sessionGoneProof() : await handoverProof(process.argv[2] === "legacy");
-  console.log(JSON.stringify(result, null, 2));
+  if (process.argv[2] === "gone") {
+    const host = await savedSessionHost({ sessionGone: true });
+    try { console.log(JSON.stringify(await sessionGoneProof(host), null, 2)); }
+    finally { await host.close(); }
+  } else {
+    const result = process.argv[2] === "load" ? await loadOutageProof() : await handoverProof(process.argv[2] === "legacy");
+    console.log(JSON.stringify(result, null, 2));
+  }
 }

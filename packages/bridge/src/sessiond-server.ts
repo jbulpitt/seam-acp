@@ -4,8 +4,8 @@ import { promises as fs, openSync, closeSync, statSync } from "node:fs";
 import net, { type Socket } from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { readProcessIdentity as readSessiondProcessIdentity, type ProcessIdentity } from "@seam/adapters";
-export { readProcessIdentity as readSessiondProcessIdentity } from "@seam/adapters";
+import { readProcessIdentity as readSessiondProcessIdentity, type ProcessIdentity } from "@seam/adapters/process-group";
+export { readProcessIdentity as readSessiondProcessIdentity } from "@seam/adapters/process-group";
 import { createNdjsonReader } from "./ndjson-reader.js";
 import { createOutputLog, type OutputLog, type OutputLogOptions } from "./output-log.js";
 import {

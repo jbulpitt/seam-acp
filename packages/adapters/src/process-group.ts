@@ -1,6 +1,10 @@
 import type { ChildProcess } from "node:child_process";
 import { execFileSync } from "node:child_process";
 import { readFileSync, readdirSync } from "node:fs";
+import { setTimeout as delay } from "node:timers/promises";
+
+export const PROCESS_GROUP_KILL_GRACE_MS = 2_000;
+export const PROCESS_GROUP_REAP_MS = 2_000;
 
 export interface ProcessIdentity {
   pid: number;
@@ -78,4 +82,36 @@ export function releaseOwnedProcessGroup(child: ChildProcess): void {
   if (!identity) return;
   owner?.({ type: "release_group", identity });
   registered.delete(child);
+}
+
+/** Own detached process groups only. A leader's exit does not reap its tools. */
+export async function terminateProcessGroup(
+  child: ChildProcess | ProcessIdentity,
+  graceMs = PROCESS_GROUP_KILL_GRACE_MS,
+): Promise<boolean> {
+  const owned = "started" in child ? child : registeredProcessGroup(child);
+  const direct = "started" in child ? undefined : child;
+  const pid = child.pid;
+  if (pid === undefined) return true;
+  const alive = (): boolean => {
+    if (owned) return ownedProcessGroupAlive(owned);
+    try { process.kill(-pid, 0); return true; }
+    catch (error) { return (error as NodeJS.ErrnoException).code !== "ESRCH"; }
+  };
+  const wait = async (ms: number): Promise<boolean> => {
+    const until = Date.now() + ms;
+    const stopped = () => !alive() && (!direct || direct.exitCode !== null || direct.signalCode !== null);
+    while (!stopped() && Date.now() < until) await delay(20);
+    return stopped();
+  };
+  for (const [signal, ms] of [["SIGTERM", graceMs], ["SIGKILL", PROCESS_GROUP_REAP_MS]] as const) {
+    if (!owned || alive()) {
+      try { process.kill(-pid, signal); } catch { /* Verify absence even if signalling failed. */ }
+    }
+    if (await wait(ms)) {
+      if (direct) releaseOwnedProcessGroup(direct);
+      return true;
+    }
+  }
+  return false;
 }

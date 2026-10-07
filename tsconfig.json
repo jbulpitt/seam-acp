@@ -3,6 +3,7 @@
   "compilerOptions": {
     "noEmit": true,
     "paths": {
+      "@seam/adapters/process-group": ["./packages/adapters/src/process-group.ts"],
       "@seam/adapters": ["./packages/adapters/src/index.ts"]
     }
   },

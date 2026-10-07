@@ -14,7 +14,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import fs from "node:fs";
 import net from "node:net";
 import type { Readable } from "node:stream";
-import { terminateProcessGroup, type ProcessGroupOwnership, type ProcessIdentity } from "@seam/adapters";
+import { terminateProcessGroup, type ProcessGroupOwnership, type ProcessIdentity } from "@seam/adapters/process-group";
 import { createLineFramer } from "./output-log.js";
 import { createNdjsonReader } from "./ndjson-reader.js";
 import {

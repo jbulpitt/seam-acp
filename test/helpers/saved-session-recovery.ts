@@ -16,6 +16,7 @@ import { Orchestrator } from "../../packages/core/src/platforms/discord/orchestr
 import { discordRenderer } from "../../packages/core/src/platforms/discord/renderer.js";
 import { fixtureModelCatalog } from "../model-catalog-fixture.js";
 import { visualConfig } from "../plugin-card-visuals-fixture.js";
+import type { SessionExecutables } from "./saved-session-executables.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const fakeAgent = path.resolve(here, "../fixtures/fake-acp-agent.mjs");
@@ -31,7 +32,7 @@ export async function savedSessionHost(options: {
   authFailure?: boolean;
   writerLock?: boolean;
   recoverySleep?: (ms: number) => Promise<void>;
-} = {}) {
+} & Partial<SessionExecutables> = {}) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "seam-797-"));
   const failure = path.join(root, "load.failure");
   if (options.failLoad) await fs.writeFile(failure, "fixture outage");
@@ -42,7 +43,7 @@ export async function savedSessionHost(options: {
   await fs.symlink(fakeAgent, path.join(bin, "codex-acp"));
   const server = new SessiondServer({ socketPath: path.join(root, "control.sock"),
     statePath: path.join(root, "slots.json"), resumeDir: path.join(root, "resume"),
-    holderPath: process.env.SEAM_SLOT_HOLDER_PATH ?? path.join(here, "slot-holder-source.mjs") });
+    holderPath: options.holderPath ?? process.env.SEAM_SLOT_HOLDER_PATH ?? path.join(here, "slot-holder-source.mjs") });
   await server.start();
   const client = await SessiondClient.connect(path.join(root, "control.sock"));
   const logger = pino({ level: "silent" });
@@ -92,7 +93,7 @@ export async function savedSessionHost(options: {
   }
   const socket = new Socket();
   slots = new SupervisedSlots({ client, copilotCmd: fakeAgent, localCwd: root,
-    adapterChildPath: path.join(here, options.oldAuthDisarm ? "adapter-child-old-auth-disarm.mjs"
+    adapterChildPath: options.adapterChildPath ?? path.join(here, options.oldAuthDisarm ? "adapter-child-old-auth-disarm.mjs"
       : options.legacy ? "adapter-child-legacy.mjs" : "adapter-child-source.mjs"),
     environment: { HOME: root, PATH: `${bin}:${path.dirname(process.execPath)}:/usr/bin:/bin`,
       FAKE_AGENT_PIDS: path.join(root, "agent.pids"), FAKE_AGENT_REQUESTS: path.join(root, "requests.jsonl"),
@@ -156,8 +157,8 @@ export async function savedSessionHost(options: {
     } };
 }
 
-export async function loadOutageProof(recoverySleep?: (ms: number) => Promise<void>) {
-  const h = await savedSessionHost({ failLoad: true, recoverySleep });
+export async function loadOutageProof(recoverySleep?: (ms: number) => Promise<void>, executables?: SessionExecutables) {
+  const h = await savedSessionHost({ ...executables, failLoad: true, recoverySleep });
   try {
     const router = h.makeRouter();
     let loadError: any;
@@ -180,32 +181,28 @@ export async function loadOutageProof(recoverySleep?: (ms: number) => Promise<vo
   } finally { await h.close(); }
 }
 
-export async function sessionGoneProof(recordedResume = false, recoverySleep?: (ms: number) => Promise<void>) {
-  const h = await savedSessionHost({ sessionGone: true, recoverySleep });
-  try {
-    const router = h.makeRouter();
-    const orch = h.makeOrchestrator(router);
-    const first = await orch.injectTurn(h.record, "continue first turn", { session: "live",
-      ...(recordedResume ? { resumeSessionId: SAVED_SESSION } : {}) });
-    if (first.error) throw first.cause ?? new Error(first.error);
-    const afterRecovery = h.store.get(h.record.id)!.acpSessionId;
-    await router.invalidate(h.record.id);
-    const later = await orch.injectTurn(h.store.get(h.record.id)!, "continue later turn", { session: "live" });
-    if (later.error) throw later.cause ?? new Error(later.error);
-    const reopened = new SessionStore(h.db);
-    const finalId = reopened.get(h.record.id)!.acpSessionId;
-    reopened.close();
-    const requests = await h.requests();
-    return { afterRecovery, finalId, notices: h.notices,
-      missingLoads: requests.filter(r => r.method === "session/load" && r.params.sessionId === SAVED_SESSION).length,
-      laterLoads: requests.filter(r => r.method === "session/load" && r.params.sessionId === afterRecovery).length,
-      newSessions: requests.filter(r => r.method === "session/new").length,
-      promptSessions: requests.filter(r => r.method === "session/prompt").map(r => r.params.sessionId) };
-  } finally { await h.close(); }
+export async function sessionGoneProof(h: Awaited<ReturnType<typeof savedSessionHost>>, router: SessionRouter, recordedResume = false) {
+  const orch = h.makeOrchestrator(router);
+  const first = await orch.injectTurn(h.record, "continue first turn", { session: "live",
+    ...(recordedResume ? { resumeSessionId: SAVED_SESSION } : {}) });
+  if (first.error) throw first.cause ?? new Error(first.error);
+  const afterRecovery = h.store.get(h.record.id)!.acpSessionId;
+  await router.invalidate(h.record.id);
+  const later = await orch.injectTurn(h.store.get(h.record.id)!, "continue later turn", { session: "live" });
+  if (later.error) throw later.cause ?? new Error(later.error);
+  const reopened = new SessionStore(h.db);
+  const finalId = reopened.get(h.record.id)!.acpSessionId;
+  reopened.close();
+  const requests = await h.requests();
+  return { afterRecovery, finalId, notices: h.notices,
+    missingLoads: requests.filter(r => r.method === "session/load" && r.params.sessionId === SAVED_SESSION).length,
+    laterLoads: requests.filter(r => r.method === "session/load" && r.params.sessionId === afterRecovery).length,
+    newSessions: requests.filter(r => r.method === "session/new").length,
+    promptSessions: requests.filter(r => r.method === "session/prompt").map(r => r.params.sessionId) };
 }
 
-export async function handoverProof(legacy = false) {
-  const h = await savedSessionHost({ legacy });
+export async function handoverProof(legacy = false, executables?: SessionExecutables) {
+  const h = await savedSessionHost({ ...executables, legacy });
   try {
     const previous = h.makeRouter();
     const runtime = await previous.getOrStartRuntime(h.record);
@@ -247,7 +244,13 @@ export async function handoverProof(legacy = false) {
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
-  const result = process.argv[2] === "load" ? await loadOutageProof()
-    : process.argv[2] === "gone" ? await sessionGoneProof() : await handoverProof(process.argv[2] === "legacy");
+  let result;
+  if (process.argv[2] === "gone") {
+    const h = await savedSessionHost({ sessionGone: true });
+    try { result = await sessionGoneProof(h, h.makeRouter()); }
+    finally { await h.close(); }
+  } else {
+    result = process.argv[2] === "load" ? await loadOutageProof() : await handoverProof(process.argv[2] === "legacy");
+  }
   console.log(JSON.stringify(result, null, 2));
 }

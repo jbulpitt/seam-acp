@@ -552,6 +552,12 @@ const STATUS_HEARTBEAT_MS = 5000;
 export const DISPATCH_SETTLEMENT_WARN_MS = 5_000;
 const PLATFORM = "discord";
 
+function permanentDiscordDeliveryCause(err: unknown): string | null {
+  const code = err !== null && typeof err === "object" && "code" in err ? err.code : undefined;
+  if (code !== 10003 && code !== 50001 && code !== 50035) return null;
+  return `Discord rejected recorded delivery (${code}): ${err instanceof Error ? err.message : String(err)}`;
+}
+
 /**
  * Last resort when a quarantine has no recorded cause (#333).
  *
@@ -15595,9 +15601,9 @@ export class Orchestrator {
         }
         this.store.turnAttempts.markDeliveryDone(prior.id);
       } catch (err) {
-        if (isInvalidMessagePayloadError(err)) {
-          this.store.turnAttempts.abandonDelivery(prior.id,
-            `Discord rejected recorded delivery (50035): ${err instanceof Error ? err.message : String(err)}`);
+        const permanent = permanentDiscordDeliveryCause(err);
+        if (permanent) {
+          this.store.turnAttempts.abandonDelivery(prior.id, permanent);
           this.logger.warn({ err, attempt: prior.id }, "adopted remote result delivery rejected permanently");
         } else {
           this.adoptedDeliveryRetryAfter.set(prior.id, Date.now() + 30_000);
@@ -16055,6 +16061,12 @@ export class Orchestrator {
         observed = await this.adapter.findMessageByNonce!(channel, part.nonce, sinceMs);
       } catch (err) {
         if (propagateError) throw err;
+        const permanent = permanentDiscordDeliveryCause(err);
+        if (permanent) {
+          this.store.turnAttempts.abandonDelivery(attempt.id, permanent);
+          this.logger.warn({ err, id: attempt.id }, "recorded delivery rejected permanently");
+          return "abandoned";
+        }
         this.logger.warn({ err, id: attempt.id }, "Discord nonce lookup deferred");
         return "deferred";
       }
@@ -16070,14 +16082,13 @@ export class Orchestrator {
         // concurrent create won, Discord returns it rather than creating another.
         await this.sendDeliveryPart(channel, part.payload, part.nonce, attempt.spec);
       } catch (err) {
-        if (isInvalidMessagePayloadError(err)) {
-          if (propagateError) throw err;
-          this.store.turnAttempts.abandonDelivery(attempt.id,
-            `Discord rejected recorded delivery (50035): ${err instanceof Error ? err.message : String(err)}`);
+        if (propagateError) throw err;
+        const permanent = permanentDiscordDeliveryCause(err);
+        if (permanent) {
+          this.store.turnAttempts.abandonDelivery(attempt.id, permanent);
           this.logger.warn({ err, id: attempt.id }, "recorded delivery rejected permanently");
           return "abandoned";
         }
-        if (propagateError) throw err;
         this.logger.warn({ err, id: attempt.id }, "nonce-backed delivery replay deferred");
         return "deferred";
       }

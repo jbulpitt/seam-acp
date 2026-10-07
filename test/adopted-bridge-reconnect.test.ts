@@ -380,6 +380,161 @@ describe("scheduled live adoption delivery", () => {
   });
 });
 
+describe("adopted delivery retry", () => {
+  async function deliveryCase(source: "inbound" | "dispatch" | "schedule") {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const h = await setup(source);
+    if (source === "dispatch") h.store.recordDelegation({
+      id: "inbound-1", kind: "parked", targetRef: "thread", status: "running",
+    });
+    if (source === "inbound") {
+      h.store.admitInbound({ messageId: "1", platform: "discord", channelRef: "thread",
+        sessionRecordId: "discord:thread", authorId: "user", text: "work",
+        createdUtc: new Date().toISOString() });
+      h.store.claimInbound("1", 1, new Date().toISOString());
+    }
+    vi.spyOn(h.orch, "recoverInterruptedTurns").mockResolvedValue(undefined);
+    const watcher = createRuntimeDispatchWatcher({ runtime: h.orch, attempts: h.store.turnAttempts,
+      dataDir: h.dir, logger: pino({ level: "silent" }) as any, pollMs: 1_000_000 });
+    cleanups.push(() => watcher.stop());
+    await watcher.start();
+    await drain();
+    return { ...h, watcher };
+  }
+
+  it.each(["inbound", "dispatch", "schedule"] as const)(
+    "retries the retained %s receipt on the existing tick without provider work", async source => {
+      const h = await deliveryCase(source);
+      const send = h.adapter.sendMessage.getMockImplementation()!;
+      h.adapter.sendMessage.mockRejectedValue(new Error("Discord transport unavailable"));
+      h.complete("retained final answer");
+      await h.run;
+      const pending = h.store.turnAttempts.get("inbound-1")!;
+      expect(pending).toMatchObject({ state: "completed", generation: 1, deliveryDone: false,
+        deliveryNonce: expect.any(String), deliveryPayload: { kind: "messages", texts: ["retained final answer"] },
+        deliveryUncertainReason: null, deliveryAbandonedReason: null });
+      if (source === "inbound") expect(h.store.getInbound("1")?.state).toBe("completed");
+      if (source === "dispatch") expect(h.store.getDelegation("inbound-1")?.status).toBe("completed");
+      h.adapter.sendMessage.mockImplementation(send);
+      const firstSendCount = h.adapter.sendMessage.mock.calls.length;
+      await h.watcher.tick();
+      expect(h.adapter.sendMessage).toHaveBeenCalledTimes(firstSendCount);
+      vi.setSystemTime(Date.now() + 30_000);
+      await h.watcher.tick();
+      expect(h.visible).toEqual(["retained final answer"]);
+      expect(h.store.turnAttempts.get("inbound-1")).toMatchObject({
+        state: "completed", generation: 1, acpSessionId: "acp", deliveryDone: true,
+        deliveryNonce: pending.deliveryNonce, deliveryPayload: pending.deliveryPayload, outcome: pending.outcome,
+      });
+      if (source === "schedule") expect(h.store.scheduledOccurrences.get("inbound-1")?.settled).toBe(true);
+      vi.setSystemTime(Date.now() + 60_000);
+      await h.watcher.tick();
+      expect(h.visible).toEqual(["retained final answer"]);
+      expect(h.commands.filter(command => command.type === "spawn" || command.type === "data")).toEqual([]);
+    });
+
+  it("proves a lost send acknowledgement by nonce instead of sending the answer twice", async () => {
+    const h = await deliveryCase("inbound");
+    const send = h.adapter.sendMessage.getMockImplementation()!;
+    h.adapter.sendMessage.mockImplementationOnce(async (...args) => {
+      await send(...args);
+      throw new Error("Discord accepted the message but the connection closed before acknowledgement");
+    });
+    h.complete("accepted final answer");
+    await h.run;
+    expect(h.visible).toEqual(["accepted final answer"]);
+    expect(h.store.turnAttempts.get("inbound-1")?.deliveryDone).toBe(false);
+    vi.setSystemTime(Date.now() + 30_000);
+    await h.watcher.tick();
+    expect(h.store.turnAttempts.get("inbound-1")?.deliveryDone).toBe(true);
+    expect(h.adapter.sendMessage).toHaveBeenCalledTimes(1);
+    expect(h.visible).toEqual(["accepted final answer"]);
+    expect(h.commands.filter(command => command.type === "spawn" || command.type === "data")).toEqual([]);
+  });
+
+  it("backs off again while Discord is unavailable and keeps the recorded result", async () => {
+    const h = await deliveryCase("inbound");
+    const send = h.adapter.sendMessage.getMockImplementation()!;
+    h.adapter.sendMessage.mockRejectedValue(new Error("Discord transport unavailable"));
+    h.complete("retained through the outage");
+    await h.run;
+    const count = h.adapter.sendMessage.mock.calls.length;
+    vi.setSystemTime(Date.now() + 30_000);
+    await h.watcher.tick();
+    expect(h.adapter.sendMessage).toHaveBeenCalledTimes(count + 1);
+    for (let tick = 0; tick < 5; tick++) {
+      vi.setSystemTime(Date.now() + 1_000);
+      await h.watcher.tick();
+    }
+    expect(h.adapter.sendMessage).toHaveBeenCalledTimes(count + 1);
+    expect(h.store.turnAttempts.get("inbound-1")).toMatchObject({ state: "completed", deliveryDone: false,
+      deliveryUncertainReason: null, outcome: { output: "retained through the outage" } });
+    h.adapter.sendMessage.mockImplementation(send);
+    vi.setSystemTime(Date.now() + 25_000);
+    await h.watcher.tick();
+    expect(h.visible).toEqual(["retained through the outage"]);
+    expect(h.store.turnAttempts.get("inbound-1")?.deliveryDone).toBe(true);
+  });
+
+  it("keeps an adopted nonce-backed receipt pending through the diagnostic reaper", async () => {
+    const h = await deliveryCase("inbound");
+    const send = h.adapter.sendMessage.getMockImplementation()!;
+    h.adapter.sendMessage.mockRejectedValue(new Error("Discord transport unavailable"));
+    h.complete("retained beyond an hour");
+    await h.run;
+    vi.setSystemTime(Date.now() + 60 * 60_000 + 1);
+    expect(h.store.turnAttempts.reapUnsettledCompletions()).toBe(0);
+    expect(h.store.turnAttempts.get("inbound-1")?.deliveryUncertainReason).toBeNull();
+    h.adapter.sendMessage.mockImplementation(send);
+    await h.watcher.tick();
+    expect(h.visible).toEqual(["retained beyond an hour"]);
+    expect(h.store.turnAttempts.get("inbound-1")?.deliveryDone).toBe(true);
+  });
+
+  it.each([
+    { message: "Invalid Form Body: content rejected", code: 50035, status: 400 },
+    { message: "Missing Access", code: 50001, status: 403 },
+    { message: "Unknown Channel", code: 10003, status: 404 },
+  ])("records permanent Discord $code ($message) once without retrying the unchanged payload", async rejection => {
+    const h = await deliveryCase("inbound");
+    const warn = vi.spyOn((h.orch as any).logger, "warn");
+    const error = Object.assign(new Error(rejection.message), { code: rejection.code, status: rejection.status });
+    h.adapter.sendMessage.mockRejectedValue(error);
+    h.complete("rejected final answer");
+    await h.run;
+    vi.setSystemTime(Date.now() + 90_000);
+    await h.watcher.tick();
+    expect(h.adapter.sendMessage).toHaveBeenCalledTimes(1);
+    expect(h.store.turnAttempts.get("inbound-1")).toMatchObject({ state: "completed", deliveryDone: false,
+      deliveryAbandonedReason: `Discord rejected recorded delivery (${rejection.code}): ${rejection.message}`,
+      deliveryPayload: { kind: "messages", texts: ["rejected final answer"] } });
+    expect(warn).toHaveBeenCalledWith(expect.objectContaining({ err: error, attempt: "inbound-1" }),
+      "adopted remote result delivery rejected permanently");
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(h.commands.filter(command => command.type === "spawn" || command.type === "data")).toEqual([]);
+  });
+
+  it("stops retrying when nonce lookup reports permanent Discord Missing Access", async () => {
+    const h = await deliveryCase("inbound");
+    h.adapter.sendMessage.mockRejectedValue(new Error("Discord transport unavailable"));
+    h.complete("retained until the permission rejection");
+    await h.run;
+    const error = Object.assign(new Error("Missing Access"), { code: 50001, status: 403 });
+    h.adapter.findMessageByNonce.mockRejectedValue(error);
+    vi.setSystemTime(Date.now() + 30_000);
+    await h.watcher.tick();
+    const lookups = h.adapter.findMessageByNonce.mock.calls.length;
+    vi.setSystemTime(Date.now() + 30_000);
+    await h.watcher.tick();
+    expect(h.adapter.findMessageByNonce).toHaveBeenCalledTimes(lookups);
+    expect(h.store.turnAttempts.get("inbound-1")).toMatchObject({ state: "completed", deliveryDone: false,
+      deliveryAbandonedReason: "Discord rejected recorded delivery (50001): Missing Access",
+      outcome: { output: "retained until the permission rejection" } });
+    expect(h.adapter.sendMessage).toHaveBeenCalledTimes(1);
+    expect(h.commands.filter(command => command.type === "spawn" || command.type === "data")).toEqual([]);
+  });
+});
+
 describe("#777 armed recovery queue reconciliation", () => {
   it("waits visibly for a surviving unattached owner and adopts it without a new process", async () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });

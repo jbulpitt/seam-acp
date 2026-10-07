@@ -51,7 +51,7 @@ export interface MigrateSelfInput extends Omit<ConfigureThreadInput, "role"> {
   manifest: string;
 }
 
-/** Durable, validated target carried by the post-turn dispatch. */
+/** Durable requested target carried by the post-turn dispatch. */
 export interface PreparedSelfMigration {
   agent: string;
   model: string;

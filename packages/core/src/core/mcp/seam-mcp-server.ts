@@ -762,7 +762,7 @@ const TOOLS = [
       properties: {
         thread: { type: "string", description: "Target thread id from threads()." },
         agent: { type: "string", description: "Optional registered agent profile id." },
-        model: { type: "string", description: "Optional model id advertised by the target agent." },
+        model: { type: "string", description: "Optional model id. Unlisted ids pass unchanged for the provider to validate." },
         effort: {
           type: "string",
           description: "Optional live-advertised reasoning effort, or auto to clear the override.",
@@ -825,7 +825,7 @@ const TOOLS = [
       type: "object",
       properties: {
         agent: { type: "string", description: "Optional registered target agent profile id." },
-        model: { type: "string", description: "Optional model id advertised by the target agent." },
+        model: { type: "string", description: "Optional model id. Unlisted ids pass unchanged for the provider to validate." },
         effort: {
           type: "string",
           description: "Optional target-runtime reasoning effort, or auto to clear the override.",

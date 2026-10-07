@@ -63,7 +63,9 @@ async function fixture(warm: boolean) {
   const store = new SessionStore(path.join(dir, "seam.db"));
   cleanup.push(() => store.close());
   const profile = { id: "claude", defaultModel: "known", effort: { mechanism: "meta", levels: ["low", "high"] } } as AgentProfile;
-  const previousPreset: ThreadPreset = { effort: { value: "low" } };
+  const previousPreset = PresetsFileSchema.parse({
+    channels: {}, threads: { [worker]: { effort: { value: "low" } } },
+  }).threads![worker]!;
   const threadPresets = new Map<string, ThreadPreset>([[worker, previousPreset]]);
   const presetsFile = path.join(dir, "presets.json");
   fs.writeFileSync(presetsFile, JSON.stringify({ channels: {}, threads: { [worker]: previousPreset } }));
@@ -107,7 +109,7 @@ async function fixture(warm: boolean) {
     if (!prepared.ok) throw new Error(prepared.error);
     return runtime.executeSelfMigration(record(), prepared.migration);
   };
-  return { apply, record, store, threadPresets, replies };
+  return { apply, record, store, threadPresets, replies, previousPreset };
 }
 
 describe.each([false, true])("unlisted model path parity (warm catalog=%s)", warm => {
@@ -131,7 +133,7 @@ describe.each([false, true])("unlisted model path parity (warm catalog=%s)", war
     if (route === "migrate_self") {
       expect(await h.apply(route)).toEqual({ ok: false, error: cause.message });
       expect(h.record()).toEqual(previous);
-      expect(h.threadPresets.get(worker)).toEqual({ effort: { value: "low" } });
+      expect(h.threadPresets.get(worker)).toEqual(h.previousPreset);
     } else {
       await expect(h.apply(route)).rejects.toBe(cause);
     }

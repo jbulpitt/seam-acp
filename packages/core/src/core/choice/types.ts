@@ -517,7 +517,7 @@ export function renderChoicePanel(card: ChoiceCard, statusLabel?: string): Struc
 
   const last = who ? ` · last: ${who}` : "";
   const status =
-    card.status === "open" ? "open" : statusLabel?.toLowerCase() ?? (card.status === "exhausted" ? "closed" : "cancelled");
+    statusLabel?.toLowerCase() ?? (card.status === "open" ? "open" : card.status === "exhausted" ? "closed" : "cancelled");
   return {
     color,
     title,

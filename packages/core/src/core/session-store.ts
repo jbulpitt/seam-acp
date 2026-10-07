@@ -2877,6 +2877,12 @@ export class SessionStore {
       .run(deliveryId, choiceId, userId);
   }
 
+  getChoiceClickDelivery(choiceId: string, userId: string): string | null {
+    return this.db.prepare<[string, string], { delivery_id: string | null }>(
+      "SELECT delivery_id FROM choice_clicks WHERE choice_id = ? AND user_id = ?")
+      .get(choiceId, userId)?.delivery_id ?? null;
+  }
+
   cancelChoiceCard(id: string, channelRef: string): boolean {
     const info = this.db
       .prepare("UPDATE choice_cards SET status = 'cancelled' WHERE id = ? AND channel_ref = ? AND status = 'open'")

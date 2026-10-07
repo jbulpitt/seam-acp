@@ -2365,7 +2365,8 @@ describe("#174 an ingest job stays registered through its durable tail", () => {
   it("is still counted when its ledger status is written", async () => {
     let turnsAtLedgerWrite = -1;
     const host = makeQuiesceHost({
-      config: { DEFAULT_AGENT: "a", REPOS_ROOT: "/tmp", TURN_TIMEOUT_SECONDS: 900 },
+      config: { DEFAULT_AGENT: "a", REPOS_ROOT: "/tmp", TURN_TIMEOUT_SECONDS: 900,
+        channelPresets: new Map(), threadPresets: new Map() },
       ingestJobs: new Map(),
       router: {
         getProfile: () => ({ id: "a" }),

@@ -116,6 +116,8 @@ function makeOrch(opts?: {
     config: {
       DATA_DIR: dir,
       REPOS_ROOT: dir,
+      channelPresets: new Map(),
+      threadPresets: new Map(),
       TURN_TIMEOUT_SECONDS: 60,
       DEFAULT_MODEL: "default",
       SEAM_DISPATCH_STATUS_PANEL: false,

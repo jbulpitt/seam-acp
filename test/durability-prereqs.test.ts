@@ -130,6 +130,8 @@ function makeOrch(store: SessionStore, dataDir: string): Orchestrator {
     config: {
       DATA_DIR: dataDir,
       REPOS_ROOT: dataDir,
+      channelPresets: new Map(),
+      threadPresets: new Map(),
       TURN_TIMEOUT_SECONDS: 60,
       DEFAULT_MODEL: "claude-opus-4.8",
       SEAM_DISPATCH_STATUS_PANEL: false,

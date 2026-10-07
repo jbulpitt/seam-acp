@@ -69,6 +69,8 @@ function makeOrch(opts?: {
     config: {
       DATA_DIR: dir,
       REPOS_ROOT: dir,
+      channelPresets: new Map(),
+      threadPresets: new Map(),
       DISCORD_USER_NAMES: new Map<string, string>(),
       TURN_TIMEOUT_SECONDS: 60,
       DEFAULT_MODEL: "claude-opus-4.8",

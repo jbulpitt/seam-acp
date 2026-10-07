@@ -4,7 +4,7 @@ import type { RemoteRecoveryBinding, RemoteRecoveryResult } from "@seam/adapters
 import type { DispatchResult, DispatchSpec } from "./types.js";
 import type { TurnStatusSnapshot } from "../status-panel.js";
 import { compareExecutionIdentity } from "./execution-identity.js";
-import { deliveryNonce, type DurableDeliveryPayload } from "./delivery-proof.js";
+import { deliveryChunkNonce, deliveryNonce, type DurableDeliveryPayload } from "./delivery-proof.js";
 import { isProcessOwner, processOwner, provenDead, type ProcessOwner } from "./process-owner.js";
 
 /**
@@ -712,6 +712,56 @@ export class TurnAttemptStore {
         AND updated_utc <= ?`)
       .run("completion disposition timed out after one hour without delivery proof; output retained",
         new Date(nowMs).toISOString(), new Date(nowMs - UNSETTLED_COMPLETION_MAX_AGE_MS).toISOString()).changes;
+  }
+
+  /** Extend the existing receipt before a progressive message reaches Discord. */
+  prepareStreamDelivery(a: TurnAttempt, channel: string, text: string, retryIndex?: number): { nonce: string; index: number } {
+    const current = this.get(a.id);
+    if (!current || current.generation !== a.generation || current.ownerBoot !== a.ownerBoot
+      || !["active", "suspended", "completed"].includes(current.state) || current.deliveryDone) {
+      throw DispatchSuspendedError.superseded(a.id, "the stream no longer owns this attempt");
+    }
+    const prior = current.deliveryPayload;
+    if (current.deliveryNonce && (current.deliveryChannel !== channel || prior?.kind !== "messages" || !prior.stream)) {
+      throw new Error(`delivery receipt mismatch for ${a.id}`);
+    }
+    const texts = prior?.kind === "messages" ? [...prior.texts] : [];
+    const delivered = prior?.kind === "messages" ? prior.stream?.delivered ?? 0 : 0;
+    const index = retryIndex ?? texts.length;
+    if (index === texts.length) texts.push(text);
+    else if (texts[index] !== text) throw new Error(`delivery receipt mismatch for ${a.id}`);
+    const nonce = current.deliveryNonce ?? deliveryNonce(a.id);
+    const now = new Date().toISOString();
+    this.db.prepare(`UPDATE turn_attempts SET delivery_nonce=?, delivery_channel=?,
+      delivery_payload_json=?, delivery_started_utc=COALESCE(delivery_started_utc, ?), updated_utc=?
+      WHERE id=? AND generation=? AND owner_boot=?`)
+      .run(nonce, channel, JSON.stringify({ kind: "messages", texts, stream: { delivered } }),
+        now, now, a.id, a.generation, a.ownerBoot);
+    return { nonce: deliveryChunkNonce(nonce, index), index };
+  }
+
+  /** Successful sends advance only the contiguous delivered prefix. */
+  acknowledgeStreamDelivery(a: TurnAttempt, index: number): void {
+    this.db.prepare(`UPDATE turn_attempts
+      SET delivery_payload_json=json_set(delivery_payload_json, '$.stream.delivered', ?)
+      WHERE id=? AND generation=? AND owner_boot=?
+        AND json_extract(delivery_payload_json, '$.stream.delivered')=?`)
+      .run(index + 1, a.id, a.generation, a.ownerBoot, index);
+  }
+
+  /** A permanent invalid-payload rejection did not consume the planned nonce. */
+  discardStreamDelivery(a: TurnAttempt, index: number): void {
+    this.db.prepare(`UPDATE turn_attempts
+      SET delivery_payload_json=json_remove(delivery_payload_json, ?)
+      WHERE id=? AND generation=? AND owner_boot=?
+        AND json_array_length(delivery_payload_json, '$.texts')=?
+        AND json_extract(delivery_payload_json, '$.stream.delivered')=?`)
+      .run(`$.texts[${index}]`, a.id, a.generation, a.ownerBoot, index + 1, index);
+    this.db.prepare(`UPDATE turn_attempts SET delivery_nonce=NULL, delivery_channel=NULL,
+      delivery_payload_json=NULL, delivery_started_utc=NULL
+      WHERE id=? AND generation=? AND owner_boot=?
+        AND json_array_length(delivery_payload_json, '$.texts')=0`)
+      .run(a.id, a.generation, a.ownerBoot);
   }
 
   /** Record the exact terminal create-message before it can reach Discord. */

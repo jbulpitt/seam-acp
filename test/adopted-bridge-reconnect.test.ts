@@ -17,6 +17,7 @@ import { createRuntimeDispatchWatcher } from "../packages/core/src/core/dispatch
 import { enqueueDispatchSpec, dispatchDirs } from "../packages/core/src/core/dispatch/types.js";
 import { existsSync } from "node:fs";
 import type { ScheduledPrompt } from "../packages/core/src/core/scheduled-prompts/types.js";
+import { deliveryChunkNonce, deliveryNonce } from "../packages/core/src/core/dispatch/delivery-proof.js";
 
 const cleanups: (() => void)[] = [];
 afterEach(() => {
@@ -31,7 +32,8 @@ const drain = async () => {
 async function setup(source: "inbound" | "dispatch" | "schedule" = "inbound", style: "full" | "simple" = "full",
   options: { armed?: boolean; queue?: boolean; disconnected?: boolean; adoptionUnavailable?: boolean;
     attached?: boolean; terminalResult?: "completed" | "failed"; activityAgeMs?: number;
-    watchdogSeconds?: number; hangProbe?: () => unknown } = {}) {
+    watchdogSeconds?: number; hangProbe?: () => unknown;
+    stream?: { texts: string[]; delivered: number; visible?: number } } = {}) {
   const dir = mkdtempSync(path.join(tmpdir(), "seam-adopt-reconnect-"));
   cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
   let store = new SessionStore(path.join(dir, "test.db"));
@@ -68,6 +70,10 @@ async function setup(source: "inbound" | "dispatch" | "schedule" = "inbound", st
   store.turnAttempts.startPrompt(attempt);
   store.turnAttempts.recordRemoteRecovery(attempt, { version: 1, location: "remote",
     slot: 6, submissionId: "submission", acpSessionId: "acp", delegatedUtc: now });
+  if (options.stream) (store as any).db.prepare(`UPDATE turn_attempts SET delivery_nonce=?, delivery_channel=?,
+    delivery_payload_json=?, delivery_started_utc=? WHERE id=?`).run(deliveryNonce(attempt.id), "thread",
+    JSON.stringify({ kind: "messages", texts: options.stream.texts, stream: { delivered: options.stream.delivered } }),
+    now, attempt.id);
   store.turnAttempts.suspendBoot("old-controller");
   store.close();
   store = new SessionStore(path.join(dir, "test.db"));
@@ -159,8 +165,8 @@ async function setup(source: "inbound" | "dispatch" | "schedule" = "inbound", st
     },
     releaseRecoveryRuntime: (_id: string, rt: AgentRuntime) => rt.releaseRecovery(),
   };
-  const visible: string[] = [];
-  const nonces = new Set<string>();
+  const visible: string[] = options.stream?.texts.slice(0, options.stream.visible ?? options.stream.delivered) ?? [];
+  const nonces = new Set(visible.map((_, index) => deliveryChunkNonce(deliveryNonce(attempt.id), index)));
   const adapter = {
     sendMessage: vi.fn(async (channel: any, text: string, delivery?: { nonce?: string }) => {
       if (!delivery?.nonce || !nonces.has(delivery.nonce)) visible.push(text);
@@ -212,6 +218,12 @@ async function setup(source: "inbound" | "dispatch" | "schedule" = "inbound", st
     await drain();
   };
   return { orch, store, run, ready, adapter, visible, commands, text, update, complete, reconnect,
+    reopenStore: () => {
+      store.close();
+      store = new SessionStore(path.join(dir, "test.db"));
+      (orch as any).store = store;
+      return store;
+    },
     dir, snapshot, loseSlot: () => { rows = []; },
     losePrompt: () => { promptMissing = true; },
     unknownInventory: () => { inventoryUnknown = true; },
@@ -224,6 +236,88 @@ async function setup(source: "inbound" | "dispatch" | "schedule" = "inbound", st
     replaceSubmission: () => { rows = [{ ...rows[0]!, recovery: { ...snapshot, submissionId: "other-submission" } }]; },
     runtime: () => runtime };
 }
+
+describe("adoption preserves recorded stream delivery", () => {
+  it.each(["inbound", "schedule", "dispatch"] as const)("does not resend the pre-restart %s final", async source => {
+    const h = await setup(source, "full", { stream: { texts: ["SEAM880_FINAL"], delivered: 1 } });
+    await drain();
+    h.complete("SEAM880_FINAL");
+    await h.run;
+    expect(h.visible).toEqual(["SEAM880_FINAL"]);
+    expect(h.adapter.sendMessage).not.toHaveBeenCalled();
+    expect(h.store.turnAttempts.get("inbound-1")).toMatchObject({ state: "completed", generation: 1,
+      deliveryDone: true, outcome: { output: "SEAM880_FINAL" } });
+  });
+
+  it("delivers post-adoption text and a genuinely unsent final after the recorded prefix", async () => {
+    const h = await setup("schedule", "full", { stream: { texts: ["before restart"], delivered: 1 } });
+    await drain();
+    h.text("after adoption\n\n");
+    h.update({ sessionUpdate: "tool_call", toolCallId: "flush", title: "read", kind: "read" });
+    await drain();
+    expect(h.visible).toEqual(["before restart", "after adoption"]);
+    h.complete("before restart\n\nafter adoption\n\nnever streamed final");
+    await h.run;
+    expect(h.visible).toEqual(["before restart", "after adoption", "never streamed final"]);
+    expect(h.store.turnAttempts.get("inbound-1")?.deliveryDone).toBe(true);
+    expect(h.adapter.sendMessage.mock.calls.map(call => call[2]?.nonce)).toEqual([
+      deliveryChunkNonce(deliveryNonce("inbound-1"), 1), deliveryChunkNonce(deliveryNonce("inbound-1"), 2),
+    ]);
+  });
+
+  it("does not mistake an acknowledged stdout cursor for Discord delivery", async () => {
+    const h = await setup("schedule", "full", { stream: { texts: ["unsent prefix"], delivered: 0 } });
+    await drain();
+    h.complete("unsent prefix\n\nunsent final");
+    await h.run;
+    expect(h.visible.map(text => text.trim())).toEqual(["unsent prefix", "unsent final"]);
+    expect(h.store.turnAttempts.get("inbound-1")?.deliveryDone).toBe(true);
+  });
+
+  it("queries the recorded nonce when Discord accepted a send but its acknowledgment was lost", async () => {
+    const h = await setup("inbound", "full", { stream: { texts: ["accepted before restart"], delivered: 0, visible: 1 } });
+    await drain();
+    h.complete("accepted before restart");
+    await h.run;
+    expect(h.visible).toEqual(["accepted before restart"]);
+    expect(h.adapter.findMessageByNonce).toHaveBeenCalled();
+    expect(h.adapter.sendMessage).not.toHaveBeenCalled();
+    expect(h.store.turnAttempts.get("inbound-1")?.deliveryDone).toBe(true);
+  });
+
+  it("matches delivered chunks in order without suppressing a later identical paragraph", async () => {
+    const h = await setup("inbound", "full", { stream: { texts: ["same paragraph", "middle"], delivered: 2 } });
+    await drain();
+    h.complete("same paragraph\n\nmiddle\n\nsame paragraph");
+    await h.run;
+    expect(h.visible.map(text => text.trim())).toEqual(["same paragraph", "middle", "same paragraph"]);
+  });
+
+  it("recovers only unfinished delivery after a second SQLite reopen", async () => {
+    const h = await setup("schedule", "full", { stream: { texts: ["before restart"], delivered: 1 } });
+    await drain();
+    const send = h.adapter.sendMessage.getMockImplementation()!;
+    const tail = "x".repeat(1800) + "y".repeat(40);
+    h.adapter.sendMessage.mockImplementation(async (...args) => {
+      if (args[2]?.nonce === deliveryChunkNonce(deliveryNonce("inbound-1"), 2)) {
+        throw new Error("second restart interrupted delivery");
+      }
+      return send(...args);
+    });
+    h.complete("before restart\n\n" + tail);
+    await h.run;
+    expect(h.visible).toHaveLength(2);
+    expect(h.visible.map(text => text.trim()).join("")).toBe("before restart" + "x".repeat(1798));
+    expect(h.store.turnAttempts.get("inbound-1")).toMatchObject({ state: "completed", deliveryDone: false });
+    const store = h.reopenStore();
+    h.adapter.sendMessage.mockImplementation(send);
+    await h.orch.runScheduledPrompt("schedule", { id: "inbound-1", scheduledFor: null });
+    expect(h.visible).toHaveLength(3);
+    expect(h.visible.map(text => text.trim()).join("")).toBe("before restart" + tail);
+    expect(store.turnAttempts.get("inbound-1")).toMatchObject({ state: "completed", generation: 1, deliveryDone: true });
+    expect(h.commands.filter(command => command.type === "spawn")).toEqual([]);
+  });
+});
 
 describe("scheduled live adoption delivery", () => {
   it("delivers the adopted scheduled final once before projecting Done", async () => {

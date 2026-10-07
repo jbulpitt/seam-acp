@@ -89,6 +89,48 @@ function setup() {
 }
 
 describe("#250 human turn production pipeline, synthetic transport only", () => {
+  it("keeps a pre-shutdown streamed final visible once when the surviving owner settles after adoption", async () => {
+    const h = setup();
+    const final = "SEAM880_FINAL_" + "x".repeat(900);
+    const visible: string[] = [];
+    h.adapter.sendMessage.mockImplementation(async (channel, text) => {
+      visible.push(text); return { channel, id: `sent-${visible.length}` };
+    });
+    const first = h.run();
+    await h.started;
+    const attempt = h.store.turnAttempts.get("inbound-1")!;
+    h.store.turnAttempts.recordRemoteRecovery(attempt, { version: 1, location: "remote-one", slot: 6,
+      submissionId: "submission-6", acpSessionId: "recorded-acp", delegatedUtc: new Date().toISOString() });
+    await h.emit(final + "\n\n");
+    for (let i = 0; i < 20; i++) await new Promise<void>(resolve => setImmediate(resolve));
+    expect(visible).toEqual([final]);
+    expect(h.store.turnAttempts.get(attempt.id)?.state).toBe("active");
+    h.orch.suspendForRestart(); h.release(); await first;
+    const adopted = Object.assign(new EventEmitter(), { kill: vi.fn(), detach: vi.fn() });
+    const mux = {
+      sendCmd: vi.fn(async () => ({ health: [{ slot: 6, alive: true, attached: true, outputAckedThrough: 41,
+        recovery: { version: 1, owner: "bridge", submissionId: "submission-6", acpSessionId: "recorded-acp",
+          rung: 1, phase: "executing", retry: 0, budget: 3, remaining: 3, disposition: "none",
+          updatedUtc: new Date().toISOString() } }] })),
+      adopt: vi.fn(() => adopted),
+    };
+    const restarted = h.make({ muxFor: () => mux, slotHealthFor: () => [] });
+    await restarted.recoverInterruptedTurns();
+    for (let i = 0; i < 20; i++) await new Promise<void>(resolve => setImmediate(resolve));
+    let successors = 0;
+    const successor = (restarted as any).queueOnChannel("worker", async () => { successors += 1; });
+    expect(successors).toBe(0);
+    adopted.emit("remoteRecoveryResult", { version: 1, submissionId: "submission-6", acpSessionId: "recorded-acp",
+      status: "completed", text: final + "\n\n", stopReason: "end_turn", finishedUtc: new Date().toISOString() });
+    await successor;
+    expect(visible).toEqual([final]);
+    expect(successors).toBe(1);
+    expect(h.runtime.prompt).toHaveBeenCalledTimes(1);
+    expect(mux.adopt).toHaveBeenCalledWith(6, { allowAppTraffic: true, afterSeq: 41 });
+    expect(h.store.turnAttempts.get(attempt.id)).toMatchObject({ state: "completed", generation: 1,
+      deliveryDone: true, outcome: { output: final + "\n\n" } });
+  });
+
   it("a saved session reported missing recovers the ordinary human turn with a named notice", async () => {
     const h = setup();
     Object.assign(h.router, { invalidate: vi.fn(async () => {}) });
@@ -700,12 +742,13 @@ describe("#250 human turn production pipeline, synthetic transport only", () => 
     expect(h.runtime.prompt).not.toHaveBeenCalled();
   });
 
-  it("confirms a Discord-accepted nonce after crashing before delivery_done", async () => {
+  it("confirms a Discord-accepted nonce after crashing before delivery acknowledgments", async () => {
     const h = setup();
     h.runtime.prompt.mockImplementationOnce(async () => {
       await h.emit("accepted exactly once");
       return { stopReason: "end_turn" };
     });
+    vi.spyOn(h.store.turnAttempts, "acknowledgeStreamDelivery").mockImplementationOnce(() => {});
     const realMark = h.store.turnAttempts.markDeliveryDone.bind(h.store.turnAttempts);
     vi.spyOn(h.store.turnAttempts, "markDeliveryDone")
       .mockImplementationOnce(() => { throw new Error("synthetic crash after Discord accept"); })
@@ -716,7 +759,7 @@ describe("#250 human turn production pipeline, synthetic transport only", () => 
     expect(receipt).toMatchObject({
       state: "completed",
       deliveryDone: false,
-      deliveryPayload: { kind: "message", text: "accepted exactly once" },
+      deliveryPayload: { kind: "messages", texts: ["accepted exactly once"], stream: { delivered: 0 } },
     });
     h.adapter.findMessageByNonce.mockResolvedValueOnce({
       status: "found",
@@ -772,6 +815,7 @@ describe("#250 human turn production pipeline, synthetic transport only", () => 
       await h.emit("accepted but too old to scan");
       return { stopReason: "end_turn" };
     });
+    vi.spyOn(h.store.turnAttempts, "acknowledgeStreamDelivery").mockImplementationOnce(() => {});
     const realMark = h.store.turnAttempts.markDeliveryDone.bind(h.store.turnAttempts);
     vi.spyOn(h.store.turnAttempts, "markDeliveryDone")
       .mockImplementationOnce(() => { throw new Error("synthetic post-send crash"); })

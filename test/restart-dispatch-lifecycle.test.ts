@@ -49,6 +49,7 @@ function setup() {
   };
   const adapter = { sendPanel: async (channel: any) => ({ channel, id: "panel" }),
     sendMessage: vi.fn(async (channel: any, _text?: string) => ({ channel, id: "message" })),
+    findMessageByNonce: vi.fn(async () => ({ status: "absent" as const })),
     editMessage: async () => {},
     editPanel: vi.fn(async () => {}) };
   const config = { DATA_DIR: dataDir, REPOS_ROOT: "/synthetic", TURN_TIMEOUT_SECONDS: 60,
@@ -148,6 +149,7 @@ describe("#576 adopted status-card diagnosis", () => {
     try {
       h.finish();
       await sending;
+      expect(h.adapter.findMessageByNonce).toHaveBeenCalledOnce();
       expect(h.store.turnAttempts.get(h.attempt.id)).toMatchObject({ state: "completed", deliveryDone: false,
         outcome: { output: "recovered answer" } });
       await vi.advanceTimersByTimeAsync(6_000);
@@ -726,6 +728,7 @@ describe("#250 production dispatch lifecycle (synthetic transport, no providers)
     expect(input).toContain('"optionId":"allow_once"');
     expect(adoptedRuntime).toBeDefined();
     await vi.waitFor(() => expect(h.router.releaseRecoveryRuntime).toHaveBeenCalledTimes(1));
+    expect(h.adapter.findMessageByNonce).toHaveBeenCalledOnce();
     expect(h.adapter.sendMessage).toHaveBeenCalledWith(
       expect.objectContaining({ id: "worker" }),
       "recovered wake output",

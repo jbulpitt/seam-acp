@@ -2617,7 +2617,11 @@ export class Orchestrator {
       try {
         await this.handleIncomingMessageInner(msg, fence);
       } catch (err) {
-        if (!(err instanceof ChannelQueueFencedError)) {
+        if (err instanceof DispatchSuspendedError &&
+          (err.suspension === "shutdown" || err.suspension === "superseded")) {
+          this.logger.info({ err, channelId, suspension: err.suspension, reason: err.reason },
+            "inbound turn suspended");
+        } else if (!(err instanceof ChannelQueueFencedError)) {
           this.logger.error({ err, channelId }, "error in handleIncomingMessageInner");
         }
       } finally {

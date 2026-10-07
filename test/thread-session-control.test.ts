@@ -530,6 +530,7 @@ describe("ThreadSessionControlService", () => {
       });
       expect(prepared).toMatchObject({ ok: true, migration: { agent: "claude", model: "My-Typed-Model" } });
       if (!prepared.ok) throw new Error(prepared.error);
+      expect(prepared.warnings).toEqual([expect.stringContaining("the provider will validate the typed id")]);
       expect(prepared.migration.effort).toBeUndefined();
       expect(h.mutations).toEqual([]);
       expect(h.invalidated).toEqual([]);

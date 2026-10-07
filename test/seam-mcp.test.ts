@@ -1070,6 +1070,26 @@ describe("SeamMcpServer", () => {
     expect(h.enqueued[0]).not.toHaveProperty("rebuild");
   });
 
+  it("migrate_self returns the unverified warning with its staged typed target", async () => {
+    const warning = 'Model "My-Typed-Model" is unverified for claude@local; the provider will validate the typed id.';
+    h = await makeHarness({ prepareSelfMigration: async () => ({
+      ok: true,
+      warnings: [warning],
+      migration: {
+        agent: "claude", model: "My-Typed-Model",
+        previousAgent: "claude", previousModel: "default", previousSessionId: "acp-1",
+      },
+    }) });
+    const { body } = await h.call("tools/call", {
+      name: "migrate_self", arguments: { model: "My-Typed-Model", manifest: "Continue." },
+    }, { "X-Seam-Session": "good-token" });
+    expect(body.result.isError).toBeFalsy();
+    expect(JSON.parse(body.result.content[0].text)).toMatchObject({
+      ok: true, staged: true, model: "My-Typed-Model", warnings: [warning],
+    });
+    expect(h.enqueued[0]?.migration?.model).toBe("My-Typed-Model");
+  });
+
   it("migrate_self rebuild:true stages Rebuild after identity change", async () => {
     const prepareSelfMigration = vi.fn(async () => ({
       ok: true as const,

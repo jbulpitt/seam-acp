@@ -92,15 +92,15 @@ async function fixture(warm: boolean) {
   cleanup.push(() => router.invalidate(initial.id));
   const record = () => store.get(initial.id)!;
   const replies: string[] = [];
-  const apply = async (route: typeof paths[number]) => {
+  const apply = async (route: typeof paths[number], model = typed, effort?: string) => {
     if (route === "command") {
-      const selected = await runtime.applyModelChange({ platform: "discord", id: initial.channelRef, parentId: "parent" }, record(), typed,
+      const selected = await runtime.applyModelChange({ platform: "discord", id: initial.channelRef, parentId: "parent" }, record(), model,
         { id: "operator", name: "Operator" }, async text => { replies.push(text); });
       expect(selected).toMatchObject({ ok: true });
       return router.getOrStartRuntime(record());
     }
-    if (route === "configure_thread") return runtime.configure(record(), record(), { model: typed });
-    const prepared = await runtime.prepareSelfMigration(record(), { model: typed, manifest: "Continue." });
+    if (route === "configure_thread") return runtime.configure(record(), record(), { model, effort });
+    const prepared = await runtime.prepareSelfMigration(record(), { model, effort, manifest: "Continue." });
     expect(prepared).toMatchObject({ ok: true });
     if (!prepared.ok) throw new Error(prepared.error);
     return runtime.executeSelfMigration(record(), prepared.migration);
@@ -118,7 +118,7 @@ describe.each([false, true])("unlisted model path parity (warm catalog=%s)", war
     expect(h.threadPresets.get("worker")?.model?.value).toBe(typed);
     if (route === "command") expect(h.replies[0]).toContain("unverified");
     if (route === "configure_thread") expect(result).toMatchObject({ ok: true, verification: "unverified" });
-    if (route === "migrate_self") expect(result).toMatchObject({ ok: true, model: typed });
+    if (route === "migrate_self") expect(result).toMatchObject({ ok: true, model: typed, warnings: [expect.stringContaining("unverified")] });
   });
 
   it.each(paths)("%s surfaces the provider's own rejection rather than a cache refusal", async route => {
@@ -134,5 +134,23 @@ describe.each([false, true])("unlisted model path parity (warm catalog=%s)", war
       await expect(h.apply(route)).rejects.toBe(cause);
     }
     expect(boundary.attempts).toEqual([{ model: typed, effort: undefined }]);
+  });
+});
+
+describe("listed model behavior and explicit unlisted effort", () => {
+  it.each(paths)("%s still canonicalizes listed aliases and applies their default effort", async route => {
+    const h = await fixture(true);
+    h.store.upsert({ ...h.record(), configJson: JSON.stringify({ model: "old-provider-model", reasoningEffort: "low" }) });
+    await h.apply(route, "Known-Alias");
+    expect(boundary.attempts).toEqual([{ model: "known", effort: undefined }]);
+    expect(h.store.readConfig(h.record())).toMatchObject({ model: "known", reasoningEffort: "default" });
+    expect(h.threadPresets.get("worker")?.effort?.value).toBe("default");
+  });
+
+  it.each(["configure_thread", "migrate_self"] as const)("%s forwards explicit effort for an unlisted model", async route => {
+    const h = await fixture(false);
+    await h.apply(route, typed, "high");
+    expect(boundary.attempts).toEqual([{ model: typed, effort: "high" }]);
+    expect(h.store.readConfig(h.record())).toMatchObject({ model: typed, reasoningEffort: "high" });
   });
 });

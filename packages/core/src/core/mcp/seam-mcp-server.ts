@@ -2570,6 +2570,7 @@ export class SeamMcpServer {
       agent: prepared.migration.agent,
       model: prepared.migration.model,
       ...(prepared.migration.effort ? { effort: prepared.migration.effort } : {}),
+      ...(prepared.warnings ? { warnings: prepared.warnings } : {}),
       rebuild,
       message: rebuild
         ? "Migration is staged. Finish this turn normally; after the switch this thread is rebuilt from Discord, then the manifest runs as the next live turn."

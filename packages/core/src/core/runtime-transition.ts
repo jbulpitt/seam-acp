@@ -63,7 +63,7 @@ export interface PreparedSelfMigration {
 }
 
 export type PrepareSelfMigrationOutcome =
-  | { ok: true; migration: PreparedSelfMigration }
+  | { ok: true; migration: PreparedSelfMigration; warnings?: string[] }
   | { ok: false; error: string };
 
 export type ExecuteSelfMigrationOutcome =
@@ -402,28 +402,15 @@ export class RuntimeTransition {
       };
     }
 
-    const models = await this.advertisedModels(
-      profile,
-      target,
-      agentChanged,
-      { agentId: nextAgent, location }
-    );
-    if (models.length === 0) {
+    const binding = { agentId: nextAgent, location };
+    const selection = assessModelSelection(this.deps.modelCatalog, binding, requestedTargetModel);
+    if (!selection.allowed) {
       return {
         ok: false,
-        error: `Agent "${nextAgent}" did not advertise a model catalog; refusing an unvalidated model.`,
+        error: `Model "${requestedTargetModel}" is unavailable in the cached catalog for ${nextAgent}@${location}.`,
       };
     }
-    const catalogModel = this.deps.modelCatalog.model(
-      { agentId: nextAgent, location },
-      requestedTargetModel
-    );
-    if (!catalogModel || !models.includes(catalogModel.id)) {
-      return {
-        ok: false,
-        error: `Model "${requestedTargetModel}" is not advertised by "${nextAgent}". Valid models: ${models.join(", ")}.`,
-      };
-    }
+    const catalogModel = selection.model;
 
     const requestedEffort = normalizeEffort(input.effort);
     if (input.effort !== undefined && !requestedEffort) {
@@ -431,9 +418,9 @@ export class RuntimeTransition {
     }
 
     const desiredEffort = requestedEffort === "auto"
-      ? catalogModel.effort.selectionDefault
-      : requestedEffort ?? (inheritSelection ? inherited.effort.value ?? catalogModel.effort.selectionDefault : catalogModel.effort.selectionDefault);
-    if (!catalogModel.effort.choices.some((choice) => choice.id === desiredEffort)) {
+      ? catalogModel?.effort.selectionDefault
+      : requestedEffort ?? (inheritSelection ? inherited.effort.value ?? catalogModel?.effort.selectionDefault : catalogModel?.effort.selectionDefault);
+    if (catalogModel && !catalogModel.effort.choices.some((choice) => choice.id === desiredEffort)) {
       return {
         ok: false,
         error: `Effort "${desiredEffort}" is not supported for ${nextAgent}/${catalogModel.id}.`,
@@ -441,9 +428,10 @@ export class RuntimeTransition {
     }
     return {
       ok: true,
+      ...(selection.verification === "unverified" ? { warnings: [unverifiedModelWarning(selection.id, binding)] } : {}),
       migration: {
         agent: nextAgent,
-        model: catalogModel.id,
+        model: selection.id,
         effort: desiredEffort,
         previousAgent: before.agent.value,
         previousModel: before.model.value,
@@ -479,7 +467,9 @@ export class RuntimeTransition {
     const snapshot: SessionRecord = { ...current };
     const overlayBefore = this.deps.mutation.readThreadPresetEntry(current.channelRef);
     const desiredEffort = prepared.effort;
-    const warnings: string[] = [];
+    const binding = { agentId: prepared.agent, location: before.location.value };
+    const warnings: string[] = assessModelSelection(this.deps.modelCatalog, binding, prepared.model).verification === "unverified"
+      ? [unverifiedModelWarning(prepared.model, binding)] : [];
 
     try {
       const staged = this.applyTargetIdentity(
@@ -619,7 +609,7 @@ export class RuntimeTransition {
     // a HARD refusal, not a warning: confirming a Fast change that can never
     // apply is exactly the false confirmation this feature must not produce.
     const warnings: string[] = selection.verification === "unverified"
-      ? [`Model ${JSON.stringify(nextModel)} is unverified for ${nextAgentId}@${location}; the provider will validate the typed id.`] : [];
+      ? [unverifiedModelWarning(nextModel, { agentId: nextAgentId, location })] : [];
     const eligible = checkFastModeEligibility({
       requested: input.fastMode === true,
       agentId: nextAgentId,
@@ -949,14 +939,15 @@ export class RuntimeTransition {
       agentId: describedBefore.agent.value,
       location: describedBefore.location.value,
     };
-    const selected = this.modelCatalog.model(binding, id);
-    if (!selected) {
+    const selection = assessModelSelection(this.modelCatalog, binding, id);
+    if (!selection.allowed) {
       return fail(
-        `model ${JSON.stringify(id)} is not available in the cached catalog for ${binding.agentId}@${binding.location}`
+        `model ${JSON.stringify(id)} is unavailable in the cached catalog for ${binding.agentId}@${binding.location}`
       );
     }
-    const canonicalId = selected.id;
-    const defaultEffort = selected.effort.selectionDefault;
+    const selected = selection.model;
+    const canonicalId = selection.id;
+    const defaultEffort = selected?.effort.selectionDefault;
     const current = describedBefore.model.value;
     if (canonicalId === current) {
       await this.identityEffects.flush(record.id);
@@ -987,7 +978,7 @@ export class RuntimeTransition {
       const overlay = this.configMutation.applyThreadOverlay({
         threadId: channel.id,
         ...(channel.parentId ? { parentRef: channel.parentId } : {}),
-        changes: { model: canonicalId, effort: defaultEffort },
+        changes: { model: canonicalId, effort: defaultEffort ?? null },
         actor,
       });
       if (!overlay.ok) {
@@ -1002,7 +993,7 @@ export class RuntimeTransition {
       const verified = this.store.get(live.id) ?? live;
       const described = this.router.describeConfig(verified);
       const spawn = this.router.planRuntimeSpawn(verified);
-      if (described.model.value !== canonicalId || spawn.model !== selected.runtimeId) {
+      if (described.model.value !== canonicalId || spawn.model !== (selected?.runtimeId ?? canonicalId)) {
         const rolled = rollback();
         return fail(
           `the effective configuration did not match the requested model.${mismatchSuffix(rolled)}`
@@ -1010,14 +1001,16 @@ export class RuntimeTransition {
       }
 
       let message: string;
+      const effortDescription = defaultEffort === undefined ? "" : ` with effort \`${defaultEffort}\``;
       if (this.router.hasRuntime(verified.id)) {
         // Model and its discovered default effort are one transaction. Retire
         // the warm runtime so no live model switch can leave the old effort.
         await this.retire(verified.id);
-        message = `🧠 Model will be \`${canonicalId}\` with effort \`${defaultEffort}\` on the next turn (session respawn).`;
+        message = `🧠 Model will be \`${canonicalId}\`${effortDescription} on the next turn (session respawn).`;
       } else {
-        message = `🧠 Model will be \`${canonicalId}\` with effort \`${defaultEffort}\` on the next turn.`;
+        message = `🧠 Model will be \`${canonicalId}\`${effortDescription} on the next turn.`;
       }
+      if (selection.verification === "unverified") message += ` ${unverifiedModelWarning(canonicalId, binding)}`;
 
       await this.identityEffects.flush(record.id);
       await respond(message);
@@ -1214,18 +1207,6 @@ export class RuntimeTransition {
     };
   }
 
-  private async advertisedModels(
-    profile: AgentProfile,
-    target: SessionRecord,
-    agentChanged: boolean,
-    binding?: CatalogBinding
-  ): Promise<string[]> {
-    void profile;
-    void target;
-    void agentChanged;
-    return binding ? this.deps.modelCatalog.models(binding, { includeHidden: true }).map((model) => model.id) : [];
-  }
-
   private async forgeFreshSession(
     sessionId: string
   ): Promise<{ record: SessionRecord; runtime: SessionControlRuntime }> {
@@ -1247,6 +1228,10 @@ export class RuntimeTransition {
     await this.deps.identityCommitted?.(record.id);
     return this.deps.store.get(record.id)?.namePrefix != null;
   }
+}
+
+function unverifiedModelWarning(model: string, binding: CatalogBinding): string {
+  return `Model ${JSON.stringify(model)} is unverified for ${binding.agentId}@${binding.location}; the provider will validate the typed id.`;
 }
 
 function normalizeEffort(value: string | undefined): string | undefined {

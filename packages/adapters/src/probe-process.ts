@@ -47,6 +47,12 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { PassThrough, type Readable, type Writable } from "node:stream";
 import { setTimeout as delay } from "node:timers/promises";
+import {
+  ownedProcessGroupAlive,
+  registeredProcessGroup,
+  releaseOwnedProcessGroup,
+  type ProcessIdentity,
+} from "./process-group.js";
 
 /** Trailing bytes of stderr retained for (redacted) diagnostics. */
 export const PROBE_STDERR_CAPTURE_BYTES = 4_000;
@@ -623,23 +629,32 @@ export async function terminate(
 
 /** Own detached process groups only. A leader's exit does not reap its tools. */
 export async function terminateProcessGroup(
-  child: import("node:child_process").ChildProcess,
+  child: import("node:child_process").ChildProcess | ProcessIdentity,
   graceMs = PROBE_DEFAULT_KILL_GRACE_MS,
 ): Promise<boolean> {
+  const owned = "started" in child ? child : registeredProcessGroup(child);
+  const direct = "started" in child ? undefined : child;
   const pid = child.pid;
   if (pid === undefined) return true;
   const alive = (): boolean => {
+    if (owned) return ownedProcessGroupAlive(owned);
     try { process.kill(-pid, 0); return true; }
     catch (error) { return (error as NodeJS.ErrnoException).code !== "ESRCH"; }
   };
   const wait = async (ms: number): Promise<boolean> => {
     const until = Date.now() + ms;
-    while (alive() && Date.now() < until) await delay(20);
-    return !alive() && (child.exitCode !== null || child.signalCode !== null);
+    const stopped = () => !alive() && (!direct || direct.exitCode !== null || direct.signalCode !== null);
+    while (!stopped() && Date.now() < until) await delay(20);
+    return stopped();
   };
   for (const [signal, ms] of [["SIGTERM", graceMs], ["SIGKILL", PROBE_DEFAULT_REAP_MS]] as const) {
-    try { process.kill(-pid, signal); } catch { /* Verify absence even if signalling failed. */ }
-    if (await wait(ms)) return true;
+    if (!owned || alive()) {
+      try { process.kill(-pid, signal); } catch { /* Verify absence even if signalling failed. */ }
+    }
+    if (await wait(ms)) {
+      if (direct) releaseOwnedProcessGroup(direct);
+      return true;
+    }
   }
   return false;
 }

@@ -1,9 +1,11 @@
-import { spawn, execFileSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { promises as fs, openSync, closeSync, readFileSync, statSync } from "node:fs";
+import { promises as fs, openSync, closeSync, statSync } from "node:fs";
 import net, { type Socket } from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { readProcessIdentity as readSessiondProcessIdentity, type ProcessIdentity } from "@seam/adapters";
+export { readProcessIdentity as readSessiondProcessIdentity } from "@seam/adapters";
 import { createNdjsonReader } from "./ndjson-reader.js";
 import { createOutputLog, type OutputLog, type OutputLogOptions } from "./output-log.js";
 import {
@@ -37,13 +39,6 @@ const MAX_WRITE_BYTES = 128 * 1024 * 1024;
 const ORPHAN_TERM_GRACE_MS = 500;
 const ORPHAN_KILL_GRACE_MS = 500;
 const EXITED_SLOT_RETENTION_MS = 24 * 60 * 60_000;
-
-interface ProcessIdentity {
-  pid: number;
-  pgid: number;
-  /** Kernel/ps process start stamp. Paired with pid to defeat PID reuse. */
-  started: string;
-}
 
 interface PersistedSlot {
   slot: number;
@@ -219,57 +214,6 @@ function parseKillParams(raw: unknown): SessiondKillParams {
     throw new SessiondError("invalid_request", "kill signal is not allowed");
   }
   return { slot: safeInteger(value.slot, "slot"), signal: signal as NodeJS.Signals };
-}
-
-function processExists(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "EPERM";
-  }
-}
-
-/**
- * Read a portable pid-reuse guard. `ps` exists on both Linux and macOS hosts,
- * and a detached Node child is its own process-group leader. A pid alone is
- * never enough authority to signal after a supervisor crash.
- */
-export function readSessiondProcessIdentity(pid: number): ProcessIdentity | undefined {
-  if (!processExists(pid)) return undefined;
-  if (process.platform === "linux") {
-    try {
-      // `/proc/<pid>/stat` fields after comm begin at field 3. pgrp is field 5
-      // and starttime is field 22. Splitting after the LAST ')' handles spaces
-      // and parentheses in comm without treating a process name as structure.
-      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
-      const close = stat.lastIndexOf(")");
-      if (close === -1) return undefined;
-      const fields = stat.slice(close + 2).trim().split(/\s+/);
-      // A zombie has exited; it only waits to be reaped (#631).
-      if (fields[0] === "Z" || fields[0] === "X") return undefined;
-      const pgid = Number(fields[2]);
-      const startTicks = fields[19];
-      if (!Number.isSafeInteger(pgid) || !startTicks) return undefined;
-      return { pid, pgid, started: `linux:${startTicks}` };
-    } catch {
-      return undefined;
-    }
-  }
-  try {
-    const raw = execFileSync("/bin/ps", ["-p", String(pid), "-o", "pid=", "-o", "stat=", "-o", "pgid=", "-o", "lstart="], {
-      encoding: "utf8",
-      timeout: 1_000,
-      maxBuffer: 8 * 1024,
-      stdio: ["ignore", "pipe", "ignore"],
-    }).trim();
-    const match = /^(\d+)\s+(\S+)\s+(\d+)\s+(.+)$/.exec(raw);
-    if (!match || Number(match[1]) !== pid) return undefined;
-    if (match[2]!.startsWith("Z")) return undefined;
-    return { pid, pgid: Number(match[3]), started: match[4]!.trim().replace(/\s+/g, " ") };
-  } catch {
-    return undefined;
-  }
 }
 
 function sameIdentity(left: ProcessIdentity | undefined, right: ProcessIdentity | undefined): boolean {
@@ -838,7 +782,7 @@ export class SessiondServer {
     return { slot: params.slot, subscribed: true, throughSeq };
   }
 
-  private killSlot(params: SessiondKillParams): { slot: number; signalled: boolean; alreadyDead: boolean } {
+  private async killSlot(params: SessiondKillParams): Promise<{ slot: number; signalled: boolean; alreadyDead: boolean }> {
     this.assertRestorableSlot(params.slot);
     const entry = this.slots.get(params.slot);
     if (!entry) throw new SessiondError("slot_not_found", "kill refused: slot does not exist");
@@ -846,19 +790,15 @@ export class SessiondServer {
     // An explicit kill ends this slot's work: never resume it after a restart.
     this.dropResumeRecord(params.slot);
     const signal = params.signal ?? "SIGTERM";
-    let signalled = false;
-    if (signal !== "SIGKILL" && entry.link && !entry.link.destroyed) {
-      // The holder passes it to the child and reports the exit.
-      signalled = entry.link.write(holderMessage({ v: SLOT_HOLDER_PROTOCOL_VERSION, type: "signal", signal })) || true;
-    } else if (entry.identity && sameIdentity(entry.identity, readSessiondProcessIdentity(entry.identity.pid))) {
-      try {
-        process.kill(-entry.identity.pgid, signal);
-        signalled = true;
-      } catch {
-        signalled = false;
-      }
+    if (!entry.link || entry.link.destroyed) {
+      await this.connectHolder(entry, 5_000);
     }
-    if (!signalled) throw new SessiondError("slot_not_alive", "kill could not signal the recorded process");
+    if (!this.entryAlive(entry)) return { slot: params.slot, signalled: false, alreadyDead: true };
+    if (!entry.link || entry.link.destroyed) {
+      throw new SessiondError("slot_not_alive", "kill could not reconnect to the live slot holder");
+    }
+    // Even SIGKILL goes through the holder: it must reap the native groups first.
+    entry.link.write(holderMessage({ v: SLOT_HOLDER_PROTOCOL_VERSION, type: "signal", signal }));
     return { slot: params.slot, signalled: true, alreadyDead: false };
   }
 

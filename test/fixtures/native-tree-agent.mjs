@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import readline from "node:readline";
 import { fileURLToPath } from "node:url";
@@ -25,10 +25,22 @@ if (process.argv.includes("--native")) {
     const request = JSON.parse(line);
     if (request.method === "initialize") reply(request.id, { protocolVersion: 1, agentCapabilities: { loadSession: true } });
     else if (request.method === "session/new" || request.method === "session/load") {
-      reply(request.id, { sessionId: "native-tree-session" });
+      let previousRunning = [];
+      if (request.method === "session/load") {
+        const previous = JSON.parse(readFileSync(path.join(root, `${process.env.SEAM_NATIVE_TREE_SLOT}.json`), "utf8"));
+        previousRunning = Object.values(previous).filter(pid => {
+          try {
+            const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+            return !["Z", "X"].includes(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[0]);
+          } catch { return false; }
+        });
+      }
+      reply(request.id, { sessionId: "native-tree-session", previousRunning });
     } else if (request.method === "session/prompt") {
       // Same detached-wrapper/native/tool topology as the observed Claude run.
       spawn(process.execPath, [source, "--native"], { env: process.env, stdio: "ignore" });
+    } else if (request.method === "fixture/exit") {
+      process.exit(0);
     }
   });
 }

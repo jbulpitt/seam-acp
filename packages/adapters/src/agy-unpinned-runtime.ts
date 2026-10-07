@@ -3,6 +3,7 @@ import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import type { AdapterRuntimeDescriptor } from "./agent-profile.js";
+import { registerOwnedProcessGroup } from "./process-group.js";
 import { AGY_UNPINNED_EXECUTABLE_LABEL, AGY_UNPINNED_GIVE_UP } from "./agy-pin-mode.js";
 import {
   type AgyLaunchRuntime,
@@ -100,12 +101,14 @@ export class AgyUnpinnedRuntime implements AgyLaunchRuntime {
       spawn(): ChildProcess {
         if (consumed) throw new Error("native AGY prepared launch was already consumed");
         consumed = true;
-        return spawn(executable, [...argv], {
+        const proc = spawn(executable, [...argv], {
           cwd,
           env,
           detached: options.detached,
           stdio: [...options.stdio],
         });
+        if (options.detached) registerOwnedProcessGroup(proc);
+        return proc;
       },
       close(): void {
         consumed = true;

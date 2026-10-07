@@ -1,8 +1,8 @@
 import os from "node:os";
 import path from "node:path";
 import { mkdtempSync, rmSync } from "node:fs";
-import { fileURLToPath } from "node:url";
-import { afterAll, vi } from "vitest";
+import { afterAll, afterEach, beforeEach, vi } from "vitest";
+import { createTestHolderScope } from "./helpers/test-slot-holders.mjs";
 
 // Production imports must not read the operator's .env in non-live tests.
 vi.mock("dotenv", async importOriginal => ({
@@ -30,6 +30,12 @@ const home = mkdtempSync(path.join(os.tmpdir(), "seam-test-home-"));
 process.env.HOME = home;
 afterAll(() => rmSync(home, { recursive: true, force: true }));
 
-// sessiond runs each slot's child under a slot holder (#631); in tests that
-// holder runs from source.
-process.env.SEAM_SLOT_HOLDER_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), "helpers/slot-holder-source.mjs");
+let holderScope: Awaited<ReturnType<typeof createTestHolderScope>> | undefined;
+beforeEach(async () => {
+  holderScope = await createTestHolderScope();
+  process.env.SEAM_SLOT_HOLDER_PATH = holderScope.holderPath;
+});
+afterEach(async () => {
+  await holderScope?.close();
+  holderScope = undefined;
+});

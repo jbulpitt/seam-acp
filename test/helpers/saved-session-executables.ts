@@ -37,7 +37,7 @@ export async function prepareSessionExecutables() {
   await Promise.all(entries.map(({ outfile, contents }) => build({
     stdin: { contents, resolveDir: root, sourcefile: path.basename(outfile), loader: "js" },
     outfile, bundle: true, platform: "node", format: "esm", target: "node22",
-    packages: "external", alias: { "@seam/adapters": path.join(root, "packages/adapters/src/index.ts") },
+    packages: "external", alias: { "@seam/adapters": path.join(root, "packages/adapters/src") },
     sourcemap: "inline", logLevel: "silent",
   })));
   return { holderPath, adapterChildPath, legacyAdapterChildPath,

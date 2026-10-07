@@ -42,7 +42,7 @@ export async function savedSessionHost(options: {
   await fs.symlink(fakeAgent, path.join(bin, "codex-acp"));
   const server = new SessiondServer({ socketPath: path.join(root, "control.sock"),
     statePath: path.join(root, "slots.json"), resumeDir: path.join(root, "resume"),
-    holderPath: path.join(here, "slot-holder-source.mjs") });
+    holderPath: process.env.SEAM_SLOT_HOLDER_PATH ?? path.join(here, "slot-holder-source.mjs") });
   await server.start();
   const client = await SessiondClient.connect(path.join(root, "control.sock"));
   const logger = pino({ level: "silent" });

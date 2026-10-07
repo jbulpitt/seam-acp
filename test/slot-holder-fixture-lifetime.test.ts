@@ -74,7 +74,9 @@ describe("test holders belong to their fixture lifetime", () => {
     let closed: Promise<void> | undefined;
     let date: ReturnType<typeof vi.spyOn> | undefined;
     try {
-      await host.makeRouter().getOrStartRuntime(host.record);
+      await host.client.spawn({ slot: 884, executable: process.execPath,
+        args: ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"],
+        cwd: host.root, env: {} });
       const state = JSON.parse(await fs.readFile(path.join(host.root, "slots.json"), "utf8"));
       const holder = state.slots[0];
       expect(await socketHolders(holder.socketPath)).toEqual([holder.identity.pid]);

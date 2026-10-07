@@ -14,6 +14,22 @@ right command on the wrong host.
 - **sessiond:** one per bridge host. It owns the agent processes and keeps
   them alive through controller and bridge restarts.
 
+## Host inventory
+
+Every execution host, including `local`, advertises its adapters in the
+bridge's `hello`. The controller uses that inventory for agent choices,
+catalog bindings and portable ACP client metadata. Session-file reads and
+writes run through the owning bridge, not the controller's profiles.
+
+`COPILOT_ENABLED=false` opts out the bridge that reads it; the controller
+does not use that flag to disable other hosts. A bridge that does not offer
+a requested agent reports that fact without substituting another agent.
+The local bridge's MCP address remains loopback because it shares the
+controller host; that does not make execution in-process.
+
+Account quota polling still uses controller credentials. It is independent
+of execution-host availability, not a claim about each host's quota.
+
 ## Controller
 
 ```bash

@@ -118,6 +118,16 @@ export interface AttachmentBytes {
   size: number;
 }
 
+/** Portable ACP client capabilities published by the process-owning host. */
+export type AgentClientMetadata = Pick<AgentAdapter,
+  "displayName" | "defaultModel" | "brand" | "requestedContextTier" |
+  "effort" | "fastMode" | "restrictDiscordAccess" | "mcpServersAtSpawn" |
+  "submissionSignals" | "claudeSessionOptions"
+> & {
+  catalogScope: import("./model-catalog.js").CatalogScope;
+  sessionManagement: { history: boolean; repair: boolean } | null;
+};
+
 /**
  * §4 agent-adapter contract, implemented in-process for PR1.
  *
@@ -205,6 +215,10 @@ export interface AgentAdapter {
   readonly mcpServersAtSpawn?: boolean;
   /** Supported, opt-in SDK feed. Absent is explicitly unknown, never rejection. */
   readonly submissionSignals?: "claude_sdk";
+  readonly claudeSessionOptions?: {
+    compactionTokenThreshold?: number;
+    thinkingDisplay?: "summarized" | "omitted";
+  };
 
   /**
    * How this agent exposes reasoning effort, if at all. Drives both the

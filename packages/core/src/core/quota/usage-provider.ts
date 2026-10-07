@@ -22,9 +22,12 @@ export interface UsageProviderPort {
   readUsage(binding: Readonly<TurnBinding>, signal?: AbortSignal): Promise<ProviderUsage>;
 }
 
-/** Internal tier: only this facade sees launch profiles and live connections. */
+export type QuotaProfile = Pick<AgentProfile, "id" | "displayName"> &
+  Pick<Partial<AgentProfile>, "configDir" | "runtime" | "accountUsage" | "brand">;
+
+/** Internal tier: account readers and live quota connections, never turn launchers. */
 export function createUsageProviderPort(options: {
-  profiles: readonly AgentProfile[];
+  profiles: readonly QuotaProfile[];
   agyRuntime?: AgyLaunchRuntime;
   grokCliPath?: string;
   ollamaUsageCliPath?: string;

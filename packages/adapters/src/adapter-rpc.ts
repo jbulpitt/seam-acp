@@ -1,11 +1,8 @@
 /**
- * In-process adapter RPC dispatcher (D9).
- *
- * The remote-bridge and the local loopback host share this switch so
- * `listWorkspaces` / `describe` / session verbs / attachment ferry take
- * one code path. `spawn` is intentionally omitted: ACP stdio is the mux
- * slot path (remote: rpc spawn after mux.spawn; local: unbound profile.spawn).
+ * Host-side adapter RPC dispatcher, shared by every bridge.
+ * Spawn uses the mux slot path; the remaining adapter verbs use this switch.
  */
+import { promises as fsp } from "node:fs";
 import { isAdapterRpcMethod } from "./command-bus.js";
 import { normalizeCatalogCandidate } from "./catalog-evidence.js";
 import { scanWorkspaces } from "./workspace-scan.js";
@@ -43,8 +40,7 @@ export async function invokeAdapterRpc(
   switch (method) {
     case "listWorkspaces":
       // D11: host enumerates under its single workspace root. Adapter
-      // stubs stay empty; this is the host-side scan both loopback and
-      // the remote bridge use.
+      // stubs stay empty; every bridge uses this host-side scan.
       return scanWorkspaces(ctx.workspaceRoot);
     case "describe":
       if (!adapter) throw new Error("no adapter for describe");
@@ -76,6 +72,13 @@ export async function invokeAdapterRpc(
     case "listSessions":
       if (!adapter) throw new Error("no adapter for listSessions");
       return adapter.listSessions(cwd);
+    case "getHistory": {
+      const history = await adapter!.sessionManager!.getHistoryPath!(cwd, str(p.sessionId)!);
+      return history ? fsp.readFile(history, "utf8") : null;
+    }
+    case "repairSession":
+      await adapter!.sessionManager!.repairSession!(cwd, str(p.sessionId)!);
+      return null;
     case "getTranscript": {
       if (!adapter) throw new Error("no adapter for getTranscript");
       const sessionId = str(p.sessionId);

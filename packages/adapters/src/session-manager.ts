@@ -40,6 +40,8 @@ export interface ISessionManager {
    *  text-only `getTranscript`. Returns undefined when the file doesn't exist or
    *  the backend has no raw-history file. */
   getHistoryPath?(cwd: string, sessionId: string): Promise<string | undefined>;
+  /** Raw history read on the process-owning host. */
+  getHistory?(cwd: string, sessionId: string): Promise<string | undefined>;
   /** Optional side-channel readout of the most recent context-window usage
    *  (e.g. parsed from session transcripts on disk). Used by profiles where
    *  the ACP path doesn't surface live `usage_update` notifications. */

@@ -7,7 +7,6 @@ import type { SessionRouter } from "./session-router.js";
 import type { Preset, SessionRecord } from "./types.js";
 import type { ConfigApplyPlan } from "./config-apply-plan.js";
 import type { ModelCatalogService } from "./model-catalog/service.js";
-import { LOCAL_LOCATION } from "./location.js";
 import type { PluginHost } from "../plugins/host.js";
 import type { SlashInvocation } from "../plugins/slash-registry.js";
 import type { PresetUi } from "../plugins/presets/ui.js";
@@ -41,9 +40,8 @@ export function installPresetUi(deps: PresetDependencies) {
     transport: { ...(deps.transport.sendChoicePicker ? { sendChoicePicker: (channel, options) => deps.transport.sendChoicePicker!(channel, options) } : {}) },
     builderDefaults: channel => {
       const location = resolveThreadLocation(deps.config, channel?.id);
-      const local = deps.router.listProfiles();
-      const profiles = location === LOCAL_LOCATION ? local : [...(deps.agentsByHost().get(location) ?? new Set<string>())].sort()
-        .map(id => local.find(profile => profile.id === id) ?? { id, displayName: id });
+      const profiles = [...(deps.agentsByHost().get(location) ?? new Set<string>())].sort()
+        .map(id => deps.router.getProfile(id, location) ?? { id, displayName: id });
       return { location, profiles: profiles.map(profile => ({ id: profile.id, displayName: profile.displayName })) };
     },
     listWorkspace: deps.listWorkspace, promptRepoPath: deps.promptRepoPath, resolveRequestedRepoPath: deps.resolveRequestedRepoPath,

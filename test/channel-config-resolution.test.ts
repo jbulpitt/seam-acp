@@ -49,20 +49,24 @@ function fixture() {
     defaultCwd: dir, ...maps, seamMcp: localBridgeWiring(profiles) });
   const mutation = new ConfigMutationService({ store, logger, modelCatalog: catalog,
     describeConfig: row => router.describeConfig(row), presetsFile: file,
-    isAgentAvailable: id => Boolean(router.getProfile(id)),
+    isAgentAvailable: id => Boolean(router.getProfile(id)), tierCEnabled: true,
     reloadPresets: () => reloadChannelPresets(maps, file, logger) });
   const config = { REPOS_ROOT: dir, DATA_DIR: dir, ...maps, ...visualConfig,
     CHANNEL_PRESETS_FILE: file, REPO_EMOJIS: new Map(), TURN_TIMEOUT_SECONDS: 60,
     SEAM_DISPATCH_STATUS_PANEL: true, SEAM_DISPATCH_OUTPUT_STYLE: "messages" } as Config;
+  const host = { workspaceRoot: dir };
+  const bridgeHub = { get: (_location: string) => ({ host }), markSessionBridge: vi.fn() };
   const { plan, runtime } = createConfigFacades({ store, router, mutation, modelCatalog: catalog, logger, config,
+    bridgeHub: bridgeHub as any,
+    resolveRequestedRepoPath: async (_channel, requested) => path.resolve(requested),
     identityCommitted: async () => {}, persistConfig: (row, cfg) => store.upsert({ ...row, configJson: JSON.stringify(cfg) }),
     repoDisplay: repo => repo ?? "", unregisteredAgentMessage: (_id, message) => message,
-    parkedSelectMessage: () => null });
+  });
   const created = router.ensureSessionRecord({ platform: "discord", channelRef: channel.id, parentRef: channel.parentId, cwd: dir });
   const record = store.get(created.id)!;
   const bare = Object.assign(Object.create(Orchestrator.prototype), { store, router, config, logger,
     adapter: { resolveChannel: vi.fn(async (ref: typeof channel) => ({ ...ref, parentId: "111111111111111111" })) } });
-  return { maps, catalog, router, mutation, plan, runtime, config, record, bare };
+  return { maps, catalog, router, mutation, plan, runtime, config, record, bare, host };
 }
 
 describe("one channel configuration resolution", () => {
@@ -88,6 +92,34 @@ describe("one channel configuration resolution", () => {
     expect(inherited.effort.value).toBe("high");
   });
 
+  it("a remote thread keeps its host when inspecting inherited model and effort", () => {
+    const h = fixture();
+    h.maps.threadPresets.set(channel.id, { location: "remote-645", agent: { value: "claude" } });
+    vi.spyOn(h.catalog, "effortChoices").mockImplementation(binding =>
+      binding.location === "remote-645" ? ["default", "high"] : ["default", "low"]);
+    const inherited = h.router.describeConfig(h.record, { inherit: true });
+    expect(inherited.location.value).toBe("remote-645");
+    expect(inherited.agent.value).toBe("codex");
+    expect(inherited.model.value).toBe("codex-channel");
+    expect(inherited.effort.value).toBe("high");
+    expect(h.catalog.effortChoices).toHaveBeenCalledWith(
+      { agentId: "codex", location: "remote-645" }, "codex-channel");
+  });
+
+  it("a channel model proposal uses the caller's actual remote binding", () => {
+    const h = fixture();
+    h.maps.threadPresets.set(channel.id, { location: "remote-645" });
+    const model = h.catalog.model.bind(h.catalog);
+    vi.spyOn(h.catalog, "model").mockImplementation((binding, id) => {
+      const found = model(binding, id);
+      return found && binding.location === "local" ? { ...found, availability: "unavailable" } : found;
+    });
+    const proposal = h.mutation.buildProposal(h.record, { channelPreset: { model: "codex-explicit" } });
+    expect(proposal).toMatchObject({ ok: true });
+    expect(h.catalog.model).toHaveBeenCalledWith(
+      { agentId: "codex", location: "remote-645" }, "codex-explicit");
+  });
+
   it("an explicit worker agent never receives another agent's channel model", () => {
     const h = fixture();
     const selected = h.router.describeConfig(h.record, { agent: "claude", location: "local" });
@@ -103,6 +135,22 @@ describe("one channel configuration resolution", () => {
     expect(selected.model.value).toBe("codex-explicit");
     expect(selected.effort.value).toBe("low");
     expect(h.router.describeConfig(store.get(h.record.id)!).model.value).toBe("codex-channel");
+  });
+
+  it.each(["local", "remote-645"])("config set uses %s's advertised workspace root", async location => {
+    const h = fixture();
+    h.host.workspaceRoot = path.join(dir, "host-root");
+    h.maps.threadPresets.set(channel.id, { location });
+    const prepare = (repo: string) => h.plan.prepareConfigSet(h.record, channel, {
+      json: null, rebuild: false, supplied: ["repo"],
+      values: { agent: null, model: null, effort: null, repo, role: null, permissions: null, card: null, gif: null },
+    });
+    const withinHost = path.join(dir, "host-root", "project");
+    expect(await prepare(withinHost)).toMatchObject({ ok: true, prepared: { resolvedRepo: withinHost } });
+    const outsideHost = path.join(dir, "controller-only");
+    expect(await prepare(outsideHost)).toMatchObject({
+      ok: false, message: expect.stringContaining(`outside host \`${location}\` workspace root`),
+    });
   });
 
   it("backfills a parent without replacing context, agent, or explicit config", () => {
@@ -179,7 +227,8 @@ describe("one channel configuration resolution", () => {
     const h = fixture();
     h.plan.applyTargetIdentity(h.record, { agent: "claude", model: "claude-explicit", effort: "low" }, actor);
     const respond = vi.fn(async () => {});
-    expect(await h.runtime.applyAgentChange(channel, store.get(h.record.id)!, "codex", actor, respond)).toMatchObject({ ok: true });
+    expect(await h.runtime.applyAgentChange(channel, store.get(h.record.id)!, "codex", actor, respond))
+      .toEqual({ ok: true, message: expect.any(String) });
     expect(h.maps.threadPresets.get(channel.id)).toMatchObject({ agent: { value: "codex" } });
     expect(h.maps.threadPresets.get(channel.id)?.model).toBeUndefined();
     expect(h.maps.threadPresets.get(channel.id)?.effort).toBeUndefined();
@@ -266,7 +315,7 @@ describe("one channel configuration resolution", () => {
       sendMessage: vi.fn(async () => ({ channel, id: "answer" })), resolveChannel: vi.fn(async ref => ({ ...ref, parentId: "111111111111111111" })) };
     const orch = new Orchestrator({ logger, config: h.config, store, router: h.router,
       modelCatalog: h.catalog, renderer: discordRenderer, adapter: adapter as any });
-    (orch as any).bridgeHub = { markSessionBridge: vi.fn(), get: () => ({ mux }), mcpServersForBridgeSpawn: () => undefined };
+    (orch as any).bridgeHub = { markSessionBridge: vi.fn(), get: () => ({ mux, host: h.host }), defaultCwdForLocation: () => dir, mcpServersForBridgeSpawn: () => undefined };
     await (orch as any).cardVisualsReady;
     const panel = vi.spyOn(orch as any, "startDispatchStatusPanel");
     const inject = vi.spyOn(orch, "injectTurn").mockImplementation(async (_row, _prompt, opts) => {

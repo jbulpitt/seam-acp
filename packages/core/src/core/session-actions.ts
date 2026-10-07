@@ -145,16 +145,16 @@ export class SessionActions {
     return {
       canCompact,
       canRepair: typeof manager.repairSession === "function",
-      canPremiumSession: canCompact && typeof manager.getHistoryPath === "function",
+      canPremiumSession: canCompact && typeof manager.getHistory === "function",
       canPremiumDiscord: isDiscordPremiumCompactAvailable((id) => router.getProfile(id)),
-      migrationTargets: router.listProfiles()
+      migrationTargets: router.listProfiles(binding.location)
         .filter((p) => p.id !== record.agentId && !!p.sessionManager)
         .map((p) => ({ id: p.id, displayName: p.displayName })),
     };
   }
 
   migrationTarget(agentId: string) {
-    const profile = this.deps.router.getProfile(agentId);
+    const profile = this.deps.router.getProfile(agentId, this.deps.binding.location);
     return profile?.sessionManager ? {
       id: profile.id, displayName: profile.displayName,
       migrate: (sessionId: string, actor: MutationActor, complete: (newSessionId: string) => Promise<void>,
@@ -286,7 +286,7 @@ export class SessionActions {
 
   migrate(sessionId: string, targetAgentId: string, actor: MutationActor, complete: (newSessionId: string) => Promise<void>,
     failed?: (error: unknown) => Promise<void>): Promise<void> {
-    return this.migrateTo(sessionId, this.deps.router.getProfile(targetAgentId)!, actor, complete, failed);
+    return this.migrateTo(sessionId, this.deps.router.getProfile(targetAgentId, this.deps.binding.location)!, actor, complete, failed);
   }
 
   private migrateTo(sessionId: string, targetProfile: AgentProfile, actor: MutationActor, complete: (newSessionId: string) => Promise<void>,

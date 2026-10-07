@@ -25,6 +25,8 @@ const HOST_EXEC_OUTPUT_MAX_BYTES = 64 * 1024;
 const SESSION_CWD_METHODS = new Set([
   "listSessions",
   "getTranscript",
+  "getHistory",
+  "repairSession",
   "getUsage",
   "usage",
   "cloneSession",

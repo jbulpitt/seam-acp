@@ -194,12 +194,13 @@ describe.sequential("#503 child-owned AGY CSRF authentication", () => {
   it("keeps concurrent children on distinct launch/header pairs and private logs", async () => {
     const f = subject({ SEAM_AGY_CSRF_MODE: "enforce" });
     const first = new AgentRuntime({ profile: f.profile, logger, spawnFn: f.profile.spawn.bind(f.profile) });
-    const second = new AgentRuntime({ profile: f.profile, logger, spawnFn: f.profile.spawn.bind(f.profile) });
+    const other = subject({ SEAM_AGY_CSRF_MODE: "enforce" });
+    const second = new AgentRuntime({ profile: other.profile, logger, spawnFn: other.profile.spawn.bind(other.profile) });
     cleanups.push(() => Promise.all([first.dispose().catch(() => {}), second.dispose().catch(() => {})]).then(() => {}));
     await Promise.all([first.start(), second.start()]);
     await Promise.all([
       first.newSession({ cwd: f.root, model: "fixture-native-model", strictModel: true }),
-      second.newSession({ cwd: f.root, model: "fixture-native-model-low", strictModel: true }),
+      second.newSession({ cwd: other.root, model: "fixture-native-model-low", strictModel: true }),
     ]);
     await Promise.all([
       first.prompt("capability-model-a"),
@@ -207,12 +208,13 @@ describe.sequential("#503 child-owned AGY CSRF authentication", () => {
     ]);
     await Promise.all([first.idle(), second.idle()]);
 
-    const launches = rows(f.log).filter((row) => row.pid && row.prompt?.startsWith("capability-model-"));
+    const allRows = [...rows(f.log), ...rows(other.log)];
+    const launches = allRows.filter((row) => row.pid && row.prompt?.startsWith("capability-model-"));
     expect(launches).toHaveLength(2);
     expect(new Set(launches.map((row) => row.csrfFingerprint)).size).toBe(2);
     const logs = launches.map((row) => row.args?.[row.args.indexOf("--log-file") + 1]);
     expect(new Set(logs).size).toBe(2);
-    const requestRows = rows(f.log).filter((row) =>
+    const requestRows = allRows.filter((row) =>
       row.scenario === "csrf-rpc" && launches.some((launch) => launch.csrfFingerprint === row.csrfFingerprint));
     expect(requestRows.filter((row) => row.rpc === "StreamAgentStateUpdates")).toHaveLength(2);
     expect(requestRows.every((row) => row.csrfStatus === "match")).toBe(true);

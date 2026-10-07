@@ -464,7 +464,7 @@ describe("stateless/preset handoff embed card", () => {
     ]);
   });
 
-  it("keeps implicit @local workers on the caller thread cwd (#367)", async () => {
+  it("uses the local bridge workspace for an implicit worker cwd", async () => {
     const { adapter } = spyAdapter();
     const orch = makeOrch({ dataDir, adapter });
     (orch as any).store.getPresetByName = () => null;
@@ -476,7 +476,7 @@ describe("stateless/preset handoff embed card", () => {
 
     await orch.dispatchInjectTurn(presetSpec({ preset: "claude", location: "local" }));
 
-    expect(injected.cwd).toBe("/repo");
+    expect(injected.cwd).toBe(dataDir);
     expect(injected.location).toBe("local");
     expect(injected.spawnFn).toEqual(expect.any(Function));
   });

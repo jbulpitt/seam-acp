@@ -6,12 +6,12 @@ import type { SessionStore } from "./session-store.js";
 import type { SessionRouter } from "./session-router.js";
 import type { BridgeHub } from "./bridge-hub.js";
 import type { ModelCatalogService } from "./model-catalog/service.js";
-import type { SessionControlRuntime, ThreadSessionControlDeps } from "./runtime-transition.js";
+import type { ThreadSessionControlDeps } from "./runtime-transition.js";
 import { RuntimeTransition } from "./runtime-transition.js";
 import { type ConfigMutationService, type ConfigMutationInput, type ConfigProposal, type MutationActor, type ConfigMutationTier, type ProposedField, type ChannelPresetChanges, type ThreadPresetChanges } from "./config-mutation.js";
 import { configTarget, CONFIG_DEFAULT_FIELDS, type ConfigDefaultField, type OverrideCounts } from "./config-target.js";
 import { parseStatusCardStyle, parseSimpleCardGif, type SessionRecord, type SessionConfigState, type PermissionPolicyMode, type StatusCardStyle, type Preset } from "./types.js";
-import { LOCAL_LOCATION, isLocalLocation, parseAgentAtLocation } from "./location.js";
+import { parseAgentAtLocation } from "./location.js";
 import { isWithinRoot } from "./path-utils.js";
 import { bindSessionLocation } from "./location-bind.js";
 import { buildSavePlan, snapshotFromDescribe, fastModeWillResetSession, willVerifyFastMode, type ThreadConfigDraft } from "../platforms/discord/config-editor.js";
@@ -54,7 +54,6 @@ export interface ConfigApplySettings {
   repoDisplay: (repo: string | null) => string;
   unregisteredAgentMessage: (id: string, fallback: string) => string;
   resolveRequestedRepoPath?: (channel: ChannelRef, requested: string, location: string) => Promise<string>;
-  parkedSelectMessage?: (id: string) => string | null;
 }
 
 export const CONFIG_SET_FIELD_NAMES = [
@@ -272,8 +271,10 @@ export class ConfigApplyPlan {
       const value = request.values[field]!.trim();
       const clear = value === "__inherit__" || value === "inherit" || (["effort", "card", "gif"].includes(field) && value === "default") || (field === "role" && value === "auto");
       if (field === "repo") {
-        changes.cwd = clear ? null : await this.settings!.resolveRequestedRepoPath!(channel, value, LOCAL_LOCATION);
-        if (changes.cwd && !isWithinRoot(changes.cwd, this.config.REPOS_ROOT)) return { ok: false as const, message: `Repo \`${changes.cwd}\` is outside REPOS_ROOT (\`${this.config.REPOS_ROOT}\`).` };
+        const location = resolveThreadLocation(this.config, channel.id);
+        changes.cwd = clear ? null : await this.settings!.resolveRequestedRepoPath!(channel, value, location);
+        const root = this.bridgeHub?.get(location)?.host.workspaceRoot;
+        if (changes.cwd && root && !isWithinRoot(changes.cwd, root)) return { ok: false as const, message: `Repo \`${changes.cwd}\` is outside host \`${location}\` workspace root (\`${root}\`).` };
       }
       else if (field === "card") {
         if (!clear && value !== "full" && value !== "simple") return { ok: false as const, message: "`card` must be full, simple or default." };
@@ -291,7 +292,7 @@ export class ConfigApplyPlan {
   }
 
   async applyChannelSet(channel: ChannelRef, prepared: { channelId: string; changes: ChannelPresetChanges }, actor: MutationActor) {
-    const result = this.applyChannelOverlay({ channelId: prepared.channelId, changes: prepared.changes, actor });
+    const result = this.applyChannelOverlay({ channelId: prepared.channelId, changes: prepared.changes, actor, location: resolveThreadLocation(this.config, channel.id) });
     if (!result.ok && !result.error.includes("No effective change")) return { ok: false as const, message: result.error, rollbackError: "" };
     this.publishChannelIdentity();
     return { ok: true as const, effective: this.describeTarget(channel, "channel"), restartRequested: false };
@@ -424,7 +425,9 @@ export class ConfigApplyPlan {
           if (!supplied.includes("effort")) changes.effort = null;
         } else if (field === "repo") {
           changes.cwd = clear ? null : await this.settings!.resolveRequestedRepoPath!(channel, value, resolveThreadLocation(this.config, channel.id));
-          if (changes.cwd && isLocalLocation(resolveThreadLocation(this.config, channel.id)) && !isWithinRoot(changes.cwd, this.config.REPOS_ROOT)) return { ok: false, message: `Repo \`${changes.cwd}\` is outside REPOS_ROOT (\`${this.config.REPOS_ROOT}\`).` };
+          const location = resolveThreadLocation(this.config, channel.id);
+          const root = this.bridgeHub?.get(location)?.host.workspaceRoot;
+          if (changes.cwd && root && !isWithinRoot(changes.cwd, root)) return { ok: false, message: `Repo \`${changes.cwd}\` is outside host \`${location}\` workspace root (\`${root}\`).` };
         } else if (field === "card") {
           if (!clear && value !== "full" && value !== "simple") return { ok: false, message: "`card` must be full, simple or default." };
           changes.statusCardStyle = clear ? null : value as StatusCardStyle;
@@ -479,10 +482,6 @@ export class ConfigApplyPlan {
     const nextAgentId = parsedAgent?.agentId ?? describedBefore.agent.value;
     const currentLocation = resolveThreadLocation(this.config, channel.id);
     const nextLocation = parsedAgent?.explicit ? parsedAgent.location : currentLocation;
-    const parkedSelect = nextLocation === LOCAL_LOCATION
-      ? this.settings!.parkedSelectMessage!(nextAgentId)
-      : null;
-    if (parkedSelect) return { ok: false, message: parkedSelect };
     if (!this.router.getProfile(nextAgentId, nextLocation)) {
       return {
         ok: false,
@@ -561,10 +560,11 @@ export class ConfigApplyPlan {
           message: `Invalid repo: ${err instanceof Error ? err.message : String(err)}`,
         };
       }
-      if (isLocalLocation(nextLocation) && !isWithinRoot(resolvedRepo, this.config.REPOS_ROOT)) {
+      const root = this.bridgeHub?.get(nextLocation)?.host.workspaceRoot;
+      if (root && !isWithinRoot(resolvedRepo, root)) {
         return {
           ok: false,
-          message: `Repo \`${resolvedRepo}\` is outside REPOS_ROOT (\`${this.config.REPOS_ROOT}\`).`,
+          message: `Repo \`${resolvedRepo}\` is outside host \`${nextLocation}\` workspace root (\`${root}\`).`,
         };
       }
     }
@@ -971,6 +971,7 @@ export class ConfigApplyPlan {
         channelId: draft.parentRef,
         changes: plan.channelPreset,
         actor,
+        location: before?.location.value ?? resolveThreadLocation(this.config, draft.threadId),
       });
       if (!written.ok) {
         return { ok: false as const, error: `Could not save: ${written.error}` };
@@ -1101,7 +1102,6 @@ export class ConfigApplyPlan {
 
 
 export interface ConfigFacadeEnvironment extends Omit<ConfigApplySettings, "runtime"> {
-  parkedSelectMessage: (id: string) => string | null;
   store: SessionStore;
   mutation: ConfigMutationService;
 }

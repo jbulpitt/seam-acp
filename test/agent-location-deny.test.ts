@@ -1,7 +1,7 @@
 /**
  * #474 — host-scoped agent availability.
  *
- * `COPILOT_ENABLED=false` removed the profile everywhere, including the 14
+ * Each bridge owns its Copilot entitlement; controller policy withholds explicit host bindings.
  * FHR threads on `remote-a`. A deny list withholds `copilot@local` while
  * the profile stays registered so `copilot@remote-a` still resolves.
  *
@@ -136,7 +136,7 @@ describe("#474 parseAgentLocationDeny", () => {
 
   it("refuses a bare id — that is a global ban, not this list", () => {
     expect(() => parseAgentLocationDeny("copilot")).toThrow(/agentId@location/);
-    expect(() => parseAgentLocationDeny("copilot")).toThrow(/COPILOT_ENABLED=false/);
+    expect(() => parseAgentLocationDeny("copilot")).toThrow(/does not name a host/);
   });
 
   it("does not silently substitute local for a missing location", () => {
@@ -228,7 +228,8 @@ describe("#474 SessionRouter: copilot@remote-a still plans; copilot@local does n
     expect(router.getProfile("copilot", "local")).toBeUndefined();
     expect(router.getProfile("copilot", "remote-a")?.id).toBe("copilot");
     expect(router.getProfile("claude", "local")?.id).toBe("claude");
-    expect(router.listProfiles().map((p) => p.id)).toEqual(["copilot", "claude"]);
+    expect(router.listProfiles().map((p) => p.id)).toEqual(["claude"]);
+    expect(router.listProfiles("remote-a").map((p) => p.id)).toEqual(["copilot", "claude"]);
   });
 
   it("planRuntimeSpawn refuses a local copilot session with the deny copy, not Unknown agent", () => {
@@ -290,13 +291,11 @@ describe("DEFAULT_AGENT denied at local refuses only default-dependent new sessi
     };
   }
 
-  it("refuses DEFAULT_AGENT=copilot when copilot@local is denied", () => {
+  it("does not make DEFAULT_AGENT depend on local's deny binding", () => {
     baseEnv({ DEFAULT_AGENT: "copilot", AGENT_LOCATION_DENY: "copilot@local" });
     const cfg = loadConfig({ env });
     expect(cfg.DEFAULT_AGENT).toBe("copilot");
-    expect(cfg.defaultAgentDisabledReason).toMatch(/AGENT_LOCATION_DENY/);
-    expect(cfg.defaultAgentDisabledReason).toMatch(/will not substitute one for you/);
-    expect(cfg.defaultAgentDisabledReason).not.toMatch(/\/seam config agent/);
+    expect(cfg.defaultAgentDisabledReason).toBeUndefined();
   });
 
   it("accepts DEFAULT_AGENT=claude with copilot@local denied", () => {

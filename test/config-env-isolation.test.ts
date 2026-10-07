@@ -70,9 +70,9 @@ describe("non-live config isolation under real dotenv files", () => {
         `const { loadConfig } = await import(${JSON.stringify(new URL("../packages/core/src/config.ts", import.meta.url).href)});
          const c = loadConfig();
          process.stdout.write(JSON.stringify({ token: c.DISCORD_BOT_TOKEN, agent: c.DEFAULT_AGENT,
-           copilot: c.COPILOT_ENABLED, deny: c.AGENT_LOCATION_DENY, root: c.REPOS_ROOT }));`,
+           copilot: "COPILOT_ENABLED" in c, deny: c.AGENT_LOCATION_DENY, root: c.REPOS_ROOT }));`,
       ], { cwd, timeout: 15_000, env: { PATH: process.env.PATH, HOME: cwd, DEFAULT_AGENT: "codex", DISCORD_BOT_TOKEN: "shell-token" } });
-      expect(JSON.parse(stdout)).toEqual({ token: "file-token", agent: "claude", copilot: true,
+      expect(JSON.parse(stdout)).toEqual({ token: "file-token", agent: "claude", copilot: false,
         deny: [{ agentId: "copilot", location: "local" }], root: cwd });
     } finally { rmSync(cwd, { recursive: true, force: true }); }
   }, 20_000);

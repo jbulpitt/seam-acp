@@ -10,6 +10,7 @@ import {
   makeMux,
   PROTOCOL_VERSION,
   type AdapterRuntimeDescriptor,
+  type AgentClientMetadata,
   type HelloFrame,
   type WorkspaceInfo,
 } from "@seam/adapters";
@@ -101,6 +102,7 @@ export interface ConnectedBridge {
     ready: boolean;
     reason?: string;
     runtime?: AdapterRuntimeDescriptor;
+    metadata?: AgentClientMetadata;
   }>;
   mux: ReturnType<typeof makeMux>;
   connectedAt: number;
@@ -307,7 +309,6 @@ export class BridgeHub {
       port,
       healthPort: this.healthPort,
       publicBaseUrl: dialed ?? publicBaseFromBridgeWsUrl(this.publicWsUrl()),
-      remote: true,
     });
   }
 
@@ -328,7 +329,7 @@ export class BridgeHub {
       });
     }
     const url = this.mcpUrlForRemote(bridgeId);
-    return buildSeamMcpServerEntry(port, token, url ? { url } : { url: resolveReachableMcpUrl({ port, healthPort: this.healthPort, remote: true }) });
+    return buildSeamMcpServerEntry(port, token, url ? { url } : { url: resolveReachableMcpUrl({ port, healthPort: this.healthPort }) });
   }
 
   async rpc(
@@ -587,6 +588,7 @@ export class BridgeHub {
       ready: boolean;
       reason?: string;
       runtime?: AdapterRuntimeDescriptor;
+      metadata?: AgentClientMetadata;
     }>();
     for (const a of hello.agents ?? []) {
       agents.set(a.agentId, {
@@ -594,6 +596,7 @@ export class BridgeHub {
         installed: a.installed,
         ready: false,
         ...(a.runtime ? { runtime: a.runtime } : {}),
+        ...(a.metadata ? { metadata: a.metadata } : {}),
       });
       if (a.agentId === "agy" && a.runtime?.topology === "virtual-acp-native-cli") {
         this.mutation.recordRuntimeProvenance({

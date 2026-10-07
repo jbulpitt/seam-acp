@@ -109,7 +109,10 @@ function briefFromToolInput(input: unknown): string {
 
 /** Read and parse a Claude session JSONL into structure-preserving events. */
 export async function readRichHistory(jsonlPath: string): Promise<RichHistory> {
-  const content = await fsp.readFile(jsonlPath, "utf8");
+  return parseRichHistory(await fsp.readFile(jsonlPath, "utf8"));
+}
+
+export function parseRichHistory(content: string): RichHistory {
   const lines = content.split("\n").filter((l) => l.trim().length > 0);
 
   const events: HistoryEvent[] = [];

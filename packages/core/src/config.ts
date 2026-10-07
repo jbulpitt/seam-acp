@@ -4,15 +4,11 @@ import fs from "node:fs";
 import path from "node:path";
 import { z } from "zod";
 import { logger } from "./lib/logger.js";
-import { parkedAgentMessage } from "./core/parked-agents.js";
 import { DEFAULT_BRAND_ICON_BASE_URL } from "./plugins/card-visuals/agent-brand.js";
 import { DEFAULT_GIF_MANIFEST_URL } from "./plugins/card-visuals/card-gifs.js";
 import { retiredAgentConfigMessage } from "./core/retired-agents.js";
 import { parseWarmSetHosts } from "./core/warm-set/hosts.js";
 import {
-  deniedAgentLocationMessage,
-  isAgentLocationDenied,
-  LOCAL_LOCATION,
   parseAgentLocationDeny,
 } from "./core/location.js";
 
@@ -184,13 +180,8 @@ const Schema = z.object({
     }),
 
 
-  // Copilot is a seat licence enabled per host, not a default (#622).
   DEFAULT_AGENT: z.string().default("claude"),
   DEFAULT_MODEL: z.string().default("gpt-6.1-sol"),
-  /** Copilot is licensed per-seat and may be entitled to one project only.
-   * Set false to refuse it on EVERY host — including remote locations.
-   * The narrower "not on this host" case is `AGENT_LOCATION_DENY`. */
-  COPILOT_ENABLED: z.enum(["true", "false"]).default("true").transform((v) => v === "true"),
   /**
    * Host-scoped availability (#474). Comma-separated `agentId@location`
    * pairs withheld from pickers and spawn. The profile stays registered.
@@ -1461,30 +1452,11 @@ export function loadConfig({ env = process.env, warn = (message) => logger.warn(
   }
 
   let defaultAgentDisabledReason: string | undefined;
-  const parkedDefault = parkedAgentMessage(
-    cfg.DEFAULT_AGENT,
-    cfg.OLLAMA_CLOUD_ENABLED,
-    "config",
-    "DEFAULT_AGENT"
-  );
-  if (parkedDefault) {
-    defaultAgentDisabledReason = (
-      `Invalid configuration: ${parkedDefault}\n` +
-        `Supported live agents include copilot, claude, codex, grok, agy.`
-    );
-  }
   const retiredDefault = retiredAgentConfigMessage("DEFAULT_AGENT", cfg.DEFAULT_AGENT);
   if (retiredDefault) {
     defaultAgentDisabledReason = (
       `Invalid configuration: ${retiredDefault}\n` +
         `Supported agents include copilot, claude, codex, grok, agy.`
-    );
-  }
-  // Refuse new default-dependent sessions, not the bot or explicit presets.
-  if (isAgentLocationDenied(cfg.DEFAULT_AGENT, LOCAL_LOCATION, cfg.AGENT_LOCATION_DENY)) {
-    defaultAgentDisabledReason = (
-      `Invalid configuration: ${deniedAgentLocationMessage(cfg.DEFAULT_AGENT, LOCAL_LOCATION, "config")}\n` +
-        `Supported live agents include copilot, claude, codex, grok, agy.`
     );
   }
   if (defaultAgentDisabledReason) warn(`DEFAULT_AGENT disabled for new sessions: ${defaultAgentDisabledReason}`);

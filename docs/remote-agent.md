@@ -296,13 +296,13 @@ Add `NODE_EXTRA_CA_CERTS` to the PM2 env or launchd `EnvironmentVariables` to ma
 - Use `wss://` (TLS) in production. Cloudflare Tunnel always terminates TLS at the edge.
 - Tokens are stored in `.env` — keep that file out of version control (it is in `.gitignore`).
 - Authentication uses `Authorization: Bearer <token>` during the HTTP upgrade handshake. Connections with a missing or wrong token are rejected before any data is exchanged (close code `4001`).
-- In server mode, the WS port is bound to `0.0.0.0`. If you're using Cloudflare Tunnel you can tighten this to `127.0.0.1` by modifying the bind address in `makeRemoteCopilotServerProfile` in `src/agents/profiles/remote.ts`.
+- The current bridge is a host process connecting to the controller's command bus. See [bridge rollout](./bridge-rollout.md) and [deployment](./agent-guides/deploying.md); the old remote-profile server described earlier is retired.
 - In client mode, the token must not contain colons (it is the segment after the last `:` in the config value).
 
 ---
 
 ## Limitations
 
-- **No `/seam whoami` support.** Remote profiles always return unknown — the agent's local config files are not readable from the seam-acp host.
+- **Identity belongs to the execution host.** `/seam whoami` asks that host's bridge through the `whoami` RPC.
 - **Agent CLI must be pre-authenticated.** Run `copilot auth login` (or `claude /login`) on the remote machine before starting the bridge.
-- **One agent process per bridge.** A single bridge connection can serve multiple concurrent Discord threads (ACP supports multiple sessions per process). Run a separate bridge instance if you want separate agent processes.
+- **One adapter child per slot.** sessiond owns the children; a bridge carries multiple independent slots and reconnects without ending running turns.

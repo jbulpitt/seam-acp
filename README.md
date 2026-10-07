@@ -44,7 +44,7 @@ Copy `.env.example` to `.env` and fill it in.
 | `DEFAULT_AGENT` | no | `copilot` (default), `agy`, or `claude`. Plus any `copilot-<id>` / `agy-<id>` / `claude-<id>` registered via the `*_PROFILES` vars. |
 | `DEFAULT_MODEL` | no | Defaults to `gpt-6.1-sol` for **all** Copilot profiles (including extras from `COPILOT_PROFILES`). Select overrides from the host's live catalog. |
 | `AGENT_LOCATION_DENY` | no | Comma-separated `agentId@location` pairs withheld from pickers and spawn. The profile stays registered. Empty = nobody is withheld. Example: `copilot@local`. |
-| `COPILOT_ENABLED` | no | Global entitlement. `false` drops the copilot profile on every host, including remote locations. Prefer `AGENT_LOCATION_DENY` for host scope. Default `true`. |
+| `COPILOT_ENABLED` | no | Host entitlement. `false` removes Copilot only from the bridge reading this flag; the controller ignores it. Other bridges keep serving Copilot. Default `true`. |
 | `COPILOT_CLI_PATH` | no | If `copilot` is not on `PATH` |
 | `CODEX_ENABLED` / `CODEX_CLI_PATH` | no | Enable the optional Codex profile (default `false`); executable defaults to `codex-acp` on `PATH`. |
 | `CODEX_DEFAULT_MODEL` | no | Defaults to `gpt-6.1-sol`. Explicit overrides take precedence; use an id offered by the configured `codex-acp` catalog. |

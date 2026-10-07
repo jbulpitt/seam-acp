@@ -119,7 +119,7 @@ export class UnspecifiedAgentError extends Error {
 export function unknownAgentMessage(agentId: string, available: readonly string[]): string {
   const held = available.length ? available.join(", ") : "none";
   return (
-    `this bridge cannot serve agent "${agentId}" (holds: ${held}). ` +
+    `this bridge does not offer agent "${agentId}" (holds: ${held}). ` +
     `Refusing the slot rather than substituting another agent.`
   );
 }

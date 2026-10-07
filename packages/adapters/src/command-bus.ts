@@ -18,6 +18,8 @@ export const ADAPTER_RPC_METHODS = [
   "listWorkspaces",
   "listSessions",
   "getTranscript",
+  "getHistory",
+  "repairSession",
   "getUsage",
   "cloneSession",
   "deleteSession",
@@ -55,6 +57,7 @@ export interface HelloAgentInventory {
   ready: boolean;
   /** Optional non-secret resolved runtime/provenance inventory. */
   runtime?: import("./agent-profile.js").AdapterRuntimeDescriptor;
+  metadata?: import("./agent-profile.js").AgentClientMetadata;
 }
 
 export interface HelloHostInfo {

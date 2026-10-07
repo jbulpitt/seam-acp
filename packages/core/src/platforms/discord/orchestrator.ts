@@ -73,7 +73,7 @@ import { DEFAULT_ERROR_RULES } from "../../core/error-resolution-rules.js";
 import type { ISessionManager } from "@seam/adapters";
 import type { ModelCatalogService, CatalogBinding } from "../../core/model-catalog/service.js";
 import type { ModelIntelligenceRefreshResult } from "../../core/model-intelligence/manager.js";
-import { readRichHistory, renderHistory, type HistoryEvent, type RichHistory } from "../../core/compaction/source-reader.js";
+import { parseRichHistory, renderHistory, type HistoryEvent, type RichHistory } from "../../core/compaction/source-reader.js";
 import { MessageReader } from "../../core/message-reader.js";
 import {
   ReconstructionUnavailableError,
@@ -86,7 +86,7 @@ import {
   firstErrorLine,
   type RebuildSuccessStats,
 } from "../../core/rebuild-card.js";
-import { analyzeSessionCoverage, detectGaps, type TimeRange, type GapReport } from "../../core/compaction/gap-detector.js";
+import { parseSessionCoverage, detectGaps, type TimeRange, type GapReport } from "../../core/compaction/gap-detector.js";
 import { runPremiumCompaction, type PremiumCompactionResult, type RunAgent } from "../../core/compaction/pipeline.js";
 import {
   DISCORD_COMPACTION_EXECUTOR_LABEL,
@@ -330,9 +330,6 @@ import {
 import type { InboundAdmission } from "../../core/inbound-admission/types.js";
 import { CANCEL_SIGNAL_TIMEOUT_MS, DefaultAgentUnavailableError, SessionRouter, simpleCardGifForRender, statusCardStyleForRender } from "../../core/session-router.js";
 import {
-  parkedAgentMessage,
-} from "../../core/parked-agents.js";
-import {
   describeFastModeOutcome,
 } from "../../core/fast-mode.js";
 import { catalogEffortChoices } from "./catalog-view.js";
@@ -446,7 +443,7 @@ import {
   type VoiceConsolePanelSpec,
 } from "./voice-console-panel.js";
 import { DiscordAdapter } from "./adapter.js";
-import { isWithinRoot, resolveRepoPath } from "../../core/path-utils.js";
+import { isWithinRoot } from "../../core/path-utils.js";
 import {
   applyVoiceNoteTranscriptions,
   formatHeardMessage,
@@ -506,7 +503,6 @@ import {
   resolveModelVisionRouting,
 } from "../../agents/attachments.js";
 import { stageAttachment, sweepStagedAttachments } from "@seam/adapters";
-import type { AgyLaunchRuntime } from "@seam/adapters";
 import {
   authorizeStagedImage,
   stagedAttachmentOwnerKey,
@@ -528,7 +524,6 @@ import {
   assertSecretName,
   SECRET_TTL_MS,
   recordThreadSecretPath,
-  writeThreadSecret,
   listThreadSecrets,
   secretHarnessRules,
   sweepExpiredSecrets,
@@ -1030,7 +1025,6 @@ export class Orchestrator {
     staggerMs: TURN_RESUME_STAGGER_MS,
   });
   private readonly recoverySleep: (ms: number) => Promise<void>;
-  private readonly agyRuntime?: AgyLaunchRuntime;
   private readonly fences: FenceRegistry;
 
   constructor(opts: {
@@ -1043,7 +1037,6 @@ export class Orchestrator {
     fences?: FenceRegistry;
     plugins?: PluginHost;
     modelCatalog: ModelCatalogService;
-    agyRuntime?: AgyLaunchRuntime;
     refreshModelIntelligence?: (forceSources: boolean) => Promise<ModelIntelligenceRefreshResult>;
     restartProcess?: () => Promise<void>;
     /** Test seam for bounded boot-recovery backoff. */
@@ -1058,7 +1051,6 @@ export class Orchestrator {
     this.fences = opts.fences ?? new FenceRegistry(this.logger);
     this.recoverySleep = opts.recoverySleep ?? ((ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
     this.modelCatalog = opts.modelCatalog;
-    this.agyRuntime = opts.agyRuntime;
     this.refreshModelIntelligence = opts.refreshModelIntelligence;
     this.restartProcess = opts.restartProcess ?? restartSeamAcpProcess;
     this.plugins = opts.plugins ?? new PluginHost(this.logger, { storageRoot: this.config.DATA_DIR, storageAliases: { presets: { "presets.sqlite": this.store.dbPath } } });
@@ -1105,7 +1097,6 @@ export class Orchestrator {
       modelCatalog: this.modelCatalog,
       modelHideList: this.modelCatalog?.hideList,
       isAgentAvailable: (agentId, location) => Boolean(this.router.getProfile(agentId, location)),
-      ollamaCloudEnabled: this.config.OLLAMA_CLOUD_ENABLED,
       presetsFile: this.config.CHANNEL_PRESETS_FILE,
       tierCEnabled: this.config.SEAM_CONFIG_MUTATION_TIER_C_ENABLED,
       reloadPresets: () => {
@@ -1324,7 +1315,7 @@ export class Orchestrator {
       ? this.modelCatalog.knownBindings()
       : [];
     for (const { agentId, location } of knownBindings) {
-      if (location === LOCAL_LOCATION) continue;
+      if (this.bridgeHub?.get(location)) continue;
       const ids = out.get(location) ?? new Set<string>();
       ids.add(agentId);
       out.set(location, ids);
@@ -3614,8 +3605,8 @@ export class Orchestrator {
       // capability the provider answers — the runtime reads `loadSession` from
       // the ACP handshake and the reattach itself fails if the session is gone.
       // `agent !== "codex"` refused Claude, which advertises loadSession and
-      // resumes with `--resume=<uuid>`; `!isLocalLocation(...)` refused remote
-      // sessions without asking the remote; and `!acpSessionId` was unreachable
+      // resumes with `--resume=<uuid>` on its bound host. The old
+      // `!acpSessionId` check was unreachable
       // because startPrompt's UPDATE requires `acp_session_id IS NOT NULL` and
       // throws otherwise. The suspended attempt still carries promptStarted, so
       // the resume below reattaches instead of replaying.
@@ -4675,9 +4666,7 @@ export class Orchestrator {
           visionRouting.agentHasVision,
           visionRouting.viaTool,
           record.id,
-          described.location.value === LOCAL_LOCATION
-            ? undefined
-            : (filename, bytes) => this.writeAttachmentToHost(
+          (filename, bytes) => this.writeAttachmentToHost(
                 described.location.value,
                 effectiveCwd,
                 filename,
@@ -4934,26 +4923,17 @@ export class Orchestrator {
       //      the CLI handles client-side (no LLM call).
       if (result !== "timeout" && !result.cancelled) {
         const location = described.location.value;
-        const profile = this.router.getProfile(described.agent.value, location);
-        const usageReader = profile?.sessionManager?.getUsage;
-        // A bridged session's transcript lives on its own host, so ask it there.
-        const remoteUsage = !isLocalLocation(location) && this.bridgeHub;
+        // Every transcript belongs to its execution host.
+        const hub = this.bridgeHub;
         let sideChannelEmitted = false;
-        if (usageReader || remoteUsage) {
+        if (hub) {
           try {
             const cwd = effectiveCwd;
-            const usage = await wrapUpStep("usage", async () => remoteUsage
-              ? (await this.bridgeHub!.rpc(location, "getUsage", {
-                  cwd,
-                  sessionId: record.acpSessionId || undefined,
-                  newerThanMs: turnStartedAt || undefined,
-                }, described.agent.value, { timeoutMs: 15_000 })) as Awaited<ReturnType<NonNullable<typeof usageReader>>> | null
-              : await usageReader!.call(
-                  profile!.sessionManager,
-                  cwd,
-                  record.acpSessionId || undefined,
-                  turnStartedAt || undefined
-                ));
+            const usage = await wrapUpStep("usage", async () =>
+              await hub.rpc(location, "getUsage", {
+                cwd, sessionId: record.acpSessionId || undefined,
+                newerThanMs: turnStartedAt || undefined,
+              }, described.agent.value, { timeoutMs: 15_000 }) as import("@seam/adapters").ContextUsage | null);
             // Trust seam-acp's per-profile model→limit table over whatever the
             // bridge inferred from the JSONL — on proxied setups the JSONL
             // model id can be remapped/wrong.
@@ -5598,19 +5578,15 @@ export class Orchestrator {
     return typeof fn === "function" ? fn.call(this.router, agentId, fallback) : fallback;
   }
 
-  private parkedSelectRefusal(agentId: string): string | null {
-    const fn = this.router.parkedSelectMessage;
-    return typeof fn === "function" ? fn.call(this.router, agentId) : null;
-  }
-
   private sessionManagerFor(
     profile: AgentProfile,
     agentId: string,
     location: string
   ): ISessionManager | undefined {
-    return isLocalLocation(location)
-      ? profile.sessionManager
-      : remoteSessionManager(this.bridgeHub, location, agentId);
+    return remoteSessionManager(this.bridgeHub, location, agentId, {
+      history: !!profile.sessionManager?.getHistory || !!profile.sessionManager?.getHistoryPath,
+      repair: !!profile.sessionManager?.repairSession,
+    });
   }
 
   /** Generic compaction policy over the operational catalog: use the available
@@ -6388,19 +6364,19 @@ export class Orchestrator {
     const { profile, manager, sessionId, cwd, channel, onProgress } = args;
     const log = (m: string) => { onProgress?.(m); this.logger.debug({ compaction: sessionId }, m); };
 
-    if (!manager.getHistoryPath) {
+    if (!manager.getHistory) {
       throw new Error(`Premium compaction needs a raw-history reader; agent \`${profile.id}\` has none.`);
     }
-    const jsonlPath = await manager.getHistoryPath(cwd, sessionId);
-    if (!jsonlPath) throw new Error("Could not locate the session's raw history file.");
+    const history = await manager.getHistory(cwd, sessionId);
+    if (!history) throw new Error("Could not locate the session's raw history file.");
 
     log("reading session history…");
-    const richHistory = await readRichHistory(jsonlPath);
+    const richHistory = parseRichHistory(history);
 
     // Mandatory gap-detection. Pull the thread's messages (with timestamps) when
     // the adapter supports it, both to anchor threadFirstTs and to enrich any
     // flagged ranges where Discord out-fidelities the session store.
-    const coverage = await analyzeSessionCoverage(jsonlPath);
+    const coverage = parseSessionCoverage(history);
     let threadMsgs: Array<{ ts: number; authorIsBot: boolean; text: string }> = [];
     if (channel && typeof this.adapter.fetchThreadMessagesTimed === "function") {
       try { threadMsgs = await this.adapter.fetchThreadMessagesTimed(channel); }
@@ -7166,7 +7142,6 @@ export class Orchestrator {
   }): string {
     const explicit = opts.preset?.repoPath ?? opts.spec.cwd;
     if (explicit !== undefined && explicit !== null) return explicit;
-    if (isLocalLocation(opts.workerLocation)) return this.effectiveCwd(opts.record);
     const remoteDefault = this.bridgeHub?.defaultCwdForLocation?.(opts.workerLocation);
     if (remoteDefault) return remoteDefault;
     throw new Error(
@@ -7236,7 +7211,6 @@ export class Orchestrator {
       persistConfig: (record: SessionRecord, cfg: SessionConfigState) => this.persistConfig(record, cfg),
       repoDisplay: (repo: string | null) => this.repoDisplay(repo),
       unregisteredAgentMessage: (id: string, fallback: string) => this.refuseUnregisteredAgent(id, fallback),
-      parkedSelectMessage: (id: string) => this.parkedSelectRefusal(id),
       resolveRequestedRepoPath: (channel: ChannelRef, requested: string, location: string) => this.resolveRequestedRepoPath(channel, requested, location),
     }).plan; }
 
@@ -7248,7 +7222,6 @@ export class Orchestrator {
       persistConfig: (record: SessionRecord, cfg: SessionConfigState) => this.persistConfig(record, cfg),
       repoDisplay: (repo: string | null) => this.repoDisplay(repo),
       unregisteredAgentMessage: (id: string, fallback: string) => this.refuseUnregisteredAgent(id, fallback),
-      parkedSelectMessage: (id: string) => this.parkedSelectRefusal(id),
       resolveRequestedRepoPath: (channel: ChannelRef, requested: string, location: string) => this.resolveRequestedRepoPath(channel, requested, location),
     }).runtime; }
 
@@ -14242,10 +14215,11 @@ export class Orchestrator {
       return { ok: false, error: (err as Error).message };
     }
     const location = resolveThreadLocation(this.config, channel.id);
-    if (isLocalLocation(location) && !isWithinRoot(resolved, this.config.REPOS_ROOT)) {
+    const root = this.bridgeHub?.get(location)?.host.workspaceRoot;
+    if (root && !isWithinRoot(resolved, root)) {
       return {
         ok: false,
-        error: `Repo \`${resolved}\` is outside REPOS_ROOT (\`${this.config.REPOS_ROOT}\`).`,
+        error: `Repo \`${resolved}\` is outside host \`${location}\` workspace root (\`${root}\`).`,
       };
     }
 
@@ -17225,153 +17199,90 @@ export class Orchestrator {
     }
 
     const cwd = this.effectiveCwd(record);
-    let tempRuntime: AgentRuntime | undefined;
-    let transcriptFile: string | undefined;
-    try {
-      const rawMessages = await this.adapter.fetchThreadMessages(channelRef);
-      if (rawMessages.length === 0) {
-        throw new Error("No messages found in this Discord thread to reconstruct.");
-      }
-
-      const transcript = rawMessages
-        .map((m) => {
-          const role = m.authorIsBot ? "Agent" : "Human";
-          const label = !m.authorIsBot && m.authorName ? `${role} (${m.authorName})` : role;
-          return `${label}: ${m.text}`;
-        })
-        .join("\n");
-      let sanitizedTranscript = transcript
-        .split("\n")
-        .map((line) =>
-          line.length > 2000 ? line.substring(0, 2000) + " ... [Line truncated]" : line
-        )
-        .join("\n");
-
-      const compactionModel = this.compactionModelFor(compactAgentId, compactLocation);
-      if (!compactionModel) {
-        throw new Error(`Compact from Thread is not supported for agent profile \`${compactAgentId}\``);
-      }
-      const promptTemplate = await fsp.readFile(path.join(this.config.REPOS_ROOT, "compact.md"), "utf8");
-      const compactAddendum =
-        "\n\nIMPORTANT: This is a full thread reconstruction from Discord history. " +
-        "The transcript below contains the ENTIRE conversation. You MUST cover " +
-        "the full conversation from start to finish in your summary. Give " +
-        "special emphasis to the most RECENT work (the last ~30% of the " +
-        "transcript) — that is the current state the user needs to resume from. " +
-        "Do NOT spend excessive detail on early/introductory messages at the " +
-        "expense of recent ones. If the analysis section is getting very long, " +
-        "abbreviate the early parts and expand on the latest work.\n";
-      const fullTemplate = promptTemplate + compactAddendum;
-      const templateOverhead = fullTemplate.length + "\n\nConversation Transcript:\n".length;
-      sanitizedTranscript = fitTranscriptToWindow(
-        sanitizedTranscript,
-        templateOverhead,
-        this.compactionWindowFor(compactAgentId, compactLocation, compactionModel)
-      );
-      this.logger.info(
-        {
-          channelId: channelRef.id,
-          msgCount: rawMessages.length,
-          transcriptChars: sanitizedTranscript.length,
-          model: compactionModel,
-        },
-        "compact-thread: transcript assembled"
-      );
-
-      let summaryText = "";
-      if (!isLocalLocation(compactLocation)) {
-        // The transcript file below lives on the controller. A remote agent
-        // cannot read it, so the fitted text goes in the prompt and the
-        // launch planner starts the child on the bound host.
-        const runAgent = this.makeCompactionRunAgent(profile, manager, {
-          model: compactionModel,
-          cwd,
-          effort: "low",
-          location: compactLocation,
-          restrictionChannelId: record.parentRef ?? record.channelRef,
-        });
-        summaryText = (await runAgent(
-          `${fullTemplate}\n\nConversation Transcript:\n${sanitizedTranscript}`,
-          "compact-thread",
-        )).trim();
-      } else {
-        transcriptFile = path.join(
-          cwd,
-          `.compact-thread-transcript-${channelRef.id}-${Date.now()}.txt`
-        );
-        await fsp.writeFile(transcriptFile, sanitizedTranscript, "utf8");
-        const compactionPrompt =
-          `${fullTemplate}\n\n` +
-          `The conversation transcript has been saved to the file: ${transcriptFile}\n` +
-          `Read that file NOW and then produce your summary. ` +
-          `The file contains ${rawMessages.length} messages (${sanitizedTranscript.length} chars). ` +
-          `You MUST read the ENTIRE file before summarizing — do not stop partway through.`;
-
-        const launch = this.launchForLocation({
-          profile,
-          location: compactLocation,
-          cwd,
-          model: compactionModel,
-          effort: "low",
-          sessionId: record.id,
-        });
-        tempRuntime = new AgentRuntime({
-          profile,
-          logger: this.logger.child({ session: `temp-compact-thread-${channelRef.id}` }),
-          ...this.router.permissionOptions(record),
-          mcpServers: launch.mcpServers,
-          spawnFn: launch.spawnFn,
-        });
-        await tempRuntime.start();
-        await tempRuntime.newSession({
-          cwd,
-          model: compactionModel,
-          meta: { reasoningEffort: "low" },
-        });
-
-        tempRuntime.onEvent((event) => {
-          if (event.kind === "agent-text") summaryText += event.text;
-        });
-        await tempRuntime.prompt(compactionPrompt);
-      }
-      if (!summaryText.trim()) {
-        throw new Error("Agent completed but returned an empty summary.");
-      }
-
-      const rbCfg = this.store.readConfig(record);
-      const newSessionId = await this.seedNewSession({
-        profile,
-        restrictionChannelId: record.parentRef ?? record.channelRef,
-        cwd,
-        location: compactLocation,
-        sessionId: record.id,
-        ...(rbCfg.model ? { model: rbCfg.model } : {}),
-        ...(rbCfg.reasoningEffort ? { effort: rbCfg.reasoningEffort } : {}),
-        summary: summaryText,
-      });
-      await this.router.invalidate(record.id);
-      this.store.upsert({
-        ...record,
-        acpSessionId: newSessionId,
-        updatedUtc: new Date().toISOString(),
-      });
-      await this.identityEffects.flush(record.id);
-      return { newSessionId, summary: summaryText };
-    } finally {
-      if (transcriptFile) await fsp.unlink(transcriptFile).catch(() => {});
-      if (tempRuntime) {
-        const tempSessionId = tempRuntime.getSessionInfo()?.sessionId;
-        await tempRuntime.dispose().catch(() => {});
-        if (tempSessionId) {
-          await manager.deleteSession(cwd, tempSessionId).catch((err) => {
-            this.logger.warn(
-              { err, sessionId: tempSessionId },
-              "failed to clean up temporary summary session"
-            );
-          });
-        }
-      }
+    const rawMessages = await this.adapter.fetchThreadMessages(channelRef);
+    if (rawMessages.length === 0) {
+      throw new Error("No messages found in this Discord thread to reconstruct.");
     }
+
+    const transcript = rawMessages
+      .map((m) => {
+        const role = m.authorIsBot ? "Agent" : "Human";
+        const label = !m.authorIsBot && m.authorName ? `${role} (${m.authorName})` : role;
+        return `${label}: ${m.text}`;
+      })
+      .join("\n");
+    let sanitizedTranscript = transcript
+      .split("\n")
+      .map((line) =>
+        line.length > 2000 ? line.substring(0, 2000) + " ... [Line truncated]" : line
+      )
+      .join("\n");
+
+    const compactionModel = this.compactionModelFor(compactAgentId, compactLocation);
+    if (!compactionModel) {
+      throw new Error(`Compact from Thread is not supported for agent profile \`${compactAgentId}\``);
+    }
+    const promptTemplate = await fsp.readFile(path.join(this.config.REPOS_ROOT, "compact.md"), "utf8");
+    const compactAddendum =
+      "\n\nIMPORTANT: This is a full thread reconstruction from Discord history. " +
+      "The transcript below contains the ENTIRE conversation. You MUST cover " +
+      "the full conversation from start to finish in your summary. Give " +
+      "special emphasis to the most RECENT work (the last ~30% of the " +
+      "transcript) — that is the current state the user needs to resume from. " +
+      "Do NOT spend excessive detail on early/introductory messages at the " +
+      "expense of recent ones. If the analysis section is getting very long, " +
+      "abbreviate the early parts and expand on the latest work.\n";
+    const fullTemplate = promptTemplate + compactAddendum;
+    const templateOverhead = fullTemplate.length + "\n\nConversation Transcript:\n".length;
+    sanitizedTranscript = fitTranscriptToWindow(
+      sanitizedTranscript,
+      templateOverhead,
+      this.compactionWindowFor(compactAgentId, compactLocation, compactionModel)
+    );
+    this.logger.info(
+      {
+        channelId: channelRef.id,
+        msgCount: rawMessages.length,
+        transcriptChars: sanitizedTranscript.length,
+        model: compactionModel,
+      },
+      "compact-thread: transcript assembled"
+    );
+
+    const runAgent = this.makeCompactionRunAgent(profile, manager, {
+      model: compactionModel,
+      cwd,
+      effort: "low",
+      location: compactLocation,
+      restrictionChannelId: record.parentRef ?? record.channelRef,
+    });
+    const summaryText = (await runAgent(
+      `${fullTemplate}\n\nConversation Transcript:\n${sanitizedTranscript}`,
+      "compact-thread",
+    )).trim();
+    if (!summaryText.trim()) {
+      throw new Error("Agent completed but returned an empty summary.");
+    }
+
+    const rbCfg = this.store.readConfig(record);
+    const newSessionId = await this.seedNewSession({
+      profile,
+      restrictionChannelId: record.parentRef ?? record.channelRef,
+      cwd,
+      location: compactLocation,
+      sessionId: record.id,
+      ...(rbCfg.model ? { model: rbCfg.model } : {}),
+      ...(rbCfg.reasoningEffort ? { effort: rbCfg.reasoningEffort } : {}),
+      summary: summaryText,
+    });
+    await this.router.invalidate(record.id);
+    this.store.upsert({
+      ...record,
+      acpSessionId: newSessionId,
+      updatedUtc: new Date().toISOString(),
+    });
+    await this.identityEffects.flush(record.id);
+    return { newSessionId, summary: summaryText };
   }
 
   private async migrateThreadAgentModelAndRebuild(
@@ -18697,30 +18608,9 @@ export class Orchestrator {
       const valueBytes = Buffer.from(value, "utf8");
       const location = resolveThreadLocation(this.config, channel.id);
       let written: { absPath: string; name: string };
-      if (location === LOCAL_LOCATION) {
-        written = await writeThreadSecret(
-          this.config.DATA_DIR,
-          channel.id,
-          safeName,
-          valueBytes
-        );
-      } else {
-        if (!this.bridgeHub) throw new Error("bridge hub is not ready");
-        const remote = await this.bridgeHub.writeSecret(
-          location,
-          channel.id,
-          safeName,
-          valueBytes,
-          Date.now() + SECRET_TTL_MS
-        );
-        written = await recordThreadSecretPath(
-          this.config.DATA_DIR,
-          channel.id,
-          safeName,
-          remote.path,
-          valueBytes.byteLength
-        );
-      }
+      if (!this.bridgeHub) throw new Error("bridge hub is not ready");
+      const stored = await this.bridgeHub.writeSecret(location, channel.id, safeName, valueBytes, Date.now() + SECRET_TTL_MS);
+      written = await recordThreadSecretPath(this.config.DATA_DIR, channel.id, safeName, stored.path, valueBytes.byteLength);
       await replyToInteraction(sub, {
         content:
           `🔐 Secret \`${written.name}\` stored for this thread at \`${written.absPath}\`.\n` +
@@ -18754,13 +18644,7 @@ export class Orchestrator {
       });
       return;
     }
-    if (!profile.whoami) {
-      await replyToInteraction(i, {
-        content: `Agent \`${profile.id}\` (${profile.displayName}) does not expose account info.`,
-      });
-      return;
-    }
-    const id = await profile.whoami();
+    const id = await this.bridgeHub!.rpc(resolved.location.value, "whoami", {}, profile.id) as import("@seam/adapters").AgentIdentity | null;
     if (!id) {
       await replyToInteraction(i, {
         content:
@@ -20294,7 +20178,7 @@ export class Orchestrator {
 
   /**
    * Resolve user input to a repo path on the thread's bound host. Absolute
-   * paths pass through (caller still sandboxes with isWithinRoot on local);
+   * paths pass through (caller checks the advertised host workspace root);
    * relative names match the execution bridge's listed workspace by basename.
    */
   private async resolveRequestedRepoPath(
@@ -20322,10 +20206,11 @@ export class Orchestrator {
       return { ok: false, error: (err as Error).message };
     }
     const location = resolveThreadLocation(this.config, channel.id);
-    if (isLocalLocation(location) && !isWithinRoot(resolved, this.config.REPOS_ROOT)) {
+    const root = this.bridgeHub?.get(location)?.host.workspaceRoot;
+    if (root && !isWithinRoot(resolved, root)) {
       return {
         ok: false,
-        error: `Repo \`${resolved}\` is outside REPOS_ROOT (\`${this.config.REPOS_ROOT}\`).`,
+        error: `Repo \`${resolved}\` is outside host \`${location}\` workspace root (\`${root}\`).`,
       };
     }
     const record = this.router.ensureSessionRecord({
@@ -20408,11 +20293,9 @@ export class Orchestrator {
         if (value === INHERIT_VALUE) return null;
         try {
           const resolved = await this.resolveRequestedRepoPath(channel, value);
-          if (
-            isLocalLocation(location) &&
-            !isWithinRoot(resolved, this.config.REPOS_ROOT)
-          ) {
-            return `Path is outside REPOS_ROOT (\`${this.config.REPOS_ROOT}\`).`;
+          const root = this.bridgeHub?.get(location)?.host.workspaceRoot;
+          if (root && !isWithinRoot(resolved, root)) {
+            return `Path is outside host \`${location}\` workspace root (\`${root}\`).`;
           }
           return null;
         } catch (err) {

@@ -321,13 +321,14 @@ describe("remote spawn drives token + reachable MCP URL (#84)", () => {
   });
 });
 
-describe("planSeamMcpInjection token reuse + stable loopback URL", () => {
+describe("planSeamMcpInjection bridge token reuse", () => {
   it("reuseToken keeps the existing token instead of rotating", () => {
     const registry = new SeamTokenRegistry();
     const first = registry.mint("discord:thread-geo");
     const wiring = {
       registry,
       getPort: () => 18765,
+      isBridgeSession: () => true,
     };
     const a = planSeamMcpInjection({
       sessionId: "discord:thread-geo",
@@ -345,18 +346,4 @@ describe("planSeamMcpInjection token reuse + stable loopback URL", () => {
     expect(seamEntry(b.mcpServers).headers[0]!.value).toBe(first);
   });
 
-  it("prefers getLoopbackUrl over the ephemeral bind port", () => {
-    const registry = new SeamTokenRegistry();
-    const injection = planSeamMcpInjection({
-      sessionId: "discord:thread-geo",
-      globalMcpServers: [],
-      seamMcp: {
-        registry,
-        getPort: () => 18765,
-        getLoopbackUrl: () => "http://127.0.0.1:3000/mcp",
-      },
-      reuseToken: true,
-    });
-    expect(seamEntry(injection.mcpServers).url).toBe("http://127.0.0.1:3000/mcp");
-  });
 });

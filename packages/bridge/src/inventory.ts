@@ -381,7 +381,20 @@ export function inventoryFromAdapters(
       /* keep default */
     }
     const runtime = adapter.describe().runtime;
-    rows.push({ agentId: id, version, installed, ready: false, ...(runtime ? { runtime } : {}) });
+    const metadata = {
+      catalogScope: adapter.catalog.scope(),
+      sessionManagement: adapter.sessionManager ? {
+        history: !!adapter.sessionManager.getHistoryPath,
+        repair: !!adapter.sessionManager.repairSession,
+      } : null,
+      displayName: adapter.displayName, defaultModel: adapter.defaultModel,
+      brand: adapter.brand, requestedContextTier: adapter.requestedContextTier,
+      effort: adapter.effort, fastMode: adapter.fastMode,
+      restrictDiscordAccess: adapter.restrictDiscordAccess,
+      mcpServersAtSpawn: adapter.mcpServersAtSpawn, submissionSignals: adapter.submissionSignals,
+      claudeSessionOptions: adapter.claudeSessionOptions,
+    };
+    rows.push({ agentId: id, version, installed, ready: false, metadata, ...(runtime ? { runtime } : {}) });
   }
   return rows;
 }

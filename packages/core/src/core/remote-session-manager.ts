@@ -7,7 +7,8 @@ type SessionRpc = Pick<BridgeHub, "rpc">;
 export function remoteSessionManager(
   hub: SessionRpc | undefined,
   location: string,
-  agentId: string
+  agentId: string,
+  capabilities?: { history: boolean; repair: boolean },
 ): ISessionManager {
   const call = async <T>(method: string, params: unknown): Promise<T> => {
     try {
@@ -22,6 +23,11 @@ export function remoteSessionManager(
   };
 
   return {
+    ...(capabilities?.history ? {
+      getHistory: (cwd: string, sessionId: string) => call<string | undefined>("getHistory", { cwd, sessionId }),
+    } : {}),
+    ...(capabilities?.repair ? { repairSession: async (cwd: string, sessionId: string) => { await call("repairSession", { cwd, sessionId }); } } : {}),
+    getUsage: (cwd, sessionId, newerThanMs) => call("getUsage", { cwd, sessionId, newerThanMs }),
     listSessions: (cwd) => call<SessionSummary[]>("listSessions", { cwd }),
     getTranscript: (cwd, sessionId) =>
       call<string>("getTranscript", { cwd, sessionId }),

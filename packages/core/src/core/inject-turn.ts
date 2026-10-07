@@ -143,16 +143,12 @@ export interface InjectTurnOptions {
    */
   resumeSessionId?: string;
 
-  /**
-   * Isolated remote spawn (#84 remainder). When set, `injectTurn` uses this
-   * instead of `profile.spawn` so a worker-on-bridge does not always hit
-   * the local AgentRuntime path.
-   */
+  /** Explicit bridge-slot launch used by isolated turns. */
   spawnFn?: (
     model?: string,
     effort?: string
   ) => ReturnType<AgentProfile["spawn"]> | Promise<ReturnType<AgentProfile["spawn"]>>;
-  /** MCP servers injected into an isolated remote spawn (token + reachable URL). */
+  /** MCP servers injected into an isolated bridge spawn (token + reachable URL). */
   mcpServers?: McpServer[];
 
   /**

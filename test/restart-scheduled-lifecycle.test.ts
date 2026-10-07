@@ -13,6 +13,7 @@ import { scheduledOccurrenceKey } from "../packages/core/src/core/scheduled-prom
 import { ScheduledPromptManager } from "../packages/core/src/core/scheduled-prompts/manager.js";
 import type { DeliveryNonceLookup } from "../packages/core/src/platforms/chat-adapter.js";
 import { attachLocalBridge } from "./local-bridge-fixture.js";
+import { DispatchSuspendedError } from "../packages/core/src/core/dispatch/attempt-store.js";
 
 const transport = vi.hoisted(() => ({ prompt: vi.fn(), load: vi.fn(), fresh: vi.fn(), delete: vi.fn(), dispose: vi.fn() }));
 vi.mock("../packages/core/src/agents/agent-runtime.js", async importOriginal => {
@@ -82,6 +83,26 @@ function rewriteAsLegacy(store: SessionStore, id: string, legacy = "a".repeat(64
 }
 
 describe("#252 actual isolated scheduler + injectTurn, synthetic transport", () => {
+  it("retains the exact live schedule suspension from runtime binding", async () => {
+    const h = setup("live");
+    const orch = h.make();
+    const key = scheduledOccurrenceKey(h.row.id);
+    const reason = "scheduled runtime binding refused after successful acquisition";
+    vi.spyOn(h.store.turnAttempts, "bindRuntime").mockImplementationOnce(() => {
+      expect(h.router.getOrStartRuntime).toHaveBeenCalledOnce();
+      throw DispatchSuspendedError.defect(key.id, reason);
+    });
+    const notice = vi.spyOn(orch as any, "notifyParkedTurn").mockResolvedValue(undefined);
+
+    await orch.runScheduledPrompt(h.row.id, key);
+
+    expect(h.store.turnAttempts.get(key.id)).toMatchObject({ state: "suspended", stalledReason: reason });
+    expect(h.store.getScheduled(h.row.id)?.lastStatus).toBe(`retained: ${reason}`);
+    expect(notice.mock.calls.some(([attempt]) => (attempt as { stalledReason?: string }).stalledReason === reason)).toBe(true);
+    expect(transport.prompt).not.toHaveBeenCalled();
+    expect(h.store.scheduledOccurrences.get(key.id)?.settled).toBe(false);
+  });
+
   it("detaches a bridge-owned live schedule at restart cutoff without posting a parked notice", async () => {
     const h = setup("live"); const orch = h.make();
     const key = scheduledOccurrenceKey(h.row.id);

@@ -543,7 +543,8 @@ describe("#302 real ACP handshake and strict session/load recovery", () => {
 
   it("lands an initialize capability refusal suspended with its actionable reason", async () => {
     const h = harness("local", "no-load"); const id = seedPromptedAttempt(h);
-    await resume(h);
+    await expect(resume(h)).rejects.toMatchObject({ name: "DispatchSuspendedError",
+      reason: "Strict resume refused: provider does not advertise session/load" });
     expect(h.calls.loads).toEqual([]);
     expect(h.calls.news).toBe(0);
     expect(h.calls.prompts).toEqual([]);
@@ -571,7 +572,10 @@ describe("#302 real ACP handshake and strict session/load recovery", () => {
     "keeps a synthetic remote %s refusal recoverably suspended with zero prompts",
     async (mode) => {
       const h = harness("bridge-a", mode); const id = seedPromptedAttempt(h);
-      await resume(h);
+      await expect(resume(h)).rejects.toMatchObject({ name: "DispatchSuspendedError",
+        reason: expect.stringMatching(mode === "no-load"
+          ? /does not advertise session\/load/
+          : /boot recovery exhausted 3 pre-prompt acquisition attempts/) });
       expect(h.calls.news).toBe(0);
       expect(h.calls.prompts).toEqual([]);
       expect(h.store.turnAttempts.get(id)).toMatchObject({
@@ -594,7 +598,8 @@ describe("#302 real ACP handshake and strict session/load recovery", () => {
   it("bounds a silent session/load and records the named refusal as recoverably suspended", async () => {
     const h = harness("local", "hang-load"); const id = seedPromptedAttempt(h);
     const startedAt = performance.now();
-    await resume(h);
+    await expect(resume(h)).rejects.toMatchObject({ name: "DispatchSuspendedError",
+      reason: expect.stringContaining("boot recovery exhausted 3 pre-prompt acquisition attempts") });
     const elapsedMs = performance.now() - startedAt;
     expect(elapsedMs).toBeGreaterThanOrEqual(15);
     expect(elapsedMs).toBeLessThan(500);

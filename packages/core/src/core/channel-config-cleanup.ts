@@ -2,7 +2,7 @@ import type { Config } from "../config.js";
 import type { SessionStore } from "./session-store.js";
 import type { ConfigApplyPlan } from "./config-apply-plan.js";
 import type { ChannelPresetChanges, MutationActor } from "./config-mutation.js";
-import { CONFIG_DEFAULT_FIELDS, type OverrideCounts } from "./config-target.js";
+import { configOverrideFields, CONFIG_DEFAULT_FIELDS, type OverrideCounts } from "./config-target.js";
 import { randomUUID } from "node:crypto";
 
 export interface ConfigParentChannel { id: string; name: string; guildId: string; guildName: string }
@@ -27,7 +27,8 @@ export class ParentConfigCleanup {
     for (const parent of await this.deps.parents()) {
       const row = this.deps.store.getByChannel("discord", parent.id);
       const thread = presets.threads?.[parent.id] as Record<string, unknown> | undefined;
-      if (!row && !thread) continue;
+      const threadEntry = configOverrideFields(Object.keys(thread ?? {})).length > 0;
+      if (!row && !threadEntry) continue;
       const cfg = row ? this.deps.store.readConfig(row) : {};
       const legacy: Record<string, unknown> = { ...(row ? { agent: row.agentId } : {}),
         ...Object.fromEntries(Object.entries(cfg).map(([key, value]) => [key === "reasoningEffort" ? "effort" : key, value])),
@@ -42,7 +43,7 @@ export class ParentConfigCleanup {
         if (current?.[field] !== undefined) preserved.push(field);
         else Object.assign(changes, { [field]: value });
       }
-      entries.push({ ...parent, ...(row ? { sessionId: row.id } : {}), threadEntry: thread !== undefined,
+      entries.push({ ...parent, ...(row ? { sessionId: row.id } : {}), threadEntry,
         changes, preserved, overrides: plan.overrideCounts(parent.id), source: JSON.stringify({ row, thread }) });
     }
     return { entries };
@@ -58,7 +59,9 @@ export class ParentConfigCleanup {
         if (!written.ok && !written.error.includes("No effective change")) throw new Error(written.error);
       }
       if (entry.threadEntry) {
-        const removed = plan.restoreThreadPresetEntry(entry.id, undefined);
+        const remaining = { ...plan.readPresetsSnapshot().threads?.[entry.id] as Record<string, unknown> };
+        for (const field of configOverrideFields(Object.keys(remaining))) delete remaining[field];
+        const removed = plan.restoreThreadPresetEntry(entry.id, Object.keys(remaining).length ? remaining : undefined);
         if (!removed.ok) throw new Error(removed.error);
       }
       const audit = {

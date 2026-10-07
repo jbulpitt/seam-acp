@@ -5,7 +5,7 @@ import type { ComponentEvent, IncomingMessage, ChannelRef } from "../../platform
 import type { CatalogBinding } from "../../core/model-catalog/service.js";
 import { LOCAL_LOCATION, parseAgentAtLocation } from "../../core/location.js";
 import { configSetRequestError, CONFIG_SET_FIELD_NAMES, type ConfigSetFieldName, type ConfigSetRequest } from "../../core/config-apply-plan.js";
-import { configTarget, formatOverrideCounts, type ConfigDefaultField } from "../../core/config-target.js";
+import { configTarget, configOverrideFields, formatOverrideCounts, type ConfigDefaultField } from "../../core/config-target.js";
 import { FAST_MODE_CONFIG_ID, FAST_MODE_COST_WARNING, FAST_MODE_RESET_NOTICE, isFastModeDisabledByEnv, fastModeEnvRefusal, fastModeAgentRefusal } from "../../core/fast-mode.js";
 import { catalogEffortChoices } from "../../platforms/discord/catalog-view.js";
 import { INHERIT_VALUE, RIDER_MODAL_MAX, applyPickerValue, authorizeDraftClick, currentRiderText, decodeRiderUpload, editScopeOf, effectiveAgentAtLocation, isDirty, makeCustomId, parseCustomId, renderCancelledHub, renderExpiredHub, renderHub, renderSavedHub, riderDownloadFilename, riderTooLong, snapshotFromDescribe, type DraftAgentCapabilities, type ThreadConfigDraft } from "../../platforms/discord/config-editor.js";
@@ -78,7 +78,7 @@ export class ConfigUi {
     if (!prepared.ok) { await i.reply(prepared.message); return; }
     const applied = await this.ports.applyChannelSet(channel, prepared.prepared, { id: i.user.id, name: i.user.displayName ?? i.user.username });
     if (!applied.ok) { await i.reply(applied.message); return; }
-    const fields = Object.keys(prepared.prepared.changes) as ConfigDefaultField[];
+    const fields = configOverrideFields(Object.keys(prepared.prepared.changes));
     const heading = request.supplied.length === 1 && request.supplied[0] === "repo"
       ? prepared.prepared.changes.cwd === null ? "Channel repo overlay cleared" : `Channel repo set to \`${this.ports.repoDisplay(applied.effective.cwd.value)}\``
       : request.supplied.length === 1 && request.supplied[0] === "role"
@@ -128,7 +128,7 @@ export class ConfigUi {
         if (!prepared.ok) return { ok: false, error: prepared.message };
         const applied = await this.ports.applyChannelSet(channel, prepared.prepared, { id: i.user.id, name: i.user.username });
         if (!applied.ok) return { ok: false, error: applied.message };
-        changedFields = Object.keys(prepared.prepared.changes) as ConfigDefaultField[];
+        changedFields = configOverrideFields(Object.keys(prepared.prepared.changes));
         await i.reply(`Channel default updated. Effective: ${configSetSummary(applied.effective, this.ports.repoDisplay)}. Thread overrides: ${formatOverrideCounts(this.ports.overrideCounts(target.id))}.`);
         return { ok: true };
       },
@@ -555,7 +555,7 @@ export class ConfigUi {
         saveEditor: this.ports.saveEditor, deleteDraft: id => this.configEditor.delete(id),
         editCard: (channel, message, panel) => this.editConfigEditorCard(channel, message, panel),
         channelSaved: async saved => {
-          const fields = Object.keys(buildSavePlan(saved).channelPreset ?? {}) as ConfigDefaultField[];
+          const fields = configOverrideFields(Object.keys(buildSavePlan(saved).channelPreset ?? {}));
           if (!fields.length || !saved.parentRef) return;
           await evt.followUpEphemeral(`Channel default saved. Thread overrides: ${formatOverrideCounts(this.ports.overrideCounts(saved.parentRef, fields))}.`);
           await this.offerFollowChannel(evt.channel, { id: evt.userId, username: evt.userName }, fields);

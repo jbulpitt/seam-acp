@@ -19,6 +19,7 @@ import os from "node:os";
 import path from "node:path";
 import { pino } from "pino";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
+import { withHarnessPreamble } from "../packages/core/src/core/agent-conventions.js";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
 import { ChoiceResultHub } from "../packages/core/src/core/choice/result.js";
 import { ChoiceIngest } from "../packages/core/src/core/choice/ingest.js";
@@ -201,8 +202,8 @@ function makeOrch(
     SEAM_DISPATCH_OUTPUT_STYLE: "messages",
     SEAM_DISPATCH_STATUS_PANEL: false,
     REPO_EMOJIS: new Map<string, string>(),
-    channelPresets: {},
-    threadPresets: {},
+    channelPresets: new Map(),
+    threadPresets: new Map(),
   };
   const orch = new Orchestrator({
     logger: silent,
@@ -644,6 +645,9 @@ describe("#246 isolated ingest owns every terminal transition", () => {
     const restarted = makeOrch(dataDir, store, {
       profile: { id: "codex", defaultModel: "default" },
     }).orch;
+    const riders = ["INGEST_CHANNEL_RIDER", "INGEST_THREAD_RIDER"];
+    (restarted as any).config.channelPresets.set(row.authoringParentRef, { rider: { value: riders[0] } });
+    (restarted as any).config.threadPresets.set(row.authoringChannelRef, { rider: { value: riders[1] } });
     restarted.setChoiceResults(results);
     const seen: Array<{ prompt: string; resumeSessionId?: string }> = [];
     (restarted as any).injectTurn = async (
@@ -661,7 +665,8 @@ describe("#246 isolated ingest owns every terminal transition", () => {
       };
     };
     await restarted.dispatchInjectTurn({ ...spec, resume: true });
-    expect(seen).toEqual([{ prompt: spec.prompt, resumeSessionId: undefined }]);
+    expect(seen).toEqual([{ prompt: withHarnessPreamble(spec.prompt, riders), resumeSessionId: undefined }]);
+    expect(seen[0]!.prompt.indexOf(riders[0]!)).toBeLessThan(seen[0]!.prompt.indexOf(riders[1]!));
     expect(store.turnAttempts.get(spec.id)).toMatchObject({
       state: "completed",
       generation: 2,

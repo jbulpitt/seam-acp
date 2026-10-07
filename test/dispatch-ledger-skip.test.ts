@@ -134,8 +134,8 @@ function makeOrch(dataDir: string, store: SessionStore, logger: Logger, fallback
     SEAM_DISPATCH_OUTPUT_STYLE: "messages",
     SEAM_DISPATCH_STATUS_PANEL: false,
     REPO_EMOJIS: new Map<string, string>(),
-    channelPresets: {},
-    threadPresets: {},
+    channelPresets: new Map(),
+    threadPresets: new Map(),
   };
   return new Orchestrator({
     logger,

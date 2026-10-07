@@ -148,8 +148,8 @@ function makeOrch(opts: {
       SEAM_CONFIG_MUTATION_TIER_C_ENABLED: false,
       SEAM_DISPATCH_OUTPUT_STYLE: "messages",
       SEAM_DISPATCH_STATUS_PANEL: false,
-      channelPresets: {},
-      threadPresets: {},
+      channelPresets: new Map(),
+      threadPresets: new Map(),
     } as any,
     adapter: opts.adapter as any,
     modelCatalog: fixtureModelCatalog([catalogProfile]),
@@ -365,7 +365,7 @@ describe("stateless/preset handoff embed card", () => {
   it("resolves a preset worker on the target host and plans a remote spawn", async () => {
     const { adapter } = spyAdapter();
     const orch = makeOrch({ dataDir, adapter });
-    (orch as any).config.threadPresets["thread-caller"] = { location: "studio" };
+    (orch as any).config.threadPresets.set("thread-caller", { location: "studio" });
     const lookups: Array<{ id: string; location?: string }> = [];
     (orch as any).router.getProfile = (id: string, location?: string) => {
       lookups.push({ id, location });

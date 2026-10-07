@@ -108,8 +108,8 @@ function makeOrch(over?: {
     DEFAULT_MODEL: "default",
     CHANNEL_PRESETS_FILE: undefined,
     SEAM_CONFIG_MUTATION_TIER_C_ENABLED: false,
-    channelPresets: {},
-    threadPresets: {},
+    channelPresets: new Map(),
+    threadPresets: new Map(),
   };
   const orch = new Orchestrator({
     logger: silent,
@@ -457,8 +457,8 @@ describe("Orchestrator.dispatchInjectTurn — compact branch", () => {
       // Isolate the compact branch's plain/card rendering — the additive status
       // panel is covered separately in dispatch-status-panel.test.ts.
       SEAM_DISPATCH_STATUS_PANEL: false,
-      channelPresets: {},
-      threadPresets: {},
+      channelPresets: new Map(),
+      threadPresets: new Map(),
     };
     const orch = new Orchestrator({
       logger: silent,

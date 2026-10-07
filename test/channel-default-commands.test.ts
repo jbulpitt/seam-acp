@@ -327,6 +327,77 @@ describe("configuration scope through the real dispatcher", () => {
     expect(h.store.get(row.id)).toEqual(before);
   });
 
+  it("saving only a channel rider never counts or offers to clear seven thread riders", async () => {
+    const h = await fixture();
+    for (let index = 0; index < 7; index++) {
+      const threadId = String(BigInt(THREAD) + BigInt(index));
+      h.router.ensureSessionRecord({ platform: "discord", channelRef: threadId, parentRef: PARENT, cwd: h.dir });
+      expect(h.plan.applyThreadOverlay({ threadId, parentRef: PARENT,
+        changes: { rider: `Thread rule ${index}` }, actor }).ok).toBe(true);
+    }
+    const before = JSON.parse(fs.readFileSync(h.file, "utf8")).threads;
+    const channel = { platform: "discord", id: THREAD, parentId: PARENT };
+    const draft = await h.ui.openConfigEditorCard(channel, actor.id, "channel") as ThreadConfigDraft;
+    h.ui.configEditor.put(applyPickerValue(draft, "rider", "Channel rule", () => undefined));
+    const followUpEphemeral = vi.fn(async (_text: string) => {});
+    await h.ui.handleConfigEditorComponent({ kind: "button", customId: `seam-cfg-edit:${draft.id}:save`,
+      channel, messageId: draft.messageId, userId: actor.id, userName: actor.name, followUpEphemeral });
+    expect(h.config.channelPresets.get(PARENT)?.rider?.value).toBe("Channel rule");
+    expect(JSON.parse(fs.readFileSync(h.file, "utf8")).threads).toEqual(before);
+    expect(h.plan.overrideCounts(PARENT)).not.toHaveProperty("rider");
+    expect(JSON.stringify(followUpEphemeral.mock.calls)).not.toContain("rider:");
+    expect(h.adapter.sendChoicePicker).not.toHaveBeenCalled();
+  });
+
+  it("a channel save with model and rider offers to clear only model overrides", async () => {
+    const h = await fixture(); h.row();
+    expect(h.plan.applyThreadOverlay({ threadId: THREAD, parentRef: PARENT,
+      changes: { rider: "Private thread rule", model: "claude-pin" }, actor }).ok).toBe(true);
+    const rider = h.config.threadPresets.get(THREAD)?.rider;
+    const channel = { platform: "discord", id: THREAD, parentId: PARENT };
+    const draft = await h.ui.openConfigEditorCard(channel, actor.id, "channel") as ThreadConfigDraft;
+    let next = applyPickerValue(draft, "model", "claude-default", () => undefined);
+    next = applyPickerValue(next, "rider", "Channel rule", () => undefined);
+    h.ui.configEditor.put(next);
+    await h.ui.handleConfigEditorComponent({ kind: "button", customId: `seam-cfg-edit:${draft.id}:save`,
+      channel, messageId: draft.messageId, userId: actor.id, userName: actor.name,
+      followUpEphemeral: vi.fn(async () => {}) });
+    expect(h.adapter.sendChoicePicker).toHaveBeenCalledOnce();
+    const choice = h.adapter.sendChoicePicker.mock.calls[0]![1];
+    expect(choice.panel.description).toContain("model: 1");
+    expect(choice.panel.description).not.toContain("rider:");
+    await choice.commit({ value: "apply" });
+    expect(h.config.threadPresets.get(THREAD)?.model).toBeUndefined();
+    expect(h.config.threadPresets.get(THREAD)?.rider).toEqual(rider);
+  });
+
+  it("channel-default counts exclude riders even from explicit field lists", async () => {
+    const h = await fixture(); h.row();
+    expect(h.plan.applyThreadOverlay({ threadId: THREAD, parentRef: PARENT,
+      changes: { rider: "Private thread rule", model: "claude-pin" }, actor }).ok).toBe(true);
+    expect(h.plan.overrideCounts(PARENT, ["rider"] as never)).toEqual({});
+  });
+
+  it("channel-default apply retains riders even from explicit field lists", async () => {
+    const h = await fixture(); h.row();
+    expect(h.plan.applyThreadOverlay({ threadId: THREAD, parentRef: PARENT,
+      changes: { rider: "Private thread rule", model: "claude-pin" }, actor }).ok).toBe(true);
+    const rider = h.config.threadPresets.get(THREAD)?.rider;
+    await h.plan.followChannel(PARENT, ["model", "rider"] as never, actor);
+    expect(h.config.threadPresets.get(THREAD)?.model).toBeUndefined();
+    expect(h.config.threadPresets.get(THREAD)?.rider).toEqual(rider);
+  });
+
+  it("the thread editor displays both riders without classifying either as an override", async () => {
+    const h = await fixture(); h.row();
+    expect(h.plan.applyChannelOverlay({ channelId: PARENT, changes: { rider: "Channel rule" }, actor }).ok).toBe(true);
+    expect(h.plan.applyThreadOverlay({ threadId: THREAD, parentRef: PARENT,
+      changes: { rider: "Private thread rule" }, actor }).ok).toBe(true);
+    const snapshot = h.plan.snapshot({ platform: "discord", id: THREAD, parentId: PARENT });
+    expect(snapshot.desc.rider).toEqual({ channel: "Channel rule", thread: "Private thread rule" });
+    expect(snapshot.threadOverrides).not.toContain("rider");
+  });
+
   it.each([["card", "style", "full", "statusCardStyle", "full"], ["gif", "state", "off", "simpleCardGif", false]] as const)
     ("parent %s with legacy session scope still writes only channel defaults", async (sub, option, value, field, expected) => {
       const h = await fixture();
@@ -458,6 +529,37 @@ describe("explicit parent configuration cleanup", () => {
     expect(h.config.threadPresets.has(PARENT)).toBe(false);
     const audit = h.store.listConfigMutations().find(entry => entry.summary === "Confirmed cleanup of misfiled parent-channel configuration");
     expect(audit?.beforeJson).toBe(preview.entries[0].source);
+    expect(await h.cleanup.preview()).toEqual({ entries: [] });
+  });
+
+  it("the admin cleanup does not classify a rider-only entry as misfiled", async () => {
+    const h = await fixture();
+    expect(h.plan.applyThreadOverlay({ threadId: PARENT,
+      changes: { rider: "Retain this thread rider" }, actor }).ok).toBe(true);
+    const before = fs.readFileSync(h.file, "utf8");
+    const reply = vi.fn(async (_text: string) => {});
+    await h.ui.cmdConfigCleanup({ threadId: PARENT, actor, reply });
+    expect(reply).toHaveBeenCalledWith(expect.stringContaining("0 parent thread entries"));
+    expect(h.adapter.sendChoicePicker).not.toHaveBeenCalled();
+    expect(await h.cleanup.preview()).toEqual({ entries: [] });
+    expect(fs.readFileSync(h.file, "utf8")).toBe(before);
+  });
+
+  it("confirmed admin cleanup retains riders beside fields it actually migrates", async () => {
+    const h = await misfiled();
+    expect(h.plan.applyThreadOverlay({ threadId: PARENT, parentRef: CATEGORY,
+      changes: { rider: "Retain parent-key rider" }, actor }).ok).toBe(true);
+    expect(h.plan.applyThreadOverlay({ threadId: THREAD, parentRef: PARENT,
+      changes: { rider: "Retain child rider" }, actor }).ok).toBe(true);
+    const parentRider = h.config.threadPresets.get(PARENT)?.rider;
+    const childRider = h.config.threadPresets.get(THREAD)?.rider;
+    const preview = await h.cleanup.preview();
+    expect(await h.cleanup.apply(preview, actor)).toBe(1);
+    expect(JSON.parse(fs.readFileSync(h.file, "utf8")).threads[PARENT]).toEqual({ rider: parentRider });
+    expect(h.config.threadPresets.get(THREAD)?.rider).toEqual(childRider);
+    expect(h.config.channelPresets.get(PARENT)?.rider).toBeUndefined();
+    expect(preview.entries[0]?.overrides).not.toHaveProperty("rider");
+    expect(preview.entries[0]?.changes).not.toHaveProperty("rider");
     expect(await h.cleanup.preview()).toEqual({ entries: [] });
   });
 

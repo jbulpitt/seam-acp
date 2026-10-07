@@ -56,7 +56,7 @@ function setup() {
     SEAM_TURN_RESUME_ENABLED: true,
     DEFAULT_MODEL: "default", SEAM_DISPATCH_STATUS_PANEL: false,
     SEAM_DISPATCH_OUTPUT_STYLE: "messages", REPO_EMOJIS: new Map(),
-    channelPresets: {}, threadPresets: {} };
+    channelPresets: new Map(), threadPresets: new Map() };
   const acquisitionSleep = vi.fn(async (_ms: number) => {});
   const makeOrch = () => attachLocalBridge(new Orchestrator({ logger: pino({ level: "silent" }) as any,
     recoverySleep: acquisitionSleep,

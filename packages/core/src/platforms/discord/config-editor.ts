@@ -4,6 +4,7 @@
  */
 import type { PermissionPolicyMode, StatusCardStyle, StructuredPanel } from "../../core/types.js";
 import type { ChannelPresetChanges, ThreadPresetChanges } from "../../core/config-mutation.js";
+import type { ConfigDefaultField } from "../../core/config-target.js";
 import type {
   ConfigDescription,
   ConfigLayer,
@@ -97,7 +98,7 @@ export interface ThreadConfigSnapshot {
   /** Raw channel-preset pins (unset = that field is not on the channel entry). */
   channelPins: ChannelPresetPins;
   /** Actual pins/mirrors, including those hidden by the effective source. */
-  threadOverrides?: readonly (keyof ChannelPresetPins | "rider")[];
+  threadOverrides?: readonly ConfigDefaultField[];
   /** Values that apply if the thread overlay is removed (inherit). */
   withoutThread: InheritedConfig;
   effortIgnoredNote?: string;

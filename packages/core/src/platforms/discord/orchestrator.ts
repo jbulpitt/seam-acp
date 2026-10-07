@@ -3573,12 +3573,7 @@ export class Orchestrator {
     // / handoffs / steer synthesize an IncomingMessage and enter HERE, so they
     // still run in a detached thread. Do not treat detach as a full mute.
     const channel = msg.channel;
-    const record = this.router.ensureSessionRecord({
-      platform: channel.platform,
-      channelRef: channel.id,
-      ...(channel.parentId ? { parentRef: channel.parentId } : {}),
-      cwd: this.config.REPOS_ROOT,
-    });
+    const record = await this.bindThreadRecord(channel);
     const admission = msg.messageId ? this.store.getInbound?.(msg.messageId) : null;
     let humanAttempt: TurnAttempt | undefined = scheduledAttempt;
     let humanOutcomeOwned = false;
@@ -4553,7 +4548,7 @@ export class Orchestrator {
       // never replacing the base conventions above).
       const { riders } = resolveChannelPreset(
         this.config,
-        record.parentRef ?? undefined,
+        record.parentRef ?? record.channelRef,
         record.channelRef
       );
       // Speaker identity (#57): stamp the human's name/id into the preamble when
@@ -6755,7 +6750,15 @@ export class Orchestrator {
           ? ""
           : (args.leadIn ??
             "[Loading prior-session context after compaction — read the summary below, reply with a one-line acknowledgement, then await the next instruction. Do not begin work yet.]");
-      const prompt = leadIn ? `${leadIn}\n\n${summary}` : summary;
+      const record = args.sessionId ? this.store.get(args.sessionId) : null;
+      const bound = record && !record.parentRef
+        ? await this.bindThreadRecord({ platform: record.platform, id: record.channelRef })
+        : record;
+      const { riders } = resolveChannelPreset(this.config,
+        bound?.parentRef ?? restrictionChannelId, bound?.channelRef);
+      // Rebuild already includes the same resolved riders in its budgeted seed.
+      const body = leadIn ? `${leadIn}\n\n${summary}` : summary;
+      const prompt = args.leadIn === null ? body : withHarnessPreamble(body, riders);
       await rt.prompt(prompt);
       // Brief pause so Claude Code finishes flushing the new session's JSONL
       // before we tear down (the turn is the only content; it must land on disk).
@@ -9802,7 +9805,10 @@ export class Orchestrator {
     // that path refuses.
     const effectivePrompt = isResume
       ? (await this.processRestartRender(previousAttempt!)).prompt
-      : withHarnessPreamble(tasked, choiceRefusal ? [choiceRefusal] : choiceAuthoringRules({ fence: true, mcp: seamMcp }), undefined, {
+      : withHarnessPreamble(tasked, [
+          ...resolveChannelPreset(this.config, record.parentRef ?? record.channelRef, record.channelRef).riders,
+          ...(choiceRefusal ? [choiceRefusal] : choiceAuthoringRules({ fence: true, mcp: seamMcp })),
+        ], undefined, {
           seamMcp,
           hostTools: areHostToolsEnabled(this.config, record.parentRef ?? undefined),
           seamFences: true,
@@ -10838,7 +10844,6 @@ export class Orchestrator {
       const cwd = preset?.repoPath ?? spec.cwd ?? this.config.REPOS_ROOT;
       const model = preset?.model ?? spec.model;
       const effort = preset?.effort ?? spec.effort;
-      const prompt = applyPresetIdentity(spec.prompt, preset);
       const synthetic: SessionRecord = {
         id: spec.id,
         platform: PLATFORM,
@@ -10855,6 +10860,14 @@ export class Orchestrator {
         updatedUtc: spec.createdUtc,
       };
       this.ingestJobs.set(spec.id, synthetic);
+
+      const authoring = endpoint ? await this.bindThreadRecord({
+        platform: endpoint.platform, id: endpoint.authoringChannelRef,
+        ...(endpoint.authoringParentRef ? { parentId: endpoint.authoringParentRef } : {}),
+      }) : synthetic;
+      const { riders } = resolveChannelPreset(this.config,
+        authoring.parentRef ?? authoring.channelRef, authoring.channelRef);
+      const prompt = withHarnessPreamble(applyPresetIdentity(spec.prompt, preset), riders);
 
       const isolatedSpawn = this.remoteDispatchSpawnOpts({
         spec,
@@ -12969,7 +12982,10 @@ export class Orchestrator {
       stopped?: RecoveryAttemptSource;
     };
   }): Promise<{ text: string; error?: string }> {
-    const { profile, record, cwd, model, effort, channel, promptText } = args;
+    const { profile, cwd, model, effort, channel, promptText } = args;
+    const record = args.record.parentRef ? args.record : await this.bindThreadRecord({
+      platform: args.record.platform, id: args.record.channelRef,
+    });
     const owned = args.owned;
     const attempt = owned?.attempt;
     const resume = attempt?.promptStarted === true;
@@ -13085,7 +13101,9 @@ export class Orchestrator {
     }
     const result = await this.injectTurn(
       record,
-      resume ? (await this.processRestartRender(owned?.stopped ?? owned?.attempt ?? attempt!)).prompt : promptText,
+      resume ? (await this.processRestartRender(owned?.stopped ?? owned?.attempt ?? attempt!)).prompt
+        : withHarnessPreamble(promptText,
+            resolveChannelPreset(this.config, record.parentRef ?? record.channelRef, record.channelRef).riders),
       options,
     );
     return { text: result.text, ...(result.error ? { error: result.error } : {}) };
@@ -17444,7 +17462,8 @@ export class Orchestrator {
     seed: ReturnType<typeof assembleReconstruction>;
     destination: { agentId: string; model: string; contextWindow: number };
   }> {
-    const { record, channel, observedAtStart, attachIntent, onProgress } = args;
+    const { channel, observedAtStart, attachIntent, onProgress } = args;
+    const record = args.record.parentRef ? args.record : await this.bindThreadRecord(channel);
     const log = (m: string) => {
       onProgress?.(m);
       this.logger.info({ rebuild: channel.id }, m);
@@ -17538,20 +17557,13 @@ export class Orchestrator {
         throw new ReconstructionUnavailableError("No reconstructable Discord messages remain after filtering.");
       }
 
-      const channelRider = channel.parentId
-        ? this.config.channelPresets.get(channel.parentId)?.rider?.value
-        : undefined;
-      const threadRider = this.config.threadPresets.get(channel.id)?.rider?.value;
-      const riders = {
-        ...(channelRider ? { channel: channelRider } : {}),
-        ...(threadRider ? { thread: threadRider } : {}),
-      };
+      const preset = resolveChannelPreset(this.config, record.parentRef ?? record.channelRef, record.channelRef);
       const seed = assembleReconstruction({
         messages: logical,
         contextWindow,
         budgetTokens,
         sourcePostCount: logical.reduce((n, message) => n + message.sourcePostIds.length, 0),
-        ...(channelRider || threadRider ? { riders } : {}),
+        ...(preset.riders.length ? { riders: preset.ridersByScope } : {}),
         onNormalizeError: ({ messageId }) => {
           this.logger.warn(
             { rebuild: channel.id, messageId },

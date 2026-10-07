@@ -9,7 +9,7 @@ import type { ModelCatalogService } from "./model-catalog/service.js";
 import type { ThreadSessionControlDeps } from "./runtime-transition.js";
 import { RuntimeTransition } from "./runtime-transition.js";
 import { type ConfigMutationService, type ConfigMutationInput, type ConfigProposal, type MutationActor, type ConfigMutationTier, type ProposedField, type ChannelPresetChanges, type ThreadPresetChanges } from "./config-mutation.js";
-import { configTarget, CONFIG_DEFAULT_FIELDS, type ConfigDefaultField, type OverrideCounts } from "./config-target.js";
+import { configTarget, configOverrideFields, CONFIG_DEFAULT_FIELDS, type ConfigDefaultField, type OverrideCounts } from "./config-target.js";
 import { parseStatusCardStyle, parseSimpleCardGif, type SessionRecord, type SessionConfigState, type PermissionPolicyMode, type StatusCardStyle, type Preset } from "./types.js";
 import { parseAgentAtLocation } from "./location.js";
 import { isWithinRoot } from "./path-utils.js";
@@ -200,7 +200,7 @@ export class ConfigApplyPlan {
     const records = this.settings!.store.listSessionsByParentInCreationOrder("discord", channelId);
     const overrides = records.map(record => this.threadOverrideFields(record));
     const counts: OverrideCounts = {};
-    for (const field of fields) {
+    for (const field of configOverrideFields(fields)) {
       counts[field] = overrides.filter(entry => entry.includes(field)).length;
     }
     return counts;
@@ -236,7 +236,7 @@ export class ConfigApplyPlan {
   async followChannel(channelId: string, fields: readonly ConfigDefaultField[], actor: MutationActor) {
     const records = this.settings!.store.listSessionsByParentInCreationOrder("discord", channelId);
     const ids = new Set(records.map(row => row.channelRef));
-    const changes = Object.fromEntries(fields.map(field => [field, null])) as ChannelPresetChanges;
+    const changes = Object.fromEntries(configOverrideFields(fields).map(field => [field, null])) as ChannelPresetChanges;
     for (const id of ids) {
       const row = records.find(record => record.channelRef === id);
       const before = row ? this.router.describeConfig(row) : undefined;
@@ -251,7 +251,7 @@ export class ConfigApplyPlan {
   async clearThreadOverrides(channel: ChannelRef, fields: readonly ConfigDefaultField[], actor: MutationActor) {
     const record = this.router.ensureSessionRecord({ platform: channel.platform, channelRef: channel.id, parentRef: channel.parentId, cwd: this.config.REPOS_ROOT });
     const before = this.router.describeConfig(record);
-    const changes = Object.fromEntries(fields.map(field => [field, null])) as ChannelPresetChanges;
+    const changes = Object.fromEntries(configOverrideFields(fields).map(field => [field, null])) as ChannelPresetChanges;
     const result = this.applyThreadOverlay({ threadId: channel.id, parentRef: channel.parentId, changes, actor });
     if (!result.ok && !result.error.includes("No effective change")) throw new Error(result.error);
     const current = this.clearLegacyOverrides(record, changes);

@@ -1319,7 +1319,7 @@ const TOOLS = [
       "- session: your thread's own runtime config (agent, model, effort, role, cwd, permission, statusCardStyle, simpleCardGif, disableThreadPrefix).\n" +
       "- preset: create/update a reusable specialist preset in this thread's project (including an optional role copied on apply).\n" +
       "- threadPreset: THIS thread's own preset in channel-presets.json (agent/model/role/cwd/effort/rider/statusCardStyle/simpleCardGif/disableThreadPrefix/detached/location/tts). " +
-      "Applies to this thread ONLY and overrides the channel preset — the right scope for a per-thread rider. " +
+      "Applies to this thread ONLY. Other fields override the channel preset; riders are additive: channel first, then thread. " +
       "`detached:true` stops treating this thread as a session (no bot replies; does not delete history). " +
       "`tts:true` speaks each completed turn as an ogg attachment (default off).\n" +
       "- channelPreset: this channel's shared preset in channel-presets.json (agent/model/role/cwd/effort/rider/statusCardStyle/simpleCardGif/disableThreadPrefix). " +

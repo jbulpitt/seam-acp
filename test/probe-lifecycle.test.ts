@@ -472,6 +472,20 @@ describe("#236 bounded probe lifecycle", () => {
     }
   });
 
+  it("retains a nested transport code and message through the existing redactor", async () => {
+    const cause = Object.assign(new Error("connect refused token=nested-secret-779"), { code: "ECONNREFUSED" });
+    await expect(runBoundedProbe({
+      executable: process.execPath,
+      args: [CHILD],
+      env: env("silent", { SUPER_SECRET_TOKEN: "nested-secret-779" }),
+      timeoutMs: 5_000,
+      run: async () => { throw new TypeError("fetch failed", { cause }); },
+    })).rejects.toMatchObject({
+      code: "protocol_error",
+      detail: expect.stringContaining("fetch failed: ECONNREFUSED: connect refused token=[redacted]"),
+    });
+  });
+
   it("runs a LATE close registration instead of dropping it", async () => {
     // A connection that finishes constructing after the deadline used to
     // register its close into an already-drained list and leak the session.

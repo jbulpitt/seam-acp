@@ -1,12 +1,12 @@
 import type { McpContribution } from "../mcp-registry.js";
 import type { ServiceStatusMcpView, ServiceStatusReadOptions, ServiceStatusRefreshOptions } from "../../core/service-status/mcp-view.js";
+import { invalidArgumentError } from "../../lib/invalid-argument.js";
 
 const descriptors = [
 {
     name: "service_status",
     description:
-      "Read the cached upstream status of the services Seam depends on (GitHub, Claude, OpenAI, xAI, " +
-      "Google AI Studio, Google Cloud). Cache only — this tool performs " +
+      "Read the cached upstream status of the registered services Seam depends on. Cache only — this tool performs " +
       "no network work and returns immediately. Each source reports `reportedStatus` (what the provider " +
       "said) separately from `observation.health` (whether Seam can currently reach it), so a stale or " +
       "failing poll is never mistaken for a provider outage. Use this first when an agent call fails and " +
@@ -81,8 +81,7 @@ const descriptors = [
 
 const instructions = [
 "- service_status(sourceIds?, includeComponents?, includeIncidents?, includeHistory?, limits…): read the",
-  "  CACHED upstream status of the services Seam depends on (GitHub, Claude, OpenAI, xAI, Google AI Studio,",
-  "  Google Cloud). No network work, returns immediately. When an agent call",
+  "  CACHED upstream status of the registered services Seam depends on. No network work, returns immediately. When an agent call",
   "  starts failing, check this BEFORE debugging Seam: it tells you whether the provider is down. Each source",
   "  separates `reportedStatus` (what the provider said) from `observation.health` (whether Seam can reach it),",
   "  so \"we cannot currently tell\" never reads as \"the provider is fine\".",
@@ -92,9 +91,26 @@ const instructions = [
   "  returns its own success, duration and error. Prefer service_status unless you specifically need fresh data."
 ].join("\n");
 
-export function serviceStatusMcp(view: () => Pick<ServiceStatusMcpView, "read" | "refresh">): McpContribution[] {
+export function serviceStatusMcp(view: () => Pick<ServiceStatusMcpView, "read" | "refresh" | "registeredSourceIds">): McpContribution[] {
+  const sourceHelp = () => `Registered source ids: ${view().registeredSourceIds().join(", ")}.`;
   return descriptors.map((descriptor, index) => ({
-    descriptor, access: "read-only", authorization: "user", instruction: index === 0 ? instructions : "",
+    descriptor: {
+      ...descriptor,
+      get description() { return `${descriptor.description} ${sourceHelp()}`; },
+      inputSchema: {
+        ...descriptor.inputSchema,
+        properties: {
+          ...descriptor.inputSchema.properties,
+          sourceIds: {
+            ...descriptor.inputSchema.properties.sourceIds,
+            items: { type: "string", get enum() { return view().registeredSourceIds(); } },
+            get description() { return `${descriptor.inputSchema.properties.sourceIds.description} ${sourceHelp()}`; },
+          },
+        },
+      },
+    },
+    access: "read-only", authorization: "user",
+    get instruction() { return index === 0 ? `${instructions}\n  ${sourceHelp()}` : ""; },
     available: () => true,
     handle: async ({ args }) => {
       if (index === 0) {
@@ -138,15 +154,15 @@ function optionalBool(args: Readonly<Record<string, unknown>>, key: string): boo
 function optionalNumber(args: Readonly<Record<string, unknown>>, key: string): number | undefined {
   const value = args[key];
   if (value === undefined || value === null) return undefined;
-  if (typeof value !== "number" || !Number.isFinite(value)) throw new Error(`"${key}" must be a finite number`);
+  if (typeof value !== "number" || !Number.isFinite(value)) throw invalidArgumentError(new Error(`"${key}" must be a finite number`));
   return value;
 }
 function optionalStringArray(args: Readonly<Record<string, unknown>>, key: string): string[] | undefined {
   const value = args[key];
   if (value === undefined || value === null) return undefined;
-  if (!Array.isArray(value)) throw new Error(`"${key}" must be an array of strings`);
+  if (!Array.isArray(value)) throw invalidArgumentError(new Error(`"${key}" must be an array of strings`));
   const result = value.map(entry => typeof entry === "string" ? entry.trim() : "");
-  if (result.some(entry => !entry)) throw new Error(`"${key}" must contain only non-empty strings`);
+  if (result.some(entry => !entry)) throw invalidArgumentError(new Error(`"${key}" must contain only non-empty strings`));
   return result.length ? result : undefined;
 }
 function spreadIfDefined<K extends string, V>(key: K, value: V | undefined): Record<K, V> | object {

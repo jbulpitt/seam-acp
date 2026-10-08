@@ -1,5 +1,6 @@
 import type { Logger } from "../lib/logger.js";
 import type { PluginContext } from "./types.js";
+import { isInvalidArgumentError } from "../lib/invalid-argument.js";
 
 export interface McpInvocation {
   threadId: string;
@@ -47,7 +48,11 @@ export class McpRegistry {
     if (!entry || !entry.contribution.available(invocation)) throw new Error(`unknown tool: ${name}`);
     try { return await entry.contribution.handle(invocation, entry.context); }
     catch (err) {
-      this.logger.error({ err, plugin: entry.plugin, tool: name }, "plugin MCP handler failed");
+      if (isInvalidArgumentError(err)) {
+        this.logger.warn({ err, plugin: entry.plugin, tool: name }, "plugin MCP arguments rejected");
+      } else {
+        this.logger.error({ err, plugin: entry.plugin, tool: name }, "plugin MCP handler failed");
+      }
       throw err;
     }
   }

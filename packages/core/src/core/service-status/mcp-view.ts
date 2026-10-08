@@ -1,6 +1,7 @@
 import { aggregateOutcome, type ServiceStatusRefreshManager } from "./manager.js";
 import { resolveQueryLimit, type ServiceStatusStore } from "./store.js";
 import { statusRank } from "./severity.js";
+import { invalidArgumentError } from "../../lib/invalid-argument.js";
 import type {
   ServiceObservationHealth,
   ServiceSourceProvenance,
@@ -347,16 +348,16 @@ export class ServiceStatusMcpView {
   private resolveSourceIds(requested: readonly string[] | undefined): string[] {
     if (requested === undefined) return this.registeredSourceIds();
     if (!Array.isArray(requested)) {
-      throw new TypeError("sourceIds must be an array of registered source ids");
+      throw invalidArgumentError(new TypeError("sourceIds must be an array of registered source ids"));
     }
     const unique = [...new Set(requested)];
     if (unique.length === 0) return this.registeredSourceIds();
     const unknown = unique.filter((id) => !this.definitions.has(id));
     if (unknown.length > 0) {
-      throw new RangeError(
+      throw invalidArgumentError(new RangeError(
         `unknown service status source id(s): ${unknown.map((id) => JSON.stringify(id)).join(", ")}. ` +
           `Registered ids: ${this.registeredSourceIds().join(", ")}`
-      );
+      ));
     }
     return unique.sort();
   }
@@ -412,7 +413,7 @@ function limitFor(
   try {
     return resolveQueryLimit(value, bounds.max, bounds.fallback);
   } catch (error) {
-    throw new RangeError(`${field} limit: ${(error as Error).message}`);
+    throw invalidArgumentError(new RangeError(`${field} limit: ${(error as Error).message}`));
   }
 }
 

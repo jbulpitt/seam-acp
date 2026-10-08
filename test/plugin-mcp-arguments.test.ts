@@ -6,6 +6,7 @@ import { pino } from "pino";
 import { afterEach, describe, expect, it } from "vitest";
 import { PluginHost } from "../packages/core/src/plugins/host.js";
 import { createServiceStatusPlugin } from "../packages/core/src/plugins/service-status/index.js";
+import { invalidArgumentError } from "../packages/core/src/lib/invalid-argument.js";
 
 type Log = { level: number; msg: string; plugin?: string; tool?: string; err?: { message: string } };
 const hosts: PluginHost[] = [];
@@ -36,6 +37,18 @@ async function statusFixture(includeOllama = false) {
   return { ...f, service };
 }
 const invocation = { threadId: "thread", args: {} };
+
+async function rejectingFixture(error: Error) {
+  const f = fixture();
+  await f.host.loadBuiltins([{ id: "broken", load: async () => ({
+    id: "broken", builtin: true, apiVersion: 1, contributions: { mcp: [{
+      descriptor: { name: "fault", description: "Fault", inputSchema: {} },
+      instruction: "", access: "read-only", authorization: "user", available: () => true,
+      handle: async () => { throw error; },
+    }] },
+  }) }]);
+  return f;
+}
 
 describe("plugin MCP argument help and logging", () => {
   it.each([false, true])("advertises the configured registry in both schemas (ollama=%s)", async includeOllama => {
@@ -93,17 +106,20 @@ describe("plugin MCP argument help and logging", () => {
     new TypeError("cannot read properties of undefined"),
     new RangeError("maximum call stack size exceeded"),
   ])("keeps a real handler fault at error and rethrows the same object: %s", async error => {
-    const f = fixture();
-    await f.host.loadBuiltins([{ id: "broken", load: async () => ({
-      id: "broken", builtin: true, apiVersion: 1, contributions: { mcp: [{
-        descriptor: { name: "fault", description: "Fault", inputSchema: {} },
-        instruction: "", access: "read-only", authorization: "user", available: () => true,
-        handle: async () => { throw error; },
-      }] },
-    }) }]);
+    const f = await rejectingFixture(error);
     await expect(f.host.mcp.dispatch("fault", invocation)).rejects.toBe(error);
     expect(f.logs.filter(log => log.tool === "fault")).toEqual([
       expect.objectContaining({ level: 50, msg: "plugin MCP handler failed", err: expect.objectContaining({ message: error.message }) }),
+    ]);
+  });
+
+  it("logs an explicitly classified argument rejection at warn and rethrows the same object", async () => {
+    const original = new RangeError("unknown option");
+    expect(invalidArgumentError(original)).toBe(original);
+    const f = await rejectingFixture(original);
+    await expect(f.host.mcp.dispatch("fault", invocation)).rejects.toBe(original);
+    expect(f.logs.filter(log => log.tool === "fault")).toEqual([
+      expect.objectContaining({ level: 40, msg: "plugin MCP arguments rejected", err: expect.objectContaining({ message: original.message }) }),
     ]);
   });
 });

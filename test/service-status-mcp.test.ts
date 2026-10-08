@@ -450,7 +450,10 @@ describe("service-status MCP tools", () => {
     const plugins = new PluginHost(logger);
     if (deps.readServiceStatus || deps.refreshServiceStatus) await plugins.loadBuiltins([{
       id: "service-status", load: async () => ({ id: "service-status", builtin: true, apiVersion: 1, contributions: {
-        mcp: serviceStatusMcp(() => ({ read: deps.readServiceStatus, refresh: deps.refreshServiceStatus }) as never),
+        mcp: serviceStatusMcp(() => ({
+          read: deps.readServiceStatus, refresh: deps.refreshServiceStatus,
+          registeredSourceIds: deps.registeredSourceIds ?? (() => createDefaultServiceStatusSources().map(source => source.id).sort()),
+        }) as never),
       } }),
     }]);
     const server = new SeamMcpServer({
@@ -506,6 +509,9 @@ describe("service-status MCP tools", () => {
         expect(Object.keys(refresh!.inputSchema.properties)).toEqual(["sourceIds"]);
         for (const tool of [read!, refresh!]) {
           expect(tool.inputSchema.required).toEqual([]);
+          const ids = createDefaultServiceStatusSources().map(source => source.id).sort();
+          expect(tool.inputSchema.properties.sourceIds.items.enum).toEqual(ids);
+          for (const id of ids) expect(tool.description).toContain(id);
           for (const [key, schema] of Object.entries<any>(tool.inputSchema.properties)) {
             // No argument NAME may suggest a network or credential surface…
             expect(key).not.toMatch(/url|uri|header|token|credential|auth|secret|key/i);
@@ -535,7 +541,7 @@ describe("service-status MCP tools", () => {
     await manager.refreshSource("alpha", { force: true });
 
     await withServer(
-      { readServiceStatus: (options: never) => view.read(options) },
+      { readServiceStatus: (options: never) => view.read(options), registeredSourceIds: () => view.registeredSourceIds() },
       async (call) => {
         const body = await call("tools/call", {
           name: "service_status",
@@ -552,7 +558,7 @@ describe("service-status MCP tools", () => {
   it("surfaces a validation error as a failed tool result, not a protocol error", async () => {
     const { view } = harness([source("alpha", () => Promise.resolve(okResult("alpha")))]);
     await withServer(
-      { readServiceStatus: (options: never) => view.read(options) },
+      { readServiceStatus: (options: never) => view.read(options), registeredSourceIds: () => view.registeredSourceIds() },
       async (call) => {
         const body = await call("tools/call", {
           name: "service_status",
@@ -585,7 +591,7 @@ describe("service-status MCP tools", () => {
       source("beta", () => Promise.reject(new Error("provider down"))),
     ]);
     await withServer(
-      { refreshServiceStatus: (options: never) => view.refresh(options) },
+      { refreshServiceStatus: (options: never) => view.refresh(options), registeredSourceIds: () => view.registeredSourceIds() },
       async (call) => {
         const body = await call("tools/call", {
           name: "service_status_refresh",

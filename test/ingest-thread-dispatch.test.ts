@@ -42,6 +42,13 @@ import type { ChannelRef, MessageRef } from "../packages/core/src/platforms/chat
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 import { attachLocalBridge } from "./local-bridge-fixture.js";
 import { simulateRetiredOwnerProcess } from "./restart-process-fixture.js";
+import { BridgeHub } from "../packages/core/src/core/bridge-hub.js";
+import { SeamTokenRegistry } from "../packages/core/src/core/mcp/token-registry.js";
+import { SeamMcpServer } from "../packages/core/src/core/mcp/seam-mcp-server.js";
+import { listSiblingThreadEntries } from "../packages/core/src/core/mcp/thread-inventory.js";
+import { isolatedBindSessionId, planIsolatedBridgeSpawn } from "../packages/core/src/core/location-bind.js";
+import { executionIdentity } from "../packages/core/src/core/dispatch/execution-identity.js";
+import type { McpServer } from "@agentclientprotocol/sdk";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
 const THREAD = "1516907849349857421";
@@ -265,6 +272,158 @@ function expectJob(results: ChoiceResultHub, dispatchId: string, schema: unknown
   p.catch(() => {});
   return p;
 }
+
+async function callerMcp(orch: Orchestrator) {
+  const registry = new SeamTokenRegistry();
+  const server = new SeamMcpServer({
+    logger: silent,
+    resolveSession: token => {
+      const id = registry.resolve(token);
+      return id ? store.get(id) ?? orch.resolveIngestJob(id) : undefined;
+    },
+    enqueueDispatch: async () => {},
+    listThreads: caller => listSiblingThreadEntries(caller, {
+      listSessionsByParent: (platform, parent) => store.listSessionsByParent(platform, parent),
+      describeConfig: record => (orch as any).router.describeConfig(record),
+      isRuntimeBusy: () => false,
+      adapter: {},
+      inspectQueue: ref => orch.inspectChannelQueue(ref),
+      inspectWorkProgress: (ref, now, queue) => orch.inspectThreadWorkProgress(ref, now, queue),
+      locationFor: () => ({ location: "local", hostEmoji: "" }),
+    }),
+    pushInbox: (caller, to, message, priority) => orch.pushInbox(caller, to, message, priority),
+    submitResult: (caller, value) => orch.submitChoiceResult(caller, value),
+  });
+  await server.start();
+  const http = createServer((req, res) => void server.handleRequest(req, res));
+  await new Promise<void>(resolve => http.listen(0, "0.0.0.0", resolve));
+  const healthPort = (http.address() as { port: number }).port;
+  const tokenHub = new BridgeHub({
+    logger: silent,
+    config: { REPOS_ROOT: dataDir, bridgePresets: new Map(),
+      SEAM_BRIDGE_PUBLIC_URL: `ws://127.0.0.1:${healthPort}/bridge` } as any,
+    mutation: {} as any,
+    httpServer: http as any,
+    getMcpRegistry: () => registry,
+    getMcpPort: () => server.port,
+    healthPort,
+    dataDir,
+    localBridgeTokenHash: "unused",
+  });
+  const bridge = (orch as any).bridgeHub;
+  const localGet = bridge.get.bind(bridge);
+  bridge.get = () => localGet("local");
+  bridge.markSessionBridge = tokenHub.markSessionBridge.bind(tokenHub);
+  bridge.mcpServersForBridgeSpawn = tokenHub.mcpServersForBridgeSpawn.bind(tokenHub);
+  return {
+    registry,
+    async call(entry: McpServer, name: string, args: unknown = {}) {
+      if (!("url" in entry) || !("headers" in entry)) throw new Error("expected bridge HTTP MCP entry");
+      const response = await fetch(entry.url, {
+        method: "POST",
+        headers: { "content-type": "application/json",
+          ...Object.fromEntries(entry.headers.map(header => [header.name, header.value])) },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call",
+          params: { name, arguments: args } }),
+      });
+      expect(response.status).toBe(200);
+      const body = await response.json() as any;
+      expect(body.error).toBeUndefined();
+      expect(body.result.isError).not.toBe(true);
+      return body.result.content.map((item: { text?: string }) => item.text ?? "").join("\n");
+    },
+    async close() {
+      tokenHub.close();
+      await new Promise<void>((resolve, reject) => http.close(error => error ? reject(error) : resolve()));
+      await server.stop();
+    },
+  };
+}
+
+describe("bridge ingest MCP caller identity", () => {
+  it.each(["local", "remote-ingest"])("routes and submits a fresh headless job on %s through its bridge token", async location => {
+    const row = endpoint({ thread: null, agentId: "codex", location, cwd: dataDir,
+      model: "gpt-5.6-sol", resultSchema: { type: "object", required: ["acknowledged"] } });
+    store.insertIngestEndpoint(row);
+    store.upsert(sessionRecord({ id: `discord:${THREAD}`, channelRef: THREAD }));
+    const spec = planEndpointDispatch({ endpoint: row, payload: "route this alert" });
+    const results = new ChoiceResultHub({ store, logger: silent });
+    const pending = expectJob(results, spec.id, row.resultSchema);
+    const { orch } = makeOrch(dataDir, store, {
+      profile: { id: "codex", defaultModel: "gpt-5.6-sol" }, profileLocation: location,
+    });
+    orch.setChoiceResults(results);
+    const mcp = await callerMcp(orch);
+    try {
+      (orch as any).injectTurn = async (_record: unknown, _prompt: string, options: InjectTurnOptions) => {
+        options.onSession?.("native-ingest-acp");
+        options.lifecycle?.beforePrompt?.();
+        const entry = options.mcpServers!.find(server => server.name === "seam-mcp")!;
+        expect(mcp.registry.peek(spec.id)).toBeUndefined();
+        expect(mcp.registry.resolve(mcp.registry.peek(isolatedBindSessionId(spec.id))))
+          .toBe(isolatedBindSessionId(spec.id));
+        expect(await mcp.call(entry, "threads")).toContain(THREAD);
+        await mcp.call(entry, "send", { to: THREAD, message: "routed source-id" });
+        expect(store.countInbox(`discord:${THREAD}`)).toBe(1);
+        await mcp.call(entry, "submit_result", { acknowledged: true });
+        return { text: "", stopReason: "end_turn" };
+      };
+      await orch.dispatchInjectTurn(spec);
+      await expect(pending).resolves.toEqual({ acknowledged: true });
+      expect(store.getChoiceResult(spec.id)).toMatchObject({ status: "ok", body: { acknowledged: true } });
+      expect(store.drainInbox(`discord:${THREAD}`)).toMatchObject([{ fromRef: row.id, body: "routed source-id" }]);
+    } finally { await mcp.close(); }
+  });
+
+  it.each(["active", "suspended"])("restores a %s headless caller and result binding without in-memory aliases", async state => {
+    const row = endpoint({ thread: null, agentId: "codex", location: "remote-ingest", cwd: dataDir,
+      model: "endpoint-model" });
+    store.insertIngestEndpoint(row);
+    store.upsert(sessionRecord({ id: `discord:${THREAD}`, channelRef: THREAD }));
+    const spec = planEndpointDispatch({ endpoint: row, payload: "route after restart" });
+    store.insertChoiceResult({ dispatchId: spec.id, choiceId: row.id, status: "pending", body: null,
+      error: null, schema: { type: "object" }, createdUtc: spec.createdUtc, finishedUtc: null });
+    const attempt = store.turnAttempts.claim(spec, executionIdentity({ agent: "codex",
+      location: "remote-ingest", session: "isolated", model: "recorded-model", effort: "low",
+      cwd: dataDir, config: JSON.stringify({ model: "recorded-model", reasoningEffort: "low" }) }), "old-boot");
+    store.turnAttempts.bind(attempt, "same-native-acp");
+    store.turnAttempts.startPrompt(attempt);
+    if (state === "suspended") store.turnAttempts.markStalled(spec.id, "controller restart");
+    const { orch } = makeOrch(dataDir, store);
+    orch.setChoiceResults(new ChoiceResultHub({ store, logger: silent }));
+    const mcp = await callerMcp(orch);
+    try {
+      const entry = planIsolatedBridgeSpawn({ hub: (orch as any).bridgeHub,
+        sessionId: isolatedBindSessionId(spec.id), location: "remote-ingest", agentId: "codex", cwd: dataDir }).mcpServers[0]!;
+      expect(await mcp.call(entry, "threads")).toContain(THREAD);
+      expect(orch.resolveIngestJob(isolatedBindSessionId(spec.id))).toMatchObject({
+        id: spec.id, parentRef: row.authoringParentRef, agentId: "codex", acpSessionId: "same-native-acp",
+        repoPath: dataDir, configJson: JSON.stringify({ model: "recorded-model", reasoningEffort: "low" }),
+      });
+      await mcp.call(entry, "send", { to: THREAD, message: "routed after restart" });
+      await mcp.call(entry, "submit_result", { acknowledged: true });
+      expect(store.getChoiceResult(spec.id)).toMatchObject({ status: "ok", body: { acknowledged: true } });
+      expect(store.countInbox(`discord:${THREAD}`)).toBe(1);
+    } finally { await mcp.close(); }
+  });
+
+  it.each(["handoff", "wake"] as const)("keeps the existing real-thread %s caller fallback", async kind => {
+    const target = sessionRecord({ id: `discord:${THREAD}`, channelRef: THREAD });
+    store.upsert(target);
+    const spec: DispatchSpec = { id: `isolated-${kind}`, kind, target: THREAD, session: "isolated",
+      prompt: "inspect siblings", createdUtc: new Date().toISOString() };
+    store.turnAttempts.claim(spec, executionIdentity({ agent: "codex", location: "local", session: "isolated" }), "boot");
+    const { orch } = makeOrch(dataDir, store);
+    const mcp = await callerMcp(orch);
+    try {
+      const entry = planIsolatedBridgeSpawn({ hub: (orch as any).bridgeHub,
+        sessionId: isolatedBindSessionId(spec.id), location: "local", agentId: "codex", cwd: dataDir }).mcpServers[0]!;
+      expect(await mcp.call(entry, "threads")).toContain(THREAD);
+      await mcp.call(entry, "send", { to: THREAD, message: "thread caller still resolves" });
+      expect(store.countInbox(target.id)).toBe(1);
+    } finally { await mcp.close(); }
+  });
+});
 
 describe("#224 live-thread ingest dispatch", () => {
   it("emits one ordered pair of kernel activity facts without awaiting its observer", async () => {

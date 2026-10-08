@@ -133,5 +133,7 @@ export function unknownAgentMessage(agentId: string, available: readonly string[
  * carries the reason for anyone who looks.
  */
 export function spawnRefusalFrame(err: unknown): { code: number; spawnError: string } {
-  return { code: 1, spawnError: err instanceof Error ? err.message : String(err) };
+  const message = err instanceof Error ? err.message : String(err);
+  const causeCode = err instanceof Error ? (err as NodeJS.ErrnoException).code : undefined;
+  return { code: 1, spawnError: causeCode ? `${causeCode}: ${message}` : message };
 }

@@ -728,10 +728,11 @@ export class AgentRuntime {
       // A remote code=1/signal=null describes the ACP supervisor, not
       // necessarily the descendant that failed (#516). When the bridge says
       // why, that reason is the cause; without one, say only what is known.
-      const error = new Error(
+      const context =
         `remote agent supervisor exited ${phase} on host '${remoteExit.bridgeId}' `
-        + `(code=${code}, signal=${signal})`
-        + (remoteExit.reason ? `: ${remoteExit.reason}` : "; the bridge reported no reason")
+        + `(code=${code}, signal=${signal})`;
+      const error = new Error(
+        remoteExit.reason ? `${remoteExit.reason}; ${context}` : `${context}; the bridge reported no reason`
       );
       attachErrorClassification(error, {
         errorKind: "agent_exit",

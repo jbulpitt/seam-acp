@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { activationRefusal, artifactName, firstActivationFromBaselineAllowed, buildArtifact, commandRunner, makeScpCommand, makeSshCommand, parseArgs, parseKeyValues, receiptEventStreamsAcceptable, resolveTarget, rollbackPlan, runActivation, runPreflight, validateReadyReceipt, validateTargetMap, verifyChecksum } from "../scripts/lib/bridge-rollout.mjs";
@@ -184,9 +185,51 @@ describe("bridge rollout target safety (#241)", () => {
     const name = `${artifactName("a".repeat(40), "b".repeat(64))}.upload-${token}`;
     expect(makeScpCommand(target, "/tmp/release.tgz", name).args.at(-1)).toBe(`workstation:${target.releaseRoot}/incoming/${name}`);
   });
+
+  it("bounds connection setup separately while giving preflight the existing activation window", () => {
+    const target = resolveTarget(targets, "workstation");
+    const preflight = makeSshCommand(target, ["preflight"], "fixed-script");
+    const activation = makeSshCommand(target, ["activate", "a".repeat(40), token, token, token, "900", token], "fixed-script");
+    expect(preflight.args).toContain("ConnectTimeout=10");
+    expect(preflight.timeoutMs).toBe(activation.timeoutMs);
+    expect(preflight.timeoutMs).toBeGreaterThan(900_000);
+    expect(preflight.mutates).toBe(false);
+  });
 });
 
 describe("bridge rollout gating and verification (#241)", () => {
+  it("lets a connected preflight finish after the old 30-second cutoff", async () => {
+    const target = resolveTarget(targets, "workstation");
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "seam-preflight-window-"));
+    const ready = path.join(dir, "ready");
+    const release = path.join(dir, "release");
+    const child = `
+      const fs = require('node:fs'), path = require('node:path');
+      const [dir, report] = process.argv.slice(1);
+      fs.writeFileSync(path.join(dir, 'ready'), '');
+      const wait = setInterval(() => {
+        if (!fs.existsSync(path.join(dir, 'release'))) return;
+        clearInterval(wait); process.stdout.write(report);
+      }, 10);
+    `;
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const result = runPreflight(target, "fixed-script", (command: Parameters<typeof commandRunner>[0]) =>
+      commandRunner({ ...command, file: process.execPath, args: ["-e", child, dir, preflightReport(target)] }));
+    // Observe rejection immediately, even when testing the old timeout.
+    void result.catch(() => undefined);
+    try {
+      await vi.waitFor(() => expect(fs.existsSync(ready)).toBe(true), { timeout: 5_000 });
+      await vi.advanceTimersByTimeAsync(31_000);
+      fs.writeFileSync(release, "");
+      await expect(result).resolves.toMatchObject({ report: { reachable: "yes", remote_mutation: "no" } });
+    } finally {
+      fs.writeFileSync(release, "");
+      await result.catch(() => undefined);
+      vi.useRealTimers();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }, 10_000);
+
   it("defaults to one-host dry-run and requires immutable phase identities", () => {
     expect(parseArgs(["--target", "workstation"])).toMatchObject({ action: "preflight", apply: false });
     expect(parseArgs(["--target", "workstation", "--stage", "--apply"])).toMatchObject({ action: "stage", apply: true });

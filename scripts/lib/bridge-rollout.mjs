@@ -185,7 +185,8 @@ export function makeSshCommand(target, actionArgs, remoteScript) {
     args: ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "--", target.sshAlias, "sh", "-s", "--", target.nodePath, ...args],
     input: remoteScript,
     mutates: actionArgs[0] !== "preflight",
-    timeoutMs: actionArgs[0] === "preflight" ? 30_000 : 960_000,
+    // Preflight hashes the whole runtime; only connecting is a short probe.
+    timeoutMs: 960_000,
   };
 }
 

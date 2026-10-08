@@ -37,15 +37,7 @@ afterAll(() => mcp.stop());
 
 type SpawnedChild = ChildProcessByStdio<Writable, Readable, Readable>;
 
-/**
- * Unit-test boundary for the separate local bridge introduced by #575.
- *
- * Tests that mock AgentRuntime never call `spawn`; tests exercising the real
- * runtime can provide a profile (or exact spawn callback) and still cross the
- * same mux/RPC boundary as production. Keeping this fixture in test code is
- * deliberate: a production fallback to profile.spawn would recreate the
- * local-only implementation #575 removes.
- */
+/** In-process mux/RPC fixture, without the WebSocket or sessiond transport. */
 export function localBridgeWiring(
   spawn: ((params: RemoteSlotSpawnParams) => SpawnedChild) | AgentProfile | readonly AgentProfile[] = () => {
     throw new Error("synthetic local bridge spawn was not configured");

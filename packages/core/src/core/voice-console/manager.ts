@@ -88,10 +88,8 @@ export class VoiceConsoleManager {
     const console = outcome.value.console;
     const binding = this.store.getVoiceConsoleBinding(input.binding.id);
     if (!binding) throw new Error("Voice Console binding disappeared after add.");
-    let attachAttempted = false;
     let failureCode: VoiceConsoleMutationFailure = "host-attach-failed";
     try {
-      attachAttempted = true;
       const attached = await this.host.addBinding(console, binding);
       if (!attached.ok) throw new Error(attached.reason);
       failureCode = "activation-failed";
@@ -149,15 +147,13 @@ export class VoiceConsoleManager {
           "voice console add interaction failure finalization failed"
         );
       }
-      if (attachAttempted) {
-        try {
-          await this.host.stopBinding(binding.id, reason);
-        } catch (cleanupErr) {
-          this.logger.warn(
-            { err: cleanupErr, bindingId: binding.id },
-            "voice console binding detach cleanup failed"
-          );
-        }
+      try {
+        await this.host.stopBinding(binding.id, reason);
+      } catch (cleanupErr) {
+        this.logger.warn(
+          { err: cleanupErr, bindingId: binding.id },
+          "voice console binding detach cleanup failed"
+        );
       }
       throw new Error(reason);
     }

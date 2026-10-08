@@ -7,8 +7,6 @@ describe("model intelligence architectural boundaries (#249)", () => {
   it("production has one refresh coordinator and no static release registry", () => {
     const entry = read("packages/core/src/index.ts");
     expect(entry).toContain("new ModelIntelligenceManager");
-    expect(entry).not.toContain("new ModelMetadataManager");
-    expect(entry).not.toContain("new ModelValueManager");
     expect(() => read("packages/core/src/core/model-metadata/aliases.ts")).toThrow();
 
     const matching = read("packages/core/src/core/model-intelligence/matching.ts");

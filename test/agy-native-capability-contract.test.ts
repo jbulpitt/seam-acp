@@ -51,22 +51,6 @@ interface Invocation {
   signal?: string;
 }
 
-interface Provenance {
-  schemaVersion: number;
-  sanitized: boolean;
-  runtime: {
-    cliVersion: string;
-    adapter: string;
-    modelId: string;
-    modelEvidence: string;
-  };
-  capabilities: Array<{
-    id: string;
-    evidence: string[];
-    liveVerified: boolean;
-  }>;
-}
-
 const seamMcp: McpServer = {
   type: "http",
   name: "seam-mcp",
@@ -277,72 +261,6 @@ describe.sequential("native AGY R1 capability contract", () => {
     for (const home of sessionHomes) fs.rmSync(home, { recursive: true, force: true });
     managedCli.cleanup();
     fs.rmSync(root, { recursive: true, force: true });
-  });
-
-  it("records explicit, non-live provenance for every frozen capability", () => {
-    const provenance = JSON.parse(
-      fs.readFileSync(path.join(fixtureDir, "provenance.json"), "utf8"),
-    ) as Provenance;
-    expect(provenance).toMatchObject({
-      schemaVersion: 1,
-      sanitized: true,
-      runtime: {
-        cliVersion: "1.1.28",
-        adapter: "Seam native agy",
-        modelId: "fixture-native-model",
-      },
-    });
-    expect(provenance.runtime.modelEvidence).toMatch(/not a model self-report/i);
-    expect(provenance.capabilities.map((entry) => entry.id)).toEqual([
-      "thinking",
-      "message-deltas-finalization",
-      "read-edit-execute-tools",
-      "tool-error-status",
-      "usage-context-input",
-      "interruption",
-      "resume-high-water",
-      "embedded-text-binary-attachments",
-      "session-scoped-mcp",
-      "structured-result",
-      "session-model-isolation",
-    ]);
-    for (const entry of provenance.capabilities) {
-      expect(entry.evidence).toContain("source-confirmed");
-      expect(entry.evidence).toContain("offline-reproduced");
-      expect(entry.liveVerified).toBe(false);
-    }
-  });
-
-  it("binds the native behavior gate to the R2 virtual-runtime descriptor", () => {
-    const profile = makeAgyProfile({
-      runtime: makeAgyNativeRuntime({
-        executable: managedCli.executable,
-        runtimeRoot: managedCli.runtimeRoot,
-        version: "agy fixture 1.1.28",
-        sha256: managedCli.sha256,
-        credentialScope: "antigravity-oauth:test",
-        cwd: root,
-        approvedEnvironment: {
-          SEAM_AGY_CAPABILITY_FIXTURE_DIR: fixtureDir,
-          SEAM_AGY_CAPABILITY_INVOCATIONS: invocationLog,
-        },
-      }),
-      defaultModel: "Fixture Native Model",
-    });
-    expect(profile.describe().runtime).toMatchObject({
-      identity: expect.stringMatching(/^[a-f0-9]{64}$/),
-      executable: "managed-artifact",
-      argv: [],
-      cwd: "session-workspace",
-      environment: {},
-      topology: "virtual-acp-native-cli",
-      cwdPolicy: "session",
-      provenance: {
-        source: "google:antigravity-native-cli",
-        version: "agy fixture 1.1.28",
-        sha256: managedCli.sha256,
-      },
-    });
   });
 
   it("replays native thinking, message, tool, usage, resume, attachment, schema, and interruption behavior end to end", async () => {

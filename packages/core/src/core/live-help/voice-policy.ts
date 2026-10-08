@@ -16,9 +16,7 @@ export function isDiscordSnowflake(id: string): boolean {
 
 export function checkLiveHelpVoiceChannel(input: {
   id: string;
-  name?: string | null;
   type?: number | null;
-  parentName?: string | null;
   obfuscated?: boolean;
 }): LiveHelpVoiceCheck {
   if (!isDiscordSnowflake(input.id)) {

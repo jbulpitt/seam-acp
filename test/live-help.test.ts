@@ -33,50 +33,19 @@ import { pino } from "pino";
 const silent = pino({ level: "silent" }) as unknown as Logger;
 
 describe("live-help voice-channel validation", () => {
-  it("accepts an explicit non-school guild voice snowflake", () => {
+  it("accepts an explicit guild voice snowflake", () => {
     expect(
       checkLiveHelpVoiceChannel({
         id: "1487095870188027987",
-        name: "General",
         type: ChannelType.GuildVoice,
-        parentName: "Voice Channels",
       })
     ).toEqual({ ok: true, channelId: "1487095870188027987" });
-  });
-
-  it("accepts a different tutoring VC (not General-only)", () => {
-    expect(
-      checkLiveHelpVoiceChannel({
-        id: "1515080987074232323",
-        name: "tutoring",
-        type: ChannelType.GuildVoice,
-      }).ok
-    ).toBe(true);
-  });
-
-  it("accepts designated school/course voice channels", () => {
-    expect(
-      checkLiveHelpVoiceChannel({
-        id: "1487095870188027987",
-        name: "school-taylor",
-        type: ChannelType.GuildVoice,
-      }).ok
-    ).toBe(true);
-    expect(
-      checkLiveHelpVoiceChannel({
-        id: "1487095870188027987",
-        name: "General",
-        type: ChannelType.GuildVoice,
-        parentName: "school-morgan",
-      }).ok
-    ).toBe(true);
   });
 
   it("refuses obfuscated and non-voice", () => {
     expect(
       checkLiveHelpVoiceChannel({
         id: "1487095870188027987",
-        name: "General",
         type: ChannelType.GuildVoice,
         obfuscated: true,
       }).ok
@@ -84,7 +53,6 @@ describe("live-help voice-channel validation", () => {
     expect(
       checkLiveHelpVoiceChannel({
         id: "1487095870188027987",
-        name: "General",
         type: ChannelType.GuildText,
       }).ok
     ).toBe(false);

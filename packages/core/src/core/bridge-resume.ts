@@ -31,25 +31,37 @@ export function remainingMaxAgeMs(
 export function waitUntilBridgeReady(
   hub: Pick<BridgeHub, "isBridgeReady" | "onBridgeReady">,
   location: string | undefined,
-  opts: { deadlineMs: number }
+  opts: { deadlineMs: number; signal?: AbortSignal }
 ): Promise<BridgeResumeWait> {
+  if (opts.signal?.aborted) return Promise.reject(opts.signal.reason);
   const loc = normalizeLocation(location);
   if (hub.isBridgeReady(loc)) return Promise.resolve("ready");
   if (opts.deadlineMs <= 0) return Promise.resolve("timeout");
 
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     let settled = false;
+    const cleanup = () => {
+      clearTimeout(timer);
+      off();
+      opts.signal?.removeEventListener("abort", abort);
+    };
+    const abort = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(opts.signal!.reason);
+    };
     const finish = (result: BridgeResumeWait) => {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
-      off();
+      cleanup();
       resolve(result);
     };
     const off = hub.onBridgeReady((id) => {
       if (id === loc) finish("ready");
     });
     const timer = setTimeout(() => finish("timeout"), opts.deadlineMs);
+    opts.signal?.addEventListener("abort", abort, { once: true });
     // Ready may have flipped between the pre-check and the subscribe.
     if (hub.isBridgeReady(loc)) finish("ready");
   });

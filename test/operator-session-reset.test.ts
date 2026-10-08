@@ -11,6 +11,8 @@ import type { DispatchSpec } from "../packages/core/src/core/dispatch/types.js";
 import { executionIdentity } from "../packages/core/src/core/dispatch/execution-identity.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
+import { logger as journal } from "../packages/core/src/lib/logger.js";
+import { RuntimeTransition } from "../packages/core/src/core/runtime-transition.js";
 
 const logger = pino({ level: "silent" }) as unknown as Logger;
 let dir: string;
@@ -75,6 +77,47 @@ afterEach(async () => {
   await router.disposeAll();
   store.close();
   rmSync(dir, { recursive: true, force: true });
+  vi.restoreAllMocks();
+});
+
+describe("binding clear causes", () => {
+  it("keeps a live binding across an unrelated cwd write from an empty snapshot", () => {
+    const observer = Object.assign(Object.create(Orchestrator.prototype), { store });
+    const stale = { ...store.get("discord:worker")!, acpSessionId: "" };
+    observer.persistSessionCwd(stale, "/new-repo");
+    expect(store.get(stale.id)).toMatchObject({ repoPath: "/new-repo", acpSessionId: "acp-old" });
+  });
+
+  it("records the slash reset's real source and cause once", async () => {
+    const info = vi.spyOn(journal, "info").mockImplementation(() => {});
+    const observer = Object.assign(Object.create(Orchestrator.prototype), {
+      store, router, identityEffects: { flush: vi.fn(async () => {}) },
+      recordFromInteraction: () => store.get("discord:worker"),
+    });
+    await observer.cmdReset({ reply: vi.fn(async () => {}), replied: false, deferred: false });
+    expect(store.get("discord:worker")?.acpSessionId).toBe("");
+    const clears = info.mock.calls.filter(([, message]) => message === "cleared stored acp session id");
+    expect(clears).toHaveLength(1);
+    expect(clears[0]?.[0]).toMatchObject({
+      sessionId: "discord:worker", previousAcpSessionId: "acp-old",
+      source: "Orchestrator.cmdReset", cause: "operator requested session reset",
+    });
+  });
+
+  it("retains the previous binding when a fresh forge fails and records the native cause", async () => {
+    const info = vi.spyOn(journal, "info").mockImplementation(() => {});
+    const warn = vi.spyOn(journal, "warn").mockImplementation(() => {});
+    const cause = new Error("session/new rejected: provider unavailable");
+    vi.spyOn(router, "getOrStartRuntime").mockRejectedValue(cause);
+    const transition = new RuntimeTransition({ store, router,
+      mutation: {} as any, modelCatalog: fixtureModelCatalog([]) });
+    await expect(transition.reset(store.get("discord:worker")!)).rejects.toBe(cause);
+    expect(store.get("discord:worker")?.acpSessionId).toBe("acp-old");
+    expect(info.mock.calls.filter(([, message]) => message === "cleared stored acp session id")).toHaveLength(1);
+    expect(warn).toHaveBeenCalledWith(expect.objectContaining({
+      sessionId: "discord:worker", cause: cause.message, previousAcpSessionId: "acp-old",
+    }), "fresh session replacement failed; restored previous binding");
+  });
 });
 
 describe("#580 operator session replacement", () => {

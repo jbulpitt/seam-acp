@@ -13,6 +13,7 @@ import type { RequestPermissionResponse } from "@agentclientprotocol/sdk";
 import { SessiondClient, SessiondClientError } from "./sessiond-client.js";
 import type {
   SessiondEvent,
+  SessiondListSlotsParams,
   SessiondListSlotsResult,
   SessiondOutputFrame,
 } from "./sessiond-protocol.js";
@@ -206,8 +207,8 @@ export class SupervisedSlots {
     this.configs.set(slot, config);
   }
 
-  async listSlots(): Promise<SessiondListSlotsResult> {
-    const listed = await this.options.client.listSlots();
+  async listSlots(params: SessiondListSlotsParams = {}): Promise<SessiondListSlotsResult> {
+    const listed = await this.options.client.listSlots(params);
     // Idle holders have no recovery record; query only on attachment.
     const previous = this.attached;
     this.attached = new Map(listed.health.map(row => [row.slot, row.alive && row.attached]));

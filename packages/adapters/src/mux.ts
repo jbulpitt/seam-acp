@@ -352,7 +352,7 @@ export function makeMux(opts: {
   function applyRemoteExit(
     slot: number,
     entry: SlotEntry,
-    frame: { code?: number; signal?: unknown; hostOom?: unknown; spawnError?: unknown; stderrTail?: unknown },
+    frame: { seq?: number; code?: number; signal?: unknown; hostOom?: unknown; spawnError?: unknown; stderrTail?: unknown },
   ): void {
     const hostOom = remoteHostOom(frame.hostOom);
     const reason = typeof frame.spawnError === "string" && frame.spawnError.trim()
@@ -378,6 +378,10 @@ export function makeMux(opts: {
     entry.fake.exitCode = frame.code ?? 1;
     entry.fake.signalCode = exitSignal(frame.signal);
     entry.fake.emit("exit", entry.fake.exitCode, entry.fake.signalCode);
+    if (typeof frame.seq === "number") {
+      outputCursor.set(slot, frame.seq);
+      scheduleAck(slot);
+    }
   }
 
   function send(msg: MuxMsg) {

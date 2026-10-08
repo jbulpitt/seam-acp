@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { promises as fs, openSync, closeSync, statSync } from "node:fs";
+import { promises as fs, openSync, closeSync, statSync, unlinkSync } from "node:fs";
 import net, { type Socket } from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -12,6 +12,7 @@ import {
   SESSIOND_PROTOCOL_VERSION,
   type SessiondEvent,
   type SessiondKillParams,
+  type SessiondListSlotsParams,
   type SessiondListSlotsResult,
   type SessiondOutputFrame,
   type SessiondReplayOutputParams,
@@ -38,7 +39,6 @@ const MAX_WIRE_BYTES = 256 * 1024 * 1024;
 const MAX_WRITE_BYTES = 128 * 1024 * 1024;
 const ORPHAN_TERM_GRACE_MS = 500;
 const ORPHAN_KILL_GRACE_MS = 500;
-const EXITED_SLOT_RETENTION_MS = 24 * 60 * 60_000;
 
 interface PersistedSlot {
   slot: number;
@@ -46,6 +46,9 @@ interface PersistedSlot {
   /** The slot holder's socket (#631). Absent for pre-holder records. */
   socketPath?: string;
   exitedAt?: number;
+  lastSeq?: number;
+  exitSeq?: number;
+  outputAckedThrough?: number;
   identity?: ProcessIdentity;
   status: "live" | "dead";
   lastStdoutAt?: number;
@@ -74,6 +77,8 @@ interface SlotEntry {
   exited?: boolean;
   exitedAt?: number;
   lastSeq: number;
+  exitSeq?: number;
+  outputAckedThrough?: number;
   replies: Map<string, (message: SlotHolderOutput) => void>;
   lastStdoutAt?: number;
   lastStdinAt?: number;
@@ -206,6 +211,15 @@ function parseAckParams(raw: unknown): SessiondAckParams {
   return { slot: safeInteger(value.slot, "slot"), throughSeq: safeInteger(value.throughSeq, "throughSeq") };
 }
 
+function parseListSlotsParams(raw: unknown): SessiondListSlotsParams {
+  const value = plainRecord(raw ?? {});
+  if (value.retiredSlots === undefined) return {};
+  if (!Array.isArray(value.retiredSlots)) {
+    throw new SessiondError("invalid_request", "retiredSlots must be an array");
+  }
+  return { retiredSlots: value.retiredSlots.map(slot => safeInteger(slot, "retired slot")) };
+}
+
 const ALLOWED_SIGNALS = new Set<NodeJS.Signals>(["SIGTERM", "SIGKILL", "SIGINT", "SIGHUP"]);
 
 function parseKillParams(raw: unknown): SessiondKillParams {
@@ -303,7 +317,6 @@ export class SessiondServer {
   private persistQueue: Promise<void> = Promise.resolve();
   private started = false;
   private closing = false;
-  private pruneTimer?: ReturnType<typeof setInterval>;
 
   constructor(private readonly options: SessiondServerOptions) {
     this.outputLog = createOutputLog(options.outputLog);
@@ -332,8 +345,6 @@ export class SessiondServer {
     });
     await fs.chmod(this.options.socketPath, 0o600);
     this.started = true;
-    this.pruneTimer = setInterval(() => this.pruneExited(), 10 * 60_000);
-    this.pruneTimer.unref();
   }
 
   /**
@@ -344,7 +355,6 @@ export class SessiondServer {
   async close(options: { terminateChildren?: boolean } = {}): Promise<void> {
     const ownedSocket = this.started;
     this.closing = true;
-    if (this.pruneTimer) clearInterval(this.pruneTimer);
     if (options.terminateChildren) {
       const live = [...this.slots.values()].filter((entry) => this.holderAlive(entry));
       for (const entry of live) {
@@ -432,7 +442,7 @@ export class SessiondServer {
       case "write": return this.writeSlot(parseWriteParams(request.params));
       case "subscribe": return this.subscribe(connection, parseCursorParams(request.params));
       case "kill": return this.killSlot(parseKillParams(request.params));
-      case "listSlots": return this.listSlots();
+      case "listSlots": return this.listSlots(parseListSlotsParams(request.params));
       case "replayOutput": return this.replayOutput(parseCursorParams(request.params));
       case "ack": {
         const params = parseAckParams(request.params);
@@ -440,7 +450,17 @@ export class SessiondServer {
         this.outputLog.ack(params.slot, params.throughSeq);
         // The holder keeps unread output across a sessiond restart; let it go.
         const entry = this.slots.get(params.slot);
+        if (entry) {
+          entry.outputAckedThrough = Math.max(entry.outputAckedThrough ?? 0, params.throughSeq);
+          // Save terminal ACK proof before the holder exits and takes its buffer.
+          if (entry.exitSeq !== undefined && entry.outputAckedThrough >= entry.exitSeq) {
+            await this.persist().catch(error => {
+              throw new SessiondError("internal_error", `slot ${entry.slot} ACK persistence failed: ${String(error)}`);
+            });
+          }
+        }
         entry?.link?.write(holderMessage({ v: SLOT_HOLDER_PROTOCOL_VERSION, type: "ack", throughSeq: params.throughSeq }));
+        await this.pruneExited();
         return { slot: params.slot };
       }
       default: throw new SessiondError("invalid_request", "unknown sessiond method");
@@ -586,6 +606,9 @@ export class SessiondServer {
           if (ack.pid) entry.pid = ack.pid;
           entry.attached = true;
           entry.orphanReason = undefined;
+          if (entry.exitSeq !== undefined && (entry.outputAckedThrough ?? 0) >= entry.exitSeq) {
+            socket.write(holderMessage({ v: SLOT_HOLDER_PROTOCOL_VERSION, type: "ack", throughSeq: entry.outputAckedThrough! }));
+          }
           return true;
         }
         socket.destroy();
@@ -626,7 +649,8 @@ export class SessiondServer {
       entry.attached = false;
       for (const reply of entry.replies.values()) reply({ v: SLOT_HOLDER_PROTOCOL_VERSION, type: "write_result", id: "", ok: false });
       entry.replies.clear();
-      void this.afterHolderLoss(entry);
+      void this.afterHolderLoss(entry).catch(error =>
+        console.error(`[seam-sessiond] slot ${entry.slot} holder-loss reconciliation failed: ${String(error)}`));
     });
   }
 
@@ -640,11 +664,16 @@ export class SessiondServer {
       entry.orphanReason = "supervisor_restarted";
       await new Promise((resolve) => setTimeout(resolve, 5_000));
     }
-    if (this.closing || this.slots.get(entry.slot) !== entry || entry.link || entry.exited) return;
+    if (this.closing || this.slots.get(entry.slot) !== entry || entry.link) return;
+    if (entry.exited) {
+      await this.pruneExited();
+      return;
+    }
     console.error(`[seam-sessiond] slot ${entry.slot} (pid ${entry.pid ?? "?"}) lost its holder without an exit report; the process group was killed from outside`);
     this.dropResumeRecord(entry.slot);
     this.markExited(entry, null, null);
-    this.publish(entry.slot, { seq: entry.lastSeq + 1, at: Date.now(), stream: "exit", code: null, signal: null });
+    entry.exitSeq = entry.lastSeq + 1;
+    this.publish(entry.slot, { seq: entry.exitSeq, at: Date.now(), stream: "exit", code: null, signal: null });
     void this.persist().catch(() => undefined);
   }
 
@@ -656,20 +685,37 @@ export class SessiondServer {
     this.backpressured.delete(entry.slot);
   }
 
-  /** Forget slots that ended more than a day ago; their output has expired too. */
-  private pruneExited(now = Date.now()): void {
-    let pruned = false;
+  /** Retire consumed output only after the original holder is provably gone. */
+  private async pruneExited(retiredSlots: ReadonlySet<number> = new Set()): Promise<void> {
+    let acknowledgedCount = 0;
+    let retiredCount = 0;
     for (const entry of [...this.slots.values()]) {
-      if (!entry.exited) continue;
-      entry.exitedAt ??= now;
-      if (now - entry.exitedAt < EXITED_SLOT_RETENTION_MS) continue;
+      const acknowledged = entry.exitSeq !== undefined
+        && (entry.outputAckedThrough ?? 0) >= Math.max(entry.exitSeq, entry.lastSeq);
+      if ((!acknowledged && !retiredSlots.has(entry.slot)) || !this.holderGone(entry)) continue;
+      // Unlink before yielding, so a later reuse of the slot cannot lose its log.
+      for (const file of [path.join(this.slotsDirectory(), `${entry.slot}.log`), entry.socketPath, this.resumeFile(entry.slot)]) {
+        if (!file) continue;
+        try { unlinkSync(file); }
+        catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+            throw new SessiondError("internal_error", `slot ${entry.slot} artifact removal failed: ${String(error)}`);
+          }
+        }
+      }
       this.slots.delete(entry.slot);
       this.outputLog.dropSlot(entry.slot);
-      void fs.unlink(path.join(this.slotsDirectory(), `${entry.slot}.log`)).catch(() => undefined);
-      if (entry.socketPath) void fs.unlink(entry.socketPath).catch(() => undefined);
-      pruned = true;
+      for (const connection of this.connections) connection.subscriptions.delete(entry.slot);
+      if (acknowledged) acknowledgedCount++;
+      else retiredCount++;
     }
-    if (pruned) void this.persist().catch(() => undefined);
+    const pruned = acknowledgedCount + retiredCount;
+    if (pruned) {
+      await this.persist().catch(error => {
+        throw new SessiondError("internal_error", `pruned slot registry persistence failed: ${String(error)}`);
+      });
+      console.error(`[seam-sessiond] pruned ${pruned} gone-holder slots: ${acknowledgedCount} acknowledged, ${retiredCount} retired by controller reconciliation; ${this.slots.size} retained`);
+    }
   }
 
   private holderRequest(entry: SlotEntry, replyType: string, message: SlotHolderInput): Promise<SlotHolderOutput> {
@@ -708,6 +754,7 @@ export class SessiondServer {
       this.dropResumeRecord(entry.slot);
       console.error(`[seam-sessiond] slot ${entry.slot} (pid ${entry.pid ?? "?"}) exited: code ${frame.code ?? "none"}, signal ${frame.signal ?? "none"}`);
       this.markExited(entry, frame.code ?? null, frame.signal ?? null);
+      entry.exitSeq = frame.seq;
       void this.persist().catch(() => undefined);
     }
     this.publish(entry.slot, frame);
@@ -803,7 +850,8 @@ export class SessiondServer {
     return { slot: params.slot, signalled: true, alreadyDead: false };
   }
 
-  private listSlots(): SessiondListSlotsResult {
+  private async listSlots(params: SessiondListSlotsParams): Promise<SessiondListSlotsResult> {
+    await this.pruneExited(new Set(params.retiredSlots));
     const now = Date.now();
     const health = [...this.slots.values()].map((entry): SessiondSlotHealth => ({
       slot: entry.slot,
@@ -812,7 +860,7 @@ export class SessiondServer {
       lastStdoutMsAgo: entry.lastStdoutAt === undefined ? null : Math.max(0, now - entry.lastStdoutAt),
       lastStdinMsAgo: entry.lastStdinAt === undefined ? null : Math.max(0, now - entry.lastStdinAt),
       attached: entry.attached,
-      outputAckedThrough: this.outputLog.acknowledgedThrough(entry.slot),
+      outputAckedThrough: Math.max(entry.outputAckedThrough ?? 0, this.outputLog.acknowledgedThrough(entry.slot)),
       resumePending: this.resumePending(entry.slot),
       ...(entry.exitCode !== undefined ? { exitCode: entry.exitCode } : {}),
       ...(entry.signal !== undefined ? { signal: entry.signal } : {}),
@@ -845,6 +893,16 @@ export class SessiondServer {
 
   private holderAlive(entry: SlotEntry): boolean {
     return !!entry.identity && sameIdentity(entry.identity, readSessiondProcessIdentity(entry.identity.pid));
+  }
+
+  private holderGone(entry: SlotEntry): boolean {
+    const identity = entry.identity;
+    if (!identity?.started) return false;
+    const observed = readSessiondProcessIdentity(identity.pid, true);
+    if (observed) return !sameIdentity(identity, observed);
+    try { process.kill(identity.pid, 0); }
+    catch (error) { return (error as NodeJS.ErrnoException).code === "ESRCH"; }
+    return false;
   }
 
   private entryAlive(entry: SlotEntry): boolean {
@@ -899,7 +957,9 @@ export class SessiondServer {
         ...(record.socketPath ? { socketPath: record.socketPath } : {}),
         attached: false,
         ...(record.status !== "live" ? { exited: true, exitedAt: record.exitedAt ?? Date.now() } : {}),
-        lastSeq: 0,
+        lastSeq: record.lastSeq ?? record.exitSeq ?? 0,
+        exitSeq: record.exitSeq,
+        outputAckedThrough: record.outputAckedThrough,
         replies: new Map(),
         lastStdoutAt: record.lastStdoutAt,
         lastStdinAt: record.lastStdinAt,
@@ -907,22 +967,26 @@ export class SessiondServer {
         signal: record.signal,
       };
       this.slots.set(entry.slot, entry);
-      if (record.status !== "live") continue;
       if (!record.identity) {
+        if (record.status !== "live") continue;
         entry.orphanReason = "identity_unverifiable";
         entry.exited = true;
         continue;
       }
       const observed = readSessiondProcessIdentity(record.identity.pid);
       if (!observed || !sameIdentity(record.identity, observed)) {
-        entry.orphanReason = observed ? "identity_mismatch" : "supervisor_restarted";
-        if (observed) entry.pid = null;
-        entry.exited = true;
-        entry.exitCode = null;
-        entry.signal = null;
+        if (record.status === "live") {
+          entry.orphanReason = observed ? "identity_mismatch" : "supervisor_restarted";
+          if (observed) entry.pid = null;
+          entry.exited = true;
+          entry.exitCode = null;
+          entry.signal = null;
+        }
       } else if (record.socketPath) {
+        // The in-memory log is new: replay the holder's retained output into it.
+        entry.lastSeq = 0;
         held.push(entry);
-      } else {
+      } else if (record.status === "live") {
         legacy.push({ entry, identity: record.identity });
       }
     }
@@ -960,6 +1024,7 @@ export class SessiondServer {
         entry.signal = escalated.has(identity.pid) ? "SIGKILL" : "SIGTERM";
       }
     }
+    await this.pruneExited();
     await this.persist();
   }
 
@@ -1006,6 +1071,10 @@ export class SessiondServer {
           ...(entry.identity ? { identity: entry.identity } : {}),
           ...(entry.socketPath ? { socketPath: entry.socketPath } : {}),
           ...(entry.exitedAt ? { exitedAt: entry.exitedAt } : {}),
+          lastSeq: entry.lastSeq,
+          ...(entry.exitSeq !== undefined ? { exitSeq: entry.exitSeq } : {}),
+          ...(entry.exitSeq !== undefined && entry.outputAckedThrough !== undefined
+            ? { outputAckedThrough: entry.outputAckedThrough } : {}),
           status: this.entryAlive(entry) ? "live" : "dead",
           ...(entry.lastStdoutAt !== undefined ? { lastStdoutAt: entry.lastStdoutAt } : {}),
           ...(entry.lastStdinAt !== undefined ? { lastStdinAt: entry.lastStdinAt } : {}),

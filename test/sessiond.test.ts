@@ -406,8 +406,8 @@ describe("#573 seam-sessiond control-plane restart", () => {
     await waitForAsync(async () => fs.access(record).then(() => undefined, () => true));
   });
 
-  it("forgets slots that ended more than a day ago (#631)", async () => {
-    const { server, client, statePath } = await harness();
+  it("forgets acknowledged exits after the holder is gone, without ageing them (#621)", async () => {
+    const { client, statePath } = await harness();
     await client.spawn({ slot: 33, executable: process.execPath, args: ["-e", "process.exit(0)"],
       cwd: process.cwd(), env: { PATH: process.env.PATH ?? "" } });
     await waitForAsync(async () => (await listedDead(client, 33)) || undefined);
@@ -416,13 +416,17 @@ describe("#573 seam-sessiond control-plane restart", () => {
     const replay = await client.replayOutput({ slot: 33, afterSeq: 0 });
     const exit = replay.frames.find(frame => frame.stream === "exit");
     expect(exit).toBeDefined();
-    // Deliver the exit before artificially ageing its retained entry.
+    // #621 replaces age-based deletion with consumed-exit and holder-gone proof.
     await client.ack({ slot: 33, throughSeq: exit!.seq });
-    await waitFor(() => readSessiondProcessIdentity(holderPid) ? undefined : true);
-    const internals = server as unknown as { pruneExited(now: number): void };
-    internals.pruneExited(Date.now());
-    expect((await client.listSlots()).slots).toEqual([33]);
-    internals.pruneExited(Date.now() + 25 * 60 * 60_000);
+    await waitFor(() => {
+      if (readSessiondProcessIdentity(holderPid, true)) return undefined;
+      try { process.kill(holderPid, 0); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ESRCH") return true;
+        throw error;
+      }
+      return undefined;
+    });
     expect((await client.listSlots()).slots).toEqual([]);
   });
 

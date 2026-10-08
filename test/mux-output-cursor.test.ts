@@ -100,6 +100,22 @@ describe("#631 controller restarts never end a running slot", () => {
     }
   });
 
+  it("acknowledges a consumed live exit at its terminal sequence", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout"] });
+    try {
+      const { ws, child } = harness();
+      const exits: number[] = [];
+      child.on("exit", code => exits.push(code));
+      ws.deliver({ slot: child.slot, type: "data", data: "finished\n", seq: 1 });
+      ws.deliver({ slot: child.slot, type: "exit", code: 0, seq: 2 });
+      expect(exits).toEqual([0]);
+      vi.advanceTimersByTime(2_000);
+      expect(ws.cmds("ackOutput").map(cmd => cmd.payload)).toEqual([{ slot: child.slot, throughSeq: 2 }]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("allocates slot ids that a later controller cannot reuse", async () => {
     const before = Date.now();
     const { child } = harness();
@@ -282,6 +298,21 @@ describe("#444 the cursor is what survives a disconnect", () => {
     });
     await flush();
     expect(exits).toEqual([3]);
+    expect(ws.cmds("ackOutput").at(-1)?.payload).toEqual({ slot: child.slot, throughSeq: 2 });
+  });
+
+  it("acknowledges the exit consumed by a fresh controller's adoption", async () => {
+    const ws = new FakeWs();
+    const mux = makeMux({ id: "b1" });
+    mux.attach(ws as never);
+    const child = mux.adopt(621);
+    const exits: number[] = [];
+    child.on("exit", code => exits.push(code));
+    await flush();
+    ws.reply(ws.cmds("replayOutput").at(-1)!, { frames: [{ seq: 5, type: "exit", code: 0 }] });
+    await flush();
+    expect(exits).toEqual([0]);
+    expect(ws.cmds("ackOutput").at(-1)?.payload).toEqual({ slot: 621, throughSeq: 5 });
   });
 
   it("preserves a replayed remote signal and host OOM fact", async () => {

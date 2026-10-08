@@ -149,6 +149,11 @@ export interface SessiondListSlotsResult {
   supervisor?: { pid: number; entrypoint: string; releaseSha: string | null };
 }
 
+export interface SessiondListSlotsParams {
+  /** The controller reconciled these slots and no longer needs their output. */
+  retiredSlots?: number[];
+}
+
 export interface SessiondReplayOutputResult {
   slot: number;
   frames: SessiondOutputFrame[];

@@ -5,6 +5,7 @@ import {
   SESSIOND_PROTOCOL_VERSION,
   type SessiondEvent,
   type SessiondKillParams,
+  type SessiondListSlotsParams,
   type SessiondListSlotsResult,
   type SessiondMethod,
   type SessiondReplayOutputParams,
@@ -105,8 +106,8 @@ export class SessiondClient {
     return this.request("kill", params) as Promise<{ slot: number; signalled: boolean; alreadyDead: boolean }>;
   }
 
-  async listSlots(): Promise<SessiondListSlotsResult> {
-    return this.request("listSlots", {}) as Promise<SessiondListSlotsResult>;
+  async listSlots(params: SessiondListSlotsParams = {}): Promise<SessiondListSlotsResult> {
+    return this.request("listSlots", params) as Promise<SessiondListSlotsResult>;
   }
 
   async replayOutput(params: SessiondReplayOutputParams): Promise<SessiondReplayOutputResult> {

@@ -1242,6 +1242,7 @@ export class Orchestrator {
       // Prompted turns finalize after output; early settlements have no live finalizer.
       this.trackContinuation(Promise.resolve().then(async () => {
         const attempt = this.store.turnAttempts.get(id);
+        if (attempt) await this.refreshDispatchChoice(attempt.spec);
         if (attempt && !attempt.promptStarted) await this.renderPersistedTerminalAttemptCard(attempt);
       }).catch(err => this.logger.warn({ err, attempt: id }, "terminal status-card settlement failed")));
     });
@@ -7805,20 +7806,6 @@ export class Orchestrator {
       }
     }
 
-    // D6: announce the wake so the user understands why the bot speaks unprompted.
-    try {
-      const when = new Date(wake.createdUtc).toISOString();
-      const detail = wake.reason ? `— ${wake.reason}` : "";
-      await this.sendResultCard(
-        target,
-        `⏰ Waking up ${detail}`.trim(),
-        `Resuming a wake this thread scheduled for itself at ${when}.`,
-        WAKE_COLOR
-      );
-    } catch (err) {
-      this.logger.warn({ id: wake.id, err }, "wake: announce card failed");
-    }
-
     // D9 / #203: raw stored prompt on the spec; generated provenance is
     // structured context that dispatchInjectTurn folds into the one runtime
     // preamble. originPrompt is the card/excerpt text.
@@ -9561,6 +9548,41 @@ export class Orchestrator {
     return { output, stopReason };
   }
 
+  async observeQueuedDispatch(spec: DispatchSpec): Promise<void> {
+    await this.refreshDispatchChoice(spec);
+    const attempt = this.store.turnAttempts?.get(spec.id);
+    if (!attempt || attempt.state !== "pending" || attempt.statusCard
+      || this.config.SEAM_DISPATCH_STATUS_PANEL === false) return;
+    // These executors own different cards, outside the injected-turn path.
+    if (spec.kind === "compact" || spec.kind === "thread_voice"
+      || (spec.kind === "ingest" && spec.session !== "live")) return;
+    const target: ChannelRef = { platform: PLATFORM, id: spec.target };
+    const record = await this.bindThreadRecord(target, spec.cwd);
+    const preset = spec.preset ? this.store.getPresetByName(spec.preset) : null;
+    const isolated = spec.session === "isolated" || Boolean(preset || spec.agentId);
+    const described = this.router.describeConfig(record, isolated ? {
+      agent: preset?.agentId ?? spec.agentId ?? spec.preset,
+      location: spec.location,
+      model: preset?.model ?? spec.model,
+      effort: preset?.effort ?? spec.effort,
+    } : undefined);
+    const panel = await this.startDispatchStatusPanel(target, spec, {
+      model: described.model.value,
+      effort: described.effort.value ?? undefined,
+      cwd: isolated ? this.isolatedDispatchCwd({ spec, preset, record,
+        workerLocation: spec.location ?? described.location.value }) : this.effectiveCwd(record),
+      profile: this.router.getProfile(described.agent.value, described.location.value),
+      isolated,
+    }, undefined, undefined, true);
+    if (panel?.reference) this.store.turnAttempts.saveStatusCardState(attempt, panel.status.snapshot());
+  }
+
+  private async refreshDispatchChoice(spec: DispatchSpec): Promise<void> {
+    if (spec.kind !== "choice" || !spec.correlationId) return;
+    const card = this.store.getChoiceCard(spec.correlationId);
+    if (card) await this.refreshChoiceCard(card);
+  }
+
   async dispatchCanaryTurn(spec: DispatchSpec): Promise<DispatchInjectTurnResult> {
     try {
       return await this.dispatchInjectTurnWithEvidence(spec);
@@ -9951,6 +9973,7 @@ export class Orchestrator {
       this.store.turnAttempts?.registerOwner(this.attemptBoot);
       const attempt = this.store.turnAttempts?.claim(spec, identity, this.attemptBoot, "dispatch", operatorResume);
       unstartedClaim = attempt;
+      await this.refreshDispatchChoice(spec);
       let outcomeOwned = false;
       let submittedThisAttempt = false;
       const lifecycle: InjectTurnOptions["lifecycle"] = attempt ? {
@@ -11960,7 +11983,8 @@ export class Orchestrator {
     },
     queueFence?: ChannelQueueFence,
     /** Reuse a resumed attempt's card, replacing only an unavailable message. */
-    existingCard?: { channelId: string; messageId: string }
+    existingCard?: { channelId: string; messageId: string },
+    waiting = false
   ): Promise<DispatchStatusPanel<MessageRef> | undefined> {
     if (!this.queueFenceCurrent(queueFence)) return undefined;
     const statusAttempt = this.store.turnAttempts?.get(spec.id);
@@ -11979,7 +12003,7 @@ export class Orchestrator {
           resolved.model
         )?.context.effective ?? 0
       : 0;
-    const visuals = this.plugins.statusCards.decorate({ state: "Working", agentId: resolved.profile?.id ?? destRecord?.agentId ?? "",
+    const visuals = this.plugins.statusCards.decorate({ state: waiting ? "Waiting" : "Working", agentId: resolved.profile?.id ?? destRecord?.agentId ?? "",
       profileBrand: resolved.profile?.brand, model: resolved.model,
       style: destDescribed ? statusCardStyleForRender(destDescribed) : "full", gifOn: destDescribed ? simpleCardGifForRender(destDescribed) : false });
     const dispatchGifUrl = visuals.thumbnail;
@@ -11995,10 +12019,12 @@ export class Orchestrator {
       brandIconURL: visuals.icon,
       authorName: resolved.profile?.displayName ?? resolved.profile?.id,
     });
-    status.setState("Working");
+    const admitted = !waiting && status.state === "Waiting";
+    if (admitted) status.startedUtc = Date.now();
+    status.setState(waiting ? "Waiting" : "Working");
     status.style = visuals.style ?? "full";
     status.brandIconURL = visuals.icon;
-    status.setAction("Thinking…");
+    status.setAction(waiting ? "Waiting for this thread's queued turn" : admitted ? "Started" : "Thinking…");
     // Seed context (live only). Invalidate on model mismatch, exactly like the
     // user-turn seed.
     if (!resolved.isolated && resolved.cachedUsage) {
@@ -12084,6 +12110,10 @@ export class Orchestrator {
     );
     await panel.start();
     if (!panel.isLive) return undefined;
+    if (waiting) {
+      panel.stop();
+      return panel;
+    }
     const savedGifId = statusAttempt?.statusCardState?.gifMessageId;
     if (dispatchGifUrl || savedGifId) {
       const gifRef = savedGifId ? { channel: target, id: savedGifId } : await postSimpleCardGifMessage({
@@ -19657,10 +19687,14 @@ export class Orchestrator {
   ): Promise<void> {
     if (!card.messageId || !this.adapter.editChoiceCard) return;
     const parked = card.options.map(option => parkedTurnAction(option.payload)).find(Boolean);
-    const attempt = parked ? this.store.turnAttempts.get(parked.attemptId) : null;
+    const dispatchId = !parked && card.lastClickerId
+      ? this.store.getChoiceClickDelivery(card.id, card.lastClickerId) : null;
+    const attempt = parked ? this.store.turnAttempts.get(parked.attemptId)
+      : dispatchId ? this.store.turnAttempts.get(dispatchId) : null;
     const statusLabel = attempt?.state === "cancelled" ? "Cancelled"
       : attempt?.state === "completed" ? attempt.outcome?.status === "failed" ? "Failed" : "Completed"
-      : undefined;
+      : !parked && attempt?.state === "active" ? "Started"
+      : !parked && attempt ? "⏳ Waiting…" : undefined;
     try {
       await this.adapter.editChoiceCard(
         { channel: { platform: PLATFORM, id: card.channelRef }, id: card.messageId },

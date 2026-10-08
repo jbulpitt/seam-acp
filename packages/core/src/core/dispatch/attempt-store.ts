@@ -408,7 +408,7 @@ export class TurnAttemptStore {
       .get(a.id, a.generation, a.ownerBoot));
   }
 
-  /** Resume reuses the card unless its edit failed and the caller replaces that address. */
+  /** Admission and resume reuse the card unless its edit failed. */
   bindStatusCard(
     a: TurnAttempt,
     ref: { channelId: string; messageId: string },
@@ -440,7 +440,7 @@ export class TurnAttemptStore {
     }
     const n = this.db.prepare(`UPDATE turn_attempts
       SET status_card_channel=?, status_card_message=?
-      WHERE id=? AND generation=? AND owner_boot=? AND state='active'
+      WHERE id=? AND generation=? AND owner_boot=? AND state IN ('pending','active')
         AND status_card_channel IS NULL AND status_card_message IS NULL`)
       .run(ref.channelId, ref.messageId, a.id, a.generation, a.ownerBoot).changes;
     if (n !== 1) throw this.notCurrent(a, "status card");

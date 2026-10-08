@@ -66,6 +66,8 @@ export interface DispatchWatcherOpts {
    * reject ⇒ `status: "failed"` with the error message.
    */
   onDispatch: (spec: DispatchSpec, operatorResume?: boolean) => Promise<{ output: string; stopReason: string }>;
+  /** Publish pending visibility before either target FIFO admits the turn. */
+  onQueued?: (spec: DispatchSpec) => Promise<void>;
   /**
    * Observe a retained callback that no other actor will finish — i.e. a
    * `defect` refusal. Shutdown and superseded retentions never reach here:
@@ -139,6 +141,7 @@ export function createRuntimeDispatchWatcher(
   opts: Omit<DispatchWatcherOpts, "onDispatch" | "onRetained" | "beforeAdmission"> & {
     runtime: {
       dispatchInjectTurn(spec: DispatchSpec, operatorResume?: boolean): Promise<{ output: string; stopReason: string }>;
+      observeQueuedDispatch?(spec: DispatchSpec): Promise<void>;
       observeRetainedDispatch(spec: DispatchSpec, err?: DispatchSuspendedError): Promise<void>;
       recoverInterruptedTurns(): Promise<void>;
       reconcileRemoteRecoveries?(): Promise<void>;
@@ -149,6 +152,7 @@ export function createRuntimeDispatchWatcher(
   return new DispatchWatcher({
     ...watcherOpts,
     onDispatch: (spec, operatorResume) => operatorResume ? runtime.dispatchInjectTurn(spec, true) : runtime.dispatchInjectTurn(spec),
+    onQueued: spec => runtime.observeQueuedDispatch?.(spec) ?? Promise.resolve(),
     onRetained: (spec, err) => runtime.observeRetainedDispatch(spec, err),
     // #307: protects the production recovery barrier; deleting this wire lets
     // the runtime watcher admit pending work before interrupted turns requeue.
@@ -177,6 +181,7 @@ export class DispatchWatcher {
   private readonly dirs: ReturnType<typeof dispatchDirs>;
   private readonly logger: Logger;
   private readonly onDispatch: DispatchWatcherOpts["onDispatch"];
+  private readonly onQueued: DispatchWatcherOpts["onQueued"];
   private readonly onRetained?: DispatchWatcherOpts["onRetained"];
   private readonly pollMs: number;
   private readonly mayRecover: (id: string) => boolean;
@@ -248,6 +253,7 @@ export class DispatchWatcher {
     this.dirs = dispatchDirs(opts.dataDir);
     this.logger = opts.logger.child({ comp: "dispatch-watcher" });
     this.onDispatch = opts.onDispatch;
+    this.onQueued = opts.onQueued;
     this.reconcileRecovery = opts.reconcileRecovery;
     this.onRetained = opts.onRetained;
     this.pollMs = opts.pollMs ?? 1000;
@@ -971,8 +977,11 @@ export class DispatchWatcher {
       { id, target: spec.target, session: spec.session, correlationId: spec.correlationId },
       "dispatch: admitted"
     );
+    const queuedCard = this.onQueued?.(spec).catch(err =>
+      this.logger.warn({ err, id, target: spec.target }, "dispatch: waiting card failed"));
 
     const run = async () => {
+      await queuedCard;
       if (!this.owns(owner)) return;
       // Another queued callback may have completed this id since claim time.
       // Keep the winning SQL outcome instead of writing a replacement failure.

@@ -217,6 +217,7 @@ function fakeRemoteHub(opts: {
     rpcCalls,
     defaultCwdForLocation,
     hub: {
+      isBridgeReady: () => true,
       defaultCwdForLocation,
       markSessionBridge: vi.fn(),
       get: () => ({ mux }),
@@ -373,6 +374,7 @@ describe("stateless/preset handoff embed card", () => {
     };
     const marked: Array<{ sessionId: string; location: string }> = [];
     orch.setBridgeHub({
+      isBridgeReady: () => true,
       defaultCwdForLocation: () => "/Users/fixture/Projects",
       markSessionBridge: (sessionId: string, location: string) => {
         marked.push({ sessionId, location });
@@ -514,6 +516,7 @@ describe("stateless/preset handoff embed card", () => {
     hub.readyEvents = new EventEmitter();
     hub.connections = new Map([["legacy-mac", {
       host: { os: "darwin", arch: "arm64" },
+      agents: new Map([["claude", { installed: true, ready: true }]]),
       mux: remote.hub.get().mux,
     }]]);
     hub.config = {

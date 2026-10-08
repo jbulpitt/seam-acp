@@ -315,7 +315,7 @@ describe("one channel configuration resolution", () => {
       sendMessage: vi.fn(async () => ({ channel, id: "answer" })), resolveChannel: vi.fn(async ref => ({ ...ref, parentId: "111111111111111111" })) };
     const orch = new Orchestrator({ logger, config: h.config, store, router: h.router,
       modelCatalog: h.catalog, renderer: discordRenderer, adapter: adapter as any });
-    (orch as any).bridgeHub = { markSessionBridge: vi.fn(), get: () => ({ mux, host: h.host }), defaultCwdForLocation: () => dir, mcpServersForBridgeSpawn: () => undefined };
+    (orch as any).bridgeHub = { isBridgeReady: () => true, markSessionBridge: vi.fn(), get: () => ({ mux, host: h.host }), defaultCwdForLocation: () => dir, mcpServersForBridgeSpawn: () => undefined };
     await (orch as any).cardVisualsReady;
     const panel = vi.spyOn(orch as any, "startDispatchStatusPanel");
     const inject = vi.spyOn(orch, "injectTurn").mockImplementation(async (_row, _prompt, opts) => {

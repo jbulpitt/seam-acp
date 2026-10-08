@@ -173,6 +173,7 @@ async function seedInterrupted(spec: DispatchSpec = handoffSpec()): Promise<void
   const { orch } = makeOrch({ enabled: true });
   if (spec.location && spec.location !== "local") {
     orch.setBridgeHub({
+      isBridgeReady: () => true,
       defaultCwdForLocation: () => "/remote/workspace",
       markSessionBridge: () => {},
       get: () => ({ mux: {} }),

@@ -19362,11 +19362,36 @@ export class Orchestrator {
   }
 
   resolveIngestJob(sessionId: string): SessionRecord | undefined {
-    const job = this.ingestJobs.get(sessionId);
+    const dispatchId = sessionId.startsWith("dispatch:") ? sessionId.slice("dispatch:".length) : sessionId;
+    const job = this.ingestJobs.get(dispatchId);
     if (job) return job;
     if (!sessionId.startsWith("dispatch:")) return undefined;
-    const attempt = this.store.turnAttempts.get(sessionId.slice("dispatch:".length));
+    const attempt = this.store.turnAttempts.get(dispatchId);
     if (!attempt || (attempt.state !== "active" && attempt.state !== "suspended")) return undefined;
+    if (attempt.spec.kind === "ingest" && attempt.spec.session === "isolated") {
+      const spec = attempt.spec;
+      const endpoint = spec.correlationId ? this.store.getIngestEndpoint(spec.correlationId) : null;
+      const identity = parseExecutionIdentity(attempt.identity);
+      const model = identity?.model || spec.model;
+      const effort = identity?.effort || spec.effort;
+      // The child keeps its dispatch token through restart; restore its caller and result alias.
+      this.choiceResults?.bindSession(dispatchId, dispatchId);
+      return {
+        id: dispatchId,
+        platform: PLATFORM,
+        channelRef: isDiscordSnowflake(spec.target) ? spec.target : spec.correlationId ?? dispatchId,
+        parentRef: endpoint?.authoringParentRef ?? null,
+        agentId: identity?.agent || spec.agentId || this.config.DEFAULT_AGENT,
+        acpSessionId: attempt.acpSessionId ?? "",
+        repoPath: identity?.cwd || spec.cwd || this.config.REPOS_ROOT,
+        configJson: identity?.config || JSON.stringify({
+          ...(model ? { model } : {}),
+          ...(effort ? { reasoningEffort: effort } : {}),
+        }),
+        createdUtc: spec.createdUtc,
+        updatedUtc: attempt.updatedUtc,
+      };
+    }
     const record = this.store.getByChannel(PLATFORM, attempt.spec.target);
     return record ? { ...record, id: sessionId, acpSessionId: attempt.acpSessionId ?? "" } : undefined;
   }

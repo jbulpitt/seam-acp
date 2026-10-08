@@ -403,6 +403,7 @@ function makeQuiesceHost(over: Record<string, unknown> = {}) {
     // from an interactive card, which outlive their click handler by minutes.
     cardJobs: new Set<Promise<void>>(),
     channelQueues: new Map<string, Promise<void>>(),
+    attemptBoot: "shutdown-fixture-owner",
     dispatchWatcher: undefined,
     scheduledManager: undefined,
     ...over,
@@ -632,7 +633,7 @@ function makeLedger() {
     worker?: string | null;
     createdUtc?: string;
   }>();
-  return {
+  return testSessionStore({
     rows,
     getDelegation: (id: string) => rows.get(id) ?? null,
     isDispatchCompleted: (id: string) => {
@@ -670,7 +671,7 @@ function makeLedger() {
       rows.set(entry.id, row);
       return row;
     },
-  };
+  });
 }
 
 function makeReplayHost(ledger: ReturnType<typeof makeLedger>, over: Record<string, unknown> = {}) {
@@ -1920,11 +1921,13 @@ function makeClosableStore() {
   };
   return {
     violations,
+    turnAttempts: ledger.turnAttempts,
     get closed() {
       return closed;
     },
     close() {
       closed = true;
+      ledger.close();
     },
     scheduled,
     // Keep the real admission boundary and the existing post-close guard;
@@ -2389,7 +2392,11 @@ describe("#174 an ingest job stays registered through its durable tail", () => {
           turnsAtLedgerWrite = host.activeTurns;
         },
       }),
-      injectTurn: async () => ({ text: "scored" }),
+      injectTurn: async (options: any) => {
+        options.onSession("ingest-fixture-session");
+        options.lifecycle.beforePrompt();
+        return { text: "scored" };
+      },
       bridgeHub: localBridgeHub([{ id: "a", defaultModel: "default" } as any], "/tmp"),
     }) as unknown as ReturnType<typeof makeQuiesceHost> & {
       dispatchIngestEndpoint(s: Record<string, unknown>): Promise<{ output: string }>;
@@ -3475,8 +3482,7 @@ function makeChainStore() {
       promptPreview?: string;
     }
   >();
-  return {
-    ...ledger,
+  return Object.assign(ledger, {
     rows: ledger.rows,
     chains,
     getChain: (id: string) => chains.get(id) ?? null,
@@ -3529,7 +3535,7 @@ function makeChainStore() {
       if (nextHop) this.advanceChain(input.chainId);
       return { dispatchId, nextHop, originRef: chain.originRef, created: true };
     },
-  };
+  });
 }
 
 /** A replay host wired to the REAL chain machinery, not an `advanceChain` stub. */

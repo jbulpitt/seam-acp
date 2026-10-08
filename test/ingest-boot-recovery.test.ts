@@ -73,6 +73,39 @@ beforeEach(() => {
 afterEach(() => { watcher.stop(); store.close(); fs.rmSync(dir, { recursive: true, force: true }); });
 
 describe("ingest interrupted-dispatch recovery", () => {
+  it("opens boot admission while an isolated bridge owner is still finishing its turn", async () => {
+    const spec = ingestSpec();
+    const active = store.turnAttempts.claim(spec,
+      executionIdentity({ agent: "codex", location: "local", session: "isolated" }), "old-boot");
+    store.turnAttempts.bind(active, "recorded-acp");
+    store.turnAttempts.startPrompt(active);
+    store.turnAttempts.recordRemoteRecovery(active, { version: 1, location: "local", slot: 42,
+      submissionId: "original-submission", acpSessionId: "recorded-acp", delegatedUtc: spec.createdUtc });
+    store.turnAttempts.markStalled(spec.id, "controller restart");
+    orch.bridgeHub = { muxFor: vi.fn(() => ({})) };
+    orch.adoptingRemoteResults = new Set();
+    orch.pendingContinuations = new Set();
+    orch.handBackReauthRecovery = vi.fn(async () => false);
+    let finish!: (value: boolean) => void;
+    const terminal = new Promise<boolean>(resolve => { finish = resolve; });
+    orch.adoptRemoteRecoveryOwned = vi.fn(() => terminal);
+    let admitted = false;
+    const adoption = orch.adoptRemoteRecovery(store.turnAttempts.get(spec.id)).then(() => { admitted = true; });
+    try {
+      await new Promise(resolve => setImmediate(resolve));
+      expect(orch.adoptRemoteRecoveryOwned).toHaveBeenCalledTimes(1);
+      expect(admitted).toBe(true);
+      expect(orch.adoptingRemoteResults.has(spec.id)).toBe(true);
+      expect(orch.pendingContinuationCount).toBe(1);
+    } finally {
+      finish(true);
+      await adoption;
+      await new Promise(resolve => setImmediate(resolve));
+    }
+    expect(orch.adoptingRemoteResults.has(spec.id)).toBe(false);
+    expect(orch.pendingContinuationCount).toBe(0);
+  });
+
   it.each(["local", "remote"])("binds an isolated %s holder before prompting, then adopts it instead of loading a second writer", async location => {
     const spec = { ...ingestSpec(), location };
     const attempt = store.turnAttempts.claim(spec,

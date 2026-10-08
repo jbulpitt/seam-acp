@@ -40,7 +40,7 @@ recomputes that permission. A retained error is deferred for the remainder of
 the boot, preventing a hot retry loop; shutdown and superseded remain silent,
 while a defect retains its specific reason and operator workflow.
 
-Stall evidence is not itself a refusal to continue (#355). Boot and operator
+Stall evidence is not itself a refusal to continue. Boot and operator
 dispatch continuation share admission checks. A stalled, prompted attempt with
 a recorded ACP session proceeds automatically through the normal execution
 identity, ownership, and strict session/load checks, without a confirmation
@@ -54,6 +54,39 @@ Only successful fenced reclaim clears `stalledUtc` and its reason/notice fields,
 atomically with the new generation. Merely considering recovery does not erase
 diagnostic evidence. A changed refusal updates the reason and permits a fresh
 notice; repeating the same refusal does not repeatedly notify.
+
+## Queue admission and continuation
+
+Live-thread work is FIFO by actual arrival. Choice clicks, wakes and handoffs
+show Waiting until admitted, then Working and Done on the same status message
+when successful. Recording pending work does not mean its turn has started.
+
+When an adopted turn loses its owner, continuation uses the admission already
+held by that turn. The interrupted admission is recovered before any queued
+successor; it does not rejoin the back of the queue. Completion, cancellation
+or a failed continuation releases the fence.
+
+## Recovering an owned turn
+
+A child that dies during an active owned turn is a recovery event. Seam
+retires the old agent tree before starting a replacement, loads the recorded
+ACP session and sends `continue`, without replaying the original brief.
+This also applies to a `steer now` turn after its explicit preemption.
+The thread sees **🔌 Reconnected to session** and resumed output; child death
+alone does not produce a Failed card.
+
+An adopted owner whose outcome remains unknown stays retained. The existing
+progress watchdog checks for a real terminal result, otherwise posts the
+cause with Resume/Cancel actions. Silence is never completion.
+
+Discord delivery after adoption is separate from provider execution. A
+transient rejection leaves the receipt pending for the existing delivery
+retry path; it never reruns provider work. Permanent rejections, such as
+Missing Access or Unknown Channel, record the real cause and stop retrying.
+
+An output-log gap posts a notice in the owning thread naming the bridge and
+slot, requested cursor, first available frame and dropped-frame count.
+Surviving output continues; unavailable frames cannot be replayed.
 
 ## Disagreement and loss
 

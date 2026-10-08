@@ -102,6 +102,13 @@ Use this as a map, not as a substitute for each tool's live schema.
 - Mid-turn course correction: `steer`.
 - Ordered multi-worker pipeline: `chain`.
 
+Choice clicks, wakes and handoffs queued for a live thread follow its FIFO
+in actual arrival order. Their status card shows **Waiting** until admission,
+then **Working** and, on successful completion, **Done** on the same message.
+A selected choice card shows **Waiting → Started → Completed**. A lost-owner
+continuation keeps its existing admission ahead of queued successors; see
+[Dispatch recovery authority](dispatch-recovery-authority.md).
+
 ### Operate paired hosts
 
 Channels explicitly enabled by an administrator also expose `host_exec`,

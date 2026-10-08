@@ -14,6 +14,12 @@ right command on the wrong host.
 - **sessiond:** one per bridge host. It owns the agent processes and keeps
   them alive through controller and bridge restarts.
 
+Redeploys, bridge restarts, reconnects, reconciliation and network loss detach
+and reattach running work; they never cancel it or kill its owned agent.
+If that child dies, Seam reloads the same ACP session and continues the turn.
+[Dispatch recovery authority](dispatch-recovery-authority.md) covers recovery
+and the notices the thread sees.
+
 ## Host inventory
 
 Every execution host, including `local`, advertises its adapters in the
@@ -42,9 +48,8 @@ the controller. Running turns stay with sessiond and reattach. Messages sent
 while the controller is down are caught up from Discord on startup.
 
 In any other checkout, `npm run redeploy` writes a sentinel that no controller
-reads, so nothing restarts. Never restart the controller directly with
-`systemctl restart` or `pm2 restart`: that kills running turns, including the
-one that ran the command.
+reads, so nothing restarts. Use the sentinel path rather than a direct
+`systemctl restart` or `pm2 restart`, which bypasses the bounded quiesce.
 
 ## Bridges and sessiond
 
@@ -79,7 +84,7 @@ durable authentication button then loads the recorded session and continues.
 A second, independent deployment with its own bot, guild, checkout, `data/`
 and units. You deploy a branch there, test it for real, and only then merge.
 It's shared, so say so before taking it over, and put it back on `main` when
-done. Restarting staging's units directly is fine.
+done. Use the same controller redeploy path there.
 [`test-deployment.md`](test-deployment.md) covers setup and the test tools.
 
 ## The change loop

@@ -146,8 +146,8 @@ sessiond and staging work in general is in `docs/agent-guides/deploying.md`.
 The checked-in units and recovery procedure live in `ops/systemd/README.md`.
 
 **Never run `systemctl restart seam-acp` or `pm2 restart seam-acp` directly.**
-A direct supervisor restart kills the process immediately — including the agent
-session running the command — so your reply will never be delivered to Discord.
+A direct supervisor restart bypasses the controller's bounded shutdown quiesce.
+Use the sentinel path so running turns detach and reattach through sessiond.
 
 **Always use:**
 

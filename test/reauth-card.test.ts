@@ -1,3 +1,4 @@
+import { testSessionRouter } from "./helpers/session-fixture.js";
 /**
  * #450 — the re-auth card calls acceptReauthWait. It is a choice card, not an
  * elicitation row, and the click does not enqueue a new prompt.
@@ -142,12 +143,12 @@ describe("reauth card click", () => {
         async sendChoiceCard() { return { channel: { platform: "discord", id: "thread-1" }, id: "card-msg", jumpUrl: "https://discord.com/channels/g/thread-1/card-msg" }; },
       } as never,
       modelCatalog: fixtureModelCatalog([{ id: "claude", defaultModel: "default" } as never]),
-      router: {
+      router: testSessionRouter({
         ensureSessionRecord: () => record,
         describeConfig: () => ({ agent: { value: "claude" }, model: { value: "m" }, effort: { value: "" }, cwd: { value: "/repo" }, location: { value: "local" } }),
         getProfile: () => ({ id: "claude" }),
         resolveProfileForChannel: () => ({ id: "claude" }),
-      } as never,
+      }) as never,
       store,
       renderer: { statusPanel: () => ({ title: "", fields: [] }), panel: () => ({ title: "", fields: [] }) } as never,
     });

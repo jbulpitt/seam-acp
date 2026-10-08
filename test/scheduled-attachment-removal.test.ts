@@ -1,3 +1,4 @@
+import { testSessionRouter, testSessionStore } from "./helpers/session-fixture.js";
 import { scheduleUiFixture } from "./plugin-schedule-fixture.js";
 import { namingCommands } from "./plugin-naming-fixture.js";
 /**
@@ -197,7 +198,7 @@ describe("#158 scheduler arming boundary", () => {
   function makeStore(rows: ScheduledPrompt[]) {
     const byId = new Map(rows.map((r) => [r.id, { ...r }]));
     const upserts: ScheduledPrompt[] = [];
-    const store = {
+    const store = testSessionStore({
       scheduledOccurrences: scheduledAdmissionFixture(),
       getScheduled: (id: string) => {
         const r = byId.get(id);
@@ -208,7 +209,7 @@ describe("#158 scheduler arming boundary", () => {
         byId.set(s.id, { ...s });
       },
       listScheduledEnabled: () => [...byId.values()].filter((r) => r.enabled).map((r) => ({ ...r })),
-    } as unknown as SessionStore;
+    }) as unknown as SessionStore;
     return { store, upserts, byId };
   }
 
@@ -468,7 +469,7 @@ async function renderBuilderCard(existing?: ScheduledPrompt): Promise<RenderedCa
   const self = {
     channelRefFromInteraction: () => ({ platform: "discord", id: "thread-1", parentId: "chan-1" }),
     config: { REPOS_ROOT: "/repo" },
-    router: {
+    router: testSessionRouter({
       ensureSessionRecord: () => ({ id: "discord:thread-1", agentId: "claude", repoPath: "/repo" }),
       describeConfig: () => ({
         agent: { value: "claude", source: "session config" },
@@ -479,8 +480,8 @@ async function renderBuilderCard(existing?: ScheduledPrompt): Promise<RenderedCa
       }),
       getProfile: (id: string) =>
         id === "claude" ? { id: "claude", defaultModel: "default", staticModels: [] } : undefined,
-    },
-    store: { readConfig: () => ({ model: null }), get: () => null },
+    }),
+    store: testSessionStore({ readConfig: () => ({ model: null }), get: () => null }),
     modelCatalog: fixtureModelCatalog([{ id: "claude", defaultModel: "default" } as any]),
     logger: silent,
     // #159: the builder's first response goes through `respondInitial` so it
@@ -538,7 +539,7 @@ describe("#158 file-free dispatch", () => {
     const self = {
       adapter: { getThreadLiveState: async () => ({ locked: false, archived: false }) },
       logger: silent,
-      store: { getScheduled: () => row },
+      store: testSessionStore({ getScheduled: () => row }),
       channelGenerations: new Map<string, number>(),
       queueOnChannel: async (_c: string, fn: () => Promise<void>) => fn(),
       handleIncomingMessageInner: async (m: Record<string, unknown>) => {

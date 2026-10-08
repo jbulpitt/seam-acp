@@ -1,3 +1,4 @@
+import { testSessionRouter } from "./helpers/session-fixture.js";
 /**
  * #437 — a finished turn says Done. A tool title is not pending work.
  * Output that actually arrives after finalization is what unlocks Working,
@@ -60,7 +61,7 @@ function setup() {
     idle: async () => {},
     cancel: async () => {},
   };
-  const router = {
+  const router = testSessionRouter({
     listProfiles: () => [],
     describeConfig: () => ({
       agent: { value: "codex" }, model: { value: "test" },
@@ -70,7 +71,7 @@ function setup() {
     ensureSessionRecord: () => ({ ...record }),
     getProfile: () => undefined,
     getOrStartRuntime: vi.fn(async () => runtime),
-  };
+  });
   type Panel = { title?: string; author?: string; fields?: { name: string; value: string }[] };
   const panels: Panel[] = [];
   const writes: Array<{ kind: "send" | "edit"; id: string; panel: Panel }> = [];

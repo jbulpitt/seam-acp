@@ -1,3 +1,4 @@
+import { testSessionStore } from "./helpers/session-fixture.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -97,7 +98,7 @@ describe("model hiding", () => {
     for (const pattern of starting) list.change("hide", pattern);
     const autocomplete = new AutocompleteRegistry();
     const self = Object.create(Orchestrator.prototype);
-    Object.assign(self, { modelCatalog: service, autocomplete, config: {}, store: { get: () => null } });
+    Object.assign(self, { modelCatalog: service, autocomplete, config: {}, store: testSessionStore({ get: () => null }) });
     self.wireSlashAutocomplete();
     const responder = autocomplete.get("config", "set", "model")!;
     const choices = await responder({ group: "config", subcommand: "set", optionName: "model", focusedValue: "", channelId: "123", agentId: "copilot", optionValues: { agent: "copilot" } });

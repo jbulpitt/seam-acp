@@ -1,3 +1,4 @@
+import { testSessionRouter } from "./helpers/session-fixture.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -96,13 +97,13 @@ beforeEach(async () => {
     editMessage: async () => {},
     getThreadLiveState: async () => ({ locked: false, archived: false }),
   };
-  const router = {
+  const router = testSessionRouter({
     listProfiles: () => [], getProfile: () => undefined, reuseMcpServers: () => [],
     ensureSessionRecord: ({ channelRef }: { channelRef: string }) => store.getByChannel("discord", channelRef)!,
     describeConfig: (row: SessionRecord) => ({ agent: { value: row.agentId }, model: { value: "default" },
       location: { value: "local" }, cwd: { value: dataDir }, effort: { value: null } }),
     getOrStartRuntime: async () => runtime,
-  };
+  });
   const config = { DATA_DIR: dataDir, REPOS_ROOT: dataDir, TURN_TIMEOUT_SECONDS: 60,
     DEFAULT_MODEL: "default", DISCORD_ALLOWED_USER_IDS: new Set(["user"]),
     SEAM_DISPATCH_STATUS_PANEL: true, SEAM_DISPATCH_OUTPUT_STYLE: "messages", REPO_EMOJIS: new Map(),

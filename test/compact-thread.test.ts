@@ -1,3 +1,4 @@
+import { testSessionRouter, testSessionStore } from "./helpers/session-fixture.js";
 import { describe, it, expect, afterEach } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
@@ -63,7 +64,7 @@ function makeOrch(over?: {
       ? over.profile
       : { id: "claude", displayName: "Claude", sessionManager: { name: "fake-manager" } };
 
-  const router = {
+  const router = testSessionRouter({
     listProfiles: () => [],
     describeConfig: (r: SessionRecord) => ({
       agent: { value: r.agentId, source: "session config" },
@@ -76,12 +77,12 @@ function makeOrch(over?: {
     invalidate: async (id: string, opts: unknown) => {
       invalidated.push({ id, opts });
     },
-  };
+  });
   // A real-ish binding cell, so the compare-and-swap is genuinely exercised
   // rather than asserted against a recorder that always says yes.
   const stored = over?.stored === undefined ? record() : over.stored;
   const bound = { value: stored?.acpSessionId ?? "" };
-  const store = {
+  const store = testSessionStore({
     readConfig: () => over?.cfg ?? { model: "opus", reasoningEffort: "high" },
     get: (_id: string) => (stored ? { ...stored, acpSessionId: bound.value } : null),
     compareAndSwapAcpSession: (id: string, expected: string, next: string) => {
@@ -100,7 +101,7 @@ function makeOrch(over?: {
     },
     recordDelegation: () => {},
     updateDelegationStatus: () => {},
-  };
+  });
   const config = {
     DATA_DIR: "/tmp/none",
     REPOS_ROOT: "/repo",
@@ -436,17 +437,17 @@ describe("Orchestrator.dispatchInjectTurn — compact branch", () => {
     const { adapter, calls } = spyAdapter();
     const ledger: any[] = [];
     const statuses: string[] = [];
-    const router = {
+    const router = testSessionRouter({
       listProfiles: () => [],
       describeConfig: () => ({}),
       ensureSessionRecord: ({ channelRef }: { channelRef: string }) =>
         record({ id: `discord:${channelRef}`, channelRef }),
-    };
-    const store = {
+    });
+    const store = testSessionStore({
       getByChannel: () => null,
       recordDelegation: (e: any) => ledger.push(e),
       updateDelegationStatus: (_id: string, s: string) => statuses.push(s),
-    };
+    });
     const config = {
       DATA_DIR: "/tmp/none",
       REPOS_ROOT: "/repo",

@@ -1,3 +1,4 @@
+import { testSessionRouter } from "./helpers/session-fixture.js";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -82,13 +83,13 @@ function setup(mode: "held-status" | "failed-status" | "held-file" | "fast" = "f
   store.claimInbound("1", 0, now);
   const messages: string[] = [];
   const edits: Array<{ id: string; panel: StructuredPanel }> = [];
-  const router = {
+  const router = testSessionRouter({
     listProfiles: () => [profile], ensureSessionRecord: () => record, getProfile: () => profile,
     getRuntime: () => runtime, getOrStartRuntime: async () => runtime, isBusy: () => runtime.busy,
     abortTurn: vi.fn(async () => "idle"), invalidate: vi.fn(async () => {}),
     describeConfig: () => ({ agent: { value: "claude" }, location: { value: "local" },
       model: { value: "fixture-model" }, effort: { value: null }, cwd: { value: dir }, fastMode: { value: false } }),
-  };
+  });
   const adapter = {
     sendPanel: vi.fn(async (channel: IncomingMessage["channel"]) => ({ channel, id: "card" })),
     editPanel: vi.fn(async (ref: { id: string }, panel: StructuredPanel) => {

@@ -1,3 +1,4 @@
+import { testSessionRouter, testSessionStore } from "./helpers/session-fixture.js";
 import { EventEmitter } from "node:events";
 import { PassThrough, Readable, Writable } from "node:stream";
 import { agent, methods, ndJsonStream, PROTOCOL_VERSION, type ClientCapabilities, type SessionUpdate, type PromptResponse } from "@agentclientprotocol/sdk";
@@ -70,15 +71,15 @@ function injectedTurn(rt: AgentRuntime, logger: Logger, onEvent: (event: AgentEv
     agentId: "test", acpSessionId: "wire-session", repoPath: "/tmp", configJson: "{}", createdUtc: now, updatedUtc: now };
   const orch = Object.create(Orchestrator.prototype) as Orchestrator;
   Object.assign(orch, { logger, config: { REPOS_ROOT: "/tmp" },
-    store: { turnAttempts: { get: () => undefined } },
+    store: testSessionStore({ turnAttempts: { get: () => undefined } }),
     plugins: new PluginHost(logger),
-    router: { getOrStartRuntime: async () => rt, describeConfig: () => ({
+    router: testSessionRouter({ getOrStartRuntime: async () => rt, describeConfig: () => ({
       agent: { value: record.agentId, source: "session config" },
       model: { value: "default", source: "default" },
       effort: { value: null, source: "default" },
       cwd: { value: "/tmp", source: "default" },
       location: { value: "local", source: "default" },
-    }) },
+    }) }),
     adapter: { sendMessage: async (_channel: unknown, text: string) => { messages.push(text); } },
     ensureOwnSession: async () => {}, contextBudgetIdentity: () => undefined,
   });

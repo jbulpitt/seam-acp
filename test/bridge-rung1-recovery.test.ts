@@ -20,7 +20,7 @@ function line(value: unknown): string {
   return `${JSON.stringify(value)}\n`;
 }
 
-function harness(opts: { connected?: boolean; kind?: AdapterErrorKind; policy?: RemoteRung1Policy; codex?: boolean; clock?: () => number } = {}) {
+function harness(opts: { kind?: AdapterErrorKind; policy?: RemoteRung1Policy; codex?: boolean; clock?: () => number } = {}) {
   const writes: string[] = [];
   const snapshots: RemoteRecoverySnapshot[] = [];
   const results: RemoteRecoveryResult[] = [];
@@ -33,7 +33,6 @@ function harness(opts: { connected?: boolean; kind?: AdapterErrorKind; policy?: 
     publishSnapshot: (_slot, value) => snapshots.push(value),
     publishResult: (_slot, value) => results.push(value),
     publishOutput: (_slot, value) => output.push(value),
-    controllerConnected: () => opts.connected ?? false,
     now: opts.clock ?? (() => Date.parse("2026-09-22T12:00:00.000Z")),
   });
   return { recovery, writes, snapshots, results, output };
@@ -336,8 +335,8 @@ describe("#467 bridge-owned rung 1", () => {
     expect(h.recovery.snapshot(6)).toMatchObject({ phase: "armed" });
   });
 
-  it("refuses app-owned requests while disconnected instead of becoming a permission proxy", () => {
-    const h = harness({ connected: false });
+  it("forwards app-owned requests for retained delivery without changing provider recovery", () => {
+    const h = harness();
     h.recovery.arm(1, { submissionId: "submission-app", acpSessionId: "session-app",
       continuation: "continue" });
     h.recovery.observeInput(1, line({ id: 9, method: "session/prompt",
@@ -345,8 +344,7 @@ describe("#467 bridge-owned rung 1", () => {
     const request = line({ id: 81, method: "session/request_permission", params: {} });
     expect(h.recovery.observeOutput(1, request)).toEqual({ forward: request });
     expect(h.recovery.snapshot(1)).toMatchObject({
-      phase: "awaiting_app",
-      terminalReason: "client_request_requires_app",
+      phase: "executing",
       disposition: "none",
     });
     expect(h.writes).toEqual([]);

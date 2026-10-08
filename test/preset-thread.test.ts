@@ -1,3 +1,4 @@
+import { testSessionRouter } from "./helpers/session-fixture.js";
 import { acknowledgedHandler } from "./acknowledged-handler-fixture.js";
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import fs from "node:fs";
@@ -200,7 +201,7 @@ function makeOrch(over?: {
     store, logger: silent, profiles: testProfiles, modelCatalog, defaultAgentId: "copilot",
     defaultModel: "default-model", defaultCwd: "/repo", channelPresets, threadPresets,
   });
-  const router = {
+  const router = testSessionRouter({
     listProfiles: () => testProfiles,
     describeConfig: resolution.describeConfig.bind(resolution),
     ensureSessionRecord: (opts: {
@@ -216,7 +217,7 @@ function makeOrch(over?: {
       return testProfiles.find((profile) => profile.id === id);
     },
     invalidate: vi.fn(async () => {}),
-  };
+  });
   let createdSeq = 0;
   const createThread =
     over?.createThread ??

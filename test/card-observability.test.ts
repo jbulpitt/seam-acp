@@ -1,3 +1,4 @@
+import { testSessionRouter, testSessionStore } from "./helpers/session-fixture.js";
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
@@ -401,7 +402,7 @@ function makeOrch(opts: {
   ledger?: Array<{ promptPreview?: string; kind?: string }>;
   statusPanel?: boolean;
 }): Orchestrator {
-  const router = {
+  const router = testSessionRouter({
     listProfiles: () => [],
     describeConfig: (r: SessionRecord) => ({
       agent: { value: r.agentId, source: "session config" },
@@ -419,8 +420,8 @@ function makeOrch(opts: {
     getProfile: () => undefined,
     getOrStartRuntime: async () => fakeRuntime(opts.capturedPrompts),
     abortTurn: async () => "cancelled",
-  };
-  const store = {
+  });
+  const store = testSessionStore({
     admitTriggeredDispatch: (spec: DispatchSpec, consume: () => void) => { consume(); return spec; },
     deleteWake: () => {},
     deleteWatch: () => {},
@@ -443,7 +444,7 @@ function makeOrch(opts: {
     upsertParked: (row: unknown) => opts.parked?.rows.push(row),
     getChain: () =>
       opts.chainPrompt ? { promptPreview: opts.chainPrompt, status: "running" } : null,
-  };
+  });
   const config = {
     DATA_DIR: opts.dataDir,
     REPOS_ROOT: "/repo",

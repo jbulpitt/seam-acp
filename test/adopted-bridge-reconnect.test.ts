@@ -1,3 +1,4 @@
+import { testSessionRouter } from "./helpers/session-fixture.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { EventEmitter } from "node:events";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -158,7 +159,7 @@ async function setup(source: "inbound" | "dispatch" | "schedule" = "inbound", st
   socket.deliver({ type: "hello", instanceId: "first", capabilities: { durableSlots: true } });
   let runtime!: AgentRuntime;
   let adoptionUnavailable = options.adoptionUnavailable ?? false;
-  const router = {
+  const router = testSessionRouter({
     isBusy: () => runtime?.busy ?? false,
     getRuntime: () => runtime,
     describeConfig: () => ({ model: { value: "test" }, agent: { value: "codex" },
@@ -173,7 +174,7 @@ async function setup(source: "inbound" | "dispatch" | "schedule" = "inbound", st
       return runtime;
     },
     releaseRecoveryRuntime: (_id: string, rt: AgentRuntime) => rt.releaseRecovery(),
-  };
+  });
   const visible: string[] = options.stream?.texts.slice(0, options.stream.visible ?? options.stream.delivered) ?? [];
   const nonces = new Set(visible.map((_, index) => deliveryChunkNonce(deliveryNonce(attempt.id), index)));
   const adapter = {

@@ -1,3 +1,4 @@
+import { testSessionRouter } from "./helpers/session-fixture.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -32,7 +33,7 @@ function setup(style = "messages", fences?: FenceRegistry) {
   const orch = new Orchestrator({ logger: pino({ level: "silent" }) as any, store,
     config: { DATA_DIR: dir, REPOS_ROOT: "/repo", SEAM_DISPATCH_OUTPUT_STYLE: style,
       SEAM_PARTICIPANT_USER_IDS: [], SEAM_CONFIG_ADMIN_USER_IDS: [] } as any,
-    router: {} as any, adapter: adapter as any, renderer: {} as any, fences });
+    router: testSessionRouter({}) as any, adapter: adapter as any, renderer: {} as any, fences });
   const channel = { platform: "discord", id: "thread" };
   const spec = { id: "dispatch", target: "thread", session: "live", kind: "forward", originThreadRef: "caller", prompt: "work", createdUtc: now };
   return { orch: orch as any, adapter, visible, channel, spec, store };

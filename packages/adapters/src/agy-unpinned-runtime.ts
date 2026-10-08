@@ -19,7 +19,6 @@ export interface AgyUnpinnedRuntimeOptions {
   credentialScope: string;
   cwd: string;
   baseEnv?: NodeJS.ProcessEnv;
-  approvedEnvironment?: Readonly<Record<string, string>>;
 }
 
 /**
@@ -38,7 +37,6 @@ export class AgyUnpinnedRuntime implements AgyLaunchRuntime {
   readonly identityKey: string;
   readonly credentialScope: string;
   private readonly baseEnv: NodeJS.ProcessEnv;
-  private readonly approvedEnvironment: Readonly<Record<string, string>>;
   private readonly labelVersion: string;
 
   constructor(options: AgyUnpinnedRuntimeOptions) {
@@ -48,8 +46,7 @@ export class AgyUnpinnedRuntime implements AgyLaunchRuntime {
     }
     this.credentialScope = scope;
     this.baseEnv = { ...(options.baseEnv ?? process.env) };
-    this.approvedEnvironment = { ...(options.approvedEnvironment ?? {}) };
-    const env = buildApprovedEnvironment(this.baseEnv, this.approvedEnvironment);
+    const env = buildApprovedEnvironment(this.baseEnv);
     const executable = resolveOrdinaryAgyExecutable(this.baseEnv);
     this.labelVersion = probeOrdinaryAgyVersion(executable, options.cwd, env);
     const environmentFingerprint = createHash("sha256").update(JSON.stringify(
@@ -91,7 +88,7 @@ export class AgyUnpinnedRuntime implements AgyLaunchRuntime {
     if (!Array.isArray(options.stdio) || options.stdio.length !== 3) {
       throw new Error("native AGY launch requires exactly three stdio entries");
     }
-    const env = buildApprovedEnvironment(this.baseEnv, this.approvedEnvironment);
+    const env = buildApprovedEnvironment(this.baseEnv);
     if (options.mcpHome) applyMcpHome(env, options.mcpHome);
     // Resolve again. A self-update between turns is the binary this child
     // runs. Do not snapshot it and do not pass a retained descriptor.

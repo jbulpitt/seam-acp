@@ -1,3 +1,4 @@
+import { testSessionRouter } from "./helpers/session-fixture.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -55,11 +56,11 @@ describe("#441 real orchestrator consumer with fake ACP", () => {
       modelCatalog: fixtureModelCatalog([profile]),
       config: { DATA_DIR: dir, REPOS_ROOT: dir, TURN_TIMEOUT_SECONDS: 60, REPO_EMOJIS: new Map(),
         DEFAULT_MODEL: "fixture-model", channelPresets: new Map(), threadPresets: new Map() } as never,
-      router: { listProfiles: () => [profile], ensureSessionRecord: () => record, getProfile: () => profile,
+      router: testSessionRouter({ listProfiles: () => [profile], ensureSessionRecord: () => record, getProfile: () => profile,
         assertAgentAllowedForRecord() {}, getOrStartRuntime: async () => runtime,
         describeConfig: () => ({ agent: { value: "claude" }, location: { value: "local" },
           model: { value: "fixture-model" }, effort: { value: null }, cwd: { value: dir }, fastMode: { value: false } }),
-      } as never,
+      }) as never,
       adapter: {
         async sendPanel(channel: unknown, panel: unknown) { panels.push(panel); return { channel, id: "panel" }; },
         async editPanel(_ref: unknown, panel: unknown) { panels.push(panel); },

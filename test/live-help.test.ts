@@ -1,3 +1,4 @@
+import { testSessionRouter } from "./helpers/session-fixture.js";
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
@@ -152,7 +153,7 @@ describe("live-help mint spec + self-service authorization", () => {
           threadPresets: new Map(),
         } as any,
         adapter: {} as any,
-        router: { listProfiles: () => [], describeConfig: () => ({}) } as any,
+        router: testSessionRouter({ listProfiles: () => [], describeConfig: () => ({}) }) as any,
         store,
         renderer: {} as any,
       });

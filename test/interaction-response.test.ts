@@ -1,3 +1,4 @@
+import { testSessionStore } from "./helpers/session-fixture.js";
 import { describe, expect, expectTypeOf, it, vi } from "vitest";
 import { pino } from "pino";
 import { MessageFlags } from "discord.js";
@@ -86,7 +87,7 @@ describe("central slash acknowledgement", () => {
     });
     const orchestrator = Object.assign(Object.create(Orchestrator.prototype), {
       config: {}, plugins: { slash: new SlashRegistry(logger) },
-      store: { getByChannel: () => ({ acpSessionId: binding }) },
+      store: testSessionStore({ getByChannel: () => ({ acpSessionId: binding }) }),
       channelRefFromInteraction: () => ({ platform: "discord", id: "thread" }),
       runInbound: async (_kind: string, run: () => Promise<void>) => run(),
       loadPlugins: async () => {}, slashAccessRefusal: () => undefined,

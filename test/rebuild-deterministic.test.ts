@@ -1,3 +1,4 @@
+import { testSessionRouter, testSessionStore } from "./helpers/session-fixture.js";
 import { describe, expect, it, vi } from "vitest";
 import { pino } from "pino";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
@@ -131,7 +132,7 @@ function makeOrch(over?: {
         panels.push(panel as { title?: string; description?: string; footer?: string; fields: unknown[] });
       },
     } as any,
-    router: {
+    router: testSessionRouter({
       permissionOptions: () => ({}),
       listProfiles: () => Object.values(profiles),
       describeConfig: (session: SessionRecord) => {
@@ -150,9 +151,9 @@ function makeOrch(over?: {
       },
       getProfile: (id: string) => profiles[id],
       invalidate: async () => {},
-    } as any,
+    }) as any,
     modelCatalog,
-    store: {
+    store: testSessionStore({
       readConfig: () => over?.cfg ?? { model: "claude-opus-4.8", reasoningEffort: "high" },
       get: () => ({ ...rec, acpSessionId: bound.value }),
       compareAndSwapAcpSession: (_id: string, expected: string, next: string) => {
@@ -163,7 +164,7 @@ function makeOrch(over?: {
       },
       upsert: () => {},
       writeConfig: () => "{}",
-    } as any,
+    }) as any,
     renderer: {} as any,
   });
   (orch as any).injectTurn = async (...args: unknown[]) => {

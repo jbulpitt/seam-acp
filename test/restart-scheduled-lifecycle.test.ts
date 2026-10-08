@@ -1,3 +1,4 @@
+import { testSessionRouter } from "./helpers/session-fixture.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { simulateRetiredOwnerProcess } from "./restart-process-fixture.js";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -51,7 +52,7 @@ function setup(mode: "live" | "isolated" = "isolated", agentId = "codex") {
     lastRunUtc: null, lastStatus: null, nextRunUtc: null, pinnedSessionId: null };
   store.upsertScheduled(row);
   const profile = { id: agentId, defaultModel: "test", displayName: agentId, sessionManager: { deleteSession: transport.delete } } as any;
-  const router = { permissionOptions: () => ({}), ensureSessionRecord: () => ({ ...record }), listProfiles: () => [profile], getProfile: () => profile,
+  const router = testSessionRouter({ permissionOptions: () => ({}), ensureSessionRecord: () => ({ ...record }), listProfiles: () => [profile], getProfile: () => profile,
     resolveProfileForChannel: () => profile,
     assertAgentAllowedForChannel: () => {},
     assertAgentAllowedForRecord: () => {},
@@ -63,7 +64,7 @@ function setup(mode: "live" | "isolated" = "isolated", agentId = "codex") {
       prompt: (text: string) => transport.prompt(text),
     })),
     reuseMcpServers: () => [], describeConfig: () => ({ agent: { value: agentId }, model: { value: "test" },
-      cwd: { value: "/synthetic" }, effort: { value: null }, location: { value: "local" }, fastMode: { value: false } }) };
+      cwd: { value: "/synthetic" }, effort: { value: null }, location: { value: "local" }, fastMode: { value: false } }) });
   const adapter = { sendPanel: vi.fn(async (channel: any, _panel?: unknown, _delivery?: unknown) => ({ channel, id: "panel" })),
     sendMessage: vi.fn(async (channel: any, _text: string, _delivery?: unknown) => ({ channel, id: "message" })),
     findMessageByNonce: vi.fn(async (): Promise<DeliveryNonceLookup> => ({ status: "absent" })),

@@ -1,3 +1,4 @@
+import { testSessionRouter } from "./helpers/session-fixture.js";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
@@ -39,7 +40,7 @@ const record = (over: Partial<SessionRecord> = {}): SessionRecord => ({
 
 function makeOrch(): Orchestrator {
   const catalogProfile = { id: "claude", defaultModel: "default" } as any;
-  const router = {
+  const router = testSessionRouter({
     listProfiles: () => [],
     describeConfig: (r: SessionRecord, selection: any = {}) => ({
       agent: { value: selection.agent ?? r.agentId, source: "session config" },
@@ -64,7 +65,7 @@ function makeOrch(): Orchestrator {
       },
       async dispose() {},
     }),
-  };
+  });
   const orch = new Orchestrator({
     logger: silent,
     config: {

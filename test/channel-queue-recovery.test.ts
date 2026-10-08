@@ -1,3 +1,4 @@
+import { testSessionRouter } from "./helpers/session-fixture.js";
 import { acknowledgedHandler } from "./acknowledged-handler-fixture.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
@@ -114,7 +115,7 @@ describe("#180 channel queue fencing", () => {
       updatedUtc: "2026-09-03T00:00:00.000Z",
     };
     store.upsert(record);
-    const router = {
+    const router = testSessionRouter({
       ensureSessionRecord: () => record,
       getRuntime: () => undefined,
       hasRuntime: () => false,
@@ -128,7 +129,7 @@ describe("#180 channel queue fencing", () => {
       }),
       abortTurn: vi.fn(async () => "idle" as const),
       invalidate: vi.fn(async () => undefined),
-    };
+    });
     const host = new Orchestrator({
       modelCatalog: fixtureModelCatalog([]),
       logger: silent,
@@ -577,12 +578,12 @@ describe("#180 dispatch and restart recovery", () => {
           bridgePresets: new Map(),
         } as never,
         adapter: {} as never,
-        router: {
+        router: testSessionRouter({
           isBusy: () => false,
           abortTurn: vi.fn(async () => "idle" as const),
           listProfiles: () => [],
           describeConfig: () => ({}),
-        } as never,
+        }) as never,
         store,
         renderer: {} as never,
       });
@@ -897,10 +898,10 @@ describe("#180 dispatch and restart recovery", () => {
         bridgePresets: new Map(),
       } as never,
       adapter: {} as never,
-      router: {
+      router: testSessionRouter({
         listProfiles: () => [],
         describeConfig: () => ({}),
-      } as never,
+      }) as never,
       store,
       renderer: {} as never,
     });
@@ -932,7 +933,7 @@ describe("#180 dispatch and restart recovery", () => {
           bridgePresets: new Map(),
         } as never,
         adapter: {} as never,
-        router: { listProfiles: () => [], describeConfig: () => ({}) } as never,
+        router: testSessionRouter({ listProfiles: () => [], describeConfig: () => ({}) }) as never,
         store,
         renderer: {} as never,
       });

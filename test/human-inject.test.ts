@@ -1,3 +1,4 @@
+import { testSessionRouter } from "./helpers/session-fixture.js";
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
@@ -73,7 +74,7 @@ function makeOrch(opts: {
   abortTurn?: ReturnType<typeof vi.fn>;
 }) {
   const abortTurn = opts.abortTurn ?? vi.fn(async () => "cancelled");
-  const router = {
+  const router = testSessionRouter({
     listProfiles: () => [],
     describeConfig: (r: SessionRecord) => ({
       agent: { value: r.agentId, source: "session config" },
@@ -88,7 +89,7 @@ function makeOrch(opts: {
     getProfile: () => ({ restrictDiscordAccess: opts.restrictDiscordAccess ?? false }),
     abortTurn,
     isBusy: () => false,
-  };
+  });
   const orch = new Orchestrator({
     logger: silent,
     config: {

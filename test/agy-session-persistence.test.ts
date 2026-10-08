@@ -20,7 +20,7 @@ import {
 } from "../packages/adapters/src/agy-session-store.js";
 import { AgentRuntime } from "../packages/core/src/agents/agent-runtime.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
-import { createManagedAgyFixture, type ManagedAgyFixture } from "./helpers/agy-runtime-fixture.js";
+import { createOrdinaryAgyFixture, type OrdinaryAgyFixture } from "./helpers/agy-runtime-fixture.js";
 
 const fixtures = fileURLToPath(new URL("./fixtures/agy-native-capabilities/", import.meta.url));
 const logger = pino({ level: "silent" }) as unknown as Logger;
@@ -41,7 +41,7 @@ vi.mock("../packages/core/src/core/recovery-directive.js", async importOriginal 
 
 interface Harness {
   root: string;
-  managed: ManagedAgyFixture;
+  managed: OrdinaryAgyFixture;
   runtimes: AgentRuntime[];
 }
 
@@ -49,11 +49,11 @@ const harnesses: Harness[] = [];
 
 function makeHarness(): Harness {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "seam-agy-r7-"));
-  const managed = createManagedAgyFixture({
+  const managed = createOrdinaryAgyFixture({
     source: path.join(fixtures, "fake-native-agy.mjs"),
     version: "agy fixture 1.1.28",
     cwd: root,
-    approvedEnvironment: {
+    environment: {
       SEAM_AGY_CAPABILITY_FIXTURE_DIR: fixtures,
       SEAM_AGY_CAPABILITY_INVOCATIONS: path.join(root, "invocations.jsonl"),
     },

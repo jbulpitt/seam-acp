@@ -663,7 +663,7 @@ export function makeClaudeProfile(opts: {
         let targetPath: string | undefined;
         if (sessionId) {
           targetPath = path.join(projectDir, `${sessionId}.jsonl`);
-          try { await fsp.access(targetPath); } catch { targetPath = undefined; }
+          try { await fsp.access(targetPath); } catch { return empty; }
         }
         if (!targetPath) {
           try {

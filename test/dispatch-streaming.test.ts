@@ -1,3 +1,4 @@
+import { testSessionRouter, testSessionStore } from "./helpers/session-fixture.js";
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
@@ -99,7 +100,7 @@ function makeOrch(opts: {
   voiceConsole?: any;
   logger?: Logger;
 }): Orchestrator {
-  const router = {
+  const router = testSessionRouter({
     listProfiles: () => [],
     describeConfig: (row: SessionRecord) => ({
       agent: { value: row.agentId, source: "session config" },
@@ -112,8 +113,8 @@ function makeOrch(opts: {
       record({ id: `discord:${channelRef}`, channelRef }),
     getProfile: () => undefined,
     getOrStartRuntime: async () => opts.rt,
-  };
-  const store = {
+  });
+  const store = testSessionStore({
     getByChannel: () => null,
     getPresetByName: () => null,
     recordDelegation: () => {},
@@ -125,7 +126,7 @@ function makeOrch(opts: {
     getReportBackByCorrelation: () => null,
     tryRecordReportBack: (e: unknown) => e,
     getParkedByChannel: () => null,
-  };
+  });
   const config = {
     DATA_DIR: opts.dataDir,
     REPOS_ROOT: "/repo",

@@ -1,3 +1,4 @@
+import { testSessionRouter } from "./helpers/session-fixture.js";
 /**
  * #454 wire: a prompt that already started is suspended, not completed, and
  * a waiting attempt is not continued. A test that still passes when the park
@@ -86,7 +87,7 @@ function harness(facts: () => { refreshTokenExpiresAt: number | null } | undefin
       DISCORD_ALLOWED_USER_IDS: new Set(["fixture-user"]),
       SEAM_DISPATCH_STATUS_PANEL: panels, SEAM_DISPATCH_OUTPUT_STYLE: "messages",
     } as never,
-    router: {
+    router: testSessionRouter({
       listProfiles: () => [profile],
       ensureSessionRecord: () => record,
       getProfile: () => profile,
@@ -96,7 +97,7 @@ function harness(facts: () => { refreshTokenExpiresAt: number | null } | undefin
       isBusy: () => false,
       getOrStartRuntime: async () => runtime,
       describeConfig: () => described,
-    } as never,
+    }) as never,
     adapter: {
       async sendPanel(channel: unknown, panel: StructuredPanel) {
         const id = `panel-${++panelOrdinal}`; cards.set(id, panel); return { channel, id };

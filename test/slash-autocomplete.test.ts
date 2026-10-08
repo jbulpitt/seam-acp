@@ -1,3 +1,4 @@
+import { testSessionRouter } from "./helpers/session-fixture.js";
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { scheduleUiFixture } from "./plugin-schedule-fixture.js";
 import { PresetUi, createPresetPlugin } from "../packages/core/src/plugins/presets/index.js";
@@ -137,7 +138,7 @@ function makeOrch(over?: {
     staticModels: [{ modelId: "gpt-5", name: "GPT-5" }],
     effort: { levels: [] },
   };
-  const router = {
+  const router = testSessionRouter({
     listProfiles: () => [grokProfile, copilotProfile],
     describeConfig: (record: SessionRecord) => ({
       agent: { value: record.agentId },
@@ -167,10 +168,10 @@ function makeOrch(over?: {
       if (id === "copilot") return copilotProfile;
       return undefined;
     },
-    getRuntime: over?.getRuntime,
+    getRuntime: over?.getRuntime ?? (() => undefined),
     isBusy: over?.isBusy ?? (() => false),
     invalidate: vi.fn(async () => {}),
-  };
+  });
   const orch = new Orchestrator({
     logger: silent,
     config: {

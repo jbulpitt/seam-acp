@@ -1,3 +1,4 @@
+import { testSessionRouter, testSessionStore } from "./helpers/session-fixture.js";
 /**
  * #174 — shutdown quiesce, drain barrier, and boot completion reconciliation.
  *
@@ -402,6 +403,7 @@ function makeQuiesceHost(over: Record<string, unknown> = {}) {
     // from an interactive card, which outlive their click handler by minutes.
     cardJobs: new Set<Promise<void>>(),
     channelQueues: new Map<string, Promise<void>>(),
+    attemptBoot: "shutdown-fixture-owner",
     dispatchWatcher: undefined,
     scheduledManager: undefined,
     ...over,
@@ -631,7 +633,7 @@ function makeLedger() {
     worker?: string | null;
     createdUtc?: string;
   }>();
-  return {
+  return testSessionStore({
     rows,
     getDelegation: (id: string) => rows.get(id) ?? null,
     isDispatchCompleted: (id: string) => {
@@ -669,7 +671,7 @@ function makeLedger() {
       rows.set(entry.id, row);
       return row;
     },
-  };
+  });
 }
 
 function makeReplayHost(ledger: ReturnType<typeof makeLedger>, over: Record<string, unknown> = {}) {
@@ -1119,10 +1121,10 @@ describe("#174 admission gates", () => {
       logger: silent,
       intakeStopped: true,
       channelQueues: new Map(),
-      store: {
+      store: testSessionStore({
         getParkedByChannel: () => ({ id: "p1", channelRef: "c1" }),
         deleteParked,
-      },
+      }),
       fireParked,
       tryFireParked: Orchestrator.prototype["tryFireParked" as never],
     } as unknown as { tryFireParked(c: string): Promise<void> };
@@ -1169,11 +1171,11 @@ describe("#174 admission gates", () => {
         logger: silent,
         intakeStopped,
         config: { TURN_TIMEOUT_SECONDS: 900, REPOS_ROOT: "/tmp" },
-        router: { ensureSessionRecord: () => ({ id: "s1" }), abortTurn },
+        router: testSessionRouter({ ensureSessionRecord: () => ({ id: "s1" }), abortTurn }),
         bindThreadRecord: async () => ({ id: "s1" }),
         startRecoveredInbound,
-        store: { admitInbound, getInbound: () => ({ messageId: "638000000000000002" }),
-          turnAttempts: { get: () => null } },
+        store: testSessionStore({ admitInbound, getInbound: () => ({ messageId: "638000000000000002" }),
+          turnAttempts: { get: () => null } }),
         postSteerCard: async () => {},
         pushHumanInbox: () => ({ queued: 1 }),
         channelRefFromInteraction: () => ({ platform: "discord", id: "t1" }),
@@ -1263,7 +1265,7 @@ describe("#174 admission gates", () => {
     const onComponent = vi.fn();
     const self = makeIngressHost<{ install(): void }>({
       adapter: { onMessage: () => {}, onComponent, setActiveChannelCheck: () => {} },
-      store: {},
+      store: testSessionStore({}),
       watchSentinel: () => {},
       // Any of these running would mean the wrapper gate did not short-circuit.
       handleConfigEditorComponent: () => {
@@ -1291,7 +1293,7 @@ describe("#174 admission gates", () => {
         onChoiceInteraction,
         setActiveChannelCheck: () => {},
       },
-      store: {},
+      store: testSessionStore({}),
       watchSentinel: () => {},
       handleChoiceCardInteraction: () => {
         throw new Error("handled a choice click after intake closed");
@@ -1310,7 +1312,7 @@ describe("#174 admission gates", () => {
   it("defers thread-delete cleanup rather than writing during shutdown", async () => {
     const listScheduledByChannel = vi.fn(() => [{ id: "s1" }]);
     const self = makeIngressHost<{ handleThreadDeleted(ref: string): Promise<void> }>({
-      store: { listScheduledByChannel },
+      store: testSessionStore({ listScheduledByChannel }),
     });
 
     await self.handleThreadDeleted("t-gone");
@@ -1378,11 +1380,11 @@ describe("#174 admission gates", () => {
       config: { TURN_TIMEOUT_SECONDS: 900 },
       channelGenerations: new Map<string, number>(),
       lastUserMessageAt: new Map<string, number>(),
-      store: {},
-      router: {
+      store: testSessionStore({}),
+      router: testSessionRouter({
         ensureSessionRecord: () => ({ id: "discord:c1" }),
         abortTurn: async () => "cancelled",
-      },
+      }),
       tryConsumeConfigEditorRiderUpload: async () => false,
       clearTurnMarkersForChannel: async () => {},
       tryParkForOfflineBridge: async () => false,
@@ -1919,11 +1921,13 @@ function makeClosableStore() {
   };
   return {
     violations,
+    turnAttempts: ledger.turnAttempts,
     get closed() {
       return closed;
     },
     close() {
       closed = true;
+      ledger.close();
     },
     scheduled,
     // Keep the real admission boundary and the existing post-close guard;
@@ -2368,12 +2372,12 @@ describe("#174 an ingest job stays registered through its durable tail", () => {
       config: { DEFAULT_AGENT: "a", REPOS_ROOT: "/tmp", TURN_TIMEOUT_SECONDS: 900,
         channelPresets: new Map(), threadPresets: new Map() },
       ingestJobs: new Map(),
-      router: {
+      router: testSessionRouter({
         getProfile: () => ({ id: "a" }),
         resolveProfileForChannel: () => ({ id: "a" }),
         mintMcpServersForSession: () => ({}),
         revokeMcpSession: () => {},
-      },
+      }),
       modelCatalog: {
         model: () => ({ id: "default" }),
         resolve: () => ({
@@ -2382,13 +2386,17 @@ describe("#174 an ingest job stays registered through its durable tail", () => {
           model: { id: "default" },
         }),
       },
-      store: {
+      store: testSessionStore({
         recordDelegation: () => {},
         updateDelegationStatus: () => {
           turnsAtLedgerWrite = host.activeTurns;
         },
+      }),
+      injectTurn: async (...[, , options]: Parameters<Orchestrator["injectTurn"]>) => {
+        await options.onSession!("ingest-fixture-session");
+        options.lifecycle!.beforePrompt!();
+        return { text: "scored" };
       },
-      injectTurn: async () => ({ text: "scored" }),
       bridgeHub: localBridgeHub([{ id: "a", defaultModel: "default" } as any], "/tmp"),
     }) as unknown as ReturnType<typeof makeQuiesceHost> & {
       dispatchIngestEndpoint(s: Record<string, unknown>): Promise<{ output: string }>;
@@ -2895,7 +2903,7 @@ describe("#174 the component wrapper AWAITS its handlers, not just gates them", 
     let finished = false;
     const host = makeQuiesceHost({
       adapter: { onMessage: () => {}, onComponent, setActiveChannelCheck: () => {} },
-      store: {},
+      store: testSessionStore({}),
       watchSentinel: () => {},
       handleConfigEditorComponent: async () => {},
       handleTtsEditorComponent: async () => {},
@@ -3265,7 +3273,7 @@ describe("#174 the component aggregate reports every handler's failure", () => {
       logger: log.logger,
       gatewayClosed: false,
       adapter: { onMessage: () => {}, onComponent, setActiveChannelCheck: () => {} },
-      store: {},
+      store: testSessionStore({}),
       watchSentinel: () => {},
       handleConfigEditorComponent: async () => {},
       handleTtsEditorComponent: async () => {},
@@ -3474,8 +3482,7 @@ function makeChainStore() {
       promptPreview?: string;
     }
   >();
-  return {
-    ...ledger,
+  return Object.assign(ledger, {
     rows: ledger.rows,
     chains,
     getChain: (id: string) => chains.get(id) ?? null,
@@ -3528,7 +3535,7 @@ function makeChainStore() {
       if (nextHop) this.advanceChain(input.chainId);
       return { dispatchId, nextHop, originRef: chain.originRef, created: true };
     },
-  };
+  });
 }
 
 /** A replay host wired to the REAL chain machinery, not an `advanceChain` stub. */

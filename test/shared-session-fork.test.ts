@@ -1,3 +1,4 @@
+import { testSessionRouter } from "./helpers/session-fixture.js";
 /**
  * #631 — one ACP session has one thread. A thread that shares its session
  * with an older thread gets its own copy before its turn, and is told so.
@@ -39,14 +40,14 @@ function thread(id: string, createdUtc: string) {
 
 function host(forkResult: string | undefined, rebuildAttaches = true) {
   const sent: Array<{ channel: string; text: string }> = [];
-  const router = {
+  const router = testSessionRouter({
     forkSharedSession: vi.fn(async (record: { id: string; acpSessionId: string }) => {
       if (!forkResult) return undefined;
       store.upsert({ ...store.get(record.id)!, acpSessionId: forkResult }, { source: "fixture", cause: "set provider binding for test" });
       return forkResult;
     }),
     invalidate: vi.fn(async () => undefined),
-  };
+  });
   const orchestrator = new Orchestrator({
     modelCatalog: fixtureModelCatalog([]),
     logger: silent,
@@ -123,7 +124,7 @@ describe("#631 tier 3: a bridge that stays unreachable", () => {
         logger: silent,
         config: { DATA_DIR: dir, REPOS_ROOT: "/repo", channelPresets: new Map(), threadPresets: new Map(), bridgePresets: new Map() } as never,
         adapter: { sendMessage: async (channel: { id: string }, text: string) => { sent.push({ channel: channel.id, text }); return { id: "m" }; } } as never,
-        router: {} as never,
+        router: testSessionRouter({}) as never,
         store,
         renderer: {} as never,
       });
@@ -155,7 +156,7 @@ function orchestratorWith(mux: Record<string, unknown>) {
     logger: silent,
     config: { DATA_DIR: dir, REPOS_ROOT: "/repo", channelPresets: new Map(), threadPresets: new Map(), bridgePresets: new Map() } as never,
     adapter: { sendMessage: async (channel: { id: string }, text: string) => { sent.push({ channel: channel.id, text }); return { id: "m" }; } } as never,
-    router: {} as never,
+    router: testSessionRouter({}) as never,
     store,
     renderer: {} as never,
   });

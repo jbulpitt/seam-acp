@@ -1,3 +1,4 @@
+import { testSessionRouter, testSessionStore } from "./helpers/session-fixture.js";
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
@@ -274,7 +275,7 @@ function makeOrch(opts: {
   cfg?: Record<string, unknown>;
   storeOverrides?: Record<string, unknown>;
 }): Orchestrator {
-  const router = {
+  const router = testSessionRouter({
     listProfiles: () => [],
     describeConfig: (row: SessionRecord) => ({
       agent: { value: row.agentId, source: "session config" },
@@ -287,8 +288,8 @@ function makeOrch(opts: {
       record({ id: `discord:${channelRef}`, channelRef }),
     getProfile: () => undefined,
     getOrStartRuntime: async () => opts.rt,
-  };
-  const store = {
+  });
+  const store = testSessionStore({
     getPresetByName: () => null,
     recordDelegation: () => {},
     // #170: dispatchInjectTurn now looks the spec up by exact id before
@@ -305,7 +306,7 @@ function makeOrch(opts: {
     getByChannel: () => record(),
     getParkedByChannel: () => null,
     ...opts.storeOverrides,
-  };
+  });
   const config = {
     ...visualConfig,
     DATA_DIR: opts.dataDir,

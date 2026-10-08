@@ -1,3 +1,4 @@
+import { testSessionRouter, testSessionStore } from "./helpers/session-fixture.js";
 import { describe, expect, it } from "vitest";
 import { pino } from "pino";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
@@ -96,7 +97,7 @@ function makePolicyOrch(opts: {
     updatedUtc: "2026-01-01T00:00:00Z",
   };
 
-  const router = {
+  const router = testSessionRouter({
     listProfiles: () => (agy ? [dest, agy] : [dest]),
     describeConfig: () => ({
       agent: { value: opts.destId, source: "session config" },
@@ -107,9 +108,9 @@ function makePolicyOrch(opts: {
     }),
     getProfile: (id?: string) => (id === "agy" ? agy : dest),
     invalidate: async () => {},
-  };
+  });
   const bound = { value: record.acpSessionId };
-  const store = {
+  const store = testSessionStore({
     readConfig: () => ({ model: opts.destModel, reasoningEffort: opts.destEffort }),
     get: () => ({ ...record, acpSessionId: bound.value }),
     compareAndSwapAcpSession: (_id: string, expected: string, next: string) => {
@@ -121,7 +122,7 @@ function makePolicyOrch(opts: {
     deleteSession: () => {},
     recordDelegation: () => {},
     updateDelegationStatus: () => {},
-  };
+  });
   const adapter = {
     fetchThreadMessagesTimed: async () => {
       fetches.push(1);

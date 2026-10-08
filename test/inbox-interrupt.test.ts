@@ -1,3 +1,4 @@
+import { testSessionRouter } from "./helpers/session-fixture.js";
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
@@ -43,7 +44,7 @@ function makeOrch(opts?: {
 }) {
   const abortTurn = opts?.abortTurn ?? vi.fn(async () => "cancelled");
   const invalidate = opts?.invalidate ?? vi.fn(async () => {});
-  const router = {
+  const router = testSessionRouter({
     listProfiles: () => [],
     describeConfig: (r: SessionRecord) => ({
       agent: { value: r.agentId, source: "session config" },
@@ -62,7 +63,7 @@ function makeOrch(opts?: {
     hasRuntime: () => true,
     abortTurn,
     invalidate,
-  };
+  });
   const orch = new Orchestrator({
     modelCatalog: fixtureModelCatalog([]),
     logger: silent,

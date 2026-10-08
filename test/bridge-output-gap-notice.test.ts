@@ -1,3 +1,4 @@
+import { testSessionRouter } from "./helpers/session-fixture.js";
 import { EventEmitter } from "node:events";
 import { createServer } from "node:http";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -34,9 +35,9 @@ async function setup(location: string, adopted: boolean) {
     healthPort: 3000, dataDir: dir, localBridgeTokenHash: "a".repeat(64) });
   cleanups.push(() => hub.close());
   const adapter = { sendMessage: vi.fn(async (channel: any, _text: string) => ({ channel, id: "notice" })) };
-  const router = { getRuntime: vi.fn(), describeConfig: () => ({ location: { value: location },
+  const router = testSessionRouter({ getRuntime: vi.fn(), describeConfig: () => ({ location: { value: location },
     agent: { value: "claude" }, model: { value: "test" }, role: { value: "worker" },
-    disableThreadPrefix: { value: false } }) };
+    disableThreadPrefix: { value: false } }) });
   const orch = new Orchestrator({ logger, config, store, router: router as any, adapter: adapter as any,
     renderer: discordRenderer as any, modelCatalog: fixtureModelCatalog([]) });
   orch.setBridgeHub(hub);

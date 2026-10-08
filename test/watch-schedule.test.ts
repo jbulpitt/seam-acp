@@ -1,3 +1,4 @@
+import { testSessionRouter } from "./helpers/session-fixture.js";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
@@ -53,7 +54,7 @@ function makeOrch(config: { WATCH_COMMAND_ENABLED?: boolean; WATCH_COMMAND_ALLOW
       WATCH_COMMAND_ALLOWLIST: config.WATCH_COMMAND_ALLOWLIST ?? [],
     } as any,
     adapter: {} as any,
-    router: { listProfiles: () => [] } as any,
+    router: testSessionRouter({ listProfiles: () => [] }) as any,
     store,
     renderer: {} as any,
   });

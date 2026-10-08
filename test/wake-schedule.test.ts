@@ -1,3 +1,4 @@
+import { testSessionRouter } from "./helpers/session-fixture.js";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
@@ -45,7 +46,7 @@ beforeEach(() => {
     logger: silent,
     config: { DATA_DIR: dir } as any,
     adapter: {} as any,
-    router: { listProfiles: () => [] } as any,
+    router: testSessionRouter({ listProfiles: () => [] }) as any,
     store,
     renderer: {} as any,
   });

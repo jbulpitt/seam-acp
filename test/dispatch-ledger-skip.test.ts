@@ -1,3 +1,4 @@
+import { testSessionRouter } from "./helpers/session-fixture.js";
 /**
  * #170 — `dispatchInjectTurn` must not re-record a spec that is already in the
  * ledger.
@@ -110,7 +111,7 @@ function spyAdapter() {
 
 function makeOrch(dataDir: string, store: SessionStore, logger: Logger, fallbackCode?: string): Orchestrator {
   const rt = fakeRuntime(fallbackCode);
-  const router = {
+  const router = testSessionRouter({
     listProfiles: () => [],
     describeConfig: (r: SessionRecord) => ({
       agent: { value: r.agentId, source: "session config" },
@@ -123,7 +124,7 @@ function makeOrch(dataDir: string, store: SessionStore, logger: Logger, fallback
       sessionRecord({ id: `discord:${channelRef}`, channelRef }),
     getProfile: () => undefined,
     getOrStartRuntime: async () => rt,
-  };
+  });
   const config = {
     DATA_DIR: dataDir,
     REPOS_ROOT: "/repo",

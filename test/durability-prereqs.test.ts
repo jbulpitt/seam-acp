@@ -1,3 +1,4 @@
+import { testSessionRouter } from "./helpers/session-fixture.js";
 /**
  * #75 durability prerequisites: persist the isolated ACP session id at the
  * `running` transition, and reconcile orphaned in-flight ledger rows on boot.
@@ -96,7 +97,7 @@ const record = (over: Partial<SessionRecord> = {}): SessionRecord => ({
 
 function makeOrch(store: SessionStore, dataDir: string): Orchestrator {
   const catalogProfile = { id: "claude", defaultModel: "claude-opus-4.8" } as any;
-  const router = {
+  const router = testSessionRouter({
     listProfiles: () => [],
     describeConfig: (r: SessionRecord, selection: any = {}) => ({
       agent: { value: selection.agent ?? r.agentId, source: "session config" },
@@ -124,7 +125,7 @@ function makeOrch(store: SessionStore, dataDir: string): Orchestrator {
     getOrStartRuntime: async () => {
       throw new Error("isolated dispatch must not use the live runtime");
     },
-  };
+  });
   const orch = new Orchestrator({
     logger: silent,
     config: {

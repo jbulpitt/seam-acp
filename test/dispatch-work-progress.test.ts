@@ -1,3 +1,4 @@
+import { testSessionRouter } from "./helpers/session-fixture.js";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -51,11 +52,11 @@ beforeEach(async () => {
     updatedUtc: "2026-09-22T00:00:00.000Z",
   });
   runtimeBusy = false;
-  const router = {
+  const router = testSessionRouter({
     isBusy: () => runtimeBusy,
     listProfiles: () => [],
     describeConfig: () => ({}),
-  };
+  });
   host = new Orchestrator({
     modelCatalog: fixtureModelCatalog([]),
     logger: silent,

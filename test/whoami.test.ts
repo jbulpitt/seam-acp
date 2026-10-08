@@ -1,3 +1,4 @@
+import { testSessionRouter } from "./helpers/session-fixture.js";
 import { describe, expect, it, vi } from "vitest";
 import { asLocalAdapter } from "@seam/adapters";
 import { dispatchBridgeRpc } from "../packages/bridge/src/rpc.js";
@@ -13,11 +14,11 @@ function fixture(agentId: string, location: string, rpcOverride?: () => Promise<
   })));
   const orch = Object.assign(Object.create(Orchestrator.prototype), {
     config: { REPOS_ROOT: "/repo" },
-    router: {
+    router: testSessionRouter({
       ensureSessionRecord: () => ({}),
       describeConfig: () => ({ agent: { value: agentId }, location: { value: location } }),
       getProfile: () => profile,
-    },
+    }),
     bridgeHub: { rpc },
   });
   const interaction = {

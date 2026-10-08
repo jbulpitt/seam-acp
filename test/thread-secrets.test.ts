@@ -1,3 +1,4 @@
+import { testSessionRouter } from "./helpers/session-fixture.js";
 import { describe, it, expect, vi } from "vitest";
 import { mkdtemp, rm, readFile, stat, utimes } from "node:fs/promises";
 import os from "node:os";
@@ -81,7 +82,7 @@ describe("thread secrets", () => {
         logger: pino({ level: "silent" }) as never,
         modelCatalog: fixtureModelCatalog([]),
         store,
-        router: { listProfiles: () => [] } as never,
+        router: testSessionRouter({ listProfiles: () => [] }) as never,
         adapter: {} as never,
         renderer: discordRenderer as never,
         config: {
@@ -183,7 +184,7 @@ describe("thread secrets", () => {
         idle: async () => {},
         cancel: async () => {},
       };
-      const router = {
+      const router = testSessionRouter({
         listProfiles: () => [],
         describeConfig: () => ({
           agent: { value: "codex" },
@@ -196,7 +197,7 @@ describe("thread secrets", () => {
         ensureSessionRecord: () => ({ ...record }),
         getProfile: () => undefined,
         getOrStartRuntime: vi.fn(async () => runtime),
-      };
+      });
       const adapter = {
         sendPanel: vi.fn(async (channel: { id: string }) => ({ channel, id: "panel" })),
         sendMessage: vi.fn(async (channel: { id: string }) => ({ channel, id: "message" })),

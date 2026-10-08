@@ -28,8 +28,6 @@ export interface AgyNativeRuntimeOptions {
   credentialScope: string;
   cwd: string;
   baseEnv?: NodeJS.ProcessEnv;
-  /** Explicit non-secret additions, primarily for hermetic host fixtures. */
-  approvedEnvironment?: Readonly<Record<string, string>>;
 }
 
 export interface AgyNativeSpawnOptions {
@@ -62,7 +60,6 @@ export type AgyProvenanceMode = "descriptor" | "immutable-path";
 interface VerifiedSnapshot extends VerificationEntry {
   fd: number;
   executable: string;
-  argvPrefix: string[];
   provenance: AgyProvenanceMode;
   close(): void;
 }
@@ -70,17 +67,10 @@ interface VerifiedSnapshot extends VerificationEntry {
 interface CachedSnapshot {
   fd: number;
   executable: string;
-  argvPrefix: string[];
   provenance: AgyProvenanceMode;
 }
 
 const snapshotCache = new Map<string, CachedSnapshot>();
-
-const NODE_FD_MODULE_LOADER = [
-  "import fs from 'node:fs';",
-  "const source=fs.readFileSync(3,'utf8').replace(/^#![^\\n]*(?:\\n|$)/,'');",
-  "await import('data:text/javascript;base64,'+Buffer.from(source).toString('base64'));",
-].join("");
 
 function requireAbsolute(name: string, value: string): string {
   const normalized = path.normalize(value.trim());
@@ -260,7 +250,6 @@ function duplicateCachedSnapshot(
     digest: verified.digest,
     fd,
     executable: cached.executable,
-    argvPrefix: [...cached.argvPrefix],
     provenance: cached.provenance,
     close() {
       if (closed) return;
@@ -325,36 +314,14 @@ function openVerifiedSnapshot(
     throw new Error("AGY executable sha256 does not match the configured immutable artifact");
   }
 
-  // macOS cannot EXEC a code-signed Mach-O through `/dev/fd/N` — the kernel
-  // resolves a real path to validate the signature — so the descriptor-bound
-  // launch below fails with EACCES for every production AGY binary. The darwin
-  // branch of `fdExecutable` existed but had never worked, so a Mac either lost
-  // native agy entirely or crashed its bridge (#330). Note macOS DOES permit
-  // opening `/dev/fd/N` for reading; only exec is refused, which is why
-  // `fdReadPath` still has a darwin branch.
-  //
-  // What the descriptor route buys is that the VERIFIED bytes and the EXECUTED
-  // bytes cannot differ: the copy is re-hashed through the fd and then unlinked,
-  // so the verified inode IS the executed inode, structurally.
-  //
-  // This branch pursues the same intent by a PRECONDITION rather than by
-  // construction, and it is honestly weaker. `verifyAgyManagedRuntimeArtifact`
-  // has proven the entire path canonical and non-writable by the service user,
-  // including every ancestor through `/`. That prevents a same-user agent from
-  // replacing any named component between verification and `spawn`, which
-  // would otherwise let different bytes inherit the verified attestation.
-  //
-  // The Node fixture loader stays on the descriptor route on every platform: it
-  // READS fd 3 rather than exec'ing it, which macOS permits.
-  const nodeFixtureSource = bytes.subarray(0, 64).toString("utf8").startsWith("#!/usr/bin/env node\n");
-  if (process.platform === "darwin" && !nodeFixtureSource) {
+  // macOS executes the verified immutable path; Linux executes its snapshot fd.
+  if (process.platform === "darwin") {
     // retainSnapshot takes ownership of this fd and closes it if it throws;
     // closing it here as well replaced the real cause with EBADF.
     const realFd = fs.openSync(executable, fs.constants.O_RDONLY);
     return retainSnapshot(sourceDigest, {
       fd: realFd,
       executable,
-      argvPrefix: [],
       provenance: "immutable-path",
     }, verified);
   }
@@ -378,14 +345,7 @@ function openVerifiedSnapshot(
     if (digest !== expectedSha256) {
       throw new Error("AGY executable snapshot sha256 does not match the configured artifact");
     }
-    // Validate descriptor execution support even for the Node-only fixture
-    // loader branch. Production AGY is an ELF binary and executes fd 3 itself.
-    fdExecutable(fd);
-    const nodeFixture = nodeFixtureSource;
-    const executableFd = nodeFixture ? process.execPath : fdExecutable(3);
-    const argvPrefix = nodeFixture
-      ? ["--input-type=module", "--eval", NODE_FD_MODULE_LOADER, "agy"]
-      : [];
+    const executableFd = fdExecutable(3);
     fs.unlinkSync(snapshotPath);
     fs.rmdirSync(dir);
     const ownedFd = fd;
@@ -393,7 +353,6 @@ function openVerifiedSnapshot(
     return retainSnapshot(digest, {
       fd: ownedFd,
       executable: executableFd,
-      argvPrefix,
       provenance: "descriptor",
     }, verified);
   } catch (error) {
@@ -405,19 +364,11 @@ function openVerifiedSnapshot(
 }
 
 export function buildApprovedEnvironment(
-  base: NodeJS.ProcessEnv,
-  additions: Readonly<Record<string, string>>
+  base: NodeJS.ProcessEnv
 ): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
   for (const key of SAFE_ENV_KEYS) {
     if (base[key] !== undefined) env[key] = base[key];
-  }
-  for (const [key, value] of Object.entries(additions)) {
-    if (!/^[A-Z][A-Z0-9_]*$/.test(key) || /(?:TOKEN|SECRET|PASSWORD|API_KEY|CREDENTIAL|AUTH)/.test(key)) {
-      throw new Error(`AGY approved environment key is not non-secret: ${key}`);
-    }
-    if (/[\0]/.test(value)) throw new Error(`AGY approved environment value for ${key} contains NUL`);
-    env[key] = value;
   }
   const home = env.HOME ?? env.USERPROFILE;
   if (!home || !path.isAbsolute(home)) {
@@ -444,7 +395,7 @@ export function verifyAgyManagedRuntimeIdentity(options: {
     if (cached?.digest === snapshot.digest && cached.version === options.version) {
       return { ...snapshot, version: options.version };
     }
-    const result = spawnSync(snapshot.executable, [...snapshot.argvPrefix, "--version"], {
+    const result = spawnSync(snapshot.executable, ["--version"], {
       cwd: options.cwd,
       env: options.env,
       encoding: "utf8",
@@ -495,7 +446,6 @@ export class AgyNativeRuntime implements AgyLaunchRuntime {
   private readonly expectedVersion: string;
   private readonly expectedSha256: string;
   private readonly baseEnv: NodeJS.ProcessEnv;
-  private readonly approvedEnvironment: Readonly<Record<string, string>>;
 
   constructor(options: AgyNativeRuntimeOptions) {
     this.executable = requireAbsolute("AGY_CLI_PATH", options.executable);
@@ -506,8 +456,7 @@ export class AgyNativeRuntime implements AgyLaunchRuntime {
     this.credentialScope = credentialScope;
     const cwd = requireAbsolute("AGY runtime cwd", options.cwd);
     this.baseEnv = { ...(options.baseEnv ?? process.env) };
-    this.approvedEnvironment = { ...(options.approvedEnvironment ?? {}) };
-    const env = buildApprovedEnvironment(this.baseEnv, this.approvedEnvironment);
+    const env = buildApprovedEnvironment(this.baseEnv);
     const environmentFingerprint = createHash("sha256").update(JSON.stringify(
       Object.entries(env).sort(([a], [b]) => a.localeCompare(b))
     )).digest("hex");
@@ -551,7 +500,7 @@ export class AgyNativeRuntime implements AgyLaunchRuntime {
   ): AgyNativePreparedLaunch {
     const normalizedCwd = requireAbsolute("AGY launch cwd", cwd);
     if (argv.some((arg) => arg.includes("\0"))) throw new Error("AGY launch argv contains NUL");
-    const env = buildApprovedEnvironment(this.baseEnv, this.approvedEnvironment);
+    const env = buildApprovedEnvironment(this.baseEnv);
     if (options.mcpHome) {
       const home = requireAbsolute("AGY MCP HOME", options.mcpHome);
       const homeStat = fs.lstatSync(home);
@@ -571,7 +520,7 @@ export class AgyNativeRuntime implements AgyLaunchRuntime {
     try {
       const cached = verificationCache.get(this.executable);
       if (cached?.digest !== snapshot.digest || cached.version !== this.expectedVersion) {
-        const result = spawnSync(snapshot.executable, [...snapshot.argvPrefix, "--version"], {
+        const result = spawnSync(snapshot.executable, ["--version"], {
           cwd: normalizedCwd,
           env,
           encoding: "utf8",
@@ -597,7 +546,7 @@ export class AgyNativeRuntime implements AgyLaunchRuntime {
           consumed = true;
           let proc: ChildProcess;
           try {
-            proc = spawn(snapshot.executable, [...snapshot.argvPrefix, ...argv], {
+            proc = spawn(snapshot.executable, [...argv], {
               cwd: normalizedCwd,
               env,
               detached: options.detached,
@@ -634,7 +583,7 @@ export class AgyNativeRuntime implements AgyLaunchRuntime {
 
   verify(cwd: string): void {
     const normalizedCwd = requireAbsolute("AGY verification cwd", cwd);
-    const env = buildApprovedEnvironment(this.baseEnv, this.approvedEnvironment);
+    const env = buildApprovedEnvironment(this.baseEnv);
     verifyAgyManagedRuntimeIdentity({
       executable: this.executable,
       runtimeRoot: this.runtimeRoot,

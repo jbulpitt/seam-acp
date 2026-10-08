@@ -25,7 +25,7 @@ async function previousTurn(h: Awaited<ReturnType<typeof savedSessionHost>>, com
 }
 
 describe("session writer acquisition", () => {
-  it.each(["new session", "no bridge", "warm runtime", "no runtime cache", "no slot inventory"] as const)("does not inspect orphan slots for %s", async mode => {
+  it.each(["new session", "no bridge", "warm runtime", "no slot inventory"] as const)("does not inspect orphan slots for %s", async mode => {
     const h = await savedSessionHost();
     try {
       const router = h.makeRouter();
@@ -33,7 +33,6 @@ describe("session writer acquisition", () => {
       if (mode === "new session") h.record.acpSessionId = "";
       if (mode === "no bridge") (orch as any).bridgeHub = undefined;
       if (mode === "warm runtime") vi.spyOn(router, "hasRuntime").mockReturnValue(true);
-      if (mode === "no runtime cache") (router as any).hasRuntime = undefined;
       if (mode === "no slot inventory") (orch as any).bridgeHub = {};
       const runtime = {} as Awaited<ReturnType<typeof router.getOrStartRuntime>>;
       const start = vi.spyOn(router, "getOrStartRuntime").mockResolvedValue(runtime);

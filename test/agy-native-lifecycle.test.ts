@@ -7,7 +7,7 @@ import { describe, it, expect, vi } from "vitest";
 import { classifyAndAttach, makeAgyProfile, readErrorClassification } from "@seam/adapters";
 import { AgentRuntime, type AgentEvent } from "../packages/core/src/agents/agent-runtime.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
-import { createManagedAgyFixture } from "./helpers/agy-runtime-fixture.js";
+import { createOrdinaryAgyFixture } from "./helpers/agy-runtime-fixture.js";
 import { ModelCatalogService } from "../packages/core/src/core/model-catalog/service.js";
 import { ModelCatalogStore } from "../packages/core/src/core/model-catalog/store.js";
 
@@ -33,12 +33,12 @@ vi.mock("../packages/core/src/core/recovery-directive.js", async importOriginal 
 async function fixture(timeoutSeconds = 10, fixtureLogger: Logger = logger, terminalFailures = false) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "seam-agy-r5-"));
   const log = path.join(root, "invocations");
-  const managed = createManagedAgyFixture({
+  const ordinary = createOrdinaryAgyFixture({
     source: path.join(fixtures, "fake-native-agy.mjs"), version: "agy fixture 1.1.28", cwd: root,
-    approvedEnvironment: { SEAM_AGY_CAPABILITY_FIXTURE_DIR: fixtures, SEAM_AGY_CAPABILITY_INVOCATIONS: log },
+    environment: { SEAM_AGY_CAPABILITY_FIXTURE_DIR: fixtures, SEAM_AGY_CAPABILITY_INVOCATIONS: log },
   });
   const profile = makeAgyProfile({
-    runtime: managed.runtime, dataDir: root, defaultModel: "Fixture Native Model",
+    runtime: ordinary.runtime, dataDir: root, defaultModel: "Fixture Native Model",
     printTimeoutSeconds: timeoutSeconds, exposeGlobalStaging: false,
     mcpServers: [{ type: "http", name: "must-not-inherit", url: "http://127.0.0.1:9", headers: [] }],
   });
@@ -52,13 +52,13 @@ async function fixture(timeoutSeconds = 10, fixtureLogger: Logger = logger, term
   await runtime.start();
   await runtime.newSession({ cwd: root, model: "fixture-native-model", strictModel: true });
   const rows = (): Row[] => fs.readFileSync(log, "utf8").trim().split("\n").map(line => JSON.parse(line) as Row);
-  return { root, runtime, managed, events, rows, async close() {
+  return { root, runtime, ordinary, events, rows, async close() {
     await runtime.dispose();
     // Mutation runs may deliberately break reaping; never leave their fixtures.
     for (const row of rows()) if (row.pid && alive(row.pid)) {
       try { process.kill(row.pid, "SIGKILL"); } catch { /* already exited */ }
     }
-    managed.cleanup();
+    ordinary.cleanup();
     fs.rmSync(root, { recursive: true, force: true });
   } };
 }
@@ -242,7 +242,7 @@ describe.sequential("R5 native production lifecycle", () => {
         "synthetic-secret-token-491",
         "Authorization: Bearer",
         f.root,
-        f.managed.executable,
+        f.ordinary.executable,
       ]) {
         expect(exposed).not.toContain(secret);
       }
@@ -274,11 +274,11 @@ describe.sequential("R5 native production lifecycle", () => {
 
   it("persists only the safe native failure through the real catalog service", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "seam-agy-r5-durable-"));
-    const managed = createManagedAgyFixture({
+    const ordinary = createOrdinaryAgyFixture({
       source: path.join(fixtures, "fake-native-agy.mjs"), version: "agy fixture 1.1.28", cwd: root,
-      approvedEnvironment: { SEAM_AGY_CAPABILITY_FIXTURE_DIR: fixtures, SEAM_AGY_R5_CATALOG_MODE: "fail" },
+      environment: { SEAM_AGY_CAPABILITY_FIXTURE_DIR: fixtures, SEAM_AGY_R5_CATALOG_MODE: "fail" },
     });
-    const profile = makeAgyProfile({ runtime: managed.runtime, defaultModel: "Fixture Native Model" });
+    const profile = makeAgyProfile({ runtime: ordinary.runtime, defaultModel: "Fixture Native Model" });
     const store = new ModelCatalogStore(path.join(root, "catalog.db"));
     const binding = { agentId: "agy", location: "local" };
     const service = new ModelCatalogService({
@@ -294,23 +294,23 @@ describe.sequential("R5 native production lifecycle", () => {
       for (const exposed of [result.error, persisted?.error]) {
         expect(exposed).not.toContain("synthetic-password");
         expect(exposed).not.toContain(root);
-        expect(exposed).not.toContain(managed.executable);
+        expect(exposed).not.toContain(ordinary.executable);
       }
-    } finally { service.stop(); store.close(); managed.cleanup(); fs.rmSync(root, { recursive: true, force: true }); }
+    } finally { service.stop(); store.close(); ordinary.cleanup(); fs.rmSync(root, { recursive: true, force: true }); }
   }, 15_000);
 
   it("#481 closes prompt-free stdin and preserves only auth_required through the real catalog consumer", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "seam-agy-auth-probe-"));
     const invocationLog = path.join(root, "invocations");
-    const managed = createManagedAgyFixture({
+    const ordinary = createOrdinaryAgyFixture({
       source: path.join(fixtures, "fake-native-agy.mjs"), version: "agy fixture 1.1.28", cwd: root,
-      approvedEnvironment: {
+      environment: {
         SEAM_AGY_CAPABILITY_FIXTURE_DIR: fixtures,
         SEAM_AGY_CAPABILITY_INVOCATIONS: invocationLog,
         SEAM_AGY_R5_CATALOG_MODE: "auth-wait",
       },
     });
-    const profile = makeAgyProfile({ runtime: managed.runtime, defaultModel: "Fixture Native Model" });
+    const profile = makeAgyProfile({ runtime: ordinary.runtime, defaultModel: "Fixture Native Model" });
     const store = new ModelCatalogStore(path.join(root, "catalog.db"));
     const warnings: Array<{ fields: Record<string, unknown>; message: string }> = [];
     const captureLogger = {
@@ -366,7 +366,7 @@ describe.sequential("R5 native production lifecycle", () => {
         "synthetic-secret-token-481",
         "Authorization: Bearer",
         root,
-        managed.executable,
+        ordinary.executable,
       ]) {
         expect(exposed).not.toContain(secret);
       }
@@ -374,7 +374,7 @@ describe.sequential("R5 native production lifecycle", () => {
       consoleSpy.mockRestore();
       service.stop();
       store.close();
-      managed.cleanup();
+      ordinary.cleanup();
       fs.rmSync(root, { recursive: true, force: true });
     }
   }, 5_000);
@@ -497,10 +497,10 @@ describe.sequential("R5 native production lifecycle", () => {
 
   it("reaps partial startup through the real ACP profile and removes turn files", async () => {
     const f = await fixture();
-    const prepare = f.managed.runtime.prepare.bind(f.managed.runtime);
+    const prepare = f.ordinary.runtime.prepare.bind(f.ordinary.runtime);
     let pid: number | undefined;
     let logFile: string | undefined;
-    const spy = vi.spyOn(f.managed.runtime, "prepare").mockImplementation((args, cwd, options) => {
+    const spy = vi.spyOn(f.ordinary.runtime, "prepare").mockImplementation((args, cwd, options) => {
       const launch = prepare(args, cwd, options);
       logFile = args[args.indexOf("--log-file") + 1];
       return { close: launch.close, spawn: () => {

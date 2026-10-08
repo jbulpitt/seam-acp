@@ -19,7 +19,7 @@ import { AgentRuntime } from "../packages/core/src/agents/agent-runtime.js";
 import { ModelCatalogService } from "../packages/core/src/core/model-catalog/service.js";
 import { ModelCatalogStore } from "../packages/core/src/core/model-catalog/store.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
-import { createManagedAgyFixture, type ManagedAgyFixture } from "./helpers/agy-runtime-fixture.js";
+import { createOrdinaryAgyFixture, type OrdinaryAgyFixture } from "./helpers/agy-runtime-fixture.js";
 
 const fixtures = fileURLToPath(new URL("./fixtures/agy-native-capabilities/", import.meta.url));
 const fakeCli = path.join(fixtures, "fake-native-agy.mjs");
@@ -52,17 +52,17 @@ function rows(log: string): Invocation[] {
 function subject(extraEnv: Record<string, string> = {}): {
   root: string;
   log: string;
-  managed: ManagedAgyFixture;
+  managed: OrdinaryAgyFixture;
   profile: AgentProfile;
 } {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "seam-agy-csrf-"));
   const log = path.join(root, "invocations.ndjson");
-  const managed = createManagedAgyFixture({
+  const managed = createOrdinaryAgyFixture({
     source: fakeCli,
     version: "agy fixture 1.1.28",
     credentialScope: `antigravity-oauth:${randomUUID()}`,
     cwd: root,
-    approvedEnvironment: {
+    environment: {
       SEAM_AGY_CAPABILITY_FIXTURE_DIR: fixtures,
       SEAM_AGY_CAPABILITY_INVOCATIONS: log,
       ...extraEnv,

@@ -1,3 +1,4 @@
+import { testSessionStore } from "./helpers/session-fixture.js";
 import { scheduleUiFixture } from "./plugin-schedule-fixture.js";
 /**
  * #152 — `/seamadmin schedule list` pagination.
@@ -305,12 +306,12 @@ function makeListCard(rows: ScheduledPrompt[]) {
     logger: silent,
     config: { DATA_DIR: "/tmp" },
     channelRefFromInteraction: () => ({ platform: "discord", id: "thread-1", parentId: "chan-1" }),
-    store: {
+    store: testSessionStore({
       listScheduledByChannel: () => [...store.values()],
       getScheduled: (id: string) => store.get(id) ?? null,
       upsertScheduled: (s: ScheduledPrompt) => store.set(s.id, { ...s }),
       deleteScheduled: (id: string) => store.delete(id),
-    },
+    }),
     scheduledManager: { runNow: vi.fn(async () => {}), armFromRow: vi.fn(), disarm: vi.fn() },
     attachListLifecycle: Orchestrator.prototype["attachListLifecycle" as never],
     slashAccessRefusal: Orchestrator.prototype["slashAccessRefusal" as never],

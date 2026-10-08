@@ -1,3 +1,4 @@
+import { testSessionRouter } from "./helpers/session-fixture.js";
 /** #466: real scheduled runner + injectTurn + ACP, synthetic execution boundaries only. */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -94,12 +95,12 @@ function setup(location = REMOTE) {
   const seam = { type: "http", name: "seam-mcp", url: "http://127.0.0.1:1234/mcp", headers: [{ name: "X-Seam-Session", value: "author-token" }] };
   const globalMcp = { name: "global-tool", command: "host-tool", args: [], env: [] };
   const remoteSeam = { ...seam, url: "https://seam.example/mcp" };
-  const router = { permissionOptions: () => ({}), ensureSessionRecord: () => ({ ...record }), getProfile: () => profile, listProfiles: () => [profile],
+  const router = testSessionRouter({ permissionOptions: () => ({}), ensureSessionRecord: () => ({ ...record }), getProfile: () => profile, listProfiles: () => [profile],
     resolveProfileForChannel: () => profile, assertAgentAllowedForChannel() {}, assertAgentAllowedForRecord() {},
     reuseMcpServers: vi.fn(() => [globalMcp, seam]), isBusy: () => false,
     revokeMcpSession: vi.fn(),
     describeConfig: () => ({ agent: { value: profile.id }, model: { value: MODEL }, effort: { value: "high" },
-      cwd: { value: cwd }, location: { value: location }, fastMode: { value: false } }) };
+      cwd: { value: cwd }, location: { value: location }, fastMode: { value: false } }) });
   const mux = { spawn: remoteSpawn, rpc: vi.fn(async (_method: string, _params: unknown, _opts?: unknown) => ({ projectMcpInjection: true })), releaseStdin: vi.fn(),
     sendCmd: vi.fn(async (_action: string, _payload: unknown) => ({ health: calls.children.map(child => ({ slot: child.slot, alive: !child.killed })) })) };
   const hub = { markSessionBridge: vi.fn(), get: vi.fn(() => ({ mux })),

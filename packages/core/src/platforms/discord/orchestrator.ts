@@ -15187,11 +15187,13 @@ export class Orchestrator {
       });
       return true;
     }
-    try {
-      return await run();
-    } finally {
+    // The bridge keeps working; its terminal result must not hold boot admission.
+    this.trackContinuation(run().then(() => undefined).catch(err => {
+      this.logger.warn({ err, attempt: attempt.id }, "isolated recovery adoption failed; bridge owner retained");
+    }).finally(() => {
       this.adoptingRemoteResults.delete(attempt.id);
-    }
+    }));
+    return true;
   }
 
   private async observeRemoteRecoveryStall(attempt: TurnAttempt, cause: string): Promise<void> {

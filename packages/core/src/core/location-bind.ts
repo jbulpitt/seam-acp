@@ -7,7 +7,7 @@ import type { AgentProfile } from "@seam/adapters";
 import type { McpServer } from "@agentclientprotocol/sdk";
 import type { BridgeHub } from "./bridge-hub.js";
 import { LOCAL_LOCATION, normalizeLocation } from "./location.js";
-import { spawnRemoteSlot } from "./remote-spawn.js";
+import { DEFAULT_REMOTE_RUNG1_POLICY, spawnRemoteSlot } from "./remote-spawn.js";
 
 /** Bind `sessionId` to its execution bridge, including the local bridge. */
 export function bindSessionLocation(
@@ -60,6 +60,7 @@ export function planIsolatedBridgeSpawn(opts: {
         model: modelOverride ?? opts.model,
         effort: effortOverride ?? opts.effort,
         cwd: opts.cwd,
+        rung1Recovery: DEFAULT_REMOTE_RUNG1_POLICY,
       }),
   };
 }

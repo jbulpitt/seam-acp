@@ -186,6 +186,52 @@ describe("#631 slots nobody owns", () => {
       vi.useRealTimers();
     }
   });
+
+  it("retires legacy dead output only after reconciliation finds no unfinished owner", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout"] });
+    try {
+      const calls: unknown[] = [];
+      const mux = {
+        sendCmd: async (_action: string, params: unknown) => {
+          calls.push(params);
+          return { health: [1, 2, 3, 4, 5, 6].map(slot => ({ slot, alive: false })) };
+        },
+        isBound: (slot: number) => slot === 1,
+        sendFrame: vi.fn(),
+      };
+      const { built } = orchestratorWith(mux);
+      vi.spyOn(store.turnAttempts, "list").mockImplementation((state?: string) => [{
+        remoteRecovery: { location: "local", slot: state === "pending" ? 2 : state === "active" ? 3 : 4 },
+      }] as never);
+      vi.spyOn(store.turnAttempts, "listUnsettledCompletions").mockReturnValue([{
+        remoteRecovery: { location: "local", slot: 5 },
+      }] as never);
+      built.sweepUnownedSlots("local");
+      await vi.advanceTimersByTimeAsync(90_000);
+      expect(calls).toEqual([{}, { retiredSlots: [6] }]);
+      expect(mux.sendFrame).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not retire output when the owner ledger has an unreadable attempt", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout"] });
+    try {
+      const sendCmd = vi.fn(async () => ({ health: [{ slot: 9, alive: false }] }));
+      const { built } = orchestratorWith({ sendCmd, isBound: () => false, sendFrame: vi.fn() });
+      vi.spyOn(store.turnAttempts, "list").mockImplementation((_state, onUnreadable) => {
+        onUnreadable!("unfinished", new Error("invalid attempt JSON"));
+        return [];
+      });
+      built.sweepUnownedSlots("local");
+      await vi.advanceTimersByTimeAsync(90_000);
+      expect(sendCmd).toHaveBeenCalledTimes(1);
+      expect(sendCmd).toHaveBeenCalledWith("listSlots", {});
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe("#631 a lost delegated turn continues only after its old slot is gone", () => {

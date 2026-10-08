@@ -15591,6 +15591,7 @@ export class Orchestrator {
               this.logger.warn({ err, attempt: attempt.id }, "bridge recovery rebind deferred"));
           }
         }
+        await this.retireReconciledDeadSlots(location, reply.health);
         const failure = this.remoteRecoveryLogFailures.get(location);
         if (failure) {
           this.remoteRecoveryLogFailures.delete(location);
@@ -15813,6 +15814,7 @@ export class Orchestrator {
           this.logger.warn({ location, slot: row.slot }, "stopping a slot no turn owns");
           mux.sendFrame({ slot: row.slot, type: "kill" });
         }
+        await this.retireReconciledDeadSlots(location, reply.health ?? []);
       })().catch((err) => this.logger.debug({ err, location }, "unowned-slot sweep skipped"));
     }, 90_000).unref?.();
   }
@@ -15821,6 +15823,26 @@ export class Orchestrator {
     if (this.bridgeHub?.muxFor(location)?.isBound(slot)) return true;
     return (["active", "suspended"] as const).some(state => this.store.turnAttempts.list(state)
       .some(attempt => attempt.remoteRecovery?.location === location && attempt.remoteRecovery.slot === slot));
+  }
+
+  /** Old sessiond records have no ACK proof; the reconciled owner can retire them. */
+  private async retireReconciledDeadSlots(location: string,
+    health: Array<{ slot?: unknown; alive?: unknown }>): Promise<void> {
+    const mux = this.bridgeHub?.muxFor(location);
+    if (!mux) return;
+    const dead = health.filter(row => row.alive === false && typeof row.slot === "number");
+    if (!dead.length) return;
+    const unreadable = (id: string, cause: unknown): never => {
+      throw new Error(`Cannot retire slot output: attempt ${id} is unreadable`, { cause });
+    };
+    const unfinished = (["pending", "active", "suspended"] as const)
+      .flatMap(state => this.store.turnAttempts.list(state, unreadable));
+    unfinished.push(...this.store.turnAttempts.listUnsettledCompletions());
+    const owned = new Set(unfinished.filter(attempt => attempt.remoteRecovery?.location === location)
+      .map(attempt => attempt.remoteRecovery!.slot));
+    const retiredSlots = dead.map(row => row.slot as number)
+      .filter(slot => !owned.has(slot) && !mux.isBound(slot));
+    if (retiredSlots.length) await mux.sendCmd("listSlots", { retiredSlots });
   }
 
   /** Retire a finished, unowned writer before loading its conversation again. */

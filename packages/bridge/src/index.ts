@@ -507,7 +507,7 @@ async function makeSlotManager(opts: {
         // omits `health` — which the caller treats as "no opinion" rather
         // than as "unhealthy". The frame is an array of objects so #456 can
         // hang a stderr tail off the same shape without another protocol turn.
-        result = await supervised.listSlots();
+        result = await supervised.listSlots(payload);
       } else if (action === "permissionStatus" || action === "answerPermission") {
         result = await supervised.permissionControl(Number(payload.slot),
           action === "permissionStatus" ? "permission_status" : "answer_permission",

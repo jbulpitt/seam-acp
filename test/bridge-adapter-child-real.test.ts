@@ -12,10 +12,12 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { once } from "node:events";
+import { EventEmitter, once } from "node:events";
 import { createServer } from "node:http";
 import { WebSocket } from "ws";
 import { pino } from "pino";
+import { makeMux, type AgentProfile } from "@seam/adapters";
+import { AgentRuntime } from "../packages/core/src/agents/agent-runtime.js";
 import { BridgeHub } from "../packages/core/src/core/bridge-hub.js";
 import { hashBridgeToken } from "../packages/core/src/core/bridge-pairing.js";
 import { planIsolatedBridgeSpawn } from "../packages/core/src/core/location-bind.js";
@@ -49,7 +51,10 @@ async function until<T>(read: () => T | undefined, what: string, ms = 20_000): P
   throw new Error(`timed out waiting for ${what}`);
 }
 
-async function localBridge(nativeFixture = false) {
+async function localBridge(nativeFixture = false, options: {
+  missingInterpreter?: boolean;
+  onFrame?: (frame: SupervisedBridgeFrame & { slot: number }) => void;
+} = {}) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "seam-610-"));
   roots.push(root);
   await fs.chmod(root, 0o700);
@@ -59,6 +64,11 @@ async function localBridge(nativeFixture = false) {
   await fs.mkdir(home);
   await fs.mkdir(path.join(home, ".gemini", "antigravity-cli"), { recursive: true });
   await fs.writeFile(path.join(bin, "agy"), "#!/bin/sh\necho 1.2.9\n", { mode: 0o755 });
+  const brokenGrok = path.join(bin, "grok-missing-interpreter");
+  if (options.missingInterpreter) {
+    // Executable discovery succeeds, but the actual OS spawn fails with ENOENT.
+    await fs.writeFile(brokenGrok, `#!${root}/missing-interpreter\n`, { mode: 0o755 });
+  }
   const invocationLog = path.join(root, "invocations.ndjson");
   if (nativeFixture) {
     const fixtures = fileURLToPath(new URL("./fixtures/agy-native-capabilities/", import.meta.url));
@@ -86,11 +96,12 @@ async function localBridge(nativeFixture = false) {
       AGY_ENABLED: "true",
       AGY_PIN: "unpinned",
       AGY_DEFAULT_MODEL: nativeFixture ? "fixture-native-model" : "gemini-3.8-flash-high",
+      ...(options.missingInterpreter ? { GROK_CLI_PATH: brokenGrok } : {}),
     },
     onStderr: () => undefined,
-    onFrame: (frame) => frames.push(frame),
+    onFrame: (frame) => { frames.push(frame); options.onFrame?.(frame); },
   });
-  return { root, client, slots, frames, invocationLog };
+  return { root, client, slots, frames, invocationLog, brokenGrok };
 }
 
 const initialize = `${JSON.stringify({
@@ -101,6 +112,40 @@ const initialize = `${JSON.stringify({
 })}\n`;
 
 describe("#610 the local agent path, end to end", () => {
+  it("#678 carries a real adapter spawn failure through the holder and mux to the controller", async () => {
+    const ws = new EventEmitter() as EventEmitter & { readyState: number; send: (data: string) => void };
+    ws.readyState = WebSocket.OPEN;
+    const { root, slots, brokenGrok } = await localBridge(false, {
+      missingInterpreter: true,
+      onFrame: frame => ws.emit("message", Buffer.from(JSON.stringify(frame))),
+    });
+    ws.send = data => {
+      const frame = JSON.parse(data);
+      if (frame.type === "data") void slots.writeInput(frame.slot, frame.data);
+    };
+    const mux = makeMux({ id: "spawn-failure-host" } as never);
+    mux.attach(ws as never);
+    const runtime = new AgentRuntime({
+      profile: { id: "grok" } as AgentProfile,
+      logger: pino({ level: "silent" }) as unknown as Logger,
+      spawnFn: () => {
+        const child = mux.spawn();
+        slots.configure(child.slot, { agentId: "grok", model: "grok-4.6", cwd: root });
+        return child;
+      },
+    });
+    try {
+      const error = await runtime.start().catch(error => error as Error);
+      expect(error).toBeInstanceOf(Error);
+      expect(error.message).toContain(`spawn ${brokenGrok} ENOENT`);
+      expect(error.message).toContain("host 'spawn-failure-host'");
+      expect(error.message).not.toContain("the bridge reported no reason");
+    } finally {
+      await runtime.dispose();
+      ws.emit("close");
+    }
+  }, 30_000);
+
   it.each([
     [129600, "capability-turn-one"],
     [1, "r5-stream-hang"],

@@ -128,6 +128,31 @@ describe("#232 canonical identity", () => {
 });
 
 describe("#232 direct Claude publishes the live list plus verified overlays", () => {
+  it("keeps canonical Haiku 5.5 when ACP advertises only the haiku alias", async () => {
+    const candidate = await directProfile(async () => liveProbe()).catalog.fetch();
+    const haiku = candidate.models.find((model) => model.id === "claude-haiku-5-5");
+    expect(haiku).toBeDefined();
+    expect(haiku?.runtimeId).toBe("claude-haiku-5-5");
+    expect(haiku?.context.native).toBe(1_000_000);
+    expect(haiku?.effort.choices.map((choice) => choice.id)).toEqual(FULL_EFFORT);
+    expect(haiku?.evidence).toEqual([expect.objectContaining({
+      kind: "verified-record",
+      observedAt: "2026-10-08T00:00:00.000Z",
+      runtimeVersion: "claude-agent-acp 0.88.0",
+      resolvedModel: "claude-haiku-5-5",
+      context: { native: 1_000_000, method: "runbook-verified" },
+    })]);
+    expect(candidate.models.filter((model) => model.id === "claude-haiku-5-5")).toHaveLength(1);
+    expect(candidate.models.find((model) => model.id === "haiku")?.evidence?.[0]?.resolvedModel).toBeUndefined();
+  });
+
+  it("does not lend default-account Haiku 5.5 evidence to another credential scope", async () => {
+    const candidate = await directProfile(async () => liveProbe(), {
+      configDir: "/tmp/haiku917-alternate-scope",
+    }).catalog.fetch();
+    expect(candidate.models.some((model) => model.id === "claude-haiku-5-5")).toBe(false);
+  });
+
   it("publishes every advertised model with its own effort choices", async () => {
     const candidate = await directProfile(async () => liveProbe()).catalog.fetch();
     validateCandidate(candidate);
@@ -170,6 +195,7 @@ describe("#232 direct Claude publishes the live list plus verified overlays", ()
       "claude-fable-5",
       "claude-sonnet-5",
       "claude-sonnet-5-5",
+      "claude-haiku-5-5",
     ]);
     const opus5 = candidate.models.find((model) => model.id === "claude-opus-5")!;
     const record = opus5.evidence![0]!;
@@ -185,7 +211,7 @@ describe("#232 direct Claude publishes the live list plus verified overlays", ()
     expect(record.note).toContain("credential scope default");
     // Existing verified models keep their proven native window.
     expect(opus5.context).toEqual({ native: 1_000_000, maximum: 1_000_000, effective: 1_000_000 });
-    expect(candidate.sourceVersion).toBe("overlay-v3");
+    expect(candidate.sourceVersion).toBe("overlay-v4");
   });
 
   it("merges by canonical identity without duplicating the [1m] variant", async () => {
@@ -371,7 +397,7 @@ describe("#232 scope, determinism, and failure handling", () => {
     expect(base.models.map((m) => m.id)).toEqual([
       "default", "opus[1m]", "claude-fable-5-1", "sonnet", "haiku",
       "claude-opus-5-5", "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7", "claude-fable-5", "claude-sonnet-5",
-      "claude-sonnet-5-5",
+      "claude-sonnet-5-5", "claude-haiku-5-5",
     ]);
     // No row on the alternate profile carries evidence captured elsewhere.
     for (const model of alternate.models) {

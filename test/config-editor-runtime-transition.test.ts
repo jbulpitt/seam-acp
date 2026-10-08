@@ -89,7 +89,7 @@ async function fixture(agent = "claude") {
     defaultModel: "old", defaultPermissionMode: "ask", seamMcp: localBridgeWiring(profiles),
   });
   const row = router.ensureSessionRecord({ platform: "discord", channelRef: threadId, parentRef, cwd: dir });
-  store.upsert({ ...row, acpSessionId: "existing-context", configJson: JSON.stringify({ model: "old", reasoningEffort: "low" }) });
+  store.upsert({ ...row, acpSessionId: "existing-context", configJson: JSON.stringify({ model: "old", reasoningEffort: "low" }) }, { source: "fixture", cause: "set provider binding for test" });
   const record = store.get(row.id)!;
   const warm = await router.getOrStartRuntime(record);
   const mutation = new ConfigMutationService({

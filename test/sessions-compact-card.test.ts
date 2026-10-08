@@ -476,7 +476,7 @@ function makeHarness(opts: HarnessOpts = {}) {
   orch.getRuntimeTransition = () => ({
     adoptMigratedSession: async (rec: SessionRecord, selection: { agent: string; acpSessionId: string }) => {
       await router.invalidate(rec.id, { clearAcpSession: false });
-      store.upsert({ ...rec, agentId: selection.agent, acpSessionId: selection.acpSessionId });
+      store.upsert({ ...rec, agentId: selection.agent, acpSessionId: selection.acpSessionId }, { source: "fixture", cause: "set provider binding for test" });
       Object.assign(rec, { agentId: selection.agent, acpSessionId: selection.acpSessionId });
     },
   }) as unknown as ReturnType<InstanceType<typeof Orchestrator>["getRuntimeTransition"]>;

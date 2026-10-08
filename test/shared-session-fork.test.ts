@@ -42,7 +42,7 @@ function host(forkResult: string | undefined, rebuildAttaches = true) {
   const router = {
     forkSharedSession: vi.fn(async (record: { id: string; acpSessionId: string }) => {
       if (!forkResult) return undefined;
-      store.upsert({ ...store.get(record.id)!, acpSessionId: forkResult });
+      store.upsert({ ...store.get(record.id)!, acpSessionId: forkResult }, { source: "fixture", cause: "set provider binding for test" });
       return forkResult;
     }),
     invalidate: vi.fn(async () => undefined),
@@ -58,7 +58,7 @@ function host(forkResult: string | undefined, rebuildAttaches = true) {
   });
   hosts.push(orchestrator);
   const rebuild = vi.fn(async (record: { id: string }) => {
-    if (rebuildAttaches) store.upsert({ ...store.get(record.id)!, acpSessionId: "acp-rebuilt" });
+    if (rebuildAttaches) store.upsert({ ...store.get(record.id)!, acpSessionId: "acp-rebuilt" }, { source: "fixture", cause: "set provider binding for test" });
     return { attached: rebuildAttaches, attachmentReason: rebuildAttaches ? "attached" : "thread moved on" };
   });
   Object.assign(orchestrator as never, { rebuildThreadFromDiscord: rebuild });

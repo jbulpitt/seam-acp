@@ -4762,7 +4762,8 @@ export class Orchestrator {
         this.assertQueueFence(queueFence);
         if (isSessionGoneError(promptErr)) {
           this.logger.warn({ session: record.id }, "session-gone on prompt; invalidating and retrying with new session");
-          await this.router.invalidate(record.id, { clearAcpSession: true });
+          await this.router.invalidate(record.id, { clearAcpSession: true,
+            bindingChange: { source: "Orchestrator.handleIncomingMessageInner", cause: promptErr instanceof Error ? promptErr.message : String(promptErr) } });
           this.assertQueueFence(queueFence);
           activeRuntime = await this.router.getOrStartRuntime(record);
           contextIdentity = this.contextBudgetIdentity(record, activeRuntime.getSessionInfo()?.sessionId);
@@ -5049,7 +5050,8 @@ export class Orchestrator {
       const errMsg = err instanceof Error ? err.message : String(err);
       if (isSessionGoneError(err) && !humanAttempt) {
         this.logger.warn({ session: record.id }, "session not found on agent; invalidating runtime");
-        await this.router.invalidate(record.id, { clearAcpSession: true });
+        await this.router.invalidate(record.id, { clearAcpSession: true,
+          bindingChange: { source: "Orchestrator.handleIncomingMessageInner", cause: errMsg } });
       } else if (!humanAttempt && (isAgentRejectionError(err) || errMsg.includes("Prompt is too long") || isImageDimensionError(errMsg))) {
         const isPromptTooLong = errMsg.includes("Prompt is too long");
         const isImageDimension = isImageDimensionError(errMsg);
@@ -5061,7 +5063,10 @@ export class Orchestrator {
           { session: record.id, isPromptTooLong, isImageDimension },
           "agent rejected prompt; invalidating session runtime"
         );
-        await this.router.invalidate(record.id, { clearAcpSession: !needsRepair });
+        await this.router.invalidate(record.id, needsRepair ? { clearAcpSession: false } : {
+          clearAcpSession: true,
+          bindingChange: { source: "Orchestrator.handleIncomingMessageInner", cause: errMsg },
+        });
 
         if (needsRepair) {
           const location = described.location.value;
@@ -5720,7 +5725,9 @@ export class Orchestrator {
       summary: built.seed,
     });
     record.acpSessionId = acNewId; // keep the in-memory record in sync (see getOrStartRuntime)
-    this.store.upsert({ ...record, updatedUtc: new Date().toISOString() });
+    this.store.upsert({ ...record, updatedUtc: new Date().toISOString() }, {
+      source: "Orchestrator.runAgyAutoCompact", cause: "attach auto-compacted provider session",
+    });
     await this.router.invalidate(record.id, { clearAcpSession: false });
 
     const elapsedSec = Math.round((Date.now() - compactStartedAt) / 1000);
@@ -7136,7 +7143,8 @@ export class Orchestrator {
           Object.assign(record, this.store.get(record.id), {
             acpSessionId: "", updatedUtc: new Date().toISOString(),
           });
-          this.store.upsert(record);
+          this.store.upsert(record, { source: "Orchestrator.acquireRecordedRuntime",
+            cause: classification.details ?? (err instanceof Error ? err.message : String(err)) });
           assertCurrent();
           return this.router.getOrStartRuntime(record, undefined, assertCurrent);
         }
@@ -7657,6 +7665,7 @@ export class Orchestrator {
     if (fresh) {
       await this.router.invalidate(record.id, {
         clearAcpSession: true,
+        bindingChange: { source: "Orchestrator.interruptRedirect", cause: "operator requested fresh interrupt" },
         operatorIntent: "replace-session",
       });
     }
@@ -10128,7 +10137,7 @@ export class Orchestrator {
           } catch (err) {
             const emsg = err instanceof Error ? err.message : String(err);
             await this.router.invalidate(snapshot.id, { clearStartFailure: true }).catch(() => {});
-            this.store.upsert(snapshot);
+            this.store.upsert(snapshot, { source: "Orchestrator.executeDispatch", cause: `migration rebuild rollback: ${emsg}` });
             await this.adapter.sendMessage(
               target,
               `⚠️ Migration failed; continuing on the prior agent/model. ${emsg}`
@@ -16766,15 +16775,13 @@ export class Orchestrator {
       });
       return;
     }
-    // Stop the live runtime (if any) so any in-flight turn is killed.
+    // Retire the runtime before replacing the durable conversation.
     await this.router.invalidate(record.id, { operatorIntent: "replace-session" });
-    // Clear the persisted ACP session id so the next message creates a
-    // fresh session (which picks up any new MCP servers / config).
     this.store.upsert({
       ...record,
       acpSessionId: "",
       updatedUtc: new Date().toISOString(),
-    });
+    }, { source: "Orchestrator.cmdReset", cause: "operator requested session reset" });
     await this.identityEffects.flush(record.id);
     await replyToInteraction(i, {
       content:
@@ -17442,7 +17449,7 @@ export class Orchestrator {
       ...record,
       acpSessionId: newSessionId,
       updatedUtc: new Date().toISOString(),
-    });
+    }, { source: "Orchestrator.compactSessionFromThread", cause: "attach compacted provider session" });
     await this.identityEffects.flush(record.id);
     return { newSessionId, summary: summaryText };
   }
@@ -17472,7 +17479,7 @@ export class Orchestrator {
       agentId,
       acpSessionId: "",
       updatedUtc: new Date().toISOString(),
-    });
+    }, { source: "Orchestrator.migrateThreadAgentModelAndRebuild", cause: `operator requested migration to ${agentId}/${model}` });
     const overlay = this.configMutation.applyThreadOverlay({
       threadId: channel.id,
       ...(channel.parentId ? { parentRef: channel.parentId } : {}),
@@ -20773,14 +20780,8 @@ export class Orchestrator {
     record: ReturnType<SessionRouter["ensureSessionRecord"]>,
     cfg: ReturnType<SessionStore["readConfig"]>
   ): void {
-    // acp_session_id is assigned out-of-band (getOrStartRuntime / compaction),
-    // so the caller's in-memory record can lag the DB. A config write must NEVER
-    // clobber the live session binding — take the authoritative id from the DB
-    // when present (defense-in-depth on top of keeping the record in sync).
-    const live = this.store.get(record.id)?.acpSessionId;
     this.store.upsert({
       ...record,
-      ...(live ? { acpSessionId: live } : {}),
       configJson: this.store.writeConfig(cfg),
       updatedUtc: new Date().toISOString(),
     });

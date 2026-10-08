@@ -277,7 +277,7 @@ describe("real injection recording, offline runtime only", () => {
       session: "live", lifecycle: { isCurrent: () => false, beforePrompt() {}, onOutcome() {} } as never,
     });
     expect(store.contextBudgets.get(identity)).toBeUndefined();
-    store.upsert({ ...record, acpSessionId: "replacement-session" });
+    store.upsert({ ...record, acpSessionId: "replacement-session" }, { source: "fixture", cause: "set provider binding for test" });
     await orch.injectTurn(record, "synthetic", { session: "live" });
     expect(store.contextBudgets.get(identity)?.promptBudget).toBe(272_000);
     expect(store.readConfig(store.get(record.id)!).lastContextUsage).toBeUndefined();

@@ -606,7 +606,7 @@ describe("SessionStore.compareAndSwapAcpSession", () => {
       seed(store);
       const before = rawRow(store, "discord:cas");
 
-      expect(store.compareAndSwapAcpSession("discord:cas", "acp-source", "acp-new")).toBe(true);
+      expect(store.compareAndSwapAcpSession("discord:cas", "acp-source", "acp-new", { source: "fixture", cause: "intentional test binding change" })).toBe(true);
 
       const after = rawRow(store, "discord:cas");
       expect(after.acp_session_id).toBe("acp-new");
@@ -642,7 +642,7 @@ describe("SessionStore.compareAndSwapAcpSession", () => {
       seed(store);
       const before = rawRow(store, "discord:cas");
 
-      expect(store.compareAndSwapAcpSession("discord:cas", "acp-someone-else", "acp-new")).toBe(
+      expect(store.compareAndSwapAcpSession("discord:cas", "acp-someone-else", "acp-new", { source: "fixture", cause: "intentional test binding change" })).toBe(
         false
       );
 
@@ -656,10 +656,12 @@ describe("SessionStore.compareAndSwapAcpSession", () => {
     const store = openStore();
     try {
       const r = seed(store);
-      store.upsert({ ...r, acpSessionId: "", updatedUtc: "2026-02-02T00:00:00.000Z" });
+      store.upsert({ ...r, acpSessionId: "", updatedUtc: "2026-02-02T00:00:00.000Z" }, {
+        source: "fixture", cause: "prepare unbound attachment target",
+      });
       const before = rawRow(store, "discord:cas");
 
-      expect(store.compareAndSwapAcpSession("discord:cas", "", "acp-new")).toBe(true);
+      expect(store.compareAndSwapAcpSession("discord:cas", "", "acp-new", { source: "fixture", cause: "intentional test binding change" })).toBe(true);
 
       const after = rawRow(store, "discord:cas");
       expect(after.acp_session_id).toBe("acp-new");
@@ -676,7 +678,7 @@ describe("SessionStore.compareAndSwapAcpSession", () => {
   it("is a no-op on an unknown id", () => {
     const store = openStore();
     try {
-      expect(store.compareAndSwapAcpSession("discord:missing", "", "acp-new")).toBe(false);
+      expect(store.compareAndSwapAcpSession("discord:missing", "", "acp-new", { source: "fixture", cause: "intentional test binding change" })).toBe(false);
       expect(store.get("discord:missing")).toBeNull();
     } finally {
       store.close();

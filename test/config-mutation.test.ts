@@ -185,6 +185,26 @@ describe("agent channel restriction mutation (#308)", () => {
 // Tier A — session config: propose is side-effect free; apply mutates + audits
 // -------------------------------------------------------------------------
 
+describe("session binding survives delayed config proposals", () => {
+  it.each(["", "acp-previous"])("keeps the acquired binding when Apply uses snapshot %j", oldId => {
+    const record = makeRecord({ acpSessionId: oldId });
+    store.upsert(record);
+    const built = makeService().buildProposal(record, { session: { role: "reviewer" } });
+    expect(built.ok).toBe(true);
+    if (!built.ok) throw new Error(built.error);
+
+    expect(store.compareAndSwapAcpSession(record.id, oldId, "acp-live", { source: "fixture", cause: "intentional test binding change" })).toBe(true);
+    const writes: Readonly<SessionRecord>[] = [];
+    const unsubscribe = store.onSessionWrite(row => writes.push(row));
+    try {
+      expect(built.proposal.apply({ id: "operator", name: "Operator" }).ok).toBe(true);
+      expect(store.readConfig(store.get(record.id)!).role).toBe("reviewer");
+      expect(store.get(record.id)?.acpSessionId).toBe("acp-live");
+      expect(writes.at(-1)?.acpSessionId).toBe("acp-live");
+    } finally { unsubscribe(); }
+  });
+});
+
 describe("#366 all four configuration proposal doors", () => {
   for (const site of ["session", "preset", "channelPreset", "threadPreset"] as const) {
     it.each(passthroughCases)(`${site}: $name`, async fixture => {

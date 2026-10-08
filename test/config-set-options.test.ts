@@ -356,7 +356,7 @@ describe("/seam config set named parameters", () => {
     const bound = read(store);
     const modes = { sessionId: "bound-s1", ...structuredClone(CODEX_ACP_2_0_1_MODES) };
     store.upsert({ ...bound.record, acpSessionId: modes.sessionId,
-      configJson: store.writeConfig({ ...bound.cfg, codexModes: modes }) });
+      configJson: store.writeConfig({ ...bound.cfg, codexModes: modes }) }, { source: "fixture", cause: "set provider binding for test" });
     const connection = {
       newSession: vi.fn(async () => ({ sessionId: "isolated-s1", modes: structuredClone(CODEX_ACP_2_0_1_MODES),
         models: { currentModelId: "gpt-5.6-sol", availableModels: [] } })),

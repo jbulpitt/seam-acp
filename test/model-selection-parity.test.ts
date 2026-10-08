@@ -74,7 +74,7 @@ async function fixture(warm: boolean) {
     defaultAgentId: "claude", defaultModel: "known", seamMcp: localBridgeWiring(profile),
   });
   const initial = router.ensureSessionRecord({ platform: "discord", channelRef: worker, parentRef: parent, cwd: dir });
-  store.upsert({ ...initial, acpSessionId: "existing-provider-session", configJson: JSON.stringify({ model: "known", reasoningEffort: "low" }) });
+  store.upsert({ ...initial, acpSessionId: "existing-provider-session", configJson: JSON.stringify({ model: "known", reasoningEffort: "low" }) }, { source: "fixture", cause: "set provider binding for test" });
   const mutation = new ConfigMutationService({
     logger, store, modelCatalog: cache.catalog, describeConfig: row => router.describeConfig(row), presetsFile,
     isAgentAvailable: id => id === "claude", ollamaCloudEnabled: false,

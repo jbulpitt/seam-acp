@@ -86,7 +86,7 @@ describe("thread naming contributions", () => {
       const next = { ...original, configJson: JSON.stringify({ role: "analyst" }) };
       h.store.upsert(next);
       await h.orchestrator.flushIdentityEffects();
-      h.store.upsert({ ...next, acpSessionId: "new-session" });
+      h.store.upsert({ ...next, acpSessionId: "new-session" }, { source: "fixture", cause: "set provider binding for test" });
       await h.orchestrator.flushIdentityEffects();
       expect(h.store.get(original.id)?.namePrefix).toBe("🧬🌞🔬1️⃣");
       expect(h.names.get("thread")).toBe("🧬🌞🔬1️⃣ my task");

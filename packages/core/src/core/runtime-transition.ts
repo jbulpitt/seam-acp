@@ -1,10 +1,11 @@
 import { resolveThreadLocation } from "../config.js";
 import type { Config } from "../config.js";
-import type { SessionStore } from "./session-store.js";
+import type { SessionStore, SessionBindingChange } from "./session-store.js";
 import type { SessionRouter } from "./session-router.js";
 import type { BridgeHub } from "./bridge-hub.js";
 import type { ChannelRef } from "../platforms/chat-adapter.js";
 import type { Logger } from "../lib/logger.js";
+import { logger as journal } from "../lib/logger.js";
 import type { MutationActor } from "./config-mutation.js";
 import { ConfigApplyPlan, type TargetIdentityChanges } from "./config-apply-plan.js";
 import { bindSessionLocation } from "./location-bind.js";
@@ -158,7 +159,8 @@ export interface ThreadSessionControlDeps {
     get(id: string): SessionRecord | null | undefined;
     readConfig(record: SessionRecord): SessionConfigState;
     writeConfig(config: SessionConfigState): string;
-    upsert(record: SessionRecord): void;
+    upsert(record: SessionRecord, binding?: SessionBindingChange): void;
+    compareAndSwapAcpSession: SessionStore["compareAndSwapAcpSession"];
   };
   router: {
     describeConfig(record: SessionRecord, selection?: ConfigResolution): ConfigDescription;
@@ -247,7 +249,9 @@ export class RuntimeTransition {
     }, actor);
     if (!applied.ok) throw new Error(applied.error);
     const current = this.deps.store.get(target.id) ?? target;
-    this.deps.store.upsert({ ...current, acpSessionId: selection.acpSessionId, updatedUtc: new Date().toISOString() });
+    this.deps.store.upsert({ ...current, acpSessionId: selection.acpSessionId, updatedUtc: new Date().toISOString() }, {
+      source: "RuntimeTransition.adoptMigratedSession", cause: "attach migrated provider session",
+    });
     Object.assign(target, this.deps.store.get(target.id) ?? current);
     const migrated = this.deps.router.describeConfig(target);
     // D10: retire the source only after its prompt; load the seeded target next.
@@ -276,11 +280,14 @@ export class RuntimeTransition {
     if (reset.sessionReset) {
       await this.retire(record.id, {
         clearAcpSession: true,
+        bindingChange: { source: "RuntimeTransition.applySavedSelection", cause: `saved selection requires ${reset.resetReason}` },
         clearStartFailure: true,
         operatorIntent: "replace-session",
       });
       const current = this.deps.store.get(record.id) ?? record;
-      this.deps.store.upsert({ ...current, acpSessionId: "", updatedUtc: new Date().toISOString() });
+      this.deps.store.upsert({ ...current, acpSessionId: "", updatedUtc: new Date().toISOString() }, {
+        source: "RuntimeTransition.applySavedSelection", cause: `saved selection requires ${reset.resetReason}`,
+      });
       return;
     }
 
@@ -493,7 +500,7 @@ export class RuntimeTransition {
         );
       }
 
-      const forged = await this.forgeFreshSession(current.id);
+      const forged = await this.forgeFreshSession(current.id, "operator requested self migration");
       const info = forged.runtime.getSessionInfo();
       if (!info?.sessionId) throw new Error("Fresh runtime did not report a session id.");
       const fresh = this.deps.store.get(current.id);
@@ -513,7 +520,9 @@ export class RuntimeTransition {
       // old durable session so no process can keep writing stale target state.
       await this.retire(current.id, { clearStartFailure: true }).catch(() => {});
       const restored = this.deps.mutation.restoreThreadPresetEntry(current.channelRef, overlayBefore);
-      this.deps.store.upsert(snapshot);
+      this.deps.store.upsert(snapshot, {
+        source: "RuntimeTransition.commitSelfMigration", cause: `migration rollback: ${err instanceof Error ? err.message : String(err)}`,
+      });
       return {
         ok: false,
         error: `${err instanceof Error ? err.message : String(err)}${restored.ok ? "" : ` Overlay rollback failed: ${restored.error}`}`,
@@ -740,7 +749,7 @@ export class RuntimeTransition {
     let retiredUnverifiedSession = false;
 
     if (reset.sessionReset) {
-      const forged = await this.forgeFreshSession(target.id);
+      const forged = await this.forgeFreshSession(target.id, `configuration requires ${reset.resetReason}`);
       runtime = forged.runtime;
       newSessionId = runtime.getSessionInfo()?.sessionId;
     } else if (
@@ -828,7 +837,8 @@ export class RuntimeTransition {
         if (settled.retireSession) {
           // Discard a fresh session whose Fast state could not be confirmed.
           try {
-            await this.retire(target.id, { clearAcpSession: true });
+            await this.retire(target.id, { clearAcpSession: true,
+              bindingChange: { source: "RuntimeTransition.configure", cause: settled.refusal } });
             retiredUnverifiedSession = true;
           } catch (err) {
             // A failed retirement must not confirm Fast is off.
@@ -891,16 +901,12 @@ export class RuntimeTransition {
       location: describedBefore.location.value,
     };
 
-    const rollback = (): { acpRestored: boolean } => {
+    const rollback = (cause: string): { acpRestored: boolean } => {
       const overlayRestored = this.configMutation.restoreThreadPresetEntry(
         channel.id,
         overlayBefore
       );
-      this.store.upsert({
-        ...sessionBefore,
-        acpSessionId: "",
-        updatedUtc: new Date().toISOString(),
-      });
+      this.store.upsert({ ...sessionBefore, updatedUtc: new Date().toISOString() });
       const now = this.store.get(sessionBefore.id) ?? sessionBefore;
       const described = this.router.describeConfig(now);
       const canRestoreAcp =
@@ -908,14 +914,10 @@ export class RuntimeTransition {
         described.agent.value === originalEffective.agent &&
         described.model.value === originalEffective.model &&
         described.location.value === originalEffective.location;
-      if (canRestoreAcp) {
-        this.store.upsert({
-          ...now,
-          acpSessionId: sessionBefore.acpSessionId,
-          updatedUtc: new Date().toISOString(),
-        });
-        return { acpRestored: true };
-      }
+      this.store.upsert({ ...now, acpSessionId: canRestoreAcp ? sessionBefore.acpSessionId : "", updatedUtc: new Date().toISOString() }, {
+        source: "RuntimeTransition.captureSelection.rollback", cause: `${kind} selection rollback: ${cause}`,
+      });
+      if (canRestoreAcp) return { acpRestored: true };
       if (!overlayRestored.ok) {
         this.logger.warn(
           { err: overlayRestored.error, threadId: channel.id },
@@ -982,7 +984,7 @@ export class RuntimeTransition {
         actor,
       });
       if (!overlay.ok) {
-        const rolled = rollback();
+        const rolled = rollback(overlay.error);
         this.logger.warn(
           { err: overlay.error, threadId: channel.id },
           "thread model overlay write failed; mutation rolled back"
@@ -994,7 +996,7 @@ export class RuntimeTransition {
       const described = this.router.describeConfig(verified);
       const spawn = this.router.planRuntimeSpawn(verified);
       if (described.model.value !== canonicalId || spawn.model !== (selected?.runtimeId ?? canonicalId)) {
-        const rolled = rollback();
+        const rolled = rollback("effective configuration did not match the requested model");
         return fail(
           `the effective configuration did not match the requested model.${mismatchSuffix(rolled)}`
         );
@@ -1016,7 +1018,7 @@ export class RuntimeTransition {
       await respond(message);
       return { ok: true, message };
     } catch (err) {
-      const rolled = rollback();
+      const rolled = rollback(err instanceof Error ? err.message : String(err));
       const detail = err instanceof Error ? err.message : String(err);
       this.logger.warn({ err, threadId: channel.id }, "model switch threw; mutation rolled back");
       return fail(`${detail}${mismatchSuffix(rolled)}`);
@@ -1078,7 +1080,7 @@ export class RuntimeTransition {
         acpSessionId: "",
         configJson: this.store.writeConfig(cfg),
         updatedUtc: new Date().toISOString(),
-      });
+      }, { source: "RuntimeTransition.applyAgentChange", cause: `operator selected ${parsed.agentId}@${nextLocation}` });
 
       if (!sameLocation) {
         const written = this.configMutation.applyThreadLocation({
@@ -1088,7 +1090,7 @@ export class RuntimeTransition {
           actor,
         });
         if (!written.ok) {
-          const rolled = rollback();
+          const rolled = rollback(written.error);
           const suffix = rolled.acpRestored
             ? ""
             : " Previous ACP session was not restored because the effective agent/model/location no longer match.";
@@ -1106,7 +1108,7 @@ export class RuntimeTransition {
         actor,
       });
       if (!overlay.ok) {
-        const rolled = rollback();
+        const rolled = rollback(overlay.error);
         const suffix = rolled.acpRestored
           ? ""
           : " Previous ACP session was not restored because the effective agent/model/location no longer match.";
@@ -1127,7 +1129,7 @@ export class RuntimeTransition {
         spawn.model !== intendedSelection.raw.model ||
         spawn.effort !== intendedSelection.raw.effort
       ) {
-        const rolled = rollback();
+        const rolled = rollback("effective configuration did not match the requested agent/model/location");
         const suffix = rolled.acpRestored
           ? ""
           : " Previous ACP session was not restored because the effective agent/model/location no longer match.";
@@ -1152,7 +1154,7 @@ export class RuntimeTransition {
       await respond(message);
       return { ok: true, message };
     } catch (err) {
-      const rolled = rollback();
+      const rolled = rollback(err instanceof Error ? err.message : String(err));
       const detail = err instanceof Error ? err.message : String(err);
       const suffix = rolled.acpRestored
         ? ""
@@ -1194,7 +1196,19 @@ export class RuntimeTransition {
 
   async reset(target: SessionRecord): Promise<ResetThreadSessionOutcome> {
     const before = this.deps.router.describeConfig(target);
-    const forged = await this.forgeFreshSession(target.id);
+    const previous = this.deps.store.get(target.id) ?? target;
+    let forged;
+    try {
+      forged = await this.forgeFreshSession(target.id, "operator requested fresh session reset");
+    } catch (error) {
+      const cause = error instanceof Error ? error.message : String(error);
+      const restored = this.deps.store.compareAndSwapAcpSession(target.id, "", previous.acpSessionId,
+        { source: "RuntimeTransition.reset", cause: `fresh reset failed: ${cause}` });
+      journal.warn({ sessionId: target.id, previousAcpSessionId: previous.acpSessionId, cause, restored },
+        restored ? "fresh session replacement failed; restored previous binding"
+          : "fresh session replacement failed; retained current binding");
+      throw error;
+    }
     const sessionId = forged.runtime.getSessionInfo()?.sessionId;
     if (!sessionId) return { ok: false, error: "Fresh runtime did not report a session id." };
     await this.deps.identityCommitted?.(target.id);
@@ -1208,7 +1222,7 @@ export class RuntimeTransition {
   }
 
   private async forgeFreshSession(
-    sessionId: string
+    sessionId: string, cause: string
   ): Promise<{ record: SessionRecord; runtime: SessionControlRuntime }> {
     await this.retire(sessionId, { operatorIntent: "replace-session" });
     const current = this.deps.store.get(sessionId);
@@ -1217,11 +1231,17 @@ export class RuntimeTransition {
       ...current,
       acpSessionId: "",
       updatedUtc: new Date().toISOString(),
-    });
+    }, { source: "RuntimeTransition.forgeFreshSession", cause });
     const fresh = this.deps.store.get(sessionId);
     if (!fresh) throw new Error("Target session disappeared while forging its replacement.");
-    const runtime = await this.deps.router.getOrStartRuntime(fresh);
-    return { record: fresh, runtime };
+    try {
+      const runtime = await this.deps.router.getOrStartRuntime(fresh);
+      return { record: fresh, runtime };
+    } catch (error) {
+      journal.warn({ sessionId, previousAcpSessionId: current.acpSessionId,
+        cause: error instanceof Error ? error.message : String(error) }, "fresh session replacement failed");
+      throw error;
+    }
   }
 
   private async applyNaming(record: SessionRecord): Promise<boolean> {

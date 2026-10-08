@@ -629,17 +629,18 @@ export class ConfigApplyPlan {
         return { ok: true, record: committed, effective: this.router.describeConfig(committed), restartRequested: false };
       } catch (err) {
         const restored = this.restoreThreadPresetEntry(channel.id, overlay);
-        this.store.upsert(source);
+        this.store.upsert(source, { source: "ConfigApplyPlan.applyPreparedConfigSet",
+          cause: `config rollback: ${err instanceof Error ? err.message : String(err)}` });
         return { ok: false, message: err instanceof Error ? err.message : String(err), rollbackError: restored.ok ? "" : ` Overlay rollback failed: ${restored.error}` };
       }
     }
     let sessionBefore: SessionRecord | undefined;
     let overlayBefore: unknown | undefined;
     let mutationStarted = false;
-    const rollback = (): string => {
+    const rollback = (cause: string): string => {
       if (!mutationStarted || !sessionBefore) return "";
       const restored = this.configMutation.restoreThreadPresetEntry(channel.id, overlayBefore);
-      this.store.upsert(sessionBefore);
+      this.store.upsert(sessionBefore, { source: "ConfigApplyPlan.applyPreparedConfigSet", cause: `config rollback: ${cause}` });
       return restored.ok ? "" : ` Overlay rollback also failed: ${restored.error}`;
     };
     try {
@@ -700,7 +701,9 @@ export class ConfigApplyPlan {
           updatedUtc: new Date().toISOString(),
         };
         mutationStarted = true;
-        this.store.upsert(updated);
+        this.store.upsert(updated, agentChanged || locationChanged ? {
+          source: "ConfigApplyPlan.applyPreparedConfigSet", cause: `operator selected ${appliedAgentId}@${prepared.nextLocation}`,
+        } : undefined);
 
         const overlayChanges: { agent?: string; model?: string | null; effort?: string | null; location?: string } = {};
         if (request.values.agent !== null) {
@@ -748,7 +751,7 @@ export class ConfigApplyPlan {
     } catch (err) {
       let rollbackError = "";
       try {
-        rollbackError = rollback();
+        rollbackError = rollback(err instanceof Error ? err.message : String(err));
       } catch (rollbackFailure) {
         rollbackError = ` Rollback failed: ${
           rollbackFailure instanceof Error ? rollbackFailure.message : String(rollbackFailure)
@@ -804,7 +807,7 @@ export class ConfigApplyPlan {
               acpSessionId: "",
               configJson: this.store.writeConfig(cfg),
               updatedUtc: new Date().toISOString(),
-            });
+            }, { source: "ConfigApplyPlan.applyPresetToSession", cause: `preset switched agent to ${preset.agentId}` });
             record = this.store.get(record.id) ?? record;
             changes.push(
               `Agent → \`${preset.agentId}\` (model \`${inheritedModel.id}\`, effort \`${inherited.effort.value ?? inheritedModel.effort.selectionDefault}\`)`
@@ -891,17 +894,12 @@ export class ConfigApplyPlan {
       changes.push(`Status card → ${preset.statusCardStyle}`);
     }
 
-    // One write for config + repo. `acp_session_id` is assigned out-of-band, so
-    // re-read the authoritative value rather than trusting the in-memory record
-    // (see persistConfig) — unless the agent switch above deliberately cleared it.
     if (preset.repoPath) {
       identityChanges.cwd = preset.repoPath;
       delete cfg.sessionCwdExplicit;
     }
-    const live = this.store.get(record.id)?.acpSessionId;
     this.store.upsert({
       ...record,
-      ...(live ? { acpSessionId: live } : {}),
       ...(identityChanges.agent ? { agentId: identityChanges.agent } : {}),
       ...(preset.repoPath ? { repoPath: null } : {}),
       configJson: this.store.writeConfig(cfg),
@@ -1027,6 +1025,7 @@ export class ConfigApplyPlan {
         await this.runtime
           .retire(bound.id, {
             clearAcpSession: true,
+            bindingChange: { source: "ConfigApplyPlan.saveEditor", cause: "saved Fast-mode selection requires fresh session" },
             clearStartFailure: true,
             operatorIntent: "replace-session",
           })
@@ -1074,6 +1073,7 @@ export class ConfigApplyPlan {
               try {
                 await this.runtime.retire(bound.id, {
                   clearAcpSession: true,
+                  bindingChange: { source: "ConfigApplyPlan.saveEditor", cause: fastRefusal ?? "provider did not confirm Fast-mode state" },
                   clearStartFailure: true,
                 });
               } catch (err) {

@@ -50,7 +50,7 @@ async function fixture() {
     channelPresets: config.channelPresets, threadPresets: config.threadPresets });
   const record = router.ensureSessionRecord({ platform: "discord", channelRef: THREAD, parentRef: PARENT, cwd: directory });
   record.acpSessionId = "retained-acp-session";
-  store.upsert(record);
+  store.upsert(record, { source: "fixture", cause: "attach provider session for card visuals" });
   const panels: StructuredPanel[] = [];
   const adapter = { sendPanel: vi.fn(async (_channel, panel) => { panels.push(panel); return { channel: { platform: "discord", id: THREAD }, id: "card" }; }),
     editPanel: vi.fn(async (_ref, panel) => { panels.push(panel); }), sendMessage: vi.fn(async () => ({ id: "message" })), deleteMessage: vi.fn(async () => {}) };
@@ -83,6 +83,7 @@ describe("card-visuals built-in", () => {
 
   it("writes every scope through the real mutation service without changing precedence or ACP identity", async () => {
     const h = await fixture();
+    expect(h.store.get(h.record.id)?.acpSessionId).toBe("retained-acp-session");
     const invalidate = vi.spyOn(h.router, "invalidate");
     await h.slash("card", { style: "full", scope: "thread" });
     await h.slash("gif", { state: "off", scope: "thread" });

@@ -37,7 +37,7 @@ function fixture(agentId = "claude") {
     defaultModel: "old", defaultPermissionMode: "ask",
   });
   const record = router.ensureSessionRecord({ platform: "discord", channelRef: "thread", parentRef: "channel", cwd: dir });
-  store.upsert({ ...record, acpSessionId: "existing-context", configJson: JSON.stringify({ model: "old", reasoningEffort: "low" }) });
+  store.upsert({ ...record, acpSessionId: "existing-context", configJson: JSON.stringify({ model: "old", reasoningEffort: "low" }) }, { source: "fixture", cause: "set provider binding for test" });
   const mutation = new ConfigMutationService({
     store, logger, modelCatalog, describeConfig: record => router.describeConfig(record),
     isAgentAvailable: id => Boolean(router.getProfile(id)), ollamaCloudEnabled: true,

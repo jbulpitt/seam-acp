@@ -41,7 +41,7 @@ export interface WarmSetRouter {
   getRuntime(sessionId: string): { markActivity(): void; getSlot?(): number | undefined } | undefined;
   isBusy(sessionId: string): boolean;
   resumeExistingSession(record: SessionRecord): Promise<unknown>;
-  invalidate(sessionId: string, opts?: { clearAcpSession?: boolean }): Promise<void>;
+  invalidate: SessionRouter["invalidate"];
 }
 
 export class WarmSetManager {
@@ -202,7 +202,9 @@ export class WarmSetManager {
         "warm-set: load failed; marking cold",
       );
       if (gone) {
-        await this.opts.router.invalidate(record.id, { clearAcpSession: true }).catch(() => {});
+        await this.opts.router.invalidate(record.id, { clearAcpSession: true,
+          bindingChange: { source: "WarmSetManager.loadOne", cause: err instanceof Error ? err.message : String(err) },
+        }).catch(() => {});
       }
     }
   }

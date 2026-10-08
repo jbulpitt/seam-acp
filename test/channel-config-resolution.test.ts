@@ -155,7 +155,7 @@ describe("one channel configuration resolution", () => {
 
   it("backfills a parent without replacing context, agent, or explicit config", () => {
     const h = fixture();
-    store.upsert({ ...h.record, parentRef: null, acpSessionId: "kept-context", agentId: "claude", configJson: '{"model":"claude-explicit"}' });
+    store.upsert({ ...h.record, parentRef: null, acpSessionId: "kept-context", agentId: "claude", configJson: '{"model":"claude-explicit"}' }, { source: "fixture", cause: "set provider binding for test" });
     const before = store.get(h.record.id)!;
     const linked = h.router.ensureSessionRecord({ platform: "discord", channelRef: channel.id, parentRef: "111111111111111111", cwd: dir });
     expect(linked).toMatchObject({ ...before, parentRef: "111111111111111111", updatedUtc: expect.any(String) });
@@ -258,7 +258,7 @@ describe("one channel configuration resolution", () => {
     const spawnPlans: unknown[] = [];
     vi.spyOn(h.router, "getOrStartRuntime").mockImplementation(async row => {
       spawnPlans.push(h.router.planRuntimeSpawn(row));
-      store.upsert({ ...row, acpSessionId: "new-context" });
+      store.upsert({ ...row, acpSessionId: "new-context" }, { source: "fixture", cause: "set provider binding for test" });
       return { getSessionInfo: () => ({ sessionId: "new-context" }) } as any;
     });
     const result = await h.runtime.configure(h.record, store.get(h.record.id)!, { agent: "codex" });
@@ -281,7 +281,7 @@ describe("one channel configuration resolution", () => {
   it.each([false, true])("self migration commits inheritance or restores the exact overlay on failure (%s)", async fail => {
     const h = fixture();
     h.plan.applyTargetIdentity(h.record, { agent: "claude", model: "claude-explicit", effort: "low" }, actor);
-    store.upsert({ ...store.get(h.record.id)!, acpSessionId: "original-context" });
+    store.upsert({ ...store.get(h.record.id)!, acpSessionId: "original-context" }, { source: "fixture", cause: "set provider binding for test" });
     const before = store.get(h.record.id)!;
     const overlay = h.mutation.readThreadPresetEntry(channel.id);
     const staged = await h.runtime.prepareSelfMigration(before, { agent: "codex", manifest: "continue" });
@@ -289,7 +289,7 @@ describe("one channel configuration resolution", () => {
     const start = vi.spyOn(h.router, "getOrStartRuntime").mockImplementation(async row => {
       expect(h.router.planRuntimeSpawn(row)).toMatchObject({ agentId: "codex", model: "codex-channel", effort: "high" });
       if (fail) throw new Error("provider load failed");
-      store.upsert({ ...row, acpSessionId: "migrated-context" });
+      store.upsert({ ...row, acpSessionId: "migrated-context" }, { source: "fixture", cause: "set provider binding for test" });
       return { getSessionInfo: () => ({ sessionId: "migrated-context" }) } as any;
     });
     const result = await h.runtime.executeSelfMigration(before, staged.migration);
@@ -307,7 +307,7 @@ describe("one channel configuration resolution", () => {
 
   it.each([false, true])("isolated spawn, attempt and panel share one inherited identity (explicit=%s)", async explicit => {
     const h = fixture();
-    store.upsert({ ...h.record, agentId: "claude", acpSessionId: "live-context", configJson: '{"model":"claude-explicit","reasoningEffort":"low"}' });
+    store.upsert({ ...h.record, agentId: "claude", acpSessionId: "live-context", configJson: '{"model":"claude-explicit","reasoningEffort":"low"}' }, { source: "fixture", cause: "set provider binding for test" });
     const before = store.get(h.record.id)!;
     const mux = { spawn: vi.fn(() => ({ slot: 1 })),
       rpc: vi.fn(async () => ({ projectMcpInjection: true })), releaseStdin: vi.fn() };

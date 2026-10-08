@@ -160,6 +160,7 @@ describe("Orchestrator.interruptRedirect (#67)", () => {
     // Removing operator intent leaves older work bound to the discarded session recoverable.
     expect(invalidate).toHaveBeenCalledWith("discord:thread-worker", {
       clearAcpSession: true,
+      bindingChange: { source: "Orchestrator.interruptRedirect", cause: "operator requested fresh interrupt" },
       operatorIntent: "replace-session",
     });
     const spec = pendingSpecs()[0]!;

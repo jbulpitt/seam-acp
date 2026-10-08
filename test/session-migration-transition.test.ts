@@ -69,7 +69,9 @@ async function fixture(location = "local") {
   const router = new SessionRouter({ store, logger, profiles, modelCatalog, threadPresets,
     defaultAgentId: "claude", defaultModel: "claude-default", defaultPermissionMode: "ask", seamMcp: localBridgeWiring(profiles) });
   const record = router.ensureSessionRecord({ platform: "discord", channelRef: threadId, parentRef: parentId, cwd: dir });
-  store.upsert({ ...record, acpSessionId: "source-context", configJson: JSON.stringify({ model: "claude-other" }) });
+  store.upsert({ ...record, acpSessionId: "source-context", configJson: JSON.stringify({ model: "claude-other" }) }, {
+    source: "fixture", cause: "attach source context before migration",
+  });
   Object.assign(record, store.get(record.id));
   const warm = await router.getOrStartRuntime(record);
   const mutation = new ConfigMutationService({ store, logger, modelCatalog,

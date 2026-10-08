@@ -1,12 +1,18 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
 import { DispatchWatcher } from "../packages/core/src/core/dispatch/watcher.js";
 import { executionIdentity } from "../packages/core/src/core/dispatch/execution-identity.js";
 import { ChoiceResultHub } from "../packages/core/src/core/choice/result.js";
+import { AgentRuntime } from "../packages/core/src/agents/agent-runtime.js";
+import { planIsolatedBridgeSpawn } from "../packages/core/src/core/location-bind.js";
+import { DEFAULT_REMOTE_RUNG1_POLICY } from "../packages/core/src/core/remote-spawn.js";
+import type { AgentProfile } from "@seam/adapters";
 import type { DispatchSpec } from "../packages/core/src/core/dispatch/types.js";
 
 let dir: string;
@@ -67,6 +73,76 @@ beforeEach(() => {
 afterEach(() => { watcher.stop(); store.close(); fs.rmSync(dir, { recursive: true, force: true }); });
 
 describe("ingest interrupted-dispatch recovery", () => {
+  it.each(["local", "remote"])("binds an isolated %s holder before prompting, then adopts it instead of loading a second writer", async location => {
+    const spec = { ...ingestSpec(), location };
+    const attempt = store.turnAttempts.claim(spec,
+      executionIdentity({ agent: "codex", location, session: "isolated", model: "recorded-model", cwd: dir }), "old-boot");
+    store.turnAttempts.bind(attempt, "recorded-acp");
+    store.turnAttempts.startPrompt(attempt);
+    pendingResult(spec);
+    const child = Object.assign(new EventEmitter(), {
+      slot: 42, stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(), kill: vi.fn(),
+    });
+    const rpc = vi.fn(async (_method: string, params: any) => ({
+      projectMcpInjection: true,
+      ...(params.rung1Recovery ? { rung1RecoveryVersion: 1 } : {}),
+    }));
+    const sendCmd = vi.fn(async (action: string, params: any) => {
+      if (action === "listSlots") return { health: [{ slot: 42, alive: true }] };
+      if (action !== "armRung1Recovery") throw new Error(`unexpected command ${action}`);
+      return { version: 1, owner: "bridge", rung: 1, phase: "armed", retry: 0, budget: 3,
+        remaining: 3, disposition: "none", submissionId: params.submissionId,
+        acpSessionId: params.acpSessionId, updatedUtc: spec.createdUtc };
+    });
+    const mux = { spawn: vi.fn(() => child), rpc, releaseStdin: vi.fn(), sendCmd,
+      isBound: vi.fn(() => false), sendFrame: vi.fn() };
+    orch.bridgeHub = { get: vi.fn(() => ({ mux })), muxFor: vi.fn(() => mux),
+      markSessionBridge: vi.fn(), mcpServersForBridgeSpawn: vi.fn() };
+    const plan = planIsolatedBridgeSpawn({ hub: orch.bridgeHub, sessionId: `dispatch:${spec.id}`,
+      location, agentId: "codex", cwd: dir, model: "recorded-model" });
+    const runtime = new AgentRuntime({ profile: { id: "codex" } as AgentProfile,
+      logger: orch.logger, bridgeHealth: mux, spawnFn: plan.spawnFn });
+    let started!: () => void;
+    const prompted = new Promise<void>(resolve => { started = resolve; });
+    let finish!: (value: { stopReason: string }) => void;
+    const originalReply = new Promise<{ stopReason: string }>(resolve => { finish = resolve; });
+    const prompt = vi.fn(() => { started(); return originalReply; });
+    Object.assign(runtime, { child: await plan.spawnFn(), connection: { prompt },
+      sessionId: "recorded-acp", promptCapabilities: {} });
+    const original = runtime.prompt("original HTTP request", undefined, {
+      recoveryScope: "ephemeral",
+      onRemoteRecovery: binding => { store.turnAttempts.recordRemoteRecovery(attempt, { ...binding, location }); },
+      onRemoteRecoveryReleased: binding => { store.turnAttempts.releaseRemoteRecovery(attempt, { ...binding, location }); },
+    });
+    try {
+      await prompted;
+      expect(store.turnAttempts.get(spec.id)?.remoteRecovery).toMatchObject({
+        slot: 42, location, acpSessionId: "recorded-acp", generation: 1,
+      });
+      expect(rpc).toHaveBeenCalledWith("spawn", expect.objectContaining({
+        rung1Recovery: DEFAULT_REMOTE_RUNG1_POLICY,
+      }), { agentId: "codex" });
+      store.turnAttempts.markStalled(spec.id, "controller restart");
+      orch.adoptRemoteRecovery = vi.fn(async () => {});
+      orch.requestDispatchContinuation = vi.fn();
+      await orch.recoverInterruptedTurns();
+      expect(orch.adoptRemoteRecovery).toHaveBeenCalledWith(expect.objectContaining({ id: spec.id }));
+      expect(orch.requestDispatchContinuation).not.toHaveBeenCalled();
+      expect(mux.spawn).toHaveBeenCalledTimes(1);
+      expect(prompt).toHaveBeenCalledTimes(1);
+      expect(store.getChoiceResult(spec.id)?.status).toBe("pending");
+      vi.useFakeTimers();
+      orch.sweepUnownedSlots(location);
+      await vi.advanceTimersByTimeAsync(90_001);
+      expect(mux.sendFrame).not.toHaveBeenCalled();
+      expect(child.kill).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+      finish({ stopReason: "end_turn" });
+      await original;
+    }
+  });
+
   it("continues a recorded headless ingest without treating its endpoint ref as a Discord thread", async () => {
     const spec = ingestSpec();
     suspended(spec);

@@ -145,6 +145,8 @@ export interface SessiondListSlotsResult {
   /** Entry existence, retained for compatibility with the bridge contract. */
   slots: number[];
   health: SessiondSlotHealth[];
+  /** Optional on older daemons. Identity of the daemon, not its holders. */
+  supervisor?: { pid: number; entrypoint: string; releaseSha: string | null };
 }
 
 export interface SessiondReplayOutputResult {

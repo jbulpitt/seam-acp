@@ -5,6 +5,7 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
+import net from "node:net";
 import { parseEnv } from "node:util";
 import process from "node:process";
 import { gunzipSync } from "node:zlib";
@@ -54,6 +55,15 @@ function assertUid(stat, uid, code) { if (stat.uid !== uid) fail(code); }
 const argv = process.argv.slice(2);
 if (argv.length < 13) fail("argument_count");
 const [bridgeId, pm2App, verifyAgent, uidText, checkoutPath, entrypointPath, nodePath, pm2ModulePath, workspaceText, releaseRoot, launcherKind, launcherPathText, mode, ...actionArgs] = argv;
+function takeOption(name) {
+  const index = actionArgs.indexOf(name);
+  if (index < 0) return undefined;
+  return actionArgs.splice(index, 2)[1];
+}
+const sessiondApp = takeOption("--sessiond-app") ?? "seam-sessiond";
+const configOverride = takeOption("--config-path");
+if (!NAME.test(sessiondApp)) fail("unsafe_sessiond_app");
+if (configOverride !== undefined) exactPath(configOverride, "unsafe_config_path");
 let safePhase = "arguments";
 let pidFilePath = "";
 if (![bridgeId, pm2App, verifyAgent].every((v) => NAME.test(v))) fail("unsafe_identity_name");
@@ -102,7 +112,7 @@ function nativeInstallPlan() {
   return { abi, target, prebuild, ready: NATIVE_PREBUILD_ABIS.has(abi) && NATIVE_PREBUILD_TARGETS.has(target) };
 }
 
-async function pm2Describe() {
+async function pm2Describe(app = pm2App) {
   let pm2;
   try { pm2 = require(pm2ModulePath); } catch { fail("configured_pm2_module_unavailable"); }
   if (!pm2 || typeof pm2.connect !== "function") fail("configured_pm2_connect_missing");
@@ -115,7 +125,7 @@ async function pm2Describe() {
     try {
       pm2.connect((connectError) => {
         if (connectError) return finish(new Error("pm2_connect_failed"));
-        try { pm2.describe(pm2App, (describeError, rows) => finish(describeError ? new Error("pm2_describe_failed") : null, rows)); }
+        try { pm2.describe(app, (describeError, rows) => finish(describeError ? new Error("pm2_describe_failed") : null, rows)); }
         catch { finish(new Error("pm2_describe_threw")); }
       });
     } catch { finish(new Error("pm2_connect_threw")); }
@@ -166,8 +176,8 @@ async function processArgv(pid) {
   } catch (error) { if (error?.code) throw error; fail("process_argv_unavailable"); }
 }
 
-async function systemctlShow(property) {
-  const result = await runBounded("/usr/bin/systemctl", ["show", pm2App, "-p", property, "--value"], { timeoutMs: 10_000, stdoutLimit: 4096, stderrLimit: 4096 });
+async function systemctlShow(property, unit = pm2App) {
+  const result = await runBounded("/usr/bin/systemctl", ["show", unit, "-p", property, "--value"], { timeoutMs: 10_000, stdoutLimit: 4096, stderrLimit: 4096 });
   return result.stdout.trim();
 }
 
@@ -178,6 +188,7 @@ async function systemdMainPid() {
 // #618: a bare `connect` takes every setting from the host's bridge config
 // file, so the same identity checks run against that file instead of argv.
 function bridgeConfigPath() {
+  if (configOverride) return configOverride;
   const base = process.env.XDG_CONFIG_HOME?.trim() || path.join(process.env.HOME?.trim() || os.homedir(), ".config");
   return path.join(base, "seam", "bridge.env");
 }
@@ -599,6 +610,97 @@ async function waitForReplacement(oldPid, seconds) {
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
   fail("replacement_pid_timeout");
+}
+
+async function sessiondSupervisorPid() {
+  if (launcherKind === "systemd") return parsePid(await systemctlShow("MainPID", sessiondApp), "sessiond_mainpid_invalid");
+  const rows = await pm2Describe(sessiondApp);
+  const row = rows.find(item => item.pm2_env?.name === sessiondApp);
+  if (!row) throw new Error(`sessiond app ${sessiondApp} is absent from PM2`);
+  return parsePid(row.pid, "sessiond_mainpid_invalid");
+}
+
+function sessiondConfig() {
+  let config = {};
+  try { config = parseEnv(fs.readFileSync(bridgeConfigPath(), "utf8")); }
+  catch (error) { if (error.code !== "ENOENT") throw error; }
+  const home = process.env.HOME || os.homedir();
+  return {
+    socket: config.SEAM_SESSIOND_SOCKET ?? path.join(home, ".seam/sessiond/control.sock"),
+    state: config.SEAM_SESSIOND_STATE ?? path.join(home, ".seam/sessiond/slots.json"),
+  };
+}
+
+function listSessiond(socketPath) {
+  return new Promise((resolve, reject) => {
+    const socket = net.connect(socketPath);
+    const timer = setTimeout(() => socket.destroy(new Error(`sessiond listSlots timed out: ${socketPath}`)), 10_000);
+    let buffer = "", complete = false;
+    socket.once("connect", () => socket.write(`${JSON.stringify({ v: 1, id: "rollout", method: "listSlots" })}\n`));
+    socket.on("data", chunk => {
+      buffer += chunk.toString();
+      const newline = buffer.indexOf("\n");
+      if (newline < 0) return;
+      try {
+        const reply = JSON.parse(buffer.slice(0, newline));
+        if (!reply.ok) throw new Error(reply.error?.message ?? "sessiond listSlots rejected");
+        complete = true; resolve(reply.payload); socket.end();
+      } catch (error) { socket.destroy(error); }
+    });
+    socket.once("error", reject);
+    socket.once("close", () => { clearTimeout(timer); if (!complete) reject(new Error(`sessiond connection closed: ${socketPath}`)); });
+  });
+}
+
+async function readSessiondIdentity() {
+  // Read the configured supervisor first; never infer a daemon PID from a holder.
+  const pid = await sessiondSupervisorPid();
+  const config = sessiondConfig();
+  const listed = await listSessiond(config.socket);
+  if (listed.supervisor && listed.supervisor.pid !== pid) throw new Error(`sessiond socket PID ${listed.supervisor.pid} differs from supervisor PID ${pid}`);
+  let entrypoint = listed.supervisor?.entrypoint;
+  let releaseSha = listed.supervisor?.releaseSha ?? null;
+  if (!entrypoint) {
+    const args = process.platform === "linux" ? await processArgv(pid)
+      : (await runBounded("/bin/ps", ["-ww", "-o", "command=", "-p", String(pid)])).stdout.trim().split(/\s+/);
+    const script = args.find(arg => /^\/.*\/sessiond\.(?:js|ts)$/.test(arg));
+    if (!script) throw new Error(`sessiond PID ${pid} has no daemon entrypoint in argv`);
+    entrypoint = await fsp.realpath(script);
+    const release = path.resolve(entrypoint, "../../../..");
+    if (release.startsWith(`${releaseRoot}/releases/`)) {
+      releaseSha = JSON.parse(await fsp.readFile(path.join(release, "release-receipt.json"), "utf8")).sourceSha;
+    }
+  }
+  const holders = !listed.health.some(row => row.alive) ? [] : JSON.parse(await fsp.readFile(config.state, "utf8")).slots
+    .filter(row => row.identity && listed.health.some(item => item.slot === row.slot && item.alive))
+    .map(row => ({ slot: row.slot, pid: row.identity.pid, started: row.identity.started, childPid: row.pid }));
+  return { pid, entrypoint, releaseSha, holders, health: listed.health };
+}
+
+async function cutoverSessiond(before, entrypoint, releaseSha, seconds) {
+  if (before.entrypoint === entrypoint && before.releaseSha === releaseSha) return before;
+  // SIGTERM is main-PID-only even if an old PM2 app still enables tree killing.
+  process.kill(before.pid, "SIGTERM");
+  const deadline = Date.now() + seconds * 1000;
+  let cause;
+  while (Date.now() <= deadline) {
+    try {
+      const after = await readSessiondIdentity();
+      if (after.pid !== before.pid && !live(before.pid) && after.entrypoint === entrypoint && after.releaseSha === releaseSha) {
+        const pending = before.holders.filter(holder => live(holder.pid) && !after.health.some(row => row.slot === holder.slot && row.alive && row.attached && row.pid === holder.childPid));
+        if (!pending.length) {
+          console.log(`sessiond_old_pid=${before.pid}`); console.log(`sessiond_pid=${after.pid}`);
+          console.log(`sessiond_source_sha=${after.releaseSha ?? "unknown"}`);
+          console.log(`sessiond_holders_before=${JSON.stringify(before.holders)}`);
+          console.log(`sessiond_holders_after=${JSON.stringify(after.holders)}`);
+          return after;
+        }
+        cause = new Error(`sessiond has not reattached slots: ${pending.map(row => row.slot).join(",")}`);
+      } else cause = new Error(`sessiond release has not changed to ${entrypoint} (${releaseSha ?? "unknown"})`);
+    } catch (error) { cause = error; }
+    await new Promise(resolve => setTimeout(resolve, 250));
+  }
+  throw new Error(`sessiond cutover timed out: ${cause?.message}`, { cause });
 }
 
 async function writeActivationEnvelope(release, envelope) {
@@ -1495,6 +1597,14 @@ async function preflight() {
   console.log(`enrollment_id=${enrollment.record?.enrollmentId ?? "none"}`);
   console.log(`baseline_digest=${enrollment.record?.baselineDigest ?? "none"}`);
   console.log(`baseline_rollback_proof=${enrollment.record?.baseline?.rollbackProof ?? "none"}`);
+  try {
+    const daemon = await readSessiondIdentity();
+    console.log("sessiond_ready=yes"); console.log(`sessiond_pid=${daemon.pid}`);
+    console.log(`sessiond_entrypoint=${daemon.entrypoint}`); console.log(`sessiond_source_sha=${daemon.releaseSha ?? "unknown"}`);
+    console.log(`sessiond_holders=${JSON.stringify(daemon.holders)}`);
+  } catch (error) {
+    console.log("sessiond_ready=no"); console.log(`sessiond_cause=${error.message}`);
+  }
   console.log("identity_bound=yes"); console.log("remote_mutation=no");
 }
 
@@ -1594,6 +1704,7 @@ async function activateFromEnrolledBaseline(input) {
   if (forward.rolloutReady !== "yes") fail("first_activation_release_not_receipt_capable");
 
   const baseline = enrollment.record.baseline;
+  const daemonBefore = await readSessiondIdentity();
   const started = Date.now(); const deadline = started + timeout * 1000;
   const intent = {
     formatVersion: 2, kind: "activate", activationId, bridgeId, pm2App,
@@ -1612,17 +1723,19 @@ async function activateFromEnrolledBaseline(input) {
     verification: { forward: "receipt", catalogRpcsVerified: false, state: "pending" },
     activatedEntrypoint: `${release}/packages/bridge/dist/index.js`,
     oldPid: before.pid,
+    sessiondBefore: daemonBefore,
     startedAt: new Date(started).toISOString(), deadlineAt: new Date(deadline).toISOString(),
   };
   await fsp.writeFile(`${releaseRoot}/activations/${activationId}.intent.json`, safeJson(intent), { flag: "wx", mode: 0o600 });
   await writeActivationEnvelope(release, { formatVersion: 2, activationId, bridgeId, sourceSha, artifactChecksum: checksum, verificationAgent: verifyAgent, stageId: staged.stageId, oldPid: before.pid, startedAt: intent.startedAt, deadlineAt: intent.deadlineAt });
   safePhase = "first_activation_switch";
   await switchEntrypoint(intent.activatedEntrypoint);
-  process.kill(before.pid, "SIGUSR2");
+  const daemonAfter = await cutoverSessiond(daemonBefore, `${release}/packages/bridge/dist/sessiond.js`, sourceSha, timeout);
+  if (live(before.pid)) process.kill(before.pid, "SIGUSR2");
   const newPid = await waitForReplacement(before.pid, timeout);
   const after = await readLiveIdentity();
   if (after.pid !== newPid || after.entryReal !== intent.activatedEntrypoint || after.legacy) fail("replacement_identity_mismatch");
-  const observed = { ...intent, newPid, observedAt: nowIso() };
+  const observed = { ...intent, newPid, sessiondAfter: daemonAfter, observedAt: nowIso() };
   await fsp.writeFile(`${releaseRoot}/activations/${activationId}.observed.json`, safeJson(observed), { flag: "wx", mode: 0o600 });
   safePhase = "first_activation_receipt";
   const ready = await receiptOrUnconfirmed(
@@ -1684,16 +1797,21 @@ async function activate() {
     const previousName = path.basename(previousDir); const match = /^([0-9a-f]{40})-([0-9a-f]{64})$/.exec(previousName); if (!match) fail("previous_release_name_invalid");
     const previousReceipt = await validateRelease(previousDir, match[1], match[2]);
     const release = `${releaseRoot}/releases/${sourceSha}-${checksum}`; const staged = await validateRelease(release, sourceSha, checksum, stageId);
-    if (release === previousDir) fail("requested_release_already_active");
+    const daemonBefore = await readSessiondIdentity();
+    if (release === previousDir && daemonBefore.releaseSha === sourceSha && daemonBefore.entrypoint === `${release}/packages/bridge/dist/sessiond.js`) {
+      console.log("activation=current"); console.log(`sessiond_pid=${daemonBefore.pid}`); console.log(`sessiond_source_sha=${sourceSha}`); return;
+    }
     const started = Date.now(); const deadline = started + timeout * 1000;
     const intent = { formatVersion: 2, kind: "activate", activationId, bridgeId, pm2App, sourceSha, artifactChecksum: checksum, stageId, previous: { sourceSha: previousReceipt.sourceSha, artifactChecksum: previousReceipt.artifactChecksum, stageId: previousReceipt.stageId, entrypoint: before.entryReal }, verification: { forward: "receipt", catalogRpcsVerified: false, state: "pending" }, activatedEntrypoint: `${release}/packages/bridge/dist/index.js`, oldPid: before.pid, startedAt: new Date(started).toISOString(), deadlineAt: new Date(deadline).toISOString() };
+    intent.sessiondBefore = daemonBefore;
     await fsp.writeFile(`${releaseRoot}/activations/${activationId}.intent.json`, safeJson(intent), { flag: "wx", mode: 0o600 });
     await writeActivationEnvelope(release, { formatVersion: 2, activationId, bridgeId, sourceSha, artifactChecksum: checksum, verificationAgent: verifyAgent, stageId: staged.stageId, oldPid: before.pid, startedAt: intent.startedAt, deadlineAt: intent.deadlineAt });
     await switchEntrypoint(intent.activatedEntrypoint);
-    process.kill(before.pid, "SIGUSR2");
+    const daemonAfter = await cutoverSessiond(daemonBefore, `${release}/packages/bridge/dist/sessiond.js`, sourceSha, timeout);
+    if (live(before.pid)) process.kill(before.pid, "SIGUSR2");
     const newPid = await waitForReplacement(before.pid, timeout);
     const after = await readLiveIdentity(); if (after.pid !== newPid || after.entryReal !== intent.activatedEntrypoint || after.legacy) fail("replacement_identity_mismatch");
-    const observed = { ...intent, newPid, observedAt: nowIso() };
+    const observed = { ...intent, newPid, sessiondAfter: daemonAfter, observedAt: nowIso() };
     await fsp.writeFile(`${releaseRoot}/activations/${activationId}.observed.json`, safeJson(observed), { flag: "wx", mode: 0o600 });
     const ready = await receiptOrUnconfirmed(release, { activationId, sourceSha, artifactChecksum: checksum, stageId, oldPid: before.pid, newPid, started, deadline }, observed);
     if (!ready) return;
@@ -1742,6 +1860,7 @@ async function rollbackToEnrolledBaseline(input) {
   }
 
   const started = Date.now(); const deadline = started + timeout * 1000;
+  const daemonBefore = await readSessiondIdentity();
   const intent = {
     formatVersion: 2, kind: "rollback", rollbackId, failedActivationId,
     failedActivationRecordKind: recordKind, bridgeId, pm2App,
@@ -1756,6 +1875,7 @@ async function rollbackToEnrolledBaseline(input) {
       note: "pre-receipt baseline: restored by digest-exact content plus live process, supervisor, protocol and drain evidence",
     },
     oldPid: current.pid,
+    sessiondBefore: daemonBefore,
     startedAt: new Date(started).toISOString(), deadlineAt: new Date(deadline).toISOString(),
   };
   await fsp.writeFile(`${releaseRoot}/rollbacks/${failedActivationId}-${rollbackId}.intent.json`, safeJson(intent), { flag: "wx", mode: 0o600 });
@@ -1781,7 +1901,8 @@ async function rollbackToEnrolledBaseline(input) {
     await restoreStub();
     fail(verified.reason);
   }
-  process.kill(current.pid, "SIGUSR2");
+  const daemonAfter = await cutoverSessiond(daemonBefore, `${checkoutPath}/packages/bridge/dist/sessiond.js`, null, timeout);
+  if (live(current.pid)) process.kill(current.pid, "SIGUSR2");
   const newPid = await waitForReplacement(current.pid, timeout);
   safePhase = "baseline_rollback_prove";
   const after = await readLiveIdentity();
@@ -1797,7 +1918,7 @@ async function rollbackToEnrolledBaseline(input) {
   if (restoredCapabilities.protocolVersion !== "1") fail("rollback_baseline_protocol_unproven");
   if (restoredCapabilities.drainSupport !== "yes") fail("rollback_baseline_drain_unproven");
   const outcome = {
-    ...intent, newPid,
+    ...intent, newPid, sessiondAfter: daemonAfter,
     proved: {
       baselineDigest: state.record.baselineDigest,
       entrypointSha256: previous.entrypointSha256,
@@ -1854,16 +1975,20 @@ async function rollback() {
     if (!SHA.test(previous.sourceSha ?? "") || !HASH.test(previous.artifactChecksum ?? "") || !HASH.test(previous.stageId ?? "") || previous.entrypoint !== expectedPreviousEntrypoint) fail("rollback_previous_invalid");
     const previousDir = path.resolve(previous.entrypoint,"../../../.."); const previousReceipt = await validateRelease(previousDir, previous.sourceSha, previous.artifactChecksum, previous.stageId);
     const started = Date.now(); const deadline = started + timeout * 1000;
+    const daemonBefore = await readSessiondIdentity();
     const intent = { formatVersion: 2, kind: "rollback", rollbackId, failedActivationId, failedActivationRecordKind: recordKind, bridgeId, pm2App, from: { sourceSha: record.sourceSha, artifactChecksum: record.artifactChecksum, stageId: record.stageId, entrypoint: record.activatedEntrypoint, pid: current.pid, readyReceiptSha256: record.readyReceiptSha256 ?? null }, to: previous, oldPid: current.pid, startedAt: new Date(started).toISOString(), deadlineAt: new Date(deadline).toISOString() };
+    intent.sessiondBefore = daemonBefore;
     await fsp.writeFile(`${releaseRoot}/rollbacks/${failedActivationId}-${rollbackId}.intent.json`, safeJson(intent), { flag: "wx", mode: 0o600 });
     await writeActivationEnvelope(previousDir, { formatVersion: 2, activationId: rollbackId, bridgeId, sourceSha: previous.sourceSha, artifactChecksum: previous.artifactChecksum, verificationAgent: verifyAgent, stageId: previousReceipt.stageId, oldPid: current.pid, startedAt: intent.startedAt, deadlineAt: intent.deadlineAt });
-    await switchEntrypoint(previous.entrypoint); process.kill(current.pid,"SIGUSR2");
+    await switchEntrypoint(previous.entrypoint);
+    const daemonAfter = await cutoverSessiond(daemonBefore, `${previousDir}/packages/bridge/dist/sessiond.js`, previous.sourceSha, timeout);
+    if (live(current.pid)) process.kill(current.pid,"SIGUSR2");
     const newPid = await waitForReplacement(current.pid, timeout); const after = await readLiveIdentity();
     if (after.pid !== newPid || after.entryReal !== previous.entrypoint) fail("rollback_replacement_identity_mismatch");
     const ready = await requireActivationReceipt(previousDir, { activationId: rollbackId, sourceSha: previous.sourceSha, artifactChecksum: previous.artifactChecksum, stageId: previous.stageId, oldPid: current.pid, newPid, started, deadline });
     const catalogVerified = ready.kind === "full";
     const rollbackReadyReceiptSha256 = hash(await fsp.readFile(`${previousDir}/release-receipt.json`));
-    await fsp.writeFile(`${releaseRoot}/rollbacks/${failedActivationId}-${rollbackId}.verified.json`, safeJson({ ...intent, newPid, instanceId: ready.receipt.instanceId, readyReceipt: `${previousDir}/release-receipt.json`, ...(catalogVerified ? { readyReceiptSha256: rollbackReadyReceiptSha256 } : {}), verification: { forward: catalogVerified ? "receipt" : "hello", catalogRpcsVerified: catalogVerified }, verifiedAt: nowIso() }), { flag: "wx", mode: 0o600 });
+    await fsp.writeFile(`${releaseRoot}/rollbacks/${failedActivationId}-${rollbackId}.verified.json`, safeJson({ ...intent, newPid, sessiondAfter: daemonAfter, instanceId: ready.receipt.instanceId, readyReceipt: `${previousDir}/release-receipt.json`, ...(catalogVerified ? { readyReceiptSha256: rollbackReadyReceiptSha256 } : {}), verification: { forward: catalogVerified ? "receipt" : "hello", catalogRpcsVerified: catalogVerified }, verifiedAt: nowIso() }), { flag: "wx", mode: 0o600 });
     console.log("rollback=verified"); console.log(`catalog_rpcs_verified=${catalogVerified ? "yes" : "no"}`);
     if (!catalogVerified) console.log("verification_reason=catalog_rpc_not_observed");
     console.log(`rollback_id=${rollbackId}`); console.log(`old_pid=${current.pid}`); console.log(`new_pid=${newPid}`); console.log(`restored_sha=${previous.sourceSha}`); console.log(`restored_checksum=${previous.artifactChecksum}`);

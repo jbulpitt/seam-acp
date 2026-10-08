@@ -2,14 +2,15 @@
 
 This is the reviewed update mechanism for receipt-capable Seam bridges, whether
 they run under PM2 or systemd. It ships an exact committed artifact without
-remote Git, drains only with `SIGUSR2`, proves the replacement on its exact
+remote Git, detaches the bridge with `SIGUSR2`, proves the replacement on its exact
 controller connection, and keeps rollback explicit and version-bound. It never
 restarts the controller.
 
-A bare invocation is read-only. Every mutation requires `--apply`, one exact
-target, and one phase. There is no host loop, implicit rollback, PM2 restart or
-reload fallback, environment dump, provider authentication, or provider catalog
-parsing.
+A bare invocation is read-only. Mutations require `--apply`. `--target` operates
+on one exact target; `--all --rollout --apply` runs the same path for every
+configured target and reports skipped hosts. Rollback remains explicit and
+target-bound. There is no PM2 restart/reload fallback, environment dump, provider
+authentication, or provider catalog parsing.
 
 ## Target inventory
 
@@ -30,7 +31,9 @@ is elsewhere.
 For each enabled bridge the map pins the bridge ID, SSH alias, supervisor name,
 verification agent, UID, checkout, stable entrypoint, Node executable, optional
 workspace argument, and rollout root. PM2 targets also pin the PM2 module;
-systemd targets pin `launcher=systemd` and their launcher path. None is
+systemd targets pin `launcher=systemd` and their launcher path. The optional
+`sessiondApp` names the daemon's supervisor app/unit (default `seam-sessiond`);
+`bridgeConfigPath` selects a second instance's own config file. None is
 overridable on the command line. Excluded hosts remain in the fleet denominator
 and every attempted phase refuses with the recorded reason.
 
@@ -64,6 +67,14 @@ remote Git; a
 managed release is fully revalidated before its receipt is reported. Run the
 preflight separately for each host. Choose and document a canary in
 `docs/local/`; obtain separate authorization before operating on another host.
+
+PREFLIGHT reports the daemon's main PID, actual entrypoint, release SHA, and
+live holder identities through its existing `listSlots` protocol. Older daemons
+are identified from their supervisor and process argv. A daemon inspection
+failure is reported as `sessiond_ready=no` with the real cause; it is not hidden
+behind the bridge's release. Install the standard daemon app/unit and launcher
+from `ops/bridge/` before activating a host that still uses a detached daemon.
+Use the same bridge config file for both processes.
 
 PREFLIGHT also reports the inventory-bound `verification_agent` and the PM2
 `process_started_at` time (or `unknown` if PM2 does not expose one). Before
@@ -338,10 +349,9 @@ Before using this, the baseline must have been proven restorable end to end on
 that host: `--restore-baseline` exercises the same verification the rollback
 would, without signalling anything.
 
-Enrollment changes nothing about drain semantics and makes no claim about
-mid-turn safety. `SIGUSR2` still exits after ten seconds without output or a
-five-minute hard limit, and silence is still not proof that a provider turn
-reached a terminal event, so a host must not be activated mid-turn.
+Enrollment changes nothing about turn ownership. The bridge detaches on
+`SIGUSR2`; sessiond's holders retain running work through both bridge and daemon
+replacement. A live turn is not cancelled or restarted by a rollout.
 
 ### 2. PREPARE + UPLOAD + STAGE
 
@@ -413,8 +423,17 @@ ACTIVATE first proves the active deployment, lock roots, current managed release
 and requested release, then takes the target lock and proves them again. It
 writes an immutable activation intent and a fresh random activation envelope
 bound to target, app, source SHA, checksum, stage ID, old PID, start time, and
-deadline. It atomically switches only the stable entrypoint and sends only
-`SIGUSR2` to the proven old PID.
+deadline. It atomically switches the stable entrypoint, sends `SIGTERM` only to
+the daemon's proven main PID, and lets its existing supervisor respawn it on the
+new release. It verifies the new daemon and reattached live holders, then sends
+`SIGUSR2` to the old bridge if it has not already exited on daemon disconnect.
+Neither signal targets a holder or agent child. This is safe even when a legacy
+PM2 app would tree-kill on `pm2 restart`; that command is never used.
+
+A bridge already on the requested release is not enough: a stale daemon is
+updated through the same activation. If both are already current, activation
+reports `activation=current` without signalling either process. Intent and
+outcome records include before/after daemon and holder identities.
 
 Within the bounded timeout, success requires positive observation that the old
 PID exited; a distinct, owned PID appeared in the exact PID file; the supervisor
@@ -507,8 +526,9 @@ PID appeared before observation, its exact activation envelope and receipt PID
 must bind it to the same failed activation. The current failed release, its
 activation envelope, and the exact previous release receipt/tree are fully
 revalidated before any switch. ROLLBACK then writes an immutable rollback
-intent, atomically restores the exact previous entrypoint, and sends only
-`SIGUSR2` to the currently proven PID. It applies the same old-exit/new-PID/
+intent, atomically restores the exact previous entrypoint, and cuts sessiond
+back to that release by the same main-PID-only path. It detaches the bridge with
+`SIGUSR2` if still needed. It applies the same old-exit/new-PID/
 supervisor/entrypoint proof, and the same 20s hello observation, to the
 previous SHA, checksum, stage ID, and a new rollback nonce. Catalog RPCs in
 that window are recorded when they arrive; they are not a second wait on the
@@ -517,6 +537,23 @@ stay byte-identical. Later catalog RPCs for other agents append to it.
 Rollback refuses that record only when the activation id, pid, source SHA, or
 artifact checksum no longer match. Success produces an immutable versioned
 rollback outcome; mutable target-only state is never used.
+
+## Reconnect updates and sleeping Macs
+
+The controller subscribes to its existing bridge-ready event and invokes the
+same staged rollout for an outdated managed bridge or daemon. Hosts run serially;
+a reconnect during that host's update does not launch a second update. Failed,
+disconnected and unmanaged hosts are named, and an unsuccessful host is tried
+again on its next connection. There is no periodic update loop. Git ancestry
+determines "outdated": a newer bridge is not rolled back during a bridges-first,
+controller-last deployment.
+
+For Darwin, mutating rollout phases read `pmset -g batt` and proceed only on AC
+or at least 50% battery. A separate SSH worker holds
+`caffeinate -i -s -w <worker-pid>` across upload, install, cutover and verification.
+Closing that worker releases the inhibitor on success or failure. A low-power
+host is reported as skipped, not updated. Rollback still requires its exact
+activation ID.
 
 ## Locks and recovery boundaries
 

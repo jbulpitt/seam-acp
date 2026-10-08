@@ -7,6 +7,8 @@ import path from "node:path";
 import { gzipSync } from "node:zlib";
 import { afterEach, describe, expect, it } from "vitest";
 import { commandRunner, renderRemoteScript } from "../scripts/lib/bridge-rollout.mjs";
+import { cleanupRolloutDaemons, prepareRolloutSessiond } from "./helpers/rollout-sessiond.js";
+import { SessiondClient } from "../packages/bridge/src/sessiond-client.js";
 
 const repo = path.resolve(import.meta.dirname,".."); const H=(v:string)=>v.repeat(64);
 const fixtures: ActivationFixture[] = [];
@@ -15,13 +17,14 @@ type ActivationFixture = Awaited<ReturnType<typeof makeFixture>>;
 function put(block:Buffer,offset:number,length:number,value:string){block.write(value,offset,Math.min(length,Buffer.byteLength(value)),"utf8");}
 function oct(block:Buffer,offset:number,length:number,value:number){put(block,offset,length,`${value.toString(8).padStart(length-1,"0")}\0`);}
 function tarMember(name:string,bytes:Buffer){const h=Buffer.alloc(512);put(h,0,100,name);oct(h,100,8,0o600);oct(h,108,8,process.getuid!());oct(h,116,8,process.getgid!());oct(h,124,12,bytes.length);oct(h,136,12,0);h.fill(32,148,156);h[156]=48;put(h,257,6,"ustar\0");put(h,263,2,"00");const sum=h.reduce((a,b)=>a+b,0);put(h,148,8,`${sum.toString(8).padStart(6,"0")}\0 `);return Buffer.concat([h,bytes,Buffer.alloc((512-bytes.length%512)%512)]);}
-function makeArchive(sourceSha:string,indexSource:string){
+function makeArchive(sourceSha:string,indexSource:string,daemonSource:string){
   const names=["package.json","package-lock.json","packages/adapters/package.json","packages/bridge/package.json","packages/core/package.json"];
   const files=names.map((name)=>({path:name,bytes:Buffer.from(readFileSync(path.join(repo,name)))}));
   files.push(
     {path:"packages/adapters/dist/index.js",bytes:Buffer.from("export {};\n")},
     {path:"packages/adapters/dist/command-bus.js",bytes:Buffer.from('export const PROTOCOL_VERSION = 1;\nconst methods = ["describeModelCatalog", "fetchModelCatalog"];\n')},
     {path:"packages/bridge/dist/index.js",bytes:Buffer.from(indexSource)},
+    {path:"packages/bridge/dist/sessiond.js",bytes:Buffer.from(daemonSource)},
     {path:"packages/bridge/dist/rpc.js",bytes:Buffer.from("export function isAllowedRpcMethod(){}\nexport function dispatchAdapter(){}\n")},
   );
   const manifest=Buffer.from(`${JSON.stringify({formatVersion:2,sourceSha,files:files.map((f)=>({path:f.path,size:f.bytes.length,sha256:createHash("sha256").update(f.bytes).digest("hex")}))})}\n`);
@@ -41,23 +44,57 @@ prebuild-install
 `,{mode:0o755});
   const bridgeSource=(mode:string)=>`import fs from 'node:fs';import path from 'node:path';import{spawn}from'node:child_process';const entry=${JSON.stringify(entry)},pidFile=${JSON.stringify(pidFile)},pm2File=${JSON.stringify(pm2File)},node=${JSON.stringify(node)},cwd=${JSON.stringify(checkout)},mode=${JSON.stringify(mode)};let signalCount=0;function update(pid){const j=JSON.parse(fs.readFileSync(pm2File));j.pid=pid;j.pm_uptime=Date.now();fs.writeFileSync(pm2File,JSON.stringify(j));fs.writeFileSync(pidFile,String(pid));}const release=path.resolve(new URL('.',import.meta.url).pathname,'../../..');const ep=path.join(release,'activation-envelope.json'),rp=path.join(release,'release-receipt.json');if(mode!=='no-hello'&&fs.existsSync(ep)){const e=JSON.parse(fs.readFileSync(ep)),s=JSON.parse(fs.readFileSync(rp)),now=Date.now(),iso=ms=>new Date(ms).toISOString(),t=iso(now),describeAt=mode==='cross-clock'?iso(now+10):t,fetchAt=mode==='cross-clock'?iso(now+20):t,ackAt=mode==='cross-clock'?iso(now+7):t,started=mode==='stale'?'2000-01-01T00:00:00.000Z':e.startedAt,instance='instance-'+e.activationId.slice(0,12),ackChecksum=mode==='wrong-ack'?'f'.repeat(64):e.artifactChecksum,adapterRefusals=mode==='adapter-loss'?[{agentId:'agy',code:'configuration_incomplete',missing:['AGY_ENABLED=true','AGY_SHA256']}]:[];const good=mode==='hello-only'?{}:{catalogRpcs:{grok:{describeModelCatalogAt:describeAt,fetchModelCatalogAt:fetchAt}},controllerAck:{activationId:e.activationId,bridgeId:e.bridgeId,instanceId:instance,pid:process.pid,sourceSha:e.sourceSha,artifactChecksum:ackChecksum},controllerVerifiedAt:ackAt,completedAt:ackAt};function publish(extra){fs.writeFileSync(rp,JSON.stringify({...s,...e,pid:process.pid,instanceId:instance,protocolVersion:1,startedAt:started,helloAcceptedAt:t,adapterRefusals,...extra})+String.fromCharCode(10));}if(mode==='settle'){fs.writeFileSync(rp,JSON.stringify({...s,formatVersion:2,activationId:'a'.repeat(64),bridgeId:e.bridgeId,sourceSha:e.sourceSha,artifactChecksum:e.artifactChecksum,stageId:e.stageId,oldPid:e.oldPid,pid:process.pid,instanceId:instance,protocolVersion:1,helloAcceptedAt:t,startedAt:started})+String.fromCharCode(10));setTimeout(()=>publish({catalogRpcs:{grok:{describeModelCatalogAt:iso(now+50),fetchModelCatalogAt:iso(now+10)}},controllerAck:{activationId:'b'.repeat(64),bridgeId:e.bridgeId,instanceId:instance,pid:process.pid,sourceSha:e.sourceSha,artifactChecksum:e.artifactChecksum},controllerVerifiedAt:ackAt,completedAt:ackAt}),400);setTimeout(()=>publish(good),900);}else publish(good);}process.on('SIGUSR2',()=>{signalCount+=1;if(mode==='interrupt'&&signalCount===1)return;const c=spawn(node,[entry],{cwd,detached:true,stdio:'ignore'});c.unref();update(c.pid);setTimeout(()=>process.exit(0),100);});setInterval(()=>{},1000);\n`;
   await fs.writeFile(entry,bridgeSource("legacy"));
-  await fs.writeFile(pm2Module,`const fs=require('fs'),p=${JSON.stringify(pm2File)};module.exports={connect(cb){setImmediate(()=>cb(null))},describe(_n,cb){const j=JSON.parse(fs.readFileSync(p,'utf8'));setImmediate(()=>cb(null,[{pid:j.pid,pm_id:j.pm_id,pm2_env:{name:j.name,pm_id:j.pm_id,pm_pid_path:j.pidFile,pm_cwd:j.cwd,pm_exec_path:j.entry,exec_interpreter:j.node,pm_uptime:j.pm_uptime,args:['connect','--server','wss://controller.invalid','--token','fixture-token','--id','fixture']}}]))},disconnect(){}}`);
+  const daemon = await prepareRolloutSessiond(root, entry, node);
+  await fs.writeFile(pm2Module,`const fs=require('fs'),p=${JSON.stringify(pm2File)};module.exports={connect(cb){setImmediate(()=>cb(null))},describe(_n,cb){${daemon.pm2Describe}const j=JSON.parse(fs.readFileSync(p,'utf8'));setImmediate(()=>cb(null,[{pid:j.pid,pm_id:j.pm_id,pm2_env:{name:j.name,pm_id:j.pm_id,pm_pid_path:j.pidFile,pm_cwd:j.cwd,pm_exec_path:j.entry,exec_interpreter:j.node,pm_uptime:j.pm_uptime,args:['connect','--server','wss://controller.invalid','--token','fixture-token','--id','fixture']}}]))},disconnect(){}}`);
   const start=spawn(node,[entry],{cwd:checkout,detached:true,stdio:"ignore"});start.unref(); await fs.writeFile(pidFile,String(start.pid)); await fs.writeFile(pm2File,JSON.stringify({pid:start.pid,pm_id:0,pidFile,name:"fixture-app",cwd:checkout,entry,node,pm_uptime:Date.now()}));
   const shell=await renderRemoteScript(path.join(repo,"scripts/bridge-rollout-remote.sh"),path.join(repo,"scripts/bridge-rollout-remote.mjs"));
   const base=["fixture","fixture-app","grok",String(process.getuid!()),checkout,entry,node,pm2Module,"-",releaseRoot,"pm2","-"];
-  const run=(action:string[],timeoutMs=30_000)=>commandRunner({file:"/bin/sh",args:["-s","--",node,...base,...action],input:shell,timeoutMs});
+  const run=(action:string[],timeoutMs=30_000)=>commandRunner({file:"/bin/sh",args:["-s","--",node,...base,...action,"--config-path",daemon.configPath],input:shell,timeoutMs});
   await run(["prepare-upload",H("f")]);
-  const stage=async(sourceSha:string,source:string,operation:string)=>{const bytes=makeArchive(sourceSha,source),checksum=createHash("sha256").update(bytes).digest("hex"),upload=`bridge-${sourceSha}-${checksum}.tgz.upload-${operation}`;await fs.mkdir(path.join(releaseRoot,"incoming"),{recursive:true});await fs.writeFile(path.join(releaseRoot,"incoming",upload),bytes);const result=await run(["stage",sourceSha,checksum,upload,operation],60_000);return{sourceSha,checksum,stageId:operation,release:path.join(releaseRoot,"releases",`${sourceSha}-${checksum}`),result};};
+  const stage=async(sourceSha:string,source:string,operation:string)=>{const bytes=makeArchive(sourceSha,source,daemon.source),checksum=createHash("sha256").update(bytes).digest("hex"),upload=`bridge-${sourceSha}-${checksum}.tgz.upload-${operation}`;await fs.mkdir(path.join(releaseRoot,"incoming"),{recursive:true});await fs.writeFile(path.join(releaseRoot,"incoming",upload),bytes);const result=await run(["stage",sourceSha,checksum,upload,operation],60_000);return{sourceSha,checksum,stageId:operation,release:path.join(releaseRoot,"releases",`${sourceSha}-${checksum}`),result};};
   const old=await stage("1".repeat(40),bridgeSource(oldBehavior),H("1"));
   process.kill(start.pid!,"SIGKILL"); await new Promise((resolve)=>setTimeout(resolve,100)); await fs.unlink(entry); await fs.symlink(path.join(old.release,"packages/bridge/dist/index.js"),entry);
   const managed=spawn(node,[entry],{cwd:checkout,detached:true,stdio:"ignore"});managed.unref();await fs.writeFile(pidFile,String(managed.pid));await fs.writeFile(pm2File,JSON.stringify({pid:managed.pid,pm_id:0,pidFile,name:"fixture-app",cwd:checkout,entry,node,pm_uptime:Date.now()}));await new Promise((resolve)=>setTimeout(resolve,100));
   const next=await stage("2".repeat(40),bridgeSource(behavior),H("2"));
-  const value={root,checkout,releaseRoot,entry,pidFile,run,stage,failPrebuild,old,next}; fixtures.push(value); return value;
+  const value={root,checkout,releaseRoot,entry,pidFile,run,stage,failPrebuild,old,next,daemon}; fixtures.push(value); return value;
 }
 
-afterEach(async()=>{while(fixtures.length){const fixture=fixtures.pop()!;try{const pid=Number(await fs.readFile(fixture.pidFile,"utf8"));process.kill(pid,"SIGKILL");}catch{}await fs.rm(fixture.root,{recursive:true,force:true});}});
+afterEach(async()=>{await cleanupRolloutDaemons();while(fixtures.length){const fixture=fixtures.pop()!;try{const pid=Number(await fs.readFile(fixture.pidFile,"utf8"));process.kill(pid,"SIGKILL");}catch{}await fs.rm(fixture.root,{recursive:true,force:true});}});
 
 describe.sequential("production remote shell activation and rollback gates (#241)",()=>{
+  it("updates and rolls back sessiond without replacing a live holder or losing its output", async () => {
+    const f = await makeFixture();
+    const client = await SessiondClient.connect(f.daemon.socketPath);
+    let next: SessiondClient | undefined;
+    try {
+      const child = await client.spawn({ slot: 42, executable: process.execPath,
+        args: ["-e", 'process.stdin.on("data", chunk => process.stdout.write("echo:" + chunk)); setInterval(() => {}, 1000)'], cwd: f.root, env: {} });
+      const holdersBefore = JSON.parse(await fs.readFile(f.daemon.statePath, "utf8")).slots.map((row: { identity: unknown }) => row.identity);
+      const activation = H("a");
+      const activated = await f.run(["activate", f.next.sourceSha, f.next.checksum, f.next.stageId, activation, "20", H("b")], 40_000);
+      expect(activated.stdout).toContain("activation=verified");
+      expect(activated.stdout).toContain(`sessiond_source_sha=${f.next.sourceSha}`);
+      next = await SessiondClient.connect(f.daemon.socketPath);
+      expect((await next.listSlots()).health).toEqual(expect.arrayContaining([expect.objectContaining({ slot: 42, pid: child.pid, alive: true, attached: true })]));
+      await next.write(42, "after-upgrade\n");
+      await expect.poll(async () => (await next!.replayOutput({ slot: 42, afterSeq: 0 })).frames.map(frame => Buffer.from(frame.dataBase64 ?? "", "base64").toString()).join("")).toContain("echo:after-upgrade");
+      const rolled = await f.run(["rollback", activation, H("c"), "20", H("d")], 40_000);
+      expect(rolled.stdout).toContain("rollback=verified");
+      expect(rolled.stdout).toContain(`sessiond_source_sha=${f.old.sourceSha}`);
+      next.close(); next = await SessiondClient.connect(f.daemon.socketPath);
+      expect((await next.listSlots()).health).toEqual(expect.arrayContaining([expect.objectContaining({ slot: 42, pid: child.pid, alive: true, attached: true })]));
+      expect(JSON.parse(await fs.readFile(f.daemon.statePath, "utf8")).slots.map((row: { identity: unknown }) => row.identity)).toEqual(holdersBefore);
+    } finally { client.close(); next?.close(); }
+  }, 90_000);
+
+  it("repairs a stale daemon even when the bridge already runs the requested release", async () => {
+    const f = await makeFixture();
+    const result = await f.run(["activate", f.old.sourceSha, f.old.checksum, f.old.stageId, H("a"), "20", H("b")], 40_000);
+    expect(result.stdout).toContain("activation=verified");
+    expect(result.stdout).toContain(`sessiond_source_sha=${f.old.sourceSha}`);
+    expect(await fs.realpath(f.entry)).toBe(path.join(f.old.release, "packages/bridge/dist/index.js"));
+  }, 60_000);
+
   it("surfaces an adapter lost by the new build without refusing the verified upgrade", async () => {
     const f = await makeFixture("adapter-loss");
     const activation = H("0");

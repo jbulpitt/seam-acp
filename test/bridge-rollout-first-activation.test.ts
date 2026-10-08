@@ -23,6 +23,7 @@ import path from "node:path";
 import { gzipSync } from "node:zlib";
 import { afterEach, describe, expect, it } from "vitest";
 import { commandRunner, parseKeyValues, renderRemoteScript } from "../scripts/lib/bridge-rollout.mjs";
+import { cleanupRolloutDaemons, prepareRolloutSessiond } from "./helpers/rollout-sessiond.js";
 
 const repo = path.resolve(import.meta.dirname, "..");
 const H = (v: string) => v.repeat(64);
@@ -46,13 +47,14 @@ const CAPABLE_RPC = 'export function isAllowedRpcMethod(){return true}\nexport f
 /** The pre-catalog shape: drain and protocol 1, neither catalog RPC. */
 const LEGACY_COMMAND_BUS = 'export const PROTOCOL_VERSION = 1;\nconst m = [];\n';
 
-function makeArchive(sourceSha: string, indexSource: string) {
+function makeArchive(sourceSha: string, indexSource: string, daemonSource: string) {
   const names = ["package.json", "package-lock.json", "packages/adapters/package.json", "packages/bridge/package.json", "packages/core/package.json"];
   const files = names.map((name) => ({ path: name, bytes: Buffer.from(readFileSync(path.join(repo, name))) }));
   files.push(
     { path: "packages/adapters/dist/index.js", bytes: Buffer.from("export {};\n") },
     { path: "packages/adapters/dist/command-bus.js", bytes: Buffer.from(CAPABLE_COMMAND_BUS) },
     { path: "packages/bridge/dist/index.js", bytes: Buffer.from(indexSource) },
+    { path: "packages/bridge/dist/sessiond.js", bytes: Buffer.from(daemonSource) },
     { path: "packages/bridge/dist/rpc.js", bytes: Buffer.from(CAPABLE_RPC) },
   );
   const manifest = Buffer.from(`${JSON.stringify({ formatVersion: 2, sourceSha, files: files.map((f) => ({ path: f.path, size: f.bytes.length, sha256: createHash("sha256").update(f.bytes).digest("hex") })) })}\n`);
@@ -94,6 +96,7 @@ async function makeFixture(options: { receipt?: "good" | "wrong-nonce" } = {}) {
     `process.on('SIGUSR2',()=>{const c=spawn(node,[entry],{cwd,detached:true,stdio:'ignore'});c.unref();update(c.pid);setTimeout(()=>process.exit(0),100);});setInterval(()=>{},1000);\n`;
 
   await fs.writeFile(entry, bridgeSource);
+  const daemon = await prepareRolloutSessiond(root, entry, node);
   await fs.writeFile(path.join(checkout, "packages/bridge/package.json"), JSON.stringify({ name: "@seam/bridge", version: "0.1.0" }));
   await fs.writeFile(path.join(checkout, "packages/adapters/dist/command-bus.js"), LEGACY_COMMAND_BUS);
   await fs.writeFile(path.join(checkout, "packages/bridge/dist/rpc.js"), CAPABLE_RPC);
@@ -101,7 +104,7 @@ async function makeFixture(options: { receipt?: "good" | "wrong-nonce" } = {}) {
   await fs.writeFile(path.join(checkout, "package.json"), JSON.stringify({ name: "seam-acp", version: "0.1.0" }));
   await fs.mkdir(path.join(checkout, ".git"));
   await fs.writeFile(path.join(checkout, ".git/HEAD"), `${checkoutSha}\n`);
-  await fs.writeFile(pm2Module, `const fs=require('fs'),p=${JSON.stringify(pm2File)};module.exports={connect(cb){setImmediate(()=>cb(null))},describe(_n,cb){const j=JSON.parse(fs.readFileSync(p,'utf8'));setImmediate(()=>cb(null,[{pid:j.pid,pm_id:j.pm_id,pm2_env:{name:j.name,pm_id:j.pm_id,pm_pid_path:j.pidFile,pm_cwd:j.cwd,pm_exec_path:j.entry,exec_interpreter:j.node,pm_uptime:j.pm_uptime,args:['connect','--server','wss://controller.invalid','--token','fixture-token','--id','fixture']}}]))},disconnect(){}}`);
+  await fs.writeFile(pm2Module, `const fs=require('fs'),p=${JSON.stringify(pm2File)};module.exports={connect(cb){setImmediate(()=>cb(null))},describe(_n,cb){${daemon.pm2Describe}const j=JSON.parse(fs.readFileSync(p,'utf8'));setImmediate(()=>cb(null,[{pid:j.pid,pm_id:j.pm_id,pm2_env:{name:j.name,pm_id:j.pm_id,pm_pid_path:j.pidFile,pm_cwd:j.cwd,pm_exec_path:j.entry,exec_interpreter:j.node,pm_uptime:j.pm_uptime,args:['connect','--server','wss://controller.invalid','--token','fixture-token','--id','fixture']}}]))},disconnect(){}}`);
 
   const child = spawn(node, [entry], { cwd: checkout, detached: true, stdio: "ignore" });
   child.unref();
@@ -111,10 +114,10 @@ async function makeFixture(options: { receipt?: "good" | "wrong-nonce" } = {}) {
   const shell = await renderRemoteScript(path.join(repo, "scripts/bridge-rollout-remote.sh"), path.join(repo, "scripts/bridge-rollout-remote.mjs"));
   const base = ["fixture", "fixture-app", "grok", String(process.getuid!()), checkout, entry, node, pm2Module, "-", releaseRoot, "pm2", "-"];
   const run = (action: string[], timeoutMs = 60_000) =>
-    commandRunner({ file: "/bin/sh", args: ["-s", "--", node, ...base, ...action], input: shell, timeoutMs });
+    commandRunner({ file: "/bin/sh", args: ["-s", "--", node, ...base, ...action, "--config-path", daemon.configPath], input: shell, timeoutMs });
 
   const stage = async (sourceSha: string, operation: string) => {
-    const bytes = makeArchive(sourceSha, bridgeSource);
+    const bytes = makeArchive(sourceSha, bridgeSource, daemon.source);
     const checksum = createHash("sha256").update(bytes).digest("hex");
     const upload = `bridge-${sourceSha}-${checksum}.tgz.upload-${operation}`;
     await run(["prepare-upload", operation]);
@@ -134,6 +137,7 @@ const enroll = (f: Fixture, id = H("1")) => f.run(["enroll", id, H("2")]);
 const livePid = async (f: Fixture) => Number(await fs.readFile(f.pidFile, "utf8"));
 
 afterEach(async () => {
+  await cleanupRolloutDaemons();
   while (fixtures.length) {
     const fixture = fixtures.pop()!;
     try { process.kill(await livePid(fixture), "SIGKILL"); } catch { /* already gone */ }

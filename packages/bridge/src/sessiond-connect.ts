@@ -38,6 +38,8 @@ async function connectOnce(): Promise<SessiondClient> {
         // anything the daemon later derives from the same base.
         ...(process.env.HOME ? { HOME: process.env.HOME } : {}),
         ...(process.env.LANG ? { LANG: process.env.LANG } : {}),
+        ...(process.env.SEAM_BRIDGE_CONFIG_PATH ? { SEAM_BRIDGE_CONFIG_PATH: process.env.SEAM_BRIDGE_CONFIG_PATH } : {}),
+        ...(process.env.XDG_CONFIG_HOME ? { XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME } : {}),
       },
     });
     let launchError: Error | undefined;

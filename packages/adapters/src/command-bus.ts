@@ -82,6 +82,8 @@ export interface HelloFrame {
    * has no stage receipt. Absence is unknown — never infer it from a sibling.
    */
   releaseSha?: string;
+  /** Descriptor owner's running release; absent on older bridges/daemons. */
+  sessiond?: { pid: number; entrypoint: string; releaseSha: string | null };
   host: HelloHostInfo;
   agents: HelloAgentInventory[];
   /** Optional bridge behaviours. Absence is the legacy contract. */

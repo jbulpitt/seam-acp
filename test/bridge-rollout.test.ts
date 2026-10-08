@@ -384,11 +384,14 @@ describe("bridge rollout gating and verification (#241)", () => {
     expect(remote).not.toContain("activation_receipt_timeout");
   });
 
-  it("contains SIGUSR2 only and no secret-bearing or immediate PM2 command", () => {
+  it("detaches bridges and signals only the daemon main PID, with no secret-bearing or immediate supervisor command", () => {
     const source = ["scripts/bridge-rollout-remote.sh", "scripts/bridge-rollout-remote.mjs", "scripts/bridge-rollout.mjs", "scripts/lib/bridge-rollout.mjs"].map((file) => fs.readFileSync(path.join(root, file), "utf8")).join("\n");
     expect(source).not.toMatch(/pm2\s+(?:restart|reload|jlist|prettylist|env)\b/i);
     expect(source).not.toMatch(/systemctl\s+(?:restart|stop|kill|reload)\b/i);
-    expect(source).not.toMatch(/SIGTERM|SIGKILL.*oldPid/);
+    expect(source).not.toMatch(/SIGKILL.*oldPid|process\.kill\(-/);
+    const cutover = source.slice(source.indexOf("async function cutoverSessiond("), source.indexOf("async function cutoverSessiond(") + 2_000);
+    expect(cutover).toContain('process.kill(before.pid, "SIGTERM")');
+    expect(source.match(/process\.kill\([^\n]*"SIGTERM"/g)).toEqual(['process.kill(before.pid, "SIGTERM"']);
     expect(source).toContain('process.kill(before.pid, "SIGUSR2")');
     expect(source).toContain("systemdMainPid");
     // #484 re-aimed this, and tightened it. The gate is spelled

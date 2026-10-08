@@ -278,6 +278,7 @@ async function makeSlotManager(opts: {
             instanceId: BRIDGE_INSTANCE_ID,
             protocolVersion: PROTOCOL_VERSION,
             ...(releaseSha ? { releaseSha } : {}),
+            ...(retained.supervisor ? { sessiond: retained.supervisor } : {}),
             host: {
               os: process.platform,
               arch: process.arch,

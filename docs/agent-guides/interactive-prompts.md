@@ -156,6 +156,10 @@ Cover recursion next.
 - **`thread`** — another seam thread by snowflake (`threads()`). Always live
   there. Unknown/gone → click not consumed.
 
+For live-thread delivery, the selected card shows **Waiting** while its prompt
+is queued, **Started** on admission and **Completed** on success. The target's
+turn status card changes **Waiting → Working → Done** on the same message.
+
 Do not use `parked_prompts` for this.
 
 ---

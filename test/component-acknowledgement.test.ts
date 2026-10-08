@@ -1,3 +1,4 @@
+import { testSessionStore } from "./helpers/session-fixture.js";
 import { EventEmitter } from "node:events";
 import { readFileSync, readdirSync } from "node:fs";
 import path from "node:path";
@@ -98,7 +99,7 @@ describe("component acknowledgement declarations", () => {
     let select: { min: number; max: number } | undefined;
     const orchestrator = Object.assign(Object.create(Orchestrator.prototype), {
       adapter: { onMessage() {}, onComponent() {}, onChoiceInteraction(_handle: unknown, mode: ComponentAcknowledgement) { declaration = mode; } },
-      store: { getChoiceCard: () => ({ options: [{ kind: "prompt" }, { kind: "custom" }], select }) },
+      store: testSessionStore({ getChoiceCard: () => ({ options: [{ kind: "prompt" }, { kind: "custom" }], select }) }),
       watchSentinel() {}, watchQueueWedges() {},
     });
     orchestrator.install();

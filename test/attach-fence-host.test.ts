@@ -1,3 +1,4 @@
+import { testSessionRouter, testSessionStore } from "./helpers/session-fixture.js";
 import { describe, it, expect, vi } from "vitest";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
 
@@ -12,8 +13,8 @@ function host(allowAny: boolean, hub: Record<string, unknown>) {
       sendFile: vi.fn(async (_c: unknown, f: { filename: string }) => { sent.push({ filename: f.filename }); }),
       sendMessage: vi.fn(async (_c: unknown, text: string) => { sent.push({ text }); }),
     },
-    store: { getByChannel: () => ({ id: "discord:t1", channelRef: "t1" }) },
-    router: { describeConfig: () => ({ location: { value: "rhc-server" } }) },
+    store: testSessionStore({ getByChannel: () => ({ id: "discord:t1", channelRef: "t1" }) }),
+    router: testSessionRouter({ describeConfig: () => ({ location: { value: "rhc-server" } }) }),
     effectiveCwd: () => "/home/ubuntu/Projects/pronoa",
     bridgeHub: hub,
   };

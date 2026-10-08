@@ -86,13 +86,6 @@ export class LiveHelpManager {
     });
     if (!policy.ok) return { ok: false, error: policy.reason };
 
-    const busyVc = this.store.getActiveLiveHelpForVoiceChannel(spec.voiceChannelId);
-    if (busyVc) {
-      return {
-        ok: false,
-        error: `Voice channel already has a live-help session (${busyVc.id}). Cancel it first.`,
-      };
-    }
     const busyGuild = this.store.getActiveLiveHelpForGuild(inspected.guildId);
     if (busyGuild) {
       return {

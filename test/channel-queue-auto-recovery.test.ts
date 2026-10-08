@@ -1,3 +1,4 @@
+import { testSessionRouter } from "./helpers/session-fixture.js";
 /**
  * #423 — "the silent death": a card sits at Working… forever.
  *
@@ -60,7 +61,7 @@ function makeHost(config: Record<string, unknown> = {}) {
     createdUtc: "2026-09-19T00:00:00.000Z", updatedUtc: "2026-09-19T00:00:00.000Z",
   } as never;
   store.upsert(record);
-  const router = {
+  const router = testSessionRouter({
     ensureSessionRecord: () => record,
     getRuntime: () => undefined,
     hasRuntime: () => false,
@@ -73,7 +74,7 @@ function makeHost(config: Record<string, unknown> = {}) {
     }),
     abortTurn: vi.fn(async () => "idle" as const),
     invalidate: vi.fn(async () => undefined),
-  };
+  });
   const host = new Orchestrator({
     modelCatalog: fixtureModelCatalog([]),
     logger: silent,

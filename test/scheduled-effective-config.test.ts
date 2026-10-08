@@ -1,3 +1,4 @@
+import { testSessionRouter } from "./helpers/session-fixture.js";
 import { scheduleUiFixture } from "./plugin-schedule-fixture.js";
 /**
  * #208 — scheduled builder + isolated fire must inherit the binding thread's
@@ -257,7 +258,7 @@ async function renderBuilder(
       parentId: PARENT,
     }),
     config: { REPOS_ROOT },
-    router: {
+    router: testSessionRouter({
       ensureSessionRecord: (opts: Parameters<SessionRouter["ensureSessionRecord"]>[0]) =>
         harness.router.ensureSessionRecord(opts),
       describeConfig: (rec: SessionRecord) =>
@@ -265,7 +266,7 @@ async function renderBuilder(
           ? routerOver.describeConfig.call(harness.router, rec)
           : harness.router.describeConfig(rec),
       getProfile,
-    },
+    }),
     store: harness.store,
     modelCatalog: harness.modelCatalog,
     logger: silent,
@@ -331,7 +332,7 @@ async function fireSchedule(
     logger: silent,
     store: harness.store,
     config: { REPOS_ROOT, TURN_TIMEOUT_SECONDS: 60 },
-    router: {
+    router: testSessionRouter({
       ensureSessionRecord: (opts: Parameters<SessionRouter["ensureSessionRecord"]>[0]) =>
         harness.router.ensureSessionRecord(opts),
       describeConfig,
@@ -339,7 +340,7 @@ async function fireSchedule(
       resolveProfileForChannel: (agentId: string, _channelId: string, location?: string) =>
         over.resolveProfileForChannel?.(agentId, _channelId, location) ?? getProfile(agentId, location),
       reuseMcpServers: () => [],
-    },
+    }),
     runIsolatedScheduledJob: vi.fn(async (args: FireCapture["jobs"][number]) => {
       jobs.push(args);
       return { text: "isolated-ok" };

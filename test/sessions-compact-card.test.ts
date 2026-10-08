@@ -1,3 +1,4 @@
+import { testSessionRouter, testSessionStore } from "./helpers/session-fixture.js";
 /**
  * #179 — every long-running job launched from the session browser card.
  *
@@ -301,7 +302,7 @@ function makeHarness(opts: HarnessOpts = {}) {
 
   const invalidated: Array<{ id: string; opts: unknown }> = [];
   const upserts: SessionRecord[] = [];
-  const router = {
+  const router = testSessionRouter({
     permissionOptions: () => ({}),
     listProfiles: () => (agy ? [profile, target, agy] : [profile, target]),
     describeConfig: () => ({
@@ -318,10 +319,10 @@ function makeHarness(opts: HarnessOpts = {}) {
     ensureSessionRecord: () => record,
     assertAgentAllowedForRecord: () => {},
     invalidate: async (id: string, o: unknown) => void invalidated.push({ id, opts: o }),
-  };
+  });
 
   const casCalls: Array<{ expected: string; next: string; ok: boolean }> = [];
-  const store = {
+  const store = testSessionStore({
     get: () => ({ ...record, acpSessionId: bound.value }),
     compareAndSwapAcpSession: (_id: string, expected: string, next: string) => {
       opts.onCasRead?.(bound);
@@ -338,7 +339,7 @@ function makeHarness(opts: HarnessOpts = {}) {
     },
     recordDelegation: () => {},
     updateDelegationStatus: () => {},
-  };
+  });
 
   /** Every payload the operator would actually see, in order. */
   const renders: any[] = [];

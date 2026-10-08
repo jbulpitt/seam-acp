@@ -1,3 +1,4 @@
+import { testSessionRouter, testSessionStore } from "./helpers/session-fixture.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
@@ -78,7 +79,7 @@ function harness(dir: string) {
   };
   const sent: string[] = [];
   const rows = new Map<string, SessionRecord>([[oldRecord.id, oldRecord]]);
-  const router = {
+  const router = testSessionRouter({
     listProfiles: () => [],
     describeConfig: (row: SessionRecord) => {
       const cfg = JSON.parse(row.configJson);
@@ -99,8 +100,8 @@ function harness(dir: string) {
       log.push(`runtime:${record.agentId}/${record.acpSessionId}`);
       return runtime;
     }),
-  };
-  const store = {
+  });
+  const store = testSessionStore({
     getByChannel: (platform: string, channelRef: string) =>
       [...rows.values()].find(row => row.platform === platform && row.channelRef === channelRef) ?? null,
     get: (id: string) => rows.get(id) ?? null,
@@ -117,7 +118,7 @@ function harness(dir: string) {
     getReportBackByCorrelation: () => null,
     tryRecordReportBack: (value: unknown) => value,
     getParkedByChannel: () => null,
-  };
+  });
   const adapter = {
     async sendMessage(_channel: unknown, text: string) {
       sent.push(text);

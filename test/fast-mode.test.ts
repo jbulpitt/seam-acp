@@ -1,3 +1,4 @@
+import { testSessionRouter, testSessionStore } from "./helpers/session-fixture.js";
 /**
  * Claude Fast mode (#37) — the seven contracts the issue requires.
  *
@@ -880,13 +881,13 @@ function ctrlHarness(opts: {
 
   const deps: ThreadSessionControlDeps = {
     modelCatalog: fixtureModelCatalog([...byId.values()]),
-    store: {
+    store: testSessionStore({
       get: (id) => records.get(id),
       readConfig: (v) => JSON.parse(v.configJson || "{}") as SessionConfigState,
       writeConfig: (v) => JSON.stringify(v),
       upsert: (v) => { records.set(v.id, v); },
-    },
-    router: {
+    }),
+    router: testSessionRouter({
       describeConfig,
       getProfile: (id) => byId.get(id),
       assertAgentAllowedForRecord: () => {},
@@ -925,7 +926,7 @@ function ctrlHarness(opts: {
         };
         return rt;
       },
-    },
+    }),
     mutation: {
       applyThreadOverlay: ({ changes }) => {
         overlays.push(changes);
@@ -1130,18 +1131,18 @@ function saveHarness(opts: {
 
   const orch = {
     config: { REPOS_ROOT: "/repo", channelPresets: new Map(), threadPresets: new Map() },
-    store: {
+    store: testSessionStore({
       getByChannel: () => rec,
       get: () => rec,
       readConfig: () => ({}),
       writeConfig: (value: SessionConfigState) => JSON.stringify(value),
       upsert: (value: SessionRecord) => { Object.assign(rec, value); },
-    },
+    }),
     modelCatalog: fixtureModelCatalog([{
       id: "claude", defaultModel: "claude-opus-5",
       effort: { mechanism: "meta", levels: ["low", "medium", "high"] },
     } as unknown as AgentProfile]),
-    router: {
+    router: testSessionRouter({
       invalidate: async (id: string, o: unknown) => {
         invalidated.push({ id, opts: o });
         if (opts.failRetire && invalidated.length > 1) {
@@ -1174,7 +1175,7 @@ function saveHarness(opts: {
         location: { value: "local", source: "default" },
       }),
       ensureSessionRecord: () => rec,
-    },
+    }),
     configMutation: {
       applyThreadOverlay: ({ changes }: { changes: Record<string, unknown> }) => {
         overlays.push(changes);

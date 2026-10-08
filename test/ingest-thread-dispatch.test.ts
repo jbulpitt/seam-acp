@@ -1,3 +1,4 @@
+import { testSessionRouter } from "./helpers/session-fixture.js";
 /**
  * #224 — a headless ingest endpoint with a `thread` fires as a LIVE handoff.
  *
@@ -151,7 +152,7 @@ function makeOrch(
   const profileLookups: Array<{ id: string; location?: string }> = [];
   const restrictionChecks: Array<{ id: string; channelId?: string; location?: string }> = [];
   const rt = fakeRuntime(opts.answer ?? "answered in-thread", opts.mode ?? "ok");
-  const router = {
+  const router = testSessionRouter({
     listProfiles: () => (opts.profile ? [opts.profile] : []),
     describeConfig: (row: SessionRecord) => {
       const cfg = store.readConfig(row);
@@ -190,7 +191,7 @@ function makeOrch(
     reuseMcpServers: () => [],
     mintMcpServersForSession: () => [],
     revokeMcpSession: () => {},
-  };
+  });
   const config = {
     DATA_DIR: dataDir,
     REPOS_ROOT: "/repo",

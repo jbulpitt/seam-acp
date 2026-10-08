@@ -1,3 +1,4 @@
+import { testSessionRouter } from "./helpers/session-fixture.js";
 /**
  * #76: isolated injectTurn uses loadSession(recorded id) instead of newSession
  * when resumeSessionId is set.
@@ -99,8 +100,8 @@ describe("injectTurn isolated resumeSessionId", () => {
     const profile = { id: "codex", defaultModel: "m", sessionManager: { deleteSession } } as any;
     const orch = new Orchestrator({ logger: silent, store, config: { REPOS_ROOT: dir, DATA_DIR: dir } as any,
       adapter: {} as any, renderer: {} as any, modelCatalog: fixtureModelCatalog([profile]),
-      router: { permissionOptions: () => ({}), listProfiles: () => [], describeConfig: () => ({ location: { value: "local" } }),
-        assertAgentAllowedForChannel: () => {} } as any });
+      router: testSessionRouter({ permissionOptions: () => ({}), listProfiles: () => [], describeConfig: () => ({ location: { value: "local" } }),
+        assertAgentAllowedForChannel: () => {} }) as any });
     attachLocalBridge(orch, [profile], dir);
     acquisitionFailure = stage;
     for (const phase of ["execution", "boot-recovery"] as const) {
@@ -135,8 +136,8 @@ describe("injectTurn isolated resumeSessionId", () => {
     const profile = { id: "codex", defaultModel: "m", sessionManager: { deleteSession } } as any;
     const orch = new Orchestrator({ logger: silent, store, config: { REPOS_ROOT: dir, DATA_DIR: dir } as any,
       adapter: {} as any, renderer: {} as any, modelCatalog: fixtureModelCatalog([profile]),
-      router: { permissionOptions: () => ({}), listProfiles: () => [], describeConfig: () => ({ location: { value: "local" } }),
-        assertAgentAllowedForChannel: () => {} } as any });
+      router: testSessionRouter({ permissionOptions: () => ({}), listProfiles: () => [], describeConfig: () => ({ location: { value: "local" } }),
+        assertAgentAllowedForChannel: () => {} }) as any });
     attachLocalBridge(orch, [profile], dir);
     let completed = false;
     await orch.injectTurn(record(), "disposable", { session: "isolated", profile, cwd: dir,
@@ -154,8 +155,8 @@ describe("injectTurn isolated resumeSessionId", () => {
       logger: silent, store, config: { REPOS_ROOT: dir, DATA_DIR: dir } as any,
       adapter: {} as any, renderer: {} as any,
       modelCatalog: fixtureModelCatalog([profile]),
-      router: { permissionOptions: () => ({}), listProfiles: () => [], describeConfig: () => ({ location: { value: "local" } }),
-        assertAgentAllowedForChannel: () => {} } as any,
+      router: testSessionRouter({ permissionOptions: () => ({}), listProfiles: () => [], describeConfig: () => ({ location: { value: "local" } }),
+        assertAgentAllowedForChannel: () => {} }) as any,
     });
     attachLocalBridge(orch, [profile], dir);
     let active = true, completed = false;
@@ -184,8 +185,8 @@ describe("injectTurn isolated resumeSessionId", () => {
     const orch = new Orchestrator({
       logger: silent, store, config: { REPOS_ROOT: dir, DATA_DIR: dir } as any,
       adapter: {} as any, renderer: {} as any, modelCatalog: fixtureModelCatalog([profile]),
-      router: { permissionOptions: () => ({}), listProfiles: () => [], describeConfig: () => ({ location: { value: "local" } }),
-        assertAgentAllowedForChannel: () => {} } as any,
+      router: testSessionRouter({ permissionOptions: () => ({}), listProfiles: () => [], describeConfig: () => ({ location: { value: "local" } }),
+        assertAgentAllowedForChannel: () => {} }) as any,
     });
     attachLocalBridge(orch, [profile], dir);
     await expect(orch.injectTurn(record(), "original", {
@@ -210,7 +211,7 @@ describe("injectTurn isolated resumeSessionId", () => {
       } as any,
       adapter: {} as any,
       modelCatalog: fixtureModelCatalog([catalogProfile]),
-      router: {
+      router: testSessionRouter({
         permissionOptions: () => ({}),
         listProfiles: () => [],
         describeConfig: () => ({ location: { value: "local" } }),
@@ -220,7 +221,7 @@ describe("injectTurn isolated resumeSessionId", () => {
         getOrStartRuntime: async () => {
           throw new Error("isolated must not use live runtime");
         },
-      } as any,
+      }) as any,
       store,
       renderer: {} as any,
     });

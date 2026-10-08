@@ -1,3 +1,4 @@
+import { testSessionRouter } from "./helpers/session-fixture.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -33,7 +34,7 @@ function makeHost() {
     config: { DATA_DIR: dir, REPOS_ROOT: "/synthetic", TURN_TIMEOUT_SECONDS: 60,
       channelPresets: new Map(), threadPresets: new Map(), bridgePresets: new Map() } as any,
     modelCatalog: fixtureModelCatalog([]), store, renderer: discordRenderer,
-    router: { listProfiles: () => [], getProfile: () => undefined } as any,
+    router: testSessionRouter({ listProfiles: () => [], getProfile: () => undefined }) as any,
     adapter: {
       sendPanel: async (channel: unknown) => ({ channel, id: "card" }),
       editPanel: async (_ref: unknown, panel: StructuredPanel) => { edits.push(panel); },

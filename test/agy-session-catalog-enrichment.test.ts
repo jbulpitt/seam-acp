@@ -14,7 +14,7 @@ import { SessionStore } from "../packages/core/src/core/session-store.js";
 import { ModelCatalogService } from "../packages/core/src/core/model-catalog/service.js";
 import { ModelCatalogStore } from "../packages/core/src/core/model-catalog/store.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
-import { createManagedAgyFixture } from "./helpers/agy-runtime-fixture.js";
+import { createOrdinaryAgyFixture } from "./helpers/agy-runtime-fixture.js";
 import { localBridgeWiring } from "./local-bridge-fixture.js";
 
 const fixtureDir = fileURLToPath(new URL("./fixtures/agy-native-capabilities/", import.meta.url));
@@ -27,12 +27,12 @@ function managedProfile(
   metadataMode: "available" | "unavailable" | "mismatch" = "available",
   invocationLog?: string,
 ) {
-  const managed = createManagedAgyFixture({
+  const managed = createOrdinaryAgyFixture({
     source: fakeCli,
     version: "agy fixture 1.1.28",
     credentialScope,
     cwd: root,
-    approvedEnvironment: {
+    environment: {
       SEAM_AGY_CAPABILITY_FIXTURE_DIR: fixtureDir,
       ...(metadataMode === "available" ? {} : { SEAM_AGY_R4B_METADATA_MODE: metadataMode }),
       ...(invocationLog ? { SEAM_AGY_CAPABILITY_INVOCATIONS: invocationLog } : {}),

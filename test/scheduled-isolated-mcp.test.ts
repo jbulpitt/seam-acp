@@ -1,3 +1,4 @@
+import { testSessionRouter } from "./helpers/session-fixture.js";
 import { describe, expect, it, vi } from "vitest";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
 import { withHarnessPreamble } from "../packages/core/src/core/agent-conventions.js";
@@ -46,7 +47,7 @@ describe("scheduled isolated Seam-MCP wiring", () => {
           config: { TURN_TIMEOUT_SECONDS: 120,
             channelPresets: new Map([["parent", { rider: { value: riders[0]! } }]]),
             threadPresets: new Map([["scheduled-owner", { rider: { value: riders[1]! } }]]) },
-          router: { reuseMcpServers, describeConfig: () => ({ location: { value: "local" } }) },
+          router: testSessionRouter({ reuseMcpServers, describeConfig: () => ({ location: { value: "local" } }) }),
           injectTurn,
           bridgeHub,
           modelCatalog: fixtureModelCatalog([profile]),

@@ -1,3 +1,4 @@
+import { testSessionRouter, testSessionStore } from "./helpers/session-fixture.js";
 import { describe, expect, it, vi } from "vitest";
 import { pino } from "pino";
 import type { Logger } from "../packages/core/src/lib/logger.js";
@@ -21,11 +22,11 @@ function fixture() {
   ];
   const mutationLedger = new Map<string, string>();
   let durableApplications = 0;
-  const store = {
+  const store = testSessionStore({
     getVoiceConsole: vi.fn(() => console),
     listVoiceConsoleBindings: vi.fn(() => bindings),
     listVoiceConsoleInputTargets: vi.fn(() => []),
-  };
+  });
   const control = {
     setInputTargets: vi.fn(async (
       _consoleId: string,
@@ -60,10 +61,10 @@ function fixture() {
       SEAM_CONFIG_ADMIN_USER_IDS: new Set<string>(),
     } as never,
     adapter: {} as never,
-    router: {
+    router: testSessionRouter({
       listProfiles: () => [],
       describeConfig: () => ({}),
-    } as never,
+    }) as never,
     store: store as never,
     renderer: {} as never,
   });

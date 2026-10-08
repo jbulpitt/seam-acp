@@ -1,3 +1,4 @@
+import { testSessionRouter } from "./helpers/session-fixture.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
@@ -154,7 +155,7 @@ describe("trusted Thread Voice dispatch boundary", () => {
     });
     batchPrompt = store.claimPendingVoiceConsoleBatch("tvb_trusted", "tvd-1")!.prompt;
     abortTurn = vi.fn(async () => "cancelled");
-    const router = {
+    const router = testSessionRouter({
       listProfiles: () => [],
       describeConfig: () => ({}),
       ensureSessionRecord: ({ channelRef, parentRef }: { channelRef: string; parentRef?: string }) => ({
@@ -170,7 +171,7 @@ describe("trusted Thread Voice dispatch boundary", () => {
         updatedUtc: base.createdUtc,
       }),
       abortTurn,
-    };
+    });
     orch = new Orchestrator({
       logger: pino({ level: "silent" }) as unknown as Logger,
       config: {

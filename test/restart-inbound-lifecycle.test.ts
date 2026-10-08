@@ -1,3 +1,4 @@
+import { testSessionRouter } from "./helpers/session-fixture.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { simulateRetiredOwnerProcess } from "./restart-process-fixture.js";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -52,14 +53,14 @@ function setup() {
     idle: async () => {},
     watchInFlightHang: vi.fn(async () => {}),
   };
-  const router = { listProfiles: () => [],
+  const router = testSessionRouter({ listProfiles: () => [],
     describeConfig: () => ({ agent: { value: "codex" }, model: { value: "test" },
       effort: { value: null }, cwd: { value: "/synthetic" }, location: { value: "local" }, fastMode: { value: false } }),
     ensureSessionRecord: () => ({ ...record }), getProfile: () => undefined,
     getOrStartRuntime: vi.fn(async (_record: unknown, _recovery?: unknown) => runtime),
     adoptRecoveryRuntime: vi.fn(() => recoveryRuntime),
     releaseRecoveryRuntime: vi.fn(),
-  };
+  });
   const adapter = { sendPanel: vi.fn(async (channel: any) => ({ channel, id: "panel" })),
     sendMessage: vi.fn(async (channel: any, _text: string, _delivery?: { nonce?: string }) => ({ channel, id: "message" })),
     sendFile: vi.fn(async () => {}),

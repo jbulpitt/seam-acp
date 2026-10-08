@@ -1073,7 +1073,7 @@ export class Orchestrator {
       isTurnActive: (channelRef) => this.channelQueues.has(channelRef),
       onCodexAsyncAnswer: (delivery) => this.admitCodexAsyncAnswer(delivery),
     });
-    this.router.setElicitationHandlers?.({
+    this.router.setElicitationHandlers({
       create: (record, request, context) => this.elicitations.create(record, request, context),
       complete: async (record, notification) => {
         const completed = await this.elicitations.completeUrl(
@@ -1234,7 +1234,7 @@ export class Orchestrator {
         await this.adapter.sendMessage(row.channel, `✅ ${row.detail}`);
       },
     });
-    this.store.turnAttempts?.onSettled?.(id => {
+    this.store.turnAttempts.onSettled(id => {
       this.trackContinuation(this.retireParkedTurnCards(id).catch(err =>
         this.logger.warn({ err, attemptId: id }, "parked-turn card retirement failed")));
       this.trackContinuation(this.actionCards.finishAttempt(id).catch(err =>
@@ -1532,10 +1532,7 @@ export class Orchestrator {
     this.autocomplete.register("config", "mode", "id", "canonical", (ctx) => {
       try {
         if (!ctx.sessionId) return [];
-        const rt =
-          typeof this.router.getRuntime === "function"
-            ? this.router.getRuntime(ctx.sessionId)
-            : undefined;
+        const rt = this.router.getRuntime(ctx.sessionId);
         const modes = rt?.getSessionInfo()?.availableModes ?? [];
         return labeledAutocompleteChoices(
           modes.map((m) => ({
@@ -1741,22 +1738,10 @@ export class Orchestrator {
       ch && typeof ch.isThread === "function" && ch.isThread()
         ? (ch.parentId ?? undefined)
         : undefined;
-    // A few narrow command-unit harnesses deliberately provide only the store
-    // methods their command uses. Production SessionStore always has `get`,
-    // while keeping this context builder defensive lets those harnesses test
-    // submission normalization without manufacturing unrelated session state.
-    const session =
-      channelId && typeof this.store.get === "function"
-        ? this.store.get(makeSessionId(PLATFORM, channelId))
-        : undefined;
+    const session = channelId ? this.store.get(makeSessionId(PLATFORM, channelId)) : undefined;
     let agentId = session?.agentId;
     if (session) {
-      try {
-        const v = this.router.describeConfig(session)?.agent?.value;
-        if (typeof v === "string" && v) agentId = v;
-      } catch {
-        /* mock routers may not implement describeConfig */
-      }
+      agentId = this.router.describeConfig(session).agent.value;
     }
     return {
       group,
@@ -2026,8 +2011,7 @@ export class Orchestrator {
    * has gone idle while its renderer/finalizer remains wedged (#180). */
   isChannelBusy(channelRef: string): boolean {
     if (this.channelQueues.has(channelRef)) return true;
-    const listInbound = (this.store as Partial<SessionStore>).listInboundNonterminal;
-    return listInbound ? listInbound.call(this.store, channelRef).length > 0 : false;
+    return this.store.listInboundNonterminal(channelRef).length > 0;
   }
 
   private queueEpoch(channelRef: string): number {
@@ -2062,14 +2046,12 @@ export class Orchestrator {
     const runtimeBusy = (record ? this.router.isBusy(record.id) : false)
       || (meta?.executing ?? 0) > 0
       || bridgeOwned;
-    const listInbound = (this.store as Partial<SessionStore>).listInboundNonterminal;
-    const durable = listInbound ? listInbound.call(this.store, channelRef) : [];
+    const durable = this.store.listInboundNonterminal(channelRef);
     const stalled = this.store.turnAttempts.listStalled(channelRef);
     const newestInbound = durable.at(-1);
     const awaitingReauth = newestInbound && stalled.some(attempt =>
       attempt.id === inboundAttemptId(newestInbound.messageId) && isAwaitingReauth(attempt.stalledReason));
-    const listUnsettled = this.store.turnAttempts.listUnsettledCompletions?.bind(this.store.turnAttempts);
-    const unsettled = listUnsettled ? listUnsettled(channelRef) : [];
+    const unsettled = this.store.turnAttempts.listUnsettledCompletions(channelRef);
     const durableSince = durable.length > 0 ? Date.parse(durable[0]!.updatedUtc) : Number.NaN;
     const idleSince = meta?.runtimeIdleSinceMs ?? meta?.lastProgressAtMs;
     const ageMs = runtimeBusy
@@ -2285,11 +2267,8 @@ export class Orchestrator {
    */
   private wedgeSweepCandidates(): string[] {
     const refs = new Set<string>(this.channelQueueMeta?.keys() ?? []);
-    const listInbound = (this.store as Partial<SessionStore>).listInboundNonterminal;
-    if (listInbound) {
-      for (const row of listInbound.call(this.store)) {
-        if (row.channelRef) refs.add(row.channelRef);
-      }
+    for (const row of this.store.listInboundNonterminal()) {
+      if (row.channelRef) refs.add(row.channelRef);
     }
     for (const state of ["pending", "suspended"] as const) {
       for (const attempt of this.store.turnAttempts.list(state, () => {})) {
@@ -2562,10 +2541,7 @@ export class Orchestrator {
       // flight. Without one there is nothing to cancel, and the new message
       // should simply queue behind the tail — which `queueOnChannel` already
       // does correctly.
-      // Defensive read: a router without `isBusy` keeps the prior
-      // abort-always behaviour rather than silently changing it.
-      const promptInFlight =
-        typeof this.router.isBusy === "function" ? this.router.isBusy(record.id) : true;
+      const promptInFlight = this.router.isBusy(record.id);
       if (!promptInFlight) {
         this.logger.info(
           { channelId, sessionId: record.id },
@@ -2701,9 +2677,7 @@ export class Orchestrator {
           // exists, the clock is this task's start so a hung boot still ends.
           lastActivityAt: () => {
             if (recovery) return recovery.lastActivityAt();
-            const read = this.router.getRuntime;
-            if (typeof read !== "function") return startedAt;
-            const at = read.call(this.router, sessionId)?.lastActivityAtMs;
+            const at = this.router.getRuntime(sessionId)?.lastActivityAtMs;
             return typeof at === "number" && Number.isFinite(at) ? Math.max(startedAt, at) : startedAt;
           },
         });
@@ -2775,7 +2749,7 @@ export class Orchestrator {
   }
 
   private inboundExecutionTerminal(messageId: string): boolean {
-    const a = this.store.turnAttempts?.get(inboundAttemptId(messageId));
+    const a = this.store.turnAttempts.get(inboundAttemptId(messageId));
     return a?.state === "completed" || a?.state === "cancelled";
   }
 
@@ -2802,7 +2776,7 @@ export class Orchestrator {
     const described = record ? this.router.describeConfig(record) : undefined;
     const identity = parseExecutionIdentity(attempt.identity);
     const agentId = identity?.agent ?? described?.agent.value ?? record?.agentId ?? "";
-    const profile = this.router.getProfile?.(agentId, identity?.location ?? described?.location.value);
+    const profile = this.router.getProfile(agentId, identity?.location ?? described?.location.value);
     const saved = attempt.statusCardState?.status;
     const status = saved ? TurnStatus.restore(saved) : new TurnStatus({
       model: identity?.model ?? described?.model.value ?? attempt.spec.model ?? "",
@@ -3523,7 +3497,7 @@ export class Orchestrator {
       await this.executeIncomingMessage(msg, queueFence, scheduledAttempt, operatorResume);
     } catch (err) {
       const a = scheduledAttempt ? this.store.turnAttempts.get(scheduledAttempt.id)
-        : msg.messageId ? this.store.turnAttempts?.get(inboundAttemptId(msg.messageId)) : null;
+        : msg.messageId ? this.store.turnAttempts.get(inboundAttemptId(msg.messageId)) : null;
       if (a?.state === "suspended" && a.stalledUtc && !isAwaitingReauth(a.stalledReason)) {
         await this.notifyParkedTurn(a).catch(noticeErr => this.logger.warn({ err: noticeErr, attempt: a.id }, "parked-turn notice failed"));
       }
@@ -3584,7 +3558,7 @@ export class Orchestrator {
     // still run in a detached thread. Do not treat detach as a full mute.
     const channel = msg.channel;
     const record = await this.bindThreadRecord(channel);
-    const admission = msg.messageId ? this.store.getInbound?.(msg.messageId) : null;
+    const admission = msg.messageId ? this.store.getInbound(msg.messageId) : null;
     let humanAttempt: TurnAttempt | undefined = scheduledAttempt;
     let humanOutcomeOwned = false;
     let humanDelivered = false;
@@ -4585,7 +4559,7 @@ export class Orchestrator {
           `model=${described.model.value}; effort=${described.effort.value ?? "auto"}. ` +
           `Treat this stamp as authoritative for the current turn.`
       );
-      const seamMcp = sessionHasSeamMcp(this.router.reuseMcpServers?.(record.id));
+      const seamMcp = sessionHasSeamMcp(this.router.reuseMcpServers(record.id));
       const seamFences = true; // live user-turn loop runs emitClosedFence
       const canAuthorChoice =
         Boolean(msg.authorId) &&
@@ -5584,18 +5558,6 @@ export class Orchestrator {
     } finally {
       runtime.onEvent(realHandler);
     }
-  }
-
-  /** Test stubs of SessionRouter may omit #220 helpers; fall back to the
-   *  generic unknown-agent copy in that case. */
-  private refuseUnregisteredAgent(agentId: string, fallback: string): string {
-    const fn = this.router.unregisteredAgentMessage;
-    return typeof fn === "function" ? fn.call(this.router, agentId, fallback) : fallback;
-  }
-
-  private refuseParkedSession(agentId: string, fallback: string): string {
-    const fn = this.router.unregisteredAgentSessionMessage;
-    return typeof fn === "function" ? fn.call(this.router, agentId, fallback) : fallback;
   }
 
   private sessionManagerFor(
@@ -7079,7 +7041,7 @@ export class Orchestrator {
   }
 
   private runtimeAcquisitionFence(attemptId: string): () => void {
-    const owner = this.store.turnAttempts?.get(attemptId);
+    const owner = this.store.turnAttempts.get(attemptId);
     return (): void => {
       if (this.restartCutoff) {
         throw DispatchSuspendedError.shutdown(attemptId, "shutdown interrupted provider acquisition; the next boot owns the turn");
@@ -7113,7 +7075,7 @@ export class Orchestrator {
       assertCurrent();
       try {
         const savedSessionId = resumeSessionId ?? record.acpSessionId;
-        if (savedSessionId && this.bridgeHub?.muxFor && this.router.hasRuntime?.(record.id) === false) {
+        if (savedSessionId && this.bridgeHub?.muxFor && this.router.hasRuntime(record.id) === false) {
           const described = this.router.describeConfig(record);
           await this.retireUnownedSessionSlots(described.location.value,
             savedSessionId, described.agent.value, assertCurrent);
@@ -7168,7 +7130,7 @@ export class Orchestrator {
         );
         let unsubscribe: (() => void) | undefined;
         const cancelled = new Promise<void>(resolve => {
-          unsubscribe = this.store.turnAttempts?.onSettled?.(id => {
+          unsubscribe = this.store.turnAttempts.onSettled(id => {
             if (id === attemptId && this.store.turnAttempts.get(id)?.state === "cancelled") resolve();
           });
         });
@@ -7270,7 +7232,7 @@ export class Orchestrator {
       identityCommitted: (id?: string) => this.identityEffects.flush(id),
       persistConfig: (record: SessionRecord, cfg: SessionConfigState) => this.persistConfig(record, cfg),
       repoDisplay: (repo: string | null) => this.repoDisplay(repo),
-      unregisteredAgentMessage: (id: string, fallback: string) => this.refuseUnregisteredAgent(id, fallback),
+      unregisteredAgentMessage: (id: string, fallback: string) => this.router.unregisteredAgentMessage(id, fallback),
       resolveRequestedRepoPath: (channel: ChannelRef, requested: string, location: string) => this.resolveRequestedRepoPath(channel, requested, location),
     }).plan; }
 
@@ -7281,7 +7243,7 @@ export class Orchestrator {
       identityCommitted: (id?: string) => this.identityEffects.flush(id),
       persistConfig: (record: SessionRecord, cfg: SessionConfigState) => this.persistConfig(record, cfg),
       repoDisplay: (repo: string | null) => this.repoDisplay(repo),
-      unregisteredAgentMessage: (id: string, fallback: string) => this.refuseUnregisteredAgent(id, fallback),
+      unregisteredAgentMessage: (id: string, fallback: string) => this.router.unregisteredAgentMessage(id, fallback),
       resolveRequestedRepoPath: (channel: ChannelRef, requested: string, location: string) => this.resolveRequestedRepoPath(channel, requested, location),
     }).runtime; }
 
@@ -7649,7 +7611,7 @@ export class Orchestrator {
       this.interruptedDispatches.add(activeId);
       // Cancellation must beat a simultaneous restart durably, not just via
       // the old in-memory reporting flag. Preserve a completed-output winner.
-      const cancelled = this.store.turnAttempts?.cancel(activeId);
+      const cancelled = this.store.turnAttempts.cancel(activeId);
       if (cancelled) await this.dispatchWatcher?.cancelRunning({ id: activeId });
     }
 
@@ -9579,7 +9541,7 @@ export class Orchestrator {
 
   async observeQueuedDispatch(spec: DispatchSpec): Promise<void> {
     await this.refreshDispatchChoice(spec);
-    const attempt = this.store.turnAttempts?.get(spec.id);
+    const attempt = this.store.turnAttempts.get(spec.id);
     if (!attempt || attempt.state !== "pending" || attempt.statusCard
       || this.config.SEAM_DISPATCH_STATUS_PANEL === false) return;
     // These executors own different cards, outside the injected-turn path.
@@ -9618,7 +9580,7 @@ export class Orchestrator {
     } catch (error) {
       let attempt: TurnAttempt | null | undefined;
       try {
-        attempt = this.store.turnAttempts?.get(spec.id);
+        attempt = this.store.turnAttempts.get(spec.id);
       } catch {
         attempt = undefined;
       }
@@ -9637,7 +9599,7 @@ export class Orchestrator {
 
   private async dispatchInjectTurnWithEvidence(spec: DispatchSpec, operatorResume = false,
     queueFence?: ChannelQueueFence): Promise<DispatchInjectTurnResult> {
-    const prior = this.store.turnAttempts?.get(spec.id);
+    const prior = this.store.turnAttempts.get(spec.id);
     if (prior?.state === "completed") {
       // Completed-output ownership never re-enters a provider. Boot projection
       // normally settles this before queue intake; this is the last race gate.
@@ -9686,7 +9648,7 @@ export class Orchestrator {
       return await (phase.phase === "boot-recovery" ? this.resumeScheduler.run(run) : run());
     } catch (err) {
       let current;
-      try { current = this.store.turnAttempts?.get(spec.id); }
+      try { current = this.store.turnAttempts.get(spec.id); }
       catch (readErr) { throw DispatchSuspendedError.from(readErr, spec.id, "reading the attempt row failed"); }
       if (current?.state === "cancelled") {
         // An unstarted claim that settled itself on the way out (#559) must
@@ -9783,7 +9745,7 @@ export class Orchestrator {
     // under its agent/model/effort/cwd, and prepend its instructions as cold-start
     // identity. `target` remains where output is posted for visibility.
     const preset = spec.preset ? this.store.getPresetByName(spec.preset) : null;
-    const threadLocation = this.router.describeConfig?.(record).location?.value
+    const threadLocation = this.router.describeConfig(record).location?.value
       ?? resolveThreadLocation(this.config, spec.target);
     const requestedWorkerLocation = spec.location ?? threadLocation;
     const restrictionChannelId = record.parentRef ?? record.channelRef;
@@ -9828,7 +9790,7 @@ export class Orchestrator {
     // so report-back and chain succession come free on completion.
     const isResume = spec.resume === true;
     const ledger = isResume ? this.store.getDelegation(spec.id) : null;
-    const previousAttempt = this.store.turnAttempts?.get(spec.id);
+    const previousAttempt = this.store.turnAttempts.get(spec.id);
     if (isResume && !previousAttempt) {
       // Legacy ACP pointers have no frozen provider/account/host identity.
       // Retain for explicit reconciliation; do not certify a guessed identity.
@@ -9878,7 +9840,7 @@ export class Orchestrator {
           })
         : {};
     const seamMcp = sessionHasSeamMcp(
-      isolatedSpawn.mcpServers ?? this.router.reuseMcpServers?.(record.id)
+      isolatedSpawn.mcpServers ?? this.router.reuseMcpServers(record.id)
     );
     const runtimePrompt = resolveDispatchRuntimePrompt(spec);
     const tasked = applyWatchFeedback(
@@ -10005,8 +9967,8 @@ export class Orchestrator {
         // credential-scope digest and an environment fingerprint, which drift
         // on token refresh and strand in-flight work — the defect this fixes.
       });
-      this.store.turnAttempts?.registerOwner(this.attemptBoot);
-      const attempt = this.store.turnAttempts?.claim(spec, identity, this.attemptBoot, "dispatch", operatorResume);
+      this.store.turnAttempts.registerOwner(this.attemptBoot);
+      const attempt = this.store.turnAttempts.claim(spec, identity, this.attemptBoot, "dispatch", operatorResume);
       unstartedClaim = attempt;
       await this.refreshDispatchChoice(spec);
       let outcomeOwned = false;
@@ -10879,12 +10841,10 @@ export class Orchestrator {
     let outcomeOwned = false;
     let submittedThisAttempt = false;
     let previousAttempt: TurnAttempt | null | undefined;
-    const attemptStore = (this.store as unknown as {
-      turnAttempts?: SessionStore["turnAttempts"];
-    }).turnAttempts;
+    const attemptStore = this.store.turnAttempts;
     const isResume = spec.resume === true;
     try {
-      previousAttempt = attemptStore?.get(spec.id);
+      previousAttempt = attemptStore.get(spec.id);
       if (this.restartCutoff) {
         throw DispatchSuspendedError.shutdown(spec.id, "restart cutoff reached before the ingest turn started");
       }
@@ -10925,7 +10885,7 @@ export class Orchestrator {
       const profile = this.router.resolveProfileForChannel(agentId, restrictionChannelId, location);
       if (!profile) {
         throw new Error(
-          `dispatch ${spec.id}: ${this.refuseUnregisteredAgent(agentId, `unknown agent "${agentId}" at "${location}"`)}`
+          `dispatch ${spec.id}: ${this.router.unregisteredAgentMessage(agentId, `unknown agent "${agentId}" at "${location}"`)}`
         );
       }
       const cwd = preset?.repoPath ?? spec.cwd ?? this.config.REPOS_ROOT;
@@ -10986,94 +10946,92 @@ export class Orchestrator {
         // never-prompted resume replays verbatim and a prompted resume has
         // already acted on, so comparing it here only adds drift.
       });
-      if (attemptStore) {
-        attemptStore.registerOwner(this.attemptBoot);
-        attempt = attemptStore.claim(spec, identity, this.attemptBoot);
-        lifecycle = {
-          isCurrent: () =>
-            !this.restartCutoff && Boolean(attempt && attemptStore.isCurrent(attempt)),
-          onStdoutFallback: code => { if (attempt) this.recordStdoutFallback(attempt, code); },
-          onSubmissionEvidence: evidence => { if (attempt) this.recordSubmissionEvidence(attempt, evidence); },
-          onRemoteRecovery: (binding) => {
-            if (!attempt || !attemptStore.recordRemoteRecovery(attempt, { ...binding, location })) {
-              throw DispatchSuspendedError.superseded(spec.id,
-                "remote recovery binding lost ingest ownership before prompt submission");
+      attemptStore.registerOwner(this.attemptBoot);
+      attempt = attemptStore.claim(spec, identity, this.attemptBoot);
+      lifecycle = {
+        isCurrent: () =>
+          !this.restartCutoff && Boolean(attempt && attemptStore.isCurrent(attempt)),
+        onStdoutFallback: code => { if (attempt) this.recordStdoutFallback(attempt, code); },
+        onSubmissionEvidence: evidence => { if (attempt) this.recordSubmissionEvidence(attempt, evidence); },
+        onRemoteRecovery: (binding) => {
+          if (!attempt || !attemptStore.recordRemoteRecovery(attempt, { ...binding, location })) {
+            throw DispatchSuspendedError.superseded(spec.id,
+              "remote recovery binding lost ingest ownership before prompt submission");
+          }
+        },
+        onRemoteRecoveryReleased: (binding) => {
+          if (!attempt || !attemptStore.releaseRemoteRecovery(attempt, { ...binding, location })) {
+            throw DispatchSuspendedError.superseded(spec.id,
+              "remote recovery handback lost ingest ownership after a pre-write failure");
+          }
+        },
+        onRuntime: (pid, providerIdentity) => {
+          try {
+            if (!attempt) {
+              throw DispatchSuspendedError.defect(spec.id, "no attempt was claimed for this ingest turn");
             }
-          },
-          onRemoteRecoveryReleased: (binding) => {
-            if (!attempt || !attemptStore.releaseRemoteRecovery(attempt, { ...binding, location })) {
-              throw DispatchSuspendedError.superseded(spec.id,
-                "remote recovery handback lost ingest ownership after a pre-write failure");
-            }
-          },
-          onRuntime: (pid, providerIdentity) => {
-            try {
-              if (!attempt) {
-                throw DispatchSuspendedError.defect(spec.id, "no attempt was claimed for this ingest turn");
-              }
-              attemptStore.bindRuntime(attempt, pid, providerIdentity);
-            } catch (bindErr) {
-              throw DispatchSuspendedError.from(bindErr, spec.id, "binding the runtime to the attempt failed");
-            }
-          },
-          beforePrompt: () => {
-            try {
-              if (this.restartCutoff) {
-                throw DispatchSuspendedError.shutdown(spec.id, "restart cutoff reached before prompt submission");
-              }
-              if (!attempt) {
-                throw DispatchSuspendedError.defect(spec.id, "no attempt was claimed for this ingest turn");
-              }
-              attemptStore.startPrompt(attempt);
-              submittedThisAttempt = true;
-              return this.beginSubmissionEvidence(attempt);
-            } catch (promptErr) {
-              throw DispatchSuspendedError.from(promptErr, spec.id, "recording prompt submission failed");
-            }
-          },
-          onOutcome: (outcome) => {
+            attemptStore.bindRuntime(attempt, pid, providerIdentity);
+          } catch (bindErr) {
+            throw DispatchSuspendedError.from(bindErr, spec.id, "binding the runtime to the attempt failed");
+          }
+        },
+        beforePrompt: () => {
+          try {
             if (this.restartCutoff) {
-              throw DispatchSuspendedError.shutdown(spec.id, "restart cutoff reached before the outcome was recorded");
+              throw DispatchSuspendedError.shutdown(spec.id, "restart cutoff reached before prompt submission");
             }
             if (!attempt) {
               throw DispatchSuspendedError.defect(spec.id, "no attempt was claimed for this ingest turn");
             }
-            if (isResume && !submittedThisAttempt) {
-              throw DispatchSuspendedError.defect(spec.id,
-                "a resumed turn produced an outcome without this attempt submitting a prompt");
-            }
-            const workerStatus = outcome.timedOut
-              ? "timed_out"
-              : outcome.error || outcome.cancelled
-                ? "failed"
-                : "completed";
-            const error = outcome.error ??
-              (outcome.timedOut ? "ingest turn timed out" : outcome.cancelled ? "ingest turn was cancelled" : undefined);
-            try {
-              outcomeOwned = attemptStore.complete(attempt, {
-                id: spec.id,
-                target: spec.target,
-                status: workerStatus === "completed" ? "completed" : "failed",
-                output: outcome.text,
-                stopReason: outcome.stopReason,
-                ...(error ? { error, workerError: error } : {}),
-                workerStatus,
-                kind: "ingest",
-                correlationId: spec.correlationId,
-                finishedUtc: new Date().toISOString(),
-              });
-            } catch (completeErr) {
-              throw DispatchSuspendedError.from(completeErr, spec.id, "recording the outcome failed");
-            }
-            if (!outcomeOwned) {
-              throw DispatchSuspendedError.superseded(spec.id,
-                "another attempt generation already recorded this dispatch's outcome");
-            }
-          },
-          mayDeleteSession: () =>
-            outcomeOwned || attemptStore.get(spec.id)?.state === "cancelled",
-        };
-      }
+            attemptStore.startPrompt(attempt);
+            submittedThisAttempt = true;
+            return this.beginSubmissionEvidence(attempt);
+          } catch (promptErr) {
+            throw DispatchSuspendedError.from(promptErr, spec.id, "recording prompt submission failed");
+          }
+        },
+        onOutcome: (outcome) => {
+          if (this.restartCutoff) {
+            throw DispatchSuspendedError.shutdown(spec.id, "restart cutoff reached before the outcome was recorded");
+          }
+          if (!attempt) {
+            throw DispatchSuspendedError.defect(spec.id, "no attempt was claimed for this ingest turn");
+          }
+          if (isResume && !submittedThisAttempt) {
+            throw DispatchSuspendedError.defect(spec.id,
+              "a resumed turn produced an outcome without this attempt submitting a prompt");
+          }
+          const workerStatus = outcome.timedOut
+            ? "timed_out"
+            : outcome.error || outcome.cancelled
+              ? "failed"
+              : "completed";
+          const error = outcome.error ??
+            (outcome.timedOut ? "ingest turn timed out" : outcome.cancelled ? "ingest turn was cancelled" : undefined);
+          try {
+            outcomeOwned = attemptStore.complete(attempt, {
+              id: spec.id,
+              target: spec.target,
+              status: workerStatus === "completed" ? "completed" : "failed",
+              output: outcome.text,
+              stopReason: outcome.stopReason,
+              ...(error ? { error, workerError: error } : {}),
+              workerStatus,
+              kind: "ingest",
+              correlationId: spec.correlationId,
+              finishedUtc: new Date().toISOString(),
+            });
+          } catch (completeErr) {
+            throw DispatchSuspendedError.from(completeErr, spec.id, "recording the outcome failed");
+          }
+          if (!outcomeOwned) {
+            throw DispatchSuspendedError.superseded(spec.id,
+              "another attempt generation already recorded this dispatch's outcome");
+          }
+        },
+        mayDeleteSession: () =>
+          outcomeOwned || attemptStore.get(spec.id)?.state === "cancelled",
+      };
       let outputTo: ChannelRef | undefined;
       if (notifyId) {
         const live = await this.threadLiveState(notifyId);
@@ -11099,20 +11057,18 @@ export class Orchestrator {
         ...isolatedSpawn,
         strictModel: true,
         ...(isResume && resumeSessionId ? { resumeSessionId } : {}),
-        ...(lifecycle ? { lifecycle } : {}),
+        lifecycle,
         ...(outputTo ? { outputTo } : {}),
         ...(spec.correlationId ? { correlationId: spec.correlationId } : {}),
         timeoutMs: this.config.TURN_TIMEOUT_SECONDS * 1000,
         onSession: (sessionId) => {
-          if (attemptStore) {
-            if (!attempt) {
-              throw DispatchSuspendedError.defect(spec.id, "no attempt was claimed for this ingest turn");
-            }
-            try {
-              attemptStore.bind(attempt, sessionId);
-            } catch (sessionErr) {
-              throw DispatchSuspendedError.from(sessionErr, spec.id, "recording the ACP session id failed");
-            }
+          if (!attempt) {
+            throw DispatchSuspendedError.defect(spec.id, "no attempt was claimed for this ingest turn");
+          }
+          try {
+            attemptStore.bind(attempt, sessionId);
+          } catch (sessionErr) {
+            throw DispatchSuspendedError.from(sessionErr, spec.id, "recording the ACP session id failed");
           }
           try {
             this.store.updateDelegationStatus(spec.id, "running", { acpSessionId: sessionId });
@@ -11137,7 +11093,7 @@ export class Orchestrator {
       completed = { output: result.text, stopReason: result.stopReason ?? "" };
     } catch (err) {
       failure = err;
-      if (err instanceof ReauthParked && attempt && lifecycle && !outcomeOwned && attemptStore) {
+      if (err instanceof ReauthParked && attempt && lifecycle && !outcomeOwned) {
         const parked = parkReauthAttempt(attemptStore, spec.id, err.park);
         if (parked) {
           await this.postReauthCard(spec.target, spec.id, err.park, err.message);
@@ -11157,7 +11113,7 @@ export class Orchestrator {
     } finally {
       let attemptState: TurnAttempt["state"] | undefined;
       try {
-        attemptState = attemptStore?.get(spec.id)?.state;
+        attemptState = attemptStore.get(spec.id)?.state;
       } catch (stateErr) {
         if (attempt) failure = DispatchSuspendedError.from(stateErr, spec.id, "reading the final attempt state failed");
       }
@@ -11559,7 +11515,7 @@ export class Orchestrator {
     const routedChainId = route.action === "chain" ? route.chainId : result.chainId;
     const routedReturnTo = route.action === "report_back" ? route.returnTo : result.returnTo;
     // Rebuild only the fields the onward paths actually read.
-    const attempt = this.store.turnAttempts?.get(result.id);
+    const attempt = this.store.turnAttempts.get(result.id);
     const spec: DispatchSpec = {
       id: result.id,
       target: result.target,
@@ -11712,7 +11668,7 @@ export class Orchestrator {
     // #153: this delivery's own prompt is the chain's wrapped RESULT, so carry
     // the chain's original ask for the card's Prompt field. A chain has many
     // hops and no single source thread, so no originThreadRef.
-    const chainPrompt = this.store.getChain?.(chainId)?.promptPreview;
+    const chainPrompt = this.store.getChain(chainId)?.promptPreview;
     const spec: DispatchSpec = {
       id,
       target: originRef,
@@ -11930,7 +11886,6 @@ export class Orchestrator {
    */
   private channelOfThread(ref: ChannelRef): string | undefined {
     if (ref.parentId) return ref.parentId;
-    if (typeof this.store.getByChannel !== "function") return undefined;
     return this.store.getByChannel(PLATFORM, ref.id)?.parentRef ?? undefined;
   }
 
@@ -12024,12 +11979,9 @@ export class Orchestrator {
     waiting = false
   ): Promise<DispatchStatusPanel<MessageRef> | undefined> {
     if (!this.queueFenceCurrent(queueFence)) return undefined;
-    const statusAttempt = this.store.turnAttempts?.get(spec.id);
+    const statusAttempt = this.store.turnAttempts.get(spec.id);
     const repoDisplay = this.repoDisplay(resolved.cwd);
-    const destRecord =
-      typeof this.store.getByChannel === "function"
-        ? this.store.getByChannel(target.platform, target.id)
-        : null;
+    const destRecord = this.store.getByChannel(target.platform, target.id);
     const destDescribed = destRecord ? this.router.describeConfig(destRecord) : undefined;
     const modelContextFloor = resolved.profile
       ? this.modelCatalog.model(
@@ -12515,7 +12467,7 @@ export class Orchestrator {
       return {
         ok: false,
         agentId,
-        error: this.refuseParkedSession(agentId, `unknown agent ${agentId}`),
+        error: this.router.unregisteredAgentSessionMessage(agentId, `unknown agent ${agentId}`),
       };
     }
     const overrideModel = overrides?.model?.trim() ? overrides.model.trim() : null;
@@ -12552,7 +12504,7 @@ export class Orchestrator {
    *  Read-only w.r.t. the thread's live session. */
   async runScheduledPrompt(id: string, key = scheduledOccurrenceKey(id), manualResume = false,
     queueFence?: ChannelQueueFence): Promise<void> {
-    const row = this.store.scheduledOccurrences?.get(key.id)?.row ?? this.store.getScheduled(id);
+    const row = this.store.scheduledOccurrences.get(key.id)?.row ?? this.store.getScheduled(id);
     if (!row) return;
     // Direct/manual recovery callers have the same durable admission boundary
     // as the manager, including failure while registering local activity.
@@ -14903,7 +14855,7 @@ export class Orchestrator {
       }
     } else if (!opts?.preserveDispatch) {
       for (const state of ["active", "suspended"] as const) {
-        for (const a of this.store.turnAttempts?.list(state) ?? []) {
+        for (const a of this.store.turnAttempts.list(state)) {
           // A normal user turn replaces the active live schedule, not an
           // independent isolated occurrence or a schedule still queued behind it.
           if (a.source === "schedule" && (a.spec.session === "isolated" || this.liveTurnByChannel.get(channelRef) !== a.id)) continue;
@@ -14929,7 +14881,7 @@ export class Orchestrator {
       }).catch((err) =>
         this.logger.warn({ err, id: m.id }, "live-turn marker cancel failed")
       );
-      if (!this.store.turnAttempts?.get(m.id)) cancelled = true;
+      if (!this.store.turnAttempts.get(m.id)) cancelled = true;
     }
     if (opts?.cancelLiveOnly && liveDispatchId) {
       const settled = await this.dispatchWatcher
@@ -14952,7 +14904,7 @@ export class Orchestrator {
   /** `/seam cancel scope:all` — finalize every live marker and running spec. */
   private async clearAllTurnMarkers(status: "cancelled"): Promise<void> {
     for (const state of ["active", "suspended"] as const) {
-      for (const a of this.store.turnAttempts?.list(state) ?? []) this.store.turnAttempts.cancel(a.id);
+      for (const a of this.store.turnAttempts.list(state)) this.store.turnAttempts.cancel(a.id);
     }
     const now = new Date().toISOString();
     this.liveTurnByChannel.clear();
@@ -15082,7 +15034,7 @@ export class Orchestrator {
 
   /** Pre-claim attempt when this marker has one; otherwise the session directory. */
   private liveRestartSource(marker: LiveTurnMarker): RecoveryAttemptSource {
-    const attempt = this.store.turnAttempts?.get(marker.id);
+    const attempt = this.store.turnAttempts.get(marker.id);
     if (attempt) return attempt;
     const record = this.store.get(marker.sessionRecordId);
     return {
@@ -15155,7 +15107,7 @@ export class Orchestrator {
       }, {
         lastActivityAt: () => {
           const record = this.store.getByChannel(PLATFORM, attempt.spec.target);
-          const runtime = record && this.router.getRuntime?.(record.id);
+          const runtime = record && this.router.getRuntime(record.id);
           const observed = this.bridgeHub?.slotHealthFor?.(attempt.remoteRecovery!.location)
             ?.find(row => row.slot === attempt.remoteRecovery!.slot)?.recovery;
           return Math.max(...[
@@ -15960,10 +15912,10 @@ export class Orchestrator {
     const liveJobs: Array<Promise<void>> = [];
     // Inspect the original admission phase BEFORE recovery resets running to
     // pending. An old marker/running row is not proof the prompt was unstarted.
-    const inbound = this.store.listInboundNonterminal?.() ?? [];
+    const inbound = this.store.listInboundNonterminal();
     const inboundChannels = new Set(inbound.map(row => row.channelRef));
     for (const row of inbound) {
-      const a = this.store.turnAttempts?.get(inboundAttemptId(row.messageId));
+      const a = this.store.turnAttempts.get(inboundAttemptId(row.messageId));
       if (a?.state === "completed" || a?.state === "cancelled") {
         await this.renderPersistedTerminalAttemptCard(a);
         this.store.settleInboundExecution(row.messageId);
@@ -16257,13 +16209,13 @@ export class Orchestrator {
 
   /** Deliver the captured winner, never re-enter a provider. */
   private async recoverInboundOutput(): Promise<void> {
-    for (const a of this.store.turnAttempts?.list("cancelled") ?? []) {
+    for (const a of this.store.turnAttempts.list("cancelled")) {
       if (a.source !== "inbound") continue;
       this.store.settleInboundExecution(a.id.slice("inbound-".length));
       await finishLiveTurn(this.config.DATA_DIR, { id: a.id, status: "cancelled",
         channelRef: a.spec.target, finishedUtc: new Date().toISOString(), reason: "durable cancellation" });
     }
-    for (const a of this.store.turnAttempts?.list("completed") ?? []) {
+    for (const a of this.store.turnAttempts.list("completed")) {
       if (a.source !== "inbound" || a.deliveryDone || !a.outcome) continue;
       if (this.adoptingRemoteResults.has(a.id)) continue;
       const row = this.store.getInbound(a.id.slice("inbound-".length));
@@ -16396,9 +16348,9 @@ export class Orchestrator {
    * row must never be guessed from a marker or replayed as a legacy turn. */
   private async liveTurnInventory(): Promise<LiveTurnMarker[]> {
     const legacy = (await listLiveMarkers(this.config.DATA_DIR).catch(() => [] as LiveTurnMarker[]))
-      .filter(m => !m.inboundMessageId && !m.scheduleOccurrenceId && !this.store.turnAttempts?.get(m.id));
+      .filter(m => !m.inboundMessageId && !m.scheduleOccurrenceId && !this.store.turnAttempts.get(m.id));
     for (const state of ["active", "suspended"] as const) {
-      for (const a of this.store.turnAttempts?.list(state) ?? []) {
+      for (const a of this.store.turnAttempts.list(state)) {
         if (a.source === "dispatch") continue;
         legacy.push({ id: a.id, kind: "live", channelRef: a.spec.target,
           sessionRecordId: makeSessionId(PLATFORM, a.spec.target),
@@ -17489,7 +17441,7 @@ export class Orchestrator {
     const profile = this.router.getProfile(agentId);
     if (!profile) {
       throw new Error(
-        this.refuseUnregisteredAgent(agentId, `Unknown agent \`${agentId}\`.`)
+        this.router.unregisteredAgentMessage(agentId, `Unknown agent \`${agentId}\`.`)
       );
     }
 
@@ -17538,7 +17490,7 @@ export class Orchestrator {
    */
   private async ensureOwnSession(record: SessionRecord, channel: ChannelRef): Promise<void> {
     if (!record.acpSessionId) return;
-    const holders = this.store.findByAcpSessionId?.(record.acpSessionId) ?? [];
+    const holders = this.store.findByAcpSessionId(record.acpSessionId);
     const owner = holders[0];
     if (!owner || owner.id === record.id || !holders.some((row) => row.id === record.id)) return;
     const shared = record.acpSessionId;
@@ -17859,7 +17811,7 @@ export class Orchestrator {
         const profile = this.router.getProfile(agentId);
         if (!profile) {
           throw new Error(
-            this.refuseUnregisteredAgent(agentId, `Unknown agent \`${agentId}\`.`)
+            this.router.unregisteredAgentMessage(agentId, `Unknown agent \`${agentId}\`.`)
           );
         }
         const location = this.router.describeConfig(record).location.value;
@@ -19293,13 +19245,13 @@ export class Orchestrator {
 
   private choiceTurnOrigin(record: SessionRecord): DispatchSpec | undefined {
     if (record.id.startsWith("dispatch:")) {
-      return this.store.turnAttempts?.get(record.id.slice("dispatch:".length))?.spec;
+      return this.store.turnAttempts.get(record.id.slice("dispatch:".length))?.spec;
     }
     const active = this.activeLiveDispatch.get(record.channelRef);
-    if (active) return this.store.turnAttempts?.get(active)?.spec;
+    if (active) return this.store.turnAttempts.get(active)?.spec;
     if (this.currentAuthorId(record.channelRef)) return undefined;
     // Adopted bridge turns keep their origin in the frozen attempt.
-    return this.store.turnAttempts?.list("suspended").find(attempt =>
+    return this.store.turnAttempts.list("suspended").find(attempt =>
       attempt.spec.session === "live" && attempt.spec.target === record.channelRef
       && attempt.remoteRecovery?.acpSessionId === record.acpSessionId)?.spec;
   }
@@ -19505,7 +19457,7 @@ export class Orchestrator {
       if (!profile) {
         return {
           ok: false,
-          error: this.refuseUnregisteredAgent(
+          error: this.router.unregisteredAgentMessage(
             agentId,
             `Unknown agent "${agentId}" at "${location}".`
           ),
@@ -19975,7 +19927,7 @@ export class Orchestrator {
       if (attempt.remoteRecovery) return null;
     }
     if (attempt.source === "schedule") {
-      const occurrence = this.store.scheduledOccurrences?.get(attemptId);
+      const occurrence = this.store.scheduledOccurrences.get(attemptId);
       if (!occurrence) return "no suspended occurrence";
       void this.runScheduledPrompt(occurrence.scheduleId, occurrence, true).catch((err) => {
         this.logger.warn({ err, id: attemptId }, "reauth schedule continuation failed");
@@ -20795,11 +20747,7 @@ export class Orchestrator {
    *  Never use `record.repoPath` for that — it is a session overlay that may
    *  still hold the REPOS_ROOT creation default (#207). */
   private effectiveCwd(record: SessionRecord): string {
-    const described =
-      typeof this.router.describeConfig === "function"
-        ? this.router.describeConfig(record)
-        : undefined;
-    return described?.cwd?.value ?? record.repoPath ?? this.config.REPOS_ROOT;
+    return this.router.describeConfig(record).cwd.value;
   }
 
   /** Persist an explicit session-scope cwd pin. Distinct from thread/channel overlays. */

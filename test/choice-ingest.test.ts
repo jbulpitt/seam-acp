@@ -1,3 +1,4 @@
+import { testSessionRouter } from "./helpers/session-fixture.js";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { createServer } from "node:http";
 import fs from "node:fs";
@@ -587,12 +588,12 @@ describe("seam-choice fence must not leak ingest tokens", () => {
           return { channel: { platform: "discord", id: "thread-1" }, id: "card-1" };
         },
       } as any,
-      router: {
+      router: testSessionRouter({
         listProfiles: () => [],
         describeConfig: () => ({}),
         ensureSessionRecord: () => record(),
         getProfile: () => ({ id: "claude" }),
-      } as any,
+      }) as any,
       store,
       renderer: {} as any,
     });

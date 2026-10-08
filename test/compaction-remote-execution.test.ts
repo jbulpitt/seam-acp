@@ -1,3 +1,4 @@
+import { testSessionRouter } from "./helpers/session-fixture.js";
 /**
  * #480: compaction analysis and seed must run on the thread's bridge.
  * A synthetic local provider that completes successfully is not evidence —
@@ -69,11 +70,11 @@ function setup(location = REMOTE) {
     deleteSession: localDelete,
   };
   const remoteSeam = { type: "http", name: "seam-mcp", url: "https://seam.example/mcp", headers: [{ name: "X-Seam-Session", value: "author-token" }] };
-  const router = { permissionOptions: () => ({}), ensureSessionRecord: () => ({ ...record }), getProfile: () => profile, listProfiles: () => [profile],
+  const router = testSessionRouter({ permissionOptions: () => ({}), ensureSessionRecord: () => ({ ...record }), getProfile: () => profile, listProfiles: () => [profile],
     resolveProfileForChannel: () => profile, assertAgentAllowedForChannel() {}, assertAgentAllowedForRecord() {},
     reuseMcpServers: vi.fn(() => []), isBusy: () => false,
     describeConfig: () => ({ agent: { value: profile.id }, model: { value: MODEL }, effort: { value: "high" },
-      cwd: { value: cwd }, location: { value: location }, fastMode: { value: false } }) };
+      cwd: { value: cwd }, location: { value: location }, fastMode: { value: false } }) });
   const mux = { spawn: remoteSpawn, rpc: vi.fn(async () => ({ projectMcpInjection: true })), releaseStdin: vi.fn() };
   const hub = { markSessionBridge: vi.fn(), get: vi.fn(() => ({ mux })),
     mcpServersForBridgeSpawn: vi.fn(() => remoteSeam),

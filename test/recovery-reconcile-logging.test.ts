@@ -1,3 +1,4 @@
+import { testSessionRouter } from "./helpers/session-fixture.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -48,7 +49,7 @@ async function setup(locations = ["remote"]) {
     }) }] as const;
   }));
   store.turnAttempts.suspendBoot("fixture");
-  const orch = new Orchestrator({ logger, store, router: {} as any, adapter: {} as any,
+  const orch = new Orchestrator({ logger, store, router: testSessionRouter({}) as any, adapter: {} as any,
     modelCatalog: fixtureModelCatalog([]), renderer: discordRenderer,
     config: { ...visualConfig, DATA_DIR: dir, REPOS_ROOT: "/synthetic", REPO_EMOJIS: new Map(),
       channelPresets: new Map(), threadPresets: new Map() } as any });

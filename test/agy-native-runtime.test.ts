@@ -104,7 +104,7 @@ describe("native AGY R2 runtime identity", () => {
       version: "agy fixture 1.1.28",
       credentialScope: "antigravity-oauth:r2-consumer",
       cwd: root,
-      approvedEnvironment: {
+      environment: {
         SEAM_AGY_CAPABILITY_FIXTURE_DIR: capabilityFixtureDir,
         SEAM_AGY_CAPABILITY_INVOCATIONS: invocationLog,
       },
@@ -284,7 +284,6 @@ describe("native AGY R2 runtime identity", () => {
         sha256: fixture.sha256,
         credentialScope: "antigravity-oauth:test",
         cwd: "/tmp",
-        approvedEnvironment: { FAKE_AGY_VERSION: "actual-version" },
       })).toThrow(/version does not match AGY_VERSION/);
     } finally {
       fixture.cleanup();
@@ -352,7 +351,7 @@ describe("native AGY R2 runtime identity", () => {
     const fixture = createManagedAgyFixture({
       version: "audited-version",
       credentialScope: auditScope,
-      approvedEnvironment: { SEAM_AGY_AUDIT_SENTINEL: auditSentinel },
+      environment: { SEAM_AGY_AUDIT_SENTINEL: auditSentinel },
     });
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "seam-agy-r2-audit-"));
     const store = new SessionStore(path.join(dir, "seam.db"));

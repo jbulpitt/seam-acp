@@ -1,3 +1,4 @@
+import { testSessionRouter } from "./helpers/session-fixture.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { EventEmitter } from "node:events";
 import { simulateRetiredOwnerProcess } from "./restart-process-fixture.js";
@@ -39,7 +40,7 @@ function setup(acpSessionId = "recorded-acp") {
     prompt: vi.fn(async (_text: string): Promise<{ stopReason: string }> => { entered(); await gate; throw new Error("ACP connection closed"); }),
     idle: async () => {},
   };
-  const router = {
+  const router = testSessionRouter({
     listProfiles: () => [], describeConfig: () => ({ agent: { value: "codex" }, model: { value: "default" },
       location: { value: "local" }, cwd: { value: "/synthetic" }, effort: { value: null } }),
     ensureSessionRecord: ({ channelRef }: { channelRef: string }) => ({ ...record, id: `discord:${channelRef}`, channelRef }), getProfile: () => undefined,
@@ -47,7 +48,7 @@ function setup(acpSessionId = "recorded-acp") {
     releaseRecoveryRuntime: vi.fn(),
     isBusy: () => false,
     getOrStartRuntime: vi.fn(async (_record: unknown, _opts?: { resumeSessionId: string }) => runtime),
-  };
+  });
   const adapter = { sendPanel: async (channel: any) => ({ channel, id: "panel" }),
     sendMessage: vi.fn(async (channel: any, _text?: string) => ({ channel, id: "message" })),
     findMessageByNonce: vi.fn(async () => ({ status: "absent" as const })),

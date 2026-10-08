@@ -1,3 +1,4 @@
+import { testSessionRouter } from "./helpers/session-fixture.js";
 import { acknowledgedHandler } from "./acknowledged-handler-fixture.js";
 /**
  * `/seam new` + `/seam config init` post the `/seam config edit` card (#157).
@@ -118,7 +119,7 @@ function makeOrch(over?: {
   const pickers: Array<{ id: string; title: string | undefined }> = [];
   const threadNames = new Map<string, string>();
 
-  const router = {
+  const router = testSessionRouter({
     listProfiles: () => [catalogProfile],
     getProfile: (id: string) => ({
       id,
@@ -169,7 +170,7 @@ function makeOrch(over?: {
       return rec;
     },
     invalidate: vi.fn(async () => {}),
-  };
+  });
 
   let seq = 0;
   const adapter: Record<string, unknown> = {

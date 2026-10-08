@@ -52,7 +52,6 @@ export interface Rung1RecoveryHooks {
   write(slot: number, line: string): boolean;
   publishSnapshot(slot: number, snapshot: RemoteRecoverySnapshot): void;
   publishResult(slot: number, result: RemoteRecoveryResult): void;
-  controllerConnected(): boolean;
   publishOutput?(slot: number, line: string): void;
   now?: () => number;
 }
@@ -331,18 +330,6 @@ export function createRung1Recovery(hooks: Rung1RecoveryHooks) {
           return { forward: `${JSON.stringify({ ...message, params: { ...params,
             update: { ...update, content: { ...record(update.content), text } } } })}\n` };
         }
-        return { forward: line };
-      }
-
-      // A child-to-client request while the controller is absent requires app
-      // policy. Refuse this recovery only; the child and every other slot stay
-      // alive, and the request remains in the output log for inspection.
-      if (message.method && message.id !== undefined && !hooks.controllerConnected()) {
-        publish(slot, state, {
-          phase: "awaiting_app",
-          disposition: "none",
-          terminalReason: "client_request_requires_app",
-        });
         return { forward: line };
       }
 

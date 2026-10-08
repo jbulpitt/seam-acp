@@ -1,3 +1,4 @@
+import { testSessionRouter } from "./helpers/session-fixture.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
@@ -151,7 +152,7 @@ function injectionFixture() {
     store, logger: pino({ level: "silent" }), adapter: {}, config: { REPOS_ROOT: dir },
     plugins: new PluginHost(pino({ level: "silent" })),
     modelCatalog: fixtureModelCatalog([profile as never]),
-    router: {
+    router: testSessionRouter({
       permissionOptions: () => ({}),
       describeConfig: (rec: SessionRecord) => ({
         agent: { value: rec.agentId }, location: { value: "local" },
@@ -160,7 +161,7 @@ function injectionFixture() {
       getProfile: () => profile,
       assertAgentAllowedForChannel: () => {},
       getOrStartRuntime: async () => runtime,
-    },
+    }),
   });
   attachLocalBridge(orch, [profile as never], dir);
   return { orch, record, profile, runtime, setEvents: (next: AgentEvent[]) => { events = next; } };
@@ -189,7 +190,7 @@ describe("real injection recording, offline runtime only", () => {
       renderer: discordRenderer,
       config: { ...visualConfig, DATA_DIR: dir, REPOS_ROOT: dir, TURN_TIMEOUT_SECONDS: 60, REPO_EMOJIS: new Map(),
         DEFAULT_MODEL: identity.model, channelPresets: new Map(), threadPresets: new Map() } as never,
-      router: {
+      router: testSessionRouter({
         listProfiles: () => [profile], ensureSessionRecord: () => store.get(record.id)!, getProfile: () => profile,
         assertAgentAllowedForRecord: () => {},
         getOrStartRuntime: async () => runtime,
@@ -198,7 +199,7 @@ describe("real injection recording, offline runtime only", () => {
           effort: { value: null }, cwd: { value: dir }, fastMode: { value: false },
           role: { value: null }, disableThreadPrefix: { value: false },
         }),
-      } as never,
+      }) as never,
       adapter: {
         async sendPanel(channel: unknown, panel: unknown) { panels.push(panel); return { channel, id: "panel" }; },
         async editPanel(_ref: unknown, panel: unknown) { panels.push(panel); },

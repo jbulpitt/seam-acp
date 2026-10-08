@@ -36,7 +36,7 @@ import {
 import type { AgentQuota } from "../packages/core/src/core/quota/agent-quota.js";
 import type { AgentProfile } from "@seam/adapters";
 import type { Logger } from "../packages/core/src/lib/logger.js";
-import { createManagedAgyFixture } from "./helpers/agy-runtime-fixture.js";
+import { createOrdinaryAgyFixture } from "./helpers/agy-runtime-fixture.js";
 import { quotaMcp } from "../packages/core/src/plugins/quota/mcp.js";
 import type { PluginContext } from "../packages/core/src/plugins/types.js";
 
@@ -54,16 +54,16 @@ const PROMPT_FLAGS = ["-p", "--print", "--prompt", "-i", "--prompt-interactive"]
 interface Invocation { args?: string[]; prompt?: string }
 
 function agyFixture(extraEnv: Record<string, string> = {}): {
-  runtime: ReturnType<typeof createManagedAgyFixture>["runtime"];
+  runtime: ReturnType<typeof createOrdinaryAgyFixture>["runtime"];
   invocations: () => Invocation[];
 } {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "seam-361-agy-"));
   const log = path.join(root, "invocations");
-  const managed = createManagedAgyFixture({
+  const managed = createOrdinaryAgyFixture({
     source: path.join(fixtures, "fake-native-agy.mjs"),
     version: "agy fixture 1.1.28",
     cwd: root,
-    approvedEnvironment: {
+    environment: {
       SEAM_AGY_CAPABILITY_FIXTURE_DIR: fixtures,
       SEAM_AGY_CAPABILITY_INVOCATIONS: log,
       ...extraEnv,

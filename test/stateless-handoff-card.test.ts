@@ -1,3 +1,4 @@
+import { testSessionRouter, testSessionStore } from "./helpers/session-fixture.js";
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { EventEmitter } from "node:events";
 import fs from "node:fs";
@@ -108,7 +109,7 @@ function makeOrch(opts: {
 }): Orchestrator {
   const catalogProfile = { id: "claude", defaultModel: "default" } as any;
   const chunks = opts.chunks ?? ["Hello ", "world"];
-  const router = {
+  const router = testSessionRouter({
     listProfiles: () => [],
     describeConfig: (r: SessionRecord, selection: any = {}) => ({
       agent: { value: selection.agent ?? r.agentId, source: "session config" },
@@ -126,8 +127,8 @@ function makeOrch(opts: {
       throw new Error("live runtime must not be used; injectTurn is stubbed");
     },
     reuseMcpServers: () => [],
-  };
-  const store = {
+  });
+  const store = testSessionStore({
     getByChannel: () => null,
     getPresetByName: (name: string) => fakePreset(name),
     recordDelegation: () => {},
@@ -136,7 +137,7 @@ function makeOrch(opts: {
     getReportBackByCorrelation: () => null,
     tryRecordReportBack: (e: unknown) => e,
     getParkedByChannel: () => null,
-  };
+  });
   const orchestrator = new Orchestrator({
     logger: silent,
     config: {

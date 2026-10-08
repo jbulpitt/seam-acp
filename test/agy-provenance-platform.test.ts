@@ -103,8 +103,6 @@ describe("AGY provenance is platform-correct and cannot take down the host (#330
   });
 
   it("verifies an immutable staged artifact on darwin instead of throwing on its own return path", () => {
-    // A Mach-O cannot start with a shebang, so this drives the real binary
-    // branch rather than the Node fixture loader.
     const { root, executable, sha256 } = stageArtifact(Buffer.from([0xcf, 0xfa, 0xed, 0xfe, 0x07, 0x00]));
     forcePlatform("darwin");
     // The regression: the darwin branch previously threw EBADF from its own

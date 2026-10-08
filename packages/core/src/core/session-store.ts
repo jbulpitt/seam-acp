@@ -3021,17 +3021,6 @@ export class SessionStore {
     return row ? mapLiveHelp(row) : null;
   }
 
-  getActiveLiveHelpForVoiceChannel(voiceChannelId: string): LiveHelpSession | null {
-    const row = this.db
-      .prepare<[string], LiveHelpRow>(
-        `SELECT * FROM live_help_sessions
-          WHERE voice_channel_id = ? AND status IN ('starting','live')
-          ORDER BY created_utc DESC LIMIT 1`
-      )
-      .get(voiceChannelId);
-    return row ? mapLiveHelp(row) : null;
-  }
-
   getActiveLiveHelpForGuild(guildId: string): LiveHelpSession | null {
     const row = this.db
       .prepare<[string], LiveHelpRow>(

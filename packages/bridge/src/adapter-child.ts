@@ -134,9 +134,6 @@ function start(config: AdapterChildBootstrap): void {
       });
       resumeRecord.clear();
     },
-    // The durable output stream retains child-to-client requests while the
-    // bridge is absent. The replacement controller can answer after replay.
-    controllerConnected: () => true,
   });
 
   // #631: relaunched after a host restart. Bring the agent back to the same

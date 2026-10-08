@@ -1,3 +1,4 @@
+import { testSessionRouter } from "./helpers/session-fixture.js";
 /**
  * #76 integration-style flows: dispatch-path resume (continue + loadSession),
  * report-back / chain succession, command-layer cancel vs dispose/onDead,
@@ -67,7 +68,7 @@ function makeOrch(opts?: {
   const sent: Array<{ channel: string; text: string }> = [];
   const loadSession = opts?.loadSession ?? vi.fn(async () => ({ sessionId: "acp-recorded" }));
   const newSession = opts?.newSession ?? vi.fn(async () => ({ sessionId: "acp-NEW" }));
-  const router = {
+  const router = testSessionRouter({
     listProfiles: () => [],
     describeConfig: (r: SessionRecord, selection: any = {}) => ({
       agent: { value: selection.agent ?? r.agentId, source: "session config" },
@@ -110,7 +111,7 @@ function makeOrch(opts?: {
     invalidate: vi.fn(async () => {}),
     killAll: vi.fn(async () => 1),
     disposeAll: vi.fn(async () => {}),
-  };
+  });
   const orch = new Orchestrator({
     logger: silent,
     config: {

@@ -1,3 +1,4 @@
+import { testSessionRouter } from "./helpers/session-fixture.js";
 import { acknowledgedHandler } from "./acknowledged-handler-fixture.js";
 /**
  * #88: park one prompt per thread while its remote bridge is offline.
@@ -65,7 +66,7 @@ function makeOrch(opts?: {
   const sent: string[] = [];
   const edited: string[] = [];
   const panels: Array<{ title?: string; description?: string }> = [];
-  const router = {
+  const router = testSessionRouter({
     listProfiles: () => [],
     describeConfig: () => ({}),
     ensureSessionRecord: (o: { channelRef: string }) =>
@@ -76,7 +77,7 @@ function makeOrch(opts?: {
     abortTurn,
     invalidate: vi.fn(async () => {}),
     killAll,
-  };
+  });
   const threadPresets = new Map([["thread-1", { location: "mac" }]]);
   const orch = new Orchestrator({
     logger: silent,

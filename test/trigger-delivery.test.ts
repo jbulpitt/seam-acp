@@ -1,3 +1,4 @@
+import { testSessionRouter } from "./helpers/session-fixture.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
@@ -44,8 +45,8 @@ function fixture() {
   vi.spyOn(adapter, "sendPanel").mockResolvedValue({ channel: target, id: "notice-1" });
   vi.spyOn(adapter, "editPanel").mockResolvedValue(undefined);
   const orch = new Orchestrator({ config, adapter, store, logger: logger as any, renderer: {} as any,
-    router: { ensureSessionRecord: () => ({ id: "discord:thread-1", channelRef: "thread-1", repoPath: dir,
-      agentId: "claude", configJson: "{}" }) } as any });
+    router: testSessionRouter({ ensureSessionRecord: () => ({ id: "discord:thread-1", channelRef: "thread-1", repoPath: dir,
+      agentId: "claude", configJson: "{}" }) }) as any });
   const writeAttachment = vi.fn(async () => ({ path: "/repo/.seam-attachments/note.txt" }));
   const hub = { isBridgeReady: () => true, onBridgeReady: () => () => {}, markSessionBridge: () => {}, writeAttachment };
   orch.setBridgeHub(hub as any);

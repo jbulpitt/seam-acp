@@ -1,3 +1,4 @@
+import { testSessionRouter } from "./helpers/session-fixture.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -29,7 +30,7 @@ function setup() {
   };
   const orch = new Orchestrator({ logger: pino({ level: "silent" }) as any, store,
     config: { DATA_DIR: dir, REPOS_ROOT: "/repo", SEAM_PARTICIPANT_USER_IDS: new Set(), SEAM_CONFIG_ADMIN_USER_IDS: new Set() } as any,
-    router: {} as any, adapter: adapter as any, renderer: {} as any });
+    router: testSessionRouter({}) as any, adapter: adapter as any, renderer: {} as any });
   const spec = (kind: DispatchSpec["kind"], over: Partial<DispatchSpec> = {}): DispatchSpec => ({
     id: "attempt", target: "worker", session: "live", kind, originThreadRef: "caller", returnTo: "delivery-thread",
     prompt: "do the work", createdUtc: now, ...over,

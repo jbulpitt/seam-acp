@@ -1,3 +1,4 @@
+import { testSessionRouter, testSessionStore } from "./helpers/session-fixture.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
@@ -40,16 +41,16 @@ function makeOrchestrator(dir: string) {
       bridgePresets: new Map(),
     } as any,
     adapter: {} as any,
-    router: {
+    router: testSessionRouter({
       listProfiles: () => [],
       describeConfig: () => ({}),
       abortTurn,
-    } as any,
-    store: {
+    }) as any,
+    store: testSessionStore({
       getByChannel: (_platform: string, channelRef: string) =>
         channelRef === session.channelRef ? session : null,
       getParkedByChannel: () => null,
-    } as any,
+    }) as any,
     renderer: {} as any,
   });
   return { orchestrator, abortTurn };

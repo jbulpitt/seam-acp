@@ -33,7 +33,7 @@ import {
 } from "@seam/adapters";
 import { AgentRuntime } from "../packages/core/src/agents/agent-runtime.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
-import { createManagedAgyFixture } from "./helpers/agy-runtime-fixture.js";
+import { createOrdinaryAgyFixture } from "./helpers/agy-runtime-fixture.js";
 
 const fixtures = fileURLToPath(new URL("./fixtures/agy-native-capabilities/", import.meta.url));
 const logger = pino({ level: "silent" }) as unknown as Logger;
@@ -46,11 +46,11 @@ interface Invocation { args?: string[]; prompt?: string; scenario?: string }
 async function discover(): Promise<{ catalog: AgyCatalogEntry[]; invocations: Invocation[]; cleanup: () => void }> {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "seam-agy-r4a-"));
   const log = path.join(root, "invocations");
-  const managed = createManagedAgyFixture({
+  const managed = createOrdinaryAgyFixture({
     source: path.join(fixtures, "fake-native-agy.mjs"),
     version: "agy fixture 1.1.28",
     cwd: root,
-    approvedEnvironment: {
+    environment: {
       SEAM_AGY_CAPABILITY_FIXTURE_DIR: fixtures,
       SEAM_AGY_CAPABILITY_INVOCATIONS: log,
     },
@@ -118,11 +118,11 @@ describe("#260 native catalog discovery is prompt-free", () => {
     // to accept any turn; #339 rule 15 keeps `default` startable, and this
     // asserts AGY does not reintroduce the dead end on its own side.
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "seam-agy-r4a-fail-"));
-    const managed = createManagedAgyFixture({
+    const managed = createOrdinaryAgyFixture({
       source: path.join(fixtures, "fake-native-agy.mjs"),
       version: "agy fixture 1.1.28",
       cwd: root,
-      approvedEnvironment: {
+      environment: {
         SEAM_AGY_CAPABILITY_FIXTURE_DIR: fixtures,
         SEAM_AGY_R5_CATALOG_MODE: "fail",
       },
@@ -150,11 +150,11 @@ describe("#260 native catalog discovery is prompt-free", () => {
 
   it("learns the real context window from the language server of a real turn", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "seam-agy-r4b-repro-"));
-    const managed = createManagedAgyFixture({
+    const managed = createOrdinaryAgyFixture({
       source: path.join(fixtures, "fake-native-agy.mjs"),
       version: "agy fixture 1.1.28",
       cwd: root,
-      approvedEnvironment: {
+      environment: {
         SEAM_AGY_CAPABILITY_FIXTURE_DIR: fixtures,
       },
     });

@@ -1,3 +1,4 @@
+import { testSessionStore } from "./helpers/session-fixture.js";
 import { presetUiFixture } from "./plugin-presets-fixture.js";
 /**
  * Call-site behaviour for the preset-list Edit button (#159).
@@ -150,10 +151,10 @@ async function runPresetListEdit(clicks: number, opts: RunOpts = {}) {
     logger: silent,
     config: { channelPresets: new Map() },
     projectScopeId: () => null,
-    store: {
+    store: testSessionStore({
       listPresetsForProject: () => [presetRow],
       getPreset: () => presetRow,
-    },
+    }),
     repoDisplay: (p: string) => p,
     slashAccessRefusal: Orchestrator.prototype["slashAccessRefusal" as never],
     attachListLifecycle: Orchestrator.prototype["attachListLifecycle" as never],

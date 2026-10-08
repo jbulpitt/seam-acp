@@ -104,6 +104,29 @@ describe("binding clear causes", () => {
     });
   });
 
+  it("records a confirmed missing-session cause once, including across repeated invalidation", async () => {
+    const info = vi.spyOn(journal, "info").mockImplementation(() => {});
+    const options = { clearAcpSession: true,
+      bindingChange: { source: "provider-session-load", cause: "session/load: unknown session acp-old" } } as const;
+    await router.invalidate("discord:worker", options);
+    await router.invalidate("discord:worker", options);
+    const clears = info.mock.calls.filter(([, message]) => message === "cleared stored acp session id");
+    expect(clears).toHaveLength(1);
+    expect(clears[0]?.[0]).toMatchObject({ ...options.bindingChange, sessionId: "discord:worker",
+      threadId: "worker", previousAcpSessionId: "acp-old", acpSessionId: "" });
+  });
+
+  it("records only a successful conditional clear, with its cause", () => {
+    const info = vi.spyOn(journal, "info").mockImplementation(() => {});
+    const binding = { source: "operator-session-attachment", cause: "operator detached provider session" };
+    expect(store.compareAndSwapAcpSession("discord:worker", "stale", "", binding)).toBe(false);
+    expect(info).not.toHaveBeenCalled();
+    expect(store.compareAndSwapAcpSession("discord:worker", "acp-old", "", binding)).toBe(true);
+    expect(info).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      ...binding, previousAcpSessionId: "acp-old", acpSessionId: "",
+    }), "cleared stored acp session id");
+  });
+
   it("retains the previous binding when a fresh forge fails and records the native cause", async () => {
     const info = vi.spyOn(journal, "info").mockImplementation(() => {});
     const warn = vi.spyOn(journal, "warn").mockImplementation(() => {});
@@ -117,6 +140,24 @@ describe("binding clear causes", () => {
     expect(warn).toHaveBeenCalledWith(expect.objectContaining({
       sessionId: "discord:worker", cause: cause.message, previousAcpSessionId: "acp-old",
     }), "fresh session replacement failed; restored previous binding");
+  });
+
+  it("does not overwrite a newer binding or config while handling a failed forge", async () => {
+    const warn = vi.spyOn(journal, "warn").mockImplementation(() => {});
+    vi.spyOn(journal, "info").mockImplementation(() => {});
+    const cause = new Error("session/new transport closed");
+    vi.spyOn(router, "getOrStartRuntime").mockImplementation(async () => {
+      const current = store.get("discord:worker")!;
+      store.upsert({ ...current, configJson: '{"role":"reviewer"}' });
+      store.compareAndSwapAcpSession(current.id, "", "acp-newer", { source: "fixture", cause: "intentional test binding change" });
+      throw cause;
+    });
+    const transition = new RuntimeTransition({ store, router,
+      mutation: {} as any, modelCatalog: fixtureModelCatalog([]) });
+    await expect(transition.reset(store.get("discord:worker")!)).rejects.toBe(cause);
+    expect(store.get("discord:worker")).toMatchObject({ acpSessionId: "acp-newer", configJson: '{"role":"reviewer"}' });
+    expect(warn).toHaveBeenCalledWith(expect.objectContaining({ cause: cause.message, restored: false }),
+      "fresh session replacement failed; retained current binding");
   });
 });
 
@@ -159,7 +200,8 @@ describe("#580 operator session replacement", () => {
   it("leaves timeout and warm-eviction clears recoverable when operator intent is absent", async () => {
     suspended("runtime-failure", "acp-old");
 
-    await router.invalidate("discord:worker", { clearAcpSession: true });
+    await router.invalidate("discord:worker", { clearAcpSession: true,
+      bindingChange: { source: "fixture", cause: "runtime failure did not replace the operator session" } });
 
     // Removing this distinction silently swallows genuine timeout/eviction failures.
     expect(store.turnAttempts.get("runtime-failure")?.state).toBe("suspended");

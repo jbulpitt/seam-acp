@@ -2,6 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { logger as journal } from "../packages/core/src/lib/logger.js";
 import type { AgentProfile } from "@seam/adapters";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
 import { planAgyIdentityMigration, readAgyHandleOwnership, rebuildMigratedAgySession } from "../packages/core/src/core/agy-identity-migration.js";
@@ -14,7 +15,7 @@ import { localBridgeWiring } from "./local-bridge-fixture.js";
 
 const stores: SessionStore[] = [];
 const dirs: string[] = [];
-afterEach(() => { for (const store of stores.splice(0)) store.close(); for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true }); });
+afterEach(() => { for (const store of stores.splice(0)) store.close(); for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true }); vi.restoreAllMocks(); });
 function setup() { const store = new SessionStore(":memory:"); stores.push(store); return store; }
 function row(id: string, agentId = "agy", acpSessionId = id): SessionRecord {
   return { id, agentId, acpSessionId, platform: "discord", channelRef: id, parentRef: "parent", repoPath: "/repo", namePrefix: "custom", configJson: '{"model":"exact-high","reasoningEffort":"default","role":"worker","availableTools":["safe"]}', createdUtc: "before", updatedUtc: "before" };
@@ -47,12 +48,13 @@ describe("owner-approved local AGY restoration", () => {
     const router = new SessionRouter({ logger: pino({ level: "silent" }) as unknown as Logger,
       store, profiles: [profile], modelCatalog: fixtureModelCatalog([profile]), defaultAgentId: "agy", defaultModel: "exact-high", threadPresets: new Map(), seamMcp: localBridgeWiring(profile) });
     expect(() => router.planRuntimeSpawn(store.get("package")!)).toThrow(/requires Discord reconstruction/);
-    store.compareAndSwapAcpSession("package", "", "rebuilt-native");
+    store.compareAndSwapAcpSession("package", "", "rebuilt-native", { source: "fixture", cause: "intentional test binding change" });
     expect(store.completeAgyIdentityRebuild("package", "rebuilt-native")).toBe(true);
     expect(router.planRuntimeSpawn(store.get("package")!)).toMatchObject({ agentId: "agy", model: "exact-high" });
     expect(spawn).not.toHaveBeenCalled();
   });
   it("preserves all columns except exact identity/handle, excludes remote and other agents, and is one-shot", () => {
+    const info = vi.spyOn(journal, "info").mockImplementation(() => {});
     const store = setup();
     const before = [row("native", "agy-old"), row("package"), row("unknown"), row("unbound", "agy", ""), row("remote"), row("other", "codex")];
     before.forEach(r => store.upsert(r));
@@ -63,12 +65,21 @@ describe("owner-approved local AGY restoration", () => {
     expect(store.needsAgyIdentityRebuild("package")).toBe(true);
     expect(store.needsAgyIdentityRebuild("unbound")).toBe(false);
     expect(store.applyAgyIdentityMigration(plan)).toBe(false);
+    const clears = info.mock.calls.filter(([, message]) => message === "cleared stored acp session id");
+    expect(clears).toHaveLength(2);
+    expect(clears.map(([event]) => event)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ sessionId: "package", previousAcpSessionId: "package", acpSessionId: "",
+        source: "SessionStore.applyAgyIdentityMigration", cause: "native AGY restoration: package binding requires rebuild" }),
+      expect.objectContaining({ sessionId: "unknown", previousAcpSessionId: "unknown", acpSessionId: "",
+        source: "SessionStore.applyAgyIdentityMigration", cause: "native AGY restoration: unrecognized binding requires rebuild" }),
+    ]));
     store.rollbackAgyIdentityMigration();
     before.forEach(r => expect(store.get(r.id)).toEqual(r));
     expect(store.agyIdentityRestored()).toBe(false);
   });
 
   it("rolls back the entire transaction on a stale row, without losing other config", () => {
+    const info = vi.spyOn(journal, "info").mockImplementation(() => {});
     const store = setup(); [row("package"), row("unknown")].forEach(r => store.upsert(r));
     const plan = planAgyIdentityMigration(store.list(), ownership, binding);
     const changed = { ...plan[1]!.before, configJson: '{"model":"changed"}' }; store.upsert(changed);
@@ -76,6 +87,7 @@ describe("owner-approved local AGY restoration", () => {
     expect(store.get(plan[0]!.before.id)).toEqual(plan[0]!.before);
     expect(store.get(changed.id)).toEqual(changed);
     expect(store.agyIdentityRestored()).toBe(false);
+    expect(info).not.toHaveBeenCalled();
   });
 
   it("fails closed on ambiguous ownership or a conflicting effective agent", () => {
@@ -123,7 +135,7 @@ describe("owner-approved local AGY restoration", () => {
     await expect(rebuildMigratedAgySession(store, pending, { agent: "agy", location: "remote" }, async () => ({ attached: true, newSessionId: "new" }))).rejects.toThrow(/binding changed/);
     await expect(rebuildMigratedAgySession(store, pending, { agent: "agy", location: "local" }, async () => ({ attached: false, newSessionId: "new" }))).rejects.toThrow(/did not attach/);
     let calls = 0;
-    const rebuild = async () => { calls++; store.compareAndSwapAcpSession(pending.id, "", "new-native"); return { attached: true, newSessionId: "new-native" }; };
+    const rebuild = async () => { calls++; store.compareAndSwapAcpSession(pending.id, "", "new-native", { source: "fixture", cause: "intentional test binding change" }); return { attached: true, newSessionId: "new-native" }; };
     await rebuildMigratedAgySession(store, pending, { agent: "agy", location: "local" }, rebuild);
     await rebuildMigratedAgySession(store, pending, { agent: "agy", location: "local" }, rebuild);
     expect(calls).toBe(1);

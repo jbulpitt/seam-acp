@@ -99,7 +99,9 @@ export async function attachCompactedSession(
   });
   let outcome: AttachOutcome;
   if (plan.action === "cas") {
-    if (store.compareAndSwapAcpSession(record.id, plan.expect, plan.next)) {
+    if (store.compareAndSwapAcpSession(record.id, plan.expect, plan.next, {
+      source: "attachCompactedSession", cause: plan.reason,
+    })) {
       outcome = { attached: true, reason: plan.reason };
       await router.invalidate(record.id, { clearAcpSession: false });
     } else {
@@ -233,7 +235,9 @@ export class SessionActions {
   async attach(sessionId: string): Promise<void> {
     const { record, store, router } = this.deps;
     await router.invalidate(record.id);
-    store.upsert({ ...record, acpSessionId: sessionId, updatedUtc: new Date().toISOString() });
+    store.upsert({ ...record, acpSessionId: sessionId, updatedUtc: new Date().toISOString() }, {
+      source: "SessionActions.attach", cause: "operator attached provider session",
+    });
     const fresh = store.get(record.id);
     if (fresh) record.acpSessionId = fresh.acpSessionId;
   }
@@ -242,7 +246,8 @@ export class SessionActions {
     const { record, manager, cwd, store, router } = this.deps;
     await manager.deleteSession(cwd, sessionId);
     if (record.acpSessionId === sessionId) {
-      await router.invalidate(record.id, { clearAcpSession: true, operatorIntent: "replace-session" });
+      await router.invalidate(record.id, { clearAcpSession: true, operatorIntent: "replace-session",
+        bindingChange: { source: "SessionActions.delete", cause: "operator deleted attached provider session" } });
       const fresh = store.get(record.id);
       record.acpSessionId = fresh ? fresh.acpSessionId : "";
     }
@@ -279,7 +284,7 @@ export class SessionActions {
       store.upsert({
         ...record, repoPath: targetCwd, acpSessionId: newSessionId,
         configJson: store.writeConfig(importedCfg), updatedUtc: new Date().toISOString(),
-      });
+      }, { source: "SessionActions.import", cause: "attach imported provider session" });
       await complete(newSessionId);
     }, failed, compactionModel);
   }

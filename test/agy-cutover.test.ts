@@ -61,8 +61,9 @@ describe("agy public identity cutover", () => {
     insert("discord:new", "agy-package");
     insert("discord:old", "agy");
 
-    await router.invalidate("discord:new", { clearAcpSession: true });
-    await router.invalidate("discord:old", { clearAcpSession: true });
+    const clear = { clearAcpSession: true, bindingChange: { source: "fixture", cause: "agent reported missing session" } } as const;
+    await router.invalidate("discord:new", clear);
+    await router.invalidate("discord:old", clear);
 
     expect(store.get("discord:new")).toMatchObject({
       agentId: "agy-package",

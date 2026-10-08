@@ -121,7 +121,9 @@ describe("SessionActions", () => {
     h.events.length = 0;
     await h.actions.delete("attached");
     expect(h.events).toEqual(["delete", "invalidate"]);
-    expect(h.invalidate).toHaveBeenLastCalledWith(h.record.id, { clearAcpSession: true, operatorIntent: "replace-session" });
+    expect(h.invalidate).toHaveBeenLastCalledWith(h.record.id, { clearAcpSession: true, operatorIntent: "replace-session",
+      bindingChange: { source: "SessionActions.delete", cause: "operator deleted attached provider session" },
+    });
     expect(h.record.acpSessionId).toBe("");
   });
 

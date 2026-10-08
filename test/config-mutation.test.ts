@@ -193,7 +193,7 @@ describe("session binding survives delayed config proposals", () => {
     expect(built.ok).toBe(true);
     if (!built.ok) throw new Error(built.error);
 
-    expect(store.compareAndSwapAcpSession(record.id, oldId, "acp-live")).toBe(true);
+    expect(store.compareAndSwapAcpSession(record.id, oldId, "acp-live", { source: "fixture", cause: "intentional test binding change" })).toBe(true);
     const writes: Readonly<SessionRecord>[] = [];
     const unsubscribe = store.onSessionWrite(row => writes.push(row));
     try {

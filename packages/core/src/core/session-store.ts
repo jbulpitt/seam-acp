@@ -9,6 +9,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import type { AgyIdentityChange } from "./agy-identity-migration.js";
+import { logger } from "../lib/logger.js";
 import {
   defaultSessionConfig,
   type ActiveProject,
@@ -316,6 +317,11 @@ export function isPlannedChainChildId(id: string | null | undefined): id is stri
     typeof id === "string" &&
     (id.startsWith(CHAIN_HOP_ID_PREFIX) || id.startsWith(CHAIN_DELIVERY_ID_PREFIX))
   );
+}
+
+export interface SessionBindingChange {
+  source: string;
+  cause: string;
 }
 
 export class SessionStore {
@@ -1016,7 +1022,7 @@ export class SessionStore {
   }
 
   applyAgyIdentityMigration(changes: readonly AgyIdentityChange[], { complete = true } = {}): boolean {
-    return this.db.transaction(() => {
+    const applied = this.db.transaction(() => {
       if (this.agyIdentityRestored()) return false;
       for (const change of changes) {
         if (JSON.stringify(this.get(change.before.id)) !== JSON.stringify(change.before)) throw new Error("AGY migration snapshot changed");
@@ -1028,6 +1034,11 @@ export class SessionStore {
       if (complete) this.db.prepare("INSERT INTO agy_identity_restore VALUES ('@complete', '{}', '{}', 0)").run();
       return true;
     })();
+    if (applied) for (const change of changes) this.recordBindingClear(change.before, change.after, {
+      source: "SessionStore.applyAgyIdentityMigration",
+      cause: `native AGY restoration: ${change.reason} binding requires rebuild`,
+    });
+    return applied;
   }
 
   needsAgyIdentityRebuild(id: string): boolean {
@@ -1044,7 +1055,7 @@ export class SessionStore {
 
   /** Offline recovery only. Refuse the whole rollback if any migrated row changed. */
   rollbackAgyIdentityMigration(): void {
-    this.db.transaction(() => {
+    const restored = this.db.transaction(() => {
       const rows = this.db.prepare("SELECT before_json, after_json FROM agy_identity_restore WHERE id != '@complete'").all() as Array<{ before_json: string; after_json: string }>;
       for (const row of rows) {
         const after = JSON.parse(row.after_json) as SessionRecord;
@@ -1055,7 +1066,11 @@ export class SessionStore {
         this.db.prepare("UPDATE sessions SET agent_id = ?, acp_session_id = ? WHERE id = ?").run(before.agentId, before.acpSessionId, before.id);
       }
       this.db.prepare("DELETE FROM agy_identity_restore").run();
+      return rows;
     })();
+    for (const row of restored) this.recordBindingClear(JSON.parse(row.after_json), JSON.parse(row.before_json), {
+      source: "SessionStore.rollbackAgyIdentityMigration", cause: "operator rolled back native AGY identity restoration",
+    });
   }
 
   /** Total session rows — uncapped, unlike {@link list}. */
@@ -1101,7 +1116,9 @@ export class SessionStore {
       .map(mapRow);
   }
 
-  upsert(record: SessionRecord): void {
+  /** Metadata writes cannot replace an ACP binding from a stale snapshot. */
+  upsert(record: SessionRecord, binding?: SessionBindingChange): void {
+    const before = binding ? this.get(record.id) : null;
     this.db
       .prepare(
         `INSERT INTO sessions
@@ -1115,13 +1132,23 @@ export class SessionStore {
            channel_ref     = excluded.channel_ref,
            parent_ref      = excluded.parent_ref,
            agent_id        = excluded.agent_id,
-           acp_session_id  = excluded.acp_session_id,
+           ${binding ? "acp_session_id = excluded.acp_session_id," : ""}
            repo_path       = excluded.repo_path,
            config_json     = excluded.config_json,
            updated_utc     = excluded.updated_utc`
       )
       .run({ ...record, namePrefix: record.namePrefix ?? null });
-    for (const listener of this.sessionWrites) listener({ ...record });
+    const committed = this.get(record.id)!;
+    if (binding) this.recordBindingClear(before, committed, binding);
+    for (const listener of this.sessionWrites) listener({ ...committed });
+  }
+
+  private recordBindingClear(before: SessionRecord | null, after: SessionRecord, binding: SessionBindingChange): void {
+    if (before?.acpSessionId && !after.acpSessionId) logger.info({
+      sessionId: after.id, threadId: after.channelRef, agentId: after.agentId,
+      previousAcpSessionId: before.acpSessionId, acpSessionId: after.acpSessionId,
+      ...binding,
+    }, "cleared stored acp session id");
   }
 
   /** Internal commit notification; observers never own or veto the write. */
@@ -1432,35 +1459,13 @@ export class SessionStore {
     this.db.prepare("UPDATE elicitations SET values_json = '{}' WHERE id = ?").run(id);
   }
 
-  /**
-   * Move the thread's ACP binding from `expected` to `next`, atomically (#179).
-   *
-   * Returns whether THIS call performed the write. `false` means the binding
-   * was no longer `expected` — someone else changed it — and nothing was
-   * touched.
-   *
-   * Deliberately not `upsert({ ...record, acpSessionId })`. That helper writes
-   * every column from the caller's snapshot, which for a compaction is a record
-   * read ten minutes earlier: it would silently revert any repo/config/agent
-   * change made meanwhile, and it has no way to notice that the binding it is
-   * overwriting is a newer deliberate choice. A single conditional UPDATE
-   * touches one column and lets SQLite arbitrate the race.
-   *
-   * `expected` is the empty string for "currently unbound", matching how
-   * `SessionRecord.acpSessionId` represents it everywhere else.
-   *
-   * Touches `acp_session_id` and NOTHING else — deliberately not `updated_utc`.
-   * That column is the thread's own last-modified stamp, read by name
-   * refreshes, staleness checks and operator listings; a compaction moving a
-   * binding is not the thread being edited, and bumping it would make an
-   * automated swap indistinguishable from a user's own change. Every other
-   * column stays byte-identical, which is the whole point of doing this as one
-   * conditional UPDATE instead of a whole-record upsert.
-   */
-  compareAndSwapAcpSession(id: string, expected: string, next: string): boolean {
+  /** Move only the expected binding; preserve config and the thread's last-edit stamp. */
+  compareAndSwapAcpSession(id: string, expected: string, next: string,
+    binding: SessionBindingChange): boolean {
     // `acp_session_id` is `TEXT NOT NULL` (see the schema above), so "unbound"
     // is the empty string and a plain `=` is exact — no COALESCE needed, and
     // none written, so nobody reads one as evidence that NULL is reachable.
+    const before = this.get(id);
     const res = this.db
       .prepare(
         `UPDATE sessions
@@ -1468,6 +1473,7 @@ export class SessionStore {
           WHERE id = ? AND acp_session_id = ?`
       )
       .run(next, id, expected);
+    if (res.changes > 0 && before) this.recordBindingClear(before, { ...before, acpSessionId: next }, binding);
     return res.changes > 0;
   }
 

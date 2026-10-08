@@ -112,6 +112,12 @@ function harness(opts: {
       readConfig: (value) => JSON.parse(value.configJson || "{}") as SessionConfigState,
       writeConfig: (value) => JSON.stringify(value),
       upsert: (value) => { records.set(value.id, value); },
+      compareAndSwapAcpSession: (id, expected, next) => {
+        const row = records.get(id);
+        if (!row || row.acpSessionId !== expected) return false;
+        records.set(id, { ...row, acpSessionId: next });
+        return true;
+      },
     },
     router: {
       describeConfig: (value, selection) => resolution.describeConfig(records.get(value.id) ?? value,

@@ -7,7 +7,7 @@ import {
   type CatalogModelEvidence,
 } from "@seam/adapters";
 import type { Logger } from "../lib/logger.js";
-import type { SessionStore } from "./session-store.js";
+import type { SessionStore, SessionBindingChange } from "./session-store.js";
 import type { SessionRecord, SessionConfigState, PermissionPolicyMode, StatusCardStyle } from "./types.js";
 import { defaultSessionConfig, resolvePermissionMode } from "./types.js";
 import { makeSessionId } from "./session-store.js";
@@ -120,14 +120,14 @@ export type CancelElicitationsFn = (
   detail: string
 ) => Promise<void>;
 
-export interface SessionInvalidationOptions {
-  clearAcpSession?: boolean;
+export type SessionInvalidationOptions = {
   clearStartFailure?: boolean;
   /** #580: positive operator intent that the outgoing ACP conversation is
    * being replaced. Omitting it keeps timeout/finalizer/eviction work eligible
    * for recovery and warning; `clearAcpSession` alone is not this evidence. */
   operatorIntent?: "replace-session";
-}
+} & ({ clearAcpSession: true; bindingChange: SessionBindingChange }
+  | { clearAcpSession?: false; bindingChange?: never });
 
 /**
  * Which configuration layer supplied an effective value. Mirrors the precedence
@@ -980,7 +980,9 @@ export class SessionRouter {
     if (!runtime.supportsSessionFork()) return undefined;
     const forked = await runtime.forkSession({ sessionId: shared, cwd: this.describeConfig(record).cwd.value });
     const live = this.store.get(record.id) ?? record;
-    this.store.upsert({ ...live, acpSessionId: forked, updatedUtc: new Date().toISOString() });
+    this.store.upsert({ ...live, acpSessionId: forked, updatedUtc: new Date().toISOString() }, {
+      source: "SessionRouter.forkSharedSession", cause: "fork shared ACP conversation for this thread",
+    });
     record.acpSessionId = forked;
     // The warm runtime is on the shared session; the next acquisition loads the fork.
     await this.invalidate(record.id, { clearAcpSession: false });
@@ -1026,25 +1028,16 @@ export class SessionRouter {
     if (opts?.clearAcpSession) {
       const record = this.store.get(sessionId);
       if (record?.acpSessionId) {
-        // For native agy, the stored acp_session_id is the durable key into the
-        // agy-sessions.json cascade mapping. Per fix 17670d1, each `agy -p`
-        // spawns a fresh language server, so the cascade survives a cancel /
-        // session-gone and the agent resumes its full context next turn.
-        // Clearing it here would orphan that preserved mapping: the next turn
-        // sees an empty acp, calls newSession → a brand-new cascade, and the
-        // reply is dropped / the thread goes amnesiac (the 2026-06-23 empty-
-        // response bug). Preserve only native `agy` handles; every other
-        // agent's failed legacy handle is cleared, leaving its Discord
-        // configuration and history available for a fresh session or a
-        // deterministic rebuild.
+        // Native AGY keeps its durable cascade key across fresh process spawns.
+        // Invalidation leaves it available for the next turn.
         if (record.agentId === "agy") {
           this.logger.info(
             { sessionId },
             "preserving agy acp/cascade id across invalidate (durable across agy -p spawns)"
           );
         } else {
-          this.store.upsert({ ...record, acpSessionId: "", updatedUtc: new Date().toISOString() });
-          this.logger.info({ sessionId }, "cleared stored acp session id");
+          this.store.upsert({ ...record, acpSessionId: "", updatedUtc: new Date().toISOString() },
+            opts.bindingChange);
         }
       }
     }
@@ -1525,7 +1518,7 @@ export class SessionRouter {
         const updated = { ...live, acpSessionId: state.identity.acpSessionId,
           configJson: JSON.stringify({ ...this.store.readConfig(live), modelAcquisition: state }),
           updatedUtc: new Date().toISOString() };
-        this.store.upsert(updated);
+        this.store.upsert(updated, { source: "SessionRouter.startRuntime", cause: `model acquisition ${state.phase}` });
         Object.assign(record, updated);
       },
       acquire: (model, effort) => this.startRuntimeCandidate(record, recovery, plan, model, effort),
@@ -1543,7 +1536,7 @@ export class SessionRouter {
         if (clearCursor) delete cfg.modelAcquisition;
         const updated = { ...record, acpSessionId: sessionId,
           configJson: JSON.stringify(cfg), updatedUtc: new Date().toISOString() };
-        this.store.upsert(updated);
+        this.store.upsert(updated, { source: "SessionRouter.startRuntime", cause: "acquired provider session" });
         Object.assign(record, updated);
       }
     } catch (error) {

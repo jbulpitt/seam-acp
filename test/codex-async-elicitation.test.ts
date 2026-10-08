@@ -371,7 +371,7 @@ describe("Codex async user-input bridge", () => {
     harnesses.push(h);
     await h.orchestrator.dispatchInjectTurn({ id: "replace-dispatch", target: THREAD, session: "live", kind: "handoff",
       responderUserId: USER, prompt: "start", createdUtc: new Date().toISOString() });
-    expect(h.store.compareAndSwapAcpSession(`discord:${THREAD}`, ACP_SESSION, "replacement")).toBe(true);
+    expect(h.store.compareAndSwapAcpSession(`discord:${THREAD}`, ACP_SESSION, "replacement", { source: "fixture", cause: "intentional test binding change" })).toBe(true);
     const yes = h.adapter.cards[0]!.card.buttons!.find(button => button.label === "Yes")!;
     const refused = await h.adapter.component({ customId: yes.customId!, interactionId: "850000000000000003" });
     expect(refused.replies.join(" ")).toMatch(/originating Codex conversation is no longer available/);
@@ -612,7 +612,7 @@ describe("Codex async user-input bridge", () => {
     harnesses.push(replaced);
     await replaced.adapter.message();
     expect(replaced.store.compareAndSwapAcpSession(
-      `discord:${THREAD}`, ACP_SESSION, "replacement-session"
+      `discord:${THREAD}`, ACP_SESSION, "replacement-session", { source: "fixture", cause: "intentional test binding change" }
     )).toBe(true);
     const yes = replaced.adapter.cards[0]!.card.buttons!.find((button) => button.label === "Yes")!;
     const refused = await replaced.adapter.component({

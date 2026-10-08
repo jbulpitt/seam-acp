@@ -76,7 +76,7 @@ describe("Discord thread reconstruction uses one bridge path", () => {
     const record = router.ensureSessionRecord({
       platform: "discord", channelRef: "thread", parentRef: "parent", cwd,
     });
-    store.upsert({ ...record, acpSessionId: "original-preserved" });
+    store.upsert({ ...record, acpSessionId: "original-preserved" }, { source: "fixture", cause: "set provider binding for test" });
     const hub = localBridgeHub([profile], cwd, wiring);
     const localGet = hub.get.bind(hub);
     hub.get = () => localGet("local");

@@ -68,7 +68,9 @@ describe("WarmSetManager", () => {
     await manager.tick();
     expect(resume).toHaveBeenCalledTimes(1);
     // Adding operator intent here would silently cancel work after memory-pressure/session-gone eviction.
-    expect(invalidate).toHaveBeenCalledWith(grok.id, { clearAcpSession: true });
+    expect(invalidate).toHaveBeenCalledWith(grok.id, { clearAcpSession: true,
+      bindingChange: { source: "WarmSetManager.loadOne", cause: "session not found" },
+    });
     resume.mockClear();
     await manager.tick();
     expect(resume).not.toHaveBeenCalled();

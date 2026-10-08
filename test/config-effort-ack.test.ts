@@ -26,7 +26,7 @@ async function fixture(agent: "claude" | "codex") {
   });
   const row = await h.create(THREAD);
   h.store.upsert({ ...row, agentId: agent, acpSessionId: "existing-context",
-    configJson: JSON.stringify({ model: h.router.getProfile(agent)!.defaultModel, reasoningEffort: "low" }) });
+    configJson: JSON.stringify({ model: h.router.getProfile(agent)!.defaultModel, reasoningEffort: "low" }) }, { source: "fixture", cause: "set provider binding for test" });
   fs.writeFileSync(h.config.CHANNEL_PRESETS_FILE!, JSON.stringify({ channels: { [NAMING_PARENT]: { role: { value: "worker" } } } }));
   const clock = { t: 0 };
   const message = { id: "reply", edit: vi.fn(async () => message) };

@@ -45,6 +45,7 @@ function setup(acpSessionId = "recorded-acp") {
     ensureSessionRecord: ({ channelRef }: { channelRef: string }) => ({ ...record, id: `discord:${channelRef}`, channelRef }), getProfile: () => undefined,
     adoptRecoveryRuntime: vi.fn(),
     releaseRecoveryRuntime: vi.fn(),
+    isBusy: () => false,
     getOrStartRuntime: vi.fn(async (_record: unknown, _opts?: { resumeSessionId: string }) => runtime),
   };
   const adapter = { sendPanel: async (channel: any) => ({ channel, id: "panel" }),

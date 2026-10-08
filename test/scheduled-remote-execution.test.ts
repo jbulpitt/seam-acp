@@ -19,6 +19,7 @@ import type { ScheduledPrompt } from "../packages/core/src/core/scheduled-prompt
 import { scheduledOccurrenceKey } from "../packages/core/src/core/scheduled-prompts/occurrence-store.js";
 import { ScheduledPromptManager } from "../packages/core/src/core/scheduled-prompts/manager.js";
 import { simulateRetiredOwnerProcess } from "./restart-process-fixture.js";
+import { DEFAULT_REMOTE_RUNG1_POLICY } from "../packages/core/src/core/remote-spawn.js";
 
 const REMOTE = "remote-synthetic";
 const MODEL = "synthetic-exact-model";
@@ -277,6 +278,7 @@ describe("#466 scheduled execution boundary", () => {
     expect(h.mux.rpc).toHaveBeenCalledExactlyOnceWith("spawn", {
       slot: 0, agentId: "agy", model: MODEL, effort: "high", cwd: h.cwd,
       mcpServers: [h.globalMcp, h.remoteSeam],
+      rung1Recovery: DEFAULT_REMOTE_RUNG1_POLICY,
     }, { agentId: "agy" });
     expect(h.hub.get).toHaveBeenCalledWith(REMOTE);
     expect(h.hub.markSessionBridge).toHaveBeenCalledWith(h.record.id, REMOTE);

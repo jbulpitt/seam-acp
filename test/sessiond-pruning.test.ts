@@ -67,6 +67,10 @@ describe("#621 acknowledged dead slots", () => {
     const { socketPath, server, client } = await harness();
     const frames = await exited(client, 622);
     await client.ack({ slot: 622, throughSeq: frames.at(-1)!.seq - 1 });
+    const entry = (server as any).slots.get(622);
+    entry.exitedAt = Date.now() - 25 * 60 * 60_000;
+    process.kill(entry.identity.pid, "SIGTERM");
+    await until(() => !readSessiondProcessIdentity(entry.identity.pid));
     client.close();
     await (server as any).pruneExited();
     const reconnected = await SessiondClient.connect(socketPath);

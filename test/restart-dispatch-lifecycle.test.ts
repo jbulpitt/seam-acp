@@ -21,13 +21,13 @@ import type { AgentProfile } from "@seam/adapters";
 
 const cleanups: (() => void)[] = [];
 afterEach(() => { for (const f of cleanups.splice(0).reverse()) f(); vi.restoreAllMocks(); vi.useRealTimers(); });
-function setup() {
+function setup(acpSessionId = "recorded-acp") {
   const dataDir = mkdtempSync(path.join(tmpdir(), "seam-250-dispatch-"));
   cleanups.push(() => rmSync(dataDir, { force: true, recursive: true }));
   const store = new SessionStore(path.join(dataDir, "test.db"));
   cleanups.push(() => store.close());
   const record = { id: "discord:worker", platform: "discord", channelRef: "worker",
-    parentRef: null, agentId: "codex", acpSessionId: "recorded-acp", repoPath: "/synthetic",
+    parentRef: null, agentId: "codex", acpSessionId, repoPath: "/synthetic",
     configJson: "{}", createdUtc: new Date().toISOString(), updatedUtc: new Date().toISOString() };
   store.upsert(record);
   let release!: () => void;
@@ -79,6 +79,133 @@ function setup() {
     createdUtc: new Date().toISOString() };
   return { orch, store, watcher, dataDir, spec, reports, runtime, router, adapter, config, notices, refusals, started, release, makeOrch, acquisitionSleep };
 }
+
+function offlineDispatch(acpSessionId = "") {
+  const h = setup(acpSessionId);
+  const events = new EventEmitter();
+  const ready = new Set<string>();
+  const hub = localBridgeHub([], h.dataDir);
+  h.orch.setBridgeHub({ ...hub,
+    isBridgeReady: (location: string) => ready.has(location),
+    onBridgeReady: (listener: (location: string) => void) => {
+      events.on("ready", listener);
+      return () => events.off("ready", listener);
+    },
+  } as any);
+  h.router.describeConfig = () => ({ agent: { value: "codex" }, model: { value: "default" },
+    location: { value: "remote-one" }, cwd: { value: "/synthetic" }, effort: { value: null } });
+  h.router.getOrStartRuntime.mockImplementation(async () => {
+    if (!ready.has("remote-one")) {
+      throw new Error('Session discord:worker is bound to bridge "remote-one" that is not connected');
+    }
+    return h.runtime;
+  });
+  h.runtime.prompt.mockResolvedValue({ stopReason: "end_turn" });
+  h.store.turnAttempts.admit(h.spec);
+  const reconnect = (location = "remote-one") => { ready.add(location); events.emit("ready", location); };
+  return { ...h, events, reconnect };
+}
+
+describe("dispatch admission while its bound bridge is away", () => {
+  it.each(["", "recorded-acp"])("waits for the bound bridge before claiming or prompting (saved session=%s)", async sessionId => {
+    vi.useFakeTimers();
+    const h = offlineDispatch(sessionId);
+    h.config.TURN_TIMEOUT_SECONDS = 1;
+    const turn = h.orch.dispatchInjectTurn(h.spec).catch(error => error);
+    try {
+      await vi.advanceTimersByTimeAsync(90_000);
+      expect(h.store.turnAttempts.get(h.spec.id)).toMatchObject({ state: "pending", generation: 0, promptStarted: false });
+      expect(h.router.getOrStartRuntime).not.toHaveBeenCalled();
+      expect(h.runtime.prompt).not.toHaveBeenCalled();
+      h.reconnect("another-host");
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(h.runtime.prompt).not.toHaveBeenCalled();
+      h.reconnect();
+      expect(await turn).toMatchObject({ stopReason: "end_turn" });
+      expect(h.store.turnAttempts.get(h.spec.id)).toMatchObject({ state: "completed", generation: 1, promptStarted: true });
+      expect(h.runtime.prompt).toHaveBeenCalledOnce();
+      expect(h.runtime.prompt.mock.calls[0][0]).toContain("original work");
+      expect(h.events.listenerCount("ready")).toBe(0);
+    } finally { h.reconnect(); await turn; }
+  });
+
+  it("preserves target FIFO while waiting for the bridge", async () => {
+    vi.useFakeTimers();
+    const h = offlineDispatch();
+    const successor = { ...h.spec, id: "successor", prompt: "later work", createdUtc: new Date(Date.now() + 1).toISOString() };
+    h.store.turnAttempts.admit(successor);
+    const first = h.orch.dispatchInjectTurn(h.spec).catch(error => error);
+    const second = h.orch.dispatchInjectTurn(successor).catch(error => error);
+    try {
+      await vi.advanceTimersByTimeAsync(90_000);
+      expect(h.store.turnAttempts.get(h.spec.id)?.state).toBe("pending");
+      expect(h.store.turnAttempts.get(successor.id)?.state).toBe("pending");
+      expect(h.runtime.prompt).not.toHaveBeenCalled();
+      h.reconnect();
+      await Promise.all([first, second]);
+      expect(h.runtime.prompt.mock.calls.map(call => call[0])).toEqual([
+        expect.stringContaining("original work"), expect.stringContaining("later work"),
+      ]);
+      expect(h.store.turnAttempts.get(successor.id)?.state).toBe("completed");
+    } finally { h.reconnect(); await Promise.all([first, second]); }
+  });
+
+  it("operator Cancel releases a bridge wait without starting a provider", async () => {
+    vi.useFakeTimers();
+    const h = offlineDispatch();
+    const turn = h.orch.dispatchInjectTurn(h.spec).catch(error => error);
+    try {
+      await vi.advanceTimersByTimeAsync(1_000);
+      h.store.turnAttempts.cancel(h.spec.id, "cancelled by operator");
+      expect(await turn).toMatchObject({ message: "cancelled by operator" });
+      expect(h.store.turnAttempts.get(h.spec.id)?.state).toBe("cancelled");
+      expect(h.router.getOrStartRuntime).not.toHaveBeenCalled();
+      expect(h.events.listenerCount("ready")).toBe(0);
+      expect(h.orch.inspectChannelQueue("worker").queued).toBe(0);
+    } finally { h.reconnect(); await turn; }
+  });
+
+  it("restart releases a bridge wait and leaves unstarted SQL work for the next boot", async () => {
+    vi.useFakeTimers();
+    const h = offlineDispatch();
+    const turn = h.orch.dispatchInjectTurn(h.spec).catch(error => error);
+    try {
+      await vi.advanceTimersByTimeAsync(1_000);
+      h.orch.suspendForRestart();
+      expect(await turn).toMatchObject({ suspension: "shutdown" });
+      expect(h.store.turnAttempts.get(h.spec.id)).toMatchObject({ state: "pending", generation: 0, promptStarted: false });
+      expect(h.router.getOrStartRuntime).not.toHaveBeenCalled();
+      expect(h.events.listenerCount("ready")).toBe(0);
+    } finally { h.reconnect(); await turn; }
+  });
+
+  it("waits the full 15 minutes before surfacing the disconnected host cause", async () => {
+    vi.useFakeTimers();
+    const h = offlineDispatch();
+    h.config.TURN_TIMEOUT_SECONDS = 1;
+    const turn = h.orch.dispatchInjectTurn(h.spec).catch(error => error);
+    try {
+      await vi.advanceTimersByTimeAsync(15 * 60_000 - 1);
+      expect(h.store.turnAttempts.get(h.spec.id)).toMatchObject({ state: "pending", generation: 0 });
+      expect(h.router.getOrStartRuntime).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(await turn).toMatchObject({ suspension: "defect", reason: expect.stringMatching(/remote-one.*15 minutes/) });
+      expect(h.events.listenerCount("ready")).toBe(0);
+    } finally { h.reconnect(); await turn; }
+  });
+
+  it("keeps a real session incompatibility refusal after reconnect with its cause", async () => {
+    vi.useFakeTimers();
+    const h = offlineDispatch("recorded-acp");
+    const cause = "Strict resume refused: thread now belongs to a different ACP session";
+    h.router.getOrStartRuntime.mockRejectedValue(new Error(cause));
+    const turn = h.orch.dispatchInjectTurn(h.spec).catch(error => error);
+    await vi.advanceTimersByTimeAsync(1_000);
+    h.reconnect();
+    expect(await turn).toMatchObject({ suspension: "defect", reason: expect.stringContaining(cause) });
+    expect(h.runtime.prompt).not.toHaveBeenCalled();
+  });
+});
 
 async function adoptedCard() {
   const h = setup();

@@ -299,6 +299,14 @@ describe("#468 the refusal an operator reads", () => {
     expect(spawnRefusalFrame(new Error("plain")).spawnError).toBe("plain");
   });
 
+  it("puts the OS spawn code first without dropping the original cause", () => {
+    const error = Object.assign(new Error("spawn /tmp/grok-missing-interpreter ENOENT"), { code: "ENOENT" });
+    expect(spawnRefusalFrame(error)).toEqual({
+      code: 1,
+      spawnError: `ENOENT: ${error.message}`,
+    });
+  });
+
   it("carries the id and inventory on the error, not only in prose", () => {
     const err = new UnknownAgentError("zai", ["claude", "codex"]);
     expect(err).toBeInstanceOf(Error);

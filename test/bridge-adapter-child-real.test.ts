@@ -18,6 +18,7 @@ import { WebSocket } from "ws";
 import { pino } from "pino";
 import { makeMux, type AgentProfile } from "@seam/adapters";
 import { AgentRuntime } from "../packages/core/src/agents/agent-runtime.js";
+import { discordRenderer } from "../packages/core/src/platforms/discord/renderer.js";
 import { BridgeHub } from "../packages/core/src/core/bridge-hub.js";
 import { hashBridgeToken } from "../packages/core/src/core/bridge-pairing.js";
 import { planIsolatedBridgeSpawn } from "../packages/core/src/core/location-bind.js";
@@ -138,6 +139,9 @@ describe("#610 the local agent path, end to end", () => {
       const error = await runtime.start().catch(error => error as Error);
       expect(error).toBeInstanceOf(Error);
       expect(error.message).toContain(`spawn ${brokenGrok} ENOENT`);
+      const action = discordRenderer.trimShort(error.message, 120);
+      expect(action).toMatch(/^ENOENT: spawn /);
+      expect(action).toContain("grok-missing-interpreter");
       expect(error.message).toContain("host 'spawn-failure-host'");
       expect(error.message).not.toContain("the bridge reported no reason");
     } finally {

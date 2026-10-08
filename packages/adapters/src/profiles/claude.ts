@@ -1097,6 +1097,8 @@ const CLAUDE_CONTEXT_WINDOWS: Readonly<Record<string, number>> = {
   // usage_update.size 1000000, raw `claude /context` 1m. On 0.81.1 the bundled
   // SDK treated it as 200K, so it needs 0.84.0 or later.
   "claude-sonnet-5-5": 1_000_000,
+  // Verified with 0.88.0/native 2.1.293: JSONL canonical id, ACP size and /context.
+  "claude-haiku-5-5": 1_000_000,
 };
 
 /** Whether a model id should be force-forwarded to the direct Anthropic backend

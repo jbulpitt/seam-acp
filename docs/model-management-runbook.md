@@ -61,7 +61,7 @@ before running any procedure in this runbook:
    of picker values → API models → context windows. Treat it as stale if any
    version has changed since the date shown.
 
-## Current verified picture (last updated 2026-09-30, claude-agent-acp 0.84.0 + Claude Code 2.1.285, no patch)
+## Current verified picture (baseline 2026-09-30; Haiku 5.5 added 2026-10-08)
 
 This table is the *output* of the §4 process, kept here as a quick reference.
 **It is not a substitute for re-running §4 after any update** — treat it as stale
@@ -70,21 +70,36 @@ model's native window comes from the `CLAUDE_CONTEXT_WINDOWS` table in
 `claude.ts`, and the agent also reports the true window at runtime via
 `UsageUpdate.size`.
 
-Every row below was re-verified on 2026-09-30 through the Seam mechanism (canonical
-id forwarded via `ANTHROPIC_MODEL`). Each showed `usage_update.size` 1000000 and a
-raw `claude /context` denominator of 1m.
+Except Haiku 5.5, the rows below were re-verified on 2026-09-30 with
+claude-agent-acp 0.84.0 + Claude Code 2.1.285, no patch. Each used the Seam
+mechanism (canonical id forwarded via `ANTHROPIC_MODEL`), showed
+`usage_update.size` 1000000 and a raw `claude /context` denominator of 1m.
 
 | Picker value | Resolves to (JSONL) | Window |
 |---|---|---|
 | `default` ⭐ | claude-opus-5-5 (auto-rolls) | 1M |
 | `claude-opus-5-5` | claude-opus-5-5 | 1M |
 | `claude-sonnet-5-5` | claude-sonnet-5-5 | 1M |
+| `claude-haiku-5-5` | claude-haiku-5-5 | 1M |
 | `claude-fable-5-1` | claude-fable-5-1 | 1M |
 | `claude-opus-5` | claude-opus-5 | 1M |
 | `claude-opus-4-8` | claude-opus-4-8 | 1M |
 | `claude-opus-4-7` | claude-opus-4-7 | 1M |
 | `claude-fable-5` | claude-fable-5 | 1M |
 | `claude-sonnet-5` | claude-sonnet-5 | 1M |
+
+**Haiku 5.5 verification (2026-10-08):** claude-agent-acp 0.88.0, bundled
+Claude Code 2.1.293 (SDK 0.3.293), standalone CLI 2.1.294. The actual Seam
+profile forwarded `ANTHROPIC_MODEL=claude-haiku-5-5`; `set_config_option` was
+accepted and assistant JSONL `message.model` remained `claude-haiku-5-5`.
+All five explicit efforts (`low`, `medium`, `high`, `xhigh`, `max`) matched the
+JSONL top-level `effort`; unset effort applied `medium`. Every tiny turn
+reported ACP size 1000000, and both bundled and standalone `/context` showed
+1m. A fresh wrapper resumed the same session and applied a new `low` effort.
+These were direct profile probes on Linux x64/default credentials, not a
+Discord canary or evidence for other credential scopes. The live ACP catalog
+advertised only the `haiku` alias, so the verified overlay retains the canonical
+row. This does not verify or promote the alias.
 
 **`claude-sonnet-5-5` needs 0.84.0 or later.** On 0.81.1 the JSONL model was correct,
 but the bundled SDK ran it as a 200K model (`size` 200000; raw CLI 2.1.282
@@ -421,7 +436,8 @@ Rules (enforced by §4 evidence, not by intuition):
 - **Bare full IDs only — no `[1m]` suffix.** The suffix is retired; window is a
   property of the model, declared in `CLAUDE_CONTEXT_WINDOWS` (§6), not the string.
   Current picker: `claude-fable-5-1`, `claude-opus-5`, `claude-opus-4-8`,
-  `claude-opus-4-7`, `claude-fable-5`, and `claude-sonnet-5`, plus the
+  `claude-opus-4-7`, `claude-fable-5`, `claude-sonnet-5`, and
+  `claude-haiku-5-5`, plus the
   `default` alias.
 - **One entry per model.** No trap variants, no redundant pairs.
 - **`default`** → the auto-rolling "latest Opus @ 1M" entry (Max tier); the proven

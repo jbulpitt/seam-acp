@@ -251,11 +251,11 @@ export interface ClaudeVerifiedOverlayEntry {
  * Versioned. Bump when entries change so an auditor can tell which generation
  * of evidence a published snapshot carries.
  */
-export const CLAUDE_VERIFIED_OVERLAY_VERSION = 3;
+export const CLAUDE_VERIFIED_OVERLAY_VERSION = 4;
 
 /**
- * Re-verified 2026-09-30 on claude-agent-acp 0.84.0 (docs/model-management-runbook.md,
- * "Current verified picture"): every row proven through the actual Seam mechanism — canonical id
+ * Each row records its own verification date and versions (runbook §4).
+ * Every row is proven through the actual Seam mechanism — canonical id
  * forwarded via `ANTHROPIC_MODEL`, `set_config_option` accepted, resolved model
  * read from assistant JSONL, window cross-checked against the raw CLI
  * `/context` denominator.
@@ -374,6 +374,18 @@ export const CLAUDE_VERIFIED_OVERLAY: ReadonlyArray<ClaudeVerifiedOverlayEntry> 
     contextWindow: 1_000_000,
     effortChoices: ["default", "low", "medium", "high", "xhigh", "max"],
     evidence: "runbook §4 JSONL entry.message.model + usage_update size 1000000 + §4a raw-CLI /context 1m; §11 JSONL effort low/medium(default)/high/xhigh/max, 2026-09-30",
+  },
+  {
+    modelId: "claude-haiku-5-5",
+    displayName: "Haiku 5.5",
+    verifiedOn: "2026-10-08",
+    wrapperVersion: "claude-agent-acp 0.88.0",
+    claudeCodeVersion: "Claude Code 2.1.293 (claude-agent-sdk 0.3.293)",
+    credentialScope: "default",
+    resolvedModel: "claude-haiku-5-5",
+    contextWindow: 1_000_000,
+    effortChoices: ["default", "low", "medium", "high", "xhigh", "max"],
+    evidence: "runbook §4 canonical ANTHROPIC_MODEL forwarding + accepted set_config_option + JSONL model; ACP size 1000000 + §4a bundled 2.1.293/standalone 2.1.294 /context 1m; §11 JSONL low/medium/high/xhigh/max, unset medium, same-session resume, 2026-10-08",
   },
 ];
 

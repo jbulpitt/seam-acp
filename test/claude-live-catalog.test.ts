@@ -195,6 +195,7 @@ describe("#232 direct Claude publishes the live list plus verified overlays", ()
       "claude-fable-5",
       "claude-sonnet-5",
       "claude-sonnet-5-5",
+      "claude-haiku-5-5",
     ]);
     const opus5 = candidate.models.find((model) => model.id === "claude-opus-5")!;
     const record = opus5.evidence![0]!;
@@ -210,7 +211,7 @@ describe("#232 direct Claude publishes the live list plus verified overlays", ()
     expect(record.note).toContain("credential scope default");
     // Existing verified models keep their proven native window.
     expect(opus5.context).toEqual({ native: 1_000_000, maximum: 1_000_000, effective: 1_000_000 });
-    expect(candidate.sourceVersion).toBe("overlay-v3");
+    expect(candidate.sourceVersion).toBe("overlay-v4");
   });
 
   it("merges by canonical identity without duplicating the [1m] variant", async () => {
@@ -396,7 +397,7 @@ describe("#232 scope, determinism, and failure handling", () => {
     expect(base.models.map((m) => m.id)).toEqual([
       "default", "opus[1m]", "claude-fable-5-1", "sonnet", "haiku",
       "claude-opus-5-5", "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7", "claude-fable-5", "claude-sonnet-5",
-      "claude-sonnet-5-5",
+      "claude-sonnet-5-5", "claude-haiku-5-5",
     ]);
     // No row on the alternate profile carries evidence captured elsewhere.
     for (const model of alternate.models) {

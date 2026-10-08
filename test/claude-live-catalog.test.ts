@@ -128,6 +128,31 @@ describe("#232 canonical identity", () => {
 });
 
 describe("#232 direct Claude publishes the live list plus verified overlays", () => {
+  it("keeps canonical Haiku 5.5 when ACP advertises only the haiku alias", async () => {
+    const candidate = await directProfile(async () => liveProbe()).catalog.fetch();
+    const haiku = candidate.models.find((model) => model.id === "claude-haiku-5-5");
+    expect(haiku).toBeDefined();
+    expect(haiku?.runtimeId).toBe("claude-haiku-5-5");
+    expect(haiku?.context.native).toBe(1_000_000);
+    expect(haiku?.effort.choices.map((choice) => choice.id)).toEqual(FULL_EFFORT);
+    expect(haiku?.evidence).toEqual([expect.objectContaining({
+      kind: "verified-record",
+      observedAt: "2026-10-08T00:00:00.000Z",
+      runtimeVersion: "claude-agent-acp 0.88.0",
+      resolvedModel: "claude-haiku-5-5",
+      context: { native: 1_000_000, method: "runbook-verified" },
+    })]);
+    expect(candidate.models.filter((model) => model.id === "claude-haiku-5-5")).toHaveLength(1);
+    expect(candidate.models.find((model) => model.id === "haiku")?.evidence?.[0]?.resolvedModel).toBeUndefined();
+  });
+
+  it("does not lend default-account Haiku 5.5 evidence to another credential scope", async () => {
+    const candidate = await directProfile(async () => liveProbe(), {
+      configDir: "/tmp/haiku917-alternate-scope",
+    }).catalog.fetch();
+    expect(candidate.models.some((model) => model.id === "claude-haiku-5-5")).toBe(false);
+  });
+
   it("publishes every advertised model with its own effort choices", async () => {
     const candidate = await directProfile(async () => liveProbe()).catalog.fetch();
     validateCandidate(candidate);

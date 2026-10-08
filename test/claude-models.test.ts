@@ -7,6 +7,12 @@ import {
 } from "@seam/adapters";
 
 describe("getClaudeContextWindow", () => {
+  it("uses Haiku 5.5's verified native 1M window", () => {
+    expect(getClaudeContextWindow("claude-haiku-5-5")).toBe(1_000_000);
+    expect(lookupClaudeNativeContextWindow("claude-haiku-5-5")).toBe(1_000_000);
+    expect(lookupClaudeNativeContextWindow("claude-haiku-5.5")).toBe(1_000_000);
+  });
+
   it("returns 200K when the model is unknown/undefined", () => {
     expect(getClaudeContextWindow()).toBe(200_000);
     expect(getClaudeContextWindow("")).toBe(200_000);
@@ -69,6 +75,36 @@ describe("isForwardableFullModelId", () => {
 });
 
 describe("makeClaudeProfile catalog", () => {
+  it("seeds Haiku 5.5's manifest with the verified native window", async () => {
+    const profile = makeClaudeProfile({
+      defaultModel: "claude-haiku-5-5",
+      staticModels: [{ modelId: "claude-haiku-5-5", name: "Haiku 5.5" }],
+    });
+    const catalog = await profile.catalog.fetch();
+    expect(catalog.models[0]?.context).toEqual({
+      native: 1_000_000,
+      maximum: 1_000_000,
+      effective: 1_000_000,
+    });
+  });
+
+  it("sizes Haiku 5.5 compaction from 1M without changing effort forwarding", () => {
+    const profile = makeClaudeProfile({
+      defaultModel: "default",
+      compactionTokenThreshold: 0.8,
+    });
+    for (const effort of ["low", "medium", "high", "xhigh", "max"]) {
+      expect(profile.newSessionMeta?.("claude-haiku-5-5", effort)).toMatchObject({
+        claudeCode: {
+          options: {
+            compactionControl: { enabled: true, contextTokenThreshold: 800_000 },
+            effort,
+          },
+        },
+      });
+    }
+  });
+
   it("stamps each manifest entry with its canonical context window", async () => {
     const profile = makeClaudeProfile({
       defaultModel: "default",

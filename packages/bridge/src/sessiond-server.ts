@@ -212,7 +212,7 @@ function parseAckParams(raw: unknown): SessiondAckParams {
 }
 
 function parseListSlotsParams(raw: unknown): SessiondListSlotsParams {
-  const value = plainRecord(raw);
+  const value = plainRecord(raw ?? {});
   if (value.retiredSlots === undefined) return {};
   if (!Array.isArray(value.retiredSlots)) {
     throw new SessiondError("invalid_request", "retiredSlots must be an array");

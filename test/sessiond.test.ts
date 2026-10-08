@@ -418,7 +418,15 @@ describe("#573 seam-sessiond control-plane restart", () => {
     expect(exit).toBeDefined();
     // #621 replaces age-based deletion with consumed-exit and holder-gone proof.
     await client.ack({ slot: 33, throughSeq: exit!.seq });
-    await waitFor(() => readSessiondProcessIdentity(holderPid) ? undefined : true);
+    await waitFor(() => {
+      if (readSessiondProcessIdentity(holderPid, true)) return undefined;
+      try { process.kill(holderPid, 0); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ESRCH") return true;
+        throw error;
+      }
+      return undefined;
+    });
     expect((await client.listSlots()).slots).toEqual([]);
   });
 

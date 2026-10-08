@@ -52,6 +52,17 @@ afterEach(async () => {
 });
 
 describe("#621 acknowledged dead slots", () => {
+  it.each([undefined, null])("accepts legacy listSlots params %s without retiring unread output", async params => {
+    const { client } = await harness();
+    const frames = await exited(client, 633);
+    // Use the wire form sent by callers predating retirement parameters.
+    const wire = client as unknown as {
+      request(method: "listSlots", params: unknown): Promise<{ slots: number[] }>;
+    };
+    expect((await wire.request("listSlots", params)).slots).toEqual([633]);
+    expect((await client.replayOutput({ slot: 633, afterSeq: 0 })).frames).toEqual(frames);
+  });
+
   it("drops an acknowledged exit, its retained output and its artifacts without waiting a day", async () => {
     const { root, statePath, server, client } = await harness();
     const frames = await exited(client, 621);

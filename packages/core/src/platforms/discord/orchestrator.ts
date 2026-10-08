@@ -2219,10 +2219,9 @@ export class Orchestrator {
     const stalled = this.store.turnAttempts.get(spec.id);
     if (stalled?.state !== "suspended" || !stalled.stalledUtc) return;
     const requester = spec.returnTo ?? spec.originThreadRef ?? spec.target;
-    await this.postParkedTurnNotice(requester, stalled,
+    await this.notifyParkedTurn(stalled, requester,
       `⚠️ Dispatch \`${spec.id}\` to <#${spec.target}> is parked: ${reason}.`
     );
-    this.store.turnAttempts.markStallNoticeDelivered(spec.id);
     this.logger.warn(
       { id: spec.id, target: spec.target, requester, reason },
       "dispatch: retained attempt quarantined as stalled"
@@ -16440,6 +16439,9 @@ export class Orchestrator {
     if (attempt.promptStarted && !attempt.acpSessionId) {
       return "the attempt recorded a started prompt but no ACP session id; the conversation to continue cannot be determined";
     }
+    // Isolated ingest owns an ACP session, not a Discord thread. Its optional
+    // notify thread does not decide whether the HTTP job can continue.
+    if (spec.kind === "ingest" && spec.session === "isolated") return null;
     const pre = await this.checkResumePreconditions({ platform: PLATFORM, id: spec.target });
     if (pre !== "ok") return `target thread is ${pre}; continuation cannot currently be admitted`;
     return null;
@@ -19780,11 +19782,16 @@ export class Orchestrator {
     }
   }
 
-  private async notifyParkedTurn(attempt: TurnAttempt): Promise<void> {
+  private async notifyParkedTurn(attempt: TurnAttempt, channelRef = attempt.spec.target,
+    body = `⚠️ Turn \`${attempt.id}\` is parked: ${attempt.stalledReason}.`): Promise<void> {
     if (attempt.state !== "suspended" || !attempt.stalledUtc || isAwaitingReauth(attempt.stalledReason)) return;
-    await this.postParkedTurnNotice(attempt.spec.target, attempt,
-      `⚠️ Turn \`${attempt.id}\` is parked: ${attempt.stalledReason}.`);
-    this.store.turnAttempts.markStallNoticeDelivered(attempt.id);
+    try {
+      await this.postParkedTurnNotice(channelRef, attempt, body);
+      this.store.turnAttempts.markStallNoticeDelivered(attempt.id);
+    } catch (err) {
+      this.logger.warn({ err, id: attempt.id, channelRef, reason: attempt.stalledReason },
+        "parked-turn notice failed; recovery continues");
+    }
   }
 
   private parkedAttemptContext(attempt: TurnAttempt, channelRef?: string): string[] {
@@ -19795,6 +19802,9 @@ export class Orchestrator {
   }
 
   private async postParkedTurnNotice(channelRef: string, attempt: TurnAttempt, body: string): Promise<(MessageLink & { messageId: string }) | undefined> {
+    const isolatedIngest = attempt.spec.kind === "ingest" && attempt.spec.session === "isolated";
+    const notifyThread = isolatedIngest && isDiscordSnowflake(attempt.spec.target) ? attempt.spec.target : null;
+    if (isolatedIngest && notifyThread) channelRef = notifyThread;
     body = [...this.parkedAttemptContext(attempt, channelRef), body].join("\n");
     const current = (await this.collectInterruptedRows(attempt.spec.target)).find(item => item.id === attempt.id);
     const actions = current ? interruptedRowActions(current) : [];
@@ -19808,7 +19818,10 @@ export class Orchestrator {
       if (attempt.source === "dispatch") {
         const cancelled = this.store.turnAttempts.get(attempt.id)!;
         await this.dispatchWatcher?.publishAdoptedResult(attempt.id, cancelled.outcome!);
-        if (channelRef !== attempt.spec.target) {
+        if (isolatedIngest) {
+          await this.replayCompletedDispatch(cancelled.outcome!, { action: "terminalize" });
+          if (notifyThread) await this.adapter.sendMessage({ platform: PLATFORM, id: notifyThread }, message);
+        } else if (channelRef !== attempt.spec.target) {
           await this.replayCompletedDispatch(cancelled.outcome!, { action: "report_back", returnTo: channelRef });
         } else {
           await this.adapter.sendMessage({ platform: PLATFORM, id: channelRef }, message);
@@ -19823,6 +19836,9 @@ export class Orchestrator {
       }
       return;
     }
+    // The pending HTTP result and recorded stalled reason survive a park.
+    // Only a configured notify thread also receives a Discord notice.
+    if (isolatedIngest && !notifyThread) return;
     if (this.adapter.sendChoiceCard && actions.includes("resume") && !isAwaitingReauth(attempt.stalledReason)) {
       body += "\nUse Resume or `/seam workflows resume:<id>` to continue under the thread's current configuration, or Cancel.";
     }

@@ -33,9 +33,11 @@ export function createBridgeUpdater(options: {
       if (bridge.releaseSha === options.currentSha && bridge.sessiond?.releaseSha === options.currentSha) {
         options.report(id, "current"); return;
       }
-      // Bridges roll before the controller; a newer bridge must not roll back.
-      if (bridge.releaseSha && bridge.releaseSha !== options.currentSha && !await options.older(bridge.releaseSha)) {
-        options.report(id, "skipped: bridge release is not older than the controller"); return;
+      // Hosts roll before the controller; neither process should roll back.
+      for (const [component, sha] of [["bridge", bridge.releaseSha], ["sessiond", bridge.sessiond?.releaseSha]] as const) {
+        if (sha && sha !== options.currentSha && !await options.older(sha)) {
+          options.report(id, `skipped: ${component} release is not older than the controller`); return;
+        }
       }
       await options.rollout(id);
       options.report(id, "updated");

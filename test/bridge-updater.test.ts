@@ -7,6 +7,7 @@ function fixture(rollout = vi.fn<(id: string) => Promise<void>>().mockResolvedVa
     ["current", { releaseSha: "new", sessiond: { releaseSha: "new" } }],
     ["stale-daemon", { releaseSha: "new", sessiond: { releaseSha: "old" } }],
     ["newer", { releaseSha: "future", sessiond: { releaseSha: "future" } }],
+    ["newer-daemon", { releaseSha: "new", sessiond: { releaseSha: "future" } }],
   ]);
   const report = vi.fn();
   const updater = createBridgeUpdater({
@@ -20,11 +21,12 @@ function fixture(rollout = vi.fn<(id: string) => Promise<void>>().mockResolvedVa
 describe("bridge connect rollout", () => {
   it("updates an old bridge and a current bridge with a stale daemon, but leaves current/newer alone", async () => {
     const f = fixture();
-    for (const id of ["old", "current", "stale-daemon", "newer", "unmapped"]) f.onReady(id);
+    for (const id of ["old", "current", "stale-daemon", "newer", "newer-daemon", "unmapped"]) f.onReady(id);
     await f.idle();
     expect(f.rollout.mock.calls).toEqual([["old"], ["stale-daemon"]]);
     expect(f.report).toHaveBeenCalledWith("unmapped", "skipped: no managed target");
     expect(f.report).toHaveBeenCalledWith("newer", "skipped: bridge release is not older than the controller");
+    expect(f.report).toHaveBeenCalledWith("newer-daemon", "skipped: sessiond release is not older than the controller");
   });
 
   it("serializes hosts and does not start another rollout when the updating bridge reconnects", async () => {

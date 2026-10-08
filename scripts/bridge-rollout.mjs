@@ -4,6 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { activationRefusal, buildArtifact, firstActivationFromBaselineAllowed, commandRunner, loadTargetMap, makeScpCommand, makeSshCommand, parseArgs, parseKeyValues, renderRemoteScript, resolveTarget, runActivation, runPreflight } from "./lib/bridge-rollout.mjs";
 import { resolveBridgeTargetsFile } from "./lib/bridge-targets.mjs";
+import { MacPowerSkip, withHostAwake } from "./lib/bridge-power.mjs";
 import { assertTargetRegistered, blockingOnly, collectBlockers, describeTargetFleet, fleetRunExitCode, formatBlockers, formatFleetCoverage, formatFleetRunSummary, loadBridgeRegistry, makeReachabilityProbe, partitionReachability, planFleetRun } from "./lib/bridge-fleet.mjs";
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
@@ -184,12 +185,17 @@ async function runFleet({ targets, fleet, options, remoteScript }) {
         });
         continue;
       }
-      await rolloutHost({ target, remoteScript, artifact, options, preflight });
+      await withHostAwake(target, preflight.report.platform, () => rolloutHost({ target, remoteScript, artifact, options, preflight }));
       results.push({ id, outcome: "succeeded" });
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
-      console.error(`host_failed=${id}: ${reason}`);
-      results.push({ id, outcome: "refused", reason });
+      if (error instanceof MacPowerSkip) {
+        console.log(`host_skipped=${id}: ${reason}`);
+        results.push({ id, outcome: "skipped-power", reason });
+      } else {
+        console.error(`host_failed=${id}: ${reason}`);
+        results.push({ id, outcome: "refused", reason });
+      }
     }
   }
 
@@ -227,6 +233,13 @@ async function main() {
     return;
   }
 
+  const operation = () => performAction({ options, target, preflight, remoteScript });
+  return ["rollout", "stage", "activate", "rollback"].includes(options.action)
+    ? withHostAwake(target, preflight.report.platform, operation)
+    : operation();
+}
+
+async function performAction({ options, target, preflight, remoteScript }) {
   if (options.action === "rollout") {
     const artifact = await buildArtifact(repoRoot);
     await rolloutHost({ target, remoteScript, artifact, options, preflight });
@@ -285,6 +298,6 @@ async function main() {
 }
 
 main().catch((error) => {
-  console.error(`bridge rollout refused: ${error instanceof Error ? error.message : String(error)}`);
-  process.exitCode = 1;
+  console.error(`bridge rollout ${error instanceof MacPowerSkip ? "skipped" : "refused"}: ${error instanceof Error ? error.message : String(error)}`);
+  process.exitCode = error instanceof MacPowerSkip ? 75 : 1;
 });

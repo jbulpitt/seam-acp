@@ -1,7 +1,11 @@
 #!/usr/bin/env node
+import "./load-bridge-config.js";
+import { realpathSync } from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { SessiondServer, defaultSessiondResumeDir } from "./sessiond-server.js";
 import { defaultSessiondPaths } from "./sessiond-paths.js";
+import { readRunningReleaseSha } from "./release-receipt.js";
 
 function valueAfter(flag: string): string | undefined {
   const index = process.argv.indexOf(flag);
@@ -23,6 +27,11 @@ const server = new SessiondServer({
   socketPath,
   statePath,
   resumeDir: valueAfter("--resume-dir") ?? defaultSessiondResumeDir(),
+  supervisor: {
+    pid: process.pid,
+    entrypoint: realpathSync(fileURLToPath(import.meta.url)),
+    releaseSha: await readRunningReleaseSha(),
+  },
 });
 await server.start();
 console.error(`[seam-sessiond] listening (${path.basename(socketPath)})`);

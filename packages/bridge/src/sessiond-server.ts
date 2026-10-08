@@ -96,6 +96,7 @@ export interface SessiondServerOptions {
   holderPath?: string;
   /** Where children record turns to resume after a host restart. Must persist across reboots. */
   resumeDir?: string;
+  supervisor?: SessiondListSlotsResult["supervisor"];
 }
 
 /** Where the production daemon keeps resume records: it must survive a reboot. */
@@ -820,7 +821,10 @@ export class SessiondServer {
     for (const slot of this.refusedSlots.keys()) {
       health.push({ slot, alive: false, attached: false, pid: null, lastStdoutMsAgo: null, lastStdinMsAgo: null, orphanReason: "identity_unverifiable" });
     }
-    return { slots: health.map((entry) => entry.slot), health };
+    return {
+      slots: health.map((entry) => entry.slot), health,
+      ...(this.options.supervisor ? { supervisor: this.options.supervisor } : {}),
+    };
   }
 
   private resumePending(slot: number): boolean | undefined {

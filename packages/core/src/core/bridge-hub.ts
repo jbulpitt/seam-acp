@@ -96,6 +96,7 @@ export interface ConnectedBridge {
   };
   /** Null when hello did not carry a valid release sha. That is unknown. */
   releaseSha: string | null;
+  sessiond?: { pid: number; entrypoint: string; releaseSha: string | null };
   agents: Map<string, {
     version: number;
     installed: boolean;
@@ -628,6 +629,7 @@ export class BridgeHub {
       instanceId: hello.instanceId,
       host: hello.host ?? { os: "unknown", arch: "unknown" },
       releaseSha,
+      ...(hello.sessiond ? { sessiond: { ...hello.sessiond, releaseSha: releaseShaFromHello(hello.sessiond.releaseSha) } } : {}),
       agents,
       mux,
       connectedAt: Date.now(),
@@ -681,6 +683,7 @@ export class BridgeHub {
         bridgeId: expectedId,
         agents: [...agents.entries()].map(([id, s]) => ({ id, ...s })),
         releaseSha: releaseSha ?? "unknown",
+        sessiond: conn.sessiond ?? "unknown",
       },
       "bridge reconciled"
     );

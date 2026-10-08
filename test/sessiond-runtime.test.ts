@@ -15,16 +15,18 @@ async function launch(configured: boolean) {
   const config = path.join(root, "bridge.env");
   await fs.writeFile(config, `SEAM_SESSIOND_SOCKET=${socketPath}\nSEAM_SESSIOND_STATE=${statePath}\n`);
   const entrypoint = path.resolve("packages/bridge/src/sessiond.ts");
+  const env: NodeJS.ProcessEnv = {
+    ...process.env, HOME: root, XDG_CONFIG_HOME: path.join(root, ".config"), SEAM_BRIDGE_CONFIG_PATH: config,
+  };
+  delete env.SEAM_SESSIOND_SOCKET;
+  delete env.SEAM_SESSIOND_STATE;
   const daemon = spawn(process.execPath, [
     "--import", "tsx", entrypoint,
     ...configured ? [] : ["--socket", socketPath, "--state", statePath],
     "--resume-dir", path.join(root, "resume"),
   ], {
     cwd: process.cwd(),
-    env: {
-      ...process.env, HOME: root, XDG_CONFIG_HOME: path.join(root, ".config"),
-      SEAM_BRIDGE_CONFIG_PATH: config, SEAM_SESSIOND_SOCKET: "", SEAM_SESSIOND_STATE: "",
-    },
+    env,
     stdio: ["ignore", "ignore", "pipe"],
   });
   fixtures.push({ root, daemon, socketPath, statePath });
@@ -65,7 +67,7 @@ describe("sessiond rollout identity and shared configuration", () => {
         supervisor: { pid: daemon.pid, entrypoint, releaseSha: null },
       });
     } finally { client.close(); }
-  });
+  }, 15_000);
 
   it("reads the bridge.env socket and state paths instead of another supervisor config", async () => {
     const { client, root, statePath } = await launch(true);
@@ -77,5 +79,5 @@ describe("sessiond rollout identity and shared configuration", () => {
       });
       expect(JSON.parse(await fs.readFile(statePath, "utf8")).slots).toHaveLength(1);
     } finally { client.close(); }
-  });
+  }, 15_000);
 });

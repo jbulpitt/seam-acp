@@ -19,7 +19,7 @@ const TARGET_KEYS = new Set([
   "sshAlias", "pm2App", "verifyAgent", "checkoutPath", "entrypointPath",
   "expectedUid", "nodePath", "pm2ModulePath", "workspaceArg",
   "devMode", "releaseRoot", "rolloutEnabled", "unmanagedReason",
-  "launcher", "launcherPath",
+  "launcher", "launcherPath", "sessiondApp", "bridgeConfigPath",
 ]);
 const SAFE_REASON = /^[A-Za-z0-9][A-Za-z0-9 .,:;#/_()-]{0,255}$/;
 
@@ -58,6 +58,8 @@ export function validateTargetMap(input) {
       throw new Error(launcher === "systemd" ? `unsafe systemd unit for ${bridgeId}` : `unsafe PM2 app for ${bridgeId}`);
     }
     if (!SAFE_NAME.test(value.verifyAgent ?? "")) throw new Error(`unsafe verification agent for ${bridgeId}`);
+    if (value.sessiondApp !== undefined && !SAFE_NAME.test(value.sessiondApp)) throw new Error(`unsafe sessiond app for ${bridgeId}`);
+    if (value.bridgeConfigPath !== undefined) exactAbsolute(value.bridgeConfigPath, `bridgeConfigPath for ${bridgeId}`);
     if (!Number.isInteger(value.expectedUid) || value.expectedUid < 1 || value.expectedUid > 0x7fffffff) throw new Error(`unsafe expected UID for ${bridgeId}`);
     const pathKeys = launcher === "systemd"
       ? ["checkoutPath", "entrypointPath", "nodePath", "releaseRoot", "launcherPath"]
@@ -170,7 +172,11 @@ function targetArgs(target) {
 
 export function makeSshCommand(target, actionArgs, remoteScript) {
   requireManagedTarget(target);
-  const args = [...targetArgs(target), ...actionArgs];
+  const args = [
+    ...targetArgs(target), ...actionArgs,
+    ...(target.sessiondApp ? ["--sessiond-app", target.sessiondApp] : []),
+    ...(target.bridgeConfigPath ? ["--config-path", target.bridgeConfigPath] : []),
+  ];
   for (const value of args) {
     if (typeof value !== "string" || value.length > 512 || /[\0-\x20\x7f'"`$;&|<>\\]/.test(value)) throw new Error(`unsafe remote argument ${JSON.stringify(value)}`);
   }

@@ -298,6 +298,7 @@ export function formatFleetRunSummary(results) {
   const by = (outcome) => results.filter((row) => row.outcome === outcome);
   const succeeded = by("succeeded");
   const unreachable = by("skipped-unreachable");
+  const power = by("skipped-power");
   const refused = by("refused");
   const failed = by("failed");
   const lines = [
@@ -305,10 +306,11 @@ export function formatFleetRunSummary(results) {
     `  considered=${results.length}`,
     `  succeeded=${succeeded.length}${succeeded.length ? `: ${succeeded.map((r) => r.id).join(", ")}` : ""}`,
     `  skipped_unreachable=${unreachable.length}${unreachable.length ? `: ${unreachable.map((r) => r.id).join(", ")}` : ""}`,
+    `  skipped_power=${power.length}${power.length ? `: ${power.map((r) => r.id).join(", ")}` : ""}`,
     `  refused=${refused.length}`,
     `  failed=${failed.length}`,
   ];
-  for (const row of [...refused, ...failed]) {
+  for (const row of [...unreachable, ...power, ...refused, ...failed]) {
     lines.push(`  ${row.outcome}=${row.id}: ${row.reason ?? "no reason recorded"}`);
     for (const blocker of row.blockers ?? []) lines.push(`    remediation=${blocker.remediation}`);
   }

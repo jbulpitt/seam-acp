@@ -1,9 +1,14 @@
 # Remote bridge hosts
 
-Every bridge host keeps its settings in **one file**, `~/.config/seam/bridge.env`
+Every bridge instance keeps its settings in **one file**, `~/.config/seam/bridge.env`
 (mode `0600`), which the bridge reads itself at startup (#618). The supervisor —
 pm2 or systemd — only runs a command. Keys in the file replace the same keys
 from the supervisor, so a pm2 dump can never reinstate a removed setting.
+
+A second bridge on the same host (for example staging) sets
+`SEAM_BRIDGE_CONFIG_PATH` to its own file in both its bridge and sessiond
+launches. It must not load the production default. Keep that instance's
+socket, state and resume directory in its file too.
 
 The channel-gated `host_exec`, `host_push`, and `host_pull` agent tools use the
 bridge command and attachment RPCs. Paths are not workspace-jailed; the bridge
@@ -32,6 +37,9 @@ Each slot's child runs under its own slot holder, so restarting sessiond
 itself (to update it) leaves running turns alone: the new sessiond reconnects
 to every holder (#631). Its unit uses `KillMode=process` and the pm2 app
 `treekill: false` for that reason; keep them.
+The daemon launcher reads the same file, including `SEAM_NODE` and the
+`SEAM_SESSIOND_SOCKET`, `SEAM_SESSIOND_STATE`, and `SEAM_SESSIOND_RESUME_DIR`
+settings. It resolves the active release with Node on Linux and macOS.
 
 ## Migrating a host
 
@@ -43,6 +51,13 @@ to every holder (#631). Its unit uses `KillMode=process` and the pm2 app
    silently disables that project's MCP servers.
 2. pm2: `pm2 delete seam-bridge && pm2 start ecosystem.config.cjs --only seam-bridge && pm2 save`.
    `pm2 restart --update-env` merges and cannot remove a key — never use it for config changes.
+   Include the shipped `seam-sessiond` app with `treekill: false`. When an old
+   daemon lacks that setting, signal its exact main PID with SIGTERM, not
+   `pm2 restart`: PM2's tree kill would kill the holders too. Installing or
+   replacing the daemon app needs an operator-reviewed migration for the
+   installed PM2 version: a supervised app can respawn while it is being
+   replaced. Verify `treekill: false` on the live app before any PM2 stop or
+   delete. Keep the holders running throughout.
 3. systemd: install the shipped launcher, remove any `EnvironmentFile=` drop-in, `daemon-reload`, restart.
 4. Verify:
    - the `[bridge] config:` line lists the keys you expect;

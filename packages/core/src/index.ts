@@ -21,6 +21,7 @@ import {
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { writeRestartSentinel } from "./core/restart-sentinel.js";
+import { installBridgeUpdater } from "./core/bridge-updater.js";
 import { loadConfig, loadBootChannelPresets, configDisabledFeatures, disabledFeatureReason, areHostToolsEnabled, isChannelLocked, resolveThreadLocation, resolveThreadTtsVoice, resolveThreadTtsPace, resolveThreadTtsStyle, adminParticipantOverlapIds } from "./config.js";
 import {
   hostEmoji,
@@ -296,6 +297,7 @@ async function main(): Promise<void> {
   let bridgeHub: BridgeHub | undefined;
   let readServiceStatus: ServiceStatusMcpView["read"] | undefined;
   let stopCatalogBridgeRefresh: (() => void) | undefined;
+  let stopBridgeUpdates: (() => void) | undefined;
   let stopPermissionBridgeRecovery: (() => void) | undefined;
   let stopCatalogEnrichmentRefresh: (() => void) | undefined;
 
@@ -571,6 +573,7 @@ async function main(): Promise<void> {
     localBridgeTokenHash: localBridgeCredential.tokenHash,
   });
   orchestrator.setBridgeHub(bridgeHub);
+  stopBridgeUpdates = await installBridgeUpdater(bridgeHub, logger);
   stopPermissionBridgeRecovery = bridgeHub.onBridgeReady(location => orchestrator.recoverPermissionCards(location));
   // #631: slots outlive controllers; stop the ones no turn owns.
   bridgeHub.onBridgeReady((location) => orchestrator.sweepUnownedSlots(location));
@@ -1557,6 +1560,7 @@ async function main(): Promise<void> {
     stopCatalogEnrichmentRefresh?.();
     modelCatalog.stop();
     stopCatalogBridgeRefresh?.();
+    stopBridgeUpdates?.();
     stopPermissionBridgeRecovery?.();
     stopRankingsCard?.();
     stopStatusCard?.();

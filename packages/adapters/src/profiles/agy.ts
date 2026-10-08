@@ -1254,7 +1254,6 @@ export function buildAgyPromptArgs(opts: {
   printTimeoutSeconds: number;
   cwd: string;
   execution: AgyExecutionPolicy;
-  /** Omitted only after a prompt-free child proved this artifact rejects it. */
   csrfToken?: string;
   cascadeId?: string;
   /**

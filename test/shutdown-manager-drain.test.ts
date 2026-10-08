@@ -5,23 +5,8 @@
  * ingress drains, then store-writing managers drain, then the #174
  * safe-to-close predicate decides whether SQLite may close.
  */
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { scheduledAdmissionFixture, syntheticScheduleExecution } from "./scheduled-admission-fixture.js";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import path from "node:path";
-import {
-  parseAaModels,
-} from "../packages/core/src/core/model-metadata/artificial-analysis.js";
-import { ModelMetadataManager } from "../packages/core/src/core/model-metadata/manager.js";
-import { ModelMetadataStore } from "../packages/core/src/core/model-metadata/store.js";
-import type { AgentModelAvailability } from "../packages/core/src/core/model-metadata/types.js";
-import {
-  parseAaModels as parseValueAaModels,
-  parseCopilotPricingMarkdown,
-} from "../packages/core/src/core/model-value/sources.js";
-import { ModelValueManager } from "../packages/core/src/core/model-value/manager.js";
-import { ModelValueStore } from "../packages/core/src/core/model-value/store.js";
 import { ScheduledPromptManager } from "../packages/core/src/core/scheduled-prompts/manager.js";
 import type { ScheduledPrompt } from "../packages/core/src/core/scheduled-prompts/types.js";
 import { WakeManager } from "../packages/core/src/core/wake/manager.js";
@@ -40,8 +25,7 @@ import {
 import {
   drainStoreWritingManagers,
   MANAGER_CALLBACKS_STAGE,
-  MODEL_METADATA_REFRESH_STAGE,
-  MODEL_VALUE_REFRESH_STAGE,
+  MODEL_INTELLIGENCE_REFRESH_STAGE,
   type DrainableManager,
   type StoreWritingManagers,
 } from "../packages/core/src/lib/shutdown-managers.js";
@@ -52,17 +36,6 @@ const silentLogger = {
   error() {},
   debug() {},
 } as any;
-
-const tempDirs: string[] = [];
-afterEach(() => {
-  for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
-});
-
-function tempDbPath(prefix: string): string {
-  const dir = mkdtempSync(path.join(tmpdir(), prefix));
-  tempDirs.push(dir);
-  return path.join(dir, "seam.db");
-}
 
 const deferred = () => {
   let resolve!: () => void;
@@ -77,51 +50,6 @@ const flush = async (turns = 8) => {
 };
 
 const idle: DrainableManager = { drain: async () => {} };
-
-const aaPayload = {
-  data: [
-    {
-      id: "aa-sol",
-      name: "GPT-5.6 Sol (max)",
-      slug: "gpt-5-6-sol",
-      release_date: "2026-03-01",
-      model_creator: { id: "openai-id", name: "OpenAI", slug: "openai" },
-      evaluations: { artificial_analysis_intelligence_index: 60, coding_index: 90 },
-      pricing: {
-        price_1m_input_tokens: 1,
-        price_1m_output_tokens: 4,
-        price_1m_blended_3_to_1: 1.75,
-      },
-    },
-  ],
-};
-
-const catalog: AgentModelAvailability[] = [
-  {
-    agentId: "copilot",
-    modelId: "gpt-5.6-sol",
-    name: "GPT-5.6 Sol",
-    contextWindow: 1_000_000,
-    vision: false,
-  },
-];
-
-const pricingMarkdown = `
-## OpenAI
-
-| Model | Release status | Category | Input | Cached input | Output |
-| --- | --- | --- | ---: | ---: | ---: |
-| GPT-5.6 Sol | GA | Standard | $1.00 | $0.10 | $4.00 |
-`;
-
-const copilotModels = [
-  {
-    modelId: "gpt-5.6-sol",
-    displayName: "GPT-5.6 Sol",
-    validEffortTiers: ["low", "high"],
-    priceCategory: "medium",
-  },
-];
 
 function httpDrained(): DrainVerdict[] {
   return [
@@ -140,34 +68,6 @@ function laterStagesDrained(): DrainVerdict[] {
   ];
 }
 
-function instrument<T extends object>(store: T, methods: (keyof T)[]) {
-  let closed = false;
-  const violations: string[] = [];
-  for (const name of methods) {
-    const orig = (store[name] as (...args: never[]) => unknown).bind(store);
-    (store as Record<string, unknown>)[String(name)] = (...args: never[]) => {
-      if (closed) {
-        violations.push(String(name));
-        throw new TypeError("The database connection is not open");
-      }
-      return orig(...args);
-    };
-  }
-  if ("close" in store && typeof store.close === "function") {
-    const origClose = store.close.bind(store);
-    (store as { close: () => void }).close = () => {
-      closed = true;
-      origClose();
-    };
-  }
-  return {
-    get closed() {
-      return closed;
-    },
-    violations,
-  };
-}
-
 function runGroup(timeoutMs: number) {
   return (label: string, work: () => Promise<unknown>) =>
     runBoundedStep({ label, timeoutMs, work });
@@ -184,239 +84,52 @@ async function productionClose(
   return verdicts;
 }
 
-function makeMetadata(fetch: () => Promise<ReturnType<typeof parseAaModels>>) {
-  const store = new ModelMetadataStore(tempDbPath("seam-192-meta-"));
-  const guard = instrument(store, ["getAll", "replaceSnapshot"]);
-  const manager = new ModelMetadataManager({
-    store,
-    logger: silentLogger,
-    source: { name: "fixture", fetch },
-    getCatalog: async () => catalog,
-    now: () => new Date("2026-09-03T00:00:00.000Z"),
-  });
-  return { store, manager, guard };
-}
-
-function makeValue(fetchAa: () => Promise<ReturnType<typeof parseValueAaModels>>) {
-  const store = new ModelValueStore(tempDbPath("seam-192-value-"), {
-    inputTokens: 8000,
-    outputTokens: 2000,
-  });
-  const guard = instrument(store, ["saveSnapshot"]);
-  const manager = new ModelValueManager({
-    store,
-    logger: silentLogger,
-    aaApiKey: "test",
-    inputTokens: 8000,
-    outputTokens: 2000,
-    fetchAa,
-    fetchPricing: async () => parseCopilotPricingMarkdown(pricingMarkdown),
-    fetchCopilot: async () => copilotModels,
-  });
-  return { store, manager, guard };
-}
-
 describe("#192 production-sequence manager drains", () => {
-  it("awaits an in-flight metadata refresh before the store can close", async () => {
-    const gate = deferred();
-    const { store, manager, guard } = makeMetadata(async () => {
-      await gate.promise;
-      return parseAaModels(aaPayload);
-    });
-    const running = manager.refresh();
-    manager.stop();
-    let drained = false;
-    const closing = productionClose(
-      {
-        scheduled: idle,
-        wake: idle,
-        watch: idle,
-        parked: idle,
-        modelMetadata: manager,
-        modelValue: idle,
-      },
-      () => store.close()
-    ).then((verdicts) => {
-      drained = true;
-      return verdicts;
-    });
-    await flush();
-    expect(drained).toBe(false);
-    expect(guard.closed).toBe(false);
-    gate.resolve();
-    const verdicts = await closing;
-    await running;
-    expect(verdicts.find((v) => v.stage === MODEL_METADATA_REFRESH_STAGE)?.drained).toBe(true);
-    expect(safeToCloseResources(verdicts)).toBe(true);
-    expect(guard.closed).toBe(true);
-    expect(guard.violations).toEqual([]);
-  });
-
-  it("awaits an in-flight value refresh before the store can close", async () => {
-    const gate = deferred();
-    const { store, manager, guard } = makeValue(async () => {
-      await gate.promise;
-      return parseValueAaModels(aaPayload);
-    });
-    const running = manager.refresh();
-    manager.stop();
-    let drained = false;
-    const closing = productionClose(
-      {
-        scheduled: idle,
-        wake: idle,
-        watch: idle,
-        parked: idle,
-        modelMetadata: idle,
-        modelValue: manager,
-      },
-      () => store.close()
-    ).then((verdicts) => {
-      drained = true;
-      return verdicts;
-    });
-    await flush();
-    expect(drained).toBe(false);
-    expect(guard.closed).toBe(false);
-    gate.resolve();
-    const verdicts = await closing;
-    await running;
-    expect(verdicts.find((v) => v.stage === MODEL_VALUE_REFRESH_STAGE)?.drained).toBe(true);
-    expect(safeToCloseResources(verdicts)).toBe(true);
-    expect(guard.closed).toBe(true);
-    expect(guard.violations).toEqual([]);
-  });
-
-  it("NEGATIVE CONTROL: skipping the metadata drain closes the store under the refresh", async () => {
-    const gate = deferred();
-    const { store, manager, guard } = makeMetadata(async () => {
-      await gate.promise;
-      return parseAaModels(aaPayload);
-    });
-    const running = manager.refresh();
-    manager.stop();
-    const verdicts = await productionClose(
-      {
-        scheduled: idle,
-        wake: idle,
-        watch: idle,
-        parked: idle,
-        modelMetadata: { drain: async () => {} },
-        modelValue: idle,
-      },
-      () => store.close()
-    );
-    expect(safeToCloseResources(verdicts)).toBe(true);
-    expect(guard.closed).toBe(true);
-    gate.resolve();
-    await running.catch(() => {});
-    await flush();
-    expect(guard.violations.some((name) => name === "getAll" || name === "replaceSnapshot")).toBe(
-      true
-    );
-  });
-
-  it("NEGATIVE CONTROL: skipping the value drain closes the store under the refresh", async () => {
-    const gate = deferred();
-    const { store, manager, guard } = makeValue(async () => {
-      await gate.promise;
-      return parseValueAaModels(aaPayload);
-    });
-    const running = manager.refresh();
-    manager.stop();
-    const verdicts = await productionClose(
-      {
-        scheduled: idle,
-        wake: idle,
-        watch: idle,
-        parked: idle,
-        modelMetadata: idle,
-        modelValue: { drain: async () => {} },
-      },
-      () => store.close()
-    );
-    expect(safeToCloseResources(verdicts)).toBe(true);
-    expect(guard.closed).toBe(true);
-    gate.resolve();
-    await running.catch(() => {});
-    await flush();
-    expect(guard.violations).toContain("saveSnapshot");
-  });
-
   it("a rejected model drain is reported and keeps the store open", async () => {
-    const { store, guard } = makeMetadata(async () => parseAaModels(aaPayload));
+    const close = vi.fn();
     const verdicts = await productionClose(
       {
         scheduled: idle,
         wake: idle,
         watch: idle,
         parked: idle,
-        modelMetadata: {
+        modelIntelligence: {
           drain: async () => {
             throw new Error("drain exploded");
           },
         },
-        modelValue: idle,
       },
-      () => store.close()
+      close
     );
-    expect(verdicts.find((v) => v.stage === MODEL_METADATA_REFRESH_STAGE)?.drained).toBe(false);
+    expect(verdicts.find((v) => v.stage === MODEL_INTELLIGENCE_REFRESH_STAGE)?.drained).toBe(false);
     expect(verdicts.find((v) => v.stage === MANAGER_CALLBACKS_STAGE)?.drained).toBe(false);
     expect(undrainedStages(verdicts)).toEqual(
-      expect.arrayContaining([MANAGER_CALLBACKS_STAGE, MODEL_METADATA_REFRESH_STAGE])
+      expect.arrayContaining([MANAGER_CALLBACKS_STAGE, MODEL_INTELLIGENCE_REFRESH_STAGE])
     );
     expect(safeToCloseResources(verdicts)).toBe(false);
-    expect(guard.closed).toBe(false);
+    expect(close).not.toHaveBeenCalled();
   });
 
   it("a timed-out model drain is reported and keeps the store open", async () => {
-    const { store, guard } = makeValue(async () => parseValueAaModels(aaPayload));
+    const close = vi.fn();
     const verdicts = await productionClose(
       {
         scheduled: idle,
         wake: idle,
         watch: idle,
         parked: idle,
-        modelMetadata: idle,
-        modelValue: { drain: () => new Promise(() => {}) },
+        modelIntelligence: { drain: () => new Promise(() => {}) },
       },
-      () => store.close(),
+      close,
       40
     );
-    expect(verdicts.find((v) => v.stage === MODEL_VALUE_REFRESH_STAGE)?.drained).toBe(false);
+    expect(verdicts.find((v) => v.stage === MODEL_INTELLIGENCE_REFRESH_STAGE)?.drained).toBe(false);
     expect(safeToCloseResources(verdicts)).toBe(false);
-    expect(guard.closed).toBe(false);
+    expect(close).not.toHaveBeenCalled();
   });
 });
 
 describe("#192 manager admission after stop", () => {
-  it("a metadata tick queued after stop does not write SQLite", async () => {
-    const fetch = vi.fn(async () => parseAaModels(aaPayload));
-    const { store, manager } = makeMetadata(fetch);
-    manager.stop();
-    (manager as unknown as { onRefreshTick(): void }).onRefreshTick();
-    await manager.refresh();
-    expect(fetch).not.toHaveBeenCalled();
-    expect(store.getAll()).toEqual([]);
-  });
-
-  it("a value tick queued after stop does not write SQLite", async () => {
-    const fetchAa = vi.fn(async () => parseValueAaModels(aaPayload));
-    const { store, manager } = makeValue(fetchAa);
-    manager.stop();
-    (manager as unknown as { onRefreshTick(): void }).onRefreshTick();
-    await manager.refresh();
-    expect(fetchAa).not.toHaveBeenCalled();
-    expect(store.getRankings().fetched_at).toBeNull();
-  });
-
-  it("NEGATIVE CONTROL: skipping the metadata admission gate writes after stop", async () => {
-    const { store, manager } = makeMetadata(async () => parseAaModels(aaPayload));
-    manager.stop();
-    await (manager as unknown as { refreshInner(): Promise<void> }).refreshInner();
-    expect(store.getAll()).toHaveLength(1);
-  });
-
   it("a scheduled cron tick after stop does not touch SQLite or enqueue work", async () => {
     const row = makeScheduledRow();
     const { store, upserts } = makeScheduledStore(row);

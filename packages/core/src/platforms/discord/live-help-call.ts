@@ -218,9 +218,7 @@ export async function inspectLiveHelpVoiceChannel(
   }
   const policy = checkLiveHelpVoiceChannel({
     id: ch.id,
-    name,
     type: ch.type,
-    parentName,
     obfuscated,
   });
   if (!policy.ok) return policy;

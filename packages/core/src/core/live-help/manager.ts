@@ -81,9 +81,7 @@ export class LiveHelpManager {
     if (!inspected.ok) return { ok: false, error: inspected.reason };
     const policy = checkLiveHelpVoiceChannel({
       id: spec.voiceChannelId,
-      name: inspected.channelName,
       type: inspected.type,
-      parentName: inspected.parentName,
       obfuscated: inspected.obfuscated,
     });
     if (!policy.ok) return { ok: false, error: policy.reason };

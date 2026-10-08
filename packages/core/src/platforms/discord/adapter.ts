@@ -2689,7 +2689,7 @@ export class DiscordAdapter implements ChatAdapter {
         } catch (err) {
           this.logger.warn(
             { err, guildId },
-            "failed to register guild slash commands — is the bot a member of this guild? skipping; other guilds unaffected"
+            "failed to register guild slash commands; skipping; other guilds unaffected"
           );
         }
       }

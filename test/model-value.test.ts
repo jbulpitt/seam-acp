@@ -8,7 +8,6 @@ import {
   parseCopilotPricingMarkdown,
 } from "../packages/core/src/core/model-value/sources.js";
 import { ModelValueStore } from "../packages/core/src/core/model-value/store.js";
-import { ModelValueManager } from "../packages/core/src/core/model-value/manager.js";
 import { SeamMcpServer } from "../packages/core/src/core/mcp/seam-mcp-server.js";
 import type { SessionRecord } from "../packages/core/src/core/types.js";
 
@@ -191,108 +190,7 @@ describe("model value sources and ranking", () => {
   });
 });
 
-describe("model value refresh and MCP cache surface", () => {
-  it("reruns when publication lands during an in-flight enrichment", async () => {
-    const store = tempStore();
-    let release: (() => void) | undefined;
-    let first = true;
-    const fetchAa = vi.fn(async () => {
-      if (first) {
-        first = false;
-        await new Promise<void>((resolve) => { release = resolve; });
-      }
-      return parseAaModels(aaPayload);
-    });
-    const fetchCopilot = vi.fn(async () => [{
-      modelId: "gpt-5.6-sol",
-      displayName: "GPT-5.6 Sol",
-      validEffortTiers: ["low", "high"],
-      priceCategory: "medium",
-    }]);
-    const manager = new ModelValueManager({
-      store,
-      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } as any,
-      aaApiKey: "test",
-      inputTokens: 8000,
-      outputTokens: 2000,
-      fetchAa,
-      fetchPricing: async () => parseCopilotPricingMarkdown(pricingMarkdown),
-      fetchCopilot,
-    });
-    const running = manager.refresh();
-    await vi.waitFor(() => expect(fetchAa).toHaveBeenCalledOnce());
-    manager.refreshForCatalogGeneration();
-    release?.();
-    await running;
-    await manager.drain();
-    expect(fetchAa).toHaveBeenCalledTimes(2);
-    expect(fetchCopilot).toHaveBeenCalledTimes(2);
-    store.close();
-  });
-
-  it("notifies render consumers only after a successful snapshot is durable", async () => {
-    const store = tempStore();
-    const logger = {
-      info: vi.fn(),
-      warn: vi.fn(),
-      error: vi.fn(),
-    } as any;
-    const onUpdate = vi.fn(() => {
-      expect(store.getRankings().fetched_at).not.toBeNull();
-    });
-    const manager = new ModelValueManager({
-      store,
-      logger,
-      aaApiKey: "test",
-      inputTokens: 8000,
-      outputTokens: 2000,
-      fetchAa: async () => parseAaModels(aaPayload),
-      fetchPricing: async () => parseCopilotPricingMarkdown(pricingMarkdown),
-      fetchCopilot: async () => [{
-        modelId: "gpt-5.6-sol",
-        displayName: "GPT-5.6 Sol",
-        validEffortTiers: ["low", "high"],
-        priceCategory: "medium",
-      }],
-    });
-    manager.setOnUpdate(onUpdate);
-    await manager.refresh();
-    expect(onUpdate).toHaveBeenCalledOnce();
-    store.close();
-  });
-
-  it("keeps a prior snapshot when a source parse/fetch fails", async () => {
-    const store = tempStore();
-    store.saveSnapshot(fixtureSnapshot().rows);
-    const logger = {
-      info: vi.fn(),
-      warn: vi.fn(),
-      error: vi.fn(),
-    } as any;
-    const manager = new ModelValueManager({
-      store,
-      logger,
-      aaApiKey: "test",
-      inputTokens: 8000,
-      outputTokens: 2000,
-      fetchAa: async () => parseAaModels(aaPayload),
-      fetchPricing: async () => {
-        throw new Error("pricing shape changed");
-      },
-      fetchCopilot: async () => [],
-    });
-    const onUpdate = vi.fn();
-    manager.setOnUpdate(onUpdate);
-    await manager.refresh();
-    expect(store.getRankings().fetched_at).toBe("2026-09-01T12:00:00.000Z");
-    expect(logger.error).toHaveBeenCalledWith(
-      expect.any(Object),
-      "model value ranking refresh failed; keeping prior snapshot"
-    );
-    expect(onUpdate).not.toHaveBeenCalled();
-    store.close();
-  });
-
+describe("model value MCP cache surface", () => {
   it("exposes structured model_value_rankings from cache only", async () => {
     const store = tempStore();
     store.saveSnapshot(fixtureSnapshot().rows);

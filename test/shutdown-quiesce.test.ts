@@ -2392,9 +2392,9 @@ describe("#174 an ingest job stays registered through its durable tail", () => {
           turnsAtLedgerWrite = host.activeTurns;
         },
       }),
-      injectTurn: async (options: any) => {
-        options.onSession("ingest-fixture-session");
-        options.lifecycle.beforePrompt();
+      injectTurn: async (...[, , options]: Parameters<Orchestrator["injectTurn"]>) => {
+        await options.onSession!("ingest-fixture-session");
+        options.lifecycle!.beforePrompt!();
         return { text: "scored" };
       },
       bridgeHub: localBridgeHub([{ id: "a", defaultModel: "default" } as any], "/tmp"),

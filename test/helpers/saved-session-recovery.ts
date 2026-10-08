@@ -138,7 +138,7 @@ export async function savedSessionHost(options: {
       config: { ...visualConfig, DATA_DIR: root, REPOS_ROOT: root, REPO_EMOJIS: new Map(),
         DISCORD_ALLOWED_USER_IDS: new Set(["fixture-user"]),
         channelPresets: new Map(), threadPresets: new Map() } as any });
-    orch.setBridgeHub({ muxFor: () => mux, onBridgeReady: () => () => {} } as any);
+    orch.setBridgeHub({ isBridgeReady: () => true, muxFor: () => mux, onBridgeReady: () => () => {} } as any);
     return orch;
   }
   const requests = async () => (await fs.readFile(path.join(root, "requests.jsonl"), "utf8"))

@@ -2655,6 +2655,7 @@ export class Orchestrator {
     channelId: string,
     task: (fence: ChannelQueueFence) => Promise<T>,
     recovery?: { lastActivityAt: () => number; onWatchdog: (error: TurnWatchdogTimeoutError) => Promise<void> },
+    prepare?: (fence: ChannelQueueFence) => Promise<void>,
   ): Promise<T> {
     this.channelQueueMeta ??= new Map<string, ChannelQueueMeta>();
     const epoch = this.queueEpoch(channelId);
@@ -2685,8 +2686,10 @@ export class Orchestrator {
       // on every path including the watchdog and a fence thrown after the turn.
       const executingMeta = this.channelQueueMeta.get(channelId);
       if (executingMeta) executingMeta.executing = (executingMeta.executing ?? 0) + 1;
-      const work = Promise.resolve().then(() => task(fence));
+      let work!: Promise<T>;
       try {
+        await prepare?.(fence);
+        work = Promise.resolve().then(() => task(fence));
         const timeoutMs = turnWatchdogTimeoutMs(
           this.config.TURN_TIMEOUT_SECONDS ?? 900
         );
@@ -7051,6 +7054,24 @@ export class Orchestrator {
     return result === "timeout" ? "abandon" : "ok";
   }
 
+  private async waitForDispatchHost(spec: DispatchSpec, location: string, phase: DispatchAcquisitionPhase): Promise<void> {
+    const hub = this.bridgeHub;
+    if (!hub || hub.isBridgeReady(location)) return;
+    this.logger.info({ id: spec.id, location }, "dispatch: waiting for bound bridge to reconnect");
+    const unsubscribe = this.store.turnAttempts.onSettled(id => {
+      if (id === spec.id) phase.interrupt(DispatchSuspendedError.superseded(spec.id,
+        this.store.turnAttempts.get(id)?.outcome?.error ?? "the attempt settled while waiting for its bridge"));
+    });
+    try {
+      await phase.acquire(async signal => {
+        const result = await waitUntilBridgeReady(hub, location, { deadlineMs: PROVIDER_RETRY_WINDOW_MS, signal });
+        if (result === "timeout") {
+          throw DispatchSuspendedError.defect(spec.id, `bridge "${location}" did not reconnect within 15 minutes`);
+        }
+      });
+    } finally { unsubscribe(); }
+  }
+
   private runtimeAcquisitionFence(attemptId: string): () => void {
     const owner = this.store.turnAttempts?.get(attemptId);
     return (): void => {
@@ -9826,6 +9847,15 @@ export class Orchestrator {
     // the prompt is untouched (applyWatchFeedback returns it verbatim).
     // Resume: do NOT re-apply identity / watch-feedback / harness — the session
     // already has that context. Replaying them on "continue" would fight its memory.
+    const prepareRun = async (queueFence?: ChannelQueueFence) => {
+      this.assertQueueFence(queueFence);
+      if (this.restartCutoff) {
+        throw DispatchSuspendedError.shutdown(spec.id, "restart cutoff reached before the turn started");
+      }
+      await this.waitForDispatchHost(spec, workerLocation, phase);
+    };
+    // Keep the FIFO position while the host is away; execution clocks start after readiness.
+    if (effectiveSession === "isolated") await prepareRun();
     const isolatedSpawn =
       effectiveSession === "isolated"
         ? this.remoteDispatchSpawnOpts({
@@ -9946,9 +9976,6 @@ export class Orchestrator {
 
     const run = async (queueFence?: ChannelQueueFence): Promise<DispatchInjectTurnResult> => {
       this.assertQueueFence(queueFence);
-      if (this.restartCutoff) {
-        throw DispatchSuspendedError.shutdown(spec.id, "restart cutoff reached before the turn started");
-      }
       const described = isolatedConfig ?? this.router.describeConfig(record);
       const selectedProfile = workerProfile ?? this.router.getProfile(described.agent.value, workerLocation);
       const identity = executionIdentity({
@@ -10610,7 +10637,9 @@ export class Orchestrator {
     try {
       if (effectiveSession === "live") {
         // Share the thread's persistent session ⇒ must not overlap a user turn.
-        return await (inheritedFence ? gatedRun(inheritedFence) : this.queueOnChannel(spec.target, gatedRun));
+        return await (inheritedFence
+          ? prepareRun(inheritedFence).then(() => gatedRun(inheritedFence))
+          : this.queueOnChannel(spec.target, gatedRun, undefined, prepareRun));
       }
       // Isolated: own throwaway runtime, so it cannot collide with the thread's
       // live session and needn't queue. It therefore appears in NO channel queue

@@ -61,6 +61,11 @@ Live-thread work is FIFO by actual arrival. Choice clicks, wakes and handoffs
 show Waiting until admitted, then Working and Done on the same status message
 when successful. Recording pending work does not mean its turn has started.
 
+If its bound bridge is away, an unstarted dispatch keeps its FIFO position and
+waits up to 15 minutes for that bridge before claiming the attempt. Reconnect
+starts the admitted work without another boot or operator Resume; Cancel and
+controller shutdown release the wait through their existing ownership paths.
+
 When an adopted turn loses its owner, continuation uses the admission already
 held by that turn. The interrupted admission is recovered before any queued
 successor; it does not rejoin the back of the queue. Completion, cancellation

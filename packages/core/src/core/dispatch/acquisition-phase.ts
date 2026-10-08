@@ -79,23 +79,28 @@ export function isRetryableBootAcquisitionError(err: unknown): boolean {
 
 /** Per-dispatch provenance, never a read of the orchestrator's ambient cutoff. */
 export class DispatchAcquisitionPhase {
-  private readonly pending = new Set<() => void>();
+  private readonly pending = new Set<(error: DispatchSuspendedError) => void>();
 
   constructor(readonly dispatchId: string, readonly phase: "execution" | "boot-recovery") {}
 
   /** The shutdown event takes ownership of acquisitions that are still pending. */
   shutdown(): void {
-    for (const cancel of this.pending) cancel();
+    this.interrupt(DispatchSuspendedError.shutdown(this.dispatchId,
+      "shutdown interrupted provider acquisition; the next boot owns the dispatch"));
   }
 
-  async acquire<T>(operation: () => Promise<T>): Promise<T> {
-    let cancel!: () => void;
+  interrupt(error: DispatchSuspendedError): void {
+    for (const cancel of this.pending) cancel(error);
+  }
+
+  async acquire<T>(operation: (signal: AbortSignal) => Promise<T>): Promise<T> {
+    const controller = new AbortController();
+    let cancel!: (error: DispatchSuspendedError) => void;
     const shutdown = new Promise<never>((_resolve, reject) => {
-      cancel = () => reject(DispatchSuspendedError.shutdown(this.dispatchId,
-        "shutdown interrupted provider acquisition; the next boot owns the dispatch"));
+      cancel = error => { controller.abort(error); reject(error); };
     });
     this.pending.add(cancel);
-    const work = Promise.resolve().then(operation);
+    const work = Promise.resolve().then(() => operation(controller.signal));
     try {
       return await Promise.race([work, shutdown]);
     } catch (err) {

@@ -68,7 +68,6 @@ function makeOrch(opts?: {
   const panels: Array<{ title?: string; description?: string }> = [];
   const router = testSessionRouter({
     listProfiles: () => [],
-    describeConfig: () => ({}),
     ensureSessionRecord: (o: { channelRef: string }) =>
       record({ id: `discord:${o.channelRef}`, channelRef: o.channelRef }),
     getProfile: () => ({ id: "claude" }),
@@ -121,7 +120,7 @@ function makeOrch(opts?: {
     writeAttachment: rpc,
     rpc,
   } as any);
-  return { orch, getOrStartRuntime, abortTurn, killAll, sent, edited, panels, rpc };
+  return { orch, router, getOrStartRuntime, abortTurn, killAll, sent, edited, panels, rpc };
 }
 
 beforeEach(() => {
@@ -737,7 +736,8 @@ describe("/seam queue (#89)", () => {
 
   it("bare Discord message while queued aborts live and cancels the parked row", async () => {
     const abortTurn = vi.fn(async () => "cancelled");
-    const { orch, edited } = makeOrch({ ready: true, abortTurn, hasRuntime: () => true });
+    const { orch, router, edited } = makeOrch({ ready: true, abortTurn, hasRuntime: () => true });
+    vi.spyOn(router, "isBusy").mockReturnValue(true);
     (orch as any).channelQueues.set("thread-1", Promise.resolve());
     await (orch as any).cmdQueue(queueIx("queued").ix);
     expect(store.getParkedByChannel("discord", "thread-1")).not.toBeNull();

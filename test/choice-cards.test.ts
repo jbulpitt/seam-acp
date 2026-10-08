@@ -720,7 +720,7 @@ describe("multi-select lifecycle (#94)", () => {
           posted.push(card);
         },
       } as any,
-      router: testSessionRouter({ listProfiles: () => [], describeConfig: () => ({}) }) as any,
+      router: testSessionRouter({ listProfiles: () => [] }) as any,
       store,
       renderer: {} as any,
     });

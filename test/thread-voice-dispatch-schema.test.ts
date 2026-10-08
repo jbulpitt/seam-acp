@@ -261,6 +261,7 @@ describe("trusted Thread Voice dispatch boundary", () => {
     expect((orch as any).channelGenerations.get("thread-1")).toBeUndefined();
     expect(abortTurn).not.toHaveBeenCalled();
 
+    vi.spyOn((orch as any).router, "isBusy").mockReturnValue(true);
     const typedTurn = (orch as any).handleIncomingMessage({
       channel: { platform: "discord", id: "thread-1", parentId: "channel-1" },
       authorId: "user-1",

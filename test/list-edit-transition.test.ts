@@ -147,14 +147,13 @@ async function runPresetListEdit(clicks: number, opts: RunOpts = {}) {
   const { ackGate, releaseAck } = opts;
   const events: string[] = [];
   const { interaction, paints, opened } = makeListInteraction(events);
+  const store = testSessionStore({});
+  store.upsertPreset(presetRow);
   const self = {
     logger: silent,
     config: { channelPresets: new Map() },
     projectScopeId: () => null,
-    store: testSessionStore({
-      listPresetsForProject: () => [presetRow],
-      getPreset: () => presetRow,
-    }),
+    store,
     repoDisplay: (p: string) => p,
     slashAccessRefusal: Orchestrator.prototype["slashAccessRefusal" as never],
     attachListLifecycle: Orchestrator.prototype["attachListLifecycle" as never],

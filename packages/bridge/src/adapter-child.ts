@@ -208,9 +208,9 @@ function start(config: AdapterChildBootstrap): void {
   child.stdin?.on("error", (error: NodeJS.ErrnoException) => {
     exitWithRefusal(`agent stdin failed (${error.code ?? "write error"})`);
   });
-  child.on("error", () => {
+  child.on("error", (error) => {
     recovery.childExited(config.slot);
-    fail("adapter process emitted an error");
+    exitWithRefusal(spawnRefusalFrame(error).spawnError);
   });
   child.on("exit", (code, signal) => {
     const tail = agentOutput.flush();

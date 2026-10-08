@@ -644,7 +644,11 @@ function decorate(err: unknown, label: string, redact: (text: string) => string)
 }
 
 function errorText(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
+  if (!(err instanceof Error)) return String(err);
+  // Fetch keeps the socket failure in cause; redact the combined text at the caller.
+  if (!(err.cause instanceof Error)) return err.message;
+  const cause = err.cause as NodeJS.ErrnoException;
+  return `${err.message}: ${cause.code ? `${cause.code}: ` : ""}${cause.message}`;
 }
 
 /** Surfaced rather than swallowed: a registration after the phase closed is a

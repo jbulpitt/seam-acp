@@ -37,6 +37,8 @@ import type { AgentQuota } from "../packages/core/src/core/quota/agent-quota.js"
 import type { AgentProfile } from "@seam/adapters";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import { createManagedAgyFixture } from "./helpers/agy-runtime-fixture.js";
+import { quotaMcp } from "../packages/core/src/plugins/quota/mcp.js";
+import type { PluginContext } from "../packages/core/src/plugins/types.js";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
 const fixtures = fileURLToPath(new URL("./fixtures/agy-native-capabilities/", import.meta.url));
@@ -146,6 +148,28 @@ describe("#361 the agy quota refresh issues no model turn", () => {
       errorKind: "unclassified",
     });
     expect(String(caught)).toContain("fetch failed");
+    expect(String(caught)).toContain("UND_ERR_SOCKET");
+    expect(String(caught)).toContain("other side closed");
+  }, 30_000);
+
+  it("#779 returns the real fetch socket cause in agent_quota and the refresh log", async () => {
+    const { runtime } = agyFixture({ SEAM_AGY_QUOTA_DROP_CONNECTION: "1" });
+    const registry = new QuotaRegistry();
+    const logs: string[] = [];
+    const logger = pino({}, { write: line => { logs.push(line); } }) as unknown as Logger;
+    const poller = new AgentQuotaPoller({ logger, registry, sources: [agySource(runtime)] });
+    await poller.refreshAll(true);
+    const result = await quotaMcp(registry)[0]!.handle(
+      { threadId: "quota-779", args: { agentId: "agy" } }, {} as PluginContext,
+    );
+    const [reading] = JSON.parse(result.content[0]!.text);
+    const failure = logs.map(line => JSON.parse(line)).find(row => row.msg === "agent quota refresh failed");
+    expect(reading).toMatchObject({ agentId: "agy", ok: false });
+    for (const message of [reading.error, failure?.error.message]) {
+      expect(message).toContain("fetch failed");
+      expect(message).toContain("UND_ERR_SOCKET");
+      expect(message).toContain("other side closed");
+    }
   }, 30_000);
 
   it("preserves the quota RPC's real 401 response", async () => {

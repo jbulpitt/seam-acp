@@ -11,6 +11,8 @@ import { EventEmitter } from "node:events";
 import { describe, expect, it, vi } from "vitest";
 import { makeMux, type AgentProfile } from "@seam/adapters";
 import { AgentRuntime } from "../packages/core/src/agents/agent-runtime.js";
+import { discordRenderer } from "../packages/core/src/platforms/discord/renderer.js";
+import { spawnRefusalFrame } from "../packages/bridge/src/resolve-adapter.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 
 class FakeWs extends EventEmitter {
@@ -60,11 +62,28 @@ describe("#610 remote start failure cause", () => {
     const error = await failure;
     expect(Date.now() - started).toBeLessThan(5_000);
     expect(error.message).toContain(
-      "remote agent supervisor exited before initialize on host 'portable-host' (code=1, signal=null): "
-      + "agent stdin is closed; input could not be delivered",
+      "agent stdin is closed; input could not be delivered; "
+      + "remote agent supervisor exited before initialize on host 'portable-host' (code=1, signal=null)",
     );
     expect(error.message).toContain("adapter-child: last words");
     expect(error.message).not.toContain("neither answered nor exited");
+  });
+
+  it("#678 keeps the real spawn code and cause visible within the unchanged card action limit", async () => {
+    const { ws, runtime, child } = remoteRuntime();
+    const failure = runtime.start().catch((error: unknown) => error as Error);
+    await new Promise((resolve) => setImmediate(resolve));
+    const cause = Object.assign(new Error("spawn /tmp/seam678-stage.47dXq0/grok-missing-interpreter ENOENT"), {
+      code: "ENOENT",
+    });
+    ws.deliver({ slot: child().slot, type: "exit", ...spawnRefusalFrame(cause) });
+
+    const error = await failure;
+    const action = discordRenderer.trimShort(error.message, 120);
+    expect(action).toMatch(/^ENOENT: spawn /);
+    expect(action).toContain("grok-missing-interpreter");
+    expect(error.message).toContain(cause.message);
+    expect(error.message).toContain("remote agent supervisor exited before initialize on host 'portable-host' (code=1, signal=null)");
   });
 
   it("gives the remote child a live ChildProcess exit state", async () => {

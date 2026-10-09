@@ -7,7 +7,7 @@ import { MessageFlags } from "discord.js";
 import { BootObserver, type BootObservation } from "../packages/core/src/lib/boot-observation.js";
 import { createBridgeUpdater, type BridgeUpdaterHandle, type BridgeReleaseFacts } from "../packages/core/src/core/bridge-updater.js";
 import { deployBootRows, deployFleetRows, verifyDeploy, type DeployRequest } from "../packages/core/src/core/deploy-verification.js";
-import { canaryIsGreen, renderCanaryLayouts, type CanaryRunResult } from "../packages/core/src/core/canary.js";
+import { canaryIsGreen, formatCanaryResult, renderCanaryLayouts, type CanaryRunResult } from "../packages/core/src/core/canary.js";
 import { legacyControllerIdentity, publishDeployCard, waitForDeployResult } from "../packages/core/src/redeploy-cli.js";
 import { processOwner } from "../packages/core/src/core/dispatch/process-owner.js";
 import { readProcessIdentity } from "@seam/adapters";
@@ -28,6 +28,37 @@ function fleet(targets: BridgeUpdaterHandle["targets"], facts: Map<string, Bridg
     older: async () => true, rollout: async () => {}, report: () => {} });
   const handle = Object.assign(() => {}, { targets, idle: updater.idle, observations: updater.observations });
   return { ...updater, handle, get: (id: string) => facts.get(id) };
+}
+
+function productionSizedVerdict(): CanaryRunResult {
+  const hosts = ["fhr", "local", "seam-server", "seam-dev-server", "rhc-server", "rhc-laptop", "mac-mini", "macbook"];
+  const probes: CanaryRunResult["rows"] = hosts.map((host, index) => ({
+    host, agent: index === 0 ? "copilot" : index === 1 ? "codex" : "claude",
+    status: "passed", durationMs: 12_000 + index * 1_000, threadId: `15536629474593341${index}4`,
+  }));
+  const skips: CanaryRunResult["rows"] = Array.from({ length: 26 }, (_, index) => ({
+    host: hosts[index % hosts.length]!, agent: ["grok", "agy", "codex", "copilot"][index % 4]!,
+    status: "skipped", durationMs: null,
+    cause: index % 3 === 0 ? "withheld by AGENT_LOCATION_DENY: not enabled for this managed host"
+      : `deploy probes one agent per host (${probes[index % probes.length]!.agent}); full agent matrix remains available on demand`,
+  }));
+  return { id: "36-row-production-verdict", target: "self", branch: "main", commit: "524324bd992b6bf1",
+    startedAt: request.startedAt, finishedAt: boot.readyAt!,
+    deploy: { requestId: request.id, previous: request.previous, controller: boot.identity },
+    rows: [...probes, ...skips,
+      { host: "media-server", agent: "reconnect", check: "fleet update", status: "failed", durationMs: null,
+        cause: "unverified: managed host missing from reconnect inventory" },
+      { host: "local", agent: "grok", status: "failed", durationMs: null,
+        cause: "spawn /opt/seam/bin/grok ENOENT: agent preparation failed" },
+    ],
+  };
+}
+
+interface TextComponent { content?: string; components?: TextComponent[] }
+function displayText(components: TextComponent[]): string[] {
+  return components.flatMap(component => [
+    ...(component.content ? [component.content] : []), ...displayText(component.components ?? []),
+  ]);
 }
 
 describe("deploy startup and reconnect verdict", () => {
@@ -152,6 +183,65 @@ describe("deploy startup and reconnect verdict", () => {
     expect(rest.post).toHaveBeenCalledWith("/channels/ops/messages", expect.objectContaining({ body: expect.objectContaining({ flags: MessageFlags.IsComponentsV2 }) }));
     expect(published.jumpUrl).toBe("https://discord.com/channels/guild/ops/message");
     expect(canaryIsGreen(published)).toBe(true);
+  });
+
+  it("publishes a realistic 36-row deploy verdict within Discord's aggregate 4000-character limit", async () => {
+    const result = productionSizedVerdict();
+    const before = JSON.stringify(result);
+    const postedText: string[] = [];
+    const rest = { get: vi.fn().mockResolvedValue({ guild_id: "guild" }), put: vi.fn(), delete: vi.fn(),
+      post: vi.fn().mockImplementation(async (_route, options: { body: { components: TextComponent[] } }) => {
+        const text = displayText(options.body.components);
+        if (text.reduce((size, content) => size + content.length, 0) > 4000) {
+          throw new Error("DiscordAPIError 50035: COMPONENT_DISPLAYABLE_TEXT_SIZE_EXCEEDED: maximum size of 4000");
+        }
+        postedText.push(...text);
+        return { id: "message" };
+      }),
+    };
+    expect(result.rows).toHaveLength(36);
+    expect(result.rows.filter(row => row.status === "passed")).toHaveLength(8);
+    expect(result.rows.filter(row => row.status === "skipped")).toHaveLength(26);
+    expect(result.rows.filter(row => row.status === "failed")).toHaveLength(2);
+
+    const published = await publishDeployCard(result, await directory(), "ops", rest);
+    expect(published.cardError).toBeUndefined();
+    expect(published.jumpUrl).toBe("https://discord.com/channels/guild/ops/message");
+    expect(rest.post).toHaveBeenCalledTimes(1);
+    const card = postedText.join("\n");
+    expect(card).toContain("deploy verification — RED");
+    for (const row of result.rows.filter(row => row.status !== "skipped")) {
+      expect(card).toContain(`**${row.host}@${row.agent}**`);
+      if (row.status === "failed") expect(card).toContain(row.cause);
+    }
+    expect(card).toContain("26 skipped");
+    expect(card.match(/⏭️/g)).toHaveLength(1);
+    expect(card).not.toContain("withheld by AGENT_LOCATION_DENY");
+    expect(JSON.stringify(result)).toBe(before);
+    const cli = formatCanaryResult(result);
+    expect(cli.match(/⏭️/g)).toHaveLength(26);
+    for (const row of result.rows) if (row.cause) expect(cli).toContain(row.cause);
+  });
+
+  it("budgets long detail without hiding a failure behind skip rows or losing green probe identities", () => {
+    const result = productionSizedVerdict();
+    for (const row of result.rows) {
+      if (row.status === "skipped") row.host = "local";
+      else row.providerNote = "provider status detail ".repeat(100);
+    }
+    const before = JSON.stringify(result);
+    const layouts = renderCanaryLayouts(result);
+    expect(layouts).toHaveLength(1);
+    const components = layouts[0]!.blocks.filter(block => block.kind === "text");
+    const card = components.map(block => block.content).join("\n");
+    for (const row of result.rows.filter(row => row.status !== "skipped")) {
+      expect(card).toContain(`**${row.host}@${row.agent}**`);
+      if (row.status === "failed") expect(card).toContain(row.cause);
+    }
+    expect(card.match(/❌ \*\*/g)).toHaveLength(2);
+    expect(card.match(/✅ \*\*/g)).toHaveLength(8);
+    expect(components.reduce((size, block) => size + block.content.length, 0)).toBeLessThanOrEqual(4000);
+    expect(JSON.stringify(result)).toBe(before);
   });
 
   it.skipIf(process.platform !== "linux")("reads the legacy controller owner without changing its database", async () => {

@@ -1033,11 +1033,11 @@ export function formatCanaryResult(result: CanaryRunResult): string {
 const MAX_CANARY_CONTAINER_BLOCKS = 40;
 const CANARY_PAGE_FRAME_BLOCKS = 4;
 
-function renderCanaryRow(row: CanaryRow): StructuredLayout["blocks"][number] {
+function renderCanaryRow(row: CanaryRow, detailLimit = 700): StructuredLayout["blocks"][number] {
   const thread = row.threadId ? ` · <#${row.threadId}>` : "";
   const check = row.check ? ` · ${row.check}` : "";
-  const cause = row.cause ? `\n↳ ${bounded(row.cause)}` : "";
-  const provider = row.providerNote ? `\n↳ Provider: ${bounded(row.providerNote)}` : "";
+  const cause = row.cause && detailLimit > 0 ? `\n↳ ${bounded(row.cause, detailLimit)}` : "";
+  const provider = row.providerNote && detailLimit > 0 ? `\n↳ Provider: ${bounded(row.providerNote, detailLimit)}` : "";
   return {
     kind: "text",
     content:
@@ -1077,19 +1077,32 @@ export function renderCanaryLayouts(result: CanaryRunResult): StructuredLayout[]
   const header = failed
     ? `❌ ${targetLabel(result.target)} ${label} — RED`
     : `✅ ${targetLabel(result.target)} ${label} — GREEN`;
-  let rows = [
-    ...result.rows.filter((row) => row.status !== "skipped").map(renderCanaryRow),
-    ...renderSkippedRows(result.rows.filter((row) => row.status === "skipped")),
-  ];
+  const heading = `## ${header}\n` +
+    `**Revision:** \`${result.branch}\` @ \`${result.commit.slice(0, 12)}\`\n` +
+    `**Run:** ${result.id.slice(0, 8)} · ${passed} passed · ${skipped} skipped`;
+  const footer = `Completed <t:${Math.floor(Date.parse(result.finishedAt) / 1000)}:R>` +
+    (result.deploy ? "\nFull detail: CLI output and `canary-self-history.jsonl`." : "");
+  let rows: StructuredLayout["blocks"];
   if (result.deploy) {
-    const hosts = [...new Set(result.rows.map(row => row.host))];
-    rows = hosts.map(host => {
-      const content = result.rows.filter(row => row.host === host).map(row => {
-        const block = renderCanaryRow(row);
-        return block.kind === "text" ? block.content : "";
-      }).join("\n");
-      return { kind: "text" as const, content: content.length > 3800 ? content.slice(0, 3799) + "…" : content };
-    });
+    const visible = [...result.rows.filter(row => row.status === "failed"),
+      ...result.rows.filter(row => row.status === "passed")];
+    const skips = skipped ? [{ kind: "text" as const, content: `⏭️ ${skipped} skipped.` }] : [];
+    const rowTextSize = visible.reduce((size, row) => {
+      const block = renderCanaryRow(row, 0);
+      return size + (block.kind === "text" ? block.content.length : 0);
+    }, 0);
+    const detailCount = visible.reduce((count, row) => count + Number(!!row.cause) + Number(!!row.providerNote), 0);
+    const detailPrefixes = visible.reduce((size, row) => size + (row.cause ? 3 : 0) + (row.providerNote ? 13 : 0), 0);
+    // Discord's text budget covers the entire message, not each host block.
+    const remaining = 4000 - heading.length - footer.length - rowTextSize - detailPrefixes -
+      skips.reduce((size, block) => size + block.content.length, 0);
+    const detailLimit = Math.max(0, Math.min(700, Math.floor(remaining / Math.max(1, detailCount))));
+    rows = [...visible.map(row => renderCanaryRow(row, detailLimit)), ...skips];
+  } else {
+    rows = [
+      ...result.rows.filter((row) => row.status !== "skipped").map(row => renderCanaryRow(row)),
+      ...renderSkippedRows(result.rows.filter((row) => row.status === "skipped")),
+    ];
   }
   const rowsPerPage = MAX_CANARY_CONTAINER_BLOCKS - CANARY_PAGE_FRAME_BLOCKS;
   const pageCount = Math.max(1, Math.ceil(rows.length / rowsPerPage));
@@ -1098,15 +1111,12 @@ export function renderCanaryLayouts(result: CanaryRunResult): StructuredLayout[]
     const blocks: StructuredLayout["blocks"] = [
       {
         kind: "text",
-        content:
-          `## ${header}${page}\n` +
-          `**Revision:** \`${result.branch}\` @ \`${result.commit.slice(0, 12)}\`\n` +
-          `**Run:** ${result.id.slice(0, 8)} · ${passed} passed · ${skipped} skipped`,
+        content: heading.replace(`## ${header}\n`, `## ${header}${page}\n`),
       },
       { kind: "separator", spacing: "small" },
       ...rows.slice(pageIndex * rowsPerPage, (pageIndex + 1) * rowsPerPage),
       { kind: "separator", spacing: "small" },
-      { kind: "text", content: `Completed <t:${Math.floor(Date.parse(result.finishedAt) / 1000)}:R>` },
+      { kind: "text", content: footer },
     ];
     return { color: failed ? 0xed4245 : 0x57f287, blocks };
   });

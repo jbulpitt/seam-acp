@@ -240,7 +240,7 @@ describe("pre-prompt bridge reconnect on the scheduled execution paths", () => {
       expect(h.calls.prompts).toEqual([]);
       expect(h.remoteSpawn).toHaveBeenCalledTimes(spawns);
       expect(h.mux.sendCmd.mock.calls.some(([action]) => action === "armRung1Recovery")).toBe(false);
-      expect(JSON.stringify([...h.adapter.sendPanel.mock.calls, ...h.adapter.editPanel.mock.calls]))
+      expect(JSON.stringify([...h.adapter.sendPanel.mock.calls, ...h.adapter.editPanel.mock.calls, ...h.adapter.sendMessage.mock.calls]))
         .toContain("Reconnecting to session");
       h.reconnect("another-host"); await drainPreprompt();
       expect(h.calls.prompts).toEqual([]);

@@ -27,6 +27,7 @@ export interface TestInventory {
       installed: boolean;
       ready: boolean;
       reason?: string;
+      withheld?: boolean;
     }>;
   }>;
 }

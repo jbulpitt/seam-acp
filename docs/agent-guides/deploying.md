@@ -47,8 +47,31 @@ sentinel, and promptly enters the bounded shutdown quiesce; systemd restarts
 the controller. Running turns stay with sessiond and reattach. Messages sent
 while the controller is down are caught up from Discord on startup.
 
-In any other checkout, `npm run redeploy` writes a sentinel that no controller
-reads, so nothing restarts. Use the sentinel path rather than a direct
+On production, the command now waits for a deploy verdict, correlated to the
+old controller's PID/start identity and the requested commit. It checks the new
+identity, `/health`, `seam-acp ready`, and every level 50/60 log between boot and
+ready. It reports the reconnect updater's outcome for every managed target;
+a missing target is **unverified**, not silently omitted.
+
+It then runs one real canary turn per connected host, choosing the cheapest
+ready agent when all candidate prices are cached, otherwise the configured
+default (or the first ready agent if that default is unavailable). Existing
+canary-thread model choices are preserved. The full host×agent matrix remains
+available through MCP/admin canary runs.
+
+The verdict is printed with the result card's jump link in the existing self
+canary destination (`SEAM_CANARY_SELF_CHANNEL_ID`, falling back to
+`SEAM_CANARY_RESULT_CHANNEL_ID`). Red exits nonzero and prints the real causes.
+It does not roll back or cancel other work. Deploy evidence is saved in
+`DATA_DIR/canary-self-history.jsonl`. Startup/reconnect observation permits
+15 minutes each; an observation timeout does not terminate the canary turn.
+
+Staging's test-driver deployment keeps the sentinel-only command: automatic
+staging/durability runs, daily scheduling and standalone-rollout hooks are
+not part of this production verification.
+
+In any other checkout, no controller reads that tree's sentinel, so nothing
+restarts; production verification reports red. Use the sentinel path rather than a direct
 `systemctl restart` or `pm2 restart`, which bypasses the bounded quiesce.
 
 ## Bridges and sessiond

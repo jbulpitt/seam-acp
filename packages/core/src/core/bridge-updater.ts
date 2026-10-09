@@ -12,6 +12,15 @@ export interface BridgeReleaseFacts {
   sessiond?: { releaseSha: string | null } | null;
 }
 
+export interface BridgeUpdateObservation { bridgeId: string; outcome: string; cause?: string }
+export interface BridgeUpdaterHandle {
+  (): void;
+  idle(): Promise<void>;
+  targets: Array<{ bridgeId: string; excluded?: string }>;
+  observations(): BridgeUpdateObservation[];
+  error?: string;
+}
+
 export function createBridgeUpdater(options: {
   currentSha: string;
   get: (id: string) => BridgeReleaseFacts | undefined;
@@ -22,32 +31,40 @@ export function createBridgeUpdater(options: {
 }) {
   let pending: Promise<void> = Promise.resolve();
   const updating = new Set<string>();
+  const observations = new Map<string, BridgeUpdateObservation>();
+  const report = (bridgeId: string, outcome: string, error?: unknown): void => {
+    observations.set(bridgeId, { bridgeId, outcome,
+      ...(error === undefined ? {} : { cause: error instanceof Error ? error.message : String(error) }) });
+    if (error === undefined) options.report(bridgeId, outcome);
+    else options.report(bridgeId, outcome, error);
+  };
   function onReady(id: string): void {
     if (updating.has(id)) return;
     const excluded = options.managed(id);
-    if (excluded) { options.report(id, `skipped: ${excluded}`); return; }
+    if (excluded) { report(id, `skipped: ${excluded}`); return; }
+    observations.delete(id);
     updating.add(id);
     pending = pending.then(async () => {
       const bridge = options.get(id);
-      if (!bridge) { options.report(id, "skipped: disconnected"); return; }
+      if (!bridge) { report(id, "skipped: disconnected"); return; }
       if (bridge.releaseSha === options.currentSha && bridge.sessiond?.releaseSha === options.currentSha) {
-        options.report(id, "current"); return;
+        report(id, "current"); return;
       }
       // Hosts roll before the controller; neither process should roll back.
       for (const [component, sha] of [["bridge", bridge.releaseSha], ["sessiond", bridge.sessiond?.releaseSha]] as const) {
         if (sha && sha !== options.currentSha && !await options.older(sha)) {
-          options.report(id, `skipped: ${component} release is not older than the controller`); return;
+          report(id, `skipped: ${component} release is not older than the controller`); return;
         }
       }
       await options.rollout(id);
-      options.report(id, "updated");
-    }).catch(error => options.report(id, "failed; retry on next connection", error))
+      report(id, "updated");
+    }).catch(error => report(id, "failed; retry on next connection", error))
       .finally(() => updating.delete(id));
   }
-  return { onReady, idle: () => pending };
+  return { onReady, idle: () => pending, observations: () => [...observations.values()] };
 }
 
-export async function installBridgeUpdater(hub: BridgeHub, logger: Logger, repoRoot = process.cwd()): Promise<() => void> {
+export async function installBridgeUpdater(hub: BridgeHub, logger: Logger, repoRoot = process.cwd()): Promise<BridgeUpdaterHandle> {
   let targets: Map<string, { rolloutEnabled: boolean; unmanagedReason?: string }>;
   let currentSha: string;
   try {
@@ -57,7 +74,8 @@ export async function installBridgeUpdater(hub: BridgeHub, logger: Logger, repoR
     currentSha = (await runFile("git", ["rev-parse", "HEAD"], { cwd: repoRoot })).stdout.trim();
   } catch (err) {
     logger.warn({ err }, "bridge reconnect updater could not read the release/target map");
-    return () => {};
+    return Object.assign(() => {}, { idle: async () => {}, targets: [], observations: () => [],
+      error: err instanceof Error ? err.message : String(err) });
   }
   const updater = createBridgeUpdater({
     currentSha,
@@ -95,5 +113,7 @@ export async function installBridgeUpdater(hub: BridgeHub, logger: Logger, repoR
   });
   const stop = hub.onBridgeReady(updater.onReady);
   for (const bridge of hub.listConnected()) updater.onReady(bridge.bridgeId);
-  return stop;
+  return Object.assign(stop, { idle: updater.idle, observations: updater.observations,
+    targets: [...targets].map(([bridgeId, target]) => ({ bridgeId,
+      ...(!target.rolloutEnabled ? { excluded: target.unmanagedReason ?? "rollout excluded" } : {}) })) });
 }

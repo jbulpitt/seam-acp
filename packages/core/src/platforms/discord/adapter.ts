@@ -2399,7 +2399,7 @@ export class DiscordAdapter implements ChatAdapter {
     return embed;
   }
 
-  private static buildContainer(
+  static buildContainer(
     layout: import("../../core/types.js").StructuredLayout
   ): ContainerBuilder {
     const container = new ContainerBuilder();

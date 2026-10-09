@@ -170,7 +170,7 @@ if (isModelsCommand && process.env.SEAM_AGY_R5_CATALOG_MODE === "auth-wait") {
   await new Promise(() => {});
 }
 if (prompt === "r5-exit" || ((prompt === "ok" || isModelsCommand) && process.env.SEAM_AGY_R5_CATALOG_MODE === "fail")) {
-  process.stderr.write(`private diagnostic synthetic-password ${process.env.HOME}\n`);
+  process.stderr.write(`private diagnostic password=synthetic-password ${process.env.HOME}\n`);
   process.exit(3);
 }
 if (prompt === "r5-stderr") process.stderr.write(Buffer.alloc(300_000, "x"));

@@ -268,9 +268,10 @@ describe("#440 journal corpus — agy", () => {
     expectKind(classifyAgyError(err), "session_gone", "agy");
   });
 
-  it("agy RequestError throws go through agyData so errorKind is produced, not inferred", () => {
+  it("agy RequestError throws produce classification or preserve classified probe data", () => {
     const src = readFileSync(path.join(adaptersRoot, "profiles/agy.ts"), "utf8");
-    const naked = src.match(/RequestError\.(invalidParams|internalError)\(\s*\{/g);
+    // Native probe errors are classified before ACP serialization.
+    const naked = src.match(/RequestError\.(invalidParams|internalError)\(\s*\{(?!\s*\.\.\.errorData\()/g);
     expect(naked).toBeNull();
     expect(src.includes("agyData(")).toBe(true);
     expect(src.includes("classifiedErrorData")).toBe(true);

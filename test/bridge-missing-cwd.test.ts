@@ -14,7 +14,7 @@ import { agent, methods, ndJsonStream, PROTOCOL_VERSION } from "@agentclientprot
 import type { AgentProfile } from "@seam/adapters";
 import { dispatchBridgeRpc, type SlotSpawnConfig } from "../packages/bridge/src/rpc.js";
 import { AgentRuntime, type AgentEvent } from "../packages/core/src/agents/agent-runtime.js";
-import { BridgeMcpInputRewriter } from "../packages/bridge/src/mcp-injection.js";
+import { rewriteSessionInput } from "../packages/bridge/src/mcp-injection.js";
 import { spawnRemoteSlot, type MuxHandle } from "../packages/core/src/core/remote-spawn.js";
 
 describe("a directory missing on this host", () => {
@@ -70,8 +70,7 @@ describe("a directory missing on this host", () => {
   });
 
   it("opens the ACP session in the directory the host actually uses", () => {
-    const rewriter = new BridgeMcpInputRewriter([], { from: "/no/such/project", to: "/tmp" });
-    const out = rewriter.push(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "session/load", params: { sessionId: "s", cwd: "/no/such/project", mcpServers: [] } })}\n`);
+    const out = rewriteSessionInput(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "session/load", params: { sessionId: "s", cwd: "/no/such/project", mcpServers: [] } })}\n`, [], { from: "/no/such/project", to: "/tmp" });
     expect(JSON.parse(out).params.cwd).toBe("/tmp");
   });
 

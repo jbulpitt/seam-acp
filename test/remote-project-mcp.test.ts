@@ -24,7 +24,8 @@ import {
 } from "../packages/core/src/core/remote-spawn.js";
 import { AgentRuntime } from "../packages/core/src/agents/agent-runtime.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
-import { BridgeMcpInputRewriter } from "../packages/bridge/src/mcp-injection.js";
+import { rewriteSessionInput } from "../packages/bridge/src/mcp-injection.js";
+import { createLineFramer } from "../packages/bridge/src/output-log.js";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
 
@@ -84,11 +85,11 @@ describe("remote project MCP ownership (#417)", () => {
     let delivered: McpServer[] | undefined;
     const spawned = child();
     const bridgeInput = new PassThrough();
-    let rewriter: BridgeMcpInputRewriter | undefined;
+    const input = createLineFramer();
     spawned.stdin.on("data", (chunk: Buffer) => {
-      rewriter ??= new BridgeMcpInputRewriter(configured[0]?.mcpServers ?? []);
-      const output = rewriter.push(chunk.toString("utf8"));
-      if (output) bridgeInput.write(output);
+      for (const line of input.push(chunk.toString("utf8"))) {
+        bridgeInput.write(rewriteSessionInput(line, configured[0]?.mcpServers ?? []));
+      }
     });
     agent({ name: "remote-project-mcp-fixture" })
       .onRequest(methods.agent.initialize, () => ({
@@ -197,11 +198,11 @@ describe("remote project MCP ownership (#417)", () => {
     expect(configureSlot).not.toHaveBeenCalled();
   });
 
-  it("enriches fragmented session/load frames without shadowing transported servers", () => {
-    const rewriter = new BridgeMcpInputRewriter([
+  it("enriches session/load frames without shadowing transported servers", () => {
+    const hostServers: McpServer[] = [
       { name: "seam-mcp", type: "http", url: "https://must-not-win", headers: [] },
       { name: "stdio-helper", command: "node", args: ["helper.mjs"], env: [] },
-    ]);
+    ];
     const request = JSON.stringify({
       jsonrpc: "2.0",
       id: 9,
@@ -218,8 +219,7 @@ describe("remote project MCP ownership (#417)", () => {
       },
     });
 
-    expect(rewriter.push(request.slice(0, 17))).toBe("");
-    const output = rewriter.push(`${request.slice(17)}\n`);
+    const output = rewriteSessionInput(`${request}\n`, hostServers);
     const message = JSON.parse(output) as {
       params: { mcpServers: McpServer[] };
     };

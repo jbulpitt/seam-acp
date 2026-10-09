@@ -6,7 +6,7 @@
  *
  * Protocol: slot mux (data / kill / exit) plus the typed command bus
  * (hello / hello_ack / rpc / rpc_reply / event). listSlots still uses
- * cmd / cmd_reply. SIGUSR2 enters drain mode.
+ * cmd / cmd_reply. SIGUSR2 finishes slot transfers, then detaches.
  *
  *   seam-bridge connect --server <wss-url> --id <bridgeId> --token <token> [--cwd]
  *
@@ -22,7 +22,7 @@
  *                 (or ws://localhost:9999 for local testing)
  *     token       Shared secret for the WS handshake
  *     --cwd path  Local working directory for spawned agent processes
- *                 (default: process.cwd()). ACP JSON cwd fields are not rewritten.
+ *                 (default: process.cwd()).
  *     agent-cmd   Optional path to the agent binary (default: "copilot")
  *                 Override with COPILOT_CMD env var.
  *
@@ -55,11 +55,10 @@ import {
   sweepAgyMcpHomes,
   type AgentAdapter,
 } from "@seam/adapters";
-import { dispatchBridgeRpc, type SlotSpawnConfig } from "./rpc.js";
+import { dispatchBridgeRpc } from "./rpc.js";
 import { collectHangEvidence, createProbeGate, readLiveProviderSocket } from "./hang-probe.js";
 import { createOomEvidenceRegistry } from "./oom-evidence.js";
 import { createStderrRegistry } from "./stderr-ring.js";
-import { BridgeMcpInputRewriter } from "./mcp-injection.js";
 import {
   inventoryFromAdapters,
   loadHostAdapterInventory,
@@ -188,7 +187,6 @@ async function makeSlotManager(opts: {
 }): Promise<SlotManager> {
   const { copilotCmd, localCwd, workspaceRoot, WebSocket, bridgeId, adapters, releaseReceipt, releaseSha, sessiond } = opts;
   let currentWs: WsSocket | null = null;
-  const slotConfigs = new Map<number, SlotSpawnConfig>();
   let draining = false;
   /**
    * #456: agent fd 2 was piped with no reader, which stalls the child once the
@@ -200,7 +198,6 @@ async function makeSlotManager(opts: {
   /** #516: exact descendant ownership while the child is alive. Kernel OOM
    * evidence is useful only when its killed pid was observed in this tree. */
   const oomEvidence = createOomEvidenceRegistry();
-  const slotInputRewriters = new Map<number, BridgeMcpInputRewriter>();
   /**
    * #443: absorbs the hang-probe response so it never becomes a turn error.
    * One probe per slot. The id is unique, so a late reply cannot swallow a
@@ -234,7 +231,6 @@ async function makeSlotManager(opts: {
       return;
     }
     if (frame.type !== "exit") return;
-    slotInputRewriters.delete(frame.slot);
     probes.close(frame.slot);
     const payload = stderrRegistry.exitPayload(frame.slot, frame.code ?? null, frame.signal ?? null);
     const abnormal = (frame.code !== 0 && frame.code !== null) || frame.signal != null;
@@ -603,7 +599,6 @@ async function makeSlotManager(opts: {
             workspaceRoot,
             cwd: localCwd,
             configureSlot: (slot, cfg) => {
-              slotConfigs.set(slot, cfg);
               supervised.configure(slot, cfg);
             },
           });
@@ -636,39 +631,17 @@ async function makeSlotManager(opts: {
     }
 
     if (msg.type === "data" && msg.data !== undefined) {
-      let rewriter = slotInputRewriters.get(msg.slot);
-      if (!rewriter) {
-        const config = slotConfigs.get(msg.slot);
-        rewriter = new BridgeMcpInputRewriter(config?.mcpServers ?? [],
-          config?.requestedCwd && config.cwd ? { from: config.requestedCwd, to: config.cwd } : undefined);
-        slotInputRewriters.set(msg.slot, rewriter);
-      }
-      const rewritten = rewriter.push(msg.data);
-      // #609: `push` only withholds bytes that have no terminating newline
-      // yet — normal for a fragmented write, permanent for one that never
-      // arrives complete. Silence here was indistinguishable from a healthy
-      // slot: the controller's only symptom was the same blind 45s
-      // ACP-initialize timeout #606 fixed for the write-side failure. This
-      // names the specific frame that never reached a slot at all.
-      if (rewritten) {
-        void forwardInput(supervised, msg.slot, rewritten, (slot, reason) => {
-          console.error(`[bridge] Slot ${slot}: input undeliverable: ${reason}`);
-          wsSend({ slot, type: "exit", code: 1, spawnError: `supervised slot unavailable: ${reason}` });
-        });
-      } else {
-        console.error(
-          `[bridge] Slot ${msg.slot}: received ${msg.data.length} bytes with no terminating newline; ` +
-            "buffered, not delivered"
-        );
-      }
+      // Partial frames belong with the surviving child, just like complete input.
+      void forwardInput(supervised, msg.slot, msg.data, (slot, reason) => {
+        console.error(`[bridge] Slot ${slot}: input undeliverable: ${reason}`);
+        wsSend({ slot, type: "exit", code: 1, spawnError: `supervised slot unavailable: ${reason}` });
+      });
     } else if (msg.type === "kill") {
       console.error(`[bridge] Slot ${msg.slot}: kill received — terminating supervised agent`);
       void supervised.kill(msg.slot).catch(() => undefined);
       // #456: a deliberate kill must not surface a stale diagnostic tail.
       stderrRegistry.drop(msg.slot);
       oomEvidence.drop(msg.slot);
-      slotConfigs.delete(msg.slot);
-      slotInputRewriters.delete(msg.slot);
       probes.close(msg.slot);
     } else if (msg.type === "cmd") {
       handleCmd(msg);
@@ -679,40 +652,10 @@ async function makeSlotManager(opts: {
     if (draining) return;
     draining = true;
 
-    const IDLE_SILENCE_MS = 10_000;
-    const POLL_INTERVAL_MS = 2_000;
-    const HARD_TIMEOUT_MS = 5 * 60 * 1_000;
-    const deadline = Date.now() + HARD_TIMEOUT_MS;
-
-    let polling = false;
-    const poll = async (): Promise<void> => {
-      if (polling) return;
-      polling = true;
-      const now = Date.now();
-      if (now >= deadline) {
-        clearInterval(timer);
-        console.error("[bridge] Drain hard timeout reached — forcing exit for restart");
-        process.exit(0);
-      }
-      const listed = await supervised.listSlots().catch(() => undefined);
-      const live = listed?.health.filter((entry) => entry.alive) ?? [];
-      if (live.length === 0) {
-        clearInterval(timer);
-        console.error("[bridge] Drain complete — exiting for restart");
-        process.exit(0);
-      }
-      const allIdle = live.every((entry) => (entry.lastStdoutMsAgo ?? Number.POSITIVE_INFINITY) >= IDLE_SILENCE_MS);
-      if (allIdle) {
-        clearInterval(timer);
-        console.error("[bridge] Drain complete — exiting for restart");
-        process.exit(0);
-      }
-      const remaining = live.filter((entry) => (entry.lastStdoutMsAgo ?? Number.POSITIVE_INFINITY) < IDLE_SILENCE_MS);
-      console.error(`[bridge] Draining — ${remaining.length} slot(s) still active`);
-      polling = false;
-    };
-    const timer = setInterval(() => { void poll(); }, POLL_INTERVAL_MS);
-    void poll();
+    void supervised.finishTransfers().then(() => {
+      console.error("[bridge] Slot transfers complete — detaching for restart");
+      process.exit(0);
+    });
   }
 
   return { setWs, handleMessage, drain };
@@ -946,7 +889,7 @@ async function resolveUrlFromGist(ownerAndId: string) {
 let activeMgr: SlotManager | null = null;
 
 process.on("SIGUSR2", () => {
-  console.error("[bridge] SIGUSR2 received — entering drain mode");
+  console.error("[bridge] SIGUSR2 received — finishing slot transfers");
   if (activeMgr) {
     activeMgr.drain();
   } else {

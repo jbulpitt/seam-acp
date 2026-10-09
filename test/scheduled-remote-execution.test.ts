@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { EventEmitter } from "node:events";
 import { PassThrough, Readable, Writable } from "node:stream";
+import { setTimeout as delay } from "node:timers/promises";
 import { agent, methods, ndJsonStream, PROTOCOL_VERSION, RequestError } from "@agentclientprotocol/sdk";
 import { BridgeUnreachableError, classifyAgyError, readErrorClassification, SEAM_AGY_STDOUT_FALLBACK_META, type AgentProfile } from "@seam/adapters";
 import { pino } from "pino";
@@ -194,6 +195,7 @@ function offlineSchedule(mode: "live" | "isolated", cached = false, location = R
   cleanups.push(() => router.disposeAll());
   if (!cached) { h.record.acpSessionId = ""; h.store.upsert(h.record); }
   const orch = new Orchestrator({ logger: h.logger, store: h.store, router,
+    recoverySleep: async () => {},
     adapter: h.adapter as any, renderer: discordRenderer, modelCatalog: catalog,
     config: { DATA_DIR: h.cwd, REPOS_ROOT: h.cwd, TURN_TIMEOUT_SECONDS: 1,
       SEAM_TURN_RESUME_ENABLED: true, REPO_EMOJIS: new Map(),
@@ -207,6 +209,15 @@ function offlineSchedule(mode: "live" | "isolated", cached = false, location = R
 
 async function drainPreprompt() {
   for (let i = 0; i < 30; i++) await new Promise<void>(resolve => setImmediate(resolve));
+}
+
+async function prepromptBoundary(h: ReturnType<typeof offlineSchedule>, id: string) {
+  for (let i = 0; i < 200; i++) {
+    const attempt = h.store.turnAttempts.get(id);
+    if (h.events.listenerCount("ready") || attempt && attempt.state !== "active") return;
+    await delay(5);
+  }
+  throw new Error("the scheduled turn reached neither a bridge wait nor a terminal outcome");
 }
 
 describe("pre-prompt bridge reconnect on the scheduled execution paths", () => {
@@ -224,7 +235,7 @@ describe("pre-prompt bridge reconnect on the scheduled execution paths", () => {
     const key = scheduledOccurrenceKey(h.row.id);
     const turn = h.orch.runScheduledPrompt(h.row.id, key);
     try {
-      await drainPreprompt();
+      await prepromptBoundary(h, key.id);
       expect(h.store.turnAttempts.get(key.id)).toMatchObject({ state: "active", promptStarted: false });
       expect(h.calls.prompts).toEqual([]);
       expect(h.remoteSpawn).toHaveBeenCalledTimes(spawns);
@@ -254,7 +265,7 @@ describe("pre-prompt bridge reconnect on the scheduled execution paths", () => {
     const key = scheduledOccurrenceKey(h.row.id);
     const turn = h.orch.runScheduledPrompt(h.row.id, key);
     try {
-      await drainPreprompt(); await vi.advanceTimersByTimeAsync(15 * 60_000 - 1);
+      await prepromptBoundary(h, key.id); await vi.advanceTimersByTimeAsync(15 * 60_000 - 1);
       expect(h.store.turnAttempts.get(key.id)).toMatchObject({ state: "active", promptStarted: false });
       expect(h.calls.prompts).toEqual([]);
       await vi.advanceTimersByTimeAsync(1); await turn;
@@ -270,7 +281,7 @@ describe("pre-prompt bridge reconnect on the scheduled execution paths", () => {
     const key = scheduledOccurrenceKey(h.row.id);
     const turn = h.orch.runScheduledPrompt(h.row.id, key);
     try {
-      await drainPreprompt();
+      await prepromptBoundary(h, key.id);
       expect(h.store.turnAttempts.get(key.id)).toMatchObject({ state: "active", promptStarted: false });
       if (action === "cancel") h.store.turnAttempts.cancel(key.id, "cancelled by operator");
       else h.orch.suspendForRestart();

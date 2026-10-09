@@ -18,6 +18,7 @@ import {
   registerOwnedProcessGroup,
 } from "@seam/adapters";
 import { createLineFramer } from "./output-log.js";
+import { rewriteSessionInput } from "./mcp-injection.js";
 import { loadHostAdapterInventory } from "./inventory.js";
 import { createRung1Recovery } from "./rung1-recovery.js";
 import { spawnSupervisedAdapter } from "./spawn-agent.js";
@@ -283,7 +284,10 @@ function start(config: AdapterChildBootstrap): void {
   };
   function deliverInput(bytes: Buffer): void {
     recovery.observeInputBytes(config.slot);
-    for (const line of agentInput.push(bytes.toString())) {
+    for (const input of agentInput.push(bytes.toString())) {
+      const line = rewriteSessionInput(input, config.config.mcpServers ?? [],
+        config.config.requestedCwd && config.config.cwd
+          ? { from: config.config.requestedCwd, to: config.config.cwd } : undefined);
       if (!permissions.observeInput(line)) continue;
       recovery.observeInput(config.slot, line);
       resumeRecord.observeInput(line);

@@ -552,6 +552,11 @@ export class SupervisedSlots {
     this.controlWaiters.delete(requestId);
   }
 
+  /** Join received slot operations, including input arriving during a transfer. */
+  async finishTransfers(): Promise<void> {
+    while (this.queues.size > 0) await Promise.allSettled([...this.queues.values()]);
+  }
+
   private serial<T>(slot: number, task: () => Promise<T>): Promise<T> {
     const prior = this.queues.get(slot) ?? Promise.resolve();
     const next = prior.catch(() => undefined).then(task);

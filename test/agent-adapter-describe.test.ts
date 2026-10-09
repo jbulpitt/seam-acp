@@ -35,7 +35,7 @@ describe("AgentAdapter.describe()", () => {
     const profile = makeClaudeProfile({
       defaultModel: "default",
       staticModels: [
-        { modelId: "default", name: "Opus latest" },
+        { modelId: "default", name: "Opus latest", contextLimit: 1_000_000 },
         { modelId: "claude-sonnet-4-6", name: "Sonnet 4.6" },
       ],
     });

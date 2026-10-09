@@ -76,6 +76,15 @@ describe("production deploy canary", () => {
     expect(dispatched).toEqual([]);
   });
 
+  it("preserves intentional skips in the manual matrix even when the bridge is not ready", async () => {
+    const { runner } = await fixture([{ host: "one", ready: false, agents: [
+      { id: "first", installed: true, ready: false, withheld: true, reason: "withheld by AGENT_LOCATION_DENY" },
+    ] }]);
+    const result = await runner.run("self");
+    expect(result.rows).toEqual([expect.objectContaining({ status: "skipped", cause: "withheld by AGENT_LOCATION_DENY" })]);
+    expect(formatCanaryResult(result)).toContain("GREEN");
+  });
+
   it("reports the real preparation failure instead of calling an installed agent disabled", async () => {
     const { runner } = await fixture([{ host: "one", ready: true, agents: [
       { id: "first", installed: true, ready: false, reason: "prepare: provider CLI authentication failed" },

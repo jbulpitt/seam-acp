@@ -334,23 +334,28 @@ export class StagingCanaryRunner {
     const rows: CanaryRow[] = [];
     const runnable: Array<{ host: string; agent: string; threadId: string }> = [];
     for (const { bridge, agent } of targets) {
+      if (!agent.installed || agent.withheld) {
+        rows.push({ host: bridge.host, agent: agent.id, status: "skipped", durationMs: null,
+          cause: agent.reason ?? (!agent.installed ? "not installed" : "withheld") });
+        continue;
+      }
       if (!bridge.ready) {
         rows.push({
           host: bridge.host,
           agent: agent.id,
           status: "failed",
           durationMs: null,
-          cause: "bridge not ready",
+          cause: agent.reason ?? "bridge not ready",
         });
         continue;
       }
-      if (!agent.installed || !agent.ready) {
+      if (!agent.ready) {
         rows.push({
           host: bridge.host,
           agent: agent.id,
-          status: !agent.installed || agent.withheld ? "skipped" : "failed",
+          status: "failed",
           durationMs: null,
-          cause: agent.reason ?? (!agent.installed ? "not installed" : "not ready"),
+          cause: agent.reason ?? "not ready",
         });
         continue;
       }
@@ -835,17 +840,22 @@ export class SelfCanaryRunner {
       }
     }
     for (const { bridge, agent } of targets) {
-      if (!bridge.ready) {
-        rows.push(this.failedRow(bridge.host, agent.id, null, "unverified: bridge inventory is not ready"));
+      if (!agent.installed || agent.withheld) {
+        rows.push({ host: bridge.host, agent: agent.id, status: "skipped", durationMs: null,
+          cause: agent.reason ?? (!agent.installed ? "not installed" : "withheld") });
         continue;
       }
-      if (!agent.installed || !agent.ready) {
+      if (!bridge.ready) {
+        rows.push(this.failedRow(bridge.host, agent.id, null, agent.reason ?? "unverified: bridge inventory is not ready"));
+        continue;
+      }
+      if (!agent.ready) {
         rows.push({
           host: bridge.host,
           agent: agent.id,
-          status: !agent.installed || agent.withheld ? "skipped" : "failed",
+          status: "failed",
           durationMs: null,
-          cause: agent.reason ?? (!agent.installed ? "not installed" : "not ready"),
+          cause: agent.reason ?? "not ready",
         });
         continue;
       }
@@ -997,8 +1007,7 @@ function targetLabel(target: CanaryTarget): string {
 }
 
 export function canaryIsGreen(result: CanaryRunResult): boolean {
-  return !result.cardError && !result.rows.some(row => row.status === "failed")
-    && result.rows.some(row => row.status === "passed");
+  return !result.cardError && !result.rows.some(row => row.status === "failed");
 }
 
 export function formatCanaryResult(result: CanaryRunResult): string {

@@ -35,6 +35,7 @@ describe("deploy startup and reconnect verdict", () => {
     expect(deployBootRows(request, boot, true).every(row => row.status === "passed")).toBe(true);
     for (const [changed, check] of [
       [{ ...boot, identity: request.previous }, "identity"],
+      [{ ...boot, identity: { ...boot.identity, started: "unknown" } }, "identity"],
       [{ ...boot, commit: "old" }, "identity"],
       [{ ...boot, readyAt: null }, "ready"],
       [{ ...boot, errorCount: 1, errors: ["DiscordAPIError 50035: ingest ref is not a snowflake"] }, "boot logs"],
@@ -98,6 +99,13 @@ describe("deploy startup and reconnect verdict", () => {
     expect(result.deploy).toEqual({ requestId: request.id, previous: request.previous, controller: boot.identity });
     expect(canaryIsGreen(result)).toBe(false);
     expect(result.rows.at(-1)?.cause).toContain("authentication expired");
+  });
+
+  it("requires a real passing turn for deploy verification even if the manual matrix would be all skipped", async () => {
+    const result = await verifyDeploy({ request, boot, health: async () => true, fleet: async () => [],
+      probe: async () => ({ ...probeResult(), rows: [{ host: "one", agent: "disabled", status: "skipped", durationMs: null }] }) });
+    expect(canaryIsGreen(result)).toBe(false);
+    expect(result.rows.at(-1)?.cause).toBe("no real canary turn passed");
   });
 
   it("does not replace the real health error with a generic failure", async () => {

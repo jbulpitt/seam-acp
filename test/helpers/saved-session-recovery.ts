@@ -30,6 +30,7 @@ export async function savedSessionHost(options: {
   legacy?: boolean;
   oldAuthDisarm?: boolean;
   authFailure?: boolean;
+  connectionFailure?: boolean;
   writerLock?: boolean;
   recoverySleep?: (ms: number) => Promise<void>;
 } & Partial<SessionExecutables> = {}) {
@@ -38,6 +39,8 @@ export async function savedSessionHost(options: {
   if (options.failLoad) await fs.writeFile(failure, "fixture outage");
   const authFailure = path.join(root, "auth.failure");
   if (options.authFailure) await fs.writeFile(authFailure, "fixture authentication required");
+  const connectionFailure = path.join(root, "connection.failure");
+  if (options.connectionFailure) await fs.writeFile(connectionFailure, "fixture provider 503");
   const bin = path.join(root, "bin");
   await fs.mkdir(bin);
   await fs.symlink(fakeAgent, path.join(bin, "codex-acp"));
@@ -101,6 +104,7 @@ export async function savedSessionHost(options: {
       ...(options.loadGate ? { FAKE_AGENT_LOAD_GATE: path.join(root, "load.release") } : {}),
       ...(options.newGate ? { FAKE_AGENT_NEW_GATE: path.join(root, "new.release") } : {}),
       FAKE_AGENT_AUTH_FAILURE: authFailure,
+      ...(options.connectionFailure ? { FAKE_AGENT_CONNECTION_FAILURE: connectionFailure } : {}),
       ...(options.writerLock ? { FAKE_AGENT_WRITER_LOCK: path.join(root, "session.writer") } : {}),
       ...(options.sessionGone ? { FAKE_AGENT_MISSING_SESSION: SAVED_SESSION } : {}) },
     onFrame: frame => socket.deliver(frame), onStderr: () => {} });

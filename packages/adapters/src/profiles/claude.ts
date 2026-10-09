@@ -209,8 +209,6 @@ export function makeClaudeProfile(opts: {
   effort?: AgentProfile["effort"];
   /** Accepted for parity; unused — MCP servers are forwarded via ACP. */
   mcpServers?: McpServer[];
-  /** Optional context token threshold to trigger context compaction. */
-  compactionTokenThreshold?: number;
   /** Custom environment variables to inject into the spawned process environment. */
   extraEnv?: Record<string, string>;
   /**
@@ -249,8 +247,7 @@ export function makeClaudeProfile(opts: {
 
   let identityCache: AgentIdentity | null | undefined;
   const catalogModels = opts.staticModels
-    ? withClaudeContextLimits(opts.staticModels)
-    : [{ modelId: opts.defaultModel, name: opts.defaultModel }];
+    ?? [{ modelId: opts.defaultModel, name: opts.defaultModel }];
   const catalogEffort = opts.effort ?? {
     mechanism: "meta" as const,
     levels: ["low", "medium", "high", "xhigh", "max"],
@@ -462,7 +459,7 @@ export function makeClaudeProfile(opts: {
       });
     },
     submissionSignals: "claude_sdk",
-    claudeSessionOptions: { compactionTokenThreshold: opts.compactionTokenThreshold, thinkingDisplay },
+    claudeSessionOptions: { thinkingDisplay },
     newSessionMeta(modelId?: string, effort?: string) {
       return claudeSessionMetadata(opts, modelId, effort);
     },
@@ -657,7 +654,7 @@ export function makeClaudeProfile(opts: {
       },
 
       async getUsage(cwd: string, sessionId?: string, newerThanMs?: number) {
-        const empty = { model: null, totalUsed: 0, contextLimit: 200_000 };
+        const empty = { model: null, totalUsed: 0 };
         const dir = configDir ?? path.join(process.env.HOME ?? "", ".claude");
         const projectDir = await resolveProjectDir(dir, cwd);
         let targetPath: string | undefined;
@@ -700,15 +697,9 @@ export function makeClaudeProfile(opts: {
             const cacheCreation = u.cache_creation_input_tokens || 0;
             const output = u.output_tokens || 0;
             const totalUsed = input + cacheRead + cacheCreation + output;
-            // Best-effort fallback from the JSONL model id (the orchestrator's
-            // monotonic ceiling + the agent-reported UsageUpdate.size are the
-            // real source). Uses the same canonical table as compaction so the
-            // two never diverge.
-            const contextLimit = getClaudeContextWindow(model ?? undefined);
             return {
               model,
               totalUsed,
-              contextLimit,
             };
           } catch { /* skip malformed */ }
         }
@@ -1073,34 +1064,6 @@ function pickStringField(
   return undefined;
 }
 
-/** Canonical context windows for Claude models, keyed by full model id. Single
- *  source of truth for BOTH auto-compaction sizing (newSessionMeta) and the
- *  staticModels `contextLimit` the orchestrator uses to seed the display window.
- *
- *  Since claude-agent-acp ≥0.42 resolves full canonical IDs correctly and 1.x
- *  reports the true window at runtime (ACP UsageUpdate.size), picker IDs carry
- *  no context-selection variant — each model declares its native window here,
- *  and the agent-reported size refines this seed once a turn completes. */
-const CLAUDE_CONTEXT_WINDOWS: Readonly<Record<string, number>> = {
-  "claude-fable-5-1": 1_000_000,
-  "claude-opus-5": 1_000_000,
-  // `default` now auto-rolls to this model. Verified 2026-09-23 on claude-agent-acp
-  // 0.81.1: an explicit selection ran as claude-opus-5-5, ACP usage_update.size
-  // 1000000, and raw `claude /context` showed 1m. Without this row an explicit
-  // pick computed a 200K compaction threshold (160K) on a 1M model.
-  "claude-opus-5-5": 1_000_000,
-  "claude-opus-4-8": 1_000_000,
-  "claude-opus-4-7": 1_000_000,
-  "claude-fable-5": 1_000_000,
-  "claude-sonnet-5": 1_000_000,
-  // Verified 2026-09-30 on claude-agent-acp 0.84.0: ran as claude-sonnet-5-5,
-  // usage_update.size 1000000, raw `claude /context` 1m. On 0.81.1 the bundled
-  // SDK treated it as 200K, so it needs 0.84.0 or later.
-  "claude-sonnet-5-5": 1_000_000,
-  // Verified with 0.88.0/native 2.1.293: JSONL canonical id, ACP size and /context.
-  "claude-haiku-5-5": 1_000_000,
-};
-
 /** Whether a model id should be force-forwarded to the direct Anthropic backend
  *  via `ANTHROPIC_MODEL` at spawn time (see `spawn()`). True for full canonical
  *  Claude IDs (`claude-<family>-<version>`, e.g. `claude-opus-5`), which
@@ -1120,63 +1083,15 @@ export function isForwardableFullModelId(modelId?: string): boolean {
   return /^claude-[a-z0-9]+(?:-[a-z0-9]+)+$/.test(modelId.trim().toLowerCase());
 }
 
-/** Map a model id to its TRUE context window, which drives the auto-compaction
- *  threshold in newSessionMeta. Getting this wrong causes premature compaction
- *  (a 200K threshold on a 1M model throws away 800K of usable context). */
-/**
- * Verified native Claude windows only. Unknown ids return undefined — callers
- * that need a compaction floor (newSessionMeta) use {@link getClaudeContextWindow}
- * which still applies the conservative 200K fallback. Rebuild and other
- * budget consumers must not use that generic fallback.
- */
-export function lookupClaudeNativeContextWindow(modelId?: string): number | undefined {
-  if (!modelId) return undefined;
-  const id = modelId.trim().toLowerCase();
-  if (!id) return undefined;
-  if (id === "default") return 1_000_000;
-  if (CLAUDE_CONTEXT_WINDOWS[id]) return CLAUDE_CONTEXT_WINDOWS[id];
-  // Picker/session ids often use dots (`claude-opus-4.8`); the table is hyphenated.
-  const hyphenated = id.replace(/(\d)\.(\d)/g, "$1-$2");
-  return CLAUDE_CONTEXT_WINDOWS[hyphenated];
-}
-
-export function getClaudeContextWindow(modelId?: string): number {
-  return lookupClaudeNativeContextWindow(modelId) ?? 200_000;
-}
-
-/** Stamp each picker entry with its canonical contextLimit so the orchestrator's
- *  `staticModels[].contextLimit → modelContextFloor` path (shared with every
- *  other agent) also works for Claude, seeding the display window on turn 1. */
-function withClaudeContextLimits<T extends { modelId: string; name: string; contextLimit?: number }>(
-  models: ReadonlyArray<T>
-): Array<T> {
-  return models.map((m) => {
-    if (m.contextLimit && m.contextLimit > 0) return m;
-    const native = lookupClaudeNativeContextWindow(m.modelId);
-    return native ? { ...m, contextLimit: native } : m;
-  });
-}
-
 /** Same portable session metadata on a host adapter and its controller client. */
 export function claudeSessionMetadata(
-  opts: { defaultModel: string; compactionTokenThreshold?: number; thinkingDisplay?: "summarized" | "omitted" },
-  modelId?: string, effort?: string,
+  opts: { defaultModel: string; thinkingDisplay?: "summarized" | "omitted" },
+  modelId?: string,
+  effort?: string,
 ): Record<string, unknown> {
   const model = modelId || opts.defaultModel;
   const thinkingDisplay = opts.thinkingDisplay;
   const options: Record<string, unknown> = {};
-
-  let threshold = opts.compactionTokenThreshold;
-  if (threshold && threshold > 0) {
-    if (threshold <= 1.0) {
-      const cw = getClaudeContextWindow(model);
-      threshold = Math.round(cw * threshold);
-    }
-    options.compactionControl = {
-      enabled: true,
-      contextTokenThreshold: threshold,
-    };
-  }
 
   // Reasoning effort is injected via _meta.claudeCode.options.effort, which
   // claude-agent-acp spreads straight into the SDK query Options.effort.

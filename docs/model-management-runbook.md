@@ -50,10 +50,10 @@ before running any procedure in this runbook:
 3. **Current state** — skim these files to understand what's deployed right now:
    - `.env` — `CLAUDE_DEFAULT_MODEL` and `CLAUDE_MODELS` (the picker values, now
      bare full IDs plus the `default` alias — no `[1m]` suffix)
-   - `packages/adapters/src/profiles/claude.ts` — the `CLAUDE_CONTEXT_WINDOWS` table +
-     `getClaudeContextWindow()` (compaction threshold + `contextLimit` seed),
-     `withClaudeContextLimits()` (stamps every picker entry's `contextLimit`), and
-     `newSessionMeta()` (how `_meta` is built)
+   - `packages/adapters/src/profiles/claude.ts` — `newSessionMeta()` (effort and
+     thinking metadata) and JSONL model/token reads; no capacity guess
+   - `packages/adapters/src/profiles/claude-catalog.ts` — scoped verified overlay
+     rows, including each row's `contextWindow` (§6/§13)
    - `packages/core/src/config.ts` — environment-variable validation
    - **No patch script.** The former `scripts/patch-claude-agent-acp.mjs` and the
      `npm run patch-acp` script were retired at 0.54.1 and no longer exist.
@@ -66,9 +66,8 @@ before running any procedure in this runbook:
 This table is the *output* of the §4 process, kept here as a quick reference.
 **It is not a substitute for re-running §4 after any update** — treat it as stale
 the moment you touch versions. Model IDs are **bare** (no `[1m]` suffix); each
-model's native window comes from the `CLAUDE_CONTEXT_WINDOWS` table in
-`claude.ts`, and the agent also reports the true window at runtime via
-`UsageUpdate.size`.
+model's native window is recorded in its scoped catalog row (§6/§13). A matching
+runtime ACP `UsageUpdate.size` takes precedence over that catalog estimate.
 
 Except Haiku 5.5, the rows below were re-verified on 2026-09-30 with
 claude-agent-acp 0.84.0 + Claude Code 2.1.285, no patch. Each used the Seam
@@ -124,11 +123,9 @@ mechanism. Do not remove the forwarding merely because `default` works.
 Two non-obvious truths this table encodes:
 1. **The `[1m]` suffix is not part of Seam.** Model IDs are bare;
    the JSONL model id (`claude-opus-4-8`) matches what you passed. Each model's
-   native window is declared in the `CLAUDE_CONTEXT_WINDOWS` table in `claude.ts`,
-   resolved by `getClaudeContextWindow(modelId)` and stamped onto every picker
-   entry (`contextLimit`) by `withClaudeContextLimits` — so the orchestrator's
-   `staticModels[].contextLimit → modelContextFloor` path seeds the window on
-   turn 1, and the agent's runtime `UsageUpdate.size` refines it.
+   native window is recorded in the scoped catalog row. Capacity comes from a
+   matching ACP budget, then the binding's catalog, and is otherwise unknown.
+   Picker labels and unscoped legacy manifests do not supply a guessed window.
 2. **Every model admitted to this picker has a native 1M window.** Legacy 200K
    choices were removed on 2026-09-02, so the picker does not need window
    variants or window labels.
@@ -160,13 +157,12 @@ Anthropic API  → writes entry.message.model into the JSONL = GROUND TRUTH
 Two independent things must both be right:
 1. **Which model actually runs** — `entry.message.model` in the JSONL.
 2. **Which context window is active** — `usage_update.size` (the agent reports
-   the true window at runtime, sourced from the API's `modelUsage.contextWindow`),
-   AND the compaction threshold seam-acp computes from the `CLAUDE_CONTEXT_WINDOWS`
-   table via `getClaudeContextWindow()` in `packages/adapters/src/profiles/claude.ts`.
+   the runtime budget, sourced from the API's `modelUsage.contextWindow` once
+   available), cross-checked against raw `/context` and recorded in the scoped
+   catalog row. See §4a for the wrapper's initial 200K guess.
 
-A model can run correctly but get a wrong compaction threshold if its window is
-missing from `CLAUDE_CONTEXT_WINDOWS` (falls through to the conservative 200K
-default). Check both.
+Native Claude Code manages compaction. Seam sends no threshold override, and
+unknown capacity never blocks an ordinary turn. Check both identity and capacity.
 
 ---
 
@@ -220,8 +216,8 @@ explicitly report on each of these categories:
 | **New models** | New Opus/Sonnet/Haiku versions, new full IDs | The picker (`CLAUDE_MODELS`) must be updated AND re-verified |
 | **Model config option / resolver** | changes to the `"model"` `SessionConfigSelect`, `setSessionConfigOption`, `resolveModelPreference`, advertised `availableModels`, or the exact-match-before-fuzzy order | Highest-risk category: this is how models are selected in 1.x. A regression here can reject full IDs or re-introduce cross-family fuzzy matching. |
 | **Effort defaults** | New default effort per model, new tiers (`xhigh`, `max`, `ultra`) | Unset effort uses the model default; a default change silently alters behavior |
-| **Context window** | new model windows, 1M support, auto-upgrade rules | Drives compaction threshold (`CLAUDE_CONTEXT_WINDOWS`) and cost |
-| **Compaction** | auto-compact thresholds, `compactionControl` shape | We pass `compactionTokenThreshold`; the API contract could change |
+| **Context window** | new model windows, 1M support, auto-upgrade rules | Verify the scoped catalog row and runtime budget |
+| **Compaction** | native auto-compact behavior | Claude Code owns compaction; Seam sends no threshold override |
 | **ACP protocol** | new `_meta` fields, `UsageUpdate` shape, config-option semantics, schema version bumps | Our `getUsage`/status-card and model-selection plumbing depend on these |
 | **Tool signatures** | new params on built-in tools (e.g. image aspect ratio) | Could unlock features currently worked around |
 
@@ -380,10 +376,8 @@ timeout 300 node /tmp/probe-models.mjs 2>/dev/null
    caveat in §5 for the fix.
 2. `API model` matches the model you intended (e.g. `default` → `claude-opus-5`,
    NOT a different family).
-3. `window` matches the expected model capability, AND `getClaudeContextWindow`
-   returns the same value for that ID (§6). A 1M model whose ID is missing from
-   `CLAUDE_CONTEXT_WINDOWS` would seed a
-   200K compaction threshold.
+3. `window` matches the expected model capability and the raw check (§4a).
+   Record it once, in the verified catalog row for the tested scope (§6/§13).
 4. `sizes` shows the expected window; a 1M model typically shows `200000,1000000`
    (the agent's runtime `UsageUpdate.size` overwriting the 200K default — see §4a).
 
@@ -418,12 +412,10 @@ agrees with it.**
 - **Raw un-advertised full IDs may be REJECTED** by `setSessionConfigOption`.
   The Seam profile's `ANTHROPIC_MODEL` forwarding is required for the full-ID
   picker rows and must be active in the probe.
-- A 1M model whose window is **missing from `CLAUDE_CONTEXT_WINDOWS`** makes seam-acp
-  compute a **200K compaction threshold** → premature compaction. Add it to the
-  table (§6). The `[1m]` suffix is retired and does NOT influence this — the table
-  is the single source of truth.
-- `default` → correct model + 1M window; `getClaudeContextWindow` special-cases it
-  to 1M (it does — verify §6).
+- An unverified model or credential scope has no proven catalog window. Record
+  only the scope §4 actually tested; do not borrow another backend's capacity.
+- `default` auto-rolls: re-verify its JSONL resolution and native window after
+  an update, rather than assuming either stayed the same.
 
 ---
 
@@ -434,7 +426,8 @@ The picker is `CLAUDE_MODELS` in `.env`, comma-separated `modelId:Label` pairs.
 
 Rules (enforced by §4 evidence, not by intuition):
 - **Bare full IDs only — no `[1m]` suffix.** The suffix is retired; window is a
-  property of the model, declared in `CLAUDE_CONTEXT_WINDOWS` (§6), not the string.
+  property verified for the selected backend and recorded in its scoped catalog
+  row (§6), not the string.
   Current picker: `claude-fable-5-1`, `claude-opus-5`, `claude-opus-4-8`,
   `claude-opus-4-7`, `claude-fable-5`, `claude-sonnet-5`, and
   `claude-haiku-5-5`, plus the
@@ -451,7 +444,7 @@ Rules (enforced by §4 evidence, not by intuition):
   are native 1M, so context-window labels are intentionally omitted.
 
 After editing `.env`, **re-run §4** for every entry you added or changed. Then
-update the compaction table if needed (§6) and deploy:
+record the verified scoped catalog row (§6/§13) and deploy:
 ```bash
 npm run redeploy
 ```
@@ -461,36 +454,26 @@ DB (§9).
 
 ---
 
-## 6. Verify the compaction threshold (the silent trap)
+## 6. Verify scoped capacity and native compaction
 
-`getClaudeContextWindow(modelId)` in `packages/adapters/src/profiles/claude.ts` decides the
-window used to compute the auto-compaction threshold (`newSessionMeta`), and — via
-`withClaudeContextLimits` — the `contextLimit` stamped on every picker entry (the
-orchestrator's `staticModels[].contextLimit → modelContextFloor` seed). If it
-returns 200K for a model that's actually 1M, Claude Code compacts at
-`0.8 × 200K = 160K` and throws away 840K of usable context. (The agent also
-reports the true window at runtime via `UsageUpdate.size`, which refines the
-display once a turn completes — but the compaction threshold is computed up front
-from this table, so the table must be right.)
+For each picker entry, use §4 JSONL model/effort, ACP usage sizes and §4a raw
+`/context` to verify the native window. Record one `contextWindow` in the
+matching `CLAUDE_VERIFIED_OVERLAY` row (§13), with wrapper/SDK versions, host,
+credential scope and evidence provenance. API-backed catalogs may supply their
+own binding-scoped capacity; do not copy default-account evidence into them.
 
-The window is resolved by an **exact-match table** (`CLAUDE_CONTEXT_WINDOWS`) and
-a `default` → 1M special case. Unknown models conservatively fall back to 200K.
-For **every** model in `CLAUDE_MODELS`, confirm `getClaudeContextWindow`
-returns the same window §4 proved — call the real exported function so the check
-can't drift from the implementation:
+Check the catalog published for the actual agent and host, not a bare model-id
+lookup. A matching ACP observation (agent, model, host, ACP session and requested
+tier) takes precedence over the catalog. If neither supplies capacity, the
+status card shows `unknown`; that does not prevent an ordinary turn. JSONL
+`getUsage` supplies actual model and token counts only. Legacy manifest limits
+are retained only when explicitly supplied, never inferred from a model name.
 
-```bash
-node -e '
-require("tsx/cjs");
-const { getClaudeContextWindow } = require("./packages/adapters/src/profiles/claude.ts");
-for (const m of ["default","claude-fable-5-1","claude-opus-5","claude-opus-4-8","claude-opus-4-7","claude-fable-5","claude-sonnet-5"]) {
-  console.log(m.padEnd(24), "→ compaction window:", getClaudeContextWindow(m));
-}
-' 2>/dev/null || echo "(no tsx loader? import from the built dist/ instead, or read CLAUDE_CONTEXT_WINDOWS directly)"
-```
-
-Each line must equal the §4 `window`. If a 1M model shows 200K here, **add it to
-the `CLAUDE_CONTEXT_WINDOWS` table** in `claude.ts`, rebuild, and re-run.
+Native Claude Code owns compaction. Seam sends no `compactionControl` or
+`contextTokenThreshold`; the former `CLAUDE_COMPACTION_TOKEN_THRESHOLD` setting
+is removed. Verify new and resumed native launches carry no compaction override,
+while JSONL effort and thinking behavior remain as verified in §11/§12. There
+is no second window table or Seam percentage threshold to synchronize.
 
 ---
 
@@ -613,7 +596,8 @@ A model-management change is complete only when:
 - [ ] §4 probe shows every picker entry resolves to the intended API model +
       window AND `set_config_option` was NOT rejected (account caveat, §5)
 - [ ] §4a raw-CLI `/context` cross-check agrees with every window claim
-- [ ] §6 confirms the compaction window matches for every entry
+- [ ] §6 records the proven window in one scoped catalog row per entry; fresh
+      and resumed cards use matching ACP budgets, with no native compaction override
 - [ ] §7 a new session shows the correct resolved model on the card AND in JSONL
 - [ ] §8 a resumed session keeps its model across a runtime restart
 - [ ] §9 DB audited; no session points at a broken/removed model; no post-deploy revert
@@ -637,7 +621,7 @@ configuration is applied identically to new and resumed sessions.
 `_meta.claudeCode.options.effort` at `session/new`. The wrapper spreads
 `sessionMeta.claudeCode.options` straight into the SDK query `Options`, and the
 SDK has an `effort` field. seam-acp builds
-this in `claude.ts` `newSessionMeta(model, effort)`, alongside `compactionControl`.
+this in `claude.ts` `newSessionMeta(model, effort)`.
 The value is threaded from `cfg.reasoningEffort` through `session-router` →
 `AgentRuntime.newSession`/`loadSession` → `newSessionMeta`. `/seam effort` saves
 it and invalidates the runtime so the next turn rebuilds the session with the new
@@ -833,9 +817,9 @@ The live list is therefore the operational base, and `CLAUDE_VERIFIED_OVERLAY`
   as `sonnet`, and publishes it under the alias's name. That bug was caught live
   during #232; the regression test is `test/claude-live-catalog.test.ts`.)
 - It **never infers** identity, context window, or effort from a label, a
-  display name, an id substring, or a model's self-report. Windows come from
-  `CLAUDE_CONTEXT_WINDOWS` (§6) alone; an unverified live model publishes a
-  **null** window rather than a guess.
+  display name, an id substring, or a model's self-report. Verified overlay
+  windows come from the scope-matched row's `contextWindow` (§6); an unverified
+  live model publishes a **null** window rather than a guess.
 - When ACP echoes an alias back unresolved (`default` → `default`), the row does
   **not** manufacture a resolution. It quotes the latest verified resolution with
   full provenance, or states plainly that the resolution is unverified.
@@ -858,7 +842,7 @@ the wrapper advertises. Read `provenance` on every row.
 Do this only deliberately; **never** as part of a refresh.
 
 1. Run §4 (JSONL ground truth) and §4a (raw-CLI `/context`) for the model.
-2. Confirm §6 agrees for its window.
+2. Record the proven window once in that scoped catalog row (§6).
 3. Confirm §11 for the effort levels actually applied.
 4. Edit `CLAUDE_VERIFIED_OVERLAY` and update that entry's `verifiedOn`,
    `wrapperVersion`, `claudeCodeVersion`, `credentialScope`, `resolvedModel`,

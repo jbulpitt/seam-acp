@@ -216,7 +216,6 @@ export interface AgentAdapter {
   /** Supported, opt-in SDK feed. Absent is explicitly unknown, never rejection. */
   readonly submissionSignals?: "claude_sdk";
   readonly claudeSessionOptions?: {
-    compactionTokenThreshold?: number;
     thinkingDisplay?: "summarized" | "omitted";
   };
 

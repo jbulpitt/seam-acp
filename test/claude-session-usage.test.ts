@@ -33,7 +33,7 @@ describe("Claude usage belongs to the requested session", () => {
   it("returns no side-channel evidence when its JSONL is missing beside a newer concurrent session", async () => {
     writeUsage("concurrent", 999, 200);
     expect(await manager().getUsage!(cwd, "missing-own-session", Date.parse("2026-10-08T11:00:00Z")))
-      .toEqual({ model: null, totalUsed: 0, contextLimit: 200_000 });
+      .toEqual({ model: null, totalUsed: 0 });
   });
 
   it("reads its own older file rather than the newest concurrent session", async () => {

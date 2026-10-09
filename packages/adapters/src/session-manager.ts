@@ -30,8 +30,8 @@ export interface ContextUsage {
   model: string | null;
   /** Total tokens currently in the context window. */
   totalUsed: number;
-  /** Context window size for the active model. */
-  contextLimit: number;
+  /** Measured context capacity, when the side channel supplies it. */
+  contextLimit?: number;
   /** Omitted for inferred/catalog limits; only telemetry is eligible for persistence. */
   contextLimitSource?: "observed";
 }

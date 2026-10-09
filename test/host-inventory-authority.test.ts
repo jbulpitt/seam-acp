@@ -88,12 +88,11 @@ describe("the bridge is authoritative on every host", () => {
       modelCatalog: { lookup: () => ({ snapshot: null }) } as any,
       defaultAgentId: "claude", defaultModel: metadata.defaultModel,
       profileMetadata: () => metadata, profileCatalog: () => catalog,
-      claudeSessionOptions: { thinkingDisplay: "summarized", compactionTokenThreshold: 0.8 },
+      claudeSessionOptions: { thinkingDisplay: "summarized" },
     });
     expect(router.getProfile("claude", location)!.newSessionMeta!(metadata.defaultModel, "high"))
       .toMatchObject({ claudeCode: { options: {
         effort: "high", thinking: { type: "adaptive", display: "summarized" },
-        compactionControl: { enabled: true, contextTokenThreshold: 800_000 },
       } } });
   });
 
@@ -118,7 +117,7 @@ describe("the bridge is authoritative on every host", () => {
           scope: () => ({ fingerprint: "f".repeat(64), provider: "fixture" }),
           fetch: async () => { throw new Error("unused catalog fetch"); },
         }),
-        claudeSessionOptions: { thinkingDisplay: "summarized", compactionTokenThreshold: 0.8 },
+        claudeSessionOptions: { thinkingDisplay: "summarized" },
       });
       expect(router.listProfiles(location).map(profile => profile.id)).toEqual(["claude", "copilot"]);
       const claude = router.getProfile("claude", location)!;
@@ -126,7 +125,6 @@ describe("the bridge is authoritative on every host", () => {
         claudeCode: {
           options: {
             effort: "high", thinking: { type: "adaptive", display: "summarized" },
-            compactionControl: { enabled: true, contextTokenThreshold: 800_000 },
           },
           emitRawSDKMessages: [{ type: "command_lifecycle" }, { type: "stream_event" }],
         },

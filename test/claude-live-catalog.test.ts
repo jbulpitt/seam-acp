@@ -25,7 +25,6 @@ import {
   type ClaudeProbedModel,
   claudeCredentialScope,
   overlayForCredentialScope,
-  lookupClaudeNativeContextWindow,
 } from "@seam/adapters";
 import { validateCandidate } from "../packages/core/src/core/model-catalog/service.js";
 
@@ -724,14 +723,12 @@ describe("#232 overlay evidence is scoped to the credential set that proved it",
     const onDefault = mergeClaudeCatalogModels({
       probe: liveProbe(),
       overlay: CLAUDE_VERIFIED_OVERLAY,
-      nativeContextWindow: lookupClaudeNativeContextWindow,
       effortMechanism: "meta",
       credentialScope: "default",
     });
     const onConfigured = mergeClaudeCatalogModels({
       probe: liveProbe(),
       overlay: CLAUDE_VERIFIED_OVERLAY,
-      nativeContextWindow: lookupClaudeNativeContextWindow,
       effortMechanism: "meta",
       credentialScope: "configured",
     });

@@ -5,7 +5,7 @@ import type {
   RemoteRecoverySnapshot,
   RemoteRung1Policy,
 } from "@seam/adapters";
-import { isRemoteRung1Policy, classifyCodexError, providerRetryBackoff, PROVIDER_RETRY_WINDOW_MS } from "@seam/adapters";
+import { isRemoteRung1Policy, classifyClaudeError, classifyCodexError, providerRetryBackoff, PROVIDER_RETRY_WINDOW_MS } from "@seam/adapters";
 import { createRung1Recovery } from "../packages/bridge/src/rung1-recovery.js";
 import { DEFAULT_REMOTE_RUNG1_POLICY } from "../packages/core/src/core/remote-spawn.js";
 
@@ -20,15 +20,16 @@ function line(value: unknown): string {
   return `${JSON.stringify(value)}\n`;
 }
 
-function harness(opts: { kind?: AdapterErrorKind; policy?: RemoteRung1Policy; codex?: boolean; clock?: () => number } = {}) {
+function harness(opts: { kind?: AdapterErrorKind; policy?: RemoteRung1Policy; codex?: boolean; claude?: boolean; clock?: () => number } = {}) {
   const writes: string[] = [];
   const snapshots: RemoteRecoverySnapshot[] = [];
   const results: RemoteRecoveryResult[] = [];
   const output: string[] = [];
   const recovery = createRung1Recovery({
     policyFor: () => opts.policy ?? policy,
-    agentId: opts.codex ? "codex" : undefined,
-    classify: (_slot, error) => opts.codex ? classifyCodexError(error).errorKind : opts.kind ?? "timeout",
+    agentId: opts.codex ? "codex" : opts.claude ? "claude" : undefined,
+    classify: (_slot, error) => opts.codex ? classifyCodexError(error).errorKind
+      : opts.claude ? classifyClaudeError(error).errorKind : opts.kind ?? "timeout",
     write: (_slot, value) => { writes.push(value); return true; },
     publishSnapshot: (_slot, value) => snapshots.push(value),
     publishResult: (_slot, value) => results.push(value),
@@ -236,6 +237,17 @@ describe("#467 bridge-owned rung 1", () => {
     expect(h.recovery.snapshot(4)).toBeUndefined();
     expect(h.recovery.terminalResult(4)).toBeUndefined();
     expect(h.writes).toEqual([]);
+  });
+
+  it("hands a Claude Authentication required rejection back without retrying", () => {
+    // Production 2026-10-08, claude@plex-server: this shape was retried at 2s/5s/10s, then failed.
+    const h = harness({ claude: true, policy: DEFAULT_REMOTE_RUNG1_POLICY });
+    sendCodex(h);
+    const decision = h.recovery.observeOutput(4, line({ id: 17, error: { code: -32000, message: "Authentication required" } }));
+    expect(decision.forward).not.toBeNull();
+    expect(h.writes).toEqual([]);
+    expect(h.recovery.terminalResult(4)).toMatchObject({ status: "failed", errorKind: "auth_required", error: "Authentication required" });
+    expect(h.recovery.disarm(4, "provider-submission")).toBe(true);
   });
 
   it.each(["auth_expired", "quota_exhausted", "protocol_error"] as const)("does not disarm another terminal failure: %s", kind => {

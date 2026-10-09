@@ -22,7 +22,7 @@ function fixture(root: string, failing: boolean, staticModels = false) {
     },
   });
   const profile = makeAgyProfile({
-    runtime: ordinary.runtime, dataDir: root, defaultModel: "Fixture Native Model",
+    runtime: ordinary.runtime, dataDir: root, defaultModel: staticModels ? modelId : "Fixture Native Model",
     initialSettingsFile: path.join(root, "settings.json"), exposeGlobalStaging: false,
     ...(staticModels ? { staticModels: [{ modelId, name: "Fixture Native Model" }] } : {}),
   });

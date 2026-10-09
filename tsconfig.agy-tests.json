@@ -9,6 +9,7 @@
     "test/agy-cutover.test.ts",
     "test/agy-identity-migration.test.ts",
     "test/agy-catalog-identity-migration.test.ts",
+    "test/agy-catalog-failure-cause.test.ts",
     "test/agy-image-inspector.test.ts",
     "test/agy-native-capability-contract.test.ts",
     "test/agy-native-translation.test.ts",

@@ -291,6 +291,7 @@ describe.sequential("R5 native production lifecycle", () => {
       const persisted = store.getRefreshStatus("agy@local");
       expect(persisted?.error).toBe(result.error);
       expect(result.error).toContain("exited_early");
+      expect(result.error).toContain("private diagnostic password=[redacted]");
       for (const exposed of [result.error, persisted?.error]) {
         expect(exposed).not.toContain("synthetic-password");
         expect(exposed).not.toContain(root);
@@ -299,7 +300,7 @@ describe.sequential("R5 native production lifecycle", () => {
     } finally { service.stop(); store.close(); ordinary.cleanup(); fs.rmSync(root, { recursive: true, force: true }); }
   }, 15_000);
 
-  it("#481 closes prompt-free stdin and preserves only auth_required through the real catalog consumer", async () => {
+  it("closes prompt-free stdin and preserves the redacted auth cause through the catalog consumer", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "seam-agy-auth-probe-"));
     const invocationLog = path.join(root, "invocations");
     const ordinary = createOrdinaryAgyFixture({
@@ -346,9 +347,7 @@ describe.sequential("R5 native production lifecycle", () => {
 
       const persisted = store.getRefreshStatus("agy@local");
       expect(persisted?.error).toBe(result.error);
-      // `result.error` is what the Discord catalog card renders; the caught
-      // error is what the real logger serializes. Both stay generic while the
-      // closed enum survives in `data.errorKind` for the resolver.
+      // Check the cause on the card, durable row and logger, not only its kind.
       const caughtRecord = caught as Error & { code?: unknown; detail?: unknown; data?: unknown };
       const exposed = JSON.stringify({
         result: result.error,
@@ -362,6 +361,7 @@ describe.sequential("R5 native production lifecycle", () => {
         consoleErrors,
       });
       expect(exposed).toContain("auth_required");
+      expect(exposed).toContain("Verification required. Please complete verification in your browser to continue.");
       for (const secret of [
         "synthetic-secret-token-481",
         "Authorization: Bearer",

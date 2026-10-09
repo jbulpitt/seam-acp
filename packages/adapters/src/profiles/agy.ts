@@ -710,7 +710,7 @@ export function makeAgyProfile(opts: {
       async fetch() {
         let models: ReadonlyArray<ManifestCatalogModel>;
         if (opts.staticModels && opts.staticModels.length > 0) {
-          const rows = await getCatalog(runtime).catch(catalogFallback);
+          const rows = await getCatalog(runtime);
           const byId = new Map(rows.map((row) => [row.modelId, row]));
           models = opts.staticModels.map((model) => {
             const row = byId.get(model.modelId);
@@ -1397,7 +1397,7 @@ class AgyAgent implements Agent {
     const mcpServers = params.mcpServers?.length ? params.mcpServers : this.defaultMcpServers;
     const mcpHome = await prepareAgyMcpHome(id, mcpServers);
     try {
-      const catalog = await getCatalog(this.runtime).catch(catalogFallback);
+      const catalog = await getCatalog(this.runtime).catch(catalogFailure);
       // An empty catalog cannot supply the exact canonical id required by --model;
       // deleting this guard would silently fall back to AGY's process-global default.
       if (catalog.length === 0) throw new Error("AGY model catalog is unavailable");
@@ -1446,7 +1446,7 @@ class AgyAgent implements Agent {
     const mcpServers = params.mcpServers?.length ? params.mcpServers : this.defaultMcpServers;
     const mcpHome = await prepareAgyMcpHome(params.sessionId, mcpServers);
     try {
-      const catalog = await getCatalog(this.runtime).catch(catalogFallback);
+      const catalog = await getCatalog(this.runtime).catch(catalogFailure);
       // Resume cannot validate or invoke a canonical session model without a catalog;
       // deleting this guard would reintroduce implicit global/list-order selection.
       if (catalog.length === 0) throw new Error("AGY model catalog is unavailable");
@@ -1570,7 +1570,7 @@ class AgyAgent implements Agent {
         details: `unknown session ${params.sessionId}`,
       }));
     }
-    const catalog = await getCatalog(this.runtime).catch(catalogFallback);
+    const catalog = await getCatalog(this.runtime).catch(catalogFailure);
     // An unavailable catalog cannot validate an exact model binding; deleting
     // this guard would turn a transient catalog failure into an arbitrary choice.
     if (catalog.length === 0) throw new Error("AGY model catalog is unavailable");
@@ -1710,7 +1710,7 @@ class AgyAgent implements Agent {
     const agyLogPath = await newSpawnLogPath();
     runRef.temporaryFiles.push(agyLogPath);
 
-    const catalog = await agyWait(getCatalog(this.runtime).catch(catalogFallback), runRef.abort.signal);
+    const catalog = await agyWait(getCatalog(this.runtime).catch(catalogFailure), runRef.abort.signal);
     const selected = selectAgyTurnModel({
       catalog,
       sessionModelId: sess.modelId,
@@ -2644,10 +2644,6 @@ async function runAgyProbe<T>(
       },
     });
   } catch (error) {
-    // Catalog failures keep their existing closed-enum persistence boundary.
-    if (!options.csrfToken) {
-      throw agyFailure(error instanceof ProbeError ? error.code : "protocol_error", agyProbeKind(error));
-    }
     // The prompt-free helper already redacts diagnostics and the child token.
     classifyAndAttach(error, classified(AGY_AGENT_ID, agyProbeKind(error)));
     throw error;
@@ -2703,10 +2699,12 @@ const sessionCatalogMetadata = new Map<string, {
   fingerprint: string;
 }>();
 
-function catalogFallback(error: unknown): AgyCatalogEntry[] {
-  // Missing metadata may fall back as before; a live leaked child may not.
-  if (error instanceof ProbeError && error.code === "not_reaped") throw error;
-  return [];
+function catalogFailure(error: unknown): never {
+  // Plain errors lose their message and classification over ACP.
+  if (error instanceof ProbeError && error.code !== "not_reaped") {
+    throw RequestError.internalError({ ...errorData(error), code: error.code }, error.message);
+  }
+  throw error;
 }
 
 async function getCatalogRows(runtime: AgyLaunchRuntime): Promise<AgyCatalogEntry[]> {

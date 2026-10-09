@@ -21,7 +21,10 @@ import {
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { writeRestartSentinel } from "./core/restart-sentinel.js";
-import { installBridgeUpdater } from "./core/bridge-updater.js";
+import { installBridgeUpdater, type BridgeUpdaterHandle } from "./core/bridge-updater.js";
+import { DEPLOY_REQUEST_FILE, DEPLOY_RESULT_FILE, deployFleetRows, readDeployFile, sameController,
+  verifyDeploy, writeDeployFile, type DeployRequest } from "./core/deploy-verification.js";
+import { bootObserver } from "./lib/boot-observation.js";
 import { loadConfig, loadBootChannelPresets, configDisabledFeatures, disabledFeatureReason, areHostToolsEnabled, isChannelLocked, resolveThreadLocation, resolveThreadTtsVoice, resolveThreadTtsPace, resolveThreadTtsStyle, adminParticipantOverlapIds } from "./config.js";
 import {
   hostEmoji,
@@ -112,6 +115,8 @@ import { BUILTIN_PLUGINS } from "./plugins/builtins.js";
 import { buildSeamCommand, buildSeamAdminCommand } from "./platforms/discord/commands.js";
 
 async function main(): Promise<void> {
+  const controllerInstanceId = randomUUID();
+  bootObserver.begin(path.resolve(process.env.DATA_DIR || "data"), readGitIdentity(), controllerInstanceId);
   const config = loadConfig();
   const plugins = new PluginHost(logger, {
     slash: [buildSeamCommand().toJSON(), buildSeamAdminCommand().toJSON()], mcp: KERNEL_MCP_TOOL_NAMES,
@@ -123,7 +128,6 @@ async function main(): Promise<void> {
       presets: { "presets.sqlite": path.join(config.DATA_DIR, "seam.db") } },
   });
   await plugins.loadBuiltins(BUILTIN_PLUGINS);
-  const controllerInstanceId = randomUUID();
   // Thread agent/model choices are saved in the presets file; with none
   // configured every switch was refused, so a fresh install keeps one here.
   if (!config.CHANNEL_PRESETS_FILE) {
@@ -185,6 +189,7 @@ async function main(): Promise<void> {
     | ((req: IncomingMessage, res: ServerResponse) => void | Promise<void>)
     | undefined;
   const health = startHealthServer(config.HEALTH_PORT, logger, {
+    boot: () => bootObserver.snapshot(),
     disabledFeatures: () => configDisabledFeatures(config),
     onMcp: (req, res) => {
       if (!mcpHttpHandle) {
@@ -297,7 +302,7 @@ async function main(): Promise<void> {
   let bridgeHub: BridgeHub | undefined;
   let readServiceStatus: ServiceStatusMcpView["read"] | undefined;
   let stopCatalogBridgeRefresh: (() => void) | undefined;
-  let stopBridgeUpdates: (() => void) | undefined;
+  let stopBridgeUpdates: BridgeUpdaterHandle | undefined;
   let stopPermissionBridgeRecovery: (() => void) | undefined;
   let stopCatalogEnrichmentRefresh: (() => void) | undefined;
 
@@ -663,6 +668,7 @@ async function main(): Promise<void> {
                   id: agentId,
                   installed: observed?.installed ?? false,
                   ready: false,
+                  withheld: true,
                   reason: "withheld by AGENT_LOCATION_DENY",
                 };
               }
@@ -728,9 +734,22 @@ async function main(): Promise<void> {
   const selfCanary = selfCanaryChannelId && bridgeHub
     ? new SelfCanaryRunner({
         dataDir: config.DATA_DIR,
+        defaultAgent: config.DEFAULT_AGENT,
+        agentCost: (host, agent, threadId) => {
+          const record = threadId ? store.getByChannel("discord", threadId) : null;
+          const model = record ? router.describeConfig(record).model.value
+            : modelCatalog.models({ agentId: agent, location: host }).find(model => model.default)?.id;
+          if (!model) return undefined;
+          const pricing = modelMetadataStore.getAll().find(row => row.agent_models.some(binding =>
+            binding.agent === agent && binding.id === model && (!binding.location || binding.location === host)))?.pricing;
+          return pricing?.blended_per_million ?? (pricing?.input_per_million != null && pricing.output_per_million != null
+            ? pricing.input_per_million + pricing.output_per_million : undefined);
+        },
         inventory: () => {
           const configured = [...new Set(bridgeHub!.listConnected().flatMap(bridge => [...bridge.agents.keys()]))].sort();
           return {
+            expectedHosts: [...new Set(["local",
+              ...stopBridgeUpdates!.targets.filter(target => !target.excluded).map(target => target.bridgeId)])],
             bridges: bridgeHub!.listConnected().map((bridge) => ({
               host: bridge.bridgeId,
               ready: bridgeHub!.isBridgeReady(bridge.bridgeId),
@@ -741,6 +760,7 @@ async function main(): Promise<void> {
                     id: agentId,
                     installed: observed?.installed ?? false,
                     ready: false,
+                    withheld: true,
                     reason: "withheld by AGENT_LOCATION_DENY",
                   };
                 }
@@ -1395,6 +1415,28 @@ async function main(): Promise<void> {
   }
 
   logger.info("seam-acp ready");
+  bootObserver.ready();
+
+  // A deploy request belongs to this sentinel restart, not ordinary boots.
+  void (async () => {
+    const request = await readDeployFile<DeployRequest>(config.DATA_DIR, DEPLOY_REQUEST_FILE);
+    const boot = bootObserver.snapshot()!;
+    if (!request || sameController(request.previous, boot.identity)) return;
+    const previous = await readDeployFile<CanaryRunResult>(config.DATA_DIR, DEPLOY_RESULT_FILE);
+    if (previous?.id === request.id) return;
+    const result = await verifyDeploy({ request, boot,
+      health: async () => {
+        const response = await fetch(`http://127.0.0.1:${config.HEALTH_PORT}/health`, { signal: AbortSignal.timeout(5000) });
+        return response.ok && (await response.json() as { status: string }).status === "ok";
+      },
+      fleet: () => deployFleetRows({ updater: stopBridgeUpdates!, get: id => bridgeHub!.get(id), commit: boot.commit }),
+      probe: () => {
+        if (!selfCanary) throw new Error("self canary is not configured on this deployment");
+        return selfCanary.run("self", { onePerHost: true });
+      },
+    });
+    await writeDeployFile(config.DATA_DIR, DEPLOY_RESULT_FILE, result);
+  })().catch(err => logger.error({ err }, "deploy verification failed"));
 
   // Operator-controlled, one-shot batch migration. Missing sentinel is a
   // silent no-op; malformed input is logged without taking the bot down.

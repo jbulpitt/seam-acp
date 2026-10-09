@@ -37,6 +37,8 @@ export interface CanaryRunResult {
   durability?: boolean;
   rows: CanaryRow[];
   cardError?: string;
+  jumpUrl?: string;
+  deploy?: { requestId: string; previous: { pid: number; started: string }; controller: { pid: number; started: string } };
 }
 
 export interface CanaryRunOptions {
@@ -92,6 +94,7 @@ const DURABILITY_AGENT = "codex";
 
 
 export interface SelfCanaryInventory {
+  expectedHosts?: string[];
   bridges: Array<{
     host: string;
     ready: boolean;
@@ -100,6 +103,7 @@ export interface SelfCanaryInventory {
       installed: boolean;
       ready: boolean;
       reason?: string;
+      withheld?: boolean;
     }>;
   }>;
 }
@@ -124,6 +128,8 @@ interface SelfCanaryRunnerOptions {
   now?: () => number;
   nonce?: () => string;
   providerStatus?: (agentId: string) => string | undefined;
+  defaultAgent?: string;
+  agentCost?: (host: string, agent: string, threadId?: string) => number | undefined;
 }
 
 const DURABILITY_CHECKS: ReadonlyArray<{ label: string; action: TestRestartAction; dispatch?: true }> = [
@@ -332,7 +338,7 @@ export class StagingCanaryRunner {
         rows.push({
           host: bridge.host,
           agent: agent.id,
-          status: "skipped",
+          status: "failed",
           durationMs: null,
           cause: "bridge not ready",
         });
@@ -342,7 +348,7 @@ export class StagingCanaryRunner {
         rows.push({
           host: bridge.host,
           agent: agent.id,
-          status: "skipped",
+          status: !agent.installed || agent.withheld ? "skipped" : "failed",
           durationMs: null,
           cause: agent.reason ?? (!agent.installed ? "not installed" : "not ready"),
         });
@@ -791,7 +797,7 @@ export class SelfCanaryRunner {
     this.makeNonce = options.nonce ?? (() => randomUUID().replaceAll("-", ""));
   }
 
-  async run(target: CanaryTarget = "self"): Promise<CanaryRunResult> {
+  async run(target: CanaryTarget = "self", options: { onePerHost?: boolean } = {}): Promise<CanaryRunResult> {
     if (target !== "self") throw new Error(`unsupported self canary target: ${target}`);
     const started = this.now();
     const inventory = this.options.inventory();
@@ -807,15 +813,45 @@ export class SelfCanaryRunner {
 
     const rows: CanaryRow[] = [];
     const runnable: Array<{ host: string; agent: string; threadId: string }> = [];
+    for (const host of inventory.expectedHosts ?? []) {
+      if (!inventory.bridges.some(bridge => bridge.host === host)) {
+        rows.push(this.failedRow(host, "inventory", null, "unverified: host missing from reconnect inventory"));
+      }
+    }
+    const selected = new Map<string, string>();
+    if (options.onePerHost) {
+      for (const bridge of inventory.bridges) {
+        const agents = bridge.agents.filter(agent => agent.installed && agent.ready && !agent.withheld);
+        const costs = new Map(agents.map(agent => [agent.id,
+          this.options.agentCost?.(bridge.host, agent.id, registry.get(threadKey(bridge.host, agent.id))?.threadId)]));
+        const pricesKnown = agents.every(agent => costs.get(agent.id) !== undefined);
+        agents.sort((a, b) => {
+          const left = costs.get(a.id), right = costs.get(b.id);
+          if (pricesKnown && left !== undefined && right !== undefined && left !== right) return left - right;
+          return Number(b.id === this.options.defaultAgent) - Number(a.id === this.options.defaultAgent) || a.id.localeCompare(b.id);
+        });
+        if (agents[0]) selected.set(bridge.host, agents[0].id);
+        else rows.push(this.failedRow(bridge.host, "inventory", null, "no ready agent available for a real deploy canary turn"));
+      }
+    }
     for (const { bridge, agent } of targets) {
+      if (!bridge.ready) {
+        rows.push(this.failedRow(bridge.host, agent.id, null, "unverified: bridge inventory is not ready"));
+        continue;
+      }
       if (!agent.installed || !agent.ready) {
         rows.push({
           host: bridge.host,
           agent: agent.id,
-          status: "skipped",
+          status: !agent.installed || agent.withheld ? "skipped" : "failed",
           durationMs: null,
           cause: agent.reason ?? (!agent.installed ? "not installed" : "not ready"),
         });
+        continue;
+      }
+      if (options.onePerHost && selected.get(bridge.host) !== agent.id) {
+        rows.push({ host: bridge.host, agent: agent.id, status: "skipped", durationMs: null,
+          cause: `deploy probes one agent per host (${selected.get(bridge.host)})` });
         continue;
       }
       try {
@@ -960,10 +996,15 @@ function targetLabel(target: CanaryTarget): string {
   return target === "self" ? "Self" : "Staging";
 }
 
+export function canaryIsGreen(result: CanaryRunResult): boolean {
+  return !result.cardError && !result.rows.some(row => row.status === "failed")
+    && result.rows.some(row => row.status === "passed");
+}
+
 export function formatCanaryResult(result: CanaryRunResult): string {
   const failed = result.rows.filter((row) => row.status === "failed").length;
   const skipped = result.rows.filter((row) => row.status === "skipped").length;
-  const state = failed > 0 ? "RED" : "GREEN";
+  const state = canaryIsGreen(result) ? "GREEN" : "RED";
   const rows = result.rows.map((row) => {
     const detail = row.cause ? ` — ${row.cause}` : "";
     const provider = row.providerNote ? ` Provider: ${row.providerNote}` : "";
@@ -971,9 +1012,11 @@ export function formatCanaryResult(result: CanaryRunResult): string {
     return `${rowIcon(row.status)} ${row.host}@${row.agent}${check} · ${formatDuration(row.durationMs)}${detail}${provider}`;
   });
   return [
-    `${targetLabel(result.target)} ${result.durability ? "durability" : "canary"}: ${state} (${failed} failed, ${skipped} skipped)`,
+    `${targetLabel(result.target)} ${result.deploy ? "deploy verification" : result.durability ? "durability" : "canary"}: ${state} (${failed} failed, ${skipped} skipped)`,
     `Revision: ${result.branch} @ ${result.commit.slice(0, 12)}`,
     ...rows,
+    ...(result.deploy ? [`Controller: ${result.deploy.previous.pid} (${result.deploy.previous.started}) → ${result.deploy.controller.pid} (${result.deploy.controller.started})`, `Deploy: ${result.deploy.requestId}`] : []),
+    ...(result.jumpUrl ? [`Result card: ${result.jumpUrl}`] : []),
     ...(result.cardError ? [`Result card error: ${result.cardError}`] : []),
   ].join("\n");
 }
@@ -1018,17 +1061,27 @@ function renderSkippedRows(rows: CanaryRow[]): StructuredLayout["blocks"] {
 }
 
 export function renderCanaryLayouts(result: CanaryRunResult): StructuredLayout[] {
-  const failed = result.rows.some((row) => row.status === "failed");
+  const failed = !canaryIsGreen(result);
   const passed = result.rows.filter((row) => row.status === "passed").length;
   const skipped = result.rows.filter((row) => row.status === "skipped").length;
-  const label = result.durability ? "durability" : "canary";
+  const label = result.deploy ? "deploy verification" : result.durability ? "durability" : "canary";
   const header = failed
     ? `❌ ${targetLabel(result.target)} ${label} — RED`
     : `✅ ${targetLabel(result.target)} ${label} — GREEN`;
-  const rows = [
+  let rows = [
     ...result.rows.filter((row) => row.status !== "skipped").map(renderCanaryRow),
     ...renderSkippedRows(result.rows.filter((row) => row.status === "skipped")),
   ];
+  if (result.deploy) {
+    const hosts = [...new Set(result.rows.map(row => row.host))];
+    rows = hosts.map(host => {
+      const content = result.rows.filter(row => row.host === host).map(row => {
+        const block = renderCanaryRow(row);
+        return block.kind === "text" ? block.content : "";
+      }).join("\n");
+      return { kind: "text" as const, content: content.length > 3800 ? content.slice(0, 3799) + "…" : content };
+    });
+  }
   const rowsPerPage = MAX_CANARY_CONTAINER_BLOCKS - CANARY_PAGE_FRAME_BLOCKS;
   const pageCount = Math.max(1, Math.ceil(rows.length / rowsPerPage));
   return Array.from({ length: pageCount }, (_, pageIndex) => {
@@ -1091,12 +1144,12 @@ async function postCanaryCards(options: CanaryCardOptions): Promise<MessageRef> 
 
 export async function publishCanaryCard(options: CanaryCardOptions): Promise<CanaryRunResult> {
   try {
-    await postCanaryCards(options);
-    return options.result;
+    const message = await postCanaryCards(options);
+    return { ...options.result, ...(message.jumpUrl ? { jumpUrl: message.jumpUrl } : {}) };
   } catch (error) {
     const cardError = error instanceof Error ? error.message : String(error);
     options.logger.error(
-      { error, canaryRunId: options.result.id },
+      { err: error, canaryRunId: options.result.id },
       "canary result card failed",
     );
     return { ...options.result, cardError };

@@ -19,7 +19,7 @@ async function fixture(bridges: SelfCanaryInventory["bridges"] = [
     { id: "first", installed: true, ready: true },
     { id: "second", installed: true, ready: true },
   ] },
-], expectedHosts: string[] = []) {
+], expectedHosts: string[] = [], selection: Pick<ConstructorParameters<typeof SelfCanaryRunner>[0], "defaultAgent" | "agentCost"> = {}) {
   const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "deploy-canary-"));
   directories.push(dataDir);
   const dispatched: string[] = [];
@@ -29,6 +29,7 @@ async function fixture(bridges: SelfCanaryInventory["bridges"] = [
     createThread: async (host, agent) => `${host}-${agent}`,
     threadExists: async () => true,
     nonce: () => "proof640",
+    ...selection,
     dispatchTurn: async thread => {
       dispatched.push(thread);
       return { output: "proof640", deliveredOutput: "proof640", toolSeen: true, statusCardDone: true };
@@ -57,6 +58,22 @@ describe("production deploy canary", () => {
       host: "missing", status: "failed", cause: expect.stringContaining("unverified"),
     }));
     expect(formatCanaryResult(result)).toContain("RED");
+  });
+
+  it("uses cached cheap-agent costs and falls back to the configured default without changing models", async () => {
+    const cheap = await fixture(undefined, [], { defaultAgent: "first", agentCost: (_host, agent) => agent === "second" ? 0 : 5 });
+    await cheap.runner.run("self", { onePerHost: true });
+    expect(cheap.dispatched).toEqual(["one-second", "two-second"]);
+    const defaults = await fixture(undefined, [], { defaultAgent: "second" });
+    await defaults.runner.run("self", { onePerHost: true });
+    expect(defaults.dispatched).toEqual(["one-second", "two-second"]);
+  });
+
+  it("does not silently pass a connected host with no ready agent", async () => {
+    const { runner, dispatched } = await fixture([{ host: "one", ready: true, agents: [] }]);
+    const result = await runner.run("self", { onePerHost: true });
+    expect(result.rows).toContainEqual(expect.objectContaining({ host: "one", status: "failed", cause: expect.stringContaining("no ready agent") }));
+    expect(dispatched).toEqual([]);
   });
 
   it("reports the real preparation failure instead of calling an installed agent disabled", async () => {

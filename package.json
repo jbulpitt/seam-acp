@@ -26,7 +26,7 @@
   "scripts": {
     "build": "npm run build -w @seam/adapters && npm run build -w @seam/core && npm run build -w @seam/bridge",
     "start": "node packages/core/dist/index.js",
-    "redeploy": "npm install --include=dev && npm run build && node -e \"require('fs').writeFileSync('data/.restart-pending', '')\" && echo 'Build complete \u2014 restart sentinel written'",
+    "redeploy": "npm install --include=dev && npm run build && node packages/core/dist/redeploy-cli.js",
     "redeploy:now": "npm run redeploy",
     "dev": "npm run build -w @seam/adapters && tsx watch packages/core/src/index.ts",
     "canary": "tsx packages/core/src/canary-cli.ts",

@@ -264,10 +264,10 @@ empirical process. Key non-negotiables from it:
 - **The `CLAUDE_MODELS` picker in `.env`** contains only JSONL-verified,
   native-1M entries. Don't add a model without running the §4 probe in the
   runbook.
-- **No `[1m]` suffix** — each model's native context window is declared in the
-  `CLAUDE_CONTEXT_WINDOWS` table (`packages/adapters/src/profiles/claude.ts`), which drives
-  the compaction threshold; the agent also reports the true window at runtime via
-  ACP `UsageUpdate.size`. (Getting the window wrong makes a 1M model compact at 200K.)
+- **No `[1m]` suffix** — verify and record the native window in one scoped
+  catalog row (runbook §6/§13). A matching ACP `UsageUpdate.size` takes precedence
+  over that catalog estimate; otherwise capacity is explicitly unknown. Native
+  Claude Code manages compaction; Seam does not set its threshold.
 - **Effort** is injected via `_meta.claudeCode.options.effort` (runbook §11).
   Verify the applied value in the assistant JSONL entry's top-level `effort`
   field. Valid levels are bounded by the bundled SDK's `EffortLevel` type

@@ -165,8 +165,9 @@ describe("Claude native compaction owns the launch", () => {
         Readable.toWeb(stdin) as ReadableStream<Uint8Array>));
     const config = loadConfig({ env: { DISCORD_BOT_TOKEN: "fixture", DISCORD_ALLOWED_USER_IDS: "123",
       REPOS_ROOT: dir } });
+    expect(config).not.toHaveProperty("CLAUDE_COMPACTION_TOKEN_THRESHOLD");
     const profile = controllerMetadataAdapter(makeClaudeProfile({ defaultModel: "default" }), undefined, undefined,
-      { thinkingDisplay: "summarized", compactionTokenThreshold: (config as any).CLAUDE_COMPACTION_TOKEN_THRESHOLD } as any);
+      { thinkingDisplay: "summarized" });
     const runtime = new AgentRuntime({ profile: profile as AgentProfile, logger: pino({ level: "silent" }),
       spawnFn: () => child as never });
     await runtime.start();

@@ -4921,18 +4921,17 @@ export class Orchestrator {
                 cwd, sessionId: record.acpSessionId || undefined,
                 newerThanMs: turnStartedAt || undefined,
               }, described.agent.value, { timeoutMs: 15_000 }) as import("@seam/adapters").ContextUsage | null);
-            // Trust seam-acp's per-profile model→limit table over whatever the
-            // bridge inferred from the JSONL — on proxied setups the JSONL
-            // model id can be remapped/wrong.
+            // JSONL supplies model and occupancy, not context capacity.
             const selectedModel = described.model.value;
             const modelEntry = this.modelCatalog.model(
               { agentId: described.agent.value, location: described.location.value },
               selectedModel
             );
-            const computedSize = modelEntry?.context.effective ?? usage?.contextLimit ?? 0;
+            const computedSize = modelEntry?.context.effective ?? 0;
             // Inferred transcript limits cannot override live ACP observations.
             // Only an explicitly measured side-channel limit is persisted.
             if (!acpUsageReceived && usage?.contextLimitSource === "observed" && contextIdentity &&
+                usage.contextLimit !== undefined &&
                 validContextUsage(usage.totalUsed, usage.contextLimit)) {
               observedContextBudget = this.recordContextBudget(
                 this.contextIdentityForModel(contextIdentity, usage.model ?? contextIdentity.model),
@@ -4940,7 +4939,7 @@ export class Orchestrator {
               );
             }
             const size = observedContextBudget?.promptBudget ?? computedSize;
-            if (usage && usage.totalUsed > 0 && size > 0) {
+            if (usage && usage.totalUsed > 0) {
               status.contextUsedHighWater = usage.totalUsed;
               status.contextWindowSize = size;
               status.context = formatContextUsage(usage.totalUsed, size);

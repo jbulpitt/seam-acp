@@ -343,7 +343,6 @@ async function main(): Promise<void> {
     modelCatalog,
     claudeSessionOptions: {
       thinkingDisplay: config.CLAUDE_THINKING_DISPLAY,
-      compactionTokenThreshold: config.CLAUDE_COMPACTION_TOKEN_THRESHOLD,
     },
     profileMetadata: (id, location) => bridgeHub?.get(location)?.agents.get(id)?.metadata,
     profileIds: location => bridgeHub?.installedAgentsByHost().get(location)

@@ -256,11 +256,6 @@ const Schema = z.object({
    */
   CLAUDE_THINKING_DISPLAY: z.enum(["summarized", "omitted"]).default("summarized"),
   /**
-   * Context token threshold to trigger compaction. Set to 0 to disable.
-   * If <= 1.0, treated as a fraction of the model's context window.
-   */
-  CLAUDE_COMPACTION_TOKEN_THRESHOLD: z.coerce.number().min(0).default(0.8),
-  /**
    * Context-usage fraction (0–1) at which agy auto-compacts. agy has no
    * built-in auto-compaction, so seam-acp watches its `usage_update` events
    * and runs the same /compact flow at end-of-turn once usage crosses this.

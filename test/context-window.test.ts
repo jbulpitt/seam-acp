@@ -8,7 +8,6 @@ const observed = (agentId: string, model: string, size: number) => ({
     totalWindow: null, outputAllocation: null, observedTier: null, source: "acp-usage",
     atUtc: "2026-09-11T00:00:00Z", previousPromptBudget: null } satisfies ContextBudgetObservation,
 });
-import { lookupClaudeNativeContextWindow } from "@seam/adapters";
 import {
   GROK_STATIC_MODELS,
   OLLAMA_CLOUD_STATIC_MODELS,
@@ -36,19 +35,6 @@ describe("enrichModelListWithKnownLimits", () => {
   it("does not invent a limit from the cosmetic label of an unknown id", () => {
     const override = [{ modelId: "mystery-999", name: "Mystery (999k)" }];
     expect(enrichModelListWithKnownLimits(override, GROK_STATIC_MODELS)).toEqual(override);
-  });
-});
-
-describe("lookupClaudeNativeContextWindow", () => {
-  it("does not apply the generic 200K fallback", () => {
-    expect(lookupClaudeNativeContextWindow("claude-haiku-4-5")).toBeUndefined();
-    expect(lookupClaudeNativeContextWindow("not-a-model")).toBeUndefined();
-  });
-
-  it("resolves default and dotted canonical aliases", () => {
-    expect(lookupClaudeNativeContextWindow("default")).toBe(1_000_000);
-    expect(lookupClaudeNativeContextWindow("claude-opus-4.8")).toBe(1_000_000);
-    expect(lookupClaudeNativeContextWindow("claude-opus-4-8")).toBe(1_000_000);
   });
 });
 

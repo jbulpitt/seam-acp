@@ -113,6 +113,7 @@ export function formatOriginSource(origin: PanelOrigin | undefined): string {
 /** Format a context-window usage line, e.g. "128k / 1m (13%)". Shared by the
  *  live user-turn panel and the dispatched-turn panel so both read identically. */
 export function formatContextUsage(used: number, size: number): string {
+  if (size <= 0) return `${fmtTokens(used)} / unknown`;
   const pct = Math.round((used / size) * 100);
   return `${fmtTokens(used)} / ${fmtTokens(size)} (${pct}%)`;
 }

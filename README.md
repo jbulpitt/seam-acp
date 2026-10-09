@@ -330,8 +330,8 @@ Because of this:
 - On the current `claude-agent-acp` 0.73.0 / ACP SDK 1.4.0 stack, no local patch is needed:
   model selection goes through `setSessionConfigOption`, which exact-matches full
   canonical `claude-*` IDs against the advertised list before the fuzzy resolver.
-  Native context windows are declared in `packages/adapters/src/profiles/claude.ts`
-  (`CLAUDE_CONTEXT_WINDOWS`) — no `[1m]` suffix.
+  Native windows are recorded in the scoped catalog, with matching ACP usage
+  budgets taking precedence — no `[1m]` suffix. Native Claude Code manages compaction.
 - The status card shows the **resolved** API model id and the current reasoning
   effort on every turn, so a wrong-model regression is visible immediately.
 

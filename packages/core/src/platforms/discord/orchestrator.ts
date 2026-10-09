@@ -15215,15 +15215,23 @@ export class Orchestrator {
     let recoveryRuntime: AgentRuntime | undefined;
     let recoveryRecord: SessionRecord | undefined;
     try {
+      if (attempt.spec.session === "live") {
+        recoveryRecord = this.store.getByChannel(PLATFORM, attempt.spec.target) ?? undefined;
+        if (!recoveryRecord) throw new Error("the recovered thread session no longer exists");
+        const cached = this.router.getRuntime(recoveryRecord.id);
+        if (cached?.getSlot() === binding.slot && cached.getSessionInfo()?.sessionId === binding.acpSessionId) {
+          // Transfer this controller's failed invocation, not the bridge's work.
+          await cached.detach();
+          this.router.releaseRecoveryRuntime(recoveryRecord.id, cached);
+        }
+      }
       child = mux.adopt(binding.slot, {
         allowAppTraffic: attempt.spec.session === "live",
         ...(Number.isSafeInteger(snapshot.outputAckedThrough)
           ? { afterSeq: snapshot.outputAckedThrough }
           : {}),
       });
-      if (attempt.spec.session === "live") {
-        recoveryRecord = this.store.getByChannel(PLATFORM, attempt.spec.target) ?? undefined;
-        if (!recoveryRecord) throw new Error("the recovered thread session no longer exists");
+      if (recoveryRecord) {
         recoveryRuntime = this.router.adoptRecoveryRuntime(
           recoveryRecord,
           child,

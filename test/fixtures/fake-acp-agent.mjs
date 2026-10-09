@@ -81,6 +81,15 @@ process.stdin.on("data", (chunk) => {
       send({ id: message.id, result: { configOptions: [] } });
     } else if (message.method === "session/prompt") {
       const text = message.params.prompt.map((part) => part.text ?? "").join("");
+      if (process.env.FAKE_AGENT_CONNECTION_FAILURE && fs.existsSync(process.env.FAKE_AGENT_CONNECTION_FAILURE)) {
+        fs.unlinkSync(process.env.FAKE_AGENT_CONNECTION_FAILURE);
+        const cause = 'Error running remote compact task: unexpected status 503 Service Unavailable: {"detail":"Unable to verify Daybreak Blue access. Please try again."}';
+        send({ id: message.id, error: { code: -32603, message: cause, data: { sessionFailure: {
+          id: "fixture-503", category: "connection", severity: "error", title: cause,
+          actions: ["retry", "new_session"],
+        } } } });
+        continue;
+      }
       if (process.env.FAKE_AGENT_AUTH_FAILURE && fs.existsSync(process.env.FAKE_AGENT_AUTH_FAILURE)) {
         fs.unlinkSync(process.env.FAKE_AGENT_AUTH_FAILURE);
         send({ id: message.id, error: { code: -32000, message: "Authentication required" } });

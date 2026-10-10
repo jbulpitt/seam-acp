@@ -8,6 +8,11 @@ import { loadConfig } from "../packages/core/src/config.js";
 import type { ChatAdapter, ChoiceCardPost } from "../packages/core/src/platforms/chat-adapter.js";
 import type { StructuredPanel } from "../packages/core/src/core/types.js";
 
+// Keep the queue's native promise timer on this file's fake clock.
+vi.mock("node:timers/promises", () => ({
+  setTimeout: (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms)),
+}));
+
 const channel = { platform: "google-chat", id: "dm.thread", parentId: "dm" };
 const panel: StructuredPanel = { color: 0, title: "Working", description: "## Result\n**Ready** [guide](https://example.com)",
   fields: [{ name: "Model", value: "`model-id`" }], footer: "*Running*" };

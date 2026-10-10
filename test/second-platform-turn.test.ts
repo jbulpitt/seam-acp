@@ -233,6 +233,8 @@ describe("a second chat platform runs a normal turn", () => {
     expect(h.store.turnAttempts.get(spec.id)).toMatchObject({ state: "completed", deliveryDone: true,
       deliveryAbandonedReason: null, deliveryUncertainReason: null });
     expect(historyRequest).toHaveBeenCalledTimes(2);
+    expect(new URL(historyRequest.mock.calls[1]![0].url).searchParams.get("filter"))
+      .toBe(`thread.name = spaces/AAA/threads/TTT AND createTime > ${JSON.stringify(new Date(Date.parse(receipt.deliveryStartedUtc!) - 5 * 60_000).toISOString())}`);
     expect(request).toHaveBeenCalledOnce();
     expect(request.mock.calls[0]).toMatchObject(["chat", { method: "POST", data: { text: "retained answer" } }]);
     expect(warn).not.toHaveBeenCalled();

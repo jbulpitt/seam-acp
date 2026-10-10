@@ -116,9 +116,11 @@ describe("Google Chat adapter history wiring", () => {
     h.historyRequest.mockRejectedValueOnce(Object.assign(new Error(message), { response: { status: 403, data: { error: {
       code: 403, status: "PERMISSION_DENIED", message, errors: [{ message, domain: "global", reason: "forbidden" }],
     } } } }));
-    await expect(h.adapter.findMessageByNonce(channel, "missing", 0)).resolves.toEqual({ status: "absent" });
+    const sinceMs = Date.parse("2026-10-10T11:55:00Z");
+    await expect(h.adapter.findMessageByNonce(channel, "missing", sinceMs)).resolves.toEqual({ status: "absent" });
     expect(h.historyRequest).toHaveBeenCalledTimes(2);
-    expect(new URL(h.historyRequest.mock.calls[1]![0].url).searchParams.has("filter")).toBe(false);
+    expect(new URL(h.historyRequest.mock.calls[1]![0].url).searchParams.get("filter"))
+      .toBe(`thread.name = ${thread} AND createTime > "2026-10-10T11:55:00.000Z"`);
   });
 
   it("fills omitted sender names from the same message's durable admission, without another Google call", async () => {

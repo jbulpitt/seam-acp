@@ -18,6 +18,7 @@ const space = "spaces/example";
 const thread = `${space}/threads/topic`;
 const target: GoogleChatHistoryTarget = { space, thread, spaceType: "SPACE" };
 const config = { credentialsFile: "/test/chat-service-account.json" };
+const sinceMs = Date.parse("2026-10-09T23:55:00Z");
 const dmCause = "DMs are not supported for methods requiring app authentication with administrator approval";
 const ambiguousMissingCause = "Permission denied to perform the requested action on the specified resource, or the resource doesn't exist.";
 
@@ -88,7 +89,7 @@ describe("Google Chat named-space history source", () => {
     const chat = history([]);
     const dm: GoogleChatHistoryTarget = { space, spaceType: "DIRECT_MESSAGE" };
     await expect(fetchMessagePage(chat.reader, dm, { limit: 100 })).resolves.toEqual({ status: "unsupported", cause: dmCause });
-    await expect(findMessageByNonce(chat.reader, dm, "delivery-1")).resolves.toEqual({ status: "unsupported", cause: dmCause });
+    await expect(findMessageByNonce(chat.reader, dm, "delivery-1", sinceMs)).resolves.toEqual({ status: "unsupported", cause: dmCause });
     expect(chat.request).not.toHaveBeenCalled();
   });
 
@@ -227,7 +228,7 @@ describe("Google Chat named-space delivery nonce lookup", () => {
     const chat = fakeChat(() => message(1, { sender: { name: "users/app", type: "BOT" } }));
     const clientId = "client-0b220df1969115139ffebb337981298d243a44f84dad5d20d7e7da5f";
     expect(googleChatClientMessageId("delivery-1")).toBe(clientId);
-    await expect(findMessageByNonce(chat.reader, target, "delivery-1")).resolves.toMatchObject({ status: "found", message: { messageId: message(1).name, threadName: thread } });
+    await expect(findMessageByNonce(chat.reader, target, "delivery-1", sinceMs)).resolves.toMatchObject({ status: "found", message: { messageId: message(1).name, threadName: thread } });
     expect(chat.request).toHaveBeenCalledTimes(1);
     expect(chat.request.mock.calls[0]![0]).toMatchObject({ method: "GET", retry: false });
     const url = new URL(String(chat.request.mock.calls[0]![0].url));
@@ -238,37 +239,47 @@ describe("Google Chat named-space delivery nonce lookup", () => {
   it("returns absent only when Google confirms the client ID is missing", async () => {
     const error = Object.assign(new Error("Google: message not found"), { response: { status: 404 } });
     const chat = fakeChat(() => { throw error; });
-    await expect(findMessageByNonce(chat.reader, target, "delivery-1")).resolves.toEqual({ status: "absent" });
+    await expect(findMessageByNonce(chat.reader, target, "delivery-1", sinceMs)).resolves.toEqual({ status: "absent" });
   });
 
-  it("proves absence after the observed ambiguous 403 by exhausting Space history, including empty native pages", async () => {
+  it("proves absence inside the receipt's time window, preserving its filter through empty native pages", async () => {
     const responses = [{ nextPageToken: "more" }, { messages: [message(1)] }];
     const chat = fakeChat(options => {
       const url = new URL(String(options.url));
       if (!url.pathname.endsWith("/messages")) throw ambiguousMissing();
       return responses.shift();
     });
-    await expect(findMessageByNonce(chat.reader, target, "delivery-1")).resolves.toEqual({ status: "absent" });
+    await expect(findMessageByNonce(chat.reader, target, "delivery-1", sinceMs)).resolves.toEqual({ status: "absent" });
     expect(chat.request).toHaveBeenCalledTimes(3);
     const queries = chat.request.mock.calls.slice(1).map(([options]) => Object.fromEntries(new URL(String(options.url)).searchParams));
     expect(queries).toEqual([
-      { pageSize: "100", orderBy: "createTime DESC" },
-      { pageSize: "100", orderBy: "createTime DESC", pageToken: "more" },
+      { pageSize: "100", orderBy: "createTime DESC", filter: `thread.name = ${thread} AND createTime > "2026-10-09T23:55:00.000Z"` },
+      { pageSize: "100", orderBy: "createTime DESC", filter: `thread.name = ${thread} AND createTime > "2026-10-09T23:55:00.000Z"`, pageToken: "more" },
     ]);
   });
 
   it("finds the sender client ID on a later native page instead of inferring absence from a 403", async () => {
-    const canonical = { ...message(2, { sender: { name: "users/app", type: "BOT" },
-      thread: { name: `${space}/threads/other` } }), clientAssignedMessageId: googleChatClientMessageId("delivery-1") };
+    const canonical = { ...message(2, { sender: { name: "users/app", type: "BOT" } }),
+      clientAssignedMessageId: googleChatClientMessageId("delivery-1") };
     const responses = [{ messages: [message(1)], nextPageToken: "later" }, { messages: [canonical] }];
     const chat = fakeChat(options => {
       if (!new URL(String(options.url)).pathname.endsWith("/messages")) throw ambiguousMissing();
       return responses.shift();
     });
-    await expect(findMessageByNonce(chat.reader, target, "delivery-1")).resolves.toMatchObject({
-      status: "found", message: { messageId: canonical.name, threadName: `${space}/threads/other` },
+    await expect(findMessageByNonce(chat.reader, target, "delivery-1", sinceMs)).resolves.toMatchObject({
+      status: "found", message: { messageId: canonical.name, threadName: thread },
     });
     expect(chat.request).toHaveBeenCalledTimes(3);
+  });
+
+  it("does not page older history or other threads to prove a missing receipt", async () => {
+    const old = Array.from({ length: 250 }, (_, index) => message(index, { createTime: "2026-10-09T12:00:00Z" }));
+    const chat = history([...old, message(300), message(301, { thread: { name: `${space}/threads/other` } })], 2);
+    vi.spyOn(chat.reader, "getMessage").mockRejectedValue(ambiguousMissing());
+    await expect(findMessageByNonce(chat.reader, target, "delivery-1", sinceMs)).resolves.toEqual({ status: "absent" });
+    expect(chat.request).toHaveBeenCalledOnce();
+    expect(new URL(String(chat.request.mock.calls[0]![0].url)).searchParams.get("filter"))
+      .toBe(`thread.name = ${thread} AND createTime > "2026-10-09T23:55:00.000Z"`);
   });
 
   it("preserves the real denial from an incomplete Space-history proof after an ambiguous GET", async () => {
@@ -279,7 +290,7 @@ describe("Google Chat named-space delivery nonce lookup", () => {
       if (chat.request.mock.calls.length === 2) return { messages: [message(1)], nextPageToken: "later" };
       throw denied;
     });
-    await expect(findMessageByNonce(chat.reader, target, "delivery-1")).rejects.toBe(denied);
+    await expect(findMessageByNonce(chat.reader, target, "delivery-1", sinceMs)).rejects.toBe(denied);
     expect(chat.request).toHaveBeenCalledTimes(3);
   });
 
@@ -293,19 +304,19 @@ describe("Google Chat named-space delivery nonce lookup", () => {
       errors: [{ message: body.message, domain: "global", reason: body.reason }],
     } } } });
     const chat = fakeChat(() => { throw denied; });
-    await expect(findMessageByNonce(chat.reader, target, "delivery-1")).rejects.toBe(denied);
+    await expect(findMessageByNonce(chat.reader, target, "delivery-1", sinceMs)).rejects.toBe(denied);
     expect(chat.request).toHaveBeenCalledOnce();
   });
 
   it.each([401, 403, 429, 500])("retains a Google %s denial or outage instead of treating it as absent", async (status) => {
     const error = Object.assign(new Error(`Google failure ${status}`), { response: { status }, cause: new Error("underlying cause") });
     const chat = fakeChat(() => { throw error; });
-    await expect(findMessageByNonce(chat.reader, target, "delivery-1")).rejects.toBe(error);
+    await expect(findMessageByNonce(chat.reader, target, "delivery-1", sinceMs)).rejects.toBe(error);
   });
 
   it("retains a transport failure with its nested cause", async () => {
     const error = new Error("Google request failed", { cause: new Error("socket closed") });
     const chat = fakeChat(() => { throw error; });
-    await expect(findMessageByNonce(chat.reader, target, "delivery-1")).rejects.toBe(error);
+    await expect(findMessageByNonce(chat.reader, target, "delivery-1", sinceMs)).rejects.toBe(error);
   });
 });

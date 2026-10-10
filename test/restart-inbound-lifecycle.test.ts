@@ -422,6 +422,9 @@ describe("#250 human turn production pipeline, synthetic transport only", () => 
 
     await restarted.recoverInterruptedTurns();
     await vi.waitFor(() => expect(attempts.get("inbound-1")?.state).toBe("completed"));
+    // Completion is recorded before delivery and the final card. The adoption
+    // holds this channel until both are done and its ownership is released.
+    await (restarted as any).queueOnChannel("worker", async () => {});
 
     expect(mux.adopt).toHaveBeenCalledWith(6, {
       allowAppTraffic: true,

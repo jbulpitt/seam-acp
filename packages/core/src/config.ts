@@ -38,6 +38,7 @@ const Schema = z.object({
   GOOGLE_CHAT_ALLOWED_SPACE_IDS: z.string().default("").transform(value =>
     new Set(value.split(",").map(id => id.trim()).filter(Boolean))),
   GOOGLE_CHAT_DEFAULT_CWD: z.string().optional(),
+  GOOGLE_CHAT_DEFAULT_LOCATION: z.string().default("local"),
   GOOGLE_CHAT_DRIVE_FOLDER_ID: z.string().optional(),
   GOOGLE_CHAT_DRIVE_SHARING_POLICY: z.string().optional(),
   GOOGLE_CHAT_DRIVE_DOMAIN: z.string().optional(),

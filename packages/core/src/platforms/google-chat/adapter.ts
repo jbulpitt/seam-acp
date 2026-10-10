@@ -17,7 +17,7 @@ import { parseGoogleChatCardClick, type GoogleChatCardClickEvent } from "./card-
 import { renderGoogleChatPanel, renderGoogleChatLayout, renderGoogleChatChoiceCard,
   renderGoogleChatElicitationCard, type GoogleChatCardsMessage } from "./card-renderer.js";
 import { parseGoogleChatCommand, type GoogleChatCommand, type GoogleChatCommandEvent } from "./commands.js";
-import { executeGoogleChatCommand, type GoogleChatCommandDeps } from "./command-actions.js";
+import { bindGoogleChatSession, executeGoogleChatCommand, type GoogleChatCommandDeps } from "./command-actions.js";
 import { hasAppMention, isSharedSpace, stripAppMentions,
   type GoogleChatAnnotation, type GoogleChatSpace, type GoogleChatSpaceLifecycle } from "./spaces.js";
 
@@ -57,8 +57,8 @@ function inboundId(name: string): string {
   return `gchat_${createHash("sha256").update(name).digest("base64url")}`;
 }
 
-type CommandDeps = Pick<GoogleChatCommandDeps, "router" | "runtimeTransition" | "cancelChannel"> & {
-  store: Pick<SessionStore, "admitInbound" | "getInbound" | "claimInbound" | "completeInboundCommand">;
+type CommandDeps = Pick<GoogleChatCommandDeps, "router" | "mutation" | "runtimeTransition" | "cancelChannel"> & {
+  store: Pick<SessionStore, "getByChannel" | "admitInbound" | "getInbound" | "claimInbound" | "completeInboundCommand">;
 };
 
 export class GoogleChatAdapter implements ChatAdapter {
@@ -77,7 +77,7 @@ export class GoogleChatAdapter implements ChatAdapter {
   private spaceLifecycle?: (event: GoogleChatSpaceLifecycle) => void | Promise<void>;
 
   constructor(private readonly opts: { api: GoogleApi; subscription: string; allowedUserIds: ReadonlySet<string>;
-    allowedSpaceIds?: ReadonlySet<string>; defaultCwd: string; logger: Logger;
+    allowedSpaceIds?: ReadonlySet<string>; defaultCwd: string; defaultLocation?: string; logger: Logger;
     writeIntervalMs?: number; driveUploader?: Pick<GoogleDriveUploader, "upload"> }) {
     this.writes = new SpaceWriteQueue({ logger: opts.logger, intervalMs: opts.writeIntervalMs });
     this.transport = new PubSubPullTransport({ ...opts,
@@ -175,7 +175,11 @@ export class GoogleChatAdapter implements ChatAdapter {
       cwd: this.opts.defaultCwd,
       onAdmitted: () => { admitted = true; acknowledge(); },
     };
-    void Promise.resolve().then(() => this.handler!(incoming)).then(() => {
+    void Promise.resolve().then(() => {
+      if (this.commandDeps) bindGoogleChatSession(incoming.channel, { ...this.commandDeps,
+        cwd: this.opts.defaultCwd, location: this.opts.defaultLocation }, { id: incoming.authorId, name: incoming.authorName ?? null });
+      return this.handler!(incoming);
+    }).then(() => {
       if (!admitted) refuse(new Error("Google Chat handler finished without durable admission"));
     }, err => {
       if (!admitted) refuse(err);
@@ -214,6 +218,7 @@ export class GoogleChatAdapter implements ChatAdapter {
           createThread: (parent, name) => this.createThread(parent, name,
             { nonce: `${messageId}-new`, enforceNonce: true }),
           cwd: this.opts.defaultCwd,
+          location: this.opts.defaultLocation,
           respond,
         });
         if (result && result.command === "cancel") {

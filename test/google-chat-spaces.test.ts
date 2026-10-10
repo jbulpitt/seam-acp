@@ -41,7 +41,8 @@ function setup(allowedSpaceIds: string[] = ["spaces/team"]) {
   const applyModelChange = vi.fn(async (_channel, _record, _arg, _actor, respond) => { await respond("Model switched."); });
   const cancelChannel = vi.fn(async () => ({ parked: null, cancelled: { cancelled: false, starting: false },
     outcome: "idle", queue: { state: "idle", queued: 0 } }));
-  adapter.setCommandDeps({ store, router: { ensureSessionRecord, describeConfig },
+  adapter.setCommandDeps({ store, router: { ensureSessionRecord, describeConfig, bindRecordLocation: () => "local" },
+    mutation: { readThreadPresetEntry: vi.fn(), applyThreadOverlay: vi.fn(() => ({ ok: true })) },
     runtimeTransition: { applyAgentChange, applyModelChange }, cancelChannel } as any);
   return { adapter, request, messages, deliver, store, record, ensureSessionRecord, applyAgentChange, applyModelChange, cancelChannel };
 }

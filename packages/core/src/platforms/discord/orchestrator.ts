@@ -7914,7 +7914,7 @@ export class Orchestrator {
    * clear uses this so it does not wipe a row we are about to replace.
    */
   private wouldParkForOfflineBridge(msg: IncomingMessage): boolean {
-    if (!msg.raw) return false;
+    if (msg.channel.platform !== PLATFORM || !msg.raw) return false;
     if (!this.bridgeHub) return false;
     const location = resolveThreadLocation(this.config, msg.channel.id);
     if (this.bridgeHub.isBridgeReady(location)) return false;

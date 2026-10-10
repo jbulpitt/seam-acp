@@ -11,7 +11,7 @@ export interface GoogleChatAnnotation {
   startIndex?: number;
   length?: number;
   userMention?: { type?: string; user?: { name?: string; type?: string } };
-  slashCommand?: { commandId?: string | number; type?: string };
+  slashCommand?: { commandId?: string | number; type?: string; bot?: { name?: string } };
 }
 
 export interface GoogleChatSpaceLifecycle {
@@ -32,9 +32,15 @@ export function hasAppMention(annotations: GoogleChatAnnotation[] = []): boolean
   return annotations.some(appMention);
 }
 
+export function mentionsChatApp(annotations: GoogleChatAnnotation[] = [], appUser?: string): boolean {
+  return annotations.some(annotation => appMention(annotation) && annotation.userMention?.user?.name === appUser);
+}
+
 // Match Google's argumentText: remove annotated app mentions, not human mentions.
-export function stripAppMentions(text: string, annotations: GoogleChatAnnotation[] = []): string {
-  const spans = annotations.filter(appMention).sort((a, b) => (b.startIndex ?? 0) - (a.startIndex ?? 0));
+export function stripAppMentions(text: string, annotations: GoogleChatAnnotation[] = [], appUser?: string): string {
+  const spans = annotations.filter(annotation => appMention(annotation)
+    && (appUser === undefined || annotation.userMention?.user?.name === appUser))
+    .sort((a, b) => (b.startIndex ?? 0) - (a.startIndex ?? 0));
   for (const span of spans) {
     const start = span.startIndex ?? 0;
     text = text.slice(0, start) + text.slice(start + (span.length ?? 0));

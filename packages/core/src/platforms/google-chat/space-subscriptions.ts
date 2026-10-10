@@ -1,5 +1,6 @@
 import { GoogleAuth } from "google-auth-library";
 import { setTimeout as delay } from "node:timers/promises";
+import type { Logger } from "pino";
 
 export const GOOGLE_CHAT_MESSAGE_CREATED = "google.workspace.chat.message.v1.created";
 export const GOOGLE_CHAT_MESSAGE_BATCH_CREATED = "google.workspace.chat.message.v1.batchCreated";
@@ -92,6 +93,7 @@ export class GoogleChatSpaceSubscriptions {
     pubsubTopic: string;
     credentialsFile?: string;
     operationPollIntervalMs?: number;
+    logger?: Pick<Logger, "info">;
   }, api?: WorkspaceEventsRequestor) {
     if (api) this.api = api;
     else {
@@ -148,6 +150,7 @@ export class GoogleChatSpaceSubscriptions {
   }
 
   private async finish<T>(initial: WorkspaceOperation<T>, signal?: AbortSignal): Promise<T | undefined> {
+    this.opts.logger?.info({ operation: initial.name, done: initial.done }, "Google Chat Workspace subscription operation");
     let operation = initial;
     while (!operation.done) {
       await delay(this.opts.operationPollIntervalMs ?? 1000, undefined, { signal });

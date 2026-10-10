@@ -1,10 +1,11 @@
 import type { Logger } from "pino";
 import { setTimeout as delay } from "node:timers/promises";
 import type { GoogleApi } from "./api.js";
+import { parseGoogleChatWorkspaceMessages, type ParsedWorkspaceChatMessage, type WorkspacePubSubMessage } from "./workspace-message-event.js";
 
 export interface PubSubMessage {
   ackId?: string;
-  message?: { messageId?: string; data?: string };
+  message?: WorkspacePubSubMessage;
 }
 
 export class PubSubPullTransport {
@@ -13,7 +14,9 @@ export class PubSubPullTransport {
   private readonly inFlight = new Map<string, Promise<void>>();
 
   constructor(private readonly opts: { api: GoogleApi; subscription: string;
-    receive: (event: unknown, signal?: AbortSignal, messageId?: string) => Promise<void>; logger: Logger }) {}
+    receive: (event: unknown, signal?: AbortSignal, messageId?: string) => Promise<void>;
+    receiveWorkspaceMessage?: (message: ParsedWorkspaceChatMessage, signal?: AbortSignal) => Promise<void>;
+    logger: Logger }) {}
 
   async start(): Promise<void> {
     if (this.loop) return;
@@ -32,9 +35,19 @@ export class PubSubPullTransport {
     const id = received.message.messageId ?? received.ackId;
     let admission = this.inFlight.get(id);
     if (!admission) {
-      // Buffer accepts missing padding and URL-safe base64 seen on the real subscription.
-      const event: unknown = JSON.parse(Buffer.from(received.message.data, "base64").toString("utf8"));
-      admission = this.opts.receive(event, signal, id);
+      if (received.message.attributes?.["ce-type"]) {
+        const messages = parseGoogleChatWorkspaceMessages(received.message);
+        admission = (async () => {
+          for (const message of messages) {
+            if (!this.opts.receiveWorkspaceMessage) throw new Error("Google Chat Workspace handler not installed");
+            await this.opts.receiveWorkspaceMessage(message, signal);
+          }
+        })();
+      } else {
+        // Buffer accepts missing padding and URL-safe base64 seen on the real subscription.
+        const event: unknown = JSON.parse(Buffer.from(received.message.data, "base64").toString("utf8"));
+        admission = this.opts.receive(event, signal, id);
+      }
       this.inFlight.set(id, admission);
     }
     try {

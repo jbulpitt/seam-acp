@@ -3,7 +3,7 @@ import { pino } from "pino";
 import { GoogleChatAdapter } from "../packages/core/src/platforms/google-chat/adapter.js";
 import type { IncomingMessage } from "../packages/core/src/platforms/chat-adapter.js";
 import { GOOGLE_CHAT_MESSAGE_BATCH_CREATED, GOOGLE_CHAT_MESSAGE_CREATED } from "../packages/core/src/platforms/google-chat/space-subscriptions.js";
-import { googleChatInboundMessageId, parseGoogleChatWorkspaceMessages,
+import { parseGoogleChatWorkspaceMessages,
   type WorkspacePubSubMessage } from "../packages/core/src/platforms/google-chat/workspace-message-event.js";
 
 const resource = { name: "spaces/SPACE/messages/Message_1", text: "Hello world", createTime: "2026-10-10T20:00:00.123Z",
@@ -19,20 +19,17 @@ function delivered(payload: unknown, type = GOOGLE_CHAT_MESSAGE_CREATED): Worksp
 }
 
 describe("Workspace Chat message CloudEvents", () => {
-  it("parses the documented Pub/Sub attributes and base64 resource payload into neutral inbound data", () => {
+  it("parses the documented Pub/Sub envelope without duplicating adapter identity or channel mapping", () => {
     const [parsed] = parseGoogleChatWorkspaceMessages(delivered({ message: resource }));
-    expect(parsed).toEqual({ kind: "message", resourceName: resource.name, messageId: googleChatInboundMessageId(resource.name),
+    expect(parsed).toEqual({ kind: "message", resourceName: resource.name,
       space: "spaces/SPACE", resource,
       cloudEvent: { id: "spaces/SPACE/spaceEvents/Event_1", type: GOOGLE_CHAT_MESSAGE_CREATED,
         source: "//workspaceevents.googleapis.com/subscriptions/one", time: "2026-10-10T20:00:01Z" },
-      incoming: { messageId: googleChatInboundMessageId(resource.name),
-        channel: { platform: "google-chat", id: "SPACE.Thread_1", parentId: "SPACE" }, authorId: "42", authorName: "Tester",
-        authorIsBot: false, text: "Hello world", attachments: [], raw: resource },
     });
     expect(parsed!.resource.annotations).toEqual(resource.annotations);
   });
 
-  it("matches the direct DM MESSAGE adapter's dedupe id and neutral message fields", async () => {
+  it("matches the direct DM MESSAGE adapter's dedupe id and neutral fields through adapter admission", async () => {
     const incoming: IncomingMessage[] = [];
     const adapter = new GoogleChatAdapter({ api: { request: async () => { throw new Error("no Google call expected"); } },
       subscription: "projects/example/subscriptions/chat-events", allowedUserIds: new Set(["users/42"]), defaultCwd: "/projects",
@@ -44,20 +41,22 @@ describe("Workspace Chat message CloudEvents", () => {
     const [parsed] = parseGoogleChatWorkspaceMessages(delivered({ message: dm }));
     expect(parsed!.kind).toBe("message");
     if (parsed!.kind !== "message") throw new Error("expected full message");
-    expect(parsed!.incoming).toMatchObject({ messageId: incoming[0]!.messageId, channel: incoming[0]!.channel,
+    await adapter.receiveWorkspaceMessage(parsed!);
+    expect(incoming).toHaveLength(2);
+    expect(incoming[1]).toMatchObject({ messageId: incoming[0]!.messageId, channel: incoming[0]!.channel,
       authorId: incoming[0]!.authorId, authorName: incoming[0]!.authorName, text: incoming[0]!.text });
   });
 
-  it("dedupes by the native message name, never the CloudEvent or Pub/Sub delivery id", () => {
+  it("retains the native resource identity, not the CloudEvent or Pub/Sub delivery id", () => {
     const first = delivered({ message: resource });
     const second = delivered({ message: resource });
     second.messageId = "different-delivery";
     second.attributes!["ce-id"] = "spaces/SPACE/spaceEvents/different-event";
     second.attributes!["ce-source"] = "//workspaceevents.googleapis.com/subscriptions/another";
     const [a] = parseGoogleChatWorkspaceMessages(first), [b] = parseGoogleChatWorkspaceMessages(second);
-    expect(a!.messageId).toBe(b!.messageId);
-    expect(a!.messageId).toMatch(/^gchat_[A-Za-z0-9_-]{43}$/);
-    expect(googleChatInboundMessageId("spaces/OTHER/messages/Message_1")).not.toBe(a!.messageId);
+    expect(a!.resourceName).toBe(b!.resourceName);
+    expect(a).not.toHaveProperty("messageId");
+    expect(a).not.toHaveProperty("incoming");
   });
 
   it("unpacks every message in the documented automatic batchCreated payload", () => {
@@ -65,14 +64,14 @@ describe("Workspace Chat message CloudEvents", () => {
     const parsed = parseGoogleChatWorkspaceMessages(delivered({ messages: [{ message: resource }, { message: second }] },
       GOOGLE_CHAT_MESSAGE_BATCH_CREATED));
     expect(parsed.map(item => item.resourceName)).toEqual([resource.name, second.name]);
-    expect(parsed[0]!.messageId).not.toBe(parsed[1]!.messageId);
+    expect(parsed[0]!.resourceName).not.toBe(parsed[1]!.resourceName);
     expect(parsed[0]!.cloudEvent.type).toBe(GOOGLE_CHAT_MESSAGE_BATCH_CREATED);
   });
 
   it("returns a hydration reference for a names-only payload, not an empty user prompt", () => {
     expect(parseGoogleChatWorkspaceMessages(delivered({ message: { name: resource.name } }))[0]).toMatchObject({
-      kind: "message-reference", resourceName: resource.name, space: "spaces/SPACE", messageId: googleChatInboundMessageId(resource.name),
-      missingFields: ["message.sender.name"],
+      kind: "message-reference", resourceName: resource.name, space: "spaces/SPACE",
+      missingFields: ["message.sender.name", "message.text"],
     });
     expect(parseGoogleChatWorkspaceMessages(delivered({ message: { name: resource.name } }))[0]).not.toHaveProperty("incoming");
   });
@@ -84,27 +83,26 @@ describe("Workspace Chat message CloudEvents", () => {
     });
   });
 
-  it("uses the native space-only channel when a message has no thread", () => {
+  it("retains absent native threading for the adapter to map", () => {
     const { thread: _thread, ...message } = resource;
-    expect(parseGoogleChatWorkspaceMessages(delivered({ message }))[0]).toMatchObject({ kind: "message",
-      incoming: { channel: { platform: "google-chat", id: "SPACE" } } });
+    expect(parseGoogleChatWorkspaceMessages(delivered({ message }))[0]).toMatchObject({ kind: "message", resource: message });
+    expect(parseGoogleChatWorkspaceMessages(delivered({ message }))[0]!.resource).not.toHaveProperty("thread");
   });
 
   it("retains bot identity and attachments without making adapter authorization decisions", () => {
-    const message = { ...resource, text: undefined, sender: { name: "users/bot", type: "BOT" }, attachment: [
+    const { text: _text, ...attachmentOnly } = resource;
+    const message = { ...attachmentOnly, sender: { name: "users/bot", type: "BOT" }, attachment: [
       { contentName: "report.txt", contentType: "text/plain", attachmentDataRef: { resourceName: "spaces/SPACE/messages/M/attachments/A" } },
     ] };
     const [parsed] = parseGoogleChatWorkspaceMessages(delivered({ message }));
-    expect(parsed).toMatchObject({ kind: "message", incoming: { authorId: "bot", authorIsBot: true, text: "", attachments: [
-      { filename: "report.txt", contentType: "text/plain", url: "spaces/SPACE/messages/M/attachments/A", size: 0, platform: "google-chat" },
-    ] } });
+    expect(parsed).toMatchObject({ kind: "message", resource: message });
   });
 
   it("accepts unpadded/url-safe base64 and preserves Unicode text exactly", () => {
     const text = "こんにちは 👋\n*not re-formatted* <users/42>";
     const delivery = delivered({ message: { ...resource, text } });
     delivery.data = Buffer.from(JSON.stringify({ message: { ...resource, text } })).toString("base64url");
-    expect(parseGoogleChatWorkspaceMessages(delivery)[0]).toMatchObject({ kind: "message", incoming: { text } });
+    expect(parseGoogleChatWorkspaceMessages(delivery)[0]).toMatchObject({ kind: "message", resource: { text } });
   });
 
   it.each([undefined, "google.workspace.chat.message.v1.updated", "google.workspace.chat.message.v1.deleted",

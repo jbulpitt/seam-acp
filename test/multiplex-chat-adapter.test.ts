@@ -1,0 +1,40 @@
+import { describe, expect, it, vi } from "vitest";
+
+function adapter(platform: string) {
+  let handle: any;
+  return { platform, start: vi.fn(async () => {}), stop: vi.fn(async () => {}),
+    sendMessage: vi.fn(async (channel: any, _text: string) => ({ channel, id: platform })),
+    editMessage: vi.fn(async (_ref: any, _text: string) => {}), onMessage: vi.fn((f: any) => { handle = f; }),
+    emit: async (msg: any) => handle(msg) };
+}
+
+describe("multi-adapter routing", () => {
+  it("starts both platforms, fans in messages, and routes writes by ChannelRef.platform", async () => {
+    const { multiplexChatAdapters } = await import("../packages/core/src/platforms/google-chat/multiplex.js");
+    const discord = adapter("discord"), chat = adapter("google-chat");
+    const mux = multiplexChatAdapters([discord, chat]);
+    const handle = vi.fn(); mux.onMessage(handle);
+    await mux.start();
+    const dc = { platform: "discord", id: "123" }, gc = { platform: "google-chat", id: "AAA.TTT" };
+    await discord.emit({ channel: dc }); await chat.emit({ channel: gc });
+    expect(handle.mock.calls.map(c => c[0].channel)).toEqual([dc, gc]);
+    await mux.sendMessage(dc, "discord unchanged");
+    const ref = await mux.sendMessage(gc, "chat"); await mux.editMessage(ref, "chat edit");
+    expect(discord.sendMessage).toHaveBeenCalledWith(dc, "discord unchanged");
+    expect(discord.editMessage).not.toHaveBeenCalled();
+    expect(chat.editMessage).toHaveBeenCalledWith(ref, "chat edit");
+    await mux.stop(); expect(discord.stop).toHaveBeenCalledOnce(); expect(chat.stop).toHaveBeenCalledOnce();
+  });
+
+  it("uses the text panel fallback only on a platform without rich panels", async () => {
+    const { multiplexChatAdapters } = await import("../packages/core/src/platforms/google-chat/multiplex.js");
+    const discord = Object.assign(adapter("discord"), { sendPanel: vi.fn(async (channel: any) => ({ channel, id: "panel" })) });
+    const chat = adapter("google-chat");
+    const mux = multiplexChatAdapters([discord, chat]);
+    const panel = { title: "Working", description: "doing work" };
+    await mux.sendPanel!({ platform: "discord", id: "123" }, panel);
+    await mux.sendPanel!({ platform: "google-chat", id: "AAA.TTT" }, panel);
+    expect(discord.sendPanel).toHaveBeenCalledOnce(); expect(discord.sendMessage).not.toHaveBeenCalled();
+    expect(chat.sendMessage.mock.calls[0]![1]).toContain("Working");
+  });
+});

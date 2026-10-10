@@ -127,6 +127,24 @@ function channelsUsed(adapter: ReturnType<typeof setup>["adapter"]) {
 }
 
 describe("a second chat platform runs a normal turn", () => {
+  it("signals committed admission before a long turn finishes, including a duplicate receipt", async () => {
+    const h = setup("test");
+    let finish!: () => void;
+    const held = new Promise<void>(resolve => { finish = resolve; });
+    h.runtime.prompt.mockImplementationOnce(async () => { await held; return { stopReason: "end_turn" }; });
+    const onAdmitted = vi.fn(() => expect(h.store.getInbound("chat_message_1")).not.toBeNull());
+    const msg = { messageId: "chat_message_1", channel: { platform: "test", id: "AAA.TTT", parentId: "AAA" },
+      authorId: "42", authorIsBot: false, text: "wait", raw: {}, onAdmitted };
+    const turn = h.run(msg);
+    try {
+      await vi.waitFor(() => expect(onAdmitted).toHaveBeenCalledOnce());
+      expect(h.store.getInbound("chat_message_1")).not.toBeNull();
+    } finally { finish(); await turn; }
+    await h.run(msg);
+    expect(onAdmitted).toHaveBeenCalledTimes(2);
+    expect(h.runtime.prompt).toHaveBeenCalledOnce();
+  });
+
   it("admits, answers and delivers on its own platform with adapter-read attachments", async () => {
     const attachmentUrl = "spaces/AAA/messages/BBB/attachments/CCC";
     const h = setup("test", new Map([[attachmentUrl, Buffer.from("hello from chat")]]));

@@ -100,6 +100,10 @@ export class GoogleChatAdapter implements ChatAdapter {
     const command = parseGoogleChatCommand(event);
     if (command) {
       if (!this.commandDeps) throw new Error("Google Chat command handlers not installed");
+      // Command invocations are private to the user and app.
+      const respond = async (channel: ChannelRef, text: string) => {
+        await this.sendText(channel, text, undefined, command.user.id);
+      };
       const result = await executeGoogleChatCommand({ ...command,
         user: { ...command.user, id: resourceId(command.user.id, "users") } }, {
         ...this.commandDeps,
@@ -107,7 +111,7 @@ export class GoogleChatAdapter implements ChatAdapter {
           : { platform: this.platform, id: resourceId(space, "spaces") },
         createThread: (parent, name) => this.createThread(parent, name),
         cwd: this.opts.defaultCwd,
-        respond: async (channel, text) => { await this.sendMessage(channel, text); },
+        respond,
       });
       if (result.command === "cancel") {
         const { outcome } = result;
@@ -120,7 +124,7 @@ export class GoogleChatAdapter implements ChatAdapter {
           : "No active turn.";
         else text = outcome.outcome === "unacknowledged"
           ? "Cancel requested, but not confirmed. Work may still be running." : "Cancel sent to the active turn.";
-        await this.sendMessage(result.channel, text);
+        await respond(result.channel, text);
       }
       return;
     }
@@ -176,7 +180,7 @@ export class GoogleChatAdapter implements ChatAdapter {
   private async postMessage(channel: ChannelRef, body: Record<string, unknown>, delivery?: DeliveryNonceOptions): Promise<MessageRef> {
     const { space, thread } = names(channel);
     const requestId = randomUUID();
-    const params = { requestId, ...(thread ? { messageReplyOption: "REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD" } : {}),
+    const params = { requestId, ...(thread ? { messageReplyOption: "REPLY_MESSAGE_OR_FAIL" } : {}),
       ...(delivery ? { messageId: clientId(delivery.nonce) } : {}) };
     const message = await this.writes.enqueue(space, async () => {
       try {

@@ -23,7 +23,7 @@ export interface GoogleChatCommandEvent {
   thread?: { name?: string };
   user?: { name?: string; displayName?: string };
   message?: {
-    argumentText?: string;
+    argumentText?: string | null;
     text?: string;
     thread?: { name?: string };
     slashCommand?: { commandId?: string | number };

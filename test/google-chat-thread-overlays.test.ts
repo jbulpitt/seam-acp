@@ -83,6 +83,21 @@ function fixture(channel = chat) {
 }
 
 describe("platform-aware persisted thread overlays", () => {
+  it("persists and reloads real agent/model changes for a flat shared Chat session", async () => {
+    const flat = { platform: "google-chat", id: "nk7nBqAAAAE", parentId: undefined } as any;
+    const h = fixture(flat);
+    const replies: string[] = [];
+    const respond = async (text: string) => { replies.push(text); };
+    expect((await h.runtime.applyAgentChange(flat, h.record(), "codex", actor, respond)).ok).toBe(true);
+    expect((await h.runtime.applyModelChange(flat, h.record(), "codex-reviewed", actor, respond)).ok).toBe(true);
+    const stored = JSON.parse(fs.readFileSync(h.file, "utf8"));
+    expect(stored.threads["google-chat:nk7nBqAAAAE"]).toMatchObject({ agent: { value: "codex" }, model: { value: "codex-reviewed" } });
+    expect(stored.threads["222222222222222222"]).toEqual(h.sibling);
+    const maps = buildChannelPresetMaps(h.file);
+    expect(maps.threadPresets.get(flat.id)?.model?.value).toBe("codex-reviewed");
+    expect(h.router.describeConfig(h.record()).model.value).toBe("codex-reviewed");
+  });
+
   it.each([[3, "agent", "claude"], [4, "model", "claude-default"]])
     ("bare command %s leaves real SQL, overlays and the warm runtime unchanged", async (commandId, command, current) => {
       const h = fixture();

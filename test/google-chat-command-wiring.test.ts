@@ -38,7 +38,10 @@ function setup(rejectPrivateRoot = false) {
   const record = { id: "google-chat:dm.thread", platform: "google-chat", channelRef: "dm.thread", parentRef: "dm",
     agentId: "claude", acpSessionId: "saved-session", configJson: "{}" };
   const ensureSessionRecord = vi.fn(() => record);
-  const describeConfig = vi.fn(() => ({ agent: { value: "claude" }, model: { value: "claude-reviewed" } }));
+  const describeConfig = vi.fn(() => ({ agent: { value: "claude" }, model: { value: "claude-reviewed" },
+    cwd: { value: "/projects/old" }, effort: { value: "low" }, location: { value: "remote" } }));
+  const applyRepoChange = vi.fn(async () => ({ ok: true, message: "Repo set. Session reset.", sessionReset: true, resetPending: false }));
+  const configure = vi.fn(async () => ({ ok: true, applied: { effort: "high" }, sessionReset: false, runtimeReloaded: false, warnings: [] }));
   const applyAgentChange = vi.fn(async (_ch, _record, _arg, _actor, respond) => {
     await respond("Switched agent, native outcome"); return { ok: true, message: "native" };
   });
@@ -49,15 +52,55 @@ function setup(rejectPrivateRoot = false) {
     outcome: "idle", queue: { state: "idle", queued: 0 } }));
   (adapter as any).setCommandDeps?.({ store, router: { ensureSessionRecord, describeConfig, bindRecordLocation: () => "local" },
     mutation: { readThreadPresetEntry: () => undefined, applyThreadOverlay: () => ({ ok: true }) },
-    runtimeTransition: { applyAgentChange, applyModelChange }, cancelChannel });
+    runtimeTransition: { applyAgentChange, applyModelChange, configure }, cancelChannel,
+    configPlan: { applyRepoChange, listRepos: async () => ["/projects/old", "/projects/new"] },
+    modelCatalog: { effortChoices: () => ["low", "high"] } });
   const transport = new PubSubPullTransport({ api: { request }, subscription: "projects/test/subscriptions/events", logger,
     receive: (...args: any[]) => (adapter.receiveEvent as any)(...args) });
   const deliver = (raw: unknown) => transport.process({ ackId: "ack-command", message: { messageId: "pubsub-command",
     data: Buffer.from(JSON.stringify(raw)).toString("base64") } });
-  return { adapter, request, messages, normal, record, ensureSessionRecord, describeConfig, applyAgentChange, applyModelChange, cancelChannel, deliver };
+  return { adapter, request, messages, normal, record, ensureSessionRecord, describeConfig, applyAgentChange, applyModelChange, cancelChannel, deliver, applyRepoChange, configure };
 }
 
 describe("merged Google Chat commands wired before ordinary turn admission", () => {
+  it.each([5, 6])("makes command %s private and unthreaded at the top level, without admitting a turn", async id => {
+    const h = setup(true);
+    await h.deliver(rootEvent(id, id === 5 ? "/repo new" : "/effort high"));
+    expect(h.messages).toHaveLength(1);
+    expect(h.messages[0]).toMatchObject({ privateMessageViewer: { name: "users/42" } });
+    expect(h.messages[0]).not.toHaveProperty("thread");
+    const selected = id === 5 ? h.applyRepoChange : h.configure;
+    expect(selected).toHaveBeenCalledOnce();
+    expect(h.ensureSessionRecord).toHaveBeenCalledWith(expect.objectContaining({ channelRef: "dm.pB-Jq3TxSfk" }));
+    expect(h.normal).not.toHaveBeenCalled();
+  });
+
+  it.each([5, 6])("makes bare command %s private in its invoking DM thread", async id => {
+    const h = setup();
+    const raw = event(id, id === 5 ? "/repo" : "/effort");
+    await h.deliver({ ...raw, message: { ...raw.message, argumentText: null } });
+    expect(h.messages[0]).toMatchObject({ thread: { name: "spaces/dm/threads/thread" }, privateMessageViewer: { name: "users/42" } });
+    expect(h.messages[0].text).toContain(id === 5 ? "/projects/old" : "low");
+    expect(h.messages[0].text).toContain(id === 5 ? "/projects/new" : "high");
+    expect(h.applyRepoChange).not.toHaveBeenCalled();
+    expect(h.configure).not.toHaveBeenCalled();
+    expect(h.normal).not.toHaveBeenCalled();
+  });
+
+  it.each([[5, "THREADED_MESSAGES"], [6, "THREADED_MESSAGES"], [5, "UNTHREADED_MESSAGES"], [6, "UNTHREADED_MESSAGES"]])
+    ("maps command %s in a %s Space through channelFor without an @mention", async (id, state) => {
+      const h = setup();
+      const raw = event(Number(id), id === 5 ? "/repo new" : "/effort high");
+      await h.deliver({ ...raw, space: { ...raw.space, spaceType: "SPACE", spaceThreadingState: state } });
+      const expected = state === "UNTHREADED_MESSAGES" ? "dm" : "dm.thread";
+      expect(h.ensureSessionRecord).toHaveBeenCalledWith(expect.objectContaining({ channelRef: expected }));
+      expect((id === 5 ? h.applyRepoChange : h.configure)).toHaveBeenCalledOnce();
+      expect(h.messages[0]).toMatchObject({ privateMessageViewer: { name: "users/42" } });
+      if (state === "UNTHREADED_MESSAGES") expect(h.messages[0]).not.toHaveProperty("thread");
+      else expect(h.messages[0].thread.name).toBe("spaces/dm/threads/thread");
+      expect(h.normal).not.toHaveBeenCalled();
+    });
+
   it.each([[3, "agent", "claude"], [4, "model", "claude-reviewed"]])
     ("replies with usage for bare /%s with null argumentText, preserving the saved session", async (id, command, current) => {
       const h = setup();

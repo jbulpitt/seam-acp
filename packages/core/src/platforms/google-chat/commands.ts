@@ -5,6 +5,8 @@ export const GOOGLE_CHAT_COMMANDS = [
   { command: "cancel", id: 2, name: "/cancel", description: "Cancel work in this session", type: "SLASH_COMMAND" },
   { command: "agent", id: 3, name: "/agent", description: "Set this session's agent: /agent <id>", type: "SLASH_COMMAND" },
   { command: "model", id: 4, name: "/model", description: "Set this session's model: /model <id>", type: "SLASH_COMMAND" },
+  { command: "repo", id: 5, name: "/repo", description: "Set this session's repo: /repo <path>", type: "SLASH_COMMAND" },
+  { command: "effort", id: 6, name: "/effort", description: "Set this session's effort: /effort <level>", type: "SLASH_COMMAND" },
 ] as const;
 
 export type GoogleChatCommandName = typeof GOOGLE_CHAT_COMMANDS[number]["command"];

@@ -14349,6 +14349,7 @@ export class Orchestrator {
     scope: "session" | "thread" | "channel",
     actor: { id: string; name: string }
   ): Promise<{ ok: true; message: string } | { ok: false; error: string }> {
+    if (scope === "thread") return this.getConfigApplyPlan().applyRepoChange(channel, record, requested, actor);
     if (requested === INHERIT_VALUE) {
       if (scope === "session") {
         return { ok: false, error: "Session scope has no inherit — pass a path." };
@@ -14376,21 +14377,6 @@ export class Orchestrator {
       return {
         ok: false,
         error: `Repo \`${resolved}\` is outside host \`${location}\` workspace root (\`${root}\`).`,
-      };
-    }
-
-    const display = this.repoDisplay(resolved);
-    if (scope === "thread") {
-      const written = this.configMutation.applyThreadOverlay({
-        threadId: record.channelRef,
-        ...(record.parentRef ? { parentRef: record.parentRef } : {}),
-        changes: { cwd: resolved },
-        actor,
-      });
-      if (!written.ok) return written;
-      return {
-        ok: true,
-        message: `Thread-preset repo set to \`${display}\`. Applies on the next turn.`,
       };
     }
 
@@ -20471,9 +20457,7 @@ export class Orchestrator {
   // --- repo picker ---
 
   /**
-   * Resolve user input to a repo path on the thread's bound host. Absolute
-   * paths pass through (caller checks the advertised host workspace root);
-   * relative names match the execution bridge's listed workspace by basename.
+   * Use the shared host-root resolver for the repo picker and typed paths.
    */
   private async resolveRequestedRepoPath(
     channel: ChannelRef,
@@ -20481,12 +20465,7 @@ export class Orchestrator {
     locationOverride?: string
   ): Promise<string> {
     const location = locationOverride ?? resolveThreadLocation(this.config, channel.id);
-    if (requested.startsWith("/")) return requested;
-    return (
-      (await this.listHostWorkspacePaths(channel.id, location))?.find(
-        (p) => path.basename(p) === requested || p === requested
-      ) ?? requested
-    );
+    return this.getConfigApplyPlan().resolveRequestedRepoPath(location, requested);
   }
 
   private async applyPickedRepo(

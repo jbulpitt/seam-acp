@@ -60,7 +60,7 @@ function inboundId(name: string): string {
   return `gchat_${createHash("sha256").update(name).digest("base64url")}`;
 }
 
-type CommandDeps = Pick<GoogleChatCommandDeps, "router" | "mutation" | "runtimeTransition" | "cancelChannel"> & {
+type CommandDeps = Pick<GoogleChatCommandDeps, "router" | "mutation" | "runtimeTransition" | "cancelChannel" | "configPlan" | "modelCatalog"> & {
   store: Pick<SessionStore, "getByChannel" | "admitInbound" | "getInbound" | "claimInbound" | "completeInboundCommand">;
 };
 

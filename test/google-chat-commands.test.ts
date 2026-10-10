@@ -11,8 +11,26 @@ describe("Google Chat non-add-on commands", () => {
     expect(GOOGLE_CHAT_COMMANDS.map(({ name, id, type }) => ({ name, id, type }))).toEqual([
       { name: "/new", id: 1, type: "SLASH_COMMAND" }, { name: "/cancel", id: 2, type: "SLASH_COMMAND" },
       { name: "/agent", id: 3, type: "SLASH_COMMAND" }, { name: "/model", id: 4, type: "SLASH_COMMAND" },
+      { name: "/repo", id: 5, type: "SLASH_COMMAND" }, { name: "/effort", id: 6, type: "SLASH_COMMAND" },
     ]);
     for (const entry of GOOGLE_CHAT_COMMANDS) expect(entry.description.length).toBeLessThanOrEqual(50);
+  });
+
+  it.each([
+    [5, "/repo /work/repo with spaces", "repo", "/work/repo with spaces"],
+    [6, "/effort high", "effort", "high"],
+    [5, "/repo", "repo", ""],
+    [6, "/effort", "effort", ""],
+  ])("parses command %s without splitting its argument", (id, text, command, args) => {
+    expect(parseGoogleChatCommand({ ...event, message: { slashCommand: { commandId: id }, argumentText: text } }))
+      .toMatchObject({ command, args });
+  });
+
+  it("publishes the reviewed repo and effort descriptions", () => {
+    expect(GOOGLE_CHAT_COMMANDS).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 5, description: "Set this session's repo: /repo <path>" }),
+      expect.objectContaining({ id: 6, description: "Set this session's effort: /effort <level>" }),
+    ]));
   });
 
   it("reads MESSAGE slashCommand.commandId and mention-stripped argumentText", () => {

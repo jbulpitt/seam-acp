@@ -561,6 +561,7 @@ async function main(): Promise<void> {
   });
 
   googleChat?.setCommandDeps({ store, router, mutation: orchestrator.getConfigMutation(), runtimeTransition: orchestrator.getRuntimeTransition(),
+    configPlan: orchestrator.getConfigApplyPlan(), modelCatalog,
     cancelChannel: channel => orchestrator.cancelChannel(channel) });
   await orchestrator.loadPlugins();
   orchestrator.install();

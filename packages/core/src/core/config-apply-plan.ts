@@ -12,7 +12,8 @@ import { type ConfigMutationService, type ConfigMutationInput, type ConfigPropos
 import { configTarget, configOverrideFields, CONFIG_DEFAULT_FIELDS, type ConfigDefaultField, type OverrideCounts } from "./config-target.js";
 import { parseStatusCardStyle, parseSimpleCardGif, type SessionRecord, type SessionConfigState, type PermissionPolicyMode, type StatusCardStyle, type Preset } from "./types.js";
 import { parseAgentAtLocation } from "./location.js";
-import { isWithinRoot } from "./path-utils.js";
+import { isWithinRoot, resolveRepoPath } from "./path-utils.js";
+import path from "node:path";
 import { bindSessionLocation } from "./location-bind.js";
 import { buildSavePlan, snapshotFromDescribe, fastModeWillResetSession, willVerifyFastMode, type ThreadConfigDraft } from "../platforms/discord/config-editor.js";
 import { FAST_MODE_CONFIG_ID, settleFastMode, fastModeRetirementFailure } from "./fast-mode.js";
@@ -165,6 +166,58 @@ export class ConfigApplyPlan {
   readThreadPresetEntry(...args: Parameters<ConfigMutationService["readThreadPresetEntry"]>) { return this.configMutation.readThreadPresetEntry(...args); }
   readPresetsSnapshot() { return this.configMutation.readPresetsSnapshot(); }
   restoreThreadPresetEntry(...args: Parameters<ConfigMutationService["restoreThreadPresetEntry"]>) { return this.configMutation.restoreThreadPresetEntry(...args); }
+
+  /** The repo picker inventory belongs to the session's execution host. */
+  async listRepos(record: SessionRecord): Promise<string[]> {
+    const location = this.router.describeConfig(record).location.value;
+    return (await this.bridgeHub?.listWorkspaces(location) ?? []).map(workspace => workspace.path);
+  }
+
+  async resolveRequestedRepoPath(location: string, requested: string): Promise<string> {
+    const root = this.bridgeHub?.get(location)?.host.workspaceRoot ?? this.config.REPOS_ROOT;
+    if (!path.isAbsolute(requested)) {
+      const workspaces = await this.bridgeHub?.listWorkspaces(location) ?? [];
+      const matched = workspaces.find(workspace => path.basename(workspace.path) === requested || workspace.path === requested);
+      if (matched) return matched.path;
+    }
+    return resolveRepoPath(root, requested);
+  }
+
+  /** Shared thread-overlay repo selection; a live turn keeps its current cwd. */
+  async applyRepoChange(channel: ChannelRef, record: SessionRecord, requested: string, actor: MutationActor): Promise<
+    { ok: true; message: string; sessionReset: boolean; resetPending: boolean } | { ok: false; error: string }
+  > {
+    const before = this.router.describeConfig(record);
+    try {
+      const cwd = requested === "__inherit__" ? null : await this.resolveRequestedRepoPath(before.location.value, requested);
+      const root = this.bridgeHub?.get(before.location.value)?.host.workspaceRoot;
+      if (cwd && root && !isWithinRoot(cwd, root)) {
+        return { ok: false, error: `Repo \`${cwd}\` is outside host \`${before.location.value}\` workspace root (\`${root}\`).` };
+      }
+      if (cwd) {
+        if (!this.bridgeHub) throw new Error(`bridge "${before.location.value}" is not connected`);
+        // The host shell's cwd check preserves ENOENT/EACCES without another filesystem RPC.
+        const checked = await this.bridgeHub.hostExec(before.location.value, { command: "pwd", cwd });
+        if (checked.exitCode !== 0) throw new Error(checked.stderr || `pwd exited ${checked.exitCode} (signal=${checked.signal})`);
+      }
+      const written = this.configMutation.applyThreadOverlay({ threadId: channel.id, platform: channel.platform,
+        ...(channel.parentId ? { parentRef: channel.parentId } : {}), changes: { cwd }, actor });
+      if (!written.ok) return written;
+      const current = this.store.get(record.id) ?? record;
+      const changed = before.cwd.value !== this.router.describeConfig(current).cwd.value;
+      const wasBusy = this.router.getRuntime(record.id)?.busy === true;
+      await this.runtime.applySavedSelection(current, before);
+      const after = this.store.get(record.id) ?? current;
+      const resetPending = changed && wasBusy && Boolean(record.acpSessionId) && Boolean(after.acpSessionId);
+      const sessionReset = changed && Boolean(record.acpSessionId) && !after.acpSessionId;
+      return { ok: true, sessionReset, resetPending,
+        message: `Repo set to \`${this.router.describeConfig(after).cwd.value}\`. ${resetPending
+          ? "Session reset pending; the current turn finishes unchanged, then the next turn starts a fresh session."
+          : sessionReset ? "Session reset; the next turn starts a fresh session." : "Session not reset."}` };
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
+  }
 
   describeTarget(channel: ChannelRef, scope?: string | null) {
     const target = configTarget(channel, scope);

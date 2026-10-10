@@ -127,6 +127,45 @@ function channelsUsed(adapter: ReturnType<typeof setup>["adapter"]) {
 }
 
 describe("a second chat platform runs a normal turn", () => {
+  it("retains an uncertain Chat receipt without replay or API calls until history lookup is configured", async () => {
+    const { GoogleChatAdapter } = await import("../packages/core/src/platforms/google-chat/adapter.js");
+    const { multiplexChatAdapters } = await import("../packages/core/src/platforms/google-chat/multiplex.js");
+    const h = setup("google-chat");
+    const channel = { platform: "google-chat", id: "AAA.TTT", parentId: "AAA" };
+    const request = vi.fn(async () => {
+      throw Object.assign(new Error("Permission denied to perform the requested action"), { response: { status: 403 } });
+    });
+    const chat = new GoogleChatAdapter({ api: { request }, subscription: "projects/test/subscriptions/events",
+      allowedUserIds: new Set(["users/42"]), defaultCwd: "/synthetic", logger: (h.orch as any).logger,
+      writeIntervalMs: 0 });
+    const lookup = vi.spyOn(chat, "findMessageByNonce");
+    const send = vi.spyOn(chat, "sendMessage");
+    const discordLookup = vi.fn(async () => ({ status: "absent" }));
+    (h.orch as any).adapter = multiplexChatAdapters([
+      { ...h.adapter, platform: "discord", findMessageByNonce: discordLookup } as any, chat,
+    ]);
+    const spec = { id: "chat-history-pending", target: channel.id, prompt: "already completed", session: "live" as const };
+    h.store.turnAttempts.admit(spec);
+    const attempt = h.store.turnAttempts.claim(spec, "fixture", "fixture-boot");
+    h.store.turnAttempts.complete(attempt, { id: spec.id, target: channel.id, status: "completed",
+      output: "retained answer", finishedUtc: new Date().toISOString() });
+    h.store.turnAttempts.prepareDelivery(spec.id, channel.id, { kind: "message", text: "retained answer" });
+    const receipt = h.store.turnAttempts.get(spec.id)!;
+
+    await expect((h.orch as any).recoverRecordedDelivery(receipt, channel)).resolves.toBe("uncertain");
+    const retained = h.store.turnAttempts.get(spec.id)!;
+    expect(retained).toMatchObject({ state: "completed", deliveryDone: false,
+      deliveryAbandonedReason: null, deliveryNonce: receipt.deliveryNonce, deliveryPayload: receipt.deliveryPayload,
+      deliveryUncertainReason: expect.stringContaining("chat.app.messages.readonly"), outcome: receipt.outcome });
+    await expect((h.orch as any).recoverRecordedDelivery(retained, channel)).resolves.toBe("uncertain");
+    expect(lookup).toHaveBeenCalledOnce();
+    expect(request).not.toHaveBeenCalled();
+    expect(discordLookup).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
+    expect(h.runtime.prompt).not.toHaveBeenCalled();
+    expect(h.store.turnAttempts.isDeliveryProven(spec.id)).toBe(false);
+  });
+
   it("defers a failed Chat nonce lookup with its real cause, never attributing it to Discord", async () => {
     const { multiplexChatAdapters } = await import("../packages/core/src/platforms/google-chat/multiplex.js");
     const h = setup("google-chat");

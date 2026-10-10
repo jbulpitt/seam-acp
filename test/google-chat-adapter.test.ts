@@ -114,8 +114,24 @@ describe("Google Chat DM adapter", () => {
     const createdId = request.mock.calls[0]![1].params.messageId;
     expect(request.mock.calls[1]![1]).toMatchObject({ method: "GET",
       url: `https://chat.googleapis.com/v1/spaces/DM_1/messages/${createdId}` });
-    expect(await adapter.findMessageByNonce(channel, "stable-delivery")).toMatchObject({ status: "found", message: { id: ref.id } });
-    expect(request.mock.calls[2]![1].url).toBe(`https://chat.googleapis.com/v1/spaces/DM_1/messages/${createdId}`);
+    // Resolving a 409 is not an authorized history lookup for an uncertain receipt.
+    expect(await adapter.findMessageByNonce(channel, "stable-delivery")).toMatchObject({
+      status: "indeterminate", reason: expect.stringContaining("chat.app.messages.readonly"),
+    });
+    expect(request).toHaveBeenCalledTimes(2);
+  });
+
+  it("reports nonce lookup unsupported without configured history access and makes no Google call", async () => {
+    const { adapter, request } = await setup();
+    request.mockRejectedValue(Object.assign(new Error("Permission denied to perform the requested action"),
+      { response: { status: 403 } }));
+
+    for (let retry = 0; retry < 2; retry++) {
+      const result = await adapter.findMessageByNonce(channel, "uncertain-delivery");
+      expect(result).toEqual({ status: "indeterminate",
+        reason: expect.stringMatching(/unsupported.*configured.*admin-approved.*chat\.app\.messages\.readonly/) });
+    }
+    expect(request).not.toHaveBeenCalled();
   });
 
   it("logs a reply fallback instead of silently claiming the original thread", async () => {

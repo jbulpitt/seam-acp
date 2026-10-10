@@ -9603,7 +9603,7 @@ export class Orchestrator {
     // These executors own different cards, outside the injected-turn path.
     if (spec.kind === "compact" || spec.kind === "thread_voice"
       || (spec.kind === "ingest" && spec.session !== "live")) return;
-    const target: ChannelRef = { platform: PLATFORM, id: spec.target };
+    const target: ChannelRef = { platform: this.platformForChannel(spec.target), id: spec.target };
     const record = await this.bindThreadRecord(target, spec.cwd);
     const preset = spec.preset ? this.store.getPresetByName(spec.preset) : null;
     const isolated = spec.session === "isolated" || Boolean(preset || spec.agentId);
@@ -9690,7 +9690,8 @@ export class Orchestrator {
     try {
       let executionSpec = prior ? { ...prior.spec, resume: prior.promptStarted } : spec;
       if (operatorResume) {
-        const record = this.router.ensureSessionRecord({ platform: PLATFORM, channelRef: spec.target, cwd: this.config.REPOS_ROOT });
+        const record = this.router.ensureSessionRecord({ platform: this.platformForChannel(spec.target),
+          channelRef: spec.target, cwd: this.config.REPOS_ROOT });
         const current = this.router.describeConfig(record);
         executionSpec = { ...executionSpec, preset: undefined, agentId: undefined,
           location: current.location.value, model: current.model.value, effort: current.effort.value ?? undefined, cwd: current.cwd.value };
@@ -9793,7 +9794,7 @@ export class Orchestrator {
       statusCardDone: false,
     };
 
-    const target: ChannelRef = { platform: PLATFORM, id: spec.target };
+    const target: ChannelRef = { platform: this.platformForChannel(spec.target), id: spec.target };
     let record = await this.bindThreadRecord(target, spec.cwd);
 
     // Preset worker (#23): dispatch to a reusable stateless identity instead of
@@ -11231,7 +11232,7 @@ export class Orchestrator {
   private async threadLiveState(threadId: string): Promise<"ok" | "gone" | "archived"> {
     if (!this.adapter.getThreadLiveState) return "ok";
     try {
-      const live = await this.adapter.getThreadLiveState({ platform: PLATFORM, id: threadId });
+      const live = await this.adapter.getThreadLiveState({ platform: this.platformForChannel(threadId), id: threadId });
       if (live === undefined) return "gone";
       if (live.archived) return "archived";
       return "ok";
@@ -11254,7 +11255,7 @@ export class Orchestrator {
    * but never silent). A self-scoped compaction has actor == target.
    */
   private async dispatchCompact(spec: DispatchSpec): Promise<{ output: string; stopReason: string }> {
-    const target: ChannelRef = { platform: PLATFORM, id: spec.target };
+    const target: ChannelRef = { platform: this.platformForChannel(spec.target), id: spec.target };
     const record = await this.bindThreadRecord(target, spec.cwd);
     const actor = spec.returnTo ?? spec.target;
 
@@ -11916,10 +11917,10 @@ export class Orchestrator {
 
     if (refs.threadRef && refs.threadRef !== target.id) {
       const name = await this.adapter
-        .getThreadName?.({ platform: PLATFORM, id: refs.threadRef })
+        .getThreadName?.({ platform: this.platformForChannel(refs.threadRef), id: refs.threadRef })
         .catch(() => undefined);
       if (name) origin.threadName = name;
-      const sourceParent = this.channelOfThread({ platform: PLATFORM, id: refs.threadRef });
+      const sourceParent = this.channelOfThread({ platform: this.platformForChannel(refs.threadRef), id: refs.threadRef });
       if (sourceParent && sourceParent !== this.channelOfThread(target)) {
         const channelName = await this.adapter
           .getChannelName?.(sourceParent)
@@ -11942,7 +11943,7 @@ export class Orchestrator {
    */
   private channelOfThread(ref: ChannelRef): string | undefined {
     if (ref.parentId) return ref.parentId;
-    return this.store.getByChannel(PLATFORM, ref.id)?.parentRef ?? undefined;
+    return this.store.getByChannel(ref.platform, ref.id)?.parentRef ?? undefined;
   }
 
   /** The start-indicator header line for a dispatch, e.g.

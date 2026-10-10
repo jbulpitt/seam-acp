@@ -77,7 +77,7 @@ function setup(platform: string, downloads?: Map<string, Buffer>) {
     // The turn holds its channel until delivery settles.
     await (orch as any).queueOnChannel(msg.channel.id, async () => {});
   };
-  return { store, adapter, runtime, run };
+  return { store, adapter, runtime, run, orch };
 }
 
 function channelsUsed(adapter: ReturnType<typeof setup>["adapter"]) {
@@ -168,6 +168,22 @@ describe("a second chat platform runs a normal turn", () => {
     const sent = h.runtime.prompt.mock.calls[0]![1] as MessageAttachment[];
     expect(sent[0]!.url).toBe(url);
     fetch.mockRestore();
+  });
+
+  it("delivers a live dispatch into a second-platform thread on that platform", async () => {
+    const h = setup("test");
+    const now = new Date().toISOString();
+    h.store.upsert({ id: "test:AAA.UUU", platform: "test", channelRef: "AAA.UUU", parentRef: "AAA",
+      agentId: "codex", acpSessionId: "acp-1", repoPath: "/synthetic", configJson: "{}", createdUtc: now, updatedUtc: now });
+
+    await h.orch.dispatchInjectTurn({ id: "second-platform-dispatch", target: "AAA.UUU", prompt: "do work",
+      session: "live", kind: "handoff", stream: false, reportBack: false, createdUtc: now });
+
+    expect(h.runtime.prompt).toHaveBeenCalledTimes(1);
+    const used = channelsUsed(h.adapter);
+    expect(used.length).toBeGreaterThan(0);
+    expect(used.every(channel => channel.platform === "test" && channel.id === "AAA.UUU")).toBe(true);
+    expect(h.store.getByChannel("discord", "AAA.UUU")).toBeNull();
   });
 
   it("still refuses a message id that is unsafe as a file name", async () => {

@@ -1229,6 +1229,25 @@ describe("SeamMcpServer", () => {
     expect(spec.originThreadRef).toBe("thread-caller");
   });
 
+  it("handoff to a sibling session on a second platform runs live in that thread", async () => {
+    const caller = makeRecord({ id: "test:AAA.TTT", platform: "test", channelRef: "AAA.TTT", parentRef: "AAA" });
+    const sibling = makeRecord({ id: "test:AAA.UUU", platform: "test", channelRef: "AAA.UUU", parentRef: "AAA" });
+    h = await makeHarness({
+      resolveSession: (token) => (token === "good-token" ? caller : undefined),
+      resolveThread: (id) => (id === sibling.channelRef ? sibling : undefined),
+      getThreadLiveState: async () => ({ locked: false, archived: false }),
+    });
+    await h.call("tools/call", { name: "handoff", arguments: { worker: "AAA.UUU", prompt: "do work" } },
+      { "X-Seam-Session": "good-token" });
+    expect(h.enqueued).toHaveLength(1);
+    expect(h.enqueued[0]).toMatchObject({ target: "AAA.UUU", session: "live", returnTo: "AAA.TTT" });
+    expect(h.enqueued[0]!.preset).toBeUndefined();
+
+    await h.call("tools/call", { name: "handoff", arguments: { worker: "reviewer", prompt: "review" } },
+      { "X-Seam-Session": "good-token" });
+    expect(h.enqueued[1]).toMatchObject({ preset: "reviewer", session: "isolated", target: "AAA.TTT" });
+  });
+
   it("handoff records the caller even when result delivery goes to a different thread", async () => {
     h = await makeHarness();
     await h.call("tools/call", { name: "handoff", arguments: {

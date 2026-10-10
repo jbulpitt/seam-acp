@@ -15,6 +15,8 @@ import { discordRenderer } from "../packages/core/src/platforms/discord/renderer
 import { inboundAttemptId } from "../packages/core/src/core/dispatch/attempt-store.js";
 import type { DeliveryNonceLookup, IncomingMessage, MessageAttachment } from "../packages/core/src/platforms/chat-adapter.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
+import { makeChoiceCustomId, type ChoiceCard } from "../packages/core/src/core/choice/types.js";
+import { readdirSync, readFileSync, existsSync } from "node:fs";
 
 const cleanups: (() => void)[] = [];
 afterEach(() => { for (const f of cleanups.splice(0).reverse()) f(); vi.restoreAllMocks(); });
@@ -59,6 +61,9 @@ function setup(platform: string, downloads?: Map<string, Buffer>) {
     sendMessage: vi.fn(async (channel: any, _text: string, _delivery?: { nonce?: string }) => ({ channel, id: "message" })),
     editMessage: vi.fn(async (_ref: any, _text?: string) => {}),
     findMessageByNonce: vi.fn(async (): Promise<DeliveryNonceLookup> => ({ status: "absent" })),
+    sendChoiceCard: vi.fn(async (channel: any, _card: unknown) => ({ channel, id: "card" })),
+    editChoiceCard: vi.fn(async (_ref: any, _card: unknown) => {}),
+    isAllowedUser: vi.fn((p: string, userId: string) => p === "test" && userId === "42"),
     ...(downloads ? {
       downloadAttachment: vi.fn(async (a: MessageAttachment) => {
         const bytes = downloads.get(a.url);
@@ -68,6 +73,7 @@ function setup(platform: string, downloads?: Map<string, Buffer>) {
     } : {}),
   };
   const config = { DATA_DIR: dir, REPOS_ROOT: "/synthetic", TURN_TIMEOUT_SECONDS: 60,
+    DISCORD_ALLOWED_USER_IDS: new Set(["1300000000000000004"]),
     DEFAULT_MODEL: "test", REPO_EMOJIS: new Map(), channelPresets: new Map(), threadPresets: new Map() };
   const orch = new Orchestrator({ logger: pino({ level: "silent" }) as any,
     modelCatalog: fixtureModelCatalog([]), store, router: router as any,
@@ -77,7 +83,38 @@ function setup(platform: string, downloads?: Map<string, Buffer>) {
     // The turn holds its channel until delivery settles.
     await (orch as any).queueOnChannel(msg.channel.id, async () => {});
   };
-  return { store, adapter, runtime, run, orch };
+  return { store, adapter, runtime, run, orch, dir };
+}
+
+
+function sessionRow(platform: string, channelRef: string, parentRef: string) {
+  const now = new Date().toISOString();
+  return { id: `${platform}:${channelRef}`, platform, channelRef, parentRef, agentId: "codex",
+    acpSessionId: "acp-1", repoPath: "/synthetic", configJson: "{}", createdUtc: now, updatedUtc: now };
+}
+
+function card(platform: string, channelRef: string, parentRef: string): ChoiceCard {
+  return { id: `card-${platform}`, platform, channelRef, parentRef, messageId: "card-msg", title: "Ship?", body: null,
+    maxClicks: 1, targetUserId: null, defaultTarget: { type: "live" },
+    options: [{ label: "Approve", kind: "prompt", payload: "Approved." }],
+    clickCount: 0, status: "open", lastClickerId: null, lastClickerName: null, lastOptionIndex: null,
+    createdBy: `${platform}:${channelRef}`, createdUtc: new Date().toISOString() } as ChoiceCard;
+}
+
+function click(platform: string, channelId: string, cardId: string, userId: string) {
+  const ephemeral: string[] = [];
+  return Object.assign({ customId: makeChoiceCustomId(cardId, 0), userId, userName: "Tester",
+    channel: { platform, id: channelId }, messageId: "card-msg", kind: "button" as const,
+    replyEphemeral: async (t: string) => { ephemeral.push(t); },
+    followUpEphemeral: async (t: string) => { ephemeral.push(t); },
+    showModal: async () => {} }, { ephemeral });
+}
+
+function pendingTargets(dir: string): string[] {
+  const pending = path.join(dir, "dispatch", "pending");
+  if (!existsSync(pending)) return [];
+  return readdirSync(pending).filter(f => f.endsWith(".json"))
+    .map(f => JSON.parse(readFileSync(path.join(pending, f), "utf8")).target);
 }
 
 function channelsUsed(adapter: ReturnType<typeof setup>["adapter"]) {
@@ -184,6 +221,54 @@ describe("a second chat platform runs a normal turn", () => {
     expect(used.length).toBeGreaterThan(0);
     expect(used.every(channel => channel.platform === "test" && channel.id === "AAA.UUU")).toBe(true);
     expect(h.store.getByChannel("discord", "AAA.UUU")).toBeNull();
+  });
+
+  it("accepts a choice click from an allowed second-platform user and keeps the card on its platform", async () => {
+    const h = setup("test");
+    h.store.upsert(sessionRow("test", "AAA.TTT", "AAA"));
+    h.store.insertChoiceCard(card("test", "AAA.TTT", "AAA"));
+    const evt = click("test", "AAA.TTT", "card-test", "42");
+
+    await (h.orch as any).handleChoiceCardInteraction(evt);
+
+    expect(evt.ephemeral.join("\n")).not.toContain("not available to you");
+    expect(h.store.getChoiceCard("card-test")).toMatchObject({ clickCount: 1 });
+    expect(h.adapter.editChoiceCard.mock.calls.every(call => (call[0] as any).channel.platform === "test")).toBe(true);
+    expect(h.adapter.editChoiceCard).toHaveBeenCalled();
+    expect(pendingTargets(h.dir)).toEqual(["AAA.TTT"]);
+  });
+
+  it("refuses a second-platform user the adapter does not allow, and Discord keeps its own allowlist", async () => {
+    const h = setup("test");
+    h.store.upsert(sessionRow("test", "AAA.TTT", "AAA"));
+    h.store.insertChoiceCard(card("test", "AAA.TTT", "AAA"));
+    const outsider = click("test", "AAA.TTT", "card-test", "99");
+    await (h.orch as any).handleChoiceCardInteraction(outsider);
+    expect(outsider.ephemeral.join("\n")).toContain("not available to you");
+    expect(h.store.getChoiceCard("card-test")).toMatchObject({ clickCount: 0 });
+
+    h.store.upsert(sessionRow("discord", "1300000000000000002", "1300000000000000003"));
+    h.store.insertChoiceCard(card("discord", "1300000000000000002", "1300000000000000003"));
+    const stranger = click("discord", "1300000000000000002", "card-discord", "42");
+    await (h.orch as any).handleChoiceCardInteraction(stranger);
+    expect(stranger.ephemeral.join("\n")).toContain("not available to you");
+    expect(h.store.getChoiceCard("card-discord")).toMatchObject({ clickCount: 0 });
+    const discordUser = click("discord", "1300000000000000002", "card-discord", "1300000000000000004");
+    await (h.orch as any).handleChoiceCardInteraction(discordUser);
+    expect(discordUser.ephemeral.join("\n")).not.toContain("not available to you");
+    expect(h.store.getChoiceCard("card-discord")).toMatchObject({ clickCount: 1 });
+  });
+
+  it("posts the sign-in notice and card on the session's own platform", async () => {
+    const h = setup("test");
+    h.store.upsert(sessionRow("test", "AAA.TTT", "AAA"));
+
+    await (h.orch as any).postReauthCard("AAA.TTT", "inbound-x", { errorKind: "auth_required" }, "Authentication required");
+
+    expect(h.adapter.sendMessage.mock.calls.map(call => call[0].platform)).toEqual(["test"]);
+    expect(h.adapter.sendChoiceCard).toHaveBeenCalledTimes(1);
+    expect((h.adapter.sendChoiceCard.mock.calls[0]![0] as any).platform).toBe("test");
+    expect(h.store.getByChannel("discord", "AAA.TTT")).toBeNull();
   });
 
   it("still refuses a message id that is unsafe as a file name", async () => {

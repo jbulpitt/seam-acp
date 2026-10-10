@@ -163,14 +163,18 @@ export type DispatchWorkerTarget =
   | { kind: "named"; name: string; location?: string };
 
 /**
- * Parse a handoff/dispatch worker. Discord snowflake → live thread.
+ * Parse a handoff/dispatch worker. Discord snowflake, or a ref `isThread`
+ * recognises (an existing session on another platform) → live thread.
  * `name@location` (explicit suffix) carries a host; bare names are
  * presets (or agent ids) on `local` unless the caller sets spec.location.
  */
-export function parseDispatchWorker(worker: string): DispatchWorkerTarget {
+export function parseDispatchWorker(
+  worker: string,
+  isThread: (ref: string) => boolean = () => false,
+): DispatchWorkerTarget {
   const trimmed = worker.trim();
   const parsed = parseAgentAtLocation(trimmed);
-  if (!parsed.explicit && /^\d{15,}$/.test(parsed.agentId)) {
+  if (!parsed.explicit && (/^\d{15,}$/.test(parsed.agentId) || isThread(parsed.agentId))) {
     return { kind: "thread", threadId: parsed.agentId };
   }
   if (parsed.explicit) {

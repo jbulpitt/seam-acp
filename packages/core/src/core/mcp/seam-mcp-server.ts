@@ -2626,7 +2626,7 @@ export class SeamMcpServer {
     const reportBack = optionalBool(args, "reportBack");
     const stream = optionalBool(args, "stream");
     const watchFeedback = optionalBool(args, "watchFeedback");
-    const parsed = parseDispatchWorker(worker);
+    const parsed = parseDispatchWorker(worker, (ref) => Boolean(this.deps.resolveThread?.(ref)));
     const toThread = parsed.kind === "thread";
     if (toThread) {
       const liveError = await this.threadLiveError(parsed.threadId);
@@ -2977,7 +2977,7 @@ export class SeamMcpServer {
 
     const lines = [`Threads in your channel (${entries.length}, newest first):`, ""];
     for (const t of entries) {
-      const addressable = looksLikeThreadId(t.id);
+      const addressable = looksLikeThreadId(t.id) || Boolean(this.deps.resolveThread?.(t.id));
       const name = t.name ?? "(unnamed)";
       const flags = [
         t.isSelf ? "YOU" : null,

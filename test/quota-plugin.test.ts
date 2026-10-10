@@ -12,12 +12,12 @@ const logger = pino({ level: "silent" }); const hosts: PluginHost[] = []; const 
 afterEach(async () => { for (const host of hosts.splice(0)) await host.dispose(); vi.restoreAllMocks(); vi.useRealTimers(); for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true }); });
 const binding: UsageBinding = { agentId: "grok", displayName: "Grok", location: "local", account: "grok", provider: "grok", quotaAvailable: true };
 const result = (): ProviderUsage => ({ provider: "grok", data: { subscriptionTier: "Free", creditUsagePercent: null, periodType: null, periodEnd: null } });
-function fixture(read: (binding: Readonly<UsageBinding>, signal?: AbortSignal) => Promise<ProviderUsage> = async () => result(), bindings = [binding]) {
+function fixture(read: (binding: Readonly<UsageBinding>, signal?: AbortSignal) => Promise<ProviderUsage> = async () => result(), bindings = [binding], agents = () => [] as Array<{ id: string; displayName: string; brand?: string }>) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "quota-plugin-")); dirs.push(root);
   const file = path.join(root, "agent-quota-card.json"); fs.writeFileSync(file, JSON.stringify({ threadId: "quota-thread", messageId: "legacy", lastBumpAt: Date.now() }));
   const card = { sendLayout: vi.fn(async channel => ({ channel, id: "new" })), editLayout: vi.fn(async () => {}), pinMessage: vi.fn(async () => {}) };
   const usage = { readUsage: vi.fn(read) };
-  const plugin = createQuotaPlugin({ usage, bindings: () => bindings, resolve: () => ({ ...binding, sessionId: "session" }), card });
+  const plugin = createQuotaPlugin({ usage, bindings: () => bindings, agents, resolve: () => ({ ...binding, sessionId: "session" }), card });
   const host = new PluginHost(logger, { storageRoot: root, storageAliases: { quota: { "agent-quota-card.json": file } } }); hosts.push(host);
   const load = () => host.loadBuiltins([{ id: "quota", load: async () => plugin }], { quota: { DISCORD_AGENT_QUOTA_THREAD_ID: "quota-thread", QUOTA_STALE_RETENTION_MS: 0, OLLAMA_CLOUD_ENABLED: false } });
   return { host, plugin, card, usage, load };
@@ -25,6 +25,26 @@ function fixture(read: (binding: Readonly<UsageBinding>, signal?: AbortSignal) =
 const invocation = { threadId: "thread", parentId: "parent", args: {} };
 
 describe("quota built-in", () => {
+  it("reports a late bridge-discovered Vertex agent's quota as unknown, not a subscription or synthetic number", async () => {
+    const agents: Array<{ id: string; displayName: string; brand?: string }> = [];
+    const f = fixture(undefined, [binding], () => agents);
+    await f.load(); await f.host.jobs.startAfterAdmission(Promise.resolve());
+    agents.push({ id: "vertex-test", displayName: "Vertex test", brand: "vertex" });
+    const response = await f.host.mcp.dispatch("agent_quota", { ...invocation, args: { agentId: "vertex-test" } });
+    expect(response.isError).not.toBe(true);
+    const [row] = JSON.parse(response.content[0]!.text);
+    expect(row).toMatchObject({
+      agentId: "vertex-test", displayName: "Vertex test", ok: false, plan: null, credits: null,
+      rolling: { usedPercent: null, resetsAt: null }, weekly: { usedPercent: null, resetsAt: null },
+    });
+    expect(row.error).toMatch(/Vertex AI.*not reported/);
+    expect(f.usage.readUsage).toHaveBeenCalledTimes(1);
+    const all = JSON.parse((await f.host.mcp.dispatch("agent_quota", invocation)).content[0]!.text);
+    expect(all.map(row => row.agentId)).toEqual(["grok", "vertex-test"]);
+    agents.push({ ...agents[0]! });
+    expect(JSON.parse((await f.host.mcp.dispatch("agent_quota", invocation)).content[0]!.text)).toHaveLength(2);
+  });
+
   it("keeps the pinned card, usage slash, MCP output and registered Refresh button", async () => {
     const f = fixture(); await f.load(); await f.host.jobs.startAfterAdmission(Promise.resolve());
     expect(f.card.sendLayout).not.toHaveBeenCalled();

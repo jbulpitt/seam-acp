@@ -502,8 +502,9 @@ import {
   isInlineableForAgent,
   MAX_BYTES_PER_ATTACHMENT,
   resolveModelVisionRouting,
+  type RejectedAttachment,
 } from "../../agents/attachments.js";
-import { stageAttachment, sweepStagedAttachments } from "@seam/adapters";
+import { errorMessage, stageAttachment, sweepStagedAttachments } from "@seam/adapters";
 import {
   authorizeStagedImage,
   stagedAttachmentOwnerKey,
@@ -2029,7 +2030,6 @@ export class Orchestrator {
     }
   }
 
-  /** Read-only truth used by MCP status, cancel copy, and admin recovery. */
   /** Session for a bare channel ref on any platform. */
   private recordForChannel(channelRef: string): SessionRecord | null {
     return this.store.getByChannelRef(channelRef);
@@ -2040,6 +2040,7 @@ export class Orchestrator {
     return this.recordForChannel(channelRef)?.platform ?? PLATFORM;
   }
 
+  /** Read-only truth used by MCP status, cancel copy, and admin recovery. */
   inspectChannelQueue(channelRef: string, nowMs = Date.now()): ChannelQueueHealth {
     this.channelQueueMeta ??= new Map<string, ChannelQueueMeta>();
     const record = this.recordForChannel(channelRef);
@@ -4541,8 +4542,11 @@ export class Orchestrator {
       const voiceNoteText = msg.attachments?.length
         ? await this.transcribeVoiceNotes(msg, channel)
         : undefined;
+      let downloadRejected: RejectedAttachment[] = [];
       if (msg.attachments?.length && this.adapter.downloadAttachment) {
-        msg = { ...msg, attachments: await this.materializeAttachments(msg.attachments) };
+        const materialized = await this.materializeAttachments(msg.attachments);
+        downloadRejected = materialized.rejected;
+        msg = { ...msg, attachments: materialized.attachments };
       }
 
       status.setAction("Thinking…");
@@ -4884,12 +4888,12 @@ export class Orchestrator {
         "turn timing"
       );
 
-      if (
-        result !== "timeout" &&
-        result.rejectedAttachments &&
-        result.rejectedAttachments.length > 0
-      ) {
-        const lines = result.rejectedAttachments
+      const rejectedAttachments = [
+        ...downloadRejected,
+        ...(result !== "timeout" ? result.rejectedAttachments ?? [] : []),
+      ];
+      if (rejectedAttachments.length > 0) {
+        const lines = rejectedAttachments
           .map((r) => `• \`${r.filename}\` — ${r.reason}`)
           .join("\n");
         await wrapUpStep("rejected-attachments", () => this.adapter.sendMessage(
@@ -13389,23 +13393,30 @@ export class Orchestrator {
 
   /**
    * In-memory `data:` URLs for attachments only the adapter can read, so every
-   * existing `fetch(a.url)` consumer works unchanged. Never persisted.
+   * existing `fetch(a.url)` consumer works unchanged. Never persisted. One that
+   * can't be read is dropped and reported with its real cause.
    */
   private async materializeAttachments(
     attachments: ReadonlyArray<MessageAttachment>,
-  ): Promise<MessageAttachment[]> {
+  ): Promise<{ attachments: MessageAttachment[]; rejected: RejectedAttachment[] }> {
     const STAGE_MAX = 100 * 1024 * 1024;
-    return Promise.all(attachments.map(async (a) => {
-      if (a.size > STAGE_MAX) return a;
+    const results = await Promise.all(attachments.map(async (a) => {
+      if (a.size > STAGE_MAX) {
+        return { rejected: { filename: a.filename, reason: `too large to download (${a.size} B)` } };
+      }
       try {
         const bytes = await this.adapter.downloadAttachment!(a);
         const type = a.contentType ?? "application/octet-stream";
-        return { ...a, url: `data:${type};base64,${bytes.toString("base64")}`, size: bytes.length };
+        return { attachment: { ...a, url: `data:${type};base64,${bytes.toString("base64")}`, size: bytes.length } };
       } catch (err) {
         this.logger.warn({ err, filename: a.filename }, "attachment download failed");
-        return a;
+        return { rejected: { filename: a.filename, reason: `download failed: ${errorMessage(err)}` } };
       }
     }));
+    return {
+      attachments: results.flatMap(r => r.attachment ? [r.attachment] : []),
+      rejected: results.flatMap(r => r.rejected ? [r.rejected] : []),
+    };
   }
 
   private async partitionAndStageAttachments(

@@ -1,16 +1,20 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { pino } from "pino";
+import { SessionStore } from "../packages/core/src/core/session-store.js";
 import { GoogleChatAdapter } from "../packages/core/src/platforms/google-chat/adapter.js";
 import { PubSubPullTransport } from "../packages/core/src/platforms/google-chat/transport.js";
 
 const channel = { platform: "google-chat", id: "dm.thread", parentId: "dm" };
 const logger = pino({ level: "silent" });
+const stores: SessionStore[] = [];
+afterEach(() => { for (const store of stores.splice(0)) store.close(); vi.restoreAllMocks(); });
 const event = (id: number, text: string) => ({ type: "MESSAGE", space: { name: "spaces/dm" },
   user: { name: "users/42", displayName: "Tester" },
   message: { name: `spaces/dm/messages/command-${id}`, argumentText: text, text, slashCommand: { commandId: id },
     thread: { name: "spaces/dm/threads/thread" } } });
 
 function setup() {
+  const store = new SessionStore(":memory:"); stores.push(store);
   const request = vi.fn(async (_scope: string, r: any): Promise<any> => ({ name: "spaces/dm/messages/app",
     thread: r.data?.thread ?? { name: "spaces/dm/threads/new" } }));
   const adapter = new GoogleChatAdapter({ api: { request }, subscription: "projects/test/subscriptions/events",
@@ -29,7 +33,7 @@ function setup() {
   });
   const cancelChannel = vi.fn(async () => ({ parked: null, cancelled: { cancelled: true, starting: false },
     outcome: "idle", queue: { state: "idle", queued: 0 } }));
-  (adapter as any).setCommandDeps?.({ router: { ensureSessionRecord, describeConfig },
+  (adapter as any).setCommandDeps?.({ store, router: { ensureSessionRecord, describeConfig },
     runtimeTransition: { applyAgentChange, applyModelChange }, cancelChannel });
   const transport = new PubSubPullTransport({ api: { request }, subscription: "projects/test/subscriptions/events", logger,
     receive: (...args: any[]) => (adapter.receiveEvent as any)(...args) });
@@ -71,16 +75,19 @@ describe("merged Google Chat commands wired before ordinary turn admission", () 
       expect(h.request.mock.calls.at(-1)![0]).toBe("pubsub");
     });
 
-  it("preserves a reply's NOT_FOUND cause without accepting a new-thread fallback or ACKing it", async () => {
+  it("ACKs a reply's permanent NOT_FOUND after execution, logging the real cause instead of retrying the effect", async () => {
     const h = setup();
     const cause = Object.assign(new Error("NOT_FOUND: requested command thread was not found"),
       { response: { status: 404 } });
+    const error = vi.spyOn(logger, "error");
     h.request.mockImplementation(async (_scope, r) => {
       if (r.params?.messageReplyOption === "REPLY_MESSAGE_OR_FAIL") throw cause;
       return { name: "spaces/dm/messages/doT0sHl7beg.doT0sHl7beg", thread: { name: "spaces/dm/threads/doT0sHl7beg" } };
     });
-    await expect(h.deliver(event(2, "/cancel"))).rejects.toBe(cause);
-    expect(h.request).toHaveBeenCalledOnce();
+    await h.deliver(event(2, "/cancel"));
+    expect(error).toHaveBeenCalledWith(expect.objectContaining({ err: cause }),
+      "Google Chat command reply rejected after execution; acknowledging event");
+    expect(h.request.mock.calls.map(([scope]) => scope)).toEqual(["chat", "pubsub"]);
     expect(h.normal).not.toHaveBeenCalled();
   });
 

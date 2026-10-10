@@ -95,7 +95,7 @@ describe("Google Chat startup isolates Workspace reconciliation", () => {
       msg.onAdmitted?.();
     });
     let started = false;
-    void h.adapter.start().then(() => { started = true; });
+    void h.adapter.start().then(() => { started = true; }, () => {});
     await vi.advanceTimersByTimeAsync(0);
     expect(started).toBe(true); expect(incoming).toHaveLength(1);
     expect(h.store.getInbound(incoming[0].messageId)).toMatchObject({ text: "unmentioned reply", channelRef: "team" });

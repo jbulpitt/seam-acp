@@ -162,6 +162,25 @@ describe("#440 journal corpus — Codex", () => {
     expect(err.message).toBe("Authentication required");
   });
 
+  it("classifies the production session/new workspace-routing 401 as auth_required with its real cause", () => {
+    // Production 2026-10-05 (09:50 CDT x2 ingest, 14:14 CDT compaction seed), codex@local session/new.
+    const err = requestError("Internal error", { details: "workspace routing discovery unauthorized (401)" });
+    const result = classifyAndAttach(err, classifyCodexError(err));
+    expectKind(result, "auth_required", "codex");
+    expect(result.details).toBe("workspace routing discovery unauthorized (401)");
+  });
+
+  it.each([
+    [-32603, "Internal error", "workspace routing discovery failed"],
+    [-32603, "Internal error", "workspace routing discovery timed out"],
+    [-32603, "Internal error", "workspace routing discovery unauthorized (401): retry later"],
+    [-32603, "Internal error", "unauthorized (401)"],
+    [-32000, "Internal error", "workspace routing discovery unauthorized (401)"],
+    [-32603, "Something else", "workspace routing discovery unauthorized (401)"],
+  ])("does not infer Codex authentication from code %s, message %s, details %s", (code, message, details) => {
+    expectKind(classifyCodexError(requestError(message as string, { details }, code as number)), "unclassified", "codex");
+  });
+
   it.each([
     [-32603, "Authentication required"],
     [-32000, "Authentication required for another service"],

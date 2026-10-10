@@ -15,6 +15,7 @@ export function multiplexChatAdapters(adapters: ChatAdapter[], platformForId = (
   const empty = new Set(["sendTyping", "getThreadName", "getChannelName", "renameThread", "addThreadMember"]);
   return new Proxy(primary, {
     get(_primary, property: keyof ChatAdapter) {
+      if (property === "catchUpMessagesAfter") return primary.catchUpMessagesAfter?.bind(primary);
       if (property === "start" || property === "stop") return async () => {
         for (const adapter of adapters) await adapter[property]();
       };

@@ -3281,10 +3281,12 @@ export class Orchestrator {
    * is up.
    */
   async catchUpAfterRestart(): Promise<void> {
-    const after = this.store.newestInboundMessageId();
-    if (!after || !this.adapter.catchUpMessagesAfter) return;
+    if (!this.adapter.catchUpMessagesAfter) return;
+    const platform = this.adapter.platform;
+    const after = this.store.newestInboundMessageId(platform);
+    if (!after) return;
     const found = await this.adapter.catchUpMessagesAfter(after);
-    this.logger.info({ after, found }, "caught up on Discord messages sent during the restart");
+    this.logger.info({ platform, after, found }, "caught up on platform messages sent during the restart");
   }
 
   /**

@@ -2624,13 +2624,13 @@ export class SessionStore {
     return row ? mapInboundAdmission(row) : null;
   }
 
-  /** Newest Discord message this controller took, by message id (#653). */
-  newestInboundMessageId(): string | undefined {
+  /** Newest admitted message id on the catch-up adapter's platform. */
+  newestInboundMessageId(platform: string): string | undefined {
     const row = this.db
-      .prepare<[], { message_id: string }>(
-        "SELECT message_id FROM inbound_admissions ORDER BY length(message_id) DESC, message_id DESC LIMIT 1"
+      .prepare<[string], { message_id: string }>(
+        "SELECT message_id FROM inbound_admissions WHERE platform = ? ORDER BY length(message_id) DESC, message_id DESC LIMIT 1"
       )
-      .get();
+      .get(platform);
     return row?.message_id;
   }
 

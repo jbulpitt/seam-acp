@@ -22,7 +22,7 @@ const REMOTE = "remote-synthetic";
 const MODEL = "synthetic-exact-model";
 const silent = pino({ level: "silent" }) as any;
 const cleanups: Array<() => void> = [];
-afterEach(() => { for (const cleanup of cleanups.splice(0).reverse()) cleanup(); vi.restoreAllMocks(); });
+afterEach(() => { for (const cleanup of cleanups.splice(0).reverse()) cleanup(); vi.useRealTimers(); vi.restoreAllMocks(); });
 
 function setup(location = REMOTE) {
   const cwd = mkdtempSync(path.join(tmpdir(), "seam-480-"));
@@ -77,13 +77,15 @@ function setup(location = REMOTE) {
       cwd: { value: cwd }, location: { value: location }, fastMode: { value: false } }) });
   const mux = { spawn: remoteSpawn, rpc: vi.fn(async () => ({ projectMcpInjection: true })), releaseStdin: vi.fn() };
   const hub = { markSessionBridge: vi.fn(), get: vi.fn(() => ({ mux })),
+    isBridgeReady: vi.fn(() => true), onBridgeReady: vi.fn(() => () => {}),
     mcpServersForBridgeSpawn: vi.fn(() => remoteSeam),
     rpc: vi.fn(async () => ({})) };
   const make = () => {
     const orch = new Orchestrator({ logger: silent, store, router: router as any, adapter: {} as any,
       renderer: discordRenderer, modelCatalog: fixtureModelCatalog([profile]),
       config: { DATA_DIR: cwd, REPOS_ROOT: cwd, TURN_TIMEOUT_SECONDS: 15,
-        REPO_EMOJIS: new Map(), channelPresets: new Map(), threadPresets: new Map() } as any });
+        REPO_EMOJIS: new Map(), channelPresets: new Map(), threadPresets: new Map(),
+        bridgePresets: new Map([[REMOTE, {}]]) } as any });
     orch.setBridgeHub(hub as any);
     return orch;
   };
@@ -126,7 +128,7 @@ describe("#480 compaction execution boundary", () => {
     expect(h.store.get(h.record.id)?.acpSessionId).toBe("live-session-untouched");
   });
 
-  it("fails a remote compaction honestly when the bridge is down, without using the local provider", async () => {
+  it("waits for offline analysis before falling back, without using the local provider", async () => {
     const h = setup();
     h.hub.get.mockReturnValue(undefined as any);
     const orch = h.make() as any;
@@ -138,7 +140,9 @@ describe("#480 compaction execution boundary", () => {
       sessionId: h.record.id,
       summary: "summary produced elsewhere",
     })).rejects.toThrow(`bridge "${REMOTE}" is not connected`);
-    const built = await orch.buildDefaultCompactionSeed({
+    h.hub.isBridgeReady.mockReturnValue(false);
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    const building = orch.buildDefaultCompactionSeed({
       profile: h.profile,
       manager: h.manager,
       agentId: h.profile.id,
@@ -147,6 +151,10 @@ describe("#480 compaction execution boundary", () => {
       sessionId: "live-session-untouched",
       restrictionChannelId: "parent",
     });
+    await vi.waitFor(() => expect(h.hub.onBridgeReady).toHaveBeenCalledOnce());
+    expect(h.remoteSpawn).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(15 * 60_000);
+    const built = await building;
     expect(built.seed).toContain("hello");
     expect(h.localSpawn).not.toHaveBeenCalled();
     expect(h.remoteSpawn).not.toHaveBeenCalled();

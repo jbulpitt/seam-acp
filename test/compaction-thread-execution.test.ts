@@ -80,6 +80,7 @@ describe("Discord thread reconstruction uses one bridge path", () => {
     const hub = localBridgeHub([profile], cwd, wiring);
     const localGet = hub.get.bind(hub);
     hub.get = () => localGet("local");
+    hub.isBridgeReady = id => id === location;
     const orch = new Orchestrator({
       store, router, logger, modelCatalog: catalog, renderer: discordRenderer,
       config: { ...visualConfig, DATA_DIR: cwd, REPOS_ROOT: cwd, TURN_TIMEOUT_SECONDS: 15,

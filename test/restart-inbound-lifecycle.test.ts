@@ -112,7 +112,7 @@ describe("#250 human turn production pipeline, synthetic transport only", () => 
           updatedUtc: new Date().toISOString() } }] : [] })),
       adopt: vi.fn(() => adopted),
     };
-    const restarted = h.make({ muxFor: () => mux, slotHealthFor: () => [] });
+    const restarted = h.make({ isBridgeReady: () => true, muxFor: () => mux, slotHealthFor: () => [] });
     await restarted.recoverInterruptedTurns();
     await vi.waitFor(() => expect(mux.adopt).toHaveBeenCalledOnce());
     await restarted.reconcileRemoteRecoveries();
@@ -582,7 +582,7 @@ describe("#250 human turn production pipeline, synthetic transport only", () => 
     h.router.getOrStartRuntime.mockClear();
     h.runtime.prompt.mockImplementationOnce(async () => ({ stopReason: "end_turn" }));
     const mux = { sendCmd: vi.fn(async () => ({ health: [] })), sendFrame: vi.fn() };
-    const next = h.make({ muxFor: () => mux, slotHealthFor: () => [], onBridgeReady: () => () => {} });
+    const next = h.make({ isBridgeReady: () => true, muxFor: () => mux, slotHealthFor: () => [], onBridgeReady: () => () => {} });
     const resume = vi.spyOn(next, "resumeTurnManually");
     await next.recoverInterruptedTurns();
     await next.reconcileRemoteRecoveries();

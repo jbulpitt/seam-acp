@@ -4154,7 +4154,24 @@ export class Orchestrator {
     // elicitation during agent setup can still be safely attributed. The
     // existing finally below clears it even if runtime startup fails.
     if (msg.authorId) this.currentAuthorIds.set(record.channelRef, msg.authorId);
+    const waitForHost = async (): Promise<void> => {
+      const action = status.action;
+      await this.waitForTurnHost(liveMarkerId, described.location.value, undefined, async () => {
+        status.setState("Waiting");
+        status.setAction("Reconnecting to session…");
+        await refresh(true);
+      });
+      this.assertQueueFence(queueFence);
+      const refusal = humanRefusal();
+      if (refusal) throw refusal;
+      if (status.action === "Reconnecting to session…") {
+        status.setState("Working");
+        status.setAction(action);
+        await refresh(true);
+      }
+    };
     try {
+      await waitForHost();
       if (this.store.needsAgyIdentityRebuild(record.id)) {
         const binding = this.router.describeConfig(record);
         await rebuildMigratedAgySession(this.store, record,
@@ -4680,6 +4697,7 @@ export class Orchestrator {
       let result: PromptOutcome | "timeout";
       let submissionEvidence: SubmissionEvidence | undefined;
       try {
+        await waitForHost();
         this.assertQueueFence(queueFence);
         if (humanAttempt) {
           const beforePromptRefusal = humanRefusal();
@@ -5836,7 +5854,15 @@ export class Orchestrator {
     };
     const acquire = <T>(operation: () => Promise<T>): Promise<T> =>
       opts.lifecycle?.acquire ? opts.lifecycle.acquire(operation) : operation();
+    const waitForHost = (location: string): Promise<void> => this.waitForTurnHost(
+      typeof opts.logContext?.dispatch === "string" ? opts.logContext.dispatch
+        : opts.correlationId ?? (target && isSessionRecord(target) ? target.id : activityTurnId),
+      location, undefined, outputTo
+        ? async () => { await this.adapter.sendMessage(outputTo, "Reconnecting to session…"); }
+        : undefined,
+    );
     const runPrompt = async (rt: AgentRuntime): Promise<PromptOutcome | "timeout"> => {
+      if (activityBinding) await waitForHost(activityBinding.location);
       const submissionEvidence = opts.lifecycle?.beforePrompt();
       activitySubmitted = true;
       if (activityBinding && !opts.resumeSessionId) this.plugins.turnActivity.emit({ type: "turn-started", turnId: activityTurnId, timestampMs: Date.now(), binding: activityBinding });
@@ -5907,12 +5933,12 @@ export class Orchestrator {
       let sessionId: string | undefined;
       // Location selects both catalog and execution bridge. Callers that
       // already passed a spawn plan keep it; otherwise this shared planner
-      // routes local and remote alike. A disconnected host refuses this turn
-      // only; direct profile.spawn is not a fallback (#466/#480/#575).
+      // routes local and remote alike; direct profile.spawn is not a fallback.
       let spawnFn = opts.spawnFn;
       let mcpServers = opts.mcpServers ?? [];
-      if (!spawnFn) {
-        try {
+      try {
+        await waitForHost(location);
+        if (!spawnFn) {
           const launch = this.launchForLocation({
             profile,
             location,
@@ -5926,14 +5952,10 @@ export class Orchestrator {
           });
           spawnFn = launch.spawnFn;
           mcpServers = launch.mcpServers;
-        } catch (err) {
-          return settle({
-            text,
-            error: err instanceof Error ? err.message : String(err),
-            cause: err,
-            ...correlation,
-          });
         }
+      } catch (err) {
+        if (err instanceof DispatchSuspendedError) throw err;
+        return settle({ text, error: err instanceof Error ? err.message : String(err), cause: err, ...correlation });
       }
       try {
         rt = new AgentRuntime({
@@ -6076,6 +6098,7 @@ export class Orchestrator {
           cwd: opts.cwd ?? this.config.REPOS_ROOT,
         });
     try {
+      await waitForHost(this.router.describeConfig(record).location.value);
       if (!opts.resumeSessionId) await this.ensureOwnSession(record, target);
       const liveConfig = this.router.describeConfig(record);
       const resumeSessionId = opts.resumeSessionId || record.acpSessionId;
@@ -7021,22 +7044,37 @@ export class Orchestrator {
     return result === "timeout" ? "abandon" : "ok";
   }
 
-  private async waitForDispatchHost(spec: DispatchSpec, location: string, phase: DispatchAcquisitionPhase): Promise<void> {
+  private async waitForTurnHost(attemptId: string, location: string, acquisition?: DispatchAcquisitionPhase,
+    onWaiting?: () => Promise<void>): Promise<void> {
     const hub = this.bridgeHub;
     if (!hub || hub.isBridgeReady(location)) return;
-    this.logger.info({ id: spec.id, location }, "dispatch: waiting for bound bridge to reconnect");
+    if (location !== LOCAL_LOCATION && !this.config.bridgePresets?.has(location)) {
+      throw new Error(`Unknown bridge location "${location}"`);
+    }
+    const phase = acquisition ?? new DispatchAcquisitionPhase(attemptId, "execution");
+    if (!acquisition) this.dispatchAcquisitions.add(phase);
+    const owner = this.store.turnAttempts.get(attemptId);
+    const assertCurrent = owner?.state === "active" ? this.runtimeAcquisitionFence(attemptId) : undefined;
+    this.logger.info({ id: attemptId, location }, "turn: waiting for bound bridge to reconnect");
     const unsubscribe = this.store.turnAttempts.onSettled(id => {
-      if (id === spec.id) phase.interrupt(DispatchSuspendedError.superseded(spec.id,
+      if (id === attemptId) phase.interrupt(DispatchSuspendedError.superseded(attemptId,
         this.store.turnAttempts.get(id)?.outcome?.error ?? "the attempt settled while waiting for its bridge"));
     });
     try {
       await phase.acquire(async signal => {
+        assertCurrent?.();
+        if (this.restartCutoff) throw DispatchSuspendedError.shutdown(attemptId, "shutdown interrupted the bridge wait");
+        await onWaiting?.();
+        assertCurrent?.();
         const result = await waitUntilBridgeReady(hub, location, { deadlineMs: PROVIDER_RETRY_WINDOW_MS, signal });
         if (result === "timeout") {
-          throw DispatchSuspendedError.defect(spec.id, `bridge "${location}" did not reconnect within 15 minutes`);
+          throw DispatchSuspendedError.defect(attemptId, `bridge "${location}" did not reconnect within 15 minutes`);
         }
       });
-    } finally { unsubscribe(); }
+    } finally {
+      unsubscribe();
+      if (!acquisition) this.dispatchAcquisitions.delete(phase);
+    }
   }
 
   private runtimeAcquisitionFence(attemptId: string): () => void {
@@ -9821,7 +9859,7 @@ export class Orchestrator {
       if (this.restartCutoff) {
         throw DispatchSuspendedError.shutdown(spec.id, "restart cutoff reached before the turn started");
       }
-      await this.waitForDispatchHost(spec, workerLocation, phase);
+      await this.waitForTurnHost(spec.id, workerLocation, phase);
     };
     // Keep the FIFO position while the host is away; execution clocks start after readiness.
     if (effectiveSession === "isolated") await prepareRun();
@@ -13048,6 +13086,7 @@ export class Orchestrator {
     // the schedule sets an explicit target.
     const options: InjectTurnOptions = {
       session: "isolated",
+      ...(attempt ? { correlationId: attempt.id } : {}),
       profile,
       cwd,
       location,
@@ -13127,28 +13166,6 @@ export class Orchestrator {
       awaitIdle: true,
       logContext: { scheduled: "run", location, agentId: profile.id },
     };
-    try {
-      // #466/#575: location metadata must select the execution boundary for
-      // every host. Refuse only this occurrence when that bridge is unavailable.
-      if (!this.bridgeHub) throw new Error(`bridge "${location}" is not connected`);
-      const selection = this.modelCatalog.resolve({ agentId: profile.id, location }, {
-        model: model ?? "default", effort,
-      });
-      const planned = planIsolatedBridgeSpawn({
-        hub: this.bridgeHub, sessionId: record.id, location, agentId: profile.id,
-        cwd, model: selection.raw.model, effort: selection.raw.effort,
-        globalMcpServers: options.mcpServers?.filter(server => server.name !== "seam-mcp"),
-      });
-      options.spawnFn = planned.spawnFn;
-      options.mcpServers = planned.mcpServers;
-    } catch (cause) {
-      // Planning failed before injectTurn could record an outcome. Use the same
-      // fenced lifecycle, so the durable occurrence keeps the actual host cause
-      // and reports once instead of remaining active or falling back locally.
-      const result = { text: "", error: cause instanceof Error ? cause.message : String(cause), cause };
-      options.lifecycle?.onOutcome(result);
-      return { text: result.text, error: result.error };
-    }
     const result = await this.injectTurn(
       record,
       resume ? (await this.processRestartRender(owned?.stopped ?? owned?.attempt ?? attempt!)).prompt

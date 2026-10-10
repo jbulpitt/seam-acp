@@ -6,8 +6,9 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { EventEmitter } from "node:events";
 import { PassThrough, Readable, Writable } from "node:stream";
+import { setTimeout as delay } from "node:timers/promises";
 import { agent, methods, ndJsonStream, PROTOCOL_VERSION, RequestError } from "@agentclientprotocol/sdk";
-import { classifyAgyError, readErrorClassification, SEAM_AGY_STDOUT_FALLBACK_META, type AgentProfile } from "@seam/adapters";
+import { BridgeUnreachableError, classifyAgyError, readErrorClassification, SEAM_AGY_STDOUT_FALLBACK_META, type AgentProfile } from "@seam/adapters";
 import { pino } from "pino";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
@@ -27,13 +28,16 @@ const MODEL = "synthetic-exact-model";
 const RIDERS = ["SCHEDULE_CHANNEL_RIDER", "SCHEDULE_THREAD_RIDER"];
 const OVERRIDE_MODEL = "synthetic-override-model";
 const silent = pino({ level: "silent" }) as any;
-const cleanups: Array<() => void> = [];
+const cleanups: Array<() => void | Promise<void>> = [];
 beforeEach(() => {
   const timeout = globalThis.setTimeout;
   vi.spyOn(globalThis, "setTimeout").mockImplementation(((fn: () => void, ms?: number) =>
     timeout(fn, [2000, 5000, 10000].includes(ms ?? 0) ? 0 : ms)) as typeof setTimeout);
 });
-afterEach(() => { for (const cleanup of cleanups.splice(0).reverse()) cleanup(); vi.restoreAllMocks(); });
+afterEach(async () => {
+  for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
+  vi.useRealTimers(); vi.restoreAllMocks();
+});
 
 function setup(location = REMOTE) {
   const cwd = mkdtempSync(path.join(tmpdir(), "seam-466-"));
@@ -104,6 +108,7 @@ function setup(location = REMOTE) {
   const mux = { spawn: remoteSpawn, rpc: vi.fn(async (_method: string, _params: unknown, _opts?: unknown) => ({ projectMcpInjection: true })), releaseStdin: vi.fn(),
     sendCmd: vi.fn(async (_action: string, _payload: unknown) => ({ health: calls.children.map(child => ({ slot: child.slot, alive: !child.killed })) })) };
   const hub = { markSessionBridge: vi.fn(), get: vi.fn(() => ({ mux })),
+    isBridgeReady: vi.fn(() => true),
     mcpServersForBridgeSpawn: vi.fn(() => remoteSeam), rpc: vi.fn(async (_location: string, _method: string, _params: unknown, _agent: string) => ({})) };
   const adapter = { sendPanel: vi.fn(async (channel: any, _panel?: unknown) => ({ channel, id: "panel" })),
     sendMessage: vi.fn(async (channel: any, _text?: string) => ({ channel, id: "message" })),
@@ -113,7 +118,7 @@ function setup(location = REMOTE) {
     const orch = new Orchestrator({ logger, store, router: router as any, adapter: adapter as any,
       renderer: discordRenderer, modelCatalog: fixtureModelCatalog([profile]),
       config: { DATA_DIR: cwd, REPOS_ROOT: cwd, TURN_TIMEOUT_SECONDS: 15, SEAM_TURN_RESUME_ENABLED: true,
-        REPO_EMOJIS: new Map(),
+        REPO_EMOJIS: new Map(), bridgePresets: new Map([[location, { id: location }]]),
         channelPresets: new Map([["parent", { rider: { value: RIDERS[0] } }]]),
         threadPresets: new Map([["author", { rider: { value: RIDERS[1] } }]]) } as any });
     orch.setBridgeHub(hub as any);
@@ -156,6 +161,158 @@ describe("#545 durable scheduled degradation", () => {
     await h.make().runScheduledPrompt(h.row.id);
     expect(h.store.turnAttempts.list("completed")).toHaveLength(1);
     expect(h.logs).toContainEqual(expect.objectContaining({ msg: "stdout fallback evidence could not be persisted", code: "unauthenticated" }));
+  });
+});
+
+function offlineSchedule(mode: "live" | "isolated", cached = false, location = REMOTE) {
+  const h = setup(location);
+  const events = new EventEmitter();
+  let ready = true;
+  h.store.upsertScheduled({ ...h.row, sessionMode: mode, targetChannel: null });
+  h.hub.isBridgeReady.mockImplementation(() => ready);
+  h.hub.get.mockImplementation(() => ready ? { mux: h.mux } : undefined as any);
+  Object.assign(h.hub, { onBridgeReady: (listener: (id: string) => void) => {
+    events.on("ready", listener); return () => events.off("ready", listener);
+  } });
+  h.mux.rpc.mockImplementation(async () => {
+    if (!ready) throw new BridgeUnreachableError("Remote bridge is offline. Make sure the bridge is running.", false);
+    return { projectMcpInjection: true, rung1RecoveryVersion: 1 };
+  });
+  h.mux.sendCmd.mockImplementation(async (action, payload: any) => {
+    if (!ready) throw new BridgeUnreachableError("Remote bridge is offline. Make sure the bridge is running.", false);
+    if (action === "armRung1Recovery") return { version: 1, owner: "bridge", ...payload,
+      rung: 1, phase: "armed", retry: 0, budget: 3, remaining: 3,
+      disposition: "continue_same_session", updatedUtc: new Date().toISOString() } as any;
+    return { health: h.calls.children.map(child => ({ slot: child.slot, alive: !child.killed })) };
+  });
+  const catalog = fixtureModelCatalog([h.profile]);
+  const router = new SessionRouter({ logger: h.logger, store: h.store, profiles: [h.profile],
+    modelCatalog: catalog, defaultAgentId: h.profile.id, defaultModel: MODEL, defaultCwd: h.cwd,
+    threadPresets: new Map([["author", { location }]]),
+    executionBridge: { isBridgeSession: () => true, muxForSession: () => h.mux },
+    bindSessionLocation: () => {},
+  });
+  cleanups.push(() => router.disposeAll());
+  if (!cached) { h.record.acpSessionId = ""; h.store.upsert(h.record); }
+  const orch = new Orchestrator({ logger: h.logger, store: h.store, router,
+    recoverySleep: async () => {},
+    adapter: h.adapter as any, renderer: discordRenderer, modelCatalog: catalog,
+    config: { DATA_DIR: h.cwd, REPOS_ROOT: h.cwd, TURN_TIMEOUT_SECONDS: 1,
+      SEAM_TURN_RESUME_ENABLED: true, REPO_EMOJIS: new Map(),
+      bridgePresets: new Map([[location, { id: location }]]),
+      channelPresets: new Map(), threadPresets: new Map([["author", { location }]]) } as any });
+  orch.setBridgeHub(h.hub as any);
+  const disconnect = () => { ready = false; };
+  const reconnect = (id = location) => { if (id === location) ready = true; events.emit("ready", id); };
+  return { ...h, router, orch, events, disconnect, reconnect };
+}
+
+async function drainPreprompt() {
+  for (let i = 0; i < 30; i++) await new Promise<void>(resolve => setImmediate(resolve));
+}
+
+async function prepromptBoundary(h: ReturnType<typeof offlineSchedule>, id: string) {
+  for (let i = 0; i < 200; i++) {
+    const attempt = h.store.turnAttempts.get(id);
+    if (h.events.listenerCount("ready") || attempt && attempt.state !== "active") return;
+    await delay(5);
+  }
+  throw new Error("the scheduled turn reached neither a bridge wait nor a terminal outcome");
+}
+
+describe("pre-prompt bridge reconnect on the scheduled execution paths", () => {
+  it.each([
+    { mode: "live" as const, cached: true },
+    { mode: "live" as const, cached: false },
+    { mode: "isolated" as const, cached: false },
+    { mode: "live" as const, cached: true, location: "local" },
+  ])("waits before $mode submission (cached=$cached, location=$location), then delivers once on the same host", async ({ mode, cached, location }) => {
+    const h = offlineSchedule(mode, cached, location);
+    if (cached) await h.router.getOrStartRuntime(h.record);
+    const spawns = h.remoteSpawn.mock.calls.length;
+    const loads = h.calls.loads.length;
+    h.disconnect();
+    const key = scheduledOccurrenceKey(h.row.id);
+    const turn = h.orch.runScheduledPrompt(h.row.id, key);
+    try {
+      await prepromptBoundary(h, key.id);
+      expect(h.store.turnAttempts.get(key.id)).toMatchObject({ state: "active", promptStarted: false });
+      expect(h.calls.prompts).toEqual([]);
+      expect(h.remoteSpawn).toHaveBeenCalledTimes(spawns);
+      expect(h.mux.sendCmd.mock.calls.some(([action]) => action === "armRung1Recovery")).toBe(false);
+      expect(JSON.stringify([...h.adapter.sendPanel.mock.calls, ...h.adapter.editPanel.mock.calls, ...h.adapter.sendMessage.mock.calls]))
+        .toContain("Reconnecting to session");
+      h.reconnect("another-host"); await drainPreprompt();
+      expect(h.calls.prompts).toEqual([]);
+      h.reconnect(); await turn;
+      expect(h.calls.prompts).toHaveLength(1);
+      expect(h.calls.prompts[0].prompt[0].text).toContain(h.row.promptText);
+      if (cached) {
+        expect(h.remoteSpawn).toHaveBeenCalledTimes(spawns);
+        expect(h.calls.loads).toHaveLength(loads);
+        expect(h.calls.prompts[0].sessionId).toBe(h.record.acpSessionId);
+      }
+      expect(h.localSpawn).not.toHaveBeenCalled();
+      expect(h.store.turnAttempts.get(key.id)).toMatchObject({ state: "completed", deliveryDone: true,
+        outcome: { status: "completed", output: "synthetic result" } });
+      expect(h.events.listenerCount("ready")).toBe(0);
+    } finally { h.reconnect(); await turn; }
+  });
+
+  it.each(["live", "isolated"] as const)("keeps %s unsent for the full 15-minute bound", async mode => {
+    const h = offlineSchedule(mode); h.disconnect();
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    const key = scheduledOccurrenceKey(h.row.id);
+    const turn = h.orch.runScheduledPrompt(h.row.id, key);
+    try {
+      await prepromptBoundary(h, key.id); await vi.advanceTimersByTimeAsync(15 * 60_000 - 1);
+      expect(h.store.turnAttempts.get(key.id)).toMatchObject({ state: "active", promptStarted: false });
+      expect(h.calls.prompts).toEqual([]);
+      await vi.advanceTimersByTimeAsync(1); await turn;
+      expect(JSON.stringify(h.store.turnAttempts.get(key.id))).toMatch(/remote-synthetic.*15 minutes/);
+      expect(h.events.listenerCount("ready")).toBe(0);
+    } finally { h.reconnect(); await turn; }
+  });
+
+  it.each((["live", "isolated"] as const).flatMap(mode =>
+    (["cancel", "shutdown"] as const).map(action => ({ mode, action }))))
+  ("releases the $mode pre-prompt wait on $action without submitting", async ({ mode, action }) => {
+    const h = offlineSchedule(mode); h.disconnect();
+    const key = scheduledOccurrenceKey(h.row.id);
+    const turn = h.orch.runScheduledPrompt(h.row.id, key);
+    try {
+      await prepromptBoundary(h, key.id);
+      expect(h.store.turnAttempts.get(key.id)).toMatchObject({ state: "active", promptStarted: false });
+      if (action === "cancel") h.store.turnAttempts.cancel(key.id, "cancelled by operator");
+      else h.orch.suspendForRestart();
+      await turn;
+      expect(h.calls.prompts).toEqual([]);
+      expect(h.events.listenerCount("ready")).toBe(0);
+      expect(h.store.turnAttempts.get(key.id)).toMatchObject({
+        state: action === "cancel" ? "cancelled" : "suspended", promptStarted: false });
+    } finally { h.reconnect(); await turn; }
+  });
+
+  it.each(["live", "isolated"] as const)("refuses an unknown %s bridge location without waiting", async mode => {
+    const h = offlineSchedule(mode, false, "unpaired-host"); h.disconnect();
+    (h.orch as any).config.bridgePresets.clear();
+    const key = scheduledOccurrenceKey(h.row.id);
+    await h.orch.runScheduledPrompt(h.row.id, key);
+    expect(h.calls.prompts).toEqual([]);
+    expect(h.events.listenerCount("ready")).toBe(0);
+    expect(JSON.stringify(h.store.turnAttempts.get(key.id))).toMatch(/Unknown bridge location.*unpaired-host/);
+  });
+
+  it("surfaces an agent-not-installed cause immediately, not as a reconnect wait", async () => {
+    const h = offlineSchedule("isolated");
+    const cause = "agent 'agy' is not installed on this host";
+    h.mux.rpc.mockRejectedValue(new Error(cause));
+    const key = scheduledOccurrenceKey(h.row.id);
+    await h.orch.runScheduledPrompt(h.row.id, key);
+    expect(h.store.turnAttempts.get(key.id)).toMatchObject({ state: "completed",
+      outcome: { status: "failed", error: cause } });
+    expect(h.calls.prompts).toEqual([]);
+    expect(h.events.listenerCount("ready")).toBe(0);
   });
 });
 

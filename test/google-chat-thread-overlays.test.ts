@@ -29,6 +29,9 @@ vi.mock("../packages/core/src/agents/agent-runtime.js", async importOriginal => 
     async newSession() { this.sessionId = "fresh-provider-context"; return { sessionId: this.sessionId }; }
     getSessionInfo() { return { sessionId: this.sessionId, currentModelId: this.modelOverride, availableModels: [] }; }
     getConfigSelectValues() { return []; }
+    hasDelegatedTurnInFlight() { return false; }
+    supportsSessionLoad() { return true; }
+    markActivity() { this.lastActivityAtMs = Date.now(); }
     async dispose() {}
     async setModel(model: string) { this.modelOverride = model; }
     async setConfigOption() {}

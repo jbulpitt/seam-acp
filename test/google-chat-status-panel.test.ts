@@ -114,6 +114,17 @@ describe("Google Chat compact status cards", () => {
     expect(text(restored)).not.toContain("💡 now complete");
   });
 
+  it("preserves the pending buffer's whitespace across restore and the next chunk", () => {
+    const turn = status();
+    turn.pushThinkingChunk(" \ncontinued ");
+    const restored = TurnStatus.restore(JSON.parse(JSON.stringify(turn.snapshot())));
+    turn.pushThinkingChunk("thought\n");
+    restored.pushThinkingChunk("thought\n");
+    expect(turn.thinkingWindow()?.at(-1)).toBe("continued thought");
+    expect(restored.thinkingWindow()).toEqual(turn.thinkingWindow());
+    expect(text(restored)).toEqual(text(turn));
+  });
+
   it("keeps legacy snapshots with only complete thinking lines readable", () => {
     const snapshot = status().snapshot();
     snapshot.input.thinking = ["old complete", "last complete"];

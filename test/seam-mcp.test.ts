@@ -711,9 +711,12 @@ describe("SeamMcpServer", () => {
     );
   });
 
-  it("configure_thread applies configuration first, then deterministically rebuilds the target", async () => {
+  it.each([
+    { platform: "discord", label: "Discord" },
+    { platform: "google-chat", label: "Google Chat" },
+  ])("configure_thread applies configuration first, then labels the $platform rebuild", async ({ platform, label }) => {
     const target = makeRecord({
-      id: "discord:thread-target",
+      id: `${platform}:thread-target`, platform,
       channelRef: "thread-target",
       parentRef: "chan-1",
     });
@@ -749,6 +752,7 @@ describe("SeamMcpServer", () => {
       attachmentReason: "swapped",
     }));
     h = await makeHarness({
+      resolveSession: token => token === "good-token" ? makeRecord({ id: `${platform}:thread-caller`, platform, parentRef: "chan-1" }) : undefined,
       resolveThread: (id) => id === target.channelRef ? target : undefined,
       configureThread,
       rebuildThread,
@@ -777,14 +781,17 @@ describe("SeamMcpServer", () => {
     );
     expect(rebuildThread).toHaveBeenCalledWith(target);
     expect(body.result.content[0].text).toContain("configuration confirmed");
-    expect(body.result.content[0].text).toContain("deterministic Discord reconstruction complete");
+    expect(body.result.content[0].text).toContain(`deterministic ${label} reconstruction complete`);
     expect(body.result.content[0].text).toContain("rebuilt-1");
     expect(body.result.content[0].text).toContain("attached (swapped)");
   });
 
-  it("configure_thread accepts rebuild:true as the only action", async () => {
+  it.each([
+    { platform: "discord", label: "Discord" },
+    { platform: "google-chat", label: "Google Chat" },
+  ])("configure_thread accepts rebuild:true as the only action and labels $platform history", async ({ platform, label }) => {
     const target = makeRecord({
-      id: "discord:thread-target",
+      id: `${platform}:thread-target`, platform,
       channelRef: "thread-target",
       parentRef: "chan-1",
     });
@@ -798,6 +805,7 @@ describe("SeamMcpServer", () => {
       attachmentReason: "swapped",
     }));
     h = await makeHarness({
+      resolveSession: token => token === "good-token" ? makeRecord({ id: `${platform}:thread-caller`, platform, parentRef: "chan-1" }) : undefined,
       resolveThread: (id) => id === target.channelRef ? target : undefined,
       configureThread,
       rebuildThread,
@@ -812,7 +820,7 @@ describe("SeamMcpServer", () => {
     expect(body.result.isError).toBeFalsy();
     expect(configureThread).not.toHaveBeenCalled();
     expect(rebuildThread).toHaveBeenCalledWith(target);
-    expect(body.result.content[0].text).toContain("rebuilt from Discord");
+    expect(body.result.content[0].text).toContain(`rebuilt from ${label}`);
     expect(body.result.content[0].text).toContain("rebuilt-only");
   });
 

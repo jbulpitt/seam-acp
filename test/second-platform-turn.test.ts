@@ -200,6 +200,45 @@ describe("a second chat platform runs a normal turn", () => {
       "platform nonce lookup deferred");
   });
 
+  it("replays a captured Space answer once after a fully proved missing nonce, without running the provider", async () => {
+    const { GoogleChatAdapter } = await import("../packages/core/src/platforms/google-chat/adapter.js");
+    const { GoogleChatHistoryReader } = await import("../packages/core/src/core/messages/google-chat-history.js");
+    const h = setup("google-chat");
+    const channel = { platform: "google-chat", id: "AAA.TTT", parentId: "AAA" };
+    const message = "Permission denied to perform the requested action on the specified resource, or the resource doesn't exist.";
+    const cause = Object.assign(new Error(message), { response: { status: 403, data: { error: {
+      code: 403, status: "PERMISSION_DENIED", message, errors: [{ message, domain: "global", reason: "forbidden" }],
+    } } } });
+    const historyRequest = vi.fn(async (options: any) => {
+      if (!new URL(options.url).pathname.endsWith("/messages")) throw cause;
+      return { data: { messages: [] } };
+    });
+    const request = vi.fn(async (_scope: string, options: any) => ({ name: "spaces/AAA/messages/TTT.answer",
+      text: options.data.text, thread: options.data.thread }));
+    const chat = new GoogleChatAdapter({ api: { request },
+      historyReader: new GoogleChatHistoryReader({ credentialsFile: "/test/key.json" }, { request: historyRequest }),
+      subscription: "projects/test/subscriptions/events", allowedUserIds: new Set(["users/42"]),
+      defaultCwd: "/synthetic", logger: (h.orch as any).logger, writeIntervalMs: 0 });
+    await chat.receiveEvent({ type: "ADDED_TO_SPACE", space: { name: "spaces/AAA", spaceType: "SPACE" } });
+    (h.orch as any).adapter = chat;
+    const spec = { id: "chat-missing-nonce-recovery", target: channel.id, prompt: "already completed", session: "live" as const };
+    h.store.turnAttempts.admit(spec);
+    const attempt = h.store.turnAttempts.claim(spec, "fixture", "fixture-boot");
+    h.store.turnAttempts.complete(attempt, { id: spec.id, target: channel.id, status: "completed",
+      output: "retained answer", finishedUtc: new Date().toISOString() });
+    h.store.turnAttempts.prepareDelivery(spec.id, channel.id, { kind: "message", text: "retained answer" });
+    const receipt = h.store.turnAttempts.get(spec.id)!;
+    const warn = vi.spyOn((h.orch as any).logger, "warn");
+    await expect((h.orch as any).recoverRecordedDelivery(receipt, channel)).resolves.toBe("delivered");
+    expect(h.store.turnAttempts.get(spec.id)).toMatchObject({ state: "completed", deliveryDone: true,
+      deliveryAbandonedReason: null, deliveryUncertainReason: null });
+    expect(historyRequest).toHaveBeenCalledTimes(2);
+    expect(request).toHaveBeenCalledOnce();
+    expect(request.mock.calls[0]).toMatchObject(["chat", { method: "POST", data: { text: "retained answer" } }]);
+    expect(warn).not.toHaveBeenCalled();
+    expect(h.runtime.prompt).not.toHaveBeenCalled();
+  });
+
   it("signals committed admission before a long turn finishes, including a duplicate receipt", async () => {
     const h = setup("test");
     let finish!: () => void;

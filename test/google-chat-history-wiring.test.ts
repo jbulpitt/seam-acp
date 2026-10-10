@@ -110,6 +110,17 @@ describe("Google Chat adapter history wiring", () => {
     expect(h.historyRequest).not.toHaveBeenCalled();
   });
 
+  it("uses the wired Space history to prove absence after Google's ambiguous missing-client-id 403", async () => {
+    const h = setup();
+    const message = "Permission denied to perform the requested action on the specified resource, or the resource doesn't exist.";
+    h.historyRequest.mockRejectedValueOnce(Object.assign(new Error(message), { response: { status: 403, data: { error: {
+      code: 403, status: "PERMISSION_DENIED", message, errors: [{ message, domain: "global", reason: "forbidden" }],
+    } } } }));
+    await expect(h.adapter.findMessageByNonce(channel, "missing", 0)).resolves.toEqual({ status: "absent" });
+    expect(h.historyRequest).toHaveBeenCalledTimes(2);
+    expect(new URL(h.historyRequest.mock.calls[1]![0].url).searchParams.has("filter")).toBe(false);
+  });
+
   it("fills omitted sender names from the same message's durable admission, without another Google call", async () => {
     const h = setup();
     const store = new SessionStore(":memory:");

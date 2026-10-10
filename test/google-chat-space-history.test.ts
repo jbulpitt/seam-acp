@@ -19,6 +19,14 @@ const thread = `${space}/threads/topic`;
 const target: GoogleChatHistoryTarget = { space, thread, spaceType: "SPACE" };
 const config = { credentialsFile: "/test/chat-service-account.json" };
 const dmCause = "DMs are not supported for methods requiring app authentication with administrator approval";
+const ambiguousMissingCause = "Permission denied to perform the requested action on the specified resource, or the resource doesn't exist.";
+
+function ambiguousMissing() {
+  return Object.assign(new Error(ambiguousMissingCause), { response: { status: 403, data: { error: {
+    code: 403, message: ambiguousMissingCause, status: "PERMISSION_DENIED",
+    errors: [{ message: ambiguousMissingCause, domain: "global", reason: "forbidden" }],
+  } } } });
+}
 
 function message(index: number, overrides: Partial<GoogleChatHistoryMessage> = {}): GoogleChatHistoryMessage {
   return {
@@ -231,6 +239,62 @@ describe("Google Chat named-space delivery nonce lookup", () => {
     const error = Object.assign(new Error("Google: message not found"), { response: { status: 404 } });
     const chat = fakeChat(() => { throw error; });
     await expect(findMessageByNonce(chat.reader, target, "delivery-1")).resolves.toEqual({ status: "absent" });
+  });
+
+  it("proves absence after the observed ambiguous 403 by exhausting Space history, including empty native pages", async () => {
+    const responses = [{ nextPageToken: "more" }, { messages: [message(1)] }];
+    const chat = fakeChat(options => {
+      const url = new URL(String(options.url));
+      if (!url.pathname.endsWith("/messages")) throw ambiguousMissing();
+      return responses.shift();
+    });
+    await expect(findMessageByNonce(chat.reader, target, "delivery-1")).resolves.toEqual({ status: "absent" });
+    expect(chat.request).toHaveBeenCalledTimes(3);
+    const queries = chat.request.mock.calls.slice(1).map(([options]) => Object.fromEntries(new URL(String(options.url)).searchParams));
+    expect(queries).toEqual([
+      { pageSize: "100", orderBy: "createTime DESC" },
+      { pageSize: "100", orderBy: "createTime DESC", pageToken: "more" },
+    ]);
+  });
+
+  it("finds the sender client ID on a later native page instead of inferring absence from a 403", async () => {
+    const canonical = { ...message(2, { sender: { name: "users/app", type: "BOT" },
+      thread: { name: `${space}/threads/other` } }), clientAssignedMessageId: googleChatClientMessageId("delivery-1") };
+    const responses = [{ messages: [message(1)], nextPageToken: "later" }, { messages: [canonical] }];
+    const chat = fakeChat(options => {
+      if (!new URL(String(options.url)).pathname.endsWith("/messages")) throw ambiguousMissing();
+      return responses.shift();
+    });
+    await expect(findMessageByNonce(chat.reader, target, "delivery-1")).resolves.toMatchObject({
+      status: "found", message: { messageId: canonical.name, threadName: `${space}/threads/other` },
+    });
+    expect(chat.request).toHaveBeenCalledTimes(3);
+  });
+
+  it("preserves the real denial from an incomplete Space-history proof after an ambiguous GET", async () => {
+    const denied = Object.assign(new Error("The administrator must grant the required OAuth authorization scope"),
+      { response: { status: 403, data: { error: { status: "PERMISSION_DENIED", message: "admin approval required" } } } });
+    const chat = fakeChat(options => {
+      if (!new URL(String(options.url)).pathname.endsWith("/messages")) throw ambiguousMissing();
+      if (chat.request.mock.calls.length === 2) return { messages: [message(1)], nextPageToken: "later" };
+      throw denied;
+    });
+    await expect(findMessageByNonce(chat.reader, target, "delivery-1")).rejects.toBe(denied);
+    expect(chat.request).toHaveBeenCalledTimes(3);
+  });
+
+  it.each([
+    { status: "UNAUTHENTICATED", reason: "forbidden", message: ambiguousMissingCause },
+    { status: "PERMISSION_DENIED", reason: "insufficientPermissions", message: ambiguousMissingCause },
+    { status: "PERMISSION_DENIED", reason: "forbidden", message: "The administrator must grant the required OAuth authorization scope" },
+  ])("does not reinterpret a different Google 403 ($status / $reason) as the observed missing-resource response", async body => {
+    const denied = Object.assign(new Error(body.message), { response: { status: 403, data: { error: {
+      code: 403, status: body.status, message: body.message,
+      errors: [{ message: body.message, domain: "global", reason: body.reason }],
+    } } } });
+    const chat = fakeChat(() => { throw denied; });
+    await expect(findMessageByNonce(chat.reader, target, "delivery-1")).rejects.toBe(denied);
+    expect(chat.request).toHaveBeenCalledOnce();
   });
 
   it.each([401, 403, 429, 500])("retains a Google %s denial or outage instead of treating it as absent", async (status) => {

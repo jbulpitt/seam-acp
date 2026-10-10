@@ -38,6 +38,8 @@ export type DeliveryNonceLookup =
 
 /** A file attached to an incoming message, normalized across platforms. */
 export interface MessageAttachment {
+  /** Platform owning an authenticated media reference; absent means the primary adapter. */
+  platform?: string;
   /** Discord: a CDN URL. Other platforms: whatever `downloadAttachment` reads. */
   url: string;
   filename: string;
@@ -49,6 +51,10 @@ export interface MessageAttachment {
 
 /** Incoming user message, normalized across platforms. */
 export interface IncomingMessage {
+  /** Transport receipt is safe to acknowledge only once its durable owner exists. */
+  onAdmitted?: () => void;
+  /** Platform's default for a newly-created session. */
+  cwd?: string;
   /** Stable platform message id. Real Discord user messages always provide it;
    * synthetic turns omit it and therefore do not enter the inbound ledger. */
   messageId?: string;

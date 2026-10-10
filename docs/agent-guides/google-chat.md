@@ -99,8 +99,8 @@ enable file-output wiring in the current adapter.
    Marketplace-compatible OAuth client to the service account, configure and
    publish a private Marketplace listing (individual + admin install, Chat app
    integration), then have a Workspace administrator install it for the
-   organization and approve the scope. Approval does not itself wire the
-   history reader into Seam.
+   organization and approve the scope. The controller builds the history
+   reader from the same credentials file.
 6. For unmentioned Space messages, enable the Google Workspace Events API and
    approve the same `chat.app.messages.readonly` scope. Set `GOOGLE_CHAT_TOPIC`
    to the topic configured on the pull subscription; its existing publisher grant
@@ -115,22 +115,20 @@ asset paths and operator commands in `docs/local/`.
 
 ## Current limits
 
-The live adapter supports text turns, text status updates, threaded replies
-and inbound attachment downloads. The Markdown formatter, interactive cards,
-Shared Drive uploader and `/new`, `/cancel`, `/agent`, `/model` command helpers
-exist as standalone modules; adapter wiring is still in progress. Registering
-the slash commands alone does not activate those helpers.
+The live adapter supports formatted text turns, cardsV2 status and interaction
+cards, threaded replies, inbound attachment downloads and `/new`, `/cancel`,
+`/agent`, `/model`. Configured Shared Drive output uploads files and posts a
+link; without that configuration, file output uses text or a binary placeholder.
 
-History reads, history-based reconstruction and search are not enabled until
-the readonly scope is approved and the reader is wired. Restart-safe output
-delivery deduplication also depends on that integration. For an uncertain
-delivery, the current adapter reports an indeterminate lookup; it does not
+Named-space history reads, reconstruction, search and restart-safe output
+delivery deduplication use the administrator-approved readonly scope. DM
+history and uncertain-delivery lookup remain unsupported with Google's real
+cause; see [named-space history](google-chat-history.md). The adapter does not
 claim the message is absent and resend it. Durable inbound admission is a
 separate mechanism.
 
 Voice/live help, permission cards and cross-platform handoff are outside this
-MVP. Agent file output currently uses text or a binary-placeholder response,
-not a Drive upload.
+MVP.
 
 ## Data flow
 

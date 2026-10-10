@@ -17,6 +17,7 @@ export function assembleReconstruction(opts: {
   budgetTokens: number;
   riders?: ReconstructionRiders;
   sourcePostCount: number;
+  sourceName?: string;
   normalize?: (text: string, options?: { priorExactTexts?: ReadonlySet<string> }) => NormalizeResult;
   onNormalizeError?: (info: { messageId: string }) => void;
 }): ReconstructionSeed {
@@ -47,6 +48,7 @@ export function assembleReconstruction(opts: {
     budgetTokens: opts.budgetTokens,
     riders: opts.riders,
     sourcePostCount: opts.sourcePostCount,
+    sourceName: opts.sourceName,
     transformSavedTokens: Math.ceil(savedChars / 4),
   });
 
@@ -56,6 +58,7 @@ export function assembleReconstruction(opts: {
     contextWindow: opts.contextWindow,
     budgetTokens: opts.budgetTokens,
     sourcePostCount: opts.sourcePostCount,
+    sourceName: opts.sourceName,
     transformSavedTokens: Math.ceil(savedChars / 4),
   });
 }

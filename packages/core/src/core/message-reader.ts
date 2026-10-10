@@ -7,7 +7,7 @@
  * a future FTS implementation can replace the live walk without changing MCP.
  */
 
-import type { MessageLink } from "../platforms/chat-adapter.js";
+import type { ChatAdapter, MessageLink } from "../platforms/chat-adapter.js";
 
 export type MessageAuthorType = "human" | "bot";
 
@@ -128,6 +128,16 @@ export interface MessageReaderOptions {
   logger?: {
     warn: (obj: unknown, msg?: string) => void;
   };
+}
+
+export function createAdapterMessageReaders(adapter: ChatAdapter, options: MessageReaderOptions = {}): {
+  reader?: MessageReader;
+  search?: LiveMessageSearch;
+} {
+  const reader = adapter.fetchMessagePage
+    ? new MessageReader({ fetchMessagePage: (id, request) => adapter.fetchMessagePage!(id, request) }, options)
+    : undefined;
+  return { reader, search: reader ? new LiveMessageSearch(reader) : undefined };
 }
 
 const DISCORD_EPOCH_MS = 1_420_070_400_000;

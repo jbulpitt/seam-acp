@@ -7,6 +7,9 @@ import type { SessionRecord } from "../packages/core/src/core/types.js";
 import type { MessagePage, MessagePageItem, MessagePageRequest } from "../packages/core/src/core/message-reader.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 import { visualConfig } from "./plugin-card-visuals-fixture.js";
+import { GoogleChatAdapter } from "../packages/core/src/platforms/google-chat/adapter.js";
+import { multiplexChatAdapters } from "../packages/core/src/platforms/google-chat/multiplex.js";
+import { GoogleChatHistoryReader } from "../packages/core/src/core/messages/google-chat-history.js";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
 const SEAM = "seam-bot";
@@ -52,6 +55,7 @@ function page(rows: readonly MessagePageItem[], over: Partial<MessagePage> = {})
 }
 
 function makeOrch(over?: {
+  adapter?: any;
   posts?: MessagePageItem[];
   cfg?: { model?: string; reasoningEffort?: string; lastContextUsage?: {
     model: string; size: number; budget?: import("../packages/core/src/core/context-budget.js").ContextBudgetObservation;
@@ -112,7 +116,7 @@ function makeOrch(over?: {
       channelPresets: over?.channelPresets ?? new Map(),
       threadPresets: over?.threadPresets ?? new Map(),
     } as any,
-    adapter: {
+    adapter: over?.adapter ?? {
       getBotUserId: () => ("botId" in (over ?? {}) ? over!.botId : SEAM),
       fetchMessagePage: async (_threadId: string, request: MessagePageRequest) => {
         fetchCalls.push(1);
@@ -194,6 +198,58 @@ function makeOrch(over?: {
 }
 
 describe("reconstructSessionFromDiscord", () => {
+  function chatFixture(error?: Error) {
+    const ch = { platform: "google-chat", id: "team.A", parentId: "team" };
+    const thread = "spaces/team/threads/A";
+    const history = vi.fn(async (): Promise<any> => {
+      if (error) throw error;
+      return { data: { messages: [
+        { name: "spaces/team/messages/3", createTime: "2026-10-10T12:00:03Z", text: "other bot must not become Seam", sender: { name: "users/other-app", type: "BOT" } },
+        { name: "spaces/team/messages/2", createTime: "2026-10-10T12:00:02Z", text: "I remember heliotrope", sender: { name: "users/real-seam-app", type: "BOT" } },
+        { name: "spaces/team/messages/1", createTime: "2026-10-10T12:00:01Z", text: "remember heliotrope", sender: { name: "users/42", type: "HUMAN", displayName: "Alex" } },
+      ] } };
+    });
+    const writes = vi.fn(async (_scope: string, r: any): Promise<any> => r.method === "GET"
+      ? { name: "spaces/team", spaceType: "SPACE" }
+      : { name: "spaces/team/messages/rebuild-card", thread: { name: thread }, sender: { name: "users/real-seam-app", type: "BOT" } });
+    const chat = new GoogleChatAdapter({ api: { request: writes },
+      historyReader: new GoogleChatHistoryReader({ credentialsFile: "/test/key.json" }, { request: history }),
+      subscription: "projects/test/subscriptions/events", allowedUserIds: new Set(["users/42"]),
+      defaultCwd: "/repo", logger: silent, writeIntervalMs: 0 } as any);
+    const discord = { platform: "discord", start: async () => {}, stop: async () => {}, onMessage: () => {},
+      sendMessage: vi.fn(), editMessage: vi.fn(), getBotUserId: vi.fn(() => "discord-seam-bot"),
+      fetchMessagePage: vi.fn(async () => page([])) };
+    const mux = multiplexChatAdapters([discord, chat], () => "google-chat");
+    const t = makeOrch({ adapter: mux, recordOver: { id: "google-chat:team.A", platform: "google-chat", channelRef: ch.id, parentRef: ch.parentId } });
+    return { ...t, ch, chat, discord, history, writes };
+  }
+
+  it("rebuilds a Chat thread through the real adapter/history/projection and preserves its own assistant identity", async () => {
+    const t = chatFixture();
+    const result = await t.orch.rebuildThreadFromDiscord(t.rec);
+    expect(result.attached).toBe(true); expect(t.bound.value).toBe("sess-new");
+    expect(t.seedCalls).toHaveLength(1);
+    expect(t.seedCalls[0].summary).toContain("Human — Alex");
+    expect(t.seedCalls[0].summary).toContain("Assistant — Seam\n\nI remember heliotrope");
+    expect(t.seedCalls[0].summary).not.toContain("other bot must not become Seam");
+    expect(t.seedCalls[0].summary).toContain("from Google Chat");
+    expect(t.discord.getBotUserId).not.toHaveBeenCalled(); expect(t.discord.fetchMessagePage).not.toHaveBeenCalled();
+    expect(t.history).toHaveBeenCalledOnce();
+    const panels = t.writes.mock.calls.filter(([, r]) => r.data?.cardsV2);
+    expect(panels.length).toBeGreaterThan(0);
+    expect(JSON.stringify(panels)).toContain("Google Chat");
+    expect(JSON.stringify(panels)).not.toContain("Fetching Discord history");
+    for (const [, r] of panels) if (r.method === "POST") expect(r.data.thread.name).toBe("spaces/team/threads/A");
+  });
+
+  it("preserves Google's real history failure and the old Chat session instead of seeding partial history", async () => {
+    const cause = Object.assign(new Error("The administrator must grant the app the required OAuth authorization scope"), { response: { status: 403 } });
+    const t = chatFixture(cause);
+    await expect(t.orch.rebuildThreadFromDiscord(t.rec)).rejects.toBe(cause);
+    expect(t.seedCalls).toHaveLength(0); expect(t.casCalls).toHaveLength(0);
+    expect(t.bound.value).toBe("acp-active");
+  });
+
   it("cross-thread wrapper rebuilds the authoritative post-configuration record", async () => {
     const t = makeOrch({
       recordOver: {

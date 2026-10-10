@@ -28,6 +28,7 @@ export function selectReconstructionRanges(opts: {
   budgetTokens: number;
   riders?: ReconstructionRiders;
   sourcePostCount: number;
+  sourceName?: string;
   transformSavedTokens?: number;
 }): ReconstructionSelection {
   const messages = [...opts.messages];
@@ -42,6 +43,7 @@ export function selectReconstructionRanges(opts: {
       contextWindow: opts.contextWindow,
       budgetTokens: opts.budgetTokens,
       sourcePostCount: opts.sourcePostCount,
+      sourceName: opts.sourceName,
       transformSavedTokens: opts.transformSavedTokens ?? 0,
     }).estimatedTokens;
 

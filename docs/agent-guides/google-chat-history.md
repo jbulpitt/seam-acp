@@ -1,9 +1,9 @@
 # Google Chat named-space history
 
-The modules in `core/messages/google-chat-history.ts` and
-`core/messages/google-chat-space-history.ts` are standalone: adapter and controller
-wiring remain separate. Set `GOOGLE_CHAT_CREDENTIALS_FILE` to the existing
-service-account JSON key and load it with `loadGoogleChatHistoryConfig()`.
+The Chat adapter uses `core/messages/google-chat-history.ts` and
+`core/messages/google-chat-space-history.ts` for named-space history. The
+controller injects a reader built from the existing
+`GOOGLE_CHAT_CREDENTIALS_FILE`; the modules also remain usable standalone.
 
 It uses app authentication with
 `https://www.googleapis.com/auth/chat.app.messages.readonly`, without impersonating
@@ -69,26 +69,28 @@ Only a 404 means absent; other errors propagate. Google's
 are set at creation, start with `client-`, and can substitute for the message
 ID in later requests. Lookup needs no time window or history scan.
 
-## Adapter call sites
+## Seam readers and reconstruction
 
-- `GoogleChatAdapter.fetchMessagePage(threadId, request)` (new method): resolve
-  the space, optional native thread and actual `spaceType`; call the standalone
-  function. Return `result.page` on success and surface `result.cause` on
-  unsupported. Do not return an empty page for a DM.
-- `GoogleChatAdapter.findMessageByNonce(channel, nonce)` (existing unsupported
-  stub): call the standalone lookup. Map the canonical message name and native
-  thread to `MessageRef`; map unsupported to the existing `indeterminate`
-  result with its cause as `reason`. `sinceMs` is unnecessary for an exact ID.
-- `GoogleChatAdapter.postMessage` and its 409 lookup: use the exported
-  `googleChatClientMessageId` in place of the identical private `clientId`.
-- Controller construction in `index.ts`: create one history reader, inject it
-  into Chat, and route the MCP `MessageReader` source through the multiplexed
-  adapter. It currently uses the Discord adapter directly.
-- The existing rebuild source in `Orchestrator.reconstructSessionFromDiscord`
-  already calls `this.adapter.fetchMessagePage`; it can use the same Chat source.
-  Its `getBotUserId()` call must use the target platform's identity before
-  projection; a no-argument call currently selects the primary Discord adapter.
-  Discord-specific notices and metadata also need a separate wiring change.
+`read_messages`, `search_messages` and `peek` share the multiplexed adapter's
+page source. A managed Chat thread is addressed as `<space-id>.<thread-id>`;
+an unthreaded Space uses `<space-id>`. Read anchors are full native message
+names, not the `gchat_…` admission ids. `read_messages` and `search_messages`
+retain their same-platform, same-parent scope. `peek` retains cross-channel
+reach. Discord targets continue to use Discord history.
+
+The adapter resolves actual `spaceType` from its space map or a space GET.
+DM reads surface the unsupported cause instead of returning empty history;
+DM nonce lookup returns `indeterminate` with that cause. Shared-space lookup
+returns a canonical message/thread reference. The sender, its 409 lookup and
+the history lookup share `googleChatClientMessageId` from
+`platforms/google-chat/message-id.ts`.
+
+Space reconstruction uses the existing full-history walk, projection, budget,
+new-session seed and compare-and-swap attachment path. It selects the target
+adapter's bot identity, learned from the sender on the app's own message
+responses, and labels the seed and card as Google Chat. A history failure
+leaves the old ACP session attached and passes through Google's real cause.
+`migrate_self` with `rebuild: true` uses this same reconstruction path.
 
 ## Admin setup
 

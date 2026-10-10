@@ -23,11 +23,13 @@ export function renderLogicalMessage(message: LogicalReconstructionMessage): str
 export function formatOmissionMarker(opts: {
   logicalCount: number;
   rawPostCount: number;
+  sourceName?: string;
 }): string {
+  const source = opts.sourceName ?? "Discord";
   return (
     `Session reconstruction boundary: ${opts.logicalCount} logical messages ` +
-    `(${opts.rawPostCount} Discord posts) were omitted here to fit the destination ` +
-    `model's context budget. The original Discord thread remains authoritative.`
+    `(${opts.rawPostCount} ${source} posts) were omitted here to fit the destination ` +
+    `model's context budget. The original ${source} thread remains authoritative.`
   );
 }
 
@@ -38,6 +40,7 @@ export function renderReconstructionSeed(opts: {
   budgetTokens: number;
   sourcePostCount: number;
   transformSavedTokens: number;
+  sourceName?: string;
 }): ReconstructionSeed {
   const { selection } = opts;
   const body = selection.complete
@@ -49,6 +52,7 @@ export function renderReconstructionSeed(opts: {
         `## Reconstruction boundary\n\n${formatOmissionMarker({
           logicalCount: selection.omitted.length,
           rawPostCount: selection.omitted.reduce((n, m) => n + m.sourcePostIds.length, 0),
+          sourceName: opts.sourceName,
         })}`,
         selection.recent.length
           ? `## Recent exchanges\n\n${selection.recent.map(renderLogicalMessage).join("\n\n")}`
@@ -63,7 +67,7 @@ export function renderReconstructionSeed(opts: {
   ].filter(Boolean);
 
   const text = [
-    RECONSTRUCTION_INSTRUCTIONS,
+    RECONSTRUCTION_INSTRUCTIONS.replaceAll("Discord", opts.sourceName ?? "Discord"),
     ...riderBlocks,
     body,
   ]

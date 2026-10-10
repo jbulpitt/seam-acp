@@ -17664,6 +17664,7 @@ export class Orchestrator {
     destination: { agentId: string; model: string; contextWindow: number };
   }> {
     const { channel, observedAtStart, attachIntent, onProgress } = args;
+    const sourceName = channel.platform === "google-chat" ? "Google Chat" : "Discord";
     const record = args.record.parentRef ? args.record : await this.bindThreadRecord(channel);
     const log = (m: string) => {
       onProgress?.(m);
@@ -17682,13 +17683,13 @@ export class Orchestrator {
       debounceMs: STATUS_EDIT_DEBOUNCE_MS,
       heartbeatMs: STATUS_HEARTBEAT_MS,
     });
-    await card.start({ agentId, model: destinationModel });
+    await card.start({ agentId, model: destinationModel, sourceName });
     try {
       const profile = this.router.getProfile(agentId, described.location.value);
       if (!profile) {
         throw new ReconstructionUnavailableError(`Agent profile "${agentId}" not found.`);
       }
-      const seamBotId = this.adapter.getBotUserId?.();
+      const seamBotId = this.adapter.getBotUserId?.(channel);
       if (!seamBotId) {
         throw new ReconstructionUnavailableError("Rebuild cannot identify the Seam bot user id.");
       }
@@ -17746,21 +17747,22 @@ export class Orchestrator {
       if (walked.truncated) {
         throw new ReconstructionUnavailableError(
           walked.truncatedReason === "cursor-stalled"
-            ? "Rebuild stopped: Discord stopped advancing through thread history before it was exhausted."
-            : "Rebuild stopped: Discord history exceeded the page cap before the thread was exhausted."
+            ? `Rebuild stopped: ${sourceName} stopped advancing through thread history before it was exhausted.`
+            : `Rebuild stopped: ${sourceName} history exceeded the page cap before the thread was exhausted.`
         );
       }
-      log(`fetched ${walked.messages.length} Discord post(s)`);
+      log(`fetched ${walked.messages.length} ${sourceName} post(s)`);
       await card.setStage("fetching", { discordPosts: walked.messages.length });
 
       const logical = projectDiscordConversation(walked.messages, { seamBotId });
       if (logical.length === 0) {
-        throw new ReconstructionUnavailableError("No reconstructable Discord messages remain after filtering.");
+        throw new ReconstructionUnavailableError(`No reconstructable ${sourceName} messages remain after filtering.`);
       }
 
       const preset = resolveChannelPreset(this.config, record.parentRef ?? record.channelRef, record.channelRef);
       const seed = assembleReconstruction({
         messages: logical,
+        sourceName,
         contextWindow,
         budgetTokens,
         sourcePostCount: logical.reduce((n, message) => n + message.sourcePostIds.length, 0),
@@ -17806,6 +17808,7 @@ export class Orchestrator {
       });
       const stats: RebuildSuccessStats = {
         agentId: profile.id,
+        sourceName,
         model: destinationModel,
         contextWindow,
         sourcePostCount: seed.sourcePostCount,

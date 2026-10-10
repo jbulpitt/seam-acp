@@ -17,6 +17,7 @@ export type RebuildWorkingStage =
   | "attaching";
 
 export interface RebuildWorkingDetails {
+  sourceName?: string;
   agentId?: string;
   model?: string;
   contextWindow?: number;
@@ -29,6 +30,7 @@ export interface RebuildWorkingDetails {
 }
 
 export interface RebuildSuccessStats {
+  sourceName?: string;
   agentId: string;
   model: string;
   contextWindow: number;
@@ -160,6 +162,7 @@ function simpleFailure(state: Extract<RebuildCardState, { kind: "failure" }>): S
 
 function fullWorking(state: Extract<RebuildCardState, { kind: "working" }>): StructuredPanel {
   const d = state.details;
+  const source = d.sourceName ?? "Discord";
   const fields: StructuredPanel["fields"] = [];
   if (d.agentId || d.model || d.contextWindow != null) {
     fields.push({
@@ -178,7 +181,7 @@ function fullWorking(state: Extract<RebuildCardState, { kind: "working" }>): Str
   if (d.discordPosts != null) {
     fields.push({
       name: "Fetched",
-      value: `${d.discordPosts} Discord post${d.discordPosts === 1 ? "" : "s"}`,
+      value: `${d.discordPosts} ${source} post${d.discordPosts === 1 ? "" : "s"}`,
       inline: true,
     });
   }
@@ -204,8 +207,8 @@ function fullWorking(state: Extract<RebuildCardState, { kind: "working" }>): Str
     case "fetching":
       description =
         d.discordPosts != null
-          ? `Fetched ${d.discordPosts} Discord post${d.discordPosts === 1 ? "" : "s"}`
-          : "Fetching Discord history";
+          ? `Fetched ${d.discordPosts} ${source} post${d.discordPosts === 1 ? "" : "s"}`
+          : `Fetching ${source} history`;
       break;
     case "assembled":
       description =
@@ -225,7 +228,7 @@ function fullWorking(state: Extract<RebuildCardState, { kind: "working" }>): Str
     title: "Rebuild",
     description,
     fields,
-    footer: `${elapsedFooter(state.startedAt, state.now)} · ${FULL_STAGE[state.stage]}`,
+    footer: `${elapsedFooter(state.startedAt, state.now)} · ${FULL_STAGE[state.stage].replaceAll("Discord", source)}`,
   };
 }
 
@@ -238,7 +241,7 @@ function fullSuccess(state: Extract<RebuildCardState, { kind: "success" }>): Str
       inline: false,
     },
     {
-      name: "Discord",
+      name: s.sourceName ?? "Discord",
       value: `${s.sourcePostCount} posts → logical ${s.projectedLogicalCount}`,
       inline: true,
     },

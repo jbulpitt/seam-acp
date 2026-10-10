@@ -6,6 +6,18 @@ import { GoogleChatSpaceEvents } from "../packages/core/src/platforms/google-cha
 import { GOOGLE_CHAT_MESSAGE_CREATED, WorkspaceEventsOperationError,
   type GoogleChatSpaceSubscription } from "../packages/core/src/platforms/google-chat/space-subscriptions.js";
 
+// Node's promise timers bypass Vitest's clock; keep this boundary on that clock.
+vi.mock("node:timers/promises", async importOriginal => {
+  const timers = await importOriginal<typeof import("node:timers/promises")>();
+  return { ...timers, setTimeout: (ms: number, value: unknown, { signal }: { signal?: AbortSignal } = {}) =>
+    new Promise((resolve, reject) => {
+      if (signal?.aborted) { reject(signal.reason); return; }
+      const abort = () => { clearTimeout(timer); signal?.removeEventListener("abort", abort); reject(signal!.reason); };
+      const timer = setTimeout(() => { signal?.removeEventListener("abort", abort); resolve(value); }, ms);
+      signal?.addEventListener("abort", abort, { once: true });
+    }) };
+});
+
 const topic = "projects/test/topics/events";
 const space = { name: "spaces/team", spaceType: "SPACE", spaceThreadingState: "UNTHREADED_MESSAGES" };
 const adapters: GoogleChatAdapter[] = [], stores: SessionStore[] = [];

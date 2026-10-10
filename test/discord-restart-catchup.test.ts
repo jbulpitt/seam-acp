@@ -6,8 +6,8 @@ import path from "node:path";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
 import { DiscordAdapter } from "../packages/core/src/platforms/discord/adapter.js";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
+import { GoogleChatAdapter } from "../packages/core/src/platforms/google-chat/adapter.js";
 import { multiplexChatAdapters } from "../packages/core/src/platforms/google-chat/multiplex.js";
-import type { ChatAdapter } from "../packages/core/src/platforms/chat-adapter.js";
 
 const id = (ms: number) => SnowflakeUtil.generate({ timestamp: ms }).toString();
 const cleanups: (() => void)[] = [];
@@ -30,8 +30,9 @@ function restartHarness() {
   (discord as any).client = { guilds: { cache: new Map([["guild", { channels: { fetchActiveThreads } }]]) } };
   const handled: string[] = [];
   (discord as any).handleMessage = vi.fn(async (message: { id: string }) => { handled.push(message.id); });
-  const chat = { platform: "google-chat", start: vi.fn(), stop: vi.fn(), onMessage: vi.fn(),
-    sendMessage: vi.fn(), editMessage: vi.fn() } as ChatAdapter;
+  const googleRequest = vi.fn();
+  const chat = new GoogleChatAdapter({ api: { request: googleRequest }, subscription: "projects/test/subscriptions/events",
+    allowedUserIds: new Set(["users/human"]), defaultCwd: "/synthetic", logger: logger as any });
   const adapter = multiplexChatAdapters([discord, chat]);
   const admit = (platform: string, messageId: string, createdUtc = new Date(since).toISOString()) => {
     const channelRef = platform === "discord" ? "discord-thread" : "AAA.TTT";
@@ -39,7 +40,7 @@ function restartHarness() {
       authorId: "human", text: "already admitted", createdUtc });
   };
   const run = () => Orchestrator.prototype.catchUpAfterRestart.call({ store, adapter, logger } as unknown as Orchestrator);
-  return { store, adapter, chat, after, older, missed, since, admit, run, busyFetch, handled, fetchActiveThreads };
+  return { store, adapter, chat, after, older, missed, since, admit, run, busyFetch, handled, fetchActiveThreads, googleRequest };
 }
 
 describe("restart catch-up platform ownership", () => {
@@ -56,6 +57,7 @@ describe("restart catch-up platform ownership", () => {
     expect(h.busyFetch).toHaveBeenCalledExactlyOnceWith({ after: h.after, limit: 100 });
     expect(h.handled).toEqual([h.missed]);
     expect(h.store.listInboundNonterminal()).toEqual(rows);
+    expect(h.googleRequest).not.toHaveBeenCalled();
   });
 
   it("does not let a higher numeric ID on another platform silently skip Discord downtime messages", async () => {
@@ -90,6 +92,7 @@ describe("restart catch-up platform ownership", () => {
       logger: { info: vi.fn() } } as unknown as Orchestrator)).resolves.toBeUndefined();
 
     expect(h.fetchActiveThreads).not.toHaveBeenCalled();
+    expect(h.googleRequest).not.toHaveBeenCalled();
   });
 
   it("preserves the underlying Discord catch-up error for the boot caller", async () => {

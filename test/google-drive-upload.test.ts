@@ -132,10 +132,9 @@ describe("Shared Drive file upload", () => {
     const drive = fakeDrive();
     const data = Buffer.alloc(size);
     await new GoogleDriveUploader(members, drive.client).upload({ ...file, data });
-    expect(drive.request.mock.calls[1]![0]).toMatchObject({
-      data,
-      headers: { "Content-Length": String(size) },
-    });
+    const content = drive.request.mock.calls[1]![0];
+    expect(content.data).toBe(data);
+    expect(content.headers).toMatchObject({ "Content-Length": String(size) });
   });
 
   it.each(["create", "content", "permission"])("preserves the original %s failure, including provider data and transport cause", async (stage) => {

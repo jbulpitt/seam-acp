@@ -35,10 +35,11 @@ describe("Workspace Chat message CloudEvents", () => {
   it("matches the existing direct MESSAGE adapter's dedupe id and neutral message fields", async () => {
     const incoming: IncomingMessage[] = [];
     const adapter = new GoogleChatAdapter({ api: { request: async () => { throw new Error("no Google call expected"); } },
-      subscription: "projects/example/subscriptions/chat-events", allowedUserIds: new Set(["42"]), defaultCwd: "/projects",
+      subscription: "projects/example/subscriptions/chat-events", allowedUserIds: new Set(["users/42"]), defaultCwd: "/projects",
       logger: pino({ level: "silent" }), writeIntervalMs: 0 });
     adapter.onMessage(message => { incoming.push(message); message.onAdmitted?.(); });
     await adapter.receiveEvent({ type: "MESSAGE", space: resource.space, user: resource.sender, message: resource });
+    expect(incoming).toHaveLength(1);
     const [parsed] = parseGoogleChatWorkspaceMessages(delivered({ message: resource }));
     expect(parsed!.kind).toBe("message");
     if (parsed!.kind !== "message") throw new Error("expected full message");

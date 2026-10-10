@@ -13,7 +13,7 @@ export class PubSubPullTransport {
   private readonly inFlight = new Map<string, Promise<void>>();
 
   constructor(private readonly opts: { api: GoogleApi; subscription: string;
-    receive: (event: unknown, signal?: AbortSignal) => Promise<void>; logger: Logger }) {}
+    receive: (event: unknown, signal?: AbortSignal, messageId?: string) => Promise<void>; logger: Logger }) {}
 
   async start(): Promise<void> {
     if (this.loop) return;
@@ -34,7 +34,7 @@ export class PubSubPullTransport {
     if (!admission) {
       // Buffer accepts missing padding and URL-safe base64 seen on the real subscription.
       const event: unknown = JSON.parse(Buffer.from(received.message.data, "base64").toString("utf8"));
-      admission = this.opts.receive(event, signal);
+      admission = this.opts.receive(event, signal, id);
       this.inFlight.set(id, admission);
     }
     try {

@@ -58,6 +58,8 @@ import { controllerQuotaProfiles } from "./core/quota/controller-profiles.js";
 import { discordRenderer } from "./platforms/discord/renderer.js";
 import { DiscordAdapter } from "./platforms/discord/adapter.js";
 import { GoogleChatAdapter } from "./platforms/google-chat/adapter.js";
+import { GoogleDriveUploader } from "./core/files/google-drive-upload.js";
+import { loadGoogleDriveUploadConfig } from "./core/files/google-drive-config.js";
 import { GoogleRestApi } from "./platforms/google-chat/api.js";
 import { multiplexChatAdapters } from "./platforms/google-chat/multiplex.js";
 import { Orchestrator } from "./platforms/discord/orchestrator.js";
@@ -478,6 +480,15 @@ async function main(): Promise<void> {
       subscription: config.GOOGLE_CHAT_SUBSCRIPTION,
       allowedUserIds: config.GOOGLE_CHAT_ALLOWED_USER_IDS,
       defaultCwd: config.GOOGLE_CHAT_DEFAULT_CWD ?? config.REPOS_ROOT,
+      driveUploader: (() => {
+        const drive = loadGoogleDriveUploadConfig({
+          GOOGLE_CHAT_CREDENTIALS_FILE: config.GOOGLE_CHAT_CREDENTIALS_FILE,
+          GOOGLE_CHAT_DRIVE_FOLDER_ID: config.GOOGLE_CHAT_DRIVE_FOLDER_ID,
+          GOOGLE_CHAT_DRIVE_SHARING_POLICY: config.GOOGLE_CHAT_DRIVE_SHARING_POLICY,
+          GOOGLE_CHAT_DRIVE_DOMAIN: config.GOOGLE_CHAT_DRIVE_DOMAIN,
+        });
+        return drive ? new GoogleDriveUploader(drive) : undefined;
+      })(),
       logger: logger.child({ platform: "google-chat" }),
     }) : undefined;
   const chatAdapter = googleChat

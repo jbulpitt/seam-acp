@@ -340,6 +340,7 @@ export class SessionRouter {
   private readonly modelMetadata?: Pick<ModelMetadataStore, "getAll">;
   private readonly defaultAgentId: string;
   private readonly defaultPermissionMode: PermissionPolicyMode;
+  private readonly defaultPermissionModes: ReadonlyMap<string, PermissionPolicyMode>;
   private readonly mcpServers: McpServer[];
   private readonly seamMcp?: SeamMcpWiring;
   private readonly executionBridge?: ExecutionBridgeWiring;
@@ -390,6 +391,7 @@ export class SessionRouter {
     agyMigrationErrors?: ReadonlyMap<string, string>;
     defaultModel: string;
     defaultPermissionMode?: PermissionPolicyMode;
+    defaultPermissionModes?: ReadonlyMap<string, PermissionPolicyMode>;
     mcpServers?: McpServer[];
     seamMcp?: SeamMcpWiring;
     executionBridge?: ExecutionBridgeWiring;
@@ -426,6 +428,7 @@ export class SessionRouter {
     this.defaultAgentDisabledReason = opts.defaultAgentDisabledReason;
     this.agyMigrationErrors = opts.agyMigrationErrors ?? new Map();
     this.defaultPermissionMode = opts.defaultPermissionMode ?? "ask";
+    this.defaultPermissionModes = opts.defaultPermissionModes ?? new Map();
     this.mcpServers = opts.mcpServers ?? [];
     this.seamMcp = opts.seamMcp;
     this.executionBridge = opts.executionBridge ?? (opts.seamMcp?.isBridgeSession && opts.seamMcp.muxForSession
@@ -660,12 +663,12 @@ export class SessionRouter {
     });
 
     // permission — resolvePermissionMode layering (session policy, then legacy
-    // auto-approve, then bot default). Presets do not carry permission.
+    // auto-approve, then platform/bot default). Presets do not carry permission.
     const permission: ResolvedSetting<PermissionPolicyMode> = cfg.permissionPolicy
       ? { value: cfg.permissionPolicy, source: "session config" }
       : cfg.autoApprovePermissions === true
         ? { value: "always", source: "session config" }
-        : { value: this.defaultPermissionMode, source: "default" };
+        : { value: this.permissionDefault(record.platform), source: "default" };
 
     const detached: ResolvedSetting<boolean> = thread?.detached
       ? { value: true, source: "thread preset" }
@@ -805,7 +808,7 @@ export class SessionRouter {
       opts.channelRef
     );
     const catalogDefault = this.modelCatalog.model({ agentId, location }, "default")?.id ?? "default";
-    const cfg = defaultSessionConfig(preset.model?.value ?? catalogDefault, this.defaultPermissionMode);
+    const cfg = defaultSessionConfig(preset.model?.value ?? catalogDefault, this.permissionDefault(opts.platform));
     const now = new Date().toISOString();
     // We don't yet know the ACP session id — it will be filled in by the
     // first runtime start. Store an empty marker for now. `opts.cwd` is the
@@ -1467,7 +1470,11 @@ export class SessionRouter {
   /** Live session row wins over the captured startRuntime record. */
   private livePermissionMode(record: SessionRecord): PermissionPolicyMode {
     const live = this.store.get(record.id) ?? record;
-    return resolvePermissionMode(this.store.readConfig(live), this.defaultPermissionMode);
+    return resolvePermissionMode(this.store.readConfig(live), this.permissionDefault(live.platform));
+  }
+
+  private permissionDefault(platform: string): PermissionPolicyMode {
+    return this.defaultPermissionModes.get(platform) ?? this.defaultPermissionMode;
   }
 
   /** Isolated and helper sessions use the same live policy. */

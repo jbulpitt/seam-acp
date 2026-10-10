@@ -12724,7 +12724,7 @@ export class Orchestrator {
     if (!occurrence.execution) return; // unknown identity is not permission to reconstruct it
     if (!attempt.deliveryDone) {
       const row = occurrence.row;
-      const target: ChannelRef = { platform: PLATFORM,
+      const target: ChannelRef = { platform: row.platform,
         id: row.sessionMode === "live" ? row.channelRef : row.targetChannel || row.channelRef };
       if (await this.checkResumePreconditions(target) !== "ok") return;
       const settleDelivery = async (
@@ -14786,23 +14786,14 @@ export class Orchestrator {
       return;
     }
 
-    // #89 D8: drop the parked row BEFORE abort so turn-end fire cannot run it.
-    const parked = await this.clearParkedForChannel(record.channelRef);
-    // #76: clear markers at the COMMAND layer, where user intent is
-    // unambiguous. dispose()/invalidate() MUST leave them intact — SIGTERM
-    // also converges on dispose, and wiping there would make resume a
-    // silent no-op on every graceful reboot.
-    const cancelled = await this.clearTurnMarkersForChannel(record.channelRef, "cancelled");
-    let outcome: Awaited<ReturnType<SessionRouter["abortTurn"]>>;
-    try {
-      outcome = await this.router.abortTurn(record.id, { force: false });
-    } catch (err) {
+    const result = await this.cancelChannel({ platform: record.platform, id: record.channelRef });
+    if ("error" in result) {
       await replyToInteraction(i,
-        `🟡 Cancel requested, but not confirmed: ${err instanceof Error ? err.message : String(err)}. ` +
+        `🟡 Cancel requested, but not confirmed: ${result.error instanceof Error ? result.error.message : String(result.error)}. ` +
         "Work may still be running. Use `/seam cancel force:true` to force it.");
       return;
     }
-    const queue = this.inspectChannelQueue(record.channelRef);
+    const { parked, cancelled, outcome, queue } = result;
     await replyToInteraction(i,
       outcome === "idle"
         ? cancelled.cancelled
@@ -14820,6 +14811,21 @@ export class Orchestrator {
             parked ? " Also cancelled the queued prompt." : ""
           }`
     );
+  }
+
+  /** Explicit cancellation clears queued work before signalling the runtime. */
+  async cancelChannel(channel: ChannelRef) {
+    const record = this.router.ensureSessionRecord({ platform: channel.platform, channelRef: channel.id,
+      ...(channel.parentId ? { parentRef: channel.parentId } : {}), cwd: this.config.REPOS_ROOT });
+    const parked = await this.clearParkedForChannel(record.channelRef);
+    const cancelled = await this.clearTurnMarkersForChannel(record.channelRef, "cancelled");
+    let outcome: Awaited<ReturnType<SessionRouter["abortTurn"]>>;
+    try {
+      outcome = await this.router.abortTurn(record.id, { force: false });
+    } catch (error) {
+      return { parked, cancelled, error };
+    }
+    return { parked, cancelled, outcome, queue: this.inspectChannelQueue(record.channelRef) };
   }
 
   /** Escalating: cancel first, and if the turn is still running after a short
@@ -15011,7 +15017,7 @@ export class Orchestrator {
   private async postResumeNotice(channelRef: string, text: string): Promise<void> {
     try {
       await this.adapter.sendMessage?.(
-        { platform: PLATFORM, id: channelRef },
+        { platform: this.platformForChannel(channelRef), id: channelRef },
         text
       );
     } catch (err) {
@@ -15066,7 +15072,7 @@ export class Orchestrator {
    */
   private async refireLiveTurn(marker: LiveTurnMarker): Promise<void> {
     const channel: ChannelRef = {
-      platform: PLATFORM,
+      platform: this.platformForChannel(marker.channelRef),
       id: marker.channelRef,
       ...(marker.parentRef ? { parentId: marker.parentRef } : {}),
     };
@@ -15176,7 +15182,7 @@ export class Orchestrator {
         }
       }, {
         lastActivityAt: () => {
-          const record = this.store.getByChannel(PLATFORM, attempt.spec.target);
+          const record = this.recordForChannel(attempt.spec.target);
           const runtime = record && this.router.getRuntime(record.id);
           const observed = this.bridgeHub?.slotHealthFor?.(attempt.remoteRecovery!.location)
             ?.find(row => row.slot === attempt.remoteRecovery!.slot)?.recovery;
@@ -15287,7 +15293,7 @@ export class Orchestrator {
     let recoveryRecord: SessionRecord | undefined;
     try {
       if (attempt.spec.session === "live") {
-        recoveryRecord = this.store.getByChannel(PLATFORM, attempt.spec.target) ?? undefined;
+        recoveryRecord = this.recordForChannel(attempt.spec.target) ?? undefined;
         if (!recoveryRecord) throw new Error("the recovered thread session no longer exists");
         const cached = this.router.getRuntime(recoveryRecord.id);
         if (cached?.getSlot() === binding.slot && cached.getSessionInfo()?.sessionId === binding.acpSessionId) {
@@ -15317,7 +15323,7 @@ export class Orchestrator {
       return true;
     }
 
-    const target: ChannelRef = { platform: PLATFORM, id: attempt.spec.target };
+    const target: ChannelRef = { platform: this.platformForChannel(attempt.spec.target), id: attempt.spec.target };
     const recordedStream = attempt.deliveryPayload?.kind === "messages" && attempt.deliveryPayload.stream
       ? attempt.deliveryPayload : undefined;
     const adoptedChunks: string[] = [...(recordedStream?.texts ?? [])];
@@ -15664,12 +15670,12 @@ export class Orchestrator {
         if (occurrence) {
           await this.deliverScheduledCompletion(occurrence, attempt);
         } else {
-          const target: ChannelRef = { platform: PLATFORM, id: attempt.spec.target };
+          const target: ChannelRef = { platform: this.platformForChannel(attempt.spec.target), id: attempt.spec.target };
           if (await this.checkResumePreconditions(target) !== "ok") continue;
           const resolution = await this.recoverRecordedDelivery(attempt, target);
           if (resolution === "deferred") continue;
           if (resolution === "delivered") {
-            const record = this.store.getByChannel(PLATFORM, target.id);
+            const record = this.store.getByChannel(target.platform, target.id);
             if (record) this.store.upsert({ ...record, updatedUtc: new Date().toISOString() });
           }
         }
@@ -15744,7 +15750,7 @@ export class Orchestrator {
     // Live adoption supplies the nonce-backed chunks, not a replay of the full answer.
     if (prior.source !== "schedule"
       || (occurrence?.row.sessionMode === "live" && delivery !== undefined)) {
-      const target: ChannelRef = { platform: PLATFORM, id: prior.spec.target };
+      const target: ChannelRef = { platform: this.platformForChannel(prior.spec.target), id: prior.spec.target };
       const output = outcome.output ?? "";
       const body = outcome.status === "failed"
         ? `❌ ${outcome.error ?? "remote recovery failed"}${output.trim() ? `\n\n${output}` : ""}`
@@ -15756,7 +15762,7 @@ export class Orchestrator {
             target,
             delivery ?? { kind: "message", text: body }
           );
-          const record = this.store.getByChannel(PLATFORM, target.id);
+          const record = this.store.getByChannel(target.platform, target.id);
           if (record) this.store.upsert({ ...record, updatedUtc: new Date().toISOString() });
         }
         this.store.turnAttempts.markDeliveryDone(prior.id);
@@ -16018,7 +16024,7 @@ export class Orchestrator {
     for (const marker of live) {
       if (marker.inboundMessageId || marker.scheduleOccurrenceId || inboundChannels.has(marker.channelRef)) continue;
       const pre = await this.checkResumePreconditions({
-        platform: PLATFORM,
+        platform: this.platformForChannel(marker.channelRef),
         id: marker.channelRef,
         ...(marker.parentRef ? { parentId: marker.parentRef } : {}),
       });
@@ -16076,7 +16082,7 @@ export class Orchestrator {
             await this.abandonDispatchSpec(spec, "bridge not ready (past max-age)");
             return;
           }
-          bindSessionLocation(this.bridgeHub, `discord:${spec.target}`, loc);
+          bindSessionLocation(this.bridgeHub, makeSessionId(this.platformForChannel(spec.target), spec.target), loc);
           const refusal = await this.requestDispatchContinuation(spec);
           if (refusal) await this.observeRetainedDispatch(spec, DispatchSuspendedError.defect(spec.id, refusal));
         })());
@@ -16413,7 +16419,7 @@ export class Orchestrator {
           ? inbound && inbound.state !== "completed"
           : this.store.scheduledOccurrences.get(row.id)?.settled === false;
         if (backed && !isAwaitingReauth(attempt.stalledReason)
-          && await this.checkResumePreconditions({ platform: PLATFORM, id: row.channelRef }) === "ok") {
+          && await this.checkResumePreconditions({ platform: this.platformForChannel(row.channelRef), id: row.channelRef }) === "ok") {
           row.actions = ["resume", "cancel"];
         }
       }
@@ -16431,7 +16437,7 @@ export class Orchestrator {
       for (const a of this.store.turnAttempts.list(state)) {
         if (a.source === "dispatch") continue;
         legacy.push({ id: a.id, kind: "live", channelRef: a.spec.target,
-          sessionRecordId: makeSessionId(PLATFORM, a.spec.target),
+          sessionRecordId: makeSessionId(this.platformForChannel(a.spec.target), a.spec.target),
           startedUtc: a.spec.createdUtc ?? a.updatedUtc,
           ...(a.acpSessionId ? { acpSessionId: a.acpSessionId } : {}),
           promptStarted: a.promptStarted,
@@ -16474,7 +16480,7 @@ export class Orchestrator {
     // Isolated ingest owns an ACP session, not a Discord thread. Its optional
     // notify thread does not decide whether the HTTP job can continue.
     if (spec.kind === "ingest" && spec.session === "isolated") return null;
-    const pre = await this.checkResumePreconditions({ platform: PLATFORM, id: spec.target });
+    const pre = await this.checkResumePreconditions({ platform: this.platformForChannel(spec.target), id: spec.target });
     if (pre !== "ok") return `target thread is ${pre}; continuation cannot currently be admitted`;
     return null;
   }
@@ -16831,19 +16837,26 @@ export class Orchestrator {
       });
       return;
     }
+    await this.resetChannel({ platform: record.platform, id: record.channelRef }, "Orchestrator.cmdReset");
+    await replyToInteraction(i, {
+      content:
+        "Session reset. Your next message will start a fresh ACP session (history is gone, but config is kept).",
+      flags: MessageFlags.Ephemeral,
+    });
+  }
+
+  /** Retire the old conversation; the next turn creates its replacement. */
+  async resetChannel(channel: ChannelRef, source = "Orchestrator.resetChannel"): Promise<void> {
+    const record = this.router.ensureSessionRecord({ platform: channel.platform, channelRef: channel.id,
+      ...(channel.parentId ? { parentRef: channel.parentId } : {}), cwd: this.config.REPOS_ROOT });
     // Retire the runtime before replacing the durable conversation.
     await this.router.invalidate(record.id, { operatorIntent: "replace-session" });
     this.store.upsert({
       ...record,
       acpSessionId: "",
       updatedUtc: new Date().toISOString(),
-    }, { source: "Orchestrator.cmdReset", cause: "operator requested session reset" });
+    }, { source, cause: "operator requested session reset" });
     await this.identityEffects.flush(record.id);
-    await replyToInteraction(i, {
-      content:
-        "Session reset. Your next message will start a fresh ACP session (history is gone, but config is kept).",
-      flags: MessageFlags.Ephemeral,
-    });
   }
 
   /**

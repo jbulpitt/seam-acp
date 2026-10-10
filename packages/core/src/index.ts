@@ -376,6 +376,7 @@ async function main(): Promise<void> {
     defaultPermissionMode: config.DEFAULT_AUTO_APPROVE
       ? "always"
       : config.DEFAULT_PERMISSION_POLICY,
+    defaultPermissionModes: new Map([["google-chat", "always"]]),
     mcpServers,
     executionBridge: {
       isBridgeSession: (sessionId) => !!bridgeHub?.sessionBridgeId(sessionId),

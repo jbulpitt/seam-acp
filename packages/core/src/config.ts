@@ -35,6 +35,8 @@ const Schema = z.object({
   GOOGLE_CHAT_CREDENTIALS_FILE: z.string().optional(),
   GOOGLE_CHAT_ALLOWED_USER_IDS: z.string().default("").transform(value =>
     new Set(value.split(",").map(id => id.trim()).filter(Boolean))),
+  GOOGLE_CHAT_ALLOWED_SPACE_IDS: z.string().default("").transform(value =>
+    new Set(value.split(",").map(id => id.trim()).filter(Boolean))),
   GOOGLE_CHAT_DEFAULT_CWD: z.string().optional(),
   GOOGLE_CHAT_DRIVE_FOLDER_ID: z.string().optional(),
   GOOGLE_CHAT_DRIVE_SHARING_POLICY: z.string().optional(),
@@ -930,8 +932,8 @@ const Schema = z.object({
 const PresetFieldSchema = <T extends z.ZodType>(value: T) => z.object({ value });
 
 const numericId = z.string().regex(/^\d+$/, "preset key must be a numeric Discord id");
-const threadPresetId = z.string().regex(/^(?:\d+|google-chat:[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)$/,
-  "preset key must be a numeric Discord id or a qualified Google Chat space.thread ref");
+const threadPresetId = z.string().regex(/^(?:\d+|google-chat:[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)?)$/,
+  "preset key must be a numeric Discord id or a qualified Google Chat space or space.thread ref");
 
 /** Preserve Discord's file keys; other platform refs cannot masquerade as them. */
 export function threadPresetKey(platform: string, id: string): string {

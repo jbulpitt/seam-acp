@@ -479,6 +479,7 @@ async function main(): Promise<void> {
       api: new GoogleRestApi(config.GOOGLE_CHAT_CREDENTIALS_FILE, config.GOOGLE_CHAT_PROJECT_ID),
       subscription: config.GOOGLE_CHAT_SUBSCRIPTION,
       allowedUserIds: config.GOOGLE_CHAT_ALLOWED_USER_IDS,
+      allowedSpaceIds: config.GOOGLE_CHAT_ALLOWED_SPACE_IDS,
       defaultCwd: config.GOOGLE_CHAT_DEFAULT_CWD ?? config.REPOS_ROOT,
       driveUploader: (() => {
         const drive = loadGoogleDriveUploadConfig({

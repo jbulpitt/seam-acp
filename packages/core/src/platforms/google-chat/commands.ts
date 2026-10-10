@@ -1,5 +1,7 @@
+import type { GoogleChatAnnotation } from "./spaces.js";
+
 export const GOOGLE_CHAT_COMMANDS = [
-  { command: "new", id: 1, name: "/new", description: "Start a fresh DM session: /new [name]", type: "SLASH_COMMAND" },
+  { command: "new", id: 1, name: "/new", description: "Start a fresh threaded session: /new [name]", type: "SLASH_COMMAND" },
   { command: "cancel", id: 2, name: "/cancel", description: "Cancel work in this session", type: "SLASH_COMMAND" },
   { command: "agent", id: 3, name: "/agent", description: "Set this session's agent: /agent <id>", type: "SLASH_COMMAND" },
   { command: "model", id: 4, name: "/model", description: "Set this session's model: /model <id>", type: "SLASH_COMMAND" },
@@ -27,10 +29,7 @@ export interface GoogleChatCommandEvent {
     text?: string;
     thread?: { name?: string };
     slashCommand?: { commandId?: string | number };
-    annotations?: Array<{
-      type?: string;
-      slashCommand?: { commandId?: string | number; type?: string };
-    }>;
+    annotations?: GoogleChatAnnotation[];
   };
 }
 

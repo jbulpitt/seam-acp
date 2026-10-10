@@ -18,14 +18,17 @@ import { renderGoogleChatPanel, renderGoogleChatLayout, renderGoogleChatChoiceCa
   renderGoogleChatElicitationCard, type GoogleChatCardsMessage } from "./card-renderer.js";
 import { parseGoogleChatCommand, type GoogleChatCommand, type GoogleChatCommandEvent } from "./commands.js";
 import { executeGoogleChatCommand, type GoogleChatCommandDeps } from "./command-actions.js";
+import { hasAppMention, isSharedSpace, stripAppMentions,
+  type GoogleChatAnnotation, type GoogleChatSpace, type GoogleChatSpaceLifecycle } from "./spaces.js";
 
 export const GOOGLE_CHAT_PLATFORM = "google-chat";
 const root = "https://chat.googleapis.com/v1";
 type ChatMessage = { name?: string; text?: string; thread?: { name?: string }; threadReply?: boolean;
+  annotations?: GoogleChatAnnotation[];
   sender?: { name?: string; type?: string; displayName?: string };
   attachment?: Array<{ contentName?: string; contentType?: string;
     attachmentDataRef?: { resourceName?: string } }> };
-type ChatEvent = GoogleChatCommandEvent & { user?: ChatMessage["sender"]; space?: { name?: string; spaceThreadingState?: string };
+type ChatEvent = GoogleChatCommandEvent & { user?: ChatMessage["sender"]; space?: GoogleChatSpace;
   message?: ChatMessage; thread?: { name?: string }; action?: GoogleChatCardClickEvent["action"];
   common?: GoogleChatCardClickEvent["common"] };
 
@@ -70,9 +73,12 @@ export class GoogleChatAdapter implements ChatAdapter {
   private choiceAcknowledgement: ComponentAcknowledgement = "update";
   private componentAcknowledgement: ComponentAcknowledgement = "update";
   private commandDeps?: CommandDeps;
+  private readonly spaces = new Map<string, GoogleChatSpace>();
+  private spaceLifecycle?: (event: GoogleChatSpaceLifecycle) => void | Promise<void>;
 
   constructor(private readonly opts: { api: GoogleApi; subscription: string; allowedUserIds: ReadonlySet<string>;
-    defaultCwd: string; logger: Logger; writeIntervalMs?: number; driveUploader?: Pick<GoogleDriveUploader, "upload"> }) {
+    allowedSpaceIds?: ReadonlySet<string>; defaultCwd: string; logger: Logger;
+    writeIntervalMs?: number; driveUploader?: Pick<GoogleDriveUploader, "upload"> }) {
     this.writes = new SpaceWriteQueue({ logger: opts.logger, intervalMs: opts.writeIntervalMs });
     this.transport = new PubSubPullTransport({ ...opts,
       receive: (event, signal, id) => this.receiveEvent(event, signal, id) });
@@ -90,6 +96,20 @@ export class GoogleChatAdapter implements ChatAdapter {
   setCommandDeps(deps: CommandDeps): void {
     this.commandDeps = deps;
   }
+  onSpaceLifecycle(handler: (event: GoogleChatSpaceLifecycle) => void | Promise<void>): void {
+    this.spaceLifecycle = handler;
+  }
+
+  private isAllowedSpace(space: GoogleChatSpace): boolean {
+    const ids = this.opts.allowedSpaceIds;
+    return !isSharedSpace(space) || !ids?.size || Boolean(space.name &&
+      (ids.has(space.name) || ids.has(resourceId(space.name, "spaces"))));
+  }
+
+  private channelFor(space: string, thread?: string | null): ChannelRef {
+    return thread && this.spaces.get(space)?.spaceThreadingState !== "UNTHREADED_MESSAGES"
+      ? channelForThread(thread) : { platform: this.platform, id: resourceId(space, "spaces") };
+  }
 
   isAllowedUser(platform: string, userId: string): boolean {
     return platform === this.platform && this.opts.allowedUserIds.has(userId.startsWith("users/") ? userId : `users/${userId}`);
@@ -101,6 +121,20 @@ export class GoogleChatAdapter implements ChatAdapter {
     this.opts.logger.info({ type: event.type, space: event.space?.name, message: message?.name,
       thread: message?.thread?.name, threadReply: message?.threadReply,
       spaceThreadingState: event.space?.spaceThreadingState }, "Google Chat event");
+    const space = { ...this.spaces.get(event.space?.name ?? ""), ...event.space };
+    if (event.type === "REMOVED_FROM_SPACE") {
+      if (!space.name) throw new Error("Google Chat REMOVED_FROM_SPACE has no space name");
+      this.spaces.delete(space.name);
+      await this.spaceLifecycle?.({ ...event, type: "REMOVED_FROM_SPACE", space: { ...space, name: space.name } });
+      return;
+    }
+    if (!this.isAllowedSpace(space)) return;
+    if (space.name) this.spaces.set(space.name, space);
+    if (event.type === "ADDED_TO_SPACE") {
+      if (!space.name) throw new Error("Google Chat ADDED_TO_SPACE has no space name");
+      await this.spaceLifecycle?.({ ...event, type: "ADDED_TO_SPACE", space: { ...space, name: space.name } });
+      return;
+    }
     const user = event.user ?? message?.sender;
     if (user?.type === "BOT" || !user?.name || !this.isAllowedUser(this.platform, user.name)) return;
     if (event.type === "CARD_CLICKED") {
@@ -118,7 +152,10 @@ export class GoogleChatAdapter implements ChatAdapter {
       return;
     }
     if (event.type !== "MESSAGE") return;
-    if (!message?.name || !message.thread?.name) throw new Error("Google Chat MESSAGE has no message or thread name");
+    if (isSharedSpace(space) && !hasAppMention(message?.annotations)) return;
+    const thread = message?.thread?.name ?? event.thread?.name;
+    const spaceName = space.name ?? thread?.split("/threads/")[0];
+    if (!message?.name || !spaceName) throw new Error("Google Chat MESSAGE has no message or space name");
     if (!this.handler) throw new Error("Google Chat inbound handler not installed");
     const attachments: MessageAttachment[] = (message.attachment ?? []).map(a => ({
       url: a.attachmentDataRef?.resourceName ?? "", filename: a.contentName ?? "attachment",
@@ -132,8 +169,9 @@ export class GoogleChatAdapter implements ChatAdapter {
     signal?.addEventListener("abort", abort, { once: true });
     const incoming: IncomingMessage = {
       messageId: inboundId(message.name),
-      channel: channelForThread(message.thread.name), authorId: resourceId(user.name, "users"),
-      authorName: user.displayName, authorIsBot: false, text: message.text ?? "", attachments, raw,
+      channel: this.channelFor(spaceName, thread), authorId: resourceId(user.name, "users"),
+      authorName: user.displayName, authorIsBot: false,
+      text: isSharedSpace(space) ? stripAppMentions(message.text ?? "", message.annotations) : message.text ?? "", attachments, raw,
       cwd: this.opts.defaultCwd,
       onAdmitted: () => { admitted = true; acknowledge(); },
     };
@@ -150,8 +188,7 @@ export class GoogleChatAdapter implements ChatAdapter {
   private async receiveCommand(command: GoogleChatCommand, messageId: string, replyChannel?: ChannelRef): Promise<void> {
     if (!this.commandDeps) throw new Error("Google Chat command handlers not installed");
     const { store } = this.commandDeps;
-    const channel = command.thread ? channelForThread(command.thread)
-      : { platform: this.platform, id: resourceId(command.space, "spaces") };
+    const channel = this.channelFor(command.space, command.thread);
     store.admitInbound({ messageId, platform: this.platform, channelRef: channel.id, parentRef: channel.parentId,
       sessionRecordId: `${this.platform}:${channel.id}`, authorId: resourceId(command.user.id, "users"),
       authorName: command.user.name, text: `/${command.command} ${command.args}`.trim(),
@@ -168,17 +205,18 @@ export class GoogleChatAdapter implements ChatAdapter {
         receipt.replies.push({ channel: replyChannel ?? channel, text, index: receipt.replies.length });
       };
       try {
-        const result = await executeGoogleChatCommand({ ...command,
+        const result = command.command === "new" && this.spaces.get(command.space)?.spaceThreadingState === "UNTHREADED_MESSAGES"
+          ? await respond(channel, "This space does not support threads; it uses one shared session. /new made no changes.")
+          : await executeGoogleChatCommand({ ...command,
           user: { ...command.user, id: resourceId(command.user.id, "users") } }, {
           ...this.commandDeps,
-          channelFor: (space, thread) => thread ? channelForThread(thread)
-            : { platform: this.platform, id: resourceId(space, "spaces") },
+          channelFor: (space, thread) => this.channelFor(space, thread),
           createThread: (parent, name) => this.createThread(parent, name,
             { nonce: `${messageId}-new`, enforceNonce: true }),
           cwd: this.opts.defaultCwd,
           respond,
         });
-        if (result.command === "cancel") {
+        if (result && result.command === "cancel") {
           const { outcome } = result;
           let text: string;
           if ("error" in outcome) text = `Cancel requested, but not confirmed: ${
@@ -252,7 +290,7 @@ export class GoogleChatAdapter implements ChatAdapter {
     if (thread && message.thread?.name !== thread) this.opts.logger.warn({ expected: thread, actual: message.thread?.name,
       message: message.name }, "Google Chat reply fell back to a different thread");
     this.opts.logger.info({ message: message.name, thread: message.thread?.name, expectedThread: thread }, "Google Chat message sent");
-    return { channel: message.thread?.name ? channelForThread(message.thread.name) : channel, id: message.name,
+    return { channel: message.thread?.name ? this.channelFor(space, message.thread.name) : channel, id: message.name,
       jumpLinkUnavailableReason: "Google Chat message permalink is not supplied by the API" };
   }
 
@@ -310,6 +348,9 @@ export class GoogleChatAdapter implements ChatAdapter {
   }
 
   async createThread(parent: ChannelRef, name: string, delivery?: DeliveryNonceOptions): Promise<ChannelRef> {
+    if (this.spaces.get(names(parent).space)?.spaceThreadingState === "UNTHREADED_MESSAGES") {
+      throw new Error("Google Chat space does not support threads; it uses one shared session");
+    }
     const message = await this.sendMessage({ platform: this.platform, id: names(parent).space.slice(7) }, name, delivery);
     if (!message.channel.parentId) throw new Error("Google Chat new top-level message returned no thread");
     return message.channel;
@@ -329,10 +370,11 @@ export class GoogleChatAdapter implements ChatAdapter {
 
   private async receiveCardClick(event: ChatEvent, interactionId?: string): Promise<void> {
     const thread = event.message?.thread?.name ?? event.thread?.name;
-    if (!thread) throw new Error("Google Chat CARD_CLICKED has no thread name");
+    const space = event.space?.name ?? thread?.split("/threads/")[0];
+    if (!space) throw new Error("Google Chat CARD_CLICKED has no space name");
     if (!interactionId) throw new Error("Google Chat CARD_CLICKED has no Pub/Sub delivery id");
     const parsed = parseGoogleChatCardClick({ ...event, type: "CARD_CLICKED" },
-      { channel: channelForThread(thread), interactionId });
+      { channel: this.channelFor(space, thread), interactionId });
     if (!parsed) return;
     const data = { ...parsed.interaction, userId: resourceId(parsed.interaction.userId, "users") };
     const acknowledgement = parsed.type === "choice" ? this.choiceAcknowledgement : this.componentAcknowledgement;
@@ -380,7 +422,9 @@ export class GoogleChatAdapter implements ChatAdapter {
 
   async getThreadLiveState(channel: ChannelRef): Promise<{ locked: boolean; archived: boolean } | undefined> {
     try {
-      await this.opts.api.request("chat", { method: "GET", url: `${root}/${names(channel).space}` });
+      const name = names(channel).space;
+      const space = await this.opts.api.request<GoogleChatSpace>("chat", { method: "GET", url: `${root}/${name}` });
+      this.spaces.set(name, { ...this.spaces.get(name), ...space, name });
       return { locked: false, archived: false };
     } catch (err) {
       if (googleErrorStatus(err) === 404) return undefined;

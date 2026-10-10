@@ -20,7 +20,7 @@ afterEach(() => {
 const event = (id: number, text: string) => ({ type: "MESSAGE", space: { name: "spaces/dm" },
   user: { name: "users/42", displayName: "Tester" }, message: {
     name: `spaces/dm/messages/command-${id}`, text, argumentText: text, slashCommand: { commandId: id },
-    thread: { name: "spaces/dm/threads/invocation" },
+    thread: { name: "spaces/dm/threads/invocation" }, threadReply: true,
   } });
 const admissionId = (id: number) => `gchat_${createHash("sha256").update(event(id, "").message.name).digest("base64url")}`;
 
@@ -137,6 +137,31 @@ describe("durable Google Chat command effects before reply delivery", () => {
     expect(restarted.applyAgentChange).not.toHaveBeenCalled();
     expect(restarted.request.mock.calls.map(([scope]) => scope)).toEqual(["chat", "pubsub"]);
     expect(restarted.request.mock.calls[0]![1].data.text).toBe("Agent switched to codex");
+  });
+
+  it("persists an unthreaded private reply across restart without changing or repeating the invocation's switch", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gchat-root-reply-")); dirs.push(dir);
+    const db = path.join(dir, "seam.db");
+    const h = setup(db);
+    const raw = event(3, "/agent codex");
+    const command = { ...raw, message: { ...raw.message, name: "spaces/dm/messages/invocation.invocation", threadReply: false } };
+    const messageId = `gchat_${createHash("sha256").update(command.message.name).digest("base64url")}`;
+    const cause = new Error("connection reset before private root reply delivery");
+    vi.spyOn(h.adapter as any, "sendText").mockRejectedValueOnce(cause);
+    await expect(h.deliver(command)).rejects.toBe(cause);
+    expect(h.applyAgentChange.mock.calls[0]![0]).toEqual({ platform: "google-chat", id: "dm.invocation", parentId: "dm" });
+    expect(h.store.getInbound(messageId)).toMatchObject({ sessionRecordId: "google-chat:dm.invocation",
+      commandResult: { replies: [{ channel: { platform: "google-chat", id: "dm" }, text: "Agent switched to codex", index: 0 }] } });
+    h.store.close(); stores.delete(h.store);
+    const restarted = setup(db);
+    await restarted.deliver(command, "retry-root-reply");
+    expect(restarted.applyAgentChange).not.toHaveBeenCalled();
+    expect(restarted.request.mock.calls.map(([scope]) => scope)).toEqual(["chat", "pubsub"]);
+    expect(restarted.request.mock.calls[0]![1].data).toMatchObject({ text: "Agent switched to codex",
+      privateMessageViewer: { name: "users/42" } });
+    expect(restarted.request.mock.calls[0]![1].data).not.toHaveProperty("thread");
+    await restarted.deliver(command, "ack-redelivery");
+    expect(restarted.request.mock.calls.map(([scope]) => scope)).toEqual(["chat", "pubsub", "pubsub"]);
   });
 
   it("never turns a command receipt into a recovered agent prompt or supersedes it with a normal message", () => {

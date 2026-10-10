@@ -100,7 +100,7 @@ describe("platform-aware persisted thread overlays", () => {
       await adapter.receiveEvent({ type: "MESSAGE", space: { name: `spaces/${chat.parentId}` },
         user: { name: "users/42", displayName: "Tester" }, message: {
           name: `spaces/${chat.parentId}/messages/bare-${commandId}`, text: `/${command}`, argumentText: null,
-          thread: { name: `spaces/${chat.parentId}/threads/bdu-1mvFHog` }, slashCommand: { commandId },
+          thread: { name: `spaces/${chat.parentId}/threads/bdu-1mvFHog` }, threadReply: true, slashCommand: { commandId },
         } });
       expect(agent).not.toHaveBeenCalled();
       expect(model).not.toHaveBeenCalled();
@@ -140,7 +140,7 @@ describe("platform-aware persisted thread overlays", () => {
       const event = { type: "MESSAGE", space: { name: `spaces/${chat.parentId}` },
         user: { name: "users/42", displayName: "Tester" }, message: {
           name: `spaces/${chat.parentId}/messages/command-${commandId}`, text, argumentText: text,
-          thread: { name: `spaces/${chat.parentId}/threads/bdu-1mvFHog` }, slashCommand: { commandId },
+          thread: { name: `spaces/${chat.parentId}/threads/bdu-1mvFHog` }, threadReply: true, slashCommand: { commandId },
         } };
       await (adapter as any).transport.process({ ackId: `ack-${commandId}`, message: {
         messageId: `delivery-${commandId}`, data: Buffer.from(JSON.stringify(event)).toString("base64"),
@@ -177,7 +177,7 @@ describe("platform-aware persisted thread overlays", () => {
       user: { name: "users/42", displayName: "Tester" }, message: {
         name: `spaces/${chat.parentId}/messages/model-reply-fails`, text: "/model claude-reviewed",
         argumentText: "/model claude-reviewed", slashCommand: { commandId: 4 },
-        thread: { name: `spaces/${chat.parentId}/threads/bdu-1mvFHog` },
+        thread: { name: `spaces/${chat.parentId}/threads/bdu-1mvFHog` }, threadReply: true,
       } });
     expect(h.router.describeConfig(h.record()).model.value).toBe("claude-reviewed");
     expect(JSON.parse(fs.readFileSync(h.file, "utf8")).threads[key].model.value).toBe("claude-reviewed");

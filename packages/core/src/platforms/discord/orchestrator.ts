@@ -16241,8 +16241,7 @@ export class Orchestrator {
       this.store.turnAttempts.abandonDelivery(attempt.id, "recorded delivery timestamp is invalid");
       return "abandoned";
     }
-    // The production Discord adapter implements this evidence lookup. A test or
-    // future adapter without it must fail closed instead of claiming dedup.
+    // Adapters query their own delivery evidence; missing support is not proof.
     const parts = await this.deliveryParts(attempt.deliveryPayload, attempt.deliveryNonce);
     const delivered = attempt.deliveryPayload.kind === "messages" ? attempt.deliveryPayload.stream?.delivered ?? 0 : 0;
     if (delivered < parts.length && !this.adapter.findMessageByNonce) {
@@ -16266,7 +16265,7 @@ export class Orchestrator {
           this.logger.warn({ err, id: attempt.id }, "recorded delivery rejected permanently");
           return "abandoned";
         }
-        this.logger.warn({ err, id: attempt.id }, "Discord nonce lookup deferred");
+        this.logger.warn({ err, id: attempt.id, platform: channel.platform }, "platform nonce lookup deferred");
         return "deferred";
       }
       if (observed.status === "found") continue;

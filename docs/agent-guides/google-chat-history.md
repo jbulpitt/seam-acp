@@ -85,8 +85,10 @@ ID in later requests. Lookup needs no time window or history scan.
   into Chat, and route the MCP `MessageReader` source through the multiplexed
   adapter. It currently uses the Discord adapter directly.
 - The existing rebuild source in `Orchestrator.reconstructSessionFromDiscord`
-  already calls `this.adapter.fetchMessagePage`; it can use the same Chat source. Its
-  Discord-specific notices and metadata still need a separate wiring change.
+  already calls `this.adapter.fetchMessagePage`; it can use the same Chat source.
+  Its `getBotUserId()` call must use the target platform's identity before
+  projection; a no-argument call currently selects the primary Discord adapter.
+  Discord-specific notices and metadata also need a separate wiring change.
 
 ## Admin setup
 

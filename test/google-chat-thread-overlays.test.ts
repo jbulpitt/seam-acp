@@ -83,6 +83,33 @@ function fixture(channel = chat) {
 }
 
 describe("platform-aware persisted thread overlays", () => {
+  it.each([[3, "agent", "claude"], [4, "model", "claude-default"]])
+    ("bare command %s leaves real SQL, overlays and the warm runtime unchanged", async (commandId, command, current) => {
+      const h = fixture();
+      const warm = await h.router.getOrStartRuntime(h.record());
+      const before = structuredClone(h.record());
+      const presetBefore = fs.readFileSync(h.file, "utf8");
+      const agent = vi.spyOn(h.runtime, "applyAgentChange");
+      const model = vi.spyOn(h.runtime, "applyModelChange");
+      const request = vi.fn(async (_scope: string, req: any) => ({
+        name: `spaces/${chat.parentId}/messages/app`, thread: req.data.thread,
+      }));
+      const adapter = new GoogleChatAdapter({ api: { request }, logger, subscription: "projects/test/subscriptions/events",
+        defaultCwd: dir, allowedUserIds: new Set(["users/42"]), writeIntervalMs: 0 });
+      adapter.setCommandDeps({ router: h.router, runtimeTransition: h.runtime, cancelChannel: vi.fn() });
+      await adapter.receiveEvent({ type: "MESSAGE", space: { name: `spaces/${chat.parentId}` },
+        user: { name: "users/42", displayName: "Tester" }, message: {
+          name: `spaces/${chat.parentId}/messages/bare-${commandId}`, text: `/${command}`, argumentText: null,
+          thread: { name: `spaces/${chat.parentId}/threads/bdu-1mvFHog` }, slashCommand: { commandId },
+        } });
+      expect(agent).not.toHaveBeenCalled();
+      expect(model).not.toHaveBeenCalled();
+      expect(h.record()).toEqual(before);
+      expect(fs.readFileSync(h.file, "utf8")).toBe(presetBefore);
+      expect(h.router.getRuntime(before.id)).toBe(warm);
+      expect(request.mock.calls[0]![1].data.text).toBe(`Usage: /${command} <id> — current: ${current}`);
+    });
+
   it("loads qualified Chat keys alongside unchanged numeric Discord keys", () => {
     const document = { threads: { [key]: { agent: { value: "codex" }, model: { value: "codex-reviewed" } },
       [discord.id]: { agent: { value: "claude" } } } };

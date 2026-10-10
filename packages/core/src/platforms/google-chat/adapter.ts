@@ -5,10 +5,15 @@ import type { ChatAdapter, ChannelRef, DeliveryNonceLookup, DeliveryNonceOptions
 import type { StructuredPanel, StructuredLayout } from "../../core/types.js";
 import type { SessionStore } from "../../core/session-store.js";
 import type { InboundCommandResult } from "../../core/inbound-admission/types.js";
+import type { MessagePage, MessagePageRequest } from "../../core/message-reader.js";
+import type { GoogleChatHistoryReader } from "../../core/messages/google-chat-history.js";
+import { fetchMessagePage as fetchSpaceMessagePage, findMessageByNonce as findSpaceMessageByNonce,
+  type GoogleChatHistoryTarget } from "../../core/messages/google-chat-space-history.js";
 import type { GoogleDriveUploader } from "../../core/files/google-drive-upload.js";
 import type { ComponentAcknowledgement } from "../interaction-response.js";
 import type { GoogleApi } from "./api.js";
 import { googleErrorStatus } from "./api.js";
+import { googleChatClientMessageId } from "./message-id.js";
 import { PubSubPullTransport } from "./transport.js";
 import { SpaceWriteQueue } from "./write-queue.js";
 import { formatGoogleChatText, GOOGLE_CHAT_TEXT_MARKUP_SYNTAX } from "./text-format.js";
@@ -51,10 +56,6 @@ function channelForThread(thread: string): ChannelRef {
   return { platform: GOOGLE_CHAT_PLATFORM, id: `${spaceId}.${threadId}`, parentId: spaceId };
 }
 
-function clientId(nonce: string): string {
-  return `client-${createHash("sha256").update(nonce).digest("hex").slice(0, 56)}`;
-}
-
 function inboundId(name: string): string {
   return `gchat_${createHash("sha256").update(name).digest("base64url")}`;
 }
@@ -76,13 +77,15 @@ export class GoogleChatAdapter implements ChatAdapter {
   private componentAcknowledgement: ComponentAcknowledgement = "update";
   private commandDeps?: CommandDeps;
   private readonly spaces = new Map<string, GoogleChatSpace>();
+  private botUserId?: string;
   private spaceLifecycle?: (event: GoogleChatSpaceLifecycle) => void | Promise<void>;
 
   constructor(private readonly opts: { api: GoogleApi; subscription: string; allowedUserIds: ReadonlySet<string>;
     allowedSpaceIds?: ReadonlySet<string>; defaultCwd: string; defaultLocation?: string; logger: Logger;
     spaceEvents?: Pick<GoogleChatSpaceEvents, "start" | "stop" | "handle" | "space" | "appUser" | "recordAppUser">;
     hasSession?: (channel: ChannelRef) => boolean;
-    writeIntervalMs?: number; driveUploader?: Pick<GoogleDriveUploader, "upload"> }) {
+    writeIntervalMs?: number; driveUploader?: Pick<GoogleDriveUploader, "upload">;
+    historyReader?: Pick<GoogleChatHistoryReader, "readRawPage" | "getMessage"> }) {
     this.writes = new SpaceWriteQueue({ logger: opts.logger, intervalMs: opts.writeIntervalMs });
     this.transport = new PubSubPullTransport({ ...opts,
       receive: (event, signal, id) => this.receiveEvent(event, signal, id),
@@ -332,19 +335,22 @@ export class GoogleChatAdapter implements ChatAdapter {
     const { space, thread } = names(channel);
     const requestId = randomUUID();
     const params = { requestId, ...(thread ? { messageReplyOption: "REPLY_MESSAGE_OR_FAIL" } : {}),
-      ...(delivery ? { messageId: clientId(delivery.nonce) } : {}) };
+      ...(delivery ? { messageId: googleChatClientMessageId(delivery.nonce) } : {}) };
     const message = await this.writes.enqueue(space, async () => {
       try {
         return await this.opts.api.request<ChatMessage>("chat", { method: "POST", url: `${root}/${space}/messages`,
           params, data: { ...body, ...(thread ? { thread: { name: thread } } : {}) } });
       } catch (err) {
         if (!delivery || googleErrorStatus(err) !== 409) throw err;
-        return this.opts.api.request<ChatMessage>("chat", { method: "GET", url: `${root}/${space}/messages/${clientId(delivery.nonce)}` });
+        return this.opts.api.request<ChatMessage>("chat", { method: "GET", url: `${root}/${space}/messages/${googleChatClientMessageId(delivery.nonce)}` });
       }
     });
     if (!message.name) throw new Error("Google Chat create returned no message name");
     // The sender of our own app-auth write is the canonical app user, without a membership lookup.
-    if (message.sender?.name) this.opts.spaceEvents?.recordAppUser(space, message.sender.name);
+    if (message.sender?.name) {
+      this.botUserId = message.sender.name;
+      this.opts.spaceEvents?.recordAppUser(space, message.sender.name);
+    }
     if (thread && message.thread?.name !== thread) this.opts.logger.warn({ expected: thread, actual: message.thread?.name,
       message: message.name }, "Google Chat reply fell back to a different thread");
     this.opts.logger.info({ message: message.name, thread: message.thread?.name, expectedThread: thread }, "Google Chat message sent");
@@ -463,10 +469,38 @@ export class GoogleChatAdapter implements ChatAdapter {
     return Buffer.from(data);
   }
 
-  async findMessageByNonce(_channel: ChannelRef, _nonce: string): Promise<DeliveryNonceLookup> {
-    // Current app auth cannot prove absence; keep uncertain output without a denied lookup.
-    return { status: "indeterminate",
+  private async historyTarget(channel: ChannelRef): Promise<GoogleChatHistoryTarget> {
+    const { space, thread } = names(channel);
+    let metadata = this.space(space);
+    if (!metadata?.spaceType) {
+      const fetched = await this.opts.api.request<GoogleChatSpace>("chat", { method: "GET", url: `${root}/${space}` });
+      metadata = { ...metadata, ...fetched, name: space };
+      this.spaces.set(space, metadata);
+    }
+    return { space, thread, spaceType: metadata.spaceType as GoogleChatHistoryTarget["spaceType"] };
+  }
+
+  async fetchMessagePage(threadId: string, request: MessagePageRequest): Promise<MessagePage> {
+    if (!this.opts.historyReader) throw new Error("Google Chat history reader is not configured");
+    const target = await this.historyTarget({ platform: this.platform, id: threadId });
+    const result = await fetchSpaceMessagePage(this.opts.historyReader, target, request);
+    if (result.status === "unsupported") throw new Error(result.cause);
+    return result.page;
+  }
+
+  async findMessageByNonce(channel: ChannelRef, nonce: string): Promise<DeliveryNonceLookup> {
+    if (!this.opts.historyReader) return { status: "indeterminate",
       reason: "Google Chat nonce lookup is unsupported until history access is configured with admin-approved chat.app.messages.readonly" };
+    const result = await findSpaceMessageByNonce(this.opts.historyReader, await this.historyTarget(channel), nonce);
+    if (result.status === "unsupported") return { status: "indeterminate", reason: result.cause };
+    if (result.status === "absent") return result;
+    const { message } = result;
+    return { status: "found", message: { channel: this.channelFor(names(channel).space, message.threadName),
+      id: message.messageId, jumpLinkUnavailableReason: message.jumpLinkUnavailableReason } };
+  }
+
+  getBotUserId(channel?: ChannelRef): string | undefined {
+    return (channel ? this.opts.spaceEvents?.appUser(names(channel).space) : undefined) ?? this.botUserId;
   }
 
   async resolveChannel(channel: ChannelRef): Promise<ChannelRef> {

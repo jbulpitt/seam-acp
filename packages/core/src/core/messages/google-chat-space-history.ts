@@ -1,4 +1,5 @@
-import { createHash } from "node:crypto";
+import { googleChatClientMessageId } from "../../platforms/google-chat/message-id.js";
+export { googleChatClientMessageId } from "../../platforms/google-chat/message-id.js";
 import type { MessagePage, MessagePageRequest } from "../message-reader.js";
 import {
   normalizeGoogleChatMessage,
@@ -27,11 +28,6 @@ export type GoogleChatNonceResult =
   | GoogleChatHistoryUnsupported;
 
 type HistoryApi = Pick<GoogleChatHistoryReader, "readRawPage" | "getMessage">;
-
-/** Matches the custom messageId already used by the Chat sender. */
-export function googleChatClientMessageId(nonce: string): string {
-  return `client-${createHash("sha256").update(nonce).digest("hex").slice(0, 56)}`;
-}
 
 /** Bridge native tokens to the existing message-id page contract without cursor state. */
 export async function fetchMessagePage(

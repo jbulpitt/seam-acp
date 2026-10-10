@@ -114,7 +114,8 @@ import { ModelHideList } from "./core/model-catalog/hide-list.js";
 import { visibleModelMetadata, visibleModelRankings, visibleModelValueRows } from "./core/model-catalog/listings.js";
 import type { AdapterCatalogCandidate, AgentProfile } from "@seam/adapters";
 import { ModelValueRankingsCard } from "./core/model-value/rankings-card.js";
-import { LiveMessageSearch, MessageReader } from "./core/message-reader.js";
+import { createAdapterMessageReaders } from "./core/message-reader.js";
+import { GoogleChatHistoryReader } from "./core/messages/google-chat-history.js";
 import type { ServiceStatusMcpView } from "./core/service-status/mcp-view.js";
 import { planAgyIdentityMigration, readAgyHandleOwnership } from "./core/agy-identity-migration.js";
 import { PluginHost } from "./plugins/host.js";
@@ -481,6 +482,7 @@ async function main(): Promise<void> {
   const googleChat = googleChatApi && config.GOOGLE_CHAT_SUBSCRIPTION
     ? new GoogleChatAdapter({
       api: googleChatApi,
+      historyReader: new GoogleChatHistoryReader({ credentialsFile: config.GOOGLE_CHAT_CREDENTIALS_FILE! }),
       subscription: config.GOOGLE_CHAT_SUBSCRIPTION,
       allowedUserIds: config.GOOGLE_CHAT_ALLOWED_USER_IDS,
       allowedSpaceIds: config.GOOGLE_CHAT_ALLOWED_SPACE_IDS,
@@ -886,13 +888,7 @@ async function main(): Promise<void> {
   // enqueue dispatch specs / read threads — the DispatchWatcher + report-back
   // do the rest.
   if (config.SEAM_MCP_ENABLED) {
-    const messageReader = adapter.fetchMessagePage
-      ? new MessageReader(
-          { fetchMessagePage: (threadId, request) => adapter.fetchMessagePage(threadId, request) },
-          { logger }
-        )
-      : undefined;
-    const messageSearch = messageReader ? new LiveMessageSearch(messageReader) : undefined;
+    const { reader: messageReader, search: messageSearch } = createAdapterMessageReaders(chatAdapter, { logger });
     const threadSessionControl = orchestrator.getRuntimeTransition();
     orchestrator.setSelfMigrationHandler((target, prepared) =>
       threadSessionControl.executeSelfMigration(target, prepared)

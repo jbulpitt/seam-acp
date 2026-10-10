@@ -182,7 +182,7 @@ export interface ChatAdapter {
   isAllowedUser?(platform: string, userId: string): boolean;
 
   /** Optional: this application's bot user id, used to identify Seam assistant posts. */
-  getBotUserId?(): string | undefined;
+  getBotUserId?(channel?: ChannelRef): string | undefined;
 
   /** Optional: register a handler called when a thread is deleted (channelRef =
    *  the thread id). Used by scheduled prompts for instant cleanup. */

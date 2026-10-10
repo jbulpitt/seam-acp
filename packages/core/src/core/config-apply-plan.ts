@@ -203,7 +203,7 @@ export class ConfigApplyPlan {
       const written = this.configMutation.applyThreadOverlay({ threadId: channel.id, platform: channel.platform,
         ...(channel.parentId ? { parentRef: channel.parentId } : {}), changes: { cwd }, actor });
       if (!written.ok) return written;
-      const current = this.clearLegacyOverrides(this.store.get(record.id) ?? record, { cwd: null });
+      const current = this.store.get(record.id) ?? record;
       const changed = before.cwd.value !== this.router.describeConfig(current).cwd.value;
       const wasBusy = this.router.getRuntime(record.id)?.busy === true;
       await this.runtime.applySavedSelection(current, before);

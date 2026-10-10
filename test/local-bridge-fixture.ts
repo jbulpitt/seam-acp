@@ -125,6 +125,8 @@ export function localBridgeHub(
     defaultCwdForLocation: () => workspaceRoot,
     markSessionBridge: () => {},
     mcpServersForBridgeSpawn: wiring.mcpServersForBridgeSpawn,
+    hostExec: async (_location: string, input: { command: string; cwd?: string; timeoutSec?: number }) =>
+      dispatchBridgeRpc("shell", input, undefined, { adapters: new Map(), workspaceRoot, cwd: workspaceRoot }),
     rpc: async (_location: string, method: string, params: unknown, agentId?: string) => {
       const profile = profiles.find(candidate => candidate.id === agentId);
       const manager = profile?.sessionManager;

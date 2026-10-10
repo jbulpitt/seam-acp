@@ -204,6 +204,9 @@ describe("a second chat platform runs a normal turn", () => {
 
   it("leaves a Discord turn's ids, refs and attachment URLs unchanged", async () => {
     const h = setup("discord");
+    // With Chat enabled the multiplexer has a downloader, but CDN handling stays Discord's.
+    const download = vi.fn(async () => Buffer.from("must not eagerly download Discord media"));
+    Object.assign(h.adapter, { downloadAttachment: download });
     const url = "https://cdn.discordapp.com/attachments/1/2/note.txt";
     const fetch = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("hello"));
     const msg: IncomingMessage = {
@@ -216,6 +219,8 @@ describe("a second chat platform runs a normal turn", () => {
     };
 
     await h.run(msg);
+
+    expect(download).not.toHaveBeenCalled();
 
     expect(h.store.turnAttempts.get(inboundAttemptId("1300000000000000001"))).toMatchObject({ state: "completed" });
     expect(channelsUsed(h.adapter).every(channel => channel.platform === "discord"

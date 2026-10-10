@@ -198,6 +198,24 @@ describe("Google Chat compact status cards", () => {
     expect(JSON.stringify(card(turn))).not.toContain('"topLabel":"Action"');
   });
 
+  it("keeps a reconnecting explanation visible while Waiting, without an Action field", () => {
+    const turn = status();
+    turn.setState("Waiting");
+    turn.setAction("Reconnecting to session…");
+    expect(card(turn).header?.title).toBe("Waiting");
+    expect(text(turn)).toContain("Reconnecting to session…");
+    expect(JSON.stringify(card(turn))).not.toContain('"topLabel":"Action"');
+  });
+
+  it("keeps catalog provenance in TurnStatus, not the card's neutral rendering payload", () => {
+    const turn = new TurnStatus({ model: "m", repoDisplay: "r", modelDescription: "Catalog-only description",
+      modelEvidence: ["Catalog-only evidence"] });
+    expect(turn.toInput()).toMatchObject({ modelDescription: "Catalog-only description",
+      modelEvidence: ["Catalog-only evidence"] });
+    expect(JSON.stringify(panel(turn))).not.toContain("Catalog-only");
+    expect(JSON.stringify(card(turn))).not.toContain("Catalog-only");
+  });
+
   it("keeps dispatch provenance and real-cause notices", () => {
     const turn = status();
     turn.titlePrefix = "📨 Handoff";

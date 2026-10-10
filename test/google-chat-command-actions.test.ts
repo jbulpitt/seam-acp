@@ -68,12 +68,12 @@ describe("Google Chat command -> existing core operations", () => {
     expect(h.createThread).not.toHaveBeenCalled();
   });
 
-  it("creates a sibling top-level DM thread then binds it, without touching the old session", async () => {
+  it("creates a bold named sibling then binds it, without touching the old session", async () => {
     const h = harness();
     const result = await executeGoogleChatCommand({ ...command, command: "new", args: "Another task" }, h.deps);
     expect(result).toEqual({ command: "new", channel: created, record: h.newRecord });
     expect(h.channelFor).toHaveBeenCalledExactlyOnceWith(command.space, null);
-    expect(h.createThread).toHaveBeenCalledExactlyOnceWith(parent, "Another task");
+    expect(h.createThread).toHaveBeenCalledExactlyOnceWith(parent, "**Another task**");
     expect(h.ensureSessionRecord).toHaveBeenCalledExactlyOnceWith({ platform: "google-chat", channelRef: "dm.new", parentRef: "dm", cwd: "/repo" });
     expect(h.trace).toEqual(["create", "bind:dm.new"]);
     expect(h.cancelChannel).not.toHaveBeenCalled();

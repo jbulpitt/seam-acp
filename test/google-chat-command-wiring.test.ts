@@ -164,14 +164,37 @@ describe("merged Google Chat commands wired before ordinary turn admission", () 
       expect(h.request.mock.calls.at(-1)![0]).toBe("pubsub");
     });
 
-  it("creates a new top-level thread for /new and binds only that returned sibling", async () => {
+  it.each(["DIRECT_MESSAGE", "SPACE"])("creates a bold /new root in %s without admitting the name; its reply is a normal prompt", async spaceType => {
     const h = setup();
-    await h.deliver(event(1, "/new Another task"));
+    const before = structuredClone(h.record);
+    const raw = event(1, "/new Another task");
+    await h.deliver({ ...raw, space: { ...raw.space, spaceType, spaceThreadingState: "THREADED_MESSAGES" } });
     expect(h.normal).not.toHaveBeenCalled();
-    expect(h.request.mock.calls[0]![1].data.text).toBe("Another task");
+    expect(h.request.mock.calls[0]![1].data).toEqual({ text: "*Another task*", markupSyntax: "MARKUP_SYNTAX_CHAT" });
     expect(h.request.mock.calls[0]![1].data.thread).toBeUndefined();
+    expect(h.request.mock.calls[0]![1].params).not.toHaveProperty("messageReplyOption");
     expect(h.ensureSessionRecord).toHaveBeenCalledExactlyOnceWith({ platform: "google-chat", channelRef: "dm.new",
       parentRef: "dm", cwd: "/projects" });
+    expect(h.record).toEqual(before);
+    await h.deliver({ type: "MESSAGE", user: { name: "users/42", displayName: "Tester" },
+      space: { ...raw.space, spaceType, spaceThreadingState: "THREADED_MESSAGES" },
+      message: { name: "spaces/dm/messages/first-reply", text: spaceType === "SPACE" ? "@Seam Start the actual task" : "Start the actual task",
+        annotations: spaceType === "SPACE" ? [{ type: "USER_MENTION", startIndex: 0, length: 5,
+          userMention: { type: "MENTION", user: { name: "users/app", type: "BOT" } } }] : [], threadReply: true,
+        thread: { name: "spaces/dm/threads/new" } } });
+    expect(h.normal).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      channel: { platform: "google-chat", id: "dm.new", parentId: "dm" }, text: "Start the actual task",
+    }));
+  });
+
+  it("leaves bare /new's plain seam root and prompt-free binding unchanged", async () => {
+    const h = setup();
+    const raw = event(1, "/new");
+    await h.deliver({ ...raw, message: { ...raw.message, argumentText: null } });
+    expect(h.request.mock.calls[0]![1].data).toEqual({ text: "seam", markupSyntax: "MARKUP_SYNTAX_CHAT" });
+    expect(h.ensureSessionRecord).toHaveBeenCalledExactlyOnceWith({ platform: "google-chat", channelRef: "dm.new",
+      parentRef: "dm", cwd: "/projects" });
+    expect(h.normal).not.toHaveBeenCalled();
   });
 
   it("routes APP_COMMAND through the same canonical channel action", async () => {

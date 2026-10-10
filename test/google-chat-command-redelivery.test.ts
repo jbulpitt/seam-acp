@@ -58,6 +58,7 @@ describe("durable Google Chat command effects before reply delivery", () => {
     await h.deliver(event(1, "/new Another task"));
     await h.deliver(event(1, "/new Another task"), "redelivery");
     expect(h.request.mock.calls.filter(([scope]) => scope === "chat")).toHaveLength(1);
+    expect(h.request.mock.calls[0]![1].data.text).toBe("*Another task*");
     expect(h.ensureSessionRecord).toHaveBeenCalledExactlyOnceWith({ platform: "google-chat", channelRef: "dm.new-1",
       parentRef: "dm", cwd: "/projects" });
     expect(h.request.mock.calls.filter(([scope]) => scope === "pubsub")).toHaveLength(2);

@@ -10,6 +10,30 @@ function adapter(platform: string) {
 }
 
 describe("multi-adapter routing", () => {
+  it("keeps restart catch-up on the primary platform without resolving the message cursor as a channel ID", async () => {
+    const { multiplexChatAdapters } = await import("../packages/core/src/platforms/google-chat/multiplex.js");
+    const discord = Object.assign(adapter("discord"), { catchUpMessagesAfter: vi.fn(async () => 2) });
+    const chat = adapter("google-chat");
+    const platformForId = vi.fn(() => "google-chat");
+    const mux = multiplexChatAdapters([discord, chat], platformForId);
+
+    await expect(mux.catchUpMessagesAfter!("1550000000000000000")).resolves.toBe(2);
+
+    expect(discord.catchUpMessagesAfter).toHaveBeenCalledExactlyOnceWith("1550000000000000000");
+    expect(platformForId).not.toHaveBeenCalled();
+  });
+
+  it("does not advertise restart history polling on a primary platform without it", async () => {
+    const { multiplexChatAdapters } = await import("../packages/core/src/platforms/google-chat/multiplex.js");
+    const chat = adapter("google-chat");
+    const discord = Object.assign(adapter("discord"), { catchUpMessagesAfter: vi.fn(async () => 2) });
+    const mux = multiplexChatAdapters([chat, discord]);
+
+    expect(mux.platform).toBe("google-chat");
+    expect(mux.catchUpMessagesAfter).toBeUndefined();
+    expect(discord.catchUpMessagesAfter).not.toHaveBeenCalled();
+  });
+
   it("starts both platforms, fans in messages, and routes writes by ChannelRef.platform", async () => {
     const { multiplexChatAdapters } = await import("../packages/core/src/platforms/google-chat/multiplex.js");
     const discord = adapter("discord"), chat = adapter("google-chat");

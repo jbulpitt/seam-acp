@@ -69,14 +69,14 @@ describe("Google Chat app-auth history", () => {
     expect(new URL(String(options.url)).pathname).toBe(`/v1/${space}/messages`);
     expect(options).toMatchObject({ method: "GET", retry: false });
     expect(options.data).toBeUndefined();
-    expect(params(options)).toEqual({ pageSize: "2", orderBy: "createTime DESC", markupSyntax: "MARKUP_SYNTAX_MARKDOWN" });
+    expect(params(options)).toEqual({ pageSize: "2", orderBy: "createTime DESC" });
     expect(result).toMatchObject({
       rawCount: 2, oldestRawId: human.name, oldestRawTimestampMs: Date.parse(firstTime), nextPageToken: "next/+token=",
     });
     expect(result.messages.map((message) => message.messageId)).toEqual([bot.name, human.name]);
     expect(result.messages[1]).toEqual({
       messageId: human.name, timestampMs: Date.parse(firstTime), authorId: "users/123", authorName: "A Person",
-      authorType: "human", content: "**hello**", attachmentNames: ["notes.txt"], hasEmbeds: false,
+      authorType: "human", content: "hello", attachmentNames: ["notes.txt"], hasEmbeds: false,
       hasComponents: false, threadName: thread,
       jumpLinkUnavailableReason: "Google Chat messages.list does not return a message permalink",
     });
@@ -89,7 +89,7 @@ describe("Google Chat app-auth history", () => {
       space, thread, limit: 100, order: "oldest", before: secondTime, after: firstTime,
     });
     expect(params(chat.request.mock.calls[0]![0])).toEqual({
-      pageSize: "100", orderBy: "createTime ASC", markupSyntax: "MARKUP_SYNTAX_MARKDOWN",
+      pageSize: "100", orderBy: "createTime ASC",
       filter: `thread.name = ${thread} AND createTime < "${secondTime}" AND createTime > "${firstTime}"`,
     });
   });
@@ -154,6 +154,14 @@ describe("Google Chat app-auth history", () => {
     const page = await new GoogleChatHistoryReader(config, chat.client).readPage({ space, limit: 2 });
     expect(page.messages[0]).toMatchObject({ content: "hello", hasEmbeds: true });
     expect(page.messages[1]).toMatchObject({ content: "", attachmentNames: ["result.pdf"], hasEmbeds: false, hasComponents: false });
+  });
+
+  it("preserves the user's literal underscores and backslashes instead of formatted Markdown", async () => {
+    const text = String.raw`SEAM951_C path\segment`;
+    const chat = fakeChat({ messages: [{ ...human, text,
+      formattedText: String.raw`SEAM951\_C path\\segment` }] });
+    const page = await new GoogleChatHistoryReader(config, chat.client).readPage({ space, limit: 2 });
+    expect(page.messages[0]!.content).toBe(text);
   });
 
   it("passes Google's unapproved-scope error through unchanged, without falling back", async () => {

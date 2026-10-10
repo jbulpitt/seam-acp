@@ -98,7 +98,6 @@ export class GoogleChatHistoryReader {
     const query = new URLSearchParams({
       pageSize: String(request.limit),
       orderBy: `createTime ${request.order === "oldest" ? "ASC" : "DESC"}`,
-      markupSyntax: "MARKUP_SYNTAX_MARKDOWN",
     });
     if (request.pageToken) query.set("pageToken", request.pageToken);
     const filters: string[] = [];
@@ -121,7 +120,7 @@ export class GoogleChatHistoryReader {
 
   async getMessage(name: string): Promise<GoogleChatHistoryMessage> {
     const { data } = await this.client.request<GoogleChatHistoryMessage>({
-      url: `https://chat.googleapis.com/v1/${name}?markupSyntax=MARKUP_SYNTAX_MARKDOWN`,
+      url: `https://chat.googleapis.com/v1/${name}`,
       method: "GET",
       retry: false,
     });
@@ -146,7 +145,7 @@ export function normalizeGoogleChatMessage(message: GoogleChatHistoryMessage): G
     authorId: message.sender?.name ?? "",
     authorName: message.sender?.displayName ?? message.sender?.name ?? "",
     authorType: message.sender?.type === "BOT" ? "bot" : "human",
-    content: message.formattedText ?? message.text ?? "",
+    content: message.text ?? "",
     attachmentNames: (message.attachment ?? []).flatMap((attachment) =>
       attachment.contentName === undefined ? [] : [attachment.contentName]),
     hasEmbeds: Boolean(message.cards?.length || message.cardsV2?.length),

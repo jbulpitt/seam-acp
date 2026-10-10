@@ -485,7 +485,10 @@ export class GoogleChatAdapter implements ChatAdapter {
     const target = await this.historyTarget({ platform: this.platform, id: threadId });
     const result = await fetchSpaceMessagePage(this.opts.historyReader, target, request);
     if (result.status === "unsupported") throw new Error(result.cause);
-    return result.page;
+    return { ...result.page, messages: result.page.messages.map(message =>
+      message.authorName !== message.authorId ? message : { ...message,
+        authorName: this.commandDeps?.store.getInbound(inboundId(message.messageId))?.authorName || message.authorName,
+      }) };
   }
 
   async findMessageByNonce(channel: ChannelRef, nonce: string): Promise<DeliveryNonceLookup> {

@@ -96,7 +96,7 @@ describe("Google Chat named-space history source", () => {
     expect(result).toMatchObject({ rawCount: 3, oldestRawId: message(1).name });
     const queries = chat.request.mock.calls.map(([options]) => Object.fromEntries(new URL(String(options.url)).searchParams));
     expect(queries).toEqual([
-      { pageSize: "3", orderBy: "createTime DESC", markupSyntax: "MARKUP_SYNTAX_MARKDOWN", filter: `thread.name = ${thread}` },
+      { pageSize: "3", orderBy: "createTime DESC", filter: `thread.name = ${thread}` },
       { ...queries[0], pageToken: "short/+=" },
       { ...queries[0], pageToken: "empty/+=" },
     ]);
@@ -112,7 +112,7 @@ describe("Google Chat named-space history source", () => {
     const chat = history(rows, 2);
     const result = await page(chat, { limit: 3, before: rows[4]!.name });
     expect(result.messages.map((item) => item.messageId)).toEqual([rows[3]!.name, rows[2]!.name, rows[1]!.name]);
-    expect(String(chat.request.mock.calls[0]![0].url)).toContain(`/v1/${rows[4]!.name}?`);
+    expect(new URL(String(chat.request.mock.calls[0]![0].url)).pathname).toBe(`/v1/${rows[4]!.name}`);
     expect(new URL(String(chat.request.mock.calls[1]![0].url)).searchParams.get("filter"))
       .toBe(`thread.name = ${thread} AND createTime < "2026-10-10T12:00:00.124Z"`);
   });
@@ -172,6 +172,23 @@ describe("Google Chat named-space history source", () => {
     expect(search.hits.map((item) => item.messageId)).toEqual([rows[0]!.name]);
   });
 
+  it("finds two plain underscore hits and preserves that text for reads and rebuild projection", async () => {
+    const rows = [
+      message(1, { text: "SEAM951_C", formattedText: String.raw`SEAM951\_C` }),
+      message(2, { text: "Remember SEAM951_C", formattedText: String.raw`Remember SEAM951\_C`,
+        sender: { name: "users/app", type: "BOT" } }),
+      message(3, { text: "another marker" }),
+    ];
+    const reader = source(history(rows, 2));
+    const search = await new LiveMessageSearch(reader).search({ query: "SEAM951_C", threads: [{ id: thread, name: "Topic" }] });
+    expect(search.hits.map(item => item.messageId)).toEqual([rows[1]!.name, rows[0]!.name]);
+    const read = await reader.readMessages(thread, { limit: 3 });
+    expect(read.messages.map(item => item.content)).toEqual(rows.map(item => item.text));
+    const walked = await reader.walkThread(thread, { maxPages: 5 });
+    const logical = projectDiscordConversation(walked.messages, { seamBotId: "users/app" });
+    expect(logical.map(item => item.text)).toEqual(rows.map(item => item.text));
+  });
+
   it("supports space-only history without a thread filter", async () => {
     const chat = history([message(1), message(2, { thread: { name: `${space}/threads/other` } })]);
     const result = await fetchMessagePage(chat.reader, { space, spaceType: "SPACE" }, { limit: 3 });
@@ -207,7 +224,7 @@ describe("Google Chat named-space delivery nonce lookup", () => {
     expect(chat.request.mock.calls[0]![0]).toMatchObject({ method: "GET", retry: false });
     const url = new URL(String(chat.request.mock.calls[0]![0].url));
     expect(url.pathname).toBe(`/v1/${space}/messages/${clientId}`);
-    expect(url.searchParams.get("markupSyntax")).toBe("MARKUP_SYNTAX_MARKDOWN");
+    expect(url.searchParams.has("markupSyntax")).toBe(false);
   });
 
   it("returns absent only when Google confirms the client ID is missing", async () => {

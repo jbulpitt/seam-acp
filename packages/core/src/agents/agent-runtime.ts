@@ -1306,6 +1306,12 @@ export class AgentRuntime {
       }
       this.logger.warn({ agentId: this.profile.id, errorKind: classification.errorKind, operation, ...cause },
         "adapter error classified");
+      // A bare JSON-RPC "Internal error" hides the sign-in cause the adapter found.
+      if (classification.errorKind === "auth_required" && error instanceof Error
+        && error.message === "Internal error" && classification.details
+        && classification.details !== error.message) {
+        error.message = `Internal error: ${classification.details}`;
+      }
       throw error;
     }
   }

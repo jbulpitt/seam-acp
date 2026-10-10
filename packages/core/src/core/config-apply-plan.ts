@@ -1,4 +1,4 @@
-import { resolveThreadLocation } from "../config.js";
+import { resolveThreadLocation, threadPresetKey } from "../config.js";
 import type { Config } from "../config.js";
 import type { ChannelRef } from "../platforms/chat-adapter.js";
 import type { Logger } from "../lib/logger.js";
@@ -252,7 +252,8 @@ export class ConfigApplyPlan {
     const record = this.router.ensureSessionRecord({ platform: channel.platform, channelRef: channel.id, parentRef: channel.parentId, cwd: this.config.REPOS_ROOT });
     const before = this.router.describeConfig(record);
     const changes = Object.fromEntries(configOverrideFields(fields).map(field => [field, null])) as ChannelPresetChanges;
-    const result = this.applyThreadOverlay({ threadId: channel.id, parentRef: channel.parentId, changes, actor });
+    const result = this.applyThreadOverlay({ threadId: channel.id, parentRef: channel.parentId, changes, actor,
+      ...(channel.platform !== "discord" ? { platform: channel.platform } : {}) });
     if (!result.ok && !result.error.includes("No effective change")) throw new Error(result.error);
     const current = this.clearLegacyOverrides(record, changes);
     await this.runtime.applySavedSelection(current, before);
@@ -305,6 +306,7 @@ export class ConfigApplyPlan {
   ): { ok: true } | { ok: false; error: string } {
     const overlay = this.mutation.applyThreadOverlay({
       threadId: target.channelRef,
+      ...(target.platform !== "discord" ? { platform: target.platform } : {}),
       ...(target.parentRef ? { parentRef: target.parentRef } : {}),
       changes: {
         ...(changes.agent !== undefined ? { agent: changes.agent } : {}),
@@ -604,9 +606,10 @@ export class ConfigApplyPlan {
     if (prepared.kind === "overlay") {
       const before = this.router.describeConfig(record);
       const source = { ...(this.store.get(record.id) ?? record) };
-      const overlay = this.readThreadPresetEntry(channel.id);
+      const overlay = this.readThreadPresetEntry(threadPresetKey(channel.platform, channel.id));
       try {
-        const result = this.applyThreadOverlay({ threadId: channel.id, parentRef: channel.parentId, changes: prepared.changes, actor });
+        const result = this.applyThreadOverlay({ threadId: channel.id, parentRef: channel.parentId, changes: prepared.changes, actor,
+          ...(channel.platform !== "discord" ? { platform: channel.platform } : {}) });
         if (!result.ok && !result.error.includes("No effective change")) throw new Error(result.error);
         let current = this.clearLegacyOverrides(source, prepared.changes);
         const changes = prepared.changes;
@@ -628,7 +631,7 @@ export class ConfigApplyPlan {
         const committed = this.store.get(record.id) ?? current;
         return { ok: true, record: committed, effective: this.router.describeConfig(committed), restartRequested: false };
       } catch (err) {
-        const restored = this.restoreThreadPresetEntry(channel.id, overlay);
+        const restored = this.restoreThreadPresetEntry(threadPresetKey(channel.platform, channel.id), overlay);
         this.store.upsert(source, { source: "ConfigApplyPlan.applyPreparedConfigSet",
           cause: `config rollback: ${err instanceof Error ? err.message : String(err)}` });
         return { ok: false, message: err instanceof Error ? err.message : String(err), rollbackError: restored.ok ? "" : ` Overlay rollback failed: ${restored.error}` };
@@ -639,7 +642,7 @@ export class ConfigApplyPlan {
     let mutationStarted = false;
     const rollback = (cause: string): string => {
       if (!mutationStarted || !sessionBefore) return "";
-      const restored = this.configMutation.restoreThreadPresetEntry(channel.id, overlayBefore);
+      const restored = this.configMutation.restoreThreadPresetEntry(threadPresetKey(channel.platform, channel.id), overlayBefore);
       this.store.upsert(sessionBefore, { source: "ConfigApplyPlan.applyPreparedConfigSet", cause: `config rollback: ${cause}` });
       return restored.ok ? "" : ` Overlay rollback also failed: ${restored.error}`;
     };
@@ -654,7 +657,7 @@ export class ConfigApplyPlan {
       }
       const live = this.store.get(record.id) ?? record;
       sessionBefore = { ...live };
-      overlayBefore = this.configMutation.readThreadPresetEntry(channel.id);
+      overlayBefore = this.configMutation.readThreadPresetEntry(threadPresetKey(channel.platform, channel.id));
 
       if (prepared.kind === "json") {
         mutationStarted = true;
@@ -718,6 +721,7 @@ export class ConfigApplyPlan {
         if (Object.keys(overlayChanges).length > 0) {
           const overlaid = this.configMutation.applyThreadOverlay({
             threadId: channel.id,
+            ...(channel.platform !== "discord" ? { platform: channel.platform } : {}),
             ...(channel.parentId ? { parentRef: channel.parentId } : {}),
             changes: overlayChanges,
             actor,
@@ -907,6 +911,7 @@ export class ConfigApplyPlan {
     });
     if (Object.keys(identityChanges).length) {
       const written = this.configMutation.applyThreadOverlay({ threadId: channel.id,
+        ...(channel.platform !== "discord" ? { platform: channel.platform } : {}),
         ...(record.parentRef ? { parentRef: record.parentRef } : {}), changes: identityChanges,
         actor: { id: null, name: "preset-apply" } });
       if (!written.ok) throw new Error(written.error);

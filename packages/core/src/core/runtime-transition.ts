@@ -1,4 +1,4 @@
-import { resolveThreadLocation } from "../config.js";
+import { resolveThreadLocation, threadPresetKey } from "../config.js";
 import type { Config } from "../config.js";
 import type { SessionStore, SessionBindingChange } from "./session-store.js";
 import type { SessionRouter } from "./session-router.js";
@@ -178,6 +178,7 @@ export interface ThreadSessionControlDeps {
     restoreThreadPresetEntry: ConfigMutationService["restoreThreadPresetEntry"];
     applyThreadOverlay(opts: {
       threadId: string;
+      platform?: string;
       parentRef?: string;
       changes: {
         agent?: string | null;
@@ -472,7 +473,7 @@ export class RuntimeTransition {
     }
 
     const snapshot: SessionRecord = { ...current };
-    const overlayBefore = this.deps.mutation.readThreadPresetEntry(current.channelRef);
+    const overlayBefore = this.deps.mutation.readThreadPresetEntry(threadPresetKey(current.platform, current.channelRef));
     const desiredEffort = prepared.effort;
     const binding = { agentId: prepared.agent, location: before.location.value };
     const warnings: string[] = assessModelSelection(this.deps.modelCatalog, binding, prepared.model).verification === "unverified"
@@ -519,7 +520,7 @@ export class RuntimeTransition {
       // A candidate runtime may already exist. Retire it before restoring the
       // old durable session so no process can keep writing stale target state.
       await this.retire(current.id, { clearStartFailure: true }).catch(() => {});
-      const restored = this.deps.mutation.restoreThreadPresetEntry(current.channelRef, overlayBefore);
+      const restored = this.deps.mutation.restoreThreadPresetEntry(threadPresetKey(current.platform, current.channelRef), overlayBefore);
       this.deps.store.upsert(snapshot, {
         source: "RuntimeTransition.commitSelfMigration", cause: `migration rollback: ${err instanceof Error ? err.message : String(err)}`,
       });
@@ -894,7 +895,7 @@ export class RuntimeTransition {
 
   private captureSelection(record: SessionRecord, channel: ChannelRef, describedBefore: ConfigDescription, kind: "agent" | "model") {
     const sessionBefore = { ...(this.store.get(record.id) ?? record) };
-    const overlayBefore = this.configMutation.readThreadPresetEntry(channel.id);
+    const overlayBefore = this.configMutation.readThreadPresetEntry(threadPresetKey(channel.platform, channel.id));
     const originalEffective = {
       agent: describedBefore.agent.value,
       model: describedBefore.model.value,
@@ -903,7 +904,7 @@ export class RuntimeTransition {
 
     const rollback = (cause: string): { acpRestored: boolean } => {
       const overlayRestored = this.configMutation.restoreThreadPresetEntry(
-        channel.id,
+        threadPresetKey(channel.platform, channel.id),
         overlayBefore
       );
       this.store.upsert({ ...sessionBefore, updatedUtc: new Date().toISOString() });
@@ -979,6 +980,7 @@ export class RuntimeTransition {
 
       const overlay = this.configMutation.applyThreadOverlay({
         threadId: channel.id,
+        ...(channel.platform !== "discord" ? { platform: channel.platform } : {}),
         ...(channel.parentId ? { parentRef: channel.parentId } : {}),
         changes: { model: canonicalId, effort: defaultEffort ?? null },
         actor,
@@ -1055,7 +1057,6 @@ export class RuntimeTransition {
     const { sessionBefore, rollback } = this.captureSelection(record, channel, describedBefore, "agent");
 
     try {
-      await this.retire(record.id);
       const live = this.store.get(record.id) ?? record;
       const cfg = this.store.readConfig(live);
       const nextBinding = { agentId: parsed.agentId, location: nextLocation };
@@ -1077,14 +1078,14 @@ export class RuntimeTransition {
       this.store.upsert({
         ...live,
         agentId: parsed.agentId,
-        acpSessionId: "",
         configJson: this.store.writeConfig(cfg),
         updatedUtc: new Date().toISOString(),
-      }, { source: "RuntimeTransition.applyAgentChange", cause: `operator selected ${parsed.agentId}@${nextLocation}` });
+      });
 
       if (!sameLocation) {
         const written = this.configMutation.applyThreadLocation({
           threadId: channel.id,
+          ...(channel.platform !== "discord" ? { platform: channel.platform } : {}),
           ...(channel.parentId ? { parentRef: channel.parentId } : {}),
           location: nextLocation,
           actor,
@@ -1100,6 +1101,7 @@ export class RuntimeTransition {
 
       const overlay = this.configMutation.applyThreadOverlay({
         threadId: channel.id,
+        ...(channel.platform !== "discord" ? { platform: channel.platform } : {}),
         ...(channel.parentId ? { parentRef: channel.parentId } : {}),
         changes: {
           agent: parsed.agentId,
@@ -1141,6 +1143,12 @@ export class RuntimeTransition {
         );
       }
 
+      // A refused overlay must leave the old runtime and binding untouched.
+      await this.retire(verified.id);
+      const committed = this.store.get(verified.id) ?? verified;
+      this.store.upsert({ ...committed, acpSessionId: "", updatedUtc: new Date().toISOString() }, {
+        source: "RuntimeTransition.applyAgentChange", cause: `operator selected ${parsed.agentId}@${nextLocation}`,
+      });
       bindSessionLocation(this.bridgeHub, verified.id, nextLocation);
       // The switch is now committed. Settling earlier would cancel old-session
       // work even when validation failed and rollback restored that session.
@@ -1173,6 +1181,7 @@ export class RuntimeTransition {
     this.persistConfig(record, cfg);
     const overlay = this.configMutation.applyThreadOverlay({
       threadId: record.channelRef,
+      ...(record.platform !== "discord" ? { platform: record.platform } : {}),
       ...(record.parentRef ? { parentRef: record.parentRef } : {}),
       changes: { effort: level },
       actor: { id: null, name: null },

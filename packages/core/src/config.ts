@@ -36,6 +36,9 @@ const Schema = z.object({
   GOOGLE_CHAT_ALLOWED_USER_IDS: z.string().default("").transform(value =>
     new Set(value.split(",").map(id => id.trim()).filter(Boolean))),
   GOOGLE_CHAT_DEFAULT_CWD: z.string().optional(),
+  GOOGLE_CHAT_DRIVE_FOLDER_ID: z.string().optional(),
+  GOOGLE_CHAT_DRIVE_SHARING_POLICY: z.string().optional(),
+  GOOGLE_CHAT_DRIVE_DOMAIN: z.string().optional(),
   BRAND_ICON_BASE_URL: z.string().url().default(DEFAULT_BRAND_ICON_BASE_URL),
   DISCORD_ALLOWED_USER_IDS: z
     .string()
@@ -927,6 +930,13 @@ const Schema = z.object({
 const PresetFieldSchema = <T extends z.ZodType>(value: T) => z.object({ value });
 
 const numericId = z.string().regex(/^\d+$/, "preset key must be a numeric Discord id");
+const threadPresetId = z.string().regex(/^(?:\d+|google-chat:[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)$/,
+  "preset key must be a numeric Discord id or a qualified Google Chat space.thread ref");
+
+/** Preserve Discord's file keys; other platform refs cannot masquerade as them. */
+export function threadPresetKey(platform: string, id: string): string {
+  return platform === "google-chat" ? `google-chat:${id}` : id;
+}
 
 // Shared value fields for both channel- and thread-level presets. These are
 // always applied at runtime (no separate per-field lock) — see
@@ -1061,7 +1071,7 @@ export type BridgeHostConfig = z.infer<typeof BridgeHostSchema> & { id: string }
 // persist a setting that would disappear on restart.
 export const PresetsFileSchema = z.object({
   channels: z.record(numericId, ChannelPresetSchema).optional().default({}),
-  threads: z.record(numericId, ThreadPresetSchema).optional().default({}),
+  threads: z.record(threadPresetId, ThreadPresetSchema).optional().default({}),
   /** D11 host config + D8 pairing hashes. Per-thread @location lives on `threads`. */
   bridges: z.record(bridgeIdKey, BridgeHostSchema).optional().default({}),
 });
@@ -1547,7 +1557,8 @@ export function buildChannelPresetMaps(
   for (const [threadId, preset] of Object.entries(result.data.threads)) {
     const normalized: ThreadPreset = { ...preset };
     if (preset.cwd) normalized.cwd = { value: path.resolve(preset.cwd.value) };
-    threadPresets.set(threadId, normalized);
+    // Runtime refs remain space.thread; the persisted prefix identifies the platform.
+    threadPresets.set(threadId.startsWith("google-chat:") ? threadId.slice("google-chat:".length) : threadId, normalized);
   }
   for (const [id, host] of Object.entries(result.data.bridges)) {
     const normalized: BridgeHostConfig = { ...host, id };

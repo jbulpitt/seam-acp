@@ -1,11 +1,21 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { Logger } from "pino";
 import type { ChatAdapter, ChannelRef, DeliveryNonceLookup, DeliveryNonceOptions, IncomingMessage,
-  MessageAttachment, MessageRef } from "../chat-adapter.js";
+  MessageAttachment, MessageRef, ChoiceCardPost, ChoiceInteraction, ComponentEvent, ElicitationCardPost } from "../chat-adapter.js";
+import type { StructuredPanel, StructuredLayout } from "../../core/types.js";
+import type { GoogleDriveUploader } from "../../core/files/google-drive-upload.js";
+import type { ComponentAcknowledgement } from "../interaction-response.js";
 import type { GoogleApi } from "./api.js";
 import { googleErrorStatus } from "./api.js";
 import { PubSubPullTransport } from "./transport.js";
 import { SpaceWriteQueue } from "./write-queue.js";
+import { formatGoogleChatText, GOOGLE_CHAT_TEXT_MARKUP_SYNTAX } from "./text-format.js";
+import { splitGoogleChatText } from "./text-split.js";
+import { parseGoogleChatCardClick, type GoogleChatCardClickEvent } from "./card-click.js";
+import { renderGoogleChatPanel, renderGoogleChatLayout, renderGoogleChatChoiceCard,
+  renderGoogleChatElicitationCard, type GoogleChatCardsMessage } from "./card-renderer.js";
+import { parseGoogleChatCommand, type GoogleChatCommandEvent } from "./commands.js";
+import { executeGoogleChatCommand, type GoogleChatCommandDeps } from "./command-actions.js";
 
 export const GOOGLE_CHAT_PLATFORM = "google-chat";
 const root = "https://chat.googleapis.com/v1";
@@ -13,8 +23,9 @@ type ChatMessage = { name?: string; text?: string; thread?: { name?: string }; t
   sender?: { name?: string; type?: string; displayName?: string };
   attachment?: Array<{ contentName?: string; contentType?: string;
     attachmentDataRef?: { resourceName?: string } }> };
-type ChatEvent = { type?: string; user?: ChatMessage["sender"]; space?: { name?: string; spaceThreadingState?: string };
-  message?: ChatMessage };
+type ChatEvent = GoogleChatCommandEvent & { user?: ChatMessage["sender"]; space?: { name?: string; spaceThreadingState?: string };
+  message?: ChatMessage; thread?: { name?: string }; action?: GoogleChatCardClickEvent["action"];
+  common?: GoogleChatCardClickEvent["common"] };
 
 function resourceId(name: string, kind: string): string {
   const parts = name.split("/");
@@ -42,30 +53,76 @@ export class GoogleChatAdapter implements ChatAdapter {
   private handler?: (message: IncomingMessage) => void | Promise<void>;
   private readonly writes: SpaceWriteQueue;
   private readonly transport: PubSubPullTransport;
+  private choiceHandler?: (event: ChoiceInteraction) => void | Promise<void>;
+  private componentHandler?: (event: ComponentEvent) => void | Promise<void>;
+  private choiceAcknowledgement: ComponentAcknowledgement = "update";
+  private componentAcknowledgement: ComponentAcknowledgement = "update";
+  private commandDeps?: Pick<GoogleChatCommandDeps, "router" | "runtimeTransition" | "cancelChannel">;
 
   constructor(private readonly opts: { api: GoogleApi; subscription: string; allowedUserIds: ReadonlySet<string>;
-    defaultCwd: string; logger: Logger; writeIntervalMs?: number }) {
+    defaultCwd: string; logger: Logger; writeIntervalMs?: number; driveUploader?: Pick<GoogleDriveUploader, "upload"> }) {
     this.writes = new SpaceWriteQueue({ logger: opts.logger, intervalMs: opts.writeIntervalMs });
-    this.transport = new PubSubPullTransport({ ...opts, receive: (event, signal) => this.receiveEvent(event, signal) });
+    this.transport = new PubSubPullTransport({ ...opts,
+      receive: (event, signal, id) => this.receiveEvent(event, signal, id) });
   }
 
   async start(): Promise<void> { await this.transport.start(); }
   async stop(): Promise<void> { await this.transport.stop(); await this.writes.flush(); }
   onMessage(handler: (message: IncomingMessage) => void | Promise<void>): void { this.handler = handler; }
+  onChoiceInteraction(handler: (event: ChoiceInteraction) => void | Promise<void>, acknowledgement: ComponentAcknowledgement): void {
+    this.choiceHandler = handler; this.choiceAcknowledgement = acknowledgement;
+  }
+  onComponent(handler: (event: ComponentEvent) => void | Promise<void>, acknowledgement: ComponentAcknowledgement): void {
+    this.componentHandler = handler; this.componentAcknowledgement = acknowledgement;
+  }
+  setCommandDeps(deps: Pick<GoogleChatCommandDeps, "router" | "runtimeTransition" | "cancelChannel">): void {
+    this.commandDeps = deps;
+  }
 
   isAllowedUser(platform: string, userId: string): boolean {
     return platform === this.platform && this.opts.allowedUserIds.has(userId.startsWith("users/") ? userId : `users/${userId}`);
   }
 
-  async receiveEvent(raw: unknown, signal?: AbortSignal): Promise<void> {
+  async receiveEvent(raw: unknown, signal?: AbortSignal, interactionId?: string): Promise<void> {
     const event = raw as ChatEvent;
     const message = event.message;
     this.opts.logger.info({ type: event.type, space: event.space?.name, message: message?.name,
       thread: message?.thread?.name, threadReply: message?.threadReply,
       spaceThreadingState: event.space?.spaceThreadingState }, "Google Chat event");
-    if (event.type !== "MESSAGE") return;
     const user = event.user ?? message?.sender;
     if (user?.type === "BOT" || !user?.name || !this.isAllowedUser(this.platform, user.name)) return;
+    if (event.type === "CARD_CLICKED") {
+      await this.receiveCardClick(event, interactionId);
+      return;
+    }
+    const command = parseGoogleChatCommand(event);
+    if (command) {
+      if (!this.commandDeps) throw new Error("Google Chat command handlers not installed");
+      const result = await executeGoogleChatCommand({ ...command,
+        user: { ...command.user, id: resourceId(command.user.id, "users") } }, {
+        ...this.commandDeps,
+        channelFor: (space, thread) => thread ? channelForThread(thread)
+          : { platform: this.platform, id: resourceId(space, "spaces") },
+        createThread: (parent, name) => this.createThread(parent, name),
+        cwd: this.opts.defaultCwd,
+        respond: async (channel, text) => { await this.sendMessage(channel, text); },
+      });
+      if (result.command === "cancel") {
+        const { outcome } = result;
+        let text: string;
+        if ("error" in outcome) text = `Cancel requested, but not confirmed: ${
+          outcome.error instanceof Error ? outcome.error.message : String(outcome.error)}. Work may still be running.`;
+        else if (outcome.outcome === "idle") text = outcome.cancelled.cancelled ? "Turn cancelled."
+          : outcome.parked ? "Queued prompt cancelled."
+          : outcome.queue.queued ? `No active turn; ${outcome.queue.queued} durable items remain queued. Nothing was discarded.`
+          : "No active turn.";
+        else text = outcome.outcome === "unacknowledged"
+          ? "Cancel requested, but not confirmed. Work may still be running." : "Cancel sent to the active turn.";
+        await this.sendMessage(result.channel, text);
+      }
+      return;
+    }
+    if (event.type !== "MESSAGE") return;
     if (!message?.name || !message.thread?.name) throw new Error("Google Chat MESSAGE has no message or thread name");
     if (!this.handler) throw new Error("Google Chat inbound handler not installed");
     const attachments: MessageAttachment[] = (message.attachment ?? []).map(a => ({
@@ -96,6 +153,25 @@ export class GoogleChatAdapter implements ChatAdapter {
   }
 
   async sendMessage(channel: ChannelRef, text: string, delivery?: DeliveryNonceOptions): Promise<MessageRef> {
+    return this.sendText(channel, text, delivery);
+  }
+
+  private async sendText(channel: ChannelRef, text: string, delivery?: DeliveryNonceOptions, privateUser?: string): Promise<MessageRef> {
+    const { thread } = names(channel);
+    const extra = { ...(thread ? { thread: { name: thread } } : {}),
+      ...(privateUser ? { privateMessageViewer: { name: privateUser } } : {}) };
+    const reservedBytes = Buffer.byteLength(JSON.stringify(extra), "utf8") - 1;
+    const parts = splitGoogleChatText(formatGoogleChatText(text), { reservedBytes });
+    let ref: MessageRef | undefined;
+    for (const [part, value] of (parts.length ? parts : [""]).entries()) {
+      ref = await this.postMessage(channel, { text: value, markupSyntax: GOOGLE_CHAT_TEXT_MARKUP_SYNTAX,
+        ...(privateUser ? { privateMessageViewer: { name: privateUser } } : {}) }, delivery
+        ? { ...delivery, nonce: part ? `${delivery.nonce}-${part}` : delivery.nonce } : undefined);
+    }
+    return ref!;
+  }
+
+  private async postMessage(channel: ChannelRef, body: Record<string, unknown>, delivery?: DeliveryNonceOptions): Promise<MessageRef> {
     const { space, thread } = names(channel);
     const requestId = randomUUID();
     const params = { requestId, ...(thread ? { messageReplyOption: "REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD" } : {}),
@@ -103,7 +179,7 @@ export class GoogleChatAdapter implements ChatAdapter {
     const message = await this.writes.enqueue(space, async () => {
       try {
         return await this.opts.api.request<ChatMessage>("chat", { method: "POST", url: `${root}/${space}/messages`,
-          params, data: { text, markupSyntax: "MARKUP_SYNTAX_MARKDOWN", ...(thread ? { thread: { name: thread } } : {}) } });
+          params, data: { ...body, ...(thread ? { thread: { name: thread } } : {}) } });
       } catch (err) {
         if (!delivery || googleErrorStatus(err) !== 409) throw err;
         return this.opts.api.request<ChatMessage>("chat", { method: "GET", url: `${root}/${space}/messages/${clientId(delivery.nonce)}` });
@@ -118,10 +194,50 @@ export class GoogleChatAdapter implements ChatAdapter {
   }
 
   async editMessage(message: MessageRef, text: string): Promise<void> {
+    const { thread } = names(message.channel);
+    const reservedBytes = thread ? Buffer.byteLength(JSON.stringify({ thread: { name: thread } }), "utf8") - 1 : 0;
+    const parts = splitGoogleChatText(formatGoogleChatText(text), { reservedBytes });
+    await this.patchMessage(message, { text: parts[0] ?? "", markupSyntax: GOOGLE_CHAT_TEXT_MARKUP_SYNTAX }, "text");
+    for (const part of parts.slice(1)) await this.postMessage(message.channel,
+      { text: part, markupSyntax: GOOGLE_CHAT_TEXT_MARKUP_SYNTAX });
+  }
+
+  private async patchMessage(message: MessageRef, body: Record<string, unknown>, updateMask: string): Promise<void> {
     await this.writes.enqueue(names(message.channel).space, async () => {
       await this.opts.api.request("chat", { method: "PATCH", url: `${root}/${message.id}`,
-        params: { updateMask: "text" }, data: { text, markupSyntax: "MARKUP_SYNTAX_MARKDOWN" } });
+        params: { updateMask }, data: body });
     }, message.id);
+  }
+
+  async sendPanel(channel: ChannelRef, panel: StructuredPanel, delivery?: DeliveryNonceOptions): Promise<MessageRef> {
+    return this.postCards(channel, renderGoogleChatPanel(panel, randomUUID()), delivery);
+  }
+  async editPanel(message: MessageRef, panel: StructuredPanel): Promise<void> {
+    await this.patchCards(message, renderGoogleChatPanel(panel, message.id));
+  }
+  async sendLayout(channel: ChannelRef, layout: StructuredLayout): Promise<MessageRef> {
+    return this.postCards(channel, renderGoogleChatLayout(layout, randomUUID()));
+  }
+  async editLayout(message: MessageRef, layout: StructuredLayout): Promise<void> {
+    await this.patchCards(message, renderGoogleChatLayout(layout, message.id));
+  }
+  async sendChoiceCard(channel: ChannelRef, card: ChoiceCardPost): Promise<MessageRef> {
+    return this.postCards(channel, renderGoogleChatChoiceCard(card));
+  }
+  async editChoiceCard(message: MessageRef, card: ChoiceCardPost): Promise<void> {
+    await this.patchCards(message, renderGoogleChatChoiceCard(card));
+  }
+  async sendElicitationCard(channel: ChannelRef, card: ElicitationCardPost): Promise<MessageRef> {
+    return this.postCards(channel, renderGoogleChatElicitationCard(card, randomUUID()));
+  }
+  async editElicitationCard(message: MessageRef, card: ElicitationCardPost): Promise<void> {
+    await this.patchCards(message, renderGoogleChatElicitationCard(card, message.id));
+  }
+  private postCards(channel: ChannelRef, card: GoogleChatCardsMessage, delivery?: DeliveryNonceOptions): Promise<MessageRef> {
+    return this.postMessage(channel, { ...card }, delivery);
+  }
+  private patchCards(message: MessageRef, card: GoogleChatCardsMessage): Promise<void> {
+    return this.patchMessage(message, { ...card }, "cardsV2");
   }
 
   async deleteMessage(message: MessageRef): Promise<void> {
@@ -138,21 +254,44 @@ export class GoogleChatAdapter implements ChatAdapter {
 
   async sendFile(channel: ChannelRef, file: { data: Buffer; filename: string; mimeType: string; caption?: string },
     delivery?: DeliveryNonceOptions): Promise<MessageRef> {
-    const textFile = /^text\//.test(file.mimeType) || /json|javascript|xml/.test(file.mimeType);
-    const body = textFile ? file.data.toString("utf8") : `[${file.data.length} bytes; binary upload is not available in this slice]`;
-    const text = [file.caption, file.filename, body].filter(Boolean).join("\n\n");
-    let remaining = text;
-    let ref: MessageRef | undefined;
-    let part = 0;
-    while (remaining.length) {
-      // Leave room for JSON overhead under Chat's 32 KB message budget.
-      let length = Math.min(remaining.length, 4000);
-      if (/[\uD800-\uDBFF]/.test(remaining[length - 1] ?? "")) length--;
-      ref = await this.sendMessage(channel, remaining.slice(0, length), delivery
-        ? { ...delivery, nonce: part === 0 ? delivery.nonce : `${delivery.nonce}-${part}` } : undefined);
-      remaining = remaining.slice(length); part++;
+    if (this.opts.driveUploader) {
+      const link = await this.opts.driveUploader.upload(file);
+      return this.sendMessage(channel, [file.caption, `[${file.filename}](${link})`].filter(Boolean).join("\n\n"), delivery);
     }
-    return ref!;
+    const textFile = /^text\//.test(file.mimeType) || /json|javascript|xml/.test(file.mimeType);
+    const body = textFile ? file.data.toString("utf8") : `[${file.data.length} bytes; Drive upload is not configured]`;
+    const text = [file.caption, file.filename, body].filter(Boolean).join("\n\n");
+    return this.sendMessage(channel, text, delivery);
+  }
+
+  private async receiveCardClick(event: ChatEvent, interactionId?: string): Promise<void> {
+    const thread = event.message?.thread?.name ?? event.thread?.name;
+    if (!thread) throw new Error("Google Chat CARD_CLICKED has no thread name");
+    if (!interactionId) throw new Error("Google Chat CARD_CLICKED has no Pub/Sub delivery id");
+    const parsed = parseGoogleChatCardClick({ ...event, type: "CARD_CLICKED" },
+      { channel: channelForThread(thread), interactionId });
+    if (!parsed) return;
+    const data = { ...parsed.interaction, userId: resourceId(parsed.interaction.userId, "users") };
+    const acknowledgement = parsed.type === "choice" ? this.choiceAcknowledgement : this.componentAcknowledgement;
+    const mode = typeof acknowledgement === "function" ? acknowledgement(data) : acknowledgement;
+    const privateUser = event.user!.name!;
+    let reply: MessageRef | undefined;
+    const replyEphemeral = async (text: string) => { reply = await this.sendText(data.channel, text, undefined, privateUser); };
+    const showModal = async () => { throw new Error("Google Chat Pub/Sub does not support dialogs; use inline card inputs"); };
+    this.opts.logger.debug({ interactionId, customId: data.customId, mode }, "Google Chat card interaction");
+    // Pub/Sub ACK follows the durable handler; card refreshes use whole-message PATCH.
+    if (parsed.type === "choice") {
+      if (!this.choiceHandler) throw new Error("Google Chat choice handler not installed");
+      await this.choiceHandler({ ...data, replyEphemeral, followUpEphemeral: replyEphemeral, showModal });
+    } else {
+      if (!this.componentHandler) throw new Error("Google Chat component handler not installed");
+      await this.componentHandler({ ...data, interactionId, replyEphemeral, followUpEphemeral: replyEphemeral,
+        editReplyEphemeral: async text => { if (reply) await this.editMessage(reply, text); else await replyEphemeral(text); },
+        replyEphemeralView: async () => { throw new Error("Google Chat cannot render a Discord ephemeral view"); },
+        updateEphemeralView: async () => { throw new Error("Google Chat cannot render a Discord ephemeral view"); },
+        followUpEphemeralFile: async file => { await replyEphemeral(`${file.filename}\n\n${file.data.toString("utf8")}`); },
+        showModal });
+    }
   }
 
   async downloadAttachment(attachment: MessageAttachment): Promise<Buffer> {

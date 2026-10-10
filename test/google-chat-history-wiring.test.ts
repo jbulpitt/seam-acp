@@ -33,7 +33,10 @@ function setup(spaceType = "SPACE") {
     if (after) page = page.filter(r => Date.parse(r.createTime) > Date.parse(after));
     page = page.sort((a, b) => Date.parse(b.createTime) - Date.parse(a.createTime));
     if (url.searchParams.get("orderBy")?.endsWith("ASC")) page.reverse();
-    return { data: { messages: page.slice(0, Number(url.searchParams.get("pageSize"))) } };
+    const offset = Number(url.searchParams.get("pageToken") ?? 0);
+    const end = offset + Number(url.searchParams.get("pageSize"));
+    return { data: { messages: page.slice(offset, end),
+      ...(end < page.length ? { nextPageToken: String(end) } : {}) } };
   });
   const historyReader = new GoogleChatHistoryReader({ credentialsFile: "/test/key.json" }, { request: historyRequest });
   const request = vi.fn(async (_scope: string, r: any): Promise<any> => {

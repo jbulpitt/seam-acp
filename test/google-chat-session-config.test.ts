@@ -36,6 +36,7 @@ vi.mock("../packages/core/src/agents/agent-runtime.js", async importOriginal => 
       return { sessionId: this.sessionId };
     }
     getSessionInfo() { return { sessionId: this.sessionId, currentModelId: this.modelOverride }; }
+    hasDelegatedTurnInFlight() { return false; }
     async dispose() { this.disposed = true; }
     async setModel(model: string) { this.modelOverride = model; }
     async setConfigOption(_id: string, value: string) { this.effortOverride = value; }

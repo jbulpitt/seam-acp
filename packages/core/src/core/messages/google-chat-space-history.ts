@@ -109,11 +109,12 @@ async function* rawMessages(
   } while (pageToken);
 }
 
-/** Query the sender's client ID; ambiguous GETs require full Space proof. */
+/** Query the sender's client ID; ambiguous GETs require receipt-window proof. */
 export async function findMessageByNonce(
   reader: HistoryApi,
   target: GoogleChatHistoryTarget,
   nonce: string,
+  sinceMs: number,
 ): Promise<GoogleChatNonceResult> {
   if (target.spaceType === "DIRECT_MESSAGE") {
     return { status: "unsupported", cause: GOOGLE_CHAT_DM_HISTORY_CAUSE };
@@ -132,9 +133,9 @@ export async function findMessageByNonce(
       || cause.message !== "Permission denied to perform the requested action on the specified resource, or the resource doesn't exist."
       || cause.errors?.length !== 1 || cause.errors[0]?.domain !== "global" || cause.errors[0]?.reason !== "forbidden") throw error;
   }
-  // The ambiguous GET is not absence proof. Exhaust public Space history;
+  // The ambiguous GET is not absence proof. Exhaust the receipt's time window;
   // a denial or interrupted page propagates, never authorizes replay.
-  for await (const message of rawMessages(reader, { space: target.space, spaceType: target.spaceType }, 100, "newest", {})) {
+  for await (const message of rawMessages(reader, target, 100, "newest", { after: new Date(sinceMs).toISOString() })) {
     if (message.clientAssignedMessageId === clientId) {
       return { status: "found", message: normalizeGoogleChatMessage(message) };
     }

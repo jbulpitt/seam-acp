@@ -491,10 +491,10 @@ export class GoogleChatAdapter implements ChatAdapter {
       }) };
   }
 
-  async findMessageByNonce(channel: ChannelRef, nonce: string): Promise<DeliveryNonceLookup> {
+  async findMessageByNonce(channel: ChannelRef, nonce: string, sinceMs: number): Promise<DeliveryNonceLookup> {
     if (!this.opts.historyReader) return { status: "indeterminate",
       reason: "Google Chat nonce lookup is unsupported until history access is configured with admin-approved chat.app.messages.readonly" };
-    const result = await findSpaceMessageByNonce(this.opts.historyReader, await this.historyTarget(channel), nonce);
+    const result = await findSpaceMessageByNonce(this.opts.historyReader, await this.historyTarget(channel), nonce, sinceMs);
     if (result.status === "unsupported") return { status: "indeterminate", reason: result.cause };
     if (result.status === "absent") return result;
     const { message } = result;

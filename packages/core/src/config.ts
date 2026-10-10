@@ -32,6 +32,7 @@ const Schema = z.object({
   DISCORD_BOT_TOKEN: z.string().min(1, "DISCORD_BOT_TOKEN is required"),
   GOOGLE_CHAT_PROJECT_ID: z.string().optional(),
   GOOGLE_CHAT_SUBSCRIPTION: z.string().optional(),
+  GOOGLE_CHAT_TOPIC: z.string().optional(),
   GOOGLE_CHAT_CREDENTIALS_FILE: z.string().optional(),
   GOOGLE_CHAT_ALLOWED_USER_IDS: z.string().default("").transform(value =>
     new Set(value.split(",").map(id => id.trim()).filter(Boolean))),

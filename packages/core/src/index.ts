@@ -58,6 +58,8 @@ import { controllerQuotaProfiles } from "./core/quota/controller-profiles.js";
 import { discordRenderer } from "./platforms/discord/renderer.js";
 import { DiscordAdapter } from "./platforms/discord/adapter.js";
 import { GoogleChatAdapter } from "./platforms/google-chat/adapter.js";
+import { GoogleChatSpaceEvents } from "./platforms/google-chat/space-events.js";
+import { GoogleChatSpaceSubscriptions } from "./platforms/google-chat/space-subscriptions.js";
 import { GoogleDriveUploader } from "./core/files/google-drive-upload.js";
 import { loadGoogleDriveUploadConfig } from "./core/files/google-drive-config.js";
 import { GoogleRestApi } from "./platforms/google-chat/api.js";
@@ -474,12 +476,21 @@ async function main(): Promise<void> {
       await orchestrator.handleAutocompleteInteraction(interaction);
     },
   });
-  const googleChat = config.GOOGLE_CHAT_PROJECT_ID && config.GOOGLE_CHAT_SUBSCRIPTION && config.GOOGLE_CHAT_CREDENTIALS_FILE
+  const googleChatApi = config.GOOGLE_CHAT_PROJECT_ID && config.GOOGLE_CHAT_CREDENTIALS_FILE
+    ? new GoogleRestApi(config.GOOGLE_CHAT_CREDENTIALS_FILE, config.GOOGLE_CHAT_PROJECT_ID) : undefined;
+  const googleChat = googleChatApi && config.GOOGLE_CHAT_SUBSCRIPTION
     ? new GoogleChatAdapter({
-      api: new GoogleRestApi(config.GOOGLE_CHAT_CREDENTIALS_FILE, config.GOOGLE_CHAT_PROJECT_ID),
+      api: googleChatApi,
       subscription: config.GOOGLE_CHAT_SUBSCRIPTION,
       allowedUserIds: config.GOOGLE_CHAT_ALLOWED_USER_IDS,
       allowedSpaceIds: config.GOOGLE_CHAT_ALLOWED_SPACE_IDS,
+      hasSession: channel => Boolean(store.getByChannel("google-chat", channel.id)),
+      spaceEvents: config.GOOGLE_CHAT_TOPIC ? new GoogleChatSpaceEvents({
+        api: googleChatApi, pubsubTopic: config.GOOGLE_CHAT_TOPIC, store: store.googleChatSpaces,
+        allowedSpaceIds: config.GOOGLE_CHAT_ALLOWED_SPACE_IDS, logger: logger.child({ platform: "google-chat", mod: "space-events" }),
+        subscriptions: new GoogleChatSpaceSubscriptions({ pubsubTopic: config.GOOGLE_CHAT_TOPIC,
+          credentialsFile: config.GOOGLE_CHAT_CREDENTIALS_FILE, logger: logger.child({ platform: "google-chat", mod: "space-events" }) }),
+      }) : undefined,
       defaultCwd: config.GOOGLE_CHAT_DEFAULT_CWD ?? config.REPOS_ROOT,
       defaultLocation: config.GOOGLE_CHAT_DEFAULT_LOCATION,
       driveUploader: (() => {

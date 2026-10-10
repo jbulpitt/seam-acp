@@ -18,10 +18,18 @@ allowed users before enabling the integration.
 
 ### Shared spaces
 
-Add the app to a named Space and @mention it to start a turn. In this slice,
-ordinary messages and unmentioned replies are not admitted; hearing those
-requires the separate Workspace Events subscription integration. Human
-mentions remain in the prompt; annotated app mentions are stripped.
+Add the app to a named Space and @mention it to start a turn. Workspace Events
+subscriptions admit unmentioned replies in existing Seam sessions. Unrelated
+threads, bot replies and messages from users outside the allowlist are not
+admitted. Direct mentions and Workspace deliveries share one durable message
+identity, so receiving both does not start two turns. Human and other-app
+mentions remain in the prompt; annotated Seam mentions are stripped.
+
+Subscriptions are created on membership or discovered at startup, renewed
+before Google's returned expiry, and deleted on removal. Space metadata and
+renewal deadlines are stored in Seam's database; startup reconciles them with
+Google before rearming timers. Name-only message events are hydrated through
+the Chat API, or skipped with the actual fetch cause logged.
 
 `THREADED_MESSAGES` uses one session per native reply thread.
 `GROUPED_MESSAGES` uses one session per native topic thread.
@@ -41,6 +49,10 @@ slice does not add permission cards or change the platform default.
 - `GOOGLE_CHAT_PROJECT_ID`: the Google Cloud project ID.
 - `GOOGLE_CHAT_SUBSCRIPTION`: the full
   `projects/<project>/subscriptions/<subscription>` resource name.
+- `GOOGLE_CHAT_TOPIC`: the matching `projects/<project>/topics/<topic>` resource
+  for Workspace Events. Set it to enable unmentioned Space replies; without it
+  shared spaces remain mention-only. No additional Pub/Sub metadata-read role
+  is needed.
 - `GOOGLE_CHAT_CREDENTIALS_FILE`: the service-account JSON key file path.
 - `GOOGLE_CHAT_ALLOWED_USER_IDS`: comma-separated Chat user resource names,
   such as `users/<id>`; an empty list admits no users.
@@ -87,6 +99,12 @@ enable file-output wiring in the current adapter.
    integration), then have a Workspace administrator install it for the
    organization and approve the scope. Approval does not itself wire the
    history reader into Seam.
+6. For unmentioned Space messages, enable the Google Workspace Events API and
+   approve the same `chat.app.messages.readonly` scope. Set `GOOGLE_CHAT_TOPIC`
+   to the topic configured on the pull subscription; its existing publisher grant
+   also covers Workspace message events. Create/renew and message hydration
+   use the approved scope; subscription list/delete and operation polling
+   use `chat.bot`. No separate topic or controller consumer is required.
 
 Google's [Pub/Sub quickstart](https://developers.google.com/workspace/chat/quickstart/pub-sub)
 and [app-auth approval guide](https://developers.google.com/workspace/chat/authenticate-authorize-chat-app)

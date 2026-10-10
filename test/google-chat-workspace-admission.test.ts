@@ -20,7 +20,7 @@ function setup(state = "THREADED_MESSAGES", allowed = ["spaces/team"]) {
   const store = new SessionStore(":memory:"); stores.push(store);
   const lifecycle = { start: vi.fn(async () => {}), stop: vi.fn(async () => {}),
     handle: vi.fn(async () => {}), space: () => ({ ...space, spaceThreadingState: state }),
-    appUser: () => "users/seam" };
+    appUser: () => "users/seam", recordAppUser: vi.fn() };
   const adapter = new GoogleChatAdapter({ api: { request }, subscription: "projects/test/subscriptions/events",
     allowedUserIds: new Set(["users/42"]), allowedSpaceIds: new Set(allowed), logger, defaultCwd: "/projects",
     spaceEvents: lifecycle, hasSession: (channel: any) => ["team.session", "team"].includes(channel.id),
@@ -28,8 +28,8 @@ function setup(state = "THREADED_MESSAGES", allowed = ["spaces/team"]) {
   const incoming: any[] = [], runs: string[] = [];
   adapter.onMessage(msg => {
     incoming.push(msg);
-    if (store.admitInbound({ ...msg, platform: "google-chat", channelRef: msg.channel.id, parentRef: msg.channel.parentId,
-      sessionRecordId: `google-chat:${msg.channel.id}`, createdUtc: new Date().toISOString() })) runs.push(msg.messageId);
+    if (store.admitInbound({ ...msg, messageId: msg.messageId!, platform: "google-chat", channelRef: msg.channel.id, parentRef: msg.channel.parentId,
+      sessionRecordId: `google-chat:${msg.channel.id}`, createdUtc: new Date().toISOString() })) runs.push(msg.messageId!);
     msg.onAdmitted?.();
   });
   const cancelChannel = vi.fn(async () => ({ outcome: "idle", queue: { state: "idle", queued: 0 },
@@ -40,7 +40,7 @@ function setup(state = "THREADED_MESSAGES", allowed = ["spaces/team"]) {
     mutation: { readThreadPresetEntry: vi.fn(), applyThreadOverlay: vi.fn(() => ({ ok: true })) },
     runtimeTransition: {} } as any);
   const transport = new PubSubPullTransport({ api: { request }, subscription: "projects/test/subscriptions/events", logger,
-    receive: (event, signal, id) => adapter.receiveEvent(event, signal, id),
+    receive: (event: unknown, signal?: AbortSignal, id?: string) => adapter.receiveEvent(event, signal, id),
     receiveWorkspaceMessage: (parsed: any, signal?: AbortSignal) => (adapter as any).receiveWorkspaceMessage(parsed, signal) } as any);
   const workspace = (payload: unknown, type = GOOGLE_CHAT_MESSAGE_CREATED, id = "delivery") => transport.process({
     ackId: `ack-${id}`, message: { messageId: id, attributes: { "ce-type": type, "ce-id": `event-${id}` },
@@ -74,7 +74,7 @@ describe("Workspace Events use the Google Chat durable admission path", () => {
   });
 
   it("uses the adapter's UNTHREADED channel mapping even when the resource has a thread", async () => {
-    const h = setup("UNTHREADED_MESSAGES"); await h.workspace({ message: message() });
+    const h = setup("UNTHREADED_MESSAGES"); await h.workspace({ message: message("flat", { space: { name: "spaces/team" } }) });
     expect(h.incoming[0]?.channel).toEqual({ platform: "google-chat", id: "team" });
   });
 
@@ -104,6 +104,42 @@ describe("Workspace Events use the Google Chat durable admission path", () => {
     expect(h.cancelChannel).toHaveBeenCalledOnce(); expect(h.incoming).toHaveLength(0);
   });
 
+  it("does not execute another app's slash command or turn an unsupported command into a prompt", async () => {
+    const h = setup();
+    await h.workspace({ message: message("foreign", { text: "/cancel", annotations: [
+      { type: "SLASH_COMMAND", slashCommand: { commandId: "2", type: "INVOKE", bot: { name: "users/other" } } }] }) });
+    await h.workspace({ message: message("unknown", { text: "/unknown", slashCommand: { commandId: "900" } }) }, undefined, "unknown");
+    expect(h.cancelChannel).not.toHaveBeenCalled(); expect(h.incoming).toHaveLength(0);
+  });
+
+  it("learns canonical app identity from its own app-auth message response, without a membership request", async () => {
+    const h = setup(); h.request.mockResolvedValue({ name: "spaces/team/messages/our-reply", sender: { name: "users/seam", type: "BOT" } });
+    await h.adapter.sendMessage({ platform: "google-chat", id: "team.session", parentId: "team" }, "hello");
+    expect(h.lifecycle.recordAppUser).toHaveBeenCalledWith("spaces/team", "users/seam");
+    expect(h.request.mock.calls.some(([, request]) => request.url.includes("members/app"))).toBe(false);
+  });
+
+  it("admits concurrent direct/Workspace copies under one durable key", async () => {
+    const h = setup(), m = message("concurrent", { text: "@Seam hello", annotations: [mention] });
+    await Promise.all([h.direct(m), h.workspace({ message: m })]);
+    expect(h.incoming).toHaveLength(2); expect(h.runs).toHaveLength(1);
+  });
+
+  it("strips only Seam's annotation, preserving another bot's mention", async () => {
+    const h = setup();
+    await h.workspace({ message: message("mentions", { text: "@Seam ask @Other", annotations: [mention,
+      { ...mention, startIndex: 10, length: 6, userMention: { ...mention.userMention, user: { name: "users/other", type: "BOT" } } }] }) });
+    expect(h.incoming[0]?.text).toBe("ask @Other");
+  });
+
+  it("starts a session for a native Seam mention but not an unmentioned new thread", async () => {
+    const h = setup();
+    const m = message("new", { text: "@Seam start", annotations: [mention], thread: { name: "spaces/team/threads/new" } });
+    await h.workspace({ message: m }); expect(h.incoming[0]?.channel.id).toBe("team.new");
+    await h.workspace({ message: message("new-unmentioned", { thread: { name: "spaces/team/threads/other" } }) }, undefined, "other");
+    expect(h.runs).toHaveLength(1);
+  });
+
   it("hydrates a name-only reference using the approved app scope, never an empty turn", async () => {
     const h = setup(); h.request.mockImplementation(async () => message("reference"));
     await h.workspace({ message: { name: "spaces/team/messages/reference" } });
@@ -118,6 +154,13 @@ describe("Workspace Events use the Google Chat durable admission path", () => {
     await h.workspace({ message: { name: "spaces/team/messages/gone" } });
     expect(h.incoming).toHaveLength(0);
     expect(h.logs.some(entry => entry.err?.message === cause.message)).toBe(true);
+  });
+
+  it("skips still-incomplete hydration, never fabricating empty text from a reference", async () => {
+    const h = setup(); h.request.mockResolvedValue({ name: "spaces/team/messages/incomplete", sender: { name: "users/42" } });
+    await h.workspace({ message: { name: "spaces/team/messages/incomplete" } });
+    expect(h.incoming).toHaveLength(0);
+    expect(h.logs.some(entry => entry.err?.message.includes("still lacks sender or content"))).toBe(true);
   });
 
   it("preserves a pre-admission failure and leaves the Workspace publication unacknowledged", async () => {
@@ -142,7 +185,8 @@ describe("Adapter wires its Space subscription lifecycle", () => {
     const h = setup();
     await h.adapter.receiveEvent({ type: "ADDED_TO_SPACE", space });
     await h.adapter.receiveEvent({ type: "REMOVED_FROM_SPACE", space, user: { name: "users/99" } });
-    expect(h.lifecycle.handle.mock.calls).toEqual([[{ type: "ADDED_TO_SPACE", space }], [{ type: "REMOVED_FROM_SPACE", space }]]);
+    expect(h.lifecycle.handle).toHaveBeenNthCalledWith(1, { type: "ADDED_TO_SPACE", space });
+    expect(h.lifecycle.handle).toHaveBeenNthCalledWith(2, expect.objectContaining({ type: "REMOVED_FROM_SPACE", space }));
   });
 
   it("does not subscribe to denied spaces or DMs", async () => {

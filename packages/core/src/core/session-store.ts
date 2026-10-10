@@ -5,6 +5,7 @@ import { ActionCardStore } from "./action-cards/store.js";
 import { TurnAttemptStore, inboundAttemptId } from "./dispatch/attempt-store.js";
 import type { DispatchSpec } from "./dispatch/types.js";
 import { ScheduledOccurrenceStore } from "./scheduled-prompts/occurrence-store.js";
+import { GoogleChatSpaceStore } from "../platforms/google-chat/space-store.js";
 import fs from "node:fs";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
@@ -333,6 +334,7 @@ export class SessionStore {
   readonly contextBudgets: ContextBudgetStore;
   readonly actionCards: ActionCardStore;
   readonly scheduledOccurrences: ScheduledOccurrenceStore;
+  readonly googleChatSpaces: GoogleChatSpaceStore;
 
   constructor(readonly dbPath: string) {
     fs.mkdirSync(path.dirname(dbPath), { recursive: true });
@@ -342,6 +344,7 @@ export class SessionStore {
     this.actionCards = new ActionCardStore(this.db);
     this.turnAttempts = new TurnAttemptStore(this.db);
     this.scheduledOccurrences = new ScheduledOccurrenceStore(this.db);
+    this.googleChatSpaces = new GoogleChatSpaceStore(this.db);
     this.db.exec(SCHEMA);
     this.db.exec(DELEGATION_SCHEMA);
     this.db.exec(DONE_ARTIFACT_EXPIRATION_SCHEMA);

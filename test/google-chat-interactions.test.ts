@@ -1,12 +1,22 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { pino } from "pino";
 import { GoogleChatAdapter } from "../packages/core/src/platforms/google-chat/adapter.js";
 import { PubSubPullTransport } from "../packages/core/src/platforms/google-chat/transport.js";
 import type { ChatAdapter } from "../packages/core/src/platforms/chat-adapter.js";
 import { renderGoogleChatChoiceCard } from "../packages/core/src/platforms/google-chat/card-renderer.js";
+import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
+import { SessionStore } from "../packages/core/src/core/session-store.js";
+import { discordRenderer } from "../packages/core/src/platforms/discord/renderer.js";
+import { fixtureModelCatalog } from "./model-catalog-fixture.js";
+import { testSessionRouter } from "./helpers/session-fixture.js";
 
 const channel = { platform: "google-chat", id: "dm.thread", parentId: "dm" };
 const logger = pino({ level: "silent" });
+const cleanups: (() => void)[] = [];
+afterEach(() => { for (const clean of cleanups.splice(0).reverse()) clean(); });
 const click = (operation = "option") => ({ type: "CARD_CLICKED", user: { name: "users/42", displayName: "Tester" },
   message: { name: "spaces/dm/messages/card", thread: { name: "spaces/dm/threads/thread" } },
   action: { actionMethodName: "seam_choice", parameters: [{ key: "choiceId", value: "pick" },
@@ -25,6 +35,46 @@ function setup() {
 }
 
 describe("Google Chat clicks through the adapter and Pub/Sub", () => {
+  it("claims a real durable core choice once, dispatches to the Chat session and freezes the clicked card", async () => {
+    const { adapter, request, deliver } = setup();
+    const dir = mkdtempSync(path.join(tmpdir(), "gchat-click-"));
+    cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+    const store = new SessionStore(path.join(dir, "test.db"));
+    cleanups.push(() => store.close());
+    const now = new Date().toISOString();
+    const record = { id: "google-chat:dm.thread", platform: "google-chat", channelRef: channel.id, parentRef: "dm",
+      agentId: "codex", acpSessionId: "acp-1", repoPath: dir, configJson: "{}", createdUtc: now, updatedUtc: now };
+    store.upsert(record);
+    store.insertChoiceCard({ id: "pick", platform: "google-chat", channelRef: channel.id, parentRef: "dm",
+      messageId: "spaces/dm/messages/card", title: "Continue?", body: null, maxClicks: 1, targetUserId: "42",
+      defaultTarget: { type: "live" }, options: [{ label: "Continue", kind: "prompt", payload: "Exact chosen prompt" }],
+      clickCount: 0, status: "open", lastClickerId: null, lastClickerName: null, lastOptionIndex: null,
+      createdBy: record.id, createdUtc: now });
+    const router = testSessionRouter({ listProfiles: () => [],
+      describeConfig: () => ({ agent: { value: "codex" }, model: { value: "test" }, effort: { value: null },
+        cwd: { value: dir }, location: { value: "local" }, role: { value: null }, fastMode: { value: false },
+        disableThreadPrefix: { value: false } }), getProfile: () => undefined });
+    const orch = new Orchestrator({ logger, modelCatalog: fixtureModelCatalog([]), store, router: router as any,
+      adapter, renderer: discordRenderer, config: { DATA_DIR: dir, REPOS_ROOT: dir, DEFAULT_MODEL: "test",
+        DISCORD_ALLOWED_USER_IDS: new Set(), REPO_EMOJIS: new Map(), channelPresets: new Map(), threadPresets: new Map() } as any });
+    adapter.onChoiceInteraction!(evt => (orch as any).handleChoiceCardInteraction(evt), "update");
+    await deliver(click());
+    expect(store.getChoiceCard("pick")).toMatchObject({ clickCount: 1, lastClickerId: "42" });
+    const pending = path.join(dir, "dispatch", "pending");
+    const dispatches = () => readdirSync(pending).filter(file => file.endsWith(".json"))
+      .map(file => JSON.parse(readFileSync(path.join(pending, file), "utf8")));
+    expect(dispatches()).toHaveLength(1);
+    expect(dispatches()[0]).toMatchObject({ target: channel.id, session: "live" });
+    expect(dispatches()[0].prompt).toContain("Exact chosen prompt");
+    const patch = request.mock.calls.find(call => call[1].method === "PATCH")![1];
+    expect(patch.url).toBe("https://chat.googleapis.com/v1/spaces/dm/messages/card");
+    expect(JSON.stringify(patch.data)).not.toContain("buttonList");
+    await deliver(click(), "a-second-click");
+    expect(store.getChoiceCard("pick")).toMatchObject({ clickCount: 1 });
+    expect(dispatches()).toHaveLength(1);
+    expect(request.mock.calls.some(call => call[1].data?.text === "This card is closed.")).toBe(true);
+  });
+
   it("routes a choice to its real thread and bare actor identity, ACKing only after the handler commits and refreshes", async () => {
     const { adapter, request, deliver } = setup();
     let commit!: () => void;

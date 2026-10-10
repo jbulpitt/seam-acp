@@ -70,6 +70,17 @@ describe("Google Chat merged surface wiring", () => {
     expect(JSON.stringify(request.mock.calls[1]![1].data)).toContain("<b>Finished</b>");
   });
 
+  it("splits a large edit into a patch and queued continuation messages without losing text", async () => {
+    const { adapter, request } = setup();
+    const text = "🌍".repeat(10_000);
+    await adapter.editMessage({ channel, id: "spaces/dm/messages/original" }, text);
+    expect(request.mock.calls[0]![1].method).toBe("PATCH");
+    expect(request.mock.calls.slice(1).every(call => call[1].method === "POST")).toBe(true);
+    expect(request.mock.calls.length).toBeGreaterThan(1);
+    expect(request.mock.calls.map(call => call[1].data.text).join("")).toBe(text);
+    expect(request.mock.calls.every(call => Buffer.byteLength(JSON.stringify(call[1].data)) <= 32_000)).toBe(true);
+  });
+
   it("wires layouts, choice closure and sign-in openLink/cancel cards", async () => {
     const { adapter, request } = setup();
     const layout = { blocks: [{ kind: "text" as const, content: "**Details**" }] };

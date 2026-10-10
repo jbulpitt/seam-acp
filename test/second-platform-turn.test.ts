@@ -127,6 +127,40 @@ function channelsUsed(adapter: ReturnType<typeof setup>["adapter"]) {
 }
 
 describe("a second chat platform runs a normal turn", () => {
+  it("defers a failed Chat nonce lookup with its real cause, never attributing it to Discord", async () => {
+    const { multiplexChatAdapters } = await import("../packages/core/src/platforms/google-chat/multiplex.js");
+    const h = setup("google-chat");
+    const channel = { platform: "google-chat", id: "AAA.TTT", parentId: "AAA" };
+    const cause = Object.assign(new Error("Permission denied or the Google Chat resource does not exist"),
+      { response: { status: 403 } });
+    h.adapter.findMessageByNonce.mockRejectedValueOnce(cause);
+    const discordLookup = vi.fn(async () => ({ status: "absent" }));
+    const mux = multiplexChatAdapters([
+      { ...h.adapter, platform: "discord", findMessageByNonce: discordLookup } as any,
+      h.adapter as any,
+    ]);
+    (h.orch as any).adapter = mux;
+    const warn = vi.spyOn((h.orch as any).logger, "warn");
+    const spec = { id: "chat-nonce-recovery", target: channel.id, prompt: "already completed", session: "live" as const };
+    h.store.turnAttempts.admit(spec);
+    const attempt = h.store.turnAttempts.claim(spec, "fixture", "fixture-boot");
+    h.store.turnAttempts.complete(attempt, { id: spec.id, target: channel.id, status: "completed",
+      output: "retained answer", finishedUtc: new Date().toISOString() });
+    h.store.turnAttempts.prepareDelivery(spec.id, channel.id, { kind: "message", text: "retained answer" });
+    const receipt = h.store.turnAttempts.get(spec.id)!;
+
+    await expect((h.orch as any).recoverRecordedDelivery(receipt, channel)).resolves.toBe("deferred");
+
+    expect(h.adapter.findMessageByNonce).toHaveBeenCalledExactlyOnceWith(channel, receipt.deliveryNonce,
+      Date.parse(receipt.deliveryStartedUtc!) - 5 * 60_000);
+    expect(discordLookup).not.toHaveBeenCalled();
+    expect(h.adapter.sendMessage).not.toHaveBeenCalled();
+    expect(h.store.turnAttempts.get(spec.id)).toEqual(receipt);
+    expect(h.runtime.prompt).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalledExactlyOnceWith({ err: cause, id: spec.id, platform: "google-chat" },
+      "platform nonce lookup deferred");
+  });
+
   it("signals committed admission before a long turn finishes, including a duplicate receipt", async () => {
     const h = setup("test");
     let finish!: () => void;

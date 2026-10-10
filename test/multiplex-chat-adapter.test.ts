@@ -39,6 +39,24 @@ describe("multi-adapter routing", () => {
     expect(chat.sendMessage.mock.calls[0]![1]).toContain("Working");
   });
 
+  it("looks up delivery nonces only on the ref's platform, including lookup failures", async () => {
+    const { multiplexChatAdapters } = await import("../packages/core/src/platforms/google-chat/multiplex.js");
+    const discord = Object.assign(adapter("discord"), { findMessageByNonce: vi.fn(async () => ({ status: "absent" })) });
+    const cause = new Error("Permission denied or Google Chat resource does not exist");
+    const chat = Object.assign(adapter("google-chat"), { findMessageByNonce: vi.fn(async () => {
+      throw cause;
+    }) });
+    const mux = multiplexChatAdapters([discord, chat]);
+    const gc = { platform: "google-chat", id: "AAA.TTT" }, dc = { platform: "discord", id: "123" };
+
+    await expect(mux.findMessageByNonce!(gc, "chat-nonce", 1234)).rejects.toBe(cause);
+    expect(chat.findMessageByNonce).toHaveBeenCalledExactlyOnceWith(gc, "chat-nonce", 1234);
+    expect(discord.findMessageByNonce).not.toHaveBeenCalled();
+    await expect(mux.findMessageByNonce!(dc, "discord-nonce", 5678)).resolves.toEqual({ status: "absent" });
+    expect(discord.findMessageByNonce).toHaveBeenCalledExactlyOnceWith(dc, "discord-nonce", 5678);
+    expect(chat.findMessageByNonce).toHaveBeenCalledOnce();
+  });
+
   it("routes media to its owning platform without treating Discord CDN URLs as Google resources", async () => {
     const { multiplexChatAdapters } = await import("../packages/core/src/platforms/google-chat/multiplex.js");
     const discord = adapter("discord");

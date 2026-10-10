@@ -109,20 +109,36 @@ async function* rawMessages(
   } while (pageToken);
 }
 
-/** Lookup uses the sender's deterministic client ID, not a recent-history scan. */
+/** Query the sender's client ID; ambiguous GETs require receipt-window proof. */
 export async function findMessageByNonce(
   reader: HistoryApi,
   target: GoogleChatHistoryTarget,
   nonce: string,
+  sinceMs: number,
 ): Promise<GoogleChatNonceResult> {
   if (target.spaceType === "DIRECT_MESSAGE") {
     return { status: "unsupported", cause: GOOGLE_CHAT_DM_HISTORY_CAUSE };
   }
+  const clientId = googleChatClientMessageId(nonce);
   try {
-    const message = await reader.getMessage(`${target.space}/messages/${googleChatClientMessageId(nonce)}`);
+    const message = await reader.getMessage(`${target.space}/messages/${clientId}`);
     return { status: "found", message: normalizeGoogleChatMessage(message) };
   } catch (error) {
-    if ((error as { response?: { status?: number } } | null)?.response?.status === 404) return { status: "absent" };
-    throw error;
+    const response = (error as { response?: { status?: number; data?: { error?: {
+      code?: number; status?: string; message?: string; errors?: Array<{ domain?: string; reason?: string }>;
+    } } } } | null)?.response;
+    if (response?.status === 404) return { status: "absent" };
+    const cause = response?.data?.error;
+    if (response?.status !== 403 || cause?.code !== 403 || cause.status !== "PERMISSION_DENIED"
+      || cause.message !== "Permission denied to perform the requested action on the specified resource, or the resource doesn't exist."
+      || cause.errors?.length !== 1 || cause.errors[0]?.domain !== "global" || cause.errors[0]?.reason !== "forbidden") throw error;
   }
+  // The ambiguous GET is not absence proof. Exhaust the receipt's time window;
+  // a denial or interrupted page propagates, never authorizes replay.
+  for await (const message of rawMessages(reader, target, 100, "newest", { after: new Date(sinceMs).toISOString() })) {
+    if (message.clientAssignedMessageId === clientId) {
+      return { status: "found", message: normalizeGoogleChatMessage(message) };
+    }
+  }
+  return { status: "absent" };
 }

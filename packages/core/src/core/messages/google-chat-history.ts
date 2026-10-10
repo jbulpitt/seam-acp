@@ -48,6 +48,7 @@ export interface GoogleChatHistoryPage extends MessagePage {
 
 export interface GoogleChatHistoryMessage {
   name: string;
+  clientAssignedMessageId?: string;
   createTime: string;
   sender?: { name?: string; displayName?: string; type?: string };
   text?: string;

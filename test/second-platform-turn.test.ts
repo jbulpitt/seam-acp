@@ -119,6 +119,34 @@ describe("a second chat platform runs a normal turn", () => {
     expect(JSON.stringify(h.store.getInbound("BBB_ccc-1"))).not.toContain("base64");
   });
 
+  it("reports an attachment the adapter cannot read with its real cause instead of passing it on", async () => {
+    const readable = "spaces/AAA/messages/BBB/attachments/OK";
+    const h = setup("test", new Map([[readable, Buffer.from("fine")]]));
+    const msg: IncomingMessage = {
+      messageId: "BBB_ccc-2",
+      channel: { platform: "test", id: "AAA.TTT", parentId: "AAA" },
+      authorId: "1234567890", authorName: "Tester", authorIsBot: false,
+      text: "read these",
+      attachments: [
+        { url: readable, filename: "fine.txt", contentType: "text/plain", size: 4 },
+        { url: "spaces/AAA/messages/BBB/attachments/GONE", filename: "gone.txt", contentType: "text/plain", size: 4 },
+        { url: "spaces/AAA/messages/BBB/attachments/HUGE", filename: "huge.bin", contentType: null, size: 200 * 1024 * 1024 },
+      ],
+      raw: { synthetic: true },
+    };
+
+    await h.run(msg);
+
+    const sent = h.runtime.prompt.mock.calls[0]![1] as MessageAttachment[];
+    expect(sent.map(a => a.filename)).toEqual(["fine.txt"]);
+    expect(sent[0]!.url.startsWith("data:text/plain;base64,")).toBe(true);
+    const notice = h.adapter.sendMessage.mock.calls.map(call => call[1]).find(text => text.includes("not sent to the agent"));
+    expect(notice).toBeDefined();
+    expect(notice).toContain("`gone.txt` — download failed: no fixture for spaces/AAA/messages/BBB/attachments/GONE");
+    expect(notice).toContain("`huge.bin` — too large to download");
+    expect(h.adapter.downloadAttachment).toHaveBeenCalledTimes(2);
+  });
+
   it("leaves a Discord turn's ids, refs and attachment URLs unchanged", async () => {
     const h = setup("discord");
     const url = "https://cdn.discordapp.com/attachments/1/2/note.txt";

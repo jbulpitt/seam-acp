@@ -90,7 +90,8 @@ describe("Workspace Chat message CloudEvents", () => {
   });
 
   it("retains bot identity and attachments without making adapter authorization decisions", () => {
-    const message = { ...resource, text: undefined, sender: { name: "users/bot", type: "BOT" }, attachment: [
+    const { text: _text, ...attachmentOnly } = resource;
+    const message = { ...attachmentOnly, sender: { name: "users/bot", type: "BOT" }, attachment: [
       { contentName: "report.txt", contentType: "text/plain", attachmentDataRef: { resourceName: "spaces/SPACE/messages/M/attachments/A" } },
     ] };
     const [parsed] = parseGoogleChatWorkspaceMessages(delivered({ message }));

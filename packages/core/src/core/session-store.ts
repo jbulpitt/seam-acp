@@ -970,6 +970,16 @@ export class SessionStore {
     return row ? mapRow(row) : null;
   }
 
+  /** A bare channel ref on any platform. Discord wins if both ever exist. */
+  getByChannelRef(channelRef: string): SessionRecord | null {
+    const row = this.db
+      .prepare<[string], Row>(
+        "SELECT * FROM sessions WHERE channel_ref = ? ORDER BY platform = 'discord' DESC LIMIT 1"
+      )
+      .get(channelRef);
+    return row ? mapRow(row) : null;
+  }
+
   list(limit = 100): SessionRecord[] {
     const rows = this.db
       .prepare<[number], Row>(

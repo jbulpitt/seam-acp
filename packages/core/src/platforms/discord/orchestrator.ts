@@ -1836,7 +1836,7 @@ export class Orchestrator {
         () => this.handleIncomingMessage(msg),
         async () => {
           await this.adapter.sendMessage?.(
-            { platform: PLATFORM, id: msg.channel.id },
+            { platform: msg.channel.platform, id: msg.channel.id },
             "⏳ Restarting — I'll pick this up as soon as I'm back."
           );
         }
@@ -2030,9 +2030,19 @@ export class Orchestrator {
   }
 
   /** Read-only truth used by MCP status, cancel copy, and admin recovery. */
+  /** Session for a bare channel ref on any platform. */
+  private recordForChannel(channelRef: string): SessionRecord | null {
+    return this.store.getByChannelRef(channelRef);
+  }
+
+  /** Platform that owns a bare channel ref; Discord when no session exists yet. */
+  private platformForChannel(channelRef: string): string {
+    return this.recordForChannel(channelRef)?.platform ?? PLATFORM;
+  }
+
   inspectChannelQueue(channelRef: string, nowMs = Date.now()): ChannelQueueHealth {
     this.channelQueueMeta ??= new Map<string, ChannelQueueMeta>();
-    const record = this.store.getByChannel(PLATFORM, channelRef);
+    const record = this.recordForChannel(channelRef);
     const meta = this.channelQueueMeta.get(channelRef);
     // #570: a turn this queue is executing counts as busy even while the ACP
     // runtime reports idle between tool segments. Asking only the runtime let
@@ -2461,8 +2471,9 @@ export class Orchestrator {
     let admissionId: string | undefined;
     let record: SessionRecord | undefined;
     if (msg.messageId && !this.wouldParkForOfflineBridge(msg)) {
-      if (!/^\d+$/.test(msg.messageId)) {
-        throw new Error("invalid Discord message id");
+      // Also a file name (inbound-<id>.json); adapters emit a safe encoding.
+      if (!/^[A-Za-z0-9_-]{1,64}$/.test(msg.messageId)) {
+        throw new Error(`invalid ${msg.channel.platform} message id`);
       }
       try {
         record = this.router.ensureSessionRecord({
@@ -2669,7 +2680,7 @@ export class Orchestrator {
           this.config.TURN_TIMEOUT_SECONDS ?? 900
         );
         const startedAt = Date.now();
-        const sessionId = makeSessionId(PLATFORM, channelId);
+        const sessionId = makeSessionId(this.platformForChannel(channelId), channelId);
         const value = await settleWithTurnWatchdog(() => work, {
           timeoutMs,
           label: `channel turn ${channelId}`,
@@ -2772,7 +2783,7 @@ export class Orchestrator {
   }
 
   private attemptTurnStatus(attempt: TurnAttempt): TurnStatus {
-    const record = this.store.getByChannel(PLATFORM, attempt.spec.target);
+    const record = this.recordForChannel(attempt.spec.target);
     const described = record ? this.router.describeConfig(record) : undefined;
     const identity = parseExecutionIdentity(attempt.identity);
     const agentId = identity?.agent ?? described?.agent.value ?? record?.agentId ?? "";
@@ -2804,7 +2815,8 @@ export class Orchestrator {
 
   private attemptStatusPanel(attempt: TurnAttempt): DispatchStatusPanel<MessageRef> | undefined {
     if (!attempt.statusCard) return undefined;
-    const ref: MessageRef = { channel: { platform: PLATFORM, id: attempt.statusCard.channelId }, id: attempt.statusCard.messageId };
+    const ref: MessageRef = { channel: { platform: this.platformForChannel(attempt.statusCard.channelId),
+      id: attempt.statusCard.channelId }, id: attempt.statusCard.messageId };
     const status = this.attemptTurnStatus(attempt);
     status.setState("Working");
     status.setAction("Reconnected to session");
@@ -2944,7 +2956,7 @@ export class Orchestrator {
       };
     }
 
-    const record = this.store.getByChannel(PLATFORM, channelRef);
+    const record = this.recordForChannel(channelRef);
     if (!record) {
       return { ok: false, before, epoch: currentEpoch, message: "No session is bound to that thread." };
     }
@@ -4529,6 +4541,9 @@ export class Orchestrator {
       const voiceNoteText = msg.attachments?.length
         ? await this.transcribeVoiceNotes(msg, channel)
         : undefined;
+      if (msg.attachments?.length && this.adapter.downloadAttachment) {
+        msg = { ...msg, attachments: await this.materializeAttachments(msg.attachments) };
+      }
 
       status.setAction("Thinking…");
       await refresh(true);
@@ -8343,7 +8358,7 @@ export class Orchestrator {
     channelRef: string,
     notice = "🚫 Cancelled parked prompt."
   ): Promise<ParkedPrompt | null> {
-    const parked = this.store.deleteParkedByChannel(PLATFORM, channelRef);
+    const parked = this.store.deleteParkedByChannel(this.platformForChannel(channelRef), channelRef);
     if (!parked) return null;
     await this.editParkedNotice(parked, notice);
     await deleteParkedAttachmentDir(this.config.DATA_DIR, parked.id).catch(() => {});
@@ -13370,6 +13385,27 @@ export class Orchestrator {
   ): Promise<{ path: string }> {
     if (!this.bridgeHub) throw new Error("bridge hub is not ready");
     return this.bridgeHub.writeAttachment(location, cwd, filename, bytes);
+  }
+
+  /**
+   * In-memory `data:` URLs for attachments only the adapter can read, so every
+   * existing `fetch(a.url)` consumer works unchanged. Never persisted.
+   */
+  private async materializeAttachments(
+    attachments: ReadonlyArray<MessageAttachment>,
+  ): Promise<MessageAttachment[]> {
+    const STAGE_MAX = 100 * 1024 * 1024;
+    return Promise.all(attachments.map(async (a) => {
+      if (a.size > STAGE_MAX) return a;
+      try {
+        const bytes = await this.adapter.downloadAttachment!(a);
+        const type = a.contentType ?? "application/octet-stream";
+        return { ...a, url: `data:${type};base64,${bytes.toString("base64")}`, size: bytes.length };
+      } catch (err) {
+        this.logger.warn({ err, filename: a.filename }, "attachment download failed");
+        return a;
+      }
+    }));
   }
 
   private async partitionAndStageAttachments(

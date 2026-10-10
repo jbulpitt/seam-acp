@@ -155,6 +155,24 @@ export function loadHostAdapters(
   const out = new Map<string, AgentAdapter>();
   // Resolved once so the existence probe and the profile use the SAME path.
   const claudeCli = env.CLAUDE_CLI_PATH?.trim() || "claude-agent-acp";
+  const vertexId = env.CLAUDE_VERTEX_AGENT_ID?.trim() || "claude-vertex";
+  const vertexProject = env.CLAUDE_VERTEX_PROJECT_ID?.trim();
+  const vertexCredentials = env.CLAUDE_VERTEX_CREDENTIALS_FILE?.trim();
+  const vertexConfigDir = env.CLAUDE_VERTEX_CONFIG_DIR?.trim();
+  const vertexConfigured = Object.entries(env).some(([key, value]) => key.startsWith("CLAUDE_VERTEX_") && value?.trim());
+  const subscriptionConfigDir = env.CLAUDE_CONFIG_DIR?.trim() || path.join(env.HOME || os.homedir(), ".claude");
+  const vertexMissing = [
+    ...(!vertexProject ? ["CLAUDE_VERTEX_PROJECT_ID"] : []),
+    ...(!vertexCredentials ? ["CLAUDE_VERTEX_CREDENTIALS_FILE"] : []),
+    ...(!vertexConfigDir ? ["CLAUDE_VERTEX_CONFIG_DIR"] :
+      path.resolve(vertexConfigDir) === path.resolve(subscriptionConfigDir)
+        ? ["CLAUDE_VERTEX_CONFIG_DIR (separate from subscription Claude)"] : []),
+  ];
+  if (vertexConfigured && vertexMissing.length) {
+    reportUnavailable(options, { agentId: vertexId, code: "configuration_incomplete", missing: vertexMissing });
+  } else if (vertexConfigured && !exists(claudeCli)) {
+    reportUnavailable(options, { agentId: vertexId, code: "executable_unavailable" });
+  }
   const agyBin = env.AGY_BIN?.trim();
   const agyVersion = env.AGY_VERSION?.trim();
   const agySha256 = env.AGY_SHA256?.trim();
@@ -242,6 +260,29 @@ export function loadHostAdapters(
           : {}),
       }),
     },
+    ...(vertexConfigured && vertexMissing.length === 0 ? [{
+      id: vertexId,
+      bin: claudeCli,
+      make: () => makeClaudeProfile({
+        id: vertexId,
+        displayName: env.CLAUDE_VERTEX_DISPLAY_NAME?.trim() || "Claude (Vertex AI)",
+        brand: "vertex",
+        cliPath: claudeCli,
+        configDir: vertexConfigDir!,
+        defaultModel: env.CLAUDE_VERTEX_DEFAULT_MODEL?.trim() || "claude-sonnet-5-5",
+        staticModels: parseConfiguredModels(env.CLAUDE_VERTEX_MODELS) ?? [
+          { modelId: "claude-opus-5-5", name: "Claude Opus 5.5" },
+          { modelId: "claude-sonnet-5-5", name: "Claude Sonnet 5.5" },
+          { modelId: "claude-haiku-5-5", name: "Claude Haiku 5.5" },
+        ],
+        extraEnv: {
+          CLAUDE_CODE_USE_VERTEX: "1",
+          ANTHROPIC_VERTEX_PROJECT_ID: vertexProject!,
+          CLOUD_ML_REGION: env.CLAUDE_VERTEX_REGION?.trim() || "global",
+          GOOGLE_APPLICATION_CREDENTIALS: vertexCredentials!,
+        },
+      }),
+    }] : []),
     ...(agyLoadable ? [{
       id: "agy",
       bin: agyUnpinned ? "agy" : agyNativeBin!,
@@ -370,6 +411,7 @@ export function inventoryFromAdapters(
       : env.AGY_CLI_PATH?.trim() || env.AGY_OLD_CLI_PATH?.trim() || env.AGY_BIN?.trim() || "agy",
     codex: "codex-acp",
     grok: env.GROK_CLI_PATH?.trim() || "grok",
+    [env.CLAUDE_VERTEX_AGENT_ID?.trim() || "claude-vertex"]: env.CLAUDE_CLI_PATH?.trim() || "claude-agent-acp",
   };
   const rows: HelloAgentInventory[] = [];
   for (const [id, adapter] of adapters) {

@@ -11,11 +11,13 @@ import { formatUsageAgentList, liveUsageAgentLabels, parkedAgentMessage } from "
 import { createQuotaSources } from "./sources.js";
 import { formatUsage } from "./format-usage.js";
 import { quotaMcp } from "./mcp.js";
+import type { AgentProfile } from "@seam/adapters";
 
 /** Internal-tier binding snapshots and provider reads; no router or runtime access. */
 export interface QuotaPorts {
   usage: UsageProviderPort;
   bindings(): readonly Readonly<UsageBinding>[];
+  agents?(): readonly Pick<AgentProfile, "id" | "displayName" | "brand">[];
   resolve(threadId: string, parentId?: string): Readonly<UsageBinding> | undefined;
   card: AgentQuotaCardTransport;
 }
@@ -72,7 +74,7 @@ export function createQuotaPlugin(ports: QuotaPorts): Plugin {
       slash: [{ command: "seam", group: { name: "info", description: "Bot & account info" },
         acknowledgement: "ephemeral", leaf: { type: ApplicationCommandOptionType.Subcommand, name: "usage", description: "Show usage / credits for this thread's agent (agy, claude, copilot, grok, codex)" },
         access: { kind: "read-only" }, authorization: "user", help: "`/seam info usage` — show usage / credits for this thread's agent", handle: usage }],
-      mcp: quotaMcp(registry),
+      mcp: quotaMcp(registry, ports.agents),
       components: [{ namespace: "seam-quota:", types: ["button"], lifetime: "persistent", access: "read-only", authorization: "user", acknowledgement: "update", handle: component }],
       turnActivity: [
         { event: "turn-started", handle: event => { poller.recordTurnStart(event.binding.agentId, event.timestampMs); } },

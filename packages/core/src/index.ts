@@ -539,6 +539,8 @@ async function main(): Promise<void> {
     refreshModelIntelligence: (forceSources) => modelIntelligenceManager.refresh({ forceSources }),
   });
 
+  googleChat?.setCommandDeps({ router, runtimeTransition: orchestrator.getRuntimeTransition(),
+    cancelChannel: channel => orchestrator.cancelChannel(channel) });
   await orchestrator.loadPlugins();
   orchestrator.install();
 

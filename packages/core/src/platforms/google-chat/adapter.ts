@@ -14,6 +14,8 @@ import { splitGoogleChatText } from "./text-split.js";
 import { parseGoogleChatCardClick, type GoogleChatCardClickEvent } from "./card-click.js";
 import { renderGoogleChatPanel, renderGoogleChatLayout, renderGoogleChatChoiceCard,
   renderGoogleChatElicitationCard, type GoogleChatCardsMessage } from "./card-renderer.js";
+import { parseGoogleChatCommand, type GoogleChatCommandEvent } from "./commands.js";
+import { executeGoogleChatCommand, type GoogleChatCommandDeps } from "./command-actions.js";
 
 export const GOOGLE_CHAT_PLATFORM = "google-chat";
 const root = "https://chat.googleapis.com/v1";
@@ -21,7 +23,7 @@ type ChatMessage = { name?: string; text?: string; thread?: { name?: string }; t
   sender?: { name?: string; type?: string; displayName?: string };
   attachment?: Array<{ contentName?: string; contentType?: string;
     attachmentDataRef?: { resourceName?: string } }> };
-type ChatEvent = { type?: string; user?: ChatMessage["sender"]; space?: { name?: string; spaceThreadingState?: string };
+type ChatEvent = GoogleChatCommandEvent & { user?: ChatMessage["sender"]; space?: { name?: string; spaceThreadingState?: string };
   message?: ChatMessage; thread?: { name?: string }; action?: GoogleChatCardClickEvent["action"];
   common?: GoogleChatCardClickEvent["common"] };
 
@@ -55,6 +57,7 @@ export class GoogleChatAdapter implements ChatAdapter {
   private componentHandler?: (event: ComponentEvent) => void | Promise<void>;
   private choiceAcknowledgement: ComponentAcknowledgement = "update";
   private componentAcknowledgement: ComponentAcknowledgement = "update";
+  private commandDeps?: Pick<GoogleChatCommandDeps, "router" | "runtimeTransition" | "cancelChannel">;
 
   constructor(private readonly opts: { api: GoogleApi; subscription: string; allowedUserIds: ReadonlySet<string>;
     defaultCwd: string; logger: Logger; writeIntervalMs?: number; driveUploader?: Pick<GoogleDriveUploader, "upload"> }) {
@@ -71,6 +74,9 @@ export class GoogleChatAdapter implements ChatAdapter {
   }
   onComponent(handler: (event: ComponentEvent) => void | Promise<void>, acknowledgement: ComponentAcknowledgement): void {
     this.componentHandler = handler; this.componentAcknowledgement = acknowledgement;
+  }
+  setCommandDeps(deps: Pick<GoogleChatCommandDeps, "router" | "runtimeTransition" | "cancelChannel">): void {
+    this.commandDeps = deps;
   }
 
   isAllowedUser(platform: string, userId: string): boolean {
@@ -89,7 +95,33 @@ export class GoogleChatAdapter implements ChatAdapter {
       await this.receiveCardClick(event, interactionId);
       return;
     }
-    // MESSAGE command parsing will plug in here, before ordinary turn admission.
+    const command = parseGoogleChatCommand(event);
+    if (command) {
+      if (!this.commandDeps) throw new Error("Google Chat command handlers not installed");
+      const result = await executeGoogleChatCommand({ ...command,
+        user: { ...command.user, id: resourceId(command.user.id, "users") } }, {
+        ...this.commandDeps,
+        channelFor: (space, thread) => thread ? channelForThread(thread)
+          : { platform: this.platform, id: resourceId(space, "spaces") },
+        createThread: (parent, name) => this.createThread(parent, name),
+        cwd: this.opts.defaultCwd,
+        respond: async (channel, text) => { await this.sendMessage(channel, text); },
+      });
+      if (result.command === "cancel") {
+        const { outcome } = result;
+        let text: string;
+        if ("error" in outcome) text = `Cancel requested, but not confirmed: ${
+          outcome.error instanceof Error ? outcome.error.message : String(outcome.error)}. Work may still be running.`;
+        else if (outcome.outcome === "idle") text = outcome.cancelled.cancelled ? "Turn cancelled."
+          : outcome.parked ? "Queued prompt cancelled."
+          : outcome.queue.queued ? `No active turn; ${outcome.queue.queued} durable items remain queued. Nothing was discarded.`
+          : "No active turn.";
+        else text = outcome.outcome === "unacknowledged"
+          ? "Cancel requested, but not confirmed. Work may still be running." : "Cancel sent to the active turn.";
+        await this.sendMessage(result.channel, text);
+      }
+      return;
+    }
     if (event.type !== "MESSAGE") return;
     if (!message?.name || !message.thread?.name) throw new Error("Google Chat MESSAGE has no message or thread name");
     if (!this.handler) throw new Error("Google Chat inbound handler not installed");

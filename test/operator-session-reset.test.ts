@@ -92,6 +92,7 @@ describe("binding clear causes", () => {
     const info = vi.spyOn(journal, "info").mockImplementation(() => {});
     const observer = Object.assign(Object.create(Orchestrator.prototype), {
       store, router, identityEffects: { flush: vi.fn(async () => {}) },
+      config: { REPOS_ROOT: "/repo" },
       recordFromInteraction: () => store.get("discord:worker"),
     });
     await observer.cmdReset({ reply: vi.fn(async () => {}), replied: false, deferred: false });

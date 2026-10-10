@@ -808,7 +808,7 @@ export class SessionRouter {
       opts.channelRef
     );
     const catalogDefault = this.modelCatalog.model({ agentId, location }, "default")?.id ?? "default";
-    const cfg = defaultSessionConfig(preset.model?.value ?? catalogDefault, this.defaultPermissionMode);
+    const cfg = defaultSessionConfig(preset.model?.value ?? catalogDefault, this.permissionDefault(opts.platform));
     const now = new Date().toISOString();
     // We don't yet know the ACP session id — it will be filled in by the
     // first runtime start. Store an empty marker for now. `opts.cwd` is the

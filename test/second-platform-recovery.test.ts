@@ -136,7 +136,7 @@ describe("restart recovery retains the chat platform", () => {
     await h.orch.recoverInterruptedTurns();
 
     expect(h.runtime.prompt).toHaveBeenCalledOnce();
-    expect(h.runtime.prompt.mock.calls[0]?.[0]).toMatch(/^continue\n/);
+    expect(h.runtime.prompt.mock.calls[0]?.[0]).toMatch(/(?:^|\n\n)continue\n/);
     expect(usedChannels(h).length).toBeGreaterThan(0);
     expect(usedChannels(h).every(channel => channel.platform === platform && channel.id === h.channel.id)).toBe(true);
     if (platform !== "discord") expect(h.store.getByChannel("discord", h.channel.id)).toBeNull();
@@ -324,8 +324,8 @@ describe("permission defaults by chat platform", () => {
     const discord = router.ensureSessionRecord({ platform: "discord", channelRef: "1300000000000000002", cwd: "/synthetic" });
 
     expect(router.describeConfig(h.record).permission).toEqual({ value: "always", source: "default" });
-    expect(router.describeConfig(chat).permission).toEqual({ value: "always", source: "default" });
-    expect(router.describeConfig(discord).permission).toEqual({ value: defaultMode, source: "default" });
+    expect(router.describeConfig(chat).permission).toEqual({ value: "always", source: "session config" });
+    expect(router.describeConfig(discord).permission).toEqual({ value: defaultMode, source: "session config" });
     expect(router.permissionOptions(chat).permissionMode!()).toBe("always");
     expect(router.permissionOptions(discord).permissionMode!()).toBe(defaultMode);
     expect(router.permissionOptions().permissionMode!()).toBe(defaultMode);

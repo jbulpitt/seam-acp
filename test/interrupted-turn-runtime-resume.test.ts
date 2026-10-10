@@ -10,7 +10,7 @@ import { EventEmitter } from "node:events";
 import { PassThrough, Readable, Writable } from "node:stream";
 import { agent, methods, ndJsonStream, PROTOCOL_VERSION, RequestError } from "@agentclientprotocol/sdk";
 import { pino } from "pino";
-import { classifyCodexError, type AgentProfile } from "@seam/adapters";
+import { classifyClaudeError, classifyCodexError, type AgentProfile } from "@seam/adapters";
 import { SessionRouter } from "../packages/core/src/core/session-router.js";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
@@ -39,6 +39,7 @@ interface AcpCalls {
   loads: string[];
   news: number;
   prompts: string[];
+  rejectedPrompts: string[];
   children: Array<{ killed: boolean }>;
 }
 
@@ -47,7 +48,8 @@ function modelOptions() {
     options: [{ value: MODEL, name: "Opus" }] }];
 }
 
-type AcpMode = "ok" | "no-load" | "reject-load" | "reject-load-with-cause" | "reject-load-once" | "hang-load" | "hang-load-once" | "codex-auth";
+type AcpMode = "ok" | "no-load" | "reject-load" | "reject-load-with-cause" | "reject-load-once" | "hang-load" | "hang-load-once" | "codex-auth"
+  | "claude-prompt-auth" | "claude-prompt-auth-after-output";
 function syntheticAcp(calls: AcpCalls, mode: AcpMode) {
   return () => {
     const stdin = new PassThrough();
@@ -87,10 +89,20 @@ function syntheticAcp(calls: AcpCalls, mode: AcpMode) {
         if (mode === "hang-load" || (mode === "hang-load-once" && calls.loads.length === 1)) return new Promise(() => {});
         return { sessionId: params.sessionId, configOptions: modelOptions() };
       })
-      .onRequest(methods.agent.session.prompt, ({ params }) => {
-        calls.prompts.push(params.prompt
+      .onRequest(methods.agent.session.prompt, async ({ params, client }) => {
+        const text = params.prompt
           .filter((block): block is Extract<(typeof params.prompt)[number], { type: "text" }> => block.type === "text")
-          .map((block) => block.text).join(""));
+          .map((block) => block.text).join("");
+        if ((mode === "claude-prompt-auth" || mode === "claude-prompt-auth-after-output") && calls.authRequired) {
+          calls.rejectedPrompts.push(text);
+          if (mode === "claude-prompt-auth-after-output") {
+            await client.notify(methods.client.session.update, { sessionId: params.sessionId,
+              update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "partial work" } } });
+          }
+          // Production 2026-10-08, claude@plex-server: claude-agent-acp session/prompt.
+          throw new RequestError(-32000, "Authentication required", null);
+        }
+        calls.prompts.push(text);
         return { stopReason: "end_turn" };
       })
       .onRequest(methods.agent.session.setConfigOption, () => ({ configOptions: modelOptions() }))
@@ -121,11 +133,12 @@ afterEach(async () => {
 function harness(location: "local" | "bridge-a", mode: AcpMode, logger = silent): Harness {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "seam-302-runtime-"));
   const store = new SessionStore(path.join(dir, "seam.db"));
-  const calls: AcpCalls = { authRequired: true, initialized: 0, loads: [], news: 0, prompts: [], children: [] };
+  const calls: AcpCalls = { authRequired: true, initialized: 0, loads: [], news: 0, prompts: [], rejectedPrompts: [], children: [] };
   const agentId = mode === "codex-auth" ? "codex" : "claude";
   const profile = {
     id: agentId,
     ...(agentId === "codex" ? { classifyError: classifyCodexError } : {}),
+    ...(mode.startsWith("claude-prompt-auth") ? { classifyError: classifyClaudeError } : {}),
     displayName: "Synthetic Claude",
     defaultModel: MODEL,
     staticModels: [{ modelId: MODEL, name: "Opus" }],
@@ -505,6 +518,47 @@ describe("#302 real ACP handshake and strict session/load recovery", () => {
     expect(h.calls.prompts[0]).toMatch(/^continue\n/);
     expect(h.calls.prompts[0]).not.toContain(ORIGINAL);
     expect(h.store.turnAttempts.get(id)?.state).toBe("completed");
+  });
+
+  it.each([false, true])("after a Claude session/prompt auth rejection (output first=%s), sign-in sends the brief once only if nothing was output", async outputFirst => {
+    const h = harness("local", outputFirst ? "claude-prompt-auth-after-output" : "claude-prompt-auth");
+    const spec = { id: "prompt-auth-dispatch", target: THREAD, prompt: ORIGINAL,
+      session: "live" as const, kind: "handoff" as const, stream: false, reportBack: false };
+    const record = h.store.get(`discord:${THREAD}`)!;
+    const described = h.router.describeConfig(record);
+    const boot = (h.orch as any).attemptBoot;
+    h.store.turnAttempts.registerOwner(boot);
+    h.store.turnAttempts.claim(spec, executionIdentity({
+      agentId: record.agentId, location: described.location.value, session: "live",
+      model: described.model.value, effort: described.effort.value,
+      cwd: described.cwd.value, config: record.configJson,
+    }), boot);
+
+    await expect(h.orch.dispatchInjectTurn(spec)).rejects.toMatchObject({ reason: expect.stringMatching(/^reauth-waiting:/) });
+    expect(h.calls.rejectedPrompts).toHaveLength(1);
+    expect(h.calls.rejectedPrompts[0]).toContain(ORIGINAL);
+    expect(h.calls.prompts).toEqual([]);
+    expect(h.store.turnAttempts.get(spec.id)).toMatchObject({
+      state: "suspended", acpSessionId: RECORDED, promptStarted: outputFirst, outcome: null,
+      stalledReason: expect.stringMatching(/^reauth-waiting:/),
+    });
+    const notice = h.adapter.sendMessage.mock.calls.map(call => String(call[1])).join("\n");
+    expect(notice).toContain("Cause: Authentication required");
+    expect(notice).toContain(outputFirst ? "The original prompt will not be replayed." : "The pending prompt has not been sent; it will be sent once.");
+
+    h.calls.authRequired = false;
+    expect(acceptReauthWait(h.store.turnAttempts, spec.id)).not.toBeNull();
+    await h.orch.dispatchInjectTurn(spec);
+    expect(h.calls.rejectedPrompts).toHaveLength(1);
+    expect(h.calls.prompts).toHaveLength(1);
+    if (outputFirst) {
+      expect(h.calls.prompts[0]).toMatch(/^continue\n/);
+      expect(h.calls.prompts[0]).not.toContain(ORIGINAL);
+    } else {
+      expect(h.calls.prompts[0]).toContain(ORIGINAL);
+      expect(h.calls.prompts[0]).not.toMatch(/^continue\n/);
+    }
+    expect(h.store.turnAttempts.get(spec.id)).toMatchObject({ state: "completed", acpSessionId: RECORDED });
   });
 
   it("loads the recorded Claude session and sends one continuation without replaying the brief", async () => {

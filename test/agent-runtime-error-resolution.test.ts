@@ -1,10 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { RequestError } from "@agentclientprotocol/sdk";
-import { classifyAgyError, classifyClaudeError, readErrorClassification, resolveError, type AgentProfile } from "@seam/adapters";
+import { classifyAgyError, classifyClaudeError, classifyCodexError, readErrorClassification, resolveError, type AgentProfile } from "@seam/adapters";
 import { AgentRuntime } from "../packages/core/src/agents/agent-runtime.js";
 import { ReauthParked } from "../packages/core/src/core/reauth-negotiation.js";
 import type { ClaudeCredentialFacts } from "../packages/core/src/core/claude-oauth-contention.js";
 import { DEFAULT_ERROR_RULES } from "../packages/core/src/core/error-resolution-rules.js";
+import { isRetryableBootAcquisitionError } from "../packages/core/src/core/dispatch/acquisition-phase.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 
 beforeEach(() => {
@@ -156,6 +157,18 @@ describe("#441 real runtime boundary to pure resolver (no providers)", () => {
     const rejected = fixture(bridge, classifyClaudeError, "claude", undefined,
       () => ({ refreshTokenExpiresAt: 1 }));
     await expect(rejected.runtime.prompt("fixture")).rejects.toBe(bridge);
+  });
+
+  it("surfaces the Codex workspace-routing 401 from session/new as a non-retryable auth failure", async () => {
+    // Production 2026-10-05: ledger, ingest result and compaction error all said only "Internal error".
+    const original = new RequestError(-32603, "Internal error", { details: "workspace routing discovery unauthorized (401)" });
+    const { runtime, prompt } = fixture(original, classifyCodexError, "codex");
+    const error = await runtime.newSession({ cwd: "/tmp" }).then(() => undefined, (err: unknown) => err);
+    expect(prompt).toHaveBeenCalledTimes(1);
+    expect(readErrorClassification(error)).toMatchObject({ errorKind: "auth_required", agentId: "codex",
+      details: "workspace routing discovery unauthorized (401)" });
+    expect((error as Error).message).toContain("workspace routing discovery unauthorized (401)");
+    expect(isRetryableBootAcquisitionError(error)).toBe(false);
   });
 
   it("keeps the load RPC cause and stderr through error classification", async () => {

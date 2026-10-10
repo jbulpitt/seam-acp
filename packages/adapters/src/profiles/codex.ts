@@ -48,6 +48,11 @@ export function classifyCodexError(error: unknown, agentId = "codex"): AdapterEr
 
 function matchCodexError(ctx: ClassifyContext): AdapterErrorClassification | AdapterErrorKind | null {
   const { haystack, agentId, message, data } = ctx;
+  // Production 2026-10-05, codex@local session/new: a stale ChatGPT login (openai/codex#47456).
+  if (ctx.errorCode === -32603 && message === "Internal error"
+    && data?.details === "workspace routing discovery unauthorized (401)") {
+    return classified(agentId, "auth_required", { details: data.details });
+  }
   if (ctx.errorCode === -32603 && message === "Internal error"
     && typeof data?.details === "string"
     && /^thread [a-z0-9-]+ already has an active writer$/i.test(data.details)) {

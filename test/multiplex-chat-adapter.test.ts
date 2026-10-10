@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import type { StructuredPanel } from "../packages/core/src/core/types.js";
 
 function adapter(platform: string) {
   let handle: any;
@@ -31,7 +32,7 @@ describe("multi-adapter routing", () => {
     const discord = Object.assign(adapter("discord"), { sendPanel: vi.fn(async (channel: any) => ({ channel, id: "panel" })) });
     const chat = adapter("google-chat");
     const mux = multiplexChatAdapters([discord, chat]);
-    const panel = { title: "Working", description: "doing work" };
+    const panel: StructuredPanel = { color: 0x5865f2, title: "Working", description: "doing work", fields: [] };
     await mux.sendPanel!({ platform: "discord", id: "123" }, panel);
     await mux.sendPanel!({ platform: "google-chat", id: "AAA.TTT" }, panel);
     expect(discord.sendPanel).toHaveBeenCalledOnce(); expect(discord.sendMessage).not.toHaveBeenCalled();

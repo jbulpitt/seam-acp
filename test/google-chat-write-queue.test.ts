@@ -1,6 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { pino } from "pino";
 
+// Keep the native promise timer on this file's fake clock too.
+vi.mock("node:timers/promises", () => ({
+  setTimeout: (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms)),
+}));
+
 afterEach(() => vi.useRealTimers());
 
 describe("Google Chat shared space writes", () => {
@@ -14,7 +19,9 @@ describe("Google Chat shared space writes", () => {
       queue.enqueue("spaces/A", write("delete")), queue.enqueue("spaces/B", write("other space"))];
     await vi.advanceTimersByTimeAsync(0);
     expect(seen).toEqual([["create thread 1", 0], ["other space", 0]]);
-    await vi.advanceTimersByTimeAsync(2000); await Promise.all(jobs);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(seen.slice(2)).toEqual([["patch thread 2", 1000]]);
+    await vi.advanceTimersByTimeAsync(1000); await Promise.all(jobs);
     expect(seen.slice(2)).toEqual([["patch thread 2", 1000], ["delete", 2000]]);
   });
 
@@ -22,12 +29,12 @@ describe("Google Chat shared space writes", () => {
     const { SpaceWriteQueue } = await import("../packages/core/src/platforms/google-chat/write-queue.js");
     vi.useFakeTimers(); vi.setSystemTime(0);
     const queue = new SpaceWriteQueue({ logger: pino({ level: "silent" }), intervalMs: 1000 });
-    const seen: string[] = [];
-    const write = (s: string) => async () => { seen.push(s); };
+    const seen: [string, number][] = [];
+    const write = (s: string) => async () => { seen.push([s, Date.now()]); };
     const jobs = [queue.enqueue("A", write("create1")), queue.enqueue("A", write("Working"), "status1"),
       queue.enqueue("A", write("create2")), queue.enqueue("A", write("Done"), "status1")];
     await vi.advanceTimersByTimeAsync(2000); await Promise.all(jobs);
-    expect(seen).toEqual(["create1", "Done", "create2"]);
+    expect(seen).toEqual([["create1", 0], ["Done", 1000], ["create2", 2000]]);
   });
 
   it("retries a 429 without dropping the create, while a permanent failure preserves its cause", async () => {

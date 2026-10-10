@@ -16,9 +16,12 @@ async function until(check: () => boolean, label: string) {
 }
 
 describe("terminal auth recovery handback", () => {
-  it.each(["new", "retained-waiting", "retained-accepted"] as const)("continues once in the recorded session: %s", async mode => {
-    const retained = mode !== "new";
-    const h = await savedSessionHost({ authFailure: true, oldAuthDisarm: retained });
+  // A rejection with no output never delivered the brief, so accept sends it once.
+  // With output first, the brief was taken: accept continues and never replays it.
+  it.each(["new", "retained-waiting", "retained-accepted", "output-first"] as const)("continues once in the recorded session: %s", async mode => {
+    const retained = mode === "retained-waiting" || mode === "retained-accepted";
+    const sendOnce = mode !== "output-first";
+    const h = await savedSessionHost({ authFailure: true, oldAuthDisarm: retained, authOutputFirst: !sendOnce });
     const router = h.makeRouter();
     const orch = h.makeOrchestrator(router);
     Object.assign((orch as any).adapter, {
@@ -40,11 +43,12 @@ describe("terminal auth recovery handback", () => {
     try {
       await watcher.start();
       await enqueueDispatchSpec(h.root, { id, target: h.record.channelRef, session: "live",
-        location: "fixture", prompt: "ORIGINAL-DO-NOT-REPLAY",
+        // The fixture only completes prompts that mention "continue".
+        location: "fixture", prompt: "ORIGINAL-BRIEF-711: continue the task",
         createdUtc: new Date().toISOString(), kind: "wake", reportBack: false }, h.store.turnAttempts);
       await watcher.tick();
       const parked = h.store.turnAttempts.get(id)!;
-      expect(parked, JSON.stringify(parked.outcome)).toMatchObject({ state: "suspended", promptStarted: true, acpSessionId: SAVED_SESSION });
+      expect(parked, JSON.stringify(parked.outcome)).toMatchObject({ state: "suspended", promptStarted: !sendOnce, acpSessionId: SAVED_SESSION });
       expect(parked.stalledReason).toMatch(/^reauth-waiting:/);
       expect(Boolean(parked.remoteRecovery)).toBe(retained);
       const oldSlot = router.getRuntime(h.record.id)!.getSlot()!;
@@ -75,7 +79,7 @@ describe("terminal auth recovery handback", () => {
         expect(h.store.turnAttempts.get(id)?.state).toBe("suspended");
         await (orch as any).handleChoiceCardInteraction(click);
         await (orch as any).handleChoiceCardInteraction(click);
-        expect(replies.join("\n")).toContain("original prompt is not sent again");
+        expect(replies.join("\n")).toContain(sendOnce ? "Its pending prompt will be sent once." : "original prompt is not sent again");
       }
       await until(() => requeue.mock.results.length > 0, "accepted continuation admission");
       await requeue.mock.results[0]!.value;
@@ -88,9 +92,14 @@ describe("terminal auth recovery handback", () => {
       const prompts = requests.filter(row => row.method === "session/prompt");
       expect(prompts).toHaveLength(2);
       expect(prompts.map(row => row.params.sessionId)).toEqual([SAVED_SESSION, SAVED_SESSION]);
-      expect(JSON.stringify(prompts[0])).toContain("ORIGINAL-DO-NOT-REPLAY");
-      expect(JSON.stringify(prompts[1])).not.toContain("ORIGINAL-DO-NOT-REPLAY");
-      expect(prompts[1].params.prompt[0].text).toMatch(/^continue\n/);
+      expect(JSON.stringify(prompts[0])).toContain("ORIGINAL-BRIEF-711");
+      if (sendOnce) {
+        expect(JSON.stringify(prompts[1])).toContain("ORIGINAL-BRIEF-711");
+        expect(prompts[1].params.prompt[0].text).not.toMatch(/^continue\n/);
+      } else {
+        expect(JSON.stringify(prompts[1])).not.toContain("ORIGINAL-BRIEF-711");
+        expect(prompts[1].params.prompt[0].text).toMatch(/^continue\n/);
+      }
       expect(requests.filter(row => row.method === "session/new")).toEqual([]);
       expect(requests.filter(row => row.method === "session/load")).toHaveLength(retained ? 2 : 1);
       expect(requeue).toHaveBeenCalledTimes(1);

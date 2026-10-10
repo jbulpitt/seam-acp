@@ -48,9 +48,6 @@ export function classifyCodexError(error: unknown, agentId = "codex"): AdapterEr
 
 function matchCodexError(ctx: ClassifyContext): AdapterErrorClassification | AdapterErrorKind | null {
   const { haystack, agentId, message, data } = ctx;
-  if (ctx.errorCode === -32000 && message === "Authentication required") {
-    return classified(agentId, "auth_required", { details: message });
-  }
   if (ctx.errorCode === -32603 && message === "Internal error"
     && typeof data?.details === "string"
     && /^thread [a-z0-9-]+ already has an active writer$/i.test(data.details)) {

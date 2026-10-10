@@ -118,6 +118,21 @@ describe("#440 journal corpus — Claude", () => {
     const err = requestError("Internal error", null);
     expectKind(classifyClaudeError(err), "unclassified", "claude");
   });
+
+  it("classifies the production session/prompt -32000 Authentication required response", () => {
+    // Production 2026-10-08 18:44Z / 18:49Z, claude@plex-server: claude-agent-acp
+    // session/prompt, code -32000, data null; logged as unclassified and retried.
+    const err = requestError("Authentication required", null, -32000);
+    expectKind(classifyAndAttach(err, classifyClaudeError(err)), "auth_required", "claude");
+    expect(err.message).toBe("Authentication required");
+  });
+
+  it.each([
+    [-32603, "Authentication required"],
+    [-32000, "Authentication required for another service"],
+  ])("does not infer Claude authentication from code %s and message %s", (code, message) => {
+    expectKind(classifyClaudeError(requestError(message as string, null, code as number)), "unclassified", "claude");
+  });
 });
 
 describe("#440 journal corpus — Codex", () => {

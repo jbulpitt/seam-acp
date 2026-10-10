@@ -856,6 +856,13 @@ export class TurnAttemptStore {
       .run(now, reason, reason, now, id, reason).changes === 1;
   }
 
+  /** A parked prompt the agent refused before any output was never delivered. */
+  unstartRejectedPrompt(id: string, now = new Date().toISOString()): boolean {
+    return this.db.prepare(`UPDATE turn_attempts SET prompt_started=0, updated_utc=?
+      WHERE id=? AND state='suspended' AND prompt_started=1`)
+      .run(now, id).changes === 1;
+  }
+
   markStallNoticeDelivered(id: string, now = new Date().toISOString()): boolean {
     return this.db.prepare(`UPDATE turn_attempts SET stall_notice_utc=?,
       stall_notice_reason=stalled_reason, updated_utc=?

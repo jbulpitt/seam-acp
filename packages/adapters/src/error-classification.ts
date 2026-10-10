@@ -337,6 +337,12 @@ export function classifySharedRuntimeError(ctx: ClassifyContext): AdapterErrorCl
   const sessionFailureKind = classifySessionFailure(ctx);
   if (sessionFailureKind) return classified(agentId, sessionFailureKind, { details: message });
 
+  // ACP's own auth error (`RequestError.authRequired()`), exact. Observed from
+  // codex-acp session/load and claude-agent-acp session/prompt.
+  if (ctx.errorCode === -32000 && message === "Authentication required") {
+    return classified(agentId, "auth_required", { details: message });
+  }
+
   if (/\bunknown rpc method:\s*describemodelcatalog\b/.test(haystack) ||
       /\brpc 'describemodelcatalog' timed out\b/.test(haystack)) {
     return classified(agentId, "capability_absent", { details: message });

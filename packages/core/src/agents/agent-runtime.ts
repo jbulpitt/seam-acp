@@ -410,6 +410,16 @@ function withTimeout<T = never>(ms: number, message: string): Promise<T> {
   });
 }
 
+/** The agent answered the first submission's session/prompt with auth_required
+ * before any session/update or Claude SDK signal, so it never took the prompt. */
+function promptRejectedBeforeOutput(evidence: SubmissionEvidence, error: unknown): boolean {
+  return readErrorClassification(error)?.errorKind === "auth_required"
+    && evidence.phase !== "intent" && !evidence.retry
+    && evidence.observedUpdateTypes.length === 0
+    && evidence.providerMessage.observations === 0
+    && evidence.wrapperCommand.observations === 0;
+}
+
 function bridgeCloseCode(error: unknown): number | undefined {
   if (!error || typeof error !== "object") return undefined;
   const rec = error as { code?: unknown; closeCode?: unknown; cause?: unknown };
@@ -1572,7 +1582,7 @@ export class AgentRuntime {
         await this.emit({ kind: "notice", agent: this.profile.id, severity: "warning",
           title: "Paused — quota or balance exhausted", description: `${errorMessage(error)}\nRetry after the reset or top-up; no automatic retries.` });
       }
-      const parked = this.reauthPark(error, lastErrorKind);
+      const parked = this.reauthPark(error, lastErrorKind, promptRejectedBeforeOutput(receipt.submission, error));
       if (parked) throw parked;
       throw error;
     } finally {
@@ -1636,7 +1646,7 @@ export class AgentRuntime {
    * 4001 all return null so the original error keeps its existing path.
    * A remote Claude process is not this machine's credential file.
    */
-  private reauthPark(error: unknown, lastErrorKind: string | undefined): ReauthParked | null {
+  private reauthPark(error: unknown, lastErrorKind: string | undefined, promptRejected = false): ReauthParked | null {
     const classified = readErrorClassification(error);
     const kind = classified?.errorKind ?? lastErrorKind;
     const message = error instanceof Error ? error.message : String(error);
@@ -1648,7 +1658,9 @@ export class AgentRuntime {
       bridgeCloseCode: bridgeCloseCode(error),
       claudeCredentials: this.credentialFactsFor(kind),
     });
-    return decision.action === "park" ? new ReauthParked(decision, error) : null;
+    if (decision.action !== "park") return null;
+    return new ReauthParked(promptRejected
+      ? { ...decision, park: { ...decision.park, promptRejected: true } } : decision, error);
   }
 
   private credentialFactsFor(kind: string | undefined): ClaudeCredentialFacts | undefined {

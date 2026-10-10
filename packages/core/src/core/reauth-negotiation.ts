@@ -45,6 +45,8 @@ export interface ReauthPark {
   userCode?: string;
   /** The message offered a loopback callback. That URL is not `url`. */
   loopbackRejected?: boolean;
+  /** The agent refused session/prompt before any output, so the prompt was never delivered. */
+  promptRejected?: true;
 }
 
 export interface NegotiateReauthInput {
@@ -186,12 +188,14 @@ export function reauthWaitNotice(park: ReauthPark, context?: ReauthNoticeContext
  * Null when the row could not be suspended.
  */
 export function parkReauthAttempt(
-  store: { markStalled(id: string, reason: string): boolean },
+  store: { markStalled(id: string, reason: string): boolean; unstartRejectedPrompt(id: string): boolean },
   attemptId: string,
   park: ReauthPark,
 ): DispatchSuspendedError | null {
   const reason = reauthStalledReason(park);
   if (!store.markStalled(attemptId, reason)) return null;
+  // Accept then sends the pending prompt once instead of a bare continuation.
+  if (park.promptRejected) store.unstartRejectedPrompt(attemptId);
   return DispatchSuspendedError.defect(attemptId, reason);
 }
 

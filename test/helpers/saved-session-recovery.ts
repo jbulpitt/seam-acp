@@ -30,6 +30,8 @@ export async function savedSessionHost(options: {
   legacy?: boolean;
   oldAuthDisarm?: boolean;
   authFailure?: boolean;
+  /** Emit one session/update before the auth rejection. */
+  authOutputFirst?: boolean;
   connectionFailure?: boolean;
   writerLock?: boolean;
   recoverySleep?: (ms: number) => Promise<void>;
@@ -104,6 +106,7 @@ export async function savedSessionHost(options: {
       ...(options.loadGate ? { FAKE_AGENT_LOAD_GATE: path.join(root, "load.release") } : {}),
       ...(options.newGate ? { FAKE_AGENT_NEW_GATE: path.join(root, "new.release") } : {}),
       FAKE_AGENT_AUTH_FAILURE: authFailure,
+      ...(options.authOutputFirst ? { FAKE_AGENT_AUTH_OUTPUT_FIRST: "1" } : {}),
       ...(options.connectionFailure ? { FAKE_AGENT_CONNECTION_FAILURE: connectionFailure } : {}),
       ...(options.writerLock ? { FAKE_AGENT_WRITER_LOCK: path.join(root, "session.writer") } : {}),
       ...(options.sessionGone ? { FAKE_AGENT_MISSING_SESSION: SAVED_SESSION } : {}) },

@@ -76,7 +76,7 @@ describe("Google Chat DM adapter", () => {
     const ref = await adapter.sendMessage(channel, "hello", { nonce: "Nonce_UPPER/123", enforceNonce: true });
     expect(request.mock.calls[0]).toEqual(["chat", expect.objectContaining({ method: "POST",
       url: "https://chat.googleapis.com/v1/spaces/DM_1/messages",
-      params: expect.objectContaining({ messageReplyOption: "REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD",
+      params: expect.objectContaining({ messageReplyOption: "REPLY_MESSAGE_OR_FAIL",
         messageId: expect.stringMatching(/^client-[a-z0-9-]{1,56}$/) }),
       data: expect.objectContaining({ text: "hello", thread: { name: "spaces/DM_1/threads/Thread_1" } }) })]);
     await adapter.editMessage(ref, "done");

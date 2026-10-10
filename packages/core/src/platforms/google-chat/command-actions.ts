@@ -9,7 +9,7 @@ export interface GoogleChatCommandDeps {
   /** The adapter owns resource-name -> canonical ChannelRef mapping. */
   channelFor(space: string, thread: string | null): ChannelRef;
   createThread: NonNullable<ChatAdapter["createThread"]>;
-  router: Pick<SessionRouter, "ensureSessionRecord">;
+  router: Pick<SessionRouter, "ensureSessionRecord" | "describeConfig">;
   runtimeTransition: Pick<RuntimeTransition, "applyAgentChange" | "applyModelChange">;
   cancelChannel: Orchestrator["cancelChannel"];
   cwd: string;
@@ -21,6 +21,7 @@ type SwitchOutcome = Awaited<ReturnType<RuntimeTransition["applyModelChange"]>>;
 export type GoogleChatCommandResult =
   | { command: "new"; channel: ChannelRef; record: SessionRecord }
   | { command: "cancel"; channel: ChannelRef; outcome: CancelOutcome }
+  | { command: "usage"; requestedCommand: "agent" | "model"; channel: ChannelRef; message: string }
   | { command: "agent" | "model"; channel: ChannelRef; outcome: SwitchOutcome };
 
 /** Uses the same core operations as /seam new, /seam cancel and /seam config. */
@@ -39,6 +40,12 @@ export async function executeGoogleChatCommand(
     command: "cancel", channel, outcome: await deps.cancelChannel(channel),
   };
   const record = bind(channel, deps);
+  if (!command.args.trim()) {
+    const current = deps.router.describeConfig(record)[command.command].value;
+    const message = `Usage: /${command.command} <id> — current: ${current}`;
+    await deps.respond(channel, message);
+    return { command: "usage", requestedCommand: command.command, channel, message };
+  }
   const actor = { id: command.user.id, name: command.user.name };
   const respond = (text: string) => deps.respond(channel, text);
   const outcome = command.command === "agent"

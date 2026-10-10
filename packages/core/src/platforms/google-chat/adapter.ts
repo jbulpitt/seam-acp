@@ -3,6 +3,8 @@ import type { Logger } from "pino";
 import type { ChatAdapter, ChannelRef, DeliveryNonceLookup, DeliveryNonceOptions, IncomingMessage,
   MessageAttachment, MessageRef, ChoiceCardPost, ChoiceInteraction, ComponentEvent, ElicitationCardPost } from "../chat-adapter.js";
 import type { StructuredPanel, StructuredLayout } from "../../core/types.js";
+import type { SessionStore } from "../../core/session-store.js";
+import type { InboundCommandResult } from "../../core/inbound-admission/types.js";
 import type { GoogleDriveUploader } from "../../core/files/google-drive-upload.js";
 import type { ComponentAcknowledgement } from "../interaction-response.js";
 import type { GoogleApi } from "./api.js";
@@ -14,7 +16,7 @@ import { splitGoogleChatText } from "./text-split.js";
 import { parseGoogleChatCardClick, type GoogleChatCardClickEvent } from "./card-click.js";
 import { renderGoogleChatPanel, renderGoogleChatLayout, renderGoogleChatChoiceCard,
   renderGoogleChatElicitationCard, type GoogleChatCardsMessage } from "./card-renderer.js";
-import { parseGoogleChatCommand, type GoogleChatCommandEvent } from "./commands.js";
+import { parseGoogleChatCommand, type GoogleChatCommand, type GoogleChatCommandEvent } from "./commands.js";
 import { executeGoogleChatCommand, type GoogleChatCommandDeps } from "./command-actions.js";
 
 export const GOOGLE_CHAT_PLATFORM = "google-chat";
@@ -48,6 +50,14 @@ function clientId(nonce: string): string {
   return `client-${createHash("sha256").update(nonce).digest("hex").slice(0, 56)}`;
 }
 
+function inboundId(name: string): string {
+  return `gchat_${createHash("sha256").update(name).digest("base64url")}`;
+}
+
+type CommandDeps = Pick<GoogleChatCommandDeps, "router" | "runtimeTransition" | "cancelChannel"> & {
+  store: Pick<SessionStore, "admitInbound" | "getInbound" | "claimInbound" | "completeInboundCommand">;
+};
+
 export class GoogleChatAdapter implements ChatAdapter {
   readonly platform = GOOGLE_CHAT_PLATFORM;
   // Unacked events redeliver via Pub/Sub; admitted work resumes from the ledger.
@@ -59,7 +69,7 @@ export class GoogleChatAdapter implements ChatAdapter {
   private componentHandler?: (event: ComponentEvent) => void | Promise<void>;
   private choiceAcknowledgement: ComponentAcknowledgement = "update";
   private componentAcknowledgement: ComponentAcknowledgement = "update";
-  private commandDeps?: Pick<GoogleChatCommandDeps, "router" | "runtimeTransition" | "cancelChannel">;
+  private commandDeps?: CommandDeps;
 
   constructor(private readonly opts: { api: GoogleApi; subscription: string; allowedUserIds: ReadonlySet<string>;
     defaultCwd: string; logger: Logger; writeIntervalMs?: number; driveUploader?: Pick<GoogleDriveUploader, "upload"> }) {
@@ -77,7 +87,7 @@ export class GoogleChatAdapter implements ChatAdapter {
   onComponent(handler: (event: ComponentEvent) => void | Promise<void>, acknowledgement: ComponentAcknowledgement): void {
     this.componentHandler = handler; this.componentAcknowledgement = acknowledgement;
   }
-  setCommandDeps(deps: Pick<GoogleChatCommandDeps, "router" | "runtimeTransition" | "cancelChannel">): void {
+  setCommandDeps(deps: CommandDeps): void {
     this.commandDeps = deps;
   }
 
@@ -99,29 +109,12 @@ export class GoogleChatAdapter implements ChatAdapter {
     }
     const command = parseGoogleChatCommand(event);
     if (command) {
-      if (!this.commandDeps) throw new Error("Google Chat command handlers not installed");
-      const result = await executeGoogleChatCommand({ ...command,
-        user: { ...command.user, id: resourceId(command.user.id, "users") } }, {
-        ...this.commandDeps,
-        channelFor: (space, thread) => thread ? channelForThread(thread)
-          : { platform: this.platform, id: resourceId(space, "spaces") },
-        createThread: (parent, name) => this.createThread(parent, name),
-        cwd: this.opts.defaultCwd,
-        respond: async (channel, text) => { await this.sendMessage(channel, text); },
-      });
-      if (result.command === "cancel") {
-        const { outcome } = result;
-        let text: string;
-        if ("error" in outcome) text = `Cancel requested, but not confirmed: ${
-          outcome.error instanceof Error ? outcome.error.message : String(outcome.error)}. Work may still be running.`;
-        else if (outcome.outcome === "idle") text = outcome.cancelled.cancelled ? "Turn cancelled."
-          : outcome.parked ? "Queued prompt cancelled."
-          : outcome.queue.queued ? `No active turn; ${outcome.queue.queued} durable items remain queued. Nothing was discarded.`
-          : "No active turn.";
-        else text = outcome.outcome === "unacknowledged"
-          ? "Cancel requested, but not confirmed. Work may still be running." : "Cancel sent to the active turn.";
-        await this.sendMessage(result.channel, text);
-      }
+      const identity = event.type === "APP_COMMAND" ? interactionId : message?.name ?? interactionId;
+      if (!identity) throw new Error("Google Chat command has no durable message identity");
+      const replyChannel = message && message.threadReply !== true
+        && event.appCommandMetadata?.appCommandType !== "QUICK_COMMAND"
+        ? { platform: this.platform, id: resourceId(command.space, "spaces") } : undefined;
+      await this.receiveCommand(command, inboundId(identity), replyChannel);
       return;
     }
     if (event.type !== "MESSAGE") return;
@@ -138,7 +131,7 @@ export class GoogleChatAdapter implements ChatAdapter {
     const abort = () => refuse(signal!.reason);
     signal?.addEventListener("abort", abort, { once: true });
     const incoming: IncomingMessage = {
-      messageId: `gchat_${createHash("sha256").update(message.name).digest("base64url")}`,
+      messageId: inboundId(message.name),
       channel: channelForThread(message.thread.name), authorId: resourceId(user.name, "users"),
       authorName: user.displayName, authorIsBot: false, text: message.text ?? "", attachments, raw,
       cwd: this.opts.defaultCwd,
@@ -152,6 +145,74 @@ export class GoogleChatAdapter implements ChatAdapter {
     });
     try { if (signal?.aborted) abort(); await admission; }
     finally { signal?.removeEventListener("abort", abort); }
+  }
+
+  private async receiveCommand(command: GoogleChatCommand, messageId: string, replyChannel?: ChannelRef): Promise<void> {
+    if (!this.commandDeps) throw new Error("Google Chat command handlers not installed");
+    const { store } = this.commandDeps;
+    const channel = command.thread ? channelForThread(command.thread)
+      : { platform: this.platform, id: resourceId(command.space, "spaces") };
+    store.admitInbound({ messageId, platform: this.platform, channelRef: channel.id, parentRef: channel.parentId,
+      sessionRecordId: `${this.platform}:${channel.id}`, authorId: resourceId(command.user.id, "users"),
+      authorName: command.user.name, text: `/${command.command} ${command.args}`.trim(),
+      createdUtc: new Date().toISOString(), preemptive: false, commandResult: { replies: [] } });
+    const admitted = store.getInbound(messageId)!;
+    let receipt = admitted.commandResult!;
+    if (admitted.state !== "completed") {
+      if (!store.claimInbound(messageId, 0, new Date().toISOString())) {
+        this.opts.logger.warn({ messageId, command: command.command, state: admitted.state },
+          "Google Chat command execution already claimed; duplicate will not repeat it");
+        return;
+      }
+      const respond = async (channel: ChannelRef, text: string) => {
+        receipt.replies.push({ channel: replyChannel ?? channel, text, index: receipt.replies.length });
+      };
+      try {
+        const result = await executeGoogleChatCommand({ ...command,
+          user: { ...command.user, id: resourceId(command.user.id, "users") } }, {
+          ...this.commandDeps,
+          channelFor: (space, thread) => thread ? channelForThread(thread)
+            : { platform: this.platform, id: resourceId(space, "spaces") },
+          createThread: (parent, name) => this.createThread(parent, name,
+            { nonce: `${messageId}-new`, enforceNonce: true }),
+          cwd: this.opts.defaultCwd,
+          respond,
+        });
+        if (result.command === "cancel") {
+          const { outcome } = result;
+          let text: string;
+          if ("error" in outcome) text = `Cancel requested, but not confirmed: ${
+            outcome.error instanceof Error ? outcome.error.message : String(outcome.error)}. Work may still be running.`;
+          else if (outcome.outcome === "idle") text = outcome.cancelled.cancelled ? "Turn cancelled."
+            : outcome.parked ? "Queued prompt cancelled."
+            : outcome.queue.queued ? `No active turn; ${outcome.queue.queued} durable items remain queued. Nothing was discarded.`
+            : "No active turn.";
+          else text = outcome.outcome === "unacknowledged"
+            ? "Cancel requested, but not confirmed. Work may still be running." : "Cancel sent to the active turn.";
+          await respond(result.channel, text);
+        }
+      } catch (err) {
+        receipt = { replies: [], error: err instanceof Error ? err.message : String(err) };
+        store.completeInboundCommand(messageId, receipt, new Date().toISOString());
+        this.opts.logger.error({ err, messageId, command: command.command },
+          "Google Chat command execution failed; admitted effect will not be replayed");
+        throw err;
+      }
+      store.completeInboundCommand(messageId, receipt, new Date().toISOString());
+    }
+    for (const reply of [...receipt.replies]) {
+      try {
+        await this.sendText(reply.channel, reply.text, { nonce: `${messageId}-reply-${reply.index}`, enforceNonce: true },
+          command.user.id);
+      } catch (err) {
+        const status = googleErrorStatus(err);
+        if (status === undefined || status < 400 || status === 408 || status === 429 || status >= 500) throw err;
+        this.opts.logger.error({ err, messageId, command: command.command, channel: reply.channel.id },
+          "Google Chat command reply rejected after execution; acknowledging event");
+      }
+      receipt.replies = receipt.replies.filter(pending => pending.index !== reply.index);
+      store.completeInboundCommand(messageId, receipt, new Date().toISOString());
+    }
   }
 
   async sendMessage(channel: ChannelRef, text: string, delivery?: DeliveryNonceOptions): Promise<MessageRef> {
@@ -176,7 +237,7 @@ export class GoogleChatAdapter implements ChatAdapter {
   private async postMessage(channel: ChannelRef, body: Record<string, unknown>, delivery?: DeliveryNonceOptions): Promise<MessageRef> {
     const { space, thread } = names(channel);
     const requestId = randomUUID();
-    const params = { requestId, ...(thread ? { messageReplyOption: "REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD" } : {}),
+    const params = { requestId, ...(thread ? { messageReplyOption: "REPLY_MESSAGE_OR_FAIL" } : {}),
       ...(delivery ? { messageId: clientId(delivery.nonce) } : {}) };
     const message = await this.writes.enqueue(space, async () => {
       try {
@@ -248,8 +309,8 @@ export class GoogleChatAdapter implements ChatAdapter {
     });
   }
 
-  async createThread(parent: ChannelRef, name: string): Promise<ChannelRef> {
-    const message = await this.sendMessage({ platform: this.platform, id: names(parent).space.slice(7) }, name);
+  async createThread(parent: ChannelRef, name: string, delivery?: DeliveryNonceOptions): Promise<ChannelRef> {
+    const message = await this.sendMessage({ platform: this.platform, id: names(parent).space.slice(7) }, name, delivery);
     if (!message.channel.parentId) throw new Error("Google Chat new top-level message returned no thread");
     return message.channel;
   }

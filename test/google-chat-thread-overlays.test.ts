@@ -83,6 +83,33 @@ function fixture(channel = chat) {
 }
 
 describe("platform-aware persisted thread overlays", () => {
+  it.each([[3, "agent", "claude"], [4, "model", "claude-default"]])
+    ("bare command %s leaves real SQL, overlays and the warm runtime unchanged", async (commandId, command, current) => {
+      const h = fixture();
+      const warm = await h.router.getOrStartRuntime(h.record());
+      const before = structuredClone(h.record());
+      const presetBefore = fs.readFileSync(h.file, "utf8");
+      const agent = vi.spyOn(h.runtime, "applyAgentChange");
+      const model = vi.spyOn(h.runtime, "applyModelChange");
+      const request = vi.fn(async (_scope: string, req: any) => ({
+        name: `spaces/${chat.parentId}/messages/app`, thread: req.data.thread,
+      }));
+      const adapter = new GoogleChatAdapter({ api: { request }, logger, subscription: "projects/test/subscriptions/events",
+        defaultCwd: dir, allowedUserIds: new Set(["users/42"]), writeIntervalMs: 0 });
+      adapter.setCommandDeps({ store: h.store, router: h.router, runtimeTransition: h.runtime, cancelChannel: vi.fn() } as any);
+      await adapter.receiveEvent({ type: "MESSAGE", space: { name: `spaces/${chat.parentId}` },
+        user: { name: "users/42", displayName: "Tester" }, message: {
+          name: `spaces/${chat.parentId}/messages/bare-${commandId}`, text: `/${command}`, argumentText: null,
+          thread: { name: `spaces/${chat.parentId}/threads/bdu-1mvFHog` }, threadReply: true, slashCommand: { commandId },
+        } });
+      expect(agent).not.toHaveBeenCalled();
+      expect(model).not.toHaveBeenCalled();
+      expect(h.record()).toEqual(before);
+      expect(fs.readFileSync(h.file, "utf8")).toBe(presetBefore);
+      expect(h.router.getRuntime(before.id)).toBe(warm);
+      expect(request.mock.calls[0]![1].data.text).toBe(`Usage: /${command} <id> — current: ${current}`);
+    });
+
   it("loads qualified Chat keys alongside unchanged numeric Discord keys", () => {
     const document = { threads: { [key]: { agent: { value: "codex" }, model: { value: "codex-reviewed" } },
       [discord.id]: { agent: { value: "claude" } } } };
@@ -107,13 +134,13 @@ describe("platform-aware persisted thread overlays", () => {
     }));
     const adapter = new GoogleChatAdapter({ api: { request }, logger, subscription: "projects/test/subscriptions/events",
       defaultCwd: dir, allowedUserIds: new Set(["users/42"]), writeIntervalMs: 0 });
-    adapter.setCommandDeps({ router: h.router, runtimeTransition: h.runtime, cancelChannel: vi.fn() });
+    adapter.setCommandDeps({ store: h.store, router: h.router, runtimeTransition: h.runtime, cancelChannel: vi.fn() } as any);
     const normal = vi.fn(); adapter.onMessage(normal);
     const deliver = async (commandId: number, text: string) => {
       const event = { type: "MESSAGE", space: { name: `spaces/${chat.parentId}` },
         user: { name: "users/42", displayName: "Tester" }, message: {
           name: `spaces/${chat.parentId}/messages/command-${commandId}`, text, argumentText: text,
-          thread: { name: `spaces/${chat.parentId}/threads/bdu-1mvFHog` }, slashCommand: { commandId },
+          thread: { name: `spaces/${chat.parentId}/threads/bdu-1mvFHog` }, threadReply: true, slashCommand: { commandId },
         } };
       await (adapter as any).transport.process({ ackId: `ack-${commandId}`, message: {
         messageId: `delivery-${commandId}`, data: Buffer.from(JSON.stringify(event)).toString("base64"),
@@ -137,6 +164,24 @@ describe("platform-aware persisted thread overlays", () => {
     for (const [id, preset] of reloaded.threadPresets) h.maps.threadPresets.set(id, preset);
     h.store.upsert({ ...h.record(), agentId: "claude", configJson: "{}" });
     expect(h.router.planRuntimeSpawn(h.record())).toMatchObject({ agentId: "codex", model: "codex-reviewed" });
+  });
+
+  it("a permanent Google reply error never rolls back the committed core model change", async () => {
+    const h = fixture();
+    const cause = Object.assign(new Error("NOT_FOUND: command thread is not replyable"), { response: { status: 404 } });
+    const request = vi.fn(async (_scope: string, _req: any): Promise<any> => { throw cause; });
+    const adapter = new GoogleChatAdapter({ api: { request }, logger, subscription: "projects/test/subscriptions/events",
+      defaultCwd: dir, allowedUserIds: new Set(["users/42"]), writeIntervalMs: 0 });
+    adapter.setCommandDeps({ store: h.store, router: h.router, runtimeTransition: h.runtime, cancelChannel: vi.fn() } as any);
+    await adapter.receiveEvent({ type: "MESSAGE", space: { name: `spaces/${chat.parentId}` },
+      user: { name: "users/42", displayName: "Tester" }, message: {
+        name: `spaces/${chat.parentId}/messages/model-reply-fails`, text: "/model claude-reviewed",
+        argumentText: "/model claude-reviewed", slashCommand: { commandId: 4 },
+        thread: { name: `spaces/${chat.parentId}/threads/bdu-1mvFHog` }, threadReply: true,
+      } });
+    expect(h.router.describeConfig(h.record()).model.value).toBe("claude-reviewed");
+    expect(JSON.parse(fs.readFileSync(h.file, "utf8")).threads[key].model.value).toBe("claude-reviewed");
+    expect(request).toHaveBeenCalledOnce();
   });
 
   it("uses the same qualified root for proposals and cross-thread identity settings", () => {

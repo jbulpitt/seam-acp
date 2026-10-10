@@ -1,24 +1,44 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { pino } from "pino";
+import { SessionStore } from "../packages/core/src/core/session-store.js";
 import { GoogleChatAdapter } from "../packages/core/src/platforms/google-chat/adapter.js";
 import { PubSubPullTransport } from "../packages/core/src/platforms/google-chat/transport.js";
 
 const channel = { platform: "google-chat", id: "dm.thread", parentId: "dm" };
+const privateRoot = "spaces/dm/threads/pB-Jq3TxSfk";
+const privateRootError = "Can't create a private message as a threaded reply to another private message.";
 const logger = pino({ level: "silent" });
+const stores: SessionStore[] = [];
+afterEach(() => { for (const store of stores.splice(0)) store.close(); vi.restoreAllMocks(); });
 const event = (id: number, text: string) => ({ type: "MESSAGE", space: { name: "spaces/dm" },
   user: { name: "users/42", displayName: "Tester" },
   message: { name: `spaces/dm/messages/command-${id}`, argumentText: text, text, slashCommand: { commandId: id },
-    thread: { name: "spaces/dm/threads/thread" } } });
+    thread: { name: "spaces/dm/threads/thread" }, threadReply: true } });
+const rootEvent = (id: number, text: string, threadReply?: boolean) => {
+  const raw = event(id, text);
+  return { ...raw, message: { ...raw.message, name: "spaces/dm/messages/pB-Jq3TxSfk.pB-Jq3TxSfk",
+    thread: { name: privateRoot }, threadReply } };
+};
 
-function setup() {
-  const request = vi.fn(async (_scope: string, r: any): Promise<any> => ({ name: "spaces/dm/messages/app",
-    thread: r.data?.thread ?? { name: "spaces/dm/threads/new" } }));
+function setup(rejectPrivateRoot = false) {
+  const store = new SessionStore(":memory:"); stores.push(store);
+  const messages: any[] = [];
+  const request = vi.fn(async (scope: string, r: any): Promise<any> => {
+    if (scope === "pubsub") return {};
+    if (rejectPrivateRoot && r.data?.thread?.name === privateRoot && r.data?.privateMessageViewer) {
+      throw Object.assign(new Error(privateRootError), { response: { status: 400 } });
+    }
+    messages.push(r.data);
+    return { name: "spaces/dm/messages/app", thread: r.data?.thread ?? { name: "spaces/dm/threads/new" } };
+  });
   const adapter = new GoogleChatAdapter({ api: { request }, subscription: "projects/test/subscriptions/events",
     allowedUserIds: new Set(["users/42"]), defaultCwd: "/projects", logger, writeIntervalMs: 0 });
   const normal = vi.fn((message: any) => message.onAdmitted());
   adapter.onMessage(normal);
-  const record = { id: "google-chat:dm.thread", platform: "google-chat", channelRef: "dm.thread", parentRef: "dm" };
+  const record = { id: "google-chat:dm.thread", platform: "google-chat", channelRef: "dm.thread", parentRef: "dm",
+    agentId: "claude", acpSessionId: "saved-session", configJson: "{}" };
   const ensureSessionRecord = vi.fn(() => record);
+  const describeConfig = vi.fn(() => ({ agent: { value: "claude" }, model: { value: "claude-reviewed" } }));
   const applyAgentChange = vi.fn(async (_ch, _record, _arg, _actor, respond) => {
     await respond("Switched agent, native outcome"); return { ok: true, message: "native" };
   });
@@ -27,16 +47,100 @@ function setup() {
   });
   const cancelChannel = vi.fn(async () => ({ parked: null, cancelled: { cancelled: true, starting: false },
     outcome: "idle", queue: { state: "idle", queued: 0 } }));
-  (adapter as any).setCommandDeps?.({ router: { ensureSessionRecord },
+  (adapter as any).setCommandDeps?.({ store, router: { ensureSessionRecord, describeConfig },
     runtimeTransition: { applyAgentChange, applyModelChange }, cancelChannel });
   const transport = new PubSubPullTransport({ api: { request }, subscription: "projects/test/subscriptions/events", logger,
     receive: (...args: any[]) => (adapter.receiveEvent as any)(...args) });
   const deliver = (raw: unknown) => transport.process({ ackId: "ack-command", message: { messageId: "pubsub-command",
     data: Buffer.from(JSON.stringify(raw)).toString("base64") } });
-  return { adapter, request, normal, ensureSessionRecord, applyAgentChange, applyModelChange, cancelChannel, deliver };
+  return { adapter, request, messages, normal, record, ensureSessionRecord, describeConfig, applyAgentChange, applyModelChange, cancelChannel, deliver };
 }
 
 describe("merged Google Chat commands wired before ordinary turn admission", () => {
+  it.each([[3, "agent", "claude"], [4, "model", "claude-reviewed"]])
+    ("replies with usage for bare /%s with null argumentText, preserving the saved session", async (id, command, current) => {
+      const h = setup();
+      const before = structuredClone(h.record);
+      const raw = event(Number(id), `/${command}`);
+      await h.deliver({ ...raw, message: { ...raw.message, argumentText: null } });
+      expect(h.applyAgentChange).not.toHaveBeenCalled();
+      expect(h.applyModelChange).not.toHaveBeenCalled();
+      expect(h.normal).not.toHaveBeenCalled();
+      expect(h.record).toEqual(before);
+      expect(h.request.mock.calls[0]![1].data.text).toBe(`Usage: /${command} <id> — current: ${current}`);
+      expect(h.request.mock.calls.at(-1)).toEqual(["pubsub", expect.objectContaining({
+        data: { ackIds: ["ack-command"] },
+      })]);
+    });
+
+  it.each([[2, "/cancel"], [3, "/agent codex"], [4, "/model native-model"]])
+    ("delivers a visible private top-level reply for command %s without moving its action's session", async (id, text) => {
+      const h = setup(true);
+      const error = vi.spyOn(logger, "error");
+      const raw = rootEvent(Number(id), String(text));
+      await h.deliver(raw);
+      expect(h.messages).toHaveLength(1);
+      expect(h.request.mock.calls[0]).toEqual(["chat", expect.objectContaining({
+        data: expect.objectContaining({ privateMessageViewer: { name: "users/42" } }),
+      })]);
+      expect(h.request.mock.calls[0]![1].data).not.toHaveProperty("thread");
+      expect(h.request.mock.calls[0]![1].params).not.toHaveProperty("messageReplyOption");
+      const action = id === 2 ? h.cancelChannel : id === 3 ? h.applyAgentChange : h.applyModelChange;
+      expect(action.mock.calls[0]![0]).toEqual({ platform: "google-chat", id: "dm.pB-Jq3TxSfk", parentId: "dm" });
+      expect(error).not.toHaveBeenCalled();
+      expect(h.normal).not.toHaveBeenCalled();
+      expect(h.request.mock.calls.at(-1)![0]).toBe("pubsub");
+    });
+
+  it.each([[3, "agent", "claude", undefined], [4, "model", "claude-reviewed", false]])
+    ("delivers bare command %s usage from a top-level private invocation", async (id, command, current, threadReply) => {
+      const h = setup(true);
+      const before = structuredClone(h.record);
+      const raw = rootEvent(Number(id), `/${command}`, threadReply as boolean | undefined);
+      await h.deliver({ ...raw, message: { ...raw.message, argumentText: null } });
+      expect(h.messages).toEqual([expect.objectContaining({
+        text: `Usage: /${command} <id> — current: ${current}`, privateMessageViewer: { name: "users/42" },
+      })]);
+      expect(h.messages[0]).not.toHaveProperty("thread");
+      expect(h.applyAgentChange).not.toHaveBeenCalled();
+      expect(h.applyModelChange).not.toHaveBeenCalled();
+      expect(h.record).toEqual(before);
+      expect(h.normal).not.toHaveBeenCalled();
+      expect(h.request.mock.calls.at(-1)![0]).toBe("pubsub");
+    });
+
+  it("ACKs a reply's permanent NOT_FOUND after execution, logging the real cause instead of retrying the effect", async () => {
+    const h = setup();
+    const cause = Object.assign(new Error("NOT_FOUND: requested command thread was not found"),
+      { response: { status: 404 } });
+    const error = vi.spyOn(logger, "error");
+    h.request.mockImplementation(async (_scope, r) => {
+      if (r.params?.messageReplyOption === "REPLY_MESSAGE_OR_FAIL") throw cause;
+      return { name: "spaces/dm/messages/doT0sHl7beg.doT0sHl7beg", thread: { name: "spaces/dm/threads/doT0sHl7beg" } };
+    });
+    await h.deliver(event(2, "/cancel"));
+    expect(error).toHaveBeenCalledWith(expect.objectContaining({ err: cause }),
+      "Google Chat command reply rejected after execution; acknowledging event");
+    expect(h.request.mock.calls.map(([scope]) => scope)).toEqual(["chat", "pubsub"]);
+    expect(h.normal).not.toHaveBeenCalled();
+  });
+
+  it("keeps every split command reply private and in the invocation thread before ACK", async () => {
+    const h = setup();
+    h.applyModelChange.mockImplementation(async (_ch, _record, _arg, _actor, respond) => {
+      const message = "Native model response. ".repeat(2000);
+      await respond(message); return { ok: true, message };
+    });
+    await h.deliver(event(4, "/model native-model"));
+    const writes = h.request.mock.calls.filter(([scope]) => scope === "chat");
+    expect(writes.length).toBeGreaterThan(1);
+    for (const [, req] of writes) expect(req).toMatchObject({
+      params: { messageReplyOption: "REPLY_MESSAGE_OR_FAIL" },
+      data: { thread: { name: "spaces/dm/threads/thread" }, privateMessageViewer: { name: "users/42" } },
+    });
+    expect(h.request.mock.calls.at(-1)![0]).toBe("pubsub");
+  });
+
   it("cancels the calling thread directly, without turning /cancel into a newer prompt", async () => {
     const h = setup();
     await h.deliver(event(2, "/cancel"));
@@ -77,6 +181,19 @@ describe("merged Google Chat commands wired before ordinary turn admission", () 
       appCommandMetadata: { appCommandId: 2, appCommandType: "SLASH_COMMAND" } });
     expect(h.cancelChannel).toHaveBeenCalledExactlyOnceWith(channel);
     expect(h.normal).not.toHaveBeenCalled();
+  });
+
+  it("keeps a quick command's private reply in its public context thread", async () => {
+    const h = setup();
+    await h.deliver({ type: "APP_COMMAND", space: { name: "spaces/dm" }, user: { name: "users/42" },
+      message: { name: "spaces/dm/messages/public.public", text: "public context", threadReply: false,
+        thread: { name: privateRoot } },
+      appCommandMetadata: { appCommandId: 2, appCommandType: "QUICK_COMMAND" } });
+    expect(h.cancelChannel).toHaveBeenCalledExactlyOnceWith({ platform: "google-chat", id: "dm.pB-Jq3TxSfk", parentId: "dm" });
+    expect(h.messages).toEqual([expect.objectContaining({
+      thread: { name: privateRoot }, privateMessageViewer: { name: "users/42" },
+    })]);
+    expect(h.request.mock.calls.at(-1)![0]).toBe("pubsub");
   });
 
   it("does not ACK while a command is still committing its real core operation", async () => {

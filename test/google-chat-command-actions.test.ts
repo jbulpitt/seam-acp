@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { SessionRecord } from "../packages/core/src/core/types.js";
+import type { ConfigDescription } from "../packages/core/src/core/session-router.js";
 import type { ChannelRef } from "../packages/core/src/platforms/chat-adapter.js";
 import { executeGoogleChatCommand, type GoogleChatCommandDeps } from "../packages/core/src/platforms/google-chat/command-actions.js";
 import { parseGoogleChatCommand, type GoogleChatCommand } from "../packages/core/src/platforms/google-chat/commands.js";
@@ -44,12 +45,14 @@ function harness() {
   });
   const cancelChannel = vi.fn(async (_channel: ChannelRef) => cancelOutcome);
   const respond = vi.fn(async (_channel: ChannelRef, _text: string) => {});
+  const describeConfig = vi.fn(() => ({ agent: { value: "codex" }, model: { value: "pinned-model" } } as ConfigDescription));
+  const router = { ensureSessionRecord, describeConfig };
   const deps: GoogleChatCommandDeps = {
-    channelFor, createThread, router: { ensureSessionRecord },
+    channelFor, createThread, router,
     runtimeTransition: { applyAgentChange, applyModelChange },
     cancelChannel, respond, cwd: "/repo",
   };
-  return { deps, cancelOutcome, switchOutcome, newRecord, trace, channelFor, createThread, ensureSessionRecord, cancelChannel, applyAgentChange, applyModelChange, respond };
+  return { deps, cancelOutcome, switchOutcome, newRecord, trace, channelFor, createThread, ensureSessionRecord, describeConfig, cancelChannel, applyAgentChange, applyModelChange, respond };
 }
 
 describe("Google Chat command -> existing core operations", () => {
@@ -98,10 +101,17 @@ describe("Google Chat command -> existing core operations", () => {
     expect(h.createThread).not.toHaveBeenCalled();
   });
 
-  it("leaves empty model/agent validation to the existing switch operation", async () => {
+  it.each(["agent", "model"] as const)("shows /%s usage and resolved identity without attempting an empty switch", async kind => {
     const h = harness();
-    await executeGoogleChatCommand({ ...command, args: "" }, h.deps);
-    expect(h.applyModelChange).toHaveBeenCalledWith(channel, record, "", expect.any(Object), expect.any(Function));
+    const before = structuredClone(record);
+    await executeGoogleChatCommand({ ...command, command: kind, args: "" }, h.deps);
+    expect(h.applyAgentChange).not.toHaveBeenCalled();
+    expect(h.applyModelChange).not.toHaveBeenCalled();
+    expect(h.describeConfig).toHaveBeenCalledExactlyOnceWith(record);
+    expect(h.respond).toHaveBeenCalledExactlyOnceWith(channel,
+      `Usage: /${kind} <id> — current: ${kind === "agent" ? "codex" : "pinned-model"}`);
+    expect(record).toEqual(before);
+    expect(h.cancelChannel).not.toHaveBeenCalled();
   });
 
   it("preserves the core refusal and its response without claiming a successful switch", async () => {

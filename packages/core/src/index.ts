@@ -57,6 +57,9 @@ import { remoteSessionManager } from "./core/remote-session-manager.js";
 import { controllerQuotaProfiles } from "./core/quota/controller-profiles.js";
 import { discordRenderer } from "./platforms/discord/renderer.js";
 import { DiscordAdapter } from "./platforms/discord/adapter.js";
+import { GoogleChatAdapter } from "./platforms/google-chat/adapter.js";
+import { GoogleRestApi } from "./platforms/google-chat/api.js";
+import { multiplexChatAdapters } from "./platforms/google-chat/multiplex.js";
 import { Orchestrator } from "./platforms/discord/orchestrator.js";
 import { DEFAULT_THREAD_NAMER_CONFIG } from "./platforms/discord/thread-namer.js";
 import { buildGlobalMcpServers } from "./mcp.js";
@@ -469,6 +472,17 @@ async function main(): Promise<void> {
       await orchestrator.handleAutocompleteInteraction(interaction);
     },
   });
+  const googleChat = config.GOOGLE_CHAT_PROJECT_ID && config.GOOGLE_CHAT_SUBSCRIPTION && config.GOOGLE_CHAT_CREDENTIALS_FILE
+    ? new GoogleChatAdapter({
+      api: new GoogleRestApi(config.GOOGLE_CHAT_CREDENTIALS_FILE, config.GOOGLE_CHAT_PROJECT_ID),
+      subscription: config.GOOGLE_CHAT_SUBSCRIPTION,
+      allowedUserIds: config.GOOGLE_CHAT_ALLOWED_USER_IDS,
+      defaultCwd: config.GOOGLE_CHAT_DEFAULT_CWD ?? config.REPOS_ROOT,
+      logger: logger.child({ platform: "google-chat" }),
+    }) : undefined;
+  const chatAdapter = googleChat
+    ? multiplexChatAdapters([adapter, googleChat], id => store.getByChannelRef(id)?.platform ?? "discord")
+    : adapter;
 
   const serviceStatusEnabled = config.SERVICE_STATUS_ENABLED ?? Boolean(config.DISCORD_SERVICE_STATUS_THREAD_ID);
   if (serviceStatusEnabled) {
@@ -506,7 +520,7 @@ async function main(): Promise<void> {
     fences: plugins.fences,
     plugins,
     config,
-    adapter,
+    adapter: chatAdapter,
     router,
     store,
     renderer,
@@ -593,7 +607,7 @@ async function main(): Promise<void> {
   // exist. Router calls this when a session's policy is "ask".
   router.setAskUser((record, req, context) => orchestrator.requestPermission(record, req, context.requestId));
 
-  await adapter.start();
+  await chatAdapter.start();
   if (config.SEAM_TEST_DRIVER_KEY && config.SEAM_TEST_DRIVER_ACTOR_ID) {
     testInteractionHandle = makeTestInteractionHandler({
       key: config.SEAM_TEST_DRIVER_KEY,
@@ -877,7 +891,7 @@ async function main(): Promise<void> {
       dispatchResponderUserId: (caller) => orchestrator.dispatchResponderUserId(caller),
       resolveThread: (threadId) => store.getByChannelRef(threadId),
       getThreadLiveState: (threadId) =>
-        adapter.getThreadLiveState({ platform: store.getByChannelRef(threadId)?.platform ?? "discord", id: threadId }),
+        chatAdapter.getThreadLiveState!({ platform: store.getByChannelRef(threadId)?.platform ?? "discord", id: threadId }),
       configureThread: async (caller, target, input) => {
         const outcome = await threadSessionControl.configure(caller, target, input);
         if (!outcome.ok) return outcome;
@@ -986,7 +1000,7 @@ async function main(): Promise<void> {
           store.listSessionsByParent(platform, parentRef),
         describeConfig: (session) => router.describeConfig(session),
         isRuntimeBusy: (sessionId) => router.isBusy(sessionId),
-        adapter,
+        adapter: chatAdapter,
         inspectQueue: (channelRef) => orchestrator.inspectChannelQueue(channelRef),
         inspectWorkProgress: (channelRef, nowMs, queue) =>
           orchestrator.inspectThreadWorkProgress(channelRef, nowMs, queue),
@@ -1783,7 +1797,7 @@ async function main(): Promise<void> {
       // not really stop still reaches the store on the next message. Closing
       // the stores after an unfinished `adapter.stop()` would be exactly the
       // race this issue is about, on the one path admission does not cover.
-      if (await bounded("adapter stop", 5000, () => adapter.stop())) {
+      if (await bounded("adapter stop", 5000, () => chatAdapter.stop())) {
         try {
           modelMetadataStore.close();
         } catch {

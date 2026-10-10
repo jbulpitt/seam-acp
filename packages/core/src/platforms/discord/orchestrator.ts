@@ -2455,7 +2455,7 @@ export class Orchestrator {
       && !this.store.getByChannel(msg.channel.platform, channelId)) {
       try {
         this.router.previewSessionRecord({ platform: msg.channel.platform, channelRef: channelId,
-          ...(msg.channel.parentId ? { parentRef: msg.channel.parentId } : {}), cwd: this.config.REPOS_ROOT });
+          ...(msg.channel.parentId ? { parentRef: msg.channel.parentId } : {}), cwd: msg.cwd ?? this.config.REPOS_ROOT });
       } catch (error) {
         return this.reportDefaultAgentRefusal(msg, error);
       }
@@ -2487,7 +2487,7 @@ export class Orchestrator {
           platform: msg.channel.platform,
           channelRef: channelId,
           ...(msg.channel.parentId ? { parentRef: msg.channel.parentId } : {}),
-          cwd: this.config.REPOS_ROOT,
+          cwd: msg.cwd ?? this.config.REPOS_ROOT,
         });
       } catch (error) {
         return this.reportDefaultAgentRefusal(msg, error);
@@ -2504,6 +2504,7 @@ export class Orchestrator {
         attachments: msg.attachments ?? [],
         createdUtc: new Date().toISOString(),
       });
+      msg.onAdmitted?.();
       if (!admitted) {
         this.logger.info(
           { channelId, messageId: msg.messageId },
@@ -2541,7 +2542,7 @@ export class Orchestrator {
         platform: channel.platform,
         channelRef: channel.id,
         ...(channel.parentId ? { parentRef: channel.parentId } : {}),
-        cwd: this.config.REPOS_ROOT,
+        cwd: msg.cwd ?? this.config.REPOS_ROOT,
       });
       // `channelQueues.has()` answers "does this channel hold an unresolved
       // queue link", which stays true through the whole POST-TURN TAIL —
@@ -3576,7 +3577,7 @@ export class Orchestrator {
     // / handoffs / steer synthesize an IncomingMessage and enter HERE, so they
     // still run in a detached thread. Do not treat detach as a full mute.
     const channel = msg.channel;
-    const record = await this.bindThreadRecord(channel);
+    const record = await this.bindThreadRecord(channel, msg.cwd ?? this.config.REPOS_ROOT);
     const admission = msg.messageId ? this.store.getInbound(msg.messageId) : null;
     let humanAttempt: TurnAttempt | undefined = scheduledAttempt;
     let humanOutcomeOwned = false;
@@ -7764,7 +7765,7 @@ export class Orchestrator {
       platform: channel.platform,
       channelRef: channel.id,
       ...(channel.parentId ? { parentRef: channel.parentId } : {}),
-      cwd: this.config.REPOS_ROOT,
+      cwd: msg.cwd ?? this.config.REPOS_ROOT,
     });
     if (!body) {
       this.logger.debug({ channelId: channel.id, sessionId: record.id }, "mid-turn reply had no text; nothing to queue");
@@ -7772,6 +7773,7 @@ export class Orchestrator {
     }
     const from = humanInboxFrom(msg.authorName, msg.authorId);
     const { queued } = this.pushHumanInbox(record, from, body);
+    msg.onAdmitted?.();
     this.logger.info(
       { channelId: channel.id, sessionId: record.id, from, queued },
       "mid-turn reply routed to inbox (cooperative)"
@@ -7930,6 +7932,7 @@ export class Orchestrator {
     if (!this.wouldParkForOfflineBridge(msg)) return false;
     const location = resolveThreadLocation(this.config, msg.channel.id);
     await this.parkUserPrompt(msg, location, inboundAdmissionId);
+    msg.onAdmitted?.();
     // Race: the host came ready while we staged. Fire now rather than waiting
     // for the next hello (which may be hours away).
     if (this.bridgeHub?.isBridgeReady(location)) {
@@ -13408,6 +13411,8 @@ export class Orchestrator {
   ): Promise<{ attachments: MessageAttachment[]; rejected: RejectedAttachment[] }> {
     const STAGE_MAX = 100 * 1024 * 1024;
     const results = await Promise.all(attachments.map(async (a) => {
+      // A multiplexer exposes other platforms' downloader; public URLs stay unchanged.
+      if (!a.platform && /^(https?:|data:)/.test(a.url)) return { attachment: a };
       if (a.size > STAGE_MAX) {
         return { rejected: { filename: a.filename, reason: `too large to download (${a.size} B)` } };
       }

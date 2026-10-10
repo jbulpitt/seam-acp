@@ -2448,9 +2448,11 @@ export class SeamMcpServer {
       }
     }
 
+    const historyPlatform = target.record.platform === "discord" ? "Discord"
+      : target.record.platform === "google-chat" ? "Google Chat" : target.record.platform;
     if (!outcome && rebuilt) {
       return textResult([
-        `✅ Thread ${target.record.channelRef} rebuilt from Discord:`,
+        `✅ Thread ${target.record.channelRef} rebuilt from ${historyPlatform}:`,
         `• Session: ${rebuilt.newSessionId}`,
         `• Destination: ${rebuilt.agent} · ${rebuilt.model} · window ${rebuilt.contextWindow}`,
         `• Binding: ${rebuilt.attached ? "attached" : "left unchanged"} (${rebuilt.attachmentReason})`,
@@ -2491,7 +2493,7 @@ export class SeamMcpServer {
       ...outcome.warnings.map((warning) => `⚠️ ${warning}`),
       ...(rebuilt
         ? [
-            "• Rebuild: deterministic Discord reconstruction complete",
+            `• Rebuild: deterministic ${historyPlatform} reconstruction complete`,
             `• Rebuilt session: ${rebuilt.newSessionId}`,
             `• Rebuild destination: ${rebuilt.agent} · ${rebuilt.model} · window ${rebuilt.contextWindow}`,
             `• Rebuild binding: ${rebuilt.attached ? "attached" : "left unchanged"} (${rebuilt.attachmentReason})`,

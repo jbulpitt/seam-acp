@@ -49,6 +49,10 @@ slice does not add permission cards or change the platform default.
   DMs are unaffected. This applies in addition to the user allowlist.
 - `GOOGLE_CHAT_DEFAULT_CWD`: optional working directory; defaults to
   `REPOS_ROOT`.
+- `GOOGLE_CHAT_DEFAULT_LOCATION`: bridge id for new sessions; defaults to
+  `local`. The cwd is on that host, not the controller. New sessions seed
+  these defaults through the normal thread overlay; existing bindings stay
+  unchanged. `/agent codex@host` uses the same host selector as Discord.
 
 The adapter starts when the project, subscription and credentials file are
 configured. Use one controller consumer per subscription. Apply controller

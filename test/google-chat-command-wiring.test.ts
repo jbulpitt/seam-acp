@@ -47,7 +47,8 @@ function setup(rejectPrivateRoot = false) {
   });
   const cancelChannel = vi.fn(async () => ({ parked: null, cancelled: { cancelled: true, starting: false },
     outcome: "idle", queue: { state: "idle", queued: 0 } }));
-  (adapter as any).setCommandDeps?.({ store, router: { ensureSessionRecord, describeConfig },
+  (adapter as any).setCommandDeps?.({ store, router: { ensureSessionRecord, describeConfig, bindRecordLocation: () => "local" },
+    mutation: { readThreadPresetEntry: () => undefined, applyThreadOverlay: () => ({ ok: true }) },
     runtimeTransition: { applyAgentChange, applyModelChange }, cancelChannel });
   const transport = new PubSubPullTransport({ api: { request }, subscription: "projects/test/subscriptions/events", logger,
     receive: (...args: any[]) => (adapter.receiveEvent as any)(...args) });

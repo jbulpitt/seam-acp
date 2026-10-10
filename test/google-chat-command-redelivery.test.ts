@@ -43,7 +43,9 @@ function setup(db = ":memory:") {
   const cancelChannel = vi.fn(async () => ({ parked: null, cancelled: { cancelled: true, starting: false },
     outcome: "idle", queue: { state: "idle", queued: 0 } }));
   adapter.setCommandDeps({ store, router: { ensureSessionRecord,
+    bindRecordLocation: () => "local",
     describeConfig: () => ({ agent: { value: "claude" }, model: { value: "claude-default" } }) },
+    mutation: { readThreadPresetEntry: () => undefined, applyThreadOverlay: () => ({ ok: true }) },
     runtimeTransition: { applyAgentChange, applyModelChange }, cancelChannel } as any);
   const transport = new PubSubPullTransport({ api: { request }, logger, subscription: "projects/test/subscriptions/events",
     receive: (...args) => adapter.receiveEvent(...args) });

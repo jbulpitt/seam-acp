@@ -46,9 +46,11 @@ function harness() {
   const cancelChannel = vi.fn(async (_channel: ChannelRef) => cancelOutcome);
   const respond = vi.fn(async (_channel: ChannelRef, _text: string) => {});
   const describeConfig = vi.fn(() => ({ agent: { value: "codex" }, model: { value: "pinned-model" } } as ConfigDescription));
-  const router = { ensureSessionRecord, describeConfig };
+  const router = { ensureSessionRecord, describeConfig, bindRecordLocation: vi.fn(() => "local") };
   const deps: GoogleChatCommandDeps = {
-    channelFor, createThread, router,
+    channelFor, createThread, router, store: { getByChannel: () => null },
+    mutation: { readThreadPresetEntry: () => undefined,
+      applyThreadOverlay: vi.fn(() => ({ ok: true as const, message: "Applied", auditId: "fixture" })) },
     runtimeTransition: { applyAgentChange, applyModelChange },
     cancelChannel, respond, cwd: "/repo",
   };

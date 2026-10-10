@@ -111,7 +111,7 @@ describe("platform-aware persisted thread overlays", () => {
       }));
       const adapter = new GoogleChatAdapter({ api: { request }, logger, subscription: "projects/test/subscriptions/events",
         defaultCwd: dir, allowedUserIds: new Set(["users/42"]), writeIntervalMs: 0 });
-      adapter.setCommandDeps({ store: h.store, router: h.router, runtimeTransition: h.runtime, cancelChannel: vi.fn() } as any);
+      adapter.setCommandDeps({ store: h.store, router: h.router, mutation: h.mutation, runtimeTransition: h.runtime, cancelChannel: vi.fn() } as any);
       await adapter.receiveEvent({ type: "MESSAGE", space: { name: `spaces/${chat.parentId}` },
         user: { name: "users/42", displayName: "Tester" }, message: {
           name: `spaces/${chat.parentId}/messages/bare-${commandId}`, text: `/${command}`, argumentText: null,
@@ -149,7 +149,7 @@ describe("platform-aware persisted thread overlays", () => {
     }));
     const adapter = new GoogleChatAdapter({ api: { request }, logger, subscription: "projects/test/subscriptions/events",
       defaultCwd: dir, allowedUserIds: new Set(["users/42"]), writeIntervalMs: 0 });
-    adapter.setCommandDeps({ store: h.store, router: h.router, runtimeTransition: h.runtime, cancelChannel: vi.fn() } as any);
+    adapter.setCommandDeps({ store: h.store, router: h.router, mutation: h.mutation, runtimeTransition: h.runtime, cancelChannel: vi.fn() } as any);
     const normal = vi.fn(); adapter.onMessage(normal);
     const deliver = async (commandId: number, text: string) => {
       const event = { type: "MESSAGE", space: { name: `spaces/${chat.parentId}` },
@@ -187,7 +187,7 @@ describe("platform-aware persisted thread overlays", () => {
     const request = vi.fn(async (_scope: string, _req: any): Promise<any> => { throw cause; });
     const adapter = new GoogleChatAdapter({ api: { request }, logger, subscription: "projects/test/subscriptions/events",
       defaultCwd: dir, allowedUserIds: new Set(["users/42"]), writeIntervalMs: 0 });
-    adapter.setCommandDeps({ store: h.store, router: h.router, runtimeTransition: h.runtime, cancelChannel: vi.fn() } as any);
+    adapter.setCommandDeps({ store: h.store, router: h.router, mutation: h.mutation, runtimeTransition: h.runtime, cancelChannel: vi.fn() } as any);
     await adapter.receiveEvent({ type: "MESSAGE", space: { name: `spaces/${chat.parentId}` },
       user: { name: "users/42", displayName: "Tester" }, message: {
         name: `spaces/${chat.parentId}/messages/model-reply-fails`, text: "/model claude-reviewed",

@@ -481,6 +481,7 @@ async function main(): Promise<void> {
       allowedUserIds: config.GOOGLE_CHAT_ALLOWED_USER_IDS,
       allowedSpaceIds: config.GOOGLE_CHAT_ALLOWED_SPACE_IDS,
       defaultCwd: config.GOOGLE_CHAT_DEFAULT_CWD ?? config.REPOS_ROOT,
+      defaultLocation: config.GOOGLE_CHAT_DEFAULT_LOCATION,
       driveUploader: (() => {
         const drive = loadGoogleDriveUploadConfig({
           GOOGLE_CHAT_CREDENTIALS_FILE: config.GOOGLE_CHAT_CREDENTIALS_FILE,
@@ -540,7 +541,7 @@ async function main(): Promise<void> {
     refreshModelIntelligence: (forceSources) => modelIntelligenceManager.refresh({ forceSources }),
   });
 
-  googleChat?.setCommandDeps({ store, router, runtimeTransition: orchestrator.getRuntimeTransition(),
+  googleChat?.setCommandDeps({ store, router, mutation: orchestrator.getConfigMutation(), runtimeTransition: orchestrator.getRuntimeTransition(),
     cancelChannel: channel => orchestrator.cancelChannel(channel) });
   await orchestrator.loadPlugins();
   orchestrator.install();

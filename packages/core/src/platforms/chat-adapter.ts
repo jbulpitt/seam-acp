@@ -172,6 +172,9 @@ export interface ChatAdapter {
    */
   downloadAttachment?(attachment: MessageAttachment): Promise<Buffer>;
 
+  /** Optional: whether a non-Discord platform's user may use Seam. Absent = refused. */
+  isAllowedUser?(platform: string, userId: string): boolean;
+
   /** Optional: this application's bot user id, used to identify Seam assistant posts. */
   getBotUserId?(): string | undefined;
 

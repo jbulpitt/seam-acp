@@ -456,7 +456,7 @@ export function isChoiceAuthoringRefused(
 export function choiceClickRefusal(
   userId: string,
   card: Pick<ChoiceCard, "targetUserId" | "status">,
-  allowedUserIds: ReadonlySet<string>
+  allowedUserIds: Pick<ReadonlySet<string>, "has">
 ): "ok" | "not-allowed" | "not-target" | "closed" {
   if (card.status !== "open") return "closed";
   if (!allowedUserIds.has(userId)) return "not-allowed";

@@ -2030,6 +2030,12 @@ export class Orchestrator {
     }
   }
 
+  /** Discord uses its env allowlist; another platform's adapter decides. Unknown fails closed. */
+  private userAllowed(platform: string, userId: string): boolean {
+    if (platform === PLATFORM) return this.config.DISCORD_ALLOWED_USER_IDS.has(userId);
+    return this.adapter.isAllowedUser?.(platform, userId) ?? false;
+  }
+
   /** Session for a bare channel ref on any platform. */
   private recordForChannel(channelRef: string): SessionRecord | null {
     return this.store.getByChannelRef(channelRef);
@@ -19182,7 +19188,7 @@ export class Orchestrator {
     }
     const reqPath = (fence.content.split("\n").find((l) => l.trim()) ?? "").trim();
     if (!reqPath) return;
-    const record = this.store.getByChannel(PLATFORM, channel.id);
+    const record = this.store.getByChannel(channel.platform, channel.id);
     if (record && this.bridgeHub) {
       try {
         const cwd = opts.preferredRoot ?? this.effectiveCwd(record);
@@ -19270,7 +19276,7 @@ export class Orchestrator {
    * validation failure, post a short note rather than rendering raw JSON.
    */
   private async emitWakeFence(channel: ChannelRef, fence: CompletedFence): Promise<void> {
-    const record = this.store.getByChannel(PLATFORM, channel.id);
+    const record = this.store.getByChannel(channel.platform, channel.id);
     if (!record) {
       await this.adapter
         .sendMessage(channel, "_(Couldn't schedule a wake — this thread has no bound session.)_")
@@ -19698,7 +19704,7 @@ export class Orchestrator {
     };
     this.store.insertChoiceCard(card);
     const channel: ChannelRef = {
-      platform: PLATFORM,
+      platform: record.platform,
       id: record.channelRef,
       ...(record.parentRef ? { parentId: record.parentRef } : {}),
     };
@@ -19728,7 +19734,7 @@ export class Orchestrator {
   }
 
   private async emitChoiceFence(channel: ChannelRef, fence: CompletedFence, turnOrigin?: DispatchSpec): Promise<void> {
-    const record = this.store.getByChannel(PLATFORM, channel.id);
+    const record = this.store.getByChannel(channel.platform, channel.id);
     const refusal = agentChoiceRefusal(turnOrigin ?? (record ? this.choiceTurnOrigin(record) : undefined));
     if (refusal) {
       await this.adapter.sendMessage(channel, agentChoiceQuestion(fence.content, refusal));
@@ -19780,7 +19786,7 @@ export class Orchestrator {
         .catch(() => {});
       return;
     }
-    const record = this.store.getByChannel(PLATFORM, channel.id);
+    const record = this.store.getByChannel(channel.platform, channel.id);
     const submitted = record
       ? this.choiceResults.submitFromSession(record.id, parsed.value)
       : { ok: false as const, error: "no session" };
@@ -19808,7 +19814,7 @@ export class Orchestrator {
       : !parked && attempt ? "⏳ Waiting…" : undefined;
     try {
       await this.adapter.editChoiceCard(
-        { channel: { platform: PLATFORM, id: card.channelRef }, id: card.messageId },
+        { channel: { platform: card.platform, id: card.channelRef }, id: card.messageId },
         {
           panel: renderChoicePanel(card, statusLabel),
           choiceId: card.id,
@@ -19825,7 +19831,8 @@ export class Orchestrator {
   }
 
   private async retireParkedTurnCards(attemptId: string): Promise<void> {
-    for (const card of this.store.listOpenChoiceCards(PLATFORM)) {
+    const target = this.store.turnAttempts.get(attemptId)?.spec.target;
+    for (const card of this.store.listOpenChoiceCards(target ? this.platformForChannel(target) : PLATFORM)) {
       if (card.options.some(option => parkedTurnAction(option.payload)?.attemptId === attemptId)
         && this.store.cancelChoiceCard(card.id, card.channelRef)) {
         await this.refreshChoiceCard(this.store.getChoiceCard(card.id)!);
@@ -19859,7 +19866,8 @@ export class Orchestrator {
     body = [...this.parkedAttemptContext(attempt, channelRef), body].join("\n");
     const current = (await this.collectInterruptedRows(attempt.spec.target)).find(item => item.id === attempt.id);
     const actions = current ? interruptedRowActions(current) : [];
-    const notices = this.store.listOpenChoiceCards(PLATFORM, channelRef).filter(card =>
+    const platform = this.platformForChannel(channelRef);
+    const notices = this.store.listOpenChoiceCards(platform, channelRef).filter(card =>
       card.options.some(option => parkedTurnAction(option.payload)?.attemptId === attempt.id));
     if (actions.length === 1 && actions[0] === "cancel" && !isAwaitingReauth(attempt.stalledReason)) {
       const cause = [attempt.stalledReason, current?.resumeRefusal].filter((value, index, values) => value && values.indexOf(value) === index).join("; ");
@@ -19871,11 +19879,11 @@ export class Orchestrator {
         await this.dispatchWatcher?.publishAdoptedResult(attempt.id, cancelled.outcome!);
         if (isolatedIngest) {
           await this.replayCompletedDispatch(cancelled.outcome!, { action: "terminalize" });
-          if (notifyThread) await this.adapter.sendMessage({ platform: PLATFORM, id: notifyThread }, message);
+          if (notifyThread) await this.adapter.sendMessage({ platform: this.platformForChannel(notifyThread), id: notifyThread }, message);
         } else if (channelRef !== attempt.spec.target) {
           await this.replayCompletedDispatch(cancelled.outcome!, { action: "report_back", returnTo: channelRef });
         } else {
-          await this.adapter.sendMessage({ platform: PLATFORM, id: channelRef }, message);
+          await this.adapter.sendMessage({ platform, id: channelRef }, message);
           this.store.updateDelegationStatus(attempt.id, "failed");
         }
       } else {
@@ -19883,7 +19891,7 @@ export class Orchestrator {
         if (attempt.source === "schedule") this.store.scheduledOccurrences.settle(attempt.id);
         await finishLiveTurn(this.config.DATA_DIR, { id: attempt.id, status: "cancelled",
           channelRef: attempt.spec.target, finishedUtc: new Date().toISOString(), reason: message });
-        await this.adapter.sendMessage({ platform: PLATFORM, id: channelRef }, message);
+        await this.adapter.sendMessage({ platform, id: channelRef }, message);
       }
       return;
     }
@@ -19895,7 +19903,7 @@ export class Orchestrator {
     }
     if (!this.adapter.sendChoiceCard || !actions.length || isAwaitingReauth(attempt.stalledReason)) {
       if (attempt.stallNoticeUtc) return;
-      const { id: messageId, ...ref } = await this.adapter.sendMessage({ platform: PLATFORM, id: channelRef }, body);
+      const { id: messageId, ...ref } = await this.adapter.sendMessage({ platform, id: channelRef }, body);
       return { ...ref, messageId };
     }
     const spec = parkedTurnChoiceSpec(attempt.id, body, {
@@ -19907,7 +19915,7 @@ export class Orchestrator {
         && option.payload === spec.options[index]!.payload
         && option.label.startsWith(actions[index] === "resume" ? "Resume " : "Cancel ")))) return;
     await this.retireParkedTurnCards(attempt.id);
-    const record = await this.bindThreadRecord({ platform: PLATFORM, id: channelRef });
+    const record = await this.bindThreadRecord({ platform, id: channelRef });
     const posted = await this.publishChoiceCard(record, spec);
     if (!posted.ok) throw new Error(posted.error);
     return posted;
@@ -19942,7 +19950,8 @@ export class Orchestrator {
   /** Choice card for a parked re-auth. Not an elicitation row. */
   private async postReauthCard(channelRef: string, attemptId: string, park: ReauthPark, cause?: string): Promise<(MessageLink & { messageId: string }) | undefined> {
     try {
-      const record = await this.bindThreadRecord({ platform: PLATFORM, id: channelRef });
+      const platform = this.platformForChannel(channelRef);
+      const record = await this.bindThreadRecord({ platform, id: channelRef });
       const attempt = this.store.turnAttempts.get(attemptId);
       const resolved = this.router.describeConfig(record);
       const location = attempt?.spec.location ?? resolved.location.value;
@@ -19952,7 +19961,7 @@ export class Orchestrator {
         cause,
         promptStarted: attempt?.promptStarted === true,
       };
-      await this.adapter.sendMessage({ platform: PLATFORM, id: channelRef }, reauthWaitNotice(park, context))
+      await this.adapter.sendMessage({ platform, id: channelRef }, reauthWaitNotice(park, context))
         .then(() => this.store.turnAttempts.markStallNoticeDelivered(attemptId))
         .catch(err => this.logger.warn({ err, attemptId }, "reauth wait notice failed"));
       if (!this.adapter.sendChoiceCard) return;
@@ -20054,7 +20063,7 @@ export class Orchestrator {
       await evt.replyEphemeral("This card is no longer available.");
       return;
     }
-    const auth = choiceClickRefusal(evt.userId, card, this.config.DISCORD_ALLOWED_USER_IDS);
+    const auth = choiceClickRefusal(evt.userId, card, { has: (id) => this.userAllowed(card.platform, id) });
     if (auth === "not-allowed") {
       await evt.replyEphemeral("This bot is not available to you.");
       return;
@@ -20146,7 +20155,7 @@ export class Orchestrator {
       return;
     }
     try {
-      const authoringSession = this.store.getByChannel(PLATFORM, card.channelRef);
+      const authoringSession = this.store.getByChannel(card.platform, card.channelRef);
       const emitted = await emitChoice({
         card: claimed.card,
         optionIndex,
@@ -20196,7 +20205,7 @@ export class Orchestrator {
       return;
     }
     const destLive = await this.choiceTargetLive(card, card.defaultTarget ?? { type: "live" });
-    const authoringSession = this.store.getByChannel(PLATFORM, card.channelRef);
+    const authoringSession = this.store.getByChannel(card.platform, card.channelRef);
     const planned = planChoiceMultiDispatch({
       card,
       optionIndices: indices,
@@ -20213,7 +20222,7 @@ export class Orchestrator {
     }
     const target = card.defaultTarget ?? { type: "live" };
     if (target.type === "thread" && target.threadId) {
-      const dest = this.store.getByChannel(PLATFORM, target.threadId);
+      const dest = this.store.getByChannel(card.platform, target.threadId);
       if (!dest) {
         await evt.replyEphemeral("Unknown destination thread.");
         return;
@@ -20267,7 +20276,7 @@ export class Orchestrator {
     payload: string,
     destLive: "ok" | "gone" | "archived"
   ): Promise<{ ok: true } | { ok: false; error: string }> {
-    const authoringSession = this.store.getByChannel(PLATFORM, card.channelRef);
+    const authoringSession = this.store.getByChannel(card.platform, card.channelRef);
     const planned = planChoiceDispatch({
       card,
       optionIndex,
@@ -20283,7 +20292,7 @@ export class Orchestrator {
     const option = card.options[optionIndex]!;
     const target = resolveOptionTarget(card, option);
     if (target.type === "thread" && target.threadId) {
-      const dest = this.store.getByChannel(PLATFORM, target.threadId);
+      const dest = this.store.getByChannel(card.platform, target.threadId);
       if (!dest) return { ok: false, error: "Unknown destination thread." };
     }
     return { ok: true };
@@ -20305,7 +20314,7 @@ export class Orchestrator {
     const destId = target.type === "thread" && target.threadId ? target.threadId : card.channelRef;
     if (!this.adapter.getThreadLiveState) return "ok";
     try {
-      const live = await this.adapter.getThreadLiveState({ platform: PLATFORM, id: destId });
+      const live = await this.adapter.getThreadLiveState({ platform: this.platformForChannel(destId), id: destId });
       if (live === undefined) return "gone";
       if (live.archived) return "archived";
       return "ok";
@@ -20323,7 +20332,7 @@ export class Orchestrator {
    * any parse/validation failure, post a short note rather than raw JSON.
    */
   private async emitWatchFence(channel: ChannelRef, fence: CompletedFence): Promise<void> {
-    const record = this.store.getByChannel(PLATFORM, channel.id);
+    const record = this.store.getByChannel(channel.platform, channel.id);
     if (!record) {
       await this.adapter
         .sendMessage(channel, "_(Couldn't register a watch — this thread has no bound session.)_")

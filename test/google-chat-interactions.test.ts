@@ -49,7 +49,8 @@ describe("Google Chat clicks through the adapter and Pub/Sub", () => {
       messageId: "spaces/dm/messages/card", title: "Continue?", body: null, maxClicks: 1, targetUserId: "42",
       defaultTarget: { type: "live" }, options: [{ label: "Continue", kind: "prompt", payload: "Exact chosen prompt" }],
       clickCount: 0, status: "open", lastClickerId: null, lastClickerName: null, lastOptionIndex: null,
-      createdBy: record.id, createdUtc: now });
+      createdBy: record.id, createdUtc: now, ingestTokenHash: null, ingestOptionIndex: null,
+      resultSchema: null, ingestWrapper: null, ingestCors: null });
     const router = testSessionRouter({ listProfiles: () => [],
       describeConfig: () => ({ agent: { value: "codex" }, model: { value: "test" }, effort: { value: null },
         cwd: { value: dir }, location: { value: "local" }, role: { value: null }, fastMode: { value: false },

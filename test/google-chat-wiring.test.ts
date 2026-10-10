@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { pino } from "pino";
+import { tmpdir } from "node:os";
 import { GoogleChatAdapter } from "../packages/core/src/platforms/google-chat/adapter.js";
 import { multiplexChatAdapters } from "../packages/core/src/platforms/google-chat/multiplex.js";
 import { GoogleDriveUploader } from "../packages/core/src/core/files/google-drive-upload.js";
@@ -178,7 +179,7 @@ describe("Google Chat merged surface wiring", () => {
   });
 
   it("loads the existing uploader's destination and policy explicitly without ambient settings", () => {
-    const config = loadConfig({ env: { DISCORD_BOT_TOKEN: "fake", DISCORD_ALLOWED_USER_IDS: "42", REPOS_ROOT: "/projects",
+    const config = loadConfig({ env: { DISCORD_BOT_TOKEN: "fake", DISCORD_ALLOWED_USER_IDS: "42", REPOS_ROOT: tmpdir(),
       GOOGLE_CHAT_DRIVE_FOLDER_ID: "shared-folder", GOOGLE_CHAT_DRIVE_SHARING_POLICY: "domain-readable",
       GOOGLE_CHAT_DRIVE_DOMAIN: "example.com" } }) as any;
     expect(config.GOOGLE_CHAT_DRIVE_FOLDER_ID).toBe("shared-folder");

@@ -1170,9 +1170,14 @@ export function createConfigFacades(environment: ConfigFacadeEnvironment): { pla
     store: environment.store, router: environment.router, mutation,
     modelCatalog: environment.modelCatalog,
     identityCommitted: environment.identityCommitted,
-  }, { ...environment, mutation });
+  }, { ...environment, mutation,
+    // Platforms can cache facades before the bridge hub is wired.
+    get bridgeHub() { return environment.bridgeHub; },
+  });
   return {
     runtime,
-    plan: new ConfigApplyPlan({ store: environment.store, mutation: environment.mutation }, { ...environment, runtime }),
+    plan: new ConfigApplyPlan({ store: environment.store, mutation: environment.mutation }, { ...environment, runtime,
+      get bridgeHub() { return environment.bridgeHub; },
+    }),
   };
 }

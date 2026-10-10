@@ -7290,10 +7290,12 @@ export class Orchestrator {
   }
 
   /** Exposed so index.ts can wire BridgeHub audit writes without growing this file. */
-  getConfigApplyPlan(): ConfigApplyPlan { return createConfigFacades({
+  getConfigApplyPlan(): ConfigApplyPlan {
+    const orchestrator = this;
+    return createConfigFacades({
       store: this.store, router: this.router, mutation: this.configMutation,
       config: this.config, modelCatalog: this.modelCatalog, logger: this.logger,
-      bridgeHub: this.bridgeHub,
+      get bridgeHub() { return orchestrator.bridgeHub; },
       identityCommitted: (id?: string) => this.identityEffects.flush(id),
       persistConfig: (record: SessionRecord, cfg: SessionConfigState) => this.persistConfig(record, cfg),
       repoDisplay: (repo: string | null) => this.repoDisplay(repo),
@@ -7301,10 +7303,12 @@ export class Orchestrator {
       resolveRequestedRepoPath: (channel: ChannelRef, requested: string, location: string) => this.resolveRequestedRepoPath(channel, requested, location),
     }).plan; }
 
-  getRuntimeTransition(): RuntimeTransition { return createConfigFacades({
+  getRuntimeTransition(): RuntimeTransition {
+    const orchestrator = this;
+    return createConfigFacades({
       store: this.store, router: this.router, mutation: this.configMutation,
       config: this.config, modelCatalog: this.modelCatalog, logger: this.logger,
-      bridgeHub: this.bridgeHub,
+      get bridgeHub() { return orchestrator.bridgeHub; },
       identityCommitted: (id?: string) => this.identityEffects.flush(id),
       persistConfig: (record: SessionRecord, cfg: SessionConfigState) => this.persistConfig(record, cfg),
       repoDisplay: (repo: string | null) => this.repoDisplay(repo),

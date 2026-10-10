@@ -31,7 +31,7 @@ export async function executeGoogleChatCommand(
 ): Promise<GoogleChatCommandResult> {
   if (command.command === "new") {
     const parent = deps.channelFor(command.space, null);
-    const channel = await deps.createThread(parent, command.args || "seam");
+    const channel = await deps.createThread(parent, command.args ? `**${command.args}**` : "seam");
     const record = bind(channel, deps);
     return { command: "new", channel, record };
   }

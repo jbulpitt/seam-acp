@@ -11,7 +11,6 @@ export function controllerQuotaProfiles(config: Config, logger: Logger) {
     ...config.COPILOT_PROFILES.map(p => ({ id: `copilot-${p.id}`, displayName: `GitHub Copilot (${p.id})`, configDir: p.configDir })),
     { id: "claude", displayName: "Anthropic Claude" },
     ...config.CLAUDE_PROFILES.map(p => ({ id: `claude-${p.id}`, displayName: `Anthropic Claude (${p.id})`, configDir: p.configDir })),
-    ...(config.CLAUDE_VERTEX_PROJECT_ID ? [{ id: "claude-vertex", displayName: "Claude (Vertex AI)", brand: "vertex" }] : []),
     ...(config.GROK_ENABLED ? [{ id: "grok", displayName: "xAI Grok" }] : []),
     ...(config.ZAI_ENABLED && config.ZAI_API_KEY ? [{ id: "zai", displayName: "Z.ai (Zhipu GLM)", brand: "z-ai" }] : []),
     ...(shouldRegisterOllamaCloud(config) ? [{ id: "ollama-cloud", displayName: "Ollama Cloud" }] : []),

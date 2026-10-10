@@ -225,6 +225,44 @@ takes no thread id: the seam session token is the sole target authority.
 
 ---
 
+## Vertex-backed Claude agents
+
+Configure these in the execution host's `~/.config/seam/bridge.env`, not the
+controller's `.env`. The bridge uses the same `claude-agent-acp` executable as
+subscription Claude (`CLAUDE_CLI_PATH` or PATH):
+
+```dotenv
+CLAUDE_VERTEX_AGENT_ID=claude-vertex
+CLAUDE_VERTEX_DISPLAY_NAME="Claude (Vertex AI)"
+CLAUDE_VERTEX_PROJECT_ID=your-gcp-project
+CLAUDE_VERTEX_REGION=global
+CLAUDE_VERTEX_CREDENTIALS_FILE=/absolute/path/to/service-account.json
+CLAUDE_VERTEX_CONFIG_DIR=/absolute/path/to/separate-claude-config
+CLAUDE_VERTEX_MODELS=claude-opus-5-5:Opus 5.5,claude-sonnet-5-5:Sonnet 5.5,claude-haiku-5-5:Haiku 5.5
+CLAUDE_VERTEX_DEFAULT_MODEL=claude-sonnet-5-5
+```
+
+Project, credentials file and a config directory separate from subscription
+Claude are required. Partial configuration reports `configuration_incomplete`
+with the missing keys; unrelated agents remain available. The other keys are
+optional and default to the values above. The project must enable the API and
+each desired model, and the service account needs `roles/aiplatform.user`.
+See [Claude Code's Vertex setup](https://code.claude.com/docs/en/google-vertex-ai).
+
+The bridge advertises this agent, its `vertex` brand and its own model manifest
+to the controller. The child receives `CLAUDE_CODE_USE_VERTEX=1`,
+`ANTHROPIC_VERTEX_PROJECT_ID`, `CLOUD_ML_REGION`,
+`GOOGLE_APPLICATION_CREDENTIALS` and its separate `CLAUDE_CONFIG_DIR`;
+`ANTHROPIC_API_KEY` is removed only from this child's environment. The selected
+model is pinned via `ANTHROPIC_MODEL`; effort uses the existing Claude `_meta`
+path. History and served-model reads use the separate config directory.
+
+`agent_quota` reports unknown Vertex quota with null usage/reset values: GCP
+project limits and billing are not subscription Claude quota. Fast mode is not
+offered. The manifest does not borrow direct-Anthropic context-window evidence;
+verify each model on the real host from assistant JSONL `message.model` and
+top-level `effort`, following the [model runbook](../model-management-runbook.md).
+
 ## Related, FYI
 
 - The Artificial Analysis benchmark data is also exposed as its own MCP server

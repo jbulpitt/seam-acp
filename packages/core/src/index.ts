@@ -529,11 +529,17 @@ async function main(): Promise<void> {
     const usage = createUsageProviderPort({ profiles: quotaProfiles.profiles, agyRuntime: quotaProfiles.agyRuntime, grokCliPath: config.GROK_CLI_PATH,
       ollamaUsageCliPath: config.OLLAMA_USAGE_CLI_PATH, ollamaCloudEnabled: config.OLLAMA_CLOUD_ENABLED,
       liveRequest: id => { const runtime = router.getRuntime(id); return runtime ? (method, params) => runtime.request(method, params) : undefined; } });
-    return createQuotaPlugin({ usage, bindings: usage.bindings, resolve: (threadId, parentId) => {
+    return createQuotaPlugin({ usage, bindings: usage.bindings,
+      agents: () => (bridgeHub?.listConnected() ?? []).flatMap(bridge => [...bridge.agents].map(([id, info]) => ({
+        id, displayName: info.metadata?.displayName ?? id, brand: info.metadata?.brand,
+      }))),
+      resolve: (threadId, parentId) => {
       if (!parentId) return undefined;
       const record = router.ensureSessionRecord({ platform: "discord", channelRef: threadId, parentRef: parentId, cwd: config.REPOS_ROOT });
       const resolved = router.describeConfig(record);
-      return usage.binding(resolved.agent.value, record.id, resolved.location.value);
+      const binding = usage.binding(resolved.agent.value, record.id, resolved.location.value);
+      return router.getProfile(binding.agentId, binding.location)?.brand === "vertex"
+        ? { ...binding, provider: null, quotaAvailable: false } : binding;
     }, card: { sendLayout: adapter.sendLayout.bind(adapter), editLayout: adapter.editLayout.bind(adapter),
       sendPanel: adapter.sendPanel.bind(adapter), editPanel: adapter.editPanel.bind(adapter),
       pinMessage: adapter.pinMessage.bind(adapter), deleteMessage: adapter.deleteMessage.bind(adapter), bumpThread: adapter.bumpThread.bind(adapter) } });

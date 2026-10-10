@@ -298,7 +298,11 @@ export function makeClaudeProfile(opts: {
     // model env vars so the adapter sends the right model to the backend.
     // setModel() (ACP config option) is rejected by claude-agent-acp for
     // non-Claude model IDs, so this is the only way to switch models.
-    if (modelOverride && opts.extraEnv?.ANTHROPIC_BASE_URL) {
+    if (opts.extraEnv?.CLAUDE_CODE_USE_VERTEX === "1") {
+      // Pin Vertex's primary model even when no override was supplied. Its
+      // built-in aliases can resolve to models this project has not enabled.
+      env.ANTHROPIC_MODEL = modelOverride || opts.defaultModel;
+    } else if (modelOverride && opts.extraEnv?.ANTHROPIC_BASE_URL) {
       env.ANTHROPIC_MODEL = modelOverride;
       env.ANTHROPIC_DEFAULT_SONNET_MODEL = modelOverride;
       env.ANTHROPIC_DEFAULT_HAIKU_MODEL = modelOverride;

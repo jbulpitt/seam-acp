@@ -1,7 +1,9 @@
 import type { McpContribution } from "../mcp-registry.js";
 import type { QuotaRegistry } from "../../core/quota/quota-registry.js";
+import type { AgentProfile } from "@seam/adapters";
+import type { AgentQuota } from "../../core/quota/agent-quota.js";
 
-export function quotaMcp(registry: QuotaRegistry): McpContribution[] {
+export function quotaMcp(registry: QuotaRegistry, agents: () => readonly Pick<AgentProfile, "id" | "displayName" | "brand">[] = () => []): McpContribution[] {
   return [{
     descriptor: {
       name: "agent_quota",
@@ -14,7 +16,21 @@ export function quotaMcp(registry: QuotaRegistry): McpContribution[] {
     instruction: "- agent_quota(agentId?): read normalized rolling + weekly quota for one agent or all agents\n  before choosing workers; steer away from agents nearing a cap.",
     handle: async ({ args }) => {
       const agentId = typeof args.agentId === "string" ? args.agentId.trim() || undefined : undefined;
-      const quotas = agentId ? [registry.get(agentId)].filter(quota => quota !== undefined) : registry.all();
+      const known = new Map(registry.all().map(quota => [quota.agentId, quota]));
+      // Bridge-only Vertex agents have no subscription quota reader. Do not
+      // turn missing GCP limits into synthetic zero usage or unlimited quota.
+      for (const profile of agents()) {
+        if (profile.brand !== "vertex") continue;
+        const quota: AgentQuota = {
+          agentId: profile.id, displayName: profile.displayName, ok: false,
+          error: "Vertex AI quota is not reported by Seam; GCP project limits and billing apply",
+          plan: null, credits: null, fetchedAt: null,
+          rolling: { label: "rolling", usedPercent: null, resetsAt: null },
+          weekly: { label: "weekly", usedPercent: null, resetsAt: null },
+        };
+        known.set(profile.id, quota);
+      }
+      const quotas = agentId ? [known.get(agentId)].filter(quota => quota !== undefined) : [...known.values()];
       const readings = quotas.map(quota => {
         if (!quota.source) return quota;
         const at = Date.parse(quota.source.observedAt ?? "");

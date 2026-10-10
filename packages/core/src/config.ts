@@ -307,9 +307,6 @@ const Schema = z.object({
 
   CLAUDE_MODELS: ModelsListSchema,
 
-  CLAUDE_VERTEX_PROJECT_ID: z.string().optional(),
-  CLAUDE_VERTEX_REGION: z.string().default("us-central1"),
-
   /** Native Seam Antigravity adapter (public agy identity). */
   AGY_ENABLED: z.enum(["true", "false"]).default("false").transform((v) => v === "true"),
   /** Owner-approved one-time local native restoration, applied before work admission. */

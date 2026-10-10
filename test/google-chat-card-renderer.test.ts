@@ -33,8 +33,8 @@ describe("Google Chat card text", () => {
   ])("formats %s", (input, expected) => expect(formatGoogleChatCardText(input)).toBe(expected));
 
   it("uses labelled table rows and readable Discord labels, not Discord controls", () => {
-    const text = "| Name | Role |\n| --- | --- |\n| Alice | Eng |\n<#123> <@456> <:done:789> ||answer||";
-    expect(formatGoogleChatCardText(text)).toBe("- Name: Alice; Role: Eng<br>#channel:123 @user:456 :done: [spoiler: answer]");
+    const text = "| Name | Role |\n| --- | --- |\n| Alice | Eng |\n\n<#123> <@456> <:done:789> ||answer||";
+    expect(formatGoogleChatCardText(text)).toBe("- Name: Alice; Role: Eng<br><br>#channel:123 @user:456 :done: [spoiler: answer]");
   });
 });
 

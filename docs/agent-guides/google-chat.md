@@ -26,10 +26,12 @@ identity, so receiving both does not start two turns. Human and other-app
 mentions remain in the prompt; annotated Seam mentions are stripped.
 
 Subscriptions are created on membership or discovered at startup, renewed
-before Google's returned expiry, and deleted on removal. Space metadata and
-renewal deadlines are stored in Seam's database; startup reconciles them with
-Google before rearming timers. Name-only message events are hydrated through
-the Chat API, or skipped with the actual fetch cause logged.
+before Google's returned expiry, and deleted on removal. Failed renewals log
+Google's cause and retry with backoff; after expiry, they recreate the
+subscription. Space metadata and renewal deadlines are stored in Seam's
+database; startup reconciles them with Google before rearming timers.
+Name-only message events are hydrated through the Chat API, or skipped with
+the actual fetch cause logged.
 
 `THREADED_MESSAGES` uses one session per native reply thread.
 `GROUPED_MESSAGES` uses one session per native topic thread.

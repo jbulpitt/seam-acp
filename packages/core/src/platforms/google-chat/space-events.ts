@@ -92,10 +92,12 @@ export class GoogleChatSpaceEvents {
     const client = this.opts.subscriptions;
     const prior = this.opts.store.get(space.name);
     const state: StoredGoogleChatSpace = { ...prior, space: { ...prior?.space, ...space } };
+    if (state.subscription && Date.parse(state.subscription.expireTime) <= Date.now()) state.subscription = undefined;
     this.opts.store.put(state);
     if (!state.subscription) {
       const existing = await client.list(space.name, this.controller.signal);
-      state.subscription = existing.find(sub => sub.notificationEndpoint.pubsubTopic === this.opts.pubsubTopic)
+      state.subscription = existing.find(sub => sub.notificationEndpoint.pubsubTopic === this.opts.pubsubTopic
+        && Date.parse(sub.expireTime) > Date.now())
         ?? await client.create(space.name, { signal: this.controller.signal });
     }
     this.saveAndArm(state, state.subscription);
@@ -103,27 +105,41 @@ export class GoogleChatSpaceEvents {
 
   private saveAndArm(state: StoredGoogleChatSpace, subscription: GoogleChatSpaceSubscription): void {
     this.opts.store.put({ ...state, appUser: this.opts.store.get(state.space.name)?.appUser ?? state.appUser, subscription });
-    this.disarm(state.space.name);
     if (this.controller.signal.aborted) return;
     const renewAt = nextGoogleChatSubscriptionRenewalTime(subscription, this.opts.renewalLeadMs ?? 5 * 60_000);
-    const timer = setTimeout(() => {
-      this.timers.delete(state.space.name);
-      void this.serial(state.space.name, async () => {
-        const current = this.opts.store.get(state.space.name);
-        if (!current?.subscription) return;
-        const renewed = await this.opts.subscriptions.renew(current.subscription.name, "0s", this.controller.signal);
-        this.saveAndArm(current, renewed);
-        this.opts.logger.info({ space: state.space.name, subscription: renewed.name, expireTime: renewed.expireTime },
-          "Google Chat Workspace subscription renewed");
-      }).catch(err => {
-        if (!this.controller.signal.aborted) this.opts.logger.error({ err, space: state.space.name, subscription: subscription.name },
-          "Google Chat Workspace subscription renewal failed");
-      });
-    }, Math.max(0, renewAt - Date.now()));
-    timer.unref();
-    this.timers.set(state.space.name, timer);
+    this.arm(state.space.name, renewAt);
     this.opts.logger.info({ space: state.space.name, subscription: subscription.name, expireTime: subscription.expireTime,
       renewAt: new Date(renewAt).toISOString() }, "Google Chat Workspace subscription renewal armed");
+  }
+
+  private arm(space: string, runAt: number, retryMs = 1000): void {
+    this.disarm(space);
+    if (this.controller.signal.aborted) return;
+    const timer = setTimeout(() => {
+      this.timers.delete(space);
+      void this.serial(space, async () => {
+        const current = this.opts.store.get(space);
+        if (!current) return;
+        if (!current.subscription || Date.parse(current.subscription.expireTime) <= Date.now()) {
+          await this.ensure(current.space);
+          return;
+        }
+        const renewed = await this.opts.subscriptions.renew(current.subscription.name, "0s", this.controller.signal);
+        this.saveAndArm(current, renewed);
+        this.opts.logger.info({ space, subscription: renewed.name, expireTime: renewed.expireTime },
+          "Google Chat Workspace subscription renewed");
+      }).catch(err => {
+        if (this.controller.signal.aborted) return;
+        const current = this.opts.store.get(space);
+        const now = Date.now(), expiry = current?.subscription ? Date.parse(current.subscription.expireTime) : undefined;
+        const retryAt = expiry !== undefined && expiry > now ? Math.min(now + retryMs, expiry) : now + retryMs;
+        this.opts.logger.error({ err, space, subscription: current?.subscription?.name, retryAt: new Date(retryAt).toISOString() },
+          "Google Chat Workspace subscription renewal failed");
+        if (current) this.arm(space, retryAt, Math.min(30_000, retryMs * 2));
+      });
+    }, Math.max(0, runAt - Date.now()));
+    timer.unref();
+    this.timers.set(space, timer);
   }
 
   private disarm(space: string): void {

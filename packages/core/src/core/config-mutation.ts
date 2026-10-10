@@ -30,7 +30,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { AGY_EXECUTABLE_LABELS, type AdapterRuntimeDescriptor } from "@seam/adapters";
-import { PresetsFileSchema } from "../config.js";
+import { PresetsFileSchema, threadPresetKey } from "../config.js";
 import { renderCatalogEvidenceLines } from "./catalog-evidence-render.js";
 import { uniqueBridgeId } from "./bridge-pairing.js";
 import type { Logger } from "../lib/logger.js";
@@ -611,6 +611,7 @@ export class ConfigMutationService {
 
   applyThreadOverlay(opts: {
     threadId: string;
+    platform?: string;
     parentRef?: string;
     changes: ThreadPresetChanges;
     actor: MutationActor;
@@ -619,7 +620,7 @@ export class ConfigMutationService {
       opts.threadId,
       opts.parentRef,
       opts.changes,
-      { requireTierC: false }
+      { requireTierC: false, platform: opts.platform }
     );
     if (!built.ok) {
       if (built.error.includes("No effective change")) {
@@ -638,6 +639,7 @@ export class ConfigMutationService {
 
   applyThreadLocation(opts: {
     threadId: string;
+    platform?: string;
     parentRef?: string;
     location: string;
     actor: MutationActor;
@@ -647,7 +649,7 @@ export class ConfigMutationService {
       opts.threadId,
       opts.parentRef,
       { location: loc },
-      { requireTierC: false }
+      { requireTierC: false, platform: opts.platform }
     );
     if (!built.ok) {
       if (built.error.includes("No effective change")) {
@@ -1912,7 +1914,8 @@ export class ConfigMutationService {
     return this.buildThreadPresetProposalFor(
       record.channelRef,
       record.parentRef ?? undefined,
-      changes
+      changes,
+      { platform: record.platform }
     );
   }
 
@@ -1920,7 +1923,7 @@ export class ConfigMutationService {
     threadId: string,
     parentRef: string | undefined,
     changes: ThreadPresetChanges,
-    opts: { requireTierC?: boolean } = {}
+    opts: { requireTierC?: boolean; platform?: string } = {}
   ): BuildProposalResult {
     try { changes = this.deps.configKeys?.parseChanges(changes) ?? changes; }
     catch (err) { return { ok: false, error: err instanceof Error ? err.message : String(err) }; }
@@ -1975,7 +1978,8 @@ export class ConfigMutationService {
       threads?: Record<string, Record<string, unknown>>;
     };
     const threads = { ...(doc.threads ?? {}) };
-    const current = { ...(threads[threadId] ?? {}) };
+    const presetKey = threadPresetKey(opts.platform ?? "discord", threadId);
+    const current = { ...(threads[presetKey] ?? {}) };
     // The parent channel's entry, used ONLY to detect Trap-1 shadowing below.
     const channelEntry = parentRef ? doc.channels?.[parentRef] : undefined;
     const effectiveChanges: ThreadPresetChanges = { ...changes };
@@ -2193,8 +2197,8 @@ export class ConfigMutationService {
     // Empty-entry cleanup: if attach (or a last-field removal) leaves `{}`,
     // drop the thread key so the file stays tidy. A remaining rider/effort
     // keeps the entry with `detached` omitted.
-    if (Object.keys(next).length === 0) delete threads[threadId];
-    else threads[threadId] = next;
+    if (Object.keys(next).length === 0) delete threads[presetKey];
+    else threads[presetKey] = next;
     const candidate = { ...doc, threads };
 
     // D7: the candidate MUST pass the exact boot schema or we refuse — an invalid

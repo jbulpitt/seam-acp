@@ -248,6 +248,15 @@ describe("threads() includes @location (#84)", () => {
     });
     expect(parseDispatchWorker("reviewer")).toEqual({ kind: "named", name: "reviewer" });
   });
+
+  it("parseDispatchWorker treats a ref the caller recognises as a thread, never a name@host", () => {
+    const known = new Set(["AAA.UUU"]);
+    const isThread = (ref: string) => known.has(ref);
+    expect(parseDispatchWorker("AAA.UUU", isThread)).toEqual({ kind: "thread", threadId: "AAA.UUU" });
+    expect(parseDispatchWorker("AAA.UUU")).toEqual({ kind: "named", name: "AAA.UUU" });
+    expect(parseDispatchWorker("reviewer", isThread)).toEqual({ kind: "named", name: "reviewer" });
+    expect(parseDispatchWorker("AAA.UUU@mac", () => true)).toEqual({ kind: "named", name: "AAA.UUU", location: "mac" });
+  });
 });
 
 describe("flattened host-prefixed picker (D10)", () => {

@@ -1,4 +1,5 @@
 import type { Logger } from "pino";
+import { setTimeout as delay } from "node:timers/promises";
 import type { GoogleApi } from "./api.js";
 import { isSharedSpace, type GoogleChatSpace, type GoogleChatSpaceLifecycle } from "./spaces.js";
 import { nextGoogleChatSubscriptionRenewalTime, type GoogleChatSpaceSubscription, type GoogleChatSpaceSubscriptions } from "./space-subscriptions.js";
@@ -6,8 +7,9 @@ import type { GoogleChatSpaceStore, StoredGoogleChatSpace } from "./space-store.
 
 type Subscriptions = Pick<GoogleChatSpaceSubscriptions, "create" | "renew" | "delete" | "list">;
 const root = "https://chat.googleapis.com/v1";
+const initialRetryMs = 1000, maxRetryMs = 30_000;
 
-/** Reconcile durable memberships before pulling, then renew from Google's expiry. */
+/** Reconcile durable memberships independently of pulling, then renew from Google's expiry. */
 export class GoogleChatSpaceEvents {
   private controller = new AbortController();
   private readonly timers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -38,13 +40,29 @@ export class GoogleChatSpaceEvents {
 
   async start(): Promise<void> {
     if (this.controller.signal.aborted) this.controller = new AbortController();
+    const signal = this.controller.signal;
+    let retryMs = initialRetryMs;
+    while (!signal.aborted) {
+      try { await this.reconcile(signal); return; }
+      catch (err) {
+        if (signal.aborted) return;
+        this.opts.logger.error({ err, retryMs }, "Google Chat Workspace reconciliation failed");
+        try { await delay(retryMs, undefined, { signal }); } catch { return; }
+        retryMs = Math.min(maxRetryMs, retryMs * 2);
+      }
+    }
+  }
+
+  private async reconcile(signal: AbortSignal): Promise<void> {
     const client = this.opts.subscriptions;
-    const remote = await client.list(undefined, this.controller.signal);
+    const remote = await client.list(undefined, signal);
+    signal.throwIfAborted();
     const members = new Map<string, GoogleChatSpace & { name: string }>();
     let pageToken: string | undefined;
     do {
       const page = await this.opts.api.request<{ spaces?: Array<GoogleChatSpace & { name: string }>; nextPageToken?: string }>("chat", {
-        method: "GET", url: `${root}/spaces`, params: { ...(pageToken ? { pageToken } : {}) }, signal: this.controller.signal });
+        method: "GET", url: `${root}/spaces`, params: { ...(pageToken ? { pageToken } : {}) }, signal });
+      signal.throwIfAborted();
       for (const space of page.spaces ?? []) if (this.allowed(space)) members.set(space.name, space);
       pageToken = page.nextPageToken;
     } while (pageToken);
@@ -53,13 +71,15 @@ export class GoogleChatSpaceEvents {
     const ours = remote.filter(sub => sub.notificationEndpoint.pubsubTopic === this.opts.pubsubTopic);
     for (const sub of ours) {
       const name = sub.targetResource.replace(/^\/\/chat.googleapis.com\//, "");
-      if (!members.has(name)) await client.delete(sub.name, this.controller.signal);
+      if (!members.has(name)) await client.delete(sub.name, signal);
+      signal.throwIfAborted();
     }
     for (const state of this.opts.store.list()) if (!members.has(state.space.name)) this.opts.store.delete(state.space.name);
     for (const [name, space] of members) {
+      signal.throwIfAborted();
       const subscription = ours.find(sub => sub.targetResource === `//chat.googleapis.com/${name}`);
       this.opts.store.put({ ...this.opts.store.get(name), space, subscription });
-      await this.serial(name, () => this.ensure(space));
+      await this.serial(name, () => this.ensure(space, signal));
     }
   }
 
@@ -88,18 +108,21 @@ export class GoogleChatSpaceEvents {
     });
   }
 
-  private async ensure(space: GoogleChatSpace & { name: string }): Promise<void> {
+  private async ensure(space: GoogleChatSpace & { name: string }, signal = this.controller.signal): Promise<void> {
+    signal.throwIfAborted();
     const client = this.opts.subscriptions;
     const prior = this.opts.store.get(space.name);
     const state: StoredGoogleChatSpace = { ...prior, space: { ...prior?.space, ...space } };
     if (state.subscription && Date.parse(state.subscription.expireTime) <= Date.now()) state.subscription = undefined;
     this.opts.store.put(state);
     if (!state.subscription) {
-      const existing = await client.list(space.name, this.controller.signal);
+      const existing = await client.list(space.name, signal);
+      signal.throwIfAborted();
       state.subscription = existing.find(sub => sub.notificationEndpoint.pubsubTopic === this.opts.pubsubTopic
         && Date.parse(sub.expireTime) > Date.now())
-        ?? await client.create(space.name, { signal: this.controller.signal });
+        ?? await client.create(space.name, { signal });
     }
+    signal.throwIfAborted();
     this.saveAndArm(state, state.subscription);
   }
 
@@ -112,7 +135,7 @@ export class GoogleChatSpaceEvents {
       renewAt: new Date(renewAt).toISOString() }, "Google Chat Workspace subscription renewal armed");
   }
 
-  private arm(space: string, runAt: number, retryMs = 1000): void {
+  private arm(space: string, runAt: number, retryMs = initialRetryMs): void {
     this.disarm(space);
     if (this.controller.signal.aborted) return;
     const timer = setTimeout(() => {
@@ -135,7 +158,7 @@ export class GoogleChatSpaceEvents {
         const retryAt = expiry !== undefined && expiry > now ? Math.min(now + retryMs, expiry) : now + retryMs;
         this.opts.logger.error({ err, space, subscription: current?.subscription?.name, retryAt: new Date(retryAt).toISOString() },
           "Google Chat Workspace subscription renewal failed");
-        if (current) this.arm(space, retryAt, Math.min(30_000, retryMs * 2));
+        if (current) this.arm(space, retryAt, Math.min(maxRetryMs, retryMs * 2));
       });
     }, Math.max(0, runAt - Date.now()));
     timer.unref();

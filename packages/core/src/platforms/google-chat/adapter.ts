@@ -90,7 +90,12 @@ export class GoogleChatAdapter implements ChatAdapter {
     if (opts.spaceEvents) this.onSpaceLifecycle(event => opts.spaceEvents!.handle(event));
   }
 
-  async start(): Promise<void> { await this.opts.spaceEvents?.start(); await this.transport.start(); }
+  async start(): Promise<void> {
+    await this.transport.start();
+    void this.opts.spaceEvents?.start().catch(err => {
+      this.opts.logger.error({ err }, "Google Chat Workspace reconciliation failed");
+    });
+  }
   async stop(): Promise<void> {
     await Promise.all([this.opts.spaceEvents?.stop(), this.transport.stop()]);
     await this.writes.flush();

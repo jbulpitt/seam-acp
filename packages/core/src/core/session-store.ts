@@ -94,6 +94,7 @@ import { INBOX_MAX_PER_SESSION, type InboxMessage } from "./inbox/types.js";
 import type { ParkedAttachment, ParkedPrompt } from "./parked-prompts/types.js";
 import type {
   InboundAdmission,
+  InboundCommandResult,
   NewInboundAdmission,
 } from "./inbound-admission/types.js";
 import type {
@@ -392,6 +393,7 @@ export class SessionStore {
       "ALTER TABLE elicitations ADD COLUMN answer_message_id TEXT",
       "ALTER TABLE inbound_admissions ADD COLUMN expected_acp_session_id TEXT",
       "ALTER TABLE inbound_admissions ADD COLUMN preemptive INTEGER NOT NULL DEFAULT 1",
+      "ALTER TABLE inbound_admissions ADD COLUMN command_result_json TEXT",
     ]) {
       try { this.db.exec(ddl); } catch { /* column already exists */ }
     }
@@ -2578,11 +2580,11 @@ export class SessionStore {
           `INSERT OR IGNORE INTO inbound_admissions
              (message_id, platform, channel_ref, parent_ref, session_record_id,
               author_id, author_name, prompt, attachments_json, state,
-              queue_epoch, created_utc, updated_utc, expected_acp_session_id, preemptive)
+              queue_epoch, created_utc, updated_utc, expected_acp_session_id, preemptive, command_result_json)
            VALUES
              (@messageId, @platform, @channelRef, @parentRef, @sessionRecordId,
               @authorId, @authorName, @text, @attachmentsJson, 'pending',
-              NULL, @createdUtc, @createdUtc, @expectedAcpSessionId, @preemptive)`
+              NULL, @createdUtc, @createdUtc, @expectedAcpSessionId, @preemptive, @commandResultJson)`
         )
         .run({
           ...input,
@@ -2591,6 +2593,7 @@ export class SessionStore {
           attachmentsJson: JSON.stringify(input.attachments ?? []),
           expectedAcpSessionId: input.expectedAcpSessionId ?? null,
           preemptive: input.preemptive === false ? 0 : 1,
+          commandResultJson: input.commandResult ? JSON.stringify(input.commandResult) : null,
         });
         if (result.changes !== 1) return false;
       // A normal Discord message is a priority replacement, not FIFO. Make
@@ -2598,7 +2601,7 @@ export class SessionStore {
       // recovery cannot resurrect the turn it superseded.
       if (input.preemptive !== false) {
         for (const old of this.db.prepare(`SELECT message_id FROM inbound_admissions
-          WHERE channel_ref=? AND message_id<>? AND state IN ('pending','running')`)
+          WHERE channel_ref=? AND message_id<>? AND state IN ('pending','running') AND command_result_json IS NULL`)
           .all(input.channelRef, input.messageId) as { message_id: string }[]) {
           this.turnAttempts.cancel(inboundAttemptId(old.message_id));
         }
@@ -2606,7 +2609,7 @@ export class SessionStore {
           .prepare(
             `UPDATE inbound_admissions SET state = 'completed', updated_utc = ?
              WHERE channel_ref = ? AND message_id <> ?
-               AND state IN ('pending','running')`
+               AND state IN ('pending','running') AND command_result_json IS NULL`
           )
           .run(input.createdUtc, input.channelRef, input.messageId);
       }
@@ -2639,14 +2642,14 @@ export class SessionStore {
       ? this.db
           .prepare<[string], InboundAdmissionRow>(
             `SELECT * FROM inbound_admissions
-             WHERE channel_ref = ? AND state IN ('pending','running')
+             WHERE channel_ref = ? AND state IN ('pending','running') AND command_result_json IS NULL
              ORDER BY created_utc ASC, rowid ASC`
           )
           .all(channelRef)
       : this.db
           .prepare<[], InboundAdmissionRow>(
             `SELECT * FROM inbound_admissions
-             WHERE state IN ('pending','running')
+             WHERE state IN ('pending','running') AND command_result_json IS NULL
              ORDER BY created_utc ASC, rowid ASC`
           )
           .all();
@@ -2688,6 +2691,14 @@ export class SessionStore {
     return result.changes === 1;
   }
 
+  /** Commit the effect receipt before transport writes; retries only drain its replies. */
+  completeInboundCommand(messageId: string, result: InboundCommandResult, updatedUtc: string): boolean {
+    return this.db.prepare(`UPDATE inbound_admissions
+      SET state='completed', command_result_json=?, updated_utc=?
+      WHERE message_id=? AND command_result_json IS NOT NULL AND state IN ('running','completed')`)
+      .run(JSON.stringify(result), updatedUtc, messageId).changes === 1;
+  }
+
   /** Boot settlement requires the durable execution winner, not a stale queue epoch. */
   settleInboundExecution(messageId: string): void {
     const a = this.turnAttempts.get(inboundAttemptId(messageId));
@@ -2706,7 +2717,7 @@ export class SessionStore {
       const rows = this.db
         .prepare<[string, string | null, string | null], InboundAdmissionRow>(
           `SELECT * FROM inbound_admissions
-           WHERE channel_ref = ? AND state IN ('pending','running')
+           WHERE channel_ref = ? AND state IN ('pending','running') AND command_result_json IS NULL
            AND (? IS NULL OR message_id = ?)
            ORDER BY created_utc ASC, rowid ASC`
         )
@@ -2719,7 +2730,7 @@ export class SessionStore {
       this.db
         .prepare(
           `UPDATE inbound_admissions SET state = 'completed', updated_utc = ?
-           WHERE channel_ref = ? AND state IN ('pending','running') AND message_id <> ?
+           WHERE channel_ref = ? AND state IN ('pending','running') AND message_id <> ? AND command_result_json IS NULL
            AND (? IS NULL OR message_id = ?)`
         )
         .run(updatedUtc, channelRef, newest.message_id, messageId ?? null, messageId ?? null);
@@ -2744,7 +2755,7 @@ export class SessionStore {
     const channels = this.db
       .prepare<[], { channel_ref: string }>(
         `SELECT DISTINCT channel_ref FROM inbound_admissions
-         WHERE state IN ('pending','running') ORDER BY channel_ref`
+         WHERE state IN ('pending','running') AND command_result_json IS NULL ORDER BY channel_ref`
       )
       .all();
     return channels
@@ -7261,6 +7272,7 @@ CREATE TABLE IF NOT EXISTS inbound_admissions (
   queue_epoch       INTEGER,
   expected_acp_session_id TEXT,
   preemptive        INTEGER NOT NULL DEFAULT 1,
+  command_result_json TEXT,
   created_utc       TEXT NOT NULL,
   updated_utc       TEXT NOT NULL
 );
@@ -7379,6 +7391,7 @@ interface InboundAdmissionRow {
   queue_epoch: number | null;
   expected_acp_session_id: string | null;
   preemptive: number;
+  command_result_json: string | null;
   created_utc: string;
   updated_utc: string;
 }
@@ -7420,6 +7433,7 @@ const mapInboundAdmission = (r: InboundAdmissionRow): InboundAdmission => ({
   updatedUtc: r.updated_utc,
   expectedAcpSessionId: r.expected_acp_session_id,
   preemptive: r.preemptive !== 0,
+  ...(r.command_result_json === null ? {} : { commandResult: JSON.parse(r.command_result_json) as InboundCommandResult }),
 });
 
 /** Defensive parse of the stored hops array — a corrupt row degrades to an

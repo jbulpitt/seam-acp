@@ -38,7 +38,7 @@ export type DeliveryNonceLookup =
 
 /** A file attached to an incoming message, normalized across platforms. */
 export interface MessageAttachment {
-  /** Stable URL the bot can fetch (Discord CDN URL). */
+  /** Discord: a CDN URL. Other platforms: whatever `downloadAttachment` reads. */
   url: string;
   filename: string;
   /** MIME type if the platform reported one. */
@@ -165,6 +165,12 @@ export interface ChatAdapter {
   /** Optional: pass messages newer than `afterId` through the normal inbound
    *  handler, oldest first. Returns how many were found. */
   catchUpMessagesAfter?(afterId: string): Promise<number>;
+
+  /**
+   * Optional: bytes of an inbound attachment whose `url` is not plainly
+   * fetchable (it needs the platform's own auth). Absent = `fetch(url)`.
+   */
+  downloadAttachment?(attachment: MessageAttachment): Promise<Buffer>;
 
   /** Optional: this application's bot user id, used to identify Seam assistant posts. */
   getBotUserId?(): string | undefined;

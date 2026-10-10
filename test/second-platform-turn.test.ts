@@ -37,7 +37,8 @@ function setup(platform: string, downloads?: Map<string, Buffer>) {
   };
   const router = testSessionRouter({ listProfiles: () => [],
     describeConfig: () => ({ agent: { value: "codex" }, model: { value: "test" },
-      effort: { value: null }, cwd: { value: "/synthetic" }, location: { value: "local" }, fastMode: { value: false } }),
+      effort: { value: null }, cwd: { value: "/synthetic" }, location: { value: "local" }, fastMode: { value: false },
+      role: { value: null }, disableThreadPrefix: { value: false } }),
     ensureSessionRecord: (input: { platform: string; channelRef: string; parentRef?: string }) => {
       const existing = store.getByChannel(input.platform, input.channelRef);
       if (existing) return existing;

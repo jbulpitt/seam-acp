@@ -172,13 +172,13 @@ describe("Workspace Events use the Google Chat durable admission path", () => {
 });
 
 describe("Adapter wires its Space subscription lifecycle", () => {
-  it("reconciles before starting the pull and stops its renewal worker", async () => {
+  it("starts pulling before reconciliation and stops its renewal worker", async () => {
     const h = setup();
     h.request.mockImplementation(async (_scope, r) => new Promise((_, reject) =>
       r.signal.addEventListener("abort", () => reject(r.signal.reason), { once: true })));
     await h.adapter.start(); await h.adapter.stop();
     expect(h.lifecycle.start).toHaveBeenCalledOnce(); expect(h.lifecycle.stop).toHaveBeenCalledOnce();
-    expect(h.lifecycle.start.mock.invocationCallOrder[0]).toBeLessThan(h.request.mock.invocationCallOrder[0]!);
+    expect(h.request.mock.invocationCallOrder[0]).toBeLessThan(h.lifecycle.start.mock.invocationCallOrder[0]!);
   });
 
   it("creates on add and deletes on removal without user authorization blocking cleanup", async () => {

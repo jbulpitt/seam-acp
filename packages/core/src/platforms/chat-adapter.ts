@@ -168,8 +168,8 @@ export interface ChatAdapter {
    */
   fetchMessagePage?(threadId: string, request: MessagePageRequest): Promise<MessagePage>;
 
-  /** Optional: pass messages newer than `afterId` through the normal inbound
-   *  handler, oldest first. Returns how many were found. */
+  /** Optional history catch-up for this adapter's platform (primary when multiplexed).
+   *  `afterId` is a message cursor, not a channel ref. Replay oldest first. */
   catchUpMessagesAfter?(afterId: string): Promise<number>;
 
   /**

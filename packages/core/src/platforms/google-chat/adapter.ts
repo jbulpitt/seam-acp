@@ -50,6 +50,8 @@ function clientId(nonce: string): string {
 
 export class GoogleChatAdapter implements ChatAdapter {
   readonly platform = GOOGLE_CHAT_PLATFORM;
+  // Unacked events redeliver via Pub/Sub; admitted work resumes from the ledger.
+  readonly catchUpMessagesAfter = undefined;
   private handler?: (message: IncomingMessage) => void | Promise<void>;
   private readonly writes: SpaceWriteQueue;
   private readonly transport: PubSubPullTransport;

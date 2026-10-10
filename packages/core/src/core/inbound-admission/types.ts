@@ -3,9 +3,8 @@ import type { MessageAttachment } from "../../platforms/chat-adapter.js";
 export type InboundAdmissionState = "pending" | "running" | "completed";
 
 /**
- * Durable ownership record for one platform message. The Discord snowflake is
- * the idempotency key: reconnect delivery of the same gateway event can never
- * create a second turn.
+ * Durable ownership record for one platform message. Its platform message id
+ * is the idempotency key: reconnect delivery cannot create a second turn.
  */
 export interface InboundAdmission {
   messageId: string;

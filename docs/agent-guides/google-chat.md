@@ -16,6 +16,26 @@ Chat uses the same agent runtimes as Discord. Its MVP permission policy is
 `always`: tool requests are approved without permission cards. Configure
 allowed users before enabling the integration.
 
+### Shared spaces
+
+Add the app to a named Space and @mention it to start a turn. In this slice,
+ordinary messages and unmentioned replies are not admitted; hearing those
+requires the separate Workspace Events subscription integration. Human
+mentions remain in the prompt; annotated app mentions are stripped.
+
+`THREADED_MESSAGES` uses one session per native reply thread.
+`GROUPED_MESSAGES` uses one session per native topic thread.
+`UNTHREADED_MESSAGES` uses one shared session for the whole space and sends
+unthreaded replies. In that mode `/new` explains that no separate thread can
+be created and makes no change. With unspecified threading metadata, a
+provided thread is used; otherwise the session is space-wide. Users sharing
+a thread also share its agent, model and conversation.
+
+The registered `/new`, `/cancel`, `/agent` and `/model` commands work in spaces
+without an @mention. The existing user allowlist still applies to prompts,
+commands and card clicks. Shared-space permissions remain `always`; this
+slice does not add permission cards or change the platform default.
+
 ## Configuration
 
 - `GOOGLE_CHAT_PROJECT_ID`: the Google Cloud project ID.
@@ -24,6 +44,9 @@ allowed users before enabling the integration.
 - `GOOGLE_CHAT_CREDENTIALS_FILE`: the service-account JSON key file path.
 - `GOOGLE_CHAT_ALLOWED_USER_IDS`: comma-separated Chat user resource names,
   such as `users/<id>`; an empty list admits no users.
+- `GOOGLE_CHAT_ALLOWED_SPACE_IDS`: optional comma-separated shared-space
+  resources (`spaces/<id>`) or bare ids. Empty permits all shared spaces;
+  DMs are unaffected. This applies in addition to the user allowlist.
 - `GOOGLE_CHAT_DEFAULT_CWD`: optional working directory; defaults to
   `REPOS_ROOT`.
 

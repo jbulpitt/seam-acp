@@ -32,15 +32,16 @@ describe("Workspace Chat message CloudEvents", () => {
     expect(parsed!.resource.annotations).toEqual(resource.annotations);
   });
 
-  it("matches the existing direct MESSAGE adapter's dedupe id and neutral message fields", async () => {
+  it("matches the direct DM MESSAGE adapter's dedupe id and neutral message fields", async () => {
     const incoming: IncomingMessage[] = [];
     const adapter = new GoogleChatAdapter({ api: { request: async () => { throw new Error("no Google call expected"); } },
       subscription: "projects/example/subscriptions/chat-events", allowedUserIds: new Set(["users/42"]), defaultCwd: "/projects",
       logger: pino({ level: "silent" }), writeIntervalMs: 0 });
     adapter.onMessage(message => { incoming.push(message); message.onAdmitted?.(); });
-    await adapter.receiveEvent({ type: "MESSAGE", space: resource.space, user: resource.sender, message: resource });
+    const dm = { ...resource, space: { ...resource.space, spaceType: "DIRECT_MESSAGE" } };
+    await adapter.receiveEvent({ type: "MESSAGE", space: dm.space, user: dm.sender, message: dm });
     expect(incoming).toHaveLength(1);
-    const [parsed] = parseGoogleChatWorkspaceMessages(delivered({ message: resource }));
+    const [parsed] = parseGoogleChatWorkspaceMessages(delivered({ message: dm }));
     expect(parsed!.kind).toBe("message");
     if (parsed!.kind !== "message") throw new Error("expected full message");
     expect(parsed!.incoming).toMatchObject({ messageId: incoming[0]!.messageId, channel: incoming[0]!.channel,

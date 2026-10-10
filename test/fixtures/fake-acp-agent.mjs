@@ -92,6 +92,7 @@ process.stdin.on("data", (chunk) => {
       }
       if (process.env.FAKE_AGENT_AUTH_FAILURE && fs.existsSync(process.env.FAKE_AGENT_AUTH_FAILURE)) {
         fs.unlinkSync(process.env.FAKE_AGENT_AUTH_FAILURE);
+        if (process.env.FAKE_AGENT_AUTH_OUTPUT_FIRST) update("partial work before the auth failure");
         send({ id: message.id, error: { code: -32000, message: "Authentication required" } });
         continue;
       }

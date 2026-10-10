@@ -46,7 +46,7 @@ export interface GoogleChatHistoryPage extends MessagePage {
   nextPageToken: string | null;
 }
 
-interface ChatMessage {
+export interface GoogleChatHistoryMessage {
   name: string;
   createTime: string;
   sender?: { name?: string; displayName?: string; type?: string };
@@ -61,8 +61,13 @@ interface ChatMessage {
 }
 
 interface ListMessagesResponse {
-  messages?: ChatMessage[];
+  messages?: GoogleChatHistoryMessage[];
   nextPageToken?: string;
+}
+
+export interface GoogleChatRawHistoryPage {
+  messages: GoogleChatHistoryMessage[];
+  nextPageToken: string | null;
 }
 
 /** App-auth history without adapter, session, or cursor-cache state. */
@@ -77,6 +82,19 @@ export class GoogleChatHistoryReader {
   }
 
   async readPage(request: GoogleChatHistoryRequest): Promise<GoogleChatHistoryPage> {
+    const page = await this.readRawPage(request);
+    const raw = page.messages;
+    const oldest = request.order === "oldest" ? raw[0] : raw.at(-1);
+    return {
+      messages: raw.filter((message) => !message.deleteTime).map(normalizeGoogleChatMessage),
+      rawCount: raw.length,
+      oldestRawId: oldest?.name ?? null,
+      oldestRawTimestampMs: oldest ? Date.parse(oldest.createTime) : null,
+      nextPageToken: page.nextPageToken,
+    };
+  }
+
+  async readRawPage(request: GoogleChatHistoryRequest): Promise<GoogleChatRawHistoryPage> {
     const query = new URLSearchParams({
       pageSize: String(request.limit),
       orderBy: `createTime ${request.order === "oldest" ? "ASC" : "DESC"}`,
@@ -95,15 +113,19 @@ export class GoogleChatHistoryReader {
       method: "GET",
       retry: false,
     });
-    const raw = data.messages ?? [];
-    const oldest = request.order === "oldest" ? raw[0] : raw.at(-1);
     return {
-      messages: raw.filter((message) => !message.deleteTime).map(normalizeMessage),
-      rawCount: raw.length,
-      oldestRawId: oldest?.name ?? null,
-      oldestRawTimestampMs: oldest ? Date.parse(oldest.createTime) : null,
+      messages: data.messages ?? [],
       nextPageToken: data.nextPageToken || null,
     };
+  }
+
+  async getMessage(name: string): Promise<GoogleChatHistoryMessage> {
+    const { data } = await this.client.request<GoogleChatHistoryMessage>({
+      url: `https://chat.googleapis.com/v1/${name}?markupSyntax=MARKUP_SYNTAX_MARKDOWN`,
+      method: "GET",
+      retry: false,
+    });
+    return data;
   }
 
   /** Keep every query parameter stable while following Google's page tokens. */
@@ -117,7 +139,7 @@ export class GoogleChatHistoryReader {
   }
 }
 
-function normalizeMessage(message: ChatMessage): GoogleChatHistoryItem {
+export function normalizeGoogleChatMessage(message: GoogleChatHistoryMessage): GoogleChatHistoryItem {
   return {
     messageId: message.name,
     timestampMs: Date.parse(message.createTime),

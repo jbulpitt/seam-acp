@@ -105,4 +105,27 @@ describe("Google Chat DM adapter", () => {
       url: "https://chat.googleapis.com/v1/media/spaces/DM_1/messages/M/attachments/A",
       params: { alt: "media" }, responseType: "arraybuffer" }));
   });
+
+  it("treats a duplicate nonce as the same posted message, with a space-qualified lookup", async () => {
+    const { adapter, request } = await setup();
+    request.mockRejectedValueOnce(Object.assign(new Error("already exists"), { response: { status: 409 } }));
+    const ref = await adapter.sendMessage(channel, "terminal", { nonce: "stable-delivery", enforceNonce: true });
+    expect(ref.id).toBe("spaces/DM_1/messages/app-1");
+    const createdId = request.mock.calls[0]![1].params.messageId;
+    expect(request.mock.calls[1]![1]).toMatchObject({ method: "GET",
+      url: `https://chat.googleapis.com/v1/spaces/DM_1/messages/${createdId}` });
+    expect(await adapter.findMessageByNonce(channel, "stable-delivery")).toMatchObject({ status: "found", message: { id: ref.id } });
+    expect(request.mock.calls[2]![1].url).toBe(`https://chat.googleapis.com/v1/spaces/DM_1/messages/${createdId}`);
+  });
+
+  it("logs a reply fallback instead of silently claiming the original thread", async () => {
+    const { adapter, request } = await setup();
+    request.mockResolvedValueOnce({ name: "spaces/DM_1/messages/fallback", thread: { name: "spaces/DM_1/threads/Fallback" } });
+    const warn = vi.spyOn(logger, "warn");
+    try {
+      expect((await adapter.sendMessage(channel, "hello")).channel.id).toBe("DM_1.Fallback");
+      expect(warn).toHaveBeenCalledWith(expect.objectContaining({ expected: "spaces/DM_1/threads/Thread_1",
+        actual: "spaces/DM_1/threads/Fallback" }), "Google Chat reply fell back to a different thread");
+    } finally { warn.mockRestore(); }
+  });
 });

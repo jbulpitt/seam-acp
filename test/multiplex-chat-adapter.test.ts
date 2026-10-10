@@ -37,4 +37,20 @@ describe("multi-adapter routing", () => {
     expect(discord.sendPanel).toHaveBeenCalledOnce(); expect(discord.sendMessage).not.toHaveBeenCalled();
     expect(chat.sendMessage.mock.calls[0]![1]).toContain("Working");
   });
+
+  it("routes media to its owning platform without treating Discord CDN URLs as Google resources", async () => {
+    const { multiplexChatAdapters } = await import("../packages/core/src/platforms/google-chat/multiplex.js");
+    const discord = adapter("discord");
+    const chat = Object.assign(adapter("google-chat"), { downloadAttachment: vi.fn(async () => Buffer.from("chat media")) });
+    const mux = multiplexChatAdapters([discord, chat]);
+    const fetch = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("discord media"));
+    try {
+      const dc = { url: "https://cdn.discordapp.com/file", filename: "note.txt", contentType: "text/plain", size: 1 };
+      const gc = { ...dc, url: "spaces/A/messages/M/attachments/F", platform: "google-chat" };
+      expect((await mux.downloadAttachment!(dc)).toString()).toBe("discord media");
+      expect((await mux.downloadAttachment!(gc)).toString()).toBe("chat media");
+      expect(fetch).toHaveBeenCalledExactlyOnceWith(dc.url);
+      expect(chat.downloadAttachment).toHaveBeenCalledExactlyOnceWith(gc);
+    } finally { fetch.mockRestore(); }
+  });
 });

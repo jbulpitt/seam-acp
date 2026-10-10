@@ -23,12 +23,18 @@ vi.mock("../packages/core/src/agents/agent-runtime.js", async importOriginal => 
     lastActivityAtMs = Date.now();
     modelOverride?: string;
     effortOverride?: string;
+    cwd = "";
     finishPrompt?: () => void;
-    constructor(readonly options: { profile: AgentProfile; cwd: string }) {}
+    constructor(readonly options: { profile: AgentProfile }) {}
     async start() {}
     markActivity() { this.lastActivityAtMs = Date.now(); }
-    async loadSession(input: { sessionId: string }) { this.sessionId = input.sessionId; }
-    async newSession() { this.sessionId = "new-context"; return { sessionId: this.sessionId }; }
+    async loadSession(input: { sessionId: string; cwd: string; model?: string; effort?: string }) {
+      this.sessionId = input.sessionId; this.cwd = input.cwd; this.modelOverride = input.model; this.effortOverride = input.effort;
+    }
+    async newSession(input: { cwd: string; model?: string; effort?: string }) {
+      this.sessionId = "new-context"; this.cwd = input.cwd; this.modelOverride = input.model; this.effortOverride = input.effort;
+      return { sessionId: this.sessionId };
+    }
     getSessionInfo() { return { sessionId: this.sessionId, currentModelId: this.modelOverride }; }
     async dispose() { this.disposed = true; }
     async setModel(model: string) { this.modelOverride = model; }
@@ -38,7 +44,7 @@ vi.mock("../packages/core/src/agents/agent-runtime.js", async importOriginal => 
       this.busy = true;
       try {
         await new Promise<void>(resolve => { this.finishPrompt = resolve; });
-        return { cwd: this.options.cwd, effort: this.effortOverride };
+        return { cwd: this.cwd, effort: this.effortOverride };
       } finally { this.busy = false; }
     }
   } };
@@ -118,7 +124,7 @@ describe("Google Chat per-session repo and effort", () => {
     expect(store.get(h.record.id)?.acpSessionId).toBe("");
     expect(store.listConfigMutations()).toEqual([expect.objectContaining({ actorId: actor.id, actorName: actor.name })]);
     const next = await router.getOrStartRuntime(store.get(h.record.id)!);
-    expect((next as any).options.cwd).toBe(nextCwd);
+    expect((next as any).cwd).toBe(nextCwd);
     expect(next.getSessionInfo()?.sessionId).toBe("new-context");
   });
 
@@ -133,7 +139,7 @@ describe("Google Chat per-session repo and effort", () => {
     expect(await running).toMatchObject({ cwd: oldCwd });
     const next = await router.getOrStartRuntime(store.get(h.record.id)!);
     expect((warm as any).disposed).toBe(true);
-    expect((next as any).options.cwd).toBe(nextCwd);
+    expect((next as any).cwd).toBe(nextCwd);
     expect(next.getSessionInfo()?.sessionId).toBe("new-context");
   });
 

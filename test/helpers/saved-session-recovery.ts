@@ -23,6 +23,7 @@ const fakeAgent = path.resolve(here, "../fixtures/fake-acp-agent.mjs");
 export const SAVED_SESSION = "saved-conversation";
 
 export async function savedSessionHost(options: {
+  agentFixture?: string;
   failLoad?: boolean;
   loadGate?: boolean;
   newGate?: boolean;
@@ -45,7 +46,7 @@ export async function savedSessionHost(options: {
   if (options.connectionFailure) await fs.writeFile(connectionFailure, "fixture provider 503");
   const bin = path.join(root, "bin");
   await fs.mkdir(bin);
-  await fs.symlink(fakeAgent, path.join(bin, "codex-acp"));
+  await fs.symlink(options.agentFixture ?? fakeAgent, path.join(bin, "codex-acp"));
   const server = new SessiondServer({ socketPath: path.join(root, "control.sock"),
     statePath: path.join(root, "slots.json"), resumeDir: path.join(root, "resume"),
     holderPath: options.holderPath ?? process.env.SEAM_SLOT_HOLDER_PATH ?? path.join(here, "slot-holder-source.mjs") });

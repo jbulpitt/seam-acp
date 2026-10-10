@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { pino } from "pino";
+import { createHash } from "node:crypto";
 import { GoogleChatAdapter } from "../packages/core/src/platforms/google-chat/adapter.js";
 import { multiplexChatAdapters } from "../packages/core/src/platforms/google-chat/multiplex.js";
 import { GoogleChatHistoryReader, type GoogleChatHistoryMessage } from "../packages/core/src/core/messages/google-chat-history.js";
@@ -7,6 +8,7 @@ import { GOOGLE_CHAT_DM_HISTORY_CAUSE } from "../packages/core/src/core/messages
 import * as readers from "../packages/core/src/core/message-reader.js";
 import { SeamMcpServer } from "../packages/core/src/core/mcp/seam-mcp-server.js";
 import type { SessionRecord } from "../packages/core/src/core/types.js";
+import { SessionStore } from "../packages/core/src/core/session-store.js";
 
 const logger = pino({ level: "silent" });
 const space = "spaces/team", thread = `${space}/threads/A`;
@@ -107,6 +109,29 @@ describe("Google Chat adapter history wiring", () => {
     await expect(h.adapter.findMessageByNonce(channel, "nonce", 0)).rejects.toBe(cause);
     expect(h.historyRequest).not.toHaveBeenCalled();
   });
+
+  it("fills omitted sender names from the same message's durable admission, without another Google call", async () => {
+    const h = setup();
+    const store = new SessionStore(":memory:");
+    try {
+      h.rows[0]!.sender = { name: "users/42", type: "HUMAN" };
+      h.rows[1]!.sender = { name: "users/unadmitted", type: "HUMAN" };
+      const admittedId = `gchat_${createHash("sha256").update(h.rows[0]!.name).digest("base64url")}`;
+      store.admitInbound({ messageId: admittedId, platform: "google-chat", channelRef: channel.id,
+        parentRef: channel.parentId, sessionRecordId: `google-chat:${channel.id}`,
+        authorId: "42", authorName: "Alex from admission", text: h.rows[0]!.text!,
+        createdUtc: h.rows[0]!.createTime, preemptive: false });
+      const lookup = vi.spyOn(store, "getInbound");
+      h.adapter.setCommandDeps({ store });
+      const page = await h.adapter.fetchMessagePage(channel.id, { limit: 3 });
+      expect(page.messages.map((m: any) => m.authorName)).toEqual(["Alex", "users/unadmitted", "Alex from admission"]);
+      expect(page.messages.at(-1).authorId).toBe("users/42");
+      expect(lookup).toHaveBeenCalledWith(admittedId);
+      expect(lookup).toHaveBeenCalledTimes(2);
+      expect(h.request).toHaveBeenCalledTimes(1);
+      expect(h.historyRequest).toHaveBeenCalledTimes(1);
+    } finally { store.close(); }
+  });
 });
 
 function record(ref: string, platform = "google-chat"): SessionRecord {
@@ -143,6 +168,14 @@ describe("MCP readers through the multiplexed Chat history", () => {
     }
     const found = await call("search_messages", { query: "marker 2", threads: [channel.id], since: "2026-10-10T12:00:00Z" });
     expect(found.isError).toBeFalsy(); expect(found.structuredContent.hits).toMatchObject([{ messageId: `${space}/messages/m2` }]);
+    for (const row of [h.rows[0]!, h.rows[2]!]) {
+      row.text = "SEAM951_C"; row.formattedText = String.raw`SEAM951\_C`;
+    }
+    const underscore = await call("search_messages", { query: "SEAM951_C", threads: [channel.id] });
+    expect(underscore.isError).toBeFalsy();
+    expect(underscore.structuredContent.hits.map((hit: any) => hit.messageId)).toEqual([`${space}/messages/m3`, `${space}/messages/m1`]);
+    const plain = await call("read_messages", { thread: channel.id, around: `${space}/messages/m1`, limit: 3 });
+    expect(plain.structuredContent.messages[0].content).toBe("SEAM951_C");
     const peek = await call("peek", { thread: channel.id }, "discord");
     expect(peek.isError).toBeFalsy(); expect(peek.structuredContent.messages).toHaveLength(3);
     expect(discordPage).not.toHaveBeenCalled();

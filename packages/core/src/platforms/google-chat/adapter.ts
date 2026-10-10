@@ -161,16 +161,10 @@ export class GoogleChatAdapter implements ChatAdapter {
     return Buffer.from(data);
   }
 
-  async findMessageByNonce(channel: ChannelRef, nonce: string): Promise<DeliveryNonceLookup> {
-    try {
-      const message = await this.opts.api.request<ChatMessage>("chat", { method: "GET",
-        url: `${root}/${names(channel).space}/messages/${clientId(nonce)}` });
-      if (!message.name) return { status: "indeterminate", reason: "Google Chat lookup returned no message name" };
-      return { status: "found", message: { channel, id: message.name } };
-    } catch (err) {
-      if (googleErrorStatus(err) === 404) return { status: "absent" };
-      throw err;
-    }
+  async findMessageByNonce(_channel: ChannelRef, _nonce: string): Promise<DeliveryNonceLookup> {
+    // Current app auth cannot prove absence; keep uncertain output without a denied lookup.
+    return { status: "indeterminate",
+      reason: "Google Chat nonce lookup is unsupported until history access is configured with admin-approved chat.app.messages.readonly" };
   }
 
   async resolveChannel(channel: ChannelRef): Promise<ChannelRef> {

@@ -111,7 +111,10 @@ export class GoogleChatAdapter implements ChatAdapter {
     if (command) {
       const identity = event.type === "APP_COMMAND" ? interactionId : message?.name ?? interactionId;
       if (!identity) throw new Error("Google Chat command has no durable message identity");
-      await this.receiveCommand(command, inboundId(identity));
+      const replyChannel = message && message.threadReply !== true
+        && event.appCommandMetadata?.appCommandType !== "QUICK_COMMAND"
+        ? { platform: this.platform, id: resourceId(command.space, "spaces") } : undefined;
+      await this.receiveCommand(command, inboundId(identity), replyChannel);
       return;
     }
     if (event.type !== "MESSAGE") return;
@@ -144,7 +147,7 @@ export class GoogleChatAdapter implements ChatAdapter {
     finally { signal?.removeEventListener("abort", abort); }
   }
 
-  private async receiveCommand(command: GoogleChatCommand, messageId: string): Promise<void> {
+  private async receiveCommand(command: GoogleChatCommand, messageId: string, replyChannel?: ChannelRef): Promise<void> {
     if (!this.commandDeps) throw new Error("Google Chat command handlers not installed");
     const { store } = this.commandDeps;
     const channel = command.thread ? channelForThread(command.thread)
@@ -162,7 +165,7 @@ export class GoogleChatAdapter implements ChatAdapter {
         return;
       }
       const respond = async (channel: ChannelRef, text: string) => {
-        receipt.replies.push({ channel, text, index: receipt.replies.length });
+        receipt.replies.push({ channel: replyChannel ?? channel, text, index: receipt.replies.length });
       };
       try {
         const result = await executeGoogleChatCommand({ ...command,

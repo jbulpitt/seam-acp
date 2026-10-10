@@ -144,7 +144,9 @@ describe("Google Chat mention-only shared spaces", () => {
 
   it("keeps durable admission before ACK for a mentioned Space turn", async () => {
     const h = setup(); let admit!: () => void;
-    h.adapter.onMessage(msg => { admit = () => msg.onAdmitted?.(); });
+    h.adapter.onMessage(msg => new Promise<void>(resolve => {
+      admit = () => { msg.onAdmitted?.(); resolve(); };
+    }));
     const processing = h.deliver(event());
     await vi.waitFor(() => expect(admit).toBeTypeOf("function"));
     expect(h.request).not.toHaveBeenCalled(); admit(); await processing;

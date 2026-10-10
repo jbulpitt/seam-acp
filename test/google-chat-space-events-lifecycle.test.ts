@@ -159,4 +159,77 @@ describe("Google Chat Workspace subscription lifecycle", () => {
     expect(h.logs.some(row => row.err?.message === cause.message)).toBe(true);
     expect(h.store.googleChatSpaces.get(space.name)?.subscription?.name).toBe("subscriptions/one");
   });
+
+  it("retries failed renewals with capped backoff, logs every native cause, and resets after success", async () => {
+    const h = fixture(); await h.worker.start();
+    const cause = new WorkspaceEventsOperationError({ code: 14, message: "Google: subscription renewal temporarily unavailable" });
+    const delays = [1000, 2000, 4000, 8000, 16000, 30000, 30000];
+    for (let i = 0; i <= delays.length; i++) h.client.renew.mockRejectedValueOnce(cause);
+    await vi.advanceTimersByTimeAsync(3_300_000);
+    expect(h.client.renew).toHaveBeenCalledTimes(1);
+    for (const [index, delay] of delays.entries()) {
+      await vi.advanceTimersByTimeAsync(delay - 1);
+      expect(h.client.renew).toHaveBeenCalledTimes(index + 1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(h.client.renew).toHaveBeenCalledTimes(index + 2);
+    }
+    const failures = h.logs.filter(row => row.msg === "Google Chat Workspace subscription renewal failed");
+    expect(failures).toHaveLength(8);
+    expect(failures.every(row => row.err.message.includes(cause.message) && row.err.code === cause.code)).toBe(true);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(h.client.renew).toHaveBeenCalledTimes(9);
+    expect(Date.parse(h.store.googleChatSpaces.get(space.name)!.subscription!.expireTime)).toBe(Date.now() + 3600_000);
+    h.client.renew.mockRejectedValueOnce(cause);
+    await vi.advanceTimersByTimeAsync(3_300_000);
+    expect(h.client.renew).toHaveBeenCalledTimes(10);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(h.client.renew).toHaveBeenCalledTimes(11);
+  });
+
+  it("recreates after expiry and keeps retrying if recreation also fails", async () => {
+    const h = fixture(); h.remote.push(saved("subscriptions/old", 3)); await h.worker.start();
+    h.worker.recordAppUser(space.name, "users/seam");
+    const renewalCause = new Error("Google: renewal request unavailable");
+    const createCause = new WorkspaceEventsOperationError({ code: 14, message: "Google: create request unavailable" });
+    h.client.renew.mockRejectedValue(renewalCause); h.client.create.mockRejectedValueOnce(createCause);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(h.client.renew).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(h.client.renew).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(h.client.renew).toHaveBeenCalledTimes(2);
+    expect(h.client.create).toHaveBeenCalledTimes(1);
+    expect(h.logs.some(row => row.err?.message.includes(createCause.message))).toBe(true);
+    expect(h.store.googleChatSpaces.get(space.name)?.subscription).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(3999);
+    expect(h.client.create).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(h.client.create).toHaveBeenCalledTimes(2);
+    expect(h.store.googleChatSpaces.get(space.name)).toEqual({ space, appUser: "users/seam", subscription: h.remote[1] });
+    expect(h.store.googleChatSpaces.get(space.name)!.subscription!.name).toBe("subscriptions/one");
+  });
+
+  it("rearms a failed renewal from the durable expiry after restart", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "gchat-renewal-retry-")); dirs.push(dir);
+    const dbPath = join(dir, "seam.db"), h = fixture(dbPath);
+    await h.worker.start(); h.client.renew.mockRejectedValueOnce(new Error("Google: temporary renewal failure"));
+    const original = h.remote[0]!;
+    await vi.advanceTimersByTimeAsync(3_300_000); await h.worker.stop();
+    h.store.close(); stores.splice(stores.indexOf(h.store), 1);
+    const next = fixture(dbPath); next.remote.push(original); await next.worker.start();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(next.client.create).not.toHaveBeenCalled(); expect(next.client.renew).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(1000); expect(h.client.renew).toHaveBeenCalledOnce();
+  });
+
+  it.each(["removal", "stop"])("cancels a failed renewal's retry on %s without recreating the subscription", async action => {
+    const h = fixture(); await h.worker.start();
+    h.client.renew.mockRejectedValueOnce(new Error("Google: temporary renewal failure"));
+    await vi.advanceTimersByTimeAsync(3_300_000);
+    if (action === "removal") await h.worker.handle({ type: "REMOVED_FROM_SPACE", space });
+    else await h.worker.stop();
+    await vi.advanceTimersByTimeAsync(3600_000);
+    expect(h.client.renew).toHaveBeenCalledOnce(); expect(h.client.create).toHaveBeenCalledOnce();
+    if (action === "removal") expect(h.store.googleChatSpaces.get(space.name)).toBeUndefined();
+  });
 });

@@ -13,11 +13,12 @@ export function googleChatStatusPanel(state: StatusPanel): StructuredPanel {
   if (pct != null) segments.push(`🪟 ${pct}%`);
   segments.push(`🧠 ${state.effort ?? "default"}`);
   if (state.fastMode) segments.push(`⚡ fast ${state.fastMode}`);
-  // Terminal causes currently arrive in Action; keep them visible without a field.
-  const cause = state.state === "Failed" || state.state === "Timed out" ? state.action : undefined;
+  // Recovery/terminal reasons arrive in Action; keep them visible without a field.
+  const reason = state.state === "Waiting" || state.state === "Failed" || state.state === "Timed out"
+    ? state.action : undefined;
   return { ...panel,
     fields: panel.fields.filter(field => field.name !== "Action"),
-    description: [panel.description, cause].filter(Boolean).join("\n") || undefined,
+    description: [panel.description, reason].filter(Boolean).join("\n") || undefined,
     footer: [...lines, segments.join(" • ")].join("\n"),
   };
 }

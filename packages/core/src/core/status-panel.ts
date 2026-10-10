@@ -89,7 +89,8 @@ export function renderStatusPanel(
     ...(input.brandIconURL ? { brandIconURL: input.brandIconURL } : {}),
     ...(input.authorName ? { authorName: input.authorName } : {}),
   };
-  return { ...renderer.statusPanel(panel), status: panel };
+  const { modelDescription: _description, modelEvidence: _evidence, ...status } = panel;
+  return { ...renderer.statusPanel(panel), status };
 }
 
 /** True when a {@link PanelOrigin} carries anything worth rendering. An origin

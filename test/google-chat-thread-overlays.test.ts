@@ -148,6 +148,47 @@ describe("platform-aware persisted thread overlays", () => {
     expect(doc.threads[chat.id]).toBeUndefined();
   });
 
+  it("retires and clears an accepted switch only after the Chat overlay is committed", async () => {
+    const h = fixture();
+    await h.router.getOrStartRuntime(h.record());
+    const observed: Array<{ agent: string; acp: string }> = [];
+    const invalidate = h.router.invalidate.bind(h.router);
+    vi.spyOn(h.router, "invalidate").mockImplementation(async (...args) => {
+      observed.push({ agent: JSON.parse(fs.readFileSync(h.file, "utf8")).threads[key]?.agent?.value,
+        acp: h.record().acpSessionId });
+      await invalidate(...args);
+    });
+    const result = await h.runtime.applyAgentChange(chat, h.record(), "codex", actor, async () => {});
+    expect(result).toMatchObject({ ok: true });
+    expect(observed).toEqual([{ agent: "codex", acp: "saved-provider-context" }]);
+    expect(h.record()).toMatchObject({ agentId: "codex", acpSessionId: "" });
+    expect(h.router.hasRuntime(h.record().id)).toBe(false);
+  });
+
+  it("restores an existing qualified Chat overlay when model verification refuses it", async () => {
+    const h = fixture();
+    const original = { agent: { value: "claude" }, model: { value: "claude-default" }, role: { value: "worker" } };
+    fs.writeFileSync(h.file, JSON.stringify({ channels: {}, threads: {
+      [key]: original, "222222222222222222": h.sibling,
+    } }));
+    expect(reloadChannelPresets(h.maps, h.file, logger)).toMatchObject({ ok: true });
+    const warm = await h.router.getOrStartRuntime(h.record());
+    const before = { ...h.record() };
+    const spawn = h.router.planRuntimeSpawn.bind(h.router);
+    vi.spyOn(h.router, "planRuntimeSpawn").mockImplementation(row => ({ ...spawn(row), model: "wrong-model" }));
+    const retired = vi.spyOn(h.router, "invalidate");
+    const result = await h.runtime.applyModelChange(chat, h.record(), "claude-reviewed", actor, async () => {});
+    expect(result).toMatchObject({ ok: false, error: expect.stringContaining("effective configuration did not match") });
+    const doc = JSON.parse(fs.readFileSync(h.file, "utf8"));
+    expect(doc.threads[key]).toEqual(original);
+    expect(doc.threads[chat.id]).toBeUndefined();
+    expect(doc.threads["222222222222222222"]).toEqual(h.sibling);
+    expect(h.maps.threadPresets.get(chat.id)).toEqual(original);
+    expect(h.record()).toMatchObject({ agentId: before.agentId, configJson: before.configJson, acpSessionId: before.acpSessionId });
+    expect(retired).not.toHaveBeenCalled();
+    expect(h.router.getRuntime(before.id)).toBe(warm);
+  });
+
   it.each([chat, discord])("refused $platform agent switches preserve the warm runtime and every ACP binding write", async channel => {
     const h = fixture(channel);
     const warm = await h.router.getOrStartRuntime(h.record());

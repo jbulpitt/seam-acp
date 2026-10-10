@@ -266,7 +266,7 @@ export interface StatusPanel {
   activity?: string[];
   /** Last few lines of model reasoning (oldest → newest). */
   thinking?: string[];
-  /** Visible in-flight thought, also the final entry in thinking. */
+  /** In-flight thought buffer; thinking contains its trimmed visible form. */
   thinkingPending?: string;
   /** `"simple"` drops repo/model/action/effort/tool-tags; default `"full"`. */
   style?: StatusCardStyle;

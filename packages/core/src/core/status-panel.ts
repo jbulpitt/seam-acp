@@ -44,7 +44,7 @@ export interface StatusPanelInput {
   activity?: string[];
   /** Last few lines of model reasoning (oldest → newest). */
   thinking?: string[];
-  /** Visible in-flight thought, also the final entry in thinking. */
+  /** In-flight thought buffer; thinking contains its trimmed visible form. */
   thinkingPending?: string;
   style?: StatusCardStyle;
   brandIconURL?: string;
@@ -339,7 +339,7 @@ export class TurnStatus {
       ...(contextPct != null ? { contextPct } : {}),
       activity: this.activity.length ? [...this.activity] : undefined,
       ...(thinking ? { thinking } : {}),
-      ...(pending && !this.isSystemInstruction(pending) ? { thinkingPending: pending } : {}),
+      ...(pending && !this.isSystemInstruction(pending) ? { thinkingPending: this.thinkingPending } : {}),
       ...(this.style !== "full" ? { style: this.style } : {}),
       ...(this.brandIconURL ? { brandIconURL: this.brandIconURL } : {}),
       ...(this.authorName ? { authorName: this.authorName } : {}),

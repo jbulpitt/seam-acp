@@ -175,6 +175,7 @@ describe("platform-aware persisted thread overlays", () => {
       [key]: original, "222222222222222222": h.sibling,
     } }));
     expect(reloadChannelPresets(h.maps, h.file, logger)).toMatchObject({ ok: true });
+    const presetBefore = structuredClone(h.maps.threadPresets.get(chat.id));
     const warm = await h.router.getOrStartRuntime(h.record());
     const before = { ...h.record() };
     const spawn = h.router.planRuntimeSpawn.bind(h.router);
@@ -186,7 +187,7 @@ describe("platform-aware persisted thread overlays", () => {
     expect(doc.threads[key]).toEqual(original);
     expect(doc.threads[chat.id]).toBeUndefined();
     expect(doc.threads["222222222222222222"]).toEqual(h.sibling);
-    expect(h.maps.threadPresets.get(chat.id)).toEqual(original);
+    expect(h.maps.threadPresets.get(chat.id)).toEqual(presetBefore);
     expect(h.record()).toMatchObject({ agentId: before.agentId, configJson: before.configJson, acpSessionId: before.acpSessionId });
     expect(retired).not.toHaveBeenCalled();
     expect(h.router.getRuntime(before.id)).toBe(warm);

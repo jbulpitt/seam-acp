@@ -79,6 +79,22 @@ describe("Google Chat compact status cards", () => {
     expect(output.match(/💡/g)).toHaveLength(1);
   });
 
+  it("shows a pending-only thought once, and no thought when neither exists", () => {
+    const turn = new TurnStatus({ model: "m", repoDisplay: "r" });
+    expect(text(turn)).not.toContain("💡");
+    turn.pushThinkingChunk("first partial");
+    expect(text(turn)).toContain("💡 first partial");
+    expect(text(turn).match(/💡/g)).toHaveLength(1);
+  });
+
+  it("does not confuse identical complete and pending lines", () => {
+    const turn = new TurnStatus({ model: "m", repoDisplay: "r" });
+    turn.pushThinkingChunk("same text\nsame text");
+    expect(text(turn)).toContain("💡 same text<br>💡 same text");
+    turn.pushThinkingChunk("\n");
+    expect(text(turn).match(/💡/g)).toHaveLength(1);
+  });
+
   it("promotes the pending line and keeps it beside the next arriving line", () => {
     const turn = status();
     turn.pushThinkingChunk(" now complete\nnext partial");
@@ -154,6 +170,32 @@ describe("Google Chat compact status cards", () => {
     const turn = new TurnStatus({ model: "m", repoDisplay: "r" });
     turn.context = "30k / unknown";
     expect(text(turn)).toBe("⏱ 12s • 🧠 default");
+  });
+
+  it("keeps just the percentage when only a formatted context reading is available", () => {
+    const turn = new TurnStatus({ model: "m", repoDisplay: "r" });
+    turn.context = "30k / 1m (3%)";
+    expect(text(turn)).toBe("⏱ 12s • 🪟 3% • 🧠 default");
+  });
+
+  it("retains the requested Chat header and Repo even with Discord's simple style selected", () => {
+    const turn = status();
+    turn.style = "simple";
+    expect(card(turn).header?.title).toBe("Working");
+    expect(card(turn).header?.subtitle).toBe("gpt-6-astra (default)");
+    expect(JSON.stringify(card(turn))).toContain('"topLabel":"Repo"');
+    expect(text(turn).match(/💡/g)).toHaveLength(2);
+    expect(text(turn)).toContain("🧠 high");
+    expect(panel(turn).fields).toEqual([]);
+    expect(panel(turn).author).toBe("Working");
+  });
+
+  it.each(["Failed", "Timed out"] as const)("keeps the %s cause visible without the Action field", state => {
+    const turn = status();
+    turn.setState(state);
+    turn.setAction("ENOENT: spawn /path/to/agent ENOENT");
+    expect(text(turn)).toContain("ENOENT: spawn /path/to/agent ENOENT");
+    expect(JSON.stringify(card(turn))).not.toContain('"topLabel":"Action"');
   });
 
   it("keeps dispatch provenance and real-cause notices", () => {

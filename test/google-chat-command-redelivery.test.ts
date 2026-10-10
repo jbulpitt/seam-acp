@@ -40,21 +40,46 @@ function setup(db = ":memory:") {
   const applyModelChange = vi.fn(async (_ch, _record, _arg, _actor, respond) => {
     await respond("Model changed"); return { ok: true, message: "Model changed" };
   });
+  const applyRepoChange = vi.fn(async () => ({ ok: true, message: "Repo changed", sessionReset: true, resetPending: false }));
+  const configure = vi.fn(async () => ({ ok: true, applied: { effort: "high" }, sessionReset: false, runtimeReloaded: false, warnings: [] }));
   const cancelChannel = vi.fn(async () => ({ parked: null, cancelled: { cancelled: true, starting: false },
     outcome: "idle", queue: { state: "idle", queued: 0 } }));
   adapter.setCommandDeps({ store, router: { ensureSessionRecord,
     bindRecordLocation: () => "local",
     describeConfig: () => ({ agent: { value: "claude" }, model: { value: "claude-default" } }) },
     mutation: { readThreadPresetEntry: () => undefined, applyThreadOverlay: () => ({ ok: true }) },
-    runtimeTransition: { applyAgentChange, applyModelChange }, cancelChannel } as any);
+    runtimeTransition: { applyAgentChange, applyModelChange, configure }, cancelChannel,
+    configPlan: { applyRepoChange, listRepos: async () => [] }, modelCatalog: { effortChoices: () => [] } } as any);
   const transport = new PubSubPullTransport({ api: { request }, logger, subscription: "projects/test/subscriptions/events",
     receive: (...args) => adapter.receiveEvent(...args) });
   const deliver = (raw: unknown, publication = "first") => transport.process({ ackId: `ack-${publication}`,
     message: { messageId: publication, data: Buffer.from(JSON.stringify(raw)).toString("base64") } });
-  return { store, adapter, request, ensureSessionRecord, applyAgentChange, applyModelChange, cancelChannel, deliver };
+  return { store, adapter, request, ensureSessionRecord, applyAgentChange, applyModelChange, cancelChannel, deliver, applyRepoChange, configure };
 }
 
 describe("durable Google Chat command effects before reply delivery", () => {
+  it.each([5, 6])("does not repeat command %s after ACK failure and a controller/store restart", async id => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gchat-config-receipt-")); dirs.push(dir);
+    const db = path.join(dir, "seam.db");
+    const h = setup(db);
+    const ackFailure = new Error("Pub/Sub ACK unavailable");
+    h.request.mockImplementation(async scope => {
+      if (scope === "pubsub") throw ackFailure;
+      return { name: "spaces/dm/messages/reply", thread: { name: "spaces/dm/threads/invocation" } };
+    });
+    const raw = event(id, id === 5 ? "/repo new" : "/effort high");
+    await expect(h.deliver(raw)).rejects.toBe(ackFailure);
+    expect((id === 5 ? h.applyRepoChange : h.configure)).toHaveBeenCalledOnce();
+    expect(h.store.getInbound(admissionId(id))?.state).toBe("completed");
+    h.store.close(); stores.delete(h.store);
+    const restarted = setup(db);
+    await restarted.deliver(raw, "redelivery-after-boot");
+    expect(restarted.applyRepoChange).not.toHaveBeenCalled();
+    expect(restarted.configure).not.toHaveBeenCalled();
+    expect(restarted.ensureSessionRecord).not.toHaveBeenCalled();
+    expect(restarted.request.mock.calls.map(([scope]) => scope)).toEqual(["pubsub"]);
+  });
+
   it("redelivered /new with a different publication id creates and binds exactly one thread", async () => {
     const h = setup();
     await h.deliver(event(1, "/new Another task"));

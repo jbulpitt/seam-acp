@@ -265,6 +265,12 @@ export class RuntimeTransition {
 
   private async applySavedSelectionNow(record: SessionRecord, before: ConfigDescription): Promise<void> {
     const after = this.deps.router.describeConfig(record);
+    if (before.cwd?.value !== after.cwd?.value) {
+      await this.retire(record.id, { clearAcpSession: true, clearStartFailure: true,
+        bindingChange: { source: "RuntimeTransition.applySavedSelection", cause: "saved cwd changed" },
+        operatorIntent: "replace-session" });
+      return;
+    }
     const agentChanged = before.agent.value !== after.agent.value;
     const modelChanged = before.model.value !== after.model.value;
     const effortChanged = before.effort.value !== after.effort.value;
@@ -534,7 +540,8 @@ export class RuntimeTransition {
   async configure(
     caller: SessionRecord,
     target: SessionRecord,
-    input: ConfigureThreadInput
+    input: ConfigureThreadInput,
+    actor: MutationActor = { id: null, name: `seam-mcp:${caller.channelRef}` }
   ): Promise<ConfigureThreadOutcome> {
     const supplied = input.agent !== undefined || input.model !== undefined || input.effort !== undefined || input.role !== undefined || input.disableThreadPrefix !== undefined || input.fastMode !== undefined;
     if (!supplied) return { ok: false, error: "Provide at least one of agent, model, effort, role, disableThreadPrefix, or fastMode." };
@@ -701,7 +708,6 @@ export class RuntimeTransition {
       };
     }
 
-    const actor = { id: null, name: `seam-mcp:${caller.channelRef}` };
     const persisted = this.applyTargetIdentity(
       target,
       {

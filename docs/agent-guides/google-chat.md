@@ -41,7 +41,7 @@ be created and makes no change. With unspecified threading metadata, a
 provided thread is used; otherwise the session is space-wide. Users sharing
 a thread also share its agent, model and conversation.
 
-The registered `/new`, `/cancel`, `/agent` and `/model` commands work in spaces
+The registered `/new`, `/cancel`, `/agent`, `/model`, `/repo` and `/effort` commands work in spaces
 without an @mention. The existing user allowlist still applies to prompts,
 commands and card clicks. Shared-space permissions remain `always`; this
 slice does not add permission cards or change the platform default.
@@ -71,6 +71,33 @@ slice does not add permission cards or change the platform default.
 The adapter starts when the project, subscription and credentials file are
 configured. Use one controller consumer per subscription. Apply controller
 configuration through the normal [redeploy path](deploying.md).
+
+### Session repo and effort
+
+Register these slash commands in the Chat API configuration alongside ids 1–4:
+
+- `/repo`, id **5**, description `Set this session's repo: /repo <path>`.
+- `/effort`, id **6**, description `Set this session's effort: /effort <level>`.
+
+`/repo <path>` uses the same thread `cwd` overlay as Discord's repo picker.
+Relative paths resolve under the bound bridge's workspace root (`REPOS_ROOT`
+on that host); absolute paths use that host's filesystem too. The host validates
+the directory and returns its real cause when it cannot use it. Bare `/repo`
+shows usage, the current cwd and the existing host workspace list.
+
+A changed cwd starts a fresh session. If a turn is running, it finishes in the
+old cwd before the next turn starts in the new repo. The confirmation states
+whether the session reset now, a reset is pending, or no reset was needed.
+
+`/effort <level>` uses the same configuration operation as `configure_thread`.
+Bare `/effort` shows the current effort and the current agent/model's catalog
+levels. `auto` selects the default; invalid levels return the catalog or live
+provider's actual reason. Effort never resets conversation context, although
+some agents reload their runtime to apply it.
+
+Both commands reply privately: top-level replies are unthreaded, and in-thread
+replies stay in that thread. In unthreaded Spaces they change the shared Space
+session. Durable receipts prevent redelivery from applying a command twice.
 
 The standalone Shared Drive uploader also defines
 `GOOGLE_CHAT_DRIVE_FOLDER_ID` and `GOOGLE_CHAT_DRIVE_SHARING_POLICY`
@@ -117,7 +144,7 @@ asset paths and operator commands in `docs/local/`.
 
 The live adapter supports formatted text turns, cardsV2 status and interaction
 cards, threaded replies, inbound attachment downloads and `/new`, `/cancel`,
-`/agent`, `/model`. Configured Shared Drive output uploads files and posts a
+`/agent`, `/model`, `/repo`, `/effort`. Configured Shared Drive output uploads files and posts a
 link; without that configuration, file output uses text or a binary placeholder.
 
 Named-space history reads, reconstruction, search and restart-safe output

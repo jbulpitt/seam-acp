@@ -524,15 +524,6 @@ describe("#302 real ACP handshake and strict session/load recovery", () => {
     const h = harness("local", outputFirst ? "claude-prompt-auth-after-output" : "claude-prompt-auth");
     const spec = { id: "prompt-auth-dispatch", target: THREAD, prompt: ORIGINAL,
       session: "live" as const, kind: "handoff" as const, stream: false, reportBack: false };
-    const record = h.store.get(`discord:${THREAD}`)!;
-    const described = h.router.describeConfig(record);
-    const boot = (h.orch as any).attemptBoot;
-    h.store.turnAttempts.registerOwner(boot);
-    h.store.turnAttempts.claim(spec, executionIdentity({
-      agentId: record.agentId, location: described.location.value, session: "live",
-      model: described.model.value, effort: described.effort.value,
-      cwd: described.cwd.value, config: record.configJson,
-    }), boot);
 
     await expect(h.orch.dispatchInjectTurn(spec)).rejects.toMatchObject({ reason: expect.stringMatching(/^reauth-waiting:/) });
     expect(h.calls.rejectedPrompts).toHaveLength(1);

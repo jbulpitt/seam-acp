@@ -862,6 +862,7 @@ export class Orchestrator {
     this.attemptStatusPanels.clear();
     for (const unsubscribe of this.remoteAdoptionWaiters.values()) unsubscribe();
     this.remoteAdoptionWaiters.clear();
+    for (const finish of this.remoteAdoptionFinishers.values()) finish();
     this.store.turnAttempts.suspendBoot(this.attemptBoot);
     for (const phase of this.dispatchAcquisitions) phase.shutdown();
   }
@@ -15300,7 +15301,7 @@ export class Orchestrator {
         }
       }
       child = mux.adopt(binding.slot, {
-        allowAppTraffic: attempt.spec.session === "live",
+        allowAppTraffic: true,
         ...(Number.isSafeInteger(snapshot.outputAckedThrough)
           ? { afterSeq: snapshot.outputAckedThrough }
           : {}),
@@ -15311,6 +15312,23 @@ export class Orchestrator {
           child,
           binding.acpSessionId,
         );
+      } else {
+        const identity = parseExecutionIdentity(attempt.identity)!;
+        const profile = this.router.getProfile(identity.agent, binding.location)!;
+        const source = this.recordForChannel(attempt.spec.target);
+        const record: SessionRecord = {
+          id: source?.id ?? makeSessionId(this.platformForChannel(attempt.spec.target), attempt.spec.target),
+          platform: source?.platform ?? this.platformForChannel(attempt.spec.target),
+          channelRef: attempt.spec.target, parentRef: source?.parentRef ?? null,
+          agentId: identity.agent, acpSessionId: binding.acpSessionId, repoPath: identity.cwd,
+          configJson: identity.config, createdUtc: attempt.spec.createdUtc ?? binding.delegatedUtc,
+          updatedUtc: binding.delegatedUtc,
+        };
+        recoveryRuntime = new AgentRuntime({ profile, logger: this.logger.child({ attempt: attempt.id }),
+          ...this.router.recoveryClientOptions(record), bridgeHealth: mux, spawnFn: () => child! });
+        recoveryRuntime.modelOverride = identity.model;
+        recoveryRuntime.effortOverride = identity.effort || undefined;
+        recoveryRuntime.attachRecovery(child, binding.acpSessionId, undefined, Date.parse(binding.delegatedUtc));
       }
     } catch (err) {
       child?.detach();
@@ -15394,6 +15412,13 @@ export class Orchestrator {
         }
       });
     }
+    if (recoveryRuntime && !recoveryRecord) {
+      recoveryRuntime.onEvent(async event => {
+        if (event.kind === "notice" && event.severity === "error") {
+          await this.adapter.sendMessage(target, `❗ ${formatAgentNotice(event)}`);
+        } else if (event.kind === "agent-file") await this.sendAgentFile(target, event);
+      });
+    }
     this.remoteAdoptionWaiters.get(attempt.id)?.();
     this.remoteAdoptionWaiters.delete(attempt.id);
     let settle!: () => void;
@@ -15418,6 +15443,7 @@ export class Orchestrator {
       if (this.attemptStatusPanels.get(attempt.id) === adoptedPanel) this.attemptStatusPanels.delete(attempt.id);
       const retained = recoveryRuntime && recoveryRecord
         && this.router.releaseRecoveryRuntime(recoveryRecord.id, recoveryRuntime, retainChild);
+      if (recoveryRuntime && !recoveryRecord) recoveryRuntime.releaseRecovery();
       this.remoteAdoptionFinishers.delete(attempt.id);
       if (!retained) child.detach();
       if (cardSettlement) this.trackContinuation(cardSettlement.then(() => settle()));
@@ -15444,10 +15470,12 @@ export class Orchestrator {
         this.continueLostRemoteTurn(current, "the agent process exited before the turn finished");
         return;
       }
-      if (recoveryRuntime && adoptedRenderer) {
+      if (recoveryRuntime) {
         // The result frame can arrive before the ACP reader queues preceding stdout.
         await new Promise<void>((resolve) => setImmediate(resolve));
         await recoveryRuntime.idle();
+      }
+      if (adoptedRenderer) {
         await adoptedRenderer.whenIdle();
         let through = 0;
         for (const text of recordedChunks) {
@@ -15464,9 +15492,7 @@ export class Orchestrator {
         await adoptedRenderer.finalize();
       }
       const failed = result.status === "failed";
-      // A substitution selected before restart must still be visible when the
-      // result is adopted without an AgentRuntime/event handler. Use the notice
-      // bound before prompt bytes, not today's possibly changed thread config.
+      // Keep the model notice recorded before restart with its recovered result.
       const output = agentChoiceOutput(binding.modelFallbackNotice
         ? `${binding.modelFallbackNotice}\n\n${result.text}` : result.text, current.spec);
       const error = failed

@@ -13,7 +13,7 @@ export interface PermissionSnapshot {
 }
 
 type Pending = PermissionIdentity & {
-  options: RequestPermissionRequest["options"];
+  request: RequestPermissionRequest;
   response?: RequestPermissionResponse;
 };
 
@@ -36,7 +36,7 @@ export class PendingPermissions {
       const request = frame.params as RequestPermissionRequest;
       this.requests.set(this.key(frame.id), {
         requestId: frame.id, sessionId: request.sessionId,
-        toolCallId: request.toolCall.toolCallId, options: request.options,
+        toolCallId: request.toolCall.toolCallId, request,
       });
     } else if (this.isId(frame.id) && !frame.method) {
       const session = this.prompts.get(this.key(frame.id));
@@ -72,12 +72,19 @@ export class PendingPermissions {
     return { state: request ? request.response ? "answered" : "pending" : "gone", pid: this.pid };
   }
 
+  /** Output acknowledgement does not answer a client request. */
+  unanswered(sessionId: string): string[] {
+    return [...this.requests.values()].filter(request => request.sessionId === sessionId && !request.response)
+      .map(request => `${JSON.stringify({ jsonrpc: "2.0", id: request.requestId,
+        method: "session/request_permission", params: request.request })}\n`);
+  }
+
   answer(identity: PermissionIdentity, response: RequestPermissionResponse): PermissionSnapshot {
     const request = this.find(identity);
     if (!request || request.response) return this.status(identity);
     const outcome = response.outcome;
     if (outcome.outcome === "selected" &&
-      !request.options.some(option => option.optionId === outcome.optionId)) {
+      !request.request.options.some(option => option.optionId === outcome.optionId)) {
       throw new Error("The selected permission option was not offered by the agent.");
     }
     const line = `${JSON.stringify({ jsonrpc: "2.0", id: request.requestId, result: response })}\n`;

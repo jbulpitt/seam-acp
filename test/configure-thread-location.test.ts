@@ -105,7 +105,8 @@ async function fixture() {
   stops.push(() => new Promise<void>(resolve => server.close(() => resolve())));
   await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
   const port = (server.address() as { port: number }).port;
-  hub = new BridgeHub({ config, logger, httpServer: server, healthPort: port, dataDir: dir, mutation });
+  hub = new BridgeHub({ config, logger, httpServer: server, healthPort: port, dataDir: dir, mutation,
+    localBridgeTokenHash: hashBridgeToken("unused-local-fixture") });
   stops.push(() => hub.close());
   const rpcs: Array<{ host: string; method: string; params: any }> = [];
   for (const host of ["seam-dev-server", "gh-server"]) {

@@ -512,7 +512,7 @@ describe("#206 negative search: no repo-selection path invokes a Discord rename"
     );
     expect(configure).toContain("configure_thread");
     expect(configure).toMatch(/\bcwd\b/);
-    expect(controlSrc).toContain("prepareRepoChange");
+    expect(fs.readFileSync(path.join(REPO_ROOT, "packages/core/src/core/runtime-transition.ts"), "utf8")).toContain("prepareRepoChange");
     expect(configure).not.toMatch(/repoPath/);
     expect(fs.readFileSync(path.join(REPO_ROOT, "packages/core/src/plugins/thread-naming/index.ts"), "utf8")).toMatch(/name: "rename_thread"/);
     expect(controlSrc).not.toContain("renameThreadForSetup");

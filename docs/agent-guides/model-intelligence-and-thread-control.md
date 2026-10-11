@@ -119,7 +119,7 @@ data tools: inspect the candidates first, then apply the selected runtime.
 Change a target thread's agent, execution host, repo/cwd, model, reasoning effort, naming role, naming
 opt-out, and/or Claude Fast mode. Optional `rebuild: true` runs deterministic
 Discord reconstruction after any configuration change and is valid by itself.
-- **`agent` accepts `agent@host`.** For example, `claude@gh-server` selects Claude
+- **`agent` accepts `agent@host`.** For example, `claude@remote-host` selects Claude
   and binds the thread to that bridge. A bare `claude` keeps its existing host.
   Changing the host starts a fresh session even when the agent stays the same;
   a disconnected host returns the normal bridge error without retiring the old context.
@@ -129,7 +129,7 @@ Discord reconstruction after any configuration change and is valid by itself.
   overlay, so an explicit session cwd pin still wins. A changed effective cwd
   resets an idle session; a running turn finishes unchanged and the result
   reports `resetPending` until the next acquisition. Host and cwd can be set
-  together, e.g. `{ agent: "claude@gh-server", cwd: "/home/jessebulpitt/Projects" }`.
+  together, e.g. `{ agent: "claude@remote-host", cwd: "my-project" }`.
 - **The result is exact, including no-ops.** Agent, model, and effort are always
   returned as the effective post-set identity; each field says whether it
   changed and names its previous value when it did. The target thread receives

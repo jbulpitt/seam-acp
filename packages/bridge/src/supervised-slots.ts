@@ -1,6 +1,6 @@
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
-import type { RemoteRecoveryResult, RemoteRecoverySnapshot } from "@seam/adapters";
+import { threadEnvironment, type RemoteRecoveryResult, type RemoteRecoverySnapshot } from "@seam/adapters";
 import {
   ADAPTER_CHILD_PROTOCOL_VERSION,
   adapterChildLine,
@@ -477,6 +477,7 @@ export class SupervisedSlots {
     const environment = {
       ...exactEnvironment(this.options.environment ?? process.env),
       ...(config.env ?? {}),
+      ...threadEnvironment(config.threadIdentity),
     };
     const spawned = await this.options.client.spawn({
       slot,

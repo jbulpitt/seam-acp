@@ -8,6 +8,7 @@ export type {
   RemoteHostOomEvidence,
 } from "./mux.js";
 export * from "./agent-profile.js";
+export * from "./thread-environment.js";
 export * from "./error-classification.js";
 export * from "./session-failure.js";
 export * from "./provider-retry.js";

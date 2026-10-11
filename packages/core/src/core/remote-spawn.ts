@@ -11,7 +11,7 @@
 import type { ChildProcessByStdio } from "node:child_process";
 import type { Readable, Writable } from "node:stream";
 import type { McpServer } from "@agentclientprotocol/sdk";
-import type { RemoteRung1Policy } from "@seam/adapters";
+import type { RemoteRung1Policy, ThreadIdentity } from "@seam/adapters";
 import { providerRetryBackoff } from "@seam/adapters";
 import { buildSeamMcpServerEntry } from "./mcp/seam-mcp-server.js";
 import { resolveReachableMcpUrl } from "./mcp-url.js";
@@ -115,6 +115,7 @@ export function planSeamMcpInjection(opts: {
 }
 
 export interface RemoteSlotSpawnParams {
+  threadIdentity?: ThreadIdentity;
   mcpServers: McpServer[];
   agentId: string;
   model?: string;
@@ -144,6 +145,7 @@ export async function spawnRemoteSlot(
   if (params.effort !== undefined) rpcParams.effort = params.effort;
   if (params.cwd !== undefined) rpcParams.cwd = params.cwd;
   if (params.rung1Recovery !== undefined) rpcParams.rung1Recovery = params.rung1Recovery;
+  if (params.threadIdentity !== undefined) rpcParams.threadIdentity = params.threadIdentity;
   try {
     const result = await mux.rpc("spawn", rpcParams, { agentId: params.agentId });
     const projectMcpInjection = result && typeof result === "object"

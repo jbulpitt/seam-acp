@@ -5,6 +5,7 @@ import {
   type AgentProfile,
   type AgentClientMetadata,
   type CatalogModelEvidence,
+  type ThreadIdentity,
 } from "@seam/adapters";
 import type { Logger } from "../lib/logger.js";
 import type { SessionStore, SessionBindingChange } from "./session-store.js";
@@ -1426,8 +1427,9 @@ export class SessionRouter {
       throw new Error(`Session ${record.id} is bound to bridge "${location}" that is not connected`);
     }
     const bridgeHealth: RuntimeSpawnPlan["bridgeHealth"] = mux;
-    const spawnChild: RuntimeSpawnPlan["spawnChild"] = (modelOverride, effortOverride) =>
+    const spawnChild: RuntimeSpawnPlan["spawnChild"] = async (modelOverride, effortOverride) =>
       spawnRemoteSlot(mux, {
+        threadIdentity: await this.threadIdentity(record, { agentId, location }),
         mcpServers,
         agentId,
         model: modelOverride,
@@ -1465,6 +1467,15 @@ export class SessionRouter {
       resolveThreadLocation({ threadPresets: this.threadPresets }, record.channelRef);
     this.bindSessionLocationFn?.(record.id, location);
     return location;
+  }
+
+  async threadIdentity(record: Pick<SessionRecord, "platform" | "channelRef" | "parentRef">,
+    binding: { agentId: string; location: string }): Promise<ThreadIdentity> {
+    return {
+      threadId: record.channelRef,
+      channelId: record.parentRef ?? record.channelRef,
+      agentId: `${binding.agentId}@${binding.location}`,
+    };
   }
 
   /** Live session row wins over the captured startRuntime record. */

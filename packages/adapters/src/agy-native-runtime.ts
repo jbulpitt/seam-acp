@@ -10,10 +10,12 @@ import path from "node:path";
 import type { AdapterRuntimeDescriptor } from "./agent-profile.js";
 import { AGY_MANAGED_EXECUTABLE_LABEL } from "./agy-pin-mode.js";
 import { registerOwnedProcessGroup } from "./process-group.js";
+import { THREAD_ENV_KEYS } from "./thread-environment.js";
 
 const SAFE_ENV_KEYS = [
   "HOME", "USERPROFILE", "PATH", "TMPDIR", "TMP", "TEMP",
   "LANG", "LC_ALL", "LC_CTYPE", "TZ", "SystemRoot", "ComSpec", "PATHEXT",
+  ...THREAD_ENV_KEYS,
 ] as const;
 const VERSION_TIMEOUT_MS = 5_000;
 const VERSION_OUTPUT_LIMIT = 16_384;

@@ -5704,6 +5704,7 @@ export class Orchestrator {
     let built: { seed: string; keptTurns: number; summarizedTurns: number; pinnedCount: number } | null = null;
     try {
       built = await this.buildDefaultCompactionSeed({
+        bindingThread: channel,
         profile,
         manager,
         agentId,
@@ -5978,6 +5979,9 @@ export class Orchestrator {
             sessionId: (target && isSessionRecord(target) ? target.id : undefined)
               ?? restrictionChannelId
               ?? `isolated:${profile.id}`,
+            thread: target ? (isSessionRecord(target)
+              ? { platform: target.platform, id: target.channelRef, parentId: target.parentRef ?? undefined }
+              : target) : opts.bindingThread,
           });
           spawnFn = launch.spawnFn;
           mcpServers = launch.mcpServers;
@@ -6270,6 +6274,7 @@ export class Orchestrator {
       strictModel?: boolean;
       location?: string;
       restrictionChannelId?: string;
+      bindingThread?: ChannelRef;
     }
   ): RunAgent {
     const model = opts?.model ?? "default";
@@ -6298,12 +6303,13 @@ export class Orchestrator {
             `You MUST read the ENTIRE file before producing your response.`;
         }
 
-        // No target: these analysis runs belong to no thread, so agent files
-        // are dropped and only the text is collected. No timeout — a fan-out
+        // No output target: collect analysis text without posting agent files.
+        // The binding thread still supplies its process identity. A fan-out
         // stage runs as long as it needs. `awaitIdle` drains trailing chunks
         // before the text is handed to the pipeline.
         const result = await this.injectTurn(null, actualPrompt, {
           session: "isolated",
+          bindingThread: opts?.bindingThread,
           profile,
           ...(opts?.restrictionChannelId ? { restrictionChannelId: opts.restrictionChannelId } : {}),
           sessionManager: manager,
@@ -6432,6 +6438,7 @@ export class Orchestrator {
     // xhigh, Copilot high; agy/remote have no separate knob) — fidelity is the
     // whole point of this tier.
     const runAgent = this.makeCompactionRunAgent(profile, manager, {
+      bindingThread: channel,
       effort: this.compactionEffortFor(profile, "default", "premium", args.location ?? LOCAL_LOCATION),
       ...(args.location ? { location: args.location } : {}),
       ...(args.restrictionChannelId ? { restrictionChannelId: args.restrictionChannelId } : {}),
@@ -6541,6 +6548,7 @@ export class Orchestrator {
     };
 
     const runAgent = this.makeCompactionRunAgent(analysisProfile, analysisManager, {
+      bindingThread: channel,
       model: DISCORD_COMPACTION_MODEL,
       strictModel: true,
       effort: this.compactionEffortFor(analysisProfile, DISCORD_COMPACTION_MODEL, "premium"),
@@ -6572,6 +6580,7 @@ export class Orchestrator {
    *  caller then keeps the legacy behavior. Works for any agent with a transcript
    *  reader; analysis runs in throwaway runtimes. */
   private async buildDefaultCompactionSeed(args: {
+    bindingThread?: ChannelRef;
     profile: AgentProfile;
     manager: ISessionManager;
     agentId: string;
@@ -6609,6 +6618,7 @@ export class Orchestrator {
     // Cheap tier (single-pass summary): a notch below premium on each agent's
     // own scale (Claude high, Copilot medium).
     const runAgent = this.makeCompactionRunAgent(profile, manager, {
+      bindingThread: args.bindingThread,
       model: compactionModel,
       cwd,
       effort: this.compactionEffortFor(profile, compactionModel, "cheap", location),
@@ -6698,10 +6708,17 @@ export class Orchestrator {
     effort?: string;
     mcpServers?: McpServer[];
     sessionId: string;
+    thread?: ChannelRef;
   }): { spawnFn: NonNullable<InjectTurnOptions["spawnFn"]>; mcpServers: McpServer[] } {
     const mcpServers = args.mcpServers ?? [];
     if (!this.bridgeHub) throw new Error(`bridge "${args.location}" is not connected`);
+    const record = this.store.get(args.sessionId) ?? (args.thread
+      ? this.store.get(makeSessionId(args.thread.platform, args.thread.id)) ?? {
+          platform: args.thread.platform, channelRef: args.thread.id, parentRef: args.thread.parentId ?? null,
+        }
+      : undefined);
     const planned = planIsolatedBridgeSpawn({
+      ...(record ? { threadIdentity: () => this.router.threadIdentity(record, { agentId: args.profile.id, location: args.location }) } : {}),
       hub: this.bridgeHub,
       sessionId: args.sessionId,
       location: args.location,
@@ -7274,6 +7291,7 @@ export class Orchestrator {
     const planned = planIsolatedBridgeSpawn({
       hub: this.bridgeHub,
       sessionId: isolatedBindSessionId(opts.spec.id),
+      threadIdentity: () => this.router.threadIdentity(opts.record, binding),
       location: opts.workerLocation,
       agentId,
       cwd: opts.cwd,
@@ -17510,6 +17528,7 @@ export class Orchestrator {
     );
 
     const runAgent = this.makeCompactionRunAgent(profile, manager, {
+      bindingThread: channelRef,
       model: compactionModel,
       cwd,
       effort: "low",

@@ -49,6 +49,7 @@ interface SessionActionServices {
     model?: string; effort?: string; summary: string; location: string; sessionId: string;
   }): Promise<string>;
   buildSeed(args: {
+    bindingThread?: ChannelRef;
     profile: AgentProfile; manager: ISessionManager; agentId: string; location: string;
     cwd: string; sessionId: string; restrictionChannelId: string;
   }): Promise<{ seed: string; keptTurns: number; summarizedTurns: number; pinnedCount: number } | null>;
@@ -178,6 +179,7 @@ export class SessionActions {
       throw new Error(`Compaction is not supported for agent profile \`${record.agentId}\` (no summarizer model).`);
     }
     const built = await services.buildSeed({
+      bindingThread: { platform: record.platform, id: record.channelRef, parentId: record.parentRef ?? undefined },
       profile, manager, agentId: record.agentId, location: binding.location, cwd, sessionId,
       restrictionChannelId: record.parentRef ?? record.channelRef,
     });

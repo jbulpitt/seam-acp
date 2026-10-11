@@ -55,6 +55,17 @@ still govern the current thread. This primer does not replace them.
    plan and reorient.
 2. Call `threads()` before addressing another thread. Use its exact `id`, heed
    `busy` and `status`, and never hand work to the entry marked `isSelf`.
+   Shells and tool grandchildren inherit the same owner key as
+   `SEAM_THREAD_ID`. Use it for shared-resource registries, locks and scratch
+   directories. Discord uses the thread id; Google Chat uses the exact
+   `<space>.<thread>` ref accepted by `handoff`, `send` and `steer`.
+   `SEAM_CHANNEL_ID` is the parent channel or Space (the thread ref itself
+   when there is no parent). `SEAM_AGENT_ID` is `agentId@location`.
+   Look up the current human name through the `threads()` entry marked
+   `isSelf`. Isolated scheduled runs and
+   preset specialists use their binding thread's key, without an extra run
+   suffix. Bridge reattachment and sessiond resume preserve these values;
+   agent or host selections apply to the next runtime, not its environment.
 3. Choose delivery deliberately:
    - `peek` reads recent context without posting.
    - `send` leaves a note for the target's next inbox poll and starts no turn.

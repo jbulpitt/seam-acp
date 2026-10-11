@@ -435,6 +435,7 @@ describe("#466 scheduled execution boundary", () => {
     expect(h.remoteSpawn).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ holdStdinUntilReady: true }));
     expect(h.mux.rpc).toHaveBeenCalledExactlyOnceWith("spawn", {
       slot: 0, agentId: "agy", model: MODEL, effort: "high", cwd: h.cwd,
+      threadIdentity: { threadId: "author", channelId: "parent", agentId: `agy@${REMOTE}` },
       mcpServers: [h.globalMcp, h.remoteSeam],
       rung1Recovery: DEFAULT_REMOTE_RUNG1_POLICY,
     }, { agentId: "agy" });

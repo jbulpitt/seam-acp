@@ -56,7 +56,7 @@ const logger = pino({ level: "silent" });
 const profiles = ["claude", "codex"].map(id => ({ id, displayName: id, defaultModel: "native",
   staticModels: [{ modelId: "native", name: "Native" }], effort: { mechanism: "meta", levels: ["low", "high"] },
 })) as unknown as AgentProfile[];
-const channel = { platform: "discord", id: "target", parentId: "parent" };
+const channel = { platform: "discord", id: "111111111111111111", parentId: "222222222222222222" };
 const stops: Array<() => void | Promise<void>> = [];
 let dir: string;
 beforeEach(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), "configure-location-")); });
@@ -70,7 +70,7 @@ async function fixture() {
   const nextCwd = path.join(root, "seam-acp");
   fs.mkdirSync(nextCwd, { recursive: true });
   const presetsFile = path.join(dir, "presets.json");
-  fs.writeFileSync(presetsFile, JSON.stringify({ threads: { target: { location: "seam-dev-server" } } }));
+  fs.writeFileSync(presetsFile, JSON.stringify({ threads: { [channel.id]: { location: "seam-dev-server" } } }));
   const maps = buildChannelPresetMaps(presetsFile);
   const config = { ...maps, REPOS_ROOT: path.join(dir, "controller"), CHANNEL_PRESETS_FILE: presetsFile,
     bridgePresets: new Map(["seam-dev-server", "gh-server"].map(id => [id, {
@@ -139,7 +139,7 @@ async function fixture() {
     parentRef: channel.parentId, cwd: root });
   store.upsert({ ...row, acpSessionId: "existing-context" }, { source: "fixture", cause: "existing provider session" });
   const record = store.get(row.id)!;
-  const caller = router.ensureSessionRecord({ platform: "discord", channelRef: "caller", parentRef: "parent", cwd: root });
+  const caller = router.ensureSessionRecord({ platform: "discord", channelRef: "333333333333333333", parentRef: channel.parentId, cwd: root });
   const outcomes: any[] = [];
   const mcp = new SeamMcpServer({ logger, resolveSession: token => token === "caller-fixture" ? caller : undefined,
     resolveThread: id => id === channel.id ? store.get(record.id) ?? undefined : undefined,

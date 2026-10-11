@@ -41,6 +41,8 @@ export interface InjectTurnOptions {
    *   `finally`, so the run never shows up in `/seam sessions`.
    */
   session: "live" | "isolated";
+  /** Owner thread for analysis that collects output without posting there. */
+  bindingThread?: ChannelRef;
 
   /** Model for the turn. Isolated: passed to `newSession`. */
   model?: string;

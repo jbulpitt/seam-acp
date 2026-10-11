@@ -17,6 +17,7 @@ import {
   isRemoteRung1Policy,
   type ModelFallbackPlan,
   type RemoteRung1Policy,
+  type ThreadIdentity,
 } from "@seam/adapters";
 
 const HOST_EXEC_DEFAULT_TIMEOUT_MS = 30_000;
@@ -34,6 +35,7 @@ const SESSION_CWD_METHODS = new Set([
 ]);
 
 export interface SlotSpawnConfig {
+  threadIdentity?: ThreadIdentity;
   agentId?: string;
   cwd?: string;
   /** The controller's cwd, when this host lacks it and runs in `cwd` instead. */
@@ -201,6 +203,7 @@ async function dispatchAdapter(
       throw new Error("spawn received an invalid rung-1 recovery policy");
     }
     ctx.configureSlot?.(slot, {
+      threadIdentity: params.threadIdentity as ThreadIdentity | undefined,
       agentId: str(params.agentId) ?? agentId,
       cwd: spawnCwd,
       ...(spawnCwd !== requestedCwd ? { requestedCwd } : {}),

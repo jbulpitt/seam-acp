@@ -3,7 +3,7 @@
  * bridge spawn. `markSessionBridge` is the #84 hook — this module is
  * the only production caller besides tests.
  */
-import type { AgentProfile } from "@seam/adapters";
+import type { AgentProfile, ThreadIdentity } from "@seam/adapters";
 import type { McpServer } from "@agentclientprotocol/sdk";
 import type { BridgeHub } from "./bridge-hub.js";
 import { LOCAL_LOCATION, normalizeLocation } from "./location.js";
@@ -24,6 +24,7 @@ export function isolatedBindSessionId(dispatchId: string): string {
 }
 
 export function planIsolatedBridgeSpawn(opts: {
+  threadIdentity?: () => Promise<ThreadIdentity>;
   hub: BridgeHub;
   sessionId: string;
   location: string;
@@ -53,8 +54,9 @@ export function planIsolatedBridgeSpawn(opts: {
   return {
     location: loc,
     mcpServers,
-    spawnFn: (modelOverride, effortOverride) =>
+    spawnFn: async (modelOverride, effortOverride) =>
       spawnRemoteSlot(mux, {
+        ...(opts.threadIdentity ? { threadIdentity: await opts.threadIdentity() } : {}),
         mcpServers,
         agentId: opts.agentId,
         model: modelOverride ?? opts.model,

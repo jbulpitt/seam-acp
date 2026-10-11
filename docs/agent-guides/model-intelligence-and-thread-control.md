@@ -125,8 +125,10 @@ Discord reconstruction after any configuration change and is valid by itself.
   a disconnected host returns the normal bridge error without retiring the old context.
 - **`cwd` uses the shared repo picker operation.** Pass an absolute path or a
   repo name relative to the destination bridge's workspace root. Host validation
-  errors (such as ENOENT) are returned before saving. It writes the thread cwd
-  overlay, so an explicit session cwd pin still wins. A changed effective cwd
+  errors (such as ENOENT) are returned before saving, on the new host when supplied
+  together. Like an explicit `/seam config set repo:...`, it replaces the session
+  cwd pin as well as writing the thread overlay. Calls without `cwd` leave the
+  existing session > thread > channel cwd precedence unchanged. A changed effective cwd
   resets an idle session; a running turn finishes unchanged and the result
   reports `resetPending` until the next acquisition. Host and cwd can be set
   together, e.g. `{ agent: "claude@remote-host", cwd: "my-project" }`.

@@ -750,7 +750,7 @@ const TOOLS = [
       "the same deterministic Discord-history reconstruction as /seamadmin rebuild; rebuild:true " +
       "is also valid by itself. The durable Rebuild card is posted in the target thread. " +
       "An agent or host switch ALWAYS creates a fresh session and drops that thread's conversation context. " +
-      "A cwd change uses the repo picker's host validation and thread overlay; a running turn finishes " +
+      "An explicit cwd uses the repo picker's host validation and replaces the session's repo pin; a running turn finishes " +
       "unchanged before the next turn starts a fresh session. Read resetPending in the outcome. " +
       "Model switches follow the adapter-owned catalog: live and reload preserve context, while " +
       "freshSession creates a new ACP session. Read the reported outcome. Effort never resets the ACP session: config-option " +

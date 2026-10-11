@@ -422,9 +422,14 @@ export class ConfigApplyPlan {
       if (changes.disableThreadPrefix) cfg.disableThreadPrefix = true;
       else delete cfg.disableThreadPrefix;
     }
+    if (changes.cwd !== undefined) {
+      if (changes.cwd === null) delete cfg.sessionCwdExplicit;
+      else cfg.sessionCwdExplicit = true;
+    }
     this.store.upsert({
       ...current,
       ...(changes.agent !== undefined ? { agentId: changes.agent } : {}),
+      ...(changes.cwd !== undefined ? { repoPath: changes.cwd } : {}),
       configJson: this.store.writeConfig(cfg),
       updatedUtc: new Date().toISOString(),
     });

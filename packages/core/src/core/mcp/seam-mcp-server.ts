@@ -745,11 +745,13 @@ const TOOLS = [
   {
     name: "configure_thread",
     description:
-      "Change a teammate thread's agent, model, reasoning effort, naming role, automatic-naming " +
+      "Change a teammate thread's agent (agent@host binds its location), repo/cwd, model, reasoning effort, naming role, automatic-naming " +
       "opt-out, and/or Claude Fast mode within YOUR channel. Optional rebuild:true then performs " +
       "the same deterministic Discord-history reconstruction as /seamadmin rebuild; rebuild:true " +
       "is also valid by itself. The durable Rebuild card is posted in the target thread. " +
-      "An agent switch ALWAYS creates a fresh session and drops that thread's conversation context. " +
+      "An agent or host switch ALWAYS creates a fresh session and drops that thread's conversation context. " +
+      "A cwd change uses the repo picker's host validation and thread overlay; a running turn finishes " +
+      "unchanged before the next turn starts a fresh session. Read resetPending in the outcome. " +
       "Model switches follow the adapter-owned catalog: live and reload preserve context, while " +
       "freshSession creates a new ACP session. Read the reported outcome. Effort never resets the ACP session: config-option " +
       "agents update live, while meta/spawn-argument agents (including Claude) reload their runtime " +
@@ -761,7 +763,8 @@ const TOOLS = [
       type: "object",
       properties: {
         thread: { type: "string", description: "Target thread id from threads()." },
-        agent: { type: "string", description: "Optional registered agent profile id." },
+        agent: { type: "string", description: "Optional registered agent id, or agent@host. A bare id keeps the current host." },
+        cwd: { type: "string", description: "Optional repo name relative to the bound host's workspace root, or absolute cwd. Uses the shared repo picker validation and thread overlay; explicit session cwd pins still win." },
         model: { type: "string", description: "Optional model id. Unlisted ids pass unchanged for the provider to validate." },
         effort: {
           type: "string",
@@ -1822,7 +1825,7 @@ const INSTRUCTIONS = [
   "  result is dispatched back when it completes; use reportBack:false to skip the report-back.",
   "- forward(to, content, reportBack?): relay a message into another thread (thin handoff, no specialist framing). Use reportBack:false to skip the report-back.",
   "- steer(thread, prompt): redirect a teammate mid-task — inject a new instruction into its live session.",
-  "- configure_thread(thread, agent?, model?, effort?, role?, disableThreadPrefix?, fastMode?, rebuild?): reconfigure a teammate in YOUR channel; returns exact changed/no-change identity and posts a target confirmation card. rebuild:true then runs deterministic Discord reconstruction with a durable card in the target (and may be used alone). Agent switches reset context. `fastMode` is Claude-only, defaults off, always forges a fresh session, and spends paid usage credits.",
+  "- configure_thread(thread, agent?, cwd?, model?, effort?, role?, disableThreadPrefix?, fastMode?, rebuild?): reconfigure a teammate in YOUR channel; agent@host binds that host (bare agent keeps the current host), cwd uses the shared repo picker path. Returns exact changed/no-change identity and posts a target confirmation card. rebuild:true then runs deterministic Discord reconstruction with a durable card in the target (and may be used alone). Agent/host switches reset context; repo changes wait for an in-flight turn to finish. `fastMode` is Claude-only, defaults off, always forges a fresh session, and spends paid usage credits.",
   "- reset_thread_session(thread): deliberately drop a teammate's context and forge a fresh session with its current agent/model.",
   "- migrate_self(agent?, model?, effort?, manifest, rebuild?): migrate YOUR OWN thread after this turn ends. Default: the manifest is the replacement session's first prompt. rebuild:true rebuilds from Discord history first, then fires the manifest as the next live turn. Purpose-agnostic and rollback-safe.",
   "- search_messages(query, threads?, author?, since?, limit?): search live conversation text in your thread or same-channel siblings.",
@@ -2388,6 +2391,7 @@ export class SeamMcpServer {
     }
     const input: ConfigureThreadInput = {
       ...(optionalString(args, "agent") ? { agent: optionalString(args, "agent") } : {}),
+      ...(typeof args.cwd === "string" ? { cwd: args.cwd } : {}),
       ...(optionalString(args, "model") ? { model: optionalString(args, "model") } : {}),
       ...(typeof args.effort === "string" ? { effort: args.effort } : {}),
       ...(typeof args.role === "string" ? { role: args.role } : {}),
@@ -2399,7 +2403,7 @@ export class SeamMcpServer {
     const hasConfiguration = Object.keys(input).length > 0;
     if (!hasConfiguration && !rebuild) {
       return textResult(
-        "Provide at least one of agent, model, effort, role, disableThreadPrefix, fastMode, or rebuild:true.",
+        "Provide at least one of agent, cwd, model, effort, role, disableThreadPrefix, fastMode, or rebuild:true.",
         true
       );
     }
@@ -2464,7 +2468,9 @@ export class SeamMcpServer {
     if (!outcome) return textResult("No configuration or rebuild action was requested.", true);
     const status = (field: { before: string; after: string; changed: boolean }) =>
       field.changed ? `changed from ${field.before}` : "no change";
-    const runtime = outcome.sessionReset
+    const runtime = outcome.resetPending
+      ? "session reset pending; current turn finishes unchanged, next turn starts a fresh session"
+      : outcome.sessionReset
       ? `fresh ACP session${outcome.resetReason ? ` (${outcome.resetReason})` : ""}`
       : outcome.runtimeReloaded
         ? "runtime reloaded; ACP session/context preserved"
@@ -2483,6 +2489,8 @@ export class SeamMcpServer {
     return textResult([
       `✅ Thread ${target.record.channelRef} configuration confirmed:`,
       `• Agent: ${outcome.applied.agent} (${status(outcome.changes.agent)})`,
+      ...(outcome.changes.location ? [`• Host: ${outcome.applied.location} (${status(outcome.changes.location)})`] : []),
+      ...(outcome.changes.cwd ? [`• Repo: ${outcome.applied.cwd} (${status(outcome.changes.cwd)})`] : []),
       `• Model: ${outcome.applied.model} (${status(outcome.changes.model)})`,
       `• Effort: ${outcome.applied.effort} (${status(outcome.changes.effort)})`,
       `• Role: ${outcome.applied.role} (${status(outcome.changes.role)})`,

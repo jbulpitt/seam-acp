@@ -34,6 +34,8 @@ import { assessModelSelection, type CatalogBinding, type ModelCatalogService, ty
 
 export interface ConfigureThreadInput {
   agent?: string;
+  /** Host-relative repo name or absolute cwd, through the shared repo picker path. */
+  cwd?: string;
   model?: string;
   effort?: string;
   /** Free-form naming role; empty/auto clears the session override. */
@@ -48,7 +50,7 @@ export interface ConfigureThreadInput {
   fastMode?: boolean;
 }
 
-export interface MigrateSelfInput extends Omit<ConfigureThreadInput, "role"> {
+export interface MigrateSelfInput extends Omit<ConfigureThreadInput, "role" | "cwd"> {
   manifest: string;
 }
 
@@ -87,7 +89,9 @@ export interface ConfigureThreadSuccess {
   /** Exact before/after status for every identity field, including no-ops. */
   changes: ThreadConfigurationChanges;
   sessionReset: boolean;
-  resetReason?: "agent-switch" | "model-switch" | "fast-mode-switch";
+  resetReason?: "agent-switch" | "location-switch" | "cwd-switch" | "model-switch" | "fast-mode-switch";
+  /** Repo changes wait for a running turn to finish, like the repo picker. */
+  resetPending?: boolean;
   newSessionId?: string;
   /** The ACP session survived, but its process was reloaded to apply spawn/meta effort. */
   runtimeReloaded: boolean;
@@ -100,6 +104,8 @@ export interface ConfigureThreadSuccess {
 
 export interface ThreadConfigurationIdentity {
   agent: string;
+  location?: string;
+  cwd?: string;
   model: string;
   /** Explicit level, or `auto` when no override is active. */
   effort: string;
@@ -118,6 +124,8 @@ export interface ThreadConfigurationFieldChange {
 
 export interface ThreadConfigurationChanges {
   agent: ThreadConfigurationFieldChange;
+  location?: ThreadConfigurationFieldChange;
+  cwd?: ThreadConfigurationFieldChange;
   model: ThreadConfigurationFieldChange;
   effort: ThreadConfigurationFieldChange;
   role: ThreadConfigurationFieldChange;
@@ -182,6 +190,8 @@ export interface ThreadSessionControlDeps {
       parentRef?: string;
       changes: {
         agent?: string | null;
+        location?: string;
+        cwd?: string | null;
         model?: string | null;
         effort?: string | null;
         role?: string | null;
@@ -543,17 +553,20 @@ export class RuntimeTransition {
     input: ConfigureThreadInput,
     actor: MutationActor = { id: null, name: `seam-mcp:${caller.channelRef}` }
   ): Promise<ConfigureThreadOutcome> {
-    const supplied = input.agent !== undefined || input.model !== undefined || input.effort !== undefined || input.role !== undefined || input.disableThreadPrefix !== undefined || input.fastMode !== undefined;
-    if (!supplied) return { ok: false, error: "Provide at least one of agent, model, effort, role, disableThreadPrefix, or fastMode." };
+    const supplied = input.agent !== undefined || input.cwd !== undefined || input.model !== undefined || input.effort !== undefined || input.role !== undefined || input.disableThreadPrefix !== undefined || input.fastMode !== undefined;
+    if (!supplied) return { ok: false, error: "Provide at least one of agent, cwd, model, effort, role, disableThreadPrefix, or fastMode." };
 
     const before = this.deps.router.describeConfig(target);
-    const location = before.location?.value ?? "local";
+    const previousLocation = before.location?.value ?? "local";
     const previousAgentId = before.agent.value;
     const requestedAgent = input.agent?.trim();
     if (input.agent !== undefined && !requestedAgent) {
       return { ok: false, error: "`agent` must be a non-empty string." };
     }
-    const nextAgentId = requestedAgent ?? previousAgentId;
+    const parsedAgent = requestedAgent ? parseAgentAtLocation(requestedAgent) : undefined;
+    const nextAgentId = parsedAgent?.agentId ?? previousAgentId;
+    const location = parsedAgent?.explicit ? parsedAgent.location : previousLocation;
+    const locationChanged = location !== previousLocation;
     // #308: protects configure_thread before it persists a barred agent; deleting
     // it makes reconfiguration an immediate bypass of the channel allowlist.
     try {
@@ -571,6 +584,12 @@ export class RuntimeTransition {
     }
 
     const agentChanged = nextAgentId !== previousAgentId;
+    let cwd: string | null | undefined;
+    if (input.cwd !== undefined) {
+      const prepared = await this.settings!.mutation.prepareRepoChange(location, input.cwd);
+      if (!prepared.ok) return prepared;
+      cwd = prepared.cwd;
+    }
     const requestedModel = input.model?.trim();
     if (input.model !== undefined && !requestedModel) {
       return { ok: false, error: "`model` must be a non-empty string." };
@@ -647,7 +666,9 @@ export class RuntimeTransition {
     // Shared rule (#37): Fast is validated per session AND per model, so a
     // model/agent change under an active Fast setting needs a fresh session
     // even though the Fast setting itself did not change.
-    const reset = detectSessionReset({
+    const reset = locationChanged && !agentChanged
+      ? { sessionReset: true, resetReason: "location-switch" as const }
+      : detectSessionReset({
       previousAgentId,
       nextAgentId,
       modelChanged,
@@ -675,6 +696,19 @@ export class RuntimeTransition {
     }
 
     const beforeIdentity = identityFromDescription(before);
+    const withBinding = (outcome: ConfigureThreadSuccess): ConfigureThreadSuccess => {
+      const after = this.deps.router.describeConfig(this.deps.store.get(target.id) ?? target);
+      const field = (from: string, to: string) => ({ before: from, after: to, changed: from !== to });
+      return { ...outcome,
+        applied: { ...outcome.applied,
+          ...(parsedAgent?.explicit ? { location: after.location.value } : {}),
+          ...(input.cwd !== undefined ? { cwd: after.cwd.value } : {}) },
+        changes: { ...outcome.changes,
+          ...(parsedAgent?.explicit ? { location: field(previousLocation, after.location.value) } : {}),
+          ...(input.cwd !== undefined ? { cwd: field(before.cwd.value, after.cwd.value) } : {}) },
+        ...(input.cwd !== undefined ? { resetPending: outcome.resetPending ?? false } : {}),
+      };
+    };
     const plannedIdentity: ThreadConfigurationIdentity = {
       agent: nextAgentId,
       model: nextModel,
@@ -693,10 +727,10 @@ export class RuntimeTransition {
       !plannedChanges.effort.changed &&
       !plannedChanges.role.changed &&
       !plannedChanges.disableThreadPrefix.changed &&
-      !plannedChanges.fastMode.changed
+      !plannedChanges.fastMode.changed && !locationChanged && cwd === undefined
     ) {
       const threadIdentityUpdated = await this.applyNaming(target);
-      return {
+      return withBinding({
         ok: true,
         verification: selection.verification,
         applied: beforeIdentity,
@@ -705,13 +739,18 @@ export class RuntimeTransition {
         runtimeReloaded: false,
         threadIdentityUpdated,
         warnings,
-      };
+      });
     }
 
+    const selectionBefore = locationChanged ? this.captureSelection(target, {
+      platform: target.platform, id: target.channelRef, ...(target.parentRef ? { parentId: target.parentRef } : {}),
+    }, before, "agent") : undefined;
     const persisted = this.applyTargetIdentity(
       target,
       {
         ...(agentChanged ? { agent: nextAgentId } : {}),
+        ...(locationChanged ? { location } : {}),
+        ...(cwd !== undefined ? { cwd } : {}),
         ...(inheritSelection ? { inheritSelection: true } : {
           ...(modelChanged || agentChanged ? { model: nextModel } : {}),
           ...(effortTouched ? { effort: desiredEffort ?? null } : {}),
@@ -725,6 +764,34 @@ export class RuntimeTransition {
       actor
     );
     if (!persisted.ok) return persisted;
+    if (locationChanged) {
+      try {
+        this.router.planRuntimeSpawn(this.deps.store.get(target.id) ?? target);
+        bindSessionLocation(this.bridgeHub, target.id, location);
+      } catch (err) {
+        const error = err instanceof Error ? err.message : String(err);
+        const rolled = selectionBefore!.rollback(error);
+        bindSessionLocation(this.bridgeHub, target.id, previousLocation);
+        return { ok: false, error: error + (rolled.acpRestored ? ""
+          : " Previous ACP session was not restored because the effective agent/model/location no longer match.") };
+      }
+    }
+    const currentSelection = this.deps.store.get(target.id) ?? target;
+    const cwdChanged = before.cwd.value !== this.deps.router.describeConfig(currentSelection).cwd.value;
+    if (input.cwd !== undefined && !agentChanged && !locationChanged && !fastModeChanged
+      && (cwdChanged || (!modelChanged && !plannedChanges.effort.changed))) {
+      const wasBusy = this.router.getRuntime(target.id)?.busy === true;
+      await this.applySavedSelection(currentSelection, before);
+      const current = this.deps.store.get(target.id) ?? currentSelection;
+      const sessionReset = cwdChanged && Boolean(target.acpSessionId) && !current.acpSessionId;
+      const threadIdentityUpdated = await this.applyNaming(current);
+      const effectiveIdentity = identityFromDescription(this.deps.router.describeConfig(current));
+      return withBinding({ ok: true, verification: selection.verification,
+        applied: effectiveIdentity, changes: diffIdentity(beforeIdentity, effectiveIdentity),
+        sessionReset, ...(sessionReset ? { resetReason: "cwd-switch" as const } : {}),
+        resetPending: cwdChanged && wasBusy && Boolean(current.acpSessionId),
+        runtimeReloaded: false, threadIdentityUpdated, warnings });
+    }
 
     const onlyNaming = (input.role !== undefined || input.disableThreadPrefix !== undefined)
       && input.agent === undefined
@@ -736,7 +803,7 @@ export class RuntimeTransition {
       if (!current) return { ok: false, error: "Target session disappeared after configuration." };
       const threadIdentityUpdated = await this.applyNaming(current);
       const effectiveIdentity = identityFromDescription(this.deps.router.describeConfig(current));
-      return {
+      return withBinding({
         ok: true,
         verification: selection.verification,
         applied: effectiveIdentity,
@@ -745,7 +812,7 @@ export class RuntimeTransition {
         runtimeReloaded: false,
         threadIdentityUpdated,
         warnings,
-      };
+      });
     }
 
     let runtime: SessionControlRuntime;
@@ -868,7 +935,7 @@ export class RuntimeTransition {
     const effectiveIdentity = identityFromDescription(this.deps.router.describeConfig(current),
       inheritSelection ? catalogModel?.effort.selectionDefault : undefined);
     const changes = diffIdentity(beforeIdentity, effectiveIdentity);
-    return {
+    return withBinding({
       ok: true,
       verification: selection.verification,
       applied: effectiveIdentity,
@@ -883,7 +950,7 @@ export class RuntimeTransition {
       runtimeReloaded,
       threadIdentityUpdated,
       warnings,
-    };
+    });
   }
 
   /**

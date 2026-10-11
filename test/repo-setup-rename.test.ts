@@ -504,14 +504,15 @@ describe("#206 negative search: no repo-selection path invokes a Discord rename"
     }
   });
 
-  it("MCP configure_thread cannot set cwd, and rename_thread is the explicit naming tool", () => {
+  it("MCP configure_thread shares repo selection without renaming, and rename_thread is the naming tool", () => {
     expect(mcpSrc).not.toContain("renameThreadForSetup");
     const configure = mcpSrc.slice(
       mcpSrc.indexOf('name: "configure_thread"'),
       mcpSrc.indexOf('name: "reset_thread_session"')
     );
     expect(configure).toContain("configure_thread");
-    expect(configure).not.toMatch(/\bcwd\b/);
+    expect(configure).toMatch(/\bcwd\b/);
+    expect(controlSrc).toContain("prepareRepoChange");
     expect(configure).not.toMatch(/repoPath/);
     expect(fs.readFileSync(path.join(REPO_ROOT, "packages/core/src/plugins/thread-naming/index.ts"), "utf8")).toMatch(/name: "rename_thread"/);
     expect(controlSrc).not.toContain("renameThreadForSetup");

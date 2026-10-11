@@ -7365,7 +7365,9 @@ export class Orchestrator {
       field.changed
         ? `\`${field.after}\`\nChanged from \`${field.before}\``
         : `\`${field.after}\` *(no change)*`;
-    const runtime = outcome.sessionReset
+    const runtime = outcome.resetPending
+      ? "Session reset pending; current turn finishes unchanged, next turn starts a fresh session"
+      : outcome.sessionReset
       ? `Fresh ACP session${outcome.resetReason ? ` — ${outcome.resetReason}` : ""}`
       : outcome.runtimeReloaded
         ? "Runtime reloaded; ACP session and context preserved"
@@ -7380,6 +7382,8 @@ export class Orchestrator {
       ...(brandIconURL ? { authorIconURL: brandIconURL } : {}),
       fields: [
         { name: "Agent", value: displayField(outcome.changes.agent), inline: true },
+        ...(outcome.changes.location ? [{ name: "Host", value: displayField(outcome.changes.location), inline: true }] : []),
+        ...(outcome.changes.cwd ? [{ name: "Repo", value: displayField(outcome.changes.cwd) }] : []),
         { name: "Model", value: displayField(outcome.changes.model), inline: true },
         { name: "Effort", value: displayField(outcome.changes.effort), inline: true },
         { name: "Role", value: displayField(outcome.changes.role), inline: true },

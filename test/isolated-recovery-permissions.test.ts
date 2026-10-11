@@ -41,12 +41,14 @@ async function interruptedSchedule(policy: "always" | "ask") {
   h.store.turnAttempts.startPrompt(attempt);
   const original = runtime.prompt(row.promptText, undefined, {
     onRemoteRecovery: binding => { h.store.turnAttempts.recordRemoteRecovery(attempt, { ...binding, location: "fixture" }); },
+    onRemoteRecoveryReleased: () => {},
     recoveryScope: "ephemeral",
   }).catch(() => undefined);
   const slot = runtime.getSlot()!;
   const permission = { requestId: "isolated-permission", sessionId: info.sessionId, toolCallId: "isolated-tool" };
   await vi.waitFor(async () => expect(await h.slots.permissionControl(slot, "permission_status", permission))
     .toMatchObject({ state: "pending" }), { timeout: 10_000 });
+  expect(h.store.turnAttempts.get(attempt.id)?.remoteRecovery).toMatchObject({ slot, acpSessionId: info.sessionId });
   const owner = (await h.client.listSlots()).health.find(row => row.slot === slot)!;
   await runtime.detach();
   await original;
@@ -61,7 +63,9 @@ describe("isolated restart adoption services the surviving permission", () => {
     const orch = h.makeOrchestrator(router);
     const live = await router.getOrStartRuntime(h.store.get(h.record.id)!);
     const liveSlot = live.getSlot()!;
-    const parallel = live.prompt("parallel live turn").catch(() => undefined);
+    const parallel = live.prompt("parallel live turn", undefined, {
+      onRemoteRecovery: () => {}, onRemoteRecoveryReleased: () => {},
+    }).catch(() => undefined);
     const liveOwner = (await h.client.listSlots()).health.find(row => row.slot === liveSlot)!;
     const hang = vi.spyOn(AgentRuntime.prototype, "watchInFlightHang");
     // A later thread edit must not change the admitted occurrence's policy.

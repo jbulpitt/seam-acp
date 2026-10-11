@@ -7,7 +7,7 @@ import type { SessionRouter } from "./session-router.js";
 import type { BridgeHub } from "./bridge-hub.js";
 import type { ModelCatalogService } from "./model-catalog/service.js";
 import type { ThreadSessionControlDeps } from "./runtime-transition.js";
-import { RuntimeTransition } from "./runtime-transition.js";
+import { RuntimeTransition, type RuntimeSettingsDeps } from "./runtime-transition.js";
 import { type ConfigMutationService, type ConfigMutationInput, type ConfigProposal, type MutationActor, type ConfigMutationTier, type ProposedField, type ChannelPresetChanges, type ThreadPresetChanges } from "./config-mutation.js";
 import { configTarget, configOverrideFields, CONFIG_DEFAULT_FIELDS, type ConfigDefaultField, type OverrideCounts } from "./config-target.js";
 import { parseStatusCardStyle, parseSimpleCardGif, type SessionRecord, type SessionConfigState, type PermissionPolicyMode, type StatusCardStyle, type Preset } from "./types.js";
@@ -20,6 +20,8 @@ import { FAST_MODE_CONFIG_ID, settleFastMode, fastModeRetirementFailure } from "
 
 export interface TargetIdentityChanges {
   agent?: string;
+  location?: string;
+  cwd?: string | null;
   model?: string;
   effort?: string | null;
   role?: string | null;
@@ -183,23 +185,36 @@ export class ConfigApplyPlan {
     return resolveRepoPath(root, requested);
   }
 
+  async prepareRepoChange(location: string, requested: string): Promise<
+    { ok: true; cwd: string | null } | { ok: false; error: string }
+  > {
+    try {
+      const cwd = requested === "__inherit__" ? null : await this.resolveRequestedRepoPath(location, requested);
+      const root = this.bridgeHub?.get(location)?.host.workspaceRoot;
+      if (cwd && root && !isWithinRoot(cwd, root)) {
+        return { ok: false, error: `Repo \`${cwd}\` is outside host \`${location}\` workspace root (\`${root}\`).` };
+      }
+      if (cwd) {
+        if (!this.bridgeHub) throw new Error(`bridge "${location}" is not connected`);
+        // The host shell's cwd check preserves ENOENT/EACCES without another filesystem RPC.
+        const checked = await this.bridgeHub.hostExec(location, { command: "pwd", cwd });
+        if (checked.exitCode !== 0) throw new Error(checked.stderr || `pwd exited ${checked.exitCode} (signal=${checked.signal})`);
+      }
+      return { ok: true, cwd };
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
+  }
+
   /** Shared thread-overlay repo selection; a live turn keeps its current cwd. */
   async applyRepoChange(channel: ChannelRef, record: SessionRecord, requested: string, actor: MutationActor): Promise<
     { ok: true; message: string; sessionReset: boolean; resetPending: boolean } | { ok: false; error: string }
   > {
     const before = this.router.describeConfig(record);
+    const prepared = await this.prepareRepoChange(before.location.value, requested);
+    if (!prepared.ok) return prepared;
     try {
-      const cwd = requested === "__inherit__" ? null : await this.resolveRequestedRepoPath(before.location.value, requested);
-      const root = this.bridgeHub?.get(before.location.value)?.host.workspaceRoot;
-      if (cwd && root && !isWithinRoot(cwd, root)) {
-        return { ok: false, error: `Repo \`${cwd}\` is outside host \`${before.location.value}\` workspace root (\`${root}\`).` };
-      }
-      if (cwd) {
-        if (!this.bridgeHub) throw new Error(`bridge "${before.location.value}" is not connected`);
-        // The host shell's cwd check preserves ENOENT/EACCES without another filesystem RPC.
-        const checked = await this.bridgeHub.hostExec(before.location.value, { command: "pwd", cwd });
-        if (checked.exitCode !== 0) throw new Error(checked.stderr || `pwd exited ${checked.exitCode} (signal=${checked.signal})`);
-      }
+      const { cwd } = prepared;
       const written = this.configMutation.applyThreadOverlay({ threadId: channel.id, platform: channel.platform,
         ...(channel.parentId ? { parentRef: channel.parentId } : {}), changes: { cwd }, actor });
       if (!written.ok) return written;
@@ -363,6 +378,8 @@ export class ConfigApplyPlan {
       ...(target.parentRef ? { parentRef: target.parentRef } : {}),
       changes: {
         ...(changes.agent !== undefined ? { agent: changes.agent } : {}),
+        ...(changes.location !== undefined ? { location: changes.location } : {}),
+        ...(changes.cwd !== undefined ? { cwd: changes.cwd } : {}),
         ...(changes.inheritSelection ? { model: null, effort: null } : {}),
         ...(changes.model !== undefined ? { model: changes.model } : {}),
         // `auto` is an explicit thread-level sentinel: it shadows a channel
@@ -1166,18 +1183,18 @@ export interface ConfigFacadeEnvironment extends Omit<ConfigApplySettings, "runt
 
 export function createConfigFacades(environment: ConfigFacadeEnvironment): { plan: ConfigApplyPlan; runtime: RuntimeTransition } {
   const mutation = new ConfigApplyPlan({ store: environment.store, mutation: environment.mutation });
+  const settings: RuntimeSettingsDeps = { ...environment, mutation,
+    // Platforms can cache facades before the bridge hub is wired.
+    get bridgeHub() { return environment.bridgeHub; },
+  };
   const runtime = new RuntimeTransition({
     store: environment.store, router: environment.router, mutation,
     modelCatalog: environment.modelCatalog,
     identityCommitted: environment.identityCommitted,
-  }, { ...environment, mutation,
-    // Platforms can cache facades before the bridge hub is wired.
+  }, settings);
+  const plan = new ConfigApplyPlan({ store: environment.store, mutation: environment.mutation }, { ...environment, runtime,
     get bridgeHub() { return environment.bridgeHub; },
   });
-  return {
-    runtime,
-    plan: new ConfigApplyPlan({ store: environment.store, mutation: environment.mutation }, { ...environment, runtime,
-      get bridgeHub() { return environment.bridgeHub; },
-    }),
-  };
+  settings.mutation = plan;
+  return { runtime, plan };
 }

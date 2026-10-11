@@ -873,6 +873,7 @@ function ctrlHarness(opts: {
       model: { value: cfg.model ?? "claude-opus-5", source: "session config" },
       effort: { value: cfg.reasoningEffort ?? null, source: "default" },
       location: { value: "local", source: "default" },
+      cwd: { value: current.repoPath ?? "/repo", source: "default" },
       role: { value: null, source: "default" },
       disableThreadPrefix: { value: false, source: "default" },
       fastMode: { value: fastPreset, source: fastPreset ? "thread preset" : "default" },

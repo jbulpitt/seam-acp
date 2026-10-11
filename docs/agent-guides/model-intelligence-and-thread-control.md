@@ -115,10 +115,21 @@ There are two scopes. `configure_thread` and `reset_thread_session` target
 `handoff`. `migrate_self` targets only the calling thread. They compose with the
 data tools: inspect the candidates first, then apply the selected runtime.
 
-### `configure_thread(thread, { agent?, model?, effort?, role?, disableThreadPrefix?, fastMode?, rebuild? })`
-Change a target thread's agent, model, reasoning effort, naming role, naming
+### `configure_thread(thread, { agent?, cwd?, model?, effort?, role?, disableThreadPrefix?, fastMode?, rebuild? })`
+Change a target thread's agent, execution host, repo/cwd, model, reasoning effort, naming role, naming
 opt-out, and/or Claude Fast mode. Optional `rebuild: true` runs deterministic
 Discord reconstruction after any configuration change and is valid by itself.
+- **`agent` accepts `agent@host`.** For example, `claude@remote-host` selects Claude
+  and binds the thread to that bridge. A bare `claude` keeps its existing host.
+  Changing the host starts a fresh session even when the agent stays the same;
+  a disconnected host returns the normal bridge error without retiring the old context.
+- **`cwd` uses the shared repo picker operation.** Pass an absolute path or a
+  repo name relative to the destination bridge's workspace root. Host validation
+  errors (such as ENOENT) are returned before saving. It writes the thread cwd
+  overlay, so an explicit session cwd pin still wins. A changed effective cwd
+  resets an idle session; a running turn finishes unchanged and the result
+  reports `resetPending` until the next acquisition. Host and cwd can be set
+  together, e.g. `{ agent: "claude@remote-host", cwd: "my-project" }`.
 - **The result is exact, including no-ops.** Agent, model, and effort are always
   returned as the effective post-set identity; each field says whether it
   changed and names its previous value when it did. The target thread receives

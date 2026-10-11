@@ -44,6 +44,8 @@ export interface StatusPanelInput {
   activity?: string[];
   /** Last few lines of model reasoning (oldest → newest). */
   thinking?: string[];
+  /** In-flight thought buffer; thinking contains its trimmed visible form. */
+  thinkingPending?: string;
   style?: StatusCardStyle;
   brandIconURL?: string;
   authorName?: string;
@@ -82,11 +84,13 @@ export function renderStatusPanel(
     ...(input.contextPct != null ? { contextPct: input.contextPct } : {}),
     activity: input.activity,
     thinking: input.thinking,
+    ...(input.thinkingPending ? { thinkingPending: input.thinkingPending } : {}),
     ...(input.style ? { style: input.style } : {}),
     ...(input.brandIconURL ? { brandIconURL: input.brandIconURL } : {}),
     ...(input.authorName ? { authorName: input.authorName } : {}),
   };
-  return renderer.statusPanel(panel);
+  const { modelDescription: _description, modelEvidence: _evidence, ...status } = panel;
+  return { ...renderer.statusPanel(panel), status };
 }
 
 /** True when a {@link PanelOrigin} carries anything worth rendering. An origin
@@ -230,7 +234,9 @@ export class TurnStatus {
     status.contextUsedHighWater = snapshot.contextUsed;
     status.contextWindowSize = snapshot.contextWindow;
     for (const line of input.activity ?? []) status.pushActivity(line);
-    if (input.thinking?.length) status.pushThinkingChunk(input.thinking.join("\n") + "\n");
+    const complete = input.thinkingPending ? input.thinking?.slice(0, -1) : input.thinking;
+    if (complete?.length) status.pushThinkingChunk(complete.join("\n") + "\n");
+    if (input.thinkingPending) status.pushThinkingChunk(input.thinkingPending);
     return status;
   }
 
@@ -310,6 +316,7 @@ export class TurnStatus {
 
   toInput(): StatusPanelInput {
     const thinking = this.thinkingWindow();
+    const pending = this.thinkingPending.trim();
     const contextPct =
       this.contextWindowSize > 0
         ? Math.round((this.contextUsedHighWater / this.contextWindowSize) * 100)
@@ -332,6 +339,7 @@ export class TurnStatus {
       ...(contextPct != null ? { contextPct } : {}),
       activity: this.activity.length ? [...this.activity] : undefined,
       ...(thinking ? { thinking } : {}),
+      ...(pending && !this.isSystemInstruction(pending) ? { thinkingPending: this.thinkingPending } : {}),
       ...(this.style !== "full" ? { style: this.style } : {}),
       ...(this.brandIconURL ? { brandIconURL: this.brandIconURL } : {}),
       ...(this.authorName ? { authorName: this.authorName } : {}),

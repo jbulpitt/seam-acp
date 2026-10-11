@@ -3,6 +3,42 @@ import { discordRenderer } from "../packages/core/src/platforms/discord/renderer
 import { brandIconUrl } from "../packages/core/src/plugins/card-visuals/agent-brand.js";
 
 describe("discordRenderer", () => {
+  it("keeps the full Discord status output unchanged while Chat is compacted", () => {
+    expect(discordRenderer.statusPanel({
+      state: "Working", repoDisplay: "seam-acp", model: "default", resolvedModel: "gpt-6-astra",
+      action: "Tool: git diff", elapsedSeconds: 12, context: "30k / 1m (3%)", contextPct: 3,
+      effort: "high", fastMode: "on", brandIconURL: "https://example.com/agent.png",
+      activity: ["Read old.ts", "Search old symbols", "Edit current.ts", "Run checks", "git diff"],
+      thinking: ["first complete", "second complete", "last complete", "still arriving"],
+    })).toMatchInlineSnapshot(`
+      {
+        "author": "gpt-6-astra (default)",
+        "authorIconURL": "https://example.com/agent.png",
+        "color": 16426522,
+        "description": "\`📄 Read old.ts\`  \`🔍 Search old symbols\`  \`✏️ Edit current.ts\`  \`▶️ Run checks\`  \`📦 git diff\`",
+        "fields": [
+          {
+            "inline": true,
+            "name": "Repo",
+            "value": "seam-acp",
+          },
+          {
+            "inline": true,
+            "name": "Action",
+            "value": "Tool: git diff",
+          },
+        ],
+        "footer": "💡 first complete
+      💡 second complete
+      💡 last complete
+      💡 still arriving
+
+      ⏱ 12s elapsed • 🪟 30k / 1m (3%) • 🧠 high effort • ⚡ fast on",
+        "title": "Working",
+      }
+    `);
+  });
+
   it("status panel uses the right icon and rows", () => {
     const out = discordRenderer.statusPanel({
       state: "Working",

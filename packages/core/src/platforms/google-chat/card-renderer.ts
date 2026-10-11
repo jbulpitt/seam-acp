@@ -1,6 +1,7 @@
 import type { PanelButton, StructuredLayout, StructuredPanel } from "../../core/types.js";
 import type { ChoiceCardPost, ElicitationCardPost } from "../chat-adapter.js";
 import { formatGoogleChatCardText } from "./card-text.js";
+import { googleChatStatusPanel } from "./status-panel.js";
 
 export const GOOGLE_CHAT_CARD_MAX_WIDGETS = 100;
 export const GOOGLE_CHAT_SELECTION_MAX_ITEMS = 100;
@@ -45,7 +46,7 @@ export interface GoogleChatCardsMessage {
 }
 
 export function renderGoogleChatPanel(panel: StructuredPanel, cardId: string): GoogleChatCardsMessage {
-  return panelMessage(panel, cardId, actionRows(panel.actions));
+  return panelMessage(panel.status ? googleChatStatusPanel(panel.status) : panel, cardId, actionRows(panel.actions));
 }
 
 export function renderGoogleChatLayout(layout: StructuredLayout, cardId: string): GoogleChatCardsMessage {

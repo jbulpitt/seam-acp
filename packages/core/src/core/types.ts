@@ -266,6 +266,8 @@ export interface StatusPanel {
   activity?: string[];
   /** Last few lines of model reasoning (oldest → newest). */
   thinking?: string[];
+  /** In-flight thought buffer; thinking contains its trimmed visible form. */
+  thinkingPending?: string;
   /** `"simple"` drops repo/model/action/effort/tool-tags; default `"full"`. */
   style?: StatusCardStyle;
   /** Hosted brand icon URL. */
@@ -569,6 +571,8 @@ export interface PanelButton {
 }
 
 export interface StructuredPanel {
+  /** Neutral turn status for platform-specific card layouts. */
+  status?: StatusPanel;
   /** Sidebar / accent color as a hex number (e.g. 0x57F287 for green). */
   color: number;
   /** Main title line (e.g. "⏳ Working"). Omit on the simple status card. */

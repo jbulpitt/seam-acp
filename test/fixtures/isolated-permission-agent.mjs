@@ -19,6 +19,8 @@ for await (const line of readline.createInterface({ input: process.stdin })) {
   } else if (frame.method === "session/set_mode") {
     mode = frame.params.modeId;
     send({ id: frame.id, result: {} });
+  } else if (frame.method === "session/set_config_option") {
+    send({ id: frame.id, result: { configOptions: [] } });
   } else if (frame.method === "session/prompt") {
     prompt = frame.id;
     const text = frame.params.prompt.map(part => part.text ?? "").join("");

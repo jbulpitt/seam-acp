@@ -73,6 +73,7 @@ export type AdapterChildInput =
       /** Re-publish the current recovery state; a restarted bridge asks. */
       v: typeof ADAPTER_CHILD_PROTOCOL_VERSION;
       type: "report_recovery";
+      replayPermissions?: boolean;
     };
 
 export type AdapterChildOutput =

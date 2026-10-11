@@ -272,6 +272,11 @@ function start(config: AdapterChildBootstrap): void {
       if (snapshot) publish({ v: ADAPTER_CHILD_PROTOCOL_VERSION, type: "recovery", recovery: snapshot });
       const result = recovery.terminalResult(config.slot);
       if (result) publish({ v: ADAPTER_CHILD_PROTOCOL_VERSION, type: "recovery_result", recoveryResult: result });
+      if (message.replayPermissions && snapshot && !result) {
+        for (const data of permissions.unanswered(snapshot.acpSessionId)) {
+          publish({ v: ADAPTER_CHILD_PROTOCOL_VERSION, type: "data", data });
+        }
+      }
     } else if (message.type === "disarm_recovery") {
       publish({
         v: ADAPTER_CHILD_PROTOCOL_VERSION,

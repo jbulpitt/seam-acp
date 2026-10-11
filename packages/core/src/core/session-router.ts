@@ -1484,6 +1484,56 @@ export class SessionRouter {
     };
   }
 
+  /** An adopted isolated turn keeps its captured policy, not later thread edits. */
+  recoveryClientOptions(record: SessionRecord) {
+    const mode = resolvePermissionMode(this.store.readConfig(record), this.permissionDefault(record.platform));
+    return this.clientOptions(record, () => mode);
+  }
+
+  private clientOptions(record: SessionRecord, permissionMode = () => this.livePermissionMode(record)):
+    Pick<ConstructorParameters<typeof AgentRuntime>[0], "permissionMode" | "permissionPolicy" |
+      "elicitationHandler" | "completeElicitationHandler" | "cancelElicitations"> {
+    return {
+      permissionMode,
+      permissionPolicy: async (req, context) => {
+        const mode = permissionMode();
+        if (mode === "always") {
+          const opt = req.options.find((o) => o.kind?.startsWith("allow_")) ?? req.options[0];
+          if (opt) return { outcome: { outcome: "selected", optionId: opt.optionId } };
+          return { outcome: { outcome: "cancelled" } };
+        }
+        if (mode === "ask" && this.askUser) {
+          try {
+            return await this.askUser(record, req, context);
+          } catch (err) {
+            this.logger.warn({ err, sessionId: record.id }, "askUser failed; denying");
+            return { outcome: { outcome: "cancelled" } };
+          }
+        }
+        return { outcome: { outcome: "cancelled" } };
+      },
+      elicitationHandler: async (request, context) => {
+        return handleElicitationWithPermissionPolicy({
+          request,
+          context,
+          mode: permissionMode(),
+          elicitUser: this.elicitUser,
+          record,
+        });
+      },
+      completeElicitationHandler: async (notification) => {
+        await this.completeElicitation?.(record, notification);
+      },
+      cancelElicitations: async () => {
+        await this.cancelElicitations?.(
+          record,
+          "cancelled",
+          "The running turn was cancelled before this request completed."
+        );
+      },
+    };
+  }
+
   private async startRuntime(record: SessionRecord, recovery?: { resumeSessionId: string }): Promise<AgentRuntime> {
     const plan = this.planRuntimeSpawn(record);
     const identity = { agentId: plan.agentId, location: plan.location, requestedModel: plan.model,
@@ -1576,7 +1626,7 @@ export class SessionRouter {
       onCatalogRefresh: async () => {
         await this.modelCatalog.refresh({ agentId, location }, "session");
       },
-      ...this.permissionOptions(record),
+      ...this.clientOptions(record),
       onSessionModes: info => {
         if (profile.id !== "codex") return;
         const live = this.store.get(record.id) ?? record;
@@ -1584,42 +1634,6 @@ export class SessionRouter {
         const modes = { sessionId: info.sessionId, availableModes: info.availableModes, currentModeId: info.currentModeId };
         if (JSON.stringify(cfg.codexModes) === JSON.stringify(modes)) return;
         this.store.upsert({ ...live, configJson: this.store.writeConfig({ ...cfg, codexModes: modes }) });
-      },
-      permissionPolicy: async (req, context) => {
-        const mode = this.livePermissionMode(record);
-        if (mode === "always") {
-          const opt = req.options.find((o) => o.kind?.startsWith("allow_")) ?? req.options[0];
-          if (opt) return { outcome: { outcome: "selected", optionId: opt.optionId } };
-          return { outcome: { outcome: "cancelled" } };
-        }
-        if (mode === "ask" && this.askUser) {
-          try {
-            return await this.askUser(record, req, context);
-          } catch (err) {
-            this.logger.warn({ err, sessionId: record.id }, "askUser failed; denying");
-            return { outcome: { outcome: "cancelled" } };
-          }
-        }
-        return { outcome: { outcome: "cancelled" } };
-      },
-      elicitationHandler: async (request, context) => {
-        return handleElicitationWithPermissionPolicy({
-          request,
-          context,
-          mode: this.livePermissionMode(record),
-          elicitUser: this.elicitUser,
-          record,
-        });
-      },
-      completeElicitationHandler: async (notification) => {
-        await this.completeElicitation?.(record, notification);
-      },
-      cancelElicitations: async () => {
-        await this.cancelElicitations?.(
-          record,
-          "cancelled",
-          "The running turn was cancelled before this request completed."
-        );
       },
       ...(this.sessionLoadTimeoutMs !== undefined
         ? { loadSessionTimeoutMs: this.sessionLoadTimeoutMs }

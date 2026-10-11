@@ -65,16 +65,19 @@ afterEach(async () => {
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-async function fixture() {
+async function fixture(separateHostRoots = false) {
   const root = path.join(dir, "execution");
   const nextCwd = path.join(root, "seam-acp");
   fs.mkdirSync(nextCwd, { recursive: true });
+  const remoteRoot = separateHostRoots ? path.join(dir, "remote-execution") : root;
+  const remoteCwd = path.join(remoteRoot, "seam-acp");
+  fs.mkdirSync(remoteCwd, { recursive: true });
   const presetsFile = path.join(dir, "presets.json");
   fs.writeFileSync(presetsFile, JSON.stringify({ threads: { [channel.id]: { location: "seam-dev-server" } } }));
   const maps = buildChannelPresetMaps(presetsFile);
   const config = { ...maps, REPOS_ROOT: path.join(dir, "controller"), CHANNEL_PRESETS_FILE: presetsFile,
     bridgePresets: new Map(["seam-dev-server", "gh-server"].map(id => [id, {
-      id, tokenHash: hashBridgeToken(`${id}-fixture`), workspaceRoot: root,
+      id, tokenHash: hashBridgeToken(`${id}-fixture`), workspaceRoot: id === "gh-server" ? remoteRoot : root,
     }])),
   } as Config;
   const store = new SessionStore(path.join(dir, "seam.db"));
@@ -119,6 +122,7 @@ async function fixture() {
   stops.push(() => hub.close());
   const rpcs: Array<{ host: string; method: string; params: any }> = [];
   for (const host of ["seam-dev-server", "gh-server"]) {
+    const workspaceRoot = host === "gh-server" ? remoteRoot : root;
     const ready = new Promise<string>(resolve => hub.onBridgeReady(resolve));
     const socket = new WebSocket(`ws://127.0.0.1:${port}/bridge`, {
       headers: { Authorization: `Bearer ${host}-fixture` },
@@ -130,7 +134,7 @@ async function fixture() {
       rpcs.push({ host, method: frame.method, params: frame.params });
       try {
         const result = frame.method === "prepare" ? {} : await dispatchBridgeRpc(frame.method, frame.params, frame.agentId,
-          { adapters: new Map(), workspaceRoot: root, cwd: root });
+          { adapters: new Map(), workspaceRoot, cwd: workspaceRoot });
         socket.send(JSON.stringify({ v: PROTOCOL_VERSION, type: "rpc_reply", id: frame.id, ok: true, result }));
       } catch (err) {
         socket.send(JSON.stringify({ v: PROTOCOL_VERSION, type: "rpc_reply", id: frame.id, ok: false,
@@ -140,7 +144,7 @@ async function fixture() {
     await once(socket, "open");
     socket.send(JSON.stringify({ v: PROTOCOL_VERSION, type: "hello", bridgeId: host, instanceId: `${host}-instance`,
       protocolVersion: PROTOCOL_VERSION, capabilities: { durableSlots: true },
-      host: { os: process.platform, arch: process.arch, workspaceRoot: root },
+      host: { os: process.platform, arch: process.arch, workspaceRoot },
       agents: profiles.map(profile => ({ agentId: profile.id, version: 1, installed: true })),
     }));
     expect(await ready).toBe(host);
@@ -170,7 +174,7 @@ async function fixture() {
     expect(body.error).toBeUndefined();
     return body.result as { isError?: boolean; content: Array<{ text: string }> };
   };
-  return { call, store, router, plan, hub, record, rpcs, root, nextCwd, outcomes, presetsFile };
+  return { call, store, router, plan, hub, record, rpcs, root, nextCwd, remoteRoot, remoteCwd, outcomes, presetsFile };
 }
 
 describe("configure_thread agent@location and shared cwd selection", () => {
@@ -222,20 +226,28 @@ describe("configure_thread agent@location and shared cwd selection", () => {
     expect((warm as any).disposed).toBe(false);
   });
 
-  it("sets cwd together with the host through the existing repo validation on the destination", async () => {
-    const h = await fixture();
+  it("replaces a stale session cwd pin and validates the combined host/cwd selection on the destination", async () => {
+    const h = await fixture(true);
+    h.store.upsert({ ...h.store.get(h.record.id)!, repoPath: h.nextCwd,
+      configJson: JSON.stringify({ sessionCwdExplicit: true }) });
     const reply = await h.call({ agent: "claude@gh-server", cwd: "seam-acp" });
     expect(reply.isError, reply.content[0]?.text).toBeFalsy();
-    expect(h.rpcs).toContainEqual({ host: "gh-server", method: "shell", params: { command: "pwd", cwd: h.nextCwd } });
-    expect(h.router.planRuntimeSpawn(h.store.get(h.record.id)!)).toMatchObject({ location: "gh-server", cwd: h.nextCwd });
-    expect(h.store.get(h.record.id)?.repoPath).toBeNull();
+    expect(h.rpcs).toContainEqual({ host: "gh-server", method: "shell", params: { command: "pwd", cwd: h.remoteCwd } });
+    expect(h.rpcs.filter(rpc => rpc.method === "shell").every(rpc => rpc.host === "gh-server")).toBe(true);
+    const row = h.store.get(h.record.id)!;
+    expect(h.router.planRuntimeSpawn(row)).toMatchObject({ location: "gh-server", cwd: h.remoteCwd });
+    expect(row.repoPath).toBe(h.remoteCwd);
+    expect(h.store.readConfig(row).sessionCwdExplicit).toBe(true);
+    expect(h.outcomes.at(-1)).toMatchObject({ changes: { cwd: { before: h.nextCwd, after: h.remoteCwd, changed: true } } });
     expect(h.store.listConfigMutations()).toHaveLength(1);
-    expect(reply.content[0]?.text).toContain(`Repo: ${h.nextCwd}`);
+    expect(reply.content[0]?.text).toContain(`Repo: ${h.remoteCwd}`);
   });
 
   it("defers a cwd-only reset until the running turn completes", async () => {
     const h = await fixture();
-    const warm = await h.router.getOrStartRuntime(h.record);
+    h.store.upsert({ ...h.store.get(h.record.id)!, repoPath: h.root,
+      configJson: JSON.stringify({ sessionCwdExplicit: true }) });
+    const warm = await h.router.getOrStartRuntime(h.store.get(h.record.id)!);
     const running = warm.prompt("keep working");
     expect((await h.call({ cwd: h.nextCwd })).isError).toBeFalsy();
     expect(h.outcomes.at(-1)).toMatchObject({ sessionReset: false, resetPending: true });
@@ -261,13 +273,47 @@ describe("configure_thread agent@location and shared cwd selection", () => {
     expect(h.store.listConfigMutations()).toHaveLength(0);
   });
 
-  it("does not reset an unchanged cwd and preserves an explicit session cwd pin", async () => {
+  it("does not reset an unchanged cwd", async () => {
     const h = await fixture();
     expect((await h.call({ cwd: h.root })).isError).toBeFalsy();
     expect(h.outcomes.at(-1)).toMatchObject({ sessionReset: false, resetPending: false });
+  });
+
+  it("replaces an explicit session cwd pin through MCP and reports the effective change", async () => {
+    const h = await fixture();
     h.store.upsert({ ...h.store.get(h.record.id)!, repoPath: h.root, configJson: JSON.stringify({ sessionCwdExplicit: true }) });
+    const reply = await h.call({ cwd: h.nextCwd });
+    expect(reply.isError, reply.content[0]?.text).toBeFalsy();
+    const row = h.store.get(h.record.id)!;
+    expect(row.repoPath).toBe(h.nextCwd);
+    expect(h.store.readConfig(row).sessionCwdExplicit).toBe(true);
+    expect(h.router.describeConfig(row).cwd.value).toBe(h.nextCwd);
+    expect(h.outcomes.at(-1)).toMatchObject({ sessionReset: true, resetReason: "cwd-switch",
+      applied: { cwd: h.nextCwd }, changes: { cwd: { before: h.root, after: h.nextCwd, changed: true } } });
+    expect(reply.content[0]?.text).toContain(`Repo: ${h.nextCwd} (changed`);
+  });
+
+  it("keeps session cwd precedence when configure_thread does not supply cwd", async () => {
+    const h = await fixture();
     expect((await h.call({ cwd: h.nextCwd })).isError).toBeFalsy();
-    expect(h.router.describeConfig(h.store.get(h.record.id)!).cwd.value).toBe(h.root);
-    expect(h.outcomes.at(-1)).toMatchObject({ sessionReset: false, applied: { cwd: h.root } });
+    h.store.upsert({ ...h.store.get(h.record.id)!, repoPath: h.root, configJson: JSON.stringify({ sessionCwdExplicit: true }) });
+    expect((await h.call({ effort: "high" })).isError).toBeFalsy();
+    const row = h.store.get(h.record.id)!;
+    expect(h.router.describeConfig(row).cwd.value).toBe(h.root);
+    expect(row.repoPath).toBe(h.root);
+    expect(h.store.readConfig(row).sessionCwdExplicit).toBe(true);
+  });
+
+  it("clears the explicit session cwd pin when inheritance is requested", async () => {
+    const h = await fixture();
+    expect((await h.call({ cwd: h.nextCwd })).isError).toBeFalsy();
+    h.store.upsert({ ...h.store.get(h.record.id)!, repoPath: h.nextCwd,
+      configJson: JSON.stringify({ sessionCwdExplicit: true }) });
+    expect((await h.call({ cwd: "__inherit__" })).isError).toBeFalsy();
+    const row = h.store.get(h.record.id)!;
+    expect(row.repoPath).toBeNull();
+    expect(h.store.readConfig(row).sessionCwdExplicit).toBeUndefined();
+    expect(h.router.describeConfig(row).cwd.value).toBe(h.root);
+    expect(h.outcomes.at(-1)).toMatchObject({ applied: { cwd: h.root }, changes: { cwd: { changed: true } } });
   });
 });

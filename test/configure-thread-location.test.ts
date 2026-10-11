@@ -83,6 +83,15 @@ async function fixture() {
   let hub: BridgeHub;
   const router = new SessionRouter({ store, logger, profiles, modelCatalog, ...maps,
     defaultAgentId: "codex", defaultModel: "native", defaultCwd: root,
+    // index.ts supplies a catalog adapter even for an unknown/composite id.
+    profileCatalog: (agentId, location) => ({
+      scope: () => {
+        const scope = modelCatalog.lookup({ agentId, location }).snapshot?.candidate.scope;
+        if (!scope) throw new Error(`catalog scope for ${agentId}@${location} is not available yet`);
+        return scope;
+      },
+      fetch: async () => await hub.fetchModelCatalog(location, agentId) as any,
+    }),
     bindSessionLocation: (id, host) => hub?.markSessionBridge(id, host),
     executionBridge: {
       isBridgeSession: id => Boolean(hub?.sessionBridgeId(id)),

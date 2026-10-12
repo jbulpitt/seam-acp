@@ -15,6 +15,8 @@ import type { ScheduledPrompt } from "../packages/core/src/core/scheduled-prompt
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import { logger as journal } from "../packages/core/src/lib/logger.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
+import { multiplexChatAdapters } from "../packages/core/src/platforms/google-chat/multiplex.js";
+import type { PermissionCardRecord } from "../packages/core/src/core/action-cards/store.js";
 
 const cleanups: Array<() => void | Promise<void>> = [];
 afterEach(async () => {
@@ -28,14 +30,14 @@ const drain = async () => {
 const logger = pino({ level: "silent" }) as unknown as Logger;
 
 // Same synthetic adapter boundary as second-platform-turn; storage and recovery are real.
-function setup(platform: string) {
+function setup(platform: string, channelOverride?: ChannelRef) {
   const dir = mkdtempSync(path.join(tmpdir(), "seam-second-recovery-"));
   cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
   const store = new SessionStore(path.join(dir, "test.db"));
   cleanups.push(() => store.close());
-  const channel: ChannelRef = { platform, id: platform === "discord" ? "1300000000000000002" : "AAA.TTT", parentId: "parent" };
+  const channel: ChannelRef = channelOverride ?? { platform, id: platform === "discord" ? "1300000000000000002" : "AAA.TTT", parentId: "parent" };
   const now = new Date().toISOString();
-  const record = { id: `${platform}:${channel.id}`, platform, channelRef: channel.id, parentRef: channel.parentId!,
+  const record = { id: `${platform}:${channel.id}`, platform, channelRef: channel.id, parentRef: channel.parentId ?? null,
     agentId: "codex", acpSessionId: "saved-acp", repoPath: "/synthetic", configJson: "{}", createdUtc: now, updatedUtc: now };
   store.upsert(record);
   const router = new SessionRouter({ logger, store, profiles: [], modelCatalog: fixtureModelCatalog([]),
@@ -65,33 +67,42 @@ function setup(platform: string) {
       visible.push(text); return { channel, id: `message-${visible.length}` };
     }),
     editMessage: vi.fn(async (_ref: any, _text: string) => {}),
+    sendFile: vi.fn(async (channel: ChannelRef, _file: any) => ({ channel, id: "file" })),
+    editElicitationCard: vi.fn(async (_ref: any, _card: any) => {}),
     findMessageByNonce: vi.fn(async (_channel: ChannelRef): Promise<DeliveryNonceLookup> => ({ status: "absent" })),
     getThreadLiveState: vi.fn(async (_channel: ChannelRef) => ({ archived: false, locked: false })),
   };
   const config = { DATA_DIR: dir, REPOS_ROOT: "/synthetic", TURN_TIMEOUT_SECONDS: 60,
     SEAM_TURN_RESUME_ENABLED: true, DEFAULT_MODEL: "test", REPO_EMOJIS: new Map(),
     channelPresets: new Map(), threadPresets: new Map() };
+  const discord = { platform: "discord", editPanel: vi.fn(async () => {
+    throw new Error("Invalid Form Body: channel_id[NUMBER_TYPE_COERCE]: Chat target is not snowflake.");
+  }), sendFile: vi.fn(async () => { throw new Error("file sent to the wrong adapter"); }),
+    editElicitationCard: vi.fn(async () => { throw new Error("permission sent to the wrong adapter"); }) };
+  const transport = channelOverride ? multiplexChatAdapters([discord, adapter] as any) : adapter;
   const orch = new Orchestrator({ logger, store, router, modelCatalog: fixtureModelCatalog([]),
-    adapter: adapter as any, renderer: discordRenderer, config: config as any });
+    adapter: transport as any, renderer: discordRenderer, config: config as any });
   cleanups.push(async () => { orch.suspendForRestart(); await drain(); });
   const run = async (msg: IncomingMessage) => {
     await (orch as any).handleIncomingMessage(msg);
     await (orch as any).queueOnChannel(channel.id, async () => {});
   };
-  return { dir, store, router, channel, record, runtime, start, adapter, orch, run, visible };
+  return { dir, store, router, channel, record, runtime, start, adapter, discord, orch, run, visible };
 }
 
-function suspended(h: ReturnType<typeof setup>, source: "inbound" | "dispatch" = "inbound", remote = false) {
+function suspended(h: ReturnType<typeof setup>, source: "inbound" | "dispatch" = "inbound", remote = false,
+  cardChannel = h.channel.id, deliveryChannel?: ChannelRef) {
   const spec: DispatchSpec = { id: source === "inbound" ? "inbound-original" : "handoff-original",
     target: h.channel.id, prompt: "original work", session: "live", kind: "handoff", createdUtc: new Date().toISOString() };
   h.store.turnAttempts.registerOwner("previous-controller");
   const attempt = h.store.turnAttempts.claim(spec, "identity", "previous-controller", source);
   h.store.turnAttempts.bind(attempt, "saved-acp");
   h.store.turnAttempts.startPrompt(attempt);
-  h.store.turnAttempts.bindStatusCard(attempt, { channelId: h.channel.id, messageId: "original-card" });
+  h.store.turnAttempts.bindStatusCard(attempt, { channelId: cardChannel, messageId: "original-card" });
   if (source === "inbound") {
     h.store.admitInbound({ messageId: "original", platform: h.channel.platform, channelRef: h.channel.id,
-      parentRef: h.channel.parentId, sessionRecordId: h.record.id, authorId: "user", text: "original work", createdUtc: spec.createdUtc });
+      parentRef: h.channel.parentId, sessionRecordId: h.record.id, authorId: "user", text: "original work", createdUtc: spec.createdUtc,
+      ...(deliveryChannel ? { deliveryChannel, preemptive: false } : {}) });
     h.store.claimInbound("original", 1, spec.createdUtc);
   }
   if (remote) h.store.turnAttempts.recordRemoteRecovery(attempt, { version: 1, location: "local", slot: 6,
@@ -107,6 +118,93 @@ function usedChannels(h: ReturnType<typeof setup>) {
     ...h.adapter.getThreadLiveState.mock.calls.map(call => call[0]),
     ...h.adapter.findMessageByNonce.mock.calls.map(call => call[0])];
 }
+
+describe("session-Space recovery routes durable card and delivery refs", () => {
+  const root: ChannelRef = { platform: "google-chat", id: "SPACE" };
+  const reply: ChannelRef = { platform: "google-chat", id: "SPACE.prompt", parentId: "SPACE" };
+
+  it.each([
+    { label: "top-level card's native thread", card: "SPACE.native-card", delivery: root },
+    { label: "prompt's native thread", card: reply.id, delivery: reply },
+    { label: "Space root", card: root.id, delivery: root },
+  ])("updates the $label through Chat while adopting the original turn", async ({ card, delivery }) => {
+    const h = setup("google-chat", root);
+    const attempt = suspended(h, "inbound", true, card, delivery);
+    if (card !== root.id) expect(h.store.getByChannelRef(card)).toBeNull();
+    const child = Object.assign(new EventEmitter(), { detach: vi.fn(), kill: vi.fn() });
+    const mux = { adopt: vi.fn(() => child), sendCmd: vi.fn(async () => ({ health: [{ slot: 6, alive: true, attached: true,
+      recovery: { version: 1, owner: "bridge", submissionId: "submission", acpSessionId: "saved-acp",
+        rung: 1, phase: "executing", retry: 0, budget: 3, remaining: 3, disposition: "none", updatedUtc: attempt.updatedUtc } }] })) };
+    const recoveryRuntime = { onEvent: vi.fn(), idle: async () => {}, watchInFlightHang: async () => {} };
+    vi.spyOn(h.router, "adoptRecoveryRuntime").mockReturnValue(recoveryRuntime as any);
+    vi.spyOn(h.router, "releaseRecoveryRuntime").mockReturnValue(false);
+    h.orch.setBridgeHub({ muxFor: () => mux, slotHealthFor: () => [], onBridgeReady: () => () => {} } as any);
+    await h.orch.recoverInterruptedTurns();
+    await drain();
+    expect(child.kill).not.toHaveBeenCalled();
+    child.emit("remoteRecoveryResult", { version: 1, submissionId: "submission", acpSessionId: "saved-acp",
+      status: "completed", text: "SPACE_RECOVERED", stopReason: "end_turn", finishedUtc: new Date().toISOString() });
+    await (h.orch as any).queueOnChannel(root.id, async () => {});
+    await drain();
+
+    expect(h.store.turnAttempts.get(attempt.id)).toMatchObject({ state: "completed", deliveryDone: true, acpSessionId: "saved-acp" });
+    expect(h.adapter.sendMessage).toHaveBeenCalledWith(delivery, "SPACE_RECOVERED", expect.objectContaining({ enforceNonce: true }));
+    expect(h.adapter.editPanel).toHaveBeenCalledWith({ channel: { platform: "google-chat", id: card }, id: "original-card" },
+      expect.objectContaining({ title: expect.stringContaining("Done") }));
+    expect(h.adapter.editPanel.mock.calls.some(([, panel]) => panel.title.includes("Working"))).toBe(true);
+    expect(h.discord.editPanel).not.toHaveBeenCalled();
+    expect(h.start).not.toHaveBeenCalled();
+    if (card !== root.id) expect(h.store.getByChannelRef(card)).toBeNull();
+  });
+
+  it("replays a dispatch completion's native status card from its Space owner", async () => {
+    const h = setup("google-chat", root), attempt = suspended(h, "dispatch", true, reply.id);
+    const finishedUtc = new Date().toISOString(), outcome = { id: attempt.id, target: root.id,
+      status: "completed" as const, output: "REPORT_FINAL", finishedUtc };
+    expect(h.store.turnAttempts.adoptRemoteResult(attempt, { version: 1, submissionId: "submission", acpSessionId: "saved-acp",
+      status: "completed", text: outcome.output, finishedUtc }, outcome)).toBe(true);
+    await h.orch.replayCompletedDispatch(outcome, { action: "terminalize" });
+    await drain();
+    expect(h.adapter.editPanel).toHaveBeenCalledWith({ channel: { platform: "google-chat", id: reply.id }, id: "original-card" },
+      expect.objectContaining({ title: expect.stringContaining("Done") }));
+    expect(h.discord.editPanel).not.toHaveBeenCalled();
+    expect(h.start).not.toHaveBeenCalled();
+    expect(h.store.getByChannelRef(reply.id)).toBeNull();
+  });
+
+  it("replays a saved file to its durable native prompt target, without another session", async () => {
+    const h = setup("google-chat", root), attempt = suspended(h, "inbound", true, reply.id, reply);
+    const finishedUtc = new Date().toISOString();
+    h.store.turnAttempts.adoptRemoteResult(attempt, { version: 1, submissionId: "submission", acpSessionId: "saved-acp",
+      status: "completed", text: "FILE_FINAL", finishedUtc }, { id: attempt.id, target: root.id, status: "completed", output: "FILE_FINAL", finishedUtc });
+    h.store.turnAttempts.prepareDelivery(attempt.id, reply.id, { kind: "file",
+      file: { filename: "result.txt", mimeType: "text/plain", dataBase64: Buffer.from("FILE_FINAL").toString("base64") } });
+    await (h.orch as any).recoverInboundOutput();
+    expect(h.adapter.findMessageByNonce).toHaveBeenCalledWith(reply, expect.any(String), expect.any(Number));
+    expect(h.adapter.sendFile).toHaveBeenCalledWith(reply, expect.objectContaining({ filename: "result.txt", data: Buffer.from("FILE_FINAL") }),
+      expect.objectContaining({ inboundMessageId: "original", enforceNonce: true }));
+    expect(h.discord.sendFile).not.toHaveBeenCalled();
+    expect(h.store.turnAttempts.get(attempt.id)?.deliveryDone).toBe(true);
+    expect(h.store.getByChannelRef(reply.id)).toBeNull();
+  });
+
+  it("replays a permission card from its recorded ChannelRef rather than a session lookup", async () => {
+    const h = setup("google-chat", root);
+    const row: PermissionCardRecord = { kind: "permission", id: "permission", identity: "permission-owner", sessionId: h.record.id,
+      channel: reply, messageId: "permission-card", expiresUtc: new Date(Date.now() + 60000).toISOString(), detail: "Approved",
+      attemptId: "inbound-original", location: "local", slot: 6, requestId: "request", acpSessionId: "saved-acp", ownerPid: 77,
+      request: { sessionId: "saved-acp", options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }],
+        toolCall: { toolCallId: "call", title: "Read file", kind: "read" } },
+      status: "answered", response: { outcome: { outcome: "selected", optionId: "allow" } }, delivered: false };
+    h.store.actionCards.save(row);
+    h.orch.setBridgeHub({ muxFor: () => ({ sendCmd: vi.fn(async () => ({ state: "answered", pid: 77 })) }) } as any);
+    await (h.orch as any).actionCards.recover();
+    expect(h.adapter.editElicitationCard).toHaveBeenCalledWith({ channel: reply, id: "permission-card" }, expect.any(Object));
+    expect(h.discord.editElicitationCard).not.toHaveBeenCalled();
+    expect(h.store.actionCards.getPermission(row.id)?.delivered).toBe(true);
+    expect(h.store.getByChannelRef(reply.id)).toBeNull();
+  });
+});
 
 describe("restart recovery retains the chat platform", () => {
   it.each(["test", "discord"])("rebinds a stale %s dispatch to its qualified session id", async platform => {

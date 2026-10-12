@@ -200,6 +200,16 @@ describe("durable Google Chat session Space creation", () => {
     expect(bindRecordLocation).toHaveBeenCalledWith(record);
   });
 
+  it("passes auto effort through the core's existing clear/default representation", () => {
+    const applyThreadOverlay = vi.fn(() => ({ ok: true }));
+    (actions as any).bindGoogleChatSessionSpace({ platform: "google-chat", id: "new-home" },
+      { agentId: "codex", location: "local", model: "default", effort: "auto", repo: "/repo" },
+      { store: { getByChannel: () => null }, mutation: { applyThreadOverlay },
+        router: { ensureSessionRecord: () => ({ id: "google-chat:new-home" }), bindRecordLocation: vi.fn() } },
+      { id: "person", name: "Person" });
+    expect(applyThreadOverlay).toHaveBeenCalledWith(expect.objectContaining({ changes: expect.objectContaining({ effort: null }) }));
+  });
+
   it("does not reset or reconfigure an already-bound root on setup replay", () => {
     const record: any = { id: "google-chat:original", channelRef: "new-home", acpSessionId: "keep-acp" };
     const applyThreadOverlay = vi.fn(), ensureSessionRecord = vi.fn(), bindRecordLocation = vi.fn();

@@ -45,6 +45,9 @@ function fixture() {
 }
 
 describe("one Google Chat session root with native per-prompt delivery", () => {
+  it("does not expose creation of another thread-bound session", () => {
+    expect(fixture().adapter.createThread).toBeUndefined();
+  });
   it.each(["direct", "workspace"] as const)("admits an unmentioned top-level %s prompt at the exact root", async source => {
     const h = fixture(); await h.receive("top", false, source);
     expect(h.incoming).toHaveLength(1);

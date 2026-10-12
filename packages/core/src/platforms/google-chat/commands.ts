@@ -11,6 +11,30 @@ export const GOOGLE_CHAT_COMMANDS = [
 
 export type GoogleChatCommandName = typeof GOOGLE_CHAT_COMMANDS[number]["command"];
 
+export interface GoogleChatNewArgs {
+  name: string;
+  overrides: Partial<Record<"agent" | "model" | "effort" | "repo", string>>;
+}
+
+/** Split names from options; shared core operations validate their values. */
+export function parseGoogleChatNewArgs(args: string): GoogleChatNewArgs {
+  const overrides: GoogleChatNewArgs["overrides"] = {};
+  const name: string[] = [];
+  const unquote = (value: string) => value.replace(/^"|"$/g, "");
+  for (const token of args.match(/(?:[^\s"]|"[^"]*")+/g) ?? []) {
+    const equals = token.indexOf("=");
+    if (equals < 0) { name.push(unquote(token)); continue; }
+    const key = token.slice(0, equals);
+    if (key !== "agent" && key !== "model" && key !== "effort" && key !== "repo") {
+      throw new Error(`Unknown /new option: ${key}`);
+    }
+    const value = unquote(token.slice(equals + 1));
+    if (!value.trim()) throw new Error(`/new option ${key} must not be empty`);
+    overrides[key] = value;
+  }
+  return { name: name.join(" ").trim() || "seam", overrides };
+}
+
 export interface GoogleChatCommand {
   command: GoogleChatCommandName;
   args: string;

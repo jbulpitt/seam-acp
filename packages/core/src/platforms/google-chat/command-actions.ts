@@ -11,6 +11,9 @@ import type { ChannelRef, ChatAdapter } from "../chat-adapter.js";
 import type { Orchestrator } from "../discord/orchestrator.js";
 import type { GoogleChatCommand } from "./commands.js";
 
+export { GoogleChatSessionSpaces, resolveGoogleChatOrgDefaults, prepareGoogleChatSpaceSelection,
+  bindGoogleChatSessionSpace } from "./session-spaces.js";
+
 export interface GoogleChatCommandDeps {
   /** The adapter owns resource-name -> canonical ChannelRef mapping. */
   channelFor(space: string, thread: string | null): ChannelRef;

@@ -1342,7 +1342,7 @@ function normalizeEffort(value: string | undefined): string | undefined {
   return normalized || undefined;
 }
 
-function normalizeStoredEffort(value: string | undefined): string | undefined {
+export function normalizeStoredEffort(value: string | undefined): string | undefined {
   return !value || value === "default" || value === "auto" ? undefined : value;
 }
 

@@ -2,9 +2,35 @@ import type { ChannelRef, MessageAttachment } from "../../platforms/chat-adapter
 
 export type InboundAdmissionState = "pending" | "running" | "completed";
 
+export interface GoogleChatSpaceSelection {
+  agentId: string;
+  location: string;
+  model: string;
+  effort: string;
+  repo: string;
+}
+
+/** Native setup effects retained in the command's existing receipt JSON. */
+export interface GoogleChatSpaceCreationReceipt {
+  requestId: string;
+  customer: string;
+  displayName: string;
+  requester: { id: string; name: string };
+  snapshot: GoogleChatSpaceSelection;
+  prepared?: boolean;
+  space?: { name: string; spaceType?: string; displayName?: string;
+    spaceThreadingState?: string; spaceUri?: string; customer?: string };
+  membershipName?: string;
+  managerPromoted?: boolean;
+  appsLocked?: boolean;
+  subscribed?: boolean;
+  sessionRecordId?: string;
+}
+
 export interface InboundCommandResult {
   replies: Array<{ channel: ChannelRef; text: string; index: number }>;
   error?: string;
+  spaceCreation?: GoogleChatSpaceCreationReceipt;
 }
 
 /**

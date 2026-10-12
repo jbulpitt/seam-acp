@@ -2710,6 +2710,14 @@ export class SessionStore {
     return result.changes === 1;
   }
 
+  /** Checkpoint setup without claiming that the command's effect is complete. */
+  saveInboundCommandProgress(messageId: string, result: InboundCommandResult, updatedUtc: string): boolean {
+    return this.db.prepare(`UPDATE inbound_admissions
+      SET command_result_json=?, updated_utc=?
+      WHERE message_id=? AND command_result_json IS NOT NULL AND state IN ('pending','running')`)
+      .run(JSON.stringify(result), updatedUtc, messageId).changes === 1;
+  }
+
   /** Commit the effect receipt before transport writes; retries only drain its replies. */
   completeInboundCommand(messageId: string, result: InboundCommandResult, updatedUtc: string): boolean {
     return this.db.prepare(`UPDATE inbound_admissions

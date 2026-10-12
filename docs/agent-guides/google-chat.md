@@ -72,6 +72,28 @@ The adapter starts when the project, subscription and credentials file are
 configured. Use one controller consumer per subscription. Apply controller
 configuration through the normal [redeploy path](deploying.md).
 
+### Session-Space launch foundation
+
+The Space-creation primitive snapshots one deployment/customer default from
+`GOOGLE_CHAT_DEFAULT_AGENT`, `GOOGLE_CHAT_DEFAULT_MODEL`,
+`GOOGLE_CHAT_DEFAULT_EFFORT` and the existing cwd/location settings. Unset
+agent/model/effort use `DEFAULT_AGENT`, `default` and `auto`. An explicit
+`agent@location` overrides the location fallback. These are operator settings;
+there is no per-person default or user-facing setter.
+
+Its `/new` argument parser accepts name words plus optional `agent=`, `model=`,
+`effort=` and `repo=` values. Options override the org snapshot for one Space,
+using the existing core agent/catalog/repo validation. Every non-option token
+belongs to the title; the default title is `seam`. Setup checkpoints the native
+Space, requester manager promotion, managers-only `manageApps`, subscription
+and root binding in the command's existing admission receipt. Retries reuse
+that snapshot and Google's create requestId.
+
+This foundation does not yet change the adapter's `/new` or message ingress.
+The separate routing slice will switch new sessions to Spaces; existing
+thread-bound sessions are unchanged here. Media, naming polish, archive and
+migration are not part of this foundation.
+
 ### Session repo and effort
 
 Register these slash commands in the Chat API configuration alongside ids 1–4:

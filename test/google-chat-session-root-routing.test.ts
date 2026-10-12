@@ -19,10 +19,13 @@ function fixture() {
     thread: r.data?.thread ?? { name: `${space.name}/threads/new-output` }, sender: { name: "users/seam", type: "BOT" } }));
   const lifecycle = { space: () => space, appUser: () => "users/seam", recordAppUser: vi.fn(),
     start: vi.fn(async () => {}), stop: vi.fn(async () => {}), handle: vi.fn(async () => {}) };
-  const history = { getMessage: vi.fn(async (name: string) => ({ name, createTime: "2026-10-12T18:00:00Z",
+  const rootMessage = (name: string) => ({ name, createTime: "2026-10-12T18:00:00Z",
     sender: { name: "users/author", displayName: "Root Author", type: "HUMAN" },
-    text: "Root report", attachment: [{ contentName: "report.csv" }] })), readRawPage: vi.fn() };
-  const adapter = new GoogleChatAdapter({ api: { request }, logger: pino({ level: "silent" }),
+    text: "Root report", attachment: [{ contentName: "report.csv" }] });
+  const history = { getMessage: vi.fn(async (name: string) => rootMessage(name)),
+    readRawPage: vi.fn(async () => ({ messages: [rootMessage("spaces/session-home/messages/topic.root")], nextPageToken: null })) };
+  const logger = pino({ level: "silent" });
+  const adapter = new GoogleChatAdapter({ api: { request }, logger,
     subscription: "projects/test/subscriptions/events", allowedUserIds: new Set(["users/42"]),
     defaultCwd: "/projects", spaceEvents: lifecycle, historyReader: history, writeIntervalMs: 0 });
   const incoming: any[] = [];
@@ -38,7 +41,7 @@ function fixture() {
       thread: { name: `${space.name}/threads/${thread}` }, threadReply: reply,
       quotedMessageMetadata: reply ? { name: `${space.name}/messages/${thread}.root` } : undefined },
   }, undefined, undefined, source);
-  return { store, record, adapter, request, incoming, receive, ensureSessionRecord, history };
+  return { store, record, adapter, request, incoming, receive, ensureSessionRecord, history, logger };
 }
 
 describe("one Google Chat session root with native per-prompt delivery", () => {
@@ -69,15 +72,26 @@ describe("one Google Chat session root with native per-prompt delivery", () => {
     expect(h.incoming[0].text).toContain("Root report");
     expect(h.incoming[0].text).toContain("report.csv");
     expect(h.incoming[0].text).toMatch(/\]\n\nPrompt reply$/);
-    expect(h.history.getMessage).toHaveBeenCalledExactlyOnceWith("spaces/session-home/messages/topic.root");
-    expect(h.history.readRawPage).not.toHaveBeenCalled();
+    expect(h.history.readRawPage).toHaveBeenCalledExactlyOnceWith({ space: "spaces/session-home",
+      thread: "spaces/session-home/threads/topic", order: "oldest", limit: 1 });
+    expect(h.history.getMessage).not.toHaveBeenCalled();
   });
 
-  it("keeps a context-read error's real cause and does not acknowledge an invented prompt", async () => {
+  it("admits the original prompt without a header when root history fails and logs the real cause", async () => {
     const h = fixture(), cause = Object.assign(new Error("Google root read: permission denied"), { response: { status: 403 } });
-    h.history.getMessage.mockRejectedValueOnce(cause);
-    await expect(h.receive("reply", true, "workspace")).rejects.toBe(cause);
-    expect(h.incoming).toHaveLength(0);
+    h.history.readRawPage.mockRejectedValueOnce(cause);
+    const warn = vi.spyOn(h.logger, "warn");
+    await h.receive("reply", true, "workspace");
+    expect(h.incoming[0]).toMatchObject({ channel, text: "Prompt reply" });
+    expect(warn).toHaveBeenCalledWith(expect.objectContaining({ err: cause }),
+      "Google Chat thread context unavailable; admitting without header");
+  });
+
+  it("uses Seam's own root-message delivery record before any Google history call", async () => {
+    const h = fixture(); await h.adapter.sendMessage(channel, "Own explanation");
+    await h.receive("reply", true, "workspace", "new-output");
+    expect(h.incoming[0].text).toContain("Own explanation");
+    expect(h.history.getMessage).not.toHaveBeenCalled(); expect(h.history.readRawPage).not.toHaveBeenCalled();
   });
 
   it("keeps returned status-message references on their native thread, not the root", async () => {

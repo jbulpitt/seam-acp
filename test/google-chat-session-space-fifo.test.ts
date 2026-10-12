@@ -70,6 +70,16 @@ describe("Space-root FIFO keeps per-prompt delivery across restart", () => {
     expect((h.host as any).inboundMessage(row)).toMatchObject({ channel, deliveryChannel: target("A"), preemptive: false });
   });
 
+  it("recovers the FIFO head at boot without settling its queued successors as replacements", () => {
+    const h = fixture();
+    for (const [id, thread] of [["first", "A"], ["second", "B"]]) h.store.admitInbound({ ...h.input(id!, thread!),
+      platform: "google-chat", channelRef: channel.id, sessionRecordId: h.record.id, createdUtc: now } as any);
+    h.store.claimInbound("first", 0, now);
+    expect(h.store.recoverInboundChannel(channel.id, now)).toMatchObject({ messageId: "first", deliveryChannel: target("A") });
+    expect(h.store.getInbound("second")).toMatchObject({ state: "pending", deliveryChannel: target("B") });
+    expect(h.store.listInboundNonterminal(channel.id).map(row => row.messageId)).toEqual(["first", "second"]);
+  });
+
   it("keeps old admissions' delivery target equal to their original channel", () => {
     const h = fixture();
     h.store.admitInbound({ messageId: "legacy", platform: "discord", channelRef: "123", parentRef: "12",

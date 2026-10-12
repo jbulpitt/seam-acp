@@ -127,4 +127,25 @@ describe("Space-root FIFO keeps per-prompt delivery across restart", () => {
     expect(h.store.getInbound("second")?.deliveryChannel).toEqual(target("B"));
     expect(h.store.get(h.record.id)?.acpSessionId).toBe("keep-acp");
   });
+
+  it("boot opens admission after queuing durable FIFO heads, without waiting for a model turn to finish", async () => {
+    const h = fixture();
+    for (const [id, thread] of [["first", "A"], ["second", "B"]]) h.store.admitInbound({ ...h.input(id!, thread!),
+      platform: "google-chat", channelRef: channel.id, sessionRecordId: h.record.id, createdUtc: now } as any);
+    Object.assign(h.host, { liveTurnInventory: async () => [], recoverInboundOutput: async () => {} });
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; }), seen: string[] = [];
+    (h.host as any).handleIncomingMessageInner.mockImplementation(async (msg: any) => {
+      seen.push(msg.messageId); if (msg.messageId === "first") await held;
+    });
+    let ready = false;
+    const boot = h.host.recoverInterruptedTurns().then(() => { ready = true; });
+    try {
+      await vi.waitFor(() => expect(seen).toEqual(["first"]));
+      expect(ready).toBe(true);
+      expect(h.store.getInbound("second")?.state).toBe("pending");
+    } finally { release(); await boot; }
+    await (h.host as any).queueOnChannel(channel.id, async () => {});
+    expect(seen).toEqual(["first", "second"]);
+  });
 });

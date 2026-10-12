@@ -8,6 +8,10 @@ import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrato
 import { discordRenderer } from "../packages/core/src/platforms/discord/renderer.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 import { testSessionRouter } from "./helpers/session-fixture.js";
+import { executionIdentity } from "../packages/core/src/core/dispatch/execution-identity.js";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 
 vi.mock("node:timers/promises", () => ({
   setTimeout: (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms)),
@@ -22,7 +26,9 @@ function capError() {
 }
 
 const stores: SessionStore[] = [];
-afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); for (const store of stores.splice(0)) store.close(); });
+const dirs: string[] = [];
+afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); for (const store of stores.splice(0)) store.close();
+  for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 
 function fixture(spaceType = "SPACE") {
   vi.useFakeTimers(); vi.setSystemTime(new Date("2026-10-12T02:00:00Z"));
@@ -96,7 +102,7 @@ describe("Google Chat threading reply limit", () => {
     expect(ref.channel.id).toBe("A.Next");
     expect(h.store.getByChannel("google-chat", "A.Next")).toMatchObject({
       id: h.record.id, acpSessionId: "same-acp-session", configJson: h.record.configJson, repoPath: "/fixture" });
-    expect(h.store.getByChannel("google-chat", "A.Full")).toBeNull();
+    expect(h.store.listSessionsUncapped().filter(row => row.channelRef === "A.Full")).toEqual([]);
     expect(h.store.countSessions()).toBe(1);
     expect(warn).toHaveBeenCalledWith(expect.objectContaining({ err: h.cause }),
       "Google Chat thread reply limit reached; continuing conversation");
@@ -155,5 +161,76 @@ describe("Google Chat threading reply limit", () => {
       expect(orch.isChannelBusy("A.Next")).toBe(true);
       expect(next).not.toHaveBeenCalled();
     } finally { release(); await first; await second; }
+  });
+
+  it("keeps the original stream receipt identity while routing later chunks to the new thread", async () => {
+    const h = fixture(); await h.added;
+    const orch = new Orchestrator({ store: h.store, router: testSessionRouter({ getProfile: () => undefined }) as any,
+      adapter: h.adapter, renderer: discordRenderer, logger: h.logger as any, modelCatalog: fixtureModelCatalog([]),
+      config: { DATA_DIR: "/fixture", REPOS_ROOT: "/fixture", DISCORD_ALLOWED_USER_IDS: new Set(),
+        channelPresets: new Map(), threadPresets: new Map() } as any });
+    const spec = { id: "stream-cap", target: "A.Full", prompt: "answer", session: "live" as const };
+    h.store.turnAttempts.admit(spec);
+    const attempt = h.store.turnAttempts.claim(spec, "fixture", "fixture-boot");
+    const first = (orch as any).sendStreamAttemptText(attempt, h.channel, "first chunk", 0);
+    await vi.advanceTimersByTimeAsync(3000); await first;
+    const second = (orch as any).sendStreamAttemptText(attempt, h.channel, "second chunk", 1)
+      .then(() => undefined, (err: unknown) => err);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(await second).toBeUndefined();
+    expect(h.channel.id).toBe("A.Full");
+    expect(h.store.turnAttempts.get(spec.id)).toMatchObject({ deliveryChannel: "A.Full",
+      deliveryPayload: { kind: "messages", texts: ["first chunk", "second chunk"], stream: { delivered: 2 } } });
+    expect(h.request.mock.lastCall![1].data.thread.name).toBe("spaces/A/threads/Next");
+  });
+
+  it("reuses the existing inbound ledger to route a prior continuation thread after another rollover", async () => {
+    const h = fixture(); await h.added;
+    const first = h.adapter.sendMessage(h.channel, "first answer");
+    await vi.advanceTimersByTimeAsync(3000); await first;
+    h.store.admitInbound({ messageId: "next-turn", platform: "google-chat", channelRef: "A.Next", parentRef: "A",
+      sessionRecordId: h.record.id, authorId: "42", text: "follow up", createdUtc: new Date().toISOString() });
+    let capped = false;
+    h.request.mockImplementation(async (_scope: string, r: any) => {
+      if (!capped && r.data.thread?.name === "spaces/A/threads/Next") { capped = true; throw capError(); }
+      return { name: "spaces/A/messages/third", thread: { name: r.data.thread?.name ?? "spaces/A/threads/Third" } };
+    });
+    const nextChannel = { platform: "google-chat", id: "A.Next", parentId: "A" };
+    const second = h.adapter.sendMessage({ ...nextChannel }, "second answer");
+    await vi.advanceTimersByTimeAsync(3000); await second;
+    const remainder = h.adapter.sendMessage({ ...nextChannel }, "remaining output");
+    await vi.advanceTimersByTimeAsync(1000); await remainder;
+    expect(h.request.mock.lastCall![1].data.thread.name).toBe("spaces/A/threads/Third");
+    expect(h.store.getByChannel("google-chat", "A.Next")).toMatchObject({ id: h.record.id, channelRef: "A.Third" });
+    expect(h.store.countSessions()).toBe(1);
+  });
+
+  it("can recover the same attempt's immutable status card after the Chat home has moved", async () => {
+    const h = fixture(); await h.added;
+    const moved = h.adapter.sendMessage(h.channel, "move home");
+    await vi.advanceTimersByTimeAsync(3000); await moved;
+    const description = { agent: { value: "codex" }, model: { value: "test-model" }, effort: { value: null },
+      cwd: { value: "/fixture" }, location: { value: "local" }, fastMode: { value: false },
+      role: { value: null }, disableThreadPrefix: { value: false } };
+    const router = testSessionRouter({ getProfile: () => undefined, describeConfig: () => description,
+      ensureSessionRecord: () => h.store.get(h.record.id)! });
+    const dir = mkdtempSync(path.join(tmpdir(), "seam-cap-recovery-")); dirs.push(dir);
+    const orch = new Orchestrator({ store: h.store, router: router as any, adapter: h.adapter,
+      renderer: discordRenderer, logger: h.logger as any, modelCatalog: fixtureModelCatalog([]),
+      config: { DATA_DIR: dir, REPOS_ROOT: "/fixture", REPO_EMOJIS: new Map(), DEFAULT_MODEL: "test-model",
+        DISCORD_ALLOWED_USER_IDS: new Set(), channelPresets: new Map(), threadPresets: new Map() } as any });
+    const spec = { id: "resume-card", target: "A.Full", prompt: "answer", session: "live" as const };
+    const identity = executionIdentity({ agent: "codex", model: "test-model", location: "local", cwd: "/fixture",
+      config: { model: "test-model" } });
+    h.store.turnAttempts.admit(spec);
+    const attempt = h.store.turnAttempts.claim(spec, identity, "fixture-boot");
+    h.store.turnAttempts.bindStatusCard(attempt, { channelId: "A.Next", messageId: "spaces/A/messages/card" });
+    const edit = vi.spyOn(h.adapter, "editPanel").mockRejectedValue(new Error("fixture unavailable card"));
+    vi.spyOn(h.adapter, "sendPanel").mockRejectedValue(new Error("fixture status replacement reached"));
+    await expect((orch as any).executeIncomingMessage({ channel: { platform: "google-chat", id: "A.Full", parentId: "A" },
+      authorId: "42", authorIsBot: false, text: "answer" }, undefined, attempt))
+      .rejects.toThrow("fixture status replacement reached");
+    expect(edit).toHaveBeenCalledWith(expect.objectContaining({ id: "spaces/A/messages/card",
+      channel: expect.objectContaining({ id: "A.Next" }) }), expect.anything());
   });
 });

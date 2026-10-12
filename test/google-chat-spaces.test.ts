@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import { GoogleChatAdapter } from "../packages/core/src/platforms/google-chat/adapter.js";
 import { PubSubPullTransport } from "../packages/core/src/platforms/google-chat/transport.js";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
+import { seedLegacyChatRecords } from "./helpers/google-chat-legacy-fixture.js";
 
 const logger = pino({ level: "silent" });
 const stores: SessionStore[] = [];
@@ -20,8 +21,9 @@ const flat = { platform: "google-chat", id: "team" };
 const idFor = (raw: any) => `gchat_${createHash("sha256").update(raw.message.name).digest("base64url")}`;
 
 function setup(allowedSpaceIds: string[] = ["spaces/team"]) {
+  let unthreaded = false;
   const request = vi.fn(async (scope: string, r: any): Promise<any> => scope === "pubsub" ? {} : {
-    name: "spaces/team/messages/app-1", thread: r.data?.thread ?? { name: "spaces/team/threads/new" },
+    name: "spaces/team/messages/app-1", ...(unthreaded ? {} : { thread: r.data?.thread ?? { name: "spaces/team/threads/new" } }),
   });
   const adapter = new GoogleChatAdapter({ api: { request }, subscription: "projects/test/subscriptions/events",
     allowedUserIds: new Set(["users/42"]), allowedSpaceIds: new Set(allowedSpaceIds),
@@ -30,9 +32,13 @@ function setup(allowedSpaceIds: string[] = ["spaces/team"]) {
   adapter.onMessage(msg => { messages.push(msg); msg.onAdmitted?.(); });
   const transport = new PubSubPullTransport({ api: { request }, subscription: "projects/test/subscriptions/events", logger,
     receive: (raw, signal, id) => adapter.receiveEvent(raw, signal, id) });
-  const deliver = (raw: unknown, id = "publication") => transport.process({ ackId: `ack-${id}`,
-    message: { messageId: id, data: Buffer.from(JSON.stringify(raw)).toString("base64") } });
+  const deliver = (raw: any, id = "publication") => {
+    if (raw.space?.spaceThreadingState === "UNTHREADED_MESSAGES") { unthreaded = true; seedLegacyChatRecords(store, ["team"]); }
+    return transport.process({ ackId: `ack-${id}`,
+      message: { messageId: id, data: Buffer.from(JSON.stringify(raw)).toString("base64") } });
+  };
   const store = new SessionStore(":memory:"); stores.push(store);
+  seedLegacyChatRecords(store, ["team.A", "team.B"]);
   const record = { id: "google-chat:team.A", platform: "google-chat", channelRef: "team.A", parentRef: "team",
     agentId: "codex", acpSessionId: "saved-session", configJson: "{}" };
   const ensureSessionRecord = vi.fn(() => record);
@@ -70,7 +76,7 @@ describe("Google Chat mention-only shared spaces", () => {
     expect(h.messages[0].text).toBe("One  two  three @Seam");
   });
 
-  it.each(["THREADED_MESSAGES", "GROUPED_MESSAGES"])("uses a native %s thread/topic as the shared session", async state => {
+  it.each(["THREADED_MESSAGES", "GROUPED_MESSAGES"])("keeps an already-bound native %s legacy session", async state => {
     const h = setup(); const reply = event(state); reply.message.name += ".reply"; reply.message.threadReply = true;
     await h.deliver(event(state)); await h.deliver(reply, "reply"); await h.deliver(event(state, "B"), "other");
     expect(h.messages.map(msg => msg.channel)).toEqual([threaded, threaded,
@@ -167,19 +173,6 @@ describe("Google Chat mention-only shared spaces", () => {
         thread: { name: "spaces/team/threads/A" } });
       expect(h.request.mock.calls.at(-1)![0]).toBe("pubsub");
     });
-
-  it("explains /new in an unthreaded Space without creating a phantom session or repeating the response", async () => {
-    const h = setup(); const raw = event("UNTHREADED_MESSAGES"); delete raw.message.thread;
-    raw.message.text = "/new separate"; raw.message.argumentText = "/new separate"; raw.message.slashCommand = { commandId: 1 };
-    await h.deliver(raw); await h.deliver(raw, "redelivery");
-    expect(h.ensureSessionRecord).not.toHaveBeenCalled();
-    const writes = h.request.mock.calls.filter(([scope]) => scope === "chat");
-    expect(writes).toHaveLength(1);
-    expect(writes[0]![1].data.text).toMatch(/does not support threads.*one shared session/i);
-    expect(writes[0]![1].data).not.toHaveProperty("thread");
-    expect(writes[0]![1].data.privateMessageViewer).toEqual({ name: "users/42" });
-    expect(h.store.getInbound(idFor(raw))).toMatchObject({ channelRef: "team", state: "completed" });
-  });
 
   it("routes flat-space choice clicks through the same session and ACKs only after the handler commits", async () => {
     const h = setup(); const raw = event("UNTHREADED_MESSAGES"); delete raw.message.thread;

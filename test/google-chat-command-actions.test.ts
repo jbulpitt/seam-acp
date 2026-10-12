@@ -53,7 +53,7 @@ function harness() {
   const effortChoices = vi.fn(() => ["low", "high", "provider-special"]);
   const router = { ensureSessionRecord, describeConfig, bindRecordLocation: vi.fn(() => "local") };
   const deps: GoogleChatCommandDeps = {
-    channelFor, createThread, router, store: { getByChannel: () => null },
+    channelFor, router, store: { getByChannel: () => record },
     mutation: { readThreadPresetEntry: () => undefined,
       applyThreadOverlay: vi.fn(() => ({ ok: true as const, message: "Applied", auditId: "fixture" })) },
     runtimeTransition: { applyAgentChange, applyModelChange, configure },
@@ -124,24 +124,11 @@ describe("Google Chat command -> existing core operations", () => {
     expect(h.createThread).not.toHaveBeenCalled();
   });
 
-  it("creates a bold named sibling then binds it, without touching the old session", async () => {
-    const h = harness();
-    const result = await executeGoogleChatCommand({ ...command, command: "new", args: "Another task" }, h.deps);
-    expect(result).toEqual({ command: "new", channel: created, record: h.newRecord });
-    expect(h.channelFor).toHaveBeenCalledExactlyOnceWith(command.space, null);
-    expect(h.createThread).toHaveBeenCalledExactlyOnceWith(parent, "**Another task**");
-    expect(h.ensureSessionRecord).toHaveBeenCalledExactlyOnceWith({ platform: "google-chat", channelRef: "dm.new", parentRef: "dm", cwd: "/repo" });
-    expect(h.trace).toEqual(["create", "bind:dm.new"]);
-    expect(h.cancelChannel).not.toHaveBeenCalled();
-    expect(h.applyAgentChange).not.toHaveBeenCalled();
-    expect(h.applyModelChange).not.toHaveBeenCalled();
-    expect(record.acpSessionId).toBe("old-acp");
-  });
-
-  it("uses /seam new's existing default name when no name is supplied", async () => {
-    const h = harness();
-    await executeGoogleChatCommand({ ...command, command: "new", args: "" }, h.deps);
-    expect(h.createThread).toHaveBeenCalledWith(parent, "seam");
+  it("does not create a thread-bound session to configure an unbound launcher", async () => {
+    const h = harness(); h.deps.store.getByChannel = () => null;
+    await executeGoogleChatCommand(command, h.deps);
+    expect(h.respond).toHaveBeenCalledExactlyOnceWith(channel, expect.stringContaining("/new"));
+    expect(h.ensureSessionRecord).not.toHaveBeenCalled(); expect(h.applyModelChange).not.toHaveBeenCalled();
   });
 
   it.each(["agent", "model"] as const)("uses RuntimeTransition.apply%sChange with the real actor and unchanged id", async (kind) => {
@@ -151,7 +138,7 @@ describe("Google Chat command -> existing core operations", () => {
     expect(result).toEqual({ command: kind, channel, outcome: h.switchOutcome });
     const selected = kind === "agent" ? h.applyAgentChange : h.applyModelChange;
     expect(selected).toHaveBeenCalledExactlyOnceWith(channel, record, args, { id: "users/person", name: "A Person" }, expect.any(Function));
-    expect(h.ensureSessionRecord).toHaveBeenCalledExactlyOnceWith({ platform: "google-chat", channelRef: "dm.old", parentRef: "dm", cwd: "/repo" });
+    expect(h.ensureSessionRecord).not.toHaveBeenCalled();
     expect(h.respond).toHaveBeenCalledExactlyOnceWith(channel, h.switchOutcome.message);
     expect(h.cancelChannel).not.toHaveBeenCalled();
     expect(h.createThread).not.toHaveBeenCalled();
@@ -193,13 +180,11 @@ describe("Google Chat command -> existing core operations", () => {
     expect(result.outcome).toBe(failure);
   });
 
-  it.each(["create", "bind", "switch"])("propagates a thrown %s cause unchanged", async (where) => {
+  it("propagates a thrown switch cause unchanged", async () => {
     const h = harness();
-    const cause = new Error(`${where}: original cause`, { cause: new Error("native detail") });
-    if (where === "create") h.deps.createThread = async () => { throw cause; };
-    if (where === "bind") h.deps.router.ensureSessionRecord = () => { throw cause; };
-    if (where === "switch") h.deps.runtimeTransition.applyModelChange = async () => { throw cause; };
-    await expect(executeGoogleChatCommand({ ...command, command: where === "switch" ? "model" : "new" }, h.deps)).rejects.toBe(cause);
+    const cause = new Error("switch: original cause", { cause: new Error("native detail") });
+    h.deps.runtimeTransition.applyModelChange = async () => { throw cause; };
+    await expect(executeGoogleChatCommand(command, h.deps)).rejects.toBe(cause);
   });
 
   it("passes a parsed slash command through the action map exactly once", async () => {

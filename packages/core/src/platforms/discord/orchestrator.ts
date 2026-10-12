@@ -52,6 +52,7 @@ import { getSlashCommandAccess, getSlashAcknowledgement, type SlashCommandAccess
 import type {
   ChatAdapter,
   ChannelRef,
+  DeliveryNonceOptions,
   ComponentEvent,
   ChoiceInteraction,
   IncomingMessage,
@@ -649,6 +650,7 @@ interface ChannelQueueFence {
 }
 
 interface ChannelQueueMeta {
+  inboundMessageIds?: Set<string>;
   epoch: number;
   queued: number;
   admittedAtMs: number;
@@ -2422,6 +2424,7 @@ export class Orchestrator {
 
   private async handleIncomingMessage(msg: IncomingMessage): Promise<void> {
     const channelId = msg.channel.id;
+    const preemptive = msg.preemptive !== false;
 
     // Config editor: next file from the editor owner becomes the draft rider.
     // Must run before abort / park so the upload is not treated as a new turn.
@@ -2431,7 +2434,7 @@ export class Orchestrator {
     // new prompt is admitted. This also precedes mid-turn inbox routing: a user
     // answer typed as a message is a competing turn, never a hidden form reply.
     let supersededElicitation = 0;
-    if (msg.raw) {
+    if (msg.raw && preemptive) {
       const existing = this.store.getByChannel(msg.channel.platform, channelId);
       if (existing) {
         supersededElicitation = await this.elicitations.cancelForSession(
@@ -2451,6 +2454,7 @@ export class Orchestrator {
     // "abort" mode falls through to the priority-interrupt path unchanged.
     if (
       this.config.SEAM_MIDTURN_REPLY_MODE === "inbox" &&
+      preemptive &&
       this.channelQueues.has(this.queueChannelRef(channelId)) &&
       supersededElicitation === 0
     ) {
@@ -2472,7 +2476,7 @@ export class Orchestrator {
     // #89 D9: a live (non-park) user message supersedes any parked queue item
     // BEFORE aborting, so a turn-end fire cannot sneak the old prompt in after
     // abort completes. Offline-bridge parks skip this — they REPLACE the row.
-    if (msg.raw && !this.wouldParkForOfflineBridge(msg)) {
+    if (msg.raw && preemptive && !this.wouldParkForOfflineBridge(msg)) {
       this.lastUserMessageAt.set(channelId, Date.now());
       await this.clearParkedForChannel(
         channelId,
@@ -2510,6 +2514,8 @@ export class Orchestrator {
         authorName: msg.authorName ?? null,
         text: msg.text,
         attachments: msg.attachments ?? [],
+        preemptive,
+        deliveryChannel: msg.deliveryChannel,
         createdUtc: new Date().toISOString(),
       });
       msg.onAdmitted?.();
@@ -2523,10 +2529,18 @@ export class Orchestrator {
       admissionId = msg.messageId;
     }
 
+    if (!preemptive && msg.deliveryChannel && admissionId) {
+      if (!this.channelQueues.has(this.queueChannelRef(channelId)) && this.promptedAttemptBlock(channelId, true)) return;
+      await Promise.all(this.store.listInboundNonterminal(channelId)
+        .filter(row => !row.preemptive && row.deliveryChannel && row.state === "pending")
+        .map(row => this.startRecoveredInbound(row)));
+      return;
+    }
+
     // Bump the generation so a preemptive recovered row queued before this
     // message stands down. Queued user messages are not superseded: each runs.
     const queueRef = this.queueChannelRef(channelId);
-    this.channelGenerations.set(queueRef, (this.channelGenerations.get(queueRef) ?? 0) + 1);
+    if (preemptive) this.channelGenerations.set(queueRef, (this.channelGenerations.get(queueRef) ?? 0) + 1);
 
     let interruptedDispatchFence: DispatchTargetFence | undefined;
     const resumeQueuedDispatches = async (): Promise<void> => {
@@ -2545,7 +2559,7 @@ export class Orchestrator {
       }
     };
 
-    if (this.channelQueues.has(this.queueChannelRef(channelId))) {
+    if (preemptive && this.channelQueues.has(this.queueChannelRef(channelId))) {
       const channel = msg.channel;
       record ??= this.router.ensureSessionRecord({
         platform: channel.platform,
@@ -2659,11 +2673,13 @@ export class Orchestrator {
     task: (fence: ChannelQueueFence) => Promise<T>,
     recovery?: { lastActivityAt: () => number; onWatchdog: (error: TurnWatchdogTimeoutError) => Promise<void> },
     prepare?: (fence: ChannelQueueFence) => Promise<void>,
+    inboundMessageId?: string,
   ): Promise<T> {
     channelId = this.queueChannelRef(channelId);
     this.channelQueueMeta ??= new Map<string, ChannelQueueMeta>();
     const epoch = this.queueEpoch(channelId);
     const existingMeta = this.channelQueueMeta.get(channelId);
+    if (inboundMessageId && existingMeta?.epoch === epoch && existingMeta.inboundMessageIds?.has(inboundMessageId)) return Promise.resolve(undefined as T);
     const existing =
       !existingMeta || existingMeta.epoch === epoch
         ? this.channelQueues.get(channelId) ?? Promise.resolve()
@@ -2674,6 +2690,10 @@ export class Orchestrator {
         ? { ...existingMeta, queued: existingMeta.queued + 1 }
         : { epoch, queued: 1, admittedAtMs: now, lastProgressAtMs: now };
     this.channelQueueMeta.set(channelId, meta);
+    if (inboundMessageId) {
+      meta.inboundMessageIds ??= new Set();
+      meta.inboundMessageIds.add(inboundMessageId);
+    }
     let releaseLink!: () => void;
     const released = new Promise<void>((resolve) => { releaseLink = resolve; });
     const fence: ChannelQueueFence = { channelId, epoch, release: () => releaseLink() };
@@ -2744,6 +2764,7 @@ export class Orchestrator {
           currentMeta.lastProgressAtMs = Date.now();
         }
         endTurn();
+        if (inboundMessageId) meta.inboundMessageIds?.delete(inboundMessageId);
       }
     });
     // The link stored in channelQueues must never reject: the next task chains
@@ -2773,6 +2794,8 @@ export class Orchestrator {
       ...(row.authorName ? { authorName: row.authorName } : {}),
       authorIsBot: false,
       text: row.text,
+      ...(row.deliveryChannel ? { deliveryChannel: row.deliveryChannel } : {}),
+      ...(!row.preemptive ? { preemptive: false } : {}),
       ...(row.attachments.length > 0 ? { attachments: row.attachments } : {}),
     };
   }
@@ -2833,7 +2856,8 @@ export class Orchestrator {
 
   private attemptStatusPanel(attempt: TurnAttempt): DispatchStatusPanel<MessageRef> | undefined {
     if (!attempt.statusCard) return undefined;
-    const ref: MessageRef = { channel: { platform: this.platformForChannel(attempt.statusCard.channelId),
+    // The attempt's root owns the platform, not its native card destination.
+    const ref: MessageRef = { channel: { platform: this.platformForChannel(attempt.spec.target),
       id: attempt.statusCard.channelId }, id: attempt.statusCard.messageId };
     const status = this.attemptTurnStatus(attempt);
     status.setState("Working");
@@ -2903,7 +2927,7 @@ export class Orchestrator {
         }
       }
     };
-    return (queueFence ? run(queueFence) : this.queueOnChannel(row.channelRef, run)).catch((err) => {
+    return (queueFence ? run(queueFence) : this.queueOnChannel(row.channelRef, run, undefined, undefined, row.messageId)).catch((err) => {
       if (!(err instanceof ChannelQueueFencedError)) {
         this.logger.error(
           { err, channelRef: row.channelRef, messageId: row.messageId },
@@ -3075,12 +3099,12 @@ export class Orchestrator {
    * leaves `owner_boot` empty, and that emptiness is not a reason to suspend
    * them. Read-only: this does not reclassify anything.
    */
-  private promptedAttemptBlock(channelRef: string): { suspendedId: string; pendingIds: string[] } | null {
+  private promptedAttemptBlock(channelRef: string, includeInbound = false): { suspendedId: string; pendingIds: string[] } | null {
     const pendingIds: string[] = [];
     let suspendedId: string | undefined;
     for (const state of ["pending", "suspended"] as const) {
       for (const attempt of this.store.turnAttempts.list(state, () => {})) {
-        if (attempt.source !== "dispatch" || attempt.spec?.target !== channelRef) continue;
+        if ((!includeInbound && attempt.source !== "dispatch") || attempt.spec?.target !== channelRef) continue;
         if (state === "pending" && !attempt.promptStarted) pendingIds.push(attempt.id);
         if (state === "suspended" && attempt.promptStarted && suspendedId === undefined) {
           suspendedId = attempt.id;
@@ -3135,6 +3159,10 @@ export class Orchestrator {
       await this.tryFireParked(channelId).catch((err) =>
         this.logger.warn({ err, channelId }, "post-turn parked fire failed")
       );
+      if (!this.restartCutoff && !this.promptedAttemptBlock(channelId, true)) {
+        const pending = this.store.listInboundNonterminal(channelId).find(row => !row.preemptive && row.deliveryChannel && row.state === "pending");
+        if (pending) void this.startRecoveredInbound(pending);
+      }
     });
     this.trackContinuation(settled);
   }
@@ -3657,7 +3685,7 @@ export class Orchestrator {
         const staged = this.stagedRecovery.get(channel.id);
         this.stagedRecovery.delete(channel.id);
         const render = staged ?? await this.processRestartRender(priorHuman);
-        if (!staged) await this.postResumeNotice(channel.id, render.note);
+        if (!staged) await this.postResumeNotice(channel.id, render.note, admission?.deliveryChannel);
         msg = { ...msg, text: render.prompt, attachments: undefined };
       } else {
         this.stagedRecovery.delete(channel.id);
@@ -15045,10 +15073,10 @@ export class Orchestrator {
     }
   }
 
-  private async postResumeNotice(channelRef: string, text: string): Promise<void> {
+  private async postResumeNotice(channelRef: string, text: string, deliveryChannel?: ChannelRef): Promise<void> {
     try {
       await this.adapter.sendMessage?.(
-        { platform: this.platformForChannel(channelRef), id: channelRef },
+        deliveryChannel ?? { platform: this.platformForChannel(channelRef), id: channelRef },
         text
       );
     } catch (err) {
@@ -15385,7 +15413,8 @@ export class Orchestrator {
       let fenceCounter = 0;
       adoptedRenderer = new StreamingMessageRenderer(
         async (text) => {
-          if (collectOnly) this.store.turnAttempts.prepareStreamDelivery(attempt, target.id, text, adoptedChunks.length);
+          if (collectOnly) this.store.turnAttempts.prepareStreamDelivery(attempt,
+            this.deliveryForChannel(target, attempt.source === "inbound" ? attempt.id.slice("inbound-".length) : undefined).channel.id, text, adoptedChunks.length);
           else await this.sendStreamAttemptText(attempt, target, text, adoptedChunks.length);
           const payload = this.store.turnAttempts.get(attempt.id)?.deliveryPayload;
           if (payload?.kind === "messages") adoptedChunks.splice(0, adoptedChunks.length, ...payload.texts);
@@ -15558,7 +15587,8 @@ export class Orchestrator {
         const texts = [...adoptedChunks];
         if (failed) {
           const text = `❌ ${error}`;
-          this.store.turnAttempts.prepareStreamDelivery(current, target.id, text);
+          this.store.turnAttempts.prepareStreamDelivery(current,
+            this.deliveryForChannel(target, current.source === "inbound" ? current.id.slice("inbound-".length) : undefined).channel.id, text);
           texts.push(text);
         } else if (texts.length === 0 && output.trim() && adoptedRenderer.sentCount === 0) {
           texts.push(...await streamingMessageChunks(output));
@@ -16069,12 +16099,18 @@ export class Orchestrator {
         if (isAwaitingReauth(a.stalledReason)) continue;
         if (a.state !== "suspended" || (a.promptStarted && !enabled)) continue;
         if (await this.checkResumePreconditions(this.inboundMessage(row).channel) !== "ok") continue;
-      } else if (row.state !== "pending" || live.some(m => m.channelRef === row.channelRef)) {
+      } else if (row.state !== "pending" || (row.preemptive && live.some(m => m.channelRef === row.channelRef))) {
         // Legacy ambiguous execution is inventory, not original-task replay.
         continue;
       }
-      const pending = this.store.recoverInboundChannel(row.channelRef, now.toISOString());
-      if (pending) liveJobs.push(this.resumeScheduler.run(() => this.startRecoveredInbound(pending)));
+      const pending = this.store.recoverInboundChannel(row.channelRef, now.toISOString(), row.preemptive ? undefined : row.messageId);
+      if (pending) {
+        if (pending.deliveryChannel && !pending.preemptive) {
+          if (!this.channelQueues.has(this.queueChannelRef(row.channelRef)) && this.promptedAttemptBlock(row.channelRef, true) && !a) continue;
+          void this.startRecoveredInbound(pending);
+        }
+        else liveJobs.push(this.resumeScheduler.run(() => this.startRecoveredInbound(pending)));
+      }
     }
     await this.recoverInboundOutput();
     for (const marker of live) {
@@ -16183,17 +16219,23 @@ export class Orchestrator {
     nonce: string,
     turnOrigin?: DispatchSpec
   ): Promise<void> {
-    const delivery = { nonce, enforceNonce: true as const };
+    const messageId = turnOrigin?.id.startsWith("inbound-") ? turnOrigin.id.slice("inbound-".length) : undefined;
+    const admission = messageId ? this.store.getInbound(messageId) : null;
+    const authoring = admission ? this.inboundMessage(admission).channel : channel;
+    channel = this.deliveryForChannel(channel, messageId).channel;
+    const delivery = { nonce, enforceNonce: true as const,
+      ...(channel.platform === "google-chat" && admission?.deliveryChannel ? { inboundMessageId: messageId } : {}) };
     if (payload.kind === "message") {
-      await this.renderCapturedAgentText(channel, payload.text, async (text) => {
+      await this.renderCapturedAgentText(authoring, payload.text, async (text) => {
         await this.adapter.sendMessage(channel, text, delivery);
-      }, turnOrigin);
+      }, turnOrigin, channel.platform === "google-chat" ? delivery : undefined);
       return;
     }
     if (payload.kind === "panel") {
       let description = "";
       const body = payload.panel.description ?? "";
-      await this.renderCapturedAgentText(channel, body, async (part) => { description += part; }, turnOrigin);
+      await this.renderCapturedAgentText(authoring, body, async (part) => { description += part; }, turnOrigin,
+        channel.platform === "google-chat" ? delivery : undefined);
       if (description.trim() || !body.trim()) {
         const panel = { ...payload.panel, description };
         if (this.adapter.sendPanel) await this.adapter.sendPanel(channel, panel, delivery);
@@ -16227,9 +16269,12 @@ export class Orchestrator {
   }
 
   private async sendStreamAttemptText(attempt: TurnAttempt, channel: ChannelRef, text: string, index: number): Promise<void> {
-    const receipt = this.store.turnAttempts.prepareStreamDelivery(attempt, channel.id, text, index);
+    const messageId = attempt.source === "inbound" && attempt.id.startsWith("inbound-") ? attempt.id.slice("inbound-".length) : undefined;
+    const target = this.deliveryForChannel(channel, messageId).channel;
+    const receipt = this.store.turnAttempts.prepareStreamDelivery(attempt, target.id, text, index);
     try {
-      await this.adapter.sendMessage(channel, text, { nonce: receipt.nonce, enforceNonce: true });
+      await this.adapter.sendMessage(target, text, { nonce: receipt.nonce, enforceNonce: true,
+        ...(channel.platform === "google-chat" && messageId ? { inboundMessageId: messageId } : {}) });
       this.store.turnAttempts.acknowledgeStreamDelivery(attempt, receipt.index);
     } catch (err) {
       if (isInvalidMessagePayloadError(err)) this.store.turnAttempts.discardStreamDelivery(attempt, receipt.index);
@@ -16243,16 +16288,19 @@ export class Orchestrator {
     channel: ChannelRef,
     payload: DurableDeliveryPayload
   ): Promise<void> {
-    const receipt = this.store.turnAttempts.prepareDelivery(attemptId, channel.id, payload);
+    const attempt = this.store.turnAttempts.get(attemptId);
+    const messageId = attempt?.source === "inbound" && attemptId.startsWith("inbound-") ? attemptId.slice("inbound-".length) : undefined;
+    const target = this.deliveryForChannel(channel, messageId).channel;
+    const receipt = this.store.turnAttempts.prepareDelivery(attemptId, target.id, payload);
     if (payload.kind === "messages" && payload.stream) {
-      const resolution = await this.recoverRecordedDelivery(this.store.turnAttempts.get(attemptId)!, channel, true);
+      const resolution = await this.recoverRecordedDelivery(this.store.turnAttempts.get(attemptId)!, target, true);
       if (resolution !== "delivered") {
         const current = this.store.turnAttempts.get(attemptId)!;
         throw new Error(current.deliveryUncertainReason ?? current.deliveryAbandonedReason ?? resolution);
       }
       return;
     }
-    return this.sendDeliveryPayload(channel, payload, receipt.nonce, this.store.turnAttempts.get(attemptId)?.spec);
+    return this.sendDeliveryPayload(target, payload, receipt.nonce, this.store.turnAttempts.get(attemptId)?.spec);
   }
 
   private async recoverRecordedDelivery(
@@ -16260,6 +16308,9 @@ export class Orchestrator {
     channel: ChannelRef,
     propagateError = false,
   ): Promise<"delivered" | "abandoned" | "uncertain" | "deferred"> {
+    if (attempt.source === "inbound" && attempt.id.startsWith("inbound-")) {
+      channel = this.deliveryForChannel(channel, attempt.id.slice("inbound-".length)).channel;
+    }
     // Protects bounded uncertainty from being re-queried on every boot;
     // deleting this check recreates noisy retries without creating proof.
     if (attempt.deliveryUncertainReason) return "uncertain";
@@ -19163,13 +19214,14 @@ export class Orchestrator {
     channel: ChannelRef,
     text: string,
     postProse: (text: string) => Promise<void>,
-    turnOrigin?: DispatchSpec
+    turnOrigin?: DispatchSpec,
+    delivery?: DeliveryNonceOptions,
   ): Promise<void> {
     text = agentChoiceOutput(text, turnOrigin);
     const parts = this.capturedAgentTextParts(text);
     let counter = 0;
     for (const part of parts) {
-      if ("fence" in part) await this.emitClosedFence(channel, part.fence, ++counter, { notice: part.notice, turnOrigin });
+      if ("fence" in part) await this.emitClosedFence(channel, part.fence, ++counter, { notice: part.notice, turnOrigin, delivery });
       else if (part.text.trim()) await postProse(part.text);
     }
     if (!text.trim()) await postProse(text);
@@ -19180,7 +19232,7 @@ export class Orchestrator {
     channel: ChannelRef,
     fence: CompletedFence,
     counter: number,
-    opts: { notice?: string; preferredRoot?: string | null; turnOrigin?: DispatchSpec } = {}
+    opts: { notice?: string; preferredRoot?: string | null; turnOrigin?: DispatchSpec; delivery?: DeliveryNonceOptions } = {}
   ): Promise<void> {
     // Explicit file-attach signal: a fence tagged `seam-attach` whose body is a
     // workspace file path. Upload the real file (resolved against the thread's
@@ -19189,7 +19241,8 @@ export class Orchestrator {
     // attach ANY fenced path that happened to exist — a footgun when an agent
     // merely references files while narrating its work.
     if (fence.lang === ATTACH_FENCE_LANG) {
-      await this.emitAttachFence(channel, fence, opts);
+      await this.emitAttachFence(channel, fence, { ...opts, delivery: opts.delivery
+        ? { ...opts.delivery, nonce: deliveryNonce(`${opts.delivery.nonce}-file-${counter}`) } : undefined });
       return;
     }
 
@@ -19251,7 +19304,7 @@ export class Orchestrator {
   private async emitAttachFence(
     channel: ChannelRef,
     fence: CompletedFence,
-    opts: { notice?: string; preferredRoot?: string | null }
+    opts: { notice?: string; preferredRoot?: string | null; delivery?: DeliveryNonceOptions }
   ): Promise<void> {
     const note = opts.notice ? `\n\n${opts.notice}` : "";
     if (!this.adapter.sendFile) {
@@ -19260,6 +19313,10 @@ export class Orchestrator {
         .catch(() => {});
       return;
     }
+    const sendFile = (file: Parameters<NonNullable<ChatAdapter["sendFile"]>>[1]) => {
+      const target = this.deliveryForChannel(channel, opts.delivery?.inboundMessageId).channel;
+      return opts.delivery ? this.adapter.sendFile!(target, file, opts.delivery) : this.adapter.sendFile!(target, file);
+    };
     const reqPath = (fence.content.split("\n").find((l) => l.trim()) ?? "").trim();
     if (!reqPath) return;
     const record = this.store.getByChannel(channel.platform, channel.id);
@@ -19287,7 +19344,7 @@ export class Orchestrator {
               .catch(() => {});
             return;
           }
-          await this.adapter.sendFile(channel, {
+          await sendFile({
             data: ferried.bytes,
             filename: ferried.filename,
             mimeType: mimeTypeForFilename(ferried.filename),
@@ -19322,7 +19379,7 @@ export class Orchestrator {
     try {
       const data = await fsp.readFile(resolved.realPath);
       const filename = path.basename(resolved.realPath);
-      await this.adapter.sendFile(channel, {
+      await sendFile({
         data,
         filename,
         mimeType: mimeTypeForFilename(filename),
@@ -20880,11 +20937,30 @@ export class Orchestrator {
   private async bindThreadRecord(channel: ChannelRef, cwd = this.config.REPOS_ROOT): Promise<SessionRecord> {
     const existing = this.store.getByChannel(channel.platform, channel.id);
     const parentId = channel.parentId ?? existing?.parentRef;
-    const resolved = parentId
+    const resolved = channel.platform === "google-chat" ? await this.adapter.resolveChannel?.(channel) ?? channel : parentId
       ? { ...channel, parentId }
       : await this.adapter.resolveChannel?.(channel) ?? channel;
     return this.router.ensureSessionRecord({ platform: resolved.platform, channelRef: resolved.id,
       ...(resolved.parentId ? { parentRef: resolved.parentId } : {}), cwd });
+  }
+
+  /** The executing admission, not a later queued message, owns the reply target. */
+  deliveryForChannel(channel: ChannelRef, inboundMessageId?: string) {
+    const record = this.store.getByChannel(channel.platform, channel.id);
+    const root = record?.channelRef ?? (channel.platform === "google-chat" ? channel.parentId ?? channel.id : channel.id);
+    const marker = this.liveTurnByChannel.get(root) ?? [...this.adoptingRemoteResults].find(id => {
+      const attempt = this.store.turnAttempts.get(id);
+      return attempt?.source === "inbound" && attempt.spec.target === root;
+    });
+    const messageId = inboundMessageId ?? (marker?.startsWith("inbound-") ? marker.slice("inbound-".length) : undefined);
+    const row = messageId ? this.store.getInbound(messageId) : null;
+    if (!row?.deliveryChannel || row.platform !== channel.platform || (channel.id !== row.channelRef && channel.id !== row.deliveryChannel.id
+      && !(inboundMessageId && channel.platform === "google-chat" && channel.id.startsWith(`${row.channelRef}.`)))) return { channel };
+    const from = row.deliveryChannel.id;
+    return { channel: row.deliveryChannel, continued: (destination: ChannelRef) => {
+      this.store.continueInboundDelivery(row.messageId, destination);
+      this.store.turnAttempts.continueDelivery(inboundAttemptId(row.messageId), from, destination.id);
+    } };
   }
 
   private channelRefFromInteraction(

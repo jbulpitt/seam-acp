@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { pino } from "pino";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
+import { seedLegacyChatRecords } from "./helpers/google-chat-legacy-fixture.js";
 import { GoogleChatAdapter } from "../packages/core/src/platforms/google-chat/adapter.js";
 import { PubSubPullTransport } from "../packages/core/src/platforms/google-chat/transport.js";
 
@@ -22,6 +23,7 @@ const rootEvent = (id: number, text: string, threadReply?: boolean) => {
 
 function setup(rejectPrivateRoot = false) {
   const store = new SessionStore(":memory:"); stores.push(store);
+  seedLegacyChatRecords(store, ["dm.thread", "dm.pB-Jq3TxSfk"]);
   const messages: any[] = [];
   const request = vi.fn(async (scope: string, r: any): Promise<any> => {
     if (scope === "pubsub") return {};
@@ -59,7 +61,7 @@ function setup(rejectPrivateRoot = false) {
     receive: (...args: any[]) => (adapter.receiveEvent as any)(...args) });
   const deliver = (raw: unknown) => transport.process({ ackId: "ack-command", message: { messageId: "pubsub-command",
     data: Buffer.from(JSON.stringify(raw)).toString("base64") } });
-  return { adapter, request, messages, normal, record, ensureSessionRecord, describeConfig, applyAgentChange, applyModelChange, cancelChannel, deliver, applyRepoChange, configure };
+  return { adapter, request, store, messages, normal, record, ensureSessionRecord, describeConfig, applyAgentChange, applyModelChange, cancelChannel, deliver, applyRepoChange, configure };
 }
 
 describe("merged Google Chat commands wired before ordinary turn admission", () => {
@@ -71,7 +73,7 @@ describe("merged Google Chat commands wired before ordinary turn admission", () 
     expect(h.messages[0]).not.toHaveProperty("thread");
     const selected = id === 5 ? h.applyRepoChange : h.configure;
     expect(selected).toHaveBeenCalledOnce();
-    expect(h.ensureSessionRecord).toHaveBeenCalledWith(expect.objectContaining({ channelRef: "dm.pB-Jq3TxSfk" }));
+    expect(h.ensureSessionRecord).not.toHaveBeenCalled();
     expect(h.normal).not.toHaveBeenCalled();
   });
 
@@ -91,9 +93,11 @@ describe("merged Google Chat commands wired before ordinary turn admission", () 
     ("maps command %s in a %s Space through channelFor without an @mention", async (id, state) => {
       const h = setup();
       const raw = event(Number(id), id === 5 ? "/repo new" : "/effort high");
+      if (state === "UNTHREADED_MESSAGES") seedLegacyChatRecords(h.store, ["dm"]);
       await h.deliver({ ...raw, space: { ...raw.space, spaceType: "SPACE", spaceThreadingState: state } });
       const expected = state === "UNTHREADED_MESSAGES" ? "dm" : "dm.thread";
-      expect(h.ensureSessionRecord).toHaveBeenCalledWith(expect.objectContaining({ channelRef: expected }));
+      expect(h.ensureSessionRecord).not.toHaveBeenCalled();
+      expect(h.store.getByChannel("google-chat", expected)).toBeDefined();
       expect((id === 5 ? h.applyRepoChange : h.configure)).toHaveBeenCalledOnce();
       expect(h.messages[0]).toMatchObject({ privateMessageViewer: { name: "users/42" } });
       if (state === "UNTHREADED_MESSAGES") expect(h.messages[0]).not.toHaveProperty("thread");
@@ -201,45 +205,11 @@ describe("merged Google Chat commands wired before ordinary turn admission", () 
       const selected = id === 3 ? h.applyAgentChange : h.applyModelChange;
       expect(selected).toHaveBeenCalledExactlyOnceWith(channel, expect.objectContaining({ id: "google-chat:dm.thread" }),
         args, { id: "42", name: "Tester" }, expect.any(Function));
-      expect(h.ensureSessionRecord).toHaveBeenCalledExactlyOnceWith({ platform: "google-chat", channelRef: "dm.thread",
-        parentRef: "dm", cwd: "/projects" });
+      expect(h.ensureSessionRecord).not.toHaveBeenCalled();
       expect(h.normal).not.toHaveBeenCalled();
       expect(h.request.mock.calls[0]![1].data.thread.name).toBe("spaces/dm/threads/thread");
       expect(h.request.mock.calls.at(-1)![0]).toBe("pubsub");
     });
-
-  it.each(["DIRECT_MESSAGE", "SPACE"])("creates a bold /new root in %s without admitting the name; its reply is a normal prompt", async spaceType => {
-    const h = setup();
-    const before = structuredClone(h.record);
-    const raw = event(1, "/new Another task");
-    await h.deliver({ ...raw, space: { ...raw.space, spaceType, spaceThreadingState: "THREADED_MESSAGES" } });
-    expect(h.normal).not.toHaveBeenCalled();
-    expect(h.request.mock.calls[0]![1].data).toEqual({ text: "*Another task*", markupSyntax: "MARKUP_SYNTAX_CHAT" });
-    expect(h.request.mock.calls[0]![1].data.thread).toBeUndefined();
-    expect(h.request.mock.calls[0]![1].params).not.toHaveProperty("messageReplyOption");
-    expect(h.ensureSessionRecord).toHaveBeenCalledExactlyOnceWith({ platform: "google-chat", channelRef: "dm.new",
-      parentRef: "dm", cwd: "/projects" });
-    expect(h.record).toEqual(before);
-    await h.deliver({ type: "MESSAGE", user: { name: "users/42", displayName: "Tester" },
-      space: { ...raw.space, spaceType, spaceThreadingState: "THREADED_MESSAGES" },
-      message: { name: "spaces/dm/messages/first-reply", text: spaceType === "SPACE" ? "@Seam Start the actual task" : "Start the actual task",
-        annotations: spaceType === "SPACE" ? [{ type: "USER_MENTION", startIndex: 0, length: 5,
-          userMention: { type: "MENTION", user: { name: "users/app", type: "BOT" } } }] : [], threadReply: true,
-        thread: { name: "spaces/dm/threads/new" } } });
-    expect(h.normal).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
-      channel: { platform: "google-chat", id: "dm.new", parentId: "dm" }, text: "Start the actual task",
-    }));
-  });
-
-  it("leaves bare /new's plain seam root and prompt-free binding unchanged", async () => {
-    const h = setup();
-    const raw = event(1, "/new");
-    await h.deliver({ ...raw, message: { ...raw.message, argumentText: null } });
-    expect(h.request.mock.calls[0]![1].data).toEqual({ text: "seam", markupSyntax: "MARKUP_SYNTAX_CHAT" });
-    expect(h.ensureSessionRecord).toHaveBeenCalledExactlyOnceWith({ platform: "google-chat", channelRef: "dm.new",
-      parentRef: "dm", cwd: "/projects" });
-    expect(h.normal).not.toHaveBeenCalled();
-  });
 
   it("routes APP_COMMAND through the same canonical channel action", async () => {
     const h = setup();

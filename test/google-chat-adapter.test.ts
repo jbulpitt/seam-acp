@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { pino } from "pino";
+import { installLegacyChatFixture } from "./helpers/google-chat-legacy-fixture.js";
 
 const logger = pino({ level: "silent" });
 const channel = { platform: "google-chat", id: "DM_1.Thread_1", parentId: "DM_1" };
@@ -15,11 +16,12 @@ async function setup() {
     ? Buffer.from("attached text") : { name: "spaces/DM_1/messages/app-1", thread: { name: "spaces/DM_1/threads/Thread_1" } });
   const adapter = new GoogleChatAdapter({ api: { request }, subscription: "projects/test/subscriptions/events",
     allowedUserIds: new Set(["users/42"]), defaultCwd: "/projects", logger, writeIntervalMs: 0 });
+  installLegacyChatFixture(adapter, ["DM_1.Thread_1", "DM_1.Another"]);
   return { adapter, request };
 }
 
 describe("Google Chat DM adapter", () => {
-  it("maps a top-level DM and its reply to the same safe session ref, and a new top-level to a new session", async () => {
+  it("keeps already-bound DM-thread sessions working until they are manually moved", async () => {
     const { adapter } = await setup();
     const messages: any[] = [];
     adapter.onMessage(msg => { messages.push(msg); msg.onAdmitted?.(); });
@@ -85,15 +87,12 @@ describe("Google Chat DM adapter", () => {
       data: expect.objectContaining({ text: "done" }) })]);
   });
 
-  it("creates a new top-level session thread and sends text files as text, not app-auth uploads", async () => {
+  it("has no thread-session creation port and retains the text-file fallback", async () => {
     const { adapter, request } = await setup();
-    request.mockResolvedValueOnce({ name: "spaces/DM_1/messages/new", thread: { name: "spaces/DM_1/threads/New" } });
-    expect(await adapter.createThread({ platform: "google-chat", id: "DM_1" }, "new session"))
-      .toEqual({ platform: "google-chat", id: "DM_1.New", parentId: "DM_1" });
-    expect(request.mock.calls[0]![1].data.thread).toBeUndefined();
+    expect(adapter.createThread).toBeUndefined();
     await adapter.sendFile(channel, { data: Buffer.from("file body"), filename: "note.txt", mimeType: "text/plain" });
-    expect(request.mock.calls[1]![1].data.text).toContain("file body");
-    expect(request.mock.calls[1]![1].url).not.toContain("upload");
+    expect(request.mock.calls[0]![1].data.text).toContain("file body");
+    expect(request.mock.calls[0]![1].url).not.toContain("upload");
   });
 
   it("downloads an inbound attachment through media.download using app authentication", async () => {

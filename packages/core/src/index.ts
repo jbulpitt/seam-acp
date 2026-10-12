@@ -59,6 +59,7 @@ import { discordRenderer } from "./platforms/discord/renderer.js";
 import { DiscordAdapter } from "./platforms/discord/adapter.js";
 import { GoogleChatAdapter } from "./platforms/google-chat/adapter.js";
 import { GoogleChatSpaceEvents } from "./platforms/google-chat/space-events.js";
+import { prepareGoogleChatSpaceSelection, bindGoogleChatSessionSpace } from "./platforms/google-chat/session-spaces.js";
 import { GoogleChatSpaceSubscriptions } from "./platforms/google-chat/space-subscriptions.js";
 import { GoogleDriveUploader } from "./core/files/google-drive-upload.js";
 import { loadGoogleDriveUploadConfig } from "./core/files/google-drive-config.js";
@@ -486,10 +487,11 @@ async function main(): Promise<void> {
       subscription: config.GOOGLE_CHAT_SUBSCRIPTION,
       allowedUserIds: config.GOOGLE_CHAT_ALLOWED_USER_IDS,
       allowedSpaceIds: config.GOOGLE_CHAT_ALLOWED_SPACE_IDS,
-      hasSession: channel => Boolean(store.getByChannel("google-chat", channel.id)),
       spaceEvents: config.GOOGLE_CHAT_TOPIC ? new GoogleChatSpaceEvents({
         api: googleChatApi, pubsubTopic: config.GOOGLE_CHAT_TOPIC, store: store.googleChatSpaces,
         allowedSpaceIds: config.GOOGLE_CHAT_ALLOWED_SPACE_IDS, logger: logger.child({ platform: "google-chat", mod: "space-events" }),
+        isSessionSpace: name => store.getByChannel("google-chat", name.slice("spaces/".length))?.channelRef === name.slice("spaces/".length)
+          || store.createdGoogleChatSpace(name),
         subscriptions: new GoogleChatSpaceSubscriptions({ pubsubTopic: config.GOOGLE_CHAT_TOPIC,
           credentialsFile: config.GOOGLE_CHAT_CREDENTIALS_FILE, logger: logger.child({ platform: "google-chat", mod: "space-events" }) }),
       }) : undefined,
@@ -562,7 +564,13 @@ async function main(): Promise<void> {
 
   googleChat?.setCommandDeps({ store, router, mutation: orchestrator.getConfigMutation(), runtimeTransition: orchestrator.getRuntimeTransition(),
     configPlan: orchestrator.getConfigApplyPlan(), modelCatalog,
+    deliveryForChannel: (channel, messageId) => orchestrator.deliveryForChannel(channel, messageId),
     cancelChannel: channel => orchestrator.cancelChannel(channel) });
+  googleChat?.installSessionSpaces({ config,
+    prepare: snapshot => prepareGoogleChatSpaceSelection(snapshot, { router, modelCatalog,
+      configPlan: orchestrator.getConfigApplyPlan(), defaultCwd: config.REPOS_ROOT }),
+    bind: (channel, snapshot, actor) => bindGoogleChatSessionSpace(channel, snapshot,
+      { store, router, mutation: orchestrator.getConfigMutation() }, actor) });
   await orchestrator.loadPlugins();
   orchestrator.install();
 

@@ -102,7 +102,7 @@ export class GoogleChatHistoryReader {
     });
     if (request.pageToken) query.set("pageToken", request.pageToken);
     const filters: string[] = [];
-    if (request.thread) filters.push(`thread.name = ${request.thread}`);
+    if (request.thread) filters.push(`thread.name = ${JSON.stringify(request.thread)}`);
     if (request.before) filters.push(`createTime < ${JSON.stringify(request.before)}`);
     if (request.after) filters.push(`createTime > ${JSON.stringify(request.after)}`);
     if (filters.length) query.set("filter", filters.join(" AND "));

@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { pino } from "pino";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
+import { seedLegacyChatRecords } from "./helpers/google-chat-legacy-fixture.js";
 import { GoogleChatAdapter } from "../packages/core/src/platforms/google-chat/adapter.js";
 import { GoogleChatSpaceEvents } from "../packages/core/src/platforms/google-chat/space-events.js";
 import { GOOGLE_CHAT_MESSAGE_CREATED, WorkspaceEventsOperationError,
@@ -35,6 +36,7 @@ function untilAbort(signal: AbortSignal): Promise<never> {
 function setup() {
   const logs: any[] = [], logger = pino({ level: "debug" }, { write: line => logs.push(JSON.parse(line)) });
   const store = new SessionStore(":memory:"); stores.push(store);
+  seedLegacyChatRecords(store, ["team"]);
   const request = vi.fn(async (scope: string, r: any): Promise<any> => {
     if (scope === "pubsub" && r.url.endsWith(":pull")) return untilAbort(r.signal);
     if (scope === "chat" && r.url.endsWith("/spaces")) return { spaces: [space] };
@@ -50,7 +52,11 @@ function setup() {
     subscriptions: client, store: store.googleChatSpaces, logger });
   const adapter = new GoogleChatAdapter({ api: { request }, subscription: "projects/test/subscriptions/events",
     allowedUserIds: new Set(["users/42"]), defaultCwd: "/projects", logger,
-    spaceEvents: worker, hasSession: () => true, writeIntervalMs: 0 });
+    spaceEvents: worker, writeIntervalMs: 0 });
+  adapter.setCommandDeps({ store, router: { ensureSessionRecord: (input: { channelRef: string }) => store.getByChannel("google-chat", input.channelRef),
+    bindRecordLocation: () => "local" }, mutation: { readThreadPresetEntry: () => undefined,
+    applyThreadOverlay: () => ({ ok: true }), restoreThreadPresetEntry: () => ({ ok: true }) },
+    runtimeTransition: {}, cancelChannel: async () => {} } as any);
   adapters.push(adapter);
   return { adapter, worker, client, request, store, logs, logger };
 }

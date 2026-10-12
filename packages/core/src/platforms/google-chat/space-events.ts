@@ -21,6 +21,7 @@ export class GoogleChatSpaceEvents {
     subscriptions: Subscriptions;
     store: GoogleChatSpaceStore;
     allowedSpaceIds?: ReadonlySet<string>;
+    isSessionSpace?: (space: string) => boolean;
     logger: Logger;
     renewalLeadMs?: number;
   }) {}
@@ -35,7 +36,8 @@ export class GoogleChatSpaceEvents {
 
   private allowed(space: GoogleChatSpace): boolean {
     const ids = this.opts.allowedSpaceIds;
-    return isSharedSpace(space) && !!space.name && (!ids?.size || ids.has(space.name) || ids.has(space.name.slice("spaces/".length)));
+    return isSharedSpace(space) && !!space.name && (this.opts.isSessionSpace?.(space.name)
+      || !ids?.size || ids.has(space.name) || ids.has(space.name.slice("spaces/".length)));
   }
 
   async start(): Promise<void> {
@@ -93,19 +95,22 @@ export class GoogleChatSpaceEvents {
   async handle(event: GoogleChatSpaceLifecycle): Promise<void> {
     const name = event.space.name;
     if (event.type === "ADDED_TO_SPACE" && !this.allowed(event.space)) return;
+    if (event.type === "ADDED_TO_SPACE") return this.register(event.space);
     await this.serial(name, async () => {
-      if (event.type === "ADDED_TO_SPACE") await this.ensure(event.space);
-      else {
-        this.disarm(name);
-        const client = this.opts.subscriptions;
-        // Covers a create that reached Google but not the local commit.
-        const subscriptions = await client.list(name, this.controller.signal);
-        for (const sub of subscriptions) if (sub.notificationEndpoint.pubsubTopic === this.opts.pubsubTopic) {
-          await client.delete(sub.name, this.controller.signal);
-        }
-        this.opts.store.delete(name);
+      this.disarm(name);
+      const client = this.opts.subscriptions;
+      // Covers a create that reached Google but not the local commit.
+      const subscriptions = await client.list(name, this.controller.signal);
+      for (const sub of subscriptions) if (sub.notificationEndpoint.pubsubTopic === this.opts.pubsubTopic) {
+        await client.delete(sub.name, this.controller.signal);
       }
+      this.opts.store.delete(name);
     });
+  }
+
+  /** Explicit session creation uses the same subscription/renewal path as membership events. */
+  register(space: GoogleChatSpace & { name: string }): Promise<void> {
+    return this.serial(space.name, () => this.ensure(space));
   }
 
   private async ensure(space: GoogleChatSpace & { name: string }, signal = this.controller.signal): Promise<void> {
@@ -127,7 +132,9 @@ export class GoogleChatSpaceEvents {
   }
 
   private saveAndArm(state: StoredGoogleChatSpace, subscription: GoogleChatSpaceSubscription): void {
-    this.opts.store.put({ ...state, appUser: this.opts.store.get(state.space.name)?.appUser ?? state.appUser, subscription });
+    const latest = this.opts.store.get(state.space.name);
+    this.opts.store.put({ ...state, messageRoots: latest?.messageRoots ?? state.messageRoots,
+      appUser: latest?.appUser ?? state.appUser, subscription });
     if (this.controller.signal.aborted) return;
     const renewAt = nextGoogleChatSubscriptionRenewalTime(subscription, this.opts.renewalLeadMs ?? 5 * 60_000);
     this.arm(state.space.name, renewAt);

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { pino } from "pino";
 import { GoogleChatAdapter } from "../packages/core/src/platforms/google-chat/adapter.js";
+import { installLegacyChatFixture } from "./helpers/google-chat-legacy-fixture.js";
 import type { IncomingMessage } from "../packages/core/src/platforms/chat-adapter.js";
 import { GOOGLE_CHAT_MESSAGE_BATCH_CREATED, GOOGLE_CHAT_MESSAGE_CREATED } from "../packages/core/src/platforms/google-chat/space-subscriptions.js";
 import { parseGoogleChatWorkspaceMessages,
@@ -29,12 +30,19 @@ describe("Workspace Chat message CloudEvents", () => {
     expect(parsed!.resource.annotations).toEqual(resource.annotations);
   });
 
-  it("matches the direct DM MESSAGE adapter's dedupe id and neutral fields through adapter admission", async () => {
+  it("keeps direct/Workspace DM dedupe identity and neutral fields for an existing legacy session", async () => {
     const incoming: IncomingMessage[] = [];
     const adapter = new GoogleChatAdapter({ api: { request: async () => { throw new Error("no Google call expected"); } },
       subscription: "projects/example/subscriptions/chat-events", allowedUserIds: new Set(["users/42"]), defaultCwd: "/projects",
       logger: pino({ level: "silent" }), writeIntervalMs: 0 });
-    adapter.onMessage(message => { incoming.push(message); message.onAdmitted?.(); });
+    const store = installLegacyChatFixture(adapter, ["SPACE.Thread_1"]);
+    const legacy = store.getByChannel("google-chat", "SPACE.Thread_1")!;
+    adapter.onMessage(message => {
+      incoming.push(message);
+      store.admitInbound({ ...message, messageId: message.messageId!, platform: "google-chat", channelRef: message.channel.id,
+        parentRef: message.channel.parentId, sessionRecordId: legacy.id, createdUtc: new Date().toISOString() });
+      message.onAdmitted?.();
+    });
     const dm = { ...resource, space: { ...resource.space, spaceType: "DIRECT_MESSAGE" } };
     await adapter.receiveEvent({ type: "MESSAGE", space: dm.space, user: dm.sender, message: dm });
     expect(incoming).toHaveLength(1);
@@ -45,6 +53,9 @@ describe("Workspace Chat message CloudEvents", () => {
     expect(incoming).toHaveLength(2);
     expect(incoming[1]).toMatchObject({ messageId: incoming[0]!.messageId, channel: incoming[0]!.channel,
       authorId: incoming[0]!.authorId, authorName: incoming[0]!.authorName, text: incoming[0]!.text });
+    expect(incoming[0]!.channel).toEqual({ platform: "google-chat", id: "SPACE.Thread_1", parentId: "SPACE" });
+    expect(store.listInboundNonterminal().map(row => row.messageId)).toEqual([incoming[0]!.messageId]);
+    expect(store.get(legacy.id)?.acpSessionId).toBe(legacy.acpSessionId);
   });
 
   it("retains the native resource identity, not the CloudEvent or Pub/Sub delivery id", () => {

@@ -65,7 +65,7 @@ describe("Google Chat adapter history wiring", () => {
     const result = await h.adapter.fetchMessagePage(channel.id, input);
     expect(result.messages.map((m: any) => m.messageId)).toEqual((ids as string[]).map(id => `${space}/messages/${id}`));
     expect(result.rawCount).toBe((ids as string[]).length);
-    expect(new URL(h.historyRequest.mock.calls.at(-1)![0].url).searchParams.get("filter")).toContain(`thread.name = ${thread}`);
+    expect(new URL(h.historyRequest.mock.calls.at(-1)![0].url).searchParams.get("filter")).toContain(`thread.name = "${thread}"`);
     expect(h.request).toHaveBeenCalledExactlyOnceWith("chat", expect.objectContaining({ method: "GET", url: `https://chat.googleapis.com/v1/${space}` }));
   });
 
@@ -120,7 +120,7 @@ describe("Google Chat adapter history wiring", () => {
     await expect(h.adapter.findMessageByNonce(channel, "missing", sinceMs)).resolves.toEqual({ status: "absent" });
     expect(h.historyRequest).toHaveBeenCalledTimes(2);
     expect(new URL(h.historyRequest.mock.calls[1]![0].url).searchParams.get("filter"))
-      .toBe(`thread.name = ${thread} AND createTime > "2026-10-10T11:55:00.000Z"`);
+      .toBe(`thread.name = "${thread}" AND createTime > "2026-10-10T11:55:00.000Z"`);
   });
 
   it("fills omitted sender names from the same message's durable admission, without another Google call", async () => {

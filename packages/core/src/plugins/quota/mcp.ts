@@ -7,13 +7,13 @@ export function quotaMcp(registry: QuotaRegistry, agents: () => readonly Pick<Ag
   return [{
     descriptor: {
       name: "agent_quota",
-      description: "Read normalized rolling and weekly quota for one configured agent or all agents. " +
+      description: "Read normalized rolling and weekly quota for one configured agent or all agents, including independent named pools for Antigravity. " +
         "Orchestration models use this to pick workers with headroom and steer handoffs away " +
         "from agents nearing a rolling or weekly cap.",
       inputSchema: { type: "object", properties: { agentId: { type: "string", description: "Optional configured agent id. Omit to return every agent." } }, required: [] },
     },
     access: "read-only", authorization: "user", available: () => true,
-    instruction: "- agent_quota(agentId?): read normalized rolling + weekly quota for one agent or all agents\n  before choosing workers; steer away from agents nearing a cap.",
+    instruction: "- agent_quota(agentId?): read normalized rolling + weekly quota for one agent or all agents\n  before choosing workers; Antigravity pools are independent, so use the pool covering the selected model.",
     handle: async ({ args }) => {
       const agentId = typeof args.agentId === "string" ? args.agentId.trim() || undefined : undefined;
       const known = new Map(registry.all().map(quota => [quota.agentId, quota]));

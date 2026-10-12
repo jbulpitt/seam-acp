@@ -26,6 +26,7 @@ function harness(row = record()) {
     releaseStdin() {},
   };
   const store = { readConfig: (r: SessionRecord) => JSON.parse(r.configJson), get: (id: string) => id === row.id ? row : null,
+    getByChannel: (platform: string, channelRef: string) => platform === row.platform && channelRef === row.channelRef ? row : null,
     lookupAgentChannelRestriction: () => ({ state: "absent" }), needsAgyIdentityRebuild: () => false };
   const modelCatalog = fixtureModelCatalog([profile]);
   const router = new SessionRouter({ logger, store, profiles: [profile], modelCatalog,

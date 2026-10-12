@@ -838,7 +838,7 @@ export class SessionRouter {
     cwd: string;
   }): SessionRecord {
     const id = makeSessionId(opts.platform, opts.channelRef);
-    const existing = this.store.get(id);
+    const existing = this.store.getByChannel(opts.platform, opts.channelRef) ?? this.store.get(id);
     if (existing) {
       if (!existing.parentRef && opts.parentRef) {
         const linked = { ...existing, parentRef: opts.parentRef, updatedUtc: new Date().toISOString() };

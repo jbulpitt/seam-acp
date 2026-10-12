@@ -4,6 +4,9 @@ import type { ChatAdapter, ChannelRef, DeliveryNonceLookup, DeliveryNonceOptions
   MessageAttachment, MessageRef, ChoiceCardPost, ChoiceInteraction, ComponentEvent, ElicitationCardPost } from "../chat-adapter.js";
 import type { StructuredPanel, StructuredLayout } from "../../core/types.js";
 import type { SessionStore } from "../../core/session-store.js";
+import { makeSessionId } from "../../core/session-store.js";
+import { threadPresetKey } from "../../config.js";
+import type { ConfigMutationService } from "../../core/config-mutation.js";
 import type { InboundCommandResult } from "../../core/inbound-admission/types.js";
 import type { MessagePage, MessagePageRequest } from "../../core/message-reader.js";
 import type { GoogleChatHistoryReader } from "../../core/messages/google-chat-history.js";
@@ -12,7 +15,7 @@ import { fetchMessagePage as fetchSpaceMessagePage, findMessageByNonce as findSp
 import type { GoogleDriveUploader } from "../../core/files/google-drive-upload.js";
 import type { ComponentAcknowledgement } from "../interaction-response.js";
 import type { GoogleApi } from "./api.js";
-import { googleErrorStatus } from "./api.js";
+import { googleErrorStatus, isGoogleChatThreadReplyLimit } from "./api.js";
 import { googleChatClientMessageId } from "./message-id.js";
 import { PubSubPullTransport } from "./transport.js";
 import { SpaceWriteQueue } from "./write-queue.js";
@@ -30,6 +33,7 @@ import type { ParsedWorkspaceChatMessage } from "./workspace-message-event.js";
 
 export const GOOGLE_CHAT_PLATFORM = "google-chat";
 const root = "https://chat.googleapis.com/v1";
+const continuationNote = "Continued from the previous thread (reply limit reached)";
 type ChatMessage = { name?: string; text?: string; thread?: { name?: string }; threadReply?: boolean;
   annotations?: GoogleChatAnnotation[];
   sender?: { name?: string; type?: string; displayName?: string };
@@ -61,7 +65,9 @@ function inboundId(name: string): string {
 }
 
 type CommandDeps = Pick<GoogleChatCommandDeps, "router" | "mutation" | "runtimeTransition" | "cancelChannel" | "configPlan" | "modelCatalog"> & {
-  store: Pick<SessionStore, "getByChannel" | "admitInbound" | "getInbound" | "claimInbound" | "completeInboundCommand">;
+  store: Pick<SessionStore, "getByChannel" | "admitInbound" | "getInbound" | "claimInbound" | "completeInboundCommand" | "rebindChannel">
+    & Partial<Pick<SessionStore, "get">>;
+  mutation: GoogleChatCommandDeps["mutation"] & Pick<ConfigMutationService, "restoreThreadPresetEntry">;
 };
 
 export class GoogleChatAdapter implements ChatAdapter {
@@ -248,7 +254,8 @@ export class GoogleChatAdapter implements ChatAdapter {
     const { store } = this.commandDeps;
     const channel = this.channelFor(command.space, command.thread);
     store.admitInbound({ messageId, platform: this.platform, channelRef: channel.id, parentRef: channel.parentId,
-      sessionRecordId: `${this.platform}:${channel.id}`, authorId: resourceId(command.user.id, "users"),
+      sessionRecordId: store.getByChannel(this.platform, channel.id)?.id ?? `${this.platform}:${channel.id}`,
+      authorId: resourceId(command.user.id, "users"),
       authorName: command.user.name, text: `/${command.command} ${command.args}`.trim(),
       createdUtc: new Date().toISOString(), preemptive: false, commandResult: { replies: [] } });
     const admitted = store.getInbound(messageId)!;
@@ -320,7 +327,7 @@ export class GoogleChatAdapter implements ChatAdapter {
     const { thread } = names(channel);
     const extra = { ...(thread ? { thread: { name: thread } } : {}),
       ...(privateUser ? { privateMessageViewer: { name: privateUser } } : {}) };
-    const reservedBytes = Buffer.byteLength(JSON.stringify(extra), "utf8") - 1;
+    const reservedBytes = Buffer.byteLength(JSON.stringify(extra), "utf8") - 1 + Buffer.byteLength(continuationNote, "utf8") + 2;
     const parts = splitGoogleChatText(formatGoogleChatText(text), { reservedBytes });
     let ref: MessageRef | undefined;
     for (const [part, value] of (parts.length ? parts : [""]).entries()) {
@@ -332,18 +339,55 @@ export class GoogleChatAdapter implements ChatAdapter {
   }
 
   private async postMessage(channel: ChannelRef, body: Record<string, unknown>, delivery?: DeliveryNonceOptions): Promise<MessageRef> {
-    const { space, thread } = names(channel);
+    const { space } = names(channel);
+    const store = this.commandDeps?.store;
+    const bound = store?.getByChannel(this.platform, channel.id) ?? store?.get?.(makeSessionId(this.platform, channel.id));
     const requestId = randomUUID();
-    const params = { requestId, ...(thread ? { messageReplyOption: "REPLY_MESSAGE_OR_FAIL" } : {}),
-      ...(delivery ? { messageId: googleChatClientMessageId(delivery.nonce) } : {}) };
-    const message = await this.writes.enqueue(space, async () => {
-      try {
-        return await this.opts.api.request<ChatMessage>("chat", { method: "POST", url: `${root}/${space}/messages`,
-          params, data: { ...body, ...(thread ? { thread: { name: thread } } : {}) } });
-      } catch (err) {
-        if (!delivery || googleErrorStatus(err) !== 409) throw err;
-        return this.opts.api.request<ChatMessage>("chat", { method: "GET", url: `${root}/${space}/messages/${googleChatClientMessageId(delivery.nonce)}` });
+    let continued = false, deduplicated = false, thread: string | undefined;
+    let content = body;
+    const message = await this.writes.enqueue(space, async nextWrite => {
+      const current = bound ? store!.get?.(bound.id) ?? bound : undefined;
+      thread = continued ? undefined : names(current ? { ...channel, id: current.channelRef } : channel).thread;
+      const create = async () => {
+        try {
+          return await this.opts.api.request<ChatMessage>("chat", { method: "POST", url: `${root}/${space}/messages`,
+            params: { requestId, ...(thread ? { messageReplyOption: "REPLY_MESSAGE_OR_FAIL" } : {}),
+              ...(delivery ? { messageId: googleChatClientMessageId(delivery.nonce) } : {}) },
+            data: { ...content, ...(thread ? { thread: { name: thread } } : {}) } });
+        } catch (err) {
+          if (!delivery || googleErrorStatus(err) !== 409) throw err;
+          deduplicated = true;
+          return this.opts.api.request<ChatMessage>("chat", { method: "GET", url: `${root}/${space}/messages/${googleChatClientMessageId(delivery.nonce)}` });
+        }
+      };
+      let result: ChatMessage;
+      try { result = await create(); }
+      catch (err) {
+        if (!thread || !isGoogleChatThreadReplyLimit(err)) throw err;
+        this.opts.logger.warn({ err, space, thread }, "Google Chat thread reply limit reached; continuing conversation");
+        continued = true;
+        thread = undefined;
+        content = { ...body, text: [continuationNote, body.text].filter(Boolean).join("\n\n") };
+        // Keep the continuation in this lane, but spend a separate write-budget slot.
+        await nextWrite();
+        result = await create();
       }
+      if (!result.name) throw new Error("Google Chat create returned no message name");
+      if (result.thread?.name && (continued || (deduplicated && result.thread.name !== thread))) {
+        const destination = this.channelFor(space, result.thread.name);
+        if (current) {
+          const preset = this.commandDeps!.mutation.readThreadPresetEntry(threadPresetKey(this.platform, current.channelRef));
+          if (preset !== undefined) {
+            const copied = this.commandDeps!.mutation.restoreThreadPresetEntry(threadPresetKey(this.platform, destination.id), preset);
+            if (!copied.ok) throw new Error(copied.error);
+          }
+          store!.rebindChannel(current.id, destination.id, destination.parentId ?? null);
+          this.opts.logger.info({ session: current.id, acpSessionId: current.acpSessionId,
+            from: current.channelRef, to: destination.id }, "Google Chat session rebound to continuation thread");
+        }
+        thread = result.thread.name;
+      }
+      return result;
     });
     if (!message.name) throw new Error("Google Chat create returned no message name");
     // The sender of our own app-auth write is the canonical app user, without a membership lookup.
@@ -494,7 +538,8 @@ export class GoogleChatAdapter implements ChatAdapter {
   async findMessageByNonce(channel: ChannelRef, nonce: string, sinceMs: number): Promise<DeliveryNonceLookup> {
     if (!this.opts.historyReader) return { status: "indeterminate",
       reason: "Google Chat nonce lookup is unsupported until history access is configured with admin-approved chat.app.messages.readonly" };
-    const result = await findSpaceMessageByNonce(this.opts.historyReader, await this.historyTarget(channel), nonce, sinceMs);
+    const result = await findSpaceMessageByNonce(this.opts.historyReader,
+      await this.historyTarget(await this.resolveChannel(channel)), nonce, sinceMs);
     if (result.status === "unsupported") return { status: "indeterminate", reason: result.cause };
     if (result.status === "absent") return result;
     const { message } = result;
@@ -507,7 +552,9 @@ export class GoogleChatAdapter implements ChatAdapter {
   }
 
   async resolveChannel(channel: ChannelRef): Promise<ChannelRef> {
-    const { thread } = names(channel);
+    const store = this.commandDeps?.store;
+    const record = store?.getByChannel(this.platform, channel.id) ?? store?.get?.(makeSessionId(this.platform, channel.id));
+    const { thread } = names(record ? { ...channel, id: record.channelRef } : channel);
     return thread ? channelForThread(thread) : channel;
   }
 

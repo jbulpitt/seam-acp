@@ -967,11 +967,20 @@ export class SessionStore {
   }
 
   getByChannel(platform: string, channelRef: string): SessionRecord | null {
-    const row = this.db
+    let row = this.db
       .prepare<[string, string], Row>(
         "SELECT * FROM sessions WHERE platform = ? AND channel_ref = ?"
       )
       .get(platform, channelRef);
+    if (!row && platform === "google-chat") {
+      // The original ID and admitted messages already identify moved Chat homes.
+      row = this.db.prepare<[string], Row>("SELECT * FROM sessions WHERE id = ?")
+        .get(makeSessionId(platform, channelRef))
+        ?? this.db.prepare<[string, string, string], Row>(`SELECT s.* FROM sessions s
+          JOIN inbound_admissions i ON i.session_record_id = s.id
+          WHERE i.channel_ref = ? AND i.platform = ? AND s.platform = ?
+          ORDER BY i.created_utc DESC LIMIT 1`).get(channelRef, platform, platform);
+    }
     return row ? mapRow(row) : null;
   }
 
@@ -982,7 +991,7 @@ export class SessionStore {
         "SELECT * FROM sessions WHERE channel_ref = ? ORDER BY platform = 'discord' DESC LIMIT 1"
       )
       .get(channelRef);
-    return row ? mapRow(row) : null;
+    return row ? mapRow(row) : this.getByChannel("google-chat", channelRef);
   }
 
   list(limit = 100): SessionRecord[] {
@@ -1144,7 +1153,6 @@ export class SessionStore {
             @repoPath, @configJson, @namePrefix, @createdUtc, @updatedUtc)
          ON CONFLICT(id) DO UPDATE SET
            platform        = excluded.platform,
-           channel_ref     = excluded.channel_ref,
            parent_ref      = excluded.parent_ref,
            agent_id        = excluded.agent_id,
            ${binding ? "acp_session_id = excluded.acp_session_id," : ""}
@@ -1170,6 +1178,14 @@ export class SessionStore {
   onSessionWrite(listener: (record: Readonly<SessionRecord>) => void): () => void {
     this.sessionWrites.add(listener);
     return () => this.sessionWrites.delete(listener);
+  }
+
+  /** Move the chat home without replacing its runtime, ACP session, or token identity. */
+  rebindChannel(id: string, channelRef: string, parentRef: string | null): void {
+    this.db.prepare("UPDATE sessions SET channel_ref = ?, parent_ref = ?, updated_utc = ? WHERE id = ?")
+      .run(channelRef, parentRef, new Date().toISOString(), id);
+    const committed = this.get(id)!;
+    for (const listener of this.sessionWrites) listener({ ...committed });
   }
 
   /** Atomically supersede every conflicting open request and publish a new one. */

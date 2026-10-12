@@ -90,25 +90,30 @@ describe("Space-root FIFO keeps per-prompt delivery across restart", () => {
 
   it("executes queued prompts from different threads serially with each prompt's own target", async () => {
     const h = fixture(); (h.router as any).isBusy = () => false;
-    let release!: () => void, began!: () => void;
-    const started = new Promise<void>(resolve => { began = resolve; });
+    let release!: () => void, began!: () => void, startupFailed!: (error: unknown) => void;
+    const started = new Promise<void>((resolve, reject) => { began = resolve; startupFailed = reject; });
     const held = new Promise<void>(resolve => { release = resolve; });
     const seen: any[] = [];
     (h.host as any).handleIncomingMessageInner.mockImplementation(async (msg: any) => {
       (h.host as any).liveTurnByChannel.set(channel.id, `inbound-${msg.messageId}`);
-      seen.push(h.host.deliveryForChannel(channel).channel);
-      if (msg.messageId === "first") { began(); await held; }
-      (h.host as any).liveTurnByChannel.delete(channel.id);
+      try {
+        seen.push(h.host.deliveryForChannel(channel).channel);
+        if (msg.messageId === "first") { began(); await held; }
+      } catch (err) { startupFailed(err); throw err; }
+      finally { (h.host as any).liveTurnByChannel.delete(channel.id); }
     });
     const first = (h.host as any).handleIncomingMessage(h.input("first", "A"));
-    await started;
-    const second = (h.host as any).handleIncomingMessage(h.input("second", "B"));
-    await vi.waitFor(() => expect(h.store.getInbound("second")?.state).toBe("pending"));
-    expect(seen).toEqual([target("A")]);
-    release(); await Promise.all([first, second]);
-    expect(seen).toEqual([target("A"), target("B")]);
-    expect(h.router.abortTurn).not.toHaveBeenCalled();
-    expect(h.store.get(h.record.id)?.acpSessionId).toBe("keep-acp");
+    let second: Promise<void> | undefined;
+    try {
+      await started;
+      second = (h.host as any).handleIncomingMessage(h.input("second", "B"));
+      await vi.waitFor(() => expect(h.store.getInbound("second")?.state).toBe("pending"));
+      expect(seen).toEqual([target("A")]);
+      release(); await Promise.all([first, second]);
+      expect(seen).toEqual([target("A"), target("B")]);
+      expect(h.router.abortTurn).not.toHaveBeenCalled();
+      expect(h.store.get(h.record.id)?.acpSessionId).toBe("keep-acp");
+    } finally { release(); await Promise.all([first, second]); }
   });
 
   it("reattached bridge output uses its own receipt and continuation does not change a queued prompt", () => {

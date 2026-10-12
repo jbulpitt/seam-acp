@@ -51,7 +51,7 @@ export async function savedSessionHost(options: {
     statePath: path.join(root, "slots.json"), resumeDir: path.join(root, "resume"),
     holderPath: options.holderPath ?? process.env.SEAM_SLOT_HOLDER_PATH ?? path.join(here, "slot-holder-source.mjs") });
   await server.start();
-  const client = await SessiondClient.connect(path.join(root, "control.sock"));
+  let client = await SessiondClient.connect(path.join(root, "control.sock"));
   const logger = pino({ level: "silent" });
   const commands: any[] = [];
   let slots!: SupervisedSlots;
@@ -97,8 +97,8 @@ export async function savedSessionHost(options: {
     }
     close() { this.readyState = 3; this.emit("close"); }
   }
-  const socket = new Socket();
-  slots = new SupervisedSlots({ client, copilotCmd: fakeAgent, localCwd: root,
+  let socket = new Socket();
+  const makeSlots = () => new SupervisedSlots({ client, copilotCmd: fakeAgent, localCwd: root,
     adapterChildPath: options.adapterChildPath ?? path.join(here, options.oldAuthDisarm ? "adapter-child-old-auth-disarm.mjs"
       : options.legacy ? "adapter-child-legacy.mjs" : "adapter-child-source.mjs"),
     environment: { HOME: root, PATH: `${bin}:${path.dirname(process.execPath)}:/usr/bin:/bin`,
@@ -112,6 +112,7 @@ export async function savedSessionHost(options: {
       ...(options.writerLock ? { FAKE_AGENT_WRITER_LOCK: path.join(root, "session.writer") } : {}),
       ...(options.sessionGone ? { FAKE_AGENT_MISSING_SESSION: SAVED_SESSION } : {}) },
     onFrame: frame => socket.deliver(frame), onStderr: () => {} });
+  slots = makeSlots();
   const mux = makeMux({ id: "fixture" });
   mux.attach(socket as never);
   socket.deliver({ type: "hello", instanceId: "fixture", capabilities: { durableSlots: true } });
@@ -151,7 +152,18 @@ export async function savedSessionHost(options: {
   }
   const requests = async () => (await fs.readFile(path.join(root, "requests.jsonl"), "utf8"))
     .trim().split("\n").map(line => JSON.parse(line));
-  return { root, db, record, store, mux, slots, client, commands, notices, makeRouter, makeOrchestrator, requests,
+  return { root, db, record, store, mux, get slots() { return slots; }, get client() { return client; },
+    commands, notices, makeRouter, makeOrchestrator, requests,
+    async restartBridge() {
+      socket.close();
+      client.close();
+      client = await SessiondClient.connect(path.join(root, "control.sock"));
+      socket = new Socket();
+      slots = makeSlots();
+      await slots.rebind();
+      mux.attach(socket as never);
+      socket.deliver({ type: "hello", instanceId: "replacement-fixture", capabilities: { durableSlots: true } });
+    },
     repairLoad: () => fs.rm(failure, { force: true }),
     releaseLoad: () => fs.writeFile(path.join(root, "load.release"), "released"),
     releaseNew: () => fs.writeFile(path.join(root, "new.release"), "released"),

@@ -9,7 +9,7 @@ const stores: SessionStore[] = [], workers: GoogleChatSpaceEvents[] = [];
 afterEach(async () => { await Promise.all(workers.splice(0).map(worker => worker.stop()));
   stores.splice(0).forEach(store => store.close()); vi.restoreAllMocks(); });
 
-function setup() {
+function setup(allowedSpaceIds?: ReadonlySet<string>) {
   const store = new SessionStore(":memory:"); stores.push(store);
   const logger = pino({ level: "silent" });
   const space = { name: "spaces/created", spaceType: "SPACE", spaceThreadingState: "THREADED_MESSAGES",
@@ -38,7 +38,7 @@ function setup() {
   const client = { list: vi.fn(async () => []), create: vi.fn(async () => subscription),
     renew: vi.fn(async () => subscription), delete: vi.fn(async () => {}) };
   const events = new GoogleChatSpaceEvents({ api: { request }, pubsubTopic: "projects/test/topics/events",
-    store: store.googleChatSpaces, subscriptions: client, logger }); workers.push(events);
+    store: store.googleChatSpaces, subscriptions: client, allowedSpaceIds, logger }); workers.push(events);
   const prepare = vi.fn(async (selection: any) => ({ ...selection }));
   const bind = vi.fn(async (channel: any, snapshot: any) => {
     const prior = store.getByChannel("google-chat", channel.id);
@@ -90,6 +90,13 @@ describe("durable Google Chat session Space creation", () => {
     expect(result.snapshot).toEqual({ agentId: "codex", location: "local", model: "override", effort: "high", repo: "/override" });
     expect(JSON.stringify(h.config)).toBe(before);
     expect(h.store.get("google-chat:origin.command")?.acpSessionId).toBe("keep-acp");
+  });
+
+  it("registers a newly created session Space explicitly rather than silently skipping a membership event", async () => {
+    const h = setup(new Set(["spaces/launcher"]));
+    await h.make().create(h.input);
+    expect(h.client.create).toHaveBeenCalledWith("spaces/created", expect.any(Object));
+    expect(h.store.googleChatSpaces.get(h.space.name)?.subscription?.name).toBe("subscriptions/created");
   });
 
   it("replays a completed creation without repeating Google effects, validation or binding", async () => {
